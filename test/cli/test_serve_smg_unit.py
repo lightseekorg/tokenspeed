@@ -58,6 +58,21 @@ from tokenspeed.cli.serve_smg import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _mock_smg_policy_choices(monkeypatch):
+    monkeypatch.setattr(
+        "tokenspeed.cli.serve_smg._smg_launch_policy_choices",
+        lambda: (
+            "random",
+            "round_robin",
+            "cache_aware",
+            "power_of_two",
+            "manual",
+            "passthrough",
+        ),
+    )
+
+
 def _make_proc(returncode: int | None = None) -> MagicMock:
     proc = MagicMock()
     proc.returncode = returncode
@@ -103,6 +118,17 @@ def test_gateway_args_default_policy_is_passthrough():
     gateway_args = _gateway_args_with_default_policy(["--model", "/tmp/x"])
 
     assert gateway_args == ["--model", "/tmp/x", "--policy", "passthrough"]
+
+
+def test_gateway_args_default_policy_falls_back_for_older_smg(monkeypatch):
+    monkeypatch.setattr(
+        "tokenspeed.cli.serve_smg._smg_launch_policy_choices",
+        lambda: ("random", "round_robin", "cache_aware", "power_of_two", "manual"),
+    )
+
+    gateway_args = _gateway_args_with_default_policy(["--model", "/tmp/x"])
+
+    assert gateway_args == ["--model", "/tmp/x", "--policy", "round_robin"]
 
 
 def test_gateway_args_preserve_user_policy():

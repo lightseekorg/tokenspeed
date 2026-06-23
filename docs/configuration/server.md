@@ -119,6 +119,13 @@ Common reasoning parser values include `kimi_k25`, `base`, `qwen3`,
 are validated by the SMG gateway, so use
 the values accepted by the bundled `tokenspeed-smg` package.
 
+## Gateway Defaults
+
+`tokenspeed serve` launches a single SMG gateway in front of one engine worker.
+When no `--policy` is provided, it uses SMG's `passthrough` policy if the
+bundled gateway supports it, and falls back to `round_robin` for older gateway
+builds. An explicit `--policy` value is passed through unchanged.
+
 ## Speculative Decoding
 
 | Parameter | Purpose |

@@ -25,10 +25,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import functools
 import json
 import logging
 import os
+import re
 import signal
+import subprocess
 import sys
 from pathlib import Path
 
@@ -60,6 +63,8 @@ DEFAULT_SMG_PROMETHEUS_PORT = 8413
 # which happens to share the "passthrough" string but configures an unrelated
 # flag (--reasoning-parser).
 DEFAULT_SMG_POLICY = "passthrough"
+FALLBACK_SMG_POLICY = "round_robin"
+_SMG_POLICY_HELP_RE = re.compile(r"--policy\s+\{([^}]*)\}")
 # smg reliability knobs we always want disabled when launched under
 # ts serve. These are tokenspeed-internal defaults: not surfaced via
 # the ts CLI, not routed through split_argv.
@@ -131,8 +136,44 @@ def _gateway_args_with_smg_disable_defaults(gateway_args: list[str]) -> list[str
     return result
 
 
+@functools.lru_cache(maxsize=1)
+def _smg_launch_policy_choices() -> tuple[str, ...]:
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "smg", "launch", "--help"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning(
+            "Could not probe smg launch policy choices; using %s: %s",
+            FALLBACK_SMG_POLICY,
+            exc,
+        )
+        return ()
+
+    match = _SMG_POLICY_HELP_RE.search(proc.stdout + "\n" + proc.stderr)
+    if match is None:
+        return ()
+    return tuple(choice.strip() for choice in match.group(1).split(","))
+
+
+def _default_smg_policy() -> str:
+    choices = _smg_launch_policy_choices()
+    if DEFAULT_SMG_POLICY in choices:
+        return DEFAULT_SMG_POLICY
+    if FALLBACK_SMG_POLICY in choices:
+        return FALLBACK_SMG_POLICY
+    if choices:
+        return choices[0]
+    return FALLBACK_SMG_POLICY
+
+
 def _gateway_args_with_default_policy(gateway_args: list[str]) -> list[str]:
-    """Front smg's single backend with the ``passthrough`` routing policy.
+    """Front smg's single backend with the lightest supported routing policy.
 
     ``ts serve`` always orchestrates exactly one engine endpoint, so smg's binary
     default (``cache_aware``) is pure overhead here: it runs the load-aware worker
@@ -140,19 +181,14 @@ def _gateway_args_with_default_policy(gateway_args: list[str]) -> list[str]:
     Against engines that predate that RPC the subscription surfaced as
     ``NotImplementedError: Method not implemented`` (smg#1794). The ``passthrough``
     policy (smg#1797) forwards every request to the single healthy worker with no
-    load balancing, load monitoring, or KV-event subscription.
+    load balancing, load monitoring, or KV-event subscription. Older bundled smg
+    wheels reject that enum, so fall back to ``round_robin`` for compatibility.
 
     Default-when-unset: an explicit operator ``--policy`` is preserved.
-
-    NOTE: ``--policy`` is whitelisted by smg's clap ``value_parser`` — a gateway
-    that predates smg#1797 rejects ``passthrough`` and fails to start. This
-    injection therefore requires a bundled ``tokenspeed-smg`` that ships smg#1797;
-    the pin in ``python/pyproject.toml`` must be bumped to such a release in
-    lockstep with this default.
     """
     if "--policy" in gateway_args:
         return gateway_args
-    return [*gateway_args, "--policy", DEFAULT_SMG_POLICY]
+    return [*gateway_args, "--policy", _default_smg_policy()]
 
 
 _TOKENIZER_CACHE_FLAGS = (
