@@ -25,6 +25,7 @@ import torch
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.ops.moe.triton.mxfp4 import (
     _routing_from_topk,
+    _routing_from_topk_medium_m,
     _routing_from_topk_small_m,
 )
 
@@ -78,6 +79,65 @@ def _assert_routing_equal(actual, expected) -> None:
     torch.testing.assert_close(actual_gate, expected_gate, rtol=0.0, atol=0.0)
 
 
+def _assert_metadata_equal(actual, expected) -> None:
+    actual_metadata = actual[0]
+    expected_metadata = expected[0]
+
+    assert torch.equal(actual_metadata.slice_sizes, expected_metadata.slice_sizes)
+    assert torch.equal(actual_metadata.slice_offs, expected_metadata.slice_offs)
+    assert torch.equal(
+        actual_metadata.block_offs_data,
+        expected_metadata.block_offs_data,
+    )
+    assert torch.equal(
+        actual_metadata.block_schedule_data,
+        expected_metadata.block_schedule_data,
+    )
+
+
+def _assert_valid_routing_permutation(
+    actual,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    gate_dtype: torch.dtype,
+) -> None:
+    metadata, gather, scatter, gate = actual
+    total_rows = topk_ids.numel()
+    assert torch.equal(
+        torch.sort(scatter).values,
+        torch.arange(total_rows, device=topk_ids.device, dtype=torch.int32),
+    )
+    assert torch.equal(gather, scatter // topk_ids.shape[1])
+
+    flat_ids = topk_ids.reshape(-1)
+    flat_weights = topk_weights.reshape(-1).to(gate_dtype)
+    routed_ids = flat_ids[scatter.to(torch.long)]
+    routed_weights = flat_weights[scatter.to(torch.long)]
+    torch.testing.assert_close(gate, routed_weights, rtol=0.0, atol=0.0)
+
+    expected_counts = torch.bincount(
+        topk_ids.reshape(-1).to(torch.long),
+        minlength=num_experts,
+    ).to(torch.int32)
+    assert torch.equal(metadata.slice_sizes, expected_counts)
+
+    for expert in range(num_experts):
+        start = int(metadata.slice_offs[expert].item())
+        stop = int(metadata.slice_offs[expert + 1].item())
+        if start == stop:
+            continue
+        assert torch.equal(
+            routed_ids[start:stop],
+            torch.full(
+                (stop - start,),
+                expert,
+                device=topk_ids.device,
+                dtype=routed_ids.dtype,
+            ),
+        )
+
+
 @pytest.mark.parametrize("num_tokens", [0, 1, 8, 16])
 @pytest.mark.parametrize("num_experts", [64, 384])
 @pytest.mark.parametrize("gate_dtype", [torch.float32, torch.bfloat16])
@@ -112,6 +172,47 @@ def test_small_m_routing_from_topk_matches_reference(
     _assert_routing_equal(actual, expected)
 
 
+@pytest.mark.parametrize("num_tokens", [32, 128, 512])
+@pytest.mark.parametrize("num_experts", [64, 384])
+@pytest.mark.parametrize("gate_dtype", [torch.float32, torch.bfloat16])
+def test_medium_m_routing_from_topk_matches_reference_metadata(
+    device: str,
+    num_tokens: int,
+    num_experts: int,
+    gate_dtype: torch.dtype,
+) -> None:
+    topk_weights, topk_ids = _make_topk(
+        num_tokens,
+        num_experts,
+        topk=8,
+        device=device,
+    )
+
+    actual = _routing_from_topk_medium_m(
+        topk_weights,
+        topk_ids,
+        num_experts=num_experts,
+        dtype=gate_dtype,
+    )
+    assert actual is not None
+    expected = _routing_from_topk(
+        topk_weights,
+        topk_ids,
+        num_experts=num_experts,
+        dtype=gate_dtype,
+    )
+    torch.cuda.synchronize()
+
+    _assert_metadata_equal(actual, expected)
+    _assert_valid_routing_permutation(
+        actual,
+        topk_weights,
+        topk_ids,
+        num_experts,
+        gate_dtype,
+    )
+
+
 def test_small_m_routing_from_topk_rejects_large_work(device: str) -> None:
     topk_weights, topk_ids = _make_topk(
         num_tokens=17,
@@ -122,6 +223,25 @@ def test_small_m_routing_from_topk_rejects_large_work(device: str) -> None:
 
     assert (
         _routing_from_topk_small_m(
+            topk_weights,
+            topk_ids,
+            num_experts=384,
+            dtype=torch.bfloat16,
+        )
+        is None
+    )
+
+
+def test_medium_m_routing_from_topk_rejects_large_work(device: str) -> None:
+    topk_weights, topk_ids = _make_topk(
+        num_tokens=513,
+        num_experts=384,
+        topk=8,
+        device=device,
+    )
+
+    assert (
+        _routing_from_topk_medium_m(
             topk_weights,
             topk_ids,
             num_experts=384,
