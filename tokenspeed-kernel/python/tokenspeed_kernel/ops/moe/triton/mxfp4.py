@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import dataclass
 from contextlib import contextmanager
 
 import tokenspeed_kernel
@@ -79,6 +80,21 @@ platform = current_platform()
 
 MXFP4_BLOCK = 32
 MXFP4_ACTIVATION_SCALE_LAYOUT = "linear"
+
+
+@dataclass(frozen=True)
+class _SortedMoEMetadata:
+    """Expert-sorted routing view for sorted-token MoE kernels."""
+
+    sorted_token_ids: torch.Tensor
+    sorted_weights: torch.Tensor
+    sorted_expert_ids: torch.Tensor
+    num_valid_ids: torch.Tensor
+    source_token_ids: torch.Tensor
+    scatter_indices: torch.Tensor
+    slice_sizes: torch.Tensor
+    slice_offsets: torch.Tensor
+    block_size: int
 
 
 @triton.jit(repr=lambda _: "_quantize_mxfp4_tokenspeed")
@@ -662,6 +678,50 @@ def _routing_from_local_topk(
             dtype=dtype,
         )
     return routed
+
+
+def _sorted_moe_metadata_from_routing(
+    ragged_metadata: RaggedTensorMetadata,
+    gather_indx: torch.Tensor,
+    scatter_indx: torch.Tensor,
+    gate_scal: torch.Tensor,
+    *,
+    block_size: int,
+) -> _SortedMoEMetadata:
+    if block_size not in RaggedTensorMetadata.block_sizes():
+        raise ValueError(
+            f"block_size must be one of {RaggedTensorMetadata.block_sizes()}, "
+            f"got {block_size}"
+        )
+    if gather_indx.shape != scatter_indx.shape or gather_indx.shape != gate_scal.shape:
+        raise ValueError(
+            "gather_indx, scatter_indx, and gate_scal must have matching shapes, "
+            f"got {tuple(gather_indx.shape)}, {tuple(scatter_indx.shape)}, "
+            f"and {tuple(gate_scal.shape)}"
+        )
+    if gather_indx.dtype != torch.int32 or scatter_indx.dtype != torch.int32:
+        raise ValueError("gather_indx and scatter_indx must be int32 tensors")
+    if ragged_metadata.slice_sizes is None or ragged_metadata.slice_offs is None:
+        raise ValueError("ragged metadata must include slice sizes and offsets")
+
+    num_valid = int(scatter_indx.numel())
+    num_valid_ids = torch.full(
+        (2,),
+        num_valid,
+        dtype=torch.int32,
+        device=scatter_indx.device,
+    )
+    return _SortedMoEMetadata(
+        sorted_token_ids=scatter_indx,
+        sorted_weights=gate_scal,
+        sorted_expert_ids=ragged_metadata.block_schedule(block_size),
+        num_valid_ids=num_valid_ids,
+        source_token_ids=gather_indx,
+        scatter_indices=scatter_indx,
+        slice_sizes=ragged_metadata.slice_sizes,
+        slice_offsets=ragged_metadata.slice_offs,
+        block_size=block_size,
+    )
 
 
 def _local_topk_for_ep(

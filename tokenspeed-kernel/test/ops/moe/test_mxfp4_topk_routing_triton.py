@@ -27,6 +27,7 @@ from tokenspeed_kernel.ops.moe.triton.mxfp4 import (
     _routing_from_topk,
     _routing_from_topk_medium_m,
     _routing_from_topk_small_m,
+    _sorted_moe_metadata_from_routing,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -136,6 +137,30 @@ def _assert_valid_routing_permutation(
                 dtype=routed_ids.dtype,
             ),
         )
+
+
+def _routing_from_topk_fast_path(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    *,
+    num_experts: int,
+    gate_dtype: torch.dtype,
+):
+    routed = _routing_from_topk_small_m(
+        topk_weights,
+        topk_ids,
+        num_experts=num_experts,
+        dtype=gate_dtype,
+    )
+    if routed is None:
+        routed = _routing_from_topk_medium_m(
+            topk_weights,
+            topk_ids,
+            num_experts=num_experts,
+            dtype=gate_dtype,
+        )
+    assert routed is not None
+    return routed
 
 
 @pytest.mark.parametrize("num_tokens", [0, 1, 8, 16])
@@ -275,6 +300,112 @@ def test_medium_m_routing_can_schedule_only_block16(device: str) -> None:
         384,
         torch.float32,
     )
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "block_size"),
+    [
+        (4, 16),
+        (128, 16),
+        (128, 32),
+    ],
+)
+def test_sorted_moe_metadata_view_matches_routing(
+    device: str,
+    num_tokens: int,
+    block_size: int,
+) -> None:
+    topk_weights, topk_ids = _make_topk(
+        num_tokens=num_tokens,
+        num_experts=384,
+        topk=8,
+        device=device,
+    )
+    metadata, gather, scatter, gate = _routing_from_topk_fast_path(
+        topk_weights,
+        topk_ids,
+        num_experts=384,
+        gate_dtype=torch.float32,
+    )
+    sorted_metadata = _sorted_moe_metadata_from_routing(
+        metadata,
+        gather,
+        scatter,
+        gate,
+        block_size=block_size,
+    )
+    torch.cuda.synchronize()
+
+    assert sorted_metadata.block_size == block_size
+    assert torch.equal(sorted_metadata.sorted_token_ids, scatter)
+    assert torch.equal(sorted_metadata.scatter_indices, scatter)
+    assert torch.equal(sorted_metadata.source_token_ids, gather)
+    torch.testing.assert_close(
+        sorted_metadata.sorted_weights,
+        gate,
+        rtol=0.0,
+        atol=0.0,
+    )
+    assert torch.equal(
+        sorted_metadata.sorted_expert_ids,
+        metadata.block_schedule(block_size),
+    )
+    assert torch.equal(sorted_metadata.slice_sizes, metadata.slice_sizes)
+    assert torch.equal(sorted_metadata.slice_offsets, metadata.slice_offs)
+    assert torch.equal(
+        sorted_metadata.num_valid_ids,
+        torch.full(
+            (2,),
+            topk_ids.numel(),
+            device=device,
+            dtype=torch.int32,
+        ),
+    )
+    assert torch.equal(
+        sorted_metadata.source_token_ids,
+        sorted_metadata.sorted_token_ids // topk_ids.shape[1],
+    )
+
+    flat_ids = topk_ids.reshape(-1)
+    routed_ids = flat_ids[sorted_metadata.sorted_token_ids.to(torch.long)]
+    for expert in range(384):
+        start = int(sorted_metadata.slice_offsets[expert].item())
+        stop = int(sorted_metadata.slice_offsets[expert + 1].item())
+        if start == stop:
+            continue
+        assert torch.equal(
+            routed_ids[start:stop],
+            torch.full(
+                (stop - start,),
+                expert,
+                device=device,
+                dtype=routed_ids.dtype,
+            ),
+        )
+
+
+def test_sorted_moe_metadata_rejects_unsupported_block_size(device: str) -> None:
+    topk_weights, topk_ids = _make_topk(
+        num_tokens=4,
+        num_experts=384,
+        topk=8,
+        device=device,
+    )
+    metadata, gather, scatter, gate = _routing_from_topk_fast_path(
+        topk_weights,
+        topk_ids,
+        num_experts=384,
+        gate_dtype=torch.float32,
+    )
+
+    with pytest.raises(ValueError, match="block_size must be one of"):
+        _sorted_moe_metadata_from_routing(
+            metadata,
+            gather,
+            scatter,
+            gate,
+            block_size=24,
+        )
 
 
 def test_small_m_routing_from_topk_rejects_large_work(device: str) -> None:
