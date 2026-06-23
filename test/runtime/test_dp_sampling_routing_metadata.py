@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
 from tokenspeed.runtime.execution.drafter import eagle as eagle_module
@@ -761,6 +762,96 @@ def test_glm_dsa_prefill_topk_uses_cpu_length_metadata(monkeypatch):
     assert captured["deepgemm_max_query_rows"] == (1024 * 1024) // (12 * 4)
     assert captured["deepgemm_chunk_max_seqlens"] == [12]
     assert captured["deepgemm_num_prefill_tokens"] == 5
+
+
+def test_glm_dsa_prefill_topk_slices_metadata_for_local_tp_rank(monkeypatch):
+    captured = {}
+
+    def fake_build_prefill_kv_workspace_slots(**kwargs):
+        captured["workspace_max_seq_len"] = kwargs["max_seq_len"]
+        captured["workspace_block_tables"] = kwargs["block_tables"].tolist()
+        captured["workspace_seq_lens"] = kwargs["seq_lens"].tolist()
+        return (
+            torch.arange(36, dtype=torch.int64),
+            torch.tensor([0, 15], dtype=torch.int64),
+        )
+
+    def fake_compute_prefill_topk_indices_deepgemm(self, **kwargs):
+        captured["deepgemm_prefix_lens"] = kwargs["prefix_lens"].tolist()
+        captured["deepgemm_extend_lens"] = kwargs["extend_lens"].tolist()
+        captured["deepgemm_seq_lens"] = kwargs["seq_lens"].tolist()
+        captured["deepgemm_max_seq_len"] = kwargs["max_seq_len"]
+        captured["deepgemm_max_query_rows"] = kwargs["max_query_rows"]
+        captured["deepgemm_chunk_max_seqlens"] = kwargs["prefill_chunk_max_seqlens"]
+        captured["deepgemm_num_prefill_tokens"] = kwargs["num_prefill_tokens"]
+        return "prefill-topk"
+
+    monkeypatch.setitem(
+        glm5_module.global_server_args_dict,
+        glm5_module._INDEXER_PREFILL_MAX_LOGITS_MB_ARG,
+        1,
+    )
+    monkeypatch.setitem(
+        glm5_module.global_server_args_dict,
+        "mapping",
+        Mapping(rank=2, world_size=4, attn_tp_size=4),
+    )
+    monkeypatch.setattr(
+        glm5_module,
+        "_build_prefill_kv_workspace_slots",
+        fake_build_prefill_kv_workspace_slots,
+    )
+    monkeypatch.setattr(
+        GlmMoeDsaAttention,
+        "_compute_prefill_topk_indices_deepgemm",
+        fake_compute_prefill_topk_indices_deepgemm,
+    )
+
+    # Flattened prefill rows have global request extents [0:5] and [5:7].
+    # For tp=4 the scattered counts are [2, 2, 2, 1], so rank 2 owns [4:6],
+    # crossing from the last token of request 0 to the first token of request 1.
+    chunk_meta = SimpleNamespace(
+        extend_prefix_lens=torch.tensor([100, 100], dtype=torch.int32),
+        extend_seq_lens=torch.tensor([100, 100], dtype=torch.int32),
+        extend_prefix_lens_cpu=torch.tensor([10, 20], dtype=torch.int32),
+        extend_seq_lens_cpu=torch.tensor([5, 2], dtype=torch.int32),
+        req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+    )
+
+    attn = GlmMoeDsaAttention.__new__(GlmMoeDsaAttention)
+    attn.index_topk = 3
+    ctx = ForwardContext(
+        attn_backend=SimpleNamespace(chunked_prefill_metadata=chunk_meta),
+        token_to_kv_pool=SimpleNamespace(page_size=64),
+        req_to_page=torch.tensor([[11, 12], [21, 22]], dtype=torch.int32),
+        bs=2,
+        num_extends=2,
+        input_num_tokens=7,
+        forward_mode=ForwardMode.EXTEND,
+    )
+    indexer_output = GlmDsaIndexerOutput(
+        query=torch.empty((2, 1, 1), dtype=torch.float32),
+        key=torch.empty((2, 1, 1), dtype=torch.float32),
+        weights=torch.empty((2, 1), dtype=torch.float32),
+    )
+
+    result = attn._compute_prefill_topk_indices(
+        indexer_output,
+        ctx,
+        num_prefill_tokens=2,
+    )
+
+    assert result == "prefill-topk"
+    assert captured["workspace_max_seq_len"] == 21
+    assert captured["workspace_block_tables"] == [[11], [21]]
+    assert captured["workspace_seq_lens"] == [15, 21]
+    assert captured["deepgemm_prefix_lens"] == [14, 20]
+    assert captured["deepgemm_extend_lens"] == [1, 1]
+    assert captured["deepgemm_seq_lens"] == [15, 21]
+    assert captured["deepgemm_max_seq_len"] == 21
+    assert captured["deepgemm_max_query_rows"] == (1024 * 1024) // (36 * 4)
+    assert captured["deepgemm_chunk_max_seqlens"] == [21]
+    assert captured["deepgemm_num_prefill_tokens"] == 2
 
 
 def _make_empty_local_glm_dsa_attention():

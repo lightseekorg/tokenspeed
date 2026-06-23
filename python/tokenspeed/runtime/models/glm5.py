@@ -227,6 +227,142 @@ def _glm_dsa_prefill_chunk_max_seqlens_cpu(
     return chunk_max_seqlens
 
 
+def _glm_dsa_scatter_token_counts(num_tokens: int, tp_size: int) -> list[int]:
+    tp_size = max(1, int(tp_size))
+    base, remainder = divmod(max(0, int(num_tokens)), tp_size)
+    return [base + (rank < remainder) for rank in range(tp_size)]
+
+
+def _glm_dsa_local_prefill_metadata(
+    *,
+    prefix_lens: torch.Tensor,
+    extend_lens: torch.Tensor,
+    prefix_lens_cpu: torch.Tensor | None,
+    extend_lens_cpu: torch.Tensor | None,
+    req_pool_indices: torch.Tensor,
+    num_prefill_tokens: int,
+    global_extend_token_count: int,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    if global_extend_token_count == num_prefill_tokens:
+        request_indices = torch.arange(
+            prefix_lens.numel(),
+            dtype=torch.int64,
+            device=req_pool_indices.device,
+        )
+        return (
+            prefix_lens,
+            extend_lens,
+            prefix_lens_cpu,
+            extend_lens_cpu,
+            req_pool_indices,
+            request_indices,
+        )
+
+    mapping = global_server_args_dict.get("mapping")
+    if mapping is None or not hasattr(mapping, "attn"):
+        raise RuntimeError(
+            "GLM DSA prefill token count mismatch: "
+            f"metadata={global_extend_token_count}, tokens={num_prefill_tokens}"
+        )
+
+    counts = _glm_dsa_scatter_token_counts(
+        global_extend_token_count,
+        int(mapping.attn.tp_size),
+    )
+    tp_rank = int(mapping.attn.tp_rank)
+    local_start = sum(counts[:tp_rank])
+    local_count = counts[tp_rank]
+    local_end = local_start + local_count
+    if local_count != num_prefill_tokens:
+        raise RuntimeError(
+            "GLM DSA local prefill token count mismatch: "
+            f"metadata={global_extend_token_count}, "
+            f"rank={tp_rank}, expected={local_count}, tokens={num_prefill_tokens}"
+        )
+
+    prefix_values = (
+        prefix_lens_cpu if prefix_lens_cpu is not None else prefix_lens.cpu()
+    ).tolist()
+    extend_values = (
+        extend_lens_cpu if extend_lens_cpu is not None else extend_lens.cpu()
+    ).tolist()
+    req_pool_values = req_pool_indices.cpu().tolist()
+    local_prefix_values: list[int] = []
+    local_extend_values: list[int] = []
+    local_req_pool_values: list[int] = []
+    local_request_values: list[int] = []
+
+    cursor = 0
+    for req_idx, extend_len in enumerate(extend_values):
+        extend_len = int(extend_len)
+        req_start = cursor
+        req_end = cursor + extend_len
+        cursor = req_end
+        segment_start = max(local_start, req_start)
+        segment_end = min(local_end, req_end)
+        if segment_start >= segment_end:
+            continue
+
+        offset_in_req = segment_start - req_start
+        local_prefix_values.append(int(prefix_values[req_idx]) + offset_in_req)
+        local_extend_values.append(segment_end - segment_start)
+        local_req_pool_values.append(int(req_pool_values[req_idx]))
+        local_request_values.append(req_idx)
+
+    if sum(local_extend_values) != num_prefill_tokens:
+        raise RuntimeError(
+            "GLM DSA local prefill metadata slice mismatch: "
+            f"rank={tp_rank}, tokens={num_prefill_tokens}, "
+            f"segments={local_extend_values}"
+        )
+
+    local_prefix_lens = torch.tensor(
+        local_prefix_values,
+        dtype=torch.int32,
+        device=prefix_lens.device,
+    )
+    local_extend_lens = torch.tensor(
+        local_extend_values,
+        dtype=torch.int32,
+        device=extend_lens.device,
+    )
+    local_prefix_lens_cpu = (
+        torch.tensor(local_prefix_values, dtype=torch.int32)
+        if prefix_lens_cpu is not None
+        else None
+    )
+    local_extend_lens_cpu = (
+        torch.tensor(local_extend_values, dtype=torch.int32)
+        if extend_lens_cpu is not None
+        else None
+    )
+    local_req_pool_indices = torch.tensor(
+        local_req_pool_values,
+        dtype=req_pool_indices.dtype,
+        device=req_pool_indices.device,
+    )
+    local_request_indices = torch.tensor(
+        local_request_values,
+        dtype=torch.int64,
+        device=req_pool_indices.device,
+    )
+    return (
+        local_prefix_lens,
+        local_extend_lens,
+        local_prefix_lens_cpu,
+        local_extend_lens_cpu,
+        local_req_pool_indices,
+        local_request_indices,
+    )
+
+
 def _glm_dsa_rope_scaling(
     rope_scaling: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
@@ -1276,12 +1412,26 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             if extend_lens_cpu is not None
             else int(extend_lens.sum().item())
         )
-        if extend_token_count != num_prefill_tokens:
-            raise RuntimeError(
-                "GLM DSA prefill token count mismatch: "
-                f"metadata={extend_token_count}, "
-                f"tokens={num_prefill_tokens}"
-            )
+        req_pool_indices = chunk_meta.req_pool_indices[: ctx.num_extends].long()
+        (
+            prefix_lens,
+            extend_lens,
+            prefix_lens_cpu,
+            extend_lens_cpu,
+            req_pool_indices,
+            request_indices,
+        ) = _glm_dsa_local_prefill_metadata(
+            prefix_lens=prefix_lens,
+            extend_lens=extend_lens,
+            prefix_lens_cpu=prefix_lens_cpu,
+            extend_lens_cpu=extend_lens_cpu,
+            req_pool_indices=req_pool_indices,
+            num_prefill_tokens=num_prefill_tokens,
+            global_extend_token_count=extend_token_count,
+        )
+        seq_lens = prefix_lens + extend_lens
+        if seq_lens.numel() == 0:
+            return None
         if ctx.req_to_page is None:
             raise RuntimeError("GLM DSA sparse prefill requires req_to_page metadata")
 
@@ -1310,8 +1460,12 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         max_pages = (max_seq_len + page_size - 1) // page_size
         block_tables_snapshot = getattr(ctx.attn_backend, "_prefill_block_tables", None)
         if block_tables_snapshot is None:
-            req_pool_indices = chunk_meta.req_pool_indices[: ctx.num_extends].long()
             block_tables_snapshot = ctx.req_to_page[req_pool_indices]
+        else:
+            block_tables_snapshot = block_tables_snapshot.index_select(
+                0,
+                request_indices.to(block_tables_snapshot.device),
+            )
         block_tables = block_tables_snapshot[:, :max_pages].to(
             device=indexer_output.query.device,
             dtype=torch.int32,

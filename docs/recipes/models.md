@@ -51,8 +51,10 @@ also excluded from expert-distribution recording. The GLM DSA decode top-k
 schedule cache is refreshed against the current MTP query width and visible
 lengths, and DSA prefill top-k uses scheduler CPU length mirrors for scalar
 planning, including chunk budgets and per-chunk max lengths, to avoid extra GPU
-synchronizations. The DSA KV cache pool currently does not support hierarchical
-kvstore, so pass `--disable-kvstore` for GLM5.2 DSA launches.
+synchronizations. Under attention TP, DSA prefill top-k slices global scheduler
+metadata to each rank's local prefill rows. The DSA KV cache pool currently
+does not support hierarchical kvstore, so pass `--disable-kvstore` for GLM5.2
+DSA launches.
 
 ```bash
 tokenspeed serve zai-org/GLM-5.2-FP8 \
