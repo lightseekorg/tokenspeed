@@ -646,7 +646,18 @@ class MHAAttnBackend(AttentionBackend):
             bs, spec_num_tokens, self.max_num_pages
         )
         expanded_page_table.copy_(page_table[:, None, :])
-        expanded_seq_lens.view(bs, spec_num_tokens).copy_(seq_lens[:, None])
+        # Clamp to max_context_len so the draft decode never asks the attention
+        # kernel for more than max_num_pages worth of page-table columns. The
+        # block-end length is prefix + spec_num_tokens, which can exceed
+        # max_context_len for a request near the context limit; without the
+        # clamp the kernel reads page_table[:, >= max_num_pages] out of bounds
+        # (CUDA illegal memory access). Mirrors fill_block_decode_seq_lens on the
+        # cuda-graph path (this eager path is taken by mixed prefill+decode
+        # batches even when cuda graphs are enabled).
+        expanded_seq_lens.view(bs, spec_num_tokens).copy_(
+            seq_lens.clamp(spec_num_tokens, self.max_context_len)[:, None]
+        )
+
 
 for _backend_name in _KERNEL_SOLUTION_BY_BACKEND:
     register_backend(_backend_name, {AttentionArch.MHA}, MHAAttnBackend)

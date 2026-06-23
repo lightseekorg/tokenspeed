@@ -152,6 +152,57 @@ class DFlash(BaseDrafter):
         self.lm_head = target_model.lm_head
         self.logits_processor = language_model.logits_processor
 
+    def _greedy_gather_capacity(self) -> int:
+        """Max element count for the greedy head's tensor-parallel all-gather
+        scratch: a full ``max_bs`` decode block.
+
+        The greedy head samples the last ``spec_num_tokens - 1`` block
+        positions per request and all-gathers them across the TP group, so the
+        worst case is ``tp_size * max_bs * (spec_num_tokens - 1)``.
+        """
+        tp_size = int(self.logits_processor.tp_size)
+        return tp_size * self.input_buffers.max_bs * max(self.spec_num_tokens - 1, 1)
+
+    def _ensure_greedy_gather_buffers(
+        self,
+        max_dtype: torch.dtype,
+        ids_dtype: torch.dtype,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Lazily create the greedy all-gather scratch ONCE at its maximum
+        capacity, then reuse it in place for every batch size.
+
+        Sizing to the max ``max_bs`` block (rather than growing per batch size)
+        is required for CUDA-graph correctness. Graphs are captured for
+        increasing batch sizes (``[1, 2, ..., max_bs]``); a buffer grown lazily
+        would be freed and reallocated when a larger bs needs more room, leaving
+        every smaller-bs graph captured earlier with an
+        ``all_gather_into_tensor`` recorded against freed memory. On replay
+        those small-bs decode steps read garbage (out-of-vocab) draft token ids,
+        which flow into the next verify forward's embedding lookup and trigger a
+        CUDA illegal memory access. A fixed max-capacity buffer is allocated
+        during warmup (before capture) and shared by every captured graph.
+
+        Returns the (max, id) scratch tensors; callers slice ``[:needed]``.
+        """
+        cap = self._greedy_gather_capacity()
+        if (
+            self._greedy_gathered_max is None
+            or self._greedy_gathered_ids is None
+            or self._greedy_gather_cap < cap
+            or self._greedy_gathered_max.dtype != max_dtype
+            or self._greedy_gathered_max.device != device
+            or self._greedy_gathered_ids.dtype != ids_dtype
+        ):
+            self._greedy_gathered_max = torch.empty(
+                (cap,), dtype=max_dtype, device=device
+            )
+            self._greedy_gathered_ids = torch.empty(
+                (cap,), dtype=ids_dtype, device=device
+            )
+            self._greedy_gather_cap = cap
+        return self._greedy_gathered_max, self._greedy_gathered_ids
+
     def _greedy_sample_from_vocab_parallel_head(
         self,
         hidden_states: torch.Tensor,
@@ -221,23 +272,11 @@ class DFlash(BaseDrafter):
             return global_ids.to(torch.int32)
 
         needed = tp_size * chunk_len
-        if (
-            self._greedy_gather_cap < needed
-            or self._greedy_gathered_max is None
-            or self._greedy_gathered_ids is None
-            or self._greedy_gathered_max.dtype != local_max.dtype
-            or self._greedy_gathered_max.device != hidden_states.device
-        ):
-            self._greedy_gathered_max = torch.empty(
-                (needed,), dtype=local_max.dtype, device=hidden_states.device
-            )
-            self._greedy_gathered_ids = torch.empty(
-                (needed,), dtype=global_ids.dtype, device=hidden_states.device
-            )
-            self._greedy_gather_cap = needed
-
-        gathered_max = self._greedy_gathered_max[:needed]
-        gathered_ids = self._greedy_gathered_ids[:needed]
+        gathered_max, gathered_ids = self._ensure_greedy_gather_buffers(
+            local_max.dtype, global_ids.dtype, hidden_states.device
+        )
+        gathered_max = gathered_max[:needed]
+        gathered_ids = gathered_ids[:needed]
         all_gather_into_tensor(
             gathered_max,
             local_max.contiguous(),
@@ -497,6 +536,12 @@ class DFlash(BaseDrafter):
             draft_hidden[:, 1:, :].reshape(-1, self.hidden_size)
         )
         next_tokens[:, 1:] = sampled.view(bs, self.spec_num_tokens - 1)
+        # Defense-in-depth: keep draft ids non-negative before they are written
+        # to future_input_map and embedded by the next verify forward, mirroring
+        # the EAGLE drafter's draft_ids.clamp_(min=0) guard. A negative id (the
+        # -1 NaN sentinel) would otherwise index the embedding table out of
+        # bounds (CUDA illegal memory access).
+        next_tokens.clamp_(min=0)
         return next_tokens
 
     @nvtx_range("drafter:dflash", color="purple")
