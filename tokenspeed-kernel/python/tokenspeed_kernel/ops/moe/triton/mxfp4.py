@@ -66,7 +66,10 @@ from triton_kernels.topk import topk
 
 # isort: off
 from tokenspeed_kernel.ops.quantization.triton import fp8_quantize
-from tokenspeed_kernel.thirdparty.triton import deepseek_v4_softplus_topk
+from tokenspeed_kernel.thirdparty.triton import (
+    deepseek_v4_softplus_topk,
+    moe_routing_from_topk_small_m,
+)
 
 platform = current_platform()
 
@@ -253,6 +256,65 @@ def _routing_from_topk(
     n_total_rows = int(sort_order.numel())
     ragged_metadata = make_ragged_tensor_metadata(col_sum, n_total_rows)
 
+    return ragged_metadata, gather_indx, scatter_indx, gate_scal
+
+
+def _small_m_topk_routing_supported(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_experts: int,
+) -> bool:
+    if not current_platform().is_amd:
+        return False
+    if topk_ids.ndim != 2 or topk_weights.shape != topk_ids.shape:
+        return False
+    if topk_ids.dtype not in (torch.int32, torch.int64):
+        return False
+    if not topk_ids.is_cuda or topk_ids.device != topk_weights.device:
+        return False
+    if num_experts <= 0 or num_experts > 1024:
+        return False
+    num_tokens, top_k = topk_ids.shape
+    if num_tokens > 16 or top_k <= 0:
+        return False
+    return num_tokens * top_k <= 128
+
+
+def _routing_from_topk_small_m(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    dtype: torch.dtype | None = None,
+) -> tuple[RaggedTensorMetadata, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    if not _small_m_topk_routing_supported(topk_weights, topk_ids, num_experts):
+        return None
+
+    if dtype is None:
+        dtype = topk_weights.dtype
+    n_total_rows = int(topk_ids.numel())
+    max_num_blocks = RaggedTensorMetadata.max_n_blocks(num_experts, n_total_rows)
+    (
+        slice_sizes,
+        slice_offs,
+        block_offs_data,
+        block_schedule_data,
+        gather_indx,
+        scatter_indx,
+        gate_scal,
+    ) = moe_routing_from_topk_small_m(
+        topk_weights,
+        topk_ids,
+        num_experts=num_experts,
+        gate_dtype=dtype,
+        num_block_sizes=len(RaggedTensorMetadata.block_sizes()),
+        max_num_blocks=max_num_blocks,
+    )
+    ragged_metadata = RaggedTensorMetadata(
+        slice_sizes,
+        slice_offs,
+        block_offs_data,
+        block_schedule_data,
+    )
     return ragged_metadata, gather_indx, scatter_indx, gate_scal
 
 
@@ -554,12 +616,22 @@ def triton_mxfp4_moe_apply(
             topk_ids,
             w,
         )
-        ragged_metadata, gather_indx, scatter_indx, gate_scal = _routing_from_topk(
-            topk_weights,
-            topk_ids,
-            num_experts=num_experts,
-            dtype=router_logits.dtype,
-        )
+        routed = None
+        if int(getattr(w, "ep_size", 1)) <= 1:
+            routed = _routing_from_topk_small_m(
+                topk_weights,
+                topk_ids,
+                num_experts=num_experts,
+                dtype=router_logits.dtype,
+            )
+        if routed is None:
+            routed = _routing_from_topk(
+                topk_weights,
+                topk_ids,
+                num_experts=num_experts,
+                dtype=router_logits.dtype,
+            )
+        ragged_metadata, gather_indx, scatter_indx, gate_scal = routed
     elif topk_weights is not None or topk_ids is not None:
         if topk_weights is None or topk_ids is None:
             raise ValueError("topk_weights and topk_ids must be provided together")

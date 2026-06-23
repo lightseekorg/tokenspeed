@@ -28,6 +28,7 @@ from tokenspeed_kernel._triton import tl, triton
 __all__ = [
     "deepseek_v4_softplus_topk",
     "minimax_biased_grouped_topk",
+    "moe_routing_from_topk_small_m",
     "stage_deepseek_v4_mega_moe_inputs",
 ]
 
@@ -344,6 +345,251 @@ def deepseek_v4_softplus_topk(
         num_warps=1,
     )
     return topk_weights, topk_ids
+
+
+@triton.jit
+def _moe_topk_metadata_small_m_kernel(
+    topk_ids_ptr,
+    slice_sizes_ptr,
+    slice_offs_ptr,
+    block_offs_ptr,
+    block_schedule_ptr,
+    ids_stride_m: tl.constexpr,
+    ids_stride_k: tl.constexpr,
+    block_offs_stride_b: tl.constexpr,
+    block_offs_stride_e: tl.constexpr,
+    block_schedule_stride_b: tl.constexpr,
+    block_schedule_stride_j: tl.constexpr,
+    num_tokens: tl.constexpr,
+    topk: tl.constexpr,
+    num_experts: tl.constexpr,
+    num_block_sizes: tl.constexpr,
+    max_num_blocks: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+    BLOCK_G: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+):
+    experts = tl.arange(0, BLOCK_E)
+    expert_mask = experts < num_experts
+
+    hist = tl.zeros([BLOCK_E], dtype=tl.int32)
+    for flat_idx in tl.static_range(0, BLOCK_G):
+        token_idx = flat_idx // topk
+        slot_idx = flat_idx - token_idx * topk
+        valid_flat = flat_idx < num_tokens * topk
+        expert = tl.load(
+            topk_ids_ptr + token_idx * ids_stride_m + slot_idx * ids_stride_k,
+            mask=valid_flat,
+            other=-1,
+        ).to(tl.int32)
+        hist += tl.where((experts == expert) & expert_mask & valid_flat, 1, 0)
+
+    inclusive = tl.cumsum(hist, 0)
+    slice_offs = inclusive - hist
+    total_rows = tl.sum(hist, 0)
+    tl.store(slice_sizes_ptr + experts, hist, mask=expert_mask)
+    tl.store(slice_offs_ptr + experts, slice_offs, mask=expert_mask)
+    tl.store(slice_offs_ptr + num_experts, total_rows)
+
+    has_block = hist > 0
+    block_count = has_block.to(tl.int32)
+    block_inclusive = tl.cumsum(block_count, 0)
+    block_offs = block_inclusive - block_count
+    total_blocks = tl.sum(block_count, 0)
+
+    schedule_pos = tl.arange(0, BLOCK_B)
+    schedule_mask = schedule_pos < max_num_blocks
+    fill_mask = schedule_mask & (schedule_pos >= total_blocks)
+    for block_idx in tl.static_range(0, num_block_sizes):
+        block_offs_base = block_offs_ptr + block_idx * block_offs_stride_b
+        tl.store(
+            block_offs_base + experts * block_offs_stride_e,
+            block_offs,
+            mask=expert_mask,
+        )
+        tl.store(block_offs_base + num_experts * block_offs_stride_e, total_blocks)
+
+        schedule_base = block_schedule_ptr + block_idx * block_schedule_stride_b
+        tl.store(
+            schedule_base + schedule_pos * block_schedule_stride_j,
+            -1,
+            mask=fill_mask,
+        )
+        tl.store(
+            schedule_base + block_offs * block_schedule_stride_j,
+            experts.to(tl.int32),
+            mask=expert_mask & has_block,
+        )
+
+
+@triton.jit
+def _moe_topk_indices_small_m_kernel(
+    topk_weights_ptr,
+    topk_ids_ptr,
+    slice_offs_ptr,
+    gather_indx_ptr,
+    scatter_indx_ptr,
+    gate_scal_ptr,
+    weights_stride_m: tl.constexpr,
+    weights_stride_k: tl.constexpr,
+    ids_stride_m: tl.constexpr,
+    ids_stride_k: tl.constexpr,
+    num_tokens: tl.constexpr,
+    topk: tl.constexpr,
+    num_experts: tl.constexpr,
+    BLOCK_G: tl.constexpr,
+):
+    flat = tl.arange(0, BLOCK_G)
+    valid = flat < num_tokens * topk
+    token_idx = flat // topk
+    slot_idx = flat - token_idx * topk
+
+    expert_ids = tl.load(
+        topk_ids_ptr + token_idx * ids_stride_m + slot_idx * ids_stride_k,
+        mask=valid,
+        other=-1,
+    ).to(tl.int32)
+    expert_valid = valid & (expert_ids >= 0) & (expert_ids < num_experts)
+
+    row_ids = tl.expand_dims(expert_ids, 1)
+    col_ids = tl.expand_dims(expert_ids, 0)
+    row_flat = tl.expand_dims(flat, 1)
+    col_flat = tl.expand_dims(flat, 0)
+    row_valid = tl.expand_dims(expert_valid, 1)
+    col_valid = tl.expand_dims(expert_valid, 0)
+    rank = tl.sum(
+        tl.where(
+            row_valid & col_valid & (row_ids == col_ids) & (col_flat < row_flat),
+            1,
+            0,
+        ),
+        axis=1,
+    )
+
+    slice_base = tl.load(slice_offs_ptr + expert_ids, mask=expert_valid, other=0)
+    sorted_pos = slice_base + rank
+    weights = tl.load(
+        topk_weights_ptr + token_idx * weights_stride_m + slot_idx * weights_stride_k,
+        mask=valid,
+        other=0.0,
+    )
+
+    tl.store(gather_indx_ptr + sorted_pos, token_idx.to(tl.int32), mask=expert_valid)
+    tl.store(scatter_indx_ptr + sorted_pos, flat.to(tl.int32), mask=expert_valid)
+    tl.store(gate_scal_ptr + sorted_pos, weights, mask=expert_valid)
+
+
+def moe_routing_from_topk_small_m(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    gate_dtype: torch.dtype,
+    num_block_sizes: int,
+    max_num_blocks: int,
+):
+    if topk_ids.ndim != 2:
+        raise ValueError(f"topk_ids must be rank-2, got {tuple(topk_ids.shape)}")
+    if topk_weights.shape != topk_ids.shape:
+        raise ValueError(
+            "topk_weights and topk_ids must have the same shape, got "
+            f"{tuple(topk_weights.shape)} and {tuple(topk_ids.shape)}"
+        )
+    if topk_ids.dtype not in (torch.int32, torch.int64):
+        raise ValueError(f"topk_ids must be int32 or int64, got {topk_ids.dtype}")
+
+    num_tokens, topk = topk_ids.shape
+    total_rows = num_tokens * topk
+    if num_tokens > 16 or total_rows > 128:
+        raise ValueError(
+            "small-M top-k routing metadata supports at most 16 tokens and "
+            f"128 routed rows, got {num_tokens} tokens and {total_rows} rows"
+        )
+    if num_experts <= 0 or num_experts > 1024:
+        raise ValueError(f"num_experts must be in [1, 1024], got {num_experts}")
+    if num_block_sizes <= 0 or max_num_blocks < 0:
+        raise ValueError(
+            "num_block_sizes must be positive and max_num_blocks must be nonnegative"
+        )
+
+    device = topk_ids.device
+
+    slice_sizes = torch.empty((num_experts,), dtype=torch.int32, device=device)
+    slice_offs = torch.empty((num_experts + 1,), dtype=torch.int32, device=device)
+    block_offs_data = torch.empty(
+        (num_block_sizes, num_experts + 1), dtype=torch.int32, device=device
+    )
+    block_schedule_data = torch.empty(
+        (num_block_sizes, max_num_blocks), dtype=torch.int32, device=device
+    )
+    gather_indx = torch.empty((total_rows,), dtype=torch.int32, device=device)
+    scatter_indx = torch.empty((total_rows,), dtype=torch.int32, device=device)
+    gate_scal = torch.empty((total_rows,), dtype=gate_dtype, device=device)
+
+    if total_rows == 0:
+        slice_sizes.zero_()
+        slice_offs.zero_()
+        block_offs_data.zero_()
+        return (
+            slice_sizes,
+            slice_offs,
+            block_offs_data,
+            block_schedule_data,
+            gather_indx,
+            scatter_indx,
+            gate_scal,
+        )
+
+    block_g = triton.next_power_of_2(total_rows)
+    block_e = triton.next_power_of_2(num_experts)
+    block_b = triton.next_power_of_2(max(1, max_num_blocks))
+    _moe_topk_metadata_small_m_kernel[(1,)](
+        topk_ids,
+        slice_sizes,
+        slice_offs,
+        block_offs_data,
+        block_schedule_data,
+        topk_ids.stride(0),
+        topk_ids.stride(1),
+        block_offs_data.stride(0),
+        block_offs_data.stride(1),
+        block_schedule_data.stride(0),
+        block_schedule_data.stride(1),
+        num_tokens=num_tokens,
+        topk=topk,
+        num_experts=num_experts,
+        num_block_sizes=num_block_sizes,
+        max_num_blocks=max_num_blocks,
+        BLOCK_E=block_e,
+        BLOCK_G=block_g,
+        BLOCK_B=block_b,
+        num_warps=4,
+    )
+    _moe_topk_indices_small_m_kernel[(1,)](
+        topk_weights,
+        topk_ids,
+        slice_offs,
+        gather_indx,
+        scatter_indx,
+        gate_scal,
+        topk_weights.stride(0),
+        topk_weights.stride(1),
+        topk_ids.stride(0),
+        topk_ids.stride(1),
+        num_tokens=num_tokens,
+        topk=topk,
+        num_experts=num_experts,
+        BLOCK_G=block_g,
+        num_warps=4,
+    )
+    return (
+        slice_sizes,
+        slice_offs,
+        block_offs_data,
+        block_schedule_data,
+        gather_indx,
+        scatter_indx,
+        gate_scal,
+    )
 
 
 @triton.jit
