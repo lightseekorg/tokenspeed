@@ -112,17 +112,17 @@ def _workspace_indices_to_kv_slots(
 ) -> torch.Tensor:
     if kv_workspace_slots is None:
         return workspace_indices.to(torch.int32)
-    if workspace_indices.numel() == 0:
+    if workspace_indices.numel() == 0 or kv_workspace_slots.numel() == 0:
         return workspace_indices.to(torch.int32)
 
     flat_indices = workspace_indices.reshape(-1)
     valid = flat_indices >= 0
-    flat_slots = flat_indices.to(torch.int64)
-    if valid.any():
-        flat_slots[valid] = kv_workspace_slots.to(
-            device=workspace_indices.device,
-            dtype=torch.int64,
-        ).index_select(0, flat_slots[valid])
+    safe_indices = flat_indices.clamp_min(0).to(torch.int64)
+    mapped_slots = kv_workspace_slots.to(
+        device=workspace_indices.device,
+        dtype=torch.int64,
+    ).index_select(0, safe_indices)
+    flat_slots = torch.where(valid, mapped_slots, flat_indices.to(torch.int64))
     return flat_slots.view_as(workspace_indices).to(torch.int32)
 
 
