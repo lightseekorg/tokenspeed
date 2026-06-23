@@ -15,7 +15,8 @@ COPY . /workspace
 RUN apt-get update && apt-get install -y --no-install-recommends libssl-dev libopenmpi-dev libnuma1 && \
     rm -rf /var/lib/apt/lists/*
 
-RUN MAX_JOBS=${MAX_JOBS} FLASHINFER_CUDA_ARCH_LIST="9.0a 10.0a" TOKENSPEED_KERNEL_BACKEND=cuda \
+ARG CUDA_ARCH_LIST="9.0a 10.0a"
+RUN MAX_JOBS=${MAX_JOBS} FLASHINFER_CUDA_ARCH_LIST="${CUDA_ARCH_LIST}" TOKENSPEED_KERNEL_BACKEND=cuda \
     pip install tokenspeed-kernel/python/ --no-build-isolation && \
     pip install tokenspeed-scheduler/ && \
     pip install "./python" --no-build-isolation
