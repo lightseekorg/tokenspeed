@@ -940,6 +940,139 @@ def test_glm_dsa_forward_keeps_carried_topk_when_local_window_empty():
     assert ctx.dsa_decode_topk is carried_decode_topk
 
 
+def test_glm_dsa_forward_prefill_window_uses_communicated_query_rows():
+    captured = {}
+    local_rows = 4
+    attn_rows = 28
+    qkv_width = 5
+
+    attn = GlmMoeDsaAttention.__new__(GlmMoeDsaAttention)
+    attn.q_lora_rank = 2
+    attn.kv_lora_rank = 2
+    attn.qk_rope_head_dim = 1
+    attn.num_local_heads = 1
+    attn.v_head_dim = 2
+    attn.is_nextn = False
+    attn.skip_indexer_topk = False
+    attn.index_topk = 3
+    attn.attn_mqa = SimpleNamespace(layer_id=3)
+
+    attn.fused_qkv_a_proj_with_mqa = (
+        lambda hidden_states, block_scale, output_dtype: torch.empty(
+            (hidden_states.shape[0], qkv_width),
+            dtype=output_dtype,
+        )
+    )
+    attn.fused_qk_layernorm = lambda **kwargs: kwargs["output_q_a"].zero_()
+    attn.q_b_proj = lambda q_norm: (torch.empty((q_norm.shape[0], 2)), None)
+    attn.o_proj = lambda attn_output: (torch.empty((attn_output.shape[0], 4)), None)
+
+    class Indexer:
+        def __call__(self, indexer_hidden_states, q_lora, positions):
+            captured["indexer_rows"] = (
+                indexer_hidden_states.shape[0],
+                q_lora.shape[0],
+                positions.shape[0],
+            )
+            return GlmDsaIndexerOutput(
+                query=torch.empty((q_lora.shape[0], 1, 1)),
+                key=torch.empty((positions.shape[0], 1, 1)),
+                weights=torch.ones((q_lora.shape[0], 1)),
+            )
+
+    attn.indexer = Indexer()
+
+    def fake_compute_prefill_topk_indices(indexer_output, ctx, num_prefill_tokens):
+        captured["topk_rows"] = (
+            indexer_output.query.shape[0],
+            num_prefill_tokens,
+        )
+        return GlmDsaPrefillTopK(
+            workspace_indices=torch.empty((num_prefill_tokens, 3), dtype=torch.int32),
+            topk_lens=torch.ones(num_prefill_tokens, dtype=torch.int32),
+            block_tables=torch.empty((1, 1), dtype=torch.int32),
+            seq_lens=torch.tensor([num_prefill_tokens], dtype=torch.int32),
+            max_seq_len=num_prefill_tokens,
+            kv_workspace_slots=torch.arange(num_prefill_tokens, dtype=torch.int64),
+        )
+
+    def fake_forward_sparse_prefill(
+        positions,
+        q,
+        latent_cache,
+        ctx,
+        out_cache_loc,
+        output,
+        *,
+        prefill_topk,
+    ):
+        captured["sparse_rows"] = (
+            positions.shape[0],
+            q.shape[0],
+            latent_cache.shape[0],
+            out_cache_loc.shape[0],
+            output.shape[0],
+            prefill_topk.workspace_indices.shape[0],
+            ctx.input_num_tokens,
+        )
+        output.zero_()
+        return output
+
+    class TokenPool:
+        page_size = 64
+
+        @staticmethod
+        def set_index_k_buffer(layer_id, out_cache_loc, index_k):
+            captured["index_k_rows"] = (
+                layer_id,
+                out_cache_loc.shape[0],
+                index_k.shape[0],
+            )
+
+    class CommManager:
+        @staticmethod
+        def pre_attn_comm(tensor, ctx):
+            del ctx
+            return torch.empty((attn_rows, tensor.shape[1]), dtype=tensor.dtype)
+
+    attn._compute_prefill_topk_indices = fake_compute_prefill_topk_indices
+    attn.forward_dsa_sparse_prefill = fake_forward_sparse_prefill
+    attn.forward_absorb = lambda *args, **kwargs: pytest.fail(
+        "extend-only prefill should not call decode"
+    )
+
+    ctx = ForwardContext(
+        attn_backend=SimpleNamespace(forward_decode_metadata=None),
+        token_to_kv_pool=TokenPool(),
+        bs=1,
+        num_extends=1,
+        input_num_tokens=attn_rows,
+        forward_mode=ForwardMode.EXTEND,
+    )
+
+    out = attn.forward(
+        positions=torch.arange(attn_rows, dtype=torch.int64),
+        hidden_states=torch.empty((local_rows, 4)),
+        ctx=ctx,
+        out_cache_loc=torch.arange(attn_rows, dtype=torch.int64),
+        comm_manager=CommManager(),
+    )
+
+    assert out.shape == (attn_rows, 4)
+    assert captured["indexer_rows"] == (attn_rows, attn_rows, attn_rows)
+    assert captured["index_k_rows"] == (3, attn_rows, attn_rows)
+    assert captured["topk_rows"] == (attn_rows, attn_rows)
+    assert captured["sparse_rows"] == (
+        attn_rows,
+        attn_rows,
+        attn_rows,
+        attn_rows,
+        attn_rows,
+        attn_rows,
+        attn_rows,
+    )
+
+
 def test_glm_dsa_prefill_chunk_max_seqlens_use_request_order_cpu():
     chunk_maxes = glm5_module._glm_dsa_prefill_chunk_max_seqlens_cpu(
         torch.tensor([7, 1, 20], dtype=torch.int32),

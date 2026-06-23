@@ -1718,10 +1718,11 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             )
 
         decode_metadata = getattr(ctx.attn_backend, "forward_decode_metadata", None)
+        num_attn_tokens = int(q_norm.shape[0])
         decode_window = self._resolve_decode_window(
             ctx,
             decode_metadata,
-            total_tokens=hidden_states.shape[0],
+            total_tokens=num_attn_tokens,
         )
         num_decode_tokens = decode_window.num_tokens
         num_prefill_tokens = decode_window.start
@@ -1756,8 +1757,8 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             full_context_decode_topk = (
                 self._try_compute_decode_full_context_topk_indices(
                     ctx,
-                    num_tokens=hidden_states.shape[0],
-                    device=hidden_states.device,
+                    num_tokens=num_attn_tokens,
+                    device=q_norm.device,
                 )
                 if should_compute_indexer
                 else None
