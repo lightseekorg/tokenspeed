@@ -57,7 +57,7 @@ RUNNER_SM_PREFIXES = (
 
 AMD_RUNNER_PREFIXES = ("amd-mi35x-", "amd-mi355-", "amd-mi350-")
 GB200_RUNNER_PREFIXES = ("gb200",)
-NVIDIA_GPU_CLEANUP_RUNNER_PREFIXES = ("gb200", "b300")
+NVIDIA_GPU_CLEANUP_RUNNER_PREFIXES = ("b200", "gb200", "b300")
 PERF_DIAGNOSTIC_RUNNERS = ("b300-4gpu",)
 
 
@@ -1149,7 +1149,11 @@ def write_result(path: str | None, payload: Dict[str, Any]) -> None:
     result_path.write_text(json.dumps(payload, indent=2) + "\n")
 
 
-def poll_readiness(ready: Dict[str, Any], dry_run: bool) -> None:
+def poll_readiness(
+    ready: Dict[str, Any],
+    dry_run: bool,
+    server_process: subprocess.Popen[str] | None = None,
+) -> None:
     url = str(ready["url"])
     timeout_seconds = int(ready.get("timeout", 600))
     interval_seconds = int(ready.get("interval", 10))
@@ -1161,6 +1165,13 @@ def poll_readiness(ready: Dict[str, Any], dry_run: bool) -> None:
 
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
+        if server_process is not None:
+            returncode = server_process.poll()
+            if returncode is not None:
+                raise RuntimeError(
+                    "server process exited before readiness "
+                    f"with return code {returncode}: {url}"
+                )
         try:
             with urlopen(url, timeout=5) as response:
                 if response.status == expected_status:
@@ -1250,7 +1261,17 @@ def get_stage_commands(task: Dict[str, Any]) -> List[tuple[str, Any]]:
                 raise ValueError(f"{task_type}.install must be a string list")
             stages.append((f"{task_type}.install", section_install))
         if section.get("command"):
-            stages.append((task_type, [section["command"]]))
+            command = section["command"]
+            timeout_seconds = section.get("timeout")
+            if timeout_seconds is not None:
+                timeout_seconds = int(timeout_seconds)
+                if timeout_seconds <= 0:
+                    raise ValueError(f"{task_type}.timeout must be positive")
+                command = (
+                    f"timeout --kill-after=60s {timeout_seconds}s "
+                    f"bash -lc {shlex.quote(command)}"
+                )
+            stages.append((task_type, [command]))
         return stages
 
     raise ValueError(f"unsupported task type: {task_type}")
@@ -1387,7 +1408,7 @@ def execute_task(
                         repo_root,
                         dry_run,
                     )
-                poll_readiness(stage_payload["ready"], dry_run)
+                poll_readiness(stage_payload["ready"], dry_run, server_process)
                 if enable_perf_diagnostics:
                     run_perf_diagnostics(
                         "after server ready", runner_env, repo_root, dry_run

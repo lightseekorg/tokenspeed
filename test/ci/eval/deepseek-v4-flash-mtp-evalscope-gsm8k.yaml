@@ -37,6 +37,7 @@ server:
     timeout: 1800
     interval: 10
 eval:
+  timeout: 1800
   install:
     - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
   command: >-

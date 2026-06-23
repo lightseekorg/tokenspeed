@@ -1,4 +1,5 @@
 import re
+import shlex
 import textwrap
 from pathlib import Path
 
@@ -13,8 +14,10 @@ from pipeline import (
     extract_perf_summary_rows,
     format_perf_reference_markdown_table,
     format_perf_reference_table,
+    get_stage_commands,
     is_amd_runner,
     is_gb200_runner,
+    poll_readiness,
     resolve_score_threshold_for_runner,
     should_run_nvidia_gpu_cleanup,
     validate_task,
@@ -58,19 +61,66 @@ def test_amd_runner_prefixes_cover_legacy_and_arc_labels():
     assert not is_amd_runner("gb200-4gpu-perf")
 
 
-def test_nvidia_gpu_cleanup_runner_prefixes_cover_gb200_and_b300():
+def test_nvidia_gpu_cleanup_runner_prefixes_cover_b200_gb200_and_b300():
     assert is_gb200_runner("gb200-1gpu")
     assert is_gb200_runner("gb200-4gpu-perf")
     assert not is_gb200_runner("b300-4gpu")
 
     assert should_run_nvidia_gpu_cleanup("gb200-1gpu")
     assert should_run_nvidia_gpu_cleanup("gb200-4gpu-perf")
+    assert should_run_nvidia_gpu_cleanup("b200-4gpu")
+    assert should_run_nvidia_gpu_cleanup("b200-8gpu")
     assert should_run_nvidia_gpu_cleanup("b300-4gpu")
-    assert not should_run_nvidia_gpu_cleanup("b200-4gpu")
     assert not should_run_nvidia_gpu_cleanup("h100-1gpu")
     assert not should_run_nvidia_gpu_cleanup("amd-mi35x-2gpu-test")
     assert not should_run_nvidia_gpu_cleanup("amd-mi355-1gpu-bench")
     assert not should_run_nvidia_gpu_cleanup("amd-mi350-1gpu-bench")
+
+
+def test_nvidia_cleanup_script_handles_dirty_memory_with_aggressive_cleanup():
+    script = Path("test/ci_system/cleanup_nvidia_gpu_state.sh").read_text()
+
+    assert "TOKENSPEED_NVIDIA_GPU_DIRTY_MEMORY_THRESHOLD_PERCENT:-5" in script
+    assert "TOKENSPEED_NVIDIA_GPU_RESET_DIRTY_MEMORY:-1" in script
+    assert "TOKENSPEED_NVIDIA_GPU_FAIL_ON_DIRTY_MEMORY:-1" in script
+    assert "_discover_aggressive_gpu_pids" in script
+    assert "sudo -n fuser" in script
+    assert "Dirty GPU memory detected; discovering device holders" in script
+    assert "_reset_dirty_gpus" in script
+    assert "nvidia-smi --gpu-reset -i" in script
+    assert "refusing to start CI task" in script
+    assert '_kill_gpu_pids "' in script and "aggressive_gpu_pids" in script
+
+
+def test_poll_readiness_fails_when_server_exits_before_ready():
+    class ExitedProcess:
+        def poll(self):
+            return 7
+
+    with pytest.raises(
+        RuntimeError, match="server process exited before readiness with return code 7"
+    ):
+        poll_readiness(
+            {"url": "http://127.0.0.1:9/readiness", "timeout": 30},
+            dry_run=False,
+            server_process=ExitedProcess(),
+        )
+
+
+def test_eval_command_timeout_wraps_command():
+    command = "echo 'hello' && sleep 1"
+    stages = dict(
+        get_stage_commands(
+            {
+                "type": "eval",
+                "eval": {"command": command, "timeout": 30},
+            }
+        )
+    )
+
+    assert stages["eval"] == [
+        f"timeout --kill-after=60s 30s bash -lc {shlex.quote(command)}"
+    ]
 
 
 def test_extract_evalscope_score_from_pipe_table():
