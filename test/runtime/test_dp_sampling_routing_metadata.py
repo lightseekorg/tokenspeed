@@ -763,7 +763,7 @@ def test_glm_dsa_prefill_topk_uses_cpu_length_metadata(monkeypatch):
     assert captured["deepgemm_num_prefill_tokens"] == 5
 
 
-def test_glm_dsa_forward_skips_sparse_prefill_when_local_prefill_empty():
+def _make_empty_local_glm_dsa_attention():
     attn = GlmMoeDsaAttention.__new__(GlmMoeDsaAttention)
     attn.q_lora_rank = 2
     attn.kv_lora_rank = 2
@@ -788,6 +788,11 @@ def test_glm_dsa_forward_skips_sparse_prefill_when_local_prefill_empty():
     attn.forward_absorb = lambda *args, **kwargs: pytest.fail(
         "local empty prefill should not call decode"
     )
+    return attn
+
+
+def test_glm_dsa_forward_skips_sparse_prefill_when_local_prefill_empty():
+    attn = _make_empty_local_glm_dsa_attention()
 
     ctx = ForwardContext(
         attn_backend=SimpleNamespace(forward_decode_metadata=None),
@@ -809,6 +814,39 @@ def test_glm_dsa_forward_skips_sparse_prefill_when_local_prefill_empty():
 
     assert out.shape == (0, 4)
     assert ctx.dsa_prefill_topk is None
+
+
+def test_glm_dsa_forward_keeps_carried_topk_when_local_window_empty():
+    attn = _make_empty_local_glm_dsa_attention()
+    carried_prefill_topk = object()
+    carried_decode_topk = GlmDsaDecodeTopK(
+        topk_indices=torch.empty((0, 0), dtype=torch.int32),
+        topk_lens=torch.empty(0, dtype=torch.int32),
+    )
+
+    ctx = ForwardContext(
+        attn_backend=SimpleNamespace(forward_decode_metadata=None),
+        token_to_kv_pool=SimpleNamespace(),
+        bs=1,
+        num_extends=1,
+        input_num_tokens=0,
+        forward_mode=ForwardMode.EXTEND,
+        dsa_prefill_topk=carried_prefill_topk,
+        dsa_decode_topk=carried_decode_topk,
+    )
+    comm_manager = SimpleNamespace(pre_attn_comm=lambda tensor, ctx: tensor)
+
+    out = attn.forward(
+        positions=torch.empty(0, dtype=torch.int64),
+        hidden_states=torch.empty((0, 4)),
+        ctx=ctx,
+        out_cache_loc=torch.empty(0, dtype=torch.int64),
+        comm_manager=comm_manager,
+    )
+
+    assert out.shape == (0, 4)
+    assert ctx.dsa_prefill_topk is carried_prefill_topk
+    assert ctx.dsa_decode_topk is carried_decode_topk
 
 
 def test_glm_dsa_prefill_chunk_max_seqlens_use_request_order_cpu():

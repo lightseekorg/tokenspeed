@@ -1640,8 +1640,14 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             decode_topk = full_context_decode_topk
             if decode_topk is None and indexer_output is not None:
                 decode_topk = self._compute_decode_topk_indices(indexer_output, ctx)
-            ctx.dsa_prefill_topk = prefill_topk
-            ctx.dsa_decode_topk = decode_topk
+            if prefill_topk is not None or num_prefill_tokens > 0:
+                ctx.dsa_prefill_topk = prefill_topk
+            else:
+                prefill_topk = carried_prefill_topk
+            if decode_topk is not None or num_decode_tokens > 0:
+                ctx.dsa_decode_topk = decode_topk
+            else:
+                decode_topk = carried_decode_topk
         attn_output = torch.empty(
             q.size(0),
             self.num_local_heads * self.v_head_dim,
@@ -1659,8 +1665,20 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 forward_mode=ForwardMode.EXTEND,
             )
             if prefill_topk is None:
+                chunk_meta = getattr(ctx.attn_backend, "chunked_prefill_metadata", None)
                 raise RuntimeError(
-                    "GLM DSA sparse prefill requires computed top-k indices."
+                    "GLM DSA sparse prefill requires computed top-k indices "
+                    f"(layer_id={getattr(self.attn_mqa, 'layer_id', None)}, "
+                    f"skip_indexer_topk={self.skip_indexer_topk}, "
+                    f"is_nextn={self.is_nextn}, "
+                    f"indexer_output={indexer_output is not None}, "
+                    f"carried_prefill_topk={carried_prefill_topk is not None}, "
+                    f"forward_mode={ctx.forward_mode}, "
+                    f"ctx_num_extends={ctx.num_extends}, "
+                    f"num_prefill_tokens={num_prefill_tokens}, "
+                    f"hidden_rows={hidden_states.shape[0]}, "
+                    f"has_set_index_k={hasattr(ctx.token_to_kv_pool, 'set_index_k_buffer')}, "
+                    f"chunk_meta={chunk_meta is not None})"
                 )
             self.forward_dsa_sparse_prefill(
                 positions[:num_prefill_tokens],
