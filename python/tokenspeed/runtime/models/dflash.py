@@ -104,12 +104,19 @@ class DFlashAttention(nn.Module):
         eps = float(getattr(config, "rms_norm_eps", 1e-6))
         self.q_norm = RMSNorm(self.head_dim, eps=eps)
         self.k_norm = RMSNorm(self.head_dim, eps=eps)
+        rope_parameters = getattr(config, "rope_parameters", None)
+        if rope_parameters is not None:
+            rope_theta = float(rope_parameters["rope_theta"])
+            rope_scaling = rope_parameters
+        else:
+            rope_theta = float(getattr(config, "rope_theta", 1000000))
+            rope_scaling = getattr(config, "rope_scaling", None)
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
             max_position=int(getattr(config, "max_position_embeddings", 32768)),
-            base=float(getattr(config, "rope_theta", 1000000)),
-            rope_scaling=getattr(config, "rope_scaling", None),
+            base=rope_theta,
+            rope_scaling=rope_scaling,
         )
 
         sliding_window, causal = _get_dflash_layer_attention_params(config, layer_id)
