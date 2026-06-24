@@ -14,7 +14,8 @@ on:
         type: boolean
 
 permissions:
-  contents: write
+  contents: read
+  id-token: write
 
 concurrency:
   group: ${{ github.workflow }}
@@ -82,7 +83,7 @@ jobs:
           path: dist/*
 
   release:
-    name: Create GitHub release
+    name: Create wheelhouse release
     needs: [metadata, build]
     runs-on: ubuntu-latest
     steps:
@@ -98,22 +99,42 @@ jobs:
 
       - name: Create or update GitHub release
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+          RELEASE_REPOSITORY: lightseekorg/whl
           TAG_NAME: ${{ needs.metadata.outputs.tag_name }}
           VERSION: ${{ needs.metadata.outputs.version }}
           PRERELEASE: ${{ inputs.prerelease }}
+          SOURCE_SHA: ${{ github.sha }}
         run: |
           prerelease_args=()
           if [ "$PRERELEASE" = "true" ]; then
             prerelease_args+=(--prerelease)
           fi
 
-          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
-            gh release upload "$TAG_NAME" dist/* --clobber
+          if gh release view "$TAG_NAME" --repo "$RELEASE_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG_NAME" dist/* --repo "$RELEASE_REPOSITORY" --clobber
           else
             gh release create "$TAG_NAME" dist/* \
-              --target "$GITHUB_SHA" \
+              --repo "$RELEASE_REPOSITORY" \
               --title "tokenspeed-kernel-amd ${VERSION}" \
-              --notes "tokenspeed-kernel-amd ${VERSION}" \
+              --notes "tokenspeed-kernel-amd ${VERSION} built from lightseekorg/tokenspeed@${SOURCE_SHA}" \
               "${prerelease_args[@]}"
           fi
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: [metadata, build]
+    runs-on: ubuntu-latest
+    environment: pypi
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: tokenspeed-kernel-amd-*
+          merge-multiple: true
+
+      - name: Publish distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
