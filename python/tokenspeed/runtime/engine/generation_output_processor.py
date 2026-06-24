@@ -204,6 +204,11 @@ class RequestState:
             mm.mrope_positions, target_len - current_len
         )
 
+    def release_pending_multimodal_features(self) -> None:
+        mm = self.multimodal_inputs
+        if mm is not None and hasattr(mm, "release_shm_features"):
+            mm.release_shm_features()
+
     def init_incremental_detokenize(self):
         """Return (all_ids_from_surr_offset, read_offset_relative_to_surr)."""
         if self._surr_offset is None or self._read_offset is None:
@@ -392,6 +397,7 @@ class OutputProcesser:
             state.finished_output = False
             self.stream_output([rid], [state])
         finally:
+            state.release_pending_multimodal_features()
             self.rid_to_state.pop(rid, None)
             # This path replaces register() for grammar-aborted rids —
             # drop any queued abort marker so pending_aborts doesn't leak
@@ -669,6 +675,7 @@ class OutputProcesser:
                 if request_state.abort_notify_client:
                     stream_out_rids.append(rid)
                     stream_out_states.append(request_state)
+                request_state.release_pending_multimodal_features()
                 self.rid_to_state.pop(rid)
                 continue
 
@@ -687,6 +694,7 @@ class OutputProcesser:
                 request_changes.append(
                     make_abort_event(rid) if nan_detected else make_finish_event(rid)
                 )
+                request_state.release_pending_multimodal_features()
                 self.rid_to_state.pop(rid)
             else:
                 stream_out_rids.append(rid)
@@ -738,6 +746,7 @@ class OutputProcesser:
         if req_id not in self.rid_to_state:
             return []
         rs = self.rid_to_state.pop(req_id)
+        rs.release_pending_multimodal_features()
 
         # Ensure a finish reason is set so TokenizerManager marks the request done.
         if not rs.finished:

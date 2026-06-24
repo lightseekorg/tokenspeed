@@ -70,7 +70,7 @@ def test_deepseek_v4_swa_slot_mapping_prefers_draft_prefill_metadata():
         cache=cache,
     )
     ctx = SimpleNamespace(
-        forward_mode=ForwardMode.DRAFT_EXTEND,
+        forward_mode=ForwardMode.DECODE,
         input_num_tokens=5,
         attn_backend=SimpleNamespace(
             forward_metadata=decode_metadata,
@@ -101,7 +101,7 @@ def test_deepseek_v4_swa_slot_mapping_falls_back_for_incompatible_draft_metadata
         ),
     )
     ctx = SimpleNamespace(
-        forward_mode=ForwardMode.DRAFT_EXTEND,
+        forward_mode=ForwardMode.DECODE,
         input_num_tokens=5,
         attn_backend=SimpleNamespace(forward_metadata=metadata),
         token_to_kv_pool=SimpleNamespace(swa_block_size=2),

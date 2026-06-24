@@ -89,15 +89,38 @@ class MultimodalDataItem:
             return self.__dict__["model_specific_data"][name]
         raise AttributeError(f"'{self.__class__.__name__}' has no attribute '{name}'")
 
-    def set_pad_value(self):
-        if self.pad_value is not None:
-            return
+    def ensure_hash(self):
+        """Resolve ``self.hash`` to a concrete content id, lazily.
 
+        The hash is resolved on demand rather than at construction because it
+        is usually supplied by the caller, a SHM-backed feature cannot be
+        hashed here without reading shared memory, and hashing inline bytes is
+        only worth doing once the value is actually needed.
+
+        Resolution order:
+          * ``TOKENSPEED_MM_SKIP_COMPUTE_HASH`` -> a random id (dedup disabled);
+          * an already-set hash (e.g. the gateway-provided ``content_hash`` for
+            image/video) is kept as-is, no recompute;
+          * inline features the gateway does not hash (e.g. audio) are hashed
+            in-engine via ``hash_feature``;
+          * SHM-backed features must carry a caller-provided hash, else raise --
+            we cannot hash a handle without reading shared memory.
+        """
         if envs.TOKENSPEED_MM_SKIP_COMPUTE_HASH.get():
             self.hash = uuid.uuid4().int
         elif self.hash is None:
+            if isinstance(self.feature, ShmTensorHandle):
+                raise ValueError(
+                    "SHM-backed multimodal items must carry content hash or "
+                    "pad_value before TokenSpeed consumes them"
+                )
             self.hash = hash_feature(self.feature)
         assert self.hash is not None
+
+    def set_pad_value(self):
+        if self.pad_value is not None:
+            return
+        self.ensure_hash()
         self.pad_value = _MM_PAD_BASE + (self.hash & _MM_PAD_HASH_MASK)
 
     def is_modality(self, modality: Modality) -> bool:
@@ -111,7 +134,12 @@ class MultimodalInputs:
     video_token_id: Optional[int] = None
     mrope_positions: Optional[torch.Tensor] = None
     mrope_position_delta: Optional[torch.Tensor] = None
+    mrope_position_delta_scalar: Optional[int] = None
     mrope_position_delta_repeated_cache: Optional[torch.Tensor] = None
+
+    def ensure_pad_values(self) -> None:
+        for item in self.mm_items:
+            item.set_pad_value()
 
     def publish_shm_features(self) -> None:
         for item in self.mm_items:
@@ -126,10 +154,11 @@ class MultimodalInputs:
             if isinstance(item.feature, ShmTensorHandle):
                 item.feature.attach()
 
-    def consume_shm_features(self) -> None:
+    def release_shm_features(self) -> None:
         for item in self.mm_items:
             if isinstance(item.feature, ShmTensorHandle):
-                item.feature = item.feature.consume()
+                item.feature.release()
+                item.feature = None
 
     def has_pending_shm_features(self) -> bool:
         return any(isinstance(item.feature, ShmTensorHandle) for item in self.mm_items)

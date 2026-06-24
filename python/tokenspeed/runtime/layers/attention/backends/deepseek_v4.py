@@ -331,6 +331,22 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         extend_prefix_lens: torch.Tensor | None,
     ) -> torch.Tensor:
         if forward_mode is not None and forward_mode.is_decode_or_idle():
+            if forward_mode.is_decode() and num_tokens != bs:
+                if bs == 0:
+                    return torch.zeros(0, dtype=torch.int32, device=seq_lens.device)
+                if num_tokens % bs != 0:
+                    raise RuntimeError(
+                        "DeepSeek V4 packed decode metadata expects uniformly "
+                        f"packed tokens per request, got num_tokens={num_tokens}, "
+                        f"bs={bs}"
+                    )
+                tokens_per_req = num_tokens // bs
+                return torch.full(
+                    (bs,),
+                    tokens_per_req,
+                    dtype=torch.int32,
+                    device=seq_lens.device,
+                )
             return torch.ones(bs, dtype=torch.int32, device=seq_lens.device)
         if forward_mode is not None and forward_mode.is_mixed():
             lens = torch.ones(bs, dtype=torch.int32, device=seq_lens.device)
@@ -356,21 +372,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             else:
                 lens[:num_prefill_reqs] = seq_lens[:num_prefill_reqs].to(torch.int32)
             return lens
-        if forward_mode is not None and forward_mode.is_speculative():
-            if bs == 0:
-                return torch.zeros(0, dtype=torch.int32, device=seq_lens.device)
-            if num_tokens % bs != 0:
-                raise RuntimeError(
-                    "DeepSeek V4 speculative metadata expects uniformly packed "
-                    f"tokens per request, got num_tokens={num_tokens}, bs={bs}"
-                )
-            tokens_per_req = num_tokens // bs
-            return torch.full(
-                (bs,),
-                tokens_per_req,
-                dtype=torch.int32,
-                device=seq_lens.device,
-            )
         if extend_seq_lens_cpu is not None:
             return extend_seq_lens_cpu[:bs].to(seq_lens.device, dtype=torch.int32)
         if extend_prefix_lens_cpu is not None:
@@ -552,11 +553,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             num_tokens = int(num_tokens_arg)
         elif isinstance(positions, torch.Tensor):
             num_tokens = int(positions.numel())
-        elif forward_mode is not None and forward_mode.is_speculative():
-            raise RuntimeError(
-                "DeepSeek V4 speculative metadata requires explicit num_tokens "
-                "or positions"
-            )
         else:
             num_tokens = bs
         del kwargs
@@ -573,11 +569,11 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             extend_prefix_lens_cpu,
             extend_prefix_lens,
         )
-        is_spec = forward_mode is not None and forward_mode.is_speculative()
-        metadata_forward_mode = ForwardMode.DECODE if is_spec else forward_mode
-        if is_spec:
-            num_prefill_reqs = 0
-        elif forward_mode is not None and forward_mode.is_mixed():
+        is_packed_decode = (
+            forward_mode is not None and forward_mode.is_decode() and num_tokens != bs
+        )
+        metadata_forward_mode = forward_mode
+        if forward_mode is not None and forward_mode.is_mixed():
             num_prefill_reqs = max(0, min(num_extends, bs))
         elif forward_mode is not None and forward_mode.is_extend_or_mixed():
             num_prefill_reqs = bs
@@ -618,12 +614,10 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             elif forward_mode.is_mixed():
                 seq_lens_cpu = seq_lens[:bs].to(dtype=torch.int32, device="cpu")
         max_seq_len = int(seq_lens.max().item()) if bs else 0
-        if forward_mode is not None and (
-            forward_mode.is_extend()
-            or forward_mode.is_target_verify()
-            or forward_mode.is_draft_extend()
-        ):
+        if forward_mode is not None and forward_mode.is_extend():
             max_seq_len += max(self.speculative_num_steps - 1, 0)
+        if is_packed_decode:
+            max_seq_len += max(int(query_lens.max().item()) - 1, 0)
         max_pages = (max_seq_len + self.page_size - 1) // self.page_size
         if req_to_page is None:
             block_table = torch.zeros(
@@ -693,9 +687,9 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             num_prefill_tokens=num_prefill_tokens,
             forward_mode=metadata_forward_mode,
         )
-        if is_spec:
+        if is_packed_decode:
             self.forward_decode_metadata = self.forward_metadata
-            if forward_mode is not None and forward_mode.is_draft_extend():
+            if getattr(self, "is_draft", False):
                 self._prepare_draft_decode_metadata(
                     self.forward_metadata,
                     seq_lens.clone(),
@@ -1741,19 +1735,19 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         num_tokens: int,
         forward_mode: Optional[ForwardMode],
     ) -> int:
-        if forward_mode is not None and forward_mode.is_speculative():
+        if num_tokens != bs:
             if bs == 0:
                 return self._cuda_graph_max_tokens_per_req
             if num_tokens % bs != 0:
                 raise RuntimeError(
-                    "DeepSeek V4 speculative CUDA graph metadata expects "
-                    f"uniformly packed tokens per request, got "
-                    f"num_tokens={num_tokens}, bs={bs}"
+                    "DeepSeek V4 packed CUDA graph metadata expects uniformly "
+                    f"packed tokens per request, got num_tokens={num_tokens}, "
+                    f"bs={bs}"
                 )
             tokens_per_req = num_tokens // bs
             if tokens_per_req > self._cuda_graph_max_tokens_per_req:
                 raise RuntimeError(
-                    "DeepSeek V4 speculative CUDA graph metadata was initialized "
+                    "DeepSeek V4 packed CUDA graph metadata was initialized "
                     f"for at most {self._cuda_graph_max_tokens_per_req} tokens "
                     f"per request, got {tokens_per_req}"
                 )
@@ -1800,37 +1794,32 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         )
         num_tokens_arg = kwargs.pop("num_tokens", None)
         del kwargs
-        if forward_mode is not None and not (
-            forward_mode.is_decode_or_idle()
-            or forward_mode.is_target_verify()
-            or forward_mode.is_draft_extend()
-        ):
+        if forward_mode is not None and not forward_mode.is_decode_or_idle():
             raise NotImplementedError(
                 f"DeepSeek V4 CUDA graph capture not supported for {forward_mode}"
             )
         if num_tokens_arg is None:
-            if forward_mode is not None and forward_mode.is_speculative():
-                num_tokens = bs * self._cuda_graph_max_tokens_per_req
-            else:
-                num_tokens = bs
+            num_tokens = bs
         else:
             num_tokens = int(num_tokens_arg)
         tokens_per_req = self._cuda_graph_tokens_per_req(bs, num_tokens, forward_mode)
+        is_packed_decode = (
+            forward_mode is not None and forward_mode.is_decode() and num_tokens != bs
+        )
         total_tokens = self._refresh_cuda_graph_packed_metadata(
             bs=bs,
             actual_bs=bs,
             tokens_per_req=tokens_per_req,
         )
-        is_spec = forward_mode is not None and forward_mode.is_speculative()
         capture_seq_lens = seq_lens[:bs].to(torch.int32)
-        if is_spec:
+        if is_packed_decode:
             capture_seq_lens = torch.maximum(
                 capture_seq_lens,
                 torch.full_like(capture_seq_lens, tokens_per_req),
             )
         self._cuda_graph_req_pool_indices[:bs].copy_(req_pool_indices[:bs])
         self._cuda_graph_seq_lens[:bs].copy_(capture_seq_lens)
-        metadata_forward_mode = ForwardMode.DECODE if is_spec else forward_mode
+        metadata_forward_mode = forward_mode
         is_decode = (
             metadata_forward_mode is not None and metadata_forward_mode.is_decode()
         )
@@ -1906,7 +1895,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             metadata.query_lens_cpu = None
             metadata.forward_mode = metadata_forward_mode
         self._cuda_graph_metadata[bs] = metadata
-        if forward_mode is not None and forward_mode.is_draft_extend():
+        if is_packed_decode and getattr(self, "is_draft", False):
             self._prepare_draft_decode_metadata(
                 metadata,
                 self._cuda_graph_seq_lens[:bs],
@@ -1931,24 +1920,18 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         actual_bs = max(0, min(int(kwargs.pop("actual_bs", bs)), bs))
         num_tokens_arg = kwargs.pop("num_tokens", None)
         del kwargs
-        if forward_mode is not None and not (
-            forward_mode.is_decode_or_idle()
-            or forward_mode.is_target_verify()
-            or forward_mode.is_draft_extend()
-        ):
+        if forward_mode is not None and not forward_mode.is_decode_or_idle():
             raise NotImplementedError(
                 f"DeepSeek V4 CUDA graph replay not supported for {forward_mode}"
             )
         if num_tokens_arg is None:
-            if forward_mode is not None and forward_mode.is_speculative():
-                raise RuntimeError(
-                    "DeepSeek V4 speculative CUDA graph replay requires "
-                    "explicit num_tokens"
-                )
             num_tokens = bs
         else:
             num_tokens = int(num_tokens_arg)
         tokens_per_req = self._cuda_graph_tokens_per_req(bs, num_tokens, forward_mode)
+        is_packed_decode = (
+            forward_mode is not None and forward_mode.is_decode() and num_tokens != bs
+        )
         total_tokens = self._refresh_cuda_graph_packed_metadata(
             bs=bs,
             actual_bs=actual_bs,
@@ -1988,8 +1971,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             metadata_paged,
             metadata_base_offsets,
         )
-        is_spec = forward_mode is not None and forward_mode.is_speculative()
-        metadata_forward_mode = ForwardMode.DECODE if is_spec else forward_mode
+        metadata_forward_mode = forward_mode
         is_decode = (
             metadata_forward_mode is not None and metadata_forward_mode.is_decode()
         )
@@ -2013,7 +1995,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         )
         metadata.num_prefill_reqs = 0
         metadata.num_prefill_tokens = 0
-        if forward_mode is not None and forward_mode.is_draft_extend():
+        if is_packed_decode and getattr(self, "is_draft", False):
             self._prepare_draft_decode_metadata(
                 metadata,
                 self._cuda_graph_seq_lens[:bs],

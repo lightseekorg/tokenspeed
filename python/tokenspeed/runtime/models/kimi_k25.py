@@ -78,7 +78,10 @@ except ImportError:
 
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.deepseek_v3 import DeepseekV3ForCausalLM
-from tokenspeed.runtime.multimodal.encoder_cudagraph import EncoderCudaGraphWrapper
+from tokenspeed.runtime.multimodal.encoder_cudagraph import (
+    EncoderCudaGraphWrapper,
+    VisionEncoderCudaGraphAdapter,
+)
 from tokenspeed.runtime.multimodal.inputs import (
     Modality,
     MultimodalDataItem,
@@ -790,9 +793,9 @@ class KimiK25ForConditionalGeneration(nn.Module):
         tokens, grid_thws = self.pre_encode(items)
         encoder = self.vision_tower.encoder
         encoded = encoder.forward_blocks(tokens, encoder.prepare_metadata(grid_thws))
-        # forward_blocks keeps a leading batch dim of 1; squeeze it for per-image
-        # consumption (mirrors ``out_squeeze_dim=0`` in
-        # ``make_encoder_cudagraph_wrapper``).
+        # forward_blocks keeps a leading batch dim of 1; squeeze it for
+        # per-image consumption (mirrors ``out_squeeze_dim=0`` in the
+        # cudagraph wrapper).
         return self.post_encode([encoded.squeeze(0)], grid_thws)
 
     def pre_encode(
@@ -824,23 +827,29 @@ class KimiK25ForConditionalGeneration(nn.Module):
         proj_out = mm_projection_auto(self.mm_projector, merged)
         return torch.cat(proj_out, dim=0)
 
-    def make_encoder_cudagraph_wrapper(self, mapping):
+    def make_encoder_cudagraph_wrappers(self, mapping):
         # Captured region is ``MoonViT3dEncoder.forward_blocks`` (token-preserving
         # block loop); spatial/temporal merge lives in ``post_encode``, so
         # budgets are encoder-input patch counts (``out_div=1``). ``forward_blocks``
         # keeps a leading batch dim of 1 -- ``out_squeeze_dim=0`` drops it before
         # per-item slicing.
-        return EncoderCudaGraphWrapper(
-            mapping=mapping,
-            tower=self.vision_tower.encoder,
-            pre_encode=self.pre_encode,
-            post_encode=self.post_encode,
-            out_div=1,
-            merge=1,
-            budget_range=(256, 16384),
-            input_feature_shape=(self.config.vision_config.hidden_size,),
-            out_squeeze_dim=0,
-        )
+        return {
+            "image_encoder": EncoderCudaGraphWrapper(
+                adapter=VisionEncoderCudaGraphAdapter(
+                    tower=self.vision_tower.encoder,
+                    pre_encode=self.pre_encode,
+                    post_encode=self.post_encode,
+                    out_div=1,
+                    merge=1,
+                    input_feature_shape=(self.config.vision_config.hidden_size,),
+                    modality_name="image",
+                    out_squeeze_dim=0,
+                    capture_tp_size=mapping.vision.tp_size,
+                    capture_tp_group=mapping.vision.tp_group,
+                ),
+                budget_range=(256, 16384),
+            )
+        }
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         return pad_input_tokens(input_ids, mm_inputs)
