@@ -124,7 +124,7 @@ class ModelExecutorConfig:
     spec_num_tokens: int | None = None
     dp_sampling: bool = False
     dp_sampling_min_bs: int | None = None
-    use_target_verify_forward_mode: bool = False
+    use_v4_mtp_paged_metadata: bool = False
 
     # ====== GRAMMAR =========
     # "none" disables all grammar handling; otherwise the backend name
@@ -179,7 +179,7 @@ class ModelExecutorConfig:
             dp_sampling=server_args.dp_sampling,
             dp_sampling_min_bs=server_args.dp_sampling_min_bs,
             enable_nan_detection=server_args.enable_nan_detection,
-            use_target_verify_forward_mode=model_config.use_target_verify_forward_mode,
+            use_v4_mtp_paged_metadata=model_config.use_v4_mtp_paged_metadata,
             grammar_backend=server_args.grammar_backend,
             disable_capturable_grammar=server_args.disable_capturable_grammar,
             mamba_cache_chunk_size=server_args.mamba_cache_chunk_size,
@@ -604,7 +604,7 @@ class ModelExecutor:
             or runtime.min_bs is None
             or runtime.topology is None
             or ctx.forward_mode is None
-            or not (ctx.forward_mode.is_decode() or ctx.forward_mode.is_target_verify())
+            or not ctx.forward_mode.is_decode()
         ):
             return
 
@@ -650,9 +650,7 @@ class ModelExecutor:
         # attention/MoE. Rejoined at wait_bitmask() before apply_mask.
         if self.capturable_grammar is not None:
             n = self.capturable_grammar.max_tokens_per_req
-            is_spec_verify = n > 1 and (
-                ctx.forward_mode.is_decode() or ctx.forward_mode.is_target_verify()
-            )
+            is_spec_verify = n > 1 and ctx.forward_mode.is_decode()
             slice_ = (
                 self.input_buffers.input_ids_buf[: bs * n] if is_spec_verify else None
             )
@@ -1056,10 +1054,7 @@ class ModelExecutor:
         ranks do. The MoE all-to-all is a collective that requires ALL
         ranks to participate.
         """
-        graph_forward_mode = ForwardMode.decode_or_target_verify(
-            has_drafter=self.drafter is not None,
-            use_target_verify=self.config.use_target_verify_forward_mode,
-        )
+        graph_forward_mode = ForwardMode.DECODE
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
             token_to_kv_pool=self.token_to_kv_pool,
@@ -1401,12 +1396,7 @@ class ModelExecutor:
             if timing_enabled:
                 mrope_ms = (time.perf_counter() - mrope_start) * 1000.0
 
-            forward_mode = ForwardMode.from_num_extends(
-                num_extends,
-                bs,
-                has_drafter=self.drafter is not None,
-                use_target_verify=self.config.use_target_verify_forward_mode,
-            )
+            forward_mode = ForwardMode.from_num_extends(num_extends, bs)
 
             if num_extends <= 0:
                 self._prev_decode_bs = bs

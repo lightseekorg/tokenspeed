@@ -249,10 +249,7 @@ class LogitsProcessor(nn.Module):
     ) -> LogitsLayoutPlan | None:
         if not self.dp_sampling_enabled:
             return None
-        if not (
-            logits_metadata.forward_mode.is_decode()
-            or logits_metadata.forward_mode.is_target_verify()
-        ):
+        if not logits_metadata.forward_mode.is_decode():
             return None
         n = self.dp_num_tokens_per_req
         rows = hidden_states.shape[0]

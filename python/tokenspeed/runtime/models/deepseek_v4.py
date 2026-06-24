@@ -164,35 +164,31 @@ def _deepseek_v4_indexer_token_split(
 ) -> tuple[int, int]:
     if forward_mode is not None and forward_mode.is_mixed():
         return int(metadata.num_prefill_tokens), metadata.decode_token_count()
-    if forward_mode is not None and (
-        forward_mode.is_decode()
-        or forward_mode.is_target_verify()
-        or forward_mode.is_draft_extend()
-    ):
+    if forward_mode is not None and forward_mode.is_decode():
         return 0, int(total_tokens)
     return int(total_tokens), 0
 
 
 def _deepseek_v4_forward_metadata(ctx: ForwardContext):
     metadata = getattr(ctx.attn_backend, "forward_metadata", None)
-    if ctx.forward_mode == ForwardMode.EXTEND:
+    forward_mode = getattr(ctx, "forward_mode", None)
+    if forward_mode == ForwardMode.EXTEND:
         return getattr(ctx.attn_backend, "forward_prefill_metadata", None) or metadata
-    if ctx.forward_mode is not None and ctx.forward_mode.is_draft_extend():
-        prefill_metadata = getattr(ctx.attn_backend, "forward_prefill_metadata", None)
-        if _deepseek_v4_metadata_matches_tokens(
-            prefill_metadata,
-            ctx.input_num_tokens,
-        ):
-            return prefill_metadata
-        return metadata or prefill_metadata
-    if ctx.forward_mode is not None and ctx.forward_mode.is_decode_or_idle():
+    if forward_mode is not None and forward_mode.is_decode_or_idle():
+        input_num_tokens = getattr(ctx, "input_num_tokens", None)
         decode_metadata = getattr(ctx.attn_backend, "forward_decode_metadata", None)
-        if _deepseek_v4_metadata_matches_tokens(
+        if input_num_tokens is not None and _deepseek_v4_metadata_matches_tokens(
             decode_metadata,
-            ctx.input_num_tokens,
+            input_num_tokens,
         ):
             return decode_metadata
-        return decode_metadata or metadata
+        prefill_metadata = getattr(ctx.attn_backend, "forward_prefill_metadata", None)
+        if input_num_tokens is not None and _deepseek_v4_metadata_matches_tokens(
+            prefill_metadata,
+            input_num_tokens,
+        ):
+            return prefill_metadata
+        return decode_metadata or metadata or prefill_metadata
     return metadata
 
 
@@ -2966,11 +2962,7 @@ class DeepseekV4Indexer(nn.Module):
         if forward_mode is not None and forward_mode.is_mixed():
             num_prefill_tokens = int(metadata.num_prefill_tokens)
             num_decode_tokens = metadata.decode_token_count()
-        elif forward_mode is not None and (
-            forward_mode.is_decode()
-            or forward_mode.is_target_verify()
-            or forward_mode.is_draft_extend()
-        ):
+        elif forward_mode is not None and forward_mode.is_decode():
             num_prefill_tokens = 0
             num_decode_tokens = positions.numel()
         else:
@@ -3695,7 +3687,7 @@ class DeepseekV4Attention(nn.Module):
                     attn_sink=self.attn_sink,
                     topk_indices=topk_indices,
                 )
-        elif forward_mode.is_decode() or forward_mode.is_speculative():
+        elif forward_mode.is_decode():
             with nvtx_range(f"{profile_prefix}_decode_backend"):
                 attn_output = ctx.attn_backend.forward_deepseek_v4_decode(
                     q=q,
