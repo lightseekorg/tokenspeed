@@ -354,15 +354,12 @@ class DSABackend(AttentionBackend):
         spec_info=None,
         **kwargs,
     ):
-        dense_forward_mode = (
-            ForwardMode.DECODE if forward_mode.is_target_verify() else forward_mode
-        )
         out = self._dense_backend.init_forward_metadata(
             bs=bs,
             num_extends=num_extends,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
-            forward_mode=dense_forward_mode,
+            forward_mode=forward_mode,
             req_to_page=req_to_page,
             spec_info=spec_info,
             **kwargs,

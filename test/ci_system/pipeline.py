@@ -289,6 +289,18 @@ def get_default_runner_env(runner: str) -> Dict[str, str]:
     return {}
 
 
+def get_runner_specific_env(task: Dict[str, Any], runner: str) -> Dict[str, str]:
+    runner_env = task["runner"].get("env", {})
+    if runner in runner_env:
+        return dict(runner_env[runner])
+
+    for label in task["runner"]["labels"]:
+        if resolve_runner_label(label) == runner:
+            return dict(runner_env.get(label, {}))
+
+    return {}
+
+
 def create_ci_venv_name(runner_name: str | None = None) -> str:
     if runner_name:
         # Fixed path per runner so flashinfer JIT cache (which embeds the
@@ -1311,7 +1323,7 @@ def execute_task(
     env["CI_TASK_TYPE"] = str(task["type"])
     env["CI_RUNNER_LABEL"] = runner
     env.update(get_default_runner_env(runner))
-    env.update(task["runner"].get("env", {}).get(runner, {}))
+    env.update(get_runner_specific_env(task, runner))
 
     stages = filter_stage_commands(
         get_stage_commands(task),

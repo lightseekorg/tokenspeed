@@ -21,15 +21,15 @@ if not _IS_GFX950:
         allow_module_level=True,
     )
 
-from tokenspeed_kernel.ops.moe.gluon.mxfp4 import gluon_mxfp4_moe_process_weights
-from tokenspeed_kernel.ops.moe.triton.mxfp4 import (
-    _routing,
-    fp8_quantize,
-    triton_mxfp4_moe_process_weights,
-)
 from tokenspeed_kernel_amd.ops.moe import fused_mxfp_gfx950 as gluon_moe
-from triton_kernels.matmul import FnSpecs, FusedActivation, matmul
-from triton_kernels.swiglu import swiglu_fn
+from tokenspeed_kernel_amd.ops.moe.fused_mxfp_gfx950 import (
+    default_route,
+    fp8_quantize,
+)
+from tokenspeed_kernel_amd.ops.moe.mxfp4_gfx950_preprocess import (
+    preprocess_gluon_mxfp4_gfx950_moe_weights,
+)
+from tokenspeed_kernel_amd.ops.moe.utils import FnSpecs, FusedActivation, swiglu_fn
 
 HIDDEN_SIZE = 2880
 INTERMEDIATE_SIZE = 2880
@@ -45,6 +45,7 @@ W2_ACT_SCALE = 0.125
 WEIGHT_NIBBLES = (0, 1, 2, 9, 10)
 # e8m0 block scales centered around the previous uniform exponent 124.
 WEIGHT_SCALE_EXPONENTS = (123, 124, 125)
+E2M1_POSITIVE_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 GEMM_ATOL = 0.05
 RTOL = 0.01
 
@@ -278,17 +279,17 @@ class Mxfp4Weights:
 
 @dataclass
 class Mxfp4WeightVariants:
+    raw: RawMxfp4Weights
     nonpreshuffled: Mxfp4Weights
     preshuffled: Mxfp4Weights
 
 
 @dataclass
-class TritonReference:
+class TorchReference:
     ragged_metadata: Any
     gather_indx: Any
     scatter_indx: Any
     gate_scal: torch.Tensor
-    hidden_dtype: torch.dtype
     gemm1_input: torch.Tensor
     gemm2_input: torch.Tensor
     gemm1_output: torch.Tensor
@@ -389,10 +390,7 @@ def _make_preprocessed_weights(
 ) -> Mxfp4Weights:
     layer = _make_weight_module(raw)
     plan = {"internal_activation_dtype": "fp8"}
-    if preshuffle:
-        gluon_mxfp4_moe_process_weights(plan, layer)
-    else:
-        triton_mxfp4_moe_process_weights(plan, layer)
+    preprocess_gluon_mxfp4_gfx950_moe_weights(plan, layer, preshuffle=preshuffle)
 
     return Mxfp4Weights(
         w13_weight=layer.w13_weight_triton_tensor,
@@ -410,6 +408,7 @@ def _make_preprocessed_weights(
 def mxfp4_weights() -> Mxfp4WeightVariants:
     raw_weights = _make_raw_mxfp4_weights()
     return Mxfp4WeightVariants(
+        raw=raw_weights,
         nonpreshuffled=_make_preprocessed_weights(raw_weights, preshuffle=False),
         preshuffled=_make_preprocessed_weights(raw_weights, preshuffle=True),
     )
@@ -467,16 +466,106 @@ def _swiglu_activation() -> FusedActivation:
     )
 
 
-def _compute_triton_reference(
-    num_tokens: int,
+def _mxfp4_dequant(packed: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    positive = torch.tensor(
+        E2M1_POSITIVE_VALUES, device=packed.device, dtype=torch.float32
+    )
+    lut = torch.cat((positive, -positive))
+    lo = lut[(packed & 0x0F).long()]
+    hi = lut[(packed >> 4).long()]
+    values = torch.stack((lo, hi), dim=-1).reshape(*packed.shape[:-1], -1)
+    block_scales = torch.exp2(scales.to(torch.float32) - 127.0)
+    scaled = values.reshape(
+        *values.shape[:-1], values.shape[-1] // MXFP4_BLOCK, MXFP4_BLOCK
+    )
+    return (scaled * block_scales.unsqueeze(-1)).reshape_as(values)
+
+
+def _fp8_dequant(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    return x.to(torch.float32) * scale.to(torch.float32).reshape(())
+
+
+def _swiglu_reference(gate_up: torch.Tensor) -> torch.Tensor:
+    gate, linear = gate_up.reshape(gate_up.shape[0], -1, 2).unbind(dim=-1)
+    gate = torch.clamp(gate, max=SWIGLU_LIMIT)
+    linear = torch.clamp(linear, -SWIGLU_LIMIT, SWIGLU_LIMIT)
+    sigmoid = 1.0 / (1.0 + torch.exp(-SWIGLU_ALPHA * gate))
+    return (gate * sigmoid) * (linear + 1.0)
+
+
+def _expert_ranges(ragged_metadata: Any) -> list[tuple[int, int]]:
+    slice_sizes = ragged_metadata.slice_sizes.to(torch.int64).tolist()
+    ranges = []
+    offset = 0
+    for size in slice_sizes:
+        end = offset + int(size)
+        ranges.append((offset, end))
+        offset = end
+    return ranges
+
+
+def _compute_torch_gemm1_reference(
+    raw: RawMxfp4Weights,
+    gemm1_input: torch.Tensor,
     weights: Mxfp4Weights,
-) -> TritonReference:
+    ragged_metadata: Any,
+    gather_indx: torch.Tensor,
+) -> torch.Tensor:
+    output = torch.empty(
+        (gather_indx.numel(), INTERMEDIATE_SIZE),
+        device=gemm1_input.device,
+        dtype=torch.bfloat16,
+    )
+    x = _fp8_dequant(gemm1_input, weights.w13_act_scale)
+    for expert, (start, end) in enumerate(_expert_ranges(ragged_metadata)):
+        if start == end:
+            continue
+        row_idx = gather_indx[start:end].long()
+        w13 = _mxfp4_dequant(raw.w13_weight[expert], raw.w13_scale[expert])
+        gate_up = x[row_idx] @ w13.T
+        if weights.w13_bias is not None:
+            gate_up = gate_up + weights.w13_bias[expert][None, :]
+        output[start:end] = _swiglu_reference(gate_up).to(torch.bfloat16)
+    return output
+
+
+def _compute_torch_gemm2_reference(
+    raw: RawMxfp4Weights,
+    gemm2_input: torch.Tensor,
+    weights: Mxfp4Weights,
+    ragged_metadata: Any,
+    scatter_indx: torch.Tensor,
+    gate_scal: torch.Tensor,
+    num_tokens: int,
+) -> torch.Tensor:
+    routed = torch.empty(
+        (num_tokens * TOPK, HIDDEN_SIZE),
+        device=gemm2_input.device,
+        dtype=torch.bfloat16,
+    )
+    x = _fp8_dequant(gemm2_input, weights.w2_act_scale)
+    for expert, (start, end) in enumerate(_expert_ranges(ragged_metadata)):
+        if start == end:
+            continue
+        w2 = _mxfp4_dequant(raw.w2_weight[expert], raw.w2_scale[expert])
+        expert_out = x[start:end] @ w2.T
+        if weights.w2_bias is not None:
+            expert_out = expert_out + weights.w2_bias[expert][None, :]
+        expert_out = expert_out * gate_scal[start:end].to(torch.float32)[:, None]
+        routed[scatter_indx[start:end].long()] = expert_out.to(torch.bfloat16)
+    return routed.view(num_tokens, TOPK, HIDDEN_SIZE).sum(dim=1)
+
+
+def _compute_torch_reference(
+    num_tokens: int,
+    raw: RawMxfp4Weights,
+    weights: Mxfp4Weights,
+) -> TorchReference:
     hidden_states, router_logits = _make_hidden_and_router(num_tokens)
 
-    ragged_metadata, gather_indx, scatter_indx, gate_scal = _routing(
+    ragged_metadata, gather_indx, scatter_indx, gate_scal = default_route(
         router_logits,
         TOPK,
-        sm_first=False,
         dtype=router_logits.dtype,
     )
 
@@ -489,36 +578,25 @@ def _compute_triton_reference(
     gemm2_input = _make_gemm2_input(num_tokens, weights.w2_act_scale)
 
     with torch.no_grad():
-        gemm1_output = matmul(
-            gemm1_input,
-            weights.w13_weight,
-            weights.w13_bias,
-            a_ragged_metadata=ragged_metadata,
-            gather_indx=gather_indx,
-            precision_config=weights.w13_precision_config,
-            fused_activation=_swiglu_activation(),
+        gemm1_output = _compute_torch_gemm1_reference(
+            raw, gemm1_input, weights, ragged_metadata, gather_indx
         )
-
-        gemm2_routed = matmul(
+        gemm2_output = _compute_torch_gemm2_reference(
+            raw,
             gemm2_input,
-            weights.w2_weight,
-            weights.w2_bias,
-            a_ragged_metadata=ragged_metadata,
-            scatter_indx=scatter_indx,
-            precision_config=weights.w2_precision_config,
-            gammas=gate_scal,
-        )
-        gemm2_output = gemm2_routed.view(num_tokens, TOPK, gemm2_routed.shape[-1]).sum(
-            dim=1
+            weights,
+            ragged_metadata,
+            scatter_indx,
+            gate_scal,
+            num_tokens,
         )
 
     torch.cuda.synchronize()
-    return TritonReference(
+    return TorchReference(
         ragged_metadata=ragged_metadata,
         gather_indx=gather_indx,
         scatter_indx=scatter_indx,
         gate_scal=gate_scal,
-        hidden_dtype=hidden_states.dtype,
         gemm1_input=gemm1_input,
         gemm2_input=gemm2_input,
         gemm1_output=gemm1_output,
@@ -527,17 +605,19 @@ def _compute_triton_reference(
 
 
 @pytest.fixture(scope="module")
-def triton_references(
+def torch_references(
     mxfp4_weights: Mxfp4WeightVariants,
-) -> dict[int, TritonReference]:
+) -> dict[int, TorchReference]:
     return {
-        num_tokens: _compute_triton_reference(num_tokens, mxfp4_weights.nonpreshuffled)
+        num_tokens: _compute_torch_reference(
+            num_tokens, mxfp4_weights.raw, mxfp4_weights.nonpreshuffled
+        )
         for num_tokens in KEY_NUM_TOKEN_VALUES
     }
 
 
 def _run_gluon_gemms(
-    reference: TritonReference,
+    reference: TorchReference,
     weights: Mxfp4Weights,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     with torch.no_grad():
@@ -567,13 +647,13 @@ def _run_gluon_gemms(
     return gemm1_output, gemm2_output
 
 
-def _assert_gluon_matches_triton(
+def _assert_gluon_matches_torch(
     num_tokens: int,
     *,
     weights: Mxfp4Weights,
-    triton_references: dict[int, TritonReference],
+    torch_references: dict[int, TorchReference],
 ) -> None:
-    reference = triton_references[num_tokens]
+    reference = torch_references[num_tokens]
     gluon_gemm1, gluon_gemm2 = _run_gluon_gemms(reference, weights)
 
     torch.testing.assert_close(
@@ -592,27 +672,27 @@ def _assert_gluon_matches_triton(
 
 @requires_gfx950
 @pytest.mark.parametrize("num_tokens", KEY_NUM_TOKENS)
-def test_gluon_moe_gemms_without_preshuffle_match_triton_gfx950(
+def test_gluon_moe_gemms_without_preshuffle_match_torch_gfx950(
     num_tokens: int,
     mxfp4_weights: Mxfp4WeightVariants,
-    triton_references: dict[int, TritonReference],
+    torch_references: dict[int, TorchReference],
 ) -> None:
-    _assert_gluon_matches_triton(
+    _assert_gluon_matches_torch(
         num_tokens,
         weights=mxfp4_weights.nonpreshuffled,
-        triton_references=triton_references,
+        torch_references=torch_references,
     )
 
 
 @requires_gfx950
 @pytest.mark.parametrize("num_tokens", KEY_NUM_TOKENS)
-def test_gluon_moe_gemms_with_preshuffle_match_triton_gfx950(
+def test_gluon_moe_gemms_with_preshuffle_match_torch_gfx950(
     num_tokens: int,
     mxfp4_weights: Mxfp4WeightVariants,
-    triton_references: dict[int, TritonReference],
+    torch_references: dict[int, TorchReference],
 ) -> None:
-    _assert_gluon_matches_triton(
+    _assert_gluon_matches_torch(
         num_tokens,
         weights=mxfp4_weights.preshuffled,
-        triton_references=triton_references,
+        torch_references=torch_references,
     )

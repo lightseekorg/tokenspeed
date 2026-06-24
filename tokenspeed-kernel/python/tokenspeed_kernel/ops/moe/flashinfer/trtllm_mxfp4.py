@@ -27,7 +27,7 @@ from tokenspeed_kernel.platform import (
     current_platform,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import format_signature, format_signatures
+from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
 next_power_of_2 = lambda value: 1 if value <= 1 else 1 << (value - 1).bit_length()
@@ -162,21 +162,7 @@ if platform.is_nvidia:
             else getattr(w, name, default)
         )
 
-    @register_kernel(
-        "moe",
-        "process_weights",
-        name="flashinfer_trtllm_mxfp4_moe_process_weights",
-        solution="flashinfer_trtllm",
-        capability=CapabilityRequirement(
-            vendors=frozenset({"nvidia"}),
-            min_arch_version=ArchVersion(10, 0),
-            max_arch_version=ArchVersion(10, 3),
-        ),
-        signatures=frozenset({format_signature()}),
-        traits={"weight_dtype": frozenset({"mxfp4"})},
-        priority=Priority.SPECIALIZED,
-    )
-    def flashinfer_trtllm_mxfp4_moe_process_weights(plan: dict, w: torch.nn.Module):
+    def flashinfer_trtllm_mxfp4_moe_weights(plan: dict, w: torch.nn.Module):
         sf_block_size = 32
         num_experts = w.w13_weight.shape[0]
         ispp_padded = w.w13_weight.shape[1] // 2
@@ -357,6 +343,7 @@ if platform.is_nvidia:
         "apply",
         name="flashinfer_trtllm_mxfp4_moe_apply",
         solution="flashinfer_trtllm",
+        weight_preprocessor=flashinfer_trtllm_mxfp4_moe_weights,
         capability=CapabilityRequirement(
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(10, 0),

@@ -243,20 +243,14 @@ class Eagle(BaseDrafter):
             draft_input, bs, draft_input.input_num_tokens
         )
         input_ids = maybe_substitute_mm_pad(input_ids, self.mm_pad_substitute_id)
-        # Llama Eagle3 and Qwen3.5 NextN narrow for any non-idle catch-up
-        # (EXTEND/MIXED/TARGET_VERIFY/DECODE); DeepSeek keeps is_decode() only.
+        # Llama Eagle3 narrows for any non-idle catch-up; Qwen/DeepSeek
+        # keep is_decode() only.
         draft_first_step_reduce = forward_mode.is_decode() or (
             isinstance(
                 self.draft_model_runner.model,
                 (LlamaForCausalLMEagle3, Qwen3_5ForConditionalGenerationNextN),
             )
             and not forward_mode.is_idle()
-        )
-
-        draft_first_mode = (
-            ForwardMode.DRAFT_EXTEND
-            if forward_mode.is_target_verify()
-            else forward_mode
         )
 
         ctx = ForwardContext(
@@ -266,7 +260,7 @@ class Eagle(BaseDrafter):
             bs=bs,
             num_extends=draft_input.num_extends,
             input_num_tokens=draft_input.input_num_tokens,
-            forward_mode=draft_first_mode,
+            forward_mode=forward_mode,
             capture_hidden_mode=CaptureHiddenMode.LAST,
             gather_ids=gather_ids,
             global_num_tokens=draft_input.global_num_tokens,
@@ -457,9 +451,9 @@ class Eagle(BaseDrafter):
             return next_tokens
 
         if self.input_buffers.all_extends_mid_chunk and self.dp_size == 1:
-            # Skip multi-step when the whole batch is mid-chunk EXTEND: no
-            # request transitions to target_verify after this forward, so
-            # any speculative tokens we draft would be discarded.
+            # Skip multi-step when the whole batch is mid-chunk EXTEND:
+            # no request completes a target-side speculative verification
+            # after this forward, so any speculative tokens would be discarded.
             #
             # In DP we still run, because peer ranks may have completing
             # extends or decodes; diverging here would desync the drafter's
