@@ -82,7 +82,7 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         )
         self.page_size_bytes = self._get_page_size_bytes()
 
-        with memory_saver_adapter.region():
+        with memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False):
             # The padded page 0 is used for writing dummy outputs from padded tokens.
             if self.quant_method == "per_token_head":
                 self.kv_buffer = [

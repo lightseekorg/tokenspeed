@@ -4,10 +4,11 @@
 
 from __future__ import annotations
 
-import math
 from functools import cache
 
 import torch
+import triton
+import triton.language as tl
 
 from tokenspeed.runtime.utils import ceil_div
 
@@ -15,13 +16,6 @@ try:
     from tokenspeed_kernel.thirdparty import deep_gemm
 except Exception:
     deep_gemm = None  # type: ignore[assignment]
-
-try:
-    import tilelang
-    import tilelang.language as T
-except Exception:  # pragma: no cover - availability depends on deployment image
-    tilelang = None
-    T = None
 
 
 @cache
@@ -34,183 +28,281 @@ def _compute_num_split(block_k: int, k: int | None, grid_size: int) -> int:
     return max(split_k, 1)
 
 
-if tilelang is not None:
+@triton.jit
+def _load_reduced_mix(
+    gemm_out_mul,
+    token_id,
+    mix_id: tl.constexpr,
+    num_tokens,
+    hc_mult3: tl.constexpr,
+    n_splits: tl.constexpr,
+):
+    value = tl.full((), 0.0, tl.float32)
+    for split_id in tl.static_range(0, n_splits):
+        offset = split_id * num_tokens * hc_mult3 + token_id * hc_mult3 + mix_id
+        value += tl.load(gemm_out_mul + offset)
+    return value
 
-    @tilelang.jit(
-        pass_configs={
-            tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-            tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-            tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
-        },
+
+@triton.jit
+def _mhc_pre_mix_triton_kernel(
+    gemm_out_mul,
+    gemm_out_sqrsum,
+    hc_scale,
+    hc_base,
+    pre_mix,
+    post_mix,
+    comb_mix,
+    hidden_size: tl.constexpr,
+    rms_eps: tl.constexpr,
+    hc_eps: tl.constexpr,
+    sinkhorn_iters: tl.constexpr,
+    n_splits: tl.constexpr,
+    hc_mult: tl.constexpr,
+    hc_mult2: tl.constexpr,
+    hc_mult3: tl.constexpr,
+    block_comb: tl.constexpr,
+    num_tokens,
+):
+    token_id = tl.program_id(0)
+
+    rms_sum = tl.full((), 0.0, tl.float32)
+    for split_id in tl.static_range(0, n_splits):
+        rms_sum += tl.load(gemm_out_sqrsum + split_id * num_tokens + token_id)
+    rms = tl.rsqrt(rms_sum / (hc_mult * hidden_size) + rms_eps)
+
+    pre_scale = tl.load(hc_scale)
+    for hc_id in tl.static_range(0, hc_mult):
+        mix = _load_reduced_mix(
+            gemm_out_mul,
+            token_id,
+            hc_id,
+            num_tokens,
+            hc_mult3,
+            n_splits,
+        )
+        pre = tl.sigmoid(mix * rms * pre_scale + tl.load(hc_base + hc_id)) + hc_eps
+        tl.store(pre_mix + token_id * hc_mult + hc_id, pre)
+
+    post_scale = tl.load(hc_scale + 1)
+    for hc_id in tl.static_range(0, hc_mult):
+        mix = _load_reduced_mix(
+            gemm_out_mul,
+            token_id,
+            hc_mult + hc_id,
+            num_tokens,
+            hc_mult3,
+            n_splits,
+        )
+        post = (
+            tl.sigmoid(mix * rms * post_scale + tl.load(hc_base + hc_mult + hc_id))
+            * 2.0
+        )
+        tl.store(post_mix + token_id * hc_mult + hc_id, post)
+
+    comb_offsets = tl.arange(0, block_comb)
+    comb_mask = comb_offsets < hc_mult2
+    comb_scale = tl.load(hc_scale + 2)
+    comb_mix_values = tl.zeros((block_comb,), tl.float32)
+    for split_id in tl.static_range(0, n_splits):
+        split_base = split_id * num_tokens * hc_mult3 + token_id * hc_mult3
+        comb_mix_values += tl.load(
+            gemm_out_mul + split_base + hc_mult * 2 + comb_offsets,
+            mask=comb_mask,
+            other=0.0,
+        )
+    comb_values = comb_mix_values * rms * comb_scale + tl.load(
+        hc_base + hc_mult * 2 + comb_offsets, mask=comb_mask, other=0.0
     )
-    def _mhc_pre_big_fuse_tilelang(
-        gemm_out_mul,
-        gemm_out_sqrsum,
-        hc_scale,
-        hc_base,
-        residual,
-        post_mix,
-        comb_mix,
-        layer_input,
-        hidden_size: int,
-        rms_eps: float,
-        hc_pre_eps: float,
-        hc_sinkhorn_eps: float,
-        hc_post_mult_value: float,
-        sinkhorn_repeat: int,
-        n_splits: int = 16,
-        hc_mult: int = 4,
-    ):
-        num_tokens = T.dynamic("num_tokens")
-        hc_mult3 = hc_mult * (2 + hc_mult)
-        hidden_block = math.gcd(512, hidden_size)
+    rows = comb_offsets // hc_mult
+    cols = comb_offsets - rows * hc_mult
+    active = comb_mask
 
-        gemm_out_mul: T.Tensor[[n_splits, num_tokens, hc_mult3], T.float32]
-        gemm_out_sqrsum: T.Tensor[[n_splits, num_tokens], T.float32]
-        hc_scale: T.Tensor[[3], T.float32]
-        hc_base: T.Tensor[[hc_mult3], T.float32]
-        residual: T.Tensor[[num_tokens, hc_mult, hidden_size], T.bfloat16]
-        post_mix: T.Tensor[[num_tokens, hc_mult], T.float32]
-        comb_mix: T.Tensor[[num_tokens, hc_mult * hc_mult], T.float32]
-        layer_input: T.Tensor[[num_tokens, hidden_size], T.bfloat16]
+    for row_id in tl.static_range(0, hc_mult):
+        row_values = tl.where((rows == row_id) & active, comb_values, -float("inf"))
+        row_max = tl.max(row_values, axis=0)
+        comb_values = tl.where(
+            (rows == row_id) & active, tl.exp(comb_values - row_max), comb_values
+        )
+    for row_id in tl.static_range(0, hc_mult):
+        row_sum = tl.sum(tl.where((rows == row_id) & active, comb_values, 0.0), axis=0)
+        comb_values = tl.where(
+            (rows == row_id) & active, comb_values / row_sum + hc_eps, comb_values
+        )
+    for col_id in tl.static_range(0, hc_mult):
+        col_sum = tl.sum(tl.where((cols == col_id) & active, comb_values, 0.0), axis=0)
+        comb_values = tl.where(
+            (cols == col_id) & active,
+            comb_values / (col_sum + hc_eps),
+            comb_values,
+        )
 
-        with T.Kernel(num_tokens, threads=96) as i:
-            T.pdl_sync()
-            rms = T.alloc_fragment(1, T.float32)
-            mixes = T.alloc_fragment(hc_mult3, T.float32)
-            T.clear(mixes)
-            rms[0] = 0
-            for i_split in T.serial(n_splits):
-                rms[0] += gemm_out_sqrsum[i_split, i]
-            rms[0] = T.rsqrt(rms[0] / (hc_mult * hidden_size) + rms_eps)
-            for j in T.Parallel(hc_mult3):
-                mixes[j] = 0
-                for i_split in T.serial(n_splits):
-                    mixes[j] += gemm_out_mul[i_split, i, j]
-                mixes[j] *= rms[0]
-            mixes_shared = T.alloc_shared(hc_mult3, T.float32)
-            T.copy(mixes, mixes_shared)
+    for _ in tl.static_range(1, sinkhorn_iters):
+        for row_id in tl.static_range(0, hc_mult):
+            row_sum = tl.sum(
+                tl.where((rows == row_id) & active, comb_values, 0.0), axis=0
+            )
+            comb_values = tl.where(
+                (rows == row_id) & active,
+                comb_values / (row_sum + hc_eps),
+                comb_values,
+            )
+        for col_id in tl.static_range(0, hc_mult):
+            col_sum = tl.sum(
+                tl.where((cols == col_id) & active, comb_values, 0.0), axis=0
+            )
+            comb_values = tl.where(
+                (cols == col_id) & active,
+                comb_values / (col_sum + hc_eps),
+                comb_values,
+            )
 
-            if T.get_thread_binding() < 32:
-                cm = T.alloc_fragment((hc_mult, hc_mult), T.float32)
-                for j in T.Parallel(hc_mult):
-                    post_mix[i, j] = (
-                        T.sigmoid(
-                            mixes_shared[j + hc_mult] * hc_scale[1]
-                            + hc_base[j + hc_mult]
-                        )
-                        * hc_post_mult_value
-                    )
-                for j, k in T.Parallel(hc_mult, hc_mult):
-                    cm[j, k] = (
-                        mixes_shared[j * hc_mult + k + hc_mult * 2] * hc_scale[2]
-                        + hc_base[j * hc_mult + k + hc_mult * 2]
-                    )
-
-                row_sum = T.alloc_fragment(hc_mult, T.float32)
-                col_sum = T.alloc_fragment(hc_mult, T.float32)
-                row_max = T.alloc_fragment(hc_mult, T.float32)
-                T.reduce_max(cm, row_max, dim=1)
-                for j, k in T.Parallel(hc_mult, hc_mult):
-                    cm[j, k] = T.exp(cm[j, k] - row_max[j])
-                T.reduce_sum(cm, row_sum, dim=1)
-                for j, k in T.Parallel(hc_mult, hc_mult):
-                    cm[j, k] = cm[j, k] / row_sum[j] + hc_sinkhorn_eps
-
-                T.reduce_sum(cm, col_sum, dim=0)
-                for j, k in T.Parallel(hc_mult, hc_mult):
-                    cm[j, k] = cm[j, k] / (col_sum[k] + hc_sinkhorn_eps)
-
-                for _ in T.serial(sinkhorn_repeat - 1):
-                    T.reduce_sum(cm, row_sum, dim=1)
-                    for j, k in T.Parallel(hc_mult, hc_mult):
-                        cm[j, k] = cm[j, k] / (row_sum[j] + hc_sinkhorn_eps)
-
-                    T.reduce_sum(cm, col_sum, dim=0)
-                    for j, k in T.Parallel(hc_mult, hc_mult):
-                        cm[j, k] = cm[j, k] / (col_sum[k] + hc_sinkhorn_eps)
-
-                for j, k in T.Parallel(hc_mult, hc_mult):
-                    comb_mix[i, j * hc_mult + k] = cm[j, k]
-            else:
-                pre_mix_shared = T.alloc_shared(hc_mult, T.float32)
-                for j in T.Parallel(hc_mult):
-                    pre_mix_shared[j] = (
-                        T.sigmoid(mixes_shared[j] * hc_scale[0] + hc_base[j])
-                        + hc_pre_eps
-                    )
-                for i0_h in T.Pipelined(hidden_size // hidden_block, num_stages=2):
-                    xs = T.alloc_shared((hc_mult, hidden_block), T.float32)
-                    xl = T.alloc_fragment((hc_mult, hidden_block), T.float32)
-                    T.copy(residual[i, 0, i0_h * hidden_block], xs)
-                    T.copy(xs, xl)
-
-                    ol = T.alloc_fragment(hidden_block, T.float32)
-                    T.clear(ol)
-                    for i_hc in T.serial(hc_mult):
-                        pre = pre_mix_shared[i_hc]
-                        for i1_h in T.Parallel(hidden_block):
-                            ol[i1_h] += pre * xl[i_hc, i1_h]
-                    T.copy(ol, layer_input[i, i0_h * hidden_block])
-            T.pdl_trigger()
-
-    @tilelang.jit(
-        pass_configs={
-            tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-            tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-            tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
-        },
+    tl.store(
+        comb_mix + token_id * hc_mult2 + comb_offsets,
+        comb_values,
+        mask=comb_mask,
     )
-    def _mhc_post_tilelang(
-        a,
-        b,
-        c,
-        d,
-        x,
-        hc: int,
-        hidden: int,
-        n_thr: int = 128,
-        h_blk: int = 1024,
-    ):
-        n = T.dynamic("num_tokens")
-        h_blk = math.gcd(hidden, h_blk)
-        a: T.Tensor((n, hc, hc), T.float32)
-        b: T.Tensor((n, hc, hidden), T.bfloat16)
-        c: T.Tensor((n, hc), T.float32)
-        d: T.Tensor((n, hidden), T.bfloat16)
-        x: T.Tensor((n, hc, hidden), T.bfloat16)
 
-        with T.Kernel(n, threads=n_thr) as i_n:
-            x_shared = T.alloc_shared((hc, h_blk), T.bfloat16)
-            b_shared = T.alloc_shared((hc, h_blk), T.bfloat16)
-            d_shared = T.alloc_shared(h_blk, T.bfloat16)
-            x_local = T.alloc_fragment((hc, h_blk), T.float32)
-            b_local = T.alloc_fragment((hc, h_blk), T.float32)
-            d_local = T.alloc_fragment(h_blk, T.float32)
-            a_local = T.alloc_fragment((hc, hc), T.float32)
-            c_local = T.alloc_fragment(hc, T.float32)
 
-            T.pdl_sync()
-            T.copy(a[i_n, 0, 0], a_local)
-            T.copy(c[i_n, 0], c_local)
-            for i0_h in T.Pipelined(T.ceildiv(hidden, h_blk), num_stages=2):
-                T.copy(b[i_n, 0, i0_h * h_blk], b_shared)
-                T.copy(d[i_n, i0_h * h_blk], d_shared)
-                T.copy(b_shared, b_local)
-                T.copy(d_shared, d_local)
-                for i_hco, i1_h in T.Parallel(hc, h_blk):
-                    x_local[i_hco, i1_h] = c_local[i_hco] * d_local[i1_h]
-                    for i_hci in T.serial(hc):
-                        x_local[i_hco, i1_h] += (
-                            a_local[i_hci, i_hco] * b_local[i_hci, i1_h]
-                        )
-                T.copy(x_local, x_shared)
-                T.copy(x_shared, x[i_n, 0, i0_h * h_blk])
-            T.pdl_trigger()
+@triton.jit
+def _mhc_pre_layer_triton_kernel(
+    pre_mix,
+    residual,
+    layer_input,
+    hidden_size: tl.constexpr,
+    hc_mult: tl.constexpr,
+    block_h: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    hidden_block_id = tl.program_id(1)
 
-else:
-    _mhc_pre_big_fuse_tilelang = None
-    _mhc_post_tilelang = None
+    hidden_offsets = hidden_block_id * block_h + tl.arange(0, block_h)
+    hidden_mask = hidden_offsets < hidden_size
+    layer_acc = tl.zeros((block_h,), tl.float32)
+    for hc_id in tl.static_range(0, hc_mult):
+        pre = tl.load(pre_mix + token_id * hc_mult + hc_id).to(tl.float32)
+        residual_offsets = (
+            token_id * hc_mult * hidden_size + hc_id * hidden_size + hidden_offsets
+        )
+        residual_values = tl.load(
+            residual + residual_offsets, mask=hidden_mask, other=0.0
+        ).to(tl.float32)
+        layer_acc += pre * residual_values
+    tl.store(
+        layer_input + token_id * hidden_size + hidden_offsets,
+        layer_acc,
+        mask=hidden_mask,
+    )
+
+
+@triton.jit
+def _mhc_post_triton_kernel(
+    comb,
+    residual,
+    post,
+    hidden_states,
+    out,
+    hidden_size: tl.constexpr,
+    hc_mult: tl.constexpr,
+    block_h: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    hidden_block_id = tl.program_id(1)
+    hidden_offsets = hidden_block_id * block_h + tl.arange(0, block_h)
+    hidden_mask = hidden_offsets < hidden_size
+    hidden_values = tl.load(
+        hidden_states + token_id * hidden_size + hidden_offsets,
+        mask=hidden_mask,
+        other=0.0,
+    ).to(tl.float32)
+
+    for out_hc in tl.static_range(0, hc_mult):
+        acc = tl.load(post + token_id * hc_mult + out_hc).to(tl.float32) * hidden_values
+        for in_hc in tl.static_range(0, hc_mult):
+            comb_value = tl.load(
+                comb + token_id * hc_mult * hc_mult + in_hc * hc_mult + out_hc
+            ).to(tl.float32)
+            residual_values = tl.load(
+                residual
+                + token_id * hc_mult * hidden_size
+                + in_hc * hidden_size
+                + hidden_offsets,
+                mask=hidden_mask,
+                other=0.0,
+            ).to(tl.float32)
+            acc += comb_value * residual_values
+        tl.store(
+            out
+            + token_id * hc_mult * hidden_size
+            + out_hc * hidden_size
+            + hidden_offsets,
+            acc,
+            mask=hidden_mask,
+        )
+
+
+@triton.jit
+def _mhc_post_hc4_triton_kernel(
+    comb,
+    residual,
+    post,
+    hidden_states,
+    out,
+    hidden_size: tl.constexpr,
+    block_h: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    hidden_block_id = tl.program_id(1)
+    hidden_offsets = hidden_block_id * block_h + tl.arange(0, block_h)
+    hidden_mask = hidden_offsets < hidden_size
+    token_hidden_offset = token_id * hidden_size
+    token_residual_offset = token_id * 4 * hidden_size
+
+    hidden_values = tl.load(
+        hidden_states + token_hidden_offset + hidden_offsets,
+        mask=hidden_mask,
+        other=0.0,
+    ).to(tl.float32)
+
+    post_base = token_id * 4
+    acc0 = tl.load(post + post_base + 0).to(tl.float32) * hidden_values
+    acc1 = tl.load(post + post_base + 1).to(tl.float32) * hidden_values
+    acc2 = tl.load(post + post_base + 2).to(tl.float32) * hidden_values
+    acc3 = tl.load(post + post_base + 3).to(tl.float32) * hidden_values
+
+    comb_base = token_id * 16
+    for in_hc in tl.static_range(0, 4):
+        residual_values = tl.load(
+            residual + token_residual_offset + in_hc * hidden_size + hidden_offsets,
+            mask=hidden_mask,
+            other=0.0,
+        ).to(tl.float32)
+        comb_row = comb_base + in_hc * 4
+        acc0 += tl.load(comb + comb_row + 0).to(tl.float32) * residual_values
+        acc1 += tl.load(comb + comb_row + 1).to(tl.float32) * residual_values
+        acc2 += tl.load(comb + comb_row + 2).to(tl.float32) * residual_values
+        acc3 += tl.load(comb + comb_row + 3).to(tl.float32) * residual_values
+
+    tl.store(
+        out + token_residual_offset + hidden_offsets,
+        acc0,
+        mask=hidden_mask,
+    )
+    tl.store(
+        out + token_residual_offset + hidden_size + hidden_offsets,
+        acc1,
+        mask=hidden_mask,
+    )
+    tl.store(
+        out + token_residual_offset + hidden_size * 2 + hidden_offsets,
+        acc2,
+        mask=hidden_mask,
+    )
+    tl.store(
+        out + token_residual_offset + hidden_size * 3 + hidden_offsets,
+        acc3,
+        mask=hidden_mask,
+    )
 
 
 def mhc_pre(
@@ -222,8 +314,6 @@ def mhc_pre(
     hc_eps: float,
     sinkhorn_iters: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if tilelang is None or _mhc_pre_big_fuse_tilelang is None:
-        raise RuntimeError("tilelang is unavailable")
     if residual.dtype != torch.bfloat16 or fn.dtype != torch.float32:
         raise RuntimeError("fast mHC requires bf16 residual and fp32 weights")
     if not residual.is_cuda:
@@ -268,6 +358,9 @@ def mhc_pre(
     post_mix = torch.empty(
         num_tokens, hc_mult, dtype=torch.float32, device=residual.device
     )
+    pre_mix = torch.empty(
+        num_tokens, hc_mult, dtype=torch.float32, device=residual.device
+    )
     comb_mix = torch.empty(
         num_tokens, hc_mult2, dtype=torch.float32, device=residual.device
     )
@@ -288,23 +381,36 @@ def mhc_pre(
         gemm_out_sqrsum,
         n_splits,
     )
-    _mhc_pre_big_fuse_tilelang(
+    block_h = 1024
+    block_comb = triton.next_power_of_2(hc_mult2)
+    _mhc_pre_mix_triton_kernel[(num_tokens,)](
         gemm_out_mul,
         gemm_out_sqrsum,
         hc_scale,
         hc_base,
-        residual_flat,
+        pre_mix,
         post_mix,
         comb_mix,
+        hidden_size=hidden_size,
+        rms_eps=rms_eps,
+        hc_eps=hc_eps,
+        sinkhorn_iters=sinkhorn_iters,
+        n_splits=n_splits,
+        hc_mult=hc_mult,
+        hc_mult2=hc_mult2,
+        hc_mult3=hc_mult3,
+        block_comb=block_comb,
+        num_tokens=num_tokens,
+        num_warps=1,
+    )
+    _mhc_pre_layer_triton_kernel[(num_tokens, triton.cdiv(hidden_size, block_h))](
+        pre_mix,
+        residual_flat,
         layer_input,
-        hidden_size,
-        rms_eps,
-        hc_eps,
-        hc_eps,
-        2.0,
-        sinkhorn_iters,
-        n_splits,
-        hc_mult,
+        hidden_size=hidden_size,
+        hc_mult=hc_mult,
+        block_h=block_h,
+        num_warps=4,
     )
 
     return (
@@ -320,20 +426,42 @@ def mhc_post(
     post: torch.Tensor,
     comb: torch.Tensor,
 ) -> torch.Tensor:
-    if tilelang is None or _mhc_post_tilelang is None:
-        raise RuntimeError("tilelang is unavailable")
     if not hidden_states.is_cuda:
         raise RuntimeError("fast mHC requires CUDA tensors")
     if residual.numel() == 0:
         return torch.empty_like(residual)
     out = torch.empty_like(residual)
-    _mhc_post_tilelang(
-        comb,
-        residual,
-        post.squeeze(-1),
-        hidden_states,
+    hc_mult = residual.shape[-2]
+    hidden_size = residual.shape[-1]
+    residual_flat = residual.view(-1, hc_mult, hidden_size)
+    hidden_states_flat = hidden_states.view(-1, hidden_size)
+    post_flat = post.view(-1, hc_mult)
+    comb_flat = comb.view(-1, hc_mult, hc_mult)
+    num_tokens = residual_flat.shape[0]
+    if hc_mult == 4:
+        block_h = 256
+        _mhc_post_hc4_triton_kernel[(num_tokens, triton.cdiv(hidden_size, block_h))](
+            comb_flat,
+            residual_flat,
+            post_flat,
+            hidden_states_flat,
+            out,
+            hidden_size=hidden_size,
+            block_h=block_h,
+            num_warps=4,
+        )
+        return out
+
+    block_h = 1024
+    _mhc_post_triton_kernel[(num_tokens, triton.cdiv(hidden_size, block_h))](
+        comb_flat,
+        residual_flat,
+        post_flat,
+        hidden_states_flat,
         out,
-        residual.shape[-2],
-        residual.shape[-1],
+        hidden_size=hidden_size,
+        hc_mult=hc_mult,
+        block_h=block_h,
+        num_warps=4,
     )
     return out

@@ -1263,6 +1263,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         bs: int,
         save_kv_cache: bool = True,
+        record_kv_cache: bool | None = None,
         **kwargs,
     ):
         if forward_mode is None:
@@ -1276,6 +1277,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 forward_mode,
                 bs,
                 save_kv_cache,
+                record_kv_cache=record_kv_cache,
                 **kwargs,
             )
 
@@ -1287,45 +1289,36 @@ class HybridLinearAttnBackend(AttentionBackend):
         layer_id = layer.layer_id if layer else kwargs["layer_id"]
         backend = self._backend_for_layer(layer_id)
 
-        if forward_mode.is_decode():
-            return backend.forward_decode(
-                q,
-                k,
-                v,
-                layer,
-                out_cache_loc,
-                token_to_kv_pool,
-                bs,
-                save_kv_cache=save_kv_cache,
-                **kwargs,
-            )
-        else:
-            step_counter = getattr(self, "step_counter", None)
-            if (
-                not forward_mode.is_idle()
-                and step_counter is not None
-                and not save_kv_cache
-            ):
-                step_counter.record_cache()
-            ret = backend.forward_extend(
-                q,
-                k,
-                v,
-                layer,
-                out_cache_loc,
-                token_to_kv_pool,
-                bs,
-                save_kv_cache=save_kv_cache,
-                forward_mode=forward_mode,
-                **kwargs,
-            )
-            if (
-                not forward_mode.is_idle()
-                and step_counter is not None
-                and save_kv_cache
-            ):
-                step_counter.record_cache()
-            return ret
+        # See AttentionBackend.forward for the record_kv_cache contract; the step
+        # is recorded in this wrapper (not the child backends) to keep one step
+        # per model layer across full-attn + mamba. Idle already returned above.
+        with self.record_pd_cache_step(forward_mode, save_kv_cache, record_kv_cache):
+            if forward_mode.is_decode():
+                ret = backend.forward_decode(
+                    q,
+                    k,
+                    v,
+                    layer,
+                    out_cache_loc,
+                    token_to_kv_pool,
+                    bs,
+                    save_kv_cache=save_kv_cache,
+                    **kwargs,
+                )
+            else:
+                ret = backend.forward_extend(
+                    q,
+                    k,
+                    v,
+                    layer,
+                    out_cache_loc,
+                    token_to_kv_pool,
+                    bs,
+                    save_kv_cache=save_kv_cache,
+                    forward_mode=forward_mode,
+                    **kwargs,
+                )
+        return ret
 
     def forward_decode(
         self, q, k, v, layer, out_cache_loc, token_to_kv_pool, bs, **kwargs

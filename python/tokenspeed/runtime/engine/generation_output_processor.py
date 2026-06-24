@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 
 from tokenspeed.runtime.engine.io_struct import BatchTokenIDOut
 from tokenspeed.runtime.engine.request_types import (
+    ABORT_CODE,
     FINISH_ABORT,
     FINISH_LENGTH,
     FINISH_MATCHED_STR,
@@ -33,6 +34,7 @@ from tokenspeed.runtime.engine.request_types import (
     BaseFinishReason,
 )
 from tokenspeed.runtime.engine.scheduler_utils import (
+    make_abort_event,
     make_extend_result_event,
     make_finish_event,
     make_update_reserve_tokens_event,
@@ -201,6 +203,11 @@ class RequestState:
         mm.mrope_positions = extend_mrope_positions_for_retracted_request(
             mm.mrope_positions, target_len - current_len
         )
+
+    def release_pending_multimodal_features(self) -> None:
+        mm = self.multimodal_inputs
+        if mm is not None and hasattr(mm, "release_shm_features"):
+            mm.release_shm_features()
 
     def init_incremental_detokenize(self):
         """Return (all_ids_from_surr_offset, read_offset_relative_to_surr)."""
@@ -390,6 +397,7 @@ class OutputProcesser:
             state.finished_output = False
             self.stream_output([rid], [state])
         finally:
+            state.release_pending_multimodal_features()
             self.rid_to_state.pop(rid, None)
             # This path replaces register() for grammar-aborted rids —
             # drop any queued abort marker so pending_aborts doesn't leak
@@ -534,6 +542,12 @@ class OutputProcesser:
             if model_execution_results.output_logprobs is not None
             else None
         )
+        # NaN-guard flags, aligned with forward_op.request_ids (None when disabled).
+        nan_flags_list = (
+            model_execution_results.output_nan_flags.tolist()
+            if model_execution_results.output_nan_flags is not None
+            else None
+        )
         pt = 0
         for i, rid in enumerate(forward_op.request_ids):
             output_length = model_execution_results.output_lengths[i].item()
@@ -561,9 +575,32 @@ class OutputProcesser:
             if not request_state.prefill_finished:
                 continue
 
+            nan_detected = nan_flags_list is not None and nan_flags_list[i]
+            if nan_detected and not request_state.finished:
+                request_state.finished_reason = FINISH_ABORT(
+                    message=(
+                        "Request terminated: numerical corruption (NaN logits"
+                        " or out-of-vocab sample) detected during generation."
+                    ),
+                    err_type=ABORT_CODE.NumericalError,
+                )
+                # Keep one sanitized token so accounting matches a mid-step finish.
+                model_output_ids = model_output_ids[:1]
+                if model_output_logprobs is not None:
+                    model_output_logprobs = model_output_logprobs[:1]
+                self.metrics.record_nan_abort()
+                if self.global_rank == 0:
+                    logger.warning(
+                        "Req %s terminated: NaN detected in logits (or an"
+                        " out-of-vocab sample escaped the sampler);"
+                        " isolating it from the batch.",
+                        rid,
+                    )
+
             # Notify caller of first output token (used by prefill node to hand off
             # bootstrap token to the KV transfer layer before streaming output).
-            if on_first_token is not None and model_output_ids:
+            # NaN-terminated requests skip the handoff: their KV is suspect.
+            if on_first_token is not None and model_output_ids and not nan_detected:
                 spec_candidate_ids = None
                 if model_execution_results.next_input_ids is not None and i < len(
                     model_execution_results.next_input_ids
@@ -638,6 +675,7 @@ class OutputProcesser:
                 if request_state.abort_notify_client:
                     stream_out_rids.append(rid)
                     stream_out_states.append(request_state)
+                request_state.release_pending_multimodal_features()
                 self.rid_to_state.pop(rid)
                 continue
 
@@ -652,7 +690,11 @@ class OutputProcesser:
             elif request_state.finished:
                 stream_out_rids.append(rid)
                 stream_out_states.append(request_state)
-                request_changes.append(make_finish_event(rid))
+                # Abort (vs Finish) keeps corrupted KV out of the prefix caches.
+                request_changes.append(
+                    make_abort_event(rid) if nan_detected else make_finish_event(rid)
+                )
+                request_state.release_pending_multimodal_features()
                 self.rid_to_state.pop(rid)
             else:
                 stream_out_rids.append(rid)
@@ -704,6 +746,7 @@ class OutputProcesser:
         if req_id not in self.rid_to_state:
             return []
         rs = self.rid_to_state.pop(req_id)
+        rs.release_pending_multimodal_features()
 
         # Ensure a finish reason is set so TokenizerManager marks the request done.
         if not rs.finished:

@@ -52,6 +52,8 @@ first item's ``encoded`` tensor.
 
 from __future__ import annotations
 
+import logging
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -65,8 +67,13 @@ from tokenspeed.runtime.multimodal.inputs import (
     MultimodalForwardContext,
     MultimodalInputs,
 )
+from tokenspeed.runtime.multimodal.shm_transport import ShmTensorHandle
+from tokenspeed.runtime.utils.env import envs
 
 EncoderFn = Callable[[List[MultimodalDataItem]], torch.Tensor]
+
+logger = logging.getLogger(__name__)
+LOG_MM_TIMING = envs.TOKENSPEED_LOG_MM_TIMING.get()
 
 
 @dataclass
@@ -100,13 +107,18 @@ def pad_input_tokens(input_ids: List[int], mm_inputs: MultimodalInputs) -> List[
     if not input_ids or not mm_inputs.mm_items:
         return input_ids
 
-    out = torch.as_tensor(input_ids)
+    out = None
     for item in mm_inputs.mm_items:
         if item.pad_value is None or not item.offsets:
             continue
+        if out is None:
+            out = list(input_ids)
+        pad_value = int(item.pad_value)
         for offset_start, offset_end in item.offsets:
-            out[offset_start : offset_end + 1] = item.pad_value
-    return out.tolist()
+            out[offset_start : offset_end + 1] = [pad_value] * (
+                offset_end - offset_start + 1
+            )
+    return input_ids if out is None else out
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +157,9 @@ class EncodePlan:
         default_factory=lambda: defaultdict(list)
     )
     scatter_ranges: List[ScatterRange] = field(default_factory=list)
+    aliases_by_canonical: Dict[MultimodalDataItem, List[MultimodalDataItem]] = field(
+        default_factory=lambda: defaultdict(list)
+    )
 
     def __bool__(self) -> bool:
         return bool(self.scatter_ranges)
@@ -189,19 +204,74 @@ class VisionEmbedder:
         if is_decode_or_idle or ctx is None or not ctx.has_extend_inputs():
             return None, {}
 
+        total_started = time.perf_counter() if LOG_MM_TIMING else None
+        plan_started = time.perf_counter() if LOG_MM_TIMING else None
         plan = self._plan(ctx)
+        plan_elapsed_ms = (
+            (time.perf_counter() - plan_started) * 1000
+            if plan_started is not None
+            else None
+        )
         if not plan:
             return None, {}
 
+        encode_started = time.perf_counter() if LOG_MM_TIMING else None
         self._encode(plan, encoders, multimodal_model, input_ids.device)
+        encode_elapsed_ms = (
+            (time.perf_counter() - encode_started) * 1000
+            if encode_started is not None
+            else None
+        )
 
+        alias_started = time.perf_counter() if LOG_MM_TIMING else None
+        released_alias_features = self._share_encoded_aliases(plan)
+        alias_elapsed_ms = (
+            (time.perf_counter() - alias_started) * 1000
+            if alias_started is not None
+            else None
+        )
+
+        assemble_started = time.perf_counter() if LOG_MM_TIMING else None
         input_embeds, kwargs = self._assemble(
             input_ids, text_embedding, plan, encoders, multimodal_model
         )
+        assemble_elapsed_ms = (
+            (time.perf_counter() - assemble_started) * 1000
+            if assemble_started is not None
+            else None
+        )
 
-        # Pixel tensors are no longer needed; reclaim their GPU bytes by
-        # parking them on the host. Encoded tensors stay on device.
-        self._offload_pixel_features_to_cpu(ctx)
+        cleanup_started = time.perf_counter() if LOG_MM_TIMING else None
+        released_encoded_features = self._drop_encoded_pixel_features(ctx)
+        cleanup_elapsed_ms = (
+            (time.perf_counter() - cleanup_started) * 1000
+            if cleanup_started is not None
+            else None
+        )
+        if LOG_MM_TIMING and total_started is not None:
+            misses = {
+                modality.name: len(items)
+                for modality, items in plan.misses_by_modality.items()
+                if items
+            }
+            logger.info(
+                "mm_timing vision_embedder_apply_ms total=%.3f plan=%.3f "
+                "encode=%.3f alias=%.3f assemble=%.3f feature_cleanup=%.3f "
+                "scatter_ranges=%d misses=%s input_rows=%d aliases=%d "
+                "released_alias_features=%d released_encoded_features=%d",
+                (time.perf_counter() - total_started) * 1000,
+                plan_elapsed_ms,
+                encode_elapsed_ms,
+                alias_elapsed_ms,
+                assemble_elapsed_ms,
+                cleanup_elapsed_ms,
+                len(plan.scatter_ranges),
+                misses,
+                int(input_ids.numel()),
+                sum(len(items) for items in plan.aliases_by_canonical.values()),
+                released_alias_features,
+                released_encoded_features,
+            )
         return input_embeds, kwargs
 
     # --- phase 1: plan -----------------------------------------------------
@@ -247,6 +317,9 @@ class VisionEmbedder:
                     canonical = item
                     if item.hash is not None:
                         canonical_by_hash[item.hash] = item
+
+                if canonical is not item:
+                    plan.aliases_by_canonical[canonical].append(item)
 
                 # src_cursor: start of current subgrid inside item.encoded.
                 src_cursor = 0
@@ -294,8 +367,22 @@ class VisionEmbedder:
                     f"VisionEmbedder: no encoder registered for {modality}"
                 )
 
+            move_started = time.perf_counter() if LOG_MM_TIMING else None
             self._move_pixel_features_to_device(items, device)
+            move_elapsed_ms = (
+                (time.perf_counter() - move_started) * 1000
+                if move_started is not None
+                else None
+            )
+            encoder_started = time.perf_counter() if LOG_MM_TIMING else None
             output = spec.fn(items)
+            if LOG_MM_TIMING and device.type == "cuda":
+                torch.cuda.synchronize(device)
+            encoder_elapsed_ms = (
+                (time.perf_counter() - encoder_started) * 1000
+                if encoder_started is not None
+                else None
+            )
             output = output.reshape(-1, output.shape[-1])
 
             per_item_lens = [_item_token_count(it) for it in items]
@@ -309,6 +396,30 @@ class VisionEmbedder:
             else:
                 for item, emb in zip(items, per_item_embs):
                     item.encoded = emb
+            if LOG_MM_TIMING:
+                logger.info(
+                    "mm_timing encoder_ms modality=%s items=%d "
+                    "encoder_output_tokens=%d move_h2d=%.3f encode=%.3f "
+                    "per_item_tokens=%s",
+                    modality.name,
+                    len(items),
+                    int(output.shape[0]),
+                    move_elapsed_ms,
+                    encoder_elapsed_ms,
+                    per_item_lens,
+                )
+
+    def _share_encoded_aliases(self, plan: EncodePlan) -> int:
+        released = 0
+        for canonical, aliases in plan.aliases_by_canonical.items():
+            if canonical.encoded is None:
+                continue
+            for alias in aliases:
+                alias.encoded = canonical.encoded
+                alias.encoded_deepstack = canonical.encoded_deepstack
+                if self._drop_raw_feature(alias):
+                    released += 1
+        return released
 
     # --- phase 3: assemble -------------------------------------------------
 
@@ -380,28 +491,46 @@ class VisionEmbedder:
         pending = [
             it
             for it in items
-            if isinstance(it.feature, torch.Tensor) and it.feature.device != device
+            if isinstance(it.feature, (torch.Tensor, ShmTensorHandle))
+            and (isinstance(it.feature, ShmTensorHandle) or it.feature.device != device)
         ]
         if not pending:
             return
 
+        for it in pending:
+            if isinstance(it.feature, ShmTensorHandle):
+                it.feature = it.feature.consume()
+
         if device.type != "cuda":
             for it in pending:
-                it.feature = it.feature.to(device, non_blocking=True)
+                if isinstance(it.feature, torch.Tensor):
+                    it.feature = it.feature.to(device, non_blocking=True)
             return
 
         h2d = self._h2d_stream_on(device)
         current = torch.cuda.current_stream(device)
         with torch.cuda.stream(h2d):
             for it in pending:
-                it.feature = it.feature.to(device, non_blocking=True)
+                if isinstance(it.feature, torch.Tensor):
+                    it.feature = it.feature.to(device, non_blocking=True)
         current.wait_stream(h2d)
 
     @staticmethod
-    def _offload_pixel_features_to_cpu(ctx: MultimodalForwardContext) -> None:
+    def _drop_raw_feature(item: MultimodalDataItem) -> bool:
+        if item.feature is None:
+            return False
+        if isinstance(item.feature, ShmTensorHandle):
+            item.feature.release()
+        item.feature = None
+        return True
+
+    @staticmethod
+    def _drop_encoded_pixel_features(ctx: MultimodalForwardContext) -> int:
+        released = 0
         for mm in ctx.mm_inputs:
             if mm is None:
                 continue
             for it in mm.mm_items:
-                if isinstance(it.feature, torch.Tensor) and it.feature.is_cuda:
-                    it.feature = it.feature.to("cpu", non_blocking=True)
+                if it.encoded is not None and VisionEmbedder._drop_raw_feature(it):
+                    released += 1
+        return released

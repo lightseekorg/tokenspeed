@@ -23,10 +23,9 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from tokenspeed_kernel.platform import current_platform
-
 from tokenspeed.runtime.configs.model_config import AttentionArch, is_deepseek_v4
 from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
+from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
@@ -105,13 +104,10 @@ _BACKEND_ALIASES = {
 
 
 def _get_default_backend_name(arch: AttentionArch) -> str:
-    platform = current_platform()
     if arch == AttentionArch.MLA:
-        if platform.is_blackwell:
-            return "trtllm_mla"
-        if platform.is_hopper:
-            return "flashmla"
-        return "trtllm_mla"
+        return "mla"
+    if arch == AttentionArch.DSA:
+        return "dsa"
     else:
         return "mha"
 
@@ -146,6 +142,7 @@ def _get_backend_cls(name: str, arch: AttentionArch) -> type[AttentionBackend]:
 _CONFIG_CLS: dict[AttentionArch, type[BaseAttnConfig]] = {
     AttentionArch.MHA: MHAConfig,
     AttentionArch.MLA: MLAConfig,
+    AttentionArch.DSA: DSAConfig,
 }
 
 

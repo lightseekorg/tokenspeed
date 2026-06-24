@@ -54,6 +54,76 @@ from triton_kernels.tensor import (
 from triton_kernels.tensor_details import layout
 
 platform = current_platform()
+_GLUON_COMBINE_BLOCK_N = 128
+
+
+def _pad_w2_to_block_n(w: torch.nn.Module, block_n: int) -> None:
+    original_n = int(w.w2_weight.shape[-2])
+    w._w2_logical_n = original_n
+
+    if original_n % block_n == 0:
+        return
+
+    padded_n = (original_n + block_n - 1) // block_n * block_n
+    extra_n = padded_n - original_n
+
+    w2_weight = w.w2_weight.data
+    w2_scale = w.w2_weight_scale.data
+    w.w2_weight = torch.nn.Parameter(
+        torch.cat(
+            [
+                w2_weight,
+                torch.zeros(
+                    *w2_weight.shape[:-2],
+                    extra_n,
+                    w2_weight.shape[-1],
+                    dtype=w2_weight.dtype,
+                    device=w2_weight.device,
+                ),
+            ],
+            dim=-2,
+        ),
+        requires_grad=False,
+    )
+    w.w2_weight_scale = torch.nn.Parameter(
+        torch.cat(
+            [
+                w2_scale,
+                torch.full(
+                    (*w2_scale.shape[:-2], extra_n, w2_scale.shape[-1]),
+                    127,
+                    dtype=w2_scale.dtype,
+                    device=w2_scale.device,
+                ),
+            ],
+            dim=-2,
+        ),
+        requires_grad=False,
+    )
+
+
+def _attach_gluon_preshuffle(w: torch.nn.Module) -> None:
+    from tokenspeed_kernel_amd.ops.moe import fused_mxfp_gfx950
+
+    targets = (
+        ("w13_weight_triton_tensor", None),
+        ("w2_weight_triton_tensor", getattr(w, "_w2_logical_n", None)),
+    )
+    for attr, logical_n in targets:
+        wrapped = getattr(w, attr, None)
+        if wrapped is None:
+            continue
+        raw = fused_mxfp_gfx950._extract_gluon_raw_w(wrapped)
+        try:
+            shuffled = fused_mxfp_gfx950.shuffle_weight_for_gluon_dot_layout(raw)
+        except (AssertionError, ValueError):
+            continue
+        if logical_n is not None and int(logical_n) != int(shuffled.shape[-1]):
+            shuffled.original_n = int(logical_n)
+            raw.original_n = int(logical_n)
+            wrapped.original_n = int(logical_n)
+        raw._gluon_shuffled = shuffled
+        wrapped._gluon_shuffled = shuffled
 
 
 def _swizzle_mxfp4(quant_tensor, scale, num_warps):
@@ -105,8 +175,8 @@ if platform.is_amd:
         ),
         signatures=frozenset({format_signature()}),
         traits={"weight_dtype": frozenset({"mxfp4"})},
-        # Lower priority than the triton implementation due to performance issue
-        priority=Priority.PORTABLE - 1,
+        # gluon is narrowly gated to gfx950
+        priority=Priority.SPECIALIZED,
     )
     def gluon_mxfp4_moe_process_weights(plan: dict, w: torch.nn.Module):
         MXFP_BLOCK_SIZE = 32
@@ -115,6 +185,7 @@ if platform.is_amd:
         w2_weight_bias = w.w2_weight_bias.to(torch.float32)
         w.w13_weight_bias = torch.nn.Parameter(w13_weight_bias, requires_grad=False)
         w.w2_weight_bias = torch.nn.Parameter(w2_weight_bias, requires_grad=False)
+        _pad_w2_to_block_n(w, _GLUON_COMBINE_BLOCK_N)
 
         num_warps = 8
         w13_weight, w13_flex, w13_scale = _swizzle_mxfp4(
@@ -169,6 +240,7 @@ if platform.is_amd:
 
         w.w13_weight_triton_tensor = w13_weight
         w.w2_weight_triton_tensor = w2_weight
+        _attach_gluon_preshuffle(w)
         del w.w13_weight
         del w.w2_weight
 
@@ -200,8 +272,8 @@ if platform.is_amd:
             "internal_activation_dtype": frozenset({"fp8"}),
             "supports_bias": frozenset({True}),
         },
-        # Lower priority than the triton implementation due to performance issue
-        priority=Priority.PORTABLE - 1,
+        # gluon is narrowly gated to gfx950
+        priority=Priority.SPECIALIZED,
     )
     def gluon_mxfp4_moe_apply(
         plan: dict,

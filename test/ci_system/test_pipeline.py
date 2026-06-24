@@ -49,9 +49,9 @@ def test_stale_process_patterns_match_existing_targets():
 
 
 def test_amd_runner_prefixes_cover_legacy_and_arc_labels():
-    assert is_amd_runner("linux-mi355-1gpu-lightseek")
     assert is_amd_runner("amd-mi35x-1gpu-test")
     assert is_amd_runner("amd-mi35x-4gpu-test")
+    assert is_amd_runner("amd-mi355-1gpu-bench")
     assert is_amd_runner("amd-mi350-1gpu-bench")
     assert is_amd_runner("amd-mi350-4gpu-bench")
     assert not is_amd_runner("b200-1gpu")
@@ -69,6 +69,7 @@ def test_nvidia_gpu_cleanup_runner_prefixes_cover_gb200_and_b300():
     assert not should_run_nvidia_gpu_cleanup("b200-4gpu")
     assert not should_run_nvidia_gpu_cleanup("h100-1gpu")
     assert not should_run_nvidia_gpu_cleanup("amd-mi35x-2gpu-test")
+    assert not should_run_nvidia_gpu_cleanup("amd-mi355-1gpu-bench")
     assert not should_run_nvidia_gpu_cleanup("amd-mi350-1gpu-bench")
 
 

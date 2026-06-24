@@ -72,6 +72,7 @@ class FINISH_LENGTH(BaseFinishReason):
 class ABORT_CODE(Enum):
     TransferFailed = 521
     UnknownError = 522
+    NumericalError = 523
 
 
 class FINISH_ABORT(BaseFinishReason):

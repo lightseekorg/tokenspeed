@@ -32,7 +32,6 @@ from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.torch_compile import get_compiler_backend
 
 _is_nvidia = current_platform().is_nvidia
-_is_amd = current_platform().is_amd
 
 
 def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
@@ -622,10 +621,6 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
-
-        # Re-dispatch
-        if _is_amd:
-            self._forward_method = self.forward_native
 
     def _compute_inv_freq(self, scaling_factor: float) -> torch.Tensor:
         pos_freqs = self.base ** (

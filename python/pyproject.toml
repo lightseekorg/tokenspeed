@@ -45,7 +45,7 @@ dependencies = [
     "msgspec",
     "ninja",
     "numpy",
-    "openai==2.33.0",
+    "openai>=2.24.1",
     "openai-harmony",
     "orjson",
     "packaging",
@@ -65,17 +65,21 @@ dependencies = [
     "setproctitle",
     "tiktoken",
     "tokenspeed-mooncake>=0.3.11.post20260527",
-    "tokenspeed-smg==1.5.0.post20260612",
-    "tokenspeed-smg-grpc-proto==0.4.10.post20260612",
-    "tokenspeed-smg-grpc-servicer==0.5.5.post20260612",
+    "tokenspeed-smg==1.6.0.post20260623",
+    "tokenspeed-smg-grpc-proto==0.4.11.post20260623",
+    "tokenspeed-smg-grpc-servicer==0.5.6.post20260623",
     "torch==2.11.0",
+    # Tag-capable sleep/wake allocator (region(tag, enable_cpu_backup)/pause/
+    # resume). Bundles cu12/cu13 binaries; import-guarded so it's a no-op unless
+    # --enable-memory-saver is set. See runtime/utils/torch_memory_saver_adapter.py.
+    "torch_memory_saver==0.0.9.post1",
     "torchvision",
     "tqdm",
-    "transformers==5.6.2",
+    "transformers==5.12.0",
     "uv",
     "uvicorn",
     "uvloop",
-    "xgrammar==0.1.33",
+    "xgrammar==0.2.2",
     "viztracer",
 ]
 

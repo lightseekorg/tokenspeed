@@ -64,6 +64,7 @@ if _is_nvidia:
     )
 
 from tokenspeed_kernel.ops.attention.triton.context import context_attention_fwd
+from tokenspeed_kernel.ops.attention.triton.qkv_rotary import packed_qkv_complex_rotary
 
 # CUDA-graph bucketing for the cuDNN vision prefill backend: batch and max
 # seqlen are quantized so a small set of captured graphs covers the request
@@ -348,6 +349,7 @@ class VisionAttention(nn.Module):
         customized_position_embedding_applier: Callable[
             [torch.Tensor, torch.Tensor, Any, Any], Tuple[torch.Tensor, torch.Tensor]
         ] = None,
+        position_embedding_mode: str | None = None,
         workspace_buffer: Optional[torch.Tensor] = None,
         mm_attention_backend: str | None = None,
     ):
@@ -370,7 +372,16 @@ class VisionAttention(nn.Module):
         self.customized_position_embedding_applier = (
             customized_position_embedding_applier
         )
+        if position_embedding_mode not in (None, "complex_rope"):
+            raise ValueError(
+                f"Unknown vision position embedding mode: {position_embedding_mode}"
+            )
+        self.position_embedding_mode = position_embedding_mode
         self._backend_fn = _resolve_backend(mm_attention_backend)
+        self._use_packed_qkv_complex_rotary = (
+            self._backend_fn is vision_attn_fa4
+            and self.position_embedding_mode == "complex_rope"
+        )
         self._workspace_buffer = workspace_buffer
 
         self.qkv_proj = QKVParallelLinear(
@@ -426,16 +437,29 @@ class VisionAttention(nn.Module):
         )
 
         qkv, _ = self.qkv_proj(x)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-
-        q = q.reshape(bsz * s, head, -1).contiguous()
-        k = k.reshape(bsz * s, kv_head, -1).contiguous()
-        v = v.reshape(bsz * s, kv_head, -1).contiguous()
-
         cos = None
         sin = None
 
-        if position_embeddings is not None:
+        use_packed_qkv_complex_rotary = (
+            self._use_packed_qkv_complex_rotary and position_embeddings is not None
+        )
+        if use_packed_qkv_complex_rotary:
+            q, k, v = packed_qkv_complex_rotary(
+                qkv,
+                self.q_size,
+                self.kv_size,
+                head,
+                self.head_size,
+                position_embeddings,
+            )
+        else:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+            q = q.reshape(bsz * s, head, -1).contiguous()
+            k = k.reshape(bsz * s, kv_head, -1).contiguous()
+            v = v.reshape(bsz * s, kv_head, -1).contiguous()
+
+        if not use_packed_qkv_complex_rotary and position_embeddings is not None:
             if self.customized_position_embedding_applier is not None:
                 q, k = self.customized_position_embedding_applier(
                     q, k, position_embeddings, x_shape

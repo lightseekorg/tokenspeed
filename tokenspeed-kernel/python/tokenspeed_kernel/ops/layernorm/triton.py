@@ -35,6 +35,47 @@ def _rmsnorm_kernel(
     tl.store(out_ptr + row_offsets, x * weight, mask=mask)
 
 
+@triton.jit
+def _rmsnorm_fused_parallel_kernel(
+    input1_ptr,
+    weight1_ptr,
+    output1_ptr,
+    input2_ptr,
+    weight2_ptr,
+    output2_ptr,
+    n_cols1: tl.constexpr,
+    n_cols2: tl.constexpr,
+    stride_input1: tl.constexpr,
+    stride_output1: tl.constexpr,
+    stride_input2: tl.constexpr,
+    stride_output2: tl.constexpr,
+    eps: tl.constexpr,
+    BLOCK1: tl.constexpr,
+    BLOCK2: tl.constexpr,
+):
+    row = tl.program_id(0)
+
+    offsets1 = tl.arange(0, BLOCK1)
+    mask1 = offsets1 < n_cols1
+    input1_offsets = row * stride_input1 + offsets1
+    output1_offsets = row * stride_output1 + offsets1
+    input1 = tl.load(input1_ptr + input1_offsets, mask=mask1, other=0.0).to(tl.float32)
+    variance1 = tl.sum(input1 * input1, axis=0) / n_cols1
+    weight1 = tl.load(weight1_ptr + offsets1, mask=mask1, other=0.0).to(tl.float32)
+    output1 = input1 * tl.rsqrt(variance1 + eps) * weight1
+    tl.store(output1_ptr + output1_offsets, output1, mask=mask1)
+
+    offsets2 = tl.arange(0, BLOCK2)
+    mask2 = offsets2 < n_cols2
+    input2_offsets = row * stride_input2 + offsets2
+    output2_offsets = row * stride_output2 + offsets2
+    input2 = tl.load(input2_ptr + input2_offsets, mask=mask2, other=0.0).to(tl.float32)
+    variance2 = tl.sum(input2 * input2, axis=0) / n_cols2
+    weight2 = tl.load(weight2_ptr + offsets2, mask=mask2, other=0.0).to(tl.float32)
+    output2 = input2 * tl.rsqrt(variance2 + eps) * weight2
+    tl.store(output2_ptr + output2_offsets, output2, mask=mask2)
+
+
 def rmsnorm(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -398,4 +439,73 @@ def fused_qk_rmsnorm_rope_gate(
     return q_out, k_out, gate_out
 
 
-__all__ = ["rmsnorm", "qk_rmsnorm", "fused_qk_rmsnorm_rope_gate"]
+def rmsnorm_fused_parallel(
+    input1: torch.Tensor,
+    weight1: torch.Tensor,
+    output1: torch.Tensor,
+    input2: torch.Tensor,
+    weight2: torch.Tensor,
+    output2: torch.Tensor,
+    eps: float,
+    enable_pdl: bool = False,
+) -> None:
+    del enable_pdl
+    if input1.shape[0] == 0:
+        return
+    if input1.dim() != 2 or input2.dim() != 2:
+        raise ValueError("rmsnorm_fused_parallel expects 2D inputs")
+    if input1.shape[0] != input2.shape[0]:
+        raise ValueError(f"input row mismatch: {input1.shape[0]} vs {input2.shape[0]}")
+    if input1.shape != output1.shape:
+        raise ValueError(
+            f"output1 shape {tuple(output1.shape)} does not match input1 "
+            f"shape {tuple(input1.shape)}"
+        )
+    if input2.shape != output2.shape:
+        raise ValueError(
+            f"output2 shape {tuple(output2.shape)} does not match input2 "
+            f"shape {tuple(input2.shape)}"
+        )
+    if input1.shape[-1] != weight1.shape[0]:
+        raise ValueError(
+            f"weight1 shape {tuple(weight1.shape)} does not match hidden size "
+            f"{input1.shape[-1]}"
+        )
+    if input2.shape[-1] != weight2.shape[0]:
+        raise ValueError(
+            f"weight2 shape {tuple(weight2.shape)} does not match hidden size "
+            f"{input2.shape[-1]}"
+        )
+    tensors = (input1, weight1, output1, input2, weight2, output2)
+    if any(t.stride(-1) != 1 for t in tensors):
+        raise ValueError("rmsnorm_fused_parallel requires contiguous last dimension")
+
+    n_cols1 = input1.shape[-1]
+    n_cols2 = input2.shape[-1]
+    block1 = triton.next_power_of_2(n_cols1)
+    block2 = triton.next_power_of_2(n_cols2)
+    _rmsnorm_fused_parallel_kernel[(input1.shape[0],)](
+        input1,
+        weight1,
+        output1,
+        input2,
+        weight2,
+        output2,
+        n_cols1,
+        n_cols2,
+        input1.stride(0),
+        output1.stride(0),
+        input2.stride(0),
+        output2.stride(0),
+        eps,
+        BLOCK1=block1,
+        BLOCK2=block2,
+    )
+
+
+__all__ = [
+    "rmsnorm",
+    "qk_rmsnorm",
+    "fused_qk_rmsnorm_rope_gate",
+    "rmsnorm_fused_parallel",
+]

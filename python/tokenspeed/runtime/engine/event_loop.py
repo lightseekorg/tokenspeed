@@ -41,6 +41,7 @@ from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
 from tokenspeed.runtime.engine.generation_output_processor import OutputProcesser
+from tokenspeed.runtime.engine.memory_occupation import MemoryOccupationController
 from tokenspeed.runtime.engine.pause import PauseController
 from tokenspeed.runtime.engine.request_handler import RequestHandler
 from tokenspeed.runtime.engine.scheduler_utils import (
@@ -93,6 +94,7 @@ from tokenspeed.runtime.utils.exceptions import get_exception_traceback
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.process import register_usr_signal
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = get_colorful_logger(__name__)
 
@@ -104,6 +106,23 @@ def calc_l3_query_hashes(scheduler, tokens: list[int]) -> list[str]:
 # Sleep between iterations while frozen (PAUSED_ALL) so the keep-mode pause does
 # not busy-spin a CPU core waiting for /resume.
 _PAUSED_IDLE_SLEEP_S = 0.001
+
+
+def _forward_op_executes_model_forward(forward_op, *, is_disagg_decode: bool) -> bool:
+    """Return whether ``forward_op`` will enter the model forward path.
+
+    On decode-side PD, EXTEND ops only start remote KV receive; the model
+    forward runs after the remote prefill completes and the scheduler advances
+    the request into decode. Treating those EXTEND ops as model work makes
+    idle DP ranks enter dummy collectives that the active rank will not match.
+    """
+    if forward_op is None:
+        return False
+    if sum(forward_op.input_lengths) <= 0:
+        return False
+    if is_disagg_decode and forward_op.num_extends() > 0:
+        return False
+    return True
 
 
 class _NullSender:
@@ -371,6 +390,28 @@ class EventLoop:
         # drives the control-request side; the event loop reads the gate.
         self._pause = PauseController(self.send_to_tokenizer)
 
+        # GPU-memory data plane (release/resume_memory_occupation). Reuses the
+        # pause controller's drain machinery; frees memory via the memory-saver
+        # adapter once the scheduler drains. See memory_occupation.py.
+        # Releasing KV is only safe if any prefix cache it backs can be cleared:
+        # either prefix caching is off, or the scheduler exposes a reset. Decide
+        # once here (static config) and let the controller reject unsafe releases.
+        kv_cache_release_allowed = (
+            not self.server_args.enable_prefix_caching
+            or callable(getattr(self.scheduler, "reset_prefix_cache", None))
+        )
+        self._memory = MemoryOccupationController(
+            send_func=self.send_to_tokenizer,
+            pause_controller=self._pause,
+            adapter=TorchMemorySaverAdapter.create(
+                enable=self.server_args.enable_memory_saver
+            ),
+            enabled=self.server_args.enable_memory_saver,
+            reset_caches_fn=self._reset_caches_for_release,
+            kv_repair_fn=self._kv_repair_after_wake,
+            kv_cache_release_allowed=kv_cache_release_allowed,
+        )
+
         self.metrics = EngineMetrics(
             labels={
                 "model_name": server_args.served_model_name,
@@ -394,6 +435,7 @@ class EventLoop:
             get_load_fn=self._get_load,
             architectures=self.model_config.hf_config.architectures,
             pause_controller=self._pause,
+            memory_controller=self._memory,
         )
 
         self.output_processor = OutputProcesser(
@@ -1098,9 +1140,13 @@ class EventLoop:
         """
         import torch.distributed as dist
 
-        num_tokens = sum(forward_op.input_lengths) if forward_op is not None else 0
-        batch_size = len(forward_op.request_ids) if forward_op is not None else 0
-        if forward_op is None:
+        executes_model_forward = _forward_op_executes_model_forward(
+            forward_op,
+            is_disagg_decode=isinstance(self.pd_kv_transfer, DisaggDecodeExecutor),
+        )
+        num_tokens = sum(forward_op.input_lengths) if executes_model_forward else 0
+        batch_size = len(forward_op.request_ids) if executes_model_forward else 0
+        if not executes_model_forward:
             forward_mode = ForwardMode.IDLE
         else:
             forward_mode = ForwardMode.from_num_extends(
@@ -1168,6 +1214,40 @@ class EventLoop:
     # Pause / resume helpers
     # ------------------------------------------------------------------
 
+    def _reset_caches_for_release(self) -> None:
+        """Invalidate the prefix/radix cache before KV is discarded on release.
+
+        KV pages are re-mapped + zeroed on wake, so any retained prefix entry
+        would be stale. The unsafe case (prefix caching on with no reset) is
+        rejected up front in ``MemoryOccupationController.handle_release`` via
+        ``kv_cache_release_allowed``, so by the time we get here either a reset
+        exists or prefix caching is off (nothing to invalidate).
+        """
+        reset = getattr(self.scheduler, "reset_prefix_cache", None)
+        if callable(reset):
+            reset()
+
+    def _kv_pools(self) -> list:
+        """All KV pools whose pages are tagged ``kv_cache`` — the target pool and
+        the draft pool in speculative-decoding runs. Release/repair must walk the
+        SAME set, so both derive it here rather than enumerating pools by hand."""
+        pools = []
+        for attr in ("token_to_kv_pool", "draft_token_to_kv_pool"):
+            pool = getattr(self.model_executor, attr, None)
+            if pool is not None:
+                pools.append(pool)
+        return pools
+
+    def _kv_repair_after_wake(self) -> None:
+        """Zero re-mapped KV buffers (garbage after re-map) for every KV pool,
+        including the draft pool in spec-decode runs — its allocations are tagged
+        ``kv_cache`` too, so a wake that skipped it would feed the draft model
+        stale KV. FP8 KV scales ride with the weights region, so no scale reset
+        is needed here."""
+        for pool in self._kv_pools():
+            if hasattr(pool, "clear_kv_buffers"):
+                pool.clear_kv_buffers()
+
     def _paused_idle_step(self, prev_forward_op=None, prev_results=None) -> None:
         """Run one iteration under ``PAUSED_ALL`` (keep mode): no new forward
         work, but keep DP ranks in lockstep, service the drain check, and yield
@@ -1181,7 +1261,11 @@ class EventLoop:
 
         if self.has_dp:
             dp_metadata = self._dp_sync_and_check(None)
-            if dp_metadata.need_idle_forward:
+            # While memory is released the weights region is unmapped; an idle
+            # forward runs the model and would read freed memory. All DP ranks
+            # release together, so skipping the idle forward stays consistent
+            # across ranks (the small DP sync above still runs to keep lockstep).
+            if dp_metadata.need_idle_forward and not self._pause.released:
                 self.model_executor.execute_idle_forward(
                     dp_metadata.global_num_tokens,
                     dp_metadata.global_batch_size,

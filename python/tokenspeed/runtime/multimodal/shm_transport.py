@@ -20,18 +20,27 @@
 
 """POSIX SHM handle for cross-process multimodal feature tensors.
 
-Three-step lifecycle so a cross-rank barrier can sit between FD-open
-and FD-unlink: ``publish`` (producer) -> ``attach`` (every rank, before
-barrier) -> ``consume`` (every rank, after barrier). Driver methods live on
-``MultimodalInputs``.
+The lifecycle keeps the unlink race-free for tensor-parallel ranks while still
+allowing the model-side multimodal planner to deduplicate requests before any
+large payload copy happens:
+
+``publish`` (producer) -> ``attach`` (every rank, before barrier) ->
+``consume`` (only encoder misses) or ``release`` (deduplicated aliases).
 """
 
 from __future__ import annotations
 
+import logging
+import time
 from dataclasses import dataclass, field
 from multiprocessing import shared_memory
 
 import torch
+
+from tokenspeed.runtime.utils.env import envs
+
+logger = logging.getLogger(__name__)
+LOG_MM_TIMING = envs.TOKENSPEED_LOG_MM_TIMING.get()
 
 
 @dataclass
@@ -77,6 +86,7 @@ class ShmTensorHandle:
                 "before consume() (or has already been consumed on this rank)"
             )
         segment = self._segment
+        started = time.perf_counter() if LOG_MM_TIMING else None
         try:
             dst = torch.empty(self.shape, dtype=self.dtype, pin_memory=True)
             src = torch.frombuffer(segment.buf, dtype=self.dtype).reshape(self.shape)
@@ -89,19 +99,47 @@ class ShmTensorHandle:
             except FileNotFoundError:
                 # Another rank already won the unlink race; benign.
                 pass
+        if LOG_MM_TIMING and started is not None:
+            logger.info(
+                "mm_timing shm_consume_ms name=%s elapsed=%.3f shape=%s dtype=%s",
+                self.shm_name,
+                (time.perf_counter() - started) * 1000,
+                list(self.shape),
+                self.dtype,
+            )
         return dst
+
+    def release(self) -> None:
+        """Close and unlink a SHM segment without materializing the tensor."""
+        started = time.perf_counter() if LOG_MM_TIMING else None
+        segment = self._segment
+        self._segment = None
+        try:
+            if segment is None:
+                segment = shared_memory.SharedMemory(name=self.shm_name)
+            segment.close()
+            try:
+                segment.unlink()
+            except FileNotFoundError:
+                pass
+        except FileNotFoundError:
+            pass
+        if LOG_MM_TIMING and started is not None:
+            logger.info(
+                "mm_timing shm_release_ms name=%s elapsed=%.3f shape=%s dtype=%s",
+                self.shm_name,
+                (time.perf_counter() - started) * 1000,
+                list(self.shape),
+                self.dtype,
+            )
 
 
 def sync_shm_features(reqs, group, group_size: int) -> None:
-    """Consumer-side three-phase pipeline for SHM-backed features in
-    ``reqs``: attach FDs on this rank, optional cross-rank barrier, then
-    consume (memcpy out + close + unlink). No-op when no request carries
-    a pending handle.
+    """Attach SHM-backed features in ``reqs`` on every rank.
 
-    The barrier is what makes the open-vs-unlink race-free in multi-rank
-    setups; ``reqs`` must be identical across ranks (broadcast output)
-    so the predicate is consistent everywhere and the barrier is
-    deadlock-free.
+    The barrier makes later consume/release unlink race-free in multi-rank
+    setups. Actual materialization is intentionally deferred until the
+    multimodal encoder planner has deduplicated the batch.
     """
     pending = [
         mm
@@ -111,9 +149,16 @@ def sync_shm_features(reqs, group, group_size: int) -> None:
     ]
     if not pending:
         return
+    started = time.perf_counter() if LOG_MM_TIMING else None
     for mm in pending:
         mm.attach_shm_features()
     if group_size > 1:
         torch.distributed.barrier(group)
-    for mm in pending:
-        mm.consume_shm_features()
+    if LOG_MM_TIMING and started is not None:
+        item_count = sum(len(mm.mm_items) for mm in pending)
+        logger.info(
+            "mm_timing shm_attach_ms requests=%d items=%d elapsed=%.3f",
+            len(pending),
+            item_count,
+            (time.perf_counter() - started) * 1000,
+        )

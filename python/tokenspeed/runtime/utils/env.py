@@ -28,7 +28,6 @@ from tokenspeed.runtime.utils.server_args import ServerArgs
 
 global_server_args_dict: dict = {
     "attention_backend": ServerArgs.attention_backend,
-    "mha_extend_mode": ServerArgs.mha_extend_mode,
     "sampling_backend": ServerArgs.sampling_backend,
     "attention_use_fp4_indexer_cache": ServerArgs.attention_use_fp4_indexer_cache,
     "deepseek_v4_mega_moe_max_num_tokens": ServerArgs.deepseek_v4_mega_moe_max_num_tokens,
@@ -72,7 +71,6 @@ def global_server_args_dict_update(server_args: ServerArgs):
     global_server_args_dict.update(
         {
             "attention_backend": server_args.attention_backend,
-            "mha_extend_mode": server_args.mha_extend_mode,
             "sampling_backend": server_args.sampling_backend,
             "attention_use_fp4_indexer_cache": server_args.attention_use_fp4_indexer_cache,
             "deepseek_v4_mega_moe_max_num_tokens": server_args.deepseek_v4_mega_moe_max_num_tokens,
@@ -287,7 +285,9 @@ class Envs:
     TOKENSPEED_REQUEST_CONVERSION_WORKERS = EnvInt(8)
 
     # Multimodal / VLM
+    TOKENSPEED_LOG_MM_TIMING = EnvBool(False)
     TOKENSPEED_MM_ENABLE_ENCODER_CUDA_GRAPH = EnvBool(False)
+    TOKENSPEED_MM_VIDEO_ENCODER_CUDA_GRAPH_MAX_SEQUENCES_PER_BATCH = EnvInt(None)
     TOKENSPEED_MM_SKIP_COMPUTE_HASH = EnvBool(False)
 
     # fmt: on

@@ -44,10 +44,12 @@ class EngineBase(ABC):
         prompt: list[str] | str | None = None,
         sampling_params: list[dict] | dict | None = None,
         input_ids: list[list[int]] | list[int] | None = None,
-        return_logprob: list[bool] | bool | None = False,
+        return_logprob: list[bool] | bool | None = None,
         logprob_start_len: list[int] | int | None = None,
         top_logprobs_num: list[int] | int | None = None,
         token_ids_logprob: list[list[int]] | list[int] | None = None,
+        return_text_in_logprobs: bool = False,
+        logprob_format: list[str | None] | str | None = None,
         custom_logit_processor: list[str] | str | None = None,
         return_hidden_states: bool | None = None,
         stream: bool | None = None,
@@ -72,12 +74,16 @@ class EngineBase(ABC):
         """Update model weights with in-memory tensor data."""
 
     @abstractmethod
-    def release_memory_occupation(self) -> None:
-        """Release GPU memory occupation temporarily."""
+    def release_memory_occupation(self, tags: list[str] | None = None) -> None:
+        """Release GPU memory occupation temporarily (optionally by tag)."""
 
     @abstractmethod
-    def resume_memory_occupation(self) -> None:
-        """Resume GPU memory occupation which is previously released."""
+    def resume_memory_occupation(self, tags: list[str] | None = None) -> None:
+        """Resume GPU memory occupation previously released (optionally by tag)."""
+
+    @abstractmethod
+    def is_sleeping(self) -> bool:
+        """Return whether any GPU memory is currently released."""
 
     @abstractmethod
     def shutdown(self) -> None:
