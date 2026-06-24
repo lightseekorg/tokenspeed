@@ -25,6 +25,10 @@ import torch
 from tokenspeed.runtime.engine.generation_output_processor import (
     OutputProcesser,
     RequestState,
+)
+from tokenspeed.runtime.engine.request_stats import (
+    NOOP_STATS,
+    RequestStats,
     RequestStatsTracker,
 )
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
@@ -276,8 +280,8 @@ def test_log_request_stats_disabled_by_default():
 
     assert state.finished
     assert not any(line.startswith("RequestStats(") for line in rec.lines)
-    # no tracker attached when disabled
-    assert state.stats is None
+    # disabled: request still carries the shared no-op tracker (never registered)
+    assert state.stats is NOOP_STATS
 
 
 def test_log_request_stats_line_fields():
@@ -303,11 +307,10 @@ def test_log_request_stats_line_fields():
         rs.stats.scheduled_time = 1000.010
         rs.stats.prefill_done_time = 1000.030
         rs.stats.first_token_time = 1000.030
-        rs.stats.finish_time = 1000.130
         rs.stats.preempt_count = 2
         rs.stats.preempt_time = 0.005
 
-        processor._log_request_stats("rid-x", rs)
+        processor._log_request_stats("rid-x", rs, finish_time=1000.130)
     finally:
         gop.logger = gop_logger
 
@@ -348,8 +351,7 @@ def test_log_request_stats_aborted_with_spec_acceptance():
         rs.accept_draft_tokens = 3.0
         rs.finished_reason = FINISH_ABORT("client abort")
         rs.stats = RequestStatsTracker()
-        rs.stats.finish_time = 1000.05
-        processor._log_request_stats("rid-a", rs)
+        processor._log_request_stats("rid-a", rs, finish_time=1000.05)
     finally:
         gop.logger = gop_logger
 
@@ -359,9 +361,63 @@ def test_log_request_stats_aborted_with_spec_acceptance():
     assert "acc_len=3.0, acc_rate=0.5" in line
 
 
+def test_log_request_stats_noop_without_tracker():
+    """A request carrying the no-op tracker (flag off / finished-at-admission)
+    is skipped by _log_request_stats's single guard, without raising."""
+    import tokenspeed.runtime.engine.generation_output_processor as gop
+    from tokenspeed.runtime.engine.request_types import FINISH_LENGTH
+
+    rec = _RecordingLogger()
+    gop_logger, gop.logger = gop.logger, rec
+    try:
+        processor = OutputProcesser(
+            _Sender(), global_rank=0, log_request_stats=True, metrics=_Metrics()
+        )
+        rs = _state([1, 2, 3])
+        rs.finished_reason = FINISH_LENGTH(length=1)
+        assert rs.stats is NOOP_STATS  # never registered -> no-op tracker
+        processor._log_request_stats("no-tracker", rs, finish_time=123.0)
+    finally:
+        gop.logger = gop_logger
+    assert rec.lines == []
+
+
+def test_request_stats_from_state_total_on_degenerate_input():
+    """from_state never divides by zero / reads a missing stage: a request with
+    no output and unset timestamps yields zeros and None, not an exception."""
+    from tokenspeed.runtime.engine.request_types import FINISH_ABORT
+
+    rs = _state([1, 2, 3, 4])
+    rs.finished_reason = FINISH_ABORT("aborted before any output")
+    rs.stats = RequestStatsTracker()  # all timestamps still 0.0
+    # output_ids empty, no spec decode, no timestamps set.
+    stats = RequestStats.from_state("d", rs, spec_algorithm=None, spec_num_tokens=None)
+
+    assert stats.status == "aborted" and stats.reason == "abort"
+    assert stats.output_tokens == 0
+    assert stats.cache_hit_rate == 0.0
+    assert stats.queue_ms == stats.prefill_ms == stats.ttft_ms == stats.total_ms == 0.0
+    assert stats.decode_tps == 0.0
+    assert stats.acc_len is None and stats.acc_rate is None
+
+
+def test_noop_stats_singleton_is_frozen():
+    """NOOP_STATS is shared, so its methods are no-ops and writes raise -- a
+    future tracker mutator without a no-op override fails loudly, not silently."""
+    import pytest
+
+    NOOP_STATS.mark_scheduled(5.0)  # no-op, does not raise or record
+    NOOP_STATS.record_decode_step(1.0, True)
+    with pytest.raises(AttributeError):
+        NOOP_STATS.scheduled_time = 1.0
+
+
 def test_log_request_stats_records_timestamps_through_forward():
-    """End-to-end: with the flag on, a finishing request gets its lifecycle
-    timestamps recorded host-side and emits one ReqStats line."""
+    """End-to-end: with the flag on, a finishing request gets its post-forward
+    timestamps recorded host-side and emits one ReqStats line. (scheduled_time
+    is stamped pre-forward in the event loop; simulated here.)"""
+    import time
+
     import tokenspeed.runtime.engine.generation_output_processor as gop
 
     rec = _RecordingLogger()
@@ -374,6 +430,7 @@ def test_log_request_stats_records_timestamps_through_forward():
         state = _state([5, 6, 7], computed_length=3)
         state.sampling_params.max_new_tokens = 1
         processor.register("d", state)  # attaches the stats tracker
+        state.stats.mark_scheduled(time.time())  # event loop does this pre-forward
 
         class _DecodeOp:
             request_ids = ["d"]
@@ -389,9 +446,9 @@ def test_log_request_stats_records_timestamps_through_forward():
         gop.logger = gop_logger
 
     assert state.finished
-    # Lifecycle timestamps were stamped on the host.
+    # Lifecycle timestamps were stamped on the host, in order.
     assert state.stats.scheduled_time > 0.0
-    assert state.stats.prefill_done_time > 0.0
+    assert state.stats.prefill_done_time >= state.stats.scheduled_time
     assert state.stats.first_token_time > 0.0
     assert state.stats.finish_time > 0.0
     stats_lines = [

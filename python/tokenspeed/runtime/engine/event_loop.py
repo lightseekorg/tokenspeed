@@ -1318,6 +1318,7 @@ class EventLoop:
             if forward_op is not None:
                 sampling_params_list = self._gather_sampling_params(forward_op)
                 grammar_inputs = self._gather_grammar_state(forward_op)
+                self._mark_stats_scheduled(forward_op)
                 results, on_first_token = self._dispatch_forward(
                     forward_op,
                     sampling_params_list,
@@ -1345,6 +1346,19 @@ class EventLoop:
             self._pause.maybe_finish_drain(self.scheduler)
 
             self._record_scheduler_iteration_metrics(stats, num_iter_tokens)
+
+    def _mark_stats_scheduled(self, forward_op) -> None:
+        # Stamp the pre-forward "scheduled" time on each request's stats tracker
+        # so the queue/prefill split is anchored before the forward (idempotent:
+        # only the first forward a request appears in sets it). --log-request-stats.
+        if not self.server_args.log_request_stats or forward_op is None:
+            return
+        now = time.time()
+        rid_to_state = self.output_processor.rid_to_state
+        for rid in forward_op.request_ids:
+            st = rid_to_state.get(rid)
+            if st is not None:
+                st.stats.mark_scheduled(now)
 
     def _gather_sampling_params(self, forward_op) -> list[SamplingParams]:
         """Look up per-request SamplingParams from the output processor. The
@@ -1487,6 +1501,7 @@ class EventLoop:
 
             curr_results = None
             if forward_op is not None:
+                self._mark_stats_scheduled(forward_op)
                 curr_results, _ = self._dispatch_forward(
                     forward_op,
                     sampling_params_list,

@@ -21,10 +21,14 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from tokenspeed.runtime.engine.io_struct import BatchTokenIDOut
+from tokenspeed.runtime.engine.request_stats import (
+    NOOP_STATS,
+    RequestStats,
+    RequestStatsTracker,
+)
 from tokenspeed.runtime.engine.request_types import (
     ABORT_CODE,
     FINISH_ABORT,
@@ -56,147 +60,6 @@ from tokenspeed.runtime.utils.nvtx import nvtx_range
 logger = get_colorful_logger(__name__)
 
 DEFAULT_FORCE_STREAM_INTERVAL = 50
-
-
-def _ms(end: float, start: float) -> float:
-    # 0 for unset (0.0) timestamps, not a garbage epoch-sized number
-    return round((end - start) * 1e3, 2) if end > 0.0 and start > 0.0 else 0.0
-
-
-class RequestStatsTracker:
-    """Host-side per-request timing/preemption accumulator (--log-request-stats).
-
-    Attached to a RequestState only when logging is on; the engine fires
-    lifecycle events into it. No GPU sync.
-    """
-
-    def __init__(self) -> None:
-        self.scheduled_time = 0.0
-        self.prefill_done_time = 0.0
-        self.first_token_time = 0.0
-        self.finish_time = 0.0
-        self.preempt_count = 0
-        self.preempt_time = 0.0
-        self._preempted_last_step = False
-
-    def mark_scheduled(self, now: float) -> None:
-        if self.scheduled_time == 0.0:
-            self.scheduled_time = now
-
-    def mark_prefill_done(self, now: float) -> None:
-        if self.prefill_done_time == 0.0:
-            self.prefill_done_time = now
-
-    def mark_first_token(self, now: float) -> None:
-        if self.first_token_time == 0.0:
-            self.first_token_time = now
-
-    def mark_finish(self, now: float) -> None:
-        self.finish_time = now
-
-    def record_decode_step(self, step_dt: float, prefilling_others: bool) -> None:
-        # count each prefill-of-others interruption (rising edge) and its time
-        if prefilling_others:
-            if not self._preempted_last_step:
-                self.preempt_count += 1
-            self.preempt_time += step_dt
-            self._preempted_last_step = True
-        else:
-            self._preempted_last_step = False
-
-
-@dataclass
-class RequestStats:
-    """Host-side per-request perf summary (--log-request-stats), logged as repr.
-
-    Durations are ms, rates are 0-1, ``*_ts`` are epoch seconds; ``acc_*`` are
-    None when spec decode is off. No GPU sync.
-    """
-
-    rid: str
-    status: str
-    reason: str
-
-    prompt_tokens: int
-    cache_tokens: int
-    output_tokens: int
-    cache_hit_rate: float
-
-    queue_ms: float
-    prefill_ms: float
-    ttft_ms: float
-    total_ms: float
-    preempt_ms: float
-    preempt_count: int
-    decode_tps: float
-
-    acc_len: float | None
-    acc_rate: float | None
-
-    recv_ts: float
-    commit_ts: float
-    finish_ts: float
-
-    @classmethod
-    def from_state(
-        cls, rid: str, rs: RequestState, spec_algorithm, spec_num_tokens
-    ) -> RequestStats:
-        t = rs.stats
-        prompt = rs.input_length
-        output = rs.output_length
-
-        decode_window = (
-            t.finish_time - t.first_token_time
-            if t.finish_time > 0.0 and t.first_token_time > 0.0
-            else 0.0
-        )
-        decode_tps = (
-            round((output - 1) / decode_window, 1)
-            if decode_window > 0.0 and output > 1
-            else 0.0
-        )
-
-        # spec acceptance; None when spec decode is off
-        if spec_algorithm is not None and rs.spec_verify_ct > 0:
-            acc_len = rs.accept_draft_tokens or 0.0
-            acc_rate = (
-                round(max(0.0, acc_len - 1.0) / spec_num_tokens, 4)
-                if spec_num_tokens
-                else 0.0
-            )
-            acc_len = round(acc_len, 2)
-        else:
-            acc_len = acc_rate = None
-
-        return cls(
-            rid=rid,
-            status=(
-                "aborted"
-                if isinstance(rs.finished_reason, FINISH_ABORT)
-                else "finished"
-            ),
-            reason=(
-                rs.finished_reason.to_json().get("type", "unknown")
-                if rs.finished_reason is not None
-                else "unknown"
-            ),
-            prompt_tokens=prompt,
-            cache_tokens=rs.cached_tokens,
-            output_tokens=output,
-            cache_hit_rate=round(rs.cached_tokens / prompt, 4) if prompt > 0 else 0.0,
-            queue_ms=_ms(t.scheduled_time, rs.created_time),
-            prefill_ms=_ms(t.prefill_done_time, t.scheduled_time),
-            ttft_ms=_ms(t.first_token_time, rs.created_time),
-            total_ms=_ms(t.finish_time, rs.created_time),
-            preempt_ms=round(t.preempt_time * 1e3, 2),
-            preempt_count=t.preempt_count,
-            decode_tps=decode_tps,
-            acc_len=acc_len,
-            acc_rate=acc_rate,
-            recv_ts=round(rs.created_time, 3),
-            commit_ts=round(t.scheduled_time, 3),
-            finish_ts=round(t.finish_time, 3),
-        )
 
 
 class RequestState:
@@ -247,7 +110,7 @@ class RequestState:
 
         # request stats (host-side); tracker attached only with --log-request-stats
         self.created_time: float = created_time
-        self.stats: RequestStatsTracker | None = None
+        self.stats: RequestStatsTracker = NOOP_STATS
         # Sampled-token logprobs, accumulated per generated token.
         # None when return_logprob is False.
         self.output_token_logprobs_val: list[float] | None = (
@@ -490,9 +353,15 @@ class OutputProcesser:
                 request_state.accept_draft_tokens,
             )
 
-    def _log_request_stats(self, rid: str, rs: RequestState) -> None:
-        if self.global_rank != 0:
+    def _log_request_stats(
+        self, rid: str, rs: RequestState, finish_time: float
+    ) -> None:
+        # Single guard for the whole stats path: no tracker (flag off) or non-zero
+        # rank => nothing to do. Keeps the forward-loop call sites trivial and the
+        # derivation in from_state total (it always sees a tracker).
+        if rs.stats is NOOP_STATS or self.global_rank != 0:
             return
+        rs.stats.mark_finish(finish_time)
         stats = RequestStats.from_state(
             rid, rs, self.spec_algorithm, self.spec_num_tokens
         )
@@ -743,19 +612,15 @@ class OutputProcesser:
                 continue
 
             request_state: RequestState = self.rid_to_state[rid]
-
-            # first forward step the request appears in == queue end
-            if request_state.stats is not None:
-                request_state.stats.mark_scheduled(stats_now)
+            # scheduled_time is stamped pre-forward in the event loop (queue end)
 
             # Do not output chunking result
             if not request_state.prefill_finished:
                 continue
 
-            if request_state.stats is not None:
-                request_state.stats.mark_prefill_done(stats_now)
-                if i >= num_extends:
-                    request_state.stats.record_decode_step(step_dt, prefilling_others)
+            request_state.stats.mark_prefill_done(stats_now)
+            if i >= num_extends:
+                request_state.stats.record_decode_step(step_dt, prefilling_others)
 
             nan_detected = nan_flags_list is not None and nan_flags_list[i]
             if nan_detected and not request_state.finished:
@@ -848,7 +713,7 @@ class OutputProcesser:
                     break
 
             # first output token == TTFT anchor
-            if request_state.stats is not None and request_state.output_ids:
+            if request_state.output_ids:
                 request_state.stats.mark_first_token(stats_now)
 
             # For aborted requests, skip output to detokenizer (the tokenizer
@@ -861,9 +726,7 @@ class OutputProcesser:
                 if request_state.abort_notify_client:
                     stream_out_rids.append(rid)
                     stream_out_states.append(request_state)
-                if request_state.stats is not None:
-                    request_state.stats.mark_finish(stats_now)
-                    self._log_request_stats(rid, request_state)
+                self._log_request_stats(rid, request_state, stats_now)
                 request_state.release_pending_multimodal_features()
                 self.rid_to_state.pop(rid)
                 continue
@@ -883,9 +746,7 @@ class OutputProcesser:
                 request_changes.append(
                     make_abort_event(rid) if nan_detected else make_finish_event(rid)
                 )
-                if request_state.stats is not None:
-                    request_state.stats.mark_finish(stats_now)
-                    self._log_request_stats(rid, request_state)
+                self._log_request_stats(rid, request_state, stats_now)
                 request_state.release_pending_multimodal_features()
                 self.rid_to_state.pop(rid)
             else:
@@ -944,6 +805,9 @@ class OutputProcesser:
         if not rs.finished:
             rs.finished_reason = FINISH_LENGTH(length=len(rs.output_ids))
         rs.finished_output = False
+        # PD prefill node's terminal path (the other finish/abort logging lives in
+        # post_process_forward_op). Self-guarded, so a no-op when the flag is off.
+        self._log_request_stats(req_id, rs, time.time())
         self.stream_output([req_id], [rs])
         # SucceededEvent already finishes the C++ FSM; no extra FinishEvent needed
         return []
