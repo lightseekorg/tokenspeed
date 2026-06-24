@@ -113,19 +113,12 @@ class GlmDsaDecodeWindow:
 
 def _glm_dsa_is_decode_token_mode(forward_mode: ForwardMode | None) -> bool:
     return forward_mode is not None and (
-        forward_mode.is_decode()
-        or forward_mode.is_mixed()
-        or forward_mode.is_target_verify()
-        or forward_mode.is_draft_extend()
+        forward_mode.is_decode() or forward_mode.is_mixed()
     )
 
 
 def _glm_dsa_is_pure_decode_token_mode(forward_mode: ForwardMode | None) -> bool:
-    return forward_mode is not None and (
-        forward_mode.is_decode()
-        or forward_mode.is_target_verify()
-        or forward_mode.is_draft_extend()
-    )
+    return forward_mode is not None and forward_mode.is_decode()
 
 
 def _glm_dsa_skip_indexer_topk(config, layer_id: int | None) -> bool:
@@ -873,7 +866,8 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         draft_catchup = bool(
             getattr(ctx.attn_backend, "is_draft", False)
             and ctx.forward_mode is not None
-            and ctx.forward_mode.is_draft_extend()
+            and ctx.forward_mode.is_decode()
+            and decode_window.q_len_per_req > 1
         )
         seq_lens_per_token = self._expand_decode_seq_lens_per_token(
             seq_lens,
@@ -984,7 +978,8 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         draft_catchup = bool(
             getattr(ctx.attn_backend, "is_draft", False)
             and ctx.forward_mode is not None
-            and ctx.forward_mode.is_draft_extend()
+            and ctx.forward_mode.is_decode()
+            and decode_window.q_len_per_req > 1
         )
         seq_lens_per_token = self._expand_decode_seq_lens_per_token(
             seq_lens,

@@ -106,12 +106,6 @@ def test_logits_processor_dp_layout_threshold_and_modes():
     )
     assert decode_plan is not None
 
-    verify_plan = processor._resolve_logits_layout_plan(
-        torch.empty(16 * 6, 3),
-        LogitsMetadata(forward_mode=ForwardMode.TARGET_VERIFY),
-    )
-    assert verify_plan is not None
-
     assert (
         processor._resolve_logits_layout_plan(
             torch.empty(32 * 6, 3),
@@ -266,7 +260,7 @@ def test_resolve_dp_sampling_runtime_uses_grouped_metadata():
 
 @pytest.mark.parametrize(
     "forward_mode",
-    [ForwardMode.DECODE, ForwardMode.TARGET_VERIFY],
+    [ForwardMode.DECODE],
 )
 def test_logits_processor_derives_dp_layout_from_effective_hidden_states(
     forward_mode,

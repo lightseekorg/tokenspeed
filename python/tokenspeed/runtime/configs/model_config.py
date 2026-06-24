@@ -412,7 +412,7 @@ class ModelConfig:
         else:
             self.attention_arch = AttentionArch.MHA
 
-        self.use_target_verify_forward_mode = (
+        self.use_v4_mtp_paged_metadata = (
             getattr(server_args, "speculative_algorithm", None) is not None
             and not is_draft_worker
             and attention_family is not None
