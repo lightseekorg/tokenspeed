@@ -279,7 +279,7 @@ def test_log_request_stats_disabled_by_default():
         gop.logger = gop_logger
 
     assert state.finished
-    assert not any(line.startswith("RequestStats(") for line in rec.lines)
+    assert not any("RequestStats(" in line for line in rec.lines)
     # disabled: request still carries the shared no-op tracker (never registered)
     assert state.stats is NOOP_STATS
 
@@ -317,7 +317,7 @@ def test_log_request_stats_line_fields():
     assert len(rec.lines) == 1
     line = rec.lines[0]
     assert line.startswith(
-        "RequestStats(rid='rid-x', status='finished', reason='length'"
+        "Req: rid-x Finish! RequestStats(status='finished', reason='length'"
     )
     assert (
         "prompt_tokens=4, cache_tokens=2, output_tokens=5, cache_hit_rate=0.5" in line
@@ -391,7 +391,7 @@ def test_request_stats_from_state_total_on_degenerate_input():
     rs.finished_reason = FINISH_ABORT("aborted before any output")
     rs.stats = RequestStatsTracker()  # all timestamps still 0.0
     # output_ids empty, no spec decode, no timestamps set.
-    stats = RequestStats.from_state("d", rs, spec_algorithm=None, spec_num_tokens=None)
+    stats = RequestStats.from_state(rs, spec_algorithm=None, spec_num_tokens=None)
 
     assert stats.status == "aborted" and stats.reason == "abort"
     assert stats.output_tokens == 0
@@ -451,8 +451,6 @@ def test_log_request_stats_records_timestamps_through_forward():
     assert state.stats.prefill_done_time >= state.stats.scheduled_time
     assert state.stats.first_token_time > 0.0
     assert state.stats.finish_time > 0.0
-    stats_lines = [
-        line for line in rec.lines if line.startswith("RequestStats(rid='d'")
-    ]
+    stats_lines = [line for line in rec.lines if "Req: d Finish! RequestStats(" in line]
     assert len(stats_lines) == 1
     assert "status='finished', reason='length'" in stats_lines[0]

@@ -152,13 +152,15 @@ draft model, and token count together.
 
 ### Per-Request Stats
 
-`--log-request-stats` emits one line per request when it finishes or aborts, for
-latency/throughput debugging. The line is a Python-object repr (`RequestStats(...)`).
-Every field is derived from host-side timestamps and counters already available in
-the scheduler — it adds **no GPU sync** and so no engine slowdown. Example:
+`--log-request-stats` enriches the scheduler's per-request finish line for
+latency/throughput debugging. When set, the `Req: <rid> Finish! ...` line carries
+a Python-object repr (`RequestStats(...)`) instead of the default
+`Accept_num_tokens_avg` value (which it subsumes as `acc_len`). Every field is
+derived from host-side timestamps and counters already available in the
+scheduler — it adds **no GPU sync** and so no engine slowdown. Example:
 
 ```
-RequestStats(rid='chatcmpl-019ef6b7', status='finished', reason='stop', prompt_tokens=28684, cache_tokens=832, output_tokens=33, cache_hit_rate=0.029, queue_ms=13.8, prefill_ms=15.8, ttft_ms=42.1, total_ms=58.0, preempt_ms=0.0, preempt_count=0, decode_tps=210.4, acc_len=None, acc_rate=None, recv_ts=1782255696.726, commit_ts=1782255696.74, finish_ts=1782255696.784)
+Req: chatcmpl-019ef6b7 Finish! RequestStats(status='finished', reason='stop', prompt_tokens=28684, cache_tokens=832, output_tokens=33, cache_hit_rate=0.029, queue_ms=13.8, prefill_ms=15.8, ttft_ms=42.1, total_ms=58.0, preempt_ms=0.0, preempt_count=0, decode_tps=210.4, acc_len=None, acc_rate=None, recv_ts=1782255696.726, commit_ts=1782255696.74, finish_ts=1782255696.784)
 ```
 
 | Field | Meaning |

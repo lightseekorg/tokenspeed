@@ -346,7 +346,9 @@ class OutputProcesser:
         self.pending_aborts: dict[str, float] = {}
 
     def log_accept_length(self, rid, request_state: RequestState):
-        if self.global_rank == 0:
+        # When --log-request-stats is on, the richer RequestStats line (which
+        # already carries acc_len) replaces this one — see _log_request_stats.
+        if self.global_rank == 0 and not self.log_request_stats:
             logger.info(
                 "Req: %s Finish! Accept_num_tokens_avg: %s",
                 rid,
@@ -362,10 +364,10 @@ class OutputProcesser:
         if rs.stats is NOOP_STATS or self.global_rank != 0:
             return
         rs.stats.mark_finish(finish_time)
-        stats = RequestStats.from_state(
-            rid, rs, self.spec_algorithm, self.spec_num_tokens
-        )
-        logger.info("%s", stats)
+        stats = RequestStats.from_state(rs, self.spec_algorithm, self.spec_num_tokens)
+        # Fused into the scheduler's per-request finish line (supersedes the
+        # Accept_num_tokens_avg variant in log_accept_length).
+        logger.info("Req: %s Finish! %s", rid, stats)
 
     def sweep_pending_aborts(self) -> None:
         """Drop TTL-expired entries from ``pending_aborts``.
