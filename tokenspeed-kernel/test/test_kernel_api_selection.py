@@ -526,6 +526,26 @@ def _moe_apply_fp8_cutlass() -> object:
     return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
 
 
+def _moe_apply_fp8_trtllm() -> object:
+    plan = tokenspeed_kernel.moe_plan(
+        "fp8",
+        input_dtype=torch.bfloat16,
+        activation="silu",
+        ep_size=2,
+        ispp=128,
+        fp8_scale_block_shape=(128, 128),
+        internal_activation_dtype="input",
+    )
+    _assert_moe_plan(
+        plan,
+        apply="flashinfer_trtllm_fp8_moe_apply",
+        preprocessor="flashinfer_trtllm_fp8_moe_process_weights",
+    )
+    x = torch.empty((4, 16), dtype=torch.bfloat16)
+    router_logits = torch.empty((4, 8), dtype=torch.float32)
+    return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
+
+
 def _moe_apply_nvfp4_trtllm() -> object:
     plan = tokenspeed_kernel.moe_plan(
         "nvfp4",
@@ -938,12 +958,20 @@ _CASES = [
         _moe_apply_unquant_cutlass,
     ),
     _case(
-        _is_hopper_plus,
-        "hopper-plus",
+        _is_hopper,
+        "hopper",
         "moe",
         "apply",
         "flashinfer_cutlass_fp8_moe_apply",
         _moe_apply_fp8_cutlass,
+    ),
+    _case(
+        _is_blackwell_sm100,
+        "blackwell-sm100",
+        "moe",
+        "apply",
+        "flashinfer_trtllm_fp8_moe_apply",
+        _moe_apply_fp8_trtllm,
     ),
     _case(
         _is_blackwell_sm100,
