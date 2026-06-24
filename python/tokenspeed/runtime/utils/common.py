@@ -173,6 +173,22 @@ def get_available_gpu_memory(
             torch.cuda.empty_cache()
         free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
 
+    elif device == "npu":
+        num_gpus = torch.npu.device_count()
+        assert gpu_id < num_gpus
+
+        if torch.npu.current_device() != gpu_id:
+            logger.debug(
+                "Current device is not %s, but %s, which may cause useless "
+                "memory allocation for torch NPU context.",
+                gpu_id,
+                torch.npu.current_device(),
+            )
+
+        if empty_cache:
+            torch.npu.empty_cache()
+        free_gpu_memory, _ = torch.npu.mem_get_info(gpu_id)
+
     if distributed:
         tensor = torch.tensor(free_gpu_memory, dtype=torch.float32)
         torch.distributed.all_reduce(
@@ -184,7 +200,11 @@ def get_available_gpu_memory(
 
 
 def is_pin_memory_available() -> bool:
-    return torch.cuda.is_available()
+    if torch.cuda.is_available():
+        return True
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        return True
+    return False
 
 
 class LayerFn(Protocol):

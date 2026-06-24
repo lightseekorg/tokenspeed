@@ -1434,7 +1434,7 @@ class EventLoop:
             # update_block_table, prefix_cache writes to req_to_page)
             # after the prev iter's forward on execution_stream that
             # reads the same tensor. Non-blocking on host.
-            torch.cuda.default_stream().wait_stream(
+            torch.get_device_module(self.model_executor.device).default_stream().wait_stream(
                 self.model_executor.execution_stream
             )
             self._process_new_requests()

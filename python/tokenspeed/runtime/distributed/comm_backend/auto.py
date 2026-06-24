@@ -32,6 +32,7 @@ from tokenspeed.runtime.distributed.comm_backend.base import CommBackend, Group
 from tokenspeed.runtime.distributed.comm_backend.custom_allreduce import (
     CustomAllReduceBackend,
 )
+from tokenspeed.runtime.distributed.comm_backend.hccl import HcclBackend
 from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
 from tokenspeed.runtime.distributed.comm_backend.triton_allreduce import (
     TritonAllReduceBackend,
@@ -46,7 +47,10 @@ class AutoBackend(CommBackend):
     """Composite backend that selects the best strategy per call."""
 
     def __init__(self):
-        self._nccl = NcclBackend()
+        from tokenspeed_kernel.platform import current_platform
+
+        backend_cls = HcclBackend if current_platform().is_ascend else NcclBackend
+        self._nccl = backend_cls()
         self._custom_ar = CustomAllReduceBackend(fallback=self._nccl)
         self._trtllm_ar = TrtllmAllReduceBackend(fallback=self._nccl)
         self._triton_ar = TritonAllReduceBackend(fallback=self._nccl)

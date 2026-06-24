@@ -38,6 +38,10 @@ def is_rocm_build() -> bool:
     return getattr(torch.version, "hip", None) is not None
 
 
+def is_ascend_build() -> bool:
+    return hasattr(torch, "npu")
+
+
 # List of packages to check versions
 PACKAGE_LIST = [
     "tokenspeed",
@@ -89,6 +93,7 @@ PACKAGE_LIST = [
     "tokenspeed-iris",
     "tokenspeed-kernel",
     "tokenspeed-kernel-amd",
+    "tokenspeed-kernel-ascend",
     "tokenspeed-mla",
     "tokenspeed-mooncake",
     "tokenspeed-proton",

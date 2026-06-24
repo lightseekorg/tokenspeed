@@ -44,10 +44,18 @@ from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
 from tokenspeed.runtime.utils.pdl import pdl_enabled
+from tokenspeed_kernel.platform import current_platform
+
+DEVICE_BACKEND = "hccl" if current_platform().is_ascend else "nccl"
+
+
+def get_device_backend() -> str:
+    """Return the torch distributed device backend for the current platform."""
+    return DEVICE_BACKEND
 
 
 def _get_process_group(group: Group):
-    return pg_manager.get_process_group("nccl", group)
+    return pg_manager.get_process_group(DEVICE_BACKEND, group)
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,2 @@
+# Ascend NPU third-party dependencies (installed at build time)
+# torch and torch_npu are expected to be pre-installed in the Ascend environment

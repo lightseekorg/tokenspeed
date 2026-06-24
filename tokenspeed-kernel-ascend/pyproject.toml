@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=69.5.1", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tokenspeed-kernel-ascend"
+version = "0.1.0"
+description = "TokenSpeed Ascend NPU-specific high-performance kernels."
+requires-python = ">=3.10"
+dependencies = [
+    "torch==2.10.0",
+    "torch_npu==2.10.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["python"]

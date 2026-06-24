@@ -2,3 +2,5 @@
 tokenspeed-kernel-amd==0.1.1
 --extra-index-url https://download.pytorch.org/whl/rocm7.2
 torch==2.11.0+rocm7.2
+tokenspeed-proton>=3.7.10.post20260531
+tokenspeed-triton>=3.7.10.post20260531

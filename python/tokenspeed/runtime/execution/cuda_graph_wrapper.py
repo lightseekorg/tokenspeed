@@ -291,7 +291,7 @@ class CudaGraphWrapper:
             if sampling_backend is not None
             else (CUDA_GRAPH_VARIANT_DEFAULT,)
         )
-        self.graphs: dict[tuple[str, int], torch.cuda.CUDAGraph] = {}
+        self.graphs: dict[tuple[str, int], object] = {}
         self.output_buffers: dict[tuple[str, int], tuple] = {}
 
         self._forward_func: Callable | None = forward_func
@@ -299,6 +299,44 @@ class CudaGraphWrapper:
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
         if not self.disable:
             self.capture()
+
+    # ------------------------------------------------------------------
+    # Hooks for platform-specific subclasses (e.g. NpuGraphWrapper)
+    # ------------------------------------------------------------------
+
+    def _create_graph(self):
+        """Create a graph object. Override in subclasses for non-CUDA devices."""
+        return torch.cuda.CUDAGraph()
+
+    def _graph_capture_kwargs(self, pool):
+        """Return kwargs for ``torch.cuda.graph()`` / ``torch.npu.graph()``.
+
+        Override in subclasses to change capture behavior (e.g. omit stream).
+        """
+        return dict(pool=pool, stream=self.stream)
+
+    def _before_capture(self):
+        """Hook called at the start of ``capture()`` before any graph is
+        captured.  Override in subclasses to reset platform-specific state."""
+        pass
+
+    def _before_graph_replay(self, padded_bs: int, seq_lens: torch.Tensor):
+        """Hook called immediately before ``graph.replay()`` in the graph
+        path.  Override in subclasses to perform platform-specific updates
+        (e.g. NPU task-group refresh)."""
+        pass
+
+    def _before_graph_replay_with_seq_lens(
+        self,
+        padded_bs: int,
+        seq_lens: torch.Tensor,
+        seq_lens_list: list[int] | None = None,
+    ):
+        self._before_graph_replay(padded_bs, seq_lens)
+
+    def requires_cpu_seq_lens_for_graph_replay(self) -> bool:
+        """Whether this wrapper needs CPU seq_lens before graph replay."""
+        return False
 
     # ------------------------------------------------------------------
     # Graph capture
@@ -312,8 +350,9 @@ class CudaGraphWrapper:
             forward_func: ModelExecutor.forward_step(bs, ctx, sampling_info).
         """
         rank = self.global_rank
+        self._before_capture()
         with freeze_gc(self.enable_cudagraph_gc):
-            self.stream = torch.cuda.Stream()
+            self.stream = torch.get_device_module(self.device).Stream()
             # Capture backend-declared sampler variants explicitly.
             capture_items = [
                 (variant, bs)
@@ -387,7 +426,7 @@ class CudaGraphWrapper:
         return (CUDA_GRAPH_VARIANT_DEFAULT, bs) in self.graphs
 
     def _capture_one(self, bs: int, variant: str = CUDA_GRAPH_VARIANT_DEFAULT):
-        graph = torch.cuda.CUDAGraph()
+        graph = self._create_graph()
 
         capture_forward_mode = ForwardMode.DECODE
         ctx = ForwardContext(
@@ -465,7 +504,7 @@ class CudaGraphWrapper:
 
         # Warm up before capture.
         for _ in range(4):
-            torch.cuda.synchronize()
+            torch.get_device_module(self.device).synchronize()
             dist.barrier()
             self._prepare_sampling_capture(bs=bs, variant=variant)
             # Keep warmup seq_lens >= q_len_per_req so no query row gets an
@@ -479,7 +518,7 @@ class CudaGraphWrapper:
         if self.sampling_backend is not None:
             self.sampling_backend.reset_capture_state()
 
-        torch.cuda.synchronize()
+        torch.get_device_module(self.device).synchronize()
         dist.barrier()
 
         # Warmups can switch a backend back to eager metadata objects. Restore
@@ -498,10 +537,11 @@ class CudaGraphWrapper:
         global _is_capture_mode
         _is_capture_mode = True
         global global_graph_memory_pool
-        with torch.cuda.graph(graph, pool=global_graph_memory_pool, stream=self.stream):
+        _graph_kwargs = self._graph_capture_kwargs(global_graph_memory_pool)
+        with torch.get_device_module(self.device).graph(graph, **_graph_kwargs):
             out = run_once()
 
-        torch.cuda.synchronize()
+        torch.get_device_module(self.device).synchronize()
         dist.barrier()
         _is_capture_mode = False
 
@@ -907,6 +947,7 @@ class CudaGraphWrapper:
         spec_info=None,
         paged_cache_block_tables: dict | None = None,
         paged_cache_block_table_base_offsets: dict | None = None,
+        seq_lens_list: list[int] | None = None,
     ):
         """
         Unified forward entry point.
@@ -930,6 +971,8 @@ class CudaGraphWrapper:
             )
             self.input_buffers.seq_lens_buf[:padded_bs].copy_(seq_lens)
             self.input_buffers.req_pool_indices_buf[:padded_bs].copy_(req_pool_indices)
+            if seq_lens_list is not None:
+                seq_lens_list = [*seq_lens_list[:bs], *([1] * pad)]
             if mamba_pool_indices is not None:
                 # Pad with -1 (PAD_SLOT_ID), NOT 0. Mamba slot 0 is a real
                 # allocatable slot, so padding with 0 aliases a live request's
@@ -999,6 +1042,9 @@ class CudaGraphWrapper:
             self.deepep_adapter.replay()
 
             graph_key = self._cuda_graph_key(padded_bs)
+            self._before_graph_replay_with_seq_lens(
+                padded_bs, seq_lens, seq_lens_list
+            )
             with nvtx_range("graph_replay", color="red"):
                 self.graphs[graph_key].replay()
 

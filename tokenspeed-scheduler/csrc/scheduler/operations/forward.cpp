@@ -433,6 +433,7 @@ static PrefillOperation applyPrefillEvent(Request* request, Event event) {
     op.input_ids = std::vector<std::int32_t>(info.input_ids.begin(), info.input_ids.end());
     op.shifted_input_ids = std::move(info.shifted_input_ids);
     op.extend_prefix_len = info.already_scheduled_len;
+    op.seq_len = info.already_scheduled_len + info.extend_len;
 
     auto* mamba = request->GetLocalMambaAllocator();
     if (mamba != nullptr && mamba->HasWorking()) {
@@ -481,6 +482,7 @@ template <typename Event>
              std::same_as<Event, fsm::ScheduleDecodeFromRetractedEvent>)
 static DecodeOperation applyDecodeEvent(Request* request, Event event, std::int32_t decode_input_tokens) {
     std::int32_t begin = static_cast<std::int32_t>(request->GetOccupiedPages().size());
+    const std::int32_t seq_len = request->TokenSize() + decode_input_tokens;
     request->Apply(std::move(event));
     std::vector<std::int32_t> all_pages = request->GetOccupiedPages();
     std::int32_t sz = static_cast<std::int32_t>(all_pages.size()) - begin;
@@ -494,6 +496,7 @@ static DecodeOperation applyDecodeEvent(Request* request, Event event, std::int3
         .size = sz,
         .prefill_length = request->PrefillSize(),
     }};
+    op.seq_len = seq_len;
 
     auto* mamba = request->GetLocalMambaAllocator();
     if (mamba != nullptr && mamba->HasWorking()) {
@@ -548,6 +551,7 @@ DecodeOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Schedu
     }};
     op.decode_input_id = request->GetLastToken();
     op.hist_token_len = request->TokenSize() - 1;
+    op.seq_len = op.hist_token_len + op.input_length;
     op.mamba_cow_src_idx = mamba_cow_src_index;
 
     auto* mamba = request->GetLocalMambaAllocator();

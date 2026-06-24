@@ -816,8 +816,8 @@ class ServerArgs:
             "--device",
             type=str,
             default="cuda",
-            choices=["cuda"],
-            help="The device type.",
+            choices=["cuda", "npu"],
+            help="The device type (cuda, or npu for Ascend NPU).",
         )
         parser.add_argument(
             "--served-model-name",

@@ -35,6 +35,8 @@ struct ForwardOperationBase {
     std::string request_id;
     std::int32_t request_pool_index;
     std::int32_t input_length;
+    // Total sequence length visible to attention for this forward.
+    std::int32_t seq_len{};
     // All pages currently occupied by this request (existing + newly allocated).
     std::vector<int32_t> occupied_pages;
     // Index into occupied_pages where newly allocated pages begin.
@@ -79,6 +81,7 @@ struct FlatForwardOperation {
     std::vector<std::string> request_ids;
     std::vector<std::int32_t> request_pool_indices;
     std::vector<std::int32_t> input_lengths;
+    std::vector<std::int32_t> seq_lens;
     // Per-request total number of prompt tokens (Request::PrefillSize()).
     std::vector<std::int32_t> prefill_lengths;
 
@@ -118,6 +121,7 @@ struct FlatForwardOperation {
                     request_ids.push_back(std::move(inner.request_id));
                     request_pool_indices.push_back(inner.request_pool_index);
                     input_lengths.push_back(inner.input_length);
+                    seq_lens.push_back(inner.seq_len);
                     prefill_lengths.push_back(inner.prefill_length);
                     occupied_pages.push_back(std::move(inner.occupied_pages));
                     begins.push_back(inner.begin);

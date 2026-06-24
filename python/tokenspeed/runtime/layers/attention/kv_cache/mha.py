@@ -22,6 +22,7 @@
 import numpy as np
 import torch
 from tokenspeed_kernel.ops.kvcache.triton import store_kv_cache
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
 from tokenspeed.runtime.layers.attention.kv_cache.utils import (
@@ -131,15 +132,20 @@ class MHATokenToKVPool(BaseTokenToKVPool):
                 )
                 for _ in range(self.layer_num)
             ]
+            # data_ptrs holds buffer pointer addresses for the kv-transfer
+            # triton kernels' grid launch.  Ascend NPU does not support
+            # uint64 cat on-device, so keep those tensors on CPU there;
+            # other platforms keep them on-device for fast kernel access.
+            _ptrs_device = "cpu" if current_platform().is_ascend else self.device
             self.k_data_ptrs = torch.tensor(
                 [x.data_ptr() for x in self.k_buffer],
                 dtype=torch.uint64,
-                device=self.device,
+                device=_ptrs_device,
             )
             self.v_data_ptrs = torch.tensor(
                 [x.data_ptr() for x in self.v_buffer],
                 dtype=torch.uint64,
-                device=self.device,
+                device=_ptrs_device,
             )
             self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
             self.data_strides = torch.tensor(

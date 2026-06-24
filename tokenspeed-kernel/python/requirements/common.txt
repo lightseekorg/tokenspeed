@@ -2,7 +2,5 @@ apache-tvm-ffi>=0.1.5,<=0.1.11
 numpy
 packaging
 PyYAML>=6.0
-tokenspeed-proton>=3.7.10.post20260531
-tokenspeed-triton>=3.7.10.post20260531
 wheel
 psutil

@@ -140,6 +140,8 @@ class DistributedInitializer:
         # Determine backend
         if config.device == "cuda":
             backend = "nccl"
+        elif config.device == "npu":
+            backend = "hccl"
         else:
             raise ValueError(f"Unsupported device: {config.device}")
 
@@ -156,10 +158,11 @@ class DistributedInitializer:
             distributed_init_method=dist_init_method,
             timeout=config.distributed_timeout_seconds,
         )
-        pg_manager.init_process_group(config.mapping.world_group)
-        pg_manager.init_process_group(config.mapping.attn.tp_group)
-        pg_manager.init_process_group(config.mapping.dense.tp_group)
-        pg_manager.init_process_group(config.mapping.moe.tp_ep_group)
+        group_backends = [backend, "gloo"]
+        pg_manager.init_process_group(config.mapping.world_group, backend=group_backends)
+        pg_manager.init_process_group(config.mapping.attn.tp_group, backend=group_backends)
+        pg_manager.init_process_group(config.mapping.dense.tp_group, backend=group_backends)
+        pg_manager.init_process_group(config.mapping.moe.tp_ep_group, backend=group_backends)
 
         logger.info(
             "Init comm buff end. Avail mem=%.4f GB",

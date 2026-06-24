@@ -22,20 +22,9 @@
 
 import torch
 import torch.nn as nn
-from tokenspeed_kernel.ops.communication.triton import (
-    allreduce_residual_rmsnorm as triton_allreduce_residual_rmsnorm,
-)
-from tokenspeed_kernel.ops.communication.trtllm import (
-    allgather_dual_rmsnorm,
-)
-from tokenspeed_kernel.ops.communication.trtllm import (
-    allreduce_residual_rmsnorm as trtllm_allreduce_residual_rmsnorm,
-)
-from tokenspeed_kernel.ops.communication.trtllm import (
-    reducescatter_residual_rmsnorm,
-)
 from tokenspeed_kernel.platform import current_platform
 
+from tokenspeed.runtime.distributed.comm_ops import get_device_backend
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -46,13 +35,46 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 _is_amd = current_platform().is_amd
+_is_ascend = current_platform().is_ascend
+allgather_dual_rmsnorm = None
+reducescatter_residual_rmsnorm = None
+trtllm_allreduce_residual_rmsnorm = None
+triton_allreduce_residual_rmsnorm = None
 
-if _is_amd:
+if _is_ascend:
+    from tokenspeed_kernel_ascend.ops.communication.triton import (
+        allgather_dual_rmsnorm,
+        allreduce_residual_rmsnorm as triton_allreduce_residual_rmsnorm,
+        reducescatter_residual_rmsnorm,
+    )
+    from tokenspeed_kernel_ascend.ops.layernorm.rmsnorm import (
+        rmsnorm as triton_rmsnorm,
+    )
+    from tokenspeed_kernel_ascend.ops.layernorm.rmsnorm import (
+        rmsnorm_fused_parallel as triton_rmsnorm_fused_parallel,
+    )
+elif _is_amd:
+    from tokenspeed_kernel.ops.communication.trtllm import (
+        allgather_dual_rmsnorm,
+        reducescatter_residual_rmsnorm,
+    )
+    from tokenspeed_kernel.ops.communication.triton import (
+        allreduce_residual_rmsnorm as triton_allreduce_residual_rmsnorm,
+    )
     from tokenspeed_kernel.ops.layernorm.triton import rmsnorm as triton_rmsnorm
     from tokenspeed_kernel.ops.layernorm.triton import (
         rmsnorm_fused_parallel as triton_rmsnorm_fused_parallel,
     )
 else:
+    from tokenspeed_kernel.ops.communication.trtllm import (
+        allgather_dual_rmsnorm,
+    )
+    from tokenspeed_kernel.ops.communication.trtllm import (
+        allreduce_residual_rmsnorm as trtllm_allreduce_residual_rmsnorm,
+    )
+    from tokenspeed_kernel.ops.communication.trtllm import (
+        reducescatter_residual_rmsnorm,
+    )
     from tokenspeed_kernel.ops.layernorm.cuda import rmsnorm_fused_parallel
     from tokenspeed_kernel.ops.layernorm.flashinfer import (
         fused_add_rmsnorm,
@@ -66,7 +88,7 @@ logger = get_colorful_logger(__name__)
 
 
 def _get_process_group(group: tuple[int, ...]):
-    return pg_manager.get_process_group("nccl", group)
+    return pg_manager.get_process_group(get_device_backend(), group)
 
 
 class RMSNorm(torch.nn.Module):
@@ -92,7 +114,7 @@ class RMSNorm(torch.nn.Module):
             else:
                 return x
 
-        if _is_amd:
+        if _is_amd or _is_ascend:
             if residual is not None:
                 assert (
                     not inplace
@@ -150,7 +172,7 @@ class RMSNorm(torch.nn.Module):
         if residual is not None:
 
             if len(group) > 1:
-                if _is_amd:
+                if _is_amd or _is_ascend:
                     allreduce_residual_rmsnorm = triton_allreduce_residual_rmsnorm
                 else:
                     assert current_platform().is_nvidia
@@ -245,7 +267,7 @@ class GemmaRMSNorm(torch.nn.Module):
             else:
                 return x
 
-        if _is_amd:
+        if _is_amd or _is_ascend:
             if x.shape[0] == 0:
                 if residual is not None:
                     return x, residual
@@ -301,7 +323,7 @@ class GemmaRMSNorm(torch.nn.Module):
         if residual is not None:
 
             if len(group) > 1:
-                if _is_amd:
+                if _is_amd or _is_ascend:
                     allreduce_residual_rmsnorm = triton_allreduce_residual_rmsnorm
                 else:
                     assert current_platform().is_nvidia
@@ -413,7 +435,7 @@ class FusedRMSNorm(nn.Module):
         Returns:
             Tuple of (normalized_q_a, normalized_kv_a)
         """
-        if _is_amd:
+        if _is_amd or _is_ascend:
             triton_rmsnorm_fused_parallel(
                 input1=input_q_a,
                 weight1=self.weight_q_a,

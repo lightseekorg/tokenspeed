@@ -352,3 +352,4 @@ __all__ = ["FusedSetKVBufferArg", "apply_rope", "apply_rope_mla"]
 import tokenspeed_kernel.ops.embedding.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.embedding.flashinfer  # noqa: E402,F401
 import tokenspeed_kernel.ops.embedding.triton  # noqa: E402,F401
+import tokenspeed_kernel.ops.embedding.ascend  # noqa: E402,F401

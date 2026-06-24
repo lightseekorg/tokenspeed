@@ -28,6 +28,7 @@ import tokenspeed_kernel.ops.gemm.deep_gemm  # noqa: F401
 import tokenspeed_kernel.ops.gemm.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.gemm.triton  # noqa: F401
 import tokenspeed_kernel.ops.gemm.trtllm  # noqa: F401
+import tokenspeed_kernel.ops.gemm.ascend  # noqa: F401
 import torch
 from tokenspeed_kernel.platform import Platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
@@ -52,6 +53,7 @@ _fp8_dtype = _platform.fp8e4m3fn.dtype
 _KERNELS_WITH_FUSED_BIAS: frozenset[str] = frozenset(
     {
         "torch_mm",
+        "torch_npu_mm",
         "triton_mm_fp8_scaled",
     }
 )

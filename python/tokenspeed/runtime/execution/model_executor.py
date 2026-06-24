@@ -37,6 +37,11 @@ from tokenspeed.runtime.execution.cache_loc_kernel import update_block_table
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
 from tokenspeed.runtime.execution.drafter.dflash import DFlash
+
+if current_platform().is_ascend:
+    from tokenspeed_kernel_ascend.execution import NpuGraphWrapper as _GraphWrapper
+else:
+    _GraphWrapper = CudaGraphWrapper
 from tokenspeed.runtime.execution.drafter.eagle import Eagle
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
@@ -438,7 +443,7 @@ class ModelExecutor:
         self._active_multimodal_context = None
         self._active_positions_override = None
 
-        self.forward_step = CudaGraphWrapper(
+        self.forward_step = _GraphWrapper(
             forward_func=self._forward_step,
             attn_backend=attn_backend,
             token_to_kv_pool=token_to_kv_pool,
@@ -481,7 +486,7 @@ class ModelExecutor:
 
             self.encoder_graph_wrappers = active_encoder_graph_wrappers
 
-        self.execution_stream = torch.cuda.Stream()
+        self.execution_stream = torch.get_device_module(self.device).Stream()
         self.log_step = 0
         self._seen_prefill_ids: set[str] = set()
         self._prev_decode_bs: int = 0
@@ -748,6 +753,35 @@ class ModelExecutor:
             runtime.min_bs,
         )
 
+    def _cpu_seq_lens_for_graph_replay(
+        self,
+        forward_op,
+        bs: int,
+        ctx: ForwardContext,
+        num_extends: int,
+    ) -> list[int] | None:
+        if (
+            self.drafter is not None
+            or num_extends != 0
+            or not self.forward_step.requires_cpu_seq_lens_for_graph_replay()
+            or not self.forward_step.can_run(bs=bs, ctx=ctx)
+        ):
+            return None
+
+        seq_lens = getattr(forward_op, "seq_lens", None)
+        if seq_lens is None:
+            return None
+        if isinstance(seq_lens, torch.Tensor):
+            raise RuntimeError(
+                "NPU graph CPU seq_lens expects scheduler-provided CPU "
+                "sequence lengths, got torch.Tensor."
+            )
+        if len(seq_lens) < bs:
+            raise RuntimeError(
+                f"seq_lens length mismatch: got {len(seq_lens)}, expected {bs}"
+            )
+        return [int(seq_lens[i]) for i in range(bs)]
+
     @maybe_inference_mode()
     def _forward_step(
         self,
@@ -1011,7 +1045,7 @@ class ModelExecutor:
 
         sentinel = self._sentinel_neg1
 
-        with torch.cuda.stream(self.execution_stream):
+        with torch.get_device_module(self.device).stream(self.execution_stream):
             req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
             working = self.input_buffers.mamba_pool_indices_buf[:bs]
 
@@ -1187,6 +1221,10 @@ class ModelExecutor:
                 batch_size=padded_bs,
                 total_tokens=padded_bs * self.config.output_length,
             )
+            seq_lens_list = None
+            if self.forward_step.requires_cpu_seq_lens_for_graph_replay():
+                seq_len = max(self.config.output_length, 1)
+                seq_lens_list = [seq_len] * padded_bs
             # Captured hostfunc pops one entry per replay; push a dummy
             # for this idle replay, same as run_once.
             if self.capturable_grammar is not None:
@@ -1201,6 +1239,7 @@ class ModelExecutor:
                     ctx=ctx,
                     sampling_info=sampling_info,
                     req_to_page=self.req_to_page,
+                    seq_lens_list=seq_lens_list,
                 )
             return
 
@@ -1352,9 +1391,9 @@ class ModelExecutor:
             hist_token_lens_tensor = None
             all_pool_indices = None
 
-        self.execution_stream.wait_stream(torch.cuda.current_stream())
+        self.execution_stream.wait_stream(torch.get_device_module(self.device).current_stream())
 
-        with torch.cuda.stream(self.execution_stream):
+        with torch.get_device_module(self.device).stream(self.execution_stream):
             if is_prefill:
                 extend_request_pool_indices = torch.tensor(
                     forward_op.request_pool_indices[:num_extends],
@@ -1482,9 +1521,9 @@ class ModelExecutor:
             # Wait for previous iteration's runtime state updates
             # (future_input_map, valid_cache_lengths) on execution_stream to
             # complete before reading them.
-            torch.cuda.current_stream().wait_stream(self.execution_stream)
-            self.execution_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(self.execution_stream):
+            torch.get_device_module(self.device).current_stream().wait_stream(self.execution_stream)
+            self.execution_stream.wait_stream(torch.get_device_module(self.device).current_stream())
+        with torch.get_device_module(self.device).stream(self.execution_stream):
             bs = len(forward_op.request_ids)
             # Outside the graph: in-graph sites only OR into the flag buffer.
             self.nan_guard.reset(bs)
@@ -1692,6 +1731,12 @@ class ModelExecutor:
                             else bs
                         )
                         forward_step_start = time.perf_counter()
+                    seq_lens_list = self._cpu_seq_lens_for_graph_replay(
+                        forward_op,
+                        bs,
+                        ctx,
+                        num_extends,
+                    )
                     output_tokens, output_lengths, output_logprobs = self.forward_step(
                         bs=bs,
                         ctx=ctx,
@@ -1714,6 +1759,7 @@ class ModelExecutor:
                         paged_cache_block_table_base_offsets=(
                             paged_cache_block_table_base_offsets
                         ),
+                        seq_lens_list=seq_lens_list,
                         **mamba_kwargs,
                     )
                     if timing_enabled:
@@ -1787,7 +1833,7 @@ class ModelExecutor:
 
                 output_nan_flags = self.nan_guard.flags_cpu
 
-                copy_event = torch.cuda.Event()
+                copy_event = torch.get_device_module(self.device).Event()
                 copy_event.record()
                 if timing_enabled:
                     output_d2h_ms = (time.perf_counter() - output_d2h_start) * 1000.0
@@ -1844,7 +1890,7 @@ class ModelExecutor:
         # Remote spec candidates are CPU materialized; enqueue the H2D copy and
         # future_input_map update on execution_stream. The next forward's input
         # prep already waits on execution_stream before reading runtime state.
-        with torch.cuda.stream(self.execution_stream):
+        with torch.get_device_module(self.device).stream(self.execution_stream):
             self.runtime_states.write_remote_spec_candidate_ids(
                 req_pool_idx, candidate_ids
             )

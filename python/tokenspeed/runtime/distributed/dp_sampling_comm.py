@@ -46,7 +46,10 @@ from tokenspeed.runtime.distributed.comm_backend import (
     Group,
     get_global_backend,
 )
-from tokenspeed.runtime.distributed.comm_ops import all_gather_into_tensor
+from tokenspeed.runtime.distributed.comm_ops import (
+    all_gather_into_tensor,
+    get_device_backend,
+)
 from tokenspeed.runtime.distributed.dp_sampling_swap import (
     swap_batch_vocab as _swap_batch_vocab_nccl,
 )
@@ -380,7 +383,7 @@ class DpSamplingComm:
         assert create_dp_sampling_state is not None
 
         self._state = create_dp_sampling_state(
-            group=pg_manager.get_process_group("nccl", self._group),
+            group=pg_manager.get_process_group(get_device_backend(), self._group),
             rank_in_group=self._rank,
             tp_size=self._tp_size,
             max_pad_bs=self._max_pad_bs,

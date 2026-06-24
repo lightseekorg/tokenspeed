@@ -64,6 +64,9 @@ void BindForwardCommonFields(Cls& cls) {
             "input_lengths", [](const Op& op) -> const std::vector<std::int32_t>& { return op.input_lengths; },
             nb::rv_policy::reference_internal)
         .def_prop_ro(
+            "seq_lens", [](const Op& op) -> const std::vector<std::int32_t>& { return op.seq_lens; },
+            nb::rv_policy::reference_internal)
+        .def_prop_ro(
             "occupied_pages",
             [](const Op& op) -> const std::vector<std::vector<std::int32_t>>& { return op.occupied_pages; },
             nb::rv_policy::reference_internal)

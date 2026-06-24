@@ -102,7 +102,7 @@ _fp8e4m3_dtype = None
 class PlatformInfo:
     """Complete description of a compute platform."""
 
-    vendor: str  # "nvidia", "amd"
+    vendor: str  # "nvidia", "amd", "ascend"
     arch_version: ArchVersion
     device_name: str
     device_count: int
@@ -181,6 +181,22 @@ class PlatformInfo:
         return self.is_amd and self.arch_version >= ArchVersion(9, 5)
 
     @property
+    def is_ascend(self) -> bool:
+        return self.vendor == "ascend"
+
+    @property
+    def is_ascend_910b(self) -> bool:
+        return self.is_ascend and self.arch_version == ArchVersion(1, 0)
+
+    @property
+    def is_ascend_910c(self) -> bool:
+        return self.is_ascend and self.arch_version == ArchVersion(2, 0)
+
+    @property
+    def is_ascend_910b_plus(self) -> bool:
+        return self.is_ascend and self.arch_version >= ArchVersion(1, 0)
+
+    @property
     def arch(self) -> str:
         """Short architecture string for cache keys."""
         return str(self.arch_version)
@@ -205,6 +221,8 @@ class PlatformInfo:
 
     def register_host_tensor_for_gpu_access(self, tensor: torch.Tensor) -> None:
         """Register host memory that GPU kernels will directly dereference."""
+        if self.is_ascend:
+            return
         if tensor.device.type != "cpu" or tensor.numel() == 0:
             return
         status = torch.cuda.cudart().cudaHostRegister(
@@ -239,6 +257,12 @@ class PlatformInfo:
                 (9, 5): "CDNA4",  # MI350
             }
             return names.get(arch_version, f"GFX{arch_version[0]}.{arch_version[1]}")
+        if self.is_ascend:
+            names = {
+                (1, 0): "Ascend 910B",
+                (2, 0): "Ascend 910C",
+            }
+            return names.get(arch_version, f"Ascend{arch_version[0]}.{arch_version[1]}")
         return f"{self.vendor}:{arch_version[0]}.{arch_version[1]}"
 
 
@@ -331,7 +355,7 @@ def _detect_platform() -> PlatformInfo:
         import torch
     except ImportError:
         raise RuntimeError(
-            "tokenspeed-kernel requires PyTorch with NVIDIA CUDA or AMD ROCm support."
+            "tokenspeed-kernel requires PyTorch with NVIDIA CUDA, AMD ROCm, or Ascend NPU support."
         ) from None
 
     if torch.cuda.is_available():
@@ -339,7 +363,12 @@ def _detect_platform() -> PlatformInfo:
             return _detect_rocm_platform()
         return _detect_cuda_platform()
 
-    raise RuntimeError("tokenspeed-kernel requires an NVIDIA CUDA or AMD ROCm GPU.")
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        return _detect_ascend_platform()
+
+    raise RuntimeError(
+        "tokenspeed-kernel requires an NVIDIA CUDA, AMD ROCm, or Ascend NPU device."
+    )
 
 
 def _detect_cuda_platform() -> PlatformInfo:
@@ -461,6 +490,106 @@ def _get_rocm_runtime_features() -> frozenset[str]:
         features.add("comms:symmetric_memory")
 
     return frozenset(features)
+
+
+def _detect_ascend_platform() -> PlatformInfo:
+    """Detect Ascend NPU platform."""
+    import torch
+    import torch_npu  # noqa: F401
+
+    device_id = torch.npu.current_device()
+    device_name = torch.npu.get_device_name(device_id)
+    device_count = torch.npu.device_count()
+    props = torch.npu.get_device_properties(device_id)
+    total_memory = getattr(props, "total_memory", 0)
+
+    soc_version = _get_ascend_soc_version()
+    arch_version = _ascend_soc_to_arch(soc_version)
+    sm_features = _get_ascend_features(soc_version)
+    runtime_features = _get_ascend_runtime_features()
+    interconnect = _detect_ascend_interconnect(device_count)
+
+    return PlatformInfo(
+        vendor="ascend",
+        arch_version=arch_version,
+        device_name=device_name,
+        device_count=device_count,
+        total_memory=total_memory,
+        memory_bandwidth=_estimate_ascend_bandwidth(soc_version),
+        sm_count=_get_ascend_ai_core_count(soc_version),
+        max_threads_per_sm=0,
+        max_shared_memory_per_sm=0,
+        sm_features=sm_features,
+        runtime_features=runtime_features,
+        interconnect=interconnect,
+    )
+
+
+def _get_ascend_soc_version() -> str:
+    """Get the Ascend SOC version string."""
+    try:
+        import torch_npu
+
+        return torch_npu.npu.get_soc_version().upper()
+    except Exception:
+        return "ASCEND910B"
+
+
+def _ascend_soc_to_arch(soc_version: str) -> ArchVersion:
+    """Map Ascend SOC version to ArchVersion."""
+    if "910C" in soc_version or "910D" in soc_version:
+        return ArchVersion(2, 0)
+    # 910B and earlier variants
+    return ArchVersion(1, 0)
+
+
+def _get_ascend_features(soc_version: str) -> frozenset[str]:
+    """Determine Ascend compute features from SOC version."""
+    features: set[str] = {"tensor_core:f16", "tensor_core:bf16"}
+
+    if "910C" in soc_version or "910D" in soc_version:
+        features.add("tensor_core:f8")
+
+    return frozenset(features)
+
+
+def _get_ascend_runtime_features() -> frozenset[str]:
+    """Detect Ascend runtime features."""
+    features: set[str] = set()
+
+    try:
+        import torch.distributed as _dist
+
+        if hasattr(_dist, "is_hccl_available") and _dist.is_hccl_available():
+            features.add("comms:hccl")
+    except Exception:
+        pass
+
+    return frozenset(features)
+
+
+def _estimate_ascend_bandwidth(soc_version: str) -> float:
+    """Estimate HBM bandwidth in GB/s for Ascend devices."""
+    if "910C" in soc_version or "910D" in soc_version:
+        return 1800.0
+    # 910B
+    return 1200.0
+
+
+def _get_ascend_ai_core_count(soc_version: str) -> int:
+    """Return the number of AI cores for an Ascend SOC."""
+    if "910C" in soc_version or "910D" in soc_version:
+        return 48
+    # 910B
+    return 32
+
+
+def _detect_ascend_interconnect(device_count: int) -> InterconnectInfo | None:
+    """Detect Ascend multi-NPU interconnect topology."""
+    if device_count <= 1:
+        return InterconnectInfo(topology="single_gpu")
+    # Ascend 910B/C uses HCCS links between NPUs
+    return InterconnectInfo(topology="hccs_full")
 
 
 # ---------------------------------------------------------------------------

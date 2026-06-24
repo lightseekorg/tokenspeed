@@ -122,3 +122,4 @@ def argmax(
 # Backend registration (side-effect imports).
 import tokenspeed_kernel.ops.sampling.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.gluon  # noqa: E402,F401
+import tokenspeed_kernel.ops.sampling.ascend  # noqa: E402,F401

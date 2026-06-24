@@ -26,7 +26,15 @@ from collections.abc import Iterable
 from typing import Any
 
 import torch
-from tokenspeed_kernel.ops.layernorm.triton import qk_rmsnorm
+from tokenspeed_kernel.platform import current_platform
+
+if current_platform().is_ascend:
+    from tokenspeed_kernel_ascend.ops.layernorm.qkv_rmsnorm_rope import (
+        qkv_rmsnorm_rope,
+    )
+else:
+    qkv_rmsnorm_rope = None
+    from tokenspeed_kernel.ops.layernorm.triton import qk_rmsnorm  # noqa: F811
 from torch import nn
 
 from tokenspeed.runtime.configs.qwen3_config import Qwen3Config
@@ -177,6 +185,14 @@ class Qwen3Attention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
         )
+        if qkv_rmsnorm_rope is not None and not hasattr(
+            self.rotary_emb, "_ascend_qkv_rmsnorm_rope_cos_sin_cache"
+        ):
+            self.rotary_emb.register_buffer(
+                "_ascend_qkv_rmsnorm_rope_cos_sin_cache",
+                self.rotary_emb.cos_sin_cache.to(dtype=torch.bfloat16),
+                persistent=False,
+            )
         self.attn = PagedAttention(
             self.num_heads,
             self.head_dim,
@@ -184,6 +200,30 @@ class Qwen3Attention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
         )
+
+    def forward_npu(
+        self,
+        positions: torch.Tensor,
+        qkv: torch.Tensor,
+        ctx: ForwardContext,
+        out_cache_loc: torch.Tensor,
+    ) -> torch.Tensor:
+        q, k, v = qkv_rmsnorm_rope(
+            qkv,
+            self.q_norm.weight.data,
+            self.k_norm.weight.data,
+            self.q_size,
+            self.kv_size,
+            self.head_dim,
+            self.q_norm.variance_epsilon,
+            self.rotary_emb._ascend_qkv_rmsnorm_rope_cos_sin_cache,
+            positions.flatten(),
+        )
+        attn_output = self.attn(q, k, v, ctx, out_cache_loc)
+        if len(attn_output.size()) == 3:
+            attn_output = attn_output.reshape(attn_output.shape[0], -1)
+        output, _ = self.o_proj(attn_output)
+        return output
 
     def _apply_qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
@@ -213,6 +253,9 @@ class Qwen3Attention(nn.Module):
         cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
+        if qkv_rmsnorm_rope is not None:
+            return self.forward_npu(positions, qkv, ctx, out_cache_loc)
+
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self._apply_qk_norm(q, k)
         q, k = self.rotary_emb(positions, q, k)

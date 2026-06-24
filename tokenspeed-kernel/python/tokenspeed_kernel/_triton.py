@@ -21,6 +21,9 @@
 # Single point of indirection for the triton vendor release package used by
 # tokenspeed-kernel. All in-tree code imports triton symbols from here so the
 # underlying distribution can be swapped in one place.
+#
+# On Ascend platforms, use triton-ascend (3.2.0) directly instead of
+# tokenspeed_triton (3.7.10) to avoid JIT API version mismatches.
 
 import contextlib
 import importlib
@@ -28,14 +31,61 @@ import importlib.abc
 import importlib.util
 import sys
 
-import tokenspeed_triton as triton
-import tokenspeed_triton.experimental.gluon.language as gl
-import tokenspeed_triton.profiler as proton
-from tokenspeed_triton import language as tl
-from tokenspeed_triton.experimental import gluon
-from tokenspeed_triton.language.core import _aggregate as aggregate
-from tokenspeed_triton.language.extra import libdevice
-from tokenspeed_triton.tools.tensor_descriptor import TensorDescriptor
+
+def _is_ascend_env() -> bool:
+    try:
+        import torch
+
+        return hasattr(torch, "npu") and torch.npu.is_available()
+    except Exception:
+        return False
+
+
+if _is_ascend_env():
+    import triton
+
+    from triton import language as tl
+
+    # triton-ascend may not have all submodules that tokenspeed_triton has;
+    # provide safe fallbacks.
+    try:
+        import triton.profiler as proton
+    except (ImportError, AttributeError):
+        proton = None
+
+    try:
+        import triton.experimental.gluon.language as gl
+        from triton.experimental import gluon
+        from triton.language.core import _aggregate as aggregate
+    except (ImportError, AttributeError):
+        gl = None
+        gluon = None
+        aggregate = None
+
+    try:
+        from triton.language.extra import libdevice
+    except (ImportError, AttributeError):
+        libdevice = None
+
+    try:
+        from triton.tools.tensor_descriptor import TensorDescriptor
+    except (ImportError, AttributeError):
+        TensorDescriptor = None
+
+    _TRITON_SRC = "tokenspeed_triton"
+    _TRITON_DST = "triton"
+else:
+    import tokenspeed_triton as triton
+    import tokenspeed_triton.experimental.gluon.language as gl
+    import tokenspeed_triton.profiler as proton
+    from tokenspeed_triton import language as tl
+    from tokenspeed_triton.experimental import gluon
+    from tokenspeed_triton.language.core import _aggregate as aggregate
+    from tokenspeed_triton.language.extra import libdevice
+    from tokenspeed_triton.tools.tensor_descriptor import TensorDescriptor
+
+    _TRITON_SRC = "triton"
+    _TRITON_DST = "tokenspeed_triton"
 
 __all__ = [
     "aggregate",
@@ -48,10 +98,6 @@ __all__ = [
     "tl",
     "triton",
 ]
-
-
-_TRITON_SRC = "triton"
-_TRITON_DST = "tokenspeed_triton"
 
 
 class _ReuseModuleLoader(importlib.abc.Loader):
@@ -74,7 +120,7 @@ class _ReuseModuleLoader(importlib.abc.Loader):
 
 
 class _TritonRedirectFinder(importlib.abc.MetaPathFinder):
-    """Lazy ``triton[.x.y]`` -> ``tokenspeed_triton[.x.y]`` redirect finder."""
+    """Lazy redirect finder between triton package namespaces."""
 
     def find_spec(self, fullname, path, target=None):
         if fullname != _TRITON_SRC and not fullname.startswith(_TRITON_SRC + "."):
@@ -95,18 +141,10 @@ class _TritonRedirectFinder(importlib.abc.MetaPathFinder):
 
 @contextlib.contextmanager
 def redirect_triton_to_tokenspeed_triton():
-    """Make ``triton[.x.y]`` resolve to ``tokenspeed_triton[.x.y]`` in scope.
+    """Make one triton namespace resolve to the other in scope.
 
-    Use as a context manager around imports of third-party packages that
-    bind ``triton`` at module load time::
-
-        from tokenspeed_kernel._triton import redirect_triton_to_tokenspeed_triton
-
-        with redirect_triton_to_tokenspeed_triton():
-            import some_third_party_package_that_uses_triton
-
-    Outside the ``with`` block ``sys.modules`` is restored to its prior
-    state, so unrelated code is unaffected.
+    On CUDA/ROCm: ``triton[.x.y]`` -> ``tokenspeed_triton[.x.y]``
+    On Ascend:    ``tokenspeed_triton[.x.y]`` -> ``triton[.x.y]``
     """
     saved = {
         name: sys.modules[name]
@@ -116,9 +154,6 @@ def redirect_triton_to_tokenspeed_triton():
     for name in saved:
         del sys.modules[name]
 
-    # Redirect every ``tokenspeed_triton.*`` already in ``sys.modules`` so the
-    # protected imports hit the cache directly (no spec/loader machinery, no
-    # risk of accidentally instantiating a duplicate module).
     for name, mod in list(sys.modules.items()):
         if name == _TRITON_DST or name.startswith(_TRITON_DST + "."):
             sys.modules[_TRITON_SRC + name[len(_TRITON_DST) :]] = mod

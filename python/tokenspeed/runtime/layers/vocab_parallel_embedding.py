@@ -41,8 +41,10 @@ from tokenspeed.runtime.layers.quantization.base_config import (
     method_has_implemented_embedding,
 )
 from tokenspeed.runtime.utils import set_weight_attrs
+from tokenspeed_kernel.platform import current_platform
 
 DEFAULT_VOCAB_PADDING_SIZE = 64
+_is_ascend = current_platform().is_ascend
 
 
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
@@ -162,7 +164,7 @@ class VocabParallelEmbeddingShardIndices:
         assert self.num_added_elements <= self.num_added_elements_padded
 
 
-@torch.compile
+@torch.compile(disable=_is_ascend)
 def get_masked_input_and_mask(
     input_: torch.Tensor,
     org_vocab_start_index: int,

@@ -6,3 +6,5 @@ flashinfer-python==0.6.13
 flashinfer-cubin==0.6.13
 nvidia-ml-py==13.580.82
 nvtx
+tokenspeed-proton>=3.7.10.post20260531
+tokenspeed-triton>=3.7.10.post20260531

@@ -30,6 +30,7 @@ import tokenspeed_kernel.ops.attention.flash_mla  # noqa: F401
 import tokenspeed_kernel.ops.attention.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.attention.gluon  # noqa: F401
 import tokenspeed_kernel.ops.attention.triton  # noqa: F401
+import tokenspeed_kernel.ops.attention.ascend  # noqa: F401
 import torch
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope

@@ -1,0 +1,115 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""Registration shims for Ascend NPU attention kernels."""
+
+from __future__ import annotations
+
+import torch
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+)
+from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import format_signatures
+
+if current_platform().is_ascend:
+    from tokenspeed_kernel_ascend.ops.attention.torch_npu_mha import (
+        torch_npu_mha_decode_with_kvcache as _decode_impl,
+    )
+    from tokenspeed_kernel_ascend.ops.attention.torch_npu_mha import (
+        torch_npu_mha_extend_with_kvcache as _extend_impl,
+    )
+    from tokenspeed_kernel_ascend.ops.attention.torch_npu_mha import (
+        torch_npu_mha_prefill as _prefill_impl,
+    )
+
+    @register_kernel(
+        "attention",
+        "mha_prefill",
+        name="torch_npu_mha_prefill",
+        solution="torch_npu",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(1, 0),
+            vendors=frozenset({"ascend"}),
+        ),
+        signatures=format_signatures(
+            ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
+        ),
+        priority=Priority.PERFORMANT,
+        traits={
+            "sliding_window": frozenset({False, True}),
+            "support_logit_cap": frozenset({False}),
+            "support_sinks": frozenset({False}),
+            "return_lse": frozenset({False, True}),
+        },
+    )
+    def torch_npu_mha_prefill(*args, **kwargs):
+        return _prefill_impl(*args, **kwargs)
+
+    @register_kernel(
+        "attention",
+        "mha_decode_with_kvcache",
+        name="torch_npu_mha_decode_with_kvcache",
+        solution="torch_npu",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(1, 0),
+            vendors=frozenset({"ascend"}),
+        ),
+        signatures=format_signatures(
+            ("q", "k_cache", "v_cache"),
+            "dense",
+            {torch.float16, torch.bfloat16},
+        ),
+        priority=Priority.PERFORMANT,
+        traits={
+            "sliding_window": frozenset({False, True}),
+            "support_logit_cap": frozenset({False}),
+            "support_sinks": frozenset({False}),
+            "return_lse": frozenset({False, True}),
+        },
+    )
+    def torch_npu_mha_decode_with_kvcache(*args, **kwargs):
+        return _decode_impl(*args, **kwargs)
+
+    @register_kernel(
+        "attention",
+        "mha_extend_with_kvcache",
+        name="torch_npu_mha_extend_with_kvcache",
+        solution="torch_npu",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(1, 0),
+            vendors=frozenset({"ascend"}),
+        ),
+        signatures=format_signatures(
+            ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
+        ),
+        priority=Priority.PERFORMANT,
+        traits={
+            "is_causal": frozenset({False, True}),
+            "sliding_window": frozenset({False, True}),
+            "support_logit_cap": frozenset({False}),
+            "support_sinks": frozenset({False}),
+            "return_lse": frozenset({False, True}),
+        },
+    )
+    def torch_npu_mha_extend_with_kvcache(*args, **kwargs):
+        return _extend_impl(*args, **kwargs)

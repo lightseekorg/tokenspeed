@@ -133,6 +133,12 @@ class LogitsMetadata:
 
 
 _FUSED_LM_HEAD_GEMM = None
+_ASCEND_LM_HEAD_MM = None
+
+if current_platform().is_ascend:
+    from tokenspeed_kernel.ops.gemm.ascend import torch_npu_mm as _torch_npu_mm
+
+    _ASCEND_LM_HEAD_MM = _torch_npu_mm
 
 
 def _get_fused_lm_head_gemm():
@@ -160,23 +166,34 @@ def _get_fused_lm_head_gemm():
     return _FUSED_LM_HEAD_GEMM
 
 
-def _lm_head_matmul(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+def _lm_head_matmul(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    allow_fused: bool = False,
+) -> torch.Tensor:
     """Compute ``hidden_states @ weight.T``.
 
-    Routes to the fused ``lm_head_gemm`` when the shape matches a compiled
-    template and the bench-driven perf gate accepts (``should_use_fused``).
-    Otherwise falls back to ``torch.matmul``.
+    On Ascend, route through the same vllm-ascend-style dense GEMM wrapper used
+    by unquantized linear layers. On NVIDIA, optionally routes to the fused
+    ``lm_head_gemm`` when the shape matches a compiled template and the
+    bench-driven perf gate accepts (``should_use_fused``). Otherwise falls back
+    to ``torch.matmul`` on non-Ascend platforms.
 
-    Only enabled for Kimi (``model_type == "kimi_k2"``) at the call site —
-    on DSv3 the fused kernel's PDL launch surface caused a downstream EAGLE3
-    spec decode AR regression that we have not characterised end-to-end; on
-    Kimi the perf win is the largest and the regression has not been
-    reproduced, so we gate the fused path to Kimi only.
+    NVIDIA fused GEMM remains gated to Kimi at the call site. On DSv3 the fused
+    kernel's PDL launch surface caused a downstream EAGLE3 spec decode AR
+    regression that we have not characterised end-to-end; on Kimi the perf win
+    is the largest and the regression has not been reproduced.
     """
     cast_hidden = hidden_states.to(weight.dtype)
-    should_use_fused, lm_head_gemm = _get_fused_lm_head_gemm()
-    if should_use_fused is not None and should_use_fused(cast_hidden, weight):
-        return lm_head_gemm(cast_hidden, weight, enable_pdl=True)
+    if current_platform().is_ascend:
+        if _ASCEND_LM_HEAD_MM is None:
+            raise RuntimeError("Ascend lm_head GEMM is unavailable")
+        return _ASCEND_LM_HEAD_MM(cast_hidden, weight)
+    if allow_fused:
+        should_use_fused, lm_head_gemm = _get_fused_lm_head_gemm()
+        if should_use_fused is not None and should_use_fused(cast_hidden, weight):
+            return lm_head_gemm(cast_hidden, weight, enable_pdl=True)
     return torch.matmul(cast_hidden, weight.T)
 
 
@@ -547,12 +564,11 @@ class LogitsProcessor(nn.Module):
             )
 
         if hasattr(lm_head, "weight"):
-            if self._use_fused_lm_head:
-                logits = _lm_head_matmul(hidden_states, lm_head.weight)
-            else:
-                logits = torch.matmul(
-                    hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
-                )
+            logits = _lm_head_matmul(
+                hidden_states,
+                lm_head.weight,
+                allow_fused=self._use_fused_lm_head,
+            )
         else:
             # GGUF models
             logits = lm_head.linear_method.apply(lm_head, hidden_states, embedding_bias)
