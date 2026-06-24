@@ -60,32 +60,32 @@ DEFAULT_FORCE_STREAM_INTERVAL = 50
 
 @dataclass
 class RequestStats:
-    """Host-side per-request performance summary (logged by --log-request-stats).
+    """Host-side per-request perf summary (--log-request-stats), logged as repr.
 
-    Printed as a Python-object repr, e.g.
-    ``RequestStats(rid='chatcmpl-...', status='finished', ..., queue_ms=13.8, ...)``.
-    Durations are milliseconds, rates are 0-1 ratios, and ``*_ts`` are absolute
-    epoch seconds. ``acc_len``/``acc_rate`` are ``None`` when speculative decoding
-    is off. All fields are derived from host-side timestamps/counters — building
-    this introduces no GPU sync.
+    Durations are ms, rates are 0-1, ``*_ts`` are epoch seconds; ``acc_*`` are
+    None when spec decode is off. No GPU sync.
     """
 
     rid: str
-    status: str  # "finished" | "aborted"
-    reason: str  # finish-reason type: "stop" | "length" | "abort"
+    status: str
+    reason: str
+
     prompt_tokens: int
     cache_tokens: int
     output_tokens: int
     cache_hit_rate: float
-    queue_ms: float  # received -> first scheduled into a forward batch
-    prefill_ms: float  # scheduled -> prefill complete
-    ttft_ms: float  # received -> first output token (>= prefill_ms)
-    total_ms: float  # received -> finished/aborted
-    preempt_ms: float  # decode time lost to prefilling other requests
-    preempt_count: int  # number of such interruptions
-    decode_tps: float  # decode throughput (tokens/s)
-    acc_len: float | None  # spec-decode acceptance length
-    acc_rate: float | None  # spec-decode acceptance rate
+
+    queue_ms: float
+    prefill_ms: float
+    ttft_ms: float
+    total_ms: float
+    preempt_ms: float
+    preempt_count: int
+    decode_tps: float
+
+    acc_len: float | None
+    acc_rate: float | None
+
     recv_ts: float
     commit_ts: float
     finish_ts: float
@@ -137,17 +137,13 @@ class RequestState:
         self.spec_verify_ct: int = 0
         self.accept_draft_tokens: float | None = None
 
-        # --- request-stats timing (host-side; only populated/read when the
-        # server is started with --log-request-stats). All wall-clock floats
-        # recorded on the host; nothing here forces a GPU sync. ---
-        self.created_time: float = created_time  # received (frontend) timestamp
-        self.scheduled_time: float = 0.0  # first forward step (queue end / commit)
-        self.prefill_done_time: float = 0.0  # prefill completed
-        self.first_token_time: float = 0.0  # first output token produced (TTFT)
-        self.finish_time: float = 0.0  # finished / aborted
-        # Preemption = this request's decode steps that also prefilled OTHER
-        # requests (host-observable from forward_op). count = number of such
-        # interruptions (rising edges); time = their summed wall-clock.
+        # request-stats timing (host-side; only used with --log-request-stats)
+        self.created_time: float = created_time
+        self.scheduled_time: float = 0.0
+        self.prefill_done_time: float = 0.0
+        self.first_token_time: float = 0.0
+        self.finish_time: float = 0.0
+        # preemption: decode steps that also prefilled other requests
         self.preempt_count: int = 0
         self.preempt_time: float = 0.0
         self._preempted_last_step: bool = False
@@ -374,8 +370,7 @@ class OutputProcesser:
         self.stream_interval = stream_interval
         self.metrics = metrics
         self.log_request_stats = log_request_stats
-        # Wall-clock of the previous forward step, for host-side preemption
-        # accounting (only used when log_request_stats is enabled).
+        # previous forward step ts, for host-side preempt timing
         self._last_step_ts: float = 0.0
         self.log_cnt = 0
         self.rid_to_state: dict[str, RequestState] = {}
@@ -395,20 +390,15 @@ class OutputProcesser:
             )
 
     def _log_request_stats(self, rid: str, rs: RequestState) -> None:
-        """Emit a one-line per-request performance summary on finish/abort.
+        """Emit the per-request stats line on finish/abort (--log-request-stats).
 
-        Gated by ``--log-request-stats``. Every value is derived from
-        host-side timestamps and counters already available at finish, so
-        this introduces no GPU sync and no engine slowdown. Durations are in
-        ms; ``ttft`` (received -> first output token) is always >= ``prefill``
-        (commit -> prefill done) because it additionally spans the queue.
+        All values are host-side; no GPU sync.
         """
         if self.global_rank != 0:
             return
 
         def _ms(end: float, start: float) -> float:
-            # Guard unset (0.0) timestamps so a missing stage reads 0, not a
-            # garbage epoch-sized number.
+            # 0 for unset (0.0) timestamps, not a garbage epoch-sized number.
             return round((end - start) * 1e3, 2) if end > 0.0 and start > 0.0 else 0.0
 
         prompt = rs.input_length
@@ -419,14 +409,14 @@ class OutputProcesser:
             if rs.finish_time > 0.0 and rs.first_token_time > 0.0
             else 0.0
         )
-        # Tokens generated after the first, over the decode window.
+        # tokens after the first, over the decode window
         decode_tps = (
             round((output - 1) / decode_window, 1)
             if decode_window > 0.0 and output > 1
             else 0.0
         )
 
-        # Spec-decode acceptance; None when speculative decoding is off.
+        # spec acceptance; None when spec decode is off
         if self.spec_algorithm is not None and rs.spec_verify_ct > 0:
             acc_len = rs.accept_draft_tokens or 0.0
             draft = self.spec_num_tokens or 0
@@ -662,10 +652,7 @@ class OutputProcesser:
         )
         num_extends = forward_op.num_extends()
 
-        # Host-side per-request stats timing (only when --log-request-stats).
-        # stats_now is this step's wall-clock; step_dt is the gap since the
-        # previous step (used to attribute preemption time); prefilling_others
-        # is True when this step prefills any request.
+        # per-request stats timing (host-side, only when --log-request-stats)
         stats_now = time.time() if self.log_request_stats else 0.0
         step_dt = 0.0
         prefilling_others = False
@@ -713,7 +700,7 @@ class OutputProcesser:
 
             request_state: RequestState = self.rid_to_state[rid]
 
-            # First forward step this request appears in == queue end / commit.
+            # first forward step the request appears in == queue end
             if self.log_request_stats and request_state.scheduled_time == 0.0:
                 request_state.scheduled_time = stats_now
 
@@ -724,9 +711,7 @@ class OutputProcesser:
             if self.log_request_stats:
                 if request_state.prefill_done_time == 0.0:
                     request_state.prefill_done_time = stats_now
-                # Decode steps that also prefilled other requests delay this
-                # request's decode: count each interruption (rising edge) and
-                # accumulate its wall-clock.
+                # count each prefill-of-others interruption (rising edge) and its time
                 if i >= num_extends and prefilling_others:
                     if not request_state._preempted_last_step:
                         request_state.preempt_count += 1
@@ -825,7 +810,7 @@ class OutputProcesser:
                     self.log_accept_length(rid, request_state)
                     break
 
-            # First produced output token == TTFT anchor (received -> here).
+            # first output token == TTFT anchor
             if (
                 self.log_request_stats
                 and request_state.first_token_time == 0.0
