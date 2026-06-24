@@ -25,6 +25,7 @@ import torch
 from tokenspeed.runtime.engine.generation_output_processor import (
     OutputProcesser,
     RequestState,
+    RequestStatsTracker,
 )
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
@@ -275,9 +276,8 @@ def test_log_request_stats_disabled_by_default():
 
     assert state.finished
     assert not any(line.startswith("RequestStats(") for line in rec.lines)
-    # Timing fields stay at their unset default.
-    assert state.scheduled_time == 0.0
-    assert state.finish_time == 0.0
+    # no tracker attached when disabled
+    assert state.stats is None
 
 
 def test_log_request_stats_line_fields():
@@ -296,15 +296,16 @@ def test_log_request_stats_line_fields():
         # total 130ms; output=5 over a 100ms decode window -> decode_tps 40.
         rs = _state([1, 2, 3, 4])
         rs.created_time = 1000.000
-        rs.scheduled_time = 1000.010
-        rs.prefill_done_time = 1000.030
-        rs.first_token_time = 1000.030
-        rs.finish_time = 1000.130
         rs.cached_tokens = 2
         rs.output_ids = [11, 12, 13, 14, 15]
-        rs.preempt_count = 2
-        rs.preempt_time = 0.005
         rs.finished_reason = FINISH_LENGTH(length=5)
+        rs.stats = RequestStatsTracker()
+        rs.stats.scheduled_time = 1000.010
+        rs.stats.prefill_done_time = 1000.030
+        rs.stats.first_token_time = 1000.030
+        rs.stats.finish_time = 1000.130
+        rs.stats.preempt_count = 2
+        rs.stats.preempt_time = 0.005
 
         processor._log_request_stats("rid-x", rs)
     finally:
@@ -343,10 +344,11 @@ def test_log_request_stats_aborted_with_spec_acceptance():
         )
         rs = _state([1, 2, 3, 4])
         rs.created_time = 1000.0
-        rs.finish_time = 1000.05
         rs.spec_verify_ct = 10
         rs.accept_draft_tokens = 3.0
         rs.finished_reason = FINISH_ABORT("client abort")
+        rs.stats = RequestStatsTracker()
+        rs.stats.finish_time = 1000.05
         processor._log_request_stats("rid-a", rs)
     finally:
         gop.logger = gop_logger
@@ -371,7 +373,7 @@ def test_log_request_stats_records_timestamps_through_forward():
         # prefill already done; max_new_tokens=1 so it finishes after one token
         state = _state([5, 6, 7], computed_length=3)
         state.sampling_params.max_new_tokens = 1
-        processor.rid_to_state["d"] = state
+        processor.register("d", state)  # attaches the stats tracker
 
         class _DecodeOp:
             request_ids = ["d"]
@@ -388,10 +390,10 @@ def test_log_request_stats_records_timestamps_through_forward():
 
     assert state.finished
     # Lifecycle timestamps were stamped on the host.
-    assert state.scheduled_time > 0.0
-    assert state.prefill_done_time > 0.0
-    assert state.first_token_time > 0.0
-    assert state.finish_time > 0.0
+    assert state.stats.scheduled_time > 0.0
+    assert state.stats.prefill_done_time > 0.0
+    assert state.stats.first_token_time > 0.0
+    assert state.stats.finish_time > 0.0
     stats_lines = [
         line for line in rec.lines if line.startswith("RequestStats(rid='d'")
     ]
