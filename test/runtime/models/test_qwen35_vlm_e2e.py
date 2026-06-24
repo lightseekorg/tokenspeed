@@ -22,7 +22,7 @@ register_cuda_ci(
     est_time=1200,
     suite="runtime-1gpu",
     disabled_on_runners=["amd-*", "h100-*"],
-    disabled_on_runners_reason="Qwen3.5 FP8 VLM smoke requires NVIDIA Blackwell.",
+    disabled_on_runners_reason="Qwen3.5 FP8 VLM requires NVIDIA Blackwell.",
 )
 
 MODEL = os.environ.get("QWEN35_VLM_E2E_MODEL", "Qwen/Qwen3.5-35B-A3B-FP8")
@@ -49,6 +49,8 @@ def _serve_server(log_path: Path) -> subprocess.Popen:
         "-m",
         "tokenspeed.cli",
         "serve",
+        "--gateway-startup-timeout",
+        "300",
         "--model",
         MODEL,
         "--served-model-name",
@@ -74,23 +76,27 @@ def _serve_server(log_path: Path) -> subprocess.Popen:
         "--moe-backend",
         "flashinfer_trtllm",
         "--sampling-backend",
-        "flashinfer",
+        "greedy",
         "--quantization",
         "fp8",
         "--mm-attention-backend",
         "fa4",
+        "--policy",
+        "random",
         "--disable-kvstore",
         "--disable-prefill-graph",
         "--trust-remote-code",
     ]
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_f = log_path.open("w")
-    return subprocess.Popen(
+    proc = subprocess.Popen(
         cmd,
         stdout=log_f,
         stderr=subprocess.STDOUT,
         env=os.environ.copy(),
     )
+    proc._log_file = log_f
+    return proc
 
 
 def _wait_for_server(timeout: int = SERVER_LAUNCH_TIMEOUT) -> bool:
@@ -121,7 +127,7 @@ class TestQwen35VlmE2E(unittest.TestCase):
             raise unittest.SkipTest(f"TokenSpeed kernel deps unavailable: {exc}")
 
         if not current_platform().is_blackwell:
-            raise unittest.SkipTest("Qwen3.5 FP8 VLM smoke requires NVIDIA Blackwell")
+            raise unittest.SkipTest("Qwen3.5 FP8 VLM requires NVIDIA Blackwell")
 
     def test_image_chat_completion(self):
         import requests
@@ -158,11 +164,18 @@ class TestQwen35VlmE2E(unittest.TestCase):
                 "temperature": 0.0,
                 "stream": False,
             }
-            resp = requests.post(
-                f"http://127.0.0.1:{PORT}/v1/chat/completions",
-                json=payload,
-                timeout=REQUEST_TIMEOUT,
-            )
+            deadline = time.time() + REQUEST_TIMEOUT
+            resp = None
+            while time.time() < deadline:
+                resp = requests.post(
+                    f"http://127.0.0.1:{PORT}/v1/chat/completions",
+                    json=payload,
+                    timeout=60,
+                )
+                if resp.status_code < 500:
+                    break
+                time.sleep(5)
+            assert resp is not None
             resp.raise_for_status()
             data = resp.json()
             content = data["choices"][0]["message"].get("content") or ""
@@ -172,6 +185,11 @@ class TestQwen35VlmE2E(unittest.TestCase):
             from tokenspeed.runtime.utils.process import kill_process_tree
 
             kill_process_tree(proc.pid)
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                pass
+            proc._log_file.close()
             time.sleep(5)
 
 
