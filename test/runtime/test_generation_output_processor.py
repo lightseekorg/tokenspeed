@@ -231,3 +231,167 @@ def test_nan_flag_skips_first_token_pd_handoff():
 
     # Flagged prefill slot is skipped; the healthy decode slot still hands off.
     assert handoffs == ["decode"]
+
+
+class _RecordingLogger:
+    """Capture logger.info(fmt, *args) calls as formatted strings."""
+
+    def __init__(self):
+        self.lines: list[str] = []
+
+    def info(self, fmt, *args):
+        self.lines.append(fmt % args if args else fmt)
+
+    def warning(self, *a, **k):
+        pass
+
+
+def test_log_request_stats_disabled_by_default():
+    """Without --log-request-stats, no ReqStats line is emitted and no
+    timestamps are recorded (zero overhead path)."""
+    import tokenspeed.runtime.engine.generation_output_processor as gop
+
+    rec = _RecordingLogger()
+    gop_logger, gop.logger = gop.logger, rec
+    try:
+        processor = OutputProcesser(_Sender(), global_rank=0, metrics=_Metrics())
+        assert processor.log_request_stats is False
+        state = _state([5, 6, 7], computed_length=3)
+        state.sampling_params.max_new_tokens = 1
+        processor.rid_to_state["d"] = state
+
+        class _DecodeOp:
+            request_ids = ["d"]
+            request_pool_indices = [0]
+            input_lengths = [1]
+            extend_prefix_lens = []
+
+            def num_extends(self):
+                return 0
+
+        processor.post_process_forward_op(_DecodeOp(), _ExecutionResult())
+    finally:
+        gop.logger = gop_logger
+
+    assert state.finished
+    assert not any(line.startswith("RequestStats(") for line in rec.lines)
+    # Timing fields stay at their unset default.
+    assert state.scheduled_time == 0.0
+    assert state.finish_time == 0.0
+
+
+def test_log_request_stats_line_fields():
+    """The per-request stats line reports the right host-side derived values:
+    queue/prefill/ttft/total ms, cache-hit, decode throughput, preemption."""
+    import tokenspeed.runtime.engine.generation_output_processor as gop
+    from tokenspeed.runtime.engine.request_types import FINISH_LENGTH
+
+    rec = _RecordingLogger()
+    gop_logger, gop.logger = gop.logger, rec
+    try:
+        processor = OutputProcesser(
+            _Sender(), global_rank=0, log_request_stats=True, metrics=_Metrics()
+        )
+        rs = _state([1, 2, 3, 4])  # prompt = 4
+        rs.created_time = 1000.000
+        rs.scheduled_time = 1000.010  # queue = 10 ms
+        rs.prefill_done_time = 1000.030  # prefill = 20 ms
+        rs.first_token_time = 1000.030  # ttft = 30 ms (>= prefill)
+        rs.finish_time = 1000.130  # total = 130 ms; decode window = 100 ms
+        rs.cached_tokens = 2  # cache_hit = 50%
+        rs.output_ids = [11, 12, 13, 14, 15]  # output = 5 -> decode_tps = 4/0.1 = 40
+        rs.preempt_count = 2
+        rs.preempt_time = 0.005  # 5 ms
+        rs.finished_reason = FINISH_LENGTH(length=5)
+
+        processor._log_request_stats("rid-x", rs)
+    finally:
+        gop.logger = gop_logger
+
+    assert len(rec.lines) == 1
+    line = rec.lines[0]
+    # Logged as a Python-object repr: RequestStats(field=value, ...).
+    assert line.startswith(
+        "RequestStats(rid='rid-x', status='finished', reason='length'"
+    )
+    assert (
+        "prompt_tokens=4, cache_tokens=2, output_tokens=5, cache_hit_rate=0.5" in line
+    )
+    assert "queue_ms=10.0, prefill_ms=20.0, ttft_ms=30.0, total_ms=130.0" in line
+    assert "preempt_ms=5.0, preempt_count=2" in line
+    assert "decode_tps=40.0" in line
+    assert "acc_len=None, acc_rate=None" in line  # spec decode off
+
+
+def test_log_request_stats_aborted_with_spec_acceptance():
+    """Aborted requests log status=aborted; with spec decode on, acc_len and
+    acc_rate are populated."""
+    import tokenspeed.runtime.engine.generation_output_processor as gop
+    from tokenspeed.runtime.engine.request_types import FINISH_ABORT
+
+    rec = _RecordingLogger()
+    gop_logger, gop.logger = gop.logger, rec
+    try:
+        processor = OutputProcesser(
+            _Sender(),
+            global_rank=0,
+            spec_algorithm="eagle",
+            spec_num_tokens=4,
+            log_request_stats=True,
+            metrics=_Metrics(),
+        )
+        rs = _state([1, 2, 3, 4])
+        rs.created_time = 1000.0
+        rs.finish_time = 1000.05
+        rs.spec_verify_ct = 10
+        rs.accept_draft_tokens = 3.0  # avg accepted/step
+        rs.finished_reason = FINISH_ABORT("client abort")
+        processor._log_request_stats("rid-a", rs)
+    finally:
+        gop.logger = gop_logger
+
+    line = rec.lines[0]
+    assert "status='aborted', reason='abort'" in line
+    # acc_rate = (acc_len - 1) / draft = (3 - 1) / 4 = 0.5
+    assert "acc_len=3.0, acc_rate=0.5" in line
+
+
+def test_log_request_stats_records_timestamps_through_forward():
+    """End-to-end: with the flag on, a finishing request gets its lifecycle
+    timestamps recorded host-side and emits one ReqStats line."""
+    import tokenspeed.runtime.engine.generation_output_processor as gop
+
+    rec = _RecordingLogger()
+    gop_logger, gop.logger = gop.logger, rec
+    try:
+        processor = OutputProcesser(
+            _Sender(), global_rank=0, log_request_stats=True, metrics=_Metrics()
+        )
+        state = _state([5, 6, 7], computed_length=3)  # prefill already done
+        state.sampling_params.max_new_tokens = 1  # finishes after one token
+        processor.rid_to_state["d"] = state
+
+        class _DecodeOp:
+            request_ids = ["d"]
+            request_pool_indices = [0]
+            input_lengths = [1]
+            extend_prefix_lens = []
+
+            def num_extends(self):
+                return 0
+
+        processor.post_process_forward_op(_DecodeOp(), _ExecutionResult())
+    finally:
+        gop.logger = gop_logger
+
+    assert state.finished
+    # Lifecycle timestamps were stamped on the host.
+    assert state.scheduled_time > 0.0
+    assert state.prefill_done_time > 0.0
+    assert state.first_token_time > 0.0
+    assert state.finish_time > 0.0
+    stats_lines = [
+        line for line in rec.lines if line.startswith("RequestStats(rid='d'")
+    ]
+    assert len(stats_lines) == 1
+    assert "status='finished', reason='length'" in stats_lines[0]

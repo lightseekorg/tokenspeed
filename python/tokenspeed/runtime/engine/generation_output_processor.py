@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from tokenspeed.runtime.engine.io_struct import BatchTokenIDOut
@@ -57,6 +58,39 @@ logger = get_colorful_logger(__name__)
 DEFAULT_FORCE_STREAM_INTERVAL = 50
 
 
+@dataclass
+class RequestStats:
+    """Host-side per-request performance summary (logged by --log-request-stats).
+
+    Printed as a Python-object repr, e.g.
+    ``RequestStats(rid='chatcmpl-...', status='finished', ..., queue_ms=13.8, ...)``.
+    Durations are milliseconds, rates are 0-1 ratios, and ``*_ts`` are absolute
+    epoch seconds. ``acc_len``/``acc_rate`` are ``None`` when speculative decoding
+    is off. All fields are derived from host-side timestamps/counters — building
+    this introduces no GPU sync.
+    """
+
+    rid: str
+    status: str  # "finished" | "aborted"
+    reason: str  # finish-reason type: "stop" | "length" | "abort"
+    prompt_tokens: int
+    cache_tokens: int
+    output_tokens: int
+    cache_hit_rate: float
+    queue_ms: float  # received -> first scheduled into a forward batch
+    prefill_ms: float  # scheduled -> prefill complete
+    ttft_ms: float  # received -> first output token (>= prefill_ms)
+    total_ms: float  # received -> finished/aborted
+    preempt_ms: float  # decode time lost to prefilling other requests
+    preempt_count: int  # number of such interruptions
+    decode_tps: float  # decode throughput (tokens/s)
+    acc_len: float | None  # spec-decode acceptance length
+    acc_rate: float | None  # spec-decode acceptance rate
+    recv_ts: float
+    commit_ts: float
+    finish_ts: float
+
+
 class RequestState:
     """Per-request state needed for incremental streaming output.
 
@@ -76,6 +110,7 @@ class RequestState:
         token_ids_logprob: list[int] | None = None,
         multimodal_inputs=None,
         prompt_input_ids_unpadded: list[int] | None = None,
+        created_time: float = 0.0,
     ) -> None:
         # --- Extracted from recv_req (immutable) ---
         self.prompt_input_ids: list[int] = prompt_input_ids
@@ -101,6 +136,21 @@ class RequestState:
         self.prefix_len: int = 0
         self.spec_verify_ct: int = 0
         self.accept_draft_tokens: float | None = None
+
+        # --- request-stats timing (host-side; only populated/read when the
+        # server is started with --log-request-stats). All wall-clock floats
+        # recorded on the host; nothing here forces a GPU sync. ---
+        self.created_time: float = created_time  # received (frontend) timestamp
+        self.scheduled_time: float = 0.0  # first forward step (queue end / commit)
+        self.prefill_done_time: float = 0.0  # prefill completed
+        self.first_token_time: float = 0.0  # first output token produced (TTFT)
+        self.finish_time: float = 0.0  # finished / aborted
+        # Preemption = this request's decode steps that also prefilled OTHER
+        # requests (host-observable from forward_op). count = number of such
+        # interruptions (rising edges); time = their summed wall-clock.
+        self.preempt_count: int = 0
+        self.preempt_time: float = 0.0
+        self._preempted_last_step: bool = False
         # Sampled-token logprobs, accumulated per generated token.
         # None when return_logprob is False.
         self.output_token_logprobs_val: list[float] | None = (
@@ -165,6 +215,7 @@ class RequestState:
             token_ids_logprob=getattr(recv_req, "token_ids_logprob", None),
             multimodal_inputs=getattr(recv_req, "multimodal_inputs", None),
             prompt_input_ids_unpadded=getattr(recv_req, "input_ids_unpadded", None),
+            created_time=getattr(recv_req, "created_time", 0.0),
         )
 
     @property
@@ -308,6 +359,7 @@ class OutputProcesser:
         spec_algorithm=None,
         spec_num_tokens: int | None = None,
         stream_interval: int = 1,
+        log_request_stats: bool = False,
         *,
         metrics: EngineMetrics,
     ) -> None:
@@ -321,6 +373,10 @@ class OutputProcesser:
         self.spec_num_tokens = spec_num_tokens
         self.stream_interval = stream_interval
         self.metrics = metrics
+        self.log_request_stats = log_request_stats
+        # Wall-clock of the previous forward step, for host-side preemption
+        # accounting (only used when log_request_stats is enabled).
+        self._last_step_ts: float = 0.0
         self.log_cnt = 0
         self.rid_to_state: dict[str, RequestState] = {}
         # rid → monotonic ts at which the abort was seen. Covers the
@@ -337,6 +393,78 @@ class OutputProcesser:
                 rid,
                 request_state.accept_draft_tokens,
             )
+
+    def _log_request_stats(self, rid: str, rs: RequestState) -> None:
+        """Emit a one-line per-request performance summary on finish/abort.
+
+        Gated by ``--log-request-stats``. Every value is derived from
+        host-side timestamps and counters already available at finish, so
+        this introduces no GPU sync and no engine slowdown. Durations are in
+        ms; ``ttft`` (received -> first output token) is always >= ``prefill``
+        (commit -> prefill done) because it additionally spans the queue.
+        """
+        if self.global_rank != 0:
+            return
+
+        def _ms(end: float, start: float) -> float:
+            # Guard unset (0.0) timestamps so a missing stage reads 0, not a
+            # garbage epoch-sized number.
+            return round((end - start) * 1e3, 2) if end > 0.0 and start > 0.0 else 0.0
+
+        prompt = rs.input_length
+        output = rs.output_length
+
+        decode_window = (
+            rs.finish_time - rs.first_token_time
+            if rs.finish_time > 0.0 and rs.first_token_time > 0.0
+            else 0.0
+        )
+        # Tokens generated after the first, over the decode window.
+        decode_tps = (
+            round((output - 1) / decode_window, 1)
+            if decode_window > 0.0 and output > 1
+            else 0.0
+        )
+
+        # Spec-decode acceptance; None when speculative decoding is off.
+        if self.spec_algorithm is not None and rs.spec_verify_ct > 0:
+            acc_len = rs.accept_draft_tokens or 0.0
+            draft = self.spec_num_tokens or 0
+            acc_rate = round(max(0.0, acc_len - 1.0) / draft, 4) if draft > 0 else 0.0
+            acc_len = round(acc_len, 2)
+        else:
+            acc_len = acc_rate = None
+
+        stats = RequestStats(
+            rid=rid,
+            status=(
+                "aborted"
+                if isinstance(rs.finished_reason, FINISH_ABORT)
+                else "finished"
+            ),
+            reason=(
+                rs.finished_reason.to_json().get("type", "unknown")
+                if rs.finished_reason is not None
+                else "unknown"
+            ),
+            prompt_tokens=prompt,
+            cache_tokens=rs.cached_tokens,
+            output_tokens=output,
+            cache_hit_rate=round(rs.cached_tokens / prompt, 4) if prompt > 0 else 0.0,
+            queue_ms=_ms(rs.scheduled_time, rs.created_time),
+            prefill_ms=_ms(rs.prefill_done_time, rs.scheduled_time),
+            ttft_ms=_ms(rs.first_token_time, rs.created_time),
+            total_ms=_ms(rs.finish_time, rs.created_time),
+            preempt_ms=round(rs.preempt_time * 1e3, 2),
+            preempt_count=rs.preempt_count,
+            decode_tps=decode_tps,
+            acc_len=acc_len,
+            acc_rate=acc_rate,
+            recv_ts=round(rs.created_time, 3),
+            commit_ts=round(rs.scheduled_time, 3),
+            finish_ts=round(rs.finish_time, 3),
+        )
+        logger.info("%s", stats)
 
     def sweep_pending_aborts(self) -> None:
         """Drop TTL-expired entries from ``pending_aborts``.
@@ -534,6 +662,20 @@ class OutputProcesser:
         )
         num_extends = forward_op.num_extends()
 
+        # Host-side per-request stats timing (only when --log-request-stats).
+        # stats_now is this step's wall-clock; step_dt is the gap since the
+        # previous step (used to attribute preemption time); prefilling_others
+        # is True when this step prefills any request.
+        stats_now = time.time() if self.log_request_stats else 0.0
+        step_dt = 0.0
+        prefilling_others = False
+        if self.log_request_stats:
+            step_dt = (
+                stats_now - self._last_step_ts if self._last_step_ts > 0.0 else 0.0
+            )
+            self._last_step_ts = stats_now
+            prefilling_others = num_extends > 0
+
         request_changes = []
         stream_out_rids = []
         stream_out_states = []
@@ -571,9 +713,27 @@ class OutputProcesser:
 
             request_state: RequestState = self.rid_to_state[rid]
 
+            # First forward step this request appears in == queue end / commit.
+            if self.log_request_stats and request_state.scheduled_time == 0.0:
+                request_state.scheduled_time = stats_now
+
             # Do not output chunking result
             if not request_state.prefill_finished:
                 continue
+
+            if self.log_request_stats:
+                if request_state.prefill_done_time == 0.0:
+                    request_state.prefill_done_time = stats_now
+                # Decode steps that also prefilled other requests delay this
+                # request's decode: count each interruption (rising edge) and
+                # accumulate its wall-clock.
+                if i >= num_extends and prefilling_others:
+                    if not request_state._preempted_last_step:
+                        request_state.preempt_count += 1
+                    request_state.preempt_time += step_dt
+                    request_state._preempted_last_step = True
+                elif i >= num_extends:
+                    request_state._preempted_last_step = False
 
             nan_detected = nan_flags_list is not None and nan_flags_list[i]
             if nan_detected and not request_state.finished:
@@ -665,6 +825,14 @@ class OutputProcesser:
                     self.log_accept_length(rid, request_state)
                     break
 
+            # First produced output token == TTFT anchor (received -> here).
+            if (
+                self.log_request_stats
+                and request_state.first_token_time == 0.0
+                and request_state.output_ids
+            ):
+                request_state.first_token_time = stats_now
+
             # For aborted requests, skip output to detokenizer (the tokenizer
             # manager already cleaned up), just notify the scheduler to finish.
             # Exception: pause-initiated aborts (abort_notify_client) leave a
@@ -675,6 +843,9 @@ class OutputProcesser:
                 if request_state.abort_notify_client:
                     stream_out_rids.append(rid)
                     stream_out_states.append(request_state)
+                if self.log_request_stats:
+                    request_state.finish_time = stats_now
+                    self._log_request_stats(rid, request_state)
                 request_state.release_pending_multimodal_features()
                 self.rid_to_state.pop(rid)
                 continue
@@ -694,6 +865,9 @@ class OutputProcesser:
                 request_changes.append(
                     make_abort_event(rid) if nan_detected else make_finish_event(rid)
                 )
+                if self.log_request_stats:
+                    request_state.finish_time = stats_now
+                    self._log_request_stats(rid, request_state)
                 request_state.release_pending_multimodal_features()
                 self.rid_to_state.pop(rid)
             else:
