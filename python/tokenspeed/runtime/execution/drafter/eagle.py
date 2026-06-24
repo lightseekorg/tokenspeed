@@ -72,6 +72,7 @@ class EagleDraftInput:
     global_num_tokens: list[int] | None = None
     global_bs: list[int] | None = None
     all_decode_or_idle: bool = False
+    dsa_topk: DsaTopKState = (None, None)
 
 
 class Eagle(BaseDrafter):
@@ -243,15 +244,19 @@ class Eagle(BaseDrafter):
             draft_input, bs, draft_input.input_num_tokens
         )
         input_ids = maybe_substitute_mm_pad(input_ids, self.mm_pad_substitute_id)
-        # Llama Eagle3 narrows for any non-idle catch-up; Qwen/DeepSeek
-        # keep is_decode() only.
-        draft_first_step_reduce = forward_mode.is_decode() or (
-            isinstance(
-                self.draft_model_runner.model,
-                (LlamaForCausalLMEagle3, Qwen3_5ForConditionalGenerationNextN),
-            )
-            and not forward_mode.is_idle()
+        draft_model = self.draft_model_runner.model
+        # These draft models run first-step catch-up on the full input window,
+        # then narrow to one row per request for sampling and later MTP steps.
+        reduce_first_step_catchup = bool(
+            getattr(draft_model, "draft_first_step_reduce_for_catchup", False)
+        ) or isinstance(
+            draft_model,
+            (LlamaForCausalLMEagle3, Qwen3_5ForConditionalGenerationNextN),
         )
+        draft_first_step_reduce = forward_mode.is_decode() or (
+            reduce_first_step_catchup and not forward_mode.is_idle()
+        )
+        input_num_tokens = draft_input.input_num_tokens
 
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
@@ -259,7 +264,7 @@ class Eagle(BaseDrafter):
             req_to_page=self.req_to_page,
             bs=bs,
             num_extends=draft_input.num_extends,
-            input_num_tokens=draft_input.input_num_tokens,
+            input_num_tokens=input_num_tokens,
             forward_mode=forward_mode,
             capture_hidden_mode=CaptureHiddenMode.LAST,
             gather_ids=gather_ids,
@@ -271,15 +276,36 @@ class Eagle(BaseDrafter):
             accept_lengths=draft_input.accept_lengths,
         )
 
+        dsa_topk = draft_input.dsa_topk
+        prepare_dsa_topk = getattr(draft_model, "prepare_dsa_topk_for_mtp_decode", None)
+        compute_dsa_topk_first_step = bool(
+            getattr(draft_model, "compute_dsa_topk_first_step", False)
+        )
+        if compute_dsa_topk_first_step:
+            # GLM NextN has its own indexer weights. Compute first-step top-k
+            # in the draft model, then select rows used by later MTP steps.
+            dsa_topk = (None, None)
+        elif draft_input.num_extends == 0 and prepare_dsa_topk is not None:
+            dsa_topk = prepare_dsa_topk(dsa_topk, gather_ids)
+        else:
+            dsa_topk = (None, None)
+        self._attach_dsa_topk(ctx, dsa_topk)
+
         logits_output = self.draft_model_runner.forward(
             ctx=ctx,
             input_ids=input_ids,
-            positions=buffers.positions_buf[: draft_input.input_num_tokens],
-            out_cache_loc=buffers.out_cache_loc_buf[: draft_input.input_num_tokens],
+            positions=buffers.positions_buf[:input_num_tokens],
+            out_cache_loc=buffers.out_cache_loc_buf[:input_num_tokens],
             captured_hidden_states=draft_input.base_out_hidden_states,
             spec_step_idx=0,
         )
-        dsa_topk = self._extract_dsa_topk(ctx, (None, None))
+        dsa_topk = self._extract_dsa_topk(ctx, dsa_topk)
+        if compute_dsa_topk_first_step and prepare_dsa_topk is not None:
+            dsa_topk = prepare_dsa_topk(
+                dsa_topk,
+                gather_ids,
+                num_prefill_rows=draft_input.num_extends,
+            )
         return logits_output, dsa_topk
 
     @nvtx_range("draft_multi_step", color="purple")
@@ -356,7 +382,8 @@ class Eagle(BaseDrafter):
             # Keep attention metadata on the accepted prefix; rejected verify
             # tail slots may still contain stale draft KV.
             _advance_draft_forward_metadata_if_supported(
-                ctx.attn_backend, draft_seq_lens
+                ctx.attn_backend,
+                draft_seq_lens,
             )
 
             with nvtx_range("draft_forward", color="red"):
@@ -496,6 +523,7 @@ class Eagle(BaseDrafter):
             global_num_tokens=base_ctx.global_num_tokens,
             global_bs=base_ctx.global_bs,
             all_decode_or_idle=base_ctx.all_decode_or_idle,
+            dsa_topk=(base_ctx.dsa_prefill_topk, base_ctx.dsa_decode_topk),
         )
 
         # next_tokens layout: column 0 = last verified id, columns 1.. = drafter tokens.

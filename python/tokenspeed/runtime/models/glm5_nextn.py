@@ -23,6 +23,8 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import replace
+from typing import Any
 
 import torch
 from torch import nn
@@ -30,6 +32,7 @@ from transformers import PretrainedConfig
 
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.layers.attention.dsa.utils import workspace_indices_to_kv_slots
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
@@ -173,6 +176,9 @@ class GlmMoeDsaModelNextN(nn.Module):
 
 
 class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
+    compute_dsa_topk_first_step = True
+    draft_first_step_reduce_for_catchup = True
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -215,6 +221,82 @@ class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
             tp_group=self.mapping.attn.tp_group,
         )
 
+    @staticmethod
+    def _apply_first_step_correction(ctx: ForwardContext) -> None:
+        seq_lens_buf = ctx.draft_seq_lens_buf
+        accept_lengths = ctx.accept_lengths
+        if (
+            not ctx.draft_first_step_reduce
+            or seq_lens_buf is None
+            or accept_lengths is None
+        ):
+            return
+        num_extends = ctx.num_extends
+        if num_extends >= ctx.bs:
+            return
+        correction = (
+            ctx.attn_backend.spec_num_tokens - accept_lengths[num_extends:]
+        ).to(seq_lens_buf.dtype)
+        seq_lens_buf[num_extends : ctx.bs].sub_(correction).clamp_(min=1)
+        ctx.attn_backend.advance_draft_forward_metadata(seq_lens_buf[: ctx.bs])
+
+    @staticmethod
+    def prepare_dsa_topk_for_mtp_decode(
+        dsa_topk: tuple[Any | None, Any | None],
+        gather_ids: torch.Tensor,
+        *,
+        num_prefill_rows: int = 0,
+    ) -> tuple[Any | None, Any | None]:
+        prefill_topk, decode_topk = dsa_topk
+        if decode_topk is None:
+            return dsa_topk
+        topk_indices = decode_topk.topk_indices
+        topk_lens = decode_topk.topk_lens
+        if topk_indices.shape[0] == 0:
+            return dsa_topk
+        if num_prefill_rows <= 0 and topk_indices.shape[0] <= gather_ids.numel():
+            return dsa_topk
+        if num_prefill_rows <= 0:
+            selected_indices = topk_indices.index_select(0, gather_ids)
+            selected_lens = topk_lens.index_select(0, gather_ids)
+        else:
+            if prefill_topk is None:
+                return dsa_topk
+            num_prefill_rows = min(int(num_prefill_rows), gather_ids.numel())
+            prefill_row_ids = gather_ids[:num_prefill_rows]
+            decode_row_ids = gather_ids[num_prefill_rows:]
+            selected_prefill_indices = workspace_indices_to_kv_slots(
+                prefill_topk.workspace_indices.index_select(0, prefill_row_ids),
+                prefill_topk.kv_workspace_slots,
+            ).to(device=topk_indices.device, dtype=topk_indices.dtype)
+            selected_prefill_lens = prefill_topk.topk_lens.index_select(
+                0,
+                prefill_row_ids,
+            ).to(
+                device=topk_lens.device,
+                dtype=topk_lens.dtype,
+            )
+            if decode_row_ids.numel() > 0:
+                selected_decode_indices = topk_indices.index_select(0, decode_row_ids)
+                selected_decode_lens = topk_lens.index_select(0, decode_row_ids)
+                selected_indices = torch.cat(
+                    [selected_prefill_indices, selected_decode_indices],
+                    dim=0,
+                )
+                selected_lens = torch.cat(
+                    [selected_prefill_lens, selected_decode_lens],
+                    dim=0,
+                )
+            else:
+                selected_indices = selected_prefill_indices
+                selected_lens = selected_prefill_lens
+        selected_decode_topk = replace(
+            decode_topk,
+            topk_indices=selected_indices,
+            topk_lens=selected_lens,
+        )
+        return prefill_topk, selected_decode_topk
+
     @torch.no_grad()
     def forward(
         self,
@@ -231,6 +313,7 @@ class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
             out_cache_loc,
             captured_hidden_states=captured_hidden_states,
         )
+        self._apply_first_step_correction(ctx)
         logits_metadata = LogitsMetadata.from_forward_context(ctx)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, logits_metadata

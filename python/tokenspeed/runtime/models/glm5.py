@@ -1089,7 +1089,14 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 None,
             )
         )
-        if schedule_metadata is None:
+        schedule_shape = tuple(seq_lens_2d.shape)
+        if (
+            schedule_metadata is None
+            or getattr(decode_metadata, "_dsa_paged_mqa_schedule_q_len", None)
+            != q_len_per_req
+            or getattr(decode_metadata, "_dsa_paged_mqa_schedule_shape", None)
+            != schedule_shape
+        ):
             schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                 seq_lens_2d,
                 page_size,
@@ -1105,6 +1112,11 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                     decode_metadata,
                     "_dsa_paged_mqa_schedule_q_len",
                     q_len_per_req,
+                )
+                setattr(
+                    decode_metadata,
+                    "_dsa_paged_mqa_schedule_shape",
+                    schedule_shape,
                 )
         index_k_with_scale_cache = ctx.token_to_kv_pool.get_index_k_with_scale_buffer(
             self.attn_mqa.layer_id
@@ -1459,10 +1471,11 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             )
 
         decode_metadata = getattr(ctx.attn_backend, "forward_decode_metadata", None)
+        num_attn_tokens = int(q_norm.shape[0])
         decode_window = self._resolve_decode_window(
             ctx,
             decode_metadata,
-            total_tokens=hidden_states.shape[0],
+            total_tokens=num_attn_tokens,
         )
         num_decode_tokens = decode_window.num_tokens
         num_prefill_tokens = decode_window.start
@@ -1490,8 +1503,8 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             full_context_decode_topk = (
                 self._try_compute_decode_full_context_topk_indices(
                     ctx,
-                    num_tokens=hidden_states.shape[0],
-                    device=hidden_states.device,
+                    num_tokens=num_attn_tokens,
+                    device=q_norm.device,
                 )
             )
             key_only_indexer = (
