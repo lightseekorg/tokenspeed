@@ -23,6 +23,7 @@
 import torch
 from torch import nn
 
+from tokenspeed.runtime.execution.breakable_cuda_graph import break_attn
 from tokenspeed.runtime.execution.context import ForwardContext
 
 
@@ -76,7 +77,16 @@ class PagedAttention(nn.Module):
                 k = k.view(-1, self.tp_k_head_num, self.v_head_dim)
                 v = v.view(-1, self.tp_v_head_num, self.v_head_dim)
 
-        return ctx.attn_backend.forward(
+        # Attention is a breakable-graph break point: KV writeback + the varlen
+        # kernel are data/length-dependent (and the source of the host-side
+        # max_seq_len_q scalar), so under a prefill-graph capture they run eager
+        # while the surrounding token-shaped compute is graphed. No-op (direct
+        # call) otherwise. See docs/design/prefill-breakable-cudagraph.md.
+        return break_attn(
+            ctx.attn_backend.forward,
+            (q.shape[0], self.tp_q_head_num * self.v_head_dim),
+            q.dtype,
+            q.device,
             q,
             k,
             v,

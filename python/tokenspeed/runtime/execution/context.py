@@ -60,6 +60,11 @@ class ForwardContext:
     global_num_tokens: list[int] | None = None
     global_bs: list[int] | None = None
     all_decode_or_idle: bool = False
+    # True when every DP rank is in EXTEND mode (no idle/decode/mixed rank). The
+    # prefill CUDA graph needs this to engage safely under DP: it bakes a uniform
+    # ``[bucket]*world_size`` EP all-to-all, which only matches if all ranks replay
+    # the same-shaped prefill graph. Mirrors ``all_decode_or_idle`` for the decode graph.
+    all_extend: bool = False
 
     # --- logits processor ---
     gather_ids: torch.Tensor | None = None

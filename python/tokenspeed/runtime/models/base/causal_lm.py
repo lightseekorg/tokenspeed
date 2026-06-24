@@ -44,6 +44,18 @@ class BaseCausalLM(nn.Module):
 
     model_cls: type[BaseTransformerModel]
 
+    # Breakable prefill CUDA graph capability flags (read by
+    # ModelExecutor._install_prefill_graph_runner). Conservative defaults: the
+    # graph is allowed but mixed (prefill+decode) batches are NOT graphed unless a
+    # subclass opts in. A model opts into mixed only if its attention break reads
+    # the LIVE prefill/decode split from the singleton backend
+    # (``attn_backend.prefill_graph_token_split``) rather than the captured ctx --
+    # otherwise a mixed batch replays with the stale capture-time forward mode/
+    # split and silently mis-routes rows. See deepseek_v3 (opts in) vs deepseek_v4/
+    # glm5 (do not).
+    prefill_graph_enabled: bool = True
+    prefill_graph_supports_mixed: bool = False
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -57,6 +69,8 @@ class BaseCausalLM(nn.Module):
         self.mapping = mapping
         self.quant_config = quant_config
         self.capture_aux_hidden_states: bool = False
+        # Optional breakable prefill CUDA graph, installed by ModelExecutor.
+        self.prefill_graph_runner = None
 
         self.model = self.resolve_model(config, mapping, quant_config, prefix)
         self.lm_head = self.resolve_lm_head(config, quant_config, prefix)
@@ -144,13 +158,26 @@ class BaseCausalLM(nn.Module):
 
         model_kwargs = self.prepare_model_kwargs(ctx, input_ids, kwargs)
 
-        hidden_states, aux_hidden_states = self.model(
-            input_ids,
-            positions,
-            ctx,
-            out_cache_loc,
-            **model_kwargs,
-        )
+        # Breakable prefill graph: only for plain (no input_embeds) forwards; the
+        # runner returns None for ineligible batches and we fall back to eager.
+        # getattr (not attribute access): subclasses like the EAGLE3 draft model
+        # may not run BaseCausalLM.__init__, so the attribute can be absent — and
+        # the draft model must not use the target's prefill graph regardless.
+        graph_out = None
+        runner = getattr(self, "prefill_graph_runner", None)
+        if runner is not None and not model_kwargs:
+            graph_out = runner.maybe_run(ctx)
+
+        if graph_out is not None:
+            hidden_states, aux_hidden_states = graph_out
+        else:
+            hidden_states, aux_hidden_states = self.model(
+                input_ids,
+                positions,
+                ctx,
+                out_cache_loc,
+                **model_kwargs,
+            )
         logits_metadata = LogitsMetadata.from_forward_context(ctx)
 
         return self.logits_processor(

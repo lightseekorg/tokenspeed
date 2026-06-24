@@ -57,6 +57,24 @@ _KERNEL_SOLUTION_BY_BACKEND = {
 }
 
 
+def _scrub_extend_padding(metadata, q, k, v) -> None:
+    """Zero the q/k/v rows beyond the real (unpadded) token count.
+
+    Under a breakable prefill CUDA graph the inner model runs padded up to a token
+    bucket, so extend attention receives ``bucket`` rows where ``[real:bucket]``
+    hold garbage that grows across layers; the varlen kernel can read those padded
+    rows and produce NaN. Zeroing them keeps attention correct (the rows are
+    discarded by the final output slice anyway) and is a no-op in normal,
+    unpadded forwards. Reads the token count from the pinned CPU cu-seqlens mirror
+    so it stays sync-free on the hot path.
+    """
+    ntok = metadata.cu_extend_seq_lens_cpu[-1]
+    if ntok < q.shape[0]:
+        q[ntok:].zero_()
+        k[ntok:].zero_()
+        v[ntok:].zero_()
+
+
 @dataclass(kw_only=True)
 class MHAExtendMetadata:
     # Device-side metadata:
@@ -374,6 +392,7 @@ class MHAAttnBackend(AttentionBackend):
         save_kv_cache: bool,
         sinks: torch.Tensor | None,
     ) -> torch.Tensor:
+        _scrub_extend_padding(metadata, q, k, v)
         # TODO: use a custom kernel to do downcast
         if self.is_fp8:
             q = q.to(torch.float8_e4m3fn)
@@ -409,6 +428,7 @@ class MHAAttnBackend(AttentionBackend):
         save_kv_cache: bool,
         sinks: torch.Tensor | None,
     ) -> torch.Tensor:
+        _scrub_extend_padding(metadata, q, k, v)
         if save_kv_cache:
             self._save_kv_cache(layer, out_cache_loc, token_to_kv_pool, k, v)
 

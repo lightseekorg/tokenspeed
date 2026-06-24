@@ -33,6 +33,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     paged_cache_block_table_base_offsets_from_forward_op,
     paged_cache_block_tables_from_forward_op,
 )
+from tokenspeed.runtime.execution import cuda_graph_wrapper as _cuda_graph_wrapper
 from tokenspeed.runtime.execution.cache_loc_kernel import update_block_table
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
@@ -134,6 +135,14 @@ class ModelExecutorConfig:
     disable_capturable_grammar: bool = False
     mamba_cache_chunk_size: int = 64
 
+    # ====== PREFILL CUDA GRAPH (breakable) =========
+    # When False and the model/backend support it, prefill (extend) forwards are
+    # replayed from a breakable CUDA graph (attention runs eager as a break).
+    # ``prefill_graph_max_tokens`` bounds the largest captured token bucket;
+    # 0 (default) leaves the prefill graph off (opt-in).
+    disable_prefill_graph: bool = False
+    prefill_graph_max_tokens: int = 0
+
     @staticmethod
     def from_server_args(
         server_args: ServerArgs,
@@ -168,6 +177,8 @@ class ModelExecutorConfig:
             cudagraph_capture_sizes=server_args.cudagraph_capture_sizes,
             disable_cuda_graph_padding=server_args.disable_cuda_graph_padding,
             max_cudagraph_capture_size=server_args.max_cudagraph_capture_size,
+            disable_prefill_graph=bool(server_args.disable_prefill_graph),
+            prefill_graph_max_tokens=int(server_args.prefill_graph_max_tokens or 0),
             model_is_mrope=model_is_mrope,
             data_parallel_size=server_args.mapping.attn.dp_size,
             world_size=server_args.mapping.world_size,
@@ -407,6 +418,11 @@ class ModelExecutor:
         # Clear the residue so pool slots reused by real requests start clean.
         self.runtime_states.future_input_map.zero_()
 
+        # Breakable prefill (extend) CUDA graph. Installed on the BaseCausalLM so
+        # its forward replays the token-shaped inner stack with attention as eager
+        # breaks. Shares the decode graph's mempool. Disabled under enforce_eager.
+        self._install_prefill_graph_runner(config)
+
         # Encoder CUDA graph: install the model-built wrapper by overriding
         # ``image_encoder``. Vision-encoder analogue of ``forward_step``'s
         # ``CudaGraphWrapper``.
@@ -469,6 +485,136 @@ class ModelExecutor:
         )
 
     @nvtx_range("target_forward", color="red")
+    def _install_prefill_graph_runner(self, config: ModelExecutorConfig) -> None:
+        """Capture a breakable prefill graph per token bucket and attach the runner.
+
+        No-op when disabled, under ``enforce_eager``, or with no token buckets.
+        Capture happens up front (like the decode graph), driven by a dummy bs=1
+        extend batch per bucket; shares the decode graph's mempool.
+        """
+        from tokenspeed.runtime.execution.prefill_graph import PrefillGraphRunner
+
+        causal_lm = self.model_runner.model
+        # Multimodal wrappers (e.g. KimiK25ForConditionalGeneration) nest the text
+        # BaseCausalLM under ``.language_model``; the prefill graph wraps the text
+        # transformer, so unwrap to it. Text-only prefills route through
+        # ``language_model.forward`` (which carries the prefill_graph_runner hook);
+        # image prefills pass model_kwargs and fall back to eager.
+        causal_lm = getattr(causal_lm, "language_model", None) or causal_lm
+        inner_model = getattr(causal_lm, "model", None)
+        if inner_model is None or config.enforce_eager or config.disable_prefill_graph:
+            return
+        # Per-model capability gates (see BaseCausalLM): some families are not yet
+        # correct under the breakable prefill graph (e.g. GLM DSA reads a stale
+        # split from the captured ctx) -- they opt out entirely. ``supports_mixed``
+        # restricts mixed (prefill+decode) batches to families whose attention
+        # break recovers the live split from the singleton backend (MLA only).
+        if not getattr(causal_lm, "prefill_graph_enabled", True):
+            return
+        supports_mixed = bool(getattr(causal_lm, "prefill_graph_supports_mixed", False))
+        runner = PrefillGraphRunner(
+            inner_model,
+            self.input_buffers,
+            config,
+            model_is_mrope=config.model_is_mrope,
+            pool=_cuda_graph_wrapper.global_graph_memory_pool,
+            enabled=not config.enforce_eager,
+            supports_mixed=supports_mixed,
+        )
+        if not runner.enabled:
+            return
+        # Capture can fail for model families the dummy-batch machinery doesn't yet
+        # support (e.g. DeepSeek-V4 DSA needs SWA/compressor/indexer paged-cache
+        # block tables the generic dummy batch doesn't build). Degrade gracefully:
+        # log and run eager prefill rather than crashing the server at startup.
+        try:
+            # Capture under inference mode like the decode graph: serving forwards
+            # run inference-mode, so model state buffers (e.g. DeepSeek-V4's indexer
+            # top-k workspace) are inference tensors. Their in-place updates
+            # (``topk_out.fill_``) are only legal inside inference mode, so the
+            # capture must re-enter it too.
+            with maybe_inference_mode():
+                runner.capture(self._make_dummy_prefill_batch)
+        except Exception as exc:
+            logger.warning(
+                "Prefill graph capture failed (%s: %s); falling back to eager "
+                "prefill. This model family may need dedicated dummy-batch support.",
+                type(exc).__name__,
+                exc,
+            )
+            return
+        causal_lm.prefill_graph_runner = runner
+
+    def _make_dummy_prefill_batch(self, num_tokens: int) -> ForwardContext:
+        """Populate the static buffers + attention metadata for a dummy bs=1 extend
+        forward of ``num_tokens`` tokens, and return its ForwardContext.
+
+        Used only to capture the prefill graph at startup. KV writes go to the
+        reserved dummy slot and the page table points at page 0, so the forward
+        runs (producing discarded garbage) without touching real cache state.
+        """
+        ib = self.input_buffers
+        ib.input_ids_buf[:num_tokens].fill_(1)
+        ib.out_cache_loc_buf[:num_tokens].fill_(ib.dummy_kv_slot)
+        ib.positions_buf[:num_tokens].copy_(
+            torch.arange(num_tokens, device=self.device)
+        )
+        ib.req_pool_indices_buf[:1].zero_()
+        ib.seq_lens_buf[:1].fill_(num_tokens)
+        ib.extend_seq_lens_buf[:1].fill_(num_tokens)
+        ib.extend_seq_lens_cpu[:1].fill_(num_tokens)
+        ib.extend_prefix_lens_buf[:1].zero_()
+        ib.extend_prefix_lens_cpu[:1].zero_()
+        self.req_to_page[0].zero_()  # dummy request's pages -> page 0 (valid memory)
+
+        ctx = ForwardContext(
+            attn_backend=self.attn_backend,
+            token_to_kv_pool=self.token_to_kv_pool,
+            req_to_page=self.req_to_page,
+            bs=1,
+            num_extends=1,
+            input_num_tokens=num_tokens,
+            forward_mode=ForwardMode.EXTEND,
+            capture_hidden_mode=(
+                CaptureHiddenMode.FULL
+                if self.drafter is not None
+                else CaptureHiddenMode.NULL
+            ),
+        )
+        if self.config.data_parallel_size > 1:
+            ctx.global_num_tokens = [num_tokens] * self.config.world_size
+            ctx.global_bs = [1] * self.config.world_size
+        # Backends with extra paged caches (DeepSeek-V4 DSA: SWA + compressor +
+        # indexer state) derive their per-cache block tables from
+        # ``paged_cache_block_tables``; without them ``init_forward_metadata``
+        # leaves e.g. ``swa_block_table`` None and the eager attention break aborts
+        # during capture. Reuse the decode graph's dummy-table builder (all zeros ->
+        # the safe page 0) and pass the token count so the extend metadata is sized
+        # correctly. Other backends don't take these kwargs, so gate on the flag.
+        extra_metadata_kwargs: dict = {}
+        if getattr(self.attn_backend, "uses_paged_cache_groups", False):
+            tables = self.forward_step._capture_paged_cache_block_tables(
+                1, self.token_to_kv_pool
+            )
+            if tables is not None:
+                extra_metadata_kwargs["paged_cache_block_tables"] = tables
+            extra_metadata_kwargs["num_tokens"] = num_tokens
+            extra_metadata_kwargs["positions"] = ib.positions_buf[:num_tokens]
+        self.attn_backend.init_forward_metadata(
+            bs=1,
+            num_extends=1,
+            req_pool_indices=ib.req_pool_indices_buf[:1],
+            seq_lens=ib.seq_lens_buf[:1],
+            req_to_page=self.req_to_page,
+            forward_mode=ForwardMode.EXTEND,
+            extend_seq_lens=ib.extend_seq_lens_buf[:1],
+            extend_seq_lens_cpu=ib.extend_seq_lens_cpu[:1],
+            extend_prefix_lens=ib.extend_prefix_lens_buf[:1],
+            extend_prefix_lens_cpu=ib.extend_prefix_lens_cpu[:1],
+            **extra_metadata_kwargs,
+        )
+        return ctx
+
     def _run_target_forward(self, bs: int, ctx: ForwardContext, req_pool_indices):
         positions = self._active_positions_override
         if positions is None:
@@ -901,6 +1047,7 @@ class ModelExecutor:
         dp_global_num_tokens=None,
         dp_global_bs=None,
         dp_all_decode_or_idle: bool = False,
+        dp_all_extend: bool = False,
         grammar_inputs=None,
         multimodal_context=None,
         capture_next_input_ids: bool = False,
@@ -940,6 +1087,7 @@ class ModelExecutor:
             dp_global_num_tokens,
             dp_global_bs,
             dp_all_decode_or_idle,
+            dp_all_extend,
             grammar_inputs=grammar_inputs,
             multimodal_context=multimodal_context,
             capture_next_input_ids=capture_next_input_ids,
@@ -1307,6 +1455,7 @@ class ModelExecutor:
         dp_global_num_tokens=None,
         dp_global_bs=None,
         dp_all_decode_or_idle: bool = False,
+        dp_all_extend: bool = False,
         grammar_inputs=None,
         multimodal_context=None,
         capture_next_input_ids: bool = False,
@@ -1456,6 +1605,7 @@ class ModelExecutor:
                     ctx.global_num_tokens = dp_global_num_tokens
                     ctx.global_bs = dp_global_bs
                     ctx.all_decode_or_idle = dp_all_decode_or_idle
+                    ctx.all_extend = dp_all_extend
                 with nvtx_range("sampling_prep", color="yellow"):
                     sampling_info = self._build_sampling_info(bs, sampling_params_list)
                     grammar_completion = setup_grammar_step(

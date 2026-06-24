@@ -1032,6 +1032,19 @@ class MambaAttnBackend(AttentionBackend):
                 and self.forward_metadata.track_ssm_h_src.numel() > 0
             )
 
+            # Under a breakable prefill CUDA graph the mixer runs over a padded token
+            # bucket (n real + (bucket-n) garbage rows). The conv/scan honor the live
+            # cu-seqlens (real tokens), but zero the padding rows of the kernel inputs
+            # so garbage can't leak into the recurrent state writeback or NaN out.
+            # No-op on normal unpadded forwards. Sync-free: token count from the
+            # pinned CPU cu-seqlens mirror. Mirrors mha `_scrub_extend_padding`.
+            if extend_seq_lens_cpu is not None:
+                ntok = int(sum(int(x) for x in extend_seq_lens_cpu))
+                if ntok < mixed_qkv.shape[0]:
+                    mixed_qkv[ntok:].zero_()
+                    a[ntok:].zero_()
+                    b[ntok:].zero_()
+
             mixed_qkv_t = mixed_qkv.transpose(0, 1)
             if need_h_track:
                 if self.forward_metadata.track_conv_indices is None:

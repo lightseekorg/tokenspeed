@@ -128,6 +128,38 @@ def get_batch_sizes_to_capture(config: ModelExecutorConfig):
     return capture_bs
 
 
+def get_prefill_token_buckets(config: ModelExecutorConfig) -> list[int]:
+    """Padded token-count buckets to capture for the breakable prefill graph.
+
+    Unlike decode (keyed by batch size), the breakable prefill graph captures
+    pure token-shaped compute, so it is keyed by total token count. A live extend
+    forward is padded up to the smallest bucket >= its token count; forwards above
+    the largest bucket run eager.
+
+    Returns an empty list (graph disabled) when ``disable_prefill_graph`` is set or
+    ``prefill_graph_max_tokens <= 0``. The largest bucket is clamped to the
+    chunked-prefill size, since one extend forward never exceeds it.
+
+    Args:
+        config: The model-executor config carrying ``disable_prefill_graph``,
+            ``prefill_graph_max_tokens`` and ``chunked_prefill_size``.
+
+    Returns:
+        Sorted ascending list of token-bucket sizes (possibly empty).
+    """
+    max_tokens = int(getattr(config, "prefill_graph_max_tokens", 0) or 0)
+    if getattr(config, "disable_prefill_graph", False) or max_tokens <= 0:
+        return []
+    chunk = int(getattr(config, "chunked_prefill_size", 0) or 0)
+    if chunk > 0:
+        max_tokens = min(max_tokens, chunk)
+    candidates = [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
+    buckets = [b for b in candidates if 0 < b <= max_tokens]
+    if not buckets or buckets[-1] != max_tokens:
+        buckets.append(max_tokens)
+    return sorted(set(buckets))
+
+
 global_graph_memory_pool = None
 
 
@@ -824,9 +856,7 @@ class CudaGraphWrapper:
         if active_bs > 0:
             state_indices[:active_bs].copy_(active_req_pool_indices)
         if active_bs < padded_bs:
-            state_indices[active_bs:padded_bs].fill_(
-                int(self.config.max_req_pool_size)
-            )
+            state_indices[active_bs:padded_bs].fill_(int(self.config.max_req_pool_size))
 
     def __call__(
         self,

@@ -139,6 +139,7 @@ class DpForwardMetadata:
     global_batch_size: list[int]
     global_forward_mode: list[int]
     all_decode_or_idle: bool
+    all_extend: bool
     need_idle_forward: bool
 
 
@@ -244,8 +245,8 @@ class EventLoop:
             self.world_cpu_group = pg_manager.get_process_group(
                 "gloo", mapping.world_group
             )
-            self._dp_local_info = torch.zeros(1, 3, dtype=torch.int32)
-            self._dp_global_info = torch.zeros(mapping.world_size, 3, dtype=torch.int32)
+            self._dp_local_info = torch.zeros(1, 4, dtype=torch.int32)
+            self._dp_global_info = torch.zeros(mapping.world_size, 4, dtype=torch.int32)
         if not server_args.enable_kvstore:
             logger.warning(
                 "KVStore L2 cache will not be used during normal execution, but it will still be used when retraction happens."
@@ -621,6 +622,7 @@ class EventLoop:
         dp_all_decode_or_idle = (
             dp_metadata.all_decode_or_idle if dp_metadata is not None else False
         )
+        dp_all_extend = dp_metadata.all_extend if dp_metadata is not None else False
         multimodal_context = self._get_multimodal_context_for_forward(forward_op)
 
         self.model_executor.update_block_table(forward_op)
@@ -635,6 +637,7 @@ class EventLoop:
                     dp_global_num_tokens=dp_global_num_tokens,
                     dp_global_bs=dp_global_bs,
                     dp_all_decode_or_idle=dp_all_decode_or_idle,
+                    dp_all_extend=dp_all_extend,
                     grammar_inputs=grammar_inputs,
                     multimodal_context=multimodal_context,
                     **stats,
@@ -665,6 +668,7 @@ class EventLoop:
                         dp_global_num_tokens=dp_global_num_tokens,
                         dp_global_bs=dp_global_bs,
                         dp_all_decode_or_idle=dp_all_decode_or_idle,
+                        dp_all_extend=dp_all_extend,
                         multimodal_context=multimodal_context,
                         **stats,
                     ),
@@ -689,6 +693,7 @@ class EventLoop:
                         dp_global_num_tokens=dp_global_num_tokens,
                         dp_global_bs=dp_global_bs,
                         dp_all_decode_or_idle=dp_all_decode_or_idle,
+                        dp_all_extend=dp_all_extend,
                         grammar_inputs=grammar_inputs,
                         multimodal_context=multimodal_context,
                         capture_next_input_ids=True,
@@ -1158,9 +1163,19 @@ class EventLoop:
                 ),
             )
 
+        # Whether this rank's extend requests carry a non-zero KV prefix (prefix
+        # cache hit). The prefill CUDA graph cannot serve a non-zero prefix (it
+        # changes the ragged attention layout), so it must be gated globally under
+        # DP -- if even one rank has a prefix, ALL ranks must run eager, otherwise
+        # the prefix rank falls back while the others replay and the uniform EP
+        # all-to-all desyncs (NCCL deadlock). Replicated alongside forward_mode.
+        has_prefix = bool(
+            executes_model_forward and any(p > 0 for p in forward_op.extend_prefix_lens)
+        )
         self._dp_local_info[0, 0] = num_tokens
         self._dp_local_info[0, 1] = batch_size
         self._dp_local_info[0, 2] = int(forward_mode)
+        self._dp_local_info[0, 3] = int(has_prefix)
         dist.all_gather_into_tensor(
             self._dp_global_info,
             self._dp_local_info,
@@ -1169,6 +1184,7 @@ class EventLoop:
         global_num_tokens = self._dp_global_info[:, 0].tolist()
         global_batch_size = self._dp_global_info[:, 1].tolist()
         global_forward_mode = self._dp_global_info[:, 2].tolist()
+        any_rank_has_prefix = any(self._dp_global_info[:, 3].tolist())
         any_rank_has_work = max(global_num_tokens) > 0
         need_idle_forward = num_tokens == 0 and any_rank_has_work
         all_decode_or_idle = all(
@@ -1180,11 +1196,23 @@ class EventLoop:
             )
             for mode in global_forward_mode
         )
+        # Every DP rank in pure EXTEND with NO prefix cache (idle ranks report
+        # DECODE, so this is False whenever any rank is idle/decode/mixed, and the
+        # prefix term forces all-ranks-eager if any rank has a prefix hit). Gates
+        # the prefill CUDA graph, which bakes a uniform EP all-to-all that only all
+        # ranks replaying the same prefill graph can satisfy -- the prefix gate must
+        # be replicated here (not left to the rank-local eligibility check) or the
+        # ranks desync. This flag is the prefill graph's only consumer.
+        all_extend = (
+            all(mode == int(ForwardMode.EXTEND) for mode in global_forward_mode)
+            and not any_rank_has_prefix
+        )
         return DpForwardMetadata(
             global_num_tokens=global_num_tokens,
             global_batch_size=global_batch_size,
             global_forward_mode=global_forward_mode,
             all_decode_or_idle=all_decode_or_idle,
+            all_extend=all_extend,
             need_idle_forward=need_idle_forward,
         )
 

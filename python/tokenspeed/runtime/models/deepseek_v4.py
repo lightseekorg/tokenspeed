@@ -82,6 +82,10 @@ from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
+from tokenspeed.runtime.execution.breakable_cuda_graph import (
+    break_attn,
+    is_breakable_capture_active,
+)
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -3555,6 +3559,39 @@ class DeepseekV4Attention(nn.Module):
         swa_slot_mapping: torch.Tensor | None = None,
         compressor_slot_cache: dict | None = None,
     ) -> torch.Tensor:
+        # DSA attention is one coarse breakable-graph break point. Per layer it
+        # does multiple paged-cache writes (SWA / compressor / indexer), a
+        # data/length-dependent indexer -> top-k stage, the FlashMLA sparse kernel,
+        # AND aux-stream forks -- none of which can be captured into a CUDA graph.
+        # So under a prefill-graph capture the whole attention runs eager (output is
+        # token-shaped [tokens, hidden_size] = hidden_states.shape) while the layer's
+        # norms + MoE stay graphed. No-op (direct call) when not capturing. Padding
+        # rows are handled by the existing metadata.is_valid_token masking. See
+        # docs/design/prefill-breakable-cudagraph.md.
+        if hidden_states.shape[0] == 0:
+            return hidden_states
+        return break_attn(
+            self._forward_breakable_impl,
+            hidden_states.shape,
+            hidden_states.dtype,
+            hidden_states.device,
+            positions,
+            hidden_states,
+            ctx,
+            out_cache_loc,
+            swa_slot_mapping,
+            compressor_slot_cache,
+        )
+
+    def _forward_breakable_impl(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        ctx: ForwardContext,
+        out_cache_loc: torch.Tensor,
+        swa_slot_mapping: torch.Tensor | None = None,
+        compressor_slot_cache: dict | None = None,
+    ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             return hidden_states
         if compressor_slot_cache is None:
@@ -3567,6 +3604,22 @@ class DeepseekV4Attention(nn.Module):
         metadata = ctx.attn_backend.forward_metadata
         if metadata is None:
             raise RuntimeError("DeepSeek V4 attention requires forward metadata")
+
+        # Under a breakable prefill CUDA graph the inner model runs a padded token
+        # bucket, but DSA attention (indexer -> top-k, sparse FlashMLA, paged-cache
+        # writes) must operate on exactly the real tokens the live metadata
+        # describes -- forward_deepseek_v4_prefill asserts q matches the metadata
+        # token count. This eager break re-runs each replay, so slice the
+        # token-shaped inputs down to the live count; the padded tail is discarded
+        # by the prefill-graph output slice. No-op in eager (already equal).
+        token_to_req = getattr(metadata, "token_to_req_indices", None)
+        if token_to_req is not None and token_to_req.numel() < hidden_states.shape[0]:
+            real_tokens = token_to_req.numel()
+            positions = positions[:real_tokens]
+            hidden_states = hidden_states[:real_tokens]
+            out_cache_loc = out_cache_loc[:real_tokens]
+            if swa_slot_mapping is not None:
+                swa_slot_mapping = swa_slot_mapping[:real_tokens]
 
         # --- Phase 1: pre-compute input GEMMs in parallel ---
         # Q/KV projection on main stream; compressor GEMM(s) on aux stream.
@@ -3981,18 +4034,25 @@ class DeepseekV4Model(nn.Module):
                 hidden_states = self.embed_tokens(input_ids)
         with nvtx_range("hc_repeat"):
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
-        # The SWA write-slot mapping is identical across all layers, so compute
-        # it once per step here instead of recomputing it in every attention
-        # layer (DeepSeek-V3 likewise derives its slot mapping once per step).
-        swa_slot_mapping = _deepseek_v4_swa_slot_mapping(
-            ctx,
-            positions,
-            out_cache_loc,
-        )
-        # Per-(step, ratio) compressor slot mappings are identical across layers of the
-        # same ratio; memoize within the step (filled lazily by the first compressor of
-        # each ratio, reused by the rest).
-        compressor_slot_cache: dict = {}
+        # The SWA write-slot mapping and the per-ratio compressor slot-mapping memo are
+        # normally computed once per step here (identical across layers) and shared.
+        # That is correct for eager, but UNSAFE under the breakable prefill CUDA graph:
+        # both are derived from per-forward *metadata tensors* (token_to_req_indices,
+        # swa_block_table) that live at capture-time addresses, so a value computed in
+        # this captured forward bakes the dummy batch's metadata and replays stale ->
+        # wrong cache slots -> garbage. While capturing, pass ``None`` so each attention
+        # eager-break recomputes both from LIVE metadata at replay; outside capture keep
+        # the shared fast path (no perf change to normal eager serving).
+        if is_breakable_capture_active():
+            swa_slot_mapping = None
+            compressor_slot_cache = None
+        else:
+            swa_slot_mapping = _deepseek_v4_swa_slot_mapping(
+                ctx,
+                positions,
+                out_cache_loc,
+            )
+            compressor_slot_cache = {}
         for layer in self.layers:
             hidden_states = layer(
                 positions,
@@ -4026,6 +4086,12 @@ class DeepseekV4Model(nn.Module):
 
 class DeepseekV4ForCausalLM(BaseCausalLM):
     model_cls = DeepseekV4Model
+
+    # DSA attention's eager break selects its prefill/decode/mixed backend path
+    # from the CAPTURED ctx.forward_mode (baked EXTEND at capture), so a mixed
+    # batch would mis-route to the prefill path. Pure-extend is correct (validated);
+    # mixed stays eager until the break reads the live mode from the singleton.
+    prefill_graph_supports_mixed = False
 
     def get_stacked_params_mapping(self):
         return [
