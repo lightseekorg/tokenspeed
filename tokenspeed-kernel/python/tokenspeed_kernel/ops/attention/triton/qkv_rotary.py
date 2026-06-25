@@ -65,9 +65,7 @@ def _packed_qkv_complex_rotary_kernel(
     k_odd = tl.load(k_base + odd_d[None, :], mask=mask, other=0.0).to(tl.float32)
 
     freq_base = (
-        FREQS
-        + offs_t[:, None] * freqs_stride_t
-        + offs_p[None, :] * freqs_stride_pair
+        FREQS + offs_t[:, None] * freqs_stride_t + offs_p[None, :] * freqs_stride_pair
     )
     real = tl.load(freq_base, mask=mask, other=0.0).to(tl.float32)
     imag = tl.load(freq_base + freqs_stride_ri, mask=mask, other=0.0).to(tl.float32)
@@ -240,12 +238,10 @@ def _packed_qkv_neox_rotary_kernel(
     q = tl.load(q_ptr, mask=mask, other=0.0).to(tl.float32)
     k = tl.load(k_ptr, mask=mask, other=0.0).to(tl.float32)
     q_rot = (
-        tl.load(q_rot_ptr, mask=rot_mask, other=0.0).to(tl.float32)
-        * rot_sign[None, :]
+        tl.load(q_rot_ptr, mask=rot_mask, other=0.0).to(tl.float32) * rot_sign[None, :]
     )
     k_rot = (
-        tl.load(k_rot_ptr, mask=rot_mask, other=0.0).to(tl.float32)
-        * rot_sign[None, :]
+        tl.load(k_rot_ptr, mask=rot_mask, other=0.0).to(tl.float32) * rot_sign[None, :]
     )
     cos = tl.load(cos_ptr, mask=mask, other=0.0).to(tl.float32)
     sin = tl.load(sin_ptr, mask=mask, other=0.0).to(tl.float32)

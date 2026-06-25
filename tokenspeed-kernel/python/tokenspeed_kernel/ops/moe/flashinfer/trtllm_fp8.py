@@ -40,6 +40,7 @@ if platform.is_nvidia:
     from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
 
     _FP8_BLOCK = 128
+
     def _routing_value(w: torch.nn.Module, name: str, default):
         routing_config = getattr(w, "routing_config", {})
         if not isinstance(routing_config, dict):
