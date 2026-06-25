@@ -514,10 +514,22 @@ class EventLoop:
             payload = cache_event_to_payload(event)
             self._pending_cache_event_payloads[cache_event_key(payload)] = payload
 
-        # Local short-circuit: counter mirrors across ranks (same plan every-
-        # where), so if nothing is in flight here AND nothing is buffered
-        # awaiting commit, no rank has anything to gather.
-        if self._num_inflight_cache_ops == 0 and not self._pending_cache_event_payloads:
+        # Skip the cross-rank gather below only when EVERY attn-tp rank agrees
+        # there is nothing to commit. Cache-op completion (poll_results above)
+        # is asynchronous and NOT lock-step across ranks: the submit-side counts
+        # mirror (same execution plan everywhere), but the poll-side decrements
+        # land at different iterations per rank, so _num_inflight_cache_ops and
+        # _pending_cache_event_payloads diverge transiently. The gather in
+        # _pop_ready_cache_event_payloads is a collective (all_gather_object on
+        # attn_tp_cpu_group); a rank-local short-circuit lets some ranks gather
+        # while others return, desyncing the group and hanging the engine (the
+        # gathering ranks block forever, the others run ahead into the next
+        # forward whose NCCL collective then has no peer). Agree on the skip
+        # with a cheap single-int all_reduce so it is unanimous.
+        local_has_work = bool(
+            self._num_inflight_cache_ops != 0 or self._pending_cache_event_payloads
+        )
+        if not self._cache_group_has_work(local_has_work):
             return
 
         ready_payloads = self._pop_ready_cache_event_payloads()
@@ -557,6 +569,29 @@ class EventLoop:
         self.kv_event_publisher.publish(
             KVEventBatch(ts=time.time(), events=events, attn_dp_rank=self.dp_rank)
         )
+
+    def _cache_group_has_work(self, local_has_work: bool) -> bool:
+        """Whether ANY attn-tp rank has cache work to synchronize this step.
+
+        The cache-event gather is a collective, so the decision to run or skip
+        it must be unanimous across the attn-tp group; deciding from rank-local
+        state alone desyncs the group and deadlocks (see _commit_cache_results).
+        A single-int MAX all_reduce is far cheaper than the payload
+        all_gather_object it guards.
+
+        Args:
+            local_has_work: This rank's local view of whether any cache op is
+                in flight or any polled payload is awaiting commit.
+
+        Returns:
+            ``True`` if at least one rank in the attn-tp group has work, so all
+            ranks must enter the gather; ``False`` only when every rank is idle.
+        """
+        if self.attn_tp_size == 1:
+            return local_has_work
+        flag = torch.tensor([1 if local_has_work else 0], dtype=torch.int32)
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=self.attn_tp_cpu_group)
+        return bool(flag.item())
 
     def _pop_ready_cache_event_payloads(self) -> list[dict]:
         local_payloads = list(self._pending_cache_event_payloads.values())
