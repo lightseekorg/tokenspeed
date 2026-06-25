@@ -517,7 +517,7 @@ def _mha_decode_fp16(
 
     for start_n in range(program.split_start, program.split_end, cfg.BLOCK_N):
         with gl.amd.warp_pipeline_stage("load", priority=1):
-            physical_page = program.load_page(start_n + cfg.BLOCK_N)
+            physical_page = program.load_page(start_n)
             program.issue_load_k(physical_page, k_smem)
             program.issue_load_v(physical_page, v_smem)
 
