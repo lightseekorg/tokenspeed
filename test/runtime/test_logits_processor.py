@@ -131,25 +131,27 @@ def test_argmax_routes_sharded_to_kernel(monkeypatch):
     assert torch.equal(ids, shard.argmax(dim=-1))
 
 
-def test_argmax_full_vocab_skips_kernel(monkeypatch):
-    """Full-vocab logits fall back to argmax even when a state is present."""
+def test_argmax_falls_back_without_state(monkeypatch):
+    """No fused state (e.g. EAGLE3 draft vocab != target, or gate failed):
+    _argmax falls back to a plain argmax instead of routing to the kernel."""
     proc = LogitsProcessor(
-        config=SimpleNamespace(model_type="test", vocab_size=8),
+        config=SimpleNamespace(model_type="test", vocab_size=100),
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 1),
     )
-    proc._dist_argmax_state = object()
+    proc._dist_argmax_state = None  # gate failed (draft vocab != target vocab)
 
     monkeypatch.setattr(
         logits_processor_module,
         "distributed_argmax",
-        lambda *a, **k: pytest.fail("kernel must not run on full-vocab logits"),
+        lambda *a, **k: pytest.fail("kernel must not run without a fused state"),
     )
 
-    full = torch.randn(4, 8, dtype=torch.float32)  # width == vocab_size => not sharded
-    ids = proc._argmax(full)
-    assert torch.equal(ids, full.argmax(dim=-1))
+    # Gathered draft logits are narrower than the target config.vocab_size.
+    draft = torch.randn(4, 32, dtype=torch.float32)
+    ids = proc._argmax(draft)
+    assert torch.equal(ids, draft.argmax(dim=-1))
 
 
 def test_get_logits_skips_gather_when_dist_argmax_active(monkeypatch):

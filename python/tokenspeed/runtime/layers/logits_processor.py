@@ -618,17 +618,17 @@ class LogitsProcessor(nn.Module):
 
         return logits
 
-    def _argmax(
-        self, logits: torch.Tensor, *, out: torch.Tensor | None = None
-    ) -> torch.Tensor:
-        if self.tp_size > 1 and logits.size(-1) < self.config.vocab_size:
-            assert self._dist_argmax_state is not None
-            assert not self.final_logit_softcapping
-            assert logits.size(0) <= self._LOGITS_DIST_ARGMAX_MAX_TOKENS
+    def _argmax(self, logits: torch.Tensor) -> torch.Tensor:
+        if (
+            self._dist_argmax_state
+            not in (self._LOGITS_DIST_ARGMAX_UNINITIALIZED, None)
+            and not self.final_logit_softcapping
+            and logits.size(0) <= self._LOGITS_DIST_ARGMAX_MAX_TOKENS
+        ):
             _, idx = distributed_argmax(self._dist_argmax_state, logits)
             return idx
         else:
-            return sampling_argmax(logits, out=out)
+            return sampling_argmax(logits)
 
     @staticmethod
     def get_top_logprobs(all_logprobs: torch.Tensor, logits_metadata: LogitsMetadata):
