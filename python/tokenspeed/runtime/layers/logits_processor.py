@@ -177,6 +177,7 @@ class LogitsProcessor(nn.Module):
 
     _LOGITS_AG_MAX_TOKENS = 128
     _LOGITS_AG_STATE_UNINITIALIZED = object()
+    _LOGITS_AG_STATES = {}
 
     def __init__(
         self,
@@ -276,12 +277,15 @@ class LogitsProcessor(nn.Module):
         if vocab_padded % (self.tp_size * 8) != 0:
             return None
 
-        return create_state(
-            group=pg_manager.get_process_group("nccl", self.tp_group),
-            rank_in_group=self.tp_rank,
-            max_tokens=self._LOGITS_AG_MAX_TOKENS,
-            hidden_size=vocab_padded,
-        )
+        key = (self.tp_group, vocab_padded)
+        if key not in self._LOGITS_AG_STATES:
+            self._LOGITS_AG_STATES[key] = create_state(
+                group=pg_manager.get_process_group("nccl", self.tp_group),
+                rank_in_group=self.tp_rank,
+                max_tokens=self._LOGITS_AG_MAX_TOKENS,
+                hidden_size=vocab_padded,
+            )
+        return self._LOGITS_AG_STATES[key]
 
     def forward(
         self,

@@ -135,6 +135,7 @@ class ModelRunner:
         seq_lens: torch.Tensor | None = None,
         extend_prefix_lens: torch.Tensor | None = None,
         captured_hidden_states: torch.Tensor | None = None,
+        input_embeds: torch.Tensor | None = None,
         multimodal_context: MultimodalForwardContext | None = None,
         spec_step_idx: int | None = None,
     ) -> LogitsProcessorOutput:
@@ -149,6 +150,8 @@ class ModelRunner:
             kwargs["get_embedding"] = True
         if captured_hidden_states is not None:
             kwargs["captured_hidden_states"] = captured_hidden_states
+        if input_embeds is not None:
+            kwargs["input_embeds"] = input_embeds
         if multimodal_context is not None:
             kwargs["multimodal_context"] = multimodal_context
         if spec_step_idx is not None and getattr(
