@@ -96,7 +96,7 @@ def test_mixed_forward_updates_reserve_for_decode_slots_only():
     sender = _Sender()
     processor = OutputProcesser(
         sender,
-        global_rank=0,
+        attn_tp_rank=0,
         metrics=_Metrics(),
     )
     processor.rid_to_state["prefill"] = _state([1, 2, 3, 4])
@@ -116,7 +116,7 @@ def test_mark_abort_notify_client_flag():
     """Pause-initiated aborts must flag the request to stream a terminating
     finish to the (passive) client; client-initiated aborts must not."""
     sender = _Sender()
-    processor = OutputProcesser(sender, global_rank=0, metrics=_Metrics())
+    processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
 
     pause_state = _state([1, 2, 3])
     processor.rid_to_state["pause"] = pause_state
@@ -139,7 +139,7 @@ def test_nan_flag_finishes_request_with_numerical_error():
 
     sender = _Sender()
     metrics = _Metrics()
-    processor = OutputProcesser(sender, global_rank=0, metrics=metrics)
+    processor = OutputProcesser(sender, attn_tp_rank=0, metrics=metrics)
     prefill_state = _state([1, 2, 3, 4])
     decode_state = _state([5, 6, 7], computed_length=3)
     processor.rid_to_state["prefill"] = prefill_state
@@ -182,7 +182,7 @@ def test_nan_flag_keeps_single_sanitized_token():
     metrics = _Metrics()
     processor = OutputProcesser(
         sender,
-        global_rank=0,
+        attn_tp_rank=0,
         spec_algorithm="eagle",
         spec_num_tokens=4,
         metrics=metrics,
@@ -219,7 +219,7 @@ def test_nan_flag_skips_first_token_pd_handoff():
     """NaN-terminated requests must not hand their bootstrap token to the PD
     transfer layer — their KV is suspect."""
     sender = _Sender()
-    processor = OutputProcesser(sender, global_rank=0, metrics=_Metrics())
+    processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
     processor.rid_to_state["prefill"] = _state([1, 2, 3, 4])
     processor.rid_to_state["decode"] = _state([5, 6, 7], computed_length=3)
 
@@ -259,7 +259,7 @@ def test_log_request_stats_disabled_by_default():
     rec = _RecordingLogger()
     gop_logger, gop.logger = gop.logger, rec
     try:
-        processor = OutputProcesser(_Sender(), global_rank=0, metrics=_Metrics())
+        processor = OutputProcesser(_Sender(), attn_tp_rank=0, metrics=_Metrics())
         assert processor.log_request_stats is False
         state = _state([5, 6, 7], computed_length=3)
         state.sampling_params.max_new_tokens = 1
@@ -294,7 +294,7 @@ def test_log_request_stats_line_fields():
     gop_logger, gop.logger = gop.logger, rec
     try:
         processor = OutputProcesser(
-            _Sender(), global_rank=0, log_request_stats=True, metrics=_Metrics()
+            _Sender(), attn_tp_rank=0, log_request_stats=True, metrics=_Metrics()
         )
         # prompt=4, cache=2 -> cache_hit 0.5; queue 10ms, prefill 20ms, ttft 30ms,
         # total 130ms; output=5 over a 100ms decode window -> decode_tps 40.
@@ -339,7 +339,7 @@ def test_log_request_stats_aborted_with_spec_acceptance():
     try:
         processor = OutputProcesser(
             _Sender(),
-            global_rank=0,
+            attn_tp_rank=0,
             spec_algorithm="eagle",
             spec_num_tokens=4,
             log_request_stats=True,
@@ -371,7 +371,7 @@ def test_log_request_stats_noop_without_tracker():
     gop_logger, gop.logger = gop.logger, rec
     try:
         processor = OutputProcesser(
-            _Sender(), global_rank=0, log_request_stats=True, metrics=_Metrics()
+            _Sender(), attn_tp_rank=0, log_request_stats=True, metrics=_Metrics()
         )
         rs = _state([1, 2, 3])
         rs.finished_reason = FINISH_LENGTH(length=1)
@@ -424,7 +424,7 @@ def test_log_request_stats_records_timestamps_through_forward():
     gop_logger, gop.logger = gop.logger, rec
     try:
         processor = OutputProcesser(
-            _Sender(), global_rank=0, log_request_stats=True, metrics=_Metrics()
+            _Sender(), attn_tp_rank=0, log_request_stats=True, metrics=_Metrics()
         )
         # prefill already done; max_new_tokens=1 so it finishes after one token
         state = _state([5, 6, 7], computed_length=3)
@@ -454,3 +454,35 @@ def test_log_request_stats_records_timestamps_through_forward():
     stats_lines = [line for line in rec.lines if "Req: d Finish! RequestStats(" in line]
     assert len(stats_lines) == 1
     assert "status='finished', reason='length'" in stats_lines[0]
+
+
+def test_log_request_stats_logs_on_each_dp_replica_leader():
+    """Per-request logging is gated on attn_tp_rank == 0 (each DP replica's TP
+    leader), not the global rank. So a request on a DP replica > 0 (whose leader
+    has global_rank != 0) is still logged -- not missed -- while non-leader TP
+    shards stay silent so the line isn't duplicated."""
+    import tokenspeed.runtime.engine.generation_output_processor as gop
+    from tokenspeed.runtime.engine.request_types import FINISH_LENGTH
+
+    def emit(attn_tp_rank):
+        rec = _RecordingLogger()
+        gop_logger, gop.logger = gop.logger, rec
+        try:
+            p = OutputProcesser(
+                _Sender(),
+                attn_tp_rank=attn_tp_rank,
+                log_request_stats=True,
+                metrics=_Metrics(),
+            )
+            rs = _state([1, 2, 3, 4])
+            rs.finished_reason = FINISH_LENGTH(length=1)
+            rs.stats = RequestStatsTracker()
+            p._log_request_stats("rid", rs, finish_time=1.0)
+        finally:
+            gop.logger = gop_logger
+        return rec.lines
+
+    # TP leader of ANY DP replica logs (attn_tp_rank == 0 even when global_rank != 0).
+    assert any("Req: rid Finish! RequestStats(" in line for line in emit(0))
+    # Non-leader TP shards within a replica stay silent (no duplicate line).
+    assert emit(1) == []

@@ -440,7 +440,7 @@ class EventLoop:
 
         self.output_processor = OutputProcesser(
             send_to_tokenizer=self.send_to_tokenizer,
-            global_rank=global_rank,
+            attn_tp_rank=attn_tp_rank,
             spec_algorithm=self.server_args.speculative_algorithm,
             spec_num_tokens=(
                 self.server_args.speculative_num_draft_tokens
