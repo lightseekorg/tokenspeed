@@ -273,11 +273,7 @@ class DSABackend(AttentionBackend):
         self._refresh_decode_topk_schedule_metadata(bs)
         return result
 
-    def _refresh_decode_topk_schedule_metadata(
-        self,
-        bs: int,
-        seq_lens_offset: int = 0,
-    ) -> None:
+    def _refresh_decode_topk_schedule_metadata(self, bs: int) -> None:
         if deep_gemm is None:
             return
         metadata = getattr(self._dense_backend, "forward_decode_metadata", None)
@@ -291,16 +287,11 @@ class DSABackend(AttentionBackend):
         if schedule_metadata is None:
             return
 
-        start = max(0, int(seq_lens_offset))
-        bs = min(int(bs), max(0, int(metadata.seq_lens_k.numel()) - start))
-        if bs <= 0:
-            return
-
         # Rebuild the per-token visible lengths the capture used: verify
         # graphs schedule [bs, q_len] rows (token j of a request sees
         # seq_len - q_len + j + 1 positions), plain decode [bs, 1].
         q_len = int(getattr(metadata, "_dsa_paged_mqa_schedule_q_len", 1) or 1)
-        base_lens = metadata.seq_lens_k[start : start + bs].to(torch.int32)
+        base_lens = metadata.seq_lens_k[:bs].to(torch.int32)
         if q_len == 1:
             seq_lens = base_lens.view(-1, 1).contiguous()
         else:
@@ -341,11 +332,7 @@ class DSABackend(AttentionBackend):
             metadata.seq_lens_k.add_(1)
         else:
             metadata.seq_lens_k.copy_(seq_lens[: metadata.seq_lens_k.numel()])
-        num_extends = int(metadata.num_extends or 0)
-        self._refresh_decode_topk_schedule_metadata(
-            metadata.seq_lens_k.numel() - num_extends,
-            seq_lens_offset=num_extends,
-        )
+        self._refresh_decode_topk_schedule_metadata(metadata.seq_lens_k.numel())
 
     def init_forward_metadata(
         self,

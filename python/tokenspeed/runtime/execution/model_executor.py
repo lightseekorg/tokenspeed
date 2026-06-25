@@ -48,6 +48,8 @@ from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 from tokenspeed.runtime.execution.types import ModelExecutionResult
 from tokenspeed.runtime.grammar.capturable_grammar import setup_grammar_step
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
+from tokenspeed.runtime.models.llama_eagle3 import LlamaForCausalLMEagle3
+from tokenspeed.runtime.models.qwen3_5_nextn import Qwen3_5ForConditionalGenerationNextN
 from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 from tokenspeed.runtime.sampling.dp_sampling_config import (
     DpSamplingRuntimeLimits,
@@ -81,15 +83,6 @@ def _draft_idle_global_num_tokens_for_step(
     if step_idx == 0 or global_bs is None:
         return global_num_tokens
     return global_bs
-
-
-def _draft_first_step_reduce_for_idle_mirror(
-    draft_model,
-    all_decode_or_idle: bool,
-) -> bool:
-    return bool(all_decode_or_idle) or bool(
-        getattr(draft_model, "draft_first_step_reduce_for_catchup", False)
-    )
 
 
 @dataclass
@@ -1119,11 +1112,6 @@ class ModelExecutor:
         # NCCL collectives. Idle ranks must match those collectives:
         # 1 first-step forward + (spec_num_steps - 1) multi-step decode forwards.
         if self.drafter is not None:
-            draft_model = self.drafter.draft_model_runner.model
-            reduce_first_step = _draft_first_step_reduce_for_idle_mirror(
-                draft_model,
-                all_decode_or_idle,
-            )
             for step_idx in range(self.drafter.spec_num_steps):
                 # Mirror active rank's catch-up step: when all non-idle ranks
                 # are decoding, step 0 sizes collectives from bs/global_bs.
@@ -1143,8 +1131,22 @@ class ModelExecutor:
                     global_num_tokens=draft_global_num_tokens,
                     global_bs=global_bs,
                     all_decode_or_idle=all_decode_or_idle,
-                    # Mirror the active-rank reduction decision in eagle.py.
-                    draft_first_step_reduce=step_idx == 0 and reduce_first_step,
+                    # Mirror the active-rank broaden in eagle.py: Llama Eagle3
+                    # and Qwen3.5 NextN narrow for any non-idle catch-up, so the
+                    # idle peer must size collectives the same way.
+                    draft_first_step_reduce=(
+                        step_idx == 0
+                        and (
+                            all_decode_or_idle
+                            or isinstance(
+                                self.drafter.draft_model_runner.model,
+                                (
+                                    LlamaForCausalLMEagle3,
+                                    Qwen3_5ForConditionalGenerationNextN,
+                                ),
+                            )
+                        )
+                    ),
                 )
                 self.drafter.draft_model_runner.forward(
                     draft_ctx,
