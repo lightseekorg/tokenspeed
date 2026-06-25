@@ -171,7 +171,66 @@ struct FlatForwardOperation {
     bool empty() const { return request_ids.empty(); }
     std::size_t num_extends() const { return extend_prefix_lens.size(); }
 
+    // Pure-decode projection of a combined [extends | decodes] op: a NEW
+    // FlatForwardOperation holding only the trailing decode slots
+    // request_ids[num_extends():] with num_extends()==0. Used on the kD node so a
+    // cycle that triggered KV-receive EXTENDs (the leading extend rows) can ALSO
+    // forward its Decoding requests WITHOUT ever handing a mixed op to the model.
+    // The slice point is the single integer num_extends(); the op is already
+    // Id()-sorted + stable_partition'd, so every TP rank derives an IDENTICAL
+    // decode op (the cross-rank invariant lives here, not in Python).
+    FlatForwardOperation decode_only() const {
+        const std::size_t ne = num_extends();
+        const std::size_t n = request_ids.size();
+        FlatForwardOperation out;  // private default ctor; fields filled below
+        if (ne >= n) {
+            return out;  // no decode rows this cycle
+        }
+        auto tail_str = [&](const std::vector<std::string>& v) {
+            return std::vector<std::string>(v.begin() + ne, v.end());
+        };
+        auto tail_i32 = [&](const std::vector<std::int32_t>& v) {
+            return std::vector<std::int32_t>(v.begin() + ne, v.end());
+        };
+        out.request_ids = tail_str(request_ids);
+        out.request_pool_indices = tail_i32(request_pool_indices);
+        out.input_lengths = tail_i32(input_lengths);
+        out.prefill_lengths = tail_i32(prefill_lengths);
+        out.occupied_pages =
+            std::vector<std::vector<std::int32_t>>(occupied_pages.begin() + ne, occupied_pages.end());
+        out.begins = tail_i32(begins);
+        out.sizes = tail_i32(sizes);
+        out.mamba_working_indices = tail_i32(mamba_working_indices);
+        out.mamba_checkpoint_dst_indices = tail_i32(mamba_checkpoint_dst_indices);
+        out.mamba_cow_src_indices = tail_i32(mamba_cow_src_indices);
+        out.mamba_branching_seqlens = tail_i32(mamba_branching_seqlens);
+        // decode_input_ids / hist_token_lens are emitted ONCE per decode row in
+        // the ctor (the DecodeOperation branch, after stable_partition puts
+        // decodes last), so they already correspond 1:1 to rows [ne, n) — copy
+        // them whole. This is what carries a just-Decoding request's
+        // bootstrap_token (decode_input_id) into its first decode step.
+        out.decode_input_ids = decode_input_ids;
+        out.hist_token_lens = hist_token_lens;
+        // input_ids / shifted_input_ids / extend_prefix_lens are extend-only and
+        // intentionally stay EMPTY -> out.num_extends()==0 -> ForwardMode==DECODE.
+        // Per-group block tables: keep decode rows [ne:], then re-pad to the
+        // decode batch's own max width.
+        for (const auto& [gid, table] : paged_cache_block_tables) {
+            out.paged_cache_block_tables[gid] =
+                std::vector<std::vector<std::int32_t>>(table.begin() + ne, table.end());
+        }
+        for (const auto& [gid, offs] : paged_cache_block_table_base_offsets) {
+            out.paged_cache_block_table_base_offsets[gid] = tail_i32(offs);
+        }
+        padRectangularMinusOne(out.paged_cache_block_tables);
+        return out;
+    }
+
 private:
+    // Empty shell used only by decode_only(); external construction still goes
+    // through the explicit ops ctor.
+    FlatForwardOperation() = default;
+
     template <typename Key>
     static void padRectangularMinusOne(std::map<Key, std::vector<std::vector<std::int32_t>>>& tables) {
         for (auto& [_, table] : tables) {

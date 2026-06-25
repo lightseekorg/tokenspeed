@@ -259,6 +259,17 @@ class Envs:
     TOKENSPEED_DISAGGREGATION_THREAD_POOL_SIZE = EnvInt(-1)
     TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT = EnvInt(120)
     TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
+    # EPD: row-shard each image embedding across the prefill attn-TP ranks (1/N
+    # over the wire per rank, reassembled by an intra-node all-gather at
+    # admission) instead of sending every rank a full copy -- cuts the encode
+    # worker's egress by the attn-TP factor (measured 8.0x on the embedding
+    # component at TP8). Effective only when the encode pool advertises shard
+    # support via its bootstrap parallel-info; otherwise receivers fall back to
+    # identity (full-copy) shards, and at attn-TP 1 it is inert. Default ON
+    # (validated cross-node at TP4 + TP8: accuracy parity, heavy-vision soak,
+    # encode-worker kill drill); set to 0 as the kill-switch to restore the
+    # full-copy wire behavior.
+    TOKENSPEED_EPD_EMBEDDING_SHARD = EnvBool(True)
     TOKENSPEED_PD_LAYERWISE_DEBUG = EnvBool(False)
     TOKENSPEED_PD_PREFILL_METADATA_TIMEOUT = EnvFloat(5.0)
 

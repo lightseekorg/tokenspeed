@@ -18,9 +18,23 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Runtime cache subsystem.
+from __future__ import annotations
 
-This package groups KV cache data structures, allocators, storage backends,
-and cache-operation executors under one top-level domain. It also holds the
-vision-embedding cache used by the EPD encode stage (:mod:`embedding_cache`).
-"""
+
+class TransferPoll:
+    """Transfer-status FSM shared by both disaggregation roles.
+
+    Integer-ordered so :meth:`DisaggManagerBase.update_status` can enforce
+    monotonic, ``Failed``-sticky transitions via ``max()``. The KV
+    (prefill->decode) and embedding (encode->prefill) paths use this single
+    enum; ``WaitingForInput`` is only meaningful to the KV path (the embedding
+    path never sets it, but sharing one ordered enum keeps the two status FSMs
+    from drifting apart).
+    """
+
+    Failed = 0
+    Bootstrapping = 1
+    Bootstrapped = 2
+    WaitingForInput = 3
+    Transferring = 4
+    Success = 5

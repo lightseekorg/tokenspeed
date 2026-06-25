@@ -174,7 +174,11 @@ def should_use_overlap_schedule(
 
     if disable_overlap_schedule:
         return False
-    if disaggregation_mode == "prefill":
+    if disaggregation_mode in ("prefill", "encode"):
+        # prefill: the EPD embedding drain and the KV send both run only in the
+        # non-overlap event_loop(). encode: the EPD encode role has no LM
+        # EventLoop at all (run_event_loop routes it to run_encode_loop before
+        # this is called), so the value is moot -- return False defensively.
         return False
     if speculative_algorithm is not None and paged_cache_groups:
         return False

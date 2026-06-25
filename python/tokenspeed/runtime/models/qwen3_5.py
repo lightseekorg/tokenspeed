@@ -1155,12 +1155,14 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
         prefix: str = "",
         is_multimodal_active: bool = True,
         mm_attention_backend: str | None = None,
+        vision_tower_only: bool = False,
     ):
         super().__init__(
             config=config.text_config,
             mapping=mapping,
             quant_config=quant_config,
             prefix=prefix,
+            vision_tower_only=vision_tower_only,
         )
 
         rope_config = get_rope_parameters(self.config)
@@ -1229,9 +1231,10 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
         video, ``image_grid_thw`` otherwise) so a single shared encoder cudagraph
         wrapper can serve both image and video batches.
         """
-        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
-            self.visual.dtype
-        )
+        device = self.visual.device
+        pixel_values = torch.cat(
+            [item.feature.to(device, non_blocking=True) for item in items], dim=0
+        ).type(self.visual.dtype)
         grid = torch.concat(
             [
                 getattr(
@@ -1407,6 +1410,12 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
                 continue
             if not self.is_multimodal_active and "visual" in name:
                 continue
+            # Vision-only role: drop every non-visual (LM / lm_head / norm /
+            # embed) weight up front, before any rename or params_dict lookup,
+            # so none is routed into a None module. self.model is None here, so
+            # named_parameters() exposes only visual params.
+            if getattr(self, "vision_tower_only", False) and "visual" not in name:
+                continue
             if "language_model" in name:
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
@@ -1460,6 +1469,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         prefix: str = "",
         is_multimodal_active: bool = True,
         mm_attention_backend: str | None = None,
+        vision_tower_only: bool = False,
     ) -> None:
         super().__init__(
             config=config,
@@ -1468,6 +1478,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
             prefix=prefix,
             is_multimodal_active=is_multimodal_active,
             mm_attention_backend=mm_attention_backend,
+            vision_tower_only=vision_tower_only,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
@@ -1526,6 +1537,13 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
             if "mtp" in name:
                 continue
             if not self.is_multimodal_active and "visual" in name:
+                continue
+            # Vision-only role: drop every non-visual (LM / lm_head / norm /
+            # embed / expert) weight up front, before any rename, params_dict
+            # lookup, or moe_loader.load (which would KeyError on a missing
+            # expert param). self.model is None here, so named_parameters()
+            # exposes only visual params.
+            if getattr(self, "vision_tower_only", False) and "visual" not in name:
                 continue
             if "language_model" in name:
                 name = name.replace(r"model.language_model.", r"model.")

@@ -716,6 +716,13 @@ class OutputProcesser:
         It is appended to output_ids so the decode side starts generation from the
         correct position.
 
+        MRoPE positions need no transfer here: the gateway ships the decode the
+        lightweight mm metadata (grid_thw), so the decode computes the same
+        mrope_position_delta locally (InputProcessor.compute_mrope_positions),
+        matching what prefill computed. The decode mrope override reads that
+        request-local delta; text / no-image requests carry no mm and fall back to
+        linear positions.
+
         bootstrap_token == -1 means the prefill side did not (or could not) supply a
         token (e.g. it was generated on a rank whose ZMQ message arrived after the
         success barrier had already been satisfied).

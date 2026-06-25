@@ -27,11 +27,11 @@ from typing import TYPE_CHECKING
 import torch
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.disaggregation.kv.utils import StepCounter
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
     from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
     from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
-    from tokenspeed.runtime.pd.utils import StepCounter
 
 
 class AttentionBackend(ABC):

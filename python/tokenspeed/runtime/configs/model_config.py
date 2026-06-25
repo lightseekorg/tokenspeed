@@ -348,6 +348,27 @@ class ModelConfig:
             )
         # ``is_multimodal`` is the architectural fact; this is the runtime gate.
         self.is_multimodal_active = self.is_multimodal and not apply_language_model_only
+        # Vision-only role (EPD encode): the inverse axis of language_model_only.
+        # Build the vision tower (is_multimodal_active stays True) but SKIP LM
+        # construction + LM weight load so a full ViT fits at encode TP=1.
+        vision_tower_only = (
+            bool(getattr(server_args, "vision_tower_only", False))
+            and not is_draft_worker
+        )
+        if vision_tower_only and not self.is_multimodal:
+            raise ValueError(
+                "disaggregation_mode=encode requires a multimodal checkpoint."
+            )
+        if vision_tower_only and apply_language_model_only:
+            raise ValueError(
+                "vision-tower-only and language-model-only are mutually exclusive."
+            )
+        if vision_tower_only:
+            logger.info(
+                "Running in vision-tower-only mode: the language model will not "
+                "be constructed or loaded (encode role)."
+            )
+        self.vision_tower_only = vision_tower_only
         # Cap gpu_memory_utilization for VLMs in mm mode — the vision encoder
         # needs headroom that the global default doesn't account for.
         if (

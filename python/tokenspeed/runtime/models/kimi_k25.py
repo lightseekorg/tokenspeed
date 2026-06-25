@@ -808,10 +808,18 @@ class KimiK25ForConditionalGeneration(nn.Module):
         """
         device = self.vision_tower.device
         target_dtype = self.vision_tower.patch_embed.proj.weight.dtype
-        pixel_values = torch.cat([item.feature for item in items], dim=0).to(
-            device=device, dtype=target_dtype
-        )
-        grid_thws = torch.concat([item.grid_thws for item in items], dim=0).to(device)
+        pixel_values = torch.cat(
+            [item.feature.to(device, non_blocking=True) for item in items], dim=0
+        ).to(dtype=target_dtype)
+
+        # The grid lives under "image_grid_thw" on the EPD path (smg processor) and
+        # under "grid_thws" on the aggregated path (engine-side preprocessing); accept
+        # either so both topologies work.
+        def _grid(item):
+            g = getattr(item, "image_grid_thw", None)
+            return g if g is not None else item.grid_thws
+
+        grid_thws = torch.concat([_grid(item) for item in items], dim=0).to(device)
         hidden_states = self.vision_tower.patch_embed(pixel_values, grid_thws)
         return hidden_states, grid_thws
 

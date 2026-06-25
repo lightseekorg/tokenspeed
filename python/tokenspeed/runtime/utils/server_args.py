@@ -78,6 +78,9 @@ class ServerArgs:
     served_model_name: str | None = None
     revision: str | None = None
     language_model_only: bool = False
+    # Derived (not a CLI flag): set True for the EPD encode role so the model
+    # class builds only the vision tower and skips LM construction/weight load.
+    vision_tower_only: bool = False
 
     # Port for the HTTP server
     host: str = "127.0.0.1"
@@ -269,7 +272,9 @@ class ServerArgs:
     mla_chunk_multiplier: int = 4
     mm_attention_backend: str | None = None
 
-    # For PD disaggregation: can be "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only)
+    # For PD/EPD disaggregation: "null" (not disaggregated), "prefill"
+    # (prefill-only), "decode" (decode-only), or "encode" (vision-tower-only,
+    # ships image embeddings to a prefill server).
     disaggregation_mode: str = "null"
     disaggregation_bootstrap_port: int = 8998
     disaggregation_transfer_backend: str = "mooncake"
@@ -585,6 +590,15 @@ class ServerArgs:
                 "enable_prefix_caching=%r for decode server",
                 self.enable_prefix_caching,
             )
+        elif self.disaggregation_mode == "encode":
+            # Encode-only server runs the vision tower only: no LM forward, no
+            # KV pool, no prefix cache. The vision tower keeps its own CUDA
+            # graph, so enforce_eager is left untouched here.
+            self.enable_prefix_caching = False
+            # Build + load only the vision tower; never construct/load the LM so
+            # a full ViT fits on one GPU at encode TP=1. Single source of truth
+            # for the vision-only role.
+            self.vision_tower_only = True
 
         # Prefill graph disable logic is handled by AttnInitializer.modify_args
         # after the attention backend is resolved.
@@ -598,9 +612,12 @@ class ServerArgs:
             ), f"Not Supported when {self.disaggregation_mode=} {self.load_balance_method=} {self.mapping.attn.dp_size=}"
 
     def _handle_kvstore(self):
-        if self.disaggregation_mode == "decode":
+        if self.disaggregation_mode in ("decode", "encode"):
             self.enable_kvstore = False
-            logger.info("Decode instance has set enable_kvstore to False!")
+            logger.info(
+                "%s instance has set enable_kvstore to False!",
+                self.disaggregation_mode,
+            )
         elif not self.disable_kvstore:
             self.enable_kvstore = True
 
@@ -1735,8 +1752,8 @@ class ServerArgs:
             "--disaggregation-mode",
             type=str,
             default="null",
-            choices=["null", "prefill", "decode"],
-            help='Only used for PD disaggregation. "prefill" for prefill-only server, and "decode" for decode-only server. If not specified, it is not PD disaggregated',
+            choices=["null", "prefill", "decode", "encode"],
+            help='Used for PD/EPD disaggregation. "prefill" for prefill-only server, "decode" for decode-only server, and "encode" for a vision-tower-only server that ships image embeddings to a prefill server. If not specified, it is not disaggregated',
         )
         parser.add_argument(
             "--comm-fusion-max-num-tokens",

@@ -50,6 +50,7 @@ class BaseCausalLM(nn.Module):
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        vision_tower_only: bool = False,
     ) -> None:
 
         super().__init__()
@@ -58,9 +59,19 @@ class BaseCausalLM(nn.Module):
         self.quant_config = quant_config
         self.capture_aux_hidden_states: bool = False
 
-        self.model = self.resolve_model(config, mapping, quant_config, prefix)
-        self.lm_head = self.resolve_lm_head(config, quant_config, prefix)
-        self.logits_processor = self.resolve_logits_processor(config)
+        self.vision_tower_only = vision_tower_only
+        if vision_tower_only:
+            # Vision-only role (EPD encode): never allocate the LM / lm_head /
+            # logits processor (the LM allocation is the OOM at encode TP=1).
+            # self.config is already set above for the vision path
+            # (separate_deepstack_embeds needs self.config.hidden_size).
+            self.model = None
+            self.lm_head = None
+            self.logits_processor = None
+        else:
+            self.model = self.resolve_model(config, mapping, quant_config, prefix)
+            self.lm_head = self.resolve_lm_head(config, quant_config, prefix)
+            self.logits_processor = self.resolve_logits_processor(config)
         self.post_init()
 
     def resolve_model(

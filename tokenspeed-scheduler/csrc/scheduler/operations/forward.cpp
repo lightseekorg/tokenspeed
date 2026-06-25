@@ -613,16 +613,43 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
                 }
             }
         } else if (request->Is<fsm::PrefillDone>() || (request->Is<fsm::Decoding>() && config_.role != Role::kP)) {
-            // If mixed-batch is disabled, skip ALL decode if any prefill was scheduled this round.
-            // If mixed-batch is enabled, the priority sort puts decodes first, so this
-            // branch is reached before any prefill push.
-            if (!config_.enable_mixed_prefill_decode && pushed_prefill) break;
+            // Mixed-batch disabled: a P/Fused instance must not emit a genuinely
+            // mixed (extend+decode) op to the model, so it stops scheduling decode
+            // once a prefill was pushed. kD is the exception: its "prefill" pushes
+            // are KV-receive extends that never reach the model forward, and
+            // push_op does NOT charge token_budget for kD, so we DO want to also
+            // schedule the ready decodes this cycle. The resulting combined op is
+            // split in Python: the extend rows drive the RDMA receive, the
+            // decode_only() projection (num_extends==0) drives the model forward.
+            if (!config_.enable_mixed_prefill_decode && pushed_prefill && config_.role != Role::kD) {
+                break;
+            }
+
+            // kD: a PrefillDone request whose bootstrap token has not yet been
+            // written into the TokenContainer (GetLastToken()==-1) is not ready to
+            // decode. applyEventAndGenerateOp would set decode_input_id = -1
+            // (forward.cpp ~491/497), and once that decode runs on the same cycle a
+            // receive completes the -1 token id hits the embedding gather -> CUDA
+            // index-out-of-bounds. Defer it: it stays PrefillDone and is re-scheduled
+            // a later cycle once RemotePrefillDoneEvent has extended the container.
+            // GetLastToken() is replicated FSM state, so every TP rank skips the same
+            // request (no divergent per-rank op -> no NCCL deadlock). Legacy path is
+            // unaffected: there decode was already scheduled a cycle after PrefillDone,
+            // by when GetLastToken() is valid, so this guard never fires.
+            if (config_.role == Role::kD && request->Is<fsm::PrefillDone>() &&
+                request->GetLastToken() == -1) {
+                continue;
+            }
 
             if (auto ev = scheduleDecode(request, simulated_free)) {
                 push_op(applyEventAndGenerateOp(request, *ev));
             }
         } else if (request->Is<fsm::Retracted>() && config_.role != Role::kP) {
-            if (!config_.enable_mixed_prefill_decode && pushed_prefill) break;
+            // Same kD exception as the decode branch above: a receive-extend cycle
+            // may also recover and forward retracted decodes.
+            if (!config_.enable_mixed_prefill_decode && pushed_prefill && config_.role != Role::kD) {
+                break;
+            }
 
             if (auto ev = scheduleDecodeFromRetracted(request, simulated_free)) {
                 std::vector<TreeNode*> loadback_diff = ev->GetLoadbackDiff();

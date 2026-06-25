@@ -1,0 +1,829 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+from __future__ import annotations
+
+"""EPD prefill-side receive glue: fill each multimodal item's ``encoded``
+tensor from the Mooncake transfer instead of running the vision tower.
+
+This is the exact inverse of ``encode_executor.assign_encoded_embeddings``: the
+encode worker row-split the tower output per item and column-split the deepstack
+half; here the prefill allocates a receive buffer sized to each item's post-merge
+token count (and deepstack width), registers it with that item's encode worker
+via :class:`MooncakeEmbeddingReceiver`, waits for the push, and assigns the
+result onto ``item.encoded`` / ``item.encoded_deepstack`` -- the ``skip-ViT``
+form the prefill ``VisionEmbedder`` already consumes (it never re-encodes an item
+whose ``encoded`` is already set).
+
+The buffer-sizing + assignment here is the silent-corruption-risk part (wrong
+token count or deepstack width would mis-size the RDMA target), so it is isolated
+and unit-testable on CPU with a fake receiver.
+
+The receive is structured as a POLL-DRIVEN state machine
+(:class:`EmbeddingReceiveJob`): ``start()`` does only the non-blocking Phase-1
+allocation + receiver construction (it must NEVER block the prefill event loop),
+and ``poll()`` advances every receiver Bootstrapping->Bootstrapped->(pre_alloc)
+->Success a little each cycle, publishing ``item.encoded`` only once EVERY
+handshaked item has landed. The scheduler holds the job per request and does not
+admit the request to a prefill forward until ``poll()`` returns ``DONE`` -- so a
+request blocked on its (possibly multi-worker, per-item) transfers no longer
+serializes the whole prefill engine; other ready requests prefill meanwhile.
+
+``receive_encoded_embeddings`` is preserved as a thin BLOCKING wrapper on top of
+the job (start + spin poll), so existing CPU tests and any synchronous caller
+keep working unchanged. New event-loop wiring should drive the job directly.
+"""
+
+import logging
+import os
+import time
+from collections import deque
+from typing import Any, Callable, List, Mapping, Optional, Sequence, Tuple
+
+import torch
+
+logger = logging.getLogger(__name__)
+
+from tokenspeed.runtime.disaggregation.base.poll import TransferPoll
+from tokenspeed.runtime.disaggregation.embedding.embedding_transfer import (
+    MooncakeEmbeddingReceiver,
+)
+from tokenspeed.runtime.multimodal.embedder import _item_token_count
+from tokenspeed.runtime.multimodal.inputs import MultimodalDataItem
+
+# (manager, bootstrap_addr, bootstrap_room) -> receiver. Defaults to the real
+# MooncakeEmbeddingReceiver; overridden in tests with a fake.
+ReceiverFactory = Callable[[Any, str, int], Any]
+
+# poll() return values (the per-job lifecycle status, distinct from the
+# per-receiver Poll status it aggregates).
+PENDING = "pending"
+DONE = "done"
+FAILED = "failed"
+
+# Deregistering a receive MR the moment its Success notif arrives races the
+# responder NIC's DMA placement tail: the encode side's transfer_sync CQE (and
+# thus the Success frame) only guarantees the transport-level ACK, not that the
+# last bytes have cleared the HCA->PCIe placement pipeline on THIS host. Under
+# load that tail stretches to milliseconds, the immediate deregister lands mid
+# placement, and the QP dies with `local access violation work queue error`
+# (observed at ~2-3% of images at >10 req/s; each kill forces a session
+# re-establish and a visible throughput dip). So deregistration is DEFERRED:
+# entries hold the tensor ref (the allocator therefore cannot reuse the address
+# while it is still registered, preserving the no-double-register invariant)
+# and are swept once the grace period has passed. Sweeps piggyback on job
+# construction and poll(), both on the scheduler loop, so no extra thread and
+# no lock are needed.
+_DEREG_DELAY_S = float(os.environ.get("EPD_RECV_DEREG_DELAY_S", "0.5"))
+# (due_monotonic, engine, [(tensor, ptr), ...]) in due order (delay is constant).
+_pending_dereg: deque = deque()
+
+
+def _lazy_deregister(engine: Any, tensors: List[Tuple[torch.Tensor, int]]) -> None:
+    _pending_dereg.append((time.monotonic() + _DEREG_DELAY_S, engine, tensors))
+    _sweep_deregister()
+
+
+def _sweep_deregister() -> None:
+    now = time.monotonic()
+    while _pending_dereg and _pending_dereg[0][0] <= now:
+        _, engine, tensors = _pending_dereg.popleft()
+        for _tensor, ptr in tensors:
+            try:
+                engine.deregister(ptr)
+            except Exception:  # noqa: BLE001 -- best-effort; worst case the MR leaks
+                pass
+
+
+class _RecvBufferPool:
+    """Pre-registered, lifetime-stable receive slots for E->P embedding lands.
+
+    Root cause this kills (mode-2): with per-request buffers, deregistering and
+    re-registering a recycled allocator address mints a NEW rkey for the same
+    address range, but the encode side's Mooncake segment cache keeps resolving
+    that range to the OLD rkey until a transfer fails -- every reuse risks an
+    `local access violation work queue error` that kills the QP and rides the
+    retry path. The pool registers ONE region for the engine's lifetime, so the
+    sender's cached mapping can never go stale; requests lease slots, the
+    publish path clones the landed rows out (~0.05ms for 100MB on B200), and
+    the slot returns immediately.
+
+    Failure path: a FAILED job may still have an in-flight remote write
+    targeting its slot. Under a single lifetime MR that write would land
+    SILENTLY in the next tenant's data (no violation to save us), so failed
+    slots sit in quarantine until the transfer layer's own timeouts have long
+    expired (EPD_RECV_POOL_QUARANTINE_S).
+
+    Single-threaded by design: all callers run on the scheduler loop, matching
+    the rest of this module (no locks).
+    """
+
+    def __init__(self, engine: Any, device: Any, slot_bytes: int, n_slots: int):
+        self.engine = engine
+        self.slot_bytes = slot_bytes
+        self.buf = torch.empty(n_slots * slot_bytes, dtype=torch.uint8, device=device)
+        engine.register(self.buf.data_ptr(), self.buf.numel())
+        self._free = list(range(n_slots))
+        self._quarantine: deque = deque()  # (release_due_monotonic, slot)
+
+    def lease(self, nbytes: int) -> Optional[int]:
+        now = time.monotonic()
+        while self._quarantine and self._quarantine[0][0] <= now:
+            self._free.append(self._quarantine.popleft()[1])
+        if nbytes > self.slot_bytes or not self._free:
+            return None
+        return self._free.pop()
+
+    def view(self, slot: int, nbytes: int, dtype: torch.dtype, shape) -> torch.Tensor:
+        off = slot * self.slot_bytes
+        return self.buf[off : off + nbytes].view(dtype).reshape(shape)
+
+    def release(self, slot: int) -> None:
+        self._free.append(slot)
+
+    def quarantine(self, slot: int, delay_s: float) -> None:
+        self._quarantine.append((time.monotonic() + delay_s, slot))
+
+
+# (id(engine), str(device)) -> _RecvBufferPool | False (False = disabled).
+_POOLS: dict = {}
+
+
+def _get_pool(engine: Any, device: Any) -> Optional[_RecvBufferPool]:
+    key = (id(engine), str(device))
+    pool = _POOLS.get(key)
+    if pool is None:
+        n_slots = int(os.environ.get("EPD_RECV_POOL_SLOTS", "16"))
+        slot_mb = int(os.environ.get("EPD_RECV_POOL_SLOT_MB", "256"))
+        if n_slots <= 0 or slot_mb <= 0:
+            pool = False
+        else:
+            pool = _RecvBufferPool(engine, device, slot_mb << 20, n_slots)
+            logger.info(
+                "EPD recv pool up: %d slots x %d MB (lifetime MR)", n_slots, slot_mb
+            )
+        _POOLS[key] = pool
+    return pool or None
+
+
+def shard_rows(span: int, shard_rank: int, shard_size: int) -> tuple[int, int]:
+    """Balanced contiguous row shard of ``span`` rows across ``shard_size``
+    ranks: returns this rank's ``(row_start, row_count)``. The first
+    ``span % shard_size`` ranks get one extra row; shards tile ``[0, span)``
+    disjointly and in rank order, which BOTH sides of the transfer (the
+    receiver's pre_alloc and the post-receive reassembly) must derive from this
+    one function so their geometry can never diverge. ``row_count`` may be 0
+    when ``span < shard_size`` (tiny images)."""
+    base, rem = divmod(span, shard_size)
+    start = shard_rank * base + min(shard_rank, rem)
+    count = base + (1 if shard_rank < rem else 0)
+    return start, count
+
+
+class _ItemReceive:
+    """Per-item receive bookkeeping for one :class:`EmbeddingReceiveJob`.
+
+    Holds the single ``[n_tokens, hidden]`` receive buffer (+ optional deepstack
+    column buffer) and one receiver per owned image, each targeting a contiguous
+    row sub-range of that buffer. The buffers are filled in place by the encode
+    side's RDMA writes; this object publishes them onto the item only once every
+    one of its receivers reaches ``Success`` (handled by the owning job).
+    """
+
+    __slots__ = (
+        "item",
+        "recv_main",
+        "recv_deepstack",
+        "receivers",
+        "pre_alloced",
+        "main_slice_ptrs",
+        "deepstack_slice_ptrs",
+        "spans",
+        "row_starts",
+        "row_counts",
+        "sharded",
+        "n_tokens",
+        "hidden",
+        "pool",
+        "pool_slot",
+    )
+
+    def __init__(
+        self,
+        item: MultimodalDataItem,
+        recv_main: torch.Tensor,
+        recv_deepstack: Optional[torch.Tensor],
+        receivers: List[Any],
+        main_slice_ptrs: List[int],
+        deepstack_slice_ptrs: List[int],
+        spans: List[int],
+        row_starts: List[int],
+        row_counts: List[int],
+        sharded: List[bool],
+        n_tokens: int,
+        hidden: int,
+        pool: Optional[_RecvBufferPool] = None,
+        pool_slot: Optional[int] = None,
+    ):
+        self.item = item
+        self.recv_main = recv_main
+        self.recv_deepstack = recv_deepstack
+        self.receivers = receivers
+        self.pool = pool
+        self.pool_slot = pool_slot
+        # Lazy-pre_alloc latch, one per receiver (index-aligned): each receiver's
+        # pre_alloc must be issued exactly once, AFTER it reports Bootstrapped, and
+        # never again (a second pre_alloc would double-register the transfer).
+        self.pre_alloced = [False] * len(receivers)
+        self.main_slice_ptrs = main_slice_ptrs
+        self.deepstack_slice_ptrs = deepstack_slice_ptrs
+        self.spans = spans
+        # Per-image shard geometry (index-aligned with receivers/spans): this
+        # rank's row sub-range WITHIN the image, and whether the image was
+        # sharded at all (identity images need no reassembly broadcast).
+        self.row_starts = row_starts
+        self.row_counts = row_counts
+        self.sharded = sharded
+        self.n_tokens = n_tokens
+        self.hidden = hidden
+
+
+class EmbeddingReceiveJob:
+    """Poll-driven, non-blocking EPD embedding receive for ONE request.
+
+    Usage (driven by the scheduler/event loop):
+
+        job = start_embedding_receive(items, manager, ...)
+        # ... each cycle, until DONE/FAILED:
+        status = job.poll()        # PENDING | DONE | FAILED
+
+    ``start()`` (the constructor) runs Phase-1 only: it sizes + allocates each
+    handshaked item's receive buffer, registers it with the Mooncake engine, and
+    constructs one :class:`MooncakeEmbeddingReceiver` on the item's room (the
+    receiver's own ``__init__`` performs the bootstrap handshake). It does NOT
+    wait for any transfer and does NOT call ``pre_alloc`` -- that is deferred to
+    ``poll()``, which issues each ``pre_alloc`` lazily once its receiver reports
+    Bootstrapped and then waits (across cycles, never blocking) for Success.
+
+    HARD CONSTRAINT preserved: one room/receiver PER ITEM. A single request's
+    items may be served by DIFFERENT encode workers, so collapsing to one
+    receiver per request is not possible. ``poll()`` returns DONE only when every
+    item's receiver is Success.
+
+    Buffer lifetime: by default the receive target is a leased slot from the
+    lifetime-registered :class:`_RecvBufferPool`; on DONE the landed rows are
+    cloned onto ``item.encoded`` and the slot returns immediately (no MR churn,
+    see the pool docstring). Deepstack models, oversized items, pool
+    exhaustion, or ``EPD_RECV_POOL_SLOTS=0`` fall back to a per-request
+    buffer registered on start and lazily deregistered after publish. The GPU
+    cost per request is roughly ``n_tokens * hidden * dtype.itemsize`` (plus
+    ``* (1 + num_deepstack)`` with deepstack); the caller should cap the
+    number of in-flight jobs accordingly.
+
+    Idempotent re-`start`/poll: items whose ``item.encoded`` is already set
+    (chunked prefill re-runs the receive per Path-4 forward on the same item) are
+    SKIPPED at start time -- no receiver is constructed for them.
+    """
+
+    def __init__(
+        self,
+        items: Sequence[MultimodalDataItem],
+        manager: Any,
+        *,
+        hidden: int,
+        num_deepstack: int,
+        dtype: torch.dtype,
+        device: torch.device | str,
+        receiver_factory: Optional[ReceiverFactory] = None,
+        shard_rank: int = 0,
+        shard_size: int = 1,
+    ):
+        self.manager = manager
+        self.hidden = hidden
+        self.num_deepstack = num_deepstack
+        # Row sharding across the attn-TP group: with shard_size > 1 this rank
+        # registers only its shard_rows() sub-range of each image; after the
+        # rank-agreed DONE the caller MUST run reassemble() (rank-lockstep) to
+        # rebuild the full rows before any forward consumes item.encoded.
+        # shard_size <= 1 reproduces today's full-copy behavior exactly.
+        self._shard_rank = shard_rank
+        self._shard_size = shard_size
+        # Keep the torch.dtype for buffer allocation (exactly as the old sync path
+        # did, so no dtype is lost in a string round-trip); the string is only the
+        # encode-side wire contract carried in pre_alloc.
+        self.dtype = dtype
+        self.dtype_str = str(dtype)
+        self._factory: ReceiverFactory = receiver_factory or MooncakeEmbeddingReceiver
+        # Terminal latch: once DONE/FAILED, poll() is a cheap no-op returning it
+        # (the receivers/buffers have been torn down).
+        self._status: str = PENDING
+
+        # Phase 1 (non-blocking): for each item carrying an encode handshake
+        # (``item.encode_handshake``), allocate ONE [n_tokens, hidden] buffer
+        # (+ deepstack columns), register it with the Mooncake engine, and build a
+        # single receiver on the item's room. The handshake lives ON the item, so
+        # there is no request-global image index to map: the gateway splits the mm
+        # payload one item per image and mints one room per item, and the encode
+        # worker row-splits the concatenated-subgrid embedding per item -- so one
+        # item == one room == one embedding.
+        self._items: List[_ItemReceive] = []
+        for item in items:
+            handshake = getattr(item, "encode_handshake", None)
+            if handshake is None:
+                # No EPD-routed embedding on this item; leave it for the tower.
+                continue
+
+            # Chunked prefill re-runs the receive per Path-4 forward on the SAME
+            # item object; ``item.encoded`` is set only after the item reaches
+            # Success, so ``encoded is not None`` means fully received -- skip it.
+            # Re-bootstrapping a room already at Success would never re-report
+            # Bootstrapped, so this avoids a stuck job. Mirrors ``VisionEmbedder``,
+            # which never re-encodes an encoded item.
+            if item.encoded is not None:
+                continue
+
+            self._items.append(self._start_item(item, handshake, device))
+
+        # Nothing to receive (text-only / all-already-encoded / no EPD item):
+        # the job is immediately DONE so the scheduler admits the request at once.
+        if not self._items:
+            self._status = DONE
+
+    def _start_item(
+        self,
+        item: MultimodalDataItem,
+        handshake: Mapping[str, Any],
+        device: torch.device | str,
+    ) -> _ItemReceive:
+        """Allocate + register one item's receive buffer and construct its single
+        receiver on the item's room, recording the (possibly sharded) destination
+        row range so ``poll()`` can lazily issue ``pre_alloc`` once the receiver
+        bootstraps. Does NOT block on any transfer (no ``_wait``, no ``pre_alloc``
+        here).
+
+        One room per item: the encode worker concatenates the item's subgrid
+        tokens into a single ``[n_tokens, hidden]`` embedding and row-splits it per
+        prefill TP rank, so the receive geometry spans the item's FULL token count
+        (sum of its offset spans), not per offset.
+        """
+        elt = torch.empty(0, dtype=self.dtype).element_size()
+
+        # The item's image spans all its concatenated subgrid tokens.
+        span = _item_token_count(item)
+        addr = f"{handshake['bootstrap_host']}:{handshake['bootstrap_port']}"
+        # The receiver __init__ performs the bootstrap handshake (HTTP /route fetch
+        # + endpoint registration); on return its poll() is already Bootstrapped or
+        # Failed. We do NOT pre_alloc here -- poll() does it once Bootstrapped,
+        # keeping start() free of the per-transfer wait.
+        receiver = self._factory(self.manager, addr, int(handshake["bootstrap_room"]))
+
+        # Row sharding across the attn-TP group: this rank registers only its
+        # shard_rows() sub-range of the item, or the full image when sharding is
+        # off (shard_size == 1).
+        is_sharded = self._shard_size > 1
+        if is_sharded:
+            row_start, row_count = shard_rows(span, self._shard_rank, self._shard_size)
+        else:
+            row_start, row_count = 0, span
+        # Length-1 per-image lists so poll()/_packed_to_full()/reassemble() iterate
+        # unchanged (one item == one image under per-item rooms).
+        receivers: List[Any] = [receiver]
+        spans: List[int] = [span]
+        row_starts: List[int] = [row_start]
+        row_counts: List[int] = [row_count]
+        sharded: List[bool] = [is_sharded]
+
+        # The RECEIVE buffer holds only THIS rank's shard rows, packed contiguously
+        # (image i at rows [packed_cursor, packed_cursor + row_count)); the FULL
+        # embedding is rebuilt later in item.encoded (publish scatter + reassemble),
+        # which needs no MR. Sizing + registering just the shard rows -- not the
+        # full image -- is the win: with row-sharding a prefill TP rank receives
+        # only 1/shard_size of the rows, so a full-image buffer wastes
+        # (shard_size-1)/shard_size of the registration and, worse, can overflow
+        # the lifetime recv pool's slot for a big K2.5 multi-image item, forcing it
+        # onto the per-request register_memory fallback (GIL-held). When NOTHING is
+        # sharded, packed_tokens == full_tokens and the buffer is byte-identical to
+        # the pre-change full layout.
+        full_tokens = _item_token_count(item)
+        packed_tokens = sum(row_counts)
+        nbytes = packed_tokens * self.hidden * elt
+        pool = None
+        pool_slot = None
+        recv_main = None
+        if self.num_deepstack == 0:
+            # Preferred path: lease a lifetime-registered pool slot (see
+            # _RecvBufferPool for why per-request register/deregister kills
+            # QPs). Deepstack models keep the legacy path for now (a second
+            # buffer per item; out of the pool's scope).
+            pool = _get_pool(self.manager.engine, device)
+            if pool is not None:
+                pool_slot = pool.lease(nbytes)
+                if pool_slot is not None:
+                    recv_main = pool.view(
+                        pool_slot, nbytes, self.dtype, (packed_tokens, self.hidden)
+                    )
+                else:
+                    logger.info(
+                        "EPD recv pool: no slot for %d B (free=%d); falling back "
+                        "to per-request registration",
+                        nbytes,
+                        len(pool._free),
+                    )
+                    pool = None
+        if recv_main is None:
+            recv_main = torch.empty(
+                (packed_tokens, self.hidden), dtype=self.dtype, device=device
+            )
+            # Legacy fallback (pool disabled/exhausted, oversized item, or
+            # deepstack present): register per request; the deregister is
+            # DEFERRED on the publish/fail paths (lazy queue) to soften -- not
+            # eliminate -- the stale-rkey window the pool exists to remove. A
+            # 0-row packed buffer (every image's span < shard_size) has nothing
+            # to register.
+            if packed_tokens > 0:
+                self.manager.engine.register(
+                    recv_main.data_ptr(),
+                    recv_main.numel() * recv_main.element_size(),
+                )
+        recv_deepstack: Optional[torch.Tensor] = None
+        if self.num_deepstack > 0:
+            recv_deepstack = torch.empty(
+                (packed_tokens, self.hidden * self.num_deepstack),
+                dtype=self.dtype,
+                device=device,
+            )
+            if packed_tokens > 0:
+                self.manager.engine.register(
+                    recv_deepstack.data_ptr(),
+                    recv_deepstack.numel() * recv_deepstack.element_size(),
+                )
+
+        # Destination pointers into the PACKED buffer: the encode side writes its
+        # n_tokens(=row_count) source rows CONTIGUOUSLY at this pointer (it does
+        # not re-apply row_start -- that only selects which SOURCE rows to read),
+        # so a packed destination is exactly what it expects. A 0-row shard still
+        # records its (empty) pointer; its pre_alloc is the registration heartbeat
+        # the encode fanout gate counts.
+        main_slice_ptrs: List[int] = []
+        deepstack_slice_ptrs: List[int] = []
+        packed_cursor = 0
+        for row_count in row_counts:
+            main_slice_ptrs.append(
+                recv_main[packed_cursor : packed_cursor + row_count].data_ptr()
+            )
+            if recv_deepstack is not None:
+                deepstack_slice_ptrs.append(
+                    recv_deepstack[packed_cursor : packed_cursor + row_count].data_ptr()
+                )
+            else:
+                deepstack_slice_ptrs.append(0)
+            packed_cursor += row_count
+
+        return _ItemReceive(
+            item=item,
+            recv_main=recv_main,
+            recv_deepstack=recv_deepstack,
+            receivers=receivers,
+            main_slice_ptrs=main_slice_ptrs,
+            deepstack_slice_ptrs=deepstack_slice_ptrs,
+            spans=spans,
+            row_starts=row_starts,
+            row_counts=row_counts,
+            sharded=sharded,
+            n_tokens=full_tokens,
+            hidden=self.hidden,
+            pool=pool,
+            pool_slot=pool_slot,
+        )
+
+    def poll(self) -> str:
+        """Advance the receive state machine one cheap step.
+
+        For every still-pending receiver: if it just reached Bootstrapped, issue
+        its (single) ``pre_alloc`` so the encode side learns where to write; if it
+        reached Failed -> the whole job is FAILED; otherwise leave it. When EVERY
+        receiver of EVERY item is Success, deregister the buffers, publish
+        ``item.encoded`` / ``item.encoded_deepstack``, and return DONE.
+
+        Returns ``PENDING`` | ``DONE`` | ``FAILED``. Idempotent after a terminal
+        result (the buffers/receivers are gone, so it just returns the latch).
+        """
+        _sweep_deregister()
+        if self._status is not PENDING:
+            return self._status
+
+        all_success = True
+        for it in self._items:
+            for idx, receiver in enumerate(it.receivers):
+                status = receiver.poll()
+                if status == TransferPoll.Failed:
+                    self._fail()
+                    return FAILED
+                if not it.pre_alloced[idx] and status in (
+                    TransferPoll.Bootstrapped,
+                    TransferPoll.Transferring,
+                    TransferPoll.Success,
+                ):
+                    # Bootstrapped (or already further along on a fast/in-process
+                    # transport): issue the one-shot pre_alloc and latch it. Done
+                    # at most once per receiver -- a second would double-register
+                    # the transfer on the encode side. In shard mode n_tokens
+                    # carries this rank's row COUNT and the dst pointers are
+                    # already offset to the shard's first row; a row_count of 0
+                    # is still sent (it doubles as the registration heartbeat
+                    # the encode-side fanout gate counts).
+                    receiver.pre_alloc(
+                        dst_embedding_ptr=it.main_slice_ptrs[idx],
+                        n_tokens=it.row_counts[idx],
+                        hidden=it.hidden,
+                        dtype=self.dtype_str,
+                        dst_deepstack_ptr=it.deepstack_slice_ptrs[idx],
+                        has_deepstack=self.num_deepstack > 0,
+                        row_start=it.row_starts[idx],
+                        span=it.spans[idx],
+                    )
+                    it.pre_alloced[idx] = True
+                    # Re-poll once after pre_alloc: an in-process/fake transport may
+                    # flip straight to Success on pre_alloc, letting a single-image
+                    # request complete in one poll cycle.
+                    status = receiver.poll()
+                    if status == TransferPoll.Failed:
+                        self._fail()
+                        return FAILED
+                if status != TransferPoll.Success:
+                    all_success = False
+
+        if not all_success:
+            return PENDING
+
+        # Every image of every item has landed; publish and reclaim. Pooled
+        # path: clone the landed rows OUT of the slot (item.encoded must
+        # outlive the lease) and return the slot at once -- the MR stays
+        # registered for the engine's lifetime, so nothing here can stale the
+        # sender's rkey cache. Legacy path: hand the buffer itself to
+        # item.encoded and queue the registration for DEFERRED drop (the lazy
+        # entry holds the tensor ref, so the allocator cannot recycle a
+        # still-registered address).
+        for it in self._items:
+            any_sharded = any(it.sharded)
+            if it.pool is not None:
+                # Pooled path is deepstack-free. Copy the rows OUT of the slot
+                # before releasing it. When sharded the buffer is packed (this
+                # rank's rows only), so scatter them into a full-layout tensor at
+                # each image's absolute offset (reassemble fills the rest); when
+                # not sharded the buffer is already full -> clone it as before.
+                it.item.encoded = (
+                    self._packed_to_full(it, it.recv_main, self.hidden)
+                    if any_sharded
+                    else it.recv_main.clone()
+                )
+                it.item.encoded_deepstack = None
+                it.pool.release(it.pool_slot)
+            else:
+                # Legacy path. When sharded, the packed buffers are smaller than
+                # the image and cannot alias item.encoded, so build separate full
+                # tensors; when not sharded, hand the (full) buffers over directly
+                # as before.
+                if any_sharded:
+                    it.item.encoded = self._packed_to_full(
+                        it, it.recv_main, self.hidden
+                    )
+                    it.item.encoded_deepstack = (
+                        self._packed_to_full(
+                            it, it.recv_deepstack, self.hidden * self.num_deepstack
+                        )
+                        if it.recv_deepstack is not None
+                        else None
+                    )
+                else:
+                    it.item.encoded = it.recv_main
+                    it.item.encoded_deepstack = it.recv_deepstack
+                pairs = [(it.recv_main, it.recv_main.data_ptr())]
+                if it.recv_deepstack is not None:
+                    pairs.append((it.recv_deepstack, it.recv_deepstack.data_ptr()))
+                _lazy_deregister(self.manager.engine, pairs)
+        self._status = DONE
+        return DONE
+
+    def _packed_to_full(
+        self, it: "_ItemReceive", packed: torch.Tensor, width: int
+    ) -> torch.Tensor:
+        """Scatter a PACKED shard buffer (this rank's rows, image-contiguous) into
+        a full-layout ``[n_tokens, width]`` tensor, placing each image's shard at
+        its absolute row offset and leaving the non-owned rows for ``reassemble``
+        to fill. The packed buffer holds ``sum(row_counts)`` rows; the full tensor
+        holds ``sum(spans)`` rows (== n_tokens). Identity images (row_count==span,
+        row_start==0) copy whole, so a buffer with no real sharding round-trips
+        unchanged."""
+        full = torch.empty(
+            (it.n_tokens, width), dtype=packed.dtype, device=packed.device
+        )
+        packed_cursor = 0
+        full_cursor = 0
+        for span, row_start, row_count in zip(it.spans, it.row_starts, it.row_counts):
+            if row_count > 0:
+                full[full_cursor + row_start : full_cursor + row_start + row_count] = (
+                    packed[packed_cursor : packed_cursor + row_count]
+                )
+            packed_cursor += row_count
+            full_cursor += span
+        return full
+
+    def reassemble(self, nccl_group: Any, group_ranks: Sequence[int]) -> None:
+        """Rebuild full embeddings from row shards via per-image broadcasts.
+
+        Must be called RANK-LOCKSTEP on every attn-TP rank, only after the
+        rank-agreed DONE (the drain's MIN all-reduce) and BEFORE any forward
+        consumes ``item.encoded``: until then each rank's buffer holds only its
+        own shard rows, the rest is uninitialized memory. All ranks iterate the
+        identical items/images in identical order issuing identical collectives,
+        which also requires the caller to run on the NON-overlap event loop (a
+        second thread launching forward collectives concurrently would break the
+        cross-rank launch-order guarantee NCCL needs across communicators).
+
+        ``group_ranks`` is the attn-TP group as GLOBAL ranks
+        (``mapping.attn.tp_group``): ``dist.broadcast`` takes a global src rank,
+        and group rank p == global rank p only in the no-DP single-engine case.
+        Per-image sub-range broadcasts (2 x shard_size x n_images launches per
+        request); a coalesced all_gather_into_tensor variant can replace this
+        loop if launch overhead ever shows at high admission rates.
+
+        No-op for identity images and when sharding is off; safe after _fail
+        (items were dropped). Idempotence is NOT required: called exactly once
+        per admitted request by the drain.
+
+        Broadcasts target ``item.encoded`` (the PUBLISHED tensor), never
+        ``recv_main``: on the pooled path the publish step cloned the rows out
+        and RELEASED the slot, so ``recv_main`` may already belong to the next
+        tenant; on the legacy path ``item.encoded`` IS ``recv_main``, so the
+        two are equivalent there.
+        """
+        if self._shard_size <= 1 or self._status is not DONE:
+            return
+        import torch.distributed as dist
+
+        for it in self._items:
+            main = it.item.encoded
+            deep = it.item.encoded_deepstack
+            cursor = 0
+            for idx, span in enumerate(it.spans):
+                if not it.sharded[idx]:
+                    cursor += span
+                    continue
+                for p in range(self._shard_size):
+                    start, count = shard_rows(span, p, self._shard_size)
+                    if count == 0:
+                        continue
+                    src = group_ranks[p]
+                    dist.broadcast(
+                        main[cursor + start : cursor + start + count],
+                        src=src,
+                        group=nccl_group,
+                    )
+                    if deep is not None:
+                        dist.broadcast(
+                            deep[cursor + start : cursor + start + count],
+                            src=src,
+                            group=nccl_group,
+                        )
+                cursor += span
+
+    def _fail(self) -> None:
+        """Tear down on failure and drop our references. A SIBLING image's
+        write may still be in flight into the item buffer, so reclamation is
+        deferred on both paths: pooled slots go to quarantine (under the
+        lifetime MR a late write would land SILENTLY in the next tenant's
+        data), legacy buffers go to the lazy-deregistration queue.
+        ``item.encoded`` is left unset -- the request is being failed, not
+        served.
+        """
+        quarantine_s = float(os.environ.get("EPD_RECV_POOL_QUARANTINE_S", "10"))
+        for it in self._items:
+            if it.pool is not None:
+                it.pool.quarantine(it.pool_slot, quarantine_s)
+            else:
+                pairs = [(it.recv_main, it.recv_main.data_ptr())]
+                if it.recv_deepstack is not None:
+                    pairs.append((it.recv_deepstack, it.recv_deepstack.data_ptr()))
+                _lazy_deregister(self.manager.engine, pairs)
+        self._items = []
+        self._status = FAILED
+
+    @property
+    def status(self) -> str:
+        return self._status
+
+    def release(self) -> None:
+        """Best-effort teardown for an externally-driven abort.
+
+        Used when a rank-agreed FAILED is reached but THIS rank had not yet seen a
+        local Failed poll (so its buffers are still registered): free/deregister
+        them so a reused allocator address is never left double-registered.
+        Idempotent and a no-op once terminal (poll() already tore a DONE/FAILED job
+        down). After release() the job is FAILED.
+        """
+        if self._status is not PENDING:
+            return
+        self._fail()
+
+
+def start_embedding_receive(
+    items: Sequence[MultimodalDataItem],
+    manager: Any,
+    *,
+    hidden: int,
+    num_deepstack: int,
+    dtype: torch.dtype,
+    device: torch.device | str,
+    receiver_factory: Optional[ReceiverFactory] = None,
+    shard_rank: int = 0,
+    shard_size: int = 1,
+) -> EmbeddingReceiveJob:
+    """Begin (non-blocking) the per-item EPD embedding receive for one request.
+
+    See :class:`EmbeddingReceiveJob`. The handshake for each EPD-routed item
+    rides on ``item.encode_handshake`` (a dict ``{bootstrap_room, bootstrap_host,
+    bootstrap_port}``); items without one are left to the vision tower. Returns a
+    job whose ``poll()`` the caller drives every cycle until DONE/FAILED; the
+    request must not be admitted to a prefill forward before then. With
+    ``shard_size > 1`` the caller must also run ``job.reassemble()`` rank-
+    lockstep after the rank-agreed DONE, before the request's first forward.
+    """
+    return EmbeddingReceiveJob(
+        items,
+        manager,
+        hidden=hidden,
+        num_deepstack=num_deepstack,
+        dtype=dtype,
+        device=device,
+        receiver_factory=receiver_factory,
+        shard_rank=shard_rank,
+        shard_size=shard_size,
+    )
+
+
+def receive_encoded_embeddings(
+    items: Sequence[MultimodalDataItem],
+    manager: Any,
+    *,
+    hidden: int,
+    num_deepstack: int,
+    dtype: torch.dtype,
+    device: torch.device | str,
+    timeout: float = 60.0,
+    receiver_factory: Optional[ReceiverFactory] = None,
+) -> None:
+    """BLOCKING wrapper: fill ``item.encoded`` from the per-item transfers.
+
+    Preserved for existing synchronous callers and the CPU unit tests. It is the
+    poll-driven :class:`EmbeddingReceiveJob` spun to completion in place: it
+    start()s the job, then busy-polls until DONE (raising on FAILED or timeout).
+    New code on the prefill event loop should hold the job and drive ``poll()``
+    once per cycle instead, so a request blocked on its transfers does not
+    serialize the prefill engine.
+
+    The handshake for each EPD-routed item rides on ``item.encode_handshake``
+    (``{bootstrap_room, bootstrap_host, bootstrap_port}``). ``hidden`` is the main
+    embedding width, ``num_deepstack`` the deepstack level count (0 if absent),
+    and ``dtype`` must match the encode worker's tower output dtype (asserted on
+    the encode side before the unchecked RDMA write).
+    """
+    job = start_embedding_receive(
+        items,
+        manager,
+        hidden=hidden,
+        num_deepstack=num_deepstack,
+        dtype=dtype,
+        device=device,
+        receiver_factory=receiver_factory,
+    )
+    deadline = time.monotonic() + timeout
+    while True:
+        status = job.poll()
+        if status == DONE:
+            return
+        if status == FAILED:
+            raise RuntimeError("encode->prefill embedding transfer failed")
+        if time.monotonic() > deadline:
+            raise TimeoutError(
+                f"embedding receive timed out after {timeout:.1f}s "
+                f"(job still {status})"
+            )
+        time.sleep(0.0005)

@@ -151,6 +151,15 @@ def _initialize_model(
     if model_config.is_multimodal:
         extra_kwargs["is_multimodal_active"] = model_config.is_multimodal_active
         extra_kwargs["mm_attention_backend"] = model_config.mm_attention_backend
+        extra_kwargs["vision_tower_only"] = getattr(
+            model_config, "vision_tower_only", False
+        )
+    if getattr(model_config, "vision_tower_only", False):
+        # Kimi gates LM construction/weight-load on hf_config.encoder_only (a
+        # dormant vendor flag, set nowhere else). Drive it from the encode role
+        # here so the same vision_tower_only intent reaches both model families
+        # (kimi swallows **kwargs, so the extra kwarg above is harmless there).
+        model_config.hf_config.encoder_only = True
     return model_class(
         config=model_config.hf_config,
         mapping=mapping,

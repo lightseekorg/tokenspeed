@@ -18,9 +18,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Runtime cache subsystem.
+"""KV-cache (prefill->decode) disaggregation -- the PD transfer stack.
 
-This package groups KV cache data structures, allocators, storage backends,
-and cache-operation executors under one top-level domain. It also holds the
-vision-embedding cache used by the EPD encode stage (:mod:`embedding_cache`).
+Moves computed KV pages from a prefill server to a decode server over a
+pluggable transport. The shared args/poll types live in :mod:`base`, the
+backend managers in :mod:`mooncake`, the role executors in
+:mod:`prefill_executor` / :mod:`decode_executor`, and transport selection in
+:mod:`factory`. Import entry points from those submodules directly.
 """

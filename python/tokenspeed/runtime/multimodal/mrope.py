@@ -56,6 +56,12 @@ def compute_mrope_positions(hf_config, input_ids, mm_items):
     if not any(arch in _MROPE_ARCHITECTURES for arch in architectures):
         return None, None
 
+    # Concatenate per-item grids: under the itemized multimodal ABI each image is
+    # its own MultimodalItem carrying a [1, 3] grid, so the full request's grid is
+    # the cat over items ([N, 3]); get_rope_index indexes one row per image
+    # placeholder. Overwriting per item kept only the last image's [1, 3], which
+    # IndexErrors for any multi-image request (single-image happened to be correct).
+    # Mirrors the model forward path, which already cats item grids.
     image_grids = [
         item.model_specific_data["image_grid_thw"]
         for item in mm_items

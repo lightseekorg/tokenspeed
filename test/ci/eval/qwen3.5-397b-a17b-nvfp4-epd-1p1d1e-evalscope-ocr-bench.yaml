@@ -1,0 +1,35 @@
+api_version: ci.tokenspeed.io/v1
+name: eval-qwen35-397b-nvfp4-epd-1p1d1e-ocr-bench
+type: eval
+triggers:
+  - per-commit
+  - manual
+runner:
+  labels:
+    - b200-8gpu
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps.sh
+server:
+  command: >-
+    LB_HOST=127.0.0.1
+    LB_PORT=8000
+    bash test/ci_system/serve_qwen35_397b_nvfp4_epd_1p1d1e.sh
+  ready:
+    url: http://127.0.0.1:8000/v1/models
+    timeout: 2400
+    interval: 10
+eval:
+  install:
+    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
+  command: >-
+    /tmp/evalscope-perf/bin/evalscope eval
+    --model nvidia/Qwen3.5-397B-A17B-NVFP4
+    --api-url http://127.0.0.1:8000/v1
+    --api-key EMPTY_TOKEN
+    --datasets ocr_bench
+    --eval-batch-size 16
+report:
+  github_step_summary: true
+score_threshold: 0.9

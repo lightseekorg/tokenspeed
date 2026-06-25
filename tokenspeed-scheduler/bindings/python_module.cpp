@@ -342,6 +342,10 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
             },
             nb::rv_policy::reference_internal)
         .def("num_extends", &tokenspeed::FlatForwardOperation::num_extends)
+        // Pure-decode projection over the trailing decode slots (num_extends==0).
+        // Lets the kD event loop forward only the Decoding requests of a cycle
+        // that also triggered KV-receive extends, without ever building a mixed op.
+        .def("decode_only", &tokenspeed::FlatForwardOperation::decode_only, nb::rv_policy::move)
         .def_ro("mamba_pool_indices", &tokenspeed::FlatForwardOperation::mamba_working_indices)
         .def_ro("mamba_checkpoint_dst_indices", &tokenspeed::FlatForwardOperation::mamba_checkpoint_dst_indices)
         .def_ro("mamba_track_pool_indices", &tokenspeed::FlatForwardOperation::mamba_checkpoint_dst_indices)

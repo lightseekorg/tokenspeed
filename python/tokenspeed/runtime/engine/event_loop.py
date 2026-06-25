@@ -29,7 +29,7 @@ import setproctitle
 import torch
 import torch.distributed as dist
 import zmq
-from tokenspeed_scheduler import PD, Cache, ExecutionEvent, Scheduler
+from tokenspeed_scheduler import PD, Cache, ExecutionEvent, ForwardEvent, Scheduler
 
 from tokenspeed.runtime.cache.executor.memory_executor import (
     MemoryExecutor,
@@ -37,6 +37,20 @@ from tokenspeed.runtime.cache.executor.memory_executor import (
 )
 from tokenspeed.runtime.cache.transfer.types import CacheKind
 from tokenspeed.runtime.configs.model_config import ModelConfig
+from tokenspeed.runtime.disaggregation.kv.decode_executor import DisaggDecodeExecutor
+from tokenspeed.runtime.disaggregation.kv.factory import (
+    create_kv_transfer,
+    get_kv_args,
+)
+from tokenspeed.runtime.disaggregation.kv.kv_events import (
+    EventPublisherFactory,
+    KVEventBatch,
+    NullEventPublisher,
+    drain_scheduler_kv_events,
+    scheduler_kv_events_to_wire_events,
+)
+from tokenspeed.runtime.disaggregation.kv.mooncake.entities import ManagerArgs
+from tokenspeed.runtime.disaggregation.kv.prefill_executor import DisaggPrefillExecutor
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -70,20 +84,6 @@ from tokenspeed.runtime.execution.types import ModelExecutionResult
 from tokenspeed.runtime.grammar.capturable_grammar import GrammarStepInputs
 from tokenspeed.runtime.layers.attention.registry import create_attn_components
 from tokenspeed.runtime.metrics.collector import EngineMetrics
-from tokenspeed.runtime.pd.decode_executor import DisaggDecodeExecutor
-from tokenspeed.runtime.pd.factory import (
-    create_pd_kv_transfer,
-    get_kv_args,
-)
-from tokenspeed.runtime.pd.kv_events import (
-    EventPublisherFactory,
-    KVEventBatch,
-    NullEventPublisher,
-    drain_scheduler_kv_events,
-    scheduler_kv_events_to_wire_events,
-)
-from tokenspeed.runtime.pd.mooncake.entities import ManagerArgs
-from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 from tokenspeed.runtime.utils import (
     configure_logger,
@@ -231,6 +231,26 @@ class EventLoop:
         )
         self._pending_cache_event_payloads: OrderedDict[tuple[str, int], dict] = (
             OrderedDict()
+        )
+        # EPD prefill async embedding-receive staging: requests whose per-image
+        # encode->prefill embeddings are still arriving. They are registered but
+        # NOT yet submitted to the scheduler; _drain_ready_epd_embeddings polls
+        # their receive jobs each cycle and admits (rank-synced) only once ready,
+        # so a request waiting on its embeddings no longer blocks the prefill loop.
+        # Rank-identical in length+order across attn-TP ranks (recv_reqs broadcasts
+        # the new-request set), which the drain's MIN all-reduce relies on.
+        self._epd_pending: list = []
+        # Deadline for an EPD request's per-image embeddings to all arrive; past
+        # this the request is aborted (not waited on forever) -- see the timeout in
+        # _drain_ready_epd_embeddings. Reuse the SAME knob as the PD KV-receive wait
+        # (decode.py: waiting_timeout = TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT,
+        # default 300s): the prefill waiting for the encode->prefill embedding
+        # transfer is the direct analog of the decode waiting for the prefill->decode
+        # KV transfer, so one operator knob covers both disaggregation-transfer waits.
+        from tokenspeed.runtime.utils.env import envs as _envs_tl
+
+        self._epd_embed_timeout: float = float(
+            _envs_tl.TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT.get()
         )
         # All ranks submit identical cache plans (the C++ scheduler is mirrored),
         # so a local in-flight counter mirrors across ranks: if it's 0 here, no
@@ -477,7 +497,7 @@ class EventLoop:
                 metrics_reporters=server_args.metrics_reporters,
                 enable_dp_attention=self.has_dp,
             )
-            self.pd_kv_transfer = create_pd_kv_transfer(
+            self.kv_transfer = create_kv_transfer(
                 mode=server_args.disaggregation_mode,
                 backend=server_args.disaggregation_transfer_backend,
                 args=pd_manager_args,
@@ -488,22 +508,346 @@ class EventLoop:
             self._setup_pd_layerwise_transfer(
                 server_args.disaggregation_layerwise_interval
             )
+            # EPD: a multimodal prefill node is also the encode->prefill embedding
+            # SINK (independent of kv_transfer, which is its P->D KV source). It
+            # receives each image's embedding from encode workers over Mooncake so
+            # the prefill skips the vision tower. Built once per rank; None for
+            # decode/encode/text-only nodes.
+            self.embedding_manager = self._maybe_init_embedding_manager(
+                server_args, pd_manager_args, global_rank
+            )
         else:
-            self.pd_kv_transfer = None
+            self.kv_transfer = None
+            self.embedding_manager = None
+
+        # EPD embedding row-sharding: each attn-TP rank receives only 1/N of
+        # every image's rows over the wire; the full embedding is rebuilt by an
+        # NCCL all-gather in the admission drain (job.reassemble). The collective
+        # runs on the prefill's NON-overlap event loop, where the drain and the
+        # forward launch from one thread in the same order on every rank -- the
+        # cross-rank launch-order consistency NCCL requires across communicators.
+        # If the prefill ever gains an overlap loop, this must be redesigned.
+        self._epd_shard_embeddings = False
+        self._attn_tp_nccl_group = None
+        self._attn_tp_group_ranks = tuple(mapping.attn.tp_group)
+        shard_flag = False
+        if self.embedding_manager is not None and self.attn_tp_size > 1:
+            shard_flag = bool(_envs_tl.TOKENSPEED_EPD_EMBEDDING_SHARD.get())
+            # The flag is a per-process env read but gates a GROUP collective:
+            # torn across ranks (e.g. set on one node of a multi-node prefill),
+            # flag-on ranks would join the warmup broadcast below while
+            # flag-off ranks never do -- a silent boot hang. Agree first, loud.
+            flag_t = torch.tensor(
+                [int(shard_flag), -int(shard_flag)], dtype=torch.int32
+            )
+            dist.all_reduce(flag_t, op=dist.ReduceOp.MIN, group=self.attn_tp_cpu_group)
+            if flag_t[0].item() != -flag_t[1].item():
+                raise RuntimeError(
+                    "TOKENSPEED_EPD_EMBEDDING_SHARD differs across attn-TP ranks; "
+                    "set it identically on every node of the prefill engine"
+                )
+        if shard_flag:
+            self._attn_tp_nccl_group = pg_manager.get_process_group(
+                "nccl", mapping.attn.tp_group
+            )
+            self._epd_shard_embeddings = True
+            # Warm the communicator at startup: NCCL initializes lazily on the
+            # first collective, and nothing else issues torch.distributed NCCL
+            # ops on this group in the scheduler process -- without this, the
+            # FIRST admitted EPD request pays communicator init (hundreds of ms,
+            # all ranks) inside the drain, and a misconfigured group would
+            # surface on a customer request instead of at boot.
+            warmup = torch.zeros(1, device=self.model_executor.device)
+            dist.broadcast(
+                warmup,
+                src=self._attn_tp_group_ranks[0],
+                group=self._attn_tp_nccl_group,
+            )
+            torch.cuda.current_stream().synchronize()
+            logger.info(
+                "EPD embedding row-sharding enabled (attn_tp=%d, NCCL group warm)",
+                self.attn_tp_size,
+            )
 
     def _setup_pd_layerwise_transfer(self, interval: int) -> None:
-        if not isinstance(self.pd_kv_transfer, DisaggPrefillExecutor):
+        if not isinstance(self.kv_transfer, DisaggPrefillExecutor):
             return
         if interval <= 0:
             return
 
-        from tokenspeed.runtime.pd.utils import StepCounter
+        from tokenspeed.runtime.disaggregation.kv.utils import StepCounter
 
         step_counter = StepCounter(self.model_executor.device, self.gpu_id)
         self.model_executor.attn_backend.register_step_counter(step_counter)
         if self.model_executor.draft_attn_backend is not None:
             self.model_executor.draft_attn_backend.register_step_counter(step_counter)
-        self.pd_kv_transfer.register_layerwise_step_counter(step_counter, interval)
+        self.kv_transfer.register_layerwise_step_counter(step_counter, interval)
+
+    def _maybe_init_embedding_manager(self, server_args, pd_manager_args, global_rank):
+        """Stand up the EPD encode->prefill embedding sink, if applicable.
+
+        Only a multimodal *prefill* node receives embeddings from encode workers.
+        The manager is built dp_size=1 (process-DP; the embedding transport allows
+        prefill_tp = any multiple of encode_tp), matching the encode side's
+        EmbeddingManagerArgs, and with
+        no fixed base buffer (embedding_data_ptr=0) since receive buffers are
+        allocated per image at receive time. Construction spawns a daemon status
+        thread, so it is created exactly once per rank here. Returns None for
+        decode/encode/text-only nodes (they never receive embeddings).
+        """
+        if server_args.disaggregation_mode != "prefill":
+            return None
+        if not self.model_config.is_multimodal_active:
+            return None
+
+        from tokenspeed.runtime.disaggregation.embedding.conn import (
+            EmbeddingManagerArgs,
+        )
+        from tokenspeed.runtime.disaggregation.embedding.embedding_transfer import (
+            EmbeddingArgs,
+            MooncakeEmbeddingManagerPrefill,
+        )
+
+        emb_mgr_args = EmbeddingManagerArgs(
+            bootstrap_port=pd_manager_args.bootstrap_port,
+            world_size=pd_manager_args.world_size,
+            dp_size=1,
+        )
+        emb_args = EmbeddingArgs(
+            engine_rank=global_rank,
+            gpu_id=global_rank,
+            ib_device=server_args.disaggregation_ib_device,
+            embedding_data_ptr=0,
+            embedding_data_len=0,
+        )
+        return MooncakeEmbeddingManagerPrefill(emb_mgr_args, emb_args)
+
+    def _is_epd_request(self, state) -> bool:
+        """True iff this is an EPD-routed multimodal request on the prefill node:
+        the embedding manager exists (multimodal prefill node) and smg injected
+        per-image encode handshakes. Such requests must wait for their embeddings
+        (async, via _epd_pending) before being scheduled; everything else
+        (text-only, decode/encode nodes) admits immediately.
+        """
+        mm = getattr(state, "multimodal_inputs", None)
+        return (
+            self.embedding_manager is not None
+            and mm is not None
+            and any(getattr(it, "encode_handshake", None) for it in mm.mm_items)
+        )
+
+    def _start_epd_receive(self, state):
+        """Begin the non-blocking per-image embedding receive for an EPD request.
+
+        Returns the EmbeddingReceiveJob; the request is staged in _epd_pending and
+        only submitted to the scheduler once the job polls DONE. Mirrors the args
+        the synchronous _maybe_receive_epd_embeddings used, but driven by poll().
+        """
+        from tokenspeed.runtime.disaggregation.embedding.prefill_receiver import (
+            start_embedding_receive,
+        )
+
+        model = self.model_executor.model_runner.model
+        return start_embedding_receive(
+            items=state.multimodal_inputs.mm_items,
+            manager=self.embedding_manager,
+            hidden=model.config.hidden_size,
+            num_deepstack=getattr(model, "num_deepstack_embeddings", 0),
+            dtype=(getattr(model, "visual", None) or model.vision_tower).dtype,
+            device=self.model_executor.device,
+            shard_rank=self.attn_tp_rank,
+            shard_size=self.attn_tp_size if self._epd_shard_embeddings else 1,
+        )
+
+    def _drain_ready_epd_embeddings(self) -> None:
+        """Poll staged EPD embedding receives; admit (or abort) ready ones.
+
+        Called every prefill-loop cycle right after _process_new_requests. Each
+        staged job's poll() advances its per-image receivers (lazy pre_alloc on
+        Bootstrapped, publish item.encoded on all-Success). The per-request status
+        is MIN-reduced across attn-TP ranks (FAILED=0 < PENDING=1 < DONE=2) over the
+        gloo group, so all ranks admit/abort a request on the SAME cycle and build
+        identical scheduler batches (the committed-P1 rank-divergence trap).
+
+        - rank-agreed DONE: register the P->D sender (deferred from admission) then
+          submit_requests([spec]) (item.encoded already set this cycle by the
+          publishing poll()).
+        - rank-agreed FAILED: release the job's buffers (no-op if this rank already
+          tore down on a local Failed) and finish the request with an abort. No
+          sender was registered yet, so nothing to cancel.
+        - else: leave it staged.
+        """
+        if not self._epd_pending:
+            return  # rank-identical emptiness -> all ranks skip the collective
+
+        from tokenspeed.runtime.disaggregation.embedding.prefill_receiver import (
+            DONE,
+            FAILED,
+            PENDING,
+        )
+
+        code_of = {FAILED: 0, PENDING: 1, DONE: 2}
+        codes = [code_of[job.poll()] for (_s, _st, _b, job, _t0) in self._epd_pending]
+
+        # Timeout: a still-PENDING request whose per-image embeddings have not all
+        # arrived within the deadline is marked FAILED (-> rank-agreed abort below).
+        # Without this the prefill waits FOREVER if an embedding is ever lost (a
+        # degraded/dead encode worker, a network drop) -- a deadlock. The old
+        # synchronous receive had a 60s timeout; the poll-driven path must too.
+        # Folded into the SAME MIN all-reduce: a timed-out job -> code 0 -> all ranks
+        # abort it together; union-of-timeout is rank-safe even if ranks cross the
+        # deadline a cycle apart (any rank's 0 propagates via MIN).
+        _now = time.time()
+        for _i in range(len(self._epd_pending)):
+            if (
+                codes[_i] == 1
+                and (_now - self._epd_pending[_i][4]) > self._epd_embed_timeout
+            ):
+                codes[_i] = 0
+                logger.warning(
+                    "EPD embedding receive timed out after %.0fs for rid=%s; aborting",
+                    self._epd_embed_timeout,
+                    self._epd_pending[_i][0].request_id,
+                )
+
+        if self.attn_tp_size > 1:
+            t = torch.tensor(codes, dtype=torch.uint8, device="cpu")
+            dist.all_reduce(t, op=dist.ReduceOp.MIN, group=self.attn_tp_cpu_group)
+            codes = t.tolist()
+
+        admitted_specs = []
+        leftover = []
+        for (spec, state, bootstrap, job, start_ts), code in zip(
+            self._epd_pending, codes
+        ):
+            if code == 2:  # DONE on every rank
+                # Sharded receive: rebuild the full rows from the per-rank
+                # shards FIRST -- item.encoded is shard-only until this runs.
+                # Rank-lockstep-safe here: codes are identical post-MIN and
+                # _epd_pending is rank-identical in length/order, so every rank
+                # issues the identical collectives in identical order this cycle.
+                if self._epd_shard_embeddings:
+                    job.reassemble(self._attn_tp_nccl_group, self._attn_tp_group_ranks)
+                # Register the P->D sender now (deferred from admission) -- the
+                # request is about to enter the scheduler, so its BootstrappedEvent
+                # will have a request to apply to.
+                if self.kv_transfer is not None:
+                    self.kv_transfer.register(spec.request_id, bootstrap)
+                admitted_specs.append(spec)
+            elif (
+                code == 0
+            ):  # FAILED/timed-out on some rank -> abort everywhere this cycle
+                job.release()
+                # Signal the dual-dispatched decode that this request failed, so its
+                # KV receiver fails (FailedEvent -> _process_pd_events abort) instead
+                # of waiting forever for KV the prefill will never send. The prefill
+                # never registered a P->D sender (deferred to admission), so the decode
+                # has no other reliable way to learn (its heartbeat only trips on a
+                # dead prefill /health). Best-effort: only reaches decodes that already
+                # pre-allocated for the room.
+                if (
+                    isinstance(self.kv_transfer, DisaggPrefillExecutor)
+                    and bootstrap is not None
+                ):
+                    try:
+                        self.kv_transfer.abort(spec.request_id, bootstrap)
+                    except (
+                        Exception
+                    ) as exc:  # never let a signal failure wedge the drain
+                        logger.warning(
+                            "EPD abort->decode signal failed for rid=%s: %s",
+                            spec.request_id,
+                            exc,
+                        )
+                state.set_finish_with_abort("EPD embedding receive failed or timed out")
+                self.output_processor.publish_finished_at_admission(
+                    spec.request_id, state
+                )
+            else:  # still pending on some rank
+                leftover.append((spec, state, bootstrap, job, start_ts))
+        self._epd_pending = leftover
+
+        if admitted_specs:
+            self.scheduler.submit_requests(admitted_specs)
+        elif leftover:
+            # Nothing advanced this cycle but requests are still receiving their
+            # embeddings. The embedding manager's transfer/recv workers are PYTHON
+            # daemon threads (GIL-bound); without yielding here the prefill loop
+            # busy-spins (incl. a per-cycle TP all_reduce) and starves them, so a
+            # receive that should take ~ms drags to seconds. Yield the GIL briefly
+            # (mirrors the old synchronous _wait's sleep). Rank-consistent:
+            # `admitted_specs`/`leftover` are rank-identical after the synced drain,
+            # so all ranks sleep (or not) together.
+            time.sleep(0.0005)
+
+    def _maybe_receive_epd_embeddings(self, multimodal_context) -> None:
+        """EPD backstop: ensure item.encoded is filled for handshaked items
+        before the prefill forward runs the vision embedder.
+
+        The primary receive is the async _drain_ready_epd_embeddings, which fills
+        item.encoded BEFORE a request is admitted; by the time the forward runs
+        every handshaked item is therefore already encoded and this is a no-op for
+        them. It remains as a defensive backstop / invariant check. Triple-guarded
+        no-op for non-EPD / text-only requests: (a) no embedding manager
+        (non-prefill / non-multimodal node), (b) no multimodal context (text-only
+        batch), (c) no item carries an encode handshake (the item falls through to
+        the tower).
+        """
+
+        def _has_handshake(mm) -> bool:
+            return mm is not None and any(it.encode_handshake for it in mm.mm_items)
+
+        if (
+            self.embedding_manager is None
+            or multimodal_context is None
+            or not multimodal_context.has_extend_inputs()
+            or not any(_has_handshake(mm) for mm in multimodal_context.mm_inputs)
+        ):
+            return
+
+        from tokenspeed.runtime.disaggregation.embedding.prefill_receiver import (
+            receive_encoded_embeddings,
+        )
+
+        if self._epd_shard_embeddings:
+            # Sharded mode: this blocking backstop must never perform a real
+            # receive -- it bypasses the reassembly collective, so each rank
+            # would publish shard-only rows straight into the forward, with no
+            # rank synchronization at all. Drain-admitted requests always reach
+            # here with item.encoded set (the job skips encoded items), so a
+            # miss means a request leaked past the async admission: fail loud
+            # instead of silently corrupting. Only items that carry a handshake
+            # must be encoded -- the receive job leaves un-handshaked items to the
+            # vision tower.
+            for mm in multimodal_context.mm_inputs:
+                if not _has_handshake(mm):
+                    continue
+                missing = [
+                    i
+                    for i, item in enumerate(mm.mm_items)
+                    if item.encode_handshake is not None and item.encoded is None
+                ]
+                if missing:
+                    raise RuntimeError(
+                        "EPD sharded-embedding mode: handshaked items "
+                        f"{missing} reached the forward un-received; sharded "
+                        "requests must be admitted via _drain_ready_epd_embeddings "
+                        "(a blocking receive here would publish shard-only rows)"
+                    )
+            return
+
+        model = self.model_executor.model_runner.model
+        for mm in multimodal_context.mm_inputs:
+            if not _has_handshake(mm):
+                continue
+            receive_encoded_embeddings(
+                items=mm.mm_items,
+                manager=self.embedding_manager,
+                hidden=model.config.hidden_size,
+                num_deepstack=getattr(model, "num_deepstack_embeddings", 0),
+                dtype=(getattr(model, "visual", None) or model.vision_tower).dtype,
+                device=self.model_executor.device,
+            )
 
     def _commit_cache_results(self) -> None:
         if self.memory_executor is None:
@@ -606,7 +950,11 @@ class EventLoop:
         only in *when* they call post_process on the returned results.
 
         Path 1 — no PD:              run forward, return (results, None)
-        Path 2 — decode, extend:     trigger RDMA receive, return (None, None)
+        Path 2 — decode (kD):        pure-decode forward, return (results, None).
+                                     The KV receive for any extend rows was already
+                                     triggered upstream in
+                                     _kd_split_receive_and_decode, which replaced
+                                     forward_op with its decode-only projection.
         Path 3 — prefill, decode:    send KV to decode side, return (None, None)
         Path 4 — prefill, extend:    run prefill forward, return (results, on_first_token)
         """
@@ -625,7 +973,7 @@ class EventLoop:
 
         self.model_executor.update_block_table(forward_op)
 
-        if self.pd_kv_transfer is None:
+        if self.kv_transfer is None:
             # Path 1: normal (no disaggregation)
             self.model_executor.reset_valid_cache_length(forward_op)
             return (
@@ -642,46 +990,46 @@ class EventLoop:
                 None,
             )
 
-        elif isinstance(self.pd_kv_transfer, DisaggDecodeExecutor):
-            # Decode node
-            if forward_op.num_extends() > 0:
-                # Path 2: new requests waiting for remote KV — trigger RDMA receive
-                self.pd_kv_transfer.reset_valid_cache_length(
+        elif isinstance(self.kv_transfer, DisaggDecodeExecutor):
+            # Decode node. The KV-receive (formerly Path 2) was already triggered
+            # upstream in _kd_split_receive_and_decode, which also replaced
+            # forward_op with its pure-decode projection. So forward_op.num_extends()
+            # == 0 here and we always run the ordinary pure-decode forward (no mixed
+            # op, no MHA assert). reset_valid_cache_length handles retraction-recover
+            # decodes; update_block_table above is an idempotent re-write of the
+            # decode rows already written on the combined op.
+            self.model_executor.reset_valid_cache_length(forward_op)
+            return (
+                self.model_executor.execute_forward_op_with_log(
                     forward_op,
-                    self.model_executor.runtime_states,
-                    self.model_executor.execution_stream,
-                    self.model_executor.device,
-                )
-                self.pd_kv_transfer.execute(forward_op)
-                self.model_executor.reset_remote_prefill_mamba_inputs(forward_op)
-                return None, None
-            else:
-                # Path 3b: decode batch — normal forward
-                self.model_executor.reset_valid_cache_length(forward_op)
-                return (
-                    self.model_executor.execute_forward_op_with_log(
-                        forward_op,
-                        sampling_params_list,
-                        dp_global_num_tokens=dp_global_num_tokens,
-                        dp_global_bs=dp_global_bs,
-                        dp_all_decode_or_idle=dp_all_decode_or_idle,
-                        multimodal_context=multimodal_context,
-                        **stats,
-                    ),
-                    None,
-                )
+                    sampling_params_list,
+                    dp_global_num_tokens=dp_global_num_tokens,
+                    dp_global_bs=dp_global_bs,
+                    dp_all_decode_or_idle=dp_all_decode_or_idle,
+                    multimodal_context=multimodal_context,
+                    **stats,
+                ),
+                None,
+            )
 
         else:
             # Prefill node (only reached from event_loop, never event_loop_overlap)
-            assert isinstance(self.pd_kv_transfer, DisaggPrefillExecutor)
+            assert isinstance(self.kv_transfer, DisaggPrefillExecutor)
             if forward_op.num_extends() == 0:
                 # Path 3: all prefill done — send KV to decode side
-                self.pd_kv_transfer.execute(forward_op)
+                self.kv_transfer.execute(forward_op)
                 return None, None
             else:
                 # Path 4: extend batch — run prefill forward
                 self.model_executor.reset_valid_cache_length(forward_op)
-                self.pd_kv_transfer.prepare_prefill(forward_op)
+                self.kv_transfer.prepare_prefill(forward_op)
+                # EPD backstop: handshaked items are already filled by the async
+                # _drain_ready_epd_embeddings before admission, so this is a no-op
+                # for them (and for non-EPD / text-only requests). In sharded mode
+                # it additionally asserts no handshaked item slipped through
+                # un-received; it does NOT block the forward on a transfer in any
+                # currently-reachable config.
+                self._maybe_receive_epd_embeddings(multimodal_context)
                 return (
                     self.model_executor.execute_forward_op_with_log(
                         forward_op,
@@ -694,7 +1042,7 @@ class EventLoop:
                         capture_next_input_ids=True,
                         **stats,
                     ),
-                    self.pd_kv_transfer.store_prefill_token,
+                    self.kv_transfer.store_prefill_token,
                 )
 
     def _get_multimodal_context_for_forward(self, forward_op):
@@ -998,11 +1346,19 @@ class EventLoop:
                 )
                 continue
 
-            if isinstance(self.pd_kv_transfer, DisaggDecodeExecutor):
+            if isinstance(self.kv_transfer, DisaggDecodeExecutor):
                 state.computed_length = state.input_length
             self.output_processor.register(spec.request_id, state)
-            if self.pd_kv_transfer is not None:
-                self.pd_kv_transfer.register(spec.request_id, bootstrap)
+            is_epd = self._is_epd_request(state)
+            # EPD: DEFER the P->D sender registration to admission (in
+            # _drain_ready_epd_embeddings, just before submit_requests). Registering
+            # it now -- while the request is staged and NOT yet in the C++ scheduler
+            # -- would let DisaggPrefillExecutor.generate_events poll the sender and
+            # emit a BootstrappedEvent that the scheduler's requests_.at(rid) THROWS
+            # on (no such request yet). Non-EPD requests register now (submitted this
+            # same call).
+            if self.kv_transfer is not None and not is_epd:
+                self.kv_transfer.register(spec.request_id, bootstrap)
 
             if self.memory_executor is not None:
                 hashes = calc_l3_query_hashes(self.scheduler, spec.tokens)
@@ -1017,7 +1373,25 @@ class EventLoop:
                     )
                     spec.rolling_hashes = hashes
                     spec.storage_hit_pages = hit_pages
-            admitted_specs.append(spec)
+            # EPD prefill: hold a request whose images are encode-routed OUT of the
+            # scheduler until its per-image embeddings have been received (started
+            # here, polled in _drain_ready_epd_embeddings, which registers the P->D
+            # sender + submits once ready). It is output_processor-registered above;
+            # the sender registration + submission are both deferred. Non-EPD
+            # requests admit immediately as before. Rank-identical because `ready` is
+            # rank-synced (recv_reqs broadcast + grammar gather).
+            if is_epd:
+                self._epd_pending.append(
+                    (
+                        spec,
+                        state,
+                        bootstrap,
+                        self._start_epd_receive(state),
+                        time.time(),
+                    )
+                )
+            else:
+                admitted_specs.append(spec)
 
         # Pause gate: while paused, withhold new requests from the scheduler
         # (running requests keep stepping); buffered specs are flushed on resume
@@ -1063,13 +1437,14 @@ class EventLoop:
         self.request_handler._profile_batch_predicate(forward_mode)
 
         # post_process_forward_op calls sync() — after this, CPU tensors are ready
-        is_prefill_instance = isinstance(self.pd_kv_transfer, DisaggPrefillExecutor)
+        is_prefill_instance = isinstance(self.kv_transfer, DisaggPrefillExecutor)
         request_changes = self.output_processor.post_process_forward_op(
             forward_op,
             results,
             is_prefill_instance=is_prefill_instance,
             on_first_token=on_first_token,
         )
+
         # Accumulate decode stats from synced results (no GPU sync)
         if forward_op.num_extends() <= 0:
             bs = len(forward_op.request_ids)
@@ -1084,22 +1459,94 @@ class EventLoop:
             return None
         return forward_ops[0]
 
+    def _kd_split_receive_and_decode(self, forward_op):
+        """kD only: split a combined [extends | decodes] op into (receive, decode).
+
+        On the decode node a cycle may carry KV-receive EXTENDs in rows
+        [:num_extends] and already-Decoding requests in rows [num_extends:] (the
+        C++ scheduler now schedules decodes after extends on kD). We:
+          1. update_block_table on the COMBINED op so the extend rows' received
+             KV pages land in req_to_page. This kernel is INCREMENTAL (writes
+             only [begin:begin+size] per row), and a just-Decoding request's
+             first decode op has begin == received_pages so it never back-fills
+             the received prefill pages — only the extend row of that request
+             writes positions [0:received_pages]. Doing this on the combined op
+             (not the decode-only projection) is therefore load-bearing.
+          2. trigger the RDMA receive on the COMBINED op — decode_executor
+             reads only op.*[:num_extends] and skips any rid not in
+             self.receivers, so decode slots are untouched (SAFE).
+          3. return the pure-decode projection (num_extends()==0) for the rest of
+             the loop to forward. _dispatch_forward calls update_block_table again
+             on that op, an idempotent re-write (same begin/page IDs).
+
+        Returns the op to forward this cycle, or None when there is nothing to
+        decode (receive-only cycle == prior behavior). Non-kD ops pass through
+        unchanged so prefill / no-PD paths are bit-for-bit identical.
+        """
+        if not isinstance(self.kv_transfer, DisaggDecodeExecutor):
+            return forward_op
+        if forward_op is None or forward_op.num_extends() == 0:
+            return forward_op  # idle, or already a pure-decode op
+        # The decode rows must be post-TransferPoll.Success (their receiver was deleted
+        # in generate_events), otherwise decode_executor._prefill would index
+        # op.extend_prefix_lens[i] for a decode row and IndexError. Cheap guard
+        # against a future backend that keeps a rid past Success.
+        num_extends = forward_op.num_extends()
+        assert all(
+            rid not in self.kv_transfer.receivers
+            for rid in forward_op.request_ids[num_extends:]
+        ), "decode-slot rid still registered as a KV receiver"
+        # Write the received KV pages (extend rows) into req_to_page on the
+        # COMBINED op before triggering the receive — preserves the original
+        # update_block_table -> reset_valid_cache_length -> execute order.
+        self.model_executor.update_block_table(forward_op)
+        self.kv_transfer.reset_valid_cache_length(
+            forward_op,
+            self.model_executor.runtime_states,
+            self.model_executor.execution_stream,
+            self.model_executor.device,
+        )
+        self.kv_transfer.execute(forward_op)
+        # Re-homed from upstream's decode-node Path-2 (which this method replaced):
+        # clear the remote-prefill mamba/GDN inputs on the received rows so hybrid
+        # models don't decode off stale prefill state. Runs right after execute(),
+        # exactly as the old Path-2 did, before the same-cycle fence below.
+        self.model_executor.reset_remote_prefill_mamba_inputs(forward_op)
+        # Same-cycle barrier (kD receive cycles only). P1 runs the decode forward
+        # in the SAME cycle that sets up the KV receive (update_block_table on the
+        # COMBINED op + reset_valid_cache_length + execute), whereas the legacy
+        # path deferred the forward to a later cycle. That setup touches device
+        # state (req_to_page / valid_cache_lengths / receive registration) across
+        # the default and execution streams; the per-op stream waits inside
+        # execute_forward_op do NOT fully order it against the in-cycle decode
+        # forward, so the forward could read partially-updated state -> a
+        # nondeterministic CUDA illegal memory access (surfacing async at the next
+        # sync, e.g. the mrope delta .to(); CUDA_LAUNCH_BLOCKING=1 masks it, which
+        # is the signature of a stream race, not the bootstrap-token / -1 theory in
+        # earlier notes). Fence here so the receive-cycle setup is fully committed
+        # before the decode forward consumes it. Fires only on receive cycles
+        # (num_extends>0), so steady-state pure-decode cycles keep full overlap;
+        # cross-node TP=4 c64 still grows the decode batch to ~53 at >4000 tok/s.
+        torch.cuda.synchronize()
+        decode_op = forward_op.decode_only()
+        # num_extends()==0; empty => this was a receive-only cycle (no ready decodes).
+        return decode_op if len(decode_op.request_ids) > 0 else None
+
     def _process_pd_events(self, pd_events: list) -> list:
         processed = []
         for event in pd_events:
             processed.append(event)
             if isinstance(event, PD.SucceededEvent) and isinstance(
-                self.pd_kv_transfer, DisaggPrefillExecutor
+                self.kv_transfer, DisaggPrefillExecutor
             ):
                 req_id = event.request_id
                 processed.extend(self.output_processor.finish_prefill_request(req_id))
             elif isinstance(event, PD.RemotePrefillDoneEvent):
                 req_id = event.request_id
                 bootstrap_token = event.bootstrap_token
-
                 self.output_processor.on_remote_prefill_done(req_id, bootstrap_token)
-                if isinstance(self.pd_kv_transfer, DisaggDecodeExecutor):
-                    candidate_info = self.pd_kv_transfer.pop_remote_spec_candidate_ids(
+                if isinstance(self.kv_transfer, DisaggDecodeExecutor):
+                    candidate_info = self.kv_transfer.pop_remote_spec_candidate_ids(
                         req_id
                     )
                     if candidate_info is not None:
@@ -1107,6 +1554,25 @@ class EventLoop:
                         self.model_executor.write_remote_spec_candidate_ids(
                             req_pool_idx, candidate_ids
                         )
+            elif isinstance(event, PD.FailedEvent):
+                # A PD/EPD transfer failed: the decode KV receiver timed out (e.g. the
+                # prefill aborted on embedding timeout so the KV never arrives), or a
+                # transfer errored. The C++ scheduler's FailedEvent handler is a no-op,
+                # so without this the request is never finished and the CLIENT HANGS
+                # FOREVER (the decode is its response stream). Finish it with an abort
+                # (streams the error to the client) and abort it in the scheduler so its
+                # slot/KV is freed. AbortEvent is valid from the decode-waiting state
+                # (forward_events.cpp: AbortEvent(Prefilling&&) -> Finished).
+                req_id = event.request_id
+                state = self.output_processor.rid_to_state.get(req_id)
+                if state is not None:
+                    state.set_finish_with_abort(
+                        "PD/EPD remote transfer failed or timed out"
+                    )
+                    self.output_processor.publish_finished_at_admission(req_id, state)
+                    abort = ForwardEvent.Abort()
+                    abort.request_id = req_id
+                    processed.append(abort)
 
         return processed
 
@@ -1138,7 +1604,7 @@ class EventLoop:
 
         executes_model_forward = _forward_op_executes_model_forward(
             forward_op,
-            is_disagg_decode=isinstance(self.pd_kv_transfer, DisaggDecodeExecutor),
+            is_disagg_decode=isinstance(self.kv_transfer, DisaggDecodeExecutor),
         )
         num_tokens = sum(forward_op.input_lengths) if executes_model_forward else 0
         batch_size = len(forward_op.request_ids) if executes_model_forward else 0
@@ -1274,6 +1740,10 @@ class EventLoop:
         """Non-overlapping scheduler loop."""
         while True:
             self._process_new_requests()
+            # EPD prefill: admit requests whose async embedding receives are now
+            # complete (rank-synced). Fixed position right after _process_new_requests
+            # so the drain's TP collective ordering is rank-identical every cycle.
+            self._drain_ready_epd_embeddings()
             self._commit_cache_results()
             if self._pause.forward_blocked:
                 self._paused_idle_step()
@@ -1283,7 +1753,14 @@ class EventLoop:
             self._submit_cache_ops(execution_plan)
 
             forward_op = self._get_forward_op(execution_plan)
+            # Flush BEFORE the kD split so the retract-flush predicate (forward_op
+            # is None) sees the same combined op it saw before this change.
             self._flush_mamba_retract_states(forward_op)
+            # kD: trigger the KV receive on the extend rows and continue with the
+            # pure-decode op so this cycle still emits decode tokens. dp_sync,
+            # sampling, grammar, dispatch and commit below all then operate on the
+            # decode-only op, keeping the DP token vector == forwarded tokens.
+            forward_op = self._kd_split_receive_and_decode(forward_op)
 
             stats = self._get_scheduler_stats()
             num_iter_tokens = (
@@ -1323,8 +1800,8 @@ class EventLoop:
                         )
                     )
 
-            if self.pd_kv_transfer is not None:
-                pd_events = self.pd_kv_transfer.generate_events()
+            if self.kv_transfer is not None:
+                pd_events = self.kv_transfer.generate_events()
                 request_changes.extend(self._process_pd_events(pd_events))
 
             if request_changes:
@@ -1382,6 +1859,17 @@ class EventLoop:
         Overlapping scheduler loop: post-process the previous step's results
         while the current step's forward pass is in flight.
         """
+        # EPD invariant: the async embedding drain (_drain_ready_epd_embeddings)
+        # that admits EPD requests runs ONLY in event_loop(), never here. A
+        # prefill node that receives encode embeddings must therefore run the
+        # non-overlap loop -- should_use_overlap_schedule enforces this by forcing
+        # prefill -> non-overlap. Assert it rather than trusting that external
+        # coupling: if a prefill ever reached this loop, every EPD request would
+        # stage into _epd_pending and hang forever with no drain.
+        assert self.embedding_manager is None, (
+            "EPD prefill must run the non-overlap event_loop(); the embedding "
+            "drain is not wired into event_loop_overlap()"
+        )
         prev_results: ModelExecutionResult = None
         prev_forward_op = None
 
@@ -1408,7 +1896,13 @@ class EventLoop:
             self._submit_cache_ops(execution_plan)
 
             forward_op = self._get_forward_op(execution_plan)
+            # Flush BEFORE the kD split (see the non-overlap loop) so the
+            # retract-flush predicate sees the same combined op as before.
             self._flush_mamba_retract_states(forward_op)
+            # kD: same receive+decode split as the non-overlap loop. prev_forward_op
+            # is set to this (decode-only) op at the loop tail, so the deferred
+            # commit / post_process aligns to the sampled decode rows.
+            forward_op = self._kd_split_receive_and_decode(forward_op)
 
             stats = self._get_scheduler_stats()
             num_iter_tokens = (
@@ -1493,8 +1987,8 @@ class EventLoop:
                 )
 
             # ---- collect PD events ----
-            if self.pd_kv_transfer is not None:
-                pd_events = self.pd_kv_transfer.generate_events()
+            if self.kv_transfer is not None:
+                pd_events = self.kv_transfer.generate_events()
                 request_changes.extend(self._process_pd_events(pd_events))
 
             if request_changes:
@@ -1530,6 +2024,16 @@ def run_event_loop(
     configure_logger(server_args, prefix=prefix)
 
     try:
+        if server_args.disaggregation_mode == "encode":
+            # The encode role is LM-free; run the lightweight vision-tower loop
+            # instead of building the full EventLoop (KV/LM scheduler).
+            from tokenspeed.runtime.disaggregation.embedding.encode_loop import (
+                run_encode_loop,
+            )
+
+            run_encode_loop(server_args, port_args, pipe_writer, gpu_id, global_rank)
+            return
+
         event_loop = EventLoop(
             server_args,
             port_args,

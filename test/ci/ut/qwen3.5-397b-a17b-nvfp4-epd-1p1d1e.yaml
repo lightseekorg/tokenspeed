@@ -1,0 +1,18 @@
+api_version: ci.tokenspeed.io/v1
+name: ut-runtime-qwen35-397b-epd-1p1d1e
+type: ut
+triggers:
+  - per-commit
+  - manual
+runner:
+  labels:
+    - b200-8gpu
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps.sh
+ut:
+  commands:
+    - python3 -m pytest test/runtime/distributed/test_qwen35_397b_epd_1p1d1e.py -v -s
+report:
+  github_step_summary: true
