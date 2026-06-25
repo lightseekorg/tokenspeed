@@ -36,8 +36,6 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
-from tokenspeed.runtime.models.llama_eagle3 import LlamaForCausalLMEagle3
-from tokenspeed.runtime.models.qwen3_5_nextn import Qwen3_5ForConditionalGenerationNextN
 from tokenspeed.runtime.multimodal.inputs import maybe_substitute_mm_pad
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
@@ -249,9 +247,6 @@ class Eagle(BaseDrafter):
         # then narrow to one row per request for sampling and later MTP steps.
         reduce_first_step_catchup = bool(
             getattr(draft_model, "draft_first_step_reduce_for_catchup", False)
-        ) or isinstance(
-            draft_model,
-            (LlamaForCausalLMEagle3, Qwen3_5ForConditionalGenerationNextN),
         )
         draft_first_step_reduce = forward_mode.is_decode() or (
             reduce_first_step_catchup and not forward_mode.is_idle()
