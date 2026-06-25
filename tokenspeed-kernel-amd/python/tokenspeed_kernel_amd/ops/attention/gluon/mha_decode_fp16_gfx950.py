@@ -338,7 +338,7 @@ class AttentionProgram:
         cfg = self.cfg
         offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(1, cfg.load_layout))
         offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.load_layout))
-        token_loc = physical_page * cfg.PAGE_SIZE + offs_n
+        token_loc = physical_page.to(gl.int64) * cfg.PAGE_SIZE + offs_n.to(gl.int64)
         offsets = (
             token_loc[:, None] * cfg.NUM_KV_HEADS * cfg.HEAD_DIM
             + self.kv_head * cfg.HEAD_DIM
@@ -353,7 +353,7 @@ class AttentionProgram:
         cfg = self.cfg
         offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(1, cfg.load_layout))
         offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.load_layout))
-        token_loc = physical_page * cfg.PAGE_SIZE + offs_n
+        token_loc = physical_page.to(gl.int64) * cfg.PAGE_SIZE + offs_n.to(gl.int64)
         offsets = (
             token_loc[:, None] * cfg.NUM_KV_HEADS * cfg.HEAD_DIM
             + self.kv_head * cfg.HEAD_DIM
@@ -515,11 +515,13 @@ def _mha_decode_fp16(
     q = program.load_q()
     m_i, l_i, acc, sink_log2 = program.init_state(q_ptr, False)
 
+    physical_page = program.load_page(program.split_start)
+
     for start_n in range(program.split_start, program.split_end, cfg.BLOCK_N):
         with gl.amd.warp_pipeline_stage("load", priority=1):
-            physical_page = program.load_page(start_n)
             program.issue_load_k(physical_page, k_smem)
             program.issue_load_v(physical_page, v_smem)
+            physical_page = program.load_page(start_n + cfg.BLOCK_N)
 
         with gl.amd.warp_pipeline_stage("qk_softmax", priority=0):
             async_copy.wait_group(1)
