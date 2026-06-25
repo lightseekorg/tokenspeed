@@ -15,17 +15,21 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""FlashInfer Blackwell (sm100) gated delta net chunked prefill.
+"""FlashInfer gated delta net chunked prefill (Hopper sm90 + Blackwell sm100/sm103).
 
-Fast-path for GDN prefill on Blackwell (sm100/sm103) + CUDA 13 + bf16 +
-head_dim==128. The caller gates on ``is_supported`` and must fail fast when the
-fast-path is unavailable;
-this module has no Triton fallback.
+Fast-path for GDN prefill on bf16 + head_dim==128. flashinfer's
+``chunk_gated_delta_rule`` is a unified API that dispatches by architecture under
+the hood: a CuTe DSL kernel on Blackwell (sm100/sm103, CUDA 13) and a C++ JIT
+kernel on Hopper (sm90). Both share the same input/output conventions and are
+validated against the same reference in flashinfer's
+``tests/gdn/test_prefill_delta_rule.py``. The caller gates on ``is_supported``
+and must fail fast when the fast-path is unavailable; this module has no Triton
+fallback.
 
-Convention vs the Triton FLA path (verified equal to bf16 on B200):
-- q, k must be L2-normalized by the caller (the sm100 kernel ignores its own
+Convention vs the Triton FLA path (verified equal to bf16 on B200 and H200):
+- q, k must be L2-normalized by the caller (the kernel ignores its own
   use_qk_l2norm flag).
-- g is the FLA log-space forget gate; the sm100 kernel takes log internally, so
+- g is the FLA log-space forget gate; flashinfer takes log internally, so
   we pass alpha = exp(g).
 - beta is cast to float32 (flashinfer passes it through without casting).
 - the recurrent state is stored transposed (K<->V) vs FLA, so we transpose the
@@ -45,29 +49,43 @@ _AVAILABLE = False
 
 if current_platform().is_nvidia:
     try:
-        from flashinfer.gdn_kernels import (
-            _has_blackwell_prefill as _fi_has_blackwell_prefill,
-        )
         from flashinfer.gdn_prefill import chunk_gated_delta_rule as _fi_chunk
+
+        # flashinfer < 0.6.13 exposed `_has_blackwell_prefill` from
+        # flashinfer.gdn_kernels to tell whether the Blackwell CuTe DSL prefill
+        # kernel is present. flashinfer main removed that symbol (the kernels are
+        # now imported directly), so treat its absence as "present" -- on main
+        # the sm100 path is always available when the arch/CUDA match.
+        try:
+            from flashinfer.gdn_kernels import (
+                _has_blackwell_prefill as _fi_has_blackwell_prefill,
+            )
+        except ImportError:
+            _fi_has_blackwell_prefill = True
 
         _chunk_gated_delta_rule = _fi_chunk
         _p = current_platform()
         _cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
-        # flashinfer's gdn_prefill treats any compute-capability major 10 as the
-        # Blackwell path (sm100 B200/GB200, sm103 B300), gated on CUDA>=13 and the
-        # prefill kernel being present; it raises NotImplementedError otherwise.
-        # Mirror that here so the caller does not commit to a crashing fast-path.
-        _AVAILABLE = (
+        # flashinfer's chunk_gated_delta_rule is a unified API that dispatches by
+        # architecture internally:
+        #   - sm100/sm103 (Blackwell): CuTe DSL kernel, needs CUDA>=13 and the
+        #     blackwell prefill module present, else it falls through.
+        #   - sm90 (Hopper): C++ JIT kernel, always available on major==9.
+        # Mirror that dispatch here so the caller only commits to a fast-path
+        # that flashinfer can actually run.
+        _is_blackwell = (
             _p.arch_version.major == 10
             and _cuda_major >= 13
             and _fi_has_blackwell_prefill
         )
+        _is_hopper = _p.arch_version.major == 9
+        _AVAILABLE = _is_blackwell or _is_hopper
     except ImportError:
         _AVAILABLE = False
 
 
 def is_available() -> bool:
-    """Whether the sm100 GDN kernel can run on this platform."""
+    """Whether the flashinfer GDN prefill kernel can run on this platform."""
     return _AVAILABLE
 
 
