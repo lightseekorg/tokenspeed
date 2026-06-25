@@ -105,3 +105,107 @@ def test_fused_softcap_handles_large_logits_without_nan():
 
     assert torch.isfinite(out).all()
     torch.testing.assert_close(out, expected, rtol=1e-5, atol=2e-5)
+
+
+def test_argmax_routes_sharded_to_kernel(monkeypatch):
+    """Sharded logits (tp shards reconstruct vocab) hit the fused kernel."""
+    proc = LogitsProcessor(
+        config=SimpleNamespace(model_type="test", vocab_size=8),
+        tp_rank=0,
+        tp_size=2,
+        tp_group=(0, 1),
+    )
+    proc._dist_argmax_state = object()  # non-None, non-sentinel => active
+
+    recorded = {}
+
+    def fake_dist(state, logits):
+        recorded["called"] = True
+        return None, logits.argmax(dim=-1)
+
+    monkeypatch.setattr(logits_processor_module, "distributed_argmax", fake_dist)
+
+    shard = torch.randn(4, 4, dtype=torch.float32)  # 4 * tp_size(2) == vocab_size(8)
+    ids = proc._argmax(shard)
+    assert recorded.get("called")
+    assert torch.equal(ids, shard.argmax(dim=-1))
+
+
+def test_argmax_full_vocab_skips_kernel(monkeypatch):
+    """Full-vocab logits fall back to argmax even when a state is present."""
+    proc = LogitsProcessor(
+        config=SimpleNamespace(model_type="test", vocab_size=8),
+        tp_rank=0,
+        tp_size=2,
+        tp_group=(0, 1),
+    )
+    proc._dist_argmax_state = object()
+
+    monkeypatch.setattr(
+        logits_processor_module,
+        "distributed_argmax",
+        lambda *a, **k: pytest.fail("kernel must not run on full-vocab logits"),
+    )
+
+    full = torch.randn(4, 8, dtype=torch.float32)  # width == vocab_size => not sharded
+    ids = proc._argmax(full)
+    assert torch.equal(ids, full.argmax(dim=-1))
+
+
+def test_get_logits_skips_gather_when_dist_argmax_active(monkeypatch):
+    """do_argmax + active state keeps logits sharded (no all-gather)."""
+    proc = LogitsProcessor(
+        config=SimpleNamespace(
+            model_type="test", vocab_size=8, final_logit_softcapping=None
+        ),
+        tp_rank=0,
+        tp_size=2,
+        tp_group=(0, 1),
+        do_argmax=True,
+    )
+    monkeypatch.setattr(proc, "_init_dist_argmax_state", lambda lm_head: object())
+    monkeypatch.setattr(
+        logits_processor_module,
+        "all_gather_inner",
+        lambda *a, **k: pytest.fail("gather must be skipped on the fused path"),
+    )
+
+    hidden = torch.randn(4, 2, dtype=torch.float32)
+    lm_head = SimpleNamespace(weight=torch.randn(4, 2, dtype=torch.float32))  # 4*2 == 8
+    md = LogitsMetadata(forward_mode=ForwardMode.DECODE)
+    out = proc._get_logits(hidden, lm_head, md)
+    assert out.shape == (4, 4)  # local shard width retained, not gathered to 8
+
+
+def test_get_logits_softcap_disables_fused_argmax(monkeypatch):
+    """final_logit_softcapping must disable the fused early-return so the
+    softcap is applied to full-vocab logits (then a plain argmax runs)."""
+    proc = LogitsProcessor(
+        config=SimpleNamespace(
+            model_type="test", vocab_size=8, final_logit_softcapping=30.0
+        ),
+        tp_rank=0,
+        tp_size=2,
+        tp_group=(0, 1),
+        do_argmax=True,
+    )
+    # Fused state is otherwise eligible; softcap must still force the gather.
+    monkeypatch.setattr(proc, "_init_dist_argmax_state", lambda lm_head: object())
+    monkeypatch.setattr(proc, "_init_all_gather_state", lambda lm_head: object())
+    called = {}
+
+    def fake_ag(state, logits, **kw):
+        called["ag"] = True
+        return logits.repeat(1, proc.tp_size)  # [bs, vocab/tp] -> [bs, vocab]
+
+    monkeypatch.setattr(logits_processor_module, "all_gather_inner", fake_ag)
+    monkeypatch.setattr(
+        logits_processor_module, "fused_softcap_generic", lambda *a, **k: None
+    )
+
+    hidden = torch.randn(4, 2, dtype=torch.float32)
+    lm_head = SimpleNamespace(weight=torch.randn(4, 2, dtype=torch.float32))  # 4*2 == 8
+    md = LogitsMetadata(forward_mode=ForwardMode.DECODE)
+    out = proc._get_logits(hidden, lm_head, md)
+    assert called.get("ag")  # gathered (softcap on full vocab), not early-returned
+    assert out.shape == (4, 8)
