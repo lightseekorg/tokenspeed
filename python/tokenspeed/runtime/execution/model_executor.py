@@ -36,6 +36,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
 from tokenspeed.runtime.execution.cache_loc_kernel import update_block_table
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
+from tokenspeed.runtime.execution.drafter.dflash import DFlash
 from tokenspeed.runtime.execution.drafter.eagle import Eagle
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
@@ -71,7 +72,7 @@ if TYPE_CHECKING:
 
 logger = get_colorful_logger(__name__)
 
-_DRAFTER_MAPPING = {"EAGLE3": Eagle, "MTP": Eagle}
+_DRAFTER_MAPPING = {"EAGLE3": Eagle, "MTP": Eagle, "DFLASH": DFlash}
 LOG_MM_TIMING = envs.TOKENSPEED_LOG_MM_TIMING.get()
 
 
@@ -267,18 +268,30 @@ class ModelExecutor:
                 token_to_kv_pool=draft_token_to_kv_pool,
                 vocab_size=config.vocab_size,
             )
-            embed, head = self.model_runner.model.get_embed_and_head()
-            draft_model_runner.model.set_embed_and_head(embed, head)
-            target_hf = self.model_runner.model_config.hf_config
-            mm_pad_substitute_id = getattr(
-                target_hf, "image_token_id", None
-            ) or getattr(target_hf, "media_placeholder_token_id", None)
-            if mm_pad_substitute_id is not None:
-                self.drafter.set_mm_pad_substitute_id(mm_pad_substitute_id)
+            if hasattr(self.drafter, "bind_target_model"):
+                self.drafter.bind_target_model(self.model_runner.model)
+            if config.spec_algo in ("EAGLE3", "MTP"):
+                embed, head = self.model_runner.model.get_embed_and_head()
+                draft_model_runner.model.set_embed_and_head(embed, head)
+                target_hf = self.model_runner.model_config.hf_config
+                mm_pad_substitute_id = getattr(
+                    target_hf, "image_token_id", None
+                ) or getattr(target_hf, "media_placeholder_token_id", None)
+                if mm_pad_substitute_id is not None:
+                    self.drafter.set_mm_pad_substitute_id(mm_pad_substitute_id)
             if config.spec_algo in ("EAGLE3",) and hasattr(
                 self.model_runner.model, "set_eagle3_layers_to_capture"
             ):
                 self.model_runner.model.set_eagle3_layers_to_capture()
+            if config.spec_algo == "DFLASH":
+                if not hasattr(self.model_runner.model, "set_dflash_layers_to_capture"):
+                    raise ValueError(
+                        "DFLASH requires the target model to support "
+                        "set_dflash_layers_to_capture."
+                    )
+                self.model_runner.model.set_dflash_layers_to_capture(
+                    self.drafter.target_layer_ids
+                )
         else:
             self.drafter = None
 

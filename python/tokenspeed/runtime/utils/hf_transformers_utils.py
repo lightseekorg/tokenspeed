@@ -260,6 +260,7 @@ def get_config(
         and config.architectures
         and "NextN" not in config.architectures[0]
         and "Eagle" not in config.architectures[0]
+        and "DFlash" not in config.architectures[0]
     ):
         if config.architectures[0] == "MiniMaxM2ForCausalLM":
             config.architectures[0] = "LlamaForCausalLMEagle3"

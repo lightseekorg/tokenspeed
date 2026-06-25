@@ -311,8 +311,8 @@ class MHAAttnBackend(AttentionBackend):
     def forward_extend(
         self,
         q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
+        k: torch.Tensor | None,
+        v: torch.Tensor | None,
         layer: PagedAttention,
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
@@ -322,11 +322,12 @@ class MHAAttnBackend(AttentionBackend):
     ) -> torch.Tensor:
         assert layer.qk_head_dim == layer.v_head_dim
         assert (k is None) == (v is None)
-        assert k is not None
+        has_kv = k is not None
 
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
-        k = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
-        v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
+        if has_kv:
+            k = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+            v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
 
         metadata = self.forward_extend_metadata
         sinks = kwargs.get("sinks")
@@ -426,7 +427,7 @@ class MHAAttnBackend(AttentionBackend):
             cache_seqlens=metadata.seq_lens,
             max_seqlen_q=metadata.max_extend_seq_len,
             max_seqlen_k=self.max_context_len,
-            is_causal=True,
+            is_causal=getattr(layer, 'causal', True),
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
             sinks=sinks,

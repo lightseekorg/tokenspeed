@@ -390,6 +390,46 @@ class CudaGraphWrapper:
             grammar_backend=self.grammar_backend,
         )
 
+        # Spec-decode capture runs a synthetic multi-token decode. Keep the
+        # dummy cache lengths internally consistent with that token count so
+        # attention warmup does not read an impossible q_len > seq_len state.
+        tokens_per_req = self.max_tokens_per_req
+        self.input_buffers.seq_lens_buf[:bs].fill_(tokens_per_req)
+        self.input_buffers.input_lengths_buf[:bs].fill_(tokens_per_req)
+
+        # Capture block tables point at synthetic per-request pages. Write the
+        # dummy KV tokens into those same slots so attention warmup/capture reads
+        # initialized keys instead of the reserved padding slot.
+        page_size = self.input_buffers.page_size
+        pages_per_req = (tokens_per_req + page_size - 1) // page_size
+        token_offsets = torch.arange(
+            tokens_per_req, dtype=torch.int32, device=self.device
+        )
+        request_offsets = (
+            torch.arange(bs, dtype=torch.int32, device=self.device).unsqueeze(1)
+            * pages_per_req
+            * page_size
+        )
+        self.input_buffers.out_cache_loc_buf[: bs * tokens_per_req].copy_(
+            (request_offsets + token_offsets).reshape(-1)
+        )
+
+        # Some fused decode kernels may read full page vectors during capture
+        # even when seq_lens bounds the logical context. Clear the synthetic
+        # pages so any padding read is deterministic zero, not allocator noise.
+        capture_slots = bs * pages_per_req * page_size
+        for pool in (self.token_to_kv_pool, self.draft_token_to_kv_pool):
+            if pool is None or not hasattr(pool, "kv_buffer"):
+                continue
+            for layer_buf in pool.kv_buffer:
+                if isinstance(layer_buf, (tuple, list)):
+                    for sub_buf in layer_buf:
+                        sub_buf[:capture_slots].zero_()
+                else:
+                    layer_buf[:capture_slots].zero_()
+
+        self._init_capture_metadata(bs)
+
         def run_once():
             # Dummy add_batch keeps the grammar queue 1:1 with replays —
             # fetch_batch pops once per forward, so warmup + capture
@@ -399,6 +439,22 @@ class CudaGraphWrapper:
                     grammars=[None] * bs, bs=bs, has_candidates=False
                 )
             return self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
+
+        from tokenspeed.runtime.execution.drafter.dflash import DFlash
+
+        is_dflash = isinstance(self.drafter, DFlash) if self.drafter is not None else False
+        # Choose a large prefix bound for DFlash warmup so that FA4 max_seqlen_k
+        # recorded during capture covers the longest possible runtime prefix.
+        saved_valid_cache_lengths = None
+        if is_dflash and self.runtime_states is not None:
+            graph_prefix_bound = max(
+                int(self.context_len) if self.context_len > 0 else 0,
+                int(self.max_tokens_per_req),
+            )
+            saved_valid_cache_lengths = (
+                self.runtime_states.valid_cache_lengths.clone()
+            )
+            self.runtime_states.valid_cache_lengths.fill_(graph_prefix_bound)
 
         # Warm up before capture.
         for _ in range(4):
@@ -421,6 +477,11 @@ class CudaGraphWrapper:
 
         torch.cuda.synchronize()
         dist.barrier()
+
+        # Warmups can switch a backend back to eager metadata objects. Restore
+        # the graph-backed metadata immediately before capture so replay-time
+        # metadata refreshes update the same tensors recorded by the graph.
+        self._init_capture_metadata(bs)
 
         # Fill sampler buffers OUTSIDE the capture so RNG ops aren't recorded.
         if self.sampling_backend is not None:
@@ -456,6 +517,10 @@ class CudaGraphWrapper:
             self.capturable_grammar.reset_state()
 
         global_graph_memory_pool = graph.pool()
+
+        if saved_valid_cache_lengths is not None:
+            self.runtime_states.valid_cache_lengths.copy_(saved_valid_cache_lengths)
+
         return graph, out
 
     def _capture_paged_cache_block_tables(self, bs: int, pool) -> dict | None:
@@ -740,6 +805,10 @@ class CudaGraphWrapper:
                         **draft_kwargs,
                     )
             else:
+                from tokenspeed.runtime.execution.drafter.dflash import DFlash
+
+                if isinstance(self.drafter, DFlash):
+                    return
                 draft_metadata_seq_lens = (
                     seq_lens if self.use_v4_mtp_paged_metadata else draft_seq_lens
                 )

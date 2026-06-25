@@ -341,7 +341,13 @@ class ServerArgs:
 
             num_speculative_tokens = config.get("num_speculative_tokens")
             if num_speculative_tokens is not None:
-                self.speculative_num_steps = int(num_speculative_tokens)
+                num_speculative_tokens = int(num_speculative_tokens)
+                if self.speculative_algorithm == "DFLASH":
+                    if self.speculative_num_draft_tokens is None:
+                        self.speculative_num_draft_tokens = num_speculative_tokens
+                    self.speculative_num_steps = max(num_speculative_tokens - 1, 0)
+                else:
+                    self.speculative_num_steps = num_speculative_tokens
 
         if self.speculative_num_draft_tokens is None:
             self.speculative_num_draft_tokens = self.speculative_num_steps + 1
@@ -520,6 +526,18 @@ class ServerArgs:
 
         if self.speculative_draft_model_quantization == "unquant":
             self.speculative_draft_model_quantization = None
+
+        if self.speculative_algorithm == "DFLASH":
+            expected_steps = max(int(self.speculative_num_draft_tokens) - 1, 0)
+            if self.speculative_num_steps == ServerArgs.speculative_num_steps:
+                self.speculative_num_steps = expected_steps
+            elif self.speculative_num_steps != expected_steps:
+                raise ValueError(
+                    "DFLASH requires speculative_num_steps to equal "
+                    "speculative_num_draft_tokens - 1. "
+                    f"Got {self.speculative_num_steps=} and "
+                    f"{self.speculative_num_draft_tokens=}."
+                )
 
         if self.eagle3_layers_to_capture is not None:
             self.eagle3_layers_to_capture = [
@@ -1422,7 +1440,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE3", "MTP"],
+            choices=["EAGLE3", "MTP", "DFLASH"],
             help="Speculative algorithm.",
         )
         parser.add_argument(

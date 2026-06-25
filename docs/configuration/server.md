@@ -124,7 +124,7 @@ the values accepted by the bundled `tokenspeed-smg` package.
 | Parameter | Purpose |
 | --- | --- |
 | `--speculative-config` | JSON speculative decoding configuration. |
-| `--speculative-algorithm` | Speculative algorithm, such as `EAGLE3` or `MTP`. |
+| `--speculative-algorithm` | Speculative algorithm, such as `EAGLE3`, `MTP`, or `DFLASH`. |
 | `--speculative-draft-model-path` | Draft model path or repo ID. |
 | `--speculative-draft-model-quantization` | Draft model quantization. Defaults to `unquant`. |
 | `--speculative-num-steps` | Number of draft model steps. Defaults to `3`. |
