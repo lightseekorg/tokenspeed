@@ -20,10 +20,15 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+import torch.nn.functional as F
 
 from tokenspeed.runtime.distributed.comm_ops import all_gather_into_tensor
 from tokenspeed.runtime.execution.cache_loc_kernel import compute_out_cache_loc_uniform
 from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.drafter._dflash_fused_kv import (
+    _fused_norm_rope_stacked,
+    _fused_norm_rope_stacked_scatter,
+)
 from tokenspeed.runtime.execution.drafter.base import BaseDrafter
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
@@ -105,6 +110,7 @@ class DFlash(BaseDrafter):
         self._greedy_gathered_max: torch.Tensor | None = None
         self._greedy_gathered_ids: torch.Tensor | None = None
         self._greedy_gather_cap = 0
+        self._init_fused_kv_helper()
 
     def _init_native_buffers(self) -> None:
         if self.input_buffers is None:
@@ -278,8 +284,9 @@ class DFlash(BaseDrafter):
         positions = self.input_buffers.positions_buf[: base_ctx.input_num_tokens]
         cache_locs = self.input_buffers.out_cache_loc_buf[: base_ctx.input_num_tokens]
 
+        decode_only = base_ctx.num_extends == 0
         if (
-            base_ctx.num_extends == 0
+            decode_only
             and torch.cuda.is_available()
             and torch.cuda.is_current_stream_capturing()
         ):
@@ -289,7 +296,9 @@ class DFlash(BaseDrafter):
             self.draft_seq_lens_buf[:bs].copy_(
                 old_lens.to(torch.int32) + accept_lengths[:bs].to(torch.int32)
             )
-            self._write_native_cache(hidden, positions, cache_locs)
+            self._write_native_cache(
+                hidden, positions, cache_locs, decode_only=True
+            )
             return
 
         hidden_chunks = torch.split(hidden, lengths.detach().cpu().tolist(), dim=0)
@@ -328,13 +337,19 @@ class DFlash(BaseDrafter):
         target_hidden = torch.cat(selected_hidden, dim=0)
         target_positions = torch.cat(selected_positions, dim=0)
         target_cache_locs = torch.cat(selected_cache_locs, dim=0)
-        self._write_native_cache(target_hidden, target_positions, target_cache_locs)
+        self._write_native_cache(
+            target_hidden,
+            target_positions,
+            target_cache_locs,
+            decode_only=decode_only,
+        )
 
     def _write_native_cache(
         self,
         target_hidden: torch.Tensor,
         target_positions: torch.Tensor,
         target_cache_locs: torch.Tensor,
+        decode_only: bool = False,
     ) -> None:
         target_hidden = target_hidden.to(
             device=self.device,
@@ -352,6 +367,12 @@ class DFlash(BaseDrafter):
             ctx_hidden = self.draft_model_runner.model.project_target_hidden(
                 target_hidden
             )
+            if decode_only:
+                self._write_native_cache_fused(
+                    ctx_hidden, target_positions, target_cache_locs
+                )
+                return
+
             for layer in self.draft_model_runner.model.layers:
                 attn = layer.self_attn
                 k, v = attn.kv_proj_only(ctx_hidden)
@@ -367,6 +388,175 @@ class DFlash(BaseDrafter):
                     attn.attn.k_scale,
                     attn.attn.v_scale,
                 )
+
+    def _init_fused_kv_helper(self) -> None:
+        """Pre-stack KV weights, k_norm, eps, and cos_sin_cache at construction."""
+        self._fused_kv_enabled = False
+        self._fused_kv_workspace_capacity = 0
+        self._fused_kv_workspace_dtype = None
+        self._fused_kv_proj_workspace = None
+        self._fused_kv_mm_out_supported = True
+        self._fused_kv_k_buffers = []
+        self._fused_kv_v_buffers = []
+        try:
+            layers = self.draft_model_runner.model.layers
+            if not layers:
+                return
+            first_attn = layers[0].self_attn
+            is_neox = bool(getattr(first_attn.rotary_emb, "is_neox_style", True))
+            if not is_neox:
+                return
+
+            from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
+
+            for layer in layers:
+                attn = layer.self_attn
+                if not isinstance(
+                    getattr(attn.qkv_proj, "quant_method", None),
+                    UnquantizedLinearMethod,
+                ):
+                    return
+                if not hasattr(attn.qkv_proj, "weight"):
+                    return
+
+            num_kv_heads = int(first_attn.num_kv_heads)
+            head_dim = int(first_attn.head_dim)
+            kv_size = int(first_attn.kv_size)
+            rotary_dim = int(getattr(first_attn.rotary_emb, "rotary_dim", head_dim))
+            n_layers = len(layers)
+
+            self._fused_kv_num_kv_heads = num_kv_heads
+            self._fused_kv_head_dim = head_dim
+            self._fused_kv_kv_size = kv_size
+            self._fused_kv_rotary_dim = rotary_dim
+            self._fused_kv_n_layers = n_layers
+            self._fused_kv_layer_out_dim = 2 * kv_size
+
+            kv_weight_rows = []
+            k_norm_rows = []
+            eps_values = []
+            for layer in layers:
+                attn = layer.self_attn
+                kv_weight_rows.append(
+                    attn.qkv_proj.weight[attn.q_size : attn.q_size + 2 * attn.kv_size]
+                )
+                k_norm_rows.append(attn.k_norm.weight)
+                eps_values.append(float(attn.k_norm.variance_epsilon))
+
+            flat_kv_weight = torch.cat(kv_weight_rows, dim=0)
+            self._fused_kv_flat_weight_t = flat_kv_weight.t().contiguous()
+            self._fused_kv_k_norm_weight = torch.stack(k_norm_rows, dim=0).contiguous()
+            self._fused_kv_eps = torch.tensor(
+                eps_values, dtype=torch.float32, device=self.device
+            )
+
+            cos_sin_cache = first_attn.rotary_emb.cos_sin_cache
+            if cos_sin_cache.device != self.device:
+                cos_sin_cache = cos_sin_cache.to(self.device)
+            self._fused_kv_cos_sin_cache = cos_sin_cache
+
+            self._fused_kv_k_buffers = [
+                self.token_to_kv_pool.get_key_buffer(layer.self_attn.attn.layer_id)
+                for layer in layers
+            ]
+            self._fused_kv_v_buffers = [
+                self.token_to_kv_pool.get_value_buffer(layer.self_attn.attn.layer_id)
+                for layer in layers
+            ]
+
+            self._fused_kv_enabled = True
+            logger.info(
+                "DFLASH fused KV materialization enabled. "
+                "n_layers=%d, num_kv_heads=%d, head_dim=%d",
+                n_layers, num_kv_heads, head_dim,
+            )
+        except Exception as e:
+            logger.warning(
+                "DFLASH fused KV initialization failed, falling back to sequential: %s",
+                e,
+            )
+            self._fused_kv_enabled = False
+
+    def _ensure_fused_workspace(self, total_ctx: int, dtype: torch.dtype) -> None:
+        """Ensure the projection workspace is large enough."""
+        if (
+            self._fused_kv_workspace_capacity >= total_ctx
+            and self._fused_kv_workspace_dtype == dtype
+            and self._fused_kv_proj_workspace is not None
+        ):
+            return
+        new_cap = max(1, total_ctx)
+        if self._fused_kv_workspace_capacity > 0:
+            new_cap = max(new_cap, self._fused_kv_workspace_capacity * 2)
+        self._fused_kv_proj_workspace = torch.empty(
+            (new_cap, self._fused_kv_n_layers * self._fused_kv_layer_out_dim),
+            dtype=dtype,
+            device=self.device,
+        )
+        self._fused_kv_workspace_capacity = new_cap
+        self._fused_kv_workspace_dtype = dtype
+
+    def _write_native_cache_fused(
+        self,
+        ctx_hidden: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_cache_locs: torch.Tensor,
+    ) -> None:
+        """Fused KV materialization for decode-only batches.
+
+        One stacked GEMM for all 6 layers' K|V projection, then one Triton
+        kernel for fused RMSNorm + RoPE + direct scatter into KV pool.
+        Total: 1 GEMM + 1 Triton launch.
+        """
+        layers = self.draft_model_runner.model.layers
+        if not self._fused_kv_enabled:
+            for layer in layers:
+                attn = layer.self_attn
+                k, v = attn.kv_proj_only(ctx_hidden)
+                k = attn.apply_k_norm(k)
+                k = attn.apply_k_rope(target_positions, k)
+                k = k.view(-1, attn.num_kv_heads, attn.head_dim)
+                v = v.view(-1, attn.num_kv_heads, attn.head_dim)
+                self.token_to_kv_pool.set_kv_buffer(
+                    attn.attn,
+                    target_cache_locs,
+                    k,
+                    v,
+                    attn.attn.k_scale,
+                    attn.attn.v_scale,
+                )
+            return
+
+        total_ctx = int(ctx_hidden.shape[0])
+        self._ensure_fused_workspace(total_ctx, ctx_hidden.dtype)
+
+        proj_out_2d = self._fused_kv_proj_workspace[:total_ctx]
+        if self._fused_kv_mm_out_supported:
+            try:
+                torch.mm(ctx_hidden, self._fused_kv_flat_weight_t, out=proj_out_2d)
+            except Exception:
+                self._fused_kv_mm_out_supported = False
+                proj_out_2d = torch.mm(ctx_hidden, self._fused_kv_flat_weight_t)
+        else:
+            proj_out_2d = torch.mm(ctx_hidden, self._fused_kv_flat_weight_t)
+
+        proj_out = proj_out_2d.view(
+            total_ctx, self._fused_kv_n_layers, self._fused_kv_layer_out_dim
+        )
+
+        _fused_norm_rope_stacked_scatter(
+            proj_out,
+            self._fused_kv_k_norm_weight,
+            self._fused_kv_eps,
+            self._fused_kv_cos_sin_cache,
+            target_positions,
+            target_cache_locs,
+            self._fused_kv_k_buffers,
+            self._fused_kv_v_buffers,
+            self._fused_kv_num_kv_heads,
+            self._fused_kv_head_dim,
+            self._fused_kv_rotary_dim,
+        )
 
     @staticmethod
     def _current_tokens_from_output(
