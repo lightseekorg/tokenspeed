@@ -490,6 +490,23 @@ class TestDescribeKernel:
         assert "attention" in desc
         assert "flashinfer" in desc
 
+    def test_describe_includes_weight_preprocessor_link(self):
+        def moe_weights(**_):
+            return None
+
+        reg = KernelRegistry.get()
+        spec = KernelSpec(
+            name="moe_apply",
+            family="moe",
+            mode="apply",
+            weight_preprocessor=moe_weights,
+        )
+        reg.register(spec, dummy_impl("moe_apply"))
+
+        desc = describe_kernel("moe_apply")
+
+        assert "Weight preprocessor: moe_weights" in desc
+
     def test_describe_not_found(self):
         desc = describe_kernel("nonexistent_kernel")
         assert "not found" in desc.lower()

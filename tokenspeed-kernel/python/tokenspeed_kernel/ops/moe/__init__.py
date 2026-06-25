@@ -124,8 +124,9 @@ def moe_plan(
 
     The selected apply kernel owns plan metadata. A plan with support_routing
     false requires precomputed top-k ids and weights when calling moe_apply.
-    Process-weights is pinned to the processor selected for the chosen apply
-    solution when weights are loaded.
+    Weight preprocessing is selected from the ordered candidates advertised by
+    the selected apply kernel, then pinned by callable in the returned plan so load
+    time does not rerun selection or conflict resolution.
     """
     weight_dtype = _normalize_weight_dtype(weight_dtype)
     _validate_a2a_backend(a2a_backend)
@@ -156,19 +157,6 @@ def moe_plan(
     if apply_spec is None:
         raise RuntimeError(f"Kernel spec not found for selected kernel {kernel.name}")
 
-    process_weights_kernel = select_kernel(
-        "moe",
-        "process_weights",
-        format_signature(),
-        traits={"weight_dtype": weight_dtype},
-        solution=apply_spec.solution,
-    )
-    process_weights_spec = registry.get_by_name(process_weights_kernel.name)
-    if process_weights_spec is None:
-        raise RuntimeError(
-            f"Kernel spec not found for selected kernel {process_weights_kernel.name}"
-        )
-
     routing_modes = apply_spec.traits.get("routing_mode", frozenset())
     support_routing = "kernel_routing" in routing_modes
     supports_deferred_finalize = True in apply_spec.traits.get(
@@ -177,7 +165,7 @@ def moe_plan(
     return {
         "weight_dtype": weight_dtype,
         "apply_kernel_name": apply_spec.name,
-        "process_weights_kernel_name": process_weights_spec.name,
+        "weight_preprocessor": apply_spec.weight_preprocessor,
         "a2a_backend": a2a_backend,
         "deepep_group": deepep_group,
         "support_routing": support_routing,
@@ -195,13 +183,12 @@ def moe_process_weights(plan: dict, w: torch.nn.Module):
         w: Module containing loaded MoE weights. This module is mutated in
             place to prepare solution-specific layouts and scales.
     """
-    kernel = select_kernel(
-        "moe",
-        "process_weights",
-        format_signature(),
-        override=plan["process_weights_kernel_name"],
-    )
-    return kernel(plan=plan, w=w)
+    preprocessor = plan.get("weight_preprocessor")
+    if preprocessor is None:
+        return None
+    if not callable(preprocessor):
+        raise RuntimeError(f"Weight preprocessor is not callable: {preprocessor!r}")
+    return preprocessor(plan=plan, w=w)
 
 
 def moe_apply(

@@ -13,6 +13,7 @@ from pipeline import (
     extract_perf_summary_rows,
     format_perf_reference_markdown_table,
     format_perf_reference_table,
+    get_runner_specific_env,
     is_amd_runner,
     is_gb200_runner,
     resolve_score_threshold_for_runner,
@@ -71,6 +72,39 @@ def test_nvidia_gpu_cleanup_runner_prefixes_cover_gb200_and_b300():
     assert not should_run_nvidia_gpu_cleanup("amd-mi35x-2gpu-test")
     assert not should_run_nvidia_gpu_cleanup("amd-mi355-1gpu-bench")
     assert not should_run_nvidia_gpu_cleanup("amd-mi350-1gpu-bench")
+
+
+def test_runner_specific_env_uses_original_label_after_b200_override(monkeypatch):
+    monkeypatch.setenv("TOKENSPEED_B200_RUNNER_LABEL", "b200v2")
+    task = {
+        "runner": {
+            "labels": ["b200-2gpu"],
+            "env": {
+                "b200-2gpu": {
+                    "GPT_OSS_EVAL_MODEL": "openai/gpt-oss-120b",
+                },
+            },
+        },
+    }
+
+    assert get_runner_specific_env(task, "b200v2-2gpu") == {
+        "GPT_OSS_EVAL_MODEL": "openai/gpt-oss-120b",
+    }
+
+
+def test_runner_specific_env_prefers_exact_label(monkeypatch):
+    monkeypatch.setenv("TOKENSPEED_B200_RUNNER_LABEL", "b200v2")
+    task = {
+        "runner": {
+            "labels": ["b200-2gpu", "b200v2-2gpu"],
+            "env": {
+                "b200-2gpu": {"MODEL": "original"},
+                "b200v2-2gpu": {"MODEL": "exact"},
+            },
+        },
+    }
+
+    assert get_runner_specific_env(task, "b200v2-2gpu") == {"MODEL": "exact"}
 
 
 def test_extract_evalscope_score_from_pipe_table():
