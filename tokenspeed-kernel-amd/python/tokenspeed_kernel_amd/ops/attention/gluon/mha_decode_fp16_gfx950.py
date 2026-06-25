@@ -515,13 +515,11 @@ def _mha_decode_fp16(
     q = program.load_q()
     m_i, l_i, acc, sink_log2 = program.init_state(q_ptr, False)
 
-    physical_page = program.load_page(program.split_start)
-
     for start_n in range(program.split_start, program.split_end, cfg.BLOCK_N):
         with gl.amd.warp_pipeline_stage("load", priority=1):
+            physical_page = program.load_page(start_n + cfg.BLOCK_N)
             program.issue_load_k(physical_page, k_smem)
             program.issue_load_v(physical_page, v_smem)
-            physical_page = program.load_page(start_n + cfg.BLOCK_N)
 
         with gl.amd.warp_pipeline_stage("qk_softmax", priority=0):
             async_copy.wait_group(1)
