@@ -49,7 +49,6 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as _dist
 import torch.distributed._symmetric_memory as _symm_mem
-
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -467,9 +466,8 @@ if _CUTE_AVAILABLE:
     def pack_argmax_payload_u64(
         val_f32: cutlass.Float32, global_idx: cutlass.Int32
     ) -> cutlass.Int64:
-        val_bits = (
-            val_f32.bitcast(cutlass.Int32).to(cutlass.Int64)
-            & cutlass.Int64(0xFFFFFFFF)
+        val_bits = val_f32.bitcast(cutlass.Int32).to(cutlass.Int64) & cutlass.Int64(
+            0xFFFFFFFF
         )
         idx_bits = cutlass.Int64(global_idx) & cutlass.Int64(0x7FFFFFFF)
         flag_bit = cutlass.Int64(1) << cutlass.Int64(63)
@@ -479,15 +477,11 @@ if _CUTE_AVAILABLE:
     def unpack_argmax_payload_u64(packed: cutlass.Int64):
         val_bits32 = (packed & cutlass.Int64(0xFFFFFFFF)).to(Int32)
         val_f32 = val_bits32.bitcast(cutlass.Float32)
-        idx_i32 = (
-            (packed >> cutlass.Int64(32)) & cutlass.Int64(0x7FFFFFFF)
-        ).to(Int32)
+        idx_i32 = ((packed >> cutlass.Int64(32)) & cutlass.Int64(0x7FFFFFFF)).to(Int32)
         return val_f32, idx_i32
 
     @dsl_user_op
-    def ptx_ld_global_u32(
-        addr: cutlass.Int64, *, loc=None, ip=None
-    ) -> cutlass.Int32:
+    def ptx_ld_global_u32(addr: cutlass.Int64, *, loc=None, ip=None) -> cutlass.Int32:
         return cutlass.Int32(
             llvm.inline_asm(
                 T.i32(),
@@ -776,17 +770,15 @@ if _CUTE_AVAILABLE:
                 cute.arch.mbarrier_wait(mbar_ptr, phase=0)
                 block_reduce_val = -tXsX.element_type.inf
                 block_reduce_argmax = Int32(0xFFFFFFFF)
-                num_iter = cute.ceil_div(
-                    warps_per_row * cluster_n, cute.arch.WARP_SIZE
-                )
+                num_iter = cute.ceil_div(warps_per_row * cluster_n, cute.arch.WARP_SIZE)
 
                 for i in cutlass.range_constexpr(num_iter):
                     idx = lane_idx + i * cute.arch.WARP_SIZE
                     if idx < cute.size(reduction_buffer, mode=[1]):
                         element_max = reduction_buffer[row_idx_buf, idx, 0, 0]
-                        element_argmax = reduction_buffer[
-                            row_idx_buf, idx, 0, 1
-                        ].to(cutlass.Int32)
+                        element_argmax = reduction_buffer[row_idx_buf, idx, 0, 1].to(
+                            cutlass.Int32
+                        )
                         if element_max > block_reduce_val:
                             block_reduce_val = element_max
                             block_reduce_argmax = element_argmax
@@ -858,13 +850,9 @@ if _CUTE_AVAILABLE:
                         ptx_atomic_and_relaxed_sys_u64(slot_addr, clear_mask)
 
                     if cutlass.const_expr(self.use_redux):
-                        warp_max, warp_argmax = warp_argmax_redux(
-                            peer_val, peer_idx
-                        )
+                        warp_max, warp_argmax = warp_argmax_redux(peer_val, peer_idx)
                     else:
-                        warp_max, warp_argmax = warp_reduce_argmax(
-                            peer_val, peer_idx
-                        )
+                        warp_max, warp_argmax = warp_reduce_argmax(peer_val, peer_idx)
                     if warp_argmax == Int32(0x7FFFFFFF):
                         warp_argmax = Int32(0xFFFFFFFF)
 
@@ -877,9 +865,7 @@ if _CUTE_AVAILABLE:
                                 ptx_atomic_add_acq_rel_sys_u32(
                                     round_id_ptr, cutlass.Int32(1)
                                 )
-                                ptx_st_relaxed_sys_u32(
-                                    warps_done_ptr, cutlass.Int32(0)
-                                )
+                                ptx_st_relaxed_sys_u32(warps_done_ptr, cutlass.Int32(0))
 
             if (
                 tidx == first_thread_for_row
@@ -919,9 +905,11 @@ def create_dist_argmax_state(
     device: torch.device | None = None,
     skip_ping_pong: bool = False,
 ) -> DistArgmaxState:
-    assert dtype in (torch.bfloat16, torch.float16, torch.float32), (
-        f"distributed argmax supports bf16/fp16/fp32 value dtype; got {dtype}"
-    )
+    assert dtype in (
+        torch.bfloat16,
+        torch.float16,
+        torch.float32,
+    ), f"distributed argmax supports bf16/fp16/fp32 value dtype; got {dtype}"
     assert _ARCH_SUPPORTED and _CUTE_AVAILABLE, (
         "distributed_argmax requires CuTe DSL on NVIDIA Hopper+/Blackwell; "
         "current platform doesn't qualify."
@@ -936,7 +924,9 @@ def create_dist_argmax_state(
     sm = p.arch_version.major * 10 + p.arch_version.minor
     use_redux = 100 <= sm < 120
     slots = _symm_mem.empty(
-        (2 * max_M * world_size,), dtype=torch.int64, device=device,
+        (2 * max_M * world_size,),
+        dtype=torch.int64,
+        device=device,
     )
     slots.zero_()
     round_id_gpu = torch.zeros(1, dtype=torch.int32, device=device)
@@ -979,22 +969,22 @@ def _dist_argmax_validate_inputs(
     out_max: torch.Tensor | None,
     out_idx: torch.Tensor | None,
 ) -> tuple[int, int]:
-    assert logits.dim() == 2, (
-        f"logits must be 2D (M, N); got shape {tuple(logits.shape)}"
-    )
+    assert (
+        logits.dim() == 2
+    ), f"logits must be 2D (M, N); got shape {tuple(logits.shape)}"
     M, N = logits.shape
-    assert logits.device == state.device, (
-        f"logits.device={logits.device} != state.device={state.device}"
-    )
-    assert logits.dtype == state.dtype, (
-        f"logits.dtype={logits.dtype} != state.dtype={state.dtype}"
-    )
-    assert N >= _MIN_VOCAB_SIZE, (
-        f"per-rank vocab N={N} below kernel floor {_MIN_VOCAB_SIZE}"
-    )
-    assert N % _VOCAB_SIZE_ALIGNMENT == 0, (
-        f"per-rank vocab N={N} not aligned to {_VOCAB_SIZE_ALIGNMENT}"
-    )
+    assert (
+        logits.device == state.device
+    ), f"logits.device={logits.device} != state.device={state.device}"
+    assert (
+        logits.dtype == state.dtype
+    ), f"logits.dtype={logits.dtype} != state.dtype={state.dtype}"
+    assert (
+        N >= _MIN_VOCAB_SIZE
+    ), f"per-rank vocab N={N} below kernel floor {_MIN_VOCAB_SIZE}"
+    assert (
+        N % _VOCAB_SIZE_ALIGNMENT == 0
+    ), f"per-rank vocab N={N} not aligned to {_VOCAB_SIZE_ALIGNMENT}"
     if out_max is not None:
         assert out_max.shape == (M,) and out_max.device == logits.device, (
             f"out_max must be shape ({M},) on logits.device; got "
@@ -1019,20 +1009,33 @@ def _dist_argmax_invoke_kernel(
 
     N = logits.shape[1]
     compile_key = (
-        dtype, N, state.use_redux, out_max.dtype, out_idx.dtype,
-        state.world_size, state.rank_in_group, state.skip_ping_pong,
+        dtype,
+        N,
+        state.use_redux,
+        out_max.dtype,
+        out_idx.dtype,
+        state.world_size,
+        state.rank_in_group,
+        state.skip_ping_pong,
     )
     round_id_ptr = state.round_id_gpu.data_ptr()
     warps_done_ptr = state.warps_done_gpu.data_ptr()
     compiled = _dist_argmax_compile_cache.get(compile_key)
     if compiled is None:
         kernel = DistArgmaxKernel(
-            dtype, N, use_redux=state.use_redux,
-            world_size=state.world_size, rank=state.rank_in_group,
+            dtype,
+            N,
+            use_redux=state.use_redux,
+            world_size=state.world_size,
+            rank=state.rank_in_group,
             skip_ping_pong=state.skip_ping_pong,
         )
         compiled = cute.compile(
-            kernel, x_tensor, max_tensor, idx_tensor, stream,
+            kernel,
+            x_tensor,
+            max_tensor,
+            idx_tensor,
+            stream,
             state.slot_handle.buffer_ptrs_dev,
             state.slot_handle.multicast_ptr,
             round_id_ptr,
@@ -1041,7 +1044,10 @@ def _dist_argmax_invoke_kernel(
         _dist_argmax_compile_cache[compile_key] = compiled
 
     compiled(
-        x_tensor, max_tensor, idx_tensor, stream,
+        x_tensor,
+        max_tensor,
+        idx_tensor,
+        stream,
         state.slot_handle.buffer_ptrs_dev,
         state.slot_handle.multicast_ptr,
         round_id_ptr,
@@ -1077,9 +1083,9 @@ def distributed_argmax(
         return max_vals, idx_vals
 
     assert M <= state.max_M, f"batch size {M} exceeds state.max_M={state.max_M}"
-    assert state.world_size * N < 0x7FFFFFFF, (
-        f"world_size*N = {state.world_size * N} overflows the 31-bit slot idx"
-    )
+    assert (
+        state.world_size * N < 0x7FFFFFFF
+    ), f"world_size*N = {state.world_size * N} overflows the 31-bit slot idx"
 
     if out_max is None:
         out_max = torch.empty((M,), dtype=logits.dtype, device=device)
