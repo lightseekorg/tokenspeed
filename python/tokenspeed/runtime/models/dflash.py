@@ -24,12 +24,14 @@ from collections.abc import Iterable, Sequence
 from typing import Any, Optional
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.activation import SiluAndMul
+from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import (
     MergedColumnParallelLinear,
@@ -188,7 +190,17 @@ class DFlashAttention(nn.Module):
     def kv_proj_only(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        qkv, _ = self.qkv_proj(hidden_states)
+        qkv_proj = self.qkv_proj
+        if isinstance(
+            getattr(qkv_proj, "quant_method", None), UnquantizedLinearMethod
+        ) and hasattr(qkv_proj, "weight"):
+            kv_slice = slice(self.q_size, self.q_size + 2 * self.kv_size)
+            weight = qkv_proj.weight[kv_slice]
+            bias = qkv_proj.bias[kv_slice] if qkv_proj.bias is not None else None
+            kv = F.linear(hidden_states, weight, bias)
+            k, v = kv.split([self.kv_size, self.kv_size], dim=-1)
+            return k, v
+        qkv, _ = qkv_proj(hidden_states)
         _, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         return k, v
 
