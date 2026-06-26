@@ -5,6 +5,7 @@ from typing import Any
 
 import pytest
 import torch
+from tokenspeed_kernel import quantize_mxfp4
 
 
 def _is_gfx950() -> bool:
@@ -529,6 +530,32 @@ def _compute_torch_gemm1_reference(
     return output
 
 
+def _compute_torch_gemm1_mxfp4_reference(
+    raw: RawMxfp4Weights,
+    gemm1_input: torch.Tensor,
+    gemm1_scale: torch.Tensor,
+    weights: Mxfp4Weights,
+    ragged_metadata: Any,
+    gather_indx: torch.Tensor,
+) -> torch.Tensor:
+    output = torch.empty(
+        (gather_indx.numel(), INTERMEDIATE_SIZE),
+        device=gemm1_input.device,
+        dtype=torch.bfloat16,
+    )
+    x = _mxfp4_dequant(gemm1_input, gemm1_scale)
+    for expert, (start, end) in enumerate(_expert_ranges(ragged_metadata)):
+        if start == end:
+            continue
+        row_idx = gather_indx[start:end].long()
+        w13 = _mxfp4_dequant(raw.w13_weight[expert], raw.w13_scale[expert])
+        gate_up = x[row_idx] @ w13.T
+        if weights.w13_bias is not None:
+            gate_up = gate_up + weights.w13_bias[expert][None, :]
+        output[start:end] = _swiglu_reference(gate_up).to(torch.bfloat16)
+    return output
+
+
 def _compute_torch_gemm2_reference(
     raw: RawMxfp4Weights,
     gemm2_input: torch.Tensor,
@@ -695,4 +722,60 @@ def test_gluon_moe_gemms_with_preshuffle_match_torch_gfx950(
         num_tokens,
         weights=mxfp4_weights.preshuffled,
         torch_references=torch_references,
+    )
+
+
+@requires_gfx950
+@pytest.mark.parametrize("variant", ("nonpreshuffled", "preshuffled"))
+def test_gluon_moe_gemm1_dynamic_mxfp4_gather_scales_match_torch_gfx950(
+    mxfp4_weights: Mxfp4WeightVariants,
+    variant: str,
+) -> None:
+    num_tokens = 64
+    weights = getattr(mxfp4_weights, variant)
+    hidden_states, router_logits = _make_hidden_and_router(num_tokens)
+    ragged_metadata, gather_indx, _scatter_indx, _gate_scal = default_route(
+        router_logits,
+        TOPK,
+        dtype=router_logits.dtype,
+    )
+    gemm1_input, gemm1_scale = quantize_mxfp4(
+        hidden_states,
+        scale_size=MXFP4_BLOCK,
+        scale_layout="linear",
+        solution="triton",
+        enable_pdl=False,
+    )
+    precision_config = gluon_moe.PrecisionConfig(
+        a_mx_scale=gemm1_scale,
+        a_microblock_size=MXFP4_BLOCK,
+        b_mx_scale=weights.w13_precision_config.b_mx_scale,
+        b_microblock_size=MXFP4_BLOCK,
+        out_dtype=torch.bfloat16,
+    )
+
+    with torch.no_grad():
+        actual = gluon_moe.gluon_mxfp_ragged_matmul(
+            gemm1_input,
+            weights.w13_weight,
+            weights.w13_bias,
+            a_ragged_metadata=ragged_metadata,
+            gather_indx=gather_indx,
+            precision_config=precision_config,
+            fused_activation=_swiglu_activation(),
+        )
+        expected = _compute_torch_gemm1_mxfp4_reference(
+            mxfp4_weights.raw,
+            gemm1_input,
+            gemm1_scale,
+            weights,
+            ragged_metadata,
+            gather_indx,
+        )
+
+    torch.testing.assert_close(
+        actual.float(),
+        expected.float(),
+        atol=GEMM_ATOL,
+        rtol=RTOL,
     )
