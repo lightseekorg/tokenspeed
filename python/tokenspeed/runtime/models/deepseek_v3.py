@@ -92,6 +92,7 @@ from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfi
 from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
 from tokenspeed.runtime.layers.quantization.utils import (
     block_dequant,
+    should_exclude_quant_module,
     should_ignore_quant_layer,
 )
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
@@ -421,9 +422,9 @@ class DeepseekV3FusedQkvAProjWithMqa(ReplicatedLinear):
             kv_a_prefix = prefix.replace(
                 "fused_qkv_a_proj_with_mqa", "kv_a_proj_with_mqa"
             )
-            if quant_config.is_layer_excluded(
-                q_a_prefix
-            ) or quant_config.is_layer_excluded(kv_a_prefix):
+            if should_exclude_quant_module(
+                q_a_prefix, quant_config.exclude_modules
+            ) or should_exclude_quant_module(kv_a_prefix, quant_config.exclude_modules):
                 quant_config = None
         super().__init__(
             input_size,
@@ -2030,6 +2031,8 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
 
         self.logits_processor = LogitsProcessor(
             config,
+            skip_all_gather=self.mapping.attn.has_dp,
+            do_argmax=True,
             tp_rank=self.mapping.attn.tp_rank,
             tp_size=self.mapping.attn.tp_size,
             tp_group=self.mapping.attn.tp_group,

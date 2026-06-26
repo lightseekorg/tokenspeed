@@ -39,10 +39,9 @@ class Nvfp4Config(QuantizationConfig):
         group_size: int = 16,
         exclude_modules: list[str] | None = None,
     ) -> None:
-        super().__init__()
+        super().__init__(exclude_modules=exclude_modules)
         self.kv_cache_quant_algo = kv_cache_quant_algo
         self.group_size = group_size
-        self.exclude_modules = exclude_modules or []
         self.weight_block_size = None  # FP4 uses group_size, not weight_block_size
 
     @classmethod
@@ -114,13 +113,3 @@ class Nvfp4Config(QuantizationConfig):
 
     def get_scaled_act_names(self) -> list[str]:
         return []
-
-    def is_layer_excluded(self, prefix: str) -> bool:
-        """Check if a layer should be excluded from FP4 quantization."""
-        import re
-
-        for pattern in self.exclude_modules:
-            regex_str = pattern.replace(".", r"\.").replace("*", ".*")
-            if re.fullmatch(regex_str, prefix):
-                return True
-        return False

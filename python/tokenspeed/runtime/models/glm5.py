@@ -1352,14 +1352,16 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
 
         row_starts_i32 = row_starts.to(torch.int32).contiguous()
         row_ends_i32 = row_ends.to(torch.int32).contiguous()
+        local_starts_i32 = torch.zeros_like(row_starts_i32)
+        causal_lens_i32 = causal_lens.to(torch.int32).contiguous()
         for start in range(0, num_prefill_tokens, max_query_rows):
             end = min(start + max_query_rows, num_prefill_tokens)
             logits = deep_gemm.fp8_mqa_logits(
                 q_fp8[start:end].contiguous(),
                 kv_fp8,
                 weights[start:end].contiguous(),
-                row_starts_i32[start:end].contiguous(),
-                row_ends_i32[start:end].contiguous(),
+                row_starts_i32[start:end],
+                row_ends_i32[start:end],
                 clean_logits=False,
                 max_seqlen_k=int(causal_lens[start:end].max().item()),
             )
@@ -1370,8 +1372,8 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             )
             trtllm_ops.indexer_topk_prefill(
                 logits.contiguous(),
-                row_starts_i32[start:end].contiguous(),
-                row_ends_i32[start:end].contiguous(),
+                local_starts_i32[start:end],
+                causal_lens_i32[start:end],
                 workspace_indices[start:end],
                 topk,
             )
