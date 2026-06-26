@@ -106,6 +106,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
     _group_slot_mapping_from_raw,
     _mask_invalid_graph_tokens,
 )
+from tokenspeed.runtime.layers.deepseek_v4_mhc import mhc_fused_hc as fast_mhc_fused_hc
 from tokenspeed.runtime.layers.deepseek_v4_mhc import mhc_post as fast_mhc_post
 from tokenspeed.runtime.layers.deepseek_v4_mhc import mhc_pre as fast_mhc_pre
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
@@ -385,6 +386,32 @@ def mhc_post(
     comb: torch.Tensor,
 ) -> torch.Tensor:
     return fast_mhc_post(hidden_states, residual, post, comb)
+
+
+def mhc_fused_hc(
+    x_prev: torch.Tensor,
+    residual_prev: torch.Tensor,
+    post_prev: torch.Tensor,
+    comb_prev: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return fast_mhc_fused_hc(
+        x_prev,
+        residual_prev,
+        post_prev,
+        comb_prev,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_eps,
+        sinkhorn_iters,
+    )
 
 
 def hc_head(
@@ -3831,20 +3858,39 @@ class DeepseekV4DecoderLayer(nn.Module):
         input_ids: torch.Tensor,
         swa_slot_mapping: torch.Tensor | None = None,
         compressor_slot_cache: dict | None = None,
-    ) -> torch.Tensor:
-        residual = hidden_states
-        with nvtx_range("hc_attn_pre"):
-            hidden_states, post, comb = mhc_pre(
-                hidden_states,
-                self.hc_attn_fn,
-                self.hc_attn_scale,
-                self.hc_attn_base,
-                self.rms_norm_eps,
-                self.hc_eps,
-                self.hc_sinkhorn_iters,
-            )
+        hc_x_prev: torch.Tensor | None = None,
+        hc_post_prev: torch.Tensor | None = None,
+        hc_comb_prev: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if hc_x_prev is not None:
+            with nvtx_range("hc_fused_attn_pre"):
+                residual, hidden_states, post, comb = mhc_fused_hc(
+                    hc_x_prev,
+                    hidden_states,
+                    hc_post_prev,
+                    hc_comb_prev,
+                    self.hc_attn_fn,
+                    self.hc_attn_scale,
+                    self.hc_attn_base,
+                    self.rms_norm_eps,
+                    self.hc_eps,
+                    self.hc_sinkhorn_iters,
+                )
+        else:
+            residual = hidden_states
+            with nvtx_range("hc_attn_pre"):
+                hidden_states, post, comb = mhc_pre(
+                    hidden_states,
+                    self.hc_attn_fn,
+                    self.hc_attn_scale,
+                    self.hc_attn_base,
+                    self.rms_norm_eps,
+                    self.hc_eps,
+                    self.hc_sinkhorn_iters,
+                )
         with nvtx_range("attn_norm"):
             hidden_states = self.attn_norm(hidden_states)
+
         with nvtx_range("attn_total"):
             hidden_states = self.attn(
                 positions,
@@ -3854,13 +3900,13 @@ class DeepseekV4DecoderLayer(nn.Module):
                 swa_slot_mapping,
                 compressor_slot_cache,
             )
-        with nvtx_range("hc_attn_post"):
-            hidden_states = mhc_post(hidden_states, residual, post, comb)
 
-        residual = hidden_states
-        with nvtx_range("hc_ffn_pre"):
-            hidden_states, post, comb = mhc_pre(
+        with nvtx_range("hc_fused_ffn_pre"):
+            residual, hidden_states, post, comb = mhc_fused_hc(
                 hidden_states,
+                residual,
+                post,
+                comb,
                 self.hc_ffn_fn,
                 self.hc_ffn_scale,
                 self.hc_ffn_base,
@@ -3870,6 +3916,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
         with nvtx_range("ffn_norm"):
             hidden_states = self.ffn_norm(hidden_states)
+
         ffn_input_ids = input_ids
         use_mega_moe = getattr(self.ffn, "use_mega_moe", False)
         if use_mega_moe:
@@ -3901,9 +3948,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                 hidden_states, _ = self.comm_manager.post_mlp_comm(
                     hidden_states, None, ctx
                 )
-        with nvtx_range("hc_ffn_post"):
-            hidden_states = mhc_post(hidden_states, residual, post, comb)
-        return hidden_states
+        # Defer ffn post_mapping to next layer's fused_hc
+        return residual, hidden_states, post, comb
 
 
 class DeepseekV4Model(nn.Module):
@@ -3985,8 +4031,11 @@ class DeepseekV4Model(nn.Module):
         # same ratio; memoize within the step (filled lazily by the first compressor of
         # each ratio, reused by the rest).
         compressor_slot_cache: dict = {}
+        hc_x_prev = None
+        hc_post_prev = None
+        hc_comb_prev = None
         for layer in self.layers:
-            hidden_states = layer(
+            hidden_states, hc_x_prev, hc_post_prev, hc_comb_prev = layer(
                 positions,
                 hidden_states,
                 ctx,
@@ -3994,6 +4043,13 @@ class DeepseekV4Model(nn.Module):
                 input_ids,
                 swa_slot_mapping,
                 compressor_slot_cache,
+                hc_x_prev,
+                hc_post_prev,
+                hc_comb_prev,
+            )
+        with nvtx_range("hc_ffn_post_final"):
+            hidden_states = mhc_post(
+                hc_x_prev, hidden_states, hc_post_prev, hc_comb_prev
             )
         aux_hidden_states = None
         if (
