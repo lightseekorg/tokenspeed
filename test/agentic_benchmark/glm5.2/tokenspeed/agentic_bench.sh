@@ -24,6 +24,8 @@ pip install "evalscope[perf] @ git+https://github.com/modelscope/evalscope.git@$
 CONFIGS=(
     attn_tp4_moe_tp4
     attn_tp4_moe_ep4
+    attn_tp8_moe_tp8
+    attn_tp8_moe_ep8
 )
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

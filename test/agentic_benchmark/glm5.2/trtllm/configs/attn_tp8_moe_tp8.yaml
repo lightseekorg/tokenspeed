@@ -1,0 +1,13 @@
+tensor_parallel_size: 8
+enable_attention_dp: false
+moe_expert_parallel_size: 1
+max_batch_size: 16
+cuda_graph_config:
+    batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+kv_cache_config:
+    dtype: fp8
+moe_config:
+    backend: TRTLLM
+speculative_config:
+    decoding_type: MTP
+    max_draft_len: 3
