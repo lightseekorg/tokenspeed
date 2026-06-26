@@ -151,15 +151,12 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
         self.cuda_graph_prefill_metadata: dict[int, TRTLLMMHAMetadata] = {}
         self.cuda_graph_decode_metadata: dict[int, TRTLLMMHAMetadata] = {}
 
-        # DFLASH draft: the drafter predicts a whole block of spec_num_tokens in
-        # one decode forward and needs *non-causal* (block-diffusion) attention.
-        # Rather than ask the trtllm multi-query decode kernel for a non-causal
-        # mask, expand each request into spec_num_tokens single-query decode rows
-        # (q_len_per_req == 1) that all carry the SAME block-end seq_len; each row
-        # then attends over the entire block (prefix + every block position),
-        # which is exactly the non-causal block view. This mirrors the MHA
-        # backend's draft_block_decode path. Only ever true for the DFLASH draft
-        # backend; the target verify and ordinary trtllm decode are untouched.
+        # DFLASH draft: the drafter predicts a whole block of spec_num_tokens
+        # per decode forward and needs non-causal (block-diffusion) attention.
+        # Instead of a non-causal mask, expand each request into spec_num_tokens
+        # single-query rows sharing the SAME block-end seq_len, so each row
+        # attends over the whole block. Mirrors the MHA draft_block_decode path;
+        # target verify and ordinary trtllm decode are untouched.
         self.draft_block_decode = bool(getattr(config, "draft_block_decode", False))
 
     # ------------------------------------------------------------------
@@ -277,11 +274,10 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
             attention_sink = attention_sink.float()
 
         if self.draft_block_decode and self.spec_num_tokens > 1:
-            # DFLASH draft block: the metadata was expanded to bs*spec_num_tokens
-            # single-query rows (max_seq_len_q == 1), so each block position
-            # decodes over the whole block (non-causal). Use the decode slot
-            # directly instead of inferring q_len_per_req from q.shape[0]//bs
-            # (which would be spec_num_tokens and wrongly pick the prefill slot).
+            # DFLASH draft block: metadata is expanded to bs*spec_num_tokens
+            # single-query rows, so use the decode slot directly. Inferring
+            # q_len_per_req from q.shape[0]//bs would be spec_num_tokens and
+            # wrongly pick the prefill slot.
             metadata = self.forward_decode_metadata
         else:
             # Multi-token decode (q_len > 1) reads the prefill slot's
@@ -389,9 +385,9 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
             return
 
         if self.draft_block_decode and self.spec_num_tokens > 1:
-            # DFLASH draft block (eager path): expand to spec_num_tokens
-            # single-query rows per request. seq_lens is the block-end length
-            # (prefix + spec_num_tokens) the drafter already wrote.
+            # DFLASH draft block (eager): expand to spec_num_tokens single-query
+            # rows per request; seq_lens is the block-end length the drafter
+            # already wrote.
             self._init_block_decode_metadata(
                 bs, req_pool_indices, seq_lens, req_to_page
             )
@@ -439,10 +435,9 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
     ) -> None:
         """Replicate each request's page table to its spec_num_tokens block rows.
 
-        ``out`` is the [bs*spec_num_tokens, max_num_pages] destination; row
-        ``r*spec + i`` holds request ``r``'s pages for every block position
-        ``i``. All block rows of a request share its pages (decode only reads
-        KV), so a single broadcast copy is enough.
+        ``out`` is the [bs*spec_num_tokens, max_num_pages] destination. All block
+        rows of a request share its pages (decode only reads KV), so a single
+        broadcast copy suffices.
         """
         spec = self.spec_num_tokens
         base_page_table = req_to_page[req_pool_indices[:bs], : self.max_num_pages]
@@ -458,12 +453,9 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
         req_to_page: torch.Tensor,
     ):
         """Eager DFLASH draft-block metadata: spec_num_tokens single-query rows
-        per request, all carrying the request's block-end seq_len so each block
-        query attends over the whole block (non-causal block-diffusion).
-
-        ``seq_lens`` is the block-end length (prefix + spec_num_tokens). Fresh
-        buffers are allocated here (eager path only; the cuda-graph path uses the
-        persistent expanded buffers), mirroring the MHA backend.
+        per request, all carrying the block-end seq_len (prefix + spec_num_tokens)
+        so each query attends over the whole block. Allocates fresh buffers (the
+        cuda-graph path uses persistent ones), mirroring the MHA backend.
         """
         assert (
             seq_lens.dtype == torch.int32
@@ -477,9 +469,8 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
         )
         self._replicate_block_page_table(page_table, req_pool_indices, bs, req_to_page)
 
-        # Clamp the block-end length so the decode never asks the kernel for more
-        # page-table columns than exist (a request near the context limit can
-        # have prefix + spec_num_tokens exceed max_context_len).
+        # Clamp the block-end length so the decode never asks for more page-table
+        # columns than exist (prefix + spec_num_tokens can exceed max_context_len).
         cache_seqlens = (
             seq_lens[:bs]
             .clamp(spec, self.max_context_len)
@@ -605,11 +596,9 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
         self.cuda_graph_prefill_metadata = {}
         self.cuda_graph_decode_metadata = {}
         if self.draft_block_decode and self.spec_num_tokens > 1:
-            # DFLASH draft block: spec_num_tokens decode rows per request. The
-            # page table is replicated per block row on replay; the block-end
-            # seq_lens are written into a dedicated buffer from inside the
-            # captured graph (see fill_block_decode_seq_lens), so this one is NOT
-            # an alias of the controller's seq_lens_buf.
+            # DFLASH draft block: spec_num_tokens decode rows per request. Unlike
+            # the plain path, cache_seqlens is a dedicated buffer (NOT aliasing
+            # seq_lens_buf): it is filled in-graph by fill_block_decode_seq_lens.
             self.cuda_graph_page_table = torch.zeros(
                 (max_bs * self.spec_num_tokens, self.max_num_pages),
                 dtype=torch.int32,
@@ -653,10 +642,9 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
 
     def _init_block_decode_metadata_capture(self, bs: int):
         """DFLASH draft block (cuda-graph capture): spec_num_tokens single-query
-        decode rows per request, referencing the persistent expanded cuda-graph
-        buffers. The block-end seq_lens are filled from inside the captured graph
-        by fill_block_decode_seq_lens; seed a safe baseline here so the capture
-        run stays in range before that op records."""
+        rows per request over the persistent expanded buffers. seq_lens are
+        filled in-graph by fill_block_decode_seq_lens; seed a safe baseline here
+        so the capture run stays in range before that op records."""
         expanded_bs = bs * self.spec_num_tokens
         self.cuda_graph_cache_seqlens[:expanded_bs].fill_(self.spec_num_tokens)
         metadata = TRTLLMMHAMetadata(
@@ -718,10 +706,8 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
             )
 
         if self.draft_block_decode and self.spec_num_tokens > 1:
-            # DFLASH draft block: replicate each request's page table to its
-            # spec_num_tokens block rows. The block-end seq_lens are re-derived
-            # inside the captured graph (fill_block_decode_seq_lens), so they are
-            # not touched here.
+            # DFLASH draft block: replicate the page table to each request's
+            # block rows. seq_lens are re-derived in-graph, so not touched here.
             if req_to_page is not None:
                 self._replicate_block_page_table(
                     self.cuda_graph_page_table, req_pool_indices, bs, req_to_page
@@ -750,17 +736,15 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
 
     def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
         """DFLASH: broadcast each request's block-end length to its
-        spec_num_tokens cuda-graph decode rows (uniform, non-causal).
+        spec_num_tokens cuda-graph decode rows.
 
-        Called by the drafter from inside the captured graph so that on every
-        replay the expanded cache_seqlens re-derive from the live draft length
-        (recomputed in-graph from the target's accept lengths). Mirrors the MHA
+        Called by the drafter inside the captured graph so every replay
+        re-derives cache_seqlens from the live draft length. Mirrors the MHA
         backend method of the same name.
 
         Args:
             bs: Number of draft requests.
-            block_seq_lens: ``[bs]`` per-request block-end lengths
-                (prefix + spec_num_tokens).
+            block_seq_lens: ``[bs]`` per-request block-end lengths.
         """
         spec = self.spec_num_tokens
         self.cuda_graph_cache_seqlens[: bs * spec].view(bs, spec).copy_(

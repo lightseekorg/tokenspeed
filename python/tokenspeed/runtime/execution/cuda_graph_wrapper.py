@@ -803,25 +803,15 @@ class CudaGraphWrapper:
         pad = padded_bs - active_req_pool_indices.shape[0]
         if pad <= 0:
             return active_req_pool_indices
-        # Route cuda-graph padding rows to the dedicated sentinel req-pool slot
-        # (index == max_req_pool_size) rather than slot 0.
-        #
-        # valid_cache_lengths and req_to_page are sized [max_req_pool_size + 1];
-        # the sentinel row keeps its zero init (cache length 0, page table -> the
-        # dummy page 0) because _update_runtime_state only ever writes the real
-        # (unpadded) rows, so the sentinel never accumulates state. Pointing
-        # padding at slot 0 instead made every padding row alias the *live* first
-        # request: harmless for the target verify decode (seq_len forced to 1),
-        # but the DFLASH draft expands each row into a spec_num_tokens block whose
-        # uniform seq_len is derived from valid_cache_lengths[req_pool] (see
-        # DFlash._update_native_cache_from_target -> fill_block_decode_seq_lens).
-        # With slot 0 that gave padding rows a block seq_len of
-        # valid_cache_lengths[0] + accept + spec_num_tokens over slot 0's page
-        # table — unbounded as the first request's context grows (long-output
-        # workloads) and inconsistent with the pages slot 0 actually owns,
-        # which hangs the draft block-decode kernel on a drain boundary. The
-        # sentinel keeps that derived seq_len at ~spec_num_tokens over the dummy
-        # page, so padding rows stay inert for every drafter attention backend.
+        # Route padding rows to the sentinel req-pool slot (max_req_pool_size),
+        # not slot 0. valid_cache_lengths / req_to_page are sized
+        # [max_req_pool_size + 1]; the sentinel row stays zero-init (length 0,
+        # dummy page 0) since _update_runtime_state only writes real rows. Slot 0
+        # would alias the live first request: harmless for verify (seq_len == 1),
+        # but the DFLASH draft derives each row's block seq_len from
+        # valid_cache_lengths[req_pool], so padding rows would grow unbounded with
+        # request 0's context and hang the draft block-decode kernel. The sentinel
+        # keeps that derived length inert for every drafter backend.
         sentinel = int(self.config.max_req_pool_size)
         return torch.cat(
             [

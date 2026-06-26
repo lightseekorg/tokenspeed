@@ -215,19 +215,13 @@ class ModelExecutor:
         self._layerwise_mamba_cow_done = None
 
         if config.spec_algo is not None:
-            # The scheduler reserves a fresh draft block (spec_num_tokens of KV)
-            # for every decode step it keeps a request scheduled — including the
-            # bounded number of extra steps a request lingers between finishing
-            # (hitting max_new_tokens / the context limit) and being evicted, a
-            # finish/removal latency inherent to the overlap scheduler. Its peak
-            # per-request page count therefore runs a little past
-            # context_len + spec_num_tokens (empirically ~1 page near the limit).
-            # Without headroom that tips req_to_page over its width: the next
-            # draft block's page write lands out of bounds, hanging the draft
-            # block-decode / attention kernel (GPU 100% spin, server silently
-            # wedged) or, under CUDA_LAUNCH_BLOCKING, raising the
-            # update_block_table capacity check. Pad generously; the table is a
-            # few int32 columns per request, negligible memory.
+            # The overlap scheduler reserves a fresh draft block per decode step
+            # a request stays scheduled, including the few steps it lingers
+            # between finishing and eviction, so peak page count runs ~1 page past
+            # context_len + spec_num_tokens. Without headroom req_to_page
+            # overflows and the next draft block's page write goes out of bounds,
+            # hanging the attention kernel. Pad generously; a few int32 columns
+            # per request.
             draft_block_reservation_slack = config.spec_num_tokens * 64
             max_num_pages_per_req = (
                 config.context_len
@@ -586,28 +580,16 @@ class ModelExecutor:
         accept_lengths: torch.Tensor,
         decode_req_pool_indices: torch.Tensor,
     ) -> torch.Tensor:
-        """Clamp spec-verify accept so a request's committed length never
-        exceeds ``context_len``.
+        """Clamp spec-verify accept so committed length never exceeds
+        ``context_len``.
 
-        ``req_to_page`` is sized for exactly ``context_len + spec_num_tokens``
-        pages (see ``ModelExecutor.__init__``), which assumes a request's
-        committed KV length stays ``<= context_len`` and leaves room for the one
-        draft block beyond it. A speculative decode request sitting at the
-        context limit can, when its ``max_new_tokens`` termination lags by a
-        step (the scheduler keeps it in flight while the finish is committed),
-        accept tokens that push its committed length *past* ``context_len``. The
-        next draft block then needs a page column beyond ``req_to_page``'s
-        width, an out-of-bounds page access that hangs the attention kernel on
-        the GPU (an illegal access manifests as a 100%-util spin under CUDA
-        graph / async launch) or, with ``CUDA_LAUNCH_BLOCKING=1``, raises the
-        ``update_block_table`` capacity check synchronously.
-
-        Clamping accept to the remaining budget (``context_len - committed``)
-        keeps committed ``<= context_len`` so the page table always fits; the
-        request is still removed by the normal ``max_new_tokens`` termination a
-        step later. The clamp is a deterministic function of
-        ``valid_cache_lengths`` and ``accept_lengths`` (identical on every
-        attn-tp rank), so it introduces no cross-rank divergence.
+        ``req_to_page`` is sized for ``context_len + spec_num_tokens`` pages. A
+        request at the context limit whose ``max_new_tokens`` termination lags a
+        step can accept past ``context_len``, so its next draft block needs a
+        page beyond ``req_to_page``'s width — an out-of-bounds access that hangs
+        the attention kernel. Clamping to the remaining budget keeps the table in
+        range; the request is still removed a step later. Deterministic in
+        ``valid_cache_lengths`` / ``accept_lengths``, so no cross-rank divergence.
         """
         if accept_lengths.numel() == 0:
             return accept_lengths
@@ -615,9 +597,7 @@ class ModelExecutor:
             0, decode_req_pool_indices
         ).to(accept_lengths.dtype)
         remaining = (self.config.context_len - committed).clamp_(min=0)
-        # In-place so the clamp lands on the same buffer the verify path returns
-        # (which the drafter then reads to size its next draft block); a fresh
-        # ``torch.minimum`` result would only reach the local return value.
+        # In-place: the drafter reads this same buffer to size its next block.
         accept_lengths.copy_(torch.minimum(accept_lengths, remaining))
         return accept_lengths
 
@@ -627,33 +607,21 @@ class ModelExecutor:
         num_extends: int,
         bs: int,
     ) -> torch.Tensor:
-        """Return ``output_lengths`` with decode rows clamped so no request's
-        committed KV length exceeds ``context_len``.
+        """Return ``output_lengths`` with decode rows clamped so committed KV
+        length never exceeds ``context_len`` (post-forward, outside the CUDA
+        graph).
 
-        Runs on the post-forward accept lengths *outside* the CUDA graph. The
-        clamp must reach BOTH consumers to keep the runtime KV length and the
-        scheduler's page table in lock-step at ``<= context_len``:
-
-        * ``_update_runtime_state`` (``valid_cache_lengths``), and
-        * the ``ModelExecutionResult`` the output processor turns into scheduler
-          page-reservation events.
-
-        Critically the result is a FRESH tensor, not the persistent
-        ``_accept_length_buf`` the verify path returns. An in-place clamp of that
-        buffer caps ``valid_cache_lengths`` but the verify path ALSO mirrors the
-        accept counts into ``_output_pack_buf``; the packed-D2H fast path
-        (``get_packed_output_d2h``) reads that mirror, so the output processor /
-        scheduler would still see the uncapped value and reserve a draft block
-        past ``req_to_page``'s width (sized for ``context_len + spec_num_tokens``)
-        — an out-of-bounds page access that hangs the attention kernel under
-        async/graph launch (GPU 100% spin) or raises the ``update_block_table``
-        capacity check. Returning a fresh tensor forces the safe two-D2H
-        fallback, which reads these capped lengths.
+        The clamp must reach BOTH ``_update_runtime_state``
+        (``valid_cache_lengths``) and the ``ModelExecutionResult`` that drives
+        scheduler page reservation, so they stay in lock-step. Hence a FRESH
+        tensor, not the persistent ``_accept_length_buf``: the verify path also
+        mirrors accept counts into ``_output_pack_buf``, and an in-place clamp
+        would leave that mirror (read by the packed-D2H fast path) uncapped,
+        reserving a draft block past ``req_to_page``'s width and hanging the
+        kernel. A fresh tensor forces the safe two-D2H fallback.
 
         Only decode rows ``[num_extends:bs]`` carry an accept delta; prefill rows
-        commit their bounded chunk and are passed through. The clamp is a
-        deterministic function of ``valid_cache_lengths`` and ``output_lengths``
-        (identical on every attn-tp rank), so it adds no cross-rank divergence.
+        pass through. Deterministic, so no cross-rank divergence.
         """
         if bs <= num_extends:
             return output_lengths
@@ -1742,16 +1710,9 @@ class ModelExecutor:
                         ) * 1000.0
 
                 # Clamp the committed-length delta so no request grows past
-                # context_len. Done here (outside the CUDA graph, on the actual
-                # output_lengths the graph returns) so the clamp reaches BOTH
-                # consumers below: _update_runtime_state (valid_cache_lengths)
-                # and the output processor / scheduler page reservation (via the
-                # ModelExecutionResult). A clamp inside _run_sampling only lands
-                # on the drafter's copy, leaving the scheduler reservation on the
-                # uncapped value -> a request near the limit reserves a draft
-                # block past req_to_page's width (sized for context_len + spec),
-                # an out-of-bounds page access that hangs the attention kernel
-                # (GPU 100% spin) / raises the update_block_table capacity check.
+                # context_len. Done here (outside the graph) so it reaches both
+                # _update_runtime_state and the scheduler page reservation; see
+                # _clamp_committed_to_context_len.
                 output_lengths = self._clamp_committed_to_context_len(
                     output_lengths, num_extends, bs
                 )

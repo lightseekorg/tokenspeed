@@ -514,18 +514,11 @@ class EventLoop:
             payload = cache_event_to_payload(event)
             self._pending_cache_event_payloads[cache_event_key(payload)] = payload
 
-        # Skip the cross-rank gather below only when EVERY attn-tp rank agrees
-        # there is nothing to commit. Cache-op completion (poll_results above)
-        # is asynchronous and NOT lock-step across ranks: the submit-side counts
-        # mirror (same execution plan everywhere), but the poll-side decrements
-        # land at different iterations per rank, so _num_inflight_cache_ops and
-        # _pending_cache_event_payloads diverge transiently. The gather in
-        # _pop_ready_cache_event_payloads is a collective (all_gather_object on
-        # attn_tp_cpu_group); a rank-local short-circuit lets some ranks gather
-        # while others return, desyncing the group and hanging the engine (the
-        # gathering ranks block forever, the others run ahead into the next
-        # forward whose NCCL collective then has no peer). Agree on the skip
-        # with a cheap single-int all_reduce so it is unanimous.
+        # The gather below is a collective, but cache-op completion is async and
+        # not lock-step across ranks, so local state (_num_inflight_cache_ops /
+        # _pending_cache_event_payloads) diverges transiently. A rank-local skip
+        # would let some ranks gather while others return, deadlocking the group.
+        # Agree on the skip via a cheap single-int all_reduce.
         local_has_work = bool(
             self._num_inflight_cache_ops != 0 or self._pending_cache_event_payloads
         )
@@ -571,21 +564,18 @@ class EventLoop:
         )
 
     def _cache_group_has_work(self, local_has_work: bool) -> bool:
-        """Whether ANY attn-tp rank has cache work to synchronize this step.
-
-        The cache-event gather is a collective, so the decision to run or skip
-        it must be unanimous across the attn-tp group; deciding from rank-local
-        state alone desyncs the group and deadlocks (see _commit_cache_results).
-        A single-int MAX all_reduce is far cheaper than the payload
-        all_gather_object it guards.
+        """Whether ANY attn-tp rank has cache work this step (unanimous via a
+        single-int MAX all_reduce, far cheaper than the payload gather it
+        guards). Deciding from rank-local state alone deadlocks the group; see
+        _commit_cache_results.
 
         Args:
-            local_has_work: This rank's local view of whether any cache op is
-                in flight or any polled payload is awaiting commit.
+            local_has_work: This rank's view of whether any cache op is in
+                flight or any polled payload awaits commit.
 
         Returns:
-            ``True`` if at least one rank in the attn-tp group has work, so all
-            ranks must enter the gather; ``False`` only when every rank is idle.
+            ``True`` if any rank has work (all must gather); ``False`` only when
+            every rank is idle.
         """
         if self.attn_tp_size == 1:
             return local_has_work
