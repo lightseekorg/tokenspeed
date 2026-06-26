@@ -422,6 +422,11 @@ class CudaGraphWrapper:
         torch.cuda.synchronize()
         dist.barrier()
 
+        # Warmups can switch a backend back to eager metadata objects. Restore
+        # the graph-backed metadata immediately before capture so replay-time
+        # metadata refreshes update the same tensors recorded by the graph.
+        self._init_capture_metadata(bs)
+
         # Fill sampler buffers OUTSIDE the capture so RNG ops aren't recorded.
         if self.sampling_backend is not None:
             self.sampling_backend.prepare_capture(
@@ -656,10 +661,12 @@ class CudaGraphWrapper:
             draft_forward_mode = ForwardMode.DECODE
             if draft_uses_paged_groups:
                 draft_attn_kwargs["num_tokens"] = padded_bs * self.max_tokens_per_req
+            draft_seq_lens = self.drafter.draft_seq_lens_buf[:padded_bs]
+            draft_seq_lens.copy_(seq_lens[:padded_bs])
             self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
                 padded_bs,
                 req_pool_indices,
-                seq_lens,
+                draft_seq_lens,
                 req_to_page=self.drafter.req_to_page,
                 forward_mode=draft_forward_mode,
                 **draft_attn_kwargs,

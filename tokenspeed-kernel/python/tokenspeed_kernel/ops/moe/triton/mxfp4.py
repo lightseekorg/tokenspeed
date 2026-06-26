@@ -29,7 +29,7 @@ import torch.nn.functional as F
 from tokenspeed_kernel._triton import redirect_triton_to_tokenspeed_triton
 from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import format_signature, format_signatures
+from tokenspeed_kernel.signature import format_signatures
 
 with redirect_triton_to_tokenspeed_triton():
     import triton_kernels  # noqa: F401
@@ -275,16 +275,7 @@ def _local_topk_for_ep(
     return local_weights, local_ids, num_local_experts
 
 
-@register_kernel(
-    "moe",
-    "process_weights",
-    name="triton_mxfp4_moe_process_weights",
-    solution="triton",
-    signatures=frozenset({format_signature()}),
-    traits={"weight_dtype": frozenset({"mxfp4"})},
-    priority=Priority.PORTABLE,
-)
-def triton_mxfp4_moe_process_weights(plan: dict, w: torch.nn.Module):
+def triton_mxfp4_moe_weights(plan: dict, w: torch.nn.Module):
     MXFP_BLOCK_SIZE = 32
 
     if hasattr(w, "w13_weight_bias"):
@@ -368,6 +359,7 @@ def triton_mxfp4_moe_process_weights(plan: dict, w: torch.nn.Module):
     "apply",
     name="triton_mxfp4_precomputed_moe_apply",
     solution="triton",
+    weight_preprocessor=triton_mxfp4_moe_weights,
     capability=CapabilityRequirement(vendors=frozenset({"amd"})),
     signatures=format_signatures(
         "x",
@@ -392,6 +384,7 @@ def triton_mxfp4_moe_process_weights(plan: dict, w: torch.nn.Module):
     "apply",
     name="triton_mxfp4_ep_precomputed_moe_apply",
     solution="triton",
+    weight_preprocessor=triton_mxfp4_moe_weights,
     capability=CapabilityRequirement(vendors=frozenset({"amd"})),
     signatures=format_signatures(
         "x",
@@ -416,6 +409,7 @@ def triton_mxfp4_moe_process_weights(plan: dict, w: torch.nn.Module):
     "apply",
     name="triton_mxfp4_moe_apply",
     solution="triton",
+    weight_preprocessor=triton_mxfp4_moe_weights,
     signatures=format_signatures(
         "x",
         "dense",

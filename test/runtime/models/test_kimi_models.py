@@ -10,6 +10,7 @@ Usage:
     python3 -m unittest models.test_kimi_models.TestKimiK25.test_base -v
     python3 -m unittest models.test_kimi_models.TestKimiK25.test_tsckpt_eagle3 -v
     python3 -m unittest models.test_kimi_models.TestKimiK25.test_nvckpt_eagle3 -v
+    python3 -m unittest models.test_kimi_models.TestKimiK25.test_dflash -v
 
 Environment (all optional):
     KIMI_K25_MODEL                HF model id or path (default: nvidia/Kimi-K2.5-NVFP4)
@@ -17,6 +18,7 @@ Environment (all optional):
     KIMI_K25_WORLD_SIZE           GPU count (default: 4)
     KIMI_K25_DRAFT_MODEL          EAGLE3 draft repo (default: lightseekorg/kimi-k2.5-eagle3)
     KIMI_K25_MLA_DRAFT_MODEL      MLA EAGLE3 draft repo (default: nvidia/Kimi-K2.5-Thinking-Eagle3)
+    KIMI_K25_DFLASH_DRAFT_MODEL   Native DFLASH draft repo (default: z-lab/Kimi-K2.5-DFlash)
 """
 
 import dataclasses
@@ -36,6 +38,9 @@ WORLD_SIZE = int(os.environ.get("KIMI_K25_WORLD_SIZE", "4"))
 DRAFT_MODEL = os.environ.get("KIMI_K25_DRAFT_MODEL", "lightseekorg/kimi-k2.5-eagle3")
 MLA_DRAFT_MODEL = os.environ.get(
     "KIMI_K25_MLA_DRAFT_MODEL", "nvidia/Kimi-K2.5-Thinking-Eagle3"
+)
+DFLASH_DRAFT_MODEL = os.environ.get(
+    "KIMI_K25_DFLASH_DRAFT_MODEL", "z-lab/Kimi-K2.5-DFlash"
 )
 TIMEOUT = 600
 
@@ -207,6 +212,41 @@ MESH_CASES = {
             "trtllm_mla",
         ),
     ),
+    "dflash": MeshCase(
+        "dflash",
+        (
+            # Native DFLASH drafts a whole block per decode step. The main model
+            # runs MLA (tokenspeed_mla), but the z-lab/Kimi-K2.5-DFlash draft is
+            # a Qwen3 MHA/GQA model, so the drafter must use an MHA-family
+            # backend (fa4); tokenspeed_mla is MLA-only and would reject it.
+            "--attention-backend",
+            "tokenspeed_mla",
+            "--moe-backend",
+            "flashinfer_trtllm",
+            "--kv-cache-dtype",
+            "fp8_e4m3",
+            "--max-prefill-tokens",
+            "8192",
+            "--chunked-prefill-size",
+            "8192",
+            "--speculative-algorithm",
+            "DFLASH",
+            "--speculative-draft-model-path",
+            DFLASH_DRAFT_MODEL,
+            "--speculative-num-steps",
+            "7",
+            "--speculative-eagle-topk",
+            "1",
+            "--speculative-num-draft-tokens",
+            "8",
+            "--speculative-draft-model-quantization",
+            "unquant",
+            "--drafter-attention-backend",
+            "fa4",
+            "--sampling-backend",
+            "greedy",
+        ),
+    ),
 }
 
 
@@ -245,6 +285,10 @@ class TestKimiK25(unittest.TestCase):
     def test_nvckpt_eagle3(self):
         """Kimi K2.5 with MLA EAGLE3 draft (trtllm_mla drafter + FP8 KV cache)."""
         self._run_quality_checks(MESH_CASES["nvckpt_eagle3"])
+
+    def test_dflash(self):
+        """Kimi K2.5 with native DFLASH block-diffusion draft (fa4 drafter)."""
+        self._run_quality_checks(MESH_CASES["dflash"])
 
 
 if __name__ == "__main__":

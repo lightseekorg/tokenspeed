@@ -129,7 +129,8 @@ void InsertHybridCache(HybridPrefixCache* hybrid_cache,
                                                                                        std::move(pages_to_insert));
 
     if (local_mamba_allocator != nullptr && local_mamba_allocator->HasCheckpoint()) {
-        if (ShouldPublishMambaCheckpoint(hybrid_cache, chunk_begin, chunk_size, page_size)) {
+        const bool publish = ShouldPublishMambaCheckpoint(hybrid_cache, chunk_begin, chunk_size, page_size);
+        if (publish) {
             hybrid_cache->InsertMamba(insert_result.last_node, local_mamba_allocator->DetachCheckpoint());
         } else {
             local_mamba_allocator->DetachCheckpoint();

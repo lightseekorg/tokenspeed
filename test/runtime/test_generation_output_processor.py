@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from tokenspeed.runtime.engine.generation_output_processor import (
@@ -71,6 +72,7 @@ class _ExecutionResult:
     output_logprobs = None
     output_nan_flags = None
     grammar_completion = None
+    next_input_ids = None
 
     def sync(self):
         return None
@@ -231,3 +233,80 @@ def test_nan_flag_skips_first_token_pd_handoff():
 
     # Flagged prefill slot is skipped; the healthy decode slot still hands off.
     assert handoffs == ["decode"]
+
+
+class _PrefillForwardOp:
+    request_ids = ["prefill"]
+    request_pool_indices = [3]
+    input_lengths = [4]
+    extend_prefix_lens = [0]
+
+    def num_extends(self):
+        return 1
+
+
+class _PrefillExecutionResult:
+    output_tokens = torch.tensor([101], dtype=torch.int32)
+    output_lengths = torch.tensor([1], dtype=torch.int32)
+    output_logprobs = None
+    output_nan_flags = None
+    grammar_completion = None
+    next_input_ids = torch.tensor([[101, 102, 103]], dtype=torch.int32)
+
+    def sync(self):
+        return None
+
+
+class _EmptyPrefillExecutionResult(_PrefillExecutionResult):
+    output_tokens = torch.tensor([], dtype=torch.int32)
+    output_lengths = torch.tensor([0], dtype=torch.int32)
+
+
+class _MismatchedPrefillExecutionResult(_PrefillExecutionResult):
+    next_input_ids = torch.tensor([[201, 202, 203]], dtype=torch.int32)
+
+
+def test_prefill_first_token_passes_spec_candidates():
+    sender = _Sender()
+    processor = OutputProcesser(sender, global_rank=0, metrics=_Metrics())
+    processor.rid_to_state["prefill"] = _state([1, 2, 3, 4])
+    calls = []
+
+    processor.post_process_forward_op(
+        _PrefillForwardOp(),
+        _PrefillExecutionResult(),
+        is_prefill_instance=True,
+        on_first_token=lambda *args: calls.append(args),
+    )
+
+    assert calls == [("prefill", 3, 101, [101, 102, 103])]
+
+
+def test_prefill_first_token_does_not_guess_from_next_input_ids():
+    sender = _Sender()
+    processor = OutputProcesser(sender, global_rank=0, metrics=_Metrics())
+    processor.rid_to_state["prefill"] = _state([1, 2, 3, 4])
+    calls = []
+
+    processor.post_process_forward_op(
+        _PrefillForwardOp(),
+        _EmptyPrefillExecutionResult(),
+        is_prefill_instance=True,
+        on_first_token=lambda *args: calls.append(args),
+    )
+
+    assert calls == []
+
+
+def test_prefill_first_token_checks_spec_candidate_bootstrap():
+    sender = _Sender()
+    processor = OutputProcesser(sender, global_rank=0, metrics=_Metrics())
+    processor.rid_to_state["prefill"] = _state([1, 2, 3, 4])
+
+    with pytest.raises(RuntimeError, match="Prefill bootstrap token mismatch"):
+        processor.post_process_forward_op(
+            _PrefillForwardOp(),
+            _MismatchedPrefillExecutionResult(),
+            is_prefill_instance=True,
+            on_first_token=lambda *args: None,
+        )

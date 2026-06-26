@@ -54,7 +54,9 @@ from tokenspeed_kernel.ops.moe.flashinfer import (
 from tokenspeed_kernel.ops.moe.flashinfer import cutlass_fp8 as _moe_cutlass_fp8
 from tokenspeed_kernel.ops.moe.flashinfer import cutlass_nvfp4 as _moe_cutlass_nvfp4
 from tokenspeed_kernel.ops.moe.flashinfer import cutlass_unquant as _moe_cutlass_unquant
+from tokenspeed_kernel.ops.moe.flashinfer import trtllm_fp8 as _moe_trtllm_fp8
 from tokenspeed_kernel.ops.moe.flashinfer import trtllm_mxfp4 as _moe_trtllm_mxfp4
+from tokenspeed_kernel.ops.moe.flashinfer import trtllm_mxint4 as _moe_trtllm_mxint4
 from tokenspeed_kernel.ops.moe.flashinfer import trtllm_nvfp4 as _moe_trtllm_nvfp4
 from tokenspeed_kernel.ops.moe.flashinfer import trtllm_unquant as _moe_trtllm_unquant
 from tokenspeed_kernel.ops.moe.gluon import mxfp4 as _moe_gluon_mxfp4
@@ -83,7 +85,9 @@ _RELOAD_MODULES = [
     _moe_cutlass_fp8,
     _moe_cutlass_nvfp4,
     _moe_cutlass_unquant,
+    _moe_trtllm_fp8,
     _moe_trtllm_mxfp4,
+    _moe_trtllm_mxint4,
     _moe_trtllm_nvfp4,
     _moe_trtllm_unquant,
     _moe_flashinfer,
@@ -106,6 +110,46 @@ def _kernel_registry(fresh_registry):
     """Reload real registrations into the fresh registry for each case."""
     for mod in _RELOAD_MODULES:
         importlib.reload(mod)
+
+
+def test_builtin_moe_preprocessor_links_are_callables():
+    kernel_registry = KernelRegistry.get()
+    errors = []
+    for kernel_spec in kernel_registry.list_kernels("moe", "apply"):
+        preprocessor = kernel_spec.weight_preprocessor
+        if preprocessor is not None and not callable(preprocessor):
+            errors.append(f"{kernel_spec.name}: non-callable preprocessor")
+
+    process_weight_kernels = kernel_registry.list_kernels("moe", "process_weights")
+    assert process_weight_kernels == []
+
+    assert errors == []
+
+
+def test_moe_process_weights_returns_for_no_preprocessing_plan():
+    module = torch.nn.Module()
+
+    result = tokenspeed_kernel.moe_process_weights(
+        {"weight_preprocessor": None},
+        module,
+    )
+
+    assert result is None
+
+
+def test_moe_process_weights_dispatches_plan_preprocessor_callable():
+    calls = []
+
+    def preprocess(plan, w):
+        calls.append((plan, w))
+
+    module = torch.nn.Module()
+    plan = {"weight_preprocessor": preprocess}
+
+    result = tokenspeed_kernel.moe_process_weights(plan, module)
+
+    assert result is None
+    assert calls == [(plan, module)]
 
 
 @dataclass(frozen=True)
@@ -406,6 +450,17 @@ def _sampling_argmax() -> object:
     return tokenspeed_kernel.argmax(logits)
 
 
+def _assert_moe_plan(plan: dict, *, apply: str, preprocessor: str | None) -> None:
+    assert plan["apply_kernel_name"] == apply
+    actual_preprocessor = plan["weight_preprocessor"]
+    actual_name = (
+        None
+        if actual_preprocessor is None
+        else getattr(actual_preprocessor, "__name__", repr(actual_preprocessor))
+    )
+    assert actual_name == preprocessor
+
+
 def _moe_apply_unquant_trtllm() -> object:
     plan = tokenspeed_kernel.moe_plan(
         "unquant",
@@ -416,10 +471,10 @@ def _moe_apply_unquant_trtllm() -> object:
         ispp=128,
         internal_activation_dtype="input",
     )
-    assert plan["apply_kernel_name"] == "flashinfer_trtllm_unquant_moe_apply"
-    assert (
-        plan["process_weights_kernel_name"]
-        == "flashinfer_trtllm_unquant_moe_process_weights"
+    _assert_moe_plan(
+        plan,
+        apply="flashinfer_trtllm_unquant_moe_apply",
+        preprocessor="flashinfer_trtllm_unquant_moe_weights",
     )
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
@@ -441,10 +496,10 @@ def _moe_apply_unquant_cutlass() -> object:
         ispp=128,
         internal_activation_dtype="input",
     )
-    assert plan["apply_kernel_name"] == "flashinfer_cutlass_unquant_moe_apply"
-    assert (
-        plan["process_weights_kernel_name"]
-        == "flashinfer_cutlass_unquant_moe_process_weights"
+    _assert_moe_plan(
+        plan,
+        apply="flashinfer_cutlass_unquant_moe_apply",
+        preprocessor="flashinfer_cutlass_unquant_moe_weights",
     )
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
@@ -461,10 +516,30 @@ def _moe_apply_fp8_cutlass() -> object:
         fp8_scale_block_shape=(128, 128),
         internal_activation_dtype="input",
     )
-    assert plan["apply_kernel_name"] == "flashinfer_cutlass_fp8_moe_apply"
-    assert (
-        plan["process_weights_kernel_name"]
-        == "flashinfer_cutlass_fp8_moe_process_weights"
+    _assert_moe_plan(
+        plan,
+        apply="flashinfer_cutlass_fp8_moe_apply",
+        preprocessor="flashinfer_cutlass_fp8_moe_weights",
+    )
+    x = torch.empty((4, 16), dtype=torch.bfloat16)
+    router_logits = torch.empty((4, 8), dtype=torch.float32)
+    return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
+
+
+def _moe_apply_fp8_trtllm() -> object:
+    plan = tokenspeed_kernel.moe_plan(
+        "fp8",
+        input_dtype=torch.bfloat16,
+        activation="silu",
+        ep_size=2,
+        ispp=128,
+        fp8_scale_block_shape=(128, 128),
+        internal_activation_dtype="input",
+    )
+    _assert_moe_plan(
+        plan,
+        apply="flashinfer_trtllm_fp8_moe_apply",
+        preprocessor="flashinfer_trtllm_fp8_moe_process_weights",
     )
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
@@ -481,10 +556,10 @@ def _moe_apply_nvfp4_trtllm() -> object:
         ispp=128,
         internal_activation_dtype="input",
     )
-    assert plan["apply_kernel_name"] == "flashinfer_trtllm_nvfp4_moe_apply"
-    assert (
-        plan["process_weights_kernel_name"]
-        == "flashinfer_trtllm_nvfp4_moe_process_weights"
+    _assert_moe_plan(
+        plan,
+        apply="flashinfer_trtllm_nvfp4_moe_apply",
+        preprocessor="flashinfer_trtllm_nvfp4_moe_weights",
     )
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
@@ -507,10 +582,10 @@ def _moe_apply_nvfp4_cutlass() -> object:
         internal_activation_dtype="input",
         solution="flashinfer_cutlass",
     )
-    assert plan["apply_kernel_name"] == "flashinfer_cutlass_nvfp4_moe_apply"
-    assert (
-        plan["process_weights_kernel_name"]
-        == "flashinfer_cutlass_nvfp4_moe_process_weights"
+    _assert_moe_plan(
+        plan,
+        apply="flashinfer_cutlass_nvfp4_moe_apply",
+        preprocessor="flashinfer_cutlass_nvfp4_moe_weights",
     )
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
@@ -529,10 +604,10 @@ def _moe_apply_nvfp4_deepep_cutedsl() -> object:
         deepep_group=object(),
         solution="flashinfer_cutedsl",
     )
-    assert plan["apply_kernel_name"] == "flashinfer_cutedsl_deepep_nvfp4_moe_apply"
-    assert (
-        plan["process_weights_kernel_name"]
-        == "flashinfer_cutedsl_deepep_nvfp4_moe_process_weights"
+    _assert_moe_plan(
+        plan,
+        apply="flashinfer_cutedsl_deepep_nvfp4_moe_apply",
+        preprocessor="flashinfer_cutedsl_deepep_nvfp4_moe_weights",
     )
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
@@ -549,10 +624,10 @@ def _moe_apply_mxfp4_trtllm() -> object:
         internal_activation_dtype="input",
         with_bias=True,
     )
-    assert plan["apply_kernel_name"] == "flashinfer_trtllm_mxfp4_moe_apply"
-    assert (
-        plan["process_weights_kernel_name"]
-        == "flashinfer_trtllm_mxfp4_moe_process_weights"
+    _assert_moe_plan(
+        plan,
+        apply="flashinfer_trtllm_mxfp4_moe_apply",
+        preprocessor="flashinfer_trtllm_mxfp4_moe_weights",
     )
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
@@ -568,8 +643,11 @@ def _moe_apply_mxfp4_triton() -> object:
         internal_activation_dtype="fp8",
         with_bias=True,
     )
-    assert plan["apply_kernel_name"] == "triton_mxfp4_moe_apply"
-    assert plan["process_weights_kernel_name"] == "triton_mxfp4_moe_process_weights"
+    _assert_moe_plan(
+        plan,
+        apply="triton_mxfp4_moe_apply",
+        preprocessor="triton_mxfp4_moe_weights",
+    )
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
     return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
@@ -584,8 +662,30 @@ def _moe_apply_mxfp4_gluon() -> object:
         internal_activation_dtype="fp8",
         with_bias=True,
     )
-    assert plan["apply_kernel_name"] == "gluon_mxfp4_moe_apply"
-    assert plan["process_weights_kernel_name"] == "gluon_mxfp4_moe_process_weights"
+    _assert_moe_plan(
+        plan,
+        apply="gluon_mxfp4_moe_apply",
+        preprocessor="gluon_mxfp4_gfx950_moe_weights",
+    )
+    x = torch.empty((4, 16), dtype=torch.bfloat16)
+    router_logits = torch.empty((4, 8), dtype=torch.float32)
+    return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
+
+
+def _moe_apply_mxint4_trtllm() -> object:
+    plan = tokenspeed_kernel.moe_plan(
+        "mxint4",
+        input_dtype=torch.bfloat16,
+        activation="swiglu",
+        ep_size=2,
+        ispp=256,
+        internal_activation_dtype="input",
+    )
+    _assert_moe_plan(
+        plan,
+        apply="flashinfer_trtllm_mxint4_moe_apply",
+        preprocessor="flashinfer_trtllm_mxint4_moe_weights",
+    )
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
     return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
@@ -858,12 +958,20 @@ _CASES = [
         _moe_apply_unquant_cutlass,
     ),
     _case(
-        _is_hopper_plus,
-        "hopper-plus",
+        _is_hopper,
+        "hopper",
         "moe",
         "apply",
         "flashinfer_cutlass_fp8_moe_apply",
         _moe_apply_fp8_cutlass,
+    ),
+    _case(
+        _is_blackwell_sm100,
+        "blackwell-sm100",
+        "moe",
+        "apply",
+        "flashinfer_trtllm_fp8_moe_apply",
+        _moe_apply_fp8_trtllm,
     ),
     _case(
         _is_blackwell_sm100,
@@ -904,6 +1012,14 @@ _CASES = [
         "apply",
         "flashinfer_trtllm_mxfp4_moe_apply",
         _moe_apply_mxfp4_trtllm,
+    ),
+    _case(
+        _is_blackwell_sm100,
+        "blackwell-sm100",
+        "moe",
+        "apply",
+        "flashinfer_trtllm_mxint4_moe_apply",
+        _moe_apply_mxint4_trtllm,
     ),
     _case(
         _is_hopper,

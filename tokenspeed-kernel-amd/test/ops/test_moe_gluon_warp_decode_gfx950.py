@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import pytest
 import torch
 
@@ -24,6 +22,9 @@ if not _is_gfx950():
 
 from tokenspeed_kernel_amd.ops.moe.fused_mxfp_gfx950 import (  # noqa: E402
     _gluon_mxfp4_fp8_warp_decode_moe,
+)
+from tokenspeed_kernel_amd.ops.moe.mxfp4_gfx950_preprocess import (  # noqa: E402
+    PrecisionConfig,
 )
 
 try:
@@ -57,13 +58,6 @@ _E2M1_VALUES = [
 ]
 
 _FP8_DTYPE = torch.float8_e4m3fn
-
-
-@dataclass
-class PrecisionConfig:
-    b_mx_scale: torch.Tensor
-    b_microblock_size: int = 32
-    out_dtype: torch.dtype | None = None
 
 
 def _mxfp4_dequant(packed: torch.Tensor) -> torch.Tensor:
@@ -153,10 +147,11 @@ def _run_kernel(case: dict) -> torch.Tensor:
         case["wt2"],
         w13_bias=case["w13_bias"],
         w2_bias=case["w2_bias"],
-        w13_precision_config=case["pc1"],
-        w2_precision_config=case["pc2"],
+        w13_mx_scale=case["pc1"].b_mx_scale,
+        w2_mx_scale=case["pc2"].b_mx_scale,
         w13_act_scale=case["scale1"],
         w2_act_scale=case["scale2"],
+        out_dtype=case["pc2"].out_dtype,
         top_k=case["topk"],
     )
 

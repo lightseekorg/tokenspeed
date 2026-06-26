@@ -89,6 +89,7 @@ def fused_mamba_state_copy(
     dst_indices: torch.Tensor,  # [num_valid]
     cache_lengths: torch.Tensor | None = None,  # [num_valid], for page filter
     page_size: int = 0,  # 0 means no page filtering
+    single_layer: bool | None = None,
 ):
     """
     Copy mamba states: pool[:, dst_indices[i], :] = pool[:, src_indices[i], :]
@@ -102,12 +103,18 @@ def fused_mamba_state_copy(
     and 2D per-layer slices ``[pool_size, *state_shape]`` (which may be
     non-contiguous views into a larger cache).  For 2D inputs the kernel
     is launched with ``num_layers=1``.
+    Per-layer slices with rank > 2 (for example
+    ``[pool_size, channels, state_len]``) must pass ``single_layer=True`` so
+    the leading dimension is interpreted as the slot dimension, not as a layer
+    dimension.
 
     Args:
         pool: State tensor, either 3D [num_layers, pool_size, *state_shape]
             or 2D [pool_size, *state_shape].
         src_indices: Source slot indices [num_valid], int32 or int64.
         dst_indices: Destination slot indices [num_valid], int32 or int64.
+        single_layer: Interpret ``pool`` as a per-layer ``[pool_size, ...]``
+            slice. Defaults to True only for rank-2 tensors for compatibility.
         cache_lengths: Per-entry cache lengths for page-boundary filtering.
         page_size: When > 0, only copy entries where cache_lengths[i] is
             aligned to page_size. Set to 0 to disable filtering (used by
@@ -126,11 +133,14 @@ def fused_mamba_state_copy(
             f"indices length mismatch: {src_indices.shape[0]} vs {dst_indices.shape[0]}"
         )
 
-    if pool.ndim == 2:
+    if single_layer is None:
+        single_layer = pool.ndim == 2
+
+    if single_layer:
         num_layers = 1
         pool_size = pool.shape[0]
         elem_per_entry = pool.numel() // pool_size
-        layer_stride = 0  # unused when num_layers=1 (pid_layer is always 0)
+        layer_stride = 0
         req_stride = pool.stride(0)
     else:
         num_layers = pool.shape[0]

@@ -25,6 +25,7 @@ class SpeculativeAlgorithm(IntEnum):
     NONE = auto()
     EAGLE3 = auto()
     MTP = auto()
+    DFLASH = auto()
 
     def is_none(self) -> bool:
         return self == SpeculativeAlgorithm.NONE
@@ -37,6 +38,7 @@ class SpeculativeAlgorithm(IntEnum):
         name_map = {
             "EAGLE3": SpeculativeAlgorithm.EAGLE3,
             "MTP": SpeculativeAlgorithm.MTP,
+            "DFLASH": SpeculativeAlgorithm.DFLASH,
             None: SpeculativeAlgorithm.NONE,
         }
         if name is not None:

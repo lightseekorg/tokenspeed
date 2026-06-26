@@ -5301,7 +5301,7 @@ def _launch_kernel(
     if not needs_scale_load:
         x_global_scale_buf = _make_dummy(x.device, torch.float32)
     elif isinstance(x_global_scale, torch.Tensor):
-        # Production: zero-copy passthrough of upstream FlexCtx scale.
+        # Production: zero-copy passthrough of the precision config scale.
         scale_view = x_global_scale.detach().reshape(-1)[:1]
         if scale_view.device == x.device and scale_view.dtype == torch.float32:
             x_global_scale_buf = scale_view
@@ -6230,15 +6230,10 @@ def gluon_mxfp_combine(
     else:
         n_tokens_eff = int(n_tokens)
         n_rows = n_tokens_eff * n_act_eff
-    # Preshuffled/medium-decode W may be padded in N to satisfy the packed
-    # layout. Keep padded N for tiling/W-scale reads, but store only the
-    # caller-visible width.
+    # W may be padded in N to satisfy the packed layout. Keep padded N for
+    # tiling/W-scale reads, but store only the caller-visible width.
     logical_n = int(getattr(w, "original_n", N))
-    y_n = (
-        logical_n
-        if (w_preshuffle or medium_decode_combine_eligible) and logical_n < N
-        else N
-    )
+    y_n = logical_n if logical_n < N else N
     y = torch.empty((n_rows, y_n), device=x.device, dtype=out_dtype)
     _launch_kernel(
         x,
@@ -6394,45 +6389,38 @@ def gluon_mxfp_ragged_matmul(
     w: torch.Tensor,
     bias: torch.Tensor | None,
     *,
+    w_mx_scale: torch.Tensor,
+    x_global_scale: Optional[torch.Tensor] = None,
+    x_mx_scale: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    x_format: str = "e4m3",
     a_ragged_metadata=None,
     gather_indx=None,
     scatter_indx=None,
-    precision_config=None,
     fused_activation=None,
     n_tokens=None,
     n_expts_act=None,
     **extra_kwargs,
 ) -> torch.Tensor | None:
-    assert precision_config is not None
-    w_mx_scale = getattr(precision_config, "b_mx_scale", None)
     assert w_mx_scale is not None
 
-    flex = getattr(precision_config, "flex_ctx", None)
-    lhs = getattr(flex, "lhs_data", None) if flex is not None else None
-    fp8_dtype = getattr(lhs, "dtype", None) if lhs is not None else None
-    fp8_scale = getattr(lhs, "scale", None) if lhs is not None else None
-
-    x_mx_scale = getattr(precision_config, "a_mx_scale", None)
-
-    if fp8_dtype is not None:
-        x_format = "e4m3"
-        x_global_scale = _global_scale_passthrough(fp8_scale)
+    if x_format == "e4m3":
+        x_global_scale = _global_scale_passthrough(x_global_scale)
         x_view = x.view(torch.uint8) if x.dtype != torch.uint8 else x
         x_scale = None
-    elif x_mx_scale is not None:
-        x_format = "e2m1"
+    elif x_format == "e2m1":
+        if x_mx_scale is None:
+            raise RuntimeError("x_mx_scale is required for e2m1 input X")
         x_global_scale = 1.0
         x_view = x.view(torch.uint8) if x.dtype != torch.uint8 else x
         x_scale = _extract_gluon_raw_s(x_mx_scale)
         assert isinstance(x_scale, torch.Tensor)
     else:
-        raise RuntimeError("missing required precision config for input X")
+        raise RuntimeError(f"unsupported input X format: {x_format}")
 
-    if precision_config.out_dtype is not None:
-        out_dtype = precision_config.out_dtype
-    elif x.dtype.is_floating_point:
+    if out_dtype is None and x.dtype.is_floating_point:
         out_dtype = x.dtype
-    else:
+    elif out_dtype is None:
         out_dtype = torch.bfloat16
 
     prefer_unshuffled_w = bool(extra_kwargs.get("prefer_unshuffled_w", False))
@@ -6525,10 +6513,11 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
     *,
     w13_bias=None,
     w2_bias=None,
-    w13_precision_config=None,
-    w2_precision_config=None,
+    w13_mx_scale: torch.Tensor,
+    w2_mx_scale: torch.Tensor,
     w13_act_scale: torch.Tensor,
     w2_act_scale: torch.Tensor,
+    out_dtype: torch.dtype,
     top_k: int,
     swiglu_alpha: float = 1.702,
     swiglu_limit: float = 7.0,
@@ -6543,8 +6532,6 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
     if n_tokens > WARP_DECODE_MAX_M:
         return None
     if not gluon_route_supported(router_logits, top_k, router_logits.dtype):
-        return None
-    if w13_precision_config is None or w2_precision_config is None:
         return None
 
     # Use the optional Gluon dot-layout preshuffled attachments when they match
@@ -6565,8 +6552,8 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
         and int(getattr(w2_raw_candidate, "gluon_dot_block_n", 0)) == 128
     )
     w2_raw = w2_raw_candidate if w2_preshuffled else _extract_gluon_raw_s(w2_weight)
-    w13_scale = _extract_gluon_raw_s(getattr(w13_precision_config, "b_mx_scale", None))
-    w2_scale = _extract_gluon_raw_s(getattr(w2_precision_config, "b_mx_scale", None))
+    w13_scale = _extract_gluon_raw_s(w13_mx_scale)
+    w2_scale = _extract_gluon_raw_s(w2_mx_scale)
     if not all(
         isinstance(t, torch.Tensor) for t in (w13_raw, w2_raw, w13_scale, w2_scale)
     ):
@@ -6610,7 +6597,6 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
     # Pass the FP8 tensor straight to Gluon.  ``view(torch.uint8)`` materializes a
     # copy for float8 tensors on this stack and dominates small-M latency.
 
-    out_dtype = getattr(w2_precision_config, "out_dtype", None) or torch.bfloat16
     out = torch.empty((n_tokens, N), dtype=out_dtype, device=hidden_states.device)
 
     # The kernels only read the bias pointer when HAS_BIAS; allocate the
@@ -6723,16 +6709,17 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
 def gluon_mxfp_fused_moe(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
-    w13_weight,
-    w2_weight,
+    w13_weight: torch.Tensor,
+    w2_weight: torch.Tensor,
     *,
-    w13_bias=None,
-    w2_bias=None,
-    w13_precision_config=None,
-    w2_precision_config=None,
+    w13_mx_scale: torch.Tensor,
+    w2_mx_scale: torch.Tensor,
     w13_act_scale: torch.Tensor,
     w2_act_scale: torch.Tensor,
     top_k: int,
+    w13_bias: Optional[torch.Tensor] = None,
+    w2_bias: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
     enable_warp_decode: bool = True,
     swiglu_alpha: float = 1.702,
     swiglu_limit: float = 7.0,
@@ -6746,10 +6733,11 @@ def gluon_mxfp_fused_moe(
         w13_weight, w2_weight: gluon-swizzled MXFP4 expert weights
             (``RaggedTensorMetadata``-compatible wrapped tensors).
         w13_bias, w2_bias: optional float32 expert biases.
-        w13_precision_config, w2_precision_config: ``PrecisionConfig``
-            built by the backend (encodes fp8 LHS scale + mxfp4 RHS).
+        w13_mx_scale, w2_mx_scale: gluon-swizzled MXFP4 expert weight
+            scales for the two GEMMs.
         w13_act_scale, w2_act_scale: per-tensor FP8 activation scales
             for the two GEMMs.
+        out_dtype: output dtype for the final combine output.
         top_k: routing top_k.
         swiglu_alpha / swiglu_limit: SwiGLU activation parameters.
 
@@ -6772,10 +6760,11 @@ def gluon_mxfp_fused_moe(
             w2_weight,
             w13_bias=w13_bias,
             w2_bias=w2_bias,
-            w13_precision_config=w13_precision_config,
-            w2_precision_config=w2_precision_config,
+            w13_mx_scale=w13_mx_scale,
+            w2_mx_scale=w2_mx_scale,
             w13_act_scale=w13_act_scale,
             w2_act_scale=w2_act_scale,
+            out_dtype=out_dtype,
             top_k=top_k,
             swiglu_alpha=swiglu_alpha,
             swiglu_limit=swiglu_limit,
@@ -6812,9 +6801,11 @@ def gluon_mxfp_fused_moe(
         gemm1_input,
         w13_weight,
         w13_bias,
+        w_mx_scale=w13_mx_scale,
+        x_global_scale=w13_act_scale,
+        out_dtype=out_dtype,
         a_ragged_metadata=ragged_metadata,
         gather_indx=gather_indx,
-        precision_config=w13_precision_config,
         fused_activation=act,
         out_quant_scale=w2_act_scale,
         prefer_unshuffled_w=use_medium_decode,
@@ -6826,9 +6817,11 @@ def gluon_mxfp_fused_moe(
         gemm2_input,
         w2_weight,
         w2_bias,
+        w_mx_scale=w2_mx_scale,
+        x_global_scale=w2_act_scale,
+        out_dtype=out_dtype,
         a_ragged_metadata=ragged_metadata,
         scatter_indx=scatter_indx,
-        precision_config=w2_precision_config,
         gammas=gate_scal,
         n_tokens=n_tokens,
         n_expts_act=top_k,
