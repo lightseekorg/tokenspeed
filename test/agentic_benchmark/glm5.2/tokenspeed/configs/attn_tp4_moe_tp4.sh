@@ -3,9 +3,9 @@
 set -euo pipefail
 
 exec ts serve \
-    --model nvidia/GLM-5.1-NVFP4 \
+    --model nvidia/GLM-5.2-NVFP4 \
     --attn-tp-size 4 \
-    --ep-size 4 \
+    --moe-tp-size 4 \
     --max-model-len 80000 \
     --max-num-seqs 16 \
     --max-prefill-tokens 8192 \

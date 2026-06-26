@@ -11,7 +11,7 @@ pip install "evalscope[perf] @ git+https://github.com/modelscope/evalscope.git@$
 
 # Note: Only 94 conversations can be built
 [ -f agentic_dataset.json ] || python3 build_swe_smith_dataset.py \
-    --model zai-org/GLM-5.1 \
+    --model zai-org/GLM-5.2 \
     --first-turn-length 50000 \
     --subsequent-turn-length 800 \
     --min-turns 10 \
@@ -106,22 +106,22 @@ for CONFIG in "${CONFIGS[@]}"; do
 
     echo "Warmup..."
     evalscope perf \
-        --model nvidia/GLM-5.1-NVFP4 \
+        --model nvidia/GLM-5.2-NVFP4 \
         --url http://127.0.0.1:8000/v1/chat/completions \
         --api openai \
         --dataset swe_smith \
         --dataset-path agentic_dataset.json \
         --max-tokens 500 \
         --multi-turn \
-        --number 1 \
-        --parallel 1 \
+        --number 2 \
+        --parallel 2 \
         --extra-args '{"ignore_eos": true}' \
         --dataset-offset 68 \
         --outputs-dir /tmp/outputs
 
     echo "Benchmark..."
     evalscope perf \
-        --model nvidia/GLM-5.1-NVFP4 \
+        --model nvidia/GLM-5.2-NVFP4 \
         --url http://127.0.0.1:8000/v1/chat/completions \
         --api openai \
         --dataset swe_smith \
