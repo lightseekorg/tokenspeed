@@ -1,5 +1,5 @@
 api_version: ci.tokenspeed.io/v1
-name: eval-kimi-k2.5-nvfp4-dflash-gsm8k
+name: eval-kimi-k2.5-nvfp4-dflash-aime25
 type: eval
 triggers:
   - manual
