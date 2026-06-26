@@ -455,6 +455,8 @@ class MoEConfig:
     WITH_W_MX_SCALE: gl.constexpr
     SCALE_LOAD_MODE: gl.constexpr
     SCALE_VIA_LDS: gl.constexpr
+    X_SCALE_VIA_LDS: gl.constexpr
+    W_SCALE_VIA_LDS: gl.constexpr
     PRESHUFFLE_FACTOR: gl.constexpr
     BLOCK_M_PRESHUFFLED: gl.constexpr
     BLOCK_N_PRESHUFFLED: gl.constexpr
@@ -510,6 +512,8 @@ class MoEConfig:
         W_PRESHUFFLED=False,
         W_VIA_VGPR=False,
         W_PREFETCH=True,
+        X_SCALE_VIA_LDS=None,
+        W_SCALE_VIA_LDS=None,
     ):
         if SCALE_LOAD_MODE not in _SCALE_LOAD_MODES:
             raise ValueError(
@@ -533,10 +537,14 @@ class MoEConfig:
         self.DTYPE_X = gl.constexpr(DTYPE_X)
         self.DTYPE_W = gl.constexpr(DTYPE_W)
 
-        _scale_via_lds = SCALE_LOAD_MODE == "swizzle" and (
-            WITH_X_MX_SCALE or WITH_W_MX_SCALE
-        )
+        if X_SCALE_VIA_LDS is None:
+            X_SCALE_VIA_LDS = SCALE_LOAD_MODE == "swizzle" and WITH_X_MX_SCALE
+        if W_SCALE_VIA_LDS is None:
+            W_SCALE_VIA_LDS = SCALE_LOAD_MODE == "swizzle" and WITH_W_MX_SCALE
+        _scale_via_lds = X_SCALE_VIA_LDS or W_SCALE_VIA_LDS
         self.SCALE_VIA_LDS = gl.constexpr(_scale_via_lds)
+        self.X_SCALE_VIA_LDS = gl.constexpr(X_SCALE_VIA_LDS)
+        self.W_SCALE_VIA_LDS = gl.constexpr(W_SCALE_VIA_LDS)
         self.PRESHUFFLE_FACTOR = gl.constexpr(_SCALE_PRESHUFFLE_FACTOR)
         self.BLOCK_M_PRESHUFFLED = gl.constexpr(BLOCK_M // _SCALE_PRESHUFFLE_FACTOR)
         self.BLOCK_N_PRESHUFFLED = gl.constexpr(BLOCK_N // _SCALE_PRESHUFFLE_FACTOR)
@@ -558,9 +566,9 @@ class MoEConfig:
         if not W_VIA_VGPR:
             num_loads += 1  # w (LDS path)
         if _scale_via_lds:
-            if WITH_X_MX_SCALE:
+            if X_SCALE_VIA_LDS:
                 num_loads += 1
-            if WITH_W_MX_SCALE:
+            if W_SCALE_VIA_LDS:
                 num_loads += 1
         self.NUM_LOADS_IN_BATCH = gl.constexpr(num_loads)
 
@@ -727,11 +735,11 @@ class MoEProgramBase:
                 load_idx, self.w_buffer, pred, USE_MASK=USE_MASK
             )
         if cfg.SCALE_VIA_LDS:
-            if cfg.WITH_X_MX_SCALE:
+            if cfg.X_SCALE_VIA_LDS:
                 self.x_scale_desc.issue_async_load(
                     load_idx, self.x_scale_buffer, pred, USE_MASK=USE_MASK
                 )
-            if cfg.WITH_W_MX_SCALE:
+            if cfg.W_SCALE_VIA_LDS:
                 self.w_scale_desc.issue_async_load(
                     load_idx, self.w_scale_buffer, pred, USE_MASK=USE_MASK
                 )
@@ -1167,16 +1175,8 @@ class MoEPipelinedProgram:
         self.cfg = cfg
         self.x_buffer = x_buffer
         self.w_buffer = w_buffer if not cfg.W_VIA_VGPR else gl.constexpr(0)
-        self.x_scale_buffer = (
-            x_scale_buffer
-            if (cfg.SCALE_VIA_LDS and cfg.WITH_X_MX_SCALE)
-            else gl.constexpr(0)
-        )
-        self.w_scale_buffer = (
-            w_scale_buffer
-            if (cfg.SCALE_VIA_LDS and cfg.WITH_W_MX_SCALE)
-            else gl.constexpr(0)
-        )
+        self.x_scale_buffer = x_scale_buffer if cfg.X_SCALE_VIA_LDS else gl.constexpr(0)
+        self.w_scale_buffer = w_scale_buffer if cfg.W_SCALE_VIA_LDS else gl.constexpr(0)
         self.x_desc = x_desc
         self.w_desc = w_desc
         self.x_scale_desc = x_scale_desc if cfg.WITH_X_MX_SCALE else gl.constexpr(0)
@@ -1215,7 +1215,7 @@ class MoEPipelinedProgram:
                 layout=cfg.shared_layout_w,
             )
 
-        if cfg.SCALE_VIA_LDS and cfg.WITH_X_MX_SCALE:
+        if cfg.X_SCALE_VIA_LDS:
             x_scale_buffer = gl.allocate_shared_memory(
                 gl.uint8,
                 shape=[
@@ -1228,7 +1228,7 @@ class MoEPipelinedProgram:
         else:
             x_scale_buffer = gl.constexpr(0)
 
-        if cfg.SCALE_VIA_LDS and cfg.WITH_W_MX_SCALE:
+        if cfg.W_SCALE_VIA_LDS:
             w_scale_buffer = gl.allocate_shared_memory(
                 gl.uint8,
                 shape=[
@@ -1308,7 +1308,7 @@ class MoEPipelinedProgram:
         BLOCK_K_SCALE: gl.constexpr = cfg.BLOCK_K // cfg.SCALE_BLOCK
         if cfg.USE_MFMA_SCALED:
             if cfg.WITH_X_MX_SCALE:
-                if cfg.SCALE_VIA_LDS:
+                if cfg.X_SCALE_VIA_LDS:
                     scale_x = self.x_scale_desc.issue_local_load_unswizzle(
                         mfma_idx,
                         self.x_scale_buffer,
@@ -1327,7 +1327,7 @@ class MoEPipelinedProgram:
                     layout=cfg.layout_x_scale,
                 )
             if cfg.WITH_W_MX_SCALE:
-                if cfg.SCALE_VIA_LDS:
+                if cfg.W_SCALE_VIA_LDS:
                     scale_w = self.w_scale_desc.issue_local_load_unswizzle(
                         mfma_idx,
                         self.w_scale_buffer,
@@ -1359,7 +1359,7 @@ class MoEPipelinedProgram:
 
         if cfg.USE_MFMA_SCALED:
             if cfg.WITH_X_MX_SCALE:
-                if cfg.SCALE_VIA_LDS:
+                if cfg.X_SCALE_VIA_LDS:
                     scale_x = self.x_scale_desc.issue_local_load_unswizzle(
                         mfma_idx,
                         self.x_scale_buffer,
@@ -1379,7 +1379,7 @@ class MoEPipelinedProgram:
                 )
 
             if cfg.WITH_W_MX_SCALE:
-                if cfg.SCALE_VIA_LDS:
+                if cfg.W_SCALE_VIA_LDS:
                     scale_w = self.w_scale_desc.issue_local_load_unswizzle(
                         mfma_idx,
                         self.w_scale_buffer,
@@ -1644,16 +1644,8 @@ class MoESliceMNProgram:
         self.x_buffer_bot = x_buffer_bot
         self.w_buffer_left = w_buffer_left
         self.w_buffer_right = w_buffer_right
-        self.x_scale_buffer = (
-            x_scale_buffer
-            if (cfg.SCALE_VIA_LDS and cfg.WITH_X_MX_SCALE)
-            else gl.constexpr(0)
-        )
-        self.w_scale_buffer = (
-            w_scale_buffer
-            if (cfg.SCALE_VIA_LDS and cfg.WITH_W_MX_SCALE)
-            else gl.constexpr(0)
-        )
+        self.x_scale_buffer = x_scale_buffer if cfg.X_SCALE_VIA_LDS else gl.constexpr(0)
+        self.w_scale_buffer = w_scale_buffer if cfg.W_SCALE_VIA_LDS else gl.constexpr(0)
         self.x_desc_top = x_desc_top
         self.x_desc_bot = x_desc_bot
         self.w_desc_left = w_desc_left
@@ -1705,7 +1697,7 @@ class MoESliceMNProgram:
             layout=cfg.shared_layout_w_half_n,
         )
 
-        if cfg.SCALE_VIA_LDS and cfg.WITH_X_MX_SCALE:
+        if cfg.X_SCALE_VIA_LDS:
             x_scale_buffer = gl.allocate_shared_memory(
                 gl.uint8,
                 shape=[
@@ -1718,7 +1710,7 @@ class MoESliceMNProgram:
         else:
             x_scale_buffer = gl.constexpr(0)
 
-        if cfg.SCALE_VIA_LDS and cfg.WITH_W_MX_SCALE:
+        if cfg.W_SCALE_VIA_LDS:
             w_scale_buffer = gl.allocate_shared_memory(
                 gl.uint8,
                 shape=[
@@ -1841,7 +1833,7 @@ class MoESliceMNProgram:
             load_idx, self.x_buffer_top, pred, USE_MASK=USE_MASK, COMMIT=0
         )
         if cfg.SCALE_VIA_LDS:
-            if cfg.WITH_X_MX_SCALE:
+            if cfg.X_SCALE_VIA_LDS:
                 self.x_scale_desc.issue_async_load(
                     load_idx,
                     self.x_scale_buffer,
@@ -1849,7 +1841,7 @@ class MoESliceMNProgram:
                     USE_MASK=USE_MASK,
                     COMMIT=0,
                 )
-            if cfg.WITH_W_MX_SCALE:
+            if cfg.W_SCALE_VIA_LDS:
                 self.w_scale_desc.issue_async_load(
                     load_idx,
                     self.w_scale_buffer,
@@ -2074,16 +2066,8 @@ class MoESliceNProgram:
         self.x_buffer = x_buffer
         self.w_buffer_top = w_buffer_top if not cfg.W_VIA_VGPR else gl.constexpr(0)
         self.w_buffer_bot = w_buffer_bot if not cfg.W_VIA_VGPR else gl.constexpr(0)
-        self.x_scale_buffer = (
-            x_scale_buffer
-            if (cfg.SCALE_VIA_LDS and cfg.WITH_X_MX_SCALE)
-            else gl.constexpr(0)
-        )
-        self.w_scale_buffer = (
-            w_scale_buffer
-            if (cfg.SCALE_VIA_LDS and cfg.WITH_W_MX_SCALE)
-            else gl.constexpr(0)
-        )
+        self.x_scale_buffer = x_scale_buffer if cfg.X_SCALE_VIA_LDS else gl.constexpr(0)
+        self.w_scale_buffer = w_scale_buffer if cfg.W_SCALE_VIA_LDS else gl.constexpr(0)
         self.x_desc = x_desc
         self.w_desc_top = w_desc_top
         self.w_desc_bot = w_desc_bot
@@ -2153,7 +2137,7 @@ class MoESliceNProgram:
                 layout=cfg.shared_layout_w_half_n,
             )
 
-        if cfg.SCALE_VIA_LDS and cfg.WITH_X_MX_SCALE:
+        if cfg.X_SCALE_VIA_LDS:
             x_scale_buffer = gl.allocate_shared_memory(
                 gl.uint8,
                 shape=[
@@ -2166,7 +2150,7 @@ class MoESliceNProgram:
         else:
             x_scale_buffer = gl.constexpr(0)
 
-        if cfg.SCALE_VIA_LDS and cfg.WITH_W_MX_SCALE:
+        if cfg.W_SCALE_VIA_LDS:
             w_scale_buffer = gl.allocate_shared_memory(
                 gl.uint8,
                 shape=[
@@ -2216,7 +2200,7 @@ class MoESliceNProgram:
 
         if cfg.USE_MFMA_SCALED:
             if cfg.WITH_X_MX_SCALE:
-                if cfg.SCALE_VIA_LDS:
+                if cfg.X_SCALE_VIA_LDS:
                     scale_x = self.x_scale_desc.issue_local_load_unswizzle(
                         mfma_idx,
                         self.x_scale_buffer,
@@ -2247,7 +2231,7 @@ class MoESliceNProgram:
             load_idx, self.x_buffer, pred, USE_MASK=USE_MASK, COMMIT=0
         )
         if cfg.SCALE_VIA_LDS:
-            if cfg.WITH_X_MX_SCALE:
+            if cfg.X_SCALE_VIA_LDS:
                 self.x_scale_desc.issue_async_load(
                     load_idx,
                     self.x_scale_buffer,
@@ -2255,7 +2239,7 @@ class MoESliceNProgram:
                     USE_MASK=USE_MASK,
                     COMMIT=0,
                 )
-            if cfg.WITH_W_MX_SCALE:
+            if cfg.W_SCALE_VIA_LDS:
                 self.w_scale_desc.issue_async_load(
                     load_idx,
                     self.w_scale_buffer,
@@ -3738,6 +3722,8 @@ def _pipelined_moe_tile_compute(
     W_VIA_VGPR: gl.constexpr = False,
     W_PREFETCH: gl.constexpr = True,
     W_CACHE_CG: gl.constexpr = False,
+    X_SCALE_VIA_LDS: gl.constexpr = False,
+    W_SCALE_VIA_LDS: gl.constexpr = False,
     USE_NARROW_N_STORE_LAYOUT: gl.constexpr = False,
 ):
     expert_id = compact_idx
@@ -3791,6 +3777,8 @@ def _pipelined_moe_tile_compute(
         W_PRESHUFFLED=W_PRESHUFFLED,
         W_VIA_VGPR=W_VIA_VGPR,
         W_PREFETCH=W_PREFETCH,
+        X_SCALE_VIA_LDS=X_SCALE_VIA_LDS,
+        W_SCALE_VIA_LDS=W_SCALE_VIA_LDS,
     )
     BLOCK_K_X: gl.constexpr = cfg.BLOCK_K // cfg.DIV_FACTOR_X
     BLOCK_K_W: gl.constexpr = cfg.BLOCK_K // cfg.DIV_FACTOR_W
@@ -3831,23 +3819,21 @@ def _pipelined_moe_tile_compute(
         # Post-gather rows_m is in global token-id space (size M_X);
         # mask out junk gather_idx values too. Don't conflate M_X with
         # ``M`` (= dispatched tile count, can exceed M_X for top-k>1).
-        mask_m = pre_gather_mask & (rows_m < M_X)
         mask_m_x = pre_gather_mask_x & (rows_m_x < M_X)
     else:
         # Clamp OOB lanes to 0 so the buffer_load address stays in
         # bounds during HIP graph warm-up; mask still filters.
         rows_m = gl.where(pre_gather_mask, rows_m, gl.zeros_like(rows_m))
         rows_m_x = gl.where(pre_gather_mask_x, rows_m_x, gl.zeros_like(rows_m_x))
-        mask_m = pre_gather_mask
         mask_m_x = pre_gather_mask_x
 
     k_limit_x = gl.multiple_of(K // cfg.DIV_FACTOR_X, 16)
     k_limit_w = gl.multiple_of(K // cfg.DIV_FACTOR_W, 16)
 
-    # SCALE_VIA_LDS uses post-swizzle HBM shape via buffer_load_to_shared;
-    # other modes load scales G->VGPR via gl.load.
+    # Swizzled scale loads use post-swizzle HBM shape via buffer_load_to_shared;
+    # direct scale loads use G->VGPR gl.load and can follow gathered X rows.
     if HAS_X_BLOCK_SCALE:
-        if cfg.SCALE_VIA_LDS:
+        if cfg.X_SCALE_VIA_LDS:
             BLOCK_M_PS: gl.constexpr = cfg.BLOCK_M_PRESHUFFLED
             BLOCK_K_S_PS: gl.constexpr = cfg.BLOCK_K_SCALE_PRESHUFFLED
             LX_S: gl.constexpr = cfg.load_layout_x_scale
@@ -3884,7 +3870,25 @@ def _pipelined_moe_tile_compute(
             )
             rows_m_scale = off_m + offs_xs_m
             if HAS_GATHER:
-                rows_m_scale = rows_m
+                pre_gather_mask_scale = rows_m_scale < m_limit
+                rows_m_scale_safe = gl.where(
+                    pre_gather_mask_scale,
+                    rows_m_scale,
+                    gl.zeros_like(rows_m_scale),
+                )
+                rows_m_scale = gl.load(
+                    gather_idx_ptr + rows_m_scale_safe,
+                    mask=pre_gather_mask_scale,
+                    other=0,
+                ).to(gl.int32)
+                mask_m_scale = pre_gather_mask_scale & (rows_m_scale < M_X)
+            else:
+                mask_m_scale = rows_m_scale < m_limit
+                rows_m_scale = gl.where(
+                    mask_m_scale,
+                    rows_m_scale,
+                    gl.zeros_like(rows_m_scale),
+                )
             x_scale_desc = AsyncCopyDescriptor.initialize(
                 cfg,
                 0,
@@ -3894,14 +3898,14 @@ def _pipelined_moe_tile_compute(
                 offs_xs_k,
                 stride_xsm,
                 stride_xsk,
-                rows_m_scale[:, None] < M_X,
+                mask_m_scale[:, None],
                 K // cfg.SCALE_BLOCK,
             )
     else:
         x_scale_desc: gl.constexpr = 0
 
     if HAS_W_BLOCK_SCALE:
-        if cfg.SCALE_VIA_LDS:
+        if cfg.W_SCALE_VIA_LDS:
             BLOCK_N_PS: gl.constexpr = cfg.BLOCK_N_PRESHUFFLED
             BLOCK_K_S_PS_W: gl.constexpr = cfg.BLOCK_K_SCALE_PRESHUFFLED
             LW_S: gl.constexpr = cfg.load_layout_w_scale
@@ -4718,6 +4722,8 @@ def _pipelined_moe_kernel_scaled(
     W_VIA_VGPR: gl.constexpr = False,
     W_PREFETCH: gl.constexpr = True,
     W_CACHE_CG: gl.constexpr = False,
+    X_SCALE_VIA_LDS: gl.constexpr = False,
+    W_SCALE_VIA_LDS: gl.constexpr = False,
     USE_NARROW_N_STORE_LAYOUT: gl.constexpr = False,
     IS_MEDIUM_DECODE: gl.constexpr = False,
     MEDIUM_COMBINE: gl.constexpr = False,
@@ -4876,6 +4882,8 @@ def _pipelined_moe_kernel_scaled(
             W_VIA_VGPR=W_VIA_VGPR,
             W_PREFETCH=W_PREFETCH,
             W_CACHE_CG=W_CACHE_CG,
+            X_SCALE_VIA_LDS=X_SCALE_VIA_LDS,
+            W_SCALE_VIA_LDS=W_SCALE_VIA_LDS,
             USE_NARROW_N_STORE_LAYOUT=USE_NARROW_N_STORE_LAYOUT,
         )
 
@@ -5269,20 +5277,27 @@ def _launch_kernel(
         # N-contig W staged as [BK, BN] in LDS.
         stride_wn, stride_wk = w3.stride(-1), w3.stride(-2)
 
+    x_scale_load_mode = scale_load_mode
+    if has_x_block_scale and gather_indx is not None:
+        x_scale_load_mode = "transpose"
+    w_scale_load_mode = scale_load_mode
+    x_scale_via_lds = x_scale_load_mode == "swizzle" and has_x_block_scale
+    w_scale_via_lds = w_scale_load_mode == "swizzle" and has_w_block_scale
+
     if has_w_block_scale:
         w_scale3 = w_scale if w_scale.ndim == 3 else w_scale.unsqueeze(0)
-        w_scale_proc3 = _preprocess_scale(w_scale3, scale_load_mode)
+        w_scale_proc3 = _preprocess_scale(w_scale3, w_scale_load_mode)
         stride_wse = w_scale_proc3.stride(0)
-        stride_wsn, stride_wsk = _scale_strides(w_scale_proc3, scale_load_mode)
+        stride_wsn, stride_wsk = _scale_strides(w_scale_proc3, w_scale_load_mode)
         w_scale_buf = w_scale_proc3
     else:
         stride_wse = stride_wsn = stride_wsk = 0
         w_scale_buf = _make_dummy(x.device, torch.uint8)
 
     x_scale_proc = (
-        _preprocess_scale(x_scale, scale_load_mode) if has_x_block_scale else None
+        _preprocess_scale(x_scale, x_scale_load_mode) if has_x_block_scale else None
     )
-    stride_xsm, stride_xsk = _scale_strides(x_scale_proc, scale_load_mode)
+    stride_xsm, stride_xsk = _scale_strides(x_scale_proc, x_scale_load_mode)
 
     x_scale_buf = (
         x_scale_proc if x_scale_proc is not None else _make_dummy(x.device, torch.uint8)
@@ -5415,6 +5430,8 @@ def _launch_kernel(
         W_VIA_VGPR=False,
         W_PREFETCH=False,
         W_CACHE_CG=bool(w_cache_cg),
+        X_SCALE_VIA_LDS=bool(x_scale_via_lds),
+        W_SCALE_VIA_LDS=bool(w_scale_via_lds),
         USE_NARROW_N_STORE_LAYOUT=bool(use_narrow_n_store_layout),
         GRID_N=grid_n,
         GROUP_M=group_m,
