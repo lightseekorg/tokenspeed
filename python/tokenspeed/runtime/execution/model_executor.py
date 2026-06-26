@@ -76,6 +76,18 @@ _DRAFTER_MAPPING = {"EAGLE3": Eagle, "MTP": Eagle, "DFLASH": DFlash}
 LOG_MM_TIMING = envs.TOKENSPEED_LOG_MM_TIMING.get()
 
 
+def _eagle_aux_layer_ids(hf_config) -> list[int] | None:
+    """Draft's eagle_aux_hidden_state_layer_ids (nested or top-level), or None."""
+    eagle_config = getattr(hf_config, "eagle_config", None)
+    if isinstance(eagle_config, dict):
+        ids = eagle_config.get("eagle_aux_hidden_state_layer_ids")
+    elif eagle_config is not None:
+        ids = getattr(eagle_config, "eagle_aux_hidden_state_layer_ids", None)
+    else:
+        ids = getattr(hf_config, "eagle_aux_hidden_state_layer_ids", None)
+    return list(ids) if ids else None
+
+
 def _draft_idle_global_num_tokens_for_step(
     step_idx: int,
     global_num_tokens: list[int],
@@ -286,7 +298,11 @@ class ModelExecutor:
             if config.spec_algo in ("EAGLE3",) and hasattr(
                 self.model_runner.model, "set_eagle3_layers_to_capture"
             ):
-                self.model_runner.model.set_eagle3_layers_to_capture()
+                # capture the layers the draft was trained on, not the default
+                aux_layer_ids = _eagle_aux_layer_ids(
+                    draft_model_runner.model_config.hf_config
+                )
+                self.model_runner.model.set_eagle3_layers_to_capture(aux_layer_ids)
             if config.spec_algo == "DFLASH":
                 if not hasattr(self.model_runner.model, "set_dflash_layers_to_capture"):
                     raise ValueError(

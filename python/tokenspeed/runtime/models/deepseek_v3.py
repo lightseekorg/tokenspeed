@@ -1338,7 +1338,7 @@ class DeepseekV3Model(nn.Module):
                 )
         if not ctx.forward_mode.is_idle():
             if not ENABLE_CP:
-                hidden_states = layer.comm_manager.final_norm(
+                hidden_states, _ = layer.comm_manager.final_norm(
                     hidden_states, residual, ctx, self.norm
                 )
             else:

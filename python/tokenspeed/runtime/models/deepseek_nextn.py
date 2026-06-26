@@ -142,7 +142,7 @@ class DeepseekModelNextN(nn.Module):
 
         if not ctx.forward_mode.is_idle():
             if not ENABLE_CP:
-                hidden_states = self.decoder.comm_manager.final_norm(
+                hidden_states, _ = self.decoder.comm_manager.final_norm(
                     hidden_states, residual, ctx, self.shared_head.norm
                 )
             else:

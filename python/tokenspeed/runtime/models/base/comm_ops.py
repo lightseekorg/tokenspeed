@@ -381,20 +381,24 @@ class FinalNormOp(CommOp):
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
         ctx: ForwardContext,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        # Returns (normed hidden states, post-add residual); see
+        # CommManager.final_norm for the residual's meaning.
         if self._should_fuse(hidden_states.shape[0]):
-            hidden_states, *_ = self.norm_module.forward_with_allreduce_fusion(
-                self._rank,
-                self._group,
-                hidden_states,
-                residual,
+            hidden_states, residual_out, *_ = (
+                self.norm_module.forward_with_allreduce_fusion(
+                    self._rank,
+                    self._group,
+                    hidden_states,
+                    residual,
+                )
             )
         else:
             # The preceding DeferredReduceOp always defers, so we must
             # perform the all-reduce here before applying the norm.
             if self._has_parallel and self.use_all_reduce_mode:
                 hidden_states = all_reduce(hidden_states, self._group)
-            hidden_states, _ = self.norm_module(hidden_states, residual)
+            hidden_states, residual_out = self.norm_module(hidden_states, residual)
             # In RSAG mode, all-gather to restore tokens for the LM head.
             # Uses the LM head group (ATTN_TP) which may differ from the
             # scatter group when attn_tp != dense_tp.
@@ -407,4 +411,4 @@ class FinalNormOp(CommOp):
                     group=self._lm_group,
                     scattered_num_tokens=scattered_num_tokens,
                 )
-        return hidden_states
+        return hidden_states, residual_out
