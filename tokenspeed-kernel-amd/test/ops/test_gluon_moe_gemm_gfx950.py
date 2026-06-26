@@ -625,9 +625,11 @@ def _run_gluon_gemms(
             reference.gemm1_input,
             weights.w13_weight,
             weights.w13_bias,
+            w_mx_scale=weights.w13_precision_config.b_mx_scale,
+            x_global_scale=weights.w13_act_scale,
+            out_dtype=weights.w13_precision_config.out_dtype,
             a_ragged_metadata=reference.ragged_metadata,
             gather_indx=reference.gather_indx,
-            precision_config=weights.w13_precision_config,
             fused_activation=_swiglu_activation(),
         )
 
@@ -635,9 +637,11 @@ def _run_gluon_gemms(
             reference.gemm2_input,
             weights.w2_weight,
             weights.w2_bias,
+            w_mx_scale=weights.w2_precision_config.b_mx_scale,
+            x_global_scale=weights.w2_act_scale,
+            out_dtype=weights.w2_precision_config.out_dtype,
             a_ragged_metadata=reference.ragged_metadata,
             scatter_indx=reference.scatter_indx,
-            precision_config=weights.w2_precision_config,
             gammas=reference.gate_scal,
             n_tokens=reference.gate_scal.shape[0] // TOPK,
             n_expts_act=TOPK,
@@ -696,3 +700,33 @@ def test_gluon_moe_gemms_with_preshuffle_match_torch_gfx950(
         weights=mxfp4_weights.preshuffled,
         torch_references=torch_references,
     )
+
+
+@requires_gfx950
+def test_gluon_mxfp_fused_moe_accepts_flat_precision_args_gfx950(
+    mxfp4_weights: Mxfp4WeightVariants,
+) -> None:
+    weights = mxfp4_weights.nonpreshuffled
+    hidden_states, router_logits = _make_hidden_and_router(1)
+
+    with torch.no_grad():
+        out = gluon_moe.gluon_mxfp_fused_moe(
+            hidden_states,
+            router_logits,
+            weights.w13_weight,
+            weights.w2_weight,
+            w13_bias=weights.w13_bias,
+            w2_bias=weights.w2_bias,
+            w13_mx_scale=weights.w13_precision_config.b_mx_scale,
+            w2_mx_scale=weights.w2_precision_config.b_mx_scale,
+            w13_act_scale=weights.w13_act_scale,
+            w2_act_scale=weights.w2_act_scale,
+            out_dtype=weights.w2_precision_config.out_dtype,
+            top_k=TOPK,
+            enable_warp_decode=False,
+        )
+
+    torch.cuda.synchronize()
+    assert out.shape == (1, HIDDEN_SIZE)
+    assert out.dtype == torch.bfloat16
+    assert torch.isfinite(out).all()
