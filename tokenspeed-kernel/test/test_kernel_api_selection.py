@@ -60,6 +60,7 @@ from tokenspeed_kernel.ops.moe.flashinfer import trtllm_mxint4 as _moe_trtllm_mx
 from tokenspeed_kernel.ops.moe.flashinfer import trtllm_nvfp4 as _moe_trtllm_nvfp4
 from tokenspeed_kernel.ops.moe.flashinfer import trtllm_unquant as _moe_trtllm_unquant
 from tokenspeed_kernel.ops.moe.gluon import mxfp4 as _moe_gluon_mxfp4
+from tokenspeed_kernel.ops.moe.triton import fp8 as _moe_triton_fp8
 from tokenspeed_kernel.ops.moe.triton import mxfp4 as _moe_triton_mxfp4
 from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry
@@ -93,6 +94,7 @@ _RELOAD_MODULES = [
     _moe_flashinfer,
     _moe_gluon_mxfp4,
     _moe_gluon,
+    _moe_triton_fp8,
     _moe_triton_mxfp4,
     _moe_triton,
     _moe_pkg,
@@ -255,8 +257,8 @@ def test_gemm_mxfp8_online_activation_signature_uses_quantized_storage() -> None
 def test_gemm_mxfp8_online_activation_preserves_repeated_rows() -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for online mxfp8 GEMM verification")
-    if not Platform.get().is_nvidia:
-        pytest.skip("NVIDIA GPU is required for TRTLLM mxfp8 scale layout")
+    if not (Platform.get().is_nvidia or Platform.get().is_cdna4):
+        pytest.skip("online mxfp8 GEMM verification requires NVIDIA or AMD CDNA4")
 
     torch.manual_seed(0)
     num_tokens = 16
@@ -713,6 +715,52 @@ def _moe_apply_mxfp4_precomputed_tp() -> object:
     )
 
 
+def _moe_apply_fp8_precomputed_tp() -> object:
+    plan = _moe_pkg.moe_plan(
+        "fp8",
+        input_dtype=torch.bfloat16,
+        activation="silu",
+        ep_size=1,
+        fp8_scale_block_shape=(128, 128),
+        solution="triton",
+    )
+    x = torch.empty((4, 16), dtype=torch.bfloat16)
+    router_logits = torch.empty((4, 8), dtype=torch.float32)
+    topk_weights = torch.empty((4, 2), dtype=torch.float32)
+    topk_ids = torch.empty((4, 2), dtype=torch.int64)
+    return tokenspeed_kernel.moe_apply(
+        plan,
+        x,
+        torch.nn.Module(),
+        router_logits,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+    )
+
+
+def _moe_apply_fp8_precomputed_ep() -> object:
+    plan = _moe_pkg.moe_plan(
+        "fp8",
+        input_dtype=torch.bfloat16,
+        activation="silu",
+        ep_size=2,
+        fp8_scale_block_shape=(128, 128),
+        solution="triton",
+    )
+    x = torch.empty((4, 16), dtype=torch.bfloat16)
+    router_logits = torch.empty((4, 8), dtype=torch.float32)
+    topk_weights = torch.empty((4, 2), dtype=torch.float32)
+    topk_ids = torch.empty((4, 2), dtype=torch.int64)
+    return tokenspeed_kernel.moe_apply(
+        plan,
+        x,
+        torch.nn.Module(),
+        router_logits,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+    )
+
+
 def _moe_apply_mxfp4_precomputed_ep() -> object:
     plan = tokenspeed_kernel.moe_plan(
         "mxfp4",
@@ -931,6 +979,14 @@ _CASES = [
         "cublaslt_mm_nvfp4",
         _mm_nvfp4,
     ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "gemm",
+        "mm",
+        "triton_mm_fp8_blockscale",
+        _mm_mxfp8,
+    ),
     # Sampling API x architecture golden cases.
     _case(
         _is_nvidia_with_cute_dsl,
@@ -1052,6 +1108,22 @@ _CASES = [
         "apply",
         "triton_mxfp4_ep_precomputed_moe_apply",
         _moe_apply_mxfp4_precomputed_ep,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "moe",
+        "apply",
+        "triton_fp8_precomputed_moe_apply",
+        _moe_apply_fp8_precomputed_tp,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "moe",
+        "apply",
+        "triton_fp8_ep_precomputed_moe_apply",
+        _moe_apply_fp8_precomputed_ep,
     ),
 ]
 
