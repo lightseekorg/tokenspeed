@@ -35,7 +35,10 @@ from tokenspeed.runtime.layers.moe.utils import (
 )
 from tokenspeed.runtime.layers.moe.weights import create_layer_weights
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
-from tokenspeed.runtime.layers.quantization.utils import should_ignore_quant_layer
+from tokenspeed.runtime.layers.quantization.utils import (
+    should_exclude_quant_module,
+    should_ignore_quant_layer,
+)
 from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.pdl import pdl_enabled
 
@@ -140,11 +143,15 @@ class MoELayer(torch.nn.Module):
         self._topk_group = routing_config.get("topk_group", 0)
         self._routed_scaling_factor = routing_config.get("routed_scaling_factor", 1.0)
 
-        # Quantization config
+        # Quantization config. ignored_layers (compressed-tensors) keys the MoE
+        # block; exclude_modules (ModelOpt) keys the fused experts.
         self._quant_kind = "unquant"
-        if quant_config is not None and not should_ignore_quant_layer(
-            prefix=self.prefix,
-            ignored_layers=quant_config.ignored_layers,
+        if (
+            quant_config is not None
+            and not should_ignore_quant_layer(self.prefix, quant_config.ignored_layers)
+            and not should_exclude_quant_module(
+                f"{self.prefix}.experts", quant_config.exclude_modules
+            )
         ):
             self._quant_kind = quant_config.moe_weight_dtype()
 
