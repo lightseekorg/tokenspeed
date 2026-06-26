@@ -6,6 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: write
   issues: write
   pull-requests: write
 
@@ -33,3 +34,4 @@ jobs:
           close-pr-message: >
             This PR has been automatically closed due to inactivity.
             Feel free to reopen it if it is still relevant.
+          operations-per-run: 200

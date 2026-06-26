@@ -20,6 +20,7 @@ Core components:
 
 ## News
 
+- [2026/06] Deep dive into the design and optimization of TokenSpeed-Kernel. [[Blog](https://pytorch.org/blog/lightseek-tokenspeed-kernel/)]
 - [2026/05] 🚀 TokenSpeed hits 580 TPS on Qwen3.5-397B-A17B for agentic workloads. [[blog](https://pytorch.org/blog/up-to-580tps-new-speed-record-of-qwen3-5-397b-a17b-on-gpu-for-agentic-workloads-with-tokenspeed/)]
 - [2026/05] TokenSpeed announced — a speed-of-light LLM inference engine for agentic workloads. [[blog](https://lightseek.org/blog/lightseek-tokenspeed.html)]
 

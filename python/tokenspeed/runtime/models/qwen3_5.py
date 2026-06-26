@@ -458,7 +458,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
 
         linear_attn_quant_config = (
             None
-            if quant_config and quant_config.get_name() == "nvfp4"
+            if quant_config and quant_config.get_name() in ("fp8", "nvfp4")
             else quant_config
         )
         self.linear_attn = Qwen3_5GatedDeltaNet(
