@@ -43,6 +43,7 @@ from tokenspeed.runtime.layers.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
+from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.vocab_parallel_embedding import ParallelLMHead
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
@@ -545,7 +546,14 @@ class LlamaForCausalLMEagle3(BaseCausalLM):
                 prefix=add_prefix("lm_head", prefix),
             )
 
-        self.logits_processor = self.resolve_logits_processor(config)
+        self.logits_processor = LogitsProcessor(
+            config,
+            skip_all_gather=self.mapping.attn.has_dp,
+            do_argmax=True,
+            tp_rank=self.mapping.attn.tp_rank,
+            tp_size=self.mapping.attn.tp_size,
+            tp_group=self.mapping.attn.tp_group,
+        )
         self.capture_aux_hidden_states = True
         self.hot_token_id = None
 
