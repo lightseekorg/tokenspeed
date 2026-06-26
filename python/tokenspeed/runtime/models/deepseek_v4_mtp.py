@@ -52,6 +52,7 @@ from tokenspeed.runtime.models.deepseek_v4 import (
     DeepseekV4MegaMoEExperts,
     _deepseek_v4_swa_slot_mapping,
     hc_head,
+    mhc_post,
 )
 from tokenspeed.runtime.utils import add_prefix
 
@@ -180,7 +181,7 @@ class DeepseekV4MultiTokenPredictorLayer(nn.Module):
             positions,
             out_cache_loc,
         )
-        return self.mtp_block(
+        residual, x_def, post_def, comb_def = self.mtp_block(
             positions,
             hidden_states,
             ctx,
@@ -188,6 +189,7 @@ class DeepseekV4MultiTokenPredictorLayer(nn.Module):
             input_ids,
             swa_slot_mapping,
         )
+        return mhc_post(x_def, residual, post_def, comb_def)
 
     def compute_logits_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = hidden_states.view(-1, self.hc_mult, self.config.hidden_size)

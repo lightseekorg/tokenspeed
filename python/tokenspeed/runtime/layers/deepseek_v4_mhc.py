@@ -305,6 +305,35 @@ def _mhc_post_hc4_triton_kernel(
     )
 
 
+def mhc_fused_hc(
+    x_prev: torch.Tensor,
+    residual_prev: torch.Tensor,
+    post_prev: torch.Tensor,
+    comb_prev: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused post_mapping(prev) + pre_mapping(curr).
+
+    Returns (residual_cur, layer_input, post_cur, comb_cur).
+    """
+    residual_cur = mhc_post(x_prev, residual_prev, post_prev, comb_prev)
+    layer_input, post_cur, comb_cur = mhc_pre(
+        residual_cur,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_eps,
+        sinkhorn_iters,
+    )
+    return residual_cur, layer_input, post_cur, comb_cur
+
+
 def mhc_pre(
     residual: torch.Tensor,
     fn: torch.Tensor,
