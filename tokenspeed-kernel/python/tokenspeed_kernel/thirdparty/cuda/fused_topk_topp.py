@@ -93,6 +93,7 @@ def fused_topk_topp_renorm(
     top_ps: torch.Tensor,
     workspace: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
+    enable_pdl: bool = True,
 ) -> torch.Tensor:
     """Fused TopK + TopP renormalization.
 
@@ -105,6 +106,7 @@ def fused_topk_topp_renorm(
                    fresh one is allocated via the CUDA caching allocator.
         out: optional pre-allocated ``[bs, V]`` float32 output; if omitted, a
              fresh one is allocated.
+        enable_pdl: whether to use Programmatic Dependent Launch attributes.
 
     Returns:
         ``[bs, V]`` float32. Non-kept positions are 0; kept positions are
@@ -117,6 +119,6 @@ def fused_topk_topp_renorm(
         workspace = torch.empty(ws_bytes, dtype=torch.uint8, device=probs.device)
     side_handle = _get_side_stream_handle(probs.device)
     _load_fused_topk_topp_module().fused_topk_topp_renorm(
-        probs, top_ks, top_ps, out, workspace, side_handle
+        probs, top_ks, top_ps, out, workspace, side_handle, bool(enable_pdl)
     )
     return out

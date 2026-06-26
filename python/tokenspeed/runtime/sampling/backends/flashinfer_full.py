@@ -315,7 +315,12 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
             # top_p_renorm_prob(is_deterministic=True) pair. Sentinel
             # K = 1<<30 in top_ks routes per-row through the radix top-p
             # only path.
-            probs = fused_topk_topp_renorm(probs, top_ks, top_ps)
+            probs = fused_topk_topp_renorm(
+                probs,
+                top_ks,
+                top_ps,
+                enable_pdl=pdl_enabled(),
+            )
         else:
             probs = top_k_renorm_prob(probs, top_ks)
             probs = top_p_renorm_prob(probs, top_ps, is_deterministic=True)
@@ -417,7 +422,12 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
             # top_p_renorm_prob(is_deterministic=True) pair. Sentinel
             # K = 1<<30 in top_ks routes per-row through the radix top-p
             # only path.
-            target_probs = fused_topk_topp_renorm(target_probs, top_ks, top_ps)
+            target_probs = fused_topk_topp_renorm(
+                target_probs,
+                top_ks,
+                top_ps,
+                enable_pdl=pdl_enabled(),
+            )
         else:
             target_probs = top_k_renorm_prob(target_probs, top_ks)
             target_probs = top_p_renorm_prob(
