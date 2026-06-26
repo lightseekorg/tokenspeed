@@ -768,6 +768,10 @@ class DeepseekV3AttentionMLA(nn.Module):
             and getattr(ctx.attn_backend, "data_type", None) == torch.float8_e4m3fn
             and self.rotary_emb is not None
             and k_scale == 1.0
+            and not (
+                _is_amd
+                and getattr(ctx.attn_backend, "_sparse_decode_impl", None) == "triton"
+            )
         )
 
         if use_fused_fp8_decode:
@@ -914,6 +918,10 @@ class DeepseekV3AttentionMLA(nn.Module):
             and getattr(ctx.attn_backend, "data_type", None) == torch.float8_e4m3fn
             and self.rotary_emb is not None
             and k_scale == 1.0
+            and not (
+                _is_amd
+                and getattr(ctx.attn_backend, "_sparse_decode_impl", None) == "triton"
+            )
         )
 
         if use_fp8_prefill:

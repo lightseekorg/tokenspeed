@@ -31,7 +31,12 @@ from tokenspeed_kernel.ops.attention.triton.dsa_sparse_layout import (
     full_context_topk_to_global_slots,
     local_topk_to_global_slots,
 )
+from tokenspeed_kernel.ops.attention.triton.dsa_topk import (
+    dsa_decode_topk,
+    dsa_prefill_topk,
+)
 from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
+from tokenspeed_kernel.platform import current_platform
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -77,6 +82,7 @@ from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 _INDEXER_PREFILL_MAX_LOGITS_MB_ARG = "deepseek_v4_indexer_prefill_max_logits_mb"
+_platform = current_platform()
 
 
 @dataclass
@@ -196,19 +202,30 @@ def _glm_dsa_rope_scaling(
     return rope_scaling
 
 
-def _glm_dsa_hadamard_rotate(x: torch.Tensor) -> torch.Tensor:
+def _glm_dsa_hadamard_transform(x: torch.Tensor, *, scale: float) -> torch.Tensor:
     try:
         from tokenspeed_kernel.thirdparty.fast_hadamard_transform import (
             hadamard_transform,
         )
-    except Exception as exc:
+
+        return hadamard_transform(x, scale=scale)
+    except Exception:
+        if x.shape[-1] == 128:
+            from tokenspeed_kernel.ops.transform.triton.hadamard import (
+                hadamard_transform_128,
+            )
+
+            return hadamard_transform_128(x, scale=scale)
         raise RuntimeError(
-            "GLM DSA indexer requires fast_hadamard_transform. "
-            "Build/install `tokenspeed-kernel/python` before serving GLM DSA."
-        ) from exc
+            "GLM DSA indexer requires fast_hadamard_transform or the in-tree "
+            "Triton Hadamard fallback for 128-wide indexer tensors."
+        )
+
+
+def _glm_dsa_hadamard_rotate(x: torch.Tensor) -> torch.Tensor:
 
     shape = x.shape
-    return hadamard_transform(
+    return _glm_dsa_hadamard_transform(
         x.to(torch.bfloat16).reshape(-1, shape[-1]).contiguous(),
         scale=shape[-1] ** -0.5,
     ).reshape(shape)
@@ -223,16 +240,6 @@ def _glm_dsa_hadamard_rotate_pair(
             "GLM DSA paired Hadamard requires matching last dimensions; "
             f"got query={query.shape[-1]}, key={key.shape[-1]}"
         )
-    try:
-        from tokenspeed_kernel.thirdparty.fast_hadamard_transform import (
-            hadamard_transform,
-        )
-    except Exception as exc:
-        raise RuntimeError(
-            "GLM DSA indexer requires fast_hadamard_transform. "
-            "Build/install `tokenspeed-kernel/python` before serving GLM DSA."
-        ) from exc
-
     query_shape = query.shape
     key_shape = key.shape
     head_dim = query_shape[-1]
@@ -248,7 +255,7 @@ def _glm_dsa_hadamard_rotate_pair(
         ),
         dim=0,
     )
-    rotated = hadamard_transform(
+    rotated = _glm_dsa_hadamard_transform(
         combined,
         scale=head_dim**-0.5,
     )
@@ -1000,22 +1007,91 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         if full_topk is not None:
             return full_topk
 
-        topk_indices, _, topk_lens = self._compute_decode_topk_indices_deepgemm(
-            indexer_output=indexer_output,
-            ctx=ctx,
-            seq_lens_per_token=seq_lens_per_token,
-            block_tables=block_tables,
-            block_tables_per_token=block_tables_per_token,
-            q_len_per_req=decode_window.q_len_per_req,
-            decode_start=decode_window.start,
-            num_tokens=num_tokens,
-            num_decode_tokens=decode_window.num_tokens,
-            topk=topk,
-        )
+        if _platform.is_amd:
+            topk_indices, _, topk_lens = self._compute_decode_topk_indices_triton(
+                indexer_output=indexer_output,
+                ctx=ctx,
+                seq_lens_per_token=seq_lens_per_token,
+                block_tables_per_token=block_tables_per_token,
+                decode_start=decode_window.start,
+                num_tokens=num_tokens,
+                num_decode_tokens=decode_window.num_tokens,
+                topk=topk,
+            )
+        else:
+            topk_indices, _, topk_lens = self._compute_decode_topk_indices_deepgemm(
+                indexer_output=indexer_output,
+                ctx=ctx,
+                seq_lens_per_token=seq_lens_per_token,
+                block_tables=block_tables,
+                block_tables_per_token=block_tables_per_token,
+                q_len_per_req=decode_window.q_len_per_req,
+                decode_start=decode_window.start,
+                num_tokens=num_tokens,
+                num_decode_tokens=decode_window.num_tokens,
+                topk=topk,
+            )
         return GlmDsaDecodeTopK(
             topk_indices=topk_indices,
             topk_lens=topk_lens,
         )
+
+    def _compute_decode_topk_indices_triton(
+        self,
+        *,
+        indexer_output: GlmDsaIndexerOutput,
+        ctx: ForwardContext,
+        seq_lens_per_token: torch.Tensor,
+        block_tables_per_token: torch.Tensor,
+        decode_start: int,
+        num_tokens: int,
+        num_decode_tokens: int,
+        topk: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if topk not in (512, 1024, 2048):
+            raise RuntimeError(f"GLM DSA decode top-k does not support topk={topk}.")
+        page_size = ctx.token_to_kv_pool.page_size
+        if page_size != 64 or self.indexer.index_head_dim != 128:
+            raise RuntimeError(
+                "GLM DSA Triton decode top-k requires page_size=64 and "
+                "index_head_dim=128; "
+                f"got page_size={page_size}, index_head_dim={self.indexer.index_head_dim}."
+            )
+        if not hasattr(ctx.token_to_kv_pool, "get_index_k_buffer"):
+            raise RuntimeError("GLM DSA Triton decode top-k requires index-K cache.")
+
+        q = indexer_output.query[
+            decode_start : decode_start + num_decode_tokens
+        ].contiguous()
+        weights = (
+            indexer_output.weights[decode_start : decode_start + num_decode_tokens]
+            .float()
+            .contiguous()
+        )
+        index_k_cache = ctx.token_to_kv_pool.get_index_k_buffer(self.attn_mqa.layer_id)
+        topk_slice, topk_lens_slice = dsa_decode_topk(
+            q,
+            index_k_cache,
+            weights,
+            seq_lens_per_token,
+            block_tables_per_token,
+            page_size=page_size,
+            topk=topk,
+            softmax_scale=self.indexer.softmax_scale,
+        )
+        topk_indices = self._get_decode_topk_workspace(
+            "_decode_topk_indices_buffer",
+            num_tokens,
+            topk,
+            q.device,
+            fill_value=-1,
+        )
+        topk_indices[decode_start : decode_start + num_decode_tokens].copy_(topk_slice)
+        topk_lens = self._get_decode_topk_lens_workspace(num_tokens, q.device)
+        topk_lens[decode_start : decode_start + num_decode_tokens].copy_(
+            topk_lens_slice
+        )
+        return topk_indices, topk_slice, topk_lens
 
     def _compute_decode_topk_indices_deepgemm(
         self,
@@ -1233,6 +1309,19 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             page_size=page_size,
             device=indexer_output.query.device,
         )
+        if _platform.is_amd:
+            return self._compute_prefill_topk_indices_triton(
+                indexer_output=indexer_output,
+                ctx=ctx,
+                prefix_lens=prefix_lens,
+                extend_lens=extend_lens,
+                seq_lens=seq_lens,
+                block_tables=block_tables,
+                kv_workspace_slots=kv_workspace_slots,
+                max_seq_len=max_seq_len,
+                num_prefill_tokens=num_prefill_tokens,
+                topk=topk,
+            )
         return self._compute_prefill_topk_indices_deepgemm(
             indexer_output=indexer_output,
             ctx=ctx,
@@ -1245,6 +1334,106 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             max_seq_len=max_seq_len,
             num_prefill_tokens=num_prefill_tokens,
             topk=topk,
+        )
+
+    def _compute_prefill_topk_indices_triton(
+        self,
+        *,
+        indexer_output: GlmDsaIndexerOutput,
+        ctx: ForwardContext,
+        prefix_lens: torch.Tensor,
+        extend_lens: torch.Tensor,
+        seq_lens: torch.Tensor,
+        block_tables: torch.Tensor,
+        kv_workspace_slots: torch.Tensor,
+        max_seq_len: int,
+        num_prefill_tokens: int,
+        topk: int,
+    ) -> GlmDsaPrefillTopK:
+        if topk not in (512, 1024, 2048):
+            raise RuntimeError(f"GLM DSA prefill top-k does not support topk={topk}.")
+        page_size = ctx.token_to_kv_pool.page_size
+        if page_size != 64 or self.indexer.index_head_dim != 128:
+            raise RuntimeError(
+                "GLM DSA Triton prefill top-k requires page_size=64 and "
+                "index_head_dim=128; "
+                f"got page_size={page_size}, index_head_dim={self.indexer.index_head_dim}."
+            )
+        if num_prefill_tokens <= 0 or seq_lens.numel() == 0:
+            raise RuntimeError("GLM DSA prefill top-k requires at least one token.")
+        if not hasattr(ctx.token_to_kv_pool, "get_index_k_buffer"):
+            raise RuntimeError("GLM DSA Triton prefill top-k requires index-K cache.")
+
+        q = indexer_output.query[:num_prefill_tokens].contiguous()
+        weights = indexer_output.weights[:num_prefill_tokens].float().contiguous()
+        index_k_cache = ctx.token_to_kv_pool.get_index_k_buffer(self.attn_mqa.layer_id)
+
+        req_ids = torch.arange(
+            seq_lens.numel(),
+            dtype=torch.int64,
+            device=q.device,
+        )
+        token_req = torch.repeat_interleave(req_ids, extend_lens.to(torch.int64))
+        extend_cu = torch.zeros(
+            extend_lens.numel() + 1,
+            dtype=torch.int64,
+            device=q.device,
+        )
+        torch.cumsum(extend_lens.to(torch.int64), dim=0, out=extend_cu[1:])
+        token_offsets = torch.arange(
+            num_prefill_tokens, dtype=torch.int64, device=q.device
+        ) - extend_cu.index_select(0, token_req)
+        causal_lens = (
+            prefix_lens.to(torch.int64).index_select(0, token_req) + token_offsets + 1
+        )
+        seq_cu = torch.zeros(
+            seq_lens.numel() + 1,
+            dtype=torch.int64,
+            device=q.device,
+        )
+        torch.cumsum(seq_lens.to(torch.int64), dim=0, out=seq_cu[1:])
+        row_starts = seq_cu.index_select(0, token_req)
+        row_ends = row_starts + causal_lens
+
+        workspace_indices = torch.full(
+            (num_prefill_tokens, topk),
+            -1,
+            dtype=torch.int32,
+            device=q.device,
+        )
+        topk_lens = torch.zeros(
+            num_prefill_tokens,
+            dtype=torch.int32,
+            device=q.device,
+        )
+        seq_len_sum = max(int(seq_lens.sum().item()), 1)
+        max_logits_mb = int(global_server_args_dict[_INDEXER_PREFILL_MAX_LOGITS_MB_ARG])
+        max_logits_bytes = max(1, max_logits_mb) * 1024 * 1024
+        max_query_rows = max(1, max_logits_bytes // (seq_len_sum * 4))
+        row_starts_i32 = row_starts.to(torch.int32).contiguous()
+        row_ends_i32 = row_ends.to(torch.int32).contiguous()
+        for start in range(0, num_prefill_tokens, max_query_rows):
+            end = min(start + max_query_rows, num_prefill_tokens)
+            chunk_indices, chunk_lens = dsa_prefill_topk(
+                q[start:end],
+                index_k_cache,
+                weights[start:end],
+                kv_workspace_slots,
+                row_starts_i32[start:end],
+                row_ends_i32[start:end],
+                topk=topk,
+                softmax_scale=self.indexer.softmax_scale,
+            )
+            workspace_indices[start:end].copy_(chunk_indices)
+            topk_lens[start:end].copy_(chunk_lens)
+
+        return GlmDsaPrefillTopK(
+            workspace_indices=workspace_indices,
+            topk_lens=topk_lens,
+            block_tables=block_tables,
+            seq_lens=seq_lens.to(device=q.device, dtype=torch.int32),
+            max_seq_len=max_seq_len,
+            kv_workspace_slots=kv_workspace_slots,
         )
 
     def _compute_prefill_topk_indices_deepgemm(

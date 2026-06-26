@@ -18,6 +18,7 @@ from typing import Optional
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
 from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
@@ -222,6 +223,45 @@ def triton_quantize_fp8(
     return fp8_quantize(x, scale=scale, enable_pdl=enable_pdl)
 
 
+@register_kernel(
+    "quantization",
+    "fp8_with_scale",
+    name="triton_quantize_fp8_with_scale",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"amd"})),
+    signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
+    traits={
+        "granularity": frozenset({"token_group_128"}),
+        "scale_encoding": frozenset({"float32"}),
+    },
+    priority=Priority.PORTABLE,
+)
+def triton_quantize_fp8_with_scale(
+    x: torch.Tensor,
+    granularity: str = "tensor",
+    group_size: int | None = None,
+    scale_encoding: str = "float32",
+    enable_pdl: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del enable_pdl
+    if granularity != "token_group" or group_size != 128:
+        raise ValueError(
+            "triton FP8 dynamic quantization currently supports only "
+            f"granularity='token_group' with group_size=128, got "
+            f"granularity={granularity!r}, group_size={group_size}."
+        )
+    if scale_encoding != "float32":
+        raise ValueError(
+            "triton FP8 dynamic quantization currently requires "
+            f"scale_encoding='float32', got {scale_encoding!r}."
+        )
+    return per_token_group_quant_fp8(
+        x.contiguous(),
+        128,
+        column_major_scales=False,
+    )
+
+
 @triton.jit
 def _mxfp4_quantize_block(x):
     max_normal: tl.constexpr = 6
@@ -380,4 +420,5 @@ __all__ = [
     "fp8_quantize",
     "mxfp4_quantize",
     "triton_quantize_mxfp4",
+    "triton_quantize_fp8_with_scale",
 ]

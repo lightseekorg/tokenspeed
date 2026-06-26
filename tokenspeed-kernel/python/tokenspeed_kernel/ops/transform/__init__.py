@@ -7,6 +7,9 @@
 # copies of the Software, and to permit persons to whom the Software is
 # furnished to do so, subject to the following conditions:
 #
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
 # THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 # IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 # FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
@@ -15,22 +18,4 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""FlashInfer rotary embedding kernels."""
-
-from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.registry import error_fn
-
-platform = current_platform()
-mla_rope_quantize_fp8 = error_fn
-
-if platform.is_nvidia:
-    try:
-        from flashinfer.rope import mla_rope_quantize_fp8
-    except ImportError:
-        pass
-elif platform.is_amd:
-    from tokenspeed_kernel.ops.embedding.triton import (
-        mla_rope_quantize_fp8_triton as mla_rope_quantize_fp8,
-    )
-
-__all__ = ["mla_rope_quantize_fp8"]
+from __future__ import annotations

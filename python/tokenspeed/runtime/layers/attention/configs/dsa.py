@@ -23,6 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
@@ -80,11 +81,13 @@ class DSAConfig(MLAConfig):
     ):
         base = MLAConfig.generate(server_args, model_config, is_draft)
         if base.kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-            if not _is_blackwell_device(server_args.device):
+            platform = current_platform()
+            if not (_is_blackwell_device(server_args.device) or platform.is_cdna4_plus):
                 raise ValueError(
-                    "GLM DSA FP8 KV cache currently requires the Blackwell TRTLLM "
-                    "sparse attention path; use --kv-cache-dtype auto or bfloat16 "
-                    f"on this platform, got {server_args.kv_cache_dtype}."
+                    "GLM DSA FP8 KV cache currently requires NVIDIA Blackwell "
+                    "or AMD CDNA4 sparse attention support; use --kv-cache-dtype "
+                    "auto or bfloat16 on this platform, got "
+                    f"{server_args.kv_cache_dtype}."
                 )
         return cls(
             **base.__dict__,

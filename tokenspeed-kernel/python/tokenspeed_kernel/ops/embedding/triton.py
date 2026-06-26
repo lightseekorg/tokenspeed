@@ -356,6 +356,133 @@ def apply_rope_triton(
     )
 
 
+@triton.jit
+def _fp8_quantize_3d_kernel(
+    x,
+    out,
+    scale,
+    x_stride_t: tl.constexpr,
+    x_stride_h: tl.constexpr,
+    out_stride_t: tl.constexpr,
+    out_stride_h: tl.constexpr,
+    num_heads: tl.constexpr,
+    n_cols: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HAS_SCALE_TENSOR: tl.constexpr,
+):
+    token = tl.program_id(0)
+    head = tl.program_id(1)
+    offsets = tl.arange(0, BLOCK_N)
+    mask = offsets < n_cols
+    values = tl.load(
+        x + token * x_stride_t + head * x_stride_h + offsets,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    if HAS_SCALE_TENSOR:
+        scale = tl.load(scale)
+    values = values * (1.0 / scale)
+    values_fp8 = values.to(tl.float8e4nv)
+    tl.store(
+        out + token * out_stride_t + head * out_stride_h + offsets,
+        values_fp8,
+        mask=(head < num_heads) & mask,
+    )
+
+
+def _fp8_quantize_3d_strided(
+    x: torch.Tensor,
+    out: torch.Tensor,
+    scale: float | torch.Tensor,
+    *,
+    enable_pdl: bool,
+) -> None:
+    if x.dim() != 3 or out.dim() != 3:
+        raise ValueError(
+            f"MLA FP8 quantize expects rank-3 tensors, got {x.shape} and {out.shape}"
+        )
+    if x.shape != out.shape:
+        raise ValueError(f"MLA FP8 quantize shape mismatch: {x.shape} vs {out.shape}")
+    if out.dtype != torch.float8_e4m3fn:
+        raise TypeError(f"MLA FP8 quantize output must be e4m3fn, got {out.dtype}")
+    if isinstance(scale, torch.Tensor):
+        scale = scale.contiguous()
+    block_n = max(16, _next_power_of_2(x.shape[-1]))
+    extra_kwargs = {"launch_pdl": True} if enable_pdl else {}
+    _fp8_quantize_3d_kernel[(x.shape[0], x.shape[1])](
+        x,
+        out,
+        scale,
+        x.stride(0),
+        x.stride(1),
+        out.stride(0),
+        out.stride(1),
+        num_heads=x.shape[1],
+        n_cols=x.shape[2],
+        BLOCK_N=block_n,
+        HAS_SCALE_TENSOR=isinstance(scale, torch.Tensor),
+        num_warps=4,
+        num_stages=1,
+        **extra_kwargs,
+    )
+
+
+def mla_rope_quantize_fp8_triton(
+    *,
+    q_rope: torch.Tensor,
+    k_rope: torch.Tensor,
+    q_nope: torch.Tensor,
+    k_nope: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    pos_ids: torch.Tensor,
+    is_neox: bool = True,
+    quantize_dtype: torch.dtype = torch.float8_e4m3fn,
+    q_rope_out: torch.Tensor,
+    k_rope_out: torch.Tensor,
+    q_nope_out: torch.Tensor,
+    k_nope_out: torch.Tensor,
+    quant_scale_q: float | torch.Tensor = 1.0,
+    quant_scale_kv: float | torch.Tensor = 1.0,
+    enable_pdl: bool = False,
+) -> None:
+    if quantize_dtype != torch.float8_e4m3fn:
+        raise TypeError(
+            f"Triton MLA RoPE FP8 only supports e4m3fn, got {quantize_dtype}"
+        )
+    if q_rope.shape[-1] != k_rope.shape[-1]:
+        raise ValueError(
+            "q_rope and k_rope must have the same rope dim, got "
+            f"{q_rope.shape[-1]} and {k_rope.shape[-1]}"
+        )
+    if q_rope.shape[0] != k_rope.shape[0] or q_rope.shape[0] != pos_ids.numel():
+        raise ValueError(
+            "MLA RoPE token count mismatch: "
+            f"q={q_rope.shape[0]}, k={k_rope.shape[0]}, pos={pos_ids.numel()}"
+        )
+
+    q_rope_tmp = torch.empty(q_rope.shape, dtype=q_rope.dtype, device=q_rope.device)
+    k_rope_tmp = torch.empty(k_rope.shape, dtype=k_rope.dtype, device=k_rope.device)
+    apply_rope_triton(
+        positions=pos_ids,
+        query=q_rope,
+        key=k_rope,
+        head_size=q_rope.shape[-1],
+        cos_sin_cache=cos_sin_cache,
+        is_neox=is_neox,
+        rotary_dim=q_rope.shape[-1],
+        output_q_rope=q_rope_tmp,
+        output_k_rope=k_rope_tmp,
+    )
+    _fp8_quantize_3d_strided(
+        q_rope_tmp, q_rope_out, quant_scale_q, enable_pdl=enable_pdl
+    )
+    _fp8_quantize_3d_strided(
+        k_rope_tmp, k_rope_out, quant_scale_kv, enable_pdl=enable_pdl
+    )
+    _fp8_quantize_3d_strided(q_nope, q_nope_out, quant_scale_q, enable_pdl=enable_pdl)
+    _fp8_quantize_3d_strided(k_nope, k_nope_out, quant_scale_kv, enable_pdl=enable_pdl)
+
+
 @register_kernel(
     "embedding",
     "rope",
