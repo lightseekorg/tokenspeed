@@ -126,6 +126,30 @@ class DisaggPrefillExecutor:
             return None
         return np.array([slot], dtype=np.int64)
 
+    @staticmethod
+    def _mamba_optional_index(op, attr: str, index: int):
+        indices = getattr(op, attr, None)
+        if indices is None or index >= len(indices):
+            return None
+        slot = int(indices[index])
+        if slot < 0:
+            return None
+        return slot
+
+    @classmethod
+    def _mamba_transfer_indices(cls, op, index: int):
+        working = cls._mamba_indices(op, index)
+        if working is None:
+            return None
+
+        slots = [int(x) for x in working.tolist()]
+        checkpoint_src = cls._mamba_optional_index(
+            op, "mamba_checkpoint_dst_indices", index
+        )
+        if checkpoint_src is not None and checkpoint_src not in slots:
+            slots.append(checkpoint_src)
+        return np.array(slots, dtype=np.int64)
+
     def _decode_prefix_len(self, bootstrap_room: int) -> int:
         transfer_info = next(
             t
@@ -182,7 +206,7 @@ class DisaggPrefillExecutor:
             kv_indices, index_slice, is_last = self._prefill_page_window(op, i, sender)
             if len(kv_indices) == 0 and not is_last:
                 continue
-            mamba_indices = self._mamba_indices(op, i) if is_last else None
+            mamba_indices = self._mamba_transfer_indices(op, i) if is_last else None
             sender.send_layerwise(
                 kv_indices,
                 index_slice,
@@ -226,7 +250,7 @@ class DisaggPrefillExecutor:
                 op.occupied_pages[i][decode_prefix_len // self.page_size :],
                 dtype=np.int64,
             )
-            mamba_indices = self._mamba_indices(op, i)
+            mamba_indices = self._mamba_transfer_indices(op, i)
             logger.debug(
                 "[prefill][_decode] rid=%s aux_index=%d kv_indices(len=%d)=%s bootstrap_token=%d",
                 request_id,

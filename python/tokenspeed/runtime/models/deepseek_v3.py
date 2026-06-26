@@ -1410,6 +1410,22 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
         else:
             self.model.layers_to_capture = {val + 1 for val in layer_ids}
 
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]):
+        # DFlash checkpoints name 0-indexed target layer outputs. The capture
+        # check runs before layer i, so capture at i + 1 for layer i's output.
+        num_layers = len(self.model.layers)
+        if len(set(layer_ids)) != len(layer_ids):
+            raise ValueError("DFLASH target_layer_ids must be unique.")
+
+        invalid = [val for val in layer_ids if val < 0 or val + 1 >= num_layers]
+        if invalid:
+            raise ValueError(
+                "DFLASH target_layer_ids must map to capturable target layer "
+                f"outputs. Got invalid ids {invalid}; valid range is "
+                f"[0, {num_layers - 2}] for {num_layers} target layers."
+            )
+        self.model.layers_to_capture = {val + 1 for val in layer_ids}
+
     def get_param(self, params_dict, name):
         if name in params_dict:
             return params_dict[name]

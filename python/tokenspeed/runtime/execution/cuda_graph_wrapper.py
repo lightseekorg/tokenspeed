@@ -422,6 +422,11 @@ class CudaGraphWrapper:
         torch.cuda.synchronize()
         dist.barrier()
 
+        # Warmups can switch a backend back to eager metadata objects. Restore
+        # the graph-backed metadata immediately before capture so replay-time
+        # metadata refreshes update the same tensors recorded by the graph.
+        self._init_capture_metadata(bs)
+
         # Fill sampler buffers OUTSIDE the capture so RNG ops aren't recorded.
         if self.sampling_backend is not None:
             self.sampling_backend.prepare_capture(

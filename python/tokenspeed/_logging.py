@@ -74,7 +74,7 @@ def _suppress_flash_attn_jit_cache_debug_log():
     logging.disable(logging.INFO)
     try:
         import_module(logger_name)
-    except ImportError:
+    except Exception:
         return
     finally:
         logging.disable(previous_disable_level)
