@@ -179,6 +179,13 @@ class GreedySamplingBackend(SamplingBackend):
         bs = logits.shape[0]
         tokens = sampling_argmax(logits, out=self._sample_token_buf[:bs])
 
+        # TP-rank sync: rank 0 wins. Mirrors FlashInferSamplingBackend.sample.
+        # The per-rank argmax can diverge when the all-gathered target logits
+        # are not bit-identical across attention-TP ranks (gather fast-path /
+        # sub-ulp accumulation order). An unsynced token id desyncs the batch
+        # composition across ranks and deadlocks a downstream model all-reduce.
+        self.maybe_broadcast(tokens)
+
         if self.config.enable_output_logprobs:
             logits_output.next_token_logprobs = gather_token_logprobs_torch(
                 logits, tokens
@@ -228,6 +235,14 @@ class GreedySamplingBackend(SamplingBackend):
         )
 
         accept_length += 1
+
+        # TP-rank sync: rank 0 wins on the full verify-output triple. Mirrors
+        # FlashInferSamplingBackend.verify. Without it, per-rank argmax /
+        # accept-length divergence (gathered logits not bit-identical across
+        # attention-TP ranks) makes the next batch composition differ per rank
+        # and deadlocks the model all-reduce under DFlash spec-decode. The
+        # buffers are laid out flat precisely so these views are NCCL-contiguous.
+        self.maybe_broadcast(predict, accept_index, accept_length)
 
         if self.config.enable_output_logprobs:
             logits_output.next_token_logprobs = gather_token_logprobs_torch(
