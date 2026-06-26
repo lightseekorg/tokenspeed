@@ -441,6 +441,36 @@ def _make_hidden_and_router(num_tokens: int) -> tuple[torch.Tensor, torch.Tensor
     return hidden_states, router_logits
 
 
+def _quantize_mxfp4_for_test(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    if x.shape[-1] % MXFP4_BLOCK != 0:
+        raise ValueError("MXFP4 test quantization requires 32-element blocks")
+
+    x_blocks = x.to(torch.float32).reshape(
+        *x.shape[:-1],
+        x.shape[-1] // MXFP4_BLOCK,
+        MXFP4_BLOCK,
+    )
+    max_abs = x_blocks.abs().amax(dim=-1)
+    min_exp = torch.full_like(max_abs, -127.0)
+    scale_exp = torch.where(
+        max_abs > 0,
+        torch.floor(torch.log2(max_abs)) - 2,
+        min_exp,
+    ).clamp(-127, 127)
+
+    scaled = x_blocks * torch.exp2(-scale_exp).unsqueeze(-1)
+    abs_scaled = scaled.abs()
+    codes = torch.zeros_like(abs_scaled, dtype=torch.uint8)
+    for threshold in (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0):
+        codes += (abs_scaled >= threshold).to(torch.uint8)
+    codes |= (scaled < 0).to(torch.uint8) * 8
+
+    packed_blocks = codes[..., 0::2] | (codes[..., 1::2] << 4)
+    packed = packed_blocks.reshape(*x.shape[:-1], x.shape[-1] // 2).contiguous()
+    scales = (scale_exp.to(torch.int16) + 127).to(torch.uint8).contiguous()
+    return packed, scales
+
+
 def _make_gemm2_input(num_tokens: int, scale: torch.Tensor) -> torch.Tensor:
     generator = torch.Generator(device="cuda").manual_seed(19000 + num_tokens)
     exact_values = (
@@ -736,8 +766,6 @@ def test_gluon_moe_gemm1_dynamic_mxfp4_gather_scales_match_torch_gfx950(
     mxfp4_weights: Mxfp4WeightVariants,
     variant: str,
 ) -> None:
-    from tokenspeed_kernel import quantize_mxfp4
-
     weights = getattr(mxfp4_weights, variant)
     hidden_states, router_logits = _make_hidden_and_router(num_tokens)
     ragged_metadata, gather_indx, _scatter_indx, _gate_scal = default_route(
@@ -745,13 +773,7 @@ def test_gluon_moe_gemm1_dynamic_mxfp4_gather_scales_match_torch_gfx950(
         TOPK,
         dtype=router_logits.dtype,
     )
-    gemm1_input, gemm1_scale = quantize_mxfp4(
-        hidden_states,
-        scale_size=MXFP4_BLOCK,
-        scale_layout="linear",
-        solution="triton",
-        enable_pdl=False,
-    )
+    gemm1_input, gemm1_scale = _quantize_mxfp4_for_test(hidden_states)
     precision_config = gluon_moe.PrecisionConfig(
         a_mx_scale=gemm1_scale,
         a_microblock_size=MXFP4_BLOCK,
