@@ -5,7 +5,6 @@ from typing import Any
 
 import pytest
 import torch
-from tokenspeed_kernel import quantize_mxfp4
 
 
 def _is_gfx950() -> bool:
@@ -730,12 +729,15 @@ def test_gluon_moe_gemms_with_preshuffle_match_torch_gfx950(
 
 
 @requires_gfx950
+@pytest.mark.parametrize("num_tokens", KEY_NUM_TOKENS)
 @pytest.mark.parametrize("variant", ("nonpreshuffled", "preshuffled"))
 def test_gluon_moe_gemm1_dynamic_mxfp4_gather_scales_match_torch_gfx950(
+    num_tokens: int,
     mxfp4_weights: Mxfp4WeightVariants,
     variant: str,
 ) -> None:
-    num_tokens = 64
+    from tokenspeed_kernel import quantize_mxfp4
+
     weights = getattr(mxfp4_weights, variant)
     hidden_states, router_logits = _make_hidden_and_router(num_tokens)
     ragged_metadata, gather_indx, _scatter_indx, _gate_scal = default_route(
