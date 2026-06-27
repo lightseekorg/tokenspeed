@@ -1,5 +1,5 @@
 api_version: ci.tokenspeed.io/v1
-name: eval-kimi-k2.5-nvfp4-mmlu
+name: eval-kimi-k2.5-nvfp4-eagle3-gpqa-diamond
 type: eval
 triggers:
   - manual
@@ -43,7 +43,7 @@ eval:
     --model nvidia/Kimi-K2.5-NVFP4
     --api-url http://127.0.0.1:8000/v1
     --api-key EMPTY_TOKEN
-    --datasets mmlu
+    --datasets gpqa_diamond
     --eval-batch-size 16
 report:
   github_step_summary: true

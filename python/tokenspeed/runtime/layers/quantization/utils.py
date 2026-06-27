@@ -33,6 +33,17 @@ from tokenspeed.runtime.layers.quantization.compressed_tensors.scalar_type impor
 )
 
 
+def should_exclude_quant_module(prefix: str, exclude_modules: list[str]) -> bool:
+    """Whether ``prefix`` matches a ModelOpt-style glob in ``exclude_modules``."""
+    if prefix is None or not exclude_modules:
+        return False
+    for pattern in exclude_modules:
+        regex_str = pattern.replace(".", r"\.").replace("*", ".*")
+        if re.fullmatch(regex_str, prefix):
+            return True
+    return False
+
+
 def should_ignore_quant_layer(
     prefix: str,
     ignored_layers: list[str],

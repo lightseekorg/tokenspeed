@@ -242,7 +242,7 @@ MESH_CASES = {
             "--speculative-draft-model-quantization",
             "unquant",
             "--drafter-attention-backend",
-            "fa4",
+            "trtllm",
             "--sampling-backend",
             "greedy",
         ),

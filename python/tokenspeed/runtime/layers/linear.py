@@ -58,7 +58,10 @@ from tokenspeed.runtime.layers.quantization.base_config import (
 from tokenspeed.runtime.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
 )
-from tokenspeed.runtime.layers.quantization.utils import should_ignore_quant_layer
+from tokenspeed.runtime.layers.quantization.utils import (
+    should_exclude_quant_module,
+    should_ignore_quant_layer,
+)
 from tokenspeed.runtime.utils import get_colorful_logger, set_weight_attrs
 
 logger = get_colorful_logger(__name__)
@@ -175,7 +178,7 @@ class LinearBase(torch.nn.Module):
             self.quant_method: QuantizeMethodBase | None = UnquantizedLinearMethod()
         elif isinstance(quant_config, Nvfp4Config):
             # For NVFP4, excluded layers use unquantized (bf16)
-            if quant_config.is_layer_excluded(prefix):
+            if should_exclude_quant_module(prefix, quant_config.exclude_modules):
                 self.quant_method = UnquantizedLinearMethod()
             else:
                 self.quant_method = Nvfp4LinearMethod(quant_config)
