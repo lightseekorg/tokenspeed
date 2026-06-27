@@ -16,7 +16,7 @@ runner:
     - b200-1gpu
     - gb200-1gpu
     - b300-1gpu
-    - amd-mi35x-1gpu-test
+    - amd-mi355-1gpu-bench
 env:
   CI: "true"
 install:
