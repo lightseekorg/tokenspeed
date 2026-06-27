@@ -341,6 +341,11 @@ __launch_bounds__(BLOCK_SIZE) __global__ void applyKernel(
     int32_t vocab_size,
     int32_t max_k,
     bool enable_pdl) {
+    // PDL: wait for preceding stream work before reading top-k outputs.
+    if (enable_pdl) {
+        cudaGridDependencySynchronize();
+    }
+
     constexpr int MAX_K = BLOCK_SIZE * ITEMS_PER_THREAD;
     const int b = blockIdx.x;
     const int32_t k_raw = top_ks[b];
