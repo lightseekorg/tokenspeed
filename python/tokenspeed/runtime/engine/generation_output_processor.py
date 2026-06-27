@@ -24,6 +24,11 @@ import time
 from typing import TYPE_CHECKING
 
 from tokenspeed.runtime.engine.io_struct import BatchTokenIDOut
+from tokenspeed.runtime.engine.request_stats import (
+    NOOP_STATS,
+    RequestStats,
+    RequestStatsTracker,
+)
 from tokenspeed.runtime.engine.request_types import (
     ABORT_CODE,
     FINISH_ABORT,
@@ -76,6 +81,7 @@ class RequestState:
         token_ids_logprob: list[int] | None = None,
         multimodal_inputs=None,
         prompt_input_ids_unpadded: list[int] | None = None,
+        created_time: float = 0.0,
     ) -> None:
         # --- Extracted from recv_req (immutable) ---
         self.prompt_input_ids: list[int] = prompt_input_ids
@@ -101,6 +107,10 @@ class RequestState:
         self.prefix_len: int = 0
         self.spec_verify_ct: int = 0
         self.accept_draft_tokens: float | None = None
+
+        # request stats (host-side); tracker attached only with --enable-log-request-stats
+        self.created_time: float = created_time
+        self.stats: RequestStatsTracker = NOOP_STATS
         # Sampled-token logprobs, accumulated per generated token.
         # None when return_logprob is False.
         self.output_token_logprobs_val: list[float] | None = (
@@ -165,6 +175,7 @@ class RequestState:
             token_ids_logprob=getattr(recv_req, "token_ids_logprob", None),
             multimodal_inputs=getattr(recv_req, "multimodal_inputs", None),
             prompt_input_ids_unpadded=getattr(recv_req, "input_ids_unpadded", None),
+            created_time=getattr(recv_req, "created_time", 0.0),
         )
 
     @property
@@ -304,10 +315,11 @@ class OutputProcesser:
     def __init__(
         self,
         send_to_tokenizer,
-        global_rank: int = 0,
+        attn_tp_rank: int = 0,
         spec_algorithm=None,
         spec_num_tokens: int | None = None,
         stream_interval: int = 1,
+        enable_log_request_stats: bool = False,
         *,
         metrics: EngineMetrics,
     ) -> None:
@@ -316,11 +328,17 @@ class OutputProcesser:
         # inline detokenizer inside AsyncLLM is the only
         # detokenization path.
         self.send_to_tokenizer = send_to_tokenizer
-        self.global_rank = global_rank
+        # Per-request logs fire on each DP replica's TP leader (attn_tp_rank == 0),
+        # NOT the global rank 0 — otherwise DP replicas > 0 would log nothing and
+        # their requests would be missing from the logs entirely.
+        self.attn_tp_rank = attn_tp_rank
         self.spec_algorithm = spec_algorithm
         self.spec_num_tokens = spec_num_tokens
         self.stream_interval = stream_interval
         self.metrics = metrics
+        self.enable_log_request_stats = enable_log_request_stats
+        # previous forward step ts, for host-side preempt timing
+        self._last_step_ts: float = 0.0
         self.log_cnt = 0
         self.rid_to_state: dict[str, RequestState] = {}
         # rid → monotonic ts at which the abort was seen. Covers the
@@ -331,12 +349,28 @@ class OutputProcesser:
         self.pending_aborts: dict[str, float] = {}
 
     def log_accept_length(self, rid, request_state: RequestState):
-        if self.global_rank == 0:
+        # When --enable-log-request-stats is on, the richer RequestStats line (which
+        # already carries acc_len) replaces this one — see _log_request_stats.
+        if self.attn_tp_rank == 0 and not self.enable_log_request_stats:
             logger.info(
                 "Req: %s Finish! Accept_num_tokens_avg: %s",
                 rid,
                 request_state.accept_draft_tokens,
             )
+
+    def _log_request_stats(
+        self, rid: str, rs: RequestState, finish_time: float
+    ) -> None:
+        # Single guard for the whole stats path: no tracker (flag off) or non-zero
+        # rank => nothing to do. Keeps the forward-loop call sites trivial and the
+        # derivation in from_state total (it always sees a tracker).
+        if rs.stats is NOOP_STATS or self.attn_tp_rank != 0:
+            return
+        rs.stats.mark_finish(finish_time)
+        stats = RequestStats.from_state(rs, self.spec_algorithm, self.spec_num_tokens)
+        # Fused into the scheduler's per-request finish line (supersedes the
+        # Accept_num_tokens_avg variant in log_accept_length).
+        logger.info("Req: %s Finish! %s", rid, stats)
 
     def sweep_pending_aborts(self) -> None:
         """Drop TTL-expired entries from ``pending_aborts``.
@@ -380,6 +414,8 @@ class OutputProcesser:
 
     def register(self, rid, state):
         self.rid_to_state[rid] = state
+        if self.enable_log_request_stats:
+            state.stats = RequestStatsTracker()
         if self.pending_aborts.pop(rid, None) is not None:
             # Same reasoning as ``mark_abort``: drive the abort all the
             # way to ``finished_reason`` so the slot-release gate fires.
@@ -534,6 +570,17 @@ class OutputProcesser:
         )
         num_extends = forward_op.num_extends()
 
+        # per-request stats timing (host-side, only when --enable-log-request-stats)
+        stats_now = time.time() if self.enable_log_request_stats else 0.0
+        step_dt = 0.0
+        prefilling_others = False
+        if self.enable_log_request_stats:
+            step_dt = (
+                stats_now - self._last_step_ts if self._last_step_ts > 0.0 else 0.0
+            )
+            self._last_step_ts = stats_now
+            prefilling_others = num_extends > 0
+
         request_changes = []
         stream_out_rids = []
         stream_out_states = []
@@ -570,10 +617,15 @@ class OutputProcesser:
                 continue
 
             request_state: RequestState = self.rid_to_state[rid]
+            # scheduled_time is stamped pre-forward in the event loop (queue end)
 
             # Do not output chunking result
             if not request_state.prefill_finished:
                 continue
+
+            request_state.stats.mark_prefill_done(stats_now)
+            if i >= num_extends:
+                request_state.stats.record_decode_step(step_dt, prefilling_others)
 
             nan_detected = nan_flags_list is not None and nan_flags_list[i]
             if nan_detected and not request_state.finished:
@@ -589,7 +641,7 @@ class OutputProcesser:
                 if model_output_logprobs is not None:
                     model_output_logprobs = model_output_logprobs[:1]
                 self.metrics.record_nan_abort()
-                if self.global_rank == 0:
+                if self.attn_tp_rank == 0:
                     logger.warning(
                         "Req %s terminated: NaN detected in logits (or an"
                         " out-of-vocab sample escaped the sampler);"
@@ -667,6 +719,10 @@ class OutputProcesser:
                     self.log_accept_length(rid, request_state)
                     break
 
+            # first output token == TTFT anchor
+            if request_state.output_ids:
+                request_state.stats.mark_first_token(stats_now)
+
             # For aborted requests, skip output to detokenizer (the tokenizer
             # manager already cleaned up), just notify the scheduler to finish.
             # Exception: pause-initiated aborts (abort_notify_client) leave a
@@ -677,6 +733,7 @@ class OutputProcesser:
                 if request_state.abort_notify_client:
                     stream_out_rids.append(rid)
                     stream_out_states.append(request_state)
+                self._log_request_stats(rid, request_state, stats_now)
                 request_state.release_pending_multimodal_features()
                 self.rid_to_state.pop(rid)
                 continue
@@ -696,6 +753,7 @@ class OutputProcesser:
                 request_changes.append(
                     make_abort_event(rid) if nan_detected else make_finish_event(rid)
                 )
+                self._log_request_stats(rid, request_state, stats_now)
                 request_state.release_pending_multimodal_features()
                 self.rid_to_state.pop(rid)
             else:
@@ -754,6 +812,9 @@ class OutputProcesser:
         if not rs.finished:
             rs.finished_reason = FINISH_LENGTH(length=len(rs.output_ids))
         rs.finished_output = False
+        # PD prefill node's terminal path (the other finish/abort logging lives in
+        # post_process_forward_op). Self-guarded, so a no-op when the flag is off.
+        self._log_request_stats(req_id, rs, time.time())
         self.stream_output([req_id], [rs])
         # SucceededEvent already finishes the C++ FSM; no extra FinishEvent needed
         return []

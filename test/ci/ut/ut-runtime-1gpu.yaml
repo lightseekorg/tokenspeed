@@ -9,9 +9,9 @@ runner:
     - h100-1gpu
     - b200-1gpu
     - gb200-1gpu
-    - amd-mi355-1gpu-bench
+    - amd-mi35x-1gpu-test
   env:
-    amd-mi355-1gpu-bench:
+    amd-mi35x-1gpu-test:
       CI_TIMEOUT_PER_FILE: "600"
 env:
   CI: "true"
