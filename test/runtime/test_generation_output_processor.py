@@ -254,7 +254,7 @@ class _RecordingLogger:
 
 
 def test_log_request_stats_disabled_by_default():
-    """Without --log-request-stats, no ReqStats line is emitted and no
+    """Without --enable-log-request-stats, no ReqStats line is emitted and no
     timestamps are recorded (zero overhead path)."""
     import tokenspeed.runtime.engine.generation_output_processor as gop
 
@@ -262,7 +262,7 @@ def test_log_request_stats_disabled_by_default():
     gop_logger, gop.logger = gop.logger, rec
     try:
         processor = OutputProcesser(_Sender(), attn_tp_rank=0, metrics=_Metrics())
-        assert processor.log_request_stats is False
+        assert processor.enable_log_request_stats is False
         state = _state([5, 6, 7], computed_length=3)
         state.sampling_params.max_new_tokens = 1
         processor.rid_to_state["d"] = state
@@ -296,7 +296,7 @@ def test_log_request_stats_line_fields():
     gop_logger, gop.logger = gop.logger, rec
     try:
         processor = OutputProcesser(
-            _Sender(), attn_tp_rank=0, log_request_stats=True, metrics=_Metrics()
+            _Sender(), attn_tp_rank=0, enable_log_request_stats=True, metrics=_Metrics()
         )
         # prompt=4, cache=2 -> cache_hit 0.5; queue 10ms, prefill 20ms, ttft 30ms,
         # total 130ms; output=5 over a 100ms decode window -> decode_tps 40.
@@ -344,7 +344,7 @@ def test_log_request_stats_aborted_with_spec_acceptance():
             attn_tp_rank=0,
             spec_algorithm="eagle",
             spec_num_tokens=4,
-            log_request_stats=True,
+            enable_log_request_stats=True,
             metrics=_Metrics(),
         )
         rs = _state([1, 2, 3, 4])
@@ -373,7 +373,7 @@ def test_log_request_stats_noop_without_tracker():
     gop_logger, gop.logger = gop.logger, rec
     try:
         processor = OutputProcesser(
-            _Sender(), attn_tp_rank=0, log_request_stats=True, metrics=_Metrics()
+            _Sender(), attn_tp_rank=0, enable_log_request_stats=True, metrics=_Metrics()
         )
         rs = _state([1, 2, 3])
         rs.finished_reason = FINISH_LENGTH(length=1)
@@ -426,7 +426,7 @@ def test_log_request_stats_records_timestamps_through_forward():
     gop_logger, gop.logger = gop.logger, rec
     try:
         processor = OutputProcesser(
-            _Sender(), attn_tp_rank=0, log_request_stats=True, metrics=_Metrics()
+            _Sender(), attn_tp_rank=0, enable_log_request_stats=True, metrics=_Metrics()
         )
         # prefill already done; max_new_tokens=1 so it finishes after one token
         state = _state([5, 6, 7], computed_length=3)
@@ -473,7 +473,7 @@ def test_log_request_stats_logs_on_each_dp_replica_leader():
             p = OutputProcesser(
                 _Sender(),
                 attn_tp_rank=attn_tp_rank,
-                log_request_stats=True,
+                enable_log_request_stats=True,
                 metrics=_Metrics(),
             )
             rs = _state([1, 2, 3, 4])

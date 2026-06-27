@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Per-request performance stats for --log-request-stats.
+"""Per-request performance stats for --enable-log-request-stats.
 
 Two cohesive pieces:
 - ``RequestStatsTracker``: a mutable, host-side accumulator that the engine fires
@@ -48,7 +48,7 @@ def _ms(end: float, start: float) -> float:
 
 
 class RequestStatsTracker:
-    """Host-side per-request timing/preemption accumulator (--log-request-stats).
+    """Host-side per-request timing/preemption accumulator (--enable-log-request-stats).
 
     Attached to a RequestState only when logging is on; the engine fires
     lifecycle events into it. No GPU sync.
@@ -90,7 +90,7 @@ class RequestStatsTracker:
 
 
 class _NoOpStatsTracker(RequestStatsTracker):
-    """Null-object tracker used when --log-request-stats is off, so the engine
+    """Null-object tracker used when --enable-log-request-stats is off, so the engine
     can fire lifecycle events unconditionally without a per-request guard. The
     only stats check lives in _log_request_stats (which skips this singleton).
 
@@ -128,7 +128,7 @@ NOOP_STATS = _NoOpStatsTracker()
 
 @dataclass
 class RequestStats:
-    """Host-side per-request perf summary (--log-request-stats), logged as repr.
+    """Host-side per-request perf summary (--enable-log-request-stats), logged as repr.
 
     Durations are ms, rates are 0-1, ``*_ts`` are epoch seconds; ``acc_*`` are
     None when spec decode is off. No GPU sync.

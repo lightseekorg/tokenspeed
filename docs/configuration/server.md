@@ -143,7 +143,7 @@ draft model, and token count together.
 | `--log-level-http` | HTTP server log level. Defaults to `--log-level` when unset. |
 | `--enable-log-requests` | Log request metadata and optionally payloads. |
 | `--log-requests-level` | Request logging verbosity. |
-| `--log-request-stats` | Log a one-line per-request performance summary on finish/abort (see below). |
+| `--enable-log-request-stats` | Log a one-line per-request performance summary on finish/abort (see below). |
 | `--enable-metrics` | Enable metrics reporting. |
 | `--metrics-reporters` | Metrics reporter, such as `prometheus`. |
 | `--decode-log-interval` | Decode batch log interval. |
@@ -152,7 +152,7 @@ draft model, and token count together.
 
 ### Per-Request Stats
 
-`--log-request-stats` enriches the scheduler's per-request finish line for
+`--enable-log-request-stats` enriches the scheduler's per-request finish line for
 latency/throughput debugging. When set, the `Req: <rid> Finish! ...` line carries
 a Python-object repr (`RequestStats(...)`) instead of the default
 `Accept_num_tokens_avg` value (which it subsumes as `acc_len`). Every field is

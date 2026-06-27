@@ -108,7 +108,7 @@ class RequestState:
         self.spec_verify_ct: int = 0
         self.accept_draft_tokens: float | None = None
 
-        # request stats (host-side); tracker attached only with --log-request-stats
+        # request stats (host-side); tracker attached only with --enable-log-request-stats
         self.created_time: float = created_time
         self.stats: RequestStatsTracker = NOOP_STATS
         # Sampled-token logprobs, accumulated per generated token.
@@ -319,7 +319,7 @@ class OutputProcesser:
         spec_algorithm=None,
         spec_num_tokens: int | None = None,
         stream_interval: int = 1,
-        log_request_stats: bool = False,
+        enable_log_request_stats: bool = False,
         *,
         metrics: EngineMetrics,
     ) -> None:
@@ -336,7 +336,7 @@ class OutputProcesser:
         self.spec_num_tokens = spec_num_tokens
         self.stream_interval = stream_interval
         self.metrics = metrics
-        self.log_request_stats = log_request_stats
+        self.enable_log_request_stats = enable_log_request_stats
         # previous forward step ts, for host-side preempt timing
         self._last_step_ts: float = 0.0
         self.log_cnt = 0
@@ -349,9 +349,9 @@ class OutputProcesser:
         self.pending_aborts: dict[str, float] = {}
 
     def log_accept_length(self, rid, request_state: RequestState):
-        # When --log-request-stats is on, the richer RequestStats line (which
+        # When --enable-log-request-stats is on, the richer RequestStats line (which
         # already carries acc_len) replaces this one — see _log_request_stats.
-        if self.attn_tp_rank == 0 and not self.log_request_stats:
+        if self.attn_tp_rank == 0 and not self.enable_log_request_stats:
             logger.info(
                 "Req: %s Finish! Accept_num_tokens_avg: %s",
                 rid,
@@ -414,7 +414,7 @@ class OutputProcesser:
 
     def register(self, rid, state):
         self.rid_to_state[rid] = state
-        if self.log_request_stats:
+        if self.enable_log_request_stats:
             state.stats = RequestStatsTracker()
         if self.pending_aborts.pop(rid, None) is not None:
             # Same reasoning as ``mark_abort``: drive the abort all the
@@ -570,11 +570,11 @@ class OutputProcesser:
         )
         num_extends = forward_op.num_extends()
 
-        # per-request stats timing (host-side, only when --log-request-stats)
-        stats_now = time.time() if self.log_request_stats else 0.0
+        # per-request stats timing (host-side, only when --enable-log-request-stats)
+        stats_now = time.time() if self.enable_log_request_stats else 0.0
         step_dt = 0.0
         prefilling_others = False
-        if self.log_request_stats:
+        if self.enable_log_request_stats:
             step_dt = (
                 stats_now - self._last_step_ts if self._last_step_ts > 0.0 else 0.0
             )

@@ -122,7 +122,7 @@ class ServerArgs:
     log_level_http: str | None = None
     enable_log_requests: bool = False
     log_requests_level: int = 0
-    log_request_stats: bool = False
+    enable_log_request_stats: bool = False
     enable_metrics: bool = False
     decode_log_interval: int = 40
     metrics_reporters: list[str] | None = None
@@ -1080,9 +1080,9 @@ class ServerArgs:
             choices=[0, 1, 2],
         )
         parser.add_argument(
-            "--log-request-stats",
+            "--enable-log-request-stats",
             action=argparse.BooleanOptionalAction,
-            default=ServerArgs.log_request_stats,
+            default=ServerArgs.enable_log_request_stats,
             help=(
                 "Log a one-line per-request performance summary when each request "
                 "finishes or aborts: timings (queue/prefill/ttft/total/preemption), "

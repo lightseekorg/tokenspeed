@@ -448,7 +448,7 @@ class EventLoop:
                 else None
             ),
             stream_interval=self.server_args.stream_interval,
-            log_request_stats=self.server_args.log_request_stats,
+            enable_log_request_stats=self.server_args.enable_log_request_stats,
             metrics=self.metrics,
         )
         self.prefetch_threshold = scheduler_cfg.prefetch_threshold
@@ -1366,8 +1366,8 @@ class EventLoop:
     def _mark_stats_scheduled(self, forward_op) -> None:
         # Stamp the pre-forward "scheduled" time on each request's stats tracker
         # so the queue/prefill split is anchored before the forward (idempotent:
-        # only the first forward a request appears in sets it). --log-request-stats.
-        if not self.server_args.log_request_stats or forward_op is None:
+        # only the first forward a request appears in sets it). --enable-log-request-stats.
+        if not self.server_args.enable_log_request_stats or forward_op is None:
             return
         now = time.time()
         rid_to_state = self.output_processor.rid_to_state
