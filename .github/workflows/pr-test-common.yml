@@ -1,43 +1,17 @@
-name: PR Test
+name: PR Test Common
 
-# This workflow is created for PRs targeting lightseekorg/tokenspeed, pushes to
-# lightseekorg/tokenspeed:main, and manual runs. The jobs below guard execution
-# so non-PR events only run in the upstream repository, while PRs from forks to
-# the upstream repository still run normally.
 on:
-  push:
-    branches: [main]
-    paths:
-      - "python/pyproject.toml"
-      - "python/tokenspeed/**"
-      - "tokenspeed-kernel/**"
-      - "tokenspeed-kernel-amd/**"
-      - "tokenspeed-mla/**"
-      - "tokenspeed-scheduler/**"
-      - "test/**"
-      - ".github/workflows/pr-test.yml"
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review, closed]
-    branches: [main]
-    paths:
-      - "python/pyproject.toml"
-      - "python/tokenspeed/**"
-      - "tokenspeed-kernel/**"
-      - "tokenspeed-kernel-amd/**"
-      - "tokenspeed-mla/**"
-      - "tokenspeed-scheduler/**"
-      - "test/**"
-      - ".github/workflows/pr-test.yml"
-  workflow_dispatch:
+  workflow_call:
     inputs:
+      runner_group:
+        description: "Runner group to include in the CI matrix."
+        required: true
+        type: string
       trigger:
         description: "CI task trigger to run"
         required: false
-        default: manual
-        type: choice
-        options:
-          - manual
-          - debug
+        default: per-commit
+        type: string
 
 env:
   PIP_BREAK_SYSTEM_PACKAGES: 1
@@ -45,8 +19,8 @@ env:
   TOKENSPEED_B200_RUNNER_LABEL: ${{ vars.TOKENSPEED_B200_RUNNER_LABEL }}
 
 concurrency:
-  group: pr-test-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+  group: pr-test-${{ inputs.runner_group }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ inputs.trigger == 'per-commit' }}
 
 jobs:
   cancel-on-close:
@@ -55,7 +29,7 @@ jobs:
     steps:
       - name: Cancel superseded PR Test runs
         run: |
-          echo "Cancelling older PR Test runs for PR #${{ github.event.pull_request.number }}"
+          echo "Cancelling older ${{ inputs.runner_group }} PR Test runs for PR #${{ github.event.pull_request.number }}"
 
   scan:
     # Closed PRs only need cancel-on-close. For all other events, run jobs for
@@ -88,15 +62,10 @@ jobs:
       - name: Build task matrix
         id: scan
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TRIGGER="${{ github.event.inputs.trigger }}"
-            if [ -z "$TRIGGER" ]; then
-              TRIGGER=manual
-            fi
-          else
-            TRIGGER=per-commit
-          fi
-          MATRIX=$(python3 test/ci_system/pipeline.py scan --root test/ci --trigger "$TRIGGER")
+          MATRIX=$(python3 test/ci_system/pipeline.py scan \
+            --root test/ci \
+            --trigger "${{ inputs.trigger }}" \
+            --runner-group "${{ inputs.runner_group }}")
           echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
 
       # Compute this once on the hosted runner (where `gh` is pre-installed)

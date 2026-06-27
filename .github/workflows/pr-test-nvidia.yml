@@ -1,0 +1,50 @@
+name: PR Test NVIDIA
+
+# Split vendor CI into separate workflows so either side can be rerun without
+# waiting for the other side's jobs to finish.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "python/pyproject.toml"
+      - "python/tokenspeed/**"
+      - "tokenspeed-kernel/**"
+      - "tokenspeed-kernel-amd/**"
+      - "tokenspeed-mla/**"
+      - "tokenspeed-scheduler/**"
+      - "test/**"
+      - ".github/workflows/pr-test-amd.yml"
+      - ".github/workflows/pr-test-common.yml"
+      - ".github/workflows/pr-test-nvidia.yml"
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, closed]
+    branches: [main]
+    paths:
+      - "python/pyproject.toml"
+      - "python/tokenspeed/**"
+      - "tokenspeed-kernel/**"
+      - "tokenspeed-kernel-amd/**"
+      - "tokenspeed-mla/**"
+      - "tokenspeed-scheduler/**"
+      - "test/**"
+      - ".github/workflows/pr-test-amd.yml"
+      - ".github/workflows/pr-test-common.yml"
+      - ".github/workflows/pr-test-nvidia.yml"
+  workflow_dispatch:
+    inputs:
+      trigger:
+        description: "CI task trigger to run"
+        required: false
+        default: manual
+        type: choice
+        options:
+          - manual
+          - debug
+
+jobs:
+  pr-test:
+    uses: ./.github/workflows/pr-test-common.yml
+    with:
+      runner_group: nvidia
+      trigger: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.trigger || 'per-commit' }}
+    secrets: inherit
