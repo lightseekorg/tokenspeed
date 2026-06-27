@@ -118,7 +118,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.scan.outputs.matrix) }}
-    name: ${{ matrix.name }} / ${{ matrix.runner }}
+    name: ${{ matrix.name }} (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     env:
