@@ -89,6 +89,7 @@ from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfi
 from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
 from tokenspeed.runtime.layers.quantization.utils import (
     block_dequant,
+    should_exclude_quant_module,
     should_ignore_quant_layer,
 )
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
@@ -418,9 +419,9 @@ class DeepseekV3FusedQkvAProjWithMqa(ReplicatedLinear):
             kv_a_prefix = prefix.replace(
                 "fused_qkv_a_proj_with_mqa", "kv_a_proj_with_mqa"
             )
-            if quant_config.is_layer_excluded(
-                q_a_prefix
-            ) or quant_config.is_layer_excluded(kv_a_prefix):
+            if should_exclude_quant_module(
+                q_a_prefix, quant_config.exclude_modules
+            ) or should_exclude_quant_module(kv_a_prefix, quant_config.exclude_modules):
                 quant_config = None
         super().__init__(
             input_size,
@@ -1410,6 +1411,22 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
         else:
             self.model.layers_to_capture = {val + 1 for val in layer_ids}
 
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]):
+        # DFlash checkpoints name 0-indexed target layer outputs. The capture
+        # check runs before layer i, so capture at i + 1 for layer i's output.
+        num_layers = len(self.model.layers)
+        if len(set(layer_ids)) != len(layer_ids):
+            raise ValueError("DFLASH target_layer_ids must be unique.")
+
+        invalid = [val for val in layer_ids if val < 0 or val + 1 >= num_layers]
+        if invalid:
+            raise ValueError(
+                "DFLASH target_layer_ids must map to capturable target layer "
+                f"outputs. Got invalid ids {invalid}; valid range is "
+                f"[0, {num_layers - 2}] for {num_layers} target layers."
+            )
+        self.model.layers_to_capture = {val + 1 for val in layer_ids}
+
     def get_param(self, params_dict, name):
         if name in params_dict:
             return params_dict[name]
@@ -1932,6 +1949,8 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
 
         self.logits_processor = LogitsProcessor(
             config,
+            skip_all_gather=self.mapping.attn.has_dp,
+            do_argmax=True,
             tp_rank=self.mapping.attn.tp_rank,
             tp_size=self.mapping.attn.tp_size,
             tp_group=self.mapping.attn.tp_group,

@@ -42,6 +42,7 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.backends.trtllm_mla import TRTLLMMLABackend
 from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
+from tokenspeed.runtime.layers.attention.dsa.utils import workspace_indices_to_kv_slots
 from tokenspeed.runtime.layers.attention.registry import register_backend
 
 _DSA_TRTLLM_WORKSPACE_BYTES = 384 * 1024 * 1024
@@ -104,26 +105,6 @@ def _default_dsa_sparse_prefill_impl(kv_cache_dtype: torch.dtype | None = None) 
     ):
         return _SPARSE_IMPL_TRTLLM
     return _SPARSE_IMPL_FLASHMLA
-
-
-def _workspace_indices_to_kv_slots(
-    workspace_indices: torch.Tensor,
-    kv_workspace_slots: torch.Tensor | None,
-) -> torch.Tensor:
-    if kv_workspace_slots is None:
-        return workspace_indices.to(torch.int32)
-    if workspace_indices.numel() == 0:
-        return workspace_indices.to(torch.int32)
-
-    flat_indices = workspace_indices.reshape(-1)
-    valid = flat_indices >= 0
-    flat_slots = flat_indices.to(torch.int64)
-    if valid.any():
-        flat_slots[valid] = kv_workspace_slots.to(
-            device=workspace_indices.device,
-            dtype=torch.int64,
-        ).index_select(0, flat_slots[valid])
-    return flat_slots.view_as(workspace_indices).to(torch.int32)
 
 
 class DSABackend(AttentionBackend):
@@ -342,6 +323,16 @@ class DSABackend(AttentionBackend):
 
     def get_cuda_graph_seq_len_fill_value(self):
         return self._dense_backend.get_cuda_graph_seq_len_fill_value()
+
+    def advance_draft_forward_metadata(self, seq_lens: torch.Tensor | None = None):
+        metadata = self.forward_decode_metadata
+        if metadata is None or metadata.seq_lens_k is None:
+            raise RuntimeError("DSA draft decode metadata was not initialized")
+        if seq_lens is None:
+            metadata.seq_lens_k.add_(1)
+        else:
+            metadata.seq_lens_k.copy_(seq_lens[: metadata.seq_lens_k.numel()])
+        self._refresh_decode_topk_schedule_metadata(metadata.seq_lens_k.numel())
 
     def init_forward_metadata(
         self,
@@ -882,7 +873,7 @@ class DSABackend(AttentionBackend):
         if q.shape[0] == 0:
             return q.new_empty((0, layer.tp_q_head_num * layer.v_head_dim))
 
-        block_tables = _workspace_indices_to_kv_slots(
+        block_tables = workspace_indices_to_kv_slots(
             workspace_indices.to(torch.int32),
             kv_workspace_slots,
         ).view(q.shape[0], 1, self.index_topk)

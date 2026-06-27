@@ -422,6 +422,11 @@ class CudaGraphWrapper:
         torch.cuda.synchronize()
         dist.barrier()
 
+        # Warmups can switch a backend back to eager metadata objects. Restore
+        # the graph-backed metadata immediately before capture so replay-time
+        # metadata refreshes update the same tensors recorded by the graph.
+        self._init_capture_metadata(bs)
+
         # Fill sampler buffers OUTSIDE the capture so RNG ops aren't recorded.
         if self.sampling_backend is not None:
             self.sampling_backend.prepare_capture(
@@ -656,10 +661,12 @@ class CudaGraphWrapper:
             draft_forward_mode = ForwardMode.DECODE
             if draft_uses_paged_groups:
                 draft_attn_kwargs["num_tokens"] = padded_bs * self.max_tokens_per_req
+            draft_seq_lens = self.drafter.draft_seq_lens_buf[:padded_bs]
+            draft_seq_lens.copy_(seq_lens[:padded_bs])
             self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
                 padded_bs,
                 req_pool_indices,
-                seq_lens,
+                draft_seq_lens,
                 req_to_page=self.drafter.req_to_page,
                 forward_mode=draft_forward_mode,
                 **draft_attn_kwargs,
@@ -790,15 +797,27 @@ class CudaGraphWrapper:
         index = bisect.bisect_left(self.capture_bs, target_bs)
         return self.capture_bs[index]
 
-    @staticmethod
     def _pad_graph_req_pool_indices(
-        active_req_pool_indices: torch.Tensor, padded_bs: int
+        self, active_req_pool_indices: torch.Tensor, padded_bs: int
     ) -> torch.Tensor:
         pad = padded_bs - active_req_pool_indices.shape[0]
         if pad <= 0:
             return active_req_pool_indices
+        # Route padding rows to the sentinel req-pool slot (max_req_pool_size),
+        # not slot 0. valid_cache_lengths / req_to_page are sized
+        # [max_req_pool_size + 1]; the sentinel row stays zero-init (length 0,
+        # dummy page 0) since _update_runtime_state only writes real rows. Slot 0
+        # would alias the live first request: harmless for verify (seq_len == 1),
+        # but the DFLASH draft derives each row's block seq_len from
+        # valid_cache_lengths[req_pool], so padding rows would grow unbounded with
+        # request 0's context and hang the draft block-decode kernel. The sentinel
+        # keeps that derived length inert for every drafter backend.
+        sentinel = int(self.config.max_req_pool_size)
         return torch.cat(
-            [active_req_pool_indices, active_req_pool_indices.new_zeros(pad)]
+            [
+                active_req_pool_indices,
+                active_req_pool_indices.new_full((pad,), sentinel),
+            ]
         )
 
     def _set_graph_state_write_indices(

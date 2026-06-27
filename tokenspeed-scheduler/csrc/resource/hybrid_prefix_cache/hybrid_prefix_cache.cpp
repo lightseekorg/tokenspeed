@@ -72,12 +72,17 @@ void HybridPrefixCache::augmentMatch(MatchResult& match) const {
     // Backward-compatible path: before Mamba L2 is enabled, only device Mamba is
     // a valid hybrid prefix source and both match tiers are truncated together.
     if (mamba_host_allocator_ == nullptr) {
-        TreeNode* kv_terminal = match.device.last_node;
+        TreeNode* device_terminal = match.device.last_node;
+        TreeNode* host_terminal = match.host.last_node;
+        const std::int32_t page_size = match.device.page_size;
+        const std::int32_t device_depth = device_terminal != nullptr ? device_terminal->DepthInPage(page_size) : 0;
+        const std::int32_t host_depth = host_terminal != nullptr ? host_terminal->DepthInPage(page_size) : 0;
+        const std::int32_t kv_depth = std::max(device_depth, host_depth);
+        TreeNode* kv_terminal = device_depth >= host_depth ? device_terminal : host_terminal;
         if (kv_terminal == nullptr || kv_terminal->IsRoot()) return;
 
         TreeNode* mamba_node = FindLastMambaNode(kv_terminal);
         if (mamba_node == nullptr) {
-            const std::int32_t kv_depth = match.device.DepthInPage();
             const std::int32_t aligned_seqlen = AlignMambaCacheSeqlen(kv_depth * match.device.page_size);
             if (aligned_seqlen > 0) {
                 match.mamba_branching_seqlen = aligned_seqlen;
@@ -87,8 +92,6 @@ void HybridPrefixCache::augmentMatch(MatchResult& match) const {
             return;
         }
 
-        std::int32_t page_size = match.device.page_size;
-        std::int32_t kv_depth = match.device.DepthInPage();
         std::int32_t mamba_depth = mamba_node->DepthInPage(page_size);
         match.mamba_cow_src_index = mamba_node->MambaSlotIndex();
         if (kv_depth > mamba_depth) {
@@ -97,8 +100,8 @@ void HybridPrefixCache::augmentMatch(MatchResult& match) const {
                 match.mamba_branching_seqlen = aligned_seqlen;
             }
         }
-        match.device.last_node = mamba_node;
-        match.host.last_node = mamba_node;
+        match.device.last_node = device_depth >= mamba_depth ? mamba_node : root;
+        match.host.last_node = host_depth >= mamba_depth ? mamba_node : root;
         return;
     }
 

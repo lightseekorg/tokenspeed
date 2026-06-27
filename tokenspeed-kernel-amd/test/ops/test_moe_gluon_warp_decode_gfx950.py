@@ -147,10 +147,11 @@ def _run_kernel(case: dict) -> torch.Tensor:
         case["wt2"],
         w13_bias=case["w13_bias"],
         w2_bias=case["w2_bias"],
-        w13_precision_config=case["pc1"],
-        w2_precision_config=case["pc2"],
+        w13_mx_scale=case["pc1"].b_mx_scale,
+        w2_mx_scale=case["pc2"].b_mx_scale,
         w13_act_scale=case["scale1"],
         w2_act_scale=case["scale2"],
+        out_dtype=case["pc2"].out_dtype,
         top_k=case["topk"],
     )
 

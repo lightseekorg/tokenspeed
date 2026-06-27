@@ -722,7 +722,8 @@ class TestDeepseekV4Config(unittest.TestCase):
         wrapper.attn_backend = FakeBackend("target")
         wrapper.draft_attn_backend = FakeBackend("draft")
         wrapper.drafter = SimpleNamespace(
-            req_to_page=torch.zeros((1, 1), dtype=torch.int32)
+            req_to_page=torch.zeros((1, 1), dtype=torch.int32),
+            draft_seq_lens_buf=torch.zeros(4, dtype=torch.int32),
         )
         wrapper.max_tokens_per_req = 4
         wrapper.use_v4_mtp_paged_metadata = True
@@ -750,6 +751,12 @@ class TestDeepseekV4Config(unittest.TestCase):
             [1, 2, 0, 0],
         )
         self.assertEqual(draft_kwargs["forward_mode"], ForwardMode.DECODE)
+        draft_seq_lens = captured["draft"]["args"][2]
+        self.assertEqual(
+            draft_seq_lens.data_ptr(),
+            wrapper.drafter.draft_seq_lens_buf.data_ptr(),
+        )
+        self.assertEqual(wrapper.drafter.draft_seq_lens_buf.tolist(), [1, 1, 1, 1])
 
     def test_cuda_graph_mamba_verify_state_update_keeps_decode_mode_speculation(self):
         class BackendWithMambaUpdate:

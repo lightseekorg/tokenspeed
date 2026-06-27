@@ -650,9 +650,10 @@ class OutputProcesser:
                     )
 
             # Notify caller of first output token (used by prefill node to hand off
-            # bootstrap token to the KV transfer layer before streaming output).
+            # bootstrap token and speculative candidates to the KV transfer layer).
             # NaN-terminated requests skip the handoff: their KV is suspect.
             if on_first_token is not None and model_output_ids and not nan_detected:
+                bootstrap_token = int(model_output_ids[0])
                 spec_candidate_ids = None
                 if model_execution_results.next_input_ids is not None and i < len(
                     model_execution_results.next_input_ids
@@ -661,10 +662,11 @@ class OutputProcesser:
                         int(x)
                         for x in model_execution_results.next_input_ids[i].tolist()
                     ]
+
                 on_first_token(
                     rid,
                     forward_op.request_pool_indices[i],
-                    model_output_ids[0],
+                    bootstrap_token,
                     spec_candidate_ids,
                 )
 

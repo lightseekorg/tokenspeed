@@ -791,9 +791,7 @@ def dp_sampling_gather(
 def _get_available_gpu_memory(gpu_id: int, empty_cache: bool = True) -> float:
     if torch.cuda.current_device() != gpu_id:
         logger.warning(
-            "current device is not %s, but %s, which may cause useless memory allocation for torch CUDA context.",
-            gpu_id,
-            torch.cuda.current_device(),
+            f"current device is not {gpu_id}, but {torch.cuda.current_device()}, which may cause useless memory allocation for torch CUDA context."
         )
     if empty_cache:
         torch.cuda.empty_cache()
@@ -1027,8 +1025,7 @@ def nvidia_create_rsag_state(
         )
     free_gpu_memory_after = _get_available_gpu_memory(torch.cuda.current_device())
     logger.info(
-        "Custom Triton RSAG buffer allocated: %s GB",
-        free_gpu_memory_begin - free_gpu_memory_after,
+        f"Custom Triton RSAG symmetric-memory buffer allocated: {free_gpu_memory_begin - free_gpu_memory_after} GB"
     )
     symm_mem.rendezvous(comm_buff, group=group)
     return TritonCommState(
@@ -1244,8 +1241,7 @@ def amd_create_rsag_state(
     symm_mem_hdl = symm_mem.rendezvous(comm_buff, group=group)
     free_gpu_memory_after = _get_available_gpu_memory(torch.cuda.current_device())
     logger.info(
-        "Custom Triton RSAG AMD symmetric-memory buffer allocated: %s GB",
-        free_gpu_memory_begin - free_gpu_memory_after,
+        f"Custom Triton RSAG AMD symmetric-memory buffer allocated: {free_gpu_memory_begin - free_gpu_memory_after} GB"
     )
     assert rank_in_group == symm_mem_hdl.rank, "Mismatched rank id"
     return TritonCommState(
@@ -1449,8 +1445,7 @@ def create_allreduce_residual_rmsnorm_state(
         symm_mem_hdl = symm_mem.rendezvous(comm_buff, group=group)
         free_gpu_memory_after = _get_available_gpu_memory(torch.cuda.current_device())
         logger.info(
-            "Triton AR+RMSNorm AMD symmetric-memory buffer allocated: %s GB",
-            free_gpu_memory_begin - free_gpu_memory_after,
+            f"Triton AR+RMSNorm AMD symmetric-memory buffer allocated: {free_gpu_memory_begin - free_gpu_memory_after} GB"
         )
         assert rank_in_group == symm_mem_hdl.rank, "Mismatched rank id"
     else:
@@ -1655,8 +1650,7 @@ def create_state(
                 torch.cuda.current_device()
             )
             logger.info(
-                "Triton all-reduce AMD symmetric-memory buffer allocated: %s GB",
-                free_gpu_memory_begin - free_gpu_memory_after,
+                f"Triton all-reduce AMD symmetric-memory buffer allocated: {free_gpu_memory_begin - free_gpu_memory_after} GB"
             )
             assert rank_in_group == symm_mem_hdl.rank, "Mismatched rank id"
         else:
