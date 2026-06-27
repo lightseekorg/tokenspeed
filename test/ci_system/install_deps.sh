@@ -115,7 +115,8 @@ pip_install_with_retry pip3 install -e "./python" \
 # ============================================================
 # Step 6: Optionally override tokenspeed-mla with in-tree source
 # ============================================================
-# Set by `.github/workflows/pr-test-common.yml` when the diff touches
+# Set by `.github/workflows/pr-test-amd.yml` and
+# `.github/workflows/pr-test-nvidia.yml` when the diff touches
 # `tokenspeed-mla/`. Without this override CI exercises whichever
 # `tokenspeed-mla` version is pinned in
 # `tokenspeed-kernel/python/requirements/cuda-thirdparty.txt` and the
