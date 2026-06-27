@@ -647,7 +647,7 @@ class _RuntimeLongcatModel(nn.Module):
                 )
 
         if not ctx.forward_mode.is_idle() and layer is not None:
-            hidden_states = layer.final_norm_comm.final_norm(
+            hidden_states, _ = layer.final_norm_comm.final_norm(
                 hidden_states,
                 residual,
                 ctx,
