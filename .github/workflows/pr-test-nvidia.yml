@@ -42,7 +42,7 @@ on:
           - debug
 
 jobs:
-  pr-test:
+  nvidia-pr-test:
     uses: ./.github/workflows/pr-test-common.yml
     with:
       runner_group: nvidia
