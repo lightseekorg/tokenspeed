@@ -166,9 +166,15 @@ if platform.is_nvidia:
         del w.w13_weight_scale
         del w.w2_weight_scale
 
-        # Compute fused-kernel scales.
-        # Reduce w13_weight_scale_2: take per-expert value.
-        w13_ws2 = w.w13_weight_scale_2[:, 0]
+        # Compute fused-kernel scales. The trtllm SwiGLU MoE kernel dequantizes the GEMM1 gate
+        # (W1) and up (W3) halves with separate scalars, so feed each its own global scale_2
+        # (else non-uniform-W1/W3 checkpoints mis-scale the up-proj by up_s2/gate_s2).
+        ws2 = w.w13_weight_scale_2
+        if ws2.dim() == 2 and ws2.shape[1] == 2:
+            gate_ws2, up_ws2 = ws2[:, 0], ws2[:, 1]
+        else:
+            gate_ws2 = ws2.reshape(ws2.shape[0])
+            up_ws2 = gate_ws2
         # Input scales (max across shards) for alpha computation
         w13_input_scale = w.w13_input_scale.max().to(torch.float32)
         w2_input_scale = w.w2_input_scale.max().to(torch.float32)
@@ -180,16 +186,17 @@ if platform.is_nvidia:
         w.w13_input_scale_quant = torch.nn.Parameter(
             w13_input_scale_quant, requires_grad=False
         )
-        # Fused-kernel alphas: input_scale * weight_scale_2
+        # gate (W1) dequant alpha -> output1_scale_gate_scalar
         w.g1_alphas = torch.nn.Parameter(
-            (w13_input_scale * w13_ws2).to(torch.float32), requires_grad=False
+            (w13_input_scale * gate_ws2).to(torch.float32), requires_grad=False
         )
         w.g2_alphas = torch.nn.Parameter(
             (w2_input_scale * w.w2_weight_scale_2).to(torch.float32),
             requires_grad=False,
         )
+        # up (W3) dequant alpha folded with the GEMM2-input requant -> output1_scale_scalar
         w.g1_scale_c = torch.nn.Parameter(
-            (w2_input_scale_quant * w.g1_alphas).to(torch.float32),
+            (w2_input_scale_quant * w13_input_scale * up_ws2).to(torch.float32),
             requires_grad=False,
         )
         # Store intermediate_size_per_partition for the executor
