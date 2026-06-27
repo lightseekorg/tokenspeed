@@ -215,10 +215,27 @@ class BaseTransformerModel(nn.Module):
             assert residual is not None
 
             if isinstance(layer, BaseDecoderLayer):
-                hidden_states = layer.comm_manager.final_norm(
+                hidden_states, final_residual = layer.comm_manager.final_norm(
                     hidden_states, residual, ctx, self.norm
                 )
             else:
-                hidden_states = self._final_norm_op(hidden_states, residual, ctx)
+                hidden_states, final_residual = self._final_norm_op(
+                    hidden_states, residual, ctx
+                )
+
+            # An id == num_layers (capture index num_layers + 1) selects the
+            # final norm's output residual as an aux state, matching how each
+            # layer type captures in-loop: BaseDecoderLayer gathers across
+            # attn-TP, CompiledDecoderLayer appends raw.
+            if (
+                aux_hidden_states is not None
+                and final_residual is not None
+                and len(self.layers) + 1 in self.layers_to_capture
+            ):
+                if hasattr(layer, "comm_manager"):
+                    final_residual = layer.comm_manager.gather_residual(
+                        final_residual, ctx
+                    )
+                aux_hidden_states.append(final_residual.clone())
 
         return hidden_states, aux_hidden_states or None

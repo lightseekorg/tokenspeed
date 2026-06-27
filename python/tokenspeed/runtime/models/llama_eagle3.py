@@ -434,6 +434,16 @@ class Eagle3LlamaModel(BaseTransformerModel):
             tp_group=self.mapping.attn.tp_group,
         )
 
+        # norm_before_fc: RMSNorm over the concatenated aux states before fc (replicated)
+        self.input_norm = (
+            RMSNorm(
+                config.hidden_size * self.num_fc_input_dim,
+                eps=config.rms_norm_eps,
+            )
+            if getattr(config, "norm_before_fc", False)
+            else None
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -463,6 +473,8 @@ class Eagle3LlamaModel(BaseTransformerModel):
             raise ValueError("Eagle3 forward requires hidden_states")
 
         if hidden_states.size(-1) != embeds.size(-1):
+            if self.input_norm is not None:
+                hidden_states = self.input_norm(hidden_states)
             hidden_states, _ = self.fc(hidden_states)
 
         residual = None
@@ -577,6 +589,10 @@ class LlamaForCausalLMEagle3(BaseCausalLM):
         ]
 
         for name, loaded_weight in weights:
+            # some Eagle3 checkpoints name the block "layers.0" not "midlayer"
+            if name.startswith("layers.0."):
+                name = "midlayer." + name[len("layers.0.") :]
+
             if "d2t" in name:
                 self.hot_token_id = loaded_weight + torch.arange(loaded_weight.shape[0])
                 continue

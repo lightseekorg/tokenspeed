@@ -191,7 +191,7 @@ class Qwen3MoeModel(Qwen3Model):
             )
 
         if not ctx.forward_mode.is_idle():
-            hidden_states = layer.comm_manager.final_norm(
+            hidden_states, _ = layer.comm_manager.final_norm(
                 hidden_states, residual, ctx, self.norm
             )
         return hidden_states, None

@@ -1,9 +1,7 @@
-name: PR Test
+name: PR Test NVIDIA
 
-# This workflow is created for PRs targeting lightseekorg/tokenspeed, pushes to
-# lightseekorg/tokenspeed:main, and manual runs. The jobs below guard execution
-# so non-PR events only run in the upstream repository, while PRs from forks to
-# the upstream repository still run normally.
+# Split vendor CI into separate workflows so either side can be rerun without
+# waiting for the other side's jobs to finish.
 on:
   push:
     branches: [main]
@@ -15,7 +13,8 @@ on:
       - "tokenspeed-mla/**"
       - "tokenspeed-scheduler/**"
       - "test/**"
-      - ".github/workflows/pr-test.yml"
+      - ".github/workflows/pr-test-amd.yml"
+      - ".github/workflows/pr-test-nvidia.yml"
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, closed]
     branches: [main]
@@ -27,7 +26,8 @@ on:
       - "tokenspeed-mla/**"
       - "tokenspeed-scheduler/**"
       - "test/**"
-      - ".github/workflows/pr-test.yml"
+      - ".github/workflows/pr-test-amd.yml"
+      - ".github/workflows/pr-test-nvidia.yml"
   workflow_dispatch:
     inputs:
       trigger:
@@ -45,7 +45,7 @@ env:
   TOKENSPEED_B200_RUNNER_LABEL: ${{ vars.TOKENSPEED_B200_RUNNER_LABEL }}
 
 concurrency:
-  group: pr-test-${{ github.event.pull_request.number || github.ref }}
+  group: pr-test-nvidia-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 jobs:
@@ -55,7 +55,7 @@ jobs:
     steps:
       - name: Cancel superseded PR Test runs
         run: |
-          echo "Cancelling older PR Test runs for PR #${{ github.event.pull_request.number }}"
+          echo "Cancelling older PR Test NVIDIA runs for PR #${{ github.event.pull_request.number }}"
 
   scan:
     # Closed PRs only need cancel-on-close. For all other events, run jobs for
@@ -88,15 +88,10 @@ jobs:
       - name: Build task matrix
         id: scan
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TRIGGER="${{ github.event.inputs.trigger }}"
-            if [ -z "$TRIGGER" ]; then
-              TRIGGER=manual
-            fi
-          else
-            TRIGGER=per-commit
-          fi
-          MATRIX=$(python3 test/ci_system/pipeline.py scan --root test/ci --trigger "$TRIGGER")
+          MATRIX=$(python3 test/ci_system/pipeline.py scan \
+            --root test/ci \
+            --trigger "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.trigger || 'per-commit' }}" \
+            --runner-group "nvidia")
           echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
 
       # Compute this once on the hosted runner (where `gh` is pre-installed)
@@ -149,7 +144,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.scan.outputs.matrix) }}
-    name: ${{ matrix.name }} / ${{ matrix.runner }}
+    name: ${{ matrix.name }} (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     env:

@@ -952,7 +952,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 )
 
         # Apply final normalization with optional allreduce fusion
-        hidden_states = layer.comm_manager.final_norm(
+        hidden_states, _ = layer.comm_manager.final_norm(
             hidden_states, residual, ctx, self.norm
         )
 
