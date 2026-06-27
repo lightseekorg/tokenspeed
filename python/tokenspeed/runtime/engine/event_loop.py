@@ -514,10 +514,15 @@ class EventLoop:
             payload = cache_event_to_payload(event)
             self._pending_cache_event_payloads[cache_event_key(payload)] = payload
 
-        # Local short-circuit: counter mirrors across ranks (same plan every-
-        # where), so if nothing is in flight here AND nothing is buffered
-        # awaiting commit, no rank has anything to gather.
-        if self._num_inflight_cache_ops == 0 and not self._pending_cache_event_payloads:
+        # The gather below is a collective, but cache-op completion is async and
+        # not lock-step across ranks, so local state (_num_inflight_cache_ops /
+        # _pending_cache_event_payloads) diverges transiently. A rank-local skip
+        # would let some ranks gather while others return, deadlocking the group.
+        # Agree on the skip via a cheap single-int all_reduce.
+        local_has_work = bool(
+            self._num_inflight_cache_ops != 0 or self._pending_cache_event_payloads
+        )
+        if not self._cache_group_has_work(local_has_work):
             return
 
         ready_payloads = self._pop_ready_cache_event_payloads()
@@ -557,6 +562,26 @@ class EventLoop:
         self.kv_event_publisher.publish(
             KVEventBatch(ts=time.time(), events=events, attn_dp_rank=self.dp_rank)
         )
+
+    def _cache_group_has_work(self, local_has_work: bool) -> bool:
+        """Whether ANY attn-tp rank has cache work this step (unanimous via a
+        single-int MAX all_reduce, far cheaper than the payload gather it
+        guards). Deciding from rank-local state alone deadlocks the group; see
+        _commit_cache_results.
+
+        Args:
+            local_has_work: This rank's view of whether any cache op is in
+                flight or any polled payload awaits commit.
+
+        Returns:
+            ``True`` if any rank has work (all must gather); ``False`` only when
+            every rank is idle.
+        """
+        if self.attn_tp_size == 1:
+            return local_has_work
+        flag = torch.tensor([1 if local_has_work else 0], dtype=torch.int32)
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=self.attn_tp_cpu_group)
+        return bool(flag.item())
 
     def _pop_ready_cache_event_payloads(self) -> list[dict]:
         local_payloads = list(self._pending_cache_event_payloads.values())

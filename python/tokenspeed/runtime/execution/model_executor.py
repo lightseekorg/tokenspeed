@@ -215,8 +215,20 @@ class ModelExecutor:
         self._layerwise_mamba_cow_done = None
 
         if config.spec_algo is not None:
+            # The overlap scheduler reserves a fresh draft block per decode step
+            # a request stays scheduled, including the few steps it lingers
+            # between finishing and eviction, so peak page count runs ~1 page past
+            # context_len + spec_num_tokens. Without headroom req_to_page
+            # overflows and the next draft block's page write goes out of bounds,
+            # hanging the attention kernel. Pad generously; a few int32 columns
+            # per request.
+            draft_block_reservation_slack = config.spec_num_tokens * 64
             max_num_pages_per_req = (
-                config.context_len + config.spec_num_tokens + config.block_size - 1
+                config.context_len
+                + config.spec_num_tokens
+                + draft_block_reservation_slack
+                + config.block_size
+                - 1
             ) // config.block_size
         else:
             max_num_pages_per_req = (
@@ -563,6 +575,66 @@ class ModelExecutor:
         ]
         return torch.where(force_mask, torch.ones_like(accept_lengths), accept_lengths)
 
+    def _cap_accept_to_context_len(
+        self,
+        accept_lengths: torch.Tensor,
+        decode_req_pool_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Clamp spec-verify accept so committed length never exceeds
+        ``context_len``.
+
+        ``req_to_page`` is sized for ``context_len + spec_num_tokens`` pages. A
+        request at the context limit whose ``max_new_tokens`` termination lags a
+        step can accept past ``context_len``, so its next draft block needs a
+        page beyond ``req_to_page``'s width — an out-of-bounds access that hangs
+        the attention kernel. Clamping to the remaining budget keeps the table in
+        range; the request is still removed a step later. Deterministic in
+        ``valid_cache_lengths`` / ``accept_lengths``, so no cross-rank divergence.
+        """
+        if accept_lengths.numel() == 0:
+            return accept_lengths
+        committed = self.runtime_states.valid_cache_lengths.index_select(
+            0, decode_req_pool_indices
+        ).to(accept_lengths.dtype)
+        remaining = (self.config.context_len - committed).clamp_(min=0)
+        # In-place: the drafter reads this same buffer to size its next block.
+        accept_lengths.copy_(torch.minimum(accept_lengths, remaining))
+        return accept_lengths
+
+    def _clamp_committed_to_context_len(
+        self,
+        output_lengths: torch.Tensor,
+        num_extends: int,
+        bs: int,
+    ) -> torch.Tensor:
+        """Return ``output_lengths`` with decode rows clamped so committed KV
+        length never exceeds ``context_len`` (post-forward, outside the CUDA
+        graph).
+
+        The clamp must reach BOTH ``_update_runtime_state``
+        (``valid_cache_lengths``) and the ``ModelExecutionResult`` that drives
+        scheduler page reservation, so they stay in lock-step. Hence a FRESH
+        tensor, not the persistent ``_accept_length_buf``: the verify path also
+        mirrors accept counts into ``_output_pack_buf``, and an in-place clamp
+        would leave that mirror (read by the packed-D2H fast path) uncapped,
+        reserving a draft block past ``req_to_page``'s width and hanging the
+        kernel. A fresh tensor forces the safe two-D2H fallback.
+
+        Only decode rows ``[num_extends:bs]`` carry an accept delta; prefill rows
+        pass through. Deterministic, so no cross-rank divergence.
+        """
+        if bs <= num_extends:
+            return output_lengths
+        decode_rpi = self.input_buffers.req_pool_indices_buf[num_extends:bs]
+        committed = self.runtime_states.valid_cache_lengths.index_select(
+            0, decode_rpi
+        ).to(output_lengths.dtype)
+        remaining = (self.config.context_len - committed).clamp_(min=0)
+        capped_decode = torch.minimum(output_lengths[num_extends:bs], remaining)
+        if num_extends == 0:
+            return capped_decode
+        return torch.cat([output_lengths[:num_extends], capped_decode])
+
     @nvtx_range("sampling", color="yellow")
     def _run_sampling(
         self,
@@ -587,6 +659,9 @@ class ModelExecutor:
             accept_lengths = self._apply_force_single_token_verify(
                 accept_lengths, 0, num_decodes, ctx.decode_input_ids
             )
+            accept_lengths = self._cap_accept_to_context_len(
+                accept_lengths, sampling_info.req_pool_indices[:num_decodes]
+            )
             return output_tokens, accept_lengths
 
         logits = logits_output.next_token_logits
@@ -600,6 +675,9 @@ class ModelExecutor:
         )
         decode_accept = self._apply_force_single_token_verify(
             decode_accept, num_extends, num_decodes, ctx.decode_input_ids
+        )
+        decode_accept = self._cap_accept_to_context_len(
+            decode_accept, sampling_info.req_pool_indices[num_extends:]
         )
         if (
             prefill_out.next_token_logprobs is not None
@@ -1630,6 +1708,14 @@ class ModelExecutor:
                         forward_step_ms = (
                             time.perf_counter() - forward_step_start
                         ) * 1000.0
+
+                # Clamp the committed-length delta so no request grows past
+                # context_len. Done here (outside the graph) so it reaches both
+                # _update_runtime_state and the scheduler page reservation; see
+                # _clamp_committed_to_context_len.
+                output_lengths = self._clamp_committed_to_context_len(
+                    output_lengths, num_extends, bs
+                )
 
                 # Update runtime state on execution_stream (NOT in the CUDA graph).
                 self._update_runtime_state(

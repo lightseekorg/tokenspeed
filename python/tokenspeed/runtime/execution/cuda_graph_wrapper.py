@@ -797,15 +797,27 @@ class CudaGraphWrapper:
         index = bisect.bisect_left(self.capture_bs, target_bs)
         return self.capture_bs[index]
 
-    @staticmethod
     def _pad_graph_req_pool_indices(
-        active_req_pool_indices: torch.Tensor, padded_bs: int
+        self, active_req_pool_indices: torch.Tensor, padded_bs: int
     ) -> torch.Tensor:
         pad = padded_bs - active_req_pool_indices.shape[0]
         if pad <= 0:
             return active_req_pool_indices
+        # Route padding rows to the sentinel req-pool slot (max_req_pool_size),
+        # not slot 0. valid_cache_lengths / req_to_page are sized
+        # [max_req_pool_size + 1]; the sentinel row stays zero-init (length 0,
+        # dummy page 0) since _update_runtime_state only writes real rows. Slot 0
+        # would alias the live first request: harmless for verify (seq_len == 1),
+        # but the DFLASH draft derives each row's block seq_len from
+        # valid_cache_lengths[req_pool], so padding rows would grow unbounded with
+        # request 0's context and hang the draft block-decode kernel. The sentinel
+        # keeps that derived length inert for every drafter backend.
+        sentinel = int(self.config.max_req_pool_size)
         return torch.cat(
-            [active_req_pool_indices, active_req_pool_indices.new_zeros(pad)]
+            [
+                active_req_pool_indices,
+                active_req_pool_indices.new_full((pad,), sentinel),
+            ]
         )
 
     def _set_graph_state_write_indices(
