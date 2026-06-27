@@ -90,6 +90,8 @@ if platform.is_amd:
 
         swiglu_alpha = swiglu_arg.alpha if swiglu_arg else 1.702
         swiglu_limit = swiglu_arg.limit if swiglu_arg else 7.0
+        w13_precision_config = w.w13_precision_config
+        w2_precision_config = w.w2_precision_config
 
         return gluon_mxfp_fused_moe(
             x,
@@ -98,10 +100,11 @@ if platform.is_amd:
             w.w2_weight_triton_tensor,
             w13_bias=getattr(w, "w13_weight_bias", None),
             w2_bias=getattr(w, "w2_weight_bias", None),
-            w13_precision_config=getattr(w, "w13_precision_config", None),
-            w2_precision_config=getattr(w, "w2_precision_config", None),
+            w13_mx_scale=w13_precision_config.b_mx_scale,
+            w2_mx_scale=w2_precision_config.b_mx_scale,
             w13_act_scale=w.w13_act_scale,
             w2_act_scale=w.w2_act_scale,
+            out_dtype=w2_precision_config.out_dtype or torch.bfloat16,
             top_k=top_k,
             swiglu_alpha=swiglu_alpha,
             swiglu_limit=swiglu_limit,

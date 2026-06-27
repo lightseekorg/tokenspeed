@@ -40,7 +40,6 @@ if platform.is_nvidia:
     from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
 
     _FP8_BLOCK = 128
-    _DEEPSEEK_V3_ROUTING = int(RoutingMethodType.DeepSeekV3)
 
     def _routing_value(w: torch.nn.Module, name: str, default):
         routing_config = getattr(w, "routing_config", {})
@@ -144,9 +143,10 @@ if platform.is_nvidia:
             if isinstance(correction_bias, torch.Tensor)
             else None
         )
-        n_group = _routing_value(w, "n_group", 0) or None
-        topk_group = _routing_value(w, "topk_group", 0) or None
+        n_group = _routing_value(w, "n_group", 0) or 1
+        topk_group = _routing_value(w, "topk_group", 0) or 1
         routed_scaling_factor = _routing_value(w, "routed_scaling_factor", None)
+        routing_method_type = _routing_value(w, "routing_method_type", 1)
 
         result = trtllm_fp8_block_scale_moe(
             routing_logits=router_logits.to(torch.float32),
@@ -165,7 +165,7 @@ if platform.is_nvidia:
             local_expert_offset=getattr(w, "ep_rank", 0) * local_experts,
             local_num_experts=local_experts,
             routed_scaling_factor=routed_scaling_factor,
-            routing_method_type=_DEEPSEEK_V3_ROUTING,
+            routing_method_type=int(routing_method_type),
             do_finalize=True,
             tune_max_num_tokens=next_power_of_2(x_fp8.shape[0]),
         )

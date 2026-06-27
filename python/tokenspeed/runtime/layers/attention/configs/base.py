@@ -58,6 +58,10 @@ class BaseAttnConfig:
     speculative_num_steps: int = 0
     speculative_num_draft_tokens: int = 1
     is_draft: bool = False
+    # DFLASH drafts a whole block in one decode forward (q_len = spec_num_tokens
+    # per request) instead of Eagle/MTP's per-step single-token decode. Backends
+    # use this to expand decode metadata to spec_num_tokens rows per request.
+    draft_block_decode: bool = False
 
     @classmethod
     def generate(

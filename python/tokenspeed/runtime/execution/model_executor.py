@@ -36,6 +36,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
 from tokenspeed.runtime.execution.cache_loc_kernel import update_block_table
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
+from tokenspeed.runtime.execution.drafter.dflash import DFlash
 from tokenspeed.runtime.execution.drafter.eagle import Eagle
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
@@ -71,8 +72,20 @@ if TYPE_CHECKING:
 
 logger = get_colorful_logger(__name__)
 
-_DRAFTER_MAPPING = {"EAGLE3": Eagle, "MTP": Eagle}
+_DRAFTER_MAPPING = {"EAGLE3": Eagle, "MTP": Eagle, "DFLASH": DFlash}
 LOG_MM_TIMING = envs.TOKENSPEED_LOG_MM_TIMING.get()
+
+
+def _eagle_aux_layer_ids(hf_config) -> list[int] | None:
+    """Draft's eagle_aux_hidden_state_layer_ids (nested or top-level), or None."""
+    eagle_config = getattr(hf_config, "eagle_config", None)
+    if isinstance(eagle_config, dict):
+        ids = eagle_config.get("eagle_aux_hidden_state_layer_ids")
+    elif eagle_config is not None:
+        ids = getattr(eagle_config, "eagle_aux_hidden_state_layer_ids", None)
+    else:
+        ids = getattr(hf_config, "eagle_aux_hidden_state_layer_ids", None)
+    return list(ids) if ids else None
 
 
 def _draft_idle_global_num_tokens_for_step(
@@ -214,8 +227,20 @@ class ModelExecutor:
         self._layerwise_mamba_cow_done = None
 
         if config.spec_algo is not None:
+            # The overlap scheduler reserves a fresh draft block per decode step
+            # a request stays scheduled, including the few steps it lingers
+            # between finishing and eviction, so peak page count runs ~1 page past
+            # context_len + spec_num_tokens. Without headroom req_to_page
+            # overflows and the next draft block's page write goes out of bounds,
+            # hanging the attention kernel. Pad generously; a few int32 columns
+            # per request.
+            draft_block_reservation_slack = config.spec_num_tokens * 64
             max_num_pages_per_req = (
-                config.context_len + config.spec_num_tokens + config.block_size - 1
+                config.context_len
+                + config.spec_num_tokens
+                + draft_block_reservation_slack
+                + config.block_size
+                - 1
             ) // config.block_size
         else:
             max_num_pages_per_req = (
@@ -267,18 +292,38 @@ class ModelExecutor:
                 token_to_kv_pool=draft_token_to_kv_pool,
                 vocab_size=config.vocab_size,
             )
-            embed, head = self.model_runner.model.get_embed_and_head()
-            draft_model_runner.model.set_embed_and_head(embed, head)
+            if hasattr(self.drafter, "bind_target_model"):
+                self.drafter.bind_target_model(self.model_runner.model)
+            # EAGLE3/MTP share the target's embed + lm_head; DFLASH ships its
+            # own draft weights, so it must NOT inherit the target's.
+            if config.spec_algo in ("EAGLE3", "MTP"):
+                embed, head = self.model_runner.model.get_embed_and_head()
+                draft_model_runner.model.set_embed_and_head(embed, head)
             target_hf = self.model_runner.model_config.hf_config
             mm_pad_substitute_id = getattr(
                 target_hf, "image_token_id", None
             ) or getattr(target_hf, "media_placeholder_token_id", None)
-            if mm_pad_substitute_id is not None:
+            if mm_pad_substitute_id is not None and hasattr(
+                self.drafter, "set_mm_pad_substitute_id"
+            ):
                 self.drafter.set_mm_pad_substitute_id(mm_pad_substitute_id)
             if config.spec_algo in ("EAGLE3",) and hasattr(
                 self.model_runner.model, "set_eagle3_layers_to_capture"
             ):
-                self.model_runner.model.set_eagle3_layers_to_capture()
+                # capture the layers the draft was trained on, not the default
+                aux_layer_ids = _eagle_aux_layer_ids(
+                    draft_model_runner.model_config.hf_config
+                )
+                self.model_runner.model.set_eagle3_layers_to_capture(aux_layer_ids)
+            if config.spec_algo == "DFLASH":
+                if not hasattr(self.model_runner.model, "set_dflash_layers_to_capture"):
+                    raise ValueError(
+                        "DFLASH requires the target model to support "
+                        "set_dflash_layers_to_capture."
+                    )
+                self.model_runner.model.set_dflash_layers_to_capture(
+                    self.drafter.target_layer_ids
+                )
         else:
             self.drafter = None
 
@@ -546,6 +591,66 @@ class ModelExecutor:
         ]
         return torch.where(force_mask, torch.ones_like(accept_lengths), accept_lengths)
 
+    def _cap_accept_to_context_len(
+        self,
+        accept_lengths: torch.Tensor,
+        decode_req_pool_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Clamp spec-verify accept so committed length never exceeds
+        ``context_len``.
+
+        ``req_to_page`` is sized for ``context_len + spec_num_tokens`` pages. A
+        request at the context limit whose ``max_new_tokens`` termination lags a
+        step can accept past ``context_len``, so its next draft block needs a
+        page beyond ``req_to_page``'s width — an out-of-bounds access that hangs
+        the attention kernel. Clamping to the remaining budget keeps the table in
+        range; the request is still removed a step later. Deterministic in
+        ``valid_cache_lengths`` / ``accept_lengths``, so no cross-rank divergence.
+        """
+        if accept_lengths.numel() == 0:
+            return accept_lengths
+        committed = self.runtime_states.valid_cache_lengths.index_select(
+            0, decode_req_pool_indices
+        ).to(accept_lengths.dtype)
+        remaining = (self.config.context_len - committed).clamp_(min=0)
+        # In-place: the drafter reads this same buffer to size its next block.
+        accept_lengths.copy_(torch.minimum(accept_lengths, remaining))
+        return accept_lengths
+
+    def _clamp_committed_to_context_len(
+        self,
+        output_lengths: torch.Tensor,
+        num_extends: int,
+        bs: int,
+    ) -> torch.Tensor:
+        """Return ``output_lengths`` with decode rows clamped so committed KV
+        length never exceeds ``context_len`` (post-forward, outside the CUDA
+        graph).
+
+        The clamp must reach BOTH ``_update_runtime_state``
+        (``valid_cache_lengths``) and the ``ModelExecutionResult`` that drives
+        scheduler page reservation, so they stay in lock-step. Hence a FRESH
+        tensor, not the persistent ``_accept_length_buf``: the verify path also
+        mirrors accept counts into ``_output_pack_buf``, and an in-place clamp
+        would leave that mirror (read by the packed-D2H fast path) uncapped,
+        reserving a draft block past ``req_to_page``'s width and hanging the
+        kernel. A fresh tensor forces the safe two-D2H fallback.
+
+        Only decode rows ``[num_extends:bs]`` carry an accept delta; prefill rows
+        pass through. Deterministic, so no cross-rank divergence.
+        """
+        if bs <= num_extends:
+            return output_lengths
+        decode_rpi = self.input_buffers.req_pool_indices_buf[num_extends:bs]
+        committed = self.runtime_states.valid_cache_lengths.index_select(
+            0, decode_rpi
+        ).to(output_lengths.dtype)
+        remaining = (self.config.context_len - committed).clamp_(min=0)
+        capped_decode = torch.minimum(output_lengths[num_extends:bs], remaining)
+        if num_extends == 0:
+            return capped_decode
+        return torch.cat([output_lengths[:num_extends], capped_decode])
+
     @nvtx_range("sampling", color="yellow")
     def _run_sampling(
         self,
@@ -570,6 +675,9 @@ class ModelExecutor:
             accept_lengths = self._apply_force_single_token_verify(
                 accept_lengths, 0, num_decodes, ctx.decode_input_ids
             )
+            accept_lengths = self._cap_accept_to_context_len(
+                accept_lengths, sampling_info.req_pool_indices[:num_decodes]
+            )
             return output_tokens, accept_lengths
 
         logits = logits_output.next_token_logits
@@ -583,6 +691,9 @@ class ModelExecutor:
         )
         decode_accept = self._apply_force_single_token_verify(
             decode_accept, num_extends, num_decodes, ctx.decode_input_ids
+        )
+        decode_accept = self._cap_accept_to_context_len(
+            decode_accept, sampling_info.req_pool_indices[num_extends:]
         )
         if (
             prefill_out.next_token_logprobs is not None
@@ -1112,7 +1223,13 @@ class ModelExecutor:
         # NCCL collectives. Idle ranks must match those collectives:
         # 1 first-step forward + (spec_num_steps - 1) multi-step decode forwards.
         if self.drafter is not None:
-            for step_idx in range(self.drafter.spec_num_steps):
+            # DFLASH is a block drafter (idle_forward_steps=1); EAGLE3/MTP
+            # default to spec_num_steps. Mirror the active rank's per-step
+            # collective sizing either way.
+            idle_forward_steps = getattr(
+                self.drafter, "idle_forward_steps", self.drafter.spec_num_steps
+            )
+            for step_idx in range(idle_forward_steps or 0):
                 # Mirror active rank's catch-up step: when all non-idle ranks
                 # are decoding, step 0 sizes collectives from bs/global_bs.
                 draft_global_num_tokens = _draft_idle_global_num_tokens_for_step(
@@ -1607,6 +1724,14 @@ class ModelExecutor:
                         forward_step_ms = (
                             time.perf_counter() - forward_step_start
                         ) * 1000.0
+
+                # Clamp the committed-length delta so no request grows past
+                # context_len. Done here (outside the graph) so it reaches both
+                # _update_runtime_state and the scheduler page reservation; see
+                # _clamp_committed_to_context_len.
+                output_lengths = self._clamp_committed_to_context_len(
+                    output_lengths, num_extends, bs
+                )
 
                 # Update runtime state on execution_stream (NOT in the CUDA graph).
                 self._update_runtime_state(

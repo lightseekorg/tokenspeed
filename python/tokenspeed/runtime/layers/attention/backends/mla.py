@@ -317,12 +317,20 @@ class MLAAttnBackend(AttentionBackend):
             page_table = metadata.page_table[num_extends:].repeat_interleave(
                 q_len_per_req, dim=0
             )
-            base_lens = metadata.seq_lens[num_extends:].repeat_interleave(q_len_per_req)
+            cache_seqlens = metadata.seq_lens[num_extends:].repeat_interleave(
+                q_len_per_req
+            )
+            # Draft catch-up starts from the current draft KV length; target
+            # verify starts from the final target KV length and backs up.
+            offset_start = 0 if self.is_draft else 1 - q_len_per_req
             offsets = torch.arange(
-                q_len_per_req, device=base_lens.device, dtype=base_lens.dtype
+                offset_start,
+                offset_start + q_len_per_req,
+                device=cache_seqlens.device,
+                dtype=cache_seqlens.dtype,
             ).repeat(bs)
-            cache_seqlens = base_lens + offsets
-            max_seqlen_k = self.max_context_len + q_len_per_req
+            cache_seqlens = cache_seqlens + offsets
+            max_seqlen_k = self.max_context_len
         else:
             query = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
             page_table = metadata.page_table[num_extends:]

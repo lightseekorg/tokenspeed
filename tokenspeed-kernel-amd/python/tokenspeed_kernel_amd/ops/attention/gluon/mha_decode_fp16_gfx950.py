@@ -338,7 +338,7 @@ class AttentionProgram:
         cfg = self.cfg
         offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(1, cfg.load_layout))
         offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.load_layout))
-        token_loc = physical_page * cfg.PAGE_SIZE + offs_n
+        token_loc = physical_page.to(gl.int64) * cfg.PAGE_SIZE + offs_n.to(gl.int64)
         offsets = (
             token_loc[:, None] * cfg.NUM_KV_HEADS * cfg.HEAD_DIM
             + self.kv_head * cfg.HEAD_DIM
@@ -353,7 +353,7 @@ class AttentionProgram:
         cfg = self.cfg
         offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(1, cfg.load_layout))
         offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.load_layout))
-        token_loc = physical_page * cfg.PAGE_SIZE + offs_n
+        token_loc = physical_page.to(gl.int64) * cfg.PAGE_SIZE + offs_n.to(gl.int64)
         offsets = (
             token_loc[:, None] * cfg.NUM_KV_HEADS * cfg.HEAD_DIM
             + self.kv_head * cfg.HEAD_DIM

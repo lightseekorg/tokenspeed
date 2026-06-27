@@ -119,6 +119,9 @@ class MHAAttnBackend(AttentionBackend):
             return_lse=False,
             solution=self.kernel_solution,
         )
+        # DFLASH draft: expand decode metadata to spec_num_tokens rows/request
+        # (whole block in one decode forward), with uniform non-causal seq_lens.
+        self.draft_block_decode = bool(getattr(config, "draft_block_decode", False))
 
         # Forward metadata is initialized in the runner per forward call
         self.forward_decode_metadata: MHADecodeMetadata | None = None
@@ -136,6 +139,9 @@ class MHAAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         req_to_page: torch.Tensor,
         forward_mode: ForwardMode,
+        # Only consumed on the extend/mixed path; decode callers (e.g. the
+        # DFLASH draft and the cuda-graph wrapper's draft decode init) omit
+        # them, so they must be optional.
         extend_seq_lens: torch.Tensor | None = None,
         extend_seq_lens_cpu: torch.Tensor | None = None,
         extend_prefix_lens: torch.Tensor | None = None,
@@ -198,10 +204,34 @@ class MHAAttnBackend(AttentionBackend):
                     seq_lens=seq_lens,
                 )
         else:
-            self.forward_decode_metadata = MHADecodeMetadata(
-                page_table=page_table,
-                seq_lens=seq_lens,
-            )
+            if self.draft_block_decode and self.spec_num_tokens > 1:
+                # DFLASH drafts a whole block in one decode forward; the decode
+                # kernel keys masking off max_seqlen_q, so expand each request
+                # into spec_num_tokens rows with the SAME full seq_len. That
+                # makes max_seqlen_q == 1 per row, so every block query attends
+                # over the entire block (non-causal block-diffusion drafting).
+                # Target verify keeps the unexpanded multi-query decode path.
+                expanded_page_table, expanded_seq_lens = (
+                    self._make_spec_metadata_buffers(
+                        bs,
+                        page_table.device,
+                    )
+                )
+                self._fill_spec_metadata_uniform(
+                    expanded_page_table,
+                    expanded_seq_lens,
+                    page_table,
+                    seq_lens,
+                )
+                self.forward_decode_metadata = MHADecodeMetadata(
+                    page_table=expanded_page_table,
+                    seq_lens=expanded_seq_lens,
+                )
+            else:
+                self.forward_decode_metadata = MHADecodeMetadata(
+                    page_table=page_table,
+                    seq_lens=seq_lens,
+                )
 
     def init_cuda_graph_state(self, max_bs: int, seq_lens_buf: torch.Tensor):
         assert (
@@ -214,6 +244,18 @@ class MHAAttnBackend(AttentionBackend):
         )
 
         self.cuda_graph_decode_metadata = {}
+        if self.draft_block_decode and self.spec_num_tokens > 1:
+            # DFLASH draft block: expand to spec_num_tokens decode rows per
+            # request (one row per block position), so max_seqlen_q == 1 per row
+            # and every block query attends over the whole block (non-causal).
+            self.cuda_graph_page_table, self.cuda_graph_seq_lens = (
+                self._make_spec_metadata_buffers(max_bs, self.device)
+            )
+            self.cuda_graph_page_table.zero_()
+            # seq_lens are filled from the live draft length inside the captured
+            # graph; seed a valid baseline so any pre-broadcast read stays in range.
+            self.cuda_graph_seq_lens.fill_(self.spec_num_tokens)
+            return
         self.cuda_graph_page_table = torch.zeros(
             (max_bs, self.max_num_pages), dtype=torch.int32, device=self.device
         )
@@ -234,12 +276,24 @@ class MHAAttnBackend(AttentionBackend):
     ):
         assert not forward_mode.is_extend_or_mixed()
 
-        metadata = MHADecodeMetadata(
-            page_table=self.cuda_graph_page_table[:bs, :],
-            seq_lens=self.cuda_graph_seq_lens[:bs],
-        )
-        if self.spec_num_tokens > 1 and not self.is_draft:
-            metadata.seq_lens.copy_(seq_lens[:bs].clamp_min(self.spec_num_tokens))
+        if self.draft_block_decode and self.spec_num_tokens > 1:
+            # DFLASH draft block: spec_num_tokens decode rows per request.
+            expanded_bs = bs * self.spec_num_tokens
+            metadata = MHADecodeMetadata(
+                page_table=self.cuda_graph_page_table[:expanded_bs, :],
+                seq_lens=self.cuda_graph_seq_lens[:expanded_bs],
+            )
+            # Uniform non-causal seq_lens are written by the drafter inside the
+            # captured graph (see fill_block_decode_seq_lens); seed a safe
+            # baseline for the capture run before that op records.
+            metadata.seq_lens.fill_(self.spec_num_tokens)
+        else:
+            metadata = MHADecodeMetadata(
+                page_table=self.cuda_graph_page_table[:bs, :],
+                seq_lens=self.cuda_graph_seq_lens[:bs],
+            )
+            if self.spec_num_tokens > 1 and not self.is_draft:
+                metadata.seq_lens.copy_(seq_lens[:bs].clamp_min(self.spec_num_tokens))
         self.cuda_graph_decode_metadata[bs] = metadata
         self.forward_decode_metadata = metadata
 
@@ -266,9 +320,38 @@ class MHAAttnBackend(AttentionBackend):
         )
         if self.spec_num_tokens > 1 and not self.is_draft:
             self.cuda_graph_seq_lens[:bs].copy_(seq_lens[:bs])
+        elif self.draft_block_decode:
+            # DFLASH draft: replicate each request's page table to its
+            # spec_num_tokens block rows. The block-end seq_lens are filled by
+            # the drafter inside the captured graph, so they are not touched
+            # here (they re-derive from the live draft length on every replay).
+            base_page_table = req_to_page[req_pool_indices[:bs], : self.max_num_pages]
+            self.cuda_graph_page_table[: bs * self.spec_num_tokens, :].view(
+                bs, self.spec_num_tokens, self.max_num_pages
+            ).copy_(base_page_table[:, None, :])
 
         if bs in self.cuda_graph_decode_metadata:
             self.forward_decode_metadata = self.cuda_graph_decode_metadata[bs]
+
+    def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
+        """DFLASH: broadcast each request's block-end length to its
+        spec_num_tokens cuda-graph decode rows (uniform, non-causal).
+
+        Called by the drafter inside the captured graph so that on every replay
+        the expanded seq_lens re-derive from the live draft length (which is
+        recomputed in-graph from the target's accept lengths).
+
+        Args:
+            bs: Number of draft requests.
+            block_seq_lens: ``[bs]`` per-request block-end lengths
+                (prefix + spec_num_tokens).
+        """
+        spec = self.spec_num_tokens
+        self.cuda_graph_seq_lens[: bs * spec].view(bs, spec).copy_(
+            block_seq_lens[:bs]
+            .clamp(self.spec_num_tokens, self.max_context_len)
+            .unsqueeze(1)
+        )
 
     # ------------------------------------------------------------------
     # Forward
@@ -426,7 +509,10 @@ class MHAAttnBackend(AttentionBackend):
             cache_seqlens=metadata.seq_lens,
             max_seqlen_q=metadata.max_extend_seq_len,
             max_seqlen_k=self.max_context_len,
-            is_causal=True,
+            # DFLASH marks its draft attention non-causal so the draft block's
+            # query positions attend bidirectionally. Every other layer leaves
+            # the attribute unset, so this stays causal by default.
+            is_causal=not bool(getattr(layer, "non_causal", False)),
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
             sinks=sinks,
@@ -520,6 +606,57 @@ class MHAAttnBackend(AttentionBackend):
             layer.v_head_dim,
         )
         return k_cache, v_cache
+
+    def _make_spec_metadata_buffers(
+        self,
+        bs: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        expanded_bs = bs * self.spec_num_tokens
+        cuda_graph_page_table = torch.empty(
+            (expanded_bs, self.max_num_pages),
+            dtype=torch.int32,
+            device=device,
+        )
+        cuda_graph_seq_lens = torch.empty(
+            (expanded_bs,),
+            dtype=torch.int32,
+            device=device,
+        )
+        return (cuda_graph_page_table, cuda_graph_seq_lens)
+
+    def _fill_spec_metadata_uniform(
+        self,
+        expanded_page_table: torch.Tensor,
+        expanded_seq_lens: torch.Tensor,
+        page_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ):
+        """Expand spec metadata with a uniform (non-causal) seq_len per row.
+
+        Replicates the full seq_len to all spec_num_tokens rows of a request so
+        each row decodes with max_seqlen_q == 1 over the whole block. Used by the
+        DFLASH drafter so every block query attends over the entire block
+        (non-causal block-diffusion drafting), as opposed to the target's
+        unexpanded causal multi-query verify path.
+        """
+        bs = seq_lens.shape[0]
+        spec_num_tokens = self.spec_num_tokens
+        expanded_page_table = expanded_page_table.view(
+            bs, spec_num_tokens, self.max_num_pages
+        )
+        expanded_page_table.copy_(page_table[:, None, :])
+        # Clamp to max_context_len so the draft decode never asks the attention
+        # kernel for more than max_num_pages worth of page-table columns. The
+        # block-end length is prefix + spec_num_tokens, which can exceed
+        # max_context_len for a request near the context limit; without the
+        # clamp the kernel reads page_table[:, >= max_num_pages] out of bounds
+        # (CUDA illegal memory access). Mirrors fill_block_decode_seq_lens on the
+        # cuda-graph path (this eager path is taken by mixed prefill+decode
+        # batches even when cuda graphs are enabled).
+        expanded_seq_lens.view(bs, spec_num_tokens).copy_(
+            seq_lens.clamp(spec_num_tokens, self.max_context_len)[:, None]
+        )
 
 
 for _backend_name in _KERNEL_SOLUTION_BY_BACKEND:

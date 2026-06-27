@@ -440,7 +440,7 @@ class EventLoop:
 
         self.output_processor = OutputProcesser(
             send_to_tokenizer=self.send_to_tokenizer,
-            global_rank=global_rank,
+            attn_tp_rank=attn_tp_rank,
             spec_algorithm=self.server_args.speculative_algorithm,
             spec_num_tokens=(
                 self.server_args.speculative_num_draft_tokens
@@ -448,6 +448,7 @@ class EventLoop:
                 else None
             ),
             stream_interval=self.server_args.stream_interval,
+            enable_log_request_stats=self.server_args.enable_log_request_stats,
             metrics=self.metrics,
         )
         self.prefetch_threshold = scheduler_cfg.prefetch_threshold
@@ -514,10 +515,15 @@ class EventLoop:
             payload = cache_event_to_payload(event)
             self._pending_cache_event_payloads[cache_event_key(payload)] = payload
 
-        # Local short-circuit: counter mirrors across ranks (same plan every-
-        # where), so if nothing is in flight here AND nothing is buffered
-        # awaiting commit, no rank has anything to gather.
-        if self._num_inflight_cache_ops == 0 and not self._pending_cache_event_payloads:
+        # The gather below is a collective, but cache-op completion is async and
+        # not lock-step across ranks, so local state (_num_inflight_cache_ops /
+        # _pending_cache_event_payloads) diverges transiently. A rank-local skip
+        # would let some ranks gather while others return, deadlocking the group.
+        # Agree on the skip via a cheap single-int all_reduce.
+        local_has_work = bool(
+            self._num_inflight_cache_ops != 0 or self._pending_cache_event_payloads
+        )
+        if not self._cache_group_has_work(local_has_work):
             return
 
         ready_payloads = self._pop_ready_cache_event_payloads()
@@ -557,6 +563,26 @@ class EventLoop:
         self.kv_event_publisher.publish(
             KVEventBatch(ts=time.time(), events=events, attn_dp_rank=self.dp_rank)
         )
+
+    def _cache_group_has_work(self, local_has_work: bool) -> bool:
+        """Whether ANY attn-tp rank has cache work this step (unanimous via a
+        single-int MAX all_reduce, far cheaper than the payload gather it
+        guards). Deciding from rank-local state alone deadlocks the group; see
+        _commit_cache_results.
+
+        Args:
+            local_has_work: This rank's view of whether any cache op is in
+                flight or any polled payload awaits commit.
+
+        Returns:
+            ``True`` if any rank has work (all must gather); ``False`` only when
+            every rank is idle.
+        """
+        if self.attn_tp_size == 1:
+            return local_has_work
+        flag = torch.tensor([1 if local_has_work else 0], dtype=torch.int32)
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=self.attn_tp_cpu_group)
+        return bool(flag.item())
 
     def _pop_ready_cache_event_payloads(self) -> list[dict]:
         local_payloads = list(self._pending_cache_event_payloads.values())
@@ -1308,6 +1334,7 @@ class EventLoop:
             if forward_op is not None:
                 sampling_params_list = self._gather_sampling_params(forward_op)
                 grammar_inputs = self._gather_grammar_state(forward_op)
+                self._mark_stats_scheduled(forward_op)
                 results, on_first_token = self._dispatch_forward(
                     forward_op,
                     sampling_params_list,
@@ -1335,6 +1362,19 @@ class EventLoop:
             self._pause.maybe_finish_drain(self.scheduler)
 
             self._record_scheduler_iteration_metrics(stats, num_iter_tokens)
+
+    def _mark_stats_scheduled(self, forward_op) -> None:
+        # Stamp the pre-forward "scheduled" time on each request's stats tracker
+        # so the queue/prefill split is anchored before the forward (idempotent:
+        # only the first forward a request appears in sets it). --enable-log-request-stats.
+        if not self.server_args.enable_log_request_stats or forward_op is None:
+            return
+        now = time.time()
+        rid_to_state = self.output_processor.rid_to_state
+        for rid in forward_op.request_ids:
+            st = rid_to_state.get(rid)
+            if st is not None:
+                st.stats.mark_scheduled(now)
 
     def _gather_sampling_params(self, forward_op) -> list[SamplingParams]:
         """Look up per-request SamplingParams from the output processor. The
@@ -1477,6 +1517,7 @@ class EventLoop:
 
             curr_results = None
             if forward_op is not None:
+                self._mark_stats_scheduled(forward_op)
                 curr_results, _ = self._dispatch_forward(
                     forward_op,
                     sampling_params_list,

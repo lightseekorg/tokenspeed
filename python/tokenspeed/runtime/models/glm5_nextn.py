@@ -160,7 +160,7 @@ class GlmMoeDsaModelNextN(nn.Module):
 
         if not ctx.forward_mode.is_idle():
             if not ENABLE_CP:
-                hidden_states = self.decoder.comm_manager.final_norm(
+                hidden_states, _ = self.decoder.comm_manager.final_norm(
                     hidden_states, residual, ctx, self.shared_head.norm
                 )
             else:
@@ -216,6 +216,7 @@ class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
         self.logits_processor = LogitsProcessor(
             config,
             skip_all_gather=self.mapping.attn.has_dp,
+            do_argmax=True,
             tp_rank=self.mapping.attn.tp_rank,
             tp_size=self.mapping.attn.tp_size,
             tp_group=self.mapping.attn.tp_group,

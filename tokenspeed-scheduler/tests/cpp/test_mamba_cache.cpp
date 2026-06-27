@@ -45,7 +45,7 @@ class MambaCacheTest : public ::testing::Test {
 protected:
     static constexpr std::int32_t kPageSize = 2;
     static constexpr std::int32_t kDevicePages = 32;
-    static constexpr std::int32_t kHostPages = 0;
+    static constexpr std::int32_t kHostPages = 32;
     static constexpr std::int32_t kMambaSlots = 8;
     static constexpr std::int32_t kMambaCacheChunkSize = 4;
 
@@ -114,6 +114,31 @@ TEST_F(MambaCacheTest, MatchWithFullMambaKeepsDepth) {
     auto match = hybrid_prefix_cache_->Match(tokens);
     EXPECT_EQ(match.device.DepthInPage(), 3);
     EXPECT_NE(match.mamba_cow_src_index, -1);
+    EXPECT_EQ(match.mamba_branching_seqlen, -1);
+}
+
+TEST_F(MambaCacheTest, HostKVWithDeviceMambaStillProvidesMambaCow) {
+    auto tokens = MakeAlignedTokens(3, kPageSize);
+    InsertKVAndMamba(tokens);
+
+    auto device_match = prefix_cache_->Match(tokens);
+    TreeNode* terminal = device_match.device.last_node;
+    ASSERT_NE(terminal, nullptr);
+    ASSERT_TRUE(terminal->HasMamba());
+    const std::int32_t mamba_slot = terminal->MambaSlotIndex();
+
+    ASSERT_TRUE(
+        prefix_cache_->AllocateResourceOfType<ResourceType::Host>(device_match.NodesWithout<ResourceType::Host>()));
+    auto released = prefix_cache_->ReleaseDeviceResourcesPresentOnHost(terminal);
+    ASSERT_FALSE(released.empty());
+    EXPECT_FALSE(terminal->OnDevice());
+    EXPECT_TRUE(terminal->OnHost());
+    EXPECT_TRUE(terminal->HasMamba());
+
+    auto match = hybrid_prefix_cache_->Match(tokens);
+    EXPECT_EQ(match.device.DepthInPage(), 0);
+    EXPECT_EQ(match.host.DepthInPage(), 3);
+    EXPECT_EQ(match.mamba_cow_src_index, mamba_slot);
     EXPECT_EQ(match.mamba_branching_seqlen, -1);
 }
 

@@ -56,8 +56,13 @@ class QuantizeMethodBase(ABC):
 class QuantizationConfig(ABC):
     """Base class for quantization configs."""
 
-    def __init__(self, ignored_layers: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        ignored_layers: list[str] | None = None,
+        exclude_modules: list[str] | None = None,
+    ) -> None:
         self.ignored_layers = ignored_layers or []
+        self.exclude_modules = exclude_modules or []
 
     @abstractmethod
     def get_name(self) -> str:
