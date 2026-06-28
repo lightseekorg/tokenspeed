@@ -1,0 +1,36 @@
+api_version: ci.tokenspeed.io/v1
+name: eval-qwen3.5-122b-a10b-nvfp4-epd-1e2p1d-ocr-bench
+type: eval
+triggers:
+  - per-commit
+  - manual
+runner:
+  labels:
+    - b200-4gpu
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps.sh
+server:
+  command: >-
+    LB_HOST=127.0.0.1
+    LB_PORT=8000
+    bash test/ci_system/serve_qwen35_122b_nvfp4_epd_1e2p1d.sh
+  ready:
+    url: http://127.0.0.1:8000/v1/models
+    timeout: 2400
+    interval: 10
+eval:
+  install:
+    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
+  command: >-
+    /tmp/evalscope-perf/bin/evalscope eval
+    --model nvidia/Qwen3.5-122B-A10B-NVFP4
+    --api-url http://127.0.0.1:8000/v1
+    --api-key EMPTY_TOKEN
+    --datasets ocr_bench
+    --eval-batch-size 16
+    --generation-config '{"do_sample":false,"temperature":0.0,"max_tokens":256}'
+report:
+  github_step_summary: true
+score_threshold: 0.86
