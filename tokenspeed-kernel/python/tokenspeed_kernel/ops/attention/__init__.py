@@ -26,6 +26,7 @@ import math
 import tokenspeed_kernel.ops.attention.cuda  # noqa: F401
 import tokenspeed_kernel.ops.attention.deep_gemm  # noqa: F401
 import tokenspeed_kernel.ops.attention.flash_attn  # noqa: F401
+import tokenspeed_kernel.ops.attention.flash_mla  # noqa: F401
 import tokenspeed_kernel.ops.attention.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.attention.gluon  # noqa: F401
 import tokenspeed_kernel.ops.attention.triton  # noqa: F401
@@ -51,6 +52,8 @@ __all__ = [
     "mha_decode_with_kvcache",
     "mla_prefill",
     "mla_decode_with_kvcache",
+    "dsa_prefill",
+    "dsa_decode",
     "dsa_topk",
     "dsa_top_paged",
     "attn_merge_state",
@@ -695,6 +698,207 @@ def attn_merge_state(
 # ===-----------------------------------------------------------------------===#
 # DSA Kernels
 # ===-----------------------------------------------------------------------===#
+
+
+def dsa_decode(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor | None,
+    sparse_kv_cache: torch.Tensor | None,
+    topk_slots: torch.Tensor,
+    topk_lens: torch.Tensor | None,
+    max_seqlen_k: int,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    softmax_scale: float,
+    page_size: int,
+    q_len_per_req: int = 1,
+    logit_cap: float = 0.0,
+    k_scale: float = 1.0,
+    return_lse: bool = False,
+    out: torch.Tensor | None = None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> AttentionResult:
+    """Sparse DSA decode over selected global KV slots.
+
+    Args:
+        q: Absorbed MLA query with shape [tokens, heads, R + D_rope] or
+            [batch, q_len, heads, R + D_rope].
+        kv_cache: Regular compressed MLA KV cache, flat [slots, dim] or paged.
+        sparse_kv_cache: Packed sparse DSA KV cache, flat [slots, row_bytes] or
+            paged.
+        topk_slots: Global KV slot ids with shape [tokens, topk]. Invalid
+            entries are -1.
+        topk_lens: Valid selected-slot count per token, or None when the
+            implementation relies on -1 padding.
+        max_seqlen_k: Maximum dense visible context length for this batch.
+        qk_nope_head_dim: Original non-RoPE q/k dimension.
+        kv_lora_rank: MLA latent rank and output head dimension.
+        qk_rope_head_dim: RoPE q/k dimension.
+        softmax_scale: Scale applied to attention logits.
+        page_size: KV cache page size.
+        q_len_per_req: Query rows per request.
+        logit_cap: Optional logit cap.
+        k_scale: KV scale multiplier for FP8 backends.
+        return_lse: Whether to return LSE in addition to output.
+        out: Optional output buffer.
+        override: Optional exact kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+
+    Returns:
+        Latent DSA attention output, or ``(out, lse)`` when ``return_lse=True``.
+    """
+    if q.dim() == 4:
+        batch_size, q_len, num_heads, head_dim = q.shape
+        tokens = batch_size * q_len
+    else:
+        tokens, num_heads, head_dim = q.shape
+        q_len = int(q_len_per_req)
+        batch_size = tokens // q_len
+
+    traits = {
+        "page_size": int(page_size),
+        "q_len_per_req": int(q_len_per_req),
+        "qk_nope_head_dim": int(qk_nope_head_dim),
+        "kv_lora_rank": int(kv_lora_rank),
+        "qk_rope_head_dim": int(qk_rope_head_dim),
+        "topk": int(topk_slots.shape[-1]),
+        "kv_cache_available": kv_cache is not None,
+        "sparse_kv_cache_available": sparse_kv_cache is not None,
+        "topk_layout": "global_slots",
+        "support_logit_cap": logit_cap != 0.0,
+        "return_lse": return_lse,
+    }
+    signature = _attention_format_signature(q=q)
+    kernel = select_kernel(
+        "attention",
+        "dsa_decode",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+    shape_params = {
+        "batch_size": batch_size,
+        "q_len": q_len,
+        "tokens": tokens,
+        "num_heads": num_heads,
+        "head_dim": head_dim,
+        "topk": topk_slots.shape[-1],
+        "page_size": int(page_size),
+        "max_seqlen_k": int(max_seqlen_k),
+    }
+    ShapeCapture.get().record(
+        "attention", "dsa_decode", kernel.name, q.dtype, shape_params
+    )
+    with kernel_scope(
+        "attention", "dsa_decode", q.dtype, kernel_name=kernel.name, **shape_params
+    ):
+        return kernel(
+            q=q,
+            kv_cache=kv_cache,
+            sparse_kv_cache=sparse_kv_cache,
+            topk_slots=topk_slots,
+            topk_lens=topk_lens,
+            max_seqlen_k=max_seqlen_k,
+            qk_nope_head_dim=qk_nope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            softmax_scale=softmax_scale,
+            page_size=page_size,
+            q_len_per_req=q_len_per_req,
+            logit_cap=logit_cap,
+            k_scale=k_scale,
+            return_lse=return_lse,
+            out=out,
+        )
+
+
+def dsa_prefill(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor | None,
+    sparse_kv_cache: torch.Tensor | None,
+    topk_slots: torch.Tensor,
+    topk_lens: torch.Tensor,
+    max_seqlen_k: int,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    softmax_scale: float,
+    page_size: int,
+    logit_cap: float = 0.0,
+    k_scale: float = 1.0,
+    return_lse: bool = False,
+    out: torch.Tensor | None = None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> AttentionResult:
+    """Sparse DSA prefill over selected global KV slots."""
+    if q.dim() == 4:
+        batch_size, q_len, num_heads, head_dim = q.shape
+        tokens = batch_size * q_len
+    else:
+        tokens, num_heads, head_dim = q.shape
+        q_len = 1
+        batch_size = tokens
+
+    traits = {
+        "page_size": int(page_size),
+        "q_len_per_req": 1,
+        "qk_nope_head_dim": int(qk_nope_head_dim),
+        "kv_lora_rank": int(kv_lora_rank),
+        "qk_rope_head_dim": int(qk_rope_head_dim),
+        "topk": int(topk_slots.shape[-1]),
+        "kv_cache_available": kv_cache is not None,
+        "sparse_kv_cache_available": sparse_kv_cache is not None,
+        "topk_layout": "global_slots",
+        "support_logit_cap": logit_cap != 0.0,
+        "return_lse": return_lse,
+    }
+    signature = _attention_format_signature(q=q)
+    kernel = select_kernel(
+        "attention",
+        "dsa_prefill",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+    shape_params = {
+        "batch_size": batch_size,
+        "q_len": q_len,
+        "tokens": tokens,
+        "num_heads": num_heads,
+        "head_dim": head_dim,
+        "topk": topk_slots.shape[-1],
+        "page_size": int(page_size),
+        "max_seqlen_k": int(max_seqlen_k),
+    }
+    ShapeCapture.get().record(
+        "attention", "dsa_prefill", kernel.name, q.dtype, shape_params
+    )
+    with kernel_scope(
+        "attention", "dsa_prefill", q.dtype, kernel_name=kernel.name, **shape_params
+    ):
+        return kernel(
+            q=q,
+            kv_cache=kv_cache,
+            sparse_kv_cache=sparse_kv_cache,
+            topk_slots=topk_slots,
+            topk_lens=topk_lens,
+            max_seqlen_k=max_seqlen_k,
+            qk_nope_head_dim=qk_nope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            softmax_scale=softmax_scale,
+            page_size=page_size,
+            q_len_per_req=1,
+            logit_cap=logit_cap,
+            k_scale=k_scale,
+            return_lse=return_lse,
+            out=out,
+        )
 
 
 def dsa_topk(

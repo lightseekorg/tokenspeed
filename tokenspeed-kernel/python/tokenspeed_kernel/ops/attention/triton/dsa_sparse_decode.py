@@ -22,6 +22,9 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 
 @triton.jit
@@ -259,4 +262,172 @@ def dsa_sparse_decode(
     return out
 
 
-__all__ = ["dsa_sparse_decode"]
+def _flatten_sparse_kv_cache(
+    sparse_kv_cache: torch.Tensor, page_size: int
+) -> torch.Tensor:
+    if sparse_kv_cache.dim() == 2:
+        return sparse_kv_cache
+    if sparse_kv_cache.dim() == 4:
+        if sparse_kv_cache.shape[1] != int(page_size) or sparse_kv_cache.shape[2] != 1:
+            raise ValueError(
+                "paged sparse_kv_cache must be [pages, page_size, 1, row_bytes], "
+                f"got {tuple(sparse_kv_cache.shape)} with page_size={page_size}"
+            )
+        return sparse_kv_cache.reshape(-1, sparse_kv_cache.shape[-1])
+    raise ValueError(
+        "sparse_kv_cache must be [slots, row_bytes] or "
+        f"[pages, page_size, 1, row_bytes], got {tuple(sparse_kv_cache.shape)}"
+    )
+
+
+def _flatten_sparse_query(q: torch.Tensor, q_len_per_req: int) -> torch.Tensor:
+    if q.dim() == 3:
+        return q
+    if q.dim() == 4:
+        return q.reshape(-1, q.shape[2], q.shape[3])
+    raise ValueError(
+        "sparse MLA q must be [tokens, heads, dim] or "
+        f"[batch, q_len, heads, dim], got {tuple(q.shape)}"
+    )
+
+
+def _copy_or_return_sparse_out(
+    result: torch.Tensor,
+    out: torch.Tensor | None,
+) -> torch.Tensor:
+    if out is None:
+        return result
+    out_view = out.reshape_as(result)
+    out_view.copy_(result)
+    return out
+
+
+@register_kernel(
+    "attention",
+    "dsa_decode",
+    name="triton_dsa_decode",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=frozenset({format_signature(q=dense_tensor_format(torch.bfloat16))}),
+    traits={
+        "page_size": frozenset({64}),
+        "q_len_per_req": frozenset({1, 2, 3, 4, 5, 6}),
+        "qk_nope_head_dim": frozenset({128, 192}),
+        "kv_lora_rank": frozenset({128, 512}),
+        "qk_rope_head_dim": frozenset({64}),
+        "topk": frozenset({512, 1024, 2048}),
+        "kv_cache_available": frozenset({False, True}),
+        "sparse_kv_cache_available": frozenset({True}),
+        "topk_layout": frozenset({"global_slots"}),
+        "support_logit_cap": frozenset({False}),
+        "return_lse": frozenset({False}),
+    },
+    priority=Priority.PORTABLE,
+    tags={"portability"},
+)
+def triton_dsa_decode(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor | None,
+    sparse_kv_cache: torch.Tensor | None,
+    topk_slots: torch.Tensor,
+    topk_lens: torch.Tensor | None,
+    max_seqlen_k: int,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    softmax_scale: float,
+    page_size: int,
+    q_len_per_req: int = 1,
+    logit_cap: float = 0.0,
+    k_scale: float = 1.0,
+    return_lse: bool = False,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if sparse_kv_cache is None:
+        raise RuntimeError("Triton sparse MLA requires sparse_kv_cache")
+    if topk_lens is None:
+        raise RuntimeError("Triton sparse MLA requires topk_lens")
+    if return_lse:
+        raise RuntimeError("Triton sparse MLA does not support return_lse")
+    if logit_cap != 0.0:
+        raise RuntimeError("Triton sparse MLA does not support logit_cap")
+    q_flat = _flatten_sparse_query(q, q_len_per_req).contiguous()
+    sparse_kv = _flatten_sparse_kv_cache(sparse_kv_cache, page_size).contiguous()
+    result = dsa_sparse_decode(
+        q_flat,
+        sparse_kv,
+        topk_slots.contiguous(),
+        topk_lens.contiguous(),
+        softmax_scale=softmax_scale * float(k_scale),
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+    )
+    return _copy_or_return_sparse_out(result, out)
+
+
+@register_kernel(
+    "attention",
+    "dsa_prefill",
+    name="triton_dsa_prefill",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=frozenset({format_signature(q=dense_tensor_format(torch.bfloat16))}),
+    traits={
+        "page_size": frozenset({64}),
+        "q_len_per_req": frozenset({1}),
+        "qk_nope_head_dim": frozenset({128, 192}),
+        "kv_lora_rank": frozenset({128, 512}),
+        "qk_rope_head_dim": frozenset({64}),
+        "topk": frozenset({512, 1024, 2048}),
+        "kv_cache_available": frozenset({False, True}),
+        "sparse_kv_cache_available": frozenset({True}),
+        "topk_layout": frozenset({"global_slots"}),
+        "support_logit_cap": frozenset({False}),
+        "return_lse": frozenset({False}),
+    },
+    priority=Priority.PORTABLE,
+    tags={"portability"},
+)
+def triton_dsa_prefill(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor | None,
+    sparse_kv_cache: torch.Tensor | None,
+    topk_slots: torch.Tensor,
+    topk_lens: torch.Tensor | None,
+    max_seqlen_k: int,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    softmax_scale: float,
+    page_size: int,
+    q_len_per_req: int = 1,
+    logit_cap: float = 0.0,
+    k_scale: float = 1.0,
+    return_lse: bool = False,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return triton_dsa_decode(
+        q=q,
+        kv_cache=kv_cache,
+        sparse_kv_cache=sparse_kv_cache,
+        topk_slots=topk_slots,
+        topk_lens=topk_lens,
+        max_seqlen_k=max_seqlen_k,
+        qk_nope_head_dim=qk_nope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        softmax_scale=softmax_scale,
+        page_size=page_size,
+        q_len_per_req=q_len_per_req,
+        logit_cap=logit_cap,
+        k_scale=k_scale,
+        return_lse=return_lse,
+        out=out,
+    )
+
+
+__all__ = [
+    "dsa_sparse_decode",
+    "triton_dsa_decode",
+    "triton_dsa_prefill",
+]

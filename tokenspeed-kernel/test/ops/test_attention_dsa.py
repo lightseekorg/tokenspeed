@@ -20,9 +20,16 @@
 
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
-from tokenspeed_kernel import dsa_top_paged, dsa_topk
+from tokenspeed_kernel import (
+    dsa_decode,
+    dsa_prefill,
+    dsa_top_paged,
+    dsa_topk,
+)
 
 torch.manual_seed(42)
 
@@ -138,3 +145,117 @@ def test_dsa_topk(device: str, solution: str, require) -> None:
     torch.testing.assert_close(topk_lens.cpu(), expected_lens.cpu())
     torch.testing.assert_close(workspace_indices[:, :65].cpu(), expected[:, :65].cpu())
     assert (workspace_indices[0, int(expected_lens[0].item()) :] == -1).all()
+
+
+def _pack_sparse_kv(
+    latent: torch.Tensor,
+    rope: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    kv_lora_rank = latent.shape[1]
+    qk_rope_head_dim = rope.shape[1]
+    scale = latent.float().abs().amax(dim=1, keepdim=True).clamp_min(1.0e-6) / 448.0
+    latent_fp8 = (latent.float() / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    row_bytes = kv_lora_rank + kv_lora_rank // 128 * 4 + qk_rope_head_dim * 2
+    sparse = torch.empty(
+        (latent.shape[0], row_bytes),
+        dtype=torch.uint8,
+        device=latent.device,
+    )
+    sparse[:, :kv_lora_rank].copy_(latent_fp8.view(torch.uint8))
+    scale_start = kv_lora_rank
+    scale_end = scale_start + kv_lora_rank // 128 * 4
+    sparse[:, scale_start:scale_end].view(torch.float32).copy_(scale)
+    sparse[:, scale_end:].view(torch.bfloat16).copy_(rope)
+    return sparse, latent_fp8.float() * scale
+
+
+def _dsa_reference(
+    q: torch.Tensor,
+    latent: torch.Tensor,
+    rope: torch.Tensor,
+    topk_slots: torch.Tensor,
+    topk_lens: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    refs = []
+    kv_lora_rank = latent.shape[1]
+    for token in range(q.shape[0]):
+        valid_slots = topk_slots[token, : int(topk_lens[token].item())].long()
+        q_nope = q[token, :, :kv_lora_rank].float()
+        q_rope = q[token, :, kv_lora_rank:].float()
+        k_nope = latent.index_select(0, valid_slots).float()
+        k_rope = rope.index_select(0, valid_slots).float()
+        scores = torch.einsum("hd,kd->hk", q_nope, k_nope)
+        scores += torch.einsum("hd,kd->hk", q_rope, k_rope)
+        probs = torch.softmax(scores * softmax_scale, dim=-1)
+        refs.append(torch.matmul(probs, k_nope))
+    return torch.stack(refs, dim=0).to(q.dtype)
+
+
+@pytest.mark.parametrize(
+    "mode,api_name",
+    [
+        pytest.param("decode", "dsa_decode", id="decode"),
+        pytest.param("prefill", "dsa_prefill", id="prefill"),
+    ],
+)
+@pytest.mark.parametrize("solution", ["triton"])
+def test_dsa_with_kvcache(
+    device: str,
+    mode: str,
+    api_name: str,
+    solution: str,
+    require,
+) -> None:
+    require("attention", api_name, solution, torch.bfloat16, "q")
+
+    tokens = 3
+    num_heads = 2
+    num_slots = 16
+    topk = 512
+    kv_lora_rank = 128
+    qk_rope_head_dim = 64
+    qk_nope_head_dim = 128
+    softmax_scale = 1.0 / math.sqrt(qk_nope_head_dim + qk_rope_head_dim)
+    q = torch.randn(
+        tokens,
+        num_heads,
+        kv_lora_rank + qk_rope_head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    latent = torch.randn(num_slots, kv_lora_rank, device=device, dtype=torch.bfloat16)
+    rope = torch.randn(num_slots, qk_rope_head_dim, device=device, dtype=torch.bfloat16)
+    sparse_kv, dequant_latent = _pack_sparse_kv(latent, rope)
+    topk_slots = torch.full((tokens, topk), -1, device=device, dtype=torch.int32)
+    topk_lens = torch.tensor([5, 7, 4], device=device, dtype=torch.int32)
+    for token in range(tokens):
+        count = int(topk_lens[token].item())
+        topk_slots[token, :count] = torch.randperm(num_slots, device=device)[:count]
+
+    api = dsa_decode if mode == "decode" else dsa_prefill
+    out = api(
+        q=q,
+        kv_cache=None,
+        sparse_kv_cache=sparse_kv,
+        topk_slots=topk_slots,
+        topk_lens=topk_lens,
+        max_seqlen_k=num_slots,
+        qk_nope_head_dim=qk_nope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        softmax_scale=softmax_scale,
+        page_size=64,
+        solution=solution,
+    )
+
+    ref = _dsa_reference(
+        q,
+        dequant_latent,
+        rope,
+        topk_slots,
+        topk_lens,
+        softmax_scale,
+    )
+    assert out.shape == (tokens, num_heads, kv_lora_rank)
+    torch.testing.assert_close(out.float(), ref.float(), rtol=8e-2, atol=8e-2)

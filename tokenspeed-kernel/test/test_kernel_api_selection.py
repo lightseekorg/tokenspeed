@@ -32,6 +32,7 @@ import tokenspeed_kernel.numerics.reference.gemm as _gemm_reference
 import tokenspeed_kernel.ops.attention as _attention_pkg
 import tokenspeed_kernel.ops.attention.cuda as _attention_cuda
 import tokenspeed_kernel.ops.attention.flash_attn as _attention_flash_attn
+import tokenspeed_kernel.ops.attention.flash_mla as _attention_flash_mla
 import tokenspeed_kernel.ops.attention.flashinfer as _attention_flashinfer
 import tokenspeed_kernel.ops.attention.gluon as _attention_gluon
 import tokenspeed_kernel.ops.attention.triton as _attention_triton
@@ -48,6 +49,24 @@ import tokenspeed_kernel.ops.sampling as _sampling_pkg
 import tokenspeed_kernel.ops.sampling.cute_dsl as _sampling_cute_dsl
 import tokenspeed_kernel.ops.sampling.gluon as _sampling_gluon
 import torch
+from tokenspeed_kernel.ops.attention.triton import (
+    dsa_sparse_decode as _attention_triton_dsa_sparse_decode,
+)
+from tokenspeed_kernel.ops.attention.triton import (
+    merge_state as _attention_triton_merge_state,
+)
+from tokenspeed_kernel.ops.attention.triton import (
+    mha_decode as _attention_triton_mha_decode,
+)
+from tokenspeed_kernel.ops.attention.triton import (
+    mha_prefill as _attention_triton_mha_prefill,
+)
+from tokenspeed_kernel.ops.attention.triton import (
+    mla_decode as _attention_triton_mla_decode,
+)
+from tokenspeed_kernel.ops.attention.triton import (
+    mla_prefill as _attention_triton_mla_prefill,
+)
 from tokenspeed_kernel.ops.moe.flashinfer import (
     cutedsl_deepep_nvfp4 as _moe_cutedsl_deepep_nvfp4,
 )
@@ -70,8 +89,15 @@ _RELOAD_MODULES = [
     # Attention registration modules.
     _attention_cuda,
     _attention_flash_attn,
+    _attention_flash_mla,
     _attention_flashinfer,
     _attention_gluon,
+    _attention_triton_mha_prefill,
+    _attention_triton_mha_decode,
+    _attention_triton_mla_prefill,
+    _attention_triton_mla_decode,
+    _attention_triton_merge_state,
+    _attention_triton_dsa_sparse_decode,
     _attention_triton,
     _attention_pkg,
     # GEMM registration modules.
@@ -436,6 +462,48 @@ def _attention_decode() -> object:
         cache_seqlens,
         max_seqlen_k=128,
         max_seqlen_q=1,
+    )
+
+
+def _attention_dsa_decode() -> object:
+    q = torch.empty((2, 8, 576), dtype=torch.bfloat16)
+    sparse_kv_cache = torch.empty((64, 656), dtype=torch.uint8)
+    topk_slots = torch.empty((2, 512), dtype=torch.int32)
+    topk_lens = torch.empty((2,), dtype=torch.int32)
+    return tokenspeed_kernel.dsa_decode(
+        q=q,
+        kv_cache=None,
+        sparse_kv_cache=sparse_kv_cache,
+        topk_slots=topk_slots,
+        topk_lens=topk_lens,
+        max_seqlen_k=64,
+        qk_nope_head_dim=192,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        softmax_scale=1.0,
+        page_size=64,
+        solution="triton",
+    )
+
+
+def _attention_dsa_prefill() -> object:
+    q = torch.empty((2, 8, 576), dtype=torch.bfloat16)
+    sparse_kv_cache = torch.empty((64, 656), dtype=torch.uint8)
+    topk_slots = torch.empty((2, 512), dtype=torch.int32)
+    topk_lens = torch.empty((2,), dtype=torch.int32)
+    return tokenspeed_kernel.dsa_prefill(
+        q=q,
+        kv_cache=None,
+        sparse_kv_cache=sparse_kv_cache,
+        topk_slots=topk_slots,
+        topk_lens=topk_lens,
+        max_seqlen_k=64,
+        qk_nope_head_dim=192,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        softmax_scale=1.0,
+        page_size=64,
+        solution="triton",
     )
 
 
@@ -952,6 +1020,22 @@ _CASES = [
         "attn_merge_state",
         "triton_attn_merge_state",
         _attention_merge_state,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "dsa_decode",
+        "triton_dsa_decode",
+        _attention_dsa_decode,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "dsa_prefill",
+        "triton_dsa_prefill",
+        _attention_dsa_prefill,
     ),
     # GEMM API x architecture golden cases.
     _case(_is_supported_gpu, "supported-gpu", "gemm", "mm", "torch_mm", _mm_dense),
