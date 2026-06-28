@@ -189,7 +189,7 @@ def _dsa_reference(
         scores += torch.einsum("hd,kd->hk", q_rope, k_rope)
         probs = torch.softmax(scores * softmax_scale, dim=-1)
         refs.append(torch.matmul(probs, k_nope))
-    return torch.stack(refs, dim=0).to(q.dtype)
+    return torch.stack(refs, dim=0).to(torch.bfloat16)
 
 
 @pytest.mark.parametrize(
@@ -200,14 +200,22 @@ def _dsa_reference(
     ],
 )
 @pytest.mark.parametrize("solution", ["triton"])
+@pytest.mark.parametrize(
+    "q_dtype",
+    [
+        pytest.param(torch.bfloat16, id="q_bf16"),
+        pytest.param(torch.float8_e4m3fn, id="q_fp8"),
+    ],
+)
 def test_dsa_with_kvcache(
     device: str,
     mode: str,
     api_name: str,
     solution: str,
+    q_dtype: torch.dtype,
     require,
 ) -> None:
-    require("attention", api_name, solution, torch.bfloat16, "q")
+    require("attention", api_name, solution, q_dtype, "q")
 
     tokens = 3
     num_heads = 2
@@ -217,13 +225,14 @@ def test_dsa_with_kvcache(
     qk_rope_head_dim = 64
     qk_nope_head_dim = 128
     softmax_scale = 1.0 / math.sqrt(qk_nope_head_dim + qk_rope_head_dim)
-    q = torch.randn(
+    q_bf16 = torch.randn(
         tokens,
         num_heads,
         kv_lora_rank + qk_rope_head_dim,
         device=device,
         dtype=torch.bfloat16,
     )
+    q = q_bf16.to(q_dtype)
     latent = torch.randn(num_slots, kv_lora_rank, device=device, dtype=torch.bfloat16)
     rope = torch.randn(num_slots, qk_rope_head_dim, device=device, dtype=torch.bfloat16)
     sparse_kv, dequant_latent = _pack_sparse_kv(latent, rope)
@@ -258,4 +267,5 @@ def test_dsa_with_kvcache(
         softmax_scale,
     )
     assert out.shape == (tokens, num_heads, kv_lora_rank)
+    assert out.dtype == torch.bfloat16
     torch.testing.assert_close(out.float(), ref.float(), rtol=8e-2, atol=8e-2)

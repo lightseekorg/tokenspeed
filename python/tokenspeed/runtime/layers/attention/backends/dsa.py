@@ -451,16 +451,18 @@ class DSABackend(AttentionBackend):
                 "DSA sparse decode does not support "
                 "kv_cache_quant_method='per_token_head' yet."
             )
-        allow_trtllm_fp8_query = (
-            getattr(self, "_sparse_decode_impl", _SPARSE_IMPL_FLASHINFER_TRTLLM)
-            == _SPARSE_IMPL_FLASHINFER_TRTLLM
+        sparse_decode_impl = getattr(
+            self, "_sparse_decode_impl", _SPARSE_IMPL_FLASHINFER_TRTLLM
+        )
+        allow_fp8_query = (
+            sparse_decode_impl in (_SPARSE_IMPL_FLASHINFER_TRTLLM, _SPARSE_IMPL_TRITON)
             and getattr(self, "data_type", torch.bfloat16) == torch.float8_e4m3fn
             and q.dtype == torch.float8_e4m3fn
         )
-        if q.dtype != torch.bfloat16 and not allow_trtllm_fp8_query:
+        if q.dtype != torch.bfloat16 and not allow_fp8_query:
             raise RuntimeError(
                 "DSA sparse decode requires BF16 query tensors, or FP8 query "
-                f"tensors on the TRTLLM FP8 KV path, got {q.dtype}."
+                f"tensors on FP8 KV sparse paths, got {q.dtype}."
             )
         if save_kv_cache:
             assert k is not None

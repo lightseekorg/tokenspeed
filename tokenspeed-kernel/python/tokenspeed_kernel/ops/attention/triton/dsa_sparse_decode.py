@@ -26,6 +26,8 @@ from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
+_DSA_QUERY_DTYPES = frozenset({torch.bfloat16, torch.float8_e4m3fn})
+
 
 @triton.jit
 def _dsa_sparse_decode_kernel(
@@ -188,8 +190,8 @@ def dsa_sparse_decode(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
 ) -> torch.Tensor:
-    if q.dtype != torch.bfloat16:
-        raise TypeError(f"dsa_sparse_decode expects BF16 q, got {q.dtype}")
+    if q.dtype not in _DSA_QUERY_DTYPES:
+        raise TypeError(f"dsa_sparse_decode expects BF16 or FP8 q, got {q.dtype}")
     if sparse_kv.dtype != torch.uint8:
         raise TypeError(
             f"dsa_sparse_decode expects uint8 sparse_kv, got {sparse_kv.dtype}"
@@ -234,7 +236,7 @@ def dsa_sparse_decode(
     topk_lens = topk_lens.contiguous()
     out = torch.empty(
         (q.shape[0], q.shape[1], kv_lora_rank),
-        dtype=q.dtype,
+        dtype=torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype,
         device=q.device,
     )
     grid = (q.shape[0], q.shape[1], triton.cdiv(kv_lora_rank, 64))
@@ -308,7 +310,9 @@ def _copy_or_return_sparse_out(
     name="triton_dsa_decode",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
-    signatures=frozenset({format_signature(q=dense_tensor_format(torch.bfloat16))}),
+    signatures=frozenset(
+        {format_signature(q=dense_tensor_format(dtype)) for dtype in _DSA_QUERY_DTYPES}
+    ),
     traits={
         "page_size": frozenset({64}),
         "q_len_per_req": frozenset({1, 2, 3, 4, 5, 6}),
@@ -371,7 +375,9 @@ def triton_dsa_decode(
     name="triton_dsa_prefill",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
-    signatures=frozenset({format_signature(q=dense_tensor_format(torch.bfloat16))}),
+    signatures=frozenset(
+        {format_signature(q=dense_tensor_format(dtype)) for dtype in _DSA_QUERY_DTYPES}
+    ),
     traits={
         "page_size": frozenset({64}),
         "q_len_per_req": frozenset({1}),
