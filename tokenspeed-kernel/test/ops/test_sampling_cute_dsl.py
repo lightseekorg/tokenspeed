@@ -41,6 +41,7 @@ cute_dsl = pytest.importorskip("tokenspeed_kernel.ops.sampling.cute_dsl")
 cute_argmax = cute_dsl.argmax
 cute_argmax_pair = cute_dsl.argmax_pair
 
+from tokenspeed_kernel.ops.sampling import argmax as public_argmax  # noqa: E402
 
 # Vocab sizes for the models tokenspeed actively serves — same list as
 # ``tmp/integrate_cutedsl_argmax/bench_argmax.py::DEFAULT_N``.
@@ -146,6 +147,22 @@ def test_argmax_falls_back_for_unaligned_N(N):
     torch.manual_seed(N)
     x = torch.randn(M, N, device="cuda", dtype=torch.float32)
     torch.testing.assert_close(cute_argmax(x), torch.argmax(x, dim=-1), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("N", [4096, MODEL_VOCABS["kimi_k2_5"]])
+def test_argmax_empty_rows_falls_back(N):
+    """An idle data-parallel rank runs the draft forward with bs=0, so argmax
+    sees a ``(0, N)`` tensor over the real vocab. The kernel would launch a
+    0-block grid and raise CUDA_ERROR_INVALID_VALUE; both the cute entry and the
+    public dispatcher must route the empty case through ``torch.argmax`` and
+    return an empty index tensor."""
+    _need_cuda()
+    x = torch.randn(0, N, device="cuda", dtype=torch.float32)
+    expected = torch.argmax(x, dim=-1)
+    for fn in (cute_argmax, public_argmax):
+        out = fn(x)
+        assert out.shape == (0,)
+        torch.testing.assert_close(out, expected, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

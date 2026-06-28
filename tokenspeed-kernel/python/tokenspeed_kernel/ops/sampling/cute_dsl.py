@@ -341,9 +341,13 @@ def _argmax_cute(
 
     if (
         logits.dim() != 2
+        or logits.shape[0] == 0
         or not logits.is_cuda
         or not _supports_cute(logits.shape[1], logits.dtype)
     ):
+        # ``shape[0] == 0`` (e.g. an idle data-parallel rank's draft forward with
+        # bs=0) would launch a 0-block grid over the vocab tiles and raise
+        # CUDA_ERROR_INVALID_VALUE; torch.argmax returns an empty index tensor.
         return _argmax_torch_fallback(logits, out=out)
 
     M = logits.shape[0]
