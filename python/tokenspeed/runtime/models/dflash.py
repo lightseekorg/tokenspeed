@@ -394,15 +394,20 @@ class DFlashDraftModel(nn.Module):
         out_cache_loc: torch.Tensor,
         input_lengths: torch.Tensor | None = None,
         input_embeds: torch.Tensor | None = None,
+        kv_sync_event=None,
         **kwargs,
     ) -> LogitsProcessorOutput:
         if input_embeds is None:
             if not ctx.forward_mode.is_idle():
                 raise ValueError("DFlashDraftModel requires input_embeds.")
             hidden_states = self.fc.weight.new_empty((0, int(self.config.hidden_size)))
+            residual = None
         else:
             hidden_states = input_embeds
-        residual = None
+            residual = torch.zeros_like(input_embeds)
+
+        if kv_sync_event is not None:
+            torch.cuda.current_stream().wait_event(kv_sync_event)
 
         for layer in self.layers:
             hidden_states, residual = layer(

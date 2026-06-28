@@ -55,10 +55,15 @@ if TYPE_CHECKING:
 logger = get_colorful_logger(__name__)
 
 _is_capture_mode = False
+_is_cuda_graph_phase = False
 
 
 def get_is_capture_mode() -> bool:
     return _is_capture_mode
+
+
+def get_is_cuda_graph_phase() -> bool:
+    return _is_cuda_graph_phase
 
 
 def _should_update_mamba_state_after_mtp_verify(
@@ -456,6 +461,9 @@ class CudaGraphWrapper:
             )
             self.runtime_states.valid_cache_lengths.fill_(graph_prefix_bound)
 
+        global _is_cuda_graph_phase
+        _is_cuda_graph_phase = True
+
         # Warm up before capture.
         for _ in range(4):
             torch.cuda.synchronize()
@@ -503,6 +511,7 @@ class CudaGraphWrapper:
         torch.cuda.synchronize()
         dist.barrier()
         _is_capture_mode = False
+        _is_cuda_graph_phase = False
 
         # Graph capture records the hostfunc launches without invoking
         # them, so the dummy run_once pushed stays queued — drain it, and
