@@ -1302,19 +1302,20 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 num_prefill_tokens=num_prefill_tokens,
                 topk=topk,
             )
-        return self._compute_prefill_topk_indices_deepgemm(
-            indexer_output=indexer_output,
-            ctx=ctx,
-            prefix_lens=prefix_lens,
-            extend_lens=extend_lens,
-            seq_lens=seq_lens,
-            block_tables=block_tables,
-            kv_workspace_slots=kv_workspace_slots,
-            kv_workspace_bases=kv_workspace_bases,
-            max_seq_len=max_seq_len,
-            num_prefill_tokens=num_prefill_tokens,
-            topk=topk,
-        )
+        else:
+            return self._compute_prefill_topk_indices_deepgemm(
+                indexer_output=indexer_output,
+                ctx=ctx,
+                prefix_lens=prefix_lens,
+                extend_lens=extend_lens,
+                seq_lens=seq_lens,
+                block_tables=block_tables,
+                kv_workspace_slots=kv_workspace_slots,
+                kv_workspace_bases=kv_workspace_bases,
+                max_seq_len=max_seq_len,
+                num_prefill_tokens=num_prefill_tokens,
+                topk=topk,
+            )
 
     def _compute_prefill_topk_indices_triton(
         self,
