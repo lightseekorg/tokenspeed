@@ -25,6 +25,8 @@ bootstrap_profiling_from_env()
 from tokenspeed_kernel.ops.attention import (
     attn_merge_state,
     attn_plan,
+    dsa_top_paged,
+    dsa_topk,
     mha_decode_with_kvcache,
     mha_extend_with_kvcache,
     mha_prefill,
@@ -56,6 +58,8 @@ __all__ = [
     "mha_decode_with_kvcache",
     "mla_prefill",
     "mla_decode_with_kvcache",
+    "dsa_topk",
+    "dsa_top_paged",
     "attn_merge_state",
     # moe
     "moe_apply",

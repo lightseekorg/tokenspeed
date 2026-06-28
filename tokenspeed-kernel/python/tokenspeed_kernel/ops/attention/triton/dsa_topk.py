@@ -25,6 +25,9 @@ from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.triton.dsa_sparse_layout import (
     local_topk_to_global_slots,
 )
+from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 
 @triton.jit
@@ -302,6 +305,8 @@ def dsa_decode_topk(
     page_size: int,
     topk: int,
     softmax_scale: float,
+    out: torch.Tensor | None = None,
+    lens_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute GLM DSA decode top-k global KV slots.
 
@@ -336,8 +341,16 @@ def dsa_decode_topk(
         raise ValueError(f"topk must be positive, got {topk}")
     if q.shape[0] == 0:
         return (
-            torch.empty((0, int(topk)), dtype=torch.int32, device=q.device),
-            torch.empty((0,), dtype=torch.int32, device=q.device),
+            (
+                torch.empty((0, int(topk)), dtype=torch.int32, device=q.device)
+                if out is None
+                else out
+            ),
+            (
+                torch.empty((0,), dtype=torch.int32, device=q.device)
+                if lens_out is None
+                else lens_out
+            ),
         )
     if not q.is_cuda:
         raise RuntimeError("DSA Triton decode top-k requires CUDA tensors")
@@ -378,6 +391,8 @@ def dsa_decode_topk(
         block_table=block_table,
         block_size=int(page_size),
         seq_lens=seq_lens,
+        out=out,
+        lens_out=lens_out,
     )
 
 
@@ -391,6 +406,8 @@ def dsa_prefill_topk(
     *,
     topk: int,
     softmax_scale: float,
+    out: torch.Tensor | None = None,
+    lens_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute GLM DSA prefill top-k workspace-row indices.
 
@@ -425,8 +442,16 @@ def dsa_prefill_topk(
         raise ValueError(f"topk must be positive, got {topk}")
     if q.shape[0] == 0:
         return (
-            torch.empty((0, int(topk)), dtype=torch.int32, device=q.device),
-            torch.empty((0,), dtype=torch.int32, device=q.device),
+            (
+                torch.empty((0, int(topk)), dtype=torch.int32, device=q.device)
+                if out is None
+                else out
+            ),
+            (
+                torch.empty((0,), dtype=torch.int32, device=q.device)
+                if lens_out is None
+                else lens_out
+            ),
         )
     if not q.is_cuda:
         raise RuntimeError("DSA Triton prefill top-k requires CUDA tensors")
@@ -442,8 +467,18 @@ def dsa_prefill_topk(
     seq_len_sum = int(kv_workspace_slots.numel())
     if seq_len_sum == 0:
         return (
-            torch.full((q.shape[0], int(topk)), -1, dtype=torch.int32, device=q.device),
-            torch.zeros((q.shape[0],), dtype=torch.int32, device=q.device),
+            (
+                torch.full(
+                    (q.shape[0], int(topk)), -1, dtype=torch.int32, device=q.device
+                )
+                if out is None
+                else out.fill_(-1)
+            ),
+            (
+                torch.zeros((q.shape[0],), dtype=torch.int32, device=q.device)
+                if lens_out is None
+                else lens_out.zero_()
+            ),
         )
 
     logits = torch.empty(
@@ -478,7 +513,154 @@ def dsa_prefill_topk(
         (row_ends - row_starts).clamp_min_(0),
         torch.full_like(row_ends, int(topk)),
     ).to(torch.int32)
+    if out is not None:
+        out.copy_(workspace_indices)
+        workspace_indices = out
+    if lens_out is not None:
+        lens_out.copy_(topk_lens)
+        topk_lens = lens_out
     return workspace_indices, topk_lens
 
 
-__all__ = ["dsa_decode_topk", "dsa_prefill_topk"]
+@register_kernel(
+    "attention",
+    "dsa_top_paged",
+    name="triton_dsa_top_paged",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=frozenset(
+        {
+            format_signature(
+                q=dense_tensor_format(torch.bfloat16),
+                weights=dense_tensor_format(torch.float32),
+            )
+        }
+    ),
+    traits={
+        "head_dim": frozenset({128}),
+        "topk": frozenset({512, 1024, 2048}),
+        "page_size": frozenset({64}),
+        "index_k_format": frozenset({"bf16"}),
+    },
+    priority=Priority.PORTABLE,
+    tags={"portability"},
+)
+def triton_dsa_top_paged(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    *,
+    page_size: int,
+    topk: int,
+    softmax_scale: float,
+    q_len_per_req: int = 1,
+    index_k_cache: torch.Tensor | None = None,
+    index_k_with_scale_cache: torch.Tensor | None = None,
+    plan: object | None = None,
+    out: torch.Tensor | None = None,
+    lens_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if index_k_cache is None:
+        raise RuntimeError("Triton DSA paged top-k requires BF16 index_k_cache")
+    return dsa_decode_topk(
+        q,
+        index_k_cache,
+        weights,
+        seq_lens,
+        block_table,
+        page_size=page_size,
+        topk=topk,
+        softmax_scale=softmax_scale,
+        out=out,
+        lens_out=lens_out,
+    )
+
+
+@register_kernel(
+    "attention",
+    "dsa_topk",
+    name="triton_dsa_topk",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=frozenset(
+        {
+            format_signature(
+                q=dense_tensor_format(torch.bfloat16),
+                weights=dense_tensor_format(torch.float32),
+            )
+        }
+    ),
+    traits={
+        "head_dim": frozenset({128}),
+        "topk": frozenset({512, 1024, 2048}),
+        "index_k_format": frozenset({"bf16"}),
+    },
+    priority=Priority.PORTABLE,
+    tags={"portability"},
+)
+def triton_dsa_topk(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    kv_workspace_slots: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    *,
+    topk: int,
+    softmax_scale: float,
+    index_k_cache: torch.Tensor | None = None,
+    index_k_with_scale_cache: torch.Tensor | None = None,
+    page_size: int | None = None,
+    index_k_fp8: torch.Tensor | None = None,
+    index_k_scale: torch.Tensor | None = None,
+    max_logits_bytes: int | None = None,
+    out: torch.Tensor | None = None,
+    lens_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if index_k_cache is None:
+        raise RuntimeError("Triton DSA top-k requires BF16 index_k_cache")
+    if max_logits_bytes is None:
+        return dsa_prefill_topk(
+            q,
+            index_k_cache,
+            weights,
+            kv_workspace_slots,
+            row_starts,
+            row_ends,
+            topk=topk,
+            softmax_scale=softmax_scale,
+            out=out,
+            lens_out=lens_out,
+        )
+
+    if out is None:
+        out = torch.empty((q.shape[0], int(topk)), dtype=torch.int32, device=q.device)
+    if lens_out is None:
+        lens_out = torch.empty((q.shape[0],), dtype=torch.int32, device=q.device)
+    out.fill_(-1)
+    lens_out.zero_()
+    seq_len_sum = max(int(kv_workspace_slots.numel()), 1)
+    max_query_rows = max(1, int(max_logits_bytes) // (seq_len_sum * 4))
+    for start in range(0, q.shape[0], max_query_rows):
+        end = min(start + max_query_rows, q.shape[0])
+        dsa_prefill_topk(
+            q[start:end],
+            index_k_cache,
+            weights[start:end],
+            kv_workspace_slots,
+            row_starts[start:end],
+            row_ends[start:end],
+            topk=topk,
+            softmax_scale=softmax_scale,
+            out=out[start:end],
+            lens_out=lens_out[start:end],
+        )
+    return out, lens_out
+
+
+__all__ = [
+    "dsa_decode_topk",
+    "dsa_prefill_topk",
+    "triton_dsa_top_paged",
+    "triton_dsa_topk",
+]

@@ -24,6 +24,7 @@ import math
 
 # Backend registration (side-effect imports)
 import tokenspeed_kernel.ops.attention.cuda  # noqa: F401
+import tokenspeed_kernel.ops.attention.deep_gemm  # noqa: F401
 import tokenspeed_kernel.ops.attention.flash_attn  # noqa: F401
 import tokenspeed_kernel.ops.attention.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.attention.gluon  # noqa: F401
@@ -50,6 +51,8 @@ __all__ = [
     "mha_decode_with_kvcache",
     "mla_prefill",
     "mla_decode_with_kvcache",
+    "dsa_topk",
+    "dsa_top_paged",
     "attn_merge_state",
     "attn_plan",
 ]
@@ -686,6 +689,227 @@ def attn_merge_state(
             out_b=out_b,
             lse_b=lse_b,
             lse_scale_log2=lse_scale_log2,
+        )
+
+
+# ===-----------------------------------------------------------------------===#
+# DSA Kernels
+# ===-----------------------------------------------------------------------===#
+
+
+def dsa_topk(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    kv_workspace_slots: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    *,
+    topk: int,
+    softmax_scale: float,
+    index_k_cache: torch.Tensor | None = None,
+    index_k_with_scale_cache: torch.Tensor | None = None,
+    page_size: int | None = None,
+    index_k_fp8: torch.Tensor | None = None,
+    index_k_scale: torch.Tensor | None = None,
+    max_logits_bytes: int | None = None,
+    out: torch.Tensor | None = None,
+    lens_out: torch.Tensor | None = None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute DSA top-k over packed workspace rows.
+
+    Args:
+        q: BF16 indexer query with shape [tokens, index_heads, head_dim].
+        weights: FP32 per-token/head weights with shape [tokens, index_heads].
+        kv_workspace_slots: Global KV slot for each workspace row, shape
+            [workspace_rows].
+        row_starts: Inclusive workspace-row start per query token, shape [tokens].
+        row_ends: Exclusive workspace-row end per query token, shape [tokens].
+        topk: Number of workspace candidates to select.
+        softmax_scale: Score scale, normally index_head_dim ** -0.5.
+        index_k_cache: BF16 index-K cache with shape [slots, head_dim]. Used by
+            Triton together with kv_workspace_slots.
+        index_k_with_scale_cache: Packed FP8 index-K cache with scales. Used by
+            DeepGEMM to gather workspace rows internally.
+        page_size: KV cache page size for index_k_with_scale_cache.
+        index_k_fp8: FP8 index-K rows in workspace-row order. Used by DeepGEMM.
+        index_k_scale: FP8 index-K scales in workspace-row order. Used by DeepGEMM.
+        max_logits_bytes: Optional temporary logits memory cap.
+        out: Optional int32 output buffer with shape [tokens, topk].
+        lens_out: Optional int32 output buffer with shape [tokens].
+        override: Optional exact kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+
+    Returns:
+        Tuple of workspace row ids and valid counts. Returned indices are
+        absolute row ids into kv_workspace_slots; invalid entries are -1.
+    """
+    if out is not None and out.shape != (q.shape[0], int(topk)):
+        raise ValueError(
+            f"out must have shape {(q.shape[0], int(topk))}, got {tuple(out.shape)}"
+        )
+    if lens_out is not None and lens_out.shape != (q.shape[0],):
+        raise ValueError(
+            f"lens_out must have shape {(q.shape[0],)}, got {tuple(lens_out.shape)}"
+        )
+    traits = {
+        "head_dim": q.shape[-1],
+        "topk": int(topk),
+    }
+    has_bf16 = index_k_cache is not None
+    has_fp8 = index_k_with_scale_cache is not None or (
+        index_k_fp8 is not None and index_k_scale is not None
+    )
+    if has_bf16 and not has_fp8:
+        traits["index_k_format"] = "bf16"
+    elif has_fp8 and not has_bf16:
+        traits["index_k_format"] = "fp8_scaled"
+    signature = _attention_format_signature(q=q, weights=weights)
+    kernel = select_kernel(
+        "attention",
+        "dsa_topk",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+    shape_params = {
+        "tokens": q.shape[0],
+        "workspace_rows": kv_workspace_slots.numel(),
+        "index_heads": q.shape[1],
+        "head_dim": q.shape[-1],
+        "topk": int(topk),
+    }
+    ShapeCapture.get().record(
+        "attention", "dsa_topk", kernel.name, q.dtype, shape_params
+    )
+    with kernel_scope(
+        "attention", "dsa_topk", q.dtype, kernel_name=kernel.name, **shape_params
+    ):
+        return kernel(
+            q=q,
+            weights=weights,
+            kv_workspace_slots=kv_workspace_slots,
+            row_starts=row_starts,
+            row_ends=row_ends,
+            topk=topk,
+            softmax_scale=softmax_scale,
+            index_k_cache=index_k_cache,
+            index_k_with_scale_cache=index_k_with_scale_cache,
+            page_size=page_size,
+            index_k_fp8=index_k_fp8,
+            index_k_scale=index_k_scale,
+            max_logits_bytes=max_logits_bytes,
+            out=out,
+            lens_out=lens_out,
+        )
+
+
+def dsa_top_paged(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    *,
+    page_size: int,
+    topk: int,
+    softmax_scale: float,
+    q_len_per_req: int = 1,
+    index_k_cache: torch.Tensor | None = None,
+    index_k_with_scale_cache: torch.Tensor | None = None,
+    plan: object | None = None,
+    out: torch.Tensor | None = None,
+    lens_out: torch.Tensor | None = None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute DSA top-k over a paged KV cache.
+
+    Args:
+        q: BF16 indexer query with shape [tokens, index_heads, head_dim].
+        weights: FP32 per-token/head weights with shape [tokens, index_heads].
+        seq_lens: Visible KV length per query token, shape [tokens].
+        block_table: Paged KV block table with one row per query token.
+        page_size: Number of tokens per KV page.
+        topk: Number of KV candidates to select.
+        softmax_scale: Score scale, normally index_head_dim ** -0.5.
+        q_len_per_req: Query rows per request. Plain decode uses 1.
+        index_k_cache: BF16 index-K cache with shape [slots, head_dim]. Used by
+            Triton.
+        index_k_with_scale_cache: Packed FP8 index-K cache with scales. Used by
+            DeepGEMM.
+        plan: Optional opaque backend-specific plan.
+        out: Optional int32 output buffer with shape [tokens, topk].
+        lens_out: Optional int32 output buffer with shape [tokens].
+        override: Optional exact kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+
+    Returns:
+        Tuple of global KV slots and valid counts; invalid entries are -1.
+    """
+    if out is not None and out.shape != (q.shape[0], int(topk)):
+        raise ValueError(
+            f"out must have shape {(q.shape[0], int(topk))}, got {tuple(out.shape)}"
+        )
+    if lens_out is not None and lens_out.shape != (q.shape[0],):
+        raise ValueError(
+            f"lens_out must have shape {(q.shape[0],)}, got {tuple(lens_out.shape)}"
+        )
+    traits = {
+        "head_dim": q.shape[-1],
+        "topk": int(topk),
+        "page_size": int(page_size),
+        "q_len_per_req": int(q_len_per_req),
+    }
+    has_bf16 = index_k_cache is not None
+    has_fp8 = index_k_with_scale_cache is not None
+    if has_bf16 and not has_fp8:
+        traits["index_k_format"] = "bf16"
+    elif has_fp8 and not has_bf16:
+        traits["index_k_format"] = "fp8_scaled"
+    signature = _attention_format_signature(q=q, weights=weights)
+    kernel = select_kernel(
+        "attention",
+        "dsa_top_paged",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+    shape_params = {
+        "tokens": q.shape[0],
+        "max_pages": block_table.shape[1],
+        "index_heads": q.shape[1],
+        "head_dim": q.shape[-1],
+        "page_size": int(page_size),
+        "topk": int(topk),
+        "q_len_per_req": int(q_len_per_req),
+    }
+    ShapeCapture.get().record(
+        "attention", "dsa_top_paged", kernel.name, q.dtype, shape_params
+    )
+    with kernel_scope(
+        "attention",
+        "dsa_top_paged",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            q=q,
+            weights=weights,
+            seq_lens=seq_lens,
+            block_table=block_table,
+            page_size=page_size,
+            topk=topk,
+            softmax_scale=softmax_scale,
+            q_len_per_req=q_len_per_req,
+            index_k_cache=index_k_cache,
+            index_k_with_scale_cache=index_k_with_scale_cache,
+            plan=plan,
+            out=out,
+            lens_out=lens_out,
         )
 
 

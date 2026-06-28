@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import math
 
+import tokenspeed_kernel.ops.attention.triton.dsa_topk  # noqa: F401
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.triton.mha_decode import decode_attention_fwd
