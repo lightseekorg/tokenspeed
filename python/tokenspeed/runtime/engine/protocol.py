@@ -65,6 +65,7 @@ from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.engine.io_struct import (
     CloseSessionReqInput,
     ConfigureLoggingReq,
+    DestroyWeightsUpdateGroupReqInput,
     EmbeddingReqInput,
     FlushCacheReqOutput,
     GenerateReqInput,
@@ -167,6 +168,11 @@ class EngineClient(Protocol):
     async def init_weights_update_group(
         self,
         obj: InitWeightsUpdateGroupReqInput,
+    ) -> tuple[bool, str]: ...
+
+    async def destroy_weights_update_group(
+        self,
+        obj: DestroyWeightsUpdateGroupReqInput,
     ) -> tuple[bool, str]: ...
 
     async def update_weights_from_distributed(

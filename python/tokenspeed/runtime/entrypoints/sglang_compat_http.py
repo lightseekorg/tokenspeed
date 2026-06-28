@@ -46,6 +46,7 @@ from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from tokenspeed.runtime.engine.io_struct import (
+    DestroyWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -130,9 +131,20 @@ async def init_weights_update_group(request: Request) -> JSONResponse:
 
 @router.post("/destroy_weights_update_group")
 async def destroy_weights_update_group(request: Request) -> JSONResponse:
-    # tokenspeed tears the group down with the engine; expose a no-op so
-    # trainers that always call it (slime swallows failures) succeed.
-    return JSONResponse({"success": True, "message": "noop"})
+    async def _do() -> dict[str, Any]:
+        # Body is optional: trainers that always call destroy (e.g. slime) may
+        # send only ``{group_name}`` or nothing at all. Tolerate an empty body.
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        obj = DestroyWeightsUpdateGroupReqInput(
+            group_name=str(body.get("group_name", "weight_update_group")),
+        )
+        success, message = await _llm(request).destroy_weights_update_group(obj)
+        return {"success": success, "message": message}
+
+    return await _guarded(_do)
 
 
 # --------------------------------------------------------------------------- #

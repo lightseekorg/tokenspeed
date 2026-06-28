@@ -749,6 +749,18 @@ class InitWeightsUpdateGroupReqOutput:
 
 
 @dataclass
+class DestroyWeightsUpdateGroupReqInput:
+    # The group name to tear down (must match the init group_name).
+    group_name: str = "weight_update_group"
+
+
+@dataclass
+class DestroyWeightsUpdateGroupReqOutput:
+    success: bool
+    message: str
+
+
+@dataclass
 class GetWeightsByNameReqInput:
     name: str
     truncate_size: int = 100

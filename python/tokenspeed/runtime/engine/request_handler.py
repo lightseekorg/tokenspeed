@@ -35,6 +35,8 @@ from tokenspeed.runtime.distributed.process_group_manager import (
 from tokenspeed.runtime.engine.generation_output_processor import RequestState
 from tokenspeed.runtime.engine.io_struct import (
     AbortReq,
+    DestroyWeightsUpdateGroupReqInput,
+    DestroyWeightsUpdateGroupReqOutput,
     FlushCacheReqInput,
     FlushCacheReqOutput,
     GetInternalStateReq,
@@ -228,6 +230,12 @@ class RequestHandler:
                 ok, msg = self.model_runner.update_weights_from_distributed(recv_req)
                 self.send_func.send_pyobj(
                     UpdateWeightsFromDistributedReqOutput(success=ok, message=msg)
+                )
+            elif isinstance(recv_req, DestroyWeightsUpdateGroupReqInput):
+                # RL weight sync: tear down the trainer's NCCL group on this worker.
+                ok, msg = self.model_runner.destroy_weights_update_group(recv_req)
+                self.send_func.send_pyobj(
+                    DestroyWeightsUpdateGroupReqOutput(success=ok, message=msg)
                 )
             else:
                 raise NotImplementedError(f"Unsupported request type: {type(recv_req)}")

@@ -278,3 +278,33 @@ class ModelRunner:
         except Exception as e:  # noqa: BLE001 - surface to the control plane
             logger.exception("update_weights_from_distributed failed")
             return False, str(e)
+
+    def destroy_weights_update_group(self, obj) -> tuple[bool, str]:
+        """Tear down the trainer weight-update NCCL group joined in ``init``.
+
+        When a training run ends the trainer drops its end of the group, so the
+        worker must release its side too -- free the NCCL communicator and the
+        torch ``_world`` bookkeeping ``init_weights_update_group`` registered --
+        instead of leaking it until engine shutdown. A fresh run then re-inits a
+        clean group. Idempotent: tearing down when no group is live is a success
+        so a trainer that always calls destroy (e.g. slime) never errors.
+        """
+        pg = getattr(self, "_weight_update_pg", None)
+        if pg is None:
+            return True, "weight update group not initialized"
+
+        import torch.distributed as dist
+        from torch.distributed.distributed_c10d import _world
+
+        try:
+            dist.destroy_process_group(pg)
+            # init() registered this group's rank map via the low-level helper;
+            # drop it explicitly in case destroy_process_group left it behind.
+            _world.pg_group_ranks.pop(pg, None)
+        except Exception as e:  # noqa: BLE001 - surface to the control plane
+            logger.exception("destroy_weights_update_group failed")
+            return False, str(e)
+        self._weight_update_pg = None
+        self._weight_update_device = None
+        logger.info("weight-update group destroyed")
+        return True, "weight update group destroyed"
