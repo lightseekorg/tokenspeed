@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Kernel dispatch for trtllm-kernel quant and MoE helpers.
+"""Kernel dispatch for trtllm-kernel quantization, MoE, and mHC helpers.
 
 The implementation uses TRT-LLM CUDA kernels exposed as torch.ops.trtllm /
 torch.ops.tensorrt_llm.
@@ -36,6 +36,16 @@ per_token_group_quant_8bit = error_fn
 per_tensor_quant_fp8 = error_fn
 per_token_quant_fp8 = error_fn
 fast_topk_v2 = error_fn
+mhc_big_fuse = error_fn
+mhc_fused_hc = error_fn
+mhc_post_mapping = error_fn
+
+
+def has_mhc_kernels() -> bool:
+    """Return whether the installed TRT-LLM extension exposes all mHC ops."""
+
+    return False
+
 
 # deep_ep_cpp MUST be loaded before trtllm_kernel.  libtensorrt_llm.so
 # statically links libcudart_static.a, creating a second CUDA runtime in
@@ -131,6 +141,217 @@ if platform.is_nvidia:
                     values, row_starts, row_ends, indices, topk
                 )
 
+        def has_mhc_kernels() -> bool:
+            """Return whether the installed TRT-LLM extension exposes all mHC ops."""
+
+            return all(
+                hasattr(torch.ops.trtllm, name)
+                for name in ("mhc_big_fuse", "mhc_fused_hc", "mhc_post_mapping")
+            )
+
+        def mhc_big_fuse(
+            y_acc: torch.Tensor,
+            r_acc: torch.Tensor,
+            residual: torch.Tensor,
+            hc_scale: torch.Tensor,
+            hc_base: torch.Tensor,
+            post_mix: torch.Tensor,
+            comb_mix: torch.Tensor,
+            layer_input: torch.Tensor,
+            num_tokens: int,
+            hc_dim: int,
+            hidden_size: int,
+            rms_eps: float,
+            hc_pre_eps: float,
+            hc_sinkhorn_eps: float,
+            hc_post_mult_value: float,
+            sinkhorn_repeat: int,
+            num_splits: int,
+            block_size: int,
+        ) -> None:
+            """Launch TRT-LLM's fused mHC pre-mapping epilogue.
+
+            Args:
+                y_acc: FP32 GEMM accumulators.
+                r_acc: FP32 residual square-sum accumulators.
+                residual: BF16 hyper-connected residual input.
+                hc_scale: FP32 pre/post/comb scale values.
+                hc_base: FP32 pre/post/comb bias values.
+                post_mix: FP32 post-mapping output buffer.
+                comb_mix: FP32 combination-matrix output buffer.
+                layer_input: BF16 reduced layer-input output buffer.
+                num_tokens: Flattened token count.
+                hc_dim: Flattened hyper-connected hidden dimension.
+                hidden_size: Per-lane hidden dimension.
+                rms_eps: RMS normalization epsilon.
+                hc_pre_eps: Pre-mapping sigmoid epsilon.
+                hc_sinkhorn_eps: Sinkhorn normalization epsilon.
+                hc_post_mult_value: Post-mapping sigmoid multiplier.
+                sinkhorn_repeat: Number of Sinkhorn iterations.
+                num_splits: Number of split-K accumulator partitions.
+                block_size: CUDA block size selected for the epilogue.
+
+            Returns:
+                None. ``post_mix``, ``comb_mix``, and ``layer_input`` are
+                populated in place.
+            """
+
+            torch.ops.trtllm.mhc_big_fuse(
+                y_acc,
+                r_acc,
+                residual,
+                hc_scale,
+                hc_base,
+                post_mix,
+                comb_mix,
+                layer_input,
+                num_tokens,
+                hc_dim,
+                hidden_size,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                num_splits,
+                block_size,
+            )
+
+        def mhc_post_mapping(
+            residual: torch.Tensor,
+            hidden_states: torch.Tensor,
+            post_mix: torch.Tensor,
+            comb_mix: torch.Tensor,
+            output: torch.Tensor,
+            num_tokens: int,
+            hidden_size: int,
+        ) -> None:
+            """Launch TRT-LLM's mHC post-mapping kernel.
+
+            Args:
+                residual: BF16 hyper-connected residual input.
+                hidden_states: BF16 layer output to mix into the residual.
+                post_mix: FP32 per-lane post-mapping weights.
+                comb_mix: FP32 lane-combination matrices.
+                output: BF16 hyper-connected residual output buffer.
+                num_tokens: Flattened token count.
+                hidden_size: Per-lane hidden dimension.
+
+            Returns:
+                None. ``output`` is populated in place.
+            """
+
+            torch.ops.trtllm.mhc_post_mapping(
+                residual,
+                hidden_states,
+                post_mix,
+                comb_mix,
+                output,
+                num_tokens,
+                hidden_size,
+            )
+
+        def mhc_fused_hc(
+            x_prev: torch.Tensor,
+            residual_prev: torch.Tensor,
+            post_mix_prev: torch.Tensor,
+            comb_mix_prev: torch.Tensor,
+            weight: torch.Tensor,
+            hc_scale: torch.Tensor,
+            hc_base: torch.Tensor,
+            residual_cur: torch.Tensor,
+            post_mix_cur: torch.Tensor,
+            comb_mix_cur: torch.Tensor,
+            layer_input_cur: torch.Tensor,
+            y_acc_workspace: torch.Tensor,
+            r_acc_workspace: torch.Tensor,
+            done_counter_workspace: torch.Tensor,
+            num_tokens: int,
+            hidden_size: int,
+            hc_mult: int,
+            rms_eps: float,
+            hc_pre_eps: float,
+            hc_sinkhorn_eps: float,
+            hc_post_mult_value: float,
+            sinkhorn_repeat: int,
+            backend: int,
+            tile_n: int,
+            num_k_splits: int,
+            bigfuse_block_size: int,
+            tile_m: int,
+            norm_weight: torch.Tensor | None,
+            norm_eps: float,
+        ) -> None:
+            """Launch TRT-LLM's fused previous-post/current-pre mHC kernel.
+
+            Args:
+                x_prev: BF16 previous layer output.
+                residual_prev: BF16 previous hyper-connected residual.
+                post_mix_prev: FP32 previous post-mapping weights.
+                comb_mix_prev: FP32 previous lane-combination matrices.
+                weight: FP32 current pre-mapping projection weight.
+                hc_scale: FP32 current pre/post/comb scale values.
+                hc_base: FP32 current pre/post/comb bias values.
+                residual_cur: BF16 current residual output buffer.
+                post_mix_cur: FP32 current post-mapping output buffer.
+                comb_mix_cur: FP32 current combination output buffer.
+                layer_input_cur: BF16 current layer-input output buffer.
+                y_acc_workspace: FP32 projection accumulator workspace.
+                r_acc_workspace: FP32 square-sum accumulator workspace.
+                done_counter_workspace: INT32 kernel synchronization workspace.
+                num_tokens: Flattened token count.
+                hidden_size: Per-lane hidden dimension.
+                hc_mult: Number of hyper-connection lanes.
+                rms_eps: RMS normalization epsilon.
+                hc_pre_eps: Pre-mapping sigmoid epsilon.
+                hc_sinkhorn_eps: Sinkhorn normalization epsilon.
+                hc_post_mult_value: Post-mapping sigmoid multiplier.
+                sinkhorn_repeat: Number of Sinkhorn iterations.
+                backend: TRT-LLM fused-mHC backend code.
+                tile_n: FMA output tile size.
+                num_k_splits: Hidden-axis split count.
+                bigfuse_block_size: Block size for half-fused backends.
+                tile_m: Tokens processed per CTA by all-in-one FMA.
+                norm_weight: Optional fused RMSNorm weight.
+                norm_eps: Optional fused RMSNorm epsilon.
+
+            Returns:
+                None. The four current-state outputs and workspaces are
+                populated in place.
+            """
+
+            torch.ops.trtllm.mhc_fused_hc(
+                x_prev,
+                residual_prev,
+                post_mix_prev,
+                comb_mix_prev,
+                weight,
+                hc_scale,
+                hc_base,
+                residual_cur,
+                post_mix_cur,
+                comb_mix_cur,
+                layer_input_cur,
+                y_acc_workspace,
+                r_acc_workspace,
+                done_counter_workspace,
+                num_tokens,
+                hidden_size,
+                hc_mult,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                backend,
+                tile_n,
+                num_k_splits,
+                bigfuse_block_size,
+                tile_m,
+                norm_weight,
+                norm_eps,
+            )
+
 
 __all__ = [
     "dsv3_fused_a_gemm",
@@ -139,4 +360,8 @@ __all__ = [
     "per_tensor_quant_fp8",
     "per_token_quant_fp8",
     "fast_topk_v2",
+    "has_mhc_kernels",
+    "mhc_big_fuse",
+    "mhc_fused_hc",
+    "mhc_post_mapping",
 ]

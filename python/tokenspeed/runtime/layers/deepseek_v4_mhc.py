@@ -9,13 +9,16 @@ from functools import cache
 import torch
 import triton
 import triton.language as tl
+from tokenspeed_kernel.ops.mhc import (
+    deep_gemm_mhc_prenorm_gemm,
+    has_deep_gemm_mhc,
+    supports_trtllm_mhc,
+    trtllm_mhc_big_fuse,
+    trtllm_mhc_fused_hc,
+    trtllm_mhc_post_mapping,
+)
 
 from tokenspeed.runtime.utils import ceil_div
-
-try:
-    from tokenspeed_kernel.thirdparty import deep_gemm
-except Exception:
-    deep_gemm = None  # type: ignore[assignment]
 
 
 @cache
@@ -305,6 +308,111 @@ def _mhc_post_hc4_triton_kernel(
     )
 
 
+class _FusedHcPingPong:
+    """Double-buffered workspace for TRT-LLM fused mHC.
+
+    Two buffer sets alternate each call so consecutive layers never alias
+    their input (previous output) with the current output.
+    """
+
+    def __init__(
+        self, max_bs: int, hc_mult: int, hidden_size: int, device: torch.device
+    ):
+        n2 = hc_mult * hc_mult
+        shape_n = hc_mult * (2 + hc_mult)
+        self.bufs = tuple(
+            (
+                torch.empty(
+                    max_bs, hc_mult, hidden_size, dtype=torch.bfloat16, device=device
+                ),
+                torch.empty(max_bs, hc_mult, dtype=torch.float32, device=device),
+                torch.empty(max_bs, n2, dtype=torch.float32, device=device),
+                torch.empty(max_bs, hidden_size, dtype=torch.bfloat16, device=device),
+                torch.empty(max_bs, shape_n, dtype=torch.float32, device=device),
+                torch.empty(max_bs, dtype=torch.float32, device=device),
+                torch.empty(max_bs, dtype=torch.int32, device=device),
+            )
+            for _ in range(2)
+        )
+        self.idx = 0
+
+    def reset(self):
+        self.idx = 0
+
+    def get(self):
+        buf = self.bufs[self.idx]
+        self.idx ^= 1
+        return buf
+
+
+class MhcFusedWorkspace:
+    """Model-owned fused-mHC buffers for serial CUDA execution.
+
+    Captured and eager forwards use separate pools so a large eager prefill
+    cannot replace storage referenced by a decode graph. Captured buffers grow
+    by powers of two, and superseded allocations stay alive for the lifetime
+    of this workspace because existing graphs retain their raw addresses.
+
+    Returned fused-mHC tensors borrow one of two alternating buffer sets. A
+    caller must consume each state before the same workspace wraps around and
+    reuses that set. CUDA graph replays must be serialized on the model stream.
+    """
+
+    def __init__(self) -> None:
+        self._captured: dict[tuple[torch.device, int, int], _FusedHcPingPong] = {}
+        self._retired_captured: list[_FusedHcPingPong] = []
+        self._eager: dict[tuple[torch.device, int, int], _FusedHcPingPong] = {}
+
+    def reset(self) -> None:
+        """Start a serial model forward at the first ping-pong buffer.
+
+        Eager buffers from the previous forward are released back to PyTorch's
+        stream-aware allocator. Captured buffers remain owned for graph replay.
+
+        Returns:
+            None.
+        """
+
+        for pp in self._captured.values():
+            pp.reset()
+        self._eager.clear()
+
+    def get(
+        self,
+        num_tokens: int,
+        hc_mult: int,
+        hidden_size: int,
+        device: torch.device,
+    ) -> _FusedHcPingPong:
+        """Return the ping-pong allocation for the current execution mode.
+
+        Args:
+            num_tokens: Flattened token count required by this forward.
+            hc_mult: Number of hyper-connection lanes.
+            hidden_size: Per-lane hidden dimension.
+            device: CUDA device that owns the buffers.
+
+        Returns:
+            A model-owned double-buffer allocation with sufficient capacity.
+        """
+
+        capturing = (
+            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        )
+        key = (device, hc_mult, hidden_size)
+        cache = self._captured if capturing else self._eager
+        pp = cache.get(key)
+        if pp is None or pp.bufs[0][0].shape[0] < num_tokens:
+            if capturing and pp is not None:
+                self._retired_captured.append(pp)
+            capacity = num_tokens
+            if capturing:
+                capacity = 1 << (max(num_tokens, 1) - 1).bit_length()
+            pp = _FusedHcPingPong(capacity, hc_mult, hidden_size, device)
+            cache[key] = pp
+        return pp
+
+
 def mhc_fused_hc(
     x_prev: torch.Tensor,
     residual_prev: torch.Tensor,
@@ -316,11 +424,54 @@ def mhc_fused_hc(
     rms_eps: float,
     hc_eps: float,
     sinkhorn_iters: int,
+    workspace: MhcFusedWorkspace,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused post_mapping(prev) + pre_mapping(curr).
 
-    Returns (residual_cur, layer_input, post_cur, comb_cur).
+    Args:
+        x_prev: Previous sublayer output.
+        residual_prev: Previous hyper-connected residual.
+        post_prev: Previous post-mapping weights.
+        comb_prev: Previous lane-combination matrices.
+        fn: Current pre-mapping projection weight.
+        hc_scale: Current pre/post/comb scales.
+        hc_base: Current pre/post/comb biases.
+        rms_eps: RMS normalization epsilon.
+        hc_eps: Hyper-connection normalization epsilon.
+        sinkhorn_iters: Number of Sinkhorn normalization iterations.
+        workspace: Model-owned serial fused-mHC workspace.
+
+    Returns:
+        ``(residual_cur, layer_input, post_cur, comb_cur)``. The TRT-LLM path
+        returns borrowed workspace views that must be consumed before the same
+        ping-pong set is reused.
     """
+    hc_mult = residual_prev.shape[-2]
+    hidden_size = residual_prev.shape[-1]
+    if (
+        x_prev.dtype != torch.bfloat16
+        or residual_prev.dtype != torch.bfloat16
+        or fn.dtype != torch.float32
+        or hc_scale.dtype != torch.float32
+        or hc_base.dtype != torch.float32
+        or post_prev.dtype != torch.float32
+        or comb_prev.dtype != torch.float32
+    ):
+        raise RuntimeError("fast mHC requires bf16 states and fp32 weights/mixes")
+    if supports_trtllm_mhc(residual_prev.device, hc_mult, hidden_size):
+        return _trtllm_mhc_fused_hc(
+            x_prev,
+            residual_prev,
+            post_prev,
+            comb_prev,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_eps,
+            sinkhorn_iters,
+            workspace,
+        )
     residual_cur = mhc_post(x_prev, residual_prev, post_prev, comb_prev)
     layer_input, post_cur, comb_cur = mhc_pre(
         residual_cur,
@@ -334,6 +485,189 @@ def mhc_fused_hc(
     return residual_cur, layer_input, post_cur, comb_cur
 
 
+def _trtllm_mhc_fused_hc(
+    x_prev: torch.Tensor,
+    residual_prev: torch.Tensor,
+    post_prev: torch.Tensor,
+    comb_prev: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+    workspace: MhcFusedWorkspace,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    hc_mult = residual_prev.shape[-2]
+    hidden_size = residual_prev.shape[-1]
+    outer_shape = residual_prev.shape[:-2]
+    B = residual_prev[..., 0, 0].numel()
+    if B == 0:
+        return (
+            torch.empty_like(residual_prev),
+            residual_prev.new_empty(*outer_shape, hidden_size),
+            torch.empty(
+                *outer_shape,
+                hc_mult,
+                1,
+                dtype=torch.float32,
+                device=residual_prev.device,
+            ),
+            torch.empty(
+                *outer_shape,
+                hc_mult,
+                hc_mult,
+                dtype=torch.float32,
+                device=residual_prev.device,
+            ),
+        )
+
+    x_flat = x_prev.reshape(B, hidden_size).contiguous()
+    res_flat = residual_prev.reshape(B, hc_mult, hidden_size).contiguous()
+    post_flat = post_prev.reshape(B, hc_mult).float().contiguous()
+    comb_flat = comb_prev.reshape(B, hc_mult, hc_mult).float().contiguous()
+
+    pp = workspace.get(B, hc_mult, hidden_size, x_prev.device)
+    residual_cur, post_cur, comb_cur, layer_input, y_acc, r_acc, dc = pp.get()
+
+    trtllm_mhc_fused_hc(
+        x_flat,
+        res_flat,
+        post_flat,
+        comb_flat,
+        fn.contiguous(),
+        hc_scale.contiguous(),
+        hc_base.contiguous(),
+        residual_cur,
+        post_cur,
+        comb_cur,
+        layer_input,
+        y_acc,
+        r_acc,
+        dc,
+        rms_eps,
+        hc_eps,
+        sinkhorn_iters,
+    )
+
+    return (
+        residual_cur[:B].view(*outer_shape, hc_mult, hidden_size),
+        layer_input[:B].view(*outer_shape, hidden_size),
+        post_cur[:B].view(*outer_shape, hc_mult, 1),
+        comb_cur[:B].view(*outer_shape, hc_mult, hc_mult),
+    )
+
+
+def _trtllm_mhc_pre(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    hc_mult = residual.shape[-2]
+    hidden_size = residual.shape[-1]
+    hc_dim = hc_mult * hidden_size
+    mix_hc = fn.shape[0]
+    outer_shape = residual.shape[:-2]
+    residual_flat = residual.view(-1, hc_mult, hidden_size)
+    num_tokens = residual_flat.shape[0]
+    if num_tokens == 0:
+        return (
+            residual.new_empty(*outer_shape, hidden_size),
+            torch.empty(
+                *outer_shape, hc_mult, 1, dtype=torch.float32, device=residual.device
+            ),
+            torch.empty(
+                *outer_shape,
+                hc_mult,
+                hc_mult,
+                dtype=torch.float32,
+                device=residual.device,
+            ),
+        )
+    block_k = 64
+    block_m = 64
+    # mhc_big_fuse only supports split-K counts in {1, 2, 4, 8, 16}; floor the
+    # heuristic value to the nearest power of two (split-K is a reduction, so
+    # fewer splits is numerically identical).
+    raw_splits = min(
+        _compute_num_split(block_k, hc_dim, ceil_div(num_tokens, block_m)), 16
+    )
+    n_splits = 1 << (raw_splits.bit_length() - 1)
+    y_acc = torch.empty(
+        n_splits, num_tokens, mix_hc, dtype=torch.float32, device=residual.device
+    )
+    r_acc = torch.empty(
+        n_splits, num_tokens, dtype=torch.float32, device=residual.device
+    )
+    deep_gemm_mhc_prenorm_gemm(
+        residual_flat.reshape(num_tokens, hc_dim),
+        fn,
+        y_acc,
+        r_acc,
+        n_splits,
+    )
+    post_mix = torch.empty(
+        num_tokens, hc_mult, dtype=torch.float32, device=residual.device
+    )
+    comb_mix = torch.empty(
+        num_tokens, hc_mult * hc_mult, dtype=torch.float32, device=residual.device
+    )
+    layer_input = torch.empty(
+        num_tokens, hidden_size, dtype=torch.bfloat16, device=residual.device
+    )
+    trtllm_mhc_big_fuse(
+        y_acc,
+        r_acc,
+        residual_flat.contiguous(),
+        hc_scale.float().contiguous(),
+        hc_base.float().contiguous(),
+        post_mix,
+        comb_mix,
+        layer_input,
+        rms_eps,
+        hc_eps,
+        sinkhorn_iters,
+    )
+    return (
+        layer_input.view(*outer_shape, hidden_size),
+        post_mix.view(*outer_shape, hc_mult, 1),
+        comb_mix.view(*outer_shape, hc_mult, hc_mult),
+    )
+
+
+def _trtllm_mhc_post(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+) -> torch.Tensor:
+    hc_mult = residual.shape[-2]
+    hidden_size = residual.shape[-1]
+    outer_shape = residual.shape[:-2]
+    residual_flat = residual.view(-1, hc_mult, hidden_size).contiguous()
+    num_tokens = residual_flat.shape[0]
+    if num_tokens == 0:
+        return torch.empty_like(residual)
+    x_flat = hidden_states.view(num_tokens, hidden_size).contiguous()
+    post_flat = post.view(num_tokens, hc_mult).float().contiguous()
+    comb_flat = comb.view(num_tokens, hc_mult, hc_mult).float().contiguous()
+    out = torch.empty(
+        num_tokens, hc_mult, hidden_size, dtype=torch.bfloat16, device=residual.device
+    )
+    trtllm_mhc_post_mapping(
+        residual_flat,
+        x_flat,
+        post_flat,
+        comb_flat,
+        out,
+    )
+    return out.view(*outer_shape, hc_mult, hidden_size)
+
+
 def mhc_pre(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -343,16 +677,25 @@ def mhc_pre(
     hc_eps: float,
     sinkhorn_iters: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if residual.dtype != torch.bfloat16 or fn.dtype != torch.float32:
+    hc_mult = residual.shape[-2]
+    hidden_size = residual.shape[-1]
+    if (
+        residual.dtype != torch.bfloat16
+        or fn.dtype != torch.float32
+        or hc_scale.dtype != torch.float32
+        or hc_base.dtype != torch.float32
+    ):
         raise RuntimeError("fast mHC requires bf16 residual and fp32 weights")
+    if supports_trtllm_mhc(residual.device, hc_mult, hidden_size):
+        return _trtllm_mhc_pre(
+            residual, fn, hc_scale, hc_base, rms_eps, hc_eps, sinkhorn_iters
+        )
     if not residual.is_cuda:
         raise RuntimeError("fast mHC requires CUDA tensors")
 
-    if deep_gemm is None:
+    if not has_deep_gemm_mhc():
         raise RuntimeError("deep_gemm.tf32_hc_prenorm_gemm is unavailable")
 
-    hc_mult = residual.shape[-2]
-    hidden_size = residual.shape[-1]
     hc_mult2 = hc_mult * hc_mult
     hc_mult3 = hc_mult * 2 + hc_mult2
     hc_hidden_size = hc_mult * hidden_size
@@ -403,7 +746,7 @@ def mhc_pre(
         n_splits, num_tokens, dtype=torch.float32, device=residual.device
     )
 
-    deep_gemm.tf32_hc_prenorm_gemm(
+    deep_gemm_mhc_prenorm_gemm(
         residual_flat.view(num_tokens, hc_hidden_size),
         fn,
         gemm_out_mul,
@@ -455,13 +798,22 @@ def mhc_post(
     post: torch.Tensor,
     comb: torch.Tensor,
 ) -> torch.Tensor:
+    hc_mult = residual.shape[-2]
+    hidden_size = residual.shape[-1]
+    if (
+        hidden_states.dtype != torch.bfloat16
+        or residual.dtype != torch.bfloat16
+        or post.dtype != torch.float32
+        or comb.dtype != torch.float32
+    ):
+        raise RuntimeError("fast mHC requires bf16 states and fp32 mixes")
+    if supports_trtllm_mhc(residual.device, hc_mult, hidden_size):
+        return _trtllm_mhc_post(hidden_states, residual, post, comb)
     if not hidden_states.is_cuda:
         raise RuntimeError("fast mHC requires CUDA tensors")
     if residual.numel() == 0:
         return torch.empty_like(residual)
     out = torch.empty_like(residual)
-    hc_mult = residual.shape[-2]
-    hidden_size = residual.shape[-1]
     residual_flat = residual.view(-1, hc_mult, hidden_size)
     hidden_states_flat = hidden_states.view(-1, hidden_size)
     post_flat = post.view(-1, hc_mult)

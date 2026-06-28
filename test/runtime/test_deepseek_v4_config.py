@@ -20,6 +20,7 @@ from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
     has_indexer_topk_prefill,
     indexer_topk_prefill,
 )
+from tokenspeed_kernel.ops.mhc import supports_trtllm_mhc
 from tokenspeed_kernel.thirdparty.cuda import (
     hash_softplus_sqrt_topk_flash,
     softplus_sqrt_topk_flash,
@@ -51,6 +52,7 @@ from tokenspeed.runtime.execution.drafter.eagle import (
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.model_runner import ModelRunner
+from tokenspeed.runtime.layers import deepseek_v4_mhc
 from tokenspeed.runtime.layers.attention.backends import (
     deepseek_v4 as deepseek_v4_backend,
 )
@@ -4008,6 +4010,326 @@ class TestDeepseekV4Config(unittest.TestCase):
             )
         with self.assertRaises(RuntimeError):
             mhc_post(hidden_states, residual, post, comb)
+
+    def test_mhc_post_uses_triton_for_unsupported_trtllm_shape(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required for the fast mHC fallback")
+
+        device = torch.device("cuda")
+        tokens, hc_mult, hidden_size = 2, 2, 8
+        self.assertFalse(supports_trtllm_mhc(device, hc_mult, hidden_size))
+        hidden_states = torch.randn(
+            tokens, hidden_size, dtype=torch.bfloat16, device=device
+        )
+        residual = torch.randn(
+            tokens, hc_mult, hidden_size, dtype=torch.bfloat16, device=device
+        )
+        post = torch.randn(tokens, hc_mult, 1, dtype=torch.float32, device=device)
+        comb = torch.randn(tokens, hc_mult, hc_mult, dtype=torch.float32, device=device)
+
+        actual = deepseek_v4_mhc.mhc_post(hidden_states, residual, post, comb)
+        expected = _mhc_post_reference(hidden_states, residual, post, comb)
+
+        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+    def test_mhc_fused_workspace_separates_capture_and_eager_buffers(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required for capture workspace semantics")
+
+        device = torch.device("cuda")
+        workspace = deepseek_v4_mhc.MhcFusedWorkspace()
+        with patch.object(
+            torch.cuda, "is_current_stream_capturing", return_value=False
+        ):
+            eager = workspace.get(1, 2, 8, device)
+
+        with patch.object(torch.cuda, "is_current_stream_capturing", return_value=True):
+            first = workspace.get(1, 2, 8, device)
+            second = workspace.get(2, 2, 8, device)
+            third = workspace.get(3, 2, 8, device)
+            other_mult = workspace.get(1, 4, 8, device)
+            other_hidden = workspace.get(1, 2, 16, device)
+
+        self.assertIsNot(eager, first)
+        self.assertEqual(first.bufs[0][0].shape[0], 1)
+        self.assertEqual(second.bufs[0][0].shape[0], 2)
+        self.assertEqual(third.bufs[0][0].shape[0], 4)
+        self.assertEqual(workspace._retired_captured, [first, second])
+        self.assertIsNot(third, other_mult)
+        self.assertIsNot(third, other_hidden)
+
+        workspace.reset()
+        self.assertFalse(workspace._eager)
+        self.assertEqual(third.idx, 0)
+
+    def test_mhc_fused_workspace_survives_graph_bucket_growth(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required for graph replay validation")
+
+        device = torch.device("cuda")
+        hc_mult, hidden_size = 4, 4096
+        if not supports_trtllm_mhc(device, hc_mult, hidden_size):
+            self.skipTest("TRT-LLM mHC requires a supported SM100 installation")
+
+        torch.manual_seed(0)
+        mix_hc = hc_mult * (2 + hc_mult)
+        weight = (
+            torch.randn(
+                mix_hc,
+                hc_mult * hidden_size,
+                dtype=torch.float32,
+                device=device,
+            )
+            * 0.01
+        )
+        scale = torch.ones(3, dtype=torch.float32, device=device)
+        base = torch.zeros(mix_hc, dtype=torch.float32, device=device)
+        workspace = deepseek_v4_mhc.MhcFusedWorkspace()
+        capture_stream = torch.cuda.Stream()
+        graph_pool = None
+
+        def capture_bucket(batch_size, sentinel_specs=()):
+            nonlocal graph_pool
+            x = torch.randn(
+                batch_size, hidden_size, dtype=torch.bfloat16, device=device
+            )
+            residual = torch.randn(
+                batch_size,
+                hc_mult,
+                hidden_size,
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            post = torch.ones(
+                batch_size, hc_mult, 1, dtype=torch.float32, device=device
+            )
+            comb = (
+                torch.eye(hc_mult, dtype=torch.float32, device=device)
+                .unsqueeze(0)
+                .expand(batch_size, -1, -1)
+                .contiguous()
+            )
+            probes = (
+                torch.empty_like(residual),
+                torch.empty_like(x),
+                torch.empty_like(post),
+                torch.empty_like(comb),
+            )
+            sentinel_probes = tuple(
+                torch.empty(shape, dtype=dtype, device=device)
+                for shape, dtype in sentinel_specs
+            )
+
+            workspace.reset()
+            warmup = deepseek_v4_mhc.mhc_fused_hc(
+                x,
+                residual,
+                post,
+                comb,
+                weight,
+                scale,
+                base,
+                1e-6,
+                1e-6,
+                2,
+                workspace,
+            )
+            expected_residual = _mhc_post_reference(x, residual, post, comb)
+            expected_pre = _mhc_pre_reference(
+                expected_residual,
+                weight,
+                scale,
+                base,
+                rms_eps=1e-6,
+                hc_eps=1e-6,
+                sinkhorn_iters=2,
+            )
+            separate_residual = deepseek_v4_mhc.mhc_post(x, residual, post, comb)
+            separate_pre = deepseek_v4_mhc.mhc_pre(
+                separate_residual,
+                weight,
+                scale,
+                base,
+                1e-6,
+                1e-6,
+                2,
+            )
+            torch.testing.assert_close(
+                separate_residual, expected_residual, rtol=3e-2, atol=7e-2
+            )
+            for actual, expected in zip(separate_pre, expected_pre):
+                torch.testing.assert_close(actual, expected, rtol=3e-2, atol=7e-2)
+            for actual, expected in zip(warmup, (expected_residual, *expected_pre)):
+                torch.testing.assert_close(actual, expected, rtol=3e-2, atol=7e-2)
+            warmup = deepseek_v4_mhc.mhc_fused_hc(
+                warmup[1],
+                warmup[0],
+                warmup[2],
+                warmup[3],
+                weight,
+                scale,
+                base,
+                1e-6,
+                1e-6,
+                2,
+                workspace,
+            )
+            torch.cuda.synchronize()
+            del warmup
+
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(
+                graph,
+                pool=graph_pool,
+                stream=capture_stream,
+            ):
+                workspace.reset()
+                state = deepseek_v4_mhc.mhc_fused_hc(
+                    x,
+                    residual,
+                    post,
+                    comb,
+                    weight,
+                    scale,
+                    base,
+                    1e-6,
+                    1e-6,
+                    2,
+                    workspace,
+                )
+                state = deepseek_v4_mhc.mhc_fused_hc(
+                    state[1],
+                    state[0],
+                    state[2],
+                    state[3],
+                    weight,
+                    scale,
+                    base,
+                    1e-6,
+                    1e-6,
+                    2,
+                    workspace,
+                )
+                for probe, value in zip(probes, state):
+                    probe.copy_(value)
+                # Allocate these after a potential workspace grow. Without the
+                # retired owner, the shared graph pool can recycle an older
+                # bucket's buffers here, and replaying that graph mutates them.
+                sentinels = tuple(
+                    torch.empty(shape, dtype=dtype, device=device)
+                    for shape, dtype in sentinel_specs
+                )
+                for probe, sentinel in zip(sentinel_probes, sentinels):
+                    probe.copy_(sentinel)
+
+            graph_pool = graph.pool()
+            for index, sentinel in enumerate(sentinels):
+                sentinel.fill_(index + 17)
+            torch.cuda.synchronize()
+            graph.replay()
+            torch.cuda.synchronize()
+            expected = tuple(probe.clone() for probe in probes)
+            static_inputs = (x, residual, post, comb)
+            sentinel_expected = tuple(probe.clone() for probe in sentinel_probes)
+            return SimpleNamespace(
+                graph=graph,
+                probes=probes,
+                expected=expected,
+                static_inputs=static_inputs,
+                sentinels=sentinels,
+                sentinel_probes=sentinel_probes,
+                sentinel_expected=sentinel_expected,
+            )
+
+        small = capture_bucket(1)
+        small_pp = next(iter(workspace._captured.values()))
+        small_ptrs = {
+            tensor.data_ptr() for buffer_set in small_pp.bufs for tensor in buffer_set
+        }
+        sentinel_specs = tuple(
+            (tuple(tensor.shape), tensor.dtype)
+            for buffer_set in small_pp.bufs
+            for tensor in buffer_set
+        )
+        del small_pp
+
+        large = capture_bucket(33, sentinel_specs)
+        self.assertEqual(len(workspace._retired_captured), 1)
+        self.assertEqual(
+            next(iter(workspace._captured.values())).bufs[0][0].shape[0], 64
+        )
+        self.assertFalse(small_ptrs & {tensor.data_ptr() for tensor in large.sentinels})
+
+        workspace.reset()
+        eager = workspace.get(128, hc_mult, hidden_size, device)
+        self.assertEqual(eager.bufs[0][0].shape[0], 128)
+        self.assertEqual(
+            next(iter(workspace._captured.values())).bufs[0][0].shape[0], 64
+        )
+
+        for _ in range(3):
+            small.graph.replay()
+            large.graph.replay()
+        torch.cuda.synchronize()
+
+        for captured in (small, large):
+            for actual, expected in zip(captured.probes, captured.expected):
+                torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+        for actual, expected in zip(large.sentinel_probes, large.sentinel_expected):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+        empty_x = torch.empty(0, hidden_size, dtype=torch.bfloat16, device=device)
+        empty_residual = torch.empty(
+            0, hc_mult, hidden_size, dtype=torch.bfloat16, device=device
+        )
+        empty_post = torch.empty(0, hc_mult, 1, dtype=torch.float32, device=device)
+        empty_comb = torch.empty(
+            0, hc_mult, hc_mult, dtype=torch.float32, device=device
+        )
+        workspace.reset()
+        empty_state = deepseek_v4_mhc.mhc_fused_hc(
+            empty_x,
+            empty_residual,
+            empty_post,
+            empty_comb,
+            weight,
+            scale,
+            base,
+            1e-6,
+            1e-6,
+            2,
+            workspace,
+        )
+        self.assertEqual(
+            tuple(tuple(tensor.shape) for tensor in empty_state),
+            (
+                (0, hc_mult, hidden_size),
+                (0, hidden_size),
+                (0, hc_mult, 1),
+                (0, hc_mult, hc_mult),
+            ),
+        )
+        empty_pre = deepseek_v4_mhc.mhc_pre(
+            empty_residual,
+            weight,
+            scale,
+            base,
+            1e-6,
+            1e-6,
+            2,
+        )
+        self.assertEqual(
+            tuple(tuple(tensor.shape) for tensor in empty_pre),
+            (
+                (0, hidden_size),
+                (0, hc_mult, 1),
+                (0, hc_mult, hc_mult),
+            ),
+        )
+        empty_post_result = deepseek_v4_mhc.mhc_post(
+            empty_x, empty_residual, empty_post, empty_comb
+        )
+        self.assertEqual(tuple(empty_post_result.shape), (0, hc_mult, hidden_size))
 
     def test_hc_head_matches_shape_contract(self):
         tokens, hc_mult, hidden = 2, 4, 6

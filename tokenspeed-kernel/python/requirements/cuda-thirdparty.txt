@@ -8,4 +8,4 @@ tokenspeed-fa3==3.0.0.post20260408
 tokenspeed-fa4==4.0.0.post20260524
 nvidia-cutlass-dsl==4.5.2
 tokenspeed-triton-kernels==1.0.0.post20260510
-tokenspeed-trtllm-kernel==1.2.1.post20260427
+tokenspeed-trtllm-kernel==1.3.0.post20260624
