@@ -523,8 +523,23 @@ def test_qwen_b200_agentic_uses_unpadded_cuda_graph_capture():
         / "test/ci/perf/qwen3.5-397b-a17b-nvfp4-evalscope-agentic-b200-8gpu.yaml"
     )
 
+    assert "debug" in task["triggers"]
     assert task["runner"]["labels"] == ["b200-8gpu"]
     assert "--disable-cuda-graph-padding" in task["server"]["command"]
+
+    matrix = build_matrix(repo_root / "test/ci", repo_root, "debug", "nvidia")
+    assert matrix["include"] == [
+        {
+            "name": "perf-qwen3.5-397b-a17b-nvfp4-agentic-b200-8gpu",
+            "type": "perf",
+            "config": (
+                "test/ci/perf/"
+                "qwen3.5-397b-a17b-nvfp4-evalscope-agentic-b200-8gpu.yaml"
+            ),
+            "runner": "b200-8gpu",
+            "priority": "normal",
+        }
+    ]
 
 
 def _checks_fixture():
