@@ -20,6 +20,9 @@
 
 from __future__ import annotations
 
+# Backend registration (side-effect imports)
+import tokenspeed_kernel.ops.transform.faster_hadamard_transform  # noqa: F401
+import tokenspeed_kernel.ops.transform.triton  # noqa: F401
 import torch
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import select_kernel
@@ -52,9 +55,6 @@ def hadamard_transform(
     Returns:
         Tensor with the same shape and dtype as x.
 
-    This API is the stable TokenSpeed kernel boundary for model-side Hadamard
-    transforms. Runtime code should call this function rather than importing a
-    third-party package or a concrete backend implementation directly.
     """
     if x.dim() == 0:
         raise ValueError("hadamard_transform requires at least one dimension")
@@ -92,12 +92,3 @@ def hadamard_transform(
         **shape_params,
     ):
         return kernel(x, scale=scale)
-
-
-# Backend registration (side-effect imports)
-import tokenspeed_kernel.ops.transform.triton  # noqa: E402,F401
-
-try:
-    import tokenspeed_kernel.ops.transform.faster_hadamard_transform  # noqa: E402,F401
-except Exception:
-    pass
