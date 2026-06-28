@@ -526,6 +526,7 @@ def test_qwen_b200_agentic_uses_unpadded_cuda_graph_capture():
     assert "debug" in task["triggers"]
     assert task["runner"]["labels"] == ["b200-8gpu"]
     assert "--disable-cuda-graph-padding" in task["server"]["command"]
+    assert "--draft-moe-backend flashinfer_cutlass" in task["server"]["command"]
 
     matrix = build_matrix(repo_root / "test/ci", repo_root, "debug", "nvidia")
     assert matrix["include"] == [

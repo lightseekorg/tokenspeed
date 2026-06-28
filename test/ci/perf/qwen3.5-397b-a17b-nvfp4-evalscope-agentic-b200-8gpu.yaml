@@ -23,6 +23,7 @@ server:
     --disable-cuda-graph-padding
     --mamba-ssm-dtype float32
     --moe-backend flashinfer_trtllm
+    --draft-moe-backend flashinfer_cutlass
     --trust-remote-code
     --attention-backend trtllm
     --chunked-prefill-size 2048
