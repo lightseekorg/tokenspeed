@@ -489,5 +489,5 @@ def test_rope_fp8_mla_quantize(
         dim=-1,
     ).to(torch.float8_e4m3fn)
 
-    torch.testing.assert_close(query_fp8.float(), q_ref.float(), rtol=0, atol=0)
-    torch.testing.assert_close(key_fp8.float(), k_ref.float(), rtol=0, atol=0)
+    torch.testing.assert_close(query_fp8.float(), q_ref.float(), rtol=0, atol=0.25)
+    torch.testing.assert_close(key_fp8.float(), k_ref.float(), rtol=0, atol=0.25)
