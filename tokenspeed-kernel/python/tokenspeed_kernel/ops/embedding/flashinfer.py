@@ -17,20 +17,69 @@
 
 """FlashInfer rotary embedding kernels."""
 
-from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.registry import error_fn
+import torch
+from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
+from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
-mla_rope_quantize_fp8 = error_fn
+
 
 if platform.is_nvidia:
-    try:
-        from flashinfer.rope import mla_rope_quantize_fp8
-    except ImportError:
-        pass
-elif platform.is_amd:
-    from tokenspeed_kernel.ops.embedding.triton import (
-        mla_rope_quantize_fp8_triton as mla_rope_quantize_fp8,
-    )
+    from flashinfer.rope import mla_rope_quantize_fp8
 
-__all__ = ["mla_rope_quantize_fp8"]
+    @register_kernel(
+        "embedding",
+        "rope_fp8",
+        name="flashinfer_embedding_rope_fp8",
+        solution="flashinfer",
+        capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+        signatures=format_signatures(
+            ("q_rope", "k_rope", "q_nope", "k_nope"),
+            "dense",
+            {torch.float16, torch.bfloat16},
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "is_neox": frozenset({True, False}),
+            "quantize_dtype": frozenset({torch.float8_e4m3fn}),
+            "has_scale_q_tensor": frozenset({False}),
+            "has_scale_kv_tensor": frozenset({False}),
+        },
+        tags={"throughput"},
+    )
+    def flashinfer_embedding_rope_fp8(
+        *,
+        q_rope: torch.Tensor,
+        k_rope: torch.Tensor,
+        q_nope: torch.Tensor,
+        k_nope: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        pos_ids: torch.Tensor,
+        q_rope_out: torch.Tensor,
+        k_rope_out: torch.Tensor,
+        q_nope_out: torch.Tensor,
+        k_nope_out: torch.Tensor,
+        is_neox: bool = True,
+        quantize_dtype: torch.dtype = torch.float8_e4m3fn,
+        quant_scale_q: float = 1.0,
+        quant_scale_kv: float = 1.0,
+        enable_pdl: bool = False,
+    ) -> None:
+        mla_rope_quantize_fp8(
+            q_rope=q_rope,
+            k_rope=k_rope,
+            q_nope=q_nope,
+            k_nope=k_nope,
+            cos_sin_cache=cos_sin_cache,
+            pos_ids=pos_ids,
+            is_neox=is_neox,
+            quantize_dtype=quantize_dtype,
+            q_rope_out=q_rope_out,
+            k_rope_out=k_rope_out,
+            q_nope_out=q_nope_out,
+            k_nope_out=k_nope_out,
+            quant_scale_q=quant_scale_q,
+            quant_scale_kv=quant_scale_kv,
+            enable_pdl=enable_pdl,
+        )

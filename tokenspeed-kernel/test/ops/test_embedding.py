@@ -22,7 +22,11 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.embedding import FusedSetKVBufferArg, apply_rope
+from tokenspeed_kernel.ops.embedding import (
+    FusedSetKVBufferArg,
+    apply_rope,
+    apply_rope_fp8,
+)
 
 
 @pytest.mark.parametrize("solution", ["triton", "cuda"])
@@ -388,3 +392,102 @@ def test_rope_fused_set_kv_buffer(
         rtol=0,
         atol=0,
     )
+
+
+@pytest.mark.parametrize("solution", [None, "triton", "flashinfer"])
+@pytest.mark.parametrize("is_neox", [True, False])
+def test_rope_fp8_mla_quantize(
+    device: str,
+    solution: str,
+    is_neox: bool,
+    require,
+) -> None:
+    torch.manual_seed(6)
+    dtype = torch.bfloat16
+    if solution is not None:
+        require("embedding", "rope_fp8", solution, dtype, "q_rope")
+
+    num_tokens = 13
+    num_heads = 4
+    nope_dim = 32
+    rope_dim = 64
+    max_position = 512
+    inv_freq = 1.0 / (
+        10000.0
+        ** (torch.arange(0, rope_dim, 2, device=device, dtype=torch.float32) / rope_dim)
+    )
+    t = torch.arange(max_position, device=device, dtype=torch.float32)
+    freqs = torch.einsum("i,j -> ij", t, inv_freq)
+    cos_sin_cache = torch.cat((freqs.cos(), freqs.sin()), dim=-1).contiguous()
+
+    positions = torch.randint(
+        0, max_position, (num_tokens,), device=device, dtype=torch.int64
+    )
+    cos, sin = cos_sin_cache.index_select(0, positions).chunk(2, dim=-1)
+    cos = cos.unsqueeze(1)
+    sin = sin.unsqueeze(1)
+    rope_ref = lambda x: (
+        torch.cat(
+            (
+                torch.chunk(x.float(), 2, dim=-1)[0] * cos
+                - torch.chunk(x.float(), 2, dim=-1)[1] * sin,
+                torch.chunk(x.float(), 2, dim=-1)[1] * cos
+                + torch.chunk(x.float(), 2, dim=-1)[0] * sin,
+            ),
+            dim=-1,
+        )
+        if is_neox
+        else torch.stack(
+            (
+                x.float()[..., ::2] * cos - x.float()[..., 1::2] * sin,
+                x.float()[..., 1::2] * cos + x.float()[..., ::2] * sin,
+            ),
+            dim=-1,
+        ).flatten(-2)
+    ).to(x.dtype)
+    q_rope = torch.randn(num_tokens, num_heads, rope_dim, device=device, dtype=dtype)
+    k_rope = torch.randn(num_tokens, num_heads, rope_dim, device=device, dtype=dtype)
+    q_nope = torch.randn(num_tokens, num_heads, nope_dim, device=device, dtype=dtype)
+    k_nope = torch.randn(num_tokens, num_heads, nope_dim, device=device, dtype=dtype)
+
+    query_fp8 = torch.empty(
+        num_tokens,
+        num_heads,
+        nope_dim + rope_dim,
+        device=device,
+        dtype=torch.float8_e4m3fn,
+    )
+    key_fp8 = torch.empty_like(query_fp8)
+    quant_scale_q = 1.0
+    quant_scale_kv = 2.0
+
+    apply_rope_fp8(
+        q_rope=q_rope,
+        k_rope=k_rope,
+        q_nope=q_nope,
+        k_nope=k_nope,
+        cos_sin_cache=cos_sin_cache,
+        pos_ids=positions,
+        q_rope_out=query_fp8[..., nope_dim:],
+        k_rope_out=key_fp8[..., nope_dim:],
+        q_nope_out=query_fp8[..., :nope_dim],
+        k_nope_out=key_fp8[..., :nope_dim],
+        is_neox=is_neox,
+        quant_scale_q=quant_scale_q,
+        quant_scale_kv=quant_scale_kv,
+        solution=solution,
+    )
+
+    q_rope_ref = rope_ref(q_rope)
+    k_rope_ref = rope_ref(k_rope)
+    q_ref = torch.cat(
+        (q_nope.float() / quant_scale_q, q_rope_ref.float() / quant_scale_q),
+        dim=-1,
+    ).to(torch.float8_e4m3fn)
+    k_ref = torch.cat(
+        (k_nope.float() / quant_scale_kv, k_rope_ref.float() / quant_scale_kv),
+        dim=-1,
+    ).to(torch.float8_e4m3fn)
+
+    torch.testing.assert_close(query_fp8.float(), q_ref.float(), rtol=0, atol=0)
+    torch.testing.assert_close(key_fp8.float(), k_ref.float(), rtol=0, atol=0)

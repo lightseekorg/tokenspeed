@@ -170,9 +170,149 @@ def apply_rope(
     )
 
 
-__all__ = ["FusedSetKVBufferArg", "apply_rope"]
+def apply_rope_fp8(
+    *,
+    q_rope: torch.Tensor,
+    k_rope: torch.Tensor,
+    q_nope: torch.Tensor,
+    k_nope: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    pos_ids: torch.Tensor,
+    q_rope_out: torch.Tensor,
+    k_rope_out: torch.Tensor,
+    q_nope_out: torch.Tensor,
+    k_nope_out: torch.Tensor,
+    is_neox: bool = True,
+    quantize_dtype: torch.dtype = torch.float8_e4m3fn,
+    quant_scale_q: float | torch.Tensor = 1.0,
+    quant_scale_kv: float | torch.Tensor = 1.0,
+    enable_pdl: bool = False,
+    solution: str | None = None,
+    override: str | None = None,
+) -> None:
+    """Apply MLA RoPE and quantize query/key parts to FP8.
+
+    Args:
+        q_rope: Query RoPE slice with shape [tokens, q_heads, rope_dim].
+        k_rope: Key RoPE slice with shape [tokens, kv_heads, rope_dim].
+        q_nope: Query non-RoPE slice with shape [tokens, q_heads, nope_dim].
+        k_nope: Key non-RoPE slice with shape [tokens, kv_heads, nope_dim].
+        cos_sin_cache: Packed RoPE cache as concat(cos, sin) on the last dim.
+        pos_ids: Token positions with shape [tokens].
+        q_rope_out: FP8 output buffer for rotated q_rope.
+        k_rope_out: FP8 output buffer for rotated k_rope.
+        q_nope_out: FP8 output buffer for q_nope.
+        k_nope_out: FP8 output buffer for k_nope.
+        is_neox: Whether to use Neox-style half-split rotation.
+        quantize_dtype: Output FP8 dtype. Currently only e4m3fn is supported.
+        quant_scale_q: Divisor applied before quantizing query tensors.
+        quant_scale_kv: Divisor applied before quantizing key tensors.
+        enable_pdl: Passed through to kernels that support PDL.
+        solution: Optional registered solution to select.
+        override: Optional exact kernel-name or solution override.
+    """
+    if quantize_dtype != torch.float8_e4m3fn:
+        raise TypeError(
+            f"embedding.rope_fp8 only supports e4m3fn, got {quantize_dtype}"
+        )
+    if q_rope.shape[-1] != k_rope.shape[-1]:
+        raise ValueError(
+            "q_rope and k_rope must have the same RoPE dim, got "
+            f"{q_rope.shape[-1]} and {k_rope.shape[-1]}"
+        )
+    if q_rope.shape[0] != k_rope.shape[0] or q_rope.shape[0] != pos_ids.numel():
+        raise ValueError(
+            "embedding.rope_fp8 token count mismatch: "
+            f"q={q_rope.shape[0]}, k={k_rope.shape[0]}, pos={pos_ids.numel()}"
+        )
+    for name, tensor, out in (
+        ("q_rope", q_rope, q_rope_out),
+        ("k_rope", k_rope, k_rope_out),
+        ("q_nope", q_nope, q_nope_out),
+        ("k_nope", k_nope, k_nope_out),
+    ):
+        if tensor.shape != out.shape:
+            raise ValueError(
+                f"{name} output shape mismatch: "
+                f"{tuple(tensor.shape)} vs {tuple(out.shape)}"
+            )
+        if out.dtype != quantize_dtype:
+            raise TypeError(
+                f"{name} output must have dtype {quantize_dtype}, got {out.dtype}"
+            )
+
+    pos_ids = pos_ids.flatten()
+    num_tokens = q_rope.shape[0]
+    if num_tokens == 0:
+        return
+
+    traits = {
+        "is_neox": bool(is_neox),
+        "quantize_dtype": quantize_dtype,
+        "has_scale_q_tensor": isinstance(quant_scale_q, torch.Tensor),
+        "has_scale_kv_tensor": isinstance(quant_scale_kv, torch.Tensor),
+    }
+    signature = format_signature(
+        q_rope=dense_tensor_format(q_rope.dtype),
+        k_rope=dense_tensor_format(k_rope.dtype),
+        q_nope=dense_tensor_format(q_nope.dtype),
+        k_nope=dense_tensor_format(k_nope.dtype),
+    )
+    kernel = select_kernel(
+        "embedding",
+        "rope_fp8",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+
+    shape_params = {
+        "num_tokens": num_tokens,
+        "q_heads": q_rope.shape[1],
+        "kv_heads": k_rope.shape[1],
+        "q_nope_dim": q_nope.shape[-1],
+        "k_nope_dim": k_nope.shape[-1],
+        "rope_dim": q_rope.shape[-1],
+        "is_neox": bool(is_neox),
+    }
+    ShapeCapture.get().record(
+        "embedding",
+        "rope_fp8",
+        kernel.name,
+        q_rope.dtype,
+        shape_params,
+    )
+    with kernel_scope(
+        "embedding",
+        "rope_fp8",
+        q_rope.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        kernel(
+            q_rope=q_rope,
+            k_rope=k_rope,
+            q_nope=q_nope,
+            k_nope=k_nope,
+            cos_sin_cache=cos_sin_cache,
+            pos_ids=pos_ids,
+            q_rope_out=q_rope_out,
+            k_rope_out=k_rope_out,
+            q_nope_out=q_nope_out,
+            k_nope_out=k_nope_out,
+            is_neox=is_neox,
+            quantize_dtype=quantize_dtype,
+            quant_scale_q=quant_scale_q,
+            quant_scale_kv=quant_scale_kv,
+            enable_pdl=enable_pdl,
+        )
+
+
+__all__ = ["FusedSetKVBufferArg", "apply_rope", "apply_rope_fp8"]
 
 
 # Backend registration (side-effect imports).
 import tokenspeed_kernel.ops.embedding.cuda  # noqa: E402,F401
+import tokenspeed_kernel.ops.embedding.flashinfer  # noqa: E402,F401
 import tokenspeed_kernel.ops.embedding.triton  # noqa: E402,F401
