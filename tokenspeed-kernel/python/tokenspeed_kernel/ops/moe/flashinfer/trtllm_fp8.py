@@ -79,6 +79,10 @@ if platform.is_nvidia:
         capability=CapabilityRequirement(
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(10, 0),
+            # Datacenter Blackwell only (sm_100/sm_103). TRT-LLM-Gen FP8 MoE is
+            # AOT-built for sm_100a/sm_103a — no consumer (sm_120/sm_121) or Thor
+            # (sm_110) binary. Mirrors the sibling mxfp4/nvfp4/mxint4 kernels.
+            max_arch_version=ArchVersion(10, 3),
         ),
         signatures=format_signatures(
             "x",

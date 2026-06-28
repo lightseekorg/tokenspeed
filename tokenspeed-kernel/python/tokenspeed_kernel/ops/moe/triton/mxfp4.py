@@ -187,7 +187,9 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
     scale_layout = layout.make_default_matmul_mxfp4_w_scale_layout(
         mx_axis=-2, num_warps=num_warps
     )
-    if platform.is_blackwell:
+    # Generic Triton matmul hints (persistent + epilogue subtiling), not a
+    # datacenter-only path — consumer Blackwell (sm_120/sm_121) wants them too.
+    if platform.is_blackwell_plus:
         constraints = {
             "is_persistent": True,
             "epilogue_subtile": 1,
