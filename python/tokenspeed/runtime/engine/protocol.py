@@ -21,7 +21,7 @@
 """Serving-facing engine protocol.
 
 ``EngineClient`` is the narrow surface that the OpenAI serving layer
-and ``http_server.py`` are allowed to depend on, letting callers stop
+and ``control_server.py`` are allowed to depend on, letting callers stop
 typing against the concrete ``AsyncLLM`` class.
 ``AsyncLLM(SchedulerControlClient, EngineClient)`` inherits the protocol so the
 conformance is a class-definition-time invariant rather than duck
@@ -42,7 +42,7 @@ Two categories stay concrete and are accessed via a narrower type
 (or via ``isinstance`` casts in the caller):
 
 1. Attribute escape hatches — ``rid_to_state``, ``server_status``.
-   ``http_server.py`` reads them directly for liveness / health
+   ``control_server.py`` reads them directly for liveness / health
    reasons that are out of scope for the serving-facing protocol.
 
 2. Purely internal coordination state — ``model_update_lock``,
@@ -107,7 +107,7 @@ class EngineClient(Protocol):
 
     # ---- Liveness state -------------------------------------------
     # Monotonic epoch-second timestamp of the last message received
-    # from the scheduler's shared output socket. ``http_server.py``
+    # from the scheduler's shared output socket. ``control_server.py``
     # reads this for health / idle-timeout logic.
     last_receive_tstamp: float
     gracefully_exit: bool
