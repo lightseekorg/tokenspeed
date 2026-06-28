@@ -41,6 +41,7 @@ from tokenspeed_kernel.ops.quantization import (
     quantize_nvfp4,
 )
 from tokenspeed_kernel.ops.sampling import argmax
+from tokenspeed_kernel.ops.transform import hadamard_transform
 from tokenspeed_kernel.selection import NoKernelFoundError
 
 __all__ = [
@@ -68,4 +69,6 @@ __all__ = [
     "quantize_mxfp4",
     # sampling
     "argmax",
+    # transform
+    "hadamard_transform",
 ]

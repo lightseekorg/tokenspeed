@@ -36,6 +36,7 @@ from tokenspeed_kernel.ops.attention.triton.dsa_topk import (
     dsa_prefill_topk,
 )
 from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
+from tokenspeed_kernel.ops.transform import hadamard_transform
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 from transformers import PretrainedConfig
@@ -202,30 +203,9 @@ def _glm_dsa_rope_scaling(
     return rope_scaling
 
 
-def _glm_dsa_hadamard_transform(x: torch.Tensor, *, scale: float) -> torch.Tensor:
-    try:
-        from tokenspeed_kernel.thirdparty.fast_hadamard_transform import (
-            hadamard_transform,
-        )
-
-        return hadamard_transform(x, scale=scale)
-    except Exception:
-        if x.shape[-1] == 128:
-            from tokenspeed_kernel.ops.transform.triton.hadamard import (
-                hadamard_transform_128,
-            )
-
-            return hadamard_transform_128(x, scale=scale)
-        raise RuntimeError(
-            "GLM DSA indexer requires fast_hadamard_transform or the in-tree "
-            "Triton Hadamard fallback for 128-wide indexer tensors."
-        )
-
-
 def _glm_dsa_hadamard_rotate(x: torch.Tensor) -> torch.Tensor:
-
     shape = x.shape
-    return _glm_dsa_hadamard_transform(
+    return hadamard_transform(
         x.to(torch.bfloat16).reshape(-1, shape[-1]).contiguous(),
         scale=shape[-1] ** -0.5,
     ).reshape(shape)
@@ -255,7 +235,7 @@ def _glm_dsa_hadamard_rotate_pair(
         ),
         dim=0,
     )
-    rotated = _glm_dsa_hadamard_transform(
+    rotated = hadamard_transform(
         combined,
         scale=head_dim**-0.5,
     )

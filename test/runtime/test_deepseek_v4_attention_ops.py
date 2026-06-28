@@ -21,6 +21,7 @@ from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
     indexer_mxfp4_paged_gather,
     persistent_topk,
 )
+from tokenspeed_kernel.ops.transform import hadamard_transform
 
 from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
     deepseek_v4_swa_scale_dim,
@@ -179,8 +180,6 @@ def _mxfp4_bytes_and_scales(
 
 
 def _hadamard_rotate(row: torch.Tensor) -> torch.Tensor:
-    from tokenspeed_kernel.thirdparty.fast_hadamard_transform import hadamard_transform
-
     shape = row.shape
     return hadamard_transform(
         row.to(torch.bfloat16).reshape(-1, shape[-1]).contiguous(),

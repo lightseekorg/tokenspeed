@@ -58,6 +58,7 @@ from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     write_deepseek_v4_indexer_mxfp4_cache_cuda as _triton_write_indexer_mxfp4_cache_cuda,
 )
+from tokenspeed_kernel.ops.transform import hadamard_transform
 
 from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
     DEEPSEEK_V4_FP8_MAX,
@@ -185,16 +186,6 @@ def _e2m1_values(nibbles: torch.Tensor) -> torch.Tensor:
 
 
 def _deepseek_v4_hadamard_rotate(x: torch.Tensor) -> torch.Tensor:
-    try:
-        from tokenspeed_kernel.thirdparty.fast_hadamard_transform import (
-            hadamard_transform,
-        )
-    except Exception as exc:
-        raise RuntimeError(
-            "DeepSeek V4 CSA indexer requires fast_hadamard_transform. "
-            "Build/install `tokenspeed-kernel/python` before serving V4."
-        ) from exc
-
     shape = x.shape
     rotated = hadamard_transform(
         x.to(torch.bfloat16).reshape(-1, shape[-1]).contiguous(),

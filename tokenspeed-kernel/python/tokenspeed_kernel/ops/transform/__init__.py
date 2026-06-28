@@ -19,3 +19,85 @@
 # SOFTWARE.
 
 from __future__ import annotations
+
+import torch
+from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
+from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+
+__all__ = ["hadamard_transform"]
+
+
+# ===-----------------------------------------------------------------------===#
+# Hadamard Transform Kernels
+# ===-----------------------------------------------------------------------===#
+
+
+def hadamard_transform(
+    x: torch.Tensor,
+    *,
+    scale: float = 1.0,
+    override: str | None = None,
+    solution: str | None = None,
+) -> torch.Tensor:
+    """Apply a Hadamard transform along the last dimension.
+
+    Args:
+        x: Input tensor. Registered implementations currently accept dense CUDA
+            tensors. The Triton implementation supports last dimension 128.
+        scale: Multiplicative output scale applied after the transform.
+        override: Optional exact kernel override name.
+        solution: Optional registered solution to force through normal selection.
+
+    Returns:
+        Tensor with the same shape and dtype as x.
+
+    This API is the stable TokenSpeed kernel boundary for model-side Hadamard
+    transforms. Runtime code should call this function rather than importing a
+    third-party package or a concrete backend implementation directly.
+    """
+    if x.dim() == 0:
+        raise ValueError("hadamard_transform requires at least one dimension")
+
+    traits = {
+        "last_dim": x.shape[-1],
+    }
+    signature = format_signature(x=dense_tensor_format(x.dtype))
+    kernel = select_kernel(
+        "transform",
+        "hadamard_transform",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+
+    shape_params = {
+        "shape": tuple(x.shape),
+        "last_dim": x.shape[-1],
+    }
+    ShapeCapture.get().record(
+        "transform",
+        "hadamard_transform",
+        kernel.name,
+        x.dtype,
+        shape_params,
+    )
+
+    with kernel_scope(
+        "transform",
+        "hadamard_transform",
+        x.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(x, scale=scale)
+
+
+# Backend registration (side-effect imports)
+import tokenspeed_kernel.ops.transform.triton  # noqa: E402,F401
+
+try:
+    import tokenspeed_kernel.ops.transform.faster_hadamard_transform  # noqa: E402,F401
+except Exception:
+    pass
