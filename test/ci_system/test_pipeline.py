@@ -516,7 +516,7 @@ def test_build_matrix_sort_is_stable_within_priority(tmp_path):
     ]
 
 
-def test_qwen_b200_agentic_uses_unpadded_cuda_graph_capture():
+def test_qwen_b200_agentic_uses_cutlass_draft_moe_for_debug_ci():
     repo_root = Path(__file__).resolve().parents[2]
     task = load_yaml(
         repo_root
@@ -525,7 +525,7 @@ def test_qwen_b200_agentic_uses_unpadded_cuda_graph_capture():
 
     assert "debug" in task["triggers"]
     assert task["runner"]["labels"] == ["b200-8gpu"]
-    assert "--disable-cuda-graph-padding" in task["server"]["command"]
+    assert "--disable-cuda-graph-padding" not in task["server"]["command"]
     assert "--draft-moe-backend flashinfer_cutlass" in task["server"]["command"]
 
     matrix = build_matrix(repo_root / "test/ci", repo_root, "debug", "nvidia")

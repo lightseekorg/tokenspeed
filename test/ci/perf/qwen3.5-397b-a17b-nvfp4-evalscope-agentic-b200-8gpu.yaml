@@ -20,7 +20,6 @@ server:
     --moe-tp-size 8
     --gpu-memory-utilization 0.6
     --max-num-seqs 128
-    --disable-cuda-graph-padding
     --mamba-ssm-dtype float32
     --moe-backend flashinfer_trtllm
     --draft-moe-backend flashinfer_cutlass
