@@ -439,9 +439,17 @@ class DFlash(BaseDrafter):
         self._fused_kv_workspace_capacity = 0
         self._fused_kv_workspace_dtype = None
         self._fused_kv_proj_workspace = None
-        self._fused_kv_mm_out_supported = True
+        # torch.mm(out=...) is always used; workspace pre-allocated at warmup.
         self._fused_kv_k_buffers = []
         self._fused_kv_v_buffers = []
+        # Aux stream for overlapping KV cache write with draft block preparation
+        self._kv_aux_stream: torch.cuda.Stream | None = None
+        self._kv_fork_event: torch.cuda.Event | None = None
+        self._kv_join_event: torch.cuda.Event | None = None
+        if torch.cuda.is_available():
+            self._kv_aux_stream = torch.cuda.Stream(device=self.device)
+            self._kv_fork_event = torch.cuda.Event()
+            self._kv_join_event = torch.cuda.Event()
         try:
             layers = self.draft_model_runner.model.layers
             if not layers:
@@ -575,14 +583,7 @@ class DFlash(BaseDrafter):
         self._ensure_fused_workspace(total_ctx, ctx_hidden.dtype)
 
         proj_out_2d = self._fused_kv_proj_workspace[:total_ctx]
-        if self._fused_kv_mm_out_supported:
-            try:
-                torch.mm(ctx_hidden, self._fused_kv_flat_weight_t, out=proj_out_2d)
-            except Exception:
-                self._fused_kv_mm_out_supported = False
-                proj_out_2d = torch.mm(ctx_hidden, self._fused_kv_flat_weight_t)
-        else:
-            proj_out_2d = torch.mm(ctx_hidden, self._fused_kv_flat_weight_t)
+        torch.mm(ctx_hidden, self._fused_kv_flat_weight_t, out=proj_out_2d)
 
         proj_out = proj_out_2d.view(
             total_ctx, self._fused_kv_n_layers, self._fused_kv_layer_out_dim
@@ -648,7 +649,9 @@ class DFlash(BaseDrafter):
         return self._draft_native(current_tokens)
 
     @nvtx_range("dflash_native_draft", color="purple")
-    def _draft_native(self, current_tokens: torch.Tensor) -> torch.Tensor:
+    def _draft_native(
+        self, current_tokens: torch.Tensor, kv_sync_event: torch.cuda.Event = None
+    ) -> torch.Tensor:
         bs = current_tokens.shape[0]
         req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
         prefix_lens = self.draft_seq_lens_buf[:bs].clone()
@@ -708,7 +711,8 @@ class DFlash(BaseDrafter):
         )
 
         flat_ids = block_ids.reshape(-1)
-        input_embeds = self.embed_tokens(flat_ids)
+        input_embeds = self.embed_tokens(flat_ids, reduce_results=False)
+
         with torch.inference_mode():
             logits_output = self.draft_model_runner.forward(
                 ctx=ctx,
@@ -717,6 +721,7 @@ class DFlash(BaseDrafter):
                 out_cache_loc=cache_locs,
                 captured_hidden_states=None,
                 input_embeds=input_embeds,
+                kv_sync_event=kv_sync_event,
             )
 
         draft_hidden = logits_output.hidden_states
@@ -752,6 +757,23 @@ class DFlash(BaseDrafter):
     ) -> torch.Tensor:
         if not hasattr(self, "target_model"):
             raise RuntimeError("DFLASH drafter is not bound to a target model.")
+
+        from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_cuda_graph_phase
+
+        decode_only = base_ctx.num_extends == 0
+        capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        can_overlap = (
+            decode_only
+            and self._fused_kv_enabled
+            and self._kv_aux_stream is not None
+            and (capturing or not get_is_cuda_graph_phase())
+        )
+        if can_overlap:
+            return self._run_overlap(
+                base_ctx, logits_output, output_tokens, accept_lengths
+            )
+
+        # Default sequential path
         self._update_native_cache_from_target(base_ctx, logits_output, accept_lengths)
         current_tokens = self._current_tokens_from_output(
             output_tokens,
@@ -760,3 +782,68 @@ class DFlash(BaseDrafter):
             self.spec_num_tokens,
         )
         return self.draft(current_tokens)
+
+    def _run_overlap(
+        self,
+        base_ctx: ForwardContext,
+        logits_output: LogitsProcessorOutput,
+        output_tokens: torch.Tensor,
+        accept_lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        """Overlap _update_native_cache_from_target (aux stream) with draft (main).
+
+        Requires decode-only batch and fused KV path. Falls back to sequential
+        run() otherwise.
+        """
+        if not hasattr(self, "target_model"):
+            raise RuntimeError("DFLASH drafter is not bound to a target model.")
+
+        decode_only = base_ctx.num_extends == 0
+        can_overlap = (
+            decode_only
+            and self._fused_kv_enabled
+            and self._kv_aux_stream is not None
+        )
+        if not can_overlap:
+            return self.run(
+                base_ctx, logits_output, output_tokens, accept_lengths
+            )
+
+        hidden = logits_output.hidden_states
+        if hidden is None:
+            raise RuntimeError("DFLASH requires target hidden states.")
+
+        # draft_seq_lens_buf on main stream (draft block prep depends on it)
+        bs = base_ctx.bs
+        req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
+        old_lens = self.runtime_states.valid_cache_lengths.index_select(
+            0, req_pool_indices
+        )
+        new_lens = old_lens.to(torch.int32) + accept_lengths[:bs].to(torch.int32)
+        max_draft_prefix = self.req_to_page.shape[1] * self.page_size - self.spec_num_tokens
+        new_lens.clamp_(max=max_draft_prefix)
+        self.draft_seq_lens_buf[:bs].copy_(new_lens)
+
+        # Fork: aux stream runs full KV write (project + fused GEMM + scatter)
+        positions = self.input_buffers.positions_buf[: base_ctx.input_num_tokens]
+        cache_locs = self.input_buffers.out_cache_loc_buf[: base_ctx.input_num_tokens]
+        main_stream = torch.cuda.current_stream()
+        self._kv_fork_event.record(main_stream)
+
+        if not (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()):
+            hidden.record_stream(self._kv_aux_stream)
+            positions.record_stream(self._kv_aux_stream)
+            cache_locs.record_stream(self._kv_aux_stream)
+            if self._fused_kv_proj_workspace is not None:
+                self._fused_kv_proj_workspace.record_stream(self._kv_aux_stream)
+
+        with torch.cuda.stream(self._kv_aux_stream):
+            self._kv_aux_stream.wait_event(self._kv_fork_event)
+            self._write_native_cache(hidden, positions, cache_locs, decode_only=True)
+            self._kv_join_event.record(self._kv_aux_stream)
+
+        # Main stream: draft block prep overlaps with aux KV write
+        current_tokens = self._current_tokens_from_output(
+            output_tokens, accept_lengths, 0, self.spec_num_tokens,
+        )
+        return self._draft_native(current_tokens, kv_sync_event=self._kv_join_event)
