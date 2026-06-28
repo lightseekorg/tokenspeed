@@ -16,6 +16,7 @@ from pipeline import (
     get_runner_specific_env,
     is_amd_runner,
     is_gb200_runner,
+    load_yaml,
     resolve_score_threshold_for_runner,
     should_run_nvidia_gpu_cleanup,
     validate_task,
@@ -513,6 +514,17 @@ def test_build_matrix_sort_is_stable_within_priority(tmp_path):
         ("a", "b200-4gpu"),
         ("b", "gb200-4gpu"),
     ]
+
+
+def test_qwen_b200_agentic_uses_unpadded_cuda_graph_capture():
+    repo_root = Path(__file__).resolve().parents[2]
+    task = load_yaml(
+        repo_root
+        / "test/ci/perf/qwen3.5-397b-a17b-nvfp4-evalscope-agentic-b200-8gpu.yaml"
+    )
+
+    assert task["runner"]["labels"] == ["b200-8gpu"]
+    assert "--disable-cuda-graph-padding" in task["server"]["command"]
 
 
 def _checks_fixture():
