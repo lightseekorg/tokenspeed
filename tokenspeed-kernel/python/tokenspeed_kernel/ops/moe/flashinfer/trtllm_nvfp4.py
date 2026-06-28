@@ -196,7 +196,7 @@ if platform.is_nvidia:
         )
         # up (W3) dequant alpha folded with the GEMM2-input requant -> output1_scale_scalar
         w.g1_scale_c = torch.nn.Parameter(
-            (w2_input_scale_quant * w13_input_scale * up_ws2).to(torch.float32),
+            w2_input_scale_quant * (w13_input_scale * up_ws2).to(torch.float32),
             requires_grad=False,
         )
         # Store intermediate_size_per_partition for the executor
