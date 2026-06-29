@@ -164,12 +164,6 @@ def _fused_norm_rope_stacked_scatter(
     kv_size = num_kv_heads * head_dim
     half_rotary_dim = rotary_dim // 2
     BLOCK_HD = triton.next_power_of_2(head_dim)
-
-    if positions.dtype != torch.int64:
-        positions = positions.to(torch.int64)
-    if loc.dtype != torch.int64:
-        loc = loc.to(torch.int64)
-
     k_ptrs, v_ptrs = _get_kv_buffer_ptrs(k_buffers, v_buffers)
     dst_row_stride = k_buffers[0].stride(0)
 
@@ -331,10 +325,6 @@ def _fused_norm_rope_stacked(
     kv_size = num_kv_heads * head_dim
     half_rotary_dim = rotary_dim // 2
     BLOCK_HD = triton.next_power_of_2(head_dim)
-
-    if positions.dtype != torch.int64:
-        positions = positions.to(torch.int64)
-
     expected_shape = (n_layers, total_ctx, num_kv_heads, head_dim)
     if k_out is None:
         k_out = torch.empty(expected_shape, dtype=kv.dtype, device=kv.device)

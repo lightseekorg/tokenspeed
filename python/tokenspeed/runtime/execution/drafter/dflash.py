@@ -28,6 +28,7 @@ from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.drafter._dflash_fused_kv import (
     _fused_norm_rope_stacked,
     _fused_norm_rope_stacked_scatter,
+    _get_kv_buffer_ptrs,
 )
 from tokenspeed.runtime.execution.drafter.base import BaseDrafter
 from tokenspeed.runtime.execution.forward_batch_info import (
@@ -516,7 +517,22 @@ class DFlash(BaseDrafter):
                 for layer in layers
             ]
 
+            self._fused_kv_k_ptrs, self._fused_kv_v_ptrs = _get_kv_buffer_ptrs(
+                self._fused_kv_k_buffers, self._fused_kv_v_buffers
+            )
+
             self._fused_kv_enabled = True
+
+            max_total_ctx = self.input_buffers.max_bs * self.spec_num_tokens
+            ws_dtype = self.draft_model_runner.model.fc.weight.dtype
+            self._fused_kv_proj_workspace = torch.empty(
+                (max_total_ctx, n_layers * self._fused_kv_layer_out_dim),
+                dtype=ws_dtype,
+                device=self.device,
+            )
+            self._fused_kv_workspace_capacity = max_total_ctx
+            self._fused_kv_workspace_dtype = ws_dtype
+
             logger.info(
                 "DFLASH fused KV materialization enabled. "
                 "n_layers=%d, num_kv_heads=%d, head_dim=%d",
@@ -530,23 +546,22 @@ class DFlash(BaseDrafter):
             self._fused_kv_enabled = False
 
     def _ensure_fused_workspace(self, total_ctx: int, dtype: torch.dtype) -> None:
-        """Ensure the projection workspace is large enough."""
+        """Ensure the projection workspace is large enough.
+
+        The workspace is pre-allocated at init to max_bs * spec_num_tokens,
+        so this should always be a no-op.
+        """
         if (
             self._fused_kv_workspace_capacity >= total_ctx
             and self._fused_kv_workspace_dtype == dtype
             and self._fused_kv_proj_workspace is not None
         ):
             return
-        new_cap = max(1, total_ctx)
-        if self._fused_kv_workspace_capacity > 0:
-            new_cap = max(new_cap, self._fused_kv_workspace_capacity * 2)
-        self._fused_kv_proj_workspace = torch.empty(
-            (new_cap, self._fused_kv_n_layers * self._fused_kv_layer_out_dim),
-            dtype=dtype,
-            device=self.device,
+        raise RuntimeError(
+            f"DFLASH fused KV workspace too small: need {total_ctx}, "
+            f"have {self._fused_kv_workspace_capacity}. "
+            "This should not happen — workspace is pre-allocated at init."
         )
-        self._fused_kv_workspace_capacity = new_cap
-        self._fused_kv_workspace_dtype = dtype
 
     def _write_native_cache_fused(
         self,
