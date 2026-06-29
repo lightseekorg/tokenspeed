@@ -352,5 +352,71 @@ class TestControlPortArg(unittest.TestCase):
         self.assertIsNone(result.opts.control_port)
 
 
+class TestMetricsEndpointMounting(unittest.TestCase):
+    """``build_server(enable_metrics=True)`` must mount the ``/metrics``
+    Prometheus endpoint on the control server so runtime metrics are
+    scrapeable in the ``ts serve`` path (previously returned empty/404)."""
+
+    def test_metrics_route_absent_by_default(self):
+        from tokenspeed.runtime.entrypoints.http_server import _metrics_route_mounted
+
+        # The module-level ``app`` must not have /metrics unless explicitly
+        # mounted. (Other test classes may have mounted it; this checks the
+        # helper, not the global app state.)
+        bare = FastAPI()
+        self.assertFalse(_metrics_route_mounted(bare))
+
+    def test_build_server_mounts_metrics_when_enabled(self):
+        import os
+        import tempfile
+
+        # prometheus_client requires PROMETHEUS_MULTIPROC_DIR for multiprocess
+        # mode; set a temp dir so add_prometheus_middleware doesn't fail.
+        tmpdir = tempfile.mkdtemp()
+        prev = os.environ.get("PROMETHEUS_MULTIPROC_DIR")
+        os.environ["PROMETHEUS_MULTIPROC_DIR"] = tmpdir
+        try:
+            from tokenspeed.runtime.entrypoints.http_server import (
+                _metrics_route_mounted,
+                app,
+                build_server,
+            )
+
+            already = _metrics_route_mounted(app)
+            build_server(
+                gateway_url="http://127.0.0.1:1",
+                engine_grpc_addr="127.0.0.1:1",
+                host="127.0.0.1",
+                port=0,  # don't bind
+                enable_metrics=True,
+            )
+            self.assertTrue(
+                _metrics_route_mounted(app),
+                "/metrics route must be mounted when enable_metrics=True",
+            )
+        finally:
+            if prev is None:
+                os.environ.pop("PROMETHEUS_MULTIPROC_DIR", None)
+            else:
+                os.environ["PROMETHEUS_MULTIPROC_DIR"] = prev
+            import shutil
+
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_build_server_skips_metrics_when_disabled(self):
+        from tokenspeed.runtime.entrypoints.http_server import build_server
+
+        # enable_metrics=False (default) must not raise and must not require
+        # PROMETHEUS_MULTIPROC_DIR.
+        server = build_server(
+            gateway_url="http://127.0.0.1:1",
+            engine_grpc_addr="127.0.0.1:1",
+            host="127.0.0.1",
+            port=0,
+            enable_metrics=False,
+        )
+        self.assertIsNotNone(server)
+
+
 if __name__ == "__main__":
     unittest.main()

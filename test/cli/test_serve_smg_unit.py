@@ -40,6 +40,7 @@ from tokenspeed.cli.serve_smg import (
     DEEPSEEK_V4_REASONING_PARSER,
     DEEPSEEK_V4_TOOL_CALL_PARSER,
     _args_with_default_model_parsers,
+    _engine_args_enable_metrics,
     _gateway_args_with_default_log_level,
     _gateway_args_with_default_policy,
     _gateway_args_with_default_port,
@@ -369,6 +370,31 @@ def test_prewarm_swallows_download_errors():
     ):
         # Must not raise — smg's own retry path is the fallback.
         _prewarm_hf_tokenizer("nvidia/Qwen3.5-397B-A17B-NVFP4")
+
+
+def test_engine_args_enable_metrics_detects_bare_flag():
+    assert _engine_args_enable_metrics(["--enable-metrics"]) is True
+
+
+def test_engine_args_enable_metrics_detects_equals_true():
+    assert _engine_args_enable_metrics(["--enable-metrics=true"]) is True
+    assert _engine_args_enable_metrics(["--enable-metrics=1"]) is True
+    assert _engine_args_enable_metrics(["--enable-metrics=yes"]) is True
+
+
+def test_engine_args_enable_metrics_rejects_equals_false():
+    assert _engine_args_enable_metrics(["--enable-metrics=false"]) is False
+    assert _engine_args_enable_metrics(["--enable-metrics=0"]) is False
+
+
+def test_engine_args_enable_metrics_absent_returns_false():
+    assert _engine_args_enable_metrics(["--model", "/tmp/x"]) is False
+    assert _engine_args_enable_metrics([]) is False
+
+
+def test_engine_args_enable_metrics_among_other_flags():
+    args = ["--model", "/tmp/x", "--enable-metrics", "--tensor-parallel-size", "4"]
+    assert _engine_args_enable_metrics(args) is True
 
 
 @pytest.mark.asyncio
