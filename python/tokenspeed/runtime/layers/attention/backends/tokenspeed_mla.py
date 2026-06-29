@@ -406,7 +406,7 @@ class CuteDSLMLABackend(AttentionBackend):
         # When the buffer is aliased to a peer backend (e.g. drafter aliasing
         # the target's kv_indices), the peer's replay has already populated it
         # with identical content.
-        if req_to_page is not None and not getattr(self, "_block_table_aliased", False):
+        if req_to_page is not None and not self._block_table_aliased:
             self._create_block_kv_indices(
                 bs,
                 metadata.block_kv_indices.shape[1],

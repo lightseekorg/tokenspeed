@@ -663,5 +663,9 @@ class ArgmaxKernel(ReductionBase):
             and local_row_idx < tiler_mn[0]
             and (self.cluster_n == 1 or bidy == 0)
         ):
+            # A row whose elements never beat -inf (all-NaN / all -inf) leaves
+            # the argmax at its 0xFFFFFFFF sentinel; emit the in-range index 0.
+            if warp_argmax == Int32(0xFFFFFFFF):
+                warp_argmax = Int32(0)
             mO_max[local_row_idx] = warp_max.to(mO_max.element_type)
             mO_idx[local_row_idx] = warp_argmax.to(mO_idx.element_type)
