@@ -774,22 +774,18 @@ def test_gluon_moe_gemm1_dynamic_mxfp4_gather_scales_match_torch_gfx950(
         dtype=router_logits.dtype,
     )
     gemm1_input, gemm1_scale = _quantize_mxfp4_for_test(hidden_states)
-    precision_config = gluon_moe.PrecisionConfig(
-        a_mx_scale=gemm1_scale,
-        a_microblock_size=MXFP4_BLOCK,
-        b_mx_scale=weights.w13_precision_config.b_mx_scale,
-        b_microblock_size=MXFP4_BLOCK,
-        out_dtype=torch.bfloat16,
-    )
 
     with torch.no_grad():
         actual = gluon_moe.gluon_mxfp_ragged_matmul(
             gemm1_input,
             weights.w13_weight,
             weights.w13_bias,
+            w_mx_scale=weights.w13_precision_config.b_mx_scale,
+            x_mx_scale=gemm1_scale,
+            x_format="e2m1",
+            out_dtype=weights.w13_precision_config.out_dtype,
             a_ragged_metadata=ragged_metadata,
             gather_indx=gather_indx,
-            precision_config=precision_config,
             fused_activation=_swiglu_activation(),
         )
         expected = _compute_torch_gemm1_mxfp4_reference(
