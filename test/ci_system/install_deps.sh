@@ -61,6 +61,57 @@ echo "WORKSPACE=${WORKSPACE}"
 echo "=========================================="
 
 # ============================================================
+# Step 0: Clear precompiled / JIT caches
+# ============================================================
+# Wipe every per-user kernel / JIT cache so the install steps below and
+# the first `ts serve` invocation rebuild Triton, FlashInfer, Inductor
+# and CUDA driver caches from scratch. Used to rule out stale cached
+# cubins as the cause of runner-only "illegal memory access" failures.
+echo "=== Step 0: Clear precompiled / JIT caches ==="
+CACHE_PATHS=(
+    "${HOME}/.triton"
+    "${HOME}/.cache/triton"
+    "${HOME}/.cache/tokenspeed_triton"
+    "${HOME}/.cache/flashinfer"
+    "${HOME}/.cache/flashinfer_jit_cache"
+    "${HOME}/.cache/torch"
+    "${HOME}/.cache/torch_extensions"
+    "${HOME}/.cache/torch_inductor"
+    "${HOME}/.cache/torchinductor"
+    "${HOME}/.cache/torchinductor_${USER:-runner}"
+    "${HOME}/.nv/ComputeCache"
+    "${HOME}/.cache/nv/ComputeCache"
+    "${HOME}/.cache/nvidia"
+    "${HOME}/.cache/cutlass"
+    "${HOME}/.cache/cuda"
+    "/tmp/torchinductor_${USER:-runner}"
+    "/tmp/triton-cache"
+    "/tmp/flashinfer"
+    "/tmp/.flashinfer"
+)
+for p in "${CACHE_PATHS[@]}"; do
+    if [ -e "${p}" ]; then
+        sz="$(du -sh "${p}" 2>/dev/null | awk '{print $1}')"
+        echo "[clear-cache] removing ${p} (${sz:-?})"
+        rm -rf "${p}" 2>/dev/null || sudo rm -rf "${p}" 2>/dev/null || \
+            echo "[clear-cache] WARN: failed to remove ${p}"
+    else
+        echo "[clear-cache] absent: ${p}"
+    fi
+done
+# Drop the on-disk caches that ship inside installed wheels too; they
+# get reinstalled (and any new content re-downloaded) by Step 3-7 below.
+for pkg_cache in \
+    /usr/local/lib/python3.12/dist-packages/flashinfer/data \
+    /usr/local/lib/python3.12/dist-packages/flashinfer_jit_cache \
+    /usr/local/lib/python3.12/dist-packages/tokenspeed_triton/.cache \
+    /usr/local/lib/python3.12/dist-packages/triton/.cache; do
+    if [ -e "${pkg_cache}" ]; then
+        echo "[clear-cache] note: leaving wheel-provided ${pkg_cache} (pip reinstall handles it)"
+    fi
+done
+
+# ============================================================
 # Step 1: Determine CUDA index and FlashInfer architecture
 # ============================================================
 echo "=== Step 1: Determine CUDA index and architecture ==="
