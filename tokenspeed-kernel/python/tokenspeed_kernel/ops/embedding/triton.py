@@ -483,7 +483,51 @@ def mla_rope_quantize_fp8_triton(
     _fp8_quantize_3d_strided(k_nope, k_nope_out, quant_scale_kv, enable_pdl=enable_pdl)
 
 
-mla_rope_quantize_fp8 = mla_rope_quantize_fp8_triton
+@register_kernel(
+    "embedding",
+    "rope",
+    name="triton_embedding_rope",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
+    signatures=format_signatures(
+        ("query", "key"), "dense", {torch.float16, torch.bfloat16}
+    ),
+    priority=Priority.PORTABLE,
+    traits={
+        "partial_rotary": frozenset({True, False}),
+        "is_neox": frozenset({True, False}),
+        "has_fused_kv": frozenset({True, False}),
+        "has_q_out": frozenset({True, False}),
+        "has_k_out": frozenset({True, False}),
+    },
+    tags={"portability"},
+)
+def triton_embedding_rope(
+    *,
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool = True,
+    rotary_dim: int | None = None,
+    fused_set_kv_buffer_arg: Any = None,
+    output_q_rope: torch.Tensor | None = None,
+    output_k_rope: torch.Tensor | None = None,
+    enable_pdl: bool = False,
+) -> None:
+    apply_rope_triton(
+        positions=positions,
+        query=query,
+        key=key,
+        head_size=head_size,
+        cos_sin_cache=cos_sin_cache,
+        is_neox=is_neox,
+        rotary_dim=rotary_dim,
+        fused_set_kv_buffer_arg=fused_set_kv_buffer_arg,
+        output_q_rope=output_q_rope,
+        output_k_rope=output_k_rope,
+    )
 
 
 @register_kernel(
@@ -540,51 +584,4 @@ def triton_embedding_rope_fp8(
         quant_scale_q=quant_scale_q,
         quant_scale_kv=quant_scale_kv,
         enable_pdl=enable_pdl,
-    )
-
-
-@register_kernel(
-    "embedding",
-    "rope",
-    name="triton_embedding_rope",
-    solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
-    signatures=format_signatures(
-        ("query", "key"), "dense", {torch.float16, torch.bfloat16}
-    ),
-    priority=Priority.PORTABLE,
-    traits={
-        "partial_rotary": frozenset({True, False}),
-        "is_neox": frozenset({True, False}),
-        "has_fused_kv": frozenset({True, False}),
-        "has_q_out": frozenset({True, False}),
-        "has_k_out": frozenset({True, False}),
-    },
-    tags={"portability"},
-)
-def triton_embedding_rope(
-    *,
-    positions: torch.Tensor,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    head_size: int,
-    cos_sin_cache: torch.Tensor,
-    is_neox: bool = True,
-    rotary_dim: int | None = None,
-    fused_set_kv_buffer_arg: Any = None,
-    output_q_rope: torch.Tensor | None = None,
-    output_k_rope: torch.Tensor | None = None,
-    enable_pdl: bool = False,
-) -> None:
-    apply_rope_triton(
-        positions=positions,
-        query=query,
-        key=key,
-        head_size=head_size,
-        cos_sin_cache=cos_sin_cache,
-        is_neox=is_neox,
-        rotary_dim=rotary_dim,
-        fused_set_kv_buffer_arg=fused_set_kv_buffer_arg,
-        output_q_rope=output_q_rope,
-        output_k_rope=output_k_rope,
     )
