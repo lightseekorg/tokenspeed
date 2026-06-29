@@ -82,6 +82,8 @@ struct DecodeOperation : public ForwardOperationBase {
 using ForwardOperation = std::variant<PrefillOperation, DecodeOperation>;
 
 struct FlatForwardOperation {
+    enum class Order { kPrefillFirst, kPreserve };
+
     std::vector<std::string> request_ids;
     std::vector<std::int32_t> request_pool_indices;
     std::vector<std::int32_t> input_lengths;
@@ -120,9 +122,11 @@ struct FlatForwardOperation {
     // (null hole = 0, no compaction); there is no base-offset companion.
     std::map<std::string, std::vector<std::vector<std::int32_t>>> flat_block_tables;
 
-    explicit FlatForwardOperation(std::vector<ForwardOperation> ops) {
-        std::stable_partition(ops.begin(), ops.end(),
-                              [](const ForwardOperation& a) { return std::holds_alternative<PrefillOperation>(a); });
+    explicit FlatForwardOperation(std::vector<ForwardOperation> ops, Order order = Order::kPrefillFirst) {
+        if (order == Order::kPrefillFirst) {
+            std::stable_partition(ops.begin(), ops.end(),
+                                  [](const ForwardOperation& a) { return std::holds_alternative<PrefillOperation>(a); });
+        }
         for (auto& op : ops) {
             std::visit(
                 [this](auto& inner) {
