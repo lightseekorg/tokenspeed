@@ -56,7 +56,7 @@ logger = logging.getLogger(__name__)
 # Block constraint from flashinfer: block_num % (128 / page_size) == 0
 TRTLLM_BLOCK_CONSTRAINT = 128
 
-# Shared workspace buffer for fused kernels (150 MB, zero-initialized).
+# Shared workspace buffer for fused kernels (256 MB, zero-initialized).
 # Zero-init is required for the kernel's internal semaphore mechanism.
 _trtllm_workspace_buffer = None
 
@@ -66,7 +66,7 @@ def get_trtllm_workspace_buffer(device):
     global _trtllm_workspace_buffer
     if _trtllm_workspace_buffer is None:
         _trtllm_workspace_buffer = torch.zeros(
-            150 * 1024 * 1024,
+            256 * 1024 * 1024,
             dtype=torch.uint8,
             device=device,
         )

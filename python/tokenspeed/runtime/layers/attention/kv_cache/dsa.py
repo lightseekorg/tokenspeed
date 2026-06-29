@@ -21,15 +21,9 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.ops.attention.triton.dsa_sparse_layout import (
-    pack_sparse_decode_kv,
-)
 from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
 
-from tokenspeed.runtime.layers.attention.configs.dsa import (
-    dsa_index_k_row_bytes,
-    dsa_sparse_decode_row_bytes,
-)
+from tokenspeed.runtime.layers.attention.configs.dsa import dsa_index_k_row_bytes
 from tokenspeed.runtime.layers.attention.kv_cache.mla import (
     MLATokenToKVPool,
     _get_tensor_size_bytes,
@@ -51,29 +45,12 @@ class DSATokenToKVPool(MLATokenToKVPool):
         **kwargs,
     ):
         self.index_head_dim = int(index_head_dim)
-        kv_lora_rank = kwargs.get("kv_lora_rank", args[4] if len(args) > 4 else None)
-        qk_rope_head_dim = kwargs.get(
-            "qk_rope_head_dim",
-            args[5] if len(args) > 5 else None,
-        )
-        self.sparse_decode_kv_row_bytes = dsa_sparse_decode_row_bytes(
-            kv_lora_rank,
-            qk_rope_head_dim,
-        )
         self.index_k_row_bytes = dsa_index_k_row_bytes(
             self.index_head_dim,
         )
         self._index_k_available = self.index_k_row_bytes > 0
         super().__init__(*args, **kwargs)
         with self.memory_saver_adapter.region():
-            self.sparse_decode_kv_buffer = [
-                torch.zeros(
-                    (self.size + self.page_size, self.sparse_decode_kv_row_bytes),
-                    dtype=torch.uint8,
-                    device=self.device,
-                )
-                for _ in range(self.layer_num)
-            ]
             self.index_k_buffer = [
                 (
                     torch.zeros(
@@ -91,21 +68,15 @@ class DSATokenToKVPool(MLATokenToKVPool):
             ]
 
     def _get_page_size_bytes(self):
-        sparse_decode_size_bytes = self.sparse_decode_kv_row_bytes
         index_size_bytes = self.index_k_row_bytes
         return (
             super()._get_page_size_bytes()
-            + self.page_size * self.layer_num * sparse_decode_size_bytes
             + self.page_size * self.layer_num * index_size_bytes
         )
 
     def get_kv_size_bytes(self):
-        return (
-            super().get_kv_size_bytes()
-            + _get_tensor_size_bytes(self.sparse_decode_kv_buffer)
-            + _get_tensor_size_bytes(
-                [buf for buf in self.index_k_buffer if buf is not None]
-            )
+        return super().get_kv_size_bytes() + _get_tensor_size_bytes(
+            [buf for buf in self.index_k_buffer if buf is not None]
         )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
@@ -114,8 +85,6 @@ class DSATokenToKVPool(MLATokenToKVPool):
             return
         tgt_loc_flat = tgt_loc.view(-1).long()
         src_loc_flat = src_loc.view(-1).long()
-        for buf in self.sparse_decode_kv_buffer:
-            buf[tgt_loc_flat] = buf[src_loc_flat]
         for buf in self.index_k_buffer:
             if buf is not None:
                 # Packed FP8 index-K is block-split per page, so a single
@@ -129,31 +98,6 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 src_slot = src_loc_flat % ps
                 fp8_view[tgt_page, tgt_slot] = fp8_view[src_page, src_slot]
                 scale_view[tgt_page, tgt_slot] = scale_view[src_page, src_slot]
-
-    def set_mla_kv_buffer(
-        self,
-        layer,
-        loc: torch.Tensor,
-        cache_k_nope: torch.Tensor,
-        cache_k_rope: torch.Tensor,
-    ):
-        super().set_mla_kv_buffer(layer, loc, cache_k_nope, cache_k_rope)
-        if self.quant_method == "per_token_head":
-            return
-        if cache_k_nope.dtype != torch.bfloat16:
-            cache_k_nope = cache_k_nope.to(torch.bfloat16)
-            cache_k_rope = cache_k_rope.to(torch.bfloat16)
-        pack_sparse_decode_kv(
-            out=self.sparse_decode_kv_buffer[layer.layer_id],
-            loc=loc,
-            cache_k_nope=cache_k_nope,
-            cache_k_rope=cache_k_rope,
-        )
-
-    def get_sparse_decode_kv_buffer(self, layer_id: int) -> torch.Tensor:
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id)
-        return self.sparse_decode_kv_buffer[layer_id]
 
     def has_index_k_buffer(self) -> bool:
         return self._index_k_available
@@ -281,10 +225,6 @@ class DSATokenToKVPool(MLATokenToKVPool):
         data_ptrs = list(data_ptrs)
         data_lens = list(data_lens)
         item_lens = list(item_lens)
-        for buf in self.sparse_decode_kv_buffer:
-            data_ptrs.append(buf.data_ptr())
-            data_lens.append(buf.nbytes)
-            item_lens.append(buf[0].nbytes * self.page_size)
         for buf in self.index_k_buffer:
             if buf is not None:
                 data_ptrs.append(buf.data_ptr())
@@ -300,14 +240,11 @@ class DSATokenToKVPool(MLATokenToKVPool):
             base_count = self.layer_num
         return [
             layer_offsets
-            + [
-                start_idx + base_count + layer_id,
-                *(
-                    [start_idx + base_count + self.layer_num + layer_id]
-                    if self.index_k_row_bytes > 0
-                    else []
-                ),
-            ]
+            + (
+                [start_idx + base_count + layer_id]
+                if self.index_k_row_bytes > 0
+                else []
+            )
             for layer_id, layer_offsets in enumerate(offsets)
         ]
 
