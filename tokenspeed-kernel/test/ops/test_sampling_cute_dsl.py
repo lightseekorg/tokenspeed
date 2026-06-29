@@ -286,6 +286,39 @@ def test_argmax_returns_first_index_on_ties_like_torch():
     torch.testing.assert_close(out, torch.argmax(x, dim=-1), atol=0, rtol=0)
 
 
+@pytest.mark.parametrize(
+    "N", [4096, MODEL_VOCABS["kimi_k2_5"], MODEL_VOCABS["qwen3_5"]]
+)
+def test_argmax_in_range_for_nan_and_neg_inf_rows(N):
+    """A row whose elements never beat ``-inf`` (all-NaN or all ``-inf``) must
+    still yield an *in-range* index, not the ``0xFFFFFFFF`` (-1) sentinel.
+
+    The kernel suppresses NaN (IEEE ``NaN > x`` is false) and the warp/block/
+    cluster max reductions are NaN-suppressing, so NaN never wins; the argmax
+    sentinels are seeded to 0 so such rows resolve to index 0. ``N`` covers both
+    the single-block (``cluster_n == 1``) and the cluster reduction path (fp32
+    ``N > 32K``), since the cluster path has its own sentinel seed.
+    """
+    _need_cuda()
+    nan, ninf = float("nan"), float("-inf")
+    x = torch.full((4, N), -100.0, device="cuda", dtype=torch.float32)
+    x[0].fill_(nan)  # all-NaN -> sentinel row, must map to a valid index (0)
+    x[1].fill_(ninf)  # all -inf -> never beats the -inf init, also sentinel
+    x[2, 2000] = 5.0  # mixed: real max at 2000 ...
+    x[2, 100] = nan  # ... plus a NaN the kernel must ignore
+    # row 3 stays a plain non-degenerate row as a control.
+    x[3, 1234] = 0.0
+
+    out = cute_argmax(x)
+    assert ((out >= 0) & (out < N)).all(), f"out-of-range index: {out.tolist()}"
+    # Degenerate rows resolve to index 0 (lowest-index tie among equal maxima).
+    assert out[0].item() == 0
+    assert out[1].item() == 0
+    # Mixed row: NaN is suppressed, so the kernel returns the finite argmax.
+    assert out[2].item() == 2000
+    assert out[3].item() == 1234
+
+
 def test_argmax_mtp_pattern():
     """Matches the test_argmax_mtp_case in TRT-LLM: one hot row at vocab[1].
 
