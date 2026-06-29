@@ -170,3 +170,106 @@ echo ""
 echo "=========================================="
 echo "Installed successfully! CUDA_VERSION=${CUDA_VERSION}, SM=${SM}"
 echo "=========================================="
+
+# ============================================================
+# Step 9: Dump environment info
+# ============================================================
+# Captured at install time so post-mortems on runner-only failures (e.g.
+# illegal memory access seen on the b200-8gpu agentic perf job that does
+# not reproduce locally) can diff toolchain / driver / pinned-package
+# versions without rerunning the job. Best-effort: never fail the
+# install stage if a probe tool is missing.
+echo ""
+echo "=========================================="
+echo "=== Step 9: Environment info dump      ==="
+echo "=========================================="
+echo "--- env vars ---"
+echo "CUDA_VERSION=${CUDA_VERSION}"
+echo "SM=${SM}"
+echo "CUINDEX=${CUINDEX}"
+echo "FI_ARCH=${FI_ARCH}"
+echo "INSTALL_TOKENSPEED_MLA_FROM_SOURCE=${INSTALL_TOKENSPEED_MLA_FROM_SOURCE:-unset}"
+echo "PIP_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL:-unset}"
+echo "MAX_JOBS=${MAX_JOBS:-unset}"
+echo "CI_RUNNER_LABEL=${CI_RUNNER_LABEL:-unset}"
+echo "WORKSPACE=${WORKSPACE}"
+
+echo "--- OS / kernel / glibc ---"
+{ cat /etc/os-release || true; } 2>&1 | sed 's/^/[os-release] /'
+uname -a 2>&1 | sed 's/^/[uname] /' || true
+ldd --version 2>&1 | head -n 1 | sed 's/^/[glibc] /' || true
+
+echo "--- NVIDIA driver / GPUs ---"
+nvidia-smi --query-gpu=index,name,driver_version,vbios_version,pstate,memory.total,compute_cap \
+    --format=csv 2>&1 | sed 's/^/[nvidia-smi] /' || true
+nvidia-smi -q -d CLOCK,POWER,TEMPERATURE 2>&1 | head -n 40 | sed 's/^/[nvidia-smi] /' || true
+
+echo "--- CUDA toolkit ---"
+{ command -v nvcc && nvcc --version; } 2>&1 | sed 's/^/[nvcc] /' || true
+{ ls -l /usr/local/cuda 2>/dev/null; ls /usr/local/cuda/version.json 2>/dev/null \
+    && cat /usr/local/cuda/version.json; } 2>&1 | sed 's/^/[cuda] /' || true
+
+echo "--- Python ---"
+python3 --version 2>&1 | sed 's/^/[python] /' || true
+python3 -c "import sys; print(sys.executable); print(sys.prefix)" 2>&1 \
+    | sed 's/^/[python] /' || true
+python3 -m pip --version 2>&1 | sed 's/^/[pip] /' || true
+
+echo "--- Key Python packages ---"
+python3 - <<'PY' 2>&1 | sed 's/^/[pkg] /' || true
+from importlib.metadata import PackageNotFoundError, version
+pkgs = [
+    "torch",
+    "triton",
+    "flashinfer-python",
+    "flashinfer-cubin",
+    "nvidia-cutlass-dsl",
+    "nvidia-cutlass-dsl-libs-cu12",
+    "nvidia-cutlass-dsl-libs-cu13",
+    "nvidia-nccl-cu12",
+    "nvidia-nccl-cu13",
+    "nvidia-nvshmem-cu12",
+    "nvidia-nvshmem-cu13",
+    "nvidia-cudnn-cu12",
+    "nvidia-cudnn-cu13",
+    "cuda-python",
+    "cuda-bindings",
+    "tokenspeed",
+    "tokenspeed-kernel",
+    "tokenspeed-mla",
+    "tokenspeed-scheduler",
+    "tokenspeed-smg",
+    "tokenspeed-grpc-servicer",
+    "tokenspeed-grpc-proto",
+    "transformers",
+    "huggingface-hub",
+    "evalscope",
+]
+for p in pkgs:
+    try:
+        print(f"{p}=={version(p)}")
+    except PackageNotFoundError:
+        print(f"{p}==<not installed>")
+PY
+
+echo "--- torch CUDA build info ---"
+python3 - <<'PY' 2>&1 | sed 's/^/[torch] /' || true
+try:
+    import torch
+    print("version:", torch.__version__)
+    print("cuda:", torch.version.cuda)
+    print("cudnn:", torch.backends.cudnn.version() if torch.cuda.is_available() else None)
+    print("nccl:", torch.cuda.nccl.version() if torch.cuda.is_available() else None)
+    print("device_count:", torch.cuda.device_count())
+    for i in range(torch.cuda.device_count()):
+        print(f"device{i}:", torch.cuda.get_device_name(i), torch.cuda.get_device_capability(i))
+except Exception as exc:
+    print("torch probe failed:", exc)
+PY
+
+echo "--- pip freeze ---"
+python3 -m pip freeze 2>&1 | sed 's/^/[freeze] /' || true
+
+echo "=========================================="
+echo "=== End of environment info dump      ==="
+echo "=========================================="
