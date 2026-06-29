@@ -39,7 +39,6 @@ if platform.is_nvidia:
         capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
         signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
         priority=Priority.PERFORMANT,
-        tags={"throughput"},
     )
     def fast_hadamard_transform(
         x: torch.Tensor,
