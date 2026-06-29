@@ -170,7 +170,7 @@ def apply_rope(
     )
 
 
-def apply_rope_fp8(
+def apply_rope_mla(
     *,
     q_rope: torch.Tensor,
     k_rope: torch.Tensor,
@@ -213,7 +213,7 @@ def apply_rope_fp8(
     """
     if quantize_dtype != torch.float8_e4m3fn:
         raise TypeError(
-            f"embedding.rope_fp8 only supports e4m3fn, got {quantize_dtype}"
+            f"embedding.rope_mla only supports e4m3fn, got {quantize_dtype}"
         )
     if q_rope.shape[-1] != k_rope.shape[-1]:
         raise ValueError(
@@ -222,7 +222,7 @@ def apply_rope_fp8(
         )
     if q_rope.shape[0] != k_rope.shape[0] or q_rope.shape[0] != pos_ids.numel():
         raise ValueError(
-            "embedding.rope_fp8 token count mismatch: "
+            "embedding.rope_mla token count mismatch: "
             f"q={q_rope.shape[0]}, k={k_rope.shape[0]}, pos={pos_ids.numel()}"
         )
     for name, tensor, out in (
@@ -260,7 +260,7 @@ def apply_rope_fp8(
     )
     kernel = select_kernel(
         "embedding",
-        "rope_fp8",
+        "rope_mla",
         signature,
         traits=traits,
         solution=solution,
@@ -278,14 +278,14 @@ def apply_rope_fp8(
     }
     ShapeCapture.get().record(
         "embedding",
-        "rope_fp8",
+        "rope_mla",
         kernel.name,
         q_rope.dtype,
         shape_params,
     )
     with kernel_scope(
         "embedding",
-        "rope_fp8",
+        "rope_mla",
         q_rope.dtype,
         kernel_name=kernel.name,
         **shape_params,
@@ -309,7 +309,7 @@ def apply_rope_fp8(
         )
 
 
-__all__ = ["FusedSetKVBufferArg", "apply_rope", "apply_rope_fp8"]
+__all__ = ["FusedSetKVBufferArg", "apply_rope", "apply_rope_mla"]
 
 
 # Backend registration (side-effect imports).

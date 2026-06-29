@@ -21,7 +21,7 @@
 """Shared utilities for MLA FP8 attention backends."""
 
 import torch
-from tokenspeed_kernel.ops.embedding import apply_rope_fp8
+from tokenspeed_kernel.ops.embedding import apply_rope_mla
 
 from tokenspeed.runtime.utils.pdl import pdl_enabled
 
@@ -58,7 +58,7 @@ def mla_fused_rope_fp8_quantize(
     if q_nope.size(0) == 0:
         return query_fp8, key_fp8
 
-    apply_rope_fp8(
+    apply_rope_mla(
         q_rope=q_pe,
         k_rope=k_pe,
         q_nope=q_nope,

@@ -30,8 +30,8 @@ if platform.is_nvidia:
 
     @register_kernel(
         "embedding",
-        "rope_fp8",
-        name="flashinfer_embedding_rope_fp8",
+        "rope_mla",
+        name="flashinfer_embedding_rope_mla",
         solution="flashinfer",
         capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
         signatures=format_signatures(
@@ -48,7 +48,7 @@ if platform.is_nvidia:
         },
         tags={"throughput"},
     )
-    def flashinfer_embedding_rope_fp8(
+    def flashinfer_embedding_rope_mla(
         *,
         q_rope: torch.Tensor,
         k_rope: torch.Tensor,

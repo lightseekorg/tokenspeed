@@ -532,8 +532,8 @@ def triton_embedding_rope(
 
 @register_kernel(
     "embedding",
-    "rope_fp8",
-    name="triton_embedding_rope_fp8",
+    "rope_mla",
+    name="triton_embedding_rope_mla",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
     signatures=format_signatures(
@@ -550,7 +550,7 @@ def triton_embedding_rope(
     },
     tags={"portability"},
 )
-def triton_embedding_rope_fp8(
+def triton_embedding_rope_mla(
     *,
     q_rope: torch.Tensor,
     k_rope: torch.Tensor,

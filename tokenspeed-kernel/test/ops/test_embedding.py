@@ -25,7 +25,7 @@ import torch
 from tokenspeed_kernel.ops.embedding import (
     FusedSetKVBufferArg,
     apply_rope,
-    apply_rope_fp8,
+    apply_rope_mla,
 )
 
 
@@ -396,7 +396,7 @@ def test_rope_fused_set_kv_buffer(
 
 @pytest.mark.parametrize("solution", [None, "triton", "flashinfer"])
 @pytest.mark.parametrize("is_neox", [True, False])
-def test_rope_fp8_mla_quantize(
+def test_rope_mla_quantize(
     device: str,
     solution: str,
     is_neox: bool,
@@ -405,7 +405,7 @@ def test_rope_fp8_mla_quantize(
     torch.manual_seed(6)
     dtype = torch.bfloat16
     if solution is not None:
-        require("embedding", "rope_fp8", solution, dtype, "q_rope")
+        require("embedding", "rope_mla", solution, dtype, "q_rope")
 
     num_tokens = 13
     num_heads = 4
@@ -461,7 +461,7 @@ def test_rope_fp8_mla_quantize(
     quant_scale_q = 1.0
     quant_scale_kv = 2.0
 
-    apply_rope_fp8(
+    apply_rope_mla(
         q_rope=q_rope,
         k_rope=k_rope,
         q_nope=q_nope,
