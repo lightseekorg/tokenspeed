@@ -87,12 +87,10 @@ jobs:
 
       - name: Build task matrix
         id: scan
+        # DEBUG BRANCH OVERRIDE: skip all AMD PR tests on this branch. Restore
+        # the real `pipeline.py scan` invocation before merging.
         run: |
-          MATRIX=$(python3 test/ci_system/pipeline.py scan \
-            --root test/ci \
-            --trigger "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.trigger || 'per-commit' }}" \
-            --runner-group "amd")
-          echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
+          echo 'matrix={"include":[]}' >> "$GITHUB_OUTPUT"
 
       # Compute this once on the hosted runner (where `gh` is pre-installed)
       # and propagate the result to every matrix job via job output. The

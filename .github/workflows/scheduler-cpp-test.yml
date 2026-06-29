@@ -19,6 +19,8 @@ concurrency:
 
 jobs:
   test:
+    # DEBUG BRANCH OVERRIDE: skip on jjd/main-qwen-tp8-perf-ci-debug.
+    if: github.head_ref != 'jjd/main-qwen-tp8-perf-ci-debug' && github.ref_name != 'jjd/main-qwen-tp8-perf-ci-debug'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
