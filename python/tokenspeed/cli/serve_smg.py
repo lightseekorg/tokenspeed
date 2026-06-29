@@ -604,14 +604,22 @@ async def run_smg(
                     pass
 
 
-def _engine_args_enable_metrics(engine_args: list[str]) -> bool:
-    """Return True if ``--enable-metrics`` is present in the engine argv.
+def _raw_argv_enable_metrics(raw_argv: list[str]) -> bool:
+    """Return True if ``--enable-metrics`` is present in the raw argv.
 
-    ``--enable-metrics`` is a store-true flag (no value), so it is detected by
-    a bare token match. Both ``--enable-metrics`` and ``--enable-metrics=true``
-    are accepted; ``--no-enable-metrics`` is not a valid form for this flag.
+    ``--enable-metrics`` is a ``store_true`` flag: it takes no value, so
+    ``--enable-metrics=false`` is not a valid form. We inspect the **raw**
+    argv (before ``split_argv`` normalization) because the splitter rewrites
+    ``--flag=value`` into ``['--flag', 'value']``, which would make the bare
+    ``--enable-metrics`` token match even when the user wrote
+    ``--enable-metrics=false`` — and would also leave a stray ``false`` token
+    that the engine's argparse rejects.
+
+    Only the bare ``--enable-metrics`` token (or ``--enable-metrics=1`` /
+    ``--enable-metrics=true``) enables metrics. ``--enable-metrics=false`` /
+    ``--enable-metrics=0`` explicitly disables it.
     """
-    for token in engine_args:
+    for token in raw_argv:
         if token == "--enable-metrics":
             return True
         if token.startswith("--enable-metrics="):
@@ -631,6 +639,9 @@ def run_smg_from_args(args: argparse.Namespace, raw_argv: list[str]) -> None:
     print_logo()
 
     _check_serve_extra_installed()
+    # Detect --enable-metrics from the raw argv BEFORE split_argv normalizes
+    # --flag=value forms. See _raw_argv_enable_metrics docstring for why.
+    enable_metrics = _raw_argv_enable_metrics(raw_argv)
     split = split_argv(raw_argv)
     engine_args, gateway_args = _args_with_default_model_parsers(
         split.engine, split.gateway
@@ -641,7 +652,6 @@ def run_smg_from_args(args: argparse.Namespace, raw_argv: list[str]) -> None:
     model_id = _user_model_id(gateway_args)
     if model_id is not None:
         _prewarm_hf_tokenizer(model_id)
-    enable_metrics = _engine_args_enable_metrics(engine_args)
     rc = asyncio.run(
         run_smg(
             engine_args=engine_args,
