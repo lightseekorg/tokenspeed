@@ -732,7 +732,6 @@ def triton_scaled_mm(
     name="triton_mm_fp8_blockscale",
     solution="triton",
     capability=CapabilityRequirement(
-        min_arch_version=ArchVersion(9, 5),
         vendors=frozenset({"amd", "nvidia"}),
     ),
     signatures=_MXFP8_FORMAT_SIGNATURES,
