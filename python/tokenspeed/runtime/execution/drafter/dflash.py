@@ -122,7 +122,9 @@ class DFlash(BaseDrafter):
             raise ValueError("Native DFLASH requires draft attention components.")
 
         max_bs = self.input_buffers.max_bs
-        self.draft_seq_lens_buf = torch.zeros_like(self.input_buffers.seq_lens_buf)
+        self.draft_seq_lens_buf = torch.zeros(
+            (max_bs,), dtype=torch.int32, device=self.device
+        )
         self.draft_out_cache_loc_buf = torch.empty(
             (max_bs * self.spec_num_tokens,),
             dtype=torch.int32,
@@ -146,11 +148,28 @@ class DFlash(BaseDrafter):
         self.block_offsets = torch.arange(
             self.spec_num_tokens, dtype=torch.int64, device=self.device
         )
-        self.block_ids_buf = torch.empty(
-            (max_bs, self.spec_num_tokens), dtype=torch.int32, device=self.device
+        self.block_ids_buf = torch.full(
+            (max_bs, self.spec_num_tokens),
+            self.mask_token_id,
+            dtype=torch.int32,
+            device=self.device,
         )
         self.block_positions_buf = torch.empty(
             (max_bs, self.spec_num_tokens), dtype=torch.int64, device=self.device
+        )
+        self.next_tokens_buf = torch.empty(
+            (max_bs, self.spec_num_tokens), dtype=torch.int32, device=self.device
+        )
+        self.current_tokens_buf = torch.empty(
+            (max_bs,), dtype=torch.int32, device=self.device
+        )
+        self.decode_offsets_buf = (
+            torch.arange(max_bs, dtype=torch.int64, device=self.device)
+            * self.spec_num_tokens
+            - 1
+        )
+        self.gather_indices_buf = torch.empty(
+            (max_bs,), dtype=torch.int64, device=self.device
         )
 
     def bind_target_model(self, target_model) -> None:
@@ -215,6 +234,7 @@ class DFlash(BaseDrafter):
     def _greedy_sample_from_vocab_parallel_head(
         self,
         hidden_states: torch.Tensor,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if not hasattr(self.lm_head, "weight") or not hasattr(
             self.lm_head, "shard_indices"
@@ -223,7 +243,11 @@ class DFlash(BaseDrafter):
             logits = self.logits_processor._get_logits(
                 hidden_states, self.lm_head, metadata
             )
-            return torch.argmax(logits, dim=-1).to(torch.int32)
+            argmax = torch.argmax(logits, dim=-1)
+            if out is not None:
+                out.copy_(argmax.view_as(out))
+                return out
+            return argmax.to(torch.int32)
 
         shard = self.lm_head.shard_indices
         weight = self.lm_head.weight
@@ -278,6 +302,9 @@ class DFlash(BaseDrafter):
 
         tp_size = int(self.logits_processor.tp_size)
         if tp_size == 1:
+            if out is not None:
+                out.copy_(global_ids.view_as(out))
+                return out
             return global_ids.to(torch.int32)
 
         needed = tp_size * chunk_len
@@ -300,7 +327,11 @@ class DFlash(BaseDrafter):
         gathered_max = gathered_max.view(tp_size, chunk_len)
         gathered_ids = gathered_ids.view(tp_size, chunk_len)
         best_rank = torch.argmax(gathered_max, dim=0).unsqueeze(0)
-        return torch.gather(gathered_ids, 0, best_rank).view(-1).to(torch.int32)
+        result = torch.gather(gathered_ids, 0, best_rank).view(-1)
+        if out is not None:
+            out.copy_(result.view_as(out))
+            return out
+        return result.to(torch.int32)
 
     @nvtx_range("dflash_update_native_cache", color="purple")
     def _update_native_cache_from_target(
@@ -618,26 +649,30 @@ class DFlash(BaseDrafter):
             self._fused_kv_rotary_dim,
         )
 
-    @staticmethod
     def _current_tokens_from_output(
+        self,
         output_tokens: torch.Tensor,
         accept_lengths: torch.Tensor,
         num_extends: int,
         spec_num_tokens: int,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         bs = accept_lengths.shape[0]
-        current = torch.empty((bs,), dtype=torch.int32, device=output_tokens.device)
+        current = out if out is not None else self.current_tokens_buf[:bs]
         if num_extends > 0:
             current[:num_extends] = output_tokens[:num_extends]
         num_decodes = bs - num_extends
         if num_decodes > 0:
-            offsets = (
-                torch.arange(
-                    num_decodes, dtype=torch.int64, device=output_tokens.device
-                )
-                * spec_num_tokens
-                - 1
-                + num_extends
+            indices = self.gather_indices_buf[:num_decodes]
+            torch.add(
+                self.decode_offsets_buf[:num_decodes],
+                accept_lengths[num_extends:bs],
+                out=indices,
+            )
+            if num_extends > 0:
+                indices.add_(num_extends)
+            torch.index_select(
+                output_tokens, 0, indices, out=current[num_extends:]
             )
             # ``accept_lengths`` can be clamped to 0 at the context limit.  The
             # request will be finished by the scheduler, but the drafter still
@@ -669,16 +704,17 @@ class DFlash(BaseDrafter):
     ) -> torch.Tensor:
         bs = current_tokens.shape[0]
         req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
-        prefix_lens = self.draft_seq_lens_buf[:bs].clone()
-        seq_lens_after = self.draft_seq_lens_buf[:bs]
-        seq_lens_after.copy_(prefix_lens + int(self.spec_num_tokens))
+        prefix_lens = self.draft_seq_lens_buf[:bs]
+        seq_lens_after = prefix_lens + int(self.spec_num_tokens)
 
         block_ids = self.block_ids_buf[:bs]
-        block_ids.fill_(int(self.mask_token_id))
-        block_ids[:, 0].copy_(current_tokens.to(torch.int32))
+        # NOTE: callers (run/_run_overlap) write current_tokens directly into
+        # block_ids_buf[:bs, 0] before invoking _draft_native
         block_positions = self.block_positions_buf[:bs]
-        block_positions.copy_(
-            prefix_lens.to(torch.int64).unsqueeze(1) + self.block_offsets
+        torch.add(
+            prefix_lens.unsqueeze(1),
+            self.block_offsets,
+            out=block_positions,
         )
 
         cache_locs = self.draft_out_cache_loc_buf[: bs * self.spec_num_tokens]
@@ -746,19 +782,12 @@ class DFlash(BaseDrafter):
             )
         draft_hidden = draft_hidden.view(bs, self.spec_num_tokens, self.hidden_size)
 
-        next_tokens = torch.empty(
-            (bs, self.spec_num_tokens), dtype=torch.int32, device=self.device
+        next_tokens = self.next_tokens_buf[:bs]
+        next_tokens[:, 0] = block_ids[:, 0]
+        self._greedy_sample_from_vocab_parallel_head(
+            draft_hidden[:, 1:, :].reshape(-1, self.hidden_size),
+            out=next_tokens[:, 1:],
         )
-        next_tokens[:, 0] = current_tokens.to(torch.int32)
-        sampled = self._greedy_sample_from_vocab_parallel_head(
-            draft_hidden[:, 1:, :].reshape(-1, self.hidden_size)
-        )
-        next_tokens[:, 1:] = sampled.view(bs, self.spec_num_tokens - 1)
-        # Defense-in-depth: keep draft ids non-negative before they are written
-        # to future_input_map and embedded by the next verify forward, mirroring
-        # the EAGLE drafter's draft_ids.clamp_(min=0) guard. A negative id (the
-        # -1 NaN sentinel) would otherwise index the embedding table out of
-        # bounds (CUDA illegal memory access).
         next_tokens.clamp_(min=0)
         return next_tokens
 
@@ -790,11 +819,14 @@ class DFlash(BaseDrafter):
 
         # Default sequential path
         self._update_native_cache_from_target(base_ctx, logits_output, accept_lengths)
-        current_tokens = self._current_tokens_from_output(
+        bs = base_ctx.bs
+        current_tokens = self.block_ids_buf[:bs, 0]
+        self._current_tokens_from_output(
             output_tokens,
             accept_lengths,
             base_ctx.num_extends,
             self.spec_num_tokens,
+            out=current_tokens,
         )
         return self.draft(current_tokens)
 
@@ -806,24 +838,9 @@ class DFlash(BaseDrafter):
         accept_lengths: torch.Tensor,
     ) -> torch.Tensor:
         """Overlap _update_native_cache_from_target (aux stream) with draft (main).
-
-        Requires decode-only batch and fused KV path. Falls back to sequential
-        run() otherwise.
+        Called from run() only when decode-only + fused KV + aux stream are all
+        satisfied.
         """
-        if not hasattr(self, "target_model"):
-            raise RuntimeError("DFLASH drafter is not bound to a target model.")
-
-        decode_only = base_ctx.num_extends == 0
-        can_overlap = (
-            decode_only
-            and self._fused_kv_enabled
-            and self._kv_aux_stream is not None
-        )
-        if not can_overlap:
-            return self.run(
-                base_ctx, logits_output, output_tokens, accept_lengths
-            )
-
         hidden = logits_output.hidden_states
         if hidden is None:
             raise RuntimeError("DFLASH requires target hidden states.")
@@ -834,10 +851,11 @@ class DFlash(BaseDrafter):
         old_lens = self.runtime_states.valid_cache_lengths.index_select(
             0, req_pool_indices
         )
-        new_lens = old_lens.to(torch.int32) + accept_lengths[:bs].to(torch.int32)
         max_draft_prefix = self.req_to_page.shape[1] * self.page_size - self.spec_num_tokens
-        new_lens.clamp_(max=max_draft_prefix)
-        self.draft_seq_lens_buf[:bs].copy_(new_lens)
+        torch.add(
+            old_lens, accept_lengths[:bs], out=self.draft_seq_lens_buf[:bs]
+        )
+        self.draft_seq_lens_buf[:bs].clamp_(max=max_draft_prefix)
 
         # Fork: aux stream runs full KV write (project + fused GEMM + scatter)
         positions = self.input_buffers.positions_buf[: base_ctx.input_num_tokens]
@@ -858,7 +876,9 @@ class DFlash(BaseDrafter):
             self._kv_join_event.record(self._kv_aux_stream)
 
         # Main stream: draft block prep overlaps with aux KV write
-        current_tokens = self._current_tokens_from_output(
+        current_tokens = self.block_ids_buf[:bs, 0]
+        self._current_tokens_from_output(
             output_tokens, accept_lengths, 0, self.spec_num_tokens,
+            out=current_tokens,
         )
         return self._draft_native(current_tokens, kv_sync_event=self._kv_join_event)
