@@ -1139,13 +1139,18 @@ class DeepseekV3DraftAttentionMLA(DeepseekV3AttentionMLA):
         )
         Q = Q.index_select(0, ctx.gather_ids)
         attn_output = q.new_empty(ctx.bs, self.num_local_heads * self.v_head_dim)
-        self.forward_absorb_attn_v_proj(
-            Q,
-            K,
-            decode_ctx,
-            out_cache_loc,
-            attn_output,
-        )
+        # gather_ids keeps one live row per request, so the decode runs on the
+        # full bs -- the page table and seq lens must span the same rows. Drop
+        # the [num_extends:] slice a MIXED target's first-step metadata sets up
+        # (mirrors the multi-step drafter loop's override_num_extends(0)).
+        with ctx.attn_backend.override_num_extends(0):
+            self.forward_absorb_attn_v_proj(
+                Q,
+                K,
+                decode_ctx,
+                out_cache_loc,
+                attn_output,
+            )
         return attn_output
 
     def _apply_correction(self, ctx: ForwardContext) -> None:
