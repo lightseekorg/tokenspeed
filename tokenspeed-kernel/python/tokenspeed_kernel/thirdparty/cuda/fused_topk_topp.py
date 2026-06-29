@@ -28,12 +28,11 @@ import functools
 from pathlib import Path
 
 import torch
+import tvm_ffi
 
 
 @functools.cache
 def _load_fused_topk_topp_module():
-    import tvm_ffi
-
     objs_dir = Path(__file__).parent / "objs" / "fused_topk_topp"
     so_path = objs_dir / "fused_topk_topp.so"
     if not so_path.exists():
