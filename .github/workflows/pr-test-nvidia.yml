@@ -93,7 +93,7 @@ jobs:
         # same runner. Restore the real `pipeline.py scan` invocation
         # before merging.
         run: |
-          MATRIX='{"include":[{"name":"perf-qwen3.5-397b-a17b-nvfp4-agentic-b200-8gpu","type":"perf","config":"test/ci/perf/qwen3.5-397b-a17b-nvfp4-evalscope-agentic-b200-8gpu.yaml","runner":"b200-8gpu","priority":"normal"},{"name":"perf-qwen3.5-397b-a17b-nvfp4-agentic-b200-8gpu-nomtp","type":"perf","config":"test/ci/perf/qwen3.5-397b-a17b-nvfp4-evalscope-agentic-b200-8gpu-nomtp.yaml","runner":"b200-8gpu","priority":"normal"}]}'
+          MATRIX='{"include":[{"name":"perf-qwen3.5-397b-a17b-nvfp4-agentic-b200-8gpu","type":"perf","config":"test/ci/perf/qwen3.5-397b-a17b-nvfp4-evalscope-agentic-b200-8gpu.yaml","runner":"b200-8gpu","priority":"normal"},{"name":"perf-qwen3.5-397b-a17b-nvfp4-agentic-b200-8gpu-nomtp","type":"perf","config":"test/ci/perf/qwen3.5-397b-a17b-nvfp4-evalscope-agentic-b200-8gpu-nomtp.yaml","runner":"b200-8gpu","priority":"normal"},{"name":"perf-qwen3.5-397b-a17b-nvfp4-agentic-b200-8gpu-mtp-launch-blocking","type":"perf","config":"test/ci/perf/qwen3.5-397b-a17b-nvfp4-evalscope-agentic-b200-8gpu-mtp-launch-blocking.yaml","runner":"b200-8gpu","priority":"normal"},{"name":"perf-qwen3.5-397b-a17b-nvfp4-agentic-b200-8gpu-mtp-eager","type":"perf","config":"test/ci/perf/qwen3.5-397b-a17b-nvfp4-evalscope-agentic-b200-8gpu-mtp-eager.yaml","runner":"b200-8gpu","priority":"normal"}]}'
           if [ -n "${TOKENSPEED_B200_RUNNER_LABEL:-}" ]; then
             RUNNER="${TOKENSPEED_B200_RUNNER_LABEL%-}-8gpu"
             MATRIX=$(printf '%s' "$MATRIX" | sed "s/\"runner\":\"b200-8gpu\"/\"runner\":\"${RUNNER}\"/g")
