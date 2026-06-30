@@ -30,6 +30,9 @@ from tokenspeed_kernel import (
     dsa_top_paged,
     dsa_topk,
 )
+from tokenspeed_kernel.ops.attention.triton.dsa_sparse_layout import (
+    workspace_topk_to_global_slots as dsa_workspace_topk_to_global_slots,
+)
 
 torch.manual_seed(42)
 
@@ -182,6 +185,34 @@ def test_dsa_topk(device: str, solution: str, require) -> None:
     torch.testing.assert_close(topk_lens.cpu(), expected_lens.cpu())
     torch.testing.assert_close(workspace_indices[:, :65].cpu(), expected[:, :65].cpu())
     assert (workspace_indices[0, int(expected_lens[0].item()) :] == -1).all()
+
+
+def test_dsa_workspace_topk_to_global_slots(device: str) -> None:
+    workspace_indices = torch.tensor(
+        [[2, -1, 0], [1, 3, -1]],
+        device=device,
+        dtype=torch.int32,
+    )
+    kv_workspace_slots = torch.tensor(
+        [10, 20, 30, 40],
+        device=device,
+        dtype=torch.int64,
+    )
+    out = torch.empty_like(workspace_indices)
+
+    slots = dsa_workspace_topk_to_global_slots(
+        workspace_indices=workspace_indices,
+        kv_workspace_slots=kv_workspace_slots,
+        out=out,
+    )
+
+    expected = torch.tensor(
+        [[30, -1, 10], [20, 40, -1]],
+        device=device,
+        dtype=torch.int32,
+    )
+    assert slots.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(slots.cpu(), expected.cpu())
 
 
 def _pack_sparse_kv(
