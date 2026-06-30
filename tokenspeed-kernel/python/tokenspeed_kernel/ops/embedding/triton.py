@@ -357,7 +357,7 @@ def apply_rope_triton(
 
 
 @triton.jit
-def _fp8_quantize_3d_kernel(
+def _fp8_quantize_kernel(
     x,
     out,
     scale,
@@ -390,7 +390,7 @@ def _fp8_quantize_3d_kernel(
     )
 
 
-def _fp8_quantize_3d_strided(
+def _fp8_quantize(
     x: torch.Tensor,
     out: torch.Tensor,
     scale: float | torch.Tensor,
@@ -409,7 +409,7 @@ def _fp8_quantize_3d_strided(
         scale = scale.contiguous()
     block_n = max(16, _next_power_of_2(x.shape[-1]))
     extra_kwargs = {"launch_pdl": True} if enable_pdl else {}
-    _fp8_quantize_3d_kernel[(x.shape[0], x.shape[1])](
+    _fp8_quantize_kernel[(x.shape[0], x.shape[1])](
         x,
         out,
         scale,
@@ -468,14 +468,10 @@ def mla_rope_quantize_fp8_triton(
         output_q_rope=q_rope_tmp,
         output_k_rope=k_rope_tmp,
     )
-    _fp8_quantize_3d_strided(
-        q_rope_tmp, q_rope_out, quant_scale_q, enable_pdl=enable_pdl
-    )
-    _fp8_quantize_3d_strided(
-        k_rope_tmp, k_rope_out, quant_scale_kv, enable_pdl=enable_pdl
-    )
-    _fp8_quantize_3d_strided(q_nope, q_nope_out, quant_scale_q, enable_pdl=enable_pdl)
-    _fp8_quantize_3d_strided(k_nope, k_nope_out, quant_scale_kv, enable_pdl=enable_pdl)
+    _fp8_quantize(q_rope_tmp, q_rope_out, quant_scale_q, enable_pdl=enable_pdl)
+    _fp8_quantize(k_rope_tmp, k_rope_out, quant_scale_kv, enable_pdl=enable_pdl)
+    _fp8_quantize(q_nope, q_nope_out, quant_scale_q, enable_pdl=enable_pdl)
+    _fp8_quantize(k_nope, k_nope_out, quant_scale_kv, enable_pdl=enable_pdl)
 
 
 @register_kernel(
