@@ -206,7 +206,6 @@ if (
             "return_lse": frozenset({False}),
         },
         priority=Priority.PERFORMANT,
-        tags={"throughput"},
     )
     def flashmla_dsa_decode(
         q: torch.Tensor,
@@ -296,7 +295,6 @@ if (
             "return_lse": frozenset({False}),
         },
         priority=Priority.PERFORMANT,
-        tags={"throughput"},
     )
     def flashmla_dsa_prefill(
         q: torch.Tensor,

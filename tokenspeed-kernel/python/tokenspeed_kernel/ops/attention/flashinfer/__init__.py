@@ -287,7 +287,6 @@ if platform.is_nvidia and platform.is_hopper_plus:
             "support_logit_cap": frozenset({False}),
             "return_lse": frozenset({False}),
         },
-        tags={"throughput"},
     )
     def flashinfer_trtllm_dsa_decode(
         q: torch.Tensor,
@@ -377,7 +376,6 @@ if platform.is_nvidia and platform.is_hopper_plus:
             "support_logit_cap": frozenset({False}),
             "return_lse": frozenset({False}),
         },
-        tags={"throughput"},
     )
     def flashinfer_trtllm_dsa_prefill(
         q: torch.Tensor,

@@ -80,7 +80,6 @@ if platform.is_nvidia:
             "q_len_per_req": frozenset({1, 2, 3, 4, 5, 6}),
         },
         priority=Priority.PERFORMANT,
-        tags={"throughput"},
     )
     def deep_gemm_dsa_top_paged(
         q: torch.Tensor,
@@ -195,7 +194,6 @@ if platform.is_nvidia:
             "index_k_format": frozenset({"fp8_scaled"}),
         },
         priority=Priority.PERFORMANT,
-        tags={"throughput"},
     )
     def deep_gemm_dsa_topk(
         q: torch.Tensor,
