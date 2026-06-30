@@ -784,7 +784,7 @@ class DeepseekV3AttentionMLA(nn.Module):
                 cos_sin_cache=self.rotary_emb.cos_sin_cache,
                 positions=positions,
                 is_neox=getattr(self.rotary_emb, "is_neox_style", True),
-                k_scale_inv=1.0 / k_scale,
+                k_scale=k_scale,
             )
 
             # Write FP8 KV cache (single write, no double-write)

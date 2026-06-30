@@ -46,7 +46,6 @@ if platform.is_nvidia:
             "has_scale_q_tensor": frozenset({False}),
             "has_scale_kv_tensor": frozenset({False}),
         },
-        tags={"throughput"},
     )
     def flashinfer_embedding_rope_mla(
         *,
@@ -79,7 +78,7 @@ if platform.is_nvidia:
             k_rope_out=k_rope_out,
             q_nope_out=q_nope_out,
             k_nope_out=k_nope_out,
-            quant_scale_q=1.0 / quant_scale_q,
-            quant_scale_kv=1.0 / quant_scale_kv,
+            quant_scale_q=quant_scale_q,
+            quant_scale_kv=quant_scale_kv,
             enable_pdl=enable_pdl,
         )

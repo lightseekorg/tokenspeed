@@ -34,7 +34,7 @@ def mla_fused_rope_fp8_quantize(
     cos_sin_cache: torch.Tensor,
     positions: torch.Tensor,
     is_neox: bool = True,
-    k_scale_inv: float = 1.0,
+    k_scale: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused RoPE + FP8 quantization for pre-shaped MLA tensors.
 
@@ -72,7 +72,7 @@ def mla_fused_rope_fp8_quantize(
         q_nope_out=query_fp8[..., :nope_dim],
         k_nope_out=key_fp8[..., :nope_dim],
         quant_scale_q=1.0,
-        quant_scale_kv=k_scale_inv,
+        quant_scale_kv=k_scale,
         enable_pdl=pdl_enabled(),
     )
 
