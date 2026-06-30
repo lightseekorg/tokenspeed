@@ -29,9 +29,8 @@ from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
-_SPARSE_DECODE_FP8_QUANT_BLOCK = 128
-_SPARSE_DECODE_FP8_SCALE_BYTES = torch._utils._element_size(torch.float32)
-_SPARSE_DECODE_ROPE_BYTES = torch._utils._element_size(torch.bfloat16)
+_INDEX_K_FP8_GROUP_SIZE = 128
+_INDEX_K_SCALE_BYTES = torch._utils._element_size(torch.float32)
 
 
 def _is_blackwell_device(device: str) -> bool:
@@ -44,24 +43,15 @@ def _is_blackwell_device(device: str) -> bool:
     return major >= 10
 
 
-def dsa_sparse_decode_row_bytes(
-    kv_lora_rank: int,
-    qk_rope_head_dim: int,
-) -> int:
-    """Return bytes in one packed DSA sparse-decode KV cache row."""
-    kv_lora_rank = int(kv_lora_rank)
-    qk_rope_head_dim = int(qk_rope_head_dim)
-    if kv_lora_rank % _SPARSE_DECODE_FP8_QUANT_BLOCK != 0:
+def dsa_index_k_row_bytes(index_head_dim: int) -> int:
+    if index_head_dim % _INDEX_K_FP8_GROUP_SIZE != 0:
         raise ValueError(
-            "DSA sparse decode NoPE dim must be divisible by "
-            f"{_SPARSE_DECODE_FP8_QUANT_BLOCK}, got {kv_lora_rank}"
+            "DSA index_head_dim must be divisible by "
+            f"{_INDEX_K_FP8_GROUP_SIZE}, got {index_head_dim}"
         )
     return (
-        kv_lora_rank
-        + kv_lora_rank
-        // _SPARSE_DECODE_FP8_QUANT_BLOCK
-        * _SPARSE_DECODE_FP8_SCALE_BYTES
-        + qk_rope_head_dim * _SPARSE_DECODE_ROPE_BYTES
+        index_head_dim
+        + index_head_dim // _INDEX_K_FP8_GROUP_SIZE * _INDEX_K_SCALE_BYTES
     )
 
 
@@ -94,12 +84,10 @@ class DSAConfig(MLAConfig):
         )
 
     def cache_cell_size(self) -> int:
-        index_cell_size = self.index_head_dim * torch._utils._element_size(self.dtype)
-        sparse_decode_cell_size = dsa_sparse_decode_row_bytes(
-            self.kv_lora_rank,
-            self.qk_rope_head_dim,
+        index_k_cell_size = dsa_index_k_row_bytes(
+            self.index_head_dim,
         )
-        return super().cache_cell_size() + index_cell_size + sparse_decode_cell_size
+        return super().cache_cell_size() + index_k_cell_size
 
     def create_pool(
         self,

@@ -56,7 +56,7 @@ logger = logging.getLogger(__name__)
 # Block constraint from flashinfer: block_num % (128 / page_size) == 0
 TRTLLM_BLOCK_CONSTRAINT = 128
 
-# Shared workspace buffer for fused kernels (150 MB, zero-initialized).
+# Shared workspace buffer for fused kernels (256 MB, zero-initialized).
 # Zero-init is required for the kernel's internal semaphore mechanism.
 _trtllm_workspace_buffer = None
 
@@ -66,7 +66,7 @@ def get_trtllm_workspace_buffer(device):
     global _trtllm_workspace_buffer
     if _trtllm_workspace_buffer is None:
         _trtllm_workspace_buffer = torch.zeros(
-            150 * 1024 * 1024,
+            256 * 1024 * 1024,
             dtype=torch.uint8,
             device=device,
         )
@@ -96,6 +96,9 @@ class TRTLLMMLAChunkedPrefillMetadata:
     chunked_seq_len: torch.Tensor  # (chunked_loop_num, num_extends) int32 GPU
     cu_chunked_seq_len: torch.Tensor  # (chunked_loop_num, num_extends+1) int32 GPU
     max_chunk_len_per_loop: list  # List[int], one per loop_idx
+    # Per-request page table (req_to_page[req_pool_indices]). Populated only by
+    # the DSA backend for sparse-prefill top-k; plain MLA leaves it None.
+    block_tables: torch.Tensor | None = None
 
 
 @dataclass
@@ -374,7 +377,7 @@ class TRTLLMMLABackend(AttentionBackend):
         # When the buffer is aliased to a peer backend (e.g. drafter aliasing
         # the target's kv_indices), the peer's replay has already populated it
         # with identical content.
-        if req_to_page is not None and not getattr(self, "_block_table_aliased", False):
+        if req_to_page is not None and not self._block_table_aliased:
             self._create_block_kv_indices(
                 bs,
                 metadata.block_kv_indices.shape[1],
