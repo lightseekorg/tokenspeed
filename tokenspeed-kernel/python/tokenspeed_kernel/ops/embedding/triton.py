@@ -381,7 +381,7 @@ def _fp8_quantize_3d_kernel(
     ).to(tl.float32)
     if HAS_SCALE_TENSOR:
         scale = tl.load(scale)
-    values = values * (1.0 / scale)
+    values = values * scale
     values_fp8 = values.to(tl.float8e4nv)
     tl.store(
         out + token * out_stride_t + head * out_stride_h + offsets,

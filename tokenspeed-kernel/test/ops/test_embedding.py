@@ -449,7 +449,7 @@ def test_rope_mla_quantize(
     q_nope = torch.randn(num_tokens, num_heads, nope_dim, device=device, dtype=dtype)
     k_nope = torch.randn(num_tokens, num_heads, nope_dim, device=device, dtype=dtype)
 
-    quant_scale_q = 1.0
+    quant_scale_q = 2.0
     quant_scale_kv = 2.0
 
     query_fp8, key_fp8 = apply_rope_mla(
@@ -468,11 +468,11 @@ def test_rope_mla_quantize(
     q_rope_ref = rope_ref(q_rope)
     k_rope_ref = rope_ref(k_rope)
     q_ref = torch.cat(
-        (q_nope.float() / quant_scale_q, q_rope_ref.float() / quant_scale_q),
+        (q_nope.float() * quant_scale_q, q_rope_ref.float() * quant_scale_q),
         dim=-1,
     ).to(torch.float8_e4m3fn)
     k_ref = torch.cat(
-        (k_nope.float() / quant_scale_kv, k_rope_ref.float() / quant_scale_kv),
+        (k_nope.float() * quant_scale_kv, k_rope_ref.float() * quant_scale_kv),
         dim=-1,
     ).to(torch.float8_e4m3fn)
 
@@ -480,5 +480,5 @@ def test_rope_mla_quantize(
     assert key_fp8.shape == k_ref.shape
     assert query_fp8.dtype == torch.float8_e4m3fn
     assert key_fp8.dtype == torch.float8_e4m3fn
-    torch.testing.assert_close(query_fp8.float(), q_ref.float(), rtol=0, atol=0.25)
-    torch.testing.assert_close(key_fp8.float(), k_ref.float(), rtol=0, atol=0.25)
+    torch.testing.assert_close(query_fp8.float(), q_ref.float(), rtol=0, atol=0.5)
+    torch.testing.assert_close(key_fp8.float(), k_ref.float(), rtol=0, atol=0.5)
