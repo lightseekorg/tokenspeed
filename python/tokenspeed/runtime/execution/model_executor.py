@@ -49,8 +49,6 @@ from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 from tokenspeed.runtime.execution.types import ModelExecutionResult
 from tokenspeed.runtime.grammar.capturable_grammar import setup_grammar_step
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
-from tokenspeed.runtime.models.llama_eagle3 import LlamaForCausalLMEagle3
-from tokenspeed.runtime.models.qwen3_5_nextn import Qwen3_5ForConditionalGenerationNextN
 from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 from tokenspeed.runtime.sampling.dp_sampling_config import (
     DpSamplingRuntimeLimits,
@@ -1223,6 +1221,7 @@ class ModelExecutor:
                     global_num_tokens,
                     global_bs,
                 )
+
                 draft_ctx = ForwardContext(
                     attn_backend=self.drafter.attn_backend,
                     token_to_kv_pool=self.drafter.token_to_kv_pool,
@@ -1234,22 +1233,6 @@ class ModelExecutor:
                     global_num_tokens=draft_global_num_tokens,
                     global_bs=global_bs,
                     all_decode_or_idle=all_decode_or_idle,
-                    # Mirror the active-rank broaden in eagle.py: Llama Eagle3
-                    # and Qwen3.5 NextN narrow for any non-idle catch-up, so the
-                    # idle peer must size collectives the same way.
-                    draft_first_step_reduce=(
-                        step_idx == 0
-                        and (
-                            all_decode_or_idle
-                            or isinstance(
-                                self.drafter.draft_model_runner.model,
-                                (
-                                    LlamaForCausalLMEagle3,
-                                    Qwen3_5ForConditionalGenerationNextN,
-                                ),
-                            )
-                        )
-                    ),
                 )
                 self.drafter.draft_model_runner.forward(
                     draft_ctx,

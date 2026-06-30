@@ -30,7 +30,10 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from tokenspeed.runtime.distributed.mapping import Mapping
-from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.context import (
+    ForwardContext,
+    report_collective_sizing,
+)
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
@@ -261,13 +264,14 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
 
         hidden_states = self.fc(hidden_states)
 
-        hidden_states, _ = self.model(
-            input_ids,
-            positions,
-            ctx,
-            out_cache_loc,
-            input_embeds=hidden_states,
-        )
+        with report_collective_sizing(ctx, ctx.bs, ctx.global_bs):
+            hidden_states, _ = self.model(
+                input_ids,
+                positions,
+                ctx,
+                out_cache_loc,
+                input_embeds=hidden_states,
+            )
 
         logits_metadata = LogitsMetadata.from_forward_context(ctx)
         return self.logits_processor(
