@@ -377,7 +377,7 @@ def triton_mxfp4_moe_weights(plan: dict, w: torch.nn.Module):
         "internal_activation_dtype": frozenset({"fp8", "input"}),
         "supports_bias": frozenset({True}),
     },
-    priority=Priority.SPECIALIZED + 2,
+    priority=Priority.PORTABLE,
 )
 @register_kernel(
     "moe",
@@ -402,7 +402,7 @@ def triton_mxfp4_moe_weights(plan: dict, w: torch.nn.Module):
         "internal_activation_dtype": frozenset({"fp8", "input"}),
         "supports_bias": frozenset({True}),
     },
-    priority=Priority.SPECIALIZED + 1,
+    priority=Priority.PORTABLE,
 )
 @register_kernel(
     "moe",

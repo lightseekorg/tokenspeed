@@ -170,7 +170,7 @@ def triton_fp8_moe_weights(plan: dict, w: torch.nn.Module):
         "fp8_scale_block_shape": frozenset({(128, 128)}),
         "supports_bias": frozenset({False}),
     },
-    priority=Priority.SPECIALIZED + 2,
+    priority=Priority.PORTABLE,
 )
 @register_kernel(
     "moe",
@@ -196,7 +196,7 @@ def triton_fp8_moe_weights(plan: dict, w: torch.nn.Module):
         "fp8_scale_block_shape": frozenset({(128, 128)}),
         "supports_bias": frozenset({False}),
     },
-    priority=Priority.SPECIALIZED + 1,
+    priority=Priority.PORTABLE,
 )
 def triton_fp8_moe_apply(
     plan: dict,
