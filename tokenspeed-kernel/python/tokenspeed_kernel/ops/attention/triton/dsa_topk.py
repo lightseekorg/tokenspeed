@@ -154,24 +154,180 @@ def _dsa_prefill_logits_kernel(
     )
 
 
+@triton.jit
+def _dsa_decode_logits_fp8_kernel(
+    q,
+    index_k_fp8,
+    index_k_scale,
+    weights,
+    seq_lens,
+    block_table,
+    logits,
+    block_table_stride: tl.constexpr,
+    logits_stride: tl.constexpr,
+    page_size: tl.constexpr,
+    row_bytes: tl.constexpr,
+    max_seq_len: tl.constexpr,
+    num_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    num_groups: tl.constexpr,
+    softmax_scale: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    token = tl.program_id(0)
+    block_id = tl.program_id(1)
+    offsets = block_id * BLOCK_N + tl.arange(0, BLOCK_N)
+    seq_len = tl.load(seq_lens + token).to(tl.int32)
+    valid = offsets < seq_len
+    block_idx = offsets // page_size
+    block_offset = offsets - block_idx * page_size
+    valid = valid & (offsets < max_seq_len)
+    page = tl.load(
+        block_table + token * block_table_stride + block_idx,
+        mask=valid,
+        other=0,
+    ).to(tl.int64)
+    page_bytes = page_size * row_bytes
+    fp8_base = page * page_bytes + block_offset * head_dim
+    scale_base = (
+        page * (page_bytes // 4)
+        + (page_size * head_dim) // 4
+        + block_offset * num_groups
+    )
+    scores = tl.zeros((BLOCK_N,), tl.float32)
+
+    dim_offsets = tl.arange(0, BLOCK_D)
+    for head in tl.static_range(0, num_heads):
+        head_weight = tl.load(weights + token * num_heads + head).to(tl.float32)
+        head_score = tl.zeros((BLOCK_N,), tl.float32)
+        for dim_start in tl.static_range(0, head_dim, BLOCK_D):
+            dims = dim_start + dim_offsets
+            q_vals = tl.load(
+                q + (token * num_heads + head) * head_dim + dims,
+                mask=dims < head_dim,
+                other=0.0,
+            ).to(tl.float32)
+            k_vals = tl.load(
+                index_k_fp8 + fp8_base[:, None] + dims[None, :],
+                mask=valid[:, None] & (dims[None, :] < head_dim),
+                other=0.0,
+            ).to(tl.float32)
+            k_scale = tl.load(
+                index_k_scale + scale_base + dim_start // 128,
+                mask=valid,
+                other=0.0,
+            ).to(tl.float32)
+            head_score += tl.sum(k_vals * k_scale[:, None] * q_vals[None, :], axis=1)
+        scores += head_score * head_weight
+
+    scores *= softmax_scale
+    scores = tl.where(valid, scores, -float("inf"))
+    tl.store(
+        logits + token * logits_stride + offsets,
+        scores,
+        mask=offsets < max_seq_len,
+    )
+
+
+@triton.jit
+def _dsa_prefill_logits_fp8_kernel(
+    q,
+    index_k_fp8,
+    index_k_scale,
+    weights,
+    kv_workspace_slots,
+    row_starts,
+    row_ends,
+    logits,
+    logits_stride: tl.constexpr,
+    seq_len_sum: tl.constexpr,
+    page_size: tl.constexpr,
+    row_bytes: tl.constexpr,
+    num_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    num_groups: tl.constexpr,
+    softmax_scale: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    token = tl.program_id(0)
+    block_id = tl.program_id(1)
+    offsets = block_id * BLOCK_N + tl.arange(0, BLOCK_N)
+    row_start = tl.load(row_starts + token).to(tl.int32)
+    row_end = tl.load(row_ends + token).to(tl.int32)
+    valid = (offsets >= row_start) & (offsets < row_end) & (offsets < seq_len_sum)
+    slots = tl.load(
+        kv_workspace_slots + offsets,
+        mask=offsets < seq_len_sum,
+        other=0,
+    ).to(tl.int64)
+    page = slots // page_size
+    block_offset = slots - page * page_size
+    page_bytes = page_size * row_bytes
+    fp8_base = page * page_bytes + block_offset * head_dim
+    scale_base = (
+        page * (page_bytes // 4)
+        + (page_size * head_dim) // 4
+        + block_offset * num_groups
+    )
+    scores = tl.zeros((BLOCK_N,), tl.float32)
+
+    dim_offsets = tl.arange(0, BLOCK_D)
+    for head in tl.static_range(0, num_heads):
+        head_weight = tl.load(weights + token * num_heads + head).to(tl.float32)
+        head_score = tl.zeros((BLOCK_N,), tl.float32)
+        for dim_start in tl.static_range(0, head_dim, BLOCK_D):
+            dims = dim_start + dim_offsets
+            q_vals = tl.load(
+                q + (token * num_heads + head) * head_dim + dims,
+                mask=dims < head_dim,
+                other=0.0,
+            ).to(tl.float32)
+            k_vals = tl.load(
+                index_k_fp8 + fp8_base[:, None] + dims[None, :],
+                mask=valid[:, None] & (dims[None, :] < head_dim),
+                other=0.0,
+            ).to(tl.float32)
+            k_scale = tl.load(
+                index_k_scale + scale_base + dim_start // 128,
+                mask=valid,
+                other=0.0,
+            ).to(tl.float32)
+            head_score += tl.sum(k_vals * k_scale[:, None] * q_vals[None, :], axis=1)
+        scores += head_score * head_weight
+
+    scores *= softmax_scale
+    scores = tl.where(valid, scores, -float("inf"))
+    tl.store(
+        logits + token * logits_stride + offsets,
+        scores,
+        mask=offsets < seq_len_sum,
+    )
+
+
 def _check_common_inputs(
     q: torch.Tensor,
     index_k: torch.Tensor,
     weights: torch.Tensor,
 ) -> None:
-    if q.dtype != torch.bfloat16:
-        raise TypeError(f"DSA Triton top-k expects BF16 q, got {q.dtype}")
+    _check_q_weights(q, weights)
     if index_k.dtype != torch.bfloat16:
         raise TypeError(f"DSA Triton top-k expects BF16 index_k, got {index_k.dtype}")
-    if weights.dtype != torch.float32:
-        raise TypeError(f"DSA Triton top-k expects FP32 weights, got {weights.dtype}")
-    if q.dim() != 3:
-        raise ValueError(f"q must be [tokens, heads, dim], got {tuple(q.shape)}")
     if index_k.dim() != 2 or index_k.shape[1] != q.shape[2]:
         raise ValueError(
             "index_k must be [slots, dim] matching q dim, got "
             f"index_k={tuple(index_k.shape)}, q={tuple(q.shape)}"
         )
+
+
+def _check_q_weights(q: torch.Tensor, weights: torch.Tensor) -> None:
+    if q.dtype != torch.bfloat16:
+        raise TypeError(f"DSA Triton top-k expects BF16 q, got {q.dtype}")
+    if weights.dtype != torch.float32:
+        raise TypeError(f"DSA Triton top-k expects FP32 weights, got {weights.dtype}")
+    if q.dim() != 3:
+        raise ValueError(f"q must be [tokens, heads, dim], got {tuple(q.shape)}")
     if weights.shape != q.shape[:2]:
         raise ValueError(
             "weights must be [tokens, heads] matching q, got "
@@ -181,6 +337,37 @@ def _check_common_inputs(
         raise ValueError(
             f"DSA Triton top-k requires dim multiple of 64, got {q.shape[2]}"
         )
+
+
+def _check_packed_fp8_inputs(
+    q: torch.Tensor,
+    index_k_with_scale: torch.Tensor,
+    weights: torch.Tensor,
+    page_size: int,
+) -> int:
+    _check_q_weights(q, weights)
+    if q.shape[2] % 128 != 0:
+        raise ValueError(
+            "DSA Triton FP8 top-k requires dim multiple of 128, got " f"{q.shape[2]}"
+        )
+    if index_k_with_scale.dtype != torch.uint8:
+        raise TypeError(
+            "DSA Triton FP8 top-k expects uint8 packed index_k_with_scale, got "
+            f"{index_k_with_scale.dtype}"
+        )
+    row_bytes = q.shape[2] + q.shape[2] // 128 * 4
+    if index_k_with_scale.dim() != 2 or index_k_with_scale.shape[1] != row_bytes:
+        raise ValueError(
+            "index_k_with_scale must be [slots, row_bytes] matching q dim, got "
+            f"index_k_with_scale={tuple(index_k_with_scale.shape)}, "
+            f"expected row_bytes={row_bytes}, q={tuple(q.shape)}"
+        )
+    if index_k_with_scale.shape[0] % int(page_size) != 0:
+        raise ValueError(
+            "index_k_with_scale slot count must be divisible by page_size, got "
+            f"slots={index_k_with_scale.shape[0]}, page_size={page_size}"
+        )
+    return row_bytes
 
 
 @triton.jit
@@ -627,6 +814,92 @@ def dsa_decode_topk(
     )
 
 
+def dsa_decode_topk_fp8(
+    q: torch.Tensor,
+    index_k_with_scale: torch.Tensor,
+    weights: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    *,
+    page_size: int,
+    topk: int,
+    softmax_scale: float,
+    out: torch.Tensor | None = None,
+    lens_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    row_bytes = _check_packed_fp8_inputs(q, index_k_with_scale, weights, page_size)
+    if seq_lens.dim() != 1 or seq_lens.numel() != q.shape[0]:
+        raise ValueError(
+            "seq_lens must be [tokens], got "
+            f"{tuple(seq_lens.shape)} for q={tuple(q.shape)}"
+        )
+    if block_table.dim() != 2 or block_table.shape[0] < q.shape[0]:
+        raise ValueError(
+            "block_table must have at least one row per token, got "
+            f"block_table={tuple(block_table.shape)}, q={tuple(q.shape)}"
+        )
+    if topk <= 0:
+        raise ValueError(f"topk must be positive, got {topk}")
+    if q.shape[0] == 0:
+        return (
+            (
+                torch.empty((0, int(topk)), dtype=torch.int32, device=q.device)
+                if out is None
+                else out
+            ),
+            (
+                torch.empty((0,), dtype=torch.int32, device=q.device)
+                if lens_out is None
+                else lens_out
+            ),
+        )
+    if not q.is_cuda:
+        raise RuntimeError("DSA Triton FP8 decode top-k requires CUDA tensors")
+
+    q = q.contiguous()
+    index_k_with_scale = index_k_with_scale.contiguous()
+    weights = weights.contiguous()
+    seq_lens = seq_lens.to(device=q.device, dtype=torch.int32).contiguous()
+    block_table = block_table.to(device=q.device, dtype=torch.int32).contiguous()
+    max_seq_len = int(block_table.shape[1]) * int(page_size)
+    logits = torch.empty(
+        (q.shape[0], max_seq_len), dtype=torch.float32, device=q.device
+    )
+    block_n = 64
+    grid = (q.shape[0], triton.cdiv(max_seq_len, block_n))
+    _dsa_decode_logits_fp8_kernel[grid](
+        q,
+        index_k_with_scale.view(torch.float8_e4m3fn),
+        index_k_with_scale.view(torch.float32),
+        weights,
+        seq_lens,
+        block_table,
+        logits,
+        block_table.stride(0),
+        logits.stride(0),
+        page_size=int(page_size),
+        row_bytes=row_bytes,
+        max_seq_len=max_seq_len,
+        num_heads=q.shape[1],
+        head_dim=q.shape[2],
+        num_groups=q.shape[2] // 128,
+        softmax_scale=float(softmax_scale),
+        BLOCK_N=block_n,
+        BLOCK_D=64,
+        num_warps=4,
+        num_stages=1,
+    )
+    local_topk_offsets = _topk_with_padding(logits, int(topk))
+    return local_topk_to_global_slots(
+        local_topk_offsets=local_topk_offsets,
+        block_table=block_table,
+        block_size=int(page_size),
+        seq_lens=seq_lens,
+        out=out,
+        lens_out=lens_out,
+    )
+
+
 def dsa_prefill_topk(
     q: torch.Tensor,
     index_k: torch.Tensor,
@@ -753,6 +1026,102 @@ def dsa_prefill_topk(
     return workspace_indices, topk_lens
 
 
+def dsa_prefill_topk_fp8(
+    q: torch.Tensor,
+    index_k_with_scale: torch.Tensor,
+    weights: torch.Tensor,
+    kv_workspace_slots: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    *,
+    page_size: int,
+    topk: int,
+    softmax_scale: float,
+    max_logits_bytes: int | None = None,
+    out: torch.Tensor | None = None,
+    lens_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    row_bytes = _check_packed_fp8_inputs(q, index_k_with_scale, weights, page_size)
+    if kv_workspace_slots.dim() != 1:
+        raise ValueError(
+            f"kv_workspace_slots must be 1-D, got {tuple(kv_workspace_slots.shape)}"
+        )
+    if row_starts.shape != (q.shape[0],) or row_ends.shape != (q.shape[0],):
+        raise ValueError(
+            "row_starts/row_ends must be [tokens], got "
+            f"row_starts={tuple(row_starts.shape)}, row_ends={tuple(row_ends.shape)}, "
+            f"q={tuple(q.shape)}"
+        )
+    if topk <= 0:
+        raise ValueError(f"topk must be positive, got {topk}")
+    if out is None:
+        out = torch.empty((q.shape[0], int(topk)), dtype=torch.int32, device=q.device)
+    if lens_out is None:
+        lens_out = torch.empty((q.shape[0],), dtype=torch.int32, device=q.device)
+    out.fill_(-1)
+    lens_out.zero_()
+    if q.shape[0] == 0:
+        return out, lens_out
+    if not q.is_cuda:
+        raise RuntimeError("DSA Triton FP8 prefill top-k requires CUDA tensors")
+
+    q = q.contiguous()
+    index_k_with_scale = index_k_with_scale.contiguous()
+    weights = weights.contiguous()
+    kv_workspace_slots = kv_workspace_slots.to(
+        device=q.device, dtype=torch.int64
+    ).contiguous()
+    row_starts = row_starts.to(device=q.device, dtype=torch.int32).contiguous()
+    row_ends = row_ends.to(device=q.device, dtype=torch.int32).contiguous()
+    seq_len_sum = int(kv_workspace_slots.numel())
+    candidate_lens = (row_ends - row_starts).clamp_min(0)
+    lens_out.copy_(
+        torch.minimum(candidate_lens, torch.full_like(candidate_lens, int(topk)))
+    )
+    if seq_len_sum == 0:
+        return out, lens_out
+
+    if max_logits_bytes is None:
+        max_query_rows = q.shape[0]
+    else:
+        max_query_rows = max(1, int(max_logits_bytes) // (max(seq_len_sum, 1) * 4))
+    block_n = 64
+    for start in range(0, q.shape[0], max_query_rows):
+        end = min(start + max_query_rows, q.shape[0])
+        logits = torch.empty(
+            (end - start, seq_len_sum), dtype=torch.float32, device=q.device
+        )
+        grid = (end - start, triton.cdiv(seq_len_sum, block_n))
+        _dsa_prefill_logits_fp8_kernel[grid](
+            q[start:end],
+            index_k_with_scale.view(torch.float8_e4m3fn),
+            index_k_with_scale.view(torch.float32),
+            weights[start:end],
+            kv_workspace_slots,
+            row_starts[start:end],
+            row_ends[start:end],
+            logits,
+            logits.stride(0),
+            seq_len_sum=seq_len_sum,
+            page_size=int(page_size),
+            row_bytes=row_bytes,
+            num_heads=q.shape[1],
+            head_dim=q.shape[2],
+            num_groups=q.shape[2] // 128,
+            softmax_scale=float(softmax_scale),
+            BLOCK_N=block_n,
+            BLOCK_D=64,
+            num_warps=4,
+            num_stages=1,
+        )
+        workspace_indices = _topk_with_padding(logits, int(topk))
+        valid = (workspace_indices >= row_starts[start:end, None]) & (
+            workspace_indices < row_ends[start:end, None]
+        )
+        out[start:end].copy_(torch.where(valid, workspace_indices, -1))
+    return out, lens_out
+
+
 @register_kernel(
     "attention",
     "dsa_top_paged",
@@ -797,6 +1166,63 @@ def triton_dsa_top_paged(
     return dsa_decode_topk(
         q,
         index_k_cache,
+        weights,
+        seq_lens,
+        block_table,
+        page_size=page_size,
+        topk=topk,
+        softmax_scale=softmax_scale,
+        out=out,
+        lens_out=lens_out,
+    )
+
+
+@register_kernel(
+    "attention",
+    "dsa_top_paged",
+    name="triton_dsa_top_paged_fp8",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=frozenset(
+        {
+            format_signature(
+                q=dense_tensor_format(torch.bfloat16),
+                weights=dense_tensor_format(torch.float32),
+            )
+        }
+    ),
+    traits={
+        "head_dim": frozenset({128}),
+        "topk": frozenset({512, 1024, 2048}),
+        "page_size": frozenset({64}),
+        "index_k_format": frozenset({"fp8_scaled"}),
+    },
+    priority=Priority.PORTABLE,
+    tags={"portability"},
+)
+def triton_dsa_top_paged_fp8(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    *,
+    page_size: int,
+    topk: int,
+    softmax_scale: float,
+    q_len_per_req: int = 1,
+    index_k_cache: torch.Tensor | None = None,
+    index_k_with_scale_cache: torch.Tensor | None = None,
+    plan: object | None = None,
+    out: torch.Tensor | None = None,
+    lens_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if index_k_with_scale_cache is None:
+        raise RuntimeError(
+            "Triton DSA paged top-k requires packed FP8 index_k_with_scale_cache"
+        )
+    return dsa_decode_topk_fp8(
+        q,
+        index_k_with_scale_cache,
         weights,
         seq_lens,
         block_table,
@@ -889,9 +1315,73 @@ def triton_dsa_topk(
     return out, lens_out
 
 
+@register_kernel(
+    "attention",
+    "dsa_topk",
+    name="triton_dsa_topk_fp8",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=frozenset(
+        {
+            format_signature(
+                q=dense_tensor_format(torch.bfloat16),
+                weights=dense_tensor_format(torch.float32),
+            )
+        }
+    ),
+    traits={
+        "head_dim": frozenset({128}),
+        "topk": frozenset({512, 1024, 2048}),
+        "index_k_format": frozenset({"fp8_scaled"}),
+    },
+    priority=Priority.PORTABLE,
+    tags={"portability"},
+)
+def triton_dsa_topk_fp8(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    kv_workspace_slots: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    *,
+    topk: int,
+    softmax_scale: float,
+    index_k_cache: torch.Tensor | None = None,
+    index_k_with_scale_cache: torch.Tensor | None = None,
+    page_size: int | None = None,
+    index_k_fp8: torch.Tensor | None = None,
+    index_k_scale: torch.Tensor | None = None,
+    max_logits_bytes: int | None = None,
+    out: torch.Tensor | None = None,
+    lens_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if index_k_with_scale_cache is None or page_size is None:
+        raise RuntimeError(
+            "Triton DSA top-k requires packed FP8 index_k_with_scale_cache and page_size"
+        )
+    return dsa_prefill_topk_fp8(
+        q,
+        index_k_with_scale_cache,
+        weights,
+        kv_workspace_slots,
+        row_starts,
+        row_ends,
+        page_size=page_size,
+        topk=topk,
+        softmax_scale=softmax_scale,
+        max_logits_bytes=max_logits_bytes,
+        out=out,
+        lens_out=lens_out,
+    )
+
+
 __all__ = [
     "dsa_decode_topk",
+    "dsa_decode_topk_fp8",
     "dsa_prefill_topk",
+    "dsa_prefill_topk_fp8",
     "triton_dsa_top_paged",
+    "triton_dsa_top_paged_fp8",
     "triton_dsa_topk",
+    "triton_dsa_topk_fp8",
 ]

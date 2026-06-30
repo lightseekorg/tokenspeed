@@ -1337,65 +1337,36 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         row_starts = seq_cu.index_select(0, token_req)
         row_ends = row_starts + causal_lens
 
-        workspace_indices = torch.full(
-            (num_prefill_tokens, topk),
-            -1,
-            dtype=torch.int32,
-            device=q.device,
+        index_k_cache = (
+            ctx.token_to_kv_pool.get_index_k_buffer(self.attn_mqa.layer_id)
+            if hasattr(ctx.token_to_kv_pool, "get_index_k_buffer")
+            else None
         )
-        trtllm_ops = getattr(torch.ops, "trtllm", None)
-        if trtllm_ops is None or not hasattr(trtllm_ops, "indexer_topk_prefill"):
-            raise RuntimeError(
-                "GLM DSA prefill top-k requires torch.ops.trtllm.indexer_topk_prefill."
+        index_k_with_scale_cache = (
+            ctx.token_to_kv_pool.get_index_k_with_scale_buffer(self.attn_mqa.layer_id)
+            if (
+                hasattr(ctx.token_to_kv_pool, "has_index_k_with_scale_buffer")
+                and ctx.token_to_kv_pool.has_index_k_with_scale_buffer()
             )
-
-        seq_len_sum = max(seq_len_sum, 1)
-        max_logits_bytes = max(1, max_logits_mb) * 1024 * 1024
-        max_query_rows = max(1, max_logits_bytes // (seq_len_sum * 4))
-
-        row_starts_i32 = row_starts.to(torch.int32).contiguous()
-        row_ends_i32 = row_ends.to(torch.int32).contiguous()
-        local_starts_i32 = torch.zeros_like(row_starts_i32)
-        causal_lens_i32 = causal_lens.to(torch.int32).contiguous()
-        for start in range(0, num_prefill_tokens, max_query_rows):
-            end = min(start + max_query_rows, num_prefill_tokens)
-            logits = deep_gemm.fp8_mqa_logits(
-                q_fp8[start:end].contiguous(),
-                kv_fp8,
-                weights[start:end].contiguous(),
-                row_starts_i32[start:end],
-                row_ends_i32[start:end],
-                clean_logits=False,
-                max_seqlen_k=int(causal_lens[start:end].max().item()),
-            )
-            logits.nan_to_num_(
-                nan=float("-inf"),
-                posinf=float("-inf"),
-                neginf=float("-inf"),
-            )
-            trtllm_ops.indexer_topk_prefill(
-                logits.contiguous(),
-                local_starts_i32[start:end],
-                causal_lens_i32[start:end],
-                workspace_indices[start:end],
-                topk,
-            )
-        valid_topk = workspace_indices >= 0
-        workspace_indices = torch.where(
-            valid_topk,
-            workspace_indices
-            + kv_workspace_bases.to(torch.int32)
-            .index_select(
-                0,
-                token_req,
-            )
-            .unsqueeze(1),
-            workspace_indices,
+            else None
         )
-        topk_lens = torch.minimum(
-            causal_lens,
-            torch.full_like(causal_lens, topk),
-        ).to(torch.int32)
+        if index_k_cache is None and index_k_with_scale_cache is None:
+            raise RuntimeError("GLM DSA top-k requires an index-K cache.")
+
+        max_logits_mb = int(global_server_args_dict[_INDEXER_PREFILL_MAX_LOGITS_MB_ARG])
+        workspace_indices, topk_lens = dsa_topk(
+            q,
+            weights,
+            kv_workspace_slots,
+            row_starts.to(torch.int32).contiguous(),
+            row_ends.to(torch.int32).contiguous(),
+            topk=topk,
+            softmax_scale=self.indexer.softmax_scale,
+            index_k_cache=index_k_cache,
+            index_k_with_scale_cache=index_k_with_scale_cache,
+            page_size=ctx.token_to_kv_pool.page_size,
+            max_logits_bytes=max(1, max_logits_mb) * 1024 * 1024,
+        )
         return GlmDsaPrefillTopK(
             workspace_indices=workspace_indices,
             topk_lens=topk_lens,

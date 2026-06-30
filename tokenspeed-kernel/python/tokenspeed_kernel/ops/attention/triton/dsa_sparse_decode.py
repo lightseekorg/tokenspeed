@@ -180,6 +180,126 @@ def _dsa_sparse_decode_kernel(
     tl.store(out + out_base + v_offsets, result, mask=v_mask)
 
 
+@triton.jit
+def _dsa_dense_kv_decode_kernel(
+    q,
+    kv,
+    topk_indices,
+    topk_lens,
+    out,
+    num_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    kv_lora_rank: tl.constexpr,
+    qk_rope_head_dim: tl.constexpr,
+    kv_dim: tl.constexpr,
+    topk: tl.constexpr,
+    softmax_scale: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+):
+    token = tl.program_id(0)
+    head = tl.program_id(1)
+    v_block = tl.program_id(2)
+
+    topk_offsets = tl.arange(0, BLOCK_TOPK)
+    k_offsets = tl.arange(0, BLOCK_K)
+    rope_offsets = tl.arange(0, 64)
+    v_offsets = v_block * BLOCK_V + tl.arange(0, BLOCK_V)
+
+    q_base = (token * num_heads + head) * head_dim
+    q_nope_base = q_base
+    q_rope_base = q_base + kv_lora_rank
+
+    q_rope = tl.load(
+        q + q_rope_base + rope_offsets,
+        mask=rope_offsets < qk_rope_head_dim,
+        other=0.0,
+    ).to(tl.float32)
+
+    valid_len = tl.load(topk_lens + token).to(tl.int32)
+    max_score = tl.full((), -float("inf"), tl.float32)
+
+    for start in range(0, topk, BLOCK_TOPK):
+        cols = start + topk_offsets
+        valid = cols < valid_len
+        slots = tl.load(
+            topk_indices + token * topk + cols,
+            mask=valid,
+            other=0,
+        ).to(tl.int64)
+        valid = valid & (slots >= 0)
+        score = tl.zeros((BLOCK_TOPK,), tl.float32)
+
+        for k_start in range(0, kv_lora_rank, BLOCK_K):
+            ks = k_start + k_offsets
+            q_vals = tl.load(q + q_nope_base + ks).to(tl.float32)
+            k_vals = tl.load(
+                kv + slots[:, None] * kv_dim + ks[None, :],
+                mask=valid[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            score += tl.sum(k_vals * q_vals[None, :], axis=1)
+
+        k_rope = tl.load(
+            kv + slots[:, None] * kv_dim + kv_lora_rank + rope_offsets[None, :],
+            mask=valid[:, None] & (rope_offsets[None, :] < qk_rope_head_dim),
+            other=0.0,
+        ).to(tl.float32)
+        score += tl.sum(k_rope * q_rope[None, :], axis=1)
+        score *= softmax_scale
+        score = tl.where(valid, score, -float("inf"))
+        max_score = tl.maximum(max_score, tl.max(score, axis=0))
+
+    denom = tl.full((), 0.0, tl.float32)
+    acc = tl.zeros((BLOCK_V,), tl.float32)
+    v_mask = v_offsets < kv_lora_rank
+    for start in range(0, topk, BLOCK_TOPK):
+        cols = start + topk_offsets
+        valid = cols < valid_len
+        slots = tl.load(
+            topk_indices + token * topk + cols,
+            mask=valid,
+            other=0,
+        ).to(tl.int64)
+        valid = valid & (slots >= 0)
+        score = tl.zeros((BLOCK_TOPK,), tl.float32)
+
+        for k_start in range(0, kv_lora_rank, BLOCK_K):
+            ks = k_start + k_offsets
+            q_vals = tl.load(q + q_nope_base + ks).to(tl.float32)
+            k_vals = tl.load(
+                kv + slots[:, None] * kv_dim + ks[None, :],
+                mask=valid[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            score += tl.sum(k_vals * q_vals[None, :], axis=1)
+
+        k_rope = tl.load(
+            kv + slots[:, None] * kv_dim + kv_lora_rank + rope_offsets[None, :],
+            mask=valid[:, None] & (rope_offsets[None, :] < qk_rope_head_dim),
+            other=0.0,
+        ).to(tl.float32)
+        score += tl.sum(k_rope * q_rope[None, :], axis=1)
+        score *= softmax_scale
+        score = tl.where(valid, score, -float("inf"))
+        probs = tl.exp(score - max_score)
+        probs = tl.where(valid, probs, 0.0)
+        denom += tl.sum(probs, axis=0)
+
+        v_vals = tl.load(
+            kv + slots[:, None] * kv_dim + v_offsets[None, :],
+            mask=valid[:, None] & v_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        acc += tl.sum(probs[:, None] * v_vals, axis=0)
+
+    result = acc / denom
+    result = tl.where(denom > 0.0, result, 0.0)
+    out_base = (token * num_heads + head) * kv_lora_rank
+    tl.store(out + out_base + v_offsets, result, mask=v_mask)
+
+
 def dsa_sparse_decode(
     q: torch.Tensor,
     sparse_kv: torch.Tensor,
@@ -264,6 +384,88 @@ def dsa_sparse_decode(
     return out
 
 
+def dsa_dense_kv_decode(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    topk_indices: torch.Tensor,
+    topk_lens: torch.Tensor,
+    *,
+    softmax_scale: float,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+) -> torch.Tensor:
+    if q.dtype not in _DSA_QUERY_DTYPES:
+        raise TypeError(f"dsa_dense_kv_decode expects BF16 or FP8 q, got {q.dtype}")
+    if kv_cache.dtype not in _DSA_QUERY_DTYPES:
+        raise TypeError(
+            f"dsa_dense_kv_decode expects BF16 or FP8 kv_cache, got {kv_cache.dtype}"
+        )
+    if topk_indices.dtype != torch.int32:
+        raise TypeError(
+            f"dsa_dense_kv_decode expects int32 topk_indices, got {topk_indices.dtype}"
+        )
+    if topk_lens.dtype != torch.int32:
+        raise TypeError(
+            f"dsa_dense_kv_decode expects int32 topk_lens, got {topk_lens.dtype}"
+        )
+    if q.dim() != 3:
+        raise ValueError(
+            f"dsa_dense_kv_decode expects q [tokens, heads, dim], got {q.shape}"
+        )
+    if topk_indices.dim() != 2 or topk_indices.shape[0] != q.shape[0]:
+        raise ValueError(
+            "dsa_dense_kv_decode top-k shape mismatch: "
+            f"q={tuple(q.shape)}, topk={tuple(topk_indices.shape)}"
+        )
+    if topk_lens.shape != (q.shape[0],):
+        raise ValueError(
+            "dsa_dense_kv_decode top-k lens shape mismatch: "
+            f"expected {(q.shape[0],)}, got {tuple(topk_lens.shape)}"
+        )
+    kv_dim = int(kv_lora_rank) + int(qk_rope_head_dim)
+    if kv_cache.dim() != 2 or kv_cache.shape[1] != kv_dim:
+        raise ValueError(
+            "dsa_dense_kv_decode kv_cache must be [slots, kv_dim], got "
+            f"{tuple(kv_cache.shape)}, expected kv_dim={kv_dim}"
+        )
+    if q.shape[-1] != kv_dim:
+        raise ValueError(
+            "dsa_dense_kv_decode q dim mismatch: "
+            f"got {q.shape[-1]}, expected {kv_dim}"
+        )
+
+    q = q.contiguous()
+    kv_cache = kv_cache.contiguous()
+    topk_indices = topk_indices.contiguous()
+    topk_lens = topk_lens.contiguous()
+    out = torch.empty(
+        (q.shape[0], q.shape[1], kv_lora_rank),
+        dtype=torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype,
+        device=q.device,
+    )
+    grid = (q.shape[0], q.shape[1], triton.cdiv(kv_lora_rank, 64))
+    _dsa_dense_kv_decode_kernel[grid](
+        q,
+        kv_cache,
+        topk_indices,
+        topk_lens,
+        out,
+        q.shape[1],
+        q.shape[2],
+        kv_lora_rank,
+        qk_rope_head_dim,
+        kv_dim,
+        topk_indices.shape[1],
+        float(softmax_scale),
+        BLOCK_TOPK=32,
+        BLOCK_K=64,
+        BLOCK_V=64,
+        num_warps=4,
+        num_stages=1,
+    )
+    return out
+
+
 def _flatten_sparse_kv_cache(
     sparse_kv_cache: torch.Tensor, page_size: int
 ) -> torch.Tensor:
@@ -279,6 +481,22 @@ def _flatten_sparse_kv_cache(
     raise ValueError(
         "sparse_kv_cache must be [slots, row_bytes] or "
         f"[pages, page_size, 1, row_bytes], got {tuple(sparse_kv_cache.shape)}"
+    )
+
+
+def _flatten_dense_kv_cache(kv_cache: torch.Tensor, page_size: int) -> torch.Tensor:
+    if kv_cache.dim() == 2:
+        return kv_cache
+    if kv_cache.dim() == 3 and kv_cache.shape[1] == 1:
+        return kv_cache.squeeze(1)
+    if kv_cache.dim() == 4:
+        if kv_cache.shape[1] == int(page_size) and kv_cache.shape[2] == 1:
+            return kv_cache.reshape(-1, kv_cache.shape[-1])
+        if kv_cache.shape[1] == 1 and kv_cache.shape[2] == int(page_size):
+            return kv_cache.permute(0, 2, 1, 3).reshape(-1, kv_cache.shape[-1])
+    raise ValueError(
+        "kv_cache must be [slots, dim], [slots, 1, dim], or paged MLA cache, "
+        f"got {tuple(kv_cache.shape)}"
     )
 
 
@@ -321,7 +539,7 @@ def _copy_or_return_sparse_out(
         "qk_rope_head_dim": frozenset({64}),
         "topk": frozenset({512, 1024, 2048}),
         "kv_cache_available": frozenset({False, True}),
-        "sparse_kv_cache_available": frozenset({True}),
+        "sparse_kv_cache_available": frozenset({False, True}),
         "topk_layout": frozenset({"global_slots"}),
         "support_logit_cap": frozenset({False}),
         "return_lse": frozenset({False}),
@@ -347,8 +565,8 @@ def triton_dsa_decode(
     return_lse: bool = False,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    if sparse_kv_cache is None:
-        raise RuntimeError("Triton sparse MLA requires sparse_kv_cache")
+    if sparse_kv_cache is None and kv_cache is None:
+        raise RuntimeError("Triton sparse MLA requires kv_cache or sparse_kv_cache")
     if topk_lens is None:
         raise RuntimeError("Triton sparse MLA requires topk_lens")
     if return_lse:
@@ -356,16 +574,28 @@ def triton_dsa_decode(
     if logit_cap != 0.0:
         raise RuntimeError("Triton sparse MLA does not support logit_cap")
     q_flat = _flatten_sparse_query(q, q_len_per_req).contiguous()
-    sparse_kv = _flatten_sparse_kv_cache(sparse_kv_cache, page_size).contiguous()
-    result = dsa_sparse_decode(
-        q_flat,
-        sparse_kv,
-        topk_slots.contiguous(),
-        topk_lens.contiguous(),
-        softmax_scale=softmax_scale * float(k_scale),
-        kv_lora_rank=kv_lora_rank,
-        qk_rope_head_dim=qk_rope_head_dim,
-    )
+    if sparse_kv_cache is not None:
+        sparse_kv = _flatten_sparse_kv_cache(sparse_kv_cache, page_size).contiguous()
+        result = dsa_sparse_decode(
+            q_flat,
+            sparse_kv,
+            topk_slots.contiguous(),
+            topk_lens.contiguous(),
+            softmax_scale=softmax_scale * float(k_scale),
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+        )
+    else:
+        dense_kv = _flatten_dense_kv_cache(kv_cache, page_size).contiguous()
+        result = dsa_dense_kv_decode(
+            q_flat,
+            dense_kv,
+            topk_slots.contiguous(),
+            topk_lens.contiguous(),
+            softmax_scale=softmax_scale * float(k_scale),
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+        )
     return _copy_or_return_sparse_out(result, out)
 
 
@@ -386,7 +616,7 @@ def triton_dsa_decode(
         "qk_rope_head_dim": frozenset({64}),
         "topk": frozenset({512, 1024, 2048}),
         "kv_cache_available": frozenset({False, True}),
-        "sparse_kv_cache_available": frozenset({True}),
+        "sparse_kv_cache_available": frozenset({False, True}),
         "topk_layout": frozenset({"global_slots"}),
         "support_logit_cap": frozenset({False}),
         "return_lse": frozenset({False}),
@@ -433,6 +663,7 @@ def triton_dsa_prefill(
 
 
 __all__ = [
+    "dsa_dense_kv_decode",
     "dsa_sparse_decode",
     "triton_dsa_decode",
     "triton_dsa_prefill",

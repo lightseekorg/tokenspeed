@@ -957,11 +957,18 @@ def dsa_topk(
         raise ValueError(
             f"lens_out must have shape {(q.shape[0],)}, got {tuple(lens_out.shape)}"
         )
+    if (
+        index_k_cache is not None
+        and index_k_cache.dtype == torch.uint8
+        and index_k_with_scale_cache is None
+    ):
+        index_k_with_scale_cache = index_k_cache
+        index_k_cache = None
     traits = {
         "head_dim": q.shape[-1],
         "topk": int(topk),
     }
-    has_bf16 = index_k_cache is not None
+    has_bf16 = index_k_cache is not None and index_k_cache.dtype == torch.bfloat16
     has_fp8 = index_k_with_scale_cache is not None or (
         index_k_fp8 is not None and index_k_scale is not None
     )
@@ -1060,13 +1067,20 @@ def dsa_top_paged(
         raise ValueError(
             f"lens_out must have shape {(q.shape[0],)}, got {tuple(lens_out.shape)}"
         )
+    if (
+        index_k_cache is not None
+        and index_k_cache.dtype == torch.uint8
+        and index_k_with_scale_cache is None
+    ):
+        index_k_with_scale_cache = index_k_cache
+        index_k_cache = None
     traits = {
         "head_dim": q.shape[-1],
         "topk": int(topk),
         "page_size": int(page_size),
         "q_len_per_req": int(q_len_per_req),
     }
-    has_bf16 = index_k_cache is not None
+    has_bf16 = index_k_cache is not None and index_k_cache.dtype == torch.bfloat16
     has_fp8 = index_k_with_scale_cache is not None
     if has_bf16 and not has_fp8:
         traits["index_k_format"] = "bf16"
