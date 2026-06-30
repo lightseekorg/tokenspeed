@@ -908,7 +908,7 @@ class DeepseekV3AttentionMLA(nn.Module):
         v = kv[..., self.qk_nope_head_dim :]
 
         # FP8 prefill: fused RoPE + FP8 quantize, direct FP8 KV cache write.
-        # Disabled when k_scale != 1.0 until the attention scale compensation is generalized.
+        # Disabled when k_scale != 1.0; mla_fp8_utils.py documents the current limitation.
         k_scale = getattr(self.attn_mha, "k_scale_float", 1.0)
         use_fp8_prefill = (
             self.attention_backend in self._MLA_KERNEL_BACKENDS
