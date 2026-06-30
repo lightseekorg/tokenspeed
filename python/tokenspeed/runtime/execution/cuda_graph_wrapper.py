@@ -36,6 +36,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from tokenspeed.runtime.layers.attention.backends.base import CudaGraphProfile
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 from tokenspeed.runtime.utils import (
     get_available_gpu_memory,
@@ -233,66 +234,135 @@ class CudaGraphWrapper:
         self.use_v4_mtp_paged_metadata = config.use_v4_mtp_paged_metadata
         self.dp_size = config.data_parallel_size
         self.world_size = config.world_size
+        self.cuda_graph_profiles = self._get_cuda_graph_profiles(attn_backend)
+        self.default_cuda_graph_profile = self.cuda_graph_profiles[0]
         # Backends alias their cache_seqlens buffer. Draft backend aliases
         # the drafter-owned draft_seq_lens to keep InputBuffers read-only.
         paged_cache_group_specs = tuple(token_to_kv_pool.paged_cache_group_specs)
-        try:
-            attn_backend.init_cuda_graph_state(
-                self.max_bs,
-                self.input_buffers.seq_lens_buf,
-                paged_cache_group_specs=paged_cache_group_specs,
-                max_tokens_per_req=self.max_tokens_per_req,
-            )
-        except TypeError:
-            attn_backend.init_cuda_graph_state(
-                self.max_bs,
-                self.input_buffers.seq_lens_buf,
-            )
+        self._init_backend_cuda_graph_states(
+            attn_backend,
+            self.input_buffers.seq_lens_buf,
+            paged_cache_group_specs=paged_cache_group_specs,
+        )
         if draft_attn_backend is not None:
             draft_paged_cache_group_specs = tuple(
                 draft_token_to_kv_pool.paged_cache_group_specs
             )
-            try:
-                draft_attn_backend.init_cuda_graph_state(
-                    self.max_bs,
-                    self.drafter.draft_seq_lens_buf,
-                    paged_cache_group_specs=draft_paged_cache_group_specs,
-                    max_tokens_per_req=self.max_tokens_per_req,
-                )
-            except TypeError:
-                draft_attn_backend.init_cuda_graph_state(
-                    self.max_bs, self.drafter.draft_seq_lens_buf
-                )
+            self._init_backend_cuda_graph_states(
+                draft_attn_backend,
+                self.drafter.draft_seq_lens_buf,
+                paged_cache_group_specs=draft_paged_cache_group_specs,
+            )
 
-            # Drafter (Eagle) is constructed with the target's req_to_page
-            # (ModelExecutor passes the same self.req_to_page to both), and the
-            # replay path hands both backends the same req_pool_indices. The
-            # block-table gather is req_to_page[req_pool_indices] (see
-            # _create_block_kv_indices; it does not depend on seq_lens), so both
-            # backends would compute identical block_kv_indices. When the backing
-            # buffer shapes/dtypes also line up, point the draft backend at the
-            # target's buffer and skip its gather+copy in the replay path: the
-            # target's metadata prep runs first and populates the shared buffer
-            # (see init_forward_metadata_replay_cuda_graph).
-            target_kv = getattr(attn_backend, "decode_cuda_graph_kv_indices", None)
-            draft_kv = getattr(draft_attn_backend, "decode_cuda_graph_kv_indices", None)
-            if (
-                target_kv is not None
-                and draft_kv is not None
-                and target_kv.shape == draft_kv.shape
-                and target_kv.dtype == draft_kv.dtype
-            ):
-                draft_attn_backend.decode_cuda_graph_kv_indices = target_kv
-                draft_attn_backend._block_table_aliased = True
+            self._alias_draft_decode_block_tables(attn_backend, draft_attn_backend)
 
-        self.graphs: dict[int, torch.cuda.CUDAGraph] = {}
-        self.output_buffers: dict[int, tuple] = {}
+        self.graphs: dict[tuple[CudaGraphProfile, int], torch.cuda.CUDAGraph] = {}
+        self.output_buffers: dict[tuple[CudaGraphProfile, int], tuple] = {}
 
         self._forward_func: Callable | None = forward_func
         self.disable = config.enforce_eager
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
         if not self.disable:
             self.capture()
+
+    def _get_cuda_graph_profiles(
+        self,
+        attn_backend: AttentionBackend,
+    ) -> tuple[CudaGraphProfile, ...]:
+        default_profile = CudaGraphProfile()
+        profiles = [default_profile]
+        if self.dp_size > 1:
+            return tuple(profiles)
+
+        seen = {default_profile}
+        for profile in attn_backend.get_cuda_graph_profiles():
+            if profile.is_default:
+                continue
+            if profile in seen:
+                continue
+            profiles.append(profile)
+            seen.add(profile)
+        return tuple(profiles)
+
+    @staticmethod
+    def _graph_dict_key(
+        profile: CudaGraphProfile, bs: int
+    ) -> tuple[CudaGraphProfile, int]:
+        return (profile, int(bs))
+
+    @staticmethod
+    def _compatible_alias_buffer(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
+        return (
+            lhs.shape == rhs.shape
+            and lhs.dtype == rhs.dtype
+            and lhs.device == rhs.device
+        )
+
+    def _init_backend_cuda_graph_states(
+        self,
+        backend: AttentionBackend,
+        seq_lens_buf: torch.Tensor,
+        *,
+        paged_cache_group_specs: tuple,
+    ) -> None:
+        for profile in self.cuda_graph_profiles:
+            kwargs = {
+                "paged_cache_group_specs": paged_cache_group_specs,
+                "max_tokens_per_req": self.max_tokens_per_req,
+            }
+            if not profile.is_default:
+                kwargs["cuda_graph_profile"] = profile
+            try:
+                backend.init_cuda_graph_state(self.max_bs, seq_lens_buf, **kwargs)
+            except TypeError:
+                if not profile.is_default:
+                    raise
+                backend.init_cuda_graph_state(self.max_bs, seq_lens_buf)
+
+    def _alias_draft_decode_block_tables(
+        self,
+        attn_backend: AttentionBackend,
+        draft_attn_backend: AttentionBackend,
+    ) -> None:
+        # Drafter and target gather the same req_to_page rows. If their graph
+        # block-table buffers match, target replay can populate them once.
+        target_by_context = getattr(
+            attn_backend,
+            "decode_cuda_graph_kv_indices_by_context",
+            None,
+        )
+        draft_by_context = getattr(
+            draft_attn_backend,
+            "decode_cuda_graph_kv_indices_by_context",
+            None,
+        )
+        if isinstance(target_by_context, dict) and isinstance(draft_by_context, dict):
+            if target_by_context.keys() != draft_by_context.keys():
+                return
+            if not all(
+                self._compatible_alias_buffer(
+                    target_by_context[context_len],
+                    draft_by_context[context_len],
+                )
+                for context_len in target_by_context
+            ):
+                return
+            draft_by_context.update(target_by_context)
+            target_kv = getattr(attn_backend, "decode_cuda_graph_kv_indices", None)
+            if target_kv is not None:
+                draft_attn_backend.decode_cuda_graph_kv_indices = target_kv
+            draft_attn_backend._block_table_aliased = True
+            return
+
+        target_kv = getattr(attn_backend, "decode_cuda_graph_kv_indices", None)
+        draft_kv = getattr(draft_attn_backend, "decode_cuda_graph_kv_indices", None)
+        if (
+            target_kv is not None
+            and draft_kv is not None
+            and self._compatible_alias_buffer(target_kv, draft_kv)
+        ):
+            draft_attn_backend.decode_cuda_graph_kv_indices = target_kv
+            draft_attn_backend._block_table_aliased = True
 
     # ------------------------------------------------------------------
     # Graph capture
@@ -308,22 +378,31 @@ class CudaGraphWrapper:
         rank = self.global_rank
         with freeze_gc(self.enable_cudagraph_gc):
             self.stream = torch.cuda.Stream()
-            capture_range = tqdm.tqdm(self.capture_bs) if rank == 0 else self.capture_bs
-            if rank == 0:
-                logger.info("Capturing batches: %s", self.capture_bs)
-            for bs in capture_range:
+            for profile in self.cuda_graph_profiles:
+                capture_range = (
+                    tqdm.tqdm(self.capture_bs) if rank == 0 else self.capture_bs
+                )
                 if rank == 0:
-                    avail_mem = get_available_gpu_memory(
-                        self.device, self.gpu_id, empty_cache=False
+                    logger.info(
+                        "Capturing %s batches: %s", profile.label, self.capture_bs
                     )
-                    capture_range.set_description(
-                        f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
+                for bs in capture_range:
+                    if rank == 0:
+                        avail_mem = get_available_gpu_memory(
+                            self.device, self.gpu_id, empty_cache=False
+                        )
+                        capture_range.set_description(
+                            f"Capturing {profile.label} batches ({bs=} {avail_mem=:.2f} GB)"
+                        )
+                    graph, output_buffers = self._capture_one(
+                        bs,
+                        cuda_graph_profile=profile,
                     )
-                graph, output_buffers = self._capture_one(bs)
-                self.graphs[bs] = graph
-                self.output_buffers[bs] = output_buffers
+                    dict_key = self._graph_dict_key(profile, bs)
+                    self.graphs[dict_key] = graph
+                    self.output_buffers[dict_key] = output_buffers
 
-    def _capture_one(self, bs: int):
+    def _capture_one(self, bs: int, cuda_graph_profile: CudaGraphProfile):
         graph = torch.cuda.CUDAGraph()
 
         capture_forward_mode = ForwardMode.DECODE
@@ -339,6 +418,7 @@ class CudaGraphWrapper:
                 if self.drafter is not None
                 else CaptureHiddenMode.NULL
             ),
+            **cuda_graph_profile.forward_context_kwargs(),
         )
 
         # For DP mode, global_num_tokens must be set so that the MoE
@@ -411,7 +491,7 @@ class CudaGraphWrapper:
             # Keep warmup seq_lens >= q_len_per_req so no query row gets an
             # empty causal span; a stale seq_len of 1 overflows to non-finite KV.
             self.input_buffers.seq_lens_buf[:bs].fill_(self.max_tokens_per_req)
-            self._init_capture_metadata(bs)
+            self._init_capture_metadata(bs, cuda_graph_profile=cuda_graph_profile)
             run_once()
 
         # Clear any per-pool state that warm-up dirtied at pool row 0,
@@ -425,7 +505,7 @@ class CudaGraphWrapper:
         # Warmups can switch a backend back to eager metadata objects. Restore
         # the graph-backed metadata immediately before capture so replay-time
         # metadata refreshes update the same tensors recorded by the graph.
-        self._init_capture_metadata(bs)
+        self._init_capture_metadata(bs, cuda_graph_profile=cuda_graph_profile)
 
         # Fill sampler buffers OUTSIDE the capture so RNG ops aren't recorded.
         if self.sampling_backend is not None:
@@ -434,7 +514,7 @@ class CudaGraphWrapper:
             )
         # Warmup forwards can mutate aliased metadata buffers, so refresh
         # them again immediately before graph capture records the final views.
-        self._init_capture_metadata(bs)
+        self._init_capture_metadata(bs, cuda_graph_profile=cuda_graph_profile)
 
         self.deepep_adapter.capture()
 
@@ -485,8 +565,14 @@ class CudaGraphWrapper:
             )
         return out
 
-    def _init_capture_metadata(self, bs: int):
+    def _init_capture_metadata(
+        self,
+        bs: int,
+        cuda_graph_profile: CudaGraphProfile,
+    ):
         capture_kwargs = {}
+        if not cuda_graph_profile.is_default:
+            capture_kwargs["cuda_graph_profile"] = cuda_graph_profile
         if self.input_buffers.has_mamba:
             capture_kwargs["mamba_pool_indices"] = (
                 self.input_buffers.mamba_pool_indices_buf[:bs]
@@ -511,6 +597,8 @@ class CudaGraphWrapper:
         )
         if self.draft_attn_backend is not None:
             draft_kwargs = {}
+            if not cuda_graph_profile.is_default:
+                draft_kwargs["cuda_graph_profile"] = cuda_graph_profile
             if self.draft_token_to_kv_pool is not None:
                 draft_paged_cache_block_tables = self._capture_paged_cache_block_tables(
                     bs,
@@ -593,6 +681,7 @@ class CudaGraphWrapper:
         seq_lens: torch.Tensor,
         req_to_page: torch.Tensor,
         forward_mode: ForwardMode,
+        cuda_graph_profile: CudaGraphProfile,
         **kwargs,
     ):
         """Graph-replay path — update persistent cuda-graph buffers in place."""
@@ -638,6 +727,8 @@ class CudaGraphWrapper:
                     )
         if self.attn_backend.uses_padded_decode_token_mask:
             kwargs["actual_bs"] = actual_bs
+        if not cuda_graph_profile.is_default:
+            kwargs["cuda_graph_profile"] = cuda_graph_profile
         if target_uses_paged_groups and getattr(self, "drafter", None) is not None:
             kwargs["num_tokens"] = padded_bs * self.max_tokens_per_req
         self.attn_backend.init_forward_metadata_replay_cuda_graph(
@@ -650,6 +741,8 @@ class CudaGraphWrapper:
         )
         if self.draft_attn_backend is not None:
             draft_attn_kwargs = {}
+            if not cuda_graph_profile.is_default:
+                draft_attn_kwargs["cuda_graph_profile"] = cuda_graph_profile
             if draft_uses_paged_groups and paged_cache_block_tables is not None:
                 draft_attn_kwargs["paged_cache_block_tables"] = paged_cache_block_tables
                 if paged_cache_block_table_base_offsets is not None:
@@ -767,11 +860,30 @@ class CudaGraphWrapper:
         max_num_tokens = max(ctx.global_num_tokens)
         return (max_num_tokens + self.max_tokens_per_req - 1) // self.max_tokens_per_req
 
+    def _select_cuda_graph_profile(self, ctx: ForwardContext) -> CudaGraphProfile:
+        profile = self.attn_backend.select_cuda_graph_profile(
+            self.cuda_graph_profiles,
+            ctx,
+        )
+        if profile not in self.cuda_graph_profiles:
+            return self.default_cuda_graph_profile
+        return profile
+
+    def _captured_bs_for_target(self, target_bs: int) -> int | None:
+        index = bisect.bisect_left(self.capture_bs, target_bs)
+        if index >= len(self.capture_bs):
+            return None
+        return self.capture_bs[index]
+
+    def _has_graph(self, profile: CudaGraphProfile, bs: int) -> bool:
+        return self._graph_dict_key(profile, bs) in self.graphs
+
     def _can_use_graph(self, bs: int, ctx: ForwardContext) -> bool:
         if self.disable:
             return False
         if not ctx.forward_mode.is_decode():
             return False
+        graph_profile = self._select_cuda_graph_profile(ctx)
         if self.dp_size > 1:
             if not ctx.all_decode_or_idle:
                 return False
@@ -779,11 +891,13 @@ class CudaGraphWrapper:
             if global_bs is None or global_bs == 0:
                 return False
             if self.disable_padding:
-                return global_bs in self.graphs
-            return global_bs <= self.max_bs
+                return self._has_graph(graph_profile, global_bs)
+            padded_bs = self._captured_bs_for_target(global_bs)
+            return padded_bs is not None and self._has_graph(graph_profile, padded_bs)
         if self.disable_padding:
-            return bs in self.graphs
-        return bs <= self.max_bs
+            return self._has_graph(graph_profile, bs)
+        padded_bs = self._captured_bs_for_target(bs)
+        return padded_bs is not None and self._has_graph(graph_profile, padded_bs)
 
     def can_run(self, bs: int, ctx: ForwardContext) -> bool:
         return self._can_use_graph(bs, ctx)
@@ -794,8 +908,10 @@ class CudaGraphWrapper:
     def _padded_bs(self, bs: int, ctx: ForwardContext) -> int:
         graph_bs = self._global_graph_bs(ctx)
         target_bs = graph_bs if graph_bs is not None else bs
-        index = bisect.bisect_left(self.capture_bs, target_bs)
-        return self.capture_bs[index]
+        padded_bs = self._captured_bs_for_target(target_bs)
+        if padded_bs is None:
+            raise RuntimeError(f"No CUDA graph capture size for batch size {target_bs}")
+        return padded_bs
 
     def _pad_graph_req_pool_indices(
         self, active_req_pool_indices: torch.Tensor, padded_bs: int
@@ -860,6 +976,11 @@ class CudaGraphWrapper:
         """
         use_graph = self._can_use_graph(bs, ctx)
         padded_bs = self._padded_bs(bs, ctx) if use_graph else bs
+        graph_profile = (
+            self._select_cuda_graph_profile(ctx)
+            if use_graph
+            else self.default_cuda_graph_profile
+        )
         active_req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
 
         if use_graph and padded_bs != bs:
@@ -928,6 +1049,7 @@ class CudaGraphWrapper:
                 seq_lens,
                 req_to_page=req_to_page,
                 forward_mode=ctx.forward_mode,
+                cuda_graph_profile=graph_profile,
                 num_padding=padded_bs - bs if padded_bs != bs else 0,
                 paged_cache_block_tables=paged_cache_block_tables,
                 paged_cache_block_table_base_offsets=(
@@ -942,10 +1064,11 @@ class CudaGraphWrapper:
             self.deepep_adapter.replay()
 
             with nvtx_range("graph_replay", color="red"):
-                self.graphs[padded_bs].replay()
+                dict_key = self._graph_dict_key(graph_profile, padded_bs)
+                self.graphs[dict_key].replay()
 
             output_tokens, output_lengths, output_logprobs = self.output_buffers[
-                padded_bs
+                dict_key
             ]
 
             result = (

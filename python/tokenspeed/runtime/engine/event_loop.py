@@ -648,6 +648,9 @@ class EventLoop:
             dp_metadata.all_decode_or_idle if dp_metadata is not None else False
         )
         multimodal_context = self._get_multimodal_context_for_forward(forward_op)
+        decode_seq_len_upper_bound = self._get_decode_seq_len_upper_bound_for_forward(
+            forward_op
+        )
 
         self.model_executor.update_block_table(forward_op)
 
@@ -663,6 +666,7 @@ class EventLoop:
                     dp_all_decode_or_idle=dp_all_decode_or_idle,
                     grammar_inputs=grammar_inputs,
                     multimodal_context=multimodal_context,
+                    decode_seq_len_upper_bound=decode_seq_len_upper_bound,
                     **stats,
                 ),
                 None,
@@ -692,6 +696,7 @@ class EventLoop:
                         dp_global_bs=dp_global_bs,
                         dp_all_decode_or_idle=dp_all_decode_or_idle,
                         multimodal_context=multimodal_context,
+                        decode_seq_len_upper_bound=decode_seq_len_upper_bound,
                         **stats,
                     ),
                     None,
@@ -717,11 +722,42 @@ class EventLoop:
                         dp_all_decode_or_idle=dp_all_decode_or_idle,
                         grammar_inputs=grammar_inputs,
                         multimodal_context=multimodal_context,
+                        decode_seq_len_upper_bound=decode_seq_len_upper_bound,
                         capture_next_input_ids=True,
                         **stats,
                     ),
                     self.pd_kv_transfer.store_prefill_token,
                 )
+
+    def _get_decode_seq_len_upper_bound_for_forward(self, forward_op) -> int | None:
+        if forward_op is None:
+            return None
+        num_extends = forward_op.num_extends()
+        bs = len(forward_op.request_ids)
+        if num_extends >= bs:
+            return None
+
+        rid_to_state = self.output_processor.rid_to_state
+        hist_token_lens = getattr(forward_op, "hist_token_lens", None)
+        decode_margin = max(1, int(self.model_executor.config.output_length or 1))
+        max_seq_len = 0
+        for row_idx in range(num_extends, bs):
+            rid = forward_op.request_ids[row_idx]
+            state = rid_to_state.get(rid)
+            if state is None:
+                return None
+            input_len = int(forward_op.input_lengths[row_idx])
+            hist_len = None
+            if hist_token_lens is not None and row_idx < len(hist_token_lens):
+                raw_hist_len = int(hist_token_lens[row_idx])
+                if raw_hist_len >= 0:
+                    hist_len = raw_hist_len
+            if hist_len is None:
+                seq_len = state.input_length + state.output_length + input_len
+            else:
+                seq_len = hist_len + input_len
+            max_seq_len = max(max_seq_len, seq_len + decode_margin)
+        return max_seq_len or None
 
     def _get_multimodal_context_for_forward(self, forward_op):
         if not self.model_config.is_multimodal_active:

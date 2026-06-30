@@ -22,16 +22,51 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.execution.context import ForwardContext
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
     from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
     from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
     from tokenspeed.runtime.pd.utils import StepCounter
+
+
+@dataclass(frozen=True, slots=True)
+class CudaGraphProfile:
+    """CUDA graph capture/replay profile declared by a backend.
+
+    ``name`` is a stable human-readable profile label used in logs. ``metadata``
+    carries backend-owned profile dimensions as hashable key/value pairs; the
+    graph wrapper treats it as opaque and delegates profile selection to the
+    backend that declared it. ``forward_context_fields`` carries capture-time
+    ForwardContext overrides owned by the declaring backend.
+    """
+
+    name: str = "default"
+    metadata: tuple[tuple[str, int], ...] = ()
+    forward_context_fields: tuple[tuple[str, int], ...] = ()
+
+    @property
+    def is_default(self) -> bool:
+        return self.name == "default" and not self.metadata
+
+    @property
+    def label(self) -> str:
+        return self.name
+
+    def get_int(self, key: str, default: int | None = None) -> int | None:
+        for metadata_key, value in self.metadata:
+            if metadata_key == key:
+                return int(value)
+        return default
+
+    def forward_context_kwargs(self) -> dict[str, int]:
+        return {key: int(value) for key, value in self.forward_context_fields}
 
 
 class AttentionBackend(ABC):
@@ -87,6 +122,23 @@ class AttentionBackend(ABC):
         the controller-owned per-request seq_lens; backends should reference
         (alias) it rather than copy, and must not mutate the contents."""
         raise NotImplementedError()
+
+    def get_cuda_graph_profiles(self) -> tuple[CudaGraphProfile, ...]:
+        """Return CUDA graph profiles this backend wants captured."""
+        return (CudaGraphProfile(),)
+
+    def select_cuda_graph_profile(
+        self,
+        profiles: tuple[CudaGraphProfile, ...],
+        forward_context: ForwardContext,
+    ) -> CudaGraphProfile:
+        """Select a captured profile for the current forward batch.
+
+        Backends that declare non-default profiles should override this and use
+        CPU-side fields from ``forward_context``. The default keeps existing
+        behavior: a single full-context decode graph.
+        """
+        return profiles[0]
 
     def init_forward_metadata_capture_cuda_graph(
         self,

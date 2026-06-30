@@ -20,6 +20,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 from tokenspeed_kernel.ops.attention.flashinfer import (
     trtllm_batch_decode_with_kv_cache_mla,
@@ -33,11 +35,17 @@ except Exception:
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
+from tokenspeed.runtime.layers.attention.backends.base import (
+    AttentionBackend,
+    CudaGraphProfile,
+)
 from tokenspeed.runtime.layers.attention.backends.trtllm_mla import TRTLLMMLABackend
 from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
 from tokenspeed.runtime.layers.attention.dsa.utils import workspace_indices_to_kv_slots
 from tokenspeed.runtime.layers.attention.registry import register_backend
+
+if TYPE_CHECKING:
+    from tokenspeed.runtime.execution.context import ForwardContext
 
 
 class DSABackend(AttentionBackend):
@@ -87,6 +95,10 @@ class DSABackend(AttentionBackend):
         self._dense_backend.decode_cuda_graph_kv_indices = value
 
     @property
+    def decode_cuda_graph_kv_indices_by_context(self):
+        return self._dense_backend.decode_cuda_graph_kv_indices_by_context
+
+    @property
     def trtllm_workspace(self):
         return self._dense_backend.trtllm_workspace
 
@@ -106,8 +118,58 @@ class DSABackend(AttentionBackend):
     def override_num_extends(self, num_extends: int):
         return self._dense_backend.override_num_extends(num_extends)
 
-    def init_cuda_graph_state(self, max_bs: int, seq_lens_buf: torch.Tensor):
-        return self._dense_backend.init_cuda_graph_state(max_bs, seq_lens_buf)
+    @staticmethod
+    def _decode_context_profile(max_seq_len: int) -> CudaGraphProfile:
+        return CudaGraphProfile(
+            name=f"decode_ctx_{max_seq_len}",
+            metadata=(("max_seq_len", int(max_seq_len)),),
+            forward_context_fields=(("decode_seq_len_upper_bound", int(max_seq_len)),),
+        )
+
+    def get_cuda_graph_profiles(self) -> tuple[CudaGraphProfile, ...]:
+        profiles = [CudaGraphProfile()]
+        if self.index_topk <= 0 or self.max_context_len <= self.index_topk:
+            return tuple(profiles)
+        variants = (
+            int(self.index_topk),
+            int(self.index_topk + self.index_topk // 2),
+            int(self.index_topk * 2),
+        )
+        profiles.extend(
+            self._decode_context_profile(value)
+            for value in sorted(set(variants))
+            if 0 < value < int(self.max_context_len)
+        )
+        return tuple(profiles)
+
+    def select_cuda_graph_profile(
+        self,
+        profiles: tuple[CudaGraphProfile, ...],
+        forward_context: ForwardContext,
+    ) -> CudaGraphProfile:
+        upper_bound = getattr(forward_context, "decode_seq_len_upper_bound", None)
+        if upper_bound is None:
+            return profiles[0]
+        for profile in profiles:
+            max_seq_len = profile.get_int("max_seq_len")
+            if max_seq_len is not None and int(upper_bound) <= max_seq_len:
+                return profile
+        return profiles[0]
+
+    def init_cuda_graph_state(
+        self,
+        max_bs: int,
+        seq_lens_buf: torch.Tensor,
+        *,
+        cuda_graph_profile: CudaGraphProfile | None = None,
+        **kwargs,
+    ):
+        return self._dense_backend.init_cuda_graph_state(
+            max_bs,
+            seq_lens_buf,
+            cuda_graph_profile=cuda_graph_profile,
+            **kwargs,
+        )
 
     def _clear_metadata_caches(self) -> None:
         metadata_objects = [
@@ -130,12 +192,17 @@ class DSABackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
+        *,
+        cuda_graph_profile: CudaGraphProfile | None = None,
+        **kwargs,
     ):
         result = self._dense_backend.init_forward_metadata_capture_cuda_graph(
             bs=bs,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             forward_mode=forward_mode,
+            cuda_graph_profile=cuda_graph_profile,
+            **kwargs,
         )
         self._clear_metadata_caches()
         return result

@@ -55,6 +55,9 @@ class ForwardContext:
     draft_first_step_reduce: bool = False
     # Normalized explicit decode input overrides for this forward, if any.
     decode_input_ids: list[int] | None = None
+    # CPU-side upper bound for decode seq_lens, used to select safe graph
+    # profiles and skip context-limit clamps without syncing GPU seq_lens.
+    decode_seq_len_upper_bound: int | None = None
 
     # --- dp attention ---
     global_num_tokens: list[int] | None = None

@@ -40,7 +40,10 @@ from tokenspeed_kernel.ops.attention.flashinfer import (
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
+from tokenspeed.runtime.layers.attention.backends.base import (
+    AttentionBackend,
+    CudaGraphProfile,
+)
 from tokenspeed.runtime.layers.attention.chunk import (
     build_chunked_prefill_metadata_arrays,
 )
@@ -142,7 +145,10 @@ class TRTLLMMLABackend(AttentionBackend):
         # Metadata
         self.forward_decode_metadata: TRTLLMMLADecodeMetadata | None = None
         self.forward_prefill_metadata: TRTLLMMLAPrefillMetadata | None = None
-        self.decode_cuda_graph_metadata: dict[int, TRTLLMMLADecodeMetadata] = {}
+        self.decode_cuda_graph_metadata: dict[
+            tuple[int, int], TRTLLMMLADecodeMetadata
+        ] = {}
+        self.decode_cuda_graph_kv_indices_by_context: dict[int, torch.Tensor] = {}
         self.decode_cuda_graph_kv_indices = None
         self.chunked_prefill_metadata: TRTLLMMLAChunkedPrefillMetadata | None = None
 
@@ -313,7 +319,31 @@ class TRTLLMMLABackend(AttentionBackend):
 
     # ---- CUDA Graph ----
 
-    def init_cuda_graph_state(self, max_bs: int, seq_lens_buf: torch.Tensor):
+    def _cuda_graph_context_len(
+        self, cuda_graph_profile: CudaGraphProfile | None = None
+    ) -> int:
+        if cuda_graph_profile is None:
+            return int(self.max_context_len)
+        max_seq_len = cuda_graph_profile.get_int("max_seq_len")
+        if max_seq_len is None:
+            return int(self.max_context_len)
+        return max(1, min(int(max_seq_len), int(self.max_context_len)))
+
+    def _cuda_graph_metadata_key(
+        self,
+        bs: int,
+        cuda_graph_profile: CudaGraphProfile | None = None,
+    ) -> tuple[int, int]:
+        return (self._cuda_graph_context_len(cuda_graph_profile), int(bs))
+
+    def init_cuda_graph_state(
+        self,
+        max_bs: int,
+        seq_lens_buf: torch.Tensor,
+        *,
+        cuda_graph_profile: CudaGraphProfile | None = None,
+        **_,
+    ):
         assert (
             seq_lens_buf.dtype == torch.int32
             and seq_lens_buf.dim() == 1
@@ -324,10 +354,16 @@ class TRTLLMMLABackend(AttentionBackend):
         )
         # Alias controller's seq_lens_buf — backend never mutates it.
         self.cuda_graph_seq_lens_buf = seq_lens_buf
-        max_blocks = self._calc_padded_blocks(self.max_context_len)
-        self.decode_cuda_graph_kv_indices = torch.zeros(
-            (max_bs, max_blocks), dtype=torch.int32, device=self.device
-        )
+        context_len = self._cuda_graph_context_len(cuda_graph_profile)
+        if context_len not in self.decode_cuda_graph_kv_indices_by_context:
+            max_blocks = self._calc_padded_blocks(context_len)
+            self.decode_cuda_graph_kv_indices_by_context[context_len] = torch.zeros(
+                (max_bs, max_blocks), dtype=torch.int32, device=self.device
+            )
+        if cuda_graph_profile is None or cuda_graph_profile.is_default:
+            self.decode_cuda_graph_kv_indices = (
+                self.decode_cuda_graph_kv_indices_by_context[context_len]
+            )
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -335,14 +371,19 @@ class TRTLLMMLABackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
+        *,
+        cuda_graph_profile: CudaGraphProfile | None = None,
+        **_,
     ):
         if forward_mode.is_extend_or_mixed():
             raise NotImplementedError(
                 f"trtllm_mla CUDA graph capture not supported for {forward_mode}"
             )
 
-        max_blocks = self._calc_padded_blocks(self.max_context_len)
-        block_kv_indices = self.decode_cuda_graph_kv_indices[:bs, :max_blocks]
+        context_len = self._cuda_graph_context_len(cuda_graph_profile)
+        kv_indices = self.decode_cuda_graph_kv_indices_by_context[context_len]
+        max_blocks = self._calc_padded_blocks(context_len)
+        block_kv_indices = kv_indices[:bs, :max_blocks]
 
         # For capture we don't have req_to_page yet; just zero-fill the block indices.
         # The actual indices will be filled on replay. seq_lens_k aliases
@@ -350,11 +391,11 @@ class TRTLLMMLABackend(AttentionBackend):
         metadata = TRTLLMMLADecodeMetadata(
             num_extends=0,
             block_kv_indices=block_kv_indices,
-            max_seq_len_k=self.max_context_len,
+            max_seq_len_k=context_len,
             seq_lens_k=self.cuda_graph_seq_lens_buf[:bs],
         )
 
-        self.decode_cuda_graph_metadata[bs] = metadata
+        self.decode_cuda_graph_metadata[(context_len, int(bs))] = metadata
         self.forward_decode_metadata = metadata
 
     def init_forward_metadata_replay_cuda_graph(
@@ -366,12 +407,15 @@ class TRTLLMMLABackend(AttentionBackend):
         req_to_page: torch.Tensor = None,
         **kwargs,
     ):
+        cuda_graph_profile = kwargs.pop("cuda_graph_profile", None)
         if forward_mode is not None and forward_mode.is_extend_or_mixed():
             raise NotImplementedError(
                 f"trtllm_mla CUDA graph replay not supported for {forward_mode}"
             )
 
-        metadata = self.decode_cuda_graph_metadata[bs]
+        metadata = self.decode_cuda_graph_metadata[
+            self._cuda_graph_metadata_key(bs, cuda_graph_profile)
+        ]
 
         # seq_lens_k aliases seq_lens_buf; only block indices need refresh.
         # When the buffer is aliased to a peer backend (e.g. drafter aliasing

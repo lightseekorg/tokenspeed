@@ -83,12 +83,19 @@ from deep_gemm import (
     get_paged_mqa_logits_metadata,
     get_symm_buffer_for_mega_moe,
     m_grouped_fp8_gemm_nt_contiguous,
-    m_grouped_fp8_gemm_nt_masked,
     set_num_sms,
     tf32_hc_prenorm_gemm,
     transform_sf_into_required_layout,
     transform_weights_for_mega_moe,
 )
+
+try:
+    from deep_gemm import m_grouped_fp8_gemm_nt_masked
+except ImportError:
+    from deep_gemm import (
+        fp8_m_grouped_gemm_nt_masked as m_grouped_fp8_gemm_nt_masked,
+    )
+
 from tokenspeed_kernel.thirdparty.deep_gemm.warmup import (
     warmup_fp8_gemm_nt,
     warmup_fp8_gemm_nt_from_model,

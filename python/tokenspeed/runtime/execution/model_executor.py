@@ -590,6 +590,7 @@ class ModelExecutor:
         self,
         accept_lengths: torch.Tensor,
         decode_req_pool_indices: torch.Tensor,
+        decode_seq_len_upper_bound: int | None = None,
     ) -> torch.Tensor:
         """Clamp spec-verify accept so committed length never exceeds
         ``context_len``.
@@ -604,6 +605,10 @@ class ModelExecutor:
         """
         if accept_lengths.numel() == 0:
             return accept_lengths
+        if decode_seq_len_upper_bound is not None and int(
+            decode_seq_len_upper_bound
+        ) < int(self.config.context_len):
+            return accept_lengths
         committed = self.runtime_states.valid_cache_lengths.index_select(
             0, decode_req_pool_indices
         ).to(accept_lengths.dtype)
@@ -617,6 +622,7 @@ class ModelExecutor:
         output_lengths: torch.Tensor,
         num_extends: int,
         bs: int,
+        decode_seq_len_upper_bound: int | None = None,
     ) -> torch.Tensor:
         """Return ``output_lengths`` with decode rows clamped so committed KV
         length never exceeds ``context_len`` (post-forward, outside the CUDA
@@ -635,6 +641,10 @@ class ModelExecutor:
         pass through. Deterministic, so no cross-rank divergence.
         """
         if bs <= num_extends:
+            return output_lengths
+        if decode_seq_len_upper_bound is not None and int(
+            decode_seq_len_upper_bound
+        ) < int(self.config.context_len):
             return output_lengths
         decode_rpi = self.input_buffers.req_pool_indices_buf[num_extends:bs]
         committed = self.runtime_states.valid_cache_lengths.index_select(
@@ -671,7 +681,9 @@ class ModelExecutor:
                 accept_lengths, 0, num_decodes, ctx.decode_input_ids
             )
             accept_lengths = self._cap_accept_to_context_len(
-                accept_lengths, sampling_info.req_pool_indices[:num_decodes]
+                accept_lengths,
+                sampling_info.req_pool_indices[:num_decodes],
+                ctx.decode_seq_len_upper_bound,
             )
             return output_tokens, accept_lengths
 
@@ -688,7 +700,9 @@ class ModelExecutor:
             decode_accept, num_extends, num_decodes, ctx.decode_input_ids
         )
         decode_accept = self._cap_accept_to_context_len(
-            decode_accept, sampling_info.req_pool_indices[num_extends:]
+            decode_accept,
+            sampling_info.req_pool_indices[num_extends:],
+            ctx.decode_seq_len_upper_bound,
         )
         if (
             prefill_out.next_token_logprobs is not None
@@ -1040,6 +1054,7 @@ class ModelExecutor:
         grammar_inputs=None,
         multimodal_context=None,
         capture_next_input_ids: bool = False,
+        decode_seq_len_upper_bound: int | None = None,
     ) -> ModelExecutionResult:
         self.log_step += 1
 
@@ -1079,6 +1094,7 @@ class ModelExecutor:
             grammar_inputs=grammar_inputs,
             multimodal_context=multimodal_context,
             capture_next_input_ids=capture_next_input_ids,
+            decode_seq_len_upper_bound=decode_seq_len_upper_bound,
         )
 
         if is_decode and (
@@ -1449,6 +1465,7 @@ class ModelExecutor:
         grammar_inputs=None,
         multimodal_context=None,
         capture_next_input_ids: bool = False,
+        decode_seq_len_upper_bound: int | None = None,
     ) -> ModelExecutionResult:
         num_extends = forward_op.num_extends()
         total_tokens = sum(forward_op.input_lengths)
@@ -1595,6 +1612,7 @@ class ModelExecutor:
                     ),
                     gather_ids=gather_ids,
                     decode_input_ids=decode_input_ids,
+                    decode_seq_len_upper_bound=decode_seq_len_upper_bound,
                 )
                 if self.config.data_parallel_size > 1:
                     if dp_global_num_tokens is None:
@@ -1716,7 +1734,10 @@ class ModelExecutor:
                 # _update_runtime_state and the scheduler page reservation; see
                 # _clamp_committed_to_context_len.
                 output_lengths = self._clamp_committed_to_context_len(
-                    output_lengths, num_extends, bs
+                    output_lengths,
+                    num_extends,
+                    bs,
+                    decode_seq_len_upper_bound=decode_seq_len_upper_bound,
                 )
 
                 # Update runtime state on execution_stream (NOT in the CUDA graph).
