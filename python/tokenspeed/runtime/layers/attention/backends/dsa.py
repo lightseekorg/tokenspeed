@@ -351,7 +351,7 @@ class DSABackend(AttentionBackend):
     ) -> torch.Tensor:
         self._validate_logit_cap(layer.logit_cap)
         if topk_indices is not None:
-            return self._forward_sparse_decode(
+            return self.forward_sparse_decode(
                 q=q,
                 k=k,
                 v=v,
@@ -459,7 +459,7 @@ class DSABackend(AttentionBackend):
         )
         return out.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 
-    def _forward_sparse_decode(
+    def forward_sparse_decode(
         self,
         *,
         q: torch.Tensor,
