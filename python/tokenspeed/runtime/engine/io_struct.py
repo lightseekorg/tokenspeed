@@ -219,9 +219,7 @@ class GenerateReqInput:
             if self.sampling_params is None:
                 self.sampling_params = [{} for _ in range(num)]
             elif not isinstance(self.sampling_params, list):
-                self.sampling_params = [
-                    dict(self.sampling_params) for _ in range(num)
-                ]
+                self.sampling_params = [dict(self.sampling_params) for _ in range(num)]
 
             if self.rid is None:
                 self.rid = [uuid.uuid4().hex for _ in range(num)]
