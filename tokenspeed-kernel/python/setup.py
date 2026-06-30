@@ -306,6 +306,19 @@ KERNEL_GROUPS = [
         ],
         [],
     ),
+    # TODO: Import these kernels from tokenspeed_trtllm_kernel once they are
+    # exposed there, instead of building this standalone vendored extension.
+    (
+        "trtllm_deepseek_v4_indexer_q",
+        [
+            CUDA_CSRC_DIR / "trtllm_deepseek_v4_indexer_q.cu",
+        ],
+        [],
+        # TRT-LLM's fusedCat contract requires IEEE division for bit-exact
+        # DeepGEMM parity. Override TokenSpeed's global fast-math expansion for
+        # this separately built vendored source without changing other groups.
+        ["--ftz=false", "--prec-div=true", "--prec-sqrt=true"],
+    ),
     (
         "dsv3_gemm",
         [

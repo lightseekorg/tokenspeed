@@ -58,6 +58,12 @@ from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     write_deepseek_v4_indexer_mxfp4_cache_cuda as _triton_write_indexer_mxfp4_cache_cuda,
 )
+from tokenspeed_kernel.ops.attention.trtllm.deepseek_v4 import (
+    supports_trtllm_deepseek_v4_indexer_q_prepare as _supports_trtllm_indexer_q_prepare,
+)
+from tokenspeed_kernel.ops.attention.trtllm.deepseek_v4 import (
+    trtllm_deepseek_v4_indexer_q_prepare_mxfp4 as _trtllm_indexer_q_prepare_mxfp4,
+)
 
 from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
     DEEPSEEK_V4_FP8_MAX,
@@ -75,6 +81,12 @@ from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
     deepseek_v4_swa_scale_dim,
     deepseek_v4_swa_token_stride,
 )
+
+# The vendored TRT-LLM chain replaces one fused Triton launch with RoPE,
+# fast-Hadamard, FP4-pack, and weight-scale launches.  B200 measurements show
+# a clear prefill win at this conservative crossover while preserving the
+# lower-launch-overhead Triton path for decode and small mixed batches.
+_TRTLLM_INDEXER_Q_MIN_TOKENS = 128
 
 
 def _indexer_mxfp4_layout_from_cache(
@@ -270,7 +282,12 @@ def deepseek_v4_prepare_indexer_q_mxfp4(
     softmax_scale: float,
     head_scale: float,
 ) -> tuple[tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
-    """Apply indexer Q RoPE and return DeepGEMM-ready MXFP4 values/scales."""
+    """Apply indexer Q RoPE and return DeepGEMM-ready MXFP4 values/scales.
+
+    The specialized large-token path applies RoPE in place to ``index_q``.
+    The model passes the disposable output of the indexer projection here, so
+    callers must not reuse that tensor after this function returns.
+    """
 
     if index_q.dim() != 3:
         raise ValueError(f"index_q must be [tokens, heads, dim], got {index_q.shape}")
@@ -291,6 +308,22 @@ def deepseek_v4_prepare_indexer_q_mxfp4(
     if not index_q.is_cuda:
         raise ValueError(
             "deepseek_v4_prepare_indexer_q_mxfp4 only supports CUDA tensors."
+        )
+    if index_q.shape[
+        0
+    ] >= _TRTLLM_INDEXER_Q_MIN_TOKENS and _supports_trtllm_indexer_q_prepare(
+        index_q,
+        positions,
+        cos_sin_cache,
+    ):
+        return _trtllm_indexer_q_prepare_mxfp4(
+            index_q=index_q,
+            positions=positions,
+            cos_sin_cache=cos_sin_cache,
+            weights=weights,
+            softmax_scale=softmax_scale,
+            head_scale=head_scale,
+            enable_pdl=True,
         )
     return _triton_fused_indexer_q_rope_hadamard_mxfp4(
         index_q=index_q,

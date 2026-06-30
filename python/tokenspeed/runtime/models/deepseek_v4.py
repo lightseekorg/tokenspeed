@@ -3073,6 +3073,8 @@ class DeepseekV4Indexer(nn.Module):
         with nvtx_range("indexer_weights_proj"):
             weights, _ = self.weights_proj(hidden_states)
         with nvtx_range("indexer_prepare_mxfp4"):
+            # This call consumes the disposable projection output. The
+            # large-token TRT-LLM kernel path applies RoPE to index_q in place.
             packed_index_q, packed_weights = deepseek_v4_prepare_indexer_q_mxfp4(
                 index_q=index_q,
                 positions=positions,
