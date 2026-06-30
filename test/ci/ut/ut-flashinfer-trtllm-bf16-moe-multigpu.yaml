@@ -1,0 +1,27 @@
+api_version: ci.tokenspeed.io/v1
+name: ut-flashinfer-trtllm-bf16-moe-multigpu
+type: ut
+# Multi-GPU reproducer for the qwen3.5-397b-a17b-nvfp4 agentic perf IMA.
+# Sibling of `ut-flashinfer-trtllm-bf16-moe.yaml`: the 1-GPU UT exercises
+# `trtllm_bf16_moe` alone and passes on B200, while the 8-GPU agentic
+# perf job blows up the first time CudaGraphWrapper captures the
+# MTP/NextN drafter at bs=1. This task captures
+# `trtllm_allreduce_fusion -> trtllm_bf16_moe -> trtllm_reducescatter_fusion`
+# in one CUDAGraph on the same b200-8gpu runner, to see whether IPC /
+# lamport workspace racing the MoE workspace is the trigger -- without
+# spinning up the full TokenSpeed server.
+triggers:
+  - per-commit
+  - manual
+runner:
+  labels:
+    - b200-8gpu
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps.sh
+ut:
+  commands:
+    - python3 -m pytest tokenspeed-kernel/test/thirdparty/test_flashinfer_trtllm_bf16_moe_multigpu.py -v
+report:
+  github_step_summary: true
