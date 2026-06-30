@@ -874,8 +874,11 @@ class CudaGraphWrapper:
             self.input_buffers.seq_lens_buf[:padded_bs].copy_(seq_lens)
             self.input_buffers.req_pool_indices_buf[:padded_bs].copy_(req_pool_indices)
             if mamba_pool_indices is not None:
+                # Pad with -1 (PAD_SLOT_ID), NOT 0. Mamba slot 0 is a real
+                # allocatable slot, so padding with 0 aliases a live request's
+                # mamba state and corrupts it. -1 is the kernel-skipped pad id.
                 mamba_pool_indices = torch.nn.functional.pad(
-                    mamba_pool_indices, (0, pad), value=0
+                    mamba_pool_indices, (0, pad), value=-1
                 )
             if mamba_cow_src_indices is not None:
                 mamba_cow_src_indices = torch.nn.functional.pad(
