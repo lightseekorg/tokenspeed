@@ -752,10 +752,9 @@ class TRTLLMMHAAttnBackend(AttentionBackend):
                 dummy_slot=0,
             )
 
-        # Refresh spec_cache_seqlens_buf (clamped to >= spec_num_tokens) from
-        # this step's seq_lens so padded rows (seq_len=1) avoid NaN in the
-        # multi-token (target-verify) decode path.
-        if self.spec_num_tokens > 1 and not self.is_draft:
+        # Refresh for both verify and draft: draft step 1 is multi-token
+        # and reads spec_cache_seqlens_buf; later single-token steps don't.
+        if self.spec_num_tokens > 1:
             self._clamped_spec_seqlens(seq_lens, bs, self.spec_num_tokens)
 
         if bs in self.cuda_graph_prefill_metadata:

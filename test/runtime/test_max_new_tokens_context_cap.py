@@ -101,5 +101,28 @@ def test_resolved_cap_is_never_none():
         assert out.sampling_params.max_new_tokens == CONTEXT_LEN - 5
 
 
+def test_batch_each_item_gets_own_dict():
+    """normalize_batch_and_arguments must give each batch item its own dict."""
+    obj = GenerateReqInput(
+        input_ids=[list(range(90)), list(range(10)), list(range(5))],
+        sampling_params={},
+    )
+    obj.normalize_batch_and_arguments()
+
+    # Each item must have a distinct dict (no aliasing).
+    assert obj.sampling_params[0] is not obj.sampling_params[1]
+    assert obj.sampling_params[1] is not obj.sampling_params[2]
+
+    proc = _make_processor()
+    results = []
+    for i in range(obj.batch_size):
+        sub = obj[i]
+        results.append(asyncio.run(proc.tokenize_one_request(sub)))
+
+    assert results[0].sampling_params.max_new_tokens == CONTEXT_LEN - 90
+    assert results[1].sampling_params.max_new_tokens == CONTEXT_LEN - 10
+    assert results[2].sampling_params.max_new_tokens == CONTEXT_LEN - 5
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

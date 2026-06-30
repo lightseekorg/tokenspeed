@@ -28,6 +28,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.trtllm import (
     TRTLLMMHAAttnBackend,
 )
@@ -145,6 +146,47 @@ def test_cuda_graph_capture_builder_clamps():
     # Must be the dedicated clamped buffer, not the shared seq_lens_buf.
     assert cache_seqlens.data_ptr() == be.spec_cache_seqlens_buf.data_ptr()
     assert cache_seqlens.data_ptr() != seq_lens_buf.data_ptr()
+
+
+def test_draft_replay_refreshes_spec_cache_seqlens_buf():
+    """Draft replay must refresh spec_cache_seqlens_buf (draft step 1 is multi-token)."""
+    be = _make_backend(is_draft=True)
+    max_bs = 8
+    # At capture time, seq_lens_buf is all 1s (padded rows).
+    seq_lens_buf = torch.ones((max_bs,), dtype=torch.int32)
+    be.init_cuda_graph_state(max_bs, seq_lens_buf)
+
+    bs = 4
+    # Capture: multi-token metadata (step 1) + decode metadata (steps 2+).
+    be._init_multi_token_metadata_capture(bs, SPEC_NUM_TOKENS)
+    be._init_decode_metadata_capture(bs, seq_lens_buf)
+
+    # At capture, spec_cache_seqlens_buf was seeded from all-ones → clamped to 4.
+    capture_vals = be.spec_cache_seqlens_buf[:bs].clone()
+    assert int(capture_vals.min()) >= SPEC_NUM_TOKENS
+    assert int(capture_vals[0]) == SPEC_NUM_TOKENS  # 1 → clamped to 4
+
+    # Replay with real seq_lens (two real rows + two padded).
+    real_seq_lens = torch.tensor([512, 300, 1, 1], dtype=torch.int32)
+    req_pool_indices = torch.tensor([1, 2, 0, 0], dtype=torch.int32)
+    be.init_forward_metadata_replay_cuda_graph(
+        bs,
+        req_pool_indices,
+        real_seq_lens,
+        ForwardMode.DECODE,
+        req_to_page=None,  # skip page-table gather (Triton kernel)
+    )
+
+    # spec_cache_seqlens_buf must now reflect the clamped real values.
+    replay_vals = be.spec_cache_seqlens_buf[:bs]
+    assert int(replay_vals[0]) == 512  # real, no clamp needed
+    assert int(replay_vals[1]) == 300  # real, no clamp needed
+    assert int(replay_vals[2]) == SPEC_NUM_TOKENS  # 1 → clamped to 4
+    assert int(replay_vals[3]) == SPEC_NUM_TOKENS  # 1 → clamped to 4
+
+    # forward_prefill_metadata must point at spec_cache_seqlens_buf.
+    prefill_cache_seqlens = be.forward_prefill_metadata.cache_seqlens_int32
+    assert prefill_cache_seqlens.data_ptr() == be.spec_cache_seqlens_buf.data_ptr()
 
 
 if __name__ == "__main__":

@@ -191,6 +191,8 @@ def compute_out_cache_loc_kernel(
 
         # Compute page indices and offsets
         page_indices = positions // page_size
+        # Clamp to last valid page: avoids OOB reads past context-length bound.
+        page_indices = tl.minimum(page_indices, max_pages - 1)
         offsets_in_page = positions % page_size
 
         # Load page IDs from req_to_pages
@@ -281,6 +283,8 @@ def fused_decode_input_prep_kernel(
 
         positions_local = cache_start + token_offsets
         page_indices = positions_local // page_size
+        # Clamp to last valid page (avoids OOB reads past context-length bound).
+        page_indices = tl.minimum(page_indices, max_pages - 1)
         offsets_in_page = positions_local % page_size
 
         page_ptrs = req_to_pages_ptr + pool_idx * max_pages + page_indices
