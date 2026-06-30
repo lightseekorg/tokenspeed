@@ -3125,7 +3125,7 @@ def _run_moe_tile_w_via_vgpr(
 
     if USE_SLICE_N:
         SUB_BN: gl.constexpr = BLOCK_N // 2
-        scale_via_lds_slice_n: gl.constexpr = cfg.X_SCALE_VIA_LDS or cfg.W_SCALE_VIA_LDS
+        w_scale_via_lds_slice_n: gl.constexpr = cfg.W_SCALE_VIA_LDS
         gl.static_assert(
             SUB_BN == 128 and BLOCK_K_W == 128 and NUM_WARPS == 4,
             "USE_SLICE_N + W_VIA_VGPR requires SUB_BN=BLOCK_K_W=128 "
@@ -3133,7 +3133,7 @@ def _run_moe_tile_w_via_vgpr(
             "this shape (re-derive otherwise).",
         )
         LOAD_W_HALF_COPY_LAYOUT: gl.constexpr = _preshuffled_w_copy_layout(
-            SUB_BN // 16, BLOCK_K_W, scale_via_lds_slice_n, False
+            SUB_BN // 16, BLOCK_K_W, w_scale_via_lds_slice_n, False
         )
         (
             offsets_h,
@@ -3179,7 +3179,7 @@ def _run_moe_tile_w_via_vgpr(
         )
         return pgm.pipeline(K)
     else:
-        scale_via_lds_full: gl.constexpr = cfg.X_SCALE_VIA_LDS or cfg.W_SCALE_VIA_LDS
+        w_scale_via_lds_full: gl.constexpr = cfg.W_SCALE_VIA_LDS
         gl.static_assert(
             BLOCK_N == 128,
             "W_VIA_VGPR full-tile layout bases assume BLOCK_N=128. "
@@ -3187,7 +3187,7 @@ def _run_moe_tile_w_via_vgpr(
         )
         BLOCK_N_LAYOUT: gl.constexpr = BLOCK_N
         LOAD_W_COPY_LAYOUT: gl.constexpr = _preshuffled_w_copy_layout(
-            BLOCK_N_LAYOUT // 16, BLOCK_K_W, scale_via_lds_full, False
+            BLOCK_N_LAYOUT // 16, BLOCK_K_W, w_scale_via_lds_full, False
         )
         offsets_b_vgpr, base_off_b_vgpr = _make_preshuffled_w_full_offsets(
             w_base_offset,
@@ -3273,7 +3273,7 @@ def _run_moe_tile_preshuffled_lds_w(
 
     if USE_SLICE_N:
         SUB_BN: gl.constexpr = BLOCK_N // 2
-        scale_via_lds_slice_n: gl.constexpr = cfg.X_SCALE_VIA_LDS or cfg.W_SCALE_VIA_LDS
+        w_scale_via_lds_slice_n: gl.constexpr = cfg.W_SCALE_VIA_LDS
         gl.static_assert(
             SUB_BN == 128 and BLOCK_K_W == 128 and NUM_WARPS == 4,
             "USE_SLICE_N + preshuffled W requires SUB_BN=BLOCK_K_W=128 "
@@ -3281,10 +3281,10 @@ def _run_moe_tile_preshuffled_lds_w(
             "this shape (re-derive otherwise).",
         )
         LOAD_W_HALF_LAYOUT: gl.constexpr = _preshuffled_w_read_layout(
-            SUB_BN // 16, BLOCK_K_W, scale_via_lds_slice_n
+            SUB_BN // 16, BLOCK_K_W, w_scale_via_lds_slice_n
         )
         LOAD_W_HALF_COPY_LAYOUT: gl.constexpr = _preshuffled_w_copy_layout(
-            SUB_BN // 16, BLOCK_K_W, scale_via_lds_slice_n, True
+            SUB_BN // 16, BLOCK_K_W, w_scale_via_lds_slice_n, True
         )
         (
             offsets_h,
@@ -3340,12 +3340,12 @@ def _run_moe_tile_preshuffled_lds_w(
     # Keep the original half-tile layout in that specialization so the
     # preshuffled copy/read layouts remain valid during compilation.
     BLOCK_N_LAYOUT: gl.constexpr = (BLOCK_N // 2) if USE_SLICE_N else BLOCK_N
-    scale_via_lds_full: gl.constexpr = cfg.X_SCALE_VIA_LDS or cfg.W_SCALE_VIA_LDS
+    w_scale_via_lds_full: gl.constexpr = cfg.W_SCALE_VIA_LDS
     LOAD_W_LAYOUT: gl.constexpr = _preshuffled_w_read_layout(
-        BLOCK_N_LAYOUT // 16, BLOCK_K_W, scale_via_lds_full
+        BLOCK_N_LAYOUT // 16, BLOCK_K_W, w_scale_via_lds_full
     )
     LOAD_W_COPY_LAYOUT: gl.constexpr = _preshuffled_w_copy_layout(
-        BLOCK_N_LAYOUT // 16, BLOCK_K_W, scale_via_lds_full, True
+        BLOCK_N_LAYOUT // 16, BLOCK_K_W, w_scale_via_lds_full, True
     )
     offsets_b_vgpr, base_off_b_vgpr = _make_preshuffled_w_full_offsets(
         w_base_offset,
@@ -6629,9 +6629,9 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
         return None
     if w13_preshuffled and two_i % 128 != 0:
         return None
-    I = two_i // 2
+    i_dim = two_i // 2
     w2_k_pk = int(getattr(w2_raw, "original_k_pk", int(w2_raw.shape[1])))
-    if w2_k_pk * 2 != I:
+    if w2_k_pk * 2 != i_dim:
         return None
     w2_n_phys = int(w2_raw.shape[2])
     N = int(getattr(w2_raw, "original_n", w2_n_phys))
@@ -6676,7 +6676,7 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
         s2_split_k = 1
 
     inter = torch.empty(
-        (n_tokens * top_k, I), dtype=x_fp8.dtype, device=hidden_states.device
+        (n_tokens * top_k, i_dim), dtype=x_fp8.dtype, device=hidden_states.device
     )
     # Cooperative-LDS, num_warps=4, software-pipelined stage1 -- the smallest-M
     # decode path (this wrapper is only entered for n_tokens <= WARP_DECODE_MAX_M).
@@ -6687,14 +6687,14 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
     COOP_BLOCK_N = 128 if w13_preshuffled else 64
     COOP_BLOCK_K = 256
     COOP_NUM_BUFFERS = 3
-    coop_grid = (n_tokens * ((2 * I + COOP_BLOCK_N - 1) // COOP_BLOCK_N) * top_k,)
+    coop_grid = (n_tokens * ((2 * i_dim + COOP_BLOCK_N - 1) // COOP_BLOCK_N) * top_k,)
     # X is stored as raw i8 in LDS and bitcast to e4m3 in mfma_scaled; pass the
     # uint8 view (an fp8 LDS buffer fails to lower).
     x_uint8 = x_fp8.view(torch.uint8)
     # fmt: off
     _warp_decode_topk_stage1_coop_kernel[coop_grid](
         x_uint8, router_logits_c, w13_raw, w13_scale, topk_ids, topk_weights, inter,
-        n_tokens, n_experts, D, I,
+        n_tokens, n_experts, D, i_dim,
         x_uint8.stride(0), x_uint8.stride(1),
         router_logits_c.stride(0), topk_ids.stride(0), topk_weights.stride(0),
         w13_raw.stride(0), w13_raw.stride(-2), w13_raw.stride(-1),
@@ -6734,13 +6734,13 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
     # fmt: off
     _warp_decode_stage2_fp8_mxfp4_kernel[s2_grid](
         inter, w2_raw, w2_scale, topk_ids, topk_weights, s2_dst,
-        n_tokens, N, w2_n_phys, I,
+        n_tokens, N, w2_n_phys, i_dim,
         inter.stride(0), inter.stride(1),
         w2_raw.stride(0), w2_raw.stride(-2), w2_raw.stride(-1),
         w2_scale.stride(0), w2_scale.stride(-2), w2_scale.stride(-1),
         s2_stride_om, s2_stride_on, s2_stride_ok,
         w2_act_scale, b2,
-        I_PACKED=I // 2, TOPK=top_k,
+        I_PACKED=i_dim // 2, TOPK=top_k,
         BLOCK_K=BLOCK_K, BLOCK_N=S2_BLOCK_N, M_DUP=S2_M_DUP,
         W_PRESHUFFLED=w2_preshuffled,
         HAS_BIAS=w2_bias is not None, SPLIT_K=s2_split_k,
@@ -7262,7 +7262,7 @@ def _warp_decode_stage1_coop_compute(
     Y,
     M,
     D,
-    I,
+    i_dim,
     stride_xm,
     stride_xk,
     stride_we,
@@ -7294,7 +7294,7 @@ def _warp_decode_stage1_coop_compute(
     per-tensor x scale) but specialized to a single decode token (row 0 of the
     BLOCK_M tile).
     """
-    N = 2 * I
+    N = 2 * i_dim
     off_n = pid_n * BLOCK_N
     # Keep base offsets int32 (buffer_load_to_shared requires int32/uint32
     # offsets); expert * stride fits int32 for GPT-OSS shapes.
@@ -7363,12 +7363,12 @@ def _warp_decode_stage1_coop_compute(
             "warp_decode preshuffled W13 path assumes 128x128 W tiles "
             "and NUM_WARPS=4; re-derive the copy/read layouts for other shapes.",
         )
-        scale_via_lds: gl.constexpr = cfg.X_SCALE_VIA_LDS or cfg.W_SCALE_VIA_LDS
+        w_scale_via_lds: gl.constexpr = cfg.W_SCALE_VIA_LDS
         LOAD_W_LAYOUT: gl.constexpr = _preshuffled_w_read_layout(
-            BLOCK_N // 16, BLOCK_K_W, scale_via_lds
+            BLOCK_N // 16, BLOCK_K_W, w_scale_via_lds
         )
         LOAD_W_COPY_LAYOUT: gl.constexpr = _preshuffled_w_copy_layout(
-            BLOCK_N // 16, BLOCK_K_W, scale_via_lds, True
+            BLOCK_N // 16, BLOCK_K_W, w_scale_via_lds, True
         )
         offsets_w, base_off_w = _make_preshuffled_w_full_offsets(
             w_base_offset,
@@ -7477,7 +7477,7 @@ def _warp_decode_stage1_coop_compute(
         + offs_y_n[None, :].to(gl.int64) * stride_yn
         + offs_y_m[:, None].to(gl.int64) * 0
     )
-    mask_y = (offs_y_m[:, None] == 0) & valid & (offs_y_n[None, :] < I)
+    mask_y = (offs_y_m[:, None] == 0) & valid & (offs_y_n[None, :] < i_dim)
     gl.store(Y + y_offs, out, mask=mask_y)
 
 
@@ -7493,7 +7493,7 @@ def _warp_decode_topk_stage1_coop_kernel(
     M,
     E,
     D,
-    I,
+    i_dim,
     stride_xm,
     stride_xk,
     stride_lm,
@@ -7532,7 +7532,7 @@ def _warp_decode_topk_stage1_coop_kernel(
     by TOPK. Routing layouts span all warps (EP/TKP padded to 64*NUM_WARPS).
     """
     pid = gl.program_id(axis=0)
-    num_pid_n = gl.cdiv(2 * I, BLOCK_N)
+    num_pid_n = gl.cdiv(2 * i_dim, BLOCK_N)
     slot = pid % TOPK
     rest = pid // TOPK
     pid_n = rest % num_pid_n
@@ -7585,7 +7585,7 @@ def _warp_decode_topk_stage1_coop_kernel(
     _warp_decode_stage1_coop_compute(
         token, slot, expert, pid_n,
         X, W, WScale, Y,
-        M, D, I,
+        M, D, i_dim,
         stride_xm, stride_xk,
         stride_we, stride_wk, stride_wn,
         stride_wse, stride_wsk, stride_wsn,
@@ -7645,7 +7645,7 @@ def _warp_decode_stage2_load_tile(
     stride_wk,
     stride_wsk,
     N_PHYS,
-    I,
+    i_dim,
     BLOCK_K: gl.constexpr,
     BLOCK_K_PACKED: gl.constexpr,
     BLOCK_K_SCALE: gl.constexpr,
@@ -7674,8 +7674,10 @@ def _warp_decode_stage2_load_tile(
     if MASK_TAIL:
         # Partial / odd final K-tile (K = intermediate dim I): mask out-of-range
         # K lanes to 0 so they contribute nothing and never over-read.
-        sk_valid = (kt * BLOCK_K_SCALE + bsk) < (I // 32)
-        a = gl.amd.cdna4.buffer_load(ptr=X, offsets=a_off, mask=k_elem < I, other=0.0)
+        sk_valid = (kt * BLOCK_K_SCALE + bsk) < (i_dim // 32)
+        a = gl.amd.cdna4.buffer_load(
+            ptr=X, offsets=a_off, mask=k_elem < i_dim, other=0.0
+        )
         b_mask = k_pack < I_PACKED
         b = gl.amd.cdna4.buffer_load(ptr=W, offsets=b_off, mask=b_mask, other=0)
         s = gl.amd.cdna4.buffer_load(ptr=WScale, offsets=s_off, mask=sk_valid, other=0)
@@ -7706,7 +7708,7 @@ def _warp_decode_stage2_load_pair(
     stride_wk,
     stride_wsk,
     N_PHYS,
-    I,
+    i_dim,
     BLOCK_K: gl.constexpr,
     BLOCK_K_PACKED: gl.constexpr,
     BLOCK_K_SCALE: gl.constexpr,
@@ -7718,13 +7720,13 @@ def _warp_decode_stage2_load_pair(
     a_even, b_even, s_even = _warp_decode_stage2_load_tile(
         kt, ak, bk, bsk, am, X, W, WScale,
         x_row_off, w_expert_off, w_n_off, ws_expert_off, scale_row_off,
-        n_cols, stride_xk, stride_wk, stride_wsk, N_PHYS, I,
+        n_cols, stride_xk, stride_wk, stride_wsk, N_PHYS, i_dim,
         BLOCK_K, BLOCK_K_PACKED, BLOCK_K_SCALE, I_PACKED, W_PRESHUFFLED,
     )
     a_odd, b_odd, s_odd = _warp_decode_stage2_load_tile(
         kt + 1, ak, bk, bsk, am, X, W, WScale,
         x_row_off, w_expert_off, w_n_off, ws_expert_off, scale_row_off,
-        n_cols, stride_xk, stride_wk, stride_wsk, N_PHYS, I,
+        n_cols, stride_xk, stride_wk, stride_wsk, N_PHYS, i_dim,
         BLOCK_K, BLOCK_K_PACKED, BLOCK_K_SCALE, I_PACKED, W_PRESHUFFLED,
     )
     # fmt: on
@@ -7760,7 +7762,7 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
     M,
     N,
     N_PHYS,
-    I,
+    i_dim,
     stride_xm,
     stride_xk,
     stride_we,
@@ -7814,8 +7816,8 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
     # Full + partial K-tile coverage (K = intermediate dim I). The old
     # `num_kt = I // BLOCK_K` dropped the partial final tile, miscomputing any
     # I not a multiple of BLOCK_K (GPT-OSS I=2880 lost K=2816..2879).
-    num_full = I // BLOCK_K
-    total_kt = (I + BLOCK_K - 1) // BLOCK_K
+    num_full = i_dim // BLOCK_K
+    total_kt = (i_dim + BLOCK_K - 1) // BLOCK_K
     kt_per = (total_kt + SPLIT_K - 1) // SPLIT_K
     kt_start = pid_k * kt_per
     kt_stop = gl.minimum(kt_start + kt_per, total_kt)
@@ -7869,7 +7871,7 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
                      a_odd, b_odd, s_odd) = _warp_decode_stage2_load_pair(
                         kt_start, ak, bk, bsk, am, X, W, WScale,
                         x_row_off, w_expert_off, w_n_off, ws_expert_off, scale_row_off,
-                        n_cols, stride_xk, stride_wk, stride_wsk, N_PHYS, I,
+                        n_cols, stride_xk, stride_wk, stride_wsk, N_PHYS, i_dim,
                         BLOCK_K, BLOCK_K_PACKED, BLOCK_K_SCALE, I_PACKED, W_PRESHUFFLED,
                     )
                     for kt in range(kt_start, main_end - 2, 2):
@@ -7877,7 +7879,7 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
                          nxt_a_odd, nxt_b_odd, nxt_s_odd) = _warp_decode_stage2_load_pair(
                             kt + 2, ak, bk, bsk, am, X, W, WScale,
                             x_row_off, w_expert_off, w_n_off, ws_expert_off, scale_row_off,
-                            n_cols, stride_xk, stride_wk, stride_wsk, N_PHYS, I,
+                            n_cols, stride_xk, stride_wk, stride_wsk, N_PHYS, i_dim,
                             BLOCK_K, BLOCK_K_PACKED, BLOCK_K_SCALE, I_PACKED, W_PRESHUFFLED,
                         )
                         acc = _warp_decode_stage2_mfma_pair(
@@ -7896,7 +7898,7 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
                     a_t, b_t, s_t = _warp_decode_stage2_load_tile(
                         kt, ak, bk, bsk, am, X, W, WScale,
                         x_row_off, w_expert_off, w_n_off, ws_expert_off, scale_row_off,
-                        n_cols, stride_xk, stride_wk, stride_wsk, N_PHYS, I,
+                        n_cols, stride_xk, stride_wk, stride_wsk, N_PHYS, i_dim,
                         BLOCK_K, BLOCK_K_PACKED, BLOCK_K_SCALE, I_PACKED, W_PRESHUFFLED,
                         MASK_TAIL=True,
                     )
