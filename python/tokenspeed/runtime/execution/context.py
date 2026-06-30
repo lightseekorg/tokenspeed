@@ -60,6 +60,11 @@ class ForwardContext:
     global_num_tokens: list[int] | None = None
     global_bs: list[int] | None = None
     all_decode_or_idle: bool = False
+    # True when every DP rank is in EXTEND mode (no idle/decode/mixed rank). The
+    # prefill CUDA graph needs this to engage safely under DP: it bakes a uniform
+    # ``[bucket]*world_size`` EP all-to-all, which only matches if all ranks replay
+    # the same-shaped prefill graph. Mirrors ``all_decode_or_idle`` for the decode graph.
+    all_extend: bool = False
 
     # --- logits processor ---
     gather_ids: torch.Tensor | None = None
@@ -73,3 +78,12 @@ class ForwardContext:
     # DSA sparse top-k shared across layers and draft steps.
     dsa_prefill_topk: Any | None = None
     dsa_decode_topk: Any | None = None
+
+    # DSA SWA write-slot mapping + per-ratio compressor memo, computed once per forward
+    # by the first attention layer and shared across the rest (like the top-k above).
+    # Kept on ctx (not threaded from the model forward) so the sharing is replay-safe
+    # under the breakable prefill graph: ctx is rebound to the live forward at each
+    # replay, so the first eager attention break recomputes from live metadata and the
+    # rest reuse -- no capture-time value can leak across replays.
+    dsa_swa_slot_mapping: torch.Tensor | None = None
+    dsa_compressor_slot_cache: Any | None = None

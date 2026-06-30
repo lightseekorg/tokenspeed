@@ -82,6 +82,10 @@ from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
+from tokenspeed.runtime.execution.breakable_cuda_graph import (
+    break_point,
+    slice_to_real_tokens,
+)
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -3565,6 +3569,7 @@ class DeepseekV4Attention(nn.Module):
         out, _ = self.wo_b(z.flatten(1))
         return out
 
+    @break_point
     def forward(
         self,
         positions: torch.Tensor,
@@ -3574,10 +3579,26 @@ class DeepseekV4Attention(nn.Module):
         swa_slot_mapping: torch.Tensor | None = None,
         compressor_slot_cache: dict | None = None,
     ) -> torch.Tensor:
+        # DSA attention is one coarse breakable-graph break point. Per layer it
+        # does multiple paged-cache writes (SWA / compressor / indexer), a
+        # data/length-dependent indexer -> top-k stage, the FlashMLA sparse kernel,
+        # AND aux-stream forks -- none of which can be captured into a CUDA graph.
+        # So under a prefill-graph capture the whole attention runs eager (reading
+        # the live ``ctx``) while the layer's norms + MoE stay graphed; direct call
+        # otherwise (see ``break_point``). Padding rows are handled by the existing
+        # metadata.is_valid_token masking. See docs/design/prefill-breakable-cudagraph.md.
+        # Skip the whole DSA stack on an empty (idle / DP-idle) batch -- explicit,
+        # like the sibling MLP/MoE forwards; the @break_point decorator does NOT
+        # short-circuit 0 rows on the eager path.
         if hidden_states.shape[0] == 0:
             return hidden_states
+        # Cross-layer compressor memo, shared via ctx (created once per forward by the
+        # first layer); replay-safe because ctx is rebound to the live forward. See
+        # ForwardContext.dsa_compressor_slot_cache and DeepseekV4Model.forward.
         if compressor_slot_cache is None:
-            compressor_slot_cache = {}
+            compressor_slot_cache = ctx.dsa_compressor_slot_cache
+            if compressor_slot_cache is None:
+                compressor_slot_cache = ctx.dsa_compressor_slot_cache = {}
         profile_prefix = f"attn_{self.attention_kind}"
         cos_sin_cache = self.rotary_emb.cos_sin_cache
         if cos_sin_cache.dtype != torch.float32:
@@ -3586,6 +3607,25 @@ class DeepseekV4Attention(nn.Module):
         metadata = ctx.attn_backend.forward_metadata
         if metadata is None:
             raise RuntimeError("DeepSeek V4 attention requires forward metadata")
+
+        # Under a breakable prefill CUDA graph the inner model runs a padded token
+        # bucket, but DSA attention (indexer -> top-k, sparse FlashMLA, paged-cache
+        # writes) must operate on exactly the real tokens the live metadata
+        # describes -- forward_deepseek_v4_prefill asserts q matches the metadata
+        # token count. This eager break re-runs each replay, so slice the
+        # token-shaped inputs down to the live count; the padded tail is discarded
+        # by the prefill-graph output slice. No-op in eager (already equal).
+        token_to_req = getattr(metadata, "token_to_req_indices", None)
+        if token_to_req is not None:
+            positions, hidden_states, out_cache_loc, swa_slot_mapping = (
+                slice_to_real_tokens(
+                    token_to_req.numel(),
+                    positions,
+                    hidden_states,
+                    out_cache_loc,
+                    swa_slot_mapping,
+                )
+            )
 
         # --- Phase 1: pre-compute input GEMMs in parallel ---
         # Q/KV projection on main stream; compressor GEMM(s) on aux stream.
@@ -3612,11 +3652,19 @@ class DeepseekV4Attention(nn.Module):
                         )
 
         if swa_slot_mapping is None:
-            swa_slot_mapping = _deepseek_v4_swa_slot_mapping(
-                ctx,
-                positions,
-                out_cache_loc,
-            )
+            # Cross-layer SWA slot mapping, shared via ctx (computed once per forward by
+            # the first layer from LIVE sliced positions/out_cache_loc); replay-safe
+            # because ctx is rebound to the live forward. The mapping is per-token, not
+            # per-layer, so every layer's slice is identical -- caching the first is
+            # correct. See ForwardContext.dsa_swa_slot_mapping and DeepseekV4Model.forward.
+            swa_slot_mapping = ctx.dsa_swa_slot_mapping
+            if swa_slot_mapping is None:
+                swa_slot_mapping = _deepseek_v4_swa_slot_mapping(
+                    ctx,
+                    positions,
+                    out_cache_loc,
+                )
+                ctx.dsa_swa_slot_mapping = swa_slot_mapping
 
         def insert_swa_cache() -> None:
             with nvtx_range(f"{profile_prefix}_insert_swa_cache"):
@@ -4019,18 +4067,19 @@ class DeepseekV4Model(nn.Module):
                 hidden_states = self.embed_tokens(input_ids)
         with nvtx_range("hc_repeat"):
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
-        # The SWA write-slot mapping is identical across all layers, so compute
-        # it once per step here instead of recomputing it in every attention
-        # layer (DeepSeek-V3 likewise derives its slot mapping once per step).
-        swa_slot_mapping = _deepseek_v4_swa_slot_mapping(
-            ctx,
-            positions,
-            out_cache_loc,
-        )
-        # Per-(step, ratio) compressor slot mappings are identical across layers of the
-        # same ratio; memoize within the step (filled lazily by the first compressor of
-        # each ratio, reused by the rest).
-        compressor_slot_cache: dict = {}
+        # The SWA write-slot mapping + per-ratio compressor memo are identical across
+        # layers. They are derived from per-forward metadata tensors
+        # (token_to_req_indices, swa_block_table), so computing them HERE (the graphed
+        # model-forward scope) would bake the dummy batch's addresses under a breakable
+        # prefill graph and replay stale. Instead the FIRST attention layer's eager break
+        # computes them from LIVE metadata and stashes them on ``ctx``
+        # (ForwardContext.dsa_swa_slot_mapping) for the rest to reuse. ctx is rebound to
+        # the live forward at each replay, so the sharing is replay-safe and no
+        # capture-aware branching is needed; eager keeps the once-per-forward fast path.
+        ctx.dsa_swa_slot_mapping = None
+        ctx.dsa_compressor_slot_cache = None
+        # Deferred-state MHC cross-layer fusion (#529): the hypercompressed residual
+        # state threads layer-to-layer and is finalized by mhc_post after the loop.
         hc_x_prev = None
         hc_post_prev = None
         hc_comb_prev = None
@@ -4041,8 +4090,8 @@ class DeepseekV4Model(nn.Module):
                 ctx,
                 out_cache_loc,
                 input_ids,
-                swa_slot_mapping,
-                compressor_slot_cache,
+                None,  # swa_slot_mapping: first break computes + caches on ctx
+                None,  # compressor_slot_cache: shared dict created on ctx
                 hc_x_prev,
                 hc_post_prev,
                 hc_comb_prev,

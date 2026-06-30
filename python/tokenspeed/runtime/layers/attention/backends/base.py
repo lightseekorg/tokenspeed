@@ -26,6 +26,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
+
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
     from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
@@ -160,6 +162,7 @@ class AttentionBackend(ABC):
         if record_cache and save_kv_cache:
             self.step_counter.record_cache()
 
+    @break_point
     def forward(
         self,
         q: torch.Tensor,
@@ -175,6 +178,15 @@ class AttentionBackend(ABC):
         **kwargs,
     ):
         """Run forward on an attention layer with explicit scheduler metadata.
+
+        Decorated as a breakable-graph break point: under a prefill-graph capture
+        the data/length-dependent attention (KV writeback + varlen kernel) runs
+        eager while the surrounding token-shaped compute (projections, norms, MoE)
+        stays graphed; a direct call otherwise. So any model whose attention routes
+        through this method is breakable by default. Models that need a broader
+        break (e.g. MLA's prefill/decode split + both attention paths) decorate
+        their own enclosing method with ``@break_point`` -- this inner break then
+        passes through (capture is inactive inside the outer eager break).
 
         ``record_kv_cache`` overrides the PD layerwise cache-step recording:
         ``None`` keeps the default (record on the EXTEND-side path), an explicit

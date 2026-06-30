@@ -37,6 +37,7 @@ from tokenspeed_kernel.ops.kvcache.triton import (
 )
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
+from tokenspeed.runtime.execution.breakable_cuda_graph import scrub_padding_tail
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
@@ -55,6 +56,15 @@ _KERNEL_SOLUTION_BY_BACKEND = {
     "triton": "triton",
     "flashinfer": "flashinfer",
 }
+
+
+def _scrub_extend_padding(metadata, q, k, v) -> None:
+    """Zero the q/k/v rows beyond the real (unpadded) token count under a prefill graph.
+
+    Reads the count from the pinned CPU cu-seqlens mirror (sync-free) and delegates the
+    zeroing to the shared prefill-graph padding helper. No-op on normal unpadded forwards.
+    """
+    scrub_padding_tail(metadata.cu_extend_seq_lens_cpu[-1], q, k, v)
 
 
 @dataclass(kw_only=True)
@@ -457,6 +467,7 @@ class MHAAttnBackend(AttentionBackend):
         save_kv_cache: bool,
         sinks: torch.Tensor | None,
     ) -> torch.Tensor:
+        _scrub_extend_padding(metadata, q, k, v)
         # TODO: use a custom kernel to do downcast
         if self.is_fp8:
             q = q.to(torch.float8_e4m3fn)
@@ -492,6 +503,7 @@ class MHAAttnBackend(AttentionBackend):
         save_kv_cache: bool,
         sinks: torch.Tensor | None,
     ) -> torch.Tensor:
+        _scrub_extend_padding(metadata, q, k, v)
         if save_kv_cache:
             self._save_kv_cache(layer, out_cache_loc, token_to_kv_pool, k, v)
 

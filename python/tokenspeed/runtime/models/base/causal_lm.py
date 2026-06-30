@@ -44,6 +44,12 @@ class BaseCausalLM(nn.Module):
 
     model_cls: type[BaseTransformerModel]
 
+    # Optional breakable prefill CUDA graph, installed by ModelExecutor. Declared at
+    # class scope (not only in __init__) so it is unconditionally present even on
+    # subclasses that bypass BaseCausalLM.__init__ (e.g. the EAGLE3 draft model),
+    # which must never run the target's prefill graph and keep the default None.
+    prefill_graph_runner = None
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -57,6 +63,8 @@ class BaseCausalLM(nn.Module):
         self.mapping = mapping
         self.quant_config = quant_config
         self.capture_aux_hidden_states: bool = False
+        # Optional breakable prefill CUDA graph, installed by ModelExecutor.
+        self.prefill_graph_runner = None
 
         self.model = self.resolve_model(config, mapping, quant_config, prefix)
         self.lm_head = self.resolve_lm_head(config, quant_config, prefix)
@@ -144,13 +152,25 @@ class BaseCausalLM(nn.Module):
 
         model_kwargs = self.prepare_model_kwargs(ctx, input_ids, kwargs)
 
-        hidden_states, aux_hidden_states = self.model(
-            input_ids,
-            positions,
-            ctx,
-            out_cache_loc,
-            **model_kwargs,
-        )
+        # Breakable prefill graph: only for plain (no input_embeds) forwards; the
+        # runner returns None for ineligible batches and we fall back to eager.
+        # ``prefill_graph_runner`` defaults to None at class scope, so even draft
+        # subclasses that skip BaseCausalLM.__init__ have it (and never install one).
+        graph_out = None
+        runner = self.prefill_graph_runner
+        if runner is not None and not model_kwargs:
+            graph_out = runner.maybe_run(ctx)
+
+        if graph_out is not None:
+            hidden_states, aux_hidden_states = graph_out
+        else:
+            hidden_states, aux_hidden_states = self.model(
+                input_ids,
+                positions,
+                ctx,
+                out_cache_loc,
+                **model_kwargs,
+            )
         logits_metadata = LogitsMetadata.from_forward_context(ctx)
 
         return self.logits_processor(

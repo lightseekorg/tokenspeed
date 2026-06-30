@@ -417,7 +417,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             "z": z,
         }
 
-        core_attn_out = ctx.attn_backend.forward(
+        # The GDN mixer (causal conv1d + chunked gated-delta scan) is the breakable-
+        # graph break point: it is data/length-dependent and mutates the recurrent
+        # conv/ssm state in place (via live cache_indices), so under a prefill-graph
+        # capture it runs eager (the @break_point on the linear attn backend's
+        # forward) while the surrounding in/out projections, gating and norm stay
+        # graphed. Direct call when not capturing. The backend returns a rank-stable
+        # [T, Hv, D] (== z.shape) -- it canonicalizes the scan's batched-vs-ragged
+        # output internally -- so no model-side reshape is needed here.
+        attn_kwargs = dict(
             q=None,
             k=None,
             v=None,
@@ -428,6 +436,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             bs=ctx.bs,
             **kwargs,
         )
+        core_attn_out = ctx.attn_backend.forward(**attn_kwargs)
 
         z_shape_og = z.shape
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])

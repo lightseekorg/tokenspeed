@@ -52,6 +52,10 @@ except Exception:
 from tokenspeed.runtime.configs.utils import get_rope_theta
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_manager import CommManager
+from tokenspeed.runtime.execution.breakable_cuda_graph import (
+    break_point,
+    slice_to_real_tokens,
+)
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
@@ -1428,6 +1432,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         )
         return indexer_output
 
+    @break_point
     def forward(
         self,
         positions: torch.Tensor,
@@ -1437,6 +1442,38 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         comm_manager: CommManager,
         block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # GLM-5 DSA attention is one coarse breakable-graph break point: like
+        # DeepSeek-V4 it does paged-cache writes, a data-dependent indexer ->
+        # top-k stage and the FlashMLA sparse kernel (plus pre-attn collectives),
+        # none capturable. Under a prefill-graph capture the whole attention runs
+        # eager (reading the live ``ctx``) while the layer's norms + MoE stay
+        # graphed; direct call otherwise (see ``break_point``).
+        # Under a breakable prefill graph the inner model runs a padded token
+        # bucket, but DSA attention (and the decode-window split, which derives
+        # decode_start from the total token count) must operate on exactly the real
+        # tokens the live metadata describes -- otherwise the decode rows are sliced
+        # out of the padded tail. This eager break re-runs each replay on the live
+        # ambient ctx, so slice the token-shaped inputs to the real count; the padded
+        # tail is discarded by the prefill-graph output slice. No-op in eager
+        # (already equal). Mirrors the DeepSeek-V4 DSA break.
+        # Skip the whole DSA stack on an empty (idle / DP-idle) batch -- explicit;
+        # the @break_point decorator does NOT short-circuit 0 rows on the eager path.
+        if hidden_states.shape[0] == 0:
+            return hidden_states
+        _metadata = getattr(ctx.attn_backend, "forward_metadata", None)
+        _token_to_req = getattr(_metadata, "token_to_req_indices", None)
+        if _token_to_req is not None:
+            real_tokens = _token_to_req.numel()
+            # block_scale is only token-shaped when it matches hidden_states (else a
+            # different layout we must not slice); guard before trimming it.
+            if (
+                block_scale is not None
+                and block_scale.shape[0] == hidden_states.shape[0]
+            ):
+                (block_scale,) = slice_to_real_tokens(real_tokens, block_scale)
+            positions, hidden_states, out_cache_loc = slice_to_real_tokens(
+                real_tokens, positions, hidden_states, out_cache_loc
+            )
         qkv = self.fused_qkv_a_proj_with_mqa(
             hidden_states,
             block_scale,

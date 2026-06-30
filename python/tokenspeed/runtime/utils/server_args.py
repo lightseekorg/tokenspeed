@@ -245,7 +245,11 @@ class ServerArgs:
     low_latency_max_num_tokens_per_gpu: int = 256
     max_cudagraph_capture_size: int | None = None
     disable_prefill_graph: bool | None = False
-    prefill_graph_max_tokens: int | None = 128
+    # Breakable prefill CUDA graph is opt-in: 0 disables it. Set > 0 to enable and
+    # cap the largest captured token bucket. Per-family correctness is validated
+    # incrementally (mha: gpt-oss/qwen3; MLA/GDN: in progress), so it stays off by
+    # default until each model family it touches is validated on hardware.
+    prefill_graph_max_tokens: int | None = 0
     cudagraph_capture_sizes: list[int] | None = None
     enable_nan_detection: bool = False
     enable_nvtx: bool = False
@@ -1582,7 +1586,8 @@ class ServerArgs:
             "--prefill-graph-max-tokens",
             type=int,
             default=ServerArgs.prefill_graph_max_tokens,
-            help="Max query tokens to capture when enable prefill graph",
+            help="Enable the breakable prefill CUDA graph and cap the largest "
+            "captured token bucket. 0 (default) disables it (opt-in).",
         )
         parser.add_argument(
             "--enable-nan-detection",

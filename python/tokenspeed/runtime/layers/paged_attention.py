@@ -76,6 +76,12 @@ class PagedAttention(nn.Module):
                 k = k.view(-1, self.tp_k_head_num, self.v_head_dim)
                 v = v.view(-1, self.tp_v_head_num, self.v_head_dim)
 
+        # The backend ``forward`` is the breakable-graph break point (decorated with
+        # @break_point on AttentionBackend.forward): under a prefill-graph capture
+        # the data/length-dependent attention (KV writeback + varlen kernel, and the
+        # source of the host-side max_seq_len_q scalar) runs eager while the
+        # surrounding token-shaped compute is graphed; a direct call otherwise. So
+        # any model routing attention through here is breakable by default.
         return ctx.attn_backend.forward(
             q,
             k,
