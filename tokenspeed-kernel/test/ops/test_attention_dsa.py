@@ -91,6 +91,43 @@ def test_dsa_top_paged(device: str, solution: str, require) -> None:
     assert (topk_slots[0, int(expected_lens[0].item()) :] == -1).all()
 
 
+def test_dsa_top_paged_large_context(device: str, require) -> None:
+    require("attention", "dsa_top_paged", "triton", torch.bfloat16, "q")
+
+    page_size = 64
+    pages = 1024
+    topk = 512
+    q = torch.randn((1, 2, 128), device=device, dtype=torch.bfloat16)
+    weights = torch.randn((1, 2), device=device, dtype=torch.float32)
+    index_k = torch.randn((page_size, 128), device=device, dtype=torch.bfloat16)
+    seq_lens = torch.tensor([5], device=device, dtype=torch.int32)
+    block_table = torch.zeros((1, pages), device=device, dtype=torch.int32)
+
+    topk_slots, topk_lens = dsa_top_paged(
+        q,
+        weights,
+        seq_lens,
+        block_table,
+        page_size=page_size,
+        topk=topk,
+        softmax_scale=128**-0.5,
+        index_k_cache=index_k,
+        solution="triton",
+    )
+
+    scores = []
+    for offset in range(int(seq_lens[0].item())):
+        per_head = (q[0].float() * index_k[offset].float()).sum(dim=-1)
+        scores.append((per_head * weights[0]).sum() * (128**-0.5))
+    expected = torch.topk(torch.stack(scores), int(seq_lens[0].item())).indices.to(
+        torch.int32
+    )
+
+    torch.testing.assert_close(topk_lens.cpu(), torch.tensor([5], dtype=torch.int32))
+    torch.testing.assert_close(topk_slots[0, :5].cpu(), expected.cpu())
+    assert (topk_slots[0, 5:] == -1).all()
+
+
 @pytest.mark.parametrize("solution", ["triton", "deep_gemm"])
 def test_dsa_topk(device: str, solution: str, require) -> None:
     require("attention", "dsa_topk", solution, torch.bfloat16, "q")

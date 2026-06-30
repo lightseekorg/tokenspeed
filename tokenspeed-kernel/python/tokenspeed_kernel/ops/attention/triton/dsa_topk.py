@@ -29,6 +29,9 @@ from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
+_RADIX_TOPK_MIN_COLS = 65536
+_RADIX_TOPK_BLOCK_N = 4096
+
 
 @triton.jit
 def _dsa_decode_logits_kernel(
@@ -247,6 +250,167 @@ def _dsa_logits_topk_kernel(
     )
 
 
+@triton.jit
+def _dsa_radix_hist_kernel(
+    logits,
+    prefixes,
+    hist,
+    logits_stride: tl.constexpr,
+    hist_tiles: tl.constexpr,
+    n_cols: tl.constexpr,
+    shift: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    row = tl.program_id(0)
+    tile = tl.program_id(1)
+    offsets = tile * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = offsets < n_cols
+    values = tl.load(
+        logits + row * logits_stride + offsets,
+        mask=mask,
+        other=-float("inf"),
+    )
+    keys = _fp32_to_ordered_key(values)
+    prefix = tl.load(prefixes + row).to(tl.uint32)
+    if shift == 28:
+        prefix_match = mask
+    else:
+        prefix_match = (keys >> (shift + 4)) == prefix
+    bucket = (keys >> shift) & 0xF
+    base = (row * hist_tiles + tile) * 16
+    for b in tl.static_range(0, 16):
+        count = tl.sum(tl.where(mask & prefix_match & (bucket == b), 1, 0))
+        tl.store(hist + base + b, count)
+
+
+@triton.jit
+def _dsa_radix_update_kernel(
+    prefixes,
+    remaining,
+    hist,
+    hist_tiles: tl.constexpr,
+    BLOCK_TILES: tl.constexpr,
+):
+    row = tl.program_id(0)
+    tile_offsets = tl.arange(0, BLOCK_TILES)
+    tile_mask = tile_offsets < hist_tiles
+    row_hist = hist + row * hist_tiles * 16
+    kth = tl.load(remaining + row).to(tl.int32)
+    cumulative = tl.full((), 0, dtype=tl.int32)
+    selected = tl.full((), 0, dtype=tl.uint32)
+    selected_remaining = kth
+    found = False
+    for b_desc in tl.static_range(0, 16):
+        b = 15 - b_desc
+        counts = tl.load(row_hist + tile_offsets * 16 + b, mask=tile_mask, other=0)
+        count = tl.sum(counts).to(tl.int32)
+        take = (found == False) & (kth <= cumulative + count)
+        selected = tl.where(take, b, selected)
+        selected_remaining = tl.where(take, kth - cumulative, selected_remaining)
+        cumulative += tl.where(found == False, count, 0)
+        found = found | take
+    prefix = tl.load(prefixes + row).to(tl.uint32)
+    tl.store(prefixes + row, (prefix << 4) | selected)
+    tl.store(remaining + row, selected_remaining)
+
+
+@triton.jit
+def _dsa_radix_scatter_kernel(
+    logits,
+    prefixes,
+    remaining,
+    out_values,
+    out_indices,
+    logits_stride: tl.constexpr,
+    out_stride: tl.constexpr,
+    n_cols: tl.constexpr,
+    topk: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    row = tl.program_id(0)
+    top_offsets = tl.arange(0, topk)
+    tl.store(out_values + row * out_stride + top_offsets, -float("inf"))
+    tl.store(out_indices + row * out_stride + top_offsets, -1)
+
+    threshold = tl.load(prefixes + row).to(tl.uint32)
+    keep_equal = tl.load(remaining + row).to(tl.int32)
+    count_greater = topk - keep_equal
+    num_greater = tl.full((), 0, dtype=tl.int32)
+    num_equal = tl.full((), 0, dtype=tl.int32)
+    for start in tl.range(0, n_cols, BLOCK_N):
+        offsets = start + tl.arange(0, BLOCK_N)
+        mask = offsets < n_cols
+        values = tl.load(
+            logits + row * logits_stride + offsets,
+            mask=mask,
+            other=-float("inf"),
+        )
+        finite = values != -float("inf")
+        keys = _fp32_to_ordered_key(values)
+        greater = mask & finite & (keys > threshold)
+        equal = mask & finite & (keys == threshold)
+
+        greater_pos = num_greater + tl.cumsum(greater.to(tl.int32), 0) - 1
+        greater_mask = greater & (greater_pos < topk)
+        tl.store(
+            out_values + row * out_stride + greater_pos,
+            values,
+            mask=greater_mask,
+        )
+        tl.store(
+            out_indices + row * out_stride + greater_pos,
+            offsets,
+            mask=greater_mask,
+        )
+        num_greater += tl.sum(greater.to(tl.int32))
+
+        equal_pos = count_greater + num_equal + tl.cumsum(equal.to(tl.int32), 0) - 1
+        equal_mask = (
+            equal & (equal_pos < topk) & (equal_pos < count_greater + keep_equal)
+        )
+        tl.store(
+            out_values + row * out_stride + equal_pos,
+            values,
+            mask=equal_mask,
+        )
+        tl.store(
+            out_indices + row * out_stride + equal_pos,
+            offsets,
+            mask=equal_mask,
+        )
+        num_equal += tl.sum(equal.to(tl.int32))
+
+
+@triton.jit
+def _dsa_radix_sort_selected_kernel(
+    values,
+    indices,
+    out,
+    stride: tl.constexpr,
+    n_cols_padded: tl.constexpr,
+    topk: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, topk)
+    vals = tl.load(values + row * stride + offsets)
+    idx = tl.load(indices + row * stride + offsets).to(tl.int32)
+    valid = idx >= 0
+    value_keys = _fp32_to_ordered_key(vals).to(tl.uint64)
+    index_keys = (n_cols_padded - idx).to(tl.uint64)
+    packed = (value_keys << 32) | index_keys
+    packed = tl.where(valid, packed, tl.zeros_like(packed))
+    packed = tl.sort(packed[None, :], dim=1, descending=True)
+    packed = tl.reshape(packed, (topk,))
+    sorted_idx = n_cols_padded - (packed & 0xFFFFFFFF).to(tl.int32)
+    sorted_vals = _ordered_key_to_fp32((packed >> 32).to(tl.uint32))
+    valid = (
+        (sorted_idx >= 0)
+        & (sorted_idx < n_cols_padded)
+        & (sorted_vals != -float("inf"))
+    )
+    tl.store(out + row * stride + offsets, tl.where(valid, sorted_idx, -1))
+
+
 def _is_power_of_2(value: int) -> bool:
     return value > 0 and (value & (value - 1)) == 0
 
@@ -255,6 +419,70 @@ def _next_power_of_2(value: int) -> int:
     if value <= 1:
         return 1
     return 1 << (int(value) - 1).bit_length()
+
+
+def _radix_topk(logits: torch.Tensor, topk: int) -> torch.Tensor:
+    rows, cols = logits.shape
+    block_n = _RADIX_TOPK_BLOCK_N
+    tiles = triton.cdiv(cols, block_n)
+    hist = torch.empty((rows, tiles, 16), dtype=torch.int32, device=logits.device)
+    prefixes = torch.zeros((rows,), dtype=torch.int32, device=logits.device)
+    remaining = torch.full(
+        (rows,), min(int(topk), cols), dtype=torch.int32, device=logits.device
+    )
+    out_values = torch.empty((rows, topk), dtype=torch.float32, device=logits.device)
+    out_indices = torch.empty((rows, topk), dtype=torch.int32, device=logits.device)
+    out = torch.empty((rows, topk), dtype=torch.int32, device=logits.device)
+    block_tiles = _next_power_of_2(tiles)
+
+    for shift in range(28, -1, -4):
+        _dsa_radix_hist_kernel[(rows, tiles)](
+            logits,
+            prefixes,
+            hist,
+            logits.stride(0),
+            tiles,
+            n_cols=cols,
+            shift=shift,
+            BLOCK_N=block_n,
+            num_warps=8,
+            num_stages=1,
+        )
+        _dsa_radix_update_kernel[(rows,)](
+            prefixes,
+            remaining,
+            hist,
+            hist_tiles=tiles,
+            BLOCK_TILES=block_tiles,
+            num_warps=8,
+            num_stages=1,
+        )
+
+    _dsa_radix_scatter_kernel[(rows,)](
+        logits,
+        prefixes,
+        remaining,
+        out_values,
+        out_indices,
+        logits.stride(0),
+        out_indices.stride(0),
+        n_cols=cols,
+        topk=int(topk),
+        BLOCK_N=block_n,
+        num_warps=8,
+        num_stages=1,
+    )
+    _dsa_radix_sort_selected_kernel[(rows,)](
+        out_values,
+        out_indices,
+        out,
+        out.stride(0),
+        n_cols_padded=_next_power_of_2(max(cols, int(topk))),
+        topk=int(topk),
+        num_warps=8,
+        num_stages=1,
+    )
+    return out
 
 
 def _topk_with_padding(logits: torch.Tensor, topk: int) -> torch.Tensor:
@@ -269,9 +497,12 @@ def _topk_with_padding(logits: torch.Tensor, topk: int) -> torch.Tensor:
         raise TypeError(f"logits must be FP32, got {logits.dtype}")
 
     rows, cols = logits.shape
-    out = torch.full((rows, topk), -1, dtype=torch.int32, device=logits.device)
     if rows == 0 or cols == 0:
-        return out
+        return torch.full((rows, topk), -1, dtype=torch.int32, device=logits.device)
+    logits = logits.contiguous()
+    if cols >= _RADIX_TOPK_MIN_COLS:
+        return _radix_topk(logits, topk)
+    out = torch.full((rows, topk), -1, dtype=torch.int32, device=logits.device)
     n_cols_padded = _next_power_of_2(max(cols, topk))
     block_n = min(n_cols_padded, 2048)
     block_n = max(block_n, topk)
@@ -281,7 +512,7 @@ def _topk_with_padding(logits: torch.Tensor, topk: int) -> torch.Tensor:
             f"cols={cols}, padded={n_cols_padded}, block={block_n}"
         )
     _dsa_logits_topk_kernel[(rows,)](
-        logits.contiguous(),
+        logits,
         out,
         logits.stride(0),
         out.stride(0),
