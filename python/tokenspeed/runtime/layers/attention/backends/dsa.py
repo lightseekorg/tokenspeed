@@ -26,7 +26,7 @@ from tokenspeed_kernel.ops.attention import (
     dsa_prefill,
 )
 from tokenspeed_kernel.ops.attention.triton.dsa_sparse_layout import (
-    workspace_topk_to_global_slots as dsa_workspace_topk_to_global_slots,
+    workspace_topk_to_global_slots,
 )
 from tokenspeed_kernel.platform import current_platform
 
@@ -423,7 +423,7 @@ class DSABackend(AttentionBackend):
                 "DSA sparse prefill requires kv_workspace_slots to "
                 "map workspace-local top-k rows back to KV cache slots."
             )
-        topk_slots = dsa_workspace_topk_to_global_slots(
+        topk_slots = workspace_topk_to_global_slots(
             workspace_indices=workspace_indices,
             kv_workspace_slots=kv_workspace_slots,
         )
