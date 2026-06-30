@@ -26,11 +26,9 @@ from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
-_DSA_QUERY_DTYPES = frozenset({torch.bfloat16, torch.float8_e4m3fn})
-
 
 @triton.jit
-def _dsa_sparse_decode_kernel(
+def _dsa_packed_kv_kernel(
     q,
     kv_fp8,
     kv_scale,
@@ -181,7 +179,7 @@ def _dsa_sparse_decode_kernel(
 
 
 @triton.jit
-def _dsa_dense_kv_decode_kernel(
+def _dsa_dense_kv_kernel(
     q,
     kv,
     topk_indices,
@@ -300,9 +298,9 @@ def _dsa_dense_kv_decode_kernel(
     tl.store(out + out_base + v_offsets, result, mask=v_mask)
 
 
-def dsa_sparse_decode(
+def _run_packed_kv(
     q: torch.Tensor,
-    sparse_kv: torch.Tensor,
+    packed_kv: torch.Tensor,
     topk_indices: torch.Tensor,
     topk_lens: torch.Tensor,
     *,
@@ -310,61 +308,18 @@ def dsa_sparse_decode(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
 ) -> torch.Tensor:
-    if q.dtype not in _DSA_QUERY_DTYPES:
-        raise TypeError(f"dsa_sparse_decode expects BF16 or FP8 q, got {q.dtype}")
-    if sparse_kv.dtype != torch.uint8:
-        raise TypeError(
-            f"dsa_sparse_decode expects uint8 sparse_kv, got {sparse_kv.dtype}"
-        )
-    if topk_indices.dtype != torch.int32:
-        raise TypeError(
-            f"dsa_sparse_decode expects int32 topk_indices, got {topk_indices.dtype}"
-        )
-    if topk_lens.dtype != torch.int32:
-        raise TypeError(
-            f"dsa_sparse_decode expects int32 topk_lens, got {topk_lens.dtype}"
-        )
-    if q.dim() != 3:
-        raise ValueError(
-            f"dsa_sparse_decode expects q [tokens, heads, dim], got {q.shape}"
-        )
-    if topk_indices.dim() != 2 or topk_indices.shape[0] != q.shape[0]:
-        raise ValueError(
-            "dsa_sparse_decode top-k shape mismatch: "
-            f"q={tuple(q.shape)}, topk={tuple(topk_indices.shape)}"
-        )
-    if topk_lens.shape != (q.shape[0],):
-        raise ValueError(
-            "dsa_sparse_decode top-k lens shape mismatch: "
-            f"expected {(q.shape[0],)}, got {tuple(topk_lens.shape)}"
-        )
-    row_bytes = int(sparse_kv.shape[1])
-    expected_row_bytes = kv_lora_rank + kv_lora_rank // 128 * 4 + qk_rope_head_dim * 2
-    if row_bytes != expected_row_bytes:
-        raise ValueError(
-            "dsa_sparse_decode sparse KV row size mismatch: "
-            f"got {row_bytes}, expected {expected_row_bytes}"
-        )
-    if q.shape[-1] != kv_lora_rank + qk_rope_head_dim:
-        raise ValueError(
-            "dsa_sparse_decode q dim mismatch: "
-            f"got {q.shape[-1]}, expected {kv_lora_rank + qk_rope_head_dim}"
-        )
-
-    q = q.contiguous()
-    topk_indices = topk_indices.contiguous()
-    topk_lens = topk_lens.contiguous()
+    row_bytes = int(packed_kv.shape[1])
     out = torch.empty(
         (q.shape[0], q.shape[1], kv_lora_rank),
         dtype=torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype,
         device=q.device,
     )
     grid = (q.shape[0], q.shape[1], triton.cdiv(kv_lora_rank, 64))
-    _dsa_sparse_decode_kernel[grid](
+    _dsa_packed_kv_kernel[grid](
         q,
-        sparse_kv.view(torch.float8_e4m3fn),
-        sparse_kv.view(torch.float32),
-        sparse_kv.view(torch.bfloat16),
+        packed_kv.view(torch.float8_e4m3fn),
+        packed_kv.view(torch.float32),
+        packed_kv.view(torch.bfloat16),
         topk_indices,
         topk_lens,
         out,
@@ -384,7 +339,7 @@ def dsa_sparse_decode(
     return out
 
 
-def dsa_dense_kv_decode(
+def _run_dense_kv(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -394,57 +349,14 @@ def dsa_dense_kv_decode(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
 ) -> torch.Tensor:
-    if q.dtype not in _DSA_QUERY_DTYPES:
-        raise TypeError(f"dsa_dense_kv_decode expects BF16 or FP8 q, got {q.dtype}")
-    if kv_cache.dtype not in _DSA_QUERY_DTYPES:
-        raise TypeError(
-            f"dsa_dense_kv_decode expects BF16 or FP8 kv_cache, got {kv_cache.dtype}"
-        )
-    if topk_indices.dtype != torch.int32:
-        raise TypeError(
-            f"dsa_dense_kv_decode expects int32 topk_indices, got {topk_indices.dtype}"
-        )
-    if topk_lens.dtype != torch.int32:
-        raise TypeError(
-            f"dsa_dense_kv_decode expects int32 topk_lens, got {topk_lens.dtype}"
-        )
-    if q.dim() != 3:
-        raise ValueError(
-            f"dsa_dense_kv_decode expects q [tokens, heads, dim], got {q.shape}"
-        )
-    if topk_indices.dim() != 2 or topk_indices.shape[0] != q.shape[0]:
-        raise ValueError(
-            "dsa_dense_kv_decode top-k shape mismatch: "
-            f"q={tuple(q.shape)}, topk={tuple(topk_indices.shape)}"
-        )
-    if topk_lens.shape != (q.shape[0],):
-        raise ValueError(
-            "dsa_dense_kv_decode top-k lens shape mismatch: "
-            f"expected {(q.shape[0],)}, got {tuple(topk_lens.shape)}"
-        )
     kv_dim = int(kv_lora_rank) + int(qk_rope_head_dim)
-    if kv_cache.dim() != 2 or kv_cache.shape[1] != kv_dim:
-        raise ValueError(
-            "dsa_dense_kv_decode kv_cache must be [slots, kv_dim], got "
-            f"{tuple(kv_cache.shape)}, expected kv_dim={kv_dim}"
-        )
-    if q.shape[-1] != kv_dim:
-        raise ValueError(
-            "dsa_dense_kv_decode q dim mismatch: "
-            f"got {q.shape[-1]}, expected {kv_dim}"
-        )
-
-    q = q.contiguous()
-    kv_cache = kv_cache.contiguous()
-    topk_indices = topk_indices.contiguous()
-    topk_lens = topk_lens.contiguous()
     out = torch.empty(
         (q.shape[0], q.shape[1], kv_lora_rank),
         dtype=torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype,
         device=q.device,
     )
     grid = (q.shape[0], q.shape[1], triton.cdiv(kv_lora_rank, 64))
-    _dsa_dense_kv_decode_kernel[grid](
+    _dsa_dense_kv_kernel[grid](
         q,
         kv_cache,
         topk_indices,
@@ -466,55 +378,67 @@ def dsa_dense_kv_decode(
     return out
 
 
-def _flatten_sparse_kv_cache(
-    sparse_kv_cache: torch.Tensor, page_size: int
-) -> torch.Tensor:
-    if sparse_kv_cache.dim() == 2:
-        return sparse_kv_cache
-    if sparse_kv_cache.dim() == 4:
-        if sparse_kv_cache.shape[1] != int(page_size) or sparse_kv_cache.shape[2] != 1:
-            raise ValueError(
-                "paged sparse_kv_cache must be [pages, page_size, 1, row_bytes], "
-                f"got {tuple(sparse_kv_cache.shape)} with page_size={page_size}"
-            )
-        return sparse_kv_cache.reshape(-1, sparse_kv_cache.shape[-1])
-    raise ValueError(
-        "sparse_kv_cache must be [slots, row_bytes] or "
-        f"[pages, page_size, 1, row_bytes], got {tuple(sparse_kv_cache.shape)}"
-    )
+def _flatten_packed_kv_cache(packed_kv_cache: torch.Tensor) -> torch.Tensor:
+    if packed_kv_cache.dim() == 2:
+        return packed_kv_cache
+    return packed_kv_cache.reshape(-1, packed_kv_cache.shape[-1])
 
 
-def _flatten_dense_kv_cache(kv_cache: torch.Tensor, page_size: int) -> torch.Tensor:
+def _flatten_dense_kv_cache(kv_cache: torch.Tensor) -> torch.Tensor:
     if kv_cache.dim() == 2:
         return kv_cache
-    if kv_cache.dim() == 3 and kv_cache.shape[1] == 1:
+    if kv_cache.dim() == 3:
         return kv_cache.squeeze(1)
-    if kv_cache.dim() == 4:
-        if kv_cache.shape[1] == int(page_size) and kv_cache.shape[2] == 1:
-            return kv_cache.reshape(-1, kv_cache.shape[-1])
-        if kv_cache.shape[1] == 1 and kv_cache.shape[2] == int(page_size):
-            return kv_cache.permute(0, 2, 1, 3).reshape(-1, kv_cache.shape[-1])
-    raise ValueError(
-        "kv_cache must be [slots, dim], [slots, 1, dim], or paged MLA cache, "
-        f"got {tuple(kv_cache.shape)}"
-    )
+    if kv_cache.shape[1] == 1:
+        kv_cache = kv_cache.permute(0, 2, 1, 3)
+    return kv_cache.reshape(-1, kv_cache.shape[-1])
 
 
-def _flatten_sparse_query(q: torch.Tensor, q_len_per_req: int) -> torch.Tensor:
+def _flatten_query(q: torch.Tensor) -> torch.Tensor:
     if q.dim() == 3:
         return q
-    if q.dim() == 4:
-        return q.reshape(-1, q.shape[2], q.shape[3])
-    raise ValueError(
-        "sparse MLA q must be [tokens, heads, dim] or "
-        f"[batch, q_len, heads, dim], got {tuple(q.shape)}"
-    )
+    return q.reshape(-1, q.shape[-2], q.shape[-1])
 
 
-def _copy_or_return_sparse_out(
-    result: torch.Tensor,
+def _run_dsa(
+    *,
+    q: torch.Tensor,
+    kv_cache: torch.Tensor | None,
+    packed_kv_cache: torch.Tensor | None,
+    topk_slots: torch.Tensor,
+    topk_lens: torch.Tensor,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    softmax_scale: float,
+    k_scale: float,
     out: torch.Tensor | None,
 ) -> torch.Tensor:
+    q = _flatten_query(q).contiguous()
+    topk_slots = topk_slots.contiguous()
+    topk_lens = topk_lens.contiguous()
+    softmax_scale = float(softmax_scale) * float(k_scale)
+
+    if packed_kv_cache is not None:
+        result = _run_packed_kv(
+            q,
+            _flatten_packed_kv_cache(packed_kv_cache).contiguous(),
+            topk_slots,
+            topk_lens,
+            softmax_scale=softmax_scale,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+        )
+    else:
+        result = _run_dense_kv(
+            q,
+            _flatten_dense_kv_cache(kv_cache).contiguous(),
+            topk_slots,
+            topk_lens,
+            softmax_scale=softmax_scale,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+        )
+
     if out is None:
         return result
     out_view = out.reshape_as(result)
@@ -529,7 +453,10 @@ def _copy_or_return_sparse_out(
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
     signatures=frozenset(
-        {format_signature(q=dense_tensor_format(dtype)) for dtype in _DSA_QUERY_DTYPES}
+        {
+            format_signature(q=dense_tensor_format(torch.bfloat16)),
+            format_signature(q=dense_tensor_format(torch.float8_e4m3fn)),
+        }
     ),
     traits={
         "page_size": frozenset({64}),
@@ -565,38 +492,18 @@ def triton_dsa_decode(
     return_lse: bool = False,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    if sparse_kv_cache is None and kv_cache is None:
-        raise RuntimeError("Triton sparse MLA requires kv_cache or sparse_kv_cache")
-    if topk_lens is None:
-        raise RuntimeError("Triton sparse MLA requires topk_lens")
-    if return_lse:
-        raise RuntimeError("Triton sparse MLA does not support return_lse")
-    if logit_cap != 0.0:
-        raise RuntimeError("Triton sparse MLA does not support logit_cap")
-    q_flat = _flatten_sparse_query(q, q_len_per_req).contiguous()
-    if sparse_kv_cache is not None:
-        sparse_kv = _flatten_sparse_kv_cache(sparse_kv_cache, page_size).contiguous()
-        result = dsa_sparse_decode(
-            q_flat,
-            sparse_kv,
-            topk_slots.contiguous(),
-            topk_lens.contiguous(),
-            softmax_scale=softmax_scale * float(k_scale),
-            kv_lora_rank=kv_lora_rank,
-            qk_rope_head_dim=qk_rope_head_dim,
-        )
-    else:
-        dense_kv = _flatten_dense_kv_cache(kv_cache, page_size).contiguous()
-        result = dsa_dense_kv_decode(
-            q_flat,
-            dense_kv,
-            topk_slots.contiguous(),
-            topk_lens.contiguous(),
-            softmax_scale=softmax_scale * float(k_scale),
-            kv_lora_rank=kv_lora_rank,
-            qk_rope_head_dim=qk_rope_head_dim,
-        )
-    return _copy_or_return_sparse_out(result, out)
+    return _run_dsa(
+        q=q,
+        kv_cache=kv_cache,
+        packed_kv_cache=sparse_kv_cache,
+        topk_slots=topk_slots,
+        topk_lens=topk_lens,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        softmax_scale=softmax_scale,
+        k_scale=k_scale,
+        out=out,
+    )
 
 
 @register_kernel(
@@ -606,7 +513,10 @@ def triton_dsa_decode(
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
     signatures=frozenset(
-        {format_signature(q=dense_tensor_format(dtype)) for dtype in _DSA_QUERY_DTYPES}
+        {
+            format_signature(q=dense_tensor_format(torch.bfloat16)),
+            format_signature(q=dense_tensor_format(torch.float8_e4m3fn)),
+        }
     ),
     traits={
         "page_size": frozenset({64}),
@@ -642,21 +552,15 @@ def triton_dsa_prefill(
     return_lse: bool = False,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    return triton_dsa_decode(
+    return _run_dsa(
         q=q,
         kv_cache=kv_cache,
-        sparse_kv_cache=sparse_kv_cache,
+        packed_kv_cache=sparse_kv_cache,
         topk_slots=topk_slots,
         topk_lens=topk_lens,
-        max_seqlen_k=max_seqlen_k,
-        qk_nope_head_dim=qk_nope_head_dim,
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
         softmax_scale=softmax_scale,
-        page_size=page_size,
-        q_len_per_req=q_len_per_req,
-        logit_cap=logit_cap,
         k_scale=k_scale,
-        return_lse=return_lse,
         out=out,
     )
