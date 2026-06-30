@@ -160,6 +160,34 @@ def test_argmax_matches_torch_for_low_precision_dtypes(dtype):
     torch.testing.assert_close(cute_argmax(x), torch.argmax(x, dim=-1), atol=0, rtol=0)
 
 
+def test_argmax_empty_batch_falls_back_to_torch():
+    """M=0 (empty batch) must fall back to torch.argmax instead of launching
+    the CuTe kernel with zero grid blocks, which raises
+    ``CUDA_ERROR_INVALID_VALUE``.
+
+    This path is hit during ``execute_idle_forward()`` in DP/EP configs
+    where an idle rank runs the drafter model with ``bs=0``.
+    """
+    _need_cuda()
+    N = MODEL_VOCABS["qwen3_5"]
+    x = torch.empty((0, N), device="cuda", dtype=torch.float32)
+    out = cute_argmax(x)
+    assert out.shape == (0,)
+    assert out.dtype == torch.int64
+    ref = torch.argmax(x, dim=-1)
+    torch.testing.assert_close(out, ref, atol=0, rtol=0)
+
+    # With caller-provided out buffer.
+    out_buf = torch.empty(0, dtype=torch.int32, device="cuda")
+    ret = cute_argmax(x, out=out_buf)
+    assert ret.data_ptr() == out_buf.data_ptr()
+
+    # argmax_pair must also handle M=0.
+    pair = cute_argmax_pair(x)
+    assert pair.shape == (0, 2)
+    assert pair.dtype == torch.float32
+
+
 def test_argmax_falls_back_for_1d_input():
     _need_cuda()
     x = torch.randn(4096, device="cuda", dtype=torch.float32)
