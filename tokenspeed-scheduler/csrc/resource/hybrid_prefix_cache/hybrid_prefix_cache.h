@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -116,10 +117,17 @@ public:
     void PopulateOp(ForwardOperationBase& op_base) const;
 
     // Run admission against `simulated_free`; prunes evictable snapshots on
-    // group-pool pressure, then applies the debit on success.
+    // group-pool pressure, then applies the debit on success. When present,
+    // `commit_target_raw_tokens` is the terminal depth CommitChunk will publish
+    // immediately before AcquireForRequest for this chunk. `commit_token_pages`
+    // identifies an already-existing exact terminal so admission can account
+    // for continuation-state groups that CommitChunk will reuse rather than
+    // checkpoint again.
     bool AdmitChunk(const std::string& request_id, std::int32_t first_raw_position_of_op,
                     std::int32_t target_raw_tokens_exclusive, std::map<std::string, std::int32_t>& simulated_free,
-                    const MatchResult::PagedCache& paged_cache_hit = {});
+                    const MatchResult::PagedCache& paged_cache_hit = {},
+                    std::optional<std::int32_t> commit_target_raw_tokens = std::nullopt,
+                    std::span<const std::span<const std::int32_t>> commit_token_pages = {});
 
     // Retract-decode variant: admission uses a fresh-table view and credits
     // pages owned by the stale table before it is released.
@@ -173,6 +181,8 @@ private:
     struct PagedCacheAdmissionContext {
         bool fresh_table_view{false};
         std::map<std::string, std::int32_t> owned_release_credit{};
+        std::optional<std::int32_t> commit_target_raw_tokens{};
+        std::span<const std::span<const std::int32_t>> commit_token_pages{};
     };
 
     // Classify which family caused `admission.ok == false`.
