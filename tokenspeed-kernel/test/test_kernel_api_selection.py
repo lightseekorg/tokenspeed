@@ -51,6 +51,9 @@ import tokenspeed_kernel.ops.sampling.gluon as _sampling_gluon
 import torch
 from tokenspeed_kernel.ops.attention.triton import dsa as _attention_triton_dsa
 from tokenspeed_kernel.ops.attention.triton import (
+    dsa_topk as _attention_triton_dsa_topk,
+)
+from tokenspeed_kernel.ops.attention.triton import (
     merge_state as _attention_triton_merge_state,
 )
 from tokenspeed_kernel.ops.attention.triton import (
@@ -96,6 +99,7 @@ _RELOAD_MODULES = [
     _attention_triton_mla_decode,
     _attention_triton_merge_state,
     _attention_triton_dsa,
+    _attention_triton_dsa_topk,
     _attention_triton,
     _attention_pkg,
     # GEMM registration modules.
@@ -503,6 +507,48 @@ def _attention_dsa_prefill() -> object:
         page_size=64,
         solution="triton",
     )
+
+
+def _attention_dsa_decode_topk() -> object:
+    q = torch.empty((2, 2, 128), dtype=torch.bfloat16)
+    weights = torch.empty((2, 2), dtype=torch.float32)
+    index_k = torch.empty((128, 128), dtype=torch.bfloat16)
+    seq_lens = torch.tensor([64, 64], dtype=torch.int32)
+    block_table = torch.empty((2, 1), dtype=torch.int32)
+    return tokenspeed_kernel.dsa_decode_topk(
+        q,
+        weights,
+        seq_lens,
+        block_table,
+        page_size=64,
+        topk=512,
+        softmax_scale=1.0,
+        index_k_cache=index_k,
+    )
+
+
+def _attention_dsa_prefill_topk() -> object:
+    q = torch.empty((2, 2, 128), dtype=torch.bfloat16)
+    weights = torch.empty((2, 2), dtype=torch.float32)
+    index_k = torch.empty((128, 128), dtype=torch.bfloat16)
+    kv_workspace_slots = torch.arange(64, dtype=torch.int64)
+    row_starts = torch.tensor([0, 8], dtype=torch.int32)
+    row_ends = torch.tensor([8, 16], dtype=torch.int32)
+    return tokenspeed_kernel.dsa_prefill_topk(
+        q,
+        weights,
+        kv_workspace_slots,
+        row_starts,
+        row_ends,
+        topk=512,
+        softmax_scale=1.0,
+        index_k_cache=index_k,
+    )
+
+
+def _attention_dsa_plan() -> object:
+    seq_lens = torch.tensor([64, 64], dtype=torch.int32)
+    return tokenspeed_kernel.dsa_plan(seq_lens, page_size=64)
 
 
 def _attention_merge_state() -> object:
@@ -1035,6 +1081,30 @@ _CASES = [
         "triton_dsa_prefill",
         _attention_dsa_prefill,
     ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "dsa_decode_topk",
+        "triton_dsa_decode_topk",
+        _attention_dsa_decode_topk,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "dsa_prefill_topk",
+        "triton_dsa_prefill_topk",
+        _attention_dsa_prefill_topk,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "dsa_plan",
+        "triton_dsa_plan",
+        _attention_dsa_plan,
+    ),
     # GEMM API x architecture golden cases.
     _case(_is_supported_gpu, "supported-gpu", "gemm", "mm", "torch_mm", _mm_dense),
     _case(
@@ -1230,6 +1300,8 @@ def selected_kernel_spy(monkeypatch):
                 return torch.empty_like(kwargs["out_a"]), torch.empty_like(
                     kwargs["lse_a"]
                 )
+            if case.mode == "dsa_plan":
+                return torch.empty((1, 4), dtype=torch.int32)
 
             q = kwargs["q"]
             if kwargs.get("return_lse", False):

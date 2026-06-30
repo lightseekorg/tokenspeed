@@ -54,11 +54,70 @@ def _check_out(
 
 if platform.is_nvidia:
     from tokenspeed_kernel.thirdparty import deep_gemm
+    from tokenspeed_kernel.thirdparty import trtllm as _trtllm  # noqa: F401
 
     @register_kernel(
         "attention",
-        "dsa_top_paged",
-        name="deep_gemm_dsa_top_paged",
+        "dsa_plan",
+        name="deep_gemm_dsa_plan",
+        solution="deep_gemm",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 0),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=frozenset(
+            {format_signature(seq_lens=dense_tensor_format(torch.int32))}
+        ),
+        traits={
+            "page_size": frozenset({64}),
+            "q_len_per_req": frozenset({1, 2, 3, 4, 5, 6}),
+        },
+        priority=Priority.PERFORMANT,
+    )
+    def deep_gemm_dsa_plan(
+        seq_lens: torch.Tensor,
+        *,
+        page_size: int,
+        q_len_per_req: int = 1,
+        out: object | None = None,
+    ) -> torch.Tensor:
+        q_len_per_req = int(q_len_per_req)
+        seq_lens = seq_lens.to(dtype=torch.int32).contiguous()
+        if seq_lens.dim() == 1:
+            seq_lens = seq_lens.view(-1, q_len_per_req).contiguous()
+        else:
+            seq_lens = seq_lens.contiguous()
+        refreshed = deep_gemm.get_paged_mqa_logits_metadata(
+            seq_lens,
+            int(page_size),
+            deep_gemm.get_num_sms(),
+        )
+        if out is None:
+            return refreshed
+        if (
+            not isinstance(out, torch.Tensor)
+            or out.shape != refreshed.shape
+            or out.device != refreshed.device
+            or out.dtype != refreshed.dtype
+        ):
+            actual = (
+                f"{tuple(out.shape)} {out.dtype} {out.device}"
+                if isinstance(out, torch.Tensor)
+                else type(out).__name__
+            )
+            raise RuntimeError(
+                "DSA paged top-k plan changed shape during CUDA graph replay; "
+                "recapture or use eager for this batch. "
+                f"captured={actual}, refreshed={tuple(refreshed.shape)} "
+                f"{refreshed.dtype} {refreshed.device}"
+            )
+        out.copy_(refreshed)
+        return out
+
+    @register_kernel(
+        "attention",
+        "dsa_decode_topk",
+        name="deep_gemm_dsa_decode_topk",
         solution="deep_gemm",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
@@ -81,7 +140,7 @@ if platform.is_nvidia:
         },
         priority=Priority.PERFORMANT,
     )
-    def deep_gemm_dsa_top_paged(
+    def deep_gemm_dsa_decode_topk(
         q: torch.Tensor,
         weights: torch.Tensor,
         seq_lens: torch.Tensor,
@@ -173,8 +232,8 @@ if platform.is_nvidia:
 
     @register_kernel(
         "attention",
-        "dsa_topk",
-        name="deep_gemm_dsa_topk",
+        "dsa_prefill_topk",
+        name="deep_gemm_dsa_prefill_topk",
         solution="deep_gemm",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
@@ -195,7 +254,7 @@ if platform.is_nvidia:
         },
         priority=Priority.PERFORMANT,
     )
-    def deep_gemm_dsa_topk(
+    def deep_gemm_dsa_prefill_topk(
         q: torch.Tensor,
         weights: torch.Tensor,
         kv_workspace_slots: torch.Tensor,
@@ -301,7 +360,7 @@ if platform.is_nvidia:
             logits.nan_to_num_(
                 nan=float("-inf"), posinf=float("-inf"), neginf=float("-inf")
             )
-            trtllm_ops.indexer_topk_prefill(
+            torch.ops.trtllm.indexer_topk_prefill(
                 logits.contiguous(),
                 local_starts_i32[start:end],
                 candidate_lens[start:end].to(torch.int32).contiguous(),

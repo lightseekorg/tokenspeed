@@ -26,9 +26,10 @@ import pytest
 import torch
 from tokenspeed_kernel import (
     dsa_decode,
+    dsa_decode_topk,
+    dsa_plan,
     dsa_prefill,
-    dsa_top_paged,
-    dsa_topk,
+    dsa_prefill_topk,
 )
 from tokenspeed_kernel.ops.attention.triton.dsa_sparse_layout import (
     workspace_topk_to_global_slots as dsa_workspace_topk_to_global_slots,
@@ -74,8 +75,8 @@ def _pack_index_k_cache(
 
 
 @pytest.mark.parametrize("solution", ["triton", "deep_gemm"])
-def test_dsa_top_paged(device: str, solution: str, require) -> None:
-    require("attention", "dsa_top_paged", solution, torch.bfloat16, "q")
+def test_dsa_decode_topk(device: str, solution: str, require) -> None:
+    require("attention", "dsa_decode_topk", solution, torch.bfloat16, "q")
     if solution == "deep_gemm":
         pytest.skip("DeepGEMM DSA paged top-k requires packed FP8 cache fixture")
 
@@ -91,7 +92,7 @@ def test_dsa_top_paged(device: str, solution: str, require) -> None:
     out = torch.empty((3, topk), device=device, dtype=torch.int32)
     lens_out = torch.empty((3,), device=device, dtype=torch.int32)
 
-    topk_slots, topk_lens = dsa_top_paged(
+    topk_slots, topk_lens = dsa_decode_topk(
         q,
         weights,
         seq_lens,
@@ -130,8 +131,8 @@ def test_dsa_top_paged(device: str, solution: str, require) -> None:
     assert (topk_slots[0, int(expected_lens[0].item()) :] == -1).all()
 
 
-def test_dsa_top_paged_large_context(device: str, require) -> None:
-    require("attention", "dsa_top_paged", "triton", torch.bfloat16, "q")
+def test_dsa_decode_topk_large_context(device: str, require) -> None:
+    require("attention", "dsa_decode_topk", "triton", torch.bfloat16, "q")
 
     page_size = 64
     pages = 1024
@@ -142,7 +143,7 @@ def test_dsa_top_paged_large_context(device: str, require) -> None:
     seq_lens = torch.tensor([5], device=device, dtype=torch.int32)
     block_table = torch.zeros((1, pages), device=device, dtype=torch.int32)
 
-    topk_slots, topk_lens = dsa_top_paged(
+    topk_slots, topk_lens = dsa_decode_topk(
         q,
         weights,
         seq_lens,
@@ -167,8 +168,8 @@ def test_dsa_top_paged_large_context(device: str, require) -> None:
     assert (topk_slots[0, 5:] == -1).all()
 
 
-def test_dsa_top_paged_fp8(device: str, require) -> None:
-    require("attention", "dsa_top_paged", "triton", torch.bfloat16, "q")
+def test_dsa_decode_topk_fp8(device: str, require) -> None:
+    require("attention", "dsa_decode_topk", "triton", torch.bfloat16, "q")
 
     page_size = 64
     topk = 512
@@ -183,7 +184,7 @@ def test_dsa_top_paged_fp8(device: str, require) -> None:
         [[1, 3], [0, 2], [2, 1]], device=device, dtype=torch.int32
     )
 
-    topk_slots, topk_lens = dsa_top_paged(
+    topk_slots, topk_lens = dsa_decode_topk(
         q,
         weights,
         seq_lens,
@@ -219,8 +220,8 @@ def test_dsa_top_paged_fp8(device: str, require) -> None:
 
 
 @pytest.mark.parametrize("solution", ["triton", "deep_gemm"])
-def test_dsa_topk(device: str, solution: str, require) -> None:
-    require("attention", "dsa_topk", solution, torch.bfloat16, "q")
+def test_dsa_prefill_topk(device: str, solution: str, require) -> None:
+    require("attention", "dsa_prefill_topk", solution, torch.bfloat16, "q")
     if solution == "deep_gemm":
         pytest.skip("DeepGEMM DSA workspace top-k requires gathered FP8 fixture")
 
@@ -234,7 +235,7 @@ def test_dsa_topk(device: str, solution: str, require) -> None:
     out = torch.empty((3, topk), device=device, dtype=torch.int32)
     lens_out = torch.empty((3,), device=device, dtype=torch.int32)
 
-    workspace_indices, topk_lens = dsa_topk(
+    workspace_indices, topk_lens = dsa_prefill_topk(
         q,
         weights,
         kv_workspace_slots,
@@ -274,8 +275,8 @@ def test_dsa_topk(device: str, solution: str, require) -> None:
     assert (workspace_indices[0, int(expected_lens[0].item()) :] == -1).all()
 
 
-def test_dsa_topk_fp8(device: str, require) -> None:
-    require("attention", "dsa_topk", "triton", torch.bfloat16, "q")
+def test_dsa_prefill_topk_fp8(device: str, require) -> None:
+    require("attention", "dsa_prefill_topk", "triton", torch.bfloat16, "q")
 
     page_size = 64
     topk = 512
@@ -289,7 +290,7 @@ def test_dsa_topk_fp8(device: str, require) -> None:
     row_starts = torch.tensor([0, 10, 70], device=device, dtype=torch.int32)
     row_ends = torch.tensor([20, 75, 85], device=device, dtype=torch.int32)
 
-    workspace_indices, topk_lens = dsa_topk(
+    workspace_indices, topk_lens = dsa_prefill_topk(
         q,
         weights,
         kv_workspace_slots,
@@ -324,6 +325,38 @@ def test_dsa_topk_fp8(device: str, require) -> None:
     torch.testing.assert_close(topk_lens.cpu(), expected_lens.cpu())
     torch.testing.assert_close(workspace_indices[:, :65].cpu(), expected[:, :65].cpu())
     assert (workspace_indices[0, int(expected_lens[0].item()) :] == -1).all()
+
+
+def test_dsa_plan_triton(device: str, require) -> None:
+    require("attention", "dsa_plan", "triton", torch.int32, "seq_lens")
+
+    seq_lens = torch.tensor([20, 65, 3], device=device, dtype=torch.int32)
+    plan = dsa_plan(seq_lens, page_size=64, solution="triton")
+
+    assert isinstance(plan, torch.Tensor)
+    assert plan.shape == (3, 4)
+    assert plan.dtype == torch.int32
+    torch.testing.assert_close(plan[:, 0].cpu(), seq_lens.cpu())
+    torch.testing.assert_close(plan[:, 1].cpu(), seq_lens.cpu())
+    torch.testing.assert_close(plan[:, 2].cpu(), torch.full((3,), 1, dtype=torch.int32))
+    torch.testing.assert_close(
+        plan[:, 3].cpu(), torch.full((3,), 64, dtype=torch.int32)
+    )
+
+    plan_ptr = plan.data_ptr()
+    refreshed = dsa_plan(seq_lens + 1, page_size=64, out=plan, solution="triton")
+    assert refreshed is plan
+    assert plan.data_ptr() == plan_ptr
+    torch.testing.assert_close(plan[:, 0].cpu(), (seq_lens + 1).cpu())
+
+    with pytest.raises(RuntimeError, match="DSA paged top-k plan changed shape"):
+        dsa_plan(seq_lens[:2], page_size=64, out=plan, solution="triton")
+
+
+def test_dsa_plan_returns_none_without_kernel(device: str) -> None:
+    seq_lens = torch.tensor([1], device=device, dtype=torch.int32)
+
+    assert dsa_plan(seq_lens, page_size=64, solution="missing") is None
 
 
 def test_dsa_workspace_topk_to_global_slots(device: str) -> None:

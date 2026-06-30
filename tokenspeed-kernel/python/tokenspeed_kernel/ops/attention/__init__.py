@@ -34,7 +34,11 @@ import torch
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry, Priority
-from tokenspeed_kernel.selection import select_kernel, spec_matches_traits
+from tokenspeed_kernel.selection import (
+    NoKernelFoundError,
+    select_kernel,
+    spec_matches_traits,
+)
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 AttentionResult = torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]
@@ -54,10 +58,11 @@ __all__ = [
     "mla_decode_with_kvcache",
     "dsa_prefill",
     "dsa_decode",
-    "dsa_topk",
-    "dsa_top_paged",
+    "dsa_prefill_topk",
+    "dsa_decode_topk",
+    "dsa_plan",
     "attn_merge_state",
-    "attn_plan",
+    "mha_plan",
 ]
 
 LSE_LN = math.log2(math.e)
@@ -830,7 +835,7 @@ def dsa_prefill(
         )
 
 
-def dsa_topk(
+def dsa_prefill_topk(
     q: torch.Tensor,
     weights: torch.Tensor,
     kv_workspace_slots: torch.Tensor,
@@ -850,7 +855,7 @@ def dsa_topk(
     override: str | None = None,
     solution: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute DSA top-k over packed workspace rows.
+    """Compute DSA prefill top-k over packed workspace rows.
 
     Args:
         q: BF16 indexer query with shape [tokens, index_heads, head_dim].
@@ -908,7 +913,7 @@ def dsa_topk(
     signature = _attention_format_signature(q=q, weights=weights)
     kernel = select_kernel(
         "attention",
-        "dsa_topk",
+        "dsa_prefill_topk",
         signature,
         traits=traits,
         solution=solution,
@@ -922,10 +927,14 @@ def dsa_topk(
         "topk": int(topk),
     }
     ShapeCapture.get().record(
-        "attention", "dsa_topk", kernel.name, q.dtype, shape_params
+        "attention", "dsa_prefill_topk", kernel.name, q.dtype, shape_params
     )
     with kernel_scope(
-        "attention", "dsa_topk", q.dtype, kernel_name=kernel.name, **shape_params
+        "attention",
+        "dsa_prefill_topk",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
     ):
         return kernel(
             q=q,
@@ -946,7 +955,7 @@ def dsa_topk(
         )
 
 
-def dsa_top_paged(
+def dsa_decode_topk(
     q: torch.Tensor,
     weights: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -964,7 +973,7 @@ def dsa_top_paged(
     override: str | None = None,
     solution: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute DSA top-k over a paged KV cache.
+    """Compute DSA decode top-k over a paged KV cache.
 
     Args:
         q: BF16 indexer query with shape [tokens, index_heads, head_dim].
@@ -1018,7 +1027,7 @@ def dsa_top_paged(
     signature = _attention_format_signature(q=q, weights=weights)
     kernel = select_kernel(
         "attention",
-        "dsa_top_paged",
+        "dsa_decode_topk",
         signature,
         traits=traits,
         solution=solution,
@@ -1034,11 +1043,11 @@ def dsa_top_paged(
         "q_len_per_req": int(q_len_per_req),
     }
     ShapeCapture.get().record(
-        "attention", "dsa_top_paged", kernel.name, q.dtype, shape_params
+        "attention", "dsa_decode_topk", kernel.name, q.dtype, shape_params
     )
     with kernel_scope(
         "attention",
-        "dsa_top_paged",
+        "dsa_decode_topk",
         q.dtype,
         kernel_name=kernel.name,
         **shape_params,
@@ -1057,6 +1066,80 @@ def dsa_top_paged(
             plan=plan,
             out=out,
             lens_out=lens_out,
+        )
+
+
+def dsa_plan(
+    seq_lens: torch.Tensor,
+    *,
+    page_size: int,
+    q_len_per_req: int = 1,
+    out: object | None = None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> object | None:
+    """Build or refresh an opaque plan for DSA decode top-k.
+
+    Args:
+        seq_lens: Visible KV length per query token, shape [tokens] or
+            [batch, q_len_per_req].
+        page_size: KV cache page size.
+        q_len_per_req: Query rows per request. Plain decode uses 1.
+        out: Optional previously allocated plan object to refresh in place.
+        override: Optional exact kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+
+    Returns:
+        Opaque backend-owned plan object, or None when no selected backend needs
+        an explicit plan.
+    """
+    if seq_lens.dtype != torch.int32:
+        seq_lens = seq_lens.to(torch.int32)
+    q_len_per_req = int(q_len_per_req)
+    traits = {
+        "page_size": int(page_size),
+        "q_len_per_req": q_len_per_req,
+    }
+    signature = format_signature(seq_lens=dense_tensor_format(seq_lens.dtype))
+    try:
+        kernel = select_kernel(
+            "attention",
+            "dsa_plan",
+            signature,
+            traits=traits,
+            solution=solution,
+            override=override,
+        )
+    except NoKernelFoundError:
+        return None
+
+    if seq_lens.dim() == 1:
+        batch_size = int(seq_lens.numel()) // max(q_len_per_req, 1)
+        tokens = int(seq_lens.numel())
+    else:
+        batch_size = int(seq_lens.shape[0])
+        tokens = int(seq_lens.numel())
+    shape_params = {
+        "batch_size": batch_size,
+        "tokens": tokens,
+        "q_len_per_req": q_len_per_req,
+        "page_size": int(page_size),
+    }
+    ShapeCapture.get().record(
+        "attention", "dsa_plan", kernel.name, seq_lens.dtype, shape_params
+    )
+    with kernel_scope(
+        "attention",
+        "dsa_plan",
+        seq_lens.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            seq_lens=seq_lens,
+            page_size=page_size,
+            q_len_per_req=q_len_per_req,
+            out=out,
         )
 
 
@@ -1131,7 +1214,7 @@ def attn_merge_state(
         )
 
 
-def attn_plan(
+def mha_plan(
     dtype: torch.dtype,
     head_dim: int,
     window_left: int = -1,
@@ -1140,7 +1223,7 @@ def attn_plan(
     return_lse: bool = False,
     solution: str | None = None,
 ) -> dict:
-    """Build an attention execution plan from registered kernel capabilities.
+    """Build a dense MHA execution plan from registered kernel capabilities.
 
     Args:
         dtype: Query/K/V dtype for prefill planning.

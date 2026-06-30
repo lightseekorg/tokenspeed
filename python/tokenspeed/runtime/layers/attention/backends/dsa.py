@@ -23,17 +23,13 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel.ops.attention import (
     dsa_decode,
+    dsa_plan,
     dsa_prefill,
 )
 from tokenspeed_kernel.ops.attention.triton.dsa_sparse_layout import (
     workspace_topk_to_global_slots,
 )
 from tokenspeed_kernel.platform import current_platform
-
-try:
-    from tokenspeed_kernel.thirdparty import deep_gemm
-except Exception:
-    deep_gemm = None
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -143,23 +139,17 @@ class DSABackend(AttentionBackend):
                     delattr(metadata, attr)
 
     def _refresh_decode_topk_schedule_metadata(self, bs: int) -> None:
-        if deep_gemm is None:
-            return
         metadata = getattr(self._dense_backend, "forward_decode_metadata", None)
         if metadata is None:
             return
-        schedule_metadata = getattr(
-            metadata,
-            "_dsa_paged_mqa_schedule_metadata",
-            None,
-        )
-        if schedule_metadata is None:
+        plan = getattr(metadata, "_dsa_plan", None)
+        if plan is None:
             return
 
-        q_len = int(getattr(metadata, "_dsa_paged_mqa_schedule_q_len", 1) or 1)
+        q_len = int(getattr(metadata, "_dsa_plan_q_len", 1) or 1)
         base_lens = metadata.seq_lens_k[:bs].to(torch.int32)
         if q_len == 1:
-            seq_lens = base_lens.view(-1, 1).contiguous()
+            seq_lens = base_lens.contiguous()
         else:
             offsets = torch.arange(
                 1 - q_len, 1, device=base_lens.device, dtype=torch.int32
@@ -167,25 +157,13 @@ class DSABackend(AttentionBackend):
             seq_lens = (
                 (base_lens.view(-1, 1) + offsets.view(1, -1)).clamp_min_(0).contiguous()
             )
-        refreshed = deep_gemm.get_paged_mqa_logits_metadata(
-            seq_lens,
-            self.page_size,
-            deep_gemm.get_num_sms(),
-        )
-        if (
-            schedule_metadata.shape != refreshed.shape
-            or schedule_metadata.device != refreshed.device
-            or schedule_metadata.dtype != refreshed.dtype
-        ):
-            raise RuntimeError(
-                "DSA CUDA graph paged-MQA schedule metadata changed shape "
-                "during replay; recapture or use eager for this batch. "
-                f"captured={tuple(schedule_metadata.shape)} {schedule_metadata.dtype} "
-                f"{schedule_metadata.device}, refreshed={tuple(refreshed.shape)} "
-                f"{refreshed.dtype} {refreshed.device}"
-            )
         with torch.inference_mode():
-            schedule_metadata.copy_(refreshed)
+            dsa_plan(
+                seq_lens=seq_lens,
+                page_size=self.page_size,
+                q_len_per_req=q_len,
+                out=plan,
+            )
 
     def init_forward_metadata_capture_cuda_graph(
         self,
