@@ -134,9 +134,18 @@ def _build_inputs(
     )
 
 
+_VALID_MODES = ("warmup", "no_warmup")
+
+
 def _worker_capture_fusion_with_moe(
     rank: int, world_size: int, port: int, results
 ) -> None:
+    # Mode is read from the environment so multiple pytest cases can share
+    # the same worker without re-spawning, while still selecting between
+    # the warmup / no-warmup variants.
+    mode = os.environ.get("MULTIGPU_UT_MODE", "warmup")
+    assert mode in _VALID_MODES, f"unknown MULTIGPU_UT_MODE {mode!r}"
+
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
     dist.init_process_group(
@@ -240,19 +249,24 @@ def _worker_capture_fusion_with_moe(
                 layout_code=None,
             )
 
-        # Warm up on a side stream, exactly as CudaGraphWrapper does.
-        warmup_stream = torch.cuda.Stream()
-        warmup_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(warmup_stream):
-            for _ in range(SPEC_NUM_STEPS):
-                one_step()
-        torch.cuda.current_stream().wait_stream(warmup_stream)
+        if mode == "warmup":
+            # Warm up on a side stream, exactly as CudaGraphWrapper does.
+            warmup_stream = torch.cuda.Stream()
+            warmup_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(warmup_stream):
+                for _ in range(SPEC_NUM_STEPS):
+                    one_step()
+            torch.cuda.current_stream().wait_stream(warmup_stream)
         torch.cuda.synchronize()
         dist.barrier()
 
         # Capture all SPEC_NUM_STEPS calls in a single graph, matching the
-        # runtime's per-bs capture of `_run_multi_step_decode`.
+        # runtime's per-bs capture of `_run_multi_step_decode`. For
+        # `no_warmup` the very first MoE call lands inside the capture
+        # stream, exactly like the runtime does for MTP/NextN drafter
+        # capture at bs=1.
         graph = torch.cuda.CUDAGraph()
+
         with torch.cuda.graph(graph):
             for _ in range(SPEC_NUM_STEPS):
                 one_step()
@@ -284,22 +298,27 @@ def _worker_capture_fusion_with_moe(
         dist.destroy_process_group()
 
 
-def _spawn(world_size: int) -> None:
+def _spawn(world_size: int, *, mode: str) -> None:
+    assert mode in _VALID_MODES, f"unknown mode {mode!r}"
     port = _find_free_port()
     manager = mp.Manager()
     results = manager.dict()
-    torch_mp.spawn(
-        _worker_capture_fusion_with_moe,
-        args=(world_size, port, results),
-        nprocs=world_size,
-        join=True,
-    )
+    os.environ["MULTIGPU_UT_MODE"] = mode
+    try:
+        torch_mp.spawn(
+            _worker_capture_fusion_with_moe,
+            args=(world_size, port, results),
+            nprocs=world_size,
+            join=True,
+        )
+    finally:
+        os.environ.pop("MULTIGPU_UT_MODE", None)
     assert results.get(
         "ok", False
-    ), "trtllm_bf16_moe + allreduce/reducescatter fusion graph capture failed"
+    ), f"trtllm_bf16_moe + AR fusion graph capture failed (mode={mode})"
 
 
-@pytest.mark.skipif(
+_skip_unless_8gpu = pytest.mark.skipif(
     _NUM_GPUS < 8,
     reason=(
         "Reproducing the qwen3.5-397b-a17b-nvfp4 MTP IMA needs the same"
@@ -307,9 +326,27 @@ def _spawn(world_size: int) -> None:
         " AR fusion code paths."
     ),
 )
-def test_trtllm_bf16_moe_cuda_graph_8gpu_with_ar_fusion() -> None:
+
+
+def _ensure_spawn() -> None:
     # Force `spawn` so CUDA state does not leak from the test runner
     # (matches the pattern in `test_trtllm_comm.py`).
     if mp.get_start_method(allow_none=True) != "spawn":
         mp.set_start_method("spawn", force=True)
-    _spawn(world_size=8)
+
+
+@_skip_unless_8gpu
+def test_trtllm_bf16_moe_cuda_graph_8gpu_with_ar_fusion() -> None:
+    """Warm-up-then-capture variant: matches CudaGraphWrapper exactly."""
+    _ensure_spawn()
+    _spawn(world_size=8, mode="warmup")
+
+
+@_skip_unless_8gpu
+def test_trtllm_bf16_moe_cuda_graph_8gpu_no_warmup() -> None:
+    """Cold-capture variant: drop the side-stream warmup so the first
+    `trtllm_bf16_moe` call happens inside the capture stream, the same
+    way the MTP/NextN drafter sees the bs=1 shape for the first time in
+    `CudaGraphWrapper.capture()`."""
+    _ensure_spawn()
+    _spawn(world_size=8, mode="no_warmup")

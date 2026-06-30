@@ -56,6 +56,9 @@ TOP_K = 10
 HIDDEN_SIZE = 4096
 INTERMEDIATE_SIZE_PER_RANK = 128  # moe_intermediate_size (1024) // tp_size (8)
 BLOCK_K = 128
+# Drafter capture starts at bs=1, which is the shape that actually IMAs in
+# the agentic perf job's CudaGraphWrapper.capture() invocation.
+DRAFT_BS = 1
 
 
 def _build_inputs(
@@ -196,3 +199,41 @@ def test_trtllm_bf16_moe_cuda_graph(device: str, bs: int) -> None:
     assert torch.isfinite(
         captured
     ).all(), "trtllm_bf16_moe produced non-finite output under cuda-graph replay"
+
+
+def test_trtllm_bf16_moe_cuda_graph_no_warmup(device: str) -> None:
+    """Capture `trtllm_bf16_moe` without any prior warmup.
+
+    The runtime's `CudaGraphWrapper.capture()` is called before
+    `_run_multi_step_decode` has ever executed the drafter's bs=1 MoE
+    eagerly, so the very first time flashinfer sees the
+    `(bs=1, E=512, H=4096, I=128)` shape is inside the capture stream.
+    `test_trtllm_bf16_moe_cuda_graph` above warms up first, which can
+    hide bugs that only fire on the first call (e.g. lazy workspace
+    allocation, JIT, or autotuner book-keeping). This variant forces the
+    same cold-capture path the runtime takes.
+    """
+    from flashinfer.fused_moe.core import trtllm_bf16_moe
+
+    torch.manual_seed(0)
+    inputs = _build_inputs(bs=DRAFT_BS, device=torch.device(device))
+
+    torch.cuda.synchronize()
+
+    g = torch.cuda.CUDAGraph()
+    captured_out: list[torch.Tensor] = []
+    with torch.cuda.graph(g):
+        out = trtllm_bf16_moe(**inputs, tune_max_num_tokens=max(1, DRAFT_BS))
+        if isinstance(out, (list, tuple)):
+            out = out[0]
+        captured_out.append(out)
+
+    g.replay()
+    torch.cuda.synchronize()
+
+    captured = captured_out[0]
+    assert captured.shape == (DRAFT_BS, HIDDEN_SIZE)
+    assert captured.dtype == torch.bfloat16
+    assert torch.isfinite(
+        captured
+    ).all(), "trtllm_bf16_moe produced non-finite output (no-warmup capture)"
