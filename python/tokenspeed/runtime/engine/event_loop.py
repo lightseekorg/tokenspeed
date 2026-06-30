@@ -803,9 +803,9 @@ class EventLoop:
                 self._num_inflight_cache_ops += 1
             else:
                 raise ValueError(f"unsupported cache op kind: {type(op).__name__}")
-        self._setup_layerwise_loadback(execution_plan)
+        self._setup_layerwise_loadback(execution_plan, forward_op)
 
-    def _setup_layerwise_loadback(self, execution_plan) -> None:
+    def _setup_layerwise_loadback(self, execution_plan, forward_op) -> None:
         host_exec = getattr(self.memory_executor, "host_exec", None)
         available_pools = (
             getattr(host_exec, "pools", {}) if host_exec is not None else {}
@@ -829,6 +829,30 @@ class EventLoop:
             self.memory_executor.set_consumer(
                 kind, consumer_indices if consumer_indices else -1
             )
+
+        # Coarse loadback fence for CUDA-graph decode replay.
+        #
+        # The per-layer ``wait_until`` above (issued inside attention's
+        # ``get_key_buffer``) only gates reads on loadback when it runs
+        # eagerly. Under a captured decode graph it is baked in at capture
+        # time, and the loadback ``load_events`` are recorded on the host
+        # ``load_stream`` -- not a captured stream -- so the graph replay
+        # never waits on the current iter's loadback. A pure-decode forward
+        # (``num_extends() == 0``) admitted alongside a LoadBackOp is exactly a
+        # retraction -> reload -> resume-decode recovery, which runs through
+        # the captured graph. Coarsely order the compute stream behind
+        # ``load_stream`` so the replay (target and draft, both enqueued on
+        # ``execution_stream``) waits for the reload to land. Also fence while
+        # any prior iter's loadback is still in flight. Cheap no-op when
+        # ``load_stream`` is idle.
+        if host_exec is not None:
+            recovery_with_loadback = (
+                forward_op is not None
+                and forward_op.num_extends() == 0
+                and any(isinstance(op, Cache.LoadBackOp) for op in execution_plan.cache)
+            )
+            if recovery_with_loadback or host_exec.ack_load_queue:
+                self.model_executor.execution_stream.wait_stream(host_exec.load_stream)
 
     def _flush_mamba_retract_states(self, forward_op) -> None:
         """Copy draft->working mamba states when retract occurred (no forward scheduled)."""
