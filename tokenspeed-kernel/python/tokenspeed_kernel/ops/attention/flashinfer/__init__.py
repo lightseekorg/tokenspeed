@@ -99,14 +99,20 @@ def _flashinfer_trtllm_mla_kv_cache(
         kv_cache = kv_cache.to(dtype)
     if kv_cache.dim() == 2:
         return kv_cache.view(-1, int(page_size), kv_cache.shape[-1]).unsqueeze(1)
+    if kv_cache.dim() == 3 and kv_cache.shape[1] == 1:
+        return (
+            kv_cache.squeeze(1)
+            .view(-1, int(page_size), kv_cache.shape[-1])
+            .unsqueeze(1)
+        )
     if kv_cache.dim() == 4:
         if kv_cache.shape[1] == int(page_size) and kv_cache.shape[2] == 1:
             return kv_cache.permute(0, 2, 1, 3).contiguous()
         if kv_cache.shape[1] == 1 and kv_cache.shape[2] == int(page_size):
             return kv_cache.contiguous()
     raise ValueError(
-        "kv_cache must be flat [slots, dim] or paged [pages, page_size, 1, dim] "
-        f"for FlashInfer/TRTLLM sparse MLA, got {tuple(kv_cache.shape)}"
+        "kv_cache must be flat [slots, dim], flat [slots, 1, dim], or paged "
+        f"[pages, page_size, 1, dim] for FlashInfer/TRTLLM sparse MLA, got {tuple(kv_cache.shape)}"
     )
 
 

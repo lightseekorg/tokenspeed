@@ -191,6 +191,8 @@ def compute_out_cache_loc_kernel(
 
         # Compute page indices and offsets
         page_indices = positions // page_size
+        # Clamp to last valid page: avoids OOB reads past context-length bound.
+        page_indices = tl.minimum(page_indices, max_pages - 1)
         offsets_in_page = positions % page_size
 
         # Load page IDs from req_to_pages
@@ -281,6 +283,8 @@ def fused_decode_input_prep_kernel(
 
         positions_local = cache_start + token_offsets
         page_indices = positions_local // page_size
+        # Clamp to last valid page (avoids OOB reads past context-length bound).
+        page_indices = tl.minimum(page_indices, max_pages - 1)
         offsets_in_page = positions_local % page_size
 
         page_ptrs = req_to_pages_ptr + pool_idx * max_pages + page_indices
@@ -387,26 +391,46 @@ def update_block_table(forward_op, device, req_to_page):
         return
 
     max_pages = req_to_page.shape[1]
-    for begin, size in zip(forward_op.begins, forward_op.sizes):
+    # Clamp a request that would overflow req_to_page instead of crashing the
+    # engine. Happens when MTP accept-rate collapse keeps a request alive past
+    # context_len; its KV drops but it will be finished shortly.
+    sizes = list(forward_op.sizes)
+    begins = list(forward_op.begins)
+    # new_occupied_pages is a list-of-lists [batch, size_i] of page ids;
+    # take a shallow copy so we can trim the offending request's row.
+    new_occupied_pages = [list(row) for row in forward_op.new_occupied_pages]
+    request_ids = list(forward_op.request_ids)
+    for i, (begin, size) in enumerate(zip(begins, sizes)):
         if begin + size > max_pages:
-            raise RuntimeError(
-                f"page copy would exceed req_to_page capacity: "
-                f"begin={begin} + size={size} = {begin + size} "
-                f"> req_to_page.shape[1]={max_pages}"
+            clamped = max(0, max_pages - begin)
+            logger.warning(
+                "page copy would exceed req_to_page capacity for req %s: "
+                "begin=%s + size=%s = %s > req_to_page.shape[1]=%s; "
+                "clamping size to %s to avoid engine crash. The request is past "
+                "its context-length bound and will be finished by the length "
+                "check; KV writes after this point are dropped.",
+                request_ids[i] if i < len(request_ids) else "?",
+                begin,
+                size,
+                begin + size,
+                max_pages,
+                clamped,
             )
+            sizes[i] = clamped
+            # Keep new_occupied_pages[i] consistent with the clamped size so
+            # the kernel's cumsum-based offsets stay aligned across the batch.
+            new_occupied_pages[i] = new_occupied_pages[i][:clamped]
 
-    new_occupied_pages_num = flatten_and_to_device(forward_op.sizes, dtype=torch.int32)
-    pages_copy_starts = flatten_and_to_device(forward_op.begins, dtype=torch.int32)
-    new_occupied_pages = flatten_and_to_device(
-        forward_op.new_occupied_pages, dtype=torch.int32
-    )
+    new_occupied_pages_num = flatten_and_to_device(sizes, dtype=torch.int32)
+    pages_copy_starts = flatten_and_to_device(begins, dtype=torch.int32)
+    new_occupied_pages_t = flatten_and_to_device(new_occupied_pages, dtype=torch.int32)
     request_pool_indices = flatten_and_to_device(
         forward_op.request_pool_indices, dtype=torch.int64
     )
     update_req_to_page(
         req_to_page=req_to_page,
         req_pool_indices=request_pool_indices,
-        new_occupied_pages=new_occupied_pages,
+        new_occupied_pages=new_occupied_pages_t,
         new_occupied_pages_num=new_occupied_pages_num,
         pages_copy_starts=pages_copy_starts,
     )
