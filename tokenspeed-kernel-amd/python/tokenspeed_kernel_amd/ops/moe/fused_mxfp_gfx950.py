@@ -3125,7 +3125,6 @@ def _run_moe_tile_w_via_vgpr(
 
     if USE_SLICE_N:
         SUB_BN: gl.constexpr = BLOCK_N // 2
-        w_scale_via_lds_slice_n: gl.constexpr = cfg.W_SCALE_VIA_LDS
         gl.static_assert(
             SUB_BN == 128 and BLOCK_K_W == 128 and NUM_WARPS == 4,
             "USE_SLICE_N + W_VIA_VGPR requires SUB_BN=BLOCK_K_W=128 "
@@ -3133,7 +3132,7 @@ def _run_moe_tile_w_via_vgpr(
             "this shape (re-derive otherwise).",
         )
         LOAD_W_HALF_COPY_LAYOUT: gl.constexpr = _preshuffled_w_copy_layout(
-            SUB_BN // 16, BLOCK_K_W, w_scale_via_lds_slice_n, False
+            SUB_BN // 16, BLOCK_K_W, cfg.W_SCALE_VIA_LDS, False
         )
         (
             offsets_h,
@@ -3179,7 +3178,6 @@ def _run_moe_tile_w_via_vgpr(
         )
         return pgm.pipeline(K)
     else:
-        w_scale_via_lds_full: gl.constexpr = cfg.W_SCALE_VIA_LDS
         gl.static_assert(
             BLOCK_N == 128,
             "W_VIA_VGPR full-tile layout bases assume BLOCK_N=128. "
@@ -3187,7 +3185,7 @@ def _run_moe_tile_w_via_vgpr(
         )
         BLOCK_N_LAYOUT: gl.constexpr = BLOCK_N
         LOAD_W_COPY_LAYOUT: gl.constexpr = _preshuffled_w_copy_layout(
-            BLOCK_N_LAYOUT // 16, BLOCK_K_W, w_scale_via_lds_full, False
+            BLOCK_N_LAYOUT // 16, BLOCK_K_W, cfg.W_SCALE_VIA_LDS, False
         )
         offsets_b_vgpr, base_off_b_vgpr = _make_preshuffled_w_full_offsets(
             w_base_offset,
@@ -3273,7 +3271,6 @@ def _run_moe_tile_preshuffled_lds_w(
 
     if USE_SLICE_N:
         SUB_BN: gl.constexpr = BLOCK_N // 2
-        w_scale_via_lds_slice_n: gl.constexpr = cfg.W_SCALE_VIA_LDS
         gl.static_assert(
             SUB_BN == 128 and BLOCK_K_W == 128 and NUM_WARPS == 4,
             "USE_SLICE_N + preshuffled W requires SUB_BN=BLOCK_K_W=128 "
@@ -3281,10 +3278,10 @@ def _run_moe_tile_preshuffled_lds_w(
             "this shape (re-derive otherwise).",
         )
         LOAD_W_HALF_LAYOUT: gl.constexpr = _preshuffled_w_read_layout(
-            SUB_BN // 16, BLOCK_K_W, w_scale_via_lds_slice_n
+            SUB_BN // 16, BLOCK_K_W, cfg.W_SCALE_VIA_LDS
         )
         LOAD_W_HALF_COPY_LAYOUT: gl.constexpr = _preshuffled_w_copy_layout(
-            SUB_BN // 16, BLOCK_K_W, w_scale_via_lds_slice_n, True
+            SUB_BN // 16, BLOCK_K_W, cfg.W_SCALE_VIA_LDS, True
         )
         (
             offsets_h,
@@ -3340,12 +3337,11 @@ def _run_moe_tile_preshuffled_lds_w(
     # Keep the original half-tile layout in that specialization so the
     # preshuffled copy/read layouts remain valid during compilation.
     BLOCK_N_LAYOUT: gl.constexpr = (BLOCK_N // 2) if USE_SLICE_N else BLOCK_N
-    w_scale_via_lds_full: gl.constexpr = cfg.W_SCALE_VIA_LDS
     LOAD_W_LAYOUT: gl.constexpr = _preshuffled_w_read_layout(
-        BLOCK_N_LAYOUT // 16, BLOCK_K_W, w_scale_via_lds_full
+        BLOCK_N_LAYOUT // 16, BLOCK_K_W, cfg.W_SCALE_VIA_LDS
     )
     LOAD_W_COPY_LAYOUT: gl.constexpr = _preshuffled_w_copy_layout(
-        BLOCK_N_LAYOUT // 16, BLOCK_K_W, w_scale_via_lds_full, True
+        BLOCK_N_LAYOUT // 16, BLOCK_K_W, cfg.W_SCALE_VIA_LDS, True
     )
     offsets_b_vgpr, base_off_b_vgpr = _make_preshuffled_w_full_offsets(
         w_base_offset,
@@ -7363,12 +7359,11 @@ def _warp_decode_stage1_coop_compute(
             "warp_decode preshuffled W13 path assumes 128x128 W tiles "
             "and NUM_WARPS=4; re-derive the copy/read layouts for other shapes.",
         )
-        w_scale_via_lds: gl.constexpr = cfg.W_SCALE_VIA_LDS
         LOAD_W_LAYOUT: gl.constexpr = _preshuffled_w_read_layout(
-            BLOCK_N // 16, BLOCK_K_W, w_scale_via_lds
+            BLOCK_N // 16, BLOCK_K_W, cfg.W_SCALE_VIA_LDS
         )
         LOAD_W_COPY_LAYOUT: gl.constexpr = _preshuffled_w_copy_layout(
-            BLOCK_N // 16, BLOCK_K_W, w_scale_via_lds, True
+            BLOCK_N // 16, BLOCK_K_W, cfg.W_SCALE_VIA_LDS, True
         )
         offsets_w, base_off_w = _make_preshuffled_w_full_offsets(
             w_base_offset,
