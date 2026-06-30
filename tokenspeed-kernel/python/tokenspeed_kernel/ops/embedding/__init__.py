@@ -191,8 +191,10 @@ def apply_rope_mla(
         cos_sin_cache: Packed RoPE cache as concat(cos, sin) on the last dim.
         is_neox: Whether to use Neox-style half-split rotation.
         quantize_dtype: Output FP8 dtype. Currently only e4m3fn is supported.
-        quant_scale_q: Quantization scale for query tensors.
-        quant_scale_kv: Quantization scale for key tensors.
+        quant_scale_q: Quantization scale multiplied into query tensors before
+            the FP8 cast.
+        quant_scale_kv: Quantization scale multiplied into key tensors before
+            the FP8 cast.
         q_rope_out: Optional FP8 output buffer for rotated q_rope. If omitted
             together with q_nope_out, a combined query output is allocated and
             this slice is derived from it.
