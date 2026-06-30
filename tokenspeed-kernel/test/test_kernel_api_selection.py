@@ -811,7 +811,13 @@ def _moe_apply_mxfp4_precomputed_tp() -> object:
         input_dtype=torch.bfloat16,
         activation="silu",
         ep_size=1,
-        internal_activation_dtype="input",
+        ispp=2048,
+        internal_activation_dtype="fp8",
+    )
+    _assert_moe_plan(
+        plan,
+        apply="triton_mxfp4_precomputed_moe_apply",
+        preprocessor="triton_mxfp4_moe_weights",
     )
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
@@ -1250,7 +1256,7 @@ _CASES = [
         "cdna4",
         "moe",
         "apply",
-        "triton_mxfp4_moe_apply",
+        "triton_mxfp4_precomputed_moe_apply",
         _moe_apply_mxfp4_precomputed_tp,
     ),
     _case(
