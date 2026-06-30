@@ -25,10 +25,19 @@ from tokenspeed_kernel.ops.attention import (
     dsa_decode,
     dsa_prefill,
 )
+from tokenspeed_kernel.ops.attention.flashinfer import (
+    trtllm_batch_decode_with_kv_cache_mla,
+)
 from tokenspeed_kernel.ops.attention.triton.dsa_sparse_layout import (
     workspace_topk_to_global_slots,
 )
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.registry import error_fn
+
+try:
+    from tokenspeed_kernel.thirdparty import deep_gemm
+except Exception:
+    deep_gemm = None
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -36,24 +45,19 @@ from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.backends.mla import MLAAttnBackend
 from tokenspeed.runtime.layers.attention.backends.trtllm_mla import TRTLLMMLABackend
 from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
+from tokenspeed.runtime.layers.attention.dsa.utils import workspace_indices_to_kv_slots
 from tokenspeed.runtime.layers.attention.registry import register_backend
 
-_SPARSE_IMPL_FLASHMLA = "flashmla"
 _SPARSE_IMPL_FLASHINFER_TRTLLM = "flashinfer_trtllm"
 _SPARSE_IMPL_TRITON = "triton"
 
 
-def _default_dsa_sparse_prefill_impl(kv_cache_dtype: torch.dtype | None = None) -> str:
-    platform = current_platform()
+def _default_dsa_sparse_impl(platform) -> str:
     if platform.is_amd:
         return _SPARSE_IMPL_TRITON
-    if (
-        platform.is_nvidia
-        and platform.is_blackwell
-        and kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-    ):
+    if platform.is_nvidia:
         return _SPARSE_IMPL_FLASHINFER_TRTLLM
-    return _SPARSE_IMPL_FLASHMLA
+    raise RuntimeError(f"DSA backend does not support platform {platform.vendor!r}.")
 
 
 def _make_dense_backend(config: DSAConfig, platform) -> AttentionBackend:
@@ -97,12 +101,8 @@ class DSABackend(AttentionBackend):
         # Only graph-captured decode workspaces must survive a regrow. Eager
         # buffers are not referenced by replay and can be released normally.
         self._decode_query_workspace_captured = False
-        self._sparse_prefill_impl = _default_dsa_sparse_prefill_impl(self.data_type)
-        self._sparse_decode_impl = (
-            _SPARSE_IMPL_FLASHINFER_TRTLLM
-            if platform.is_nvidia
-            else _SPARSE_IMPL_TRITON
-        )
+        self._sparse_prefill_impl = _default_dsa_sparse_impl(platform)
+        self._sparse_decode_impl = _default_dsa_sparse_impl(platform)
 
     @property
     def forward_decode_metadata(self):
@@ -133,12 +133,17 @@ class DSABackend(AttentionBackend):
         self._dense_backend.decode_cuda_graph_kv_indices = value
 
     @property
+    def trtllm_workspace(self):
+        return self._dense_backend.trtllm_workspace
+
+    @property
     def _block_table_aliased(self):
         return getattr(self._dense_backend, "_block_table_aliased", False)
 
     @_block_table_aliased.setter
     def _block_table_aliased(self, value):
-        self._dense_backend._block_table_aliased = value
+        if hasattr(self, "_dense_backend"):
+            self._dense_backend._block_table_aliased = value
 
     def register_step_counter(self, step_counter):
         super().register_step_counter(step_counter)
@@ -150,6 +155,66 @@ class DSABackend(AttentionBackend):
     def init_cuda_graph_state(self, max_bs: int, seq_lens_buf: torch.Tensor):
         return self._dense_backend.init_cuda_graph_state(max_bs, seq_lens_buf)
 
+    def _clear_metadata_caches(self) -> None:
+        metadata_objects = [
+            self.forward_decode_metadata,
+            self.forward_prefill_metadata,
+        ]
+        metadata_objects.extend(self.decode_cuda_graph_metadata.values())
+        seen = set()
+        for metadata in metadata_objects:
+            if metadata is None or id(metadata) in seen:
+                continue
+            seen.add(id(metadata))
+            for attr in tuple(vars(metadata)):
+                if attr.startswith("_dsa_") and attr.endswith("_cache"):
+                    delattr(metadata, attr)
+
+    def _refresh_decode_topk_schedule_metadata(self, bs: int) -> None:
+        if deep_gemm is None:
+            return
+        metadata = getattr(self._dense_backend, "forward_decode_metadata", None)
+        if metadata is None:
+            return
+        schedule_metadata = getattr(
+            metadata,
+            "_dsa_paged_mqa_schedule_metadata",
+            None,
+        )
+        if schedule_metadata is None:
+            return
+
+        q_len = int(getattr(metadata, "_dsa_paged_mqa_schedule_q_len", 1) or 1)
+        base_lens = metadata.seq_lens_k[:bs].to(torch.int32)
+        if q_len == 1:
+            seq_lens = base_lens.view(-1, 1).contiguous()
+        else:
+            offsets = torch.arange(
+                1 - q_len, 1, device=base_lens.device, dtype=torch.int32
+            )
+            seq_lens = (
+                (base_lens.view(-1, 1) + offsets.view(1, -1)).clamp_min_(0).contiguous()
+            )
+        refreshed = deep_gemm.get_paged_mqa_logits_metadata(
+            seq_lens,
+            self.page_size,
+            deep_gemm.get_num_sms(),
+        )
+        if (
+            schedule_metadata.shape != refreshed.shape
+            or schedule_metadata.device != refreshed.device
+            or schedule_metadata.dtype != refreshed.dtype
+        ):
+            raise RuntimeError(
+                "DSA CUDA graph paged-MQA schedule metadata changed shape "
+                "during replay; recapture or use eager for this batch. "
+                f"captured={tuple(schedule_metadata.shape)} {schedule_metadata.dtype} "
+                f"{schedule_metadata.device}, refreshed={tuple(refreshed.shape)} "
+                f"{refreshed.dtype} {refreshed.device}"
+            )
+        with torch.inference_mode():
+            schedule_metadata.copy_(refreshed)
+
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
@@ -157,12 +222,14 @@ class DSABackend(AttentionBackend):
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
     ):
-        return self._dense_backend.init_forward_metadata_capture_cuda_graph(
+        result = self._dense_backend.init_forward_metadata_capture_cuda_graph(
             bs=bs,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             forward_mode=forward_mode,
         )
+        self._clear_metadata_caches()
+        return result
 
     def init_forward_metadata_replay_cuda_graph(
         self,
@@ -173,7 +240,7 @@ class DSABackend(AttentionBackend):
         req_to_page: torch.Tensor = None,
         **kwargs,
     ):
-        return self._dense_backend.init_forward_metadata_replay_cuda_graph(
+        result = self._dense_backend.init_forward_metadata_replay_cuda_graph(
             bs=bs,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
@@ -181,6 +248,8 @@ class DSABackend(AttentionBackend):
             req_to_page=req_to_page,
             **kwargs,
         )
+        self._refresh_decode_topk_schedule_metadata(bs)
+        return result
 
     def get_cuda_graph_seq_len_fill_value(self):
         return self._dense_backend.get_cuda_graph_seq_len_fill_value()
@@ -193,6 +262,7 @@ class DSABackend(AttentionBackend):
             metadata.seq_lens_k.add_(1)
         else:
             metadata.seq_lens_k.copy_(seq_lens[: metadata.seq_lens_k.numel()])
+        self._refresh_decode_topk_schedule_metadata(metadata.seq_lens_k.numel())
 
     def init_forward_metadata(
         self,
@@ -226,6 +296,7 @@ class DSABackend(AttentionBackend):
             if cmeta is not None and cmeta_req_pool_indices is not None:
                 ext_idx = cmeta_req_pool_indices[:num_extends].long()
                 self._prefill_block_tables = req_to_page[ext_idx]
+                cmeta.block_tables = self._prefill_block_tables
         return out
 
     def _validate_logit_cap(self, logits_soft_cap: float) -> None:
@@ -350,6 +421,41 @@ class DSABackend(AttentionBackend):
         kv_workspace_slots: torch.Tensor | None = None,
         max_seq_len: int,
     ) -> torch.Tensor:
+        if self._sparse_prefill_impl == _SPARSE_IMPL_FLASHINFER_TRTLLM:
+            return self._forward_sparse_prefill_trtllm(
+                q=q,
+                layer=layer,
+                token_to_kv_pool=token_to_kv_pool,
+                workspace_indices=workspace_indices,
+                topk_lens=topk_lens,
+                kv_workspace_slots=kv_workspace_slots,
+                max_seq_len=max_seq_len,
+            )
+        return self._forward_sparse_prefill_triton(
+            q=q,
+            layer=layer,
+            token_to_kv_pool=token_to_kv_pool,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            workspace_indices=workspace_indices,
+            topk_lens=topk_lens,
+            kv_workspace_slots=kv_workspace_slots,
+            max_seq_len=max_seq_len,
+        )
+
+    def _forward_sparse_prefill_triton(
+        self,
+        *,
+        q: torch.Tensor,
+        layer,
+        token_to_kv_pool,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        workspace_indices: torch.Tensor,
+        topk_lens: torch.Tensor,
+        kv_workspace_slots: torch.Tensor | None,
+        max_seq_len: int,
+    ) -> torch.Tensor:
         if block_tables is None or seq_lens is None:
             raise RuntimeError("DSA sparse prefill requires block table metadata.")
         if layer.logit_cap and layer.logit_cap > 0:
@@ -426,6 +532,85 @@ class DSABackend(AttentionBackend):
         )
         return out.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 
+    def _forward_sparse_prefill_trtllm(
+        self,
+        *,
+        q: torch.Tensor,
+        layer,
+        token_to_kv_pool,
+        workspace_indices: torch.Tensor,
+        topk_lens: torch.Tensor,
+        kv_workspace_slots: torch.Tensor | None,
+        max_seq_len: int,
+    ) -> torch.Tensor:
+        if trtllm_batch_decode_with_kv_cache_mla is error_fn:
+            raise RuntimeError(
+                "DSA sparse prefill requires TRTLLM sparse MLA on Blackwell. "
+                "Build/install `tokenspeed-kernel/python` with FlashInfer TRTLLM "
+                "decode support."
+            )
+        allow_fp8_query = (
+            self.data_type == torch.float8_e4m3fn and q.dtype == torch.float8_e4m3fn
+        )
+        if q.dtype != torch.bfloat16 and not allow_fp8_query:
+            raise RuntimeError(
+                "DSA sparse prefill requires BF16 query tensors, or FP8 query "
+                f"tensors on the TRTLLM FP8 KV path, got {q.dtype}."
+            )
+        if topk_lens.shape[0] != q.shape[0]:
+            raise RuntimeError(
+                "DSA sparse prefill top-k length mismatch: "
+                f"lens={topk_lens.shape[0]}, q_tokens={q.shape[0]}"
+            )
+        if workspace_indices.shape != (q.shape[0], self.index_topk):
+            raise RuntimeError(
+                "DSA sparse prefill top-k shape mismatch: "
+                f"indices={tuple(workspace_indices.shape)}, "
+                f"expected={(q.shape[0], self.index_topk)}"
+            )
+        if kv_workspace_slots is None:
+            raise RuntimeError(
+                "DSA TRTLLM sparse prefill requires kv_workspace_slots to "
+                "map workspace-local top-k rows back to KV cache slots."
+            )
+        if q.shape[0] == 0:
+            return q.new_empty((0, layer.tp_q_head_num * layer.v_head_dim))
+
+        block_tables = workspace_indices_to_kv_slots(
+            workspace_indices.to(torch.int32),
+            kv_workspace_slots,
+        ).view(q.shape[0], 1, self.index_topk)
+        seq_lens = topk_lens.to(device=q.device, dtype=torch.int32).contiguous()
+        q = q.view(q.shape[0], 1, layer.tp_q_head_num, layer.head_dim)
+        if self.data_type == torch.float8_e4m3fn:
+            q = q.to(self.data_type)
+
+        k_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
+        if self.data_type != k_cache.dtype:
+            k_cache = k_cache.to(self.data_type)
+        kv_cache = k_cache.view(-1, self.page_size, self.kv_cache_dim).unsqueeze(1)
+
+        k_scale = (
+            layer.k_scale_float
+            if getattr(layer, "k_scale_float", None) is not None
+            else 1.0
+        )
+        out = trtllm_batch_decode_with_kv_cache_mla(
+            query=q,
+            kv_cache=kv_cache,
+            workspace_buffer=self.trtllm_workspace,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_seq_len=max_seq_len,
+            sparse_mla_top_k=self.index_topk,
+            bmm1_scale=k_scale * layer.scaling,
+            backend="trtllm-gen",
+        )
+        return out.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
+
     def _forward_sparse_decode(
         self,
         *,
@@ -491,6 +676,37 @@ class DSABackend(AttentionBackend):
         else:
             q_len_per_req = 1
         num_reqs = num_tokens // q_len_per_req
+        if sparse_decode_impl == _SPARSE_IMPL_FLASHINFER_TRTLLM:
+            return self._forward_sparse_decode_trtllm(
+                q=q,
+                layer=layer,
+                token_to_kv_pool=token_to_kv_pool,
+                num_reqs=num_reqs,
+                topk_indices=topk_indices,
+                topk_lens=topk_lens,
+                q_len_per_req=q_len_per_req,
+            )
+        return self._forward_sparse_decode_triton(
+            q=q,
+            layer=layer,
+            token_to_kv_pool=token_to_kv_pool,
+            num_reqs=num_reqs,
+            topk_indices=topk_indices,
+            topk_lens=topk_lens,
+            q_len_per_req=q_len_per_req,
+        )
+
+    def _forward_sparse_decode_triton(
+        self,
+        *,
+        q: torch.Tensor,
+        layer,
+        token_to_kv_pool,
+        num_reqs: int,
+        topk_indices: torch.Tensor,
+        topk_lens: torch.Tensor | None = None,
+        q_len_per_req: int = 1,
+    ) -> torch.Tensor:
         metadata = getattr(self, "forward_decode_metadata", None)
         if metadata is None or metadata.seq_lens_k is None:
             raise RuntimeError("DSA sparse decode requires decode metadata.")
@@ -560,6 +776,112 @@ class DSABackend(AttentionBackend):
             q_len_per_req=q_len_per_req,
             k_scale=k_scale,
             solution=getattr(self, "_sparse_decode_impl", None),
+        )
+        return out.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+    def _forward_sparse_decode_trtllm(
+        self,
+        *,
+        q: torch.Tensor,
+        layer,
+        token_to_kv_pool,
+        num_reqs: int,
+        topk_indices: torch.Tensor,
+        topk_lens: torch.Tensor | None = None,
+        q_len_per_req: int = 1,
+    ) -> torch.Tensor:
+        if trtllm_batch_decode_with_kv_cache_mla is error_fn:
+            raise RuntimeError(
+                "DSA plain sparse decode requires TRTLLM sparse MLA. "
+                "Build/install `tokenspeed-kernel/python` with FlashInfer TRTLLM "
+                "decode support."
+            )
+        metadata = getattr(self, "forward_decode_metadata", None)
+        if (
+            metadata is None
+            or metadata.seq_lens_k is None
+            or metadata.max_seq_len_k is None
+        ):
+            raise RuntimeError("DSA plain sparse decode requires decode metadata.")
+        num_extends = int(metadata.num_extends or 0)
+        available_reqs = max(0, int(metadata.seq_lens_k.shape[0]) - num_extends)
+        if available_reqs < num_reqs:
+            if available_reqs <= 0 or q.shape[0] % available_reqs != 0:
+                raise RuntimeError(
+                    "DSA sparse decode metadata batch mismatch: "
+                    f"seq_lens={available_reqs}, requests={num_reqs}, "
+                    f"q_tokens={q.shape[0]}."
+                )
+            num_reqs = available_reqs
+            q_len_per_req = q.shape[0] // available_reqs
+        seq_lens = metadata.seq_lens_k[num_extends : num_extends + num_reqs]
+        if seq_lens.numel() != num_reqs:
+            raise RuntimeError(
+                "DSA sparse decode metadata batch mismatch: "
+                f"seq_lens={seq_lens.numel()}, requests={num_reqs}."
+            )
+        num_tokens = q.shape[0]
+        expected_tokens = num_reqs * int(q_len_per_req)
+        if num_tokens != expected_tokens:
+            raise RuntimeError(
+                "DSA TRTLLM sparse decode token shape mismatch: "
+                f"q_tokens={num_tokens}, requests={num_reqs}, "
+                f"q_len_per_req={q_len_per_req}."
+            )
+        if q_len_per_req > 1:
+            if getattr(self, "is_draft", False):
+                offsets = torch.arange(
+                    q_len_per_req,
+                    device=seq_lens.device,
+                    dtype=seq_lens.dtype,
+                )
+            else:
+                offsets = torch.arange(
+                    1 - q_len_per_req,
+                    1,
+                    device=seq_lens.device,
+                    dtype=seq_lens.dtype,
+                )
+            seq_lens = (
+                (seq_lens.view(-1, 1) + offsets.view(1, -1))
+                .clamp_min_(0)
+                .reshape(-1)
+                .contiguous()
+            )
+        if topk_lens is not None:
+            if topk_lens.dim() != 1 or topk_lens.numel() != num_tokens:
+                raise RuntimeError(
+                    "DSA TRTLLM sparse decode top-k length mismatch: "
+                    f"lens={tuple(topk_lens.shape)}, q_tokens={num_tokens}."
+                )
+            seq_lens = topk_lens.to(device=q.device, dtype=torch.int32).contiguous()
+
+        q_view = q.view(num_tokens, 1, layer.tp_q_head_num, layer.head_dim)
+        if self.data_type == torch.float8_e4m3fn:
+            q_view = q_view.to(self.data_type)
+        kv_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
+        if self.data_type != kv_cache.dtype:
+            kv_cache = kv_cache.to(self.data_type)
+        kv_cache = kv_cache.view(-1, self.page_size, self.kv_cache_dim).unsqueeze(1)
+
+        k_scale = (
+            layer.k_scale_float
+            if getattr(layer, "k_scale_float", None) is not None
+            else 1.0
+        )
+        out = trtllm_batch_decode_with_kv_cache_mla(
+            query=q_view,
+            kv_cache=kv_cache,
+            workspace_buffer=self.trtllm_workspace,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            block_tables=topk_indices.view(num_tokens, 1, -1),
+            seq_lens=seq_lens,
+            max_seq_len=metadata.max_seq_len_k,
+            sparse_mla_top_k=self.index_topk,
+            bmm1_scale=k_scale * layer.scaling,
+            backend="trtllm-gen",
         )
         return out.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 

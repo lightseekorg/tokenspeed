@@ -71,7 +71,6 @@ def _hadamard_128_kernel(
         "last_dim": frozenset({128}),
     },
     priority=Priority.PORTABLE,
-    tags={"portability"},
 )
 def triton_hadamard_transform_128(
     x: torch.Tensor,

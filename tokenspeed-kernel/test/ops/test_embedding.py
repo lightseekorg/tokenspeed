@@ -25,7 +25,7 @@ import torch
 from tokenspeed_kernel.ops.embedding import (
     FusedSetKVBufferArg,
     apply_rope,
-    apply_rope_fp8,
+    apply_rope_mla,
 )
 
 
@@ -43,7 +43,7 @@ def test_rope_neox_full_bf16(
     rotary_dim = 128
     max_position = 1024
     dtype = torch.bfloat16
-    require("embedding", "rope", solution, dtype, "query")
+    require("embedding", "rope", solution, dtype, "q")
 
     inv_freq = 1.0 / (
         10000.0
@@ -84,8 +84,8 @@ def test_rope_neox_full_bf16(
 
     apply_rope(
         positions=positions,
-        query=query,
-        key=key,
+        q=query,
+        k=key,
         head_size=head_size,
         cos_sin_cache=cos_sin_cache,
         is_neox=True,
@@ -110,7 +110,7 @@ def test_rope_gptj_full_bf16(
     rotary_dim = 64
     max_position = 512
     dtype = torch.bfloat16
-    require("embedding", "rope", solution, dtype, "query")
+    require("embedding", "rope", solution, dtype, "q")
 
     inv_freq = 1.0 / (
         10000.0
@@ -151,8 +151,8 @@ def test_rope_gptj_full_bf16(
 
     apply_rope(
         positions=positions,
-        query=query,
-        key=key,
+        q=query,
+        k=key,
         head_size=head_size,
         cos_sin_cache=cos_sin_cache,
         is_neox=False,
@@ -177,7 +177,7 @@ def test_rope_neox_partial_bf16(
     rotary_dim = 64
     max_position = 256
     dtype = torch.bfloat16
-    require("embedding", "rope", solution, dtype, "query")
+    require("embedding", "rope", solution, dtype, "q")
 
     inv_freq = 1.0 / (
         10000.0
@@ -220,12 +220,11 @@ def test_rope_neox_partial_bf16(
 
     apply_rope(
         positions=positions,
-        query=query,
-        key=key,
+        q=query,
+        k=key,
         head_size=head_size,
         cos_sin_cache=cos_sin_cache,
         is_neox=True,
-        rotary_dim=rotary_dim,
         solution=solution,
     )
 
@@ -255,7 +254,7 @@ def test_rope_single_token(
     rotary_dim = 128
     max_position = 64
     dtype = torch.bfloat16
-    require("embedding", "rope", solution, dtype, "query")
+    require("embedding", "rope", solution, dtype, "q")
 
     inv_freq = 1.0 / (
         10000.0
@@ -289,8 +288,8 @@ def test_rope_single_token(
 
     apply_rope(
         positions=positions,
-        query=query,
-        key=key,
+        q=query,
+        k=key,
         head_size=head_size,
         cos_sin_cache=cos_sin_cache,
         is_neox=True,
@@ -316,7 +315,7 @@ def test_rope_fused_set_kv_buffer(
     max_position = 512
     cache_size = 32
     dtype = torch.bfloat16
-    require("embedding", "rope", solution, dtype, "query")
+    require("embedding", "rope", solution, dtype, "q")
 
     inv_freq = 1.0 / (
         10000.0
@@ -342,7 +341,7 @@ def test_rope_fused_set_kv_buffer(
         cache_size, num_k_heads * head_size, device=device, dtype=dtype
     )
     v_buffer = torch.zeros_like(k_buffer)
-    output_q_rope = torch.empty_like(query)
+    q_rope_out = torch.empty_like(query)
 
     cos_sin_ref = cos_sin_cache.index_select(0, positions)
     cos_ref, sin_ref = cos_sin_ref.chunk(2, dim=-1)
@@ -363,8 +362,8 @@ def test_rope_fused_set_kv_buffer(
 
     apply_rope(
         positions=positions,
-        query=query,
-        key=key,
+        q=query,
+        k=key,
         head_size=head_size,
         cos_sin_cache=cos_sin_cache,
         is_neox=True,
@@ -376,12 +375,12 @@ def test_rope_fused_set_kv_buffer(
             v_scale=None,
             cache_loc=cache_loc,
         ),
-        output_q_rope=output_q_rope,
+        q_rope_out=q_rope_out,
         solution=solution,
     )
 
     torch.testing.assert_close(query, query_orig, rtol=0, atol=0)
-    torch.testing.assert_close(output_q_rope, q_ref, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(q_rope_out, q_ref, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(key, k_ref, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(
         k_buffer.index_select(0, cache_loc), k_ref, rtol=2e-2, atol=2e-2
@@ -396,7 +395,7 @@ def test_rope_fused_set_kv_buffer(
 
 @pytest.mark.parametrize("solution", [None, "triton", "flashinfer"])
 @pytest.mark.parametrize("is_neox", [True, False])
-def test_rope_fp8_mla_quantize(
+def test_rope_mla_quantize(
     device: str,
     solution: str,
     is_neox: bool,
@@ -405,7 +404,7 @@ def test_rope_fp8_mla_quantize(
     torch.manual_seed(6)
     dtype = torch.bfloat16
     if solution is not None:
-        require("embedding", "rope_fp8", solution, dtype, "q_rope")
+        require("embedding", "rope_mla", solution, dtype, "q_rope")
 
     num_tokens = 13
     num_heads = 4
@@ -450,28 +449,16 @@ def test_rope_fp8_mla_quantize(
     q_nope = torch.randn(num_tokens, num_heads, nope_dim, device=device, dtype=dtype)
     k_nope = torch.randn(num_tokens, num_heads, nope_dim, device=device, dtype=dtype)
 
-    query_fp8 = torch.empty(
-        num_tokens,
-        num_heads,
-        nope_dim + rope_dim,
-        device=device,
-        dtype=torch.float8_e4m3fn,
-    )
-    key_fp8 = torch.empty_like(query_fp8)
     quant_scale_q = 1.0
     quant_scale_kv = 2.0
 
-    apply_rope_fp8(
+    query_fp8, key_fp8 = apply_rope_mla(
+        positions=positions,
         q_rope=q_rope,
         k_rope=k_rope,
         q_nope=q_nope,
         k_nope=k_nope,
         cos_sin_cache=cos_sin_cache,
-        pos_ids=positions,
-        q_rope_out=query_fp8[..., nope_dim:],
-        k_rope_out=key_fp8[..., nope_dim:],
-        q_nope_out=query_fp8[..., :nope_dim],
-        k_nope_out=key_fp8[..., :nope_dim],
         is_neox=is_neox,
         quant_scale_q=quant_scale_q,
         quant_scale_kv=quant_scale_kv,
@@ -489,5 +476,9 @@ def test_rope_fp8_mla_quantize(
         dim=-1,
     ).to(torch.float8_e4m3fn)
 
+    assert query_fp8.shape == q_ref.shape
+    assert key_fp8.shape == k_ref.shape
+    assert query_fp8.dtype == torch.float8_e4m3fn
+    assert key_fp8.dtype == torch.float8_e4m3fn
     torch.testing.assert_close(query_fp8.float(), q_ref.float(), rtol=0, atol=0.25)
     torch.testing.assert_close(key_fp8.float(), k_ref.float(), rtol=0, atol=0.25)

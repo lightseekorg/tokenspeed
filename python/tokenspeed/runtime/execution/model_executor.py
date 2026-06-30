@@ -448,11 +448,6 @@ class ModelExecutor:
             runtime_states=self.runtime_states,
         )
 
-        # CUDA graph warmup runs the drafter with dummy data whose
-        # uninitialized KV cache produces NaN → argmax sentinel -1.
-        # Clear the residue so pool slots reused by real requests start clean.
-        self.runtime_states.future_input_map.zero_()
-
         # Encoder CUDA graph: install model-built wrappers by overriding
         # modality encoder callables (e.g. ``image_encoder``, ``video_encoder``).
         # Multimodal-encoder analogue of ``forward_step``'s ``CudaGraphWrapper``.
@@ -785,19 +780,10 @@ class ModelExecutor:
             logits_output, sampling_info, ctx, candidates
         )
 
-        # Single choke point for every (sample/verify) x (greedy/flashinfer)
-        # path: NaN logits (e.g. DP dummy/warmup batches over uninitialized KV)
-        # make sampling argmax emit the -1 sentinel. Left unclamped, that -1 poisons
-        # both consumers below -- it flows into output_ids -> detokenizer (the
-        # HF Rust tokenizer raises OverflowError on a negative id and kills the
-        # engine) and, via the drafter, back into future_input_map as the next
-        # round's input_ids (negative embedding index -> garbage / CUDA illegal
-        # access). Clamp in place (this runs inside the CUDA graph) so grammar,
-        # drafter, and the return value all observe clean ids. Mirror of the
-        # draft-side draft_ids.clamp_(min=0) guard.
-        # Record which requests produced bad ids before the clamp erases them.
+        # Backstop: flag any request whose sampled id falls outside [0, vocab)
+        # so the output processor can terminate it. Covers sampler/verify kernel
+        # corruption and DP-sharded steps that audit_logits cannot attribute.
         self.nan_guard.merge_oov(output_tokens, ctx, self.runtime_states.vocab_size)
-        output_tokens.clamp_(min=0)
 
         # Fork sampler-output D2H onto the grammar side stream so the
         # next step's build hostfunc can advance the matcher.
