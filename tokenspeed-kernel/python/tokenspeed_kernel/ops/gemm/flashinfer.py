@@ -147,7 +147,10 @@ if gemm_fp8_nt_groupwise is not error_fn:
 
 mm_fp4 = error_fn
 
-if platform.is_nvidia and platform.is_blackwell:
+# NVFP4 GEMM runs across the Blackwell family (FP4 hardware); use
+# is_blackwell_plus so consumer (sm_120/sm_121) and Thor (sm_110) register it,
+# not just datacenter Blackwell.
+if platform.is_nvidia and platform.is_blackwell_plus:
     try:
         from flashinfer import mm_fp4
     except ImportError:

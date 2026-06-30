@@ -142,7 +142,43 @@ class PlatformInfo:
 
     @property
     def is_blackwell(self) -> bool:
+        """Datacenter Blackwell only (sm_100/sm_103, major 10; B200/GB200).
+
+        Does NOT include Thor (major 11) or consumer Blackwell (major 12). Note
+        Thor ALSO has tcgen05/TMEM, so to gate "tcgen05-capable Blackwell"
+        (datacenter + Thor, excluding consumer) require the ``compute:tmem``
+        feature instead; use this predicate (or ``is_datacenter_blackwell``) only
+        when you specifically mean the datacenter SKUs.
+        """
         return self.is_nvidia and self.arch_version.major == 10
+
+    @property
+    def is_datacenter_blackwell(self) -> bool:
+        """Explicit alias of :attr:`is_blackwell` (datacenter Blackwell, major 10)."""
+        return self.is_nvidia and self.arch_version.major == 10
+
+    @property
+    def is_thor_blackwell(self) -> bool:
+        """Thor Blackwell SoC (sm_110, major 11; Jetson/DRIVE Thor).
+
+        Has FP4 (``tensor_core:f4``) AND tcgen05/TMEM (``compute:tmem``; see
+        triton-lang/triton#9160) — unlike consumer Blackwell. It is a distinct
+        SASS target (sm_110a) from datacenter, so arch-specific AOT binaries built
+        for sm_100a/sm_103a still do not run on it.
+        """
+        return self.is_nvidia and self.arch_version.major == 11
+
+    @property
+    def is_consumer_blackwell(self) -> bool:
+        """Consumer/workstation Blackwell (sm_120 and sm_121, major 12).
+
+        Covers RTX 50-series, RTX PRO 6000 Blackwell and GB10 (DGX Spark). One
+        instruction-compatible family (the ``sm_120f`` target): keying on
+        ``major == 12`` admits BOTH (12, 0) and (12, 1). Has FP4
+        (``tensor_core:f4``) but NOT tcgen05/TMEM (``compute:tmem``) — that is the
+        feature that distinguishes it from datacenter and Thor Blackwell.
+        """
+        return self.is_nvidia and self.arch_version.major == 12
 
     @property
     def is_ampere(self) -> bool:
@@ -170,6 +206,13 @@ class PlatformInfo:
 
     @property
     def is_blackwell_plus(self) -> bool:
+        """Blackwell-or-newer (arch >= 10.0): INCLUDES Thor (11) and consumer (12).
+
+        Do NOT use as a datacenter-only gate. ``compute:tmem`` /
+        ``tensor_core:tcgen05`` marks the tcgen05 tensor-core path (datacenter +
+        Thor, NOT consumer); ``is_blackwell`` / ``is_datacenter_blackwell`` is the
+        datacenter-only predicate.
+        """
         return self.is_nvidia and self.arch_version >= ArchVersion(10, 0)
 
     @property
@@ -230,7 +273,11 @@ class PlatformInfo:
                 (8, 6): "Ampere",
                 (8, 9): "Ada Lovelace",
                 (9, 0): "Hopper",
-                (10, 0): "Blackwell",
+                (10, 0): "Blackwell (Data Center)",
+                (10, 3): "Blackwell (Data Center)",
+                (11, 0): "Blackwell (Thor)",
+                (12, 0): "Blackwell (Consumer)",
+                (12, 1): "Blackwell (Consumer)",
             }
             return names.get(arch_version, f"SM{arch_version[0]}.{arch_version[1]}")
         if self.is_amd:
@@ -388,6 +435,16 @@ def _get_cuda_sm_features(arch_version: ArchVersion) -> frozenset[str]:
 
     if arch_version >= ArchVersion(10, 0):
         features |= {"tensor_core:f4"}
+
+    # tcgen05 (5th-gen tensor-core MMA) + tensor memory (TMEM): datacenter
+    # Blackwell (major 10; sm_100/sm_103) AND Thor (major 11; sm_110, per
+    # triton-lang/triton#9160 "Enable tcgen05 MMA for sm110"). Consumer Blackwell
+    # (major 12; sm_120/sm_121) has FP4 (granted above) but NOT this tensor-core
+    # path, so kernels gate on these features to auto-exclude consumer with a
+    # clean "missing features: compute:tmem" reason. (2-CTA UTCMMA is a separate,
+    # as-yet unmodeled capability — datacenter has it; Thor's status is unverified.)
+    if arch_version.major in (10, 11):
+        features |= {"tensor_core:tcgen05", "compute:tmem"}
 
     return frozenset(features)
 

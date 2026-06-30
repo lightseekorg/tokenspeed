@@ -58,7 +58,9 @@ if platform.is_nvidia:
         return mxfp8_quantize(x, False)
 
 
-if platform.is_nvidia and platform.is_blackwell:
+# NVFP4 quantize uses FP4 hardware present across the Blackwell family; gate on
+# is_blackwell_plus so consumer (sm_120/sm_121) and Thor (sm_110) register it.
+if platform.is_nvidia and platform.is_blackwell_plus:
     from flashinfer import (
         fp4_quantize,
         nvfp4_block_scale_interleave,

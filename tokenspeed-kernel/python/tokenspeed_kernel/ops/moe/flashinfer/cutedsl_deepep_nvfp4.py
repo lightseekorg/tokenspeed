@@ -113,6 +113,9 @@ if platform.is_nvidia:
         capability=CapabilityRequirement(
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(10, 0),
+            # FlashInfer CuTe-DSL blockscaled grouped GEMM supports SM100/SM103
+            # only; exclude Thor (sm_110) and consumer Blackwell (sm_120/sm_121).
+            max_arch_version=ArchVersion(10, 3),
         ),
         signatures=format_signatures(
             "x",

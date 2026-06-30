@@ -855,6 +855,11 @@ def explain_selection(
                         f"arch mismatch (requires "
                         f"{spec.capability.min_arch_version})"
                     )
+            if spec.capability.max_arch_version:
+                if platform.arch_version > spec.capability.max_arch_version:
+                    reasons.append(
+                        f"arch mismatch (max " f"{spec.capability.max_arch_version})"
+                    )
             if format_signature and not spec.supports_format_signature(
                 format_signature
             ):

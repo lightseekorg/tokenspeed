@@ -403,7 +403,11 @@ def register_kernel(
             solution="triton",
             capability=CapabilityRequirement(
                 min_arch_version=ArchVersion(10, 0),
-                required_features=frozenset({"tensor_core:f8"}),
+                # tcgen05 tensor-core path: present on datacenter (sm_100/sm_103)
+                # and Thor (sm_110), absent on consumer Blackwell (sm_120/sm_121),
+                # so selection excludes consumer automatically — prefer a feature
+                # over a bare arch bound.
+                required_features=frozenset({"tensor_core:tcgen05"}),
             ),
             signatures=format_signatures(
                 ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
