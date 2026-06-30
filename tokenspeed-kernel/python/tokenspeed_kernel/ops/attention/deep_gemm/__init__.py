@@ -20,26 +20,6 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 platform = current_platform()
 
 
-def _validate_common(q: torch.Tensor, weights: torch.Tensor, topk: int) -> None:
-    if q.dtype != torch.bfloat16:
-        raise TypeError(f"DeepGEMM DSA top-k expects BF16 q, got {q.dtype}")
-    if weights.dtype != torch.float32:
-        raise TypeError(f"DeepGEMM DSA top-k expects FP32 weights, got {weights.dtype}")
-    if q.dim() != 3:
-        raise ValueError(f"q must be [tokens, heads, dim], got {tuple(q.shape)}")
-    if weights.shape != q.shape[:2]:
-        raise ValueError(
-            "weights must be [tokens, heads] matching q, got "
-            f"weights={tuple(weights.shape)}, q={tuple(q.shape)}"
-        )
-    if topk not in (512, 1024, 2048):
-        raise RuntimeError(f"DeepGEMM DSA top-k does not support topk={topk}")
-    if q.shape[-1] != 128:
-        raise RuntimeError(
-            f"DeepGEMM DSA top-k requires head_dim=128, got {q.shape[-1]}"
-        )
-
-
 def _check_out(
     out: torch.Tensor | None,
     lens_out: torch.Tensor | None,
@@ -118,23 +98,6 @@ if platform.is_nvidia:
         out: torch.Tensor | None = None,
         lens_out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        _validate_common(q, weights, topk)
-        if index_k_with_scale_cache is None:
-            raise RuntimeError(
-                "DeepGEMM DSA paged top-k requires FP8 index_k_with_scale_cache"
-            )
-        if page_size != 64:
-            raise RuntimeError(
-                f"DeepGEMM DSA paged top-k requires page_size=64, got {page_size}"
-            )
-        if q.shape[0] % int(q_len_per_req) != 0:
-            raise ValueError(
-                f"tokens={q.shape[0]} must be divisible by "
-                f"q_len_per_req={q_len_per_req}"
-            )
-        if not has_deterministic_decode_topk():
-            raise RuntimeError("DeepGEMM DSA paged top-k requires flashinfer top_k")
-
         q = q.contiguous()
         weights = weights.float().contiguous()
         seq_lens = seq_lens.to(device=q.device, dtype=torch.int32).contiguous()
@@ -252,18 +215,6 @@ if platform.is_nvidia:
         out: torch.Tensor | None = None,
         lens_out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        _validate_common(q, weights, topk)
-        if index_k_fp8 is None or index_k_scale is None:
-            if index_k_with_scale_cache is None or page_size is None:
-                raise RuntimeError(
-                    "DeepGEMM DSA top-k requires gathered FP8 index-K rows or "
-                    "a packed FP8 index-K cache with page_size"
-                )
-        trtllm_ops = getattr(torch.ops, "trtllm", None)
-        if trtllm_ops is None or not hasattr(trtllm_ops, "indexer_topk_prefill"):
-            raise RuntimeError(
-                "DeepGEMM DSA top-k requires torch.ops.trtllm.indexer_topk_prefill"
-            )
 
         q = q.contiguous()
         weights = weights.float().contiguous()
@@ -362,8 +313,3 @@ if platform.is_nvidia:
         valid = out >= 0
         out.copy_(torch.where(valid, out + row_starts.unsqueeze(1), out))
         return out, lens_out
-
-
-__all__ = (
-    ["deep_gemm_dsa_top_paged", "deep_gemm_dsa_topk"] if platform.is_nvidia else []
-)
