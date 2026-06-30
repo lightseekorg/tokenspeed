@@ -853,8 +853,10 @@ if _CUTE_AVAILABLE:
                         warp_max, warp_argmax = warp_argmax_redux(peer_val, peer_idx)
                     else:
                         warp_max, warp_argmax = warp_reduce_argmax(peer_val, peer_idx)
+                    # A row whose elements never beat -inf (all-NaN / all -inf) leaves
+                    # the argmax at its 0xFFFFFFFF sentinel; emit the in-range index 0.
                     if warp_argmax == Int32(0x7FFFFFFF):
-                        warp_argmax = Int32(0xFFFFFFFF)
+                        warp_argmax = Int32(0)
 
                     if cutlass.const_expr(not self.skip_ping_pong):
                         if lane_idx == 0:

@@ -122,6 +122,7 @@ class ServerArgs:
     log_level_http: str | None = None
     enable_log_requests: bool = False
     log_requests_level: int = 0
+    enable_log_request_stats: bool = False
     enable_metrics: bool = False
     decode_log_interval: int = 40
     metrics_reporters: list[str] | None = None
@@ -1077,6 +1078,18 @@ class ServerArgs:
             default=0,
             help="0: Log metadata. 1. Log metadata and partial input/output. 2. Log every input/output.",
             choices=[0, 1, 2],
+        )
+        parser.add_argument(
+            "--enable-log-request-stats",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.enable_log_request_stats,
+            help=(
+                "Log a one-line per-request performance summary when each request "
+                "finishes or aborts: timings (queue/prefill/ttft/total/preemption), "
+                "token counts (prompt/cache/output), cache-hit rate, decode "
+                "throughput, and spec-decode acceptance. Measured entirely on the "
+                "host (no GPU sync), so it adds no engine slowdown."
+            ),
         )
         parser.add_argument(
             "--enable-metrics",

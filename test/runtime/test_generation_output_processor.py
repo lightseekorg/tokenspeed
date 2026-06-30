@@ -27,6 +27,11 @@ from tokenspeed.runtime.engine.generation_output_processor import (
     OutputProcesser,
     RequestState,
 )
+from tokenspeed.runtime.engine.request_stats import (
+    NOOP_STATS,
+    RequestStats,
+    RequestStatsTracker,
+)
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 
@@ -93,7 +98,7 @@ def test_mixed_forward_updates_reserve_for_decode_slots_only():
     sender = _Sender()
     processor = OutputProcesser(
         sender,
-        global_rank=0,
+        attn_tp_rank=0,
         metrics=_Metrics(),
     )
     processor.rid_to_state["prefill"] = _state([1, 2, 3, 4])
@@ -113,7 +118,7 @@ def test_mark_abort_notify_client_flag():
     """Pause-initiated aborts must flag the request to stream a terminating
     finish to the (passive) client; client-initiated aborts must not."""
     sender = _Sender()
-    processor = OutputProcesser(sender, global_rank=0, metrics=_Metrics())
+    processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
 
     pause_state = _state([1, 2, 3])
     processor.rid_to_state["pause"] = pause_state
@@ -136,7 +141,7 @@ def test_nan_flag_finishes_request_with_numerical_error():
 
     sender = _Sender()
     metrics = _Metrics()
-    processor = OutputProcesser(sender, global_rank=0, metrics=metrics)
+    processor = OutputProcesser(sender, attn_tp_rank=0, metrics=metrics)
     prefill_state = _state([1, 2, 3, 4])
     decode_state = _state([5, 6, 7], computed_length=3)
     processor.rid_to_state["prefill"] = prefill_state
@@ -179,7 +184,7 @@ def test_nan_flag_keeps_single_sanitized_token():
     metrics = _Metrics()
     processor = OutputProcesser(
         sender,
-        global_rank=0,
+        attn_tp_rank=0,
         spec_algorithm="eagle",
         spec_num_tokens=4,
         metrics=metrics,
@@ -216,7 +221,7 @@ def test_nan_flag_skips_first_token_pd_handoff():
     """NaN-terminated requests must not hand their bootstrap token to the PD
     transfer layer — their KV is suspect."""
     sender = _Sender()
-    processor = OutputProcesser(sender, global_rank=0, metrics=_Metrics())
+    processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
     processor.rid_to_state["prefill"] = _state([1, 2, 3, 4])
     processor.rid_to_state["decode"] = _state([5, 6, 7], computed_length=3)
 
@@ -233,6 +238,256 @@ def test_nan_flag_skips_first_token_pd_handoff():
 
     # Flagged prefill slot is skipped; the healthy decode slot still hands off.
     assert handoffs == ["decode"]
+
+
+class _RecordingLogger:
+    """Capture logger.info(fmt, *args) calls as formatted strings."""
+
+    def __init__(self):
+        self.lines: list[str] = []
+
+    def info(self, fmt, *args):
+        self.lines.append(fmt % args if args else fmt)
+
+    def warning(self, *a, **k):
+        pass
+
+
+def test_log_request_stats_disabled_by_default():
+    """Without --enable-log-request-stats, no ReqStats line is emitted and no
+    timestamps are recorded (zero overhead path)."""
+    import tokenspeed.runtime.engine.generation_output_processor as gop
+
+    rec = _RecordingLogger()
+    gop_logger, gop.logger = gop.logger, rec
+    try:
+        processor = OutputProcesser(_Sender(), attn_tp_rank=0, metrics=_Metrics())
+        assert processor.enable_log_request_stats is False
+        state = _state([5, 6, 7], computed_length=3)
+        state.sampling_params.max_new_tokens = 1
+        processor.rid_to_state["d"] = state
+
+        class _DecodeOp:
+            request_ids = ["d"]
+            request_pool_indices = [0]
+            input_lengths = [1]
+            extend_prefix_lens = []
+
+            def num_extends(self):
+                return 0
+
+        processor.post_process_forward_op(_DecodeOp(), _ExecutionResult())
+    finally:
+        gop.logger = gop_logger
+
+    assert state.finished
+    assert not any("RequestStats(" in line for line in rec.lines)
+    # disabled: request still carries the shared no-op tracker (never registered)
+    assert state.stats is NOOP_STATS
+
+
+def test_log_request_stats_line_fields():
+    """The per-request stats line reports the right host-side derived values:
+    queue/prefill/ttft/total ms, cache-hit, decode throughput, preemption."""
+    import tokenspeed.runtime.engine.generation_output_processor as gop
+    from tokenspeed.runtime.engine.request_types import FINISH_LENGTH
+
+    rec = _RecordingLogger()
+    gop_logger, gop.logger = gop.logger, rec
+    try:
+        processor = OutputProcesser(
+            _Sender(), attn_tp_rank=0, enable_log_request_stats=True, metrics=_Metrics()
+        )
+        # prompt=4, cache=2 -> cache_hit 0.5; queue 10ms, prefill 20ms, ttft 30ms,
+        # total 130ms; output=5 over a 100ms decode window -> decode_tps 40.
+        rs = _state([1, 2, 3, 4])
+        rs.created_time = 1000.000
+        rs.cached_tokens = 2
+        rs.output_ids = [11, 12, 13, 14, 15]
+        rs.finished_reason = FINISH_LENGTH(length=5)
+        rs.stats = RequestStatsTracker()
+        rs.stats.scheduled_time = 1000.010
+        rs.stats.prefill_done_time = 1000.030
+        rs.stats.first_token_time = 1000.030
+        rs.stats.preempt_count = 2
+        rs.stats.preempt_time = 0.005
+
+        processor._log_request_stats("rid-x", rs, finish_time=1000.130)
+    finally:
+        gop.logger = gop_logger
+
+    assert len(rec.lines) == 1
+    line = rec.lines[0]
+    assert line.startswith(
+        "Req: rid-x Finish! RequestStats(status='finished', reason='length'"
+    )
+    assert (
+        "prompt_tokens=4, cache_tokens=2, output_tokens=5, cache_hit_rate=0.5" in line
+    )
+    assert "queue_ms=10.0, prefill_ms=20.0, ttft_ms=30.0, total_ms=130.0" in line
+    assert "preempt_ms=5.0, preempt_count=2" in line
+    assert "decode_tps=40.0" in line
+    assert "acc_len=None, acc_rate=None" in line
+
+
+def test_log_request_stats_aborted_with_spec_acceptance():
+    """Aborted requests log status=aborted; with spec decode on, acc_len and
+    acc_rate are populated."""
+    import tokenspeed.runtime.engine.generation_output_processor as gop
+    from tokenspeed.runtime.engine.request_types import FINISH_ABORT
+
+    rec = _RecordingLogger()
+    gop_logger, gop.logger = gop.logger, rec
+    try:
+        processor = OutputProcesser(
+            _Sender(),
+            attn_tp_rank=0,
+            spec_algorithm="eagle",
+            spec_num_tokens=4,
+            enable_log_request_stats=True,
+            metrics=_Metrics(),
+        )
+        rs = _state([1, 2, 3, 4])
+        rs.created_time = 1000.0
+        rs.spec_verify_ct = 10
+        rs.accept_draft_tokens = 3.0
+        rs.finished_reason = FINISH_ABORT("client abort")
+        rs.stats = RequestStatsTracker()
+        processor._log_request_stats("rid-a", rs, finish_time=1000.05)
+    finally:
+        gop.logger = gop_logger
+
+    line = rec.lines[0]
+    assert "status='aborted', reason='abort'" in line
+    # acc_rate = (acc_len - 1) / draft = (3 - 1) / 4 = 0.5
+    assert "acc_len=3.0, acc_rate=0.5" in line
+
+
+def test_log_request_stats_noop_without_tracker():
+    """A request carrying the no-op tracker (flag off / finished-at-admission)
+    is skipped by _log_request_stats's single guard, without raising."""
+    import tokenspeed.runtime.engine.generation_output_processor as gop
+    from tokenspeed.runtime.engine.request_types import FINISH_LENGTH
+
+    rec = _RecordingLogger()
+    gop_logger, gop.logger = gop.logger, rec
+    try:
+        processor = OutputProcesser(
+            _Sender(), attn_tp_rank=0, enable_log_request_stats=True, metrics=_Metrics()
+        )
+        rs = _state([1, 2, 3])
+        rs.finished_reason = FINISH_LENGTH(length=1)
+        assert rs.stats is NOOP_STATS  # never registered -> no-op tracker
+        processor._log_request_stats("no-tracker", rs, finish_time=123.0)
+    finally:
+        gop.logger = gop_logger
+    assert rec.lines == []
+
+
+def test_request_stats_from_state_total_on_degenerate_input():
+    """from_state never divides by zero / reads a missing stage: a request with
+    no output and unset timestamps yields zeros and None, not an exception."""
+    from tokenspeed.runtime.engine.request_types import FINISH_ABORT
+
+    rs = _state([1, 2, 3, 4])
+    rs.finished_reason = FINISH_ABORT("aborted before any output")
+    rs.stats = RequestStatsTracker()  # all timestamps still 0.0
+    # output_ids empty, no spec decode, no timestamps set.
+    stats = RequestStats.from_state(rs, spec_algorithm=None, spec_num_tokens=None)
+
+    assert stats.status == "aborted" and stats.reason == "abort"
+    assert stats.output_tokens == 0
+    assert stats.cache_hit_rate == 0.0
+    assert stats.queue_ms == stats.prefill_ms == stats.ttft_ms == stats.total_ms == 0.0
+    assert stats.decode_tps == 0.0
+    assert stats.acc_len is None and stats.acc_rate is None
+
+
+def test_noop_stats_singleton_is_frozen():
+    """NOOP_STATS is shared, so its methods are no-ops and writes raise -- a
+    future tracker mutator without a no-op override fails loudly, not silently."""
+    import pytest
+
+    NOOP_STATS.mark_scheduled(5.0)  # no-op, does not raise or record
+    NOOP_STATS.record_decode_step(1.0, True)
+    with pytest.raises(AttributeError):
+        NOOP_STATS.scheduled_time = 1.0
+
+
+def test_log_request_stats_records_timestamps_through_forward():
+    """End-to-end: with the flag on, a finishing request gets its post-forward
+    timestamps recorded host-side and emits one ReqStats line. (scheduled_time
+    is stamped pre-forward in the event loop; simulated here.)"""
+    import time
+
+    import tokenspeed.runtime.engine.generation_output_processor as gop
+
+    rec = _RecordingLogger()
+    gop_logger, gop.logger = gop.logger, rec
+    try:
+        processor = OutputProcesser(
+            _Sender(), attn_tp_rank=0, enable_log_request_stats=True, metrics=_Metrics()
+        )
+        # prefill already done; max_new_tokens=1 so it finishes after one token
+        state = _state([5, 6, 7], computed_length=3)
+        state.sampling_params.max_new_tokens = 1
+        processor.register("d", state)  # attaches the stats tracker
+        state.stats.mark_scheduled(time.time())  # event loop does this pre-forward
+
+        class _DecodeOp:
+            request_ids = ["d"]
+            request_pool_indices = [0]
+            input_lengths = [1]
+            extend_prefix_lens = []
+
+            def num_extends(self):
+                return 0
+
+        processor.post_process_forward_op(_DecodeOp(), _ExecutionResult())
+    finally:
+        gop.logger = gop_logger
+
+    assert state.finished
+    # Lifecycle timestamps were stamped on the host, in order.
+    assert state.stats.scheduled_time > 0.0
+    assert state.stats.prefill_done_time >= state.stats.scheduled_time
+    assert state.stats.first_token_time > 0.0
+    assert state.stats.finish_time > 0.0
+    stats_lines = [line for line in rec.lines if "Req: d Finish! RequestStats(" in line]
+    assert len(stats_lines) == 1
+    assert "status='finished', reason='length'" in stats_lines[0]
+
+
+def test_log_request_stats_logs_on_each_dp_replica_leader():
+    """Per-request logging is gated on attn_tp_rank == 0 (each DP replica's TP
+    leader), not the global rank. So a request on a DP replica > 0 (whose leader
+    has global_rank != 0) is still logged -- not missed -- while non-leader TP
+    shards stay silent so the line isn't duplicated."""
+    import tokenspeed.runtime.engine.generation_output_processor as gop
+    from tokenspeed.runtime.engine.request_types import FINISH_LENGTH
+
+    def emit(attn_tp_rank):
+        rec = _RecordingLogger()
+        gop_logger, gop.logger = gop.logger, rec
+        try:
+            p = OutputProcesser(
+                _Sender(),
+                attn_tp_rank=attn_tp_rank,
+                enable_log_request_stats=True,
+                metrics=_Metrics(),
+            )
+            rs = _state([1, 2, 3, 4])
+            rs.finished_reason = FINISH_LENGTH(length=1)
+            rs.stats = RequestStatsTracker()
+            p._log_request_stats("rid", rs, finish_time=1.0)
+        finally:
+            gop.logger = gop_logger
+        return rec.lines
+
+    # TP leader of ANY DP replica logs (attn_tp_rank == 0 even when global_rank != 0).
+    assert any("Req: rid Finish! RequestStats(" in line for line in emit(0))
+    # Non-leader TP shards within a replica stay silent (no duplicate line).
+    assert emit(1) == []
 
 
 class _PrefillForwardOp:
@@ -268,7 +523,7 @@ class _MismatchedPrefillExecutionResult(_PrefillExecutionResult):
 
 def test_prefill_first_token_passes_spec_candidates():
     sender = _Sender()
-    processor = OutputProcesser(sender, global_rank=0, metrics=_Metrics())
+    processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
     processor.rid_to_state["prefill"] = _state([1, 2, 3, 4])
     calls = []
 
@@ -284,7 +539,7 @@ def test_prefill_first_token_passes_spec_candidates():
 
 def test_prefill_first_token_does_not_guess_from_next_input_ids():
     sender = _Sender()
-    processor = OutputProcesser(sender, global_rank=0, metrics=_Metrics())
+    processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
     processor.rid_to_state["prefill"] = _state([1, 2, 3, 4])
     calls = []
 
@@ -300,7 +555,7 @@ def test_prefill_first_token_does_not_guess_from_next_input_ids():
 
 def test_prefill_first_token_checks_spec_candidate_bootstrap():
     sender = _Sender()
-    processor = OutputProcesser(sender, global_rank=0, metrics=_Metrics())
+    processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
     processor.rid_to_state["prefill"] = _state([1, 2, 3, 4])
 
     with pytest.raises(RuntimeError, match="Prefill bootstrap token mismatch"):

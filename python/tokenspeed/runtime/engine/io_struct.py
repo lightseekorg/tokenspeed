@@ -217,9 +217,9 @@ class GenerateReqInput:
                 num = self.batch_size * self.parallel_sample_num
 
             if self.sampling_params is None:
-                self.sampling_params = [{}] * num
+                self.sampling_params = [{} for _ in range(num)]
             elif not isinstance(self.sampling_params, list):
-                self.sampling_params = [self.sampling_params] * num
+                self.sampling_params = [dict(self.sampling_params) for _ in range(num)]
 
             if self.rid is None:
                 self.rid = [uuid.uuid4().hex for _ in range(num)]
@@ -483,7 +483,7 @@ class EmbeddingReqInput:
                 ), "user_rid should be a str or a list of matching length."
 
             if self.sampling_params is None:
-                self.sampling_params = [{}] * self.batch_size
+                self.sampling_params = [{} for _ in range(self.batch_size)]
             for i in range(self.batch_size):
                 self.sampling_params[i]["max_new_tokens"] = 0
 

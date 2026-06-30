@@ -41,6 +41,11 @@ cute_dsl = pytest.importorskip("tokenspeed_kernel.ops.sampling.cute_dsl")
 cute_argmax = cute_dsl.argmax
 cute_argmax_pair = cute_dsl.argmax_pair
 
+requires_nvidia = pytest.mark.skipif(
+    not cute_dsl.current_platform().is_nvidia,
+    reason="CuTe DSL argmax kernel is NVIDIA-only",
+)
+
 
 # Vocab sizes for the models tokenspeed actively serves — same list as
 # ``tmp/integrate_cutedsl_argmax/bench_argmax.py::DEFAULT_N``.
@@ -284,6 +289,43 @@ def test_argmax_returns_first_index_on_ties_like_torch():
             x[row, pos] = 0.0
     out = cute_argmax(x)
     torch.testing.assert_close(out, torch.argmax(x, dim=-1), atol=0, rtol=0)
+
+
+@requires_nvidia
+@pytest.mark.parametrize(
+    "N", [4096, MODEL_VOCABS["kimi_k2_5"], MODEL_VOCABS["qwen3_5"]]
+)
+def test_argmax_in_range_for_nan_and_neg_inf_rows(N):
+    """A row whose elements never beat ``-inf`` (all-NaN or all ``-inf``) must
+    still yield an *in-range* index, not the ``0xFFFFFFFF`` (-1) sentinel.
+
+    The kernel suppresses NaN (IEEE ``NaN > x`` is false) and the warp/block/
+    cluster max reductions are NaN-suppressing, so NaN never wins; the argmax
+    sentinels are seeded to 0 so such rows resolve to index 0. ``N`` covers both
+    the single-block (``cluster_n == 1``) and the cluster reduction path (fp32
+    ``N > 32K``), since the cluster path has its own sentinel seed.
+    """
+    _need_cuda()
+    x = torch.full((6, N), -100.0, device="cuda", dtype=torch.float32)
+    x[0].fill_(float("nan"))  # all NaN -> sentinel row, must map to a valid index (0)
+    x[1].fill_(float("inf"))  # all inf -> first element wins, so output index 0
+    x[2].fill_(float("-inf"))  # all -inf -> never beats the -inf init, also sentinel
+    x[3, 2000] = 5.0  # mixed: real max at 2000 ...
+    x[3, 100] = float("nan")  # ... plus a NaN the kernel must ignore
+    x[4, 2000] = float("nan")
+    x[4, 100] = 5.0
+    x[5, 1234] = 0.0
+    out = cute_argmax(x)
+
+    assert ((out >= 0) & (out < N)).all(), f"out-of-range index: {out.tolist()}"
+    # Degenerate rows resolve to index 0 (lowest-index tie among equal maxima).
+    assert out[0].item() == 0
+    assert out[1].item() == 0
+    assert out[2].item() == 0
+    # Mixed row: NaN is suppressed, so the kernel returns the finite argmax.
+    assert out[3].item() == 2000
+    assert out[4].item() == 100
+    assert out[5].item() == 1234
 
 
 def test_argmax_mtp_pattern():
