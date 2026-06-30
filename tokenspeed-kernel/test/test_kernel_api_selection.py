@@ -49,9 +49,7 @@ import tokenspeed_kernel.ops.sampling as _sampling_pkg
 import tokenspeed_kernel.ops.sampling.cute_dsl as _sampling_cute_dsl
 import tokenspeed_kernel.ops.sampling.gluon as _sampling_gluon
 import torch
-from tokenspeed_kernel.ops.attention.triton import (
-    dsa_sparse_decode as _attention_triton_dsa_sparse_decode,
-)
+from tokenspeed_kernel.ops.attention.triton import dsa as _attention_triton_dsa
 from tokenspeed_kernel.ops.attention.triton import (
     merge_state as _attention_triton_merge_state,
 )
@@ -97,7 +95,7 @@ _RELOAD_MODULES = [
     _attention_triton_mla_prefill,
     _attention_triton_mla_decode,
     _attention_triton_merge_state,
-    _attention_triton_dsa_sparse_decode,
+    _attention_triton_dsa,
     _attention_triton,
     _attention_pkg,
     # GEMM registration modules.

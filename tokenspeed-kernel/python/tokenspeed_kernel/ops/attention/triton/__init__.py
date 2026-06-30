@@ -20,9 +20,8 @@
 
 from __future__ import annotations
 
-import tokenspeed_kernel.ops.attention.triton.dsa_sparse_decode  # noqa: F401
-
 # Backend registration (side-effect imports)
+import tokenspeed_kernel.ops.attention.triton.dsa  # noqa: F401
 import tokenspeed_kernel.ops.attention.triton.dsa_topk  # noqa: F401
 import tokenspeed_kernel.ops.attention.triton.merge_state  # noqa: F401
 import tokenspeed_kernel.ops.attention.triton.mha_decode  # noqa: F401

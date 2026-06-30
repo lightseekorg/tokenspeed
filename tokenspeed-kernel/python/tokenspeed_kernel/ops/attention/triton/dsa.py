@@ -660,11 +660,3 @@ def triton_dsa_prefill(
         return_lse=return_lse,
         out=out,
     )
-
-
-__all__ = [
-    "dsa_dense_kv_decode",
-    "dsa_sparse_decode",
-    "triton_dsa_decode",
-    "triton_dsa_prefill",
-]
