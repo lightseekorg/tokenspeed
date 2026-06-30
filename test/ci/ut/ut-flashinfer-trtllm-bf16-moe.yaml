@@ -1,0 +1,23 @@
+api_version: ci.tokenspeed.io/v1
+name: ut-flashinfer-trtllm-bf16-moe
+type: ut
+# Single-GPU repro for the SM100 flashinfer `trtllm_bf16_moe` IMA seen
+# in the qwen3.5-397b-a17b-nvfp4 agentic perf job. Runs both the eager
+# call and the cuda-graph-capture path against the failing GEMM shape
+# (numBatches=512, M=1, N=4096, K=128) so the bug can be reproduced
+# without spinning up the full 8-GPU server.
+triggers:
+  - per-commit
+  - manual
+runner:
+  labels:
+    - b200-1gpu
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps.sh
+ut:
+  commands:
+    - python3 -m pytest tokenspeed-kernel/test/thirdparty/test_flashinfer_trtllm_bf16_moe.py -v
+report:
+  github_step_summary: true
