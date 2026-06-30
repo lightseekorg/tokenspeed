@@ -335,9 +335,11 @@ std::optional<fsm::ScheduleRetractEvent> Scheduler::scheduleRetract(Request* req
     std::int32_t alloc_count =
         static_cast<std::int32_t>(full_paged_tokens.size()) - static_cast<std::int32_t>(prefix_pages.size());
 
-    OwnedPages alloc_pages = request->TakeFirstPages(alloc_count);
-
-    kv_prefix_cache_.Insert<ResourceType::Device>(full_paged_tokens, prefix_pages, std::move(alloc_pages));
+    // Skip when alloc_count <= 0: a prefix deeper than total_available would make TakeFirstPages negative.
+    if (alloc_count > 0) {
+        OwnedPages alloc_pages = request->TakeFirstPages(alloc_count);
+        kv_prefix_cache_.Insert<ResourceType::Device>(full_paged_tokens, prefix_pages, std::move(alloc_pages));
+    }
 
     MatchResult match_result = kv_prefix_cache_.Match(full_paged_tokens, MatchIntent::StateRecovery);
 
