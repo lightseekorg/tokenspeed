@@ -175,18 +175,17 @@ class RotaryEmbedding(torch.nn.Module):
         output_k_rope: torch.Tensor | None = None,
         enable_pdl: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert offsets is None, "embedding.rope does not support offsets"
         return apply_rope(
             positions=positions,
-            query=query,
-            key=key,
+            q=query,
+            k=key,
             head_size=self.head_size,
             cos_sin_cache=self.cos_sin_cache,
             is_neox=self.is_neox_style,
-            offsets=offsets,
-            rotary_dim=self.rotary_dim,
             fused_set_kv_buffer_arg=fused_set_kv_buffer_arg,
-            output_q_rope=output_q_rope,
-            output_k_rope=output_k_rope,
+            q_rope_out=output_q_rope,
+            k_rope_out=output_k_rope,
             enable_pdl=enable_pdl,
         )
 

@@ -429,41 +429,36 @@ def _fp8_quantize_3d_strided(
 
 def mla_rope_quantize_fp8_triton(
     *,
+    positions: torch.Tensor,
     q_rope: torch.Tensor,
     k_rope: torch.Tensor,
     q_nope: torch.Tensor,
     k_nope: torch.Tensor,
     cos_sin_cache: torch.Tensor,
-    pos_ids: torch.Tensor,
-    is_neox: bool = True,
-    quantize_dtype: torch.dtype = torch.float8_e4m3fn,
     q_rope_out: torch.Tensor,
     k_rope_out: torch.Tensor,
     q_nope_out: torch.Tensor,
     k_nope_out: torch.Tensor,
+    is_neox: bool = True,
     quant_scale_q: float | torch.Tensor = 1.0,
     quant_scale_kv: float | torch.Tensor = 1.0,
     enable_pdl: bool = False,
 ) -> None:
-    if quantize_dtype != torch.float8_e4m3fn:
-        raise TypeError(
-            f"Triton MLA RoPE FP8 only supports e4m3fn, got {quantize_dtype}"
-        )
     if q_rope.shape[-1] != k_rope.shape[-1]:
         raise ValueError(
             "q_rope and k_rope must have the same rope dim, got "
             f"{q_rope.shape[-1]} and {k_rope.shape[-1]}"
         )
-    if q_rope.shape[0] != k_rope.shape[0] or q_rope.shape[0] != pos_ids.numel():
+    if q_rope.shape[0] != k_rope.shape[0] or q_rope.shape[0] != positions.numel():
         raise ValueError(
             "MLA RoPE token count mismatch: "
-            f"q={q_rope.shape[0]}, k={k_rope.shape[0]}, pos={pos_ids.numel()}"
+            f"q={q_rope.shape[0]}, k={k_rope.shape[0]}, pos={positions.numel()}"
         )
 
     q_rope_tmp = torch.empty(q_rope.shape, dtype=q_rope.dtype, device=q_rope.device)
     k_rope_tmp = torch.empty(k_rope.shape, dtype=k_rope.dtype, device=k_rope.device)
     apply_rope_triton(
-        positions=pos_ids,
+        positions=positions,
         query=q_rope,
         key=k_rope,
         head_size=q_rope.shape[-1],
@@ -489,9 +484,7 @@ def mla_rope_quantize_fp8_triton(
     name="triton_embedding_rope",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
-    signatures=format_signatures(
-        ("query", "key"), "dense", {torch.float16, torch.bfloat16}
-    ),
+    signatures=format_signatures(("q", "k"), "dense", {torch.float16, torch.bfloat16}),
     priority=Priority.PORTABLE,
     traits={
         "partial_rotary": frozenset({True, False}),
@@ -505,28 +498,26 @@ def mla_rope_quantize_fp8_triton(
 def triton_embedding_rope(
     *,
     positions: torch.Tensor,
-    query: torch.Tensor,
-    key: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
     head_size: int,
     cos_sin_cache: torch.Tensor,
     is_neox: bool = True,
-    rotary_dim: int | None = None,
     fused_set_kv_buffer_arg: Any = None,
-    output_q_rope: torch.Tensor | None = None,
-    output_k_rope: torch.Tensor | None = None,
+    q_rope_out: torch.Tensor | None = None,
+    k_rope_out: torch.Tensor | None = None,
     enable_pdl: bool = False,
 ) -> None:
     apply_rope_triton(
         positions=positions,
-        query=query,
-        key=key,
+        query=q,
+        key=k,
         head_size=head_size,
         cos_sin_cache=cos_sin_cache,
         is_neox=is_neox,
-        rotary_dim=rotary_dim,
         fused_set_kv_buffer_arg=fused_set_kv_buffer_arg,
-        output_q_rope=output_q_rope,
-        output_k_rope=output_k_rope,
+        output_q_rope=q_rope_out,
+        output_k_rope=k_rope_out,
     )
 
 
@@ -552,35 +543,33 @@ def triton_embedding_rope(
 )
 def triton_embedding_rope_mla(
     *,
+    positions: torch.Tensor,
     q_rope: torch.Tensor,
     k_rope: torch.Tensor,
     q_nope: torch.Tensor,
     k_nope: torch.Tensor,
     cos_sin_cache: torch.Tensor,
-    pos_ids: torch.Tensor,
     q_rope_out: torch.Tensor,
     k_rope_out: torch.Tensor,
     q_nope_out: torch.Tensor,
     k_nope_out: torch.Tensor,
     is_neox: bool = True,
-    quantize_dtype: torch.dtype = torch.float8_e4m3fn,
     quant_scale_q: float | torch.Tensor = 1.0,
     quant_scale_kv: float | torch.Tensor = 1.0,
     enable_pdl: bool = False,
 ) -> None:
     mla_rope_quantize_fp8_triton(
+        positions=positions,
         q_rope=q_rope,
         k_rope=k_rope,
         q_nope=q_nope,
         k_nope=k_nope,
         cos_sin_cache=cos_sin_cache,
-        pos_ids=pos_ids,
-        is_neox=is_neox,
-        quantize_dtype=quantize_dtype,
         q_rope_out=q_rope_out,
         k_rope_out=k_rope_out,
         q_nope_out=q_nope_out,
         k_nope_out=k_nope_out,
+        is_neox=is_neox,
         quant_scale_q=quant_scale_q,
         quant_scale_kv=quant_scale_kv,
         enable_pdl=enable_pdl,
