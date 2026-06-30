@@ -835,7 +835,7 @@ def _moe_apply_mxint4_trtllm() -> object:
     return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
 
 
-def _moe_apply_mxfp4_precomputed_tp() -> object:
+def _moe_apply_mxfp4_dynamic_tp() -> object:
     plan = tokenspeed_kernel.moe_plan(
         "mxfp4",
         input_dtype=torch.bfloat16,
@@ -895,17 +895,18 @@ def _moe_apply_fp8_precomputed_ep() -> object:
         fp8_scale_block_shape=(128, 128),
         solution="triton",
     )
+    _assert_moe_plan(
+        plan,
+        apply="gluon_mxfp4_dynamic_moe_apply",
+        preprocessor="gluon_mxfp4_gfx950_moe_weights",
+    )
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
-    topk_weights = torch.empty((4, 2), dtype=torch.float32)
-    topk_ids = torch.empty((4, 2), dtype=torch.int64)
     return tokenspeed_kernel.moe_apply(
         plan,
         x,
         torch.nn.Module(),
         router_logits,
-        topk_weights=topk_weights,
-        topk_ids=topk_ids,
     )
 
 
@@ -1294,8 +1295,8 @@ _CASES = [
         "cdna4",
         "moe",
         "apply",
-        "triton_mxfp4_precomputed_moe_apply",
-        _moe_apply_mxfp4_precomputed_tp,
+        "gluon_mxfp4_dynamic_moe_apply",
+        _moe_apply_mxfp4_dynamic_tp,
     ),
     _case(
         _is_cdna4,

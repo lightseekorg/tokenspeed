@@ -314,6 +314,7 @@ class DeepseekV3MoE(nn.Module):
                 "n_group": getattr(config, "n_group", 0),
                 "topk_group": getattr(config, "topk_group", 0),
                 "routed_scaling_factor": getattr(config, "routed_scaling_factor", 1.0),
+                "normalize_topk_weights": config.norm_topk_prob,
                 "correction_bias": self.gate.e_score_correction_bias,
                 "routing_method_type": RoutingMethodType.DeepSeekV3,
             },
