@@ -2,7 +2,9 @@ from tokenspeed_scheduler import (
     ExecutionEvent,
     ForwardEvent,
     PagedCacheGroupConfig,
+    PagedCacheGroupFamily,
     PagedCacheRetention,
+    PrefixCacheAdjunctSpec,
     RequestSpec,
     Scheduler,
     SchedulerConfig,
@@ -162,3 +164,204 @@ def test_batch_admission_debits_simulated_free_pages():
     assert len(admitted & {"r0", "r1"}) <= 1
     for gid in ("swa.g0", "swa.g1"):
         assert scheduler.paged_cache_group_failed_alloc_count(gid) == 0
+
+
+def _transport_state_checkpoint_scheduler(
+    state_total_pages: int,
+    *,
+    max_scheduled_tokens: int = 64,
+    requests: list[tuple[str, list[int]]] | None = None,
+    decode_input_tokens: int = 1,
+    enable_mixed_prefill_decode: bool = False,
+    num_host_pages: int = 0,
+) -> Scheduler:
+    cfg = _base_config(num_device_pages=256)
+    cfg.page_size = 16
+    cfg.max_scheduled_tokens = max_scheduled_tokens
+    cfg.max_batch_size = 2
+    cfg.decode_input_tokens = decode_input_tokens
+    cfg.enable_mixed_prefill_decode = enable_mixed_prefill_decode
+    cfg.num_host_pages = num_host_pages
+    cfg.paged_cache_groups = [
+        PagedCacheGroupConfig(
+            group_id="fh.test",
+            rows_per_page=16,
+            entry_stride_tokens=1,
+            total_pages=256,
+            retention=PagedCacheRetention.FullHistory,
+            family=PagedCacheGroupFamily.History,
+        ),
+        PagedCacheGroupConfig(
+            group_id="c4.test",
+            rows_per_page=4,
+            entry_stride_tokens=1,
+            total_pages=state_total_pages,
+            retention=PagedCacheRetention.SlidingWindow,
+            sliding_window_tokens=8,
+            family=PagedCacheGroupFamily.State,
+        ),
+    ]
+    adjunct = PrefixCacheAdjunctSpec()
+    adjunct.required_groups = ["fh.test"]
+    cfg.prefix_cache_adjunct = adjunct
+
+    scheduler = Scheduler(cfg)
+    if requests is None:
+        requests = [
+            ("A", list(range(260))),
+            ("B", list(range(1_000, 1_500))),
+        ]
+    scheduler.submit_requests(
+        [_make_spec(request_id, tokens) for request_id, tokens in requests]
+    )
+    return scheduler
+
+
+def _request_input_lengths(plan) -> dict[str, int]:
+    return {
+        request_id: input_length
+        for op in plan.forward
+        for request_id, input_length in zip(op.request_ids, op.input_lengths)
+    }
+
+
+def test_transport_state_terminal_checkpoint_credit_is_not_overcounted():
+    scheduler = _transport_state_checkpoint_scheduler(state_total_pages=23)
+
+    for _ in range(4):
+        assert _request_ids_in_plan(scheduler.next_execution_plan()) == {"A"}
+
+    split_plan = scheduler.next_execution_plan()
+    assert _request_ids_in_plan(split_plan) == {"A", "B"}
+    split_op = next(op for op in split_plan.forward if "B" in op.request_ids)
+    assert list(split_op.request_ids) == ["A", "B"]
+    assert list(split_op.input_lengths) == [4, 60]
+    assert len(scheduler.get_request_paged_cache_page_ids("B", "c4.test")) == 15
+    assert scheduler.get_request_paged_cache_base_logical_page("B", "c4.test") == 0
+
+    # Publishing B's 48-token terminal checkpoint retains two owned state
+    # pages as borrowed snapshot pages before ReleaseSkipped runs. Admission
+    # must not count those pages as immediately available to the next acquire.
+    next_plan = scheduler.next_execution_plan()
+    assert _request_ids_in_plan(next_plan) == {"A"}
+    assert len(scheduler.get_request_paged_cache_page_ids("B", "c4.test")) == 15
+    assert scheduler.get_request_paged_cache_base_logical_page("B", "c4.test") == 0
+    assert scheduler.paged_cache_group_failed_alloc_count("c4.test") == 0
+
+    finish = ForwardEvent.Finish()
+    finish.request_id = "A"
+    execution_event = ExecutionEvent()
+    execution_event.add_event(finish)
+    scheduler.advance(execution_event)
+
+    resumed_plan = scheduler.next_execution_plan()
+    assert _request_ids_in_plan(resumed_plan) == {"B"}
+    assert scheduler.paged_cache_group_failed_alloc_count("c4.test") == 0
+
+
+def test_transport_state_terminal_checkpoint_exact_capacity_is_admitted():
+    scheduler = _transport_state_checkpoint_scheduler(state_total_pages=24)
+
+    for _ in range(4):
+        assert _request_input_lengths(scheduler.next_execution_plan()) == {"A": 64}
+
+    split_plan = scheduler.next_execution_plan()
+    assert _request_input_lengths(split_plan) == {"A": 4, "B": 60}
+
+    next_plan = scheduler.next_execution_plan()
+    assert _request_input_lengths(next_plan) == {"B": 64}
+    assert scheduler.paged_cache_group_available_pages("c4.test") == 0
+    assert scheduler.paged_cache_group_failed_alloc_count("c4.test") == 0
+
+
+def test_existing_terminal_state_snapshot_preserves_real_release_credit():
+    scheduler = _transport_state_checkpoint_scheduler(
+        state_total_pages=41,
+        max_scheduled_tokens=136,
+        enable_mixed_prefill_decode=True,
+        requests=[
+            ("A", list(range(68))),
+            ("B", list(range(203))),
+        ],
+    )
+
+    first_plan = scheduler.next_execution_plan()
+    assert _request_input_lengths(first_plan) == {"A": 68, "B": 68}
+    assert scheduler.paged_cache_group_available_pages("c4.test") == 6
+
+    # A first publishes the depth-64 continuation snapshot. B reaches the
+    # exact same terminal in this plan, so CommitChunk reuses that snapshot
+    # and B's stale owned page remains real release credit.
+    second_plan = scheduler.next_execution_plan()
+    assert _request_input_lengths(second_plan) == {"B": 135, "A": 1}
+    assert scheduler.paged_cache_group_available_pages("c4.test") == 0
+    assert scheduler.paged_cache_group_failed_alloc_count("c4.test") == 0
+
+
+def test_existing_terminal_state_snapshot_credit_is_branch_specific():
+    scheduler = _transport_state_checkpoint_scheduler(
+        state_total_pages=41,
+        max_scheduled_tokens=136,
+        enable_mixed_prefill_decode=True,
+        requests=[
+            ("A", list(range(68))),
+            ("B", list(range(1_000, 1_203))),
+        ],
+    )
+
+    first_plan = scheduler.next_execution_plan()
+    assert _request_input_lengths(first_plan) == {"A": 68, "B": 68}
+
+    # A has a continuation snapshot at the same depth, but B is on another
+    # token branch and must still reserve the pages its own checkpoint retains.
+    second_plan = scheduler.next_execution_plan()
+    assert _request_input_lengths(second_plan) == {"A": 1}
+    assert scheduler.paged_cache_group_failed_alloc_count("c4.test") == 0
+
+
+def test_transport_state_decode_checkpoint_credit_is_not_overcounted():
+    scheduler = _transport_state_checkpoint_scheduler(
+        state_total_pages=20,
+        max_scheduled_tokens=72,
+        decode_input_tokens=64,
+        enable_mixed_prefill_decode=True,
+        num_host_pages=256,
+        requests=[
+            ("A", list(range(68))),
+            ("B", list(range(1_000, 1_004))),
+        ],
+    )
+
+    first_plan = scheduler.next_execution_plan()
+    assert _request_input_lengths(first_plan) == {"A": 68, "B": 4}
+    assert scheduler.paged_cache_group_available_pages("c4.test") == 1
+
+    # The terminal checkpoint retains one of the pages that ReleaseSkipped
+    # would otherwise return, so A cannot safely fit at this capacity.
+    second_plan = scheduler.next_execution_plan()
+    assert _request_input_lengths(second_plan) == {}
+    assert scheduler.paged_cache_group_available_pages("c4.test") == 1
+    assert scheduler.paged_cache_group_failed_alloc_count("c4.test") == 0
+
+
+def test_transport_state_decode_checkpoint_exact_capacity_is_admitted():
+    scheduler = _transport_state_checkpoint_scheduler(
+        state_total_pages=21,
+        max_scheduled_tokens=72,
+        decode_input_tokens=64,
+        enable_mixed_prefill_decode=True,
+        num_host_pages=256,
+        requests=[
+            ("A", list(range(68))),
+            ("B", list(range(1_000, 1_004))),
+        ],
+    )
+
+    first_plan = scheduler.next_execution_plan()
+    assert _request_input_lengths(first_plan) == {"A": 68, "B": 4}
+    assert scheduler.paged_cache_group_available_pages("c4.test") == 2
+
+    second_plan = scheduler.next_execution_plan()
+    assert _request_input_lengths(second_plan) == {"A": 64}
+    assert scheduler.paged_cache_group_available_pages("c4.test") == 0
+    assert scheduler.paged_cache_group_failed_alloc_count("c4.test") == 0

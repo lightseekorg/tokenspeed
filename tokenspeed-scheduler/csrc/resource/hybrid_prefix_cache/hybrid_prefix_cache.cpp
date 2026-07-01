@@ -39,6 +39,58 @@
 #include <utility>
 
 namespace tokenspeed {
+namespace {
+
+const TreeNode* FindExactRadixNode(const KVPrefixCache& cache,
+                                   std::span<const std::span<const std::int32_t>> token_pages,
+                                   std::int32_t target_raw_tokens) {
+    const RadixTree& tree = cache.GetRadixTree();
+    const std::int32_t page_size = tree.PageSize();
+    if (target_raw_tokens <= 0 || page_size <= 0 || target_raw_tokens % page_size != 0) {
+        return nullptr;
+    }
+
+    const std::int32_t target_pages = target_raw_tokens / page_size;
+    if (target_pages > static_cast<std::int32_t>(token_pages.size())) {
+        return nullptr;
+    }
+
+    const TreeNode* current = tree.Root();
+    std::int32_t matched_pages = 0;
+    while (matched_pages < target_pages) {
+        const auto& first_page = token_pages[matched_pages];
+        if (first_page.size() != static_cast<std::size_t>(page_size)) {
+            return nullptr;
+        }
+
+        const token_vec_t key(first_page.begin(), first_page.end());
+        const TreeNode* child = FindChild(current, key);
+        if (child == nullptr || child->Tokens().size() % static_cast<std::size_t>(page_size) != 0) {
+            return nullptr;
+        }
+
+        const std::int32_t child_pages = static_cast<std::int32_t>(child->Tokens().size()) / page_size;
+        if (child_pages <= 0 || matched_pages + child_pages > target_pages) {
+            return nullptr;
+        }
+        for (std::int32_t page = 0; page < child_pages; ++page) {
+            const auto& expected = token_pages[matched_pages + page];
+            if (expected.size() != static_cast<std::size_t>(page_size)) {
+                return nullptr;
+            }
+            const auto actual_begin = child->Tokens().begin() + page * page_size;
+            if (!std::equal(actual_begin, actual_begin + page_size, expected.begin(), expected.end())) {
+                return nullptr;
+            }
+        }
+
+        matched_pages += child_pages;
+        current = child;
+    }
+    return current;
+}
+
+}  // namespace
 
 HybridPrefixCache::HybridPrefixCache(KVPrefixCache& kv_prefix_cache, MambaChunkAllocator* mamba_allocator,
                                      std::int32_t mamba_cache_chunk_size, MambaHostAllocator* mamba_host_allocator)
@@ -1074,6 +1126,18 @@ HybridPrefixCache::PagedCacheGroupAdmission HybridPrefixCache::checkPagedCacheGr
         return result;
     }
 
+    std::unordered_set<std::string> existing_commit_snapshot_groups;
+    if (context.commit_target_raw_tokens.has_value()) {
+        const TreeNode* terminal =
+            FindExactRadixNode(kv_prefix_cache_, context.commit_token_pages, *context.commit_target_raw_tokens);
+        const PagedCacheSnapshot* snapshot = terminal != nullptr ? terminal->GetPagedCacheSnapshot() : nullptr;
+        if (snapshot != nullptr) {
+            for (const auto& [gid, _] : snapshot->groups) {
+                existing_commit_snapshot_groups.insert(gid);
+            }
+        }
+    }
+
     auto req_it =
         context.fresh_table_view ? request_paged_cache_tables_.end() : request_paged_cache_tables_.find(request_id);
     const bool has_hit = (paged_cache_hit.last_node != nullptr) && (paged_cache_hit.prefix_len_tokens > 0);
@@ -1148,8 +1212,8 @@ HybridPrefixCache::PagedCacheGroupAdmission HybridPrefixCache::checkPagedCacheGr
             // snapshot tail from owned to borrowed before ReleaseSkipped runs,
             // so the only immediate pool credit is from stale-owned pages
             // dropped at the first commit step. Transport-only State groups do
-            // not participate in intermediate snapshots and must keep the
-            // ReleaseSkipped estimate above.
+            // not participate in intermediate snapshots; their terminal-only
+            // checkpoint is accounted separately below when one is pending.
             const std::int32_t lcm = paged_cache_history_alignment_tokens_;
             const bool required_state_group =
                 paged_cache_state_group_set_.find(gid) != paged_cache_state_group_set_.end();
@@ -1163,6 +1227,32 @@ HybridPrefixCache::PagedCacheGroupAdmission HybridPrefixCache::checkPagedCacheGr
                     base += std::min(live_lower_page - base, borrowed_in_table);
                 }
                 releasable_owned = (live_lower_page > base) ? std::min(live_lower_page - base, owned_in_table) : 0;
+            }
+
+            // A terminal continuation checkpoint runs before ReleaseSkipped.
+            // For transport-only State groups, owned pages in the trailing
+            // checkpoint window become borrowed snapshot pages. Dropping
+            // those borrowed ids later does not return pages to this pool,
+            // so remove their overlap from the immediate release credit.
+            const bool continuation_state_group =
+                paged_cache_continuation_state_group_set_.find(gid) != paged_cache_continuation_state_group_set_.end();
+            const bool terminal_group_already_exists =
+                existing_commit_snapshot_groups.find(gid) != existing_commit_snapshot_groups.end();
+            if (!required_state_group && continuation_state_group && table_exists && lcm > 0 &&
+                context.commit_target_raw_tokens.has_value() && !terminal_group_already_exists) {
+                const std::int32_t commit_target = *context.commit_target_raw_tokens;
+                const std::int32_t retained_tokens = *cfg.sliding_window_tokens;
+                if (commit_target > committed_prefix && commit_target <= raw_cursor && commit_target % lcm == 0 &&
+                    commit_target % raw_per_page == 0 && retained_tokens % raw_per_page == 0) {
+                    const std::int32_t owned_begin = already_released + borrowed_in_table;
+                    const std::int32_t owned_end = owned_begin + owned_in_table;
+                    const std::int32_t checkpoint_begin = std::max(0, commit_target - retained_tokens) / raw_per_page;
+                    const std::int32_t checkpoint_end = commit_target / raw_per_page;
+                    const std::int32_t retained_begin = std::max(owned_begin, checkpoint_begin);
+                    const std::int32_t retained_end = std::min({owned_end, checkpoint_end, target_releases});
+                    const std::int32_t retained_release_credit = std::max(0, retained_end - retained_begin);
+                    releasable_owned = std::max(0, releasable_owned - retained_release_credit);
+                }
             }
         }
 
@@ -1358,9 +1448,15 @@ bool HybridPrefixCache::tryPrunePagedCacheSnapshot(AdmissionFailureKind kind) {
 bool HybridPrefixCache::AdmitChunk(const std::string& request_id, std::int32_t first_raw_position_of_op,
                                    std::int32_t target_raw_tokens_exclusive,
                                    std::map<std::string, std::int32_t>& simulated_free,
-                                   const MatchResult::PagedCache& paged_cache_hit) {
+                                   const MatchResult::PagedCache& paged_cache_hit,
+                                   std::optional<std::int32_t> commit_target_raw_tokens,
+                                   std::span<const std::span<const std::int32_t>> commit_token_pages) {
+    PagedCacheAdmissionContext context{
+        .commit_target_raw_tokens = commit_target_raw_tokens,
+        .commit_token_pages = commit_token_pages,
+    };
     return admitPagedCacheChunk(request_id, first_raw_position_of_op, target_raw_tokens_exclusive, simulated_free,
-                                paged_cache_hit, {});
+                                paged_cache_hit, context);
 }
 
 bool HybridPrefixCache::AdmitChunkFromRetracted(const std::string& request_id, std::int32_t target_raw_tokens_exclusive,

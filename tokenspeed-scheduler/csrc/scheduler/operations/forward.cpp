@@ -188,8 +188,13 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
 
     const std::int32_t first_pos = request->PrefillSize() - unscheduled;
     const std::int32_t target = first_pos + tokens_this_round;
-    if (hybrid_prefix_cache_ && !hybrid_prefix_cache_->AdmitChunk(request->Id(), first_pos, target, simulated_free)) {
-        return {};
+    if (hybrid_prefix_cache_) {
+        const std::int32_t commit_target = (first_pos / config_.page_size) * config_.page_size;
+        const auto commit_token_pages = request->GetFullPagedTokens(false);
+        if (!hybrid_prefix_cache_->AdmitChunk(request->Id(), first_pos, target, simulated_free, {}, commit_target,
+                                              commit_token_pages)) {
+            return {};
+        }
     }
 
     return fsm::SchedulePrefillEvent{tokens_this_round, reserve_num_tokens_in_next_schedule_event,
@@ -214,8 +219,17 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* reque
 
     const std::int32_t first_pos = request->TokenSize();
     const std::int32_t target = first_pos + config_.decode_input_tokens;
-    if (hybrid_prefix_cache_ && !hybrid_prefix_cache_->AdmitChunk(request->Id(), first_pos, target, simulated_free)) {
-        return {};
+    if (hybrid_prefix_cache_) {
+        std::optional<std::int32_t> commit_target;
+        std::vector<std::span<const std::int32_t>> commit_token_pages;
+        if (request->Is<fsm::PrefillDone>()) {
+            commit_target = (request->PrefillSize() / config_.page_size) * config_.page_size;
+            commit_token_pages = request->GetFullPagedTokens(false);
+        }
+        if (!hybrid_prefix_cache_->AdmitChunk(request->Id(), first_pos, target, simulated_free, {}, commit_target,
+                                              commit_token_pages)) {
+            return {};
+        }
     }
 
     return fsm::ScheduleDecodeEvent{config_.decode_input_tokens,
@@ -321,9 +335,11 @@ std::optional<fsm::ScheduleRetractEvent> Scheduler::scheduleRetract(Request* req
     std::int32_t alloc_count =
         static_cast<std::int32_t>(full_paged_tokens.size()) - static_cast<std::int32_t>(prefix_pages.size());
 
-    OwnedPages alloc_pages = request->TakeFirstPages(alloc_count);
-
-    kv_prefix_cache_.Insert<ResourceType::Device>(full_paged_tokens, prefix_pages, std::move(alloc_pages));
+    // Skip when alloc_count <= 0: a prefix deeper than total_available would make TakeFirstPages negative.
+    if (alloc_count > 0) {
+        OwnedPages alloc_pages = request->TakeFirstPages(alloc_count);
+        kv_prefix_cache_.Insert<ResourceType::Device>(full_paged_tokens, prefix_pages, std::move(alloc_pages));
+    }
 
     MatchResult match_result = kv_prefix_cache_.Match(full_paged_tokens, MatchIntent::StateRecovery);
 
