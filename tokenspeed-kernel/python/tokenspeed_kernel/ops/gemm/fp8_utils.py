@@ -36,6 +36,12 @@ if _is_nvidia:
     from tokenspeed_kernel.ops.quantization.flashinfer import (
         fp8_blockscale_quantize_runner_sm90 as _flashinfer_fp8_blockscale_quantize_runner_sm90,
     )
+    from tokenspeed_kernel.ops.quantization.trtllm import (
+        supports_trtllm_fp8_packed_ue8m0 as _supports_trtllm_fp8_packed_ue8m0,
+    )
+    from tokenspeed_kernel.ops.quantization.trtllm import (
+        trtllm_fp8_packed_ue8m0 as _trtllm_fp8_packed_ue8m0,
+    )
     from tokenspeed_kernel.thirdparty.trtllm import (
         per_token_group_quant_8bit as _trtllm_per_token_group_quant_fp8,
     )
@@ -400,6 +406,7 @@ def per_token_group_quant_fp8(
     column_major_scales: bool = False,
     scale_tma_aligned: bool = False,
     scale_ue8m0: bool = False,
+    enable_pdl: bool = False,
 ):
     flashinfer_quantized = _flashinfer_sm90_per_token_group_quant_fp8(
         x,
@@ -410,6 +417,18 @@ def per_token_group_quant_fp8(
     )
     if flashinfer_quantized is not None:
         return flashinfer_quantized
+
+    if (
+        _is_nvidia
+        and group_size == 128
+        and column_major_scales
+        and scale_tma_aligned
+        and scale_ue8m0
+        and _supports_trtllm_fp8_packed_ue8m0(x)
+    ):
+        # Preserve the existing TokenSpeed quantization contract while using
+        # TRT-LLM's packed SM100 launch and memory layout.
+        return _trtllm_fp8_packed_ue8m0(x, enable_pdl=enable_pdl)
 
     if (
         _is_nvidia
