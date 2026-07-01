@@ -1,7 +1,7 @@
 from pathlib import Path
 
 import pytest
-from flashinfer_jit_cache import (
+from flashinfer_jit_cache_installer import (
     expected_jit_cache_version,
     install_url_if_needed,
     jit_cache_wheel_url,
