@@ -70,5 +70,19 @@ jobs:
       - name: Lint scheduler C++
         run: |
           cpp_files="$(git ls-files tokenspeed-scheduler | grep -E '\.(c|cc|cpp|cxx|h|hh|hpp|hxx)$')"
-          printf '%s\n' "$cpp_files" | xargs clang-format --dry-run --Werror
-          printf '%s\n' "$cpp_files" | grep -E '\.(c|cc|cpp|cxx)$' | xargs clang-tidy -p tokenspeed-scheduler/build
+          jobs="$(nproc)"
+          tidy_files="$(printf '%s\n' "$cpp_files" | grep -E '\.(c|cc|cpp|cxx)$' || true)"
+          format_count="$(printf '%s\n' "$cpp_files" | sed '/^$/d' | wc -l)"
+          tidy_count="$(printf '%s\n' "$tidy_files" | sed '/^$/d' | wc -l)"
+
+          echo "Running clang-format on ${format_count} files with ${jobs} workers"
+          printf '%s\n' "$cpp_files" | xargs -r -n 16 -P "$jobs" sh -c '
+            echo "clang-format: $*"
+            clang-format --dry-run --Werror "$@"
+          ' sh
+
+          echo "Running clang-tidy on ${tidy_count} translation units with ${jobs} workers"
+          printf '%s\n' "$tidy_files" | xargs -r -n 1 -P "$jobs" sh -c '
+            echo "clang-tidy: $1"
+            clang-tidy -p tokenspeed-scheduler/build "$1"
+          ' sh
