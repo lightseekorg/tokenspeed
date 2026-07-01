@@ -376,8 +376,8 @@ std::variant<Draining, Finished> FinishEvent::apply(ForwardStateT&& state) {
         const std::int32_t avail = static_cast<std::int32_t>(local_allocator->PageCount());
         if (alloc_count > avail) {
             full_paged_tokens.resize(prefix_pages.size() + avail);
-            alloc_count = static_cast<std::int32_t>(full_paged_tokens.size()) -
-                          static_cast<std::int32_t>(prefix_pages.size());
+            alloc_count =
+                static_cast<std::int32_t>(full_paged_tokens.size()) - static_cast<std::int32_t>(prefix_pages.size());
         }
         OwnedPages alloc_pages = local_allocator->TakeFirst(alloc_count);
 
