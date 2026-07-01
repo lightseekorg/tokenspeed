@@ -34,10 +34,6 @@ _INDEX_K_SCALE_BYTES = torch._utils._element_size(torch.float32)
 
 
 class DSATokenToKVPool(MLATokenToKVPool):
-    # KVStore currently transfers only the base MLA KV rows. DSA also needs
-    # sparse/indexer cache rows to stay coherent with the reused KV pages.
-    supports_hierarchical_kv_cache = False
-
     def __init__(
         self,
         *args,
@@ -45,9 +41,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         **kwargs,
     ):
         self.index_head_dim = int(index_head_dim)
-        self.index_k_row_bytes = dsa_index_k_row_bytes(
-            self.index_head_dim,
-        )
+        self.index_k_row_bytes = dsa_index_k_row_bytes(self.index_head_dim)
         self._index_k_available = self.index_k_row_bytes > 0
         super().__init__(*args, **kwargs)
         with self.memory_saver_adapter.region():
@@ -66,6 +60,12 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 )
                 for _ in range(self.layer_num)
             ]
+
+        self.index_k_data_ptrs = torch.tensor(
+            [buf.data_ptr() for buf in self.index_k_buffer if buf is not None],
+            dtype=torch.uint64,
+            device=self.device,
+        )
 
     def _get_page_size_bytes(self):
         index_size_bytes = self.index_k_row_bytes
