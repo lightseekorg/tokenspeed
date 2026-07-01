@@ -18,18 +18,16 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from abc import ABC, abstractmethod
+"""Value types for the KV (prefill->decode) disaggregation path.
+
+The role-specific buffer/engine args and bootstrap handshake record. The
+transfer-status FSM is the shared :class:`...base.poll.TransferPoll`; the transport
+mechanics are the shared :class:`...base.manager.DisaggManagerBase` /
+:class:`...base.bootstrap.DisaggBootstrapServer`.
+"""
+
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
-
-import numpy as np
-import numpy.typing as npt
-
-from tokenspeed.runtime.pd.utils import (
-    DisaggregationMode,
-    PageTransferMetadata,
-)
-from tokenspeed.runtime.utils.server_args import ServerArgs
+from typing import List, Tuple
 
 
 @dataclass
@@ -57,10 +55,8 @@ class KVArgs:
     mamba_offsets: List[int] | None = None
 
 
-class KVPoll:
-    Failed = 0
-    Bootstrapping = 1
-    Bootstrapped = 2
-    WaitingForInput = 3
-    Transferring = 4
-    Success = 5
+@dataclass
+class BootstrapInfo:
+    bootstrap_host: str
+    bootstrap_port: int
+    bootstrap_room: int

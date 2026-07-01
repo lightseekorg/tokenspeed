@@ -18,16 +18,16 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from tokenspeed.runtime.pd.mooncake.conn import MooncakeKVBootstrapServer
-from tokenspeed.runtime.pd.mooncake.decode import (
+from tokenspeed.runtime.disaggregation.kv.mooncake.conn import MooncakeKVBootstrapServer
+from tokenspeed.runtime.disaggregation.kv.mooncake.decode import (
     MooncakeKVManagerDecode,
 )
-from tokenspeed.runtime.pd.mooncake.prefill import (
+from tokenspeed.runtime.disaggregation.kv.mooncake.prefill import (
     MooncakeKVManagerPrefill,
 )
-from tokenspeed.runtime.pd.mooncake.receiver import (
+from tokenspeed.runtime.disaggregation.kv.mooncake.receiver import (
     MooncakeKVReceiver,
 )
-from tokenspeed.runtime.pd.mooncake.sender import (
+from tokenspeed.runtime.disaggregation.kv.mooncake.sender import (
     MooncakeKVSender,
 )

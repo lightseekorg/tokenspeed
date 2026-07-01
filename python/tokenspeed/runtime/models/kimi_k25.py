@@ -808,9 +808,9 @@ class KimiK25ForConditionalGeneration(nn.Module):
         """
         device = self.vision_tower.device
         target_dtype = self.vision_tower.patch_embed.proj.weight.dtype
-        pixel_values = torch.cat([item.feature for item in items], dim=0).to(
-            device=device, dtype=target_dtype
-        )
+        pixel_values = torch.cat(
+            [item.feature.to(device, non_blocking=True) for item in items], dim=0
+        ).to(dtype=target_dtype)
         grid_thws = torch.concat([item.grid_thws for item in items], dim=0).to(device)
         hidden_states = self.vision_tower.patch_embed(pixel_values, grid_thws)
         return hidden_states, grid_thws

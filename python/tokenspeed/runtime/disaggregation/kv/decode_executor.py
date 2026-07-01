@@ -24,12 +24,11 @@ import numpy as np
 import torch
 from tokenspeed_scheduler import PD, Forward
 
-from tokenspeed.runtime.pd.base import BootstrapInfo, KVPoll
-from tokenspeed.runtime.pd.mooncake import (
-    MooncakeKVManagerDecode,
-    MooncakeKVReceiver,
-)
-from tokenspeed.runtime.pd.utils import (
+from tokenspeed.runtime.disaggregation.base.poll import TransferPoll
+from tokenspeed.runtime.disaggregation.kv.mooncake.decode import MooncakeKVManagerDecode
+from tokenspeed.runtime.disaggregation.kv.mooncake.receiver import MooncakeKVReceiver
+from tokenspeed.runtime.disaggregation.kv.types import BootstrapInfo
+from tokenspeed.runtime.disaggregation.kv.utils import (
     TransferBackend,
     poll_and_all_reduce,
 )
@@ -114,6 +113,10 @@ class DisaggDecodeExecutor:
         )
 
         for i, request_id in enumerate(op.request_ids):
+            if request_id not in self.receivers:
+                # Request failed and its receiver was cleaned up in generate_events;
+                # the scheduler may still dispatch its forward op one last time.
+                continue
             extend_prefix_len = op.extend_prefix_lens[i]
             kv_indices = np.array(
                 op.occupied_pages[i][extend_prefix_len // self.page_size :],
@@ -131,7 +134,7 @@ class DisaggDecodeExecutor:
             )
 
     def register(self, request_id: str, bootstrap_info: BootstrapInfo):
-        self._local_states[request_id] = KVPoll.Bootstrapping
+        self._local_states[request_id] = TransferPoll.Bootstrapping
         self._bootstrap(request_id, bootstrap_info)
 
     def execute(self, op):
@@ -147,29 +150,32 @@ class DisaggDecodeExecutor:
         to_remove = []
         for req_id, poll in zip(list(self.receivers.keys()), polls):
             if (
-                self._local_states[req_id] == KVPoll.Bootstrapping
-                and poll == KVPoll.Bootstrapped
+                self._local_states[req_id] == TransferPoll.Bootstrapping
+                and poll == TransferPoll.Bootstrapped
             ):
                 logger.debug(
                     "[decode][generate_events] rid=%s -> BootstrappedEvent", req_id
                 )
                 events.append(PD.BootstrappedEvent(req_id))
-                self._local_states[req_id] = KVPoll.Bootstrapped
-            elif poll == KVPoll.Failed:
+                self._local_states[req_id] = TransferPoll.Bootstrapped
+            elif poll == TransferPoll.Failed:
                 logger.warning(
                     "[decode][generate_events] rid=%s -> FailedEvent", req_id
                 )
                 events.append(PD.FailedEvent(req_id))
+                # Drop the failed receiver so it is not polled again. Without this
+                # a single failed request keeps re-emitting FailedEvent every loop
+                # (poll stays Failed), wedging the whole conn-1 scheduler.
                 to_remove.append(req_id)
             elif (
-                self._local_states[req_id] == KVPoll.Bootstrapped
-                and poll == KVPoll.Success
+                self._local_states[req_id] == TransferPoll.Bootstrapped
+                and poll == TransferPoll.Success
             ):
-                self._local_states[req_id] = KVPoll.Success
                 # Read bootstrap_token from the ZMQ-delivered table in kv_manager.
                 # The decode_thread stored it there when it received the Success status
                 # message from the prefill side.  bootstrap_room == bootstrap_info.bootstrap_room,
                 # which is the key used in MooncakeKVReceiver.
+                self._local_states[req_id] = TransferPoll.Success
                 bootstrap_room = self.receivers[req_id].bootstrap_room
                 bootstrap_token, spec_candidate_ids = (
                     self.kv_manager.pop_prefill_metadata(bootstrap_room)
@@ -208,7 +214,7 @@ class DisaggDecodeExecutor:
             # so without explicit pop these dicts would grow unbounded across
             # failed requests. NOTE: _remote_spec_candidate_ids must NOT be
             # popped here — its consumer pop_remote_spec_candidate_ids runs
-            # later inside event_loop._process_pd_events, after we return.
+            # later inside event_loop._process_kv_transfer_events, after we return.
             # That dict is small (one tuple per Success request, between
             # generate_events emitting RemotePrefillDoneEvent and event_loop
             # consuming it) and is naturally drained by the pop path; an

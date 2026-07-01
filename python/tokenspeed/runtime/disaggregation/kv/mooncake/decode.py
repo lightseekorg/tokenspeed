@@ -27,15 +27,11 @@ from typing import Dict, Set, Union
 import numpy as np
 import requests
 
-from tokenspeed.runtime.pd.base.conn import (
-    KVArgs,
-    KVPoll,
-)
-from tokenspeed.runtime.pd.mooncake.conn import MooncakeKVManagerBase
-from tokenspeed.runtime.pd.mooncake.entities import ManagerArgs
-from tokenspeed.runtime.pd.utils import (
-    DisaggregationMode,
-)
+from tokenspeed.runtime.disaggregation.base.poll import TransferPoll
+from tokenspeed.runtime.disaggregation.kv.mooncake.conn import MooncakeKVManagerBase
+from tokenspeed.runtime.disaggregation.kv.mooncake.entities import ManagerArgs
+from tokenspeed.runtime.disaggregation.kv.types import KVArgs
+from tokenspeed.runtime.disaggregation.utils import DisaggregationMode
 from tokenspeed.runtime.utils import (
     get_colorful_logger,
 )
@@ -70,7 +66,13 @@ def parse_prefill_status_message(
     spec_candidate_ids = None
     if len(parts) > 4 and parts[4] != b"":
         spec_candidate_ids = np.frombuffer(parts[4], dtype=np.int32).copy().tolist()
-    return bootstrap_room, status, prefill_rank, bootstrap_token, spec_candidate_ids
+    return (
+        bootstrap_room,
+        status,
+        prefill_rank,
+        bootstrap_token,
+        spec_candidate_ids,
+    )
 
 
 class MooncakeKVManagerDecode(MooncakeKVManagerBase):
@@ -147,7 +149,7 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
                             ].copy()
 
                             for bootstrap_room in current_rooms:
-                                # Remove KVPoll.Success requests from the map
+                                # Remove TransferPoll.Success requests from the map
                                 if bootstrap_room not in self.request_status:
                                     self.addr_to_rooms_tracker[bootstrap_addr].discard(
                                         bootstrap_room
@@ -188,7 +190,7 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
         bootstrap_token: int,
         spec_candidate_ids: list[int] | None,
     ) -> None:
-        if status == KVPoll.Success:
+        if status == TransferPoll.Success:
             if bootstrap_room not in self.request_status:
                 return
 
@@ -221,15 +223,15 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
                 self.spec_candidate_ids_table[bootstrap_room] = (
                     self._pending_spec_candidate_ids_table.pop(bootstrap_room)
                 )
-            self.update_status(bootstrap_room, KVPoll.Success)
+            self.update_status(bootstrap_room, TransferPoll.Success)
             return
 
-        if status == KVPoll.Failed:
+        if status == TransferPoll.Failed:
             self.record_failure(
                 bootstrap_room,
                 "Failed to get kvcache from prefill instance, it might be dead",
             )
-            self.update_status(bootstrap_room, KVPoll.Failed)
+            self.update_status(bootstrap_room, TransferPoll.Failed)
             return
 
         self.update_status(bootstrap_room, status)
@@ -263,18 +265,18 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
             if failed_bootstrap_addr in self.addr_to_rooms_tracker:
                 del self.addr_to_rooms_tracker[failed_bootstrap_addr]
 
-        # Report the requests associated with the failed bootstrap addr and mark their status as KVPoll.Failed
+        # Report the requests associated with the failed bootstrap addr and mark their status as TransferPoll.Failed
         affected_rooms = []
         for room in possible_affected_rooms:
             if (
                 room in self.request_status
-                and self.check_status(room) != KVPoll.Success
+                and self.check_status(room) != TransferPoll.Success
             ):
                 self.record_failure(
                     room,
                     f"Losing connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr})",
                 )
-                self.update_status(room, KVPoll.Failed)
+                self.update_status(room, TransferPoll.Failed)
                 affected_rooms.append(room)
         logger.error(
             "Losing connection with prefill instance (bootstrap_addr: %s), affected %s requests",

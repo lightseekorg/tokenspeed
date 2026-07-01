@@ -25,11 +25,11 @@ from typing import List, Optional
 import numpy as np
 import numpy.typing as npt
 
-from tokenspeed.runtime.pd.transfer_plan import (
+from tokenspeed.runtime.disaggregation.kv.transfer_plan import (
     TransferFragment,
     decode_transfer_fragments,
 )
-from tokenspeed.runtime.pd.utils import PageTransferMetadata
+from tokenspeed.runtime.disaggregation.kv.utils import PageTransferMetadata
 
 
 class KVTransferError(Exception):

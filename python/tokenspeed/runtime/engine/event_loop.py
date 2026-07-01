@@ -29,7 +29,7 @@ import setproctitle
 import torch
 import torch.distributed as dist
 import zmq
-from tokenspeed_scheduler import PD, Cache, ExecutionEvent, Scheduler
+from tokenspeed_scheduler import PD, Cache, ExecutionEvent, ForwardEvent, Scheduler
 
 from tokenspeed.runtime.cache.executor.memory_executor import (
     MemoryExecutor,
@@ -37,6 +37,20 @@ from tokenspeed.runtime.cache.executor.memory_executor import (
 )
 from tokenspeed.runtime.cache.transfer.types import CacheKind
 from tokenspeed.runtime.configs.model_config import ModelConfig
+from tokenspeed.runtime.disaggregation.kv.decode_executor import DisaggDecodeExecutor
+from tokenspeed.runtime.disaggregation.kv.factory import (
+    create_kv_transfer,
+    get_kv_args,
+)
+from tokenspeed.runtime.disaggregation.kv.kv_events import (
+    EventPublisherFactory,
+    KVEventBatch,
+    NullEventPublisher,
+    drain_scheduler_kv_events,
+    scheduler_kv_events_to_wire_events,
+)
+from tokenspeed.runtime.disaggregation.kv.mooncake.entities import ManagerArgs
+from tokenspeed.runtime.disaggregation.kv.prefill_executor import DisaggPrefillExecutor
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -70,20 +84,6 @@ from tokenspeed.runtime.execution.types import ModelExecutionResult
 from tokenspeed.runtime.grammar.capturable_grammar import GrammarStepInputs
 from tokenspeed.runtime.layers.attention.registry import create_attn_components
 from tokenspeed.runtime.metrics.collector import EngineMetrics
-from tokenspeed.runtime.pd.decode_executor import DisaggDecodeExecutor
-from tokenspeed.runtime.pd.factory import (
-    create_pd_kv_transfer,
-    get_kv_args,
-)
-from tokenspeed.runtime.pd.kv_events import (
-    EventPublisherFactory,
-    KVEventBatch,
-    NullEventPublisher,
-    drain_scheduler_kv_events,
-    scheduler_kv_events_to_wire_events,
-)
-from tokenspeed.runtime.pd.mooncake.entities import ManagerArgs
-from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 from tokenspeed.runtime.utils import (
     configure_logger,
@@ -478,7 +478,7 @@ class EventLoop:
                 metrics_reporters=server_args.metrics_reporters,
                 enable_dp_attention=self.has_dp,
             )
-            self.pd_kv_transfer = create_pd_kv_transfer(
+            self.kv_transfer = create_kv_transfer(
                 mode=server_args.disaggregation_mode,
                 backend=server_args.disaggregation_transfer_backend,
                 args=pd_manager_args,
@@ -489,22 +489,153 @@ class EventLoop:
             self._setup_pd_layerwise_transfer(
                 server_args.disaggregation_layerwise_interval
             )
+            # EPD: a multimodal prefill node is also the encode->prefill embedding
+            # SINK (independent of kv_transfer, its P->D KV source) -- it receives
+            # each image's embedding from encode workers over Mooncake so the
+            # prefill skips the vision tower. The admission controller owns the
+            # receive jobs, the rank-synced admission drain, and the optional NCCL
+            # row-shard reassembly; None for decode/encode/text-only nodes.
+            from tokenspeed.runtime.disaggregation.embedding.prefill_receiver import (
+                make_epd_prefill_admission,
+            )
+
+            self.epd_admission = make_epd_prefill_admission(
+                server_args,
+                global_rank,
+                model_config=self.model_config,
+                model_executor=self.model_executor,
+                mapping=mapping,
+                attn_tp_rank=self.attn_tp_rank,
+                attn_tp_size=self.attn_tp_size,
+                attn_tp_cpu_group=self.attn_tp_cpu_group,
+                pg_manager=pg_manager,
+            )
+            # Staged EPD request payloads (request_id -> (spec, state, bootstrap)),
+            # held here while the controller (rid-keyed, like kv_transfer) runs the
+            # async receive; popped in _drain_ready_epd_embeddings on admit/abort.
+            self._epd_staged: dict = {}
         else:
-            self.pd_kv_transfer = None
+            self.kv_transfer = None
+            self.epd_admission = None
+            self._epd_staged: dict = {}
 
     def _setup_pd_layerwise_transfer(self, interval: int) -> None:
-        if not isinstance(self.pd_kv_transfer, DisaggPrefillExecutor):
+        if not isinstance(self.kv_transfer, DisaggPrefillExecutor):
             return
         if interval <= 0:
             return
 
-        from tokenspeed.runtime.pd.utils import StepCounter
+        from tokenspeed.runtime.disaggregation.kv.utils import StepCounter
 
         step_counter = StepCounter(self.model_executor.device, self.gpu_id)
         self.model_executor.attn_backend.register_step_counter(step_counter)
         if self.model_executor.draft_attn_backend is not None:
             self.model_executor.draft_attn_backend.register_step_counter(step_counter)
-        self.pd_kv_transfer.register_layerwise_step_counter(step_counter, interval)
+        self.kv_transfer.register_layerwise_step_counter(step_counter, interval)
+
+    def _is_epd_request(self, state) -> bool:
+        """True iff this request's images are encode-routed (smg injected per-image
+        encode handshakes) -- it must wait for its embeddings (staged via the EPD
+        admission controller, polled in _drain_ready_epd_embeddings) before being
+        scheduled. Caller guards on self.epd_admission (only a multimodal prefill
+        node has one); everything else admits immediately.
+        """
+        mm = getattr(state, "multimodal_inputs", None)
+        return mm is not None and any(
+            getattr(it, "encode_handshake", None) for it in mm.mm_items
+        )
+
+    def _assert_epd_embeddings_received(self, multimodal_context) -> None:
+        """EPD invariant: every handshaked item is filled with its embedding by the
+        async EPD admission drain (EpdPrefillAdmission.drain) BEFORE admission, so by
+        it is already encoded. This is a defensive check, not a receive: a handshaked
+        item that reached the forward un-received leaked past async admission (the
+        only EPD admission path) -- fail loud instead of running the tower or
+        publishing shard-only rows. No-op for non-EPD / text-only requests.
+        """
+        if (
+            self.epd_admission is None
+            or multimodal_context is None
+            or not multimodal_context.has_extend_inputs()
+        ):
+            return
+        for mm in multimodal_context.mm_inputs:
+            if mm is None:
+                continue
+            missing = [
+                i
+                for i, item in enumerate(mm.mm_items)
+                if getattr(item, "encode_handshake", None) is not None
+                and item.encoded is None
+            ]
+            if missing:
+                raise RuntimeError(
+                    f"EPD: handshaked items {missing} reached the prefill forward "
+                    "un-received; they must be admitted via the EPD admission drain"
+                )
+
+    def _drain_ready_epd_embeddings(self) -> None:
+        """Admit EPD requests whose async embedding receives completed this cycle.
+
+        The EpdPrefillAdmission controller DECIDES (poll + rank-lockstep MIN
+        all-reduce + reassemble) and returns (admitted, failed); here we ACT on
+        those decisions with the EventLoop's collaborators -- register/abort the
+        P->D sender, submit admitted requests, finish failed ones. No-op (and no
+        collective) on non-EPD nodes.
+        """
+        if self.epd_admission is None:
+            return
+        # Pause gate: withhold EPD admission while paused, mirroring the non-EPD
+        # admit_blocked gate -- else the drain below would submit and RUN reassembled
+        # specs during the pause. Staged receives wait in _pending until resume.
+        # Rank-safe: admit_blocked is rank-identical, so all ranks skip together.
+        if self._pause.admit_blocked:
+            return
+        admitted_ids, failed_ids = self.epd_admission.drain()
+        for rid in failed_ids:
+            spec, state, bootstrap = self._epd_staged.pop(rid)
+            # Signal the dual-dispatched decode that this request failed so its KV
+            # receiver fails (FailedEvent -> _process_kv_transfer_events abort)
+            # instead of waiting forever for KV the prefill will never send. The
+            # prefill never registered a P->D sender (deferred to admission), so the
+            # decode has no other reliable way to learn (heartbeat only trips on a
+            # dead prefill /health). Best-effort: only reaches decodes that already
+            # pre-allocated.
+            if (
+                isinstance(self.kv_transfer, DisaggPrefillExecutor)
+                and bootstrap is not None
+            ):
+                try:
+                    self.kv_transfer.abort(rid, bootstrap)
+                except Exception as exc:  # never let it wedge the loop
+                    logger.warning(
+                        "EPD abort->decode signal failed for rid=%s: %s",
+                        rid,
+                        exc,
+                    )
+            state.set_finish_with_abort("EPD embedding receive failed or timed out")
+            self.output_processor.publish_finished_at_admission(rid, state)
+        admitted_specs = []
+        for rid in admitted_ids:
+            spec, state, bootstrap = self._epd_staged.pop(rid)
+            # Aborted mid-receive (no abort path, so drain still returns it admitted):
+            # don't register the P->D sender or submit -- that runs a wasted forward
+            # and leaks the sender. Stream its finish instead.
+            if state.finished:
+                self.output_processor.publish_finished_at_admission(rid, state)
+                continue
+            # Register the P->D sender now (deferred from admission) -- the request
+            # is about to enter the scheduler.
+            if self.kv_transfer is not None:
+                self.kv_transfer.register(rid, bootstrap)
+            admitted_specs.append(spec)
+        if admitted_specs:
+            self.scheduler.submit_requests(admitted_specs)
+        elif self.epd_admission.has_pending():
+            # Nothing advanced this cycle but requests are still receiving; yield the
+            # GIL so the Python daemon transfer/recv threads run (rank-consistent:
+            # admitted/leftover are rank-identical here).
+            time.sleep(0.0005)
 
     def _commit_cache_results(self) -> None:
         if self.memory_executor is None:
@@ -651,7 +782,7 @@ class EventLoop:
 
         self.model_executor.update_block_table(forward_op)
 
-        if self.pd_kv_transfer is None:
+        if self.kv_transfer is None:
             # Path 1: normal (no disaggregation)
             self.model_executor.reset_valid_cache_length(forward_op)
             return (
@@ -668,17 +799,17 @@ class EventLoop:
                 None,
             )
 
-        elif isinstance(self.pd_kv_transfer, DisaggDecodeExecutor):
+        elif isinstance(self.kv_transfer, DisaggDecodeExecutor):
             # Decode node
             if forward_op.num_extends() > 0:
                 # Path 2: new requests waiting for remote KV — trigger RDMA receive
-                self.pd_kv_transfer.reset_valid_cache_length(
+                self.kv_transfer.reset_valid_cache_length(
                     forward_op,
                     self.model_executor.runtime_states,
                     self.model_executor.execution_stream,
                     self.model_executor.device,
                 )
-                self.pd_kv_transfer.execute(forward_op)
+                self.kv_transfer.execute(forward_op)
                 self.model_executor.reset_remote_prefill_mamba_inputs(forward_op)
                 return None, None
             else:
@@ -699,15 +830,19 @@ class EventLoop:
 
         else:
             # Prefill node (only reached from event_loop, never event_loop_overlap)
-            assert isinstance(self.pd_kv_transfer, DisaggPrefillExecutor)
+            assert isinstance(self.kv_transfer, DisaggPrefillExecutor)
             if forward_op.num_extends() == 0:
                 # Path 3: all prefill done — send KV to decode side
-                self.pd_kv_transfer.execute(forward_op)
+                self.kv_transfer.execute(forward_op)
                 return None, None
             else:
                 # Path 4: extend batch — run prefill forward
                 self.model_executor.reset_valid_cache_length(forward_op)
-                self.pd_kv_transfer.prepare_prefill(forward_op)
+                self.kv_transfer.prepare_prefill(forward_op)
+                # EPD invariant: handshaked items are filled by the async
+                # EPD admission drain before admission; assert none reached
+                # the forward un-received (no-op for non-EPD / text-only requests).
+                self._assert_epd_embeddings_received(multimodal_context)
                 return (
                     self.model_executor.execute_forward_op_with_log(
                         forward_op,
@@ -720,7 +855,7 @@ class EventLoop:
                         capture_next_input_ids=True,
                         **stats,
                     ),
-                    self.pd_kv_transfer.store_prefill_token,
+                    self.kv_transfer.store_prefill_token,
                 )
 
     def _get_multimodal_context_for_forward(self, forward_op):
@@ -1024,11 +1159,19 @@ class EventLoop:
                 )
                 continue
 
-            if isinstance(self.pd_kv_transfer, DisaggDecodeExecutor):
+            if isinstance(self.kv_transfer, DisaggDecodeExecutor):
                 state.computed_length = state.input_length
             self.output_processor.register(spec.request_id, state)
-            if self.pd_kv_transfer is not None:
-                self.pd_kv_transfer.register(spec.request_id, bootstrap)
+            is_epd = self.epd_admission is not None and self._is_epd_request(state)
+            # EPD: DEFER the P->D sender registration to admission (in
+            # EpdPrefillAdmission.drain, just before submit_requests). Registering
+            # it now -- while the request is staged and NOT yet in the C++ scheduler
+            # -- would let DisaggPrefillExecutor.generate_events poll the sender and
+            # emit a BootstrappedEvent that the scheduler's requests_.at(rid) THROWS
+            # on (no such request yet). Non-EPD requests register now (submitted this
+            # same call).
+            if self.kv_transfer is not None and not is_epd:
+                self.kv_transfer.register(spec.request_id, bootstrap)
 
             if self.memory_executor is not None:
                 hashes = calc_l3_query_hashes(self.scheduler, spec.tokens)
@@ -1043,7 +1186,20 @@ class EventLoop:
                     )
                     spec.rolling_hashes = hashes
                     spec.storage_hit_pages = hit_pages
-            admitted_specs.append(spec)
+            # EPD prefill: hold a request whose images are encode-routed OUT of the
+            # scheduler until its per-image embeddings have been received (started
+            # here, polled in EpdPrefillAdmission.drain, which registers the P->D
+            # sender + submits once ready). It is output_processor-registered above;
+            # the sender registration + submission are both deferred. Non-EPD
+            # requests admit immediately as before. Rank-identical because `ready` is
+            # rank-synced (recv_reqs broadcast + grammar gather).
+            if is_epd:
+                self.epd_admission.stage(
+                    spec.request_id, state.multimodal_inputs.mm_items
+                )
+                self._epd_staged[spec.request_id] = (spec, state, bootstrap)
+            else:
+                admitted_specs.append(spec)
 
         # Pause gate: while paused, withhold new requests from the scheduler
         # (running requests keep stepping); buffered specs are flushed on resume
@@ -1089,13 +1245,14 @@ class EventLoop:
         self.request_handler._profile_batch_predicate(forward_mode)
 
         # post_process_forward_op calls sync() — after this, CPU tensors are ready
-        is_prefill_instance = isinstance(self.pd_kv_transfer, DisaggPrefillExecutor)
+        is_prefill_instance = isinstance(self.kv_transfer, DisaggPrefillExecutor)
         request_changes = self.output_processor.post_process_forward_op(
             forward_op,
             results,
             is_prefill_instance=is_prefill_instance,
             on_first_token=on_first_token,
         )
+
         # Accumulate decode stats from synced results (no GPU sync)
         if forward_op.num_extends() <= 0:
             bs = len(forward_op.request_ids)
@@ -1110,22 +1267,21 @@ class EventLoop:
             return None
         return forward_ops[0]
 
-    def _process_pd_events(self, pd_events: list) -> list:
+    def _process_kv_transfer_events(self, kv_transfer_events: list) -> list:
         processed = []
-        for event in pd_events:
+        for event in kv_transfer_events:
             processed.append(event)
             if isinstance(event, PD.SucceededEvent) and isinstance(
-                self.pd_kv_transfer, DisaggPrefillExecutor
+                self.kv_transfer, DisaggPrefillExecutor
             ):
                 req_id = event.request_id
                 processed.extend(self.output_processor.finish_prefill_request(req_id))
             elif isinstance(event, PD.RemotePrefillDoneEvent):
                 req_id = event.request_id
                 bootstrap_token = event.bootstrap_token
-
                 self.output_processor.on_remote_prefill_done(req_id, bootstrap_token)
-                if isinstance(self.pd_kv_transfer, DisaggDecodeExecutor):
-                    candidate_info = self.pd_kv_transfer.pop_remote_spec_candidate_ids(
+                if isinstance(self.kv_transfer, DisaggDecodeExecutor):
+                    candidate_info = self.kv_transfer.pop_remote_spec_candidate_ids(
                         req_id
                     )
                     if candidate_info is not None:
@@ -1133,6 +1289,25 @@ class EventLoop:
                         self.model_executor.write_remote_spec_candidate_ids(
                             req_pool_idx, candidate_ids
                         )
+            elif isinstance(event, PD.FailedEvent):
+                # A PD/EPD transfer failed: the decode KV receiver timed out (e.g. the
+                # prefill aborted on embedding timeout so the KV never arrives), or a
+                # transfer errored. The C++ scheduler's FailedEvent handler is a no-op,
+                # so without this the request is never finished and the CLIENT HANGS
+                # FOREVER (the decode is its response stream). Finish it with an abort
+                # (streams the error to the client) and abort it in the scheduler so its
+                # slot/KV is freed. AbortEvent is valid from the decode-waiting state
+                # (forward_events.cpp: AbortEvent(Prefilling&&) -> Finished).
+                req_id = event.request_id
+                state = self.output_processor.rid_to_state.get(req_id)
+                if state is not None:
+                    state.set_finish_with_abort(
+                        "PD/EPD remote transfer failed or timed out"
+                    )
+                    self.output_processor.publish_finished_at_admission(req_id, state)
+                    abort = ForwardEvent.Abort()
+                    abort.request_id = req_id
+                    processed.append(abort)
 
         return processed
 
@@ -1164,7 +1339,7 @@ class EventLoop:
 
         executes_model_forward = _forward_op_executes_model_forward(
             forward_op,
-            is_disagg_decode=isinstance(self.pd_kv_transfer, DisaggDecodeExecutor),
+            is_disagg_decode=isinstance(self.kv_transfer, DisaggDecodeExecutor),
         )
         num_tokens = sum(forward_op.input_lengths) if executes_model_forward else 0
         batch_size = len(forward_op.request_ids) if executes_model_forward else 0
@@ -1300,6 +1475,11 @@ class EventLoop:
         """Non-overlapping scheduler loop."""
         while True:
             self._process_new_requests()
+            # EPD prefill: admit requests whose async embedding receives completed
+            # this cycle (rank-synced). Fixed position right after
+            # _process_new_requests so the drain's TP collective ordering is
+            # rank-identical every cycle.
+            self._drain_ready_epd_embeddings()
             self._commit_cache_results()
             if self._pause.forward_blocked:
                 self._paused_idle_step()
@@ -1350,9 +1530,11 @@ class EventLoop:
                         )
                     )
 
-            if self.pd_kv_transfer is not None:
-                pd_events = self.pd_kv_transfer.generate_events()
-                request_changes.extend(self._process_pd_events(pd_events))
+            if self.kv_transfer is not None:
+                kv_transfer_events = self.kv_transfer.generate_events()
+                request_changes.extend(
+                    self._process_kv_transfer_events(kv_transfer_events)
+                )
 
             if request_changes:
                 advance_forward(self.scheduler, request_changes)
@@ -1422,6 +1604,17 @@ class EventLoop:
         Overlapping scheduler loop: post-process the previous step's results
         while the current step's forward pass is in flight.
         """
+        # EPD invariant: the async embedding drain (EpdPrefillAdmission.drain)
+        # that admits EPD requests runs ONLY in event_loop(), never here. A
+        # prefill node that receives encode embeddings must therefore run the
+        # non-overlap loop -- should_use_overlap_schedule enforces this by forcing
+        # prefill -> non-overlap. Assert it rather than trusting that external
+        # coupling: if a prefill ever reached this loop, every EPD request would
+        # stage into the admission controller and hang forever with no drain.
+        assert self.epd_admission is None, (
+            "EPD prefill must run the non-overlap event_loop(); the embedding "
+            "drain is not wired into event_loop_overlap()"
+        )
         prev_results: ModelExecutionResult = None
         prev_forward_op = None
 
@@ -1533,10 +1726,12 @@ class EventLoop:
                     self._commit_forward_results(prev_forward_op, prev_results)
                 )
 
-            # ---- collect PD events ----
-            if self.pd_kv_transfer is not None:
-                pd_events = self.pd_kv_transfer.generate_events()
-                request_changes.extend(self._process_pd_events(pd_events))
+            # ---- collect KV transfer events ----
+            if self.kv_transfer is not None:
+                kv_transfer_events = self.kv_transfer.generate_events()
+                request_changes.extend(
+                    self._process_kv_transfer_events(kv_transfer_events)
+                )
 
             if request_changes:
                 advance_forward(self.scheduler, request_changes)
@@ -1571,6 +1766,16 @@ def run_event_loop(
     configure_logger(server_args, prefix=prefix)
 
     try:
+        if server_args.disaggregation_mode == "encode":
+            # The encode role is LM-free; run the lightweight vision-tower loop
+            # instead of building the full EventLoop (KV/LM scheduler).
+            from tokenspeed.runtime.disaggregation.embedding.encode_loop import (
+                run_encode_loop,
+            )
+
+            run_encode_loop(server_args, port_args, pipe_writer, gpu_id, global_rank)
+            return
+
         event_loop = EventLoop(
             server_args,
             port_args,

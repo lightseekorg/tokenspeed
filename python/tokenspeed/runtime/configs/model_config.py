@@ -348,6 +348,30 @@ class ModelConfig:
             )
         # ``is_multimodal`` is the architectural fact; this is the runtime gate.
         self.is_multimodal_active = self.is_multimodal and not apply_language_model_only
+        # Vision-only role (EPD encode): the inverse axis of language_model_only.
+        # Build the vision tower (is_multimodal_active stays True) but SKIP LM
+        # construction + LM weight load so a full ViT fits at encode TP=1.
+        encoder_only = (
+            getattr(server_args, "disaggregation_mode", None) == "encode"
+            and not is_draft_worker
+        )
+        if encoder_only and not self.is_multimodal:
+            raise ValueError(
+                "disaggregation_mode=encode requires a multimodal checkpoint."
+            )
+        if encoder_only and apply_language_model_only:
+            raise ValueError(
+                "disaggregation_mode=encode (encoder-only) and language_model_only "
+                "are mutually exclusive."
+            )
+        if encoder_only:
+            # Single model-facing gate: Kimi reads hf_config.encoder_only directly;
+            # Qwen3_5ForConditionalGeneration reads it to skip LM construction.
+            self.hf_config.encoder_only = True
+            logger.info(
+                "Running in encoder-only mode: the language model will not "
+                "be constructed or loaded (encode role)."
+            )
         # Cap gpu_memory_utilization for VLMs in mm mode — the vision encoder
         # needs headroom that the global default doesn't account for.
         if (

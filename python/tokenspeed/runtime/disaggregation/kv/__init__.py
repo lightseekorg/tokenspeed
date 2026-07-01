@@ -18,8 +18,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from tokenspeed.runtime.pd.fake.conn import (
-    FakeKVManager,
-    FakeKVReceiver,
-    FakeKVSender,
-)
+"""KV-cache (prefill->decode) disaggregation -- the PD transfer stack.
+
+Moves computed KV pages from a prefill server to a decode server over a
+pluggable transport. The shared args/poll types live in :mod:`base`, the
+backend managers in :mod:`mooncake`, the role executors in
+:mod:`prefill_executor` / :mod:`decode_executor`, and transport selection in
+:mod:`factory`. Import entry points from those submodules directly.
+"""

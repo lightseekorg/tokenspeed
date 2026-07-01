@@ -174,7 +174,8 @@ def should_use_overlap_schedule(
 
     if disable_overlap_schedule:
         return False
-    if disaggregation_mode == "prefill":
+    if disaggregation_mode in ("prefill", "encode"):
+        # prefill drain + KV send run only on the non-overlap loop; encode has no LM loop.
         return False
     if speculative_algorithm is not None and paged_cache_groups:
         return False

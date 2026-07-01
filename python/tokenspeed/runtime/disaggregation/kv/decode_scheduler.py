@@ -37,7 +37,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
-class DisaggregationDecodeScheduler:
+class DisaggDecodeScheduler:
 
     def prepare_for_prebuilt_extend(self: ScheduleBatch):
         """

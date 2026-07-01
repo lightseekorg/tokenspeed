@@ -18,15 +18,14 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from __future__ import annotations
-
 """Shared helpers for disaggregation runtime components."""
+
+from __future__ import annotations
 
 import ctypes
 import dataclasses
 import os
 import random
-import threading
 import warnings
 from collections import deque
 from enum import Enum
@@ -45,27 +44,23 @@ from tokenspeed.runtime.utils.network import get_ip
 if TYPE_CHECKING:
     from tokenspeed.runtime.engine.request import Req
 
-FAKE_BOOTSTRAP_HOST = "2.2.2.2"
-
 # env var for testing failure, convert to float explicitly
 FAILURE_PROB = float(os.getenv("DISAGGREGATION_TEST_FAILURE_PROB", 0))
 logger = get_colorful_logger(__name__)
-
-
-class DisaggregationMode(Enum):
-    NULL = "null"
-    PREFILL = "prefill"
-    DECODE = "decode"
 
 
 def poll_and_all_reduce(pollers, gloo_group):
     """Poll transfer state and all-reduce the result across the gloo group."""
     # At a certain probability, mark the poll as failed to simulate failure.
     if FAILURE_PROB > 0:
-        from tokenspeed.runtime.pd.base import KVPoll
+        from tokenspeed.runtime.disaggregation.base.poll import TransferPoll
 
         polls = [
-            int(KVPoll.Failed) if random.random() < FAILURE_PROB else int(poller.poll())
+            (
+                int(TransferPoll.Failed)
+                if random.random() < FAILURE_PROB
+                else int(poller.poll())
+            )
             for poller in pollers
         ]
     else:
@@ -101,13 +96,15 @@ class ReqToMetadataIdxAllocator:
 class TransferBackend(Enum):
     MOONCAKE = "mooncake"
     MOONCAKE_ASYNC = "mooncake_async"
-    FAKE = "fake"
-    COMMON = "common"
 
 
 class KVClassType(Enum):
     MANAGER_PREFILL = "manager_prefill"
     MANAGER_DECODE = "manager_decode"
+    # The async backend uses one role-agnostic manager (see get_kv_class's
+    # MOONCAKE_ASYNC branch); the sync backend splits into the prefill/decode
+    # managers above.
+    MANAGER = "manager"
     SENDER = "sender"
     RECEIVER = "receiver"
     BOOTSTRAP_SERVER = "bootstrap_server"
@@ -115,11 +112,19 @@ class KVClassType(Enum):
 
 def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType):
     if transfer_backend == TransferBackend.MOONCAKE:
-        from tokenspeed.runtime.pd.mooncake import (
+        from tokenspeed.runtime.disaggregation.kv.mooncake.conn import (
             MooncakeKVBootstrapServer,
+        )
+        from tokenspeed.runtime.disaggregation.kv.mooncake.decode import (
             MooncakeKVManagerDecode,
+        )
+        from tokenspeed.runtime.disaggregation.kv.mooncake.prefill import (
             MooncakeKVManagerPrefill,
+        )
+        from tokenspeed.runtime.disaggregation.kv.mooncake.receiver import (
             MooncakeKVReceiver,
+        )
+        from tokenspeed.runtime.disaggregation.kv.mooncake.sender import (
             MooncakeKVSender,
         )
 
@@ -133,10 +138,16 @@ def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType):
         return class_mapping.get(class_type)
 
     if transfer_backend == TransferBackend.MOONCAKE_ASYNC:
-        from tokenspeed.runtime.pd.mooncake import (
+        from tokenspeed.runtime.disaggregation.kv.mooncake.async_conn import (
             MooncakeAsyncKVManager,
+        )
+        from tokenspeed.runtime.disaggregation.kv.mooncake.conn import (
             MooncakeKVBootstrapServer,
+        )
+        from tokenspeed.runtime.disaggregation.kv.mooncake.receiver import (
             MooncakeKVReceiver,
+        )
+        from tokenspeed.runtime.disaggregation.kv.mooncake.sender import (
             MooncakeKVSender,
         )
 
@@ -364,36 +375,6 @@ class MetadataBuffers:
                 ] = torch.tensor(
                     req.output_top_logprobs_idx[0], dtype=torch.int32, device="cpu"
                 )
-
-
-class FastQueue:
-    class Empty(Exception):
-        """Exception raised when the queue is empty."""
-
-        pass
-
-    def __init__(self):
-        self._buf = deque()
-        self._cond = threading.Condition()
-
-    def put(self, item):
-        with self._cond:
-            self._buf.append(item)
-            # wake up a thread of wait()
-            self._cond.notify()
-
-    def get(self):
-        with self._cond:
-            # if queue is empty  ,block until is notified()
-            while not self._buf:
-                self._cond.wait()
-            return self._buf.popleft()
-
-    def get_nowait(self):
-        with self._cond:
-            if not self._buf:
-                raise FastQueue.Empty()
-            return self._buf.popleft()
 
 
 def group_concurrent_contiguous(

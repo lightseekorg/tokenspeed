@@ -1943,11 +1943,22 @@ class ModelExecutor:
         mrope_chunks = []
         for batch_idx, base_chunk in enumerate(pos_chunks):
             mm_input = mm_inputs[batch_idx] if batch_idx < len(mm_inputs) else None
-            if mm_input is None or mm_input.mrope_positions is None:
+            # Fall back to linear only when there is neither a per-token mrope table
+            # nor a transferred scalar delta. A decode-only mm_input may carry just
+            # the delta (post-image decode positions = base+delta); it must skip the
+            # fallback and take the base+delta branch below.
+            if mm_input is None or (
+                mm_input.mrope_positions is None
+                and mm_input.mrope_position_delta is None
+            ):
                 mrope_chunks.append(base_chunk.unsqueeze(0).expand(3, -1))
                 continue
 
-            if is_prefill and batch_idx < len(forward_op.extend_prefix_lens):
+            if (
+                is_prefill
+                and mm_input.mrope_positions is not None
+                and batch_idx < len(forward_op.extend_prefix_lens)
+            ):
                 start = int(forward_op.extend_prefix_lens[batch_idx])
                 end = start + int(forward_op.input_lengths[batch_idx])
                 positions = mm_input.mrope_positions[:, start:end]

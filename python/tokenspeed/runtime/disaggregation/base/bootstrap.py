@@ -23,132 +23,37 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from functools import cache
 from typing import Dict, Union
 
-import zmq
 from aiohttp import web
 
-from tokenspeed.runtime.metrics.collector import KVTransferMetrics
-from tokenspeed.runtime.pd.base import KVArgs, KVPoll
-from tokenspeed.runtime.pd.mooncake.entities import ManagerArgs
-from tokenspeed.runtime.pd.mooncake.transfer_engine import (
-    MooncakeTransferEngine,
-)
-from tokenspeed.runtime.pd.utils import DisaggregationMode
 from tokenspeed.runtime.utils import get_colorful_logger
-from tokenspeed.runtime.utils.network import get_local_ip_by_remote
 
 logger = get_colorful_logger(__name__)
 
 
-class MooncakeKVManagerBase:
-    def __init__(
-        self,
-        args: ManagerArgs,
-        kv_args: KVArgs,
-        disaggregation_mode: DisaggregationMode,
-    ):
-        self.args = args
-        self.kv_args = kv_args
-        self.attn_tp_rank = args.attn_tp_rank
-        self.src_mode = "ON" if bool(args.enable_mla_l1_5_cache) else "OFF"
-        self.is_mla_backend = args.is_mla_backend
-        self.draft_is_mla_backend = args.draft_is_mla_backend
-        self.disaggregation_mode = disaggregation_mode
-        self.bootstrap_port = args.bootstrap_port
-        self.dist_init_addr = args.dist_init_addr
-        self.world_size = args.world_size
-        self.dp_size = args.dp_size
-        self.attn_dp_rank = args.attn_dp_rank
-        self.enable_dp_attention = args.enable_dp_attention
-        if not args.enable_dp_attention and args.dp_size != 1:
-            raise ValueError(
-                "If dp_attention is not enabled, dp size must be 1 in disaggregation mode."
-            )
+class DisaggBootstrapServer:
+    """HTTP rendezvous server shared by both disaggregation roles.
 
-        self.engine = MooncakeTransferEngine(
-            hostname=get_local_ip_by_remote(),
-            gpu_id=self.kv_args.gpu_id,
-            ib_device=self.kv_args.ib_device,
-        )
+    A data-source rank PUTs its (ip, port) keyed by (dp_group, tp_rank_in_dp);
+    the peer GETs that back to open a Mooncake session, and uses the sentinel
+    ``engine_rank == -1`` query to sync the source's parallel sizes. The routing,
+    dp-group sharding, and server lifecycle are role-neutral and live here;
+    role-specific parallel-info fields (e.g. the KV path's MLA / kv-page lengths)
+    are layered in by subclasses via :meth:`_ingest_put_extra` (record extra PUT
+    fields) and :meth:`_extra_parallel_info` (add them to the GET sync response).
+    """
 
-        if hasattr(args, "enable_metrics") and args.enable_metrics:
-            labels = {
-                "model_name": args.served_model_name,
-                "app_key": args.app_key,
-            }
-            self.kv_transfer_metrics = KVTransferMetrics(labels, args.metrics_reporters)
-        else:
-            self.kv_transfer_metrics = None
-
-        self.server_socket = zmq.Context().socket(zmq.PULL)
-        self.register_buffer_to_engine()
-
-        self.rank_port = None
-        self.request_status: Dict[int, KVPoll] = {}
-        self.failure_records: Dict[int, str] = {}
-        self.failure_lock = threading.Lock()
-
-    def register_buffer_to_engine(self):
-        for kv_data_ptr, kv_data_len in zip(
-            self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens
-        ):
-            self.engine.register(kv_data_ptr, kv_data_len)
-        for state_data_ptr, state_data_len in zip(
-            self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
-        ):
-            self.engine.register(state_data_ptr, state_data_len)
-
-    @cache
-    def _connect(self, endpoint: str):
-        socket = zmq.Context().socket(zmq.PUSH)
-        socket.connect(endpoint)
-        return socket
-
-    def check_status(self, bootstrap_room: int):
-        return self.request_status[bootstrap_room]
-
-    def update_status(self, bootstrap_room: int, status: KVPoll):
-        if bootstrap_room not in self.request_status:
-            self.request_status[bootstrap_room] = status
-        else:
-            # status is only allowed to be incremented unless either side has
-            # observed a failure. Failed is sticky so a late success cannot
-            # resurrect a broken transfer.
-            if (
-                self.request_status[bootstrap_room] == KVPoll.Failed
-                or status == KVPoll.Failed
-            ):
-                self.request_status[bootstrap_room] = KVPoll.Failed
-            else:
-                self.request_status[bootstrap_room] = max(
-                    self.request_status[bootstrap_room], status
-                )
-
-    def record_failure(self, bootstrap_room: int, failure_reason: str):
-        with self.failure_lock:
-            self.failure_records[bootstrap_room] = failure_reason
-
-
-class MooncakeKVBootstrapServer:
     def __init__(self, port: int):
         self.port = port
         self.app = web.Application()
-        self.store = dict()
         self.lock = asyncio.Lock()
         self._setup_routes()
         self.world_size = None
         self.dp_size = None
         self.tp_size_per_dp_rank = None
         self.prefill_port_table: Dict[int, Dict[int, Dict[str, Union[str, int]]]] = {}
-        self.enable_mla_l1_5_cache = False
-        self.prefill_kv_item_lens = []
-        self.prefill_kv_unit_lens = []
-        self.prefill_state_item_lens = []
-        self.prefill_state_unit_lens = []
 
-        # Start bootstrap server
         self.thread = threading.Thread(target=self._run_server, daemon=True)
         self.run()
 
@@ -181,15 +86,7 @@ class MooncakeKVBootstrapServer:
         rank_ip = data["rank_ip"]
         rank_port = int(data["rank_port"])
         engine_rank = int(data["engine_rank"])
-        self.enable_mla_l1_5_cache = bool(data["enable_mla_l1_5_cache"])
-        self.prefill_kv_item_lens = data.get("kv_item_lens", self.prefill_kv_item_lens)
-        self.prefill_kv_unit_lens = data.get("kv_unit_lens", self.prefill_kv_unit_lens)
-        self.prefill_state_item_lens = data.get(
-            "state_item_lens", self.prefill_state_item_lens
-        )
-        self.prefill_state_unit_lens = data.get(
-            "state_unit_lens", self.prefill_state_unit_lens
-        )
+        self._ingest_put_extra(data)
 
         if self.world_size is None:
             self.world_size = world_size
@@ -234,12 +131,8 @@ class MooncakeKVBootstrapServer:
             prefill_parallel_info = {
                 "prefill_tp_size": self.world_size,
                 "prefill_dp_size": self.dp_size,
-                "enable_mla_l1_5_cache": self.enable_mla_l1_5_cache,
-                "kv_item_lens": self.prefill_kv_item_lens,
-                "kv_unit_lens": self.prefill_kv_unit_lens,
-                "state_item_lens": self.prefill_state_item_lens,
-                "state_unit_lens": self.prefill_state_unit_lens,
             }
+            prefill_parallel_info.update(self._extra_parallel_info())
             return web.json_response(prefill_parallel_info, status=200)
 
         # Find corresponding prefill info
@@ -252,6 +145,14 @@ class MooncakeKVBootstrapServer:
             return web.json_response(bootstrap_info, status=200)
         else:
             return web.Response(text="Bootstrap info not Found", status=404)
+
+    def _ingest_put_extra(self, data: dict) -> None:
+        """Record role-specific fields off a register PUT. Default: none."""
+
+    def _extra_parallel_info(self) -> dict:
+        """Role-specific fields to merge into the GET parallel-info sync response.
+        Default: none."""
+        return {}
 
     def _run_server(self):
         try:
@@ -285,5 +186,3 @@ class MooncakeKVBootstrapServer:
         if self.thread.is_alive():
             self.thread.join(timeout=2)
             logger.info("Server thread stopped")
-
-    def poll(self) -> KVPoll: ...

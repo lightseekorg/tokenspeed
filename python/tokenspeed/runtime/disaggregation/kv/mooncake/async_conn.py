@@ -27,20 +27,20 @@ from typing import Any, List, Optional, Tuple
 import numpy as np
 import numpy.typing as npt
 
-from tokenspeed.runtime.pd.base import KVArgs, KVPoll
-from tokenspeed.runtime.pd.mooncake.entities import (
+from tokenspeed.runtime.disaggregation.base.poll import TransferPoll
+from tokenspeed.runtime.disaggregation.kv.mooncake.entities import (
     TransferInfo,
     TransferKVChunk,
 )
-from tokenspeed.runtime.pd.mooncake.prefill import (
+from tokenspeed.runtime.disaggregation.kv.mooncake.prefill import (
     MooncakeKVManagerPrefill as MooncakeKVManager,
 )
-from tokenspeed.runtime.pd.utils import (
-    DisaggregationMode,
-    FastQueue,
+from tokenspeed.runtime.disaggregation.kv.types import KVArgs
+from tokenspeed.runtime.disaggregation.kv.utils import (
     StepCounter,
     group_concurrent_contiguous,
 )
+from tokenspeed.runtime.disaggregation.utils import DisaggregationMode, FastQueue
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
@@ -171,7 +171,7 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
 
         if (
             bootstrap_room not in self.request_status
-            or self.check_status(bootstrap_room) == KVPoll.Failed
+            or self.check_status(bootstrap_room) == TransferPoll.Failed
         ):
             logger.debug(
                 "Request with bootstrap_room=%s already failed", bootstrap_room
@@ -500,9 +500,11 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
         def finalize(tasks: List[LayerWiseTask]) -> None:
             for task in tasks:
                 kv_chunk = task.kv_chunk
-                status = KVPoll.Success if all(task.polls) else KVPoll.Failed
+                status = (
+                    TransferPoll.Success if all(task.polls) else TransferPoll.Failed
+                )
                 if (
-                    status == KVPoll.Failed or kv_chunk.is_last
+                    status == TransferPoll.Failed or kv_chunk.is_last
                 ):  # last chunk or any failed
                     self.update_status(kv_chunk.room, status)
                     for packed_req in task.write_requests:
@@ -513,7 +515,7 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
 
                 if (
                     kv_chunk.room not in self.request_status
-                    or self.check_status(kv_chunk.room) == KVPoll.Success
+                    or self.check_status(kv_chunk.room) == TransferPoll.Success
                 ):
                     if kv_chunk.room in self.transfer_infos:
                         self.transfer_infos.pop(kv_chunk.room)

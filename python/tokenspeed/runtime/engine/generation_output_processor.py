@@ -793,7 +793,7 @@ class OutputProcesser:
     def finish_prefill_request(self, req_id: str) -> list:
         """Finish a prefill-instance request when KV transfer succeeds (SucceededEvent).
 
-        Called by event_loop._process_pd_events at the correct moment — the
+        Called by event_loop._process_kv_transfer_events at the correct moment — the
         SucceededEvent itself drives the C++ FSM transition Decoding → Finished,
         so we must NOT emit an additional make_finish_event here.
 
