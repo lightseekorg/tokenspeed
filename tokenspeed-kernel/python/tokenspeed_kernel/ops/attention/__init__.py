@@ -101,7 +101,7 @@ def mha_prefill(
         cu_seqlens_cpu: Host-side cumulative sequence lengths as a strict
             list[int]. Used for host-side launch metadata; must match cu_seqlens.
         max_seqlen: Maximum sequence length.
-        window_left: Inclusive left sliding-window size. -1 means full attention.
+        window_left: Exclusive left sliding-window size. -1 means full attention.
         logit_cap: Optional soft cap applied to attention logits.
         sinks: Optional attention sink tensor.
         return_lse: Whether to also return natural-log log-sum-exp values with
@@ -206,7 +206,7 @@ def mha_extend_with_kvcache(
         max_seqlen_q: Maximum query length.
         max_seqlen_k: Maximum KV length.
         is_causal: Whether query tokens are a causal suffix of cached KV.
-        window_left: Inclusive left sliding-window size. -1 means full attention.
+        window_left: Exclusive left sliding-window size. -1 means full attention.
         logit_cap: Optional soft cap applied to attention logits.
         sinks: Optional attention sink tensor.
         return_lse: Whether to also return natural-log log-sum-exp values with
@@ -313,7 +313,7 @@ def mha_decode_with_kvcache(
         max_seqlen_q: Number of uniformly packed query tokens per request. This
             is 1 for normal decode and `spec_num_tokens` for compact
             speculative decode.
-        window_left: Inclusive left sliding-window size. -1 means full attention.
+        window_left: Exclusive left sliding-window size. -1 means full attention.
         logit_cap: Optional soft cap applied to attention logits.
         sinks: Optional attention sink tensor.
         return_lse: Whether to also return log-sum-exp values.
@@ -1228,7 +1228,8 @@ def mha_plan(
     Args:
         dtype: Query/K/V dtype for prefill planning.
         head_dim: Attention head dimension.
-        window_left: Sliding-window size, or -1 for full-context attention.
+        window_left: Exclusive left sliding-window size, or -1 for full-context
+            attention.
         logit_cap: Logit soft-cap value, or 0.0 when disabled.
         sinks: Attention sinks tensor when sinks are enabled.
         return_lse: Whether the selected path must return LSE values.
