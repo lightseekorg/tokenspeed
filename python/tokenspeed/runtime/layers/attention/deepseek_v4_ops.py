@@ -701,28 +701,52 @@ def read_deepseek_v4_indexer_fp8_cache(
             f"cache_2d must be [pages, >= {min_stride}], got {tuple(cache_2d.shape)}"
         )
 
-    out = torch.zeros(
-        slot_mapping.numel(),
-        index_head_dim,
-        device=cache_2d.device,
-        dtype=torch.float32,
-    )
+    out_shape = (slot_mapping.numel(), index_head_dim)
+    # Also bail when cache_2d has zero pages: the gather below uses
+    # `where(valid, slots, 0)` to keep offsets in-range, but the resulting
+    # row-0 read still OOBs against an empty `flat_cache`. The reference
+    # per-token loop tolerated this (it iterates `slot_mapping.tolist()` and
+    # `continue`s on `slot < 0`), so preserve that behavior with zeros.
+    if slot_mapping.numel() == 0 or cache_2d.shape[0] == 0:
+        return torch.zeros(out_shape, device=cache_2d.device, dtype=torch.float32)
+
     flat_cache = cache_2d.reshape(-1)
-    for token_idx, raw_slot in enumerate(slot_mapping.tolist()):
-        slot = int(raw_slot)
-        if slot < 0:
-            continue
-        page = slot // block_size
-        pos = slot % block_size
-        page_base = page * cache_2d.stride(0)
-        value_base = page_base + pos * index_head_dim
-        scale_base = page_base + block_size * index_head_dim + pos * scale_bytes
-        scale = flat_cache[scale_base : scale_base + scale_bytes].view(torch.float32)[0]
-        values = flat_cache[value_base : value_base + index_head_dim].view(
-            torch.float8_e4m3fn
-        )
-        out[token_idx].copy_(values.float() * scale)
-    return out
+    # Move slot_mapping to cache_2d.device so the gather offsets composed below
+    # (which mix it with torch.arange(device=cache_2d.device)) don't fail on
+    # cross-device tensors when the caller passes a CPU slot_mapping.
+    slots = slot_mapping.to(device=cache_2d.device, dtype=torch.int64)
+    valid = slots >= 0
+    safe_slots = torch.where(valid, slots, torch.zeros_like(slots))
+    pages = torch.div(safe_slots, block_size, rounding_mode="floor")
+    pos = safe_slots % block_size
+    page_base = pages * cache_2d.stride(0)
+    value_base = page_base + pos * index_head_dim
+    scale_base = page_base + block_size * index_head_dim + pos * scale_bytes
+
+    value_offsets = (
+        value_base[:, None]
+        + torch.arange(
+            index_head_dim,
+            device=cache_2d.device,
+            dtype=torch.int64,
+        )[None, :]
+    )
+    values = flat_cache[value_offsets].view(torch.float8_e4m3fn).float()
+
+    scale_offsets = (
+        scale_base[:, None]
+        + torch.arange(
+            scale_bytes,
+            device=cache_2d.device,
+            dtype=torch.int64,
+        )[None, :]
+    )
+    # scale_bytes is a multiple of 4 (FP32). The reference loop uses only the
+    # first FP32 per row (`view(torch.float32)[0]`); mirror that here.
+    scales = flat_cache[scale_offsets].view(torch.float32)[:, 0]
+
+    out = values * scales[:, None]
+    return torch.where(valid[:, None], out, torch.zeros_like(out))
 
 
 def _compress_v4_state_windows_capturable(
