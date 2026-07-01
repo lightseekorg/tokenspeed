@@ -1311,17 +1311,26 @@ class ServerArgs:
         parser.add_argument(
             "--sampling-backend",
             type=str,
-            choices=["greedy", "flashinfer", "flashinfer_full"],
+            choices=[
+                "greedy",
+                "flashinfer",
+                "flashinfer_full",
+                "triton",
+                "triton_full",
+            ],
             default=ServerArgs.sampling_backend,
             help="Sampling backend. "
-            "When unspecified, defaults to 'flashinfer' on NVIDIA and 'greedy' elsewhere. "
             "'greedy': argmax + verify_chain_greedy, zero sampling-param plumbing. "
             "'flashinfer': temperature/top_k/top_p via fused softmax + top_k_top_p_sampling_from_probs; "
             "min_p and penalties silently ignored. "
+            "'triton': temperature/top_k/top_p via MRV2-style logits-to-Gumbel-Max; "
+            "min_p and penalties silently ignored. "
             "'flashinfer_full': adds min_p plus frequency/presence/repetition penalties and logit_bias "
             "via the softmax+renorm+min_p kernel sequence. "
+            "'triton_full': adds min_p plus frequency/presence/repetition penalties and logit_bias "
+            "with Triton Gumbel-Max for single-step sampling. "
             "Allocates a counts[max_req_pool_size, vocab_size] int32 buffer (substantial memory). "
-            "Both 'flashinfer' and 'flashinfer_full' require top_k < 128 (fused kernel limit) or -1.",
+            "Finite top_k values must be < 128 or -1.",
         )
         parser.add_argument(
             "--dp-sampling",
