@@ -127,6 +127,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_kv_cache_events.cpp
         tests/cpp/test_eviction_lru.cpp
         tests/cpp/test_host_node_ref_lifetime.cpp
+        tests/cpp/test_hybrid_takefirst_overflow.cpp
     )
 
     target_link_libraries(tokenspeed_scheduler_tests
