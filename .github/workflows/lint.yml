@@ -19,7 +19,7 @@ jobs:
 
       - name: Install pre-commit hook
         run: |
-          python -m pip install pre-commit ruff nanobind tokenspeed-spdlog==1.15.1
+          python -m pip install pre-commit ruff "nanobind>=2.13.0" tokenspeed-spdlog==1.15.1
           pre-commit install
 
       - name: Linting

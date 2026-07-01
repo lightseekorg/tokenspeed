@@ -33,7 +33,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build
-          python -m pip install nanobind tokenspeed-spdlog==1.15.1
+          python -m pip install "nanobind>=2.13.0" tokenspeed-spdlog==1.15.1
 
       - name: Configure scheduler C++ tests
         run: |
