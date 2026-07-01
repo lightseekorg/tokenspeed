@@ -33,6 +33,10 @@ output order become deterministic).
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
+    has_persistent_topk,
+    persistent_topk,
+)
 from tokenspeed_kernel.platform import current_platform
 
 platform = current_platform()
@@ -48,24 +52,47 @@ if platform.is_nvidia:
 
 
 def has_deterministic_decode_topk() -> bool:
-    """Whether the flashinfer deterministic top-k path is importable."""
+    """Whether the flashinfer deterministic top-k fallback is importable."""
     return top_k is not None and TopKTieBreak is not None
+
+
+def has_ragged_decode_topk() -> bool:
+    """Whether the length-aware CUDA top-k path is importable."""
+    return has_persistent_topk()
 
 
 def deterministic_decode_topk(
     logits: torch.Tensor,
     out: torch.Tensor,
     topk: int,
+    *,
+    lengths: torch.Tensor | None = None,
+    workspace: torch.Tensor | None = None,
+    max_seq_len: int | None = None,
 ) -> None:
     """Select per-row top-``topk`` local offsets deterministically.
 
-    ``logits`` rows are pre-masked with ``-inf`` beyond each request's valid
-    length (so a global per-row top-``topk`` yields the in-sequence candidates).
-    Writes int32 local offsets into ``out`` in-place. Uses a stable
-    ``tie_break=SMALL`` (smallest index wins ties) and ``deterministic`` +
-    ``dsa_graph_safe`` so eager and CUDA-graph replay agree.
+    When ``lengths`` and ``workspace`` are provided, use the ragged CUDA top-k
+    path so padded logits beyond each row's valid context are not scanned. This
+    path delegates tie handling to the persistent top-k kernel. Otherwise,
+    ``logits`` rows must already be pre-masked with ``-inf`` beyond each
+    request's valid length, and the flashinfer fallback uses a stable
+    ``tie_break=SMALL`` plus ``deterministic`` + ``dsa_graph_safe``.
     """
-    if not has_deterministic_decode_topk():
+    if lengths is not None or workspace is not None:
+        if lengths is None or workspace is None or not has_ragged_decode_topk():
+            raise RuntimeError("length-aware DSA decode top-k is unavailable.")
+        persistent_topk(
+            logits.contiguous(),
+            lengths.to(torch.int32).contiguous().reshape(-1),
+            out,
+            workspace,
+            int(topk),
+            int(max_seq_len or logits.shape[1]),
+        )
+        return
+
+    if top_k is None or TopKTieBreak is None:
         raise RuntimeError("flashinfer deterministic top_k is unavailable.")
     _values, indices = top_k(
         logits.contiguous(),

@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel.ops.attention.flashinfer.dsa_topk import (
     deterministic_decode_topk,
-    has_deterministic_decode_topk,
+    has_ragged_decode_topk,
 )
 from tokenspeed_kernel.ops.attention.triton.dsa_sparse_layout import (
     local_topk_to_global_slots,
@@ -18,6 +18,7 @@ from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 platform = current_platform()
+_PERSISTENT_TOPK_WORKSPACE_BYTES = 1024 * 1024
 
 
 def _check_out(
@@ -217,10 +218,26 @@ if platform.is_nvidia:
         logits.nan_to_num_(
             nan=float("-inf"), posinf=float("-inf"), neginf=float("-inf")
         )
-        col_ids = torch.arange(logits.shape[1], dtype=torch.int32, device=q.device)
-        logits.masked_fill_(col_ids.view(1, -1) >= seq_lens.view(-1, 1), float("-inf"))
         local_topk_offsets = torch.empty_like(out)
-        deterministic_decode_topk(logits, local_topk_offsets, int(topk))
+        if has_ragged_decode_topk():
+            deterministic_decode_topk(
+                logits,
+                local_topk_offsets,
+                int(topk),
+                lengths=seq_lens,
+                workspace=torch.empty(
+                    (_PERSISTENT_TOPK_WORKSPACE_BYTES,),
+                    dtype=torch.uint8,
+                    device=q.device,
+                ),
+                max_seq_len=max_seq_len,
+            )
+        else:
+            col_ids = torch.arange(logits.shape[1], dtype=torch.int32, device=q.device)
+            logits.masked_fill_(
+                col_ids.view(1, -1) >= seq_lens.view(-1, 1), float("-inf")
+            )
+            deterministic_decode_topk(logits, local_topk_offsets, int(topk))
         return local_topk_to_global_slots(
             local_topk_offsets=local_topk_offsets,
             block_table=block_table,
