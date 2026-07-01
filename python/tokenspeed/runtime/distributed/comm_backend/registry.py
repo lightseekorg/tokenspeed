@@ -23,9 +23,12 @@
 Provides global singleton instances for CommBackend and TritonRSAGBackend.
 """
 
+import threading
+
 from tokenspeed.runtime.distributed.comm_backend.base import CommBackend
 
 _global_backend: CommBackend | None = None
+_backend_lock = threading.Lock()
 
 
 def initialize_comm_backend(
@@ -35,14 +38,18 @@ def initialize_comm_backend(
     """Create and configure the global communication backend."""
     global _global_backend
 
-    from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
+    with _backend_lock:
+        if _global_backend is not None:
+            return _global_backend
 
-    _global_backend = AutoBackend()
-    _global_backend.configure(
-        use_pynccl=use_pynccl,
-        use_custom_allreduce=use_custom_allreduce,
-    )
-    return _global_backend
+        from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
+
+        _global_backend = AutoBackend()
+        _global_backend.configure(
+            use_pynccl=use_pynccl,
+            use_custom_allreduce=use_custom_allreduce,
+        )
+        return _global_backend
 
 
 def get_global_backend() -> CommBackend:
