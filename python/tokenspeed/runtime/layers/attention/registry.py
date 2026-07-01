@@ -271,16 +271,14 @@ def _create_hybrid_linear_attn(
 
     # Mamba radix cache uses C++ chunk indices. Without radix cache, the
     # backend uses 1-based req_pool_indices directly, so keep slot 0 as padding.
+    per_rank_max_batch = server_args.max_num_seqs // max(
+        server_args.data_parallel_size or server_args.mapping.attn.dp_size, 1
+    )
+    req_pool_padding_index = per_rank_max_batch + 1
     mamba_pool_size = (
         mamba_pool_total_chunks + 1
         if mamba_pool_total_chunks > 0
-        else (
-            server_args.max_num_seqs
-            // max(
-                server_args.data_parallel_size or server_args.mapping.attn.dp_size, 1
-            )
-            + 1
-        )
+        else per_rank_max_batch + 1
     )
     mamba_pool = SimpleMambaPool(
         size=mamba_pool_size,
@@ -297,12 +295,10 @@ def _create_hybrid_linear_attn(
             if server_args.speculative_algorithm is not None
             else 0
         ),
-        max_req_pool_size=(
-            server_args.max_num_seqs
-            // max(
-                server_args.data_parallel_size or server_args.mapping.attn.dp_size, 1
-            )
-        ),
+        # ``current_input_indices`` is keyed by the scheduler's rank-local,
+        # 1-based req_pool_idx; the row after that range is the CUDA graph
+        # padding sentinel.
+        max_req_pool_size=req_pool_padding_index,
     )
     linear_attn_backend.set_pool(mamba_pool)
 

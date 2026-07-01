@@ -431,9 +431,14 @@ class DFlash(BaseDrafter):
                 - 1
                 + num_extends
             )
-            current[num_extends:] = output_tokens[
-                offsets + accept_lengths[num_extends:].to(torch.int64)
-            ]
+            # ``accept_lengths`` can be clamped to 0 at the context limit.  The
+            # request will be finished by the scheduler, but the drafter still
+            # runs for graph shape. Select a valid in-row dummy token instead of
+            # producing ``row * N - 1`` or crossing into the previous row.
+            safe_accept_lengths = (
+                accept_lengths[num_extends:].to(torch.int64).clamp(1, spec_num_tokens)
+            )
+            current[num_extends:] = output_tokens[offsets + safe_accept_lengths]
         return current
 
     def get_candidates(self, base_ctx: ForwardContext) -> torch.Tensor | None:

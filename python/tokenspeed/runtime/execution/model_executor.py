@@ -106,6 +106,9 @@ class ModelExecutorConfig:
     Created once via from_server_args() and injected into ModelExecutor.
     """
 
+    # Rank-local graph-padding req-pool index. The C++ scheduler owns real rows
+    # 1..max_batch_size and row 0 is reserved, so this must sit after the
+    # scheduler-owned range.
     max_req_pool_size: int
     output_length: int
     enforce_eager: bool
@@ -247,6 +250,8 @@ class ModelExecutor:
                 config.context_len + config.block_size
             ) // config.block_size
 
+        max_bs = config.max_num_seqs // max(config.data_parallel_size, 1)
+
         self.req_to_page = torch.zeros(
             (config.max_req_pool_size + 1, max_num_pages_per_req),
             dtype=torch.int32,
@@ -254,7 +259,7 @@ class ModelExecutor:
         )
         spec_num_tokens = config.spec_num_tokens if config.spec_algo is not None else 1
         self.input_buffers = InputBuffers(
-            max_bs=config.max_num_seqs // max(config.data_parallel_size, 1),
+            max_bs=max_bs,
             max_num_tokens=config.chunked_prefill_size,
             page_size=config.block_size,
             # token_to_kv_pool allocates size+page_size slots; index `size` is
@@ -275,7 +280,7 @@ class ModelExecutor:
         # Sized like InputBuffers.max_bs so the padded graph-bucket bs fits.
         self.nan_guard = NanGuard.create(
             config.enable_nan_detection,
-            config.max_num_seqs // max(config.data_parallel_size, 1),
+            max_bs,
             self.device,
         )
         if self.config.spec_algo is not None:
@@ -345,14 +350,14 @@ class ModelExecutor:
             )
             if use_captured:
                 self.grammar_runtime = CapturableGrammarExecutor(
-                    max_bs=config.max_num_seqs,
+                    max_bs=max_bs,
                     vocab_size=config.vocab_size,
                     max_tokens_per_req=spec_num_tokens,
                     device=self.device,
                 )
             else:
                 self.grammar_runtime = EagerGrammarBuffers(
-                    max_bs=config.max_num_seqs // max(config.data_parallel_size, 1),
+                    max_bs=max_bs,
                     vocab_size=config.vocab_size,
                     max_tokens_per_req=spec_num_tokens,
                     device=self.device,
@@ -1010,12 +1015,17 @@ class ModelExecutor:
             req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
             working = self.input_buffers.mamba_pool_indices_buf[:bs]
 
-            src_raw = pool.current_input_indices[req_pool_indices.clamp(0).long()].to(
-                dtype=torch.int64
-            )
+            req = req_pool_indices.to(dtype=torch.int64)
+            current_input_size = int(pool.current_input_indices.shape[0])
+            in_bounds = (req >= 0) & (req < current_input_size)
+            safe_req = req.clamp(0, current_input_size - 1)
+            src_raw = pool.current_input_indices[safe_req].to(dtype=torch.int64)
+            src_raw = torch.where(in_bounds, src_raw, sentinel)
             dst_raw = working.to(dtype=torch.int64)
 
-            invalid = (src_raw < 0) | (dst_raw < 0) | (src_raw == dst_raw)
+            invalid = (
+                (~in_bounds) | (src_raw < 0) | (dst_raw < 0) | (src_raw == dst_raw)
+            )
             src = torch.where(invalid, sentinel, src_raw)
             dst = torch.where(invalid, sentinel, dst_raw)
 

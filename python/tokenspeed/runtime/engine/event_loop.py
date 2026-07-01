@@ -199,10 +199,17 @@ class EventLoop:
             text_config is not None and hasattr(text_config, "mamba2_cache_params")
         )
 
+        mapping = server_args.mapping
+        # The C++ scheduler's req_pool_idx range is rank-local and 1-based:
+        # real rows are 1..max_batch_size, row 0 is reserved, and CUDA graph
+        # padding needs one non-real sink row after the scheduler-owned range.
+        per_rank_max_batch = server_args.max_num_seqs // max(mapping.attn.dp_size, 1)
+        req_pool_padding_index = per_rank_max_batch + 1
+
         model_executor_config = ModelExecutorConfig.from_server_args(
             server_args=server_args,
             model_config=self.model_config,
-            max_req_pool_size=server_args.max_num_seqs,
+            max_req_pool_size=req_pool_padding_index,
             gpu_id=gpu_id,
             global_rank=global_rank,
             num_total_pages=num_total_pages,
@@ -222,7 +229,6 @@ class EventLoop:
         # Reserve one token slot because request validation uses a strict
         # ``< max_req_len`` check against the model context length.
         self.max_req_input_len = self.model_config.context_len - 1
-        mapping = server_args.mapping
         self.attn_tp_size = server_args.attn_tp_size or mapping.attn.tp_size
         self.world_size = server_args.world_size or mapping.world_size
         self.attn_tp_rank = attn_tp_rank
@@ -276,6 +282,9 @@ class EventLoop:
             page_size=server_args.block_size,
             host_ratio=server_args.kvstore_ratio,
             host_size_gb=server_args.kvstore_size,
+            host_parallel_count=max(
+                int(getattr(server_args.mapping, "nprocs_per_node", 1) or 1), 1
+            ),
             io_backend=server_args.kvstore_io_backend,
             host_layout=server_args.kvstore_mem_layout,
             storage_backend=server_args.kvstore_storage_backend,
@@ -305,11 +314,6 @@ class EventLoop:
             )
             num_host_pages = self.memory_executor.host_pool.page_num
 
-        # For DP attention, max_batch_size must be per-rank to avoid
-        # req_pool_allocator overflow.  The C++ scheduler allocates
-        # req_pool_slots based on this value, so it must match the
-        # per-DP-rank budget (same division used in cuda_graph_wrapper).
-        per_rank_max_batch = server_args.max_num_seqs // max(self.dp_size, 1)
         self._kv_events_enabled = (
             EventPublisherFactory.is_enabled(server_args.kv_events_config)
             and attn_tp_rank == 0
@@ -1589,6 +1593,11 @@ def run_event_loop(
                 "max_model_len": event_loop.model_config.context_len,
             }
         )
+
+        if event_loop.has_dp:
+            # All DP schedulers must finish initialization before any rank enters
+            # the loop and starts the first DP metadata collective.
+            dist.barrier(group=event_loop.world_cpu_group)
 
         use_overlap = should_use_overlap_schedule(
             disable_overlap_schedule=server_args.disable_overlap_schedule,
