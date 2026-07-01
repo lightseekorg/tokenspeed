@@ -4,7 +4,6 @@ type: eval
 triggers:
   - per-commit
   - manual
-  - debug
 runner:
   labels:
     - b200-4gpu
@@ -55,3 +54,4 @@ eval:
     --generation-config '{"do_sample":true,"temperature":1.0,"top_p":0.95,"max_tokens":163840}'
 report:
   github_step_summary: true
+score_threshold: 0.93
