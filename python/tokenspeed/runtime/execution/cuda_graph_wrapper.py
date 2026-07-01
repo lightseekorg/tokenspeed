@@ -314,6 +314,7 @@ class CudaGraphWrapper:
         rank = self.global_rank
         with freeze_gc(self.enable_cudagraph_gc):
             self.stream = torch.cuda.Stream()
+            # Capture backend-declared sampler variants explicitly.
             capture_items = [
                 (variant, bs)
                 for variant in self._cuda_graph_capture_variants()
@@ -369,6 +370,17 @@ class CudaGraphWrapper:
         key = (variant, bs)
         if key in self.graphs:
             return key
+        if variant != CUDA_GRAPH_VARIANT_DEFAULT:
+            captured_variants = sorted(
+                graph_variant
+                for graph_variant, graph_bs in self.graphs
+                if graph_bs == bs
+            )
+            raise RuntimeError(
+                "Sampling backend requested CUDA graph variant "
+                f"{variant!r} for batch size {bs}, but it was not captured. "
+                f"Captured variants for this batch size: {captured_variants}."
+            )
         return (CUDA_GRAPH_VARIANT_DEFAULT, bs)
 
     def _has_cuda_graph_for_bs(self, bs: int) -> bool:
@@ -456,6 +468,9 @@ class CudaGraphWrapper:
             torch.cuda.synchronize()
             dist.barrier()
             self._prepare_sampling_capture(bs=bs, variant=variant)
+            # Keep warmup seq_lens >= q_len_per_req so no query row gets an
+            # empty causal span; a stale seq_len of 1 overflows to non-finite KV.
+            self.input_buffers.seq_lens_buf[:bs].fill_(self.max_tokens_per_req)
             self._init_capture_metadata(bs)
             run_once()
 
@@ -618,8 +633,8 @@ class CudaGraphWrapper:
             if rows == padded_bs:
                 out[key] = off
                 continue
-            # Padded rows have no real request — base 0 keeps absolute
-            # indexing aligned to column 0, matching dummy-page row padding.
+            # Padded rows have no real request. Base 0 is only used before
+            # block-table lookup; the paired padded table row is invalid (-1).
             out[key] = torch.nn.functional.pad(
                 off,
                 (0, padded_bs - rows),
@@ -838,6 +853,39 @@ class CudaGraphWrapper:
         target_bs = graph_bs if graph_bs is not None else bs
         index = bisect.bisect_left(self.capture_bs, target_bs)
         return self.capture_bs[index]
+
+    def _pad_graph_req_pool_indices(
+        self, active_req_pool_indices: torch.Tensor, padded_bs: int
+    ) -> torch.Tensor:
+        pad = padded_bs - active_req_pool_indices.shape[0]
+        if pad <= 0:
+            return active_req_pool_indices
+        # Route padding rows to the sentinel req-pool slot (max_req_pool_size),
+        # not slot 0. valid_cache_lengths / req_to_page are sized
+        # [max_req_pool_size + 1]; the sentinel row stays zero-init (length 0,
+        # dummy page 0) since _update_runtime_state only writes real rows. Slot 0
+        # would alias the live first request: harmless for verify (seq_len == 1),
+        # but the DFLASH draft derives each row's block seq_len from
+        # valid_cache_lengths[req_pool], so padding rows would grow unbounded with
+        # request 0's context and hang the draft block-decode kernel. The sentinel
+        # keeps that derived length inert for every drafter backend.
+        sentinel = int(self.config.max_req_pool_size)
+        return torch.cat(
+            [
+                active_req_pool_indices,
+                active_req_pool_indices.new_full((pad,), sentinel),
+            ]
+        )
+
+    def _set_graph_state_write_indices(
+        self, active_req_pool_indices: torch.Tensor, padded_bs: int
+    ) -> None:
+        state_indices = self.input_buffers.state_write_req_pool_indices_buf[:padded_bs]
+        active_bs = active_req_pool_indices.shape[0]
+        if active_bs > 0:
+            state_indices[:active_bs].copy_(active_req_pool_indices)
+        if active_bs < padded_bs:
+            state_indices[active_bs:padded_bs].fill_(int(self.config.max_req_pool_size))
 
     def __call__(
         self,

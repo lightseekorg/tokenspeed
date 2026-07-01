@@ -29,15 +29,214 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel._triton import tl, triton
 
-from .common import (
-    _QRITA_BLOCK_SIZE,
-    _QRITA_BLOCK_SIZE_TRUNC,
-    _QRITA_NUM_WARPS,
-    _QRITA_PERCENTILE_TO_STD_TABLE,
-    _TOP_K_TOP_P_BLOCK_SIZE,
-    _TOP_K_TOP_P_CANDIDATE_BLOCK_SIZE,
-    _TOP_K_TOP_P_PAD,
-)
+_TOP_K_TOP_P_BLOCK_SIZE = 2048
+_TOP_K_TOP_P_PAD = 128
+_QRITA_BLOCK_SIZE = 8192
+_QRITA_BLOCK_SIZE_TRUNC = 4096
+_QRITA_NUM_WARPS = 16
+
+_QRITA_PERCENTILE_TO_STD_TABLE = [
+    2.576,
+    2.319,
+    2.178,
+    2.064,
+    1.968,
+    1.892,
+    1.819,
+    1.757,
+    1.708,
+    1.659,
+    1.616,
+    1.568,
+    1.526,
+    1.492,
+    1.456,
+    1.420,
+    1.382,
+    1.342,
+    1.309,
+    1.280,
+    1.249,
+    1.221,
+    1.193,
+    1.169,
+    1.145,
+    1.121,
+    1.095,
+    1.073,
+    1.050,
+    1.030,
+    1.008,
+    0.987,
+    0.966,
+    0.945,
+    0.926,
+    0.910,
+    0.891,
+    0.871,
+    0.854,
+    0.837,
+    0.819,
+    0.803,
+    0.784,
+    0.767,
+    0.753,
+    0.734,
+    0.719,
+    0.702,
+    0.690,
+    0.675,
+    0.658,
+    0.640,
+    0.625,
+    0.609,
+    0.595,
+    0.578,
+    0.564,
+    0.550,
+    0.537,
+    0.521,
+    0.509,
+    0.495,
+    0.481,
+    0.466,
+    0.453,
+    0.439,
+    0.424,
+    0.410,
+    0.397,
+    0.383,
+    0.370,
+    0.356,
+    0.343,
+    0.330,
+    0.316,
+    0.302,
+    0.289,
+    0.274,
+    0.261,
+    0.247,
+    0.235,
+    0.223,
+    0.209,
+    0.196,
+    0.184,
+    0.172,
+    0.159,
+    0.149,
+    0.137,
+    0.124,
+    0.112,
+    0.100,
+    0.086,
+    0.074,
+    0.062,
+    0.050,
+    0.035,
+    0.023,
+    0.009,
+    -0.003,
+    -0.015,
+    -0.027,
+    -0.039,
+    -0.052,
+    -0.063,
+    -0.074,
+    -0.085,
+    -0.097,
+    -0.109,
+    -0.122,
+    -0.134,
+    -0.147,
+    -0.158,
+    -0.171,
+    -0.184,
+    -0.196,
+    -0.210,
+    -0.223,
+    -0.235,
+    -0.248,
+    -0.261,
+    -0.275,
+    -0.289,
+    -0.302,
+    -0.317,
+    -0.328,
+    -0.341,
+    -0.353,
+    -0.368,
+    -0.382,
+    -0.396,
+    -0.410,
+    -0.426,
+    -0.439,
+    -0.452,
+    -0.465,
+    -0.480,
+    -0.493,
+    -0.507,
+    -0.521,
+    -0.537,
+    -0.551,
+    -0.568,
+    -0.582,
+    -0.597,
+    -0.614,
+    -0.628,
+    -0.643,
+    -0.658,
+    -0.673,
+    -0.691,
+    -0.706,
+    -0.721,
+    -0.738,
+    -0.754,
+    -0.769,
+    -0.789,
+    -0.808,
+    -0.824,
+    -0.838,
+    -0.857,
+    -0.877,
+    -0.893,
+    -0.912,
+    -0.929,
+    -0.947,
+    -0.965,
+    -0.983,
+    -1.003,
+    -1.027,
+    -1.050,
+    -1.070,
+    -1.092,
+    -1.117,
+    -1.139,
+    -1.162,
+    -1.189,
+    -1.216,
+    -1.241,
+    -1.272,
+    -1.300,
+    -1.330,
+    -1.367,
+    -1.404,
+    -1.441,
+    -1.485,
+    -1.523,
+    -1.564,
+    -1.607,
+    -1.658,
+    -1.710,
+    -1.778,
+    -1.832,
+    -1.901,
+    -1.978,
+    -2.068,
+    -2.174,
+    -2.325,
+    -2.577,
+    -3.813,
+]
 
 
 @triton.jit
@@ -213,7 +412,7 @@ def _check_top_k_top_p_gumbel_inputs(
     block_size: int,
     top_k_pad: int,
     num_tokens_per_req: int,
-) -> tuple[int, int, int, int]:
+) -> tuple[int, int, int]:
     if logits.ndim != 2:
         raise ValueError(
             f"gumbel_sample_top_k_top_p_from_pools expects 2D logits, got {logits.ndim}D"
@@ -298,7 +497,7 @@ def _check_top_k_top_p_gumbel_inputs(
             "candidate_logits is too small: "
             f"need {num_candidates}, got {candidate_logits.shape[1]}"
         )
-    return rows, vocab_size, num_blocks, num_candidates
+    return rows, vocab_size, num_blocks
 
 
 def gumbel_sample_top_k_top_p_from_pools(
@@ -316,19 +515,12 @@ def gumbel_sample_top_k_top_p_from_pools(
     min_p_pool: torch.Tensor | None = None,
     block_size: int = _TOP_K_TOP_P_BLOCK_SIZE,
     top_k_pad: int = _TOP_K_TOP_P_PAD,
-    candidate_block_size: int = _TOP_K_TOP_P_CANDIDATE_BLOCK_SIZE,
     num_tokens_per_req: int = 1,
 ) -> torch.Tensor:
-    """Sample from finite top-k / top-k+top-p logits using Gumbel-Max.
-
-    The kernel route stays in candidate/logit space: build finite top-k
-    candidates, apply top-p after top-k renormalization, then select the next
-    token with in-kernel stateless Gumbel noise.
-    """
-    _ = candidate_block_size
+    """Sample finite top-k/top-p candidates with Gumbel-Max."""
     if top_k_pad & (top_k_pad - 1):
         raise ValueError("top_k_pad must be a power of two for tl.topk")
-    rows, vocab_size, num_blocks, num_candidates = _check_top_k_top_p_gumbel_inputs(
+    rows, vocab_size, num_blocks = _check_top_k_top_p_gumbel_inputs(
         logits,
         req_pool_indices,
         temperature_pool,
@@ -885,8 +1077,6 @@ def _check_top_k_top_p_qrita_inputs(
     percentile_to_std_table: torch.Tensor,
     out: torch.Tensor,
     *,
-    block_size: int,
-    block_size_trunc: int,
     num_tokens_per_req: int,
     num_programs: int,
 ) -> tuple[int, int]:
@@ -965,8 +1155,6 @@ def _check_top_k_top_p_qrita_inputs(
         )
     if qrita_buffer.stride(-1) != 1:
         raise ValueError("qrita_buffer requires stride-1 vocab dimension")
-    if block_size <= 0 or block_size_trunc <= 0:
-        raise ValueError("block sizes must be positive")
     return rows, vocab_size
 
 
@@ -982,16 +1170,10 @@ def gumbel_sample_top_k_top_p_qrita_from_pools(
     percentile_to_std_table: torch.Tensor,
     out: torch.Tensor,
     *,
-    block_size: int = _QRITA_BLOCK_SIZE,
-    block_size_trunc: int = _QRITA_BLOCK_SIZE_TRUNC,
     num_tokens_per_req: int = 1,
     num_programs: int | None = None,
 ) -> torch.Tensor:
-    """Sample finite top-k/top-p rows using Qrita-style pivots and Gumbel-Max.
-
-    This experimental route finds the top-k/top-p logit threshold and fuses the
-    final mask pass with Gumbel-Max so it does not materialize filtered logits.
-    """
+    """Sample finite top-k/top-p rows using Qrita-style pivots."""
     rows = logits.shape[0]
     if num_programs is None:
         num_sms = torch.cuda.get_device_properties(logits.device).multi_processor_count
@@ -1007,8 +1189,6 @@ def gumbel_sample_top_k_top_p_qrita_from_pools(
         qrita_buffer,
         percentile_to_std_table,
         out,
-        block_size=block_size,
-        block_size_trunc=block_size_trunc,
         num_tokens_per_req=num_tokens_per_req,
         num_programs=num_programs,
     )
@@ -1030,8 +1210,8 @@ def gumbel_sample_top_k_top_p_qrita_from_pools(
         qrita_buffer_row_stride=qrita_buffer.stride(0),
         batch_size=rows,
         vocab_size=vocab_size,
-        BLOCK_SIZE=block_size,
-        BLOCK_SIZE_TRUNC=block_size_trunc,
+        BLOCK_SIZE=_QRITA_BLOCK_SIZE,
+        BLOCK_SIZE_TRUNC=_QRITA_BLOCK_SIZE_TRUNC,
         NUM_TOKENS_PER_REQ=num_tokens_per_req,
         num_warps=_QRITA_NUM_WARPS,
         num_stages=3,

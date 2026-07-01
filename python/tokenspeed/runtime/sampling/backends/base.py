@@ -84,6 +84,7 @@ class SamplingBackendConfig:
     ) -> SamplingBackendConfig:
 
         return cls(
+            enable_nan_detection=server_args.enable_nan_detection,
             enable_output_logprobs=server_args.enable_output_logprobs,
             max_bs=max_bs,
             max_draft_tokens_per_req=max(max_draft_tokens_per_req, 1),
@@ -220,12 +221,7 @@ class SamplingBackend(ABC):
         )
 
     def cuda_graph_capture_variants(self, num_tokens_per_req: int) -> tuple[str, ...]:
-        """Return sampler-specific CUDA graph variants to capture.
-
-        Most backends have one graph. Backends with graph-captured control-flow
-        differences can add variants while keeping replay selection internal to
-        the backend.
-        """
+        """Return sampler-specific CUDA graph variants to capture."""
         return (CUDA_GRAPH_VARIANT_DEFAULT,)
 
     def prepare_capture_variant(

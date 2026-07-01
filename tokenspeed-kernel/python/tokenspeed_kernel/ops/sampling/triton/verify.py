@@ -21,8 +21,7 @@
 # Adapted from vLLM MRV2 speculative decode flow:
 #   https://vllm.ai/blog/2026-03-24-mrv2
 #   https://github.com/vllm-project/vllm/blob/main/vllm/v1/worker/gpu/spec_decode/rejection_sample.py
-# TokenSpeed samples target rows first, then verifies draft tokens by token-id
-# comparison without materializing full target probabilities.
+# TokenSpeed samples target rows first, then verifies by token-id comparison.
 
 from __future__ import annotations
 
@@ -78,14 +77,7 @@ def verify_chain_target_sampled(
     *,
     enable_pdl: bool = False,
 ) -> None:
-    """Verify a speculative chain against already-sampled target tokens.
-
-    ``target_sampled[b, i]`` is the target model's sampled token for draft
-    position ``i``. The chain accepts while ``candidates[b, i + 1]`` matches
-    ``target_sampled[b, i]`` and emits the first mismatching target token.
-    This is the MRV2-style verify shape: Gumbel-sample target rows first,
-    then compare token ids instead of materializing full target probabilities.
-    """
+    """Verify a speculative chain against already-sampled target tokens."""
     if candidates.ndim != 2:
         raise ValueError(f"candidates must be 2D, got {candidates.ndim}D")
     if accept_index.shape != candidates.shape:

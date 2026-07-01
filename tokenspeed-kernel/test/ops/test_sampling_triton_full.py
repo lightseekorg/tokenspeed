@@ -134,7 +134,6 @@ def test_apply_penalties_logit_bias_inplace_matches_torch_reference(
         pres,
         rep,
         num_tokens_per_req=n,
-        block_size=128,
     )
 
     assert returned.data_ptr() == out.data_ptr()
@@ -150,7 +149,7 @@ def test_accumulate_counts_inplace_matches_index_put_reference(device: str) -> N
 
     ref = counts.clone()
     ref.index_put_((pool_idx, tokens.long()), weights, accumulate=True)
-    accumulate_counts_inplace(counts, pool_idx, tokens, weights, block_size=4)
+    accumulate_counts_inplace(counts, pool_idx, tokens, weights)
 
     torch.testing.assert_close(counts, ref)
 
@@ -162,7 +161,7 @@ def test_selected_token_logprobs_matches_torch_reference(device: str) -> None:
     logits[2, 17] = float("-inf")
     tokens = torch.tensor([3, 99, 17, 128, 512], dtype=torch.int32, device=device)
 
-    actual = selected_token_logprobs(logits, tokens, block_size=128)
+    actual = selected_token_logprobs(logits, tokens)
     expected = (
         torch.log_softmax(logits, dim=-1)
         .gather(-1, tokens.long().unsqueeze(-1))

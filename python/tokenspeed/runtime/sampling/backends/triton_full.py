@@ -23,8 +23,7 @@
 #   https://github.com/vllm-project/vllm/blob/main/vllm/v1/worker/gpu/sample/min_p.py
 #   https://github.com/vllm-project/vllm/blob/main/vllm/v1/worker/gpu/sample/penalties.py
 #   https://github.com/vllm-project/vllm/blob/main/vllm/v1/worker/gpu/sample/logit_bias.py
-# This file keeps TokenSpeed-owned pool/count/logit-bias state and applies the
-# MRV2-style logits -> Gumbel-Max token selection route.
+# TokenSpeed keeps pool-owned counts and logit-bias state.
 
 from __future__ import annotations
 
@@ -57,6 +56,8 @@ from tokenspeed.runtime.sampling.backends.triton import (
     _SAMPLE_ROUTE_GUMBEL_TOP_K,
     _SAMPLE_ROUTE_GUMBEL_TOP_K_TOP_P,
     _SAMPLE_ROUTE_GUMBEL_TOP_P,
+    _TOP_K_TOP_P_PAD,
+    _TOP_K_TOP_P_SMALL_BLOCK_SIZE,
     _TOP_P_PARALLEL_SAMPLE_ATTEMPTS,
     _TOP_P_PARALLEL_SAMPLE_BLOCK_SIZE,
     _TOP_P_PARALLEL_VERIFY_ATTEMPTS,
@@ -78,13 +79,7 @@ CUDA_GRAPH_VARIANT_TRITON_FULL_TOP_K_TOP_P_MIN_P = "triton_full_top_k_top_p_min_
 
 
 class TritonFullSamplingBackend(TritonSamplingBackend):
-    """Full-feature sampling backend with Triton Gumbel single-step sample.
-
-    This backend deliberately owns its full-sampling state instead of
-    inheriting ``FlashInferFullSamplingBackend``. FlashInferFull remains a
-    separate probability-route baseline; TritonFull keeps the TokenSpeed pool
-    lifecycle and routes token selection through logits -> Gumbel-Max.
-    """
+    """Full sampling backend with TokenSpeed-owned state and Triton kernels."""
 
     def __init__(self, config: SamplingBackendConfig) -> None:
         super().__init__(config)
@@ -123,25 +118,7 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
             dtype=torch.float32,
             device=config.device,
         )
-        self._req_pool_indices_i32 = torch.empty(
-            (config.max_bs,), dtype=torch.int32, device=config.device
-        )
         self._full_has_min_p = True
-
-    def _req_pool_indices_for_kernels(
-        self, req_pool_indices: torch.Tensor, rows: int
-    ) -> torch.Tensor:
-        req_pool_indices = req_pool_indices[:rows]
-        if req_pool_indices.dtype == torch.int32:
-            return req_pool_indices
-        if req_pool_indices.dtype != torch.int64:
-            raise ValueError(
-                "Triton full sampling requires int32/int64 req_pool_indices, "
-                f"got {req_pool_indices.dtype}"
-            )
-        out = self._req_pool_indices_i32[:rows]
-        out.copy_(req_pool_indices, non_blocking=True)
-        return out
 
     def prepare_step(
         self,
@@ -369,7 +346,7 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
                 candidate_logits[:rows],
                 out[:rows],
                 min_p_pool=self._min_p_pool if self._full_has_min_p else None,
-                block_size=self._select_top_k_top_p_block_size(rows, logits.shape[1]),
+                block_size=_TOP_K_TOP_P_SMALL_BLOCK_SIZE,
                 top_k_pad=self._top_k_top_p_pad,
                 num_tokens_per_req=num_tokens_per_req,
             )
@@ -493,7 +470,6 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
                 logits_output,
                 logits_for_logprobs,
                 sampled,
-                sampling_info,
             )
 
         self._accumulate_counts(
@@ -589,8 +565,6 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
                 logits_output,
                 logits_for_logprobs,
                 predict,
-                sampling_info,
-                num_tokens_per_req=num_tokens_per_req,
             )
 
         return predict, accept_length

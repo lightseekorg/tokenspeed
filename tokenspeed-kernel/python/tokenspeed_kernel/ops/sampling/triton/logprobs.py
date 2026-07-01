@@ -21,8 +21,7 @@
 # Adapted from vLLM MRV2's compact logprob design:
 #   https://vllm.ai/blog/2026-03-24-mrv2
 #   https://github.com/vllm-project/vllm/blob/main/vllm/v1/worker/gpu/sample/logprob.py
-# In particular, compute selected-token logprobs without materializing full
-# vocabulary logprobs on the runtime path.
+# Computes selected-token logprobs without full-vocabulary materialization.
 
 from __future__ import annotations
 
@@ -69,8 +68,6 @@ def selected_token_logprobs(
     logits: torch.Tensor,
     tokens: torch.Tensor,
     out: torch.Tensor | None = None,
-    *,
-    block_size: int = 1024,
 ) -> torch.Tensor:
     """Compute ``log_softmax(logits)[row, tokens[row]]`` without materializing it."""
     if logits.ndim != 2:
@@ -104,7 +101,7 @@ def selected_token_logprobs(
         out,
         vocab_size=vocab_size,
         logits_row_stride=logits.stride(0),
-        BLOCK_SIZE=block_size,
+        BLOCK_SIZE=1024,
         num_warps=4,
         num_stages=3,
     )

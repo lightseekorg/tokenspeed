@@ -18,8 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-# Adapted from the vLLM MRV2 sampler direction of logits-space sampling with
-# stateless Gumbel RNG:
+# Adapted from vLLM MRV2 logits-space sampling with stateless Gumbel RNG:
 #   https://vllm.ai/blog/2026-03-24-mrv2
 #   https://github.com/vllm-project/vllm/blob/main/vllm/v1/worker/gpu/sample/gumbel.py
 # The top-p-only rejection/repair layout here is TokenSpeed-specific.
@@ -29,11 +28,9 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel._triton import tl, triton
 
-from .common import (
-    _TOP_P_PARALLEL_BLOCK_SIZE,
-    _TOP_P_PARALLEL_NUM_ATTEMPTS,
-    _TOP_P_REPAIR_NUM_ATTEMPTS,
-)
+_TOP_P_PARALLEL_BLOCK_SIZE = 1024
+_TOP_P_PARALLEL_NUM_ATTEMPTS = 3
+_TOP_P_REPAIR_NUM_ATTEMPTS = 8
 
 
 @triton.jit
@@ -377,12 +374,7 @@ def gumbel_sample_top_p_parallel_from_pools(
     num_attempts: int = _TOP_P_PARALLEL_NUM_ATTEMPTS,
     num_tokens_per_req: int = 1,
 ) -> torch.Tensor:
-    """Block-parallel top-p-only Gumbel sampler for normal single-token sample.
-
-    This path trades extra graph launches for much higher vocab-scan
-    parallelism. It is intended for low-row normal sampling where the serial
-    top-p rejection kernel underutilizes the GPU.
-    """
+    """Block-parallel top-p-only Gumbel sampler."""
     if logits.ndim != 2:
         raise ValueError("gumbel_sample_top_p_parallel_from_pools expects 2D logits")
     if logits.device.type != "cuda":

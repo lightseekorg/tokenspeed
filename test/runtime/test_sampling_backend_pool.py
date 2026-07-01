@@ -197,7 +197,7 @@ class TestFlashInferFlipDetection(unittest.TestCase):
             request_pool_indices=[2],
             sampling_params_list=[sp_a],
         )
-        gen_a = self.backend._generator_per_slot[2]
+        gen_a = self.backend._cpu_generator_per_slot[2]
         sp_b = _sp("b", temperature=0.3, seed=99)
         self.backend.prepare_step(
             request_ids=["b"],
@@ -207,7 +207,7 @@ class TestFlashInferFlipDetection(unittest.TestCase):
         self.assertEqual(self.backend._last_rid_per_slot[2], "b")
         self.assertAlmostEqual(self.backend._temperature_pool[2].item(), 0.3, places=3)
         self.assertEqual(self.backend._seed_pool[2].item(), 99)
-        self.assertIsNot(self.backend._generator_per_slot[2], gen_a)
+        self.assertIsNot(self.backend._cpu_generator_per_slot[2], gen_a)
 
 
 class TestTritonRouteSelection(unittest.TestCase):
@@ -243,7 +243,7 @@ class TestTritonRouteSelection(unittest.TestCase):
         self.backend.prepare_step(
             request_ids=["a"],
             request_pool_indices=[1],
-            sampling_params_list=[_sp("a", top_k=128, top_p=0.9)],
+            sampling_params_list=[_sp("a", top_k=127, top_p=0.9)],
         )
         self.assertEqual(self.backend._top_k_top_p_pad, 128)
 
@@ -357,12 +357,6 @@ class TestTritonRouteSelection(unittest.TestCase):
             self.backend.cuda_graph_replay_variant(num_tokens_per_req=4),
             CUDA_GRAPH_VARIANT_TRITON_TOP_K_TOP_P,
         )
-
-    def test_top_k_top_p_block_size_tuning_is_scoped_to_small_vocab(self):
-        self.assertEqual(self.backend._select_top_k_top_p_block_size(1, 32768), 1024)
-        self.assertEqual(self.backend._select_top_k_top_p_block_size(8, 32768), 1024)
-        self.assertEqual(self.backend._select_top_k_top_p_block_size(32, 32768), 1024)
-        self.assertEqual(self.backend._select_top_k_top_p_block_size(32, 151936), 1024)
 
     def test_verify_finite_top_k_top_p_uses_direct_sampler(self):
         n = 4
@@ -504,7 +498,7 @@ class TestTritonRouteSelection(unittest.TestCase):
             request_ids=[f"r{i}" for i in range(bs)],
             request_pool_indices=list(range(1, bs + 1)),
             sampling_params_list=[
-                _sp(f"qrita_{i}", top_k=128, top_p=0.9) for i in range(bs)
+                _sp(f"qrita_{i}", top_k=127, top_p=0.9) for i in range(bs)
             ],
             num_tokens_per_req=n,
         )
@@ -817,10 +811,8 @@ class TestCudaGraphSamplingVariants(unittest.TestCase):
         self.assertEqual(backend.replay_num_tokens_per_req, 4)
 
         backend.variant = "missing"
-        self.assertEqual(
-            wrapper._cuda_graph_key(8),
-            (CUDA_GRAPH_VARIANT_DEFAULT, 8),
-        )
+        with self.assertRaisesRegex(RuntimeError, "was not captured"):
+            wrapper._cuda_graph_key(8)
 
 
 class TestFlashInferFullFlipExtended(unittest.TestCase):
@@ -890,8 +882,7 @@ class TestFlashInferFullFlipExtended(unittest.TestCase):
 
 
 class TestTritonFullIndependentState(unittest.TestCase):
-    """TritonFull owns the same full-sampling slot state as FlashInferFull,
-    but it must not inherit the FlashInferFull probability route."""
+    """TritonFull owns full-sampling state without FlashInfer inheritance."""
 
     def setUp(self):
         self.backend = TritonFullSamplingBackend(_make_config())

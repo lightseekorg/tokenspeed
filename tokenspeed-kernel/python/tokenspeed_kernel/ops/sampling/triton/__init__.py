@@ -25,7 +25,6 @@ from .generic import gumbel_sample_from_pools_generic
 from .gumbel import (
     gumbel_sample_from_pools,
     gumbel_sample_from_pools_compact,
-    gumbel_sample_from_pools_generic,
 )
 from .logprobs import selected_token_logprobs
 from .min_p import (
@@ -35,6 +34,7 @@ from .min_p import (
 from .penalties import accumulate_counts_inplace, apply_penalties_logit_bias_inplace
 from .probability import min_p_renorm_prob
 from .topk_topp import (
+    _QRITA_PERCENTILE_TO_STD_TABLE,
     gumbel_sample_top_k_top_p_from_pools,
     gumbel_sample_top_k_top_p_qrita_from_pools,
 )

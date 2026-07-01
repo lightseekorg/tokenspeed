@@ -34,10 +34,7 @@ from tokenspeed.runtime.sampling.backends.base import (
     SamplingBackendConfig,
 )
 from tokenspeed.runtime.sampling.registry import register_backend
-from tokenspeed.runtime.sampling.utils import (
-    gather_token_logprobs_torch,
-    nan_guard_logits,
-)
+from tokenspeed.runtime.sampling.utils import gather_token_logprobs_torch
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.pdl import pdl_enabled
 
@@ -171,9 +168,7 @@ class GreedySamplingBackend(SamplingBackend):
         sampling_info: SamplingBatchInfo,
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
-        logits = nan_guard_logits(
-            logits_output.next_token_logits, self.config.enable_nan_detection
-        )
+        logits = logits_output.next_token_logits
         # Grammar bitmask apply — captured inside the CUDA graph. Buffer is
         # pre-bound by bind_grammar_mask_buf; non-grammar rows stay all-ones
         # so apply is a no-op.
@@ -216,9 +211,7 @@ class GreedySamplingBackend(SamplingBackend):
         )
         accept_length = self._accept_length_buf[:bs]
 
-        logits = nan_guard_logits(
-            logits_output.next_token_logits, self.config.enable_nan_detection
-        )
+        logits = logits_output.next_token_logits
 
         # Per-draft-position grammar bitmask: buffer shape
         # [bs * num_tokens_per_req, V/32] matches the flat target logits.
@@ -227,7 +220,7 @@ class GreedySamplingBackend(SamplingBackend):
                 logits=logits,
                 vocab_mask=sampling_info.vocab_mask,
             )
-        target_predict = cute_argmax(logits).reshape(bs, num_tokens_per_req)
+        target_predict = sampling_argmax(logits).reshape(bs, num_tokens_per_req)
 
         _verify_chain_greedy(
             predicts=predict,

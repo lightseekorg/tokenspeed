@@ -22,8 +22,7 @@
 #   https://vllm.ai/blog/2026-03-24-mrv2
 #   https://github.com/vllm-project/vllm/blob/main/vllm/v1/worker/gpu/sample/gumbel.py
 #   https://github.com/vllm-project/vllm/blob/main/vllm/v1/worker/gpu/sample/logprob.py
-# This backend keeps TokenSpeed request-pool state and routing, while adapting
-# the MRV2 logits -> Gumbel-Max and selected-token logprob ideas.
+# TokenSpeed keeps its request-pool state and backend boundary.
 
 from __future__ import annotations
 
@@ -63,7 +62,6 @@ if TYPE_CHECKING:
 _GUMBEL_BLOCK_SIZE = 1024
 _COMPACT_GUMBEL_BLOCK_SIZE = 4096
 _COMPACT_GUMBEL_VOCAB_MAX = 32768
-_TOP_K_TOP_P_BLOCK_SIZE = 2048
 _TOP_K_TOP_P_SMALL_BLOCK_SIZE = 1024
 _TOP_K_TOP_P_TUNED_VOCAB_MAX = 32768
 _TOP_K_TOP_P_PAD = 128
@@ -85,6 +83,14 @@ CUDA_GRAPH_VARIANT_TRITON_TOP_K = "triton_top_k"
 CUDA_GRAPH_VARIANT_TRITON_TOP_K_TOP_P = "triton_top_k_top_p"
 CUDA_GRAPH_VARIANT_TRITON_TOP_P = "triton_top_p"
 CUDA_GRAPH_VARIANT_TRITON_VERIFY_NO_FILTER = "triton_verify_no_filter"
+
+_CUDA_GRAPH_VARIANT_SAMPLE_ROUTES = {
+    CUDA_GRAPH_VARIANT_TRITON_NO_FILTER: _SAMPLE_ROUTE_GUMBEL_NO_FILTER,
+    CUDA_GRAPH_VARIANT_TRITON_TOP_K: _SAMPLE_ROUTE_GUMBEL_TOP_K,
+    CUDA_GRAPH_VARIANT_TRITON_TOP_K_TOP_P: _SAMPLE_ROUTE_GUMBEL_TOP_K_TOP_P,
+    CUDA_GRAPH_VARIANT_TRITON_TOP_P: _SAMPLE_ROUTE_GUMBEL_TOP_P,
+    CUDA_GRAPH_VARIANT_TRITON_VERIFY_NO_FILTER: _SAMPLE_ROUTE_GUMBEL_NO_FILTER,
+}
 
 
 class TritonSamplingBackend(SamplingBackend):
@@ -173,9 +179,8 @@ class TritonSamplingBackend(SamplingBackend):
             device=config.device,
         )
 
-        topk_scratch_block_size = _TOP_K_TOP_P_SMALL_BLOCK_SIZE
-        topk_blocks = (vocab_size + topk_scratch_block_size - 1) // (
-            topk_scratch_block_size
+        topk_blocks = (vocab_size + _TOP_K_TOP_P_SMALL_BLOCK_SIZE - 1) // (
+            _TOP_K_TOP_P_SMALL_BLOCK_SIZE
         )
         topk_candidates = topk_blocks * _TOP_K_TOP_P_PAD
         self._topk_candidate_ids = torch.empty(
@@ -286,9 +291,6 @@ class TritonSamplingBackend(SamplingBackend):
         logits_output: LogitsProcessorOutput,
         logits: torch.Tensor,
         sampled: torch.Tensor,
-        sampling_info: SamplingBatchInfo,
-        *,
-        num_tokens_per_req: int = 1,
     ) -> None:
         if not self.config.enable_output_logprobs:
             return
@@ -302,9 +304,7 @@ class TritonSamplingBackend(SamplingBackend):
     @staticmethod
     def _select_sample_route(
         sampling_params_list: list[SamplingParams],
-        num_tokens_per_req: int,
     ) -> int:
-        _ = num_tokens_per_req
         if len(sampling_params_list) == 0:
             return _SAMPLE_ROUTE_GUMBEL_GENERIC
 
@@ -344,9 +344,7 @@ class TritonSamplingBackend(SamplingBackend):
             sampling_params_list=sampling_params_list,
             num_tokens_per_req=num_tokens_per_req,
         )
-        self._sample_route = self._select_sample_route(
-            sampling_params_list, num_tokens_per_req
-        )
+        self._sample_route = self._select_sample_route(sampling_params_list)
         self._top_k_top_p_pad = self._select_top_k_top_p_pad(sampling_params_list)
 
     @staticmethod
@@ -359,11 +357,6 @@ class TritonSamplingBackend(SamplingBackend):
         if finite_top_ks and max(finite_top_ks) <= 64:
             return 64
         return _TOP_K_TOP_P_PAD
-
-    @staticmethod
-    def _select_top_k_top_p_block_size(bs: int, vocab_size: int) -> int:
-        _, _ = bs, vocab_size
-        return _TOP_K_TOP_P_SMALL_BLOCK_SIZE
 
     def _use_qrita_verify_top_k_route(self, rows: int, vocab_size: int) -> bool:
         return (
@@ -384,17 +377,16 @@ class TritonSamplingBackend(SamplingBackend):
         )
 
     def cuda_graph_capture_variants(self, num_tokens_per_req: int) -> tuple[str, ...]:
-        variants = [
+        variants = (
             CUDA_GRAPH_VARIANT_DEFAULT,
             CUDA_GRAPH_VARIANT_TRITON_NO_FILTER,
             CUDA_GRAPH_VARIANT_TRITON_TOP_P,
             CUDA_GRAPH_VARIANT_TRITON_TOP_K,
             CUDA_GRAPH_VARIANT_TRITON_TOP_K_TOP_P,
-        ]
+        )
         if num_tokens_per_req <= 1:
-            return tuple(variants)
-        variants.append(CUDA_GRAPH_VARIANT_TRITON_VERIFY_NO_FILTER)
-        return tuple(variants)
+            return variants
+        return (*variants, CUDA_GRAPH_VARIANT_TRITON_VERIFY_NO_FILTER)
 
     def prepare_capture_variant(
         self,
@@ -422,7 +414,6 @@ class TritonSamplingBackend(SamplingBackend):
         raise ValueError(f"Unsupported CUDA graph variant: {variant}")
 
     def cuda_graph_replay_variant(self, num_tokens_per_req: int) -> str:
-        _ = num_tokens_per_req
         if self._sample_route == _SAMPLE_ROUTE_GUMBEL_NO_FILTER:
             if num_tokens_per_req > 1:
                 return CUDA_GRAPH_VARIANT_TRITON_VERIFY_NO_FILTER
@@ -498,7 +489,7 @@ class TritonSamplingBackend(SamplingBackend):
                     self._topk_candidate_ids[:bs],
                     self._topk_candidate_logits[:bs],
                     self._gumbel_out[:bs],
-                    block_size=self._select_top_k_top_p_block_size(bs, logits.shape[1]),
+                    block_size=_TOP_K_TOP_P_SMALL_BLOCK_SIZE,
                     top_k_pad=self._top_k_top_p_pad,
                 )
             elif self._sample_route == _SAMPLE_ROUTE_GUMBEL_TOP_P:
@@ -540,7 +531,7 @@ class TritonSamplingBackend(SamplingBackend):
         sampled = batch_next_token_ids.to(torch.int32)
         self.maybe_broadcast(sampled)
 
-        self._write_logprob_outputs(logits_output, logits, sampled, sampling_info)
+        self._write_logprob_outputs(logits_output, logits, sampled)
 
         return sampled, self._ones_buf[: logits.shape[0]]
 
@@ -647,9 +638,7 @@ class TritonSamplingBackend(SamplingBackend):
                         self._topk_verify_candidate_ids[:rows],
                         self._topk_verify_candidate_logits[:rows],
                         self._gumbel_verify_out[:rows],
-                        block_size=self._select_top_k_top_p_block_size(
-                            rows, logits.shape[1]
-                        ),
+                        block_size=_TOP_K_TOP_P_SMALL_BLOCK_SIZE,
                         top_k_pad=self._top_k_top_p_pad,
                         num_tokens_per_req=num_tokens_per_req,
                     )
@@ -710,8 +699,6 @@ class TritonSamplingBackend(SamplingBackend):
                 logits_output,
                 logits,
                 predict,
-                sampling_info,
-                num_tokens_per_req=num_tokens_per_req,
             )
 
         return predict, accept_length

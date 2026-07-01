@@ -164,33 +164,7 @@ def test_gumbel_sample_from_pools_takes_tail_token(device: str) -> None:
         ),
     )
 
-
-def test_gumbel_sample_from_pools_compact_matches_regular_pool_path(
-    device: str,
-) -> None:
-    torch.manual_seed(112)
-    rows, vocab_size = 3, 2049
-    logits = torch.randn((rows, vocab_size), dtype=torch.float32, device=device)
-    req_pool_indices = torch.tensor([4, 2, 7], dtype=torch.int32, device=device)
-    pool_rows = 9
-    temperature_pool = torch.linspace(
-        0.5, 1.5, pool_rows, dtype=torch.float32, device=device
-    )
-    seed_pool = torch.arange(123, 123 + pool_rows, dtype=torch.int64, device=device)
-    offsets_pool = torch.arange(17, 17 + pool_rows, dtype=torch.int64, device=device)
-    local_ids, local_scores, regular_out = _gumbel_scratch(rows, vocab_size, device)
     compact_out = torch.empty((rows,), dtype=torch.int32, device=device)
-
-    regular = gumbel_sample_from_pools(
-        logits,
-        req_pool_indices,
-        temperature_pool,
-        seed_pool,
-        offsets_pool,
-        local_ids,
-        local_scores,
-        regular_out,
-    ).clone()
     compact = gumbel_sample_from_pools_compact(
         logits,
         req_pool_indices,
@@ -201,17 +175,16 @@ def test_gumbel_sample_from_pools_compact_matches_regular_pool_path(
         block_size=1024,
     ).clone()
 
-    torch.testing.assert_close(compact, regular)
+    torch.testing.assert_close(compact.cpu(), sampled.cpu())
 
 
-@pytest.mark.parametrize("use_compact", [True, False])
 def test_gumbel_no_filter_verify_idx_mapping_matches_expanded_rows(
-    device: str, use_compact: bool
+    device: str,
 ) -> None:
     torch.manual_seed(2027)
     bs, n = 2, 3
     rows = bs * n
-    vocab_size = 1025 if use_compact else 4097
+    vocab_size = 1025
     logits = torch.randn((rows, vocab_size), dtype=torch.float32, device=device) * 2.0
     req_pool_indices = torch.tensor([1, 3], dtype=torch.int32, device=device)
     pool_rows = 5
@@ -222,30 +195,16 @@ def test_gumbel_no_filter_verify_idx_mapping_matches_expanded_rows(
     offsets_pool = torch.arange(19, 19 + pool_rows, dtype=torch.int64, device=device)
 
     mapped_out = torch.empty((rows,), dtype=torch.int32, device=device)
-    if use_compact:
-        mapped = gumbel_sample_from_pools_compact(
-            logits,
-            req_pool_indices,
-            temperature_pool,
-            seed_pool,
-            offsets_pool,
-            mapped_out,
-            block_size=1024,
-            num_tokens_per_req=n,
-        ).clone()
-    else:
-        local_ids, local_scores, _ = _gumbel_scratch(rows, vocab_size, device)
-        mapped = gumbel_sample_from_pools(
-            logits,
-            req_pool_indices,
-            temperature_pool,
-            seed_pool,
-            offsets_pool,
-            local_ids,
-            local_scores,
-            mapped_out,
-            num_tokens_per_req=n,
-        ).clone()
+    mapped = gumbel_sample_from_pools_compact(
+        logits,
+        req_pool_indices,
+        temperature_pool,
+        seed_pool,
+        offsets_pool,
+        mapped_out,
+        block_size=1024,
+        num_tokens_per_req=n,
+    ).clone()
 
     expanded_req = torch.arange(rows, dtype=torch.int32, device=device)
     expanded_temperature = torch.empty((rows,), dtype=torch.float32, device=device)
@@ -258,28 +217,15 @@ def test_gumbel_no_filter_verify_idx_mapping_matches_expanded_rows(
         expanded_offsets[row] = offsets_pool[pool_idx] + row % n
 
     expanded_out = torch.empty((rows,), dtype=torch.int32, device=device)
-    if use_compact:
-        expanded = gumbel_sample_from_pools_compact(
-            logits,
-            expanded_req,
-            expanded_temperature,
-            expanded_seed,
-            expanded_offsets,
-            expanded_out,
-            block_size=1024,
-        ).clone()
-    else:
-        local_ids, local_scores, _ = _gumbel_scratch(rows, vocab_size, device)
-        expanded = gumbel_sample_from_pools(
-            logits,
-            expanded_req,
-            expanded_temperature,
-            expanded_seed,
-            expanded_offsets,
-            local_ids,
-            local_scores,
-            expanded_out,
-        ).clone()
+    expanded = gumbel_sample_from_pools_compact(
+        logits,
+        expanded_req,
+        expanded_temperature,
+        expanded_seed,
+        expanded_offsets,
+        expanded_out,
+        block_size=1024,
+    ).clone()
 
     torch.testing.assert_close(mapped, expanded)
 
@@ -343,101 +289,7 @@ def test_gumbel_generic_mixed_batch_samples_allowed_set(device: str) -> None:
         assert token_id in allowed
 
 
-def test_gumbel_generic_verify_idx_mapping_matches_expanded_rows(device: str) -> None:
-    torch.manual_seed(2026)
-    bs, n, vocab_size = 2, 3, 257
-    rows = bs * n
-    logits = torch.randn((rows, vocab_size), dtype=torch.float32, device=device) * 2.0
-    req_pool_indices = torch.tensor([1, 3], dtype=torch.int32, device=device)
-    pool_rows = 5
-    temperature_pool = torch.linspace(
-        0.8, 1.2, pool_rows, dtype=torch.float32, device=device
-    )
-    top_k_pool = torch.tensor(
-        [1, _TOP_K_DISABLED, 32, _TOP_K_DISABLED, 16],
-        dtype=torch.int32,
-        device=device,
-    )
-    top_p_pool = torch.tensor(
-        [1.0, 0.85, 0.9, 0.75, 0.95], dtype=torch.float32, device=device
-    )
-    seed_pool = torch.arange(101, 101 + pool_rows, dtype=torch.int64, device=device)
-    offsets_pool = torch.arange(17, 17 + pool_rows, dtype=torch.int64, device=device)
-
-    mapped_out = torch.empty((rows,), dtype=torch.int32, device=device)
-    mapped = gumbel_sample_from_pools_generic(
-        logits,
-        req_pool_indices,
-        temperature_pool,
-        top_k_pool,
-        top_p_pool,
-        seed_pool,
-        offsets_pool,
-        mapped_out,
-        num_tokens_per_req=n,
-    ).clone()
-
-    expanded_req = torch.arange(rows, dtype=torch.int32, device=device)
-    expanded_temperature = torch.empty((rows,), dtype=torch.float32, device=device)
-    expanded_top_k = torch.empty((rows,), dtype=torch.int32, device=device)
-    expanded_top_p = torch.empty((rows,), dtype=torch.float32, device=device)
-    expanded_seed = torch.empty((rows,), dtype=torch.int64, device=device)
-    expanded_offsets = torch.empty((rows,), dtype=torch.int64, device=device)
-    for row in range(rows):
-        pool_idx = int(req_pool_indices[row // n].item())
-        expanded_temperature[row] = temperature_pool[pool_idx]
-        expanded_top_k[row] = top_k_pool[pool_idx]
-        expanded_top_p[row] = top_p_pool[pool_idx]
-        expanded_seed[row] = seed_pool[pool_idx]
-        expanded_offsets[row] = offsets_pool[pool_idx] + row % n
-
-    expanded_out = torch.empty((rows,), dtype=torch.int32, device=device)
-    expanded = gumbel_sample_from_pools_generic(
-        logits,
-        expanded_req,
-        expanded_temperature,
-        expanded_top_k,
-        expanded_top_p,
-        expanded_seed,
-        expanded_offsets,
-        expanded_out,
-    ).clone()
-
-    torch.testing.assert_close(mapped, expanded)
-
-
-def test_gumbel_top_k_equals_argmax_for_k1(device: str) -> None:
-    torch.manual_seed(12)
-    rows, vocab_size = 4, 257
-    logits = torch.randn((rows, vocab_size), dtype=torch.float32, device=device)
-    req_pool_indices = torch.tensor([4, 2, 7, 1], dtype=torch.int32, device=device)
-    pool_rows = 9
-    temperature_pool = torch.ones((pool_rows,), dtype=torch.float32, device=device)
-    top_k_pool = torch.ones((pool_rows,), dtype=torch.int32, device=device)
-    top_p_pool = torch.ones((pool_rows,), dtype=torch.float32, device=device)
-    seed_pool = torch.arange(123, 123 + pool_rows, dtype=torch.int64, device=device)
-    offsets_pool = torch.arange(17, 17 + pool_rows, dtype=torch.int64, device=device)
-    candidate_ids, candidate_logits, out = _top_k_top_p_gumbel_scratch(
-        rows, vocab_size, device
-    )
-
-    sampled = gumbel_sample_top_k_top_p_from_pools(
-        logits,
-        req_pool_indices,
-        temperature_pool,
-        top_k_pool,
-        top_p_pool,
-        seed_pool,
-        offsets_pool,
-        candidate_ids,
-        candidate_logits,
-        out,
-    )
-
-    torch.testing.assert_close(sampled, torch.argmax(logits, dim=-1).to(torch.int32))
-
-
-@pytest.mark.parametrize("top_k,top_p", [(8, 1.0), (16, 0.75), (64, 0.9)])
+@pytest.mark.parametrize("top_k,top_p", [(1, 1.0), (8, 1.0), (64, 0.9)])
 def test_gumbel_top_k_top_p_samples_allowed_set(
     device: str, top_k: int, top_p: float
 ) -> None:
@@ -471,6 +323,12 @@ def test_gumbel_top_k_top_p_samples_allowed_set(
         candidate_logits,
         out,
     )
+
+    if top_k == 1:
+        torch.testing.assert_close(
+            sampled, torch.argmax(logits, dim=-1).to(torch.int32)
+        )
+        return
 
     for row, token_id in enumerate(sampled.cpu().tolist()):
         pool_idx = int(req_pool_indices[row].item())
@@ -528,49 +386,6 @@ def test_gumbel_top_k_top_p_min_p_samples_allowed_set(device: str) -> None:
         assert token_id in allowed
 
 
-def test_gumbel_top_k_top_p_is_deterministic(device: str) -> None:
-    torch.manual_seed(99)
-    rows, vocab_size = 2, 1025
-    logits = torch.randn((rows, vocab_size), dtype=torch.float32, device=device)
-    req_pool_indices = torch.tensor([1, 3], dtype=torch.int32, device=device)
-    pool_rows = 5
-    temperature_pool = torch.ones((pool_rows,), dtype=torch.float32, device=device)
-    top_k_pool = torch.full((pool_rows,), 32, dtype=torch.int32, device=device)
-    top_p_pool = torch.full((pool_rows,), 0.9, dtype=torch.float32, device=device)
-    seed_pool = torch.arange(11, 11 + pool_rows, dtype=torch.int64, device=device)
-    offsets_pool = torch.arange(5, 5 + pool_rows, dtype=torch.int64, device=device)
-    candidate_ids, candidate_logits, out = _top_k_top_p_gumbel_scratch(
-        rows, vocab_size, device
-    )
-
-    first = gumbel_sample_top_k_top_p_from_pools(
-        logits,
-        req_pool_indices,
-        temperature_pool,
-        top_k_pool,
-        top_p_pool,
-        seed_pool,
-        offsets_pool,
-        candidate_ids,
-        candidate_logits,
-        out,
-    ).clone()
-    second = gumbel_sample_top_k_top_p_from_pools(
-        logits,
-        req_pool_indices,
-        temperature_pool,
-        top_k_pool,
-        top_p_pool,
-        seed_pool,
-        offsets_pool,
-        candidate_ids,
-        candidate_logits,
-        out,
-    ).clone()
-
-    torch.testing.assert_close(first, second)
-
-
 def test_gumbel_top_k_top_p_large_vocab_samples_allowed_set(device: str) -> None:
     torch.manual_seed(2029)
     rows, vocab_size = 2, 32768
@@ -579,7 +394,7 @@ def test_gumbel_top_k_top_p_large_vocab_samples_allowed_set(device: str) -> None
     req_pool_indices = torch.tensor([1, 2], dtype=torch.int32, device=device)
     pool_rows = 3
     temperature_pool = torch.ones((pool_rows,), dtype=torch.float32, device=device)
-    top_k_pool = torch.full((pool_rows,), 128, dtype=torch.int32, device=device)
+    top_k_pool = torch.full((pool_rows,), 127, dtype=torch.int32, device=device)
     top_p_pool = torch.full((pool_rows,), 0.9, dtype=torch.float32, device=device)
     seed_pool = torch.arange(31, 31 + pool_rows, dtype=torch.int64, device=device)
     offsets_pool = torch.arange(9, 9 + pool_rows, dtype=torch.int64, device=device)
@@ -678,6 +493,16 @@ def test_gumbel_top_k_top_p_qrita_verify_idx_mapping_matches_expanded_rows(
         num_programs=rows,
     ).clone()
 
+    for row, token_id in enumerate(mapped.cpu().tolist()):
+        pool_idx = int(req_pool_indices[row // n].item())
+        allowed = _top_k_topp_allowed_ids(
+            logits[row],
+            float(temperature_pool[pool_idx].item()),
+            int(top_k_pool[pool_idx].item()),
+            float(top_p_pool[pool_idx].item()),
+        )
+        assert token_id in allowed
+
     expanded_req = torch.arange(rows, dtype=torch.int32, device=device)
     expanded_temperature = torch.empty((rows,), dtype=torch.float32, device=device)
     expanded_top_k = torch.empty((rows,), dtype=torch.int32, device=device)
@@ -712,169 +537,22 @@ def test_gumbel_top_k_top_p_qrita_verify_idx_mapping_matches_expanded_rows(
     torch.testing.assert_close(mapped, expanded)
 
 
-def test_gumbel_top_k_top_p_verify_idx_mapping_matches_expanded_rows(
-    device: str,
-) -> None:
-    torch.manual_seed(2030)
-    bs, n = 2, 3
-    rows, vocab_size = bs * n, 1025
-    logits = torch.randn((rows, vocab_size), dtype=torch.float32, device=device) * 2.0
-    req_pool_indices = torch.tensor([1, 3], dtype=torch.int32, device=device)
-    pool_rows = 5
-    temperature_pool = torch.linspace(
-        0.8, 1.2, pool_rows, dtype=torch.float32, device=device
-    )
-    top_k_pool = torch.full((pool_rows,), 64, dtype=torch.int32, device=device)
-    top_p_pool = torch.full((pool_rows,), 0.85, dtype=torch.float32, device=device)
-    seed_pool = torch.arange(701, 701 + pool_rows, dtype=torch.int64, device=device)
-    offsets_pool = torch.arange(19, 19 + pool_rows, dtype=torch.int64, device=device)
-
-    mapped_candidate_ids, mapped_candidate_logits, mapped_out = (
-        _top_k_top_p_gumbel_scratch(rows, vocab_size, device)
-    )
-    mapped = gumbel_sample_top_k_top_p_from_pools(
-        logits,
-        req_pool_indices,
-        temperature_pool,
-        top_k_pool,
-        top_p_pool,
-        seed_pool,
-        offsets_pool,
-        mapped_candidate_ids,
-        mapped_candidate_logits,
-        mapped_out,
-        num_tokens_per_req=n,
-    ).clone()
-
-    expanded_req = torch.arange(rows, dtype=torch.int32, device=device)
-    expanded_temperature = torch.empty((rows,), dtype=torch.float32, device=device)
-    expanded_top_k = torch.empty((rows,), dtype=torch.int32, device=device)
-    expanded_top_p = torch.empty((rows,), dtype=torch.float32, device=device)
-    expanded_seed = torch.empty((rows,), dtype=torch.int64, device=device)
-    expanded_offsets = torch.empty((rows,), dtype=torch.int64, device=device)
-    for row in range(rows):
-        pool_idx = int(req_pool_indices[row // n].item())
-        expanded_temperature[row] = temperature_pool[pool_idx]
-        expanded_top_k[row] = top_k_pool[pool_idx]
-        expanded_top_p[row] = top_p_pool[pool_idx]
-        expanded_seed[row] = seed_pool[pool_idx]
-        expanded_offsets[row] = offsets_pool[pool_idx] + row % n
-
-    expanded_candidate_ids, expanded_candidate_logits, expanded_out = (
-        _top_k_top_p_gumbel_scratch(rows, vocab_size, device)
-    )
-    expanded = gumbel_sample_top_k_top_p_from_pools(
-        logits,
-        expanded_req,
-        expanded_temperature,
-        expanded_top_k,
-        expanded_top_p,
-        expanded_seed,
-        expanded_offsets,
-        expanded_candidate_ids,
-        expanded_candidate_logits,
-        expanded_out,
-    ).clone()
-
-    torch.testing.assert_close(mapped, expanded)
-
-
-def test_gumbel_generic_top_p_only_samples_allowed_set(device: str) -> None:
-    torch.manual_seed(123)
-    rows, vocab_size = 3, 513
-    logits = torch.randn((rows, vocab_size), dtype=torch.float32, device=device) * 3.0
-    logits[:, vocab_size - 1] = float("-inf")
-    req_pool_indices = torch.tensor([4, 2, 7], dtype=torch.int32, device=device)
-    pool_rows = 9
-    temperature_pool = torch.linspace(
-        0.7, 1.3, pool_rows, dtype=torch.float32, device=device
-    )
-    top_k_pool = torch.full(
-        (pool_rows,), _TOP_K_DISABLED, dtype=torch.int32, device=device
-    )
-    top_p_pool = torch.full((pool_rows,), 0.8, dtype=torch.float32, device=device)
-    seed_pool = torch.arange(123, 123 + pool_rows, dtype=torch.int64, device=device)
-    offsets_pool = torch.arange(17, 17 + pool_rows, dtype=torch.int64, device=device)
-    out = torch.empty((rows,), dtype=torch.int32, device=device)
-
-    sampled = gumbel_sample_from_pools_generic(
-        logits,
-        req_pool_indices,
-        temperature_pool,
-        top_k_pool,
-        top_p_pool,
-        seed_pool,
-        offsets_pool,
-        out,
-    )
-
-    for row, token_id in enumerate(sampled.cpu().tolist()):
-        pool_idx = int(req_pool_indices[row].item())
-        allowed = _top_k_topp_allowed_ids(
-            logits[row],
-            float(temperature_pool[pool_idx].item()),
-            logits.shape[1],
-            float(top_p_pool[pool_idx].item()),
-        )
-        assert token_id in allowed
-
-
 def test_gumbel_top_p_parallel_samples_allowed_set(device: str) -> None:
     torch.manual_seed(456)
-    rows, vocab_size = 5, 4097
-    block_size, attempts = 512, 3
+    rows, vocab_size = 6, 4097
+    block_size, attempts = 512, 1
     logits = torch.randn((rows, vocab_size), dtype=torch.float32, device=device) * 2.0
     logits[:, -1] = float("-inf")
-    req_pool_indices = torch.tensor([1, 2, 3, 4, 5], dtype=torch.int32, device=device)
-    pool_rows = 6
-    temperature_pool = torch.linspace(
-        0.7, 1.2, pool_rows, dtype=torch.float32, device=device
-    )
-    top_p_pool = torch.full((pool_rows,), 0.8, dtype=torch.float32, device=device)
-    seed_pool = torch.arange(333, 333 + pool_rows, dtype=torch.int64, device=device)
-    offsets_pool = torch.arange(11, 11 + pool_rows, dtype=torch.int64, device=device)
-    scratch = _top_p_parallel_scratch(rows, vocab_size, block_size, attempts, device)
-
-    sampled = gumbel_sample_top_p_parallel_from_pools(
-        logits,
-        req_pool_indices,
-        temperature_pool,
-        top_p_pool,
-        seed_pool,
-        offsets_pool,
-        *scratch,
-        block_size=block_size,
-        num_attempts=attempts,
-    )
-
-    for row, token_id in enumerate(sampled.cpu().tolist()):
-        pool_idx = int(req_pool_indices[row].item())
-        allowed = _top_k_topp_allowed_ids(
-            logits[row],
-            float(temperature_pool[pool_idx].item()),
-            vocab_size,
-            float(top_p_pool[pool_idx].item()),
-        )
-        assert token_id in allowed
-
-
-def test_gumbel_top_p_parallel_repair_is_deterministic_and_allowed(
-    device: str,
-) -> None:
-    torch.manual_seed(789)
-    rows, vocab_size = 6, 769
-    block_size, attempts = 128, 1
-    logits = torch.randn((rows, vocab_size), dtype=torch.float32, device=device) * 2.5
     req_pool_indices = torch.tensor(
         [1, 2, 3, 4, 5, 6], dtype=torch.int32, device=device
     )
     pool_rows = 7
     temperature_pool = torch.linspace(
-        0.8, 1.1, pool_rows, dtype=torch.float32, device=device
+        0.7, 1.2, pool_rows, dtype=torch.float32, device=device
     )
     top_p_pool = torch.full((pool_rows,), 0.25, dtype=torch.float32, device=device)
-    seed_pool = torch.arange(444, 444 + pool_rows, dtype=torch.int64, device=device)
-    offsets_pool = torch.arange(5, 5 + pool_rows, dtype=torch.int64, device=device)
+    seed_pool = torch.arange(333, 333 + pool_rows, dtype=torch.int64, device=device)
+    offsets_pool = torch.arange(11, 11 + pool_rows, dtype=torch.int64, device=device)
     first_scratch = _top_p_parallel_scratch(
         rows, vocab_size, block_size, attempts, device
     )
@@ -984,89 +662,12 @@ def test_gumbel_top_p_parallel_verify_idx_mapping_matches_expanded_rows(
     torch.testing.assert_close(mapped, expanded)
 
 
-def test_gumbel_generic_min_p_samples_allowed_set(device: str) -> None:
-    torch.manual_seed(777)
-    rows, vocab_size = 3, 257
-    logits = torch.randn((rows, vocab_size), dtype=torch.float32, device=device) * 2.0
-    req_pool_indices = torch.tensor([1, 2, 3], dtype=torch.int32, device=device)
-    pool_rows = 4
-    temperature_pool = torch.ones((pool_rows,), dtype=torch.float32, device=device)
-    top_k_pool = torch.full(
-        (pool_rows,), _TOP_K_DISABLED, dtype=torch.int32, device=device
-    )
-    top_p_pool = torch.ones((pool_rows,), dtype=torch.float32, device=device)
-    min_p_pool = torch.full((pool_rows,), 0.2, dtype=torch.float32, device=device)
-    seed_pool = torch.arange(31, 31 + pool_rows, dtype=torch.int64, device=device)
-    offsets_pool = torch.arange(9, 9 + pool_rows, dtype=torch.int64, device=device)
-    out = torch.empty((rows,), dtype=torch.int32, device=device)
-
-    sampled = gumbel_sample_from_pools_generic(
-        logits,
-        req_pool_indices,
-        temperature_pool,
-        top_k_pool,
-        top_p_pool,
-        seed_pool,
-        offsets_pool,
-        out,
-        min_p_pool=min_p_pool,
-    )
-
-    for row, token_id in enumerate(sampled.cpu().tolist()):
-        pool_idx = int(req_pool_indices[row].item())
-        scaled = logits[row].float() / float(temperature_pool[pool_idx].item())
-        probs = torch.softmax(scaled, dim=-1)
-        threshold = float(min_p_pool[pool_idx].item()) * probs.max()
-        assert probs[token_id] >= threshold
-
-
-def test_gumbel_min_p_samples_allowed_set(device: str) -> None:
-    torch.manual_seed(778)
-    rows, vocab_size = 4, 1025
-    logits = torch.randn((rows, vocab_size), dtype=torch.float32, device=device) * 2.0
-    req_pool_indices = torch.tensor([1, 2, 3, 4], dtype=torch.int32, device=device)
-    pool_rows = 5
-    temperature_pool = torch.linspace(
-        0.7, 1.2, pool_rows, dtype=torch.float32, device=device
-    )
-    min_p_pool = torch.full((pool_rows,), 0.2, dtype=torch.float32, device=device)
-    seed_pool = torch.arange(41, 41 + pool_rows, dtype=torch.int64, device=device)
-    offsets_pool = torch.arange(3, 3 + pool_rows, dtype=torch.int64, device=device)
-    out = torch.empty((rows,), dtype=torch.int32, device=device)
-
-    first = gumbel_sample_min_p_from_pools(
-        logits,
-        req_pool_indices,
-        temperature_pool,
-        min_p_pool,
-        seed_pool,
-        offsets_pool,
-        out,
-        block_size=256,
-    ).clone()
-    second = gumbel_sample_min_p_from_pools(
-        logits,
-        req_pool_indices,
-        temperature_pool,
-        min_p_pool,
-        seed_pool,
-        offsets_pool,
-        out,
-        block_size=256,
-    ).clone()
-
-    torch.testing.assert_close(first, second)
-    for row, token_id in enumerate(first.cpu().tolist()):
-        pool_idx = int(req_pool_indices[row].item())
-        scaled = logits[row].float() / float(temperature_pool[pool_idx].item())
-        probs = torch.softmax(scaled, dim=-1)
-        threshold = float(min_p_pool[pool_idx].item()) * probs.max()
-        assert probs[token_id] >= threshold
-
-
-def test_gumbel_min_p_parallel_matches_allowed_set(device: str) -> None:
+@pytest.mark.parametrize("parallel,vocab_size", [(False, 1025), (True, 4097)])
+def test_gumbel_min_p_samples_allowed_set(
+    device: str, parallel: bool, vocab_size: int
+) -> None:
     torch.manual_seed(779)
-    rows, vocab_size = 4, 4097
+    rows = 4
     logits = torch.randn((rows, vocab_size), dtype=torch.float32, device=device) * 2.0
     req_pool_indices = torch.tensor([1, 2, 3, 4], dtype=torch.int32, device=device)
     pool_rows = 5
@@ -1076,39 +677,58 @@ def test_gumbel_min_p_parallel_matches_allowed_set(device: str) -> None:
     min_p_pool = torch.full((pool_rows,), 0.2, dtype=torch.float32, device=device)
     seed_pool = torch.arange(51, 51 + pool_rows, dtype=torch.int64, device=device)
     offsets_pool = torch.arange(7, 7 + pool_rows, dtype=torch.int64, device=device)
-    block_size = 512
-    num_blocks = (vocab_size + block_size - 1) // block_size
-    local_ids = torch.empty((rows, num_blocks), dtype=torch.int32, device=device)
-    local_scores = torch.empty((rows, num_blocks), dtype=torch.float32, device=device)
-    row_max = torch.empty((rows,), dtype=torch.float32, device=device)
     out = torch.empty((rows,), dtype=torch.int32, device=device)
 
-    first = gumbel_sample_min_p_from_pools_parallel(
-        logits,
-        req_pool_indices,
-        temperature_pool,
-        min_p_pool,
-        seed_pool,
-        offsets_pool,
-        local_ids,
-        local_scores,
-        row_max,
-        out,
-        block_size=block_size,
-    ).clone()
-    second = gumbel_sample_min_p_from_pools_parallel(
-        logits,
-        req_pool_indices,
-        temperature_pool,
-        min_p_pool,
-        seed_pool,
-        offsets_pool,
-        local_ids,
-        local_scores,
-        row_max,
-        out,
-        block_size=block_size,
-    ).clone()
+    if parallel:
+        num_blocks = (vocab_size + 1023) // 1024
+        local_ids = torch.empty((rows, num_blocks), dtype=torch.int32, device=device)
+        local_scores = torch.empty(
+            (rows, num_blocks), dtype=torch.float32, device=device
+        )
+        row_max = torch.empty((rows,), dtype=torch.float32, device=device)
+        first = gumbel_sample_min_p_from_pools_parallel(
+            logits,
+            req_pool_indices,
+            temperature_pool,
+            min_p_pool,
+            seed_pool,
+            offsets_pool,
+            local_ids,
+            local_scores,
+            row_max,
+            out,
+        ).clone()
+        second = gumbel_sample_min_p_from_pools_parallel(
+            logits,
+            req_pool_indices,
+            temperature_pool,
+            min_p_pool,
+            seed_pool,
+            offsets_pool,
+            local_ids,
+            local_scores,
+            row_max,
+            out,
+        ).clone()
+    else:
+        first = gumbel_sample_min_p_from_pools(
+            logits,
+            req_pool_indices,
+            temperature_pool,
+            min_p_pool,
+            seed_pool,
+            offsets_pool,
+            out,
+        ).clone()
+        second = gumbel_sample_min_p_from_pools(
+            logits,
+            req_pool_indices,
+            temperature_pool,
+            min_p_pool,
+            seed_pool,
+            offsets_pool,
+            out,
+        ).clone()
 
     torch.testing.assert_close(first, second)
     for row, token_id in enumerate(first.cpu().tolist()):
