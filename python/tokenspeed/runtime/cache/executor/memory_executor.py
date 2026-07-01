@@ -45,6 +45,7 @@ from tokenspeed.runtime.cache.executor.storage_executor import StorageExecutor
 from tokenspeed.runtime.cache.kv_cache_host import (
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
+    get_available_host_memory_bytes,
 )
 from tokenspeed.runtime.cache.mamba_cache_host import MambaPoolHost
 from tokenspeed.runtime.cache.transfer.kv_pool import KVCachePool
@@ -63,6 +64,8 @@ class MemoryExecutorConfig:
     page_size: int = 64
     host_ratio: float = 2.0
     host_size_gb: int = 0
+    host_parallel_count: int = 1
+    host_reserve_gb: float = 10.0
     io_backend: str = "kernel"
     host_layout: str = "layer_first"
     storage_backend: Optional[str] = "mooncake"
@@ -72,6 +75,48 @@ class MemoryExecutorConfig:
     mamba_l2_host_slots: int = 0
     mamba_l2_layout: str = "layer_first"
     mamba_l2_io_backend: str = "kernel"
+
+
+def _aligned_token_count(size: int, page_size: int) -> int:
+    return (size // page_size + 1) * page_size
+
+
+def _pool_size_per_token(pool) -> int:
+    dtype_size = pool.store_dtype.itemsize
+    if isinstance(pool, MHATokenToKVPool):
+        return pool.head_dim * pool.head_num * pool.layer_num * dtype_size * 2
+    if MLATokenToKVPoolPaged is not None and isinstance(pool, MLATokenToKVPoolPaged):
+        return (pool.kv_lora_rank + pool.qk_rope_head_dim) * dtype_size * pool.layer_num
+    if isinstance(pool, MLATokenToKVPool):
+        return (pool.kv_lora_rank + pool.qk_rope_head_dim) * dtype_size * pool.layer_num
+    raise ValueError(f"Unsupported KV pool type for host budget: {type(pool)}")
+
+
+def _auto_capped_host_size_tokens(
+    *,
+    requested_tokens: int,
+    page_size: int,
+    size_per_token: int,
+    available_host_memory_bytes: int,
+    host_parallel_count: int,
+) -> int:
+    """Return a HostKVCache host_size_tokens override, or 0 when no cap is needed."""
+
+    aligned_requested_tokens = _aligned_token_count(requested_tokens, page_size)
+    requested_bytes = aligned_requested_tokens * size_per_token
+    per_rank_budget = available_host_memory_bytes // max(host_parallel_count, 1)
+    if requested_bytes <= per_rank_budget:
+        return 0
+
+    budget_tokens = per_rank_budget // max(size_per_token, 1)
+    max_aligned_tokens = (budget_tokens // page_size) * page_size
+    if max_aligned_tokens <= page_size:
+        raise ValueError(
+            "Not enough host memory available for KVStore after cgroup-aware "
+            f"budgeting: per-rank budget={per_rank_budget / 1e9:.2f} GB, "
+            f"size_per_token={size_per_token}."
+        )
+    return max_aligned_tokens - page_size
 
 
 class MemoryExecutor:
@@ -103,6 +148,62 @@ class MemoryExecutor:
         ):
             actual_pool = device_pool.inner
 
+        actual_draft_pool = None
+        if draft_device_pool is not None:
+            actual_draft_pool = draft_device_pool
+            if hasattr(draft_device_pool, "inner") and not isinstance(
+                draft_device_pool, (*_mha_types, *_mla_types)
+            ):
+                actual_draft_pool = draft_device_pool.inner
+            if not isinstance(actual_draft_pool, (*_mha_types, *_mla_types)):
+                raise ValueError(
+                    f"draft_device_pool only supports MHA and MLA, "
+                    f"got {type(actual_draft_pool)}"
+                )
+
+        host_size_tokens = 0
+        if config.host_size_gb == 0:
+            target_size_per_token = _pool_size_per_token(actual_pool)
+            draft_size_per_token = (
+                _pool_size_per_token(actual_draft_pool)
+                if actual_draft_pool is not None
+                else 0
+            )
+            combined_size_per_token = target_size_per_token + draft_size_per_token
+            reserve_bytes = int(config.host_reserve_gb * (1024**3))
+            available_bytes, _, cgroup_available = get_available_host_memory_bytes(
+                reserve_bytes
+            )
+            requested_tokens = int(actual_pool.size * config.host_ratio)
+            host_size_tokens = _auto_capped_host_size_tokens(
+                requested_tokens=requested_tokens,
+                page_size=config.page_size,
+                size_per_token=combined_size_per_token,
+                available_host_memory_bytes=available_bytes,
+                host_parallel_count=config.host_parallel_count,
+            )
+            if host_size_tokens > 0:
+                capped_tokens = _aligned_token_count(host_size_tokens, config.page_size)
+                requested_tokens_aligned = _aligned_token_count(
+                    requested_tokens, config.page_size
+                )
+                logger.warning(
+                    "Capping KVStore host pool for cgroup budget: "
+                    "tokens %s -> %s, total bytes %.2f GB -> %.2f GB "
+                    "(parallel_count=%s, available=%.2f GB, cgroup_available=%s)",
+                    requested_tokens_aligned,
+                    capped_tokens,
+                    requested_tokens_aligned * combined_size_per_token / 1e9,
+                    capped_tokens * combined_size_per_token / 1e9,
+                    config.host_parallel_count,
+                    available_bytes / 1e9,
+                    (
+                        f"{cgroup_available / 1e9:.2f} GB"
+                        if cgroup_available is not None
+                        else "unlimited"
+                    ),
+                )
+
         if isinstance(actual_pool, _mha_types):
             self.host_pool = MHATokenToKVPoolHost(
                 actual_pool,
@@ -110,6 +211,7 @@ class MemoryExecutor:
                 config.host_size_gb,
                 config.page_size,
                 config.host_layout,
+                host_size_tokens=host_size_tokens,
             )
         elif isinstance(actual_pool, _mla_types):
             self.host_pool = MLATokenToKVPoolHost(
@@ -118,6 +220,7 @@ class MemoryExecutor:
                 config.host_size_gb,
                 config.page_size,
                 config.host_layout,
+                host_size_tokens=host_size_tokens,
             )
         else:
             raise ValueError(
@@ -128,12 +231,7 @@ class MemoryExecutor:
         # Draft model L2 cache: draft shares the same page mapping as the base
         # model, so its host pool must hold exactly the same number of tokens.
         # Pass host_size_tokens directly to bypass ratio/GB recalculation.
-        if draft_device_pool is not None:
-            actual_draft_pool = draft_device_pool
-            if hasattr(draft_device_pool, "inner") and not isinstance(
-                draft_device_pool, (*_mha_types, *_mla_types)
-            ):
-                actual_draft_pool = draft_device_pool.inner
+        if actual_draft_pool is not None:
             if isinstance(actual_draft_pool, _mha_types):
                 self.draft_host_pool = MHATokenToKVPoolHost(
                     actual_draft_pool,

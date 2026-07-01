@@ -27,6 +27,7 @@
 import abc
 import threading
 from functools import wraps
+from pathlib import Path
 from typing import Optional
 
 import psutil
@@ -66,6 +67,55 @@ if _platform.is_amd:
 
 MLA_KVSTORE_LOADBACK_BLOCK_QUOTA = 16
 MLA_KVSTORE_WRITEBACK_BLOCK_QUOTA = 16
+
+
+def _read_cgroup_memory_value(path: Path) -> int | None:
+    try:
+        raw = path.read_text().strip()
+    except OSError:
+        return None
+    if not raw or raw == "max":
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    if value <= 0 or value >= (1 << 60):
+        return None
+    return value
+
+
+def get_cgroup_memory_limit_and_current() -> tuple[int, int] | None:
+    """Return the active cgroup memory limit/current bytes, if constrained."""
+
+    limit = _read_cgroup_memory_value(Path("/sys/fs/cgroup/memory.max"))
+    current = _read_cgroup_memory_value(Path("/sys/fs/cgroup/memory.current"))
+    if limit is None or current is None:
+        limit = _read_cgroup_memory_value(
+            Path("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+        )
+        current = _read_cgroup_memory_value(
+            Path("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+        )
+    if limit is None or current is None:
+        return None
+    host_total = psutil.virtual_memory().total
+    if limit >= host_total:
+        return None
+    return limit, current
+
+
+def get_available_host_memory_bytes(
+    reserve_bytes: int,
+) -> tuple[int, int, int | None]:
+    host_available = max(psutil.virtual_memory().available - reserve_bytes, 0)
+    cgroup_available = None
+    cgroup_info = get_cgroup_memory_limit_and_current()
+    if cgroup_info is not None:
+        limit, current = cgroup_info
+        cgroup_available = max(limit - current - reserve_bytes, 0)
+        return min(host_available, cgroup_available), host_available, cgroup_available
+    return host_available, host_available, None
 
 
 def synchronized(func):
@@ -114,11 +164,12 @@ class HostKVCache(abc.ABC):
             )
 
         # Verify there is enough available host memory.
-        host_mem = psutil.virtual_memory()
         requested_bytes = self.size * self.size_per_token
         # preserve at least 10GB for other usage
         ten_gb = 10 * (1024**3)
-        available_bytes = host_mem.available - ten_gb
+        available_bytes, host_available, cgroup_available = (
+            get_available_host_memory_bytes(ten_gb)
+        )
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory available. Requesting "
@@ -134,8 +185,13 @@ class HostKVCache(abc.ABC):
                 self.size_per_token,
                 host_to_device_ratio,
                 device_pool.size,
-                host_mem.available,
+                host_available,
             )
+            if cgroup_available is not None:
+                logger.info(
+                    "KVStore cgroup-aware available host memory: %.2f GB",
+                    cgroup_available / 1e9,
+                )
 
         self.kv_buffer = self.init_kv_buffer()
 
