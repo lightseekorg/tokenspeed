@@ -2,6 +2,7 @@
 requires = [
     "scikit-build-core>=0.9.5",
     "nanobind>=1.7.0",
+    "tokenspeed-spdlog==1.15.1",
     "cmake>=3.22",
     "ninja>=1.11",
 ]

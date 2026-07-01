@@ -11,14 +11,21 @@ option(TOKENSPEED_SCHEDULER_BUILD_PYTHON "Build Python bindings" OFF)
 option(TOKENSPEED_SCHEDULER_BUILD_TESTS "Build tests" OFF)
 
 include(FetchContent)
-FetchContent_Declare(
-    spdlog
-    GIT_REPOSITORY https://github.com/gabime/spdlog.git
-    GIT_TAG        v1.15.1
-)
-FetchContent_MakeAvailable(spdlog)
 
 find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
+execute_process(
+    COMMAND "${Python_EXECUTABLE}" -c "import tokenspeed_spdlog; print(tokenspeed_spdlog.cmake_prefix_path())"
+    OUTPUT_VARIABLE tokenspeed_spdlog_ROOT
+    ERROR_VARIABLE tokenspeed_spdlog_ERROR
+    RESULT_VARIABLE tokenspeed_spdlog_RESULT
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+if(NOT tokenspeed_spdlog_RESULT EQUAL 0)
+    message(FATAL_ERROR "tokenspeed-spdlog is required. Install it with `pip install tokenspeed-spdlog`. ${tokenspeed_spdlog_ERROR}")
+endif()
+list(PREPEND CMAKE_PREFIX_PATH "${tokenspeed_spdlog_ROOT}")
+find_package(spdlog CONFIG REQUIRED)
+
 execute_process(
     COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir
     OUTPUT_STRIP_TRAILING_WHITESPACE OUTPUT_VARIABLE nanobind_ROOT
