@@ -245,12 +245,20 @@ async def stop_profile(request: Request):
 # ---------------------------------------------------------------------------
 
 
+def _metrics_route_mounted(app: FastAPI) -> bool:
+    """Return True if the ``/metrics`` Prometheus route is already on ``app``."""
+    return any(
+        getattr(route, "path", "") == "/metrics" for route in app.routes
+    )
+
+
 def build_server(
     *,
     gateway_url: str,
     engine_grpc_addr: str,
     host: str = "127.0.0.1",
     port: int = 8001,
+    enable_metrics: bool = False,
 ) -> uvicorn.Server:
     """Configure the proxy targets and return an unstarted ``uvicorn.Server``.
 
@@ -262,10 +270,24 @@ def build_server(
         engine_grpc_addr: ``host:port`` of the gRPC engine for direct calls.
         host: Bind address.
         port: Bind port.
+        enable_metrics: Mount the ``/metrics`` Prometheus endpoint. The
+            caller must have set ``PROMETHEUS_MULTIPROC_DIR`` (via
+            ``set_prometheus_multiproc_dir``) before the engine subprocess
+            was spawned so the engine's metrics and this collector share
+            the same multiprocess directory.
     """
     global _gateway_url, _engine_grpc_addr
     _gateway_url = gateway_url
     _engine_grpc_addr = engine_grpc_addr
+
+    if enable_metrics and not _metrics_route_mounted(app):
+        from tokenspeed.runtime.metrics.func_timer import enable_func_timer
+        from tokenspeed.runtime.utils.common import add_prometheus_middleware
+
+        add_prometheus_middleware(app)
+        enable_func_timer()
+        logger.info("Prometheus /metrics endpoint mounted on control server")
+
     logger.info(
         "Starting TokenSpeed HTTP server on %s:%d " "(gateway: %s, engine gRPC: %s)",
         host,
@@ -284,6 +306,7 @@ def start(
     engine_grpc_addr: str,
     host: str = "127.0.0.1",
     port: int = 8001,
+    enable_metrics: bool = False,
 ) -> None:
     """Start the HTTP server (blocking)."""
     build_server(
@@ -291,4 +314,5 @@ def start(
         engine_grpc_addr=engine_grpc_addr,
         host=host,
         port=port,
+        enable_metrics=enable_metrics,
     ).run()

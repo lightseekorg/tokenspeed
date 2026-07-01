@@ -360,6 +360,7 @@ async def _start_control_server(
     host: str,
     port: int,
     timeout: float = 30.0,
+    enable_metrics: bool = False,
 ) -> bool:
     """Start the control HTTP server in a daemon thread and wait for it to bind.
 
@@ -367,6 +368,12 @@ async def _start_control_server(
     Returns True once the server is accepting connections, or False if it
     failed to bind (e.g. the port is already in use) or did not come up within
     ``timeout`` seconds. Non-fatal: the smg gateway runs independently.
+
+    When ``enable_metrics`` is set, the control server mounts the
+    ``/metrics`` Prometheus endpoint so runtime metrics (``tokenspeed:*``)
+    collected by the engine subprocess are scrapeable from the control port.
+    The caller must have set ``PROMETHEUS_MULTIPROC_DIR`` before spawning the
+    engine so the multiprocess collector aggregates the engine's metrics.
     """
     import threading
 
@@ -377,6 +384,7 @@ async def _start_control_server(
         engine_grpc_addr=engine_grpc_addr,
         host=host,
         port=port,
+        enable_metrics=enable_metrics,
     )
     thread = threading.Thread(target=server.run, daemon=True, name="ts-http-server")
     thread.start()
@@ -455,6 +463,7 @@ async def run_smg(
     opts: OrchestratorOpts,
     user_host: str,
     user_port: int,
+    enable_metrics: bool = False,
     _stop_event: asyncio.Event | None = None,
 ) -> int:
     """Lifecycle loop. Returns the orchestrator's exit code."""
@@ -472,6 +481,16 @@ async def run_smg(
             loop.add_signal_handler(sig, stop.set)
         except NotImplementedError:
             pass  # Windows: signal handlers via asyncio aren't supported. Out of scope.
+
+    # Set up the Prometheus multiprocess directory before spawning the engine
+    # subprocess. The engine (running in a child process) and the control
+    # server (running in this process) must share the same
+    # PROMETHEUS_MULTIPROC_DIR so the MultiProcessCollector on the control
+    # server aggregates the engine's metrics into the /metrics scrape.
+    if enable_metrics:
+        from tokenspeed.runtime.utils.common import set_prometheus_multiproc_dir
+
+        set_prometheus_multiproc_dir()
 
     try:
         engine_port = get_free_port()
@@ -515,6 +534,7 @@ async def run_smg(
             engine_grpc_addr=f"127.0.0.1:{engine_port}",
             host=user_host,
             port=control_port,
+            enable_metrics=enable_metrics,
         )
         if control_ok:
             sys.stdout.write(
@@ -584,6 +604,29 @@ async def run_smg(
                     pass
 
 
+def _raw_argv_enable_metrics(raw_argv: list[str]) -> bool:
+    """Return True if ``--enable-metrics`` is present in the raw argv.
+
+    ``--enable-metrics`` is a ``store_true`` flag: it takes no value, so
+    ``--enable-metrics=false`` is not a valid form. We inspect the **raw**
+    argv (before ``split_argv`` normalization) because the splitter rewrites
+    ``--flag=value`` into ``['--flag', 'value']``, which would make the bare
+    ``--enable-metrics`` token match even when the user wrote
+    ``--enable-metrics=false`` — and would also leave a stray ``false`` token
+    that the engine's argparse rejects.
+
+    Only the bare ``--enable-metrics`` token (or ``--enable-metrics=1`` /
+    ``--enable-metrics=true``) enables metrics. ``--enable-metrics=false`` /
+    ``--enable-metrics=0`` explicitly disables it.
+    """
+    for token in raw_argv:
+        if token == "--enable-metrics":
+            return True
+        if token.startswith("--enable-metrics="):
+            return token.split("=", 1)[1].lower() in ("1", "true", "yes")
+    return False
+
+
 def run_smg_from_args(args: argparse.Namespace, raw_argv: list[str]) -> None:
     """Entry point called from cli/__main__.py for ``ts serve``."""
     try:
@@ -596,6 +639,9 @@ def run_smg_from_args(args: argparse.Namespace, raw_argv: list[str]) -> None:
     print_logo()
 
     _check_serve_extra_installed()
+    # Detect --enable-metrics from the raw argv BEFORE split_argv normalizes
+    # --flag=value forms. See _raw_argv_enable_metrics docstring for why.
+    enable_metrics = _raw_argv_enable_metrics(raw_argv)
     split = split_argv(raw_argv)
     engine_args, gateway_args = _args_with_default_model_parsers(
         split.engine, split.gateway
@@ -613,6 +659,7 @@ def run_smg_from_args(args: argparse.Namespace, raw_argv: list[str]) -> None:
             opts=split.opts,
             user_host=user_host,
             user_port=user_port,
+            enable_metrics=enable_metrics,
         )
     )
     sys.exit(rc)

@@ -49,6 +49,7 @@ from tokenspeed.cli.serve_smg import (
     _gateway_args_with_smg_disable_defaults,
     _is_deepseek_v4_model,
     _prewarm_hf_tokenizer,
+    _raw_argv_enable_metrics,
     _user_host_port_from_gateway_args,
     _user_model_id,
     run_smg,
@@ -369,6 +370,44 @@ def test_prewarm_swallows_download_errors():
     ):
         # Must not raise — smg's own retry path is the fallback.
         _prewarm_hf_tokenizer("nvidia/Qwen3.5-397B-A17B-NVFP4")
+
+
+def test_raw_argv_enable_metrics_detects_bare_flag():
+    assert _raw_argv_enable_metrics(["--enable-metrics"]) is True
+
+
+def test_raw_argv_enable_metrics_detects_equals_true():
+    assert _raw_argv_enable_metrics(["--enable-metrics=true"]) is True
+    assert _raw_argv_enable_metrics(["--enable-metrics=1"]) is True
+    assert _raw_argv_enable_metrics(["--enable-metrics=yes"]) is True
+
+
+def test_raw_argv_enable_metrics_rejects_equals_false():
+    """--enable-metrics=false must NOT enable metrics.
+
+    This is the key regression guard: split_argv normalizes --flag=value into
+    ['--flag', 'value'], so detecting from the raw argv (before normalization)
+    is required to avoid the bare-token match returning True for =false.
+    """
+    assert _raw_argv_enable_metrics(["--enable-metrics=false"]) is False
+    assert _raw_argv_enable_metrics(["--enable-metrics=0"]) is False
+
+
+def test_raw_argv_enable_metrics_absent_returns_false():
+    assert _raw_argv_enable_metrics(["--model", "/tmp/x"]) is False
+    assert _raw_argv_enable_metrics([]) is False
+
+
+def test_raw_argv_enable_metrics_among_other_flags():
+    args = ["--model", "/tmp/x", "--enable-metrics", "--tensor-parallel-size", "4"]
+    assert _raw_argv_enable_metrics(args) is True
+
+
+def test_raw_argv_enable_metrics_with_positional_model():
+    """The raw argv may contain a leading positional model before split_argv
+    rewrites it to --model. Detection must still work."""
+    assert _raw_argv_enable_metrics(["/model", "--enable-metrics"]) is True
+    assert _raw_argv_enable_metrics(["/model", "--enable-metrics=false"]) is False
 
 
 @pytest.mark.asyncio

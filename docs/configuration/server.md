@@ -144,8 +144,9 @@ draft model, and token count together.
 | `--enable-log-requests` | Log request metadata and optionally payloads. |
 | `--log-requests-level` | Request logging verbosity. |
 | `--enable-log-request-stats` | Log a one-line per-request performance summary on finish/abort (see below). |
-| `--enable-metrics` | Enable metrics reporting. |
+| `--enable-metrics` | Enable Prometheus metrics reporting. Exposes the `/metrics` endpoint on the control server (port + 1). |
 | `--metrics-reporters` | Metrics reporter, such as `prometheus`. |
+| `--control-port` | Override the control server port (defaults to `--port + 1`). The control server hosts `/metrics`, `/health`, `/get_server_info`, and `/abort`. |
 | `--decode-log-interval` | Decode batch log interval. |
 | `--enable-cache-report` | Include cached-token counts in OpenAI-compatible usage details. |
 | `--kv-events-config` | JSON config for KV cache mutation events. Set `enable_kv_cache_events` and a publisher such as `zmq` to publish device prefix-cache stores and removals. |
@@ -176,6 +177,47 @@ Req: chatcmpl-019ef6b7 Finish! RequestStats(status='finished', reason='stop', pr
 | `decode_tps` | Decode throughput (generated tokens / decode window). |
 | `acc_len` / `acc_rate` | Spec-decode acceptance length and rate (`None` when speculative decoding is off). |
 | `recv_ts` / `commit_ts` / `finish_ts` | Absolute epoch timestamps for received / scheduled / finished. |
+
+### Prometheus Metrics
+
+When `--enable-metrics` is set, TokenSpeed exposes a Prometheus-compatible
+`/metrics` endpoint on the **control server**, which runs on `--port + 1`
+(or the value of `--control-port`).
+
+```bash
+tokenspeed serve nvidia/Kimi-K2.5-NVFP4 \
+  --port 8000 \
+  --enable-metrics \
+  --tensor-parallel-size 4
+```
+
+Scrape the runtime metrics from the control port:
+
+```bash
+curl http://localhost:8001/metrics
+```
+
+The SMG gateway has a separate Prometheus exporter on port `8413`
+(overridable via `--prometheus-port`) for gateway-level metrics.
+
+Example `prometheus.yml` scrape config:
+
+```yaml
+scrape_configs:
+  - job_name: 'tokenspeed-runtime'
+    static_configs:
+      - targets: ['<host>:8001']  # control port = serve port + 1
+    metrics_path: /metrics
+
+  - job_name: 'tokenspeed-gateway'
+    static_configs:
+      - targets: ['<host>:8413']  # SMG prometheus port
+    metrics_path: /metrics
+```
+
+Runtime metrics use the `tokenspeed:` prefix (e.g.
+`tokenspeed:time_to_first_token_seconds`, `tokenspeed:kv_cache_usage_perc`,
+`tokenspeed:num_requests_running`).
 
 ### KV Cache Events
 
