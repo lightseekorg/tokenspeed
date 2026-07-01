@@ -30,6 +30,7 @@ from tokenspeed_kernel_amd._triton import gl, gluon
 from tokenspeed_kernel_amd.ops.attention.gluon.utils import (
     _INV_LN2,
     _INV_LN2_VALUE,
+    _LN2,
     InputStrides,
     max,
     maximum,
@@ -419,7 +420,10 @@ class AttentionProgram:
             )
             mask = offs_m < self.seq_len
             lse_l_i = gl.where(l_i > 0.0, l_i, 1.0)
-            lse = m_i * cfg.SM_SCALE + gl.log2(lse_l_i)
+            # Softmax runs in base-2 (exp2 hardware fast path), so m_i*SM_SCALE +
+            # log2(l_i) is the LSE in base-2 units. Convert to natural log (the
+            # public op contract / torch.logsumexp convention) by scaling by ln2.
+            lse = (m_i * cfg.SM_SCALE + gl.log2(lse_l_i)) * _LN2
             cdna4.buffer_store(lse, self.lse_ptr, offsets, mask=mask)
 
 

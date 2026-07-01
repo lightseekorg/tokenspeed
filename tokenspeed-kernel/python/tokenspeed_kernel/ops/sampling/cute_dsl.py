@@ -331,8 +331,8 @@ def _argmax_cute(
     """CuTe DSL fast path for argmax.
 
     Falls back per-call to :func:`_argmax_torch_fallback` when the input
-    isn't kernel-eligible (1D / non-CUDA / unsupported dtype / small N /
-    unaligned N). Only ever bound to the public ``argmax`` name on NVIDIA
+    isn't kernel-eligible (1D / empty rows / non-CUDA / unsupported dtype /
+    small N / unaligned N). Only ever bound to the public ``argmax`` name on NVIDIA
     hosts with the cute DSL Python packages available — see the module-level
     dispatch below.
     """
@@ -341,6 +341,7 @@ def _argmax_cute(
 
     if (
         logits.dim() != 2
+        or logits.shape[0] == 0
         or not logits.is_cuda
         or not _supports_cute(logits.shape[1], logits.dtype)
     ):
