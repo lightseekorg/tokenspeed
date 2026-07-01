@@ -306,6 +306,31 @@ KERNEL_GROUPS = [
         ],
         [],
     ),
+    # TODO: Import these kernels from tokenspeed_trtllm_kernel once they are
+    # exposed there, instead of building this standalone vendored extension.
+    (
+        "trtllm_deepseek_v4_indexer_q",
+        [
+            CUDA_CSRC_DIR / "trtllm_deepseek_v4_indexer_q.cu",
+        ],
+        [],
+        # TRT-LLM's fusedCat contract requires IEEE division for bit-exact
+        # DeepGEMM parity. Override TokenSpeed's global fast-math expansion for
+        # this separately built vendored source without changing other groups.
+        ["--ftz=false", "--prec-div=true", "--prec-sqrt=true"],
+    ),
+    # TODO: Import this kernel from tokenspeed_trtllm_kernel instead of
+    # compiling this standalone adapter once the project pin moves beyond
+    # 1.2.1 and exposes this op with per-call PDL control. Keeping it separate
+    # for now avoids coupling this change to the full third-party package
+    # upgrade and its load-order changes.
+    (
+        "trtllm_fp8_quant_packed",
+        [
+            CUDA_CSRC_DIR / "trtllm_fp8_quant_packed.cu",
+        ],
+        [],
+    ),
     (
         "dsv3_gemm",
         [

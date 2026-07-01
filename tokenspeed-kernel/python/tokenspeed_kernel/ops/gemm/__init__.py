@@ -154,6 +154,7 @@ def _online_quantize_mxfp8(
     A: torch.Tensor,
     block_size: list[int],
     kernel_name: str,
+    enable_pdl: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Perform online activation quantization for mxfp8 block-scaled GEMM.
 
@@ -199,6 +200,7 @@ def _online_quantize_mxfp8(
             column_major_scales=True,
             scale_tma_aligned=True,
             scale_ue8m0=_platform.is_blackwell_plus,
+            enable_pdl=enable_pdl,
         )
     elif kernel_name == "flashinfer_mm_fp8_blockscale":
         from tokenspeed_kernel.ops.gemm.fp8_utils import (
@@ -267,6 +269,8 @@ def mm(
         quant: Explicit quant type override.  One of ``"mxfp8"``,
             ``"fp8"``, ``"nvfp4"``, ``"mxfp4"``, ``"none"``.
             If ``None``, inferred from input dtypes and scales.
+        enable_pdl: Whether online quantization and the selected GEMM may use
+            Programmatic Dependent Launch.
         override: Force selection of a specific kernel by name (e.g.
             ``"cublaslt_mm_nvfp4"``). Bypasses heuristic scoring.
         expected_kernel_name: Debug hint for expected kernel selection.
@@ -308,7 +312,12 @@ def mm(
         assert (
             block_size is not None
         ), "block_size is required for online activation quantization"
-        A, A_scales = _online_quantize_mxfp8(A, block_size, kernel.name)
+        A, A_scales = _online_quantize_mxfp8(
+            A,
+            block_size,
+            kernel.name,
+            enable_pdl=enable_pdl,
+        )
 
     kernel_args = (A, B, A_scales, B_scales, out_dtype)
     kernel_kwargs: dict[str, object] = {"alpha": alpha, "block_size": block_size}
