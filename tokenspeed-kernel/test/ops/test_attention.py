@@ -103,6 +103,67 @@ def test_mha_prefill(
 
 @pytest.mark.parametrize(
     "dtype,head_dim,num_q_heads,num_kv_heads",
+    [(torch.bfloat16, 64, 8, 2)],
+)
+@pytest.mark.parametrize("solution", ["triton", "gluon"])
+def test_mha_prefill_lse(
+    device: str,
+    solution: str,
+    dtype: torch.dtype,
+    head_dim: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    require,
+) -> None:
+    require("attention", "mha_prefill", solution, dtype, "q")
+
+    seqlens_list = [851, 914, 1053]
+    max_seqlen = max(seqlens_list)
+    cu_seqlens_cpu = [0]
+    for seqlen in seqlens_list:
+        cu_seqlens_cpu.append(cu_seqlens_cpu[-1] + seqlen)
+    cu_seqlens = torch.tensor(cu_seqlens_cpu, device=device, dtype=torch.int32)
+    total_tokens = cu_seqlens_cpu[-1]
+
+    q = _randn((total_tokens, num_q_heads, head_dim), device=device, dtype=dtype)
+    k = _randn((total_tokens, num_kv_heads, head_dim), device=device, dtype=dtype)
+    v = _randn((total_tokens, num_kv_heads, head_dim), device=device, dtype=dtype)
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    group = num_q_heads // num_kv_heads
+
+    out, lse = mha_prefill(
+        q=q,
+        k=k,
+        v=v,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens_cpu,
+        max_seqlen=max_seqlen,
+        return_lse=True,
+        solution=solution,
+    )
+
+    assert out.shape == q.shape
+    assert lse.shape == (total_tokens, num_q_heads)
+
+    # Reference: natural-log log-sum-exp over a causal MHA prefill.
+    ref_lses = []
+    for start, end in zip(cu_seqlens_cpu[:-1], cu_seqlens_cpu[1:]):
+        q_i = q[start:end].float()
+        k_i = k[start:end].float()
+        k_exp = k_i.repeat_interleave(group, dim=1)
+        seq_len = end - start
+        scores = torch.einsum("qhd,khd->hqk", q_i, k_exp) * sm_scale
+        pos = torch.arange(seq_len, device=device)
+        causal = pos[:, None] >= pos[None, :]
+        scores = scores.masked_fill(~causal[None, :, :], float("-inf"))
+        ref_lses.append(torch.logsumexp(scores, dim=-1).transpose(0, 1))
+    lse_ref = torch.cat(ref_lses, dim=0)
+
+    torch.testing.assert_close(lse, lse_ref, rtol=8e-2, atol=8e-2)
+
+
+@pytest.mark.parametrize(
+    "dtype,head_dim,num_q_heads,num_kv_heads",
     [
         pytest.param(torch.bfloat16, 64, 8, 2, id="bf16"),
         pytest.param(torch.float8_e4m3fn, 64, 8, 2, id="fp8"),
