@@ -28,7 +28,9 @@ from tokenspeed.runtime.cache.transfer.types import CacheKind
 
 
 class CachePool(Protocol):
-    kind: CacheKind
+    kind: CacheKind  # cache type (KV / Mamba)
+    is_draft: bool  # target vs draft model role
+    pool_id: str  # executor key, e.g. "kv", "kv.draft", "mamba"
     device: torch.device | str
     host_layout: str
 

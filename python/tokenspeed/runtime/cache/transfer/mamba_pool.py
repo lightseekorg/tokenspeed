@@ -32,6 +32,8 @@ from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
 
 class MambaCachePool:
     kind = CacheKind.MAMBA
+    is_draft = False
+    pool_id = "mamba"
 
     def __init__(
         self,
