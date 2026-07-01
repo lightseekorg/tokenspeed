@@ -68,27 +68,41 @@ def _prepare_deep_gemm_cuda_home() -> None:
 
 _prepare_deep_gemm_cuda_home()
 
-from deep_gemm import (
-    ceil_div,
-    ceil_to_ue8m0,
-    fp8_einsum,
-    fp8_fp4_mega_moe,
-    fp8_fp4_mqa_logits,
-    fp8_fp4_paged_mqa_logits,
-    fp8_gemm_nt,
-    fp8_mqa_logits,
-    fp8_paged_mqa_logits,
-    get_mn_major_tma_aligned_tensor,
-    get_num_sms,
-    get_paged_mqa_logits_metadata,
-    get_symm_buffer_for_mega_moe,
-    m_grouped_fp8_gemm_nt_contiguous,
-    m_grouped_fp8_gemm_nt_masked,
-    set_num_sms,
-    tf32_hc_prenorm_gemm,
-    transform_sf_into_required_layout,
-    transform_weights_for_mega_moe,
+import deep_gemm as _deep_gemm
+
+_DEEP_GEMM_EXPORTS = (
+    "ceil_div",
+    "ceil_to_ue8m0",
+    "fp8_einsum",
+    "fp8_fp4_mega_moe",
+    "fp8_fp4_mqa_logits",
+    "fp8_fp4_paged_mqa_logits",
+    "fp8_gemm_nt",
+    "fp8_mqa_logits",
+    "fp8_paged_mqa_logits",
+    "get_mn_major_tma_aligned_tensor",
+    "get_num_sms",
+    "get_paged_mqa_logits_metadata",
+    "get_symm_buffer_for_mega_moe",
+    "m_grouped_fp8_gemm_nt_contiguous",
+    "m_grouped_fp8_gemm_nt_masked",
+    "set_num_sms",
+    "tf32_hc_prenorm_gemm",
+    "transform_sf_into_required_layout",
+    "transform_weights_for_mega_moe",
 )
+
+for _name in _DEEP_GEMM_EXPORTS:
+    if hasattr(_deep_gemm, _name):
+        globals()[_name] = getattr(_deep_gemm, _name)
+
+
+def __getattr__(name: str):
+    if name in _DEEP_GEMM_EXPORTS:
+        raise AttributeError(f"installed deep_gemm package does not provide {name!r}")
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 from tokenspeed_kernel.thirdparty.deep_gemm.warmup import (
     warmup_fp8_gemm_nt,
     warmup_fp8_gemm_nt_from_model,
@@ -97,24 +111,7 @@ from tokenspeed_kernel.thirdparty.deep_gemm.warmup import (
 )
 
 __all__ = [
-    "ceil_div",
-    "ceil_to_ue8m0",
-    "fp8_fp4_mega_moe",
-    "fp8_fp4_mqa_logits",
-    "fp8_fp4_paged_mqa_logits",
-    "fp8_einsum",
-    "fp8_gemm_nt",
-    "get_num_sms",
-    "get_symm_buffer_for_mega_moe",
-    "m_grouped_fp8_gemm_nt_contiguous",
-    "m_grouped_fp8_gemm_nt_masked",
-    "set_num_sms",
-    "tf32_hc_prenorm_gemm",
-    "transform_sf_into_required_layout",
-    "transform_weights_for_mega_moe",
-    "get_paged_mqa_logits_metadata",
-    "fp8_paged_mqa_logits",
-    "fp8_mqa_logits",
+    *[name for name in _DEEP_GEMM_EXPORTS if name in globals()],
     "warmup_fp8_gemm_nt",
     "warmup_fp8_gemm_nt_from_model",
     "warmup_mega_moe_jit",
