@@ -12,6 +12,7 @@ option(TOKENSPEED_SCHEDULER_BUILD_TESTS "Build tests" OFF)
 
 include(FetchContent)
 
+set(Python_FIND_VIRTUALENV FIRST)
 find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
 execute_process(
     COMMAND "${Python_EXECUTABLE}" -c "import tokenspeed_spdlog; print(tokenspeed_spdlog.cmake_prefix_path())"

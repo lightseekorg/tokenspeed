@@ -475,15 +475,6 @@ def setup_runner(
         cwd=cwd,
         dry_run=dry_run,
     )
-    shell_run(
-        "python3 -m pip install -q tokenspeed-spdlog==1.15.1 && "
-        "spdlog_include=$(python3 -c 'import tokenspeed_spdlog; print(tokenspeed_spdlog.include_dir())') && "
-        "sudo rm -rf /usr/local/include/spdlog && "
-        'sudo cp -r "${spdlog_include}/spdlog" /usr/local/include/',
-        env=local_env,
-        cwd=cwd,
-        dry_run=dry_run,
-    )
 
     # nvidia-cusparseLt is a CUDA-only dependency; skip on AMD/ROCm runners.
     if not is_amd_runner(runner):
