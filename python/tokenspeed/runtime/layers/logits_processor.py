@@ -546,8 +546,19 @@ class LogitsProcessor(nn.Module):
                 hidden_states, plan
             )
 
+        empty_hidden = hidden_states.shape[0] == 0
+        if empty_hidden and (self.skip_all_gather or self.tp_size == 1):
+            vocab_size = int(self.config.vocab_size)
+            if hasattr(lm_head, "weight"):
+                dtype = lm_head.weight.dtype
+                device = lm_head.weight.device
+            else:
+                dtype = hidden_states.dtype
+                device = hidden_states.device
+            return torch.empty((0, vocab_size), dtype=dtype, device=device)
+
         if hasattr(lm_head, "weight"):
-            if self._use_fused_lm_head:
+            if self._use_fused_lm_head and not empty_hidden:
                 logits = _lm_head_matmul(hidden_states, lm_head.weight)
             else:
                 logits = torch.matmul(

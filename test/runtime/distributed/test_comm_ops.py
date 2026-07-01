@@ -346,6 +346,125 @@ class TestFusionParams:
         assert params.norm_weight is weight
 
 
+class _FakeTokenBackend:
+
+    def __init__(self, name):
+        self.name = name
+        self.calls = []
+
+    def token_all_gather(self, tensor, group, scattered_num_tokens):
+        self.calls.append(("token_all_gather", group, scattered_num_tokens))
+        return f"{self.name}:token_all_gather"
+
+    def token_reduce_scatter(self, tensor, group, scattered_num_tokens):
+        self.calls.append(("token_reduce_scatter", group, scattered_num_tokens))
+        return f"{self.name}:token_reduce_scatter"
+
+    def precreate_state(self, group, hidden_size, max_num_tokens):
+        self.calls.append(("precreate_state", group, hidden_size, max_num_tokens))
+
+
+class TestAutoBackendRsagPrecreate:
+
+    def test_precreate_token_rsag_state_delegates_to_rsag(self):
+        from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
+
+        backend = AutoBackend()
+        backend._rsag = _FakeTokenBackend("rsag")
+
+        backend.precreate_token_rsag_state((0, 1, 2, 3), 128, 1024)
+
+        assert backend._rsag.calls == [("precreate_state", (0, 1, 2, 3), 128, 1024)]
+
+    def test_dense_rsag_precreate_only_for_attention_dp_supergroup(self, monkeypatch):
+        from tokenspeed.runtime.distributed.mapping import Mapping
+        from tokenspeed.runtime.execution.distributed_initializer import (
+            DistributedConfig,
+            DistributedInitializer,
+        )
+
+        calls = []
+
+        class FakeBackend:
+            def precreate_token_rsag_state(self, group, hidden_size, max_num_tokens):
+                calls.append((group, hidden_size, max_num_tokens))
+
+        monkeypatch.setattr(
+            "tokenspeed.runtime.execution.distributed_initializer.get_global_backend",
+            lambda: FakeBackend(),
+        )
+        mapping = Mapping(
+            rank=0,
+            world_size=8,
+            attn_tp_size=4,
+            attn_dp_size=2,
+            dense_tp_size=8,
+            moe_ep_size=8,
+        )
+        config = DistributedConfig(
+            device="cuda",
+            gpu_id=0,
+            world_size=8,
+            global_rank=0,
+            local_rank=0,
+            attn_tp_rank=0,
+            attn_tp_size=4,
+            dp_size=2,
+            dense_tp_size=8,
+            moe_ep_size=8,
+            moe_ep_rank=0,
+            nccl_port=12345,
+            hidden_size=7168,
+            max_num_tokens=8192,
+            mapping=mapping,
+        )
+
+        DistributedInitializer._precreate_dense_rsag_state(config)
+
+        assert calls == [(mapping.dense.tp_group, 7168, 16384)]
+
+    def test_dense_rsag_precreate_skips_without_attention_dp(self, monkeypatch):
+        from tokenspeed.runtime.distributed.mapping import Mapping
+        from tokenspeed.runtime.execution.distributed_initializer import (
+            DistributedConfig,
+            DistributedInitializer,
+        )
+
+        calls = []
+        monkeypatch.setattr(
+            "tokenspeed.runtime.execution.distributed_initializer.get_global_backend",
+            lambda: calls.append("called"),
+        )
+
+        mapping = Mapping(
+            rank=0,
+            world_size=4,
+            attn_tp_size=4,
+            dense_tp_size=4,
+            moe_ep_size=4,
+        )
+        config = DistributedConfig(
+            device="cuda",
+            gpu_id=0,
+            world_size=4,
+            global_rank=0,
+            local_rank=0,
+            attn_tp_rank=0,
+            attn_tp_size=4,
+            dp_size=1,
+            dense_tp_size=4,
+            moe_ep_size=4,
+            moe_ep_rank=0,
+            nccl_port=12345,
+            hidden_size=7168,
+            max_num_tokens=8192,
+            mapping=mapping,
+        )
+        DistributedInitializer._precreate_dense_rsag_state(config)
+
+        assert calls == []
+
+
 # ---------------------------------------------------------------------------
 # Multi-GPU test classes
 # ---------------------------------------------------------------------------

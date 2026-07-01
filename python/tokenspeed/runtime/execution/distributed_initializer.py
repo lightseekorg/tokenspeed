@@ -22,10 +22,12 @@ from dataclasses import dataclass
 
 import torch
 
+from tokenspeed.runtime.distributed.comm_backend import get_global_backend
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
 from tokenspeed.runtime.utils import (
+    ceil_div,
     get_available_gpu_memory,
     get_colorful_logger,
 )
@@ -161,6 +163,8 @@ class DistributedInitializer:
         pg_manager.init_process_group(config.mapping.dense.tp_group)
         pg_manager.init_process_group(config.mapping.moe.tp_ep_group)
 
+        DistributedInitializer._precreate_dense_rsag_state(config)
+
         logger.info(
             "Init comm buff end. Avail mem=%.4f GB",
             get_available_gpu_memory(config.device, config.gpu_id),
@@ -191,3 +195,37 @@ class DistributedInitializer:
                 )
 
         return min_per_gpu_memory
+
+    @staticmethod
+    def _precreate_dense_rsag_state(config: DistributedConfig) -> None:
+        mapping = config.mapping
+        if mapping is None or config.device != "cuda":
+            return
+        if not mapping.attn.has_dp or not mapping.dense.has_tp:
+            return
+        if mapping.dense.tp_size <= mapping.attn.tp_size:
+            return
+        if config.hidden_size <= 0 or config.max_num_tokens <= 0:
+            return
+
+        max_scattered_num_tokens = ceil_div(config.max_num_tokens, mapping.attn.tp_size)
+        max_gathered_num_tokens = max_scattered_num_tokens * max(
+            mapping.attn.tp_size,
+            mapping.dense.tp_size,
+            mapping.moe.tp_ep_size,
+        )
+        logger.info(
+            "Precreating dense RSAG state. group=%s hidden_size=%s "
+            "max_num_tokens=%s",
+            mapping.dense.tp_group,
+            config.hidden_size,
+            max_gathered_num_tokens,
+        )
+        backend = get_global_backend()
+        precreate = getattr(backend, "precreate_token_rsag_state", None)
+        if precreate is not None:
+            precreate(
+                mapping.dense.tp_group,
+                hidden_size=config.hidden_size,
+                max_num_tokens=max_gathered_num_tokens,
+            )

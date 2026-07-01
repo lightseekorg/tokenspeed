@@ -55,12 +55,15 @@ class TritonRSAGBackend:
         # (group_tuple, hidden_size) -> Triton RS/AG state
         self._instances = {}
 
-    def _get_or_create(self, group: Group, hidden_size: int):
+    def _get_or_create(
+        self, group: Group, hidden_size: int, max_num_tokens: int | None = None
+    ):
         key = (group, hidden_size)
         if key in self._instances:
             return self._instances[key]
 
-        max_num_tokens = self._get_max_num_gathered_tokens()
+        if max_num_tokens is None:
+            max_num_tokens = self._get_max_num_gathered_tokens()
         state = create_state(
             group=pg_manager.get_process_group("nccl", group),
             rank_in_group=group.index(dist.get_rank()),
@@ -69,6 +72,11 @@ class TritonRSAGBackend:
         )
         self._instances[key] = state
         return state
+
+    def precreate_state(
+        self, group: Group, hidden_size: int, max_num_tokens: int
+    ) -> None:
+        self._get_or_create(group, hidden_size, max_num_tokens=max_num_tokens)
 
     def all_gather(
         self,

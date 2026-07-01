@@ -90,6 +90,57 @@ def test_tp_logits_all_gather_handles_zero_rows(monkeypatch):
     assert tuple(output.next_token_logits.shape) == (0, 6)
 
 
+def test_empty_dp_local_hidden_returns_empty_logits_without_lm_head_launch(
+    monkeypatch,
+):
+    processor = LogitsProcessor(
+        SimpleNamespace(vocab_size=7, model_type="kimi_k2"),
+        skip_all_gather=True,
+        tp_rank=0,
+        tp_size=4,
+        tp_group=(0, 1, 2, 3),
+    )
+    hidden_states = torch.empty((0, 3), dtype=torch.float32)
+    lm_head = SimpleNamespace(weight=torch.empty((11, 3), dtype=torch.bfloat16))
+
+    def fail_on_fused_lookup():
+        raise AssertionError("empty local hidden must not launch fused lm_head")
+
+    monkeypatch.setattr(
+        logits_processor_module,
+        "_get_fused_lm_head_gemm",
+        fail_on_fused_lookup,
+    )
+
+    logits = processor._get_logits(
+        hidden_states,
+        lm_head,
+        LogitsMetadata(forward_mode=ForwardMode.DECODE),
+    )
+
+    assert logits.shape == (0, 7)
+    assert logits.dtype == torch.bfloat16
+
+
+def test_empty_hidden_single_tp_returns_empty_logits():
+    processor = LogitsProcessor(
+        SimpleNamespace(vocab_size=7, model_type="unit_test"),
+        tp_rank=0,
+        tp_size=1,
+    )
+    hidden_states = torch.empty((0, 3), dtype=torch.float32)
+    lm_head = SimpleNamespace(weight=torch.empty((11, 3), dtype=torch.float16))
+
+    logits = processor._get_logits(
+        hidden_states,
+        lm_head,
+        LogitsMetadata(forward_mode=ForwardMode.DECODE),
+    )
+
+    assert logits.shape == (0, 7)
+    assert logits.dtype == torch.float16
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_fused_softcap_handles_large_logits_without_nan():
     cap = 30.0

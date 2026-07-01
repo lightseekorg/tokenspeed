@@ -88,6 +88,11 @@ class AutoBackend(CommBackend):
     ) -> torch.Tensor:
         return self._rsag.token_reduce_scatter(tensor, group, scattered_num_tokens)
 
+    def precreate_token_rsag_state(
+        self, group: Group, hidden_size: int, max_num_tokens: int
+    ) -> None:
+        self._rsag.precreate_state(group, hidden_size, max_num_tokens)
+
     # ---- Public CommBackend interface ----
 
     def all_reduce(self, tensor: torch.Tensor, group: Group, op=None) -> torch.Tensor:
