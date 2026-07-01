@@ -341,6 +341,13 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                 return op.paged_cache_block_table_base_offsets;
             },
             nb::rv_policy::reference_internal)
+        .def_prop_ro(
+            "flat_block_tables",
+            [](const tokenspeed::FlatForwardOperation& op)
+                -> const std::map<std::string, std::vector<std::vector<std::int32_t>>>& {
+                return op.flat_block_tables;
+            },
+            nb::rv_policy::reference_internal)
         .def("num_extends", &tokenspeed::FlatForwardOperation::num_extends)
         .def_ro("mamba_pool_indices", &tokenspeed::FlatForwardOperation::mamba_working_indices)
         .def_ro("mamba_checkpoint_dst_indices", &tokenspeed::FlatForwardOperation::mamba_checkpoint_dst_indices)

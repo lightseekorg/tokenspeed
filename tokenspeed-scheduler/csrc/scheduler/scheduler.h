@@ -25,6 +25,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -47,6 +48,12 @@
 #include "fsm/forward_events.h"
 #include "fsm/cache_events.h"
 #include "fsm/pd_events.h"
+
+#if TOKENSPEED_FLAT_KVCACHE
+#include "cache/block_pool.h"
+#include "cache/kv_cache_coordinator.h"
+#include "cache/forward_cache_ops.h"
+#endif
 namespace tokenspeed {
 
 class Scheduler {
@@ -76,6 +83,10 @@ public:
                                                           const std::string& group_id) const;
     // Compact-view base logical-page offset; 0 for full-history / unseen.
     std::int32_t GetRequestPagedCacheBaseLogicalPage(const std::string& request_id, const std::string& group_id) const;
+#if TOKENSPEED_FLAT_KVCACHE
+    // Free physical pages in the flat shared BlockPool (flat path only).
+    std::int32_t FlatPoolFreeBlocks() const { return block_pool_.NumFreeBlocks(); }
+#endif
 
 private:
     // Second element is LoadBackOperation list (normal path) or WriteBackOperation list (retract triggered).
@@ -127,6 +138,16 @@ private:
         return it != requests_.end() ? it->second.get() : nullptr;
     }
 
+    // Group-id list for flat KV-cache ops; empty span on the radix path so call
+    // sites stay #if-free.
+    std::span<const std::string> FlatGroupIds() const {
+#if TOKENSPEED_FLAT_KVCACHE
+        return flat_group_ids_;
+#else
+        return {};
+#endif
+    }
+
 private:
     SchedulerConfig config_;
 
@@ -138,6 +159,12 @@ private:
     KVPrefixCache kv_prefix_cache_;
     ReqPoolAllocator req_pool_allocator_;
     std::optional<HybridPrefixCache> hybrid_prefix_cache_{};
+
+#if TOKENSPEED_FLAT_KVCACHE
+    BlockPool block_pool_;
+    KvCacheCoordinator coordinator_;
+    std::vector<std::string> flat_group_ids_;  // group_id per cache group, index-aligned to coordinator groups
+#endif
 
 private:
     std::unordered_map<std::string, std::unique_ptr<Request>> requests_;

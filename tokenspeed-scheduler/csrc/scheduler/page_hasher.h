@@ -20,6 +20,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <span>
 #include <string>
@@ -29,17 +30,38 @@
 
 namespace tokenspeed {
 
-inline std::string DigestToHex(const unsigned char* digest) {
+// Helper Func: Append each byte of [bytes, bytes+n) to out as two lowercase hex
+// characters.
+inline void AppendHexBytes(std::string& out, const uint8_t* bytes, std::size_t n) {
     static constexpr char kHex[] = "0123456789abcdef";
+    for (std::size_t i = 0; i < n; ++i) {
+        out.push_back(kHex[bytes[i] >> 4]);
+        out.push_back(kHex[bytes[i] & 0xf]);
+    }
+}
+
+// Helper Func: Absorb a uint32_t into the hash as 4 little-endian bytes. Used
+// both to encode each token id and to count/length-prefix the extra_keys framing.
+inline void Sha256UpdateU32LE(SHA256_CTX& ctx, uint32_t v) {
+    uint8_t buf[4] = {
+        static_cast<uint8_t>(v),
+        static_cast<uint8_t>(v >> 8),
+        static_cast<uint8_t>(v >> 16),
+        static_cast<uint8_t>(v >> 24),
+    };
+    SHA256_Update(&ctx, buf, 4);
+}
+
+// Helper Func: Encode a 32-byte SHA-256 digest as a 64-char lowercase hex string.
+inline std::string DigestToHex(const unsigned char* digest) {
     std::string out;
     out.reserve(SHA256_DIGEST_LENGTH * 2);
-    for (int i = 0; i < SHA256_DIGEST_LENGTH; ++i) {
-        out.push_back(kHex[digest[i] >> 4]);
-        out.push_back(kHex[digest[i] & 0xf]);
-    }
+    AppendHexBytes(out, digest, SHA256_DIGEST_LENGTH);
     return out;
 }
 
+// Helper Func: Decode a hex string back into its raw bytes (inverse of
+// DigestToHex).
 inline std::vector<uint8_t> HexToBytes(const std::string& hex) {
     std::vector<uint8_t> bytes;
     bytes.reserve(hex.size() / 2);
@@ -55,24 +77,42 @@ inline std::vector<uint8_t> HexToBytes(const std::string& hex) {
     return bytes;
 }
 
-inline std::string HashPage(std::span<const std::int32_t> tokens, const std::string& prior_hash) {
+// extra_keys: per-page list of distinguishing keys (e.g. LoRA name, cache salt).
+// The caller decides which keys a page carries and how to encode each
+// individual value; this function owns only the framing.
+//
+// The whole input is prefix-framed -- [prior_len][prior][token_count][tokens]
+// [extra_count][extra...] -- so every section is self-delimiting and no two
+// distinct (prior, tokens, extra_keys) triples can hash the same byte stream:
+//   - prior_len distinguishes an empty prior (page 0) from a chained page whose
+//     leading tokens happen to reproduce a 32-byte digest;
+//   - token_count keeps the token block from bleeding into the extra_keys frame;
+//   - per-key length prefixes keep any two keys from being re-split ambiguously.
+// Feed order is prior_hash -> tokens -> extra_keys.
+inline std::string HashPage(std::span<const std::int32_t> tokens, const std::string& prior_hash,
+                            std::span<const std::string> extra_keys = {}) {
     SHA256_CTX ctx;
     SHA256_Init(&ctx);
 
-    if (!prior_hash.empty()) {
-        std::vector<uint8_t> prior_bytes = HexToBytes(prior_hash);
+    std::vector<uint8_t> prior_bytes = HexToBytes(prior_hash);
+    Sha256UpdateU32LE(ctx, static_cast<uint32_t>(prior_bytes.size()));
+    if (!prior_bytes.empty()) {
         SHA256_Update(&ctx, prior_bytes.data(), prior_bytes.size());
     }
 
+    Sha256UpdateU32LE(ctx, static_cast<uint32_t>(tokens.size()));
     for (std::int32_t t : tokens) {
-        uint32_t le = static_cast<uint32_t>(t);
-        uint8_t buf[4] = {
-            static_cast<uint8_t>(le),
-            static_cast<uint8_t>(le >> 8),
-            static_cast<uint8_t>(le >> 16),
-            static_cast<uint8_t>(le >> 24),
-        };
-        SHA256_Update(&ctx, buf, 4);
+        Sha256UpdateU32LE(ctx, static_cast<uint32_t>(t));
+    }
+
+    // extra_keys is the terminal block, so an empty list can be skipped without
+    // ambiguity (a non-empty list always writes a count >= 1 first).
+    if (!extra_keys.empty()) {
+        Sha256UpdateU32LE(ctx, static_cast<uint32_t>(extra_keys.size()));
+        for (const std::string& key : extra_keys) {
+            Sha256UpdateU32LE(ctx, static_cast<uint32_t>(key.size()));
+            SHA256_Update(&ctx, key.data(), key.size());
+        }
     }
 
     unsigned char digest[SHA256_DIGEST_LENGTH];
@@ -80,17 +120,73 @@ inline std::string HashPage(std::span<const std::int32_t> tokens, const std::str
     return DigestToHex(digest);
 }
 
-inline std::vector<std::string> ComputePagedHashes(const std::vector<std::span<const std::int32_t>>& token_pages,
-                                                   const std::string& prior) {
+inline std::vector<std::string> ComputePagedHashes(
+    const std::vector<std::span<const std::int32_t>>& paged_tokens, const std::string& prior,
+    const std::vector<std::span<const std::string>>& extra_keys_per_page = {}) {
     std::vector<std::string> hashes;
-    hashes.reserve(token_pages.size());
+    hashes.reserve(paged_tokens.size());
     std::string current_prior = prior;
-    for (const auto& page : token_pages) {
-        std::string h = HashPage(page, current_prior);
+    for (std::size_t i = 0; i < paged_tokens.size(); ++i) {
+        std::span<const std::string> extra =
+            (i < extra_keys_per_page.size()) ? extra_keys_per_page[i] : std::span<const std::string>{};
+        std::string h = HashPage(paged_tokens[i], current_prior, extra);
         hashes.push_back(h);
         current_prior = h;
     }
     return hashes;
+}
+
+// ---- group_id packing / unpacking ----
+// cache group_id is NOT mixed into the SHA stream: it is not part of the page
+// content, it is the label for "which KV cache group this content belongs to".
+// We compute the content hash first, then wrap the group_id around the result
+// to form the lookup key. The group_id is a 4-byte big-endian value appended
+// as 8 hex characters (64-hex content hash -> 72-hex key).
+inline constexpr std::size_t kGroupIdHexLen = 8;  // 4-byte group_id as hex
+
+inline std::string MakeKeyWithGroupId(const std::string& block_hash, uint32_t group_id) {
+    std::string key = block_hash;
+    uint8_t b[4] = {
+        static_cast<uint8_t>(group_id >> 24),
+        static_cast<uint8_t>(group_id >> 16),
+        static_cast<uint8_t>(group_id >> 8),
+        static_cast<uint8_t>(group_id),
+    };
+    AppendHexBytes(key, b, 4);
+    return key;
+}
+
+// Recover the content hash (strip the trailing group_id hex characters).
+inline std::string GetBlockHashFromKey(const std::string& key) {
+    if (key.size() < kGroupIdHexLen) {
+        return {};
+    }
+    return key.substr(0, key.size() - kGroupIdHexLen);
+}
+
+// Recover the group_id (trailing group_id hex characters -> 4-byte big-endian).
+inline uint32_t GetGroupIdFromHashKey(const std::string& key) {
+    if (key.size() < kGroupIdHexLen) {
+        return 0;
+    }
+    std::vector<uint8_t> b = HexToBytes(key.substr(key.size() - kGroupIdHexLen));
+    return (static_cast<uint32_t>(b[0]) << 24) | (static_cast<uint32_t>(b[1]) << 16) |
+           (static_cast<uint32_t>(b[2]) << 8) | static_cast<uint32_t>(b[3]);
+}
+
+// Convenience wrapper: compute the content hashes once, then wrap each page's
+// hash with the given group_id. The content hash is independent of the group,
+// so multiple groups reuse the same content hashing work instead of re-running
+// SHA. The chain still links on the bare content hash (via ComputePagedHashes),
+// so group_id never leaks into the prefix chain.
+inline std::vector<std::string> ComputePagedHashesWithGroup(
+    const std::vector<std::span<const std::int32_t>>& paged_tokens, const std::string& prior, uint32_t group_id,
+    const std::vector<std::span<const std::string>>& extra_keys_per_page = {}) {
+    std::vector<std::string> keys = ComputePagedHashes(paged_tokens, prior, extra_keys_per_page);
+    for (std::string& k : keys) {
+        k = MakeKeyWithGroupId(k, group_id);
+    }
+    return keys;
 }
 
 }  // namespace tokenspeed

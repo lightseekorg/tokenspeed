@@ -41,6 +41,10 @@
 #include "resource/allocator/local_mamba_allocator.h"
 #include "utils.h"
 
+#if TOKENSPEED_FLAT_KVCACHE
+#include "cache/kv_cache_coordinator.h"
+#endif
+
 namespace tokenspeed {
 class PageAllocator;
 class KVPrefixCache;
@@ -67,7 +71,12 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
                                    bool disable_l2_cache, std::vector<TreeNode*> loadback_diff,
                                    HybridPrefixCache* hybrid_prefix_cache = nullptr,
                                    MambaChunkAllocator* mamba_allocator = nullptr,
-                                   std::vector<TreeNode*> mamba_loadback_nodes = {})
+                                   std::vector<TreeNode*> mamba_loadback_nodes = {}
+#if TOKENSPEED_FLAT_KVCACHE
+                                   ,
+                                   KvCacheCoordinator* coordinator = nullptr
+#endif
+                                   )
         : tokens_this_round_(tokens_this_round),
           decode_input_tokens_(decode_input_tokens),
           device_allocator_(device_allocator),
@@ -79,7 +88,12 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
           mamba_loadback_nodes_(std::move(mamba_loadback_nodes)),
           kv_prefix_cache_(kv_prefix_cache),
           hybrid_prefix_cache_(hybrid_prefix_cache),
-          mamba_allocator_(mamba_allocator) {}
+          mamba_allocator_(mamba_allocator)
+#if TOKENSPEED_FLAT_KVCACHE
+          ,
+          coordinator_(coordinator)
+#endif
+    {}
 
     // Returns PrefillDone (single-chunk or last chunk) or Prefilling (more chunks remain).
     std::variant<PrefillDone, Prefilling> operator()(Submitted&& state);
@@ -102,15 +116,28 @@ private:
     KVPrefixCache* kv_prefix_cache_;
     HybridPrefixCache* hybrid_prefix_cache_{};
     MambaChunkAllocator* mamba_allocator_{};
+#if TOKENSPEED_FLAT_KVCACHE
+    KvCacheCoordinator* coordinator_{};
+#endif
 };
 
 struct SchedulePrefillEvent : InvalidTransitionHandler<SchedulePrefillEvent> {
     using InvalidTransitionHandler<SchedulePrefillEvent>::operator();
     SchedulePrefillEvent(std::int32_t tokens_this_round, std::int32_t reserve_num_tokens_in_next_schedule_event,
-                         HybridPrefixCache* hybrid_prefix_cache = nullptr)
+                         HybridPrefixCache* hybrid_prefix_cache = nullptr
+#if TOKENSPEED_FLAT_KVCACHE
+                         ,
+                         KvCacheCoordinator* coordinator = nullptr
+#endif
+                         )
         : tokens_this_round_(tokens_this_round),
           reserve_num_tokens_in_next_schedule_event_(reserve_num_tokens_in_next_schedule_event),
-          hybrid_prefix_cache_(hybrid_prefix_cache) {}
+          hybrid_prefix_cache_(hybrid_prefix_cache)
+#if TOKENSPEED_FLAT_KVCACHE
+          ,
+          coordinator_(coordinator)
+#endif
+    {}
 
     // Returns PrefillDone (last chunk) or Prefilling (more chunks remain).
     std::variant<PrefillDone, Prefilling> operator()(Prefilling&& state);
@@ -119,13 +146,26 @@ private:
     std::int32_t tokens_this_round_{};
     std::int32_t reserve_num_tokens_in_next_schedule_event_{};
     HybridPrefixCache* hybrid_prefix_cache_{};
+#if TOKENSPEED_FLAT_KVCACHE
+    KvCacheCoordinator* coordinator_{};
+#endif
 };
 
 struct ScheduleDecodeEvent : InvalidTransitionHandler<ScheduleDecodeEvent> {
     using InvalidTransitionHandler<ScheduleDecodeEvent>::operator();
 
-    ScheduleDecodeEvent(std::int32_t decode_input_tokens, HybridPrefixCache* hybrid_prefix_cache = nullptr)
-        : decode_input_tokens_(decode_input_tokens), hybrid_prefix_cache_(hybrid_prefix_cache) {}
+    ScheduleDecodeEvent(std::int32_t decode_input_tokens, HybridPrefixCache* hybrid_prefix_cache = nullptr
+#if TOKENSPEED_FLAT_KVCACHE
+                        ,
+                        KvCacheCoordinator* coordinator = nullptr
+#endif
+                        )
+        : decode_input_tokens_(decode_input_tokens), hybrid_prefix_cache_(hybrid_prefix_cache)
+#if TOKENSPEED_FLAT_KVCACHE
+          ,
+          coordinator_(coordinator)
+#endif
+    {}
 
     Decoding operator()(PrefillDone&& state);
     Decoding operator()(Decoding&& state);
@@ -133,6 +173,9 @@ struct ScheduleDecodeEvent : InvalidTransitionHandler<ScheduleDecodeEvent> {
 private:
     std::int32_t decode_input_tokens_;
     HybridPrefixCache* hybrid_prefix_cache_{};
+#if TOKENSPEED_FLAT_KVCACHE
+    KvCacheCoordinator* coordinator_{};
+#endif
 };
 
 struct ScheduleDecodeFromRetractedEvent : InvalidTransitionHandler<ScheduleDecodeFromRetractedEvent> {
@@ -175,12 +218,22 @@ struct FinishEvent : InvalidTransitionHandler<FinishEvent> {
     using InvalidTransitionHandler<FinishEvent>::operator();
     explicit FinishEvent(KVPrefixCache* kv_prefix_cache, PageAllocator* host_allocator,
                          std::vector<std::string> page_hashes = {}, bool disable_l2_cache = false,
-                         HybridPrefixCache* hybrid_prefix_cache = nullptr)
+                         HybridPrefixCache* hybrid_prefix_cache = nullptr
+#if TOKENSPEED_FLAT_KVCACHE
+                         ,
+                         KvCacheCoordinator* coordinator = nullptr
+#endif
+                         )
         : kv_prefix_cache_(kv_prefix_cache),
           host_allocator_(host_allocator),
           page_hashes_(std::move(page_hashes)),
           disable_l2_cache_(disable_l2_cache),
-          hybrid_prefix_cache_(hybrid_prefix_cache) {}
+          hybrid_prefix_cache_(hybrid_prefix_cache)
+#if TOKENSPEED_FLAT_KVCACHE
+          ,
+          coordinator_(coordinator)
+#endif
+    {}
 
     // Returns Draining (needs device→host writeback) or Finished.
     std::variant<Draining, Finished> operator()(Decoding&& state);
@@ -198,6 +251,9 @@ private:
     PageAllocator* host_allocator_;
     bool disable_l2_cache_;
     HybridPrefixCache* hybrid_prefix_cache_{};
+#if TOKENSPEED_FLAT_KVCACHE
+    KvCacheCoordinator* coordinator_{};
+#endif
 
     template <typename ForwardStateT>
     std::variant<Draining, Finished> apply(ForwardStateT&& state);
@@ -205,6 +261,10 @@ private:
 
 struct AbortEvent : InvalidTransitionHandler<AbortEvent> {
     using InvalidTransitionHandler<AbortEvent>::operator();
+
+#if TOKENSPEED_FLAT_KVCACHE
+    explicit AbortEvent(KvCacheCoordinator* coordinator = nullptr) : coordinator_(coordinator) {}
+#endif
 
     Finished operator()(Submitted&& state);
     Aborting operator()(Prefetching&& state);
@@ -218,6 +278,11 @@ struct AbortEvent : InvalidTransitionHandler<AbortEvent> {
     // Defensive: late or duplicate abort after terminalization, stay Finished.
     Finished operator()(Finished&& state) { return std::move(state); }
     Aborting operator()(Aborting&& state);  // Defensive: duplicate abort, stay Aborting
+
+#if TOKENSPEED_FLAT_KVCACHE
+private:
+    KvCacheCoordinator* coordinator_{};
+#endif
 };
 
 struct ScheduleRetractEvent : InvalidTransitionHandler<ScheduleRetractEvent> {
@@ -321,6 +386,17 @@ public:
         if (hybrid_prefix_cache_ == nullptr) {
             return std::move(state);
         }
+
+#if TOKENSPEED_FLAT_KVCACHE
+        // TODO(radix-removal): the publish body below is radix-only and
+        // unreachable on the flat path (flat states carry no device node;
+        // allocation is driven by block_tables_, and result tokens were already
+        // extended above). This guard shields the GetDeviceNode() null-deref in
+        // that body until the radix path is deleted.
+        if (!state.HasDeviceNodeRef()) {
+            return std::move(state);
+        }
+#endif
 
         const std::int32_t accepted_token_size = token_container->Size();
         auto publishable_pages = [page_size](std::int32_t token_size) {

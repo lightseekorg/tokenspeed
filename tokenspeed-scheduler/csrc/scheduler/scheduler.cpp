@@ -60,7 +60,21 @@ Scheduler::Scheduler(SchedulerConfig config)
       host_allocator_{config_.page_size, config_.host_allocator.total_pages},
       mamba_allocator_{},
       kv_prefix_cache_{&device_allocator_, &host_allocator_, config_.enable_l3_storage, config_.disable_prefix_cache},
-      req_pool_allocator_{config_.max_batch_size} {
+      req_pool_allocator_{config_.max_batch_size}
+#if TOKENSPEED_FLAT_KVCACHE
+      ,
+      block_pool_{config_.device_allocator.total_pages},
+      coordinator_{MakeCoordinator(MakeSpecsFromConfig(config_), block_pool_)},
+      flat_group_ids_{[&] {
+          std::vector<std::string> ids;
+          ids.reserve(config_.paged_cache_groups.size());
+          for (const auto& g : config_.paged_cache_groups) {
+              ids.push_back(g.group_id);
+          }
+          return ids;
+      }()}
+#endif
+{
     if (auto* env = std::getenv("SPDLOG_LEVEL")) {
         std::string level_str{env};
         spdlog::level::level_enum level = spdlog::level::from_str(level_str);
@@ -299,7 +313,11 @@ std::vector<WriteBackOperation> Scheduler::newWriteBackOperation(
                 op_id, std::vector<TransferPair>(pages_to_transfer.begin(), pages_to_transfer.end())});
             req->Apply(fsm::CommitDrainingEvent{});
         } else {
-            req->Apply(fsm::AbortEvent{});
+            req->Apply(fsm::AbortEvent{
+#if TOKENSPEED_FLAT_KVCACHE
+                &coordinator_
+#endif
+            });
         }
     }
     return ops;

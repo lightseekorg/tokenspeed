@@ -41,6 +41,11 @@
 #include "resource/types.h"
 #include "scheduler/operations/cache.h"
 
+#if TOKENSPEED_FLAT_KVCACHE
+#include "cache/forward_cache_ops.h"
+#include "scheduler/page_hasher.h"
+#endif
+
 namespace {
 
 // Build a flat list of (device_page, host_page) pairs from the given write_diff nodes.
@@ -102,6 +107,33 @@ bool ShouldPublishMambaCheckpoint(tokenspeed::HybridPrefixCache* hybrid_cache, s
 
 namespace tokenspeed::fsm {
 
+#if TOKENSPEED_FLAT_KVCACHE
+namespace {
+
+// Content hashes for the full pages covered by the processed window [0, window_end),
+// truncating any tail page past the window. Feeds the coordinator's prefix cache so
+// later requests can hit these pages.
+std::vector<std::string> FlatWindowPageHashes(const BaseState& state, std::int32_t window_begin,
+                                              std::int32_t window_size) {
+    auto paged_tokens = state.GetFullPagedTokens(false);
+    const std::int32_t end_of_window_pages = (window_begin + window_size) / state.GetPageSize();
+    if (end_of_window_pages < static_cast<std::int32_t>(paged_tokens.size())) {
+        paged_tokens.resize(end_of_window_pages);
+    }
+    return ComputePagedHashes(paged_tokens, "");
+}
+
+// The flat path does not yet support retract/writeback/loadback. Used to terminate
+// those transitions; the throw makes the call noreturn so callers with non-default-
+// constructible return types still compile.
+[[noreturn]] void FlatRetractUnsupported() {
+    _assert(false, "flat path: retract/writeback/loadback unsupported in C slice");
+    throw std::logic_error("flat path: retract/writeback/loadback unsupported in C slice");
+}
+
+}  // namespace
+#endif
+
 void InsertHybridCache(HybridPrefixCache* hybrid_cache,
                        const std::vector<std::span<const std::int32_t>>& full_paged_tokens,
                        std::unique_ptr<DeviceNodeRef>& device_node_ref, LocalKVAllocator* local_kv_allocator,
@@ -153,6 +185,44 @@ void InsertHybridCache(HybridPrefixCache* hybrid_cache,
 
 // Submitted -> PrefillDone / Prefilling
 std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()(Submitted&& state) {
+#if TOKENSPEED_FLAT_KVCACHE
+    TokenContainer* token_container = state.GetTokenContainer();
+    std::vector<BlockTable> tables(coordinator_->NumGroups());
+
+    // C slice: cross-request prefix claim deferred; pass empty hashes so only Acquire runs.
+    std::vector<std::string> empty_hashes;
+    if (!PrefillFirstChunk(*coordinator_, tables, empty_hashes, tokens_this_round_)) {
+        _assert(false, "flat path: allocation failure unsupported in C slice");
+    }
+
+    auto req_pool_index = std::make_unique<ReqPoolIndex>(req_pool_allocator_->Allocate());
+
+    TokenContainer::Window window{.begin = 0, .size = tokens_this_round_};
+    bool is_last_chunk = (window.begin + window.size) == token_container->PrefillSize();
+    if (is_last_chunk && role_ != Role::kD) {
+        PrefillDone done{token_container,
+                         state.GetPageSize(),
+                         nullptr,
+                         nullptr,
+                         nullptr,
+                         std::move(req_pool_index),
+                         window,
+                         decode_input_tokens_,
+                         nullptr};
+        done.SetBlockTables(std::move(tables));
+        return done;
+    }
+    Prefilling prefilling{token_container,
+                          state.GetPageSize(),
+                          nullptr,
+                          nullptr,
+                          nullptr,
+                          std::move(req_pool_index),
+                          window,
+                          nullptr};
+    prefilling.SetBlockTables(std::move(tables));
+    return prefilling;
+#else
     // Lock node
     std::unique_ptr<HostNodeRef> host_node_ref{nullptr};
     std::unique_ptr<DeviceNodeRef> device_node_ref{nullptr};
@@ -215,10 +285,47 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()
                           window,
                           std::move(local_mamba_allocator)};
     }
+#endif
 }
 
 // Prefilling -> Prefilling / PrefillDone
 std::variant<PrefillDone, Prefilling> SchedulePrefillEvent::operator()(Prefilling&& state) {
+#if TOKENSPEED_FLAT_KVCACHE
+    auto tables = std::move(state).TakeBlockTables();
+
+    const std::vector<std::string> hashes = FlatWindowPageHashes(state, state.window.begin, state.window.size);
+    const std::int32_t num_full_blocks = static_cast<std::int32_t>(hashes.size());
+
+    if (!PrefillChunk(*coordinator_, tables, hashes, tokens_this_round_, num_full_blocks)) {
+        _assert(false, "flat path: allocation failure unsupported in C slice");
+    }
+
+    TokenContainer::Window window{.begin = state.window.begin + state.window.size, .size = tokens_this_round_};
+    bool is_last_chunk = (window.begin + window.size) == state.GetTokenContainer()->PrefillSize();
+    if (is_last_chunk) {
+        PrefillDone done{state.GetTokenContainer(),
+                         state.GetPageSize(),
+                         nullptr,
+                         nullptr,
+                         nullptr,
+                         std::move(state).TakeReqPoolIndex(),
+                         window,
+                         reserve_num_tokens_in_next_schedule_event_,
+                         nullptr};
+        done.SetBlockTables(std::move(tables));
+        return done;
+    }
+    Prefilling prefilling{state.GetTokenContainer(),
+                          state.GetPageSize(),
+                          nullptr,
+                          nullptr,
+                          nullptr,
+                          std::move(state).TakeReqPoolIndex(),
+                          window,
+                          nullptr};
+    prefilling.SetBlockTables(std::move(tables));
+    return prefilling;
+#else
     auto local_kv_allocator = std::move(state).TakeLocalKVAllocator();
     auto local_mamba_allocator = std::move(state).TakeLocalMambaAllocator();
     auto device_node_ref = std::move(state).TakeDeviceNodeRef();
@@ -265,10 +372,34 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillEvent::operator()(Prefillin
                           window,
                           std::move(local_mamba_allocator)};
     }
+#endif
 }
 
 // PrefillDone -> Decoding: insert prefill pages into tree, then transition to decode.
 Decoding ScheduleDecodeEvent::operator()(PrefillDone&& state) {
+#if TOKENSPEED_FLAT_KVCACHE
+    auto tables = std::move(state).TakeBlockTables();
+
+    // Register any remaining full prefill pages so later requests can prefix-hit.
+    const std::vector<std::string> hashes = FlatWindowPageHashes(state, state.window.begin, state.window.size);
+    coordinator_->CacheFullBlocks(tables, hashes, static_cast<std::int32_t>(hashes.size()));
+
+    std::int32_t reserve = state.GetReserveNumTokensInNextScheduleEvent();
+    if (!coordinator_->Acquire(tables, reserve)) {
+        _assert(false, "flat path: allocation failure unsupported in C slice");
+    }
+
+    Decoding decoding{state.GetTokenContainer(),
+                      state.GetPageSize(),
+                      nullptr,
+                      nullptr,
+                      nullptr,
+                      std::move(state).TakeReqPoolIndex(),
+                      decode_input_tokens_,
+                      nullptr};
+    decoding.SetBlockTables(std::move(tables));
+    return decoding;
+#else
     auto local_kv_allocator = std::move(state).TakeLocalKVAllocator();
     auto local_mamba_allocator = std::move(state).TakeLocalMambaAllocator();
     auto device_node_ref = std::move(state).TakeDeviceNodeRef();
@@ -296,10 +427,31 @@ Decoding ScheduleDecodeEvent::operator()(PrefillDone&& state) {
                     std::move(host_node_ref),      std::move(device_node_ref),
                     std::move(local_kv_allocator), std::move(state).TakeReqPoolIndex(),
                     decode_input_tokens_,          std::move(local_mamba_allocator)};
+#endif
 }
 
 // Decoding -> Decoding: allocate pages for next decode step.
 Decoding ScheduleDecodeEvent::operator()(Decoding&& state) {
+#if TOKENSPEED_FLAT_KVCACHE
+    auto tables = std::move(state).TakeBlockTables();
+
+    std::int32_t reserve = state.GetReserveNumTokensInNextScheduleEvent();
+    std::int32_t num_computed_tokens = state.GetTokenContainer()->Size();
+    if (!DecodeStep(*coordinator_, tables, reserve, num_computed_tokens)) {
+        _assert(false, "flat path: allocation failure unsupported in C slice");
+    }
+
+    Decoding decoding{state.GetTokenContainer(),
+                      state.GetPageSize(),
+                      nullptr,
+                      nullptr,
+                      nullptr,
+                      std::move(state).TakeReqPoolIndex(),
+                      decode_input_tokens_,
+                      nullptr};
+    decoding.SetBlockTables(std::move(tables));
+    return decoding;
+#else
     auto local_kv_allocator = std::move(state).TakeLocalKVAllocator();
     auto local_mamba_allocator = std::move(state).TakeLocalMambaAllocator();
     auto device_node_ref = std::move(state).TakeDeviceNodeRef();
@@ -312,11 +464,15 @@ Decoding ScheduleDecodeEvent::operator()(Decoding&& state) {
                     std::move(host_node_ref),      std::move(device_node_ref),
                     std::move(local_kv_allocator), std::move(state).TakeReqPoolIndex(),
                     decode_input_tokens_,          std::move(local_mamba_allocator)};
+#endif
 }
 
 // Retracted -> Decoding: recover via LoadBack (host → device).
 // match_result_ was computed by the caller; alloc_device_node attaches device pages to LoadBack nodes.
 Decoding ScheduleDecodeFromRetractedEvent::operator()(Retracted&& state) {
+#if TOKENSPEED_FLAT_KVCACHE
+    FlatRetractUnsupported();
+#else
     std::unique_ptr<HostNodeRef> host_node_ref{nullptr};
     std::unique_ptr<DeviceNodeRef> device_node_ref{nullptr};
     if (match_result_.host.DepthInPage() > match_result_.device.DepthInPage()) {
@@ -358,12 +514,18 @@ Decoding ScheduleDecodeFromRetractedEvent::operator()(Retracted&& state) {
                     std::move(req_pool_index),
                     decode_input_tokens_,
                     std::move(local_mamba_allocator)};
+#endif
 }
 
 // Decode -> Finish / PrefillDone -> Finish
 // This transection is triggered by python side Advance
 template <typename ForwardStateT>
 std::variant<Draining, Finished> FinishEvent::apply(ForwardStateT&& state) {
+#if TOKENSPEED_FLAT_KVCACHE
+    auto tables = std::move(state).TakeBlockTables();
+    FreeRequest(*coordinator_, tables);
+    return Finished{};
+#else
     auto full_paged_tokens = state.GetFullPagedTokens(true);
     std::vector<std::int32_t> prefix_pages = DevicePagesFromRoot(state.GetDeviceNode());
     std::int32_t alloc_count =
@@ -427,6 +589,7 @@ std::variant<Draining, Finished> FinishEvent::apply(ForwardStateT&& state) {
                         std::move(mamba_writeback_nodes)};
     }
     return Finished{};
+#endif
 }
 
 std::variant<Draining, Finished> FinishEvent::operator()(Decoding&& state) {
@@ -473,6 +636,9 @@ Finished WriteBackDoneEvent::operator()(WritingBack&& state) {
 }
 
 Retracted WriteBackDoneEvent::operator()(Retracting&& state) {
+#if TOKENSPEED_FLAT_KVCACHE
+    FlatRetractUnsupported();
+#else
     TokenContainer* token_container = state.GetTokenContainer();
     std::int32_t page_size = state.GetPageSize();
     TreeNode* device_node = state.DeviceNode();
@@ -490,6 +656,7 @@ Retracted WriteBackDoneEvent::operator()(Retracting&& state) {
     // DeviceNodeRef inside WritingBack base is released here (unique_ptr dtor).
     return Retracted{token_container, page_size, std::move(host_ref), std::move(local_device_allocator),
                      std::move(local_mamba_allocator)};
+#endif
 }
 
 Finished AbortEvent::operator()(Submitted&&) {
@@ -512,15 +679,33 @@ Aborting AbortEvent::operator()(Aborting&& state) {
     return std::move(state);
 }
 
-Finished AbortEvent::operator()(Prefilling&&) {
+Finished AbortEvent::operator()(Prefilling&& state) {
+#if TOKENSPEED_FLAT_KVCACHE
+    auto tables = std::move(state).TakeBlockTables();
+    FreeRequest(*coordinator_, tables);
+#else
+    (void)state;
+#endif
     return Finished{};
 }
 
-Finished AbortEvent::operator()(PrefillDone&&) {
+Finished AbortEvent::operator()(PrefillDone&& state) {
+#if TOKENSPEED_FLAT_KVCACHE
+    auto tables = std::move(state).TakeBlockTables();
+    FreeRequest(*coordinator_, tables);
+#else
+    (void)state;
+#endif
     return Finished{};
 }
 
-Finished AbortEvent::operator()(Decoding&&) {
+Finished AbortEvent::operator()(Decoding&& state) {
+#if TOKENSPEED_FLAT_KVCACHE
+    auto tables = std::move(state).TakeBlockTables();
+    FreeRequest(*coordinator_, tables);
+#else
+    (void)state;
+#endif
     return Finished{};
 }
 
@@ -534,6 +719,9 @@ Finished AbortEvent::operator()(Retracted&&) {
 
 template <typename ForwardStateT>
 Retracting ScheduleRetractEvent::applyRetract(ForwardStateT&& state) {
+#if TOKENSPEED_FLAT_KVCACHE
+    FlatRetractUnsupported();
+#else
     std::unique_ptr<DeviceNodeRef> device_node_ref = nullptr;
     std::unique_ptr<HostNodeRef> host_node_ref = nullptr;
     std::vector<Retracting::PagePair> pages_to_transfer;
@@ -588,6 +776,7 @@ Retracting ScheduleRetractEvent::applyRetract(ForwardStateT&& state) {
                       std::move(pages_to_transfer),
                       std::move(mamba_writeback_nodes),
                       std::move(local_mamba_allocator)};
+#endif
 }
 
 Retracting ScheduleRetractEvent::operator()(Decoding&& state) {
