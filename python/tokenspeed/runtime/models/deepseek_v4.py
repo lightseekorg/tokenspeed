@@ -106,6 +106,9 @@ from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
     _group_slot_mapping_from_raw,
     _mask_invalid_graph_tokens,
 )
+from tokenspeed.runtime.layers.deepseek_v4_mhc import (
+    MhcFusedWorkspace,
+)
 from tokenspeed.runtime.layers.deepseek_v4_mhc import mhc_fused_hc as fast_mhc_fused_hc
 from tokenspeed.runtime.layers.deepseek_v4_mhc import mhc_post as fast_mhc_post
 from tokenspeed.runtime.layers.deepseek_v4_mhc import mhc_pre as fast_mhc_pre
@@ -399,6 +402,7 @@ def mhc_fused_hc(
     rms_eps: float,
     hc_eps: float,
     sinkhorn_iters: int,
+    workspace: MhcFusedWorkspace,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return fast_mhc_fused_hc(
         x_prev,
@@ -411,6 +415,7 @@ def mhc_fused_hc(
         rms_eps,
         hc_eps,
         sinkhorn_iters,
+        workspace,
     )
 
 
@@ -3769,6 +3774,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         aux_stream: torch.cuda.Stream | None = None,
         topk_buffer: _DeepseekV4TopKBuffer | None = None,
         cache_layer_index: int | None = None,
+        mhc_workspace: MhcFusedWorkspace | None = None,
     ) -> None:
         super().__init__()
         self.mapping = mapping
@@ -3778,6 +3784,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.hc_mult = config.hc_mult
         self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
         self.hc_eps = config.hc_eps
+        self.mhc_workspace = mhc_workspace or MhcFusedWorkspace()
         mix_hc = (2 + self.hc_mult) * self.hc_mult
         hc_dim = self.hc_mult * config.hidden_size
         self.attn = DeepseekV4Attention(
@@ -3875,6 +3882,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                     self.rms_norm_eps,
                     self.hc_eps,
                     self.hc_sinkhorn_iters,
+                    self.mhc_workspace,
                 )
         else:
             residual = hidden_states
@@ -3913,6 +3921,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.rms_norm_eps,
                 self.hc_eps,
                 self.hc_sinkhorn_iters,
+                self.mhc_workspace,
             )
         with nvtx_range("ffn_norm"):
             hidden_states = self.ffn_norm(hidden_states)
@@ -3970,6 +3979,7 @@ class DeepseekV4Model(nn.Module):
         self.rms_norm_eps = config.rms_norm_eps
         self.aux_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
         self.topk_indices_buffer = _DeepseekV4TopKBuffer(int(config.index_topk))
+        self.mhc_workspace = MhcFusedWorkspace()
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
@@ -3988,6 +3998,7 @@ class DeepseekV4Model(nn.Module):
                     add_prefix(f"layers.{layer_id}", prefix),
                     aux_stream=self.aux_stream,
                     topk_buffer=self.topk_indices_buffer,
+                    mhc_workspace=self.mhc_workspace,
                 )
                 for layer_id in range(config.num_hidden_layers)
             ]
@@ -4013,6 +4024,7 @@ class DeepseekV4Model(nn.Module):
         out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
+        self.mhc_workspace.reset()
         hidden_states = input_embeds
         if hidden_states is None:
             with nvtx_range("embed_tokens"):

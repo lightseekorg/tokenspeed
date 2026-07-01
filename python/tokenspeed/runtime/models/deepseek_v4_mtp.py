@@ -166,6 +166,7 @@ class DeepseekV4MultiTokenPredictorLayer(nn.Module):
     ) -> torch.Tensor:
         if input_embeds is None:
             raise ValueError("DeepSeek V4 MTP requires input_embeds.")
+        self.mtp_block.mhc_workspace.reset()
         input_embeds = torch.where(positions.unsqueeze(-1) == 0, 0, input_embeds)
         input_embeds = self.enorm(input_embeds)
         previous_hidden_states = previous_hidden_states.view(
