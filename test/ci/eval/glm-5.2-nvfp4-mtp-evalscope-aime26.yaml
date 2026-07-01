@@ -1,5 +1,5 @@
 api_version: ci.tokenspeed.io/v1
-name: eval-glm-5.2-nvfp4-mtp-aime25
+name: eval-glm-5.2-nvfp4-mtp-aime26
 type: eval
 triggers:
   - per-commit
@@ -49,7 +49,7 @@ eval:
     --model nvidia/GLM-5.2-NVFP4
     --api-url http://127.0.0.1:8000/v1
     --api-key EMPTY_TOKEN
-    --datasets aime25
+    --datasets aime26
     --eval-batch-size 16
     --stream
     --generation-config '{"do_sample":false,"temperature":0.0,"max_tokens":65536}'
