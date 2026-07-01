@@ -749,9 +749,9 @@ class EventLoop:
         )
 
     def _build_mamba_layerwise_cow(
-        self, execution_plan, forward_op
+        self, execution_plan, forward_ops
     ) -> dict[int, list[int]]:
-        if forward_op is None:
+        if not forward_ops:
             return {}
         loaded_mamba_slots: set[int] = set()
         for cache_op in execution_plan.cache:
@@ -767,28 +767,28 @@ class EventLoop:
         if not loaded_mamba_slots:
             return {}
 
-        cow_src_indices = getattr(forward_op, "mamba_cow_src_indices", None)
-        working_indices = getattr(forward_op, "mamba_pool_indices", None)
-        if cow_src_indices is None or working_indices is None:
-            return {}
-
         cow_by_src: dict[int, list[int]] = {}
-        for cow_src, working in zip(list(cow_src_indices), list(working_indices)):
-            cow_src = int(cow_src)
-            working = int(working)
-            if cow_src < 0 or working < 0 or cow_src not in loaded_mamba_slots:
+        for forward_op in forward_ops:
+            cow_src_indices = getattr(forward_op, "mamba_cow_src_indices", None)
+            working_indices = getattr(forward_op, "mamba_pool_indices", None)
+            if cow_src_indices is None or working_indices is None:
                 continue
-            cow_dsts = cow_by_src.setdefault(cow_src, [])
-            if working not in cow_dsts:
-                cow_dsts.append(working)
+            for cow_src, working in zip(list(cow_src_indices), list(working_indices)):
+                cow_src = int(cow_src)
+                working = int(working)
+                if cow_src < 0 or working < 0 or cow_src not in loaded_mamba_slots:
+                    continue
+                cow_dsts = cow_by_src.setdefault(cow_src, [])
+                if working not in cow_dsts:
+                    cow_dsts.append(working)
         return cow_by_src
 
     def _submit_cache_ops(self, execution_plan) -> None:
         if self.memory_executor is None:
             return
-        forward_op = self._get_forward_op(execution_plan)
+        forward_ops = self._get_forward_ops(execution_plan)
         mamba_layerwise_cow = self._build_mamba_layerwise_cow(
-            execution_plan, forward_op
+            execution_plan, forward_ops
         )
         if mamba_layerwise_cow:
             self.model_executor.set_layerwise_mamba_cow_done(mamba_layerwise_cow)
@@ -1103,12 +1103,70 @@ class EventLoop:
 
         return request_changes
 
+    def _get_forward_ops(self, execution_plan, *, include_empty: bool = False) -> list:
+        """Return forward ops from the given plan in execution order."""
+        if include_empty:
+            return list(execution_plan.forward)
+        return [op for op in execution_plan.forward if len(op.request_ids) > 0]
+
     def _get_forward_op(self, execution_plan):
-        """Return the next forward op from the given plan, or None if there is nothing to run."""
-        forward_ops = execution_plan.forward
-        if len(forward_ops) == 0 or len(forward_ops[0].request_ids) == 0:
-            return None
-        return forward_ops[0]
+        """Return the first forward op from the given plan, or None if there is nothing to run."""
+        forward_ops = self._get_forward_ops(execution_plan)
+        return forward_ops[0] if forward_ops else None
+
+    def _execute_forward_op_in_plan(
+        self,
+        execution_plan,
+        forward_op,
+        stats: dict,
+    ) -> list:
+        if forward_op is None or len(forward_op.request_ids) == 0:
+            self._flush_mamba_retract_states(None)
+            if self.has_dp:
+                dp_metadata = self._dp_sync_and_check(None)
+                if dp_metadata.need_idle_forward:
+                    self.model_executor.execute_idle_forward(
+                        dp_metadata.global_num_tokens,
+                        dp_metadata.global_batch_size,
+                        dp_metadata.all_decode_or_idle,
+                    )
+            self._record_scheduler_iteration_metrics(stats, 0)
+            return []
+
+        self._flush_mamba_retract_states(forward_op)
+
+        num_iter_tokens = sum(forward_op.input_lengths)
+        dp_metadata = None
+        if self.has_dp:
+            dp_metadata = self._dp_sync_and_check(forward_op)
+            if dp_metadata.need_idle_forward:
+                self.model_executor.execute_idle_forward(
+                    dp_metadata.global_num_tokens,
+                    dp_metadata.global_batch_size,
+                    dp_metadata.all_decode_or_idle,
+                )
+                self._record_scheduler_iteration_metrics(stats, num_iter_tokens)
+                return []
+
+        sampling_params_list = self._gather_sampling_params(forward_op)
+        grammar_inputs = self._gather_grammar_state(forward_op)
+        self._mark_stats_scheduled(forward_op)
+        results, on_first_token = self._dispatch_forward(
+            forward_op,
+            sampling_params_list,
+            execution_plan,
+            dp_metadata=dp_metadata,
+            stats=stats,
+            grammar_inputs=grammar_inputs,
+        )
+
+        request_changes = []
+        if results is not None:
+            request_changes.extend(
+                self._commit_forward_results(forward_op, results, on_first_token)
+            )
+        self._record_scheduler_iteration_metrics(stats, num_iter_tokens)
+        return request_changes
 
     def _process_pd_events(self, pd_events: list) -> list:
         processed = []
@@ -1308,47 +1366,20 @@ class EventLoop:
             self._publish_scheduler_kv_events()
             self._submit_cache_ops(execution_plan)
 
-            forward_op = self._get_forward_op(execution_plan)
-            self._flush_mamba_retract_states(forward_op)
+            forward_ops = self._get_forward_ops(
+                execution_plan,
+                include_empty=self.has_dp,
+            )
+            if not forward_ops:
+                self._flush_mamba_retract_states(None)
 
             stats = self._get_scheduler_stats()
-            num_iter_tokens = (
-                sum(forward_op.input_lengths) if forward_op is not None else 0
-            )
-
-            # DP sync: all ranks must participate even when idle.
-            dp_metadata = None
-            if self.has_dp:
-                dp_metadata = self._dp_sync_and_check(forward_op)
-                if dp_metadata.need_idle_forward:
-                    self.model_executor.execute_idle_forward(
-                        dp_metadata.global_num_tokens,
-                        dp_metadata.global_batch_size,
-                        dp_metadata.all_decode_or_idle,
-                    )
-                    self._record_scheduler_iteration_metrics(stats, num_iter_tokens)
-                    continue
-
             request_changes = []
 
-            if forward_op is not None:
-                sampling_params_list = self._gather_sampling_params(forward_op)
-                grammar_inputs = self._gather_grammar_state(forward_op)
-                self._mark_stats_scheduled(forward_op)
-                results, on_first_token = self._dispatch_forward(
-                    forward_op,
-                    sampling_params_list,
-                    execution_plan,
-                    dp_metadata=dp_metadata,
-                    stats=stats,
-                    grammar_inputs=grammar_inputs,
+            for forward_op in forward_ops:
+                request_changes.extend(
+                    self._execute_forward_op_in_plan(execution_plan, forward_op, stats)
                 )
-                if results is not None:
-                    request_changes.extend(
-                        self._commit_forward_results(
-                            forward_op, results, on_first_token
-                        )
-                    )
 
             if self.pd_kv_transfer is not None:
                 pd_events = self.pd_kv_transfer.generate_events()
@@ -1361,7 +1392,8 @@ class EventLoop:
             # Resolve a deferred abort/wait pause reply once in-flight work drains.
             self._pause.maybe_finish_drain(self.scheduler)
 
-            self._record_scheduler_iteration_metrics(stats, num_iter_tokens)
+            if not forward_ops:
+                self._record_scheduler_iteration_metrics(stats, 0)
 
     def _mark_stats_scheduled(self, forward_op) -> None:
         # Stamp the pre-forward "scheduled" time on each request's stats tracker
@@ -1442,13 +1474,32 @@ class EventLoop:
                 prev_results = None
                 prev_forward_op = None
                 continue
+
+            if self.server_args.enable_mixed_batch and prev_results is not None:
+                request_changes = self._commit_forward_results(
+                    prev_forward_op, prev_results
+                )
+                if request_changes:
+                    advance_forward(self.scheduler, request_changes)
+                    self._publish_scheduler_kv_events()
+                prev_results = None
+                prev_forward_op = None
+
             execution_plan = self.scheduler.next_execution_plan()
             self._publish_scheduler_kv_events()
 
             self._submit_cache_ops(execution_plan)
 
-            forward_op = self._get_forward_op(execution_plan)
-            self._flush_mamba_retract_states(forward_op)
+            forward_ops = self._get_forward_ops(
+                execution_plan,
+                include_empty=self.has_dp,
+            )
+            forward_op = next(
+                (op for op in forward_ops if len(op.request_ids) > 0),
+                None,
+            )
+            if not forward_ops:
+                self._flush_mamba_retract_states(None)
 
             stats = self._get_scheduler_stats()
             num_iter_tokens = (
@@ -1464,6 +1515,31 @@ class EventLoop:
                 # forward_op.
                 sampling_params_list = self._gather_sampling_params(forward_op)
                 grammar_inputs = self._gather_grammar_state(forward_op)
+
+            if len(forward_ops) > 1:
+                request_changes = []
+                if prev_results is not None:
+                    request_changes.extend(
+                        self._commit_forward_results(prev_forward_op, prev_results)
+                    )
+                    prev_results = None
+                    prev_forward_op = None
+
+                for op in forward_ops:
+                    request_changes.extend(
+                        self._execute_forward_op_in_plan(execution_plan, op, stats)
+                    )
+
+                if self.pd_kv_transfer is not None:
+                    pd_events = self.pd_kv_transfer.generate_events()
+                    request_changes.extend(self._process_pd_events(pd_events))
+
+                if request_changes:
+                    advance_forward(self.scheduler, request_changes)
+                    self._publish_scheduler_kv_events()
+
+                self._pause.maybe_finish_drain(self.scheduler)
+                continue
 
             # DP sync: all ranks must participate even when idle.
             dp_metadata = None

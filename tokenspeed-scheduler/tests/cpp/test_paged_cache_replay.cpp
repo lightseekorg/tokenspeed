@@ -73,6 +73,14 @@ protected:
         }
         return nullptr;
     }
+
+    static std::vector<const FlatForwardOperation*> GetForwardOps(const ExecutionPlan& plan) {
+        std::vector<const FlatForwardOperation*> out;
+        for (const auto& op : plan.Operations()) {
+            if (auto* f = std::get_if<FlatForwardOperation>(&op)) out.push_back(f);
+        }
+        return out;
+    }
 };
 
 class PagedCacheTerminalMixedSchedulerTest : public PagedCacheTerminalSchedulerTest {
@@ -473,24 +481,34 @@ TEST_F(PagedCacheTerminalMixedSchedulerTest, MixedPrefillDecodePagedTablesCoverS
     });
 
     auto plan = PlanOnce();
-    auto* fwd = GetForwardOp(plan);
-    ASSERT_NE(fwd, nullptr);
-    ASSERT_EQ(fwd->request_ids.size(), 8u);
-    ASSERT_EQ(fwd->extend_prefix_lens.size(), 3u);
+    auto fwds = GetForwardOps(plan);
+    ASSERT_EQ(fwds.size(), 2u);
 
-    for (std::size_t row = 0; row < fwd->request_ids.size(); ++row) {
-        std::int32_t first_token = 0;
-        if (row < fwd->extend_prefix_lens.size()) {
-            first_token = fwd->extend_prefix_lens[row];
-        } else {
-            auto it = decode_first_pos.find(fwd->request_ids[row]);
-            ASSERT_NE(it, decode_first_pos.end()) << "request_id=" << fwd->request_ids[row];
-            first_token = it->second;
+    const auto* decode_fwd = fwds[0];
+    const auto* prefill_fwd = fwds[1];
+    ASSERT_EQ(decode_fwd->request_ids.size(), 5u);
+    ASSERT_EQ(decode_fwd->extend_prefix_lens.size(), 0u);
+    ASSERT_EQ(prefill_fwd->request_ids.size(), 3u);
+    ASSERT_EQ(prefill_fwd->extend_prefix_lens.size(), 3u);
+    EXPECT_EQ(prefill_fwd->request_ids, std::vector<std::string>({"prefill_0", "prefill_1", "prefill_2"}));
+
+    auto check_rows = [&](const FlatForwardOperation& fwd) {
+        for (std::size_t row = 0; row < fwd.request_ids.size(); ++row) {
+            std::int32_t first_token = 0;
+            if (row < fwd.extend_prefix_lens.size()) {
+                first_token = fwd.extend_prefix_lens[row];
+            } else {
+                auto it = decode_first_pos.find(fwd.request_ids[row]);
+                ASSERT_NE(it, decode_first_pos.end()) << "request_id=" << fwd.request_ids[row];
+                first_token = it->second;
+            }
+            ASSERT_LT(row, fwd.input_lengths.size());
+            ExpectPagedGroupCoversRange(fwd, Config(), "fh", row, first_token, fwd.input_lengths[row]);
+            ExpectPagedGroupCoversRange(fwd, Config(), "swa", row, first_token, fwd.input_lengths[row]);
         }
-        ASSERT_LT(row, fwd->input_lengths.size());
-        ExpectPagedGroupCoversRange(*fwd, Config(), "fh", row, first_token, fwd->input_lengths[row]);
-        ExpectPagedGroupCoversRange(*fwd, Config(), "swa", row, first_token, fwd->input_lengths[row]);
-    }
+    };
+    check_rows(*decode_fwd);
+    check_rows(*prefill_fwd);
 }
 
 }  // namespace tokenspeed::test
