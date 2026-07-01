@@ -91,10 +91,6 @@ def argmax(
         or not logits.is_cuda
         or logits.dtype not in _SUPPORTED_DTYPES
     ):
-        # An empty row dim (e.g. an idle data-parallel rank running the draft
-        # forward with bs=0) makes the kernel launch a 0-block grid over the
-        # vocab tiles and raise CUDA_ERROR_INVALID_VALUE; torch.argmax handles
-        # the empty case and returns an empty index tensor.
         return _argmax_torch_fallback(logits, out=out)
 
     signature = format_signature(logits=dense_tensor_format(logits.dtype))
