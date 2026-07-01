@@ -35,10 +35,9 @@ _INDEX_K_SCALE_BYTES = torch._utils._element_size(torch.float32)
 
 
 def dsa_index_k_row_bytes(index_head_dim: int) -> int:
-    if index_head_dim % _INDEX_K_FP8_GROUP_SIZE != 0:
+    if index_head_dim <= 0 or index_head_dim % _INDEX_K_FP8_GROUP_SIZE != 0:
         raise ValueError(
-            "DSA index_head_dim must be divisible by "
-            f"{_INDEX_K_FP8_GROUP_SIZE}, got {index_head_dim}"
+            f"DSA index_head_dim must be a positive multiple of {_INDEX_K_FP8_GROUP_SIZE}, got {index_head_dim}"
         )
     return (
         index_head_dim

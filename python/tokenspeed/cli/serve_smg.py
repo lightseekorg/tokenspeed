@@ -282,12 +282,20 @@ def _args_with_default_model_parsers(
     name to defer json_schema grammars past the reasoning channel.
     """
     model_id = _user_model_id(gateway_args) or _user_model_id(engine_args)
-    if not _is_deepseek_v4_model(model_id):
-        if not _is_glm_dsa_model(model_id):
-            return engine_args, gateway_args
+    engine_result = list(engine_args)
+    gateway_result = list(gateway_args)
 
-        engine_result = list(engine_args)
-        gateway_result = list(gateway_args)
+    if _is_deepseek_v4_model(model_id):
+        if (
+            "--reasoning-parser" not in engine_result
+            and "--reasoning-parser" not in gateway_result
+        ):
+            engine_result.extend(["--reasoning-parser", DEEPSEEK_V4_REASONING_PARSER])
+            gateway_result.extend(["--reasoning-parser", DEEPSEEK_V4_REASONING_PARSER])
+        if "--tool-call-parser" not in gateway_result:
+            gateway_result.extend(["--tool-call-parser", DEEPSEEK_V4_TOOL_CALL_PARSER])
+
+    elif _is_glm_dsa_model(model_id):
         if (
             "--reasoning-parser" not in engine_result
             and "--reasoning-parser" not in gateway_result
@@ -296,20 +304,7 @@ def _args_with_default_model_parsers(
             gateway_result.extend(["--reasoning-parser", GLM_REASONING_PARSER])
         if "--tool-call-parser" not in gateway_result:
             gateway_result.extend(["--tool-call-parser", GLM_TOOL_CALL_PARSER])
-        if "--disable-kvstore" not in engine_result:
-            engine_result.append("--disable-kvstore")
-        return engine_result, gateway_result
 
-    engine_result = list(engine_args)
-    gateway_result = list(gateway_args)
-    if (
-        "--reasoning-parser" not in engine_result
-        and "--reasoning-parser" not in gateway_result
-    ):
-        engine_result.extend(["--reasoning-parser", DEEPSEEK_V4_REASONING_PARSER])
-        gateway_result.extend(["--reasoning-parser", DEEPSEEK_V4_REASONING_PARSER])
-    if "--tool-call-parser" not in gateway_result:
-        gateway_result.extend(["--tool-call-parser", DEEPSEEK_V4_TOOL_CALL_PARSER])
     return engine_result, gateway_result
 
 

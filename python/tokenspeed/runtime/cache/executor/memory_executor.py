@@ -25,24 +25,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
-try:
-    from tokenspeed.runtime.layers.attention.kv_cache.mha import (
-        MHATokenToKVPool as MHATokenToKVPoolPaged,
-    )
-except ImportError:
-    MHATokenToKVPoolPaged = None
-try:
-    from tokenspeed.runtime.layers.attention.kv_cache.mla import (
-        MLATokenToKVPool as MLATokenToKVPoolPaged,
-    )
-except (ImportError, AttributeError):
-    MLATokenToKVPoolPaged = None
-
 from tokenspeed_scheduler import Cache
 
 from tokenspeed.runtime.cache.executor.host_executor import HostExecutor
 from tokenspeed.runtime.cache.executor.storage_executor import StorageExecutor
 from tokenspeed.runtime.cache.kv_cache_host import (
+    DSATokenToKVPoolHost,
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
 )
@@ -50,6 +38,7 @@ from tokenspeed.runtime.cache.mamba_cache_host import MambaPoolHost
 from tokenspeed.runtime.cache.transfer.kv_pool import KVCachePool
 from tokenspeed.runtime.cache.transfer.mamba_pool import MambaCachePool
 from tokenspeed.runtime.cache.transfer.types import CacheKind
+from tokenspeed.runtime.layers.attention.kv_cache.dsa import DSATokenToKVPool
 from tokenspeed.runtime.layers.attention.kv_cache.mha import MHATokenToKVPool
 from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -88,22 +77,23 @@ class MemoryExecutor:
     ):
         self.page_size = config.page_size
 
-        _mha_types = (MHATokenToKVPool,)
-        if MHATokenToKVPoolPaged is not None:
-            _mha_types = (MHATokenToKVPool, MHATokenToKVPoolPaged)
-
-        _mla_types = (MLATokenToKVPool,)
-        if MLATokenToKVPoolPaged is not None:
-            _mla_types = (MLATokenToKVPool, MLATokenToKVPoolPaged)
-
         # Unwrap LayerMappedKVPool (hybrid GDN models) to get the inner MHA pool.
         actual_pool = device_pool
         if hasattr(device_pool, "inner") and not isinstance(
-            device_pool, (*_mha_types, *_mla_types)
+            device_pool, (MHATokenToKVPool, MLATokenToKVPool)
         ):
             actual_pool = device_pool.inner
 
-        if isinstance(actual_pool, _mha_types):
+        # DSA subclasses MLA, so it must be matched before the MLA branch.
+        if isinstance(actual_pool, DSATokenToKVPool):
+            self.host_pool = DSATokenToKVPoolHost(
+                actual_pool,
+                config.host_ratio,
+                config.host_size_gb,
+                config.page_size,
+                config.host_layout,
+            )
+        elif isinstance(actual_pool, MHATokenToKVPool):
             self.host_pool = MHATokenToKVPoolHost(
                 actual_pool,
                 config.host_ratio,
@@ -111,7 +101,7 @@ class MemoryExecutor:
                 config.page_size,
                 config.host_layout,
             )
-        elif isinstance(actual_pool, _mla_types):
+        elif isinstance(actual_pool, MLATokenToKVPool):
             self.host_pool = MLATokenToKVPoolHost(
                 actual_pool,
                 config.host_ratio,
@@ -131,10 +121,19 @@ class MemoryExecutor:
         if draft_device_pool is not None:
             actual_draft_pool = draft_device_pool
             if hasattr(draft_device_pool, "inner") and not isinstance(
-                draft_device_pool, (*_mha_types, *_mla_types)
+                draft_device_pool, (MHATokenToKVPool, MLATokenToKVPool)
             ):
                 actual_draft_pool = draft_device_pool.inner
-            if isinstance(actual_draft_pool, _mha_types):
+            if isinstance(actual_draft_pool, DSATokenToKVPool):
+                self.draft_host_pool = DSATokenToKVPoolHost(
+                    actual_draft_pool,
+                    config.host_ratio,
+                    config.host_size_gb,
+                    config.page_size,
+                    config.host_layout,
+                    host_size_tokens=self.host_pool.size,
+                )
+            elif isinstance(actual_draft_pool, MHATokenToKVPool):
                 self.draft_host_pool = MHATokenToKVPoolHost(
                     actual_draft_pool,
                     config.host_ratio,
@@ -143,7 +142,7 @@ class MemoryExecutor:
                     config.host_layout,
                     host_size_tokens=self.host_pool.size,
                 )
-            elif isinstance(actual_draft_pool, _mla_types):
+            elif isinstance(actual_draft_pool, MLATokenToKVPool):
                 self.draft_host_pool = MLATokenToKVPoolHost(
                     actual_draft_pool,
                     config.host_ratio,
