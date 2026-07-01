@@ -191,7 +191,8 @@ def compute_out_cache_loc_kernel(
 
         # Compute page indices and offsets
         page_indices = positions // page_size
-        # Clamp to last valid page: avoids OOB reads past context-length bound.
+        overflow = page_indices >= max_pages
+        # Clamp to last valid page to avoid OOB GMEM read.
         page_indices = tl.minimum(page_indices, max_pages - 1)
         offsets_in_page = positions % page_size
 
@@ -202,6 +203,11 @@ def compute_out_cache_loc_kernel(
 
         # Compute physical cache locations
         cache_locs = page_ids * page_size + offsets_in_page
+        # For overflow tokens, route to slot 0 (a fixed safe dummy target that
+        # never aliases a real request's KV data). This avoids using a dynamic
+        # req_to_pages[0][0] load whose value can change at runtime and corrupt
+        # other requests' KV cache or trigger IndexKernel out-of-bounds.
+        cache_locs = tl.where(overflow, 0, cache_locs)
 
         # Store to output
         output_ptrs = out_cache_loc_ptr + output_offset + token_offsets
@@ -283,13 +289,16 @@ def fused_decode_input_prep_kernel(
 
         positions_local = cache_start + token_offsets
         page_indices = positions_local // page_size
-        # Clamp to last valid page (avoids OOB reads past context-length bound).
+        overflow = page_indices >= max_pages
+        # Clamp to last valid page to avoid OOB GMEM read.
         page_indices = tl.minimum(page_indices, max_pages - 1)
         offsets_in_page = positions_local % page_size
 
         page_ptrs = req_to_pages_ptr + pool_idx * max_pages + page_indices
         page_ids = tl.load(page_ptrs, mask=mask, other=0)
         cache_locs = page_ids * page_size + offsets_in_page
+        # Route overflow tokens to slot 0 (fixed safe dummy target).
+        cache_locs = tl.where(overflow, 0, cache_locs)
 
         tl.store(
             out_cache_loc_ptr + output_offset + token_offsets,
