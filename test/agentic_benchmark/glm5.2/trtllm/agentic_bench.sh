@@ -1,6 +1,6 @@
 #!/usr/bin/bash
 
-# Tested on TensorRT-LLM commit: 70c5e43
+# Tested on TensorRT-LLM commit: 281acfd
 
 set -euo pipefail
 
@@ -13,7 +13,7 @@ pip install "evalscope[perf] @ git+https://github.com/modelscope/evalscope.git@$
 
 # Note: Only 94 conversations can be built
 [ -f agentic_dataset.json ] || python3 build_swe_smith_dataset.py \
-    --model zai-org/GLM-5.1 \
+    --model zai-org/GLM-5.2 \
     --first-turn-length 50000 \
     --subsequent-turn-length 800 \
     --min-turns 10 \
@@ -37,7 +37,7 @@ SERVER_LOG=
 launch_server() {
     local config=$1
     SERVER_LOG=/tmp/trtllm_server_${config}.log
-    setsid trtllm-serve nvidia/GLM-5.1-NVFP4 \
+    setsid trtllm-serve nvidia/GLM-5.2-NVFP4 \
         --max_num_tokens 8192 \
         --max_seq_len 80000 \
         --enable_chunked_prefill \
@@ -118,7 +118,7 @@ for CONFIG in "${CONFIGS[@]}"; do
 
     echo "Warmup..."
     evalscope perf \
-        --model nvidia/GLM-5.1-NVFP4 \
+        --model nvidia/GLM-5.2-NVFP4 \
         --url http://127.0.0.1:8001/v1/chat/completions \
         --api openai \
         --dataset swe_smith \
@@ -133,7 +133,7 @@ for CONFIG in "${CONFIGS[@]}"; do
 
     echo "Benchmark..."
     evalscope perf \
-        --model nvidia/GLM-5.1-NVFP4 \
+        --model nvidia/GLM-5.2-NVFP4 \
         --url http://127.0.0.1:8001/v1/chat/completions \
         --api openai \
         --dataset swe_smith \
