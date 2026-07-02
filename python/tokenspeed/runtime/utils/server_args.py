@@ -238,6 +238,7 @@ class ServerArgs:
     enable_nccl_nvls: bool = False
     enable_symm_mem: bool = False
     disable_custom_all_reduce: bool = False
+    enable_trtllm_allreduce: bool = False
     disable_overlap_schedule: bool = False
     disable_tf32: bool = False
     force_deterministic_rsag: bool = False
@@ -1547,6 +1548,14 @@ class ServerArgs:
             "--disable-custom-all-reduce",
             action="store_true",
             help="Disable the custom all-reduce kernel and fall back to NCCL.",
+        )
+        parser.add_argument(
+            "--enable-trtllm-allreduce",
+            action="store_true",
+            help=(
+                "Enable the experimental TRT-LLM Lamport one-shot all-reduce "
+                "backend for eligible single-node tensor-parallel collectives."
+            ),
         )
         parser.add_argument(
             "--disable-overlap-schedule",

@@ -81,6 +81,7 @@ class DistributedConfig:
 
     # Feature flags
     disable_custom_all_reduce: bool = False
+    enable_trtllm_allreduce: bool = False
     force_deterministic_rsag: bool = False
 
     # The full Mapping object for pg_manager initialization
@@ -121,12 +122,66 @@ class DistributedConfig:
             hidden_size=hidden_size,
             max_num_tokens=max_num_tokens,
             disable_custom_all_reduce=server_args.disable_custom_all_reduce,
+            enable_trtllm_allreduce=server_args.enable_trtllm_allreduce,
             force_deterministic_rsag=server_args.force_deterministic_rsag,
             mapping=mapping,
         )
 
 
 class DistributedInitializer:
+    @staticmethod
+    def _configure_trtllm_allreduce(config: DistributedConfig) -> None:
+        """Create per-group Lamport workspaces before CUDA graph capture."""
+        if not config.enable_trtllm_allreduce:
+            return
+
+        if config.nnodes != 1:
+            raise RuntimeError(
+                "TRT-LLM all-reduce currently supports single-node groups only"
+            )
+
+        from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
+        from tokenspeed.runtime.distributed.comm_backend.registry import (
+            get_global_backend,
+        )
+
+        backend = get_global_backend()
+        if not isinstance(backend, AutoBackend):
+            raise RuntimeError("TRT-LLM all-reduce requires the global AutoBackend")
+
+        mapping = config.mapping
+        groups = dict.fromkeys(
+            (
+                mapping.attn.tp_group,
+                mapping.dense.tp_group,
+                mapping.moe.tp_ep_group,
+            )
+        )
+        configured_groups = []
+        for group in groups:
+            if len(group) <= 1:
+                continue
+            if config.global_rank not in group:
+                raise RuntimeError(
+                    f"global rank {config.global_rank} is not in communication group {group}"
+                )
+            local_rank = group.index(config.global_rank)
+            if not backend.trtllm_ar.configure_group(
+                rank=local_rank,
+                group=group,
+                max_token_num=config.max_num_tokens,
+                hidden_dim=config.hidden_size,
+            ):
+                raise RuntimeError(
+                    f"TRT-LLM all-reduce is unavailable for communication group {group}"
+                )
+            configured_groups.append(group)
+
+        logger.info(
+            "Configured TRT-LLM all-reduce for groups=%s",
+            configured_groups,
+        )
+
     @staticmethod
     def initialize(config: DistributedConfig) -> float:
         torch.get_device_module(config.device).set_device(config.gpu_id)
@@ -160,6 +215,7 @@ class DistributedInitializer:
         pg_manager.init_process_group(config.mapping.attn.tp_group)
         pg_manager.init_process_group(config.mapping.dense.tp_group)
         pg_manager.init_process_group(config.mapping.moe.tp_ep_group)
+        DistributedInitializer._configure_trtllm_allreduce(config)
 
         logger.info(
             "Init comm buff end. Avail mem=%.4f GB",

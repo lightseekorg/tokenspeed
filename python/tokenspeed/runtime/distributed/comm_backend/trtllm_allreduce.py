@@ -28,17 +28,23 @@ The workspace is created once per group via ``configure_group`` and
 reused for every subsequent ``all_reduce`` on that group.
 """
 
+import logging
+
 import torch
 from tokenspeed_kernel.ops.communication.trtllm import (
     AllReduceFusionPattern,
     trtllm_allreduce_fusion,
     trtllm_create_ipc_workspace_for_all_reduce_fusion,
+    trtllm_destroy_ipc_workspace_for_all_reduce_fusion,
 )
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.comm_backend.base import CommBackend, Group
 
 _MAX_ONESHOT_BYTES = 2 * 1024 * 1024
+_SUPPORTED_WORLD_SIZES = frozenset((2, 4, 8, 16))
+
+logger = logging.getLogger(__name__)
 
 
 class TrtllmAllReduceBackend(CommBackend):
@@ -68,50 +74,110 @@ class TrtllmAllReduceBackend(CommBackend):
         hidden_dim: int,
         use_fp32_lamport: bool = False,
     ) -> bool:
-        """Create IPC workspace for *group*.  Returns True on success."""
+        """Create an IPC workspace for a communication group.
+
+        Args:
+            rank: Rank within ``group``, not the global distributed rank.
+            group: Tuple of global ranks participating in the collective.
+            max_token_num: Requested maximum token rows. It is clamped to the
+                BF16 rows covered by the backend's one-shot byte limit.
+            hidden_dim: Maximum hidden dimension accepted by the workspace.
+            use_fp32_lamport: Whether the Lamport communication buffer uses
+                FP32 elements.
+
+        Returns:
+            ``True`` when the workspace is configured. Unsupported platforms
+            return ``False``. Configuration failures raise instead of allowing
+            different ranks to silently select different collective backends.
+        """
         if group in self._resources:
             return True
 
         if not self._load_comm():
             return False
-
-        try:
-
-            from tokenspeed.runtime.distributed.process_group_manager import (
-                process_group_manager as pg_manager,
+        if len(group) not in _SUPPORTED_WORLD_SIZES:
+            raise ValueError(
+                f"TRT-LLM all-reduce does not support group size {len(group)}"
+            )
+        if not 0 <= rank < len(group):
+            raise ValueError(f"group-local rank {rank} is invalid for group {group}")
+        if hidden_dim <= 0 or max_token_num <= 0:
+            raise ValueError(
+                "TRT-LLM all-reduce requires positive hidden_dim and max_token_num"
             )
 
-            device_group = pg_manager.get_process_group("nccl", group)
-
-            ipc_handles, workspace_tensor = (
-                trtllm_create_ipc_workspace_for_all_reduce_fusion(
-                    rank,
-                    len(group),
-                    max_token_num,
-                    hidden_dim,
-                    group=device_group,
-                    use_fp32_lamport=use_fp32_lamport,
-                )
+        max_bf16_tokens = _MAX_ONESHOT_BYTES // (
+            hidden_dim * torch.empty((), dtype=torch.bfloat16).element_size()
+        )
+        workspace_max_tokens = min(max_token_num, max_bf16_tokens)
+        if workspace_max_tokens <= 0:
+            raise ValueError(
+                f"hidden_dim={hidden_dim} exceeds the TRT-LLM one-shot byte limit"
             )
 
-            self._resources[group] = {
-                "ipc_handles": ipc_handles,
-                "workspace": workspace_tensor,
-                "rank": rank,
-                "world_size": len(group),
-                "max_token_num": max_token_num,
-                "hidden_dim": hidden_dim,
-                "device_group": device_group,
-            }
+        from tokenspeed.runtime.distributed.process_group_manager import (
+            process_group_manager as pg_manager,
+        )
 
-            return True
+        device_group = pg_manager.get_process_group("nccl", group)
+        ipc_handles, workspace_tensor = (
+            trtllm_create_ipc_workspace_for_all_reduce_fusion(
+                rank,
+                len(group),
+                workspace_max_tokens,
+                hidden_dim,
+                group=device_group,
+                use_fp32_lamport=use_fp32_lamport,
+            )
+        )
 
-        except Exception:
-
-            return False
+        self._resources[group] = {
+            "ipc_handles": ipc_handles,
+            "workspace": workspace_tensor,
+            "rank": rank,
+            "world_size": len(group),
+            "max_token_num": workspace_max_tokens,
+            "hidden_dim": hidden_dim,
+            "device_group": device_group,
+        }
+        logger.info(
+            "Configured TRT-LLM all-reduce group=%s local_rank=%s "
+            "max_token_num=%s hidden_dim=%s",
+            group,
+            rank,
+            workspace_max_tokens,
+            hidden_dim,
+        )
+        return True
 
     def has_trtllm_ar(self, group: Group) -> bool:
         return group in self._resources
+
+    def close_group(self, group: Group) -> None:
+        """Destroy the IPC workspace associated with ``group`` if present."""
+        res = self._resources.pop(group, None)
+        if res is None:
+            return
+        trtllm_destroy_ipc_workspace_for_all_reduce_fusion(
+            res["ipc_handles"], group=res["device_group"]
+        )
+
+    def can_run(self, tensor: torch.Tensor, group: Group, op=None) -> bool:
+        """Return whether an all-reduce call can use the configured backend."""
+        if op is None:
+            op = torch.distributed.ReduceOp.SUM
+        res = self._resources.get(group)
+        return bool(
+            res is not None
+            and op == torch.distributed.ReduceOp.SUM
+            and tensor.is_cuda
+            and tensor.dtype == torch.bfloat16
+            and tensor.is_contiguous()
+            and tensor.dim() == 2
+            and 0 < tensor.shape[0] <= res["max_token_num"]
+            and 0 < tensor.shape[1] <= res["hidden_dim"]
+            and tensor.numel() * tensor.element_size() <= _MAX_ONESHOT_BYTES
+        )
 
     # ------------------------------------------------------------------
     # CommBackend interface
@@ -124,11 +190,7 @@ class TrtllmAllReduceBackend(CommBackend):
 
         res = self._resources.get(group)
 
-        if (
-            res is not None
-            and op == torch.distributed.ReduceOp.SUM
-            and tensor.numel() * tensor.element_size() <= _MAX_ONESHOT_BYTES
-        ):
+        if self.can_run(tensor, group, op=op):
 
             result = self._lamport_allreduce(tensor, res)
 

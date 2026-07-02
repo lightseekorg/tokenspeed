@@ -220,3 +220,4 @@ features directly:
 - `--disaggregation-*`
 - `--comm-fusion-max-num-tokens`
 - `--enable-allreduce-fusion`
+- `--enable-trtllm-allreduce` (experimental, single-node NVIDIA TP only)
