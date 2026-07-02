@@ -34,9 +34,7 @@ def test_server_flag_is_explicit_opt_in():
     ServerArgs.add_cli_args(parser)
 
     default_args = parser.parse_args(["--model=stub"])
-    enabled_args = parser.parse_args(
-        ["--model=stub", "--enable-trtllm-allreduce"]
-    )
+    enabled_args = parser.parse_args(["--model=stub", "--enable-trtllm-allreduce"])
 
     assert default_args.enable_trtllm_allreduce is False
     assert enabled_args.enable_trtllm_allreduce is True
