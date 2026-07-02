@@ -150,13 +150,15 @@ class DistributedInitializer:
             raise RuntimeError("TRT-LLM all-reduce requires the global AutoBackend")
 
         mapping = config.mapping
-        groups = dict.fromkeys(
-            (
-                mapping.attn.tp_group,
-                mapping.dense.tp_group,
+        tp_groups = [mapping.attn.tp_group, mapping.dense.tp_group]
+        if mapping.moe.ep_size == 1:
+            tp_groups.append(mapping.moe.tp_ep_group)
+        else:
+            logger.info(
+                "Skipping TRT-LLM all-reduce for unvalidated MoE TP/EP group=%s",
                 mapping.moe.tp_ep_group,
             )
-        )
+        groups = dict.fromkeys(tp_groups)
         configured_groups = []
         for group in groups:
             if len(group) <= 1:

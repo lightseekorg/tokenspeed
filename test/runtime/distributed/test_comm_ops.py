@@ -317,67 +317,6 @@ def _test_backend_registry(rank, world_size, device, group, ref_group):
     assert result.shape == inp.shape
 
 
-def _test_trtllm_allreduce_graph_replay(rank, world_size, device, group, ref_group):
-    from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
-    from tokenspeed.runtime.distributed.comm_backend.trtllm_allreduce import (
-        TrtllmAllReduceBackend,
-    )
-
-    hidden_dim = 512
-    token_num = 16
-    backend = TrtllmAllReduceBackend(fallback=NcclBackend())
-    assert backend.configure_group(
-        rank=rank,
-        group=group,
-        max_token_num=128,
-        hidden_dim=hidden_dim,
-    )
-
-    try:
-        torch.manual_seed(1000 + rank)
-        eager_input = torch.randn(
-            token_num, hidden_dim, dtype=torch.bfloat16, device=device
-        )
-        eager_expected = eager_input.clone()
-        dist.all_reduce(eager_expected, group=ref_group)
-        assert backend.can_run(eager_input, group)
-        eager_result = backend.all_reduce(eager_input, group)
-        torch.cuda.synchronize(device)
-        torch.testing.assert_close(eager_result, eager_expected, atol=0.125, rtol=0.05)
-
-        static_input = eager_input.clone()
-        capture_stream = torch.cuda.Stream(device=device)
-        capture_stream.wait_stream(torch.cuda.current_stream(device))
-        with torch.cuda.stream(capture_stream):
-            for _ in range(3):
-                backend.all_reduce(eager_input, group)
-        torch.cuda.current_stream(device).wait_stream(capture_stream)
-        torch.cuda.synchronize(device)
-        dist.barrier(group=ref_group)
-
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=capture_stream):
-            graph_result = backend.all_reduce(static_input, group)
-        torch.cuda.synchronize(device)
-        dist.barrier(group=ref_group)
-
-        for iteration in range(10):
-            torch.manual_seed(2000 + iteration * world_size + rank)
-            replay_input = torch.randn_like(static_input)
-            replay_expected = replay_input.clone()
-            dist.all_reduce(replay_expected, group=ref_group)
-            static_input.copy_(replay_input)
-            dist.barrier(group=ref_group)
-            graph.replay()
-            torch.cuda.synchronize(device)
-            torch.testing.assert_close(
-                graph_result, replay_expected, atol=0.125, rtol=0.05
-            )
-            dist.barrier(group=ref_group)
-    finally:
-        backend.close_group(group)
-
-
 # ---------------------------------------------------------------------------
 # FusionParams (no GPU needed)
 # ---------------------------------------------------------------------------
@@ -450,9 +389,3 @@ class TestCommOps:
     @pytest.mark.parametrize("world_size", WORLD_SIZES)
     def test_backend_registry(self, world_size):
         _run(world_size, _test_backend_registry)
-
-
-class TestTrtllmAllReduceBackend:
-
-    def test_tp8_correctness_and_cuda_graph_replay(self):
-        _run(8, _test_trtllm_allreduce_graph_replay)

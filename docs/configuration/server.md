@@ -221,3 +221,7 @@ features directly:
 - `--comm-fusion-max-num-tokens`
 - `--enable-allreduce-fusion`
 - `--enable-trtllm-allreduce` (experimental, single-node NVIDIA TP only)
+
+The TRT-LLM backend accelerates eligible contiguous 2D BF16 SUM collectives
+for attention, dense, and pure-TP MoE groups. Groups that include expert
+parallelism and unsupported tensor layouts continue to use NCCL.

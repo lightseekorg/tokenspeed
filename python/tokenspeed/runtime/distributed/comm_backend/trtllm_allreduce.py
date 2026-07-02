@@ -80,7 +80,8 @@ class TrtllmAllReduceBackend(CommBackend):
             rank: Rank within ``group``, not the global distributed rank.
             group: Tuple of global ranks participating in the collective.
             max_token_num: Requested maximum token rows. It is clamped to the
-                BF16 rows covered by the backend's one-shot byte limit.
+                rows covered by the backend's one-shot byte limit and selected
+                Lamport communication dtype.
             hidden_dim: Maximum hidden dimension accepted by the workspace.
             use_fp32_lamport: Whether the Lamport communication buffer uses
                 FP32 elements.
@@ -106,10 +107,11 @@ class TrtllmAllReduceBackend(CommBackend):
                 "TRT-LLM all-reduce requires positive hidden_dim and max_token_num"
             )
 
-        max_bf16_tokens = _MAX_ONESHOT_BYTES // (
-            hidden_dim * torch.empty((), dtype=torch.bfloat16).element_size()
+        lamport_dtype = torch.float32 if use_fp32_lamport else torch.bfloat16
+        max_lamport_tokens = _MAX_ONESHOT_BYTES // (
+            hidden_dim * torch.empty((), dtype=lamport_dtype).element_size()
         )
-        workspace_max_tokens = min(max_token_num, max_bf16_tokens)
+        workspace_max_tokens = min(max_token_num, max_lamport_tokens)
         if workspace_max_tokens <= 0:
             raise ValueError(
                 f"hidden_dim={hidden_dim} exceeds the TRT-LLM one-shot byte limit"
@@ -163,7 +165,12 @@ class TrtllmAllReduceBackend(CommBackend):
         )
 
     def can_run(self, tensor: torch.Tensor, group: Group, op=None) -> bool:
-        """Return whether an all-reduce call can use the configured backend."""
+        """Return whether an all-reduce call can use the configured backend.
+
+        Only the production decode layout ``[tokens, hidden]`` is enabled.
+        Other tensor ranks deliberately fall back until reshape semantics have
+        dedicated correctness and CUDA Graph coverage.
+        """
         if op is None:
             op = torch.distributed.ReduceOp.SUM
         res = self._resources.get(group)
@@ -202,27 +209,20 @@ class TrtllmAllReduceBackend(CommBackend):
     def _lamport_allreduce(
         self, tensor: torch.Tensor, res: dict
     ) -> torch.Tensor | None:
-        """Run the Lamport 1-shot kernel, return None on failure."""
-        orig_shape = tensor.shape
+        """Run the Lamport 1-shot kernel for a 2D decode tensor."""
+        if tensor.dim() != 2:
+            return None
 
-        # The fused kernel expects 2D [token_num, hidden_dim].
-        if tensor.dim() == 1:
-            tensor_2d = tensor.unsqueeze(0)
-        elif tensor.dim() > 2:
-            tensor_2d = tensor.reshape(-1, tensor.shape[-1])
-        else:
-            tensor_2d = tensor
-
-        token_num, hidden_dim = tensor_2d.shape
+        token_num, hidden_dim = tensor.shape
         if hidden_dim > res["hidden_dim"] or token_num > res["max_token_num"]:
             return None
 
         from tokenspeed.runtime.utils.pdl import pdl_enabled
 
-        allreduce_out = torch.empty_like(tensor_2d)
+        allreduce_out = torch.empty_like(tensor)
 
         trtllm_allreduce_fusion(
-            allreduce_in=tensor_2d,
+            allreduce_in=tensor,
             world_size=res["world_size"],
             world_rank=res["rank"],
             token_num=token_num,
@@ -236,7 +236,7 @@ class TrtllmAllReduceBackend(CommBackend):
             allreduce_out=allreduce_out,
         )
 
-        return allreduce_out.view(orig_shape)
+        return allreduce_out
 
     # ---- Delegate everything else to fallback ----
 

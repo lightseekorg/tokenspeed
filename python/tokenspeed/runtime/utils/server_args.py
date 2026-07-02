@@ -1554,7 +1554,8 @@ class ServerArgs:
             action="store_true",
             help=(
                 "Enable the experimental TRT-LLM Lamport one-shot all-reduce "
-                "backend for eligible single-node tensor-parallel collectives."
+                "backend for eligible single-node tensor-parallel collectives. "
+                "Groups that include expert parallelism continue to use NCCL."
             ),
         )
         parser.add_argument(

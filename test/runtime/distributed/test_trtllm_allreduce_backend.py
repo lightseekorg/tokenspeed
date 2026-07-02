@@ -59,7 +59,13 @@ def test_auto_backend_selects_configured_trtllm_backend():
     assert backend.all_reduce(tensor, group) is expected
 
 
-def test_configure_group_clamps_workspace_to_oneshot_limit(monkeypatch):
+@pytest.mark.parametrize(
+    ("use_fp32_lamport", "expected_max_tokens"),
+    ((False, 146), (True, 73)),
+)
+def test_configure_group_clamps_workspace_to_oneshot_limit(
+    monkeypatch, use_fp32_lamport, expected_max_tokens
+):
     from tokenspeed.runtime.distributed import process_group_manager
     from tokenspeed.runtime.distributed.comm_backend import trtllm_allreduce
 
@@ -89,9 +95,11 @@ def test_configure_group_clamps_workspace_to_oneshot_limit(monkeypatch):
         group=group,
         max_token_num=8192,
         hidden_dim=7168,
+        use_fp32_lamport=use_fp32_lamport,
     )
-    assert calls[0][2] == 146
-    assert backend._resources[group]["max_token_num"] == 146
+    assert calls[0][2] == expected_max_tokens
+    assert calls[0][4]["use_fp32_lamport"] is use_fp32_lamport
+    assert backend._resources[group]["max_token_num"] == expected_max_tokens
 
 
 def test_backend_eligibility_is_fail_closed():
@@ -113,6 +121,14 @@ def test_backend_eligibility_is_fail_closed():
     noncontiguous.is_contiguous.return_value = False
     assert not backend.can_run(noncontiguous, group)
 
+    one_dimensional = _fake_cuda_bf16_tensor(16, 7168)
+    one_dimensional.dim.return_value = 1
+    assert not backend.can_run(one_dimensional, group)
+
+    three_dimensional = _fake_cuda_bf16_tensor(16, 7168)
+    three_dimensional.dim.return_value = 3
+    assert not backend.can_run(three_dimensional, group)
+
 
 def test_distributed_wiring_deduplicates_alias_groups(monkeypatch):
     from tokenspeed.runtime.distributed.comm_backend import registry
@@ -126,7 +142,7 @@ def test_distributed_wiring_deduplicates_alias_groups(monkeypatch):
     mapping = SimpleNamespace(
         attn=SimpleNamespace(tp_group=group),
         dense=SimpleNamespace(tp_group=group),
-        moe=SimpleNamespace(tp_ep_group=group),
+        moe=SimpleNamespace(ep_size=1, tp_ep_group=group),
     )
     config = SimpleNamespace(
         enable_trtllm_allreduce=True,
@@ -145,6 +161,33 @@ def test_distributed_wiring_deduplicates_alias_groups(monkeypatch):
         max_token_num=8192,
         hidden_dim=7168,
     )
+
+
+def test_distributed_wiring_skips_expert_parallel_group(monkeypatch):
+    from tokenspeed.runtime.distributed.comm_backend import registry
+
+    backend = AutoBackend()
+    configure_group = MagicMock(return_value=True)
+    backend._trtllm_ar = SimpleNamespace(configure_group=configure_group)
+    monkeypatch.setattr(registry, "get_global_backend", lambda: backend)
+
+    mapping = SimpleNamespace(
+        attn=SimpleNamespace(tp_group=(0,)),
+        dense=SimpleNamespace(tp_group=(0,)),
+        moe=SimpleNamespace(ep_size=8, tp_ep_group=tuple(range(8))),
+    )
+    config = SimpleNamespace(
+        enable_trtllm_allreduce=True,
+        nnodes=1,
+        mapping=mapping,
+        global_rank=0,
+        max_num_tokens=8192,
+        hidden_size=7168,
+    )
+
+    DistributedInitializer._configure_trtllm_allreduce(config)
+
+    configure_group.assert_not_called()
 
 
 def test_distributed_wiring_rejects_multinode():
