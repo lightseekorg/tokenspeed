@@ -1,6 +1,6 @@
 #!/usr/bin/bash
 
-# Tested on TensorRT-LLM tag: v1.3.0rc13
+# Tested on TensorRT-LLM commit: 70c5e43
 
 set -euo pipefail
 
