@@ -122,6 +122,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_forward_cache_ops.cpp
         tests/cpp/test_flat_forward_operation.cpp
         tests/cpp/test_flat_kvcache_lifecycle.cpp
+        tests/cpp/test_flat_kvcache_scenarios.cpp
         tests/cpp/test_scheduler_plan.cpp
         tests/cpp/test_outside_event_handler.cpp
         tests/cpp/test_write_back.cpp
