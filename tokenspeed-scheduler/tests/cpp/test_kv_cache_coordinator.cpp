@@ -404,5 +404,62 @@ TEST(KvCacheCoordinatorAdvanceWindow, OnlySlidingWindowGroupEvicts) {
     EXPECT_NE(tables[1].Blocks()[2], pool.NullBlock());
 }
 
+// Three groups (full + two sliding-window): the common prefix is the MINIMUM
+// coverage across all three, not just across two. full caches 4 pages, swa_a
+// caches a 3-run at the front, swa_b only a 2-run at the front. Common should be
+// min(4, 3, 2) = 2, and every group's per-group hit is truncated to 2.
+TEST(CoordinatorMatchTest, ThreeGroupsCommonIsMinCoverageAcrossAll) {
+    BlockPool pool(64);
+    std::vector<KvCacheSpec> specs = {
+        {AttnKind::kFull, 4, 0},
+        {AttnKind::kSlidingWindow, 4, 40},
+        {AttnKind::kSlidingWindow, 4, 40},
+    };
+    KvCacheCoordinator coord = MakeCoordinator(specs, pool);
+
+    std::vector<std::string> ch =
+        ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}});
+    // group 0 (full): all 4 pages.
+    for (const std::string& h : ch) CacheForGroup(pool, h, 0);
+    // group 1 (swa_a): front 3-run.
+    CacheForGroup(pool, ch[0], 1);
+    CacheForGroup(pool, ch[1], 1);
+    CacheForGroup(pool, ch[2], 1);
+    // group 2 (swa_b): front 2-run -> the binding minimum.
+    CacheForGroup(pool, ch[0], 2);
+    CacheForGroup(pool, ch[1], 2);
+
+    CoordinatorMatch m = coord.MatchPrefix(ch);
+    EXPECT_EQ(m.num_common_blocks, 2) << "common = min(4, 3, 2)";
+    ASSERT_EQ(m.per_group.size(), 3u);
+    EXPECT_EQ(m.per_group[0].blocks.size(), 2u);
+    EXPECT_EQ(m.per_group[1].blocks.size(), 2u);
+    EXPECT_EQ(m.per_group[2].blocks.size(), 2u);
+    // Each group's num_hit recomputed to the truncated common length.
+    EXPECT_EQ(m.per_group[0].num_hit_blocks, 2);
+    EXPECT_EQ(m.per_group[1].num_hit_blocks, 2);
+    EXPECT_EQ(m.per_group[2].num_hit_blocks, 2);
+}
+
+// Three groups where one sliding-window group has ZERO hits: that forces the
+// common prefix to 0 for everyone, even though the other two fully hit.
+TEST(CoordinatorMatchTest, ThreeGroupsOneAllMissForcesZeroCommon) {
+    BlockPool pool(64);
+    std::vector<KvCacheSpec> specs = {
+        {AttnKind::kFull, 4, 0},
+        {AttnKind::kSlidingWindow, 4, 40},
+        {AttnKind::kSlidingWindow, 4, 40},
+    };
+    KvCacheCoordinator coord = MakeCoordinator(specs, pool);
+
+    std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}});
+    // groups 0 and 1 fully cache both pages; group 2 caches nothing.
+    for (const std::string& h : ch) CacheForGroup(pool, h, 0);
+    for (const std::string& h : ch) CacheForGroup(pool, h, 1);
+
+    CoordinatorMatch m = coord.MatchPrefix(ch);
+    EXPECT_EQ(m.num_common_blocks, 0) << "one group all-miss -> common 0";
+}
+
 }  // namespace
 }  // namespace tokenspeed::test
