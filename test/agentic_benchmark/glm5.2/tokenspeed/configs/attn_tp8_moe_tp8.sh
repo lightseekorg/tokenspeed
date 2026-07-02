@@ -10,7 +10,7 @@ exec ts serve \
     --max-num-seqs 16 \
     --max-prefill-tokens 8192 \
     --chunked-prefill-size 8192 \
-    --gpu-memory-utilization 0.9 \
+    --gpu-memory-utilization 0.95 \
     --disable-cuda-graph-padding \
     --trust-remote-code \
     --moe-backend flashinfer_trtllm \
