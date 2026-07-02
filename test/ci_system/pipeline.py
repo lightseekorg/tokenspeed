@@ -475,14 +475,6 @@ def setup_runner(
         cwd=cwd,
         dry_run=dry_run,
     )
-    shell_run(
-        "sudo apt-get install -y libspdlog-dev || "
-        "(git clone --depth 1 https://github.com/gabime/spdlog.git /tmp/spdlog && "
-        "sudo cp -r /tmp/spdlog/include/spdlog /usr/local/include/)",
-        env=local_env,
-        cwd=cwd,
-        dry_run=dry_run,
-    )
 
     # nvidia-cusparseLt is a CUDA-only dependency; skip on AMD/ROCm runners.
     if not is_amd_runner(runner):

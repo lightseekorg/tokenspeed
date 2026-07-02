@@ -62,7 +62,7 @@ ensure_flashinfer_jit_cache_for_gb200() {
     fi
 
     local wheel_url
-    wheel_url="$(python3 "${SCRIPT_DIR}/flashinfer_jit_cache.py" \
+    wheel_url="$(python3 "${SCRIPT_DIR}/flashinfer_jit_cache_installer.py" \
         --requirements "${CUDA_REQ}" \
         --cuda-index "${CUINDEX}")"
     if [ -z "${wheel_url}" ]; then

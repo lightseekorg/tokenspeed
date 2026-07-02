@@ -237,8 +237,13 @@ class AttentionProgram:
         cache_len = cache_len - (cfg.MAX_SEQLEN_Q - 1 - q_pos)
         cache_len = maximum(cache_len, 0)
         if cfg.IS_SLIDING:
-            window_len = min(cache_len, cfg.WINDOW_LEFT)
-            kv_start = cache_len - window_len
+            # WINDOW_LEFT is defined as exclusive (keys strictly to the left, not
+            # counting the current token), so the window is WINDOW_LEFT + 1 keys
+            # once the current token is included. E.g. with
+            # WINDOW_LEFT = 127 and cache_len = 500 (current token at index 499),
+            # kv_start = 500 - (127 + 1) = 372 keeps keys [372, 499] = 128 keys.
+            # Without the + 1, kv_start = 373 would drop the leftmost key.
+            kv_start = cache_len - min(cache_len, cfg.WINDOW_LEFT + 1)
         else:
             kv_start = cache_len - cache_len
         first_page = kv_start // cfg.PAGE_SIZE

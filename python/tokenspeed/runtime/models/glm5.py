@@ -27,27 +27,17 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
+from tokenspeed_kernel.ops.attention import (
+    dsa_decode_topk,
+    dsa_plan,
+    dsa_prefill_topk,
+)
 from tokenspeed_kernel.ops.attention.triton.dsa_sparse_layout import (
     full_context_topk_to_global_slots,
-    local_topk_to_global_slots,
 )
-from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
+from tokenspeed_kernel.ops.transform import hadamard_transform
 from torch import nn
 from transformers import PretrainedConfig
-
-try:
-    from tokenspeed_kernel.thirdparty import deep_gemm
-except Exception:
-    deep_gemm = None
-
-try:
-    from tokenspeed_kernel.ops.attention.flashinfer.dsa_topk import (
-        deterministic_decode_topk,
-        has_deterministic_decode_topk,
-    )
-except Exception:
-    deterministic_decode_topk = None
-    has_deterministic_decode_topk = None
 
 from tokenspeed.runtime.configs.utils import get_rope_theta
 from tokenspeed.runtime.distributed import Mapping
@@ -151,7 +141,7 @@ def _build_prefill_kv_workspace_slots(
     max_seq_len: int,
     page_size: int,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     local_offsets = torch.arange(
         int(max_seq_len),
         dtype=torch.int64,
@@ -172,17 +162,7 @@ def _build_prefill_kv_workspace_slots(
         device=device,
         dtype=torch.int64,
     ).unsqueeze(1)
-    seq_cu = torch.zeros(
-        seq_lens.numel() + 1,
-        dtype=torch.int64,
-        device=device,
-    )
-    torch.cumsum(
-        seq_lens.to(device=device, dtype=torch.int64),
-        dim=0,
-        out=seq_cu[1:],
-    )
-    return slots[valid].contiguous(), seq_cu[:-1].contiguous()
+    return slots[valid].contiguous()
 
 
 def _glm_dsa_rope_scaling(
@@ -197,16 +177,6 @@ def _glm_dsa_rope_scaling(
 
 
 def _glm_dsa_hadamard_rotate(x: torch.Tensor) -> torch.Tensor:
-    try:
-        from tokenspeed_kernel.thirdparty.fast_hadamard_transform import (
-            hadamard_transform,
-        )
-    except Exception as exc:
-        raise RuntimeError(
-            "GLM DSA indexer requires fast_hadamard_transform. "
-            "Build/install `tokenspeed-kernel/python` before serving GLM DSA."
-        ) from exc
-
     shape = x.shape
     return hadamard_transform(
         x.to(torch.bfloat16).reshape(-1, shape[-1]).contiguous(),
@@ -223,16 +193,6 @@ def _glm_dsa_hadamard_rotate_pair(
             "GLM DSA paired Hadamard requires matching last dimensions; "
             f"got query={query.shape[-1]}, key={key.shape[-1]}"
         )
-    try:
-        from tokenspeed_kernel.thirdparty.fast_hadamard_transform import (
-            hadamard_transform,
-        )
-    except Exception as exc:
-        raise RuntimeError(
-            "GLM DSA indexer requires fast_hadamard_transform. "
-            "Build/install `tokenspeed-kernel/python` before serving GLM DSA."
-        ) from exc
-
     query_shape = query.shape
     key_shape = key.shape
     head_dim = query_shape[-1]
@@ -507,9 +467,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 prefix=add_prefix("indexer", prefix),
             )
         self._decode_topk_indices_buffer: torch.Tensor | None = None
-        self._decode_local_topk_offsets_buffer: torch.Tensor | None = None
         self._decode_topk_lens_buffer: torch.Tensor | None = None
-        self._decode_topk_arange_buffer: torch.Tensor | None = None
 
     def _get_decode_topk_workspace(
         self,
@@ -669,15 +627,6 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             self._retired_decode_workspaces = retired
         retired.append(buffer)
 
-    def _get_decode_topk_arange(self, topk: int, device: torch.device) -> torch.Tensor:
-        buffer = getattr(self, "_decode_topk_arange_buffer", None)
-        if buffer is None or buffer.device != device or buffer.numel() < topk:
-            if buffer is not None:
-                self._retire_decode_workspace(buffer)
-            buffer = torch.arange(topk, dtype=torch.int32, device=device)
-            self._decode_topk_arange_buffer = buffer
-        return buffer[:topk]
-
     @staticmethod
     def _expand_decode_seq_lens_per_token(
         seq_lens: torch.Tensor,
@@ -721,24 +670,6 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 "GLM DSA sparse decode supports 1-6 query tokens per request "
                 f"(verified next_n <= 6), got {q_len_per_req}."
             )
-
-    def _write_decode_topk_offsets(
-        self,
-        *,
-        logits: torch.Tensor,
-        local_topk_offsets: torch.Tensor,
-        topk: int,
-    ) -> None:
-        if (
-            deterministic_decode_topk is None
-            or has_deterministic_decode_topk is None
-            or not has_deterministic_decode_topk()
-        ):
-            raise RuntimeError(
-                "GLM DSA decode top-k requires flashinfer deterministic top-k."
-            )
-
-        deterministic_decode_topk(logits, local_topk_offsets, topk)
 
     @staticmethod
     def _tensor_version_or_none(tensor: torch.Tensor) -> int | None:
@@ -1000,11 +931,10 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         if full_topk is not None:
             return full_topk
 
-        topk_indices, _, topk_lens = self._compute_decode_topk_indices_deepgemm(
+        return self._compute_decode_topk_indices_portable(
             indexer_output=indexer_output,
             ctx=ctx,
             seq_lens_per_token=seq_lens_per_token,
-            block_tables=block_tables,
             block_tables_per_token=block_tables_per_token,
             q_len_per_req=decode_window.q_len_per_req,
             decode_start=decode_window.start,
@@ -1012,177 +942,108 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             num_decode_tokens=decode_window.num_tokens,
             topk=topk,
         )
-        return GlmDsaDecodeTopK(
-            topk_indices=topk_indices,
-            topk_lens=topk_lens,
-        )
 
-    def _compute_decode_topk_indices_deepgemm(
+    def _get_decode_topk_plan(
+        self,
+        *,
+        ctx: ForwardContext,
+        seq_lens_per_token: torch.Tensor,
+        q_len_per_req: int,
+    ) -> object | None:
+        decode_metadata = getattr(ctx.attn_backend, "forward_decode_metadata", None)
+        if decode_metadata is None:
+            return None
+        q_len_per_req = int(q_len_per_req)
+        plan_shape = (
+            int(seq_lens_per_token.numel()) // q_len_per_req,
+            q_len_per_req,
+        )
+        plan = getattr(decode_metadata, "_dsa_plan", None)
+        if (
+            plan is None
+            or getattr(decode_metadata, "_dsa_plan_q_len", None) != q_len_per_req
+            or getattr(decode_metadata, "_dsa_plan_shape", None) != plan_shape
+        ):
+            plan = dsa_plan(
+                seq_lens=seq_lens_per_token.to(torch.int32).contiguous(),
+                page_size=ctx.token_to_kv_pool.page_size,
+                q_len_per_req=q_len_per_req,
+            )
+            if plan is not None:
+                setattr(decode_metadata, "_dsa_plan", plan)
+                setattr(decode_metadata, "_dsa_plan_q_len", q_len_per_req)
+                setattr(decode_metadata, "_dsa_plan_shape", plan_shape)
+        return plan
+
+    def _compute_decode_topk_indices_portable(
         self,
         *,
         indexer_output: GlmDsaIndexerOutput,
         ctx: ForwardContext,
         seq_lens_per_token: torch.Tensor,
-        block_tables: torch.Tensor,
         block_tables_per_token: torch.Tensor,
         q_len_per_req: int,
         decode_start: int,
         num_tokens: int,
         num_decode_tokens: int,
         topk: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if deep_gemm is None:
-            raise RuntimeError("GLM DSA decode top-k requires DeepGEMM.")
-        if topk not in (512, 1024, 2048):
-            raise RuntimeError(f"GLM DSA decode top-k does not support topk={topk}.")
-        if (
-            not hasattr(ctx.token_to_kv_pool, "has_index_k_buffer")
-            or not ctx.token_to_kv_pool.has_index_k_buffer()
-        ):
-            raise RuntimeError(
-                "GLM DSA decode top-k requires FP8 index-K cache with scales."
-            )
-        page_size = ctx.token_to_kv_pool.page_size
-        if page_size != 64 or self.indexer.index_head_dim != 128:
-            raise RuntimeError(
-                "GLM DSA decode top-k requires page_size=64 and index_head_dim=128; "
-                f"got page_size={page_size}, index_head_dim={self.indexer.index_head_dim}."
-            )
-
+    ) -> GlmDsaDecodeTopK:
         q = indexer_output.query[
             decode_start : decode_start + num_decode_tokens
         ].contiguous()
-        q_2d = q.view(-1, self.indexer.index_head_dim)
-        q_fp8, q_scale = quantize_fp8_with_scale(
-            q_2d,
-            granularity="token_group",
-            group_size=128,
-            scale_encoding="float32",
-        )
-        q_fp8 = q_fp8.view_as(q)
-        q_scale = q_scale.view(num_decode_tokens, self.indexer.index_n_heads, 1)
         weights = (
             indexer_output.weights[decode_start : decode_start + num_decode_tokens]
             .float()
-            .unsqueeze(-1)
-            * q_scale
-            * self.indexer.softmax_scale
-        ).squeeze(-1)
+            .contiguous()
+        )
+        index_k_cache = (
+            ctx.token_to_kv_pool.get_index_k_buffer(self.attn_mqa.layer_id)
+            if hasattr(ctx.token_to_kv_pool, "get_index_k_buffer")
+            else None
+        )
+        index_k_with_scale_cache = (
+            ctx.token_to_kv_pool.get_index_k_with_scale_buffer(self.attn_mqa.layer_id)
+            if hasattr(ctx.token_to_kv_pool, "has_index_k_with_scale_buffer")
+            and ctx.token_to_kv_pool.has_index_k_with_scale_buffer()
+            else None
+        )
+        if index_k_cache is None and index_k_with_scale_cache is None:
+            raise RuntimeError("GLM DSA top-k requires an index-K cache.")
 
-        seq_lens_2d = (
-            seq_lens_per_token.to(torch.int32).view(-1, q_len_per_req).contiguous()
-        )
-        block_tables = block_tables.to(torch.int32).contiguous()
-        max_seq_len = int(block_tables.shape[1]) * page_size
-        if max_seq_len < topk:
-            raise RuntimeError(
-                "GLM DSA decode top-k requires block table capacity >= topk; "
-                f"got capacity={max_seq_len}, topk={topk}."
-            )
-        decode_metadata = getattr(ctx.attn_backend, "forward_decode_metadata", None)
-        schedule_metadata = (
-            None
-            if decode_metadata is None
-            else getattr(
-                decode_metadata,
-                "_dsa_paged_mqa_schedule_metadata",
-                None,
-            )
-        )
-        schedule_shape = tuple(seq_lens_2d.shape)
-        if (
-            schedule_metadata is None
-            or getattr(decode_metadata, "_dsa_paged_mqa_schedule_q_len", None)
-            != q_len_per_req
-            or getattr(decode_metadata, "_dsa_paged_mqa_schedule_shape", None)
-            != schedule_shape
-        ):
-            schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                seq_lens_2d,
-                page_size,
-                deep_gemm.get_num_sms(),
-            )
-            if decode_metadata is not None:
-                setattr(
-                    decode_metadata,
-                    "_dsa_paged_mqa_schedule_metadata",
-                    schedule_metadata,
-                )
-                setattr(
-                    decode_metadata,
-                    "_dsa_paged_mqa_schedule_q_len",
-                    q_len_per_req,
-                )
-                setattr(
-                    decode_metadata,
-                    "_dsa_paged_mqa_schedule_shape",
-                    schedule_shape,
-                )
-        index_k_cache = ctx.token_to_kv_pool.get_index_k_buffer(self.attn_mqa.layer_id)
-        kv_cache = index_k_cache.view(
-            -1,
-            page_size,
-            1,
-            index_k_cache.shape[-1],
-        )
-        logits = deep_gemm.fp8_paged_mqa_logits(
-            q_fp8.view(
-                -1,
-                q_len_per_req,
-                self.indexer.index_n_heads,
-                self.indexer.index_head_dim,
-            ),
-            kv_cache,
-            weights.contiguous(),
-            seq_lens_2d,
-            block_tables,
-            schedule_metadata,
-            max_seq_len,
-            clean_logits=False,
-        )
-        logits.nan_to_num_(
-            nan=float("-inf"),
-            posinf=float("-inf"),
-            neginf=float("-inf"),
-        )
-        col_ids = self._get_decode_topk_arange(logits.shape[1], q.device)
-        logits.masked_fill_(
-            col_ids.view(1, -1) >= seq_lens_2d.view(-1, 1),
-            float("-inf"),
-        )
-        local_topk_offsets = self._get_decode_topk_workspace(
-            "_decode_local_topk_offsets_buffer",
-            num_decode_tokens,
-            topk,
-            q.device,
-        )
-        self._write_decode_topk_offsets(
-            logits=logits,
-            local_topk_offsets=local_topk_offsets,
-            topk=topk,
-        )
         topk_indices = self._get_decode_topk_workspace(
             "_decode_topk_indices_buffer",
             num_tokens,
             topk,
             q.device,
-            fill_value=None,
+            fill_value=-1,
         )
         topk_slice = topk_indices[decode_start : decode_start + num_decode_tokens]
-        topk_lens = self._get_decode_topk_lens_workspace(
-            num_tokens,
-            q.device,
-        )
+        topk_lens = self._get_decode_topk_lens_workspace(num_tokens, q.device)
         topk_lens_slice = topk_lens[decode_start : decode_start + num_decode_tokens]
-        local_topk_to_global_slots(
-            local_topk_offsets=local_topk_offsets,
-            block_table=block_tables_per_token,
-            block_size=page_size,
-            seq_lens=seq_lens_per_token,
+        plan = self._get_decode_topk_plan(
+            ctx=ctx,
+            seq_lens_per_token=seq_lens_per_token,
+            q_len_per_req=q_len_per_req,
+        )
+        dsa_decode_topk(
+            q,
+            weights,
+            seq_lens_per_token,
+            block_tables_per_token,
+            page_size=ctx.token_to_kv_pool.page_size,
+            topk=topk,
+            softmax_scale=self.indexer.softmax_scale,
+            q_len_per_req=q_len_per_req,
+            index_k_cache=index_k_cache,
+            index_k_with_scale_cache=index_k_with_scale_cache,
+            plan=plan,
             out=topk_slice,
             lens_out=topk_lens_slice,
         )
-        return topk_indices, local_topk_offsets, topk_lens
+        return GlmDsaDecodeTopK(
+            topk_indices=topk_indices,
+            topk_lens=topk_lens,
+        )
 
     def _compute_prefill_topk_indices(
         self,
@@ -1218,14 +1079,14 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             device=indexer_output.query.device,
             dtype=torch.int32,
         )
-        kv_workspace_slots, kv_workspace_bases = _build_prefill_kv_workspace_slots(
+        kv_workspace_slots = _build_prefill_kv_workspace_slots(
             block_tables=block_tables,
             seq_lens=seq_lens,
             max_seq_len=max_seq_len,
             page_size=page_size,
             device=indexer_output.query.device,
         )
-        return self._compute_prefill_topk_indices_deepgemm(
+        return self._compute_prefill_topk_indices_portable(
             indexer_output=indexer_output,
             ctx=ctx,
             prefix_lens=prefix_lens,
@@ -1233,13 +1094,12 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             seq_lens=seq_lens,
             block_tables=block_tables,
             kv_workspace_slots=kv_workspace_slots,
-            kv_workspace_bases=kv_workspace_bases,
             max_seq_len=max_seq_len,
             num_prefill_tokens=num_prefill_tokens,
             topk=topk,
         )
 
-    def _compute_prefill_topk_indices_deepgemm(
+    def _compute_prefill_topk_indices_portable(
         self,
         *,
         indexer_output: GlmDsaIndexerOutput,
@@ -1249,55 +1109,12 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         seq_lens: torch.Tensor,
         block_tables: torch.Tensor,
         kv_workspace_slots: torch.Tensor,
-        kv_workspace_bases: torch.Tensor,
         max_seq_len: int,
         num_prefill_tokens: int,
         topk: int,
     ) -> GlmDsaPrefillTopK:
-        if deep_gemm is None:
-            raise RuntimeError("GLM DSA prefill top-k requires DeepGEMM.")
-        if topk not in (512, 1024, 2048):
-            raise RuntimeError(f"GLM DSA prefill top-k does not support topk={topk}.")
-        if (
-            not hasattr(ctx.token_to_kv_pool, "has_index_k_buffer")
-            or not ctx.token_to_kv_pool.has_index_k_buffer()
-        ):
-            raise RuntimeError(
-                "GLM DSA prefill top-k requires FP8 index-K cache with scales."
-            )
-        page_size = ctx.token_to_kv_pool.page_size
-        if page_size != 64 or self.indexer.index_head_dim != 128:
-            raise RuntimeError(
-                "GLM DSA prefill top-k requires page_size=64 and index_head_dim=128; "
-                f"got page_size={page_size}, index_head_dim={self.indexer.index_head_dim}."
-            )
-        if num_prefill_tokens <= 0 or seq_lens.numel() == 0:
-            raise RuntimeError("GLM DSA prefill top-k requires at least one token.")
-
-        seq_len_sum = int(seq_lens.sum().item())
-        max_logits_mb = int(global_server_args_dict[_INDEXER_PREFILL_MAX_LOGITS_MB_ARG])
         q = indexer_output.query[:num_prefill_tokens].contiguous()
-        q_2d = q.view(-1, self.indexer.index_head_dim)
-        q_fp8, q_scale = quantize_fp8_with_scale(
-            q_2d,
-            granularity="token_group",
-            group_size=128,
-            scale_encoding="float32",
-        )
-        q_fp8 = q_fp8.view_as(q)
-        q_scale = q_scale.view(num_prefill_tokens, self.indexer.index_n_heads, 1)
-        weights = (
-            indexer_output.weights[:num_prefill_tokens].float().unsqueeze(-1)
-            * q_scale
-            * self.indexer.softmax_scale
-        ).squeeze(-1)
-
-        k_fp8, k_scale = ctx.token_to_kv_pool.gather_index_k(
-            self.attn_mqa.layer_id,
-            kv_workspace_slots,
-        )
-        k_fp8 = k_fp8.view(q_fp8.dtype)
-        kv_fp8 = (k_fp8.contiguous(), k_scale.squeeze(-1).contiguous())
+        weights = indexer_output.weights[:num_prefill_tokens].float().contiguous()
 
         req_ids = torch.arange(
             seq_lens.numel(),
@@ -1326,65 +1143,36 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         row_starts = seq_cu.index_select(0, token_req)
         row_ends = row_starts + causal_lens
 
-        workspace_indices = torch.full(
-            (num_prefill_tokens, topk),
-            -1,
-            dtype=torch.int32,
-            device=q.device,
+        index_k_cache = (
+            ctx.token_to_kv_pool.get_index_k_buffer(self.attn_mqa.layer_id)
+            if hasattr(ctx.token_to_kv_pool, "get_index_k_buffer")
+            else None
         )
-        trtllm_ops = getattr(torch.ops, "trtllm", None)
-        if trtllm_ops is None or not hasattr(trtllm_ops, "indexer_topk_prefill"):
-            raise RuntimeError(
-                "GLM DSA prefill top-k requires torch.ops.trtllm.indexer_topk_prefill."
+        index_k_with_scale_cache = (
+            ctx.token_to_kv_pool.get_index_k_with_scale_buffer(self.attn_mqa.layer_id)
+            if (
+                hasattr(ctx.token_to_kv_pool, "has_index_k_with_scale_buffer")
+                and ctx.token_to_kv_pool.has_index_k_with_scale_buffer()
             )
-
-        seq_len_sum = max(seq_len_sum, 1)
-        max_logits_bytes = max(1, max_logits_mb) * 1024 * 1024
-        max_query_rows = max(1, max_logits_bytes // (seq_len_sum * 4))
-
-        row_starts_i32 = row_starts.to(torch.int32).contiguous()
-        row_ends_i32 = row_ends.to(torch.int32).contiguous()
-        local_starts_i32 = torch.zeros_like(row_starts_i32)
-        causal_lens_i32 = causal_lens.to(torch.int32).contiguous()
-        for start in range(0, num_prefill_tokens, max_query_rows):
-            end = min(start + max_query_rows, num_prefill_tokens)
-            logits = deep_gemm.fp8_mqa_logits(
-                q_fp8[start:end].contiguous(),
-                kv_fp8,
-                weights[start:end].contiguous(),
-                row_starts_i32[start:end],
-                row_ends_i32[start:end],
-                clean_logits=False,
-                max_seqlen_k=int(causal_lens[start:end].max().item()),
-            )
-            logits.nan_to_num_(
-                nan=float("-inf"),
-                posinf=float("-inf"),
-                neginf=float("-inf"),
-            )
-            trtllm_ops.indexer_topk_prefill(
-                logits.contiguous(),
-                local_starts_i32[start:end],
-                causal_lens_i32[start:end],
-                workspace_indices[start:end],
-                topk,
-            )
-        valid_topk = workspace_indices >= 0
-        workspace_indices = torch.where(
-            valid_topk,
-            workspace_indices
-            + kv_workspace_bases.to(torch.int32)
-            .index_select(
-                0,
-                token_req,
-            )
-            .unsqueeze(1),
-            workspace_indices,
+            else None
         )
-        topk_lens = torch.minimum(
-            causal_lens,
-            torch.full_like(causal_lens, topk),
-        ).to(torch.int32)
+        if index_k_cache is None and index_k_with_scale_cache is None:
+            raise RuntimeError("GLM DSA top-k requires an index-K cache.")
+
+        max_logits_mb = int(global_server_args_dict[_INDEXER_PREFILL_MAX_LOGITS_MB_ARG])
+        workspace_indices, topk_lens = dsa_prefill_topk(
+            q,
+            weights,
+            kv_workspace_slots,
+            row_starts.to(torch.int32).contiguous(),
+            row_ends.to(torch.int32).contiguous(),
+            topk=topk,
+            softmax_scale=self.indexer.softmax_scale,
+            index_k_cache=index_k_cache,
+            index_k_with_scale_cache=index_k_with_scale_cache,
+            page_size=ctx.token_to_kv_pool.page_size,
+            max_logits_bytes=max(1, max_logits_mb) * 1024 * 1024,
+        )
         return GlmDsaPrefillTopK(
             workspace_indices=workspace_indices,
             topk_lens=topk_lens,

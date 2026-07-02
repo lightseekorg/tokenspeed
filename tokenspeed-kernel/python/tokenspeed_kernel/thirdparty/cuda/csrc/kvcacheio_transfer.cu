@@ -108,14 +108,15 @@ inline void copy_token_span(
   copy_async_bytes(dst_ptr, src_ptr, copy_bytes, stream);
 }
 
+template <typename PackType>
 __device__ __forceinline__ void transfer_item_warp(
     int32_t lane_id,
     const void* src_addr,
     void* dst_addr,
     int64_t item_size_bytes) {
-  const uint64_t* __restrict__ src = static_cast<const uint64_t*>(src_addr);
-  uint64_t* __restrict__ dst = static_cast<uint64_t*>(dst_addr);
-  const int total_chunks = static_cast<int>(item_size_bytes / sizeof(uint64_t));
+  const PackType* __restrict__ src = static_cast<const PackType*>(src_addr);
+  PackType* __restrict__ dst = static_cast<PackType*>(dst_addr);
+  const int total_chunks = static_cast<int>(item_size_bytes / sizeof(PackType));
 
 #pragma unroll
   for (int j = lane_id; j < total_chunks; j += WARP_SIZE) {
@@ -203,7 +204,7 @@ __device__ __forceinline__ T* get_global_offset_ph(
          layer_id * item_size_bytes / head_num;                // layer_num dimension offset
 }
 
-template <auto SrcOffsetFn, auto DstOffsetFn>
+template <auto SrcOffsetFn, auto DstOffsetFn, typename PackType>
 __global__ void transfer_page_head_kernel_impl(
     const void* __restrict__ src_k,
     void* __restrict__ dst_k,
@@ -259,7 +260,7 @@ __global__ void transfer_page_head_kernel_impl(
             head_id,
             head_num,
             page_size);
-        transfer_item_warp(lane_id, src_k_ptr, dst_k_ptr, head_size_bytes);
+        transfer_item_warp<PackType>(lane_id, src_k_ptr, dst_k_ptr, head_size_bytes);
 
         const char* src_v_ptr = SrcOffsetFn(
             static_cast<const char*>(src_v),
@@ -281,13 +282,13 @@ __global__ void transfer_page_head_kernel_impl(
             head_id,
             head_num,
             page_size);
-        transfer_item_warp(lane_id, src_v_ptr, dst_v_ptr, head_size_bytes);
+        transfer_item_warp<PackType>(lane_id, src_v_ptr, dst_v_ptr, head_size_bytes);
       }
     }
   }
 }
 
-template <auto SrcOffsetFn, auto DstOffsetFn, bool IsMLA>
+template <auto SrcOffsetFn, auto DstOffsetFn, bool IsMLA, typename PackType>
 __global__ void transfer_kernel_impl(
     const void* __restrict__ src_k,
     void* __restrict__ dst_k,
@@ -323,14 +324,14 @@ __global__ void transfer_kernel_impl(
           static_cast<const char*>(src_k), src_k_layer_tbl, layer_id, src_layout_dim, src_page_id, item_size_bytes);
       char* dst_ptr = DstOffsetFn(
           static_cast<char*>(dst_k), dst_k_layer_tbl, layer_id, dst_layout_dim, dst_page_id, item_size_bytes);
-      transfer_item_warp(lane_id, src_ptr, dst_ptr, item_size_bytes);
+      transfer_item_warp<PackType>(lane_id, src_ptr, dst_ptr, item_size_bytes);
 
       if constexpr (!IsMLA) {
         const char* src_v_ptr = SrcOffsetFn(
             static_cast<const char*>(src_v), src_v_layer_tbl, layer_id, src_layout_dim, src_page_id, item_size_bytes);
         char* dst_v_ptr = DstOffsetFn(
             static_cast<char*>(dst_v), dst_v_layer_tbl, layer_id, dst_layout_dim, dst_page_id, item_size_bytes);
-        transfer_item_warp(lane_id, src_v_ptr, dst_v_ptr, item_size_bytes);
+        transfer_item_warp<PackType>(lane_id, src_v_ptr, dst_v_ptr, item_size_bytes);
       }
     }
   }
@@ -358,7 +359,8 @@ void transfer_kv_launcher(
     int64_t page_size = 16,
     int64_t head_num = 1) {
   check_indices(src_indices, dst_indices);
-  TVM_FFI_ICHECK_EQ(item_size % 8, 0) << "Item byte size must be divisible by 8";
+  const int64_t copy_granularity = PageHeadLayout ? (item_size / head_num) : item_size;
+  TVM_FFI_ICHECK_EQ(copy_granularity % 4, 0) << "Item copy granularity must be divisible by 4";
   TVM_FFI_ICHECK_GT(block_quota, 0);
   TVM_FFI_ICHECK_GT(num_warps_per_block, 0);
 
@@ -373,46 +375,57 @@ void transfer_kv_launcher(
   const dim3 grid_dim(num_blocks, 1, 1);
 
   const cudaStream_t stream = get_current_stream();
-  if constexpr (PageHeadLayout) {
-    transfer_page_head_kernel_impl<SrcOffsetFn, DstOffsetFn><<<grid_dim, threads_per_block, 0, stream>>>(
-        src_k,
-        dst_k,
-        src_v,
-        dst_v,
-        static_cast<const int64_t*>(src_indices.data_ptr()),
-        static_cast<const int64_t*>(dst_indices.data_ptr()),
-        start_layer_id,
-        num_layers_to_process,
-        num_items,
-        items_per_warp,
-        item_size,
-        src_layout_dim,
-        dst_layout_dim,
-        src_k_layers,
-        dst_k_layers,
-        src_v_layers,
-        dst_v_layers,
-        page_size,
-        head_num);
+  auto launch = [&](auto pack_tag) {
+    using PackType = decltype(pack_tag);
+    if constexpr (PageHeadLayout) {
+      transfer_page_head_kernel_impl<SrcOffsetFn, DstOffsetFn, PackType><<<grid_dim, threads_per_block, 0, stream>>>(
+          src_k,
+          dst_k,
+          src_v,
+          dst_v,
+          static_cast<const int64_t*>(src_indices.data_ptr()),
+          static_cast<const int64_t*>(dst_indices.data_ptr()),
+          start_layer_id,
+          num_layers_to_process,
+          num_items,
+          items_per_warp,
+          item_size,
+          src_layout_dim,
+          dst_layout_dim,
+          src_k_layers,
+          dst_k_layers,
+          src_v_layers,
+          dst_v_layers,
+          page_size,
+          head_num);
+    } else {
+      transfer_kernel_impl<SrcOffsetFn, DstOffsetFn, IsMLA, PackType><<<grid_dim, threads_per_block, 0, stream>>>(
+          src_k,
+          dst_k,
+          src_v,
+          dst_v,
+          static_cast<const int64_t*>(src_indices.data_ptr()),
+          static_cast<const int64_t*>(dst_indices.data_ptr()),
+          start_layer_id,
+          num_layers_to_process,
+          num_items,
+          items_per_warp,
+          item_size,
+          src_layout_dim,
+          dst_layout_dim,
+          src_k_layers,
+          dst_k_layers,
+          src_v_layers,
+          dst_v_layers);
+    }
+  };
+
+  if (copy_granularity % 16 == 0) {
+    launch(uint4{});
+  } else if (copy_granularity % 8 == 0) {
+    launch(uint64_t{});
   } else {
-    transfer_kernel_impl<SrcOffsetFn, DstOffsetFn, IsMLA><<<grid_dim, threads_per_block, 0, stream>>>(
-        src_k,
-        dst_k,
-        src_v,
-        dst_v,
-        static_cast<const int64_t*>(src_indices.data_ptr()),
-        static_cast<const int64_t*>(dst_indices.data_ptr()),
-        start_layer_id,
-        num_layers_to_process,
-        num_items,
-        items_per_warp,
-        item_size,
-        src_layout_dim,
-        dst_layout_dim,
-        src_k_layers,
-        dst_k_layers,
-        src_v_layers,
-        dst_v_layers);
+    launch(uint32_t{});
   }
 
   check_cuda(cudaGetLastError(), "transfer_kv kernel launch failed");

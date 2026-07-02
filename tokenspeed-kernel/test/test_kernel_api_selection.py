@@ -32,6 +32,7 @@ import tokenspeed_kernel.numerics.reference.gemm as _gemm_reference
 import tokenspeed_kernel.ops.attention as _attention_pkg
 import tokenspeed_kernel.ops.attention.cuda as _attention_cuda
 import tokenspeed_kernel.ops.attention.flash_attn as _attention_flash_attn
+import tokenspeed_kernel.ops.attention.flash_mla as _attention_flash_mla
 import tokenspeed_kernel.ops.attention.flashinfer as _attention_flashinfer
 import tokenspeed_kernel.ops.attention.gluon as _attention_gluon
 import tokenspeed_kernel.ops.attention.triton as _attention_triton
@@ -48,6 +49,25 @@ import tokenspeed_kernel.ops.sampling as _sampling_pkg
 import tokenspeed_kernel.ops.sampling.cute_dsl as _sampling_cute_dsl
 import tokenspeed_kernel.ops.sampling.gluon as _sampling_gluon
 import torch
+from tokenspeed_kernel.ops.attention.triton import dsa as _attention_triton_dsa
+from tokenspeed_kernel.ops.attention.triton import (
+    dsa_topk as _attention_triton_dsa_topk,
+)
+from tokenspeed_kernel.ops.attention.triton import (
+    merge_state as _attention_triton_merge_state,
+)
+from tokenspeed_kernel.ops.attention.triton import (
+    mha_decode as _attention_triton_mha_decode,
+)
+from tokenspeed_kernel.ops.attention.triton import (
+    mha_prefill as _attention_triton_mha_prefill,
+)
+from tokenspeed_kernel.ops.attention.triton import (
+    mla_decode as _attention_triton_mla_decode,
+)
+from tokenspeed_kernel.ops.attention.triton import (
+    mla_prefill as _attention_triton_mla_prefill,
+)
 from tokenspeed_kernel.ops.moe.flashinfer import (
     cutedsl_deepep_nvfp4 as _moe_cutedsl_deepep_nvfp4,
 )
@@ -60,6 +80,7 @@ from tokenspeed_kernel.ops.moe.flashinfer import trtllm_mxint4 as _moe_trtllm_mx
 from tokenspeed_kernel.ops.moe.flashinfer import trtllm_nvfp4 as _moe_trtllm_nvfp4
 from tokenspeed_kernel.ops.moe.flashinfer import trtllm_unquant as _moe_trtllm_unquant
 from tokenspeed_kernel.ops.moe.gluon import mxfp4 as _moe_gluon_mxfp4
+from tokenspeed_kernel.ops.moe.triton import fp8 as _moe_triton_fp8
 from tokenspeed_kernel.ops.moe.triton import mxfp4 as _moe_triton_mxfp4
 from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry
@@ -69,8 +90,16 @@ _RELOAD_MODULES = [
     # Attention registration modules.
     _attention_cuda,
     _attention_flash_attn,
+    _attention_flash_mla,
     _attention_flashinfer,
     _attention_gluon,
+    _attention_triton_mha_prefill,
+    _attention_triton_mha_decode,
+    _attention_triton_mla_prefill,
+    _attention_triton_mla_decode,
+    _attention_triton_merge_state,
+    _attention_triton_dsa,
+    _attention_triton_dsa_topk,
     _attention_triton,
     _attention_pkg,
     # GEMM registration modules.
@@ -93,6 +122,7 @@ _RELOAD_MODULES = [
     _moe_flashinfer,
     _moe_gluon_mxfp4,
     _moe_gluon,
+    _moe_triton_fp8,
     _moe_triton_mxfp4,
     _moe_triton,
     _moe_pkg,
@@ -255,8 +285,8 @@ def test_gemm_mxfp8_online_activation_signature_uses_quantized_storage() -> None
 def test_gemm_mxfp8_online_activation_preserves_repeated_rows() -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for online mxfp8 GEMM verification")
-    if not Platform.get().is_nvidia:
-        pytest.skip("NVIDIA GPU is required for TRTLLM mxfp8 scale layout")
+    if not (Platform.get().is_nvidia or Platform.get().is_cdna4):
+        pytest.skip("online mxfp8 GEMM verification requires NVIDIA or AMD CDNA4")
 
     torch.manual_seed(0)
     num_tokens = 16
@@ -435,6 +465,90 @@ def _attention_decode() -> object:
         max_seqlen_k=128,
         max_seqlen_q=1,
     )
+
+
+def _attention_dsa_decode() -> object:
+    q = torch.empty((2, 8, 576), dtype=torch.bfloat16)
+    sparse_kv_cache = torch.empty((64, 656), dtype=torch.uint8)
+    topk_slots = torch.empty((2, 512), dtype=torch.int32)
+    topk_lens = torch.empty((2,), dtype=torch.int32)
+    return tokenspeed_kernel.dsa_decode(
+        q=q,
+        kv_cache=None,
+        sparse_kv_cache=sparse_kv_cache,
+        topk_slots=topk_slots,
+        topk_lens=topk_lens,
+        max_seqlen_k=64,
+        qk_nope_head_dim=192,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        softmax_scale=1.0,
+        page_size=64,
+        solution="triton",
+    )
+
+
+def _attention_dsa_prefill() -> object:
+    q = torch.empty((2, 8, 576), dtype=torch.bfloat16)
+    sparse_kv_cache = torch.empty((64, 656), dtype=torch.uint8)
+    topk_slots = torch.empty((2, 512), dtype=torch.int32)
+    topk_lens = torch.empty((2,), dtype=torch.int32)
+    return tokenspeed_kernel.dsa_prefill(
+        q=q,
+        kv_cache=None,
+        sparse_kv_cache=sparse_kv_cache,
+        topk_slots=topk_slots,
+        topk_lens=topk_lens,
+        max_seqlen_k=64,
+        qk_nope_head_dim=192,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        softmax_scale=1.0,
+        page_size=64,
+        solution="triton",
+    )
+
+
+def _attention_dsa_decode_topk() -> object:
+    q = torch.empty((2, 2, 128), dtype=torch.bfloat16)
+    weights = torch.empty((2, 2), dtype=torch.float32)
+    index_k = torch.empty((128, 128), dtype=torch.bfloat16)
+    seq_lens = torch.tensor([64, 64], dtype=torch.int32)
+    block_table = torch.empty((2, 1), dtype=torch.int32)
+    return tokenspeed_kernel.dsa_decode_topk(
+        q,
+        weights,
+        seq_lens,
+        block_table,
+        page_size=64,
+        topk=512,
+        softmax_scale=1.0,
+        index_k_cache=index_k,
+    )
+
+
+def _attention_dsa_prefill_topk() -> object:
+    q = torch.empty((2, 2, 128), dtype=torch.bfloat16)
+    weights = torch.empty((2, 2), dtype=torch.float32)
+    index_k = torch.empty((128, 128), dtype=torch.bfloat16)
+    kv_workspace_slots = torch.arange(64, dtype=torch.int64)
+    row_starts = torch.tensor([0, 8], dtype=torch.int32)
+    row_ends = torch.tensor([8, 16], dtype=torch.int32)
+    return tokenspeed_kernel.dsa_prefill_topk(
+        q,
+        weights,
+        kv_workspace_slots,
+        row_starts,
+        row_ends,
+        topk=512,
+        softmax_scale=1.0,
+        index_k_cache=index_k,
+    )
+
+
+def _attention_dsa_plan() -> object:
+    seq_lens = torch.tensor([64, 64], dtype=torch.int32)
+    return tokenspeed_kernel.dsa_plan(seq_lens, page_size=64)
 
 
 def _attention_merge_state() -> object:
@@ -697,7 +811,59 @@ def _moe_apply_mxfp4_precomputed_tp() -> object:
         input_dtype=torch.bfloat16,
         activation="silu",
         ep_size=1,
-        internal_activation_dtype="input",
+        ispp=2048,
+        internal_activation_dtype="fp8",
+    )
+    _assert_moe_plan(
+        plan,
+        apply="triton_mxfp4_precomputed_moe_apply",
+        preprocessor="triton_mxfp4_moe_weights",
+    )
+    x = torch.empty((4, 16), dtype=torch.bfloat16)
+    router_logits = torch.empty((4, 8), dtype=torch.float32)
+    topk_weights = torch.empty((4, 2), dtype=torch.float32)
+    topk_ids = torch.empty((4, 2), dtype=torch.int64)
+    return tokenspeed_kernel.moe_apply(
+        plan,
+        x,
+        torch.nn.Module(),
+        router_logits,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+    )
+
+
+def _moe_apply_fp8_precomputed_tp() -> object:
+    plan = _moe_pkg.moe_plan(
+        "fp8",
+        input_dtype=torch.bfloat16,
+        activation="silu",
+        ep_size=1,
+        fp8_scale_block_shape=(128, 128),
+        solution="triton",
+    )
+    x = torch.empty((4, 16), dtype=torch.bfloat16)
+    router_logits = torch.empty((4, 8), dtype=torch.float32)
+    topk_weights = torch.empty((4, 2), dtype=torch.float32)
+    topk_ids = torch.empty((4, 2), dtype=torch.int64)
+    return tokenspeed_kernel.moe_apply(
+        plan,
+        x,
+        torch.nn.Module(),
+        router_logits,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+    )
+
+
+def _moe_apply_fp8_precomputed_ep() -> object:
+    plan = _moe_pkg.moe_plan(
+        "fp8",
+        input_dtype=torch.bfloat16,
+        activation="silu",
+        ep_size=2,
+        fp8_scale_block_shape=(128, 128),
+        solution="triton",
     )
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
@@ -905,6 +1071,46 @@ _CASES = [
         "triton_attn_merge_state",
         _attention_merge_state,
     ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "dsa_decode",
+        "triton_dsa_decode",
+        _attention_dsa_decode,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "dsa_prefill",
+        "triton_dsa_prefill",
+        _attention_dsa_prefill,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "dsa_decode_topk",
+        "triton_dsa_decode_topk",
+        _attention_dsa_decode_topk,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "dsa_prefill_topk",
+        "triton_dsa_prefill_topk",
+        _attention_dsa_prefill_topk,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "dsa_plan",
+        "triton_dsa_plan",
+        _attention_dsa_plan,
+    ),
     # GEMM API x architecture golden cases.
     _case(_is_supported_gpu, "supported-gpu", "gemm", "mm", "torch_mm", _mm_dense),
     _case(
@@ -930,6 +1136,14 @@ _CASES = [
         "mm",
         "cublaslt_mm_nvfp4",
         _mm_nvfp4,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "gemm",
+        "mm",
+        "triton_mm_fp8_blockscale",
+        _mm_mxfp8,
     ),
     # Sampling API x architecture golden cases.
     _case(
@@ -1053,6 +1267,22 @@ _CASES = [
         "triton_mxfp4_ep_precomputed_moe_apply",
         _moe_apply_mxfp4_precomputed_ep,
     ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "moe",
+        "apply",
+        "triton_fp8_ep_precomputed_moe_apply",
+        _moe_apply_fp8_precomputed_tp,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "moe",
+        "apply",
+        "triton_fp8_ep_precomputed_moe_apply",
+        _moe_apply_fp8_precomputed_ep,
+    ),
 ]
 
 
@@ -1076,6 +1306,8 @@ def selected_kernel_spy(monkeypatch):
                 return torch.empty_like(kwargs["out_a"]), torch.empty_like(
                     kwargs["lse_a"]
                 )
+            if case.mode == "dsa_plan":
+                return torch.empty((1, 4), dtype=torch.int32)
 
             q = kwargs["q"]
             if kwargs.get("return_lse", False):

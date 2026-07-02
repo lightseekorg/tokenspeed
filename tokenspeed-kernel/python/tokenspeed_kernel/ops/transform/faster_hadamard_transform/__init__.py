@@ -18,6 +18,34 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from fast_hadamard_transform import hadamard_transform
+from __future__ import annotations
 
-__all__ = ["hadamard_transform"]
+import torch
+from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
+from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import format_signatures
+
+platform = current_platform()
+
+
+if platform.is_nvidia:
+    from fast_hadamard_transform import hadamard_transform
+
+    @register_kernel(
+        "transform",
+        "hadamard_transform",
+        name="fast_hadamard_transform",
+        solution="fast_hadamard_transform",
+        capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+        signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
+        priority=Priority.PERFORMANT,
+    )
+    def fast_hadamard_transform(
+        x: torch.Tensor,
+        *,
+        scale: float = 1.0,
+    ) -> torch.Tensor:
+        return hadamard_transform(x, scale=scale)
+
+
+__all__ = ["fast_hadamard_transform"]

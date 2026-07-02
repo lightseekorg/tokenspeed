@@ -23,6 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
@@ -33,21 +34,10 @@ _INDEX_K_FP8_GROUP_SIZE = 128
 _INDEX_K_SCALE_BYTES = torch._utils._element_size(torch.float32)
 
 
-def _is_blackwell_device(device: str) -> bool:
-    if not torch.cuda.is_available() or not str(device).startswith("cuda"):
-        return False
-    try:
-        major, _minor = torch.cuda.get_device_capability(device)
-    except (AssertionError, RuntimeError, ValueError):
-        major, _minor = torch.cuda.get_device_capability()
-    return major >= 10
-
-
 def dsa_index_k_row_bytes(index_head_dim: int) -> int:
-    if index_head_dim % _INDEX_K_FP8_GROUP_SIZE != 0:
+    if index_head_dim <= 0 or index_head_dim % _INDEX_K_FP8_GROUP_SIZE != 0:
         raise ValueError(
-            "DSA index_head_dim must be divisible by "
-            f"{_INDEX_K_FP8_GROUP_SIZE}, got {index_head_dim}"
+            f"DSA index_head_dim must be a positive multiple of {_INDEX_K_FP8_GROUP_SIZE}, got {index_head_dim}"
         )
     return (
         index_head_dim
@@ -70,11 +60,13 @@ class DSAConfig(MLAConfig):
     ):
         base = MLAConfig.generate(server_args, model_config, is_draft)
         if base.kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-            if not _is_blackwell_device(server_args.device):
+            platform = current_platform()
+            if not (platform.is_blackwell_plus or platform.is_cdna4_plus):
                 raise ValueError(
-                    "GLM DSA FP8 KV cache currently requires the Blackwell TRTLLM "
-                    "sparse attention path; use --kv-cache-dtype auto or bfloat16 "
-                    f"on this platform, got {server_args.kv_cache_dtype}."
+                    "GLM DSA FP8 KV cache currently requires NVIDIA Blackwell "
+                    "or AMD CDNA4 sparse attention support; use --kv-cache-dtype "
+                    "auto or bfloat16 on this platform, got "
+                    f"{server_args.kv_cache_dtype}."
                 )
         return cls(
             **base.__dict__,

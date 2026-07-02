@@ -32,6 +32,7 @@ from typing import Any, Tuple
 import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.ops.attention.tokenspeed_mla import mla_kv_pack_quantize_fp8
+from tokenspeed_kernel.ops.embedding import apply_rope_mla
 from tokenspeed_kernel.ops.gemm.cute_dsl import (
     nvfp4_gemm_swiglu_nvfp4_quant,
 )
@@ -69,9 +70,6 @@ from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.activation import SiluAndMul
-from tokenspeed.runtime.layers.attention.mla_fp8_utils import (
-    mla_fused_rope_fp8_quantize,
-)
 from tokenspeed.runtime.layers.dense.nvfp4 import Nvfp4LinearMethod
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
 from tokenspeed.runtime.layers.linear import (
@@ -776,15 +774,17 @@ class DeepseekV3AttentionMLA(nn.Module):
             k_nope_raw = K[..., : self.kv_lora_rank]
             k_pe_raw = K[..., self.kv_lora_rank :]
 
-            query_fp8, key_fp8 = mla_fused_rope_fp8_quantize(
-                q_nope=q_nope_absorbed,
-                q_pe=q_pe,
-                k_nope=k_nope_raw,
-                k_pe=k_pe_raw,
-                cos_sin_cache=self.rotary_emb.cos_sin_cache,
+            query_fp8, key_fp8 = apply_rope_mla(
                 positions=positions,
+                q_rope=q_pe,
+                k_rope=k_pe_raw,
+                q_nope=q_nope_absorbed,
+                k_nope=k_nope_raw,
+                cos_sin_cache=self.rotary_emb.cos_sin_cache,
                 is_neox=getattr(self.rotary_emb, "is_neox_style", True),
-                k_scale_inv=1.0 / k_scale,
+                quant_scale_q=1.0,
+                quant_scale_kv=k_scale,
+                enable_pdl=pdl_enabled(),
             )
 
             # Write FP8 KV cache (single write, no double-write)
@@ -921,15 +921,17 @@ class DeepseekV3AttentionMLA(nn.Module):
             # Expand k_pe from [tokens,1,rope] to [tokens,heads,rope] for GQA
             k_pe_expanded = k_pe.expand(-1, self.num_local_heads, -1)
 
-            q_fp8, k_fp8 = mla_fused_rope_fp8_quantize(
+            q_fp8, k_fp8 = apply_rope_mla(
+                positions=positions,
+                q_rope=q_pe,
+                k_rope=k_pe_expanded,
                 q_nope=q_nope,
-                q_pe=q_pe,
                 k_nope=k_nope,
-                k_pe=k_pe_expanded,
                 cos_sin_cache=self.rotary_emb.cos_sin_cache,
                 is_neox=getattr(self.rotary_emb, "is_neox_style", True),
-                positions=positions,
-                k_scale_inv=1.0 / k_scale,
+                quant_scale_q=1.0,
+                quant_scale_kv=k_scale,
+                enable_pdl=pdl_enabled(),
             )
 
             v_fp8 = fp8_quantize(v, enable_pdl=pdl_enabled())

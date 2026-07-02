@@ -472,3 +472,82 @@ def full_context_topk_to_global_slots(
         block=1024,
     )
     return global_slots, lens
+
+
+@triton.jit
+def _workspace_topk_to_global_slots_kernel(
+    out_ptr,
+    workspace_indices_ptr,
+    workspace_indices_stride: tl.constexpr,
+    kv_workspace_slots_ptr,
+    total: tl.constexpr,
+    topk: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < total
+    workspace_idx = tl.load(workspace_indices_ptr + offsets, mask=mask, other=-1)
+    valid = mask & (workspace_idx >= 0)
+    slots = tl.load(kv_workspace_slots_ptr + workspace_idx, mask=valid, other=-1)
+    tl.store(out_ptr + offsets, tl.where(valid, slots, -1), mask=mask)
+
+
+def workspace_topk_to_global_slots(
+    *,
+    workspace_indices: torch.Tensor,
+    kv_workspace_slots: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if workspace_indices.dtype != torch.int32:
+        raise TypeError(
+            f"workspace_indices must be int32, got {workspace_indices.dtype}"
+        )
+    if workspace_indices.dim() != 2:
+        raise ValueError(
+            "workspace_indices must be [tokens, topk], got "
+            f"{tuple(workspace_indices.shape)}"
+        )
+    if kv_workspace_slots.dim() != 1:
+        raise ValueError(
+            f"kv_workspace_slots must be 1-D, got {tuple(kv_workspace_slots.shape)}"
+        )
+    if out is None:
+        out = torch.empty_like(workspace_indices)
+    elif (
+        out.shape != workspace_indices.shape
+        or out.dtype != torch.int32
+        or out.device != workspace_indices.device
+    ):
+        raise ValueError(
+            "out must be int32 with shape "
+            f"{tuple(workspace_indices.shape)} on {workspace_indices.device}, "
+            f"got {tuple(out.shape)} {out.dtype} on {out.device}"
+        )
+    if workspace_indices.numel() == 0:
+        return out
+    if not workspace_indices.is_cuda:
+        raise RuntimeError("DSA workspace top-k slot conversion requires CUDA tensors.")
+
+    workspace_indices = workspace_indices.contiguous()
+    kv_workspace_slots = kv_workspace_slots.to(
+        device=workspace_indices.device,
+        dtype=torch.int64,
+    ).contiguous()
+    out_view = out.contiguous() if not out.is_contiguous() else out
+    total = int(workspace_indices.numel())
+    block = 256
+    _workspace_topk_to_global_slots_kernel[(triton.cdiv(total, block),)](
+        out_view,
+        workspace_indices,
+        workspace_indices.stride(0),
+        kv_workspace_slots,
+        total=total,
+        topk=workspace_indices.shape[1],
+        BLOCK=block,
+        num_warps=4,
+        num_stages=1,
+    )
+    if out_view.data_ptr() != out.data_ptr():
+        out.copy_(out_view)
+    return out

@@ -276,7 +276,7 @@ def _per_token_group_quant_8bit_raw(
             bit8_max = 127.0
             bit8_min = -128.0
         else:
-            bit8_max = 224.0
+            bit8_max = platform.fp8e4m3fn.max
             bit8_min = -bit8_max
     else:
         if dtype == torch.int8:

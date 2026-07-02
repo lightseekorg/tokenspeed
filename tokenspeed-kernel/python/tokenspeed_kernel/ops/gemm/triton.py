@@ -444,17 +444,27 @@ def w8a8_block_fp8_matmul_triton(
     else:
         # Default config
         # Block-wise quant: BLOCK_SIZE_K must be divisible by block_size[1]
-        config = {
-            "BLOCK_SIZE_M": 64,
-            "BLOCK_SIZE_N": block_size[0],
-            "BLOCK_SIZE_K": block_size[1],
-            "GROUP_SIZE_M": 32,
-            "num_warps": 4,
-            "num_stages": 3,
-        }
+        if Platform.get().is_amd:
+            config = {
+                "BLOCK_SIZE_M": 32,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": block_size[1],
+                "GROUP_SIZE_M": 8,
+                "num_warps": 4,
+                "num_stages": 1,
+            }
+        else:
+            config = {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": block_size[0],
+                "BLOCK_SIZE_K": block_size[1],
+                "GROUP_SIZE_M": 32,
+                "num_warps": 4,
+                "num_stages": 3,
+            }
 
     kernel = _w8a8_block_fp8_matmul
-    if Platform.get().is_amd:
+    if Platform.get().is_amd and config["BLOCK_SIZE_N"] == block_size[0]:
         num_workgroups = math.ceil(M / config["BLOCK_SIZE_M"]) * math.ceil(
             N / config["BLOCK_SIZE_N"]
         )
@@ -722,8 +732,7 @@ def triton_scaled_mm(
     name="triton_mm_fp8_blockscale",
     solution="triton",
     capability=CapabilityRequirement(
-        min_arch_version=ArchVersion(10, 0),
-        vendors=frozenset({"nvidia"}),
+        vendors=frozenset({"amd", "nvidia"}),
     ),
     signatures=_MXFP8_FORMAT_SIGNATURES,
     traits={},
