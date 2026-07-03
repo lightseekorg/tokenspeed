@@ -35,6 +35,9 @@ if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.attention.gluon.mha_decode_fp16_gfx950 import (
         gluon_mha_decode_fp16_gfx950 as _decode_impl,
     )
+    from tokenspeed_kernel_amd.ops.attention.gluon.mha_extend_fp16_gfx950 import (
+        gluon_mha_extend_fp16_gfx950 as _extend_impl,
+    )
     from tokenspeed_kernel_amd.ops.attention.gluon.mha_prefill_fp16_gfx950 import (
         gluon_mha_prefill_fp16_gfx950 as _prefill_impl,
     )
@@ -91,3 +94,32 @@ if current_platform().is_amd:
     )
     def gluon_mha_prefill_fp16_gfx950(*args, **kwargs):
         return _prefill_impl(*args, **kwargs)
+
+    @register_kernel(
+        "attention",
+        "mha_extend_with_kvcache",
+        name="gluon_mha_extend_fp16_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=format_signatures(
+            ("q", "k_cache", "v_cache"),
+            "dense",
+            {torch.float16, torch.bfloat16},
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "head_dim": frozenset({64}),
+            "page_size": frozenset({64}),
+            "is_causal": frozenset({False, True}),
+            "sliding_window": frozenset({False, True}),
+            "support_sinks": frozenset({False, True}),
+            "support_logit_cap": frozenset({False}),
+            "return_lse": frozenset({False, True}),
+        },
+    )
+    def gluon_mha_extend_fp16_gfx950(*args, **kwargs):
+        return _extend_impl(*args, **kwargs)
