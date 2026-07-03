@@ -173,6 +173,16 @@ class EventLoop:
         target, draft = create_model_runner(
             server_args, self.model_config, draft_model_config, gpu_id, global_rank
         )
+        self.use_overlap_schedule = should_use_overlap_schedule(
+            disable_overlap_schedule=server_args.disable_overlap_schedule,
+            disaggregation_mode=server_args.disaggregation_mode,
+        )
+        self.overlap_schedule_depth = int(self.use_overlap_schedule)
+        decode_input_tokens = (
+            server_args.speculative_num_draft_tokens
+            if server_args.speculative_algorithm is not None
+            else 1
+        )
 
         (
             attn_backend,
@@ -190,6 +200,8 @@ class EventLoop:
             min_per_gpu_mem,
             server_args.enable_memory_saver,
             draft_model_config,
+            decode_input_tokens=decode_input_tokens,
+            overlap_schedule_depth=self.overlap_schedule_depth,
         )
 
         num_total_pages = self.max_total_num_tokens // server_args.block_size
@@ -213,6 +225,7 @@ class EventLoop:
             gpu_id=gpu_id,
             global_rank=global_rank,
             num_total_pages=num_total_pages,
+            overlap_schedule_depth=self.overlap_schedule_depth,
         )
         self.model_executor = create_model_executor(
             server_args=server_args,
@@ -328,7 +341,6 @@ class EventLoop:
 
         # Adjunct enabled only when pool opts in AND prefix-caching switch is on.
         paged_cache_groups = pool_to_paged_cache_groups(token_to_kv_pool)
-        self._paged_cache_groups = paged_cache_groups
         prefix_cache_adjunct = None
         required_groups = token_to_kv_pool.prefix_cache_required_group_ids
         if required_groups is not None and server_args.enable_prefix_caching:
@@ -344,11 +356,8 @@ class EventLoop:
             prefetch_threshold=4,  # Keep this hard-coded until it becomes configurable.
             role=server_args.disaggregation_mode,
             enable_kv_cache_events=self._kv_events_enabled,
-            decode_input_tokens=(
-                server_args.speculative_num_draft_tokens
-                if server_args.speculative_algorithm is not None
-                else 1
-            ),
+            decode_input_tokens=decode_input_tokens,
+            overlap_schedule_depth=self.overlap_schedule_depth,
             disable_prefix_cache=not server_args.enable_prefix_caching,
             enable_mamba=has_mamba,
             mamba_cache_chunk_size=server_args.mamba_cache_chunk_size,
@@ -361,7 +370,8 @@ class EventLoop:
         )
         logger.info(
             "Scheduler config: page_size=%s num_device_pages=%s "
-            "max_scheduled_tokens=%s decode_input_tokens=%s disable_l2_cache=%s "
+            "max_scheduled_tokens=%s decode_input_tokens=%s "
+            "overlap_schedule_depth=%s disable_l2_cache=%s "
             "max_batch_size=%s (global max_num_seqs=%s, dp_size=%s) "
             "mamba_pool_total_chunks=%s enable_mamba=%s "
             "disable_prefix_cache=%s paged_cache_groups=%s",
@@ -369,6 +379,7 @@ class EventLoop:
             scheduler_cfg.num_device_pages,
             scheduler_cfg.max_scheduled_tokens,
             scheduler_cfg.decode_input_tokens,
+            scheduler_cfg.overlap_schedule_depth,
             scheduler_cfg.disable_l2_cache,
             scheduler_cfg.max_batch_size,
             server_args.max_num_seqs,
@@ -1600,13 +1611,7 @@ def run_event_loop(
             # the loop and starts the first DP metadata collective.
             dist.barrier(group=event_loop.world_cpu_group)
 
-        use_overlap = should_use_overlap_schedule(
-            disable_overlap_schedule=server_args.disable_overlap_schedule,
-            disaggregation_mode=server_args.disaggregation_mode,
-            speculative_algorithm=server_args.speculative_algorithm,
-            paged_cache_groups=getattr(event_loop, "_paged_cache_groups", ()),
-        )
-        if use_overlap:
+        if event_loop.use_overlap_schedule:
             event_loop.event_loop_overlap()
         else:
             event_loop.event_loop()

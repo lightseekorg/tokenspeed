@@ -31,6 +31,9 @@ import torch
 import torch.distributed as dist
 import tqdm
 
+from tokenspeed.runtime.configs.paged_cache_spec import (
+    compute_max_logical_pages_for_capture,
+)
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
@@ -70,22 +73,6 @@ def _should_update_mamba_state_after_mtp_verify(
         and forward_mode.is_decode()
         and hasattr(attn_backend, "update_mamba_state_after_mtp_verify")
     )
-
-
-def compute_max_logical_pages_for_capture(
-    spec,
-    *,
-    max_context_len: int,
-    max_tokens_per_req: int = 1,
-) -> int:
-    raw_per_page = max(1, int(spec.rows_per_page) * int(spec.entry_stride_tokens))
-    if str(getattr(spec, "retention", "")) == "sliding_window":
-        window = int(getattr(spec, "sliding_window_tokens", 0) or 0)
-        live_tokens = max(1, window - 1 + max(1, int(max_tokens_per_req)))
-        if int(max_context_len) > 0:
-            live_tokens = min(live_tokens, int(max_context_len))
-        return max(1, (live_tokens + raw_per_page - 1) // raw_per_page + 1)
-    return max(1, (max(1, int(max_context_len)) + raw_per_page - 1) // raw_per_page)
 
 
 @contextmanager
@@ -231,6 +218,7 @@ class CudaGraphWrapper:
         self.max_tokens_per_req = (
             config.spec_num_tokens if config.spec_algo is not None else 1
         )
+        self.overlap_schedule_depth = config.overlap_schedule_depth
         self.use_v4_mtp_paged_metadata = config.use_v4_mtp_paged_metadata
         self.dp_size = config.data_parallel_size
         self.world_size = config.world_size
@@ -243,6 +231,7 @@ class CudaGraphWrapper:
                 self.input_buffers.seq_lens_buf,
                 paged_cache_group_specs=paged_cache_group_specs,
                 max_tokens_per_req=self.max_tokens_per_req,
+                overlap_schedule_depth=self.overlap_schedule_depth,
             )
         except TypeError:
             attn_backend.init_cuda_graph_state(
@@ -259,6 +248,7 @@ class CudaGraphWrapper:
                     self.drafter.draft_seq_lens_buf,
                     paged_cache_group_specs=draft_paged_cache_group_specs,
                     max_tokens_per_req=self.max_tokens_per_req,
+                    overlap_schedule_depth=self.overlap_schedule_depth,
                 )
             except TypeError:
                 draft_attn_backend.init_cuda_graph_state(
@@ -534,6 +524,7 @@ class CudaGraphWrapper:
                     else self.context_len
                 ),
                 max_tokens_per_req=self.max_tokens_per_req,
+                overlap_schedule_depth=self.overlap_schedule_depth,
             )
             out[str(spec.group_id)] = torch.zeros(
                 (bs, max_pages),
@@ -1019,6 +1010,11 @@ class CudaGraphWrapper:
             )
 
         else:
+            metadata_num_tokens = (
+                {"num_tokens": ctx.input_num_tokens}
+                if self.attn_backend.uses_paged_cache_groups
+                else {}
+            )
             self._init_forward_metadata(
                 padded_bs,
                 ctx.num_extends,
@@ -1037,6 +1033,7 @@ class CudaGraphWrapper:
                 all_decode_or_idle=ctx.all_decode_or_idle,
                 capture_hidden_mode=ctx.capture_hidden_mode,
                 spec_info=spec_info,
+                **metadata_num_tokens,
                 paged_cache_block_tables=(
                     paged_cache_block_tables
                     if self.attn_backend.uses_paged_cache_groups

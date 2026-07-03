@@ -323,6 +323,8 @@ def create_attn_components(
     gpu_memory: int,
     enable_memory_saver: bool = False,
     draft_model_config: ModelConfig | None = None,
+    decode_input_tokens: int = 1,
+    overlap_schedule_depth: int = 0,
 ) -> tuple[
     AttentionBackend,
     BaseTokenToKVPool,
@@ -457,6 +459,8 @@ def create_attn_components(
                 world_group=server_args.mapping.world_group,
             ),
             draft_cache_cell_size=draft_cache_cell_size,
+            decode_input_tokens=decode_input_tokens,
+            overlap_schedule_depth=overlap_schedule_depth,
         )
         logger.info(
             "DeepSeek V4 grouped KV profile: max_live_requests=%s "
@@ -570,6 +574,8 @@ def create_attn_components(
             rank=rank,
             hf_config=model_config.hf_config,
             max_scheduled_tokens=server_args.chunked_prefill_size,
+            decode_input_tokens=decode_input_tokens,
+            overlap_schedule_depth=overlap_schedule_depth,
         )
     elif is_hybrid_gdn:
         resolved_original_backend = _BACKEND_ALIASES.get(
@@ -621,6 +627,8 @@ def create_attn_components(
                 rank=rank,
                 hf_config=draft_model_config.hf_config,
                 max_scheduled_tokens=server_args.chunked_prefill_size,
+                decode_input_tokens=decode_input_tokens,
+                overlap_schedule_depth=overlap_schedule_depth,
             )
         elif any(a in _HYBRID_GDN_ARCHITECTURES for a in draft_archs):
             resolved_draft_backend = _BACKEND_ALIASES.get(

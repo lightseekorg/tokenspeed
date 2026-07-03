@@ -91,6 +91,10 @@ struct SchedulerConfig {
     std::int32_t max_scheduled_tokens{};
     std::int32_t max_batch_size{};
     std::int32_t decode_input_tokens{1};
+    // Number of scheduler iterations that may be dispatched before the
+    // accepted decode length is committed. The current event loop supports
+    // only the non-overlapped (0) and one-step-overlapped (1) contracts.
+    std::int32_t overlap_schedule_depth{0};
     bool disable_l2_cache{false};
     bool enable_l3_storage{false};
     std::int32_t prefetch_threshold{4};  // num pages

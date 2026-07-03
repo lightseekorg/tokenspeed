@@ -63,6 +63,7 @@ def make_config(
     role: str,
     enable_kv_cache_events: bool = False,
     decode_input_tokens: int = 1,
+    overlap_schedule_depth: int = 0,
     disable_prefix_cache: bool = False,
     enable_mamba: bool = False,
     mamba_cache_chunk_size: int = 64,
@@ -92,6 +93,7 @@ def make_config(
         cfg.role = SchedulerConfig.Role.Fused
     cfg.num_device_pages = num_device_pages
     cfg.decode_input_tokens = decode_input_tokens
+    cfg.overlap_schedule_depth = overlap_schedule_depth
     cfg.disable_prefix_cache = disable_prefix_cache
     cfg.disable_l2_cache = disable_l2_cache
 
@@ -167,16 +169,12 @@ def should_use_overlap_schedule(
     *,
     disable_overlap_schedule: bool,
     disaggregation_mode: str,
-    speculative_algorithm: Any | None,
-    paged_cache_groups: Sequence["PagedCacheGroupConfig"] | None = None,
 ) -> bool:
     """Return whether the runtime can use the overlapped scheduler loop."""
 
     if disable_overlap_schedule:
         return False
     if disaggregation_mode == "prefill":
-        return False
-    if speculative_algorithm is not None and paged_cache_groups:
         return False
     return True
 

@@ -1,3 +1,4 @@
+import pytest
 from tokenspeed_scheduler import (
     ExecutionEvent,
     ForwardEvent,
@@ -63,6 +64,66 @@ def _request_ids_in_plan(plan) -> set[str]:
     for op in plan.forward:
         out.update(op.request_ids)
     return out
+
+
+def _overlap_admission_scheduler(
+    verify_width: int, *, exact_capacity: bool
+) -> Scheduler:
+    committed_tokens = 3
+    reservation_end = committed_tokens + 2 * verify_width
+    cfg = _base_config(num_device_pages=256)
+    cfg.decode_input_tokens = verify_width
+    cfg.overlap_schedule_depth = 1
+    # Paged-cache group page 0 is reserved by the allocator.
+    cfg.paged_cache_groups = [
+        PagedCacheGroupConfig(
+            group_id="overlap.history",
+            rows_per_page=1,
+            entry_stride_tokens=1,
+            total_pages=reservation_end + (1 if exact_capacity else 0),
+            retention=PagedCacheRetention.FullHistory,
+            family=PagedCacheGroupFamily.History,
+        )
+    ]
+    scheduler = Scheduler(cfg)
+    scheduler.submit_requests([_make_spec("r", [1, 2])])
+    assert _request_ids_in_plan(scheduler.next_execution_plan()) == {"r"}
+    _advance_tokens(scheduler, "r", [3])
+    return scheduler
+
+
+@pytest.mark.parametrize("verify_width", [1, 2, 4, 8])
+def test_overlap_decode_admission_uses_runtime_verify_width(verify_width: int):
+    scheduler = _overlap_admission_scheduler(verify_width, exact_capacity=True)
+    assert _request_ids_in_plan(scheduler.next_execution_plan()) == {"r"}
+    assert scheduler.paged_cache_group_available_pages("overlap.history") == 0
+    assert scheduler.paged_cache_group_failed_alloc_count("overlap.history") == 0
+
+
+@pytest.mark.parametrize("verify_width", [1, 2, 4, 8])
+def test_overlap_decode_admission_rejects_one_page_short(verify_width: int):
+    scheduler = _overlap_admission_scheduler(verify_width, exact_capacity=False)
+    assert _request_ids_in_plan(scheduler.next_execution_plan()) == set()
+    assert scheduler.paged_cache_group_failed_alloc_count("overlap.history") == 0
+
+
+def test_overlap_schedule_depth_defaults_to_zero_and_rejects_deeper_pipeline():
+    assert SchedulerConfig().overlap_schedule_depth == 0
+    cfg = _base_config()
+    for invalid_depth in (-1, 2):
+        cfg.overlap_schedule_depth = invalid_depth
+        with pytest.raises(ValueError, match="overlap_schedule_depth"):
+            Scheduler(cfg)
+
+    cfg.overlap_schedule_depth = 1
+    cfg.decode_input_tokens = 0
+    with pytest.raises(ValueError, match="decode_input_tokens"):
+        Scheduler(cfg)
+
+    cfg.overlap_schedule_depth = 0
+    cfg.decode_input_tokens = -1
+    with pytest.raises(ValueError, match="decode_input_tokens"):
+        Scheduler(cfg)
 
 
 def test_full_history_admission_denies_instead_of_throwing():

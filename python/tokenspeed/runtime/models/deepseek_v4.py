@@ -172,7 +172,7 @@ def _deepseek_v4_indexer_token_split(
 def _deepseek_v4_forward_metadata(ctx: ForwardContext):
     metadata = getattr(ctx.attn_backend, "forward_metadata", None)
     forward_mode = getattr(ctx, "forward_mode", None)
-    if forward_mode == ForwardMode.EXTEND:
+    if forward_mode is not None and forward_mode.is_extend_or_mixed():
         return getattr(ctx.attn_backend, "forward_prefill_metadata", None) or metadata
     if forward_mode is not None and forward_mode.is_decode_or_idle():
         input_num_tokens = getattr(ctx, "input_num_tokens", None)

@@ -138,6 +138,7 @@ class ModelExecutorConfig:
     spec_num_steps: int | None = None
     # spec_num_tokens == spec_num_steps + 1 for now (without Tree Attention)
     spec_num_tokens: int | None = None
+    overlap_schedule_depth: int = 0
     dp_sampling: bool = False
     dp_sampling_min_bs: int | None = None
     use_v4_mtp_paged_metadata: bool = False
@@ -159,6 +160,7 @@ class ModelExecutorConfig:
         gpu_id: int,
         global_rank: int,
         num_total_pages: int,
+        overlap_schedule_depth: int = 0,
     ) -> ModelExecutorConfig:
         output_length = (
             server_args.speculative_num_draft_tokens
@@ -192,6 +194,7 @@ class ModelExecutorConfig:
             spec_algo=server_args.speculative_algorithm,
             spec_num_steps=server_args.speculative_num_steps,
             spec_num_tokens=server_args.speculative_num_draft_tokens,
+            overlap_schedule_depth=overlap_schedule_depth,
             dp_sampling=server_args.dp_sampling,
             dp_sampling_min_bs=server_args.dp_sampling_min_bs,
             enable_nan_detection=server_args.enable_nan_detection,
@@ -1318,6 +1321,15 @@ class ModelExecutor:
         ).to(self.device, non_blocking=True)
         self.attn_backend.reset_current_inputs(req_pool_tensor, mamba_tensor)
 
+    @staticmethod
+    def _contains_retracted_decode(forward_op) -> bool:
+        # FlatForwardOperation stores hist_token_lens for decode rows only;
+        # non-recovery rows use -1.
+        return any(
+            hist_token_len != -1
+            for hist_token_len in getattr(forward_op, "hist_token_lens", ())
+        )
+
     @nvtx_range("reset_valid_cache_length", color="orange")
     def reset_valid_cache_length(self, forward_op) -> None:
 
@@ -1325,10 +1337,10 @@ class ModelExecutor:
         is_prefill = num_extends > 0
 
         # Retraction recovery: scheduler pushes -1 per decode op, overriding to
-        # a real length only on ScheduleDecodeFromRetractedEvent.
-        has_retract = not is_prefill and any(
-            x != -1 for x in forward_op.hist_token_lens
-        )
+        # a real length only on ScheduleDecodeFromRetractedEvent. Decode rows
+        # may follow prefill rows in a mixed batch, so this cannot be gated on
+        # pure-decode mode.
+        has_retract = self._contains_retracted_decode(forward_op)
 
         # Pure decode without retraction has nothing to do — skip the
         # cross-stream wait + stream-context entry entirely.
@@ -1342,15 +1354,15 @@ class ModelExecutor:
                 device="cpu",
                 pin_memory=True,
             )
-            all_pool_indices = torch.tensor(
-                forward_op.request_pool_indices,
+            decode_pool_indices = torch.tensor(
+                forward_op.request_pool_indices[num_extends:],
                 dtype=torch.int64,
                 device="cpu",
                 pin_memory=True,
             )
         else:
             hist_token_lens_tensor = None
-            all_pool_indices = None
+            decode_pool_indices = None
 
         self.execution_stream.wait_stream(torch.cuda.current_stream())
 
@@ -1374,11 +1386,11 @@ class ModelExecutor:
                     extend_request_pool_indices, extend_prefix_lens
                 )
 
-            elif hist_token_lens_tensor is not None:
+            if hist_token_lens_tensor is not None:
                 # Apply retraction recovery: override valid_cache_lengths with hist_token_lens
                 # where the scheduler has specified a non-(-1) value, so that out_cache_loc
                 # and position IDs are computed against the retracted KV length.
-                pool_idx_dev = all_pool_indices.to(self.device, non_blocking=True)
+                pool_idx_dev = decode_pool_indices.to(self.device, non_blocking=True)
                 hist_dev = hist_token_lens_tensor.to(self.device, non_blocking=True)
 
                 mask_1d = hist_dev != -1
@@ -1449,6 +1461,50 @@ class ModelExecutor:
             )
         return reset_mask
 
+    def _reset_mamba_current_inputs(
+        self,
+        *,
+        num_extends: int,
+        bs: int,
+        has_retract: bool,
+        mamba_pool_indices: torch.Tensor,
+        mamba_cow_src: torch.Tensor,
+        skipped_layerwise_cow_mask: torch.Tensor | None,
+    ) -> None:
+        if not hasattr(self.attn_backend, "reset_current_inputs"):
+            return
+
+        if num_extends > 0:
+            self.attn_backend.reset_current_inputs(
+                self.input_buffers.req_pool_indices_buf[:num_extends],
+                mamba_pool_indices[:num_extends],
+            )
+
+        if not has_retract:
+            return
+
+        # FlatForwardOperation places prefill rows first. Restrict recovery to
+        # the decode suffix so a prefix-cache COW on a prefill row cannot be
+        # mistaken for a retracted decode.
+        decode_begin = num_extends
+        decode_count = bs - decode_begin
+        if decode_count <= 0:
+            return
+        skipped_decode_mask = (
+            skipped_layerwise_cow_mask[decode_begin:bs]
+            if skipped_layerwise_cow_mask is not None
+            else None
+        )
+        retract_mask = self._mamba_retract_reset_mask(
+            mamba_cow_src[decode_begin:bs],
+            decode_count,
+            skipped_decode_mask,
+        )
+        self.attn_backend.reset_current_inputs(
+            self.input_buffers.req_pool_indices_buf[decode_begin:bs][retract_mask],
+            mamba_pool_indices[decode_begin:bs][retract_mask],
+        )
+
     def execute_forward_op(
         self,
         forward_op,
@@ -1475,9 +1531,7 @@ class ModelExecutor:
         graph_padded_bs = 0
 
         with nvtx_range("pre_fill_setup", color="orange"):
-            has_retract = num_extends <= 0 and any(
-                x != -1 for x in getattr(forward_op, "hist_token_lens", [])
-            )
+            has_retract = self._contains_retracted_decode(forward_op)
 
             # Wait for previous iteration's runtime state updates
             # (future_input_map, valid_cache_lengths) on execution_stream to
@@ -1529,22 +1583,14 @@ class ModelExecutor:
                         self.input_buffers.extend_prefix_lens_buf[:num_extends],
                         num_extends,
                     )
-                    if hasattr(self.attn_backend, "reset_current_inputs"):
-                        self.attn_backend.reset_current_inputs(
-                            self.input_buffers.req_pool_indices_buf[:num_extends],
-                            mamba_pool_indices[:num_extends],
-                        )
-                elif has_retract:
-                    if hasattr(self.attn_backend, "reset_current_inputs"):
-                        retract_mask = self._mamba_retract_reset_mask(
-                            mamba_cow_src,
-                            bs,
-                            skipped_layerwise_cow_mask,
-                        )
-                        self.attn_backend.reset_current_inputs(
-                            self.input_buffers.req_pool_indices_buf[:bs][retract_mask],
-                            mamba_pool_indices[:bs][retract_mask],
-                        )
+                self._reset_mamba_current_inputs(
+                    num_extends=num_extends,
+                    bs=bs,
+                    has_retract=has_retract,
+                    mamba_pool_indices=mamba_pool_indices,
+                    mamba_cow_src=mamba_cow_src,
+                    skipped_layerwise_cow_mask=skipped_layerwise_cow_mask,
+                )
 
             grammar_completion = None
 
