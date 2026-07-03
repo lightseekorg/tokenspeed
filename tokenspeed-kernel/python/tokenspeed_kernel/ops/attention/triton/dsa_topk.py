@@ -22,15 +22,242 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.ops.attention.triton.dsa_sparse_layout import (
-    local_topk_to_global_slots,
-)
 from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 _RADIX_TOPK_MIN_COLS = 65536
 _RADIX_TOPK_BLOCK_N = 4096
+
+
+@triton.jit
+def _local_topk_to_global_slots_kernel(
+    global_topk_slots_ptr,
+    global_topk_slots_stride,
+    topk_lens_ptr,
+    local_topk_offsets_ptr,
+    local_topk_offsets_stride,
+    seq_lens_ptr,
+    block_table_ptr,
+    block_table_stride,
+    block_table_cols: tl.constexpr,
+    block_size: tl.constexpr,
+    topk: tl.constexpr,
+    has_seq_lens: tl.constexpr,
+    block: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    count = tl.zeros((), dtype=tl.int32)
+    seq_len = tl.full((), block_table_cols * block_size, dtype=tl.int32)
+    if has_seq_lens:
+        seq_len = tl.load(seq_lens_ptr + token_idx).to(tl.int32)
+
+    for start in range(0, topk, block):
+        offsets = start + tl.arange(0, block)
+        mask = offsets < topk
+        local_idx = tl.load(
+            local_topk_offsets_ptr + token_idx * local_topk_offsets_stride + offsets,
+            mask=mask,
+            other=-1,
+        )
+        valid = (local_idx >= 0) & (local_idx < seq_len)
+        block_idx = local_idx // block_size
+        block_offset = local_idx % block_size
+        valid = valid & (block_idx >= 0) & (block_idx < block_table_cols)
+        page = tl.load(
+            block_table_ptr + token_idx * block_table_stride + block_idx,
+            mask=mask & valid,
+            other=0,
+        )
+        slot = page * block_size + block_offset
+        tl.store(
+            global_topk_slots_ptr + token_idx * global_topk_slots_stride + offsets,
+            tl.where(valid, slot, -1),
+            mask=mask,
+        )
+        count += tl.sum(valid.to(tl.int32), axis=0)
+
+    tl.store(topk_lens_ptr + token_idx, count)
+
+
+def local_topk_to_global_slots(
+    *,
+    local_topk_offsets: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
+    seq_lens: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    lens_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if local_topk_offsets.dtype != torch.int32:
+        raise TypeError(
+            f"local_topk_offsets must be int32, got {local_topk_offsets.dtype}"
+        )
+    if local_topk_offsets.dim() != 2:
+        raise ValueError(
+            "local_topk_offsets must be [tokens, topk], got "
+            f"{tuple(local_topk_offsets.shape)}"
+        )
+    if block_table.dim() != 2:
+        raise ValueError(
+            f"block_table must be [tokens, pages], got {block_table.shape}"
+        )
+    if block_table.shape[1] == 0:
+        raise ValueError("block_table must have at least one page column")
+    num_tokens, topk = local_topk_offsets.shape
+    if block_table.shape[0] < num_tokens:
+        raise ValueError(
+            "block_table must have at least one row per token: "
+            f"rows={block_table.shape[0]}, tokens={num_tokens}"
+        )
+    if seq_lens is not None and seq_lens.dim() != 1:
+        raise ValueError(f"seq_lens must be 1-D, got {tuple(seq_lens.shape)}")
+    if seq_lens is not None and seq_lens.numel() < num_tokens:
+        raise ValueError(
+            "seq_lens must have at least one entry per token: "
+            f"lens={seq_lens.numel()}, tokens={num_tokens}"
+        )
+
+    if out is None:
+        global_slots = torch.empty_like(local_topk_offsets)
+    else:
+        if out.shape != local_topk_offsets.shape:
+            raise ValueError(
+                f"out must have shape {tuple(local_topk_offsets.shape)}, "
+                f"got {tuple(out.shape)}"
+            )
+        if out.dtype != torch.int32 or out.device != local_topk_offsets.device:
+            raise TypeError(
+                "out must be int32 on the same device as local_topk_offsets, "
+                f"got {out.dtype} on {out.device}"
+            )
+        global_slots = out
+    if lens_out is None:
+        lens = torch.empty(
+            num_tokens,
+            dtype=torch.int32,
+            device=local_topk_offsets.device,
+        )
+    else:
+        if lens_out.shape != (num_tokens,):
+            raise ValueError(
+                "lens_out must have shape "
+                f"({num_tokens},), got {tuple(lens_out.shape)}"
+            )
+        if (
+            lens_out.dtype != torch.int32
+            or lens_out.device != local_topk_offsets.device
+        ):
+            raise TypeError(
+                "lens_out must be int32 on the same device as local_topk_offsets, "
+                f"got {lens_out.dtype} on {lens_out.device}"
+            )
+        lens = lens_out
+    if num_tokens == 0:
+        return global_slots, lens
+
+    if not local_topk_offsets.is_cuda:
+        raise RuntimeError("DSA local top-k slot conversion requires CUDA tensors.")
+
+    block_table = block_table.to(device=local_topk_offsets.device, dtype=torch.int32)
+    if seq_lens is not None:
+        seq_lens = seq_lens.to(device=local_topk_offsets.device, dtype=torch.int32)
+    seq_lens_arg = block_table[:, 0] if seq_lens is None else seq_lens
+    _local_topk_to_global_slots_kernel[(num_tokens,)](
+        global_slots,
+        global_slots.stride(0),
+        lens,
+        local_topk_offsets,
+        local_topk_offsets.stride(0),
+        seq_lens_arg,
+        block_table,
+        block_table.stride(0),
+        block_table.shape[1],
+        block_size=int(block_size),
+        topk=topk,
+        has_seq_lens=seq_lens is not None,
+        block=1024,
+    )
+    return global_slots, lens
+
+
+@triton.jit
+def _workspace_topk_to_global_slots_kernel(
+    out_ptr,
+    workspace_indices_ptr,
+    workspace_indices_stride: tl.constexpr,
+    kv_workspace_slots_ptr,
+    total: tl.constexpr,
+    topk: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < total
+    workspace_idx = tl.load(workspace_indices_ptr + offsets, mask=mask, other=-1)
+    valid = mask & (workspace_idx >= 0)
+    slots = tl.load(kv_workspace_slots_ptr + workspace_idx, mask=valid, other=-1)
+    tl.store(out_ptr + offsets, tl.where(valid, slots, -1), mask=mask)
+
+
+def workspace_topk_to_global_slots(
+    *,
+    workspace_indices: torch.Tensor,
+    kv_workspace_slots: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if workspace_indices.dtype != torch.int32:
+        raise TypeError(
+            f"workspace_indices must be int32, got {workspace_indices.dtype}"
+        )
+    if workspace_indices.dim() != 2:
+        raise ValueError(
+            "workspace_indices must be [tokens, topk], got "
+            f"{tuple(workspace_indices.shape)}"
+        )
+    if kv_workspace_slots.dim() != 1:
+        raise ValueError(
+            f"kv_workspace_slots must be 1-D, got {tuple(kv_workspace_slots.shape)}"
+        )
+    if out is None:
+        out = torch.empty_like(workspace_indices)
+    elif (
+        out.shape != workspace_indices.shape
+        or out.dtype != torch.int32
+        or out.device != workspace_indices.device
+    ):
+        raise ValueError(
+            "out must be int32 with shape "
+            f"{tuple(workspace_indices.shape)} on {workspace_indices.device}, "
+            f"got {tuple(out.shape)} {out.dtype} on {out.device}"
+        )
+    if workspace_indices.numel() == 0:
+        return out
+    if not workspace_indices.is_cuda:
+        raise RuntimeError("DSA workspace top-k slot conversion requires CUDA tensors.")
+
+    workspace_indices = workspace_indices.contiguous()
+    kv_workspace_slots = kv_workspace_slots.to(
+        device=workspace_indices.device,
+        dtype=torch.int64,
+    ).contiguous()
+    out_view = out.contiguous() if not out.is_contiguous() else out
+    total = int(workspace_indices.numel())
+    block = 256
+    _workspace_topk_to_global_slots_kernel[(triton.cdiv(total, block),)](
+        out_view,
+        workspace_indices,
+        workspace_indices.stride(0),
+        kv_workspace_slots,
+        total=total,
+        topk=workspace_indices.shape[1],
+        BLOCK=block,
+        num_warps=4,
+        num_stages=1,
+    )
+    if out_view.data_ptr() != out.data_ptr():
+        out.copy_(out_view)
+    return out
 
 
 @triton.jit
@@ -1436,9 +1663,11 @@ __all__ = [
     "dsa_decode_topk_fp8",
     "dsa_prefill_topk",
     "dsa_prefill_topk_fp8",
+    "local_topk_to_global_slots",
     "triton_dsa_plan",
     "triton_dsa_decode_topk",
     "triton_dsa_decode_topk_fp8",
     "triton_dsa_prefill_topk",
     "triton_dsa_prefill_topk_fp8",
+    "workspace_topk_to_global_slots",
 ]

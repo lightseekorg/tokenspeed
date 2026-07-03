@@ -26,7 +26,7 @@ from tokenspeed_kernel.ops.attention import (
     dsa_plan,
     dsa_prefill,
 )
-from tokenspeed_kernel.ops.attention.triton.dsa_sparse_layout import (
+from tokenspeed_kernel.ops.attention.triton.dsa_topk import (
     workspace_topk_to_global_slots,
 )
 from tokenspeed_kernel.platform import current_platform

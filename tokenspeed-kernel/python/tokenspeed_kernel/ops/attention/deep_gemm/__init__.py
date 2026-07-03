@@ -5,7 +5,7 @@ from tokenspeed_kernel.ops.attention.flashinfer.dsa_topk import (
     deterministic_decode_topk,
     has_ragged_decode_topk,
 )
-from tokenspeed_kernel.ops.attention.triton.dsa_sparse_layout import (
+from tokenspeed_kernel.ops.attention.triton.dsa_topk import (
     local_topk_to_global_slots,
 )
 from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale

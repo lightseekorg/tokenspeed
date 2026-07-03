@@ -31,7 +31,7 @@ from tokenspeed_kernel import (
     dsa_prefill,
     dsa_prefill_topk,
 )
-from tokenspeed_kernel.ops.attention.triton.dsa_sparse_layout import (
+from tokenspeed_kernel.ops.attention.triton.dsa_topk import (
     workspace_topk_to_global_slots as dsa_workspace_topk_to_global_slots,
 )
 
