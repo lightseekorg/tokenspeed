@@ -783,6 +783,32 @@ class CudaGraphWrapper:
                     **kwargs,
                 )
                 if self.use_v4_mtp_paged_metadata:
+                    if forward_mode.is_extend():
+                        prefix_lens_cpu = kwargs.get("extend_prefix_lens_cpu")
+                        query_lens_cpu = kwargs.get("extend_seq_lens_cpu")
+                        if not (
+                            isinstance(prefix_lens_cpu, torch.Tensor)
+                            and prefix_lens_cpu.device.type == "cpu"
+                            and prefix_lens_cpu.numel() >= padded_bs
+                            and isinstance(query_lens_cpu, torch.Tensor)
+                            and query_lens_cpu.device.type == "cpu"
+                            and query_lens_cpu.numel() >= padded_bs
+                        ):
+                            raise RuntimeError(
+                                "V4 MTP draft prefill requires complete CPU "
+                                "prefix and query lengths"
+                            )
+                        prefix_lens = prefix_lens_cpu[:padded_bs].tolist()
+                        query_lens = query_lens_cpu[:padded_bs].tolist()
+                        draft_kwargs["max_seq_len_upper_bound"] = max(
+                            (
+                                int(prefix_len) + int(query_len)
+                                for prefix_len, query_len in zip(
+                                    prefix_lens, query_lens
+                                )
+                            ),
+                            default=0,
+                        )
                     self.draft_attn_backend.init_forward_metadata(
                         bs=padded_bs,
                         num_extends=0,
@@ -846,11 +872,11 @@ class CudaGraphWrapper:
         return self.capture_bs[index]
 
     def _pad_graph_req_pool_indices(
-        self, active_req_pool_indices: torch.Tensor, padded_bs: int
+        self, active_bs: int, padded_bs: int
     ) -> torch.Tensor:
-        pad = padded_bs - active_req_pool_indices.shape[0]
-        if pad <= 0:
-            return active_req_pool_indices
+        req_pool_indices = self.input_buffers.req_pool_indices_buf[:padded_bs]
+        if active_bs >= padded_bs:
+            return req_pool_indices
         if self.config.spec_algo == "DFLASH":
             # Route padding rows to the sentinel req-pool slot
             # (max_req_pool_size), not slot 0. The DFLASH draft derives each
@@ -858,26 +884,11 @@ class CudaGraphWrapper:
             # padding rows pointing at slot 0 would grow unbounded with
             # request 0's context and hang the draft block-decode kernel.
             # The sentinel row stays zero-init (length 0, dummy page 0).
-            sentinel = int(self.config.max_req_pool_size)
-            return torch.cat(
-                [
-                    active_req_pool_indices,
-                    active_req_pool_indices.new_full((pad,), sentinel),
-                ]
-            )
-        return torch.cat(
-            [active_req_pool_indices, active_req_pool_indices.new_zeros(pad)]
-        )
-
-    def _set_graph_state_write_indices(
-        self, active_req_pool_indices: torch.Tensor, padded_bs: int
-    ) -> None:
-        state_indices = self.input_buffers.state_write_req_pool_indices_buf[:padded_bs]
-        active_bs = active_req_pool_indices.shape[0]
-        if active_bs > 0:
-            state_indices[:active_bs].copy_(active_req_pool_indices)
-        if active_bs < padded_bs:
-            state_indices[active_bs:padded_bs].fill_(int(self.config.max_req_pool_size))
+            padding_index = int(self.config.max_req_pool_size)
+        else:
+            padding_index = 0
+        req_pool_indices[active_bs:padded_bs].fill_(padding_index)
+        return req_pool_indices
 
     def __call__(
         self,
@@ -909,19 +920,16 @@ class CudaGraphWrapper:
         """
         use_graph = self._can_use_graph(bs, ctx)
         padded_bs = self._padded_bs(bs, ctx) if use_graph else bs
-        active_req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
 
         if use_graph and padded_bs != bs:
             ctx.bs = padded_bs
             pad = padded_bs - bs
-            seq_lens = torch.nn.functional.pad(
-                self.input_buffers.seq_lens_buf[:bs], (0, pad), value=1
-            )
-            req_pool_indices = self._pad_graph_req_pool_indices(
-                active_req_pool_indices, padded_bs
-            )
-            self.input_buffers.seq_lens_buf[:padded_bs].copy_(seq_lens)
-            self.input_buffers.req_pool_indices_buf[:padded_bs].copy_(req_pool_indices)
+            seq_lens = self.input_buffers.seq_lens_buf[:padded_bs]
+            # A multi-token verify row needs at least one key for every query;
+            # seq_len=1 with q_len>1 creates empty causal spans in backends that
+            # consume this buffer directly. Plain decode keeps the value 1.
+            seq_lens[bs:padded_bs].fill_(self.max_tokens_per_req)
+            req_pool_indices = self._pad_graph_req_pool_indices(bs, padded_bs)
             if mamba_pool_indices is not None:
                 # Pad with -1 (PAD_SLOT_ID), NOT 0. Mamba slot 0 is a real
                 # allocatable slot, so padding with 0 aliases a live request's
@@ -944,9 +952,6 @@ class CudaGraphWrapper:
         else:
             seq_lens = self.input_buffers.seq_lens_buf[:padded_bs]
             req_pool_indices = self.input_buffers.req_pool_indices_buf[:padded_bs]
-
-        if use_graph:
-            self._set_graph_state_write_indices(active_req_pool_indices, padded_bs)
 
         mamba_kwargs = {}
         if mamba_pool_indices is not None:

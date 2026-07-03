@@ -327,6 +327,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode | None,
         num_extends: int,
+        extend_seq_lens: torch.Tensor | None,
         extend_seq_lens_cpu: torch.Tensor | None,
         extend_prefix_lens_cpu: torch.Tensor | None,
         extend_prefix_lens: torch.Tensor | None,
@@ -360,7 +361,15 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             num_prefill_reqs = max(0, min(int(num_extends), bs))
             if num_prefill_reqs == 0:
                 return lens
-            if extend_seq_lens_cpu is not None and extend_seq_lens_cpu.numel() > 0:
+            if (
+                extend_seq_lens is not None
+                and extend_seq_lens.device == seq_lens.device
+                and extend_seq_lens.numel() >= num_prefill_reqs
+            ):
+                lens[:num_prefill_reqs].copy_(
+                    extend_seq_lens[:num_prefill_reqs].to(torch.int32)
+                )
+            elif extend_seq_lens_cpu is not None and extend_seq_lens_cpu.numel() > 0:
                 lens[:num_prefill_reqs] = extend_seq_lens_cpu[:num_prefill_reqs].to(
                     seq_lens.device, dtype=torch.int32
                 )
@@ -379,6 +388,16 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             else:
                 lens[:num_prefill_reqs] = seq_lens[:num_prefill_reqs].to(torch.int32)
             return lens
+        if (
+            extend_seq_lens is not None
+            and extend_seq_lens.device == seq_lens.device
+            and extend_seq_lens.numel() >= bs
+        ):
+            return extend_seq_lens[:bs].to(
+                device=seq_lens.device,
+                dtype=torch.int32,
+                copy=True,
+            )
         if extend_seq_lens_cpu is not None:
             return extend_seq_lens_cpu[:bs].to(seq_lens.device, dtype=torch.int32)
         if extend_prefix_lens_cpu is not None:
@@ -387,7 +406,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         if extend_prefix_lens is not None:
             prefix = extend_prefix_lens[:bs].to(torch.int32)
             return (seq_lens[:bs].to(torch.int32) - prefix).clamp_min(0)
-        return seq_lens[:bs].to(torch.int32)
+        return seq_lens[:bs].to(dtype=torch.int32, copy=True)
 
     def _query_lens_cpu(
         self,
@@ -397,22 +416,23 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         extend_seq_lens_cpu: torch.Tensor | None,
         extend_prefix_lens_cpu: torch.Tensor | None,
     ) -> torch.Tensor | None:
+        for name, lengths in (
+            ("extend_seq_lens_cpu", extend_seq_lens_cpu),
+            ("extend_prefix_lens_cpu", extend_prefix_lens_cpu),
+        ):
+            if lengths is not None and lengths.device.type != "cpu":
+                raise RuntimeError(f"DeepSeek V4 {name} must be a CPU tensor")
         if forward_mode is not None and forward_mode.is_decode_or_idle():
-            return torch.ones(bs, dtype=torch.int32)
+            return None
         if forward_mode is not None and forward_mode.is_mixed():
-            verify_width = max(1, int(self.speculative_num_draft_tokens))
-            lens = torch.full((bs,), verify_width, dtype=torch.int32)
             num_prefill_reqs = max(0, min(int(num_extends), bs))
             if num_prefill_reqs == 0:
-                return lens
+                return None
             if extend_seq_lens_cpu is None:
                 return None
-            lens[:num_prefill_reqs] = extend_seq_lens_cpu[:num_prefill_reqs].to(
-                dtype=torch.int32, device="cpu"
-            )
-            return lens
+            return extend_seq_lens_cpu[:num_prefill_reqs].to(dtype=torch.int32)
         if extend_seq_lens_cpu is not None:
-            return extend_seq_lens_cpu[:bs].to(dtype=torch.int32, device="cpu")
+            return extend_seq_lens_cpu[:bs].to(dtype=torch.int32)
         if extend_prefix_lens_cpu is not None:
             return None
         return None
@@ -544,9 +564,11 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode = None,
         req_to_page: torch.Tensor = None,
+        extend_seq_lens: torch.Tensor | None = None,
         extend_seq_lens_cpu: torch.Tensor | None = None,
         extend_prefix_lens_cpu: torch.Tensor | None = None,
         extend_prefix_lens: torch.Tensor | None = None,
+        max_seq_len_upper_bound: int | None = None,
         **kwargs,
     ) -> None:
         paged_cache_block_tables = kwargs.pop("paged_cache_block_tables", None) or {}
@@ -567,12 +589,30 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         device = seq_lens.device
         req_pool_indices = req_pool_indices[:bs]
         seq_lens = seq_lens[:bs].to(torch.int32)
+        if forward_mode is not None and forward_mode.is_mixed():
+            num_prefill_reqs = max(0, min(num_extends, bs))
+        elif forward_mode is not None and forward_mode.is_extend_or_mixed():
+            num_prefill_reqs = bs
+        else:
+            num_prefill_reqs = 0
+        for name, lengths in (
+            ("extend_seq_lens", extend_seq_lens),
+            ("extend_seq_lens_cpu", extend_seq_lens_cpu),
+            ("extend_prefix_lens", extend_prefix_lens),
+            ("extend_prefix_lens_cpu", extend_prefix_lens_cpu),
+        ):
+            if lengths is not None and lengths.numel() < num_prefill_reqs:
+                raise ValueError(
+                    f"DeepSeek V4 {name} requires at least "
+                    f"{num_prefill_reqs} entries, got {lengths.numel()}"
+                )
         query_lens = self._query_lens(
             bs,
             num_tokens,
             seq_lens,
             forward_mode,
             num_extends,
+            extend_seq_lens,
             extend_seq_lens_cpu,
             extend_prefix_lens_cpu,
             extend_prefix_lens,
@@ -581,12 +621,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             forward_mode is not None and forward_mode.is_decode() and num_tokens != bs
         )
         metadata_forward_mode = forward_mode
-        if forward_mode is not None and forward_mode.is_mixed():
-            num_prefill_reqs = max(0, min(num_extends, bs))
-        elif forward_mode is not None and forward_mode.is_extend_or_mixed():
-            num_prefill_reqs = bs
-        else:
-            num_prefill_reqs = 0
         query_lens_cpu = self._query_lens_cpu(
             bs,
             forward_mode,
@@ -595,37 +629,58 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             extend_prefix_lens_cpu,
         )
         seq_lens_cpu = None
-        if extend_prefix_lens_cpu is not None and query_lens_cpu is not None:
-            seq_lens_cpu = seq_lens[:bs].to(dtype=torch.int32, device="cpu")
-            prefix_count = min(
-                int(extend_prefix_lens_cpu.numel()),
-                (
-                    num_prefill_reqs
-                    if forward_mode is not None and forward_mode.is_mixed()
-                    else bs
-                ),
+        if num_prefill_reqs:
+            if (
+                query_lens_cpu is None
+                or query_lens_cpu.device.type != "cpu"
+                or query_lens_cpu.numel() != num_prefill_reqs
+            ):
+                raise RuntimeError(
+                    "DeepSeek V4 prefill metadata requires a complete CPU query-"
+                    "length mirror"
+                )
+            if (
+                extend_prefix_lens_cpu is None
+                or extend_prefix_lens_cpu.device.type != "cpu"
+                or extend_prefix_lens_cpu.numel() < num_prefill_reqs
+            ):
+                raise RuntimeError(
+                    "DeepSeek V4 prefill metadata requires a complete CPU prefix-"
+                    "length mirror"
+                )
+            seq_lens_cpu = (
+                extend_prefix_lens_cpu[:num_prefill_reqs].to(dtype=torch.int32)
+                + query_lens_cpu
             )
-            if prefix_count:
-                seq_lens_cpu[:prefix_count] = (
-                    extend_prefix_lens_cpu[:prefix_count].to(
-                        dtype=torch.int32,
-                        device="cpu",
-                    )
-                    + query_lens_cpu[:prefix_count]
+
+        known_prefill_max = (
+            max(seq_lens_cpu.tolist(), default=0) if seq_lens_cpu is not None else 0
+        )
+        if max_seq_len_upper_bound is not None:
+            max_seq_len = int(max_seq_len_upper_bound)
+            if max_seq_len < 0:
+                raise ValueError(
+                    "DeepSeek V4 max_seq_len_upper_bound must be non-negative, "
+                    f"got {max_seq_len}"
                 )
-        elif extend_seq_lens_cpu is not None and forward_mode is not None:
-            if forward_mode.is_extend():
-                seq_lens_cpu = extend_seq_lens_cpu[:bs].to(
-                    dtype=torch.int32,
-                    device="cpu",
+            if max_seq_len < known_prefill_max:
+                raise ValueError(
+                    "DeepSeek V4 max_seq_len_upper_bound must cover all known "
+                    f"prefill lengths: bound={max_seq_len}, "
+                    f"known_max={known_prefill_max}"
                 )
-            elif forward_mode.is_mixed():
-                seq_lens_cpu = seq_lens[:bs].to(dtype=torch.int32, device="cpu")
-        max_seq_len = int(seq_lens.max().item()) if bs else 0
+        elif num_prefill_reqs == bs:
+            max_seq_len = known_prefill_max
+        else:
+            # Decode rows have no host-side sequence-length mirror. Use the
+            # configured context limit as a conservative bound rather than
+            # synchronously reading a scalar from the model stream.
+            max_seq_len = self.context_len if bs else 0
         if forward_mode is not None and forward_mode.is_extend():
             max_seq_len += max(self.speculative_num_steps - 1, 0)
         if is_packed_decode:
-            max_seq_len += max(int(query_lens.max().item()) - 1, 0)
+            tokens_per_req = num_tokens // bs if bs else 0
+            max_seq_len += max(tokens_per_req - 1, 0)
         max_pages = (max_seq_len + self.page_size - 1) // self.page_size
         if req_to_page is None:
             block_table = torch.zeros(
@@ -662,24 +717,32 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             base_offsets_on_device,
         )
         req_ids = torch.arange(bs, device=device, dtype=torch.int32)
-        token_to_req = torch.repeat_interleave(req_ids, query_lens.clamp_min(0))
+        if num_prefill_reqs:
+            assert query_lens_cpu is not None
+            num_prefill_tokens = sum(query_lens_cpu.tolist())
+            repeat_output_size = num_prefill_tokens
+            if forward_mode is not None and forward_mode.is_mixed():
+                verify_width = max(1, int(self.speculative_num_draft_tokens))
+                repeat_output_size += (bs - num_prefill_reqs) * verify_width
+        else:
+            num_prefill_tokens = 0
+            repeat_output_size = num_tokens
         if (
             forward_mode is not None
             and forward_mode.is_mixed()
             and num_tokens_arg is not None
+            and repeat_output_size != num_tokens
         ):
-            # numel() reads tensor shape metadata only. Reducing query_lens and
-            # calling .item() here would synchronize its CUDA stream on every
-            # eager mixed batch.
-            metadata_tokens = token_to_req.numel()
-            if metadata_tokens != num_tokens:
-                raise RuntimeError(
-                    "DeepSeek V4 mixed metadata token count mismatch: "
-                    f"query_lens describe {metadata_tokens} tokens, packed input has "
-                    f"{num_tokens}"
-                )
-        num_prefill_tokens = (
-            int(query_lens[:num_prefill_reqs].sum().item()) if num_prefill_reqs else 0
+            raise RuntimeError(
+                "DeepSeek V4 mixed metadata token count mismatch: "
+                f"query_lens describe {repeat_output_size} tokens, packed input has "
+                f"{num_tokens}"
+            )
+        repeat_counts = query_lens.clamp_min(0)
+        token_to_req = torch.repeat_interleave(
+            req_ids,
+            repeat_counts,
+            output_size=repeat_output_size,
         )
         query_start_loc = torch.nn.functional.pad(
             torch.cumsum(query_lens.to(torch.int32), dim=0, dtype=torch.int32),
@@ -1221,14 +1284,45 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         if cache_metadata.swa_block_table is None:
             raise RuntimeError("DeepSeek V4 missing paged-cache block table for SWA KV")
         swa_block_table = cache_metadata.swa_block_table
-        max_gather_len = int(gather_lens.max().item()) if num_reqs else 1
         compressed_lens = (
             torch.div(metadata.seq_lens, compress_ratio, rounding_mode="floor")
             if compress_ratio > 1
             else torch.zeros_like(metadata.seq_lens)
         )
+        seq_lens_cpu = metadata.seq_lens_cpu
+        query_lens_cpu = metadata.query_lens_cpu
+        # This runs once per attention layer. Keep the bounds on the retained
+        # CPU mirrors so workspace sizing never synchronizes the model stream.
+        if num_reqs:
+            if (
+                seq_lens_cpu is None
+                or query_lens_cpu is None
+                or seq_lens_cpu.device.type != "cpu"
+                or query_lens_cpu.device.type != "cpu"
+                or seq_lens_cpu.numel() != num_reqs
+                or query_lens_cpu.numel() != num_reqs
+            ):
+                raise RuntimeError(
+                    "DeepSeek V4 prefill workspace sizing requires matching CPU "
+                    "sequence and query lengths"
+                )
+            seq_lens_list = seq_lens_cpu.tolist()
+            query_lens_list = query_lens_cpu.tolist()
+        else:
+            seq_lens_list = []
+            query_lens_list = []
+        gather_window = max(window_size - 1, 0)
+        max_gather_len = max(
+            (
+                query_len + min(seq_len - query_len, gather_window)
+                for seq_len, query_len in zip(seq_lens_list, query_lens_list)
+            ),
+            default=1,
+        )
         compressed_base = (
-            int(compressed_lens.max().item()) if compress_ratio > 1 and num_reqs else 0
+            max((seq_len // compress_ratio for seq_len in seq_lens_list), default=0)
+            if compress_ratio > 1
+            else 0
         )
         workspace_width = max(1, compressed_base + max_gather_len)
         kv_workspace = self._get_prefill_workspace(
@@ -1429,12 +1523,14 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             ),
             seq_lens_cpu=(
                 metadata.seq_lens_cpu[req_start:req_end]
-                if metadata.seq_lens_cpu is not None
+                if forward_mode.is_extend_or_mixed()
+                and metadata.seq_lens_cpu is not None
                 else None
             ),
             query_lens_cpu=(
                 metadata.query_lens_cpu[req_start:req_end]
-                if metadata.query_lens_cpu is not None
+                if forward_mode.is_extend_or_mixed()
+                and metadata.query_lens_cpu is not None
                 else None
             ),
             num_prefill_reqs=num_prefill_reqs,
@@ -1558,10 +1654,23 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 topk_indices=topk_indices,
             )
 
-        token_offsets = [
-            int(x)
-            for x in metadata.query_start_loc[: num_reqs + 1].detach().cpu().tolist()
-        ]
+        query_lens_cpu = metadata.query_lens_cpu
+        if (
+            query_lens_cpu is None
+            or query_lens_cpu.device.type != "cpu"
+            or query_lens_cpu.numel() < num_reqs
+        ):
+            raise RuntimeError(
+                "DeepSeek V4 chunked prefill requires CPU query-length metadata"
+            )
+        token_offsets = [0]
+        for query_len in query_lens_cpu[:num_reqs].tolist():
+            token_offsets.append(token_offsets[-1] + int(query_len))
+        if token_offsets[-1] != q.shape[0]:
+            raise RuntimeError(
+                "DeepSeek V4 chunked prefill query lengths do not match token "
+                f"count: query_tokens={token_offsets[-1]}, q_tokens={q.shape[0]}"
+            )
         out = q.new_empty((q.shape[0], num_local_heads, head_dim))
         saved_metadata = self.forward_metadata
         try:

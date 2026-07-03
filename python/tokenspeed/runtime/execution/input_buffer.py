@@ -67,13 +67,14 @@ class InputBuffers:
         self.has_mamba = has_mamba
 
         with torch.device(device):
-            # Initialise buffers to the *padding* values the captured graph
-            # expects for padded rows (input_ids=1, positions=0, req_pool=0,
-            # seq_lens=1, out_cache_loc=dummy_kv_slot). Each iteration overwrites
-            # the active prefix [:total_tokens]; fill_input_buffers refreshes the
-            # padding tail [total_tokens:] back to these defaults every step,
-            # because a larger prior iter can leave stale values past the
-            # current prefix.
+            # Initialise buffers to neutral padding values (input_ids=1,
+            # positions=0, req_pool=0, seq_lens=1,
+            # out_cache_loc=dummy_kv_slot). CudaGraphWrapper raises padded
+            # seq_lens to the verify width for multi-token decode. Each
+            # iteration overwrites the active prefix [:total_tokens];
+            # fill_input_buffers refreshes the padding tail [total_tokens:]
+            # back to these defaults every step, because a larger prior iter
+            # can leave stale values past the current prefix.
             self.input_ids_buf = torch.ones((max_num_tokens,), dtype=torch.int32)
             # Used in draft prefill
             self.shifted_prefill_ids_buf = torch.ones_like(self.input_ids_buf)
@@ -97,7 +98,6 @@ class InputBuffers:
             )
             self.force_single_token_verify_buf = torch.zeros(max_bs, dtype=torch.bool)
             self.extend_prefix_lens_buf = torch.zeros(max_bs, dtype=torch.int32)
-            self.extend_seq_lens_buf = torch.zeros(max_bs, dtype=torch.int32)
             if has_mamba:
                 self.mamba_pool_indices_buf = torch.full(
                     (max_bs,), -1, dtype=torch.int32
@@ -112,12 +112,23 @@ class InputBuffers:
                     (max_bs,), -1, dtype=torch.int32
                 )
 
-        self.extend_prefix_lens_cpu = torch.zeros(
-            max_bs, dtype=torch.int32, pin_memory=True
-        )
-        self.extend_seq_lens_cpu = torch.zeros(
-            max_bs, dtype=torch.int32, pin_memory=True
-        )
+        # The overlap scheduler can refill the next batch while one prior
+        # forward still owns its CPU length snapshot and the prefix-length H2D
+        # may still read pinned host memory. Its host dispatch depth is one, so
+        # two slots are sufficient; a deeper pipeline must grow this ring to
+        # depth + 1.
+        self._extend_lens_cpu_staging = [
+            (
+                torch.zeros(max_bs, dtype=torch.int32, pin_memory=True),
+                torch.zeros(max_bs, dtype=torch.int32, pin_memory=True),
+            )
+            for _ in range(2)
+        ]
+        self._extend_lens_cpu_staging_idx = 0
+        (
+            self.extend_prefix_lens_cpu,
+            self.extend_seq_lens_cpu,
+        ) = self._extend_lens_cpu_staging[0]
         if has_mamba:
             self._mamba_pool_indices_cpu = torch.full(
                 (max_bs,), -1, dtype=torch.int32, pin_memory=True
@@ -149,7 +160,10 @@ class InputBuffers:
         if decode_input_ids is not None and all(x == -1 for x in decode_input_ids):
             decode_input_ids = None
         req_pool_indices_cpu = torch.tensor(
-            forward_op.request_pool_indices, device="cpu", pin_memory=True
+            forward_op.request_pool_indices,
+            dtype=torch.int64,
+            device="cpu",
+            pin_memory=True,
         )
         self.req_pool_indices_buf[:batch_size].copy_(
             req_pool_indices_cpu,
@@ -181,6 +195,14 @@ class InputBuffers:
         )
 
         if num_extends > 0:
+            staging_idx = self._extend_lens_cpu_staging_idx
+            self._extend_lens_cpu_staging_idx = (staging_idx + 1) % len(
+                self._extend_lens_cpu_staging
+            )
+            (
+                self.extend_prefix_lens_cpu,
+                self.extend_seq_lens_cpu,
+            ) = self._extend_lens_cpu_staging[staging_idx]
             self.extend_prefix_lens_cpu[:num_extends] = torch.as_tensor(
                 forward_op.extend_prefix_lens, dtype=torch.int32
             )
@@ -190,8 +212,12 @@ class InputBuffers:
             self.extend_seq_lens_cpu[:num_extends] = torch.as_tensor(
                 forward_op.input_lengths[:num_extends], dtype=torch.int32
             )
-            self.extend_seq_lens_buf[:num_extends].copy_(
-                self.extend_seq_lens_cpu[:num_extends], non_blocking=True
+            # Reuse the request/prefix metadata just uploaded above. Resetting
+            # here keeps it ordered before the valid-cache-length read below
+            # and avoids duplicate tiny H2D copies in ModelExecutor.
+            runtime_states.reset_states(
+                self.req_pool_indices_buf[:num_extends],
+                self.extend_prefix_lens_buf[:num_extends],
             )
 
         # Get valid cache lengths for requests
@@ -299,14 +325,20 @@ class InputBuffers:
         if num_extends > 0:
             prefill_token_count = sum(forward_op.input_lengths[:num_extends])
             input_ids_cpu = torch.tensor(
-                forward_op.input_ids, device="cpu", pin_memory=True
+                forward_op.input_ids,
+                dtype=torch.int32,
+                device="cpu",
+                pin_memory=True,
             )
             self.input_ids_buf[:prefill_token_count].copy_(
                 input_ids_cpu,
                 non_blocking=True,
             )
             shifted_ids_cpu = torch.tensor(
-                forward_op.shifted_input_ids, device="cpu", pin_memory=True
+                forward_op.shifted_input_ids,
+                dtype=torch.int32,
+                device="cpu",
+                pin_memory=True,
             )
             self.shifted_prefill_ids_buf[:prefill_token_count].copy_(
                 shifted_ids_cpu,
