@@ -6,7 +6,6 @@ from flashinfer_jit_cache_installer import (
     install_url_if_needed,
     jit_cache_wheel_url,
     read_exact_pin,
-    should_sync_jit_cache,
 )
 
 
@@ -37,23 +36,6 @@ def test_jit_cache_url_tracks_flashinfer_and_cuda_versions():
         "v0.6.13/flashinfer_jit_cache-0.6.13+cu130-cp39-abi3-"
         "manylinux_2_28_aarch64.whl"
     )
-
-
-@pytest.mark.parametrize(
-    "runner_label,expected",
-    [
-        ("b200-4gpu", True),
-        ("b200v2-4gpu", True),
-        ("gb200-4gpu", True),
-        ("gb200-4gpu-perf", True),
-        ("b300-4gpu", False),
-        ("h100-1gpu", False),
-        ("", False),
-        (None, False),
-    ],
-)
-def test_should_sync_jit_cache_only_on_b200_and_gb200(runner_label, expected):
-    assert should_sync_jit_cache(runner_label) is expected
 
 
 def test_install_url_if_needed_skips_matching_version(tmp_path: Path):

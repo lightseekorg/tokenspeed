@@ -56,12 +56,15 @@ pip_install_with_retry() {
     done
 }
 
-ensure_flashinfer_jit_cache_for_runner() {
+ensure_flashinfer_jit_cache_for_gb200() {
+    if [[ "${CI_RUNNER_LABEL:-}" != gb200* ]]; then
+        return 0
+    fi
+
     local wheel_url
     wheel_url="$(python3 "${SCRIPT_DIR}/flashinfer_jit_cache_installer.py" \
         --requirements "${CUDA_REQ}" \
-        --cuda-index "${CUINDEX}" \
-        --runner-label "${CI_RUNNER_LABEL:-}")"
+        --cuda-index "${CUINDEX}")"
     if [ -z "${wheel_url}" ]; then
         return 0
     fi
@@ -102,10 +105,10 @@ echo "=== Step 2: Upgrade pip/setuptools/wheel ==="
 python3 -m pip install --upgrade pip setuptools wheel
 
 # ============================================================
-# Step 3: Sync FlashInfer JIT cache on B200/GB200
+# Step 3: Sync FlashInfer JIT cache on GB200
 # ============================================================
-echo "=== Step 3: Sync FlashInfer JIT cache on B200/GB200 ==="
-ensure_flashinfer_jit_cache_for_runner
+echo "=== Step 3: Sync FlashInfer JIT cache on GB200 ==="
+ensure_flashinfer_jit_cache_for_gb200
 
 # ============================================================
 # Step 4: Install tokenspeed-kernel
