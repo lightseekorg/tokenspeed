@@ -32,7 +32,6 @@ from tokenspeed_kernel.ops.attention import (
     dsa_plan,
     dsa_prefill_topk,
 )
-from tokenspeed_kernel.ops.transform import hadamard_transform
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -163,40 +162,6 @@ def _glm_dsa_rope_scaling(
     return rope_scaling
 
 
-def _glm_dsa_hadamard_rotate_pair(
-    query: torch.Tensor,
-    key: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if query.shape[-1] != key.shape[-1]:
-        raise ValueError(
-            "GLM DSA paired Hadamard requires matching last dimensions; "
-            f"got query={query.shape[-1]}, key={key.shape[-1]}"
-        )
-    query_shape = query.shape
-    key_shape = key.shape
-    head_dim = query_shape[-1]
-    query_rows = query.numel() // head_dim
-    key_rows = key.numel() // head_dim
-    if query_rows == 0 and key_rows == 0:
-        return query, key
-
-    combined = torch.cat(
-        (
-            query.to(torch.bfloat16).reshape(query_rows, head_dim).contiguous(),
-            key.to(torch.bfloat16).reshape(key_rows, head_dim).contiguous(),
-        ),
-        dim=0,
-    )
-    rotated = hadamard_transform(
-        combined,
-        scale=head_dim**-0.5,
-    )
-    return (
-        rotated[:query_rows].reshape(query_shape),
-        rotated[query_rows:].reshape(key_shape),
-    )
-
-
 class GlmDsaIndexer(nn.Module):
     def __init__(
         self,
@@ -296,7 +261,6 @@ class GlmDsaIndexer(nn.Module):
         index_q[..., : self.rope_head_dim] = q_rope
         index_k[:, : self.rope_head_dim] = k_rope.squeeze(1)
 
-        index_q, index_k = _glm_dsa_hadamard_rotate_pair(index_q, index_k)
         return GlmDsaIndexerOutput(
             query=index_q,
             key=index_k,
