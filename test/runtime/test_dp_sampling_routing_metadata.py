@@ -45,6 +45,44 @@ def _graph_route(
     return use_graph, wrapper.padded_bs(bs, ctx) if use_graph else bs
 
 
+def _cuda_graph_replay_wrapper(
+    *,
+    dp_size: int,
+    seq_lens: list[int],
+    req_pool_indices: list[int],
+    state_write_req_pool_indices: list[int],
+) -> CudaGraphWrapper:
+    wrapper = CudaGraphWrapper.__new__(CudaGraphWrapper)
+    wrapper.disable = False
+    wrapper.dp_size = dp_size
+    wrapper.disable_padding = False
+    wrapper.max_bs = 4
+    wrapper.capture_bs = [4]
+    wrapper.max_tokens_per_req = 4
+    wrapper.config = SimpleNamespace(max_req_pool_size=99, enable_mamba=False)
+    wrapper.input_buffers = SimpleNamespace(
+        seq_lens_buf=torch.tensor(seq_lens, dtype=torch.int32),
+        req_pool_indices_buf=torch.tensor(req_pool_indices, dtype=torch.int64),
+        state_write_req_pool_indices_buf=torch.tensor(
+            state_write_req_pool_indices, dtype=torch.int64
+        ),
+    )
+    wrapper.attn_backend = SimpleNamespace(uses_paged_cache_groups=False)
+    wrapper.draft_attn_backend = None
+    wrapper.drafter = None
+    wrapper.deepep_adapter = SimpleNamespace(replay=lambda: None)
+    wrapper.graphs = {4: SimpleNamespace(replay=lambda: None)}
+    wrapper.output_buffers = {
+        4: (
+            torch.zeros(16, dtype=torch.int32),
+            torch.zeros(4, dtype=torch.int32),
+            None,
+        )
+    }
+    wrapper._init_replay_metadata = lambda *args, **kwargs: None
+    return wrapper
+
+
 def _dp_runtime_config(
     *,
     tp_rank: int = 0,
@@ -137,30 +175,86 @@ def test_cuda_graph_wrapper_uses_existing_route_for_padding():
     assert wrapper.padded_bs(30, ctx) == 32
 
 
-def test_cuda_graph_req_pool_padding_keeps_attention_default_row():
-    active_indices = torch.tensor([7, 8], dtype=torch.int64)
-
-    padded_indices = CudaGraphWrapper._pad_graph_req_pool_indices(active_indices, 4)
-
-    assert padded_indices.tolist() == [7, 8, 0, 0]
-
-
-def test_cuda_graph_state_write_padding_uses_reserved_sink_row():
+def test_cuda_graph_req_pool_padding_uses_reserved_sink_row():
     wrapper = CudaGraphWrapper.__new__(CudaGraphWrapper)
     wrapper.config = SimpleNamespace(max_req_pool_size=99)
-    wrapper.input_buffers = SimpleNamespace(
-        state_write_req_pool_indices_buf=torch.full((4,), -1, dtype=torch.int64)
+    request_indices = torch.tensor([7, 8, -1, -1], dtype=torch.int64)
+    wrapper.input_buffers = SimpleNamespace(req_pool_indices_buf=request_indices)
+
+    padded_indices = wrapper._pad_graph_req_pool_indices(2, 4)
+
+    assert padded_indices.tolist() == [7, 8, 99, 99]
+    assert padded_indices.data_ptr() == request_indices.data_ptr()
+
+
+def test_cuda_graph_spec_padding_uses_verify_width_and_sink_rows():
+    wrapper = _cuda_graph_replay_wrapper(
+        dp_size=1,
+        seq_lens=[512, 300, 1, 1],
+        req_pool_indices=[7, 8, 0, 0],
+        state_write_req_pool_indices=[7, 8, 99, 99],
     )
-    active_indices = torch.tensor([7, 8], dtype=torch.int64)
 
-    wrapper._set_graph_state_write_indices(active_indices, 4)
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=2,
+        num_extends=0,
+        input_num_tokens=8,
+        forward_mode=ForwardMode.DECODE,
+    )
+    wrapper(
+        bs=2,
+        ctx=ctx,
+        sampling_info=None,
+        req_to_page=torch.empty(0, dtype=torch.int32),
+    )
 
+    assert wrapper.input_buffers.seq_lens_buf.tolist() == [512, 300, 4, 4]
+    assert wrapper.input_buffers.req_pool_indices_buf.tolist() == [7, 8, 99, 99]
     assert wrapper.input_buffers.state_write_req_pool_indices_buf.tolist() == [
         7,
         8,
         99,
         99,
     ]
+    assert ctx.bs == 2
+
+
+def test_cuda_graph_dp_idle_keeps_dummy_verify_width():
+    wrapper = _cuda_graph_replay_wrapper(
+        dp_size=2,
+        seq_lens=[4, 4, 4, 4],
+        req_pool_indices=[0, 0, 0, 0],
+        state_write_req_pool_indices=[99, 99, 99, 99],
+    )
+
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=0,
+        num_extends=0,
+        input_num_tokens=0,
+        forward_mode=ForwardMode.DECODE,
+        global_num_tokens=[0, 8],
+        all_decode_or_idle=True,
+    )
+    wrapper(
+        bs=0,
+        ctx=ctx,
+        sampling_info=None,
+        req_to_page=torch.empty(0, dtype=torch.int32),
+    )
+
+    assert wrapper.input_buffers.seq_lens_buf.tolist() == [4, 4, 4, 4]
+    assert wrapper.input_buffers.req_pool_indices_buf.tolist() == [99, 99, 99, 99]
+    assert wrapper.input_buffers.state_write_req_pool_indices_buf.tolist() == [
+        99,
+        99,
+        99,
+        99,
+    ]
+    assert ctx.bs == 0
 
 
 def test_cuda_graph_route_uses_global_batch_for_dp_idle_rank():

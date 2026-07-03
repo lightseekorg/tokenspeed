@@ -76,7 +76,9 @@ class RuntimeStates:
         self.valid_cache_lengths[extend_request_pool_indices] = extend_prefix_lens
         self.linear_penalties.index_fill_(0, extend_request_pool_indices, 0.0)
         self.scaling_penalties.index_fill_(0, extend_request_pool_indices, 1.0)
-        self.remote_spec_candidate_ready[extend_request_pool_indices] = False
+        self.remote_spec_candidate_ready.index_fill_(
+            0, extend_request_pool_indices, False
+        )
 
     def write_remote_spec_candidate_ids(
         self, req_pool_idx: int, candidate_ids: list[int]

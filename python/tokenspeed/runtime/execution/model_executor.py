@@ -1314,69 +1314,47 @@ class ModelExecutor:
         num_extends = forward_op.num_extends()
         is_prefill = num_extends > 0
 
+        # Prefill reset is performed by fill_input_buffers after its existing
+        # request-index/prefix uploads and before it reads valid cache lengths.
+        if is_prefill:
+            return
+
         # Retraction recovery: scheduler pushes -1 per decode op, overriding to
         # a real length only on ScheduleDecodeFromRetractedEvent.
-        has_retract = not is_prefill and any(
-            x != -1 for x in forward_op.hist_token_lens
-        )
+        has_retract = any(x != -1 for x in forward_op.hist_token_lens)
 
         # Pure decode without retraction has nothing to do — skip the
         # cross-stream wait + stream-context entry entirely.
-        if not is_prefill and not has_retract:
+        if not has_retract:
             return
 
-        if has_retract:
-            hist_token_lens_tensor = torch.tensor(
-                forward_op.hist_token_lens,
-                dtype=torch.int32,
-                device="cpu",
-                pin_memory=True,
-            )
-            all_pool_indices = torch.tensor(
-                forward_op.request_pool_indices,
-                dtype=torch.int64,
-                device="cpu",
-                pin_memory=True,
-            )
-        else:
-            hist_token_lens_tensor = None
-            all_pool_indices = None
+        hist_token_lens_tensor = torch.tensor(
+            forward_op.hist_token_lens,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=True,
+        )
+        all_pool_indices = torch.tensor(
+            forward_op.request_pool_indices,
+            dtype=torch.int64,
+            device="cpu",
+            pin_memory=True,
+        )
 
         self.execution_stream.wait_stream(torch.cuda.current_stream())
 
         with torch.cuda.stream(self.execution_stream):
-            if is_prefill:
-                extend_request_pool_indices = torch.tensor(
-                    forward_op.request_pool_indices[:num_extends],
-                    dtype=torch.int64,
-                    device="cpu",
-                    pin_memory=True,
-                ).to(self.device, non_blocking=True)
+            # Apply retraction recovery: override valid_cache_lengths with
+            # hist_token_lens where the scheduler specified a non-(-1) value.
+            pool_idx_dev = all_pool_indices.to(self.device, non_blocking=True)
+            hist_dev = hist_token_lens_tensor.to(self.device, non_blocking=True)
 
-                extend_prefix_lens = torch.tensor(
-                    forward_op.extend_prefix_lens,
-                    dtype=torch.int32,
-                    device="cpu",
-                    pin_memory=True,
-                ).to(self.device, non_blocking=True)
+            mask_1d = hist_dev != -1
+            vcl = self.runtime_states.valid_cache_lengths[pool_idx_dev]
 
-                self.runtime_states.reset_states(
-                    extend_request_pool_indices, extend_prefix_lens
-                )
-
-            elif hist_token_lens_tensor is not None:
-                # Apply retraction recovery: override valid_cache_lengths with hist_token_lens
-                # where the scheduler has specified a non-(-1) value, so that out_cache_loc
-                # and position IDs are computed against the retracted KV length.
-                pool_idx_dev = all_pool_indices.to(self.device, non_blocking=True)
-                hist_dev = hist_token_lens_tensor.to(self.device, non_blocking=True)
-
-                mask_1d = hist_dev != -1
-                vcl = self.runtime_states.valid_cache_lengths[pool_idx_dev]
-
-                self.runtime_states.valid_cache_lengths[pool_idx_dev] = torch.where(
-                    mask_1d, hist_dev, vcl
-                )
+            self.runtime_states.valid_cache_lengths[pool_idx_dev] = torch.where(
+                mask_1d, hist_dev, vcl
+            )
 
     def set_layerwise_mamba_cow_done(
         self, cow_by_src: dict[int, list[int]] | None
@@ -1694,7 +1672,7 @@ class ModelExecutor:
                         extend_prefix_lens_cpu=self.input_buffers.extend_prefix_lens_cpu[
                             :num_extends
                         ],
-                        extend_seq_lens=self.input_buffers.extend_seq_lens_buf[
+                        extend_seq_lens=self.input_buffers.input_lengths_buf[
                             :num_extends
                         ],
                         extend_seq_lens_cpu=self.input_buffers.extend_seq_lens_cpu[

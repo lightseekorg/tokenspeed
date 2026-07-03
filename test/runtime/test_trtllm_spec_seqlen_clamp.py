@@ -1,11 +1,12 @@
 """Regression: trtllm decode metadata must clamp KV seqlens to >=
 spec_num_tokens on the multi-token (MTP target-verify) path.
 
-Root cause analyzed in dashllm1.log (DP4+EP4 Qwen3.5-397B, MTP, CUDA graph ON):
+Historical root cause analyzed in dashllm1.log (DP4+EP4 Qwen3.5-397B, MTP,
+CUDA graph ON):
 
     accept_rate decays to 0 over multiple rounds. Localized end-to-end:
-      * CUDA-graph padded / idle decode rows are filled with seq_len=1
-        (InputBuffer.seq_lens_buf[batch_size:].fill_(1)).
+      * CUDA-graph padded / idle decode rows were passed to this backend with
+        seq_len=1.
       * In MTP target-verify q_len_per_req == spec_num_draft_tokens (e.g. 4).
       * A row with seq_len=1 < q_len=4 gives query positions whose causal key
         span is empty; the trtllm decode kernel returns NaN for those rows.
@@ -13,11 +14,13 @@ Root cause analyzed in dashllm1.log (DP4+EP4 Qwen3.5-397B, MTP, CUDA graph ON):
         to every downstream layer, including the linear-attn (mamba) layers,
         whose conv/ssm state then accumulates NaN -> accept_rate collapses.
 
-The MHA backend already guards this (``seq_lens[:bs].clamp_min(
-self.spec_num_tokens)``). This test pins the equivalent guard for the trtllm
-backend: ``_init_multi_token_metadata`` (and the CUDA-graph capture builder)
-must expose ``cache_seqlens_int32 >= spec_num_tokens`` so padded rows keep a
-non-empty causal span. Plain single-token decode (q_len=1) is unaffected.
+The generic graph wrapper now fills padding rows to the verify width, and the
+MHA backend also guards this with ``seq_lens[:bs].clamp_min(
+self.spec_num_tokens)``. This test retains the equivalent TRT-LLM backend guard
+for direct metadata callers: ``_init_multi_token_metadata`` (and the CUDA-graph
+capture builder) must expose ``cache_seqlens_int32 >= spec_num_tokens`` so every
+query keeps a non-empty causal span. Plain single-token decode (q_len=1) is
+unaffected.
 
 The test builds a CPU-only backend (``device="cpu"``) so it needs no GPU and no
 real KV pool; it exercises the metadata builders directly.

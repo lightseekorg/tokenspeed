@@ -29,8 +29,7 @@ class DeepseekV4IndexerPrefillChunkPlan:
     token_end: int
     request_start: int
     request_end: int
-    slot_start: int
-    slot_end: int
+    gather_rows: int
     gather_row_start: int
     gather_row_end: int
     max_seq_len_k: int
@@ -44,7 +43,6 @@ class DeepseekV4IndexerPrefillMetadata:
     chunks: tuple[DeepseekV4IndexerPrefillChunkPlan, ...]
     chunk_specs: torch.Tensor
     chunk_offsets: torch.Tensor
-    slots: torch.Tensor
     cu_seq_lens: torch.Tensor
     cu_seqlen_k_start: torch.Tensor
     cu_seqlen_k_end: torch.Tensor
@@ -53,15 +51,14 @@ class DeepseekV4IndexerPrefillMetadata:
     def max_gather_rows(self) -> int:
         if not self.chunks:
             return 0
-        return max(max(0, chunk.slot_end - chunk.slot_start) for chunk in self.chunks)
+        return max(max(0, chunk.gather_rows) for chunk in self.chunks)
 
     @classmethod
     def empty(cls, device: torch.device) -> "DeepseekV4IndexerPrefillMetadata":
         return cls(
             chunks=(),
             chunk_specs=torch.empty((0, 5), dtype=torch.int64, device="cpu"),
-            chunk_offsets=torch.empty((0, 7), dtype=torch.int64, device="cpu"),
-            slots=torch.empty(0, dtype=torch.int64, device=device),
+            chunk_offsets=torch.empty((0, 6), dtype=torch.int64, device="cpu"),
             cu_seq_lens=torch.empty(0, dtype=torch.int32, device=device),
             cu_seqlen_k_start=torch.empty(0, dtype=torch.int32, device=device),
             cu_seqlen_k_end=torch.empty(0, dtype=torch.int32, device=device),
@@ -80,8 +77,6 @@ class DeepseekV4IndexerDecodePlan:
 class DeepseekV4IndexerBatchMetadata:
     positions: torch.Tensor
     token_to_req_indices: torch.Tensor
-    seq_lens_cpu: torch.Tensor
-    query_lens_cpu: torch.Tensor
     num_prefill_tokens: int
     num_decode_tokens: int
 
@@ -111,8 +106,8 @@ class DeepseekV4IndexerMetadata:
         default_factory=dict
     )
     decode_plan_refreshed_keys: set[tuple[int, int, int]] = field(default_factory=set)
-    prefill_plan_cache: dict[tuple[int, int, int], DeepseekV4IndexerPrefillMetadata] = (
-        field(default_factory=dict)
+    prefill_plan_cache: dict[tuple[int, int], DeepseekV4IndexerPrefillMetadata] = field(
+        default_factory=dict
     )
 
 
