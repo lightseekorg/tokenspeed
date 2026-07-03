@@ -1,7 +1,7 @@
-name: PR Test AMD
+name: PR Test NVIDIA ARM
 
-# Split vendor CI into separate workflows so either side can be rerun without
-# waiting for the other side's jobs to finish.
+# Split GB200/Grace NVIDIA CI into its own workflow so ARM jobs can be rerun
+# without waiting for the other NVIDIA runner pools.
 on:
   push:
     branches: [main]
@@ -47,7 +47,7 @@ env:
   TOKENSPEED_B200_RUNNER_LABEL: ${{ vars.TOKENSPEED_B200_RUNNER_LABEL }}
 
 concurrency:
-  group: pr-test-amd-${{ github.event.pull_request.number || github.ref }}
+  group: pr-test-nvidia-arm-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 jobs:
@@ -57,7 +57,7 @@ jobs:
     steps:
       - name: Cancel superseded PR Test runs
         run: |
-          echo "Cancelling older PR Test AMD runs for PR #${{ github.event.pull_request.number }}"
+          echo "Cancelling older PR Test NVIDIA ARM runs for PR #${{ github.event.pull_request.number }}"
 
   scan:
     # Closed PRs only need cancel-on-close. For all other events, run jobs for
@@ -93,7 +93,7 @@ jobs:
           MATRIX=$(python3 test/ci_system/pipeline.py scan \
             --root test/ci \
             --trigger "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.trigger || 'per-commit' }}" \
-            --runner-group "amd")
+            --runner-group "nvidia-arm")
           echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
 
       # Compute this once on the hosted runner (where `gh` is pre-installed)
@@ -237,4 +237,4 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Finish
-        run: echo "PR Test finished."
+        run: echo "PR Test NVIDIA ARM finished."

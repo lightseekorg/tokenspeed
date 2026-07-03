@@ -16,7 +16,9 @@ from pipeline import (
     get_runner_specific_env,
     is_amd_runner,
     is_gb200_runner,
+    is_nvidia_arm_runner,
     resolve_score_threshold_for_runner,
+    runner_matches_group,
     should_run_nvidia_gpu_cleanup,
     validate_task,
 )
@@ -57,6 +59,20 @@ def test_amd_runner_prefixes_cover_legacy_and_arc_labels():
     assert is_amd_runner("amd-mi350-4gpu-bench")
     assert not is_amd_runner("b200-1gpu")
     assert not is_amd_runner("gb200-4gpu-perf")
+
+
+def test_nvidia_runner_groups_split_arm_from_x86():
+    assert is_nvidia_arm_runner("gb200-1gpu")
+    assert not is_nvidia_arm_runner("b200-1gpu")
+    assert not is_nvidia_arm_runner("amd-mi35x-1gpu-test")
+
+    assert runner_matches_group("gb200-1gpu", "nvidia")
+    assert runner_matches_group("gb200-1gpu", "nvidia-arm")
+    assert not runner_matches_group("gb200-1gpu", "nvidia-x86")
+    assert runner_matches_group("b200-1gpu", "nvidia-x86")
+    assert runner_matches_group("b300-4gpu", "nvidia-x86")
+    assert not runner_matches_group("amd-mi35x-1gpu-test", "nvidia-arm")
+    assert not runner_matches_group("amd-mi35x-1gpu-test", "nvidia-x86")
 
 
 def test_nvidia_gpu_cleanup_runner_prefixes_cover_gb200_and_b300():
@@ -491,6 +507,35 @@ def test_build_matrix_per_label_priority_only_affects_listed_label(tmp_path):
         ("ut-kernel", "h100-1gpu", "normal"),
         ("ut-kernel", "b200-1gpu", "normal"),
         ("ut-kernel", "b300-1gpu", "low"),
+    ]
+
+
+def test_build_matrix_splits_nvidia_arm_from_x86(tmp_path):
+    _write_task_yaml(
+        tmp_path,
+        "mixed-nvidia.yaml",
+        _default_body("mixed-nvidia", ["h100-1gpu", "b200-1gpu", "gb200-1gpu"]),
+    )
+
+    x86_matrix = build_matrix(
+        tmp_path,
+        tmp_path,
+        trigger="per-commit",
+        runner_group="nvidia-x86",
+    )
+    arm_matrix = build_matrix(
+        tmp_path,
+        tmp_path,
+        trigger="per-commit",
+        runner_group="nvidia-arm",
+    )
+
+    assert [entry["runner"] for entry in x86_matrix["include"]] == [
+        "h100-1gpu",
+        "b200-1gpu",
+    ]
+    assert [entry["runner"] for entry in arm_matrix["include"]] == [
+        "gb200-1gpu",
     ]
 
 
