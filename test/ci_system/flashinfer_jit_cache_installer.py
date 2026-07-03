@@ -8,6 +8,7 @@ from pathlib import Path
 
 JIT_CACHE_DIST = "flashinfer-jit-cache"
 FLASHINFER_PYTHON_DIST = "flashinfer-python"
+JIT_CACHE_RUNNER_PREFIXES = ("b200", "gb200")
 _QUERY_INSTALLED = object()
 
 
@@ -25,6 +26,10 @@ def installed_distribution_version(distribution: str = JIT_CACHE_DIST) -> str | 
         return metadata.version(distribution)
     except metadata.PackageNotFoundError:
         return None
+
+
+def should_sync_jit_cache(runner_label: str | None) -> bool:
+    return bool(runner_label and runner_label.startswith(JIT_CACHE_RUNNER_PREFIXES))
 
 
 def expected_jit_cache_version(flashinfer_version: str, cuda_index: str) -> str:
@@ -72,7 +77,15 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--requirements", type=Path, required=True)
     parser.add_argument("--cuda-index", required=True)
+    parser.add_argument("--runner-label")
     args = parser.parse_args(argv)
+
+    if args.runner_label is not None and not should_sync_jit_cache(args.runner_label):
+        print(
+            f"skipping {JIT_CACHE_DIST} sync on runner {args.runner_label}",
+            file=sys.stderr,
+        )
+        return 0
 
     url, expected_version, installed_version = install_url_if_needed(
         args.requirements,
