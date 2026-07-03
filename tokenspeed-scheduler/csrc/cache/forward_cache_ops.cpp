@@ -66,6 +66,9 @@ std::vector<KvCacheSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
 }
 
 void FreeRequest(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables) {
+    if (tables.empty()) {
+        return;  // nothing was ever allocated, or a failure path already released the pages
+    }
     coordinator.Free(tables);
 }
 

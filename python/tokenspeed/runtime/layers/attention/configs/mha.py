@@ -41,6 +41,11 @@ class MHAConfig(BaseAttnConfig):
     layer_types: tuple[str, ...] = ()
     sliding_window_tokens: int | None = None
     max_scheduled_tokens: int = 0
+    # True iff server_args.speculative_algorithm is set. The pool publishes
+    # paged_cache_group_specs only when this is False: flat page tables are
+    # unsupported with spec-expanded metadata, and non-empty groups would
+    # disable the overlap scheduler under spec decode.
+    speculative_enabled: bool = False
 
     @classmethod
     def generate(
@@ -78,6 +83,7 @@ class MHAConfig(BaseAttnConfig):
             layer_types=layer_types,
             sliding_window_tokens=sliding_window_tokens,
             max_scheduled_tokens=server_args.chunked_prefill_size,
+            speculative_enabled=server_args.speculative_algorithm is not None,
             **kwargs,
         )
 
@@ -113,4 +119,5 @@ class MHAConfig(BaseAttnConfig):
             layer_types=self.layer_types,
             sliding_window_tokens=self.sliding_window_tokens,
             max_scheduled_tokens=self.max_scheduled_tokens,
+            speculative_enabled=self.speculative_enabled,
         )

@@ -488,10 +488,12 @@ class CudaGraphWrapper:
     def _capture_flat_block_tables(self, bs: int, pool) -> dict | None:
         """Capture-time shape placeholders for flat per-group page tables.
 
-        Real tables arrive at replay (absolute pages, 0=hole, -1=pad, no base
-        offsets), so unlike the radix variant there is no per-group logical
-        sizing: one zero [bs, max_num_pages] table per group is enough to tell
-        the backend which groups need persistent CUDA-graph buffers.
+        Real tables arrive at replay (absolute pages, 0=hole/dummy-row pad,
+        -1=column pad, no base offsets), so unlike the radix variant there is
+        no per-group logical sizing: one zero [bs, max_num_pages] table per
+        group is enough to tell the backend which groups need persistent
+        CUDA-graph buffers. Zeros here match the dummy-row contract: page 0 is
+        the zero-initialized dummy page, safe for the warmup dereference.
         """
         if not getattr(self.attn_backend, "uses_flat_cache_groups", False):
             return None
@@ -571,7 +573,18 @@ class CudaGraphWrapper:
         *,
         actual_bs: int,
         padded_bs: int,
+        pad_value: int = -1,
     ) -> dict:
+        """Pad each table with dummy ROWS up to padded_bs.
+
+        Row padding is not column padding: padded columns (beyond a row's
+        cache_seqlens) are never dereferenced and use -1, but padded rows are
+        live batch entries to the captured decode kernel (their seq_lens is 1,
+        see InputBuffers), so their entries ARE dereferenced. The flat path
+        must pass pad_value=0 to land dummy rows on the zero-initialized dummy
+        page 0; the radix/V4 path keeps -1 because it masks dummy tokens out
+        via is_valid_token before any block-table read.
+        """
         if padded_bs <= actual_bs:
             return block_tables
         out = {}
@@ -586,7 +599,7 @@ class CudaGraphWrapper:
             out[key] = torch.nn.functional.pad(
                 table,
                 (0, 0, 0, padded_bs - rows),
-                value=-1,
+                value=pad_value,
             )
         return out
 
@@ -672,8 +685,10 @@ class CudaGraphWrapper:
         if flat_block_tables is not None and getattr(
             self.attn_backend, "uses_flat_cache_groups", False
         ):
-            # Backend replay copy_ expects >= padded_bs rows; pad value -1
-            # matches the flat pad sentinel.
+            # Backend replay copy_ expects >= padded_bs rows. Dummy rows must
+            # pad with 0, not -1: they replay with seq_lens=1, so the captured
+            # kernel dereferences their col-0 entry — page 0 is the
+            # zero-initialized dummy page while -1 would gather out of bounds.
             flat_table_bs = next(
                 (
                     int(table.shape[0])
@@ -686,6 +701,7 @@ class CudaGraphWrapper:
                 flat_block_tables,
                 actual_bs=flat_table_bs,
                 padded_bs=padded_bs,
+                pad_value=0,
             )
         if self.attn_backend.uses_padded_decode_token_mask:
             kwargs["actual_bs"] = actual_bs
@@ -939,8 +955,9 @@ class CudaGraphWrapper:
                 )
             # No flat analogue for the bs==0 idle graph: an empty/None
             # flat_block_tables makes the backend skip the copy, and the
-            # persistent buffers keep previously valid absolute pages while
-            # dummy-row outputs are discarded.
+            # persistent buffers keep prior contents whose col-0 entries are
+            # always dereferenceable (capture zeros, real pages, or dummy-row
+            # pad 0 — never -1); dummy-row outputs are discarded.
             self._init_replay_metadata(
                 padded_bs,
                 bs,

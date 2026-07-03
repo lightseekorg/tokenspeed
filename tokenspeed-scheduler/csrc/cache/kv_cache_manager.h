@@ -20,6 +20,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <span>
 #include <string>
@@ -47,6 +48,17 @@ public:
 
     // Per-attention-type prefix match. Read-only: must NOT change ref counts.
     virtual PrefixMatch MatchPrefix(std::span<const std::string> block_hashes) const = 0;
+
+    // Bounded prefix match: the manager's best valid match whose coverage is at
+    // most max_blocks. Implemented by matching only the first max_blocks page
+    // hashes, so each manager's own validity invariant (e.g. SwaManager's
+    // trailing contiguous run) is enforced against the BOUNDED end -- never
+    // computed unbounded and then chopped, which could break it. May return a
+    // match shorter than max_blocks (or empty) if no valid match fits the bound.
+    PrefixMatch MatchPrefix(std::span<const std::string> block_hashes, std::int32_t max_blocks) const {
+        std::size_t bound = std::min(block_hashes.size(), static_cast<std::size_t>(std::max(max_blocks, 0)));
+        return MatchPrefix(block_hashes.first(bound));
+    }
 
     // Claim each real hit block (TouchBlock pulls it from the free list and bumps
     // ref) and append it to the table. null_block holes are appended as-is (they

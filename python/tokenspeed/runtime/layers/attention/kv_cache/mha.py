@@ -56,6 +56,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         layer_types: tuple[str, ...] = (),
         sliding_window_tokens: int | None = None,
         max_scheduled_tokens: int = 0,
+        speculative_enabled: bool = False,
         enable_kv_cache_copy: bool = False,
         enable_alt_stream: bool = True,
     ):
@@ -98,25 +99,40 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         )
 
         # Publish per-group specs so the C++ scheduler is configured multi-group
-        # for hybrid full/SWA models. Empty layer_types -> single full-history
-        # group (non-hybrid), preserving today's behavior.
-        effective_layer_types = layer_types or ("full_attention",)
-        self.paged_cache_group_specs = tuple(
-            group_specs_from_layer_types(
-                layer_types=effective_layer_types,
-                sliding_window_tokens=sliding_window_tokens,
-                page_size=page_size,
+        # for hybrid full/SWA models (gpt-oss). Empty layer_types -> single
+        # full-history group, which the flat (TOKENSPEED_FLAT_KVCACHE) scheduler
+        # build needs to allocate pages for plain non-hybrid MHA models.
+        #
+        # Rule: publish groups iff speculative decoding is off. Flat page tables
+        # do not support spec-expanded metadata (backends/mha.py asserts on
+        # flat_block_tables with spec_num_tokens > 1), and non-empty groups turn
+        # off the overlap scheduler under spec decode
+        # (scheduler_utils.should_use_overlap_schedule), so spec runs keep the
+        # pre-group behavior: no specs, no flat capture kwarg, overlap schedule
+        # unaffected. TODO(flat+spec): publish under spec decode once the flat
+        # path supports spec-expanded metadata.
+        if speculative_enabled:
+            self.paged_cache_group_specs = ()
+            self.paged_cache_group_page_counts = {}
+        else:
+            effective_layer_types = layer_types or ("full_attention",)
+            self.paged_cache_group_specs = tuple(
+                group_specs_from_layer_types(
+                    layer_types=effective_layer_types,
+                    sliding_window_tokens=sliding_window_tokens,
+                    page_size=page_size,
+                )
             )
-        )
-        # Per-group page budgets, required by pool_to_paged_cache_groups. Mirrors
-        # DeepseekV4TokenToKVPool: size=total tokens, max_batch_size=live reqs.
-        self.paged_cache_group_page_counts = compute_paged_cache_group_page_counts(
-            self.paged_cache_group_specs,
-            max_live_requests=max_batch_size,
-            max_scheduled_tokens=max(0, int(max_scheduled_tokens)),
-            max_total_tokens=size,
-            max_context_len=max_context_len,
-        )
+            # Per-group page budgets, required by pool_to_paged_cache_groups.
+            # Mirrors DeepseekV4TokenToKVPool: size=total tokens,
+            # max_batch_size=live reqs.
+            self.paged_cache_group_page_counts = compute_paged_cache_group_page_counts(
+                self.paged_cache_group_specs,
+                max_live_requests=max_batch_size,
+                max_scheduled_tokens=max(0, int(max_scheduled_tokens)),
+                max_total_tokens=size,
+                max_context_len=max_context_len,
+            )
 
     def _get_page_size_bytes(self):
         return (

@@ -20,6 +20,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -57,6 +58,19 @@ CacheBlock* CacheForGroup(BlockPool& pool, const std::string& content_hash, std:
     pool.CacheFullBlocks(got.front(), key);
     pool.FreeBlocks(got);
     return got.front();
+}
+
+// Asserts the sliding-window validity invariant on a group's match at its
+// claimed length: the last min(len, contiguous_needed) blocks are real cached
+// pages, i.e. no null hole inside the last window of the claimed prefix.
+void ExpectSwaWindowIntact(const PrefixMatch& m, std::int32_t window, std::int32_t page_size) {
+    std::int32_t len = static_cast<std::int32_t>(m.blocks.size());
+    std::int32_t contiguous_needed = (window - 1 + page_size - 1) / page_size;
+    std::int32_t need = std::min(len, contiguous_needed);
+    for (std::int32_t i = len - need; i < len; ++i) {
+        EXPECT_FALSE(m.blocks[static_cast<std::size_t>(i)]->IsNull())
+            << "null hole inside the last window at slot " << i << " of " << len;
+    }
 }
 
 TEST(CacheGroupTest, HoldsSpecGroupIdManager) {
@@ -289,40 +303,195 @@ TEST(CoordinatorStepTest, EndToEndTwoRequestsSharePrefix) {
     }
 }
 
-TEST(CoordinatorMatchTest, SwaHoleTruncationRecomputesNumHit) {
-    // full caches 5 pages; swa (window 10 -> contiguous_needed 3) caches a 3-run
-    // at indices 2,3,4 -> swa coverage is [null,null,b,b,b] = 5 (leading holes
-    // null-pad back to 0). full coverage 5 too. To force a truncation that cuts
-    // SWA real hits, make full SHALLOWER: full caches only 4 pages -> common 4.
-    // swa truncated to 4: [null,null,b,b] -> num_hit recomputed 4->2.
+TEST(CoordinatorMatchTest, SwaRunCutByFullBoundDropsToNoValidMatch) {
+    // full caches pages 0..3 (coverage 4); swa (window 10 -> contiguous_needed 3)
+    // caches a 3-run at the TAIL (indices 2,3,4, unbounded coverage 5). Bounded
+    // to full's 4, swa's remaining run {2,3} is only 2 long and pages 0,1 are
+    // holes, so NO valid swa match of any length <= 4 exists (claiming 4 would
+    // mark token 16 computed while its window spans the page-1 hole -> attention
+    // would read garbage KV). The coordinator must lower common to 0 for
+    // everyone, not keep [null,null,b,b] and call it a 4-block hit.
     BlockPool pool(64);
     std::vector<KvCacheSpec> specs = {{AttnKind::kFull, 4, 0}, {AttnKind::kSlidingWindow, 4, 10}};
     KvCacheCoordinator coord = MakeCoordinator(specs, pool);
 
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}, {4, 4, 4, 4}});
-    // full (group 0): cache pages 0..3 only (coverage 4).
     CacheForGroup(pool, ch[0], 0);
     CacheForGroup(pool, ch[1], 0);
     CacheForGroup(pool, ch[2], 0);
     CacheForGroup(pool, ch[3], 0);
-    // swa (group 1): cache pages 2,3,4 -> a 3-run at the tail -> coverage 5,
-    // real hits at indices 2,3,4, holes at 0,1.
     CacheForGroup(pool, ch[2], 1);
     CacheForGroup(pool, ch[3], 1);
     CacheForGroup(pool, ch[4], 1);
 
     CoordinatorMatch m = coord.MatchPrefix(ch);
-    EXPECT_EQ(m.num_common_blocks, 4);   // min(4, 5)
+    EXPECT_EQ(m.num_common_blocks, 0);
     ASSERT_EQ(m.per_group.size(), 2u);
-    // full truncated 5->4? no, full coverage is 4 already; swa truncated 5->4.
-    EXPECT_EQ(m.per_group[1].blocks.size(), 4u);
+    EXPECT_TRUE(m.per_group[0].blocks.empty());
+    EXPECT_TRUE(m.per_group[1].blocks.empty());
+    ExpectSwaWindowIntact(m.per_group[1], /*window=*/10, /*page_size=*/4);
+}
+
+TEST(CoordinatorMatchTest, FullShorterThanSwaBoundsSwaWithRunIntact) {
+    // full caches pages 0..3 (coverage 4); swa caches 1..4 (unbounded coverage 5
+    // with the run ending at 4). Bounded to 4, swa's run {1,2,3} still reaches
+    // contiguous_needed 3 against the bounded end, so common stays 4 and the
+    // swa match is [null, b1, b2, b3] -- hole only OUTSIDE the last window.
+    BlockPool pool(64);
+    std::vector<KvCacheSpec> specs = {{AttnKind::kFull, 4, 0}, {AttnKind::kSlidingWindow, 4, 10}};
+    KvCacheCoordinator coord = MakeCoordinator(specs, pool);
+
+    std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}, {4, 4, 4, 4}});
+    CacheForGroup(pool, ch[0], 0);
+    CacheForGroup(pool, ch[1], 0);
+    CacheForGroup(pool, ch[2], 0);
+    CacheForGroup(pool, ch[3], 0);
+    CacheForGroup(pool, ch[1], 1);
+    CacheForGroup(pool, ch[2], 1);
+    CacheForGroup(pool, ch[3], 1);
+    CacheForGroup(pool, ch[4], 1);
+
+    CoordinatorMatch m = coord.MatchPrefix(ch);
+    EXPECT_EQ(m.num_common_blocks, 4);
+    ASSERT_EQ(m.per_group.size(), 2u);
+    EXPECT_EQ(m.per_group[0].blocks.size(), 4u);
+    EXPECT_EQ(m.per_group[0].num_hit_blocks, 4);
+    ASSERT_EQ(m.per_group[1].blocks.size(), 4u);
     EXPECT_TRUE(m.per_group[1].blocks[0]->IsNull());
-    EXPECT_TRUE(m.per_group[1].blocks[1]->IsNull());
+    EXPECT_FALSE(m.per_group[1].blocks[1]->IsNull());
     EXPECT_FALSE(m.per_group[1].blocks[2]->IsNull());
     EXPECT_FALSE(m.per_group[1].blocks[3]->IsNull());
-    // swa had 3 real hits over coverage 5; truncated to 4 drops the rightmost
-    // real hit (index 4) -> 2 real remain.
+    EXPECT_EQ(m.per_group[1].num_hit_blocks, 3);
+    ExpectSwaWindowIntact(m.per_group[1], /*window=*/10, /*page_size=*/4);
+}
+
+TEST(CoordinatorMatchTest, SwaShorterThanFullTruncatesFull) {
+    // full caches all 5 pages; swa caches 1..3 -> its best valid match is 4
+    // blocks [null, b1, b2, b3] (run {1,2,3} ends at index 3). common drops to
+    // 4 and the FULL match truncates 5 -> 4 (always safe for full attention).
+    BlockPool pool(64);
+    std::vector<KvCacheSpec> specs = {{AttnKind::kFull, 4, 0}, {AttnKind::kSlidingWindow, 4, 10}};
+    KvCacheCoordinator coord = MakeCoordinator(specs, pool);
+
+    std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}, {4, 4, 4, 4}});
+    for (const std::string& h : ch) CacheForGroup(pool, h, 0);
+    CacheForGroup(pool, ch[1], 1);
+    CacheForGroup(pool, ch[2], 1);
+    CacheForGroup(pool, ch[3], 1);
+
+    CoordinatorMatch m = coord.MatchPrefix(ch);
+    EXPECT_EQ(m.num_common_blocks, 4);
+    ASSERT_EQ(m.per_group.size(), 2u);
+    EXPECT_EQ(m.per_group[0].blocks.size(), 4u);
+    EXPECT_EQ(m.per_group[0].num_hit_blocks, 4);
+    ASSERT_EQ(m.per_group[1].blocks.size(), 4u);
+    EXPECT_TRUE(m.per_group[1].blocks[0]->IsNull());
+    EXPECT_EQ(m.per_group[1].num_hit_blocks, 3);
+    ExpectSwaWindowIntact(m.per_group[1], /*window=*/10, /*page_size=*/4);
+}
+
+TEST(CoordinatorMatchTest, TwoSwaGroupsIterateToFixpoint) {
+    // Fixpoint iteration: lowering the bound for one SWA group can invalidate
+    // another's already-computed match, whose re-match lowers the bound AGAIN.
+    // window 10, page 4 -> contiguous_needed 3; 6 pages.
+    //   full (group 0): caches all 6           -> initial common 6.
+    //   swaA (group 1): caches {0, 2, 3, 4}    -> bound 6: run {2,3,4}, keep 5 -> common 5.
+    //   swaB (group 2): caches {0, 1, 2, 3}    -> bound 5: run {1,2,3}, keep 4 -> common 4.
+    //   swaA RE-match at 4: run {2,3} too short, falls back to the left-end run
+    //   {0}, keep 1 -> common 1 (re-match shortened again -> iteration needed).
+    //   swaB RE-match at 1: page 0 cached, keep 1 -> fixpoint common = 1.
+    // At length 1 the window clamps to the sequence start, so a single real
+    // page 0 is a valid match for both SWA groups.
+    BlockPool pool(64);
+    std::vector<KvCacheSpec> specs = {
+        {AttnKind::kFull, 4, 0},
+        {AttnKind::kSlidingWindow, 4, 10},
+        {AttnKind::kSlidingWindow, 4, 10},
+    };
+    KvCacheCoordinator coord = MakeCoordinator(specs, pool);
+
+    std::vector<std::string> ch = ContentHashes(
+        {{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}, {4, 4, 4, 4}, {5, 5, 5, 5}});
+    for (const std::string& h : ch) CacheForGroup(pool, h, 0);
+    CacheForGroup(pool, ch[0], 1);
+    CacheForGroup(pool, ch[2], 1);
+    CacheForGroup(pool, ch[3], 1);
+    CacheForGroup(pool, ch[4], 1);
+    CacheForGroup(pool, ch[0], 2);
+    CacheForGroup(pool, ch[1], 2);
+    CacheForGroup(pool, ch[2], 2);
+    CacheForGroup(pool, ch[3], 2);
+
+    CoordinatorMatch m = coord.MatchPrefix(ch);
+    EXPECT_EQ(m.num_common_blocks, 1);
+    ASSERT_EQ(m.per_group.size(), 3u);
+    for (std::size_t i = 0; i < 3; ++i) {
+        ASSERT_EQ(m.per_group[i].blocks.size(), 1u) << "group " << i;
+        EXPECT_FALSE(m.per_group[i].blocks[0]->IsNull()) << "group " << i;
+        EXPECT_EQ(m.per_group[i].num_hit_blocks, 1) << "group " << i;
+    }
+    ExpectSwaWindowIntact(m.per_group[1], /*window=*/10, /*page_size=*/4);
+    ExpectSwaWindowIntact(m.per_group[2], /*window=*/10, /*page_size=*/4);
+}
+
+TEST(CoordinatorMatchTest, AllFullGroupsMinTruncationUnchanged) {
+    // No SWA groups: behavior is the original min-then-truncate (any prefix of
+    // a full match is valid, no bounded re-match needed).
+    BlockPool pool(32);
+    std::vector<KvCacheSpec> specs = {{AttnKind::kFull, 4, 0}, {AttnKind::kFull, 4, 0}};
+    KvCacheCoordinator coord = MakeCoordinator(specs, pool);
+
+    std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}});
+    for (const std::string& h : ch) CacheForGroup(pool, h, 0);
+    CacheForGroup(pool, ch[0], 1);
+    CacheForGroup(pool, ch[1], 1);
+
+    CoordinatorMatch m = coord.MatchPrefix(ch);
+    EXPECT_EQ(m.num_common_blocks, 2);
+    ASSERT_EQ(m.per_group.size(), 2u);
+    EXPECT_EQ(m.per_group[0].blocks.size(), 2u);
+    EXPECT_EQ(m.per_group[0].num_hit_blocks, 2);
+    EXPECT_EQ(m.per_group[1].blocks.size(), 2u);
     EXPECT_EQ(m.per_group[1].num_hit_blocks, 2);
+}
+
+TEST(CoordinatorMatchTest, SingleFullGroupUnchanged) {
+    BlockPool pool(16);
+    std::vector<KvCacheSpec> specs = {{AttnKind::kFull, 4, 0}};
+    KvCacheCoordinator coord = MakeCoordinator(specs, pool);
+
+    std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}});
+    CacheForGroup(pool, ch[0], 0);
+    CacheForGroup(pool, ch[1], 0);
+
+    CoordinatorMatch m = coord.MatchPrefix(ch);
+    EXPECT_EQ(m.num_common_blocks, 2);
+    ASSERT_EQ(m.per_group.size(), 1u);
+    EXPECT_EQ(m.per_group[0].blocks.size(), 2u);
+    EXPECT_EQ(m.per_group[0].num_hit_blocks, 2);
+}
+
+TEST(CoordinatorMatchTest, SwaOnlyConfigKeepsTailRunWithLeadingHoles) {
+    // No full groups: the initial bound is the whole prompt, so a single SWA
+    // group behaves exactly like its unbounded MatchPrefix -- tail run {2,3,4}
+    // covers the window, leading holes null-pad back to page 0.
+    BlockPool pool(32);
+    std::vector<KvCacheSpec> specs = {{AttnKind::kSlidingWindow, 4, 10}};
+    KvCacheCoordinator coord = MakeCoordinator(specs, pool);
+
+    std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}, {4, 4, 4, 4}});
+    CacheForGroup(pool, ch[2], 0);
+    CacheForGroup(pool, ch[3], 0);
+    CacheForGroup(pool, ch[4], 0);
+
+    CoordinatorMatch m = coord.MatchPrefix(ch);
+    EXPECT_EQ(m.num_common_blocks, 5);
+    ASSERT_EQ(m.per_group.size(), 1u);
+    ASSERT_EQ(m.per_group[0].blocks.size(), 5u);
+    EXPECT_TRUE(m.per_group[0].blocks[0]->IsNull());
+    EXPECT_TRUE(m.per_group[0].blocks[1]->IsNull());
+    EXPECT_EQ(m.per_group[0].num_hit_blocks, 3);
+    ExpectSwaWindowIntact(m.per_group[0], /*window=*/10, /*page_size=*/4);
 }
 
 TEST(CoordinatorAllocTest, AcquireShortfallLeavesClaimedPrefixForCallerToFree) {

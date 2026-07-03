@@ -164,6 +164,14 @@ private:
     BlockPool block_pool_;
     KvCacheCoordinator coordinator_;
     std::vector<std::string> flat_group_ids_;  // group_id per cache group, index-aligned to coordinator groups
+    // Forward results the executor still owes us, per request: one ExtendResult
+    // per emitted decode op and one per prefill-completing op (mid-prefill chunk
+    // ops produce no event, so they are not counted). Incremented when
+    // newForwardOperation emits such an op, decremented on ExtendResult, erased
+    // on Finish/Abort/PD-success. Non-empty means a forward is in flight whose
+    // completion can still finish a request and free pool pages -- the flat
+    // starvation-deadlock check keys off this (see newForwardOperation).
+    std::unordered_map<std::string, std::int32_t> pending_forward_results_;
 #endif
 
 private:

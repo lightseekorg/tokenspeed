@@ -40,6 +40,8 @@ public:
         _assert(sliding_window > 0, "sliding_window must be > 0");
     }
 
+    using KvCacheManager::MatchPrefix;  // keep the bounded overload visible
+
     // Read-only sliding-window prefix match. Scans the page-hash keys right->left,
     // looking for a run of `contiguous_needed = ceil((window-1)/page_size)`
     // cached pages that covers the window. Stops at the first run that reaches

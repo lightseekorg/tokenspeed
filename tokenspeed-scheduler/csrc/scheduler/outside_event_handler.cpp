@@ -90,6 +90,10 @@ void Scheduler::handleEvent(const pd::BootstrappedEvent& event) {
 void Scheduler::handleEvent(const pd::FailedEvent& event) {}
 
 void Scheduler::handleEvent(const pd::SucceededEvent& event) {
+#if TOKENSPEED_FLAT_KVCACHE
+    // Terminal for this request's forward stream: drop any remaining result debt.
+    pending_forward_results_.erase(event.request_id);
+#endif
     std::vector<std::string> page_hashes;
     requests_.at(event.request_id)
         ->Apply(fsm::FinishEvent{&kv_prefix_cache_, &host_allocator_, std::move(page_hashes), config_.disable_l2_cache,
@@ -106,6 +110,10 @@ void Scheduler::handleEvent(const pd::RemotePrefillDoneEvent& event) {
 }
 
 void Scheduler::handleEvent(const forward::Finish& event) {
+#if TOKENSPEED_FLAT_KVCACHE
+    // Terminal for this request's forward stream: drop any remaining result debt.
+    pending_forward_results_.erase(event.request_id);
+#endif
     if (auto req = find_request(event.request_id)) {
         // except_last=true: exclude the tail page, matching FinishEvent's InsertDevice behavior
         auto token_pages = req->GetFullPagedTokens(true);
@@ -135,6 +143,14 @@ void Scheduler::handleEvent(const forward::UpdateReserveNumTokens& event) {
     }
 }
 void Scheduler::handleEvent(const forward::ExtendResult& event) {
+#if TOKENSPEED_FLAT_KVCACHE
+    // One owed forward result delivered (see pending_forward_results_).
+    if (auto it = pending_forward_results_.find(event.request_id); it != pending_forward_results_.end()) {
+        if (--it->second <= 0) {
+            pending_forward_results_.erase(it);
+        }
+    }
+#endif
     if (auto req = find_request(event.request_id)) {
         req->Apply(fsm::ExtendResultEvent{event.request_id, event.tokens,
                                           hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr});
@@ -142,6 +158,10 @@ void Scheduler::handleEvent(const forward::ExtendResult& event) {
 }
 
 void Scheduler::handleEvent(const forward::Abort& event) {
+#if TOKENSPEED_FLAT_KVCACHE
+    // Terminal for this request's forward stream: drop any remaining result debt.
+    pending_forward_results_.erase(event.request_id);
+#endif
     auto iter = requests_.find(event.request_id);
     if (iter == requests_.end()) {
         return;

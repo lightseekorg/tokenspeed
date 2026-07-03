@@ -35,6 +35,7 @@ namespace tokenspeed {
 class FullAttnManager : public KvCacheManager {
 public:
     using KvCacheManager::KvCacheManager;
+    using KvCacheManager::MatchPrefix;  // keep the bounded overload visible
 
     // Read-only prefix match: walk the pre-computed page-hash keys until the
     // first cache miss. Returns the hit blocks in order (no holes). Does NOT

@@ -35,8 +35,11 @@ struct SchedulerConfig;  // defined in scheduler/types.h; only used by-ref below
 
 // Prefill first chunk: match the common cached prefix across groups, claim the
 // hit blocks into each table, then allocate pages for this chunk's tokens.
-// Returns false if the shared pool cannot supply the chunk (check-then-act:
-// nothing allocated on failure). tables must be sized to coordinator.NumGroups().
+// Returns false if the shared pool cannot supply the chunk. The chunk itself is
+// check-then-act (Acquire allocates nothing on failure), but the prefix blocks
+// claimed by ClaimCommonPrefix REMAIN in the tables -- on failure the caller
+// must FreeRequest the tables to release those refs. tables must be sized to
+// coordinator.NumGroups().
 bool PrefillFirstChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
                        std::span<const std::string> content_hashes, std::int32_t num_tokens);
 
@@ -56,7 +59,8 @@ bool DecodeStep(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables
 // per paged_cache_group, group_id = index). All groups share config.page_size.
 std::vector<KvCacheSpec> MakeSpecsFromConfig(const SchedulerConfig& config);
 
-// Finish / abort: return every page in every table to the pool.
+// Finish / abort: return every page in every table to the pool. No-op on empty
+// tables (nothing allocated yet, or already released by a failure path).
 void FreeRequest(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables);
 
 // flat per-group block table extraction. One row per group: the BlockId()

@@ -178,8 +178,16 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()
 
     // C slice: cross-request prefix claim deferred; pass empty hashes so only Acquire runs.
     std::vector<std::string> empty_hashes;
-    if (!PrefillFirstChunk(*coordinator_, tables, empty_hashes, tokens_this_round_)) {
-        _assert(false, "flat path: allocation failure unsupported in C slice");
+    try {
+        if (!PrefillFirstChunk(*coordinator_, tables, empty_hashes, tokens_this_round_)) {
+            _assert(false, "flat path: allocation failure unsupported in C slice");
+        }
+    } catch (...) {
+        // A failed PrefillFirstChunk leaves the claimed prefix blocks in the
+        // tables (see forward_cache_ops.h). BlockTable is non-owning, so release
+        // them before the exception escapes or their refs leak forever.
+        FreeRequest(*coordinator_, tables);
+        throw;
     }
 
     auto req_pool_index = std::make_unique<ReqPoolIndex>(req_pool_allocator_->Allocate());
@@ -278,13 +286,21 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()
 // Prefilling -> Prefilling / PrefillDone
 std::variant<PrefillDone, Prefilling> SchedulePrefillEvent::operator()(Prefilling&& state) {
 #if TOKENSPEED_FLAT_KVCACHE
-    auto tables = std::move(state).TakeBlockTables();
-
+    // Read state before taking the tables (use-after-move hygiene).
     const std::vector<std::string> hashes = FlatWindowPageHashes(state, state.window.begin, state.window.size);
     const std::int32_t num_full_blocks = static_cast<std::int32_t>(hashes.size());
 
-    if (!PrefillChunk(*coordinator_, tables, hashes, tokens_this_round_, num_full_blocks)) {
-        _assert(false, "flat path: allocation failure unsupported in C slice");
+    auto tables = std::move(state).TakeBlockTables();
+    try {
+        if (!PrefillChunk(*coordinator_, tables, hashes, tokens_this_round_, num_full_blocks)) {
+            _assert(false, "flat path: allocation failure unsupported in C slice");
+        }
+    } catch (...) {
+        // On any throw the local tables would be dropped and, BlockTable being
+        // non-owning, every page's ref would leak. Return them to the pool; the
+        // request keeps empty tables and can still be Aborted cleanly.
+        FreeRequest(*coordinator_, tables);
+        throw;
     }
 
     TokenContainer::Window window{.begin = state.window.begin + state.window.size, .size = tokens_this_round_};
@@ -365,15 +381,23 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillEvent::operator()(Prefillin
 // PrefillDone -> Decoding: insert prefill pages into tree, then transition to decode.
 Decoding ScheduleDecodeEvent::operator()(PrefillDone&& state) {
 #if TOKENSPEED_FLAT_KVCACHE
-    auto tables = std::move(state).TakeBlockTables();
-
-    // Register any remaining full prefill pages so later requests can prefix-hit.
+    // Read state before taking the tables (use-after-move hygiene).
     const std::vector<std::string> hashes = FlatWindowPageHashes(state, state.window.begin, state.window.size);
-    coordinator_->CacheFullBlocks(tables, hashes, static_cast<std::int32_t>(hashes.size()));
+    const std::int32_t reserve = state.GetReserveNumTokensInNextScheduleEvent();
 
-    std::int32_t reserve = state.GetReserveNumTokensInNextScheduleEvent();
-    if (!coordinator_->Acquire(tables, reserve)) {
-        _assert(false, "flat path: allocation failure unsupported in C slice");
+    auto tables = std::move(state).TakeBlockTables();
+    try {
+        // Register any remaining full prefill pages so later requests can prefix-hit.
+        coordinator_->CacheFullBlocks(tables, hashes, static_cast<std::int32_t>(hashes.size()));
+
+        if (!coordinator_->Acquire(tables, reserve)) {
+            _assert(false, "flat path: allocation failure unsupported in C slice");
+        }
+    } catch (...) {
+        // Non-owning tables: free the pages before the exception escapes (see
+        // SchedulePrefillEvent above).
+        FreeRequest(*coordinator_, tables);
+        throw;
     }
 
     Decoding decoding{state.GetTokenContainer(),
@@ -420,12 +444,20 @@ Decoding ScheduleDecodeEvent::operator()(PrefillDone&& state) {
 // Decoding -> Decoding: allocate pages for next decode step.
 Decoding ScheduleDecodeEvent::operator()(Decoding&& state) {
 #if TOKENSPEED_FLAT_KVCACHE
-    auto tables = std::move(state).TakeBlockTables();
+    // Read state before taking the tables (use-after-move hygiene).
+    const std::int32_t reserve = state.GetReserveNumTokensInNextScheduleEvent();
+    const std::int32_t num_computed_tokens = state.GetTokenContainer()->Size();
 
-    std::int32_t reserve = state.GetReserveNumTokensInNextScheduleEvent();
-    std::int32_t num_computed_tokens = state.GetTokenContainer()->Size();
-    if (!DecodeStep(*coordinator_, tables, reserve, num_computed_tokens)) {
-        _assert(false, "flat path: allocation failure unsupported in C slice");
+    auto tables = std::move(state).TakeBlockTables();
+    try {
+        if (!DecodeStep(*coordinator_, tables, reserve, num_computed_tokens)) {
+            _assert(false, "flat path: allocation failure unsupported in C slice");
+        }
+    } catch (...) {
+        // Non-owning tables: free the pages before the exception escapes (see
+        // SchedulePrefillEvent above).
+        FreeRequest(*coordinator_, tables);
+        throw;
     }
 
     Decoding decoding{state.GetTokenContainer(),

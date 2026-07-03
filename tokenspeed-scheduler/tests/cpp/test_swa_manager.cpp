@@ -92,6 +92,33 @@ TEST(SwaManagerTest, MatchStopsAfterContiguousNeededFromRight) {
     EXPECT_EQ(m.num_hit_blocks, 3);
 }
 
+TEST(SwaManagerTest, BoundedMatchEnforcesRunAgainstBoundedEnd) {
+    // page_size 4, window 10 -> contiguous_needed 3. Cached: h2,h3,h4 (a tail
+    // 3-run). Unbounded: keep 5 = [NULL,NULL,b2,b3,b4]. Bounded to 4 the run
+    // {2,3} is too short and pages 0,1 are holes -> NO valid match of length
+    // <= 4 exists, so the bounded overload returns empty (it must re-run the
+    // scan on the first 4 hashes, never chop the unbounded result).
+    BlockPool pool(16);
+    SwaManager mgr(pool, 4, 10);
+    std::string h0 = RealKey({0, 0, 0, 0}, 0);
+    std::string h1 = RealKey({1, 1, 1, 1}, 0);
+    std::string h2 = RealKey({2, 2, 2, 2}, 0);
+    std::string h3 = RealKey({3, 3, 3, 3}, 0);
+    std::string h4 = RealKey({4, 4, 4, 4}, 0);
+    CacheOnePage(pool, h2);
+    CacheOnePage(pool, h3);
+    CacheOnePage(pool, h4);
+    std::vector<std::string> hashes{h0, h1, h2, h3, h4};
+
+    PrefixMatch unbounded = mgr.MatchPrefix(hashes, /*max_blocks=*/5);
+    EXPECT_EQ(unbounded.blocks.size(), 5u);
+    EXPECT_EQ(unbounded.num_hit_blocks, 3);
+
+    PrefixMatch bounded = mgr.MatchPrefix(hashes, /*max_blocks=*/4);
+    EXPECT_TRUE(bounded.blocks.empty());
+    EXPECT_EQ(bounded.num_hit_blocks, 0);
+}
+
 TEST(SwaManagerTest, MatchTrimsTailAfterWindow) {
     // contiguous_needed = ceil((4-1)/4) = 1 -> any single hit (from the right) suffices.
     BlockPool pool(16);

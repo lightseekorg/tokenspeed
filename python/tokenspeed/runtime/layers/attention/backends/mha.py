@@ -346,6 +346,15 @@ class MHAAttnBackend(AttentionBackend):
         # the graph-recorded addresses see the new pages (absolute pages, no
         # base-offset math). The single-table update above still serves the
         # radix/single-table path.
+        #
+        # Padding contract (bs here is the padded bs): dummy ROWS in
+        # [actual_bs, bs) arrive from the wrapper padded with 0 — they replay
+        # with seq_lens=1, so the captured kernel dereferences exactly their
+        # col-0 entry, which must be page 0 (the zero-initialized dummy page).
+        # Column tails beyond a row's pages pad with -1 — past cache_seqlens,
+        # never dereferenced. The fill_(-1) below also hits dummy rows'
+        # columns 1.. (giving [0, -1, ...]), which is fine: with seq_lens=1
+        # nothing past col 0 is read for those rows.
         flat_block_tables = kwargs.get("flat_block_tables") or None
         if flat_block_tables:
             # Group set is fixed per model (from config.layer_types), so every
@@ -354,9 +363,11 @@ class MHAAttnBackend(AttentionBackend):
                 # Buffers exist: capture allocated them for these groups.
                 buf = self.cuda_graph_flat_page_tables[gid]
                 cols = src.shape[1]
-                assert cols <= buf.shape[1], (
-                    f"flat table for group {gid!r}: {cols} cols >"
-                    f" CUDA-graph buffer {buf.shape[1]}"
+                # cols >= 1 keeps the col-0 contract self-enforcing: a
+                # zero-width table would leave dummy rows' col 0 unwritten.
+                assert 1 <= cols <= buf.shape[1], (
+                    f"flat table for group {gid!r}: {cols} cols outside"
+                    f" [1, {buf.shape[1]}] (CUDA-graph buffer width)"
                 )
                 assert src.shape[0] >= bs, (
                     f"flat table for group {gid!r} has {src.shape[0]} rows"

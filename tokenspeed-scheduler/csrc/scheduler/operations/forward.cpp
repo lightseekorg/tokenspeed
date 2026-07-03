@@ -128,6 +128,28 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         return {};
     }
 
+#if TOKENSPEED_FLAT_KVCACHE
+    // TODO(radix-removal): the EnsureCapacityByEvict gate above budgets the radix
+    // device_allocator_, which the flat path never draws from -- it always
+    // admits. The flat shared BlockPool is gated here instead: a request that
+    // does not fit is simply not scheduled this round (mirrors the radix skip),
+    // so the FSM transition's Acquire cannot fail in normal operation. The flat
+    // first chunk claims no prefix (C slice) and acquires tokens_this_round.
+    //
+    // When this chunk completes the prefill, also reserve the decode headroom the
+    // PrefillDone->Decoding transition will acquire (decode_input_tokens becomes
+    // that state's reserve; scheduleDecode gates on exactly that value). Without
+    // it, a prompt that exactly fills the pool is admitted and its own decode
+    // step defers forever -- unrecoverable while flat retract is unimplemented
+    // (TODO(flat-retract)). No window slides before the first decode step, so
+    // BlocksNeededFor(tokens_this_round + reserve) is the exact peak demand.
+    const bool completes_prefill = tokens_this_round == unscheduled;
+    const std::int32_t flat_decode_reserve = completes_prefill ? decode_input_tokens : 0;
+    if (!coordinator_.CanAcquire(tokens_this_round + flat_decode_reserve)) {
+        return {};
+    }
+#endif
+
     if (hybrid_prefix_cache_ && hybrid_prefix_cache_->HasMambaAdjunct() && match_result.mamba_host_src_index >= 0 &&
         match_result.mamba_cow_src_index < 0) {
         TreeNode* host_mamba_node = hybrid_prefix_cache_->FindLastMambaHostNode(match_result.host.last_node);
@@ -192,6 +214,20 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
         return {};
     }
 
+#if TOKENSPEED_FLAT_KVCACHE
+    // TODO(radix-removal): the radix gate above is dead on the flat path (see
+    // schedulePrefillFirstChunk); the flat pool is gated here. The final chunk
+    // additionally reserves the PrefillDone->Decoding decode headroom
+    // (reserve_num_tokens_in_next_schedule_event), mirroring the first-chunk
+    // gate: BlocksNeededFor is tail-associative, so gating chunk + reserve in
+    // one query equals gating the two acquires the request will actually run.
+    const bool completes_prefill = tokens_this_round == unscheduled;
+    const std::int32_t flat_decode_reserve = completes_prefill ? reserve_num_tokens_in_next_schedule_event : 0;
+    if (!coordinator_.CanAcquire(request->FlatBlockTablesRef(), tokens_this_round + flat_decode_reserve)) {
+        return {};
+    }
+#endif
+
     if (hybrid_prefix_cache_ && hybrid_prefix_cache_->HasMambaAdjunct() &&
         !hybrid_prefix_cache_->EnsureMambaCapacityByEvict(1)) {
         return {};
@@ -221,6 +257,16 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* reque
     if (!kv_prefix_cache_.EnsureCapacityByEvict<ResourceType::Device>(pages_needed)) {
         return {};
     }
+
+#if TOKENSPEED_FLAT_KVCACHE
+    // TODO(radix-removal): the radix gate above is dead on the flat path (see
+    // schedulePrefillFirstChunk); the flat pool is gated here. Covers both the
+    // PrefillDone->Decoding reserve Acquire and each Decoding DecodeStep.
+    if (!coordinator_.CanAcquire(request->FlatBlockTablesRef(),
+                                 request->GetReserveNumTokensInNextScheduleEvent())) {
+        return {};
+    }
+#endif
 
     if (hybrid_prefix_cache_ && hybrid_prefix_cache_->HasMambaAdjunct() && mamba_allocator_ &&
         request->Is<fsm::PrefillDone>() && request->GetLocalMambaAllocator() != nullptr &&
@@ -643,6 +689,20 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
         }
         ops.push_back(std::move(op));
     };
+#if TOKENSPEED_FLAT_KVCACHE
+    // The executor owes one ExtendResult per decode op and one per op that
+    // completes a prefill; a mid-prefill chunk op produces no event (the driver
+    // just schedules the next chunk). Record the debt so a starved round can
+    // tell "results still in flight" from a genuine starvation deadlock (see the
+    // check below the loop). Decrements live in the outside-event handlers.
+    auto note_result_owed = [&](Request* request) {
+        if (!request->Is<fsm::Prefilling>()) {
+            ++pending_forward_results_[request->Id()];
+        }
+    };
+#else
+    auto note_result_owed = [](Request*) {};
+#endif
     std::vector<LoadBackOperation> loadback_ops;
     auto simulated_free =
         hybrid_prefix_cache_ ? hybrid_prefix_cache_->InitialSimulatedFree() : std::map<std::string, std::int32_t>{};
@@ -653,6 +713,7 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
             std::int32_t reserver_num_tokens = config_.role == Role::kP ? 0 : config_.decode_input_tokens;
             if (auto ev = schedulePrefill(request, token_budget, reserver_num_tokens, simulated_free)) {
                 push_op(applyEventAndGenerateOp(request, *ev));
+                note_result_owed(request);
             }
         } else if (request->Is<fsm::Submitted>() || request->Is<fsm::PrefetchDone>()) {
             // PrefetchDone: host cache populated; treat same as Submitted for forward scheduling.
@@ -663,6 +724,7 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
                 std::vector<TreeNode*> loadback_diff = ev->GetLoadbackDiff();
                 std::vector<TreeNode*> mamba_loadback_nodes = ev->GetMambaLoadbackNodes();
                 push_op(applyEventAndGenerateOp(request, std::move(*ev)), true);
+                note_result_owed(request);
                 // will be empty when disable_l2_cache
                 if (!loadback_diff.empty() || !mamba_loadback_nodes.empty()) {
                     cache_op_id op_id = kv_prefix_cache_.AllocateCacheOpId();
@@ -677,6 +739,7 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
 
             if (auto ev = scheduleDecode(request, simulated_free)) {
                 push_op(applyEventAndGenerateOp(request, *ev));
+                note_result_owed(request);
             }
         } else if (request->Is<fsm::Retracted>() && config_.role != Role::kP) {
             if (!config_.enable_mixed_prefill_decode && pushed_prefill) break;
@@ -685,6 +748,7 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
                 std::vector<TreeNode*> loadback_diff = ev->GetLoadbackDiff();
                 std::vector<TreeNode*> mamba_loadback_nodes = ev->GetMambaLoadbackNodes();
                 push_op(applyEventAndGenerateOp(request, std::move(*ev)));
+                note_result_owed(request);
                 if (!loadback_diff.empty() || !mamba_loadback_nodes.empty()) {
                     cache_op_id op_id = kv_prefix_cache_.AllocateCacheOpId();
                     loadback_ops.push_back(GenerateLoadBackOp(loadback_diff, mamba_loadback_nodes, op_id));
@@ -693,6 +757,38 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
         }
     }
 
+#if TOKENSPEED_FLAT_KVCACHE
+    // TODO(flat-retract): retract is unsupported on the flat path (C slice), so
+    // a pool-starved round schedules nothing; the flat admission gates deferred
+    // the requests intact and they retry when pages free up. Pages only free
+    // when a request finishes, which requires a forward result still in flight
+    // (pending_forward_results_) or a pending cache op (cache_op_tracker_). If
+    // the deferred set itself holds the pool's pages with neither pending, no
+    // free can ever arrive and the stall is permanent: fail loud instead of
+    // spinning silently, until flat retract lands.
+    if (ops.empty() && !candidates.empty()) {
+        std::size_t deferred = 0;
+        for (const Request* req : candidates) {
+            if (req->Is<fsm::Submitted>() || req->Is<fsm::PrefetchDone>() || req->Is<fsm::Prefilling>() ||
+                req->Is<fsm::PrefillDone>() || req->Is<fsm::Decoding>() || req->Is<fsm::Retracted>()) {
+                ++deferred;
+            }
+        }
+        // Block 0 is the null placeholder, never allocated: fewer than
+        // TotalBlocks()-1 free blocks means live requests hold pool pages.
+        const bool pool_pages_held = block_pool_.NumFreeBlocks() < block_pool_.TotalBlocks() - 1;
+        const bool nothing_in_flight = pending_forward_results_.empty() && cache_op_tracker_.empty();
+        // Fused-only: under PD-disagg, requests awaiting pd::Succeeded /
+        // remote-prefill events hold pages while appearing in neither ledger,
+        // so this predicate would misfire on a system PD completion unwedges.
+        if (config_.role == Role::kFused && deferred > 0 && pool_pages_held && nothing_in_flight) {
+            const std::string msg = "flat pool starvation deadlock: " + std::to_string(deferred) +
+                                    " candidate(s) deferred, no request in flight to free pages; flat retract not "
+                                    "yet implemented (TODO(flat-retract))";
+            _assert(false, msg.c_str());
+        }
+    }
+#else
     // If all active decode requests failed, device memory is exhausted: retract the longest one.
     if (ops.empty() && !candidates.empty()) {
         std::vector<Request*> retract_candidates;
@@ -713,6 +809,7 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
             return {std::vector<ForwardOperation>{}, std::move(wb_ops)};
         }
     }
+#endif
 
     return {std::move(ops), std::move(loadback_ops)};
 }

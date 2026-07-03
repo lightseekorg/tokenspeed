@@ -32,7 +32,11 @@
 namespace tokenspeed {
 
 // Common-prefix match across all groups. num_common_blocks is the page-aligned
-// min coverage; per_group[i] is group i's PrefixMatch truncated to that length.
+// fixpoint coverage every group can validly claim: full-attention matches are
+// truncated to it (any prefix of a full match is valid), and sliding-window
+// matches are computed BOUNDED to it, so each SWA group's trailing
+// contiguous-run invariant holds at exactly that length (no null hole inside
+// the last window). per_group[i] is group i's PrefixMatch at that length.
 struct CoordinatorMatch {
     std::int32_t num_common_blocks{0};
     std::vector<PrefixMatch> per_group;
@@ -67,6 +71,24 @@ public:
     // so no rollback is needed). Otherwise allocates in every group and returns
     // true. Used for both the prefill remainder and each decode step.
     bool Acquire(std::span<BlockTable> tables, std::int32_t num_tokens);
+
+    // Pure pre-check: fresh pages the shared pool must supply for every group's
+    // table to absorb num_tokens (sum of the per-group BlocksNeededFor math;
+    // tail-page room is credited per group). Acquire's check-then-act gate and
+    // the scheduler's flat admission check both call this, so the page math
+    // lives in exactly one place.
+    std::int32_t BlocksNeededFor(std::span<const BlockTable> tables, std::int32_t num_tokens) const;
+    // Overload for a not-yet-allocated request (prefill first chunk): every
+    // group starts from a fresh, empty table (no tail credit).
+    std::int32_t BlocksNeededFor(std::int32_t num_tokens) const;
+
+    // Would Acquire(tables, num_tokens) succeed right now? Same math as
+    // Acquire's gate, no allocation, no mutation.
+    bool CanAcquire(std::span<const BlockTable> tables, std::int32_t num_tokens) const {
+        return BlocksNeededFor(tables, num_tokens) <= pool_.NumFreeBlocks();
+    }
+    // Fresh-request variant (see BlocksNeededFor overload above).
+    bool CanAcquire(std::int32_t num_tokens) const { return BlocksNeededFor(num_tokens) <= pool_.NumFreeBlocks(); }
 
     void CacheFullBlocks(std::span<BlockTable> tables, std::span<const std::string> content_hashes,
                          std::int32_t num_full_blocks);

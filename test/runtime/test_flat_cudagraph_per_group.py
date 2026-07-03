@@ -45,17 +45,32 @@ class PadBlockTablesTest(_TorchCase):
 
         self.pad = CudaGraphWrapper._pad_block_tables_to_padded_bs
 
-    def test_pads_tail_rows_with_minus_one(self):
+    def _tables(self):
         torch = self.torch
-        tables = {
+        return {
             "full_attention": torch.arange(6, dtype=torch.int32).reshape(2, 3),
             "sliding_attention": torch.ones((2, 3), dtype=torch.int32),
         }
+
+    def test_default_pads_tail_rows_with_minus_one(self):
+        # Radix/V4 path keeps -1 dummy rows: the backend masks dummy tokens
+        # via is_valid_token before any block-table read.
+        tables = self._tables()
         out = self.pad(tables, actual_bs=2, padded_bs=4)
         for gid, src in tables.items():
             self.assertEqual(tuple(out[gid].shape), (4, 3))
             self.assertTrue((out[gid][:2] == src).all())
             self.assertTrue((out[gid][2:] == -1).all())
+
+    def test_flat_pads_tail_rows_with_zero(self):
+        # Flat path passes pad_value=0: dummy rows replay with seq_lens=1 and
+        # ARE dereferenced, so they must land on the zero-init dummy page 0.
+        tables = self._tables()
+        out = self.pad(tables, actual_bs=2, padded_bs=4, pad_value=0)
+        for gid, src in tables.items():
+            self.assertEqual(tuple(out[gid].shape), (4, 3))
+            self.assertTrue((out[gid][:2] == src).all())
+            self.assertTrue((out[gid][2:] == 0).all())
 
     def test_noop_when_bs_equal(self):
         torch = self.torch
@@ -252,6 +267,31 @@ class BackendReplayFlatTest(_BackendCase):
             self.assertTrue((buf[:2, 2:] == -1).all())
             # Rows beyond bs untouched (still capture-time zeros).
             self.assertTrue((buf[2:] == 0).all())
+
+    def test_padded_replay_dummy_rows_land_on_page_zero(self):
+        # Wrapper row-pads flat tables with 0 before a padded replay; after
+        # the backend's column-tail fill_(-1), a dummy row is [0, ..., -1s].
+        # Only col 0 is read for dummy rows (seq_lens=1) -> dummy page 0.
+        torch = self.torch
+        from tokenspeed.runtime.execution.cuda_graph_wrapper import (
+            CudaGraphWrapper,
+        )
+
+        src = {
+            "sliding_attention": torch.tensor([[3, 4]], dtype=torch.int32),
+            "full_attention": torch.tensor([[5, 6]], dtype=torch.int32),
+        }
+        padded = CudaGraphWrapper._pad_block_tables_to_padded_bs(
+            src, actual_bs=1, padded_bs=2, pad_value=0
+        )
+        self._replay(2, padded)
+        for gid, expected in src.items():
+            buf = self.backend.cuda_graph_flat_page_tables[gid]
+            self.assertTrue((buf[:1, :2] == expected).all())
+            # Dummy row: col 0 must be a dereferenceable page (0), never -1.
+            self.assertEqual(int(buf[1, 0]), 0)
+            self.assertTrue((buf[1, :2] == 0).all())
+            self.assertTrue((buf[:2, 2:] == -1).all())
 
     def test_full_width_src_leaves_no_tail(self):
         torch = self.torch
