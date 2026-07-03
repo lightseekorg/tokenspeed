@@ -98,12 +98,6 @@ class GlmDsaDecodeWindow:
     q_len_per_req: int
 
 
-def _glm_dsa_is_decode_token_mode(forward_mode: ForwardMode | None) -> bool:
-    return forward_mode is not None and (
-        forward_mode.is_decode() or forward_mode.is_mixed()
-    )
-
-
 def _glm_dsa_skip_indexer_topk(config, layer_id: int | None) -> bool:
     if layer_id is None:
         return False
@@ -540,19 +534,6 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return decode_topk.topk_indices[start:end], decode_topk.topk_lens[start:end]
 
-    @staticmethod
-    def _decode_topk_covers_window(
-        decode_topk: GlmDsaDecodeTopK | None,
-        start: int,
-        end: int,
-    ) -> bool:
-        return (
-            decode_topk is not None
-            and decode_topk.topk_indices.shape[0] >= end
-            and decode_topk.topk_lens.shape[0] >= end
-            and start <= end
-        )
-
     def _retire_decode_workspace(self, buffer: torch.Tensor) -> None:
         retired = getattr(self, "_retired_decode_workspaces", None)
         if retired is None:
@@ -609,9 +590,6 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         indexer_output: GlmDsaIndexerOutput,
         ctx: ForwardContext,
     ) -> GlmDsaDecodeTopK | None:
-        if not _glm_dsa_is_decode_token_mode(ctx.forward_mode):
-            return None
-
         metadata = getattr(ctx.attn_backend, "forward_decode_metadata", None)
         if metadata is None or metadata.block_kv_indices is None:
             return None
@@ -770,11 +748,6 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         ctx: ForwardContext,
         num_prefill_tokens: int,
     ) -> GlmDsaPrefillTopK | None:
-        if ctx.forward_mode is None or not ctx.forward_mode.is_extend_or_mixed():
-            return None
-        if ctx.num_extends <= 0 or num_prefill_tokens <= 0:
-            return None
-
         chunk_meta = ctx.attn_backend.chunked_prefill_metadata
         prefix_lens = chunk_meta.extend_prefix_lens[: ctx.num_extends].to(torch.int32)
         extend_lens = chunk_meta.extend_seq_lens[: ctx.num_extends].to(torch.int32)
@@ -945,21 +918,13 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         decode_start = decode_window.start
         decode_end = decode_window.end
 
-        carried_prefill_topk = getattr(ctx, "dsa_prefill_topk", None)
-        carried_decode_topk = getattr(ctx, "dsa_decode_topk", None)
-        carried_decode_topk_covers_window = self._decode_topk_covers_window(
-            carried_decode_topk,
-            decode_start,
-            decode_end,
-        )
         should_compute_indexer = not self.skip_indexer_topk or (
             self.is_nextn
             and (
-                (num_prefill_tokens > 0 and carried_prefill_topk is None)
-                or (num_decode_tokens > 0 and not carried_decode_topk_covers_window)
+                (num_prefill_tokens > 0 and ctx.dsa_prefill_topk is None)
+                or (num_decode_tokens > 0 and ctx.dsa_decode_topk is None)
             )
         )
-
         if should_compute_indexer:
             hidden_states = comm_manager.pre_attn_comm(hidden_states, ctx)
             indexer_output = self.indexer(hidden_states, q_norm, positions)
@@ -968,25 +933,17 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 out_cache_loc,
                 indexer_output.key,
             )
-            indexer_output = self._forward_dsa_indexer(
-                positions=positions,
-                hidden_states=hidden_states,
-                q_lora=q_norm,
-                ctx=ctx,
-                out_cache_loc=out_cache_loc,
-                comm_manager=comm_manager,
-            )
-            prefill_topk = self._compute_prefill_topk_indices(
-                indexer_output,
-                ctx,
-                num_prefill_tokens,
-            )
-            decode_topk = self._compute_decode_topk_indices(indexer_output, ctx)
-            ctx.dsa_prefill_topk = prefill_topk
-            ctx.dsa_decode_topk = decode_topk
-        else:
-            prefill_topk = carried_prefill_topk
-            decode_topk = carried_decode_topk
+            if ctx.num_extends > 0:
+                ctx.dsa_prefill_topk = self._compute_prefill_topk_indices(
+                    indexer_output,
+                    ctx,
+                    num_prefill_tokens,
+                )
+            if ctx.num_extends < ctx.bs:
+                ctx.dsa_decode_topk = self._compute_decode_topk_indices(
+                    indexer_output,
+                    ctx,
+                )
 
         q = self.q_b_proj(q_norm)[0]
         attn_output = torch.empty(
@@ -1003,7 +960,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 input_num_tokens=num_prefill_tokens,
                 forward_mode=ForwardMode.EXTEND,
             )
-            if prefill_topk is None:
+            if ctx.dsa_prefill_topk is None:
                 raise RuntimeError(
                     "GLM DSA sparse prefill requires computed top-k indices."
                 )
@@ -1014,7 +971,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 prefill_ctx,
                 out_cache_loc[:num_prefill_tokens],
                 attn_output[:num_prefill_tokens],
-                prefill_topk=prefill_topk,
+                prefill_topk=ctx.dsa_prefill_topk,
             )
 
         if num_decode_tokens > 0:
@@ -1025,12 +982,12 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 input_num_tokens=num_decode_tokens,
                 forward_mode=ForwardMode.DECODE,
             )
-            if decode_topk is None:
+            if ctx.dsa_decode_topk is None:
                 raise RuntimeError(
                     "GLM DSA sparse decode requires computed top-k indices."
                 )
             topk_indices, topk_lens = self._slice_decode_topk(
-                decode_topk,
+                ctx.dsa_decode_topk,
                 decode_start,
                 decode_end,
             )
