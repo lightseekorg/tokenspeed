@@ -71,6 +71,7 @@ class AttentionBackend(ABC):
     # False for flat-capable backends whose spec-verify path is not wired yet.
     flat_spec_capable: bool = True
     uses_padded_decode_token_mask: bool = False
+    draft_block_use_extend: bool = False
 
     def __init__(self, config: BaseAttnConfig) -> None:
         self.device = config.device
