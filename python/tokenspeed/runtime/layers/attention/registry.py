@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import AttentionArch, is_deepseek_v4
+from tokenspeed.runtime.configs.paged_cache_spec import hybrid_slab_group_size
 from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
@@ -45,6 +46,18 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.configs.model_config import ModelConfig
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.utils.server_args import ServerArgs
+
+
+def _kv_profile_layer_divisor(num_layers, layer_types, speculative_enabled):
+    """num_attention_layers to charge per token in the KV memory profile:
+    layers-per-group under the hybrid slab layout (M12 -- paired layers
+    share slabs, so a token costs one group's layers, not all layers),
+    else all layers. MUST agree with the layout decision in
+    MHATokenToKVPool._create_buffers -- both consume
+    hybrid_slab_group_size, the single source.
+    """
+    gs = hybrid_slab_group_size(layer_types, speculative_enabled=speculative_enabled)
+    return gs if gs is not None else num_layers
 
 
 def _resolve_max_num_tokens(
@@ -539,8 +552,34 @@ def create_attn_components(
             server_args.max_total_tokens,
         )
     else:
+        # M12 hybrid slab sizing: when the slab layout activates, paired
+        # layers share K/V slabs, so a token's KV budget charges one group's
+        # layers instead of all layers. layer_types is read off the attn
+        # config -- the exact tuple MHAConfig.generate derived from
+        # hf_config.layer_types and forwards to MHATokenToKVPool -- so the
+        # sizing divisor and the buffer layout consume identical inputs
+        # (MLA configs carry no layer_types attribute -> legacy divisor).
+        slab_divisor = _kv_profile_layer_divisor(
+            num_layers,
+            getattr(config, "layer_types", None),
+            server_args.speculative_algorithm is not None,
+        )
+        if profile_cache_cell_size is not None and slab_divisor != num_layers:
+            # cache_cell_size overrides replace the per-layer cell-size
+            # computation entirely in profile_max_num_pages; the per-group
+            # divisor cannot compose with them silently, so fall back to
+            # charging all layers (conservative). Unreachable today -- the
+            # override is only set on the DeepSeek V4 branch -- but must not
+            # break quietly if that changes.
+            logger.warning(
+                "hybrid slab sizing disabled: profile cache_cell_size "
+                "override is set; charging all %d layers instead of %d",
+                num_layers,
+                slab_divisor,
+            )
+            slab_divisor = num_layers
         max_total_num_pages = profile_max_num_pages(
-            **_profile_kwargs,
+            **{**_profile_kwargs, "num_attention_layers": slab_divisor},
             gpu_memory_utilization=server_args.gpu_memory_utilization,
             cache_cell_size=profile_cache_cell_size,
             draft_cache_cell_size=draft_profile_cache_cell_size,

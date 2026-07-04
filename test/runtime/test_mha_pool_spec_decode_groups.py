@@ -90,9 +90,13 @@ class MHAPoolGroupPublicationTest(unittest.TestCase):
         self.assertIn("full_attention", pool.paged_cache_group_page_counts)
 
     def test_hybrid_no_spec_publishes_two_groups(self):
+        # layer_num must match len(layer_types): the M12 slab layout's
+        # pairing-completeness assert cross-checks them (the old fixture's
+        # 4-types/2-layers mismatch was silently tolerated pre-M12).
         pool = self._pool(
             layer_types=GPT_OSS_LAYER_TYPES,
             sliding_window_tokens=128,
+            layer_num=len(GPT_OSS_LAYER_TYPES),
         )
         self.assertEqual(
             {s.group_id for s in pool.paged_cache_group_specs},
@@ -217,6 +221,8 @@ class MHAConfigSpecSignalTest(unittest.TestCase):
             max_cudagraph_capture_size=4,
             kv_cache_quant_method="",
             chunked_prefill_size=512,
+            enable_kvstore=False,
+            disaggregation_mode="null",
         )
 
     def _model_config(self):

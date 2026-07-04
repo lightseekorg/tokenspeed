@@ -24,6 +24,7 @@ import numpy as np
 import torch
 from tokenspeed_kernel.ops.kvcache.triton import store_kv_cache
 
+from tokenspeed.runtime.configs.paged_cache_spec import hybrid_slab_group_size
 from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
 from tokenspeed.runtime.layers.attention.kv_cache.utils import (
     copy_all_layer_kv_cache_tiled,
@@ -57,6 +58,8 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         sliding_window_tokens: int | None = None,
         max_scheduled_tokens: int = 0,
         speculative_enabled: bool = False,
+        kvstore_enabled: bool = False,
+        pd_disaggregation_enabled: bool = False,
         enable_kv_cache_copy: bool = False,
         enable_alt_stream: bool = True,
     ):
@@ -71,6 +74,18 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         self.head_num = head_num
         self.head_dim = head_dim
         self.layer_num = layer_num
+        # Decide the buffer layout (M12 hybrid slab vs legacy per-layer)
+        # BEFORE sizing: _get_page_size_bytes (next line) and
+        # _create_buffers both key off _slab_group_size and must agree.
+        # hybrid_slab_group_size is also what the registry's KV memory
+        # profile consumes (_kv_profile_layer_divisor) -- one predicate,
+        # two consumers, so sizing and layout can never diverge.
+        self._layer_types = tuple(layer_types or ())
+        self._kvstore_enabled = kvstore_enabled
+        self._pd_disaggregation_enabled = pd_disaggregation_enabled
+        self._slab_group_size = hybrid_slab_group_size(
+            self._layer_types, speculative_enabled=speculative_enabled
+        )
         self.page_size_bytes = self._get_page_size_bytes()
         self._create_buffers()
 
@@ -148,14 +163,70 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             )
 
     def _get_page_size_bytes(self):
+        # Under the hybrid slab layout (M12) paired layers share K/V
+        # slabs, so a page only carries one group's layers worth of bytes
+        # -- this is the byte-level capacity win the layout exists for.
         return (
             2
             * self.page_size
-            * self.layer_num
+            * (self._slab_group_size or self.layer_num)
             * self.head_num
             * self.head_dim
             * torch._utils._element_size(self.dtype)
         )
+
+    def _slab_pair_index(self) -> list[int]:
+        """Map layer_id -> slab index for the hybrid slab layout.
+
+        Groups form in FIRST-APPEARANCE order of layer_types -- the same
+        ordering group_specs_from_layer_types uses, so slab i
+        deterministically pairs group-A's i-th layer with group-B's i-th
+        layer -- and the i-th layer of every group binds slab i.
+        """
+        assert self._slab_group_size is not None
+        assert len(self._layer_types) == self.layer_num, (
+            f"hybrid slab layout: layer_types has {len(self._layer_types)} "
+            f"entries but layer_num={self.layer_num}"
+        )
+        occurrence: dict[str, int] = {}
+        pair_index: list[int] = []
+        for label in self._layer_types:
+            idx = occurrence.get(label, 0)
+            occurrence[label] = idx + 1
+            pair_index.append(idx)
+        # Pairing completeness: every group contributes exactly one layer
+        # to each slab (equal group sizes are guaranteed by the predicate;
+        # this pins the mapping itself).
+        assert all(
+            count == self._slab_group_size for count in occurrence.values()
+        ), f"hybrid slab layout: uneven groups {occurrence!r}"
+        return pair_index
+
+    def _check_slab_guards(self):
+        """Refuse features whose per-layer buffer assumptions break under
+        the slab layout (paired layers alias the SAME tensor)."""
+        if self._kvstore_enabled:
+            raise RuntimeError(
+                "hybrid slab KV layout is incompatible with the kvstore L2 "
+                "cache: host offload copies KV per layer (get_cpu_copy / "
+                "get_flat_data / transfer), and paired layers alias the "
+                "same slab, so per-layer copies would double-count bytes "
+                "and misattribute page ownership. Disable the kvstore "
+                "(--enable-kvstore off) or use a radix-built "
+                "tokenspeed_scheduler extension, which keeps the legacy "
+                "per-layer layout."
+            )
+        if self._pd_disaggregation_enabled:
+            raise RuntimeError(
+                "hybrid slab KV layout is incompatible with PD "
+                "disaggregation: KV transfer registers per-layer buffer "
+                "pointers (get_contiguous_buf_infos), and paired layers "
+                "alias the same slab, so per-layer transfers would send "
+                "the same bytes twice and clobber the peer's pairing. Set "
+                "disaggregation_mode='null' or use a radix-built "
+                "tokenspeed_scheduler extension, which keeps the legacy "
+                "per-layer layout."
+            )
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region():
@@ -163,7 +234,9 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             # The padded page 0 is used for writing dummy outputs from padded tokens.
             # Zero-init: attention kernels may read block_table entries beyond the
             # valid seq_len (pointing at page 0), so the slots must be finite to
-            # keep softmax well-defined.
+            # keep softmax well-defined. Under the slab layout paired layers
+            # share one dummy page 0 per slab -- writes there are discarded
+            # either way, so the contract is unchanged.
             logger.info(
                 "_create_buffers self.size=%r, self.page_size=%r, self.head_num=%r, self.head_dim=%r, self.layer_num=%r",
                 self.size,
@@ -172,22 +245,61 @@ class MHATokenToKVPool(BaseTokenToKVPool):
                 self.head_dim,
                 self.layer_num,
             )
-            self.k_buffer = [
-                torch.zeros(
+
+            def _alloc():
+                return torch.zeros(
                     (self.size + self.page_size, self.head_num, self.head_dim),
                     dtype=self.store_dtype,
                     device=self.device,
                 )
-                for _ in range(self.layer_num)
-            ]
-            self.v_buffer = [
-                torch.zeros(
-                    (self.size + self.page_size, self.head_num, self.head_dim),
-                    dtype=self.store_dtype,
-                    device=self.device,
+
+            if self._slab_group_size is not None:
+                # M12 hybrid slab layout: allocate group_size K/V slab
+                # pairs and bind the i-th layer of EVERY group to slab i
+                # (same tensor object, vLLM-style aliasing). Safety
+                # invariant (do not re-derive here): the flat scheduler's
+                # single BlockPool guarantees a page id is owned by at
+                # most one group at a time, so paired layers' live rows
+                # never overlap; the M11 write-within-group-table probes
+                # cover it at runtime.
+                self._check_slab_guards()
+                pair_index = self._slab_pair_index()
+                k_slabs = [_alloc() for _ in range(self._slab_group_size)]
+                v_slabs = [_alloc() for _ in range(self._slab_group_size)]
+                self.k_buffer = [
+                    k_slabs[pair_index[layer_id]]
+                    for layer_id in range(self.layer_num)
+                ]
+                self.v_buffer = [
+                    v_slabs[pair_index[layer_id]]
+                    for layer_id in range(self.layer_num)
+                ]
+                # Per-layer host (L2) copies would alias shared slabs, so
+                # opt out of the hierarchical cache surface: event_loop
+                # builds a MemoryExecutor for retraction offload even when
+                # the kvstore flag is off, and this attribute is what
+                # gates it (DeepseekV4TokenToKVPool precedent).
+                self.supports_hierarchical_kv_cache = False
+                # move_kv_cache broadcasts one (tgt, src) over data_ptrs;
+                # duplicated slab entries would just re-copy the same rows
+                # (idempotent, wasteful). It has NO callers anywhere today
+                # (grep before wiring it up under the slab layout).
+                logger.info(
+                    "KV layout: hybrid slab (%d slabs x %d rows; paired "
+                    "layers share storage; M12)",
+                    self._slab_group_size,
+                    self.size + self.page_size,
                 )
-                for _ in range(self.layer_num)
-            ]
+            else:
+                self.k_buffer = [_alloc() for _ in range(self.layer_num)]
+                self.v_buffer = [_alloc() for _ in range(self.layer_num)]
+                logger.info(
+                    "KV layout: per-layer (%d buffers; hybrid slab "
+                    "inactive: predicate returned None -- radix ext, "
+                    "spec decode, or non-uniform/single-group "
+                    "layer_types)",
+                    self.layer_num,
+                )
             self.k_data_ptrs = torch.tensor(
                 [x.data_ptr() for x in self.k_buffer],
                 dtype=torch.uint64,
@@ -281,11 +393,14 @@ class MHATokenToKVPool(BaseTokenToKVPool):
     def get_kv_size_bytes(self):
         assert hasattr(self, "k_buffer")
         assert hasattr(self, "v_buffer")
+        # Dedup by tensor identity: under the hybrid slab layout k_buffer
+        # holds layer_num references to group_size slabs, and allocated
+        # bytes must not be double-counted (legacy layout: no-op).
         k_size_bytes = 0
-        for k_cache in self.k_buffer:
+        for k_cache in {id(t): t for t in self.k_buffer}.values():
             k_size_bytes += np.prod(k_cache.shape) * k_cache.dtype.itemsize
         v_size_bytes = 0
-        for v_cache in self.v_buffer:
+        for v_cache in {id(t): t for t in self.v_buffer}.values():
             v_size_bytes += np.prod(v_cache.shape) * v_cache.dtype.itemsize
         return k_size_bytes, v_size_bytes
 

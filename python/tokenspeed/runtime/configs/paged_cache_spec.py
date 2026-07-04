@@ -56,6 +56,48 @@ def scheduler_ext_flat_kvcache() -> bool:
     return bool(getattr(tokenspeed_scheduler, "FLAT_KVCACHE", False))
 
 
+def hybrid_slab_group_size(
+    layer_types: Optional[Sequence[str]],
+    *,
+    speculative_enabled: bool,
+) -> Optional[int]:
+    """Group size for the hybrid slab KV layout, or None to keep the legacy
+    per-layer-buffer layout.
+
+    The slab layout (M12) shares one K/V slab between one layer from EACH
+    group (vLLM-style aliasing) and divides the memory budget by
+    layers-per-group instead of total layers -- the byte-level capacity win
+    for hybrid models. Safe only when (a) the flat scheduler ext is active
+    (single BlockPool guarantees a page id is owned by at most one group at
+    a time, so paired layers' live rows never overlap) and (b) every group
+    has the SAME layer count (equal slab fan-out). Per-layer page bytes are
+    uniform for MHA pools by construction (single head_num/head_dim/dtype).
+    This predicate is the SINGLE source for both the sizing divisor
+    (registry profile) and the buffer layout (_create_buffers) -- the two
+    must never disagree.
+
+    Unlike ``group_specs_from_layer_types`` (which raises on an unknown
+    label, since spec publication must fail loudly), an unknown label here
+    returns None: the predicate gates an optimization, so unrecognized
+    input degrades to the safe legacy layout.
+    """
+    if speculative_enabled or not scheduler_ext_flat_kvcache():
+        return None
+    if not layer_types:
+        return None
+    counts: dict[str, int] = {}
+    for label in layer_types:
+        if label not in ("sliding_attention", "full_attention"):
+            return None
+        counts[label] = counts.get(label, 0) + 1
+    if len(counts) < 2:
+        return None
+    sizes = set(counts.values())
+    if len(sizes) != 1:
+        return None
+    return sizes.pop()
+
+
 def validate_flat_scheduler_config(
     *,
     flat_kvcache_ext: bool,
@@ -274,6 +316,7 @@ __all__ = [
     "Retention",
     "compute_paged_cache_group_page_counts",
     "group_specs_from_layer_types",
+    "hybrid_slab_group_size",
     "scheduler_ext_flat_kvcache",
     "validate_flat_scheduler_config",
 ]

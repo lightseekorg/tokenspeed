@@ -48,6 +48,15 @@ class MHAConfig(BaseAttnConfig):
     # would disable the overlap scheduler under spec decode, and a radix-built
     # ext never delivers flat tables at all.
     speculative_enabled: bool = False
+    # True iff server_args.enable_kvstore (L2 host cache). Forwarded as a
+    # plain bool (speculative_enabled precedent) so the pool can refuse
+    # the hybrid slab layout: L2 host offload copies KV per layer, and
+    # slab-paired layers alias the same tensor.
+    kvstore_enabled: bool = False
+    # True iff server_args.disaggregation_mode != "null" (PD split). Same
+    # slab-layout guard rationale: PD registers per-layer buffer pointers
+    # for KV transfer.
+    pd_disaggregation_enabled: bool = False
 
     @classmethod
     def generate(
@@ -86,6 +95,8 @@ class MHAConfig(BaseAttnConfig):
             sliding_window_tokens=sliding_window_tokens,
             max_scheduled_tokens=server_args.chunked_prefill_size,
             speculative_enabled=server_args.speculative_algorithm is not None,
+            kvstore_enabled=server_args.enable_kvstore,
+            pd_disaggregation_enabled=server_args.disaggregation_mode != "null",
             **kwargs,
         )
 
@@ -122,4 +133,6 @@ class MHAConfig(BaseAttnConfig):
             sliding_window_tokens=self.sliding_window_tokens,
             max_scheduled_tokens=self.max_scheduled_tokens,
             speculative_enabled=self.speculative_enabled,
+            kvstore_enabled=self.kvstore_enabled,
+            pd_disaggregation_enabled=self.pd_disaggregation_enabled,
         )
