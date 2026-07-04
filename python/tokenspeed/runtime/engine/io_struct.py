@@ -80,18 +80,19 @@ class GenerateReqInput:
     # Routing id; always server-assigned during normalize, never caller-settable.
     rid: list[str] | str | None = field(default=None, init=False)
     # --- Logprob request (two dialects, one compute path) ---
-    # vLLM dialect: request output logprobs via ``sampling_params["logprobs"]``.
-    # SGLang dialect: the fields below. A request uses one dialect; the response
-    # is rendered to match (override with ``logprob_format``).
+    # vLLM-compatible requests use ``sampling_params["logprobs"]``;
+    # SGLang-compatible requests use the legacy fields below. A request uses
+    # one dialect; the response is rendered to match (override with
+    # ``logprob_format``).
     return_logprob: list[bool] | bool | None = None
-    # SGLang: start location in the prompt for prompt logprobs. -1 (default) =
-    # output tokens only.
+    # Start location in the prompt for prompt logprobs. -1 (default) = output
+    # tokens only.
     logprob_start_len: list[int] | int | None = None
-    # SGLang: number of top logprobs per position.
+    # Number of top logprobs per position.
     top_logprobs_num: list[int] | int | None = None
-    # SGLang: specific token ids to score per position.
+    # Specific token ids to score per position.
     token_ids_logprob: list[list[int]] | list[int] | None = None
-    # SGLang: detokenize tokens in the returned logprobs.
+    # Detokenize tokens in the returned logprobs.
     return_text_in_logprobs: bool = False
     # Output rendering dialect: "vllm" | "sglang" | "both". None = auto (match
     # the request dialect: vllm if sampling_params.logprobs is set, else sglang).

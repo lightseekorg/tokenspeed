@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT AND Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 LightSeek Foundation
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
 # Copyright (c) 2026 LightSeek Foundation
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -18,11 +22,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-# Adapted from vLLM's MRV2/Qrita-style top-k/top-p Triton sampler:
-#   https://github.com/vllm-project/vllm/blob/main/vllm/v1/sample/ops/topk_topp_triton.py
-#   https://arxiv.org/abs/2602.01518
-# TokenSpeed adapts the candidate/pivot ideas for candidate-space Gumbel-Max
-# instead of vLLM's in-place logits masking API.
+# TokenSpeed uses Qrita-style candidate/pivot ideas for candidate-space Gumbel-Max
+# without mutating logits in place.
 
 from __future__ import annotations
 

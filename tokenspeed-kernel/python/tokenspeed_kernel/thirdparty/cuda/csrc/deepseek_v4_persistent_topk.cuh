@@ -1,8 +1,9 @@
 /*
  * SPDX-License-Identifier: Apache-2.0
- *
- * Adapted from vLLM csrc/persistent_topk.cuh.
- * Original copyright: Copyright contributors to the vLLM project.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 LightSeek Foundation
+ * SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ * SPDX-FileCopyrightText: Copyright contributors to the sgl-kernel project
+ * SPDX-FileCopyrightText: Copyright contributors to the FlashInfer project
  *
  * Persistent TopK Scheduler for CSA Indexer.
  */
@@ -419,11 +420,7 @@ __device__ __noinline__ void histogram_2048_topk(
 // For sequences 8K < seq_len <= 64K.
 // ============================================================================
 
-// Adapted from:
-// https://github.com/sgl-project/sglang/blob/v0.5.8/sgl-kernel/csrc/elementwise/topk.cu#L87
-// by: DarkSharpness
-// which at the same time is an optimized topk kernel copied from tilelang
-// kernel
+// sgl-kernel/tilelang-derived medium-path top-k kernel.
 template <int TopK>
 __device__ __noinline__ void histogram_256_topk(
     const float* __restrict__ logits, int* __restrict__ output_indices,
@@ -652,8 +649,7 @@ __device__ __forceinline__ void wait_ge(int* ptr, int target_val,
 // ============================================================================
 
 // ============================================================================
-// Multi-CTA cooperative RadixTopK for a single large row.
-// Adapted from https://github.com/flashinfer-ai/flashinfer/pull/2215
+// FlashInfer-derived multi-CTA cooperative RadixTopK for a single large row.
 // ============================================================================
 
 template <int TopK, uint32_t VEC_SIZE>
@@ -938,8 +934,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
 
 // ============================================================================
 // FlashInfer FilteredTopK (BS>32 dispatch) — float32 only.
-// Extracted from flashinfer_topk.cuh. Lives in namespace vllm (not persistent).
-// Adapted from https://github.com/flashinfer-ai/flashinfer/pull/2215
+// Lives in namespace vllm (not persistent).
 // ============================================================================
 
 #define FLASHINFER_CUDA_CALL(func, ...) \

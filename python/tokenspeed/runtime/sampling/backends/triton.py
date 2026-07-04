@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT AND Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 LightSeek Foundation
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
 # Copyright (c) 2026 LightSeek Foundation
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -18,10 +22,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-# Adapted from vLLM MRV2's Triton-native sampling design:
-#   https://vllm.ai/blog/2026-03-24-mrv2
-#   https://github.com/vllm-project/vllm/blob/main/vllm/v1/worker/gpu/sample/gumbel.py
-#   https://github.com/vllm-project/vllm/blob/main/vllm/v1/worker/gpu/sample/logprob.py
 # TokenSpeed keeps its request-pool state and backend boundary.
 
 from __future__ import annotations

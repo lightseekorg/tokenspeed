@@ -1,13 +1,6 @@
-# Adapted from meituan-longcat/SGLang-FluentLLM.
-# This file has been modified for this repository.
-# This file may incorporate material from ModelTC/lightllm,
-# vllm-project/vllm, and sgl-project/sglang, as identified in
-# python/THIRDPARTYNOTICES.
-
-# Adapted from fla-org/flash-linear-attention
-# This file has been modified for this repository.
-# License: https://github.com/fla-org/flash-linear-attention/blob/main/LICENSE
-# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: Copyright (c) 2026 LightSeek Foundation
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
 #
 # Copyright (c) 2026 LightSeek Foundation
 #

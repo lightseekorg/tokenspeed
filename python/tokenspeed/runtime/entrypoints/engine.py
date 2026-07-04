@@ -1,8 +1,7 @@
-# Adapted from meituan-longcat/SGLang-FluentLLM.
-# This file has been modified for this repository.
-# This file may incorporate material from ModelTC/lightllm,
-# vllm-project/vllm, and sgl-project/sglang, as identified in
-# python/THIRDPARTYNOTICES.
+# SPDX-License-Identifier: MIT AND Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 LightSeek Foundation
+# SPDX-FileCopyrightText: Copyright 2023-2024 SGLang Team
+#
 # Copyright (c) 2026 LightSeek Foundation
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -149,7 +148,8 @@ class Engine(EngineBase):
         sampling_params: list[dict] | dict | None = None,
         # The token ids for text; one can either specify text or input_ids.
         input_ids: list[list[int]] | list[int] | None = None,
-        # SGLang-dialect output logprobs (vLLM dialect: sampling_params["logprobs"]).
+        # SGLang-compatible logprob controls; vLLM-compatible requests use
+        # sampling_params["logprobs"].
         return_logprob: list[bool] | bool | None = None,
         logprob_start_len: list[int] | int | None = None,
         top_logprobs_num: list[int] | int | None = None,
@@ -211,7 +211,7 @@ class Engine(EngineBase):
         input_embeds: torch.Tensor = None,
         input_multi_ids: list[list[int]] = None,
         input_extra_infos: list[dict] = None,
-        # SGLang-dialect output logprobs (vLLM dialect: sampling_params["logprobs"]).
+        # Same legacy logprob controls as generate().
         return_logprob: list[bool] | bool | None = None,
         logprob_start_len: list[int] | int | None = None,
         top_logprobs_num: list[int] | int | None = None,

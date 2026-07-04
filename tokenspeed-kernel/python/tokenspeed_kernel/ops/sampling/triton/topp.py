@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT AND Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 LightSeek Foundation
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
 # Copyright (c) 2026 LightSeek Foundation
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -18,10 +22,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-# Adapted from vLLM MRV2 logits-space sampling with stateless Gumbel RNG:
-#   https://vllm.ai/blog/2026-03-24-mrv2
-#   https://github.com/vllm-project/vllm/blob/main/vllm/v1/worker/gpu/sample/gumbel.py
-# The top-p-only rejection/repair layout here is TokenSpeed-specific.
+# TokenSpeed-specific top-p-only rejection/repair layout.
 
 from __future__ import annotations
 

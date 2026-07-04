@@ -1,15 +1,7 @@
 /*
  * SPDX-License-Identifier: Apache-2.0
- *
- * Portions of this file are adapted from vLLM:
- *   csrc/topk.cu
- *   csrc/persistent_topk.cuh
- *
- * Original copyright:
- *   Copyright contributors to the vLLM project
- *
- * Modifications copyright:
- *   Copyright (c) 2026 LightSeek Foundation
+ * SPDX-FileCopyrightText: Copyright (c) 2026 LightSeek Foundation
+ * SPDX-FileCopyrightText: Copyright contributors to the vLLM project
  *
  * TokenSpeed modifications:
  *   - Ported the PyTorch custom op boundary to TokenSpeed's TVM FFI CUDA
