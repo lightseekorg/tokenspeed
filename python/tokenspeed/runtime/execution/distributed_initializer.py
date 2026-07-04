@@ -155,6 +155,7 @@ class DistributedInitializer:
             backend=backend,
             distributed_init_method=dist_init_method,
             timeout=config.distributed_timeout_seconds,
+            device_id=torch.device(config.device, config.gpu_id),
         )
         pg_manager.init_process_group(config.mapping.world_group)
         pg_manager.init_process_group(config.mapping.attn.tp_group)
