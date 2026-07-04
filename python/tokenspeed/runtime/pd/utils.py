@@ -30,7 +30,7 @@ import threading
 import warnings
 from collections import deque
 from enum import Enum
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING
 
 import numpy as np
 import numpy.typing as npt
@@ -88,7 +88,7 @@ class ReqToMetadataIdxAllocator:
     def available_size(self) -> int:
         return len(self.free_slots)
 
-    def alloc(self) -> Optional[int]:
+    def alloc(self) -> int | None:
         if not self.free_slots:
             return None
 
@@ -172,7 +172,7 @@ class PDRegistryRequest:
 
     mode: str
     registry_url: str
-    bootstrap_port: Optional[int] = None
+    bootstrap_port: int | None = None
 
     def __post_init__(self):
         if self.mode == "prefill" and self.bootstrap_port is None:
@@ -299,11 +299,11 @@ class MetadataBuffers:
     def set_buf_by_batch(
         self,
         output_ids: torch.Tensor,
-        output_buffer_indices: List[int],
+        output_buffer_indices: list[int],
         logits_output: LogitsProcessorOutput,
-        output_token_logprobs_indices: Optional[List[Tuple[int, int]]] = None,
-        output_top_logprobs_indices: Optional[List[Tuple[int], int]] = None,
-        cached_tokens: Optional[torch.Tensor] = None,
+        output_token_logprobs_indices: list[tuple[int, int]] | None = None,
+        output_top_logprobs_indices: list[tuple[int, int]] | None = None,
+        cached_tokens: torch.Tensor | None = None,
     ):
         self.output_ids[
             torch.tensor(output_buffer_indices).to(self.device, non_blocking=True), 0
@@ -398,7 +398,7 @@ class FastQueue:
 
 def group_concurrent_contiguous(
     src_indices: npt.NDArray[np.int64], dst_indices: npt.NDArray[np.int64]
-) -> Tuple[List[npt.NDArray[np.int64]], List[npt.NDArray[np.int64]]]:
+) -> tuple[list[npt.NDArray[np.int64]], list[npt.NDArray[np.int64]]]:
     """Vectorised NumPy implementation."""
     if src_indices.size == 0:
         return [], []
@@ -438,7 +438,7 @@ class StepCounter:
         self.h_ready_aux_step = torch.tensor(0, dtype=torch.int64, pin_memory=True)
         self.aux_step: int = 0
 
-    def current_step(self) -> Tuple[int, int]:
+    def current_step(self) -> tuple[int, int]:
         return self.cache_step, self.aux_step
 
     def advance_step(self, delta_cache_step: int, delta_aux_step: int):
@@ -464,4 +464,4 @@ class StepCounter:
 class PageTransferMetadata:
     indices_are_local: bool
     page_transfer_mask: npt.NDArray[np.bool_]
-    page_local_indices: Optional[npt.NDArray[np.int64]] = None
+    page_local_indices: npt.NDArray[np.int64] | None = None

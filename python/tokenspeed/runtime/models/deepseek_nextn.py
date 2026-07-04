@@ -272,7 +272,8 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         for name, loaded_weight in weights:
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers
-                assert num_nextn_layers == 1, "Only 1 nextn layer is supported"
+                if num_nextn_layers != 1:
+                    raise ValueError("Only 1 nextn layer is supported")
                 nextn_layer_prefix = "model.layers.0"
                 if num_nextn_layers != self.config.num_hidden_layers:
                     if name.startswith("model.layers"):

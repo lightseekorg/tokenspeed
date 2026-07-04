@@ -86,6 +86,7 @@ from tokenspeed.runtime.models.qwen3_5_moe import (
     Qwen3_5MoeSparseMoeBlock,
 )
 from tokenspeed.runtime.models.qwen3_vision import Qwen3VLMoeVisionModel
+from tokenspeed.runtime.models.utils import validate_attention_partition
 from tokenspeed.runtime.moe.distribution_recorder import (
     get_global_expert_distribution_recorder,
 )
@@ -109,7 +110,6 @@ from tokenspeed.runtime.utils import (
     make_layers,
     set_weight_attrs,
 )
-from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import envs
 
 logger = logging.getLogger(__name__)
@@ -261,8 +261,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         if hasattr(param, "weight_loader"):
             # Regular parameter/tensor that already has a mutable attr.
-            # Do NOT call set_weight_attrs here, because it asserts when
-            # overwriting an existing attribute.
+            # Do NOT call set_weight_attrs here; overwriting an existing
+            # attribute is rejected.
             param.weight_loader = loader
             return
 
@@ -317,19 +317,21 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
                 if len(loaded_weight.shape) == 0:
                     # Scalar only makes sense for a single logical shard.
-                    assert len(split_sizes) == 1 and split_sizes[0] == 1, (
-                        f"Unexpected scalar for tuple shard load: "
-                        f"{loaded_shard_id=}, {split_sizes=}"
-                    )
+                    if len(split_sizes) != 1 or split_sizes[0] != 1:
+                        raise ValueError(
+                            f"Unexpected scalar for tuple shard load: "
+                            f"{loaded_shard_id=}, {split_sizes=}"
+                        )
                     chunks = [loaded_weight.reshape(1)]
                 else:
                     split_dim = getattr(param, "output_dim", 0)
                     chunks = loaded_weight.split(split_sizes, dim=split_dim)
 
-                assert len(chunks) == len(loaded_shard_id), (
-                    f"Chunk/shard mismatch: {len(chunks)=}, "
-                    f"{len(loaded_shard_id)=}, {split_sizes=}"
-                )
+                if len(chunks) != len(loaded_shard_id):
+                    raise ValueError(
+                        f"Chunk/shard mismatch: {len(chunks)=}, "
+                        f"{len(loaded_shard_id)=}, {split_sizes=}"
+                    )
 
                 for idx, chunk in zip(loaded_shard_id, chunks):
                     # Delegate each chunk to the param's original int-shard loader.
@@ -583,13 +585,13 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self.attn_tp_size = mapping.attn.tp_size
         self.attn_tp_group = mapping.attn.tp_group
         self.total_num_heads = config.num_attention_heads
-        assert self.total_num_heads % self.attn_tp_size == 0
-        self.num_heads = self.total_num_heads // self.attn_tp_size
         self.total_num_kv_heads = config.num_key_value_heads
-        if self.total_num_kv_heads >= self.attn_tp_size:
-            assert self.total_num_kv_heads % self.attn_tp_size == 0
-        else:
-            assert self.attn_tp_size % self.total_num_kv_heads == 0
+        validate_attention_partition(
+            self.total_num_heads,
+            self.total_num_kv_heads,
+            self.attn_tp_size,
+        )
+        self.num_heads = self.total_num_heads // self.attn_tp_size
         self.num_kv_heads = max(1, self.total_num_kv_heads // self.attn_tp_size)
         self.head_dim = config.head_dim or (self.hidden_size // self.num_heads)
         self.q_size = self.num_heads * self.head_dim
@@ -1193,10 +1195,11 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             self.video_encoder = self.get_video_feature
 
     def separate_deepstack_embeds(self, embedding: torch.Tensor):
-        assert embedding.shape[-1] % (1 + self.num_deepstack_embeddings) == 0, (
-            f"hidden_state of {embedding.shape} should be divisible by "
-            f"{1 + self.num_deepstack_embeddings}"
-        )
+        divisor = 1 + self.num_deepstack_embeddings
+        if embedding.shape[-1] % divisor != 0:
+            raise ValueError(
+                f"hidden_state of {embedding.shape} should be divisible by {divisor}"
+            )
         separate_index = self.config.hidden_size
         input_embeds = embedding[:, :separate_index]
         input_deepstack_embeds = embedding[:, separate_index:]
@@ -1248,8 +1251,10 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             ],
             dim=0,
         )
-        assert pixel_values.dim() == 2, pixel_values.dim()
-        assert grid.dim() == 2, grid.dim()
+        if pixel_values.dim() != 2:
+            raise ValueError(f"pixel_values must be 2D, got {pixel_values.dim()}D.")
+        if grid.dim() != 2:
+            raise ValueError(f"grid must be 2D, got {grid.dim()}D.")
         x = self.visual.prepare_patch_embed(pixel_values, grid)
         return x, grid
 

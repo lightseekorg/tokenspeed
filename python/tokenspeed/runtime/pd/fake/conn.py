@@ -19,7 +19,6 @@
 # SOFTWARE.
 
 import logging
-from typing import Optional
 
 import numpy as np
 import numpy.typing as npt
@@ -54,8 +53,8 @@ class FakeKVSender(BaseKVSender):
     def init(
         self,
         kv_indices: list[int],
-        aux_index: Optional[int] = None,
-        decode_prefix_len: Optional[int] = 0,
+        aux_index: int | None = None,
+        decode_prefix_len: int | None = 0,
     ):
         self.decode_prefix_len = decode_prefix_len
         logger.info(
@@ -64,14 +63,13 @@ class FakeKVSender(BaseKVSender):
             aux_index,
             decode_prefix_len,
         )
-        pass
 
-    def send(self, kv_indices: npt.NDArray[np.int64], start_idx: Optional[int] = 0):
+    def send(self, kv_indices: npt.NDArray[np.int64], start_idx: int | None = 0):
         self.has_sent = True
         logger.info("FakeKVSender send with kv_indices: %s", kv_indices)
 
     def failure_exception(self):
-        raise Exception("Fake KVSender Exception")
+        raise RuntimeError("Fake KVSender Exception")
 
 
 class FakeKVReceiver(BaseKVReceiver):
@@ -79,7 +77,7 @@ class FakeKVReceiver(BaseKVReceiver):
         self,
         mgr: BaseKVManager,
         bootstrap_addr: str,
-        bootstrap_room: Optional[int] = None,
+        bootstrap_room: int | None = None,
     ):
         self.has_init = False
         self.decode_prefix_len = 0
@@ -96,8 +94,8 @@ class FakeKVReceiver(BaseKVReceiver):
     def init(
         self,
         kv_indices: list[int],
-        aux_index: Optional[int] = None,
-        decode_prefix_len: Optional[int] = 0,
+        aux_index: int | None = None,
+        decode_prefix_len: int | None = 0,
     ):
         self.has_init = True
         self.decode_prefix_len = decode_prefix_len
@@ -109,7 +107,7 @@ class FakeKVReceiver(BaseKVReceiver):
         )
 
     def failure_exception(self):
-        raise Exception("Fake KVReceiver Exception")
+        raise RuntimeError("Fake KVReceiver Exception")
 
 
 class FakeKVManager(BaseKVManager):
@@ -118,8 +116,8 @@ class FakeKVManager(BaseKVManager):
         args: KVArgs,
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
-        is_mla_backend: Optional[bool] = False,
-        draft_is_mla_backend: Optional[bool] = False,
+        is_mla_backend: bool | None = False,
+        draft_is_mla_backend: bool | None = False,
     ):
         self.kv_args = args
         self.is_mla_backend = is_mla_backend

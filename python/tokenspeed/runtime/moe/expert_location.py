@@ -62,7 +62,10 @@ class ExpertLocationMetadata:
     @property
     def num_local_physical_experts(self) -> int:
         count, remainder = divmod(self.num_physical_experts, self.ep_size)
-        assert remainder == 0
+        if remainder != 0:
+            raise ValueError(
+                f"num_physical_experts={self.num_physical_experts} must be divisible by ep_size={self.ep_size}."
+            )
         return count
 
     @property
@@ -81,9 +84,21 @@ class ExpertLocationMetadata:
         num_layers_2, num_logical_experts_1 = (
             self.logical_to_all_physical_map_num_valid.shape
         )
-        assert num_layers_0 == num_layers_1 == num_layers_2
-        assert num_logical_experts_0 == num_logical_experts_1
-        assert num_physical_experts_0 == num_physical_experts_1
+        if not num_layers_0 == num_layers_1 == num_layers_2:
+            raise ValueError(
+                "Expert location maps disagree on layer count: "
+                f"{num_layers_0}, {num_layers_1}, {num_layers_2}."
+            )
+        if num_logical_experts_0 != num_logical_experts_1:
+            raise ValueError(
+                "Expert location maps disagree on logical expert count: "
+                f"{num_logical_experts_0}, {num_logical_experts_1}."
+            )
+        if num_physical_experts_0 != num_physical_experts_1:
+            raise ValueError(
+                "Expert location maps disagree on physical expert count: "
+                f"{num_physical_experts_0}, {num_physical_experts_1}."
+            )
 
     # -------------------------------- construction ------------------------------------
 
@@ -182,9 +197,8 @@ class ExpertLocationMetadata:
             + server_args.ep_num_redundant_experts
         )
         ep_size = server_args.mapping.moe.ep_size
-        assert (
-            num_physical_experts % ep_size == 0
-        ), f"{num_physical_experts=} {ep_size=}"
+        if ep_size <= 0 or num_physical_experts % ep_size != 0:
+            raise ValueError(f"{num_physical_experts=} {ep_size=}")
         num_local_physical_experts = num_physical_experts // ep_size
 
         return dict(
@@ -241,7 +255,10 @@ class ExpertLocationMetadata:
         for field in [
             "ep_size",
         ]:
-            assert getattr(self, field) == getattr(other, field)
+            if getattr(self, field) != getattr(other, field):
+                raise ValueError(
+                    f"Cannot update ExpertLocationMetadata with different {field}."
+                )
 
         for field in [
             "physical_to_logical_map",
@@ -252,7 +269,10 @@ class ExpertLocationMetadata:
         ]:
             other_field = getattr(other, field)
             self_field = getattr(self, field)
-            assert (other_field is not None) == (self_field is not None)
+            if (other_field is not None) != (self_field is not None):
+                raise ValueError(
+                    f"Cannot update ExpertLocationMetadata with incompatible {field}."
+                )
             if self_field is not None:
                 mask_update = torch.tensor(
                     [i in update_layer_ids for i in range(self.num_layers)]
@@ -358,7 +378,10 @@ def compute_logical_to_rank_dispatch_physical_map(
                 dtype=dtype,
             )
 
-    assert torch.all(logical_to_rank_dispatch_physical_map != -1)
+    if not torch.all(logical_to_rank_dispatch_physical_map != -1):
+        raise RuntimeError(
+            "logical_to_rank_dispatch_physical_map contains unassigned entries."
+        )
 
     device = logical_to_all_physical_map.device
     return logical_to_rank_dispatch_physical_map[ep_rank, :, :].to(device)

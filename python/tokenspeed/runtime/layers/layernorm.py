@@ -117,9 +117,10 @@ class RMSNorm(torch.nn.Module):
 
         if _is_amd:
             if residual is not None:
-                assert (
-                    not inplace
-                ), "fused add rmsnorm does not support inplace operation"
+                if inplace:
+                    raise ValueError(
+                        "fused add rmsnorm does not support inplace operation"
+                    )
                 return triton_rmsnorm(
                     x,
                     self.weight.data,
@@ -134,9 +135,10 @@ class RMSNorm(torch.nn.Module):
             )
         else:
             if residual is not None:
-                assert (
-                    not inplace
-                ), "fused_add_rmsnorm does not support inplace operation"
+                if inplace:
+                    raise ValueError(
+                        "fused_add_rmsnorm does not support inplace operation"
+                    )
                 fused_add_rmsnorm(
                     x,
                     residual,
@@ -176,7 +178,8 @@ class RMSNorm(torch.nn.Module):
                 if _is_amd:
                     allreduce_residual_rmsnorm = triton_allreduce_residual_rmsnorm
                 else:
-                    assert current_platform().is_nvidia
+                    if not current_platform().is_nvidia:
+                        raise RuntimeError("Allreduce RMSNorm requires NVIDIA or AMD.")
                     allreduce_residual_rmsnorm = trtllm_allreduce_residual_rmsnorm
                 fused_result = allreduce_residual_rmsnorm(
                     input_tensor=x,
@@ -253,7 +256,10 @@ class GemmaRMSNorm(torch.nn.Module):
         self.weight.weight_loader = self._weight_loader
 
     def _weight_loader(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
-        assert param.size() == loaded_weight.size()
+        if param.size() != loaded_weight.size():
+            raise ValueError(
+                f"Shape mismatch: {param.size()} != {loaded_weight.size()}."
+            )
         param.data.copy_(loaded_weight)
         self.gemma_weight = param.data + 1.0
 
@@ -327,7 +333,8 @@ class GemmaRMSNorm(torch.nn.Module):
                 if _is_amd:
                     allreduce_residual_rmsnorm = triton_allreduce_residual_rmsnorm
                 else:
-                    assert current_platform().is_nvidia
+                    if not current_platform().is_nvidia:
+                        raise RuntimeError("Allreduce RMSNorm requires NVIDIA or AMD.")
                     allreduce_residual_rmsnorm = trtllm_allreduce_residual_rmsnorm
                 fused_result = allreduce_residual_rmsnorm(
                     input_tensor=x,

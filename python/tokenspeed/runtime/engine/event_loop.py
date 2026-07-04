@@ -703,7 +703,8 @@ class EventLoop:
 
         else:
             # Prefill node (only reached from event_loop, never event_loop_overlap)
-            assert isinstance(self.pd_kv_transfer, DisaggPrefillExecutor)
+            if not isinstance(self.pd_kv_transfer, DisaggPrefillExecutor):
+                raise TypeError("pd_kv_transfer must be a DisaggPrefillExecutor.")
             if forward_op.num_extends() == 0:
                 # Path 3: all prefill done — send KV to decode side
                 self.pd_kv_transfer.execute(forward_op)

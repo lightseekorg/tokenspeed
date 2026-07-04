@@ -69,12 +69,12 @@ class InputProcessor:
             if isinstance(schema, str):
                 schema = json.loads(schema)
             wrapped = structural_tag_for_reasoning_json_schema(reasoning_parser, schema)
-        except Exception as e:
+        except Exception as exc:
             self.engine.logger.warning(
                 "reasoning-parser=%s: failed to wrap json_schema (%s); "
                 "falling back.",
                 reasoning_parser,
-                e,
+                exc,
             )
             return
         if wrapped is None:

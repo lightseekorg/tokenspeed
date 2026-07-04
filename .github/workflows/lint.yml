@@ -25,6 +25,12 @@ jobs:
       - name: Linting
         run: pre-commit run --all-files
 
+      - name: Lint runtime Python with ruff
+        run: |
+          python -m ruff check \
+            --select F401,F841,F821,F823,F811,F541,UP035,UP006,UP007,UP045 \
+            python/tokenspeed/runtime
+
       - name: Install scheduler C++ lint tools
         run: |
           sudo apt-get update

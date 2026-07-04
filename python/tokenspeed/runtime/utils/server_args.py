@@ -545,7 +545,7 @@ class ServerArgs:
                 int(x) for x in self.eagle3_layers_to_capture.split(",")
             ]
 
-        # Hoist the PD-decode runtime assert (topk == 1) to startup.
+        # Hoist the PD-decode topk == 1 check to startup.
         if self.speculative_algorithm is not None and self.speculative_eagle_topk != 1:
             raise ValueError(
                 "speculative_eagle_topk > 1 (tree spec) is not currently "
@@ -594,9 +594,12 @@ class ServerArgs:
             self.disaggregation_mode == "prefill"
             and self.load_balance_method != "round_robin"
         ):
-            assert (
-                not self.mapping.has_attn_dp
-            ), f"Not Supported when {self.disaggregation_mode=} {self.load_balance_method=} {self.mapping.attn.dp_size=}"
+            if self.mapping.has_attn_dp:
+                raise ValueError(
+                    "Not supported when "
+                    f"{self.disaggregation_mode=} {self.load_balance_method=} "
+                    f"{self.mapping.attn.dp_size=}"
+                )
 
     def _handle_kvstore(self):
         if self.disaggregation_mode == "decode":
@@ -1911,9 +1914,10 @@ class PortArgs:
             dist_init_addr = ("127.0.0.1", server_args.port + ZMQ_TCP_PORT_DELTA)
         else:
             dist_init_addr = server_args.dist_init_addr.split(":")
-        assert (
-            len(dist_init_addr) == 2
-        ), "please provide --dist-init-addr as host:port of head node"
+        if len(dist_init_addr) != 2:
+            raise ValueError(
+                "please provide --dist-init-addr as host:port of head node"
+            )
 
         dist_init_host, dist_init_port = dist_init_addr
         dist_init_port = int(dist_init_port)

@@ -322,7 +322,8 @@ class DefaultModelLoader(BaseModelLoader):
         )
         if self.load_config.load_format == LoadFormat.NPCACHE:
             # Currently np_cache only support *.bin checkpoints
-            assert use_safetensors is False
+            if use_safetensors:
+                raise ValueError("np_cache only supports PyTorch checkpoint shards.")
             weights_iterator = np_cache_weights_iterator(
                 source.model_or_path,
                 self.load_config.download_dir,

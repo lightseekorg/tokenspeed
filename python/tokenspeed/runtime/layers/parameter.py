@@ -46,6 +46,11 @@ __all__ = [
 logger = get_colorful_logger(__name__)
 
 
+def _check_shape_match(actual: torch.Size, expected: torch.Size) -> None:
+    if actual != expected:
+        raise ValueError(f"Shape mismatch: {actual} != {expected}.")
+
+
 class BaseWeightParameter(Parameter):
     """Base parameter for TokenSpeed linear layers with custom weight loading."""
 
@@ -61,7 +66,7 @@ class BaseWeightParameter(Parameter):
         return self._weight_loader
 
     def _assert_and_load(self, loaded_weight: torch.Tensor) -> None:
-        assert self.data.shape == loaded_weight.shape
+        _check_shape_match(self.data.shape, loaded_weight.shape)
         self.data.copy_(loaded_weight)
 
     def load_column_parallel_weight(self, loaded_weight: torch.Tensor):
@@ -99,7 +104,7 @@ class _ColumnParallelWeightParameter(BaseWeightParameter):
             loaded_weight = loaded_weight.narrow(
                 self.output_dim, tp_rank * shard_size, shard_size
             )
-        assert self.data.shape == loaded_weight.shape
+        _check_shape_match(self.data.shape, loaded_weight.shape)
         self.data.copy_(loaded_weight)
 
     def load_merged_column_weight(
@@ -123,7 +128,7 @@ class _ColumnParallelWeightParameter(BaseWeightParameter):
             loaded_weight = loaded_weight.narrow(
                 self.output_dim, tp_rank * shard_size, shard_size
             )
-        assert param_data.shape == loaded_weight.shape
+        _check_shape_match(param_data.shape, loaded_weight.shape)
         param_data.copy_(loaded_weight)
 
     def load_qkv_weight(
@@ -155,9 +160,7 @@ class _ColumnParallelWeightParameter(BaseWeightParameter):
                 self.output_dim, shard_id * shard_size, shard_size
             )
 
-        assert (
-            param_data.shape == loaded_weight.shape
-        ), f"{param_data.shape=}, {loaded_weight.shape=}"
+        _check_shape_match(param_data.shape, loaded_weight.shape)
         param_data.copy_(loaded_weight)
 
 
@@ -187,7 +190,7 @@ class RowParallelWeightParameter(BaseWeightParameter):
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
 
-        assert self.data.shape == loaded_weight.shape
+        _check_shape_match(self.data.shape, loaded_weight.shape)
         self.data.copy_(loaded_weight)
 
 
@@ -244,8 +247,12 @@ class PerTensorScaleParameter(BaseWeightParameter):
 
         # if not int, assume shard_id for qkv
         # map to int and return
-        assert isinstance(shard_id, str)
-        assert shard_id in self.qkv_idxs
+        if not isinstance(shard_id, str):
+            raise TypeError(
+                f"shard_id must be a str or int, got {type(shard_id).__name__}."
+            )
+        if shard_id not in self.qkv_idxs:
+            raise ValueError(f"Invalid qkv shard_id: {shard_id}.")
         return self.qkv_idxs[shard_id]
 
     # For row parallel layers, no sharding needed
@@ -280,11 +287,14 @@ class PerTensorScaleParameter(BaseWeightParameter):
         # AutoFP8 scales do not have a shape
         # compressed-tensors scales do have a shape
         if len(loaded_weight.shape) != 0:
-            assert loaded_weight.shape[0] == 1
+            if loaded_weight.shape[0] != 1:
+                raise ValueError(
+                    f"Expected scale shard with first dimension 1, got {loaded_weight.shape}."
+                )
             loaded_weight = loaded_weight[0]
 
         param_data = param_data[shard_id]
-        assert param_data.shape == loaded_weight.shape
+        _check_shape_match(param_data.shape, loaded_weight.shape)
         param_data.copy_(loaded_weight)
 
 
@@ -390,18 +400,21 @@ def permute_param_layout_(
     curr_output_dim = getattr(param, "output_dim", None)
 
     if curr_input_dim is None or curr_output_dim is None:
-        assert param.data.dim() == 2, (
-            "permute_param_layout_ only supports 2D parameters when either "
-            "input_dim or output_dim is not set"
-        )
+        if param.data.dim() != 2:
+            raise ValueError(
+                "permute_param_layout_ only supports 2D parameters when either "
+                "input_dim or output_dim is not set"
+            )
 
     # if one of the dimensions is not set, set it to the opposite of the other
     #  we can only do this since we asserted the parameter is 2D above
     if curr_input_dim is None:
-        assert curr_output_dim is not None, "either input or output dim must be set"
+        if curr_output_dim is None:
+            raise ValueError("either input or output dim must be set")
         curr_input_dim = (curr_output_dim + 1) % 2
     if curr_output_dim is None:
-        assert curr_input_dim is not None, "either input or output dim must be set"
+        if curr_input_dim is None:
+            raise ValueError("either input or output dim must be set")
         curr_output_dim = (curr_input_dim + 1) % 2
 
     # create permutation from the current layout to the layout with
@@ -414,10 +427,13 @@ def permute_param_layout_(
     perm.insert(output_dim, curr_output_dim)
 
     if "packed_dim" in kwargs:
-        assert (
+        if not (
             hasattr(param, "packed_dim")
             and param.packed_dim == perm[kwargs["packed_dim"]]
-        ), "permute_param_layout_ currently doesn't support repacking"
+        ):
+            raise ValueError(
+                "permute_param_layout_ currently doesn't support repacking"
+            )
 
     param.data = param.data.permute(*perm)
     if hasattr(param, "_input_dim"):

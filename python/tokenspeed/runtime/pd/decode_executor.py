@@ -18,7 +18,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from typing import Dict
 
 import numpy as np
 import torch
@@ -51,12 +50,12 @@ class DisaggDecodeExecutor:
                 (Forward.FlatForwardOp, self._prefill),
             ]
         )
-        self.receivers: Dict[int, MooncakeKVReceiver] = {}
+        self.receivers: dict[int, MooncakeKVReceiver] = {}
         self.kv_manager = MooncakeKVManagerDecode(args, kv_args)
         self.gloo_group = gloo_group
         self._local_states = {}
-        self._request_pool_indices: Dict[str, int] = {}
-        self._remote_spec_candidate_ids: Dict[str, tuple[int, list[int]]] = {}
+        self._request_pool_indices: dict[str, int] = {}
+        self._remote_spec_candidate_ids: dict[str, tuple[int, list[int]]] = {}
 
     def _bootstrap(self, request_id, info):
         self.receivers[request_id] = MooncakeKVReceiver(
@@ -135,7 +134,8 @@ class DisaggDecodeExecutor:
         self._bootstrap(request_id, bootstrap_info)
 
     def execute(self, op):
-        assert isinstance(op, Forward.FlatForwardOp)
+        if not isinstance(op, Forward.FlatForwardOp):
+            raise TypeError(f"Expected FlatForwardOp, got {type(op).__name__}.")
         self._dispatcher(op)
 
     def generate_events(self):

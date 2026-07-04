@@ -13,8 +13,6 @@
 
 from __future__ import annotations
 
-from typing import Optional
-
 import torch
 from tokenspeed_kernel.ops.attention.flash_mla import (
     flash_mla_sparse_fwd,
@@ -274,7 +272,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self._prefill_workspace_buffer: torch.Tensor | None = None
         self._prefill_workspace_rows = 0
         self._prefill_workspace_head_dim = 0
-        self._prefill_dense_compressed_indices_buffer: Optional[torch.Tensor] = None
+        self._prefill_dense_compressed_indices_buffer: torch.Tensor | None = None
         self._decode_swa_window_size = 0
         self._decode_swa_block_size = 0
         self.speculative_num_steps = getattr(config, "speculative_num_steps", 0) or 0
@@ -282,8 +280,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             getattr(config, "speculative_num_draft_tokens", 0) or 0
         )
         self._draft_decode_step = 0
-        self._draft_decode_base_seq_lens: Optional[torch.Tensor] = None
-        self._draft_decode_metadata: Optional[DeepseekV4ForwardMetadata] = None
+        self._draft_decode_base_seq_lens: torch.Tensor | None = None
+        self._draft_decode_metadata: DeepseekV4ForwardMetadata | None = None
         self._cuda_graph_draft_decode_metadata = {}
         self._cuda_graph_query_start_by_tokens_per_req: dict[int, torch.Tensor] = {}
         self._cuda_graph_token_to_req_by_tokens_per_req: dict[int, torch.Tensor] = {}
@@ -385,11 +383,11 @@ class DeepseekV4AttentionBackend(AttentionBackend):
     def _query_lens_cpu(
         self,
         bs: int,
-        forward_mode: Optional[ForwardMode],
+        forward_mode: ForwardMode | None,
         num_extends: int,
-        extend_seq_lens_cpu: Optional[torch.Tensor],
-        extend_prefix_lens_cpu: Optional[torch.Tensor],
-    ) -> Optional[torch.Tensor]:
+        extend_seq_lens_cpu: torch.Tensor | None,
+        extend_prefix_lens_cpu: torch.Tensor | None,
+    ) -> torch.Tensor | None:
         if forward_mode is not None and forward_mode.is_decode_or_idle():
             return torch.ones(bs, dtype=torch.int32)
         if forward_mode is not None and forward_mode.is_mixed():
@@ -412,7 +410,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
     def _draft_decode_is_valid_token(
         self,
         prefill_metadata: DeepseekV4ForwardMetadata,
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         if prefill_metadata.is_valid_token is None:
             return None
         bs = prefill_metadata.req_pool_indices.numel()
@@ -518,7 +516,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
     def _select_decode_metadata(
         self,
         num_tokens: int,
-    ) -> Optional[DeepseekV4ForwardMetadata]:
+    ) -> DeepseekV4ForwardMetadata | None:
         for metadata in (self.forward_metadata, self.forward_decode_metadata):
             if (
                 metadata is not None
@@ -1086,7 +1084,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         window_size: int,
         softmax_scale: float,
         attn_sink: torch.Tensor,
-        topk_indices: Optional[torch.Tensor],
+        topk_indices: torch.Tensor | None,
     ) -> torch.Tensor:
         metadata = self.forward_metadata
         if metadata is None:
@@ -1481,7 +1479,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         window_size: int,
         softmax_scale: float,
         attn_sink: torch.Tensor,
-        topk_indices: Optional[torch.Tensor],
+        topk_indices: torch.Tensor | None,
     ) -> torch.Tensor:
         metadata = self.forward_metadata
         if (
@@ -1733,7 +1731,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self,
         bs: int,
         num_tokens: int,
-        forward_mode: Optional[ForwardMode],
+        forward_mode: ForwardMode | None,
     ) -> int:
         if num_tokens != bs:
             if bs == 0:
@@ -2026,7 +2024,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             self.forward_decode_metadata = metadata
         self.forward_metadata = metadata
 
-    def advance_draft_forward_metadata(self, seq_lens: Optional[torch.Tensor] = None):
+    def advance_draft_forward_metadata(self, seq_lens: torch.Tensor | None = None):
         if (
             self._draft_decode_base_seq_lens is None
             or self.forward_prefill_metadata is None

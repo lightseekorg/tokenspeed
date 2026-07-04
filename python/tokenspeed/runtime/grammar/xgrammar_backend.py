@@ -197,14 +197,14 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
             else:
                 raise ValueError(f"Invalid key_type: {key_type}")
 
-        except (RuntimeError, ValueError, json.JSONDecodeError) as e:
+        except (RuntimeError, ValueError, json.JSONDecodeError) as exc:
             logger.warning(
                 "Failed to compile %s grammar: key_string=%r, e=%r",
                 key_type,
                 key_string,
-                e,
+                exc,
             )
-            return InvalidGrammarObject(f"{type(e).__name__}: {e}")
+            return InvalidGrammarObject(f"{type(exc).__name__}: {exc}")
 
         matcher = GrammarMatcher(ctx, max_rollback_tokens=MAX_ROLLBACK_TOKENS)
         return XGrammarGrammar(matcher, self.vocab_size, ctx, self.override_stop_tokens)

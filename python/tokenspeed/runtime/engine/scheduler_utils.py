@@ -21,8 +21,8 @@
 """Helper functions for constructing scheduler specs and events."""
 
 import os
-from collections.abc import Sequence
-from typing import Any, Mapping
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 import torch
 from tokenspeed_scheduler import (

@@ -46,22 +46,25 @@ def swap_batch_vocab(
     Returned row local_req * N + d is global request
     rank * reqs_per_rank + local_req at draft position d.
     """
-    assert (
-        pad_bs % tp_size == 0
-    ), f"swap_batch_vocab: pad_bs={pad_bs} must be divisible by tp_size={tp_size}"
-    assert (
-        vocab_size % tp_size == 0
-    ), f"swap_batch_vocab: vocab_size={vocab_size} must be divisible by tp_size={tp_size}"
+    if pad_bs % tp_size != 0:
+        raise ValueError(
+            f"swap_batch_vocab: pad_bs={pad_bs} must be divisible by tp_size={tp_size}"
+        )
+    if vocab_size % tp_size != 0:
+        raise ValueError(
+            f"swap_batch_vocab: vocab_size={vocab_size} must be divisible by tp_size={tp_size}"
+        )
 
     reqs_per_rank = pad_bs // tp_size
     v_local = vocab_size // tp_size
     n = num_tokens_per_req
 
     expected_shape = (pad_bs * n, v_local)
-    assert tuple(local_logits.shape) == expected_shape, (
-        f"swap_batch_vocab: local_logits shape {tuple(local_logits.shape)} "
-        f"!= expected {expected_shape} (pad_bs={pad_bs}, N={n}, V/TP={v_local})"
-    )
+    if tuple(local_logits.shape) != expected_shape:
+        raise ValueError(
+            f"swap_batch_vocab: local_logits shape {tuple(local_logits.shape)} "
+            f"!= expected {expected_shape} (pad_bs={pad_bs}, N={n}, V/TP={v_local})"
+        )
 
     recv = torch.empty_like(local_logits)
     all_to_all_single(recv, local_logits, group, backend=backend)

@@ -20,9 +20,6 @@
 
 # -*- coding: utf-8 -*-
 
-
-from typing import Optional
-
 import torch
 from einops import rearrange
 
@@ -53,7 +50,7 @@ def chunk_gated_delta_rule_fwd(
     scale: float,
     initial_state: torch.Tensor,
     output_final_state: bool,
-    cu_seqlens: Optional[torch.LongTensor] = None,
+    cu_seqlens: torch.LongTensor | None = None,
     return_h: bool = False,
 ):
     g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)

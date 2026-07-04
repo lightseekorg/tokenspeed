@@ -748,8 +748,8 @@ class _Communicator(Generic[T]):
         if self._result_event is not None or len(self._ready_queue) > 0:
             self._ready_queue.append(ready_event)
             await ready_event.wait()
-            assert self._result_event is None
-            assert self._result_values is None
+            if self._result_event is not None or self._result_values is not None:
+                raise RuntimeError("Communicator result state was not reset.")
 
         if obj:
             self._sender.send_pyobj(obj)

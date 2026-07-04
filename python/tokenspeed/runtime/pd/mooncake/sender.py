@@ -19,7 +19,6 @@
 # SOFTWARE.
 
 import time
-from typing import Optional
 
 import numpy as np
 import numpy.typing as npt
@@ -65,10 +64,10 @@ class MooncakeKVSender:
         kv_indices: npt.NDArray[np.int64],
         aux_index,
         is_last,
-        mla_l1_5_args: Optional[PageTransferMetadata] = None,
+        mla_l1_5_args: PageTransferMetadata | None = None,
         bootstrap_token: int = -1,
-        spec_candidate_ids: Optional[list[int]] = None,
-        mamba_indices: Optional[npt.NDArray[np.int64]] = None,
+        spec_candidate_ids: list[int] | None = None,
+        mamba_indices: npt.NDArray[np.int64] | None = None,
     ):
         """
         Send the kv cache at the given kv indices to the decoder server
@@ -119,11 +118,11 @@ class MooncakeKVSender:
         is_last,
         begin_cache_step: int,
         layerwise_interval: int,
-        mla_l1_5_args: Optional[PageTransferMetadata] = None,
+        mla_l1_5_args: PageTransferMetadata | None = None,
         bootstrap_token: int = -1,
         wait_for_bootstrap_token: bool = False,
-        spec_candidate_ids: Optional[list[int]] = None,
-        mamba_indices: Optional[npt.NDArray[np.int64]] = None,
+        spec_candidate_ids: list[int] | None = None,
+        mamba_indices: npt.NDArray[np.int64] | None = None,
     ):
         self._layerwise_transfer_started = True
         self.curr_idx = max(self.curr_idx, index_slice.stop)

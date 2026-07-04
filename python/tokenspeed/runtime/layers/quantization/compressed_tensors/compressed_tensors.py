@@ -80,7 +80,8 @@ class DeviceCapability(NamedTuple):
 
         It is assumed that the minor version is always a single digit.
         """
-        assert 0 <= self.minor < 10
+        if not 0 <= self.minor < 10:
+            raise ValueError(f"Invalid device capability minor version: {self.minor}.")
         return self.major * 10 + self.minor
 
 
@@ -225,10 +226,13 @@ class CompressedTensorsConfig(QuantizationConfig):
                     # should be w8a16fp8 w8a16fp8 can also run for cases where
                     # there is an input_quant but it is ignored
                     if not input_activations:
-                        assert (
+                        if (
                             target_scheme_map[target]["weights"].type
-                            == QuantizationType.FLOAT
-                        )
+                            != QuantizationType.FLOAT
+                        ):
+                            raise ValueError(
+                                "Activation quantization config is missing input_activations."
+                            )
                     else:
                         target_scheme_map[target]["input_activations"] = (
                             QuantizationArgs.model_validate(  # noqa: E501
@@ -527,8 +531,8 @@ class CompressedTensorsConfig(QuantizationConfig):
             QuantizationStrategy.CHANNEL.value,
         ]
 
-        assert weight_quant is not None
-        assert input_quant is not None
+        if weight_quant is None or input_quant is None:
+            raise RuntimeError("Quantization args should be populated at this point.")
         if weight_quant.strategy not in supported_weight_quant_strategies:
             return False
 

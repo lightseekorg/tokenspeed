@@ -288,8 +288,8 @@ class GrammarManager:
             # here keeps the leak from re-raising out of the event loop.
             try:
                 value = state.grammar.result()
-            except Exception as e:
-                value = InvalidGrammarObject(f"{type(e).__name__}: {e}")
+            except Exception as exc:
+                value = InvalidGrammarObject(f"{type(exc).__name__}: {exc}")
 
             if value.is_invalid:
                 state.grammar = None

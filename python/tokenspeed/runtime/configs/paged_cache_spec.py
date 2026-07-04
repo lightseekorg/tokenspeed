@@ -16,8 +16,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Dict, Literal, Optional, Sequence
+from typing import Literal
 
 from tokenspeed.runtime.utils.common import ceil_div
 
@@ -31,7 +32,7 @@ class PagedCacheGroupSpec:
     retention: Retention
     rows_per_page: int
     entry_stride_tokens: int
-    sliding_window_tokens: Optional[int]
+    sliding_window_tokens: int | None
     # History groups form a chain; State groups only need the trailing window.
     family: Family = "history"
 
@@ -47,7 +48,7 @@ def compute_paged_cache_group_page_counts(
     max_total_tokens: int,
     max_context_len: int,
     safety_margin: int = 0,
-) -> Dict[str, int]:
+) -> dict[str, int]:
     if max_live_requests < 0:
         raise ValueError(f"max_live_requests must be >= 0, got {max_live_requests}")
     if max_scheduled_tokens < 0:
@@ -61,7 +62,7 @@ def compute_paged_cache_group_page_counts(
     if safety_margin < 0:
         raise ValueError(f"safety_margin must be >= 0, got {safety_margin}")
 
-    counts: Dict[str, int] = {}
+    counts: dict[str, int] = {}
     for spec in specs:
         raw_per_page = spec.rows_per_page * spec.entry_stride_tokens
         if raw_per_page <= 0:

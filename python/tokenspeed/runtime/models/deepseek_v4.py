@@ -29,8 +29,8 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any, Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -78,7 +78,6 @@ from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
 )
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_manager import CommManager
-from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -159,7 +158,7 @@ def _deepseek_v4_metadata_matches_tokens(metadata, num_tokens: int) -> bool:
 
 
 def _deepseek_v4_indexer_token_split(
-    forward_mode: Optional[ForwardMode],
+    forward_mode: ForwardMode | None,
     metadata,
     total_tokens: int,
 ) -> tuple[int, int]:
@@ -544,7 +543,7 @@ def _deepseek_v4_gather_paged_indexer_mxfp4_cache(
     block_table: torch.Tensor,
     cu_seq_lens: torch.Tensor,
     block_size: int,
-    out: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     _, value_bytes, scale_bytes = deepseek_v4_indexer_mxfp4_layout_from_row_bytes(
         cache_2d.shape[1] // block_size
@@ -600,10 +599,10 @@ def _deepseek_v4_indexer_topk_from_logits(
     *,
     next_n: int = 1,
     use_prefill_topk_op: bool = False,
-    row_starts: Optional[torch.Tensor] = None,
-    row_ends: Optional[torch.Tensor] = None,
-    out: Optional[torch.Tensor] = None,
-    persistent_topk_workspace: Optional[torch.Tensor] = None,
+    row_starts: torch.Tensor | None = None,
+    row_ends: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    persistent_topk_workspace: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if not logits.is_cuda or logits.dtype != torch.float32:
         raise RuntimeError("DeepSeek V4 indexer top-k requires CUDA float32 logits")
@@ -643,8 +642,8 @@ def _deepseek_v4_indexer_topk_from_logits(
     if max_len <= 0:
         return topk
 
-    row_starts_for_kernel: Optional[torch.Tensor] = None
-    row_ends_for_kernel: Optional[torch.Tensor] = None
+    row_starts_for_kernel: torch.Tensor | None = None
+    row_ends_for_kernel: torch.Tensor | None = None
     if row_starts is not None or row_ends is not None:
         if row_starts is None:
             row_starts_for_kernel = torch.zeros_like(length_rows)
@@ -713,8 +712,8 @@ def _deepseek_v4_indexer_topk_from_logits_prefill_op(
     length_rows: torch.Tensor,
     topk_tokens: int,
     *,
-    row_starts: Optional[torch.Tensor] = None,
-    row_ends: Optional[torch.Tensor] = None,
+    row_starts: torch.Tensor | None = None,
+    row_ends: torch.Tensor | None = None,
     out: torch.Tensor,
 ) -> torch.Tensor:
     """Use the local TRT-LLM CUDA prefill selector."""
@@ -785,7 +784,7 @@ class _DeepseekV4IndexerPrefillChunk:
 
 
 def _deepseek_v4_indexer_prefill_max_logits_bytes(
-    max_logits_bytes: Optional[int] = None,
+    max_logits_bytes: int | None = None,
 ) -> int:
     if max_logits_bytes is not None:
         return max(1, int(max_logits_bytes))
@@ -795,7 +794,7 @@ def _deepseek_v4_indexer_prefill_max_logits_bytes(
 
 def _deepseek_v4_indexer_prefill_workspace_size(
     seq_lens_cpu: torch.Tensor,
-    workspace_size: Optional[int] = None,
+    workspace_size: int | None = None,
 ) -> int:
     if workspace_size is not None:
         return max(1, int(workspace_size))
@@ -812,8 +811,8 @@ def _deepseek_v4_indexer_prefill_request_chunks(
     query_lens_cpu: torch.Tensor,
     compress_ratio: int,
     num_tokens: int,
-    max_logits_bytes: Optional[int] = None,
-    workspace_size: Optional[int] = None,
+    max_logits_bytes: int | None = None,
+    workspace_size: int | None = None,
     request_offset: int = 0,
 ) -> list[_DeepseekV4IndexerPrefillChunk]:
     """Build request/query-slice sparse-indexer prefill chunks."""
@@ -1195,8 +1194,8 @@ def _deepseek_v4_indexer_decode_plan(
     block_table: torch.Tensor,
     cache_block_size: int,
     compress_ratio: int,
-    metadata: Optional[DeepseekV4ForwardMetadata] = None,
-    is_valid_token: Optional[torch.Tensor] = None,
+    metadata: DeepseekV4ForwardMetadata | None = None,
+    is_valid_token: torch.Tensor | None = None,
     block_table_base_offsets: torch.Tensor | None = None,
 ) -> DeepseekV4IndexerDecodePlan:
     num_tokens = positions.numel()
@@ -1308,9 +1307,9 @@ def _deepseek_v4_indexer_decode_schedule_metadata(
     positions: torch.Tensor,
     cache_block_size: int,
     compress_ratio: int,
-    metadata: Optional[DeepseekV4ForwardMetadata],
-    context_lens: Optional[torch.Tensor] = None,
-) -> Optional[torch.Tensor]:
+    metadata: DeepseekV4ForwardMetadata | None,
+    context_lens: torch.Tensor | None = None,
+) -> torch.Tensor | None:
     if positions.numel() == 0:
         return None
     if deep_gemm is None:
@@ -1373,9 +1372,9 @@ def _deepseek_v4_indexer_topk_prefill_deepgemm(
     cache_block_size: int,
     topk_tokens: int,
     use_prefill_topk_op: bool,
-    gathered_k: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-    gather_workspace: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-) -> tuple[torch.Tensor, Optional[tuple[torch.Tensor, torch.Tensor]]]:
+    gathered_k: tuple[torch.Tensor, torch.Tensor] | None = None,
+    gather_workspace: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
     q_values, q_scales = index_q
     if not _deepseek_v4_deepgemm_fp4_indexer_available(q_values):
         raise RuntimeError("DeepSeek V4 sparse indexer requires DeepGEMM FP4 support")
@@ -1447,14 +1446,14 @@ def _deepseek_v4_indexer_topk_from_cache_deepgemm_decode(
     weights: torch.Tensor,
     compress_ratio: int,
     topk_tokens: int,
-    metadata: Optional[DeepseekV4ForwardMetadata] = None,
-    schedule_metadata: Optional[torch.Tensor] = None,
-    decode_context_lens: Optional[torch.Tensor] = None,
-    decode_block_table: Optional[torch.Tensor] = None,
-    decode_max_context_len: Optional[int] = None,
-    is_valid_token: Optional[torch.Tensor] = None,
-    out: Optional[torch.Tensor] = None,
-    persistent_topk_workspace: Optional[torch.Tensor] = None,
+    metadata: DeepseekV4ForwardMetadata | None = None,
+    schedule_metadata: torch.Tensor | None = None,
+    decode_context_lens: torch.Tensor | None = None,
+    decode_block_table: torch.Tensor | None = None,
+    decode_max_context_len: int | None = None,
+    is_valid_token: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    persistent_topk_workspace: torch.Tensor | None = None,
 ) -> torch.Tensor:
     q_values, q_scales = index_q
     if not _deepseek_v4_deepgemm_fp4_indexer_available(q_values):
@@ -1565,9 +1564,9 @@ def _deepseek_v4_sparse_attn_indexer_native(
     packed_q_values: torch.Tensor,
     packed_q_scales: torch.Tensor,
     packed_weights: torch.Tensor,
-    decode_schedule_metadata: Optional[torch.Tensor],
-    decode_context_lens: Optional[torch.Tensor],
-    decode_block_table: Optional[torch.Tensor],
+    decode_schedule_metadata: torch.Tensor | None,
+    decode_context_lens: torch.Tensor | None,
+    decode_block_table: torch.Tensor | None,
     decode_max_context_len: int,
     topk_indices_buffer: torch.Tensor,
     prefill_gather_values_workspace: torch.Tensor,
@@ -2393,14 +2392,13 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             symm_buffer.topk_weights[:num_tokens],
         )
 
-        assert (
-            self._transformed_l1_weights is not None
-            and self._transformed_l2_weights is not None
-        ), (
-            "DeepseekV4MegaMoEExperts.finalize_weights() must run via "
-            "post_load_weights() before forward()"
-        )
-        assert deep_gemm is not None
+        if self._transformed_l1_weights is None or self._transformed_l2_weights is None:
+            raise RuntimeError(
+                "DeepseekV4MegaMoEExperts.finalize_weights() must run via "
+                "post_load_weights() before forward()"
+            )
+        if deep_gemm is None:
+            raise RuntimeError("deep_gemm is required for fp8_fp4_mega_moe.")
         deep_gemm.fp8_fp4_mega_moe(
             y,
             self._transformed_l1_weights,
@@ -3267,10 +3265,6 @@ class DeepseekV4Indexer(nn.Module):
             )
         with nvtx_range("indexer_compressed_slot_mapping"):
             indexer_block_size = pool.get_indexer_block_size(layer_index)
-            indexer_block_table = cache_metadata.compressed_block_table(
-                self.compress_ratio,
-                indexer_block_size,
-            )
             compressed_slots = cache_metadata.compressed_slot_mapping(
                 positions,
                 self.compress_ratio,
@@ -3654,7 +3648,8 @@ class DeepseekV4Attention(nn.Module):
         # state updates and paged cache writes — safe to overlap.
         topk_indices = None
         if self.indexer is not None:
-            assert self.compressor is not None
+            if self.compressor is None:
+                raise RuntimeError("compressor is required when indexer is enabled.")
             with nvtx_range(f"{profile_prefix}_indexer_prepare_decode_metadata"):
                 self.indexer.prepare_decode_metadata(
                     positions=positions,
@@ -4105,7 +4100,7 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
             name = name[:-6] + ".weight_scale_inv"
         return name
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         stacked_params_mapping = self.get_stacked_params_mapping()
         params_dict = dict(self.named_parameters())
         moe_loader = build_moe_checkpoint_loader(

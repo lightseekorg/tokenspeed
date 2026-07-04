@@ -185,9 +185,8 @@ class CapturableGrammarExecutor:
 
             advance_list = list(advance_mask)
 
-            assert (
-                len(advance_list) == bs
-            ), f"advance_mask length {len(advance_list)} != bs {bs}"
+            if len(advance_list) != bs:
+                raise ValueError(f"advance_mask length {len(advance_list)} != bs {bs}")
 
         completion = GrammarStepCompletion(
             grammars=grammars_list,

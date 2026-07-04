@@ -20,7 +20,7 @@
 
 from __future__ import annotations
 
-from typing import Iterable
+from collections.abc import Iterable
 
 from tokenspeed.runtime.utils import get_colorful_logger, get_device_module
 
@@ -35,11 +35,12 @@ class LayerLoadingEvent:
         self.load_events = [device_module.Event() for _ in range(num_layers)]
         self.start_event = device_module.Event()  # start event on controller stream
 
-    def complete(self, layer_index: int):
-        assert 0 <= layer_index < self._num_layers
+    def complete(self, layer_index: int) -> None:
+        if not 0 <= layer_index < self._num_layers:
+            raise IndexError(f"layer_index out of range: {layer_index}")
         self.load_events[layer_index].record()
 
-    def wait(self, layer_index: int):
+    def wait(self, layer_index: int) -> None:
         device_module.current_stream().wait_event(self.load_events[layer_index])
 
     @property

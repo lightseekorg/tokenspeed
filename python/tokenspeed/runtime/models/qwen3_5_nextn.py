@@ -137,11 +137,12 @@ class Qwen3_5DraftForCausalLM(Qwen3_5ForCausalLM):
         quant_config=None,
         prefix: str = "",
     ) -> None:
-        assert config.num_hidden_layers == 1, (
-            "Qwen3_5DraftForCausalLM requires num_hidden_layers == 1 "
-            f"(got {config.num_hidden_layers}); _apply_correction is not "
-            "idempotent across layers."
-        )
+        if config.num_hidden_layers != 1:
+            raise ValueError(
+                "Qwen3_5DraftForCausalLM requires num_hidden_layers == 1 "
+                f"(got {config.num_hidden_layers}); _apply_correction is not "
+                "idempotent across layers."
+            )
         super().__init__(config, mapping, quant_config=quant_config, prefix=prefix)
 
 
@@ -251,7 +252,8 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
                 dtype=self.model.embed_tokens.weight.dtype,
             )
         else:
-            assert input_embeds is None
+            if input_embeds is not None:
+                raise ValueError("input_embeds is not supported for nextn forward.")
             input_embeds = self.model.embed_tokens(input_ids)
             hidden_states = captured_hidden_states
             input_embeds = self.pre_fc_norm_embedding(input_embeds)

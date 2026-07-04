@@ -27,7 +27,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 from dataclasses import replace
-from typing import Any, Tuple
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -88,7 +88,6 @@ from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
 from tokenspeed.runtime.layers.quantization.utils import (
     block_dequant,
     should_exclude_quant_module,
-    should_ignore_quant_layer,
 )
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
@@ -491,7 +490,10 @@ class DeepseekV3AttentionMLA(nn.Module):
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
         self.num_heads = num_heads
-        assert num_heads % self.mapping.attn.tp_size == 0
+        if num_heads % self.mapping.attn.tp_size != 0:
+            raise ValueError(
+                f"num_heads={num_heads} must be divisible by attn_tp_size={self.mapping.attn.tp_size}."
+            )
         self.num_local_heads = num_heads // self.mapping.attn.tp_size
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
@@ -731,7 +733,7 @@ class DeepseekV3AttentionMLA(nn.Module):
         positions,
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         q = q.view(-1, self.num_local_heads, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
@@ -892,7 +894,7 @@ class DeepseekV3AttentionMLA(nn.Module):
         latent_cache: torch.Tensor,
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         kv_a, k_pe = latent_cache.split(
             [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
         )
@@ -1593,7 +1595,10 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
             ):
                 weight_block_size = self.quant_config.weight_block_size
                 if weight_block_size is not None:
-                    assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
+                    if not hasattr(self_attn.kv_b_proj, "weight_scale_inv"):
+                        raise RuntimeError(
+                            "kv_b_proj.weight_scale_inv is required for block FP8 dequant."
+                        )
                     dtype = torch.get_default_dtype()
                     w = block_dequant(
                         self_attn.kv_b_proj.weight,
@@ -2008,7 +2013,10 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
         ):
             weight_block_size = self.quant_config.weight_block_size
             if weight_block_size is not None:
-                assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
+                if not hasattr(self_attn.kv_b_proj, "weight_scale_inv"):
+                    raise RuntimeError(
+                        "kv_b_proj.weight_scale_inv is required for block FP8 dequant."
+                    )
                 dtype = torch.get_default_dtype()
                 w = block_dequant(
                     self_attn.kv_b_proj.weight,

@@ -32,7 +32,6 @@ also avoids the PyTorch 2.9.1 + CuDNN < 9.15 Conv3d bug
 """
 
 import math
-from typing import Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -44,7 +43,8 @@ _VALID_PADDING_MODES = {"zeros", "reflect", "replicate", "circular"}
 
 def _tuplify(val, n: int) -> tuple:
     if isinstance(val, (list, tuple)):
-        assert len(val) == n
+        if len(val) != n:
+            raise ValueError(f"Expected {n} values, got {len(val)}.")
         return tuple(val)
     return (val,) * n
 
@@ -120,10 +120,10 @@ class Conv2dLayer(nn.Module):
         self,
         in_channels: int,
         out_channels: int,
-        kernel_size: Union[int, Tuple[int, int]],
-        stride: Union[int, Tuple[int, int]] = 1,
-        padding: Union[int, Tuple[int, int], str] = 0,
-        dilation: Union[int, Tuple[int, int]] = 1,
+        kernel_size: int | tuple[int, int],
+        stride: int | tuple[int, int] = 1,
+        padding: int | tuple[int, int] | str = 0,
+        dilation: int | tuple[int, int] = 1,
         groups: int = 1,
         bias: bool = True,
         padding_mode: str = "zeros",
@@ -221,10 +221,10 @@ class Conv3dLayer(nn.Module):
         self,
         in_channels: int,
         out_channels: int,
-        kernel_size: Union[int, Tuple[int, int, int]],
-        stride: Union[int, Tuple[int, int, int]] = 1,
-        padding: Union[int, Tuple[int, int, int], str] = 0,
-        dilation: Union[int, Tuple[int, int, int]] = 1,
+        kernel_size: int | tuple[int, int, int],
+        stride: int | tuple[int, int, int] = 1,
+        padding: int | tuple[int, int, int] | str = 0,
+        dilation: int | tuple[int, int, int] = 1,
         groups: int = 1,
         bias: bool = True,
         padding_mode: str = "zeros",

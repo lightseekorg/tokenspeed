@@ -22,7 +22,7 @@ import dataclasses
 import threading
 import time
 from contextlib import contextmanager
-from typing import Any, List, Optional, Tuple
+from typing import Any
 
 import numpy as np
 import numpy.typing as npt
@@ -50,10 +50,10 @@ logger = get_colorful_logger(__name__)
 @dataclasses.dataclass
 class WriteRequest:
     trans_info: TransferInfo
-    dst_ranks_info: Tuple[str, int, int]
+    dst_ranks_info: tuple[str, int, int]
     prefill_kv_blocks: npt.NDArray[np.int64]
     dst_kv_blocks: npt.NDArray[np.int64]
-    submit_bids: List[int] = dataclasses.field(default_factory=list)
+    submit_bids: list[int] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
@@ -62,8 +62,8 @@ class LayerWiseTask:
     begin_cache_step: int
     aux_step: int
     next_layer_id: int = 0
-    write_requests: List[WriteRequest] = dataclasses.field(default_factory=list)
-    polls: List[bool] = dataclasses.field(default_factory=list)
+    write_requests: list[WriteRequest] = dataclasses.field(default_factory=list)
+    polls: list[bool] = dataclasses.field(default_factory=list)
 
 
 class MooncakeAsyncKVManager(MooncakeKVManager):
@@ -72,8 +72,8 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
         args: KVArgs,
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
-        is_mla_backend: Optional[bool] = False,
-        draft_is_mla_backend: Optional[bool] = False,
+        is_mla_backend: bool | None = False,
+        draft_is_mla_backend: bool | None = False,
     ):
         super().__init__(
             args, disaggregation_mode, server_args, is_mla_backend, draft_is_mla_backend
@@ -85,8 +85,9 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
         self.draft_is_mla_backend = draft_is_mla_backend
         self.kv_cache_quant_method = server_args.kv_cache_quant_method
         self.submit_interval = server_args.disaggregation_layerwise_interval
-        assert self.submit_interval > 0, "submit_interval must be positive"
-        self.current_transfer_batch: List[Tuple[TransferKVChunk, int]] = []
+        if self.submit_interval <= 0:
+            raise ValueError("submit_interval must be positive")
+        self.current_transfer_batch: list[tuple[TransferKVChunk, int]] = []
         self.offsets = args.offsets
 
     def _init_offsets(self):
@@ -125,7 +126,7 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
     def start_transfer_thread(
         self, transfer_thread_pool_size: int, transfer_queue_size: int
     ):
-        self.transfer_queues: List[FastQueue] = [FastQueue()]
+        self.transfer_queues: list[FastQueue] = [FastQueue()]
         for queue in self.transfer_queues:
             threading.Thread(
                 target=self.async_transfer_worker, args=(queue,), daemon=True
@@ -162,12 +163,14 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
         kv_indices: npt.NDArray[np.int64],
         index_slice: slice,
         is_last: bool,
-        aux_index: Optional[int] = None,
-        mla_l1_5_args: Optional[Tuple[Any, Any]] = None,
+        aux_index: int | None = None,
+        mla_l1_5_args: tuple[Any, Any] | None = None,
     ):
         logger.debug("async manager add_transfer_request")
-        assert self.disaggregation_mode == DisaggregationMode.PREFILL
-        assert not is_last or (is_last and aux_index is not None)
+        if self.disaggregation_mode != DisaggregationMode.PREFILL:
+            raise RuntimeError("Transfer requests can only be added in prefill mode.")
+        if is_last and aux_index is None:
+            raise ValueError("aux_index must be set for the last transfer chunk.")
 
         if (
             bootstrap_room not in self.request_status
@@ -259,7 +262,7 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
         return self._transfer_data(mooncake_session_id, transfer_blocks)
 
     def async_transfer_worker(self, transfer_queue: FastQueue):
-        def disard_finished_bid_inplace(submit_bids: List[int]):
+        def discard_finished_bid_inplace(submit_bids: list[int]):
             finished_cnt = 0
             failed = False
             for bid in submit_bids:
@@ -285,12 +288,12 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
             return not failed
 
         def discard_tasks(
-            tasks: List[LayerWiseTask], dropped: List[LayerWiseTask]
-        ) -> List[LayerWiseTask]:
+            tasks: list[LayerWiseTask], dropped: list[LayerWiseTask]
+        ) -> list[LayerWiseTask]:
             dropped_rooms = set(id(task) for task in dropped)
             return [task for task in tasks if id(task) not in dropped_rooms]
 
-        def query_ready_step(task: LayerWiseTask) -> Tuple[int, int]:
+        def query_ready_step(task: LayerWiseTask) -> tuple[int, int]:
             if task.next_layer_id < self.layer_num:
                 ready_cache_step = self.step_counter.query_ready_cache_step()
                 if not StepCounter.is_step_ready(
@@ -306,8 +309,8 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
             ready_aux_step = self.step_counter.query_ready_aux_step()
             return ready_cache_step, ready_aux_step
 
-        def get_new_tasks(blocking: bool) -> List[LayerWiseTask]:
-            new_tasks: List[LayerWiseTask] = []
+        def get_new_tasks(blocking: bool) -> list[LayerWiseTask]:
+            new_tasks: list[LayerWiseTask] = []
             if blocking:
                 new_tasks.append(transfer_queue.get())
             while True:
@@ -318,8 +321,8 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
 
             return new_tasks
 
-        def initialize(tasks: List[LayerWiseTask]) -> List[LayerWiseTask]:
-            abort_tasks: List[LayerWiseTask] = []
+        def initialize(tasks: list[LayerWiseTask]) -> list[LayerWiseTask]:
+            abort_tasks: list[LayerWiseTask] = []
 
             for task in tasks:
                 kv_chunk = task.kv_chunk
@@ -368,10 +371,10 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
             return abort_tasks
 
         def submit_transfer(
-            tasks: List[LayerWiseTask], ready_cache_step: int, ready_aux_step: int
-        ) -> Tuple[List[LayerWiseTask], List[LayerWiseTask]]:
-            abort_tasks: List[LayerWiseTask] = []
-            complete_tasks: List[LayerWiseTask] = []
+            tasks: list[LayerWiseTask], ready_cache_step: int, ready_aux_step: int
+        ) -> tuple[list[LayerWiseTask], list[LayerWiseTask]]:
+            abort_tasks: list[LayerWiseTask] = []
+            complete_tasks: list[LayerWiseTask] = []
 
             for task in tasks:
                 kv_chunk = task.kv_chunk
@@ -451,14 +454,14 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
 
             return complete_tasks, abort_tasks
 
-        def pop_transferred(tasks: List[LayerWiseTask]) -> List[LayerWiseTask]:
-            complete_tasks: List[LayerWiseTask] = []
+        def pop_transferred(tasks: list[LayerWiseTask]) -> list[LayerWiseTask]:
+            complete_tasks: list[LayerWiseTask] = []
             for task in tasks:
                 kv_chunk = task.kv_chunk
                 for req in task.write_requests[
                     len(task.polls) :
                 ]:  # only check the uncompleted requests
-                    success = disard_finished_bid_inplace(req.submit_bids)
+                    success = discard_finished_bid_inplace(req.submit_bids)
                     if success:
                         if len(req.submit_bids) == 0:
                             task.polls.append(True)
@@ -497,7 +500,7 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
 
             return complete_tasks
 
-        def finalize(tasks: List[LayerWiseTask]) -> None:
+        def finalize(tasks: list[LayerWiseTask]) -> None:
             for task in tasks:
                 kv_chunk = task.kv_chunk
                 status = KVPoll.Success if all(task.polls) else KVPoll.Failed
@@ -518,8 +521,8 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
                     if kv_chunk.room in self.transfer_infos:
                         self.transfer_infos.pop(kv_chunk.room)
 
-        pending_tasks: List[LayerWiseTask] = []
-        inflight_tasks: List[LayerWiseTask] = []
+        pending_tasks: list[LayerWiseTask] = []
+        inflight_tasks: list[LayerWiseTask] = []
         while True:
             try:
                 if (
@@ -553,7 +556,8 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
                     finalize(complete_tasks)
                     inflight_tasks = discard_tasks(inflight_tasks, complete_tasks)
 
-            except Exception as e:
+            except Exception as exc:
                 raise RuntimeError(
-                    f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
-                )
+                    f"Transfer thread failed because of {exc}. Prefill instance "
+                    f"with bootstrap_port={self.bootstrap_port} is dead."
+                ) from exc

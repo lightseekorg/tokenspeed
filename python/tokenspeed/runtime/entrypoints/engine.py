@@ -421,8 +421,10 @@ class Engine(EngineBase):
         obj = RpcReqInput(method=method, parameters=kwargs)
         self.send_to_rpc.send_pyobj(obj)
         recv_req = self.send_to_rpc.recv_pyobj(zmq.BLOCKY)
-        assert isinstance(recv_req, RpcReqOutput)
-        assert recv_req.success, recv_req.message
+        if not isinstance(recv_req, RpcReqOutput):
+            raise TypeError(f"Expected RpcReqOutput, got {type(recv_req).__name__}.")
+        if not recv_req.success:
+            raise RuntimeError(recv_req.message)
 
     def save_remote_model(self, **kwargs):
         self.collective_rpc("save_remote_model", **kwargs)
@@ -535,7 +537,10 @@ def _launch_subprocesses(
 
         for reader in scheduler_pipe_readers:
             data = reader.recv()
-            assert data["status"] == "ready"
+            if data.get("status") != "ready":
+                raise RuntimeError(
+                    "Initialization failed. Please see the error messages above."
+                )
 
         if not envs.TOKENSPEED_BLOCK_NONZERO_RANK_CHILDREN.get():
             # When using `Engine` as a Python API, we don't want to block here.

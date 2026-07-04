@@ -26,8 +26,8 @@ import json
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
+from functools import partial
 from queue import Empty, Queue
-from typing import Optional
 
 import torch
 import torch.distributed as dist
@@ -45,12 +45,12 @@ from tokenspeed.runtime.utils import get_colorful_logger
 logger = get_colorful_logger(__name__)
 
 
-def _parse_storage_backend_extra_config(raw: Optional[str]):
+def _parse_storage_backend_extra_config(raw: str | None):
     extra_config = {}
     if raw:
         try:
             extra_config = json.loads(raw)
-        except Exception as exc:
+        except json.JSONDecodeError as exc:
             logger.error("Invalid backend extra config JSON: %s", exc)
             raise
 
@@ -84,7 +84,7 @@ def _parse_storage_backend_extra_config(raw: Optional[str]):
 def _generate_storage_config(
     device_pool,
     host_pool,
-    model_name: Optional[str],
+    model_name: str | None,
     extra_config_dict: dict,
     is_dp_attention_enabled: bool,
 ) -> KVStoreStorageConfig:
@@ -111,9 +111,9 @@ class StorageExecutor:
         page_size: int,
         device_pool,
         host_pool,
-        storage_backend_type: Optional[str],
-        storage_backend_extra_config: Optional[str] = None,
-        model_name: Optional[str] = None,
+        storage_backend_type: str | None,
+        storage_backend_extra_config: str | None = None,
+        model_name: str | None = None,
         is_dp_attention_enabled: bool = False,
         storage_batch_size: int = 128,
         tp_group=None,
@@ -178,7 +178,7 @@ class StorageExecutor:
                     self._tp_group = pg
         self._results: Queue = Queue()
         self._prefetch_op_to_rid: dict = {}  # op_id → request_id
-        self._executor: Optional[ThreadPoolExecutor] = None
+        self._executor: ThreadPoolExecutor | None = None
         # All collectives on the dedicated kvstore subgroup are funneled
         # through a single aggregator thread so they issue in deterministic
         # submit order across ranks (Gloo and NCCL groups both require
@@ -187,7 +187,7 @@ class StorageExecutor:
         # each rank).
         self._aggregator_pending: Queue = Queue()
         self._aggregator_stop = threading.Event()
-        self._aggregator_thread: Optional[threading.Thread] = None
+        self._aggregator_thread: threading.Thread | None = None
         if self.storage_backend is not None:
             self._executor = ThreadPoolExecutor(
                 max_workers=2,
@@ -231,9 +231,7 @@ class StorageExecutor:
             self._results.put(evt)
             return
         future = self._executor.submit(self._run_backup, op)
-        future.add_done_callback(
-            lambda fut, oid=op.op_id: self._on_backup_done(oid, fut)
-        )
+        future.add_done_callback(partial(self._on_backup_done, op.op_id))
 
     def _prefetch_deadline(self, n_pages: int) -> float:
         return (
@@ -248,10 +246,11 @@ class StorageExecutor:
             logger.debug("[cache_op] prefetch_exec op_id=%s no hashes, skip", op.op_id)
             return 0
         dst_pages = op.dst_pages
-        assert len(hashes) == len(dst_pages), (
-            f"prefetch key/page mismatch: {len(hashes)} hashes "
-            f"vs {len(dst_pages)} dst_pages"
-        )
+        if len(hashes) != len(dst_pages):
+            raise ValueError(
+                f"prefetch key/page mismatch: {len(hashes)} hashes "
+                f"vs {len(dst_pages)} dst_pages"
+            )
 
         deadline = self._prefetch_deadline(len(hashes))
         completed_pages = 0

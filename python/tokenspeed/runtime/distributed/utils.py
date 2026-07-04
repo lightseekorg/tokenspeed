@@ -28,7 +28,8 @@ import dataclasses
 import pickle
 import time
 from collections import deque
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 import torch
 from torch.distributed import TCPStore
@@ -40,9 +41,8 @@ logger = get_colorful_logger(__name__)
 
 def ensure_divisibility(numerator, denominator) -> None:
     """Ensure that numerator is divisible by the denominator."""
-    assert (
-        numerator % denominator == 0
-    ), f"{numerator} is not divisible by {denominator}"
+    if numerator % denominator != 0:
+        raise ValueError(f"{numerator} is not divisible by {denominator}")
 
 
 def divide(numerator, denominator):
@@ -99,7 +99,10 @@ class StatelessProcessGroup:
     entries: deque[tuple[str, float]] = dataclasses.field(default_factory=deque)
 
     def __post_init__(self):
-        assert self.rank < self.world_size
+        if self.rank >= self.world_size:
+            raise ValueError(
+                f"rank={self.rank} must be less than world_size={self.world_size}"
+            )
         self.broadcast_recv_src_counter = {i: 0 for i in range(self.world_size)}
 
     def expire_data(self) -> None:

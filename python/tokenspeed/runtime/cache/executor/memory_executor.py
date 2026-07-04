@@ -18,12 +18,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from __future__ import annotations
-
 """Top-level memory executor that coordinates host and storage executors."""
 
+from __future__ import annotations
+
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable, Optional
 
 from tokenspeed_scheduler import Cache
 
@@ -57,9 +57,9 @@ class MemoryExecutorConfig:
     host_reserve_gb: float = 10.0
     io_backend: str = "kernel"
     host_layout: str = "layer_first"
-    storage_backend: Optional[str] = "mooncake"
-    storage_backend_extra_config: Optional[str] = None
-    model_name: Optional[str] = None
+    storage_backend: str | None = "mooncake"
+    storage_backend_extra_config: str | None = None
+    model_name: str | None = None
     enable_mamba_l2: bool = False
     mamba_l2_host_slots: int = 0
     mamba_l2_layout: str = "layer_first"
@@ -478,7 +478,7 @@ class MemoryExecutor:
 
     def get_producer_index(
         self, kind_or_op_id: CacheKind | str | int, op_id: int | None = None
-    ) -> Optional[int]:
+    ) -> int | None:
         return self.host_exec.get_producer_index(kind_or_op_id, op_id)
 
     def set_consumer(

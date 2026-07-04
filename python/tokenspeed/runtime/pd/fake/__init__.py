@@ -23,3 +23,9 @@ from tokenspeed.runtime.pd.fake.conn import (
     FakeKVReceiver,
     FakeKVSender,
 )
+
+__all__ = (
+    "FakeKVManager",
+    "FakeKVReceiver",
+    "FakeKVSender",
+)

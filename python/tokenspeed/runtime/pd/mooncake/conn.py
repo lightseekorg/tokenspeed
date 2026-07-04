@@ -24,7 +24,6 @@ import asyncio
 import logging
 import threading
 from functools import cache
-from typing import Dict, Union
 
 import zmq
 from aiohttp import web
@@ -86,8 +85,8 @@ class MooncakeKVManagerBase:
         self.register_buffer_to_engine()
 
         self.rank_port = None
-        self.request_status: Dict[int, KVPoll] = {}
-        self.failure_records: Dict[int, str] = {}
+        self.request_status: dict[int, KVPoll] = {}
+        self.failure_records: dict[int, str] = {}
         self.failure_lock = threading.Lock()
 
     def register_buffer_to_engine(self):
@@ -141,7 +140,7 @@ class MooncakeKVBootstrapServer:
         self.world_size = None
         self.dp_size = None
         self.tp_size_per_dp_rank = None
-        self.prefill_port_table: Dict[int, Dict[int, Dict[str, Union[str, int]]]] = {}
+        self.prefill_port_table: dict[int, dict[int, dict[str, str | int]]] = {}
         self.enable_mla_l1_5_cache = False
         self.prefill_kv_item_lens = []
         self.prefill_kv_unit_lens = []
@@ -269,8 +268,8 @@ class MooncakeKVBootstrapServer:
             site = web.TCPSite(self._runner, port=self.port)
             self._loop.run_until_complete(site.start())
             self._loop.run_forever()
-        except Exception as e:
-            logger.error("Server error: %s", str(e))
+        except Exception as exc:
+            logger.error("Server error: %s", str(exc))
         finally:
             # Cleanup
             self._loop.run_until_complete(self._runner.cleanup())

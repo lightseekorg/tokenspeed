@@ -25,6 +25,8 @@ from tokenspeed.runtime.pd.base.conn import (
     KVPoll,
 )
 
+__all__ = ("BootstrapInfo", "KVArgs", "KVPoll")
+
 
 @dataclass
 class BootstrapInfo:

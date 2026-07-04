@@ -20,8 +20,6 @@
 
 from __future__ import annotations
 
-from typing import Dict
-
 import numpy as np
 
 from tokenspeed.runtime.pd.base import BootstrapInfo, KVPoll
@@ -53,7 +51,7 @@ class DisaggPrefillExecutor:
                 (Forward.FlatForwardOp, self._decode),
             ]
         )
-        self.senders: Dict[int, MooncakeKVSender] = {}
+        self.senders: dict[int, MooncakeKVSender] = {}
         self.kv_manager = MooncakeKVManagerPrefill(args, kv_args)
         self.gloo_group = gloo_group
         self._local_states = {}
@@ -61,8 +59,8 @@ class DisaggPrefillExecutor:
         self._layerwise_interval = 1
         # request_id -> bootstrap metadata, populated after the prefill forward pass.
         # Request ids and bootstrap rooms are stable across request-pool slot reuse.
-        self._request_token: Dict[str, int] = {}
-        self._request_spec_candidate_ids: Dict[str, list[int]] = {}
+        self._request_token: dict[str, int] = {}
+        self._request_spec_candidate_ids: dict[str, list[int]] = {}
         self._layerwise_token_published = set()
 
     def store_prefill_token(
@@ -160,9 +158,11 @@ class DisaggPrefillExecutor:
 
     def _prefill_page_window(self, op, index: int, sender):
         decode_prefix_len = self._decode_prefix_len(sender.bootstrap_room)
-        assert (
-            decode_prefix_len % self.page_size == 0
-        ), f"decode_prefix_len % page_size != 0 ! {decode_prefix_len=} {self.page_size=}"
+        if decode_prefix_len % self.page_size != 0:
+            raise ValueError(
+                "decode_prefix_len must be divisible by page_size: "
+                f"{decode_prefix_len=} {self.page_size=}"
+            )
 
         chunk_begin = op.extend_prefix_lens[index]
         chunk_end = chunk_begin + op.input_lengths[index]
@@ -243,9 +243,11 @@ class DisaggPrefillExecutor:
 
             bootstrap_room = sender.bootstrap_room
             decode_prefix_len = self._decode_prefix_len(bootstrap_room)
-            assert (
-                decode_prefix_len % self.page_size == 0
-            ), f"decode_prefix_len % page_size != 0 ! {decode_prefix_len=} {self.page_size=}"
+            if decode_prefix_len % self.page_size != 0:
+                raise ValueError(
+                    "decode_prefix_len must be divisible by page_size: "
+                    f"{decode_prefix_len=} {self.page_size=}"
+                )
             kv_indices = np.array(
                 op.occupied_pages[i][decode_prefix_len // self.page_size :],
                 dtype=np.int64,

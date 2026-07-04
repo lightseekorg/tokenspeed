@@ -25,7 +25,7 @@ from __future__ import annotations
 import dataclasses
 import uuid
 from enum import Enum, auto
-from typing import Any, List, Optional, Union
+from typing import Any
 
 import numpy as np
 import torch
@@ -68,18 +68,18 @@ class Modality(Enum):
 @dataclasses.dataclass(eq=False)
 class MultimodalDataItem:
     modality: Modality
-    hash: Optional[int] = None
-    pad_value: Optional[int] = None
-    offsets: Optional[list] = None
-    feature: Optional[Union[torch.Tensor, np.ndarray, ShmTensorHandle]] = None
+    hash: int | None = None
+    pad_value: int | None = None
+    offsets: list | None = None
+    feature: torch.Tensor | np.ndarray | ShmTensorHandle | None = None
     model_specific_data: dict[str, Any] = dataclasses.field(default_factory=dict)
     # Encoder output for this item, populated on first encoder pass and reused
     # across chunked-prefill iterations of the owning request. Lifetime is
     # tied to the request: when the request finishes the item is GC'd and
     # these tensors are released. ``encoded_deepstack`` is set only for
     # deepstack-enabled modalities.
-    encoded: Optional[torch.Tensor] = None
-    encoded_deepstack: Optional[torch.Tensor] = None
+    encoded: torch.Tensor | None = None
+    encoded_deepstack: torch.Tensor | None = None
 
     def __getattr__(self, name: str):
         if (
@@ -115,7 +115,8 @@ class MultimodalDataItem:
                     "pad_value before TokenSpeed consumes them"
                 )
             self.hash = hash_feature(self.feature)
-        assert self.hash is not None
+        if self.hash is None:
+            raise RuntimeError("Failed to resolve multimodal item hash.")
 
     def set_pad_value(self):
         if self.pad_value is not None:
@@ -129,13 +130,13 @@ class MultimodalDataItem:
 
 @dataclasses.dataclass(eq=False)
 class MultimodalInputs:
-    mm_items: List[MultimodalDataItem]
-    im_token_id: Optional[int] = None
-    video_token_id: Optional[int] = None
-    mrope_positions: Optional[torch.Tensor] = None
-    mrope_position_delta: Optional[torch.Tensor] = None
-    mrope_position_delta_scalar: Optional[int] = None
-    mrope_position_delta_repeated_cache: Optional[torch.Tensor] = None
+    mm_items: list[MultimodalDataItem]
+    im_token_id: int | None = None
+    video_token_id: int | None = None
+    mrope_positions: torch.Tensor | None = None
+    mrope_position_delta: torch.Tensor | None = None
+    mrope_position_delta_scalar: int | None = None
+    mrope_position_delta_repeated_cache: torch.Tensor | None = None
 
     def ensure_pad_values(self) -> None:
         for item in self.mm_items:
@@ -168,9 +169,9 @@ class MultimodalInputs:
 class MultimodalForwardContext:
     """Per-forward multimodal metadata for prefill embedding replacement."""
 
-    mm_inputs: List[Optional[MultimodalInputs]]
-    extend_prefix_lens: List[int]
-    extend_seq_lens: List[int]
+    mm_inputs: list[MultimodalInputs | None]
+    extend_prefix_lens: list[int]
+    extend_seq_lens: list[int]
 
     def has_inputs(self) -> bool:
         return bool(self.mm_inputs and any(x is not None for x in self.mm_inputs))

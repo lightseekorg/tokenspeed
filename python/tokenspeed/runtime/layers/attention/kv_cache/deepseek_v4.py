@@ -14,9 +14,10 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from fractions import Fraction
-from typing import Any, Iterable, Optional, Sequence
+from typing import Any
 
 import numpy as np
 import torch
@@ -714,7 +715,7 @@ def deepseek_v4_cache_layout_from_config(
     hf_config,
     page_size: int,
     use_fp4_indexer_cache: bool,
-    layer_indices: Optional[Iterable[int]] = None,
+    layer_indices: Iterable[int] | None = None,
 ) -> DeepseekV4CacheLayout:
     compress_ratios = tuple(hf_config.compress_ratios)
     if layer_indices is None:

@@ -26,7 +26,6 @@ import socket
 import threading
 import time
 from functools import cache
-from typing import Dict, Optional, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -59,8 +58,8 @@ class CommonKVManager(BaseKVManager):
         args: KVArgs,
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
-        is_mla_backend: Optional[bool] = False,
-        draft_is_mla_backend: Optional[bool] = False,
+        is_mla_backend: bool | None = False,
+        draft_is_mla_backend: bool | None = False,
     ):
         self.kv_args = args
         self.is_mla_backend = is_mla_backend
@@ -81,15 +80,15 @@ class CommonKVManager(BaseKVManager):
             # Start bootstrap thread to receive decode prefix info from decode side
             self._start_bootstrap_thread()
             # For decode side receivers that need to fetch prefill info
-            self.prefill_tp_size_table: Dict[str, int] = {}
-            self.prefill_dp_size_table: Dict[str, int] = {}
+            self.prefill_tp_size_table: dict[str, int] = {}
+            self.prefill_dp_size_table: dict[str, int] = {}
             # Keep this attribute populated because some decode-side callers
             # still read connection_pool directly.
-            self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
+            self.connection_pool: dict[str, dict[str, str | int]] = {}
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
-            self.prefill_tp_size_table: Dict[str, int] = {}
-            self.prefill_dp_size_table: Dict[str, int] = {}
+            self.connection_pool: dict[str, dict[str, str | int]] = {}
+            self.prefill_tp_size_table: dict[str, int] = {}
+            self.prefill_dp_size_table: dict[str, int] = {}
         else:
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
@@ -123,8 +122,8 @@ class CommonKVManager(BaseKVManager):
                     response.status_code,
                     response.text,
                 )
-        except Exception as e:
-            logger.error("Prefill failed to register with bootstrap server: %s", e)
+        except Exception as exc:
+            logger.error("Prefill failed to register with bootstrap server: %s", exc)
 
     @cache
     def _connect(self, endpoint: str):
@@ -170,8 +169,8 @@ class CommonKVManager(BaseKVManager):
                             "Received unexpected message format with %s parts",
                             len(msg_parts),
                         )
-                except Exception as e:
-                    logger.error("Error in bootstrap thread: %s", e)
+                except Exception as exc:
+                    logger.error("Error in bootstrap thread: %s", exc)
                     time.sleep(0.1)  # Avoid busy loop
 
         threading.Thread(target=bootstrap_thread, daemon=True).start()
@@ -203,7 +202,7 @@ class CommonKVReceiver(BaseKVReceiver):
         self,
         mgr: BaseKVManager,
         bootstrap_addr: str,
-        bootstrap_room: Optional[int] = None,
+        bootstrap_room: int | None = None,
     ):
         self.bootstrap_room = bootstrap_room
         self.bootstrap_addr = bootstrap_addr
@@ -244,9 +243,11 @@ class CommonKVReceiver(BaseKVReceiver):
             prefill_tp_size_per_dp_rank = 1
 
         if not self.kv_mgr.draft_is_mla_backend:
-            assert (
-                local_tp_size_per_dp_rank == prefill_tp_size_per_dp_rank
-            ), "PD with different TP sizes per DP rank is not yet supported for non-MLA models"
+            if local_tp_size_per_dp_rank != prefill_tp_size_per_dp_rank:
+                raise RuntimeError(
+                    "PD with different TP sizes per DP rank is not yet supported "
+                    "for non-MLA models"
+                )
 
         if local_tp_size_per_dp_rank == prefill_tp_size_per_dp_rank:
             self.target_tp_rank = (
@@ -255,9 +256,11 @@ class CommonKVReceiver(BaseKVReceiver):
             self.required_dst_info_num = 1
             self.target_tp_ranks = [self.target_tp_rank]
         elif local_tp_size_per_dp_rank > prefill_tp_size_per_dp_rank:
-            assert (
-                self.kv_mgr.is_mla_backend
-            ), "PD with different TP sizes per DP rank is not yet supported for non-MLA models"
+            if not self.kv_mgr.is_mla_backend:
+                raise RuntimeError(
+                    "PD with different TP sizes per DP rank is not yet supported "
+                    "for non-MLA models"
+                )
             self.target_tp_rank = (
                 self.kv_mgr.kv_args.engine_rank % local_tp_size_per_dp_rank
             ) // (local_tp_size_per_dp_rank // prefill_tp_size_per_dp_rank)
@@ -266,9 +269,11 @@ class CommonKVReceiver(BaseKVReceiver):
             )
             self.target_tp_ranks = [self.target_tp_rank]
         else:
-            assert (
-                self.kv_mgr.is_mla_backend
-            ), "PD with different TP sizes per DP rank is not yet supported for non-MLA models"
+            if not self.kv_mgr.is_mla_backend:
+                raise RuntimeError(
+                    "PD with different TP sizes per DP rank is not yet supported "
+                    "for non-MLA models"
+                )
 
             # For non-MLA models, one decode rank needs to retrieve KVCache from multiple prefill ranks for non MLA models;
             self.target_tp_ranks = [
@@ -332,7 +337,8 @@ class CommonKVReceiver(BaseKVReceiver):
         else:
             self.bootstrap_infos = self.kv_mgr.connection_pool[bootstrap_key]
 
-        assert len(self.bootstrap_infos) > 0
+        if not self.bootstrap_infos:
+            raise RuntimeError("Could not fetch bootstrap info.")
 
     def _get_bootstrap_info_from_server(self, engine_rank, target_dp_group):
         """Fetch the bootstrap info from the bootstrap server."""
@@ -349,8 +355,8 @@ class CommonKVReceiver(BaseKVReceiver):
                     response.text,
                 )
                 return None
-        except Exception as e:
-            logger.error("Error fetching prefill info from bootstrap: %s", e)
+        except Exception as exc:
+            logger.error("Error fetching prefill info from bootstrap: %s", exc)
             return None
 
     def _get_prefill_dp_size_from_server(self) -> int:
@@ -370,8 +376,8 @@ class CommonKVReceiver(BaseKVReceiver):
                     response.text,
                 )
                 return None
-        except Exception as e:
-            logger.error("Error fetching prefill parallel info from bootstrap: %s", e)
+        except Exception as exc:
+            logger.error("Error fetching prefill parallel info from bootstrap: %s", exc)
             return None
 
     @classmethod
@@ -387,8 +393,8 @@ class CommonKVReceiver(BaseKVReceiver):
     def init(
         self,
         kv_indices: npt.NDArray[np.int64],
-        aux_index: Optional[int] = None,
-        decode_prefix_len: Optional[int] = 0,
+        aux_index: int | None = None,
+        decode_prefix_len: int | None = 0,
     ):
         """
         Notify prefill server about the kv indices and aux index,
@@ -441,7 +447,7 @@ class CommonKVReceiver(BaseKVReceiver):
         pass
 
     def failure_exception(self):
-        raise Exception("Common KVReceiver Exception")
+        raise RuntimeError("Common KVReceiver Exception")
 
 
 class CommonKVSender(BaseKVSender):
@@ -457,8 +463,8 @@ class CommonKVSender(BaseKVSender):
     def init(
         self,
         num_kv_indices: int,
-        aux_index: Optional[int] = None,
-        decode_prefix_len: Optional[int] = 0,
+        aux_index: int | None = None,
+        decode_prefix_len: int | None = 0,
     ):
         """Receive decode prefix length from decode side"""
         self.num_kv_indices = num_kv_indices
@@ -479,7 +485,7 @@ class CommonKVSender(BaseKVSender):
             self.bootstrap_room,
         )
 
-    def send(self, kv_indices: npt.NDArray[np.int64], start_idx: Optional[int] = 0):
+    def send(self, kv_indices: npt.NDArray[np.int64], start_idx: int | None = 0):
         """In common implementation, this is a no-op since we don't actually transfer"""
         logger.debug("CommonKVSender send with kv_indices: %s", kv_indices)
 
@@ -491,7 +497,7 @@ class CommonKVSender(BaseKVSender):
             return KVPoll.Success
 
     def failure_exception(self):
-        raise Exception("Common KVSender Exception")
+        raise RuntimeError("Common KVSender Exception")
 
 
 class CommonKVBootstrapServer(BaseKVBootstrapServer):
@@ -504,7 +510,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.world_size = None
         self.dp_size = None
         self.tp_size_per_dp_rank = None
-        self.prefill_port_table: Dict[int, Dict[int, Dict[str, Union[str, int]]]] = {}
+        self.prefill_port_table: dict[int, dict[int, dict[str, str | int]]] = {}
 
         # Start bootstrap server
         self.thread = threading.Thread(target=self._run_server, daemon=True)
@@ -605,8 +611,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             site = web.TCPSite(self._runner, port=self.port)
             self._loop.run_until_complete(site.start())
             self._loop.run_forever()
-        except Exception as e:
-            logger.error("Server error: %s", str(e))
+        except Exception as exc:
+            logger.error("Server error: %s", str(exc))
         finally:
             # Cleanup
             self._loop.run_until_complete(self._runner.cleanup())

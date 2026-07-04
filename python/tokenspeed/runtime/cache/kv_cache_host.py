@@ -26,7 +26,6 @@ import abc
 import threading
 from functools import wraps
 from pathlib import Path
-from typing import Optional
 
 import psutil
 import torch
@@ -222,7 +221,7 @@ class HostKVCache(abc.ABC):
         host_indices,
         device_indices,
         io_backend,
-        block_quota: Optional[int] = None,
+        block_quota: int | None = None,
     ) -> None:
         """
         Backup KV data from the device memory pool to the host memory pool for all layers.
@@ -263,10 +262,9 @@ class HostKVCache(abc.ABC):
         return len(self.free_slots)
 
     @synchronized
-    def alloc(self, need_size: int) -> Optional[torch.Tensor]:
-        assert (
-            need_size % self.page_size == 0
-        ), "The requested size should be a multiple of the page size."
+    def alloc(self, need_size: int) -> torch.Tensor | None:
+        if need_size % self.page_size != 0:
+            raise ValueError("The requested size should be a multiple of page_size.")
         if need_size > self.available_size():
             return None
 
@@ -432,7 +430,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         host_indices,
         device_indices,
         io_backend,
-        block_quota: Optional[int] = None,
+        block_quota: int | None = None,
     ):
         if io_backend == "kernel":
             if self.layout == "layer_first":
@@ -538,10 +536,8 @@ class MHATokenToKVPoolHost(HostKVCache):
             raise ValueError(f"Unsupported layout: {self.layout}")
 
     def get_page_buffer_meta(self, indices):
-        """ "
-        meta data for zero copy
-        """
-        assert len(indices) % self.page_size == 0
+        if len(indices) % self.page_size != 0:
+            raise ValueError("indices length must be a multiple of page_size")
         ptr_list = []
         kv_buffer_data_ptr = self.kv_buffer.data_ptr()
         indices = indices.tolist()
@@ -720,7 +716,7 @@ class MLATokenToKVPoolHost(HostKVCache):
         host_indices,
         device_indices,
         io_backend,
-        block_quota: Optional[int] = None,
+        block_quota: int | None = None,
     ):
         if block_quota is None:
             block_quota = MLA_KVSTORE_WRITEBACK_BLOCK_QUOTA
@@ -805,10 +801,8 @@ class MLATokenToKVPoolHost(HostKVCache):
             raise ValueError(f"Unsupported layout: {self.layout}")
 
     def get_page_buffer_meta(self, indices):
-        """ "
-        meta data for zero copy
-        """
-        assert len(indices) % self.page_size == 0
+        if len(indices) % self.page_size != 0:
+            raise ValueError("indices length must be a multiple of page_size")
         ptr_list = []
         kv_buffer_data_ptr = self.kv_buffer.data_ptr()
         indices = indices.tolist()
@@ -953,7 +947,7 @@ class DSATokenToKVPoolHost(MLATokenToKVPoolHost):
         host_indices,
         device_indices,
         io_backend,
-        block_quota: Optional[int] = None,
+        block_quota: int | None = None,
     ):
         super().backup_from_device_all_layer(
             device_pool, host_indices, device_indices, io_backend, block_quota
