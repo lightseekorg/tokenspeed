@@ -108,10 +108,28 @@ CoordinatorMatch KvCacheCoordinator::MatchPrefix(std::span<const std::string> co
 
 void KvCacheCoordinator::ClaimCommonPrefix(std::span<BlockTable> tables, const CoordinatorMatch& hit) {
     _assert(tables.size() == groups_.size(), "tables/groups size mismatch");
+    if (hit.per_group.empty()) {
+        // Default-constructed CoordinatorMatch: the canonical zero hit (see the
+        // header). Nothing to claim; num_common_blocks must agree.
+        _assert(hit.num_common_blocks == 0, "empty per_group with nonzero num_common_blocks");
+        return;
+    }
     _assert(hit.per_group.size() == groups_.size(), "hit/groups size mismatch");
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         groups_[i].Manager().ClaimHitBlocks(tables[i], hit.per_group[i]);
     }
+}
+
+std::int32_t KvCacheCoordinator::BlocksConsumedByClaim(const CoordinatorMatch& hit) const {
+    std::int32_t consumed = 0;
+    for (const PrefixMatch& match : hit.per_group) {
+        for (const CacheBlock* block : match.blocks) {
+            if (!block->IsNull() && block->RefCount() == 0) {
+                ++consumed;
+            }
+        }
+    }
+    return consumed;
 }
 
 std::int32_t KvCacheCoordinator::BlocksNeededFor(std::span<const BlockTable> tables, std::int32_t num_tokens) const {

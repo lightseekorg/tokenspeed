@@ -49,6 +49,7 @@
 #include "resource/types.h"
 #include "scheduler/operations/cache.h"
 #include "scheduler/operations/forward.h"
+#include "scheduler/page_hasher.h"
 #include "scheduler/request.h"
 #include "scheduler/request_spec.h"
 #include "scheduler/scheduler.h"
@@ -129,12 +130,51 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     }
 
 #if TOKENSPEED_FLAT_KVCACHE
+    // M9: cross-request prefix hit. One match at admission (vLLM V1 shape);
+    // the SAME num_common_blocks drives the token math here, the gate charge
+    // below, and window.begin in the FSM event -- single source, so the
+    // double-subtraction class of bugs cannot exist.
+    // Hash input: GetFullPagedTokens(/*except_last=*/false) pages the whole
+    // token buffer, which at admission holds exactly the prompt -- so the
+    // chained page hashes are byte-identical to what the write side registers
+    // (the prefill events hash state.GetFullPagedTokens(false); the radix
+    // match above uses except_last=true, but admission hashes must equal the
+    // REGISTRATION form or hits never occur). The rule except_last=true
+    // encodes for radix -- the last prompt token is always recomputed to
+    // produce logits (vLLM semantics) -- is applied here as the explicit
+    // (PrefillSize-1)/page_size cap instead, which also bounds the SWA
+    // fixpoint match input.
+    // Safety of claiming pages whose KV write may still be in flight
+    // (registration happens at schedule time): identical stream-ordering
+    // invariant as the prefill window slide -- the claimer's read kernels
+    // are enqueued after the writer's on the single execution stream, and
+    // claimed pages are ref>1 so they cannot be freed and reloaded from
+    // outside the stream. TODO(flat-l2): revisit when out-of-stream writers
+    // (load-back H2D) join the flat path.
+    CoordinatorMatch flat_hit;
+    if (!config_.disable_prefix_cache) {
+        const std::int32_t cap_pages = std::max((request->PrefillSize() - 1) / config_.page_size, 0);
+        const std::vector<std::string> flat_hashes = FlatWindowPageHashes(
+            request->GetFullPagedTokens(/*except_last=*/false), config_.page_size, 0, request->PrefillSize());
+        const std::size_t bounded = std::min(flat_hashes.size(), static_cast<std::size_t>(cap_pages));
+        flat_hit = coordinator_.MatchPrefix(std::span<const std::string>(flat_hashes).first(bounded));
+    }
+    // Overwrite the radix-sourced locals: the radix tree is never written on
+    // flat builds, so the match at the top of this function is always empty
+    // and both arrived holding the full prompt. Every consumer below
+    // (completes_prefill, the pool gate, first_pos, the event) then reads the
+    // hit-adjusted values naturally.
+    const std::int32_t flat_hit_tokens = flat_hit.num_common_blocks * config_.page_size;
+    unscheduled = request->PrefillSize() - flat_hit_tokens;
+    tokens_this_round = std::min(remaining, unscheduled);
+
     // TODO(radix-removal): the EnsureCapacityByEvict gate above budgets the radix
     // device_allocator_, which the flat path never draws from -- it always
     // admits. The flat shared BlockPool is gated here instead: a request that
     // does not fit is simply not scheduled this round (mirrors the radix skip),
     // so the FSM transition's Acquire cannot fail in normal operation. The flat
-    // first chunk claims no prefix (C slice) and acquires tokens_this_round.
+    // first chunk claims the admission prefix hit (flat_hit, threaded through
+    // the event) and acquires tokens_this_round.
     //
     // When this chunk completes the prefill, also charge the decode headroom the
     // PrefillDone->Decoding transition will acquire (decode_input_tokens becomes
@@ -146,7 +186,11 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     // the SWA group transiently allocates the FULL chunk before any later op
     // slides it (TODO(flat-swa-alloc), forward_cache_ops.h), so
     // BlocksNeededFor(tokens_this_round + reserve) charges that transient peak
-    // -- correctness over post-slide optimism.
+    // -- correctness over post-slide optimism. With an admission prefix hit,
+    // tokens_this_round above is already the hit-adjusted remainder, and the
+    // charge stays exact for the NEW tokens only: claimed pages are full (no
+    // tail credit), and the fresh-table BlocksNeededFor overload assumes no
+    // tail credit either.
     // The charge is only kept if a reservation is recorded in
     // flat_reserved_pages_ (below): the reserve is not Acquired until the
     // PrefillDone->Decoding round, so without the ledger other candidates would
@@ -155,7 +199,20 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     const bool completes_prefill = tokens_this_round == unscheduled;
     const std::int32_t flat_decode_reserve = completes_prefill ? decode_input_tokens : 0;
     const std::int32_t flat_blocks_needed = coordinator_.BlocksNeededFor(tokens_this_round + flat_decode_reserve);
-    if (flat_blocks_needed > block_pool_.NumFreeBlocks() - flatReservedPagesExcept(request->Id())) {
+    // The transition's ClaimCommonPrefix consumes free blocks BlocksNeededFor
+    // never sees: TouchBlock on a ref-0 cached hit block REMOVES it from the
+    // free list (block_pool.h), so the claim shrinks the free count by the
+    // number of such blocks before the remainder Acquire runs. Charge them
+    // too. The count is exact, not a bound: this gate and the event's apply
+    // run back to back within the same planning-loop iteration for this
+    // request (no other admission interleaves), so the set of hit blocks at
+    // ref 0 now is precisely the set TouchBlock will pull. Not added to
+    // flat_reserve_pages below: the ledger carries cross-round promises only
+    // (the decode acquire lands rounds later), while the claim lands within
+    // this same round's apply.
+    const std::int32_t flat_claim_blocks = coordinator_.BlocksConsumedByClaim(flat_hit);
+    if (flat_blocks_needed + flat_claim_blocks >
+        block_pool_.NumFreeBlocks() - flatReservedPagesExcept(request->Id())) {
         return {};
     }
     // Exact reserve page need on the post-prefill table shape: BlocksNeededFor
@@ -231,6 +288,7 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         std::move(mamba_loadback_nodes),
 #if TOKENSPEED_FLAT_KVCACHE
         &coordinator_,
+        std::move(flat_hit),
 #endif
     };
 }
@@ -568,6 +626,17 @@ template <typename Event>
     requires(std::same_as<Event, fsm::SchedulePrefillFirstChunkEvent> || std::same_as<Event, fsm::SchedulePrefillEvent>)
 static PrefillOperation applyPrefillEvent(Request* request, Event event,
                                           std::span<const std::string> flat_group_ids) {
+    // begin/size are in PAGE space: the slice of occupied_pages that is new to
+    // the REQUEST'S TABLE this round (Python copies exactly that slice into
+    // req_to_page rows [begin, begin+size)). On a first chunk with a prefix hit
+    // -- radix or flat -- the matched pages enter the table during the event
+    // (radix: PageContainer prepends the device node's prefix pages; flat:
+    // ClaimCommonPrefix appends the claimed blocks), so begin stays 0 and size
+    // COUNTS THE PREFIX: req_to_page has no rows for this request yet and needs
+    // the prefix mappings too. The op's INPUT window is token-space and comes
+    // from the state's window below (input_ids/extend_len/extend_prefix_len),
+    // which the transition already started past the hit -- the two spaces
+    // intentionally differ on a hit.
     std::int32_t begin = static_cast<std::int32_t>(request->GetOccupiedPages().size());
     request->Apply(event);
     std::vector<std::int32_t> all_pages = request->GetOccupiedPages();

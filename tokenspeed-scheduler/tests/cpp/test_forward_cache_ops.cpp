@@ -62,11 +62,81 @@ TEST(ForwardCacheOpsPrefill, FirstChunkAcquiresPagesForTokens) {
     KvCacheCoordinator coordinator = MakeTwoGroup(pool);
     std::vector<BlockTable> tables(coordinator.NumGroups());
 
-    // No prefix cached -> MatchPrefix empty -> Acquire 4 tokens -> 2 pages/group.
-    std::vector<std::string> hashes;  // empty: miss path
-    ASSERT_TRUE(PrefillFirstChunk(coordinator, tables, hashes, /*num_tokens=*/4));
+    // Zero hit (default-constructed match: miss path) -> Acquire 4 tokens -> 2 pages/group.
+    ASSERT_TRUE(PrefillFirstChunk(coordinator, tables, CoordinatorMatch{}, /*num_new_tokens=*/4));
     EXPECT_EQ(tables[0].NumBlocks(), 2);
     EXPECT_EQ(tables[1].NumBlocks(), 2);
+}
+
+// Cross-request prefix reuse (M9, review landmine L1): the first chunk claims
+// the admission-layer match and Acquires pages for the NEW tokens only.
+TEST(ForwardCacheOpsPrefill, FirstChunkClaimsHitThenAcquiresOnlyRemainder) {
+    BlockPool pool(/*total_num_blocks=*/32, /*enable_caching=*/true);
+    // Wider SWA window than MakeTwoGroup's W=4: with page_size=2 and W=16 the
+    // SWA bounded match keeps all 4 prefix pages as REAL hits (its right->left
+    // scan needs contiguous_needed = ceil((16-1)/2) = 8 > 4, so it never stops
+    // early and leaves no leading null holes), and nothing slides out of window
+    // -- the test stays about claim/acquire math, not SWA eviction.
+    std::vector<KvCacheSpec> specs{
+        KvCacheSpec{AttnKind::kFull, /*page_size=*/2, /*sliding_window=*/0},
+        KvCacheSpec{AttnKind::kSlidingWindow, /*page_size=*/2, /*sliding_window=*/16},
+    };
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, pool);
+
+    // r1: prefill 8 tokens -> 4 full pages/group; register their hashes; finish.
+    // FreeRequest drops each block's ref to 0 and returns it to the free list
+    // WITH its hash intact (cached free block, still prefix-reusable).
+    std::vector<std::string> hashes8(4);
+    for (std::size_t i = 0; i < hashes8.size(); ++i) {
+        hashes8[i] = std::string(64, static_cast<char>('a' + i));
+    }
+    std::vector<BlockTable> r1(coordinator.NumGroups());
+    ASSERT_TRUE(PrefillFirstChunk(coordinator, r1, CoordinatorMatch{}, /*num_new_tokens=*/8));
+    coordinator.CacheFullBlocks(r1, hashes8, /*num_full_blocks=*/4);
+    const std::vector<std::int32_t> r1_full_ids = BlockTablePageIds(r1[0]);
+    const std::vector<std::int32_t> r1_swa_ids = BlockTablePageIds(r1[1]);
+    FreeRequest(coordinator, r1);
+
+    // r2: same 8-token prefix, 12-token prefill target -> 4 NEW tokens.
+    const CoordinatorMatch hit = coordinator.MatchPrefix(hashes8);
+    ASSERT_EQ(hit.num_common_blocks, 4);
+    ASSERT_EQ(hit.per_group[1].num_hit_blocks, 4) << "W=16 must keep every SWA prefix page real";
+
+    // Tail semantics (spec §4.3): ClaimHitBlocks appends whole pages and never
+    // touches tail_avail_ (stays 0 from the fresh table), so the 4 claimed
+    // pages carry NO tail credit and the incremental page math stays exact:
+    // BlocksNeededFor(4 new tokens) = ceil(4/2) = 2 pages/group = 4 total.
+    {
+        std::vector<BlockTable> probe(coordinator.NumGroups());
+        coordinator.ClaimCommonPrefix(probe, hit);
+        EXPECT_EQ(probe[0].TailAvailableTokens(), 0);
+        EXPECT_EQ(probe[1].TailAvailableTokens(), 0);
+        EXPECT_EQ(coordinator.BlocksNeededFor(probe, /*num_tokens=*/4), 4);
+        FreeRequest(coordinator, probe);
+    }
+
+    const std::int32_t free_before = pool.NumFreeBlocks();
+    std::vector<BlockTable> r2(coordinator.NumGroups());
+    ASSERT_TRUE(PrefillFirstChunk(coordinator, r2, hit, /*num_new_tokens=*/4));
+
+    // Per-group table: 4 claimed prefix pages + ceil(4 new / 2) = 2 fresh = 6.
+    // The length also re-pins the tail semantics: bogus tail credit left by the
+    // claim would make Acquire under-allocate (5 pages, or 4 with credit >= 4).
+    ASSERT_EQ(r2[0].NumBlocks(), 6);
+    ASSERT_EQ(r2[1].NumBlocks(), 6);
+
+    // Reuse: the first 4 slots are r1's physical pages, revived from the free
+    // list -- not fresh copies. The 2 new pages come from AllocateBlocks, which
+    // pops the LRU head (long-untouched blocks), so they cannot alias these.
+    for (std::int32_t i = 0; i < 4; ++i) {
+        EXPECT_EQ(r2[0].Blocks()[i]->BlockId(), r1_full_ids[i]) << "full slot " << i;
+        EXPECT_EQ(r2[1].Blocks()[i]->BlockId(), r1_swa_ids[i]) << "swa slot " << i;
+    }
+
+    // Free-list accounting: TouchBlock pulls a claimed ref==0 cached block OUT
+    // of the free list (block_pool.h), so the claim costs 4 blocks/group, and
+    // the Acquire pops 2 fresh blocks/group. Delta = (4 + 2) * 2 groups = 12.
+    EXPECT_EQ(free_before - pool.NumFreeBlocks(), 12);
 }
 
 TEST(ForwardCacheOpsPrefill, ChunkAcquiresAndCachesFullBlocks) {
@@ -74,8 +144,7 @@ TEST(ForwardCacheOpsPrefill, ChunkAcquiresAndCachesFullBlocks) {
     KvCacheCoordinator coordinator = MakeTwoGroup(pool);
     std::vector<BlockTable> tables(coordinator.NumGroups());
 
-    std::vector<std::string> hashes0;
-    ASSERT_TRUE(PrefillFirstChunk(coordinator, tables, hashes0, /*num_tokens=*/4));
+    ASSERT_TRUE(PrefillFirstChunk(coordinator, tables, CoordinatorMatch{}, /*num_new_tokens=*/4));
 
     // Second chunk: 4 more tokens -> +2 pages/group; cache the 2 now-full pages.
     // num_computed = 4 (chunk 0's tokens) -> skipped = 4-4+1 = 1 -> 1/2 = 0
@@ -101,8 +170,7 @@ TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowAndKeepsPunchedPageHashes) {
 
     // Chunk 0: 8 tokens -> 4 pages/group (chunk >> window is fine: the slide
     // happens on the NEXT op; see TODO(flat-swa-alloc)).
-    std::vector<std::string> hashes0;
-    ASSERT_TRUE(PrefillFirstChunk(coordinator, tables, hashes0, /*num_tokens=*/8));
+    ASSERT_TRUE(PrefillFirstChunk(coordinator, tables, CoordinatorMatch{}, /*num_new_tokens=*/8));
     const std::int32_t free_before_chunk = pool.NumFreeBlocks();
 
     // Chunk 1: num_computed = 8 -> skipped = 8-4+1 = 5 -> 5/2 = 2 pages fully
@@ -144,8 +212,7 @@ TEST(ForwardCacheOpsPrefill, FinalizeSlidesSwaWindowBeforeReserveAcquire) {
     std::vector<BlockTable> tables(coordinator.NumGroups());
 
     // 12-token prefill -> 6 pages/group, tails full.
-    std::vector<std::string> hashes0;
-    ASSERT_TRUE(PrefillFirstChunk(coordinator, tables, hashes0, /*num_tokens=*/12));
+    ASSERT_TRUE(PrefillFirstChunk(coordinator, tables, CoordinatorMatch{}, /*num_new_tokens=*/12));
     const std::int32_t free_before = pool.NumFreeBlocks();
 
     // num_computed = 12 -> skipped = 12-4+1 = 9 -> 9/2 = 4 pages punched

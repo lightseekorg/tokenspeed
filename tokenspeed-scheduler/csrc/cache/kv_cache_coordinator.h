@@ -62,8 +62,26 @@ public:
 
     // Claim the common-prefix hit blocks into each group's table. Pure claim, no
     // allocation, never fails (ClaimHitBlocks skips null holes). Call on fresh
-    // tables before Acquire, at prefill start.
+    // tables before Acquire, at prefill start. A default-constructed
+    // CoordinatorMatch (empty per_group, num_common_blocks == 0) is the
+    // canonical zero hit and claims nothing; any non-empty per_group must be
+    // sized to the group count.
     void ClaimCommonPrefix(std::span<BlockTable> tables, const CoordinatorMatch& hit);
+
+    // Pure query, gate-side twin of ClaimCommonPrefix (same pattern as
+    // AdvanceWindow / BlocksFreedByAdvance): free-list blocks the claim will
+    // consume. ClaimCommonPrefix TouchBlock()s every real hit block, and
+    // touching a ref_cnt==0 cached block REMOVES it from the free list
+    // (block_pool.h), so a claim shrinks NumFreeBlocks() by exactly the number
+    // of ref-0 hit blocks -- on top of anything Acquire takes. Admission gates
+    // must charge this or the free count they check overstates what the
+    // transition's Acquire will find. Hit blocks with ref > 0 (still held by a
+    // live request) are not in the free list and cost nothing; null holes are
+    // TouchBlock no-ops. No block is ever counted twice across groups: a block
+    // carries at most one hash (CacheBlock::SetHash asserts) and hash keys are
+    // group-scoped (MakeKeyWithGroupId), so a physical block can appear in at
+    // most one group's match.
+    std::int32_t BlocksConsumedByClaim(const CoordinatorMatch& hit) const;
 
     // Token-driven incremental allocation across all groups. Check-then-act: sums
     // the pages every group needs, and if the shared pool cannot supply them all,

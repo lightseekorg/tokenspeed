@@ -33,14 +33,19 @@ namespace tokenspeed {
 
 struct SchedulerConfig;  // defined in scheduler/types.h; only used by-ref below
 
-// Prefill first chunk: match the common cached prefix across groups, claim the
-// hit blocks into each table, then allocate pages for this chunk's tokens.
-// Returns false if the shared pool cannot supply the chunk. The chunk itself is
-// check-then-act (Acquire allocates nothing on failure), but the prefix blocks
-// claimed by ClaimCommonPrefix REMAIN in the tables -- on failure the caller
-// must FreeRequest the tables to release those refs. tables must be sized to
-// coordinator.NumGroups(). No window slide happens here: nothing is computed
-// before the first chunk (num_computed = 0 frees nothing).
+// Prefill first chunk: claim the admission-layer prefix match into each table,
+// then allocate pages for the NEW tokens only. The match itself happens once at
+// scheduler admission (single num_common_blocks source drives the token math,
+// the gate charge and window.begin; see the M9 spec), so the ops layer is pure
+// claim + Acquire(remainder). Claimed pages are FULL pages -- ClaimHitBlocks
+// leaves no tail credit -- so the incremental Acquire's page math is exact for
+// num_new_tokens. Returns false if the shared pool cannot supply the new pages;
+// the Acquire is check-then-act (allocates nothing on failure), but the prefix
+// blocks claimed by ClaimCommonPrefix REMAIN in the tables -- on failure the
+// caller must FreeRequest the tables to release those refs (unchanged
+// contract). tables must be sized to coordinator.NumGroups(). No window slide
+// happens here: nothing is computed before the first chunk (num_computed = 0
+// frees nothing).
 //
 // TODO(flat-swa-alloc): Acquire allocates ceil(chunk/page) SWA pages even when
 // chunk >> window -- the pages below the window are only released by the NEXT
@@ -50,7 +55,7 @@ struct SchedulerConfig;  // defined in scheduler/types.h; only used by-ref below
 // until then the first-chunk admission gate must charge this transient peak
 // (full chunk), and does (schedulePrefillFirstChunk).
 bool PrefillFirstChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
-                       std::span<const std::string> content_hashes, std::int32_t num_tokens);
+                       const CoordinatorMatch& hit, std::int32_t num_new_tokens);
 
 // Subsequent prefill chunk: register the pages the PRIOR chunks completed,
 // slide the SWA window forward to num_computed_tokens, then allocate this

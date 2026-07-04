@@ -173,10 +173,8 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()
 
     std::vector<BlockTable> tables(coordinator_->NumGroups());
 
-    // C slice: cross-request prefix claim deferred; pass empty hashes so only Acquire runs.
-    std::vector<std::string> empty_hashes;
     try {
-        if (!PrefillFirstChunk(*coordinator_, tables, empty_hashes, tokens_this_round_)) {
+        if (!PrefillFirstChunk(*coordinator_, tables, flat_hit_, tokens_this_round_)) {
             _assert(false, "flat path: allocation failure unsupported in C slice");
         }
     } catch (...) {
@@ -187,7 +185,14 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()
         throw;
     }
 
-    TokenContainer::Window window{.begin = 0, .size = tokens_this_round_};
+    // The window starts past the claimed prefix: the same num_common_blocks
+    // that drove the admission token math (tokens_this_round_ is already the
+    // hit-adjusted remainder) sets window.begin here, mirroring the radix arm's
+    // max_matched_pages * page_size below. Everything window-derived follows:
+    // input_ids slice [begin, begin+size), extend_prefix_len = begin, and
+    // is_last_chunk covers a hit + one chunk completing the prompt.
+    const std::int32_t hit_tokens = flat_hit_.num_common_blocks * state.GetPageSize();
+    TokenContainer::Window window{.begin = hit_tokens, .size = tokens_this_round_};
     bool is_last_chunk = (window.begin + window.size) == token_container->PrefillSize();
     if (is_last_chunk && role_ != Role::kD) {
         PrefillDone done{token_container,

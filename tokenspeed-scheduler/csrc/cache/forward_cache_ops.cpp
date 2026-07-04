@@ -26,10 +26,9 @@
 namespace tokenspeed {
 
 bool PrefillFirstChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
-                       std::span<const std::string> content_hashes, std::int32_t num_tokens) {
-    CoordinatorMatch hit = coordinator.MatchPrefix(content_hashes);
-    coordinator.ClaimCommonPrefix(tables, hit);      // pure claim, never fails
-    return coordinator.Acquire(tables, num_tokens);  // check-then-act
+                       const CoordinatorMatch& hit, std::int32_t num_new_tokens) {
+    coordinator.ClaimCommonPrefix(tables, hit);          // pure claim, never fails
+    return coordinator.Acquire(tables, num_new_tokens);  // check-then-act
 }
 
 bool PrefillChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,

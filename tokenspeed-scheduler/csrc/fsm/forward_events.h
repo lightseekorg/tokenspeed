@@ -78,7 +78,11 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
                                    // in flat builds too and legitimately construct events without one.
                                    // Every flat transition body asserts coordinator_ != nullptr on entry.
                                    ,
-                                   KvCacheCoordinator* coordinator = nullptr
+                                   KvCacheCoordinator* coordinator = nullptr,
+                                   // Admission-layer prefix match (M9): the scheduler matches once and
+                                   // threads the hit here; the default {} is the canonical zero hit for
+                                   // call sites that never match (radix-only paths, tests).
+                                   CoordinatorMatch flat_hit = {}
 #endif
                                    )
         : tokens_this_round_(tokens_this_round),
@@ -95,7 +99,8 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
           mamba_allocator_(mamba_allocator)
 #if TOKENSPEED_FLAT_KVCACHE
           ,
-          coordinator_(coordinator)
+          coordinator_(coordinator),
+          flat_hit_(std::move(flat_hit))
 #endif
     {}
 
@@ -122,6 +127,7 @@ private:
     MambaChunkAllocator* mamba_allocator_{};
 #if TOKENSPEED_FLAT_KVCACHE
     KvCacheCoordinator* coordinator_{};
+    CoordinatorMatch flat_hit_{};
 #endif
 };
 
