@@ -500,31 +500,12 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
     def _expand_decode_seq_lens_per_token(
         seq_lens: torch.Tensor,
         q_len_per_req: int,
-        *,
-        draft_catchup: bool = False,
     ) -> torch.Tensor:
-        """Per-token visible KV lengths for multi-query (spec-verify) decode.
-
-        ``seq_lens`` holds the FULL per-request context: during target verify
-        the draft tokens are already written to the KV cache and counted, so
-        token ``j`` of a request may only see
-        ``seq_lens - q_len_per_req + j + 1`` positions. With
-        ``q_len_per_req == 1`` this is ``seq_lens`` itself (plain decode).
-
-        The draft model's first catch-up step is the opposite: it writes its KV
-        one token at a time after target verify, so visible lengths advance from
-        ``seq_lens`` through ``seq_lens + q_len_per_req - 1``.
-        """
         if q_len_per_req == 1:
             return seq_lens
-        if draft_catchup:
-            offsets = torch.arange(
-                q_len_per_req, device=seq_lens.device, dtype=seq_lens.dtype
-            )
-        else:
-            offsets = torch.arange(
-                1 - q_len_per_req, 1, device=seq_lens.device, dtype=seq_lens.dtype
-            )
+        offsets = torch.arange(
+            1 - q_len_per_req, 1, device=seq_lens.device, dtype=seq_lens.dtype
+        )
         # Padded graph rows can be shorter than q_len; real rows are unaffected.
         return (seq_lens.view(-1, 1) + offsets).clamp_min_(0).reshape(-1)
 
@@ -566,16 +547,9 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         block_tables = metadata.block_kv_indices[
             num_extends : num_extends + decode_window.num_reqs
         ]
-        draft_catchup = bool(
-            getattr(ctx.attn_backend, "is_draft", False)
-            and ctx.forward_mode is not None
-            and ctx.forward_mode.is_decode()
-            and decode_window.q_len_per_req > 1
-        )
         seq_lens_per_token = self._expand_decode_seq_lens_per_token(
             seq_lens,
             decode_window.q_len_per_req,
-            draft_catchup=draft_catchup,
         )
         block_tables_per_token = (
             block_tables
