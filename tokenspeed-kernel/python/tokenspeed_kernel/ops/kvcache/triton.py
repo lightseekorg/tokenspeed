@@ -1040,38 +1040,6 @@ def transfer_kv_all_layer(
     if _ALL_LAYER_GRID_CAP > 0:
         num_programs = min(num_programs, _ALL_LAYER_GRID_CAP)
     grid = (num_programs,)
-
-    import logging as _logging
-    _dbg = _logging.getLogger("tokenspeed_kernel.kvcache.triton")
-    use_cs32 = _is_nvidia and total_words % words_per_chunk == 0
-    # Check ptr alignment: cs32 uses ld/st.global.cs.b32 → 4-byte aligned
-    _sk = src_k_layers.tolist()
-    _dk = dst_k_layers.tolist()
-    _sv = src_v_layers.tolist()
-    _dv = dst_v_layers.tolist()
-    _bad_src_k = [i for i, p in enumerate(_sk) if p % 4 != 0]
-    _bad_dst_k = [i for i, p in enumerate(_dk) if p % 4 != 0]
-    _bad_src_v = [i for i, p in enumerate(_sv) if p % 4 != 0]
-    _bad_dst_v = [i for i, p in enumerate(_dv) if p % 4 != 0]
-    _null_src_k = [i for i, p in enumerate(_sk) if p == 0]
-    _null_dst_k = [i for i, p in enumerate(_dk) if p == 0]
-    _stride_words = item_size // 4
-    _dbg.warning(
-        "[DEBUG-KVTransfer] use_cs32=%s item_size=%d stride_words=%d "
-        "total_words=%d num_chunks=%d num_layers=%d length=%d | "
-        "src_k[0]=0x%x dst_k[0]=0x%x src_v[0]=0x%x dst_v[0]=0x%x | "
-        "bad_align(src_k=%s dst_k=%s src_v=%s dst_v=%s) "
-        "null(src_k=%s dst_k=%s) | "
-        "stride_align_ok=%s",
-        use_cs32, item_size, _stride_words,
-        total_words, num_chunks, num_layers, length,
-        _sk[0] if _sk else 0, _dk[0] if _dk else 0,
-        _sv[0] if _sv else 0, _dv[0] if _dv else 0,
-        _bad_src_k, _bad_dst_k, _bad_src_v, _bad_dst_v,
-        _null_src_k, _null_dst_k,
-        _stride_words % 1 == 0,  # always True, but shows the value
-    )
-
     if _is_nvidia and total_words % words_per_chunk == 0:
         _kv_transfer_all_layer_cs32_kernel[grid](
             dst_k_layers,
