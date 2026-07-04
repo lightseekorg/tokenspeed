@@ -74,100 +74,6 @@ def _pack_index_k_cache(
     return packed, (x_fp8.float() * scale).reshape_as(index_k)
 
 
-@pytest.mark.parametrize("solution", ["triton", "deep_gemm"])
-def test_dsa_decode_topk(device: str, solution: str, require) -> None:
-    require("attention", "dsa_decode_topk", solution, torch.bfloat16, "q")
-    if solution == "deep_gemm":
-        pytest.skip("DeepGEMM DSA paged top-k requires packed FP8 cache fixture")
-
-    page_size = 64
-    topk = 512
-    q = torch.randn((3, 2, 128), device=device, dtype=torch.bfloat16)
-    weights = torch.randn((3, 2), device=device, dtype=torch.float32)
-    index_k = torch.randn((4 * page_size, 128), device=device, dtype=torch.bfloat16)
-    seq_lens = torch.tensor([20, 65, 3], device=device, dtype=torch.int32)
-    block_table = torch.tensor(
-        [[1, 3], [0, 2], [2, 1]], device=device, dtype=torch.int32
-    )
-    out = torch.empty((3, topk), device=device, dtype=torch.int32)
-    lens_out = torch.empty((3,), device=device, dtype=torch.int32)
-
-    topk_slots, topk_lens = dsa_decode_topk(
-        q,
-        weights,
-        seq_lens,
-        block_table,
-        page_size=page_size,
-        topk=topk,
-        softmax_scale=128**-0.5,
-        index_k_cache=index_k,
-        out=out,
-        lens_out=lens_out,
-        solution=solution,
-    )
-
-    expected = torch.full_like(topk_slots, -1)
-    expected_lens = torch.minimum(seq_lens, torch.full_like(seq_lens, topk))
-    for token in range(q.shape[0]):
-        scores = []
-        slots = []
-        for offset in range(int(seq_lens[token].item())):
-            page = int(block_table[token, offset // page_size].item())
-            slot = page * page_size + offset % page_size
-            per_head = (q[token].float() * index_k[slot].float()).sum(dim=-1)
-            scores.append((per_head * weights[token]).sum() * (128**-0.5))
-            slots.append(slot)
-        local = torch.topk(
-            torch.stack(scores), int(expected_lens[token].item())
-        ).indices
-        expected[token, : local.numel()] = torch.tensor(
-            [slots[int(i)] for i in local.tolist()], device=device, dtype=torch.int32
-        )
-
-    assert topk_slots.data_ptr() == out.data_ptr()
-    assert topk_lens.data_ptr() == lens_out.data_ptr()
-    torch.testing.assert_close(topk_lens.cpu(), expected_lens.cpu())
-    torch.testing.assert_close(topk_slots[:, :65].cpu(), expected[:, :65].cpu())
-    assert (topk_slots[0, int(expected_lens[0].item()) :] == -1).all()
-
-
-def test_dsa_decode_topk_large_context(device: str, require) -> None:
-    require("attention", "dsa_decode_topk", "triton", torch.bfloat16, "q")
-
-    page_size = 64
-    pages = 1024
-    topk = 512
-    q = torch.randn((1, 2, 128), device=device, dtype=torch.bfloat16)
-    weights = torch.randn((1, 2), device=device, dtype=torch.float32)
-    index_k = torch.randn((page_size, 128), device=device, dtype=torch.bfloat16)
-    seq_lens = torch.tensor([5], device=device, dtype=torch.int32)
-    block_table = torch.zeros((1, pages), device=device, dtype=torch.int32)
-
-    topk_slots, topk_lens = dsa_decode_topk(
-        q,
-        weights,
-        seq_lens,
-        block_table,
-        page_size=page_size,
-        topk=topk,
-        softmax_scale=128**-0.5,
-        index_k_cache=index_k,
-        solution="triton",
-    )
-
-    scores = []
-    for offset in range(int(seq_lens[0].item())):
-        per_head = (q[0].float() * index_k[offset].float()).sum(dim=-1)
-        scores.append((per_head * weights[0]).sum() * (128**-0.5))
-    expected = torch.topk(torch.stack(scores), int(seq_lens[0].item())).indices.to(
-        torch.int32
-    )
-
-    torch.testing.assert_close(topk_lens.cpu(), torch.tensor([5], dtype=torch.int32))
-    torch.testing.assert_close(topk_slots[0, :5].cpu(), expected.cpu())
-    assert (topk_slots[0, 5:] == -1).all()
-
-
 def test_dsa_decode_topk_fp8(device: str, require) -> None:
     require("attention", "dsa_decode_topk", "triton", torch.bfloat16, "q")
 
@@ -192,7 +98,7 @@ def test_dsa_decode_topk_fp8(device: str, require) -> None:
         page_size=page_size,
         topk=topk,
         softmax_scale=128**-0.5,
-        index_k_with_scale_cache=packed_index_k,
+        index_k_cache=packed_index_k,
         solution="triton",
     )
 
@@ -217,62 +123,6 @@ def test_dsa_decode_topk_fp8(device: str, require) -> None:
     torch.testing.assert_close(topk_lens.cpu(), expected_lens.cpu())
     torch.testing.assert_close(topk_slots[:, :65].cpu(), expected[:, :65].cpu())
     assert (topk_slots[0, int(expected_lens[0].item()) :] == -1).all()
-
-
-@pytest.mark.parametrize("solution", ["triton", "deep_gemm"])
-def test_dsa_prefill_topk(device: str, solution: str, require) -> None:
-    require("attention", "dsa_prefill_topk", solution, torch.bfloat16, "q")
-    if solution == "deep_gemm":
-        pytest.skip("DeepGEMM DSA workspace top-k requires gathered FP8 fixture")
-
-    topk = 512
-    q = torch.randn((3, 2, 128), device=device, dtype=torch.bfloat16)
-    weights = torch.randn((3, 2), device=device, dtype=torch.float32)
-    index_k = torch.randn((256, 128), device=device, dtype=torch.bfloat16)
-    kv_workspace_slots = torch.arange(85, device=device, dtype=torch.int64) + 17
-    row_starts = torch.tensor([0, 10, 70], device=device, dtype=torch.int32)
-    row_ends = torch.tensor([20, 75, 85], device=device, dtype=torch.int32)
-    out = torch.empty((3, topk), device=device, dtype=torch.int32)
-    lens_out = torch.empty((3,), device=device, dtype=torch.int32)
-
-    workspace_indices, topk_lens = dsa_prefill_topk(
-        q,
-        weights,
-        kv_workspace_slots,
-        row_starts,
-        row_ends,
-        topk=topk,
-        softmax_scale=128**-0.5,
-        index_k_cache=index_k,
-        out=out,
-        lens_out=lens_out,
-        solution=solution,
-    )
-
-    expected = torch.full_like(workspace_indices, -1)
-    expected_lens = torch.minimum(
-        row_ends - row_starts, torch.full_like(row_ends, topk)
-    )
-    for token in range(q.shape[0]):
-        scores = []
-        rows = []
-        for row in range(int(row_starts[token].item()), int(row_ends[token].item())):
-            slot = int(kv_workspace_slots[row].item())
-            per_head = (q[token].float() * index_k[slot].float()).sum(dim=-1)
-            scores.append((per_head * weights[token]).sum() * (128**-0.5))
-            rows.append(row)
-        local = torch.topk(
-            torch.stack(scores), int(expected_lens[token].item())
-        ).indices
-        expected[token, : local.numel()] = torch.tensor(
-            [rows[int(i)] for i in local.tolist()], device=device, dtype=torch.int32
-        )
-
-    assert workspace_indices.data_ptr() == out.data_ptr()
-    assert topk_lens.data_ptr() == lens_out.data_ptr()
-    torch.testing.assert_close(topk_lens.cpu(), expected_lens.cpu())
-    torch.testing.assert_close(workspace_indices[:, :65].cpu(), expected[:, :65].cpu())
-    assert (workspace_indices[0, int(expected_lens[0].item()) :] == -1).all()
 
 
 def test_dsa_prefill_topk_fp8(device: str, require) -> None:
@@ -298,7 +148,7 @@ def test_dsa_prefill_topk_fp8(device: str, require) -> None:
         row_ends,
         topk=topk,
         softmax_scale=128**-0.5,
-        index_k_with_scale_cache=packed_index_k,
+        index_k_cache=packed_index_k,
         page_size=page_size,
         solution="triton",
     )

@@ -648,18 +648,8 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             .float()
             .contiguous()
         )
-        index_k_cache = (
-            ctx.token_to_kv_pool.get_index_k_buffer(self.attn_mqa.layer_id)
-            if hasattr(ctx.token_to_kv_pool, "get_index_k_buffer")
-            else None
-        )
-        index_k_with_scale_cache = (
-            ctx.token_to_kv_pool.get_index_k_with_scale_buffer(self.attn_mqa.layer_id)
-            if hasattr(ctx.token_to_kv_pool, "has_index_k_with_scale_buffer")
-            and ctx.token_to_kv_pool.has_index_k_with_scale_buffer()
-            else None
-        )
-        if index_k_cache is None and index_k_with_scale_cache is None:
+        index_k_cache = ctx.token_to_kv_pool.get_index_k_buffer(self.attn_mqa.layer_id)
+        if index_k_cache is None:
             raise RuntimeError("GLM DSA top-k requires an index-K cache.")
 
         topk_indices = self._get_decode_topk_workspace(
@@ -687,7 +677,6 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             softmax_scale=self.indexer.softmax_scale,
             q_len_per_req=q_len_per_req,
             index_k_cache=index_k_cache,
-            index_k_with_scale_cache=index_k_with_scale_cache,
             plan=plan,
             out=topk_slice,
             lens_out=topk_lens_slice,
@@ -790,20 +779,8 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         row_starts = seq_cu.index_select(0, token_req)
         row_ends = row_starts + causal_lens
 
-        index_k_cache = (
-            ctx.token_to_kv_pool.get_index_k_buffer(self.attn_mqa.layer_id)
-            if hasattr(ctx.token_to_kv_pool, "get_index_k_buffer")
-            else None
-        )
-        index_k_with_scale_cache = (
-            ctx.token_to_kv_pool.get_index_k_with_scale_buffer(self.attn_mqa.layer_id)
-            if (
-                hasattr(ctx.token_to_kv_pool, "has_index_k_with_scale_buffer")
-                and ctx.token_to_kv_pool.has_index_k_with_scale_buffer()
-            )
-            else None
-        )
-        if index_k_cache is None and index_k_with_scale_cache is None:
+        index_k_cache = ctx.token_to_kv_pool.get_index_k_buffer(self.attn_mqa.layer_id)
+        if index_k_cache is None:
             raise RuntimeError("GLM DSA top-k requires an index-K cache.")
 
         max_logits_mb = int(global_server_args_dict[_INDEXER_PREFILL_MAX_LOGITS_MB_ARG])
@@ -816,7 +793,6 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             topk=topk,
             softmax_scale=self.indexer.softmax_scale,
             index_k_cache=index_k_cache,
-            index_k_with_scale_cache=index_k_with_scale_cache,
             page_size=ctx.token_to_kv_pool.page_size,
             max_logits_bytes=max(1, max_logits_mb) * 1024 * 1024,
         )

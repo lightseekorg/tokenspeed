@@ -512,9 +512,9 @@ def _attention_dsa_prefill() -> object:
 def _attention_dsa_decode_topk() -> object:
     q = torch.empty((2, 2, 128), dtype=torch.bfloat16)
     weights = torch.empty((2, 2), dtype=torch.float32)
-    index_k = torch.empty((128, 128), dtype=torch.bfloat16)
+    index_k = torch.zeros((128, 132), dtype=torch.uint8)
     seq_lens = torch.tensor([64, 64], dtype=torch.int32)
-    block_table = torch.empty((2, 1), dtype=torch.int32)
+    block_table = torch.zeros((2, 1), dtype=torch.int32)
     return tokenspeed_kernel.dsa_decode_topk(
         q,
         weights,
@@ -530,7 +530,7 @@ def _attention_dsa_decode_topk() -> object:
 def _attention_dsa_prefill_topk() -> object:
     q = torch.empty((2, 2, 128), dtype=torch.bfloat16)
     weights = torch.empty((2, 2), dtype=torch.float32)
-    index_k = torch.empty((128, 128), dtype=torch.bfloat16)
+    index_k = torch.zeros((128, 132), dtype=torch.uint8)
     kv_workspace_slots = torch.arange(64, dtype=torch.int64)
     row_starts = torch.tensor([0, 8], dtype=torch.int32)
     row_ends = torch.tensor([8, 16], dtype=torch.int32)
@@ -543,6 +543,7 @@ def _attention_dsa_prefill_topk() -> object:
         topk=512,
         softmax_scale=1.0,
         index_k_cache=index_k,
+        page_size=64,
     )
 
 
@@ -1092,7 +1093,7 @@ _CASES = [
         "cdna4",
         "attention",
         "dsa_decode_topk",
-        "triton_dsa_decode_topk",
+        "triton_dsa_decode_topk_fp8",
         _attention_dsa_decode_topk,
     ),
     _case(
@@ -1100,7 +1101,7 @@ _CASES = [
         "cdna4",
         "attention",
         "dsa_prefill_topk",
-        "triton_dsa_prefill_topk",
+        "triton_dsa_prefill_topk_fp8",
         _attention_dsa_prefill_topk,
     ),
     _case(

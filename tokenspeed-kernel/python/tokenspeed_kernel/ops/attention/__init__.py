@@ -845,7 +845,6 @@ def dsa_prefill_topk(
     topk: int,
     softmax_scale: float,
     index_k_cache: torch.Tensor | None = None,
-    index_k_with_scale_cache: torch.Tensor | None = None,
     page_size: int | None = None,
     index_k_fp8: torch.Tensor | None = None,
     index_k_scale: torch.Tensor | None = None,
@@ -866,11 +865,10 @@ def dsa_prefill_topk(
         row_ends: Exclusive workspace-row end per query token, shape [tokens].
         topk: Number of workspace candidates to select.
         softmax_scale: Score scale, normally index_head_dim ** -0.5.
-        index_k_cache: BF16 index-K cache with shape [slots, head_dim]. Used by
-            Triton together with kv_workspace_slots.
-        index_k_with_scale_cache: Packed FP8 index-K cache with scales. Used by
-            DeepGEMM to gather workspace rows internally.
-        page_size: KV cache page size for index_k_with_scale_cache.
+        index_k_cache: Packed FP8 index-K cache with scales (uint8). Used by
+            Triton with kv_workspace_slots and by DeepGEMM to gather workspace
+            rows internally.
+        page_size: KV cache page size for index_k_cache.
         index_k_fp8: FP8 index-K rows in workspace-row order. Used by DeepGEMM.
         index_k_scale: FP8 index-K scales in workspace-row order. Used by DeepGEMM.
         max_logits_bytes: Optional temporary logits memory cap.
@@ -891,24 +889,14 @@ def dsa_prefill_topk(
         raise ValueError(
             f"lens_out must have shape {(q.shape[0],)}, got {tuple(lens_out.shape)}"
         )
-    if (
-        index_k_cache is not None
-        and index_k_cache.dtype == torch.uint8
-        and index_k_with_scale_cache is None
-    ):
-        index_k_with_scale_cache = index_k_cache
-        index_k_cache = None
     traits = {
         "head_dim": q.shape[-1],
         "topk": int(topk),
     }
-    has_bf16 = index_k_cache is not None and index_k_cache.dtype == torch.bfloat16
-    has_fp8 = index_k_with_scale_cache is not None or (
+    has_fp8 = index_k_cache is not None or (
         index_k_fp8 is not None and index_k_scale is not None
     )
-    if has_bf16 and not has_fp8:
-        traits["index_k_format"] = "bf16"
-    elif has_fp8 and not has_bf16:
+    if has_fp8:
         traits["index_k_format"] = "fp8_scaled"
     signature = _attention_format_signature(q=q, weights=weights)
     kernel = select_kernel(
@@ -945,7 +933,6 @@ def dsa_prefill_topk(
             topk=topk,
             softmax_scale=softmax_scale,
             index_k_cache=index_k_cache,
-            index_k_with_scale_cache=index_k_with_scale_cache,
             page_size=page_size,
             index_k_fp8=index_k_fp8,
             index_k_scale=index_k_scale,
@@ -966,7 +953,6 @@ def dsa_decode_topk(
     softmax_scale: float,
     q_len_per_req: int = 1,
     index_k_cache: torch.Tensor | None = None,
-    index_k_with_scale_cache: torch.Tensor | None = None,
     plan: object | None = None,
     out: torch.Tensor | None = None,
     lens_out: torch.Tensor | None = None,
@@ -984,10 +970,8 @@ def dsa_decode_topk(
         topk: Number of KV candidates to select.
         softmax_scale: Score scale, normally index_head_dim ** -0.5.
         q_len_per_req: Query rows per request. Plain decode uses 1.
-        index_k_cache: BF16 index-K cache with shape [slots, head_dim]. Used by
-            Triton.
-        index_k_with_scale_cache: Packed FP8 index-K cache with scales. Used by
-            DeepGEMM.
+        index_k_cache: Packed FP8 index-K cache with scales (uint8). Used by
+            both Triton and DeepGEMM.
         plan: Optional opaque backend-specific plan.
         out: Optional int32 output buffer with shape [tokens, topk].
         lens_out: Optional int32 output buffer with shape [tokens].
@@ -1005,24 +989,13 @@ def dsa_decode_topk(
         raise ValueError(
             f"lens_out must have shape {(q.shape[0],)}, got {tuple(lens_out.shape)}"
         )
-    if (
-        index_k_cache is not None
-        and index_k_cache.dtype == torch.uint8
-        and index_k_with_scale_cache is None
-    ):
-        index_k_with_scale_cache = index_k_cache
-        index_k_cache = None
     traits = {
         "head_dim": q.shape[-1],
         "topk": int(topk),
         "page_size": int(page_size),
         "q_len_per_req": int(q_len_per_req),
     }
-    has_bf16 = index_k_cache is not None and index_k_cache.dtype == torch.bfloat16
-    has_fp8 = index_k_with_scale_cache is not None
-    if has_bf16 and not has_fp8:
-        traits["index_k_format"] = "bf16"
-    elif has_fp8 and not has_bf16:
+    if index_k_cache is not None:
         traits["index_k_format"] = "fp8_scaled"
     signature = _attention_format_signature(q=q, weights=weights)
     kernel = select_kernel(
@@ -1062,7 +1035,6 @@ def dsa_decode_topk(
             softmax_scale=softmax_scale,
             q_len_per_req=q_len_per_req,
             index_k_cache=index_k_cache,
-            index_k_with_scale_cache=index_k_with_scale_cache,
             plan=plan,
             out=out,
             lens_out=lens_out,

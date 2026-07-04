@@ -152,7 +152,6 @@ if platform.is_nvidia:
         softmax_scale: float,
         q_len_per_req: int = 1,
         index_k_cache: torch.Tensor | None = None,
-        index_k_with_scale_cache: torch.Tensor | None = None,
         plan: object | None = None,
         out: torch.Tensor | None = None,
         lens_out: torch.Tensor | None = None,
@@ -199,11 +198,11 @@ if platform.is_nvidia:
                 int(page_size),
                 deep_gemm.get_num_sms(),
             )
-        kv_cache = index_k_with_scale_cache.view(
+        kv_cache = index_k_cache.view(
             -1,
             int(page_size),
             1,
-            index_k_with_scale_cache.shape[-1],
+            index_k_cache.shape[-1],
         )
         logits = deep_gemm.fp8_paged_mqa_logits(
             q_fp8.view(-1, q_len_per_req, q.shape[1], q.shape[-1]),
@@ -281,7 +280,6 @@ if platform.is_nvidia:
         topk: int,
         softmax_scale: float,
         index_k_cache: torch.Tensor | None = None,
-        index_k_with_scale_cache: torch.Tensor | None = None,
         page_size: int | None = None,
         index_k_fp8: torch.Tensor | None = None,
         index_k_scale: torch.Tensor | None = None,
@@ -320,11 +318,11 @@ if platform.is_nvidia:
             hd = q.shape[-1]
             num_groups = hd // 128
             row_bytes = hd + num_groups * 4
-            flat = index_k_with_scale_cache.reshape(-1)
+            flat = index_k_cache.reshape(-1)
             fp8_view = torch.as_strided(
                 flat.view(q_fp8.dtype),
                 (
-                    index_k_with_scale_cache.shape[0] // int(page_size),
+                    index_k_cache.shape[0] // int(page_size),
                     int(page_size),
                     hd,
                 ),
@@ -333,7 +331,7 @@ if platform.is_nvidia:
             scale_view = torch.as_strided(
                 flat.view(torch.float32),
                 (
-                    index_k_with_scale_cache.shape[0] // int(page_size),
+                    index_k_cache.shape[0] // int(page_size),
                     int(page_size),
                     num_groups,
                 ),
