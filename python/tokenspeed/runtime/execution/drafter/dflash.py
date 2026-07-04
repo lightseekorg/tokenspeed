@@ -143,7 +143,9 @@ class DFlash(BaseDrafter):
             pin_memory=True,
         )
         self.draft_extend_prefix_lens_cpu = torch.zeros(
-            (max_bs,), dtype=torch.int32, pin_memory=True,
+            (max_bs,),
+            dtype=torch.int32,
+            pin_memory=True,
         )
         self.block_offsets = torch.arange(
             self.spec_num_tokens, dtype=torch.int64, device=self.device
@@ -372,9 +374,7 @@ class DFlash(BaseDrafter):
             self.draft_seq_lens_buf[:bs].copy_(
                 old_lens.to(torch.int32) + accept_lengths[:bs].to(torch.int32)
             )
-            self._write_native_cache(
-                hidden, positions, cache_locs, decode_only=True
-            )
+            self._write_native_cache(hidden, positions, cache_locs, decode_only=True)
             return
 
         hidden_chunks = torch.split(hidden, lengths.detach().cpu().tolist(), dim=0)
@@ -567,7 +567,9 @@ class DFlash(BaseDrafter):
             logger.info(
                 "DFLASH fused KV materialization enabled. "
                 "n_layers=%d, num_kv_heads=%d, head_dim=%d",
-                n_layers, num_kv_heads, head_dim,
+                n_layers,
+                num_kv_heads,
+                head_dim,
             )
         except Exception as e:
             logger.warning(
@@ -671,9 +673,7 @@ class DFlash(BaseDrafter):
             )
             if num_extends > 0:
                 indices.add_(num_extends)
-            torch.index_select(
-                output_tokens, 0, indices, out=current[num_extends:]
-            )
+            torch.index_select(output_tokens, 0, indices, out=current[num_extends:])
             # ``accept_lengths`` can be clamped to 0 at the context limit.  The
             # request will be finished by the scheduler, but the drafter still
             # runs for graph shape. Select a valid in-row dummy token instead of
@@ -682,7 +682,9 @@ class DFlash(BaseDrafter):
                 accept_lengths[num_extends:].to(torch.int64).clamp(1, spec_num_tokens)
             )
             current[num_extends:] = output_tokens[
-                self.decode_offsets_buf[:num_decodes] + num_extends + safe_accept_lengths
+                self.decode_offsets_buf[:num_decodes]
+                + num_extends
+                + safe_accept_lengths
             ]
         return current
 
@@ -822,10 +824,14 @@ class DFlash(BaseDrafter):
         if not hasattr(self, "target_model"):
             raise RuntimeError("DFLASH drafter is not bound to a target model.")
 
-        from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_cuda_graph_phase
+        from tokenspeed.runtime.execution.cuda_graph_wrapper import (
+            get_is_cuda_graph_phase,
+        )
 
         decode_only = base_ctx.num_extends == 0
-        capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        capturing = (
+            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        )
         can_overlap = (
             decode_only
             and self._fused_kv_enabled
@@ -871,10 +877,10 @@ class DFlash(BaseDrafter):
         old_lens = self.runtime_states.valid_cache_lengths.index_select(
             0, req_pool_indices
         )
-        max_draft_prefix = self.req_to_page.shape[1] * self.page_size - self.spec_num_tokens
-        torch.add(
-            old_lens, accept_lengths[:bs], out=self.draft_seq_lens_buf[:bs]
+        max_draft_prefix = (
+            self.req_to_page.shape[1] * self.page_size - self.spec_num_tokens
         )
+        torch.add(old_lens, accept_lengths[:bs], out=self.draft_seq_lens_buf[:bs])
         self.draft_seq_lens_buf[:bs].clamp_(max=max_draft_prefix)
 
         # Fork: aux stream runs full KV write (project + fused GEMM + scatter)
@@ -898,7 +904,10 @@ class DFlash(BaseDrafter):
         # Main stream: draft block prep overlaps with aux KV write
         current_tokens = self.block_ids_buf[:bs, 0]
         self._current_tokens_from_output(
-            output_tokens, accept_lengths, 0, self.spec_num_tokens,
+            output_tokens,
+            accept_lengths,
+            0,
+            self.spec_num_tokens,
             out=current_tokens,
         )
         return self._draft_native(current_tokens, kv_sync_event=self._kv_join_event)

@@ -945,9 +945,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 # across the attn TP group; aux consumers (e.g. the DFLASH
                 # drafter) expect full rows, so gather before capturing.
                 aux = (
-                    hidden_states + residual
-                    if residual is not None
-                    else hidden_states
+                    hidden_states + residual if residual is not None else hidden_states
                 )
                 gathered = layer.comm_manager.gather_residual(aux, ctx)
                 aux_hidden_states.append(

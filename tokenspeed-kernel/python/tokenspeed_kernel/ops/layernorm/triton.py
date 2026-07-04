@@ -609,9 +609,7 @@ def fused_qk_rmsnorm_rope(
 
     n_tokens = q.shape[0]
     if n_tokens == 0:
-        q_out = torch.empty(
-            (0, num_q_heads * head_dim), dtype=q.dtype, device=q.device
-        )
+        q_out = torch.empty((0, num_q_heads * head_dim), dtype=q.dtype, device=q.device)
         k_out = torch.empty(
             (0, num_kv_heads * head_dim), dtype=k.dtype, device=k.device
         )

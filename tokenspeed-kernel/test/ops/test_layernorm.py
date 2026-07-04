@@ -430,8 +430,16 @@ def test_fused_qk_rmsnorm_rope(
 
     # --- Fused kernel ---
     q_fused, k_fused = fused_qk_rmsnorm_rope(
-        q, k, q_weight, k_weight, cos_sin_cache, positions,
-        eps, num_q_heads, num_kv_heads, head_dim,
+        q,
+        k,
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        positions,
+        eps,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
     )
 
     # --- Reference: per-head norm then full RoPE ---
@@ -449,12 +457,18 @@ def test_fused_qk_rmsnorm_rope(
     q_ref_heads = q_normed.view(n_tokens, num_q_heads, head_dim)
     k_ref_heads = k_normed.view(n_tokens, num_kv_heads, head_dim)
     q_ref = torch.stack(
-        [_ref_rope_full(q_ref_heads[:, h], cos_sin_cache, positions)
-         for h in range(num_q_heads)], dim=1
+        [
+            _ref_rope_full(q_ref_heads[:, h], cos_sin_cache, positions)
+            for h in range(num_q_heads)
+        ],
+        dim=1,
     ).view(n_tokens, num_q_heads * head_dim)
     k_ref = torch.stack(
-        [_ref_rope_full(k_ref_heads[:, h], cos_sin_cache, positions)
-         for h in range(num_kv_heads)], dim=1
+        [
+            _ref_rope_full(k_ref_heads[:, h], cos_sin_cache, positions)
+            for h in range(num_kv_heads)
+        ],
+        dim=1,
     ).view(n_tokens, num_kv_heads * head_dim)
 
     torch.testing.assert_close(q_fused, q_ref, atol=2e-2, rtol=2e-2)
@@ -493,16 +507,31 @@ def test_fused_qk_rmsnorm_rope_non_contiguous_input(
 
     # Should not crash — non-contiguous inputs handled via stride
     q_fused, k_fused = fused_qk_rmsnorm_rope(
-        q, k, q_weight, k_weight, cos_sin_cache, positions,
-        eps, num_q_heads, num_kv_heads, head_dim,
+        q,
+        k,
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        positions,
+        eps,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
     )
 
     # Compare with contiguous version
     q_contig_fused, k_contig_fused = fused_qk_rmsnorm_rope(
-        q.contiguous(), k.contiguous(), q_weight, k_weight,
-        cos_sin_cache, positions, eps, num_q_heads, num_kv_heads, head_dim,
+        q.contiguous(),
+        k.contiguous(),
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        positions,
+        eps,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
     )
 
     torch.testing.assert_close(q_fused, q_contig_fused, atol=0, rtol=0)
     torch.testing.assert_close(k_fused, k_contig_fused, atol=0, rtol=0)
-

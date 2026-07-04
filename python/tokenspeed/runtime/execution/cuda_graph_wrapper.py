@@ -494,7 +494,9 @@ class CudaGraphWrapper:
 
         from tokenspeed.runtime.execution.drafter.dflash import DFlash
 
-        is_dflash = isinstance(self.drafter, DFlash) if self.drafter is not None else False
+        is_dflash = (
+            isinstance(self.drafter, DFlash) if self.drafter is not None else False
+        )
 
         global _is_cuda_graph_phase
         _is_cuda_graph_phase = True
