@@ -681,7 +681,9 @@ class DFlash(BaseDrafter):
             safe_accept_lengths = (
                 accept_lengths[num_extends:].to(torch.int64).clamp(1, spec_num_tokens)
             )
-            current[num_extends:] = output_tokens[offsets + safe_accept_lengths]
+            current[num_extends:] = output_tokens[
+                self.decode_offsets_buf[:num_decodes] + num_extends + safe_accept_lengths
+            ]
         return current
 
     def get_candidates(self, base_ctx: ForwardContext) -> torch.Tensor | None:
