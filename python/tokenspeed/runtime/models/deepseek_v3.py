@@ -1152,30 +1152,17 @@ class DeepseekV3DecoderLayer(nn.Module):
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
 
-        self.self_attn = DeepseekV3AttentionMLA(
-            config=config,
-            hidden_size=self.hidden_size,
-            num_heads=config.num_attention_heads,
-            qk_nope_head_dim=config.qk_nope_head_dim,
-            qk_rope_head_dim=config.qk_rope_head_dim,
-            v_head_dim=config.v_head_dim,
-            q_lora_rank=(
-                config.q_lora_rank if hasattr(config, "q_lora_rank") else None
-            ),
-            kv_lora_rank=config.kv_lora_rank,
-            rope_theta=rope_theta,
-            rope_scaling=rope_scaling,
-            max_position_embeddings=max_position_embeddings,
-            quant_config=(
-                None
-                if "self_attn" in getattr(config, "disable_quant_module", [])
-                else quant_config
-            ),
-            layer_id=layer_id,
-            prefix=add_prefix("self_attn", prefix),
-            reduce_attn_results=False,
-            alt_stream=alt_stream,
-            mapping=self.mapping,
+        self.self_attn = self._create_attn(
+            config,
+            self.hidden_size,
+            rope_theta,
+            rope_scaling,
+            max_position_embeddings,
+            quant_config,
+            layer_id,
+            prefix,
+            alt_stream,
+            self.mapping,
         )
 
         self.layer_id = layer_id
@@ -1218,6 +1205,43 @@ class DeepseekV3DecoderLayer(nn.Module):
             prev_is_moe=self._is_moe_layer(layer_id - 1, is_nextn, config),
             input_layernorm=self.input_layernorm,
             post_attn_layernorm=self.post_attention_layernorm,
+        )
+
+    def _create_attn(
+        self,
+        config,
+        hidden_size,
+        rope_theta,
+        rope_scaling,
+        max_position_embeddings,
+        quant_config,
+        layer_id,
+        prefix,
+        alt_stream,
+        mapping,
+    ):
+        return DeepseekV3AttentionMLA(
+            config=config,
+            hidden_size=hidden_size,
+            num_heads=config.num_attention_heads,
+            qk_nope_head_dim=config.qk_nope_head_dim,
+            qk_rope_head_dim=config.qk_rope_head_dim,
+            v_head_dim=config.v_head_dim,
+            q_lora_rank=config.q_lora_rank if hasattr(config, "q_lora_rank") else None,
+            kv_lora_rank=config.kv_lora_rank,
+            rope_theta=rope_theta,
+            rope_scaling=rope_scaling,
+            max_position_embeddings=max_position_embeddings,
+            quant_config=(
+                None
+                if "self_attn" in getattr(config, "disable_quant_module", [])
+                else quant_config
+            ),
+            layer_id=layer_id,
+            prefix=add_prefix("self_attn", prefix),
+            reduce_attn_results=False,
+            alt_stream=alt_stream,
+            mapping=mapping,
         )
 
     @staticmethod
@@ -1331,14 +1355,7 @@ class DeepseekV3Model(nn.Module):
         # config.num_hidden_layers = 5; self.start_layer,self.end_layer = 0, 5
         self.layers = nn.ModuleList(
             [
-                DeepseekV3DecoderLayer(
-                    config,
-                    layer_id,
-                    mapping=self.mapping,
-                    quant_config=quant_config,
-                    prefix=add_prefix(f"layers.{layer_id}", prefix),
-                    alt_stream=self.alt_stream,
-                )
+                self._create_decoder_layer(config, layer_id, quant_config, prefix)
                 for layer_id in range(config.num_hidden_layers)
             ]
         )
@@ -1346,6 +1363,16 @@ class DeepseekV3Model(nn.Module):
         # For EAGLE3 support: set of layer indices whose *input* hidden states
         # are captured. Populated by set_eagle3_layers_to_capture().
         self.layers_to_capture: set = set()
+
+    def _create_decoder_layer(self, config, layer_id, quant_config, prefix):
+        return DeepseekV3DecoderLayer(
+            config,
+            layer_id,
+            mapping=self.mapping,
+            quant_config=quant_config,
+            prefix=add_prefix(f"layers.{layer_id}", prefix),
+            alt_stream=self.alt_stream,
+        )
 
     def forward(
         self,
