@@ -335,19 +335,6 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
                 self.assertEqual(len({id(t) for t in pool.v_buffer}), 24)
                 self.assertTrue(pool.supports_hierarchical_kv_cache)
 
-    def test_page_size_bytes_uses_group_size(self):
-        # Slab active: a page carries one group's layers worth of bytes.
-        # 2 (K+V) * 16 (page tokens) * 12 (layers per group) * 1 head *
-        # 8 head_dim * 2 bytes (bf16) = 6144.
-        pool = self._pool()
-        self.assertEqual(pool._get_page_size_bytes(), 6144)
-        self.assertEqual(pool.page_size_bytes, 6144)
-        # Fallback charges all layers:
-        # 2 * 16 * 24 * 1 * 8 * 2 = 12288.
-        pool = self._pool(flat_ext=False)
-        self.assertEqual(pool._get_page_size_bytes(), 12288)
-        self.assertEqual(pool.page_size_bytes, 12288)
-
     def test_guard_raises_on_kvstore_with_slab(self):
         with self.assertRaisesRegex(
             RuntimeError,

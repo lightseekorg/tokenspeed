@@ -40,14 +40,14 @@ struct KvCacheSpec {
 };
 
 // Shared per-request / match data types for the flat KV-cache layer. Consumed
-// by the per-type managers (FullAttnManager, and later SwaManager /
-// MambaManager), the KVCacheCoordinator, and the FSM ForwardState. Kept here --
+// by the per-type managers (FullAttnManager, SwaManager), the
+// KVCacheCoordinator, and the FSM ForwardState. Kept here --
 // not inside any one manager header -- so consumers depend on the data contract
 // rather than on a concrete manager.
 
 // Per-request logical-page -> physical-page mapping plus the incremental
-// allocation cursor. Pure value type, movable. Takes the role LocalKVAllocator
-// holds today; its final home is the FSM ForwardState (a later increment).
+// allocation cursor. Pure value type, movable; owned by the FSM ForwardState
+// (block_tables_) for the request's lifetime.
 class BlockTable {
 public:
     std::span<CacheBlock* const> Blocks() const { return blocks_; }

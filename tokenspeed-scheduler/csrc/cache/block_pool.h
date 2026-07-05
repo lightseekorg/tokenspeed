@@ -99,10 +99,6 @@ public:
     std::int32_t TotalBlocks() const { return total_num_blocks_; }
     std::int32_t NumFreeBlocks() const { return static_cast<std::int32_t>(free_.size()); }
     CacheBlock* NullBlock() { return null_block_; }
-    CacheBlock& BlockAt(std::int32_t block_id) {
-        _assert(0 <= block_id && block_id < total_num_blocks_, "block_id out of range");
-        return blocks_[block_id];
-    }
 
     // nullptr on miss; does NOT change ref counts -- callers TouchBlock() the result to claim it.
     CacheBlock* GetCachedBlock(const std::string& block_hash_with_group) {

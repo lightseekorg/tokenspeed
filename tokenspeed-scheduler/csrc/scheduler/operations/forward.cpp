@@ -98,10 +98,12 @@ CoordinatorMatch Scheduler::matchFlatPrefixAtAdmission(Request* request) const {
     // Hash input must be byte-identical to the REGISTRATION form (GetFullPagedTokens(false)); radix's
     // except_last rule (last prompt token recomputed for logits) becomes the page cap, also bounding SWA.
     const std::int32_t cap_pages = std::max((request->PrefillSize() - 1) / config_.page_size, 0);
-    const std::vector<std::string> flat_hashes = FlatWindowPageHashes(
-        request->GetFullPagedTokens(/*except_last=*/false), config_.page_size, 0, request->PrefillSize());
-    const std::size_t bounded = std::min(flat_hashes.size(), static_cast<std::size_t>(cap_pages));
-    return coordinator_.MatchPrefix(std::span<const std::string>(flat_hashes).first(bounded));
+    std::vector<std::span<const std::int32_t>> paged_tokens = request->GetFullPagedTokens(/*except_last=*/false);
+    if (static_cast<std::size_t>(cap_pages) < paged_tokens.size()) {
+        paged_tokens.resize(cap_pages);
+    }
+    const std::vector<std::string> flat_hashes = ComputePagedHashes(paged_tokens, "");
+    return coordinator_.MatchPrefix(flat_hashes);
 }
 
 // TODO(radix-removal): radix EnsureCapacityByEvict gates never bind on flat builds; the flatAdmit* gates own admission.
@@ -114,7 +116,7 @@ std::optional<std::int32_t> Scheduler::flatAdmitFirstChunk(Request* request, con
     const std::int32_t blocks_needed = coordinator_.BlocksNeededFor(chunk_tokens + decode_reserve_tokens);
     // The claim consumes free-list blocks Acquire never sees; exact since gate and apply run back to back.
     const std::int32_t claim_blocks = coordinator_.BlocksConsumedByClaim(hit);
-    if (blocks_needed + claim_blocks > block_pool_.NumFreeBlocks() - flatReservedPagesExcept(request->Id())) {
+    if (blocks_needed + claim_blocks > flatFreeBudget(request->Id())) {
         return std::nullopt;
     }
     // Reserve need is computed on the post-prefill table shape now, never recomputed against drifted state.
@@ -130,7 +132,7 @@ std::optional<std::int32_t> Scheduler::flatAdmitPrefillChunk(Request* request, s
         coordinator_.BlocksFreedByAdvance(request->FlatBlockTablesRef(), num_computed_tokens);
     const std::int32_t blocks_needed =
         coordinator_.BlocksNeededFor(request->FlatBlockTablesRef(), chunk_tokens + decode_reserve_tokens);
-    if (blocks_needed > block_pool_.NumFreeBlocks() + slide_credit - flatReservedPagesExcept(request->Id())) {
+    if (blocks_needed > flatFreeBudget(request->Id()) + slide_credit) {
         return std::nullopt;
     }
     // The pending slide cannot drift the reserve: AdvanceWindow punches front holes, BlocksNeededFor reads tail_avail.
@@ -149,7 +151,7 @@ bool Scheduler::flatAdmitDecode(Request* request) const {
         coordinator_.BlocksFreedByAdvance(request->FlatBlockTablesRef(), num_computed_tokens);
     const std::int32_t blocks_needed = coordinator_.BlocksNeededFor(
         request->FlatBlockTablesRef(), request->GetReserveNumTokensInNextScheduleEvent());
-    return blocks_needed <= block_pool_.NumFreeBlocks() + slide_credit - flatReservedPagesExcept(request->Id());
+    return blocks_needed <= flatFreeBudget(request->Id()) + slide_credit;
 }
 
 // Deferred count when this round can never unwedge itself; fused-only (PD requests hold pages outside both ledgers).
@@ -157,7 +159,7 @@ std::optional<std::size_t> Scheduler::flatStarvationDeadlockRisk(const std::vect
     std::size_t deferred = 0;
     for (const Request* req : candidates) {
         if (req->Is<fsm::Submitted>() || req->Is<fsm::PrefetchDone>() || req->Is<fsm::Prefilling>() ||
-            req->Is<fsm::PrefillDone>() || req->Is<fsm::Decoding>() || req->Is<fsm::Retracted>()) {
+            req->Is<fsm::PrefillDone>() || req->Is<fsm::Decoding>()) {
             ++deferred;
         }
     }

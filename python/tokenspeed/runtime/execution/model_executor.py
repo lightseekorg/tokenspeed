@@ -923,6 +923,8 @@ class ModelExecutor:
                 )
                 if rid not in self._seen_prefill_ids
             )
+            if len(self._seen_prefill_ids) > 100_000:
+                self._seen_prefill_ids.clear()  # log-dedup only; bound the growth
             self._seen_prefill_ids.update(forward_op.request_ids[:num_extends])
             logger.info(
                 "%s batch. #new-seq: %s, #new-token: %s, #cached-token: %s, "

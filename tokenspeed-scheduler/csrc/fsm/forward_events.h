@@ -235,8 +235,8 @@ struct FinishEvent : InvalidTransitionHandler<FinishEvent> {
 #endif
                          )
         : kv_prefix_cache_(kv_prefix_cache),
-          host_allocator_(host_allocator),
           page_hashes_(std::move(page_hashes)),
+          host_allocator_(host_allocator),
           disable_l2_cache_(disable_l2_cache),
           hybrid_prefix_cache_(hybrid_prefix_cache)
 #if TOKENSPEED_FLAT_KVCACHE
@@ -251,7 +251,7 @@ struct FinishEvent : InvalidTransitionHandler<FinishEvent> {
 
     // Retracting: writeback already in-flight.
     WritingBack operator()(Retracting&& state);
-    Finished operator()(Retracted&& state) { return Finished{}; };
+    Finished operator()(Retracted&& state) { return Finished{}; }
     // Defensive: late forward finish after terminalization, stay Finished.
     Finished operator()(Finished&& state) { return std::move(state); }
 

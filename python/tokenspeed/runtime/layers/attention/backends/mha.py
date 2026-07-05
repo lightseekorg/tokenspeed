@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -618,8 +619,6 @@ class MHAAttnBackend(AttentionBackend):
         be real and inside the group's table. Not for graph-padded batches:
         dummy rows resolve to page 0 and would trip the non-hole assert.
         """
-        import os
-
         if os.environ.get("TOKENSPEED_FLAT_DEBUG") != "1":
             return
         for gid, locs in out_cache_locs.items():

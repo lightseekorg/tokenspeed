@@ -82,7 +82,6 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         self._slab_group_size = hybrid_slab_group_size(
             self._layer_types, speculative_enabled=speculative_enabled
         )
-        self.page_size_bytes = self._get_page_size_bytes()
         self._create_buffers()
 
         self.device_module = torch.get_device_module(self.device)
@@ -135,17 +134,9 @@ class MHATokenToKVPool(BaseTokenToKVPool):
                 max_total_tokens=size,
                 max_context_len=max_context_len,
             )
-
-    def _get_page_size_bytes(self):
-        # Slab layout: a page carries one group's layers, not all layers.
-        return (
-            2
-            * self.page_size
-            * (self._slab_group_size or self.layer_num)
-            * self.head_num
-            * self.head_dim
-            * torch._utils._element_size(self.dtype)
-        )
+        # Slab aliasing is only safe under the single-BlockPool ownership the
+        # published groups configure.
+        assert self._slab_group_size is None or self.paged_cache_group_specs
 
     def _slab_pair_index(self) -> list[int]:
         """Map layer_id -> slab index: the i-th layer of every group binds

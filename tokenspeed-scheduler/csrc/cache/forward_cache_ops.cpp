@@ -34,19 +34,16 @@ bool PrefillFirstChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>&
 bool PrefillChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
                   std::span<const std::string> content_hashes, std::int32_t num_tokens,
                   std::int32_t num_computed_tokens) {
-    // CacheFullBlocks before AdvanceWindow: registration skips null holes, so
-    // the reverse order would lose the punched pages' hashes forever.
-    // AdvanceWindow before Acquire: the slide's freed pages fund this chunk
-    // (admission gates credit them via BlocksFreedByAdvance in lockstep).
-    coordinator.CacheFullBlocks(tables, content_hashes);
-    coordinator.AdvanceWindow(tables, num_computed_tokens);
-    return coordinator.Acquire(tables, num_tokens);
+    return DecodeStep(coordinator, tables, content_hashes, /*first_page_slot=*/0, num_tokens, num_computed_tokens);
 }
 
 bool DecodeStep(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
                 std::span<const std::string> content_hashes, std::int32_t first_page_slot,
                 std::int32_t num_tokens, std::int32_t num_computed_tokens) {
-    // register -> slide -> acquire: ordering rationale in PrefillChunk above.
+    // CacheFullBlocks before AdvanceWindow: registration skips null holes, so
+    // the reverse order would lose the punched pages' hashes forever.
+    // AdvanceWindow before Acquire: the slide's freed pages fund this chunk
+    // (admission gates credit them via BlocksFreedByAdvance in lockstep).
     coordinator.CacheFullBlocks(tables, content_hashes, first_page_slot);
     coordinator.AdvanceWindow(tables, num_computed_tokens);
     return coordinator.Acquire(tables, num_tokens);
@@ -55,9 +52,7 @@ bool DecodeStep(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables
 bool FinalizePrefillAndReserveDecode(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
                                      std::span<const std::string> content_hashes, std::int32_t reserve_tokens,
                                      std::int32_t num_computed_tokens) {
-    coordinator.CacheFullBlocks(tables, content_hashes);
-    coordinator.AdvanceWindow(tables, num_computed_tokens);
-    return coordinator.Acquire(tables, reserve_tokens);
+    return PrefillChunk(coordinator, tables, content_hashes, reserve_tokens, num_computed_tokens);
 }
 
 std::vector<KvCacheSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {

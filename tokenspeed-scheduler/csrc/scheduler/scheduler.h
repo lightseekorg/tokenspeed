@@ -195,6 +195,11 @@ private:
         }
         return total;
     }
+
+    // Pool budget the flat gates charge against: free blocks minus other requests' decode reservations.
+    std::int32_t flatFreeBudget(const std::string& request_id) const {
+        return block_pool_.NumFreeBlocks() - flatReservedPagesExcept(request_id);
+    }
 #endif
 
 private:
