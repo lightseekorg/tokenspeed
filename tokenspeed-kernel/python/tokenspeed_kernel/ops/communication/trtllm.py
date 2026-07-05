@@ -39,6 +39,7 @@ __all__ = [
     "reducescatter_residual_rmsnorm",
     "trtllm_allreduce_fusion",
     "trtllm_create_ipc_workspace_for_all_reduce_fusion",
+    "trtllm_destroy_ipc_workspace_for_all_reduce_fusion",
     "trtllm_create_ipc_workspace_for_minimax",
 ]
 
@@ -51,6 +52,7 @@ minimax_allreduce_rms_qk = error_fn
 reducescatter_residual_rmsnorm = error_fn
 trtllm_allreduce_fusion = error_fn
 trtllm_create_ipc_workspace_for_all_reduce_fusion = error_fn
+trtllm_destroy_ipc_workspace_for_all_reduce_fusion = error_fn
 trtllm_create_ipc_workspace_for_minimax = error_fn
 
 if current_platform().is_nvidia:
