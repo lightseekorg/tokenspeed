@@ -535,11 +535,17 @@ class EventLoop:
         # _pending_cache_event_payloads) diverges transiently. A rank-local skip
         # would let some ranks gather while others return, deadlocking the group.
         # Agree on the skip via a cheap single-int all_reduce.
+        # NOTE: For non-DFLASH algorithms, cache ops are deterministic across
+        # ranks, so the local short-circuit is safe and avoids collective overhead.
         local_has_work = bool(
             self._num_inflight_cache_ops != 0 or self._pending_cache_event_payloads
         )
-        if not self._cache_group_has_work(local_has_work):
-            return
+        if self.server_args.speculative_algorithm == "DFLASH":
+            if not self._cache_group_has_work(local_has_work):
+                return
+        else:
+            if not local_has_work:
+                return
 
         ready_payloads = self._pop_ready_cache_event_payloads()
         if not ready_payloads:
