@@ -54,6 +54,7 @@ __all__ = [
     "mha_prefill",
     "mha_extend_with_kvcache",
     "mha_decode_with_kvcache",
+    "gdn_chunk_prefill",
     "mla_prefill",
     "mla_decode_with_kvcache",
     "dsa_prefill",
@@ -66,6 +67,113 @@ __all__ = [
 ]
 
 LSE_LN = math.log2(math.e)
+
+
+# ===-----------------------------------------------------------------------===#
+# GDN Kernels
+# ===-----------------------------------------------------------------------===#
+
+
+def gdn_chunk_prefill(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    *,
+    scale: float | None,
+    initial_state: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    qk_l2norm: bool = False,
+    output_final_state: bool = True,
+    output_h: bool = False,
+    override: str | None = None,
+    solution: str | None = None,
+) -> (
+    tuple[torch.Tensor, torch.Tensor]
+    | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+):
+    """Run Gated Delta Net chunked prefill through kernel selection.
+
+    Args:
+        q: Query tensor shaped ``[1, total_tokens, num_q_heads, head_dim]``.
+        k: Key tensor shaped ``[1, total_tokens, num_k_heads, head_dim]``.
+        v: Value tensor shaped ``[1, total_tokens, num_v_heads, head_v_dim]``.
+        g: Log-space forget gate shaped ``[1, total_tokens, num_v_heads]``.
+        beta: Beta gate shaped ``[1, total_tokens, num_v_heads]``.
+        scale: Attention scale. ``None`` lets the implementation use its default.
+        initial_state: Recurrent state shaped ``[batch, num_v_heads, head_dim, head_v_dim]``.
+        cu_seqlens: Cumulative sequence lengths for variable-length prefill.
+        qk_l2norm: Whether the selected kernel should L2-normalize Q/K.
+        output_final_state: Whether to return the final recurrent state.
+        output_h: Whether to return intermediate recurrent checkpoints. Backends
+            may return native checkpoint layouts.
+        override: Optional kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+
+    Returns:
+        ``(out, final_state)``, Triton/FLA-style ``(out, final_state, h)``, or
+        FlashInfer-style ``(out, final_state, h, h_cu_starts)``.
+    """
+    head_dim = q.shape[-1]
+    head_v_dim = v.shape[-1]
+    num_q_heads = q.shape[-2]
+    num_v_heads = v.shape[-2]
+    traits = {
+        "head_dim": head_dim,
+        "head_v_dim": head_v_dim,
+        "head_v_eq_head_k": head_v_dim == k.shape[-1],
+        "num_v_gte_num_q": num_v_heads >= num_q_heads,
+        "qk_l2norm": qk_l2norm,
+        "output_h": output_h,
+    }
+    signature = _attention_format_signature(q=q, k=k, v=v)
+    kernel = select_kernel(
+        "attention",
+        "gdn_chunk_prefill",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+
+    shape_params = {
+        "batch_size": cu_seqlens.shape[0] - 1,
+        "total_tokens": q.shape[1] if q.dim() == 4 else q.shape[0],
+        "num_q_heads": num_q_heads,
+        "num_v_heads": num_v_heads,
+        "head_dim": head_dim,
+        "head_v_dim": head_v_dim,
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "gdn_chunk_prefill",
+        kernel.name,
+        q.dtype,
+        shape_params,
+    )
+
+    with kernel_scope(
+        "attention",
+        "gdn_chunk_prefill",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            scale=scale,
+            initial_state=initial_state,
+            cu_seqlens=cu_seqlens,
+            qk_l2norm=qk_l2norm,
+            output_final_state=output_final_state,
+            output_h=output_h,
+        )
 
 
 # ===-----------------------------------------------------------------------===#

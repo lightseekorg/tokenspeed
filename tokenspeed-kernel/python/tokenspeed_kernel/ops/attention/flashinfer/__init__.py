@@ -37,6 +37,11 @@ from tokenspeed_kernel.signature import (
 
 platform = current_platform()
 
+# Side-effect registration for FlashInfer GDN kernels.
+from tokenspeed_kernel.ops.attention.flashinfer import (  # noqa: E402,F401
+    gated_delta_rule as _gdn,
+)
+
 BatchDecodeWithPagedKVCacheWrapper = ErrorClass
 BatchMLAPagedAttentionWrapper = ErrorClass
 BatchPrefillWithPagedKVCacheWrapper = ErrorClass

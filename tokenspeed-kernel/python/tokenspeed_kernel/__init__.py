@@ -29,6 +29,7 @@ from tokenspeed_kernel.ops.attention import (
     dsa_plan,
     dsa_prefill,
     dsa_prefill_topk,
+    gdn_chunk_prefill,
     mha_decode_with_kvcache,
     mha_extend_with_kvcache,
     mha_plan,
@@ -67,6 +68,7 @@ __all__ = [
     "dsa_decode_topk",
     "dsa_plan",
     "attn_merge_state",
+    "gdn_chunk_prefill",
     # moe
     "moe_apply",
     "moe_plan",
