@@ -392,6 +392,17 @@ class TestSpecMatchesShapeTraits:
         assert spec_matches_shape_traits(spec, {"N": 32})
         assert not spec_matches_shape_traits(spec, {"N": 30})
 
+    def test_required_n256_alignment_trait_matches(self):
+        spec = KernelSpec(
+            name="k",
+            family="f",
+            mode="m",
+            traits={"n_align_256": frozenset({True})},
+        )
+
+        assert spec_matches_shape_traits(spec, {"N": 512})
+        assert not spec_matches_shape_traits(spec, {"N": 384})
+
     def test_missing_shape_dim_is_ignored(self):
         spec = KernelSpec(
             name="k",
@@ -401,6 +412,41 @@ class TestSpecMatchesShapeTraits:
         )
 
         assert spec_matches_shape_traits(spec, {})
+
+    def test_required_k64_alignment_trait_matches(self):
+        spec = KernelSpec(
+            name="k",
+            family="f",
+            mode="m",
+            traits={"k_align_64": frozenset({True})},
+        )
+
+        assert spec_matches_shape_traits(spec, {"K": 128})
+        assert not spec_matches_shape_traits(spec, {"K": 96})
+
+    def test_required_maximum_trait_matches(self):
+        spec = KernelSpec(
+            name="k",
+            family="f",
+            mode="m",
+            traits={"m_max_256": frozenset({True})},
+        )
+
+        assert spec_matches_shape_traits(spec, {"M": 128})
+        assert spec_matches_shape_traits(spec, {"M": 256})
+        assert not spec_matches_shape_traits(spec, {"M": 512})
+
+    def test_required_minimum_trait_matches(self):
+        spec = KernelSpec(
+            name="k",
+            family="f",
+            mode="m",
+            traits={"m_min_2048": frozenset({True})},
+        )
+
+        assert not spec_matches_shape_traits(spec, {"M": 1024})
+        assert spec_matches_shape_traits(spec, {"M": 2048})
+        assert spec_matches_shape_traits(spec, {"M": 4096})
 
     def test_non_alignment_traits_do_not_affect_shape_matching(self):
         spec = KernelSpec(
@@ -1457,3 +1503,35 @@ class TestGemmDispatchProfiling:
                 },
             )
         ]
+
+    def test_mm_falls_back_to_torch_when_dense_kernel_returns_none(self):
+        call_log: list[str] = []
+        seen_block_sizes: list[list[int] | None] = []
+        kernel_name = "test_none_mm"
+
+        def _impl(
+            A: torch.Tensor,
+            B: torch.Tensor,
+            A_scales: torch.Tensor | None,
+            B_scales: torch.Tensor | None,
+            out_dtype: torch.dtype,
+            *,
+            alpha: torch.Tensor | None = None,
+            block_size: list[int] | None = None,
+        ) -> None:
+            _ = A, B, A_scales, B_scales, out_dtype, alpha
+            call_log.append(kernel_name)
+            seen_block_sizes.append(block_size)
+            return None
+
+        self._register_kernel(kernel_name, "gluon", _impl)
+
+        A = torch.randn(4, 8, dtype=torch.float16)
+        B = torch.randn(6, 8, dtype=torch.float16)
+
+        with kernel_override("gemm", "mm", kernel_name):
+            out = gemm.mm(A, B, out_dtype=torch.float16, block_size=[128, 128])
+
+        torch.testing.assert_close(out, torch.mm(A, B.T))
+        assert call_log == [kernel_name]
+        assert seen_block_sizes == [[128, 128]]

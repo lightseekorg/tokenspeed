@@ -1,10 +1,18 @@
 Portions of this project are based on or inspired by designs and code from the following projects:
 
 Notice for triton-lang/triton
--------------------------------
+-----------------------------
 MIT License
 
 Copyright contributors to the Triton project
+
+Licensed under the MIT License, whose full license text is available below.
+
+Notice for ROCm/gfx950-gluon-tutorials
+--------------------------------------
+MIT License
+
+Copyright (c) 2026 AMD ROCm(TM) Software
 
 Licensed under the MIT License, whose full license text is available below.
 

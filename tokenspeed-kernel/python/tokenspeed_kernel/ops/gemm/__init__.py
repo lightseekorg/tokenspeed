@@ -26,6 +26,7 @@ import logging
 import tokenspeed_kernel.numerics.reference.gemm  # noqa: F401
 import tokenspeed_kernel.ops.gemm.deep_gemm  # noqa: F401
 import tokenspeed_kernel.ops.gemm.flashinfer  # noqa: F401
+import tokenspeed_kernel.ops.gemm.gluon  # noqa: F401
 import tokenspeed_kernel.ops.gemm.triton  # noqa: F401
 import tokenspeed_kernel.ops.gemm.trtllm  # noqa: F401
 import torch
@@ -282,10 +283,16 @@ def mm(
         N = B.shape[-1] if B.shape[0] == K else B.shape[0]
 
     traits: dict[str, object] = {
+        "m_max_256": M <= 256,
+        "m_min_2048": M >= 2048,
+        "gfx950_dense16_gluon": M <= 256
+        or (M >= 2048 and M % 256 == 0 and N % 256 == 0 and K >= 256 and K % 128 == 0),
         "n_align_16": N % 16 == 0,
         "k_align_16": K % 16 == 0,
         "n_align_64": N % 64 == 0,
         "n_align_128": N % 128 == 0,
+        "n_align_256": N % 256 == 0,
+        "k_align_64": K % 64 == 0,
         "k_align_128": K % 128 == 0,
     }
 
@@ -336,6 +343,18 @@ def mm(
         **shape_params,
     ):
         output = kernel(*kernel_args, **kernel_kwargs)
+
+    if output is None:
+        if quant not in (None, "none") or A_scales is not None or B_scales is not None:
+            raise RuntimeError(
+                f"Kernel {kernel.name!r} reported no support for non-dense GEMM"
+            )
+        output = torch.mm(A, B.T)
+        if alpha is not None:
+            output = output * alpha.to(dtype=output.dtype)
+        if output.dtype != out_dtype:
+            output = output.to(out_dtype)
+        fused_bias = False
 
     if bias is not None and not fused_bias:
         output = output + bias.to(dtype=output.dtype)

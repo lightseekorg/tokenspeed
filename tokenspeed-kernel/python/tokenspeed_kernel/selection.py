@@ -483,8 +483,16 @@ def spec_matches_shape_traits(spec: KernelSpec, shape: dict[str, Any]) -> bool:
         "n_align_16": ("N", 16),
         "n_align_64": ("N", 64),
         "n_align_128": ("N", 128),
+        "n_align_256": ("N", 256),
         "k_align_16": ("K", 16),
+        "k_align_64": ("K", 64),
         "k_align_128": ("K", 128),
+    }
+    maximum_traits: dict[str, tuple[str, int]] = {
+        "m_max_256": ("M", 256),
+    }
+    minimum_traits: dict[str, tuple[str, int]] = {
+        "m_min_2048": ("M", 2048),
     }
 
     for trait_name, (dim_name, alignment) in alignment_traits.items():
@@ -494,6 +502,24 @@ def spec_matches_shape_traits(spec: KernelSpec, shape: dict[str, Any]) -> bool:
 
         dim = shape.get(dim_name)
         if isinstance(dim, int) and dim % alignment != 0:
+            return False
+
+    for trait_name, (dim_name, maximum) in maximum_traits.items():
+        values = spec.traits.get(trait_name)
+        if values is None or True not in values:
+            continue
+
+        dim = shape.get(dim_name)
+        if isinstance(dim, int) and dim > maximum:
+            return False
+
+    for trait_name, (dim_name, minimum) in minimum_traits.items():
+        values = spec.traits.get(trait_name)
+        if values is None or True not in values:
+            continue
+
+        dim = shape.get(dim_name)
+        if isinstance(dim, int) and dim < minimum:
             return False
 
     return True
