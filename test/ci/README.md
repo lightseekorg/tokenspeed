@@ -55,3 +55,7 @@ The CI system derives `SM` from common runner label prefixes by default:
 `h100`/`h200` use `sm90`, `b200`/`gb200` use `sm100`, and `b300`/`gb300` use
 `sm103`. Use `runner.env.<label>` only for environment variables that should
 override or extend the defaults for a single runner label.
+
+PR workflows split runner labels by vendor and host architecture. `PR Test
+NVIDIA` uses the `nvidia-x86` runner group, while `PR Test NVIDIA ARM` uses
+the `nvidia-arm` runner group for `gb200` labels.

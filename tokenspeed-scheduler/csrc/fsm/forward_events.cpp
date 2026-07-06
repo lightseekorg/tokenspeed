@@ -124,9 +124,21 @@ void InsertHybridCache(HybridPrefixCache* hybrid_cache,
         return;
     }
 
+    // Allocator may hold fewer pages than new_page_count by insert time; clamp page-aligned so
+    // prefix + inserted == full (a count-only clamp would relocate the overflow into Insert's TakeLast).
+    const std::vector<std::span<const std::int32_t>>* tokens_for_insert = &full_paged_tokens;
+    std::vector<std::span<const std::int32_t>> clamped_tokens;
+    const std::int32_t avail = static_cast<std::int32_t>(local_kv_allocator->PageCount());
+    if (new_page_count > avail) {
+        const std::int32_t keep = static_cast<std::int32_t>(prefix_pages->size()) + avail;
+        clamped_tokens.assign(full_paged_tokens.begin(), full_paged_tokens.begin() + keep);
+        tokens_for_insert = &clamped_tokens;
+        new_page_count = avail;
+    }
+
     OwnedPages pages_to_insert = local_kv_allocator->TakeFirst(new_page_count);
-    auto insert_result = hybrid_cache->GetKVPrefixCache().Insert<ResourceType::Device>(full_paged_tokens, *prefix_pages,
-                                                                                       std::move(pages_to_insert));
+    auto insert_result = hybrid_cache->GetKVPrefixCache().Insert<ResourceType::Device>(
+        *tokens_for_insert, *prefix_pages, std::move(pages_to_insert));
 
     if (local_mamba_allocator != nullptr && local_mamba_allocator->HasCheckpoint()) {
         const bool publish = ShouldPublishMambaCheckpoint(hybrid_cache, chunk_begin, chunk_size, page_size);
@@ -368,6 +380,13 @@ std::variant<Draining, Finished> FinishEvent::apply(ForwardStateT&& state) {
         alloc_count = owned_pages;
     }
     if (alloc_count > 0) {
+        // Same page-aligned clamp as InsertHybridCache, keeping prefix + inserted == full.
+        const std::int32_t avail = static_cast<std::int32_t>(local_allocator->PageCount());
+        if (alloc_count > avail) {
+            full_paged_tokens.resize(prefix_pages.size() + avail);
+            alloc_count =
+                static_cast<std::int32_t>(full_paged_tokens.size()) - static_cast<std::int32_t>(prefix_pages.size());
+        }
         OwnedPages alloc_pages = local_allocator->TakeFirst(alloc_count);
 
         kv_prefix_cache_->Insert<ResourceType::Device>(full_paged_tokens, prefix_pages, std::move(alloc_pages),

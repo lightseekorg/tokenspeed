@@ -545,7 +545,7 @@ class ServerArgs:
                 int(x) for x in self.eagle3_layers_to_capture.split(",")
             ]
 
-        # Hoist the PD-decode runtime assert (topk == 1) to startup.
+        # Hoist the PD-decode topk == 1 check to startup.
         if self.speculative_algorithm is not None and self.speculative_eagle_topk != 1:
             raise ValueError(
                 "speculative_eagle_topk > 1 (tree spec) is not currently "
@@ -604,9 +604,12 @@ class ServerArgs:
             self.disaggregation_mode == "prefill"
             and self.load_balance_method != "round_robin"
         ):
-            assert (
-                not self.mapping.has_attn_dp
-            ), f"Not Supported when {self.disaggregation_mode=} {self.load_balance_method=} {self.mapping.attn.dp_size=}"
+            if self.mapping.has_attn_dp:
+                raise ValueError(
+                    "Not supported when "
+                    f"{self.disaggregation_mode=} {self.load_balance_method=} "
+                    f"{self.mapping.attn.dp_size=}"
+                )
 
     def _handle_kvstore(self):
         if self.disaggregation_mode in ("decode", "encode"):
@@ -1324,17 +1327,26 @@ class ServerArgs:
         parser.add_argument(
             "--sampling-backend",
             type=str,
-            choices=["greedy", "flashinfer", "flashinfer_full"],
+            choices=[
+                "greedy",
+                "flashinfer",
+                "flashinfer_full",
+                "triton",
+                "triton_full",
+            ],
             default=ServerArgs.sampling_backend,
             help="Sampling backend. "
-            "When unspecified, defaults to 'flashinfer' on NVIDIA and 'greedy' elsewhere. "
             "'greedy': argmax + verify_chain_greedy, zero sampling-param plumbing. "
             "'flashinfer': temperature/top_k/top_p via fused softmax + top_k_top_p_sampling_from_probs; "
             "min_p and penalties silently ignored. "
+            "'triton': temperature/top_k/top_p via MRV2-style logits-to-Gumbel-Max; "
+            "min_p and penalties silently ignored. "
             "'flashinfer_full': adds min_p plus frequency/presence/repetition penalties and logit_bias "
             "via the softmax+renorm+min_p kernel sequence. "
+            "'triton_full': adds min_p plus frequency/presence/repetition penalties and logit_bias "
+            "with Triton Gumbel-Max for single-step sampling. "
             "Allocates a counts[max_req_pool_size, vocab_size] int32 buffer (substantial memory). "
-            "Both 'flashinfer' and 'flashinfer_full' require top_k < 128 (fused kernel limit) or -1.",
+            "Finite top_k values must be < 128 or -1.",
         )
         parser.add_argument(
             "--dp-sampling",
@@ -1915,9 +1927,10 @@ class PortArgs:
             dist_init_addr = ("127.0.0.1", server_args.port + ZMQ_TCP_PORT_DELTA)
         else:
             dist_init_addr = server_args.dist_init_addr.split(":")
-        assert (
-            len(dist_init_addr) == 2
-        ), "please provide --dist-init-addr as host:port of head node"
+        if len(dist_init_addr) != 2:
+            raise ValueError(
+                "please provide --dist-init-addr as host:port of head node"
+            )
 
         dist_init_host, dist_init_port = dist_init_addr
         dist_init_port = int(dist_init_port)

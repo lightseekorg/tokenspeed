@@ -50,7 +50,7 @@ class KVCachePool:
         device_pool.register_layer_transfer_counter(self._counter)
 
     @property
-    def device(self):
+    def device(self) -> torch.device | str:
         return self.device_pool.device
 
     @property
@@ -114,7 +114,7 @@ class KVCachePool:
                 self.io_backend,
             )
 
-    def alloc_host(self, n: int):
+    def alloc_host(self, n: int) -> torch.Tensor | None:
         return self.host_pool.alloc(n)
 
     def free_host(self, indices: torch.Tensor) -> None:

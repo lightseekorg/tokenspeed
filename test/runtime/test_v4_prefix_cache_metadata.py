@@ -110,18 +110,30 @@ def _prime_r1(sched: "Scheduler") -> tuple[list[int], list[int]]:
     return r1_fh, r1_swa
 
 
-def _submit_r2_same_prefix(sched: "Scheduler") -> None:
+def _submit_r2_same_prefix(sched: "Scheduler") -> int:
     spec = RequestSpec()
     spec.request_id = "r2"
     spec.tokens = list(range(1, 13))
     sched.submit_requests([spec])
-    sched.next_execution_plan()
+    plan = sched.next_execution_plan()
+    assert len(plan.forward) == 1
+    forward = plan.forward[0]
+    assert forward.request_ids == ["r2"]
+    assert len(forward.extend_prefix_lens) == 1
+    return int(forward.extend_prefix_lens[0])
 
 
 class TestV4PrefixCacheMetadata(unittest.TestCase):
 
     def setUp(self) -> None:
-        self.sched = Scheduler(_make_two_group_config())
+        config = _make_two_group_config()
+        fh_config = next(
+            group for group in config.paged_cache_groups if group.group_id == "fh"
+        )
+        self.fh_raw_tokens_per_page = (
+            fh_config.rows_per_page * fh_config.entry_stride_tokens
+        )
+        self.sched = Scheduler(config)
         self.r1_fh, self.r1_swa = _prime_r1(self.sched)
         self.assertNotEqual(
             self.r1_fh,
@@ -133,19 +145,25 @@ class TestV4PrefixCacheMetadata(unittest.TestCase):
             [],
             "r1 swa page ids must be captured before finish releases the request table",
         )
-        _submit_r2_same_prefix(self.sched)
+        self.r2_prefix_len = _submit_r2_same_prefix(self.sched)
 
     def test_block_table_borrowed_plus_suffix(self) -> None:
         """R2's table starts with r1's borrowed prefix page ids."""
         r2_fh = list(self.sched.get_request_paged_cache_page_ids("r2", "fh"))
-        self.assertGreaterEqual(len(r2_fh), 1)
-        n = min(len(self.r1_fh), len(r2_fh))
+        self.assertEqual(self.r2_prefix_len % self.fh_raw_tokens_per_page, 0)
+        borrowed_pages = self.r2_prefix_len // self.fh_raw_tokens_per_page
         self.assertGreater(
-            n,
+            borrowed_pages,
             0,
             "r2 must borrow at least one fh page from r1's prefix snapshot",
         )
-        self.assertEqual(r2_fh[:n], self.r1_fh[:n])
+        self.assertGreaterEqual(len(self.r1_fh), borrowed_pages)
+        self.assertGreater(
+            len(r2_fh),
+            borrowed_pages,
+            "r2 must allocate a suffix after its borrowed prefix pages",
+        )
+        self.assertEqual(r2_fh[:borrowed_pages], self.r1_fh[:borrowed_pages])
 
     def test_base_offsets_sliding_correct(self) -> None:
         """For sliding-window groups the per-request base_logical_page

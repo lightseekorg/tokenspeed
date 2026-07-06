@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT AND Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 LightSeek Foundation
+# SPDX-FileCopyrightText: Copyright 2023-2024 SGLang Team
+#
 # Copyright (c) 2026 LightSeek Foundation
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -140,8 +144,6 @@ def store_kv_cache(
 # -----------------------------------------------------------------------------
 
 
-# Adapted from meituan-longcat/SGLang-FluentLLM. This code may incorporate
-# material from ModelTC/lightllm, vllm-project/vllm, and sgl-project/sglang.
 @triton.jit
 def _process_fp8_kv_tensor(
     token_id,

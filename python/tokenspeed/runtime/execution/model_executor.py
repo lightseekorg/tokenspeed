@@ -106,6 +106,9 @@ class ModelExecutorConfig:
     Created once via from_server_args() and injected into ModelExecutor.
     """
 
+    # Rank-local graph-padding req-pool index. The C++ scheduler owns real rows
+    # 1..max_batch_size and row 0 is reserved, so this must sit after the
+    # scheduler-owned range.
     max_req_pool_size: int
     output_length: int
     enforce_eager: bool
@@ -135,6 +138,7 @@ class ModelExecutorConfig:
     spec_num_steps: int | None = None
     # spec_num_tokens == spec_num_steps + 1 for now (without Tree Attention)
     spec_num_tokens: int | None = None
+    overlap_schedule_depth: int = 0
     dp_sampling: bool = False
     dp_sampling_min_bs: int | None = None
     use_v4_mtp_paged_metadata: bool = False
@@ -156,6 +160,7 @@ class ModelExecutorConfig:
         gpu_id: int,
         global_rank: int,
         num_total_pages: int,
+        overlap_schedule_depth: int = 0,
     ) -> ModelExecutorConfig:
         output_length = (
             server_args.speculative_num_draft_tokens
@@ -189,6 +194,7 @@ class ModelExecutorConfig:
             spec_algo=server_args.speculative_algorithm,
             spec_num_steps=server_args.speculative_num_steps,
             spec_num_tokens=server_args.speculative_num_draft_tokens,
+            overlap_schedule_depth=overlap_schedule_depth,
             dp_sampling=server_args.dp_sampling,
             dp_sampling_min_bs=server_args.dp_sampling_min_bs,
             enable_nan_detection=server_args.enable_nan_detection,
@@ -227,14 +233,16 @@ class ModelExecutor:
         self._layerwise_mamba_cow_done = None
 
         if config.spec_algo is not None:
-            # The overlap scheduler reserves a fresh draft block per decode step
-            # a request stays scheduled, including the few steps it lingers
-            # between finishing and eviction, so peak page count runs ~1 page past
-            # context_len + spec_num_tokens. Without headroom req_to_page
-            # overflows and the next draft block's page write goes out of bounds,
-            # hanging the attention kernel. Pad generously; a few int32 columns
-            # per request.
-            draft_block_reservation_slack = config.spec_num_tokens * 64
+            # The DFLASH overlap scheduler reserves a fresh draft block per
+            # decode step a request stays scheduled, including the few steps it
+            # lingers between finishing and eviction, so peak page count runs
+            # ~1 page past context_len + spec_num_tokens. Without headroom
+            # req_to_page overflows and the next draft block's page write goes
+            # out of bounds, hanging the attention kernel. Pad generously; a few
+            # int32 columns per request. Non-DFLASH algorithms do not need this.
+            draft_block_reservation_slack = (
+                config.spec_num_tokens * 64 if config.spec_algo == "DFLASH" else 0
+            )
             max_num_pages_per_req = (
                 config.context_len
                 + config.spec_num_tokens
@@ -247,6 +255,8 @@ class ModelExecutor:
                 config.context_len + config.block_size
             ) // config.block_size
 
+        max_bs = config.max_num_seqs // max(config.data_parallel_size, 1)
+
         self.req_to_page = torch.zeros(
             (config.max_req_pool_size + 1, max_num_pages_per_req),
             dtype=torch.int32,
@@ -254,7 +264,7 @@ class ModelExecutor:
         )
         spec_num_tokens = config.spec_num_tokens if config.spec_algo is not None else 1
         self.input_buffers = InputBuffers(
-            max_bs=config.max_num_seqs // max(config.data_parallel_size, 1),
+            max_bs=max_bs,
             max_num_tokens=config.chunked_prefill_size,
             page_size=config.block_size,
             # token_to_kv_pool allocates size+page_size slots; index `size` is
@@ -275,7 +285,7 @@ class ModelExecutor:
         # Sized like InputBuffers.max_bs so the padded graph-bucket bs fits.
         self.nan_guard = NanGuard.create(
             config.enable_nan_detection,
-            config.max_num_seqs // max(config.data_parallel_size, 1),
+            max_bs,
             self.device,
         )
         if self.config.spec_algo is not None:
@@ -345,14 +355,14 @@ class ModelExecutor:
             )
             if use_captured:
                 self.grammar_runtime = CapturableGrammarExecutor(
-                    max_bs=config.max_num_seqs,
+                    max_bs=max_bs,
                     vocab_size=config.vocab_size,
                     max_tokens_per_req=spec_num_tokens,
                     device=self.device,
                 )
             else:
                 self.grammar_runtime = EagerGrammarBuffers(
-                    max_bs=config.max_num_seqs // max(config.data_parallel_size, 1),
+                    max_bs=max_bs,
                     vocab_size=config.vocab_size,
                     max_tokens_per_req=spec_num_tokens,
                     device=self.device,
@@ -447,11 +457,6 @@ class ModelExecutor:
             sampling_backend=self.sampling_backend,
             runtime_states=self.runtime_states,
         )
-
-        # CUDA graph warmup runs the drafter with dummy data whose
-        # uninitialized KV cache produces NaN → argmax sentinel -1.
-        # Clear the residue so pool slots reused by real requests start clean.
-        self.runtime_states.future_input_map.zero_()
 
         # Encoder CUDA graph: install model-built wrappers by overriding
         # modality encoder callables (e.g. ``image_encoder``, ``video_encoder``).
@@ -675,9 +680,10 @@ class ModelExecutor:
             accept_lengths = self._apply_force_single_token_verify(
                 accept_lengths, 0, num_decodes, ctx.decode_input_ids
             )
-            accept_lengths = self._cap_accept_to_context_len(
-                accept_lengths, sampling_info.req_pool_indices[:num_decodes]
-            )
+            if self.config.spec_algo == "DFLASH":
+                accept_lengths = self._cap_accept_to_context_len(
+                    accept_lengths, sampling_info.req_pool_indices[:num_decodes]
+                )
             return output_tokens, accept_lengths
 
         logits = logits_output.next_token_logits
@@ -692,9 +698,10 @@ class ModelExecutor:
         decode_accept = self._apply_force_single_token_verify(
             decode_accept, num_extends, num_decodes, ctx.decode_input_ids
         )
-        decode_accept = self._cap_accept_to_context_len(
-            decode_accept, sampling_info.req_pool_indices[num_extends:]
-        )
+        if self.config.spec_algo == "DFLASH":
+            decode_accept = self._cap_accept_to_context_len(
+                decode_accept, sampling_info.req_pool_indices[num_extends:]
+            )
         if (
             prefill_out.next_token_logprobs is not None
             and decode_out.next_token_logprobs is not None
@@ -785,19 +792,10 @@ class ModelExecutor:
             logits_output, sampling_info, ctx, candidates
         )
 
-        # Single choke point for every (sample/verify) x (greedy/flashinfer)
-        # path: NaN logits (e.g. DP dummy/warmup batches over uninitialized KV)
-        # make sampling argmax emit the -1 sentinel. Left unclamped, that -1 poisons
-        # both consumers below -- it flows into output_ids -> detokenizer (the
-        # HF Rust tokenizer raises OverflowError on a negative id and kills the
-        # engine) and, via the drafter, back into future_input_map as the next
-        # round's input_ids (negative embedding index -> garbage / CUDA illegal
-        # access). Clamp in place (this runs inside the CUDA graph) so grammar,
-        # drafter, and the return value all observe clean ids. Mirror of the
-        # draft-side draft_ids.clamp_(min=0) guard.
-        # Record which requests produced bad ids before the clamp erases them.
+        # Backstop: flag any request whose sampled id falls outside [0, vocab)
+        # so the output processor can terminate it. Covers sampler/verify kernel
+        # corruption and DP-sharded steps that audit_logits cannot attribute.
         self.nan_guard.merge_oov(output_tokens, ctx, self.runtime_states.vocab_size)
-        output_tokens.clamp_(min=0)
 
         # Fork sampler-output D2H onto the grammar side stream so the
         # next step's build hostfunc can advance the matcher.
@@ -1024,12 +1022,17 @@ class ModelExecutor:
             req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
             working = self.input_buffers.mamba_pool_indices_buf[:bs]
 
-            src_raw = pool.current_input_indices[req_pool_indices.clamp(0).long()].to(
-                dtype=torch.int64
-            )
+            req = req_pool_indices.to(dtype=torch.int64)
+            current_input_size = int(pool.current_input_indices.shape[0])
+            in_bounds = (req >= 0) & (req < current_input_size)
+            safe_req = req.clamp(0, current_input_size - 1)
+            src_raw = pool.current_input_indices[safe_req].to(dtype=torch.int64)
+            src_raw = torch.where(in_bounds, src_raw, sentinel)
             dst_raw = working.to(dtype=torch.int64)
 
-            invalid = (src_raw < 0) | (dst_raw < 0) | (src_raw == dst_raw)
+            invalid = (
+                (~in_bounds) | (src_raw < 0) | (dst_raw < 0) | (src_raw == dst_raw)
+            )
             src = torch.where(invalid, sentinel, src_raw)
             dst = torch.where(invalid, sentinel, dst_raw)
 
@@ -1322,6 +1325,15 @@ class ModelExecutor:
         ).to(self.device, non_blocking=True)
         self.attn_backend.reset_current_inputs(req_pool_tensor, mamba_tensor)
 
+    @staticmethod
+    def _contains_retracted_decode(forward_op) -> bool:
+        # FlatForwardOperation stores hist_token_lens for decode rows only;
+        # non-recovery rows use -1.
+        return any(
+            hist_token_len != -1
+            for hist_token_len in getattr(forward_op, "hist_token_lens", ())
+        )
+
     @nvtx_range("reset_valid_cache_length", color="orange")
     def reset_valid_cache_length(self, forward_op) -> None:
 
@@ -1329,10 +1341,10 @@ class ModelExecutor:
         is_prefill = num_extends > 0
 
         # Retraction recovery: scheduler pushes -1 per decode op, overriding to
-        # a real length only on ScheduleDecodeFromRetractedEvent.
-        has_retract = not is_prefill and any(
-            x != -1 for x in forward_op.hist_token_lens
-        )
+        # a real length only on ScheduleDecodeFromRetractedEvent. Decode rows
+        # may follow prefill rows in a mixed batch, so this cannot be gated on
+        # pure-decode mode.
+        has_retract = self._contains_retracted_decode(forward_op)
 
         # Pure decode without retraction has nothing to do — skip the
         # cross-stream wait + stream-context entry entirely.
@@ -1346,15 +1358,15 @@ class ModelExecutor:
                 device="cpu",
                 pin_memory=True,
             )
-            all_pool_indices = torch.tensor(
-                forward_op.request_pool_indices,
+            decode_pool_indices = torch.tensor(
+                forward_op.request_pool_indices[num_extends:],
                 dtype=torch.int64,
                 device="cpu",
                 pin_memory=True,
             )
         else:
             hist_token_lens_tensor = None
-            all_pool_indices = None
+            decode_pool_indices = None
 
         self.execution_stream.wait_stream(torch.cuda.current_stream())
 
@@ -1378,11 +1390,11 @@ class ModelExecutor:
                     extend_request_pool_indices, extend_prefix_lens
                 )
 
-            elif hist_token_lens_tensor is not None:
+            if hist_token_lens_tensor is not None:
                 # Apply retraction recovery: override valid_cache_lengths with hist_token_lens
                 # where the scheduler has specified a non-(-1) value, so that out_cache_loc
                 # and position IDs are computed against the retracted KV length.
-                pool_idx_dev = all_pool_indices.to(self.device, non_blocking=True)
+                pool_idx_dev = decode_pool_indices.to(self.device, non_blocking=True)
                 hist_dev = hist_token_lens_tensor.to(self.device, non_blocking=True)
 
                 mask_1d = hist_dev != -1
@@ -1453,6 +1465,50 @@ class ModelExecutor:
             )
         return reset_mask
 
+    def _reset_mamba_current_inputs(
+        self,
+        *,
+        num_extends: int,
+        bs: int,
+        has_retract: bool,
+        mamba_pool_indices: torch.Tensor,
+        mamba_cow_src: torch.Tensor,
+        skipped_layerwise_cow_mask: torch.Tensor | None,
+    ) -> None:
+        if not hasattr(self.attn_backend, "reset_current_inputs"):
+            return
+
+        if num_extends > 0:
+            self.attn_backend.reset_current_inputs(
+                self.input_buffers.req_pool_indices_buf[:num_extends],
+                mamba_pool_indices[:num_extends],
+            )
+
+        if not has_retract:
+            return
+
+        # FlatForwardOperation places prefill rows first. Restrict recovery to
+        # the decode suffix so a prefix-cache COW on a prefill row cannot be
+        # mistaken for a retracted decode.
+        decode_begin = num_extends
+        decode_count = bs - decode_begin
+        if decode_count <= 0:
+            return
+        skipped_decode_mask = (
+            skipped_layerwise_cow_mask[decode_begin:bs]
+            if skipped_layerwise_cow_mask is not None
+            else None
+        )
+        retract_mask = self._mamba_retract_reset_mask(
+            mamba_cow_src[decode_begin:bs],
+            decode_count,
+            skipped_decode_mask,
+        )
+        self.attn_backend.reset_current_inputs(
+            self.input_buffers.req_pool_indices_buf[decode_begin:bs][retract_mask],
+            mamba_pool_indices[decode_begin:bs][retract_mask],
+        )
+
     def execute_forward_op(
         self,
         forward_op,
@@ -1479,9 +1535,7 @@ class ModelExecutor:
         graph_padded_bs = 0
 
         with nvtx_range("pre_fill_setup", color="orange"):
-            has_retract = num_extends <= 0 and any(
-                x != -1 for x in getattr(forward_op, "hist_token_lens", [])
-            )
+            has_retract = self._contains_retracted_decode(forward_op)
 
             # Wait for previous iteration's runtime state updates
             # (future_input_map, valid_cache_lengths) on execution_stream to
@@ -1533,22 +1587,14 @@ class ModelExecutor:
                         self.input_buffers.extend_prefix_lens_buf[:num_extends],
                         num_extends,
                     )
-                    if hasattr(self.attn_backend, "reset_current_inputs"):
-                        self.attn_backend.reset_current_inputs(
-                            self.input_buffers.req_pool_indices_buf[:num_extends],
-                            mamba_pool_indices[:num_extends],
-                        )
-                elif has_retract:
-                    if hasattr(self.attn_backend, "reset_current_inputs"):
-                        retract_mask = self._mamba_retract_reset_mask(
-                            mamba_cow_src,
-                            bs,
-                            skipped_layerwise_cow_mask,
-                        )
-                        self.attn_backend.reset_current_inputs(
-                            self.input_buffers.req_pool_indices_buf[:bs][retract_mask],
-                            mamba_pool_indices[:bs][retract_mask],
-                        )
+                self._reset_mamba_current_inputs(
+                    num_extends=num_extends,
+                    bs=bs,
+                    has_retract=has_retract,
+                    mamba_pool_indices=mamba_pool_indices,
+                    mamba_cow_src=mamba_cow_src,
+                    skipped_layerwise_cow_mask=skipped_layerwise_cow_mask,
+                )
 
             grammar_completion = None
 
@@ -1725,13 +1771,14 @@ class ModelExecutor:
                             time.perf_counter() - forward_step_start
                         ) * 1000.0
 
-                # Clamp the committed-length delta so no request grows past
-                # context_len. Done here (outside the graph) so it reaches both
-                # _update_runtime_state and the scheduler page reservation; see
-                # _clamp_committed_to_context_len.
-                output_lengths = self._clamp_committed_to_context_len(
-                    output_lengths, num_extends, bs
-                )
+                if self.config.spec_algo == "DFLASH":
+                    # Clamp the committed-length delta so no request grows past
+                    # context_len. Done here (outside the graph) so it reaches
+                    # both _update_runtime_state and the scheduler page
+                    # reservation; see _clamp_committed_to_context_len.
+                    output_lengths = self._clamp_committed_to_context_len(
+                        output_lengths, num_extends, bs
+                    )
 
                 # Update runtime state on execution_stream (NOT in the CUDA graph).
                 self._update_runtime_state(

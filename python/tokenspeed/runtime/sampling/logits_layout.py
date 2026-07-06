@@ -73,12 +73,14 @@ class LogitsLayoutExecutor:
     ) -> torch.Tensor:
         n = self._tokens_per_req(plan)
         rows = hidden_states.shape[0]
-        assert rows % n == 0, f"hidden_states have {rows} rows, not divisible by N={n}"
+        if rows % n != 0:
+            raise ValueError(f"hidden_states have {rows} rows, not divisible by N={n}")
         bs = rows // n
-        assert bs == plan.effective_bs, (
-            f"hidden_states imply effective_bs={bs}, but logits layout plan has "
-            f"effective_bs={plan.effective_bs}"
-        )
+        if bs != plan.effective_bs:
+            raise ValueError(
+                f"hidden_states imply effective_bs={bs}, but logits layout plan has "
+                f"effective_bs={plan.effective_bs}"
+            )
         pad_rows = (plan.bucket_bs - plan.effective_bs) * n
         if pad_rows > 0:
             hidden_states = torch.nn.functional.pad(hidden_states, (0, 0, 0, pad_rows))
@@ -93,12 +95,14 @@ class LogitsLayoutExecutor:
     ) -> torch.Tensor:
         n = self._tokens_per_req(plan)
         rows = local_logits.shape[0]
-        assert rows % n == 0, f"local logits have {rows} rows, not divisible by N={n}"
+        if rows % n != 0:
+            raise ValueError(f"local logits have {rows} rows, not divisible by N={n}")
         bs = rows // n
-        assert bs == plan.effective_bs, (
-            f"local logits imply effective_bs={bs}, but logits layout plan has "
-            f"effective_bs={plan.effective_bs}"
-        )
+        if bs != plan.effective_bs:
+            raise ValueError(
+                f"local logits imply effective_bs={bs}, but logits layout plan has "
+                f"effective_bs={plan.effective_bs}"
+            )
         pad_rows = (plan.bucket_bs - plan.effective_bs) * n
         if pad_rows > 0:
             local_logits = torch.nn.functional.pad(local_logits, (0, 0, 0, pad_rows))

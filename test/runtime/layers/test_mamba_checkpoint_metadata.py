@@ -35,6 +35,28 @@ def _new_backend(page_size: int = 64) -> MambaAttnBackend:
     return backend
 
 
+def test_simple_mamba_pool_current_input_map_uses_rank_local_req_pool_range():
+    pool = SimpleMambaPool(
+        size=48,
+        num_mamba_layers=1,
+        conv_state_shape=(4,),
+        temporal_state_shape=(2, 2),
+        conv_dtype=torch.float32,
+        ssm_dtype=torch.float32,
+        mamba_layer_ids=[0],
+        device="cpu",
+        page_size=64,
+        speculative_num_draft_tokens=4,
+        max_req_pool_size=21,
+    )
+
+    assert pool.current_input_size == 22
+    assert pool.current_input_indices.shape[0] == 22
+    # MTP draft slots are addressed by rank-local req_pool_idx, plus one
+    # graph-padding sink row after the scheduler-owned 1-based range.
+    assert pool.total_size == 48 + 22 * 3
+
+
 def test_extend_tracks_final_page_boundary_when_branch_checkpoint_is_inside():
     backend = _new_backend(page_size=64)
 

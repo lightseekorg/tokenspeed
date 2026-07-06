@@ -22,7 +22,6 @@ import struct
 import threading
 import time
 from dataclasses import dataclass
-from typing import Optional
 
 import numpy as np
 import numpy.typing as npt
@@ -57,7 +56,7 @@ from tokenspeed.runtime.disaggregation.kv.mooncake.decode import (
 
 def _get_prefill_parallel_info_from_server(
     bootstrap_addr,
-) -> Optional[PrefillParallelInfo]:
+) -> PrefillParallelInfo | None:
     """Fetch the prefill parallel info from the bootstrap server."""
     try:
         url = f"http://{bootstrap_addr}/route?engine_rank={-1}&target_dp_group={-1}"
@@ -90,8 +89,8 @@ def _get_prefill_parallel_info_from_server(
                 response.text,
             )
             return None
-    except Exception as e:
-        logger.error("Error fetching prefill parallel info from bootstrap: %s", e)
+    except Exception as exc:
+        logger.error("Error fetching prefill parallel info from bootstrap: %s", exc)
         return None
 
 
@@ -110,8 +109,8 @@ def _get_bootstrap_info_from_server(bootstrap_addr, engine_rank, target_dp_group
                 response.text,
             )
             return None
-    except Exception as e:
-        logger.error("Error fetching prefill info from bootstrap: %s", e)
+    except Exception as exc:
+        logger.error("Error fetching prefill info from bootstrap: %s", exc)
         return None
 
 
@@ -368,7 +367,10 @@ def _calc(kv_mgr, prefill_parallel_info: PrefillParallelInfo) -> ReceiverRoutePl
     local_tp_size_per_dp_rank = kv_mgr.world_size // kv_mgr.dp_size
 
     if prefill_parallel_info.enable_mla_l1_5_cache:
-        assert kv_mgr.is_mla_backend, "PD with  is not yet supported for non-MLA models"
+        if not kv_mgr.is_mla_backend:
+            raise RuntimeError(
+                "PD with MLA L1.5 cache is not yet supported for non-MLA models"
+            )
         return _legacy_mla_route_plan(
             target_tp_rank=None,
             target_tp_ranks=range(prefill_tp_size_per_dp_rank),
@@ -472,7 +474,8 @@ class MooncakeKVReceiver:
                 )
                 self.kv_mgr.update_status(self.bootstrap_room, TransferPoll.Failed)
             else:
-                assert len(bootstrap_infos) > 0
+                if not bootstrap_infos:
+                    raise RuntimeError("Could not fetch bootstrap info.")
                 self.bootstrap_infos = bootstrap_infos
                 self.kv_mgr.connection_pool[bootstrap_key] = self.bootstrap_infos
                 # Register kv_args only once to prefill KVManager according to the info fetched from the bootstrap server
@@ -594,10 +597,10 @@ class MooncakeKVReceiver:
     def prefill(
         self,
         kv_indices: npt.NDArray[np.int64],
-        aux_index: Optional[int] = None,
-        decode_prefix_len: Optional[int] = 0,
-        mla_l1_5_args: Optional[PageTransferMetadata] = None,
-        mamba_indices: Optional[npt.NDArray[np.int64]] = None,
+        aux_index: int | None = None,
+        decode_prefix_len: int | None = 0,
+        mla_l1_5_args: PageTransferMetadata | None = None,
+        mamba_indices: npt.NDArray[np.int64] | None = None,
     ):
         logger.info(
             "[MooncakeKVReceiver.init] bootstrap_room=%s kv_indices_len=%d aux_index=%s decode_prefix_len=%s",

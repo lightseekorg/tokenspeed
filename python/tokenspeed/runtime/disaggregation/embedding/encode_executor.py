@@ -25,7 +25,6 @@ onto each item, and hand the contiguous embeddings to the Mooncake sender.
 from __future__ import annotations
 
 import logging
-from typing import List, Tuple
 
 import torch
 
@@ -41,7 +40,7 @@ logger = logging.getLogger(__name__)
 
 
 def assign_encoded_embeddings(
-    items: List[MultimodalDataItem],
+    items: list[MultimodalDataItem],
     output: torch.Tensor,
     model,
 ) -> None:
@@ -132,12 +131,12 @@ class DisaggEncodeExecutor:
         # parked chunk holds the slot's pointer until bootstrap_time_out and is
         # re-sent on late receiver registration; see _lease_slot), so a full ring
         # DEFERS the send rather than overwriting an in-flight slot.
-        self._slot_rooms: List = [None] * self._ring_slots
+        self._slot_rooms: list = [None] * self._ring_slots
         # Sends whose ViT output is ready but could not lease a free ring slot
         # (all slots still hold in-flight transfers). Retried non-blocking by
         # drain_deferred() each loop tick (a busy-wait here would GIL-starve the
         # daemon transfer-workers that free the slots and deadlock the loop).
-        self._deferred_sends: List = []
+        self._deferred_sends: list = []
 
     def register(self, request_id, bootstrap_host, bootstrap_port, bootstrap_room):
         self.senders[request_id] = MooncakeEmbeddingSender(
@@ -156,7 +155,7 @@ class DisaggEncodeExecutor:
             return self.model.get_video_feature
         raise ValueError(f"unsupported modality for encode: {modality}")
 
-    def execute(self, request_items: List[Tuple[str, MultimodalDataItem]]) -> None:
+    def execute(self, request_items: list[tuple[str, MultimodalDataItem]]) -> None:
         by_modality = {}
         for _, item in request_items:
             by_modality.setdefault(item.modality, []).append(item)
@@ -180,7 +179,7 @@ class DisaggEncodeExecutor:
         for buf in self._main_ring:
             self.manager.engine.register(buf.data_ptr(), self._ring_bytes)
 
-    def _copy_into(self, ring, slot: int, src) -> Tuple[int, int]:
+    def _copy_into(self, ring, slot: int, src) -> tuple[int, int]:
         """Copy ``src``'s bytes into pre-registered ring ``slot``; return its
         (device pointer, byte length). Fails loud if an embedding exceeds a slot."""
         nbytes = src.numel() * src.element_size()
@@ -220,7 +219,7 @@ class DisaggEncodeExecutor:
                     return slot
         return None
 
-    def _stage_and_send(self, items: List[Tuple[str, MultimodalDataItem]]) -> None:
+    def _stage_and_send(self, items: list[tuple[str, MultimodalDataItem]]) -> None:
         """Lease a ring slot per item and ship it; items that cannot lease a free
         slot (ring full) are DEFERRED for a later non-blocking retry rather than
         blocking the loop. Stages every leased item then issues ONE stream sync

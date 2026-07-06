@@ -68,7 +68,8 @@ class PagedAttention(nn.Module):
     ):
         if k is not None:
             # For cross-layer sharing, kv can be None
-            assert v is not None
+            if v is None:
+                raise ValueError("v must be provided when k is provided.")
             if "k_pe" not in kwargs:
                 k = k.view(-1, self.tp_k_head_num, self.qk_head_dim)
                 v = v.view(-1, self.tp_v_head_num, self.v_head_dim)

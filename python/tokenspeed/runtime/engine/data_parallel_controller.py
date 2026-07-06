@@ -323,9 +323,8 @@ class DataParallelController:
 
     def single_robin_scheduler(self, req):
         worker_id = int(os.environ.get("SINGLE_WORKER_ID", "-1"))
-        assert worker_id > -1 and worker_id < (
-            self.server_args.mapping.attn.dp_size - 1
-        ), f"Invalid SINGLE_WORKER_ID:{worker_id}"
+        if not 0 <= worker_id < self.server_args.mapping.attn.dp_size - 1:
+            raise ValueError(f"Invalid SINGLE_WORKER_ID:{worker_id}")
         self.workers[worker_id].send_pyobj(req)
 
     def budget_scheduler(self, req):

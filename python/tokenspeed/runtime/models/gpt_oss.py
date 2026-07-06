@@ -60,7 +60,10 @@ from tokenspeed.runtime.models.base import (
     BaseTransformerModel,
     CompiledMoEDecoderLayer,
 )
-from tokenspeed.runtime.models.utils import create_fused_set_kv_buffer_arg
+from tokenspeed.runtime.models.utils import (
+    create_fused_set_kv_buffer_arg,
+    validate_attention_partition,
+)
 from tokenspeed.runtime.utils import add_prefix, get_colorful_logger
 from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.pdl import pdl_enabled
@@ -143,13 +146,13 @@ class GptOssAttention(nn.Module):
         attn_tp_group = self.mapping.attn.tp_group
 
         self.total_num_heads = num_heads
-        assert self.total_num_heads % attn_tp_size == 0
-        self.num_heads = self.total_num_heads // attn_tp_size
         self.total_num_kv_heads = num_kv_heads
-        if self.total_num_kv_heads >= attn_tp_size:
-            assert self.total_num_kv_heads % attn_tp_size == 0
-        else:
-            assert attn_tp_size % self.total_num_kv_heads == 0
+        validate_attention_partition(
+            self.total_num_heads,
+            self.total_num_kv_heads,
+            attn_tp_size,
+        )
+        self.num_heads = self.total_num_heads // attn_tp_size
         self.num_kv_heads = max(1, self.total_num_kv_heads // attn_tp_size)
         self.head_dim = head_dim or hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
@@ -198,7 +201,8 @@ class GptOssAttention(nn.Module):
             rope_scaling=rope_scaling,
         )
 
-        assert layer_type in {"sliding_attention", "full_attention"}
+        if layer_type not in {"sliding_attention", "full_attention"}:
+            raise ValueError(f"Unsupported attention layer_type: {layer_type}.")
         use_sliding_window = layer_type == "sliding_attention"
         self.attn = PagedAttention(
             self.num_heads,
@@ -590,7 +594,8 @@ class GptOssForCausalLM(BaseCausalLM):
         quant_config_name = (
             self.quant_config.get_name() if self.quant_config is not None else None
         )
-        assert not is_nextn
+        if is_nextn:
+            raise ValueError("GPT-OSS does not support nextn weight loading.")
 
         if quant_config_name == "mxfp4":
             self._load_mxfp4_weights(weights, weight_name_mapping=weight_name_mapping)
@@ -706,7 +711,7 @@ class GptOssForCausalLM(BaseCausalLM):
 
         if rank == 0:
             if len(not_loaded_params) > 0:
-                raise Exception(f"Not all parameters loaded: {not_loaded_params=}")
+                raise RuntimeError(f"Not all parameters loaded: {not_loaded_params=}")
             else:
                 logger.info("All parameters loaded successfully.")
 

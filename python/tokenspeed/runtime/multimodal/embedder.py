@@ -55,8 +55,9 @@ from __future__ import annotations
 import logging
 import time
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any
 
 import torch
 from torch import nn
@@ -70,7 +71,7 @@ from tokenspeed.runtime.multimodal.inputs import (
 from tokenspeed.runtime.multimodal.shm_transport import ShmTensorHandle
 from tokenspeed.runtime.utils.env import envs
 
-EncoderFn = Callable[[List[MultimodalDataItem]], torch.Tensor]
+EncoderFn = Callable[[list[MultimodalDataItem]], torch.Tensor]
 
 logger = logging.getLogger(__name__)
 LOG_MM_TIMING = envs.TOKENSPEED_LOG_MM_TIMING.get()
@@ -94,7 +95,7 @@ class EncoderSpec:
 # ---------------------------------------------------------------------------
 
 
-def pad_input_tokens(input_ids: List[int], mm_inputs: MultimodalInputs) -> List[int]:
+def pad_input_tokens(input_ids: list[int], mm_inputs: MultimodalInputs) -> list[int]:
     """Substitute placeholder token IDs with each item's ``pad_value``.
 
     The gateway produces ``input_ids`` with a single placeholder token
@@ -153,11 +154,11 @@ class EncodePlan:
     ``scatter_ranges`` describes every place a vision token must land.
     """
 
-    misses_by_modality: Dict[Modality, List[MultimodalDataItem]] = field(
+    misses_by_modality: dict[Modality, list[MultimodalDataItem]] = field(
         default_factory=lambda: defaultdict(list)
     )
-    scatter_ranges: List[ScatterRange] = field(default_factory=list)
-    aliases_by_canonical: Dict[MultimodalDataItem, List[MultimodalDataItem]] = field(
+    scatter_ranges: list[ScatterRange] = field(default_factory=list)
+    aliases_by_canonical: dict[MultimodalDataItem, list[MultimodalDataItem]] = field(
         default_factory=lambda: defaultdict(list)
     )
 
@@ -182,7 +183,7 @@ class VisionEmbedder:
     """Vision-aware input embedding pipeline for one model executor."""
 
     def __init__(self) -> None:
-        self._h2d_stream: Optional[torch.cuda.Stream] = None
+        self._h2d_stream: torch.cuda.Stream | None = None
 
     # --- public entry point ------------------------------------------------
 
@@ -190,11 +191,11 @@ class VisionEmbedder:
         self,
         input_ids: torch.Tensor,
         text_embedding: nn.Embedding,
-        ctx: Optional[MultimodalForwardContext],
-        encoders: Dict[Modality, EncoderSpec],
+        ctx: MultimodalForwardContext | None,
+        encoders: dict[Modality, EncoderSpec],
         multimodal_model: nn.Module,
         is_decode_or_idle: bool = False,
-    ) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
+    ) -> tuple[torch.Tensor | None, dict[str, Any]]:
         """Compose LM input embeddings with vision tokens scattered in.
 
         Returns ``(None, {})`` when there is nothing multimodal to do this
@@ -283,7 +284,7 @@ class VisionEmbedder:
 
         # Within-batch dedup: first item per content hash is canonical;
         # duplicates reuse its encoded tensor.
-        canonical_by_hash: Dict[int, MultimodalDataItem] = {}
+        canonical_by_hash: dict[int, MultimodalDataItem] = {}
         scheduled: set[MultimodalDataItem] = set()
 
         # Walk the FULL batch (including text-only / decode requests)
@@ -354,7 +355,7 @@ class VisionEmbedder:
     def _encode(
         self,
         plan: EncodePlan,
-        encoders: Dict[Modality, EncoderSpec],
+        encoders: dict[Modality, EncoderSpec],
         multimodal_model: nn.Module,
         device: torch.device,
     ) -> None:
@@ -428,9 +429,9 @@ class VisionEmbedder:
         input_ids: torch.Tensor,
         text_embedding: nn.Embedding,
         plan: EncodePlan,
-        encoders: Dict[Modality, EncoderSpec],
+        encoders: dict[Modality, EncoderSpec],
         multimodal_model: nn.Module,
-    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
         # Placeholder positions hold large content-derived IDs that exceed
         # vocab_size; the lookup we run here is overwritten for those rows
         # by the scatter below, but the lookup still needs valid indices.
@@ -438,8 +439,8 @@ class VisionEmbedder:
         safe_ids = input_ids.clamp(min=0, max=vocab_size - 1)
         input_embeds = text_embedding(safe_ids)
 
-        kwargs: Dict[str, Any] = {}
-        deepstack_buffer: Optional[torch.Tensor] = None
+        kwargs: dict[str, Any] = {}
+        deepstack_buffer: torch.Tensor | None = None
         if any(spec.deepstack for spec in encoders.values()):
             num_deepstack = len(multimodal_model.deepstack_visual_indexes)
             shape = input_embeds.shape[:-1] + (input_embeds.shape[-1] * num_deepstack,)
@@ -478,7 +479,7 @@ class VisionEmbedder:
         return self._h2d_stream
 
     def _move_pixel_features_to_device(
-        self, items: List[MultimodalDataItem], device: torch.device
+        self, items: list[MultimodalDataItem], device: torch.device
     ) -> None:
         """Stage pixel features onto ``device`` on a dedicated H2D stream.
 

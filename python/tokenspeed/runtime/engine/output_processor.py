@@ -38,9 +38,9 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
-import os
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from tokenspeed.runtime.engine.collector import RequestOutputCollector
@@ -149,11 +149,11 @@ class OutputProcessor:
                         i,
                     )
                     meta_info.update(logprobs_info)
-                except Exception as e:
+                except Exception as exc:
                     logger.warning(
                         "Failed to attach logprobs for rid=%s: %s. Returning response without logprobs.",
                         rid,
-                        e,
+                        exc,
                     )
 
             if not isinstance(recv_obj, BatchEmbeddingOut):
@@ -294,7 +294,6 @@ class OutputProcessor:
                     if output_multi_ids is not None:
                         out_dict["output_multi_ids"] = output_multi_ids
             else:
-                assert isinstance(recv_obj, BatchEmbeddingOut)
                 out_dict = {
                     "embedding": recv_obj.embeddings[i],
                     "meta_info": meta_info,
@@ -392,9 +391,9 @@ class OutputProcessor:
         )
 
         if len(self.engine.dump_request_list) >= self.engine.dump_requests_threshold:
-            filename = os.path.join(
-                self.engine.dump_requests_folder,
-                datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".pkl",
+            dump_folder = Path(self.engine.dump_requests_folder)
+            filename = dump_folder / (
+                datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".pkl"
             )
             logger.info(
                 "Dump %s requests to %s", len(self.engine.dump_request_list), filename
@@ -403,12 +402,10 @@ class OutputProcessor:
             to_dump = self.engine.dump_request_list
             self.engine.dump_request_list = []
 
-            dump_folder = self.engine.dump_requests_folder
-
             def background_task():
-                os.makedirs(dump_folder, exist_ok=True)
-                with open(filename, "wb") as f:
-                    _pickle.dump(to_dump, f)
+                dump_folder.mkdir(parents=True, exist_ok=True)
+                with filename.open("wb") as dump_file:
+                    _pickle.dump(to_dump, dump_file)
 
             # Schedule the task to run in the background without awaiting it
             asyncio.create_task(asyncio.to_thread(background_task))

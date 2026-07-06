@@ -298,16 +298,24 @@ struct ExtendResultEvent : InvalidTransitionHandler<ExtendResultEvent> {
     ExtendResultEvent() = delete;
 
     ExtendResultEvent(std::string request_id, std::vector<std::int32_t> result_tokens,
-                      HybridPrefixCache* hybrid_prefix_cache = nullptr)
+                      HybridPrefixCache* hybrid_prefix_cache = nullptr, std::int32_t protected_tail_tokens = 0)
         : request_id_(std::move(request_id)),
           result_tokens_(std::move(result_tokens)),
-          hybrid_prefix_cache_(hybrid_prefix_cache) {}
+          hybrid_prefix_cache_(hybrid_prefix_cache),
+          protected_tail_tokens_(protected_tail_tokens) {}
 
 public:
     template <typename S>
         requires CanExtendTokenContainer<S>
     std::remove_cvref_t<S> operator()(S&& state) {
         state.ExtendResultTokens(result_tokens_);
+        using State = std::remove_cvref_t<S>;
+        if constexpr (std::same_as<State, Retracting> || std::same_as<State, Retracted>) {
+            if (hybrid_prefix_cache_ != nullptr) {
+                hybrid_prefix_cache_->RewindRequest(request_id_, state.GetTokenContainer()->Size(),
+                                                    protected_tail_tokens_);
+            }
+        }
         return std::move(state);
     }
 
@@ -331,7 +339,7 @@ public:
         const std::int32_t new_publishable_pages = publishable_pages(accepted_token_size);
 
         if (new_publishable_pages <= old_publishable_pages) {
-            hybrid_prefix_cache_->RewindRequest(request_id_, accepted_token_size);
+            hybrid_prefix_cache_->RewindRequest(request_id_, accepted_token_size, protected_tail_tokens_);
             return std::move(state);
         }
 
@@ -352,7 +360,7 @@ public:
                               static_cast<std::int32_t>(result_tokens_.size()), page_size, &prefix_pages);
             hybrid_prefix_cache_->CommitChunk(request_id_, device_node_ref->Node());
         }
-        hybrid_prefix_cache_->RewindRequest(request_id_, accepted_token_size);
+        hybrid_prefix_cache_->RewindRequest(request_id_, accepted_token_size, protected_tail_tokens_);
 
         return Decoding{token_container,
                         page_size,
@@ -375,6 +383,7 @@ private:
     std::string request_id_;
     std::vector<std::int32_t> result_tokens_;
     HybridPrefixCache* hybrid_prefix_cache_{};
+    std::int32_t protected_tail_tokens_{};
 };
 
 }  // namespace tokenspeed::fsm

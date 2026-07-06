@@ -48,11 +48,246 @@ _v4 = _load(
 )
 
 build_v4_cache_specs = _v4.build_v4_cache_specs
+compute_max_logical_pages_for_capture = _generic.compute_max_logical_pages_for_capture
 compute_paged_cache_group_page_counts = _generic.compute_paged_cache_group_page_counts
 PagedCacheGroupSpec = _generic.PagedCacheGroupSpec
 
+_PAGE_SHAPES = ((4, 1), (4, 2), (16, 4), (2, 128))
+
 
 class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
+    def test_overlap_page_budget_is_parameterized_by_verify_width_and_depth(self):
+        max_live_requests = 3
+        for rows_per_page, entry_stride_tokens in _PAGE_SHAPES:
+            raw_per_page = rows_per_page * entry_stride_tokens
+            specs = [
+                PagedCacheGroupSpec(
+                    group_id="full",
+                    retention="full_history",
+                    rows_per_page=rows_per_page,
+                    entry_stride_tokens=entry_stride_tokens,
+                    sliding_window_tokens=None,
+                ),
+                PagedCacheGroupSpec(
+                    group_id="sliding",
+                    retention="sliding_window",
+                    rows_per_page=rows_per_page,
+                    entry_stride_tokens=entry_stride_tokens,
+                    sliding_window_tokens=3 * raw_per_page + 1,
+                ),
+            ]
+            common = dict(
+                max_live_requests=max_live_requests,
+                max_scheduled_tokens=1024,
+                max_total_tokens=4096,
+                max_context_len=4096,
+            )
+            for verify_width in (1, 2, 4, 8):
+                baseline = compute_paged_cache_group_page_counts(
+                    specs,
+                    **common,
+                    decode_input_tokens=verify_width,
+                    overlap_schedule_depth=0,
+                )
+                for overlap_depth in (0, 1):
+                    with self.subTest(
+                        raw_per_page=raw_per_page,
+                        verify_width=verify_width,
+                        overlap_depth=overlap_depth,
+                    ):
+                        actual = compute_paged_cache_group_page_counts(
+                            specs,
+                            **common,
+                            decode_input_tokens=verify_width,
+                            overlap_schedule_depth=overlap_depth,
+                        )
+                        protected_pages = max_live_requests * math.ceil(
+                            overlap_depth * verify_width / raw_per_page
+                        )
+                        for group_id in ("full", "sliding"):
+                            self.assertEqual(
+                                actual[group_id],
+                                baseline[group_id] + protected_pages,
+                            )
+
+    def test_capture_table_width_is_parameterized_by_verify_width_and_depth(self):
+        for rows_per_page, entry_stride_tokens in _PAGE_SHAPES:
+            raw_per_page = rows_per_page * entry_stride_tokens
+            full = PagedCacheGroupSpec(
+                group_id="full",
+                retention="full_history",
+                rows_per_page=rows_per_page,
+                entry_stride_tokens=entry_stride_tokens,
+                sliding_window_tokens=None,
+            )
+            window = 3 * raw_per_page + 1
+            sliding = PagedCacheGroupSpec(
+                group_id="sliding",
+                retention="sliding_window",
+                rows_per_page=rows_per_page,
+                entry_stride_tokens=entry_stride_tokens,
+                sliding_window_tokens=window,
+            )
+            context_len = 5 * raw_per_page + 1
+            for verify_width in (1, 2, 4, 8):
+                for overlap_depth in (0, 1):
+                    with self.subTest(
+                        raw_per_page=raw_per_page,
+                        verify_width=verify_width,
+                        overlap_depth=overlap_depth,
+                    ):
+                        full_pages = compute_max_logical_pages_for_capture(
+                            full,
+                            max_context_len=context_len,
+                            max_tokens_per_req=verify_width,
+                            overlap_schedule_depth=overlap_depth,
+                        )
+                        self.assertEqual(
+                            full_pages,
+                            math.ceil(
+                                (context_len + (overlap_depth + 1) * verify_width)
+                                / raw_per_page
+                            ),
+                        )
+
+                        sliding_pages = compute_max_logical_pages_for_capture(
+                            sliding,
+                            max_context_len=context_len,
+                            max_tokens_per_req=verify_width,
+                            overlap_schedule_depth=overlap_depth,
+                        )
+                        self.assertEqual(
+                            sliding_pages,
+                            math.ceil(
+                                (window - 1 + (overlap_depth + 1) * verify_width)
+                                / raw_per_page
+                            )
+                            + 1,
+                        )
+
+    def test_sliding_capture_width_covers_absolute_reservation_range(self):
+        for rows_per_page, entry_stride_tokens in _PAGE_SHAPES:
+            raw_per_page = rows_per_page * entry_stride_tokens
+            window = 3 * raw_per_page + 1
+            spec = PagedCacheGroupSpec(
+                group_id="sliding",
+                retention="sliding_window",
+                rows_per_page=rows_per_page,
+                entry_stride_tokens=entry_stride_tokens,
+                sliding_window_tokens=window,
+            )
+            for context_len in (2 * raw_per_page + 1, 5 * raw_per_page + 1):
+                for verify_width in (1, 2, 4, 8):
+                    for overlap_depth in (0, 1):
+                        reservation_end = (
+                            context_len + (overlap_depth + 1) * verify_width
+                        )
+                        with self.subTest(
+                            raw_per_page=raw_per_page,
+                            context_len=context_len,
+                            verify_width=verify_width,
+                            overlap_depth=overlap_depth,
+                        ):
+                            capture_pages = compute_max_logical_pages_for_capture(
+                                spec,
+                                max_context_len=context_len,
+                                max_tokens_per_req=verify_width,
+                                overlap_schedule_depth=overlap_depth,
+                            )
+                            retained_begin = max(0, context_len - (window - 1))
+                            required_pages = math.ceil(
+                                reservation_end / raw_per_page
+                            ) - math.floor(retained_begin / raw_per_page)
+                            self.assertGreaterEqual(capture_pages, required_pages)
+
+    def test_overlap_sizing_rejects_invalid_runtime_parameters(self):
+        spec = PagedCacheGroupSpec(
+            group_id="full",
+            retention="full_history",
+            rows_per_page=4,
+            entry_stride_tokens=1,
+            sliding_window_tokens=None,
+        )
+        count_args = dict(
+            max_live_requests=1,
+            max_scheduled_tokens=8,
+            max_total_tokens=8,
+            max_context_len=8,
+        )
+        for overrides, message in (
+            ({"decode_input_tokens": -1}, "decode_input_tokens"),
+            ({"overlap_schedule_depth": 2}, "overlap_schedule_depth"),
+            (
+                {"decode_input_tokens": 0, "overlap_schedule_depth": 1},
+                "decode_input_tokens",
+            ),
+        ):
+            with self.subTest(function="page_counts", overrides=overrides):
+                with self.assertRaisesRegex(ValueError, message):
+                    compute_paged_cache_group_page_counts(
+                        [spec], **count_args, **overrides
+                    )
+
+        for overrides, message in (
+            ({"max_context_len": -1}, "max_context_len"),
+            ({"max_tokens_per_req": 0}, "max_tokens_per_req"),
+            ({"overlap_schedule_depth": 2}, "overlap_schedule_depth"),
+        ):
+            with self.subTest(function="capture_width", overrides=overrides):
+                with self.assertRaisesRegex(ValueError, message):
+                    compute_max_logical_pages_for_capture(
+                        spec,
+                        **{
+                            "max_context_len": 8,
+                            "max_tokens_per_req": 1,
+                            **overrides,
+                        },
+                    )
+
+        invalid_specs = (
+            (
+                PagedCacheGroupSpec("bad-rows", "full_history", 0, 1, None),
+                "rows_per_page",
+            ),
+            (
+                PagedCacheGroupSpec("bad-window", "sliding_window", 4, 1, 0),
+                "sliding_window_tokens",
+            ),
+            (
+                PagedCacheGroupSpec("bad-retention", "unknown", 4, 1, None),
+                "unsupported retention",
+            ),
+        )
+        for invalid_spec, message in invalid_specs:
+            with self.subTest(group=invalid_spec.group_id):
+                with self.assertRaisesRegex(ValueError, message):
+                    compute_max_logical_pages_for_capture(
+                        invalid_spec,
+                        max_context_len=8,
+                    )
+
+    def test_overlap_schedule_enablement_truth_table(self):
+        from tokenspeed.runtime.engine.scheduler_utils import (
+            should_use_overlap_schedule,
+        )
+
+        cases = (
+            # disabled, mode, expected
+            (True, "fused", False),
+            (False, "prefill", False),
+            (False, "fused", True),
+            (False, "decode", True),
+        )
+        for disabled, mode, expected in cases:
+            with self.subTest(disabled=disabled, mode=mode):
+                self.assertEqual(
+                    should_use_overlap_schedule(
+                        disable_overlap_schedule=disabled,
+                        disaggregation_mode=mode,
+                    ),
+                    expected,
+                )
+
     def test_sliding_window_scheduled_tokens_are_global_and_capped(self):
         specs = [
             PagedCacheGroupSpec(

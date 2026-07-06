@@ -26,9 +26,9 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel import (
-    attn_plan,
     mha_decode_with_kvcache,
     mha_extend_with_kvcache,
+    mha_plan,
     mha_prefill,
 )
 from tokenspeed_kernel.ops.kvcache.triton import (
@@ -113,7 +113,7 @@ class MHAAttnBackend(AttentionBackend):
         self.kv_cache_dtype = config.kv_cache_dtype
         self.is_fp8 = self.kv_cache_dtype == torch.float8_e4m3fn
         self.plan = partial(
-            attn_plan,
+            mha_plan,
             dtype=torch.float8_e4m3fn if self.is_fp8 else self.qkv_dtype,
             head_dim=self.head_dim,
             return_lse=False,

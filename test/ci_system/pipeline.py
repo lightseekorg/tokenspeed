@@ -37,7 +37,7 @@ SUPPORTED_TRIGGERS = {"per-commit", "manual", "nightly", "debug"}
 # 1gpu unit-test for the same b300 box).
 SUPPORTED_PRIORITIES = ("high", "normal", "low")
 DEFAULT_PRIORITY = "normal"
-SUPPORTED_RUNNER_GROUPS = ("all", "amd", "nvidia")
+SUPPORTED_RUNNER_GROUPS = ("all", "amd", "nvidia", "nvidia-arm", "nvidia-x86")
 _PRIORITY_ORDER = {value: index for index, value in enumerate(SUPPORTED_PRIORITIES)}
 B200_RUNNER_LABEL_ENV = "TOKENSPEED_B200_RUNNER_LABEL"
 STALE_PROCESS_PATTERNS = [
@@ -57,6 +57,7 @@ RUNNER_SM_PREFIXES = (
 )
 
 AMD_RUNNER_PREFIXES = ("amd-mi35x-", "amd-mi355-", "amd-mi350-")
+NVIDIA_ARM_RUNNER_PREFIXES = ("gb200",)
 GB200_RUNNER_PREFIXES = ("gb200",)
 NVIDIA_GPU_CLEANUP_RUNNER_PREFIXES = ("gb200", "b300")
 PERF_DIAGNOSTIC_RUNNERS = ("b300-4gpu",)
@@ -66,6 +67,10 @@ def is_amd_runner(runner: str) -> bool:
     return runner.startswith(AMD_RUNNER_PREFIXES)
 
 
+def is_nvidia_arm_runner(runner: str) -> bool:
+    return runner.startswith(NVIDIA_ARM_RUNNER_PREFIXES)
+
+
 def runner_matches_group(runner: str, runner_group: str) -> bool:
     if runner_group == "all":
         return True
@@ -73,6 +78,10 @@ def runner_matches_group(runner: str, runner_group: str) -> bool:
         return is_amd_runner(runner)
     if runner_group == "nvidia":
         return not is_amd_runner(runner)
+    if runner_group == "nvidia-arm":
+        return is_nvidia_arm_runner(runner)
+    if runner_group == "nvidia-x86":
+        return not is_amd_runner(runner) and not is_nvidia_arm_runner(runner)
     raise ValueError(f"unsupported runner group: {runner_group!r}")
 
 
@@ -471,14 +480,6 @@ def setup_runner(
     shell_run("sudo apt-get update -q", env=local_env, cwd=cwd, dry_run=dry_run)
     shell_run(
         "sudo apt-get install -y ninja-build",
-        env=local_env,
-        cwd=cwd,
-        dry_run=dry_run,
-    )
-    shell_run(
-        "sudo apt-get install -y libspdlog-dev || "
-        "(git clone --depth 1 https://github.com/gabime/spdlog.git /tmp/spdlog && "
-        "sudo cp -r /tmp/spdlog/include/spdlog /usr/local/include/)",
         env=local_env,
         cwd=cwd,
         dry_run=dry_run,

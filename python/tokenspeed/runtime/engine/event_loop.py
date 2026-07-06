@@ -173,6 +173,16 @@ class EventLoop:
         target, draft = create_model_runner(
             server_args, self.model_config, draft_model_config, gpu_id, global_rank
         )
+        self.use_overlap_schedule = should_use_overlap_schedule(
+            disable_overlap_schedule=server_args.disable_overlap_schedule,
+            disaggregation_mode=server_args.disaggregation_mode,
+        )
+        self.overlap_schedule_depth = int(self.use_overlap_schedule)
+        decode_input_tokens = (
+            server_args.speculative_num_draft_tokens
+            if server_args.speculative_algorithm is not None
+            else 1
+        )
 
         (
             attn_backend,
@@ -190,6 +200,8 @@ class EventLoop:
             min_per_gpu_mem,
             server_args.enable_memory_saver,
             draft_model_config,
+            decode_input_tokens=decode_input_tokens,
+            overlap_schedule_depth=self.overlap_schedule_depth,
         )
 
         num_total_pages = self.max_total_num_tokens // server_args.block_size
@@ -199,13 +211,21 @@ class EventLoop:
             text_config is not None and hasattr(text_config, "mamba2_cache_params")
         )
 
+        mapping = server_args.mapping
+        # The C++ scheduler's req_pool_idx range is rank-local and 1-based:
+        # real rows are 1..max_batch_size, row 0 is reserved, and CUDA graph
+        # padding needs one non-real sink row after the scheduler-owned range.
+        per_rank_max_batch = server_args.max_num_seqs // max(mapping.attn.dp_size, 1)
+        req_pool_padding_index = per_rank_max_batch + 1
+
         model_executor_config = ModelExecutorConfig.from_server_args(
             server_args=server_args,
             model_config=self.model_config,
-            max_req_pool_size=server_args.max_num_seqs,
+            max_req_pool_size=req_pool_padding_index,
             gpu_id=gpu_id,
             global_rank=global_rank,
             num_total_pages=num_total_pages,
+            overlap_schedule_depth=self.overlap_schedule_depth,
         )
         self.model_executor = create_model_executor(
             server_args=server_args,
@@ -222,7 +242,6 @@ class EventLoop:
         # Reserve one token slot because request validation uses a strict
         # ``< max_req_len`` check against the model context length.
         self.max_req_input_len = self.model_config.context_len - 1
-        mapping = server_args.mapping
         self.attn_tp_size = server_args.attn_tp_size or mapping.attn.tp_size
         self.world_size = server_args.world_size or mapping.world_size
         self.attn_tp_rank = attn_tp_rank
@@ -276,6 +295,9 @@ class EventLoop:
             page_size=server_args.block_size,
             host_ratio=server_args.kvstore_ratio,
             host_size_gb=server_args.kvstore_size,
+            host_parallel_count=max(
+                int(getattr(server_args.mapping, "nprocs_per_node", 1) or 1), 1
+            ),
             io_backend=server_args.kvstore_io_backend,
             host_layout=server_args.kvstore_mem_layout,
             storage_backend=server_args.kvstore_storage_backend,
@@ -305,11 +327,6 @@ class EventLoop:
             )
             num_host_pages = self.memory_executor.host_pool.page_num
 
-        # For DP attention, max_batch_size must be per-rank to avoid
-        # req_pool_allocator overflow.  The C++ scheduler allocates
-        # req_pool_slots based on this value, so it must match the
-        # per-DP-rank budget (same division used in cuda_graph_wrapper).
-        per_rank_max_batch = server_args.max_num_seqs // max(self.dp_size, 1)
         self._kv_events_enabled = (
             EventPublisherFactory.is_enabled(server_args.kv_events_config)
             and attn_tp_rank == 0
@@ -324,7 +341,6 @@ class EventLoop:
 
         # Adjunct enabled only when pool opts in AND prefix-caching switch is on.
         paged_cache_groups = pool_to_paged_cache_groups(token_to_kv_pool)
-        self._paged_cache_groups = paged_cache_groups
         prefix_cache_adjunct = None
         required_groups = token_to_kv_pool.prefix_cache_required_group_ids
         if required_groups is not None and server_args.enable_prefix_caching:
@@ -340,11 +356,8 @@ class EventLoop:
             prefetch_threshold=4,  # Keep this hard-coded until it becomes configurable.
             role=server_args.disaggregation_mode,
             enable_kv_cache_events=self._kv_events_enabled,
-            decode_input_tokens=(
-                server_args.speculative_num_draft_tokens
-                if server_args.speculative_algorithm is not None
-                else 1
-            ),
+            decode_input_tokens=decode_input_tokens,
+            overlap_schedule_depth=self.overlap_schedule_depth,
             disable_prefix_cache=not server_args.enable_prefix_caching,
             enable_mamba=has_mamba,
             mamba_cache_chunk_size=server_args.mamba_cache_chunk_size,
@@ -357,7 +370,8 @@ class EventLoop:
         )
         logger.info(
             "Scheduler config: page_size=%s num_device_pages=%s "
-            "max_scheduled_tokens=%s decode_input_tokens=%s disable_l2_cache=%s "
+            "max_scheduled_tokens=%s decode_input_tokens=%s "
+            "overlap_schedule_depth=%s disable_l2_cache=%s "
             "max_batch_size=%s (global max_num_seqs=%s, dp_size=%s) "
             "mamba_pool_total_chunks=%s enable_mamba=%s "
             "disable_prefix_cache=%s paged_cache_groups=%s",
@@ -365,6 +379,7 @@ class EventLoop:
             scheduler_cfg.num_device_pages,
             scheduler_cfg.max_scheduled_tokens,
             scheduler_cfg.decode_input_tokens,
+            scheduler_cfg.overlap_schedule_depth,
             scheduler_cfg.disable_l2_cache,
             scheduler_cfg.max_batch_size,
             server_args.max_num_seqs,
@@ -651,11 +666,17 @@ class EventLoop:
         # _pending_cache_event_payloads) diverges transiently. A rank-local skip
         # would let some ranks gather while others return, deadlocking the group.
         # Agree on the skip via a cheap single-int all_reduce.
+        # NOTE: For non-DFLASH algorithms, cache ops are deterministic across
+        # ranks, so the local short-circuit is safe and avoids collective overhead.
         local_has_work = bool(
             self._num_inflight_cache_ops != 0 or self._pending_cache_event_payloads
         )
-        if not self._cache_group_has_work(local_has_work):
-            return
+        if self.server_args.speculative_algorithm == "DFLASH":
+            if not self._cache_group_has_work(local_has_work):
+                return
+        else:
+            if not local_has_work:
+                return
 
         ready_payloads = self._pop_ready_cache_event_payloads()
         if not ready_payloads:
@@ -830,7 +851,8 @@ class EventLoop:
 
         else:
             # Prefill node (only reached from event_loop, never event_loop_overlap)
-            assert isinstance(self.kv_transfer, DisaggPrefillExecutor)
+            if not isinstance(self.kv_transfer, DisaggPrefillExecutor):
+                raise TypeError("kv_transfer must be a DisaggPrefillExecutor.")
             if forward_op.num_extends() == 0:
                 # Path 3: all prefill done — send KV to decode side
                 self.kv_transfer.execute(forward_op)
@@ -1795,13 +1817,12 @@ def run_event_loop(
             }
         )
 
-        use_overlap = should_use_overlap_schedule(
-            disable_overlap_schedule=server_args.disable_overlap_schedule,
-            disaggregation_mode=server_args.disaggregation_mode,
-            speculative_algorithm=server_args.speculative_algorithm,
-            paged_cache_groups=getattr(event_loop, "_paged_cache_groups", ()),
-        )
-        if use_overlap:
+        if event_loop.has_dp:
+            # All DP schedulers must finish initialization before any rank enters
+            # the loop and starts the first DP metadata collective.
+            dist.barrier(group=event_loop.world_cpu_group)
+
+        if event_loop.use_overlap_schedule:
             event_loop.event_loop_overlap()
         else:
             event_loop.event_loop()

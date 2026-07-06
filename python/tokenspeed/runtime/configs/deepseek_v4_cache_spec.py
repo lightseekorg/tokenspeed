@@ -16,7 +16,8 @@
 
 from __future__ import annotations
 
-from typing import Any, List, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 from tokenspeed.runtime.configs.paged_cache_spec import PagedCacheGroupSpec
 
@@ -192,11 +193,11 @@ def build_v4_cache_specs(
     hf_config: Any,
     *,
     layer_ratio: Sequence[int],
-) -> List[PagedCacheGroupSpec]:
+) -> list[PagedCacheGroupSpec]:
     swa_window = _resolve_sliding_window(hf_config)
     unique_compress_ratios = sorted({int(r) for r in layer_ratio if int(r) > 1})
 
-    specs: List[PagedCacheGroupSpec] = [
+    specs: list[PagedCacheGroupSpec] = [
         # SWA kv: trailing window only -> State family.
         PagedCacheGroupSpec(
             group_id=V4_SWA_KV_GROUP_ID,

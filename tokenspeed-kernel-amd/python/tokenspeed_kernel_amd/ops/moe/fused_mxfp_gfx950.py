@@ -454,7 +454,8 @@ class MoEConfig:
     WITH_X_MX_SCALE: gl.constexpr
     WITH_W_MX_SCALE: gl.constexpr
     SCALE_LOAD_MODE: gl.constexpr
-    SCALE_VIA_LDS: gl.constexpr
+    X_SCALE_VIA_LDS: gl.constexpr
+    W_SCALE_VIA_LDS: gl.constexpr
     PRESHUFFLE_FACTOR: gl.constexpr
     BLOCK_M_PRESHUFFLED: gl.constexpr
     BLOCK_N_PRESHUFFLED: gl.constexpr
@@ -510,6 +511,8 @@ class MoEConfig:
         W_PRESHUFFLED=False,
         W_VIA_VGPR=False,
         W_PREFETCH=True,
+        X_SCALE_VIA_LDS=None,
+        W_SCALE_VIA_LDS=None,
     ):
         if SCALE_LOAD_MODE not in _SCALE_LOAD_MODES:
             raise ValueError(
@@ -533,10 +536,13 @@ class MoEConfig:
         self.DTYPE_X = gl.constexpr(DTYPE_X)
         self.DTYPE_W = gl.constexpr(DTYPE_W)
 
-        _scale_via_lds = SCALE_LOAD_MODE == "swizzle" and (
-            WITH_X_MX_SCALE or WITH_W_MX_SCALE
-        )
-        self.SCALE_VIA_LDS = gl.constexpr(_scale_via_lds)
+        if X_SCALE_VIA_LDS is None:
+            X_SCALE_VIA_LDS = SCALE_LOAD_MODE == "swizzle" and WITH_X_MX_SCALE
+        if W_SCALE_VIA_LDS is None:
+            W_SCALE_VIA_LDS = SCALE_LOAD_MODE == "swizzle" and WITH_W_MX_SCALE
+        _scale_via_lds = X_SCALE_VIA_LDS or W_SCALE_VIA_LDS
+        self.X_SCALE_VIA_LDS = gl.constexpr(X_SCALE_VIA_LDS)
+        self.W_SCALE_VIA_LDS = gl.constexpr(W_SCALE_VIA_LDS)
         self.PRESHUFFLE_FACTOR = gl.constexpr(_SCALE_PRESHUFFLE_FACTOR)
         self.BLOCK_M_PRESHUFFLED = gl.constexpr(BLOCK_M // _SCALE_PRESHUFFLE_FACTOR)
         self.BLOCK_N_PRESHUFFLED = gl.constexpr(BLOCK_N // _SCALE_PRESHUFFLE_FACTOR)
@@ -558,9 +564,9 @@ class MoEConfig:
         if not W_VIA_VGPR:
             num_loads += 1  # w (LDS path)
         if _scale_via_lds:
-            if WITH_X_MX_SCALE:
+            if X_SCALE_VIA_LDS:
                 num_loads += 1
-            if WITH_W_MX_SCALE:
+            if W_SCALE_VIA_LDS:
                 num_loads += 1
         self.NUM_LOADS_IN_BATCH = gl.constexpr(num_loads)
 
@@ -726,12 +732,13 @@ class MoEProgramBase:
             self.w_desc.issue_async_load(
                 load_idx, self.w_buffer, pred, USE_MASK=USE_MASK
             )
-        if cfg.SCALE_VIA_LDS:
-            if cfg.WITH_X_MX_SCALE:
+        scale_via_lds: gl.constexpr = cfg.X_SCALE_VIA_LDS or cfg.W_SCALE_VIA_LDS
+        if scale_via_lds:
+            if cfg.X_SCALE_VIA_LDS:
                 self.x_scale_desc.issue_async_load(
                     load_idx, self.x_scale_buffer, pred, USE_MASK=USE_MASK
                 )
-            if cfg.WITH_W_MX_SCALE:
+            if cfg.W_SCALE_VIA_LDS:
                 self.w_scale_desc.issue_async_load(
                     load_idx, self.w_scale_buffer, pred, USE_MASK=USE_MASK
                 )
@@ -1137,6 +1144,23 @@ def _load_scale_tile_via_gl_load(desc, mfma_idx):
     return gl.load(base + desc.offsets, mask=mask, other=0)
 
 
+@gluon.jit
+def _load_scale_subtile_via_gl_load(
+    desc, mfma_idx, subtile_start_nonk: gl.constexpr, SUBTILE_NONK: gl.constexpr
+):
+    EVEN_K: gl.constexpr = desc.cfg.EVEN_K
+    off_k_step = mfma_idx * desc.BLOCK_K
+    base = desc.ptr + off_k_step * desc.stride_k
+    offsets = desc.offsets.slice(subtile_start_nonk, SUBTILE_NONK, 0)
+    masks_nonk = desc.masks_nonk.slice(subtile_start_nonk, SUBTILE_NONK, 0)
+    if EVEN_K:
+        mask = masks_nonk
+    else:
+        mask_k = gl.expand_dims(off_k_step + desc.off_k, desc.op_idx) < desc.k_limit
+        mask = mask_k & masks_nonk
+    return gl.load(base + offsets, mask=mask, other=0)
+
+
 @composition
 @gluon.aggregate
 class MoEPipelinedProgram:
@@ -1167,16 +1191,8 @@ class MoEPipelinedProgram:
         self.cfg = cfg
         self.x_buffer = x_buffer
         self.w_buffer = w_buffer if not cfg.W_VIA_VGPR else gl.constexpr(0)
-        self.x_scale_buffer = (
-            x_scale_buffer
-            if (cfg.SCALE_VIA_LDS and cfg.WITH_X_MX_SCALE)
-            else gl.constexpr(0)
-        )
-        self.w_scale_buffer = (
-            w_scale_buffer
-            if (cfg.SCALE_VIA_LDS and cfg.WITH_W_MX_SCALE)
-            else gl.constexpr(0)
-        )
+        self.x_scale_buffer = x_scale_buffer if cfg.X_SCALE_VIA_LDS else gl.constexpr(0)
+        self.w_scale_buffer = w_scale_buffer if cfg.W_SCALE_VIA_LDS else gl.constexpr(0)
         self.x_desc = x_desc
         self.w_desc = w_desc
         self.x_scale_desc = x_scale_desc if cfg.WITH_X_MX_SCALE else gl.constexpr(0)
@@ -1215,7 +1231,7 @@ class MoEPipelinedProgram:
                 layout=cfg.shared_layout_w,
             )
 
-        if cfg.SCALE_VIA_LDS and cfg.WITH_X_MX_SCALE:
+        if cfg.X_SCALE_VIA_LDS:
             x_scale_buffer = gl.allocate_shared_memory(
                 gl.uint8,
                 shape=[
@@ -1228,7 +1244,7 @@ class MoEPipelinedProgram:
         else:
             x_scale_buffer = gl.constexpr(0)
 
-        if cfg.SCALE_VIA_LDS and cfg.WITH_W_MX_SCALE:
+        if cfg.W_SCALE_VIA_LDS:
             w_scale_buffer = gl.allocate_shared_memory(
                 gl.uint8,
                 shape=[
@@ -1308,7 +1324,7 @@ class MoEPipelinedProgram:
         BLOCK_K_SCALE: gl.constexpr = cfg.BLOCK_K // cfg.SCALE_BLOCK
         if cfg.USE_MFMA_SCALED:
             if cfg.WITH_X_MX_SCALE:
-                if cfg.SCALE_VIA_LDS:
+                if cfg.X_SCALE_VIA_LDS:
                     scale_x = self.x_scale_desc.issue_local_load_unswizzle(
                         mfma_idx,
                         self.x_scale_buffer,
@@ -1327,7 +1343,7 @@ class MoEPipelinedProgram:
                     layout=cfg.layout_x_scale,
                 )
             if cfg.WITH_W_MX_SCALE:
-                if cfg.SCALE_VIA_LDS:
+                if cfg.W_SCALE_VIA_LDS:
                     scale_w = self.w_scale_desc.issue_local_load_unswizzle(
                         mfma_idx,
                         self.w_scale_buffer,
@@ -1359,7 +1375,7 @@ class MoEPipelinedProgram:
 
         if cfg.USE_MFMA_SCALED:
             if cfg.WITH_X_MX_SCALE:
-                if cfg.SCALE_VIA_LDS:
+                if cfg.X_SCALE_VIA_LDS:
                     scale_x = self.x_scale_desc.issue_local_load_unswizzle(
                         mfma_idx,
                         self.x_scale_buffer,
@@ -1379,7 +1395,7 @@ class MoEPipelinedProgram:
                 )
 
             if cfg.WITH_W_MX_SCALE:
-                if cfg.SCALE_VIA_LDS:
+                if cfg.W_SCALE_VIA_LDS:
                     scale_w = self.w_scale_desc.issue_local_load_unswizzle(
                         mfma_idx,
                         self.w_scale_buffer,
@@ -1644,16 +1660,8 @@ class MoESliceMNProgram:
         self.x_buffer_bot = x_buffer_bot
         self.w_buffer_left = w_buffer_left
         self.w_buffer_right = w_buffer_right
-        self.x_scale_buffer = (
-            x_scale_buffer
-            if (cfg.SCALE_VIA_LDS and cfg.WITH_X_MX_SCALE)
-            else gl.constexpr(0)
-        )
-        self.w_scale_buffer = (
-            w_scale_buffer
-            if (cfg.SCALE_VIA_LDS and cfg.WITH_W_MX_SCALE)
-            else gl.constexpr(0)
-        )
+        self.x_scale_buffer = x_scale_buffer if cfg.X_SCALE_VIA_LDS else gl.constexpr(0)
+        self.w_scale_buffer = w_scale_buffer if cfg.W_SCALE_VIA_LDS else gl.constexpr(0)
         self.x_desc_top = x_desc_top
         self.x_desc_bot = x_desc_bot
         self.w_desc_left = w_desc_left
@@ -1705,7 +1713,7 @@ class MoESliceMNProgram:
             layout=cfg.shared_layout_w_half_n,
         )
 
-        if cfg.SCALE_VIA_LDS and cfg.WITH_X_MX_SCALE:
+        if cfg.X_SCALE_VIA_LDS:
             x_scale_buffer = gl.allocate_shared_memory(
                 gl.uint8,
                 shape=[
@@ -1718,7 +1726,7 @@ class MoESliceMNProgram:
         else:
             x_scale_buffer = gl.constexpr(0)
 
-        if cfg.SCALE_VIA_LDS and cfg.WITH_W_MX_SCALE:
+        if cfg.W_SCALE_VIA_LDS:
             w_scale_buffer = gl.allocate_shared_memory(
                 gl.uint8,
                 shape=[
@@ -1762,16 +1770,24 @@ class MoESliceMNProgram:
 
         if cfg.USE_MFMA_SCALED:
             if cfg.WITH_X_MX_SCALE:
-                scale_x = self.x_scale_desc.issue_local_load_unswizzle_sub(
-                    mfma_idx,
-                    self.x_scale_buffer,
-                    cfg.layout_x_scale,
-                    cfg.BLOCK_M_PRESHUFFLED,
-                    cfg.BLOCK_M,
-                    BLOCK_K_SCALE,
-                    SUBTILE_M,
-                    subtile_start_m,
-                )
+                if cfg.X_SCALE_VIA_LDS:
+                    scale_x = self.x_scale_desc.issue_local_load_unswizzle_sub(
+                        mfma_idx,
+                        self.x_scale_buffer,
+                        cfg.layout_x_scale,
+                        cfg.BLOCK_M_PRESHUFFLED,
+                        cfg.BLOCK_M,
+                        BLOCK_K_SCALE,
+                        SUBTILE_M,
+                        subtile_start_m,
+                    )
+                else:
+                    scale_x = _load_scale_subtile_via_gl_load(
+                        self.x_scale_desc,
+                        mfma_idx,
+                        subtile_start_m,
+                        SUBTILE_M,
+                    )
             else:
                 scale_x = gl.full(
                     [SUBTILE_M, BLOCK_K_SCALE],
@@ -1805,16 +1821,24 @@ class MoESliceMNProgram:
 
         if cfg.USE_MFMA_SCALED:
             if cfg.WITH_W_MX_SCALE:
-                scale_w = self.w_scale_desc.issue_local_load_unswizzle_sub(
-                    mfma_idx,
-                    self.w_scale_buffer,
-                    cfg.layout_w_scale,
-                    cfg.BLOCK_N_PRESHUFFLED,
-                    cfg.BLOCK_N,
-                    BLOCK_K_SCALE,
-                    SUBTILE_N,
-                    subtile_start_n,
-                )
+                if cfg.W_SCALE_VIA_LDS:
+                    scale_w = self.w_scale_desc.issue_local_load_unswizzle_sub(
+                        mfma_idx,
+                        self.w_scale_buffer,
+                        cfg.layout_w_scale,
+                        cfg.BLOCK_N_PRESHUFFLED,
+                        cfg.BLOCK_N,
+                        BLOCK_K_SCALE,
+                        SUBTILE_N,
+                        subtile_start_n,
+                    )
+                else:
+                    scale_w = _load_scale_subtile_via_gl_load(
+                        self.w_scale_desc,
+                        mfma_idx,
+                        subtile_start_n,
+                        SUBTILE_N,
+                    )
             else:
                 scale_w = gl.full(
                     [SUBTILE_N, BLOCK_K_SCALE],
@@ -1840,8 +1864,9 @@ class MoESliceMNProgram:
         self.x_desc_top.issue_async_load(
             load_idx, self.x_buffer_top, pred, USE_MASK=USE_MASK, COMMIT=0
         )
-        if cfg.SCALE_VIA_LDS:
-            if cfg.WITH_X_MX_SCALE:
+        scale_via_lds: gl.constexpr = cfg.X_SCALE_VIA_LDS or cfg.W_SCALE_VIA_LDS
+        if scale_via_lds:
+            if cfg.X_SCALE_VIA_LDS:
                 self.x_scale_desc.issue_async_load(
                     load_idx,
                     self.x_scale_buffer,
@@ -1849,7 +1874,7 @@ class MoESliceMNProgram:
                     USE_MASK=USE_MASK,
                     COMMIT=0,
                 )
-            if cfg.WITH_W_MX_SCALE:
+            if cfg.W_SCALE_VIA_LDS:
                 self.w_scale_desc.issue_async_load(
                     load_idx,
                     self.w_scale_buffer,
@@ -2074,16 +2099,8 @@ class MoESliceNProgram:
         self.x_buffer = x_buffer
         self.w_buffer_top = w_buffer_top if not cfg.W_VIA_VGPR else gl.constexpr(0)
         self.w_buffer_bot = w_buffer_bot if not cfg.W_VIA_VGPR else gl.constexpr(0)
-        self.x_scale_buffer = (
-            x_scale_buffer
-            if (cfg.SCALE_VIA_LDS and cfg.WITH_X_MX_SCALE)
-            else gl.constexpr(0)
-        )
-        self.w_scale_buffer = (
-            w_scale_buffer
-            if (cfg.SCALE_VIA_LDS and cfg.WITH_W_MX_SCALE)
-            else gl.constexpr(0)
-        )
+        self.x_scale_buffer = x_scale_buffer if cfg.X_SCALE_VIA_LDS else gl.constexpr(0)
+        self.w_scale_buffer = w_scale_buffer if cfg.W_SCALE_VIA_LDS else gl.constexpr(0)
         self.x_desc = x_desc
         self.w_desc_top = w_desc_top
         self.w_desc_bot = w_desc_bot
@@ -2153,7 +2170,7 @@ class MoESliceNProgram:
                 layout=cfg.shared_layout_w_half_n,
             )
 
-        if cfg.SCALE_VIA_LDS and cfg.WITH_X_MX_SCALE:
+        if cfg.X_SCALE_VIA_LDS:
             x_scale_buffer = gl.allocate_shared_memory(
                 gl.uint8,
                 shape=[
@@ -2166,7 +2183,7 @@ class MoESliceNProgram:
         else:
             x_scale_buffer = gl.constexpr(0)
 
-        if cfg.SCALE_VIA_LDS and cfg.WITH_W_MX_SCALE:
+        if cfg.W_SCALE_VIA_LDS:
             w_scale_buffer = gl.allocate_shared_memory(
                 gl.uint8,
                 shape=[
@@ -2216,7 +2233,7 @@ class MoESliceNProgram:
 
         if cfg.USE_MFMA_SCALED:
             if cfg.WITH_X_MX_SCALE:
-                if cfg.SCALE_VIA_LDS:
+                if cfg.X_SCALE_VIA_LDS:
                     scale_x = self.x_scale_desc.issue_local_load_unswizzle(
                         mfma_idx,
                         self.x_scale_buffer,
@@ -2246,8 +2263,9 @@ class MoESliceNProgram:
         self.x_desc.issue_async_load(
             load_idx, self.x_buffer, pred, USE_MASK=USE_MASK, COMMIT=0
         )
-        if cfg.SCALE_VIA_LDS:
-            if cfg.WITH_X_MX_SCALE:
+        scale_via_lds: gl.constexpr = cfg.X_SCALE_VIA_LDS or cfg.W_SCALE_VIA_LDS
+        if scale_via_lds:
+            if cfg.X_SCALE_VIA_LDS:
                 self.x_scale_desc.issue_async_load(
                     load_idx,
                     self.x_scale_buffer,
@@ -2255,7 +2273,7 @@ class MoESliceNProgram:
                     USE_MASK=USE_MASK,
                     COMMIT=0,
                 )
-            if cfg.WITH_W_MX_SCALE:
+            if cfg.W_SCALE_VIA_LDS:
                 self.w_scale_desc.issue_async_load(
                     load_idx,
                     self.w_scale_buffer,
@@ -3114,7 +3132,7 @@ def _run_moe_tile_w_via_vgpr(
             "this shape (re-derive otherwise).",
         )
         LOAD_W_HALF_COPY_LAYOUT: gl.constexpr = _preshuffled_w_copy_layout(
-            SUB_BN // 16, BLOCK_K_W, cfg.SCALE_VIA_LDS, False
+            SUB_BN // 16, BLOCK_K_W, cfg.W_SCALE_VIA_LDS, False
         )
         (
             offsets_h,
@@ -3167,7 +3185,7 @@ def _run_moe_tile_w_via_vgpr(
         )
         BLOCK_N_LAYOUT: gl.constexpr = BLOCK_N
         LOAD_W_COPY_LAYOUT: gl.constexpr = _preshuffled_w_copy_layout(
-            BLOCK_N_LAYOUT // 16, BLOCK_K_W, cfg.SCALE_VIA_LDS, False
+            BLOCK_N_LAYOUT // 16, BLOCK_K_W, cfg.W_SCALE_VIA_LDS, False
         )
         offsets_b_vgpr, base_off_b_vgpr = _make_preshuffled_w_full_offsets(
             w_base_offset,
@@ -3260,10 +3278,10 @@ def _run_moe_tile_preshuffled_lds_w(
             "this shape (re-derive otherwise).",
         )
         LOAD_W_HALF_LAYOUT: gl.constexpr = _preshuffled_w_read_layout(
-            SUB_BN // 16, BLOCK_K_W, cfg.SCALE_VIA_LDS
+            SUB_BN // 16, BLOCK_K_W, cfg.W_SCALE_VIA_LDS
         )
         LOAD_W_HALF_COPY_LAYOUT: gl.constexpr = _preshuffled_w_copy_layout(
-            SUB_BN // 16, BLOCK_K_W, cfg.SCALE_VIA_LDS, True
+            SUB_BN // 16, BLOCK_K_W, cfg.W_SCALE_VIA_LDS, True
         )
         (
             offsets_h,
@@ -3320,10 +3338,10 @@ def _run_moe_tile_preshuffled_lds_w(
     # preshuffled copy/read layouts remain valid during compilation.
     BLOCK_N_LAYOUT: gl.constexpr = (BLOCK_N // 2) if USE_SLICE_N else BLOCK_N
     LOAD_W_LAYOUT: gl.constexpr = _preshuffled_w_read_layout(
-        BLOCK_N_LAYOUT // 16, BLOCK_K_W, cfg.SCALE_VIA_LDS
+        BLOCK_N_LAYOUT // 16, BLOCK_K_W, cfg.W_SCALE_VIA_LDS
     )
     LOAD_W_COPY_LAYOUT: gl.constexpr = _preshuffled_w_copy_layout(
-        BLOCK_N_LAYOUT // 16, BLOCK_K_W, cfg.SCALE_VIA_LDS, True
+        BLOCK_N_LAYOUT // 16, BLOCK_K_W, cfg.W_SCALE_VIA_LDS, True
     )
     offsets_b_vgpr, base_off_b_vgpr = _make_preshuffled_w_full_offsets(
         w_base_offset,
@@ -3738,6 +3756,8 @@ def _pipelined_moe_tile_compute(
     W_VIA_VGPR: gl.constexpr = False,
     W_PREFETCH: gl.constexpr = True,
     W_CACHE_CG: gl.constexpr = False,
+    X_SCALE_VIA_LDS: gl.constexpr = False,
+    W_SCALE_VIA_LDS: gl.constexpr = False,
     USE_NARROW_N_STORE_LAYOUT: gl.constexpr = False,
 ):
     expert_id = compact_idx
@@ -3791,6 +3811,8 @@ def _pipelined_moe_tile_compute(
         W_PRESHUFFLED=W_PRESHUFFLED,
         W_VIA_VGPR=W_VIA_VGPR,
         W_PREFETCH=W_PREFETCH,
+        X_SCALE_VIA_LDS=X_SCALE_VIA_LDS,
+        W_SCALE_VIA_LDS=W_SCALE_VIA_LDS,
     )
     BLOCK_K_X: gl.constexpr = cfg.BLOCK_K // cfg.DIV_FACTOR_X
     BLOCK_K_W: gl.constexpr = cfg.BLOCK_K // cfg.DIV_FACTOR_W
@@ -3831,23 +3853,21 @@ def _pipelined_moe_tile_compute(
         # Post-gather rows_m is in global token-id space (size M_X);
         # mask out junk gather_idx values too. Don't conflate M_X with
         # ``M`` (= dispatched tile count, can exceed M_X for top-k>1).
-        mask_m = pre_gather_mask & (rows_m < M_X)
         mask_m_x = pre_gather_mask_x & (rows_m_x < M_X)
     else:
         # Clamp OOB lanes to 0 so the buffer_load address stays in
         # bounds during HIP graph warm-up; mask still filters.
         rows_m = gl.where(pre_gather_mask, rows_m, gl.zeros_like(rows_m))
         rows_m_x = gl.where(pre_gather_mask_x, rows_m_x, gl.zeros_like(rows_m_x))
-        mask_m = pre_gather_mask
         mask_m_x = pre_gather_mask_x
 
     k_limit_x = gl.multiple_of(K // cfg.DIV_FACTOR_X, 16)
     k_limit_w = gl.multiple_of(K // cfg.DIV_FACTOR_W, 16)
 
-    # SCALE_VIA_LDS uses post-swizzle HBM shape via buffer_load_to_shared;
-    # other modes load scales G->VGPR via gl.load.
+    # Swizzled scale loads use post-swizzle HBM shape via buffer_load_to_shared;
+    # direct scale loads use G->VGPR gl.load and can follow gathered X rows.
     if HAS_X_BLOCK_SCALE:
-        if cfg.SCALE_VIA_LDS:
+        if cfg.X_SCALE_VIA_LDS:
             BLOCK_M_PS: gl.constexpr = cfg.BLOCK_M_PRESHUFFLED
             BLOCK_K_S_PS: gl.constexpr = cfg.BLOCK_K_SCALE_PRESHUFFLED
             LX_S: gl.constexpr = cfg.load_layout_x_scale
@@ -3884,7 +3904,25 @@ def _pipelined_moe_tile_compute(
             )
             rows_m_scale = off_m + offs_xs_m
             if HAS_GATHER:
-                rows_m_scale = rows_m
+                pre_gather_mask_scale = rows_m_scale < m_limit
+                rows_m_scale_safe = gl.where(
+                    pre_gather_mask_scale,
+                    rows_m_scale,
+                    gl.zeros_like(rows_m_scale),
+                )
+                rows_m_scale = gl.load(
+                    gather_idx_ptr + rows_m_scale_safe,
+                    mask=pre_gather_mask_scale,
+                    other=0,
+                ).to(gl.int32)
+                mask_m_scale = pre_gather_mask_scale & (rows_m_scale < M_X)
+            else:
+                mask_m_scale = rows_m_scale < m_limit
+                rows_m_scale = gl.where(
+                    mask_m_scale,
+                    rows_m_scale,
+                    gl.zeros_like(rows_m_scale),
+                )
             x_scale_desc = AsyncCopyDescriptor.initialize(
                 cfg,
                 0,
@@ -3894,14 +3932,14 @@ def _pipelined_moe_tile_compute(
                 offs_xs_k,
                 stride_xsm,
                 stride_xsk,
-                rows_m_scale[:, None] < M_X,
+                mask_m_scale[:, None],
                 K // cfg.SCALE_BLOCK,
             )
     else:
         x_scale_desc: gl.constexpr = 0
 
     if HAS_W_BLOCK_SCALE:
-        if cfg.SCALE_VIA_LDS:
+        if cfg.W_SCALE_VIA_LDS:
             BLOCK_N_PS: gl.constexpr = cfg.BLOCK_N_PRESHUFFLED
             BLOCK_K_S_PS_W: gl.constexpr = cfg.BLOCK_K_SCALE_PRESHUFFLED
             LW_S: gl.constexpr = cfg.load_layout_w_scale
@@ -4718,6 +4756,8 @@ def _pipelined_moe_kernel_scaled(
     W_VIA_VGPR: gl.constexpr = False,
     W_PREFETCH: gl.constexpr = True,
     W_CACHE_CG: gl.constexpr = False,
+    X_SCALE_VIA_LDS: gl.constexpr = False,
+    W_SCALE_VIA_LDS: gl.constexpr = False,
     USE_NARROW_N_STORE_LAYOUT: gl.constexpr = False,
     IS_MEDIUM_DECODE: gl.constexpr = False,
     MEDIUM_COMBINE: gl.constexpr = False,
@@ -4876,6 +4916,8 @@ def _pipelined_moe_kernel_scaled(
             W_VIA_VGPR=W_VIA_VGPR,
             W_PREFETCH=W_PREFETCH,
             W_CACHE_CG=W_CACHE_CG,
+            X_SCALE_VIA_LDS=X_SCALE_VIA_LDS,
+            W_SCALE_VIA_LDS=W_SCALE_VIA_LDS,
             USE_NARROW_N_STORE_LAYOUT=USE_NARROW_N_STORE_LAYOUT,
         )
 
@@ -5107,7 +5149,7 @@ def _launch_kernel(
         block_n,
         block_k,
         scale_block=32,
-        has_x_scale=has_x_block_scale,
+        has_x_scale=has_x_block_scale and gather_indx is None,
         has_w_scale=has_w_block_scale,
         k=K,
         x_format=x_format,
@@ -5269,20 +5311,27 @@ def _launch_kernel(
         # N-contig W staged as [BK, BN] in LDS.
         stride_wn, stride_wk = w3.stride(-1), w3.stride(-2)
 
+    x_scale_load_mode = scale_load_mode
+    if has_x_block_scale and gather_indx is not None:
+        x_scale_load_mode = "transpose"
+    w_scale_load_mode = scale_load_mode
+    x_scale_via_lds = x_scale_load_mode == "swizzle" and has_x_block_scale
+    w_scale_via_lds = w_scale_load_mode == "swizzle" and has_w_block_scale
+
     if has_w_block_scale:
         w_scale3 = w_scale if w_scale.ndim == 3 else w_scale.unsqueeze(0)
-        w_scale_proc3 = _preprocess_scale(w_scale3, scale_load_mode)
+        w_scale_proc3 = _preprocess_scale(w_scale3, w_scale_load_mode)
         stride_wse = w_scale_proc3.stride(0)
-        stride_wsn, stride_wsk = _scale_strides(w_scale_proc3, scale_load_mode)
+        stride_wsn, stride_wsk = _scale_strides(w_scale_proc3, w_scale_load_mode)
         w_scale_buf = w_scale_proc3
     else:
         stride_wse = stride_wsn = stride_wsk = 0
         w_scale_buf = _make_dummy(x.device, torch.uint8)
 
     x_scale_proc = (
-        _preprocess_scale(x_scale, scale_load_mode) if has_x_block_scale else None
+        _preprocess_scale(x_scale, x_scale_load_mode) if has_x_block_scale else None
     )
-    stride_xsm, stride_xsk = _scale_strides(x_scale_proc, scale_load_mode)
+    stride_xsm, stride_xsk = _scale_strides(x_scale_proc, x_scale_load_mode)
 
     x_scale_buf = (
         x_scale_proc if x_scale_proc is not None else _make_dummy(x.device, torch.uint8)
@@ -5415,6 +5464,8 @@ def _launch_kernel(
         W_VIA_VGPR=False,
         W_PREFETCH=False,
         W_CACHE_CG=bool(w_cache_cg),
+        X_SCALE_VIA_LDS=bool(x_scale_via_lds),
+        W_SCALE_VIA_LDS=bool(w_scale_via_lds),
         USE_NARROW_N_STORE_LAYOUT=bool(use_narrow_n_store_layout),
         GRID_N=grid_n,
         GROUP_M=group_m,
@@ -6574,9 +6625,9 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
         return None
     if w13_preshuffled and two_i % 128 != 0:
         return None
-    I = two_i // 2
+    i_dim = two_i // 2
     w2_k_pk = int(getattr(w2_raw, "original_k_pk", int(w2_raw.shape[1])))
-    if w2_k_pk * 2 != I:
+    if w2_k_pk * 2 != i_dim:
         return None
     w2_n_phys = int(w2_raw.shape[2])
     N = int(getattr(w2_raw, "original_n", w2_n_phys))
@@ -6621,7 +6672,7 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
         s2_split_k = 1
 
     inter = torch.empty(
-        (n_tokens * top_k, I), dtype=x_fp8.dtype, device=hidden_states.device
+        (n_tokens * top_k, i_dim), dtype=x_fp8.dtype, device=hidden_states.device
     )
     # Cooperative-LDS, num_warps=4, software-pipelined stage1 -- the smallest-M
     # decode path (this wrapper is only entered for n_tokens <= WARP_DECODE_MAX_M).
@@ -6632,14 +6683,14 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
     COOP_BLOCK_N = 128 if w13_preshuffled else 64
     COOP_BLOCK_K = 256
     COOP_NUM_BUFFERS = 3
-    coop_grid = (n_tokens * ((2 * I + COOP_BLOCK_N - 1) // COOP_BLOCK_N) * top_k,)
+    coop_grid = (n_tokens * ((2 * i_dim + COOP_BLOCK_N - 1) // COOP_BLOCK_N) * top_k,)
     # X is stored as raw i8 in LDS and bitcast to e4m3 in mfma_scaled; pass the
     # uint8 view (an fp8 LDS buffer fails to lower).
     x_uint8 = x_fp8.view(torch.uint8)
     # fmt: off
     _warp_decode_topk_stage1_coop_kernel[coop_grid](
         x_uint8, router_logits_c, w13_raw, w13_scale, topk_ids, topk_weights, inter,
-        n_tokens, n_experts, D, I,
+        n_tokens, n_experts, D, i_dim,
         x_uint8.stride(0), x_uint8.stride(1),
         router_logits_c.stride(0), topk_ids.stride(0), topk_weights.stride(0),
         w13_raw.stride(0), w13_raw.stride(-2), w13_raw.stride(-1),
@@ -6679,13 +6730,13 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
     # fmt: off
     _warp_decode_stage2_fp8_mxfp4_kernel[s2_grid](
         inter, w2_raw, w2_scale, topk_ids, topk_weights, s2_dst,
-        n_tokens, N, w2_n_phys, I,
+        n_tokens, N, w2_n_phys, i_dim,
         inter.stride(0), inter.stride(1),
         w2_raw.stride(0), w2_raw.stride(-2), w2_raw.stride(-1),
         w2_scale.stride(0), w2_scale.stride(-2), w2_scale.stride(-1),
         s2_stride_om, s2_stride_on, s2_stride_ok,
         w2_act_scale, b2,
-        I_PACKED=I // 2, TOPK=top_k,
+        I_PACKED=i_dim // 2, TOPK=top_k,
         BLOCK_K=BLOCK_K, BLOCK_N=S2_BLOCK_N, M_DUP=S2_M_DUP,
         W_PRESHUFFLED=w2_preshuffled,
         HAS_BIAS=w2_bias is not None, SPLIT_K=s2_split_k,
@@ -7207,7 +7258,7 @@ def _warp_decode_stage1_coop_compute(
     Y,
     M,
     D,
-    I,
+    i_dim,
     stride_xm,
     stride_xk,
     stride_we,
@@ -7235,11 +7286,11 @@ def _warp_decode_stage1_coop_compute(
     """Cooperative gate_up GEMM + bias + SwiGLU + fp8-quant + store for one
     (token, slot, expert).  N runs over the INTERLEAVED gate_up rows (2*I);
     ``_swiglu_reduce`` splits even=gate / odd=up.  Mirrors the plain path of
-    ``_pipelined_moe_tile_compute`` (W_TRANSPOSE=False, SCALE_VIA_LDS w-scale,
+    ``_pipelined_moe_tile_compute`` (W_TRANSPOSE=False, swizzled w-scale,
     per-tensor x scale) but specialized to a single decode token (row 0 of the
     BLOCK_M tile).
     """
-    N = 2 * I
+    N = 2 * i_dim
     off_n = pid_n * BLOCK_N
     # Keep base offsets int32 (buffer_load_to_shared requires int32/uint32
     # offsets); expert * stride fits int32 for GPT-OSS shapes.
@@ -7257,7 +7308,7 @@ def _warp_decode_stage1_coop_compute(
         not W_PRESHUFFLED,  # W_TRANSPOSE for non-preshuffled K-packed-contiguous W
         False,  # WITH_X_MX_SCALE (per-tensor x scale only)
         True,  # WITH_W_MX_SCALE (e8m0 block scales)
-        "swizzle",  # SCALE_LOAD_MODE -> SCALE_VIA_LDS unswizzle
+        "swizzle",  # SCALE_LOAD_MODE -> W_SCALE_VIA_LDS unswizzle
         gl.int32,
         (1, 1, 1),  # NUM_SUBTILES
         False,  # EVEN_K (D=2880 not a multiple of BLOCK_K)
@@ -7309,10 +7360,10 @@ def _warp_decode_stage1_coop_compute(
             "and NUM_WARPS=4; re-derive the copy/read layouts for other shapes.",
         )
         LOAD_W_LAYOUT: gl.constexpr = _preshuffled_w_read_layout(
-            BLOCK_N // 16, BLOCK_K_W, cfg.SCALE_VIA_LDS
+            BLOCK_N // 16, BLOCK_K_W, cfg.W_SCALE_VIA_LDS
         )
         LOAD_W_COPY_LAYOUT: gl.constexpr = _preshuffled_w_copy_layout(
-            BLOCK_N // 16, BLOCK_K_W, cfg.SCALE_VIA_LDS, True
+            BLOCK_N // 16, BLOCK_K_W, cfg.W_SCALE_VIA_LDS, True
         )
         offsets_w, base_off_w = _make_preshuffled_w_full_offsets(
             w_base_offset,
@@ -7421,7 +7472,7 @@ def _warp_decode_stage1_coop_compute(
         + offs_y_n[None, :].to(gl.int64) * stride_yn
         + offs_y_m[:, None].to(gl.int64) * 0
     )
-    mask_y = (offs_y_m[:, None] == 0) & valid & (offs_y_n[None, :] < I)
+    mask_y = (offs_y_m[:, None] == 0) & valid & (offs_y_n[None, :] < i_dim)
     gl.store(Y + y_offs, out, mask=mask_y)
 
 
@@ -7437,7 +7488,7 @@ def _warp_decode_topk_stage1_coop_kernel(
     M,
     E,
     D,
-    I,
+    i_dim,
     stride_xm,
     stride_xk,
     stride_lm,
@@ -7476,7 +7527,7 @@ def _warp_decode_topk_stage1_coop_kernel(
     by TOPK. Routing layouts span all warps (EP/TKP padded to 64*NUM_WARPS).
     """
     pid = gl.program_id(axis=0)
-    num_pid_n = gl.cdiv(2 * I, BLOCK_N)
+    num_pid_n = gl.cdiv(2 * i_dim, BLOCK_N)
     slot = pid % TOPK
     rest = pid // TOPK
     pid_n = rest % num_pid_n
@@ -7529,7 +7580,7 @@ def _warp_decode_topk_stage1_coop_kernel(
     _warp_decode_stage1_coop_compute(
         token, slot, expert, pid_n,
         X, W, WScale, Y,
-        M, D, I,
+        M, D, i_dim,
         stride_xm, stride_xk,
         stride_we, stride_wk, stride_wn,
         stride_wse, stride_wsk, stride_wsn,
@@ -7589,7 +7640,7 @@ def _warp_decode_stage2_load_tile(
     stride_wk,
     stride_wsk,
     N_PHYS,
-    I,
+    i_dim,
     BLOCK_K: gl.constexpr,
     BLOCK_K_PACKED: gl.constexpr,
     BLOCK_K_SCALE: gl.constexpr,
@@ -7618,8 +7669,10 @@ def _warp_decode_stage2_load_tile(
     if MASK_TAIL:
         # Partial / odd final K-tile (K = intermediate dim I): mask out-of-range
         # K lanes to 0 so they contribute nothing and never over-read.
-        sk_valid = (kt * BLOCK_K_SCALE + bsk) < (I // 32)
-        a = gl.amd.cdna4.buffer_load(ptr=X, offsets=a_off, mask=k_elem < I, other=0.0)
+        sk_valid = (kt * BLOCK_K_SCALE + bsk) < (i_dim // 32)
+        a = gl.amd.cdna4.buffer_load(
+            ptr=X, offsets=a_off, mask=k_elem < i_dim, other=0.0
+        )
         b_mask = k_pack < I_PACKED
         b = gl.amd.cdna4.buffer_load(ptr=W, offsets=b_off, mask=b_mask, other=0)
         s = gl.amd.cdna4.buffer_load(ptr=WScale, offsets=s_off, mask=sk_valid, other=0)
@@ -7650,7 +7703,7 @@ def _warp_decode_stage2_load_pair(
     stride_wk,
     stride_wsk,
     N_PHYS,
-    I,
+    i_dim,
     BLOCK_K: gl.constexpr,
     BLOCK_K_PACKED: gl.constexpr,
     BLOCK_K_SCALE: gl.constexpr,
@@ -7662,13 +7715,13 @@ def _warp_decode_stage2_load_pair(
     a_even, b_even, s_even = _warp_decode_stage2_load_tile(
         kt, ak, bk, bsk, am, X, W, WScale,
         x_row_off, w_expert_off, w_n_off, ws_expert_off, scale_row_off,
-        n_cols, stride_xk, stride_wk, stride_wsk, N_PHYS, I,
+        n_cols, stride_xk, stride_wk, stride_wsk, N_PHYS, i_dim,
         BLOCK_K, BLOCK_K_PACKED, BLOCK_K_SCALE, I_PACKED, W_PRESHUFFLED,
     )
     a_odd, b_odd, s_odd = _warp_decode_stage2_load_tile(
         kt + 1, ak, bk, bsk, am, X, W, WScale,
         x_row_off, w_expert_off, w_n_off, ws_expert_off, scale_row_off,
-        n_cols, stride_xk, stride_wk, stride_wsk, N_PHYS, I,
+        n_cols, stride_xk, stride_wk, stride_wsk, N_PHYS, i_dim,
         BLOCK_K, BLOCK_K_PACKED, BLOCK_K_SCALE, I_PACKED, W_PRESHUFFLED,
     )
     # fmt: on
@@ -7704,7 +7757,7 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
     M,
     N,
     N_PHYS,
-    I,
+    i_dim,
     stride_xm,
     stride_xk,
     stride_we,
@@ -7758,8 +7811,8 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
     # Full + partial K-tile coverage (K = intermediate dim I). The old
     # `num_kt = I // BLOCK_K` dropped the partial final tile, miscomputing any
     # I not a multiple of BLOCK_K (GPT-OSS I=2880 lost K=2816..2879).
-    num_full = I // BLOCK_K
-    total_kt = (I + BLOCK_K - 1) // BLOCK_K
+    num_full = i_dim // BLOCK_K
+    total_kt = (i_dim + BLOCK_K - 1) // BLOCK_K
     kt_per = (total_kt + SPLIT_K - 1) // SPLIT_K
     kt_start = pid_k * kt_per
     kt_stop = gl.minimum(kt_start + kt_per, total_kt)
@@ -7813,7 +7866,7 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
                      a_odd, b_odd, s_odd) = _warp_decode_stage2_load_pair(
                         kt_start, ak, bk, bsk, am, X, W, WScale,
                         x_row_off, w_expert_off, w_n_off, ws_expert_off, scale_row_off,
-                        n_cols, stride_xk, stride_wk, stride_wsk, N_PHYS, I,
+                        n_cols, stride_xk, stride_wk, stride_wsk, N_PHYS, i_dim,
                         BLOCK_K, BLOCK_K_PACKED, BLOCK_K_SCALE, I_PACKED, W_PRESHUFFLED,
                     )
                     for kt in range(kt_start, main_end - 2, 2):
@@ -7821,7 +7874,7 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
                          nxt_a_odd, nxt_b_odd, nxt_s_odd) = _warp_decode_stage2_load_pair(
                             kt + 2, ak, bk, bsk, am, X, W, WScale,
                             x_row_off, w_expert_off, w_n_off, ws_expert_off, scale_row_off,
-                            n_cols, stride_xk, stride_wk, stride_wsk, N_PHYS, I,
+                            n_cols, stride_xk, stride_wk, stride_wsk, N_PHYS, i_dim,
                             BLOCK_K, BLOCK_K_PACKED, BLOCK_K_SCALE, I_PACKED, W_PRESHUFFLED,
                         )
                         acc = _warp_decode_stage2_mfma_pair(
@@ -7840,7 +7893,7 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
                     a_t, b_t, s_t = _warp_decode_stage2_load_tile(
                         kt, ak, bk, bsk, am, X, W, WScale,
                         x_row_off, w_expert_off, w_n_off, ws_expert_off, scale_row_off,
-                        n_cols, stride_xk, stride_wk, stride_wsk, N_PHYS, I,
+                        n_cols, stride_xk, stride_wk, stride_wsk, N_PHYS, i_dim,
                         BLOCK_K, BLOCK_K_PACKED, BLOCK_K_SCALE, I_PACKED, W_PRESHUFFLED,
                         MASK_TAIL=True,
                     )

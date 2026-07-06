@@ -39,7 +39,7 @@ import os
 import struct
 import threading
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING
 
 import requests
 import zmq
@@ -56,6 +56,9 @@ from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.network import get_free_port, get_local_ip_by_remote
 
 logger = get_colorful_logger(__name__)
+
+if TYPE_CHECKING:
+    import torch
 
 
 def _route_get(bootstrap_addr: str, engine_rank: int, target_dp_group: int):
@@ -117,7 +120,7 @@ class EmbeddingArgs:
 
     engine_rank: int
     gpu_id: int
-    ib_device: Optional[str]
+    ib_device: str | None
     embedding_data_ptr: int
     embedding_data_len: int
     deepstack_data_ptr: int = 0
@@ -146,7 +149,7 @@ class EmbeddingChunk:
     # filled this chunk's ring slot. The transfer worker waits it before its
     # one-sided RDMA read so the read never races the copy (ViT->send corruption
     # hazard). None on CPU/no-CUDA.
-    copy_event: Optional["torch.cuda.Event"] = None
+    copy_event: torch.cuda.Event | None = None
 
 
 @dataclasses.dataclass
@@ -166,7 +169,7 @@ class EmbeddingArgsRegisterInfo:
     dst_embedding_ptr: int
     dst_deepstack_ptr: int
 
-    def to_zmq(self) -> List[bytes]:
+    def to_zmq(self) -> list[bytes]:
         return [
             _b(self.room),
             _b(self.endpoint),
@@ -177,7 +180,7 @@ class EmbeddingArgsRegisterInfo:
         ]
 
     @classmethod
-    def from_zmq(cls, msg: List[bytes]) -> "EmbeddingArgsRegisterInfo":
+    def from_zmq(cls, msg: list[bytes]) -> "EmbeddingArgsRegisterInfo":
         return cls(
             room=msg[0].decode("ascii"),
             endpoint=msg[1].decode("ascii"),
@@ -221,7 +224,7 @@ class EmbeddingTransferInfo:
     row_start: int = 0
     span: int = 0
 
-    def to_zmq(self) -> List[bytes]:
+    def to_zmq(self) -> list[bytes]:
         return [
             _b(self.room),
             _b(self.endpoint),
@@ -239,7 +242,7 @@ class EmbeddingTransferInfo:
         ]
 
     @classmethod
-    def from_zmq(cls, msg: List[bytes]) -> "EmbeddingTransferInfo":
+    def from_zmq(cls, msg: list[bytes]) -> "EmbeddingTransferInfo":
         # Length-guarded so a truncated frame is logged and dropped by the
         # bootstrap listener instead of mis-parsing.
         if len(msg) < 13:
@@ -264,8 +267,8 @@ class EmbeddingTransferInfo:
 
 
 def validate_fanout_frames(
-    infos: List[EmbeddingTransferInfo], chunk: "EmbeddingChunk"
-) -> Optional[str]:
+    infos: list[EmbeddingTransferInfo], chunk: "EmbeddingChunk"
+) -> str | None:
     """Pre-send contract check over a room's full fanout set; None when valid.
 
     Per frame: hidden/dtype must match the chunk; ``span`` (every frame carries
@@ -316,7 +319,7 @@ def validate_fanout_frames(
 
 def shard_payload(
     chunk: "EmbeddingChunk", info: EmbeddingTransferInfo
-) -> Tuple[int, int, int, int]:
+) -> tuple[int, int, int, int]:
     """Source pointer/length math for one receiver's row shard of a chunk.
 
     Returns ``(src_ptr, nbytes, src_deepstack_ptr, deepstack_nbytes)`` for the
@@ -364,7 +367,7 @@ class MooncakeEmbeddingSender:
         src_deepstack_ptr: int = 0,
         deepstack_width: int = 0,
         deepstack_nbytes: int = 0,
-        copy_event: Optional["torch.cuda.Event"] = None,
+        copy_event: torch.cuda.Event | None = None,
     ) -> None:
         chunk = EmbeddingChunk(
             room=self.bootstrap_room,
@@ -418,12 +421,12 @@ class MooncakeEmbeddingManagerEncode(EmbeddingManagerBase):
     def __init__(self, args: EmbeddingManagerArgs, embedding_args: "EmbeddingArgs"):
         super().__init__(args, embedding_args, DisaggregationMode.ENCODE)
         # room -> {receiver_session -> EmbeddingTransferInfo}
-        self.transfer_infos: Dict[int, Dict[str, EmbeddingTransferInfo]] = {}
+        self.transfer_infos: dict[int, dict[str, EmbeddingTransferInfo]] = {}
         # Bootstrap registration-wait timeout (default 120s).
         self.bootstrap_time_out = envs.TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
         # room -> [(deadline, chunk), ...] chunks popped before the receiver
         # registered; flushed by the bootstrap thread once its info arrives.
-        self._pending: Dict[int, List[tuple]] = {}
+        self._pending: dict[int, list[tuple]] = {}
         self._pending_lock = threading.Lock()
         # zmq sockets are not thread-safe and status pushes come from any
         # fanout-pool thread: keep one PUSH socket per (thread, endpoint).
@@ -444,7 +447,7 @@ class MooncakeEmbeddingManagerEncode(EmbeddingManagerBase):
             f"TOKENSPEED_DISAGGREGATION_THREAD_POOL_SIZE={pool_size} must be >= "
             f"TOKENSPEED_DISAGGREGATION_QUEUE_SIZE={queue_count}"
         )
-        self._queues: List[FastQueue] = [FastQueue() for _ in range(queue_count)]
+        self._queues: list[FastQueue] = [FastQueue() for _ in range(queue_count)]
         self._executors = [
             concurrent.futures.ThreadPoolExecutor(max(1, pool_size // queue_count))
             for _ in range(queue_count)
@@ -612,8 +615,8 @@ class MooncakeEmbeddingManagerEncode(EmbeddingManagerBase):
     def _fail_room(
         self,
         room: int,
-        reason: Optional[str],
-        infos: List[EmbeddingTransferInfo],
+        reason: str | None,
+        infos: list[EmbeddingTransferInfo],
     ) -> None:
         if reason is not None:
             self.record_failure(room, reason)
@@ -629,7 +632,7 @@ class MooncakeEmbeddingManagerEncode(EmbeddingManagerBase):
         with self._pending_lock:
             return room in self._pending
 
-    def fail_room(self, room: int, reason: Optional[str]) -> None:
+    def fail_room(self, room: int, reason: str | None) -> None:
         """Conclude ``room`` Failed and push Failed to all of its registered
         receivers. Public seam for the encode executor, which must not reach into
         ``transfer_infos`` or the status FSM directly."""
@@ -714,10 +717,10 @@ class MooncakeEmbeddingManagerPrefill(EmbeddingManagerBase):
 
     def __init__(self, args: EmbeddingManagerArgs, embedding_args: "EmbeddingArgs"):
         super().__init__(args, embedding_args, DisaggregationMode.PREFILL)
-        self.required_response_num: Dict[int, int] = {}
-        self.response_tracker: Dict[int, set] = {}
-        self.connection_pool: Dict[str, list] = {}
-        self.prefill_parallel_info: Dict[str, dict] = {}
+        self.required_response_num: dict[int, int] = {}
+        self.response_tracker: dict[int, set] = {}
+        self.connection_pool: dict[str, list] = {}
+        self.prefill_parallel_info: dict[str, dict] = {}
         self._start_status_thread()
 
     def _start_status_thread(self):

@@ -22,7 +22,6 @@ import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Dict, Set, Union
 
 import numpy as np
 import requests
@@ -98,11 +97,11 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
             envs.TOKENSPEED_DISAGGREGATION_HEARTBEAT_MAX_FAILURE.get(), 1
         )
         self.start_decode_thread()
-        self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
-        self.required_prefill_response_num_table: Dict[int, int] = {}
-        self.prefill_response_tracker: Dict[int, Set[int]] = defaultdict(set)
+        self.connection_pool: dict[str, dict[str, str | int]] = {}
+        self.required_prefill_response_num_table: dict[int, int] = {}
+        self.prefill_response_tracker: dict[int, set[int]] = defaultdict(set)
 
-        self.prefill_parallel_info: Dict[str, PrefillParallelInfo] = {}
+        self.prefill_parallel_info: dict[str, PrefillParallelInfo] = {}
 
         # If a timeout happens on the decode side, it means decode instances
         # fail to receive the KV Cache transfer done signal after bootstrapping.
@@ -115,10 +114,10 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
         # Maps bootstrap_room -> bootstrap_token (first output token from prefill).
         # Populated by decode_thread when a Success message carries a valid token,
         # consumed by DisaggDecodeExecutor.generate_events() via pop_bootstrap_token().
-        self.bootstrap_token_table: Dict[int, int] = {}
-        self.spec_candidate_ids_table: Dict[int, list[int]] = {}
-        self._pending_bootstrap_token_table: Dict[int, int] = {}
-        self._pending_spec_candidate_ids_table: Dict[int, list[int]] = {}
+        self.bootstrap_token_table: dict[int, int] = {}
+        self.spec_candidate_ids_table: dict[int, list[int]] = {}
+        self._pending_bootstrap_token_table: dict[int, int] = {}
+        self._pending_spec_candidate_ids_table: dict[int, list[int]] = {}
 
         def decode_thread():
             while True:

@@ -90,7 +90,7 @@ class _AttentionFamilySpec:
 
 
 def override_model_config(model_config, ext_yaml):
-    with open(ext_yaml) as f:
+    with open(ext_yaml, encoding="utf-8") as f:
         ext_config = yaml.safe_load(f)
 
     override_model_config: dict = ext_config.get("override_model_config", {})
@@ -506,12 +506,17 @@ class ModelConfig:
                         allow_patterns=["*.json"],
                         local_files_only=True,
                     )
-                except Exception:
+                except Exception as exc:
+                    logger.debug(
+                        "Unable to resolve local quantization config for %s: %s",
+                        self.model_path,
+                        exc,
+                    )
                     model_dir = None
             if model_dir is not None:
                 hf_quant_path = os.path.join(model_dir, "hf_quant_config.json")
                 if os.path.isfile(hf_quant_path):
-                    with open(hf_quant_path) as f:
+                    with open(hf_quant_path, encoding="utf-8") as f:
                         hf_quant = json.load(f)
                     quant_algo = hf_quant.get("quantization", {}).get("quant_algo", "")
                     if quant_algo:
@@ -621,13 +626,10 @@ def get_hf_text_config(config: PretrainedConfig):
         return config
 
     if hasattr(config, "text_config"):
-        # The code operates under the assumption that text_config should have
-        # `num_attention_heads` (among others). Assert here to fail early
-        # if transformers config doesn't align with this assumption.
-        assert hasattr(config.text_config, "num_attention_heads")
+        if not hasattr(config.text_config, "num_attention_heads"):
+            raise ValueError("text_config must define num_attention_heads")
         return config.text_config
-    else:
-        return config
+    return config
 
 
 _STR_DTYPE_TO_TORCH_DTYPE = {

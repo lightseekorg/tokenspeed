@@ -441,6 +441,36 @@ def _make_hidden_and_router(num_tokens: int) -> tuple[torch.Tensor, torch.Tensor
     return hidden_states, router_logits
 
 
+def _quantize_mxfp4_for_test(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    if x.shape[-1] % MXFP4_BLOCK != 0:
+        raise ValueError("MXFP4 test quantization requires 32-element blocks")
+
+    x_blocks = x.to(torch.float32).reshape(
+        *x.shape[:-1],
+        x.shape[-1] // MXFP4_BLOCK,
+        MXFP4_BLOCK,
+    )
+    max_abs = x_blocks.abs().amax(dim=-1)
+    min_exp = torch.full_like(max_abs, -127.0)
+    scale_exp = torch.where(
+        max_abs > 0,
+        torch.floor(torch.log2(max_abs)) - 2,
+        min_exp,
+    ).clamp(-127, 127)
+
+    scaled = x_blocks * torch.exp2(-scale_exp).unsqueeze(-1)
+    abs_scaled = scaled.abs()
+    codes = torch.zeros_like(abs_scaled, dtype=torch.uint8)
+    for threshold in (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0):
+        codes += (abs_scaled >= threshold).to(torch.uint8)
+    codes |= (scaled < 0).to(torch.uint8) * 8
+
+    packed_blocks = codes[..., 0::2] | (codes[..., 1::2] << 4)
+    packed = packed_blocks.reshape(*x.shape[:-1], x.shape[-1] // 2).contiguous()
+    scales = (scale_exp.to(torch.int16) + 127).to(torch.uint8).contiguous()
+    return packed, scales
+
+
 def _make_gemm2_input(num_tokens: int, scale: torch.Tensor) -> torch.Tensor:
     generator = torch.Generator(device="cuda").manual_seed(19000 + num_tokens)
     exact_values = (
@@ -517,6 +547,32 @@ def _compute_torch_gemm1_reference(
         dtype=torch.bfloat16,
     )
     x = _fp8_dequant(gemm1_input, weights.w13_act_scale)
+    for expert, (start, end) in enumerate(_expert_ranges(ragged_metadata)):
+        if start == end:
+            continue
+        row_idx = gather_indx[start:end].long()
+        w13 = _mxfp4_dequant(raw.w13_weight[expert], raw.w13_scale[expert])
+        gate_up = x[row_idx] @ w13.T
+        if weights.w13_bias is not None:
+            gate_up = gate_up + weights.w13_bias[expert][None, :]
+        output[start:end] = _swiglu_reference(gate_up).to(torch.bfloat16)
+    return output
+
+
+def _compute_torch_gemm1_mxfp4_reference(
+    raw: RawMxfp4Weights,
+    gemm1_input: torch.Tensor,
+    gemm1_scale: torch.Tensor,
+    weights: Mxfp4Weights,
+    ragged_metadata: Any,
+    gather_indx: torch.Tensor,
+) -> torch.Tensor:
+    output = torch.empty(
+        (gather_indx.numel(), INTERMEDIATE_SIZE),
+        device=gemm1_input.device,
+        dtype=torch.bfloat16,
+    )
+    x = _mxfp4_dequant(gemm1_input, gemm1_scale)
     for expert, (start, end) in enumerate(_expert_ranges(ragged_metadata)):
         if start == end:
             continue
@@ -699,4 +755,51 @@ def test_gluon_moe_gemms_with_preshuffle_match_torch_gfx950(
         num_tokens,
         weights=mxfp4_weights.preshuffled,
         torch_references=torch_references,
+    )
+
+
+@requires_gfx950
+@pytest.mark.parametrize("num_tokens", KEY_NUM_TOKENS)
+@pytest.mark.parametrize("variant", ("nonpreshuffled", "preshuffled"))
+def test_gluon_moe_gemm1_dynamic_mxfp4_gather_scales_match_torch_gfx950(
+    num_tokens: int,
+    mxfp4_weights: Mxfp4WeightVariants,
+    variant: str,
+) -> None:
+    weights = getattr(mxfp4_weights, variant)
+    hidden_states, router_logits = _make_hidden_and_router(num_tokens)
+    ragged_metadata, gather_indx, _scatter_indx, _gate_scal = default_route(
+        router_logits,
+        TOPK,
+        dtype=router_logits.dtype,
+    )
+    gemm1_input, gemm1_scale = _quantize_mxfp4_for_test(hidden_states)
+
+    with torch.no_grad():
+        actual = gluon_moe.gluon_mxfp_ragged_matmul(
+            gemm1_input,
+            weights.w13_weight,
+            weights.w13_bias,
+            w_mx_scale=weights.w13_precision_config.b_mx_scale,
+            x_mx_scale=gemm1_scale,
+            x_format="e2m1",
+            out_dtype=weights.w13_precision_config.out_dtype,
+            a_ragged_metadata=ragged_metadata,
+            gather_indx=gather_indx,
+            fused_activation=_swiglu_activation(),
+        )
+        expected = _compute_torch_gemm1_mxfp4_reference(
+            mxfp4_weights.raw,
+            gemm1_input,
+            gemm1_scale,
+            weights,
+            ragged_metadata,
+            gather_indx,
+        )
+
+    torch.testing.assert_close(
+        actual.float(),
+        expected.float(),
+        atol=GEMM_ATOL,
+        rtol=RTOL,
     )

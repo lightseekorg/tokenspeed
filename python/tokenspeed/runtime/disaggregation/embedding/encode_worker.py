@@ -35,7 +35,6 @@ orchestrates them, so it is unit-testable with fakes.
 from __future__ import annotations
 
 import dataclasses
-from typing import List, Union
 
 from tokenspeed.runtime.cache.embedding_cache import (
     EmbeddingCache,
@@ -65,7 +64,7 @@ class EncodeRequest:
     bootstrap_host: str
     bootstrap_port: int
     bootstrap_room: int
-    items: List[MultimodalDataItem]
+    items: list[MultimodalDataItem]
 
 
 def _nbytes(tensor) -> int:
@@ -85,7 +84,7 @@ class EncodeWorker:
         self,
         executor,
         scheduler: EncodeScheduler,
-        cache: Union[EmbeddingCache, TieredEmbeddingCache],
+        cache: EmbeddingCache | TieredEmbeddingCache,
     ):
         self.executor = executor
         self.scheduler = scheduler

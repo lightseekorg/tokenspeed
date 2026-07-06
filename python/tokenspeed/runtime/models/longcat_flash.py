@@ -836,7 +836,10 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
                 ):
                     weight_block_size = self.quant_config.weight_block_size
                     if weight_block_size is not None:
-                        assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
+                        if not hasattr(self_attn.kv_b_proj, "weight_scale_inv"):
+                            raise RuntimeError(
+                                "kv_b_proj.weight_scale_inv is required for block FP8 dequant."
+                            )
                         dtype = torch.get_default_dtype()
                         w = _block_dequant(
                             self_attn.kv_b_proj.weight,

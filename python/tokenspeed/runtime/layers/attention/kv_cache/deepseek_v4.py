@@ -14,9 +14,10 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from fractions import Fraction
-from typing import Any, Iterable, Optional, Sequence
+from typing import Any
 
 import numpy as np
 import torch
@@ -237,6 +238,8 @@ def profile_deepseek_v4_max_num_pages(
     max_context_len: int,
     available_cache_memory_bytes: int,
     draft_cache_cell_size: int = 0,
+    decode_input_tokens: int = 1,
+    overlap_schedule_depth: int = 0,
 ) -> int:
     """Return the largest scheduler page budget that fits V4 grouped caches."""
     page_size = int(layout.page_size)
@@ -264,6 +267,8 @@ def profile_deepseek_v4_max_num_pages(
             max_scheduled_tokens=max_scheduled_tokens,
             max_total_tokens=num_tokens,
             max_context_len=max_context_len,
+            decode_input_tokens=decode_input_tokens,
+            overlap_schedule_depth=overlap_schedule_depth,
         )
         cache_bytes = sum(
             int(counts[gid]) * bytes_per_page
@@ -290,6 +295,8 @@ def profile_deepseek_v4_max_num_pages(
         max_scheduled_tokens=max_scheduled_tokens,
         max_total_tokens=0,
         max_context_len=max_context_len,
+        decode_input_tokens=decode_input_tokens,
+        overlap_schedule_depth=overlap_schedule_depth,
     )
     fixed_bytes = sum(
         int(fixed_counts[gid]) * bytes_per_page
@@ -714,7 +721,7 @@ def deepseek_v4_cache_layout_from_config(
     hf_config,
     page_size: int,
     use_fp4_indexer_cache: bool,
-    layer_indices: Optional[Iterable[int]] = None,
+    layer_indices: Iterable[int] | None = None,
 ) -> DeepseekV4CacheLayout:
     compress_ratios = tuple(hf_config.compress_ratios)
     if layer_indices is None:
@@ -772,6 +779,8 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
         rank: int,
         hf_config: Any,
         max_scheduled_tokens: int,
+        decode_input_tokens: int = 1,
+        overlap_schedule_depth: int = 0,
     ) -> None:
         if size <= 0:
             raise ValueError(f"DeepSeek V4 KV pool size must be positive, got {size}")
@@ -818,6 +827,8 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
             max_scheduled_tokens=max(0, int(max_scheduled_tokens)),
             max_total_tokens=size,
             max_context_len=max_context_len,
+            decode_input_tokens=decode_input_tokens,
+            overlap_schedule_depth=overlap_schedule_depth,
         )
 
         def _group_rows(group_id: str, default: int) -> int:

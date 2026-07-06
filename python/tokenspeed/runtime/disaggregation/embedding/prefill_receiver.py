@@ -48,7 +48,8 @@ from __future__ import annotations
 import logging
 import time
 from collections import deque
-from typing import Any, Callable, List, Mapping, Optional, Sequence, Tuple
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -85,7 +86,7 @@ _RECV_POOL_QUARANTINE_S = 10.0
 _pending_dereg: deque = deque()
 
 
-def _lazy_deregister(engine: Any, tensors: List[Tuple[torch.Tensor, int]]) -> None:
+def _lazy_deregister(engine: Any, tensors: list[tuple[torch.Tensor, int]]) -> None:
     _pending_dereg.append((time.monotonic() + _DEREG_DELAY_S, engine, tensors))
     _sweep_deregister()
 
@@ -128,7 +129,7 @@ class _RecvBufferPool:
         self._free = list(range(n_slots))
         self._quarantine: deque = deque()  # (release_due_monotonic, slot)
 
-    def lease(self, nbytes: int) -> Optional[int]:
+    def lease(self, nbytes: int) -> int | None:
         now = time.monotonic()
         while self._quarantine and self._quarantine[0][0] <= now:
             self._free.append(self._quarantine.popleft()[1])
@@ -151,7 +152,7 @@ class _RecvBufferPool:
 _POOLS: dict = {}
 
 
-def _get_pool(engine: Any, device: Any) -> Optional[_RecvBufferPool]:
+def _get_pool(engine: Any, device: Any) -> _RecvBufferPool | None:
     key = (id(engine), str(device))
     pool = _POOLS.get(key)
     if pool is None:
@@ -214,18 +215,18 @@ class _ItemReceive:
         self,
         item: MultimodalDataItem,
         recv_main: torch.Tensor,
-        recv_deepstack: Optional[torch.Tensor],
-        receivers: List[Any],
-        main_slice_ptrs: List[int],
-        deepstack_slice_ptrs: List[int],
-        spans: List[int],
-        row_starts: List[int],
-        row_counts: List[int],
-        sharded: List[bool],
+        recv_deepstack: torch.Tensor | None,
+        receivers: list[Any],
+        main_slice_ptrs: list[int],
+        deepstack_slice_ptrs: list[int],
+        spans: list[int],
+        row_starts: list[int],
+        row_counts: list[int],
+        sharded: list[bool],
         n_tokens: int,
         hidden: int,
-        pool: Optional[_RecvBufferPool] = None,
-        pool_slot: Optional[int] = None,
+        pool: _RecvBufferPool | None = None,
+        pool_slot: int | None = None,
     ):
         self.item = item
         self.recv_main = recv_main
@@ -296,7 +297,7 @@ class EmbeddingReceiveJob:
         num_deepstack: int,
         dtype: torch.dtype,
         device: torch.device | str,
-        receiver_factory: Optional[ReceiverFactory] = None,
+        receiver_factory: ReceiverFactory | None = None,
         shard_rank: int = 0,
         shard_size: int = 1,
     ):
@@ -326,7 +327,7 @@ class EmbeddingReceiveJob:
         # gateway mints one room per item and the encode worker row-splits the
         # concatenated-subgrid embedding per item -- so one item == one room == one
         # embedding.
-        self._items: List[_ItemReceive] = []
+        self._items: list[_ItemReceive] = []
         for item in items:
             handshake = getattr(item, "encode_handshake", None)
             if handshake is None:
@@ -384,11 +385,11 @@ class EmbeddingReceiveJob:
             row_start, row_count = 0, span
         # Length-1 per-image lists so poll()/_packed_to_full()/reassemble() iterate
         # unchanged (one item == one image under per-item rooms).
-        receivers: List[Any] = [receiver]
-        spans: List[int] = [span]
-        row_starts: List[int] = [row_start]
-        row_counts: List[int] = [row_count]
-        sharded: List[bool] = [is_sharded]
+        receivers: list[Any] = [receiver]
+        spans: list[int] = [span]
+        row_starts: list[int] = [row_start]
+        row_counts: list[int] = [row_count]
+        sharded: list[bool] = [is_sharded]
 
         # The RECEIVE buffer holds only THIS rank's shard rows, packed contiguously
         # (image i at rows [packed_cursor, packed_cursor + row_count)); the FULL
@@ -436,7 +437,7 @@ class EmbeddingReceiveJob:
                     recv_main.data_ptr(),
                     recv_main.numel() * recv_main.element_size(),
                 )
-        recv_deepstack: Optional[torch.Tensor] = None
+        recv_deepstack: torch.Tensor | None = None
         if self.num_deepstack > 0:
             recv_deepstack = torch.empty(
                 (packed_tokens, self.hidden * self.num_deepstack),
@@ -454,8 +455,8 @@ class EmbeddingReceiveJob:
         # not re-apply row_start -- that only selects which SOURCE rows to read).
         # A 0-row shard still records its (empty) pointer; its pre_alloc is the
         # registration heartbeat the encode fanout gate counts.
-        main_slice_ptrs: List[int] = []
-        deepstack_slice_ptrs: List[int] = []
+        main_slice_ptrs: list[int] = []
+        deepstack_slice_ptrs: list[int] = []
         packed_cursor = 0
         for row_count in row_counts:
             main_slice_ptrs.append(
@@ -728,7 +729,7 @@ def start_embedding_receive(
     num_deepstack: int,
     dtype: torch.dtype,
     device: torch.device | str,
-    receiver_factory: Optional[ReceiverFactory] = None,
+    receiver_factory: ReceiverFactory | None = None,
     shard_rank: int = 0,
     shard_size: int = 1,
 ) -> EmbeddingReceiveJob:
@@ -764,7 +765,7 @@ def receive_encoded_embeddings(
     dtype: torch.dtype,
     device: torch.device | str,
     timeout: float = 60.0,
-    receiver_factory: Optional[ReceiverFactory] = None,
+    receiver_factory: ReceiverFactory | None = None,
 ) -> None:
     """BLOCKING wrapper: fill ``item.encoded`` from the per-item transfers.
 

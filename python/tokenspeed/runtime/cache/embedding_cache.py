@@ -34,7 +34,7 @@ sizes and the device<->host copies are injectable.
 from __future__ import annotations
 
 import collections
-from typing import Callable, Hashable, Optional, Tuple
+from collections.abc import Callable, Hashable
 
 
 class EmbeddingCache:
@@ -52,21 +52,21 @@ class EmbeddingCache:
     def __init__(
         self,
         capacity_bytes: int,
-        on_evict: Optional[Callable[[Hashable, object, int], None]] = None,
+        on_evict: Callable[[Hashable, object, int], None] | None = None,
     ):
         if capacity_bytes < 0:
             raise ValueError(f"capacity_bytes must be >= 0, got {capacity_bytes}")
         self.capacity_bytes = capacity_bytes
         self._on_evict = on_evict
         # key -> (value, nbytes); ordered by recency (oldest first).
-        self._store: "collections.OrderedDict[Hashable, Tuple[object, int]]" = (
+        self._store: collections.OrderedDict[Hashable, tuple[object, int]] = (
             collections.OrderedDict()
         )
         self._cur_bytes = 0
         self.hits = 0
         self.misses = 0
 
-    def get(self, key: Hashable) -> Optional[object]:
+    def get(self, key: Hashable) -> object | None:
         entry = self._store.get(key)
         if entry is None:
             self.misses += 1
@@ -89,7 +89,7 @@ class EmbeddingCache:
         self._cur_bytes += nbytes
         self._evict()
 
-    def pop(self, key: Hashable) -> Optional[Tuple[object, int]]:
+    def pop(self, key: Hashable) -> tuple[object, int] | None:
         """Remove ``key`` and return its ``(value, nbytes)``, or ``None`` if
         absent. A structural removal: it neither counts as a hit/miss nor fires
         ``on_evict`` (the caller is taking ownership of the value, e.g. to
@@ -162,8 +162,8 @@ class TieredEmbeddingCache:
         l2_capacity_bytes: int,
         *,
         device: object = None,
-        to_host: Optional[Callable[[object], object]] = None,
-        to_device: Optional[Callable[[object], object]] = None,
+        to_host: Callable[[object], object] | None = None,
+        to_device: Callable[[object], object] | None = None,
     ):
         # L1 demotes its evictions into L2 via the on_evict hook; L2 is the
         # bottom tier (no hook), so its evictions are true drops -- no recursion.
@@ -178,7 +178,7 @@ class TieredEmbeddingCache:
         self.promotions = 0
         self.demotions = 0
 
-    def get(self, key: Hashable) -> Optional[object]:
+    def get(self, key: Hashable) -> object | None:
         value = self.l1.get(key)
         if value is not None:
             self.l1_hits += 1

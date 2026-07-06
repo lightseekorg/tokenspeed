@@ -19,13 +19,12 @@
 # SOFTWARE.
 
 import logging
-from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
 
 class MooncakeTransferEngine:
-    def __init__(self, hostname: str, gpu_id: int, ib_device: Optional[str] = None):
+    def __init__(self, hostname: str, gpu_id: int, ib_device: str | None = None):
         try:
             from mooncake.engine import TransferEngine
         except ImportError as e:
@@ -69,7 +68,7 @@ class MooncakeTransferEngine:
     def initialize(
         self,
         hostname: str,
-        device_name: Optional[str],
+        device_name: str | None,
     ) -> None:
         """Initialize the mooncake instance."""
         ret_value = self.engine.initialize(
@@ -110,9 +109,9 @@ class MooncakeTransferEngine:
     def batch_transfer_sync(
         self,
         session_id: str,
-        buffers: List[int],
-        peer_buffer_addresses: List[int],
-        lengths: List[int],
+        buffers: list[int],
+        peer_buffer_addresses: list[int],
+        lengths: list[int],
     ) -> int:
         """Synchronously transfer data to the specified addresses in batches."""
         try:

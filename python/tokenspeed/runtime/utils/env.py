@@ -130,7 +130,8 @@ class EnvField:
     def get(self) -> Any:
         value = os.getenv(self.name)
         if self._set_to_none:
-            assert value is None
+            if value is not None:
+                raise RuntimeError(f"{self.name} is set while marked as None.")
             return None
 
         if value is None:

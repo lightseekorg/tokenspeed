@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import threading
 from functools import cache
-from typing import Dict
 
 import zmq
 
@@ -53,8 +52,8 @@ class DisaggManagerBase:
         self.register_buffer_to_engine()
 
         self.rank_port = None
-        self.request_status: Dict[int, int] = {}
-        self.failure_records: Dict[int, str] = {}
+        self.request_status: dict[int, int] = {}
+        self.failure_records: dict[int, str] = {}
         self.failure_lock = threading.Lock()
 
     def register_buffer_to_engine(self):

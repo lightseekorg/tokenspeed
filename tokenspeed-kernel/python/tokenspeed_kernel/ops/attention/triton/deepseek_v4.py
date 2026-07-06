@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT AND Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 LightSeek Foundation
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
 # Copyright (c) 2026 LightSeek Foundation
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -1792,10 +1796,9 @@ def deepseek_v4_indexer_decode_metadata_compute(
 
 
 # Fused inverse-RoPE + block-scaled FP8 quant for the V4 attention output
-# projection. Adapted from vllm-project/vllm
-# (models/deepseek_v4/common/ops/fused_inv_rope_fp8_quant.py). Output scale is
-# pre-transformed (MN-major TMA-aligned; INT32-packed UE8M0 on SM100, FP32 on
-# SM90) so deep_gemm.fp8_einsum can consume it without re-transforming.
+# projection. Output scale is pre-transformed (MN-major TMA-aligned;
+# INT32-packed UE8M0 on SM100, FP32 on SM90) so deep_gemm.fp8_einsum can
+# consume it without re-transforming.
 @triton.jit(do_not_specialize=["num_tokens"])
 def _deepseek_v4_fused_inv_rope_fp8_quant_per_head(
     o_ptr,

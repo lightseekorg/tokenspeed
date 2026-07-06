@@ -18,6 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+from __future__ import annotations
+
 from enum import IntEnum, auto
 
 
@@ -34,13 +36,15 @@ class SpeculativeAlgorithm(IntEnum):
         return self in (SpeculativeAlgorithm.EAGLE3, SpeculativeAlgorithm.MTP)
 
     @staticmethod
-    def from_string(name: str | None) -> "SpeculativeAlgorithm":
+    def from_string(name: str | None) -> SpeculativeAlgorithm:
+        if name is None:
+            return SpeculativeAlgorithm.NONE
         name_map = {
             "EAGLE3": SpeculativeAlgorithm.EAGLE3,
             "MTP": SpeculativeAlgorithm.MTP,
             "DFLASH": SpeculativeAlgorithm.DFLASH,
-            None: SpeculativeAlgorithm.NONE,
         }
-        if name is not None:
-            name = name.upper()
-        return name_map[name]
+        try:
+            return name_map[name.upper()]
+        except KeyError as exc:
+            raise ValueError(f"Unknown speculative algorithm: {name}") from exc

@@ -23,7 +23,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.ops.attention.flashinfer import (
@@ -65,16 +65,16 @@ if TYPE_CHECKING:
 class MambaForwardMetadata:
     query_start_loc: torch.Tensor | None
     mamba_cache_indices: torch.Tensor
-    mamba_output_indices: Optional[torch.Tensor] = None
-    mamba_req_pool_indices: Optional[torch.Tensor] = None
-    extend_prefix_lens: Optional[torch.Tensor] = None
-    extend_seq_lens_cpu: Optional[torch.Tensor] = None
+    mamba_output_indices: torch.Tensor | None = None
+    mamba_req_pool_indices: torch.Tensor | None = None
+    extend_prefix_lens: torch.Tensor | None = None
+    extend_seq_lens_cpu: torch.Tensor | None = None
     # Pre-computed src/dst indices for extracting Mamba prefix-cache snapshots.
-    track_ssm_h_src: Optional[torch.Tensor] = None
-    track_ssm_h_dst: Optional[torch.Tensor] = None
-    track_conv_indices: Optional[torch.Tensor] = None
-    track_ssm_final_src: Optional[torch.Tensor] = None
-    track_ssm_final_dst: Optional[torch.Tensor] = None
+    track_ssm_h_src: torch.Tensor | None = None
+    track_ssm_h_dst: torch.Tensor | None = None
+    track_conv_indices: torch.Tensor | None = None
+    track_ssm_final_src: torch.Tensor | None = None
+    track_ssm_final_dst: torch.Tensor | None = None
 
 
 class LayerMappedKVPool:

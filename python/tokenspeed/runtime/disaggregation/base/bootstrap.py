@@ -23,7 +23,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from typing import Dict, Union
 
 from aiohttp import web
 
@@ -52,7 +51,7 @@ class DisaggBootstrapServer:
         self.world_size = None
         self.dp_size = None
         self.tp_size_per_dp_rank = None
-        self.prefill_port_table: Dict[int, Dict[int, Dict[str, Union[str, int]]]] = {}
+        self.prefill_port_table: dict[int, dict[int, dict[str, str | int]]] = {}
 
         self.thread = threading.Thread(target=self._run_server, daemon=True)
         self.run()
@@ -170,8 +169,8 @@ class DisaggBootstrapServer:
             site = web.TCPSite(self._runner, port=self.port)
             self._loop.run_until_complete(site.start())
             self._loop.run_forever()
-        except Exception as e:
-            logger.error("Server error: %s", str(e))
+        except Exception as exc:
+            logger.error("Server error: %s", str(exc))
         finally:
             # Cleanup
             self._loop.run_until_complete(self._runner.cleanup())

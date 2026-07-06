@@ -15,6 +15,7 @@ on:
       - "test/**"
       - ".github/workflows/pr-test-amd.yml"
       - ".github/workflows/pr-test-nvidia.yml"
+      - ".github/workflows/pr-test-nvidia-arm.yml"
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, closed]
     branches: [main]
@@ -28,6 +29,7 @@ on:
       - "test/**"
       - ".github/workflows/pr-test-amd.yml"
       - ".github/workflows/pr-test-nvidia.yml"
+      - ".github/workflows/pr-test-nvidia-arm.yml"
   workflow_dispatch:
     inputs:
       trigger:

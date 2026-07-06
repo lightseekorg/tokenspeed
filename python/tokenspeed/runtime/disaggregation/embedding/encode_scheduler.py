@@ -34,7 +34,6 @@ scheduler.
 from __future__ import annotations
 
 import dataclasses
-from typing import Dict, List, Tuple
 
 
 @dataclasses.dataclass(frozen=True)
@@ -50,7 +49,7 @@ class PendingEncodeItem:
     cost: int
 
     @property
-    def key(self) -> Tuple[str, int]:
+    def key(self) -> tuple[str, int]:
         return (self.request_id, self.item_index)
 
 
@@ -81,7 +80,7 @@ class EncodeScheduler:
             )
         self.max_tokens_per_batch = max_tokens_per_batch
         self.max_items_per_batch = max_items_per_batch
-        self._pending: Dict[Tuple[str, int], PendingEncodeItem] = {}
+        self._pending: dict[tuple[str, int], PendingEncodeItem] = {}
 
     def add(self, item: PendingEncodeItem) -> None:
         # Idempotent on (request_id, item_index): a re-added item overwrites.
@@ -90,17 +89,17 @@ class EncodeScheduler:
     def pending_size(self) -> int:
         return len(self._pending)
 
-    def _ordered_pending(self) -> List[PendingEncodeItem]:
+    def _ordered_pending(self) -> list[PendingEncodeItem]:
         # Sort by (request_id, item_index) for cross-rank determinism.
         return [self._pending[k] for k in sorted(self._pending.keys())]
 
-    def next_batch(self) -> List[PendingEncodeItem]:
+    def next_batch(self) -> list[PendingEncodeItem]:
         """Pop and return the next deterministic batch of items to encode.
 
         Empty when nothing is pending. Removes the returned items from the
         pending set.
         """
-        batch: List[PendingEncodeItem] = []
+        batch: list[PendingEncodeItem] = []
         used = 0
         for it in self._ordered_pending():
             if batch and (

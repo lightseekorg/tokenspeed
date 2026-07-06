@@ -24,7 +24,9 @@ import math
 
 # Backend registration (side-effect imports)
 import tokenspeed_kernel.ops.attention.cuda  # noqa: F401
+import tokenspeed_kernel.ops.attention.deep_gemm  # noqa: F401
 import tokenspeed_kernel.ops.attention.flash_attn  # noqa: F401
+import tokenspeed_kernel.ops.attention.flash_mla  # noqa: F401
 import tokenspeed_kernel.ops.attention.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.attention.gluon  # noqa: F401
 import tokenspeed_kernel.ops.attention.triton  # noqa: F401
@@ -32,7 +34,11 @@ import torch
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry, Priority
-from tokenspeed_kernel.selection import select_kernel, spec_matches_traits
+from tokenspeed_kernel.selection import (
+    NoKernelFoundError,
+    select_kernel,
+    spec_matches_traits,
+)
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 AttentionResult = torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]
@@ -50,8 +56,13 @@ __all__ = [
     "mha_decode_with_kvcache",
     "mla_prefill",
     "mla_decode_with_kvcache",
+    "dsa_prefill",
+    "dsa_decode",
+    "dsa_prefill_topk",
+    "dsa_decode_topk",
+    "dsa_plan",
     "attn_merge_state",
-    "attn_plan",
+    "mha_plan",
 ]
 
 LSE_LN = math.log2(math.e)
@@ -90,7 +101,7 @@ def mha_prefill(
         cu_seqlens_cpu: Host-side cumulative sequence lengths as a strict
             list[int]. Used for host-side launch metadata; must match cu_seqlens.
         max_seqlen: Maximum sequence length.
-        window_left: Inclusive left sliding-window size. -1 means full attention.
+        window_left: Exclusive left sliding-window size. -1 means full attention.
         logit_cap: Optional soft cap applied to attention logits.
         sinks: Optional attention sink tensor.
         return_lse: Whether to also return natural-log log-sum-exp values with
@@ -195,7 +206,7 @@ def mha_extend_with_kvcache(
         max_seqlen_q: Maximum query length.
         max_seqlen_k: Maximum KV length.
         is_causal: Whether query tokens are a causal suffix of cached KV.
-        window_left: Inclusive left sliding-window size. -1 means full attention.
+        window_left: Exclusive left sliding-window size. -1 means full attention.
         logit_cap: Optional soft cap applied to attention logits.
         sinks: Optional attention sink tensor.
         return_lse: Whether to also return natural-log log-sum-exp values with
@@ -302,7 +313,7 @@ def mha_decode_with_kvcache(
         max_seqlen_q: Number of uniformly packed query tokens per request. This
             is 1 for normal decode and `spec_num_tokens` for compact
             speculative decode.
-        window_left: Inclusive left sliding-window size. -1 means full attention.
+        window_left: Exclusive left sliding-window size. -1 means full attention.
         logit_cap: Optional soft cap applied to attention logits.
         sinks: Optional attention sink tensor.
         return_lse: Whether to also return log-sum-exp values.
@@ -619,6 +630,492 @@ def mla_decode_with_kvcache(
 
 
 # ===-----------------------------------------------------------------------===#
+# DSA Kernels
+# ===-----------------------------------------------------------------------===#
+
+
+def dsa_decode(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor | None,
+    sparse_kv_cache: torch.Tensor | None,
+    topk_slots: torch.Tensor,
+    topk_lens: torch.Tensor | None,
+    max_seqlen_k: int,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    softmax_scale: float,
+    page_size: int,
+    q_len_per_req: int = 1,
+    logit_cap: float = 0.0,
+    k_scale: float = 1.0,
+    return_lse: bool = False,
+    out: torch.Tensor | None = None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> AttentionResult:
+    """Sparse DSA decode over selected global KV slots.
+
+    Args:
+        q: Absorbed MLA query with shape [tokens, heads, R + D_rope] or
+            [batch, q_len, heads, R + D_rope].
+        kv_cache: Regular compressed MLA KV cache, flat [slots, dim] or paged.
+        sparse_kv_cache: Packed sparse DSA KV cache, flat [slots, row_bytes] or
+            paged.
+        topk_slots: Global KV slot ids with shape [tokens, topk]. Invalid
+            entries are -1.
+        topk_lens: Valid selected-slot count per token, or None when the
+            implementation relies on -1 padding.
+        max_seqlen_k: Maximum dense visible context length for this batch.
+        qk_nope_head_dim: Original non-RoPE q/k dimension.
+        kv_lora_rank: MLA latent rank and output head dimension.
+        qk_rope_head_dim: RoPE q/k dimension.
+        softmax_scale: Scale applied to attention logits.
+        page_size: KV cache page size.
+        q_len_per_req: Query rows per request.
+        logit_cap: Optional logit cap.
+        k_scale: KV scale multiplier for FP8 backends.
+        return_lse: Whether to return LSE in addition to output.
+        out: Optional output buffer.
+        override: Optional exact kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+
+    Returns:
+        Latent DSA attention output, or ``(out, lse)`` when ``return_lse=True``.
+    """
+    if q.dim() == 4:
+        batch_size, q_len, num_heads, head_dim = q.shape
+        tokens = batch_size * q_len
+    else:
+        tokens, num_heads, head_dim = q.shape
+        q_len = int(q_len_per_req)
+        batch_size = tokens // q_len
+
+    traits = {
+        "page_size": int(page_size),
+        "q_len_per_req": int(q_len_per_req),
+        "qk_nope_head_dim": int(qk_nope_head_dim),
+        "kv_lora_rank": int(kv_lora_rank),
+        "qk_rope_head_dim": int(qk_rope_head_dim),
+        "topk": int(topk_slots.shape[-1]),
+        "kv_cache_available": kv_cache is not None,
+        "sparse_kv_cache_available": sparse_kv_cache is not None,
+        "topk_layout": "global_slots",
+        "support_logit_cap": logit_cap != 0.0,
+        "return_lse": return_lse,
+    }
+    signature = _attention_format_signature(q=q)
+    kernel = select_kernel(
+        "attention",
+        "dsa_decode",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+    shape_params = {
+        "batch_size": batch_size,
+        "q_len": q_len,
+        "tokens": tokens,
+        "num_heads": num_heads,
+        "head_dim": head_dim,
+        "topk": topk_slots.shape[-1],
+        "page_size": int(page_size),
+        "max_seqlen_k": int(max_seqlen_k),
+    }
+    ShapeCapture.get().record(
+        "attention", "dsa_decode", kernel.name, q.dtype, shape_params
+    )
+    with kernel_scope(
+        "attention", "dsa_decode", q.dtype, kernel_name=kernel.name, **shape_params
+    ):
+        return kernel(
+            q=q,
+            kv_cache=kv_cache,
+            sparse_kv_cache=sparse_kv_cache,
+            topk_slots=topk_slots,
+            topk_lens=topk_lens,
+            max_seqlen_k=max_seqlen_k,
+            qk_nope_head_dim=qk_nope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            softmax_scale=softmax_scale,
+            page_size=page_size,
+            q_len_per_req=q_len_per_req,
+            logit_cap=logit_cap,
+            k_scale=k_scale,
+            return_lse=return_lse,
+            out=out,
+        )
+
+
+def dsa_prefill(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor | None,
+    sparse_kv_cache: torch.Tensor | None,
+    topk_slots: torch.Tensor,
+    topk_lens: torch.Tensor,
+    max_seqlen_k: int,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    softmax_scale: float,
+    page_size: int,
+    logit_cap: float = 0.0,
+    k_scale: float = 1.0,
+    return_lse: bool = False,
+    out: torch.Tensor | None = None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> AttentionResult:
+    """Sparse DSA prefill over selected global KV slots."""
+    if q.dim() == 4:
+        batch_size, q_len, num_heads, head_dim = q.shape
+        tokens = batch_size * q_len
+    else:
+        tokens, num_heads, head_dim = q.shape
+        q_len = 1
+        batch_size = tokens
+
+    traits = {
+        "page_size": int(page_size),
+        "q_len_per_req": 1,
+        "qk_nope_head_dim": int(qk_nope_head_dim),
+        "kv_lora_rank": int(kv_lora_rank),
+        "qk_rope_head_dim": int(qk_rope_head_dim),
+        "topk": int(topk_slots.shape[-1]),
+        "kv_cache_available": kv_cache is not None,
+        "sparse_kv_cache_available": sparse_kv_cache is not None,
+        "topk_layout": "global_slots",
+        "support_logit_cap": logit_cap != 0.0,
+        "return_lse": return_lse,
+    }
+    signature = _attention_format_signature(q=q)
+    kernel = select_kernel(
+        "attention",
+        "dsa_prefill",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+    shape_params = {
+        "batch_size": batch_size,
+        "q_len": q_len,
+        "tokens": tokens,
+        "num_heads": num_heads,
+        "head_dim": head_dim,
+        "topk": topk_slots.shape[-1],
+        "page_size": int(page_size),
+        "max_seqlen_k": int(max_seqlen_k),
+    }
+    ShapeCapture.get().record(
+        "attention", "dsa_prefill", kernel.name, q.dtype, shape_params
+    )
+    with kernel_scope(
+        "attention", "dsa_prefill", q.dtype, kernel_name=kernel.name, **shape_params
+    ):
+        return kernel(
+            q=q,
+            kv_cache=kv_cache,
+            sparse_kv_cache=sparse_kv_cache,
+            topk_slots=topk_slots,
+            topk_lens=topk_lens,
+            max_seqlen_k=max_seqlen_k,
+            qk_nope_head_dim=qk_nope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            softmax_scale=softmax_scale,
+            page_size=page_size,
+            q_len_per_req=1,
+            logit_cap=logit_cap,
+            k_scale=k_scale,
+            return_lse=return_lse,
+            out=out,
+        )
+
+
+def dsa_prefill_topk(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    kv_workspace_slots: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    *,
+    topk: int,
+    softmax_scale: float,
+    index_k_cache: torch.Tensor | None = None,
+    page_size: int | None = None,
+    index_k_fp8: torch.Tensor | None = None,
+    index_k_scale: torch.Tensor | None = None,
+    max_logits_bytes: int | None = None,
+    out: torch.Tensor | None = None,
+    lens_out: torch.Tensor | None = None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute DSA prefill top-k over packed workspace rows.
+
+    Args:
+        q: BF16 indexer query with shape [tokens, index_heads, head_dim].
+        weights: FP32 per-token/head weights with shape [tokens, index_heads].
+        kv_workspace_slots: Global KV slot for each workspace row, shape
+            [workspace_rows].
+        row_starts: Inclusive workspace-row start per query token, shape [tokens].
+        row_ends: Exclusive workspace-row end per query token, shape [tokens].
+        topk: Number of workspace candidates to select.
+        softmax_scale: Score scale, normally index_head_dim ** -0.5.
+        index_k_cache: Packed FP8 index-K cache with scales (uint8). Used by
+            Triton with kv_workspace_slots and by DeepGEMM to gather workspace
+            rows internally.
+        page_size: KV cache page size for index_k_cache.
+        index_k_fp8: FP8 index-K rows in workspace-row order. Used by DeepGEMM.
+        index_k_scale: FP8 index-K scales in workspace-row order. Used by DeepGEMM.
+        max_logits_bytes: Optional temporary logits memory cap.
+        out: Optional int32 output buffer with shape [tokens, topk].
+        lens_out: Optional int32 output buffer with shape [tokens].
+        override: Optional exact kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+
+    Returns:
+        Tuple of workspace row ids and valid counts. Returned indices are
+        absolute row ids into kv_workspace_slots; invalid entries are -1.
+    """
+    if out is not None and out.shape != (q.shape[0], int(topk)):
+        raise ValueError(
+            f"out must have shape {(q.shape[0], int(topk))}, got {tuple(out.shape)}"
+        )
+    if lens_out is not None and lens_out.shape != (q.shape[0],):
+        raise ValueError(
+            f"lens_out must have shape {(q.shape[0],)}, got {tuple(lens_out.shape)}"
+        )
+    traits = {
+        "head_dim": q.shape[-1],
+        "topk": int(topk),
+    }
+    has_fp8 = index_k_cache is not None or (
+        index_k_fp8 is not None and index_k_scale is not None
+    )
+    if has_fp8:
+        traits["index_k_format"] = "fp8_scaled"
+    signature = _attention_format_signature(q=q, weights=weights)
+    kernel = select_kernel(
+        "attention",
+        "dsa_prefill_topk",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+    shape_params = {
+        "tokens": q.shape[0],
+        "workspace_rows": kv_workspace_slots.numel(),
+        "index_heads": q.shape[1],
+        "head_dim": q.shape[-1],
+        "topk": int(topk),
+    }
+    ShapeCapture.get().record(
+        "attention", "dsa_prefill_topk", kernel.name, q.dtype, shape_params
+    )
+    with kernel_scope(
+        "attention",
+        "dsa_prefill_topk",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            q=q,
+            weights=weights,
+            kv_workspace_slots=kv_workspace_slots,
+            row_starts=row_starts,
+            row_ends=row_ends,
+            topk=topk,
+            softmax_scale=softmax_scale,
+            index_k_cache=index_k_cache,
+            page_size=page_size,
+            index_k_fp8=index_k_fp8,
+            index_k_scale=index_k_scale,
+            max_logits_bytes=max_logits_bytes,
+            out=out,
+            lens_out=lens_out,
+        )
+
+
+def dsa_decode_topk(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    *,
+    page_size: int,
+    topk: int,
+    softmax_scale: float,
+    q_len_per_req: int = 1,
+    index_k_cache: torch.Tensor | None = None,
+    plan: object | None = None,
+    out: torch.Tensor | None = None,
+    lens_out: torch.Tensor | None = None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute DSA decode top-k over a paged KV cache.
+
+    Args:
+        q: BF16 indexer query with shape [tokens, index_heads, head_dim].
+        weights: FP32 per-token/head weights with shape [tokens, index_heads].
+        seq_lens: Visible KV length per query token, shape [tokens].
+        block_table: Paged KV block table with one row per query token.
+        page_size: Number of tokens per KV page.
+        topk: Number of KV candidates to select.
+        softmax_scale: Score scale, normally index_head_dim ** -0.5.
+        q_len_per_req: Query rows per request. Plain decode uses 1.
+        index_k_cache: Packed FP8 index-K cache with scales (uint8). Used by
+            both Triton and DeepGEMM.
+        plan: Optional opaque backend-specific plan.
+        out: Optional int32 output buffer with shape [tokens, topk].
+        lens_out: Optional int32 output buffer with shape [tokens].
+        override: Optional exact kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+
+    Returns:
+        Tuple of global KV slots and valid counts; invalid entries are -1.
+    """
+    if out is not None and out.shape != (q.shape[0], int(topk)):
+        raise ValueError(
+            f"out must have shape {(q.shape[0], int(topk))}, got {tuple(out.shape)}"
+        )
+    if lens_out is not None and lens_out.shape != (q.shape[0],):
+        raise ValueError(
+            f"lens_out must have shape {(q.shape[0],)}, got {tuple(lens_out.shape)}"
+        )
+    traits = {
+        "head_dim": q.shape[-1],
+        "topk": int(topk),
+        "page_size": int(page_size),
+        "q_len_per_req": int(q_len_per_req),
+    }
+    if index_k_cache is not None:
+        traits["index_k_format"] = "fp8_scaled"
+    signature = _attention_format_signature(q=q, weights=weights)
+    kernel = select_kernel(
+        "attention",
+        "dsa_decode_topk",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+    shape_params = {
+        "tokens": q.shape[0],
+        "max_pages": block_table.shape[1],
+        "index_heads": q.shape[1],
+        "head_dim": q.shape[-1],
+        "page_size": int(page_size),
+        "topk": int(topk),
+        "q_len_per_req": int(q_len_per_req),
+    }
+    ShapeCapture.get().record(
+        "attention", "dsa_decode_topk", kernel.name, q.dtype, shape_params
+    )
+    with kernel_scope(
+        "attention",
+        "dsa_decode_topk",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            q=q,
+            weights=weights,
+            seq_lens=seq_lens,
+            block_table=block_table,
+            page_size=page_size,
+            topk=topk,
+            softmax_scale=softmax_scale,
+            q_len_per_req=q_len_per_req,
+            index_k_cache=index_k_cache,
+            plan=plan,
+            out=out,
+            lens_out=lens_out,
+        )
+
+
+def dsa_plan(
+    seq_lens: torch.Tensor,
+    *,
+    page_size: int,
+    q_len_per_req: int = 1,
+    out: object | None = None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> object | None:
+    """Build or refresh an opaque plan for DSA decode top-k.
+
+    Args:
+        seq_lens: Visible KV length per query token, shape [tokens] or
+            [batch, q_len_per_req].
+        page_size: KV cache page size.
+        q_len_per_req: Query rows per request. Plain decode uses 1.
+        out: Optional previously allocated plan object to refresh in place.
+        override: Optional exact kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+
+    Returns:
+        Opaque backend-owned plan object, or None when no selected backend needs
+        an explicit plan.
+    """
+    if seq_lens.dtype != torch.int32:
+        seq_lens = seq_lens.to(torch.int32)
+    q_len_per_req = int(q_len_per_req)
+    traits = {
+        "page_size": int(page_size),
+        "q_len_per_req": q_len_per_req,
+    }
+    signature = format_signature(seq_lens=dense_tensor_format(seq_lens.dtype))
+    try:
+        kernel = select_kernel(
+            "attention",
+            "dsa_plan",
+            signature,
+            traits=traits,
+            solution=solution,
+            override=override,
+        )
+    except NoKernelFoundError:
+        return None
+
+    if seq_lens.dim() == 1:
+        batch_size = int(seq_lens.numel()) // max(q_len_per_req, 1)
+        tokens = int(seq_lens.numel())
+    else:
+        batch_size = int(seq_lens.shape[0])
+        tokens = int(seq_lens.numel())
+    shape_params = {
+        "batch_size": batch_size,
+        "tokens": tokens,
+        "q_len_per_req": q_len_per_req,
+        "page_size": int(page_size),
+    }
+    ShapeCapture.get().record(
+        "attention", "dsa_plan", kernel.name, seq_lens.dtype, shape_params
+    )
+    with kernel_scope(
+        "attention",
+        "dsa_plan",
+        seq_lens.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            seq_lens=seq_lens,
+            page_size=page_size,
+            q_len_per_req=q_len_per_req,
+            out=out,
+        )
+
+
+# ===-----------------------------------------------------------------------===#
 # Attention Utility Kernels
 # ===-----------------------------------------------------------------------===#
 
@@ -689,7 +1186,7 @@ def attn_merge_state(
         )
 
 
-def attn_plan(
+def mha_plan(
     dtype: torch.dtype,
     head_dim: int,
     window_left: int = -1,
@@ -698,12 +1195,13 @@ def attn_plan(
     return_lse: bool = False,
     solution: str | None = None,
 ) -> dict:
-    """Build an attention execution plan from registered kernel capabilities.
+    """Build a dense MHA execution plan from registered kernel capabilities.
 
     Args:
         dtype: Query/K/V dtype for prefill planning.
         head_dim: Attention head dimension.
-        window_left: Sliding-window size, or -1 for full-context attention.
+        window_left: Exclusive left sliding-window size, or -1 for full-context
+            attention.
         logit_cap: Logit soft-cap value, or 0.0 when disabled.
         sinks: Attention sinks tensor when sinks are enabled.
         return_lse: Whether the selected path must return LSE values.

@@ -69,12 +69,12 @@ class InputProcessor:
             if isinstance(schema, str):
                 schema = json.loads(schema)
             wrapped = structural_tag_for_reasoning_json_schema(reasoning_parser, schema)
-        except Exception as e:
+        except Exception as exc:
             self.engine.logger.warning(
                 "reasoning-parser=%s: failed to wrap json_schema (%s); "
                 "falling back.",
                 reasoning_parser,
-                e,
+                exc,
             )
             return
         if wrapped is None:
@@ -190,11 +190,13 @@ class InputProcessor:
             )
 
         max_new_tokens = obj.sampling_params.get("max_new_tokens")
-        if (
-            max_new_tokens is not None
-            and max_new_tokens + input_token_num >= self.engine.context_len
-        ):
-            adjusted_max_new_tokens = self.engine.context_len - input_token_num
+        # Resolve to a finite cap bounded by remaining context. Both
+        # Req.check_finished and RequestState.check_finished read this field;
+        # leaving it None lets a request reach the per-request page-table cap.
+        adjusted_max_new_tokens = self.engine.context_len - input_token_num
+        if max_new_tokens is None:
+            obj.sampling_params.update({"max_new_tokens": adjusted_max_new_tokens})
+        elif max_new_tokens + input_token_num >= self.engine.context_len:
             self.engine.logger.warning(
                 "Requested(rid=%s) token count exceeds the model's maximum context length of %s tokens. You requested a total of %s tokens: %s tokens from the input messages and %s tokens for the completion. The max_new_tokens will be truncated to %s.",
                 obj.rid,
