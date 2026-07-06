@@ -51,7 +51,14 @@ def _make_inputs(*, device: str, dtype: torch.dtype, seq_len: int = 130):
     return q, k, v, g, beta, initial_state, cu_seqlens
 
 
-def _naive_gdn_chunk_prefill_reference(
+def _torch_l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    x_float = x.float()
+    return (
+        x_float * torch.rsqrt(x_float.square().sum(dim=-1, keepdim=True).clamp_min(eps))
+    ).to(x.dtype)
+
+
+def _torch_gdn_chunk_prefill_reference(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -102,26 +109,26 @@ def _naive_gdn_chunk_prefill_reference(
     return out.to(q.dtype), torch.stack(final_states, dim=0).to(initial_state.dtype)
 
 
-def test_gdn_chunk_prefill_triton_matches_naive_reference(device: str, require):
+def test_gdn_chunk_prefill_triton_matches_torch_reference(device: str, require):
     # The Triton wrapper should match an independent token-by-token recurrence.
     require("attention", "gdn_chunk_prefill", "triton", torch.bfloat16, "q")
 
     torch.manual_seed(1234)
-    seq_len = 9
-    num_q_heads = 2
-    num_v_heads = 4
-    head_dim = 8
+    seq_len = 130
+    num_q_heads = 16
+    num_v_heads = 32
+    head_dim = 128
     dtype = torch.bfloat16
     q = torch.randn(1, seq_len, num_q_heads, head_dim, device=device, dtype=dtype)
     k = torch.randn(1, seq_len, num_q_heads, head_dim, device=device, dtype=dtype)
-    v = torch.randn(1, seq_len, num_v_heads, head_dim, device=device, dtype=dtype)
+    v = torch.randn(1, seq_len, num_v_heads, head_dim, device=device, dtype=dtype) * 0.5
     g = F.logsigmoid(
         torch.randn(1, seq_len, num_v_heads, device=device, dtype=torch.float32)
     )
     beta = torch.rand(1, seq_len, num_v_heads, device=device, dtype=dtype).sigmoid()
     initial_state = (
         torch.randn(1, num_v_heads, head_dim, head_dim, device=device, dtype=dtype)
-        * 0.1
+        * 0.01
     )
     cu_seqlens = torch.tensor([0, seq_len], device=device, dtype=torch.int32)
     scale = head_dim**-0.5
@@ -135,13 +142,13 @@ def test_gdn_chunk_prefill_triton_matches_naive_reference(device: str, require):
         scale=scale,
         initial_state=initial_state.clone(),
         cu_seqlens=cu_seqlens,
-        qk_l2norm=False,
+        qk_l2norm=True,
         output_final_state=True,
         solution="triton",
     )
-    ref_out, ref_state = _naive_gdn_chunk_prefill_reference(
-        q,
-        k,
+    ref_out, ref_state = _torch_gdn_chunk_prefill_reference(
+        _torch_l2norm(q),
+        _torch_l2norm(k),
         v,
         g,
         beta,
@@ -159,20 +166,23 @@ def test_gdn_chunk_prefill_triton_matches_naive_reference(device: str, require):
     )
 
 
-def test_gdn_chunk_prefill_triton_matches_naive_reference_varlen(device: str, require):
+def test_gdn_chunk_prefill_triton_matches_torch_reference_varlen(device: str, require):
     # Varlen cu_seqlens should reset recurrent state independently per sequence.
     require("attention", "gdn_chunk_prefill", "triton", torch.bfloat16, "q")
 
     torch.manual_seed(4321)
-    seq_lens = [3, 5]
+    seq_lens = [63, 67]
     total_tokens = sum(seq_lens)
-    num_q_heads = 2
-    num_v_heads = 4
-    head_dim = 8
+    num_q_heads = 4
+    num_v_heads = 8
+    head_dim = 128
     dtype = torch.bfloat16
     q = torch.randn(1, total_tokens, num_q_heads, head_dim, device=device, dtype=dtype)
     k = torch.randn(1, total_tokens, num_q_heads, head_dim, device=device, dtype=dtype)
-    v = torch.randn(1, total_tokens, num_v_heads, head_dim, device=device, dtype=dtype)
+    v = (
+        torch.randn(1, total_tokens, num_v_heads, head_dim, device=device, dtype=dtype)
+        * 0.5
+    )
     g = F.logsigmoid(
         torch.randn(1, total_tokens, num_v_heads, device=device, dtype=torch.float32)
     )
@@ -183,7 +193,7 @@ def test_gdn_chunk_prefill_triton_matches_naive_reference_varlen(device: str, re
         torch.randn(
             len(seq_lens), num_v_heads, head_dim, head_dim, device=device, dtype=dtype
         )
-        * 0.1
+        * 0.01
     )
     cu_seqlens = torch.tensor([0, *torch.tensor(seq_lens).cumsum(0)], device=device)
     cu_seqlens = cu_seqlens.to(torch.int32)
@@ -198,13 +208,13 @@ def test_gdn_chunk_prefill_triton_matches_naive_reference_varlen(device: str, re
         scale=scale,
         initial_state=initial_state.clone(),
         cu_seqlens=cu_seqlens,
-        qk_l2norm=False,
+        qk_l2norm=True,
         output_final_state=True,
         solution="triton",
     )
-    ref_out, ref_state = _naive_gdn_chunk_prefill_reference(
-        q,
-        k,
+    ref_out, ref_state = _torch_gdn_chunk_prefill_reference(
+        _torch_l2norm(q),
+        _torch_l2norm(k),
         v,
         g,
         beta,
