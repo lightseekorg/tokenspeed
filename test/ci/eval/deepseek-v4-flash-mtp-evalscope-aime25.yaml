@@ -21,10 +21,12 @@ server:
     --moe-backend mega_moe
     --attention-use-fp4-indexer-cache
     --max-model-len 80000
-    --max-total-tokens 163840
+    --max-total-tokens 262144
+    --max-num-seqs 80
     --chunked-prefill-size 8192
     --gpu-memory-utilization 0.9
     --disable-kvstore
+    --seed 48
     --speculative-algorithm MTP
     --speculative-num-steps 3
     --disable-overlap-schedule
@@ -41,9 +43,11 @@ eval:
     - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
   # AIME25 needs thinking mode on (reasoning_effort=high) for V4-Flash to reach
   # ~0.96; reasoning chains run up to max_tokens=65536. MTP speculative decode
-  # keeps tokens flowing fast (like Kimi's EAGLE3), so eval-batch-size 16 is
-  # viable here without the long-stream read-timeout stalls the non-MTP config
-  # hits at 16. timeout=3600 guards the longest single-request streams.
+  # keeps tokens flowing fast (like Kimi's EAGLE3). Run eval-batch-size 16 to
+  # exercise the intended CI concurrency; the server KV-page budget is sized
+  # separately with --max-total-tokens. Pin server seed and max-num-seqs to the
+  # configuration used by the repeated local validation runs.
+  # timeout=3600 guards the longest single-request streams.
   command: >-
     python3 -c "import urllib.request,json;urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:8000/v1/completions',json.dumps({'model':'deepseek-ai/DeepSeek-V4-Flash','prompt':' '.join(['hello']*300),'max_tokens':2}).encode(),{'Content-Type':'application/json'}),timeout=120).read()" &&
     /tmp/evalscope-perf/bin/evalscope eval
