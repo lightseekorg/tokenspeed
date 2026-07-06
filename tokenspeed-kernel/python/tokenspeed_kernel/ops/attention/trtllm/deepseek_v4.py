@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.transform import hadamard_transform
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -35,13 +36,6 @@ from tokenspeed_kernel.thirdparty.cuda.trtllm_deepseek_v4_indexer import (
     trtllm_fused_cat_fp4,
     trtllm_mla_rope_inplace,
 )
-
-try:
-    from tokenspeed_kernel.thirdparty.fast_hadamard_transform import (
-        hadamard_transform,
-    )
-except (ImportError, OSError):
-    hadamard_transform = None
 
 _HEAD_DIM = 128
 _ROPE_DIM = 64
@@ -56,7 +50,7 @@ _BLACKWELL_CAPABILITY = CapabilityRequirement(
 def has_trtllm_deepseek_v4_indexer_q_prepare() -> bool:
     """Return whether the TRT-LLM Q preparation chain is importable."""
 
-    return has_trtllm_indexer_q_kernels() and hadamard_transform is not None
+    return has_trtllm_indexer_q_kernels()
 
 
 def supports_trtllm_deepseek_v4_indexer_q_prepare(

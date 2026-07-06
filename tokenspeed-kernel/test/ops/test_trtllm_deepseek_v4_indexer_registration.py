@@ -24,9 +24,14 @@ import importlib
 
 import tokenspeed_kernel.ops.attention.trtllm.deepseek_v4 as trtllm_indexer
 import torch
+from tokenspeed_kernel.ops.transform import hadamard_transform
 from tokenspeed_kernel.platform import ArchVersion, current_platform
 from tokenspeed_kernel.registry import KernelRegistry, Priority
 from tokenspeed_kernel.signature import format_signatures
+
+
+def test_trtllm_indexer_q_uses_registered_hadamard_transform() -> None:
+    assert trtllm_indexer.hadamard_transform is hadamard_transform
 
 
 def test_trtllm_indexer_q_registration_matches_availability(fresh_registry) -> None:
