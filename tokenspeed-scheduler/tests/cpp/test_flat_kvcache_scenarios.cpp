@@ -230,6 +230,91 @@ TEST_F(FlatThreeGroupSuite, ThreeGroupsEachEmitARowAndReclaim) {
 }
 
 // ---------------------------------------------------------------------------
+// Sub-page and page-straddling windows (M14): P=4 with w=3 (< P, needs a
+// 1-page trailing run) and w=5 (= P+1, straddles a page boundary). Pins the
+// per-group slide independence and the <=2-real-page steady state.
+// ---------------------------------------------------------------------------
+class FlatSubPageWindowSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg{};
+        cfg.page_size = 4;
+        cfg.device_allocator.total_pages = 96;
+        cfg.host_allocator.total_pages = 96;
+        cfg.max_scheduled_tokens = 64;
+        cfg.max_batch_size = 8;
+        cfg.enable_l3_storage = false;
+        cfg.disable_l2_cache = true;
+        cfg.disable_prefix_cache = true;
+
+        cfg.paged_cache_groups = {
+            MakeGroup("full", cfg.page_size, cfg.device_allocator.total_pages,
+                      PagedCacheGroupConfig::Retention::FullHistory,
+                      PagedCacheGroupFamily::History),
+            MakeGroup("swa_w3", cfg.page_size, cfg.device_allocator.total_pages,
+                      PagedCacheGroupConfig::Retention::SlidingWindow,
+                      PagedCacheGroupFamily::State, /*sliding_window_tokens=*/3),
+            MakeGroup("swa_w5", cfg.page_size, cfg.device_allocator.total_pages,
+                      PagedCacheGroupConfig::Retention::SlidingWindow,
+                      PagedCacheGroupFamily::State, /*sliding_window_tokens=*/5),
+        };
+        return cfg;
+    }
+};
+
+TEST_F(FlatSubPageWindowSuite, SubPageWindowsPlateauAtTwoRealPages) {
+    const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
+
+    Submit(MakeRequestSpec("r1", /*num_pages=*/3));
+    ExecutionPlan prefill = PlanOnce();
+    ASSERT_NE(FindFlatOp(prefill), nullptr);
+    SendForwardDone("r1", {1000});
+
+    for (std::int32_t step = 0; step < 24; ++step) {
+        ExecutionPlan decode = PlanOnce();
+        const FlatForwardOperation* op = FindFlatOp(decode);
+        ASSERT_NE(op, nullptr) << "decode step " << step;
+        // fullySlidOutBlocks frees only FULLY slid-out pages, so a window
+        // straddling a boundary keeps its previous page: 1 <= real pages <= 2.
+        const std::size_t w3_real = RealPages(op->flat_block_tables.at("swa_w3")).size();
+        const std::size_t w5_real = RealPages(op->flat_block_tables.at("swa_w5")).size();
+        EXPECT_GE(w3_real, 1u) << "w=3 lost its live tail page at step " << step;
+        EXPECT_LE(w3_real, 2u) << "w=3 working set exceeded 2 pages at step " << step;
+        EXPECT_GE(w5_real, 1u) << "w=5 lost its live tail page at step " << step;
+        EXPECT_LE(w5_real, 2u) << "w=5 working set exceeded 2 pages at step " << step;
+        SendForwardDone("r1", {1001 + step});
+    }
+
+    SendFinish("r1");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start);
+}
+
+TEST_F(FlatSubPageWindowSuite, StraddlingWindowHoldsPreviousPage) {
+    Submit(MakeRequestSpec("r1", /*num_pages=*/3));
+    PlanOnce();
+    SendForwardDone("r1", {1000});
+
+    bool diverged = false;
+    for (std::int32_t step = 0; step < 8; ++step) {
+        ExecutionPlan decode = PlanOnce();
+        const FlatForwardOperation* op = FindFlatOp(decode);
+        ASSERT_NE(op, nullptr);
+        const std::size_t w3_real = RealPages(op->flat_block_tables.at("swa_w3")).size();
+        const std::size_t w5_real = RealPages(op->flat_block_tables.at("swa_w5")).size();
+        EXPECT_LE(w3_real, w5_real) << "a smaller window can never hold more pages, step " << step;
+        if (w3_real < w5_real) {
+            diverged = true;  // the straddling window (w=5) holds one more real page
+        }
+        SendForwardDone("r1", {1001 + step});
+    }
+    EXPECT_TRUE(diverged) << "w=3 and w=5 never diverged: per-group slides are not independent";
+
+    SendFinish("r1");
+    PlanOnce();
+}
+
+// ---------------------------------------------------------------------------
 // Two full-history groups (no sliding window at all). Verifies the flat path
 // works for a non-hybrid multi-group shape: neither group ever develops a null
 // hole, and both reclaim on finish.

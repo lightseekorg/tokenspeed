@@ -55,7 +55,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         page_size: int,
         rank: int,
         layer_types: tuple[str, ...] = (),
-        sliding_window_tokens: int | None = None,
+        sliding_window_tokens: int | tuple[int | None, ...] | None = None,
         max_scheduled_tokens: int = 0,
         speculative_enabled: bool = False,
         kvstore_enabled: bool = False,
@@ -80,7 +80,9 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         self._kvstore_enabled = kvstore_enabled
         self._pd_disaggregation_enabled = pd_disaggregation_enabled
         self._slab_group_size = hybrid_slab_group_size(
-            self._layer_types, speculative_enabled=speculative_enabled
+            self._layer_types,
+            speculative_enabled=speculative_enabled,
+            sliding_window_tokens=sliding_window_tokens,
         )
         self._create_buffers()
 

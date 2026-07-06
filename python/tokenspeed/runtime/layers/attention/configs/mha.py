@@ -38,7 +38,7 @@ class MHAConfig(BaseAttnConfig):
     # Per-layer attention-type labels + window, forwarded to the KV pool for
     # paged_cache_group_specs publication (empty -> single full-history group).
     layer_types: tuple[str, ...] = ()
-    sliding_window_tokens: int | None = None
+    sliding_window_tokens: int | tuple[int | None, ...] | None = None
     max_scheduled_tokens: int = 0
     # True iff server_args.speculative_algorithm is set (publication rule:
     # kv_cache/mha.py).

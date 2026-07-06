@@ -48,11 +48,17 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
-def _kv_profile_layer_divisor(num_layers, layer_types, speculative_enabled):
+def _kv_profile_layer_divisor(
+    num_layers, layer_types, *, speculative_enabled, sliding_window_tokens=None
+):
     """Attention layers to charge per token in the KV memory profile:
     layers-per-group under the slab layout, else all layers (single
     source: hybrid_slab_group_size)."""
-    gs = hybrid_slab_group_size(layer_types, speculative_enabled=speculative_enabled)
+    gs = hybrid_slab_group_size(
+        layer_types,
+        speculative_enabled=speculative_enabled,
+        sliding_window_tokens=sliding_window_tokens,
+    )
     return gs if gs is not None else num_layers
 
 
@@ -548,13 +554,14 @@ def create_attn_components(
             server_args.max_total_tokens,
         )
     else:
-        # config.layer_types is the exact tuple forwarded to the KV pool, so
-        # sizing and layout consume identical inputs (MLA configs carry no
-        # layer_types -> legacy divisor).
+        # config.layer_types / config.sliding_window_tokens are the exact
+        # values forwarded to the KV pool, so sizing and layout consume
+        # identical inputs (MLA configs carry neither -> legacy divisor).
         slab_divisor = _kv_profile_layer_divisor(
             num_layers,
             getattr(config, "layer_types", None),
-            server_args.speculative_algorithm is not None,
+            speculative_enabled=server_args.speculative_algorithm is not None,
+            sliding_window_tokens=getattr(config, "sliding_window_tokens", None),
         )
         if profile_cache_cell_size is not None and slab_divisor != num_layers:
             # A cell-size override can't compose with the slab divisor.

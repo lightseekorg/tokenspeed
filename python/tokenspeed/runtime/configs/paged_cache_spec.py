@@ -16,8 +16,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Dict, Literal, Optional, Sequence
+from typing import Dict, Literal, Optional
 
 Retention = Literal["full_history", "sliding_window"]
 Family = Literal["history", "state"]
@@ -50,10 +51,18 @@ def scheduler_ext_flat_kvcache() -> bool:
     return bool(getattr(tokenspeed_scheduler, "FLAT_KVCACHE", False))
 
 
+# layer_type label -> retention. GPT-OSS uses these two; unknown labels raise.
+_LAYER_TYPE_RETENTION: Dict[str, Retention] = {
+    "full_attention": "full_history",
+    "sliding_attention": "sliding_window",
+}
+
+
 def hybrid_slab_group_size(
     layer_types: Optional[Sequence[str]],
     *,
     speculative_enabled: bool,
+    sliding_window_tokens: int | Sequence[int | None] | None = None,
 ) -> Optional[int]:
     """Group size for the hybrid slab KV layout (one layer of EACH group
     shares a K/V slab), or None to keep the legacy per-layer layout.
@@ -64,6 +73,10 @@ def hybrid_slab_group_size(
     page id by at most one group, so paired layers' live rows never
     overlap) and equal group sizes. Unknown labels degrade to None -- the
     predicate gates an optimization, so it must not raise.
+
+    Multi-window models (a per-layer window sequence with >1 distinct
+    window) degrade to None: the slab pairing is per raw label, not per
+    (retention, window) group.
     """
     if speculative_enabled or not scheduler_ext_flat_kvcache():
         return None
@@ -71,11 +84,26 @@ def hybrid_slab_group_size(
         return None
     counts: dict[str, int] = {}
     for label in layer_types:
-        if label not in ("sliding_attention", "full_attention"):
+        if label not in _LAYER_TYPE_RETENTION:
             return None
         counts[label] = counts.get(label, 0) + 1
     if len(counts) < 2:
         return None
+    if sliding_window_tokens is not None and not isinstance(sliding_window_tokens, int):
+        if not isinstance(sliding_window_tokens, Sequence) or len(
+            sliding_window_tokens
+        ) != len(layer_types):
+            return None
+        distinct = {
+            w
+            for label, w in zip(layer_types, sliding_window_tokens)
+            if _LAYER_TYPE_RETENTION[label] == "sliding_window"
+            and isinstance(w, int)
+            and not isinstance(w, bool)
+            and w > 0
+        }
+        if len(distinct) > 1:
+            return None
     sizes = set(counts.values())
     if len(sizes) != 1:
         return None
@@ -205,71 +233,125 @@ def compute_paged_cache_group_page_counts(
     return counts
 
 
-# layer_type label -> retention. GPT-OSS uses these two; unknown labels raise.
-_LAYER_TYPE_RETENTION: Dict[str, Retention] = {
-    "full_attention": "full_history",
-    "sliding_attention": "sliding_window",
-}
+def _layer_specs(
+    layer_types: Sequence[str],
+    sliding_window_tokens: int | Sequence[int | None] | None,
+) -> list[tuple[str, Retention, int | None]]:
+    """Per-layer (group_id, retention, window). group_id is the bare label
+    unless sliding layers carry more than one distinct window (then
+    label_<window>), so single-window models keep byte-identical ids.
+    A scalar window broadcasts to sliding layers; a sequence lines up 1:1."""
+    if isinstance(sliding_window_tokens, str):
+        raise ValueError(
+            "_layer_specs: sliding_window_tokens must be None, an int, or a "
+            f"sequence of int/None, got {sliding_window_tokens!r}"
+        )
+    if sliding_window_tokens is None or isinstance(sliding_window_tokens, int):
+        if isinstance(sliding_window_tokens, bool):
+            raise ValueError(
+                "_layer_specs: sliding_window_tokens must be None, an int, or "
+                f"a sequence of int/None, got {sliding_window_tokens!r}"
+            )
+        windows: list[int | None] = [sliding_window_tokens] * len(layer_types)
+        scalar = True
+    elif not isinstance(sliding_window_tokens, Sequence):
+        raise ValueError(
+            "_layer_specs: sliding_window_tokens must be None, an int, or a "
+            f"sequence of int/None, got {sliding_window_tokens!r}"
+        )
+    else:
+        windows = list(sliding_window_tokens)
+        scalar = False
+        if len(windows) != len(layer_types):
+            raise ValueError(
+                f"_layer_specs: sliding_window_tokens has {len(windows)} "
+                f"entries but layer_types has {len(layer_types)}"
+            )
+    rows: list[tuple[str, Retention, int | None]] = []
+    for i, (label, raw) in enumerate(zip(layer_types, windows)):
+        retention = _LAYER_TYPE_RETENTION.get(label)
+        if retention is None:
+            raise ValueError(
+                f"_layer_specs: unknown layer_type {label!r} at layer {i}; "
+                f"expected one of {sorted(_LAYER_TYPE_RETENTION)}"
+            )
+        if raw is not None and (isinstance(raw, bool) or not isinstance(raw, int)):
+            raise ValueError(
+                f"_layer_specs: layer {i} ({label!r}) window must be None or "
+                f"an int, got {raw!r}"
+            )
+        window = raw
+        if retention == "sliding_window":
+            if window is None or window <= 0:
+                raise ValueError(
+                    f"_layer_specs: layer {i} ({label!r}) is sliding but its "
+                    f"window is not a positive int (got {raw!r})"
+                )
+        else:
+            if not scalar and window is not None and window > 0:
+                raise ValueError(
+                    f"_layer_specs: layer {i} ({label!r}) is full-history but "
+                    f"carries sliding window {window}; mislabeled layer_type?"
+                )
+            window = None
+        rows.append((label, retention, window))
+    distinct = {w for _, r, w in rows if r == "sliding_window"}
+    multi_window = len(distinct) > 1
+    return [
+        (
+            f"{label}_{window}"
+            if multi_window and retention == "sliding_window"
+            else label,
+            retention,
+            window,
+        )
+        for label, retention, window in rows
+    ]
+
+
+def layer_group_ids(
+    *,
+    layer_types: Sequence[str],
+    sliding_window_tokens: int | Sequence[int | None] | None,
+) -> list[str]:
+    """Per-layer paged-cache group id — the single source multi-window models
+    will assign ``PagedAttention(group_id=...)`` from (today gpt_oss.py
+    assigns group_id=layer_type, identical in the single-window case), so
+    ``flat_block_tables`` keys line up with the published group specs."""
+    return [gid for gid, _, _ in _layer_specs(layer_types, sliding_window_tokens)]
 
 
 def group_specs_from_layer_types(
     *,
     layer_types: Sequence[str],
-    sliding_window_tokens: Optional[int],
+    sliding_window_tokens: int | Sequence[int | None] | None,
     page_size: int,
 ) -> list[PagedCacheGroupSpec]:
-    """Derive paged-cache group specs from a model's per-layer attention types.
+    """Derive paged-cache group specs from per-layer attention types.
 
-    Mirrors vLLM's spec-value grouping: layers sharing an attention type
-    collapse into one group. Group order = first-appearance order of the layer
-    type. group_id is the layer-type label itself, so downstream
-    ``flat_block_tables`` keys line up with it.
+    vLLM-style spec-value grouping: layers collapse into one group per
+    distinct (retention, window). Group order = first-appearance order.
 
     Args:
-        layer_types: Per-layer attention-type labels (e.g. from
-            ``hf_config.layer_types``): ``"full_attention"`` /
-            ``"sliding_attention"``.
-        sliding_window_tokens: Window size for sliding layers; required (>0) when
-            any ``"sliding_attention"`` layer is present, else may be None.
-        page_size: Tokens per page; used as ``rows_per_page`` for every group
-            (uniform page size across groups).
-
-    Returns:
-        One ``PagedCacheGroupSpec`` per distinct attention type, in
-        first-appearance order.
+        layer_types: Per-layer labels: "full_attention" / "sliding_attention".
+        sliding_window_tokens: One window for all sliding layers (today's HF
+            scalar), or a per-layer sequence (multi-window models; full-layer
+            positions must be None).
+        page_size: Tokens per page (uniform across groups).
 
     Raises:
-        ValueError: on an unknown layer-type label, or a sliding layer without a
-            positive ``sliding_window_tokens``.
+        ValueError: unknown label; window sequence length mismatch; sliding
+            layer without a positive window; full layer carrying a window.
     """
     specs: list[PagedCacheGroupSpec] = []
     seen: set[str] = set()
-    for label in layer_types:
-        if label in seen:
+    for gid, retention, window in _layer_specs(layer_types, sliding_window_tokens):
+        if gid in seen:
             continue
-        retention = _LAYER_TYPE_RETENTION.get(label)
-        if retention is None:
-            raise ValueError(
-                f"group_specs_from_layer_types: unknown layer_type {label!r}; "
-                f"expected one of {sorted(_LAYER_TYPE_RETENTION)}"
-            )
-        window: Optional[int] = None
-        if retention == "sliding_window":
-            window = (
-                None
-                if sliding_window_tokens is None
-                else int(sliding_window_tokens)
-            )
-            if window is None or window <= 0:
-                raise ValueError(
-                    f"group_specs_from_layer_types: layer_type {label!r} is "
-                    "sliding but sliding_window_tokens is not a positive int "
-                    f"(got {sliding_window_tokens!r})"
-                )
-        seen.add(label)
+        seen.add(gid)
         specs.append(
             PagedCacheGroupSpec(
-                group_id=label,
+                group_id=gid,
                 retention=retention,
                 rows_per_page=page_size,
                 entry_stride_tokens=1,
@@ -286,6 +368,7 @@ __all__ = [
     "compute_paged_cache_group_page_counts",
     "group_specs_from_layer_types",
     "hybrid_slab_group_size",
+    "layer_group_ids",
     "scheduler_ext_flat_kvcache",
     "validate_flat_scheduler_config",
 ]

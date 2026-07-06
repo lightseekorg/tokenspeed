@@ -36,6 +36,7 @@ def _load(mod_name: str, file_name: str):
 
 _pcs = _load("paged_cache_spec_under_test", "paged_cache_spec.py")
 group_specs_from_layer_types = _pcs.group_specs_from_layer_types
+layer_group_ids = _pcs.layer_group_ids
 PagedCacheGroupSpec = _pcs.PagedCacheGroupSpec
 
 
@@ -120,6 +121,179 @@ class GroupSpecsFromLayerTypesTest(unittest.TestCase):
                 sliding_window_tokens=0,
                 page_size=16,
             )
+
+
+class LayerGroupIdsTest(unittest.TestCase):
+    """layer_group_ids 与 group_specs_from_layer_types 共享同一分组核,
+    模型侧 PagedAttention(group_id=...) 从这里取值。"""
+
+    def test_single_window_ids_equal_layer_types(self):
+        # 回归锚:标量路径 id 必须逐元素等于 layer_types,页表 key 零变动。
+        layer_types = ["full_attention", "sliding_attention"] * 12
+        self.assertEqual(
+            layer_group_ids(layer_types=layer_types, sliding_window_tokens=128),
+            list(layer_types),
+        )
+
+    def test_multi_window_ids_gain_window_suffix(self):
+        self.assertEqual(
+            layer_group_ids(
+                layer_types=[
+                    "full_attention",
+                    "sliding_attention",
+                    "sliding_attention",
+                ],
+                sliding_window_tokens=[None, 4, 512],
+            ),
+            ["full_attention", "sliding_attention_4", "sliding_attention_512"],
+        )
+
+    def test_uniform_window_sequence_keeps_bare_labels(self):
+        # 序列形式但只有一种 window -> 与标量等价,不加后缀。
+        self.assertEqual(
+            layer_group_ids(
+                layer_types=[
+                    "full_attention",
+                    "sliding_attention",
+                    "sliding_attention",
+                ],
+                sliding_window_tokens=[None, 128, 128],
+            ),
+            ["full_attention", "sliding_attention", "sliding_attention"],
+        )
+
+    def test_repeated_window_layers_share_group_id(self):
+        self.assertEqual(
+            layer_group_ids(
+                layer_types=[
+                    "sliding_attention",
+                    "sliding_attention",
+                    "sliding_attention",
+                ],
+                sliding_window_tokens=[4, 512, 4],
+            ),
+            ["sliding_attention_4", "sliding_attention_512", "sliding_attention_4"],
+        )
+
+
+class MultiWindowGroupSpecsTest(unittest.TestCase):
+    def test_two_windows_yield_three_groups_in_first_appearance_order(self):
+        specs = group_specs_from_layer_types(
+            layer_types=[
+                "full_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            sliding_window_tokens=[None, 4, 512, None],
+            page_size=16,
+        )
+        self.assertEqual(
+            [s.group_id for s in specs],
+            ["full_attention", "sliding_attention_4", "sliding_attention_512"],
+        )
+        by_id = {s.group_id: s for s in specs}
+        self.assertEqual(by_id["sliding_attention_4"].sliding_window_tokens, 4)
+        self.assertEqual(by_id["sliding_attention_512"].sliding_window_tokens, 512)
+        self.assertIsNone(by_id["full_attention"].sliding_window_tokens)
+        for s in specs:
+            self.assertEqual(s.rows_per_page, 16)
+
+    def test_window_sequence_length_mismatch_raises(self):
+        with self.assertRaises(ValueError):
+            group_specs_from_layer_types(
+                layer_types=["full_attention", "sliding_attention"],
+                sliding_window_tokens=[None, 4, 512],
+                page_size=16,
+            )
+
+    def test_sliding_layer_without_window_in_sequence_raises(self):
+        with self.assertRaises(ValueError):
+            group_specs_from_layer_types(
+                layer_types=["full_attention", "sliding_attention"],
+                sliding_window_tokens=[None, None],
+                page_size=16,
+            )
+
+    def test_sliding_layer_nonpositive_window_in_sequence_raises(self):
+        with self.assertRaises(ValueError):
+            group_specs_from_layer_types(
+                layer_types=["sliding_attention"],
+                sliding_window_tokens=[0],
+                page_size=16,
+            )
+
+    def test_full_layer_with_positive_window_in_sequence_raises(self):
+        # 疑似标错 layer_type:响亮拒绝而非忽略。
+        with self.assertRaises(ValueError):
+            group_specs_from_layer_types(
+                layer_types=["full_attention", "sliding_attention"],
+                sliding_window_tokens=[64, 64],
+                page_size=16,
+            )
+
+    def test_repeated_window_across_layers_dedups_to_one_group(self):
+        specs = group_specs_from_layer_types(
+            layer_types=[
+                "full_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+            ],
+            sliding_window_tokens=[None, 4, 512, 4],
+            page_size=16,
+        )
+        self.assertEqual(
+            [s.group_id for s in specs],
+            ["full_attention", "sliding_attention_4", "sliding_attention_512"],
+        )
+
+    def test_bool_window_raises(self):
+        with self.assertRaises(ValueError):
+            group_specs_from_layer_types(
+                layer_types=["sliding_attention"],
+                sliding_window_tokens=True,
+                page_size=16,
+            )
+        with self.assertRaises(ValueError):
+            group_specs_from_layer_types(
+                layer_types=["sliding_attention"],
+                sliding_window_tokens=[True],
+                page_size=16,
+            )
+
+    def test_float_window_raises(self):
+        with self.assertRaises(ValueError):
+            group_specs_from_layer_types(
+                layer_types=["sliding_attention"],
+                sliding_window_tokens=[4.7],
+                page_size=16,
+            )
+
+    def test_scalar_str_window_raises(self):
+        with self.assertRaises(ValueError):
+            group_specs_from_layer_types(
+                layer_types=["sliding_attention"],
+                sliding_window_tokens="128",
+                page_size=16,
+            )
+
+    def test_scalar_float_window_raises(self):
+        with self.assertRaises(ValueError):
+            group_specs_from_layer_types(
+                layer_types=["sliding_attention"],
+                sliding_window_tokens=4.5,
+                page_size=16,
+            )
+
+    def test_scalar_window_with_full_layers_does_not_raise(self):
+        # 标量广播不触发 full-layer 守卫(gpt-oss 现状:标量 128 + full 层共存)。
+        specs = group_specs_from_layer_types(
+            layer_types=["full_attention", "sliding_attention"],
+            sliding_window_tokens=128,
+            page_size=16,
+        )
+        self.assertEqual(len(specs), 2)
 
 
 class PoolToPagedCacheGroupsIntegrationTest(unittest.TestCase):

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib.util
+import itertools
 import os
 import pathlib
 import sys
@@ -144,6 +145,75 @@ class HybridSlabGroupSizeTest(unittest.TestCase):
                 hybrid_slab_group_size(None, speculative_enabled=False)
             )
 
+    def test_none_when_multi_window_sequence(self):
+        # 多种 sliding window:slab 的 1:1 配对布局未按 (retention, window)
+        # 组划分,保守退 legacy(M14 spec §2.3)。
+        with self._flat_ext(True):
+            it = itertools.cycle((4, 512))
+            windows = [
+                next(it) if t == "sliding_attention" else None
+                for t in GPT_OSS_LAYER_TYPES
+            ]
+            self.assertIsNone(
+                hybrid_slab_group_size(
+                    GPT_OSS_LAYER_TYPES,
+                    speculative_enabled=False,
+                    sliding_window_tokens=windows,
+                )
+            )
+
+    def test_uniform_window_sequence_stays_active(self):
+        with self._flat_ext(True):
+            windows = [
+                None if t == "full_attention" else 128
+                for t in GPT_OSS_LAYER_TYPES
+            ]
+            self.assertEqual(
+                hybrid_slab_group_size(
+                    GPT_OSS_LAYER_TYPES,
+                    speculative_enabled=False,
+                    sliding_window_tokens=windows,
+                ),
+                12,
+            )
+
+    def test_scalar_window_stays_active(self):
+        # 今日两个消费点传的都是标量/None:行为逐字节不变。
+        with self._flat_ext(True):
+            self.assertEqual(
+                hybrid_slab_group_size(
+                    GPT_OSS_LAYER_TYPES,
+                    speculative_enabled=False,
+                    sliding_window_tokens=128,
+                ),
+                12,
+            )
+
+    def test_none_when_window_sequence_length_mismatch(self):
+        # 谓词永不 raise(门控优化);畸形输入按 None 降级,守卫由
+        # group_specs_from_layer_types 在发布点响亮报错。
+        with self._flat_ext(True):
+            self.assertIsNone(
+                hybrid_slab_group_size(
+                    GPT_OSS_LAYER_TYPES,
+                    speculative_enabled=False,
+                    sliding_window_tokens=[128],
+                )
+            )
+
+    def test_garbage_elements_ignored_not_raised(self):
+        # 非 int 元素被忽略(发布点守卫才响亮报错);谓词只看
+        # 有效 window 的 distinct 数,且永不 raise。
+        with self._flat_ext(True):
+            self.assertEqual(
+                hybrid_slab_group_size(
+                    GPT_OSS_LAYER_TYPES,
+                    speculative_enabled=False,
+                    sliding_window_tokens=["a"] * len(GPT_OSS_LAYER_TYPES),
+                ),
+                12,
+            )
+
 
 class KvProfileLayerDivisorTest(unittest.TestCase):
     """Registry-side sizing consumer (M12 Task 2): _kv_profile_layer_divisor
@@ -186,7 +256,7 @@ class KvProfileLayerDivisorTest(unittest.TestCase):
         with self._pkg_flat_ext(True):
             self.assertEqual(
                 self._registry._kv_profile_layer_divisor(
-                    24, GPT_OSS_LAYER_TYPES, False
+                    24, GPT_OSS_LAYER_TYPES, speculative_enabled=False
                 ),
                 12,
             )
@@ -195,7 +265,7 @@ class KvProfileLayerDivisorTest(unittest.TestCase):
         with self._pkg_flat_ext(False):
             self.assertEqual(
                 self._registry._kv_profile_layer_divisor(
-                    24, GPT_OSS_LAYER_TYPES, False
+                    24, GPT_OSS_LAYER_TYPES, speculative_enabled=False
                 ),
                 24,
             )
@@ -204,7 +274,7 @@ class KvProfileLayerDivisorTest(unittest.TestCase):
         with self._pkg_flat_ext(True):
             self.assertEqual(
                 self._registry._kv_profile_layer_divisor(
-                    24, GPT_OSS_LAYER_TYPES, True
+                    24, GPT_OSS_LAYER_TYPES, speculative_enabled=True
                 ),
                 24,
             )
@@ -215,10 +285,53 @@ class KvProfileLayerDivisorTest(unittest.TestCase):
         # into None via getattr. Both keep the all-layers divisor.
         with self._pkg_flat_ext(True):
             self.assertEqual(
-                self._registry._kv_profile_layer_divisor(24, (), False), 24
+                self._registry._kv_profile_layer_divisor(
+                    24, (), speculative_enabled=False
+                ),
+                24,
             )
             self.assertEqual(
-                self._registry._kv_profile_layer_divisor(24, None, False), 24
+                self._registry._kv_profile_layer_divisor(
+                    24, None, speculative_enabled=False
+                ),
+                24,
+            )
+
+    def test_all_layers_when_multi_window_sequence(self):
+        # M14: the registry must FORWARD sliding_window_tokens into the
+        # predicate -- multi-window sequences degrade sizing to all layers,
+        # matching the pool's layout decision (sizing/layout divergence is
+        # the hazard this pins).
+        with self._pkg_flat_ext(True):
+            it = itertools.cycle((4, 512))
+            windows = [
+                next(it) if t == "sliding_attention" else None
+                for t in GPT_OSS_LAYER_TYPES
+            ]
+            self.assertEqual(
+                self._registry._kv_profile_layer_divisor(
+                    24,
+                    GPT_OSS_LAYER_TYPES,
+                    speculative_enabled=False,
+                    sliding_window_tokens=windows,
+                ),
+                24,
+            )
+
+    def test_group_size_when_uniform_window_sequence(self):
+        with self._pkg_flat_ext(True):
+            windows = [
+                128 if t == "sliding_attention" else None
+                for t in GPT_OSS_LAYER_TYPES
+            ]
+            self.assertEqual(
+                self._registry._kv_profile_layer_divisor(
+                    24,
+                    GPT_OSS_LAYER_TYPES,
+                    speculative_enabled=False,
+                    sliding_window_tokens=windows,
+                ),
+                12,
             )
 
 
