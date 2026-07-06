@@ -38,7 +38,9 @@ struct SchedulerConfig;  // defined in scheduler/types.h; only used by-ref below
 // TODO(flat-l2): out-of-stream writers (load-back H2D) must fence before joining the flat path.
 
 // On false (pool short) nothing is acquired but the claimed prefix blocks REMAIN -- caller must FreeRequest.
-// TODO(flat-swa-alloc): SWA Acquire transiently allocates the full chunk (even chunk >> window); gates charge it.
+// SWA transient footprint contract: each chunk is fully resident during its forward (intra-chunk reads),
+// so per-request SWA peak = ceil((chunk+W-1)/P) pages, bounded by the scheduler round budget -- same
+// plateau as vLLM. Pinned by FlatPrefillPlateauSuite; shrinking it further needs a kernel-level ring buffer.
 bool PrefillFirstChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
                        const CoordinatorMatch& hit, std::int32_t num_new_tokens);
 

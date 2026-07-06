@@ -863,6 +863,52 @@ TEST_F(FlatPrefillSlideAdmissionSuite, LongPromptAdmittedOnlyBecausePrefillSlide
     EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start);
 }
 
+// Pool 17 -> 16 usable: swa at full prompt length would need 10+10+2 = 22
+// (infeasible); the plateau ceil((chunk+W-1)/P) = ceil(7/2) = 4 keeps the peak
+// at full 10 + swa 4 + reserve 2 = 16 (exact fit) -- the flat-swa-alloc contract.
+class FlatPrefillPlateauSuite : public FlatPrefillSlideAdmissionSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = FlatPrefillSlideAdmissionSuite::MakeConfig();
+        cfg.device_allocator.total_pages = 17;
+        cfg.host_allocator.total_pages = 17;
+        return cfg;
+    }
+};
+
+TEST_F(FlatPrefillPlateauSuite, SwaWorkingSetPlateausWhileFullGrowsToPromptLength) {
+    const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
+    ASSERT_EQ(free_at_start, 16);
+
+    Submit(MakeRequestSpec("r1", /*num_pages=*/10));  // 20 tokens, 5 chunks of 4
+    std::size_t swa_peak = 0;
+    std::size_t full_last = 0;
+    for (std::int32_t chunk = 0; chunk < 5; ++chunk) {
+        ExecutionPlan plan = PlanOnce();
+        const FlatForwardOperation* op = FindFlatOp(plan);
+        ASSERT_NE(op, nullptr) << "chunk " << chunk;
+        ASSERT_EQ(op->request_ids.size(), 1u) << "chunk " << chunk << " must be admitted";
+        const std::size_t swa_real = RealPages(op->flat_block_tables.at("swa")).size();
+        const std::size_t full_real = RealPages(op->flat_block_tables.at("full")).size();
+        EXPECT_LE(swa_real, 4u) << "swa exceeded the plateau at chunk " << chunk;
+        EXPECT_GE(full_real, full_last) << "full group must grow monotonically, chunk " << chunk;
+        swa_peak = std::max(swa_peak, swa_real);
+        full_last = full_real;
+    }
+    EXPECT_EQ(swa_peak, 4u) << "the plateau bound must be reached, not just respected";
+    EXPECT_EQ(full_last, 10u);
+
+    SendForwardDone("r1", {99});
+    ExecutionPlan decode = PlanOnce();
+    ASSERT_NE(FindFlatOp(decode), nullptr);
+    EXPECT_EQ(scheduler_->DecodingSize(), 1u);
+
+    SendForwardDone("r1", {100});
+    SendFinish("r1");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start);
+}
+
 // ---------------------------------------------------------------------------
 // Collective starvation deadlock: the scheduler must fail loudly, but only on
 // the SECOND consecutive fully-starved round with nothing in flight (a queued

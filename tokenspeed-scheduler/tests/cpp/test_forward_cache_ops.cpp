@@ -150,7 +150,7 @@ TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowAndKeepsPunchedPageHashes) {
     std::vector<BlockTable> tables(coordinator.NumGroups());
 
     // Chunk 0: 8 tokens -> 4 pages/group (chunk >> window is fine: the slide
-    // happens on the NEXT op; see TODO(flat-swa-alloc)).
+    // happens on the NEXT op; SWA footprint contract in forward_cache_ops.h).
     ASSERT_TRUE(PrefillFirstChunk(coordinator, tables, CoordinatorMatch{}, /*num_new_tokens=*/8));
     const std::int32_t free_before_chunk = pool.NumFreeBlocks();
 
