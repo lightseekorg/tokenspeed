@@ -23,7 +23,7 @@
 import numpy as np
 import torch
 from tokenspeed_kernel._triton import triton
-from tokenspeed_kernel.ops.attention.triton.fla.utils import tensor_cache
+from tokenspeed_kernel.ops.attention.triton.linear.utils import tensor_cache
 
 # Pre-computed total chunk counts. Keyed by (chunk_size, id(cu_seqlens)) and
 # cleared at the start of every set_*() call.

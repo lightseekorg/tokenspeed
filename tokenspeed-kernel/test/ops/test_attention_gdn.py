@@ -24,7 +24,7 @@ from tokenspeed_kernel import gdn_chunk_prefill
 
 
 def _fla_chunk_gated_delta_rule():
-    from tokenspeed_kernel.ops.attention.triton.fla.chunk import (
+    from tokenspeed_kernel.ops.attention.triton.linear.chunk import (
         chunk_gated_delta_rule,
     )
 

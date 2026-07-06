@@ -36,7 +36,7 @@ Convention vs the Triton FLA path (verified equal to bf16 on B200):
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.ops.attention.triton.fla.l2norm import l2norm_fwd
+from tokenspeed_kernel.ops.attention.triton.linear.l2norm import l2norm_fwd
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,

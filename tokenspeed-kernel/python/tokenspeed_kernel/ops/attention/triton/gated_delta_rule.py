@@ -23,7 +23,7 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.ops.attention.triton.fla.chunk import chunk_gated_delta_rule
+from tokenspeed_kernel.ops.attention.triton.linear.chunk import chunk_gated_delta_rule
 from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures

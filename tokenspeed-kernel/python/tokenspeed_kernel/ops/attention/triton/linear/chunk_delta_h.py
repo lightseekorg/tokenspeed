@@ -27,11 +27,11 @@
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.ops.attention.triton.fla.index import (
+from tokenspeed_kernel.ops.attention.triton.linear.index import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
 )
-from tokenspeed_kernel.ops.attention.triton.fla.op import exp, safe_exp
+from tokenspeed_kernel.ops.attention.triton.linear.op import exp, safe_exp
 
 CHUNK_SIZE = 64
 

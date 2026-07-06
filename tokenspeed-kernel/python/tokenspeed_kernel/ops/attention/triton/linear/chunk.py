@@ -21,22 +21,22 @@
 # -*- coding: utf-8 -*-
 
 import torch
-from tokenspeed_kernel.ops.attention.triton.fla.chunk_delta_h import (
+from tokenspeed_kernel.ops.attention.triton.linear.chunk_delta_h import (
     chunk_gated_delta_rule_fwd_h,
 )
-from tokenspeed_kernel.ops.attention.triton.fla.chunk_o import chunk_fwd_o
-from tokenspeed_kernel.ops.attention.triton.fla.chunk_scaled_dot_kkt import (
+from tokenspeed_kernel.ops.attention.triton.linear.chunk_o import chunk_fwd_o
+from tokenspeed_kernel.ops.attention.triton.linear.chunk_scaled_dot_kkt import (
     chunk_scaled_dot_kkt_fwd,
 )
-from tokenspeed_kernel.ops.attention.triton.fla.cumsum import chunk_local_cumsum
-from tokenspeed_kernel.ops.attention.triton.fla.l2norm import l2norm_fwd
-from tokenspeed_kernel.ops.attention.triton.fla.solve_tril import solve_tril
-from tokenspeed_kernel.ops.attention.triton.fla.utils import (
+from tokenspeed_kernel.ops.attention.triton.linear.cumsum import chunk_local_cumsum
+from tokenspeed_kernel.ops.attention.triton.linear.l2norm import l2norm_fwd
+from tokenspeed_kernel.ops.attention.triton.linear.solve_tril import solve_tril
+from tokenspeed_kernel.ops.attention.triton.linear.utils import (
     SUPPRESS_LEVEL,
     autocast_custom_fwd,
     input_guard,
 )
-from tokenspeed_kernel.ops.attention.triton.fla.wy_fast import recompute_w_u_fwd
+from tokenspeed_kernel.ops.attention.triton.linear.wy_fast import recompute_w_u_fwd
 
 
 def chunk_gated_delta_rule_fwd(
