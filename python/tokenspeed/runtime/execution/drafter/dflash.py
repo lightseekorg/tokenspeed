@@ -142,11 +142,6 @@ class DFlash(BaseDrafter):
             dtype=torch.int32,
             pin_memory=True,
         )
-        self.draft_extend_prefix_lens_cpu = torch.zeros(
-            (max_bs,),
-            dtype=torch.int32,
-            pin_memory=True,
-        )
         self.block_offsets = torch.arange(
             self.spec_num_tokens, dtype=torch.int64, device=self.device
         )
@@ -374,7 +369,9 @@ class DFlash(BaseDrafter):
             self.draft_seq_lens_buf[:bs].copy_(
                 old_lens.to(torch.int32) + accept_lengths[:bs].to(torch.int32)
             )
-            self._write_native_cache(hidden, positions, cache_locs, decode_only=True)
+            self._write_native_cache(
+                hidden, positions, cache_locs, decode_only=True
+            )
             return
 
         hidden_chunks = torch.split(hidden, lengths.detach().cpu().tolist(), dim=0)
@@ -552,6 +549,30 @@ class DFlash(BaseDrafter):
                 self._fused_kv_k_buffers, self._fused_kv_v_buffers
             )
 
+            self._fused_kv_inv_k_scales = None
+            self._fused_kv_inv_v_scales = None
+            if self._fused_kv_k_buffers[0].dtype == torch.float8_e4m3fn:
+                has_scale = any(
+                    getattr(layer.self_attn.attn, "k_scale", None) is not None
+                    or getattr(layer.self_attn.attn, "v_scale", None) is not None
+                    for layer in layers
+                )
+                if has_scale:
+                    inv_k_vals = []
+                    inv_v_vals = []
+                    for layer in layers:
+                        attn = layer.self_attn.attn
+                        k_s = getattr(attn, "k_scale", None)
+                        v_s = getattr(attn, "v_scale", None)
+                        inv_k_vals.append(1.0 / float(k_s) if k_s is not None else 1.0)
+                        inv_v_vals.append(1.0 / float(v_s) if v_s is not None else 1.0)
+                    self._fused_kv_inv_k_scales = torch.tensor(
+                        inv_k_vals, dtype=torch.float32, device=self.device
+                    )
+                    self._fused_kv_inv_v_scales = torch.tensor(
+                        inv_v_vals, dtype=torch.float32, device=self.device
+                    )
+
             self._fused_kv_enabled = True
 
             max_total_ctx = self.input_buffers.max_bs * self.spec_num_tokens
@@ -567,9 +588,7 @@ class DFlash(BaseDrafter):
             logger.info(
                 "DFLASH fused KV materialization enabled. "
                 "n_layers=%d, num_kv_heads=%d, head_dim=%d",
-                n_layers,
-                num_kv_heads,
-                head_dim,
+                n_layers, num_kv_heads, head_dim,
             )
         except Exception as e:
             logger.warning(
@@ -649,6 +668,8 @@ class DFlash(BaseDrafter):
             self._fused_kv_num_kv_heads,
             self._fused_kv_head_dim,
             self._fused_kv_rotary_dim,
+            self._fused_kv_inv_k_scales,
+            self._fused_kv_inv_v_scales,
         )
 
     def _current_tokens_from_output(
@@ -673,7 +694,9 @@ class DFlash(BaseDrafter):
             )
             if num_extends > 0:
                 indices.add_(num_extends)
-            torch.index_select(output_tokens, 0, indices, out=current[num_extends:])
+            torch.index_select(
+                output_tokens, 0, indices, out=current[num_extends:]
+            )
             # ``accept_lengths`` can be clamped to 0 at the context limit.  The
             # request will be finished by the scheduler, but the drafter still
             # runs for graph shape. Select a valid in-row dummy token instead of
@@ -682,9 +705,7 @@ class DFlash(BaseDrafter):
                 accept_lengths[num_extends:].to(torch.int64).clamp(1, spec_num_tokens)
             )
             current[num_extends:] = output_tokens[
-                self.decode_offsets_buf[:num_decodes]
-                + num_extends
-                + safe_accept_lengths
+                self.decode_offsets_buf[:num_decodes] + num_extends + safe_accept_lengths
             ]
         return current
 
@@ -731,30 +752,10 @@ class DFlash(BaseDrafter):
             page_size=self.page_size,
         )
 
-        extend_prefix_lens_cpu = self.draft_extend_prefix_lens_cpu[:bs]
         is_capturing = (
             torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
         )
-        use_extend = (
-            getattr(self.attn_backend, "draft_block_use_extend", False)
-            and not is_capturing
-        )
-        if use_extend:
-            extend_prefix_lens_cpu.copy_(prefix_lens.to(dtype=torch.int32))
-            self.attn_backend.init_forward_metadata(
-                bs=bs,
-                num_extends=bs,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens_after,
-                req_to_page=self.req_to_page,
-                forward_mode=ForwardMode.EXTEND,
-                extend_seq_lens=self.draft_input_lengths_buf[:bs],
-                extend_seq_lens_cpu=self.draft_extend_seq_lens_cpu[:bs],
-                extend_prefix_lens=prefix_lens,
-                extend_prefix_lens_cpu=extend_prefix_lens_cpu,
-            )
-            ctx_forward_mode = ForwardMode.EXTEND
-        elif not is_capturing:
+        if not is_capturing:
             self.attn_backend.init_forward_metadata(
                 bs=bs,
                 num_extends=bs,
@@ -767,10 +768,8 @@ class DFlash(BaseDrafter):
                 extend_prefix_lens=None,
                 extend_prefix_lens_cpu=None,
             )
-            ctx_forward_mode = ForwardMode.DECODE
         else:
             self.attn_backend.fill_block_decode_seq_lens(bs, seq_lens_after)
-            ctx_forward_mode = ForwardMode.DECODE
 
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
@@ -779,7 +778,7 @@ class DFlash(BaseDrafter):
             bs=bs,
             num_extends=bs,
             input_num_tokens=bs * self.spec_num_tokens,
-            forward_mode=ctx_forward_mode,
+            forward_mode=ForwardMode.DECODE,
             capture_hidden_mode=CaptureHiddenMode.FULL,
         )
 
@@ -824,14 +823,10 @@ class DFlash(BaseDrafter):
         if not hasattr(self, "target_model"):
             raise RuntimeError("DFLASH drafter is not bound to a target model.")
 
-        from tokenspeed.runtime.execution.cuda_graph_wrapper import (
-            get_is_cuda_graph_phase,
-        )
+        from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_cuda_graph_phase
 
         decode_only = base_ctx.num_extends == 0
-        capturing = (
-            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
-        )
+        capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
         can_overlap = (
             decode_only
             and self._fused_kv_enabled
@@ -877,10 +872,10 @@ class DFlash(BaseDrafter):
         old_lens = self.runtime_states.valid_cache_lengths.index_select(
             0, req_pool_indices
         )
-        max_draft_prefix = (
-            self.req_to_page.shape[1] * self.page_size - self.spec_num_tokens
+        max_draft_prefix = self.req_to_page.shape[1] * self.page_size - self.spec_num_tokens
+        torch.add(
+            old_lens, accept_lengths[:bs], out=self.draft_seq_lens_buf[:bs]
         )
-        torch.add(old_lens, accept_lengths[:bs], out=self.draft_seq_lens_buf[:bs])
         self.draft_seq_lens_buf[:bs].clamp_(max=max_draft_prefix)
 
         # Fork: aux stream runs full KV write (project + fused GEMM + scatter)
@@ -904,10 +899,7 @@ class DFlash(BaseDrafter):
         # Main stream: draft block prep overlaps with aux KV write
         current_tokens = self.block_ids_buf[:bs, 0]
         self._current_tokens_from_output(
-            output_tokens,
-            accept_lengths,
-            0,
-            self.spec_num_tokens,
+            output_tokens, accept_lengths, 0, self.spec_num_tokens,
             out=current_tokens,
         )
         return self._draft_native(current_tokens, kv_sync_event=self._kv_join_event)
