@@ -20,7 +20,11 @@ from __future__ import annotations
 import pytest
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel import gdn_chunk_prefill
+from tokenspeed_kernel import (
+    GdnCheckpointLayout,
+    GdnChunkPrefillResult,
+    gdn_chunk_prefill,
+)
 
 
 def _fla_chunk_gated_delta_rule():
@@ -133,7 +137,7 @@ def test_gdn_chunk_prefill_triton_matches_torch_reference(device: str, require):
     cu_seqlens = torch.tensor([0, seq_len], device=device, dtype=torch.int32)
     scale = head_dim**-0.5
 
-    out, final_state = gdn_chunk_prefill(
+    result = gdn_chunk_prefill(
         q,
         k,
         v,
@@ -146,6 +150,8 @@ def test_gdn_chunk_prefill_triton_matches_torch_reference(device: str, require):
         output_final_state=True,
         solution="triton",
     )
+    assert isinstance(result, GdnChunkPrefillResult)
+    assert result.h_layout is GdnCheckpointLayout.NONE
     ref_out, ref_state = _torch_gdn_chunk_prefill_reference(
         _torch_l2norm(q),
         _torch_l2norm(k),
@@ -157,9 +163,11 @@ def test_gdn_chunk_prefill_triton_matches_torch_reference(device: str, require):
         cu_seqlens=cu_seqlens,
     )
 
-    torch.testing.assert_close(out.float(), ref_out.float(), rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(
-        final_state.float(),
+        result.out.float(), ref_out.float(), rtol=2e-2, atol=2e-2
+    )
+    torch.testing.assert_close(
+        result.final_state.float(),
         ref_state.float(),
         rtol=2e-2,
         atol=3e-2,
@@ -199,7 +207,7 @@ def test_gdn_chunk_prefill_triton_matches_torch_reference_varlen(device: str, re
     cu_seqlens = cu_seqlens.to(torch.int32)
     scale = head_dim**-0.5
 
-    out, final_state = gdn_chunk_prefill(
+    result = gdn_chunk_prefill(
         q,
         k,
         v,
@@ -212,6 +220,8 @@ def test_gdn_chunk_prefill_triton_matches_torch_reference_varlen(device: str, re
         output_final_state=True,
         solution="triton",
     )
+    assert isinstance(result, GdnChunkPrefillResult)
+    assert result.h_layout is GdnCheckpointLayout.NONE
     ref_out, ref_state = _torch_gdn_chunk_prefill_reference(
         _torch_l2norm(q),
         _torch_l2norm(k),
@@ -223,9 +233,11 @@ def test_gdn_chunk_prefill_triton_matches_torch_reference_varlen(device: str, re
         cu_seqlens=cu_seqlens,
     )
 
-    torch.testing.assert_close(out.float(), ref_out.float(), rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(
-        final_state.float(),
+        result.out.float(), ref_out.float(), rtol=2e-2, atol=2e-2
+    )
+    torch.testing.assert_close(
+        result.final_state.float(),
         ref_state.float(),
         rtol=2e-2,
         atol=3e-2,
@@ -241,7 +253,7 @@ def test_gdn_chunk_prefill_matches_fla_reference(device: str, solution: str, req
         device=device,
         dtype=torch.bfloat16,
     )
-    out, final_state = gdn_chunk_prefill(
+    result = gdn_chunk_prefill(
         q,
         k,
         v,
@@ -254,6 +266,8 @@ def test_gdn_chunk_prefill_matches_fla_reference(device: str, solution: str, req
         output_final_state=True,
         solution=solution,
     )
+    assert isinstance(result, GdnChunkPrefillResult)
+    assert result.h_layout is GdnCheckpointLayout.NONE
 
     ref_out, ref_state = _fla_chunk_gated_delta_rule()(
         q=q,
@@ -269,12 +283,12 @@ def test_gdn_chunk_prefill_matches_fla_reference(device: str, solution: str, req
         use_qk_l2norm_in_kernel=True,
     )
 
-    assert out.shape == ref_out.shape
-    assert final_state.shape == ref_state.shape
+    assert result.out.shape == ref_out.shape
+    assert result.final_state.shape == ref_state.shape
     # The FLA implementation is nondeterministic due to atomics; mean error is
     # the stable signal, while max error can be noisy on a few elements.
-    assert (out.float() - ref_out.float()).abs().mean() < 1e-3
-    assert (final_state.float() - ref_state.float()).abs().mean() < 1e-3
+    assert (result.out.float() - ref_out.float()).abs().mean() < 1e-3
+    assert (result.final_state.float() - ref_state.float()).abs().mean() < 1e-3
 
 
 @pytest.mark.parametrize("solution", ["triton", "flashinfer"])
@@ -300,14 +314,21 @@ def test_gdn_chunk_prefill_output_h_contract(device: str, solution: str, require
         output_h=True,
         solution=solution,
     )
+    assert isinstance(result, GdnChunkPrefillResult)
 
     if solution == "triton":
-        out, final_state, h = result
-        assert h.shape == (1, 3, 32, 128, 128)
+        assert result.h_layout is GdnCheckpointLayout.FLA
+        assert result.h is not None
+        assert result.h_cu_starts is None
+        assert result.h.shape == (1, 3, 32, 128, 128)
     else:
-        out, final_state, h, h_cu_starts = result
-        assert h.shape == (2, 32, 128, 128)
-        torch.testing.assert_close(h_cu_starts, torch.tensor([0, 2], device=device))
+        assert result.h_layout is GdnCheckpointLayout.FLASHINFER
+        assert result.h is not None
+        assert result.h_cu_starts is not None
+        assert result.h.shape == (2, 32, 128, 128)
+        torch.testing.assert_close(
+            result.h_cu_starts, torch.tensor([0, 2], device=device)
+        )
 
-    assert out.shape == v.shape
-    assert final_state.shape == initial_state.shape
+    assert result.out.shape == v.shape
+    assert result.final_state.shape == initial_state.shape

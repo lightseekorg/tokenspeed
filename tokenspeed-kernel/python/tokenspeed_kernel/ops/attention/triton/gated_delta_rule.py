@@ -23,6 +23,10 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.attention.gdn_utils import (
+    GdnCheckpointLayout,
+    GdnChunkPrefillResult,
+)
 from tokenspeed_kernel.ops.attention.triton.linear.chunk import chunk_gated_delta_rule
 from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
@@ -58,10 +62,8 @@ def triton_gdn_chunk_prefill(
     qk_l2norm: bool = False,
     output_final_state: bool = True,
     output_h: bool = False,
-) -> (
-    tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-):
-    return chunk_gated_delta_rule(
+) -> GdnChunkPrefillResult:
+    result = chunk_gated_delta_rule(
         q=q,
         k=k,
         v=v,
@@ -75,3 +77,13 @@ def triton_gdn_chunk_prefill(
         use_qk_l2norm_in_kernel=qk_l2norm,
         output_h=output_h,
     )
+    if output_h:
+        out, final_state, h = result
+        return GdnChunkPrefillResult(
+            out=out,
+            final_state=final_state,
+            h=h,
+            h_layout=GdnCheckpointLayout.FLA,
+        )
+    out, final_state = result
+    return GdnChunkPrefillResult(out=out, final_state=final_state)

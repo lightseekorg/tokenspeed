@@ -50,6 +50,7 @@ import tokenspeed_kernel.ops.sampling as _sampling_pkg
 import tokenspeed_kernel.ops.sampling.cute_dsl as _sampling_cute_dsl
 import tokenspeed_kernel.ops.sampling.gluon as _sampling_gluon
 import torch
+from tokenspeed_kernel.ops.attention.gdn_utils import GdnChunkPrefillResult
 from tokenspeed_kernel.ops.attention.triton import dsa as _attention_triton_dsa
 from tokenspeed_kernel.ops.attention.triton import (
     dsa_topk as _attention_triton_dsa_topk,
@@ -1346,6 +1347,11 @@ def selected_kernel_spy(monkeypatch):
             if case.mode == "dsa_plan":
                 return torch.empty((1, 4), dtype=torch.int32)
             q = kwargs["q"]
+            if case.mode == "gdn_chunk_prefill":
+                return GdnChunkPrefillResult(
+                    out=torch.empty_like(q),
+                    final_state=kwargs.get("initial_state"),
+                )
             if kwargs.get("return_lse", False):
                 lse = torch.empty(q.shape[:-1], dtype=torch.float32, device=q.device)
                 return torch.empty_like(q), lse

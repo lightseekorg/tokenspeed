@@ -36,6 +36,10 @@ Convention vs the Triton FLA path (verified equal to bf16 on B200):
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.attention.gdn_utils import (
+    GdnCheckpointLayout,
+    GdnChunkPrefillResult,
+)
 from tokenspeed_kernel.ops.attention.triton.linear.l2norm import l2norm_fwd
 from tokenspeed_kernel.platform import (
     ArchVersion,
@@ -222,9 +226,15 @@ if is_available():
         )
 
         if not output_h:
-            return out, final_state_fla
+            return GdnChunkPrefillResult(out=out, final_state=final_state_fla)
 
         # Return raw flashinfer checkpoints in FLA state layout [total_fi, H, K, V].
         # The caller indexes directly using flashinfer-native offsets
         h_ckpts_fla = state_checkpoints.transpose(-1, -2)
-        return out, final_state_fla, h_ckpts_fla, checkpoint_cu_starts
+        return GdnChunkPrefillResult(
+            out=out,
+            final_state=final_state_fla,
+            h=h_ckpts_fla,
+            h_cu_starts=checkpoint_cu_starts,
+            h_layout=GdnCheckpointLayout.FLASHINFER,
+        )

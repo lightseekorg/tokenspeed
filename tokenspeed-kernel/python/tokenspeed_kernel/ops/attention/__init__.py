@@ -31,6 +31,10 @@ import tokenspeed_kernel.ops.attention.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.attention.gluon  # noqa: F401
 import tokenspeed_kernel.ops.attention.triton  # noqa: F401
 import torch
+from tokenspeed_kernel.ops.attention.gdn_utils import (
+    GdnCheckpointLayout,
+    GdnChunkPrefillResult,
+)
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry, Priority
@@ -55,6 +59,8 @@ __all__ = [
     "mha_extend_with_kvcache",
     "mha_decode_with_kvcache",
     "gdn_chunk_prefill",
+    "GdnCheckpointLayout",
+    "GdnChunkPrefillResult",
     "mla_prefill",
     "mla_decode_with_kvcache",
     "dsa_prefill",
@@ -89,11 +95,7 @@ def gdn_chunk_prefill(
     output_h: bool = False,
     override: str | None = None,
     solution: str | None = None,
-) -> (
-    tuple[torch.Tensor, torch.Tensor]
-    | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-    | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
-):
+) -> GdnChunkPrefillResult:
     """Run Gated Delta Net chunked prefill through kernel selection.
 
     Args:
@@ -107,14 +109,14 @@ def gdn_chunk_prefill(
         cu_seqlens: Cumulative sequence lengths for variable-length prefill.
         qk_l2norm: Whether the selected kernel should L2-normalize Q/K.
         output_final_state: Whether to return the final recurrent state.
-        output_h: Whether to return intermediate recurrent checkpoints. Backends
-            may return native checkpoint layouts.
+        output_h: Whether to return intermediate recurrent checkpoints in the
+            selected backend's native layout.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
     Returns:
-        ``(out, final_state)``, Triton/FLA-style ``(out, final_state, h)``, or
-        FlashInfer-style ``(out, final_state, h, h_cu_starts)``.
+        ``GdnChunkPrefillResult`` with output, final state, and optional
+        backend-native recurrent checkpoints.
     """
     head_dim = q.shape[-1]
     head_v_dim = v.shape[-1]

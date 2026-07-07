@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel.ops.attention import gdn_chunk_prefill
+from tokenspeed_kernel.ops.attention import GdnCheckpointLayout, gdn_chunk_prefill
 from tokenspeed_kernel.ops.attention.triton.gdn_qkv_split import (
     fused_qkv_split_gdn_prefill,
 )
@@ -1122,7 +1122,7 @@ class MambaAttnBackend(AttentionBackend):
             fi_h_checkpoints = None
             h_src = None
             if need_h_track:
-                gdn_out = gdn_chunk_prefill(
+                gdn_result = gdn_chunk_prefill(
                     query,
                     key,
                     value,
@@ -1135,29 +1135,25 @@ class MambaAttnBackend(AttentionBackend):
                     output_final_state=True,
                     output_h=True,
                 )
-                if len(gdn_out) == 4:
-                    (
-                        core_attn_out,
-                        last_recurrent_state,
-                        fi_h_checkpoints,
-                        _,
-                    ) = gdn_out
+                core_attn_out = gdn_result.out
+                last_recurrent_state = gdn_result.final_state
+                if gdn_result.h is None:
+                    raise RuntimeError(
+                        "gdn_chunk_prefill(output_h=True) must return checkpoints"
+                    )
+                if gdn_result.h_layout is GdnCheckpointLayout.FLASHINFER:
+                    fi_h_checkpoints = gdn_result.h
                     h_src = self.forward_metadata.track_ssm_h_src
-                elif len(gdn_out) == 3:
-                    (
-                        core_attn_out,
-                        last_recurrent_state,
-                        fi_h_checkpoints,
-                    ) = gdn_out
-                    fi_h_checkpoints = fi_h_checkpoints.squeeze(0)
+                elif gdn_result.h_layout is GdnCheckpointLayout.FLA:
+                    fi_h_checkpoints = gdn_result.h.squeeze(0)
                     h_src = self.forward_metadata.track_ssm_h_src_fla
                 else:
                     raise RuntimeError(
-                        "gdn_chunk_prefill(output_h=True) must return "
-                        "(out, final_state, h) or (out, final_state, h, h_cu_starts)"
+                        "gdn_chunk_prefill(output_h=True) returned unsupported "
+                        f"checkpoint layout {gdn_result.h_layout}"
                     )
             else:
-                core_attn_out, last_recurrent_state = gdn_chunk_prefill(
+                gdn_result = gdn_chunk_prefill(
                     query,
                     key,
                     value,
@@ -1170,6 +1166,8 @@ class MambaAttnBackend(AttentionBackend):
                     output_final_state=True,
                     output_h=False,
                 )
+                core_attn_out = gdn_result.out
+                last_recurrent_state = gdn_result.final_state
             last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
             ssm_states[cache_indices] = last_recurrent_state
 

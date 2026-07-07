@@ -23,6 +23,8 @@ from tokenspeed_kernel.profiling import bootstrap_profiling_from_env
 bootstrap_profiling_from_env()
 
 from tokenspeed_kernel.ops.attention import (
+    GdnCheckpointLayout,
+    GdnChunkPrefillResult,
     attn_merge_state,
     dsa_decode,
     dsa_decode_topk,
@@ -69,6 +71,8 @@ __all__ = [
     "dsa_plan",
     "attn_merge_state",
     "gdn_chunk_prefill",
+    "GdnCheckpointLayout",
+    "GdnChunkPrefillResult",
     # moe
     "moe_apply",
     "moe_plan",
