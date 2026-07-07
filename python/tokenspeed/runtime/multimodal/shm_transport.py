@@ -31,6 +31,7 @@ large payload copy happens:
 from __future__ import annotations
 
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from multiprocessing import shared_memory
@@ -53,6 +54,12 @@ class ShmTensorHandle:
     _segment: shared_memory.SharedMemory | None = field(
         default=None, init=False, repr=False, compare=False
     )
+
+    @property
+    def nbytes(self) -> int:
+        if self._segment is not None:
+            return self._segment.size
+        return math.prod(self.shape) * self.dtype.itemsize
 
     @classmethod
     def publish(cls, tensor: torch.Tensor) -> ShmTensorHandle:

@@ -75,6 +75,9 @@ EncoderFn = Callable[[list[MultimodalDataItem]], torch.Tensor]
 
 logger = logging.getLogger(__name__)
 LOG_MM_TIMING = envs.TOKENSPEED_LOG_MM_TIMING.get()
+# Small transfers are faster after staging the whole batch; larger transfers
+# benefit from overlapping each H2D enqueue with the next SHM-to-pinned copy.
+_INTERLEAVED_H2D_MIN_AVERAGE_BYTES = 1024 * 1024
 
 
 @dataclass
@@ -504,20 +507,32 @@ class MultimodalEmbedder:
         if not pending:
             return
 
-        for it in pending:
-            if isinstance(it.feature, ShmTensorHandle):
-                it.feature = it.feature.consume()
-
         if device.type != "cuda":
             for it in pending:
+                if isinstance(it.feature, ShmTensorHandle):
+                    it.feature = it.feature.consume()
                 if isinstance(it.feature, torch.Tensor):
                     it.feature = it.feature.to(device, non_blocking=True)
             return
+
+        shm_count = 0
+        shm_nbytes = 0
+        for item in pending:
+            if isinstance(item.feature, ShmTensorHandle):
+                shm_count += 1
+                shm_nbytes += item.feature.nbytes
+        interleave_h2d = shm_nbytes > shm_count * _INTERLEAVED_H2D_MIN_AVERAGE_BYTES
+        if not interleave_h2d:
+            for item in pending:
+                if isinstance(item.feature, ShmTensorHandle):
+                    item.feature = item.feature.consume()
 
         h2d = self._h2d_stream_on(device)
         current = torch.cuda.current_stream(device)
         with torch.cuda.stream(h2d):
             for it in pending:
+                if isinstance(it.feature, ShmTensorHandle):
+                    it.feature = it.feature.consume()
                 if isinstance(it.feature, torch.Tensor):
                     it.feature = it.feature.to(device, non_blocking=True)
         current.wait_stream(h2d)
