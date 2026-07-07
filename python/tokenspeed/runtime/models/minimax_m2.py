@@ -138,6 +138,7 @@ class MiniMaxM2SparseMoeBlock(nn.Module):
             "n_group": 1,
             "topk_group": 1,
             "routed_scaling_factor": 1.0,
+            "normalize_topk_weights": True,
             "correction_bias": self.routing_bias,
             "routing_method_type": RoutingMethodType.MiniMax2,
         }

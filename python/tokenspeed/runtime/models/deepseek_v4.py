@@ -2514,6 +2514,7 @@ class DeepseekV4MoE(nn.Module):
                 with_bias=True,
                 routing_config={
                     "routed_scaling_factor": self.routed_scaling_factor,
+                    "normalize_topk_weights": config.norm_topk_prob,
                     "correction_bias": self.gate.e_score_correction_bias,
                     "routing_method_type": RoutingMethodType.Renormalize,
                 },

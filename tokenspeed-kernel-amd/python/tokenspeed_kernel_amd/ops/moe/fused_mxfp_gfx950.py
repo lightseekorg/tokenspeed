@@ -7416,10 +7416,9 @@ def _dynamic_mxfp4_route(
     n_tokens = router_logits.shape[0]
 
     if int(routing_method_type) == _ROUTING_METHOD_RENORMALIZE:
-        return default_scaled_route(
+        return default_packed_topk_route(
             router_logits,
             top_k,
-            routed_scaling_factor=1.0,
             normalize_topk_weights=normalize_topk_weights,
             dtype=dtype,
         )
@@ -7600,6 +7599,29 @@ def default_scaled_route(
     return _route_from_topk(
         topk_weights,
         topk_ids,
+        num_experts=logits.shape[1],
+        dtype=dtype,
+    )
+
+
+def default_packed_topk_route(
+    logits: torch.Tensor,
+    topk: int,
+    *,
+    normalize_topk_weights: bool,
+    dtype: torch.dtype | None = None,
+) -> tuple[RaggedTensorMetadata, torch.Tensor, torch.Tensor, torch.Tensor]:
+    topk_logits, topk_ids = torch.topk(logits, k=topk, dim=-1, sorted=True)
+    topk_weights = topk_logits.exp()
+    topk_weights = _normalize_route_weights(
+        topk_weights,
+        normalize_topk_weights=normalize_topk_weights,
+        routed_scaling_factor=1.0,
+        scale_when_unnormalized=False,
+    )
+    return _route_from_topk(
+        topk_weights.to(torch.float32),
+        topk_ids.to(torch.int32),
         num_experts=logits.shape[1],
         dtype=dtype,
     )

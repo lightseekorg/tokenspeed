@@ -537,7 +537,7 @@ def select_experts(
             topk_weights,
             num_real_experts,
             routed_scaling_factor,
-            True,
+            renormalize,
         )
     elif custom_routing_function is None:
         topk_weights, topk_ids = torch_native_fused_topk(

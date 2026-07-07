@@ -1012,18 +1012,39 @@ def test_default_grouped_route_preserves_grouping_and_scaling_gfx950() -> None:
     )
 
 
-def test_renormalize_route_recovers_packed_topk_without_scaling_gfx950() -> None:
+@pytest.mark.parametrize(
+    ("topk_weights", "normalize_topk_weights", "expected_weights"),
+    [
+        (
+            [[0.7, 0.3], [0.6, 0.4]],
+            True,
+            [[0.7, 0.3], [0.6, 0.4]],
+        ),
+        (
+            [[2.0, 0.5], [1.5, 0.25]],
+            False,
+            [[2.0, 0.5], [1.5, 0.25]],
+        ),
+        (
+            [[2.0, 0.5], [1.5, 0.25]],
+            True,
+            [[0.8, 0.2], [0.85714287, 0.14285715]],
+        ),
+    ],
+)
+def test_renormalize_route_recovers_packed_topk_without_scaling_gfx950(
+    topk_weights: list[list[float]],
+    normalize_topk_weights: bool,
+    expected_weights: list[list[float]],
+) -> None:
     device = "cuda"
     topk_ids = torch.tensor(
         [[4, 1], [2, 7]],
         device=device,
         dtype=torch.int32,
     )
-    topk_weights = torch.tensor(
-        [[0.7, 0.3], [0.6, 0.4]],
-        device=device,
-        dtype=torch.float32,
-    )
+    topk_weights = torch.tensor(topk_weights, device=device, dtype=torch.float32)
+    expected_weights = torch.tensor(expected_weights, device=device, dtype=torch.float32)
     router_logits = torch.full((2, 8), -1e20, device=device, dtype=torch.float32)
     router_logits.scatter_(1, topk_ids.long(), topk_weights.log())
     correction_bias = torch.linspace(-4.0, 4.0, 8, device=device, dtype=torch.float32)
@@ -1035,7 +1056,7 @@ def test_renormalize_route_recovers_packed_topk_without_scaling_gfx950() -> None
         n_group=0,
         topk_group=0,
         routed_scaling_factor=3.0,
-        normalize_topk_weights=True,
+        normalize_topk_weights=normalize_topk_weights,
         routing_method_type=1,
         dtype=router_logits.dtype,
     )
@@ -1044,7 +1065,7 @@ def test_renormalize_route_recovers_packed_topk_without_scaling_gfx950() -> None
     )
 
     torch.testing.assert_close(actual_ids, topk_ids)
-    torch.testing.assert_close(actual_weights, topk_weights)
+    torch.testing.assert_close(actual_weights, expected_weights)
 
 
 def test_gluon_dynamic_mxfp4_moe_concatenated_silu_matches_torch_gfx950() -> None:
