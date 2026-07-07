@@ -26,6 +26,7 @@ from tokenspeed_kernel_amd.ops.gemm.mm_a16w16_gfx950 import (  # noqa: E402
     _use_mfma_lds_mediumm,
     _use_mfma_lds_smallm,
     _use_warp_reduce_smallm,
+    gluon_mm_a16w16_gfx950,
     gluon_mm_a16w16_mfma_lds_mediumm_gfx950,
     gluon_mm_a16w16_mfma_lds_smallm_gfx950,
     gluon_mm_a16w16_warp_reduce_smallm_gfx950,
@@ -106,12 +107,21 @@ def test_supports_splitk_rejects_non_target_shapes() -> None:
     assert not _supports_mfma_lds_smallm(8, 8192, 4096)
 
 
-def test_use_splitk_routes_supported_non_warp_shapes() -> None:
-    assert _use_mfma_lds_smallm(1, 4096, 4096)
-    assert _use_mfma_lds_smallm(4, 2560, 2048)
+def test_use_splitk_is_disabled_for_default_routing() -> None:
+    assert not _use_mfma_lds_smallm(1, 4096, 4096)
+    assert not _use_mfma_lds_smallm(4, 2560, 2048)
     assert not _use_mfma_lds_smallm(1, 2560, 2048)
     assert not _use_mfma_lds_smallm(2, 2560, 2048)
     assert not _use_mfma_lds_smallm(4, 1280, 1024)
+
+
+def test_dispatcher_falls_back_for_splitk_shapes() -> None:
+    dtype = torch.bfloat16
+    a = torch.empty((1, 4096), device="cuda", dtype=dtype)
+    b = torch.empty((4096, 4096), device="cuda", dtype=dtype)
+
+    assert _supports_mfma_lds_smallm(1, 4096, 4096)
+    assert gluon_mm_a16w16_gfx950(a, b, dtype) is None
 
 
 def test_splitk_partial_scratch_is_stream_local() -> None:

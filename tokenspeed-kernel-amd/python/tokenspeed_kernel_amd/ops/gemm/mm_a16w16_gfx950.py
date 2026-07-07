@@ -1080,8 +1080,10 @@ def _supports_mfma_lds_smallm(M: int, N: int, K: int) -> bool:
     )
 
 
-def _use_mfma_lds_smallm(M: int, N: int, K: int) -> bool:
-    return _supports_mfma_lds_smallm(M, N, K) and not _use_warp_reduce_smallm(M, N, K)
+def _use_mfma_lds_smallm(_M: int, _N: int, _K: int) -> bool:
+    # Keep the split-K kernels available for direct experiments, but do not
+    # route them by default until they are consistently faster than torch.mm.
+    return False
 
 
 def _choose_mfma_lds_mediumm_config(
@@ -1403,8 +1405,8 @@ def gluon_mm_a16w16_gfx950(
 ) -> torch.Tensor | None:
     """Compute dense16 GEMM ``A @ B.T`` on gfx950 when supported.
 
-    Dispatches among warp-reduce small-M, split-K small-M, tuned medium-M, and
-    large-M paths. Returns ``None`` for unsupported dense16 shapes so the generic
+    Dispatches among warp-reduce small-M, tuned medium-M, and large-M paths.
+    Returns ``None`` for unsupported or disabled dense16 shapes so the generic
     GEMM caller can use its torch fallback.
 
     Args:
