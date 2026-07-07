@@ -981,7 +981,7 @@ _CASES = [
         "hopper",
         "attention",
         "attn_merge_state",
-        "triton_attn_merge_state",
+        "cuda_attn_merge_state",
         _attention_merge_state,
     ),
     _case(

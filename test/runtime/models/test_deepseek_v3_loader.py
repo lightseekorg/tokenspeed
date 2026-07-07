@@ -1,9 +1,10 @@
 import unittest
 from unittest import mock
 
+from tokenspeed_kernel.ops.attention import attn_merge_state
+
 from tokenspeed.runtime.models import deepseek_v3
 from tokenspeed.runtime.models.deepseek_v3 import DeepseekV3ForCausalLM
-from tokenspeed_kernel.ops.attention import attn_merge_state
 
 
 class TestDeepseekV3Loader(unittest.TestCase):
