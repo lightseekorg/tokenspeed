@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import pytest
+import torch
+from tokenspeed_kernel.platform import Platform
 from tokenspeed_kernel_amd.ops.gemm.mm_a16w16_gfx950 import (
     _choose_mfma_lds_mediumm_config,
     _supports_mfma_lds_smallm,
@@ -7,10 +10,57 @@ from tokenspeed_kernel_amd.ops.gemm.mm_a16w16_gfx950 import (
     _use_mfma_lds_mediumm,
     _use_mfma_lds_smallm,
     _use_warp_reduce_smallm,
+    gluon_mm_a16w16_mfma_lds_mediumm_gfx950,
+    gluon_mm_a16w16_mfma_lds_smallm_gfx950,
+    gluon_mm_a16w16_warp_reduce_smallm_gfx950,
 )
 from tokenspeed_kernel_amd.ops.gemm.mm_a16w16_largem_gfx950 import (
     _supports_largem_shape,
+    gluon_mm_a16w16_largem_gfx950,
 )
+
+_CORRECTNESS_CASES = [
+    pytest.param(
+        gluon_mm_a16w16_warp_reduce_smallm_gfx950,
+        (2, 128, 1024),
+        id="warp-reduce",
+    ),
+    pytest.param(
+        gluon_mm_a16w16_mfma_lds_smallm_gfx950,
+        (4, 256, 2048),
+        id="splitk-smallm",
+    ),
+    pytest.param(
+        gluon_mm_a16w16_mfma_lds_mediumm_gfx950,
+        (8, 128, 64),
+        id="mediumm",
+    ),
+    pytest.param(
+        gluon_mm_a16w16_largem_gfx950,
+        (256, 256, 256),
+        id="largem",
+    ),
+]
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not Platform.get().is_cdna4,
+    reason="requires a CDNA4 HIP GPU",
+)
+@pytest.mark.parametrize("kernel,shape", _CORRECTNESS_CASES)
+def test_dense16_kernel_variant_correctness(
+    kernel, shape: tuple[int, int, int]
+) -> None:
+    torch.manual_seed(0)
+    dtype = torch.bfloat16
+    m, n, k = shape
+    a = torch.randn((m, k), device="cuda", dtype=dtype) * 0.25
+    b = torch.randn((n, k), device="cuda", dtype=dtype) * 0.25
+
+    out = kernel(a, b, dtype)
+    assert out is not None
+
+    torch.testing.assert_close(out, torch.mm(a, b.T), atol=0.5, rtol=0.05)
 
 
 def test_use_warp_reduce_covers_small_k_decode_shapes() -> None:

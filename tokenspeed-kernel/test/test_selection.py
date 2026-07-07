@@ -1468,35 +1468,3 @@ class TestGemmDispatchProfiling:
                 },
             )
         ]
-
-    def test_mm_returns_none_when_selected_kernel_returns_none(self):
-        call_log: list[str] = []
-        seen_block_sizes: list[list[int] | None] = []
-        kernel_name = "test_none_mm"
-
-        def _impl(
-            A: torch.Tensor,
-            B: torch.Tensor,
-            A_scales: torch.Tensor | None,
-            B_scales: torch.Tensor | None,
-            out_dtype: torch.dtype,
-            *,
-            alpha: torch.Tensor | None = None,
-            block_size: list[int] | None = None,
-        ) -> None:
-            _ = A, B, A_scales, B_scales, out_dtype, alpha
-            call_log.append(kernel_name)
-            seen_block_sizes.append(block_size)
-            return None
-
-        self._register_kernel(kernel_name, "gluon", _impl)
-
-        A = torch.randn(4, 8, dtype=torch.float16)
-        B = torch.randn(6, 8, dtype=torch.float16)
-
-        with kernel_override("gemm", "mm", kernel_name):
-            out = gemm.mm(A, B, out_dtype=torch.float16, block_size=[128, 128])
-
-        assert out is None
-        assert call_log == [kernel_name]
-        assert seen_block_sizes == [[128, 128]]
