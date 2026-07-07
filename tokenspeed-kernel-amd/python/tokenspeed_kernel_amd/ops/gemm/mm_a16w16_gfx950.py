@@ -53,7 +53,6 @@ LARGEM_DISPATCH_MIN_M = 2048
 KERNEL_NAME = "gluon_mm_a16w16_gfx950"
 
 _SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
-_partial_cache: dict[tuple[int, int, int, int], torch.Tensor] = {}
 
 
 @gluon.jit
@@ -995,26 +994,24 @@ def _mfma_lds_mediumm_kernel(
     )
 
 
-def _get_partial_scratch(
+def _allocate_partial_scratch(
     device: torch.device,
     total_tiles: int,
     split_k: int,
     block_n: int,
     block_m: int = DENSE16_BLOCK_M,
 ) -> torch.Tensor:
-    device_index = 0 if device.index is None else device.index
-    key = (device_index, total_tiles, split_k, block_m * block_n)
-    cached = _partial_cache.get(key)
-    if cached is not None:
-        return cached
+    """Allocate per-call split-K partial sums.
 
-    partial = torch.empty(
+    The producer and reducer kernels run asynchronously on the caller's stream,
+    so sharing this scratch across invocations can race when same-shape GEMMs run
+    concurrently on different HIP streams.
+    """
+    return torch.empty(
         (total_tiles * split_k * block_m * block_n,),
         device=device,
         dtype=torch.float32,
     )
-    _partial_cache[key] = partial
-    return partial
 
 
 def _check_supported_dense16_shape(M: int, N: int, K: int) -> None:
@@ -1245,7 +1242,7 @@ def gluon_mm_a16w16_mfma_lds_smallm_gfx950(
     total_work = num_n_tiles * split_k
     sms = torch.cuda.get_device_properties(A.device).multi_processor_count
     grid = min(total_work, sms)
-    partial = _get_partial_scratch(
+    partial = _allocate_partial_scratch(
         A.device, num_n_tiles, split_k, MFMA_LDS_BLOCK_N, MFMA_LDS_REDUCE_M
     )
     k_tiles_per_split = (K // MFMA_LDS_BLOCK_K) // split_k

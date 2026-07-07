@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel_amd.ops.gemm.mm_a16w16_gfx950 import (
+    _allocate_partial_scratch,
     _choose_mfma_lds_mediumm_config,
     _supports_mfma_lds_smallm,
     _use_mfma_lds_largem,
@@ -109,6 +110,14 @@ def test_use_splitk_routes_supported_non_warp_shapes() -> None:
     assert not _use_mfma_lds_smallm(1, 2560, 2048)
     assert not _use_mfma_lds_smallm(2, 2560, 2048)
     assert not _use_mfma_lds_smallm(4, 1280, 1024)
+
+
+def test_splitk_partial_scratch_is_per_call() -> None:
+    first = _allocate_partial_scratch(torch.device("cpu"), 2, 8, 256, 4)
+    second = _allocate_partial_scratch(torch.device("cpu"), 2, 8, 256, 4)
+
+    assert first.shape == second.shape
+    assert first.data_ptr() != second.data_ptr()
 
 
 def test_choose_mfma_lds_mediumm_config_uses_tuned_medium_m_tiles() -> None:
