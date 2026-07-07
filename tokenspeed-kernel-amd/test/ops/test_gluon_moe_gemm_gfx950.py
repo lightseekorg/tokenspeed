@@ -338,6 +338,31 @@ def _make_e8m0_scales(
     ]
 
 
+def _make_random_mxfp4_quantized_tensor(
+    logical_shape: tuple[int, ...],
+    *,
+    device: str,
+    generator: torch.Generator,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if logical_shape[-1] % MXFP4_BLOCK != 0:
+        raise ValueError(
+            f"MXFP4 test tensor K must be divisible by {MXFP4_BLOCK}, "
+            f"got {logical_shape[-1]}"
+        )
+    return (
+        _make_mxfp4_weight_bytes(
+            (*logical_shape[:-1], logical_shape[-1] // 2),
+            device=device,
+            generator=generator,
+        ),
+        _make_e8m0_scales(
+            (*logical_shape[:-1], logical_shape[-1] // MXFP4_BLOCK),
+            device=device,
+            generator=generator,
+        ),
+    )
+
+
 def _make_raw_mxfp4_weights() -> RawMxfp4Weights:
     device = "cuda"
     generator = torch.Generator(device=device).manual_seed(20260610)
@@ -771,13 +796,13 @@ def _recover_topk_from_route(
 
 
 def test_gluon_dynamic_mxfp4_moe_small_matches_torch_gfx950() -> None:
-    import tokenspeed_kernel
     from tokenspeed_kernel_amd.ops.moe.fused_mxfp_gfx950 import (
         _quantize_mxfp4_activation,
     )
 
     torch.manual_seed(20260630)
     device = "cuda"
+    generator = torch.Generator(device=device).manual_seed(20260630)
     m, e, h, i, topk = 4, 8, 512, 512, 2
     n_group, topk_group = 2, 1
     hidden = (
@@ -789,15 +814,10 @@ def test_gluon_dynamic_mxfp4_moe_small_matches_torch_gfx950() -> None:
     def quant_weight(
         shape: tuple[int, ...],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        fp = (
-            torch.randn(shape, device=device, dtype=torch.bfloat16) * 0.02
-        ).contiguous()
-        quant, scale = tokenspeed_kernel.quantize_mxfp4(
-            fp,
-            scale_size=MXFP4_BLOCK,
-            scale_layout="linear",
-            solution="triton",
-            enable_pdl=False,
+        quant, scale = _make_random_mxfp4_quantized_tensor(
+            shape,
+            device=device,
+            generator=generator,
         )
         return (
             quant,
@@ -1028,13 +1048,13 @@ def test_renormalize_route_recovers_packed_topk_without_scaling_gfx950() -> None
 
 
 def test_gluon_dynamic_mxfp4_moe_concatenated_silu_matches_torch_gfx950() -> None:
-    import tokenspeed_kernel
     from tokenspeed_kernel_amd.ops.moe.fused_mxfp_gfx950 import (
         _quantize_mxfp4_activation,
     )
 
     torch.manual_seed(20260630)
     device = "cuda"
+    generator = torch.Generator(device=device).manual_seed(20260631)
     m, e, h, i, topk = 4, 8, 512, 512, 2
     n_group, topk_group = 2, 1
     hidden = (
@@ -1046,15 +1066,10 @@ def test_gluon_dynamic_mxfp4_moe_concatenated_silu_matches_torch_gfx950() -> Non
     def quant_weight(
         shape: tuple[int, ...],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        fp = (
-            torch.randn(shape, device=device, dtype=torch.bfloat16) * 0.02
-        ).contiguous()
-        return tokenspeed_kernel.quantize_mxfp4(
-            fp,
-            scale_size=MXFP4_BLOCK,
-            scale_layout="linear",
-            solution="triton",
-            enable_pdl=False,
+        return _make_random_mxfp4_quantized_tensor(
+            shape,
+            device=device,
+            generator=generator,
         )
 
     w13_quant, w13_scale = quant_weight((e, 2 * i, h))
