@@ -7325,6 +7325,7 @@ def gluon_mxfp_dynamic_mxfp4_fused_moe(
     topk_group: int,
     routed_scaling_factor: float,
     normalize_topk_weights: bool,
+    routing_method_type: int = 0,
     w13_bias: Optional[torch.Tensor] = None,
     w2_bias: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
@@ -7341,66 +7342,17 @@ def gluon_mxfp_dynamic_mxfp4_fused_moe(
     n_tokens = router_logits.shape[0]
     route_dtype = router_logits.dtype
 
-    if correction_bias is not None and (n_group <= 0 or topk_group <= 0):
-        raise ValueError(
-            "correction_bias requires grouped routing metadata: "
-            f"n_group={n_group}, topk_group={topk_group}"
-        )
-
-    if correction_bias is not None:
-        if n_tokens <= SMALLM_MAX_M and gluon_biased_grouped_route_supported(
-            router_logits,
-            correction_bias,
-            top_k,
-            n_group=n_group,
-            topk_group=topk_group,
-            dtype=route_dtype,
-        ):
-            (
-                ragged_metadata,
-                gather_indx,
-                scatter_indx,
-                gate_scal,
-            ) = gluon_biased_grouped_fused_route(
-                router_logits,
-                correction_bias,
-                top_k,
-                n_group=n_group,
-                topk_group=topk_group,
-                routed_scaling_factor=routed_scaling_factor,
-                normalize_topk_weights=normalize_topk_weights,
-                dtype=route_dtype,
-            )
-        else:
-            (
-                ragged_metadata,
-                gather_indx,
-                scatter_indx,
-                gate_scal,
-            ) = default_biased_grouped_route(
-                router_logits,
-                correction_bias,
-                top_k,
-                n_group=n_group,
-                topk_group=topk_group,
-                routed_scaling_factor=routed_scaling_factor,
-                normalize_topk_weights=normalize_topk_weights,
-                dtype=route_dtype,
-            )
-    elif n_tokens <= SMALLM_MAX_M and gluon_route_supported(
-        router_logits, top_k, route_dtype
-    ):
-        ragged_metadata, gather_indx, scatter_indx, gate_scal = gluon_fused_route(
-            router_logits,
-            top_k,
-            dtype=route_dtype,
-        )
-    else:
-        ragged_metadata, gather_indx, scatter_indx, gate_scal = default_route(
-            router_logits,
-            top_k,
-            dtype=route_dtype,
-        )
+    ragged_metadata, gather_indx, scatter_indx, gate_scal = _dynamic_mxfp4_route(
+        router_logits,
+        top_k,
+        correction_bias=correction_bias,
+        n_group=n_group,
+        topk_group=topk_group,
+        routed_scaling_factor=routed_scaling_factor,
+        normalize_topk_weights=normalize_topk_weights,
+        routing_method_type=routing_method_type,
+        dtype=route_dtype,
+    )
 
     act = FusedActivation(
         FnSpecs("swiglu", swiglu_fn, ("alpha", "limit", "beta"), reduction_n=2),
@@ -7443,6 +7395,263 @@ def gluon_mxfp_dynamic_mxfp4_fused_moe(
         n_tokens=n_tokens,
         n_expts_act=top_k,
         x_scale_ragged_padded=True,
+    )
+
+
+_ROUTING_METHOD_RENORMALIZE = 1
+
+
+def _dynamic_mxfp4_route(
+    router_logits: torch.Tensor,
+    top_k: int,
+    *,
+    correction_bias: torch.Tensor | None,
+    n_group: int,
+    topk_group: int,
+    routed_scaling_factor: float,
+    normalize_topk_weights: bool,
+    routing_method_type: int,
+    dtype: torch.dtype,
+) -> tuple[RaggedTensorMetadata, torch.Tensor, torch.Tensor, torch.Tensor]:
+    n_tokens = router_logits.shape[0]
+
+    if int(routing_method_type) == _ROUTING_METHOD_RENORMALIZE:
+        return default_scaled_route(
+            router_logits,
+            top_k,
+            routed_scaling_factor=1.0,
+            normalize_topk_weights=normalize_topk_weights,
+            dtype=dtype,
+        )
+
+    if _uses_grouped_routing(n_group, topk_group):
+        if correction_bias is None:
+            return default_grouped_route(
+                router_logits,
+                top_k,
+                n_group=n_group,
+                topk_group=topk_group,
+                routed_scaling_factor=routed_scaling_factor,
+                normalize_topk_weights=normalize_topk_weights,
+                dtype=dtype,
+            )
+        if n_tokens <= SMALLM_MAX_M and gluon_biased_grouped_route_supported(
+            router_logits,
+            correction_bias,
+            top_k,
+            n_group=n_group,
+            topk_group=topk_group,
+            dtype=dtype,
+        ):
+            return gluon_biased_grouped_fused_route(
+                router_logits,
+                correction_bias,
+                top_k,
+                n_group=n_group,
+                topk_group=topk_group,
+                routed_scaling_factor=routed_scaling_factor,
+                normalize_topk_weights=normalize_topk_weights,
+                dtype=dtype,
+            )
+        return default_biased_grouped_route(
+            router_logits,
+            correction_bias,
+            top_k,
+            n_group=n_group,
+            topk_group=topk_group,
+            routed_scaling_factor=routed_scaling_factor,
+            normalize_topk_weights=normalize_topk_weights,
+            dtype=dtype,
+        )
+
+    if _has_incomplete_grouped_routing(n_group, topk_group):
+        raise ValueError(
+            "grouped routing requires both n_group and topk_group; "
+            f"got n_group={n_group}, topk_group={topk_group}"
+        )
+
+    if correction_bias is not None:
+        return default_biased_route(
+            router_logits,
+            correction_bias,
+            top_k,
+            routed_scaling_factor=routed_scaling_factor,
+            normalize_topk_weights=normalize_topk_weights,
+            dtype=dtype,
+        )
+
+    if normalize_topk_weights or routed_scaling_factor != 1.0:
+        return default_scaled_route(
+            router_logits,
+            top_k,
+            routed_scaling_factor=routed_scaling_factor,
+            normalize_topk_weights=normalize_topk_weights,
+            dtype=dtype,
+        )
+
+    if n_tokens <= SMALLM_MAX_M and gluon_route_supported(router_logits, top_k, dtype):
+        return gluon_fused_route(
+            router_logits,
+            top_k,
+            dtype=dtype,
+        )
+
+    return default_route(
+        router_logits,
+        top_k,
+        dtype=dtype,
+    )
+
+
+def _uses_grouped_routing(n_group: int, topk_group: int) -> bool:
+    return n_group > 0 and topk_group > 0
+
+
+def _has_incomplete_grouped_routing(n_group: int, topk_group: int) -> bool:
+    return (n_group > 0) != (topk_group > 0)
+
+
+def _normalize_route_weights(
+    topk_weights: torch.Tensor,
+    *,
+    normalize_topk_weights: bool,
+    routed_scaling_factor: float,
+    scale_when_unnormalized: bool,
+) -> torch.Tensor:
+    if normalize_topk_weights:
+        tiny = torch.finfo(topk_weights.dtype).tiny
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True).clamp_min(
+            tiny
+        )
+    if normalize_topk_weights or scale_when_unnormalized:
+        topk_weights = topk_weights * routed_scaling_factor
+    return topk_weights
+
+
+def _softmax_topk_reference(
+    logits: torch.Tensor,
+    topk: int,
+    *,
+    correction_bias: torch.Tensor | None,
+    routed_scaling_factor: float,
+    normalize_topk_weights: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    scores = torch.softmax(logits.float(), dim=-1)
+    scores_for_choice = scores
+    if correction_bias is not None:
+        scores_for_choice = scores + correction_bias.to(scores.dtype).unsqueeze(0)
+    _, topk_ids = torch.topk(scores_for_choice, k=topk, dim=-1, sorted=True)
+    topk_weights = scores.gather(1, topk_ids)
+    topk_weights = _normalize_route_weights(
+        topk_weights,
+        normalize_topk_weights=normalize_topk_weights,
+        routed_scaling_factor=routed_scaling_factor,
+        scale_when_unnormalized=True,
+    )
+    return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+
+
+def _grouped_topk_reference(
+    logits: torch.Tensor,
+    topk: int,
+    *,
+    n_group: int,
+    topk_group: int,
+    routed_scaling_factor: float,
+    normalize_topk_weights: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    scores = torch.softmax(logits.float(), dim=-1)
+    n_tokens, n_experts = scores.shape
+    group_scores = scores.view(n_tokens, n_group, -1).max(dim=-1).values
+    group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[1]
+    group_mask = torch.zeros_like(group_scores)
+    group_mask.scatter_(1, group_idx, 1)
+    score_mask = (
+        group_mask.unsqueeze(-1)
+        .expand(n_tokens, n_group, n_experts // n_group)
+        .reshape(n_tokens, -1)
+    )
+    tmp_scores = scores.masked_fill(~score_mask.bool(), 0.0)
+    topk_weights, topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=False)
+    topk_weights = _normalize_route_weights(
+        topk_weights,
+        normalize_topk_weights=normalize_topk_weights,
+        routed_scaling_factor=routed_scaling_factor,
+        scale_when_unnormalized=False,
+    )
+    return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+
+
+def default_scaled_route(
+    logits: torch.Tensor,
+    topk: int,
+    *,
+    routed_scaling_factor: float,
+    normalize_topk_weights: bool,
+    dtype: torch.dtype | None = None,
+) -> tuple[RaggedTensorMetadata, torch.Tensor, torch.Tensor, torch.Tensor]:
+    topk_weights, topk_ids = _softmax_topk_reference(
+        logits,
+        topk,
+        correction_bias=None,
+        routed_scaling_factor=routed_scaling_factor,
+        normalize_topk_weights=normalize_topk_weights,
+    )
+    return _route_from_topk(
+        topk_weights,
+        topk_ids,
+        num_experts=logits.shape[1],
+        dtype=dtype,
+    )
+
+
+def default_biased_route(
+    logits: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk: int,
+    *,
+    routed_scaling_factor: float,
+    normalize_topk_weights: bool,
+    dtype: torch.dtype | None = None,
+) -> tuple[RaggedTensorMetadata, torch.Tensor, torch.Tensor, torch.Tensor]:
+    topk_weights, topk_ids = _softmax_topk_reference(
+        logits,
+        topk,
+        correction_bias=correction_bias,
+        routed_scaling_factor=routed_scaling_factor,
+        normalize_topk_weights=normalize_topk_weights,
+    )
+    return _route_from_topk(
+        topk_weights,
+        topk_ids,
+        num_experts=logits.shape[1],
+        dtype=dtype,
+    )
+
+
+def default_grouped_route(
+    logits: torch.Tensor,
+    topk: int,
+    *,
+    n_group: int,
+    topk_group: int,
+    routed_scaling_factor: float,
+    normalize_topk_weights: bool,
+    dtype: torch.dtype | None = None,
+) -> tuple[RaggedTensorMetadata, torch.Tensor, torch.Tensor, torch.Tensor]:
+    topk_weights, topk_ids = _grouped_topk_reference(
+        logits,
+        topk,
+        n_group=n_group,
+        topk_group=topk_group,
+        routed_scaling_factor=routed_scaling_factor,
+        normalize_topk_weights=normalize_topk_weights,
+    )
+    return _route_from_topk(
+        topk_weights,
+        topk_ids,
+        num_experts=logits.shape[1],
+        dtype=dtype,
     )
 
 

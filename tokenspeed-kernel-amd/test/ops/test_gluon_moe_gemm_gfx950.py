@@ -23,6 +23,9 @@ if not _IS_GFX950:
 
 from tokenspeed_kernel_amd.ops.moe import fused_mxfp_gfx950 as gluon_moe  # noqa: E402
 from tokenspeed_kernel_amd.ops.moe.fused_mxfp_gfx950 import (  # noqa: E402
+    _dynamic_mxfp4_route,
+    default_biased_route,
+    default_grouped_route,
     default_route,
     fp8_quantize,
     gluon_biased_grouped_fused_route,
@@ -742,6 +745,31 @@ def _compute_torch_gemm2_reference(
     return routed.view(num_tokens, TOPK, HIDDEN_SIZE).sum(dim=1)
 
 
+def _recover_topk_from_route(
+    ragged_metadata: Any,
+    scatter_indx: torch.Tensor,
+    gate_scal: torch.Tensor,
+    num_tokens: int,
+    topk: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    device = scatter_indx.device
+    expert_ids = torch.repeat_interleave(
+        torch.arange(
+            ragged_metadata.slice_sizes.numel(),
+            device=device,
+            dtype=torch.int32,
+        ),
+        ragged_metadata.slice_sizes.to(torch.long),
+    )
+    flat_ids = torch.empty((num_tokens * topk,), device=device, dtype=torch.int32)
+    flat_weights = torch.empty(
+        (num_tokens * topk,), device=device, dtype=gate_scal.dtype
+    )
+    flat_ids[scatter_indx.long()] = expert_ids
+    flat_weights[scatter_indx.long()] = gate_scal
+    return flat_weights.view(num_tokens, topk), flat_ids.view(num_tokens, topk)
+
+
 def test_gluon_dynamic_mxfp4_moe_small_matches_torch_gfx950() -> None:
     import tokenspeed_kernel
     from tokenspeed_kernel_amd.ops.moe.fused_mxfp_gfx950 import (
@@ -852,30 +880,151 @@ def test_gluon_dynamic_mxfp4_moe_small_matches_torch_gfx950() -> None:
     )
 
 
-def test_gluon_dynamic_mxfp4_moe_rejects_incomplete_grouped_bias_config_gfx950() -> (
-    None
-):
+def test_default_biased_route_handles_nongrouped_correction_bias_gfx950() -> None:
     device = "cuda"
-    hidden = torch.empty((1, 32), device=device, dtype=torch.bfloat16)
-    logits = torch.empty((1, 8), device=device, dtype=torch.bfloat16)
-    correction_bias = torch.zeros((8,), device=device, dtype=torch.float32)
-    dummy = torch.empty((1,), device=device, dtype=torch.uint8)
+    logits = torch.tensor(
+        [
+            [1.0, -0.5, 0.25, 0.75, -1.0, 0.5, -0.25, 1.25],
+            [-0.75, 0.5, 1.5, -0.25, 0.0, 1.0, -1.5, 0.25],
+        ],
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    correction_bias = torch.tensor(
+        [0.0, 0.2, -0.1, 0.3, -0.2, 0.1, 0.4, -0.3],
+        device=device,
+        dtype=torch.float32,
+    )
+    topk = 3
+    scale = 1.75
 
-    with pytest.raises(ValueError, match="correction_bias requires grouped routing"):
-        gluon_mxfp_dynamic_mxfp4_fused_moe(
-            hidden,
-            logits,
-            dummy,
-            dummy,
-            w13_mx_scale=dummy,
-            w2_mx_scale=dummy,
-            top_k=2,
-            correction_bias=correction_bias,
-            n_group=0,
-            topk_group=1,
-            routed_scaling_factor=1.0,
-            normalize_topk_weights=True,
-        )
+    ragged, _, scatter, gate = default_biased_route(
+        logits,
+        correction_bias,
+        topk,
+        routed_scaling_factor=scale,
+        normalize_topk_weights=True,
+        dtype=logits.dtype,
+    )
+    actual_weights, actual_ids = _recover_topk_from_route(
+        ragged, scatter, gate, logits.shape[0], topk
+    )
+
+    scores = torch.softmax(logits.float(), dim=-1)
+    _, expected_ids = torch.topk(
+        scores + correction_bias.unsqueeze(0),
+        k=topk,
+        dim=-1,
+        sorted=True,
+    )
+    expected_weights = scores.gather(1, expected_ids)
+    expected_weights = expected_weights / expected_weights.sum(dim=-1, keepdim=True)
+    expected_weights = expected_weights * scale
+
+    torch.testing.assert_close(actual_ids, expected_ids.to(torch.int32))
+    torch.testing.assert_close(
+        actual_weights.float(),
+        expected_weights,
+        atol=5e-3,
+        rtol=5e-3,
+    )
+
+
+def test_default_grouped_route_preserves_grouping_and_scaling_gfx950() -> None:
+    device = "cuda"
+    logits = torch.tensor(
+        [
+            [1.0, 0.75, -0.25, -0.5, 0.5, 0.25, -1.0, -0.75],
+            [-0.25, -0.5, 0.5, 1.0, -0.75, 0.25, 0.75, -1.0],
+        ],
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    topk = 2
+    n_group = 4
+    topk_group = 2
+    scale = 2.0
+
+    ragged, _, scatter, gate = default_grouped_route(
+        logits,
+        topk,
+        n_group=n_group,
+        topk_group=topk_group,
+        routed_scaling_factor=scale,
+        normalize_topk_weights=True,
+        dtype=logits.dtype,
+    )
+    actual_weights, actual_ids = _recover_topk_from_route(
+        ragged, scatter, gate, logits.shape[0], topk
+    )
+
+    scores = torch.softmax(logits.float(), dim=-1)
+    num_tokens, num_experts = scores.shape
+    group_scores = scores.view(num_tokens, n_group, -1).max(dim=-1).values
+    group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[1]
+    group_mask = torch.zeros_like(group_scores)
+    group_mask.scatter_(1, group_idx, 1)
+    score_mask = (
+        group_mask.unsqueeze(-1)
+        .expand(num_tokens, n_group, num_experts // n_group)
+        .reshape(num_tokens, -1)
+    )
+    expected_weights, expected_ids = torch.topk(
+        scores.masked_fill(~score_mask.bool(), 0.0),
+        k=topk,
+        dim=-1,
+        sorted=False,
+    )
+    expected_weights = expected_weights / expected_weights.sum(dim=-1, keepdim=True)
+    expected_weights = expected_weights * scale
+
+    actual_order = actual_ids.argsort(dim=-1)
+    expected_order = expected_ids.argsort(dim=-1)
+    torch.testing.assert_close(
+        actual_ids.gather(1, actual_order),
+        expected_ids.to(torch.int32).gather(1, expected_order),
+    )
+    torch.testing.assert_close(
+        actual_weights.float().gather(1, actual_order),
+        expected_weights.gather(1, expected_order),
+        atol=5e-3,
+        rtol=5e-3,
+    )
+
+
+def test_renormalize_route_recovers_packed_topk_without_scaling_gfx950() -> None:
+    device = "cuda"
+    topk_ids = torch.tensor(
+        [[4, 1], [2, 7]],
+        device=device,
+        dtype=torch.int32,
+    )
+    topk_weights = torch.tensor(
+        [[0.7, 0.3], [0.6, 0.4]],
+        device=device,
+        dtype=torch.float32,
+    )
+    router_logits = torch.full((2, 8), -1e20, device=device, dtype=torch.float32)
+    router_logits.scatter_(1, topk_ids.long(), topk_weights.log())
+    correction_bias = torch.linspace(-4.0, 4.0, 8, device=device, dtype=torch.float32)
+
+    ragged, _, scatter, gate = _dynamic_mxfp4_route(
+        router_logits,
+        top_k=2,
+        correction_bias=correction_bias,
+        n_group=0,
+        topk_group=0,
+        routed_scaling_factor=3.0,
+        normalize_topk_weights=True,
+        routing_method_type=1,
+        dtype=router_logits.dtype,
+    )
+    actual_weights, actual_ids = _recover_topk_from_route(
+        ragged, scatter, gate, router_logits.shape[0], 2
+    )
+
+    torch.testing.assert_close(actual_ids, topk_ids)
+    torch.testing.assert_close(actual_weights, topk_weights)
 
 
 def test_gluon_dynamic_mxfp4_moe_concatenated_silu_matches_torch_gfx950() -> None:

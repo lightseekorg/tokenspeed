@@ -121,6 +121,7 @@ if platform.is_amd:
                 getattr(w, "_routed_scaling_factor", 1.0) or 1.0
             ),
             normalize_topk_weights=bool(getattr(w, "_normalize_topk_weights", True)),
+            routing_method_type=int(getattr(w, "_routing_method_type", 0)),
             swiglu_alpha=swiglu_alpha,
             swiglu_limit=swiglu_limit,
             swiglu_beta=swiglu_beta,
