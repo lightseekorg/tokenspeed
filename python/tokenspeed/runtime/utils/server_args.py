@@ -27,12 +27,12 @@ import os
 import random
 from typing import Literal
 
+from tokenspeed_kernel.ops.attention.triton.linear.chunk_delta_h import (
+    CHUNK_SIZE as FLA_CHUNK_SIZE,
+)
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.mapping import Mapping, _resolve_parallelism_sizes
-from tokenspeed.runtime.layers.attention.linear.chunk_delta_h import (
-    CHUNK_SIZE as FLA_CHUNK_SIZE,
-)
 from tokenspeed.runtime.utils import (
     get_amdgpu_memory_capacity,
     get_colorful_logger,

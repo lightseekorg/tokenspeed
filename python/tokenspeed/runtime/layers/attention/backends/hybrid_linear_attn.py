@@ -30,6 +30,13 @@ from tokenspeed_kernel.ops.attention import gdn_chunk_prefill
 from tokenspeed_kernel.ops.attention.triton.gdn_qkv_split import (
     fused_qkv_split_gdn_prefill,
 )
+from tokenspeed_kernel.ops.attention.triton.linear.chunk_delta_h import (
+    CHUNK_SIZE as FLA_CHUNK_SIZE,
+)
+from tokenspeed_kernel.ops.attention.triton.linear.index import (
+    set_total_chunks_hint,
+    set_total_chunks_hint_uniform,
+)
 
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     break_point,
@@ -42,17 +49,10 @@ from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
-from tokenspeed.runtime.layers.attention.linear.chunk_delta_h import (
-    CHUNK_SIZE as FLA_CHUNK_SIZE,
-)
 from tokenspeed.runtime.layers.attention.linear.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
 from tokenspeed.runtime.layers.attention.linear.gdn import fused_gdn_gating
-from tokenspeed.runtime.layers.attention.linear.index import (
-    set_total_chunks_hint,
-    set_total_chunks_hint_uniform,
-)
 from tokenspeed.runtime.layers.attention.linear.mamba_state_scatter_triton import (
     fused_mamba_state_copy,
 )
