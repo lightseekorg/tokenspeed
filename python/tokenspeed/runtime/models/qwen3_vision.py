@@ -740,16 +740,3 @@ class Qwen3VLMoeVisionModel(nn.Module):
         if not deepstack_feature_lists:
             return x
         return torch.cat([x] + deepstack_feature_lists, dim=1)
-
-    def forward_blocks_split(
-        self,
-        x: torch.Tensor,
-        metadata: dict,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Eager encoder body avoiding the main+deepstack concat roundtrip."""
-        x, deepstack_feature_lists = self._forward_blocks_parts(x, metadata)
-        if not deepstack_feature_lists:
-            return x, None
-        if len(deepstack_feature_lists) == 1:
-            return x, deepstack_feature_lists[0]
-        return x, torch.cat(deepstack_feature_lists, dim=1)

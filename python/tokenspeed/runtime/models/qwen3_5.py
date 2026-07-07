@@ -115,6 +115,41 @@ from tokenspeed.runtime.utils.env import envs
 logger = logging.getLogger(__name__)
 
 
+def _cat_or_storage_view(tensors: list[torch.Tensor]) -> torch.Tensor:
+    """Return a dim-0 view when Qwen item tensors are adjacent storage slices."""
+    if len(tensors) == 1:
+        return tensors[0]
+    first = tensors[0]
+    if first.dim() == 0 or not first.is_contiguous():
+        return torch.cat(tensors, dim=0)
+
+    tail_shape = tuple(first.shape[1:])
+    stride = first.stride()
+    storage_ptr = first.untyped_storage().data_ptr()
+    expected_offset = first.storage_offset()
+    total_rows = 0
+    for tensor in tensors:
+        if (
+            tensor.dtype != first.dtype
+            or tensor.device != first.device
+            or tuple(tensor.shape[1:]) != tail_shape
+            or tensor.stride() != stride
+            or not tensor.is_contiguous()
+            or tensor.untyped_storage().data_ptr() != storage_ptr
+            or tensor.storage_offset() != expected_offset
+        ):
+            return torch.cat(tensors, dim=0)
+        expected_offset += tensor.numel()
+        total_rows += int(tensor.shape[0])
+
+    return torch.as_strided(
+        first,
+        (total_rows, *tail_shape),
+        stride,
+        first.storage_offset(),
+    )
+
+
 class Qwen3_5GatedDeltaNet(nn.Module):
     def __init__(
         self,
@@ -1209,18 +1244,16 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
         return pad_input_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: list[MultimodalDataItem]) -> torch.Tensor:
-        """Eager image encode via the ``pre_encode`` / ``forward_blocks`` /
-        ``post_encode`` decomposition the cudagraph wrapper uses, so eager
-        and captured paths share a single source of truth."""
-        tokens, grid = self.pre_encode(items)
-        metadata = self.visual.prepare_metadata(grid)
-        encoded = self.visual.forward_blocks(tokens, metadata)
-        return self.post_encode([encoded], grid)
+        """Encode images using the existing tensor return contract."""
+        return self._get_feature(items)
 
     def get_video_feature(self, items: list[MultimodalDataItem]) -> torch.Tensor:
-        """Eager video encode; the cudagraph path uses the same pre/post hooks."""
-        tokens, grid = self.pre_encode(items)
-        metadata = self.visual.prepare_metadata(grid)
+        """Encode videos using the existing tensor return contract."""
+        return self._get_feature(items)
+
+    def _get_feature(self, items: list[MultimodalDataItem]) -> torch.Tensor:
+        tokens, grid, grid_rows = self._pre_encode_with_metadata(items)
+        metadata = self.visual.prepare_metadata(grid_rows)
         encoded = self.visual.forward_blocks(tokens, metadata)
         return self.post_encode([encoded], grid)
 
@@ -1228,40 +1261,61 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
         self,
         items: list[MultimodalDataItem],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Eager patch-embed before the captured region; returns ``(tokens, grid)``.
+        """Preserve the existing eager pre-encode return contract."""
+        tokens, grid, _ = self._pre_encode_with_metadata(items)
+        return tokens, grid
+
+    def _pre_encode_with_metadata(
+        self,
+        items: list[MultimodalDataItem],
+    ) -> tuple[torch.Tensor, torch.Tensor, list[list[int]]]:
+        """Eager patch-embed before the captured region.
 
         The grid field is selected per item by modality (``video_grid_thw`` for
         video, ``image_grid_thw`` otherwise) so a single shared encoder cudagraph
-        wrapper can serve both image and video batches.
+        wrapper can serve both image and video batches. The grid rows are
+        materialized once for patch embedding, metadata, and graph packing.
         """
-        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
-            self.visual.dtype
-        )
-        grid = torch.concat(
-            [
-                getattr(
-                    item,
-                    (
-                        "video_grid_thw"
-                        if item.modality == Modality.VIDEO
-                        else "image_grid_thw"
-                    ),
-                )
-                for item in items
-            ],
-            dim=0,
-        )
+        if len(items) == 1:
+            item = items[0]
+            pixel_values = item.feature
+            grid = getattr(
+                item,
+                (
+                    "video_grid_thw"
+                    if item.modality == Modality.VIDEO
+                    else "image_grid_thw"
+                ),
+            )
+        else:
+            pixel_values = _cat_or_storage_view([item.feature for item in items])
+            grid = _cat_or_storage_view(
+                [
+                    getattr(
+                        item,
+                        (
+                            "video_grid_thw"
+                            if item.modality == Modality.VIDEO
+                            else "image_grid_thw"
+                        ),
+                    )
+                    for item in items
+                ]
+            )
         if pixel_values.dim() != 2:
             raise ValueError(f"pixel_values must be 2D, got {pixel_values.dim()}D.")
         if grid.dim() != 2:
             raise ValueError(f"grid must be 2D, got {grid.dim()}D.")
-        x = self.visual.prepare_patch_embed(pixel_values, grid)
-        return x, grid
+        grid_rows = grid.tolist()
+        x = self.visual.prepare_patch_embed(pixel_values, grid_rows)
+        return x, grid, grid_rows
 
     def post_encode(
         self, encoder_outs: list[torch.Tensor], grid: torch.Tensor
     ) -> torch.Tensor:
         """Eager step after the captured region; returns features."""
+        if len(encoder_outs) == 1:
+            return encoder_outs[0]
         return torch.cat(encoder_outs, dim=0)
 
     def _build_encoder_cudagraph_wrapper(
@@ -1278,7 +1332,7 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
         # ``spatial_merge_size ** 2 * budget`` patches.
         adapter = VisionEncoderCudaGraphAdapter(
             tower=self.visual,
-            pre_encode=self.pre_encode,
+            pre_encode=self._pre_encode_with_metadata,
             post_encode=self.post_encode,
             out_div=self.visual.spatial_merge_size**2,
             merge=self.visual.spatial_merge_size,
@@ -1350,8 +1404,14 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             text_embedding=self.model.get_input_embeddings(),
             ctx=multimodal_context,
             encoders={
-                Modality.IMAGE: EncoderSpec(self.image_encoder, deepstack=True),
-                Modality.VIDEO: EncoderSpec(self.video_encoder, deepstack=True),
+                Modality.IMAGE: EncoderSpec(
+                    self.image_encoder,
+                    deepstack=self.num_deepstack_embeddings > 0,
+                ),
+                Modality.VIDEO: EncoderSpec(
+                    self.video_encoder,
+                    deepstack=self.num_deepstack_embeddings > 0,
+                ),
             },
             multimodal_model=self,
             is_decode_or_idle=ctx.forward_mode.is_decode_or_idle(),
