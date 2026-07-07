@@ -446,6 +446,7 @@ def _build_qwen35_mrope_positions(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build positions after the caller validates normalized segments."""
     positions = torch.empty((3, seq_len), dtype=torch.long)
+    grid_positions = {}
     next_pos = 0
     cursor = 0
     for start, end, llm_grid_t, llm_grid_h, llm_grid_w in segments:
@@ -455,11 +456,12 @@ def _build_qwen35_mrope_positions(
                 next_pos,
             )
 
-        torch.add(
-            _qwen35_grid_position_indices(llm_grid_t, llm_grid_h, llm_grid_w),
-            next_pos,
-            out=positions[:, start : end + 1],
-        )
+        grid_shape = (llm_grid_t, llm_grid_h, llm_grid_w)
+        grid_position = grid_positions.get(grid_shape)
+        if grid_position is None:
+            grid_position = _qwen35_grid_position_indices(*grid_shape)
+            grid_positions[grid_shape] = grid_position
+        torch.add(grid_position, next_pos, out=positions[:, start : end + 1])
         next_pos += max(llm_grid_t, llm_grid_h, llm_grid_w)
         cursor = end + 1
 
