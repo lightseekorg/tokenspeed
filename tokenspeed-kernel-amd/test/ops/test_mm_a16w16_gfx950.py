@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.platform import Platform
 from tokenspeed_kernel_amd.ops.gemm.mm_a16w16_gfx950 import (
     _choose_mfma_lds_mediumm_config,
     _supports_mfma_lds_smallm,
@@ -18,6 +17,16 @@ from tokenspeed_kernel_amd.ops.gemm.mm_a16w16_largem_gfx950 import (
     _supports_largem_shape,
     gluon_mm_a16w16_largem_gfx950,
 )
+
+
+def _is_gfx950() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
+    return "gfx950" in arch
+
+
+_IS_GFX950 = _is_gfx950()
 
 _CORRECTNESS_CASES = [
     pytest.param(
@@ -44,8 +53,8 @@ _CORRECTNESS_CASES = [
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or not Platform.get().is_cdna4,
-    reason="requires a CDNA4 HIP GPU",
+    not _IS_GFX950,
+    reason="requires a gfx950 HIP GPU",
 )
 @pytest.mark.parametrize("kernel,shape", _CORRECTNESS_CASES)
 def test_dense16_kernel_variant_correctness(
