@@ -24,15 +24,9 @@
 
 # -*- coding: utf-8 -*-
 
-import os
-
-from tokenspeed_kernel._triton import libdevice as tldevice
 from tokenspeed_kernel._triton import tl, triton
 
-if os.environ.get("FLA_USE_FAST_OPS", "0") == "1":
-    exp = tldevice.fast_expf
-else:
-    exp = tl.exp
+exp = tl.exp
 
 
 @triton.jit

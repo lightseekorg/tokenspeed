@@ -51,7 +51,7 @@ SUPPORTED_HEAD_DIM = 128
 _chunk_gated_delta_rule = error_fn
 _has_blackwell_prefill = False
 
-if platform.is_nvidia and platform.is_blackwell:
+if platform.is_blackwell:
     try:
         from flashinfer.gdn_kernels import (
             _has_blackwell_prefill,
@@ -72,7 +72,7 @@ def is_available() -> bool:
     # Mirror that here so the caller does not commit to a crashing fast-path.
     return (
         _chunk_gated_delta_rule is not error_fn
-        and platform.arch_version.major == 10
+        and platform.is_blackwell
         and cuda_major >= 13
         and _has_blackwell_prefill
     )
