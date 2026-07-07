@@ -605,6 +605,21 @@ def _assert_moe_plan(plan: dict, *, apply: str, preprocessor: str | None) -> Non
     assert actual_name == preprocessor
 
 
+def test_gluon_mxfp4_swiglu_args_default_missing_values_to_standard_swiglu() -> None:
+    if not hasattr(_moe_gluon_mxfp4, "_swiglu_args"):
+        pytest.skip("Gluon MXFP4 SwiGLU args are AMD-only")
+
+    w = torch.nn.Module()
+    w.swiglu_arg = type("SwigluArg", (), {"alpha": None, "limit": None})()
+
+    assert _moe_gluon_mxfp4._swiglu_args(w) == (1.0, 0.0, 0.0)
+
+    w.swiglu_arg = type("SwigluArg", (), {"alpha": 1.702, "limit": 7.0})()
+    w.swiglu_beta = 1.0
+
+    assert _moe_gluon_mxfp4._swiglu_args(w) == (1.702, 7.0, 1.0)
+
+
 def _moe_apply_unquant_trtllm() -> object:
     plan = tokenspeed_kernel.moe_plan(
         "unquant",
@@ -842,24 +857,20 @@ def _moe_apply_mxfp4_dynamic_tp() -> object:
         activation="silu",
         ep_size=1,
         ispp=2048,
-        internal_activation_dtype="fp8",
+        internal_activation_dtype="input",
     )
     _assert_moe_plan(
         plan,
-        apply="triton_mxfp4_precomputed_moe_apply",
-        preprocessor="triton_mxfp4_moe_weights",
+        apply="gluon_mxfp4_dynamic_moe_apply",
+        preprocessor="gluon_mxfp4_gfx950_moe_weights",
     )
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
-    topk_weights = torch.empty((4, 2), dtype=torch.float32)
-    topk_ids = torch.empty((4, 2), dtype=torch.int64)
     return tokenspeed_kernel.moe_apply(
         plan,
         x,
         torch.nn.Module(),
         router_logits,
-        topk_weights=topk_weights,
-        topk_ids=topk_ids,
     )
 
 
@@ -897,16 +908,20 @@ def _moe_apply_fp8_precomputed_ep() -> object:
     )
     _assert_moe_plan(
         plan,
-        apply="gluon_mxfp4_dynamic_moe_apply",
-        preprocessor="gluon_mxfp4_gfx950_moe_weights",
+        apply="triton_fp8_ep_precomputed_moe_apply",
+        preprocessor="triton_fp8_moe_weights",
     )
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
+    topk_weights = torch.empty((4, 2), dtype=torch.float32)
+    topk_ids = torch.empty((4, 2), dtype=torch.int64)
     return tokenspeed_kernel.moe_apply(
         plan,
         x,
         torch.nn.Module(),
         router_logits,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
     )
 
 

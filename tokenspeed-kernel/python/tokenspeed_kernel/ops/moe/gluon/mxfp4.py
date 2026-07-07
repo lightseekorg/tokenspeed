@@ -50,9 +50,9 @@ if platform.is_amd:
             return 1.0, 0.0, 0.0
         swiglu_beta = getattr(w, "swiglu_beta", None)
         return (
-            swiglu_arg.alpha,
-            swiglu_arg.limit,
-            1.0 if swiglu_beta is None else swiglu_beta,
+            1.0 if swiglu_arg.alpha is None else swiglu_arg.alpha,
+            0.0 if swiglu_arg.limit is None else swiglu_arg.limit,
+            0.0 if swiglu_beta is None else swiglu_beta,
         )
 
     @register_kernel(
