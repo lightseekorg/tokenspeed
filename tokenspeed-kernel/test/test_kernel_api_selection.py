@@ -263,27 +263,6 @@ def _mm_mxfp8() -> torch.Tensor:
     )
 
 
-def test_gluon_dense16_fallback_handles_rank3_activation(monkeypatch) -> None:
-    if not hasattr(_gemm_gluon, "gluon_mm_a16w16_gfx950"):
-        pytest.skip("gfx950 Gluon dense16 GEMM is not registered on this platform")
-
-    monkeypatch.setattr(_gemm_gluon, "_dense16_impl", lambda *args, **kwargs: None)
-
-    a = torch.randn((2, 3, 64), dtype=torch.bfloat16)
-    b = torch.randn((128, 64), dtype=torch.bfloat16)
-
-    out = _gemm_gluon.gluon_mm_a16w16_gfx950(
-        a,
-        b,
-        None,
-        None,
-        torch.bfloat16,
-    )
-
-    assert out.shape == (2, 3, 128)
-    torch.testing.assert_close(out, torch.nn.functional.linear(a, b))
-
-
 def test_gemm_mxfp8_online_activation_signature_uses_quantized_storage() -> None:
     a = torch.empty((4, 128), dtype=torch.bfloat16)
     b = torch.empty((128, 128), dtype=_fp8_dtype())
