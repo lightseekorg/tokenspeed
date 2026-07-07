@@ -58,7 +58,6 @@ if _dense16_impl is not None:
             ("a", "b"), "dense", {torch.float16, torch.bfloat16}
         ),
         traits={
-            "gfx950_dense16_gluon": frozenset({True}),
             "n_align_128": frozenset({True}),
             "k_align_64": frozenset({True}),
         },
@@ -76,4 +75,15 @@ if _dense16_impl is not None:
     ):
         if A_scales is not None or B_scales is not None or block_size is not None:
             return None
-        return _dense16_impl(A, B, out_dtype, alpha=alpha)
+
+        output = _dense16_impl(A, B, out_dtype, alpha=alpha)
+        if output is not None:
+            return output
+
+        # TODO: Optimize M >= 256 and M <= 1024 dense16 cases in Gluon.
+        output = torch.mm(A, B.T)
+        if alpha is not None:
+            output = output * alpha.to(dtype=output.dtype)
+        if output.dtype != out_dtype:
+            output = output.to(out_dtype)
+        return output
