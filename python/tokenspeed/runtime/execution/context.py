@@ -60,6 +60,7 @@ class ForwardContext:
     global_num_tokens: list[int] | None = None
     global_bs: list[int] | None = None
     all_decode_or_idle: bool = False
+    all_extend: bool = False
 
     # --- logits processor ---
     gather_ids: torch.Tensor | None = None
@@ -73,3 +74,7 @@ class ForwardContext:
     # DSA sparse top-k shared across layers and draft steps.
     dsa_prefill_topk: Any | None = None
     dsa_decode_topk: Any | None = None
+
+    # DSA SWA slot mapping + compressor memo, computed once per forward, shared across layers.
+    dsa_swa_slot_mapping: torch.Tensor | None = None
+    dsa_compressor_slot_cache: Any | None = None

@@ -20,7 +20,10 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import torch
+from tokenspeed_kernel.ops.tuning import autotune_frozen
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -91,7 +94,8 @@ if platform.is_nvidia:
             )
             topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
             topk_weights = topk_weights.to(x.dtype)
-        with flashinfer_autotune():
+        # Tune new shapes during startup only, frozen once serving (see ops.tuning).
+        with nullcontext() if autotune_frozen() else flashinfer_autotune():
             return cutlass_fused_moe(
                 input=x,
                 token_selected_experts=topk_ids.to(torch.int),

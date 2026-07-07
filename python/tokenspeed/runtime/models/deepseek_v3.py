@@ -66,6 +66,10 @@ _device_sm = _platform.arch_version.major * 10 + _platform.arch_version.minor
 
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_manager import CommManager
+from tokenspeed.runtime.execution.breakable_cuda_graph import (
+    break_point,
+    scrub_padding_tail,
+)
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -635,6 +639,19 @@ class DeepseekV3AttentionMLA(nn.Module):
         comm_manager: CommManager,
         block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """MLA attention with a NARROW prefill-graph break.
+
+        The token-shaped input/output projections (q/kv-down, layernorm,
+        q_b_proj, o_proj) stay in the captured prefill graph; only the
+        data-dependent attention -- KV write + varlen prefill / absorb decode
+        kernels + the live prefill/decode split -- runs as the eager break
+        (``_attention_core``). This keeps the big projection GEMMs graphed
+        instead of dispatch-bound eager, collapsing the inter-segment bubbles a
+        coarse whole-attention break leaves. Outside capture the
+        ``@break_point`` is a direct call, so the eager path is unchanged.
+        """
+        if hidden_states.shape[0] == 0:
+            return hidden_states
         if self.q_lora_rank is not None:
             qkv = self.fused_qkv_a_proj_with_mqa(
                 hidden_states, block_scale, torch.bfloat16
@@ -658,9 +675,44 @@ class DeepseekV3AttentionMLA(nn.Module):
             kv_a = latent_cache[..., : self.kv_lora_rank]
             self.kv_a_layernorm(kv_a, inplace=True)
 
-        num_decodes = ctx.bs - ctx.num_extends
-        num_decode_tokens = num_decodes * ctx.attn_backend.spec_num_tokens
-        num_prefill_tokens = q.size(0) - num_decode_tokens
+        attn_output = self._attention_core(
+            positions, q, latent_cache, ctx, out_cache_loc
+        )
+
+        if ctx.draft_first_step_reduce:
+            # KV already written; keep one live row per request for o_proj/MLP.
+            attn_output = attn_output.index_select(0, ctx.gather_ids)
+        output, _ = self.o_proj(attn_output)
+        return output
+
+    @break_point
+    def _attention_core(
+        self,
+        positions: torch.Tensor,
+        q: torch.Tensor,
+        latent_cache: torch.Tensor,
+        ctx: ForwardContext,
+        out_cache_loc: torch.Tensor,
+    ) -> torch.Tensor:
+        """The eager break: KV write + varlen prefill / absorb decode attention.
+
+        The prefill/decode split is recovered from LIVE state -- correct both
+        in eager and under a prefill-graph replay, where ``ctx`` is the live
+        ambient context but ``q`` is padded to the graph bucket (``q.size(0)``
+        is NOT the real token count). The decode token count comes from the
+        live ctx; the real prefill token count from the live attention
+        metadata (the same source the padding scrub uses). Padded tail rows
+        produce discarded garbage.
+        """
+        spec = ctx.attn_backend.spec_num_tokens or 1
+        num_decodes = max(ctx.bs - ctx.num_extends, 0)
+        num_decode_tokens = num_decodes * spec
+        if ctx.num_extends > 0:
+            cmeta = ctx.attn_backend.chunked_prefill_metadata
+            num_prefill_tokens = int(sum(cmeta.extend_seq_lens_cpu))
+        else:
+            num_prefill_tokens = 0
+        real_total = num_prefill_tokens + num_decode_tokens
         attn_output = torch.empty(
             q.size(0),
             self.num_local_heads * self.v_head_dim,
@@ -668,10 +720,11 @@ class DeepseekV3AttentionMLA(nn.Module):
             device=q.device,
         )
 
-        if ctx.num_extends > 0:
+        if num_prefill_tokens > 0:
             prefill_ctx = replace(
                 ctx,
-                bs=ctx.num_extends,
+                bs=max(ctx.bs - num_decodes, 1),
+                num_extends=max(ctx.bs - num_decodes, 1),
                 input_num_tokens=num_prefill_tokens,
                 forward_mode=ForwardMode.EXTEND,
             )
@@ -684,7 +737,7 @@ class DeepseekV3AttentionMLA(nn.Module):
                 attn_output[:num_prefill_tokens],
             )
 
-        if ctx.num_extends < ctx.bs:
+        if num_decode_tokens > 0:
             decode_ctx = replace(
                 ctx,
                 bs=num_decodes,
@@ -693,20 +746,15 @@ class DeepseekV3AttentionMLA(nn.Module):
                 forward_mode=ForwardMode.DECODE,
             )
             self.forward_absorb(
-                positions[num_prefill_tokens:],
-                q[num_prefill_tokens:],
-                latent_cache[num_prefill_tokens:],
+                positions[num_prefill_tokens:real_total],
+                q[num_prefill_tokens:real_total],
+                latent_cache[num_prefill_tokens:real_total],
                 decode_ctx,
-                out_cache_loc[num_prefill_tokens:],
-                attn_output[num_prefill_tokens:],
+                out_cache_loc[num_prefill_tokens:real_total],
+                attn_output[num_prefill_tokens:real_total],
             )
 
-        if ctx.draft_first_step_reduce:
-            # KV already written; drop dead-position rows so o_proj / MLP /
-            # post-norms only run on one live row per request.
-            attn_output = attn_output.index_select(0, ctx.gather_ids)
-        output, _ = self.o_proj(attn_output)
-        return output
+        return attn_output
 
     def forward_absorb(
         self,
@@ -882,6 +930,10 @@ class DeepseekV3AttentionMLA(nn.Module):
         out_cache_loc: torch.Tensor,
         output: torch.Tensor,
     ) -> torch.Tensor:
+        # Prefill-graph padding contract: zero garbage rows the per-row projections
+        # + FP8 quantize would otherwise touch (see scrub_padding_tail).
+        ntok = sum(ctx.attn_backend.chunked_prefill_metadata.extend_seq_lens_cpu)
+        scrub_padding_tail(ntok, q, latent_cache)
         q, k, v = self.forward_normal_chunked_kv_prepare(
             positions, q, latent_cache, ctx, out_cache_loc
         )

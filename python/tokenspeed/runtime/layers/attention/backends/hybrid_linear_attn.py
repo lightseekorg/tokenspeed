@@ -33,6 +33,11 @@ from tokenspeed_kernel.ops.attention.triton.gdn_qkv_split import (
     fused_qkv_split_gdn_prefill,
 )
 
+from tokenspeed.runtime.execution.breakable_cuda_graph import (
+    break_point,
+    current_forward_ctx,
+    scrub_padding_tail,
+)
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
@@ -1032,6 +1037,11 @@ class MambaAttnBackend(AttentionBackend):
                 and self.forward_metadata.track_ssm_h_src.numel() > 0
             )
 
+            # Zero padded rows so garbage can't reach recurrent state (see scrub_padding_tail).
+            if extend_seq_lens_cpu is not None:
+                ntok = int(sum(int(x) for x in extend_seq_lens_cpu))
+                scrub_padding_tail(ntok, mixed_qkv, a, b)
+
             mixed_qkv_t = mixed_qkv.transpose(0, 1)
             if need_h_track:
                 if self.forward_metadata.track_conv_indices is None:
@@ -1254,6 +1264,7 @@ class HybridLinearAttnBackend(AttentionBackend):
 
     # ---- Forward dispatch ----
 
+    @break_point
     def forward(
         self,
         q: torch.Tensor,
@@ -1268,6 +1279,23 @@ class HybridLinearAttnBackend(AttentionBackend):
         record_kv_cache: bool | None = None,
         **kwargs,
     ):
+        """Dispatch one layer to its full-attention or GDN backend (the break point).
+
+        This wrapper OVERRIDES the base forward, so it carries its own
+        ``@break_point`` (else its full-attn + GDN layers bypass the base
+        decoration). The handoff buffer is inferred from the actual output --
+        q-shaped for full-attention layers, z-shaped for the GDN path (q=None)
+        -- so no per-branch out-spec is needed. Under a prefill-graph replay
+        the decorated scalar args (``forward_mode``, ``bs``) are frozen to the
+        capture-time dummy (EXTEND, bs=1) and are re-read from the live ambient
+        ctx instead, so a MIXED or bs>1 replay dispatches the per-mode backend
+        (and the GDN scan) correctly. The GDN scan's output rank is
+        canonicalized here to a stable [T, Hv, D] (== z.shape), as the
+        ``@break_point`` handoff buffer requires: ``gdn_chunk_prefill`` mirrors
+        its input rank, returning batched [1, T, Hv, D] on the uniform bs=1
+        path (which the dummy capture batch hits) vs ragged [T, Hv, D]
+        otherwise; full-attention output is 2D and untouched.
+        """
         if forward_mode is None:
             return super().forward(
                 q,
@@ -1282,6 +1310,12 @@ class HybridLinearAttnBackend(AttentionBackend):
                 record_kv_cache=record_kv_cache,
                 **kwargs,
             )
+
+        # Frozen capture-time scalars, re-read live (see docstring); no-op in eager.
+        amb = current_forward_ctx()
+        if amb is not None:
+            forward_mode = amb.forward_mode
+            bs = amb.bs
 
         if forward_mode.is_idle():
             if layer is None:
@@ -1320,6 +1354,13 @@ class HybridLinearAttnBackend(AttentionBackend):
                     forward_mode=forward_mode,
                     **kwargs,
                 )
+        # Collapse the GDN scan's batched [1, T, Hv, D] to z-shaped (see docstring).
+        if ret is not None and ret.dim() == 4:
+            # Strictly [1, T, Hv, D]: a genuine B>1 must fail loud, not corrupt the handoff.
+            assert (
+                ret.shape[0] == 1
+            ), f"GDN scan batched rank expected leading 1, got {ret.shape}"
+            ret = ret.flatten(0, 1)
         return ret
 
     def forward_decode(

@@ -38,6 +38,11 @@ from transformers import PretrainedConfig
 from tokenspeed.runtime.configs.utils import get_rope_theta
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_manager import CommManager
+from tokenspeed.runtime.execution.breakable_cuda_graph import (
+    break_point,
+    current_forward_ctx,
+    slice_to_real_tokens,
+)
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, LayerNorm, RMSNorm
@@ -805,6 +810,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             kv_workspace_slots=kv_workspace_slots,
         )
 
+    @break_point
     def forward(
         self,
         positions: torch.Tensor,
@@ -814,6 +820,22 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         comm_manager: CommManager,
         block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """GLM-5 DSA attention, one COARSE breakable-graph break point.
+
+        Like DeepSeek-V4 it does paged-cache writes, a data-dependent indexer
+        -> top-k stage and the FlashMLA sparse kernel (plus pre-attn
+        collectives), none capturable. Under a prefill-graph capture the whole
+        attention runs eager (reading the live ``ctx``) while the layer's
+        norms + MoE stay graphed; direct call otherwise (see ``break_point``).
+        Padded token-shaped inputs are sliced to the real count the live
+        metadata describes -- DSA and the decode-window split (which derives
+        ``decode_start`` from the total token count) must not see padded rows,
+        or decode rows get sliced out of the padded tail. Mirrors the
+        DeepSeek-V4 DSA break.
+        """
+        # Empty (idle / DP-idle) batch: explicit skip, like the sibling MLP/MoE forwards.
+        if hidden_states.shape[0] == 0:
+            return hidden_states
         qkv = self.fused_qkv_a_proj_with_mqa(
             hidden_states,
             block_scale,
@@ -828,6 +850,17 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         if qkv.shape[-1] != _qkv_width:
             qkv = qkv[..., :_qkv_width]
         qkv = comm_manager.pre_attn_comm(qkv, ctx)
+        # Slice only under a breakable capture/replay (see the DeepSeek-V4 break):
+        # eager forwards (incl. MTP draft steps) are never padded. Sliced AFTER
+        # the pre-attn comm: at replay ``_padded_to`` pins ``global_num_tokens``
+        # to the padded bucket, so the comm must see padded-length rows; only
+        # the DSA stack below needs exactly the real rows.
+        _metadata = getattr(ctx.attn_backend, "forward_metadata", None)
+        _token_to_req = getattr(_metadata, "token_to_req_indices", None)
+        if current_forward_ctx() is not None and _token_to_req is not None:
+            positions, qkv, out_cache_loc = slice_to_real_tokens(
+                _token_to_req.numel(), positions, qkv, out_cache_loc
+            )
         q_a, latent_cache = qkv.split(
             [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
             dim=-1,
