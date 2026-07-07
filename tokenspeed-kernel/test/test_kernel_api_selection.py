@@ -1053,7 +1053,7 @@ _CASES = [
         "cdna4",
         "attention",
         "mha_extend_with_kvcache",
-        "triton_mha_extend_with_kvcache",
+        "gluon_mha_extend_fp16_gfx950",
         _attention_extend,
     ),
     _case(

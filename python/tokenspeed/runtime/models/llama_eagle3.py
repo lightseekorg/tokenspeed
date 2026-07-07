@@ -510,6 +510,7 @@ class Eagle3LlamaModel(BaseTransformerModel):
 
 class LlamaForCausalLMEagle3(BaseCausalLM):
 
+    draft_first_step_reduce_for_catchup = True
     model_cls = Eagle3LlamaModel
 
     def __init__(

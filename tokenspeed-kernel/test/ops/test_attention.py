@@ -165,7 +165,7 @@ def test_mha_prefill_lse(
         pytest.param(torch.float8_e4m3fn, 64, 8, 2, id="fp8"),
     ],
 )
-@pytest.mark.parametrize("solution", ["triton", "fa3", "fa4", "flashinfer"])
+@pytest.mark.parametrize("solution", ["triton", "fa3", "fa4", "flashinfer", "gluon"])
 def test_mha_extend_with_kvcache(
     device: str,
     solution: str,
@@ -270,8 +270,8 @@ def test_mha_extend_with_kvcache(
 
     assert out.shape == q.shape
 
-    if solution == "triton":
-        triton_out, triton_lse = mha_extend_with_kvcache(
+    if solution in ("triton", "gluon"):
+        lse_out, lse = mha_extend_with_kvcache(
             q=q,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_kv=cu_seqlens_kv,
@@ -285,8 +285,8 @@ def test_mha_extend_with_kvcache(
             solution=solution,
         )
 
-        assert triton_out.shape == q.shape
-        assert triton_lse.shape == (q.shape[0], q.shape[1])
+        assert lse_out.shape == q.shape
+        assert lse.shape == (q.shape[0], q.shape[1])
 
 
 @pytest.mark.parametrize(

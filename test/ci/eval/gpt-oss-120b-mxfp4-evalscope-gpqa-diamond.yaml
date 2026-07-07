@@ -13,7 +13,6 @@ runner:
       GPT_OSS_EVAL_MODEL: openai/gpt-oss-120b
     amd-mi35x-2gpu-test:
       GPT_OSS_EVAL_DISABLE_KVSTORE: "1"
-      GPT_OSS_EVAL_DISABLE_PREFIX_CACHING: "1"
       GPT_OSS_EVAL_MODEL: amd/gpt-oss-120b-w-mxfp4-a-fp8
 env:
   CI: "true"
@@ -29,7 +28,6 @@ server:
     --trust-remote-code
     --reasoning-parser base
     ${GPT_OSS_EVAL_DISABLE_KVSTORE:+--disable-kvstore}
-    ${GPT_OSS_EVAL_DISABLE_PREFIX_CACHING:+--no-enable-prefix-caching}
     --enable-cache-report
     --host 127.0.0.1
     --port 8000
