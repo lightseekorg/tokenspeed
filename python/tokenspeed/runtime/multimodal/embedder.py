@@ -611,11 +611,7 @@ class MultimodalEmbedder:
         if is_source:
             for handle, length in zip(handles, element_lengths, strict=True):
                 if len(handles) == 1:
-                    try:
-                        source = handle.copy_to_pinned().reshape(-1)
-                        base.narrow(0, offset, length).copy_(source, non_blocking=True)
-                    finally:
-                        handle.release()
+                    handle.copy_into(base.narrow(0, offset, length))
                 else:
                     source = handle.consume().reshape(-1)
                     base.narrow(0, offset, length).copy_(source, non_blocking=True)

@@ -120,6 +120,43 @@ class ShmTensorHandle:
             )
         return dst
 
+    def copy_into(self, destination: torch.Tensor) -> None:
+        """Synchronously copy into an existing tensor and release the SHM segment."""
+        if self._segment is None:
+            raise RuntimeError(
+                f"ShmTensorHandle({self.shm_name!r}) must be attach()'d "
+                "before copying (or has already been released on this rank)"
+            )
+        started = time.perf_counter() if LOG_MM_TIMING else None
+        source = torch.frombuffer(self._segment.buf, dtype=self.dtype).reshape(
+            self.shape
+        )
+        try:
+            if source.dtype != destination.dtype:
+                raise ValueError(
+                    "SHM source and destination dtypes differ: "
+                    f"{source.dtype} != {destination.dtype}"
+                )
+            if source.shape != destination.shape:
+                if source.numel() != destination.numel():
+                    raise ValueError(
+                        "SHM source and destination element counts differ: "
+                        f"{source.numel()} != {destination.numel()}"
+                    )
+                source = source.reshape(destination.shape)
+            destination.copy_(source)
+        finally:
+            del source
+            self._close_and_unlink()
+        if LOG_MM_TIMING and started is not None:
+            logger.info(
+                "mm_timing shm_copy_into_ms name=%s elapsed=%.3f shape=%s dtype=%s",
+                self.shm_name,
+                (time.perf_counter() - started) * 1000,
+                list(self.shape),
+                self.dtype,
+            )
+
     def _copy_to_pinned(self) -> torch.Tensor:
         if self._segment is None:
             raise RuntimeError(
