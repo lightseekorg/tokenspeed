@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -81,7 +82,7 @@ if _dense16_impl is not None:
             return output
 
         # TODO: Optimize M >= 256 and M <= 1024 dense16 cases in Gluon.
-        output = torch.mm(A, B.T)
+        output = F.linear(A, B)
         if alpha is not None:
             output = output * alpha.to(dtype=output.dtype)
         if output.dtype != out_dtype:
