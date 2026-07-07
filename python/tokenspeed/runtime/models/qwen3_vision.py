@@ -48,6 +48,20 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbe
 from tokenspeed.runtime.utils import add_prefix
 
 
+def _same_grid_row_repeat(
+    grid_thw: list[list[int]],
+) -> tuple[tuple[int, int, int], int] | None:
+    if not grid_thw:
+        return None
+    first = tuple(int(value) for value in grid_thw[0])
+    if len(first) != 3:
+        return None
+    for row in grid_thw[1:]:
+        if tuple(int(value) for value in row) != first:
+            return None
+    return first, len(grid_thw)
+
+
 @lru_cache(maxsize=1024)
 def _rot_pos_ids(h: int, w: int, spatial_merge_size: int) -> torch.Tensor:
     if isinstance(h, torch.Tensor):
@@ -388,20 +402,39 @@ class Qwen3VLMoeVisionModel(nn.Module):
     def rot_pos_emb(
         self, grid_thw: list[list[int]]
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        pos_ids = []
+        device = self.device
+        same_row = _same_grid_row_repeat(grid_thw)
+        if same_row is not None:
+            (t, h, w), repeats = same_row
+            cos, sin = self._rot_pos_emb_one(t, h, w, device)
+            if repeats == 1:
+                return cos, sin
+            return cos.repeat(repeats, 1), sin.repeat(repeats, 1)
+
+        cos_outputs = []
+        sin_outputs = []
         for t, h, w in grid_thw:
-            base = _rot_pos_ids(h, w, self.spatial_merge_size)
-            pos_ids.append(base if t == 1 else base.repeat(t, 1))
+            cos, sin = self._rot_pos_emb_one(int(t), int(h), int(w), device)
+            cos_outputs.append(cos)
+            sin_outputs.append(sin)
 
-        pos_ids = torch.cat(pos_ids, dim=0).to(self.device, non_blocking=True)
-        max_grid_size = max(max(h, w) for _, h, w in grid_thw)
+        if len(cos_outputs) == 1:
+            return cos_outputs[0], sin_outputs[0]
+        return torch.cat(cos_outputs, dim=0), torch.cat(sin_outputs, dim=0)
 
-        cos, sin = self._get_rotary_cos_sin(max_grid_size)
+    def _rot_pos_emb_one(
+        self,
+        t: int,
+        h: int,
+        w: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        base = _rot_pos_ids(h, w, self.spatial_merge_size)
+        pos_ids = base if t == 1 else base.repeat(t, 1)
+        pos_ids = pos_ids.to(device, non_blocking=True)
 
-        cos_combined = cos[pos_ids].flatten(1)
-        sin_combined = sin[pos_ids].flatten(1)
-
-        return cos_combined, sin_combined
+        cos, sin = self._get_rotary_cos_sin(max(h, w))
+        return cos[pos_ids].flatten(1), sin[pos_ids].flatten(1)
 
     def _get_rotary_cos_sin(self, seqlen: int) -> tuple[torch.Tensor, torch.Tensor]:
         cos_sin = self.rotary_pos_emb.cos_sin_cache[:seqlen].to(self.device)
@@ -411,61 +444,108 @@ class Qwen3VLMoeVisionModel(nn.Module):
         num_grid_per_side = self.num_grid_per_side
         m_size = self.spatial_merge_size
         hidden_dim = self.pos_embed.embedding_dim
+        device = self.device
+        dtype = self.dtype
+
+        same_row = _same_grid_row_repeat(grid_thw)
+        if same_row is not None:
+            (t, h, w), repeats = same_row
+            interpolated = self._pos_embed_interpolate_one(
+                t,
+                h,
+                w,
+                num_grid_per_side,
+                m_size,
+                hidden_dim,
+                device,
+                dtype,
+            )
+            if repeats == 1:
+                return interpolated
+            return interpolated.repeat(repeats, 1)
 
         outputs = []
         for t, h, w in grid_thw:
-            h_idxs = torch.linspace(
-                0, num_grid_per_side - 1, h, dtype=torch.float32, device=self.device
+            t = int(t)
+            h = int(h)
+            w = int(w)
+            outputs.append(
+                self._pos_embed_interpolate_one(
+                    t,
+                    h,
+                    w,
+                    num_grid_per_side,
+                    m_size,
+                    hidden_dim,
+                    device,
+                    dtype,
+                )
             )
-            w_idxs = torch.linspace(
-                0, num_grid_per_side - 1, w, dtype=torch.float32, device=self.device
-            )
 
-            h_floor = h_idxs.to(torch.long)
-            w_floor = w_idxs.to(torch.long)
-            h_ceil = torch.clamp(h_floor + 1, max=num_grid_per_side - 1)
-            w_ceil = torch.clamp(w_floor + 1, max=num_grid_per_side - 1)
-
-            dh = h_idxs - h_floor
-            dw = w_idxs - w_floor
-
-            # Create meshgrid view for all h, w vars
-            dh_grid, dw_grid = torch.meshgrid(dh, dw, indexing="ij")
-            h_floor_grid, w_floor_grid = torch.meshgrid(h_floor, w_floor, indexing="ij")
-            h_ceil_grid, w_ceil_grid = torch.meshgrid(h_ceil, w_ceil, indexing="ij")
-
-            # original computation of weights
-            # w00 = (1 - dh_grid) * (1 - dw_grid)
-            # w01 = (1 - dh_grid) * dw_grid
-            # w10 = dh_grid * (1 - dw_grid)
-            # w11 = dh_grid * dw_grid
-            # we reuse w11 here to avoid duplicate
-            # dh_grid * dw_grid computation
-            w11 = dh_grid * dw_grid
-            w10 = dh_grid - w11
-            w01 = dw_grid - w11
-            w00 = 1 - dh_grid - w01
-
-            h_grid = torch.stack([h_floor_grid, h_floor_grid, h_ceil_grid, h_ceil_grid])
-            w_grid = torch.stack([w_floor_grid, w_ceil_grid, w_floor_grid, w_ceil_grid])
-            h_grid_idx = h_grid * num_grid_per_side
-
-            indices = (h_grid_idx + w_grid).reshape(4, -1)
-            weights = torch.stack([w00, w01, w10, w11], dim=0).reshape(4, -1, 1)
-            weights = weights.to(dtype=self.dtype)
-
-            embeds = self.pos_embed(indices)
-            embeds *= weights
-            combined = embeds.sum(dim=0)
-
-            combined = combined.reshape(
-                h // m_size, m_size, w // m_size, m_size, hidden_dim
-            )
-            combined = combined.permute(0, 2, 1, 3, 4).reshape(1, -1, hidden_dim)
-            repeated = combined.expand(t, -1, -1).reshape(-1, hidden_dim)
-            outputs.append(repeated)
-
+        if len(outputs) == 1:
+            return outputs[0]
         return torch.cat(outputs, dim=0)
+
+    def _pos_embed_interpolate_one(
+        self,
+        t: int,
+        h: int,
+        w: int,
+        num_grid_per_side: int,
+        m_size: int,
+        hidden_dim: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        h_idxs = torch.linspace(
+            0, num_grid_per_side - 1, h, dtype=torch.float32, device=device
+        )
+        w_idxs = torch.linspace(
+            0, num_grid_per_side - 1, w, dtype=torch.float32, device=device
+        )
+
+        h_floor = h_idxs.to(torch.long)
+        w_floor = w_idxs.to(torch.long)
+        h_ceil = torch.clamp(h_floor + 1, max=num_grid_per_side - 1)
+        w_ceil = torch.clamp(w_floor + 1, max=num_grid_per_side - 1)
+
+        dh = h_idxs - h_floor
+        dw = w_idxs - w_floor
+
+        # Create meshgrid view for all h, w vars
+        dh_grid, dw_grid = torch.meshgrid(dh, dw, indexing="ij")
+        h_floor_grid, w_floor_grid = torch.meshgrid(h_floor, w_floor, indexing="ij")
+        h_ceil_grid, w_ceil_grid = torch.meshgrid(h_ceil, w_ceil, indexing="ij")
+
+        # original computation of weights
+        # w00 = (1 - dh_grid) * (1 - dw_grid)
+        # w01 = (1 - dh_grid) * dw_grid
+        # w10 = dh_grid * (1 - dw_grid)
+        # w11 = dh_grid * dw_grid
+        # we reuse w11 here to avoid duplicate
+        # dh_grid * dw_grid computation
+        w11 = dh_grid * dw_grid
+        w10 = dh_grid - w11
+        w01 = dw_grid - w11
+        w00 = 1 - dh_grid - w01
+
+        h_grid = torch.stack([h_floor_grid, h_floor_grid, h_ceil_grid, h_ceil_grid])
+        w_grid = torch.stack([w_floor_grid, w_ceil_grid, w_floor_grid, w_ceil_grid])
+        h_grid_idx = h_grid * num_grid_per_side
+
+        indices = (h_grid_idx + w_grid).reshape(4, -1)
+        weights = torch.stack([w00, w01, w10, w11], dim=0).reshape(4, -1, 1)
+        weights = weights.to(dtype=dtype)
+
+        embeds = self.pos_embed(indices)
+        embeds *= weights
+        combined = embeds.sum(dim=0)
+
+        combined = combined.reshape(
+            h // m_size, m_size, w // m_size, m_size, hidden_dim
+        )
+        combined = combined.permute(0, 2, 1, 3, 4).reshape(1, -1, hidden_dim)
+        return combined.expand(t, -1, -1).reshape(-1, hidden_dim)
 
     def compute_cudnn_batch_offsets_packed(
         self,
@@ -560,8 +640,8 @@ class Qwen3VLMoeVisionModel(nn.Module):
             grid_thw_list = grid_thw
             grid_thw_np = np.array(grid_thw, dtype=np.int32)
         else:
-            grid_thw_list = grid_thw.tolist()
             grid_thw_np = grid_thw.cpu().numpy()
+            grid_thw_list = grid_thw_np.tolist()
 
         rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
 
@@ -615,12 +695,17 @@ class Qwen3VLMoeVisionModel(nn.Module):
             "sequence_lengths": sequence_lengths,
         }
 
-    def forward_blocks(self, x: torch.Tensor, metadata: dict) -> torch.Tensor:
-        """Capture-safe encoder body: block loop + deepstack mergers + merger.
+    def _forward_blocks_parts(
+        self,
+        x: torch.Tensor,
+        metadata: dict,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """Encoder body returning main and deepstack tensors separately.
 
         No host syncs and no data-dependent control flow, so this region is
-        safe to record into a CUDA graph. ``metadata`` comes from
-        :meth:`prepare_metadata`; ``x`` from :meth:`prepare_patch_embed`.
+        safe to record into a CUDA graph when wrapped by ``forward_blocks``.
+        ``metadata`` comes from :meth:`prepare_metadata`; ``x`` from
+        :meth:`prepare_patch_embed`.
         """
         cu_seqlens = metadata["cu_seqlens"]
         rotary_pos_emb_cos = metadata["rotary_pos_emb_cos"]
@@ -646,5 +731,25 @@ class Qwen3VLMoeVisionModel(nn.Module):
                 deepstack_feature_lists.append(deepstack_feature)
                 num_deepstack_captured += 1
         x = self.merger(x)
+        return x, deepstack_feature_lists
+
+    def forward_blocks(self, x: torch.Tensor, metadata: dict) -> torch.Tensor:
+        """Capture-safe encoder body: block loop + deepstack mergers + merger."""
+        x, deepstack_feature_lists = self._forward_blocks_parts(x, metadata)
         # [seq_len, out_hidden_size * (1 + depth_of_deepstack)]
+        if not deepstack_feature_lists:
+            return x
         return torch.cat([x] + deepstack_feature_lists, dim=1)
+
+    def forward_blocks_split(
+        self,
+        x: torch.Tensor,
+        metadata: dict,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Eager encoder body avoiding the main+deepstack concat roundtrip."""
+        x, deepstack_feature_lists = self._forward_blocks_parts(x, metadata)
+        if not deepstack_feature_lists:
+            return x, None
+        if len(deepstack_feature_lists) == 1:
+            return x, deepstack_feature_lists[0]
+        return x, torch.cat(deepstack_feature_lists, dim=1)
