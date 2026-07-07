@@ -245,7 +245,10 @@ class ServerArgs:
     low_latency_max_num_tokens_per_gpu: int = 256
     max_cudagraph_capture_size: int | None = None
     disable_prefill_graph: bool | None = False
-    prefill_graph_max_tokens: int | None = 128
+    # Breakable prefill CUDA graph, opt-in: > 0 enables and caps the largest bucket.
+    prefill_graph_max_tokens: int | None = 0
+    # Explicit prefill bucket list; unset = the relative-stride ladder (see get_prefill_token_buckets).
+    prefill_graph_capture_sizes: list[int] | None = None
     cudagraph_capture_sizes: list[int] | None = None
     enable_nan_detection: bool = False
     enable_nvtx: bool = False
@@ -1594,7 +1597,18 @@ class ServerArgs:
             "--prefill-graph-max-tokens",
             type=int,
             default=ServerArgs.prefill_graph_max_tokens,
-            help="Max query tokens to capture when enable prefill graph",
+            help="Enable the breakable prefill CUDA graph and cap the largest "
+            "captured token bucket. 0 (default) disables it (opt-in).",
+        )
+        parser.add_argument(
+            "--prefill-graph-capture-sizes",
+            metavar="PREFILL_GRAPH_CAPTURE_SIZE",
+            type=int,
+            nargs="+",
+            help="Explicit list of token-bucket sizes to capture for the "
+            "breakable prefill graph (like --cudagraph-capture-sizes for "
+            "decode). Unset: a relative-stride ladder bounding padded compute "
+            "at ~12.5%% of any size.",
         )
         parser.add_argument(
             "--enable-nan-detection",

@@ -883,6 +883,38 @@ class KimiK25ForConditionalGeneration(nn.Module):
         )
 
     @torch.no_grad()
+    def multimodal_input_embeds(
+        self,
+        input_ids: torch.Tensor,
+        ctx,
+        multimodal_context,
+    ) -> torch.Tensor | None:
+        """Merged text+vision input embeddings, or ``None`` for a plain text step.
+
+        Kimi-K2.5's multimodal path is embeds-only -- the vision features are
+        scattered into the input embeddings and nothing else reaches the
+        language model (no per-layer extras like deepstack) -- so both the
+        eager ``forward`` below and a prefill-graph replay take the exact same
+        tensor from here.
+        """
+        if (
+            multimodal_context is None
+            or self.vision_embedder is None
+            or not multimodal_context.has_extend_inputs()
+            or ctx.forward_mode.is_decode_or_idle()
+        ):
+            return None
+        input_embeds, model_kwargs = self.vision_embedder.apply(
+            input_ids=input_ids,
+            text_embedding=self.get_input_embeddings(),
+            ctx=multimodal_context,
+            encoders={Modality.IMAGE: EncoderSpec(self.image_encoder)},
+            multimodal_model=self,
+            is_decode_or_idle=ctx.forward_mode.is_decode_or_idle(),
+        )
+        assert not model_kwargs, "Kimi-K2.5 multimodal path must stay embeds-only"
+        return input_embeds
+
     def forward(
         self,
         ctx,
@@ -894,22 +926,9 @@ class KimiK25ForConditionalGeneration(nn.Module):
         if self.language_model is None:
             raise RuntimeError("KimiK25 language_model is not initialized.")
         multimodal_context = kwargs.pop("multimodal_context", None)
-        if (
-            multimodal_context is not None
-            and multimodal_context.has_extend_inputs()
-            and not ctx.forward_mode.is_decode_or_idle()
-        ):
-            input_embeds, model_kwargs = self.vision_embedder.apply(
-                input_ids=input_ids,
-                text_embedding=self.get_input_embeddings(),
-                ctx=multimodal_context,
-                encoders={Modality.IMAGE: EncoderSpec(self.image_encoder)},
-                multimodal_model=self,
-                is_decode_or_idle=ctx.forward_mode.is_decode_or_idle(),
-            )
-            kwargs.update(model_kwargs)
-            if input_embeds is not None:
-                kwargs["input_embeds"] = input_embeds
+        input_embeds = self.multimodal_input_embeds(input_ids, ctx, multimodal_context)
+        if input_embeds is not None:
+            kwargs["input_embeds"] = input_embeds
         return self.language_model.forward(
             ctx,
             input_ids,
