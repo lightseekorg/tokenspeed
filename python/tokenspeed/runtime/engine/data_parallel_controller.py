@@ -311,6 +311,9 @@ class DataParallelController:
         self.max_num_seqs = scheduler_info[0]["max_num_seqs"]
         self.chunked_prefill_size = scheduler_info[0]["chunked_prefill_size"]
         self.max_model_len = scheduler_info[0]["max_model_len"]
+        self.multimodal_encoder_dtype = scheduler_info[0].get(
+            "multimodal_encoder_dtype"
+        )
 
     def round_robin_scheduler(self, req: Req):
         if self.server_args.disaggregation_mode == "null":
@@ -364,6 +367,7 @@ def run_data_parallel_controller_process(
                 "max_num_seqs": controller.max_num_seqs,
                 "chunked_prefill_size": controller.chunked_prefill_size,
                 "max_model_len": controller.max_model_len,
+                "multimodal_encoder_dtype": controller.multimodal_encoder_dtype,
             }
         )
         if server_args.node_rank == 0:
