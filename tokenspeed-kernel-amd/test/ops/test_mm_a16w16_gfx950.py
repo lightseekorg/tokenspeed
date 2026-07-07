@@ -60,7 +60,7 @@ def test_dense16_kernel_variant_correctness(
     out = kernel(a, b, dtype)
     assert out is not None
 
-    torch.testing.assert_close(out, torch.mm(a, b.T), atol=0.5, rtol=0.05)
+    torch.testing.assert_close(out, torch.mm(a, b.T), atol=1e-2, rtol=1e-2)
 
 
 def test_use_warp_reduce_covers_small_k_decode_shapes() -> None:
