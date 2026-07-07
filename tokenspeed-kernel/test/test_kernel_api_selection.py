@@ -548,8 +548,8 @@ def _attention_dsa_prefill_topk() -> object:
 
 
 def _attention_dsa_plan() -> object:
-    seq_lens = torch.tensor([64, 64], dtype=torch.int32)
-    return tokenspeed_kernel.dsa_plan(seq_lens, page_size=64)
+    seq_lens_2d = torch.tensor([[64], [64]], dtype=torch.int32)
+    return tokenspeed_kernel.dsa_plan(seq_lens_2d=seq_lens_2d, page_size=64)
 
 
 def _attention_merge_state() -> object:

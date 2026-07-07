@@ -157,6 +157,7 @@ def persistent_topk(
     workspace: torch.Tensor,
     k: int,
     max_seq_len: int,
+    q_len_per_req: int = 1,
 ) -> None:
     if logits.dtype != torch.float32:
         raise TypeError(f"logits must be float32, got {logits.dtype}")
@@ -177,4 +178,5 @@ def persistent_topk(
         workspace,
         int(k),
         int(max_seq_len),
+        int(q_len_per_req),
     )

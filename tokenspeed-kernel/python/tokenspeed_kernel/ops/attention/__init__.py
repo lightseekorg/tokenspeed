@@ -953,6 +953,7 @@ def dsa_decode_topk(
     softmax_scale: float,
     q_len_per_req: int = 1,
     index_k_cache: torch.Tensor | None = None,
+    seq_lens_2d: torch.Tensor | None = None,
     plan: object | None = None,
     out: torch.Tensor | None = None,
     lens_out: torch.Tensor | None = None,
@@ -964,12 +965,16 @@ def dsa_decode_topk(
     Args:
         q: BF16 indexer query with shape [tokens, index_heads, head_dim].
         weights: FP32 per-token/head weights with shape [tokens, index_heads].
-        seq_lens: Visible KV length per query token, shape [tokens].
-        block_table: Paged KV block table with one row per query token.
+        seq_lens: Per-request full KV length, shape [num_reqs] (= tokens /
+            q_len_per_req). Each query token's causal bound
+            seq_lens[req] - (q_len_per_req - 1) + j is derived in-kernel.
+        block_table: Paged KV block table with one row per request,
+            shape [num_reqs, max_pages].
         page_size: Number of tokens per KV page.
         topk: Number of KV candidates to select.
         softmax_scale: Score scale, normally index_head_dim ** -0.5.
-        q_len_per_req: Query rows per request. Plain decode uses 1.
+        q_len_per_req: Query rows per request (spec-verify next_n). Plain
+            decode uses 1, where per-request is equivalent to per-token.
         index_k_cache: Packed FP8 index-K cache with scales (uint8). Used by
             both Triton and DeepGEMM.
         plan: Optional opaque backend-specific plan.
@@ -1035,6 +1040,7 @@ def dsa_decode_topk(
             softmax_scale=softmax_scale,
             q_len_per_req=q_len_per_req,
             index_k_cache=index_k_cache,
+            seq_lens_2d=seq_lens_2d,
             plan=plan,
             out=out,
             lens_out=lens_out,
@@ -1042,10 +1048,9 @@ def dsa_decode_topk(
 
 
 def dsa_plan(
-    seq_lens: torch.Tensor,
     *,
     page_size: int,
-    q_len_per_req: int = 1,
+    seq_lens_2d: torch.Tensor,
     out: object | None = None,
     override: str | None = None,
     solution: str | None = None,
@@ -1053,10 +1058,9 @@ def dsa_plan(
     """Build or refresh an opaque plan for DSA decode top-k.
 
     Args:
-        seq_lens: Visible KV length per query token, shape [tokens] or
-            [batch, q_len_per_req].
         page_size: KV cache page size.
-        q_len_per_req: Query rows per request. Plain decode uses 1.
+        seq_lens_2d: Prebuilt [num_reqs, next_n] context_lens (last column =
+            full per-request KV length), built once per forward by the caller.
         out: Optional previously allocated plan object to refresh in place.
         override: Optional exact kernel override name.
         solution: Optional kernel solution to force through normal selection.
@@ -1065,14 +1069,12 @@ def dsa_plan(
         Opaque backend-owned plan object, or None when no selected backend needs
         an explicit plan.
     """
-    if seq_lens.dtype != torch.int32:
-        seq_lens = seq_lens.to(torch.int32)
-    q_len_per_req = int(q_len_per_req)
+    if seq_lens_2d.dtype != torch.int32:
+        seq_lens_2d = seq_lens_2d.to(torch.int32)
     traits = {
         "page_size": int(page_size),
-        "q_len_per_req": q_len_per_req,
     }
-    signature = format_signature(seq_lens=dense_tensor_format(seq_lens.dtype))
+    signature = format_signature()
     try:
         kernel = select_kernel(
             "attention",
@@ -1085,32 +1087,24 @@ def dsa_plan(
     except NoKernelFoundError:
         return None
 
-    if seq_lens.dim() == 1:
-        batch_size = int(seq_lens.numel()) // max(q_len_per_req, 1)
-        tokens = int(seq_lens.numel())
-    else:
-        batch_size = int(seq_lens.shape[0])
-        tokens = int(seq_lens.numel())
     shape_params = {
-        "batch_size": batch_size,
-        "tokens": tokens,
-        "q_len_per_req": q_len_per_req,
+        "batch_size": int(seq_lens_2d.shape[0]),
+        "tokens": int(seq_lens_2d.numel()),
         "page_size": int(page_size),
     }
     ShapeCapture.get().record(
-        "attention", "dsa_plan", kernel.name, seq_lens.dtype, shape_params
+        "attention", "dsa_plan", kernel.name, seq_lens_2d.dtype, shape_params
     )
     with kernel_scope(
         "attention",
         "dsa_plan",
-        seq_lens.dtype,
+        seq_lens_2d.dtype,
         kernel_name=kernel.name,
         **shape_params,
     ):
         return kernel(
-            seq_lens=seq_lens,
+            seq_lens_2d=seq_lens_2d,
             page_size=page_size,
-            q_len_per_req=q_len_per_req,
             out=out,
         )
 
