@@ -137,6 +137,8 @@ class DSABackend(AttentionBackend):
             forward_mode=forward_mode,
         )
         metadata = self.forward_decode_metadata
+        # Full-length broadcast: the plan and paged-MQA-logits kernels read only
+        # the last column, and the per-token causal bound is applied downstream.
         metadata._dsa_seq_lens_2d = (
             metadata.seq_lens_k.unsqueeze(1)
             .expand(-1, self.spec_num_tokens)
@@ -217,9 +219,12 @@ class DSABackend(AttentionBackend):
             or forward_mode.is_mixed()
             or (forward_mode.is_extend() and self.is_draft)
         ):
-            metadata = self._dense_backend.forward_decode_metadata
+            metadata = self.forward_decode_metadata
+            # Full-length broadcast: the plan and paged-MQA-logits kernels read only
+            # the last column, and the per-token causal bound is applied downstream.
             metadata._dsa_seq_lens_2d = (
-                metadata.seq_lens_k.unsqueeze(1)
+                metadata.seq_lens_k[num_extends:]
+                .unsqueeze(1)
                 .expand(-1, self.spec_num_tokens)
                 .contiguous()
             )

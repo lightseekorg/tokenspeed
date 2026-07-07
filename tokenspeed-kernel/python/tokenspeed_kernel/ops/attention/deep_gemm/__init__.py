@@ -213,7 +213,7 @@ if platform.is_nvidia:
             deterministic_decode_topk(
                 logits,
                 local_topk_offsets,
-                int(topk),
+                topk,
                 lengths=seq_lens,
                 q_len_per_req=q_len_per_req,
                 workspace=torch.empty(
@@ -224,12 +224,19 @@ if platform.is_nvidia:
                 max_seq_len=max_seq_len,
             )
         else:
-            per_token_len = seq_lens_2d.reshape(-1)
+            # No ragged CUDA top-k: mask each row to its causal window first.
+            # seq_lens_2d is a full-length broadcast (only its last column is
+            # read on the hot path), so derive the per-token bound from the
+            # per-request seq_lens: seq_lens[req] - (q_len_per_req - 1) + j.
+            offsets = torch.arange(
+                1 - q_len_per_req, 1, device=seq_lens.device, dtype=torch.int32
+            )
+            seq_lens_per_token = (seq_lens.unsqueeze(1) + offsets).reshape(-1)
             col_ids = torch.arange(logits.shape[1], dtype=torch.int32, device=q.device)
             logits.masked_fill_(
-                col_ids.view(1, -1) >= per_token_len.view(-1, 1), float("-inf")
+                col_ids.view(1, -1) >= seq_lens_per_token.view(-1, 1), float("-inf")
             )
-            deterministic_decode_topk(logits, local_topk_offsets, int(topk))
+            deterministic_decode_topk(logits, local_topk_offsets, topk)
 
         return local_topk_to_global_slots(
             local_topk_offsets=local_topk_offsets,
