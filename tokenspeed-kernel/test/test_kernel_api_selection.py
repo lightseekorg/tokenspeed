@@ -1334,6 +1334,38 @@ def selected_kernel_spy(monkeypatch):
     return active_case, calls
 
 
+def _find_case(*, arch: str, family: str, mode: str) -> KernelApiSelectionCase:
+    for case in _CASES:
+        if case.arch == arch and case.family == family and case.mode == mode:
+            return case
+    raise AssertionError(f"missing golden case for {arch}/{family}.{mode}")
+
+
+def test_attn_merge_state_routes_to_triton_on_cdna4(
+    mi350_platform: PlatformInfo,
+    selected_kernel_spy,
+) -> None:
+    case = _find_case(arch="cdna4", family="attention", mode="attn_merge_state")
+    registry = KernelRegistry.get()
+    expected_spec = registry.get_by_name(case.expected)
+    assert expected_spec is not None
+    assert expected_spec.capability.satisfied_by(mi350_platform)
+
+    real_platform = Platform.get()
+    active_case, calls = selected_kernel_spy
+    active_case["case"] = case
+    try:
+        Platform.override(mi350_platform)
+        registry.clear_cache()
+
+        case.invoke()
+
+        assert calls == ["triton_attn_merge_state"]
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
+
+
 @pytest.mark.parametrize("case", _CASES, ids=lambda case: case.id)
 def test_kernel_api_selection(case: KernelApiSelectionCase, selected_kernel_spy):
     platform = Platform.get()
