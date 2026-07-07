@@ -53,6 +53,7 @@ LARGEM_DISPATCH_MIN_M = 2048
 KERNEL_NAME = "gluon_mm_a16w16_gfx950"
 
 _SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
+_partial_cache: dict[tuple[int, int, int, int, int], torch.Tensor] = {}
 
 
 @gluon.jit
@@ -1001,17 +1002,41 @@ def _allocate_partial_scratch(
     block_n: int,
     block_m: int = DENSE16_BLOCK_M,
 ) -> torch.Tensor:
-    """Allocate per-call split-K partial sums.
-
-    The producer and reducer kernels run asynchronously on the caller's stream,
-    so sharing this scratch across invocations can race when same-shape GEMMs run
-    concurrently on different HIP streams.
-    """
     return torch.empty(
         (total_tiles * split_k * block_m * block_n,),
         device=device,
         dtype=torch.float32,
     )
+
+
+def _get_partial_scratch(
+    device: torch.device,
+    total_tiles: int,
+    split_k: int,
+    block_n: int,
+    block_m: int = DENSE16_BLOCK_M,
+) -> torch.Tensor:
+    """Return stream-local split-K partial sums.
+
+    Same-stream calls are ordered, so they can safely reuse scratch. Different
+    streams must not share the buffer because the producer and reducer kernels run
+    asynchronously and can otherwise overwrite another invocation's partial sums.
+    During CUDA/HIP graph capture, allocate from PyTorch's graph-aware allocator
+    without storing graph-private memory in the eager cache.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        return _allocate_partial_scratch(device, total_tiles, split_k, block_n, block_m)
+
+    device_index = torch.cuda.current_device() if device.index is None else device.index
+    stream_id = torch.cuda.current_stream(device_index).cuda_stream
+    key = (device_index, stream_id, total_tiles, split_k, block_m * block_n)
+    cached = _partial_cache.get(key)
+    if cached is not None:
+        return cached
+
+    partial = _allocate_partial_scratch(device, total_tiles, split_k, block_n, block_m)
+    _partial_cache[key] = partial
+    return partial
 
 
 def _check_supported_dense16_shape(M: int, N: int, K: int) -> None:
@@ -1242,7 +1267,7 @@ def gluon_mm_a16w16_mfma_lds_smallm_gfx950(
     total_work = num_n_tiles * split_k
     sms = torch.cuda.get_device_properties(A.device).multi_processor_count
     grid = min(total_work, sms)
-    partial = _allocate_partial_scratch(
+    partial = _get_partial_scratch(
         A.device, num_n_tiles, split_k, MFMA_LDS_BLOCK_N, MFMA_LDS_REDUCE_M
     )
     k_tiles_per_split = (K // MFMA_LDS_BLOCK_K) // split_k

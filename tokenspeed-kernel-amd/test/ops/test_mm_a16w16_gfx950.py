@@ -19,8 +19,8 @@ if not _is_gfx950():
 
 
 from tokenspeed_kernel_amd.ops.gemm.mm_a16w16_gfx950 import (  # noqa: E402
-    _allocate_partial_scratch,
     _choose_mfma_lds_mediumm_config,
+    _get_partial_scratch,
     _supports_mfma_lds_smallm,
     _use_mfma_lds_largem,
     _use_mfma_lds_mediumm,
@@ -114,12 +114,21 @@ def test_use_splitk_routes_supported_non_warp_shapes() -> None:
     assert not _use_mfma_lds_smallm(4, 1280, 1024)
 
 
-def test_splitk_partial_scratch_is_per_call() -> None:
-    first = _allocate_partial_scratch(torch.device("cpu"), 2, 8, 256, 4)
-    second = _allocate_partial_scratch(torch.device("cpu"), 2, 8, 256, 4)
+def test_splitk_partial_scratch_is_stream_local() -> None:
+    device = torch.device("cuda")
+    first = _get_partial_scratch(device, 2, 8, 256, 4)
+    second = _get_partial_scratch(device, 2, 8, 256, 4)
 
-    assert first.shape == second.shape
-    assert first.data_ptr() != second.data_ptr()
+    other_stream = torch.cuda.Stream()
+    with torch.cuda.stream(other_stream):
+        other_first = _get_partial_scratch(device, 2, 8, 256, 4)
+        other_second = _get_partial_scratch(device, 2, 8, 256, 4)
+    other_stream.synchronize()
+
+    assert first.shape == second.shape == other_first.shape == other_second.shape
+    assert first.data_ptr() == second.data_ptr()
+    assert other_first.data_ptr() == other_second.data_ptr()
+    assert first.data_ptr() != other_first.data_ptr()
 
 
 def test_choose_mfma_lds_mediumm_config_uses_tuned_medium_m_tiles() -> None:
