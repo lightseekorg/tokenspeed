@@ -541,6 +541,7 @@ class MultimodalEmbedder:
                 shm_nbytes += item.feature.nbytes
         use_tp_broadcast = self._should_move_shm_via_tp_broadcast(pending)
         interleave_h2d = shm_nbytes > shm_count * _INTERLEAVED_H2D_MIN_AVERAGE_BYTES
+        defer_shm_cleanup = shm_count == 1 and interleave_h2d
         if not use_tp_broadcast and not interleave_h2d:
             for item in pending:
                 if isinstance(item.feature, ShmTensorHandle):
@@ -555,6 +556,14 @@ class MultimodalEmbedder:
                 return
             for it in pending:
                 if isinstance(it.feature, ShmTensorHandle):
+                    if defer_shm_cleanup:
+                        handle = it.feature
+                        try:
+                            it.feature = handle.copy_to_pinned()
+                            it.feature = it.feature.to(device, non_blocking=True)
+                        finally:
+                            handle.release()
+                        continue
                     it.feature = it.feature.consume()
                 if isinstance(it.feature, torch.Tensor):
                     it.feature = it.feature.to(device, non_blocking=True)
@@ -601,8 +610,15 @@ class MultimodalEmbedder:
         offset = 0
         if is_source:
             for handle, length in zip(handles, element_lengths, strict=True):
-                source = handle.consume().reshape(-1)
-                base.narrow(0, offset, length).copy_(source, non_blocking=True)
+                if len(handles) == 1:
+                    try:
+                        source = handle.copy_to_pinned().reshape(-1)
+                        base.narrow(0, offset, length).copy_(source, non_blocking=True)
+                    finally:
+                        handle.release()
+                else:
+                    source = handle.consume().reshape(-1)
+                    base.narrow(0, offset, length).copy_(source, non_blocking=True)
                 offset += length
         else:
             for handle in handles:
