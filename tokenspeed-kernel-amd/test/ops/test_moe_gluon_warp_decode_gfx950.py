@@ -102,15 +102,19 @@ def _build_case(
     layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
     layer.w2_weight_scale = torch.nn.Parameter(s2, requires_grad=False)
     layer.w13_weight_bias = torch.nn.Parameter(
-        w13_bias
-        if w13_bias is not None
-        else torch.zeros((E, 2 * I), device=device, dtype=torch.float32),
+        (
+            w13_bias
+            if w13_bias is not None
+            else torch.zeros((E, 2 * I), device=device, dtype=torch.float32)
+        ),
         requires_grad=False,
     )
     layer.w2_weight_bias = torch.nn.Parameter(
-        w2_bias
-        if w2_bias is not None
-        else torch.zeros((E, D), device=device, dtype=torch.float32),
+        (
+            w2_bias
+            if w2_bias is not None
+            else torch.zeros((E, D), device=device, dtype=torch.float32)
+        ),
         requires_grad=False,
     )
     layer.w13_input_scale = torch.nn.Parameter(scale1, requires_grad=False)
