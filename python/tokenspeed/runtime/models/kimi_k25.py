@@ -789,7 +789,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
                 self.mm_projector = self.mm_projector.to(dtype=target_dtype)
 
             # image_encoder may be swapped to a cudagraph wrapper by ModelExecutor.
-            self.vision_embedder = VisionEmbedder()
+            self.vision_embedder = VisionEmbedder(mapping.vision.tp_group)
             self.image_encoder = self.get_image_feature
         else:
             self.vision_embedder = None
