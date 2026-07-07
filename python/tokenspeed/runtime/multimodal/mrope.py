@@ -344,8 +344,9 @@ def _compute_qwen35_mrope_positions_from_offsets(hf_config, input_ids, mm_items)
                 return None
             if start == 0 or input_ids[start - 1] != hf_config.vision_start_token_id:
                 return None
-            if any(
-                token != placeholder_token_id for token in input_ids[start : end + 1]
+            placeholder_tokens = input_ids[start : end + 1]
+            if placeholder_tokens.count(placeholder_token_id) != len(
+                placeholder_tokens
             ):
                 return None
             llm_grid_t = int(t)
