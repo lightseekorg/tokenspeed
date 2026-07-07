@@ -128,6 +128,42 @@ def test_qwen35_split_video_fast_path_matches_generic_positions():
     assert torch.equal(delta, expected_delta)
 
 
+def test_qwen35_timestamped_video_matches_token_type_positions():
+    config = _Qwen35Config()
+    vision_end_token_id = 151653
+    timestamp_token_id = 42
+    input_ids = [
+        config.vision_start_token_id,
+        timestamp_token_id,
+        *([config.video_token_id] * 4),
+        vision_end_token_id,
+        timestamp_token_id,
+        config.vision_start_token_id,
+        *([config.video_token_id] * 4),
+        vision_end_token_id,
+    ]
+    item = MultimodalDataItem(
+        modality=Modality.VIDEO,
+        offsets=[(2, 5), (9, 12)],
+        model_specific_data={
+            "video_grid_thw": torch.tensor([[2, 4, 4]], dtype=torch.long)
+        },
+    )
+
+    positions, delta = compute_mrope_positions(config, input_ids, [item])
+
+    expected = torch.tensor(
+        [
+            [0, 1, 2, 2, 2, 2, 4, 5, 6, 7, 7, 7, 7, 9],
+            [0, 1, 2, 2, 3, 3, 4, 5, 6, 7, 7, 8, 8, 9],
+            [0, 1, 2, 3, 2, 3, 4, 5, 6, 7, 8, 7, 8, 9],
+        ],
+        dtype=torch.long,
+    )
+    assert torch.equal(positions, expected)
+    assert torch.equal(delta, torch.tensor([[-4]], dtype=torch.long))
+
+
 def test_qwen35_mixed_items_fast_path_matches_generic_positions():
     config = _Qwen35Config()
     input_ids = [
