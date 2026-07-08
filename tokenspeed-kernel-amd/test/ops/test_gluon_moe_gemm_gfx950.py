@@ -442,6 +442,62 @@ def _make_preprocessed_weights(
     )
 
 
+def test_preprocess_releases_raw_mxfp4_parameters() -> None:
+    device = "cuda"
+    e, h, i = 2, 64, 64
+    layer = torch.nn.Module()
+    layer.w13_input_layout = "concatenated"
+    layer.w13_weight = torch.nn.Parameter(
+        torch.zeros(e, 2 * i, h // 2, dtype=torch.uint8, device=device),
+        requires_grad=False,
+    )
+    layer.w13_weight_scale = torch.nn.Parameter(
+        torch.full(
+            (e, 2 * i, h // MXFP4_BLOCK),
+            124,
+            dtype=torch.uint8,
+            device=device,
+        ),
+        requires_grad=False,
+    )
+    layer.w2_weight = torch.nn.Parameter(
+        torch.zeros(e, h, i // 2, dtype=torch.uint8, device=device),
+        requires_grad=False,
+    )
+    layer.w2_weight_scale = torch.nn.Parameter(
+        torch.full(
+            (e, h, i // MXFP4_BLOCK),
+            124,
+            dtype=torch.uint8,
+            device=device,
+        ),
+        requires_grad=False,
+    )
+    layer.w13_weight_bias = torch.nn.Parameter(
+        torch.zeros(e, 2 * i, device=device), requires_grad=False
+    )
+    layer.w2_weight_bias = torch.nn.Parameter(
+        torch.zeros(e, h, device=device), requires_grad=False
+    )
+    layer.w13_input_scale = torch.nn.Parameter(
+        torch.ones(e, device=device), requires_grad=False
+    )
+    layer.w2_input_scale = torch.nn.Parameter(
+        torch.ones(e, device=device), requires_grad=False
+    )
+
+    preprocess_gluon_mxfp4_gfx950_moe_weights({}, layer, preshuffle=False)
+
+    assert not hasattr(layer, "w13_weight")
+    assert not hasattr(layer, "w13_weight_scale")
+    assert not hasattr(layer, "w2_weight")
+    assert not hasattr(layer, "w2_weight_scale")
+    assert hasattr(layer, "w13_weight_triton_tensor")
+    assert hasattr(layer, "w2_weight_triton_tensor")
+    assert layer.w13_precision_config.b_mx_scale is not None
+    assert layer.w2_precision_config.b_mx_scale is not None
+
+
 @pytest.fixture(scope="module")
 def mxfp4_weights() -> Mxfp4WeightVariants:
     raw_weights = _make_raw_mxfp4_weights()

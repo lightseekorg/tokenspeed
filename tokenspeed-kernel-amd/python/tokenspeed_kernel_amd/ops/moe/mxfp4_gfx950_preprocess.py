@@ -107,6 +107,11 @@ def _swizzle_mxfp4(quant_tensor: torch.Tensor, scale: torch.Tensor, num_warps: i
     return quant_tensor, InFlexData(), scale
 
 
+def _release_parameter(module: torch.nn.Module, name: str) -> None:
+    if hasattr(module, name):
+        delattr(module, name)
+
+
 def _interleave_gate_up_rows(tensor: torch.Tensor, dim: int) -> torch.Tensor:
     dim = dim % tensor.ndim
     rows = int(tensor.shape[dim])
@@ -216,10 +221,12 @@ def preprocess_gluon_mxfp4_gfx950_moe_weights(
             _interleave_gate_up_rows(w13_weight.data, dim=-2),
             requires_grad=False,
         )
+        _release_parameter(w, "w13_weight")
         w13_weight_scale = torch.nn.Parameter(
             _interleave_gate_up_rows(w13_weight_scale.data, dim=-2),
             requires_grad=False,
         )
+        _release_parameter(w, "w13_weight_scale")
 
     if hasattr(w, "w13_weight_bias"):
         w13_weight_bias = w.w13_weight_bias.to(torch.float32)
@@ -289,8 +296,10 @@ def preprocess_gluon_mxfp4_gfx950_moe_weights(
     w.w13_weight_triton_tensor = w13_weight
     w.w2_weight_triton_tensor = w2_weight
     _attach_w2_logical_n(w)
-    del w.w13_weight
-    del w.w2_weight
+    _release_parameter(w, "w13_weight")
+    _release_parameter(w, "w2_weight")
+    _release_parameter(w, "w13_weight_scale")
+    _release_parameter(w, "w2_weight_scale")
 
     if preshuffle:
         _attach_gluon_preshuffle(w)
