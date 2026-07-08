@@ -1020,8 +1020,13 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
 
     @property
     def swa_capacity_slots(self) -> int:
-        # Every layer's SWA buffer is allocated with the same page count, so a
-        # single capacity bounds the write-slot mapping shared across layers.
+        """Writable SWA cache capacity shared by every layer, in token slots.
+
+        Every layer's SWA buffer is allocated with the same page count, so a
+        single capacity (pages * tokens per block) bounds the write-slot
+        mapping shared across layers. Returns 0 when no SWA buffers exist;
+        callers must then mask all slots rather than skip the bounds check.
+        """
         if not self.swa_kv_buffer:
             return 0
         return int(self.swa_kv_buffer[0].shape[0]) * int(self.swa_block_size)

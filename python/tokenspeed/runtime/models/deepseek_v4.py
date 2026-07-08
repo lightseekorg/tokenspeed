@@ -1981,12 +1981,14 @@ def _deepseek_v4_padded_heads(num_local_heads: int) -> int:
 
 def _deepseek_v4_sanitize_swa_slot_mapping(
     slot_mapping: torch.Tensor,
-    capacity: int | None,
+    capacity: int,
     is_valid_token: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    # Fail closed: with no writable SWA capacity every slot is masked, so an
+    # unchecked mapping can never reach the fused cache-insert kernels.
+    if capacity <= 0:
+        return torch.full_like(slot_mapping, -1)
     slot_mapping = _mask_invalid_graph_tokens(slot_mapping, is_valid_token)
-    if not capacity:
-        return slot_mapping
     valid = (slot_mapping >= 0) & (slot_mapping < capacity)
     return torch.where(
         valid,
@@ -2033,9 +2035,12 @@ def _deepseek_v4_swa_slot_mapping(
     is_valid_token = getattr(metadata, "is_valid_token", None)
     if is_valid_token is not None:
         is_valid_token = is_valid_token[: positions.numel()]
+    # Attribute access is deliberately unguarded: a pool without
+    # swa_capacity_slots must fail fast here rather than skip the bounds
+    # check that protects the fused cache-insert kernels.
     return _deepseek_v4_sanitize_swa_slot_mapping(
         slot_mapping,
-        getattr(ctx.token_to_kv_pool, "swa_capacity_slots", None),
+        ctx.token_to_kv_pool.swa_capacity_slots,
         is_valid_token,
     )
 
