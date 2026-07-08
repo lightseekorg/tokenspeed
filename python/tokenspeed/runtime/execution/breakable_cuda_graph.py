@@ -436,23 +436,17 @@ def slice_to_real_tokens(num_real_tokens: int, *tensors: torch.Tensor | None):
 
 
 def _land_in(dst: torch.Tensor, result: torch.Tensor) -> None:
-    """Copy ``result`` into ``dst`` at a stable address, zeroing the padded tail.
+    """Copy ``result`` into ``dst`` at a stable address.
 
     ``dst`` is the (possibly token-padded) handoff buffer the next graph segment
     reads. ``result`` may cover only the real (unpadded) leading rows -- e.g. a
     varlen attention kernel writes only ``sum(cu_seqlens_q)`` rows -- so we copy
-    into the matching leading slice and ZERO the tail. A stale tail (previous
-    replays' values, re-amplified through the captured projections/quantize on
-    every replay) intermittently overflows to Inf/NaN, and NaN rows entering
-    the MoE router corrupt its histogram/permute indexing -- out-of-bounds
-    accesses and real-row contamination, load-dependent. A zeroed tail stays
-    bounded through every row-independent op.
+    into the matching leading slice. Padded rows are left as-is (discarded by the
+    final output slice). No-op when the op already wrote ``dst`` in place.
     """
     if result is dst:
         return
     if result.shape == dst.shape:
         dst.copy_(result)
     else:
-        num_real = result.shape[0]
-        dst.narrow(0, 0, num_real).copy_(result)
-        dst.narrow(0, num_real, dst.shape[0] - num_real).zero_()
+        dst.narrow(0, 0, result.shape[0]).copy_(result)
