@@ -30,7 +30,6 @@ server:
     --speculative-num-steps 3
     --drafter-attention-backend trtllm
     --enable-cache-report
-    --disable-kvstore
     --weight-loader-prefetch-checkpoints
     --host 127.0.0.1
     --port 8000
