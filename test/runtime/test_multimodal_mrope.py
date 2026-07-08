@@ -1,3 +1,6 @@
+from types import SimpleNamespace
+
+import pytest
 import torch
 
 from tokenspeed.runtime.layers.rotary_embedding import MRotaryEmbedding
@@ -16,6 +19,31 @@ class _Qwen35Config:
     vision_start_token_id = 151652
     model_type = "qwen3_5"
     vision_config = _VisionConfig()
+
+
+@pytest.mark.parametrize("num_extends", [0, 1])
+def test_text_only_mrope_positions_copy_linear_positions_directly(num_extends):
+    model_executor = pytest.importorskip(
+        "tokenspeed.runtime.execution.model_executor", exc_type=ImportError
+    )
+    executor = object.__new__(model_executor.ModelExecutor)
+    executor.config = SimpleNamespace(model_is_mrope=True)
+    executor.input_buffers = SimpleNamespace(
+        positions_buf=torch.arange(4, dtype=torch.int64),
+        mrope_positions_buf=torch.empty((3, 4), dtype=torch.int64),
+    )
+    forward_op = SimpleNamespace(num_extends=lambda: num_extends)
+
+    positions = executor._build_mrope_positions_override(
+        forward_op,
+        multimodal_context=None,
+        total_tokens=4,
+    )
+
+    assert torch.equal(
+        positions,
+        torch.arange(4, dtype=torch.int64).unsqueeze(0).expand(3, -1),
+    )
 
 
 def test_qwen35_image_fast_path_matches_generic_positions():
