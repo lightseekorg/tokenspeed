@@ -143,8 +143,8 @@ void HybridPrefixCache::augmentMatch(MatchResult& match) const {
         const std::int32_t page_size = match.device.page_size;
         const std::int32_t device_depth = device_terminal != nullptr ? device_terminal->DepthInPage(page_size) : 0;
         const std::int32_t host_depth = host_terminal != nullptr ? host_terminal->DepthInPage(page_size) : 0;
-        const std::int32_t kv_depth = std::max(device_depth, host_depth);
-        TreeNode* kv_terminal = device_depth >= host_depth ? device_terminal : host_terminal;
+        const std::int32_t kv_depth = device_depth;
+        TreeNode* kv_terminal = device_terminal;
         if (kv_terminal == nullptr || kv_terminal->IsRoot()) return;
 
         TreeNode* mamba_node = FindLastMambaNode(kv_terminal);
