@@ -86,6 +86,14 @@ _RECV_POOL_QUARANTINE_S = 10.0
 _pending_dereg: deque = deque()
 
 
+def _record_current_stream_event(tensor: torch.Tensor) -> torch.cuda.Event | None:
+    if not tensor.is_cuda:
+        return None
+    event = torch.cuda.Event()
+    torch.cuda.current_stream(tensor.device).record_event(event)
+    return event
+
+
 def _lazy_deregister(engine: Any, tensors: list[tuple[torch.Tensor, int]]) -> None:
     _pending_dereg.append((time.monotonic() + _DEREG_DELAY_S, engine, tensors))
     _sweep_deregister()
@@ -111,7 +119,7 @@ class _RecvBufferPool:
     a `local access violation work queue error` that kills the QP. The pool
     registers ONE region for the engine's lifetime, so the sender's cached
     mapping can never go stale; requests lease slots, the publish path clones the
-    landed rows out, and the slot returns immediately.
+    landed rows out, and CUDA-backed slots return only after that clone completes.
 
     Failure path: a FAILED job may still have an in-flight remote write targeting
     its slot, which under a single lifetime MR would land SILENTLY in the next
@@ -128,11 +136,37 @@ class _RecvBufferPool:
         engine.register(self.buf.data_ptr(), self.buf.numel())
         self._free = list(range(n_slots))
         self._quarantine: deque = deque()  # (release_due_monotonic, slot)
+        self._pending_release: deque = deque()  # (cuda_event, slot)
 
-    def lease(self, nbytes: int) -> int | None:
+    def _sweep_pending_release(self) -> None:
+        kept = deque()
+        while self._pending_release:
+            event, slot = self._pending_release.popleft()
+            try:
+                ready = event.query()
+            except Exception:  # noqa: BLE001 -- avoid permanently losing a slot
+                logger.warning(
+                    "EPD recv pool: CUDA event query failed; releasing slot anyway",
+                    exc_info=True,
+                )
+                ready = True
+            if ready:
+                self._free.append(slot)
+            else:
+                kept.append((event, slot))
+        self._pending_release = kept
+
+    def _sweep_quarantine(self) -> None:
         now = time.monotonic()
         while self._quarantine and self._quarantine[0][0] <= now:
             self._free.append(self._quarantine.popleft()[1])
+
+    def sweep(self) -> None:
+        self._sweep_pending_release()
+        self._sweep_quarantine()
+
+    def lease(self, nbytes: int) -> int | None:
+        self.sweep()
         if nbytes > self.slot_bytes or not self._free:
             return None
         return self._free.pop()
@@ -143,6 +177,13 @@ class _RecvBufferPool:
 
     def release(self, slot: int) -> None:
         self._free.append(slot)
+
+    def release_after_copy(self, slot: int, copied_tensor: torch.Tensor) -> None:
+        event = _record_current_stream_event(copied_tensor)
+        if event is None:
+            self.release(slot)
+        else:
+            self._pending_release.append((event, slot))
 
     def quarantine(self, slot: int, delay_s: float) -> None:
         self._quarantine.append((time.monotonic() + delay_s, slot))
@@ -275,13 +316,15 @@ class EmbeddingReceiveJob:
 
     Buffer lifetime: by default the receive target is a leased slot from the
     lifetime-registered :class:`_RecvBufferPool`; on DONE the landed rows are
-    cloned onto ``item.encoded`` and the slot returns immediately (no MR churn,
-    see the pool docstring). Deepstack models, oversized items, pool
+    cloned onto ``item.encoded`` and the slot is reused after that copy completes
+    (no MR churn, see the pool docstring). Deepstack models, oversized items, pool
     exhaustion, or ``TOKENSPEED_EPD_RECV_POOL_SLOTS=0`` fall back to a per-request
-    buffer registered on start and lazily deregistered after publish. The GPU
-    cost per request is roughly ``n_tokens * hidden * dtype.itemsize`` (plus
-    ``* (1 + num_deepstack)`` with deepstack); the caller should cap the
-    number of in-flight jobs accordingly.
+    buffer registered on start and lazily deregistered after publish. Pooled
+    slots stay leased until the CUDA copy into ``item.encoded`` has completed,
+    so a following request cannot overwrite rows still being cloned. The GPU cost
+    per request is roughly ``n_tokens * hidden * dtype.itemsize`` (plus ``* (1 +
+    num_deepstack)`` with deepstack); the caller should cap the number of
+    in-flight jobs accordingly.
 
     Idempotent re-`start`/poll: items whose ``item.encoded`` is already set
     (chunked prefill re-runs the receive per Path-4 forward on the same item) are
@@ -547,10 +590,10 @@ class EmbeddingReceiveJob:
 
         # Every image of every item has landed; publish and reclaim. Pooled
         # path: clone the landed rows OUT of the slot (item.encoded must outlive
-        # the lease) and return the slot at once. Legacy path: hand the buffer
-        # itself to item.encoded and queue the registration for DEFERRED drop
-        # (the lazy entry holds the tensor ref, so the allocator cannot recycle
-        # a still-registered address).
+        # the lease) and release the slot only after that copy completes. Legacy
+        # path: hand the buffer itself to item.encoded and queue the registration
+        # for DEFERRED drop (the lazy entry holds the tensor ref, so the allocator
+        # cannot recycle a still-registered address).
         for it in self._items:
             any_sharded = any(it.sharded)
             if it.pool is not None:
@@ -565,7 +608,7 @@ class EmbeddingReceiveJob:
                     else it.recv_main.clone()
                 )
                 it.item.encoded_deepstack = None
-                it.pool.release(it.pool_slot)
+                it.pool.release_after_copy(it.pool_slot, it.item.encoded)
             else:
                 # Legacy path. When sharded, the packed buffers are smaller than
                 # the image and cannot alias item.encoded, so build separate full
@@ -641,9 +684,9 @@ class EmbeddingReceiveJob:
 
         Broadcasts target ``item.encoded`` (the PUBLISHED tensor), never
         ``recv_main``: on the pooled path the publish step cloned the rows out
-        and RELEASED the slot, so ``recv_main`` may already belong to the next
-        tenant; on the legacy path ``item.encoded`` IS ``recv_main``, so the
-        two are equivalent there.
+        and queued the slot for reuse after the clone completes, so ``recv_main``
+        may later belong to the next tenant; on the legacy path ``item.encoded``
+        IS ``recv_main``, so the two are equivalent there.
         """
         if self._shard_size <= 1 or self._status is not DONE:
             return

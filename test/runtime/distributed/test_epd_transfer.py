@@ -518,6 +518,29 @@ def _recv_setup(monkeypatch):
     er._pending_dereg.clear()
 
 
+def test_recv_pool_release_waits_for_clone_event(monkeypatch):
+    import tokenspeed.runtime.pd.epd.prefill_receiver as er
+
+    class _FakeEvent:
+        def __init__(self):
+            self.ready = False
+
+        def query(self):
+            return self.ready
+
+    event = _FakeEvent()
+    monkeypatch.setattr(er, "_record_current_stream_event", lambda _tensor: event)
+    pool = er._RecvBufferPool(_RecvFakeEngine(), "cpu", slot_bytes=64, n_slots=1)
+
+    slot = pool.lease(8)
+    assert slot == 0
+    pool.release_after_copy(slot, torch.empty(1))
+    assert pool.lease(8) is None
+
+    event.ready = True
+    assert pool.lease(8) == 0
+
+
 def test_receive_sizes_buffers_per_item_no_deepstack():
     items = [
         _epd(_recv_item(6), room=11, host="h0", port=7001),
