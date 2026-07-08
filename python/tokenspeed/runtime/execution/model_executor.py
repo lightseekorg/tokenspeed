@@ -98,6 +98,21 @@ def _draft_idle_global_num_tokens_for_step(
     return global_bs
 
 
+PREFILL_GRAPH_DEFAULT_MAX_TOKENS = 2048
+
+
+def _resolve_prefill_graph_max_tokens(server_args) -> int:
+    """Largest prefill-graph bucket: explicit value, or min(2048, chunk, kv budget)."""
+    if server_args.prefill_graph_max_tokens is not None:
+        return int(server_args.prefill_graph_max_tokens)
+    cap = PREFILL_GRAPH_DEFAULT_MAX_TOKENS
+    if server_args.chunked_prefill_size:
+        cap = min(cap, int(server_args.chunked_prefill_size))
+    if server_args.max_total_tokens:
+        cap = min(cap, int(server_args.max_total_tokens))
+    return cap
+
+
 @dataclass
 class ModelExecutorConfig:
     """
@@ -195,7 +210,7 @@ class ModelExecutorConfig:
             disable_cuda_graph_padding=server_args.disable_cuda_graph_padding,
             max_cudagraph_capture_size=server_args.max_cudagraph_capture_size,
             disable_prefill_graph=bool(server_args.disable_prefill_graph),
-            prefill_graph_max_tokens=int(server_args.prefill_graph_max_tokens or 0),
+            prefill_graph_max_tokens=_resolve_prefill_graph_max_tokens(server_args),
             prefill_graph_capture_sizes=server_args.prefill_graph_capture_sizes,
             model_is_mrope=model_is_mrope,
             data_parallel_size=server_args.mapping.attn.dp_size,

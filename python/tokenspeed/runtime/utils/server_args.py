@@ -245,8 +245,11 @@ class ServerArgs:
     low_latency_max_num_tokens_per_gpu: int = 256
     max_cudagraph_capture_size: int | None = None
     disable_prefill_graph: bool | None = False
-    # Breakable prefill CUDA graph, opt-in: > 0 enables and caps the largest bucket.
-    prefill_graph_max_tokens: int | None = 0
+    # Breakable prefill CUDA graph. None (default) = auto: largest bucket =
+    # min(2048, chunked-prefill size) -- covers the launch-bound small-prefill
+    # range while keeping capture time and graph-pool memory modest; > 0 caps
+    # the largest bucket explicitly; 0 disables.
+    prefill_graph_max_tokens: int | None = None
     # Explicit prefill bucket list; unset = the relative-stride ladder (see get_prefill_token_buckets).
     prefill_graph_capture_sizes: list[int] | None = None
     cudagraph_capture_sizes: list[int] | None = None
@@ -1610,8 +1613,9 @@ class ServerArgs:
             "--prefill-graph-max-tokens",
             type=int,
             default=ServerArgs.prefill_graph_max_tokens,
-            help="Enable the breakable prefill CUDA graph and cap the largest "
-            "captured token bucket. 0 (default) disables it (opt-in).",
+            help="Largest token bucket captured by the breakable prefill CUDA "
+            "graph. Default (unset) = min(2048, chunked-prefill size); "
+            "0 disables.",
         )
         parser.add_argument(
             "--prefill-graph-capture-sizes",

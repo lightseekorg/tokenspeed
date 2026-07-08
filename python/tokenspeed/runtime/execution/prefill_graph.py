@@ -278,14 +278,16 @@ class PrefillGraph:
         bucket's peak instead of growing per bucket.
 
         Runs under inference mode like serving forwards (in-place updates on
-        inference-mode model state buffers are only legal there). OOM
-        propagates -- the buckets genuinely didn't fit, don't silently boot in
-        a slower eager mode. Any other failure means the dummy-batch machinery
-        doesn't cover this model family yet: degrade to eager prefill instead
-        of crashing the server, and agree on that across the world (a MIN
-        all-reduce over the success flag) -- replay force-sets
-        ``global_num_tokens`` on every rank, so one eager rank among replaying
-        peers diverges the token counts and deadlocks the next collective.
+        inference-mode model state buffers are only legal there). OOM fails
+        the boot LOUDLY (the graph pool did not fit next to weights + KV
+        cache; the operator decides: free headroom, lower
+        ``--prefill-graph-max-tokens``, or 0 to disable). Any other failure
+        means the dummy-batch machinery doesn't cover this model family yet:
+        degrade to eager prefill instead of crashing the server, and agree on
+        that across the world (a MIN all-reduce over the success flag) --
+        replay force-sets ``global_num_tokens`` on every rank, so one eager
+        rank among replaying peers diverges the token counts and deadlocks
+        the next collective.
         """
         if self.disable:
             return
@@ -302,6 +304,13 @@ class PrefillGraph:
             with maybe_inference_mode():
                 self._capture_all_buckets(decode_wrapper)
         except torch.cuda.OutOfMemoryError:
+            logger.error(
+                "Prefill graph capture ran out of GPU memory. Free up "
+                "--gpu-memory-utilization headroom, lower "
+                "--prefill-graph-max-tokens (default %d), or set it to 0 to "
+                "disable the prefill graph.",
+                2048,
+            )
             raise
         except (NotImplementedError, AttributeError, KeyError, RuntimeError) as exc:
             logger.warning(
