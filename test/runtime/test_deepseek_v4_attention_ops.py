@@ -288,10 +288,9 @@ def _expected_overlap_normed(
 
 class DeepseekV4AttentionOpsCpuValidationTest(unittest.TestCase):
     def test_swa_slot_mapping_guard_masks_out_of_range_slots(self):
-        cache = torch.empty((2, 4 * SWA_TOKEN_STRIDE), dtype=torch.uint8)
         slots = torch.tensor([-3, -1, 0, 7, 8, 99], dtype=torch.int64)
 
-        sanitized = _deepseek_v4_sanitize_swa_slot_mapping(slots, cache, 4)
+        sanitized = _deepseek_v4_sanitize_swa_slot_mapping(slots, capacity=2 * 4)
 
         torch.testing.assert_close(
             sanitized,
@@ -299,14 +298,12 @@ class DeepseekV4AttentionOpsCpuValidationTest(unittest.TestCase):
         )
 
     def test_swa_slot_mapping_guard_masks_invalid_graph_tokens(self):
-        cache = torch.empty((2, 4 * SWA_TOKEN_STRIDE), dtype=torch.uint8)
         slots = torch.tensor([0, 1, 2, 9, -1, 3], dtype=torch.int64)
         is_valid_token = torch.tensor([True, False, True, True, True, False])
 
         sanitized = _deepseek_v4_sanitize_swa_slot_mapping(
             slots,
-            cache,
-            4,
+            capacity=2 * 4,
             is_valid_token=is_valid_token,
         )
 

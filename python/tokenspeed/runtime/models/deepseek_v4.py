@@ -1981,12 +1981,12 @@ def _deepseek_v4_padded_heads(num_local_heads: int) -> int:
 
 def _deepseek_v4_sanitize_swa_slot_mapping(
     slot_mapping: torch.Tensor,
-    swa_kv_cache: torch.Tensor,
-    block_size: int,
+    capacity: int | None,
     is_valid_token: torch.Tensor | None = None,
 ) -> torch.Tensor:
     slot_mapping = _mask_invalid_graph_tokens(slot_mapping, is_valid_token)
-    capacity = int(swa_kv_cache.shape[0]) * int(block_size)
+    if not capacity:
+        return slot_mapping
     valid = (slot_mapping >= 0) & (slot_mapping < capacity)
     return torch.where(
         valid,
@@ -2000,26 +2000,43 @@ def _deepseek_v4_swa_slot_mapping(
     positions: torch.Tensor,
     out_cache_loc: torch.Tensor,
 ) -> torch.Tensor:
+    """Build the SWA write-slot mapping, already sanitized for cache inserts.
+
+    The returned mapping has invalid CUDA-graph tokens and out-of-capacity
+    slots masked to -1, so per-layer SWA inserts can consume it directly.
+    Sanitizing here keeps the mask/clamp elementwise chain at once per step;
+    doing it per layer previously baked ~7 tiny kernels x 61 layers into the
+    captured decode graph.
+    """
     if positions.numel() == 0:
         return out_cache_loc
     metadata = _deepseek_v4_forward_metadata(ctx)
     if metadata is None:
         raise RuntimeError("DeepSeek V4 attention requires forward metadata")
     cache_metadata = metadata.cache
-    if cache_metadata.swa_block_table is None:
-        return out_cache_loc
     token_to_req_indices = metadata.token_to_req_indices[: positions.numel()]
-    if token_to_req_indices.numel() != positions.numel() and (
+    if cache_metadata.swa_block_table is None:
+        slot_mapping = out_cache_loc
+    elif token_to_req_indices.numel() != positions.numel() and (
         token_to_req_indices.numel() <= 0
         or positions.numel() % token_to_req_indices.numel() != 0
     ):
-        return out_cache_loc
-    return _group_slot_mapping_from_raw(
-        positions,
-        token_to_req_indices,
-        cache_metadata.swa_block_table,
-        ctx.token_to_kv_pool.swa_block_size,
-        base_offsets=cache_metadata.swa_base_logical_page,
+        slot_mapping = out_cache_loc
+    else:
+        slot_mapping = _group_slot_mapping_from_raw(
+            positions,
+            token_to_req_indices,
+            cache_metadata.swa_block_table,
+            ctx.token_to_kv_pool.swa_block_size,
+            base_offsets=cache_metadata.swa_base_logical_page,
+        )
+    is_valid_token = getattr(metadata, "is_valid_token", None)
+    if is_valid_token is not None:
+        is_valid_token = is_valid_token[: positions.numel()]
+    return _deepseek_v4_sanitize_swa_slot_mapping(
+        slot_mapping,
+        getattr(ctx.token_to_kv_pool, "swa_capacity_slots", None),
+        is_valid_token,
     )
 
 
@@ -3502,16 +3519,12 @@ class DeepseekV4Attention(nn.Module):
         positions: torch.Tensor,
         cos_sin_cache: torch.Tensor,
         block_size: int,
-        is_valid_token: torch.Tensor | None = None,
     ) -> None:
+        # slot_mapping arrives pre-sanitized from _deepseek_v4_swa_slot_mapping
+        # (invalid tokens and out-of-capacity slots masked to -1); sanitizing
+        # here again would re-run the mask chain once per layer.
         if q.shape[0] == 0:
             return
-        slot_mapping = _deepseek_v4_sanitize_swa_slot_mapping(
-            slot_mapping,
-            swa_kv_cache,
-            block_size,
-            is_valid_token=is_valid_token,
-        )
         fused_qnorm_rope_kv_insert(
             q=q,
             kv=kv,
@@ -3656,11 +3669,6 @@ class DeepseekV4Attention(nn.Module):
 
         def insert_swa_cache() -> None:
             with nvtx_range(f"{profile_prefix}_insert_swa_cache"):
-                is_valid_token = (
-                    metadata.is_valid_token[: positions.numel()]
-                    if metadata.is_valid_token is not None
-                    else None
-                )
                 self._insert_swa_cache(
                     q=q,
                     kv=kv,
@@ -3669,7 +3677,6 @@ class DeepseekV4Attention(nn.Module):
                     positions=positions,
                     cos_sin_cache=cos_sin_cache,
                     block_size=pool.swa_block_size,
-                    is_valid_token=is_valid_token,
                 )
 
         def run_compressor() -> None:

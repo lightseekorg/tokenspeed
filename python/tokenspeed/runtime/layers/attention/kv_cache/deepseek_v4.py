@@ -1018,6 +1018,14 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
     def get_swa_kv_buffer(self, layer_id: int) -> torch.Tensor:
         return self.swa_kv_buffer[layer_id]
 
+    @property
+    def swa_capacity_slots(self) -> int:
+        # Every layer's SWA buffer is allocated with the same page count, so a
+        # single capacity bounds the write-slot mapping shared across layers.
+        if not self.swa_kv_buffer:
+            return 0
+        return int(self.swa_kv_buffer[0].shape[0]) * int(self.swa_block_size)
+
     def get_compressed_kv_buffer_2d(self, layer_id: int) -> torch.Tensor:
         return self._require(self.compressed_kv_buffer, layer_id, "compressed KV")
 

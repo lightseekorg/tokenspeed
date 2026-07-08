@@ -86,6 +86,37 @@ def test_deepseek_v4_swa_slot_mapping_prefers_draft_prefill_metadata():
     assert slot_mapping.tolist() == [20, 21, 22, 40, 41]
 
 
+def test_deepseek_v4_swa_slot_mapping_masks_invalid_and_overflow_slots():
+    # The mapping must arrive at per-layer SWA inserts already sanitized:
+    # invalid CUDA-graph tokens and out-of-capacity slots masked to -1.
+    metadata = SimpleNamespace(
+        token_to_req_indices=torch.tensor([0, 1], dtype=torch.int32),
+        cache=SimpleNamespace(
+            swa_block_table=torch.tensor(
+                [
+                    [10, 11],
+                    [20, 21],
+                ],
+                dtype=torch.int32,
+            ),
+            swa_base_logical_page=None,
+        ),
+        is_valid_token=torch.tensor([True, True, False, True]),
+    )
+    ctx = SimpleNamespace(
+        attn_backend=SimpleNamespace(forward_metadata=metadata),
+        token_to_kv_pool=SimpleNamespace(swa_block_size=2, swa_capacity_slots=43),
+    )
+    positions = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
+    out_cache_loc = torch.tensor([100, 101, 102, 103], dtype=torch.int32)
+
+    slot_mapping = _deepseek_v4_swa_slot_mapping(ctx, positions, out_cache_loc)
+
+    # Raw mapping is [20, 21, 42, 43]: index 2 is masked by is_valid_token,
+    # index 3 exceeds the 43-slot capacity.
+    assert slot_mapping.tolist() == [20, 21, -1, -1]
+
+
 def test_deepseek_v4_swa_slot_mapping_falls_back_for_incompatible_draft_metadata():
     metadata = SimpleNamespace(
         token_to_req_indices=torch.tensor([0, 1], dtype=torch.int32),
