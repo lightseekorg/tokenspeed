@@ -1234,23 +1234,22 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
         video, ``image_grid_thw`` otherwise) so a single shared encoder cudagraph
         wrapper can serve both image and video batches.
         """
-        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
-            self.visual.dtype
-        )
-        grid = torch.concat(
-            [
-                getattr(
-                    item,
-                    (
-                        "video_grid_thw"
-                        if item.modality == Modality.VIDEO
-                        else "image_grid_thw"
-                    ),
-                )
-                for item in items
-            ],
-            dim=0,
-        )
+        features = [item.feature for item in items]
+        grids = [
+            getattr(
+                item,
+                (
+                    "video_grid_thw"
+                    if item.modality == Modality.VIDEO
+                    else "image_grid_thw"
+                ),
+            )
+            for item in items
+        ]
+        pixel_values = (
+            features[0] if len(features) == 1 else torch.cat(features, dim=0)
+        ).type(self.visual.dtype)
+        grid = grids[0] if len(grids) == 1 else torch.concat(grids, dim=0)
         if pixel_values.dim() != 2:
             raise ValueError(f"pixel_values must be 2D, got {pixel_values.dim()}D.")
         if grid.dim() != 2:
@@ -1262,6 +1261,8 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
         self, encoder_outs: list[torch.Tensor], grid: torch.Tensor
     ) -> torch.Tensor:
         """Eager step after the captured region; returns features."""
+        if len(encoder_outs) == 1:
+            return encoder_outs[0]
         return torch.cat(encoder_outs, dim=0)
 
     def _build_encoder_cudagraph_wrapper(
@@ -1350,8 +1351,14 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             text_embedding=self.model.get_input_embeddings(),
             ctx=multimodal_context,
             encoders={
-                Modality.IMAGE: EncoderSpec(self.image_encoder, deepstack=True),
-                Modality.VIDEO: EncoderSpec(self.video_encoder, deepstack=True),
+                Modality.IMAGE: EncoderSpec(
+                    self.image_encoder,
+                    deepstack=self.num_deepstack_embeddings > 0,
+                ),
+                Modality.VIDEO: EncoderSpec(
+                    self.video_encoder,
+                    deepstack=self.num_deepstack_embeddings > 0,
+                ),
             },
             multimodal_model=self,
             is_decode_or_idle=ctx.forward_mode.is_decode_or_idle(),
