@@ -1070,12 +1070,12 @@ def test_dsa_decode_dense_kvcache(device: str, q_dtype: torch.dtype, require) ->
     torch.testing.assert_close(out.float(), ref.float(), rtol=8e-2, atol=8e-2)
 
 
-@pytest.mark.parametrize("solution", ["triton"])
 @pytest.mark.parametrize(
     "case",
     _GLM52_DSA_CASES,
     ids=lambda case: case.name,
 )
+@pytest.mark.parametrize("solution", ["triton", "gluon"])
 def test_dsa_glm52_selected_attention_cases(
     device: str,
     require,
