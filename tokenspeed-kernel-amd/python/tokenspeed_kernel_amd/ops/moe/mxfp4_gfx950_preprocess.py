@@ -185,8 +185,7 @@ def _attach_gluon_preshuffle(w: torch.nn.Module) -> None:
             shuffled.original_n = int(logical_n)
             raw.original_n = int(logical_n)
             wrapped.original_n = int(logical_n)
-        raw._gluon_shuffled = shuffled
-        wrapped._gluon_shuffled = shuffled
+        setattr(w, attr, shuffled)
 
 
 def _attach_w2_logical_n(w: torch.nn.Module) -> None:
