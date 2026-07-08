@@ -145,80 +145,6 @@ class ScatterRange:
     item_src_end: int
 
 
-def _merged_visual_ranges(
-    scatter_ranges: list[ScatterRange],
-    total_rows: int,
-) -> list[tuple[int, int]]:
-    """Return half-open, merged destination ranges filled by vision tokens."""
-    if total_rows <= 0:
-        return []
-    ranges = sorted(
-        (max(0, int(r.flat_dst_start)), min(total_rows, int(r.flat_dst_end) + 1))
-        for r in scatter_ranges
-    )
-    ranges = [(start, end) for start, end in ranges if start < end]
-    if not ranges:
-        return []
-
-    merged = [ranges[0]]
-    for start, end in ranges[1:]:
-        last_start, last_end = merged[-1]
-        if start <= last_end:
-            merged[-1] = (last_start, max(last_end, end))
-        else:
-            merged.append((start, end))
-    return merged
-
-
-def _text_token_spans(
-    total_rows: int,
-    visual_ranges: list[tuple[int, int]],
-) -> list[tuple[int, int]]:
-    """Return half-open ranges that still need text embedding lookup."""
-    spans: list[tuple[int, int]] = []
-    cursor = 0
-    for start, end in visual_ranges:
-        if cursor < start:
-            spans.append((cursor, start))
-        cursor = max(cursor, end)
-    if cursor < total_rows:
-        spans.append((cursor, total_rows))
-    return spans
-
-
-def _coalesced_scatter_ranges(
-    scatter_ranges: list[ScatterRange],
-) -> list[ScatterRange]:
-    """Merge adjacent scatter work for the same item and contiguous source rows."""
-    if len(scatter_ranges) <= 1:
-        return scatter_ranges
-
-    merged: list[ScatterRange] = []
-    scatter_iter = iter(scatter_ranges)
-    current = next(scatter_iter)
-    changed = False
-    for scatter_range in scatter_iter:
-        if (
-            current.item is scatter_range.item
-            and current.flat_dst_end + 1 == scatter_range.flat_dst_start
-            and current.item_src_end + 1 == scatter_range.item_src_start
-        ):
-            current = ScatterRange(
-                current.flat_dst_start,
-                scatter_range.flat_dst_end,
-                current.item,
-                current.item_src_start,
-                scatter_range.item_src_end,
-            )
-            changed = True
-            continue
-
-        merged.append(current)
-        current = scatter_range
-    merged.append(current)
-    return merged if changed else scatter_ranges
-
-
 @dataclass
 class EncodePlan:
     """Work to do this prefill iteration.
@@ -246,94 +172,6 @@ def _item_token_count(item: MultimodalDataItem) -> int:
     if not item.offsets:
         return 0
     return sum(end - start + 1 for start, end in item.offsets)
-
-
-def _ensure_tensor_layout(
-    tensor: torch.Tensor, *, dtype: torch.dtype, device: torch.device
-) -> torch.Tensor:
-    if tensor.dtype == dtype and tensor.device == device:
-        return tensor
-    return tensor.to(dtype=dtype, device=device)
-
-
-def _allocate_deepstack_buffer(
-    input_embeds: torch.Tensor,
-    num_deepstack: int,
-    scatter_ranges: list[ScatterRange],
-    visual_ranges: list[tuple[int, int]] | None = None,
-    text_spans: list[tuple[int, int]] | None = None,
-) -> torch.Tensor:
-    """Allocate deepstack embeddings for multimodal scatter.
-
-    Qwen3.5 adds the full ``input_deepstack_embeds`` tensor into the first
-    decoder layers. Text rows must therefore be zero while vision rows are
-    populated from encoder output.
-    """
-    shape = input_embeds.shape[:-1] + (input_embeds.shape[-1] * num_deepstack,)
-    if input_embeds.dim() != 2:
-        return torch.zeros(shape, dtype=input_embeds.dtype, device=input_embeds.device)
-
-    total_rows = int(input_embeds.shape[0])
-    if visual_ranges is None:
-        visual_ranges = _merged_visual_ranges(scatter_ranges, total_rows)
-    if not visual_ranges:
-        return torch.zeros(shape, dtype=input_embeds.dtype, device=input_embeds.device)
-
-    deepstack_buffer = torch.empty(
-        shape, dtype=input_embeds.dtype, device=input_embeds.device
-    )
-    if text_spans is None:
-        text_spans = _text_token_spans(total_rows, visual_ranges)
-    for start, end in text_spans:
-        deepstack_buffer[start:end].zero_()
-    return deepstack_buffer
-
-
-def _copy_deepstack_rows(
-    dst: torch.Tensor,
-    src: torch.Tensor,
-    *,
-    dtype: torch.dtype,
-    device: torch.device,
-    src_start: int = 0,
-    src_end: int | None = None,
-) -> None:
-    if src_end is not None:
-        src = src[src_start:src_end]
-    dst.copy_(_ensure_tensor_layout(src, dtype=dtype, device=device))
-
-
-def _dense_deepstack_view_for_full_visual_chunk(
-    scatter_ranges: list[ScatterRange],
-    total_rows: int,
-    *,
-    expected_width: int,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> torch.Tensor | None:
-    """Return a direct deepstack view when one scatter covers every row."""
-    if total_rows <= 0 or len(scatter_ranges) != 1:
-        return None
-
-    scatter_range = scatter_ranges[0]
-    if (
-        scatter_range.flat_dst_start != 0
-        or scatter_range.flat_dst_end != total_rows - 1
-    ):
-        return None
-
-    src = scatter_range.item.encoded_deepstack
-    if src is None:
-        return None
-
-    src = src[scatter_range.item_src_start : scatter_range.item_src_end + 1]
-    if (
-        src.dim() != 2
-        or int(src.shape[0]) != total_rows
-        or int(src.shape[-1]) != expected_width
-    ):
-        return None
-    return _ensure_tensor_layout(src, dtype=dtype, device=device)
 
 
 # ---------------------------------------------------------------------------
@@ -454,15 +292,17 @@ class VisionEmbedder:
         # the caller hands us. Requests without mm input contribute
         # nothing but still advance ``base``.
         base = 0
-        for mm_inputs, seq, prefix in zip(
-            ctx.mm_inputs,
-            ctx.extend_seq_lens,
-            ctx.extend_prefix_lens,
-        ):
+        for req_idx, mm_inputs in enumerate(ctx.mm_inputs):
+            if req_idx >= len(ctx.extend_seq_lens) or req_idx >= len(
+                ctx.extend_prefix_lens
+            ):
+                break
+            seq = ctx.extend_seq_lens[req_idx]
             if mm_inputs is None or seq <= 0:
                 base += max(seq, 0)
                 continue
 
+            prefix = ctx.extend_prefix_lens[req_idx]
             chunk_start = prefix
             chunk_end_inc = prefix + seq - 1
 
@@ -482,6 +322,7 @@ class VisionEmbedder:
                 if canonical is not item:
                     plan.aliases_by_canonical[canonical].append(item)
 
+                # src_cursor: start of current subgrid inside item.encoded.
                 src_cursor = 0
                 for offset_start, offset_end in item.offsets:
                     span = offset_end - offset_start + 1
@@ -521,7 +362,6 @@ class VisionEmbedder:
         for modality, items in plan.misses_by_modality.items():
             if not items:
                 continue
-
             spec = encoders.get(modality)
             if spec is None:
                 raise RuntimeError(
@@ -546,32 +386,17 @@ class VisionEmbedder:
             )
             output = output.reshape(-1, output.shape[-1])
 
-            output_rows = int(output.shape[0])
-            cursor = 0
-            per_item_lens = [] if LOG_MM_TIMING else None
-            for item in items:
-                n_tokens = _item_token_count(item)
-                if per_item_lens is not None:
-                    per_item_lens.append(n_tokens)
-                next_cursor = cursor + n_tokens
-                if next_cursor > output_rows:
-                    raise RuntimeError(
-                        "VisionEmbedder encoder output is shorter than "
-                        f"planned tokens for {modality}: needed "
-                        f"{next_cursor}, got {output_rows}"
-                    )
-                item.encoded = output[cursor:next_cursor]
-                if spec.deepstack:
-                    item.encoded, item.encoded_deepstack = (
-                        multimodal_model.separate_deepstack_embeds(item.encoded)
-                    )
-                cursor = next_cursor
-            if cursor != output_rows:
-                raise RuntimeError(
-                    "VisionEmbedder encoder output token count does not match "
-                    f"planned tokens for {modality}: planned {cursor}, "
-                    f"got {output_rows}"
-                )
+            per_item_lens = [_item_token_count(it) for it in items]
+            per_item_embs = torch.split(output, per_item_lens, dim=0)
+
+            if spec.deepstack:
+                for item, emb in zip(items, per_item_embs):
+                    main, deep = multimodal_model.separate_deepstack_embeds(emb)
+                    item.encoded = main
+                    item.encoded_deepstack = deep
+            else:
+                for item, emb in zip(items, per_item_embs):
+                    item.encoded = emb
             if LOG_MM_TIMING:
                 logger.info(
                     "mm_timing encoder_ms modality=%s items=%d "
@@ -607,47 +432,24 @@ class VisionEmbedder:
         encoders: dict[Modality, EncoderSpec],
         multimodal_model: nn.Module,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
-        # Placeholder positions may hold content-derived IDs beyond vocab_size.
-        # Clamp them for the lookup; vision rows are overwritten below.
-        scatter_ranges = _coalesced_scatter_ranges(plan.scatter_ranges)
-        vocab_size = getattr(text_embedding, "num_embeddings")
-        input_embeds = text_embedding(input_ids.clamp(min=0, max=int(vocab_size) - 1))
+        # Placeholder positions hold large content-derived IDs that exceed
+        # vocab_size; the lookup we run here is overwritten for those rows
+        # by the scatter below, but the lookup still needs valid indices.
+        vocab_size = text_embedding.num_embeddings
+        safe_ids = input_ids.clamp(min=0, max=vocab_size - 1)
+        input_embeds = text_embedding(safe_ids)
 
-        has_deepstack = any(spec.deepstack for spec in encoders.values())
-        visual_ranges = None
-        text_spans = None
-        if has_deepstack and input_ids.dim() == 1:
-            input_rows = int(input_ids.shape[0])
-            visual_ranges = _merged_visual_ranges(
-                scatter_ranges,
-                input_rows,
-            )
-            if visual_ranges:
-                text_spans = _text_token_spans(input_rows, visual_ranges)
         kwargs: dict[str, Any] = {}
         deepstack_buffer: torch.Tensor | None = None
-        deepstack_buffer_is_direct = False
-        if has_deepstack:
+        if any(spec.deepstack for spec in encoders.values()):
             num_deepstack = len(multimodal_model.deepstack_visual_indexes)
-            deepstack_buffer = _dense_deepstack_view_for_full_visual_chunk(
-                scatter_ranges,
-                int(input_embeds.shape[0]) if input_embeds.dim() == 2 else 0,
-                expected_width=int(input_embeds.shape[-1]) * num_deepstack,
-                dtype=input_embeds.dtype,
-                device=input_embeds.device,
+            shape = input_embeds.shape[:-1] + (input_embeds.shape[-1] * num_deepstack,)
+            deepstack_buffer = torch.zeros(
+                shape, dtype=input_embeds.dtype, device=input_embeds.device
             )
-            deepstack_buffer_is_direct = deepstack_buffer is not None
-            if deepstack_buffer is None:
-                deepstack_buffer = _allocate_deepstack_buffer(
-                    input_embeds,
-                    num_deepstack,
-                    scatter_ranges,
-                    visual_ranges,
-                    text_spans,
-                )
             kwargs["input_deepstack_embeds"] = deepstack_buffer
 
-        for r in scatter_ranges:
+        for r in plan.scatter_ranges:
             main = r.item.encoded
             if main is None:
                 raise RuntimeError(
@@ -655,28 +457,17 @@ class VisionEmbedder:
                     "encoded tensor after _encode; this is a bug"
                 )
             src = main[r.item_src_start : r.item_src_end + 1]
-            input_embeds[r.flat_dst_start : r.flat_dst_end + 1] = _ensure_tensor_layout(
-                src,
-                dtype=input_embeds.dtype,
-                device=input_embeds.device,
+            input_embeds[r.flat_dst_start : r.flat_dst_end + 1] = src.to(
+                dtype=input_embeds.dtype, device=input_embeds.device
             )
 
-            if deepstack_buffer_is_direct:
-                continue
-
             if deepstack_buffer is not None and r.item.encoded_deepstack is not None:
-                deep_src = r.item.encoded_deepstack
-                deep_dst = deepstack_buffer[r.flat_dst_start : r.flat_dst_end + 1]
-                _copy_deepstack_rows(
-                    deep_dst,
-                    deep_src,
-                    dtype=input_embeds.dtype,
-                    device=input_embeds.device,
-                    src_start=r.item_src_start,
-                    src_end=r.item_src_end + 1,
+                deep_src = r.item.encoded_deepstack[
+                    r.item_src_start : r.item_src_end + 1
+                ]
+                deepstack_buffer[r.flat_dst_start : r.flat_dst_end + 1] = deep_src.to(
+                    dtype=input_embeds.dtype, device=input_embeds.device
                 )
-            elif deepstack_buffer is not None:
-                deepstack_buffer[r.flat_dst_start : r.flat_dst_end + 1].zero_()
 
         return input_embeds, kwargs
 

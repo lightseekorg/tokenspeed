@@ -104,8 +104,6 @@ class EncoderCudaGraphAdapter(Protocol):
         batch: EncoderCudaGraphBatch,
         encoder_output_token_budget: int | None,
         metadata_sequence_budget: int,
-        *,
-        pad_cu_seqlens: bool = True,
     ) -> dict[str, Any]: ...
 
     def forward(
@@ -133,7 +131,6 @@ class VisionEncoderBatch:
     tokens: torch.Tensor
     grid: torch.Tensor
     out_div: int
-    grid_rows: list[list[int]] | None = None
 
     @property
     def input_tensors(self) -> dict[str, torch.Tensor]:
@@ -141,8 +138,6 @@ class VisionEncoderBatch:
 
     @cached_property
     def _grid_rows(self) -> list[list[int]]:
-        if self.grid_rows is not None:
-            return self.grid_rows
         return self.grid.tolist()
 
     def num_items(self) -> int:
@@ -167,55 +162,15 @@ class VisionEncoderBatch:
         """Sub-batch at ``indices``, preserving order."""
         cu = self.cu_input
         if indices:
-            if len(indices) == 1:
-                item_idx = indices[0]
-                tokens = self.tokens[cu[item_idx] : cu[item_idx + 1]]
-                grid = self.grid[item_idx : item_idx + 1]
-            elif _is_contiguous(indices):
-                start_idx = indices[0]
-                end_idx = indices[-1] + 1
-                tokens = self.tokens[cu[start_idx] : cu[end_idx]]
-                grid = self.grid[start_idx:end_idx]
-            else:
-                total_rows = sum(cu[i + 1] - cu[i] for i in indices)
-                if total_rows <= 8192:
-                    rows = _small_row_indices_from_cu(cu, indices, self.tokens.device)
-                else:
-                    rows = torch.cat(
-                        [
-                            torch.arange(cu[i], cu[i + 1], device=self.tokens.device)
-                            for i in indices
-                        ]
-                    )
-                tokens = self.tokens.index_select(0, rows)
-                grid_indices = torch.as_tensor(
-                    indices,
-                    dtype=torch.long,
-                    device=self.grid.device,
-                )
-                grid = self.grid.index_select(0, grid_indices)
+            rows = torch.cat(
+                [
+                    torch.arange(cu[i], cu[i + 1], device=self.tokens.device)
+                    for i in indices
+                ]
+            )
         else:
-            tokens = self.tokens[:0]
-            grid = self.grid[:0]
-        grid_rows = None
-        if self.grid_rows is not None:
-            grid_rows = [self.grid_rows[i] for i in indices]
-        return VisionEncoderBatch(tokens, grid, self.out_div, grid_rows)
-
-
-def _is_contiguous(indices: list[int]) -> bool:
-    return all(curr == prev + 1 for prev, curr in zip(indices, indices[1:]))
-
-
-def _small_row_indices_from_cu(
-    cu: list[int],
-    indices: list[int],
-    device: torch.device,
-) -> torch.Tensor:
-    rows: list[int] = []
-    for i in indices:
-        rows.extend(range(cu[i], cu[i + 1]))
-    return torch.tensor(rows, dtype=torch.long, device=device)
+            rows = torch.zeros(0, dtype=torch.long, device=self.tokens.device)
+        return VisionEncoderBatch(self.tokens[rows], self.grid[indices], self.out_div)
 
 
 @dataclass
@@ -223,11 +178,7 @@ class VisionEncoderCudaGraphAdapter:
     """Adapter for Qwen/Kimi-style ``grid_thw`` vision encoders."""
 
     tower: Any
-    pre_encode: Callable[
-        [list[Any]],
-        tuple[torch.Tensor, torch.Tensor]
-        | tuple[torch.Tensor, torch.Tensor, list[list[int]]],
-    ]
+    pre_encode: Callable[[list[Any]], tuple[torch.Tensor, torch.Tensor]]
     post_encode: Callable[[list[torch.Tensor], torch.Tensor], torch.Tensor]
     out_div: int
     merge: int
@@ -258,9 +209,10 @@ class VisionEncoderCudaGraphAdapter:
         b = units // a
         return [[1, a * self.merge, b * self.merge]]
 
-    def _checked_cu_seqlens_target(
-        self, cu: torch.Tensor, metadata_sequence_budget: int
-    ) -> int:
+    def pad_cu_seqlens(
+        self, metadata: dict[str, Any], metadata_sequence_budget: int
+    ) -> None:
+        cu = metadata["cu_seqlens"]
         target = metadata_sequence_budget + 1
         if cu.shape[0] > target:
             raise RuntimeError(
@@ -268,25 +220,13 @@ class VisionEncoderCudaGraphAdapter:
                 f"metadata sequences, but the configured limit is "
                 f"{metadata_sequence_budget}"
             )
-        return target
-
-    def pad_cu_seqlens(
-        self, metadata: dict[str, Any], metadata_sequence_budget: int
-    ) -> None:
-        cu = metadata["cu_seqlens"]
-        target = self._checked_cu_seqlens_target(cu, metadata_sequence_budget)
         pad = target - cu.shape[0]
         if pad > 0:
             metadata["cu_seqlens"] = torch.cat([cu, cu[-1:].expand(pad)])
 
     def batch_from_items(self, items: list[Any]) -> VisionEncoderBatch:
-        pre_encoded = self.pre_encode(items)
-        if len(pre_encoded) == 3:
-            tokens, grid, grid_rows = pre_encoded
-        else:
-            tokens, grid = pre_encoded
-            grid_rows = None
-        return VisionEncoderBatch(tokens, grid, self.out_div, grid_rows)
+        tokens, grid = self.pre_encode(items)
+        return VisionEncoderBatch(tokens, grid, self.out_div)
 
     def capture_batch_for_budget(
         self,
@@ -313,23 +253,15 @@ class VisionEncoderCudaGraphAdapter:
         batch: EncoderCudaGraphBatch,
         encoder_output_token_budget: int | None,
         metadata_sequence_budget: int,
-        *,
-        pad_cu_seqlens: bool = True,
     ) -> dict[str, Any]:
         if not isinstance(batch, VisionEncoderBatch):
             raise TypeError(
                 f"{self.modality_name} encoder cudagraph expected "
                 f"VisionEncoderBatch, got {type(batch).__name__}"
             )
-        metadata_grid = batch._grid_rows if batch.grid_rows is not None else batch.grid
-        metadata = dict(self.tower.prepare_metadata(metadata_grid))
+        metadata = dict(self.tower.prepare_metadata(batch.grid))
         if encoder_output_token_budget is not None:
-            if pad_cu_seqlens:
-                self.pad_cu_seqlens(metadata, metadata_sequence_budget)
-            else:
-                self._checked_cu_seqlens_target(
-                    metadata["cu_seqlens"], metadata_sequence_budget
-                )
+            self.pad_cu_seqlens(metadata, metadata_sequence_budget)
             # Non-tensor scalar gets baked at capture. Use the per-budget worst
             # case so replay never exceeds the captured attention max seqlen.
             metadata["max_seqlen"] = encoder_output_token_budget * self.out_div
@@ -542,80 +474,6 @@ class EncoderCudaGraphWrapper:
             dest[idx] = sliced.clone() if clone else sliced
             offset += n_tokens
 
-    @staticmethod
-    def _scatter_cloned_output_slices(
-        output: torch.Tensor,
-        indices: list[int],
-        per_item_encoder_output_tokens: list[int],
-        dest: dict[int, torch.Tensor],
-    ) -> None:
-        """Clone one compact sub-batch output, then scatter views by item.
-
-        Captured graph outputs live in a reusable output buffer. Cloning each
-        item slice separately creates many small GPU copies under high
-        concurrency; one contiguous clone per replay keeps item tensors stable
-        without changing values.
-        """
-        owned = EncoderCudaGraphWrapper._clone_compact_output(
-            output,
-            indices,
-            per_item_encoder_output_tokens,
-        )
-        EncoderCudaGraphWrapper._scatter_output_slices(
-            owned,
-            indices,
-            per_item_encoder_output_tokens,
-            dest,
-        )
-
-    @staticmethod
-    def _clone_compact_output(
-        output: torch.Tensor,
-        indices: list[int],
-        per_item_encoder_output_tokens: list[int],
-    ) -> torch.Tensor:
-        actual_tokens = sum(per_item_encoder_output_tokens[idx] for idx in indices)
-        return output[:actual_tokens].clone()
-
-    @staticmethod
-    def _sorted_indices_by_encoder_output_tokens(
-        per_item_encoder_output_tokens: list[int],
-    ) -> list[int]:
-        if len(per_item_encoder_output_tokens) <= 1:
-            return list(range(len(per_item_encoder_output_tokens)))
-        if all(
-            prev <= curr
-            for prev, curr in zip(
-                per_item_encoder_output_tokens,
-                per_item_encoder_output_tokens[1:],
-            )
-        ):
-            return list(range(len(per_item_encoder_output_tokens)))
-        return sorted(
-            range(len(per_item_encoder_output_tokens)),
-            key=lambda i: per_item_encoder_output_tokens[i],
-        )
-
-    @staticmethod
-    def _copy_prefix_zero_tail(buf: torch.Tensor, src: torch.Tensor) -> None:
-        n = src.shape[0]
-        if n == buf.shape[0]:
-            buf.copy_(src)
-            return
-        buf[:n].copy_(src)
-        buf[n:].zero_()
-
-    @staticmethod
-    def _copy_prefix_repeat_last_tail(buf: torch.Tensor, src: torch.Tensor) -> None:
-        n = src.shape[0]
-        if n == 0:
-            raise RuntimeError("cannot repeat the last row from an empty tensor")
-        if n == buf.shape[0]:
-            buf.copy_(src)
-            return
-        buf[:n].copy_(src)
-        buf[n:].copy_(src[-1:].expand_as(buf[n:]))
-
     def _run_budget_graph(
         self,
         batch: EncoderCudaGraphBatch,
@@ -652,14 +510,12 @@ class EncoderCudaGraphWrapper:
                     f"shape changed after dim0: capture={tuple(buf.shape)}, "
                     f"replay={tuple(src.shape)}"
                 )
-            self._copy_prefix_zero_tail(buf, src)
+            buf.zero_()
+            buf[:n].copy_(src)
 
         metadata = dict(
             self.adapter.prepare_metadata(
-                batch,
-                encoder_output_token_budget,
-                metadata_sequence_budget,
-                pad_cu_seqlens=False,
+                batch, encoder_output_token_budget, metadata_sequence_budget
             )
         )
         replay_buffers = {
@@ -690,10 +546,8 @@ class EncoderCudaGraphWrapper:
                         f"has {new.shape[0]} rows, but the captured buffer only "
                         f"has {buf.shape[0]} rows"
                     )
-                if key == "cu_seqlens":
-                    self._copy_prefix_repeat_last_tail(buf, new)
-                else:
-                    self._copy_prefix_zero_tail(buf, new)
+                buf.zero_()
+                buf[: new.shape[0]].copy_(new)
 
         graph_meta.graph.replay()
         return graph_meta.output_buffer
@@ -716,10 +570,9 @@ class EncoderCudaGraphWrapper:
         per_item_encoder_output_tokens = batch.encoder_output_tokens
         per_item_metadata_sequences = batch.metadata_sequences
 
-        sorted_indices = self._sorted_indices_by_encoder_output_tokens(
-            per_item_encoder_output_tokens
+        sorted_indices = sorted(
+            range(num_items), key=lambda i: per_item_encoder_output_tokens[i]
         )
-        preserve_batch_chunks = sorted_indices == list(range(num_items))
 
         batches: list[tuple[list[int], int | None]] = []
         current_batch: list[int] = []
@@ -764,42 +617,27 @@ class EncoderCudaGraphWrapper:
             )
 
         # Packing reorders; restore original order before return.
-        ordered_outputs: list[torch.Tensor] = []
         outputs_by_orig_idx: dict[int, torch.Tensor] = {}
         for batch_orig_indices, encoder_output_token_budget in batches:
             sub_batch = batch.select(batch_orig_indices)
             if encoder_output_token_budget is None:
                 with torch.inference_mode():
                     raw = self._run_eager(sub_batch)
-                if preserve_batch_chunks:
-                    ordered_outputs.append(raw)
-                else:
-                    self._scatter_output_slices(
-                        raw,
-                        batch_orig_indices,
-                        per_item_encoder_output_tokens,
-                        outputs_by_orig_idx,
-                    )
+                self._scatter_output_slices(
+                    raw,
+                    batch_orig_indices,
+                    per_item_encoder_output_tokens,
+                    outputs_by_orig_idx,
+                )
             else:
                 output = self._run_budget_graph(sub_batch, encoder_output_token_budget)
-                # output is the shared, reused output_buffer; clone once per
-                # replay and scatter views out of the owned compact tensor.
-                if preserve_batch_chunks:
-                    ordered_outputs.append(
-                        self._clone_compact_output(
-                            output,
-                            batch_orig_indices,
-                            per_item_encoder_output_tokens,
-                        )
-                    )
-                else:
-                    self._scatter_cloned_output_slices(
-                        output,
-                        batch_orig_indices,
-                        per_item_encoder_output_tokens,
-                        outputs_by_orig_idx,
-                    )
+                # clone: output is the shared, reused output_buffer.
+                self._scatter_output_slices(
+                    output,
+                    batch_orig_indices,
+                    per_item_encoder_output_tokens,
+                    outputs_by_orig_idx,
+                    clone=True,
+                )
 
-        if preserve_batch_chunks:
-            return ordered_outputs
         return [outputs_by_orig_idx[i] for i in range(num_items)]
