@@ -58,6 +58,8 @@ def _fused_norm_rope_scatter_kernel(
     loc_ptr,  # [total_ctx] — scatter destination slot indices
     k_buf_ptrs_ptr,  # [n_layers] — data_ptr per layer
     v_buf_ptrs_ptr,  # [n_layers] — data_ptr per layer
+    inv_k_scale_ptr,  # [n_layers] float32 or dummy when USE_PROVIDED_SCALE=False
+    inv_v_scale_ptr,  # [n_layers] float32 or dummy when USE_PROVIDED_SCALE=False
     kv_stride_ctx,
     kv_stride_layer,
     k_norm_weight_stride_layer,
@@ -71,6 +73,8 @@ def _fused_norm_rope_scatter_kernel(
     rotary_dim: tl.constexpr,
     half_rotary_dim: tl.constexpr,
     BLOCK_HD: tl.constexpr,
+    IS_FP8: tl.constexpr,
+    USE_PROVIDED_SCALE: tl.constexpr,
 ):
     """Fused RMSNorm(K) + RoPE(K) + scatter to KV pool. Grid: (total_ctx, num_kv_heads, n_layers)."""
     ctx_id = tl.program_id(0)
@@ -87,10 +91,21 @@ def _fused_norm_rope_scatter_kernel(
     k_base = kv_base + head_id * head_dim
     v_base = kv_base + kv_size + head_id * head_dim
 
-    k_buf_ptr = tl.load(k_buf_ptrs_ptr + layer_id).to(tl.pointer_type(tl.bfloat16))
-    v_buf_ptr = tl.load(v_buf_ptrs_ptr + layer_id).to(tl.pointer_type(tl.bfloat16))
+    if IS_FP8:
+        k_buf_ptr = tl.load(k_buf_ptrs_ptr + layer_id).to(tl.pointer_type(tl.float8e4nv))
+        v_buf_ptr = tl.load(v_buf_ptrs_ptr + layer_id).to(tl.pointer_type(tl.float8e4nv))
+    else:
+        k_buf_ptr = tl.load(k_buf_ptrs_ptr + layer_id).to(tl.pointer_type(tl.bfloat16))
+        v_buf_ptr = tl.load(v_buf_ptrs_ptr + layer_id).to(tl.pointer_type(tl.bfloat16))
     k_write = k_buf_ptr + dst_slot * dst_row_stride + head_id * head_dim
     v_write = v_buf_ptr + dst_slot * dst_row_stride + head_id * head_dim
+
+    if USE_PROVIDED_SCALE:
+        inv_k_scale = tl.load(inv_k_scale_ptr + layer_id).to(tl.float32)
+        inv_v_scale = tl.load(inv_v_scale_ptr + layer_id).to(tl.float32)
+    else:
+        inv_k_scale = 1.0
+        inv_v_scale = 1.0
 
     offs = tl.arange(0, BLOCK_HD)
     mask_hd = offs < head_dim
@@ -130,13 +145,22 @@ def _fused_norm_rope_scatter_kernel(
     k_rot_first = k_first * cos_v - k_second * sin_v
     k_rot_second = k_second * cos_v + k_first * sin_v
 
-    tl.store(v_write + offs, v_raw, mask=mask_hd)
-    tl.store(k_write + offs, k_rot_first.to(v_raw.dtype), mask=mask_half)
-    tl.store(
-        k_write + half_rotary_dim + offs, k_rot_second.to(v_raw.dtype), mask=mask_half
-    )
+    if IS_FP8:
+        v_out = (v_raw.to(tl.float32) * inv_v_scale).to(tl.float8e4nv)
+        k_first_out = (k_rot_first * inv_k_scale).to(tl.float8e4nv)
+        k_second_out = (k_rot_second * inv_k_scale).to(tl.float8e4nv)
+        k_pass_out = (k_normed * inv_k_scale).to(tl.float8e4nv)
+    else:
+        v_out = v_raw
+        k_first_out = k_rot_first.to(v_raw.dtype)
+        k_second_out = k_rot_second.to(v_raw.dtype)
+        k_pass_out = k_normed.to(v_raw.dtype)
+
+    tl.store(v_write + offs, v_out, mask=mask_hd)
+    tl.store(k_write + offs, k_first_out, mask=mask_half)
+    tl.store(k_write + half_rotary_dim + offs, k_second_out, mask=mask_half)
     mask_pass = (offs >= rotary_dim) & (offs < head_dim)
-    tl.store(k_write + offs, k_normed.to(v_raw.dtype), mask=mask_pass)
+    tl.store(k_write + offs, k_pass_out, mask=mask_pass)
 
 
 def _fused_norm_rope_stacked_scatter(
@@ -151,8 +175,17 @@ def _fused_norm_rope_stacked_scatter(
     num_kv_heads: int,
     head_dim: int,
     rotary_dim: int,
+    inv_k_scales: Optional[torch.Tensor] = None,
+    inv_v_scales: Optional[torch.Tensor] = None,
 ) -> None:
-    """Fused RMSNorm + RoPE + scatter into KV pool for all layers in one launch."""
+    """Fused RMSNorm + RoPE + scatter into KV pool for all layers in one launch.
+
+    When ``k_buffers[0].dtype`` is ``torch.float8_e4m3fn`` the kernel quantizes
+    K and V to FP8 before the scatter store. If ``inv_k_scales`` and
+    ``inv_v_scales`` are provided (per-layer float32 tensors of shape [n_layers]),
+    values are multiplied by the inverse scale prior to FP8 conversion; otherwise
+    a scale of 1.0 is used.
+    """
     if kv.ndim != 3:
         raise ValueError(
             f"Expected 3D kv [total_ctx, n_layers, kv_size*2], got {tuple(kv.shape)}."
@@ -167,6 +200,16 @@ def _fused_norm_rope_stacked_scatter(
     k_ptrs, v_ptrs = _get_kv_buffer_ptrs(k_buffers, v_buffers)
     dst_row_stride = k_buffers[0].stride(0)
 
+    is_fp8 = k_buffers[0].dtype == torch.float8_e4m3fn
+    use_provided_scale = inv_k_scales is not None and inv_v_scales is not None
+    if use_provided_scale:
+        inv_k_arg = inv_k_scales
+        inv_v_arg = inv_v_scales
+    else:
+        # Dummy pointer; kernel does not dereference when USE_PROVIDED_SCALE=False.
+        inv_k_arg = eps
+        inv_v_arg = eps
+
     _fused_norm_rope_scatter_kernel[(total_ctx, num_kv_heads, n_layers)](
         kv,
         k_norm_weight,
@@ -176,6 +219,8 @@ def _fused_norm_rope_stacked_scatter(
         loc,
         k_ptrs,
         v_ptrs,
+        inv_k_arg,
+        inv_v_arg,
         kv.stride(0),
         kv.stride(1),
         k_norm_weight.stride(0),
@@ -189,6 +234,8 @@ def _fused_norm_rope_stacked_scatter(
         rotary_dim,
         half_rotary_dim,
         BLOCK_HD,
+        is_fp8,
+        use_provided_scale,
     )
 
 

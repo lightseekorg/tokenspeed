@@ -71,7 +71,7 @@ class MHAConfig(BaseAttnConfig):
         draft_block_decode = bool(
             is_draft and server_args.speculative_algorithm == "DFLASH"
         )
-        if draft_block_decode:
+        if draft_block_decode and server_args.drafter_attention_backend != "trtllm":
             kv_cache_dtype = "bfloat16"
 
         hf_config = getattr(model_config, "hf_config", None)
