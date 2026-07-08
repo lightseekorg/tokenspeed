@@ -17,12 +17,15 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from ci_system.ci_register import register_cuda_ci
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.model_executor import (
     _draft_idle_global_num_tokens_for_step,
 )
 from tokenspeed.runtime.models.deepseek_v4 import _deepseek_v4_swa_slot_mapping
+
+register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 
 def test_deepseek_v4_swa_slot_mapping_expands_mtp_decode_requests():
