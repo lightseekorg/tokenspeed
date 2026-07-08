@@ -97,6 +97,7 @@ def _build_case(
     scale2 = torch.ones((1,), device=device, dtype=torch.float32)
 
     layer = torch.nn.Module()
+    layer.w13_input_layout = "interleaved"
     layer.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
     layer.w13_weight_scale = torch.nn.Parameter(s13, requires_grad=False)
     layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)

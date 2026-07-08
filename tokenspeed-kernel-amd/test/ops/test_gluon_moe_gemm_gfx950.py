@@ -1100,7 +1100,9 @@ def test_renormalize_route_recovers_packed_topk_without_scaling_gfx950(
         dtype=torch.int32,
     )
     topk_weights = torch.tensor(topk_weights, device=device, dtype=torch.float32)
-    expected_weights = torch.tensor(expected_weights, device=device, dtype=torch.float32)
+    expected_weights = torch.tensor(
+        expected_weights, device=device, dtype=torch.float32
+    )
     router_logits = torch.full((2, 8), -1e20, device=device, dtype=torch.float32)
     router_logits.scatter_(1, topk_ids.long(), topk_weights.log())
     correction_bias = torch.linspace(-4.0, 4.0, 8, device=device, dtype=torch.float32)
