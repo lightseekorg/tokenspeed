@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Correctness-first DSA top-k Gluon kernels for AMD GFX950."""
+"""DSA top-k Gluon kernels for AMD GFX950."""
 
 from __future__ import annotations
 
@@ -38,6 +38,185 @@ def _vector_layout(
     LOAD_ELEMS: gl.constexpr,
 ):
     return gl.BlockedLayout([LOAD_ELEMS], [64], [NUM_WARPS], [0])
+
+
+@gluon.jit
+def _fp32_to_ordered_key(x):
+    bits = x.to(gl.uint32, bitcast=True)
+    sign = bits & 0x80000000
+    return bits ^ gl.where(sign != 0, 0xFFFFFFFF, 0x80000000)
+
+
+@gluon.jit
+def _topk_add(a, b):
+    return a + b
+
+
+@gluon.jit
+def _find_topk_threshold_key(
+    values,
+    valid,
+    topk: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    layout: gl.constexpr,
+):
+    keys = _fp32_to_ordered_key(values)
+    prefix = gl.full((), 0, dtype=gl.uint32)
+    remaining = gl.full((), topk, dtype=gl.int32)
+
+    for shift in gl.static_range(28, -1, -4):
+        if shift == 28:
+            prefix_match = valid
+        else:
+            prefix_match = valid & ((keys >> (shift + 4)) == prefix)
+        bucket = (keys >> shift) & 0xF
+        cumulative = gl.full((), 0, dtype=gl.int32)
+        selected = gl.full((), 0, dtype=gl.uint32)
+        selected_remaining = remaining
+        found = gl.full((), 0, dtype=gl.int32)
+
+        for bucket_id in gl.static_range(15, -1, -1):
+            in_bucket = prefix_match & (bucket == bucket_id)
+            count = gl.sum(
+                gl.where(
+                    in_bucket,
+                    gl.full([BLOCK_N], 1, gl.int32, layout=layout),
+                    gl.full([BLOCK_N], 0, gl.int32, layout=layout),
+                ),
+                axis=0,
+            ).to(gl.int32)
+            take = (found == 0) & (remaining <= cumulative + count)
+            selected = gl.where(take, bucket_id, selected)
+            selected_remaining = gl.where(
+                take, remaining - cumulative, selected_remaining
+            )
+            cumulative += gl.where(found == 0, count, 0)
+            found = gl.where(take, 1, found)
+
+        prefix = (prefix << 4) | selected
+        remaining = selected_remaining
+
+    return prefix
+
+
+@gluon.jit
+def _dsa_decode_select_topk_kernel(
+    logits,
+    block_table,
+    seq_lens,
+    out,
+    lens_out,
+    logits_stride: gl.constexpr,
+    block_table_stride: gl.constexpr,
+    out_stride: gl.constexpr,
+    block_table_cols: gl.constexpr,
+    page_size: gl.constexpr,
+    topk: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    LOAD_ELEMS: gl.constexpr,
+    TOPK_LOAD_ELEMS: gl.constexpr,
+):
+    row = gl.program_id(0)
+    layout: gl.constexpr = _vector_layout(BLOCK_N, gl.num_warps(), LOAD_ELEMS)
+    topk_layout: gl.constexpr = _vector_layout(topk, gl.num_warps(), TOPK_LOAD_ELEMS)
+    offsets = gl.arange(0, BLOCK_N, layout=layout)
+    top_offsets = gl.arange(0, topk, layout=topk_layout)
+    seq_len = gl.load(seq_lens + row).to(gl.int32)
+    lens = gl.minimum(seq_len, topk).to(gl.int32)
+    gl.store(lens_out + row, lens)
+    gl.store(out + row * out_stride + top_offsets, -1)
+
+    if seq_len <= topk:
+        valid_top = top_offsets < seq_len
+        local = top_offsets.to(gl.int32)
+        block_idx = local // page_size
+        block_offset = local - block_idx * page_size
+        page = gl.load(
+            block_table + row * block_table_stride + block_idx,
+            mask=valid_top & (block_idx < block_table_cols),
+            other=0,
+        ).to(gl.int32)
+        slots = page * page_size + block_offset
+        gl.store(
+            out + row * out_stride + top_offsets,
+            gl.where(valid_top, slots, -1),
+            mask=top_offsets < topk,
+        )
+        return
+
+    valid = offsets < seq_len
+    values = gl.load(
+        logits + row * logits_stride + offsets,
+        mask=valid,
+        other=-float("inf"),
+    )
+    threshold = _find_topk_threshold_key(values, valid, topk, BLOCK_N, layout)
+    keys = _fp32_to_ordered_key(values)
+    selected = valid & (keys >= threshold)
+    selected_i32 = selected.to(gl.int32)
+    selected_pos = gl.associative_scan(selected_i32, 0, _topk_add) - 1
+    write = selected & (selected_pos < topk)
+    local = offsets.to(gl.int32)
+    block_idx = local // page_size
+    block_offset = local - block_idx * page_size
+    page = gl.load(
+        block_table + row * block_table_stride + block_idx,
+        mask=write & (block_idx < block_table_cols),
+        other=0,
+    ).to(gl.int32)
+    slots = page * page_size + block_offset
+    gl.store(out + row * out_stride + selected_pos, slots, mask=write)
+
+
+@gluon.jit
+def _dsa_prefill_select_topk_kernel(
+    logits,
+    row_starts,
+    row_ends,
+    out,
+    lens_out,
+    logits_stride: gl.constexpr,
+    out_stride: gl.constexpr,
+    topk: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    LOAD_ELEMS: gl.constexpr,
+    TOPK_LOAD_ELEMS: gl.constexpr,
+):
+    row = gl.program_id(0)
+    layout: gl.constexpr = _vector_layout(BLOCK_N, gl.num_warps(), LOAD_ELEMS)
+    topk_layout: gl.constexpr = _vector_layout(topk, gl.num_warps(), TOPK_LOAD_ELEMS)
+    offsets = gl.arange(0, BLOCK_N, layout=layout)
+    top_offsets = gl.arange(0, topk, layout=topk_layout)
+    row_start = gl.load(row_starts + row).to(gl.int32)
+    row_end = gl.load(row_ends + row).to(gl.int32)
+    candidate_len = gl.maximum(row_end - row_start, 0)
+    lens = gl.minimum(candidate_len, topk).to(gl.int32)
+    gl.store(lens_out + row, lens)
+    gl.store(out + row * out_stride + top_offsets, -1)
+
+    if candidate_len <= topk:
+        local = row_start + top_offsets.to(gl.int32)
+        valid_top = top_offsets < candidate_len
+        gl.store(
+            out + row * out_stride + top_offsets,
+            gl.where(valid_top, local, -1),
+            mask=top_offsets < topk,
+        )
+        return
+
+    valid = (offsets >= row_start) & (offsets < row_end)
+    values = gl.load(
+        logits + row * logits_stride + offsets,
+        mask=valid,
+        other=-float("inf"),
+    )
+    threshold = _find_topk_threshold_key(values, valid, topk, BLOCK_N, layout)
+    keys = _fp32_to_ordered_key(values)
+    selected = valid & (keys >= threshold)
+    selected_i32 = selected.to(gl.int32)
+    selected_pos = gl.associative_scan(selected_i32, 0, _topk_add) - 1
+    write = selected & (selected_pos < topk)
+    gl.store(out + row * out_stride + selected_pos, offsets.to(gl.int32), mask=write)
 
 
 @gluon.jit
@@ -236,63 +415,21 @@ def _check_packed_fp8_inputs(
     return row_bytes
 
 
-def _topk_with_padding(logits: torch.Tensor, topk: int) -> torch.Tensor:
-    topk = int(topk)
+def _next_power_of_2(value: int) -> int:
+    if value <= 1:
+        return 1
+    return 1 << (int(value) - 1).bit_length()
+
+
+def _load_elems(block: int, num_warps: int) -> int:
+    return max(1, triton.cdiv(int(block), 64 * int(num_warps)))
+
+
+def _validate_topk(topk: int) -> None:
     if topk <= 0:
         raise ValueError(f"topk must be positive, got {topk}")
-    out = torch.full(
-        (logits.shape[0], topk), -1, device=logits.device, dtype=torch.int32
-    )
-    count = min(topk, logits.shape[1])
-    if count == 0:
-        return out
-    out[:, :count].copy_(torch.topk(logits, count, dim=1).indices.to(torch.int32))
-    return out
-
-
-def _local_topk_to_global_slots(
-    local_topk_offsets: torch.Tensor,
-    block_table: torch.Tensor,
-    seq_lens: torch.Tensor,
-    *,
-    page_size: int,
-    out: torch.Tensor | None = None,
-    lens_out: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    tokens, topk = local_topk_offsets.shape
-    if out is None:
-        out = torch.empty_like(local_topk_offsets)
-    if lens_out is None:
-        lens_out = torch.empty(
-            (tokens,), dtype=torch.int32, device=local_topk_offsets.device
-        )
-    seq_lens = seq_lens.to(device=local_topk_offsets.device, dtype=torch.int32)
-    block_table = block_table.to(device=local_topk_offsets.device, dtype=torch.int32)
-    lens_out.copy_(torch.minimum(seq_lens, torch.full_like(seq_lens, int(topk))))
-
-    local = local_topk_offsets.to(torch.int64)
-    valid = (local >= 0) & (local < seq_lens[:, None].to(torch.int64))
-    safe_local = torch.where(valid, local, torch.zeros_like(local))
-    block_idx = torch.div(safe_local, int(page_size), rounding_mode="floor")
-    block_idx = block_idx.clamp(max=block_table.shape[1] - 1)
-    pages = torch.gather(block_table.to(torch.int64), 1, block_idx)
-    slots = pages * int(page_size) + safe_local.remainder(int(page_size))
-    out.copy_(torch.where(valid, slots.to(torch.int32), torch.full_like(out, -1)))
-    return out, lens_out
-
-
-def _workspace_topk_filter(
-    workspace_indices: torch.Tensor,
-    row_starts: torch.Tensor,
-    row_ends: torch.Tensor,
-    *,
-    out: torch.Tensor,
-) -> torch.Tensor:
-    valid = (workspace_indices >= row_starts[:, None]) & (
-        workspace_indices < row_ends[:, None]
-    )
-    out.copy_(torch.where(valid, workspace_indices, torch.full_like(out, -1)))
-    return out
+    if topk & (topk - 1):
+        raise ValueError(f"DSA Gluon top-k requires power-of-two topk, got {topk}")
 
 
 def gluon_dsa_decode_topk_fp8_gfx950(
@@ -311,6 +448,8 @@ def gluon_dsa_decode_topk_fp8_gfx950(
     lens_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     del plan, q_len_per_req
+    topk = int(topk)
+    _validate_topk(topk)
     if index_k_cache is None:
         raise RuntimeError("Gluon DSA paged top-k requires packed FP8 index_k_cache")
     row_bytes = _check_packed_fp8_inputs(q, index_k_cache, weights, int(page_size))
@@ -345,6 +484,10 @@ def gluon_dsa_decode_topk_fp8_gfx950(
     seq_lens = seq_lens.to(device=q.device, dtype=torch.int32).contiguous()
     block_table = block_table.to(device=q.device, dtype=torch.int32).contiguous()
     max_seq_len = int(block_table.shape[1]) * int(page_size)
+    if out is None:
+        out = torch.empty((q.shape[0], topk), dtype=torch.int32, device=q.device)
+    if lens_out is None:
+        lens_out = torch.empty((q.shape[0],), dtype=torch.int32, device=q.device)
     logits = torch.empty(
         (q.shape[0], max_seq_len), dtype=torch.float32, device=q.device
     )
@@ -369,15 +512,26 @@ def gluon_dsa_decode_topk_fp8_gfx950(
         BLOCK_N=block_n,
         num_warps=4,
     )
-    local_topk_offsets = _topk_with_padding(logits, int(topk))
-    return _local_topk_to_global_slots(
-        local_topk_offsets,
+    select_warps = 8
+    select_block = _next_power_of_2(max(max_seq_len, topk))
+    _dsa_decode_select_topk_kernel[(q.shape[0],)](
+        logits,
         block_table,
         seq_lens,
+        out,
+        lens_out,
+        logits.stride(0),
+        block_table.stride(0),
+        out.stride(0),
+        block_table.shape[1],
         page_size=int(page_size),
-        out=out,
-        lens_out=lens_out,
+        topk=topk,
+        BLOCK_N=select_block,
+        LOAD_ELEMS=_load_elems(select_block, select_warps),
+        TOPK_LOAD_ELEMS=_load_elems(topk, select_warps),
+        num_warps=select_warps,
     )
+    return out, lens_out
 
 
 def gluon_dsa_prefill_topk_fp8_gfx950(
@@ -398,6 +552,8 @@ def gluon_dsa_prefill_topk_fp8_gfx950(
     lens_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     del index_k_fp8, index_k_scale
+    topk = int(topk)
+    _validate_topk(topk)
     if index_k_cache is None or page_size is None:
         raise RuntimeError(
             "Gluon DSA top-k requires packed FP8 index_k_cache and page_size"
@@ -414,11 +570,9 @@ def gluon_dsa_prefill_topk_fp8_gfx950(
             f"q={tuple(q.shape)}"
         )
     if out is None:
-        out = torch.empty((q.shape[0], int(topk)), dtype=torch.int32, device=q.device)
+        out = torch.empty((q.shape[0], topk), dtype=torch.int32, device=q.device)
     if lens_out is None:
         lens_out = torch.empty((q.shape[0],), dtype=torch.int32, device=q.device)
-    out.fill_(-1)
-    lens_out.zero_()
     if q.shape[0] == 0:
         return out, lens_out
     if not q.is_cuda:
@@ -433,11 +587,9 @@ def gluon_dsa_prefill_topk_fp8_gfx950(
     row_starts = row_starts.to(device=q.device, dtype=torch.int32).contiguous()
     row_ends = row_ends.to(device=q.device, dtype=torch.int32).contiguous()
     seq_len_sum = int(kv_workspace_slots.numel())
-    candidate_lens = (row_ends - row_starts).clamp_min(0)
-    lens_out.copy_(
-        torch.minimum(candidate_lens, torch.full_like(candidate_lens, int(topk)))
-    )
     if seq_len_sum == 0:
+        out.fill_(-1)
+        lens_out.zero_()
         return out, lens_out
 
     if max_logits_bytes is None:
@@ -445,6 +597,8 @@ def gluon_dsa_prefill_topk_fp8_gfx950(
     else:
         max_query_rows = max(1, int(max_logits_bytes) // (max(seq_len_sum, 1) * 4))
     block_n = 64
+    select_warps = 8
+    select_block = _next_power_of_2(max(seq_len_sum, topk))
     for start in range(0, q.shape[0], max_query_rows):
         end = min(start + max_query_rows, q.shape[0])
         logits = torch.empty(
@@ -472,11 +626,18 @@ def gluon_dsa_prefill_topk_fp8_gfx950(
             BLOCK_N=block_n,
             num_warps=4,
         )
-        workspace_indices = _topk_with_padding(logits, int(topk))
-        _workspace_topk_filter(
-            workspace_indices,
+        _dsa_prefill_select_topk_kernel[(end - start,)](
+            logits,
             row_starts[start:end],
             row_ends[start:end],
-            out=out[start:end],
+            out[start:end],
+            lens_out[start:end],
+            logits.stride(0),
+            out.stride(0),
+            topk=topk,
+            BLOCK_N=select_block,
+            LOAD_ELEMS=_load_elems(select_block, select_warps),
+            TOPK_LOAD_ELEMS=_load_elems(topk, select_warps),
+            num_warps=select_warps,
         )
     return out, lens_out
