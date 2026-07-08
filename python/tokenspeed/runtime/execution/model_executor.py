@@ -252,10 +252,11 @@ class ModelExecutor:
             # ~1 page past context_len + spec_num_tokens. Without headroom
             # req_to_page overflows and the next draft block's page write goes
             # out of bounds, hanging the attention kernel. Pad generously; a few
-            # int32 columns per request. Non-DFLASH algorithms do not need this.
-            draft_block_reservation_slack = (
-                config.spec_num_tokens * 64 if config.spec_algo == "DFLASH" else 0
-            )
+            # int32 columns per request. Kept for EVERY drafter (not just
+            # DFLASH): Eagle/MTP draft steps also write KV at the reservation
+            # frontier, and running out degrades to a clamped KV-drop near
+            # context_len.
+            draft_block_reservation_slack = config.spec_num_tokens * 64
             max_num_pages_per_req = (
                 config.context_len
                 + config.spec_num_tokens
@@ -727,10 +728,9 @@ class ModelExecutor:
             accept_lengths = self._apply_force_single_token_verify(
                 accept_lengths, 0, num_decodes, ctx.decode_input_ids
             )
-            if self.config.spec_algo == "DFLASH":
-                accept_lengths = self._cap_accept_to_context_len(
-                    accept_lengths, sampling_info.req_pool_indices[:num_decodes]
-                )
+            accept_lengths = self._cap_accept_to_context_len(
+                accept_lengths, sampling_info.req_pool_indices[:num_decodes]
+            )
             return output_tokens, accept_lengths
 
         logits = logits_output.next_token_logits
@@ -745,10 +745,9 @@ class ModelExecutor:
         decode_accept = self._apply_force_single_token_verify(
             decode_accept, num_extends, num_decodes, ctx.decode_input_ids
         )
-        if self.config.spec_algo == "DFLASH":
-            decode_accept = self._cap_accept_to_context_len(
-                decode_accept, sampling_info.req_pool_indices[num_extends:]
-            )
+        decode_accept = self._cap_accept_to_context_len(
+            decode_accept, sampling_info.req_pool_indices[num_extends:]
+        )
         if (
             prefill_out.next_token_logprobs is not None
             and decode_out.next_token_logprobs is not None
@@ -1816,9 +1815,10 @@ class ModelExecutor:
                             time.perf_counter() - forward_step_start
                         ) * 1000.0
 
-                if self.config.spec_algo == "DFLASH":
+                if self.config.spec_algo is not None:
                     # Clamp the committed-length delta so no request grows past
-                    # context_len. Done here (outside the graph) so it reaches
+                    # context_len (every drafter can overshoot near the limit).
+                    # Done here (outside the graph) so it reaches
                     # both _update_runtime_state and the scheduler page
                     # reservation; see _clamp_committed_to_context_len.
                     output_lengths = self._clamp_committed_to_context_len(
