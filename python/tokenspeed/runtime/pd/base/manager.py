@@ -25,7 +25,7 @@ from functools import cache
 
 import zmq
 
-from tokenspeed.runtime.disaggregation.base.poll import TransferPoll
+from tokenspeed.runtime.pd.base.status import TransferPoll
 
 
 class DisaggManagerBase:

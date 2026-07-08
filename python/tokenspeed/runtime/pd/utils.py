@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Shared helpers for disaggregation runtime components."""
+"""Shared helpers for PD transfer runtime components."""
 
 from __future__ import annotations
 
@@ -26,6 +26,7 @@ import ctypes
 import dataclasses
 import os
 import random
+import threading
 import warnings
 from collections import deque
 from enum import Enum
@@ -49,11 +50,46 @@ FAILURE_PROB = float(os.getenv("DISAGGREGATION_TEST_FAILURE_PROB", 0))
 logger = get_colorful_logger(__name__)
 
 
+class DisaggregationMode(Enum):
+    NULL = "null"
+    PREFILL = "prefill"
+    DECODE = "decode"
+    ENCODE = "encode"
+
+
+class FastQueue:
+    class Empty(Exception):
+        """Exception raised when the queue is empty."""
+
+        pass
+
+    def __init__(self):
+        self._buf = deque()
+        self._cond = threading.Condition()
+
+    def put(self, item):
+        with self._cond:
+            self._buf.append(item)
+            self._cond.notify()
+
+    def get(self):
+        with self._cond:
+            while not self._buf:
+                self._cond.wait()
+            return self._buf.popleft()
+
+    def get_nowait(self):
+        with self._cond:
+            if not self._buf:
+                raise FastQueue.Empty()
+            return self._buf.popleft()
+
+
 def poll_and_all_reduce(pollers, gloo_group):
     """Poll transfer state and all-reduce the result across the gloo group."""
     # At a certain probability, mark the poll as failed to simulate failure.
     if FAILURE_PROB > 0:
-        from tokenspeed.runtime.disaggregation.base.poll import TransferPoll
+        from tokenspeed.runtime.pd.base.status import TransferPoll
 
         polls = [
             (
@@ -112,19 +148,19 @@ class KVClassType(Enum):
 
 def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType):
     if transfer_backend == TransferBackend.MOONCAKE:
-        from tokenspeed.runtime.disaggregation.kv.mooncake.conn import (
+        from tokenspeed.runtime.pd.mooncake.conn import (
             MooncakeKVBootstrapServer,
         )
-        from tokenspeed.runtime.disaggregation.kv.mooncake.decode import (
+        from tokenspeed.runtime.pd.mooncake.decode import (
             MooncakeKVManagerDecode,
         )
-        from tokenspeed.runtime.disaggregation.kv.mooncake.prefill import (
+        from tokenspeed.runtime.pd.mooncake.prefill import (
             MooncakeKVManagerPrefill,
         )
-        from tokenspeed.runtime.disaggregation.kv.mooncake.receiver import (
+        from tokenspeed.runtime.pd.mooncake.receiver import (
             MooncakeKVReceiver,
         )
-        from tokenspeed.runtime.disaggregation.kv.mooncake.sender import (
+        from tokenspeed.runtime.pd.mooncake.sender import (
             MooncakeKVSender,
         )
 
@@ -138,16 +174,16 @@ def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType):
         return class_mapping.get(class_type)
 
     if transfer_backend == TransferBackend.MOONCAKE_ASYNC:
-        from tokenspeed.runtime.disaggregation.kv.mooncake.async_conn import (
+        from tokenspeed.runtime.pd.mooncake.async_conn import (
             MooncakeAsyncKVManager,
         )
-        from tokenspeed.runtime.disaggregation.kv.mooncake.conn import (
+        from tokenspeed.runtime.pd.mooncake.conn import (
             MooncakeKVBootstrapServer,
         )
-        from tokenspeed.runtime.disaggregation.kv.mooncake.receiver import (
+        from tokenspeed.runtime.pd.mooncake.receiver import (
             MooncakeKVReceiver,
         )
-        from tokenspeed.runtime.disaggregation.kv.mooncake.sender import (
+        from tokenspeed.runtime.pd.mooncake.sender import (
             MooncakeKVSender,
         )
 

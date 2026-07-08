@@ -37,20 +37,6 @@ from tokenspeed.runtime.cache.executor.memory_executor import (
 )
 from tokenspeed.runtime.cache.transfer.types import CacheKind
 from tokenspeed.runtime.configs.model_config import ModelConfig
-from tokenspeed.runtime.disaggregation.kv.decode_executor import DisaggDecodeExecutor
-from tokenspeed.runtime.disaggregation.kv.factory import (
-    create_kv_transfer,
-    get_kv_args,
-)
-from tokenspeed.runtime.disaggregation.kv.kv_events import (
-    EventPublisherFactory,
-    KVEventBatch,
-    NullEventPublisher,
-    drain_scheduler_kv_events,
-    scheduler_kv_events_to_wire_events,
-)
-from tokenspeed.runtime.disaggregation.kv.mooncake.entities import ManagerArgs
-from tokenspeed.runtime.disaggregation.kv.prefill_executor import DisaggPrefillExecutor
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -84,6 +70,20 @@ from tokenspeed.runtime.execution.types import ModelExecutionResult
 from tokenspeed.runtime.grammar.capturable_grammar import GrammarStepInputs
 from tokenspeed.runtime.layers.attention.registry import create_attn_components
 from tokenspeed.runtime.metrics.collector import EngineMetrics
+from tokenspeed.runtime.pd.decode_executor import DisaggDecodeExecutor
+from tokenspeed.runtime.pd.factory import (
+    create_kv_transfer,
+    get_kv_args,
+)
+from tokenspeed.runtime.pd.kv_events import (
+    EventPublisherFactory,
+    KVEventBatch,
+    NullEventPublisher,
+    drain_scheduler_kv_events,
+    scheduler_kv_events_to_wire_events,
+)
+from tokenspeed.runtime.pd.mooncake.entities import ManagerArgs
+from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 from tokenspeed.runtime.utils import (
     configure_logger,
@@ -510,7 +510,7 @@ class EventLoop:
             # prefill skips the vision tower. The admission controller owns the
             # receive jobs, the rank-synced admission drain, and the optional NCCL
             # row-shard reassembly; None for decode/encode/text-only nodes.
-            from tokenspeed.runtime.disaggregation.embedding.prefill_receiver import (
+            from tokenspeed.runtime.pd.epd.prefill_receiver import (
                 make_epd_prefill_admission,
             )
 
@@ -540,7 +540,7 @@ class EventLoop:
         if interval <= 0:
             return
 
-        from tokenspeed.runtime.disaggregation.kv.utils import StepCounter
+        from tokenspeed.runtime.pd.utils import StepCounter
 
         step_counter = StepCounter(self.model_executor.device, self.gpu_id)
         self.model_executor.attn_backend.register_step_counter(step_counter)
@@ -1791,7 +1791,7 @@ def run_event_loop(
         if server_args.disaggregation_mode == "encode":
             # The encode role is LM-free; run the lightweight vision-tower loop
             # instead of building the full EventLoop (KV/LM scheduler).
-            from tokenspeed.runtime.disaggregation.embedding.encode_loop import (
+            from tokenspeed.runtime.pd.epd.encode_loop import (
                 run_encode_loop,
             )
 

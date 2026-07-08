@@ -23,9 +23,9 @@ import time
 import numpy as np
 import numpy.typing as npt
 
-from tokenspeed.runtime.disaggregation.base.poll import TransferPoll
-from tokenspeed.runtime.disaggregation.kv.mooncake.entities import KVTransferError
-from tokenspeed.runtime.disaggregation.kv.utils import PageTransferMetadata
+from tokenspeed.runtime.pd.base.status import TransferPoll
+from tokenspeed.runtime.pd.mooncake.entities import KVTransferError
+from tokenspeed.runtime.pd.utils import PageTransferMetadata
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)

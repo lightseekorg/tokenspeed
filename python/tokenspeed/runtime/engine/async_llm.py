@@ -48,12 +48,6 @@ from typing import (
 import uvloop
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
-from tokenspeed.runtime.disaggregation.kv.utils import (
-    KVClassType,
-    TransferBackend,
-    get_kv_class,
-)
-from tokenspeed.runtime.disaggregation.utils import DisaggregationMode
 from tokenspeed.runtime.engine.aio_rwlock import RWLock
 from tokenspeed.runtime.engine.collector import RequestOutputCollector
 from tokenspeed.runtime.engine.core_client import EngineCoreClient
@@ -90,6 +84,12 @@ from tokenspeed.runtime.engine.scheduler_control_client import (
     SchedulerControlClient,
 )
 from tokenspeed.runtime.metrics.collector import RequestMetrics
+from tokenspeed.runtime.pd.utils import (
+    DisaggregationMode,
+    KVClassType,
+    TransferBackend,
+    get_kv_class,
+)
 from tokenspeed.runtime.utils import (
     dataclass_to_string_truncated,
     get_colorful_logger,

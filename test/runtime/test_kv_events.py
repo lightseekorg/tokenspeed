@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import msgspec
 import pytest
 
-from tokenspeed.runtime.disaggregation.kv.kv_events import (
+from tokenspeed.runtime.pd.kv_events import (
     BlockRemoved,
     BlockStored,
     EventPublisherFactory,

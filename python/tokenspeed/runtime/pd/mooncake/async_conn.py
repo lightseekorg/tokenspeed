@@ -27,20 +27,21 @@ from typing import Any
 import numpy as np
 import numpy.typing as npt
 
-from tokenspeed.runtime.disaggregation.base.poll import TransferPoll
-from tokenspeed.runtime.disaggregation.kv.mooncake.entities import (
+from tokenspeed.runtime.pd.base.status import TransferPoll
+from tokenspeed.runtime.pd.mooncake.entities import (
+    KVArgs,
     TransferInfo,
     TransferKVChunk,
 )
-from tokenspeed.runtime.disaggregation.kv.mooncake.prefill import (
+from tokenspeed.runtime.pd.mooncake.prefill import (
     MooncakeKVManagerPrefill as MooncakeKVManager,
 )
-from tokenspeed.runtime.disaggregation.kv.types import KVArgs
-from tokenspeed.runtime.disaggregation.kv.utils import (
+from tokenspeed.runtime.pd.utils import (
+    DisaggregationMode,
+    FastQueue,
     StepCounter,
     group_concurrent_contiguous,
 )
-from tokenspeed.runtime.disaggregation.utils import DisaggregationMode, FastQueue
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.server_args import ServerArgs
 

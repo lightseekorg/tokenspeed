@@ -26,11 +26,10 @@ from dataclasses import dataclass
 import numpy as np
 import requests
 
-from tokenspeed.runtime.disaggregation.base.poll import TransferPoll
-from tokenspeed.runtime.disaggregation.kv.mooncake.conn import MooncakeKVManagerBase
-from tokenspeed.runtime.disaggregation.kv.mooncake.entities import ManagerArgs
-from tokenspeed.runtime.disaggregation.kv.types import KVArgs
-from tokenspeed.runtime.disaggregation.utils import DisaggregationMode
+from tokenspeed.runtime.pd.base.status import TransferPoll
+from tokenspeed.runtime.pd.mooncake.conn import MooncakeKVManagerBase
+from tokenspeed.runtime.pd.mooncake.entities import KVArgs, KVManagerArgs
+from tokenspeed.runtime.pd.utils import DisaggregationMode
 from tokenspeed.runtime.utils import (
     get_colorful_logger,
 )
@@ -77,7 +76,7 @@ def parse_prefill_status_message(
 class MooncakeKVManagerDecode(MooncakeKVManagerBase):
     def __init__(
         self,
-        args: ManagerArgs,
+        args: KVManagerArgs,
         kv_args: KVArgs,
     ):
         super().__init__(args, kv_args, DisaggregationMode.DECODE)

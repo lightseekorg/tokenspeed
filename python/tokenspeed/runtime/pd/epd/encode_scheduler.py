@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Encode-stage batching for EPD disaggregation.
+"""Encode-stage batching for EPD transfer.
 
 The encode server runs the vision tower only, orchestrated in Python rather
 than the C++ KV scheduler, so all it needs is to batch pending vision items

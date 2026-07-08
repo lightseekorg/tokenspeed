@@ -23,11 +23,11 @@ import numpy as np
 import torch
 from tokenspeed_scheduler import PD, Forward
 
-from tokenspeed.runtime.disaggregation.base.poll import TransferPoll
-from tokenspeed.runtime.disaggregation.kv.mooncake.decode import MooncakeKVManagerDecode
-from tokenspeed.runtime.disaggregation.kv.mooncake.receiver import MooncakeKVReceiver
-from tokenspeed.runtime.disaggregation.kv.types import BootstrapInfo
-from tokenspeed.runtime.disaggregation.kv.utils import (
+from tokenspeed.runtime.pd.base.bootstrap import BootstrapInfo
+from tokenspeed.runtime.pd.base.status import TransferPoll
+from tokenspeed.runtime.pd.mooncake.decode import MooncakeKVManagerDecode
+from tokenspeed.runtime.pd.mooncake.receiver import MooncakeKVReceiver
+from tokenspeed.runtime.pd.utils import (
     TransferBackend,
     poll_and_all_reduce,
 )

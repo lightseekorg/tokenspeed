@@ -18,18 +18,24 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""EPD embedding (encode->prefill) disaggregation.
+from tokenspeed.runtime.pd.mooncake.conn import MooncakeKVBootstrapServer
+from tokenspeed.runtime.pd.mooncake.decode import (
+    MooncakeKVManagerDecode,
+)
+from tokenspeed.runtime.pd.mooncake.prefill import (
+    MooncakeKVManagerPrefill,
+)
+from tokenspeed.runtime.pd.mooncake.receiver import (
+    MooncakeKVReceiver,
+)
+from tokenspeed.runtime.pd.mooncake.sender import (
+    MooncakeKVSender,
+)
 
-The encode role runs the vision tower only and ships image embeddings over the
-Mooncake RDMA engine; the prefill role receives them and skips the tower. The
-embedding transport supports TP fanout only inside one server; encode DP scale is
-provided by running multiple independent encode servers rather than by attention
-DP in one process group. The
-role-neutral transport substrate (the :class:`...base.poll.TransferPoll` status FSM, the
-manager base, the bootstrap server) is shared from :mod:`...disaggregation.base`;
-:mod:`conn` layers the embedding buffer args onto it and :mod:`embedding_transfer`
-adds the wire frames and senders/receivers. The encode side lives in
-:mod:`encode_loop` (entry point), :mod:`encode_worker`, :mod:`encode_scheduler`,
-and :mod:`encode_executor`; the prefill side in :mod:`prefill_receiver`. Import
-entry points from those submodules directly.
-"""
+__all__ = (
+    "MooncakeKVBootstrapServer",
+    "MooncakeKVManagerDecode",
+    "MooncakeKVManagerPrefill",
+    "MooncakeKVReceiver",
+    "MooncakeKVSender",
+)

@@ -29,32 +29,32 @@ import threading
 import pytest
 import torch
 
-import tokenspeed.runtime.disaggregation.embedding.encode_loop as encode_loop
+import tokenspeed.runtime.pd.epd.encode_loop as encode_loop
 from tokenspeed.runtime.cache.embedding_cache import (
     EmbeddingCache,
     TieredEmbeddingCache,
 )
-from tokenspeed.runtime.disaggregation.base.poll import TransferPoll
-from tokenspeed.runtime.disaggregation.embedding.encode_executor import (
+from tokenspeed.runtime.multimodal.inputs import (
+    Modality,
+    MultimodalDataItem,
+)
+from tokenspeed.runtime.pd.base.status import TransferPoll
+from tokenspeed.runtime.pd.epd.encode_executor import (
     DisaggEncodeExecutor,
     assign_encoded_embeddings,
 )
-from tokenspeed.runtime.disaggregation.embedding.encode_loop import (
+from tokenspeed.runtime.pd.epd.encode_loop import (
     _embedding_cache_bytes,
     _make_embedding_cache,
     _maybe_install_encoder_cudagraph,
 )
-from tokenspeed.runtime.disaggregation.embedding.encode_scheduler import (
+from tokenspeed.runtime.pd.epd.encode_scheduler import (
     EncodeScheduler,
     PendingEncodeItem,
 )
-from tokenspeed.runtime.disaggregation.embedding.encode_worker import (
+from tokenspeed.runtime.pd.epd.encode_worker import (
     EncodeRequest,
     EncodeWorker,
-)
-from tokenspeed.runtime.multimodal.inputs import (
-    Modality,
-    MultimodalDataItem,
 )
 
 
@@ -411,7 +411,7 @@ class _FeatureFnModel:
 
 
 def test_feature_fn_image_routes_through_image_encoder_seam():
-    from tokenspeed.runtime.disaggregation.embedding.encode_executor import (
+    from tokenspeed.runtime.pd.epd.encode_executor import (
         DisaggEncodeExecutor,
     )
 

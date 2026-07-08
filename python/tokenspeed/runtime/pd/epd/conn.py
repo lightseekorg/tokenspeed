@@ -22,7 +22,7 @@
 
 The mechanical plumbing (the Mooncake engine + ZMQ control socket + room-keyed
 status FSM, and the bootstrap rendezvous server) is the role-neutral shared base
-in :mod:`...disaggregation.base`; this module just layers the embedding role's
+in :mod:`tokenspeed.runtime.pd.base`; this module just layers the embedding role's
 buffer args onto it. The embedding-specific *semantics* -- the wire frames and
 the senders/receivers -- live in :mod:`embedding_transfer`; nothing here carries
 any KV/MLA/metrics state.
@@ -30,38 +30,20 @@ any KV/MLA/metrics state.
 
 from __future__ import annotations
 
-import dataclasses
-
-from tokenspeed.runtime.disaggregation.base.bootstrap import DisaggBootstrapServer
-from tokenspeed.runtime.disaggregation.base.manager import DisaggManagerBase
-from tokenspeed.runtime.disaggregation.mooncake_transfer_engine import (
+from tokenspeed.runtime.pd.base.bootstrap import DisaggBootstrapServerBase
+from tokenspeed.runtime.pd.base.manager import DisaggManagerBase
+from tokenspeed.runtime.pd.base.mooncake_engine import (
     MooncakeTransferEngine,
 )
-from tokenspeed.runtime.disaggregation.utils import DisaggregationMode
+from tokenspeed.runtime.pd.epd.entities import EmbeddingManagerArgs
+from tokenspeed.runtime.pd.utils import DisaggregationMode
 from tokenspeed.runtime.utils.network import get_local_ip_by_remote
 
 
-class EmbeddingTransferError(Exception):
-    """Raised on an embedding (encode->prefill) transfer failure."""
-
-
-@dataclasses.dataclass
-class EmbeddingManagerArgs:
-    """Connection config for the embedding Mooncake endpoint.
-
-    Embedding transfer has a single DP group today. ``tp_size`` is the number
-    of encode/prefill endpoint ranks that participate in that group; the shared
-    bootstrap layer still receives it as ``world_size`` with ``dp_size=1``.
-    """
-
-    bootstrap_port: int
-    tp_size: int
-    bootstrap_host: str | None = None
-
-
-class EmbeddingManagerBase(DisaggManagerBase):
+class MooncakeEmbeddingManagerBase(DisaggManagerBase):
     """Embedding (encode->prefill) manager: the shared engine/socket/status FSM
-    (:class:`...base.manager.DisaggManagerBase`) plus the embedding buffer args.
+    (:class:`tokenspeed.runtime.pd.base.manager.DisaggManagerBase`) plus the
+    embedding buffer args.
     Carries none of the KV manager's KV/MLA/metrics fields.
     """
 
@@ -77,8 +59,8 @@ class EmbeddingManagerBase(DisaggManagerBase):
         self.bootstrap_port = args.bootstrap_port
         self.world_size = args.tp_size
         self.dp_size = 1
-        # Vendor binding stays out of the neutral base. embedding_args must be
-        # set above before super().__init__, which calls register_buffer_to_engine.
+        # embedding_args must be set above before super().__init__, which calls
+        # register_buffer_to_engine.
         engine = MooncakeTransferEngine(
             hostname=get_local_ip_by_remote(),
             gpu_id=embedding_args.gpu_id,
@@ -94,8 +76,8 @@ class EmbeddingManagerBase(DisaggManagerBase):
             self.engine.register(ea.deepstack_data_ptr, ea.deepstack_data_len)
 
 
-class EmbeddingBootstrapServer(DisaggBootstrapServer):
+class MooncakeEmbeddingBootstrapServer(DisaggBootstrapServerBase):
     """Embedding bootstrap rendezvous: the shared server with no extra fields --
     the encode->prefill handshake needs only the base ip/port + parallel-size
-    sync, so there is nothing to layer onto :class:`DisaggBootstrapServer`.
+    sync, so there is nothing to layer onto :class:`DisaggBootstrapServerBase`.
     """

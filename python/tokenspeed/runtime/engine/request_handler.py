@@ -29,7 +29,6 @@ import torch
 import zmq
 from viztracer import VizTracer
 
-from tokenspeed.runtime.disaggregation.kv.types import BootstrapInfo
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -60,6 +59,7 @@ from tokenspeed.runtime.engine.scheduler_utils import make_spec
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.grammar.grammar_manager import GrammarManager
 from tokenspeed.runtime.multimodal.shm_transport import sync_shm_features
+from tokenspeed.runtime.pd.base.bootstrap import BootstrapInfo
 from tokenspeed.runtime.utils import broadcast_pyobj
 from tokenspeed.runtime.utils.dispatch import TypeBasedDispatcher
 from tokenspeed.runtime.utils.env import envs

@@ -55,7 +55,7 @@ if TYPE_CHECKING:
 
 # Import KV events classes if needed
 try:
-    from tokenspeed.runtime.disaggregation.kv.kv_events import (
+    from tokenspeed.runtime.pd.kv_events import (
         AllBlocksCleared,
         BlockRemoved,
         BlockStored,

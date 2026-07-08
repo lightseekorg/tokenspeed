@@ -29,28 +29,28 @@ import threading
 import pytest
 import torch
 
-from tokenspeed.runtime.disaggregation.base.poll import TransferPoll
-from tokenspeed.runtime.disaggregation.embedding.conn import (
-    EmbeddingTransferError,
+from tokenspeed.runtime.multimodal.inputs import (
+    Modality,
+    MultimodalDataItem,
 )
-from tokenspeed.runtime.disaggregation.embedding.embedding_transfer import (
-    REGISTER_ROOM_SENTINEL,
-    EmbeddingArgsRegisterInfo,
-    EmbeddingChunk,
-    EmbeddingTransferInfo,
+from tokenspeed.runtime.pd.base.status import TransferPoll
+from tokenspeed.runtime.pd.epd.embedding_transfer import (
     MooncakeEmbeddingSender,
     shard_payload,
     validate_fanout_frames,
 )
-from tokenspeed.runtime.disaggregation.embedding.prefill_receiver import (
+from tokenspeed.runtime.pd.epd.entities import (
+    REGISTER_ROOM_SENTINEL,
+    EmbeddingArgsRegisterInfo,
+    EmbeddingChunk,
+    EmbeddingTransferError,
+    EmbeddingTransferInfo,
+)
+from tokenspeed.runtime.pd.epd.prefill_receiver import (
     DONE,
     receive_encoded_embeddings,
     shard_rows,
     start_embedding_receive,
-)
-from tokenspeed.runtime.multimodal.inputs import (
-    Modality,
-    MultimodalDataItem,
 )
 
 # Each merged concern keeps its own per-test setup (the shard
@@ -189,8 +189,15 @@ def test_sender_failure_exception_raises_and_clears():
     mgr = _SenderFakeMgr()
     s = MooncakeEmbeddingSender(mgr, "h:9", bootstrap_room=3)
     mgr.failure_records[3] = "boom on rank 1"
-    with pytest.raises(EmbeddingTransferError):
+    with pytest.raises(EmbeddingTransferError) as exc_info:
         s.failure_exception()
+    assert exc_info.value.bootstrap_room == 3
+    assert exc_info.value.failure_reason == "boom on rank 1"
+    assert exc_info.value.remote_endpoint == "h:9"
+    assert str(exc_info.value) == (
+        "EmbeddingTransferError(bootstrap_room=3, remote_endpoint=h:9): "
+        "boom on rank 1"
+    )
     assert 3 not in mgr.request_status  # cleared
     assert s.conclude_state == TransferPoll.Failed
 
@@ -355,7 +362,7 @@ class _ShardReceiver:
 
 
 def _shard_setup(monkeypatch):
-    import tokenspeed.runtime.disaggregation.embedding.prefill_receiver as er
+    import tokenspeed.runtime.pd.epd.prefill_receiver as er
 
     _ShardReceiver.created.clear()
     # Pin the LEGACY per-request buffer path: the pointer-math assertions below
@@ -499,7 +506,7 @@ def _epd(item: MultimodalDataItem, *, room: int, host: str, port: int):
 
 
 def _recv_setup(monkeypatch):
-    import tokenspeed.runtime.disaggregation.embedding.prefill_receiver as er
+    import tokenspeed.runtime.pd.epd.prefill_receiver as er
 
     _FakeReceiver.created.clear()
     # Small pool defaults so each test's fresh fake engine doesn't allocate

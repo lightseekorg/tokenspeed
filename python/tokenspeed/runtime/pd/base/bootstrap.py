@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+from dataclasses import dataclass
 
 from aiohttp import web
 
@@ -31,8 +32,15 @@ from tokenspeed.runtime.utils import get_colorful_logger
 logger = get_colorful_logger(__name__)
 
 
-class DisaggBootstrapServer:
-    """HTTP rendezvous server shared by both disaggregation roles.
+@dataclass
+class BootstrapInfo:
+    bootstrap_host: str
+    bootstrap_port: int
+    bootstrap_room: int
+
+
+class DisaggBootstrapServerBase:
+    """HTTP rendezvous server shared by both PD and EPD transfer roles.
 
     A data-source rank PUTs its (ip, port) keyed by (dp_group, tp_rank_in_dp);
     the peer GETs that back to open a Mooncake session, and uses the sentinel

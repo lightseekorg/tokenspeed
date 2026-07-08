@@ -22,13 +22,13 @@ from __future__ import annotations
 
 import numpy as np
 
-from tokenspeed.runtime.disaggregation.base.poll import TransferPoll
-from tokenspeed.runtime.disaggregation.kv.mooncake.prefill import (
+from tokenspeed.runtime.pd.base.bootstrap import BootstrapInfo
+from tokenspeed.runtime.pd.base.status import TransferPoll
+from tokenspeed.runtime.pd.mooncake.prefill import (
     MooncakeKVManagerPrefill,
     MooncakeKVSender,
 )
-from tokenspeed.runtime.disaggregation.kv.types import BootstrapInfo
-from tokenspeed.runtime.disaggregation.kv.utils import (
+from tokenspeed.runtime.pd.utils import (
     TransferBackend,
     poll_and_all_reduce,
 )

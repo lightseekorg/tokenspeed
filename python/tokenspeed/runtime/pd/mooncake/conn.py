@@ -20,15 +20,14 @@
 
 from __future__ import annotations
 
-from tokenspeed.runtime.disaggregation.base.bootstrap import DisaggBootstrapServer
-from tokenspeed.runtime.disaggregation.base.manager import DisaggManagerBase
-from tokenspeed.runtime.disaggregation.kv.mooncake.entities import ManagerArgs
-from tokenspeed.runtime.disaggregation.kv.types import KVArgs
-from tokenspeed.runtime.disaggregation.mooncake_transfer_engine import (
+from tokenspeed.runtime.metrics.collector import KVTransferMetrics
+from tokenspeed.runtime.pd.base.bootstrap import DisaggBootstrapServerBase
+from tokenspeed.runtime.pd.base.manager import DisaggManagerBase
+from tokenspeed.runtime.pd.base.mooncake_engine import (
     MooncakeTransferEngine,
 )
-from tokenspeed.runtime.disaggregation.utils import DisaggregationMode
-from tokenspeed.runtime.metrics.collector import KVTransferMetrics
+from tokenspeed.runtime.pd.mooncake.entities import KVArgs, KVManagerArgs
+from tokenspeed.runtime.pd.utils import DisaggregationMode
 from tokenspeed.runtime.utils.network import get_local_ip_by_remote
 
 
@@ -38,7 +37,7 @@ class MooncakeKVManagerBase(DisaggManagerBase):
 
     def __init__(
         self,
-        args: ManagerArgs,
+        args: KVManagerArgs,
         kv_args: KVArgs,
         disaggregation_mode: DisaggregationMode,
     ):
@@ -69,10 +68,9 @@ class MooncakeKVManagerBase(DisaggManagerBase):
         else:
             self.kv_transfer_metrics = None
 
-        # Build the Mooncake data-plane engine here (the vendor binding stays in
-        # the mooncake package, not in the neutral base) and inject it. self.kv_args
-        # is set above so register_buffer_to_engine (called by the base) sees the
-        # KV buffers.
+        # Build the Mooncake data-plane engine here and inject it into the
+        # transfer manager. self.kv_args is set above so register_buffer_to_engine
+        # (called by the base) sees the KV buffers.
         engine = MooncakeTransferEngine(
             hostname=get_local_ip_by_remote(),
             gpu_id=kv_args.gpu_id,
@@ -91,7 +89,7 @@ class MooncakeKVManagerBase(DisaggManagerBase):
             self.engine.register(state_data_ptr, state_data_len)
 
 
-class MooncakeKVBootstrapServer(DisaggBootstrapServer):
+class MooncakeKVBootstrapServer(DisaggBootstrapServerBase):
     """KV bootstrap rendezvous: the shared server plus the prefill-side MLA /
     kv-page length fields the decode side needs in the parallel-info sync."""
 

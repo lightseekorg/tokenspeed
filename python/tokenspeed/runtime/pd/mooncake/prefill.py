@@ -29,26 +29,27 @@ import numpy as np
 import numpy.typing as npt
 import requests
 
-from tokenspeed.runtime.disaggregation.base.poll import TransferPoll
-from tokenspeed.runtime.disaggregation.kv.mooncake.conn import MooncakeKVManagerBase
-from tokenspeed.runtime.disaggregation.kv.mooncake.entities import (
+from tokenspeed.runtime.pd.base.status import TransferPoll
+from tokenspeed.runtime.pd.mooncake.conn import MooncakeKVManagerBase
+from tokenspeed.runtime.pd.mooncake.entities import (
+    KVArgs,
     KVArgsRegisterInfo,
-    ManagerArgs,
+    KVManagerArgs,
     TransferIndexResolution,
     TransferInfo,
     TransferKVChunk,
 )
-from tokenspeed.runtime.disaggregation.kv.transfer_plan import (
+from tokenspeed.runtime.pd.transfer_plan import (
     BufferKind,
     TransferFragment,
 )
-from tokenspeed.runtime.disaggregation.kv.types import KVArgs
-from tokenspeed.runtime.disaggregation.kv.utils import (
+from tokenspeed.runtime.pd.utils import (
+    DisaggregationMode,
+    FastQueue,
     PageTransferMetadata,
     StepCounter,
     group_concurrent_contiguous,
 )
-from tokenspeed.runtime.disaggregation.utils import DisaggregationMode, FastQueue
 from tokenspeed.runtime.utils import (
     get_colorful_logger,
 )
@@ -65,7 +66,7 @@ logger = get_colorful_logger(__name__)
 class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
     def __init__(
         self,
-        args: ManagerArgs,
+        args: KVManagerArgs,
         kv_args: KVArgs,
     ):
         super().__init__(args, kv_args, DisaggregationMode.PREFILL)
@@ -1094,6 +1095,6 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             )
 
 
-from tokenspeed.runtime.disaggregation.kv.mooncake.sender import MooncakeKVSender
+from tokenspeed.runtime.pd.mooncake.sender import MooncakeKVSender
 
 __all__ = ["MooncakeKVManagerPrefill", "MooncakeKVSender"]

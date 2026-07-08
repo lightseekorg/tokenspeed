@@ -51,8 +51,8 @@ from tokenspeed.runtime.cache.embedding_cache import (
     EmbeddingCache,
     TieredEmbeddingCache,
 )
-from tokenspeed.runtime.disaggregation.embedding.encode_scheduler import EncodeScheduler
-from tokenspeed.runtime.disaggregation.embedding.encode_worker import EncodeWorker
+from tokenspeed.runtime.pd.epd.encode_scheduler import EncodeScheduler
+from tokenspeed.runtime.pd.epd.encode_worker import EncodeWorker
 from tokenspeed.runtime.utils import get_colorful_logger, get_zmq_socket
 from tokenspeed.runtime.utils.env import envs
 
@@ -102,7 +102,7 @@ def _build_manager_args(server_args, mapping):
     separate encode servers selected by the gateway; attention DP inside one
     encode server is rejected so it cannot be accidentally advertised as TP.
     """
-    from tokenspeed.runtime.disaggregation.embedding.conn import EmbeddingManagerArgs
+    from tokenspeed.runtime.pd.epd.entities import EmbeddingManagerArgs
 
     if mapping.attn.dp_size != 1:
         raise ValueError(
@@ -148,21 +148,19 @@ def _build_encode_worker(server_args, port_args, gpu_id, global_rank):
     """Assemble the encode worker: model + Mooncake manager + bootstrap server +
     executor + scheduler + cache, driven from the real ServerArgs."""
     from tokenspeed.runtime.configs.model_config import ModelConfig
-    from tokenspeed.runtime.disaggregation.embedding.conn import (
-        EmbeddingBootstrapServer,
-    )
-    from tokenspeed.runtime.disaggregation.embedding.embedding_transfer import (
-        EmbeddingArgs,
-        MooncakeEmbeddingManagerEncode,
-    )
-    from tokenspeed.runtime.disaggregation.embedding.encode_executor import (
-        DisaggEncodeExecutor,
-    )
     from tokenspeed.runtime.execution.distributed_initializer import (
         DistributedConfig,
         DistributedInitializer,
     )
     from tokenspeed.runtime.execution.factory import create_model_runner
+    from tokenspeed.runtime.pd.epd.conn import MooncakeEmbeddingBootstrapServer
+    from tokenspeed.runtime.pd.epd.embedding_transfer import (
+        MooncakeEmbeddingManagerEncode,
+    )
+    from tokenspeed.runtime.pd.epd.encode_executor import (
+        DisaggEncodeExecutor,
+    )
+    from tokenspeed.runtime.pd.epd.entities import EmbeddingArgs
 
     mapping = server_args.mapping
     attn_tp_rank = mapping.attn.tp_rank
@@ -215,7 +213,7 @@ def _build_encode_worker(server_args, port_args, gpu_id, global_rank):
     # look up the encode rank it pairs with (contiguous blocks of prefill ranks
     # share one encode rank; encode_tp=1 -> all prefill ranks pair encode rank 0).
     if attn_tp_rank == 0:
-        EmbeddingBootstrapServer(server_args.disaggregation_bootstrap_port)
+        MooncakeEmbeddingBootstrapServer(server_args.disaggregation_bootstrap_port)
     manager = MooncakeEmbeddingManagerEncode(manager_args, embedding_args)
     executor = DisaggEncodeExecutor(manager, model, device=device)
 

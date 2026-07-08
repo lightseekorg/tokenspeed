@@ -18,13 +18,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Factories for disaggregation KV transfer helpers."""
+"""Factories for PD KV transfer helpers."""
 
-from tokenspeed.runtime.disaggregation.kv.decode_executor import DisaggDecodeExecutor
-from tokenspeed.runtime.disaggregation.kv.mooncake.entities import ManagerArgs
-from tokenspeed.runtime.disaggregation.kv.prefill_executor import DisaggPrefillExecutor
-from tokenspeed.runtime.disaggregation.kv.types import KVArgs
-from tokenspeed.runtime.disaggregation.kv.utils import TransferBackend
+from tokenspeed.runtime.pd.decode_executor import DisaggDecodeExecutor
+from tokenspeed.runtime.pd.mooncake.entities import KVArgs, KVManagerArgs
+from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
+from tokenspeed.runtime.pd.utils import TransferBackend
 
 
 def _get_contiguous_buf_unit_lens(pool, item_lens):
@@ -128,7 +127,7 @@ def get_kv_args(
 def create_kv_transfer(
     mode: str,
     backend: TransferBackend,
-    args: ManagerArgs,
+    args: KVManagerArgs,
     kv_args: KVArgs,
     gloo_group,
     page_size,

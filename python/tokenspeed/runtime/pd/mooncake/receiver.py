@@ -28,9 +28,9 @@ import numpy.typing as npt
 import requests
 import zmq
 
-from tokenspeed.runtime.disaggregation.base.poll import TransferPoll
-from tokenspeed.runtime.disaggregation.kv.mooncake.entities import KVTransferError
-from tokenspeed.runtime.disaggregation.kv.transfer_plan import (
+from tokenspeed.runtime.pd.base.status import TransferPoll
+from tokenspeed.runtime.pd.mooncake.entities import KVTransferError
+from tokenspeed.runtime.pd.transfer_plan import (
     BufferKind,
     BufferLayout,
     ParallelLayout,
@@ -38,7 +38,7 @@ from tokenspeed.runtime.disaggregation.kv.transfer_plan import (
     RankTransferPlan,
     encode_transfer_fragments,
 )
-from tokenspeed.runtime.disaggregation.kv.utils import (
+from tokenspeed.runtime.pd.utils import (
     PageTransferMetadata,
 )
 from tokenspeed.runtime.utils import (
@@ -48,7 +48,7 @@ from tokenspeed.runtime.utils.network import get_local_ip_by_remote
 
 logger = get_colorful_logger(__name__)
 
-from tokenspeed.runtime.disaggregation.kv.mooncake.decode import (
+from tokenspeed.runtime.pd.mooncake.decode import (
     MooncakeKVManagerDecode,
     PrefillParallelInfo,
 )

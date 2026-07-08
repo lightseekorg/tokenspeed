@@ -1,7 +1,7 @@
-from tokenspeed.runtime.disaggregation.kv.mooncake.receiver import (
+from tokenspeed.runtime.pd.mooncake.receiver import (
     _build_buffer_layout_pair,
 )
-from tokenspeed.runtime.disaggregation.kv.transfer_plan import (
+from tokenspeed.runtime.pd.transfer_plan import (
     BufferKind,
     ParallelLayout,
     PDTransferPlanner,
