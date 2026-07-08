@@ -102,9 +102,16 @@ PREFILL_GRAPH_DEFAULT_MAX_TOKENS = 2048
 
 
 def _resolve_prefill_graph_max_tokens(server_args) -> int:
-    """Largest prefill-graph bucket: explicit value, or min(2048, chunk, kv budget)."""
+    """Largest prefill-graph bucket: explicit value, or min(2048, chunk, kv budget).
+
+    Defaults to on only on NVIDIA: an unexplained GPU memory-access fault was
+    observed once on mi355 under prefill-graph load, so other platforms stay
+    opt-in (pass --prefill-graph-max-tokens) until that is root-caused.
+    """
     if server_args.prefill_graph_max_tokens is not None:
         return int(server_args.prefill_graph_max_tokens)
+    if not current_platform().is_nvidia:
+        return 0
     cap = PREFILL_GRAPH_DEFAULT_MAX_TOKENS
     if server_args.chunked_prefill_size:
         cap = min(cap, int(server_args.chunked_prefill_size))
