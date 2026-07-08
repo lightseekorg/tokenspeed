@@ -47,6 +47,8 @@ if platform.is_amd:
     def _swiglu_args(w: torch.nn.Module) -> tuple[float, float, float]:
         swiglu_arg = getattr(w, "swiglu_arg", None)
         if swiglu_arg is None:
+            # alpha=1, limit=0, beta=0 makes the reducer use an unclamped
+            # SiLU gate multiplied by the linear branch.
             return 1.0, 0.0, 0.0
         swiglu_beta = getattr(w, "swiglu_beta", None)
         return (
