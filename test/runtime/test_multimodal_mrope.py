@@ -1,6 +1,3 @@
-from types import SimpleNamespace
-
-import pytest
 import torch
 
 from tokenspeed.runtime.layers.rotary_embedding import MRotaryEmbedding
@@ -19,84 +16,6 @@ class _Qwen35Config:
     vision_start_token_id = 151652
     model_type = "qwen3_5"
     vision_config = _VisionConfig()
-
-
-def _model_executor_module():
-    return pytest.importorskip(
-        "tokenspeed.runtime.execution.model_executor", exc_type=ImportError
-    )
-
-
-def test_mrope_scalar_delta_expansion_avoids_repeated_tensor_cache():
-    model_executor = _model_executor_module()
-    executor = object.__new__(model_executor.ModelExecutor)
-    mm_input = SimpleNamespace(
-        mrope_position_delta_scalar=5,
-        mrope_position_delta=None,
-        mrope_position_delta_repeated_cache=None,
-    )
-
-    positions = executor._expand_mrope_from_input(mm_input, seq_len=9)
-
-    assert torch.equal(positions, torch.full((3, 1), 13, dtype=torch.int64))
-    assert mm_input.mrope_position_delta_repeated_cache is None
-
-
-def test_text_only_mrope_prefill_copies_linear_positions_directly():
-    model_executor = _model_executor_module()
-    executor = object.__new__(model_executor.ModelExecutor)
-    executor.config = SimpleNamespace(model_is_mrope=True)
-    executor.input_buffers = SimpleNamespace(
-        positions_buf=torch.arange(4, dtype=torch.int64),
-        mrope_positions_buf=torch.empty((3, 4), dtype=torch.int64),
-    )
-    forward_op = SimpleNamespace(num_extends=lambda: 1)
-
-    positions = executor._build_mrope_positions_override(
-        forward_op,
-        multimodal_context=None,
-        total_tokens=4,
-    )
-
-    assert torch.equal(
-        positions,
-        torch.arange(4, dtype=torch.int64).unsqueeze(0).expand(3, -1),
-    )
-
-
-@pytest.mark.parametrize("deltas", [[5, 5, 5], [5, 0, -2]])
-def test_decode_mrope_positions_support_uniform_and_mixed_deltas(deltas):
-    model_executor = _model_executor_module()
-    executor = object.__new__(model_executor.ModelExecutor)
-    executor._mrope_decode_deltas_cpu = [
-        torch.empty(3, dtype=torch.int64),
-        torch.empty(3, dtype=torch.int64),
-    ]
-    executor._mrope_decode_deltas_cpu_idx = 0
-    executor._mrope_decode_deltas_buf = torch.empty(3, dtype=torch.int64)
-    executor.input_buffers = SimpleNamespace(
-        positions_buf=torch.tensor([10, 11, 12], dtype=torch.int64),
-        mrope_positions_buf=torch.empty((3, 3), dtype=torch.int64),
-    )
-    forward_op = SimpleNamespace(input_lengths=[1, 1, 1])
-    mm_inputs = [
-        SimpleNamespace(
-            mrope_position_delta_scalar=delta,
-            mrope_position_delta=None,
-        )
-        for delta in deltas
-    ]
-
-    positions = executor._build_decode_mrope_positions_override(
-        forward_op,
-        mm_inputs,
-        total_tokens=3,
-    )
-
-    expected = torch.tensor([10, 11, 12], dtype=torch.int64) + torch.tensor(
-        deltas, dtype=torch.int64
-    )
-    assert torch.equal(positions, expected.unsqueeze(0).expand(3, -1))
 
 
 def test_qwen35_image_fast_path_matches_generic_positions():

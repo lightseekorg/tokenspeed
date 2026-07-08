@@ -2050,14 +2050,6 @@ class ModelExecutor:
             )
 
     def _expand_mrope_from_input(self, mm_input, seq_len: int) -> torch.Tensor:
-        delta_scalar = getattr(mm_input, "mrope_position_delta_scalar", None)
-        if delta_scalar is not None:
-            return torch.full(
-                (3, 1),
-                int(delta_scalar) - 1 + seq_len,
-                dtype=torch.int64,
-            )
-
         # Cache delta expansion for retracted/chunked requests.
         if mm_input.mrope_position_delta_repeated_cache is None:
             mm_input.mrope_position_delta_repeated_cache = (
@@ -2100,8 +2092,6 @@ class ModelExecutor:
 
         offset = 0
         has_nonzero_delta = False
-        first_delta = None
-        all_same_delta = True
         for batch_idx, input_len in enumerate(forward_op.input_lengths):
             input_len = int(input_len)
             if input_len <= 0:
@@ -2117,33 +2107,24 @@ class ModelExecutor:
             if mm_input is not None:
                 delta = self._mrope_delta_scalar(mm_input)
                 has_nonzero_delta = has_nonzero_delta or delta != 0
-            if first_delta is None:
-                first_delta = delta
-            elif all_same_delta and delta != first_delta:
-                all_same_delta = False
-                token_deltas_cpu[:offset].fill_(first_delta)
 
-            if not all_same_delta:
-                token_deltas_cpu[offset : offset + input_len].fill_(delta)
+            token_deltas_cpu[offset : offset + input_len].fill_(delta)
             offset += input_len
 
         if offset != total_tokens:
-            if all_same_delta:
-                token_deltas_cpu[:offset].fill_(first_delta or 0)
             token_deltas_cpu[offset:total_tokens].zero_()
 
-        mrope_positions = self.input_buffers.mrope_positions_buf[:, :total_tokens]
-        expanded_base = base_positions.unsqueeze(0).expand_as(mrope_positions)
         if has_nonzero_delta:
-            if all_same_delta and offset == total_tokens:
-                torch.add(expanded_base, first_delta, out=mrope_positions)
-            else:
-                token_deltas = self._mrope_decode_deltas_buf[:total_tokens]
-                token_deltas.copy_(token_deltas_cpu, non_blocking=True)
-                torch.add(expanded_base, token_deltas, out=mrope_positions)
+            token_deltas = self._mrope_decode_deltas_buf[:total_tokens]
+            token_deltas.copy_(token_deltas_cpu, non_blocking=True)
+            mrope_base = base_positions + token_deltas
         else:
-            mrope_positions.copy_(expanded_base)
-        return mrope_positions
+            mrope_base = base_positions
+
+        self.input_buffers.mrope_positions_buf[:, :total_tokens].copy_(
+            mrope_base.unsqueeze(0).expand(3, -1)
+        )
+        return self.input_buffers.mrope_positions_buf[:, :total_tokens]
 
     def _build_mrope_positions_override(
         self,
@@ -2161,12 +2142,6 @@ class ModelExecutor:
             if multimodal_context is not None and multimodal_context.has_inputs()
             else []
         )
-        if not mm_inputs:
-            self.input_buffers.mrope_positions_buf[:, :total_tokens].copy_(
-                base_positions.unsqueeze(0).expand(3, -1)
-            )
-            return self.input_buffers.mrope_positions_buf[:, :total_tokens]
-
         if not is_prefill:
             return self._build_decode_mrope_positions_override(
                 forward_op=forward_op,
@@ -2203,20 +2178,13 @@ class ModelExecutor:
                     )
                     continue
                 if base_chunk.numel() == 1:
-                    seq_len = end
+                    seq_len = int(base_chunk[-1].item()) + 1
                     mrope_chunks.append(
                         self._expand_mrope_from_input(mm_input, seq_len).to(
                             device=self.device, dtype=torch.int64
                         )
                     )
                     continue
-
-            delta_scalar = getattr(mm_input, "mrope_position_delta_scalar", None)
-            if delta_scalar is not None:
-                mrope_chunks.append(
-                    (base_chunk + int(delta_scalar)).unsqueeze(0).expand(3, -1)
-                )
-                continue
 
             delta = mm_input.mrope_position_delta
             if delta is None:
@@ -2226,12 +2194,6 @@ class ModelExecutor:
             # already stores the per-token zero-based position (seq_len - 1 for
             # decode), so this is the same value without a GPU-to-CPU sync.
             mrope_chunks.append((base_chunk + delta).unsqueeze(0).expand(3, -1))
-
-        if len(mrope_chunks) == 1:
-            self.input_buffers.mrope_positions_buf[:, :total_tokens].copy_(
-                mrope_chunks[0]
-            )
-            return self.input_buffers.mrope_positions_buf[:, :total_tokens]
 
         mrope_positions = torch.cat(mrope_chunks, dim=1).contiguous()
         self.input_buffers.mrope_positions_buf[:, :total_tokens].copy_(mrope_positions)
