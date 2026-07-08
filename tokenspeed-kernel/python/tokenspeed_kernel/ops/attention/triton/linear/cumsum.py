@@ -26,11 +26,9 @@
 
 
 import torch
-import triton
-import triton.language as tl
-
-from tokenspeed.runtime.layers.attention.linear.index import prepare_chunk_indices
-from tokenspeed.runtime.layers.attention.linear.utils import (
+from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.attention.triton.linear.index import prepare_chunk_indices
+from tokenspeed_kernel.ops.attention.triton.linear.utils import (
     check_shared_mem,
     input_guard,
 )

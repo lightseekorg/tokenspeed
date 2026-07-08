@@ -21,24 +21,22 @@
 # -*- coding: utf-8 -*-
 
 import torch
-from einops import rearrange
-
-from tokenspeed.runtime.layers.attention.linear.chunk_delta_h import (
+from tokenspeed_kernel.ops.attention.triton.linear.chunk_delta_h import (
     chunk_gated_delta_rule_fwd_h,
 )
-from tokenspeed.runtime.layers.attention.linear.chunk_o import chunk_fwd_o
-from tokenspeed.runtime.layers.attention.linear.chunk_scaled_dot_kkt import (
+from tokenspeed_kernel.ops.attention.triton.linear.chunk_o import chunk_fwd_o
+from tokenspeed_kernel.ops.attention.triton.linear.chunk_scaled_dot_kkt import (
     chunk_scaled_dot_kkt_fwd,
 )
-from tokenspeed.runtime.layers.attention.linear.cumsum import chunk_local_cumsum
-from tokenspeed.runtime.layers.attention.linear.l2norm import l2norm_fwd
-from tokenspeed.runtime.layers.attention.linear.solve_tril import solve_tril
-from tokenspeed.runtime.layers.attention.linear.utils import (
+from tokenspeed_kernel.ops.attention.triton.linear.cumsum import chunk_local_cumsum
+from tokenspeed_kernel.ops.attention.triton.linear.l2norm import l2norm_fwd
+from tokenspeed_kernel.ops.attention.triton.linear.solve_tril import solve_tril
+from tokenspeed_kernel.ops.attention.triton.linear.utils import (
     SUPPRESS_LEVEL,
     autocast_custom_fwd,
     input_guard,
 )
-from tokenspeed.runtime.layers.attention.linear.wy_fast import recompute_w_u_fwd
+from tokenspeed_kernel.ops.attention.triton.linear.wy_fast import recompute_w_u_fwd
 
 
 def chunk_gated_delta_rule_fwd(
@@ -181,7 +179,6 @@ def chunk_gated_delta_rule(
     Examples::
         >>> import torch
         >>> import torch.nn.functional as F
-        >>> from einops import rearrange
         >>> from fla.ops.gated_delta_rule import chunk_gated_delta_rule
         # inputs with equal lengths
         >>> B, T, H, K, V = 4, 2048, 4, 512, 512
@@ -197,7 +194,7 @@ def chunk_gated_delta_rule(
             output_final_state=True
         )
         # for variable-length inputs, the batch size `B` is expected to be 1 and `cu_seqlens` is required
-        >>> q, k, v, beta, g = map(lambda x: rearrange(x, 'b t ... -> 1 (b t) ...'), (q, k, v, beta, g))
+        >>> q, k, v, beta, g = (x.reshape(1, -1, *x.shape[2:]) for x in (q, k, v, beta, g))
         # for a batch with 4 sequences, `cu_seqlens` with 5 start/end positions are expected
         >>> cu_seqlens = q.new_tensor([0, 2048, 4096, 6144, 8192], dtype=torch.long)
         >>> o_var, ht_var = chunk_gated_delta_rule(

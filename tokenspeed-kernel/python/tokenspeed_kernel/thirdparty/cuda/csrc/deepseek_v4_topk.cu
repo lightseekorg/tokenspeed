@@ -451,6 +451,7 @@ void launch_persistent_topk(const TensorView& logits,
                             TensorView& output,
                             TensorView& workspace,
                             int64_t max_seq_len,
+                            int64_t q_len_per_req,
                             cudaStream_t stream) {
   namespace P = vllm::persistent;
 
@@ -482,7 +483,8 @@ void launch_persistent_topk(const TensorView& logits,
             static_cast<int32_t*>(output.data_ptr()),
             static_cast<int32_t*>(lengths.data_ptr()),
             static_cast<uint32_t>(num_rows), static_cast<uint32_t>(TopK),
-            static_cast<uint32_t>(stride), stream);
+            static_cast<uint32_t>(stride),
+            static_cast<uint32_t>(q_len_per_req), stream);
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "FilteredTopK failed: " << cudaGetErrorString(status);
   } else {
@@ -575,6 +577,7 @@ void launch_persistent_topk(const TensorView& logits,
         reinterpret_cast<P::RadixRowState*>(workspace.data_ptr());
     params.ctas_per_group = ctas_per_group;
     params.max_seq_len = static_cast<uint32_t>(max_seq_len);
+    params.q_len_per_req = static_cast<uint32_t>(q_len_per_req);
 
 #define LAUNCH_PERSISTENT(TOPK_VAL, VS)                                      \
   do {                                                                       \
@@ -608,7 +611,8 @@ void deepseek_v4_persistent_topk(TensorView logits,
                                  TensorView output,
                                  TensorView workspace,
                                  int64_t k,
-                                 int64_t max_seq_len) {
+                                 int64_t max_seq_len,
+                                 int64_t q_len_per_req) {
   CHECK_CUDA(logits);
   CHECK_CUDA(lengths);
   CHECK_CUDA(output);
@@ -626,8 +630,11 @@ void deepseek_v4_persistent_topk(TensorView logits,
   TVM_FFI_ICHECK(lengths.dtype() == dl_int32) << "lengths must be int32";
   TVM_FFI_ICHECK(output.dtype() == dl_int32) << "output must be int32";
   TVM_FFI_ICHECK(workspace.dtype() == dl_uint8) << "workspace must be uint8";
-  TVM_FFI_ICHECK(lengths.numel() == logits.size(0))
-      << "lengths size mismatch";
+  TVM_FFI_ICHECK(q_len_per_req >= 1) << "q_len_per_req must be >= 1";
+  TVM_FFI_ICHECK(logits.size(0) % q_len_per_req == 0)
+      << "q_len_per_req must divide num_rows";
+  TVM_FFI_ICHECK(lengths.numel() == logits.size(0) / q_len_per_req)
+      << "lengths size mismatch (expected num_rows / q_len_per_req)";
   TVM_FFI_ICHECK(output.size(0) == logits.size(0) && output.size(1) == k)
       << "output size mismatch";
   TVM_FFI_ICHECK(k == 512 || k == 1024 || k == 2048)
@@ -640,12 +647,12 @@ void deepseek_v4_persistent_topk(TensorView logits,
   cudaStream_t stream = get_stream(logits.device());
   if (k == 512) {
     launch_persistent_topk<512>(logits, lengths, output, workspace, max_seq_len,
-                                stream);
+                                q_len_per_req, stream);
   } else if (k == 1024) {
     launch_persistent_topk<1024>(logits, lengths, output, workspace, max_seq_len,
-                                 stream);
+                                 q_len_per_req, stream);
   } else {
     launch_persistent_topk<2048>(logits, lengths, output, workspace, max_seq_len,
-                                 stream);
+                                 q_len_per_req, stream);
   }
 }

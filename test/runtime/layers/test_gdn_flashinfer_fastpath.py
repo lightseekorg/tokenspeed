@@ -30,7 +30,7 @@ pytestmark = pytest.mark.skipif(
 
 
 def _fla():
-    from tokenspeed.runtime.layers.attention.linear.chunk import (
+    from tokenspeed_kernel.ops.attention.triton.linear.chunk import (
         chunk_gated_delta_rule,
     )
 
@@ -38,7 +38,7 @@ def _fla():
 
 
 def _l2norm():
-    from tokenspeed.runtime.layers.attention.linear.l2norm import l2norm_fwd
+    from tokenspeed_kernel.ops.attention.triton.linear.l2norm import l2norm_fwd
 
     return l2norm_fwd
 

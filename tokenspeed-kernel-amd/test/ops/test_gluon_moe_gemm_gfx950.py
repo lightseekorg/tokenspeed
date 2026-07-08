@@ -424,6 +424,76 @@ def test_gluon_preshuffle_keeps_w2_bias_logical_n(
     assert mxfp4_weights.preshuffled.w2_bias.shape[-1] == HIDDEN_SIZE
 
 
+def _assert_gluon_route_matches_default(
+    logits: torch.Tensor,
+    topk: int,
+    case_name: str,
+) -> None:
+    ragged_metadata, gather_indx, scatter_indx, gate_scal = gluon_moe.gluon_fused_route(
+        logits,
+        topk,
+        dtype=logits.dtype,
+    )
+    ref_metadata, ref_gather, ref_scatter, ref_gate = default_route(
+        logits,
+        topk,
+        dtype=logits.dtype,
+    )
+
+    torch.cuda.synchronize()
+
+    assert int(ragged_metadata.slice_sizes.sum().item()) == logits.shape[0] * topk
+    assert torch.all(gather_indx >= 0), case_name
+    assert torch.all(gather_indx < logits.shape[0]), case_name
+    assert torch.all(scatter_indx >= 0), case_name
+    assert torch.all(scatter_indx < logits.shape[0] * topk), case_name
+    torch.testing.assert_close(ragged_metadata.slice_sizes, ref_metadata.slice_sizes)
+    torch.testing.assert_close(ragged_metadata.slice_offs, ref_metadata.slice_offs)
+    torch.testing.assert_close(
+        ragged_metadata.block_offs_data,
+        ref_metadata.block_offs_data,
+    )
+    torch.testing.assert_close(
+        ragged_metadata.block_schedule_data,
+        ref_metadata.block_schedule_data,
+    )
+    torch.testing.assert_close(gather_indx, ref_gather)
+    torch.testing.assert_close(scatter_indx, ref_scatter)
+    torch.testing.assert_close(gate_scal, ref_gate, equal_nan=True)
+
+
+@requires_gfx950
+@pytest.mark.parametrize("topk", [1, 4])
+def test_gluon_small_m_route_finite_logits_match_default_route(topk: int) -> None:
+    generator = torch.Generator(device="cuda").manual_seed(20260707 + topk)
+    logits = torch.randn(
+        (4, E),
+        device="cuda",
+        dtype=torch.float32,
+        generator=generator,
+    ).to(torch.bfloat16)
+    _assert_gluon_route_matches_default(logits, topk, "finite")
+
+
+@requires_gfx950
+@pytest.mark.parametrize("topk", [1, 4])
+@pytest.mark.parametrize(
+    ("case_name", "fill_value"),
+    [
+        ("all_nan", float("nan")),
+        ("all_neg_inf", -float("inf")),
+        ("all_pos_inf", float("inf")),
+    ],
+)
+def test_gluon_small_m_route_nonfinite_logits_match_default_route(
+    case_name: str,
+    fill_value: float,
+    topk: int,
+) -> None:
+    logits = torch.full((4, E), fill_value, device="cuda", dtype=torch.bfloat16)
+    _assert_gluon_route_matches_default(logits, topk, case_name)
+
+
 def _make_hidden_and_router(num_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
     generator = torch.Generator(device="cuda").manual_seed(9000 + num_tokens)
     hidden_states = (

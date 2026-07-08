@@ -44,13 +44,17 @@ def _local_topk_to_global_slots_kernel(
     block_size: tl.constexpr,
     topk: tl.constexpr,
     has_seq_lens: tl.constexpr,
+    q_len_per_req: tl.constexpr,
     block: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
+    req_idx = token_idx // q_len_per_req
     count = tl.zeros((), dtype=tl.int32)
     seq_len = tl.full((), block_table_cols * block_size, dtype=tl.int32)
     if has_seq_lens:
-        seq_len = tl.load(seq_lens_ptr + token_idx).to(tl.int32)
+        base = tl.load(seq_lens_ptr + req_idx).to(tl.int32)
+        seq_len = base - (q_len_per_req - 1) + (token_idx % q_len_per_req)
+        seq_len = tl.maximum(seq_len, 0)
 
     for start in range(0, topk, block):
         offsets = start + tl.arange(0, block)
@@ -65,7 +69,7 @@ def _local_topk_to_global_slots_kernel(
         block_offset = local_idx % block_size
         valid = valid & (block_idx >= 0) & (block_idx < block_table_cols)
         page = tl.load(
-            block_table_ptr + token_idx * block_table_stride + block_idx,
+            block_table_ptr + req_idx * block_table_stride + block_idx,
             mask=mask & valid,
             other=0,
         )
@@ -86,6 +90,7 @@ def local_topk_to_global_slots(
     block_table: torch.Tensor,
     block_size: int,
     seq_lens: torch.Tensor | None = None,
+    q_len_per_req: int = 1,
     out: torch.Tensor | None = None,
     lens_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -105,17 +110,23 @@ def local_topk_to_global_slots(
     if block_table.shape[1] == 0:
         raise ValueError("block_table must have at least one page column")
     num_tokens, topk = local_topk_offsets.shape
-    if block_table.shape[0] < num_tokens:
+    q_len_per_req = int(q_len_per_req)
+    if q_len_per_req < 1 or num_tokens % q_len_per_req != 0:
         raise ValueError(
-            "block_table must have at least one row per token: "
-            f"rows={block_table.shape[0]}, tokens={num_tokens}"
+            f"q_len_per_req={q_len_per_req} must divide tokens={num_tokens}"
+        )
+    num_reqs = num_tokens // q_len_per_req
+    if block_table.shape[0] < num_reqs:
+        raise ValueError(
+            "block_table must have at least one row per request: "
+            f"rows={block_table.shape[0]}, reqs={num_reqs}"
         )
     if seq_lens is not None and seq_lens.dim() != 1:
         raise ValueError(f"seq_lens must be 1-D, got {tuple(seq_lens.shape)}")
-    if seq_lens is not None and seq_lens.numel() < num_tokens:
+    if seq_lens is not None and seq_lens.numel() < num_reqs:
         raise ValueError(
-            "seq_lens must have at least one entry per token: "
-            f"lens={seq_lens.numel()}, tokens={num_tokens}"
+            "seq_lens must have at least one entry per request: "
+            f"lens={seq_lens.numel()}, reqs={num_reqs}"
         )
 
     if out is None:
@@ -176,6 +187,7 @@ def local_topk_to_global_slots(
         block_size=int(block_size),
         topk=topk,
         has_seq_lens=seq_lens is not None,
+        q_len_per_req=q_len_per_req,
         block=1024,
     )
     return global_slots, lens
@@ -278,19 +290,23 @@ def _dsa_decode_logits_fp8_kernel(
     head_dim: tl.constexpr,
     num_groups: tl.constexpr,
     softmax_scale: tl.constexpr,
+    q_len_per_req: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     token = tl.program_id(0)
     block_id = tl.program_id(1)
+    req = token // q_len_per_req
     offsets = block_id * BLOCK_N + tl.arange(0, BLOCK_N)
-    seq_len = tl.load(seq_lens + token).to(tl.int32)
+    base = tl.load(seq_lens + req).to(tl.int32)
+    seq_len = base - (q_len_per_req - 1) + (token % q_len_per_req)
+    seq_len = tl.maximum(seq_len, 0)
     valid = offsets < seq_len
     block_idx = offsets // page_size
     block_offset = offsets - block_idx * page_size
     valid = valid & (offsets < max_seq_len)
     page = tl.load(
-        block_table + token * block_table_stride + block_idx,
+        block_table + req * block_table_stride + block_idx,
         mask=valid,
         other=0,
     ).to(tl.int64)
@@ -814,19 +830,27 @@ def dsa_decode_topk_fp8(
     page_size: int,
     topk: int,
     softmax_scale: float,
+    q_len_per_req: int = 1,
     out: torch.Tensor | None = None,
     lens_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     row_bytes = _check_packed_fp8_inputs(q, index_k_cache, weights, page_size)
-    if seq_lens.dim() != 1 or seq_lens.numel() != q.shape[0]:
+    q_len_per_req = int(q_len_per_req)
+    if q_len_per_req < 1 or q.shape[0] % q_len_per_req != 0:
         raise ValueError(
-            "seq_lens must be [tokens], got "
-            f"{tuple(seq_lens.shape)} for q={tuple(q.shape)}"
+            f"q_len_per_req={q_len_per_req} must divide tokens={q.shape[0]}"
         )
-    if block_table.dim() != 2 or block_table.shape[0] < q.shape[0]:
+    num_reqs = q.shape[0] // q_len_per_req
+    if seq_lens.dim() != 1 or seq_lens.numel() != num_reqs:
         raise ValueError(
-            "block_table must have at least one row per token, got "
-            f"block_table={tuple(block_table.shape)}, q={tuple(q.shape)}"
+            "seq_lens must be [num_reqs], got "
+            f"{tuple(seq_lens.shape)} for q={tuple(q.shape)}, "
+            f"q_len_per_req={q_len_per_req}"
+        )
+    if block_table.dim() != 2 or block_table.shape[0] < num_reqs:
+        raise ValueError(
+            "block_table must have at least one row per request, got "
+            f"block_table={tuple(block_table.shape)}, num_reqs={num_reqs}"
         )
     if topk <= 0:
         raise ValueError(f"topk must be positive, got {topk}")
@@ -874,6 +898,7 @@ def dsa_decode_topk_fp8(
         head_dim=q.shape[2],
         num_groups=q.shape[2] // 128,
         softmax_scale=float(softmax_scale),
+        q_len_per_req=q_len_per_req,
         BLOCK_N=block_n,
         BLOCK_D=64,
         num_warps=4,
@@ -885,6 +910,7 @@ def dsa_decode_topk_fp8(
         block_table=block_table,
         block_size=int(page_size),
         seq_lens=seq_lens,
+        q_len_per_req=q_len_per_req,
         out=out,
         lens_out=lens_out,
     )
@@ -992,7 +1018,7 @@ def dsa_prefill_topk_fp8(
     name="triton_dsa_plan",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
-    signatures=frozenset({format_signature(seq_lens=dense_tensor_format(torch.int32))}),
+    signatures=frozenset({format_signature()}),
     traits={
         "page_size": frozenset({64}),
     },
@@ -1000,46 +1026,13 @@ def dsa_prefill_topk_fp8(
     tags={"portability"},
 )
 def triton_dsa_plan(
-    seq_lens: torch.Tensor,
     *,
     page_size: int,
-    q_len_per_req: int = 1,
+    seq_lens_2d: torch.Tensor,
     out: object | None = None,
 ) -> torch.Tensor:
-    q_len_per_req = int(q_len_per_req)
-    seq_lens = seq_lens.to(dtype=torch.int32).contiguous()
-    if seq_lens.dim() == 1:
-        seq_lens = seq_lens.view(-1, q_len_per_req).contiguous()
-    else:
-        seq_lens = seq_lens.contiguous()
-    refreshed = torch.empty(
-        (seq_lens.shape[0], 4), dtype=torch.int32, device=seq_lens.device
-    )
-    refreshed[:, 0].copy_(seq_lens[:, 0])
-    refreshed[:, 1].copy_(seq_lens[:, -1])
-    refreshed[:, 2].fill_(q_len_per_req)
-    refreshed[:, 3].fill_(int(page_size))
-    if out is None:
-        return refreshed
-    if (
-        not isinstance(out, torch.Tensor)
-        or out.shape != refreshed.shape
-        or out.device != refreshed.device
-        or out.dtype != refreshed.dtype
-    ):
-        actual = (
-            f"{tuple(out.shape)} {out.dtype} {out.device}"
-            if isinstance(out, torch.Tensor)
-            else type(out).__name__
-        )
-        raise RuntimeError(
-            "DSA paged top-k plan changed shape during CUDA graph replay; "
-            "recapture or use eager for this batch. "
-            f"captured={actual}, refreshed={tuple(refreshed.shape)} "
-            f"{refreshed.dtype} {refreshed.device}"
-        )
-    out.copy_(refreshed)
-    return out
+    # plan is unused
+    return object() if out is None else out
 
 
 @register_kernel(
@@ -1076,6 +1069,7 @@ def triton_dsa_decode_topk_fp8(
     softmax_scale: float,
     q_len_per_req: int = 1,
     index_k_cache: torch.Tensor | None = None,
+    seq_lens_2d: torch.Tensor | None = None,
     plan: object | None = None,
     out: torch.Tensor | None = None,
     lens_out: torch.Tensor | None = None,
@@ -1091,6 +1085,7 @@ def triton_dsa_decode_topk_fp8(
         page_size=page_size,
         topk=topk,
         softmax_scale=softmax_scale,
+        q_len_per_req=q_len_per_req,
         out=out,
         lens_out=lens_out,
     )

@@ -24,18 +24,8 @@ from tokenspeed_kernel_amd.ops.moe.fused_mxfp_gfx950 import (  # noqa: E402
     _gluon_mxfp4_fp8_warp_decode_moe,
 )
 from tokenspeed_kernel_amd.ops.moe.mxfp4_gfx950_preprocess import (  # noqa: E402
-    PrecisionConfig,
+    preprocess_gluon_mxfp4_gfx950_moe_weights,
 )
-
-try:
-    from tokenspeed.runtime.layers.moe.backends.mxfp4.triton_kernel import (
-        swizzle_mxfp4,
-    )
-except ImportError as exc:
-    pytest.skip(
-        f"tokenspeed runtime MXFP4 swizzle helper is required: {exc}",
-        allow_module_level=True,
-    )
 
 # Standard OCP MXFP4 (E2M1) value table; index is the 4-bit code.
 _E2M1_VALUES = [
@@ -103,12 +93,34 @@ def _build_case(
         torch.randn((E, D), device=device, dtype=torch.float32) if use_bias else None
     )
 
-    wt13, _w13_flex, st13 = swizzle_mxfp4(w13, s13, 8)
-    wt2, _w2_flex, st2 = swizzle_mxfp4(w2, s2, 8)
     scale1 = torch.ones((1,), device=device, dtype=torch.float32)
     scale2 = torch.ones((1,), device=device, dtype=torch.float32)
-    pc1 = PrecisionConfig(b_mx_scale=st13, out_dtype=torch.bfloat16)
-    pc2 = PrecisionConfig(b_mx_scale=st2, out_dtype=torch.bfloat16)
+
+    layer = torch.nn.Module()
+    layer.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
+    layer.w13_weight_scale = torch.nn.Parameter(s13, requires_grad=False)
+    layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
+    layer.w2_weight_scale = torch.nn.Parameter(s2, requires_grad=False)
+    layer.w13_weight_bias = torch.nn.Parameter(
+        (
+            w13_bias
+            if w13_bias is not None
+            else torch.zeros((E, 2 * I), device=device, dtype=torch.float32)
+        ),
+        requires_grad=False,
+    )
+    layer.w2_weight_bias = torch.nn.Parameter(
+        (
+            w2_bias
+            if w2_bias is not None
+            else torch.zeros((E, D), device=device, dtype=torch.float32)
+        ),
+        requires_grad=False,
+    )
+    layer.w13_input_scale = torch.nn.Parameter(scale1, requires_grad=False)
+    layer.w2_input_scale = torch.nn.Parameter(scale2, requires_grad=False)
+    preprocess_gluon_mxfp4_gfx950_moe_weights({}, layer)
+
     return {
         "M": M,
         "E": E,
@@ -120,14 +132,14 @@ def _build_case(
         "router": router,
         "w13": w13,
         "w2": w2,
-        "w13_bias": w13_bias,
-        "w2_bias": w2_bias,
-        "wt13": wt13,
-        "wt2": wt2,
-        "pc1": pc1,
-        "pc2": pc2,
-        "scale1": scale1,
-        "scale2": scale2,
+        "w13_bias": layer.w13_weight_bias if use_bias else None,
+        "w2_bias": layer.w2_weight_bias if use_bias else None,
+        "wt13": layer.w13_weight_triton_tensor,
+        "wt2": layer.w2_weight_triton_tensor,
+        "pc1": layer.w13_precision_config,
+        "pc2": layer.w2_precision_config,
+        "scale1": layer.w13_act_scale,
+        "scale2": layer.w2_act_scale,
     }
 
 
@@ -189,8 +201,10 @@ def _reference(case: dict) -> torch.Tensor:
             gate_up = hidden_fp8[m : m + 1] @ w13_f.T
             if use_bias:
                 gate_up = gate_up + w13_bias[expert][None, :]
-            gate = torch.minimum(gate_up[:, :I], seven)
-            linear = torch.clamp(gate_up[:, I:], -7.0, 7.0)
+            # W13 rows are interleaved gate/up pairs, matching _swiglu_reduce.
+            gate, linear = gate_up.reshape(gate_up.shape[0], I, 2).unbind(dim=-1)
+            gate = torch.minimum(gate, seven)
+            linear = torch.clamp(linear, -7.0, 7.0)
             inter = (gate / (1.0 + torch.exp(-1.702 * gate))) * (linear + 1.0)
             inter_fp8 = inter.to(_FP8_DTYPE).to(torch.float32)
             second = inter_fp8 @ w2_f.T

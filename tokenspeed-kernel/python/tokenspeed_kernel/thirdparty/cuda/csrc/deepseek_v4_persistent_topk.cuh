@@ -18,6 +18,22 @@
 #include <cstdint>
 
 namespace vllm {
+
+// Per-row visible KV length for DSA decode top-k. q_len_per_req == 1 keeps the
+// legacy per-token behavior (lengths[row]); q_len_per_req > 1 treats `lengths`
+// as per-request and applies the verify causal bound
+// lengths[row / q] - (q - 1) + (row % q), clamped to >= 0.
+__device__ __forceinline__ uint32_t dsa_topk_row_seq_len(
+    const int32_t* __restrict__ lengths, uint32_t row, uint32_t q_len_per_req) {
+  if (q_len_per_req <= 1) {
+    return static_cast<uint32_t>(lengths[row]);
+  }
+  uint32_t req = row / q_len_per_req;
+  int j = static_cast<int>(row - req * q_len_per_req);
+  int v = lengths[req] - (static_cast<int>(q_len_per_req) - 1) + j;
+  return v > 0 ? static_cast<uint32_t>(v) : 0;
+}
+
 namespace persistent {
 
 // ============================================================================
@@ -142,6 +158,7 @@ struct PersistentTopKParams {
   uint32_t chunk_size;      // large path: elements per CTA
   uint32_t ctas_per_group;  // 1=medium, >1=large
   uint32_t max_seq_len;     // max seq_len across all rows (for early CTA exit)
+  uint32_t q_len_per_req;   // >1: `lengths` is per-request (verify causal bound)
 };
 
 // ============================================================================
@@ -901,7 +918,8 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
     uint32_t row_idx = group_id + iter * num_groups;
     if (row_idx >= params.num_rows) break;
 
-    const uint32_t seq_len = params.lengths[row_idx];
+    const uint32_t seq_len =
+        dsa_topk_row_seq_len(params.lengths, row_idx, params.q_len_per_req);
     int32_t* row_output = params.output + row_idx * params.top_k;
     const float* row_input = params.input + row_idx * params.stride;
 
@@ -1016,7 +1034,7 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
                               IdType* __restrict__ output,
                               const IdType* __restrict__ lengths,
                               uint32_t num_rows, uint32_t top_k,
-                              uint32_t max_len) {
+                              uint32_t max_len, uint32_t q_len_per_req) {
   constexpr uint32_t BLOCK_SIZE = FILTERED_TOPK_BLOCK_THREADS;
   constexpr int RADIX = 256;
   constexpr int SMEM_INPUT_SIZE = FILTERED_TOPK_SMEM_INPUT_SIZE;
@@ -1027,7 +1045,9 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
   if (bid >= num_rows) return;
 
   const int length =
-      (lengths != nullptr) ? lengths[bid] : static_cast<int>(max_len);
+      (lengths != nullptr)
+          ? static_cast<int>(dsa_topk_row_seq_len(lengths, bid, q_len_per_req))
+          : static_cast<int>(max_len);
   const DType* score = input + bid * max_len;
   IdType* dst = output + bid * top_k;
 
@@ -1269,14 +1289,15 @@ template <typename DType, typename IdType, uint32_t MAX_K = 2048>
 cudaError_t FilteredTopKRaggedTransform(DType* input, IdType* output_indices,
                                         IdType* lengths, uint32_t num_rows,
                                         uint32_t top_k_val, uint32_t max_len,
+                                        uint32_t q_len_per_req,
                                         cudaStream_t stream = 0) {
   constexpr size_t smem_size = FILTERED_TOPK_SMEM_DYNAMIC;
   constexpr int MAX_VEC = 16 / sizeof(DType);
 
   dim3 grid(num_rows);
   dim3 block(FILTERED_TOPK_BLOCK_THREADS);
-  void* args[] = {&input,    &output_indices, &lengths,
-                  &num_rows, &top_k_val,      &max_len};
+  void* args[] = {&input,    &output_indices, &lengths,       &num_rows,
+                  &top_k_val, &max_len,       &q_len_per_req};
 
   const int vec_size = ComputeFilteredTopKVecSize<DType>(max_len);
 

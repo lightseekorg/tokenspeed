@@ -18,14 +18,24 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from __future__ import annotations
+"""The kernel autotune-lifecycle switch the executor flips at end of startup."""
 
-# Backend registration (side-effect imports)
-import tokenspeed_kernel.ops.attention.triton.dsa  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.dsa_topk  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.gated_delta_rule  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.merge_state  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.mha_decode  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.mha_prefill  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.mla_decode  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.mla_prefill  # noqa: F401
+import unittest
+
+from tokenspeed_kernel.ops import tuning
+
+
+class TestAutotuneFreeze(unittest.TestCase):
+    def tearDown(self):
+        tuning._frozen = False  # global switch; restore for other tests
+
+    def test_freeze_is_one_way_and_idempotent(self):
+        self.assertFalse(tuning.autotune_frozen())
+        tuning.freeze_autotuning()
+        self.assertTrue(tuning.autotune_frozen())
+        tuning.freeze_autotuning()
+        self.assertTrue(tuning.autotune_frozen())
+
+
+if __name__ == "__main__":
+    unittest.main()

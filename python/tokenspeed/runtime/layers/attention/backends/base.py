@@ -26,6 +26,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
+
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
     from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
@@ -160,6 +162,7 @@ class AttentionBackend(ABC):
         if record_cache and save_kv_cache:
             self.step_counter.record_cache()
 
+    @break_point
     def forward(
         self,
         q: torch.Tensor,

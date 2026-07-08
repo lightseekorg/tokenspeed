@@ -18,14 +18,29 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from __future__ import annotations
+"""Kernel autotune lifecycle.
 
-# Backend registration (side-effect imports)
-import tokenspeed_kernel.ops.attention.triton.dsa  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.dsa_topk  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.gated_delta_rule  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.merge_state  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.mha_decode  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.mha_prefill  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.mla_decode  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.mla_prefill  # noqa: F401
+Ops that autotune lazily (e.g. the flashinfer trtllm MoE) consult
+:func:`autotune_frozen` before starting a new tuning run. The runtime calls
+:func:`freeze_autotuning` once engine startup (model load, CUDA-graph capture,
+warmup) completes, because an autotune during serving is a hazard twice over:
+it blocks the launch thread for the whole profiling run, and under tensor
+parallelism ranks that tune at different times miss their next collective and
+deadlock. Shapes first seen after the freeze run on each library's fallback
+tactics instead -- slower, never stalled.
+"""
+
+__all__ = ["autotune_frozen", "freeze_autotuning"]
+
+_frozen = False
+
+
+def autotune_frozen() -> bool:
+    """Whether lazy autotuning is frozen (engine is serving)."""
+    return _frozen
+
+
+def freeze_autotuning() -> None:
+    """Disallow any further lazy autotune runs (call once startup completes)."""
+    global _frozen
+    _frozen = True

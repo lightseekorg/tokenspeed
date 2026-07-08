@@ -121,49 +121,7 @@ class DSABackend(AttentionBackend):
         return self._dense_backend.override_num_extends(num_extends)
 
     def init_cuda_graph_state(self, max_bs: int, seq_lens_buf: torch.Tensor):
-        return self._dense_backend.init_cuda_graph_state(max_bs, seq_lens_buf)
-
-    def _clear_metadata_caches(self) -> None:
-        metadata_objects = [
-            self.forward_decode_metadata,
-            self.forward_prefill_metadata,
-        ]
-        metadata_objects.extend(self.decode_cuda_graph_metadata.values())
-        seen = set()
-        for metadata in metadata_objects:
-            if metadata is None or id(metadata) in seen:
-                continue
-            seen.add(id(metadata))
-            for attr in tuple(vars(metadata)):
-                if attr.startswith("_dsa_") and attr.endswith("_cache"):
-                    delattr(metadata, attr)
-
-    def _refresh_decode_topk_schedule_metadata(self, bs: int) -> None:
-        metadata = getattr(self._dense_backend, "forward_decode_metadata", None)
-        if metadata is None:
-            return
-        plan = getattr(metadata, "_dsa_plan", None)
-        if plan is None:
-            return
-
-        q_len = int(getattr(metadata, "_dsa_plan_q_len", 1) or 1)
-        base_lens = metadata.seq_lens_k[:bs].to(torch.int32)
-        if q_len == 1:
-            seq_lens = base_lens.contiguous()
-        else:
-            offsets = torch.arange(
-                1 - q_len, 1, device=base_lens.device, dtype=torch.int32
-            )
-            seq_lens = (
-                (base_lens.view(-1, 1) + offsets.view(1, -1)).clamp_min_(0).contiguous()
-            )
-        with torch.inference_mode():
-            dsa_plan(
-                seq_lens=seq_lens,
-                page_size=self.page_size,
-                q_len_per_req=q_len,
-                out=plan,
-            )
+        self._dense_backend.init_cuda_graph_state(max_bs, seq_lens_buf)
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -172,14 +130,21 @@ class DSABackend(AttentionBackend):
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
     ):
-        result = self._dense_backend.init_forward_metadata_capture_cuda_graph(
+        self._dense_backend.init_forward_metadata_capture_cuda_graph(
             bs=bs,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             forward_mode=forward_mode,
         )
-        self._clear_metadata_caches()
-        return result
+        metadata = self.forward_decode_metadata
+        # Full-length broadcast: the plan and paged-MQA-logits kernels read only
+        # the last column, and the per-token causal bound is applied downstream.
+        metadata._dsa_seq_lens_2d = (
+            seq_lens.unsqueeze(1).expand(-1, self.spec_num_tokens).contiguous()
+        )
+        metadata._dsa_plan = dsa_plan(
+            seq_lens_2d=metadata._dsa_seq_lens_2d, page_size=self.page_size
+        )
 
     def init_forward_metadata_replay_cuda_graph(
         self,
@@ -190,7 +155,7 @@ class DSABackend(AttentionBackend):
         req_to_page: torch.Tensor = None,
         **kwargs,
     ):
-        result = self._dense_backend.init_forward_metadata_replay_cuda_graph(
+        self._dense_backend.init_forward_metadata_replay_cuda_graph(
             bs=bs,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
@@ -198,8 +163,15 @@ class DSABackend(AttentionBackend):
             req_to_page=req_to_page,
             **kwargs,
         )
-        self._refresh_decode_topk_schedule_metadata(bs)
-        return result
+        metadata = self.forward_decode_metadata
+        metadata._dsa_seq_lens_2d.copy_(
+            seq_lens.unsqueeze(1).expand(-1, self.spec_num_tokens)
+        )
+        dsa_plan(
+            seq_lens_2d=metadata._dsa_seq_lens_2d,
+            page_size=self.page_size,
+            out=metadata._dsa_plan,
+        )
 
     def get_cuda_graph_seq_len_fill_value(self):
         return self._dense_backend.get_cuda_graph_seq_len_fill_value()
@@ -212,7 +184,12 @@ class DSABackend(AttentionBackend):
             metadata.seq_lens_k.add_(1)
         else:
             metadata.seq_lens_k.copy_(seq_lens[: metadata.seq_lens_k.numel()])
-        self._refresh_decode_topk_schedule_metadata(metadata.seq_lens_k.numel())
+
+        dsa_plan(
+            seq_lens_2d=metadata.seq_lens_k.unsqueeze(1),
+            page_size=self.page_size,
+            out=metadata._dsa_plan,
+        )
 
     def init_forward_metadata(
         self,
@@ -225,7 +202,7 @@ class DSABackend(AttentionBackend):
         spec_info=None,
         **kwargs,
     ):
-        out = self._dense_backend.init_forward_metadata(
+        self._dense_backend.init_forward_metadata(
             bs=bs,
             num_extends=num_extends,
             req_pool_indices=req_pool_indices,
@@ -235,6 +212,26 @@ class DSABackend(AttentionBackend):
             spec_info=spec_info,
             **kwargs,
         )
+        if (
+            forward_mode.is_decode()
+            or forward_mode.is_mixed()
+            or (forward_mode.is_extend() and self.is_draft)
+        ):
+            metadata = self.forward_decode_metadata
+            # Full-length broadcast: the plan and paged-MQA-logits kernels read only
+            # the last column, and the per-token causal bound is applied downstream.
+            metadata._dsa_seq_lens_2d = (
+                seq_lens.unsqueeze(1).expand(-1, self.spec_num_tokens).contiguous()
+            )
+            if num_extends < bs:
+                seq_lens_2d = metadata._dsa_seq_lens_2d[num_extends:]
+            else:
+                # The dsa_plan is unused, alias to full-batch seq_lens_2d to generate dsa_plan as a placeholder
+                seq_lens_2d = metadata._dsa_seq_lens_2d
+            metadata._dsa_plan = dsa_plan(
+                seq_lens_2d=seq_lens_2d, page_size=self.page_size
+            )
+
         self._prefill_block_tables = None
         if (
             num_extends > 0
@@ -247,7 +244,6 @@ class DSABackend(AttentionBackend):
                 ext_idx = cmeta_req_pool_indices[:num_extends].long()
                 self._prefill_block_tables = req_to_page[ext_idx]
                 cmeta.block_tables = self._prefill_block_tables
-        return out
 
     def _validate_logit_cap(self, logits_soft_cap: float) -> None:
         if logits_soft_cap and logits_soft_cap > 0:

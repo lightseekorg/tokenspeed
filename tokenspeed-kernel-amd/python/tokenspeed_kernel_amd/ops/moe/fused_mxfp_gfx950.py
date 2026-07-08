@@ -4495,14 +4495,19 @@ def _medium_decode_body(
     lwn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, LOAD_W_LAYOUT))[None, :]
 
     local_m_l = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, LOAD_X_LAYOUT))
-    local_m_l = gl.max_contiguous(gl.multiple_of(local_m_l % m_size, BLOCK_M), BLOCK_M)
+    valid_m_l = local_m_l < m_size
+    safe_local_m_l = gl.where(valid_m_l, local_m_l, gl.zeros_like(local_m_l))
+    sorted_l = m_base + safe_local_m_l
     if MEDIUM_COMBINE:
         # Combine reads the sorted (contiguous) X rows directly.
-        row_addr = m_base + local_m_l
+        row_addr = sorted_l
     else:
         # Dispatch gathers the routed token rows for this expert block.
         token_m_l = gl.amd.cdna4.buffer_load(
-            ptr=Gather, offsets=(m_base + local_m_l).to(gl.int32)
+            ptr=Gather,
+            offsets=sorted_l.to(gl.int32),
+            mask=valid_m_l,
+            other=0,
         ).to(gl.int32)
         row_addr = token_m_l.to(gl.uint32)
 
@@ -4610,21 +4615,26 @@ def _medium_decode_body(
         STORE_LAYOUT: gl.constexpr = out.type.layout
         n_out = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, gl.SliceLayout(0, STORE_LAYOUT))
         local_store_m = gl.arange(0, BLOCK_M, gl.SliceLayout(1, STORE_LAYOUT))
-        local_store_m = gl.max_contiguous(
-            gl.multiple_of(local_store_m % m_size, BLOCK_M), BLOCK_M
+        valid_store = local_store_m < m_size
+        safe_store_m = gl.where(
+            valid_store, local_store_m, gl.zeros_like(local_store_m)
         )
-        sorted_store = m_base + local_store_m
-        scatter_row = gl.load(Scatter + sorted_store).to(gl.int32)
-        gate = gl.load(Gate + sorted_store).to(Y.dtype.element_ty)
+        sorted_store = m_base + safe_store_m
+        scatter_row = gl.load(Scatter + sorted_store, mask=valid_store, other=0).to(
+            gl.int32
+        )
+        gate = gl.load(Gate + sorted_store, mask=valid_store, other=0.0).to(
+            Y.dtype.element_ty
+        )
         out = out * gate[:, None]
         y_offs = (
             scatter_row[:, None].to(gl.int64) * stride_ym
             + n_out[None, :].to(gl.int64) * stride_yn
         )
         if Y_N_CONST:
-            store_mask = n_out[None, :] < Y_N_CONST
+            store_mask = valid_store[:, None] & (n_out[None, :] < Y_N_CONST)
         else:
-            store_mask = n_out[None, :] < N
+            store_mask = valid_store[:, None] & (n_out[None, :] < N)
         _moe_masked_store(out, Y, y_offs, store_mask, USE_BUFFER_STORE=False)
     else:
         if HAS_BIAS:
@@ -6682,7 +6692,13 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
     COOP_NUM_WARPS = 4
     COOP_BLOCK_N = 128 if w13_preshuffled else 64
     COOP_BLOCK_K = 256
-    COOP_NUM_BUFFERS = 3
+    coop_k_iters = (D + COOP_BLOCK_K - 1) // COOP_BLOCK_K
+    coop_even_k = D % COOP_BLOCK_K == 0
+    # decode_pipeline() prefetches NUM_BUFFERS-1 tiles before the main loop.
+    # For short synthetic shapes (for example D=256) the fixed 3-buffer GPT-OSS
+    # schedule over-prefetches past the only real K tile. Keep the production
+    # 3-buffer schedule when possible, but shrink the pipeline for short K.
+    COOP_NUM_BUFFERS = min(3, coop_k_iters + (1 if coop_even_k else 0))
     coop_grid = (n_tokens * ((2 * i_dim + COOP_BLOCK_N - 1) // COOP_BLOCK_N) * top_k,)
     # X is stored as raw i8 in LDS and bitcast to e4m3 in mfma_scaled; pass the
     # uint8 view (an fp8 LDS buffer fails to lower).
@@ -6705,6 +6721,7 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
         BLOCK_K=COOP_BLOCK_K, BLOCK_N=COOP_BLOCK_N, BLOCK_M=16,
         NUM_BUFFERS=COOP_NUM_BUFFERS, NUM_WARPS=COOP_NUM_WARPS,
         W_PRESHUFFLED=w13_preshuffled,
+        EVEN_K=coop_even_k,
         HAS_BIAS=w13_bias is not None,
         SWIGLU_ALPHA=float(swiglu_alpha), SWIGLU_LIMIT=float(swiglu_limit),
         num_warps=COOP_NUM_WARPS,
@@ -6981,18 +6998,32 @@ def _fused_topk(
     # value order, matching topk_forward's output slot order. Results are
     # written column-by-column into [MP, TKP] tiles (no python lists, which
     # gluon tracing does not support).
-    big = gl.full([MP, EP], E, gl.int32, layout=LT)
     tcol = gl.expand_dims(gl.arange(0, TKP, layout=gl.SliceLayout(0, LT)), 0)  # [1,TKP]
     val_t = gl.full([MP, TKP], -1e30, gl.float32, layout=LT)  # finite -inf-ish
     idx_t = gl.zeros([MP, TKP], gl.int32, layout=LT)
+    live = lmask
+    topmask = gl.full([MP, EP], 0x80000000, gl.uint32, layout=LT)
+    fullmask = gl.full([MP, EP], 0xFFFFFFFF, gl.uint32, layout=LT)
+    zero_pack = gl.full([MP, EP], 0, gl.uint64, layout=LT)
     for _r in gl.static_range(TOPK):
-        vmax = gl.max(cur, axis=1, keep_dims=True)  # [MP,1]
-        ismax = (cur == vmax) & (col < E)
-        amax = gl.min(gl.where(ismax, col, big), axis=1, keep_dims=True)  # [MP,1]
+        # Match the generic Triton top-k strategy: rank a packed key that
+        # carries both the float value ordering and the expert index. This keeps
+        # the selected index valid even for NaN/inf logits, without remapping the
+        # original selected value used by the softmax below.
+        raw = cur.to(gl.uint32, bitcast=True)
+        value_key = raw ^ gl.where((raw & topmask) != 0, fullmask, topmask)
+        index_key = (EP - col).to(gl.uint32)
+        packed = (value_key.to(gl.uint64) << 16) | index_key.to(gl.uint64)
+        packed = gl.where(live, packed, zero_pack)
+        best = gl.max(packed, axis=1, keep_dims=True)
+        amax_key = (best & 0xFFFF).to(gl.int32)
+        amax = (EP - amax_key).to(gl.int32)  # [MP,1]
+        chosen = live & (col == amax)
+        vmax = gl.sum(gl.where(chosen, cur, gl.zeros_like(cur)), axis=1, keep_dims=True)
         sel = tcol == _r  # [1,TKP]
         val_t = gl.where(sel, vmax, val_t)  # write column _r
         idx_t = gl.where(sel, amax, idx_t)
-        cur = gl.where(col == amax, NEG, cur)  # drop chosen expert
+        live = live & (col != amax)  # drop chosen expert
 
     # ---- softmax over the selected logits (matches tl.softmax in fp32) -----
     # z = x - max(x); num = exp(z); den = sum(num); gate = fdiv(num, den).
@@ -7279,6 +7310,7 @@ def _warp_decode_stage1_coop_compute(
     NUM_BUFFERS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     W_PRESHUFFLED: gl.constexpr,
+    EVEN_K: gl.constexpr,
     HAS_BIAS: gl.constexpr,
     SWIGLU_ALPHA: gl.constexpr,
     SWIGLU_LIMIT: gl.constexpr,
@@ -7311,7 +7343,7 @@ def _warp_decode_stage1_coop_compute(
         "swizzle",  # SCALE_LOAD_MODE -> W_SCALE_VIA_LDS unswizzle
         gl.int32,
         (1, 1, 1),  # NUM_SUBTILES
-        False,  # EVEN_K (D=2880 not a multiple of BLOCK_K)
+        EVEN_K,
         False,  # USE_GATHER
         NUM_WARPS,
         W_PRESHUFFLED=W_PRESHUFFLED,
@@ -7516,6 +7548,7 @@ def _warp_decode_topk_stage1_coop_kernel(
     NUM_BUFFERS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     W_PRESHUFFLED: gl.constexpr,
+    EVEN_K: gl.constexpr,
     HAS_BIAS: gl.constexpr,
     SWIGLU_ALPHA: gl.constexpr,
     SWIGLU_LIMIT: gl.constexpr,
@@ -7546,15 +7579,25 @@ def _warp_decode_topk_stage1_coop_kernel(
     t = gl.arange(0, TKP, layout=LT)
     val_t = gl.full([TKP], -1e30, gl.float32, layout=LT)
     idx_t = gl.zeros([TKP], gl.int32, layout=LT)
-    big = gl.full([EP], E, gl.int32, layout=LE)
+    live = (token < M) & emask
+    topmask = gl.full([EP], 0x80000000, gl.uint32, layout=LE)
+    fullmask = gl.full([EP], 0xFFFFFFFF, gl.uint32, layout=LE)
+    zero_pack = gl.full([EP], 0, gl.uint64, layout=LE)
     for r in gl.static_range(TOPK):
-        vmax = gl.max(cur, axis=0)
-        ismax = (cur == vmax) & emask
-        amax = gl.min(gl.where(ismax, e, big), axis=0)
+        raw = cur.to(gl.uint32, bitcast=True)
+        value_key = raw ^ gl.where((raw & topmask) != 0, fullmask, topmask)
+        index_key = (EP - e).to(gl.uint32)
+        packed = (value_key.to(gl.uint64) << 16) | index_key.to(gl.uint64)
+        packed = gl.where(live, packed, zero_pack)
+        best = gl.max(packed, axis=0)
+        amax_key = (best & 0xFFFF).to(gl.int32)
+        amax = (EP - amax_key).to(gl.int32)
+        chosen = live & (e == amax)
+        vmax = gl.sum(gl.where(chosen, cur, gl.zeros_like(cur)), axis=0)
         sel = t == r
         val_t = gl.where(sel, vmax, val_t)
         idx_t = gl.where(sel, amax, idx_t)
-        cur = gl.where(e == amax, float("-inf"), cur)
+        live = live & (e != amax)
     rmax = gl.max(val_t, axis=0)
     num = gl.exp(val_t - rmax)
     den = gl.sum(num, axis=0)
@@ -7587,7 +7630,7 @@ def _warp_decode_topk_stage1_coop_kernel(
         stride_ym, stride_yn,
         x_global_scale_ptr, out_quant_scale_ptr, w13_bias,
         TOPK, BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS, NUM_WARPS,
-        W_PRESHUFFLED, HAS_BIAS, SWIGLU_ALPHA, SWIGLU_LIMIT,
+        W_PRESHUFFLED, EVEN_K, HAS_BIAS, SWIGLU_ALPHA, SWIGLU_LIMIT,
     )
     # fmt: on
 

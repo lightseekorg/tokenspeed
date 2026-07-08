@@ -34,6 +34,7 @@ import tokenspeed_kernel.ops.attention.cuda as _attention_cuda
 import tokenspeed_kernel.ops.attention.flash_attn as _attention_flash_attn
 import tokenspeed_kernel.ops.attention.flash_mla as _attention_flash_mla
 import tokenspeed_kernel.ops.attention.flashinfer as _attention_flashinfer
+import tokenspeed_kernel.ops.attention.flashinfer.gated_delta_rule as _attention_flashinfer_gdn
 import tokenspeed_kernel.ops.attention.gluon as _attention_gluon
 import tokenspeed_kernel.ops.attention.triton as _attention_triton
 import tokenspeed_kernel.ops.gemm as _gemm_pkg
@@ -49,9 +50,13 @@ import tokenspeed_kernel.ops.sampling as _sampling_pkg
 import tokenspeed_kernel.ops.sampling.cute_dsl as _sampling_cute_dsl
 import tokenspeed_kernel.ops.sampling.gluon as _sampling_gluon
 import torch
+from tokenspeed_kernel.ops.attention.gdn_utils import GdnChunkPrefillResult
 from tokenspeed_kernel.ops.attention.triton import dsa as _attention_triton_dsa
 from tokenspeed_kernel.ops.attention.triton import (
     dsa_topk as _attention_triton_dsa_topk,
+)
+from tokenspeed_kernel.ops.attention.triton import (
+    gated_delta_rule as _attention_triton_gdn,
 )
 from tokenspeed_kernel.ops.attention.triton import (
     merge_state as _attention_triton_merge_state,
@@ -91,6 +96,7 @@ _RELOAD_MODULES = [
     _attention_cuda,
     _attention_flash_attn,
     _attention_flash_mla,
+    _attention_flashinfer_gdn,
     _attention_flashinfer,
     _attention_gluon,
     _attention_triton_mha_prefill,
@@ -100,6 +106,7 @@ _RELOAD_MODULES = [
     _attention_triton_merge_state,
     _attention_triton_dsa,
     _attention_triton_dsa_topk,
+    _attention_triton_gdn,
     _attention_triton,
     _attention_pkg,
     # GEMM registration modules.
@@ -548,8 +555,8 @@ def _attention_dsa_prefill_topk() -> object:
 
 
 def _attention_dsa_plan() -> object:
-    seq_lens = torch.tensor([64, 64], dtype=torch.int32)
-    return tokenspeed_kernel.dsa_plan(seq_lens, page_size=64)
+    seq_lens_2d = torch.tensor([[64], [64]], dtype=torch.int32)
+    return tokenspeed_kernel.dsa_plan(seq_lens_2d=seq_lens_2d, page_size=64)
 
 
 def _attention_merge_state() -> object:
@@ -558,6 +565,28 @@ def _attention_merge_state() -> object:
     lse_a = torch.empty((4, 16), dtype=torch.float32)
     lse_b = torch.empty((4, 16), dtype=torch.float32)
     return tokenspeed_kernel.attn_merge_state(out_a, lse_a, out_b, lse_b)
+
+
+def _attention_gdn_chunk_prefill() -> object:
+    q = torch.empty((1, 4, 16, 64), dtype=torch.bfloat16)
+    k = torch.empty((1, 4, 16, 64), dtype=torch.bfloat16)
+    v = torch.empty((1, 4, 16, 64), dtype=torch.bfloat16)
+    g = torch.empty((1, 4, 16), dtype=torch.bfloat16)
+    beta = torch.empty((1, 4, 16), dtype=torch.bfloat16)
+    initial_state = torch.empty((1, 16, 64, 64), dtype=torch.bfloat16)
+    cu_seqlens = torch.tensor([0, 4], dtype=torch.int32)
+    return tokenspeed_kernel.gdn_chunk_prefill(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        scale=64**-0.5,
+        initial_state=initial_state,
+        cu_seqlens=cu_seqlens,
+        qk_l2norm=True,
+        solution="triton",
+    )
 
 
 def _sampling_argmax() -> object:
@@ -981,7 +1010,7 @@ _CASES = [
         "hopper",
         "attention",
         "attn_merge_state",
-        "triton_attn_merge_state",
+        "cuda_attn_merge_state",
         _attention_merge_state,
     ),
     _case(
@@ -1053,7 +1082,7 @@ _CASES = [
         "cdna4",
         "attention",
         "mha_extend_with_kvcache",
-        "triton_mha_extend_with_kvcache",
+        "gluon_mha_extend_fp16_gfx950",
         _attention_extend,
     ),
     _case(
@@ -1111,6 +1140,14 @@ _CASES = [
         "dsa_plan",
         "triton_dsa_plan",
         _attention_dsa_plan,
+    ),
+    _case(
+        _is_supported_gpu,
+        "supported-gpu",
+        "attention",
+        "gdn_chunk_prefill",
+        "triton_gdn_chunk_prefill",
+        _attention_gdn_chunk_prefill,
     ),
     # GEMM API x architecture golden cases.
     _case(_is_supported_gpu, "supported-gpu", "gemm", "mm", "torch_mm", _mm_dense),
@@ -1309,8 +1346,12 @@ def selected_kernel_spy(monkeypatch):
                 )
             if case.mode == "dsa_plan":
                 return torch.empty((1, 4), dtype=torch.int32)
-
             q = kwargs["q"]
+            if case.mode == "gdn_chunk_prefill":
+                return GdnChunkPrefillResult(
+                    out=torch.empty_like(q),
+                    final_state=kwargs.get("initial_state"),
+                )
             if kwargs.get("return_lse", False):
                 lse = torch.empty(q.shape[:-1], dtype=torch.float32, device=q.device)
                 return torch.empty_like(q), lse
@@ -1332,6 +1373,38 @@ def selected_kernel_spy(monkeypatch):
 
     monkeypatch.setattr(SelectedKernel, "__call__", fake_call)
     return active_case, calls
+
+
+def _find_case(*, arch: str, family: str, mode: str) -> KernelApiSelectionCase:
+    for case in _CASES:
+        if case.arch == arch and case.family == family and case.mode == mode:
+            return case
+    raise AssertionError(f"missing golden case for {arch}/{family}.{mode}")
+
+
+def test_attn_merge_state_routes_to_triton_on_cdna4(
+    mi350_platform: PlatformInfo,
+    selected_kernel_spy,
+) -> None:
+    case = _find_case(arch="cdna4", family="attention", mode="attn_merge_state")
+    registry = KernelRegistry.get()
+    expected_spec = registry.get_by_name(case.expected)
+    assert expected_spec is not None
+    assert expected_spec.capability.satisfied_by(mi350_platform)
+
+    real_platform = Platform.get()
+    active_case, calls = selected_kernel_spy
+    active_case["case"] = case
+    try:
+        Platform.override(mi350_platform)
+        registry.clear_cache()
+
+        case.invoke()
+
+        assert calls == ["triton_attn_merge_state"]
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
 
 
 @pytest.mark.parametrize("case", _CASES, ids=lambda case: case.id)

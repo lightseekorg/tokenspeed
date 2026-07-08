@@ -165,7 +165,7 @@ def test_mha_prefill_lse(
         pytest.param(torch.float8_e4m3fn, 64, 8, 2, id="fp8"),
     ],
 )
-@pytest.mark.parametrize("solution", ["triton", "fa3", "fa4", "flashinfer"])
+@pytest.mark.parametrize("solution", ["triton", "fa3", "fa4", "flashinfer", "gluon"])
 def test_mha_extend_with_kvcache(
     device: str,
     solution: str,
@@ -270,8 +270,8 @@ def test_mha_extend_with_kvcache(
 
     assert out.shape == q.shape
 
-    if solution == "triton":
-        triton_out, triton_lse = mha_extend_with_kvcache(
+    if solution in ("triton", "gluon"):
+        lse_out, lse = mha_extend_with_kvcache(
             q=q,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_kv=cu_seqlens_kv,
@@ -285,8 +285,8 @@ def test_mha_extend_with_kvcache(
             solution=solution,
         )
 
-        assert triton_out.shape == q.shape
-        assert triton_lse.shape == (q.shape[0], q.shape[1])
+        assert lse_out.shape == q.shape
+        assert lse.shape == (q.shape[0], q.shape[1])
 
 
 @pytest.mark.parametrize(
@@ -402,9 +402,11 @@ def test_mha_decode_with_kvcache(
     "solution",
     ["triton", "cuda"],
 )
+@pytest.mark.parametrize("inplace", [False, True], ids=["out-of-place", "in-place"])
 def test_attn_merge_state(
     device: str,
     solution: str,
+    inplace: bool,
     dtype: torch.dtype,
     head_dim: int,
     num_heads: int,
@@ -417,23 +419,34 @@ def test_attn_merge_state(
     out_b = torch.randn(total_q, num_heads, head_dim, device=device, dtype=dtype)
     lse_a = torch.randn(total_q, num_heads, device=device, dtype=torch.float32)
     lse_b = torch.randn(total_q, num_heads, device=device, dtype=torch.float32)
+    out_a_ref_input = out_a.clone()
+    lse_a_ref_input = lse_a.clone()
 
     out, lse = attn_merge_state(
         out_a,
         lse_a,
         out_b,
         lse_b,
+        inplace=inplace,
         solution=solution,
     )
 
-    lse_ref = torch.maximum(lse_a, lse_b)
-    weight_a = torch.exp(lse_a - lse_ref)
+    lse_ref = torch.maximum(lse_a_ref_input, lse_b)
+    weight_a = torch.exp(lse_a_ref_input - lse_ref)
     weight_b = torch.exp(lse_b - lse_ref)
     denom = weight_a + weight_b
     out_ref = (
-        out_a.float() * weight_a[..., None] + out_b.float() * weight_b[..., None]
+        out_a_ref_input.float() * weight_a[..., None]
+        + out_b.float() * weight_b[..., None]
     ) / denom[..., None]
     lse_ref = lse_ref + torch.log(denom)
+
+    if inplace:
+        assert out.data_ptr() == out_a.data_ptr()
+        assert lse.data_ptr() == lse_a.data_ptr()
+    else:
+        torch.testing.assert_close(out_a, out_a_ref_input)
+        torch.testing.assert_close(lse_a, lse_a_ref_input)
 
     assert out.shape == out_a.shape
     assert lse.shape == lse_a.shape

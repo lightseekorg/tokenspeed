@@ -125,6 +125,63 @@ def test_dsa_decode_topk_fp8(device: str, require) -> None:
     assert (topk_slots[0, int(expected_lens[0].item()) :] == -1).all()
 
 
+@pytest.mark.parametrize("q_len_per_req", [2, 4])
+def test_dsa_decode_topk_fp8_mtp(device: str, q_len_per_req: int, require) -> None:
+    """Per-request (MTP) decode: seq_lens/block_table are per-request and the
+    kernel derives each token's causal bound seq_lens[req] - (q-1) + j."""
+    require("attention", "dsa_decode_topk", "triton", torch.bfloat16, "q")
+
+    page_size = 64
+    topk = 512
+    num_reqs = 2
+    pages = 8  # capacity 8*64=512 >= topk
+    tokens = num_reqs * q_len_per_req
+    q = torch.randn((tokens, 2, 128), device=device, dtype=torch.bfloat16)
+    weights = torch.randn((tokens, 2), device=device, dtype=torch.float32)
+    packed_index_k, index_k = _pack_index_k_cache(
+        torch.randn((pages * page_size, 128), device=device, dtype=torch.bfloat16),
+        page_size,
+    )
+    seq_lens = torch.tensor([200, 130], device=device, dtype=torch.int32)  # per-req
+    block_table = (
+        torch.arange(pages, device=device, dtype=torch.int32)
+        .view(1, -1)
+        .repeat(num_reqs, 1)
+    )
+
+    topk_slots, topk_lens = dsa_decode_topk(
+        q,
+        weights,
+        seq_lens,
+        block_table,
+        page_size=page_size,
+        topk=topk,
+        softmax_scale=128**-0.5,
+        q_len_per_req=q_len_per_req,
+        index_k_cache=packed_index_k,
+        solution="triton",
+    )
+
+    for r in range(num_reqs):
+        for jj in range(q_len_per_req):
+            token = r * q_len_per_req + jj
+            causal_len = int(seq_lens[r].item()) - (q_len_per_req - 1) + jj
+            scores = []
+            slots = []
+            for off in range(causal_len):
+                page = int(block_table[r, off // page_size].item())
+                slot = page * page_size + off % page_size
+                per_head = (q[token].float() * index_k[slot].float()).sum(dim=-1)
+                scores.append((per_head * weights[token]).sum() * (128**-0.5))
+                slots.append(slot)
+            k = min(causal_len, topk)
+            local = torch.topk(torch.stack(scores), k).indices
+            ref = {slots[int(i)] for i in local.tolist()}
+            got = {int(x) for x in topk_slots[token, :k].tolist() if x >= 0}
+            assert int(topk_lens[token].item()) == k, (token, topk_lens[token], k)
+            assert ref == got, f"token {token}: {len(ref ^ got)} slots differ"
+
+
 def test_dsa_prefill_topk_fp8(device: str, require) -> None:
     require("attention", "dsa_prefill_topk", "triton", torch.bfloat16, "q")
 
@@ -177,36 +234,25 @@ def test_dsa_prefill_topk_fp8(device: str, require) -> None:
     assert (workspace_indices[0, int(expected_lens[0].item()) :] == -1).all()
 
 
-def test_dsa_plan_triton(device: str, require) -> None:
-    require("attention", "dsa_plan", "triton", torch.int32, "seq_lens")
+def test_dsa_plan_triton(device: str) -> None:
+    # The triton decode kernel derives its own causal bounds and ignores the
+    # plan, so triton_dsa_plan is a no-op returning an opaque, non-None
+    # placeholder; passing out= returns that same placeholder.
+    seq_lens_2d = torch.tensor([[20], [65], [3]], device=device, dtype=torch.int32)
+    plan = dsa_plan(seq_lens_2d=seq_lens_2d, page_size=64, solution="triton")
+    if plan is None:
+        pytest.skip("triton dsa_plan is not registered on this platform")
 
-    seq_lens = torch.tensor([20, 65, 3], device=device, dtype=torch.int32)
-    plan = dsa_plan(seq_lens, page_size=64, solution="triton")
-
-    assert isinstance(plan, torch.Tensor)
-    assert plan.shape == (3, 4)
-    assert plan.dtype == torch.int32
-    torch.testing.assert_close(plan[:, 0].cpu(), seq_lens.cpu())
-    torch.testing.assert_close(plan[:, 1].cpu(), seq_lens.cpu())
-    torch.testing.assert_close(plan[:, 2].cpu(), torch.full((3,), 1, dtype=torch.int32))
-    torch.testing.assert_close(
-        plan[:, 3].cpu(), torch.full((3,), 64, dtype=torch.int32)
+    refreshed = dsa_plan(
+        seq_lens_2d=seq_lens_2d, page_size=64, out=plan, solution="triton"
     )
-
-    plan_ptr = plan.data_ptr()
-    refreshed = dsa_plan(seq_lens + 1, page_size=64, out=plan, solution="triton")
     assert refreshed is plan
-    assert plan.data_ptr() == plan_ptr
-    torch.testing.assert_close(plan[:, 0].cpu(), (seq_lens + 1).cpu())
-
-    with pytest.raises(RuntimeError, match="DSA paged top-k plan changed shape"):
-        dsa_plan(seq_lens[:2], page_size=64, out=plan, solution="triton")
 
 
 def test_dsa_plan_returns_none_without_kernel(device: str) -> None:
-    seq_lens = torch.tensor([1], device=device, dtype=torch.int32)
+    seq_lens_2d = torch.tensor([[1]], device=device, dtype=torch.int32)
 
-    assert dsa_plan(seq_lens, page_size=64, solution="missing") is None
+    assert dsa_plan(seq_lens_2d=seq_lens_2d, page_size=64, solution="missing") is None
 
 
 def test_dsa_workspace_topk_to_global_slots(device: str) -> None:

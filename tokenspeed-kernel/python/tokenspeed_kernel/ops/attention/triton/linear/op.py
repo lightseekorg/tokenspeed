@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: Copyright (c) 2026 LightSeek Foundation
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
+#
 # Copyright (c) 2026 LightSeek Foundation
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -18,14 +22,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from __future__ import annotations
+# -*- coding: utf-8 -*-
 
-# Backend registration (side-effect imports)
-import tokenspeed_kernel.ops.attention.triton.dsa  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.dsa_topk  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.gated_delta_rule  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.merge_state  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.mha_decode  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.mha_prefill  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.mla_decode  # noqa: F401
-import tokenspeed_kernel.ops.attention.triton.mla_prefill  # noqa: F401
+from tokenspeed_kernel._triton import tl, triton
+
+exp = tl.exp
+
+
+@triton.jit
+def safe_exp(x):
+    return exp(tl.where(x <= 0, x, float("-inf")))

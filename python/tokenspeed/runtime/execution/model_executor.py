@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
+from tokenspeed_kernel.ops.tuning import freeze_autotuning
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
@@ -37,7 +38,10 @@ from tokenspeed.runtime.execution.cache_loc_kernel import update_block_table
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
 from tokenspeed.runtime.execution.drafter.dflash import DFlash
-from tokenspeed.runtime.execution.drafter.eagle import Eagle
+from tokenspeed.runtime.execution.drafter.eagle import (
+    Eagle,
+    draft_model_reduces_first_step_catchup,
+)
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
@@ -45,12 +49,11 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 from tokenspeed.runtime.execution.input_buffer import InputBuffers
 from tokenspeed.runtime.execution.model_runner import ModelRunner
 from tokenspeed.runtime.execution.nan_guard import NanGuard
+from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 from tokenspeed.runtime.execution.types import ModelExecutionResult
 from tokenspeed.runtime.grammar.capturable_grammar import setup_grammar_step
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
-from tokenspeed.runtime.models.llama_eagle3 import LlamaForCausalLMEagle3
-from tokenspeed.runtime.models.qwen3_5_nextn import Qwen3_5ForConditionalGenerationNextN
 from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 from tokenspeed.runtime.sampling.dp_sampling_config import (
     DpSamplingRuntimeLimits,
@@ -152,6 +155,13 @@ class ModelExecutorConfig:
     disable_capturable_grammar: bool = False
     mamba_cache_chunk_size: int = 64
 
+    # ====== PREFILL CUDA GRAPH (breakable) =========
+    disable_prefill_graph: bool = False
+    # Opt-in: > 0 enables the prefill graph and caps the largest token bucket.
+    prefill_graph_max_tokens: int = 0
+    # Explicit bucket list overriding the ladder (see get_prefill_token_buckets).
+    prefill_graph_capture_sizes: list[int] | None = None
+
     @staticmethod
     def from_server_args(
         server_args: ServerArgs,
@@ -187,6 +197,9 @@ class ModelExecutorConfig:
             cudagraph_capture_sizes=server_args.cudagraph_capture_sizes,
             disable_cuda_graph_padding=server_args.disable_cuda_graph_padding,
             max_cudagraph_capture_size=server_args.max_cudagraph_capture_size,
+            disable_prefill_graph=bool(server_args.disable_prefill_graph),
+            prefill_graph_max_tokens=int(server_args.prefill_graph_max_tokens or 0),
+            prefill_graph_capture_sizes=server_args.prefill_graph_capture_sizes,
             model_is_mrope=model_is_mrope,
             data_parallel_size=server_args.mapping.attn.dp_size,
             world_size=server_args.mapping.world_size,
@@ -458,6 +471,20 @@ class ModelExecutor:
             runtime_states=self.runtime_states,
         )
 
+        # Breakable prefill (extend) CUDA graphs, the extend-mode analogue of
+        # the decode wrapper above; captures in __init__, borrowing the decode
+        # capture stream so all graphs share one mempool-reuse domain.
+        self.prefill_graph = PrefillGraph(
+            model_runner=self.model_runner,
+            attn_backend=attn_backend,
+            token_to_kv_pool=token_to_kv_pool,
+            input_buffers=self.input_buffers,
+            config=config,
+            req_to_page=self.req_to_page,
+            drafter=self.drafter,
+            decode_wrapper=self.forward_step,
+        )
+
         # Encoder CUDA graph: install model-built wrappers by overriding
         # modality encoder callables (e.g. ``image_encoder``, ``video_encoder``).
         # Multimodal-encoder analogue of ``forward_step``'s ``CudaGraphWrapper``.
@@ -519,6 +546,9 @@ class ModelExecutor:
 
         set_random_seed(48)
 
+        # Startup has tuned every size class it serves; serving must never autotune.
+        freeze_autotuning()
+
         logger.info("ModelExecutor initialized")
 
     @staticmethod
@@ -569,6 +599,23 @@ class ModelExecutor:
                 ]
             else:
                 positions = self.input_buffers.positions_buf[: ctx.input_num_tokens]
+        # Prefill-graph replay when captured for this forward (the decode graph
+        # replays one level up: it captures the whole _forward_step). The mode
+        # check is LOAD-BEARING, not an optimization: the decode capture runs
+        # this dispatch before prefill_graph exists (it is constructed after
+        # the decode wrapper, whose capture stream it borrows), and decode-mode
+        # forwards must short-circuit before touching it.
+        mode = ctx.forward_mode
+        if (
+            mode is not None
+            and (mode.is_extend() or mode.is_mixed())
+            and self.prefill_graph.can_run(ctx, self._active_multimodal_context)
+        ):
+            return self.prefill_graph.replay(
+                ctx,
+                self.input_buffers.input_ids_buf[: ctx.input_num_tokens],
+                self._active_multimodal_context,
+            )
         return self.model_runner.forward(
             ctx,
             self.input_buffers.input_ids_buf[: ctx.input_num_tokens],
@@ -1054,6 +1101,7 @@ class ModelExecutor:
         dp_global_num_tokens=None,
         dp_global_bs=None,
         dp_all_decode_or_idle: bool = False,
+        dp_all_extend: bool = False,
         grammar_inputs=None,
         multimodal_context=None,
         capture_next_input_ids: bool = False,
@@ -1093,6 +1141,7 @@ class ModelExecutor:
             dp_global_num_tokens,
             dp_global_bs,
             dp_all_decode_or_idle,
+            dp_all_extend,
             grammar_inputs=grammar_inputs,
             multimodal_context=multimodal_context,
             capture_next_input_ids=capture_next_input_ids,
@@ -1232,6 +1281,9 @@ class ModelExecutor:
             idle_forward_steps = getattr(
                 self.drafter, "idle_forward_steps", self.drafter.spec_num_steps
             )
+            draft_reduces_first_step_catchup = draft_model_reduces_first_step_catchup(
+                self.drafter.draft_model_runner.model
+            )
             for step_idx in range(idle_forward_steps or 0):
                 # Mirror active rank's catch-up step: when all non-idle ranks
                 # are decoding, step 0 sizes collectives from bs/global_bs.
@@ -1251,21 +1303,12 @@ class ModelExecutor:
                     global_num_tokens=draft_global_num_tokens,
                     global_bs=global_bs,
                     all_decode_or_idle=all_decode_or_idle,
-                    # Mirror the active-rank broaden in eagle.py: Llama Eagle3
-                    # and Qwen3.5 NextN narrow for any non-idle catch-up, so the
-                    # idle peer must size collectives the same way.
+                    # Mirror the active-rank broaden in eagle.py: some draft
+                    # models narrow for any non-idle catch-up, so idle peers
+                    # must size collectives the same way.
                     draft_first_step_reduce=(
                         step_idx == 0
-                        and (
-                            all_decode_or_idle
-                            or isinstance(
-                                self.drafter.draft_model_runner.model,
-                                (
-                                    LlamaForCausalLMEagle3,
-                                    Qwen3_5ForConditionalGenerationNextN,
-                                ),
-                            )
-                        )
+                        and (all_decode_or_idle or draft_reduces_first_step_catchup)
                     ),
                 )
                 self.drafter.draft_model_runner.forward(
@@ -1516,6 +1559,7 @@ class ModelExecutor:
         dp_global_num_tokens=None,
         dp_global_bs=None,
         dp_all_decode_or_idle: bool = False,
+        dp_all_extend: bool = False,
         grammar_inputs=None,
         multimodal_context=None,
         capture_next_input_ids: bool = False,
@@ -1665,6 +1709,7 @@ class ModelExecutor:
                     ctx.global_num_tokens = dp_global_num_tokens
                     ctx.global_bs = dp_global_bs
                     ctx.all_decode_or_idle = dp_all_decode_or_idle
+                    ctx.all_extend = dp_all_extend
                 with nvtx_range("sampling_prep", color="yellow"):
                     sampling_start = time.perf_counter() if timing_enabled else 0.0
                     sampling_info = self._build_sampling_info(bs, sampling_params_list)
