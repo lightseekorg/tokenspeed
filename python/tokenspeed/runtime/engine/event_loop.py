@@ -82,7 +82,7 @@ from tokenspeed.runtime.pd.kv_events import (
     drain_scheduler_kv_events,
     scheduler_kv_events_to_wire_events,
 )
-from tokenspeed.runtime.pd.mooncake.entities import ManagerArgs
+from tokenspeed.runtime.pd.mooncake.entities import KVManagerArgs
 from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 from tokenspeed.runtime.utils import (
@@ -478,7 +478,7 @@ class EventLoop:
                 draft_token_to_kv_pool,
                 mamba_pool,
             )
-            pd_manager_args = ManagerArgs(
+            pd_manager_args = KVManagerArgs(
                 bootstrap_port=server_args.disaggregation_bootstrap_port,
                 dist_init_addr=server_args.dist_init_addr,
                 world_size=server_args.world_size or mapping.world_size,
