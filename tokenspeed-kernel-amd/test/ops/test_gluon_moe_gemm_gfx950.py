@@ -1126,6 +1126,39 @@ def test_renormalize_route_recovers_packed_topk_without_scaling_gfx950(
     torch.testing.assert_close(actual_weights, expected_weights)
 
 
+def test_dynamic_route_without_topk_normalization_uses_full_softmax_gfx950() -> None:
+    device = "cuda"
+    router_logits = torch.tensor(
+        [[4.0, 3.0, 0.0, -2.0], [1.0, -1.0, 2.5, 0.5]],
+        device=device,
+        dtype=torch.float32,
+    )
+
+    ragged, _, scatter, gate = _dynamic_mxfp4_route(
+        router_logits,
+        top_k=2,
+        correction_bias=None,
+        n_group=0,
+        topk_group=0,
+        routed_scaling_factor=1.0,
+        normalize_topk_weights=False,
+        routing_method_type=0,
+        dtype=router_logits.dtype,
+    )
+    actual_weights, actual_ids = _recover_topk_from_route(
+        ragged, scatter, gate, router_logits.shape[0], 2
+    )
+    expected_weights, expected_ids = torch.softmax(router_logits, dim=-1).topk(
+        2, dim=-1, sorted=True
+    )
+
+    torch.testing.assert_close(actual_ids, expected_ids.to(torch.int32))
+    torch.testing.assert_close(actual_weights, expected_weights)
+    assert not torch.allclose(
+        actual_weights.sum(dim=-1), torch.ones_like(actual_weights.sum(dim=-1))
+    )
+
+
 def test_gluon_dynamic_mxfp4_moe_concatenated_silu_matches_torch_gfx950() -> None:
     from tokenspeed_kernel_amd.ops.moe.fused_mxfp_gfx950 import (
         _quantize_mxfp4_activation,

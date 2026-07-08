@@ -7479,25 +7479,14 @@ def _dynamic_mxfp4_route(
             dtype=dtype,
         )
 
-    if normalize_topk_weights or routed_scaling_factor != 1.0:
-        return default_scaled_route(
-            router_logits,
-            top_k,
-            routed_scaling_factor=routed_scaling_factor,
-            normalize_topk_weights=normalize_topk_weights,
-            dtype=dtype,
-        )
-
-    if n_tokens <= SMALLM_MAX_M and gluon_route_supported(router_logits, top_k, dtype):
-        return gluon_fused_route(
-            router_logits,
-            top_k,
-            dtype=dtype,
-        )
-
-    return default_route(
+    # Dynamic MXFP4 follows runtime TopK semantics: select from the full-row
+    # softmax. With normalize_topk_weights=False, gate weights must remain
+    # full-row probabilities instead of selected-logit softmax probabilities.
+    return default_scaled_route(
         router_logits,
         top_k,
+        routed_scaling_factor=routed_scaling_factor,
+        normalize_topk_weights=normalize_topk_weights,
         dtype=dtype,
     )
 
