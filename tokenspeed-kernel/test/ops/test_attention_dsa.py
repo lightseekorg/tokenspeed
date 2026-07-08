@@ -647,7 +647,7 @@ def test_dsa_prefill_topk_fp8(device: str, require) -> None:
     assert (workspace_indices[0, int(expected_lens[0].item()) :] == -1).all()
 
 
-@pytest.mark.parametrize("solution", ["triton"])
+@pytest.mark.parametrize("solution", ["triton", "gluon"])
 @pytest.mark.parametrize(
     "case",
     _GLM52_TOPK_DECODE_CASES,
@@ -706,7 +706,7 @@ def test_dsa_decode_topk_fp8_glm52_cases(
     _assert_topk_matches(topk_slots, topk_lens, expected_slots, expected_lens)
 
 
-@pytest.mark.parametrize("solution", ["triton"])
+@pytest.mark.parametrize("solution", ["triton", "gluon"])
 @pytest.mark.parametrize(
     "case",
     _GLM52_TOPK_PREFILL_CASES,
