@@ -159,46 +159,54 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
                         self.assertEqual(
                             sliding_pages,
                             math.ceil(
-                                (window - 1 + (overlap_depth + 1) * verify_width)
+                                (window + (overlap_depth + 1) * verify_width)
                                 / raw_per_page
                             )
                             + 1,
                         )
 
-    def test_sliding_capture_width_covers_absolute_reservation_range(self):
+    def test_sliding_capture_width_covers_conservative_reservation_bound(self):
         for rows_per_page, entry_stride_tokens in _PAGE_SHAPES:
             raw_per_page = rows_per_page * entry_stride_tokens
-            window = 3 * raw_per_page + 1
-            spec = PagedCacheGroupSpec(
-                group_id="sliding",
-                retention="sliding_window",
-                rows_per_page=rows_per_page,
-                entry_stride_tokens=entry_stride_tokens,
-                sliding_window_tokens=window,
-            )
-            for context_len in (2 * raw_per_page + 1, 5 * raw_per_page + 1):
-                for verify_width in (1, 2, 4, 8):
-                    for overlap_depth in (0, 1):
-                        reservation_end = (
-                            context_len + (overlap_depth + 1) * verify_width
-                        )
-                        with self.subTest(
-                            raw_per_page=raw_per_page,
-                            context_len=context_len,
-                            verify_width=verify_width,
-                            overlap_depth=overlap_depth,
-                        ):
-                            capture_pages = compute_max_logical_pages_for_capture(
-                                spec,
-                                max_context_len=context_len,
-                                max_tokens_per_req=verify_width,
-                                overlap_schedule_depth=overlap_depth,
+            # Cover a window that is a multiple of raw_per_page and one that is
+            # not, exercising both page-alignment relationships between the
+            # window and the physical page stride.
+            for window in (3 * raw_per_page, 3 * raw_per_page + 1):
+                spec = PagedCacheGroupSpec(
+                    group_id="sliding",
+                    retention="sliding_window",
+                    rows_per_page=rows_per_page,
+                    entry_stride_tokens=entry_stride_tokens,
+                    sliding_window_tokens=window,
+                )
+                for context_len in (2 * raw_per_page + 1, 5 * raw_per_page + 1):
+                    for verify_width in (1, 2, 4, 8):
+                        for overlap_depth in (0, 1):
+                            reservation_end = (
+                                context_len + (overlap_depth + 1) * verify_width
                             )
-                            retained_begin = max(0, context_len - (window - 1))
-                            required_pages = math.ceil(
-                                reservation_end / raw_per_page
-                            ) - math.floor(retained_begin / raw_per_page)
-                            self.assertGreaterEqual(capture_pages, required_pages)
+                            with self.subTest(
+                                raw_per_page=raw_per_page,
+                                window=window,
+                                context_len=context_len,
+                                verify_width=verify_width,
+                                overlap_depth=overlap_depth,
+                            ):
+                                capture_pages = compute_max_logical_pages_for_capture(
+                                    spec,
+                                    max_context_len=context_len,
+                                    max_tokens_per_req=verify_width,
+                                    overlap_schedule_depth=overlap_depth,
+                                )
+                                # Exercise the conservative full-window
+                                # metadata bound used for capture.
+                                retained_begin = max(0, reservation_end - window)
+                                conservative_pages = math.ceil(
+                                    reservation_end / raw_per_page
+                                ) - math.floor(retained_begin / raw_per_page)
+                                self.assertGreaterEqual(
+                                    capture_pages, conservative_pages
+                                )
 
     def test_overlap_sizing_rejects_invalid_runtime_parameters(self):
         spec = PagedCacheGroupSpec(

@@ -101,6 +101,7 @@ def compute_paged_cache_group_page_counts(
                     f"PagedCacheGroupSpec {spec.group_id}: sliding group missing "
                     "positive sliding_window_tokens"
                 )
+            # Capacity tracks resident history before the next token.
             resident_tokens_per_req = min(max(window - 1, 0), max_context_len)
             resident_pages = max_live_requests * ceil_div(
                 resident_tokens_per_req, raw_per_page
@@ -170,8 +171,10 @@ def compute_max_logical_pages_for_capture(
                 f"PagedCacheGroupSpec {spec.group_id}: sliding group missing "
                 "positive sliding_window_tokens"
             )
-        retained_history = min(window - 1, max_context_len)
-        live_tokens = retained_history + reservation_horizon
+        # Capture uses a conservative metadata bound; it does not change the
+        # per-token attention history counted as window - 1 above.
+        retention_bound = min(window, max_context_len)
+        live_tokens = retention_bound + reservation_horizon
         return ceil_div(live_tokens, raw_per_page) + 1
     if spec.retention == "full_history":
         live_tokens = max_context_len + reservation_horizon
