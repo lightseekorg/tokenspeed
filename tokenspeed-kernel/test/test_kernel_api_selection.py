@@ -93,6 +93,7 @@ from tokenspeed_kernel.ops.moe.flashinfer import trtllm_unquant as _moe_trtllm_u
 from tokenspeed_kernel.ops.moe.gluon import mxfp4 as _moe_gluon_mxfp4
 from tokenspeed_kernel.ops.moe.triton import fp8 as _moe_triton_fp8
 from tokenspeed_kernel.ops.moe.triton import mxfp4 as _moe_triton_mxfp4
+from tokenspeed_kernel.ops.moe.triton import unquant as _moe_triton_unquant
 from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import SelectedKernel
@@ -139,6 +140,7 @@ _RELOAD_MODULES = [
     _moe_gluon,
     _moe_triton_fp8,
     _moe_triton_mxfp4,
+    _moe_triton_unquant,
     _moe_triton,
     _moe_pkg,
     # Quantization registration modules.
@@ -1658,6 +1660,35 @@ def _moe_apply_mxfp4_precomputed_ep() -> object:
     )
 
 
+def _moe_apply_unquant_precomputed_tp() -> object:
+    plan = tokenspeed_kernel.moe_plan(
+        "unquant",
+        input_dtype=torch.bfloat16,
+        activation="silu",
+        ep_size=1,
+        ispp=256,
+        internal_activation_dtype="input",
+        solution="triton",
+    )
+    _assert_moe_plan(
+        plan,
+        apply="triton_unquant_precomputed_moe_apply",
+        preprocessor="triton_unquant_moe_weights",
+    )
+    x = torch.empty((4, 16), dtype=torch.bfloat16)
+    router_logits = torch.empty((4, 8), dtype=torch.float32)
+    topk_weights = torch.empty((4, 2), dtype=torch.float32)
+    topk_ids = torch.empty((4, 2), dtype=torch.int64)
+    return tokenspeed_kernel.moe_apply(
+        plan,
+        x,
+        torch.nn.Module(),
+        router_logits,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+    )
+
+
 def test_mxfp4_ep_topk_localization_masks_remote_experts() -> None:
     w = torch.nn.Module()
     w.num_experts = 8
@@ -2168,6 +2199,14 @@ _CASES = [
         "apply",
         "triton_fp8_ep_precomputed_moe_apply",
         _moe_apply_fp8_precomputed_ep,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "moe",
+        "apply",
+        "triton_unquant_precomputed_moe_apply",
+        _moe_apply_unquant_precomputed_tp,
     ),
 ]
 
