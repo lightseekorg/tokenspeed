@@ -6,6 +6,8 @@ linear components scale (bytes_per_slot > 0), constant components do not
 pack into one page row ([conv|ssm|pad], the vLLM hybrid layout). Two
 equalizer moves: constant rows inflate P until the widest linear row
 covers them (vLLM align); linear rows pad to the widest at binding time.
+plan_tensors then pairs physical slot j with the j-th layer of every
+group over a single page-id space and sizes each slab from the budget.
 """
 from __future__ import annotations
 
@@ -54,8 +56,73 @@ def solve_page_geometry(components, *, page_size_tokens, alignment):
     if max_const > 0:
         if max_linear == 0:
             raise ValueError("constant components need a linear row to size P against")
-        needed = math.ceil(max_const / max_linear)
+        needed = -(-max_const // max_linear)  # exact integer ceil
         if needed > page_size_tokens:
             page_size_tokens = alignment * math.ceil(needed / alignment)
     page_bytes = max(max_linear * page_size_tokens, max_const)
     return PageGeometry(page_size_tokens=page_size_tokens, page_bytes=page_bytes)
+
+
+@dataclass(frozen=True)
+class LayerBinding:
+    slot: int
+    group_id: str
+    layer: int
+    component: str
+    nbytes_per_page: int
+    row_offset: int  # byte offset of this component within its (group, layer) page row
+
+
+@dataclass(frozen=True)
+class TensorPlan:
+    name: str
+    nbytes: int
+    bindings: tuple[LayerBinding, ...]
+
+
+@dataclass(frozen=True)
+class FlatMemoryPlan:
+    geometry: PageGeometry
+    tensors: tuple[TensorPlan, ...]
+
+
+def plan_tensors(components, *, page_size_tokens, alignment, budget_bytes):
+    """Pair slot j with the j-th layer of every group over one page-id space."""
+    geo = solve_page_geometry(
+        components, page_size_tokens=page_size_tokens, alignment=alignment
+    )
+    layers_by_group: dict[str, list[int]] = {}
+    for c in components:
+        layers = layers_by_group.setdefault(c.group_id, [])
+        if c.layer not in layers:
+            layers.append(c.layer)
+    num_slots = max(len(v) for v in layers_by_group.values())
+    num_pages = budget_bytes // (num_slots * geo.page_bytes)
+    if num_pages <= 1:
+        raise ValueError("budget too small for one usable page per slot")
+    geo = PageGeometry(geo.page_size_tokens, geo.page_bytes, num_pages)
+
+    tensors = []
+    for slot in range(num_slots):
+        bindings = []
+        for gid, layers in layers_by_group.items():
+            if slot >= len(layers):
+                continue
+            layer = layers[slot]
+            row_offset = 0
+            for c in components:
+                if c.group_id != gid or c.layer != layer:
+                    continue
+                nbytes = c.bytes_per_slot * geo.page_size_tokens + c.const_bytes
+                bindings.append(
+                    LayerBinding(slot, gid, layer, c.component, nbytes, row_offset)
+                )
+                row_offset += nbytes
+        tensors.append(
+            TensorPlan(
+                name=f"flat_slab_{slot}",
+                nbytes=num_pages * geo.page_bytes,
+                bindings=tuple(bindings),
+            )
+        )
+    return FlatMemoryPlan(geometry=geo, tensors=tuple(tensors))
