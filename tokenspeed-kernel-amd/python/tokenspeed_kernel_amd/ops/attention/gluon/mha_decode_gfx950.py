@@ -851,7 +851,7 @@ def gluon_mha_decode_gfx950(
         window_left=window_left,
     )
 
-    is_fp8 = q.dtype == torch.float8_e4m3fn
+    is_fp8 = q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
     out_dtype = torch.bfloat16 if is_fp8 else q.dtype
     output = torch.empty(q.shape, device=q.device, dtype=out_dtype)
 

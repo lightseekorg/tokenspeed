@@ -171,6 +171,8 @@ def test_mha_prefill_lse(
         pytest.param(torch.bfloat16, 128, 8, 2, id="bf16-d128"),
         pytest.param(torch.float8_e4m3fn, 64, 8, 2, id="fp8"),
         pytest.param(torch.float8_e4m3fn, 128, 8, 2, id="fp8-d128"),
+        pytest.param(torch.float8_e5m2, 64, 8, 2, id="fp8-e5m2"),
+        pytest.param(torch.float8_e5m2, 128, 8, 2, id="fp8-e5m2-d128"),
     ],
 )
 @pytest.mark.parametrize("solution", ["triton", "fa3", "fa4", "flashinfer", "gluon"])
@@ -304,6 +306,8 @@ def test_mha_extend_with_kvcache(
         pytest.param(torch.bfloat16, 128, 8, 2, id="bf16-d128"),
         pytest.param(torch.float8_e4m3fn, 64, 8, 2, id="fp8"),
         pytest.param(torch.float8_e4m3fn, 128, 8, 2, id="fp8-d128"),
+        pytest.param(torch.float8_e5m2, 64, 8, 2, id="fp8-e5m2"),
+        pytest.param(torch.float8_e5m2, 128, 8, 2, id="fp8-e5m2-d128"),
     ],
 )
 @pytest.mark.parametrize("solution", ["triton", "fa3", "fa4", "flashinfer", "gluon"])

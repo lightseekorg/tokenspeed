@@ -121,10 +121,13 @@ class MHAAttnBackend(AttentionBackend):
         self.head_dim = config.head_dim
         self.qkv_dtype = config.dtype
         self.kv_cache_dtype = config.kv_cache_dtype
-        self.is_fp8 = self.kv_cache_dtype == torch.float8_e4m3fn
+        self.is_fp8 = self.kv_cache_dtype in (
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        )
         self.plan = partial(
             mha_plan,
-            dtype=torch.float8_e4m3fn if self.is_fp8 else self.qkv_dtype,
+            dtype=self.kv_cache_dtype if self.is_fp8 else self.qkv_dtype,
             head_dim=self.head_dim,
             return_lse=False,
             solution=self.kernel_solution,
@@ -470,9 +473,9 @@ class MHAAttnBackend(AttentionBackend):
         _scrub_extend_padding(metadata, q, k, v)
         # TODO: use a custom kernel to do downcast
         if self.is_fp8:
-            q = q.to(torch.float8_e4m3fn)
-            k = k.to(torch.float8_e4m3fn)
-            v = v.to(torch.float8_e4m3fn)
+            q = q.to(self.kv_cache_dtype)
+            k = k.to(self.kv_cache_dtype)
+            v = v.to(self.kv_cache_dtype)
 
         output = mha_prefill(
             q=q,
@@ -508,7 +511,7 @@ class MHAAttnBackend(AttentionBackend):
             self._save_kv_cache(layer, out_cache_loc, token_to_kv_pool, k, v)
 
         if self.is_fp8:
-            q = q.to(torch.float8_e4m3fn)
+            q = q.to(self.kv_cache_dtype)
 
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
         output = mha_extend_with_kvcache(
@@ -548,7 +551,7 @@ class MHAAttnBackend(AttentionBackend):
             self._save_kv_cache(layer, out_cache_loc, token_to_kv_pool, k, v)
 
         if self.is_fp8:
-            q = q.to(torch.float8_e4m3fn)
+            q = q.to(self.kv_cache_dtype)
 
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
         max_seqlen_q = q.shape[0] // metadata.seq_lens.shape[0]
@@ -582,7 +585,10 @@ class MHAAttnBackend(AttentionBackend):
         if k is None:
             return
 
-        if self.is_fp8 and k.dtype != torch.float8_e4m3fn:
+        if (
+            self.kv_cache_dtype == torch.float8_e4m3fn
+            and k.dtype != torch.float8_e4m3fn
+        ):
             k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
             fused_fp8_set_kv_buffer(
                 k=k,

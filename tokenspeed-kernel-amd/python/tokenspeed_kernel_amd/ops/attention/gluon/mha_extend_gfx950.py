@@ -141,9 +141,7 @@ class ExtendConfig:
         assert HEAD_DIM in (64, 128)
         assert BLOCK_N == PAGE_SIZE
 
-        # fp8 has no valid [32,32,16] MFMA; use the [16,16,32] shape (same as the
-        # decode kernel) which lowers to the CDNA4 fp8 MFMA with k_width=16.
-        instr_shape = [16, 16, 32] if IS_FP8 else [32, 32, 16]
+        instr_shape = [32, 32, 16]
         mfma_layout = gl.amd.AMDMFMALayout(
             version=4,
             instr_shape=instr_shape,
@@ -659,7 +657,7 @@ def gluon_mha_extend_gfx950(
     cu_q_i32 = cu_seqlens_q.to(torch.int32).contiguous()
     cache_i32 = cache_seqlens.to(torch.int32).contiguous()
 
-    is_fp8 = q.dtype == torch.float8_e4m3fn
+    is_fp8 = q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
     out_dtype = torch.bfloat16 if is_fp8 else q.dtype
     output = torch.empty(q.shape, device=q.device, dtype=out_dtype)
     if return_lse:

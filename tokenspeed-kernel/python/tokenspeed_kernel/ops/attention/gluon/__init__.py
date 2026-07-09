@@ -55,7 +55,12 @@ if current_platform().is_amd:
         signatures=format_signatures(
             ("q", "k_cache", "v_cache"),
             "dense",
-            {torch.float16, torch.bfloat16, torch.float8_e4m3fn},
+            {
+                torch.float16,
+                torch.bfloat16,
+                torch.float8_e4m3fn,
+                torch.float8_e5m2,
+            },
         ),
         priority=Priority.SPECIALIZED,
         traits={
@@ -83,7 +88,12 @@ if current_platform().is_amd:
         signatures=format_signatures(
             ("q", "k", "v"),
             "dense",
-            {torch.float16, torch.bfloat16, torch.float8_e4m3fn},
+            {
+                torch.float16,
+                torch.bfloat16,
+                torch.float8_e4m3fn,
+                torch.float8_e5m2,
+            },
         ),
         priority=Priority.SPECIALIZED,
         traits={
@@ -110,7 +120,12 @@ if current_platform().is_amd:
         signatures=format_signatures(
             ("q", "k_cache", "v_cache"),
             "dense",
-            {torch.float16, torch.bfloat16, torch.float8_e4m3fn},
+            {
+                torch.float16,
+                torch.bfloat16,
+                torch.float8_e4m3fn,
+                torch.float8_e5m2,
+            },
         ),
         priority=Priority.SPECIALIZED,
         traits={

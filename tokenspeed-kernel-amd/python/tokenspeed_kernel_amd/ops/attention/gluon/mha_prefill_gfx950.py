@@ -97,9 +97,7 @@ class AttentionConfig:
         assert HEAD_DIM in (64, 128)
         assert NUM_WARPS == 4
 
-        # fp8 has no valid [32,32,16] MFMA; use the [16,16,32] shape which lowers
-        # to the CDNA4 fp8 MFMA with k_width=16.
-        instr_shape = [16, 16, 32] if IS_FP8 else [32, 32, 16]
+        instr_shape = [32, 32, 16]
         qk_layout = gl.amd.AMDMFMALayout(
             version=4,
             instr_shape=instr_shape,
@@ -1095,7 +1093,7 @@ def gluon_mha_prefill_gfx950(
         max_seqlen=max_seqlen,
         window_left=window_left,
     )
-    is_fp8 = q.dtype == torch.float8_e4m3fn
+    is_fp8 = q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
     out_dtype = torch.bfloat16 if is_fp8 else q.dtype
     output = torch.empty(q.shape, device=q.device, dtype=out_dtype)
     lse = (
