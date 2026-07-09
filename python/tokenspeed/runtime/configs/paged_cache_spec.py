@@ -51,11 +51,18 @@ def scheduler_ext_flat_kvcache() -> bool:
     return bool(getattr(tokenspeed_scheduler, "FLAT_KVCACHE", False))
 
 
-# layer_type label -> retention. GPT-OSS uses these two; unknown labels raise.
+# layer_type label -> retention. GPT-OSS uses the first two, Qwen3.5 GDN
+# layers use "linear_attention"; unknown labels raise.
 _LAYER_TYPE_RETENTION: Dict[str, Retention] = {
     "full_attention": "full_history",
     "sliding_attention": "sliding_window",
+    # State groups ride full_history retention: the C++ side keys the
+    # mamba-state kind on family == State && retention != SlidingWindow.
+    "linear_attention": "full_history",
 }
+
+# Labels whose group is state-family (recurrent state rows, not KV history).
+_STATE_LAYER_TYPES = {"linear_attention"}
 
 
 def hybrid_slab_group_size(
@@ -84,7 +91,8 @@ def hybrid_slab_group_size(
         return None
     counts: dict[str, int] = {}
     for label in layer_types:
-        if label not in _LAYER_TYPE_RETENTION:
+        # State rows are not byte-equal with KV rows, so no slab pairing.
+        if label not in _LAYER_TYPE_RETENTION or label in _STATE_LAYER_TYPES:
             return None
         counts[label] = counts.get(label, 0) + 1
     if len(counts) < 2:
@@ -333,7 +341,8 @@ def group_specs_from_layer_types(
     distinct (retention, window). Group order = first-appearance order.
 
     Args:
-        layer_types: Per-layer labels: "full_attention" / "sliding_attention".
+        layer_types: Per-layer labels: "full_attention" / "sliding_attention"
+            / "linear_attention" (state-family, e.g. Qwen3.5 GDN).
         sliding_window_tokens: One window for all sliding layers (today's HF
             scalar), or a per-layer sequence (multi-window models; full-layer
             positions must be None).
@@ -356,7 +365,7 @@ def group_specs_from_layer_types(
                 rows_per_page=page_size,
                 entry_stride_tokens=1,
                 sliding_window_tokens=window,
-                family="history",
+                family="state" if gid in _STATE_LAYER_TYPES else "history",
             )
         )
     return specs

@@ -118,6 +118,34 @@ class GroupSpecsFromLayerTypesTest(unittest.TestCase):
                 page_size=16,
             )
 
+    def test_qwen35_linear_attention_yields_state_group(self):
+        layer_types = ["linear_attention", "linear_attention", "full_attention"]
+        specs = group_specs_from_layer_types(
+            layer_types=layer_types,
+            sliding_window_tokens=None,
+            page_size=16,
+        )
+        self.assertEqual(len(specs), 2)
+        by_id = {s.group_id: s for s in specs}
+        state = by_id["linear_attention"]
+        self.assertEqual(state.family, "state")
+        self.assertEqual(state.retention, "full_history")
+        self.assertIsNone(state.sliding_window_tokens)
+        self.assertEqual(by_id["full_attention"].family, "history")
+
+    def test_qwen35_mixed_with_sliding_and_state_layers(self):
+        layer_types = ["sliding_attention", "linear_attention", "full_attention"]
+        specs = group_specs_from_layer_types(
+            layer_types=layer_types,
+            sliding_window_tokens=[128, None, None],
+            page_size=16,
+        )
+        by_id = {s.group_id: s for s in specs}
+        self.assertEqual(by_id["sliding_attention"].family, "history")
+        self.assertEqual(by_id["sliding_attention"].sliding_window_tokens, 128)
+        self.assertEqual(by_id["linear_attention"].family, "state")
+        self.assertIsNone(by_id["linear_attention"].sliding_window_tokens)
+
 
 class LayerGroupIdsTest(unittest.TestCase):
     """layer_group_ids 与 group_specs_from_layer_types 共享同一分组核,
