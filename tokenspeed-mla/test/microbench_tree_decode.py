@@ -19,7 +19,6 @@ import math
 import torch
 from tokenspeed_mla import tokenspeed_mla_decode
 
-
 DEV = "cuda"
 FP8 = torch.float8_e4m3fn
 KV_LORA = 512

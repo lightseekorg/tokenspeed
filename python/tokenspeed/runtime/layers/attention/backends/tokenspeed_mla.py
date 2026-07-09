@@ -204,6 +204,7 @@ class CuteDSLMLABackend(AttentionBackend):
         # Allocated in init_cuda_graph_state only when _cache_contract_bound.
         self.decode_cuda_graph_group_out_cache_loc: torch.Tensor | None = None
         self.chunked_prefill_metadata: TRTLLMMLAChunkedPrefillMetadata | None = None
+        self.forward_decode_spec_info = None
 
     def mark_cache_contract(self, logical_page_size: int | None = None) -> None:
         """Mark this MLA backend as a Kimi-K3 Paged cache contract sub-backend.
@@ -433,8 +434,11 @@ class CuteDSLMLABackend(AttentionBackend):
         forward_mode: ForwardMode,
         page_table: torch.Tensor,
         seq_lens_cpu: torch.Tensor | None = None,
+        spec_info=None,
         **kwargs,
     ):
+        self.forward_decode_spec_info = spec_info
+
         cache_metadata = kwargs.pop("cache_metadata", None)
         forward_batch = kwargs.pop("forward_batch", None)
         group_table = None
@@ -965,6 +969,8 @@ class CuteDSLMLABackend(AttentionBackend):
 
         custom_mask = kwargs.get("custom_mask")
         cmask_off = kwargs.get("cmask_off")
+        if spec_info is None:
+            spec_info = self.forward_decode_spec_info
         if spec_info is not None:
             if custom_mask is None:
                 custom_mask = getattr(spec_info, "custom_mask", None)
