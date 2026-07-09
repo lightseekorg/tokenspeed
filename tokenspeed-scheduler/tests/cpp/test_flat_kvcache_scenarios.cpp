@@ -20,8 +20,8 @@
 
 // End-to-end scenario tests for the flat KV-cache FSM path
 // (TOKENSPEED_FLAT_KVCACHE=ON), complementing test_flat_kvcache_lifecycle.cpp.
-// Retract/writeback are deliberately deferred on the flat path (C slice), so
-// they are NOT tested here.
+// Flat retract (release-and-requeue, see FlatRetractSuite) replaces the
+// radix-style writeback retract, which stays unsupported on this path.
 
 #if TOKENSPEED_FLAT_KVCACHE
 
@@ -977,9 +977,9 @@ TEST_F(FlatPrefillPlateauSuite, SwaWorkingSetPlateausWhileFullGrowsToPromptLengt
 }
 
 // ---------------------------------------------------------------------------
-// Collective starvation deadlock: the scheduler must fail loudly, but only on
-// the SECOND consecutive fully-starved round with nothing in flight (a queued
-// Finish could make a single round a false positive).
+// Collective starvation: the scheduler retracts the largest holder, but only
+// on the SECOND consecutive fully-starved round with nothing in flight (a
+// queued Finish could make a single round a false positive).
 // ---------------------------------------------------------------------------
 class FlatCollectiveStarvationSuite : public SchedulerTestSuite {
 protected:
@@ -1008,7 +1008,7 @@ protected:
     }
 };
 
-TEST_F(FlatCollectiveStarvationSuite, DeadlockedPoolFailsLoudWithoutLeaking) {
+TEST_F(FlatCollectiveStarvationSuite, DeadlockedPoolRetractsLargestHolder) {
     ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), 12);
 
     // Round 1: both admitted (r1 gate 6 <= 12, r2 gate 6 <= 8 - 2); free 4.
@@ -1051,14 +1051,456 @@ TEST_F(FlatCollectiveStarvationSuite, DeadlockedPoolFailsLoudWithoutLeaking) {
     ASSERT_NE(starved1_op, nullptr);
     EXPECT_TRUE(starved1_op->request_ids.empty()) << "first starved round is quiet (two-round hardening)";
 
-    const std::int32_t free_before = scheduler_->FlatPoolFreeBlocks();
-    try {
-        PlanOnce();
-        FAIL() << "expected the flat starvation-deadlock assert to fire on the second starved round";
-    } catch (const std::runtime_error& e) {
-        EXPECT_NE(std::string(e.what()).find("flat pool starvation deadlock"), std::string::npos) << e.what();
+    // Second fully-starved round: retract the largest holder instead of
+    // deadlocking. r1 and r2 tie at 7 tokens; the deterministic candidate
+    // order (priority, then Id) makes r1 the victim.
+    ExecutionPlan retract_round = PlanOnce();
+    const FlatForwardOperation* retract_op = FindFlatOp(retract_round);
+    ASSERT_NE(retract_op, nullptr);
+    EXPECT_TRUE(retract_op->request_ids.empty());
+    EXPECT_TRUE(retract_round.flat_oom_request_ids.empty()) << "a holder existed: no OOM terminalization";
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), 6) << "the victim's 3 pages x 2 groups return to the pool";
+    EXPECT_EQ(scheduler_->WaitingSize(), 1u) << "the victim requeues as a fresh prefill";
+    EXPECT_EQ(scheduler_->DecodingSize(), 1u);
+
+    // The survivor's decode un-wedges on the freed pages.
+    ExecutionPlan unwedged = PlanOnce();
+    const FlatForwardOperation* unwedged_op = FindFlatOp(unwedged);
+    ASSERT_NE(unwedged_op, nullptr);
+    ASSERT_EQ(unwedged_op->request_ids.size(), 1u);
+    EXPECT_EQ(unwedged_op->request_ids.at(0), "r2");
+    SendForwardDone("r2", {145});
+    SendFinish("r2");
+
+    // With r2 reaped the victim re-admits: its prefill covers prompt + generated.
+    ExecutionPlan readmit = PlanOnce();
+    const FlatForwardOperation* readmit_op = FindFlatOp(readmit);
+    ASSERT_NE(readmit_op, nullptr);
+    ASSERT_EQ(readmit_op->request_ids.size(), 1u);
+    EXPECT_EQ(readmit_op->request_ids.at(0), "r1");
+    EXPECT_EQ(readmit_op->input_lengths.at(0), 7) << "prompt 4 + 3 generated rebased into the prefill window";
+    EXPECT_EQ(readmit_op->prefill_lengths.at(0), 7);
+
+    SendForwardDone("r1", {45});
+    PlanOnce();  // decode transition
+    SendForwardDone("r1", {46});
+    SendFinish("r1");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), 12);
+}
+
+// ---------------------------------------------------------------------------
+// Flat retract: two starved rounds pick the largest Decoding/PrefillDone
+// holder, release every page and requeue it as a fresh prefill (prompt +
+// generated rebased into the prefill window); with no holder to release the
+// head-of-line deferred request is OOM-terminalized instead.
+// ---------------------------------------------------------------------------
+class FlatRetractSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg{};
+        cfg.block_size = 2;
+        // 15 physical pages -> 14 usable: "a" (3-page prompt) charges
+        // 2*ceil(7/2) = 8 and "b" (2-page prompt) 2*ceil(5/2) = 6 = the pool.
+        cfg.device_allocator.total_pages = 15;
+        cfg.host_allocator.total_pages = 16;
+        cfg.max_scheduled_tokens = 64;
+        cfg.max_batch_size = 8;
+        cfg.enable_l3_storage = false;
+        cfg.disable_l2_cache = true;
+        cfg.disable_prefix_cache = true;
+
+        cfg.paged_cache_groups = {
+            MakeGroup("full_a", cfg.block_size, cfg.device_allocator.total_pages,
+                      PagedCacheGroupConfig::Retention::FullHistory,
+                      PagedCacheGroupFamily::History),
+            MakeGroup("full_b", cfg.block_size, cfg.device_allocator.total_pages,
+                      PagedCacheGroupConfig::Retention::FullHistory,
+                      PagedCacheGroupFamily::History),
+        };
+        return cfg;
     }
-    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_before) << "the failed round must not leak or free pages";
+
+    // Drives "a" (6-token prompt) and "b" (4-token prompt) into the exact-fit
+    // wedge and through both starved rounds to the round that retracts "a".
+    // Post: "a" Submitted with 9 tokens, "b" Decoding with 7 tokens, free = 8.
+    void DriveToRetractOfA() {
+        ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), 14);
+        Submit(MakeRequestSpec("a", /*num_pages=*/3));
+        Submit(MakeRequestSpec("b", /*num_pages=*/2, /*start=*/101));
+
+        ExecutionPlan prefill = PlanOnce();
+        const FlatForwardOperation* prefill_op = FindFlatOp(prefill);
+        ASSERT_NE(prefill_op, nullptr);
+        ASSERT_EQ(prefill_op->request_ids.size(), 2u);
+        ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), 4);
+        SendForwardDone("a", {42});
+        SendForwardDone("b", {142});
+
+        // Both decode transitions consume their reservations: free 0.
+        ExecutionPlan decode = PlanOnce();
+        const FlatForwardOperation* decode_op = FindFlatOp(decode);
+        ASSERT_NE(decode_op, nullptr);
+        ASSERT_EQ(decode_op->request_ids.size(), 2u);
+        ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), 0);
+        SendForwardDone("a", {43});   // 8 tokens = a's capacity
+        SendForwardDone("b", {143});  // 6 tokens = b's capacity
+
+        // Both next steps still fit their tail pages (0 fresh blocks).
+        ExecutionPlan tail_round = PlanOnce();
+        const FlatForwardOperation* tail_op = FindFlatOp(tail_round);
+        ASSERT_NE(tail_op, nullptr);
+        ASSERT_EQ(tail_op->request_ids.size(), 2u);
+        SendForwardDone("a", {44});   // 9 tokens: past capacity
+        SendForwardDone("b", {144});  // 7 tokens: past capacity
+
+        // First fully-starved round stays quiet (two-round hardening).
+        ExecutionPlan starved = PlanOnce();
+        const FlatForwardOperation* starved_op = FindFlatOp(starved);
+        ASSERT_NE(starved_op, nullptr);
+        ASSERT_TRUE(starved_op->request_ids.empty());
+        ASSERT_TRUE(starved.flat_oom_request_ids.empty());
+        ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), 0);
+
+        // Second starved round: retract "a" (9 tokens > b's 7).
+        ExecutionPlan retract_round = PlanOnce();
+        const FlatForwardOperation* retract_op = FindFlatOp(retract_round);
+        ASSERT_NE(retract_op, nullptr);
+        ASSERT_TRUE(retract_op->request_ids.empty());
+        ASSERT_TRUE(retract_round.flat_oom_request_ids.empty());
+        ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), 8) << "the victim's 4 pages x 2 groups return to the pool";
+        ASSERT_EQ(scheduler_->WaitingSize(), 1u) << "the victim requeues as a fresh prefill";
+        ASSERT_EQ(scheduler_->DecodingSize(), 1u);
+    }
+};
+
+TEST_F(FlatRetractSuite, VictimInDecodingReleasesPagesAndRequeues) {
+    DriveToRetractOfA();
+
+    // The survivor proceeds on the freed pages; the victim (10-block charge) waits.
+    ExecutionPlan unwedged = PlanOnce();
+    const FlatForwardOperation* unwedged_op = FindFlatOp(unwedged);
+    ASSERT_NE(unwedged_op, nullptr);
+    ASSERT_EQ(unwedged_op->request_ids.size(), 1u);
+    EXPECT_EQ(unwedged_op->request_ids.at(0), "b");
+    SendForwardDone("b", {145});
+    SendFinish("b");
+
+    // b reaped -> the victim re-admits with its FULL length and completes.
+    ExecutionPlan readmit = PlanOnce();
+    const FlatForwardOperation* readmit_op = FindFlatOp(readmit);
+    ASSERT_NE(readmit_op, nullptr);
+    ASSERT_EQ(readmit_op->request_ids.size(), 1u);
+    EXPECT_EQ(readmit_op->request_ids.at(0), "a");
+    EXPECT_EQ(readmit_op->input_lengths.at(0), 9) << "prompt 6 + 3 generated prefill as one fresh extend";
+    SendForwardDone("a", {45});
+    PlanOnce();  // decode transition
+    SendForwardDone("a", {46});
+    SendFinish("a");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), 14) << "pool balances after the full retract cycle";
+}
+
+TEST_F(FlatRetractSuite, RetractedRequestPrefillCoversOldTokens) {
+    DriveToRetractOfA();
+    EXPECT_EQ(scheduler_->GetRequestTokenSize("a"), 9);
+
+    // Free the survivor so the victim re-admits immediately.
+    SendFinish("b");
+    ExecutionPlan readmit = PlanOnce();
+    const FlatForwardOperation* op = FindFlatOp(readmit);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->request_ids.size(), 1u);
+    ASSERT_EQ(op->request_ids.at(0), "a");
+    EXPECT_EQ(op->input_lengths.at(0), 9) << "RebasePrefill: the new prefill covers prompt + generated";
+    EXPECT_EQ(op->prefill_lengths.at(0), 9) << "PrefillSize rebased to the full token count";
+}
+
+// Exact-fit re-admission after a retract: the whole freed budget (pages AND any
+// stale decode reserve) must be spendable by the next request.
+class FlatRetractExactFitSuite : public FlatRetractSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = FlatRetractSuite::MakeConfig();
+        // 9 physical pages -> 8 usable: one 3-page prompt charges exactly the pool.
+        cfg.device_allocator.total_pages = 9;
+        cfg.host_allocator.total_pages = 10;
+        for (auto& g : cfg.paged_cache_groups) {
+            g.total_pages = cfg.device_allocator.total_pages;
+        }
+        return cfg;
+    }
+};
+
+TEST_F(FlatRetractExactFitSuite, ReserveRefundBalances) {
+    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), 8);
+    Submit(MakeRequestSpec("a", /*num_pages=*/3));  // charge 2*ceil(7/2) = 8: exact fit
+    ExecutionPlan prefill = PlanOnce();
+    ASSERT_EQ(FindFlatOp(prefill)->request_ids.size(), 1u);
+    SendForwardDone("a", {42});
+    PlanOnce();  // decode transition consumes the reserve: free 0
+    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), 0);
+    SendForwardDone("a", {43});  // 8 tokens = capacity
+    PlanOnce();                  // tail-page decode (0 fresh blocks)
+    SendForwardDone("a", {44});  // 9 tokens: past capacity
+
+    PlanOnce();  // starved round 1
+    ExecutionPlan retract_round = PlanOnce();  // starved round 2 -> retract "a"
+    ASSERT_TRUE(retract_round.flat_oom_request_ids.empty());
+    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), 8);
+    ASSERT_EQ(scheduler_->WaitingSize(), 1u);
+
+    // "d" needs EXACTLY the freed budget: a stale reserve ledger entry for the
+    // victim would shrink the gate below 8 and defer it.
+    Submit(MakeRequestSpec("d", /*num_pages=*/3, /*start=*/201));
+    ExecutionPlan admitted = PlanOnce();
+    const FlatForwardOperation* op = FindFlatOp(admitted);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->request_ids.size(), 1u);
+    EXPECT_EQ(op->request_ids.at(0), "d") << "exact-fit admission proves the full budget was refunded";
+
+    SendForwardDone("d", {99});
+    PlanOnce();  // decode transition
+    SendForwardDone("d", {100});
+    SendFinish("d");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), 8);
+    EXPECT_EQ(scheduler_->WaitingSize(), 1u) << "the oversized retracted victim keeps waiting";
+}
+
+// OOM terminalization: pages held by a wedged Prefilling request (never a
+// retract victim) and a first chunk that can never fit -> after two starved
+// rounds the request is terminalized and surfaced via flat_oom_request_ids.
+class FlatRetractOomSuite : public FlatRetractSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = FlatRetractSuite::MakeConfig();
+        // 9 physical pages -> 8 usable; 4-token chunks: a 20-token prompt wedges
+        // itself mid-prefill after two chunks (8 blocks) with 12 tokens to go.
+        cfg.device_allocator.total_pages = 9;
+        cfg.host_allocator.total_pages = 10;
+        cfg.max_scheduled_tokens = 4;
+        for (auto& g : cfg.paged_cache_groups) {
+            g.total_pages = cfg.device_allocator.total_pages;
+        }
+        return cfg;
+    }
+};
+
+TEST_F(FlatRetractOomSuite, SingleOversizedRequestGetsOomTerminal) {
+    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), 8);
+    Submit(MakeRequestSpec("c", /*num_pages=*/10));  // 20 tokens: can never fit
+    ExecutionPlan chunk1 = PlanOnce();
+    ASSERT_EQ(FindFlatOp(chunk1)->request_ids.size(), 1u);
+    ExecutionPlan chunk2 = PlanOnce();
+    ASSERT_EQ(FindFlatOp(chunk2)->request_ids.size(), 1u);
+    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), 0);
+
+    ExecutionPlan starved = PlanOnce();  // round 1 stays quiet
+    ASSERT_TRUE(FindFlatOp(starved)->request_ids.empty());
+    ASSERT_TRUE(starved.flat_oom_request_ids.empty());
+
+    // Round 2: no Decoding/PrefillDone victim exists -> terminalize "c".
+    ExecutionPlan oom_round = PlanOnce();
+    ASSERT_TRUE(FindFlatOp(oom_round)->request_ids.empty());
+    ASSERT_EQ(oom_round.flat_oom_request_ids.size(), 1u);
+    EXPECT_EQ(oom_round.flat_oom_request_ids.at(0), "c");
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), 8) << "the terminalized request's pages return to the pool";
+    EXPECT_EQ(scheduler_->WaitingSize(), 0u);
+
+    // A small request then completes normally (the reaper erased "c").
+    Submit(MakeRequestSpec("d", /*num_pages=*/2, /*start=*/201));
+    ExecutionPlan admitted = PlanOnce();
+    const FlatForwardOperation* op = FindFlatOp(admitted);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->request_ids.size(), 1u);
+    EXPECT_EQ(op->request_ids.at(0), "d");
+    SendForwardDone("d", {99});
+    PlanOnce();  // decode transition
+    SendForwardDone("d", {100});
+    SendFinish("d");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), 8);
+}
+
+// Two starvation cycles on one pool: each cycle retracts a DIFFERENT largest
+// holder; the smallest request rides both frees to completion.
+class FlatRetractTrioSuite : public FlatRetractSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = FlatRetractSuite::MakeConfig();
+        // 25 physical pages -> 24 usable: r1 charges 10, r2 8, r3 6 = the pool.
+        cfg.device_allocator.total_pages = 25;
+        cfg.host_allocator.total_pages = 26;
+        for (auto& g : cfg.paged_cache_groups) {
+            g.total_pages = cfg.device_allocator.total_pages;
+        }
+        return cfg;
+    }
+};
+
+TEST_F(FlatRetractTrioSuite, TwoRoundsTwoVictims) {
+    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), 24);
+    Submit(MakeRequestSpec("r1", /*num_pages=*/4));
+    Submit(MakeRequestSpec("r2", /*num_pages=*/3, /*start=*/101));
+    Submit(MakeRequestSpec("r3", /*num_pages=*/2, /*start=*/201));
+
+    ExecutionPlan prefill = PlanOnce();
+    ASSERT_EQ(FindFlatOp(prefill)->request_ids.size(), 3u);
+    SendForwardDone("r1", {42});
+    SendForwardDone("r2", {142});
+    SendForwardDone("r3", {242});
+
+    ExecutionPlan decode = PlanOnce();  // all three consume their reserves
+    ASSERT_EQ(FindFlatOp(decode)->request_ids.size(), 3u);
+    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), 0);
+    SendForwardDone("r1", {43});   // 10 = capacity
+    SendForwardDone("r2", {143});  // 8 = capacity
+    SendForwardDone("r3", {243});  // 6 = capacity
+    PlanOnce();  // tail-page decodes (0 fresh blocks)
+    SendForwardDone("r1", {44});   // 11: past capacity
+    SendForwardDone("r2", {144});  // 9: past capacity
+    SendForwardDone("r3", {244});  // 7: past capacity
+
+    // Cycle 1: two starved rounds retract r1 (11 tokens, the largest).
+    ASSERT_TRUE(FindFlatOp(PlanOnce())->request_ids.empty());
+    ExecutionPlan first_retract = PlanOnce();
+    ASSERT_TRUE(FindFlatOp(first_retract)->request_ids.empty());
+    ASSERT_TRUE(first_retract.flat_oom_request_ids.empty());
+    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), 10) << "r1's 5 pages x 2 groups return";
+    ASSERT_EQ(scheduler_->WaitingSize(), 1u);
+
+    // r2 and r3 ride the freed pages until the pool wedges again with r2 the
+    // largest holder (r1's 12-block re-admission charge never fits meanwhile).
+    ExecutionPlan p6 = PlanOnce();  // both acquire a page pair: free 6
+    ASSERT_EQ(FindFlatOp(p6)->request_ids.size(), 2u);
+    SendForwardDone("r2", {145});
+    SendForwardDone("r3", {245});
+    PlanOnce();  // tail-page decodes
+    SendForwardDone("r2", {146});
+    SendForwardDone("r3", {246});
+    PlanOnce();  // both acquire a page pair: free 2
+    SendForwardDone("r2", {147});
+    SendForwardDone("r3", {247});
+    PlanOnce();  // tail-page decodes
+    SendForwardDone("r2", {148});
+    SendForwardDone("r3", {248});
+    ExecutionPlan p10 = PlanOnce();  // r2 takes the last pair; r3 defers
+    ASSERT_EQ(FindFlatOp(p10)->request_ids.size(), 1u);
+    ASSERT_EQ(FindFlatOp(p10)->request_ids.at(0), "r2");
+    SendForwardDone("r2", {149});
+    ExecutionPlan p11 = PlanOnce();  // r2 tail-page decode
+    ASSERT_EQ(FindFlatOp(p11)->request_ids.size(), 1u);
+    SendForwardDone("r2", {150});  // 15 tokens: past capacity
+
+    // Cycle 2: two starved rounds retract r2 (15 tokens > r3's 11).
+    ASSERT_TRUE(FindFlatOp(PlanOnce())->request_ids.empty());
+    ExecutionPlan second_retract = PlanOnce();
+    ASSERT_TRUE(FindFlatOp(second_retract)->request_ids.empty());
+    ASSERT_TRUE(second_retract.flat_oom_request_ids.empty());
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), 14) << "r2's 7 pages x 2 groups return";
+    EXPECT_EQ(scheduler_->WaitingSize(), 2u) << "two different victims retracted, one per cycle";
+    EXPECT_EQ(scheduler_->DecodingSize(), 1u);
+
+    // Third proceeds: drop the two waiting victims and let r3 finish.
+    SendAbort(*scheduler_, "r1");
+    SendAbort(*scheduler_, "r2");
+    ExecutionPlan survivor = PlanOnce();
+    const FlatForwardOperation* op = FindFlatOp(survivor);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->request_ids.size(), 1u);
+    EXPECT_EQ(op->request_ids.at(0), "r3");
+    SendForwardDone("r3", {249});
+    SendFinish("r3");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), 24);
+}
+
+// A victim whose config carries a mamba-style state group (family=State,
+// FullHistory retention) must release state pages too.
+class FlatRetractStateGroupSuite : public FlatRetractSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = FlatRetractSuite::MakeConfig();
+        cfg.device_allocator.total_pages = 9;  // 8 usable
+        cfg.host_allocator.total_pages = 10;
+        cfg.paged_cache_groups = {
+            MakeGroup("full", cfg.block_size, cfg.device_allocator.total_pages,
+                      PagedCacheGroupConfig::Retention::FullHistory,
+                      PagedCacheGroupFamily::History),
+            MakeGroup("state", cfg.block_size, cfg.device_allocator.total_pages,
+                      PagedCacheGroupConfig::Retention::FullHistory,
+                      PagedCacheGroupFamily::State),
+        };
+        return cfg;
+    }
+};
+
+TEST_F(FlatRetractStateGroupSuite, StateGroupVictimRetractsCleanly) {
+    const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
+    Submit(MakeRequestSpec("a", /*num_pages=*/2));
+    ExecutionPlan prefill = PlanOnce();
+    const FlatForwardOperation* prefill_op = FindFlatOp(prefill);
+    ASSERT_NE(prefill_op, nullptr);
+    ASSERT_EQ(prefill_op->request_ids.size(), 1u) << "the prompt must admit into the state-group config";
+    ASSERT_EQ(prefill_op->flat_block_tables.count("state"), 1u);
+    SendForwardDone("a", {1000});
+
+    // The lone grower decodes until the pool wedges; the second starved round
+    // retracts it (it is its own largest holder).
+    std::int32_t tok = 1001;
+    bool retracted = false;
+    for (int round = 0; round < 64 && !retracted; ++round) {
+        ExecutionPlan p = PlanOnce();
+        const FlatForwardOperation* op = FindFlatOp(p);
+        ASSERT_NE(op, nullptr);
+        if (!op->request_ids.empty()) {
+            SendForwardDone("a", {tok++});
+        } else if (scheduler_->WaitingSize() == 1u) {
+            retracted = true;
+        }
+    }
+    ASSERT_TRUE(retracted) << "the lone grower must starve and retract";
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start)
+        << "retract must return full-history AND state pages to the pool";
+    EXPECT_EQ(scheduler_->DecodingSize(), 0u);
+
+    SendAbort(*scheduler_, "a");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start);
+}
+
+// Event-level PrefillDone victim: the scheduler's reserve ledger keeps a
+// PrefillDone always able to transition, so drive the FSM event directly
+// (FlatEventFailurePath idiom) to pin the PrefillDone overload.
+TEST(FlatRetractEvent, PrefillDoneVictimReleasesPagesAndRequeues) {
+    BlockPool pool(/*total_num_blocks=*/9);  // 8 usable
+    std::vector<KvCacheSpec> specs{
+        KvCacheSpec{AttnKind::kFull, /*block_size=*/2, /*sliding_window=*/0},
+        KvCacheSpec{AttnKind::kSlidingWindow, /*block_size=*/2, /*sliding_window=*/4},
+    };
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, pool);
+    ReqPoolAllocator req_pool{4};
+
+    RequestSpec spec{.request_id = "r1", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*page_size=*/2)};
+    Request request{spec, /*page_size=*/2, Role::kFused};
+
+    // Whole 4-token prompt in one chunk -> PrefillDone: holds pages, no decode yet.
+    request.Apply(fsm::SchedulePrefillFirstChunkEvent{
+        /*tokens_this_round=*/4, /*decode_input_tokens=*/1, /*device_allocator=*/nullptr, &req_pool, MatchResult{},
+        Role::kFused, /*kv_prefix_cache=*/nullptr, /*disable_l2_cache=*/true, /*loadback_diff=*/{},
+        /*hybrid_prefix_cache=*/nullptr, /*mamba_allocator=*/nullptr, /*mamba_loadback_nodes=*/{}, &coordinator});
+    ASSERT_TRUE(request.Is<fsm::PrefillDone>());
+    ASSERT_LT(pool.NumFreeBlocks(), 8);
+
+    // The last chunk's ExtendResult lands while still PrefillDone.
+    request.Apply(fsm::ExtendResultEvent{"r1", {42}});
+
+    request.Apply(fsm::ScheduleFlatRetractEvent{&coordinator});
+    EXPECT_TRUE(request.Is<fsm::Submitted>());
+    EXPECT_EQ(pool.NumFreeBlocks(), 8) << "the retract must release every page";
+    EXPECT_EQ(request.TokenSize(), 5);
+    EXPECT_EQ(request.PrefillSize(), 5) << "prompt + generated rebase into the prefill window";
 }
 
 // ---------------------------------------------------------------------------
@@ -2468,11 +2910,12 @@ TEST_F(FlatHostHitSuite, StarvationWaitsForInFlightLoads) {
     ExecutionPlan starved1 = PlanOnce();
     ASSERT_NE(FindFlatOp(starved1), nullptr);
     EXPECT_TRUE(FindFlatOp(starved1)->request_ids.empty());
-    // The SECOND consecutive starved round is where the deadlock assert would
-    // fire; the in-flight load ledger must keep the starvation counter quiet.
+    // The SECOND consecutive starved round is where flat retract would fire;
+    // the in-flight load ledger must keep the starvation counter quiet.
     ExecutionPlan starved2 = PlanOnce();
     ASSERT_NE(FindFlatOp(starved2), nullptr);
     EXPECT_TRUE(FindFlatOp(starved2)->request_ids.empty());
+    EXPECT_TRUE(starved2.flat_oom_request_ids.empty()) << "in-flight load pages must hold off the retract path";
     EXPECT_EQ(scheduler_->WaitingSize(), 1u) << "deferred r3 stays intact in the waiting set";
 
     // LoadBackDone frees the 5 destinations: r3's 10-block gate now clears.

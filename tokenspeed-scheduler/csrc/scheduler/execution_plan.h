@@ -45,6 +45,10 @@ public:
 
     const std::vector<Operation>& Operations() const { return operations_; }
 
+    // Flat KV-cache: requests terminalized this round because their first chunk can never
+    // fit the pool (starvation with no retract victim). Always empty on the radix path.
+    std::vector<std::string> flat_oom_request_ids;
+
 private:
     std::vector<Operation> operations_;
 };

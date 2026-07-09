@@ -371,6 +371,9 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
 
     auto [fwd_ops, cache_ops] = newForwardOperation(candidates);
     plan.With(FlatForwardOperation{std::move(fwd_ops)});
+#if TOKENSPEED_FLAT_KVCACHE
+    plan.flat_oom_request_ids = std::exchange(flat_oom_request_ids_, {});
+#endif
 
     // Merge retract write-backs (if any) into the Draining write-back list, then emit once.
     if (auto* wb = std::get_if<std::vector<WriteBackOperation>>(&cache_ops)) {

@@ -198,9 +198,12 @@ private:
     // Reserve ledger: decode pages promised at admission but Acquired only at PrefillDone->Decoding; until
     // then they sit in the free count, so every flat gate subtracts OTHER requests' entries.
     std::unordered_map<std::string, std::int32_t> flat_reserved_pages_;
-    // The deadlock assert requires TWO starved rounds (an in-flight Finish fakes one); a Finish arriving
-    // 2+ rounds late still trips it -- residual risk accepted until TODO(flat-retract).
+    // Flat retract requires TWO consecutive starved rounds (an in-flight Finish fakes one)
+    // before releasing a victim; see newForwardOperation.
     std::int32_t flat_starved_rounds_{0};
+    // Requests terminalized because they can never fit the pool (flat OOM, no victim to
+    // retract); drained into the next ExecutionPlan for the client layer to fail them.
+    std::vector<std::string> flat_oom_request_ids_;
 
     struct FlatStoreTicket {
         std::string key;

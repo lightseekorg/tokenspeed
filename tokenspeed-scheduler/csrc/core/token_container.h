@@ -43,6 +43,10 @@ public:
 
     void Extend(const std::vector<std::int32_t>& new_tokens);
 
+    // Flat retract: fold generated tokens into the prefill window so the
+    // requeued request prefills prompt + generated as one fresh extend.
+    void RebasePrefill() { num_prefill_tokens_ = static_cast<std::int32_t>(tokens_.size()); }
+
     // constant methods
     std::vector<std::span<const std::int32_t>> GetFullPagedTokens(std::int32_t page_size, bool except_last) const;
     std::int32_t Size() const { return tokens_.size(); }
@@ -52,7 +56,7 @@ public:
 
 private:
     std::vector<std::int32_t> tokens_;
-    const std::int32_t num_prefill_tokens_{};
+    std::int32_t num_prefill_tokens_{};
 };
 
 }  // namespace tokenspeed

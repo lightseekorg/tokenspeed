@@ -425,7 +425,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     nb::class_<tokenspeed::ExecutionPlan>(m, "ExecutionPlan")
         .def(nb::init<>())
         .def_prop_ro("forward", collect_forward)
-        .def_prop_ro("cache", collect_cache);
+        .def_prop_ro("cache", collect_cache)
+        .def_ro("flat_oom_request_ids", &tokenspeed::ExecutionPlan::flat_oom_request_ids);
 
     nb::class_<tokenspeed::Scheduler>(m, "Scheduler")
         .def(nb::init<tokenspeed::SchedulerConfig>(), nb::arg("config") = tokenspeed::SchedulerConfig{})

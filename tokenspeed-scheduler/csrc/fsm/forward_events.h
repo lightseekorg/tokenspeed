@@ -311,6 +311,25 @@ private:
 #endif
 };
 
+#if TOKENSPEED_FLAT_KVCACHE
+// Flat retract: release every page and requeue as a fresh prefill (prompt + generated
+// rebased into the prefill window); prefix recovery rides the hash-intact frees and L2.
+struct ScheduleFlatRetractEvent : InvalidTransitionHandler<ScheduleFlatRetractEvent> {
+    using InvalidTransitionHandler<ScheduleFlatRetractEvent>::operator();
+
+    explicit ScheduleFlatRetractEvent(KvCacheCoordinator* coordinator) : coordinator_(coordinator) {}
+
+    Submitted operator()(Decoding&& state);
+    Submitted operator()(PrefillDone&& state);
+
+private:
+    template <typename ForwardStateT>
+    Submitted applyRetract(ForwardStateT&& state);
+
+    KvCacheCoordinator* coordinator_{};
+};
+#endif
+
 struct ScheduleRetractEvent : InvalidTransitionHandler<ScheduleRetractEvent> {
     using InvalidTransitionHandler<ScheduleRetractEvent>::operator();
     ScheduleRetractEvent(KVPrefixCache* kv_prefix_cache, PageAllocator* host_allocator, MatchResult match_result,

@@ -742,6 +742,28 @@ Finished AbortEvent::operator()(Retracted&&) {
     return Finished{};
 }
 
+#if TOKENSPEED_FLAT_KVCACHE
+template <typename ForwardStateT>
+Submitted ScheduleFlatRetractEvent::applyRetract(ForwardStateT&& state) {
+    _assert(coordinator_ != nullptr, "ScheduleFlatRetractEvent: flat path requires a coordinator");
+    TokenContainer* token_container = state.GetTokenContainer();
+    const std::int32_t page_size = state.GetPageSize();
+    // Generated tokens rebase into the prefill window so the requeued prefill recomputes them.
+    token_container->RebasePrefill();
+    auto tables = std::move(state).TakeBlockTables();
+    FreeRequest(*coordinator_, tables);
+    return Submitted{token_container, page_size};
+}
+
+Submitted ScheduleFlatRetractEvent::operator()(Decoding&& state) {
+    return applyRetract(std::move(state));
+}
+
+Submitted ScheduleFlatRetractEvent::operator()(PrefillDone&& state) {
+    return applyRetract(std::move(state));
+}
+#endif
+
 template <typename ForwardStateT>
 Retracting ScheduleRetractEvent::applyRetract(ForwardStateT&& state) {
 #if TOKENSPEED_FLAT_KVCACHE
