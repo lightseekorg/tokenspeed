@@ -20,133 +20,104 @@
 
 #include "tvm_ffi_utils.h"
 
-void transfer_kv_per_layer(
-    TensorView src_k,
-    TensorView dst_k,
-    TensorView src_v,
-    TensorView dst_v,
-    TensorView src_indices,
-    TensorView dst_indices,
-    int64_t item_size,
-    int64_t block_quota,
-    int64_t num_warps_per_block);
+void transfer_kv_per_layer(TensorView src_k, TensorView dst_k, TensorView src_v,
+                           TensorView dst_v, TensorView src_indices,
+                           TensorView dst_indices, int64_t item_size,
+                           int64_t block_quota, int64_t num_warps_per_block);
 
-void transfer_kv_per_layer_pf_lf(
-    TensorView src_k,
-    TensorView dst_k,
-    TensorView src_v,
-    TensorView dst_v,
-    TensorView src_indices,
-    TensorView dst_indices,
-    int64_t layer_id,
-    int64_t item_size,
-    int64_t src_layout_dim,
-    int64_t block_quota,
-    int64_t num_warps_per_block);
+void transfer_kv_per_layer_pf_lf(TensorView src_k, TensorView dst_k,
+                                 TensorView src_v, TensorView dst_v,
+                                 TensorView src_indices, TensorView dst_indices,
+                                 int64_t layer_id, int64_t item_size,
+                                 int64_t src_layout_dim, int64_t block_quota,
+                                 int64_t num_warps_per_block);
 
-void transfer_kv_per_layer_ph_lf(
-    TensorView src_k,
-    TensorView dst_k,
-    TensorView src_v,
-    TensorView dst_v,
-    TensorView src_indices,
-    TensorView dst_indices,
-    int64_t layer_id,
-    int64_t item_size,
-    int64_t src_layout_dim,
-    int64_t page_size,
-    int64_t head_num,
-    int64_t block_quota,
-    int64_t num_warps_per_block);
+void transfer_kv_per_layer_ph_lf(TensorView src_k, TensorView dst_k,
+                                 TensorView src_v, TensorView dst_v,
+                                 TensorView src_indices, TensorView dst_indices,
+                                 int64_t layer_id, int64_t item_size,
+                                 int64_t src_layout_dim, int64_t page_size,
+                                 int64_t head_num, int64_t block_quota,
+                                 int64_t num_warps_per_block);
 
-void transfer_kv_all_layer(
-    TensorView src_k_layers,
-    TensorView dst_k_layers,
-    TensorView src_v_layers,
-    TensorView dst_v_layers,
-    TensorView src_indices,
-    TensorView dst_indices,
-    int64_t item_size,
-    int64_t num_layers,
-    int64_t block_quota,
-    int64_t num_warps_per_block);
+void transfer_kv_all_layer(TensorView src_k_layers, TensorView dst_k_layers,
+                           TensorView src_v_layers, TensorView dst_v_layers,
+                           TensorView src_indices, TensorView dst_indices,
+                           int64_t item_size, int64_t num_layers,
+                           int64_t block_quota, int64_t num_warps_per_block);
 
-void transfer_kv_all_layer_lf_pf(
-    TensorView src_k_layers,
-    TensorView dst_k,
-    TensorView src_v_layers,
-    TensorView dst_v,
-    TensorView src_indices,
-    TensorView dst_indices,
-    int64_t item_size,
-    int64_t dst_layout_dim,
-    int64_t num_layers,
-    int64_t block_quota,
-    int64_t num_warps_per_block);
+void transfer_kv_all_layer_lf_pf(TensorView src_k_layers, TensorView dst_k,
+                                 TensorView src_v_layers, TensorView dst_v,
+                                 TensorView src_indices, TensorView dst_indices,
+                                 int64_t item_size, int64_t dst_layout_dim,
+                                 int64_t num_layers, int64_t block_quota,
+                                 int64_t num_warps_per_block);
 
-void transfer_kv_all_layer_lf_ph(
-    TensorView src_k_layers,
-    TensorView dst_k,
-    TensorView src_v_layers,
-    TensorView dst_v,
-    TensorView src_indices,
-    TensorView dst_indices,
-    int64_t item_size,
-    int64_t dst_layout_dim,
-    int64_t num_layers,
-    int64_t page_size,
-    int64_t head_num,
-    int64_t block_quota,
-    int64_t num_warps_per_block);
+void transfer_kv_all_layer_lf_ph(TensorView src_k_layers, TensorView dst_k,
+                                 TensorView src_v_layers, TensorView dst_v,
+                                 TensorView src_indices, TensorView dst_indices,
+                                 int64_t item_size, int64_t dst_layout_dim,
+                                 int64_t num_layers, int64_t page_size,
+                                 int64_t head_num, int64_t block_quota,
+                                 int64_t num_warps_per_block);
 
-void transfer_kv_per_layer_mla(
-    TensorView src,
-    TensorView dst,
-    TensorView src_indices,
-    TensorView dst_indices,
-    int64_t item_size,
-    int64_t block_quota,
-    int64_t num_warps_per_block);
+void transfer_kv_per_layer_mla(TensorView src, TensorView dst,
+                               TensorView src_indices, TensorView dst_indices,
+                               int64_t item_size, int64_t block_quota,
+                               int64_t num_warps_per_block);
 
-void transfer_kv_per_layer_mla_pf_lf(
-    TensorView src,
-    TensorView dst,
-    TensorView src_indices,
-    TensorView dst_indices,
-    int64_t layer_id,
-    int64_t item_size,
-    int64_t src_layout_dim,
-    int64_t block_quota,
-    int64_t num_warps_per_block);
+void transfer_kv_per_layer_mla_pf_lf(TensorView src, TensorView dst,
+                                     TensorView src_indices,
+                                     TensorView dst_indices, int64_t layer_id,
+                                     int64_t item_size, int64_t src_layout_dim,
+                                     int64_t block_quota,
+                                     int64_t num_warps_per_block);
 
-void transfer_kv_all_layer_mla(
-    TensorView src_layers,
-    TensorView dst_layers,
-    TensorView src_indices,
-    TensorView dst_indices,
-    int64_t item_size,
-    int64_t num_layers,
-    int64_t block_quota,
-    int64_t num_warps_per_block);
+void transfer_kv_all_layer_mla(TensorView src_layers, TensorView dst_layers,
+                               TensorView src_indices, TensorView dst_indices,
+                               int64_t item_size, int64_t num_layers,
+                               int64_t block_quota,
+                               int64_t num_warps_per_block);
 
-void transfer_kv_all_layer_mla_lf_pf(
-    TensorView src_layers,
-    TensorView dst,
-    TensorView src_indices,
-    TensorView dst_indices,
-    int64_t item_size,
-    int64_t dst_layout_dim,
-    int64_t num_layers,
-    int64_t block_quota,
-    int64_t num_warps_per_block);
+void transfer_kv_all_layer_mla_lf_pf(TensorView src_layers, TensorView dst,
+                                     TensorView src_indices,
+                                     TensorView dst_indices, int64_t item_size,
+                                     int64_t dst_layout_dim, int64_t num_layers,
+                                     int64_t block_quota,
+                                     int64_t num_warps_per_block);
+
+void transfer_kv_direct_ptr_table(TensorView src_layer_ptrs,
+                                  TensorView dst_layer_ptrs,
+                                  TensorView src_indices,
+                                  TensorView dst_indices, int64_t item_size,
+                                  int64_t page_size);
+
+void transfer_kv_direct_ptr_table_scatter_h2d(TensorView src_layer_ptrs,
+                                              TensorView dst_layer_ptrs,
+                                              TensorView src_indices,
+                                              TensorView dst_indices,
+                                              int64_t item_size,
+                                              int64_t page_size);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(transfer_kv_per_layer, transfer_kv_per_layer);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(transfer_kv_per_layer_pf_lf, transfer_kv_per_layer_pf_lf);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(transfer_kv_per_layer_ph_lf, transfer_kv_per_layer_ph_lf);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(transfer_kv_per_layer_pf_lf,
+                              transfer_kv_per_layer_pf_lf);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(transfer_kv_per_layer_ph_lf,
+                              transfer_kv_per_layer_ph_lf);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(transfer_kv_all_layer, transfer_kv_all_layer);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(transfer_kv_all_layer_lf_pf, transfer_kv_all_layer_lf_pf);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(transfer_kv_all_layer_lf_ph, transfer_kv_all_layer_lf_ph);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(transfer_kv_per_layer_mla, transfer_kv_per_layer_mla);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(transfer_kv_per_layer_mla_pf_lf, transfer_kv_per_layer_mla_pf_lf);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(transfer_kv_all_layer_mla, transfer_kv_all_layer_mla);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(transfer_kv_all_layer_mla_lf_pf, transfer_kv_all_layer_mla_lf_pf);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(transfer_kv_all_layer_lf_pf,
+                              transfer_kv_all_layer_lf_pf);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(transfer_kv_all_layer_lf_ph,
+                              transfer_kv_all_layer_lf_ph);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(transfer_kv_per_layer_mla,
+                              transfer_kv_per_layer_mla);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(transfer_kv_per_layer_mla_pf_lf,
+                              transfer_kv_per_layer_mla_pf_lf);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(transfer_kv_all_layer_mla,
+                              transfer_kv_all_layer_mla);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(transfer_kv_all_layer_mla_lf_pf,
+                              transfer_kv_all_layer_mla_lf_pf);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(transfer_kv_direct_ptr_table,
+                              transfer_kv_direct_ptr_table);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(transfer_kv_direct_ptr_table_scatter_h2d,
+                              transfer_kv_direct_ptr_table_scatter_h2d);

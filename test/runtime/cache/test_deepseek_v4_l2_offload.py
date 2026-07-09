@@ -256,18 +256,25 @@ def test_deepseek_v4_paged_pool_dispatches_direct_page_copies(monkeypatch):
         "transfer_kv_direct",
         fake_transfer_kv_direct,
     )
-    transfer = SimpleNamespace(
-        group_id="v4.c4a.compressed_kv",
-        src_pages=[3, 1, 3],
-        dst_pages=[9, 7, 9],
-    )
+    transfers = [
+        SimpleNamespace(
+            group_id="v4.c4a.compressed_kv",
+            src_pages=[3, 1, 3],
+            dst_pages=[9, 7, 9],
+        ),
+        SimpleNamespace(
+            group_id="v4.c4a.compressed_kv",
+            src_pages=[2, 1],
+            dst_pages=[8, 7],
+        ),
+    ]
 
-    transfer_pool.writeback_paged([transfer])
+    transfer_pool.writeback_paged(transfers)
 
     assert len(calls) == 1
     src_layers, dst_layers, src_indices, dst_indices, page_size = calls[0]
-    assert src_indices == [1, 3]
-    assert dst_indices == [7, 9]
+    assert src_indices == [1, 2, 3]
+    assert dst_indices == [7, 8, 9]
     assert page_size == 1
     assert src_layers[0] is device_pool.compressed_kv_buffer[1]
     assert src_layers[1] is device_pool.indexer_kv_buffer[1]
@@ -279,12 +286,16 @@ def test_deepseek_v4_paged_pool_dispatches_direct_page_copies(monkeypatch):
     )
     assert transfer_pool.get_transfer_stats()["D2H"]["v4.c4a.compressed_kv"] == {
         "calls": 1,
-        "pages": 2,
-        "bytes": 2 * c4_bytes,
+        "pages": 3,
+        "bytes": 3 * c4_bytes,
     }
 
     calls.clear()
-    transfer_pool.loadback_paged([transfer], layer_idx=1)
+    prepared = transfer_pool.prepare_paged_transfers(transfers)
+    assert len(prepared) == 1
+    assert prepared[0].page_count == 3
+    assert prepared[0].span_count == 1
+    transfer_pool.loadback_prepared_paged(prepared, layer_idx=1)
 
     assert len(calls) == 1
     src_layers, dst_layers, src_indices, dst_indices, page_size = calls[0]
@@ -292,13 +303,13 @@ def test_deepseek_v4_paged_pool_dispatches_direct_page_copies(monkeypatch):
     assert src_layers[1] is host_pool.indexer_kv_buffer[1]
     assert dst_layers[0] is device_pool.compressed_kv_buffer[1]
     assert dst_layers[1] is device_pool.indexer_kv_buffer[1]
-    assert src_indices == [1, 3]
-    assert dst_indices == [7, 9]
+    assert src_indices == [1, 2, 3]
+    assert dst_indices == [7, 8, 9]
     assert page_size == 1
     assert transfer_pool.get_transfer_stats()["H2D"]["v4.c4a.compressed_kv"] == {
         "calls": 1,
-        "pages": 2,
-        "bytes": 2 * c4_bytes,
+        "pages": 3,
+        "bytes": 3 * c4_bytes,
     }
     transfer_pool.reset_transfer_stats()
     assert transfer_pool.get_transfer_stats() == {"D2H": {}, "H2D": {}}
@@ -313,7 +324,7 @@ def test_deepseek_v4_paged_pool_dispatches_direct_page_copies(monkeypatch):
         failing_transfer_kv_direct,
     )
     try:
-        transfer_pool.writeback_paged([transfer])
+        transfer_pool.writeback_paged(transfers)
     except RuntimeError as exc:
         assert "copy submission failed" in str(exc)
     else:

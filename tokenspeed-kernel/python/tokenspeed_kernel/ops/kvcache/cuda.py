@@ -29,6 +29,7 @@ try:
         transfer_kv_all_layer_mla,
         transfer_kv_all_layer_mla_lf_pf,
         transfer_kv_direct,
+        transfer_kv_direct_h2d_scatter,
         transfer_kv_per_layer_mla,
         transfer_kv_per_layer_mla_pf_lf,
         transfer_kv_per_layer_pf_lf,
@@ -40,6 +41,7 @@ except ImportError:
     transfer_kv_all_layer_mla = error_fn
     transfer_kv_all_layer_mla_lf_pf = error_fn
     transfer_kv_direct = error_fn
+    transfer_kv_direct_h2d_scatter = error_fn
     transfer_kv_per_layer_mla = error_fn
     transfer_kv_per_layer_mla_pf_lf = error_fn
     transfer_kv_per_layer_pf_lf = error_fn
@@ -51,6 +53,7 @@ __all__ = [
     "transfer_kv_all_layer_mla",
     "transfer_kv_all_layer_mla_lf_pf",
     "transfer_kv_direct",
+    "transfer_kv_direct_h2d_scatter",
     "transfer_kv_per_layer_mla",
     "transfer_kv_per_layer_mla_pf_lf",
     "transfer_kv_per_layer_pf_lf",

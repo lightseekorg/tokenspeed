@@ -365,24 +365,57 @@ class HostExecutor:
                 op_ids.extend(unit.op_id for unit in units)
             if self.paged_write_queue:
                 assert self.paged_pool is not None
-                if logger.isEnabledFor(_DEBUG):
-                    paged_pages, paged_transfers, paged_groups = (
-                        _paged_queue_debug_summary(self.paged_write_queue)
-                    )
-                    logger.debug(
-                        "[cache_op][paged_l2] writeback submit units=%s "
-                        "transfers=%s pages=%s groups=%s",
-                        len(self.paged_write_queue),
-                        paged_transfers,
-                        paged_pages,
-                        paged_groups,
-                    )
                 transfers = [
                     transfer
                     for unit in self.paged_write_queue
                     for transfer in unit.transfers
                 ]
-                self.paged_pool.writeback_paged(transfers)
+                prepare_transfers = getattr(
+                    self.paged_pool,
+                    "prepare_paged_transfers",
+                    None,
+                )
+                write_prepared = getattr(
+                    self.paged_pool,
+                    "writeback_prepared_paged",
+                    None,
+                )
+                prepared_transfers = (
+                    prepare_transfers(transfers)
+                    if prepare_transfers is not None and write_prepared is not None
+                    else None
+                )
+                if logger.isEnabledFor(_DEBUG):
+                    paged_pages, paged_transfers, paged_groups = (
+                        _paged_queue_debug_summary(self.paged_write_queue)
+                    )
+                    prepared_count = (
+                        len(prepared_transfers)
+                        if prepared_transfers is not None
+                        else "n/a"
+                    )
+                    prepared_spans = (
+                        sum(
+                            int(getattr(transfer, "span_count", 0))
+                            for transfer in prepared_transfers
+                        )
+                        if prepared_transfers is not None
+                        else "n/a"
+                    )
+                    logger.debug(
+                        "[cache_op][paged_l2] writeback submit units=%s "
+                        "transfers=%s coalesced=%s spans=%s pages=%s groups=%s",
+                        len(self.paged_write_queue),
+                        paged_transfers,
+                        prepared_count,
+                        prepared_spans,
+                        paged_pages,
+                        paged_groups,
+                    )
+                if prepared_transfers is not None and write_prepared is not None:
+                    write_prepared(prepared_transfers)
+                else:
+                    self.paged_pool.writeback_paged(transfers)
                 op_ids.extend(unit.op_id for unit in self.paged_write_queue)
             finish_event.record()
 
@@ -448,31 +481,91 @@ class HostExecutor:
             if self.paged_load_queue:
                 assert self.paged_pool is not None
                 assert self._paged_counter is not None
-                if logger.isEnabledFor(_DEBUG):
-                    paged_pages, paged_transfers, paged_groups = (
-                        _paged_queue_debug_summary(self.paged_load_queue)
-                    )
-                    logger.debug(
-                        "[cache_op][paged_l2] loadback submit units=%s "
-                        "transfers=%s pages=%s groups=%s layers=%s",
-                        len(self.paged_load_queue),
-                        paged_transfers,
-                        paged_pages,
-                        paged_groups,
-                        self.paged_pool.num_layers(),
-                    )
-                producer_id = self._paged_counter.update_producer()
-                producer_event = self._paged_counter.events[producer_id]
-                producer_event.start_event.record()
-                producer_event.start_event.wait(self.load_stream)
                 transfers = [
                     transfer
                     for unit in self.paged_load_queue
                     for transfer in unit.transfers
                 ]
-                for layer_index in range(self.paged_pool.num_layers()):
-                    self.paged_pool.loadback_paged(transfers, layer_index)
-                    producer_event.complete(layer_index)
+                prepare_transfers = getattr(
+                    self.paged_pool,
+                    "prepare_paged_transfers",
+                    None,
+                )
+                load_prepared = getattr(
+                    self.paged_pool,
+                    "loadback_prepared_paged",
+                    None,
+                )
+                load_prepared_range = getattr(
+                    self.paged_pool,
+                    "loadback_prepared_paged_range",
+                    None,
+                )
+                prepared_transfers = (
+                    prepare_transfers(transfers)
+                    if prepare_transfers is not None and load_prepared is not None
+                    else None
+                )
+                num_layers = self.paged_pool.num_layers()
+                layer_chunk_size = 1
+                if prepared_transfers is not None and load_prepared_range is not None:
+                    layer_chunk_size = max(
+                        1,
+                        int(getattr(self.paged_pool, "loadback_layer_chunk_size", 1)),
+                    )
+                layer_chunks = (num_layers + layer_chunk_size - 1) // layer_chunk_size
+                if logger.isEnabledFor(_DEBUG):
+                    paged_pages, paged_transfers, paged_groups = (
+                        _paged_queue_debug_summary(self.paged_load_queue)
+                    )
+                    prepared_count = (
+                        len(prepared_transfers)
+                        if prepared_transfers is not None
+                        else "n/a"
+                    )
+                    prepared_spans = (
+                        sum(
+                            int(getattr(transfer, "span_count", 0))
+                            for transfer in prepared_transfers
+                        )
+                        if prepared_transfers is not None
+                        else "n/a"
+                    )
+                    logger.debug(
+                        "[cache_op][paged_l2] loadback submit units=%s "
+                        "transfers=%s coalesced=%s spans=%s pages=%s groups=%s "
+                        "layers=%s layer_chunk=%s layer_chunks=%s",
+                        len(self.paged_load_queue),
+                        paged_transfers,
+                        prepared_count,
+                        prepared_spans,
+                        paged_pages,
+                        paged_groups,
+                        num_layers,
+                        layer_chunk_size,
+                        layer_chunks,
+                    )
+                producer_id = self._paged_counter.update_producer()
+                producer_event = self._paged_counter.events[producer_id]
+                producer_event.start_event.record()
+                producer_event.start_event.wait(self.load_stream)
+                if prepared_transfers is not None and load_prepared_range is not None:
+                    for layer_start in range(0, num_layers, layer_chunk_size):
+                        layer_end = min(layer_start + layer_chunk_size, num_layers)
+                        load_prepared_range(
+                            prepared_transfers,
+                            layer_start,
+                            layer_end,
+                        )
+                        for layer_index in range(layer_start, layer_end):
+                            producer_event.complete(layer_index)
+                else:
+                    for layer_index in range(num_layers):
+                        if prepared_transfers is not None and load_prepared is not None:
+                            load_prepared(prepared_transfers, layer_index)
+                        else:
+                            self.paged_pool.loadback_paged(transfers, layer_index)
+                        producer_event.complete(layer_index)
                 op_ids = _ordered_unique(unit.op_id for unit in self.paged_load_queue)
                 self.ack_load_queue.append(_Ack(producer_event.finish_event, op_ids))
                 for op_id in op_ids:

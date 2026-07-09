@@ -137,6 +137,31 @@ class FakePagedPool:
         self.loadbacks.append((layer_idx, list(transfers)))
 
 
+class FakePreparedPagedPool(FakePagedPool):
+    loadback_layer_chunk_size = 2
+
+    def __init__(self, num_layers: int):
+        super().__init__(num_layers)
+        self.prepares = []
+        self.prepared_writebacks = []
+        self.prepared_loadbacks = []
+        self.prepared_range_loadbacks = []
+
+    def prepare_paged_transfers(self, transfers):
+        prepared = tuple(("prepared", id(transfer)) for transfer in transfers)
+        self.prepares.append(list(transfers))
+        return prepared
+
+    def writeback_prepared_paged(self, prepared):
+        self.prepared_writebacks.append(tuple(prepared))
+
+    def loadback_prepared_paged(self, prepared, layer_idx: int):
+        self.prepared_loadbacks.append((layer_idx, tuple(prepared)))
+
+    def loadback_prepared_paged_range(self, prepared, layer_start: int, layer_end: int):
+        self.prepared_range_loadbacks.append((layer_start, layer_end, tuple(prepared)))
+
+
 def _patch_host_executor_device(monkeypatch):
     import tokenspeed.runtime.cache.executor.host_executor as host_executor
 
@@ -274,6 +299,45 @@ def test_host_executor_paged_cache_loadback_marks_layers_and_producer(monkeypatc
     executor.set_consumer(PAGED_CACHE_KIND, [0])
     assert paged_pool.counter.consumer == [0]
     assert executor.drain() == []
+
+
+def test_host_executor_paged_cache_loadback_reuses_prepared_transfers(monkeypatch):
+    HostExecutor = _patch_host_executor_device(monkeypatch)
+    paged_pool = FakePreparedPagedPool(num_layers=3)
+    executor = HostExecutor(pools=[], paged_pool=paged_pool, io_backend="kernel")
+    transfers = [object(), object()]
+
+    executor.enqueue_paged_cache_loadback(33, transfers)
+    executor.flush()
+
+    assert paged_pool.prepares == [transfers]
+    expected_prepared = tuple(("prepared", id(transfer)) for transfer in transfers)
+    assert paged_pool.prepared_range_loadbacks == [
+        (0, 2, expected_prepared),
+        (2, 3, expected_prepared),
+    ]
+    assert paged_pool.prepared_loadbacks == []
+    assert paged_pool.loadbacks == []
+    assert all(event.recorded for event in paged_pool.counter.events[0].load_events)
+    assert executor.get_producer_index(PAGED_CACHE_KIND, 33) == 0
+
+
+def test_host_executor_paged_cache_writeback_uses_prepared_transfers(monkeypatch):
+    HostExecutor = _patch_host_executor_device(monkeypatch)
+    paged_pool = FakePreparedPagedPool(num_layers=3)
+    executor = HostExecutor(pools=[], paged_pool=paged_pool, io_backend="kernel")
+    transfers = [object(), object()]
+
+    executor.enqueue_paged_cache_writeback(44, transfers)
+    executor.flush()
+
+    assert paged_pool.prepares == [transfers]
+    expected_prepared = tuple(("prepared", id(transfer)) for transfer in transfers)
+    assert paged_pool.prepared_writebacks == [expected_prepared]
+    assert paged_pool.writebacks == []
+    results = executor.drain()
+    assert [event.op_id for event in results] == [44]
+    assert all(event.success for event in results)
 
 
 def test_cache_event_payloads_commit_only_common_ops_and_and_success():
