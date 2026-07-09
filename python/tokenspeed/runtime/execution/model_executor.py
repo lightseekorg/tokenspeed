@@ -1286,7 +1286,6 @@ class ModelExecutor:
                     global_num_tokens,
                     global_bs,
                 )
-
                 draft_ctx = ForwardContext(
                     attn_backend=self.drafter.attn_backend,
                     token_to_kv_pool=self.drafter.token_to_kv_pool,
