@@ -313,6 +313,25 @@ TEST(ForwardCacheOpsSpecs, TranslatesPagedCacheGroups) {
     EXPECT_EQ(specs[1].sliding_window, 128);
 }
 
+TEST(ForwardCacheOpsSpecs, StateFamilyMapsToMambaStateKind) {
+    SchedulerConfig config;
+    config.page_size = 4;
+    PagedCacheGroupConfig full_grp;
+    full_grp.group_id = "full_attention";
+    full_grp.retention = PagedCacheGroupConfig::Retention::FullHistory;
+    PagedCacheGroupConfig state_grp;
+    state_grp.group_id = "linear_attention";
+    state_grp.family = PagedCacheGroupFamily::State;
+    config.paged_cache_groups = {full_grp, state_grp};
+
+    std::vector<KvCacheSpec> specs = MakeSpecsFromConfig(config);
+    ASSERT_EQ(specs.size(), 2u);
+    EXPECT_EQ(specs[0].kind, AttnKind::kFull);
+    EXPECT_EQ(specs[1].kind, AttnKind::kMambaState);
+    EXPECT_EQ(specs[1].page_size, 4);
+    EXPECT_EQ(specs[1].sliding_window, 0);
+}
+
 TEST(ForwardCacheOpsBuildFlatBlockTables, TwoGroupsRowsAndIds) {
     BlockPool pool(/*total_num_blocks=*/32, /*enable_caching=*/true);
     KvCacheCoordinator coordinator = MakeTwoGroup(pool);
