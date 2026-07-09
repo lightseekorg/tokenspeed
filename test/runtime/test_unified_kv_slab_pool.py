@@ -423,5 +423,156 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
         self.assertEqual(len({id(t) for t in pool.k_buffer}), 24)
 
 
+GDN_LAYER_TYPES = ("linear_attention", "full_attention") * 2
+
+
+class StatePagedCacheGroupPageCountTest(unittest.TestCase):
+    """compute_paged_cache_group_page_counts: the family="state" branch is
+    positive and bounded by the full-history formula for the same inputs
+    (state rows keep <= 2 live pages per request -- the W=2 write window --
+    and snapshots are bounded by the shared page-id space).
+    The direct-loaded module still imports ceil_div from the real package
+    at call time, so this skips on a bare interpreter.
+    """
+
+    def setUp(self):
+        try:
+            from tokenspeed.runtime.utils.common import ceil_div  # noqa: F401
+        except ImportError as exc:
+            self.skipTest(f"page-count math needs the real package: {exc}")
+
+    def _counts(self, **overrides):
+        specs = _pcs.group_specs_from_layer_types(
+            layer_types=("linear_attention", "full_attention"),
+            sliding_window_tokens=None,
+            page_size=16,
+        )
+        params = dict(
+            max_live_requests=2,
+            max_scheduled_tokens=64,
+            max_total_tokens=1024,
+            max_context_len=4096,
+        )
+        params.update(overrides)
+        return _pcs.compute_paged_cache_group_page_counts(specs, **params)
+
+    def test_state_count_positive_and_bounded_by_full_history(self):
+        counts = self._counts()
+        self.assertGreater(counts["linear_attention"], 0)
+        self.assertLessEqual(
+            counts["linear_attention"], counts["full_attention"]
+        )
+
+    def test_state_branch_departs_from_full_history_formula(self):
+        # B=0 with a non-page-multiple T distinguishes the state branch
+        # (floor(T/P) + 0 live) from the full-history one (ceil(T/P) + B):
+        # 1000/16 -> state 62+1=63 < full 63+1=64.
+        counts = self._counts(max_live_requests=0, max_total_tokens=1000)
+        self.assertLess(counts["linear_attention"], counts["full_attention"])
+
+
+class MHAPoolStateSlabTest(unittest.TestCase):
+    """State-slab consumer (kv_cache/mha.py): a GDN hybrid keeps the legacy
+    per-layer KV layout (hybrid_slab_group_size -> None on state labels),
+    but flat ext + provided mamba2 shapes add one (conv, ssm) slab pair per
+    state LAYER, row-indexed by page id (row 0 = null page, never written).
+    Constructs a real (tiny, CPU) MHATokenToKVPool; skips without deps.
+    Patch target is the PACKAGE paged_cache_spec probe (see above).
+    """
+
+    CONV_SHAPE = (4, 8)
+    SSM_SHAPE = (2, 4, 4)
+
+    def setUp(self):
+        try:
+            import torch
+
+            from tokenspeed.runtime.layers.attention.kv_cache.mha import (
+                MHATokenToKVPool,
+            )
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
+        self.torch = torch
+        self.MHATokenToKVPool = MHATokenToKVPool
+
+    def _pool(self, *, flat_ext: bool = True, **overrides):
+        kwargs = dict(
+            size=32,
+            dtype=self.torch.bfloat16,
+            head_num=1,
+            head_dim=8,
+            layer_num=4,
+            device="cpu",
+            enable_memory_saver=False,
+            max_batch_size=2,
+            max_context_len=64,
+            page_size=16,
+            rank=0,
+            layer_types=GDN_LAYER_TYPES,
+            sliding_window_tokens=None,
+            enable_alt_stream=False,
+            conv_state_shape=self.CONV_SHAPE,
+            temporal_state_shape=self.SSM_SHAPE,
+            conv_dtype=self.torch.float32,
+            ssm_dtype=self.torch.float32,
+        )
+        kwargs.update(overrides)
+        with mock.patch(_PKG_FLAT_PROBE, return_value=flat_ext):
+            return self.MHATokenToKVPool(**kwargs)
+
+    def test_state_slabs_one_pair_per_state_layer(self):
+        pool = self._pool()
+        # KV side stays legacy per-layer for GDN hybrids today (no aliasing).
+        self.assertEqual(len({id(t) for t in pool.k_buffer}), 4)
+        self.assertEqual(len(pool.state_slabs), 2)
+        num_pages_with_null = 32 // 16 + 1  # row 0 = null page
+        for conv, ssm in pool.state_slabs:
+            self.assertEqual(
+                conv.shape, (num_pages_with_null, *self.CONV_SHAPE)
+            )
+            self.assertEqual(
+                ssm.shape, (num_pages_with_null, *self.SSM_SHAPE)
+            )
+            self.assertEqual(conv.dtype, self.torch.float32)
+            self.assertEqual(ssm.dtype, self.torch.float32)
+
+    def test_get_state_buffers_occurrence_indexed(self):
+        pool = self._pool()
+        # Layers 0 and 2 are the 0th/1st linear layers -> pairs 0/1.
+        self.assertIs(pool.get_state_buffers(0)[0], pool.state_slabs[0][0])
+        self.assertIs(pool.get_state_buffers(0)[1], pool.state_slabs[0][1])
+        self.assertIs(pool.get_state_buffers(2)[0], pool.state_slabs[1][0])
+        self.assertIs(pool.get_state_buffers(2)[1], pool.state_slabs[1][1])
+        with self.assertRaisesRegex(ValueError, r"not a state layer"):
+            pool.get_state_buffers(1)
+
+    def test_no_state_shapes_no_slabs(self):
+        pool = self._pool(
+            conv_state_shape=None,
+            temporal_state_shape=None,
+            conv_dtype=None,
+            ssm_dtype=None,
+        )
+        self.assertEqual(pool.state_slabs, [])
+
+    def test_radix_ext_no_slabs(self):
+        pool = self._pool(flat_ext=False)
+        self.assertEqual(pool.state_slabs, [])
+
+    def test_under_equalized_page_size_raises(self):
+        # conv row 4096 B vs 512 B linear KV row (32 B/slot * P=16): the
+        # plan would inflate P to 132, so the pre-equalized check rejects.
+        with self.assertRaisesRegex(ValueError, r"pre-equalized.*need >= "):
+            self._pool(conv_state_shape=(1024,))
+
+    def test_published_state_group_count_positive_and_bounded(self):
+        pool = self._pool()
+        counts = pool.paged_cache_group_page_counts
+        self.assertGreater(counts["linear_attention"], 0)
+        self.assertLessEqual(
+            counts["linear_attention"], counts["full_attention"]
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

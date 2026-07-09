@@ -204,7 +204,27 @@ def compute_paged_cache_group_page_counts(
                 f"PagedCacheGroupSpec {spec.group_id}: rows_per_page * "
                 "entry_stride_tokens must be > 0"
             )
-        if spec.retention == "full_history":
+        # Mamba-state kind = family "state" AND retention != sliding_window
+        # (the C++ side keys it the same way); V4's sliding-window state tail
+        # buffers keep the sliding-window formula below.
+        if spec.family == "state" and spec.retention == "full_history":
+            # State group: 2 live pages/request (the W=2 write window) +
+            # floor(T/P) snapshot pages (snapshots are bounded by the shared
+            # page-id space), capped at the full-history count.
+            full_history_total = (
+                ceil_div(max_total_tokens, raw_per_page)
+                + max_live_requests
+                + _PAGED_CACHE_GROUP_DUMMY_PAGES
+                + safety_margin
+            )
+            state_total = (
+                max_live_requests * 2
+                + max_total_tokens // raw_per_page
+                + _PAGED_CACHE_GROUP_DUMMY_PAGES
+                + safety_margin
+            )
+            total = min(state_total, full_history_total)
+        elif spec.retention == "full_history":
             full_pages = ceil_div(max_total_tokens, raw_per_page)
             total = (
                 full_pages
