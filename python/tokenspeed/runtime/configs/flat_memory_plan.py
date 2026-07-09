@@ -87,6 +87,54 @@ def solve_page_geometry(components, *, page_size_tokens, alignment):
     return PageGeometry(page_size_tokens=page_size_tokens, page_bytes=page_bytes)
 
 
+def equalized_page_size_tokens(
+    *,
+    layer_types,
+    kv_bytes_per_slot,
+    state_const_bytes,
+    page_size_tokens,
+    alignment=None,
+):
+    """Effective P for a state-hybrid profile: `page_size_tokens` when the
+    widest KV row already covers the widest constant state row, else the
+    smallest multiple of `alignment` that does. `alignment` defaults to the
+    original `page_size_tokens` (the attention backend's page granularity —
+    no backend declares a finer one), so the inflated P stays a multiple of
+    the configured block size. Pure wrapper over components_from_layers +
+    solve_page_geometry so the config-level equalization decision and its
+    tests share one implementation (the vLLM "align" move)."""
+    comps = components_from_layers(
+        layer_types=layer_types,
+        kv_bytes_per_slot=kv_bytes_per_slot,
+        state_const_bytes=state_const_bytes,
+    )
+    geo = solve_page_geometry(
+        comps,
+        page_size_tokens=page_size_tokens,
+        alignment=alignment if alignment is not None else page_size_tokens,
+    )
+    return geo.page_size_tokens
+
+
+def flat_gdn_page_bytes(
+    *,
+    num_layers,
+    num_state_layers,
+    kv_bytes_per_slot,
+    page_size_tokens,
+    state_const_bytes_per_layer,
+):
+    """Honest per-page byte cost of the M17 flat GDN layout: EVERY layer
+    keeps a legacy KV row (state layers' KV rows are allocated but never
+    written — accepted waste until the plan executor skips them) plus one
+    constant state row (conv + ssm) per state layer. The registry's flat
+    GDN profile divides the cache budget by exactly this."""
+    return (
+        num_layers * kv_bytes_per_slot * page_size_tokens
+        + num_state_layers * state_const_bytes_per_layer
+    )
+
+
 @dataclass(frozen=True)
 class LayerBinding:
     slot: int

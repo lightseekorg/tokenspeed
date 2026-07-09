@@ -25,6 +25,10 @@ from dataclasses import dataclass
 import torch
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
+from tokenspeed.runtime.configs.paged_cache_spec import (
+    _STATE_LAYER_TYPES,
+    scheduler_ext_flat_kvcache,
+)
 from tokenspeed.runtime.layers.attention.configs.base import (
     BaseAttnConfig,
     resolve_dtype,
@@ -47,6 +51,15 @@ class MHAConfig(BaseAttnConfig):
     kvstore_enabled: bool = False
     # True iff server_args.disaggregation_mode != "null"; same slab guards.
     pd_disaggregation_enabled: bool = False
+    # Mamba2/GDN per-state-layer shapes and dtypes (the configs'
+    # mamba2_cache_params), forwarded to the pool's state slabs. Populated
+    # only on a flat-built scheduler ext — the radix path keeps its
+    # SimpleMambaPool state ownership byte-identical (None here means the
+    # pool neither allocates state slabs nor runs the page-geometry check).
+    conv_state_shape: tuple[int, ...] | None = None
+    temporal_state_shape: tuple[int, ...] | None = None
+    conv_dtype: torch.dtype | None = None
+    ssm_dtype: torch.dtype | None = None
 
     @classmethod
     def generate(
@@ -61,6 +74,22 @@ class MHAConfig(BaseAttnConfig):
         hf_config = model_config.hf_config
         layer_types = tuple(getattr(hf_config, "layer_types", None) or ())
         sliding_window_tokens = getattr(hf_config, "sliding_window", None)
+        conv_state_shape = temporal_state_shape = None
+        conv_dtype = ssm_dtype = None
+        if any(
+            label in _STATE_LAYER_TYPES for label in layer_types
+        ) and scheduler_ext_flat_kvcache():
+            # GDN hybrid on the flat ext: the KV pool owns the recurrent
+            # state (state slabs), so it needs the mamba2 shapes/dtypes.
+            # Radix branch untouched: SimpleMambaPool owns the state there.
+            text_config = getattr(hf_config, "text_config", hf_config)
+            (
+                conv_state_shape,
+                temporal_state_shape,
+                conv_dtype,
+                ssm_dtype,
+                _,
+            ) = text_config.mamba2_cache_params
         return cls(
             device=server_args.device,
             context_len=model_config.context_len,
@@ -87,6 +116,10 @@ class MHAConfig(BaseAttnConfig):
             speculative_enabled=server_args.speculative_algorithm is not None,
             kvstore_enabled=server_args.enable_kvstore,
             pd_disaggregation_enabled=server_args.disaggregation_mode != "null",
+            conv_state_shape=conv_state_shape,
+            temporal_state_shape=temporal_state_shape,
+            conv_dtype=conv_dtype,
+            ssm_dtype=ssm_dtype,
             **kwargs,
         )
 
@@ -125,4 +158,8 @@ class MHAConfig(BaseAttnConfig):
             speculative_enabled=self.speculative_enabled,
             kvstore_enabled=self.kvstore_enabled,
             pd_disaggregation_enabled=self.pd_disaggregation_enabled,
+            conv_state_shape=self.conv_state_shape,
+            temporal_state_shape=self.temporal_state_shape,
+            conv_dtype=self.conv_dtype,
+            ssm_dtype=self.ssm_dtype,
         )

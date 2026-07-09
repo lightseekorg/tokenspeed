@@ -21,12 +21,20 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import TYPE_CHECKING
 
 from tokenspeed_kernel.platform import current_platform
 
+from tokenspeed.runtime.configs.flat_memory_plan import (
+    equalized_page_size_tokens,
+    flat_gdn_page_bytes,
+)
 from tokenspeed.runtime.configs.model_config import AttentionArch, is_deepseek_v4
-from tokenspeed.runtime.configs.paged_cache_spec import hybrid_slab_group_size
+from tokenspeed.runtime.configs.paged_cache_spec import (
+    hybrid_slab_group_size,
+    scheduler_ext_flat_kvcache,
+)
 from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
@@ -253,13 +261,28 @@ def _create_hybrid_linear_attn(
     if server_args.speculative_algorithm is not None:
         config.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
 
-    # Create KV cache pool (only for full attention layers)
-    num_full_attn_layers = len(full_attn_layers)
-    inner_pool = config.create_pool(
-        num_full_attn_layers, max_num_tokens, rank, enable_memory_saver
-    )
-    # Wrap with layer ID mapping (global layer IDs -> pool indices)
-    pool = LayerMappedKVPool(inner_pool, full_attn_layers)
+    flat_kvcache = scheduler_ext_flat_kvcache()
+    if flat_kvcache:
+        # Flat path: the pool covers ALL layers, so pool indices == global
+        # layer ids, its layer_types line up with the state slabs, and the
+        # group specs publish both the "full_attention" and
+        # "linear_attention" groups. KV k/v rows on state layers are
+        # allocated but never written (accepted waste for M17; skipping
+        # them belongs to the plan executor). The identity mapping keeps
+        # the wrapper type identical to the radix path.
+        num_total_layers = len(text_config.layers_block_type)
+        inner_pool = config.create_pool(
+            num_total_layers, max_num_tokens, rank, enable_memory_saver
+        )
+        pool = LayerMappedKVPool(inner_pool, list(range(num_total_layers)))
+    else:
+        # Create KV cache pool (only for full attention layers)
+        num_full_attn_layers = len(full_attn_layers)
+        inner_pool = config.create_pool(
+            num_full_attn_layers, max_num_tokens, rank, enable_memory_saver
+        )
+        # Wrap with layer ID mapping (global layer IDs -> pool indices)
+        pool = LayerMappedKVPool(inner_pool, full_attn_layers)
 
     # Read mamba2_cache_params to decide whether this model actually has
     # any linear / mamba layers. A draft model on a hybrid-GDN target
@@ -287,42 +310,54 @@ def _create_hybrid_linear_attn(
 
     linear_attn_backend = MambaAttnBackend(config)
 
-    # Mamba radix cache uses C++ chunk indices. Without radix cache, the
-    # backend uses 1-based req_pool_indices directly, so keep slot 0 as padding.
-    mamba_pool_size = (
-        mamba_pool_total_chunks + 1
-        if mamba_pool_total_chunks > 0
-        else (
-            server_args.max_num_seqs
-            // max(
-                server_args.data_parallel_size or server_args.mapping.attn.dp_size, 1
+    if flat_kvcache:
+        # Flat mode never touches a SimpleMambaPool: the recurrent state
+        # lives in the KV pool's state slabs, addressed by the flat block
+        # tables (set_kv_pool below activates the dual-index state paging),
+        # so skip the pool and its set_pool binding entirely.
+        mamba_pool = None
+    else:
+        # Mamba radix cache uses C++ chunk indices. Without radix cache, the
+        # backend uses 1-based req_pool_indices directly, so keep slot 0 as
+        # padding.
+        mamba_pool_size = (
+            mamba_pool_total_chunks + 1
+            if mamba_pool_total_chunks > 0
+            else (
+                server_args.max_num_seqs
+                // max(
+                    server_args.data_parallel_size
+                    or server_args.mapping.attn.dp_size,
+                    1,
+                )
+                + 1
             )
-            + 1
         )
-    )
-    mamba_pool = SimpleMambaPool(
-        size=mamba_pool_size,
-        num_mamba_layers=len(mamba_layer_ids),
-        conv_state_shape=conv_state_shape,
-        temporal_state_shape=temporal_state_shape,
-        conv_dtype=conv_dtype,
-        ssm_dtype=ssm_dtype,
-        mamba_layer_ids=mamba_layer_ids,
-        device=config.device,
-        page_size=server_args.block_size,
-        speculative_num_draft_tokens=(
-            server_args.speculative_num_draft_tokens
-            if server_args.speculative_algorithm is not None
-            else 0
-        ),
-        max_req_pool_size=(
-            server_args.max_num_seqs
-            // max(
-                server_args.data_parallel_size or server_args.mapping.attn.dp_size, 1
-            )
-        ),
-    )
-    linear_attn_backend.set_pool(mamba_pool)
+        mamba_pool = SimpleMambaPool(
+            size=mamba_pool_size,
+            num_mamba_layers=len(mamba_layer_ids),
+            conv_state_shape=conv_state_shape,
+            temporal_state_shape=temporal_state_shape,
+            conv_dtype=conv_dtype,
+            ssm_dtype=ssm_dtype,
+            mamba_layer_ids=mamba_layer_ids,
+            device=config.device,
+            page_size=server_args.block_size,
+            speculative_num_draft_tokens=(
+                server_args.speculative_num_draft_tokens
+                if server_args.speculative_algorithm is not None
+                else 0
+            ),
+            max_req_pool_size=(
+                server_args.max_num_seqs
+                // max(
+                    server_args.data_parallel_size
+                    or server_args.mapping.attn.dp_size,
+                    1,
+                )
+            ),
+        )
+        linear_attn_backend.set_pool(mamba_pool)
     # Flat state paging (dual-index) keys off the KV pool's state slabs +
     # published "linear_attention" group; no-op on the radix path.
     linear_attn_backend.set_kv_pool(pool)
@@ -331,10 +366,14 @@ def _create_hybrid_linear_attn(
         full_attn_backend, linear_attn_backend, full_attn_layers
     )
     logger.info(
-        "Created hybrid_linear_attn backend: %d full attn layers, %d linear attn layers, mamba pool size %d",
+        "Created hybrid_linear_attn backend: %d full attn layers, %d linear attn layers, %s",
         len(full_attn_layers),
         len(mamba_layer_ids),
-        mamba_pool_size,
+        (
+            "flat state slabs (no mamba slot pool)"
+            if mamba_pool is None
+            else f"mamba pool size {mamba_pool.size}"
+        ),
     )
     return backend, pool, mamba_pool
 
@@ -384,6 +423,34 @@ def create_attn_components(
             server_args.drafter_attention_backend = None
 
     config = _create_attn_config(server_args, model_config)
+    if getattr(config, "conv_state_shape", None) is not None:
+        # GDN page-size equalization CHOKE POINT (state shapes are stamped on
+        # the config only under a flat-built ext, so this whole branch is
+        # behind scheduler_ext_flat_kvcache()). MHAConfig.generate stamped
+        # config.page_size from server_args.block_size just above, and every
+        # OTHER page-size consumer — the sizing profile below, the draft
+        # config's generate, event_loop's make_config / ModelExecutorConfig /
+        # MemoryExecutorConfig — reads server_args.block_size only AFTER this
+        # function runs, so inflating both here reaches all of them
+        # consistently. MHATokenToKVPool's ctor re-derives the geometry and
+        # raises on any mismatch (kv_cache/mha.py).
+        conv_bytes = math.prod(config.conv_state_shape) * config.conv_dtype.itemsize
+        ssm_bytes = math.prod(config.temporal_state_shape) * config.ssm_dtype.itemsize
+        equalized_page_size = equalized_page_size_tokens(
+            layer_types=list(config.layer_types),
+            kv_bytes_per_slot=config.cache_cell_size(),
+            state_const_bytes={"conv": conv_bytes, "ssm": ssm_bytes},
+            page_size_tokens=server_args.block_size,
+        )
+        if equalized_page_size != server_args.block_size:
+            logger.info(
+                "Setting attention block size to %d tokens to cover the GDN "
+                "state row (configured block size %d)",
+                equalized_page_size,
+                server_args.block_size,
+            )
+            server_args.block_size = equalized_page_size
+            config.page_size = equalized_page_size
     draft_attn_config = None
     if draft_model_config:
         draft_attn_config = _create_attn_config(
@@ -489,6 +556,59 @@ def create_attn_components(
             config.max_bs,
             config.max_bs,
             server_args.mapping.attn.dp_size,
+            max_total_num_pages,
+        )
+        max_num_tokens = _resolve_max_num_tokens(
+            max_total_num_pages,
+            server_args.block_size,
+            server_args.max_total_tokens,
+        )
+    elif has_mamba and getattr(config, "conv_state_shape", None) is not None:
+        # Flat GDN profile (state shapes are only stamped on a flat ext, so
+        # this branch is behind scheduler_ext_flat_kvcache()): the pool
+        # covers ALL layers — KV rows on state layers are accepted waste
+        # (see _create_hybrid_linear_attn) — plus one constant state row per
+        # state layer, so divide the budget by the honest per-page bytes
+        # directly instead of the per-token cell profile. No mamba slot pool
+        # on this path (mamba_pool_total_chunks stays 0).
+        state_bytes_per_layer = (
+            math.prod(config.conv_state_shape) * config.conv_dtype.itemsize
+            + math.prod(config.temporal_state_shape) * config.ssm_dtype.itemsize
+        )
+        page_bytes = flat_gdn_page_bytes(
+            num_layers=num_layers,
+            num_state_layers=len(mamba_cache_params[4]),
+            kv_bytes_per_slot=config.cache_cell_size(),
+            page_size_tokens=server_args.block_size,
+            state_const_bytes_per_layer=state_bytes_per_layer,
+        )
+        if draft_attn_config is not None:
+            # Draft (MTP) pool rides the same page-id space: one KV row per
+            # draft layer per page.
+            page_bytes += (
+                _resolve_draft_cache_cell_size_for_profile(
+                    draft_attn_config,
+                    draft_model_config,
+                    draft_profile_cache_cell_size,
+                )
+                * server_args.block_size
+            )
+        cache_memory = profile_available_cache_memory_bytes(
+            attn_config=config,
+            gpu_id=gpu_id,
+            tp_size=server_args.mapping.world_size,
+            gpu_memory_utilization=server_args.gpu_memory_utilization,
+            total_gpu_memory=gpu_memory,
+            world_group=server_args.mapping.world_group,
+        )
+        max_total_num_pages = cache_memory // page_bytes
+        logger.info(
+            "Flat GDN KV profile: page_bytes=%d (num_layers=%d, "
+            "num_state_layers=%d, page_size=%d), max_total_num_pages=%d",
+            page_bytes,
+            num_layers,
+            len(mamba_cache_params[4]),
+            server_args.block_size,
             max_total_num_pages,
         )
         max_num_tokens = _resolve_max_num_tokens(
