@@ -224,14 +224,14 @@ bool Scheduler::flatPoolWedged(const std::vector<Request*>& candidates) const {
 
 // Wedge resolution, escalating on the SECOND consecutive wedged round (an in-flight Finish fakes one):
 // flat-retract the largest Decoding/PrefillDone holder, or -- with no holder -- OOM-terminalize the
-// head-of-line deferred non-holder. Returns whether a retract/OOM action fired.
-bool Scheduler::resolveFlatStarvation(const std::vector<Request*>& candidates) {
-    if (!flatPoolWedged(candidates)) {
+// head-of-line deferred non-holder. Sole owner of flat_starved_rounds_.
+void Scheduler::resolveFlatStarvation(const std::vector<Request*>& candidates, bool made_progress) {
+    if (made_progress || !flatPoolWedged(candidates)) {
         flat_starved_rounds_ = 0;
-        return false;
+        return;
     }
     if (++flat_starved_rounds_ < 2) {
-        return false;
+        return;
     }
     flat_starved_rounds_ = 0;
     std::vector<Request*> holders;
@@ -248,7 +248,7 @@ bool Scheduler::resolveFlatStarvation(const std::vector<Request*>& candidates) {
         victim->Apply(fsm::FlatRetractEvent{&coordinator_});
         spdlog::info("[Scheduler] flat retract: released request {} ({} tokens) to unwedge the pool", victim->Id(),
                      victim->TokenSize());
-        return true;
+        return;
     }
     // No retract victim: the pages are held mid-prefill (a wedged holder, or a mutual wedge among
     // prefilling requests). Terminalize the head-of-line deferred non-holder to unwedge the pool.
@@ -259,10 +259,10 @@ bool Scheduler::resolveFlatStarvation(const std::vector<Request*>& candidates) {
             spdlog::warn(
                 "[Scheduler] flat OOM: pool wedged by unretractable mid-prefill holders; terminalized request {}",
                 req->Id());
-            return true;
+            return;
         }
     }
-    return false;
+    _assert(false, "wedged with no holder and no deferred non-holder");
 }
 #endif
 
@@ -908,7 +908,7 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
     std::vector<ForwardOperation> ops;
     std::int32_t token_budget = config_.max_scheduled_tokens;
     bool pushed_prefill = false;
-    auto push_op = [&](auto op, bool uses_pool_slot = false) {
+    auto push_op = [&](auto op) {
         if (config_.role != Role::kD) {
             token_budget -= op.input_length;
         }
@@ -947,7 +947,7 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
                                                     config_.disable_l2_cache, simulated_free)) {
                 std::vector<TreeNode*> loadback_diff = ev->GetLoadbackDiff();
                 std::vector<TreeNode*> mamba_loadback_nodes = ev->GetMambaLoadbackNodes();
-                push_op(applyEventAndGenerateOp(request, std::move(*ev), loadback_ops), true);
+                push_op(applyEventAndGenerateOp(request, std::move(*ev), loadback_ops));
                 note_result_owed(request);
                 // will be empty when disable_l2_cache
                 if (!loadback_diff.empty() || !mamba_loadback_nodes.empty()) {
@@ -980,11 +980,7 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
     }
 
 #if TOKENSPEED_FLAT_KVCACHE
-    if (ops.empty()) {
-        resolveFlatStarvation(candidates);
-    } else {
-        flat_starved_rounds_ = 0;
-    }
+    resolveFlatStarvation(candidates, /*made_progress=*/!ops.empty());
 #else
     // If all active decode requests failed, device memory is exhausted: retract the longest one.
     if (ops.empty() && !candidates.empty()) {

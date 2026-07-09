@@ -141,7 +141,7 @@ private:
                                                       std::int32_t num_computed_tokens) const;
     bool flatAdmitDecode(Request* request) const;
     bool flatPoolWedged(const std::vector<Request*>& candidates) const;
-    bool resolveFlatStarvation(const std::vector<Request*>& candidates);
+    void resolveFlatStarvation(const std::vector<Request*>& candidates, bool made_progress);
 #endif
 
     void check_device_mem();
@@ -203,7 +203,7 @@ private:
     // before releasing a victim; see resolveFlatStarvation.
     std::int32_t flat_starved_rounds_{0};
     // Requests terminalized as flat OOM (pool wedged by unretractable mid-prefill holders, no
-    // retract victim); drained into the next ExecutionPlan for the client layer to fail them.
+    // retract victim); drained into the plan being built for the client layer to fail them.
     std::vector<std::string> flat_oom_request_ids_;
 
     struct FlatStoreTicket {
