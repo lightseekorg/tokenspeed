@@ -27,9 +27,8 @@ replay by an eager ``embed_tokens`` gather (text) or by precomputed merged
 embeddings (multimodal, via the model's ``multimodal_input_embeds`` seam).
 Constructed after the decode
 :class:`~tokenspeed.runtime.execution.cuda_graph_wrapper.CudaGraphWrapper`,
-borrowing its capture stream; buckets share one PRIVATE mempool, deliberately
-NOT the decode graphs' pool (see :meth:`capture` -- sharing it corrupts eager
-ops holding stale pointers into freed blocks). At serving time
+borrowing its capture stream; buckets share one private mempool, deliberately
+not the decode graphs' pool (see :meth:`capture`). At serving time
 the executor's target-forward dispatch is a flat
 three-way -- decode & captured replays the decode graph (one level up, since
 it captures the whole step), prefill & captured replays here (:meth:`can_run`
@@ -273,10 +272,13 @@ class PrefillGraph:
 
         Called from ``__init__``; ``decode_wrapper`` supplies the shared
         capture stream and dummy paged-cache block tables (used here only,
-        not stored). Sharing
-        decode's stream + mempool puts all graphs in one pool-reuse domain
-        (pool blocks are stream-keyed), so graph memory stays ~the largest
-        bucket's peak instead of growing per bucket.
+        not stored). Buckets share one PRIVATE mempool (first capture
+        allocates it), so graph memory stays ~the largest bucket's peak --
+        but never the decode graphs' pool: eager ops cache raw pointers to
+        buffers they lazily allocated inside a decode capture (flashinfer's
+        trtllm-gen MoE runner), and a prefill capture reusing those freed
+        blocks means every replay rewrites them, corrupting the next eager
+        call (IMA; A/B-proven on qwen3.5 MTP).
 
         Runs under inference mode like serving forwards (in-place updates on
         inference-mode model state buffers are only legal there). OOM fails
@@ -299,12 +301,6 @@ class PrefillGraph:
             dtype=weight.dtype,
             device=weight.device,
         )
-        # PRIVATE mempool (first bucket allocates; all buckets share it). Never
-        # share the decode graphs' global pool: these captures reuse blocks the
-        # decode phase freed, but eager ops between replays (flashinfer's
-        # trtllm-gen MoE runner) hold stale raw pointers into them -- every
-        # prefill replay then rewrites that memory and the next eager call
-        # faults (A/B-proven on qwen3.5 MTP: shared pool = IMA, private = clean).
         captured_ok = True
         try:
             with maybe_inference_mode():
