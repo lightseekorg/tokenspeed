@@ -265,5 +265,35 @@ class PlanTensorsTest(unittest.TestCase):
             )
 
 
+class GptOssEquivalenceTest(unittest.TestCase):
+    def test_plan_reproduces_m12_capacity(self):
+        comps = [
+            ComponentSpec(
+                "full_attention",
+                layer=i,
+                component="kv",
+                bytes_per_slot=1024,
+                const_bytes=0,
+            )
+            for i in range(24)
+        ]
+        comps += [
+            ComponentSpec(
+                "sliding_attention",
+                layer=i,
+                component="kv",
+                bytes_per_slot=1024,
+                const_bytes=0,
+            )
+            for i in range(24)
+        ]
+        budget = 10 * 1024**3
+        plan = plan_tensors(
+            comps, page_size_tokens=16, alignment=4, budget_bytes=budget
+        )
+        legacy_pages = budget // (24 * 16 * 1024)  # M12 别名:24 物理槽 × 页字节
+        self.assertEqual(plan.geometry.num_pages, legacy_pages)
+
+
 if __name__ == "__main__":
     unittest.main()

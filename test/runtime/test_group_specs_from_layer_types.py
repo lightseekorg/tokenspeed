@@ -256,6 +256,14 @@ class MultiWindowGroupSpecsTest(unittest.TestCase):
                 page_size=16,
             )
 
+    def test_linear_layer_with_positive_window_in_sequence_raises(self):
+        with self.assertRaises(ValueError):
+            group_specs_from_layer_types(
+                layer_types=["linear_attention", "full_attention"],
+                sliding_window_tokens=[128, None],
+                page_size=16,
+            )
+
     def test_repeated_window_across_layers_dedups_to_one_group(self):
         specs = group_specs_from_layer_types(
             layer_types=[
