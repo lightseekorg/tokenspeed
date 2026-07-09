@@ -20,13 +20,14 @@
 
 #pragma once
 
-#include <algorithm>
 #include <cstdint>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "cache/block_pool.h"
+#include "cache/block_ref.h"
 #include "cache/cache_types.h"
 #include "utils.h"
 
@@ -43,23 +44,30 @@ public:
     KvCacheManager(const KvCacheManager&) = delete;
     KvCacheManager& operator=(const KvCacheManager&) = delete;
 
-    // Read-only: must NOT change ref counts.
-    virtual PrefixMatch MatchPrefix(std::span<const std::string> block_hashes) const = 0;
+    // Downward-closed matches: any prefix of a valid match is itself valid, so the
+    // coordinator may match once and trim late; non-closed managers re-match bound-first.
+    virtual bool MatchIsPrefixClosed() const = 0;
 
-    // Bounds BEFORE matching so validity invariants apply to the bounded end; may come back shorter.
-    PrefixMatch MatchPrefix(std::span<const std::string> block_hashes, std::int32_t max_blocks) const {
-        std::size_t bound = std::min(block_hashes.size(), static_cast<std::size_t>(std::max(max_blocks, 0)));
-        return MatchPrefix(block_hashes.first(bound));
-    }
+    // Device match: group-wrapped hashes in, claimed-shape blocks out (read-only, no ref changes).
+    // Managers apply the bound BEFORE matching so their validity invariants hold at the bounded end.
+    virtual PrefixMatch MatchPrefix(std::span<const std::string> block_hashes,
+                                    std::int32_t max_blocks) const = 0;
+
+    // Host-pool twin of MatchPrefix over the extension range: one host block per slot out
+    // (nullptr = hole); vector length is the resume boundary in blocks (<= max_blocks), counted
+    // from slot 0 = key index `begin_blocks` upward, so empty = no extension. `keys` is the FULL
+    // per-group sequence (index = block index); only [begin_blocks, max_blocks) is considered --
+    // slots below `begin_blocks` are assumed device-valid.
+    virtual std::vector<CacheBlock*> MatchHostPages(BlockPool& host_pool,
+                                                    std::span<const std::string> keys,
+                                                    std::int32_t begin_blocks,
+                                                    std::int32_t max_blocks) const = 0;
 
     // null_block holes are appended as-is (never ref counted) to keep logical-page alignment.
     void ClaimHitBlocks(BlockTable& table, const PrefixMatch& hit) {
         _assert(table.blocks_.empty(), "ClaimHitBlocks requires a fresh (empty) table");
         for (CacheBlock* block : hit.blocks) {
-            if (!block->IsNull()) {
-                pool_.TouchBlock(block);
-            }
-            table.blocks_.push_back(block);
+            table.blocks_.push_back(BlockRef::Share(pool_, block));
         }
     }
 
@@ -79,11 +87,25 @@ public:
             return false;
         }
         for (CacheBlock* block : new_blocks) {
-            table.blocks_.push_back(block);
+            table.blocks_.push_back(BlockRef::Adopt(pool_, block));
         }
         std::int32_t used_in_tail = over % page_size_;
         table.tail_avail_ = (used_in_tail == 0) ? 0 : page_size_ - used_in_tail;
         return true;
+    }
+
+    // Contract on the forward_cache_ops facade; admission pre-charged the real slots via ext_real_pages.
+    void AppendHostExtension(BlockTable& table, std::span<CacheBlock* const> host_blocks,
+                             std::vector<std::pair<std::int32_t, CacheBlock*>>& load_pairs) {
+        _assert(table.tail_avail_ == 0, "host extension must append on a full-page boundary");
+        for (CacheBlock* host_block : host_blocks) {
+            if (host_block == nullptr) {
+                table.blocks_.push_back(BlockRef::Share(pool_, pool_.NullBlock()));
+                continue;
+            }
+            _assert(Acquire(table, page_size_), "pre-checked Acquire must succeed");
+            load_pairs.emplace_back(host_block->BlockId(), table.blocks_.back().Get());
+        }
     }
 
     // Pure query mirroring Acquire's page math exactly.
@@ -97,32 +119,48 @@ public:
 
     // Pages already carrying a hash are skipped; the partial tail is excluded by the caller.
     void CacheFullBlocks(BlockTable& table, std::span<const std::string> block_hashes,
-                         std::int32_t first_slot = 0) {
+                         std::int32_t first_slot = 0,
+                         std::vector<std::pair<std::string, CacheBlock*>>* newly_cached = nullptr) {
         _assert(first_slot >= 0, "first_slot must be >= 0");
         _assert(static_cast<std::int64_t>(first_slot) + static_cast<std::int64_t>(block_hashes.size()) <=
                     table.NumBlocks(),
                 "hash range exceeds table size");
         for (std::size_t j = 0; j < block_hashes.size(); ++j) {
-            CacheBlock* block = table.blocks_[static_cast<std::size_t>(first_slot) + j];
+            CacheBlock* block = table.blocks_[static_cast<std::size_t>(first_slot) + j].Get();
+            if (block->IsNull()) {
+                continue;
+            }
             if (block->IsCached()) {
                 continue;
             }
-            pool_.CacheFullBlocks(block, block_hashes[j]);
+            pool_.CacheFullBlock(block, block_hashes[j]);
+            if (newly_cached != nullptr) {
+                newly_cached->emplace_back(block_hashes[j], block);
+            }
         }
     }
 
-    // No-op default for full-history managers; window-evicting managers override.
-    virtual void AdvanceWindow(BlockTable& /*table*/, std::int32_t /*num_computed_tokens*/) {}
+    // Computed position advanced: reclaim pages this retention policy no longer needs.
+    // Ordinary (full-history) retention reclaims nothing.
+    virtual void ReclaimExpired(BlockTable& /*table*/, std::int32_t /*num_computed_tokens*/) {}
 
-    // Pure twin of AdvanceWindow (pages a pending slide would free), overridden in lockstep with it.
-    virtual std::int32_t BlocksFreedByAdvanceWindow(const BlockTable& /*table*/,
-                                                    std::int32_t /*num_computed_tokens*/) const {
+    // Pure twin of ReclaimExpired (pages a pending reclaim would free), overridden in lockstep with it.
+    virtual std::int32_t BlocksReclaimableAt(const BlockTable& /*table*/,
+                                             std::int32_t /*num_computed_tokens*/,
+                                             bool /*count_uncached*/) const {
         return 0;
     }
 
     // Cached pages keep their hash on free, so they stay prefix-reusable until evicted.
     void Free(BlockTable& table) {
-        pool_.FreeBlocks(table.blocks_);
+        // Free-list order is semantics -- oldest-first recycling, pinned by tests -- so keep one
+        // front->back batch here; per-ref destructors only cover stray/unwind paths.
+        std::vector<CacheBlock*> batch;
+        batch.reserve(table.blocks_.size());
+        for (BlockRef& ref : table.blocks_) {
+            batch.push_back(ref.Release());
+        }
+        pool_.FreeBlocks(batch);
         table.blocks_.clear();
         table.tail_avail_ = 0;
     }

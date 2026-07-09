@@ -31,6 +31,23 @@
 
 namespace tokenspeed {
 
+#if TOKENSPEED_FLAT_KVCACHE
+namespace {
+
+// Batched ref surrender in ticket order: after an abort these pins are the LAST refs,
+// so their push order is recycling order (vector dtor order is impl-defined).
+void FreeAll(BlockPool& pool, std::vector<BlockRef>&& refs) {
+    std::vector<CacheBlock*> batch;
+    batch.reserve(refs.size());
+    for (BlockRef& ref : refs) {
+        batch.push_back(ref.Release());
+    }
+    pool.FreeBlocks(batch);
+}
+
+}  // namespace
+#endif
+
 void Scheduler::handleEvent(const cache::PrefetchDone& event) {
     // Remove from op tracker (regardless of success).
     cache_op_tracker_.erase(event.op_id);
@@ -91,8 +108,6 @@ void Scheduler::handleEvent(const pd::FailedEvent& event) {}
 
 void Scheduler::handleEvent(const pd::SucceededEvent& event) {
 #if TOKENSPEED_FLAT_KVCACHE
-    // Terminal for this request's forward stream: drop any remaining result debt
-    // and any decode reservation it never consumed.
     pending_forward_results_.erase(event.request_id);
     flat_reserved_pages_.erase(event.request_id);
 #endif
@@ -113,8 +128,6 @@ void Scheduler::handleEvent(const pd::RemotePrefillDoneEvent& event) {
 
 void Scheduler::handleEvent(const forward::Finish& event) {
 #if TOKENSPEED_FLAT_KVCACHE
-    // Terminal for this request's forward stream: drop any remaining result debt
-    // and any decode reservation it never consumed (e.g. finished in PrefillDone).
     pending_forward_results_.erase(event.request_id);
     flat_reserved_pages_.erase(event.request_id);
 #endif
@@ -184,6 +197,25 @@ void Scheduler::handleEvent(const forward::Abort& event) {
 }
 
 void Scheduler::handleEvent(const cache::WriteBackDone& event) {
+#if TOKENSPEED_FLAT_KVCACHE
+    if (std::vector<FlatStoreTicket> tickets = flat_store_ops_.Retire(event.op_id); !tickets.empty()) {
+        // Publish-at-ack: hashing the host block makes it hittable; either way it returns to the
+        // host free list (hash-intact = reusable, unhashed = plain recycling). Batched frees in
+        // ticket order keep both pools' recycling order deterministic.
+        std::vector<CacheBlock*> device_batch;
+        std::vector<CacheBlock*> host_batch;
+        for (FlatStoreTicket& t : tickets) {
+            if (event.success) {
+                flat_host_pool_.CacheFullBlock(t.host_block.Get(), t.key);
+            }
+            device_batch.push_back(t.device_block.Release());
+            host_batch.push_back(t.host_block.Release());
+        }
+        block_pool_.FreeBlocks(device_batch);
+        flat_host_pool_.FreeBlocks(host_batch);
+        return;
+    }
+#endif
     auto it = cache_op_tracker_.find(event.op_id);
     if (it == cache_op_tracker_.end()) {
         return;
@@ -201,6 +233,21 @@ void Scheduler::handleEvent(const cache::WriteBackDone& event) {
                 fsm::WriteBackDoneEvent{&kv_prefix_cache_, hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr});
         }
     }
+}
+
+void Scheduler::handleEvent(const cache::LoadBackDone& event) {
+#if TOKENSPEED_FLAT_KVCACHE
+    if (auto flat_it = flat_load_ops_.find(event.op_id); flat_it != flat_load_ops_.end()) {
+        // The loaded device pages are already claimed as computed KV: a failed copy
+        // means the request would decode over garbage bytes -- fail loud.
+        _assert(event.success, "flat host loadback failed: host bytes integrity");
+        FreeAll(flat_host_pool_, std::move(flat_it->second.host_pins));
+        FreeAll(block_pool_, std::move(flat_it->second.device_blocks));
+        flat_load_ops_.erase(flat_it);
+        return;
+    }
+#endif
+    // Radix loadbacks emit no LoadBackDone today: unknown op_ids are silently ignored.
 }
 
 }  // namespace tokenspeed

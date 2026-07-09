@@ -20,8 +20,12 @@
 
 #pragma once
 
+#include <algorithm>
+#include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
+#include <vector>
 
 #include "cache/block_pool.h"
 #include "cache/cache_types.h"
@@ -29,28 +33,44 @@
 
 namespace tokenspeed {
 
-// Full-attention KV manager: prefix match walks the page-hash keys left-to-right
-// until the first miss (a full-attention hit is a contiguous prefix from token 0,
-// with no holes). Shared allocation/claim/cache/free come from KvCacheManager.
+// Full-attention KV manager: a hit is a contiguous run with no holes, so both
+// the device and the host lookup walk left-to-right until the first miss.
+// Shared allocation/claim/cache/free come from KvCacheManager.
 class FullAttnManager : public KvCacheManager {
 public:
     using KvCacheManager::KvCacheManager;
-    using KvCacheManager::MatchPrefix;  // keep the bounded overload visible
 
-    // Read-only prefix match: walk the pre-computed page-hash keys until the
-    // first cache miss. Returns the hit blocks in order (no holes). Does NOT
-    // change ref counts -- callers claim hits via ClaimHitBlocks.
-    PrefixMatch MatchPrefix(std::span<const std::string> block_hashes) const override {
+    bool MatchIsPrefixClosed() const override { return true; }
+
+    // Walk the keys until the first miss: contiguous hits, no holes.
+    PrefixMatch MatchPrefix(std::span<const std::string> block_hashes,
+                            std::int32_t max_blocks) const override {
+        const std::int32_t bound = static_cast<std::int32_t>(
+            std::min(block_hashes.size(), static_cast<std::size_t>(std::max(max_blocks, 0))));
         PrefixMatch match;
-        for (const std::string& hash : block_hashes) {
-            CacheBlock* block = pool_.GetCachedBlock(hash);
+        match.blocks = contiguousRun(pool_, block_hashes, 0, bound);
+        match.num_hit_blocks = static_cast<std::int32_t>(match.blocks.size());
+        return match;
+    }
+
+    // Host-pool lookup: the same contiguous walk, starting at `begin_blocks`.
+    std::vector<CacheBlock*> MatchHostPages(BlockPool& host_pool, std::span<const std::string> keys,
+                                            std::int32_t begin_blocks, std::int32_t max_blocks) const override {
+        return contiguousRun(host_pool, keys, begin_blocks, max_blocks);
+    }
+
+private:
+    static std::vector<CacheBlock*> contiguousRun(BlockPool& pool, std::span<const std::string> keys,
+                                                  std::int32_t begin_blocks, std::int32_t end_blocks) {
+        std::vector<CacheBlock*> blocks;
+        for (std::int32_t j = begin_blocks; j < end_blocks; ++j) {
+            CacheBlock* block = pool.GetCachedBlock(keys[static_cast<std::size_t>(j)]);
             if (block == nullptr) {
                 break;
             }
-            match.blocks.push_back(block);
+            blocks.push_back(block);
         }
-        match.num_hit_blocks = static_cast<std::int32_t>(match.blocks.size());
-        return match;
+        return blocks;
     }
 };
 

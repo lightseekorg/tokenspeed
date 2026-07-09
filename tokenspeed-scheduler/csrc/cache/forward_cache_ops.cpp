@@ -31,6 +31,12 @@ bool PrefillFirstChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>&
     return coordinator.Acquire(tables, num_new_tokens);
 }
 
+std::vector<std::pair<std::int32_t, CacheBlock*>> LoadHostExtension(KvCacheCoordinator& coordinator,
+                                                                    std::vector<BlockTable>& tables,
+                                                                    const HostMatch& host) {
+    return coordinator.LoadHostExtension(tables, host);
+}
+
 bool PrefillChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
                   std::span<const std::string> content_hashes, std::int32_t num_tokens,
                   std::int32_t num_computed_tokens) {
@@ -40,12 +46,14 @@ bool PrefillChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tabl
 bool DecodeStep(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
                 std::span<const std::string> content_hashes, std::int32_t first_page_slot,
                 std::int32_t num_tokens, std::int32_t num_computed_tokens) {
-    // CacheFullBlocks before AdvanceWindow: registration skips null holes, so
+    // CacheFullBlocks before ReclaimExpired: registration skips null holes, so
     // the reverse order would lose the punched pages' hashes forever.
-    // AdvanceWindow before Acquire: the slide's freed pages fund this chunk
-    // (admission gates credit them via BlocksFreedByAdvance in lockstep).
+    // ReclaimExpired before Acquire: the slide's freed pages fund this chunk
+    // (admission gates credit them via BlocksReclaimableAt in lockstep).
     coordinator.CacheFullBlocks(tables, content_hashes, first_page_slot);
-    coordinator.AdvanceWindow(tables, num_computed_tokens);
+    for (std::int32_t i = 0; i < coordinator.NumGroups(); ++i) {
+        coordinator.GroupManager(i).ReclaimExpired(tables[static_cast<std::size_t>(i)], num_computed_tokens);
+    }
     return coordinator.Acquire(tables, num_tokens);
 }
 

@@ -113,6 +113,15 @@ protected:
         scheduler_->Advance(std::move(event));
     }
 
+    void SendLoadBackDone(cache_op_id op_id, bool success = true) {
+        ExecutionEvent event;
+        event.With(CacheEvent{cache::LoadBackDone{
+            .op_id = op_id,
+            .success = success,
+        }});
+        scheduler_->Advance(std::move(event));
+    }
+
     // Send ExtendResult (new decode tokens) to the scheduler.
     void SendForwardDone(const std::string& request_id, const std::vector<std::int32_t>& tokens) {
         ExecutionEvent event;

@@ -20,19 +20,22 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
-#include <span>
+#include <iterator>
+#include <utility>
 #include <vector>
 
 #include "cache/block_pool.h"
+#include "cache/block_ref.h"
 #include "utils.h"
 
 namespace tokenspeed {
 
-// Per-group KV cache configuration (immutable). One spec per attention group;
-// GPT-OSS uses two: a full-attention group and a sliding-window group.
 enum class AttnKind { kFull, kSlidingWindow };
 
+// Per-group KV cache configuration (immutable). One spec per attention group;
+// GPT-OSS uses two: a full-attention group and a sliding-window group.
 struct KvCacheSpec {
     AttnKind kind;
     std::int32_t page_size;
@@ -50,7 +53,46 @@ struct KvCacheSpec {
 // (block_tables_) for the request's lifetime.
 class BlockTable {
 public:
-    std::span<CacheBlock* const> Blocks() const { return blocks_; }
+    class BlockView {
+    public:
+        class Iterator {
+        public:
+            using iterator_category = std::input_iterator_tag;
+            using value_type = CacheBlock*;
+            using difference_type = std::ptrdiff_t;
+            using pointer = CacheBlock* const*;
+            using reference = CacheBlock*;
+
+            explicit Iterator(const BlockRef* ref) : ref_{ref} {}
+            CacheBlock* operator*() const { return ref_->Get(); }
+            Iterator& operator++() {
+                ++ref_;
+                return *this;
+            }
+            Iterator operator++(int) {
+                Iterator tmp = *this;
+                ++ref_;
+                return tmp;
+            }
+            bool operator==(const Iterator&) const = default;
+
+        private:
+            const BlockRef* ref_;
+        };
+
+        BlockView(const BlockRef* data, std::size_t size) : data_{data}, size_{size} {}
+        CacheBlock* operator[](std::size_t i) const { return data_[i].Get(); }
+        std::size_t size() const { return size_; }
+        bool empty() const { return size_ == 0; }
+        Iterator begin() const { return Iterator{data_}; }
+        Iterator end() const { return Iterator{data_ + size_}; }
+
+    private:
+        const BlockRef* data_;
+        std::size_t size_;
+    };
+
+    BlockView Blocks() const { return BlockView{blocks_.data(), blocks_.size()}; }
     std::int32_t NumBlocks() const { return static_cast<std::int32_t>(blocks_.size()); }
     // Tokens still fillable in the last (tail) page before a new page is needed.
     std::int32_t TailAvailableTokens() const { return tail_avail_; }
@@ -62,18 +104,24 @@ public:
     CacheBlock* EvictToNull(std::int32_t index, CacheBlock* null_block) {
         _assert(0 <= index && index < static_cast<std::int32_t>(blocks_.size()),
                 "EvictToNull index out of range");
-        CacheBlock* old = blocks_[index];
+        BlockRef& slot = blocks_[static_cast<std::size_t>(index)];
+        CacheBlock* old = slot.Get();
+        _assert(old != nullptr, "EvictToNull on a moved-out slot");
         if (old == null_block) {
             return nullptr;
         }
-        blocks_[index] = null_block;
+        // Order is load-bearing: surrender the displaced ref BEFORE the move-assign,
+        // or the assignment would double-decrement it.
+        BlockRef hole = BlockRef::Share(*slot.pool_, null_block);
+        slot.Release();
+        slot = std::move(hole);
         return old;
     }
 
 private:
     friend class KvCacheManager;
 
-    std::vector<CacheBlock*> blocks_{};
+    std::vector<BlockRef> blocks_{};
     std::int32_t tail_avail_{0};
 };
 

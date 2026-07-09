@@ -72,9 +72,15 @@ Scheduler::Scheduler(SchedulerConfig config)
               ids.push_back(g.group_id);
           }
           return ids;
-      }()}
+      }()},
+      flat_host_pool_{flatStreamingSinkEnabled() ? config_.host_allocator.total_pages : 1}
 #endif
 {
+#if TOKENSPEED_FLAT_KVCACHE
+    if (flatStreamingSinkEnabled()) {
+        coordinator_.EnableStoreCandidateCollection();
+    }
+#endif
     if (auto* env = std::getenv("SPDLOG_LEVEL")) {
         std::string level_str{env};
         spdlog::level::level_enum level = spdlog::level::from_str(level_str);
@@ -366,6 +372,40 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
         write_back_ops.insert(write_back_ops.end(), std::make_move_iterator(wb->begin()),
                               std::make_move_iterator(wb->end()));
     }
+#if TOKENSPEED_FLAT_KVCACHE
+    if (flatStreamingSinkEnabled()) {
+        // Streaming L2 sink: batch this round's newly-registered pages into one D2H op.
+        std::vector<TransferPair> pairs;
+        std::vector<FlatStoreTicket> tickets;
+        // Same-round twins register the same key twice (batch_keys catches them). Cross-round
+        // recurrence is rare but real: a ticket pins its OWN source hash-intact, yet a device
+        // match can settle below that page once earlier chain pages / SWA run neighbors are
+        // evicted after their ops retire -- the identical request then recomputes and
+        // re-registers a key whose store is still in flight. InFlight() drops it (load-bearing:
+        // without it a key could sit in two ops and Retire would corrupt the ledger's key set).
+        std::unordered_set<std::string> batch_keys;
+        for (auto& cand : coordinator_.TakePendingStores()) {
+            if (flat_host_pool_.GetCachedBlock(cand.key) != nullptr || flat_store_ops_.InFlight(cand.key) ||
+                !batch_keys.insert(cand.key).second) {
+                cand.block = BlockRef{};  // duplicate: drop + unpin
+                continue;
+            }
+            CacheBlock* host_block = flat_host_pool_.AllocateBlock();
+            if (host_block == nullptr) {
+                cand.block = BlockRef{};  // host full: drop + unpin
+                continue;
+            }
+            pairs.push_back(TransferPair{CacheKind::kKV, cand.block->BlockId(), host_block->BlockId()});
+            tickets.push_back(FlatStoreTicket{std::move(cand.key), std::move(cand.block),
+                                              BlockRef::Adopt(flat_host_pool_, host_block)});
+        }
+        if (!pairs.empty()) {
+            const cache_op_id id = kv_prefix_cache_.AllocateCacheOpId();
+            flat_store_ops_.Add(id, std::move(tickets));
+            write_back_ops.push_back(WriteBackOperation{id, std::move(pairs)});
+        }
+    }
+#endif
     if (!write_back_ops.empty()) {
         plan.With(CacheOperation{FlatWriteBackOperation{write_back_ops}});
     }

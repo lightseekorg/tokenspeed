@@ -116,8 +116,10 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
     add_executable(tokenspeed_scheduler_tests
         tests/cpp/test_page_hasher.cpp
         tests/cpp/test_block_pool.cpp
+        tests/cpp/test_block_ref.cpp
         tests/cpp/test_full_attn_manager.cpp
         tests/cpp/test_swa_manager.cpp
+        tests/cpp/test_match_host_pages.cpp
         tests/cpp/test_kv_cache_coordinator.cpp
         tests/cpp/test_forward_cache_ops.cpp
         tests/cpp/test_flat_forward_operation.cpp

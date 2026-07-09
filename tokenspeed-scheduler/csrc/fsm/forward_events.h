@@ -79,10 +79,15 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
                                    // Every flat transition body asserts coordinator_ != nullptr on entry.
                                    ,
                                    KvCacheCoordinator* coordinator = nullptr,
-                                   // Admission-layer prefix match (M9): the scheduler matches once and
+                                   // Admission-layer prefix match: the scheduler matches once and
                                    // threads the hit here; the default {} is the canonical zero hit for
                                    // call sites that never match (radix-only paths, tests).
-                                   CoordinatorMatch flat_hit = {}
+                                   CoordinatorMatch flat_hit = {},
+                                   // Host-tier extension of flat_hit: pages arrive pinned
+                                   // (HostMatch::pinned BlockRefs); pin ownership rides the event
+                                   // until the emission takes the refs -- any other exit releases them.
+                                   HostMatch flat_host = {},
+                                   std::vector<std::string> flat_ext_hashes = {}
 #endif
                                    )
         : tokens_this_round_(tokens_this_round),
@@ -100,7 +105,9 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
 #if TOKENSPEED_FLAT_KVCACHE
           ,
           coordinator_(coordinator),
-          flat_hit_(std::move(flat_hit))
+          flat_hit_(std::move(flat_hit)),
+          flat_host_(std::move(flat_host)),
+          flat_ext_hashes_(std::move(flat_ext_hashes))
 #endif
     {}
 
@@ -111,6 +118,14 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
 
     const std::vector<TreeNode*>& GetLoadbackDiff() const { return loadback_diff_; }
     const std::vector<TreeNode*>& GetMambaLoadbackNodes() const { return mamba_loadback_nodes_; }
+
+#if TOKENSPEED_FLAT_KVCACHE
+    // Post-apply channel for the scheduler's LoadBack emission (transition fills the pairs).
+    std::vector<std::pair<std::int32_t, CacheBlock*>> TakeFlatLoadPairs() {
+        return std::exchange(flat_load_pairs_, {});
+    }
+    std::vector<BlockRef> TakeFlatHostPins() { return std::move(flat_host_.pinned); }
+#endif
 
 private:
     std::int32_t tokens_this_round_{};
@@ -128,6 +143,9 @@ private:
 #if TOKENSPEED_FLAT_KVCACHE
     KvCacheCoordinator* coordinator_{};
     CoordinatorMatch flat_hit_{};
+    HostMatch flat_host_{};
+    std::vector<std::string> flat_ext_hashes_{};
+    std::vector<std::pair<std::int32_t, CacheBlock*>> flat_load_pairs_{};
 #endif
 };
 

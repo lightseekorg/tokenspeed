@@ -806,7 +806,7 @@ protected:
         SchedulerConfig cfg{};
         cfg.page_size = 2;
         cfg.device_allocator.total_pages = 13;
-        cfg.host_allocator.total_pages = 13;
+        cfg.host_allocator.total_pages = 14;  // 13 usable + the null placeholder (page 0)
         cfg.max_scheduled_tokens = 4;  // 4-token prefill chunks
         cfg.max_batch_size = 8;
         cfg.enable_l3_storage = false;
@@ -860,6 +860,73 @@ TEST_F(FlatPrefillSlideAdmissionSuite, LongPromptAdmittedOnlyBecausePrefillSlide
     SendForwardDone("r1", {100});
     SendFinish("r1");
     PlanOnce();
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start);
+}
+
+TEST_F(FlatPrefillSlideAdmissionSuite, SinkPinsDeferAdmissionUntilWriteBackDone) {
+    // Sink ON over the LongPromptAdmittedOnlyBecausePrefillSlides math: device 13 -> 12 usable, c1+c2
+    // charge 8, c3 needs 6 = free 4 + slide credit 2 (pins only delay frees, so no extra device
+    // headroom); host 12 usable (+null page 0) = op1 committed 4 + op2 in-flight 4 + op3 in-flight 4 at peak.
+    config_.disable_l2_cache = false;
+    config_.host_allocator.total_pages = 13;
+    scheduler_ = std::make_unique<Scheduler>(config_);
+    const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
+    ASSERT_EQ(free_at_start, 12);
+
+    Submit(MakeRequestSpec("r1", /*num_pages=*/6));
+    ExecutionPlan c1 = PlanOnce();
+    ASSERT_NE(FindFlatOp(c1), nullptr);
+    ASSERT_EQ(FindFlatOp(c1)->request_ids.size(), 1u);
+
+    ExecutionPlan c2 = PlanOnce();  // registers pages 0,1 both groups: 4 pins + streaming op1
+    ASSERT_NE(FindFlatOp(c2), nullptr);
+    ASSERT_EQ(FindFlatOp(c2)->request_ids.size(), 1u);
+    auto wb1 = ExtractCacheOpsOfKind<FlatWriteBackOperation>(c2);
+    ASSERT_EQ(wb1.size(), 1u);
+    const auto op1 = std::get<FlatWriteBackOperation>(wb1.front());
+    ASSERT_EQ(op1.op_ids.size(), 1u);
+    EXPECT_EQ(op1.src_pages.at(0).size(), 4u);
+    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), 4);
+
+    // c3 needs 6 > free 4 + credit 0: the slide-out swa pages stay pinned by op1, so the chunk is
+    // DEFERRED; a second starved round must NOT trip the deadlock assert while the store is in flight.
+    ExecutionPlan d1 = PlanOnce();
+    ASSERT_NE(FindFlatOp(d1), nullptr);
+    EXPECT_TRUE(FindFlatOp(d1)->request_ids.empty());
+    ExecutionPlan d2 = PlanOnce();
+    ASSERT_NE(FindFlatOp(d2), nullptr);
+    EXPECT_TRUE(FindFlatOp(d2)->request_ids.empty());
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), 4);
+
+    SendWriteBackDone(op1.op_ids.at(0), /*success=*/true);
+    EXPECT_EQ(scheduler_->FlatHostPoolCachedBlocks(), 4);
+
+    ExecutionPlan c3 = PlanOnce();  // unpinned + cached -> credit 2 restored: admitted; emits op2
+    ASSERT_NE(FindFlatOp(c3), nullptr);
+    ASSERT_EQ(FindFlatOp(c3)->request_ids.size(), 1u);
+    auto wb2 = ExtractCacheOpsOfKind<FlatWriteBackOperation>(c3);
+    ASSERT_EQ(wb2.size(), 1u);
+    const auto op2 = std::get<FlatWriteBackOperation>(wb2.front());
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), 2);
+
+    SendForwardDone("r1", {99});
+    ExecutionPlan decode = PlanOnce();  // finalize registers pages 4,5: emits op3
+    ASSERT_NE(FindFlatOp(decode), nullptr);
+    ASSERT_EQ(FindFlatOp(decode)->request_ids.size(), 1u);
+    EXPECT_EQ(scheduler_->DecodingSize(), 1u);
+    auto wb3 = ExtractCacheOpsOfKind<FlatWriteBackOperation>(decode);
+    ASSERT_EQ(wb3.size(), 1u);
+    const auto op3 = std::get<FlatWriteBackOperation>(wb3.front());
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), 0);
+
+    SendForwardDone("r1", {100});
+    SendFinish("r1");
+    PlanOnce();  // reap: op2 + op3 pins (8 blocks) stay off the free list
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 8);
+
+    SendWriteBackDone(op2.op_ids.at(0), /*success=*/true);
+    SendWriteBackDone(op3.op_ids.at(0), /*success=*/true);
+    EXPECT_EQ(scheduler_->FlatHostPoolCachedBlocks(), 12);
     EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start);
 }
 
@@ -922,7 +989,7 @@ protected:
         // 13 physical pages -> 12 usable: two 2-page prompts charge
         // 2*ceil(5/2) = 6 blocks each at admission = exactly the pool.
         cfg.device_allocator.total_pages = 13;
-        cfg.host_allocator.total_pages = 13;
+        cfg.host_allocator.total_pages = 14;  // 13 usable + the null placeholder (page 0)
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
         cfg.enable_l3_storage = false;
@@ -1162,8 +1229,8 @@ TEST(FlatEventFailurePath, FirstChunkFailureLeavesPoolBalancedAndAbortStaysClean
     EXPECT_EQ(pool.NumFreeBlocks(), 3);
 }
 
-// ReqPoolAllocator::Allocate() must throw BEFORE the transition populates the
-// block tables, or freshly acquired pages bypass the FreeRequest guard.
+// ReqPoolAllocator::Allocate() throws before tables are populated; with BlockRef
+// RAII the pool balances either way -- this pins the balance, not the order.
 TEST(FlatEventFailurePath, ReqPoolExhaustionAtFirstChunkLeavesPoolBalanced) {
     BlockPool pool(/*total_num_blocks=*/32);  // 31 usable: pages are NOT the constraint
     std::vector<KvCacheSpec> specs{
@@ -1597,7 +1664,7 @@ protected:
 TEST_F(FlatPrefixHitSmallWindowSuite, SwaGroupHitRespectsWindow) {
     const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
 
-    // r1's finalize REGISTERS all 4 swa hashes BEFORE AdvanceWindow(8) punches
+    // r1's finalize REGISTERS all 4 swa hashes BEFORE ReclaimExpired(8) punches
     // slots 0,1 -- punched blocks reach the free list with hashes, matchable.
     const auto r1_rows = RunLifecycle(MakeRequestSpec("r1", /*num_pages=*/4));
     ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start);
@@ -1886,7 +1953,7 @@ TEST_F(FlatDecodeCachingSuite, MultiTurnConversationReusesResponsePages) {
 }
 
 // A decode page REGISTERS (DecodeStep registers before the slide) and a later
-// AdvanceWindow punches it: the punch frees the block WITH its hash intact.
+// ReclaimExpired punches it: the punch frees the block WITH its hash intact.
 class FlatDecodeCachingSmallWindowSuite : public FlatDecodeCachingSuite {
 protected:
     std::int32_t SlidingWindowTokens() const override { return 4; }
@@ -1988,6 +2055,610 @@ TEST_F(FlatDecodeCachingSuite, PoolBalanceAcrossDecodeCaching) {
     SendFinish("r3");
     PlanOnce();
     EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start) << "baseline restored after the whole conversation";
+}
+
+// ---------------------------------------------------------------------------
+// M15 streaming L2 sink: pages registered by a planning round batch into ONE
+// D2H write-back; WriteBackDone commits/aborts the host index and unpins the
+// pinned source blocks. Byte movement itself is Phase D.
+// ---------------------------------------------------------------------------
+class FlatStreamingSinkSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg{};
+        cfg.page_size = 2;
+        cfg.device_allocator.total_pages = 64;
+        cfg.host_allocator.total_pages = 9;  // 8 usable + the null placeholder (page 0, device convention)
+        cfg.max_scheduled_tokens = 64;
+        cfg.max_batch_size = 8;
+        cfg.enable_l3_storage = false;
+        cfg.disable_l2_cache = false;
+        cfg.disable_prefix_cache = true;
+
+        cfg.paged_cache_groups = {
+            MakeGroup("full", cfg.page_size, cfg.device_allocator.total_pages,
+                      PagedCacheGroupConfig::Retention::FullHistory,
+                      PagedCacheGroupFamily::History),
+            MakeGroup("swa", cfg.page_size, cfg.device_allocator.total_pages,
+                      PagedCacheGroupConfig::Retention::SlidingWindow,
+                      PagedCacheGroupFamily::State, /*sliding_window_tokens=*/4),
+        };
+        return cfg;
+    }
+
+    // Prefill -> finalize; the finalize round registers the prompt's page
+    // hashes, so it is the round whose plan carries the streaming write-back.
+    ExecutionPlan RunToFinalize(const RequestSpec& spec) {
+        Submit(spec);
+        PlanOnce();  // prefill
+        SendForwardDone(spec.request_id, {9001});
+        return PlanOnce();  // PrefillDone -> Decoding: registration + drain
+    }
+
+    void FinishAndReap(const std::string& id) {
+        SendForwardDone(id, {9002});
+        SendFinish(id);
+        PlanOnce();  // reap
+    }
+
+    static std::optional<FlatWriteBackOperation> FindFlatWriteBack(const ExecutionPlan& plan) {
+        auto ops = ExtractCacheOpsOfKind<FlatWriteBackOperation>(plan);
+        if (ops.empty()) {
+            return std::nullopt;
+        }
+        EXPECT_EQ(ops.size(), 1u) << "the plan must carry at most one merged write-back list";
+        return std::get<FlatWriteBackOperation>(ops.front());
+    }
+};
+
+TEST_F(FlatStreamingSinkSuite, RegisteredPagesEmitWriteBackAndIndexOnDone) {
+    const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
+
+    ExecutionPlan finalize = RunToFinalize(MakeRequestSpec("r1", /*num_pages=*/4));
+    auto wb = FindFlatWriteBack(finalize);
+    ASSERT_TRUE(wb.has_value()) << "finalize-registered pages must emit a streaming write-back";
+    ASSERT_EQ(wb->op_ids.size(), 1u);
+    EXPECT_EQ(wb->src_pages.at(0).size(), 8u) << "4 registered pages x 2 groups = 8 D2H pairs";
+    EXPECT_EQ(wb->dst_pages.at(0).size(), 8u);
+    EXPECT_EQ(scheduler_->FlatHostPoolCachedBlocks(), 0) << "nothing indexed until WriteBackDone";
+    EXPECT_EQ(scheduler_->FlatHostPoolFreeBlocks(), 0) << "all 8 host pages held in flight";
+
+    FinishAndReap("r1");
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 8)
+        << "the 8 pinned sources stay off the free list past request finish";
+    EXPECT_EQ(scheduler_->FlatHostPoolCachedBlocks(), 0);
+
+    SendWriteBackDone(wb->op_ids.at(0), /*success=*/true);
+    PlanOnce();
+    EXPECT_EQ(scheduler_->FlatHostPoolCachedBlocks(), 8);
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start) << "commit unpins every source block";
+}
+
+TEST_F(FlatStreamingSinkSuite, DuplicateRegistrationsAreDroppedAtDrain) {
+    const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
+
+    ExecutionPlan finalize1 = RunToFinalize(MakeRequestSpec("r1", /*num_pages=*/4));
+    auto wb1 = FindFlatWriteBack(finalize1);
+    ASSERT_TRUE(wb1.has_value());
+    FinishAndReap("r1");
+    SendWriteBackDone(wb1->op_ids.at(0), /*success=*/true);
+    PlanOnce();
+    ASSERT_EQ(scheduler_->FlatHostPoolCachedBlocks(), 8);
+    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start);
+
+    ExecutionPlan finalize2 = RunToFinalize(MakeRequestSpec("r2", /*num_pages=*/4));  // identical tokens
+    EXPECT_FALSE(FindFlatWriteBack(finalize2).has_value())
+        << "already-indexed keys must not re-emit a write-back";
+    FinishAndReap("r2");
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start)
+        << "duplicate candidates are unpinned at drain, pool back to baseline";
+    EXPECT_EQ(scheduler_->FlatHostPoolCachedBlocks(), 8);
+}
+
+TEST_F(FlatStreamingSinkSuite, FailedWriteBackAbortsAndUnpins) {
+    const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
+
+    ExecutionPlan finalize = RunToFinalize(MakeRequestSpec("r1", /*num_pages=*/4));
+    auto wb = FindFlatWriteBack(finalize);
+    ASSERT_TRUE(wb.has_value());
+    FinishAndReap("r1");
+    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 8);
+
+    SendWriteBackDone(wb->op_ids.at(0), /*success=*/false);
+    EXPECT_EQ(scheduler_->FlatHostPoolCachedBlocks(), 0) << "a failed transfer must not be indexed";
+    EXPECT_EQ(scheduler_->FlatHostPoolFreeBlocks(), 8) << "aborted host pages return to the host pool";
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start) << "abort still unpins the sources";
+}
+
+TEST_F(FlatStreamingSinkSuite, HostPoolExhaustionSkipsSilently) {
+    const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
+
+    ExecutionPlan finalize1 = RunToFinalize(MakeRequestSpec("r1", /*num_pages=*/4));
+    auto wb1 = FindFlatWriteBack(finalize1);
+    ASSERT_TRUE(wb1.has_value());
+    FinishAndReap("r1");
+    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 8);
+    ASSERT_EQ(scheduler_->FlatHostPoolFreeBlocks(), 0) << "r1 holds all 8 host pages in flight";
+
+    ExecutionPlan finalize2 = RunToFinalize(MakeRequestSpec("r2", /*num_pages=*/4, /*start=*/501));
+    EXPECT_FALSE(FindFlatWriteBack(finalize2).has_value())
+        << "a fully-consumed host pool drops every candidate: no op at all";
+    FinishAndReap("r2");
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 8)
+        << "r2's candidates unpinned at drain; only r1's 8 pins remain";
+
+    SendWriteBackDone(wb1->op_ids.at(0), /*success=*/true);
+    EXPECT_EQ(scheduler_->FlatHostPoolCachedBlocks(), 8);
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start) << "everything balances after r1's commit";
+}
+
+TEST_F(FlatStreamingSinkSuite, SameRoundDuplicateKeysDedupeAtDrain) {
+    // Host pool with headroom (16 usable) so duplicates are dropped by the drain's batch
+    // dedupe, NOT by pool exhaustion: two IDENTICAL prompts registering in one round drain
+    // 16 candidates into 8 pairs.
+    config_.host_allocator.total_pages = 17;
+    scheduler_ = std::make_unique<Scheduler>(config_);
+    const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
+
+    Submit(MakeRequestSpec("r1", /*num_pages=*/4));
+    Submit(MakeRequestSpec("r2", /*num_pages=*/4));
+    PlanOnce();  // both prefill (batch 2 <= max_batch_size 8, 16 tokens <= budget 64)
+    SendForwardDone("r1", {9001});
+    SendForwardDone("r2", {9001});
+    ExecutionPlan finalize = PlanOnce();  // both register, one merged drain
+    auto wb = FindFlatWriteBack(finalize);
+    ASSERT_TRUE(wb.has_value());
+    ASSERT_EQ(wb->op_ids.size(), 1u);
+    EXPECT_EQ(wb->src_pages.at(0).size(), 8u) << "each key must be emitted at most once across both requests";
+    EXPECT_EQ(scheduler_->FlatHostPoolFreeBlocks(), 8) << "duplicates must not consume host pages";
+    EXPECT_EQ(scheduler_->FlatHostPoolCachedBlocks(), 0);
+
+    FinishAndReap("r1");
+    FinishAndReap("r2");
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 8)
+        << "only the emitted op's 8 pins survive; the duplicate candidates unpinned at drain";
+
+    SendWriteBackDone(wb->op_ids.at(0), /*success=*/true);
+    EXPECT_EQ(scheduler_->FlatHostPoolCachedBlocks(), 8);
+    EXPECT_EQ(scheduler_->FlatHostPoolFreeBlocks(), 16) << "published pages are free-and-cached";
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start);
+}
+
+TEST_F(FlatStreamingSinkSuite, MidDrainPoolFillEmitsPartialOp) {
+    // 4 usable host pages against 8 candidates: the drain emits the 4 that fit and drops the
+    // rest -- a partial op IS the contract when the pool fills mid-batch.
+    config_.host_allocator.total_pages = 5;
+    scheduler_ = std::make_unique<Scheduler>(config_);
+    const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
+
+    ExecutionPlan finalize = RunToFinalize(MakeRequestSpec("r1", /*num_pages=*/4));
+    auto wb = FindFlatWriteBack(finalize);
+    ASSERT_TRUE(wb.has_value());
+    EXPECT_EQ(wb->src_pages.at(0).size(), 4u) << "4 of 8 candidates fit";
+    EXPECT_EQ(scheduler_->FlatHostPoolFreeBlocks(), 0);
+
+    FinishAndReap("r1");
+    SendWriteBackDone(wb->op_ids.at(0), /*success=*/true);
+    EXPECT_EQ(scheduler_->FlatHostPoolCachedBlocks(), 4);
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start) << "dropped candidates unpinned at drain";
+}
+
+TEST_F(FlatStreamingSinkSuite, DuplicateWriteBackDoneIsIgnored) {
+    ExecutionPlan finalize = RunToFinalize(MakeRequestSpec("r1", /*num_pages=*/4));
+    auto wb = FindFlatWriteBack(finalize);
+    ASSERT_TRUE(wb.has_value());
+    FinishAndReap("r1");
+    const std::int32_t free_after_reap = scheduler_->FlatPoolFreeBlocks();
+
+    SendWriteBackDone(wb->op_ids.at(0), /*success=*/true);
+    ASSERT_EQ(scheduler_->FlatHostPoolCachedBlocks(), 8);
+    const std::int32_t free_after_ack = scheduler_->FlatPoolFreeBlocks();
+    EXPECT_EQ(free_after_ack, free_after_reap + 8);
+
+    // A replayed ack must be a no-op (the ledger already retired the op).
+    SendWriteBackDone(wb->op_ids.at(0), /*success=*/true);
+    EXPECT_EQ(scheduler_->FlatHostPoolCachedBlocks(), 8);
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_after_ack);
+}
+
+// ---------------------------------------------------------------------------
+// M15 host-hit load-back: an admission whose device match ends inside the host
+// index extends it from the host tier; the plan carries one H2D load-back and
+// LoadBackDone releases the host load pins and the destination-page pins.
+// ---------------------------------------------------------------------------
+class FlatHostHitSuite : public FlatStreamingSinkSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = FlatStreamingSinkSuite::MakeConfig();
+        cfg.disable_prefix_cache = false;
+        // 13 device pages -> 12 free (page 0 is null): the 5-page churn request's peak
+        // (10 prefill + 2 reserve) spans the whole free list, recycling r1's 8 cached pages.
+        cfg.device_allocator.total_pages = 13;
+        cfg.host_allocator.total_pages = 33;  // ample (+null page 0): r1's 8 + the churn's 10 entries fit un-evicted
+        for (auto& g : cfg.paged_cache_groups) {
+            g.total_pages = cfg.device_allocator.total_pages;
+        }
+        return cfg;
+    }
+
+    static std::optional<FlatLoadBackOperation> FindFlatLoadBack(const ExecutionPlan& plan) {
+        auto ops = ExtractCacheOpsOfKind<FlatLoadBackOperation>(plan);
+        if (ops.empty()) {
+            return std::nullopt;
+        }
+        EXPECT_EQ(ops.size(), 1u) << "the plan must carry at most one merged load-back list";
+        return std::get<FlatLoadBackOperation>(ops.front());
+    }
+
+    // Full sink lifecycle: prefill -> finalize (registration + drain) -> reap;
+    // returns the write-back the finalize emitted.
+    std::optional<FlatWriteBackOperation> RunSinkLifecycle(const RequestSpec& spec) {
+        ExecutionPlan finalize = RunToFinalize(spec);
+        FinishAndReap(spec.request_id);
+        return FindFlatWriteBack(finalize);
+    }
+
+    // r1 (tokens 1..8) indexes 8 host entries (4 pages x 2 groups); the churn request
+    // then floods the free list so r1's pages survive ONLY on the host tier.
+    void SeedHostThenEvictDevice() {
+        auto wb1 = RunSinkLifecycle(MakeRequestSpec("r1", /*num_pages=*/4));
+        ASSERT_TRUE(wb1.has_value());
+        SendWriteBackDone(wb1->op_ids.at(0), /*success=*/true);
+        ASSERT_EQ(scheduler_->FlatHostPoolCachedBlocks(), 8);
+        // Published pages return to the free list cached-and-evictable (device convention),
+        // so the full 32 usable pages stay allocatable while 8 of them are hittable.
+        ASSERT_EQ(scheduler_->FlatHostPoolFreeBlocks(), 32);
+
+        auto wb3 = RunSinkLifecycle(MakeRequestSpec("churn", /*num_pages=*/5, /*start=*/501));
+        ASSERT_TRUE(wb3.has_value());
+        SendWriteBackDone(wb3->op_ids.at(0), /*success=*/true);
+        ASSERT_EQ(scheduler_->FlatHostPoolCachedBlocks(), 18);
+        ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), 12) << "both seeding requests fully retired";
+    }
+};
+
+TEST_F(FlatHostHitSuite, HostHitLoadsBackAfterDeviceEviction) {
+    const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
+    ASSERT_EQ(free_at_start, 12);
+    SeedHostThenEvictDevice();
+
+    // r2 == r1's tokens: hash cap = (8-1)/2 = 3 pages, device common 0 (all recycled) ->
+    // host extension 3 blocks; real pages = full 3 + swa tail ceil((W-1)/P) = 2 -> 5 pairs.
+    Submit(MakeRequestSpec("r2", /*num_pages=*/4));
+    ExecutionPlan plan = PlanOnce();
+    auto lb = FindFlatLoadBack(plan);
+    ASSERT_TRUE(lb.has_value());
+    ASSERT_EQ(lb->op_ids.size(), 1u);
+    ASSERT_EQ(lb->src_pages.at(0).size(), 5u);
+    ASSERT_EQ(lb->dst_pages.at(0).size(), 5u);
+
+    const FlatForwardOperation* op = FindFlatOp(plan);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->request_ids.size(), 1u);
+    // The input window skips the 6 host-hit tokens exactly as a device hit would.
+    EXPECT_EQ(op->input_lengths.at(0), 2);
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 6);
+    EXPECT_EQ(op->prefill_lengths.at(0), 8);
+    EXPECT_EQ(op->input_ids, MakeTokens(/*count=*/2, /*start=*/7));
+    EXPECT_EQ(op->begins.at(0), 0);
+    EXPECT_EQ(op->sizes.at(0), 4) << "3 extension + 1 fresh page, all new to the table";
+
+    // Wire pairs are group-major: full ext slots 0..2, then swa slots 1..2 (slot 0
+    // is a pre-window hole = the null page 0).
+    const auto& full_row = op->flat_block_tables.at("full").at(0);
+    const auto& swa_row = op->flat_block_tables.at("swa").at(0);
+    ASSERT_EQ(full_row.size(), 4u);
+    ASSERT_EQ(swa_row.size(), 4u);
+    const auto& dst = lb->dst_pages.at(0);
+    EXPECT_EQ(dst.at(0), full_row.at(0));
+    EXPECT_EQ(dst.at(1), full_row.at(1));
+    EXPECT_EQ(dst.at(2), full_row.at(2));
+    EXPECT_EQ(swa_row.at(0), 0) << "swa slot 0 is the pre-window hole";
+    EXPECT_EQ(dst.at(3), swa_row.at(1));
+    EXPECT_EQ(dst.at(4), swa_row.at(2));
+
+    // The 5 matched host entries stay load-pinned until LoadBackDone retires the op.
+    EXPECT_EQ(scheduler_->FlatHostPoolPinnedBlocks(), 5);
+    SendLoadBackDone(lb->op_ids.at(0));
+    EXPECT_EQ(scheduler_->FlatHostPoolPinnedBlocks(), 0);
+
+    // r2 holds full 3 ext + 1 fresh and swa 2 ext + 1 fresh = 7 blocks.
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 7);
+
+    SendForwardDone("r2", {9001});
+    PlanOnce();  // finalize: page-3 keys are already indexed, so no new write-back pins
+    SendForwardDone("r2", {9002});
+    SendFinish("r2");
+    PlanOnce();  // reap
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start) << "pool balances after the host-hit request";
+}
+
+TEST_F(FlatHostHitSuite, EmptyHostIndexEmitsNoLoadBack) {
+    Submit(MakeRequestSpec("r1", /*num_pages=*/4));
+    ExecutionPlan plan = PlanOnce();
+    ASSERT_NE(FindFlatOp(plan), nullptr);
+    EXPECT_FALSE(FindFlatLoadBack(plan).has_value()) << "an empty host index must emit no load-back";
+    EXPECT_EQ(scheduler_->FlatHostPoolPinnedBlocks(), 0);
+}
+
+TEST_F(FlatHostHitSuite, AbandonedAdmissionUnpins) {
+    const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
+    SeedHostThenEvictDevice();
+
+    // Filler: 5 pages -> 10 prefill + 2 reserve = the whole pool while it decodes.
+    Submit(MakeRequestSpec("filler", /*num_pages=*/5, /*start=*/701));
+    PlanOnce();
+    SendForwardDone("filler", {9001});
+    ExecutionPlan filler_finalize = PlanOnce();  // acquires the reserve: free = 0
+    auto filler_wb = FindFlatWriteBack(filler_finalize);
+    ASSERT_TRUE(filler_wb.has_value());
+    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), 0);
+
+    // r2's host match takes 5 pins, but the gate needs 4 + 5 ext > 0 free: the
+    // abandoning return must give the pins back.
+    Submit(MakeRequestSpec("r2", /*num_pages=*/4));
+    ExecutionPlan starved = PlanOnce();
+    EXPECT_FALSE(FindFlatLoadBack(starved).has_value());
+    EXPECT_EQ(scheduler_->FlatHostPoolPinnedBlocks(), 0) << "an abandoned admission must unpin its host match";
+    EXPECT_EQ(scheduler_->WaitingSize(), 1u);
+
+    // Free the filler (its write-back pins included) -> r2 admits with the load-back.
+    SendForwardDone("filler", {9002});
+    SendFinish("filler");
+    SendWriteBackDone(filler_wb->op_ids.at(0), /*success=*/true);
+    ExecutionPlan plan = PlanOnce();
+    auto lb = FindFlatLoadBack(plan);
+    ASSERT_TRUE(lb.has_value());
+    EXPECT_EQ(lb->src_pages.at(0).size(), 5u);
+    EXPECT_EQ(scheduler_->FlatHostPoolPinnedBlocks(), 5);
+    EXPECT_EQ(scheduler_->WaitingSize(), 0u);
+
+    SendLoadBackDone(lb->op_ids.at(0));
+    EXPECT_EQ(scheduler_->FlatHostPoolPinnedBlocks(), 0);
+    SendForwardDone("r2", {9001});
+    PlanOnce();
+    SendForwardDone("r2", {9002});
+    SendFinish("r2");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start) << "pool balances after the deferred host hit";
+}
+
+TEST_F(FlatHostHitSuite, AbortDuringLoadKeepsPagesPinned) {
+    const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
+    SeedHostThenEvictDevice();
+
+    Submit(MakeRequestSpec("r2", /*num_pages=*/4));
+    ExecutionPlan plan = PlanOnce();
+    auto lb = FindFlatLoadBack(plan);
+    ASSERT_TRUE(lb.has_value());
+    ASSERT_EQ(lb->dst_pages.at(0).size(), 5u);
+    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 7);
+
+    // Abort while the H2D copy is in flight: the reap returns only the 2 fresh pages;
+    // the 5 load destinations must stay off the free list until LoadBackDone.
+    SendAbort(*scheduler_, "r2");
+    PlanOnce();  // reap
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 5)
+        << "in-flight load destinations must not be reusable";
+    EXPECT_EQ(scheduler_->FlatHostPoolPinnedBlocks(), 5) << "the host sources stay pinned too";
+
+    SendLoadBackDone(lb->op_ids.at(0));
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start) << "LoadBackDone releases the destinations";
+    EXPECT_EQ(scheduler_->FlatHostPoolPinnedBlocks(), 0);
+}
+
+// An abort-during-load leaves pages held ONLY by the load ledger; the starvation
+// deadlock check must count that as in-flight (LoadBackDone will free them), not
+// crash a candidate that double-starves against the ticket-held pages.
+TEST_F(FlatHostHitSuite, StarvationWaitsForInFlightLoads) {
+    const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
+    SeedHostThenEvictDevice();
+
+    // Same shape as AbortDuringLoadKeepsPagesPinned: 5 destinations stay ticket-held.
+    Submit(MakeRequestSpec("r2", /*num_pages=*/4));
+    ExecutionPlan plan = PlanOnce();
+    auto lb = FindFlatLoadBack(plan);
+    ASSERT_TRUE(lb.has_value());
+    SendAbort(*scheduler_, "r2");
+    PlanOnce();  // reap
+    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 5);
+
+    // r3 (fresh tokens, no host hit) charges 8 prefill + 2 reserve = 10 > 7 free: deferred.
+    Submit(MakeRequestSpec("r3", /*num_pages=*/4, /*start=*/901));
+    ExecutionPlan starved1 = PlanOnce();
+    ASSERT_NE(FindFlatOp(starved1), nullptr);
+    EXPECT_TRUE(FindFlatOp(starved1)->request_ids.empty());
+    // The SECOND consecutive starved round is where the deadlock assert would
+    // fire; the in-flight load ledger must keep the starvation counter quiet.
+    ExecutionPlan starved2 = PlanOnce();
+    ASSERT_NE(FindFlatOp(starved2), nullptr);
+    EXPECT_TRUE(FindFlatOp(starved2)->request_ids.empty());
+    EXPECT_EQ(scheduler_->WaitingSize(), 1u) << "deferred r3 stays intact in the waiting set";
+
+    // LoadBackDone frees the 5 destinations: r3's 10-block gate now clears.
+    SendLoadBackDone(lb->op_ids.at(0));
+    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start);
+    ExecutionPlan admitted = PlanOnce();
+    const FlatForwardOperation* op = FindFlatOp(admitted);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->request_ids.size(), 1u);
+    EXPECT_EQ(op->request_ids.at(0), "r3");
+    EXPECT_EQ(scheduler_->WaitingSize(), 0u);
+}
+
+// A LoadBackDone whose op_id was already retired must hit the silent-ignore arm:
+// no crash, no double UnpinLoad, no double-free of the destination pages.
+TEST_F(FlatHostHitSuite, DuplicateLoadBackDoneIsIgnored) {
+    const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
+    SeedHostThenEvictDevice();
+
+    Submit(MakeRequestSpec("r2", /*num_pages=*/4));
+    ExecutionPlan plan = PlanOnce();
+    auto lb = FindFlatLoadBack(plan);
+    ASSERT_TRUE(lb.has_value());
+    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 7);
+
+    SendLoadBackDone(lb->op_ids.at(0));
+    EXPECT_EQ(scheduler_->FlatHostPoolPinnedBlocks(), 0);
+    const std::int32_t free_after_first = scheduler_->FlatPoolFreeBlocks();
+    EXPECT_EQ(free_after_first, free_at_start - 7) << "destinations still table-held: no free-list change";
+
+    SendLoadBackDone(lb->op_ids.at(0));  // duplicate
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_after_first) << "a duplicate Done must not double-free";
+    EXPECT_EQ(scheduler_->FlatHostPoolPinnedBlocks(), 0);
+
+    SendForwardDone("r2", {9001});
+    PlanOnce();
+    SendForwardDone("r2", {9002});
+    SendFinish("r2");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start) << "pool balances despite the duplicate event";
+}
+
+// ---------------------------------------------------------------------------
+// M15 host hit + chunked prefill: later chunks must count the host extension as
+// computed tokens, and an SWA slide that punches a still-loading destination
+// page must leave it ticket-protected until LoadBackDone.
+// ---------------------------------------------------------------------------
+class FlatChunkedHostHitSuite : public FlatHostHitSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = FlatHostHitSuite::MakeConfig();
+        cfg.max_scheduled_tokens = 4;  // 4-token prefill chunks
+        // 21 -> 20 free: r2's first chunk holds 10 (6 ext + 4 fresh) and its second
+        // chunk charges 6 with zero slide credit (ticket-held punches don't count).
+        cfg.device_allocator.total_pages = 21;
+        for (auto& g : cfg.paged_cache_groups) {
+            g.total_pages = cfg.device_allocator.total_pages;
+        }
+        return cfg;
+    }
+
+    void AckWriteBacks(const ExecutionPlan& plan) {
+        for (const CacheOperation& op : ExtractCacheOpsOfKind<FlatWriteBackOperation>(plan)) {
+            for (cache_op_id id : std::get<FlatWriteBackOperation>(op).op_ids) {
+                SendWriteBackDone(id, /*success=*/true);
+            }
+        }
+    }
+
+    // Chunked twin of RunSinkLifecycle: drives prefill round by round, acking every
+    // streaming write-back so no sink pin outlives the seeding.
+    void RunChunkedSinkLifecycle(const RequestSpec& spec, std::int32_t prefill_rounds) {
+        Submit(spec);
+        for (std::int32_t i = 0; i < prefill_rounds; ++i) {
+            ExecutionPlan plan = PlanOnce();
+            ASSERT_NE(FindFlatOp(plan), nullptr) << "chunk " << i;
+            ASSERT_EQ(FindFlatOp(plan)->request_ids.size(), 1u) << "chunk " << i << " must be admitted";
+            AckWriteBacks(plan);
+        }
+        SendForwardDone(spec.request_id, {9001});
+        AckWriteBacks(PlanOnce());  // finalize: registration + drain
+        FinishAndReap(spec.request_id);
+    }
+
+    // r1 (4 pages) indexes 8 host entries over 2 chunks; the churn request must pop
+    // 22 free-list entries (full 10 + swa 10 + reserve 2) = the 12 fresh blocks
+    // still unused plus ALL 10 of r1's cached blocks, so r1 survives host-only.
+    void SeedHostThenEvictDeviceChunked() {
+        RunChunkedSinkLifecycle(MakeRequestSpec("r1", /*num_pages=*/4), /*prefill_rounds=*/2);
+        ASSERT_EQ(scheduler_->FlatHostPoolCachedBlocks(), 8);
+        RunChunkedSinkLifecycle(MakeRequestSpec("churn", /*num_pages=*/10, /*start=*/501), /*prefill_rounds=*/5);
+        ASSERT_EQ(scheduler_->FlatHostPoolCachedBlocks(), 28);
+        ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), 20) << "both seeding requests fully retired";
+    }
+};
+
+TEST_F(FlatChunkedHostHitSuite, ChunkedPrefillAfterHostHit) {
+    const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
+    ASSERT_EQ(free_at_start, 20);
+    SeedHostThenEvictDeviceChunked();
+
+    // r2: 16 tokens sharing r1's first 8. Host extension = 4 blocks (full run 0..3;
+    // swa tail ceil((W-1)/P)=2 at the boundary) -> real pages full 4 + swa 2 = 6.
+    Submit(MakeRequestSpec("r2", /*num_pages=*/8));
+    ExecutionPlan c1 = PlanOnce();
+    auto lb = FindFlatLoadBack(c1);
+    ASSERT_TRUE(lb.has_value());
+    ASSERT_EQ(lb->src_pages.at(0).size(), 6u);
+    EXPECT_EQ(scheduler_->FlatHostPoolPinnedBlocks(), 6);
+
+    const FlatForwardOperation* op1 = FindFlatOp(c1);
+    ASSERT_NE(op1, nullptr);
+    ASSERT_EQ(op1->request_ids.size(), 1u);
+    // First chunk: the 8 host-hit tokens are computed; chunk covers tokens [8,12).
+    EXPECT_EQ(op1->extend_prefix_lens.at(0), 8);
+    EXPECT_EQ(op1->input_lengths.at(0), 4);
+    EXPECT_EQ(op1->prefill_lengths.at(0), 16);
+    // 6 ext + 2 fresh/group: 10 blocks held.
+    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 10);
+
+    // Chunk 2 completes prefill; its slide at num_computed=12 punches swa ext slots
+    // 2,3 = LOADED destinations mid-copy. The ticket must keep them off the free list.
+    ExecutionPlan c2 = PlanOnce();
+    const FlatForwardOperation* op2 = FindFlatOp(c2);
+    ASSERT_NE(op2, nullptr);
+    ASSERT_EQ(op2->request_ids.size(), 1u);
+    EXPECT_EQ(op2->extend_prefix_lens.at(0), 12) << "chunk 2 must see ext(8) + chunk1(4) as computed";
+    EXPECT_EQ(op2->input_lengths.at(0), 4);
+    AckWriteBacks(c2);  // pages 4,5 registered this round; ack so only the ticket pins remain
+    // Punched destinations withheld: chunk 2 acquired 4, punched 2 stay ticket-held.
+    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 14);
+    EXPECT_EQ(scheduler_->FlatHostPoolPinnedBlocks(), 6) << "the copy is still in flight";
+
+    // LoadBackDone releases exactly the 2 punched destinations (the other 4 stay table-held).
+    SendLoadBackDone(lb->op_ids.at(0));
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 12);
+    EXPECT_EQ(scheduler_->FlatHostPoolPinnedBlocks(), 0);
+
+    SendForwardDone("r2", {9001});
+    ExecutionPlan finalize = PlanOnce();
+    ASSERT_NE(FindFlatOp(finalize), nullptr);
+    EXPECT_EQ(scheduler_->DecodingSize(), 1u);
+    AckWriteBacks(finalize);
+    SendForwardDone("r2", {9002});
+    SendFinish("r2");
+    PlanOnce();  // reap
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start) << "pool balances after the chunked host hit";
+}
+
+// ---------------------------------------------------------------------------
+// M15-C3 review: until the emission takes the HostMatch pins, the first-chunk
+// EVENT owns them (BlockRef RAII) -- destroying it unconsumed (throwing
+// transition) must release them exactly once, and moving must not double-release.
+// ---------------------------------------------------------------------------
+TEST(FlatFirstChunkEventPinOwnership, DtorReleasesUnconsumedPinsExactlyOnce) {
+    BlockPool host_pool(/*total_num_blocks=*/2);
+    CacheBlock* page = host_pool.AllocateBlocks(1).front();
+    host_pool.CacheFullBlock(page, "k");
+    host_pool.FreeBlocks({page});
+    {
+        HostMatch host;
+        host.num_extension_blocks = 1;
+        host.pinned.push_back(BlockRef::Share(host_pool, host_pool.GetCachedBlock("k")));
+        ASSERT_EQ(host_pool.NumPinnedCachedBlocks(), 1);
+        fsm::SchedulePrefillFirstChunkEvent ev{/*tokens_this_round=*/0,
+                                               /*decode_input_tokens=*/0,
+                                               /*device_allocator=*/nullptr,
+                                               /*req_pool_allocator=*/nullptr,
+                                               MatchResult{},
+                                               Role::kFused,
+                                               /*kv_prefix_cache=*/nullptr,
+                                               /*disable_l2_cache=*/false,
+                                               /*loadback_diff=*/{},
+                                               /*hybrid_prefix_cache=*/nullptr,
+                                               /*mamba_allocator=*/nullptr,
+                                               /*mamba_loadback_nodes=*/{},
+                                               /*coordinator=*/nullptr,
+                                               CoordinatorMatch{},
+                                               std::move(host),
+                                               /*flat_ext_hashes=*/{}};
+        // Vector move must leave the source's pins empty: a double-release would
+        // underflow the ref count and throw from the second dtor.
+        fsm::SchedulePrefillFirstChunkEvent moved{std::move(ev)};
+        EXPECT_EQ(host_pool.NumPinnedCachedBlocks(), 1) << "construction and move must not unpin";
+    }
+    EXPECT_EQ(host_pool.NumPinnedCachedBlocks(), 0) << "the unconsumed event must release its pins";
 }
 
 }  // namespace tokenspeed::test

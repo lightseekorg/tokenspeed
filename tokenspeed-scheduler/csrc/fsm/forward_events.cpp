@@ -113,28 +113,6 @@ namespace {
     throw std::logic_error("flat path: retract/writeback/loadback unsupported in C slice");
 }
 
-// BlockTable is non-owning: a transition that throws before the new state adopts its tables must free
-// their page refs or they leak forever; disarm once the new state owns them.
-// After the adopting move the guard's reference sees an empty vector, and FreeRequest on empty is a no-op.
-class BlockTablesGuard {
-public:
-    BlockTablesGuard(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables)
-        : coordinator_{coordinator}, tables_{tables} {}
-    BlockTablesGuard(const BlockTablesGuard&) = delete;
-    BlockTablesGuard& operator=(const BlockTablesGuard&) = delete;
-    ~BlockTablesGuard() {
-        if (armed_) {
-            FreeRequest(coordinator_, tables_);
-        }
-    }
-    void Disarm() { armed_ = false; }
-
-private:
-    KvCacheCoordinator& coordinator_;
-    std::vector<BlockTable>& tables_;
-    bool armed_{true};
-};
-
 // Hash the newly filled pages [chain.num_hashed_pages, filled_pages) onto the chain; empty when nothing filled.
 std::vector<std::string> AdvanceFlatHashChain(FlatHashChain& chain,
                                               const std::vector<std::span<const std::int32_t>>& paged,
@@ -196,17 +174,25 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()
     _assert(coordinator_ != nullptr, "SchedulePrefillFirstChunkEvent: flat path requires a coordinator");
     TokenContainer* token_container = state.GetTokenContainer();
 
-    // Slot first: Allocate() throws on exhaustion, and ReqPoolIndex is RAII while BlockTable is not.
+    // Slot first: Allocate() throws on exhaustion; both sides are RAII now, order kept for determinism.
     auto req_pool_index = std::make_unique<ReqPoolIndex>(req_pool_allocator_->Allocate());
 
     std::vector<BlockTable> tables(coordinator_->NumGroups());
-    BlockTablesGuard tables_guard{*coordinator_, tables};
-    if (!PrefillFirstChunk(*coordinator_, tables, flat_hit_, tokens_this_round_)) {
+    coordinator_->ClaimCommonPrefix(tables, flat_hit_);
+    // The extension appends between the claim and the fresh acquire so slots stay
+    // [device hit | host ext | new pages]; ext pages are FULL, composing exactly with the gate.
+    flat_load_pairs_ = LoadHostExtension(*coordinator_, tables, flat_host_);
+    // Loaded pages become device-cached now (SWA holes skipped by the IsNull guard);
+    // the sink re-collects them and the drain dedupes against the host index.
+    coordinator_->CacheFullBlocks(tables, flat_ext_hashes_,
+                                  /*first_slot=*/flat_hit_.num_common_tokens / state.GetPageSize());
+    if (!coordinator_->Acquire(tables, tokens_this_round_)) {
         _assert(false, "flat path: allocation failure unsupported in C slice");
     }
 
-    // The admission num_common_blocks that set tokens_this_round_ also sets window.begin (single source).
-    const std::int32_t hit_tokens = flat_hit_.num_common_blocks * state.GetPageSize();
+    // The admission match that set tokens_this_round_ also sets window.begin (single source).
+    const std::int32_t hit_tokens =
+        flat_hit_.num_common_tokens + flat_host_.num_extension_blocks * state.GetPageSize();
     TokenContainer::Window window{.begin = hit_tokens, .size = tokens_this_round_};
     bool is_last_chunk = (window.begin + window.size) == token_container->PrefillSize();
     if (is_last_chunk && role_ != Role::kD) {
@@ -220,7 +206,6 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()
                          decode_input_tokens_,
                          nullptr};
         done.SetBlockTables(std::move(tables));
-        tables_guard.Disarm();
         return done;
     }
     Prefilling prefilling{token_container,
@@ -232,7 +217,6 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()
                           window,
                           nullptr};
     prefilling.SetBlockTables(std::move(tables));
-    tables_guard.Disarm();
     return prefilling;
 #else
     std::unique_ptr<HostNodeRef> host_node_ref{nullptr};
@@ -307,7 +291,6 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillEvent::operator()(Prefillin
     const std::int32_t num_computed_tokens = state.window.begin + state.window.size;
 
     auto tables = std::move(state).TakeBlockTables();
-    BlockTablesGuard tables_guard{*coordinator_, tables};
     if (!PrefillChunk(*coordinator_, tables, hashes, tokens_this_round_, num_computed_tokens)) {
         _assert(false, "flat path: allocation failure unsupported in C slice");
     }
@@ -325,7 +308,6 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillEvent::operator()(Prefillin
                          reserve_num_tokens_in_next_schedule_event_,
                          nullptr};
         done.SetBlockTables(std::move(tables));
-        tables_guard.Disarm();
         return done;
     }
     Prefilling prefilling{state.GetTokenContainer(),
@@ -337,7 +319,6 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillEvent::operator()(Prefillin
                           window,
                           nullptr};
     prefilling.SetBlockTables(std::move(tables));
-    tables_guard.Disarm();
     return prefilling;
 #else
     auto local_kv_allocator = std::move(state).TakeLocalKVAllocator();
@@ -399,7 +380,6 @@ Decoding ScheduleDecodeEvent::operator()(PrefillDone&& state) {
     const std::int32_t num_computed_tokens = state.window.begin + state.window.size;
 
     auto tables = std::move(state).TakeBlockTables();
-    BlockTablesGuard tables_guard{*coordinator_, tables};
     if (!FinalizePrefillAndReserveDecode(*coordinator_, tables, hashes, reserve, num_computed_tokens)) {
         _assert(false, "flat path: allocation failure unsupported in C slice");
     }
@@ -413,7 +393,6 @@ Decoding ScheduleDecodeEvent::operator()(PrefillDone&& state) {
                       decode_input_tokens_,
                       nullptr};
     decoding.SetBlockTables(std::move(tables));
-    tables_guard.Disarm();
     decoding.SetFlatHashChain(FlatHashChain{static_cast<std::int32_t>(hashes.size()),
                                             hashes.empty() ? std::string{} : hashes.back()});
     return decoding;
@@ -462,7 +441,6 @@ Decoding ScheduleDecodeEvent::operator()(Decoding&& state) {
         AdvanceFlatHashChain(chain, state.GetFullPagedTokens(false), num_computed_tokens / state.GetPageSize());
 
     auto tables = std::move(state).TakeBlockTables();
-    BlockTablesGuard tables_guard{*coordinator_, tables};
     if (!DecodeStep(*coordinator_, tables, new_hashes, first_page_slot, reserve, num_computed_tokens)) {
         _assert(false, "flat path: allocation failure unsupported in C slice");
     }
@@ -476,7 +454,6 @@ Decoding ScheduleDecodeEvent::operator()(Decoding&& state) {
                       decode_input_tokens_,
                       nullptr};
     decoding.SetBlockTables(std::move(tables));
-    tables_guard.Disarm();
     decoding.SetFlatHashChain(std::move(chain));
     return decoding;
 #else

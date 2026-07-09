@@ -163,17 +163,8 @@ class MHATokenToKVPool(BaseTokenToKVPool):
     def _check_slab_guards(self):
         """Refuse features whose per-layer buffer assumptions break when
         paired layers alias the same slab tensor."""
-        if self._kvstore_enabled:
-            raise RuntimeError(
-                "hybrid slab KV layout is incompatible with the kvstore L2 "
-                "cache: host offload copies KV per layer (get_cpu_copy / "
-                "get_flat_data / transfer), and paired layers alias the "
-                "same slab, so per-layer copies would double-count bytes "
-                "and misattribute page ownership. Disable the kvstore "
-                "(--enable-kvstore off) or use a radix-built "
-                "tokenspeed_scheduler extension, which keeps the legacy "
-                "per-layer layout."
-            )
+        # kvstore is allowed (spec §6 revision): the flat L2 tier mirrors
+        # whole slabs byte-blind, so per-slab copies are group-safe.
         if self._pd_disaggregation_enabled:
             raise RuntimeError(
                 "hybrid slab KV layout is incompatible with PD "

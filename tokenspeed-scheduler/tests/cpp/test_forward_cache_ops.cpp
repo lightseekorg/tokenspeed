@@ -92,7 +92,7 @@ TEST(ForwardCacheOpsPrefill, FirstChunkClaimsHitThenAcquiresOnlyRemainder) {
 
     // r2: same 8-token prefix, 12-token prefill target -> 4 NEW tokens.
     const CoordinatorMatch hit = coordinator.MatchPrefix(hashes8);
-    ASSERT_EQ(hit.num_common_blocks, 4);
+    ASSERT_EQ(hit.num_common_tokens, 8);
     ASSERT_EQ(hit.per_group[1].num_hit_blocks, 4) << "W=16 must keep every SWA prefix page real";
 
     // Claimed pages carry no tail credit (spec §4.3): tail_avail_ stays 0, so
@@ -251,7 +251,7 @@ TEST(ForwardCacheOpsDecode, DecodeStepRegistersFilledPages) {
         hashes[i] = std::string(64, static_cast<char>('a' + i));
     }
     coordinator.CacheFullBlocks(tables, std::span<const std::string>(hashes).first(2));
-    ASSERT_EQ(coordinator.MatchPrefix(hashes).num_common_blocks, 2);
+    ASSERT_EQ(coordinator.MatchPrefix(hashes).num_common_tokens, 4);
 
     const std::vector<std::string> fresh(hashes.begin() + 2, hashes.end());
     ASSERT_TRUE(DecodeStep(coordinator, tables, fresh, /*first_page_slot=*/2,
@@ -259,7 +259,7 @@ TEST(ForwardCacheOpsDecode, DecodeStepRegistersFilledPages) {
 
     // Registration maps slots to this request's physical pages, not copies.
     const CoordinatorMatch hit = coordinator.MatchPrefix(hashes);
-    EXPECT_EQ(hit.num_common_blocks, 4);
+    EXPECT_EQ(hit.num_common_tokens, 8);
     for (std::int32_t i = 0; i < 4; ++i) {
         EXPECT_EQ(hit.per_group[0].blocks[i]->BlockId(), tables[0].Blocks()[i]->BlockId()) << "slot " << i;
     }
@@ -277,7 +277,10 @@ TEST(ForwardCacheOpsDecode, DecodeStepWithEmptyHashesUnchanged) {
 
     ASSERT_TRUE(DecodeStep(coordinator_new, tables_new, /*content_hashes=*/{}, /*first_page_slot=*/0,
                            /*num_tokens=*/1, /*num_computed_tokens=*/8));
-    coordinator_old.AdvanceWindow(tables_old, /*num_computed_tokens=*/8);
+    for (std::int32_t g = 0; g < coordinator_old.NumGroups(); ++g) {
+        coordinator_old.GroupManager(g).ReclaimExpired(tables_old[static_cast<std::size_t>(g)],
+                                                       /*num_computed_tokens=*/8);
+    }
     ASSERT_TRUE(coordinator_old.Acquire(tables_old, /*num_tokens=*/1));
 
     EXPECT_EQ(pool_new.NumFreeBlocks(), pool_old.NumFreeBlocks());
@@ -347,7 +350,10 @@ TEST(ForwardCacheOpsBuildFlatBlockTables, SwaRowGetsNullHoleAfterAdvance) {
     std::vector<BlockTable> tables(coordinator.NumGroups());
     // Window = 4 tokens = 2 pages, so 8 tokens leave earlier pages out of window.
     ASSERT_TRUE(coordinator.Acquire(tables, /*num_tokens=*/8));      // 4 pages/group
-    coordinator.AdvanceWindow(tables, /*num_computed_tokens=*/8);
+    for (std::int32_t g = 0; g < coordinator.NumGroups(); ++g) {
+        coordinator.GroupManager(g).ReclaimExpired(tables[static_cast<std::size_t>(g)],
+                                                   /*num_computed_tokens=*/8);
+    }
 
     std::vector<std::string> group_ids{"full", "swa"};
     auto built = BuildFlatBlockTables(tables, group_ids);

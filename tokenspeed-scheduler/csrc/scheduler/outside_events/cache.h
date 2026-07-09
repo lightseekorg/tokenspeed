@@ -38,7 +38,12 @@ struct WriteBackDone {
     bool success;
 };
 
+struct LoadBackDone {
+    cache_op_id op_id{0};
+    bool success{true};
+};
+
 };  // namespace cache
 
-using CacheEvent = std::variant<cache::WriteBackDone, cache::PrefetchDone>;
+using CacheEvent = std::variant<cache::WriteBackDone, cache::PrefetchDone, cache::LoadBackDone>;
 }  // namespace tokenspeed

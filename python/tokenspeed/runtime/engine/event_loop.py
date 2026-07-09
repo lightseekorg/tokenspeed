@@ -31,6 +31,9 @@ import torch.distributed as dist
 import zmq
 from tokenspeed_scheduler import PD, Cache, ExecutionEvent, Scheduler
 
+from tokenspeed.runtime.cache.executor.flat_memory_executor import (
+    FlatMemoryExecutor,
+)
 from tokenspeed.runtime.cache.executor.memory_executor import (
     MemoryExecutor,
     MemoryExecutorConfig,
@@ -271,7 +274,24 @@ class EventLoop:
             mamba_l2_layout=server_args.mamba_l2_layout,
             mamba_l2_io_backend=server_args.mamba_l2_io_backend,
         )
-        if not token_to_kv_pool.supports_hierarchical_kv_cache:
+        if scheduler_ext_flat_kvcache() and server_args.enable_kvstore:
+            # Flat ext + kvstore: the L2 tier is the byte-blind FlatHostMirror
+            # driven by Flat{WriteBack,LoadBack} page-id pairs. The radix host
+            # pool's token-indexed transfer kernels do not apply (slab layouts
+            # alias paired layers), and the flat scheduler expects LoadBackDone
+            # acks, which the radix executor never emits.
+            if server_args.kvstore_storage_backend is not None:
+                raise NotImplementedError(
+                    "flat scheduler build (TOKENSPEED_FLAT_KVCACHE) has no L3 "
+                    "storage tier yet; unset --kvstore-storage-backend."
+                )
+            self.memory_executor = FlatMemoryExecutor(
+                device_pool=token_to_kv_pool,
+                host_ratio=server_args.kvstore_ratio,
+                host_size_gb=server_args.kvstore_size,
+            )
+            num_host_pages = self.memory_executor.num_host_pages
+        elif not token_to_kv_pool.supports_hierarchical_kv_cache:
             if server_args.enable_kvstore:
                 raise NotImplementedError(
                     "This KV cache pool does not support hierarchical cache "
@@ -289,6 +309,12 @@ class EventLoop:
                 mamba_pool=mamba_pool,
             )
             num_host_pages = self.memory_executor.host_pool.page_num
+
+        # Flat host tier acks loadbacks (LoadBackDoneEvent), so they join the
+        # inflight accounting in _submit_cache_ops; radix loadbacks never ack.
+        self._loadback_acks_expected = getattr(
+            self.memory_executor, "emits_loadback_acks", False
+        )
 
         # For DP attention, max_batch_size must be per-rank to avoid
         # req_pool_allocator overflow.  The C++ scheduler allocates
@@ -745,7 +771,10 @@ class EventLoop:
             if isinstance(op, Cache.WriteBackOp):
                 self._num_inflight_cache_ops += len(op.op_ids)
             elif isinstance(op, Cache.LoadBackOp):
-                continue
+                # Radix loadbacks are fire-and-forget (no ack, nothing in
+                # flight); the flat host tier acks one LoadBackDone per op_id.
+                if self._loadback_acks_expected:
+                    self._num_inflight_cache_ops += len(op.op_ids)
             elif isinstance(op, (Cache.PrefetchOp, Cache.BackUpOp)):
                 self._num_inflight_cache_ops += 1
             else:

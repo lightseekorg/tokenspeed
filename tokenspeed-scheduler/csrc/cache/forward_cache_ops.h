@@ -24,6 +24,7 @@
 #include <map>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "cache/cache_types.h"
@@ -43,6 +44,14 @@ struct SchedulerConfig;  // defined in scheduler/types.h; only used by-ref below
 // plateau as vLLM. Pinned by FlatPrefillPlateauSuite; shrinking it further needs a kernel-level ring buffer.
 bool PrefillFirstChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
                        const CoordinatorMatch& hit, std::int32_t num_new_tokens);
+
+// Appends the host-extension segment to each group's table: -1 slots push the
+// null block (slot alignment), real slots Acquire one page. Returns
+// (host_page, device_block) pairs, group-major: the LoadBack op wires BlockId(),
+// the emission ledger pins the block itself for the in-flight H2D copy.
+std::vector<std::pair<std::int32_t, CacheBlock*>> LoadHostExtension(KvCacheCoordinator& coordinator,
+                                                                    std::vector<BlockTable>& tables,
+                                                                    const HostMatch& host);
 
 // Register prior chunks' pages, slide to num_computed_tokens, then acquire; false = pool
 // short (registration and slide already ran, nothing allocated) -- same for the two ops below.

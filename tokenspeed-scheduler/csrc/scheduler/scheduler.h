@@ -50,6 +50,8 @@
 #include "fsm/pd_events.h"
 
 #if TOKENSPEED_FLAT_KVCACHE
+#include <unordered_set>
+
 #include "cache/block_pool.h"
 #include "cache/kv_cache_coordinator.h"
 #include "cache/forward_cache_ops.h"
@@ -86,6 +88,9 @@ public:
 #if TOKENSPEED_FLAT_KVCACHE
     // Free pages in the flat shared BlockPool; int32 twin of AvailableKvPages() for C++ tests.
     std::int32_t FlatPoolFreeBlocks() const { return block_pool_.NumFreeBlocks(); }
+    std::int32_t FlatHostPoolCachedBlocks() const { return flat_host_pool_.NumCachedBlocks(); }
+    std::int32_t FlatHostPoolFreeBlocks() const { return flat_host_pool_.NumFreeBlocks(); }
+    std::int32_t FlatHostPoolPinnedBlocks() const { return flat_host_pool_.NumPinnedCachedBlocks(); }
 #endif
 
 private:
@@ -97,7 +102,8 @@ private:
         std::unordered_map<std::string, std::unique_ptr<Request>>& requests);
     std::optional<WriteBackOperation> newRetractOperation(Request* retract_request);
 
-    PrefillOperation applyEventAndGenerateOp(Request* request, fsm::SchedulePrefillFirstChunkEvent event);
+    PrefillOperation applyEventAndGenerateOp(Request* request, fsm::SchedulePrefillFirstChunkEvent event,
+                                             std::vector<LoadBackOperation>& loadback_ops);
     PrefillOperation applyEventAndGenerateOp(Request* request, fsm::SchedulePrefillEvent event);
     DecodeOperation applyEventAndGenerateOp(Request* request, fsm::ScheduleDecodeEvent event);
     DecodeOperation applyEventAndGenerateOp(Request* request, fsm::ScheduleDecodeFromRetractedEvent event);
@@ -107,7 +113,7 @@ private:
     std::optional<fsm::SchedulePrefetchEvent> schedulePrefetch(Request* request, const MatchResult& match);
 
     std::optional<fsm::SchedulePrefillFirstChunkEvent> schedulePrefillFirstChunk(
-        Request* request, std::int32_t remaining, std::int32_t reserve_num_tokens_in_next_schedule_event,
+        Request* request, std::int32_t remaining, std::int32_t decode_input_tokens,
         bool disable_l2_cache, std::map<std::string, std::int32_t>& simulated_free);
     std::optional<fsm::SchedulePrefillEvent> schedulePrefill(Request* request, std::int32_t remaining,
                                                              std::int32_t reserve_num_tokens_in_next_schedule_event,
@@ -119,9 +125,16 @@ private:
     std::optional<fsm::ScheduleRetractEvent> scheduleRetract(Request* request);
 
 #if TOKENSPEED_FLAT_KVCACHE
-    CoordinatorMatch matchFlatPrefixAtAdmission(Request* request) const;
+    // One hash pass at admission: the device match, its host-tier extension
+    // (pages arrive load-pinned) and the extension's hash slice (registration form).
+    struct FlatAdmissionMatch {
+        CoordinatorMatch device;
+        HostMatch host;
+        std::vector<std::string> ext_hashes;
+    };
+    FlatAdmissionMatch matchFlatPrefixAtAdmission(Request* request);
     std::optional<std::int32_t> flatAdmitFirstChunk(Request* request, const CoordinatorMatch& hit,
-                                                    std::int32_t chunk_tokens,
+                                                    std::int32_t ext_real_pages, std::int32_t chunk_tokens,
                                                     std::int32_t decode_reserve_tokens) const;
     std::optional<std::int32_t> flatAdmitPrefillChunk(Request* request, std::int32_t chunk_tokens,
                                                       std::int32_t decode_reserve_tokens,
@@ -135,6 +148,7 @@ private:
 private:
     void handleEvent(const cache::PrefetchDone& event);
     void handleEvent(const cache::WriteBackDone& event);
+    void handleEvent(const cache::LoadBackDone& event);
     void handleEvent(const pd::BootstrappedEvent& event);
     void handleEvent(const pd::FailedEvent& event);
     void handleEvent(const pd::SucceededEvent& event);
@@ -184,6 +198,61 @@ private:
     // The deadlock assert requires TWO starved rounds (an in-flight Finish fakes one); a Finish arriving
     // 2+ rounds late still trips it -- residual risk accepted until TODO(flat-retract).
     std::int32_t flat_starved_rounds_{0};
+    // Host tier = a second BlockPool, isomorphic to the device pool (block 0 is the null
+    // placeholder there too); the two differ only in which memory the ids index.
+    BlockPool flat_host_pool_;
+
+    struct FlatStoreTicket {
+        std::string key;
+        BlockRef device_block;  // source page, pinned under the D2H copy
+        BlockRef host_block;    // destination page, unhashed until WriteBackDone publishes it
+    };
+    // In-flight D2H stores. The host pool is transaction-blind like the device pool, so the
+    // key-dedupe index lives here, paired with the op ledger by construction: Add/Retire are
+    // the only mutation points and the drain emits each key at most once (its batch set),
+    // so the set always equals the union of in-flight ticket keys.
+    class FlatStoreLedger {
+    public:
+        void Add(cache_op_id id, std::vector<FlatStoreTicket> tickets) {
+            for (const FlatStoreTicket& t : tickets) {
+                keys_.insert(t.key);
+            }
+            ops_.emplace(id, std::move(tickets));
+        }
+        // Empty result: unknown op (the radix WriteBackDone path owns it).
+        std::vector<FlatStoreTicket> Retire(cache_op_id id) {
+            auto it = ops_.find(id);
+            if (it == ops_.end()) {
+                return {};
+            }
+            for (const FlatStoreTicket& t : it->second) {
+                keys_.erase(t.key);
+            }
+            std::vector<FlatStoreTicket> tickets = std::move(it->second);
+            ops_.erase(it);
+            return tickets;
+        }
+        bool InFlight(const std::string& key) const { return keys_.contains(key); }
+        bool Empty() const { return ops_.empty(); }
+
+    private:
+        std::unordered_map<cache_op_id, std::vector<FlatStoreTicket>> ops_;
+        std::unordered_set<std::string> keys_;
+    };
+    FlatStoreLedger flat_store_ops_;
+
+    struct FlatLoadTicket {
+        std::vector<BlockRef> host_pins;
+        std::vector<BlockRef> device_blocks;
+    };
+    // In-flight H2D loads: op_id -> the pinned source host pages plus the pinned destination
+    // device pages (a freed destination must not be recycled under the copy); LoadBackDone drops both.
+    std::unordered_map<cache_op_id, FlatLoadTicket> flat_load_ops_;
+
+    // Single home of the streaming-sink enablement predicate (> 1: page 0 is the null placeholder).
+    bool flatStreamingSinkEnabled() const {
+        return !config_.disable_l2_cache && config_.host_allocator.total_pages > 1 && config_.role == Role::kFused;
+    }
 
     // Sum excluding request_id: a request consuming its own reservation must not be gated by it.
     std::int32_t flatReservedPagesExcept(const std::string& request_id) const {

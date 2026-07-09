@@ -29,16 +29,13 @@
 namespace tokenspeed {
 
 // One attention group: its spec, its index-derived group_id, and the manager
-// that runs it. Plain aggregate -- all per-attention-type behavior lives inside
-// manager_ (the virtual KvCacheManager). Move-only (owns a unique_ptr).
+// that runs it. Pure data carrier -- all per-attention-type behavior lives
+// inside manager_ (the virtual KvCacheManager). Move-only (owns a unique_ptr).
 class CacheGroup {
 public:
     CacheGroup(KvCacheSpec spec, std::uint32_t group_id, std::unique_ptr<KvCacheManager> manager)
         : spec_{spec}, group_id_{group_id}, manager_{std::move(manager)} {}
 
-    // Move-only: owns the manager via unique_ptr. Copy is implicitly deleted by
-    // the unique_ptr member; stated explicitly so the contract is visible
-    // (mirrors CacheBlock). Move is needed to store groups in a std::vector.
     CacheGroup(const CacheGroup&) = delete;
     CacheGroup& operator=(const CacheGroup&) = delete;
     CacheGroup(CacheGroup&&) = default;

@@ -131,31 +131,42 @@ public:
         }
         out.reserve(num);
         for (std::int32_t i = 0; i < num; ++i) {
-            CacheBlock* block = popFromFree();
-            if (block->IsCached()) {
-                evictCachedBlock(block);
-            }
-            block->IncrRef();
-            out.push_back(block);
+            out.push_back(AllocateBlock());
         }
         return out;
+    }
+
+    // Single-block twin (nullptr on shortfall) for allocation-free call sites.
+    CacheBlock* AllocateBlock() {
+        if (free_.empty()) {
+            return nullptr;
+        }
+        CacheBlock* block = popFromFree();
+        if (block->IsCached()) {
+            evictCachedBlock(block);
+        }
+        block->IncrRef();
+        return block;
     }
 
     // Blocks reaching ref 0 return hash-intact, in reverse so a chain's tail (more prefix tokens) evicts first.
     void FreeBlocks(const std::vector<CacheBlock*>& blocks) {
         for (auto it = blocks.rbegin(); it != blocks.rend(); ++it) {
-            CacheBlock* block = *it;
-            if (block->is_null_) {
-                continue;
-            }
-            block->DecrRef();
-            if (block->ref_cnt_ == 0) {
-                pushToFree(block);
-            }
+            FreeBlock(*it);
         }
     }
 
-    void CacheFullBlocks(CacheBlock* block, const std::string& block_hash_with_group) {
+    void FreeBlock(CacheBlock* block) {
+        if (block->is_null_) {
+            return;
+        }
+        block->DecrRef();
+        if (block->ref_cnt_ == 0) {
+            pushToFree(block);
+        }
+    }
+
+    void CacheFullBlock(CacheBlock* block, const std::string& block_hash_with_group) {
         if (!enable_caching_ || block->is_null_) {
             return;
         }
@@ -163,11 +174,32 @@ public:
         cached_hash_to_blocks_[block_hash_with_group].push_back(block);
     }
 
+    // Test probes (O(cached blocks), off the hot path).
     std::int32_t NumCachedFreeBlocks() const {
         std::int32_t n = 0;
         for (const auto& [key, blocks] : cached_hash_to_blocks_) {
             for (const CacheBlock* b : blocks) {
                 if (b->ref_cnt_ == 0) {
+                    ++n;
+                }
+            }
+        }
+        return n;
+    }
+
+    std::int32_t NumCachedBlocks() const {
+        std::int32_t n = 0;
+        for (const auto& [key, blocks] : cached_hash_to_blocks_) {
+            n += static_cast<std::int32_t>(blocks.size());
+        }
+        return n;
+    }
+
+    std::int32_t NumPinnedCachedBlocks() const {
+        std::int32_t n = 0;
+        for (const auto& [key, blocks] : cached_hash_to_blocks_) {
+            for (const CacheBlock* b : blocks) {
+                if (b->ref_cnt_ > 0) {
                     ++n;
                 }
             }

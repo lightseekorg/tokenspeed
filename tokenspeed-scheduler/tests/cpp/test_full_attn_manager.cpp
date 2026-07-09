@@ -53,7 +53,7 @@ TEST(FullAttnManagerTest, MatchEmptyListReturnsNoHit) {
     BlockPool pool(8);
     FullAttnManager mgr(pool, 4);
     std::vector<std::string> empty_hashes;
-    PrefixMatch m = mgr.MatchPrefix(empty_hashes);
+    PrefixMatch m = mgr.MatchPrefix(empty_hashes, static_cast<std::int32_t>(empty_hashes.size()));
     EXPECT_EQ(m.num_hit_blocks, 0);
     EXPECT_TRUE(m.blocks.empty());
 }
@@ -62,7 +62,7 @@ TEST(FullAttnManagerTest, MatchAllMissReturnsNoHitAndDoesNotChangeRefs) {
     BlockPool pool(8);
     FullAttnManager mgr(pool, 4);
     std::vector<std::string> hashes = {RealKey({1, 2, 3, 4}, 0), RealKey({5, 6, 7, 8}, 0)};
-    PrefixMatch m = mgr.MatchPrefix(hashes);
+    PrefixMatch m = mgr.MatchPrefix(hashes, static_cast<std::int32_t>(hashes.size()));
     EXPECT_EQ(m.num_hit_blocks, 0);
     EXPECT_EQ(pool.NumFreeBlocks(), 7);  // nothing claimed
 }
@@ -75,13 +75,14 @@ TEST(FullAttnManagerTest, MatchStopsAtFirstMiss) {
     const std::string k2 = RealKey({9, 9, 9, 9}, 0);
 
     auto a = pool.AllocateBlocks(1);
-    pool.CacheFullBlocks(a.front(), k0);
+    pool.CacheFullBlock(a.front(), k0);
     auto b = pool.AllocateBlocks(1);
-    pool.CacheFullBlocks(b.front(), k1);
+    pool.CacheFullBlock(b.front(), k1);
     pool.FreeBlocks(a);
     pool.FreeBlocks(b);
 
-    PrefixMatch m = mgr.MatchPrefix(std::vector<std::string>{k0, k1, k2});
+    std::vector<std::string> keys{k0, k1, k2};
+    PrefixMatch m = mgr.MatchPrefix(keys, 3);
     EXPECT_EQ(m.num_hit_blocks, 2);
     ASSERT_EQ(m.blocks.size(), 2u);
     EXPECT_EQ(m.blocks[0]->BlockId(), a.front()->BlockId());
@@ -93,11 +94,12 @@ TEST(FullAttnManagerTest, MatchDoesNotChangeRefCount) {
     FullAttnManager mgr(pool, 4);
     const std::string k0 = RealKey({1, 2, 3, 4}, 0);
     auto a = pool.AllocateBlocks(1);
-    pool.CacheFullBlocks(a.front(), k0);
+    pool.CacheFullBlock(a.front(), k0);
     pool.FreeBlocks(a);
     EXPECT_EQ(a.front()->RefCount(), 0);
 
-    PrefixMatch m = mgr.MatchPrefix(std::vector<std::string>{k0});
+    std::vector<std::string> keys{k0};
+    PrefixMatch m = mgr.MatchPrefix(keys, 1);
     EXPECT_EQ(m.num_hit_blocks, 1);
     EXPECT_EQ(a.front()->RefCount(), 0);  // read-only: still zero
     EXPECT_EQ(pool.NumFreeBlocks(), 7);   // still free
@@ -108,11 +110,12 @@ TEST(FullAttnManagerTest, ClaimHitBlocksClaimsAndAppends) {
     FullAttnManager mgr(pool, 4);
     const std::string k0 = RealKey({1, 2, 3, 4}, 0);
     auto a = pool.AllocateBlocks(1);
-    pool.CacheFullBlocks(a.front(), k0);
+    pool.CacheFullBlock(a.front(), k0);
     pool.FreeBlocks(a);
     EXPECT_EQ(pool.NumFreeBlocks(), 7);
 
-    PrefixMatch m = mgr.MatchPrefix(std::vector<std::string>{k0});
+    std::vector<std::string> keys{k0};
+    PrefixMatch m = mgr.MatchPrefix(keys, 1);
     BlockTable table;
     mgr.ClaimHitBlocks(table, m);
 
@@ -211,7 +214,8 @@ TEST(FullAttnManagerTest, CacheFullBlocksMakesPagesPrefixHittable) {
     ASSERT_EQ(a.NumBlocks(), 2);
     mgr.CacheFullBlocks(a, std::vector<std::string>{k0, k1});
 
-    PrefixMatch m = mgr.MatchPrefix(std::vector<std::string>{k0, k1});
+    std::vector<std::string> keys{k0, k1};
+    PrefixMatch m = mgr.MatchPrefix(keys, 2);
     EXPECT_EQ(m.num_hit_blocks, 2);
     EXPECT_EQ(m.blocks[0]->BlockId(), a.Blocks()[0]->BlockId());
     EXPECT_EQ(m.blocks[1]->BlockId(), a.Blocks()[1]->BlockId());
@@ -228,7 +232,8 @@ TEST(FullAttnManagerTest, CacheFullBlocksSkipsTailPage) {
     ASSERT_EQ(a.NumBlocks(), 2);
     mgr.CacheFullBlocks(a, std::vector<std::string>{k0});
 
-    PrefixMatch m = mgr.MatchPrefix(std::vector<std::string>{k0});
+    std::vector<std::string> keys{k0};
+    PrefixMatch m = mgr.MatchPrefix(keys, 1);
     EXPECT_EQ(m.num_hit_blocks, 1);
     EXPECT_TRUE(a.Blocks()[0]->IsCached());
     EXPECT_FALSE(a.Blocks()[1]->IsCached());
@@ -248,7 +253,8 @@ TEST(FullAttnManagerTest, CacheFullBlocksIsIdempotentAcrossCalls) {
 
     EXPECT_TRUE(a.Blocks()[0]->IsCached());
     EXPECT_TRUE(a.Blocks()[1]->IsCached());
-    PrefixMatch m = mgr.MatchPrefix(std::vector<std::string>{k0, k1});
+    std::vector<std::string> keys{k0, k1};
+    PrefixMatch m = mgr.MatchPrefix(keys, 2);
     EXPECT_EQ(m.num_hit_blocks, 2);
 }
 
@@ -276,7 +282,8 @@ TEST(FullAttnManagerTest, FreedCachedPageStaysPrefixReusable) {
     mgr.CacheFullBlocks(a, std::vector<std::string>{k0});
     mgr.Free(a);
 
-    PrefixMatch m = mgr.MatchPrefix(std::vector<std::string>{k0});
+    std::vector<std::string> keys{k0};
+    PrefixMatch m = mgr.MatchPrefix(keys, 1);
     EXPECT_EQ(m.num_hit_blocks, 1);
 }
 
@@ -288,7 +295,8 @@ TEST(FullAttnManagerTest, EndToEndTwoRequestsSharePrefix) {
 
     // Request A: cold.
     {
-        PrefixMatch m = mgr.MatchPrefix(std::vector<std::string>{k0, k1});
+        std::vector<std::string> keys{k0, k1};
+        PrefixMatch m = mgr.MatchPrefix(keys, 2);
         EXPECT_EQ(m.num_hit_blocks, 0);
         BlockTable a;
         mgr.ClaimHitBlocks(a, m);
@@ -299,7 +307,8 @@ TEST(FullAttnManagerTest, EndToEndTwoRequestsSharePrefix) {
 
     // Request B: shares the prefix.
     {
-        PrefixMatch m = mgr.MatchPrefix(std::vector<std::string>{k0, k1});
+        std::vector<std::string> keys{k0, k1};
+        PrefixMatch m = mgr.MatchPrefix(keys, 2);
         EXPECT_EQ(m.num_hit_blocks, 2);
         BlockTable b;
         mgr.ClaimHitBlocks(b, m);
@@ -322,8 +331,10 @@ TEST(FullAttnManagerTest, GroupIdIsolatesContent) {
     ASSERT_TRUE(mgr.Acquire(a, 4));
     mgr.CacheFullBlocks(a, std::vector<std::string>{g0});
 
-    EXPECT_EQ(mgr.MatchPrefix(std::vector<std::string>{g0}).num_hit_blocks, 1);
-    EXPECT_EQ(mgr.MatchPrefix(std::vector<std::string>{g1}).num_hit_blocks, 0);  // group 1 not cached
+    std::vector<std::string> keys_g0{g0};
+    std::vector<std::string> keys_g1{g1};
+    EXPECT_EQ(mgr.MatchPrefix(keys_g0, 1).num_hit_blocks, 1);
+    EXPECT_EQ(mgr.MatchPrefix(keys_g1, 1).num_hit_blocks, 0);  // group 1 not cached
 }
 
 // Claimed full pages carry tail_avail_ 0: the next Acquire must start a fresh
@@ -333,10 +344,11 @@ TEST(FullAttnManagerTest, ClaimThenAcquireStartsFreshPage) {
     FullAttnManager mgr(pool, 4);
     const std::string k0 = RealKey({1, 2, 3, 4}, 0);
     auto a = pool.AllocateBlocks(1);
-    pool.CacheFullBlocks(a.front(), k0);
+    pool.CacheFullBlock(a.front(), k0);
     pool.FreeBlocks(a);
 
-    PrefixMatch m = mgr.MatchPrefix(std::vector<std::string>{k0});
+    std::vector<std::string> keys{k0};
+    PrefixMatch m = mgr.MatchPrefix(keys, 1);
     BlockTable table;
     mgr.ClaimHitBlocks(table, m);
     ASSERT_EQ(table.NumBlocks(), 1);
@@ -388,10 +400,10 @@ TEST(FullAttnManagerTest, ChainedPriorPreventsSecondPageCollision) {
     ASSERT_TRUE(mgr.Acquire(a, 8));
     mgr.CacheFullBlocks(a, keys_a);
 
-    PrefixMatch miss = mgr.MatchPrefix(keys_b);
+    PrefixMatch miss = mgr.MatchPrefix(keys_b, static_cast<std::int32_t>(keys_b.size()));
     EXPECT_EQ(miss.num_hit_blocks, 0);
 
-    PrefixMatch hit = mgr.MatchPrefix(keys_a);
+    PrefixMatch hit = mgr.MatchPrefix(keys_a, static_cast<std::int32_t>(keys_a.size()));
     EXPECT_EQ(hit.num_hit_blocks, 2);
 }
 

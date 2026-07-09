@@ -308,7 +308,7 @@ _PKG_FLAT_PROBE = (
 class MHAPoolSlabLayoutTest(unittest.TestCase):
     """Layout consumer (kv_cache/mha.py _create_buffers): when the predicate
     activates, paired layers bind to the SAME slab tensors; otherwise the
-    legacy per-layer layout holds and the kvstore/PD guards never fire.
+    legacy per-layer layout holds and the PD guard never fires.
     Constructs a real (tiny, CPU) MHATokenToKVPool; skips without deps.
     Patch target is the PACKAGE paged_cache_spec probe (see above).
     """
@@ -399,13 +399,11 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
                 self.assertEqual(len({id(t) for t in pool.v_buffer}), 24)
                 self.assertTrue(pool.supports_hierarchical_kv_cache)
 
-    def test_guard_raises_on_kvstore_with_slab(self):
-        with self.assertRaisesRegex(
-            RuntimeError,
-            r"hybrid slab KV layout is incompatible with the kvstore"
-            r".*radix-built",
-        ):
-            self._pool(kvstore_enabled=True)
+    def test_kvstore_with_slab_allowed(self):
+        # Spec §6 revision: the flat L2 tier mirrors whole slabs byte-blind,
+        # so per-slab copies are group-safe and the guard no longer fires.
+        pool = self._pool(kvstore_enabled=True)
+        self.assertEqual(len({id(t) for t in pool.k_buffer}), 12)
 
     def test_guard_raises_on_pd_with_slab(self):
         with self.assertRaisesRegex(

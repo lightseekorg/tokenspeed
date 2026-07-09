@@ -41,6 +41,12 @@ _CACHE_EVENT_TYPES = {
     "WriteBackDoneEvent": Cache.WriteBackDoneEvent,
     "PrefetchDoneEvent": Cache.PrefetchDoneEvent,
 }
+# Emitted only by the flat host tier (FlatMemoryExecutor); the radix executors
+# never produce it, so radix behavior is unchanged. hasattr-guarded: the flat
+# tier requires a flat-built (post-C3) ext anyway, and an older radix ext must
+# keep importing this module.
+if hasattr(Cache, "LoadBackDoneEvent"):
+    _CACHE_EVENT_TYPES["LoadBackDoneEvent"] = Cache.LoadBackDoneEvent
 _TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 
 

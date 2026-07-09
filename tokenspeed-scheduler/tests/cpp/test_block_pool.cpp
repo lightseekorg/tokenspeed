@@ -104,7 +104,7 @@ TEST(BlockPoolTest, CachedFreeBlockSurvivesAndIsReusable) {
 
     auto blocks = pool.AllocateBlocks(1);
     CacheBlock* b = blocks.front();
-    pool.CacheFullBlocks(b, key);
+    pool.CacheFullBlock(b, key);
     EXPECT_TRUE(b->IsCached());
 
     pool.FreeBlocks({b});
@@ -132,7 +132,7 @@ TEST(BlockPoolTest, CachingDisabledNeverHits) {
 
     auto blocks = pool.AllocateBlocks(1);
     CacheBlock* b = blocks.front();
-    pool.CacheFullBlocks(b, key);   // no-op when caching is disabled
+    pool.CacheFullBlock(b, key);   // no-op when caching is disabled
     EXPECT_FALSE(b->IsCached());
     EXPECT_EQ(pool.GetCachedBlock(key), nullptr);  // lookups always miss
 }
@@ -144,7 +144,7 @@ TEST(BlockPoolTest, GroupIdDistinguishesSameContent) {
     ASSERT_NE(k0, k1);  // same content, different group -> different key
 
     auto a = pool.AllocateBlocks(1);
-    pool.CacheFullBlocks(a.front(), k0);
+    pool.CacheFullBlock(a.front(), k0);
     EXPECT_EQ(pool.GetCachedBlock(k0), a.front());
     EXPECT_EQ(pool.GetCachedBlock(k1), nullptr);  // group 1 not cached
 }
@@ -156,7 +156,7 @@ TEST(BlockPoolTest, EvictionDropsCachedContentWhenReused) {
 
     auto first = pool.AllocateBlocks(1);
     CacheBlock* b = first.front();
-    pool.CacheFullBlocks(b, key);
+    pool.CacheFullBlock(b, key);
     pool.FreeBlocks({b});                       // cached + free
     EXPECT_EQ(pool.GetCachedBlock(key), b);
 
@@ -181,6 +181,12 @@ TEST(BlockPoolTest, EvictionPrefersLeastRecentlyFreed) {
 
     auto next = pool.AllocateBlocks(1);
     EXPECT_EQ(next.front(), b0);
+}
+
+TEST(BlockPoolTest, AllocateZeroBlocksReturnsEmpty) {
+    BlockPool pool(4);
+    EXPECT_TRUE(pool.AllocateBlocks(0).empty());
+    EXPECT_EQ(pool.NumFreeBlocks(), 3);
 }
 
 }  // namespace

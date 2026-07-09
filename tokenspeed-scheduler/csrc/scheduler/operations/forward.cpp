@@ -89,9 +89,27 @@ static void MaybeFillFlatBlockTables(Op& op, Request* request, std::span<const s
 }  // namespace
 
 #if TOKENSPEED_FLAT_KVCACHE
-// One match at admission (vLLM V1 shape): num_common_blocks is the single source for the token math,
-// the gate charge and window.begin. Claiming in-flight pages is stream-ordering safe (forward_cache_ops.h).
-CoordinatorMatch Scheduler::matchFlatPrefixAtAdmission(Request* request) const {
+namespace {
+
+// Slide credit is registration-aware: with candidate collection on, blocks the op will register
+// get pinned and do not free (count_uncached=false path).
+std::int32_t FlatSlideCredit(const KvCacheCoordinator& coordinator, std::span<const BlockTable> tables,
+                             std::int32_t num_computed_tokens) {
+    std::int32_t total_freed = 0;
+    for (std::int32_t i = 0; i < coordinator.NumGroups(); ++i) {
+        total_freed += coordinator.GroupManager(i).BlocksReclaimableAt(
+            tables[static_cast<std::size_t>(i)], num_computed_tokens,
+            /*count_uncached=*/!coordinator.CollectingStoreCandidates());
+    }
+    return total_freed;
+}
+
+}  // namespace
+
+// One match, one hash pass at admission (vLLM V1 shape): the device match plus its host-tier
+// extension share the token math, the gate charge and window.begin. Claiming in-flight pages is
+// stream-ordering safe (forward_cache_ops.h).
+Scheduler::FlatAdmissionMatch Scheduler::matchFlatPrefixAtAdmission(Request* request) {
     if (config_.disable_prefix_cache) {
         return {};
     }
@@ -103,20 +121,33 @@ CoordinatorMatch Scheduler::matchFlatPrefixAtAdmission(Request* request) const {
         paged_tokens.resize(cap_pages);
     }
     const std::vector<std::string> flat_hashes = ComputePagedHashes(paged_tokens, "");
-    return coordinator_.MatchPrefix(flat_hashes);
+    FlatAdmissionMatch match;
+    if (flatStreamingSinkEnabled()) {
+        auto [device, host] = coordinator_.MatchPrefixWithHostExtension(flat_hashes, flat_host_pool_);
+        match.device = std::move(device);
+        match.host = std::move(host);
+        // The device hit is measured in tokens; the extension hash offsets are in scheduler
+        // pages (uniform P, same granularity the hashes were computed at).
+        const auto ext_begin = flat_hashes.begin() + match.device.num_common_tokens / config_.page_size;
+        match.ext_hashes.assign(ext_begin, ext_begin + match.host.num_extension_blocks);
+    } else {
+        match.device = coordinator_.MatchPrefix(flat_hashes);
+    }
+    return match;
 }
 
 // TODO(radix-removal): radix EnsureCapacityByEvict gates never bind on flat builds; the flatAdmit* gates own admission.
 //
 // Returns the decode-reserve pages to record when admitted (0 unless this chunk completes prefill); nullopt = defer.
 std::optional<std::int32_t> Scheduler::flatAdmitFirstChunk(Request* request, const CoordinatorMatch& hit,
-                                                           std::int32_t chunk_tokens,
+                                                           std::int32_t ext_real_pages, std::int32_t chunk_tokens,
                                                            std::int32_t decode_reserve_tokens) const {
     // Charge chunk + reserve in one query: unreserved, an exactly-filling prompt's own decode defers forever.
+    // ext_real_pages composes exactly: extension pages are FULL, so they leave tail_avail 0.
     const std::int32_t blocks_needed = coordinator_.BlocksNeededFor(chunk_tokens + decode_reserve_tokens);
-    // The claim consumes free-list blocks Acquire never sees; exact since gate and apply run back to back.
+    // Exact since gate and apply run back to back.
     const std::int32_t claim_blocks = coordinator_.BlocksConsumedByClaim(hit);
-    if (blocks_needed + claim_blocks > flatFreeBudget(request->Id())) {
+    if (blocks_needed + claim_blocks + ext_real_pages > flatFreeBudget(request->Id())) {
         return std::nullopt;
     }
     // Reserve need is computed on the post-prefill table shape now, never recomputed against drifted state.
@@ -127,15 +158,14 @@ std::optional<std::int32_t> Scheduler::flatAdmitFirstChunk(Request* request, con
 std::optional<std::int32_t> Scheduler::flatAdmitPrefillChunk(Request* request, std::int32_t chunk_tokens,
                                                              std::int32_t decode_reserve_tokens,
                                                              std::int32_t num_computed_tokens) const {
-    // Credit the pending slide (slide-before-acquire); exact because registering hashes never changes refs.
     const std::int32_t slide_credit =
-        coordinator_.BlocksFreedByAdvance(request->FlatBlockTablesRef(), num_computed_tokens);
+        FlatSlideCredit(coordinator_, request->FlatBlockTablesRef(), num_computed_tokens);
     const std::int32_t blocks_needed =
         coordinator_.BlocksNeededFor(request->FlatBlockTablesRef(), chunk_tokens + decode_reserve_tokens);
     if (blocks_needed > flatFreeBudget(request->Id()) + slide_credit) {
         return std::nullopt;
     }
-    // The pending slide cannot drift the reserve: AdvanceWindow punches front holes, BlocksNeededFor reads tail_avail.
+    // The pending slide cannot drift the reserve: ReclaimExpired punches front holes, BlocksNeededFor reads tail_avail.
     return decode_reserve_tokens > 0
                ? blocks_needed - coordinator_.BlocksNeededFor(request->FlatBlockTablesRef(), chunk_tokens)
                : 0;
@@ -148,7 +178,7 @@ bool Scheduler::flatAdmitDecode(Request* request) const {
                                                  ? request->TokenSize() - config_.decode_input_tokens
                                                  : request->PrefillSize();
     const std::int32_t slide_credit =
-        coordinator_.BlocksFreedByAdvance(request->FlatBlockTablesRef(), num_computed_tokens);
+        FlatSlideCredit(coordinator_, request->FlatBlockTablesRef(), num_computed_tokens);
     const std::int32_t blocks_needed = coordinator_.BlocksNeededFor(
         request->FlatBlockTablesRef(), request->GetReserveNumTokensInNextScheduleEvent());
     return blocks_needed <= flatFreeBudget(request->Id()) + slide_credit;
@@ -165,7 +195,10 @@ std::optional<std::size_t> Scheduler::flatStarvationDeadlockRisk(const std::vect
     }
     // Block 0 is the null placeholder, never allocated.
     const bool pool_pages_held = block_pool_.NumFreeBlocks() < block_pool_.TotalBlocks() - 1;
-    const bool nothing_in_flight = pending_forward_results_.empty() && cache_op_tracker_.empty();
+    // Both ledgers count: an in-flight D2H store OR H2D load (e.g. after an abort-during-load)
+    // still holds pool pages that its Done event will free.
+    const bool nothing_in_flight = pending_forward_results_.empty() && cache_op_tracker_.empty() &&
+                                   flat_store_ops_.Empty() && flat_load_ops_.empty();
     if (config_.role != Role::kFused || deferred == 0 || !pool_pages_held || !nothing_in_flight) {
         return std::nullopt;
     }
@@ -215,16 +248,19 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     }
 
 #if TOKENSPEED_FLAT_KVCACHE
-    CoordinatorMatch flat_hit = matchFlatPrefixAtAdmission(request);
+    FlatAdmissionMatch flat_match = matchFlatPrefixAtAdmission(request);
     // Overwrite the radix-sourced locals: the radix tree is never written on flat builds, so its match is empty.
-    const std::int32_t flat_hit_tokens = flat_hit.num_common_blocks * config_.page_size;
+    const std::int32_t flat_hit_tokens =
+        flat_match.device.num_common_tokens + flat_match.host.num_extension_blocks * config_.page_size;
     unscheduled = request->PrefillSize() - flat_hit_tokens;
     tokens_this_round = std::min(remaining, unscheduled);
 
     const bool completes_prefill = tokens_this_round == unscheduled;
     const std::int32_t flat_decode_reserve = completes_prefill ? decode_input_tokens : 0;
+    // One pin per real (non-hole) extension slot across all groups = the new device pages the load needs.
+    const std::int32_t flat_ext_real_pages = static_cast<std::int32_t>(flat_match.host.pinned.size());
     const std::optional<std::int32_t> flat_reserve_pages =
-        flatAdmitFirstChunk(request, flat_hit, tokens_this_round, flat_decode_reserve);
+        flatAdmitFirstChunk(request, flat_match.device, flat_ext_real_pages, tokens_this_round, flat_decode_reserve);
     if (!flat_reserve_pages) {
         return {};
     }
@@ -269,7 +305,6 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         flat_reserved_pages_[request->Id()] = *flat_reserve_pages;
     }
 #endif
-
     return fsm::SchedulePrefillFirstChunkEvent{
         tokens_this_round,
         decode_input_tokens,
@@ -285,7 +320,9 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         std::move(mamba_loadback_nodes),
 #if TOKENSPEED_FLAT_KVCACHE
         &coordinator_,
-        std::move(flat_hit),
+        std::move(flat_match.device),
+        std::move(flat_match.host),
+        std::move(flat_match.ext_hashes),
 #endif
     };
 }
@@ -551,9 +588,10 @@ std::optional<WriteBackOperation> Scheduler::newRetractOperation(Request* retrac
     return std::nullopt;
 }
 
+// By-reference so the first-chunk caller can harvest the transition's flat load pairs afterwards.
 template <typename Event>
     requires(std::same_as<Event, fsm::SchedulePrefillFirstChunkEvent> || std::same_as<Event, fsm::SchedulePrefillEvent>)
-static PrefillOperation applyPrefillEvent(Request* request, Event event,
+static PrefillOperation applyPrefillEvent(Request* request, Event& event,
                                           std::span<const std::string> flat_group_ids) {
     // begin/size are PAGE-space: the occupied_pages slice new this round (Python copies it into req_to_page).
     // A first-chunk prefix hit enters during the event, so begin stays 0 and size counts the hit rows too;
@@ -591,11 +629,31 @@ static PrefillOperation applyPrefillEvent(Request* request, Event event,
 }
 
 // TODO(radix-removal): the #if !TOKENSPEED_FLAT_KVCACHE publishing arms in these op-builders go with the radix path.
-PrefillOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::SchedulePrefillFirstChunkEvent event) {
+PrefillOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::SchedulePrefillFirstChunkEvent event,
+                                                    std::vector<LoadBackOperation>& loadback_ops) {
 #if !TOKENSPEED_FLAT_KVCACHE
     auto match = event.GetMatchResult();
 #endif
-    auto op = applyPrefillEvent(request, std::move(event), FlatGroupIds());
+    auto op = applyPrefillEvent(request, event, FlatGroupIds());
+#if TOKENSPEED_FLAT_KVCACHE
+    // Host-loaded pages ride the same LoadBackOperation channel as radix loadbacks.
+    std::vector<std::pair<std::int32_t, CacheBlock*>> load_pairs = event.TakeFlatLoadPairs();
+    if (!load_pairs.empty()) {
+        std::vector<TransferPair> transfers;
+        transfers.reserve(load_pairs.size());
+        FlatLoadTicket ticket{.host_pins = event.TakeFlatHostPins(), .device_blocks = {}};
+        ticket.device_blocks.reserve(load_pairs.size());
+        for (const auto& [host_page, device_block] : load_pairs) {
+            transfers.push_back(TransferPair{CacheKind::kKV, host_page, device_block->BlockId()});
+            ticket.device_blocks.push_back(BlockRef::Share(block_pool_, device_block));
+        }
+        const cache_op_id op_id = kv_prefix_cache_.AllocateCacheOpId();
+        flat_load_ops_.emplace(op_id, std::move(ticket));
+        loadback_ops.push_back(LoadBackOperation{op_id, std::move(transfers)});
+    }
+#else
+    (void)loadback_ops;
+#endif
 #if !TOKENSPEED_FLAT_KVCACHE
     if (hybrid_prefix_cache_ && hybrid_prefix_cache_->HasMambaAdjunct()) {
         op.mamba_cow_src_idx = match.mamba_cow_src_index;
@@ -613,7 +671,7 @@ PrefillOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Sched
 }
 
 PrefillOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::SchedulePrefillEvent event) {
-    auto op = applyPrefillEvent(request, std::move(event), FlatGroupIds());
+    auto op = applyPrefillEvent(request, event, FlatGroupIds());
 #if !TOKENSPEED_FLAT_KVCACHE
     if (hybrid_prefix_cache_) {
         hybrid_prefix_cache_->CommitChunk(op.request_id, const_cast<TreeNode*>(request->GetDeviceNode()));
@@ -794,7 +852,7 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
                                                     config_.disable_l2_cache, simulated_free)) {
                 std::vector<TreeNode*> loadback_diff = ev->GetLoadbackDiff();
                 std::vector<TreeNode*> mamba_loadback_nodes = ev->GetMambaLoadbackNodes();
-                push_op(applyEventAndGenerateOp(request, std::move(*ev)), true);
+                push_op(applyEventAndGenerateOp(request, std::move(*ev), loadback_ops), true);
                 note_result_owed(request);
                 // will be empty when disable_l2_cache
                 if (!loadback_diff.empty() || !mamba_loadback_nodes.empty()) {
