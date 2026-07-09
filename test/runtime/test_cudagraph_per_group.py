@@ -135,6 +135,28 @@ class CacheGroupIdsTest(_TorchCase):
         self.assertEqual(out, ())
 
 
+class TreeMaskGraphRoutingTest(_TorchCase):
+    """Tree-mask metadata must bypass graphs captured for causal decode."""
+
+    def setUp(self):
+        super().setUp()
+        from tokenspeed.runtime.execution.cuda_graph_wrapper import (
+            CudaGraphWrapper,
+        )
+
+        self.has_tree_mask = CudaGraphWrapper._has_custom_tree_mask
+
+    def test_detects_only_mask_bearing_spec_info(self):
+        torch = self.torch
+        self.assertFalse(self.has_tree_mask(None))
+        self.assertFalse(self.has_tree_mask(SimpleNamespace(custom_mask=None)))
+        self.assertTrue(
+            self.has_tree_mask(
+                SimpleNamespace(custom_mask=torch.ones(1, dtype=torch.int8))
+            )
+        )
+
+
 class DraftCacheGroupIdsTest(_TorchCase):
     """DFLASH owns an independent draft page table; EAGLE-style drafts use
     target cache-group tables at matching page ids."""

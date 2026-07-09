@@ -1150,6 +1150,7 @@ class CudaGraphWrapper:
         extend_seq_lens_cpu: torch.Tensor | None = None,
         positions: torch.Tensor | None = None,
         out_cache_loc: torch.Tensor | None = None,
+        spec_info=None,
         block_tables: dict | None = None,
         block_table_base_offsets: dict | None = None,
         cache_metadata=None,
@@ -1294,6 +1295,7 @@ class CudaGraphWrapper:
                 global_num_tokens=ctx.global_num_tokens,
                 all_decode_or_idle=ctx.all_decode_or_idle,
                 capture_hidden_mode=ctx.capture_hidden_mode,
+                spec_info=spec_info,
                 **metadata_num_tokens,
                 block_tables=(
                     block_tables if self._any_backend_uses_cache_groups() else None

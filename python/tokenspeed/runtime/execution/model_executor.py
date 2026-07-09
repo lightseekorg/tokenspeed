@@ -1500,6 +1500,7 @@ class ModelExecutor:
                         forward_batch=(
                             forward_op if cache_metadata is not None else None
                         ),
+                        spec_info=getattr(forward_op, "spec_info", None),
                     )
                     if timing_enabled:
                         forward_step_ms = (

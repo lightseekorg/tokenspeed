@@ -3216,9 +3216,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         # offsets must not drive an out-of-bounds mask read.
                         within_kv = cute.elem_less(kcol, common_params.K)
                         kcol_in = (
-                            kcol
-                            if within_kv
-                            else cutlass.Int32(common_params.K - 1)
+                            kcol if within_kv else cutlass.Int32(common_params.K - 1)
                         )
                         cm_idx = (
                             common_params.cmask_off[common_params.blk_coord[2]]
@@ -3228,10 +3226,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         if within_kv:
                             if cute.elem_less(cutlass.Int32(-1), cm_idx):
                                 if cute.elem_less(cm_idx, common_params.cmask_len):
-                                    cm_keep = (
-                                        cutlass.Int32(common_params.cmask[cm_idx])
-                                        != cutlass.Int32(0)
-                                    )
+                                    cm_keep = cutlass.Int32(
+                                        common_params.cmask[cm_idx]
+                                    ) != cutlass.Int32(0)
                                     tTR_rAcc[i] = (
                                         tTR_rAcc[i]
                                         if cm_keep
@@ -3256,9 +3253,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                                 q_tok = common_params.blk_coord[1]
                             if cutlass.const_expr(self.cp_world == 1):
                                 # Non-DCP: causal bound is the full local context length.
-                                k_bound = (
-                                    common_params.K - (self.seq_len_q - 1) + q_tok
-                                )
+                                k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
                             else:
                                 # DCP: local keys are a strided slice of global positions.
                                 k_bound = (
@@ -3326,9 +3321,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         # offsets must not drive an out-of-bounds mask read.
                         within_kv = cute.elem_less(kcol, common_params.K)
                         kcol_in = (
-                            kcol
-                            if within_kv
-                            else cutlass.Int32(common_params.K - 1)
+                            kcol if within_kv else cutlass.Int32(common_params.K - 1)
                         )
                         cm_idx = (
                             common_params.cmask_off[common_params.blk_coord[2]]
@@ -3338,10 +3331,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         if within_kv:
                             if cute.elem_less(cutlass.Int32(-1), cm_idx):
                                 if cute.elem_less(cm_idx, common_params.cmask_len):
-                                    cm_keep = (
-                                        cutlass.Int32(common_params.cmask[cm_idx])
-                                        != cutlass.Int32(0)
-                                    )
+                                    cm_keep = cutlass.Int32(
+                                        common_params.cmask[cm_idx]
+                                    ) != cutlass.Int32(0)
                                     tTR_rAcc[i] = (
                                         tTR_rAcc[i]
                                         if cm_keep
@@ -3371,9 +3363,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                             # Int32 __rsub__ quirks when self.seq_len_q==1.
                             if cutlass.const_expr(self.cp_world == 1):
                                 # Non-DCP: causal bound is the full local context length.
-                                k_bound = (
-                                    common_params.K - (self.seq_len_q - 1) + q_tok
-                                )
+                                k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
                             else:
                                 # DCP: local keys are a strided slice of global positions.
                                 k_bound = (

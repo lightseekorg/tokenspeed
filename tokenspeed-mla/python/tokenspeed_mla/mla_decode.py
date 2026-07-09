@@ -49,7 +49,6 @@ from tokenspeed_mla.utils import (
     torch_to_cutlass_dtype,
 )
 
-
 _DUMMY_TREE_MASK_CACHE: dict[tuple[str, int], tuple[torch.Tensor, torch.Tensor]] = {}
 _ZERO_CMASK_OFF_CACHE: dict[str, torch.Tensor] = {}
 
@@ -554,7 +553,9 @@ def tokenspeed_mla_decode(
     tree_mask_mode = custom_mask is not None
     if tree_mask_mode:
         if q_dtype != torch.float8_e4m3fn:
-            raise ValueError("custom_mask is currently supported only for FP8 MLA decode")
+            raise ValueError(
+                "custom_mask is currently supported only for FP8 MLA decode"
+            )
         if custom_mask.device != query.device:
             raise ValueError("custom_mask must be on the same device as query")
         if custom_mask.dtype not in (torch.bool, torch.int8):
@@ -570,7 +571,9 @@ def tokenspeed_mla_decode(
             if cmask_off.device != query.device:
                 raise ValueError("cmask_off must be on the same device as query")
             if cmask_off.dtype != torch.int32:
-                raise ValueError(f"cmask_off must be torch.int32, got {cmask_off.dtype}")
+                raise ValueError(
+                    f"cmask_off must be torch.int32, got {cmask_off.dtype}"
+                )
             if not cmask_off.is_contiguous():
                 raise ValueError("cmask_off must be contiguous")
             if cmask_off.numel() != B:
