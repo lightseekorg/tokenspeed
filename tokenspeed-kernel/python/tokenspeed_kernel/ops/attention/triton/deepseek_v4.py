@@ -24,6 +24,8 @@
 
 from __future__ import annotations
 
+import functools
+
 import torch
 from tokenspeed_kernel._triton import tl, triton
 
@@ -402,6 +404,28 @@ def _deepseek_v4_fused_sparse_compress_cache_kernel(
     )
 
 
+@functools.lru_cache(maxsize=None)
+def _wide_compress_launch_supported(device: "torch.device | int | None") -> bool:
+    """Whether the 16-warp sparse-compress launch is validated for a GPU.
+
+    Args:
+        device: Device the kernel launches on (the state cache's device);
+            results are cached per device so mixed-architecture processes
+            pick the right launch width per GPU.
+
+    Returns:
+        True only on NVIDIA sm100 (B200), where the wide launch was
+        microbenched and parity-tested. Other targets, including ROCm
+        devices reached through the ``torch.cuda`` API, keep 4 warps.
+    """
+    try:
+        if not torch.cuda.is_available() or torch.version.hip is not None:
+            return False
+        return torch.cuda.get_device_capability(device) == (10, 0)
+    except Exception:
+        return False
+
+
 def deepseek_v4_fused_sparse_compress_cache_insert(
     *,
     state_cache: torch.Tensor,
@@ -461,7 +485,18 @@ def deepseek_v4_fused_sparse_compress_cache_insert(
         TOKEN_STRIDE=DEEPSEEK_V4_SWA_TOKEN_STRIDE,
         SCALE_DIM=DEEPSEEK_V4_SWA_SCALE_DIM,
         KV_BLOCK_STRIDE=kv_cache_2d.stride(0),
-        num_warps=4,
+        # Compress-boundary tokens reduce a (1+overlap)*ratio x HEAD window
+        # inside one CTA: 128 rows on the production HCA path (overlap=False);
+        # overlapping configurations reduce 256. At ratio>=128 four warps
+        # leave that reduction 3-4x slower than 16 (validated on NVIDIA sm100
+        # only; other targets keep 4). Small ratios keep 4 warps, where 16 is
+        # slightly slower.
+        num_warps=(
+            16
+            if compress_ratio >= 128
+            and _wide_compress_launch_supported(state_cache.device)
+            else 4
+        ),
     )
 
 
