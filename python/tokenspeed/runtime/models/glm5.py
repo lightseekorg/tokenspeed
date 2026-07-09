@@ -29,7 +29,6 @@ from typing import Any
 import torch
 from tokenspeed_kernel.ops.attention import (
     dsa_decode_topk,
-    dsa_plan,
     dsa_prefill_topk,
 )
 from torch import nn
@@ -38,6 +37,11 @@ from transformers import PretrainedConfig
 from tokenspeed.runtime.configs.utils import get_rope_theta
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_manager import CommManager
+from tokenspeed.runtime.execution.breakable_cuda_graph import (
+    break_point,
+    current_forward_ctx,
+    slice_to_real_tokens,
+)
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, LayerNorm, RMSNorm
@@ -497,38 +501,6 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         retired.append(buffer)
 
     @staticmethod
-    def _expand_decode_seq_lens_per_token(
-        seq_lens: torch.Tensor,
-        q_len_per_req: int,
-        *,
-        draft_catchup: bool = False,
-    ) -> torch.Tensor:
-        """Per-token visible KV lengths for multi-query (spec-verify) decode.
-
-        ``seq_lens`` holds the FULL per-request context: during target verify
-        the draft tokens are already written to the KV cache and counted, so
-        token ``j`` of a request may only see
-        ``seq_lens - q_len_per_req + j + 1`` positions. With
-        ``q_len_per_req == 1`` this is ``seq_lens`` itself (plain decode).
-
-        The draft model's first catch-up step is the opposite: it writes its KV
-        one token at a time after target verify, so visible lengths advance from
-        ``seq_lens`` through ``seq_lens + q_len_per_req - 1``.
-        """
-        if q_len_per_req == 1:
-            return seq_lens
-        if draft_catchup:
-            offsets = torch.arange(
-                q_len_per_req, device=seq_lens.device, dtype=seq_lens.dtype
-            )
-        else:
-            offsets = torch.arange(
-                1 - q_len_per_req, 1, device=seq_lens.device, dtype=seq_lens.dtype
-            )
-        # Padded graph rows can be shorter than q_len; real rows are unaffected.
-        return (seq_lens.view(-1, 1) + offsets).clamp_min_(0).reshape(-1)
-
-    @staticmethod
     def _check_decode_q_len_per_req(q_len_per_req: int) -> None:
         # Multi-step MTP verify runs num_draft_tokens query rows per request.
         # DeepGEMM paged MQA logits (our fork) and FlashMLA sparse decode are
@@ -566,28 +538,12 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         block_tables = metadata.block_kv_indices[
             num_extends : num_extends + decode_window.num_reqs
         ]
-        draft_catchup = bool(
-            getattr(ctx.attn_backend, "is_draft", False)
-            and ctx.forward_mode is not None
-            and ctx.forward_mode.is_decode()
-            and decode_window.q_len_per_req > 1
-        )
-        seq_lens_per_token = self._expand_decode_seq_lens_per_token(
-            seq_lens,
-            decode_window.q_len_per_req,
-            draft_catchup=draft_catchup,
-        )
-        block_tables_per_token = (
-            block_tables
-            if decode_window.q_len_per_req == 1
-            else block_tables.repeat_interleave(decode_window.q_len_per_req, dim=0)
-        )
         topk = self.index_topk
         return self._compute_decode_topk_indices_portable(
             indexer_output=indexer_output,
             ctx=ctx,
-            seq_lens_per_token=seq_lens_per_token,
-            block_tables_per_token=block_tables_per_token,
+            seq_lens=seq_lens,
+            block_tables=block_tables,
             q_len_per_req=decode_window.q_len_per_req,
             decode_start=decode_window.start,
             num_tokens=num_tokens,
@@ -595,59 +551,23 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             topk=topk,
         )
 
-    def _get_decode_topk_plan(
-        self,
-        *,
-        ctx: ForwardContext,
-        seq_lens_per_token: torch.Tensor,
-        q_len_per_req: int,
-    ) -> object | None:
-        decode_metadata = getattr(ctx.attn_backend, "forward_decode_metadata", None)
-        if decode_metadata is None:
-            return None
-        q_len_per_req = int(q_len_per_req)
-        plan_shape = (
-            int(seq_lens_per_token.numel()) // q_len_per_req,
-            q_len_per_req,
-        )
-        plan = getattr(decode_metadata, "_dsa_plan", None)
-        if (
-            plan is None
-            or getattr(decode_metadata, "_dsa_plan_q_len", None) != q_len_per_req
-            or getattr(decode_metadata, "_dsa_plan_shape", None) != plan_shape
-        ):
-            plan = dsa_plan(
-                seq_lens=seq_lens_per_token.to(torch.int32).contiguous(),
-                page_size=ctx.token_to_kv_pool.page_size,
-                q_len_per_req=q_len_per_req,
-            )
-            if plan is not None:
-                setattr(decode_metadata, "_dsa_plan", plan)
-                setattr(decode_metadata, "_dsa_plan_q_len", q_len_per_req)
-                setattr(decode_metadata, "_dsa_plan_shape", plan_shape)
-        return plan
-
     def _compute_decode_topk_indices_portable(
         self,
         *,
         indexer_output: GlmDsaIndexerOutput,
         ctx: ForwardContext,
-        seq_lens_per_token: torch.Tensor,
-        block_tables_per_token: torch.Tensor,
+        seq_lens: torch.Tensor,
+        block_tables: torch.Tensor,
         q_len_per_req: int,
         decode_start: int,
         num_tokens: int,
         num_decode_tokens: int,
         topk: int,
     ) -> GlmDsaDecodeTopK:
-        q = indexer_output.query[
+        q = indexer_output.query[decode_start : decode_start + num_decode_tokens]
+        weights = indexer_output.weights[
             decode_start : decode_start + num_decode_tokens
-        ].contiguous()
-        weights = (
-            indexer_output.weights[decode_start : decode_start + num_decode_tokens]
-            .float()
-            .contiguous()
-        )
+        ]
         index_k_cache = ctx.token_to_kv_pool.get_index_k_buffer(self.attn_mqa.layer_id)
         if index_k_cache is None:
             raise RuntimeError("GLM DSA top-k requires an index-K cache.")
@@ -662,22 +582,25 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         topk_slice = topk_indices[decode_start : decode_start + num_decode_tokens]
         topk_lens = self._get_decode_topk_lens_workspace(num_tokens, q.device)
         topk_lens_slice = topk_lens[decode_start : decode_start + num_decode_tokens]
-        plan = self._get_decode_topk_plan(
-            ctx=ctx,
-            seq_lens_per_token=seq_lens_per_token,
-            q_len_per_req=q_len_per_req,
+
+        metadata = ctx.attn_backend.forward_decode_metadata
+        seq_lens_2d = (
+            metadata._dsa_seq_lens_2d[ctx.num_extends :]
+            if q_len_per_req > 1
+            else seq_lens.unsqueeze(1)
         )
         dsa_decode_topk(
             q,
             weights,
-            seq_lens_per_token,
-            block_tables_per_token,
+            seq_lens,
+            block_tables,
             page_size=ctx.token_to_kv_pool.page_size,
             topk=topk,
             softmax_scale=self.indexer.softmax_scale,
             q_len_per_req=q_len_per_req,
             index_k_cache=index_k_cache,
-            plan=plan,
+            seq_lens_2d=seq_lens_2d,
+            plan=metadata._dsa_plan,
             out=topk_slice,
             lens_out=topk_lens_slice,
         )
@@ -805,6 +728,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             kv_workspace_slots=kv_workspace_slots,
         )
 
+    @break_point
     def forward(
         self,
         positions: torch.Tensor,
@@ -814,6 +738,22 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         comm_manager: CommManager,
         block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """GLM-5 DSA attention, one COARSE breakable-graph break point.
+
+        Like DeepSeek-V4 it does paged-cache writes, a data-dependent indexer
+        -> top-k stage and the FlashMLA sparse kernel (plus pre-attn
+        collectives), none capturable. Under a prefill-graph capture the whole
+        attention runs eager (reading the live ``ctx``) while the layer's
+        norms + MoE stay graphed; direct call otherwise (see ``break_point``).
+        Padded token-shaped inputs are sliced to the real count the live
+        metadata describes -- DSA and the decode-window split (which derives
+        ``decode_start`` from the total token count) must not see padded rows,
+        or decode rows get sliced out of the padded tail. Mirrors the
+        DeepSeek-V4 DSA break.
+        """
+        # Empty (idle / DP-idle) batch: explicit skip, like the sibling MLP/MoE forwards.
+        if hidden_states.shape[0] == 0:
+            return hidden_states
         qkv = self.fused_qkv_a_proj_with_mqa(
             hidden_states,
             block_scale,
@@ -828,6 +768,17 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         if qkv.shape[-1] != _qkv_width:
             qkv = qkv[..., :_qkv_width]
         qkv = comm_manager.pre_attn_comm(qkv, ctx)
+        # Slice only under a breakable capture/replay (see the DeepSeek-V4 break):
+        # eager forwards (incl. MTP draft steps) are never padded. Sliced AFTER
+        # the pre-attn comm: at replay ``_padded_to`` pins ``global_num_tokens``
+        # to the padded bucket, so the comm must see padded-length rows; only
+        # the DSA stack below needs exactly the real rows.
+        _metadata = getattr(ctx.attn_backend, "forward_metadata", None)
+        _token_to_req = getattr(_metadata, "token_to_req_indices", None)
+        if current_forward_ctx() is not None and _token_to_req is not None:
+            positions, qkv, out_cache_loc = slice_to_real_tokens(
+                _token_to_req.numel(), positions, qkv, out_cache_loc
+            )
         q_a, latent_cache = qkv.split(
             [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
             dim=-1,

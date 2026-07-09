@@ -35,6 +35,9 @@ from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
     v4_compressed_kv_group_id,
 )
 from tokenspeed.runtime.configs.model_config import AttentionArch
+from tokenspeed.runtime.configs.paged_cache_spec import (
+    compute_max_logical_pages_for_capture,
+)
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.deepseek_v4.metadata import (
@@ -347,7 +350,13 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 )
             return torch.ones(bs, dtype=torch.int32, device=seq_lens.device)
         if forward_mode is not None and forward_mode.is_mixed():
-            lens = torch.ones(bs, dtype=torch.int32, device=seq_lens.device)
+            verify_width = max(1, int(self.speculative_num_draft_tokens))
+            lens = torch.full(
+                (bs,),
+                verify_width,
+                dtype=torch.int32,
+                device=seq_lens.device,
+            )
             num_prefill_reqs = max(0, min(int(num_extends), bs))
             if num_prefill_reqs == 0:
                 return lens
@@ -391,7 +400,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         if forward_mode is not None and forward_mode.is_decode_or_idle():
             return torch.ones(bs, dtype=torch.int32)
         if forward_mode is not None and forward_mode.is_mixed():
-            lens = torch.ones(bs, dtype=torch.int32)
+            verify_width = max(1, int(self.speculative_num_draft_tokens))
+            lens = torch.full((bs,), verify_width, dtype=torch.int32)
             num_prefill_reqs = max(0, min(int(num_extends), bs))
             if num_prefill_reqs == 0:
                 return lens
@@ -653,6 +663,21 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         )
         req_ids = torch.arange(bs, device=device, dtype=torch.int32)
         token_to_req = torch.repeat_interleave(req_ids, query_lens.clamp_min(0))
+        if (
+            forward_mode is not None
+            and forward_mode.is_mixed()
+            and num_tokens_arg is not None
+        ):
+            # numel() reads tensor shape metadata only. Reducing query_lens and
+            # calling .item() here would synchronize its CUDA stream on every
+            # eager mixed batch.
+            metadata_tokens = token_to_req.numel()
+            if metadata_tokens != num_tokens:
+                raise RuntimeError(
+                    "DeepSeek V4 mixed metadata token count mismatch: "
+                    f"query_lens describe {metadata_tokens} tokens, packed input has "
+                    f"{num_tokens}"
+                )
         num_prefill_tokens = (
             int(query_lens[:num_prefill_reqs].sum().item()) if num_prefill_reqs else 0
         )
@@ -706,7 +731,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                     self.forward_prefill_metadata,
                     seq_lens.clone(),
                 )
-        elif forward_mode == ForwardMode.EXTEND:
+        elif forward_mode is not None and forward_mode.is_extend_or_mixed():
             self.forward_prefill_metadata = self.forward_metadata
         self._decode_tile_metadata = {}
 
@@ -1087,7 +1112,17 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         topk_indices: torch.Tensor | None,
     ) -> torch.Tensor:
         metadata = self.forward_metadata
-        if metadata is None:
+        if (
+            metadata is None
+            or metadata.forward_mode is None
+            or not metadata.forward_mode.is_mixed()
+        ):
+            metadata = self.forward_prefill_metadata or metadata
+        if (
+            metadata is None
+            or metadata.forward_mode is None
+            or not metadata.forward_mode.is_mixed()
+        ):
             raise RuntimeError("DeepSeek V4 mixed attention requires forward metadata")
 
         num_prefill_reqs = metadata.num_prefill_reqs
@@ -1574,6 +1609,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         seq_lens_buf: torch.Tensor | None = None,
         paged_cache_group_specs=(),
         max_tokens_per_req: int = 1,
+        overlap_schedule_depth: int = 0,
     ):
         del seq_lens_buf
         self._decode_tile_metadata = {}
@@ -1636,23 +1672,14 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self._cuda_graph_paged_cache_block_tables = {}
         self._cuda_graph_paged_cache_base_offsets = {}
         for spec in tuple(paged_cache_group_specs or ()):
-            raw_per_page = max(
-                1,
-                int(spec.rows_per_page) * int(spec.entry_stride_tokens),
-            )
             gid = str(spec.group_id)
             sliding = str(getattr(spec, "retention", "")) == "sliding_window"
-            if sliding:
-                window = int(getattr(spec, "sliding_window_tokens", 0) or 0)
-                live_tokens = max(1, window - 1 + max(1, int(max_tokens_per_req)))
-                if self.context_len > 0:
-                    live_tokens = min(live_tokens, self.context_len)
-                max_pages = max(1, (live_tokens + raw_per_page - 1) // raw_per_page + 1)
-            else:
-                max_pages = max(
-                    1,
-                    (self.context_len + raw_per_page - 1) // raw_per_page,
-                )
+            max_pages = compute_max_logical_pages_for_capture(
+                spec,
+                max_context_len=self.context_len,
+                max_tokens_per_req=max_tokens_per_req,
+                overlap_schedule_depth=overlap_schedule_depth,
+            )
             self._cuda_graph_paged_cache_block_tables[gid] = torch.zeros(
                 (max_bs, max_pages),
                 dtype=torch.int32,

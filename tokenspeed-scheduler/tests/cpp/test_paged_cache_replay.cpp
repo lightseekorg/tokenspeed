@@ -16,11 +16,14 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <variant>
 #include <vector>
@@ -124,6 +127,116 @@ protected:
     }
 };
 
+class PagedCacheOverlapSchedulerTest
+    : public SchedulerTestSuite,
+      public ::testing::WithParamInterface<std::tuple<std::int32_t, std::int32_t, std::int32_t>> {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = SchedulerTestSuite::MakeConfig();
+        cfg.page_size = 64;
+        cfg.device_allocator.total_pages = 256;
+        cfg.host_allocator.total_pages = 256;
+        cfg.max_scheduled_tokens = 256;
+        cfg.max_batch_size = 4;
+        cfg.decode_input_tokens = std::get<0>(GetParam());
+        cfg.overlap_schedule_depth = std::get<2>(GetParam());
+        cfg.disable_l2_cache = true;
+
+        PagedCacheGroupConfig history{};
+        history.group_id = "overlap.history";
+        history.rows_per_page = 1;
+        history.entry_stride_tokens = 1;
+        history.total_pages = 256;
+        history.retention = PagedCacheGroupConfig::Retention::FullHistory;
+        history.family = PagedCacheGroupFamily::History;
+        cfg.paged_cache_groups.push_back(history);
+
+        PagedCacheGroupConfig state{};
+        state.group_id = "overlap.state";
+        state.rows_per_page = 1;
+        state.entry_stride_tokens = 1;
+        state.total_pages = 64;
+        state.retention = PagedCacheGroupConfig::Retention::SlidingWindow;
+        state.sliding_window_tokens = 8;
+        state.family = PagedCacheGroupFamily::State;
+        cfg.paged_cache_groups.push_back(state);
+        return cfg;
+    }
+
+    static const FlatForwardOperation* GetForwardOp(const ExecutionPlan& plan) {
+        for (const auto& op : plan.Operations()) {
+            if (auto* f = std::get_if<FlatForwardOperation>(&op)) return f;
+        }
+        return nullptr;
+    }
+};
+
+class PagedCacheOverlapRetractTest
+    : public SchedulerTestSuite,
+      public ::testing::WithParamInterface<std::tuple<std::int32_t, std::int32_t, bool>> {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = SchedulerTestSuite::MakeConfig();
+        cfg.page_size = 2;
+        cfg.device_allocator.total_pages = 10;
+        cfg.host_allocator.total_pages = 64;
+        cfg.max_scheduled_tokens = 64;
+        cfg.max_batch_size = 4;
+        cfg.decode_input_tokens = 4;
+        cfg.overlap_schedule_depth = std::get<0>(GetParam());
+        cfg.enable_l3_storage = false;
+
+        PagedCacheGroupConfig history{};
+        history.group_id = "retract.history";
+        history.rows_per_page = 2;
+        history.entry_stride_tokens = 1;
+        history.total_pages = 128;
+        history.retention = PagedCacheGroupConfig::Retention::FullHistory;
+        history.family = PagedCacheGroupFamily::History;
+        cfg.paged_cache_groups.push_back(history);
+
+        PagedCacheGroupConfig state{};
+        state.group_id = "retract.state";
+        state.rows_per_page = 1;
+        state.entry_stride_tokens = 1;
+        state.total_pages = 64;
+        state.retention = PagedCacheGroupConfig::Retention::SlidingWindow;
+        state.sliding_window_tokens = 8;
+        state.family = PagedCacheGroupFamily::State;
+        cfg.paged_cache_groups.push_back(state);
+
+        PrefixCacheAdjunctSpec adjunct{};
+        adjunct.required_groups = {"retract.history"};
+        cfg.prefix_cache_adjunct = adjunct;
+        return cfg;
+    }
+
+    void SendReserveNumTokens(std::int32_t value) {
+        ExecutionEvent event;
+        event.With(ForwardEvent{forward::UpdateReserveNumTokens{
+            .request_id = "r",
+            .reserve_num_tokens_in_next_schedule_event = value,
+        }});
+        scheduler_->Advance(std::move(event));
+    }
+
+    static const FlatForwardOperation* GetForwardOp(const ExecutionPlan& plan) {
+        for (const auto& op : plan.Operations()) {
+            if (auto* f = std::get_if<FlatForwardOperation>(&op)) return f;
+        }
+        return nullptr;
+    }
+
+    static const FlatWriteBackOperation* GetWriteBack(const ExecutionPlan& plan) {
+        for (const auto& op : plan.Operations()) {
+            if (auto* cache_op = std::get_if<CacheOperation>(&op)) {
+                if (auto* writeback = std::get_if<FlatWriteBackOperation>(cache_op)) return writeback;
+            }
+        }
+        return nullptr;
+    }
+};
+
 class PagedCacheTerminalContinuationTest : public ::testing::Test {
 protected:
     static constexpr std::int32_t kPageSize = 64;
@@ -147,9 +260,11 @@ protected:
             kRequiredStateGroup, kRequiredStateRows, /*stride=*/1, PagedCacheGroupConfig::Retention::SlidingWindow,
             kRequiredStateWindow, PagedCacheGroupFamily::State,
             /*total_pages=*/128));
+        // Page 0 is reserved; the longest borrower/HostRef chain holds eight
+        // transport-only window pages concurrently.
         auto window_owner = std::make_unique<PagedCacheGroupAllocator>(MakeGroup(
             kWindowStateGroup, /*rows_per_page=*/64, /*stride=*/1, PagedCacheGroupConfig::Retention::SlidingWindow,
-            kWindowStateTokens, PagedCacheGroupFamily::State, /*total_pages=*/6));
+            kWindowStateTokens, PagedCacheGroupFamily::State, /*total_pages=*/9));
 
         hybrid_ = std::make_unique<HybridPrefixCache>(*kv_cache_, /*mamba=*/nullptr,
                                                       /*mamba_chunk_size=*/0);
@@ -277,6 +392,144 @@ TEST_F(PagedCacheTerminalContinuationTest, ExactTerminalHitUsesContinuationState
     EXPECT_EQ(second_match.paged_cache.per_group_page_ids.at(kRequiredStateGroup).size(), 2u);
 }
 
+TEST_F(PagedCacheTerminalContinuationTest, SnapshotCursorStopsAtCheckpointBeforeReservedTail) {
+    constexpr std::int32_t kCheckpoint = 256;
+    constexpr std::int32_t kVerifyWidth = 4;
+    TreeNode* terminal = InsertDeviceTokens(kCheckpoint);
+    ASSERT_NE(terminal, nullptr);
+
+    hybrid_->AcquireForRequest("r", /*first_raw_position_of_op=*/0,
+                               /*target_raw_tokens_exclusive=*/kCheckpoint + 2 * kVerifyWidth);
+    hybrid_->CommitChunk("r", terminal);
+
+    ASSERT_TRUE(terminal->HasPagedCacheSnapshot());
+    const auto* snapshot = terminal->GetPagedCacheSnapshot();
+    ASSERT_NE(snapshot, nullptr);
+    EXPECT_EQ(snapshot->prefix_len_tokens, kCheckpoint);
+    ASSERT_TRUE(snapshot->continuation_state_complete);
+    for (const auto& [group_id, group] : snapshot->groups) {
+        EXPECT_EQ(group.raw_token_cursor, kCheckpoint) << "group=" << group_id;
+    }
+
+    // The request still owns the physical lookahead page, but the snapshot
+    // advertises only the accepted checkpoint.
+    EXPECT_EQ(hybrid_->GetRequestPagedCachePageIds("r", kHistoryGroup).size(), 5u);
+}
+
+TEST_F(PagedCacheTerminalContinuationTest, RewindRejectsInvalidProtectedTail) {
+    EXPECT_THROW(hybrid_->RewindRequest("missing", /*accepted_raw_tokens=*/0,
+                                        /*protected_tail_tokens=*/-1),
+                 std::invalid_argument);
+    EXPECT_THROW(hybrid_->RewindRequest("missing", std::numeric_limits<std::int32_t>::max(),
+                                        /*protected_tail_tokens=*/1),
+                 std::overflow_error);
+}
+
+TEST_F(PagedCacheTerminalContinuationTest, TableBorrowPinsStateButHostRefDoesNot) {
+    TreeNode* n256 = InsertDeviceTokens(256);
+    ASSERT_NE(n256, nullptr);
+    CommitRequest("seed", /*first_token=*/0, /*target=*/256, n256);
+    hybrid_->ReleaseRequest("seed");
+    auto hit256 = MatchTokens(256);
+    ASSERT_EQ(hit256.paged_cache.prefix_len_tokens, 256);
+
+    // A retracted request can keep borrowing n256 after its DeviceNodeRef is
+    // gone. That table, not a coarse host-ref count, must pin the State pages.
+    hybrid_->AcquireForRequest("borrower", /*first_raw_position_of_op=*/0,
+                               /*target_raw_tokens_exclusive=*/256, hit256.paged_cache);
+
+    TreeNode* n512 = InsertDeviceTokens(512);
+    ASSERT_NE(n512, nullptr);
+    {
+        DeviceNodeRef writer_ref{n512};
+        CommitRequest("writer", /*first_token=*/256, /*target=*/512, n512, hit256.paged_cache);
+    }
+    ASSERT_TRUE(n256->HasPagedCacheSnapshot());
+    EXPECT_TRUE(n256->GetPagedCacheSnapshot()->continuation_state_complete);
+
+    hybrid_->ReleaseRequest("borrower");
+
+    // Model the writer's own recovery HostNodeRef. The former HostRef-based
+    // heuristic treated this as another sharer and leaked old State snapshots.
+    PageAllocator host_alloc{kPageSize, /*total_pages=*/64};
+    std::vector<TreeNode*> attached_host_nodes;
+    for (TreeNode* cur = n256; cur != nullptr && !cur->IsRoot(); cur = cur->Parent()) {
+        if (cur->OnHost()) continue;
+        const auto host_pages = static_cast<std::int32_t>(cur->Tokens().size()) / kPageSize;
+        cur->AttachResource(std::make_unique<NodeResource<ResourceType::Host>>(host_alloc.Allocate(host_pages)));
+        attached_host_nodes.push_back(cur);
+    }
+    auto writer_host_ref = std::make_unique<HostNodeRef>(n256);
+
+    TreeNode* n768 = InsertDeviceTokens(768);
+    ASSERT_NE(n768, nullptr);
+    {
+        DeviceNodeRef writer_ref{n768};
+        CommitRequest("writer", /*first_token=*/512, /*target=*/768, n768);
+    }
+
+    ASSERT_TRUE(n256->HasPagedCacheSnapshot());
+    EXPECT_FALSE(n256->GetPagedCacheSnapshot()->continuation_state_complete);
+    EXPECT_EQ(n256->GetPagedCacheSnapshot()->groups.find(kRequiredStateGroup),
+              n256->GetPagedCacheSnapshot()->groups.end());
+    EXPECT_EQ(n256->GetPagedCacheSnapshot()->groups.find(kWindowStateGroup),
+              n256->GetPagedCacheSnapshot()->groups.end());
+
+    hybrid_->ReleaseRequest("writer");
+    writer_host_ref.reset();
+    for (TreeNode* node : attached_host_nodes) {
+        auto host_resource = node->DetachResource<ResourceType::Host>();
+        ASSERT_NE(host_resource, nullptr);
+    }
+}
+
+TEST_F(PagedCacheTerminalContinuationTest, CurrentBorrowPinsAncestorWhenTerminalSnapshotAlreadyExists) {
+    TreeNode* n64 = InsertDeviceTokens(64);
+    ASSERT_NE(n64, nullptr);
+    CommitRequest("seed", /*first_token=*/0, /*target=*/64, n64);
+    hybrid_->ReleaseRequest("seed");
+
+    auto hit64 = MatchTokens(64);
+    ASSERT_EQ(hit64.paged_cache.prefix_len_tokens, 64);
+
+    // Keep n64's transport-only State page borrowed by the request that will
+    // later adopt an already-existing terminal snapshot at n192.
+    hybrid_->AcquireForRequest("current", /*first_raw_position_of_op=*/64,
+                               /*target_raw_tokens_exclusive=*/192, hit64.paged_cache);
+
+    TreeNode* n192 = InsertDeviceTokens(192);
+    ASSERT_NE(n192, nullptr);
+    {
+        DeviceNodeRef writer_ref{n192};
+        CommitRequest("writer", /*first_token=*/64, /*target=*/192, n192, hit64.paged_cache);
+    }
+    hybrid_->ReleaseRequest("writer");
+
+    ASSERT_TRUE(n64->HasPagedCacheSnapshot());
+    ASSERT_TRUE(n192->HasPagedCacheSnapshot());
+    ASSERT_TRUE(n192->GetPagedCacheSnapshot()->continuation_state_complete);
+    const auto& ancestor_state_pages = n64->GetPagedCacheSnapshot()->groups.at(kWindowStateGroup).pages.Ids();
+    const auto& current_state_pages = hybrid_->GetRequestPagedCachePageIds("current", kWindowStateGroup);
+    ASSERT_TRUE(std::any_of(ancestor_state_pages.begin(), ancestor_state_pages.end(), [&](std::int32_t page_id) {
+        return std::find(current_state_pages.begin(), current_state_pages.end(), page_id) != current_state_pages.end();
+    }));
+
+    // Required groups adopt n192's existing snapshot, while the
+    // transport-only group is already present and therefore is not adopted.
+    // The current request still borrows n64, so ancestor cleanup must retain
+    // that State snapshot.
+    {
+        DeviceNodeRef current_ref{n192};
+        hybrid_->CommitChunk("current", n192);
+    }
+
+    ASSERT_TRUE(n64->HasPagedCacheSnapshot());
+    EXPECT_TRUE(n64->GetPagedCacheSnapshot()->continuation_state_complete);
+    EXPECT_NE(n64->GetPagedCacheSnapshot()->groups.find(kWindowStateGroup), n64->GetPagedCacheSnapshot()->groups.end());
+
+    hybrid_->ReleaseRequest("current");
+}
+
 TEST_F(PagedCacheTerminalContinuationTest, StatePruneDropsContinuationAndFallsBackToColdPrefill) {
     TreeNode* n256 = InsertDeviceTokens(256);
     ASSERT_NE(n256, nullptr);
@@ -299,6 +552,48 @@ TEST_F(PagedCacheTerminalContinuationTest, StatePruneDropsContinuationAndFallsBa
     EXPECT_EQ(match.paged_cache.history_hit_tokens, 0);
     EXPECT_EQ(match.paged_cache.prefix_len_tokens, 0);
     EXPECT_TRUE(match.paged_cache.per_group_page_ids.empty());
+}
+
+TEST_F(PagedCacheTerminalContinuationTest, StateOnlyPruneIgnoresHistoryOnlySideTableBorrow) {
+    TreeNode* n64 = InsertDeviceTokens(64);
+    ASSERT_NE(n64, nullptr);
+    CommitRequest("seed", /*first_token=*/0, /*target=*/64, n64);
+    hybrid_->ReleaseRequest("seed");
+
+    auto hit = MatchTokens(64);
+    ASSERT_EQ(hit.paged_cache.prefix_len_tokens, 64);
+    hybrid_->AcquireForRequest("borrower", /*first_raw_position_of_op=*/192,
+                               /*target_raw_tokens_exclusive=*/192, hit.paged_cache);
+
+    auto shares_snapshot_pages = [&](const std::string& group_id) {
+        const auto& snapshot_pages = n64->GetPagedCacheSnapshot()->groups.at(group_id).pages.Ids();
+        const auto& request_pages = hybrid_->GetRequestPagedCachePageIds("borrower", group_id);
+        return std::any_of(snapshot_pages.begin(), snapshot_pages.end(), [&](std::int32_t page_id) {
+            return std::find(request_pages.begin(), request_pages.end(), page_id) != request_pages.end();
+        });
+    };
+
+    ASSERT_TRUE(n64->HasPagedCacheSnapshot());
+    EXPECT_TRUE(shares_snapshot_pages(kHistoryGroup));
+    EXPECT_FALSE(shares_snapshot_pages(kRequiredStateGroup));
+    EXPECT_FALSE(shares_snapshot_pages(kWindowStateGroup));
+    const auto history_pages_before = hybrid_->GetRequestPagedCachePageIds("borrower", kHistoryGroup);
+
+    auto simulated_free = hybrid_->InitialSimulatedFree();
+    simulated_free[kWindowStateGroup] = 0;
+    ASSERT_TRUE(hybrid_->AdmitChunk("pressure", /*first_raw_position_of_op=*/0,
+                                    /*target_raw_tokens_exclusive=*/64, simulated_free));
+
+    ASSERT_TRUE(n64->HasPagedCacheSnapshot());
+    const auto* snapshot = n64->GetPagedCacheSnapshot();
+    ASSERT_NE(snapshot, nullptr);
+    EXPECT_NE(snapshot->groups.find(kHistoryGroup), snapshot->groups.end());
+    EXPECT_EQ(snapshot->groups.find(kRequiredStateGroup), snapshot->groups.end());
+    EXPECT_EQ(snapshot->groups.find(kWindowStateGroup), snapshot->groups.end());
+    EXPECT_FALSE(snapshot->continuation_state_complete);
+    EXPECT_EQ(hybrid_->GetRequestPagedCachePageIds("borrower", kHistoryGroup), history_pages_before);
+
+    hybrid_->ReleaseRequest("borrower");
 }
 
 TEST(PagedCacheHistoryOnlyTest, HistoryOnlyPrefixHitRemainsUsable) {
@@ -445,6 +740,152 @@ TEST_F(PagedCacheDecodePublishTest, ContinuingDecodePublishesAcceptedPagesOnly) 
     EXPECT_EQ(prefix_by_request.at("hit4"), 4);
     EXPECT_EQ(prefix_by_request.at("probe_tail"), 4);
 }
+
+TEST_P(PagedCacheOverlapSchedulerTest, DynamicVerifyWidthRetainsAlreadyDispatchedRange) {
+    const auto [verify_width, accepted_length, overlap_depth] = GetParam();
+    Submit(RequestSpec{.request_id = "r", .tokens = {1, 2}});
+    ASSERT_NE(GetForwardOp(PlanOnce()), nullptr);
+
+    // Commit the prefill result so the request can enter decode at C=3.
+    SendForwardDone("r", {3});
+    const std::int32_t committed_before = scheduler_->GetRequestTokenSize("r");
+    ASSERT_EQ(committed_before, 3);
+
+    auto current_plan = PlanOnce();
+    auto* current = GetForwardOp(current_plan);
+    ASSERT_NE(current, nullptr);
+    ASSERT_EQ(current->request_ids.size(), 1u);
+    EXPECT_EQ(current->input_lengths.at(0), verify_width);
+    ExpectPagedGroupCoversRange(*current, Config(), "overlap.history", /*row=*/0, committed_before,
+                                /*token_count=*/(overlap_depth + 1) * verify_width);
+    ExpectPagedGroupCoversRange(*current, Config(), "overlap.state", /*row=*/0, committed_before,
+                                /*token_count=*/(overlap_depth + 1) * verify_width);
+
+    // The overlapped event loop dispatches the next plan before committing
+    // this result. Its CPU token length is still C, while the GPU will use the
+    // accepted length A after valid_cache_lengths is updated.
+    if (overlap_depth == 1) {
+        auto stale_plan = PlanOnce();
+        auto* stale = GetForwardOp(stale_plan);
+        ASSERT_NE(stale, nullptr);
+        ExpectPagedGroupCoversRange(*stale, Config(), "overlap.history", /*row=*/0, committed_before,
+                                    /*token_count=*/2 * verify_width);
+    }
+
+    const auto history_pages_before = scheduler_->GetRequestPagedCachePageIds("r", "overlap.history");
+    const auto state_pages_before = scheduler_->GetRequestPagedCachePageIds("r", "overlap.state");
+    const auto reserved_end = committed_before + (overlap_depth + 1) * verify_width;
+    ASSERT_EQ(history_pages_before.size(), static_cast<std::size_t>(reserved_end));
+    ASSERT_EQ(state_pages_before.size(), static_cast<std::size_t>(reserved_end));
+
+    std::vector<std::int32_t> accepted(static_cast<std::size_t>(accepted_length), 1000 + accepted_length);
+    SendForwardDone("r", accepted);
+    const std::int32_t accepted_end = committed_before + accepted_length;
+    ASSERT_EQ(scheduler_->GetRequestTokenSize("r"), accepted_end);
+
+    const auto history_pages_after = scheduler_->GetRequestPagedCachePageIds("r", "overlap.history");
+    const auto state_pages_after = scheduler_->GetRequestPagedCachePageIds("r", "overlap.state");
+    const auto protected_end = accepted_end + overlap_depth * verify_width;
+    ASSERT_EQ(history_pages_after.size(), static_cast<std::size_t>(protected_end));
+    ASSERT_EQ(state_pages_after.size(), static_cast<std::size_t>(protected_end));
+    for (std::int32_t pos = accepted_end; pos < accepted_end + overlap_depth * verify_width; ++pos) {
+        ASSERT_LT(static_cast<std::size_t>(pos), history_pages_before.size());
+        ASSERT_LT(static_cast<std::size_t>(pos), history_pages_after.size());
+        EXPECT_EQ(history_pages_after[static_cast<std::size_t>(pos)],
+                  history_pages_before[static_cast<std::size_t>(pos)])
+            << "history pos=" << pos;
+        ASSERT_LT(static_cast<std::size_t>(pos), state_pages_before.size());
+        ASSERT_LT(static_cast<std::size_t>(pos), state_pages_after.size());
+        EXPECT_EQ(state_pages_after[static_cast<std::size_t>(pos)], state_pages_before[static_cast<std::size_t>(pos)])
+            << "pos=" << pos;
+    }
+
+    auto next_plan = PlanOnce();
+    auto* next = GetForwardOp(next_plan);
+    ASSERT_NE(next, nullptr);
+    ExpectPagedGroupCoversRange(*next, Config(), "overlap.history", /*row=*/0, accepted_end,
+                                /*token_count=*/(overlap_depth + 1) * verify_width);
+    ExpectPagedGroupCoversRange(*next, Config(), "overlap.state", /*row=*/0, accepted_end,
+                                /*token_count=*/(overlap_depth + 1) * verify_width);
+}
+
+TEST_P(PagedCacheOverlapRetractTest, LateResultRecoveryRebuildsDynamicHorizon) {
+    const auto [overlap_depth, accepted_length, writeback_first] = GetParam();
+    Submit(RequestSpec{.request_id = "r", .tokens = {1, 2}});
+    ASSERT_NE(GetForwardOp(PlanOnce()), nullptr);
+    SendForwardDone("r", {3});
+
+    // Dispatch a decode at C=3, then let the next scheduler pass retract it
+    // before this in-flight result is committed.
+    ASSERT_NE(GetForwardOp(PlanOnce()), nullptr);
+    const auto history_pages_before = scheduler_->GetRequestPagedCachePageIds("r", "retract.history");
+    const auto state_pages_before = scheduler_->GetRequestPagedCachePageIds("r", "retract.state");
+    SendReserveNumTokens(/*value=*/100);
+    auto retract_plan = PlanOnce();
+    const auto* writeback = GetWriteBack(retract_plan);
+    ASSERT_NE(writeback, nullptr);
+    ASSERT_FALSE(writeback->op_ids.empty());
+    if (writeback_first) {
+        SendWriteBackDone(writeback->op_ids.front());
+        ASSERT_EQ(scheduler_->RetractedSize(), 1u);
+    }
+
+    std::vector<std::int32_t> accepted;
+    for (std::int32_t i = 0; i < accepted_length; ++i) {
+        accepted.push_back(4 + i);
+    }
+    SendForwardDone("r", accepted);
+    ASSERT_EQ(scheduler_->GetRequestTokenSize("r"), 3 + accepted_length);
+    const auto retained_end = 3 + accepted_length + overlap_depth * 4;
+    const auto history_pages_after_late_result = scheduler_->GetRequestPagedCachePageIds("r", "retract.history");
+    const auto state_pages_after_late_result = scheduler_->GetRequestPagedCachePageIds("r", "retract.state");
+    ASSERT_EQ(history_pages_after_late_result.size(), static_cast<std::size_t>((retained_end + 1) / 2));
+    ASSERT_EQ(state_pages_after_late_result.size(), static_cast<std::size_t>(retained_end));
+    EXPECT_TRUE(std::equal(history_pages_after_late_result.begin(), history_pages_after_late_result.end(),
+                           history_pages_before.begin()));
+    EXPECT_TRUE(std::equal(state_pages_after_late_result.begin(), state_pages_after_late_result.end(),
+                           state_pages_before.begin()));
+    if (!writeback_first) {
+        SendWriteBackDone(writeback->op_ids.front());
+    }
+    ASSERT_EQ(scheduler_->RetractedSize(), 1u);
+
+    auto recovery_plan = PlanOnce();
+    const auto* recovery = GetForwardOp(recovery_plan);
+    ASSERT_NE(recovery, nullptr);
+    ASSERT_EQ(recovery->request_ids.size(), 1u);
+    ASSERT_EQ(recovery->request_ids.front(), "r");
+    ASSERT_EQ(recovery->hist_token_lens.size(), 1u);
+    EXPECT_EQ(recovery->hist_token_lens.front(), 2 + accepted_length);
+    EXPECT_EQ(recovery->input_lengths.front(), 4);
+    ExpectPagedGroupCoversRange(*recovery, Config(), "retract.history", /*row=*/0,
+                                /*first_token=*/2 + accepted_length, /*token_count=*/(overlap_depth + 1) * 4);
+    ExpectPagedGroupCoversRange(*recovery, Config(), "retract.state", /*row=*/0,
+                                /*first_token=*/2 + accepted_length, /*token_count=*/(overlap_depth + 1) * 4);
+    const auto history_pages_after = scheduler_->GetRequestPagedCachePageIds("r", "retract.history");
+    const auto state_pages_after = scheduler_->GetRequestPagedCachePageIds("r", "retract.state");
+    ASSERT_GE(history_pages_after.size(), history_pages_after_late_result.size());
+    ASSERT_GE(state_pages_after.size(), state_pages_after_late_result.size());
+    EXPECT_TRUE(std::equal(history_pages_after_late_result.begin(), history_pages_after_late_result.end(),
+                           history_pages_after.begin()));
+    EXPECT_TRUE(std::equal(state_pages_after_late_result.begin(), state_pages_after_late_result.end(),
+                           state_pages_after.begin()));
+    EXPECT_EQ(scheduler_->DecodingSize(), 1u);
+    EXPECT_EQ(scheduler_->RetractedSize(), 0u);
+}
+
+INSTANTIATE_TEST_SUITE_P(OverlapDepthsAndAcceptLengths, PagedCacheOverlapRetractTest,
+                         ::testing::Values(std::make_tuple(0, 0, false), std::make_tuple(0, 2, false),
+                                           std::make_tuple(0, 4, false), std::make_tuple(1, 0, false),
+                                           std::make_tuple(1, 2, false), std::make_tuple(1, 4, false),
+                                           std::make_tuple(1, 0, true)));
+
+INSTANTIATE_TEST_SUITE_P(VerifyWidthsAndAcceptLengths, PagedCacheOverlapSchedulerTest,
+                         ::testing::Values(std::make_tuple(1, 1, 0), std::make_tuple(2, 1, 0), std::make_tuple(4, 1, 0),
+                                           std::make_tuple(8, 1, 0), std::make_tuple(1, 1, 1), std::make_tuple(2, 1, 1),
+                                           std::make_tuple(2, 2, 1), std::make_tuple(4, 0, 1), std::make_tuple(4, 2, 1),
+                                           std::make_tuple(4, 4, 1), std::make_tuple(8, 0, 1), std::make_tuple(8, 4, 1),
+                                           std::make_tuple(8, 7, 1), std::make_tuple(8, 8, 1)));
 
 TEST_F(PagedCacheTerminalMixedSchedulerTest, MixedPrefillDecodePagedTablesCoverScheduledTokens) {
     std::vector<std::string> decode_ids;

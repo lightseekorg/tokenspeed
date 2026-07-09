@@ -31,6 +31,31 @@ from tokenspeed.runtime.pd.transfer_plan import (
 from tokenspeed.runtime.pd.utils import PageTransferMetadata
 
 
+@dataclasses.dataclass
+class KVArgs:
+    engine_rank: int
+    kv_data_ptrs: list[int]
+    kv_data_lens: list[int]
+    kv_item_lens: list[int]
+    offsets: list[tuple[int]]
+    aux_data_ptrs: list[int]
+    aux_data_lens: list[int]
+    aux_item_lens: list[int]
+    ib_device: str
+    gpu_id: int
+    target_layer_num: int
+    draft_layer_num: int
+    kv_layer_ids: list[int] = dataclasses.field(default_factory=list)
+    kv_unit_lens: list[int] = dataclasses.field(default_factory=list)
+    state_data_ptrs: list[int] = dataclasses.field(default_factory=list)
+    state_data_lens: list[int] = dataclasses.field(default_factory=list)
+    state_item_lens: list[int] = dataclasses.field(default_factory=list)
+    state_unit_lens: list[int] = dataclasses.field(default_factory=list)
+    state_type: str = "none"
+    state_layer_ids: list[int] = dataclasses.field(default_factory=list)
+    mamba_offsets: list[int] | None = None
+
+
 class KVTransferError(Exception):
     def __init__(
         self, bootstrap_room: int, failure_reason: str, remote_endpoint: str = None
@@ -191,7 +216,7 @@ class KVArgsRegisterInfo:
 
 
 @dataclasses.dataclass
-class ManagerArgs:
+class KVManagerArgs:
     bootstrap_port: int
     dist_init_addr: str
 

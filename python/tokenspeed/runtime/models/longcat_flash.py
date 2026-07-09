@@ -249,6 +249,7 @@ class _RuntimeLongcatMoE(nn.Module):
             zero_expert_type=config.zero_expert_type,
             routing_config={
                 "routed_scaling_factor": self.routed_scaling_factor,
+                "normalize_topk_weights": config.norm_topk_prob,
                 "correction_bias": self.router.e_score_correction_bias[
                     : config.n_routed_experts
                 ],

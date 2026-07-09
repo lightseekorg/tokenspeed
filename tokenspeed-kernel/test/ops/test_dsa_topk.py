@@ -34,12 +34,15 @@ def test_decode_topk_uses_ragged_path_when_lengths_and_workspace_are_provided(
 
     monkeypatch.setattr(dsa_topk, "has_persistent_topk", lambda: True)
 
-    def fake_persistent_topk(logits, lengths, output, workspace, k, max_seq_len):
+    def fake_persistent_topk(
+        logits, lengths, output, workspace, k, max_seq_len, q_len_per_req=1
+    ):
         calls["logits"] = logits
         calls["lengths"] = lengths
         calls["workspace"] = workspace
         calls["k"] = k
         calls["max_seq_len"] = max_seq_len
+        calls["q_len_per_req"] = q_len_per_req
         output.fill_(7)
 
     monkeypatch.setattr(dsa_topk, "persistent_topk", fake_persistent_topk)
@@ -64,6 +67,7 @@ def test_decode_topk_uses_ragged_path_when_lengths_and_workspace_are_provided(
     assert calls["workspace"] is workspace
     assert calls["k"] == 4
     assert calls["max_seq_len"] == 8
+    assert calls["q_len_per_req"] == 1
 
 
 def test_decode_topk_rejects_partial_or_unavailable_ragged_inputs(monkeypatch):

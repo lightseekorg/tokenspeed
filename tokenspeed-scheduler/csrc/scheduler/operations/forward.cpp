@@ -22,6 +22,7 @@
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -59,6 +60,19 @@ namespace tokenspeed {
 namespace {
 
 constexpr std::int32_t kLocalMambaSlotsPerRequest = 2;
+
+std::int32_t DecodePagedCacheReservationEnd(std::int32_t first_pos, std::int32_t verify_width,
+                                            std::int32_t overlap_depth) {
+    if (first_pos < 0 || verify_width < 0 || overlap_depth < 0 || overlap_depth > 1) {
+        throw std::invalid_argument("invalid paged-cache decode reservation arguments");
+    }
+    const std::int64_t reservation_end =
+        static_cast<std::int64_t>(first_pos) + static_cast<std::int64_t>(overlap_depth + 1) * verify_width;
+    if (reservation_end > std::numeric_limits<std::int32_t>::max()) {
+        throw std::overflow_error("paged-cache decode reservation exceeds int32 range");
+    }
+    return static_cast<std::int32_t>(reservation_end);
+}
 
 std::int32_t CountMambaDeviceLoadBackSlots(const std::vector<TreeNode*>& nodes) {
     std::int32_t slots = 0;
@@ -218,7 +232,8 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* reque
     }
 
     const std::int32_t first_pos = request->TokenSize();
-    const std::int32_t target = first_pos + config_.decode_input_tokens;
+    const std::int32_t target =
+        DecodePagedCacheReservationEnd(first_pos, config_.decode_input_tokens, config_.overlap_schedule_depth);
     if (hybrid_prefix_cache_) {
         std::optional<std::int32_t> commit_target;
         std::vector<std::span<const std::int32_t>> commit_token_pages;
@@ -294,9 +309,12 @@ std::optional<fsm::ScheduleDecodeFromRetractedEvent> Scheduler::scheduleDecodeFr
         }
     }
 
-    const std::int32_t target = request->TokenSize();
-    if (hybrid_prefix_cache_ && !hybrid_prefix_cache_->AdmitChunkFromRetracted(request->Id(), target, simulated_free,
-                                                                               match_result.paged_cache)) {
+    const std::int32_t first_pos = request->TokenSize() - 1;
+    const std::int32_t target = std::max(
+        request->TokenSize(),
+        DecodePagedCacheReservationEnd(first_pos, config_.decode_input_tokens, config_.overlap_schedule_depth));
+    if (hybrid_prefix_cache_ &&
+        !hybrid_prefix_cache_->AdmitChunk(request->Id(), first_pos, target, simulated_free, match_result.paged_cache)) {
         return {};
     }
     if (needs_mamba_loadback) {
@@ -521,7 +539,9 @@ DecodeOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Schedu
         if (came_from_prefill_done) {
             hybrid_prefix_cache_->CommitChunk(op.request_id, const_cast<TreeNode*>(request->GetDeviceNode()));
         }
-        hybrid_prefix_cache_->AcquireForRequest(op.request_id, first_pos, first_pos + op.input_length);
+        const std::int32_t target =
+            DecodePagedCacheReservationEnd(first_pos, op.input_length, config_.overlap_schedule_depth);
+        hybrid_prefix_cache_->AcquireForRequest(op.request_id, first_pos, target);
         hybrid_prefix_cache_->PopulateOp(op);
     }
     return op;
@@ -559,8 +579,13 @@ DecodeOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Schedu
     }
 
     if (hybrid_prefix_cache_) {
-        hybrid_prefix_cache_->ReleaseRequest(op.request_id);
-        hybrid_prefix_cache_->AcquireForRequest(op.request_id, 0, request->TokenSize(), paged_cache_hit);
+        const std::int32_t target = std::max(
+            request->TokenSize(),
+            DecodePagedCacheReservationEnd(op.hist_token_len, op.input_length, config_.overlap_schedule_depth));
+        // Preserve the existing table across retraction. Its request-local
+        // tail contains state after the last published prefix checkpoint and
+        // cannot be reconstructed by importing that older snapshot alone.
+        hybrid_prefix_cache_->AcquireForRequest(op.request_id, op.hist_token_len, target, paged_cache_hit);
         hybrid_prefix_cache_->PopulateOp(op);
     }
     return op;

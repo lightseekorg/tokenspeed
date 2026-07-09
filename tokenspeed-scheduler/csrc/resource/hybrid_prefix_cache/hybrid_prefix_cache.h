@@ -51,6 +51,7 @@ public:
     // `mamba_allocator` may be null; paged-cache adjunct is enabled separately.
     HybridPrefixCache(KVPrefixCache& prefix_cache, MambaChunkAllocator* allocator, std::int32_t mamba_cache_chunk_size,
                       MambaHostAllocator* mamba_host_allocator = nullptr);
+    ~HybridPrefixCache();
 
     MatchResult Match(const token_vec_t& token_ids, MatchIntent intent = MatchIntent::PrefixReuse);
     MatchResult Match(const std::vector<std::span<const std::int32_t>>& token_pages,
@@ -110,8 +111,11 @@ public:
     // Owned pages return to the pool via OwnedPages RAII; borrowed ids are dropped.
     void ReleaseRequest(const std::string& request_id);
 
-    // Reclaim request-local paged-cache tail slots beyond the accepted token length.
-    void RewindRequest(const std::string& request_id, std::int32_t accepted_raw_tokens);
+    // Reclaim request-local paged-cache tail slots beyond the accepted token
+    // length while retaining slots referenced by an already-dispatched
+    // overlapped decode.
+    void RewindRequest(const std::string& request_id, std::int32_t accepted_raw_tokens,
+                       std::int32_t protected_tail_tokens = 0);
 
     // Fill op.paged_cache_pages / op.paged_cache_page_base_offsets from the tables.
     void PopulateOp(ForwardOperationBase& op_base) const;
@@ -129,12 +133,6 @@ public:
                     std::optional<std::int32_t> commit_target_raw_tokens = std::nullopt,
                     std::span<const std::span<const std::int32_t>> commit_token_pages = {});
 
-    // Retract-decode variant: admission uses a fresh-table view and credits
-    // pages owned by the stale table before it is released.
-    bool AdmitChunkFromRetracted(const std::string& request_id, std::int32_t target_raw_tokens_exclusive,
-                                 std::map<std::string, std::int32_t>& simulated_free,
-                                 const MatchResult::PagedCache& paged_cache_hit);
-
     // Commit newly-written full LCM segments into TreeNode PagedCacheSnapshots.
     void CommitChunk(const std::string& request_id, TreeNode* terminal);
 
@@ -151,14 +149,10 @@ public:
     // Callback from KV prefix-cache eviction.
     void OnKVEvict(TreeNode* node);
 
-    // Callback from RadixTree just before a node is destroyed by prune. Drops
-    // the dying node from every adjunct bookkeeping set that holds raw
-    // TreeNode* (mamba_leaves_, paged_cache_snapshot_nodes_) so no dangling
-    // pointer survives the free. Unlike OnKVEvict this must NOT detach the
-    // node's slots — the node (and its owned unique_ptr<MambaSlot> /
-    // PagedCacheSnapshot) is being destroyed, so the destructors free them; we
-    // only un-register the membership. Safe to call on a node that was never
-    // tracked (erase is a no-op).
+    // Callback from RadixTree just before prune destroys a node. Detaches its
+    // adjunct resources while their allocators are alive and removes every raw
+    // TreeNode* bookkeeping entry. A paged snapshot must have no table borrower
+    // at this point; violating that lifetime invariant is an error.
     void OnNodeDestroyed(TreeNode* node);
 
     std::int32_t AvailableSlots() const;
@@ -179,8 +173,6 @@ private:
     };
 
     struct PagedCacheAdmissionContext {
-        bool fresh_table_view{false};
-        std::map<std::string, std::int32_t> owned_release_credit{};
         std::optional<std::int32_t> commit_target_raw_tokens{};
         std::span<const std::span<const std::int32_t>> commit_token_pages{};
     };
@@ -193,6 +185,8 @@ private:
     bool DetachStateSnapshotFromNode(TreeNode* node);
 
     void RefreshPagedCacheSnapshotCompleteness(PagedCacheSnapshot& snapshot) const;
+    bool isPagedCacheSnapshotBorrowed(const TreeNode* node,
+                                      std::optional<PagedCacheGroupFamily> family = std::nullopt) const;
     bool adoptExistingPagedCacheSnapshot(PagedCacheSnapshot& existing,
                                          std::map<std::string, PagedCacheGroupTable>& tables, std::int32_t target);
     bool commitTerminalContinuationSnapshot(std::map<std::string, PagedCacheGroupTable>& tables, TreeNode* terminal,

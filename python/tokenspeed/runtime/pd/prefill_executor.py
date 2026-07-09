@@ -22,7 +22,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from tokenspeed.runtime.pd.base import BootstrapInfo, KVPoll
+from tokenspeed.runtime.pd.base.bootstrap import BootstrapInfo
+from tokenspeed.runtime.pd.base.status import TransferPoll
 from tokenspeed.runtime.pd.mooncake.prefill import (
     MooncakeKVManagerPrefill,
     MooncakeKVSender,
@@ -83,7 +84,9 @@ class DisaggPrefillExecutor:
                 )
                 return
             self.kv_manager.set_prefill_metadata(
-                sender.bootstrap_room, token, spec_candidate_ids
+                sender.bootstrap_room,
+                token,
+                spec_candidate_ids,
             )
             self._layerwise_token_published.add(request_id)
 
@@ -236,7 +239,9 @@ class DisaggPrefillExecutor:
             if sender.has_layerwise_transfer():
                 if request_id not in self._layerwise_token_published:
                     self.kv_manager.set_prefill_metadata(
-                        sender.bootstrap_room, bootstrap_token, spec_candidate_ids
+                        sender.bootstrap_room,
+                        bootstrap_token,
+                        spec_candidate_ids,
                     )
                 self._layerwise_token_published.discard(request_id)
                 continue
@@ -271,8 +276,18 @@ class DisaggPrefillExecutor:
             )
 
     def register(self, request_id: str, bootstrap_info: BootstrapInfo):
-        self._local_states[request_id] = KVPoll.Bootstrapping
+        self._local_states[request_id] = TransferPoll.Bootstrapping
         self._bootstrap(request_id, bootstrap_info)
+
+    def abort(self, request_id: str, bootstrap_info: BootstrapInfo) -> None:
+        """EPD: the prefill aborted this request before registering a KV sender
+        (embedding receive timed out). Signal the dual-dispatched decode so its KV
+        receiver fails instead of waiting forever. No sender was registered, so
+        there is nothing to tear down on this side."""
+        self.kv_manager.abort_room(
+            bootstrap_info.bootstrap_room,
+            f"EPD: prefill aborted request {request_id} (embedding receive timed out)",
+        )
 
     def execute(self, op):
         self._dispatcher(op)
@@ -286,25 +301,25 @@ class DisaggPrefillExecutor:
         to_remove = []
         for req_id, poll in zip(list(self.senders.keys()), polls):
             if (
-                self._local_states[req_id] == KVPoll.Bootstrapping
-                and poll == KVPoll.Bootstrapped
+                self._local_states[req_id] == TransferPoll.Bootstrapping
+                and poll == TransferPoll.Bootstrapped
             ):
                 logger.debug(
                     "[prefill][generate_events] rid=%s -> BootstrappedEvent", req_id
                 )
                 events.append(PD.BootstrappedEvent(req_id))
-                self._local_states[req_id] = KVPoll.Bootstrapped
-            elif poll == KVPoll.Failed:
+                self._local_states[req_id] = TransferPoll.Bootstrapped
+            elif poll == TransferPoll.Failed:
                 logger.warning(
                     "[prefill][generate_events] rid=%s -> FailedEvent", req_id
                 )
                 events.append(PD.FailedEvent(req_id))
                 to_remove.append(req_id)
             elif (
-                self._local_states[req_id] == KVPoll.Bootstrapped
-                and poll == KVPoll.Success
+                self._local_states[req_id] == TransferPoll.Bootstrapped
+                and poll == TransferPoll.Success
             ):
-                self._local_states[req_id] = KVPoll.Success
+                self._local_states[req_id] = TransferPoll.Success
                 logger.debug(
                     "[prefill][generate_events] rid=%s -> SucceededEvent", req_id
                 )

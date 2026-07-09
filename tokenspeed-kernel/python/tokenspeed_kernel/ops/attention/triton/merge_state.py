@@ -82,9 +82,12 @@ def triton_attn_merge_state(
     out_b: torch.Tensor,
     lse_b: torch.Tensor,
     lse_scale_log2: float,
+    inplace: bool = False,
+    enable_pdl: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    out = torch.empty_like(out_a)
-    lse = torch.empty_like(lse_a)
+    del enable_pdl
+    out = out_a if inplace else torch.empty_like(out_a)
+    lse = lse_a if inplace else torch.empty_like(lse_a)
     total_rows = out_a.shape[0] * out_a.shape[1]
     head_dim = out_a.shape[2]
     block_d = triton.next_power_of_2(head_dim)

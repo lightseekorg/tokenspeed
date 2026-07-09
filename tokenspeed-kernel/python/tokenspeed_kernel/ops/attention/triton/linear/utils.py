@@ -32,8 +32,8 @@ from enum import Enum
 from typing import Any
 
 import torch
-import triton
 from packaging import version
+from tokenspeed_kernel._triton import triton
 
 SUPPRESS_LEVEL = int(os.getenv("GDN_RECOMPUTE_SUPPRESS_LEVEL", "0"))
 

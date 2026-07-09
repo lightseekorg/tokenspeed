@@ -147,6 +147,8 @@ class Qwen3_5DraftForCausalLM(Qwen3_5ForCausalLM):
 
 
 class Qwen3_5ForConditionalGenerationNextN(nn.Module):
+    draft_first_step_reduce_for_catchup = True
+
     def __init__(
         self,
         config: PretrainedConfig,

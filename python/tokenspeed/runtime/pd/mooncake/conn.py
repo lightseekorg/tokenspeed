@@ -20,31 +20,24 @@
 
 from __future__ import annotations
 
-import asyncio
-import logging
-import threading
-from functools import cache
-
-import zmq
-from aiohttp import web
-
 from tokenspeed.runtime.metrics.collector import KVTransferMetrics
-from tokenspeed.runtime.pd.base import KVArgs, KVPoll
-from tokenspeed.runtime.pd.mooncake.entities import ManagerArgs
-from tokenspeed.runtime.pd.mooncake.transfer_engine import (
+from tokenspeed.runtime.pd.base.bootstrap import DisaggBootstrapServerBase
+from tokenspeed.runtime.pd.base.manager import DisaggManagerBase
+from tokenspeed.runtime.pd.base.mooncake_engine import (
     MooncakeTransferEngine,
 )
+from tokenspeed.runtime.pd.mooncake.entities import KVArgs, KVManagerArgs
 from tokenspeed.runtime.pd.utils import DisaggregationMode
-from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.network import get_local_ip_by_remote
 
-logger = get_colorful_logger(__name__)
 
+class MooncakeKVManagerBase(DisaggManagerBase):
+    """KV (prefill->decode) manager: the shared engine/socket/status FSM plus the
+    KV-specific args, MLA flags, dp-attention wiring, and metrics."""
 
-class MooncakeKVManagerBase:
     def __init__(
         self,
-        args: ManagerArgs,
+        args: KVManagerArgs,
         kv_args: KVArgs,
         disaggregation_mode: DisaggregationMode,
     ):
@@ -66,12 +59,6 @@ class MooncakeKVManagerBase:
                 "If dp_attention is not enabled, dp size must be 1 in disaggregation mode."
             )
 
-        self.engine = MooncakeTransferEngine(
-            hostname=get_local_ip_by_remote(),
-            gpu_id=self.kv_args.gpu_id,
-            ib_device=self.kv_args.ib_device,
-        )
-
         if hasattr(args, "enable_metrics") and args.enable_metrics:
             labels = {
                 "model_name": args.served_model_name,
@@ -81,13 +68,15 @@ class MooncakeKVManagerBase:
         else:
             self.kv_transfer_metrics = None
 
-        self.server_socket = zmq.Context().socket(zmq.PULL)
-        self.register_buffer_to_engine()
-
-        self.rank_port = None
-        self.request_status: dict[int, KVPoll] = {}
-        self.failure_records: dict[int, str] = {}
-        self.failure_lock = threading.Lock()
+        # Build the Mooncake data-plane engine here and inject it into the
+        # transfer manager. self.kv_args is set above so register_buffer_to_engine
+        # (called by the base) sees the KV buffers.
+        engine = MooncakeTransferEngine(
+            hostname=get_local_ip_by_remote(),
+            gpu_id=kv_args.gpu_id,
+            ib_device=kv_args.ib_device,
+        )
+        super().__init__(engine=engine)
 
     def register_buffer_to_engine(self):
         for kv_data_ptr, kv_data_len in zip(
@@ -99,87 +88,22 @@ class MooncakeKVManagerBase:
         ):
             self.engine.register(state_data_ptr, state_data_len)
 
-    @cache
-    def _connect(self, endpoint: str):
-        socket = zmq.Context().socket(zmq.PUSH)
-        socket.connect(endpoint)
-        return socket
 
-    def check_status(self, bootstrap_room: int):
-        return self.request_status[bootstrap_room]
+class MooncakeKVBootstrapServer(DisaggBootstrapServerBase):
+    """KV bootstrap rendezvous: the shared server plus the prefill-side MLA /
+    kv-page length fields the decode side needs in the parallel-info sync."""
 
-    def update_status(self, bootstrap_room: int, status: KVPoll):
-        if bootstrap_room not in self.request_status:
-            self.request_status[bootstrap_room] = status
-        else:
-            # status is only allowed to be incremented unless either side has
-            # observed a failure. Failed is sticky so a late success cannot
-            # resurrect a broken transfer.
-            if (
-                self.request_status[bootstrap_room] == KVPoll.Failed
-                or status == KVPoll.Failed
-            ):
-                self.request_status[bootstrap_room] = KVPoll.Failed
-            else:
-                self.request_status[bootstrap_room] = max(
-                    self.request_status[bootstrap_room], status
-                )
-
-    def record_failure(self, bootstrap_room: int, failure_reason: str):
-        with self.failure_lock:
-            self.failure_records[bootstrap_room] = failure_reason
-
-
-class MooncakeKVBootstrapServer:
     def __init__(self, port: int):
-        self.port = port
-        self.app = web.Application()
-        self.store = dict()
-        self.lock = asyncio.Lock()
-        self._setup_routes()
-        self.world_size = None
-        self.dp_size = None
-        self.tp_size_per_dp_rank = None
-        self.prefill_port_table: dict[int, dict[int, dict[str, str | int]]] = {}
+        # Set before super() -- super() starts the server thread, after which a
+        # register PUT can call _ingest_put_extra and read these.
         self.enable_mla_l1_5_cache = False
         self.prefill_kv_item_lens = []
         self.prefill_kv_unit_lens = []
         self.prefill_state_item_lens = []
         self.prefill_state_unit_lens = []
+        super().__init__(port)
 
-        # Start bootstrap server
-        self.thread = threading.Thread(target=self._run_server, daemon=True)
-        self.run()
-
-    def run(self):
-        self.thread.start()
-
-    def _setup_routes(self):
-        self.app.router.add_route("*", "/route", self._handle_route)
-        self.app.router.add_get("/health", self._handle_health_check)
-
-    async def _handle_health_check(self, request):
-        return web.Response(text="OK", status=200)
-
-    async def _handle_route(self, request: web.Request):
-        method = request.method
-        if method == "PUT":
-            return await self._handle_route_put(request)
-        elif method == "GET":
-            return await self._handle_route_get(request)
-        else:
-            return web.Response(
-                text="Method not allowed", status=405, content_type="application/json"
-            )
-
-    async def _handle_route_put(self, request: web.Request):
-        data = await request.json()
-        role = data["role"]
-        world_size = data["world_size"]
-        dp_size = data["dp_size"]
-        rank_ip = data["rank_ip"]
-        rank_port = int(data["rank_port"])
-        engine_rank = int(data["engine_rank"])
+    def _ingest_put_extra(self, data: dict) -> None:
         self.enable_mla_l1_5_cache = bool(data["enable_mla_l1_5_cache"])
         self.prefill_kv_item_lens = data.get("kv_item_lens", self.prefill_kv_item_lens)
         self.prefill_kv_unit_lens = data.get("kv_unit_lens", self.prefill_kv_unit_lens)
@@ -190,99 +114,11 @@ class MooncakeKVBootstrapServer:
             "state_unit_lens", self.prefill_state_unit_lens
         )
 
-        if self.world_size is None:
-            self.world_size = world_size
-
-        if self.dp_size is None:
-            self.dp_size = dp_size
-
-        tp_size_per_dp_rank = world_size // dp_size
-        if self.tp_size_per_dp_rank is None:
-            self.tp_size_per_dp_rank = tp_size_per_dp_rank
-
-        if role == "Prefill":
-            dp_group = engine_rank // tp_size_per_dp_rank
-            tp_rank_in_dp_group = engine_rank % tp_size_per_dp_rank
-
-            # Add lock to make sure thread-safe
-            async with self.lock:
-                if dp_group not in self.prefill_port_table:
-                    self.prefill_port_table[dp_group] = {}
-
-            self.prefill_port_table[dp_group][tp_rank_in_dp_group] = {
-                "rank_ip": rank_ip,
-                "rank_port": rank_port,
-            }
-            logger.debug(
-                "Register prefill bootstrap: %s with rank_ip: %s and rank_port: %s",
-                engine_rank,
-                rank_ip,
-                rank_port,
-            )
-
-        return web.Response(text="OK", status=200)
-
-    async def _handle_route_get(self, request: web.Request):
-        engine_rank = request.query.get("engine_rank")
-        target_dp_group = request.query.get("target_dp_group")
-        if not engine_rank or not target_dp_group:
-            return web.Response(text="Missing inputs for bootstrap server.", status=400)
-
-        # Currently we use engine_rank == -1 and target_dp_group == -1 to sync dp size
-        if int(engine_rank) == -1 and int(target_dp_group) == -1:
-            prefill_parallel_info = {
-                "prefill_tp_size": self.world_size,
-                "prefill_dp_size": self.dp_size,
-                "enable_mla_l1_5_cache": self.enable_mla_l1_5_cache,
-                "kv_item_lens": self.prefill_kv_item_lens,
-                "kv_unit_lens": self.prefill_kv_unit_lens,
-                "state_item_lens": self.prefill_state_item_lens,
-                "state_unit_lens": self.prefill_state_unit_lens,
-            }
-            return web.json_response(prefill_parallel_info, status=200)
-
-        # Find corresponding prefill info
-        async with self.lock:
-            bootstrap_info = self.prefill_port_table[int(target_dp_group)][
-                int(engine_rank)
-            ]
-
-        if bootstrap_info is not None:
-            return web.json_response(bootstrap_info, status=200)
-        else:
-            return web.Response(text="Bootstrap info not Found", status=404)
-
-    def _run_server(self):
-        try:
-            # Event Loop
-            self._loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self._loop)
-
-            access_log = None
-            if logging.getLogger(__name__).getEffectiveLevel() <= logging.DEBUG:
-                access_log = self.app.logger
-
-            self._runner = web.AppRunner(self.app, access_log=access_log)
-            self._loop.run_until_complete(self._runner.setup())
-
-            site = web.TCPSite(self._runner, port=self.port)
-            self._loop.run_until_complete(site.start())
-            self._loop.run_forever()
-        except Exception as exc:
-            logger.error("Server error: %s", str(exc))
-        finally:
-            # Cleanup
-            self._loop.run_until_complete(self._runner.cleanup())
-            self._loop.close()
-
-    def close(self):
-        """Shutdown"""
-        if self._loop is not None and self._loop.is_running():
-            self._loop.call_soon_threadsafe(self._loop.stop)
-            logger.info("Stopping server loop...")
-
-        if self.thread.is_alive():
-            self.thread.join(timeout=2)
-            logger.info("Server thread stopped")
-
-    def poll(self) -> KVPoll: ...
+    def _extra_parallel_info(self) -> dict:
+        return {
+            "enable_mla_l1_5_cache": self.enable_mla_l1_5_cache,
+            "kv_item_lens": self.prefill_kv_item_lens,
+            "kv_unit_lens": self.prefill_kv_unit_lens,
+            "state_item_lens": self.prefill_state_item_lens,
+            "state_unit_lens": self.prefill_state_unit_lens,
+        }

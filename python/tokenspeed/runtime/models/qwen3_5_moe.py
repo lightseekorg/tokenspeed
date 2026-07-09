@@ -222,7 +222,10 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
             tp_size=self.mapping.moe.tp_size,
             ep_rank=self.mapping.moe.ep_rank,
             ep_size=self.mapping.moe.ep_size,
-            routing_config={"routing_method_type": RoutingMethodType.RenormalizeNaive},
+            routing_config={
+                "routing_method_type": RoutingMethodType.RenormalizeNaive,
+                "normalize_topk_weights": config.norm_topk_prob,
+            },
         )
         self.topk = TopK(
             top_k=config.num_experts_per_tok,

@@ -107,6 +107,21 @@ def _swizzle_mxfp4(quant_tensor: torch.Tensor, scale: torch.Tensor, num_warps: i
     return quant_tensor, InFlexData(), scale
 
 
+def _release_parameter(module: torch.nn.Module, name: str) -> None:
+    if hasattr(module, name):
+        delattr(module, name)
+
+
+def _interleave_gate_up_rows(tensor: torch.Tensor, dim: int) -> torch.Tensor:
+    dim = dim % tensor.ndim
+    rows = int(tensor.shape[dim])
+    if rows % 2 != 0:
+        raise ValueError(f"W13 gate/up row dimension must be even, got {rows}")
+    gate, up = tensor.split(rows // 2, dim=dim)
+    shape = list(tensor.shape)
+    return torch.stack((gate, up), dim=dim + 1).reshape(shape).contiguous()
+
+
 def _pad_w2_to_block_n(w: torch.nn.Module, block_n: int) -> None:
     original_n = int(w.w2_weight.shape[-2])
     w._w2_logical_n = original_n
@@ -170,8 +185,7 @@ def _attach_gluon_preshuffle(w: torch.nn.Module) -> None:
             shuffled.original_n = int(logical_n)
             raw.original_n = int(logical_n)
             wrapped.original_n = int(logical_n)
-        raw._gluon_shuffled = shuffled
-        wrapped._gluon_shuffled = shuffled
+        setattr(w, attr, shuffled)
 
 
 def _attach_w2_logical_n(w: torch.nn.Module) -> None:
@@ -195,39 +209,74 @@ def preprocess_gluon_mxfp4_gfx950_moe_weights(
 ) -> None:
     _pad_w2_to_block_n(w, _GLUON_COMBINE_BLOCK_N)
 
-    w13_weight_bias = w.w13_weight_bias.to(torch.float32)
-    w2_weight_bias = w.w2_weight_bias.to(torch.float32)
-    w.w13_weight_bias = torch.nn.Parameter(w13_weight_bias, requires_grad=False)
-    w.w2_weight_bias = torch.nn.Parameter(w2_weight_bias, requires_grad=False)
+    w13_layout = getattr(w, "w13_input_layout", "concatenated")
+    if w13_layout not in {"interleaved", "concatenated"}:
+        raise ValueError(f"unknown w13_input_layout: {w13_layout!r}")
+
+    w13_weight = w.w13_weight
+    w13_weight_scale = w.w13_weight_scale
+    if w13_layout == "concatenated":
+        w13_weight = torch.nn.Parameter(
+            _interleave_gate_up_rows(w13_weight.data, dim=-2),
+            requires_grad=False,
+        )
+        _release_parameter(w, "w13_weight")
+        w13_weight_scale = torch.nn.Parameter(
+            _interleave_gate_up_rows(w13_weight_scale.data, dim=-2),
+            requires_grad=False,
+        )
+        _release_parameter(w, "w13_weight_scale")
+
+    if hasattr(w, "w13_weight_bias"):
+        w13_weight_bias = w.w13_weight_bias.to(torch.float32)
+        if w13_layout == "concatenated":
+            w13_weight_bias = _interleave_gate_up_rows(w13_weight_bias, dim=-1)
+        w.w13_weight_bias = torch.nn.Parameter(w13_weight_bias, requires_grad=False)
+    if hasattr(w, "w2_weight_bias"):
+        w2_weight_bias = w.w2_weight_bias.to(torch.float32)
+        w.w2_weight_bias = torch.nn.Parameter(w2_weight_bias, requires_grad=False)
 
     num_warps = 8
     w13_weight, w13_flex, w13_scale = _swizzle_mxfp4(
-        w.w13_weight, w.w13_weight_scale, num_warps
+        w13_weight, w13_weight_scale, num_warps
     )
     w2_weight, w2_flex, w2_scale = _swizzle_mxfp4(
         w.w2_weight, w.w2_weight_scale, num_warps
     )
 
-    w13_in_scale = (
-        w.w13_input_scale.data.to(torch.float32)
-        .max()
-        .reshape(1)
-        .to(w.w13_input_scale.device)
-        .contiguous()
+    quant_config = getattr(w, "quant_config", None)
+    use_dynamic_mxfp4_activations = bool(
+        getattr(quant_config, "use_dynamic_mxfp4_activations", False)
     )
-    w2_in_scale = (
-        w.w2_input_scale.data.to(torch.float32)
-        .max()
-        .reshape(1)
-        .to(w.w2_input_scale.device)
-        .contiguous()
+    has_static_fp8_scales = (
+        hasattr(w, "w13_input_scale")
+        and hasattr(w, "w2_input_scale")
+        and not use_dynamic_mxfp4_activations
     )
-    w.w13_act_scale = w13_in_scale
-    w.w2_act_scale = w2_in_scale
+    if has_static_fp8_scales:
+        w13_in_scale = (
+            w.w13_input_scale.data.to(torch.float32)
+            .max()
+            .reshape(1)
+            .to(w.w13_input_scale.device)
+            .contiguous()
+        )
+        w2_in_scale = (
+            w.w2_input_scale.data.to(torch.float32)
+            .max()
+            .reshape(1)
+            .to(w.w2_input_scale.device)
+            .contiguous()
+        )
+        w.w13_act_scale = w13_in_scale
+        w.w2_act_scale = w2_in_scale
 
-    fp8_dtype = torch.float8_e4m3fn
-    w13_lhs = InFlexData(dtype=fp8_dtype, scale=w13_in_scale)
-    w2_lhs = InFlexData(dtype=fp8_dtype, scale=w2_in_scale)
+        fp8_dtype = torch.float8_e4m3fn
+        w13_lhs = InFlexData(dtype=fp8_dtype, scale=w13_in_scale)
+        w2_lhs = InFlexData(dtype=fp8_dtype, scale=w2_in_scale)
+    else:
+        w13_lhs = InFlexData()
+        w2_lhs = InFlexData()
     out_dtype = torch.bfloat16
 
     w.w13_precision_config = PrecisionConfig(
@@ -246,8 +295,10 @@ def preprocess_gluon_mxfp4_gfx950_moe_weights(
     w.w13_weight_triton_tensor = w13_weight
     w.w2_weight_triton_tensor = w2_weight
     _attach_w2_logical_n(w)
-    del w.w13_weight
-    del w.w2_weight
+    _release_parameter(w, "w13_weight")
+    _release_parameter(w, "w2_weight")
+    _release_parameter(w, "w13_weight_scale")
+    _release_parameter(w, "w2_weight_scale")
 
     if preshuffle:
         _attach_gluon_preshuffle(w)

@@ -126,8 +126,10 @@ void Scheduler::handleEvent(const forward::UpdateReserveNumTokens& event) {
 }
 void Scheduler::handleEvent(const forward::ExtendResult& event) {
     if (auto req = find_request(event.request_id)) {
+        const std::int32_t protected_tail_tokens = config_.overlap_schedule_depth * config_.decode_input_tokens;
         req->Apply(fsm::ExtendResultEvent{event.request_id, event.tokens,
-                                          hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr});
+                                          hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr,
+                                          protected_tail_tokens});
     }
 }
 

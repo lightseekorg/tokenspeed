@@ -69,6 +69,7 @@ def deterministic_decode_topk(
     lengths: torch.Tensor | None = None,
     workspace: torch.Tensor | None = None,
     max_seq_len: int | None = None,
+    q_len_per_req: int = 1,
 ) -> None:
     """Select per-row top-``topk`` local offsets deterministically.
 
@@ -89,6 +90,7 @@ def deterministic_decode_topk(
             workspace,
             int(topk),
             int(max_seq_len or logits.shape[1]),
+            int(q_len_per_req),
         )
         return
 

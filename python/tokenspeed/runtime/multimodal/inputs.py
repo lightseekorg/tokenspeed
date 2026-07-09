@@ -80,6 +80,14 @@ class MultimodalDataItem:
     # deepstack-enabled modalities.
     encoded: torch.Tensor | None = None
     encoded_deepstack: torch.Tensor | None = None
+    # EPD (encode-prefill-decode): when set, this item's embedding is received
+    # from an encode worker over Mooncake into ``encoded`` instead of running the
+    # vision tower. A dict ``{bootstrap_room, bootstrap_host, bootstrap_port}``
+    # naming the encode worker's rendezvous for this item's image (one room per
+    # item: the gateway splits the mm payload one item per image and the encode
+    # worker row-splits the concatenated-subgrid embedding per item). None for
+    # non-EPD items (left to the vision tower).
+    encode_handshake: dict | None = None
 
     def __getattr__(self, name: str):
         if (

@@ -23,9 +23,7 @@ import time
 import numpy as np
 import numpy.typing as npt
 
-from tokenspeed.runtime.pd.base.conn import (
-    KVPoll,
-)
+from tokenspeed.runtime.pd.base.status import TransferPoll
 from tokenspeed.runtime.pd.mooncake.entities import KVTransferError
 from tokenspeed.runtime.pd.utils import PageTransferMetadata
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -43,7 +41,7 @@ class MooncakeKVSender:
         self.kv_mgr = mgr
         self.bootstrap_server_url = bootstrap_addr
         self.bootstrap_room = bootstrap_room
-        self.kv_mgr.update_status(bootstrap_room, KVPoll.Bootstrapping)
+        self.kv_mgr.update_status(bootstrap_room, TransferPoll.Bootstrapping)
         logger.info(
             "[MooncakeKVSender.__init__] bootstrap_room=%s bootstrap_addr=%s status=Bootstrapping",
             bootstrap_room,
@@ -156,12 +154,12 @@ class MooncakeKVSender:
             mamba_indices=mamba_indices,
         )
 
-    def poll(self) -> KVPoll:
+    def poll(self) -> TransferPoll:
         if self.conclude_state is None:
             status = self.kv_mgr.check_status(self.bootstrap_room)
-            if status in (KVPoll.Success, KVPoll.Failed):
+            if status in (TransferPoll.Success, TransferPoll.Failed):
                 self.conclude_state = status
-            elif status == KVPoll.Bootstrapping:
+            elif status == TransferPoll.Bootstrapping:
                 if self.init_time is not None:
                     now = time.time()
                     elapsed = now - self.init_time
@@ -173,10 +171,10 @@ class MooncakeKVSender:
                         )
                         self.kv_mgr.record_failure(
                             self.bootstrap_room,
-                            f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s in KVPoll.Bootstrapping",
+                            f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s in TransferPoll.Bootstrapping",
                         )
-                        self.conclude_state = KVPoll.Failed
-                        return KVPoll.Failed
+                        self.conclude_state = TransferPoll.Failed
+                        return TransferPoll.Failed
 
             return status
         else:
@@ -189,7 +187,7 @@ class MooncakeKVSender:
     def failure_exception(self):
         # Explicitly set the status to failure since this request has failed in another rank
         if self.conclude_state is None:
-            self.conclude_state = KVPoll.Failed
+            self.conclude_state = TransferPoll.Failed
 
         self.clear()
 

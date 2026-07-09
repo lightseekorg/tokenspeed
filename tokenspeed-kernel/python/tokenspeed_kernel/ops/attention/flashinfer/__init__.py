@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import math
 
+import tokenspeed_kernel.ops.attention.flashinfer.gated_delta_rule  # noqa: F401
 import torch
 from tokenspeed_kernel.platform import (
     ArchVersion,
@@ -61,7 +62,7 @@ if platform.is_nvidia:
         trtllm_ragged_attention_deepseek,
     )
 
-if platform.is_nvidia and platform.is_blackwell:
+if platform.is_blackwell:
     from flashinfer.mla import (
         BatchMLAPagedAttentionWrapper,
         trtllm_batch_decode_with_kv_cache_mla,

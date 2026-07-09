@@ -18,38 +18,24 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from dataclasses import dataclass, field
+"""The kernel autotune-lifecycle switch the executor flips at end of startup."""
+
+import unittest
+
+from tokenspeed_kernel.ops import tuning
 
 
-@dataclass
-class KVArgs:
-    engine_rank: int
-    kv_data_ptrs: list[int]
-    kv_data_lens: list[int]
-    kv_item_lens: list[int]
-    offsets: list[tuple[int]]
-    aux_data_ptrs: list[int]
-    aux_data_lens: list[int]
-    aux_item_lens: list[int]
-    ib_device: str
-    gpu_id: int
-    target_layer_num: int
-    draft_layer_num: int
-    kv_layer_ids: list[int] = field(default_factory=list)
-    kv_unit_lens: list[int] = field(default_factory=list)
-    state_data_ptrs: list[int] = field(default_factory=list)
-    state_data_lens: list[int] = field(default_factory=list)
-    state_item_lens: list[int] = field(default_factory=list)
-    state_unit_lens: list[int] = field(default_factory=list)
-    state_type: str = "none"
-    state_layer_ids: list[int] = field(default_factory=list)
-    mamba_offsets: list[int] | None = None
+class TestAutotuneFreeze(unittest.TestCase):
+    def tearDown(self):
+        tuning._frozen = False  # global switch; restore for other tests
+
+    def test_freeze_is_one_way_and_idempotent(self):
+        self.assertFalse(tuning.autotune_frozen())
+        tuning.freeze_autotuning()
+        self.assertTrue(tuning.autotune_frozen())
+        tuning.freeze_autotuning()
+        self.assertTrue(tuning.autotune_frozen())
 
 
-class KVPoll:
-    Failed = 0
-    Bootstrapping = 1
-    Bootstrapped = 2
-    WaitingForInput = 3
-    Transferring = 4
-    Success = 5
+if __name__ == "__main__":
+    unittest.main()

@@ -115,6 +115,7 @@ def test_extend_tracks_last_inserted_page_boundary_when_branch_is_earlier():
     metadata = backend.forward_metadata
 
     assert metadata.track_ssm_h_src.tolist() == [1]
+    assert metadata.track_ssm_h_src_fla.tolist() == [2]
     assert metadata.track_ssm_h_dst.tolist() == [5]
     assert metadata.track_ssm_final_dst is None
 
@@ -136,6 +137,7 @@ def test_extend_tracks_last_inserted_page_boundary_without_branch_hint():
     metadata = backend.forward_metadata
 
     assert metadata.track_ssm_h_src.tolist() == [0]
+    assert metadata.track_ssm_h_src_fla.tolist() == [1]
 
 
 def test_extend_skips_unaligned_inserted_page_boundary():

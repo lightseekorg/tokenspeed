@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: Copyright (c) 2026 LightSeek Foundation
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
+#
 # Copyright (c) 2026 LightSeek Foundation
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -18,18 +22,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from dataclasses import dataclass
+# -*- coding: utf-8 -*-
 
-from tokenspeed.runtime.pd.base.conn import (
-    KVArgs,
-    KVPoll,
-)
+from tokenspeed_kernel._triton import tl, triton
 
-__all__ = ("BootstrapInfo", "KVArgs", "KVPoll")
+exp = tl.exp
 
 
-@dataclass
-class BootstrapInfo:
-    bootstrap_host: str
-    bootstrap_port: int
-    bootstrap_room: int
+@triton.jit
+def safe_exp(x):
+    return exp(tl.where(x <= 0, x, float("-inf")))

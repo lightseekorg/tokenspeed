@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <numeric>
 #include <stdexcept>
 #include <utility>
@@ -99,6 +100,19 @@ HybridPrefixCache::HybridPrefixCache(KVPrefixCache& kv_prefix_cache, MambaChunkA
       mamba_host_allocator_{mamba_host_allocator},
       mamba_eviction_manager_{mamba_allocator},
       mamba_cache_chunk_size_{mamba_cache_chunk_size} {}
+
+HybridPrefixCache::~HybridPrefixCache() {
+    // Paged snapshots live on KVPrefixCache TreeNodes but own pages from the
+    // group allocators below. Scheduler destroys HybridPrefixCache before the
+    // KV tree, so detach every external owner while those allocators are still
+    // alive. Request tables are cleared first to drop their borrowed ids and
+    // return any request-owned tail pages.
+    request_paged_cache_tables_.clear();
+    while (!paged_cache_snapshot_nodes_.empty()) {
+        TreeNode* node = *paged_cache_snapshot_nodes_.begin();
+        DetachPagedCacheSnapshotFromNode(node);
+    }
+}
 
 MatchResult HybridPrefixCache::Match(const token_vec_t& token_ids, MatchIntent intent) {
     auto match = kv_prefix_cache_.Match(token_ids, intent);
@@ -430,7 +444,7 @@ bool HybridPrefixCache::commitTerminalContinuationSnapshot(std::map<std::string,
         PagedCacheGroupSnapshot group_snap{};
         group_snap.pages = std::move(result.pages);
         group_snap.base_logical_page = result.segment_base_logical_page;
-        group_snap.raw_token_cursor = action.table->RawTokenCursor();
+        group_snap.raw_token_cursor = target;
         group_snap.sliding = action.table->IsSliding();
         snapshot->groups.emplace(action.gid, std::move(group_snap));
     }
@@ -457,6 +471,35 @@ std::unique_ptr<PagedCacheSnapshot> HybridPrefixCache::DetachPagedCacheSnapshotF
     return node->DetachPagedCacheSnapshot();
 }
 
+bool HybridPrefixCache::isPagedCacheSnapshotBorrowed(const TreeNode* node,
+                                                     std::optional<PagedCacheGroupFamily> family) const {
+    if (node == nullptr) return false;
+    const PagedCacheSnapshot* snapshot = node->GetPagedCacheSnapshot();
+    if (snapshot == nullptr) return false;
+
+    for (const auto& [_, tables] : request_paged_cache_tables_) {
+        for (const auto& [group_id, group_snapshot] : snapshot->groups) {
+            if (family.has_value()) {
+                auto allocator_it = paged_cache_allocators_.find(group_id);
+                if (allocator_it == paged_cache_allocators_.end() || allocator_it->second == nullptr ||
+                    allocator_it->second->Config().family != *family) {
+                    continue;
+                }
+            }
+            auto table_it = tables.find(group_id);
+            if (table_it == tables.end()) continue;
+            const auto& borrowed = table_it->second.BorrowedPageIds();
+            const auto& snapshot_pages = group_snapshot.pages.Ids();
+            if (std::any_of(snapshot_pages.begin(), snapshot_pages.end(), [&borrowed](std::int32_t page_id) {
+                    return std::find(borrowed.begin(), borrowed.end(), page_id) != borrowed.end();
+                })) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 void HybridPrefixCache::OnKVEvict(TreeNode* node) {
     if (node == nullptr) return;
     if (mamba_allocator_ != nullptr && node->HasMamba()) {
@@ -466,10 +509,10 @@ void HybridPrefixCache::OnKVEvict(TreeNode* node) {
             mamba_eviction_manager_.UpdateLeaf(node->Parent());
         }
     }
-    // Passive paged-cache detach on KV LRU drop: returns OwnedPages via RAII;
-    // the chain scan sees the gap because `HasPagedCacheSnapshot()` is false.
-    // Route through DetachPagedCacheSnapshotFromNode to keep membership set in sync.
-    if (node->HasPagedCacheSnapshot()) {
+    // Passive paged-cache detach on KV LRU drop normally returns OwnedPages
+    // via RAII. A retracted/loadback request's side table can outlive the
+    // device KV resource, so retain snapshots whose page ids it still borrows.
+    if (node->HasPagedCacheSnapshot() && !isPagedCacheSnapshotBorrowed(node)) {
         DetachPagedCacheSnapshotFromNode(node);
     }
 }
@@ -492,6 +535,8 @@ void HybridPrefixCache::OnNodeDestroyed(TreeNode* node) {
         }
     }
     if (node->HasPagedCacheSnapshot()) {
+        _assert(!isPagedCacheSnapshotBorrowed(node),
+                "HybridPrefixCache::OnNodeDestroyed: paged snapshot still has a request-table borrower");
         DetachPagedCacheSnapshotFromNode(node);
     }
     // Host-side Mamba L2 bookkeeping (no-op when the L2 pool is disabled, since
@@ -1084,16 +1129,25 @@ void HybridPrefixCache::ReleaseRequest(const std::string& request_id) {
     DemoteIdleMambaDeviceCopiesPresentOnHost();
 }
 
-void HybridPrefixCache::RewindRequest(const std::string& request_id, std::int32_t accepted_raw_tokens) {
+void HybridPrefixCache::RewindRequest(const std::string& request_id, std::int32_t accepted_raw_tokens,
+                                      std::int32_t protected_tail_tokens) {
     if (accepted_raw_tokens < 0) {
         throw std::invalid_argument("HybridPrefixCache::RewindRequest: accepted_raw_tokens must be >= 0");
+    }
+    if (protected_tail_tokens < 0) {
+        throw std::invalid_argument("HybridPrefixCache::RewindRequest: protected_tail_tokens must be >= 0");
+    }
+    const std::int64_t target =
+        static_cast<std::int64_t>(accepted_raw_tokens) + static_cast<std::int64_t>(protected_tail_tokens);
+    if (target > std::numeric_limits<std::int32_t>::max()) {
+        throw std::overflow_error("HybridPrefixCache::RewindRequest: retained target exceeds int32 range");
     }
     auto it = request_paged_cache_tables_.find(request_id);
     if (it == request_paged_cache_tables_.end()) {
         return;
     }
     for (auto& [_, table] : it->second) {
-        table.RewindTail(accepted_raw_tokens);
+        table.RewindTail(static_cast<std::int32_t>(target));
     }
 }
 
@@ -1138,8 +1192,7 @@ HybridPrefixCache::PagedCacheGroupAdmission HybridPrefixCache::checkPagedCacheGr
         }
     }
 
-    auto req_it =
-        context.fresh_table_view ? request_paged_cache_tables_.end() : request_paged_cache_tables_.find(request_id);
+    auto req_it = request_paged_cache_tables_.find(request_id);
     const bool has_hit = (paged_cache_hit.last_node != nullptr) && (paged_cache_hit.prefix_len_tokens > 0);
     for (const auto& [gid, allocator] : paged_cache_allocators_) {
         const auto& cfg = allocator->Config();
@@ -1267,11 +1320,6 @@ HybridPrefixCache::PagedCacheGroupAdmission HybridPrefixCache::checkPagedCacheGr
         if (sf_it != simulated_free.end()) {
             free = sf_it->second;
         }
-        auto credit_it = context.owned_release_credit.find(gid);
-        if (credit_it != context.owned_release_credit.end()) {
-            free += credit_it->second;
-        }
-
         result.releasable_owned_pages[gid] = releasable_owned;
         result.new_pages_needed[gid] = new_pages;
         if (free + releasable_owned < new_pages) {
@@ -1334,9 +1382,6 @@ bool HybridPrefixCache::admitPagedCacheChunk(const std::string& request_id, std:
                                                   simulated_free, paged_cache_hit, context);
     }
     if (!admission.ok) return false;
-    for (const auto& [gid, credit] : context.owned_release_credit) {
-        simulated_free[gid] += credit;
-    }
     applyPagedCacheGroupAdmissionDebit(simulated_free, admission);
     return true;
 }
@@ -1367,7 +1412,8 @@ bool HybridPrefixCache::tryPrunePagedCacheSnapshot(AdmissionFailureKind kind) {
     if (!HasPagedCacheAdjunct()) return false;
     if (kind == AdmissionFailureKind::kNone) return false;
 
-    auto is_pinned = [](TreeNode* node) {
+    auto is_pinned = [this](TreeNode* node, std::optional<PagedCacheGroupFamily> borrowed_family = std::nullopt) {
+        if (isPagedCacheSnapshotBorrowed(node, borrowed_family)) return true;
         for (TreeNode* cur = node; cur != nullptr && !cur->IsRoot(); cur = cur->Parent()) {
             if (!cur->OnDevice()) continue;
             if (cur->Device().RefCount() > 0) return true;
@@ -1391,7 +1437,7 @@ bool HybridPrefixCache::tryPrunePagedCacheSnapshot(AdmissionFailureKind kind) {
 
     auto try_state_only = [&]() {
         for (TreeNode* node : candidates) {
-            if (is_pinned(node)) continue;
+            if (is_pinned(node, PagedCacheGroupFamily::State)) continue;
             const auto* snap = node->GetPagedCacheSnapshot();
             if (snap == nullptr) continue;
             if (!snap->IsCompleteFor(PagedCacheGroupFamily::State) && !snap->continuation_state_complete) continue;
@@ -1457,19 +1503,6 @@ bool HybridPrefixCache::AdmitChunk(const std::string& request_id, std::int32_t f
     };
     return admitPagedCacheChunk(request_id, first_raw_position_of_op, target_raw_tokens_exclusive, simulated_free,
                                 paged_cache_hit, context);
-}
-
-bool HybridPrefixCache::AdmitChunkFromRetracted(const std::string& request_id, std::int32_t target_raw_tokens_exclusive,
-                                                std::map<std::string, std::int32_t>& simulated_free,
-                                                const MatchResult::PagedCache& paged_cache_hit) {
-    PagedCacheAdmissionContext context{.fresh_table_view = true};
-    auto req_it = request_paged_cache_tables_.find(request_id);
-    if (req_it != request_paged_cache_tables_.end()) {
-        for (const auto& [gid, table] : req_it->second) {
-            context.owned_release_credit[gid] = table.OwnedPagesCount();
-        }
-    }
-    return admitPagedCacheChunk(request_id, 0, target_raw_tokens_exclusive, simulated_free, paged_cache_hit, context);
 }
 
 void HybridPrefixCache::CommitChunk(const std::string& request_id, TreeNode* terminal) {
@@ -1577,7 +1610,7 @@ void HybridPrefixCache::CommitChunk(const std::string& request_id, TreeNode* ter
             PagedCacheGroupSnapshot group_snap{};
             group_snap.pages = std::move(result.pages);
             group_snap.base_logical_page = result.segment_base_logical_page;
-            group_snap.raw_token_cursor = table.RawTokenCursor();
+            group_snap.raw_token_cursor = target;
             group_snap.sliding = table.IsSliding();
             snapshot->groups.emplace(gid, std::move(group_snap));
         }
@@ -1614,14 +1647,11 @@ void HybridPrefixCache::CommitChunk(const std::string& request_id, TreeNode* ter
     //   (1) the owning request's sliding window has advanced past the ancestor
     //       (node_depth + window <= chunk_depth), so ReleaseSkipped has already
     //       dropped those pages from this request's own borrowed set; and
-    //   (2) no OTHER request references the ancestor. Each request holds exactly
-    //       one DeviceNodeRef that Locks its whole path to root (NodeRef::Lock),
-    //       so Device().RefCount() == 1 means this committing request is the
-    //       sole referencer and no other request can be borrowing the node's
-    //       continuation-state window. When shared (RefCount > 1, e.g. a second
-    //       request whose prefix runs through this node), keep the snapshot so
-    //       the sharer's continuation-state resume stays valid; it is released
-    //       on a later commit once the sharer's ref drops.
+    //   (2) no request table still borrows the ancestor's State pages.
+    //       Device().RefCount() == 1 means this committing request is the sole
+    //       active device referencer, but its own table must still be checked:
+    //       an already-existing terminal snapshot can skip State adoption and
+    //       leave an older borrow alive.
     // Gate on a complete terminal snapshot so a resume anchor always remains.
     if (terminal_state_committed) {
         std::int32_t max_state_window = 0;
@@ -1638,6 +1668,7 @@ void HybridPrefixCache::CommitChunk(const std::string& request_id, TreeNode* ter
                 continue;
             }
             if (!cur->OnDevice() || cur->Device().RefCount() != 1) continue;
+            if (isPagedCacheSnapshotBorrowed(cur, PagedCacheGroupFamily::State)) continue;
             DetachStateSnapshotFromNode(cur);
         }
     }

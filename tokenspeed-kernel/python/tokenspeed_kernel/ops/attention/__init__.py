@@ -31,6 +31,10 @@ import tokenspeed_kernel.ops.attention.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.attention.gluon  # noqa: F401
 import tokenspeed_kernel.ops.attention.triton  # noqa: F401
 import torch
+from tokenspeed_kernel.ops.attention.gdn_utils import (
+    GdnCheckpointLayout,
+    GdnChunkPrefillResult,
+)
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry, Priority
@@ -54,6 +58,9 @@ __all__ = [
     "mha_prefill",
     "mha_extend_with_kvcache",
     "mha_decode_with_kvcache",
+    "gdn_chunk_prefill",
+    "GdnCheckpointLayout",
+    "GdnChunkPrefillResult",
     "mla_prefill",
     "mla_decode_with_kvcache",
     "dsa_prefill",
@@ -66,6 +73,109 @@ __all__ = [
 ]
 
 LSE_LN = math.log2(math.e)
+
+
+# ===-----------------------------------------------------------------------===#
+# GDN Kernels
+# ===-----------------------------------------------------------------------===#
+
+
+def gdn_chunk_prefill(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    *,
+    scale: float | None,
+    initial_state: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    qk_l2norm: bool = False,
+    output_final_state: bool = True,
+    output_h: bool = False,
+    override: str | None = None,
+    solution: str | None = None,
+) -> GdnChunkPrefillResult:
+    """Run Gated Delta Net chunked prefill through kernel selection.
+
+    Args:
+        q: Query tensor shaped ``[1, total_tokens, num_q_heads, head_dim]``.
+        k: Key tensor shaped ``[1, total_tokens, num_k_heads, head_dim]``.
+        v: Value tensor shaped ``[1, total_tokens, num_v_heads, head_v_dim]``.
+        g: Log-space forget gate shaped ``[1, total_tokens, num_v_heads]``.
+        beta: Beta gate shaped ``[1, total_tokens, num_v_heads]``.
+        scale: Attention scale. ``None`` lets the implementation use its default.
+        initial_state: Recurrent state shaped ``[batch, num_v_heads, head_dim, head_v_dim]``.
+        cu_seqlens: Cumulative sequence lengths for variable-length prefill.
+        qk_l2norm: Whether the selected kernel should L2-normalize Q/K.
+        output_final_state: Whether to return the final recurrent state.
+        output_h: Whether to return intermediate recurrent checkpoints in the
+            selected backend's native layout.
+        override: Optional kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+
+    Returns:
+        ``GdnChunkPrefillResult`` with output, final state, and optional
+        backend-native recurrent checkpoints.
+    """
+    head_dim = q.shape[-1]
+    head_v_dim = v.shape[-1]
+    num_q_heads = q.shape[-2]
+    num_v_heads = v.shape[-2]
+    traits = {
+        "head_dim": head_dim,
+        "head_v_dim": head_v_dim,
+        "head_v_eq_head_k": head_v_dim == k.shape[-1],
+        "num_v_gte_num_q": num_v_heads >= num_q_heads,
+        "qk_l2norm": qk_l2norm,
+        "output_h": output_h,
+    }
+    signature = _attention_format_signature(q=q, k=k, v=v)
+    kernel = select_kernel(
+        "attention",
+        "gdn_chunk_prefill",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+
+    shape_params = {
+        "batch_size": cu_seqlens.shape[0] - 1,
+        "total_tokens": q.shape[1] if q.dim() == 4 else q.shape[0],
+        "num_q_heads": num_q_heads,
+        "num_v_heads": num_v_heads,
+        "head_dim": head_dim,
+        "head_v_dim": head_v_dim,
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "gdn_chunk_prefill",
+        kernel.name,
+        q.dtype,
+        shape_params,
+    )
+
+    with kernel_scope(
+        "attention",
+        "gdn_chunk_prefill",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            scale=scale,
+            initial_state=initial_state,
+            cu_seqlens=cu_seqlens,
+            qk_l2norm=qk_l2norm,
+            output_final_state=output_final_state,
+            output_h=output_h,
+        )
 
 
 # ===-----------------------------------------------------------------------===#
@@ -953,6 +1063,7 @@ def dsa_decode_topk(
     softmax_scale: float,
     q_len_per_req: int = 1,
     index_k_cache: torch.Tensor | None = None,
+    seq_lens_2d: torch.Tensor | None = None,
     plan: object | None = None,
     out: torch.Tensor | None = None,
     lens_out: torch.Tensor | None = None,
@@ -964,12 +1075,16 @@ def dsa_decode_topk(
     Args:
         q: BF16 indexer query with shape [tokens, index_heads, head_dim].
         weights: FP32 per-token/head weights with shape [tokens, index_heads].
-        seq_lens: Visible KV length per query token, shape [tokens].
-        block_table: Paged KV block table with one row per query token.
+        seq_lens: Per-request full KV length, shape [num_reqs] (= tokens /
+            q_len_per_req). Each query token's causal bound
+            seq_lens[req] - (q_len_per_req - 1) + j is derived in-kernel.
+        block_table: Paged KV block table with one row per request,
+            shape [num_reqs, max_pages].
         page_size: Number of tokens per KV page.
         topk: Number of KV candidates to select.
         softmax_scale: Score scale, normally index_head_dim ** -0.5.
-        q_len_per_req: Query rows per request. Plain decode uses 1.
+        q_len_per_req: Query rows per request (spec-verify next_n). Plain
+            decode uses 1, where per-request is equivalent to per-token.
         index_k_cache: Packed FP8 index-K cache with scales (uint8). Used by
             both Triton and DeepGEMM.
         plan: Optional opaque backend-specific plan.
@@ -1035,6 +1150,7 @@ def dsa_decode_topk(
             softmax_scale=softmax_scale,
             q_len_per_req=q_len_per_req,
             index_k_cache=index_k_cache,
+            seq_lens_2d=seq_lens_2d,
             plan=plan,
             out=out,
             lens_out=lens_out,
@@ -1042,10 +1158,9 @@ def dsa_decode_topk(
 
 
 def dsa_plan(
-    seq_lens: torch.Tensor,
     *,
     page_size: int,
-    q_len_per_req: int = 1,
+    seq_lens_2d: torch.Tensor,
     out: object | None = None,
     override: str | None = None,
     solution: str | None = None,
@@ -1053,10 +1168,9 @@ def dsa_plan(
     """Build or refresh an opaque plan for DSA decode top-k.
 
     Args:
-        seq_lens: Visible KV length per query token, shape [tokens] or
-            [batch, q_len_per_req].
         page_size: KV cache page size.
-        q_len_per_req: Query rows per request. Plain decode uses 1.
+        seq_lens_2d: Prebuilt [num_reqs, next_n] context_lens (last column =
+            full per-request KV length), built once per forward by the caller.
         out: Optional previously allocated plan object to refresh in place.
         override: Optional exact kernel override name.
         solution: Optional kernel solution to force through normal selection.
@@ -1065,14 +1179,12 @@ def dsa_plan(
         Opaque backend-owned plan object, or None when no selected backend needs
         an explicit plan.
     """
-    if seq_lens.dtype != torch.int32:
-        seq_lens = seq_lens.to(torch.int32)
-    q_len_per_req = int(q_len_per_req)
+    if seq_lens_2d.dtype != torch.int32:
+        seq_lens_2d = seq_lens_2d.to(torch.int32)
     traits = {
         "page_size": int(page_size),
-        "q_len_per_req": q_len_per_req,
     }
-    signature = format_signature(seq_lens=dense_tensor_format(seq_lens.dtype))
+    signature = format_signature()
     try:
         kernel = select_kernel(
             "attention",
@@ -1085,32 +1197,24 @@ def dsa_plan(
     except NoKernelFoundError:
         return None
 
-    if seq_lens.dim() == 1:
-        batch_size = int(seq_lens.numel()) // max(q_len_per_req, 1)
-        tokens = int(seq_lens.numel())
-    else:
-        batch_size = int(seq_lens.shape[0])
-        tokens = int(seq_lens.numel())
     shape_params = {
-        "batch_size": batch_size,
-        "tokens": tokens,
-        "q_len_per_req": q_len_per_req,
+        "batch_size": int(seq_lens_2d.shape[0]),
+        "tokens": int(seq_lens_2d.numel()),
         "page_size": int(page_size),
     }
     ShapeCapture.get().record(
-        "attention", "dsa_plan", kernel.name, seq_lens.dtype, shape_params
+        "attention", "dsa_plan", kernel.name, seq_lens_2d.dtype, shape_params
     )
     with kernel_scope(
         "attention",
         "dsa_plan",
-        seq_lens.dtype,
+        seq_lens_2d.dtype,
         kernel_name=kernel.name,
         **shape_params,
     ):
         return kernel(
-            seq_lens=seq_lens,
+            seq_lens_2d=seq_lens_2d,
             page_size=page_size,
-            q_len_per_req=q_len_per_req,
             out=out,
         )
 
@@ -1127,6 +1231,8 @@ def attn_merge_state(
     lse_b: torch.Tensor,
     *,
     lse_scale_log2: float = LSE_LN,
+    inplace: bool = False,
+    enable_pdl: bool = False,
     override: str | None = None,
     solution: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1138,6 +1244,8 @@ def attn_merge_state(
         out_b: Second partial output with shape [total_q, num_heads, head_dim].
         lse_b: Second partial log-sum-exp with shape [total_q, num_heads].
         lse_scale_log2: Multiplier that converts input LSE to log2 domain.
+        inplace: Whether to write the merged state back into ``out_a``/``lse_a``.
+        enable_pdl: Whether the selected backend should enable PDL when supported.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
@@ -1183,6 +1291,8 @@ def attn_merge_state(
             out_b=out_b,
             lse_b=lse_b,
             lse_scale_log2=lse_scale_log2,
+            inplace=inplace,
+            enable_pdl=enable_pdl,
         )
 
 

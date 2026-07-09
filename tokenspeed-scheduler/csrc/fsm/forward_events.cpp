@@ -371,6 +371,14 @@ std::variant<Draining, Finished> FinishEvent::apply(ForwardStateT&& state) {
 
     auto local_mamba_allocator = std::move(state).TakeLocalMambaAllocator();
     auto local_allocator = std::move(state).TakeLocalKVAllocator();
+    // Overlap / disagg handoff can grow the token container past the pages this
+    // request actually Acquired (the terminal token's Acquire is skipped). Clamp
+    // to owned pages, as scheduleRetract does.
+    const std::int32_t owned_pages = local_allocator->PageCount();
+    if (alloc_count > owned_pages) {
+        full_paged_tokens.resize(static_cast<std::size_t>(owned_pages) + prefix_pages.size());
+        alloc_count = owned_pages;
+    }
     if (alloc_count > 0) {
         // Same page-aligned clamp as InsertHybridCache, keeping prefix + inserted == full.
         const std::int32_t avail = static_cast<std::int32_t>(local_allocator->PageCount());

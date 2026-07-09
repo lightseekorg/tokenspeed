@@ -28,9 +28,7 @@ import numpy.typing as npt
 import requests
 import zmq
 
-from tokenspeed.runtime.pd.base.conn import (
-    KVPoll,
-)
+from tokenspeed.runtime.pd.base.status import TransferPoll
 from tokenspeed.runtime.pd.mooncake.entities import KVTransferError
 from tokenspeed.runtime.pd.transfer_plan import (
     BufferKind,
@@ -439,7 +437,7 @@ class MooncakeKVReceiver:
         self.prefill_enable_mla_l1_5_cache = None
         self.dst_enable_mla_l1_5_cache = False
 
-        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
+        self.kv_mgr.update_status(self.bootstrap_room, TransferPoll.Bootstrapping)
         logger.info(
             "[MooncakeKVReceiver.__init__] bootstrap_addr=%s bootstrap_room=%s session_id=%s",
             bootstrap_addr,
@@ -453,7 +451,7 @@ class MooncakeKVReceiver:
                 self.bootstrap_room,
                 f"Could not fetch prefill parallel info from bootstrap_addr: {self.bootstrap_addr}",
             )
-            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            self.kv_mgr.update_status(self.bootstrap_room, TransferPoll.Failed)
 
         route_plan = _calc(self.kv_mgr, prefill_parallel_info)
         self.route_plan = route_plan
@@ -474,7 +472,7 @@ class MooncakeKVReceiver:
                     self.bootstrap_room,
                     f"Could not fetch bootstrap info for engine rank: {self.kv_mgr.kv_args.engine_rank} and target_dp_group: {target_dp_group}",
                 )
-                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                self.kv_mgr.update_status(self.bootstrap_room, TransferPoll.Failed)
             else:
                 if not bootstrap_infos:
                     raise RuntimeError("Could not fetch bootstrap info.")
@@ -486,7 +484,7 @@ class MooncakeKVReceiver:
             self.bootstrap_infos = self.kv_mgr.connection_pool[bootstrap_key]
 
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
-        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapped)
+        self.kv_mgr.update_status(self.bootstrap_room, TransferPoll.Bootstrapped)
         logger.info(
             "[MooncakeKVReceiver.__init__] done, status set to Bootstrapped. "
             "bootstrap_room=%s bootstrap_addr=%s session_id=%s",
@@ -678,12 +676,12 @@ class MooncakeKVReceiver:
                 sock.send_multipart(message_parts)
             self.init_time = time.time()
 
-    def poll(self) -> KVPoll:
+    def poll(self) -> TransferPoll:
         if self.conclude_state is None:
             status = self.kv_mgr.check_status(self.bootstrap_room)
-            if status in (KVPoll.Success, KVPoll.Failed):
+            if status in (TransferPoll.Success, TransferPoll.Failed):
                 self.conclude_state = status
-            elif status == KVPoll.WaitingForInput:
+            elif status == TransferPoll.WaitingForInput:
                 if self.init_time is not None:
                     now = time.time()
                     elapsed = now - self.init_time
@@ -694,11 +692,11 @@ class MooncakeKVReceiver:
                         )
                         self.kv_mgr.record_failure(
                             self.bootstrap_room,
-                            f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s in KVPoll.WaitingForInput",
+                            f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s in TransferPoll.WaitingForInput",
                         )
-                        self.conclude_state = KVPoll.Failed
-                        return KVPoll.Failed
-            elif status == KVPoll.Transferring:
+                        self.conclude_state = TransferPoll.Failed
+                        return TransferPoll.Failed
+            elif status == TransferPoll.Transferring:
                 logger.warning(
                     "Req(room=%s) in Transferring, which is unexpected",
                     self.bootstrap_room,
@@ -721,7 +719,7 @@ class MooncakeKVReceiver:
     def failure_exception(self):
         # Explicitly set the status to failure since this request has failed in another rank
         if self.conclude_state is None:
-            self.conclude_state = KVPoll.Failed
+            self.conclude_state = TransferPoll.Failed
 
         self.clear()
 
