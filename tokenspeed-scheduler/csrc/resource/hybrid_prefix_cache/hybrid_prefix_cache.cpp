@@ -145,7 +145,25 @@ void HybridPrefixCache::augmentMatch(MatchResult& match) const {
         const std::int32_t host_depth = host_terminal != nullptr ? host_terminal->DepthInPage(page_size) : 0;
         const std::int32_t kv_depth = device_depth;
         TreeNode* kv_terminal = device_terminal;
-        if (kv_terminal == nullptr || kv_terminal->IsRoot()) return;
+        if (kv_terminal == nullptr || kv_terminal->IsRoot()) {
+            if (host_terminal != nullptr && !host_terminal->IsRoot()) {
+                TreeNode* mamba_node = FindLastMambaNode(host_terminal);
+                if (mamba_node != nullptr) {
+                    match.mamba_cow_src_index = mamba_node->MambaSlotIndex();
+                    std::int32_t mamba_depth = mamba_node->DepthInPage(page_size);
+                    if (host_depth > mamba_depth) {
+                        const std::int32_t aligned_seqlen = AlignMambaCacheSeqlen(host_depth * page_size);
+                        if (aligned_seqlen > mamba_depth * page_size) {
+                            match.mamba_branching_seqlen = aligned_seqlen;
+                        }
+                    }
+                    return;
+                }
+            }
+            match.device.last_node = root;
+            match.host.last_node = root;
+            return;
+        }
 
         TreeNode* mamba_node = FindLastMambaNode(kv_terminal);
         if (mamba_node == nullptr) {

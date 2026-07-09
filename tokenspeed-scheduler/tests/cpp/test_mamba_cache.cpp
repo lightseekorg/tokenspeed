@@ -117,7 +117,7 @@ TEST_F(MambaCacheTest, MatchWithFullMambaKeepsDepth) {
     EXPECT_EQ(match.mamba_branching_seqlen, -1);
 }
 
-TEST_F(MambaCacheTest, HostKVAfterDemotePreservesHostMatchWithoutMambaCow) {
+TEST_F(MambaCacheTest, HostKVWithDeviceMambaStillProvidesMambaCow) {
     auto tokens = MakeAlignedTokens(3, kPageSize);
     InsertKVAndMamba(tokens);
 
@@ -125,6 +125,7 @@ TEST_F(MambaCacheTest, HostKVAfterDemotePreservesHostMatchWithoutMambaCow) {
     TreeNode* terminal = device_match.device.last_node;
     ASSERT_NE(terminal, nullptr);
     ASSERT_TRUE(terminal->HasMamba());
+    const std::int32_t mamba_slot = terminal->MambaSlotIndex();
 
     ASSERT_TRUE(
         prefix_cache_->AllocateResourceOfType<ResourceType::Host>(device_match.NodesWithout<ResourceType::Host>()));
@@ -137,7 +138,7 @@ TEST_F(MambaCacheTest, HostKVAfterDemotePreservesHostMatchWithoutMambaCow) {
     auto match = hybrid_prefix_cache_->Match(tokens);
     EXPECT_EQ(match.device.DepthInPage(), 0);
     EXPECT_EQ(match.host.DepthInPage(), 3);
-    EXPECT_EQ(match.mamba_cow_src_index, -1);
+    EXPECT_EQ(match.mamba_cow_src_index, mamba_slot);
     EXPECT_EQ(match.mamba_branching_seqlen, -1);
 }
 
