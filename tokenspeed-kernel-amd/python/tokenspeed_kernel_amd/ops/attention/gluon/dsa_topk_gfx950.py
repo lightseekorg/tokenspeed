@@ -23,12 +23,10 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.ops.attention.triton.dsa_topk import (
-    _RADIX_TOPK_MIN_COLS,
-    dsa_decode_topk_fp8 as _triton_dsa_decode_topk_fp8,
-    dsa_prefill_topk_fp8 as _triton_dsa_prefill_topk_fp8,
-)
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
+
+_RADIX_TOPK_MIN_COLS = 65536
+_RADIX_TOPK_BLOCK_N = 4096
 
 __all__ = [
     "gluon_dsa_decode_topk_fp8_gfx950",
@@ -43,6 +41,15 @@ def _vector_layout(
     LOAD_ELEMS: gl.constexpr,
 ):
     return gl.BlockedLayout([LOAD_ELEMS], [64], [NUM_WARPS], [0])
+
+
+@gluon.constexpr_function
+def _score_layout(
+    BLOCK_N: gl.constexpr,
+    BLOCK_D: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+):
+    return gl.BlockedLayout([1, 8], [8, 8], [NUM_WARPS, 1], [1, 0])
 
 
 @gluon.jit
@@ -243,18 +250,22 @@ def _dsa_decode_logits_fp8_kernel(
     num_groups: gl.constexpr,
     softmax_scale: gl.constexpr,
     BLOCK_N: gl.constexpr,
+    BLOCK_D: gl.constexpr,
 ):
     token = gl.program_id(0)
     block_id = gl.program_id(1)
-    offsets = block_id * BLOCK_N + gl.arange(
-        0, BLOCK_N, layout=_vector_layout(BLOCK_N, gl.num_warps(), 1)
-    )
+    layout: gl.constexpr = _score_layout(BLOCK_N, BLOCK_D, gl.num_warps())
+    row_layout: gl.constexpr = gl.SliceLayout(1, layout)
+    dim_layout: gl.constexpr = gl.SliceLayout(0, layout)
+    offsets = block_id * BLOCK_N + gl.arange(0, BLOCK_N, layout=row_layout)
+    dim_offsets = gl.arange(0, BLOCK_D, layout=dim_layout)
     seq_len = gl.load(seq_lens + token).to(gl.int32)
     valid = (offsets < seq_len) & (offsets < max_seq_len)
     block_idx = offsets // page_size
     block_offset = offsets - block_idx * page_size
-    page = gl.load(
-        block_table + token * block_table_stride + block_idx,
+    page = gl.amd.cdna4.buffer_load(
+        ptr=block_table,
+        offsets=(token * block_table_stride + block_idx).to(gl.int32),
         mask=valid,
         other=0,
     ).to(gl.int64)
@@ -269,7 +280,7 @@ def _dsa_decode_logits_fp8_kernel(
         [BLOCK_N],
         value=0.0,
         dtype=gl.float32,
-        layout=_vector_layout(BLOCK_N, gl.num_warps(), 1),
+        layout=row_layout,
     )
 
     for head in gl.static_range(0, num_heads):
@@ -278,23 +289,29 @@ def _dsa_decode_logits_fp8_kernel(
             [BLOCK_N],
             value=0.0,
             dtype=gl.float32,
-            layout=_vector_layout(BLOCK_N, gl.num_warps(), 1),
+            layout=row_layout,
         )
-        for dim in gl.static_range(0, head_dim):
-            q_val = gl.load(q + (token * num_heads + head) * head_dim + dim).to(
-                gl.float32
-            )
-            k_val = gl.load(
-                index_k_fp8 + fp8_base + dim,
+        for dim_start in gl.static_range(0, head_dim, BLOCK_D):
+            dims = dim_start + dim_offsets
+            q_vals = gl.amd.cdna4.buffer_load(
+                ptr=q,
+                offsets=((token * num_heads + head) * head_dim + dims).to(gl.int32),
+                mask=dims < head_dim,
+                other=0.0,
+            ).to(gl.float32)
+            k_vals = gl.amd.cdna4.buffer_load(
+                ptr=index_k_fp8,
+                offsets=(fp8_base[:, None] + dims[None, :]).to(gl.int32),
+                mask=valid[:, None] & (dims[None, :] < head_dim),
+                other=0.0,
+            ).to(gl.float32)
+            k_scale = gl.amd.cdna4.buffer_load(
+                ptr=index_k_scale,
+                offsets=(scale_base + dim_start // 128).to(gl.int32),
                 mask=valid,
                 other=0.0,
             ).to(gl.float32)
-            k_scale = gl.load(
-                index_k_scale + scale_base + dim // 128,
-                mask=valid,
-                other=0.0,
-            ).to(gl.float32)
-            head_score += k_val * k_scale * q_val
+            head_score += gl.sum(k_vals * k_scale[:, None] * q_vals[None, :], axis=1)
         scores += head_score * head_weight
 
     scores *= softmax_scale
@@ -325,16 +342,24 @@ def _dsa_prefill_logits_fp8_kernel(
     num_groups: gl.constexpr,
     softmax_scale: gl.constexpr,
     BLOCK_N: gl.constexpr,
+    BLOCK_D: gl.constexpr,
 ):
     token = gl.program_id(0)
     block_id = gl.program_id(1)
-    offsets = block_id * BLOCK_N + gl.arange(
-        0, BLOCK_N, layout=_vector_layout(BLOCK_N, gl.num_warps(), 1)
-    )
+    layout: gl.constexpr = _score_layout(BLOCK_N, BLOCK_D, gl.num_warps())
+    row_layout: gl.constexpr = gl.SliceLayout(1, layout)
+    dim_layout: gl.constexpr = gl.SliceLayout(0, layout)
+    offsets = block_id * BLOCK_N + gl.arange(0, BLOCK_N, layout=row_layout)
+    dim_offsets = gl.arange(0, BLOCK_D, layout=dim_layout)
     row_start = gl.load(row_starts + token).to(gl.int32)
     row_end = gl.load(row_ends + token).to(gl.int32)
     valid = (offsets >= row_start) & (offsets < row_end) & (offsets < seq_len_sum)
-    slots = gl.load(kv_workspace_slots + offsets, mask=offsets < seq_len_sum, other=0)
+    slots = gl.amd.cdna4.buffer_load(
+        ptr=kv_workspace_slots,
+        offsets=offsets.to(gl.int32),
+        mask=offsets < seq_len_sum,
+        other=0,
+    )
     page = slots // page_size
     block_offset = slots - page * page_size
     page_bytes = page_size * row_bytes
@@ -348,7 +373,7 @@ def _dsa_prefill_logits_fp8_kernel(
         [BLOCK_N],
         value=0.0,
         dtype=gl.float32,
-        layout=_vector_layout(BLOCK_N, gl.num_warps(), 1),
+        layout=row_layout,
     )
 
     for head in gl.static_range(0, num_heads):
@@ -357,23 +382,29 @@ def _dsa_prefill_logits_fp8_kernel(
             [BLOCK_N],
             value=0.0,
             dtype=gl.float32,
-            layout=_vector_layout(BLOCK_N, gl.num_warps(), 1),
+            layout=row_layout,
         )
-        for dim in gl.static_range(0, head_dim):
-            q_val = gl.load(q + (token * num_heads + head) * head_dim + dim).to(
-                gl.float32
-            )
-            k_val = gl.load(
-                index_k_fp8 + fp8_base + dim,
+        for dim_start in gl.static_range(0, head_dim, BLOCK_D):
+            dims = dim_start + dim_offsets
+            q_vals = gl.amd.cdna4.buffer_load(
+                ptr=q,
+                offsets=((token * num_heads + head) * head_dim + dims).to(gl.int32),
+                mask=dims < head_dim,
+                other=0.0,
+            ).to(gl.float32)
+            k_vals = gl.amd.cdna4.buffer_load(
+                ptr=index_k_fp8,
+                offsets=(fp8_base[:, None] + dims[None, :]).to(gl.int32),
+                mask=valid[:, None] & (dims[None, :] < head_dim),
+                other=0.0,
+            ).to(gl.float32)
+            k_scale = gl.amd.cdna4.buffer_load(
+                ptr=index_k_scale,
+                offsets=(scale_base + dim_start // 128).to(gl.int32),
                 mask=valid,
                 other=0.0,
             ).to(gl.float32)
-            k_scale = gl.load(
-                index_k_scale + scale_base + dim // 128,
-                mask=valid,
-                other=0.0,
-            ).to(gl.float32)
-            head_score += k_val * k_scale * q_val
+            head_score += gl.sum(k_vals * k_scale[:, None] * q_vals[None, :], axis=1)
         scores += head_score * head_weight
 
     scores *= softmax_scale
@@ -381,6 +412,266 @@ def _dsa_prefill_logits_fp8_kernel(
     gl.store(
         logits + token * logits_stride + offsets, scores, mask=offsets < seq_len_sum
     )
+
+
+@gluon.jit
+def _dsa_decode_radix_init_kernel(
+    seq_lens,
+    out,
+    lens_out,
+    prefixes,
+    remaining,
+    counters,
+    out_stride: gl.constexpr,
+    topk: gl.constexpr,
+    TOPK_LOAD_ELEMS: gl.constexpr,
+):
+    row = gl.program_id(0)
+    top_layout: gl.constexpr = _vector_layout(topk, gl.num_warps(), TOPK_LOAD_ELEMS)
+    top_offsets = gl.arange(0, topk, layout=top_layout)
+    seq_len = gl.load(seq_lens + row).to(gl.int32)
+    lens = gl.minimum(seq_len, topk).to(gl.int32)
+    gl.store(lens_out + row, lens)
+    gl.store(prefixes + row, 0)
+    gl.store(remaining + row, lens)
+    gl.store(counters + row * 2, 0)
+    gl.store(counters + row * 2 + 1, 0)
+    gl.store(out + row * out_stride + top_offsets, -1, mask=top_offsets < topk)
+
+
+@gluon.jit
+def _dsa_prefill_radix_init_kernel(
+    row_starts,
+    row_ends,
+    out,
+    lens_out,
+    prefixes,
+    remaining,
+    counters,
+    out_stride: gl.constexpr,
+    topk: gl.constexpr,
+    TOPK_LOAD_ELEMS: gl.constexpr,
+):
+    row = gl.program_id(0)
+    top_layout: gl.constexpr = _vector_layout(topk, gl.num_warps(), TOPK_LOAD_ELEMS)
+    top_offsets = gl.arange(0, topk, layout=top_layout)
+    row_start = gl.load(row_starts + row).to(gl.int32)
+    row_end = gl.load(row_ends + row).to(gl.int32)
+    candidate_len = gl.maximum(row_end - row_start, 0)
+    lens = gl.minimum(candidate_len, topk).to(gl.int32)
+    gl.store(lens_out + row, lens)
+    gl.store(prefixes + row, 0)
+    gl.store(remaining + row, lens)
+    gl.store(counters + row * 2, 0)
+    gl.store(counters + row * 2 + 1, 0)
+    gl.store(out + row * out_stride + top_offsets, -1, mask=top_offsets < topk)
+
+
+@gluon.jit
+def _dsa_radix_hist_kernel(
+    logits,
+    prefixes,
+    hist,
+    logits_stride: gl.constexpr,
+    hist_tiles: gl.constexpr,
+    n_cols: gl.constexpr,
+    shift: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    LOAD_ELEMS: gl.constexpr,
+):
+    row = gl.program_id(0)
+    tile = gl.program_id(1)
+    layout: gl.constexpr = _vector_layout(BLOCK_N, gl.num_warps(), LOAD_ELEMS)
+    offsets = tile * BLOCK_N + gl.arange(0, BLOCK_N, layout=layout)
+    mask = offsets < n_cols
+    values = gl.load(
+        logits + row * logits_stride + offsets,
+        mask=mask,
+        other=-float("inf"),
+    )
+    keys = _fp32_to_ordered_key(values)
+    prefix = gl.load(prefixes + row).to(gl.uint32)
+    if shift == 28:
+        prefix_match = mask
+    else:
+        prefix_match = (keys >> (shift + 4)) == prefix
+    bucket = (keys >> shift) & 0xF
+    base = (row * hist_tiles + tile) * 16
+    for bucket_id in gl.static_range(0, 16):
+        count = gl.sum(
+            gl.where(
+                mask & prefix_match & (bucket == bucket_id),
+                gl.full([BLOCK_N], 1, gl.int32, layout=layout),
+                gl.full([BLOCK_N], 0, gl.int32, layout=layout),
+            ),
+            axis=0,
+        ).to(gl.int32)
+        gl.store(hist + base + bucket_id, count)
+
+
+@gluon.jit
+def _dsa_radix_update_kernel(
+    prefixes,
+    remaining,
+    hist,
+    hist_tiles: gl.constexpr,
+    BLOCK_TILES: gl.constexpr,
+    LOAD_ELEMS: gl.constexpr,
+):
+    row = gl.program_id(0)
+    layout: gl.constexpr = _vector_layout(BLOCK_TILES, gl.num_warps(), LOAD_ELEMS)
+    tile_offsets = gl.arange(0, BLOCK_TILES, layout=layout)
+    tile_mask = tile_offsets < hist_tiles
+    row_hist = hist + row * hist_tiles * 16
+    kth = gl.load(remaining + row).to(gl.int32)
+    cumulative = gl.full((), 0, dtype=gl.int32)
+    selected = gl.full((), 0, dtype=gl.uint32)
+    selected_remaining = kth
+    found = gl.full((), 0, dtype=gl.int32)
+
+    for bucket_desc in gl.static_range(0, 16):
+        bucket_id = 15 - bucket_desc
+        counts = gl.load(
+            row_hist + tile_offsets * 16 + bucket_id,
+            mask=tile_mask,
+            other=0,
+        )
+        count = gl.sum(counts, axis=0).to(gl.int32)
+        take = (found == 0) & (kth <= cumulative + count)
+        selected = gl.where(take, bucket_id, selected)
+        selected_remaining = gl.where(take, kth - cumulative, selected_remaining)
+        cumulative += gl.where(found == 0, count, 0)
+        found = gl.where(take, 1, found)
+
+    prefix = gl.load(prefixes + row).to(gl.uint32)
+    gl.store(prefixes + row, ((prefix << 4) | selected).to(gl.int32))
+    gl.store(remaining + row, selected_remaining)
+
+
+@gluon.jit
+def _dsa_decode_radix_scatter_slots_kernel(
+    logits,
+    prefixes,
+    remaining,
+    counters,
+    block_table,
+    seq_lens,
+    out,
+    logits_stride: gl.constexpr,
+    block_table_stride: gl.constexpr,
+    out_stride: gl.constexpr,
+    block_table_cols: gl.constexpr,
+    n_cols: gl.constexpr,
+    page_size: gl.constexpr,
+    topk: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    LOAD_ELEMS: gl.constexpr,
+):
+    row = gl.program_id(0)
+    tile = gl.program_id(1)
+    layout: gl.constexpr = _vector_layout(BLOCK_N, gl.num_warps(), LOAD_ELEMS)
+    offsets = tile * BLOCK_N + gl.arange(0, BLOCK_N, layout=layout)
+    seq_len = gl.load(seq_lens + row).to(gl.int32)
+    mask = (offsets < n_cols) & (offsets < seq_len)
+    values = gl.load(
+        logits + row * logits_stride + offsets,
+        mask=mask,
+        other=-float("inf"),
+    )
+    threshold = gl.load(prefixes + row).to(gl.uint32)
+    keep_equal = gl.load(remaining + row).to(gl.int32)
+    count_greater = topk - keep_equal
+    finite = values != -float("inf")
+    keys = _fp32_to_ordered_key(values)
+    greater = mask & finite & (keys > threshold)
+    equal = mask & finite & (keys == threshold)
+
+    greater_i32 = greater.to(gl.int32)
+    equal_i32 = equal.to(gl.int32)
+    tile_greater = gl.sum(greater_i32, axis=0).to(gl.int32)
+    tile_equal = gl.sum(equal_i32, axis=0).to(gl.int32)
+    greater_start = gl.atomic_add(
+        counters + row * 2, tile_greater, sem="acq_rel", scope="gpu"
+    )
+    equal_start = gl.atomic_add(
+        counters + row * 2 + 1, tile_equal, sem="acq_rel", scope="gpu"
+    )
+
+    greater_pos = greater_start + gl.associative_scan(greater_i32, 0, _topk_add) - 1
+    equal_pos = (
+        count_greater + equal_start + gl.associative_scan(equal_i32, 0, _topk_add) - 1
+    )
+    greater_write = greater & (greater_pos < topk)
+    equal_write = equal & (equal_pos < topk) & (equal_pos < count_greater + keep_equal)
+
+    block_idx = offsets.to(gl.int32) // page_size
+    block_offset = offsets.to(gl.int32) - block_idx * page_size
+    page = gl.load(
+        block_table + row * block_table_stride + block_idx,
+        mask=(greater_write | equal_write) & (block_idx < block_table_cols),
+        other=0,
+    ).to(gl.int32)
+    slots = page * page_size + block_offset
+    gl.store(out + row * out_stride + greater_pos, slots, mask=greater_write)
+    gl.store(out + row * out_stride + equal_pos, slots, mask=equal_write)
+
+
+@gluon.jit
+def _dsa_prefill_radix_scatter_kernel(
+    logits,
+    prefixes,
+    remaining,
+    counters,
+    row_starts,
+    row_ends,
+    out,
+    logits_stride: gl.constexpr,
+    out_stride: gl.constexpr,
+    n_cols: gl.constexpr,
+    topk: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    LOAD_ELEMS: gl.constexpr,
+):
+    row = gl.program_id(0)
+    tile = gl.program_id(1)
+    layout: gl.constexpr = _vector_layout(BLOCK_N, gl.num_warps(), LOAD_ELEMS)
+    offsets = tile * BLOCK_N + gl.arange(0, BLOCK_N, layout=layout)
+    row_start = gl.load(row_starts + row).to(gl.int32)
+    row_end = gl.load(row_ends + row).to(gl.int32)
+    mask = (offsets >= row_start) & (offsets < row_end) & (offsets < n_cols)
+    values = gl.load(
+        logits + row * logits_stride + offsets,
+        mask=mask,
+        other=-float("inf"),
+    )
+    threshold = gl.load(prefixes + row).to(gl.uint32)
+    keep_equal = gl.load(remaining + row).to(gl.int32)
+    count_greater = topk - keep_equal
+    finite = values != -float("inf")
+    keys = _fp32_to_ordered_key(values)
+    greater = mask & finite & (keys > threshold)
+    equal = mask & finite & (keys == threshold)
+
+    greater_i32 = greater.to(gl.int32)
+    equal_i32 = equal.to(gl.int32)
+    tile_greater = gl.sum(greater_i32, axis=0).to(gl.int32)
+    tile_equal = gl.sum(equal_i32, axis=0).to(gl.int32)
+    greater_start = gl.atomic_add(
+        counters + row * 2, tile_greater, sem="acq_rel", scope="gpu"
+    )
+    equal_start = gl.atomic_add(
+        counters + row * 2 + 1, tile_equal, sem="acq_rel", scope="gpu"
+    )
+
+    greater_pos = greater_start + gl.associative_scan(greater_i32, 0, _topk_add) - 1
+    equal_pos = (
+        count_greater + equal_start + gl.associative_scan(equal_i32, 0, _topk_add) - 1
+    )
+    greater_write = greater & (greater_pos < topk)
+    equal_write = equal & (equal_pos < topk) & (equal_pos < count_greater + keep_equal)
+    local = offsets.to(gl.int32)
+    gl.store(out + row * out_stride + greater_pos, local, mask=greater_write)
+    gl.store(out + row * out_stride + equal_pos, local, mask=equal_write)
 
 
 def _check_packed_fp8_inputs(
@@ -437,8 +728,173 @@ def _validate_topk(topk: int) -> None:
         raise ValueError(f"DSA Gluon top-k requires power-of-two topk, got {topk}")
 
 
-def _use_triton_radix_topk(cols: int) -> bool:
+def _use_radix_topk(cols: int) -> bool:
     return int(cols) >= _RADIX_TOPK_MIN_COLS
+
+
+def _dsa_radix_scratch(
+    rows: int,
+    cols: int,
+    *,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    tiles = triton.cdiv(int(cols), _RADIX_TOPK_BLOCK_N)
+    hist = torch.empty((rows, tiles, 16), dtype=torch.int32, device=device)
+    prefixes = torch.empty((rows,), dtype=torch.int32, device=device)
+    remaining = torch.empty((rows,), dtype=torch.int32, device=device)
+    counters = torch.empty((rows, 2), dtype=torch.int32, device=device)
+    block_tiles = _next_power_of_2(tiles)
+    return hist, prefixes, remaining, counters, tiles, block_tiles
+
+
+def _run_radix_prefix_passes(
+    logits: torch.Tensor,
+    hist: torch.Tensor,
+    prefixes: torch.Tensor,
+    remaining: torch.Tensor,
+    *,
+    rows: int,
+    cols: int,
+    tiles: int,
+    block_tiles: int,
+) -> None:
+    hist_load_elems = _load_elems(_RADIX_TOPK_BLOCK_N, 8)
+    update_load_elems = _load_elems(block_tiles, 8)
+    for shift in range(28, -1, -4):
+        _dsa_radix_hist_kernel[(rows, tiles)](
+            logits,
+            prefixes,
+            hist,
+            logits.stride(0),
+            tiles,
+            n_cols=cols,
+            shift=shift,
+            BLOCK_N=_RADIX_TOPK_BLOCK_N,
+            LOAD_ELEMS=hist_load_elems,
+            num_warps=8,
+        )
+        _dsa_radix_update_kernel[(rows,)](
+            prefixes,
+            remaining,
+            hist,
+            hist_tiles=tiles,
+            BLOCK_TILES=block_tiles,
+            LOAD_ELEMS=update_load_elems,
+            num_warps=8,
+        )
+
+
+def _dsa_decode_radix_topk_slots(
+    logits: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    page_size: int,
+    topk: int,
+    out: torch.Tensor,
+    lens_out: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rows, cols = logits.shape
+    hist, prefixes, remaining, counters, tiles, block_tiles = _dsa_radix_scratch(
+        rows, cols, device=logits.device
+    )
+    _dsa_decode_radix_init_kernel[(rows,)](
+        seq_lens,
+        out,
+        lens_out,
+        prefixes,
+        remaining,
+        counters,
+        out.stride(0),
+        topk=topk,
+        TOPK_LOAD_ELEMS=_load_elems(topk, 8),
+        num_warps=8,
+    )
+    _run_radix_prefix_passes(
+        logits,
+        hist,
+        prefixes,
+        remaining,
+        rows=rows,
+        cols=cols,
+        tiles=tiles,
+        block_tiles=block_tiles,
+    )
+    _dsa_decode_radix_scatter_slots_kernel[(rows, tiles)](
+        logits,
+        prefixes,
+        remaining,
+        counters,
+        block_table,
+        seq_lens,
+        out,
+        logits.stride(0),
+        block_table.stride(0),
+        out.stride(0),
+        block_table.shape[1],
+        n_cols=cols,
+        page_size=int(page_size),
+        topk=topk,
+        BLOCK_N=_RADIX_TOPK_BLOCK_N,
+        LOAD_ELEMS=_load_elems(_RADIX_TOPK_BLOCK_N, 8),
+        num_warps=8,
+    )
+    return out, lens_out
+
+
+def _dsa_prefill_radix_topk(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    *,
+    topk: int,
+    out: torch.Tensor,
+    lens_out: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rows, cols = logits.shape
+    hist, prefixes, remaining, counters, tiles, block_tiles = _dsa_radix_scratch(
+        rows, cols, device=logits.device
+    )
+    _dsa_prefill_radix_init_kernel[(rows,)](
+        row_starts,
+        row_ends,
+        out,
+        lens_out,
+        prefixes,
+        remaining,
+        counters,
+        out.stride(0),
+        topk=topk,
+        TOPK_LOAD_ELEMS=_load_elems(topk, 8),
+        num_warps=8,
+    )
+    _run_radix_prefix_passes(
+        logits,
+        hist,
+        prefixes,
+        remaining,
+        rows=rows,
+        cols=cols,
+        tiles=tiles,
+        block_tiles=block_tiles,
+    )
+    _dsa_prefill_radix_scatter_kernel[(rows, tiles)](
+        logits,
+        prefixes,
+        remaining,
+        counters,
+        row_starts,
+        row_ends,
+        out,
+        logits.stride(0),
+        out.stride(0),
+        n_cols=cols,
+        topk=topk,
+        BLOCK_N=_RADIX_TOPK_BLOCK_N,
+        LOAD_ELEMS=_load_elems(_RADIX_TOPK_BLOCK_N, 8),
+        num_warps=8,
+    )
+    return out, lens_out
 
 
 def gluon_dsa_decode_topk_fp8_gfx950(
@@ -493,20 +949,6 @@ def gluon_dsa_decode_topk_fp8_gfx950(
     seq_lens = seq_lens.to(device=q.device, dtype=torch.int32).contiguous()
     block_table = block_table.to(device=q.device, dtype=torch.int32).contiguous()
     max_seq_len = int(block_table.shape[1]) * int(page_size)
-    if _use_triton_radix_topk(max_seq_len):
-        return _triton_dsa_decode_topk_fp8(
-            q,
-            index_k_cache,
-            weights,
-            seq_lens,
-            block_table,
-            page_size=int(page_size),
-            topk=topk,
-            softmax_scale=float(softmax_scale),
-            out=out,
-            lens_out=lens_out,
-        )
-
     if out is None:
         out = torch.empty((q.shape[0], topk), dtype=torch.int32, device=q.device)
     if lens_out is None:
@@ -514,7 +956,7 @@ def gluon_dsa_decode_topk_fp8_gfx950(
     logits = torch.empty(
         (q.shape[0], max_seq_len), dtype=torch.float32, device=q.device
     )
-    block_n = 64
+    block_n = 32
     _dsa_decode_logits_fp8_kernel[(q.shape[0], triton.cdiv(max_seq_len, block_n))](
         q,
         index_k_cache.view(torch.float8_e4m3fn),
@@ -533,8 +975,20 @@ def gluon_dsa_decode_topk_fp8_gfx950(
         num_groups=q.shape[2] // 128,
         softmax_scale=float(softmax_scale),
         BLOCK_N=block_n,
+        BLOCK_D=128,
         num_warps=4,
     )
+    if _use_radix_topk(max_seq_len):
+        return _dsa_decode_radix_topk_slots(
+            logits,
+            block_table,
+            seq_lens,
+            page_size=int(page_size),
+            topk=topk,
+            out=out,
+            lens_out=lens_out,
+        )
+
     select_warps = 8
     select_block = _next_power_of_2(max(max_seq_len, topk))
     _dsa_decode_select_topk_kernel[(q.shape[0],)](
@@ -614,27 +1068,12 @@ def gluon_dsa_prefill_topk_fp8_gfx950(
         out.fill_(-1)
         lens_out.zero_()
         return out, lens_out
-    if _use_triton_radix_topk(seq_len_sum):
-        return _triton_dsa_prefill_topk_fp8(
-            q,
-            index_k_cache,
-            weights,
-            kv_workspace_slots,
-            row_starts,
-            row_ends,
-            topk=topk,
-            softmax_scale=float(softmax_scale),
-            page_size=int(page_size),
-            max_logits_bytes=max_logits_bytes,
-            out=out,
-            lens_out=lens_out,
-        )
 
     if max_logits_bytes is None:
         max_query_rows = q.shape[0]
     else:
         max_query_rows = max(1, int(max_logits_bytes) // (max(seq_len_sum, 1) * 4))
-    block_n = 64
+    block_n = 32
     select_warps = 8
     select_block = _next_power_of_2(max(seq_len_sum, topk))
     for start in range(0, q.shape[0], max_query_rows):
@@ -662,8 +1101,20 @@ def gluon_dsa_prefill_topk_fp8_gfx950(
             num_groups=q.shape[2] // 128,
             softmax_scale=float(softmax_scale),
             BLOCK_N=block_n,
+            BLOCK_D=128,
             num_warps=4,
         )
+        if _use_radix_topk(seq_len_sum):
+            _dsa_prefill_radix_topk(
+                logits,
+                row_starts[start:end],
+                row_ends[start:end],
+                topk=topk,
+                out=out[start:end],
+                lens_out=lens_out[start:end],
+            )
+            continue
+
         _dsa_prefill_select_topk_kernel[(end - start,)](
             logits,
             row_starts[start:end],
