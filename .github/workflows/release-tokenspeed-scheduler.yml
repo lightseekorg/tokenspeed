@@ -15,6 +15,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 jobs:
   build-wheel:
@@ -132,3 +133,21 @@ jobs:
               --notes "tokenspeed-scheduler ${VERSION}" \
               "${prerelease_args[@]}"
           fi
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: [build-wheel, build-sdist]
+    runs-on: ubuntu-latest
+    environment: pypi
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: tokenspeed-scheduler-*
+          merge-multiple: true
+
+      - name: Publish distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
