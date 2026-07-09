@@ -58,7 +58,6 @@ class ModelRunner:
         self.gpu_id = gpu_id
         self.global_rank = global_rank
         self.mapping = server_args.mapping
-        self.page_size = server_args.block_size
         self.is_generation = model_config.is_generation
         self.is_multimodal = model_config.is_multimodal
         self.is_draft_worker = is_draft_worker

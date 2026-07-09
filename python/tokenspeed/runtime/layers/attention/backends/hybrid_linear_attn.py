@@ -109,6 +109,9 @@ def compute_state_page_indices(
                 "request's working state page must be present in the flat "
                 f"{_STATE_GROUP_ID!r} table"
             )
+        positive_out = state_out[state_out > 0]
+        if torch.unique(positive_out).numel() != positive_out.numel():
+            raise ValueError("state out pages must be unique per batch")
     return state_in.to(torch.int32), state_out.to(torch.int32)
 
 

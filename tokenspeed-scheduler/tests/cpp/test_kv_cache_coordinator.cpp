@@ -1279,6 +1279,7 @@ TEST(MambaStateKindTest, FactoryMapsStateKindToAlignSemantics) {
     EXPECT_EQ(m.num_common_tokens, 12);  // full covers 3 pages; state resumes off snapshot @2
     ASSERT_EQ(m.per_group.size(), 2u);
     EXPECT_EQ(m.per_group[1].num_hit_blocks, 1);
+    ASSERT_EQ(m.per_group[1].blocks.size(), 3u);
     EXPECT_TRUE(m.per_group[1].blocks[0]->IsNull());
     EXPECT_TRUE(m.per_group[1].blocks[1]->IsNull());
     EXPECT_FALSE(m.per_group[1].blocks[2]->IsNull());  // [null, null, snapshot]

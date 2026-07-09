@@ -241,6 +241,9 @@ void KvCacheCoordinator::CacheFullBlocks(std::span<BlockTable> tables,
             }
             group_first_slot = first_slot + static_cast<std::int32_t>(keys.size()) - 1;
             group_keys = group_keys.last(1);
+            const bool aligned_range = first_slot + static_cast<std::int32_t>(keys.size()) ==
+                                       end_tokens / groups_[i].Spec().page_size;
+            _assert(aligned_range, "state registration range must end at the aligned boundary");
         }
         std::vector<std::pair<std::string, CacheBlock*>> newly_cached;
         groups_[i].Manager().CacheFullBlocks(pool_, tables[i], group_keys, group_first_slot,

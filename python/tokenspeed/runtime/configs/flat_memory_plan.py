@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 
 # Labels whose group is state-family (recurrent state rows, not KV history).
@@ -42,7 +42,9 @@ class PageGeometry:
 def components_from_layers(*, layer_types, kv_bytes_per_slot, state_const_bytes):
     """Per-layer ComponentSpecs: history layers carry one linear kv component;
     state layers one constant component per state tensor. Layer index is the
-    within-group occurrence count (the slab pairing order)."""
+    within-group occurrence count (the slab pairing order). State component
+    order (hence row_offset order downstream) follows state_const_bytes
+    insertion order."""
     counts: dict[str, int] = {}
     comps: list[ComponentSpec] = []
     for label in layer_types:
@@ -172,7 +174,7 @@ def plan_tensors(components, *, page_size_tokens, alignment, budget_bytes):
     num_pages = budget_bytes // (num_slots * geo.page_bytes)
     if num_pages <= 1:
         raise ValueError("budget too small for one usable page per slot")
-    geo = PageGeometry(geo.page_size_tokens, geo.page_bytes, num_pages)
+    geo = replace(geo, num_pages=num_pages)
 
     tensors = []
     for slot in range(num_slots):

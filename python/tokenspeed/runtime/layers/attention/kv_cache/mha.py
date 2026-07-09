@@ -315,6 +315,9 @@ class MHATokenToKVPool(BaseTokenToKVPool):
                 scheduler_ext_flat_kvcache,
             )
 
+            assert self.size % self.page_size == 0, (
+                "flat pool size must be whole pages"
+            )
             self.num_pages_with_null = self.size // self.page_size + 1
             state_layer_count = sum(
                 1 for label in self._layer_types if label in _STATE_LAYER_TYPES
