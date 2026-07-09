@@ -103,7 +103,7 @@ private:
                                        std::span<const std::vector<std::string>> group_keys,
                                        std::int32_t total_blocks, std::int32_t floor_tokens) const;
     std::vector<CacheGroup> groups_;
-    // Closed groups first, so non-closed groups match against a settled bound. 
+    // Closed groups first, so non-closed groups match against a settled bound.
     std::vector<std::size_t> match_order_;
     BlockPool& pool_;
     const BlockPool* host_pool_{nullptr};

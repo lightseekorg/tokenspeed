@@ -254,7 +254,6 @@ private:
     // device pages (a freed destination must not be recycled under the copy); LoadBackDone drops both.
     std::unordered_map<cache_op_id, FlatLoadTicket> flat_load_ops_;
 
-
     // Sum excluding request_id: a request consuming its own reservation must not be gated by it.
     std::int32_t flatReservedPagesExcept(const std::string& request_id) const {
         std::int32_t total = 0;

@@ -113,13 +113,11 @@ namespace {
     throw std::logic_error("flat path: retract/writeback/loadback unsupported in C slice");
 }
 
-// Hash the newly filled pages [chain.num_hashed_pages, filled_pages) onto the chain; empty when nothing filled.
+// Hash the newly filled pages [chain.num_hashed_pages, filled_pages) onto the chain.
 std::vector<std::string> AdvanceFlatHashChain(FlatHashChain& chain,
                                               const std::vector<std::span<const std::int32_t>>& paged,
                                               std::int32_t filled_pages) {
-    if (filled_pages <= chain.num_hashed_pages) {
-        return {};
-    }
+    _assert(filled_pages > chain.num_hashed_pages, "caller must pre-check hash-chain progress");
     _assert(filled_pages <= static_cast<std::int32_t>(paged.size()),
             "flat decode hashing: filled pages exceed the container's full pages");
     const std::vector<std::span<const std::int32_t>> fresh(paged.begin() + chain.num_hashed_pages,
