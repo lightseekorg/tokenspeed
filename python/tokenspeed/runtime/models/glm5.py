@@ -34,7 +34,6 @@ from tokenspeed_kernel.ops.attention import (
 from torch import nn
 from transformers import PretrainedConfig
 
-from tokenspeed.runtime.configs.utils import get_rope_theta
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
@@ -52,15 +51,12 @@ from tokenspeed.runtime.layers.linear import (
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.quantization.utils import block_dequant
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
-from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3AttentionMLA,
     DeepseekV3DecoderLayer,
     DeepseekV3ForCausalLM,
-    DeepseekV3MLP,
     DeepseekV3Model,
-    DeepseekV3MoE,
     get_layer_id,
 )
 from tokenspeed.runtime.utils import add_prefix
@@ -354,6 +350,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             )
         self._decode_topk_indices_buffer: torch.Tensor | None = None
         self._decode_topk_lens_buffer: torch.Tensor | None = None
+        self._retired_decode_workspaces: list = []
 
     def _get_decode_topk_workspace(
         self,
@@ -406,7 +403,6 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
 
     @staticmethod
     def _resolve_decode_q_len(
-        ctx: ForwardContext,
         num_decode_tokens: int,
         num_decode_reqs: int,
     ) -> int:
@@ -474,7 +470,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 f"tokens={total_tokens}, decode_tokens={num_decode_tokens}"
             )
         q_len_per_req = GlmMoeDsaAttention._resolve_decode_q_len(
-            ctx, num_decode_tokens, num_decode_reqs
+            num_decode_tokens, num_decode_reqs
         )
         decode_start = int(total_tokens) - int(num_decode_tokens)
         return GlmDsaDecodeWindow(
@@ -485,32 +481,8 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             q_len_per_req=int(q_len_per_req),
         )
 
-    @staticmethod
-    def _slice_decode_topk(
-        decode_topk: GlmDsaDecodeTopK,
-        start: int,
-        end: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return decode_topk.topk_indices[start:end], decode_topk.topk_lens[start:end]
-
     def _retire_decode_workspace(self, buffer: torch.Tensor) -> None:
-        retired = getattr(self, "_retired_decode_workspaces", None)
-        if retired is None:
-            retired = []
-            self._retired_decode_workspaces = retired
-        retired.append(buffer)
-
-    @staticmethod
-    def _check_decode_q_len_per_req(q_len_per_req: int) -> None:
-        # Multi-step MTP verify runs num_draft_tokens query rows per request.
-        # DeepGEMM paged MQA logits (our fork) and FlashMLA sparse decode are
-        # both verified bit-exact against batch expansion up to next_n = 6,
-        # which covers --speculative-num-steps 5 (5 draft + 1 bonus).
-        if not 1 <= q_len_per_req <= 6:
-            raise NotImplementedError(
-                "GLM DSA sparse decode supports 1-6 query tokens per request "
-                f"(verified next_n <= 6), got {q_len_per_req}."
-            )
+        self._retired_decode_workspaces.append(buffer)
 
     def _compute_decode_topk_indices(
         self,
@@ -526,7 +498,16 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         )
         if decode_window.num_reqs <= 0 or num_tokens == 0:
             return None
-        self._check_decode_q_len_per_req(decode_window.q_len_per_req)
+
+        # Multi-step MTP verify runs num_draft_tokens query rows per request.
+        # DeepGEMM paged MQA logits (our fork) and FlashMLA sparse decode are
+        # both verified bit-exact against batch expansion up to next_n = 6,
+        # which covers --speculative-num-steps 5 (5 draft + 1 bonus).
+        if not 1 <= decode_window.q_len_per_req <= 6:
+            raise NotImplementedError(
+                "GLM DSA sparse decode supports 1-6 query tokens per request "
+                f"(verified next_n <= 6), got {decode_window.q_len_per_req}."
+            )
 
         num_extends = int(metadata.num_extends or 0)
         seq_lens = metadata.seq_lens_k[
@@ -764,9 +745,9 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         # (see GlmMoeDsaForCausalLM._pad_fused_qkv_a_proj_for_fp8_blockscale).
         # Drop the padding columns before the split / comm. No-op when the
         # projection output already matches the logical width.
-        _qkv_width = self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim
-        if qkv.shape[-1] != _qkv_width:
-            qkv = qkv[..., :_qkv_width]
+        qkv_width = self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim
+        if qkv.shape[-1] != qkv_width:
+            qkv = qkv[..., :qkv_width]
         qkv = comm_manager.pre_attn_comm(qkv, ctx)
         # Slice only under a breakable capture/replay (see the DeepSeek-V4 break):
         # eager forwards (incl. MTP draft steps) are never padded. Sliced AFTER
@@ -868,18 +849,18 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 raise RuntimeError(
                     "GLM DSA sparse decode requires computed top-k indices."
                 )
-            topk_indices, topk_lens = self._slice_decode_topk(
-                ctx.dsa_decode_topk,
-                decode_start,
-                decode_end,
-            )
+
+            decode_slice = slice(decode_start, decode_end)
+            topk_indices = ctx.dsa_decode_topk.topk_indices[decode_slice]
+            topk_lens = ctx.dsa_decode_topk.topk_lens[decode_slice]
+
             self.forward_absorb(
-                positions[decode_start:decode_end],
-                q[decode_start:decode_end],
-                latent_cache[decode_start:decode_end],
+                positions[decode_slice],
+                q[decode_slice],
+                latent_cache[decode_slice],
                 decode_ctx,
-                out_cache_loc[decode_start:decode_end],
-                attn_output[decode_start:decode_end],
+                out_cache_loc[decode_slice],
+                attn_output[decode_slice],
                 topk_indices=topk_indices,
                 topk_lens=topk_lens,
             )
@@ -1000,16 +981,33 @@ class GlmMoeDsaDecoderLayer(DeepseekV3DecoderLayer):
         prefix: str = "",
         alt_stream: torch.cuda.Stream | None = None,
     ) -> None:
-        nn.Module.__init__(self)
-        self.mapping = mapping
-        self.hidden_size = config.hidden_size
-        rope_theta = get_rope_theta(config)
-        rope_scaling = getattr(config, "rope_scaling", None)
-        max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-
-        self.self_attn = GlmMoeDsaAttention(
+        self._is_nextn = is_nextn
+        super().__init__(
             config=config,
-            hidden_size=self.hidden_size,
+            layer_id=layer_id,
+            mapping=mapping,
+            quant_config=quant_config,
+            is_nextn=self._is_nextn,
+            prefix=prefix,
+            alt_stream=alt_stream,
+        )
+
+    def _create_attn(
+        self,
+        config,
+        hidden_size,
+        rope_theta,
+        rope_scaling,
+        max_position_embeddings,
+        quant_config,
+        layer_id,
+        prefix,
+        alt_stream,
+        mapping,
+    ):
+        return GlmMoeDsaAttention(
+            config=config,
+            hidden_size=hidden_size,
             num_heads=config.num_attention_heads,
             qk_nope_head_dim=config.qk_nope_head_dim,
             qk_rope_head_dim=config.qk_rope_head_dim,
@@ -1030,151 +1028,21 @@ class GlmMoeDsaDecoderLayer(DeepseekV3DecoderLayer):
             prefix=add_prefix("self_attn", prefix),
             reduce_attn_results=False,
             alt_stream=alt_stream,
-            mapping=self.mapping,
-            is_nextn=is_nextn,
+            mapping=mapping,
+            is_nextn=self._is_nextn,
         )
-
-        self.layer_id = layer_id
-        self.is_moe_layer = self._is_moe_layer(layer_id, is_nextn, config)
-        if self.is_moe_layer:
-            self.mlp = DeepseekV3MoE(
-                config=config,
-                mapping=self.mapping,
-                quant_config=quant_config,
-                layer_index=layer_id,
-                prefix=add_prefix("mlp", prefix),
-                alt_stream=alt_stream,
-            )
-        else:
-            self.mlp = DeepseekV3MLP(
-                hidden_size=config.hidden_size,
-                intermediate_size=(
-                    config.ffn_hidden_size
-                    if hasattr(config, "ffn_hidden_size")
-                    else config.intermediate_size
-                ),
-                hidden_act=config.hidden_act,
-                mapping=self.mapping,
-                quant_config=(
-                    None
-                    if "dense_mlp" in getattr(config, "disable_quant_module", [])
-                    else quant_config
-                ),
-                prefix=add_prefix("mlp", prefix),
-                is_shared_expert=False,
-            )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.comm_manager = CommManager(
-            mapping=self.mapping,
-            layer_id=self.layer_id,
-            is_moe=self.is_moe_layer,
-            prev_is_moe=self._is_moe_layer(layer_id - 1, is_nextn, config),
-            input_layernorm=self.input_layernorm,
-            post_attn_layernorm=self.post_attention_layernorm,
-        )
-
-    def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
-        residual: torch.Tensor | None,
-    ) -> torch.Tensor:
-        num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
-            ctx
-        )
-
-        if not ctx.forward_mode.is_idle():
-            hidden_states, residual = self.comm_manager.input_reduce_norm(
-                hidden_states, residual
-            )
-            hidden_states = self.self_attn(
-                positions=positions,
-                hidden_states=hidden_states,
-                ctx=ctx,
-                out_cache_loc=out_cache_loc,
-                comm_manager=self.comm_manager,
-            )
-            if ctx.draft_first_step_reduce:
-                residual = residual.index_select(0, ctx.gather_ids)
-            hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
-                hidden_states, residual, ctx
-            )
-            hidden_states = self.forward_mlp(
-                hidden_states,
-                residual,
-                ctx,
-                num_global_tokens,
-                max_num_tokens_per_gpu,
-            )
-        else:
-            hidden_states = self.forward_mlp(
-                hidden_states,
-                residual,
-                ctx,
-                num_global_tokens,
-                max_num_tokens_per_gpu,
-            )
-        return hidden_states, residual
-
-    def forward_mlp(
-        self,
-        hidden_states,
-        residual,
-        ctx: ForwardContext,
-        num_global_tokens,
-        max_num_tokens_per_gpu,
-    ):
-        hidden_states = self.comm_manager.pre_mlp_comm(hidden_states, ctx)
-        if self.is_moe_layer:
-            hidden_states = self.mlp(
-                hidden_states, num_global_tokens, max_num_tokens_per_gpu
-            )
-        else:
-            hidden_states = self.mlp(hidden_states)
-        hidden_states, residual = self.comm_manager.post_mlp_fused(
-            hidden_states, residual, ctx
-        )
-        return hidden_states
 
 
 class GlmMoeDsaModel(DeepseekV3Model):
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        mapping: Mapping,
-        quant_config: QuantizationConfig | None = None,
-        prefix: str = "",
-    ) -> None:
-        nn.Module.__init__(self)
-        self.mapping = mapping
-        self.padding_id = config.pad_token_id
-        self.vocab_size = config.vocab_size
-
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
+    def _create_decoder_layer(self, config, layer_id, quant_config, prefix):
+        return GlmMoeDsaDecoderLayer(
+            config,
+            layer_id,
+            mapping=self.mapping,
+            quant_config=quant_config,
+            prefix=add_prefix(f"layers.{layer_id}", prefix),
+            alt_stream=self.alt_stream,
         )
-        self.alt_stream = torch.cuda.Stream()
-        self.layers = nn.ModuleList(
-            [
-                GlmMoeDsaDecoderLayer(
-                    config,
-                    layer_id,
-                    mapping=self.mapping,
-                    quant_config=quant_config,
-                    prefix=add_prefix(f"layers.{layer_id}", prefix),
-                    alt_stream=self.alt_stream,
-                )
-                for layer_id in range(config.num_hidden_layers)
-            ]
-        )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.layers_to_capture: set = set()
 
 
 def pad_fused_qkv_a_proj_weight_for_fp8_blockscale(attn) -> None:
