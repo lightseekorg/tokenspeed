@@ -182,17 +182,20 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()
     // The extension appends between the claim and the fresh acquire so slots stay
     // [device hit | host ext | new pages]; ext pages are FULL, composing exactly with the gate.
     flat_load_pairs_ = LoadHostExtension(*coordinator_, tables, flat_host_);
+    // The admission match that set tokens_this_round_ also sets window.begin (single source).
+    // The host boundary is absolute (floor included); default-constructed (no host pool) it is 0.
+    const std::int32_t hit_tokens = std::max(flat_hit_.num_common_tokens, flat_host_.num_common_tokens);
     // Loaded pages become device-cached now (SWA holes skipped by the IsNull guard);
-    // the sink re-collects them and the drain dedupes against the host index.
+    // the sink re-collects them and the drain dedupes against the host index. The extension
+    // ends at the hit boundary (page-aligned by construction), so the state group's final
+    // page is exactly the loaded snapshot.
     coordinator_->CacheFullBlocks(tables, flat_ext_hashes_,
-                                  /*first_slot=*/flat_hit_.num_common_tokens / state.GetPageSize());
+                                  /*first_slot=*/flat_hit_.num_common_tokens / state.GetPageSize(),
+                                  /*end_tokens=*/hit_tokens);
     if (!coordinator_->Acquire(tables, tokens_this_round_)) {
         _assert(false, "flat path: allocation failure unsupported in C slice");
     }
 
-    // The admission match that set tokens_this_round_ also sets window.begin (single source).
-    // The host boundary is absolute (floor included); default-constructed (no host pool) it is 0.
-    const std::int32_t hit_tokens = std::max(flat_hit_.num_common_tokens, flat_host_.num_common_tokens);
     TokenContainer::Window window{.begin = hit_tokens, .size = tokens_this_round_};
     bool is_last_chunk = (window.begin + window.size) == token_container->PrefillSize();
     if (is_last_chunk && role_ != Role::kD) {

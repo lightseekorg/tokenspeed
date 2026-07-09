@@ -24,6 +24,7 @@
 #include <memory>
 
 #include "cache/full_attn_manager.h"
+#include "cache/mamba_state_manager.h"
 #include "cache/swa_manager.h"
 #include "scheduler/page_hasher.h"
 #include "utils.h"
@@ -223,15 +224,26 @@ bool KvCacheCoordinator::Acquire(std::span<BlockTable> tables, std::int32_t num_
 
 void KvCacheCoordinator::CacheFullBlocks(std::span<BlockTable> tables,
                                          std::span<const std::string> content_hashes,
-                                         std::int32_t first_slot) {
+                                         std::int32_t first_slot, std::int32_t end_tokens) {
     _assert(tables.size() == groups_.size(), "tables/groups size mismatch");
     if (content_hashes.empty()) {
         return;  // hot decode rounds usually fill no page
     }
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         std::vector<std::string> keys = keysForGroup(content_hashes, groups_[i].GroupId());
+        std::int32_t group_first_slot = first_slot;
+        std::span<const std::string> group_keys = keys;
+        if (groups_[i].Manager().RegistersAlignedFinalPageOnly()) {
+            // Interior page boundaries never received a state write; only an aligned chunk
+            // end holds a real snapshot, and it lives in the final full page of the range.
+            if (end_tokens < 0 || end_tokens % groups_[i].Spec().page_size != 0) {
+                continue;
+            }
+            group_first_slot = first_slot + static_cast<std::int32_t>(keys.size()) - 1;
+            group_keys = group_keys.last(1);
+        }
         std::vector<std::pair<std::string, CacheBlock*>> newly_cached;
-        groups_[i].Manager().CacheFullBlocks(pool_, tables[i], keys, first_slot,
+        groups_[i].Manager().CacheFullBlocks(pool_, tables[i], group_keys, group_first_slot,
                                              host_pool_ != nullptr ? &newly_cached : nullptr);
         for (auto& [key, block] : newly_cached) {
             pending_stores_.push_back(StoreCandidate{std::move(key), BlockRef::Share(pool_, block)});
@@ -266,8 +278,7 @@ KvCacheCoordinator MakeCoordinator(std::span<const KvCacheSpec> specs, BlockPool
         if (spec.kind == AttnKind::kFull) {
             manager = std::make_unique<FullAttnManager>(spec.page_size);
         } else if (spec.kind == AttnKind::kMambaState) {
-            // align semantics: hit = the nearest aligned snapshot, retention = last page only.
-            manager = std::make_unique<SwaManager>(spec.page_size, /*sliding_window=*/2);
+            manager = std::make_unique<MambaStateManager>(spec.page_size);
         } else {
             manager = std::make_unique<SwaManager>(spec.page_size, spec.sliding_window);
         }

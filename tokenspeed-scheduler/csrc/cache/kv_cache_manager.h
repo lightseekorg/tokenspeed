@@ -111,6 +111,10 @@ public:
         return (over + page_size_ - 1) / page_size_;
     }
 
+    // State snapshots are only boundary-correct where a forward call ended page-aligned:
+    // such groups register just the final full page of an aligned range (spec M17 §3).
+    virtual bool RegistersAlignedFinalPageOnly() const { return false; }
+
     // Pages already carrying a hash are skipped; the partial tail is excluded by the caller.
     void CacheFullBlocks(BlockPool& pool, BlockTable& table, std::span<const std::string> block_hashes,
                          std::int32_t first_slot = 0,

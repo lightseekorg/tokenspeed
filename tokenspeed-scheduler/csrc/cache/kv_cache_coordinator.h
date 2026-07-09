@@ -80,8 +80,10 @@ public:
     // Fresh-table overload for a not-yet-allocated request (no tail credit).
     std::int32_t BlocksNeededFor(std::int32_t num_tokens) const;
 
+    // end_tokens = the chunk's end position (-1 = unknown/legacy): aligned-final-page-only
+    // groups register nothing without it, since only an aligned chunk end holds a real snapshot.
     void CacheFullBlocks(std::span<BlockTable> tables, std::span<const std::string> content_hashes,
-                         std::int32_t first_slot = 0);
+                         std::int32_t first_slot = 0, std::int32_t end_tokens = -1);
     void ReclaimExpired(std::span<BlockTable> tables, std::int32_t num_computed_tokens);
     void Free(std::span<BlockTable> tables);
 

@@ -1298,5 +1298,37 @@ TEST(MambaStateKindTest, StateGroupRetentionKeepsOnlyLastPage) {
     coord.Free(tables);
 }
 
+// State snapshots are only boundary-correct where a forward call ended page-aligned: the
+// coordinator narrows a state group's registration to the final full page of an aligned range.
+TEST(MambaStateRegistrationTest, AlignedEndRegistersOnlyFinalPage) {
+    BlockPool pool(32, true);
+    std::vector<KvCacheSpec> specs = {{AttnKind::kFull, 4, 0}, {AttnKind::kMambaState, 4, 0}};
+    KvCacheCoordinator coord = MakeCoordinator(specs, pool);
+    std::vector<BlockTable> tables(coord.NumGroups());
+    ASSERT_TRUE(coord.Acquire(tables, /*num_tokens=*/12));  // 3 pages
+    std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}});
+    coord.CacheFullBlocks(tables, ch, /*first_slot=*/0, /*end_tokens=*/12);
+    // full group: all 3 registered; state group: only page 2 (the aligned chunk end)
+    EXPECT_NE(pool.GetCachedBlock(MakeKeyWithGroupId(ch[0], 0)), nullptr);
+    EXPECT_NE(pool.GetCachedBlock(MakeKeyWithGroupId(ch[2], 0)), nullptr);
+    EXPECT_EQ(pool.GetCachedBlock(MakeKeyWithGroupId(ch[0], 1)), nullptr);
+    EXPECT_EQ(pool.GetCachedBlock(MakeKeyWithGroupId(ch[1], 1)), nullptr);
+    EXPECT_NE(pool.GetCachedBlock(MakeKeyWithGroupId(ch[2], 1)), nullptr);
+    coord.Free(tables);
+}
+
+TEST(MambaStateRegistrationTest, UnalignedEndRegistersNoStatePages) {
+    BlockPool pool(32, true);
+    std::vector<KvCacheSpec> specs = {{AttnKind::kFull, 4, 0}, {AttnKind::kMambaState, 4, 0}};
+    KvCacheCoordinator coord = MakeCoordinator(specs, pool);
+    std::vector<BlockTable> tables(coord.NumGroups());
+    ASSERT_TRUE(coord.Acquire(tables, /*num_tokens=*/14));  // 3 full pages + partial tail
+    std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}});
+    coord.CacheFullBlocks(tables, ch, /*first_slot=*/0, /*end_tokens=*/14);  // 14 % 4 != 0
+    EXPECT_NE(pool.GetCachedBlock(MakeKeyWithGroupId(ch[2], 0)), nullptr);  // full group unaffected
+    EXPECT_EQ(pool.GetCachedBlock(MakeKeyWithGroupId(ch[2], 1)), nullptr);  // state group skipped
+    coord.Free(tables);
+}
+
 }  // namespace
 }  // namespace tokenspeed::test

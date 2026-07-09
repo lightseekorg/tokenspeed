@@ -50,7 +50,8 @@ bool DecodeStep(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables
     // the reverse order would lose the punched pages' hashes forever.
     // ReclaimExpired before Acquire: the slide's freed pages fund this chunk
     // (admission gates credit them via BlocksReclaimableAt in lockstep).
-    coordinator.CacheFullBlocks(tables, content_hashes, first_page_slot);
+    // num_computed_tokens is the chunk end: state groups register only its aligned final page.
+    coordinator.CacheFullBlocks(tables, content_hashes, first_page_slot, num_computed_tokens);
     coordinator.ReclaimExpired(tables, num_computed_tokens);
     return coordinator.Acquire(tables, num_tokens);
 }
