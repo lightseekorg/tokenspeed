@@ -23,45 +23,25 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
-_SPARSE_DECODE_FP8_QUANT_BLOCK = 128
-_SPARSE_DECODE_FP8_SCALE_BYTES = torch._utils._element_size(torch.float32)
-_SPARSE_DECODE_ROPE_BYTES = torch._utils._element_size(torch.bfloat16)
+_INDEX_K_FP8_GROUP_SIZE = 128
+_INDEX_K_SCALE_BYTES = torch._utils._element_size(torch.float32)
 
 
-def _is_blackwell_device(device: str) -> bool:
-    if not torch.cuda.is_available() or not str(device).startswith("cuda"):
-        return False
-    try:
-        major, _minor = torch.cuda.get_device_capability(device)
-    except (AssertionError, RuntimeError, ValueError):
-        major, _minor = torch.cuda.get_device_capability()
-    return major >= 10
-
-
-def dsa_sparse_decode_row_bytes(
-    kv_lora_rank: int,
-    qk_rope_head_dim: int,
-) -> int:
-    """Return bytes in one packed DSA sparse-decode KV cache row."""
-    kv_lora_rank = int(kv_lora_rank)
-    qk_rope_head_dim = int(qk_rope_head_dim)
-    if kv_lora_rank % _SPARSE_DECODE_FP8_QUANT_BLOCK != 0:
+def dsa_index_k_row_bytes(index_head_dim: int) -> int:
+    if index_head_dim <= 0 or index_head_dim % _INDEX_K_FP8_GROUP_SIZE != 0:
         raise ValueError(
-            "DSA sparse decode NoPE dim must be divisible by "
-            f"{_SPARSE_DECODE_FP8_QUANT_BLOCK}, got {kv_lora_rank}"
+            f"DSA index_head_dim must be a positive multiple of {_INDEX_K_FP8_GROUP_SIZE}, got {index_head_dim}"
         )
     return (
-        kv_lora_rank
-        + kv_lora_rank
-        // _SPARSE_DECODE_FP8_QUANT_BLOCK
-        * _SPARSE_DECODE_FP8_SCALE_BYTES
-        + qk_rope_head_dim * _SPARSE_DECODE_ROPE_BYTES
+        index_head_dim
+        + index_head_dim // _INDEX_K_FP8_GROUP_SIZE * _INDEX_K_SCALE_BYTES
     )
 
 
@@ -80,11 +60,13 @@ class DSAConfig(MLAConfig):
     ):
         base = MLAConfig.generate(server_args, model_config, is_draft)
         if base.kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-            if not _is_blackwell_device(server_args.device):
+            platform = current_platform()
+            if not (platform.is_blackwell_plus or platform.is_cdna4_plus):
                 raise ValueError(
-                    "GLM DSA FP8 KV cache currently requires the Blackwell TRTLLM "
-                    "sparse attention path; use --kv-cache-dtype auto or bfloat16 "
-                    f"on this platform, got {server_args.kv_cache_dtype}."
+                    "GLM DSA FP8 KV cache currently requires NVIDIA Blackwell "
+                    "or AMD CDNA4 sparse attention support; use --kv-cache-dtype "
+                    "auto or bfloat16 on this platform, got "
+                    f"{server_args.kv_cache_dtype}."
                 )
         return cls(
             **base.__dict__,
@@ -94,12 +76,10 @@ class DSAConfig(MLAConfig):
         )
 
     def cache_cell_size(self) -> int:
-        index_cell_size = self.index_head_dim * torch._utils._element_size(self.dtype)
-        sparse_decode_cell_size = dsa_sparse_decode_row_bytes(
-            self.kv_lora_rank,
-            self.qk_rope_head_dim,
+        index_k_cell_size = dsa_index_k_row_bytes(
+            self.index_head_dim,
         )
-        return super().cache_cell_size() + index_cell_size + sparse_decode_cell_size
+        return super().cache_cell_size() + index_k_cell_size
 
     def create_pool(
         self,

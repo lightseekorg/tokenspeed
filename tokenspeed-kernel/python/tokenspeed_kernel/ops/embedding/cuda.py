@@ -38,7 +38,7 @@ if platform.is_nvidia:
         solution="cuda",
         capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
         signatures=format_signatures(
-            ("query", "key"), "dense", {torch.float16, torch.bfloat16}
+            ("q", "k"), "dense", {torch.float16, torch.bfloat16}
         ),
         priority=Priority.PERFORMANT,
         traits={
@@ -54,26 +54,25 @@ if platform.is_nvidia:
     def cuda_embedding_rope(
         *,
         positions: torch.Tensor,
-        query: torch.Tensor,
-        key: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
         head_size: int,
         cos_sin_cache: torch.Tensor,
         is_neox: bool = True,
-        rotary_dim: int | None = None,
         fused_set_kv_buffer_arg: Any = None,
-        output_q_rope: torch.Tensor | None = None,
-        output_k_rope: torch.Tensor | None = None,
+        q_rope_out: torch.Tensor | None = None,
+        k_rope_out: torch.Tensor | None = None,
         enable_pdl: bool = False,
     ) -> None:
         apply_rope_with_cos_sin_cache_inplace(
             positions=positions,
-            query=query,
-            key=key,
+            query=q,
+            key=k,
             head_size=head_size,
             cos_sin_cache=cos_sin_cache,
             is_neox=is_neox,
             fused_set_kv_buffer_arg=fused_set_kv_buffer_arg,
-            output_q_rope=output_q_rope,
-            output_k_rope=output_k_rope,
+            output_q_rope=q_rope_out,
+            output_k_rope=k_rope_out,
             enable_pdl=enable_pdl,
         )

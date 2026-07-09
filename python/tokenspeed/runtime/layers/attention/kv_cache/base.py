@@ -67,12 +67,7 @@ class BaseTokenToKVPool:
         # default state for optional layer-wise transfer control
         self.layer_transfer_counter = None
         logger.info(
-            "Initialized token to kv pool with size %s, dtype %s, device %s, page size %s, rank %s",
-            size,
-            dtype,
-            device,
-            page_size,
-            rank,
+            f"Initialized token to kv pool with size {size}, dtype {dtype}, device {device}, page size {page_size}, rank {rank}"
         )
 
     @classmethod

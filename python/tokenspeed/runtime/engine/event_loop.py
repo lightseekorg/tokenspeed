@@ -29,7 +29,7 @@ import setproctitle
 import torch
 import torch.distributed as dist
 import zmq
-from tokenspeed_scheduler import PD, Cache, ExecutionEvent, Scheduler
+from tokenspeed_scheduler import PD, Cache, ExecutionEvent, ForwardEvent, Scheduler
 
 from tokenspeed.runtime.cache.executor.memory_executor import (
     MemoryExecutor,
@@ -72,7 +72,7 @@ from tokenspeed.runtime.layers.attention.registry import create_attn_components
 from tokenspeed.runtime.metrics.collector import EngineMetrics
 from tokenspeed.runtime.pd.decode_executor import DisaggDecodeExecutor
 from tokenspeed.runtime.pd.factory import (
-    create_pd_kv_transfer,
+    create_kv_transfer,
     get_kv_args,
 )
 from tokenspeed.runtime.pd.kv_events import (
@@ -82,7 +82,7 @@ from tokenspeed.runtime.pd.kv_events import (
     drain_scheduler_kv_events,
     scheduler_kv_events_to_wire_events,
 )
-from tokenspeed.runtime.pd.mooncake.entities import ManagerArgs
+from tokenspeed.runtime.pd.mooncake.entities import KVManagerArgs
 from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 from tokenspeed.runtime.utils import (
@@ -139,6 +139,7 @@ class DpForwardMetadata:
     global_batch_size: list[int]
     global_forward_mode: list[int]
     all_decode_or_idle: bool
+    all_extend: bool
     need_idle_forward: bool
 
 
@@ -173,6 +174,16 @@ class EventLoop:
         target, draft = create_model_runner(
             server_args, self.model_config, draft_model_config, gpu_id, global_rank
         )
+        self.use_overlap_schedule = should_use_overlap_schedule(
+            disable_overlap_schedule=server_args.disable_overlap_schedule,
+            disaggregation_mode=server_args.disaggregation_mode,
+        )
+        self.overlap_schedule_depth = int(self.use_overlap_schedule)
+        decode_input_tokens = (
+            server_args.speculative_num_draft_tokens
+            if server_args.speculative_algorithm is not None
+            else 1
+        )
 
         (
             attn_backend,
@@ -190,6 +201,8 @@ class EventLoop:
             min_per_gpu_mem,
             server_args.enable_memory_saver,
             draft_model_config,
+            decode_input_tokens=decode_input_tokens,
+            overlap_schedule_depth=self.overlap_schedule_depth,
         )
 
         num_total_pages = self.max_total_num_tokens // server_args.block_size
@@ -199,13 +212,21 @@ class EventLoop:
             text_config is not None and hasattr(text_config, "mamba2_cache_params")
         )
 
+        mapping = server_args.mapping
+        # The C++ scheduler's req_pool_idx range is rank-local and 1-based:
+        # real rows are 1..max_batch_size, row 0 is reserved, and CUDA graph
+        # padding needs one non-real sink row after the scheduler-owned range.
+        per_rank_max_batch = server_args.max_num_seqs // max(mapping.attn.dp_size, 1)
+        req_pool_padding_index = per_rank_max_batch + 1
+
         model_executor_config = ModelExecutorConfig.from_server_args(
             server_args=server_args,
             model_config=self.model_config,
-            max_req_pool_size=server_args.max_num_seqs,
+            max_req_pool_size=req_pool_padding_index,
             gpu_id=gpu_id,
             global_rank=global_rank,
             num_total_pages=num_total_pages,
+            overlap_schedule_depth=self.overlap_schedule_depth,
         )
         self.model_executor = create_model_executor(
             server_args=server_args,
@@ -222,7 +243,6 @@ class EventLoop:
         # Reserve one token slot because request validation uses a strict
         # ``< max_req_len`` check against the model context length.
         self.max_req_input_len = self.model_config.context_len - 1
-        mapping = server_args.mapping
         self.attn_tp_size = server_args.attn_tp_size or mapping.attn.tp_size
         self.world_size = server_args.world_size or mapping.world_size
         self.attn_tp_rank = attn_tp_rank
@@ -276,6 +296,9 @@ class EventLoop:
             page_size=server_args.block_size,
             host_ratio=server_args.kvstore_ratio,
             host_size_gb=server_args.kvstore_size,
+            host_parallel_count=max(
+                int(getattr(server_args.mapping, "nprocs_per_node", 1) or 1), 1
+            ),
             io_backend=server_args.kvstore_io_backend,
             host_layout=server_args.kvstore_mem_layout,
             storage_backend=server_args.kvstore_storage_backend,
@@ -305,11 +328,6 @@ class EventLoop:
             )
             num_host_pages = self.memory_executor.host_pool.page_num
 
-        # For DP attention, max_batch_size must be per-rank to avoid
-        # req_pool_allocator overflow.  The C++ scheduler allocates
-        # req_pool_slots based on this value, so it must match the
-        # per-DP-rank budget (same division used in cuda_graph_wrapper).
-        per_rank_max_batch = server_args.max_num_seqs // max(self.dp_size, 1)
         self._kv_events_enabled = (
             EventPublisherFactory.is_enabled(server_args.kv_events_config)
             and attn_tp_rank == 0
@@ -324,7 +342,6 @@ class EventLoop:
 
         # Adjunct enabled only when pool opts in AND prefix-caching switch is on.
         paged_cache_groups = pool_to_paged_cache_groups(token_to_kv_pool)
-        self._paged_cache_groups = paged_cache_groups
         prefix_cache_adjunct = None
         required_groups = token_to_kv_pool.prefix_cache_required_group_ids
         if required_groups is not None and server_args.enable_prefix_caching:
@@ -340,11 +357,8 @@ class EventLoop:
             prefetch_threshold=4,  # Keep this hard-coded until it becomes configurable.
             role=server_args.disaggregation_mode,
             enable_kv_cache_events=self._kv_events_enabled,
-            decode_input_tokens=(
-                server_args.speculative_num_draft_tokens
-                if server_args.speculative_algorithm is not None
-                else 1
-            ),
+            decode_input_tokens=decode_input_tokens,
+            overlap_schedule_depth=self.overlap_schedule_depth,
             disable_prefix_cache=not server_args.enable_prefix_caching,
             enable_mamba=has_mamba,
             mamba_cache_chunk_size=server_args.mamba_cache_chunk_size,
@@ -357,7 +371,8 @@ class EventLoop:
         )
         logger.info(
             "Scheduler config: page_size=%s num_device_pages=%s "
-            "max_scheduled_tokens=%s decode_input_tokens=%s disable_l2_cache=%s "
+            "max_scheduled_tokens=%s decode_input_tokens=%s "
+            "overlap_schedule_depth=%s disable_l2_cache=%s "
             "max_batch_size=%s (global max_num_seqs=%s, dp_size=%s) "
             "mamba_pool_total_chunks=%s enable_mamba=%s "
             "disable_prefix_cache=%s paged_cache_groups=%s",
@@ -365,6 +380,7 @@ class EventLoop:
             scheduler_cfg.num_device_pages,
             scheduler_cfg.max_scheduled_tokens,
             scheduler_cfg.decode_input_tokens,
+            scheduler_cfg.overlap_schedule_depth,
             scheduler_cfg.disable_l2_cache,
             scheduler_cfg.max_batch_size,
             server_args.max_num_seqs,
@@ -440,7 +456,7 @@ class EventLoop:
 
         self.output_processor = OutputProcesser(
             send_to_tokenizer=self.send_to_tokenizer,
-            global_rank=global_rank,
+            attn_tp_rank=attn_tp_rank,
             spec_algorithm=self.server_args.speculative_algorithm,
             spec_num_tokens=(
                 self.server_args.speculative_num_draft_tokens
@@ -448,6 +464,7 @@ class EventLoop:
                 else None
             ),
             stream_interval=self.server_args.stream_interval,
+            enable_log_request_stats=self.server_args.enable_log_request_stats,
             metrics=self.metrics,
         )
         self.prefetch_threshold = scheduler_cfg.prefetch_threshold
@@ -461,7 +478,7 @@ class EventLoop:
                 draft_token_to_kv_pool,
                 mamba_pool,
             )
-            pd_manager_args = ManagerArgs(
+            pd_manager_args = KVManagerArgs(
                 bootstrap_port=server_args.disaggregation_bootstrap_port,
                 dist_init_addr=server_args.dist_init_addr,
                 world_size=server_args.world_size or mapping.world_size,
@@ -477,7 +494,7 @@ class EventLoop:
                 metrics_reporters=server_args.metrics_reporters,
                 enable_dp_attention=self.has_dp,
             )
-            self.pd_kv_transfer = create_pd_kv_transfer(
+            self.kv_transfer = create_kv_transfer(
                 mode=server_args.disaggregation_mode,
                 backend=server_args.disaggregation_transfer_backend,
                 args=pd_manager_args,
@@ -488,11 +505,38 @@ class EventLoop:
             self._setup_pd_layerwise_transfer(
                 server_args.disaggregation_layerwise_interval
             )
+            # EPD: a multimodal prefill node is also the encode->prefill embedding
+            # SINK (independent of kv_transfer, its P->D KV source) -- it receives
+            # each image's embedding from encode workers over Mooncake so the
+            # prefill skips the vision tower. The admission controller owns the
+            # receive jobs, the rank-synced admission drain, and the optional NCCL
+            # row-shard reassembly; None for decode/encode/text-only nodes.
+            from tokenspeed.runtime.pd.epd.prefill_receiver import (
+                make_epd_prefill_admission,
+            )
+
+            self.epd_admission = make_epd_prefill_admission(
+                server_args,
+                global_rank,
+                model_config=self.model_config,
+                model_executor=self.model_executor,
+                mapping=mapping,
+                attn_tp_rank=self.attn_tp_rank,
+                attn_tp_size=self.attn_tp_size,
+                attn_tp_cpu_group=self.attn_tp_cpu_group,
+                pg_manager=pg_manager,
+            )
+            # Staged EPD request payloads (request_id -> (spec, state, bootstrap)),
+            # held here while the controller (rid-keyed, like kv_transfer) runs the
+            # async receive; popped in _drain_ready_epd_embeddings on admit/abort.
+            self._epd_staged: dict = {}
         else:
-            self.pd_kv_transfer = None
+            self.kv_transfer = None
+            self.epd_admission = None
+            self._epd_staged: dict = {}
 
     def _setup_pd_layerwise_transfer(self, interval: int) -> None:
-        if not isinstance(self.pd_kv_transfer, DisaggPrefillExecutor):
+        if not isinstance(self.kv_transfer, DisaggPrefillExecutor):
             return
         if interval <= 0:
             return
@@ -503,7 +547,111 @@ class EventLoop:
         self.model_executor.attn_backend.register_step_counter(step_counter)
         if self.model_executor.draft_attn_backend is not None:
             self.model_executor.draft_attn_backend.register_step_counter(step_counter)
-        self.pd_kv_transfer.register_layerwise_step_counter(step_counter, interval)
+        self.kv_transfer.register_layerwise_step_counter(step_counter, interval)
+
+    def _is_epd_request(self, state) -> bool:
+        """True iff this request's images are encode-routed (smg injected per-image
+        encode handshakes) -- it must wait for its embeddings (staged via the EPD
+        admission controller, polled in _drain_ready_epd_embeddings) before being
+        scheduled. Caller guards on self.epd_admission (only a multimodal prefill
+        node has one); everything else admits immediately.
+        """
+        mm = getattr(state, "multimodal_inputs", None)
+        return mm is not None and any(
+            getattr(it, "encode_handshake", None) for it in mm.mm_items
+        )
+
+    def _assert_epd_embeddings_received(self, multimodal_context) -> None:
+        """EPD invariant: every handshaked item is filled with its embedding by the
+        async EPD admission drain (EpdPrefillAdmission.drain) BEFORE admission, so by
+        it is already encoded. This is a defensive check, not a receive: a handshaked
+        item that reached the forward un-received leaked past async admission (the
+        only EPD admission path) -- fail loud instead of running the tower or
+        publishing shard-only rows. No-op for non-EPD / text-only requests.
+        """
+        if (
+            self.epd_admission is None
+            or multimodal_context is None
+            or not multimodal_context.has_extend_inputs()
+        ):
+            return
+        for mm in multimodal_context.mm_inputs:
+            if mm is None:
+                continue
+            missing = [
+                i
+                for i, item in enumerate(mm.mm_items)
+                if getattr(item, "encode_handshake", None) is not None
+                and item.encoded is None
+            ]
+            if missing:
+                raise RuntimeError(
+                    f"EPD: handshaked items {missing} reached the prefill forward "
+                    "un-received; they must be admitted via the EPD admission drain"
+                )
+
+    def _drain_ready_epd_embeddings(self) -> None:
+        """Admit EPD requests whose async embedding receives completed this cycle.
+
+        The EpdPrefillAdmission controller DECIDES (poll + rank-lockstep MIN
+        all-reduce + reassemble) and returns (admitted, failed); here we ACT on
+        those decisions with the EventLoop's collaborators -- register/abort the
+        P->D sender, submit admitted requests, finish failed ones. No-op (and no
+        collective) on non-EPD nodes.
+        """
+        if self.epd_admission is None:
+            return
+        # Pause gate: withhold EPD admission while paused, mirroring the non-EPD
+        # admit_blocked gate -- else the drain below would submit and RUN reassembled
+        # specs during the pause. Staged receives wait in _pending until resume.
+        # Rank-safe: admit_blocked is rank-identical, so all ranks skip together.
+        if self._pause.admit_blocked:
+            return
+        admitted_ids, failed_ids = self.epd_admission.drain()
+        for rid in failed_ids:
+            spec, state, bootstrap = self._epd_staged.pop(rid)
+            # Signal the dual-dispatched decode that this request failed so its KV
+            # receiver fails (FailedEvent -> _process_kv_transfer_events abort)
+            # instead of waiting forever for KV the prefill will never send. The
+            # prefill never registered a P->D sender (deferred to admission), so the
+            # decode has no other reliable way to learn (heartbeat only trips on a
+            # dead prefill /health). Best-effort: only reaches decodes that already
+            # pre-allocated.
+            if (
+                isinstance(self.kv_transfer, DisaggPrefillExecutor)
+                and bootstrap is not None
+            ):
+                try:
+                    self.kv_transfer.abort(rid, bootstrap)
+                except Exception as exc:  # never let it wedge the loop
+                    logger.warning(
+                        "EPD abort->decode signal failed for rid=%s: %s",
+                        rid,
+                        exc,
+                    )
+            state.set_finish_with_abort("EPD embedding receive failed or timed out")
+            self.output_processor.publish_finished_at_admission(rid, state)
+        admitted_specs = []
+        for rid in admitted_ids:
+            spec, state, bootstrap = self._epd_staged.pop(rid)
+            # Aborted mid-receive (no abort path, so drain still returns it admitted):
+            # don't register the P->D sender or submit -- that runs a wasted forward
+            # and leaks the sender. Stream its finish instead.
+            if state.finished:
+                self.output_processor.publish_finished_at_admission(rid, state)
+                continue
+            # Register the P->D sender now (deferred from admission) -- the request
+            # is about to enter the scheduler.
+            if self.kv_transfer is not None:
+                self.kv_transfer.register(rid, bootstrap)
+            admitted_specs.append(spec)
+        if admitted_specs:
+            self.scheduler.submit_requests(admitted_specs)
+        elif self.epd_admission.has_pending():
+            # Nothing advanced this cycle but requests are still receiving; yield the
+            # GIL so the Python daemon transfer/recv threads run (rank-consistent:
+            # admitted/leftover are rank-identical here).
+            time.sleep(0.0005)
 
     def _commit_cache_results(self) -> None:
         if self.memory_executor is None:
@@ -514,11 +662,22 @@ class EventLoop:
             payload = cache_event_to_payload(event)
             self._pending_cache_event_payloads[cache_event_key(payload)] = payload
 
-        # Local short-circuit: counter mirrors across ranks (same plan every-
-        # where), so if nothing is in flight here AND nothing is buffered
-        # awaiting commit, no rank has anything to gather.
-        if self._num_inflight_cache_ops == 0 and not self._pending_cache_event_payloads:
-            return
+        # The gather below is a collective, but cache-op completion is async and
+        # not lock-step across ranks, so local state (_num_inflight_cache_ops /
+        # _pending_cache_event_payloads) diverges transiently. A rank-local skip
+        # would let some ranks gather while others return, deadlocking the group.
+        # Agree on the skip via a cheap single-int all_reduce.
+        # NOTE: For non-DFLASH algorithms, cache ops are deterministic across
+        # ranks, so the local short-circuit is safe and avoids collective overhead.
+        local_has_work = bool(
+            self._num_inflight_cache_ops != 0 or self._pending_cache_event_payloads
+        )
+        if self.server_args.speculative_algorithm == "DFLASH":
+            if not self._cache_group_has_work(local_has_work):
+                return
+        else:
+            if not local_has_work:
+                return
 
         ready_payloads = self._pop_ready_cache_event_payloads()
         if not ready_payloads:
@@ -557,6 +716,26 @@ class EventLoop:
         self.kv_event_publisher.publish(
             KVEventBatch(ts=time.time(), events=events, attn_dp_rank=self.dp_rank)
         )
+
+    def _cache_group_has_work(self, local_has_work: bool) -> bool:
+        """Whether ANY attn-tp rank has cache work this step (unanimous via a
+        single-int MAX all_reduce, far cheaper than the payload gather it
+        guards). Deciding from rank-local state alone deadlocks the group; see
+        _commit_cache_results.
+
+        Args:
+            local_has_work: This rank's view of whether any cache op is in
+                flight or any polled payload awaits commit.
+
+        Returns:
+            ``True`` if any rank has work (all must gather); ``False`` only when
+            every rank is idle.
+        """
+        if self.attn_tp_size == 1:
+            return local_has_work
+        flag = torch.tensor([1 if local_has_work else 0], dtype=torch.int32)
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=self.attn_tp_cpu_group)
+        return bool(flag.item())
 
     def _pop_ready_cache_event_payloads(self) -> list[dict]:
         local_payloads = list(self._pending_cache_event_payloads.values())
@@ -621,11 +800,12 @@ class EventLoop:
         dp_all_decode_or_idle = (
             dp_metadata.all_decode_or_idle if dp_metadata is not None else False
         )
+        dp_all_extend = dp_metadata.all_extend if dp_metadata is not None else False
         multimodal_context = self._get_multimodal_context_for_forward(forward_op)
 
         self.model_executor.update_block_table(forward_op)
 
-        if self.pd_kv_transfer is None:
+        if self.kv_transfer is None:
             # Path 1: normal (no disaggregation)
             self.model_executor.reset_valid_cache_length(forward_op)
             return (
@@ -635,6 +815,7 @@ class EventLoop:
                     dp_global_num_tokens=dp_global_num_tokens,
                     dp_global_bs=dp_global_bs,
                     dp_all_decode_or_idle=dp_all_decode_or_idle,
+                    dp_all_extend=dp_all_extend,
                     grammar_inputs=grammar_inputs,
                     multimodal_context=multimodal_context,
                     **stats,
@@ -642,17 +823,17 @@ class EventLoop:
                 None,
             )
 
-        elif isinstance(self.pd_kv_transfer, DisaggDecodeExecutor):
+        elif isinstance(self.kv_transfer, DisaggDecodeExecutor):
             # Decode node
             if forward_op.num_extends() > 0:
                 # Path 2: new requests waiting for remote KV — trigger RDMA receive
-                self.pd_kv_transfer.reset_valid_cache_length(
+                self.kv_transfer.reset_valid_cache_length(
                     forward_op,
                     self.model_executor.runtime_states,
                     self.model_executor.execution_stream,
                     self.model_executor.device,
                 )
-                self.pd_kv_transfer.execute(forward_op)
+                self.kv_transfer.execute(forward_op)
                 self.model_executor.reset_remote_prefill_mamba_inputs(forward_op)
                 return None, None
             else:
@@ -665,6 +846,7 @@ class EventLoop:
                         dp_global_num_tokens=dp_global_num_tokens,
                         dp_global_bs=dp_global_bs,
                         dp_all_decode_or_idle=dp_all_decode_or_idle,
+                        dp_all_extend=dp_all_extend,
                         multimodal_context=multimodal_context,
                         **stats,
                     ),
@@ -673,15 +855,20 @@ class EventLoop:
 
         else:
             # Prefill node (only reached from event_loop, never event_loop_overlap)
-            assert isinstance(self.pd_kv_transfer, DisaggPrefillExecutor)
+            if not isinstance(self.kv_transfer, DisaggPrefillExecutor):
+                raise TypeError("kv_transfer must be a DisaggPrefillExecutor.")
             if forward_op.num_extends() == 0:
                 # Path 3: all prefill done — send KV to decode side
-                self.pd_kv_transfer.execute(forward_op)
+                self.kv_transfer.execute(forward_op)
                 return None, None
             else:
                 # Path 4: extend batch — run prefill forward
                 self.model_executor.reset_valid_cache_length(forward_op)
-                self.pd_kv_transfer.prepare_prefill(forward_op)
+                self.kv_transfer.prepare_prefill(forward_op)
+                # EPD invariant: handshaked items are filled by the async
+                # EPD admission drain before admission; assert none reached
+                # the forward un-received (no-op for non-EPD / text-only requests).
+                self._assert_epd_embeddings_received(multimodal_context)
                 return (
                     self.model_executor.execute_forward_op_with_log(
                         forward_op,
@@ -689,12 +876,13 @@ class EventLoop:
                         dp_global_num_tokens=dp_global_num_tokens,
                         dp_global_bs=dp_global_bs,
                         dp_all_decode_or_idle=dp_all_decode_or_idle,
+                        dp_all_extend=dp_all_extend,
                         grammar_inputs=grammar_inputs,
                         multimodal_context=multimodal_context,
                         capture_next_input_ids=True,
                         **stats,
                     ),
-                    self.pd_kv_transfer.store_prefill_token,
+                    self.kv_transfer.store_prefill_token,
                 )
 
     def _get_multimodal_context_for_forward(self, forward_op):
@@ -998,11 +1186,19 @@ class EventLoop:
                 )
                 continue
 
-            if isinstance(self.pd_kv_transfer, DisaggDecodeExecutor):
+            if isinstance(self.kv_transfer, DisaggDecodeExecutor):
                 state.computed_length = state.input_length
             self.output_processor.register(spec.request_id, state)
-            if self.pd_kv_transfer is not None:
-                self.pd_kv_transfer.register(spec.request_id, bootstrap)
+            is_epd = self.epd_admission is not None and self._is_epd_request(state)
+            # EPD: DEFER the P->D sender registration to admission (in
+            # EpdPrefillAdmission.drain, just before submit_requests). Registering
+            # it now -- while the request is staged and NOT yet in the C++ scheduler
+            # -- would let DisaggPrefillExecutor.generate_events poll the sender and
+            # emit a BootstrappedEvent that the scheduler's requests_.at(rid) THROWS
+            # on (no such request yet). Non-EPD requests register now (submitted this
+            # same call).
+            if self.kv_transfer is not None and not is_epd:
+                self.kv_transfer.register(spec.request_id, bootstrap)
 
             if self.memory_executor is not None:
                 hashes = calc_l3_query_hashes(self.scheduler, spec.tokens)
@@ -1017,7 +1213,20 @@ class EventLoop:
                     )
                     spec.rolling_hashes = hashes
                     spec.storage_hit_pages = hit_pages
-            admitted_specs.append(spec)
+            # EPD prefill: hold a request whose images are encode-routed OUT of the
+            # scheduler until its per-image embeddings have been received (started
+            # here, polled in EpdPrefillAdmission.drain, which registers the P->D
+            # sender + submits once ready). It is output_processor-registered above;
+            # the sender registration + submission are both deferred. Non-EPD
+            # requests admit immediately as before. Rank-identical because `ready` is
+            # rank-synced (recv_reqs broadcast + grammar gather).
+            if is_epd:
+                self.epd_admission.stage(
+                    spec.request_id, state.multimodal_inputs.mm_items
+                )
+                self._epd_staged[spec.request_id] = (spec, state, bootstrap)
+            else:
+                admitted_specs.append(spec)
 
         # Pause gate: while paused, withhold new requests from the scheduler
         # (running requests keep stepping); buffered specs are flushed on resume
@@ -1063,13 +1272,14 @@ class EventLoop:
         self.request_handler._profile_batch_predicate(forward_mode)
 
         # post_process_forward_op calls sync() — after this, CPU tensors are ready
-        is_prefill_instance = isinstance(self.pd_kv_transfer, DisaggPrefillExecutor)
+        is_prefill_instance = isinstance(self.kv_transfer, DisaggPrefillExecutor)
         request_changes = self.output_processor.post_process_forward_op(
             forward_op,
             results,
             is_prefill_instance=is_prefill_instance,
             on_first_token=on_first_token,
         )
+
         # Accumulate decode stats from synced results (no GPU sync)
         if forward_op.num_extends() <= 0:
             bs = len(forward_op.request_ids)
@@ -1084,22 +1294,21 @@ class EventLoop:
             return None
         return forward_ops[0]
 
-    def _process_pd_events(self, pd_events: list) -> list:
+    def _process_kv_transfer_events(self, kv_transfer_events: list) -> list:
         processed = []
-        for event in pd_events:
+        for event in kv_transfer_events:
             processed.append(event)
             if isinstance(event, PD.SucceededEvent) and isinstance(
-                self.pd_kv_transfer, DisaggPrefillExecutor
+                self.kv_transfer, DisaggPrefillExecutor
             ):
                 req_id = event.request_id
                 processed.extend(self.output_processor.finish_prefill_request(req_id))
             elif isinstance(event, PD.RemotePrefillDoneEvent):
                 req_id = event.request_id
                 bootstrap_token = event.bootstrap_token
-
                 self.output_processor.on_remote_prefill_done(req_id, bootstrap_token)
-                if isinstance(self.pd_kv_transfer, DisaggDecodeExecutor):
-                    candidate_info = self.pd_kv_transfer.pop_remote_spec_candidate_ids(
+                if isinstance(self.kv_transfer, DisaggDecodeExecutor):
+                    candidate_info = self.kv_transfer.pop_remote_spec_candidate_ids(
                         req_id
                     )
                     if candidate_info is not None:
@@ -1107,6 +1316,25 @@ class EventLoop:
                         self.model_executor.write_remote_spec_candidate_ids(
                             req_pool_idx, candidate_ids
                         )
+            elif isinstance(event, PD.FailedEvent):
+                # A PD/EPD transfer failed: the decode KV receiver timed out (e.g. the
+                # prefill aborted on embedding timeout so the KV never arrives), or a
+                # transfer errored. The C++ scheduler's FailedEvent handler is a no-op,
+                # so without this the request is never finished and the CLIENT HANGS
+                # FOREVER (the decode is its response stream). Finish it with an abort
+                # (streams the error to the client) and abort it in the scheduler so its
+                # slot/KV is freed. AbortEvent is valid from the decode-waiting state
+                # (forward_events.cpp: AbortEvent(Prefilling&&) -> Finished).
+                req_id = event.request_id
+                state = self.output_processor.rid_to_state.get(req_id)
+                if state is not None:
+                    state.set_finish_with_abort(
+                        "PD/EPD remote transfer failed or timed out"
+                    )
+                    self.output_processor.publish_finished_at_admission(req_id, state)
+                    abort = ForwardEvent.Abort()
+                    abort.request_id = req_id
+                    processed.append(abort)
 
         return processed
 
@@ -1138,7 +1366,7 @@ class EventLoop:
 
         executes_model_forward = _forward_op_executes_model_forward(
             forward_op,
-            is_disagg_decode=isinstance(self.pd_kv_transfer, DisaggDecodeExecutor),
+            is_disagg_decode=isinstance(self.kv_transfer, DisaggDecodeExecutor),
         )
         num_tokens = sum(forward_op.input_lengths) if executes_model_forward else 0
         batch_size = len(forward_op.request_ids) if executes_model_forward else 0
@@ -1171,11 +1399,16 @@ class EventLoop:
             )
             for mode in global_forward_mode
         )
+        # Replicated prefill-graph gate (see PrefillGraph._select_bucket).
+        all_extend = all(
+            mode == int(ForwardMode.EXTEND) for mode in global_forward_mode
+        )
         return DpForwardMetadata(
             global_num_tokens=global_num_tokens,
             global_batch_size=global_batch_size,
             global_forward_mode=global_forward_mode,
             all_decode_or_idle=all_decode_or_idle,
+            all_extend=all_extend,
             need_idle_forward=need_idle_forward,
         )
 
@@ -1274,6 +1507,11 @@ class EventLoop:
         """Non-overlapping scheduler loop."""
         while True:
             self._process_new_requests()
+            # EPD prefill: admit requests whose async embedding receives completed
+            # this cycle (rank-synced). Fixed position right after
+            # _process_new_requests so the drain's TP collective ordering is
+            # rank-identical every cycle.
+            self._drain_ready_epd_embeddings()
             self._commit_cache_results()
             if self._pause.forward_blocked:
                 self._paused_idle_step()
@@ -1308,6 +1546,7 @@ class EventLoop:
             if forward_op is not None:
                 sampling_params_list = self._gather_sampling_params(forward_op)
                 grammar_inputs = self._gather_grammar_state(forward_op)
+                self._mark_stats_scheduled(forward_op)
                 results, on_first_token = self._dispatch_forward(
                     forward_op,
                     sampling_params_list,
@@ -1323,9 +1562,11 @@ class EventLoop:
                         )
                     )
 
-            if self.pd_kv_transfer is not None:
-                pd_events = self.pd_kv_transfer.generate_events()
-                request_changes.extend(self._process_pd_events(pd_events))
+            if self.kv_transfer is not None:
+                kv_transfer_events = self.kv_transfer.generate_events()
+                request_changes.extend(
+                    self._process_kv_transfer_events(kv_transfer_events)
+                )
 
             if request_changes:
                 advance_forward(self.scheduler, request_changes)
@@ -1335,6 +1576,19 @@ class EventLoop:
             self._pause.maybe_finish_drain(self.scheduler)
 
             self._record_scheduler_iteration_metrics(stats, num_iter_tokens)
+
+    def _mark_stats_scheduled(self, forward_op) -> None:
+        # Stamp the pre-forward "scheduled" time on each request's stats tracker
+        # so the queue/prefill split is anchored before the forward (idempotent:
+        # only the first forward a request appears in sets it). --enable-log-request-stats.
+        if not self.server_args.enable_log_request_stats or forward_op is None:
+            return
+        now = time.time()
+        rid_to_state = self.output_processor.rid_to_state
+        for rid in forward_op.request_ids:
+            st = rid_to_state.get(rid)
+            if st is not None:
+                st.stats.mark_scheduled(now)
 
     def _gather_sampling_params(self, forward_op) -> list[SamplingParams]:
         """Look up per-request SamplingParams from the output processor. The
@@ -1382,6 +1636,17 @@ class EventLoop:
         Overlapping scheduler loop: post-process the previous step's results
         while the current step's forward pass is in flight.
         """
+        # EPD invariant: the async embedding drain (EpdPrefillAdmission.drain)
+        # that admits EPD requests runs ONLY in event_loop(), never here. A
+        # prefill node that receives encode embeddings must therefore run the
+        # non-overlap loop -- should_use_overlap_schedule enforces this by forcing
+        # prefill -> non-overlap. Assert it rather than trusting that external
+        # coupling: if a prefill ever reached this loop, every EPD request would
+        # stage into the admission controller and hang forever with no drain.
+        assert self.epd_admission is None, (
+            "EPD prefill must run the non-overlap event_loop(); the embedding "
+            "drain is not wired into event_loop_overlap()"
+        )
         prev_results: ModelExecutionResult = None
         prev_forward_op = None
 
@@ -1477,6 +1742,7 @@ class EventLoop:
 
             curr_results = None
             if forward_op is not None:
+                self._mark_stats_scheduled(forward_op)
                 curr_results, _ = self._dispatch_forward(
                     forward_op,
                     sampling_params_list,
@@ -1492,10 +1758,12 @@ class EventLoop:
                     self._commit_forward_results(prev_forward_op, prev_results)
                 )
 
-            # ---- collect PD events ----
-            if self.pd_kv_transfer is not None:
-                pd_events = self.pd_kv_transfer.generate_events()
-                request_changes.extend(self._process_pd_events(pd_events))
+            # ---- collect KV transfer events ----
+            if self.kv_transfer is not None:
+                kv_transfer_events = self.kv_transfer.generate_events()
+                request_changes.extend(
+                    self._process_kv_transfer_events(kv_transfer_events)
+                )
 
             if request_changes:
                 advance_forward(self.scheduler, request_changes)
@@ -1530,6 +1798,16 @@ def run_event_loop(
     configure_logger(server_args, prefix=prefix)
 
     try:
+        if server_args.disaggregation_mode == "encode":
+            # The encode role is LM-free; run the lightweight vision-tower loop
+            # instead of building the full EventLoop (KV/LM scheduler).
+            from tokenspeed.runtime.pd.epd.encode_loop import (
+                run_encode_loop,
+            )
+
+            run_encode_loop(server_args, port_args, pipe_writer, gpu_id, global_rank)
+            return
+
         event_loop = EventLoop(
             server_args,
             port_args,
@@ -1549,13 +1827,12 @@ def run_event_loop(
             }
         )
 
-        use_overlap = should_use_overlap_schedule(
-            disable_overlap_schedule=server_args.disable_overlap_schedule,
-            disaggregation_mode=server_args.disaggregation_mode,
-            speculative_algorithm=server_args.speculative_algorithm,
-            paged_cache_groups=getattr(event_loop, "_paged_cache_groups", ()),
-        )
-        if use_overlap:
+        if event_loop.has_dp:
+            # All DP schedulers must finish initialization before any rank enters
+            # the loop and starts the first DP metadata collective.
+            dist.barrier(group=event_loop.world_cpu_group)
+
+        if event_loop.use_overlap_schedule:
             event_loop.event_loop_overlap()
         else:
             event_loop.event_loop()

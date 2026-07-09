@@ -26,6 +26,7 @@ import logging
 import tokenspeed_kernel.numerics.reference.gemm  # noqa: F401
 import tokenspeed_kernel.ops.gemm.deep_gemm  # noqa: F401
 import tokenspeed_kernel.ops.gemm.flashinfer  # noqa: F401
+import tokenspeed_kernel.ops.gemm.gluon  # noqa: F401
 import tokenspeed_kernel.ops.gemm.triton  # noqa: F401
 import tokenspeed_kernel.ops.gemm.trtllm  # noqa: F401
 import torch
@@ -286,6 +287,7 @@ def mm(
         "k_align_16": K % 16 == 0,
         "n_align_64": N % 64 == 0,
         "n_align_128": N % 128 == 0,
+        "k_align_64": K % 64 == 0,
         "k_align_128": K % 128 == 0,
     }
 

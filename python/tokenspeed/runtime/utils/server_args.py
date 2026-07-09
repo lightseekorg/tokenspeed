@@ -27,12 +27,12 @@ import os
 import random
 from typing import Literal
 
+from tokenspeed_kernel.ops.attention.triton.linear.chunk_delta_h import (
+    CHUNK_SIZE as FLA_CHUNK_SIZE,
+)
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.mapping import Mapping, _resolve_parallelism_sizes
-from tokenspeed.runtime.layers.attention.linear.chunk_delta_h import (
-    CHUNK_SIZE as FLA_CHUNK_SIZE,
-)
 from tokenspeed.runtime.utils import (
     get_amdgpu_memory_capacity,
     get_colorful_logger,
@@ -122,6 +122,7 @@ class ServerArgs:
     log_level_http: str | None = None
     enable_log_requests: bool = False
     log_requests_level: int = 0
+    enable_log_request_stats: bool = False
     enable_metrics: bool = False
     decode_log_interval: int = 40
     metrics_reporters: list[str] | None = None
@@ -244,7 +245,10 @@ class ServerArgs:
     low_latency_max_num_tokens_per_gpu: int = 256
     max_cudagraph_capture_size: int | None = None
     disable_prefill_graph: bool | None = False
-    prefill_graph_max_tokens: int | None = 128
+    # Breakable prefill CUDA graph, opt-in: > 0 enables and caps the largest bucket.
+    prefill_graph_max_tokens: int | None = 0
+    # Explicit prefill bucket list; unset = the relative-stride ladder (see get_prefill_token_buckets).
+    prefill_graph_capture_sizes: list[int] | None = None
     cudagraph_capture_sizes: list[int] | None = None
     enable_nan_detection: bool = False
     enable_nvtx: bool = False
@@ -269,7 +273,7 @@ class ServerArgs:
     mla_chunk_multiplier: int = 4
     mm_attention_backend: str | None = None
 
-    # For PD disaggregation: can be "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only)
+    # For PD/EPD disaggregation: "null", "prefill", "decode", or "encode" (vision-tower-only).
     disaggregation_mode: str = "null"
     disaggregation_bootstrap_port: int = 8998
     disaggregation_transfer_backend: str = "mooncake"
@@ -544,7 +548,7 @@ class ServerArgs:
                 int(x) for x in self.eagle3_layers_to_capture.split(",")
             ]
 
-        # Hoist the PD-decode runtime assert (topk == 1) to startup.
+        # Hoist the PD-decode topk == 1 check to startup.
         if self.speculative_algorithm is not None and self.speculative_eagle_topk != 1:
             raise ValueError(
                 "speculative_eagle_topk > 1 (tree spec) is not currently "
@@ -585,6 +589,16 @@ class ServerArgs:
                 "enable_prefix_caching=%r for decode server",
                 self.enable_prefix_caching,
             )
+        elif self.disaggregation_mode == "encode":
+            # Encode server: vision tower only, no LM / KV pool / prefix cache.
+            # enforce_eager left as-is (the vision tower keeps its own CUDA graph).
+            if self.mapping.has_attn_dp:
+                raise ValueError(
+                    "disaggregation_mode=encode currently supports "
+                    "data_parallel_size == 1 inside one encode server; run "
+                    "multiple independent encode servers for horizontal scale."
+                )
+            self.enable_prefix_caching = False
 
         # Prefill graph disable logic is handled by AttnInitializer.modify_args
         # after the attention backend is resolved.
@@ -593,14 +607,20 @@ class ServerArgs:
             self.disaggregation_mode == "prefill"
             and self.load_balance_method != "round_robin"
         ):
-            assert (
-                not self.mapping.has_attn_dp
-            ), f"Not Supported when {self.disaggregation_mode=} {self.load_balance_method=} {self.mapping.attn.dp_size=}"
+            if self.mapping.has_attn_dp:
+                raise ValueError(
+                    "Not supported when "
+                    f"{self.disaggregation_mode=} {self.load_balance_method=} "
+                    f"{self.mapping.attn.dp_size=}"
+                )
 
     def _handle_kvstore(self):
-        if self.disaggregation_mode == "decode":
+        if self.disaggregation_mode in ("decode", "encode"):
             self.enable_kvstore = False
-            logger.info("Decode instance has set enable_kvstore to False!")
+            logger.info(
+                "%s instance has set enable_kvstore to False!",
+                self.disaggregation_mode,
+            )
         elif not self.disable_kvstore:
             self.enable_kvstore = True
 
@@ -1079,6 +1099,18 @@ class ServerArgs:
             choices=[0, 1, 2],
         )
         parser.add_argument(
+            "--enable-log-request-stats",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.enable_log_request_stats,
+            help=(
+                "Log a one-line per-request performance summary when each request "
+                "finishes or aborts: timings (queue/prefill/ttft/total/preemption), "
+                "token counts (prompt/cache/output), cache-hit rate, decode "
+                "throughput, and spec-decode acceptance. Measured entirely on the "
+                "host (no GPU sync), so it adds no engine slowdown."
+            ),
+        )
+        parser.add_argument(
             "--enable-metrics",
             action="store_true",
             help="Enable log metrics.",
@@ -1298,17 +1330,26 @@ class ServerArgs:
         parser.add_argument(
             "--sampling-backend",
             type=str,
-            choices=["greedy", "flashinfer", "flashinfer_full"],
+            choices=[
+                "greedy",
+                "flashinfer",
+                "flashinfer_full",
+                "triton",
+                "triton_full",
+            ],
             default=ServerArgs.sampling_backend,
             help="Sampling backend. "
-            "When unspecified, defaults to 'flashinfer' on NVIDIA and 'greedy' elsewhere. "
             "'greedy': argmax + verify_chain_greedy, zero sampling-param plumbing. "
             "'flashinfer': temperature/top_k/top_p via fused softmax + top_k_top_p_sampling_from_probs; "
             "min_p and penalties silently ignored. "
+            "'triton': temperature/top_k/top_p via MRV2-style logits-to-Gumbel-Max; "
+            "min_p and penalties silently ignored. "
             "'flashinfer_full': adds min_p plus frequency/presence/repetition penalties and logit_bias "
             "via the softmax+renorm+min_p kernel sequence. "
+            "'triton_full': adds min_p plus frequency/presence/repetition penalties and logit_bias "
+            "with Triton Gumbel-Max for single-step sampling. "
             "Allocates a counts[max_req_pool_size, vocab_size] int32 buffer (substantial memory). "
-            "Both 'flashinfer' and 'flashinfer_full' require top_k < 128 (fused kernel limit) or -1.",
+            "Finite top_k values must be < 128 or -1.",
         )
         parser.add_argument(
             "--dp-sampling",
@@ -1569,7 +1610,18 @@ class ServerArgs:
             "--prefill-graph-max-tokens",
             type=int,
             default=ServerArgs.prefill_graph_max_tokens,
-            help="Max query tokens to capture when enable prefill graph",
+            help="Enable the breakable prefill CUDA graph and cap the largest "
+            "captured token bucket. 0 (default) disables it (opt-in).",
+        )
+        parser.add_argument(
+            "--prefill-graph-capture-sizes",
+            metavar="PREFILL_GRAPH_CAPTURE_SIZE",
+            type=int,
+            nargs="+",
+            help="Explicit list of token-bucket sizes to capture for the "
+            "breakable prefill graph (like --cudagraph-capture-sizes for "
+            "decode). Unset: a relative-stride ladder bounding padded compute "
+            "at ~12.5%% of any size.",
         )
         parser.add_argument(
             "--enable-nan-detection",
@@ -1735,8 +1787,8 @@ class ServerArgs:
             "--disaggregation-mode",
             type=str,
             default="null",
-            choices=["null", "prefill", "decode"],
-            help='Only used for PD disaggregation. "prefill" for prefill-only server, and "decode" for decode-only server. If not specified, it is not PD disaggregated',
+            choices=["null", "prefill", "decode", "encode"],
+            help='Used for PD/EPD disaggregation. "prefill" for prefill-only server, "decode" for decode-only server, and "encode" for a vision-tower-only server that ships image embeddings to a prefill server. If not specified, it is not disaggregated',
         )
         parser.add_argument(
             "--comm-fusion-max-num-tokens",
@@ -1889,9 +1941,10 @@ class PortArgs:
             dist_init_addr = ("127.0.0.1", server_args.port + ZMQ_TCP_PORT_DELTA)
         else:
             dist_init_addr = server_args.dist_init_addr.split(":")
-        assert (
-            len(dist_init_addr) == 2
-        ), "please provide --dist-init-addr as host:port of head node"
+        if len(dist_init_addr) != 2:
+            raise ValueError(
+                "please provide --dist-init-addr as host:port of head node"
+            )
 
         dist_init_host, dist_init_port = dist_init_addr
         dist_init_port = int(dist_init_port)

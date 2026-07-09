@@ -352,21 +352,20 @@ class CommManager:
         residual: torch.Tensor,
         ctx: ForwardContext,
         norm: torch.nn.Module,
-    ):
-        # IDLE forward (DP only): no attn/mlp ran for this rank, so residual
-        # was never built. There is nothing to normalize; skip the call so
-        # we don't unpack a single-tensor return from norm(x, None).
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+
         if ctx.forward_mode.is_idle():
-            return hidden_states
+            return hidden_states, None
 
         if self.should_fuse(hidden_states.shape[0]):
-            hidden_states, *_ = norm.forward_with_allreduce_fusion(
+            hidden_states, residual_out, *_ = norm.forward_with_allreduce_fusion(
                 self.mapping.attn.tp_rank,
                 self.mapping.attn.tp_group,
                 hidden_states,
                 residual,
             )
         else:
-            hidden_states, _ = norm(hidden_states, residual)
+            hidden_states, residual_out = norm(hidden_states, residual)
             hidden_states, _ = self.post_final_norm_comm(hidden_states, residual, ctx)
-        return hidden_states
+
+        return hidden_states, residual_out

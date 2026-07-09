@@ -32,12 +32,15 @@ import tokenspeed_kernel.numerics.reference.gemm as _gemm_reference
 import tokenspeed_kernel.ops.attention as _attention_pkg
 import tokenspeed_kernel.ops.attention.cuda as _attention_cuda
 import tokenspeed_kernel.ops.attention.flash_attn as _attention_flash_attn
+import tokenspeed_kernel.ops.attention.flash_mla as _attention_flash_mla
 import tokenspeed_kernel.ops.attention.flashinfer as _attention_flashinfer
+import tokenspeed_kernel.ops.attention.flashinfer.gated_delta_rule as _attention_flashinfer_gdn
 import tokenspeed_kernel.ops.attention.gluon as _attention_gluon
 import tokenspeed_kernel.ops.attention.triton as _attention_triton
 import tokenspeed_kernel.ops.gemm as _gemm_pkg
 import tokenspeed_kernel.ops.gemm.deep_gemm as _gemm_deep_gemm
 import tokenspeed_kernel.ops.gemm.flashinfer as _gemm_flashinfer
+import tokenspeed_kernel.ops.gemm.gluon as _gemm_gluon
 import tokenspeed_kernel.ops.gemm.triton as _gemm_triton
 import tokenspeed_kernel.ops.gemm.trtllm as _gemm_trtllm
 import tokenspeed_kernel.ops.moe as _moe_pkg
@@ -48,6 +51,29 @@ import tokenspeed_kernel.ops.sampling as _sampling_pkg
 import tokenspeed_kernel.ops.sampling.cute_dsl as _sampling_cute_dsl
 import tokenspeed_kernel.ops.sampling.gluon as _sampling_gluon
 import torch
+from tokenspeed_kernel.ops.attention.gdn_utils import GdnChunkPrefillResult
+from tokenspeed_kernel.ops.attention.triton import dsa as _attention_triton_dsa
+from tokenspeed_kernel.ops.attention.triton import (
+    dsa_topk as _attention_triton_dsa_topk,
+)
+from tokenspeed_kernel.ops.attention.triton import (
+    gated_delta_rule as _attention_triton_gdn,
+)
+from tokenspeed_kernel.ops.attention.triton import (
+    merge_state as _attention_triton_merge_state,
+)
+from tokenspeed_kernel.ops.attention.triton import (
+    mha_decode as _attention_triton_mha_decode,
+)
+from tokenspeed_kernel.ops.attention.triton import (
+    mha_prefill as _attention_triton_mha_prefill,
+)
+from tokenspeed_kernel.ops.attention.triton import (
+    mla_decode as _attention_triton_mla_decode,
+)
+from tokenspeed_kernel.ops.attention.triton import (
+    mla_prefill as _attention_triton_mla_prefill,
+)
 from tokenspeed_kernel.ops.moe.flashinfer import (
     cutedsl_deepep_nvfp4 as _moe_cutedsl_deepep_nvfp4,
 )
@@ -60,6 +86,7 @@ from tokenspeed_kernel.ops.moe.flashinfer import trtllm_mxint4 as _moe_trtllm_mx
 from tokenspeed_kernel.ops.moe.flashinfer import trtllm_nvfp4 as _moe_trtllm_nvfp4
 from tokenspeed_kernel.ops.moe.flashinfer import trtllm_unquant as _moe_trtllm_unquant
 from tokenspeed_kernel.ops.moe.gluon import mxfp4 as _moe_gluon_mxfp4
+from tokenspeed_kernel.ops.moe.triton import fp8 as _moe_triton_fp8
 from tokenspeed_kernel.ops.moe.triton import mxfp4 as _moe_triton_mxfp4
 from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry
@@ -69,14 +96,25 @@ _RELOAD_MODULES = [
     # Attention registration modules.
     _attention_cuda,
     _attention_flash_attn,
+    _attention_flash_mla,
+    _attention_flashinfer_gdn,
     _attention_flashinfer,
     _attention_gluon,
+    _attention_triton_mha_prefill,
+    _attention_triton_mha_decode,
+    _attention_triton_mla_prefill,
+    _attention_triton_mla_decode,
+    _attention_triton_merge_state,
+    _attention_triton_dsa,
+    _attention_triton_dsa_topk,
+    _attention_triton_gdn,
     _attention_triton,
     _attention_pkg,
     # GEMM registration modules.
     _gemm_reference,
     _gemm_deep_gemm,
     _gemm_flashinfer,
+    _gemm_gluon,
     _gemm_triton,
     _gemm_trtllm,
     _gemm_pkg,
@@ -93,6 +131,7 @@ _RELOAD_MODULES = [
     _moe_flashinfer,
     _moe_gluon_mxfp4,
     _moe_gluon,
+    _moe_triton_fp8,
     _moe_triton_mxfp4,
     _moe_triton,
     _moe_pkg,
@@ -209,6 +248,12 @@ def _mm_dense() -> torch.Tensor:
     return tokenspeed_kernel.mm(a, b)
 
 
+def _mm_dense_gluon_gfx950() -> torch.Tensor:
+    a = torch.empty((16, 64), dtype=torch.bfloat16)
+    b = torch.empty((128, 64), dtype=torch.bfloat16)
+    return tokenspeed_kernel.mm(a, b)
+
+
 def _mm_mxfp8() -> torch.Tensor:
     a = torch.empty((4, 128), dtype=_fp8_dtype())
     b = torch.empty((128, 128), dtype=_fp8_dtype())
@@ -255,8 +300,8 @@ def test_gemm_mxfp8_online_activation_signature_uses_quantized_storage() -> None
 def test_gemm_mxfp8_online_activation_preserves_repeated_rows() -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for online mxfp8 GEMM verification")
-    if not Platform.get().is_nvidia:
-        pytest.skip("NVIDIA GPU is required for TRTLLM mxfp8 scale layout")
+    if not (Platform.get().is_nvidia or Platform.get().is_cdna4):
+        pytest.skip("online mxfp8 GEMM verification requires NVIDIA or AMD CDNA4")
 
     torch.manual_seed(0)
     num_tokens = 16
@@ -437,12 +482,119 @@ def _attention_decode() -> object:
     )
 
 
+def _attention_dsa_decode() -> object:
+    q = torch.empty((2, 8, 576), dtype=torch.bfloat16)
+    sparse_kv_cache = torch.empty((64, 656), dtype=torch.uint8)
+    topk_slots = torch.empty((2, 512), dtype=torch.int32)
+    topk_lens = torch.empty((2,), dtype=torch.int32)
+    return tokenspeed_kernel.dsa_decode(
+        q=q,
+        kv_cache=None,
+        sparse_kv_cache=sparse_kv_cache,
+        topk_slots=topk_slots,
+        topk_lens=topk_lens,
+        max_seqlen_k=64,
+        qk_nope_head_dim=192,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        softmax_scale=1.0,
+        page_size=64,
+        solution="triton",
+    )
+
+
+def _attention_dsa_prefill() -> object:
+    q = torch.empty((2, 8, 576), dtype=torch.bfloat16)
+    sparse_kv_cache = torch.empty((64, 656), dtype=torch.uint8)
+    topk_slots = torch.empty((2, 512), dtype=torch.int32)
+    topk_lens = torch.empty((2,), dtype=torch.int32)
+    return tokenspeed_kernel.dsa_prefill(
+        q=q,
+        kv_cache=None,
+        sparse_kv_cache=sparse_kv_cache,
+        topk_slots=topk_slots,
+        topk_lens=topk_lens,
+        max_seqlen_k=64,
+        qk_nope_head_dim=192,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        softmax_scale=1.0,
+        page_size=64,
+        solution="triton",
+    )
+
+
+def _attention_dsa_decode_topk() -> object:
+    q = torch.empty((2, 2, 128), dtype=torch.bfloat16)
+    weights = torch.empty((2, 2), dtype=torch.float32)
+    index_k = torch.zeros((128, 132), dtype=torch.uint8)
+    seq_lens = torch.tensor([64, 64], dtype=torch.int32)
+    block_table = torch.zeros((2, 1), dtype=torch.int32)
+    return tokenspeed_kernel.dsa_decode_topk(
+        q,
+        weights,
+        seq_lens,
+        block_table,
+        page_size=64,
+        topk=512,
+        softmax_scale=1.0,
+        index_k_cache=index_k,
+    )
+
+
+def _attention_dsa_prefill_topk() -> object:
+    q = torch.empty((2, 2, 128), dtype=torch.bfloat16)
+    weights = torch.empty((2, 2), dtype=torch.float32)
+    index_k = torch.zeros((128, 132), dtype=torch.uint8)
+    kv_workspace_slots = torch.arange(64, dtype=torch.int64)
+    row_starts = torch.tensor([0, 8], dtype=torch.int32)
+    row_ends = torch.tensor([8, 16], dtype=torch.int32)
+    return tokenspeed_kernel.dsa_prefill_topk(
+        q,
+        weights,
+        kv_workspace_slots,
+        row_starts,
+        row_ends,
+        topk=512,
+        softmax_scale=1.0,
+        index_k_cache=index_k,
+        page_size=64,
+    )
+
+
+def _attention_dsa_plan() -> object:
+    seq_lens_2d = torch.tensor([[64], [64]], dtype=torch.int32)
+    return tokenspeed_kernel.dsa_plan(seq_lens_2d=seq_lens_2d, page_size=64)
+
+
 def _attention_merge_state() -> object:
     out_a = torch.empty((4, 16, 64), dtype=torch.bfloat16)
     out_b = torch.empty((4, 16, 64), dtype=torch.bfloat16)
     lse_a = torch.empty((4, 16), dtype=torch.float32)
     lse_b = torch.empty((4, 16), dtype=torch.float32)
     return tokenspeed_kernel.attn_merge_state(out_a, lse_a, out_b, lse_b)
+
+
+def _attention_gdn_chunk_prefill() -> object:
+    q = torch.empty((1, 4, 16, 64), dtype=torch.bfloat16)
+    k = torch.empty((1, 4, 16, 64), dtype=torch.bfloat16)
+    v = torch.empty((1, 4, 16, 64), dtype=torch.bfloat16)
+    g = torch.empty((1, 4, 16), dtype=torch.bfloat16)
+    beta = torch.empty((1, 4, 16), dtype=torch.bfloat16)
+    initial_state = torch.empty((1, 16, 64, 64), dtype=torch.bfloat16)
+    cu_seqlens = torch.tensor([0, 4], dtype=torch.int32)
+    return tokenspeed_kernel.gdn_chunk_prefill(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        scale=64**-0.5,
+        initial_state=initial_state,
+        cu_seqlens=cu_seqlens,
+        qk_l2norm=True,
+        solution="triton",
+    )
 
 
 def _sampling_argmax() -> object:
@@ -459,6 +611,21 @@ def _assert_moe_plan(plan: dict, *, apply: str, preprocessor: str | None) -> Non
         else getattr(actual_preprocessor, "__name__", repr(actual_preprocessor))
     )
     assert actual_name == preprocessor
+
+
+def test_gluon_mxfp4_swiglu_args_default_missing_values_to_standard_swiglu() -> None:
+    if not hasattr(_moe_gluon_mxfp4, "_swiglu_args"):
+        pytest.skip("Gluon MXFP4 SwiGLU args are AMD-only")
+
+    w = torch.nn.Module()
+    w.swiglu_arg = type("SwigluArg", (), {"alpha": None, "limit": None})()
+
+    assert _moe_gluon_mxfp4._swiglu_args(w) == (1.0, 0.0, 0.0)
+
+    w.swiglu_arg = type("SwigluArg", (), {"alpha": 1.702, "limit": 7.0})()
+    w.swiglu_beta = 1.0
+
+    assert _moe_gluon_mxfp4._swiglu_args(w) == (1.702, 7.0, 1.0)
 
 
 def _moe_apply_unquant_trtllm() -> object:
@@ -691,13 +858,66 @@ def _moe_apply_mxint4_trtllm() -> object:
     return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
 
 
-def _moe_apply_mxfp4_precomputed_tp() -> object:
+def _moe_apply_mxfp4_dynamic_tp() -> object:
     plan = tokenspeed_kernel.moe_plan(
         "mxfp4",
         input_dtype=torch.bfloat16,
         activation="silu",
         ep_size=1,
+        ispp=2048,
         internal_activation_dtype="input",
+    )
+    _assert_moe_plan(
+        plan,
+        apply="gluon_mxfp4_dynamic_moe_apply",
+        preprocessor="gluon_mxfp4_gfx950_moe_weights",
+    )
+    x = torch.empty((4, 16), dtype=torch.bfloat16)
+    router_logits = torch.empty((4, 8), dtype=torch.float32)
+    return tokenspeed_kernel.moe_apply(
+        plan,
+        x,
+        torch.nn.Module(),
+        router_logits,
+    )
+
+
+def _moe_apply_fp8_precomputed_tp() -> object:
+    plan = _moe_pkg.moe_plan(
+        "fp8",
+        input_dtype=torch.bfloat16,
+        activation="silu",
+        ep_size=1,
+        fp8_scale_block_shape=(128, 128),
+        solution="triton",
+    )
+    x = torch.empty((4, 16), dtype=torch.bfloat16)
+    router_logits = torch.empty((4, 8), dtype=torch.float32)
+    topk_weights = torch.empty((4, 2), dtype=torch.float32)
+    topk_ids = torch.empty((4, 2), dtype=torch.int64)
+    return tokenspeed_kernel.moe_apply(
+        plan,
+        x,
+        torch.nn.Module(),
+        router_logits,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+    )
+
+
+def _moe_apply_fp8_precomputed_ep() -> object:
+    plan = _moe_pkg.moe_plan(
+        "fp8",
+        input_dtype=torch.bfloat16,
+        activation="silu",
+        ep_size=2,
+        fp8_scale_block_shape=(128, 128),
+        solution="triton",
+    )
+    _assert_moe_plan(
+        plan,
+        apply="triton_fp8_ep_precomputed_moe_apply",
+        preprocessor="triton_fp8_moe_weights",
     )
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
@@ -814,7 +1034,7 @@ _CASES = [
         "hopper",
         "attention",
         "attn_merge_state",
-        "triton_attn_merge_state",
+        "cuda_attn_merge_state",
         _attention_merge_state,
     ),
     _case(
@@ -886,7 +1106,7 @@ _CASES = [
         "cdna4",
         "attention",
         "mha_extend_with_kvcache",
-        "triton_mha_extend_with_kvcache",
+        "gluon_mha_extend_fp16_gfx950",
         _attention_extend,
     ),
     _case(
@@ -905,8 +1125,64 @@ _CASES = [
         "triton_attn_merge_state",
         _attention_merge_state,
     ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "dsa_decode",
+        "triton_dsa_decode",
+        _attention_dsa_decode,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "dsa_prefill",
+        "triton_dsa_prefill",
+        _attention_dsa_prefill,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "dsa_decode_topk",
+        "triton_dsa_decode_topk_fp8",
+        _attention_dsa_decode_topk,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "dsa_prefill_topk",
+        "triton_dsa_prefill_topk_fp8",
+        _attention_dsa_prefill_topk,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "dsa_plan",
+        "triton_dsa_plan",
+        _attention_dsa_plan,
+    ),
+    _case(
+        _is_supported_gpu,
+        "supported-gpu",
+        "attention",
+        "gdn_chunk_prefill",
+        "triton_gdn_chunk_prefill",
+        _attention_gdn_chunk_prefill,
+    ),
     # GEMM API x architecture golden cases.
     _case(_is_supported_gpu, "supported-gpu", "gemm", "mm", "torch_mm", _mm_dense),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "gemm",
+        "mm",
+        "gluon_mm_a16w16_gfx950",
+        _mm_dense_gluon_gfx950,
+    ),
     _case(
         _is_hopper,
         "hopper",
@@ -930,6 +1206,14 @@ _CASES = [
         "mm",
         "cublaslt_mm_nvfp4",
         _mm_nvfp4,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "gemm",
+        "mm",
+        "triton_mm_fp8_blockscale",
+        _mm_mxfp8,
     ),
     # Sampling API x architecture golden cases.
     _case(
@@ -1042,8 +1326,8 @@ _CASES = [
         "cdna4",
         "moe",
         "apply",
-        "triton_mxfp4_precomputed_moe_apply",
-        _moe_apply_mxfp4_precomputed_tp,
+        "gluon_mxfp4_dynamic_moe_apply",
+        _moe_apply_mxfp4_dynamic_tp,
     ),
     _case(
         _is_cdna4,
@@ -1052,6 +1336,22 @@ _CASES = [
         "apply",
         "triton_mxfp4_ep_precomputed_moe_apply",
         _moe_apply_mxfp4_precomputed_ep,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "moe",
+        "apply",
+        "triton_fp8_ep_precomputed_moe_apply",
+        _moe_apply_fp8_precomputed_tp,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "moe",
+        "apply",
+        "triton_fp8_ep_precomputed_moe_apply",
+        _moe_apply_fp8_precomputed_ep,
     ),
 ]
 
@@ -1076,8 +1376,14 @@ def selected_kernel_spy(monkeypatch):
                 return torch.empty_like(kwargs["out_a"]), torch.empty_like(
                     kwargs["lse_a"]
                 )
-
+            if case.mode == "dsa_plan":
+                return torch.empty((1, 4), dtype=torch.int32)
             q = kwargs["q"]
+            if case.mode == "gdn_chunk_prefill":
+                return GdnChunkPrefillResult(
+                    out=torch.empty_like(q),
+                    final_state=kwargs.get("initial_state"),
+                )
             if kwargs.get("return_lse", False):
                 lse = torch.empty(q.shape[:-1], dtype=torch.float32, device=q.device)
                 return torch.empty_like(q), lse
@@ -1099,6 +1405,38 @@ def selected_kernel_spy(monkeypatch):
 
     monkeypatch.setattr(SelectedKernel, "__call__", fake_call)
     return active_case, calls
+
+
+def _find_case(*, arch: str, family: str, mode: str) -> KernelApiSelectionCase:
+    for case in _CASES:
+        if case.arch == arch and case.family == family and case.mode == mode:
+            return case
+    raise AssertionError(f"missing golden case for {arch}/{family}.{mode}")
+
+
+def test_attn_merge_state_routes_to_triton_on_cdna4(
+    mi350_platform: PlatformInfo,
+    selected_kernel_spy,
+) -> None:
+    case = _find_case(arch="cdna4", family="attention", mode="attn_merge_state")
+    registry = KernelRegistry.get()
+    expected_spec = registry.get_by_name(case.expected)
+    assert expected_spec is not None
+    assert expected_spec.capability.satisfied_by(mi350_platform)
+
+    real_platform = Platform.get()
+    active_case, calls = selected_kernel_spy
+    active_case["case"] = case
+    try:
+        Platform.override(mi350_platform)
+        registry.clear_cache()
+
+        case.invoke()
+
+        assert calls == ["triton_attn_merge_state"]
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
 
 
 @pytest.mark.parametrize("case", _CASES, ids=lambda case: case.id)

@@ -294,7 +294,12 @@ def test_fused_topk_topp_external_workspace(device: str) -> None:
         fused_topk_topp_workspace_size(bs, V), dtype=torch.uint8, device=device
     )
     manual = fused_topk_topp_renorm(probs, top_ks, top_ps, workspace=ws)
+    ws_no_pdl = torch.empty_like(ws)
+    no_pdl = fused_topk_topp_renorm(
+        probs, top_ks, top_ps, workspace=ws_no_pdl, enable_pdl=False
+    )
     torch.testing.assert_close(auto, manual, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(auto, no_pdl, atol=0.0, rtol=0.0)
 
 
 def test_gather_empty_batch(device: str) -> None:

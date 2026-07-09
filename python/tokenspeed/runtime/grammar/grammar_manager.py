@@ -1,8 +1,7 @@
-# Adapted from meituan-longcat/SGLang-FluentLLM.
-# This file has been modified for this repository.
-# This file may incorporate material from ModelTC/lightllm,
-# vllm-project/vllm, and sgl-project/sglang, as identified in
-# python/THIRDPARTYNOTICES.
+# SPDX-License-Identifier: MIT AND Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 LightSeek Foundation
+# SPDX-FileCopyrightText: Copyright 2023-2024 SGLang Team
+#
 # Copyright (c) 2026 LightSeek Foundation
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -289,8 +288,8 @@ class GrammarManager:
             # here keeps the leak from re-raising out of the event loop.
             try:
                 value = state.grammar.result()
-            except Exception as e:
-                value = InvalidGrammarObject(f"{type(e).__name__}: {e}")
+            except Exception as exc:
+                value = InvalidGrammarObject(f"{type(exc).__name__}: {exc}")
 
             if value.is_invalid:
                 state.grammar = None

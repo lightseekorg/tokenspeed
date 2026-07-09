@@ -39,10 +39,11 @@ namespace fused_topk_topp {
 // PDL helper. B200 (sm_100) supports cudaLaunchAttributeProgrammaticStream
 // Serialization — the next kernel can run its prologue (allocate resources,
 // fetch args) in parallel with the previous kernel's epilogue. Saves a
-// fraction of each launch's overhead. Used for every kernel in this pipeline.
+// fraction of each launch's overhead. Used for every kernel in this pipeline
+// when the runtime PDL toggle is enabled.
 template <typename KernelFunc, typename... Args>
-static inline void launchPDL(KernelFunc kernel, dim3 grid, dim3 block, size_t smem,
-                             cudaStream_t stream, Args... args) {
+static inline void launchKernel(bool enable_pdl, KernelFunc kernel, dim3 grid, dim3 block,
+                                size_t smem, cudaStream_t stream, Args... args) {
     cudaLaunchAttribute attr[1];
     attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attr[0].val.programmaticStreamSerializationAllowed = 1;
@@ -51,8 +52,8 @@ static inline void launchPDL(KernelFunc kernel, dim3 grid, dim3 block, size_t sm
     config.blockDim = block;
     config.dynamicSmemBytes = smem;
     config.stream = stream;
-    config.attrs = attr;
-    config.numAttrs = 1;
+    config.attrs = enable_pdl ? attr : nullptr;
+    config.numAttrs = enable_pdl ? 1 : 0;
     cudaLaunchKernelEx(&config, kernel, args...);
 }
 
@@ -178,7 +179,8 @@ static void airTopKMultiBlockWithSkip(void* buf, size_t& buf_size, T const* in, 
                                       IdxT len, IdxT k, T* out, IdxT* out_idx,
                                       bool select_min, bool fused_last_filter, unsigned grid_dim,
                                       int32_t const* top_k_arr, int max_topk,
-                                      cudaStream_t stream, bool skip_init = false) {
+                                      cudaStream_t stream, bool enable_pdl,
+                                      bool skip_init = false) {
     static_assert(nv::air_topk_stable::calc_num_passes<T, BitsPerPass>() > 1);
     constexpr int num_buckets = nv::air_topk_stable::calc_num_buckets<BitsPerPass>();
 
@@ -217,8 +219,8 @@ static void airTopKMultiBlockWithSkip(void* buf, size_t& buf_size, T const* in, 
         if (top_k_arr) {
             int threads = 128;
             int blocks = (batch_size + threads - 1) / threads;
-            launchPDL(initTopKSkipKernel<T, IdxT>, dim3(blocks), dim3(threads), 0, stream,
-                      counters, batch_size, top_k_arr, max_topk);
+            launchKernel(enable_pdl, initTopKSkipKernel<T, IdxT>, dim3(blocks),
+                         dim3(threads), 0, stream, counters, batch_size, top_k_arr, max_topk);
         }
     }
 
@@ -248,15 +250,17 @@ static void airTopKMultiBlockWithSkip(void* buf, size_t& buf_size, T const* in, 
                 radix_kernel<T, IdxT, BitsPerPass, BlockSize, true, true>;
         }
         dim3 pass_blocks = (pass == num_passes - 1) ? last_pass_blocks : blocks;
-        launchPDL(kernel, pass_blocks, dim3(BlockSize), 0, stream, in,
-                  static_cast<IdxT const*>(nullptr), in_buf, in_idx_buf, out_buf, out_idx_buf,
-                  out, out_idx, counters, histograms, len, k, select_min, pass);
+        launchKernel(enable_pdl, kernel, pass_blocks, dim3(BlockSize), 0, stream, in,
+                     static_cast<IdxT const*>(nullptr), in_buf, in_idx_buf, out_buf,
+                     out_idx_buf, out, out_idx, counters, histograms, len, k, select_min, pass);
     }
 
     if (!fused_last_filter) {
-        launchPDL(nv::air_topk_stable::last_filter_kernel<T, IdxT, BitsPerPass, true>, blocks,
-                  dim3(BlockSize), 0, stream, in, static_cast<IdxT const*>(nullptr), out_buf,
-                  out_idx_buf, out, out_idx, len, k, counters, select_min);
+        launchKernel(enable_pdl,
+                     nv::air_topk_stable::last_filter_kernel<T, IdxT, BitsPerPass, true>,
+                     blocks, dim3(BlockSize), 0, stream, in,
+                     static_cast<IdxT const*>(nullptr), out_buf, out_idx_buf, out, out_idx, len,
+                     k, counters, select_min);
     }
 }
 
@@ -270,7 +274,8 @@ template <typename T, typename IdxT>
 static void air_topk_11bits_fused_last(void* buf, size_t& buf_size, T const* in, int batch_size,
                                        IdxT len, IdxT k, T* out, IdxT* out_idx,
                                        int32_t const* top_k_arr, int max_topk,
-                                       cudaStream_t stream, bool skip_init = false) {
+                                       cudaStream_t stream, bool enable_pdl = true,
+                                       bool skip_init = false) {
     constexpr int block_dim = 512;
     constexpr int BitsPerPass = 11;
     constexpr bool greater = true;     // largest values
@@ -290,7 +295,8 @@ static void air_topk_11bits_fused_last(void* buf, size_t& buf_size, T const* in,
     if (grid_dim == 0U) grid_dim = 1U;
     airTopKMultiBlockWithSkip<T, IdxT, BitsPerPass, block_dim>(
         buf, buf_size, in, batch_size, len, k, out, out_idx,
-        !greater, fused_last_filter, grid_dim, top_k_arr, max_topk, stream, skip_init);
+        !greater, fused_last_filter, grid_dim, top_k_arr, max_topk, stream, enable_pdl,
+        skip_init);
 }
 
 static size_t airTopKWorkspaceBytes(int batchSize, int vocabSize) {
@@ -333,7 +339,13 @@ __launch_bounds__(BLOCK_SIZE) __global__ void applyKernel(
     air_top_p::Counter<float>* __restrict__ topp_counters,
     float* __restrict__ out_probs,
     int32_t vocab_size,
-    int32_t max_k) {
+    int32_t max_k,
+    bool enable_pdl) {
+    // PDL: wait for preceding stream work before reading top-k outputs.
+    if (enable_pdl) {
+        cudaGridDependencySynchronize();
+    }
+
     constexpr int MAX_K = BLOCK_SIZE * ITEMS_PER_THREAD;
     const int b = blockIdx.x;
     const int32_t k_raw = top_ks[b];
@@ -444,7 +456,9 @@ __launch_bounds__(BLOCK_SIZE) __global__ void applyKernel(
         float* out_row = out_probs + b * vocab_size;
         for (int i = threadIdx.x; i <= cutoff; i += BLOCK_SIZE) {
             const int idx = s_idx[i];
-            out_row[idx] = s_vals[i] * inv;
+            if (static_cast<unsigned>(idx) < static_cast<unsigned>(vocab_size)) {
+                out_row[idx] = s_vals[i] * inv;
+            }
         }
     } else {
         // ── Mode 3.2: top-P only (radix top-p threshold) ────────────────────
@@ -513,7 +527,7 @@ __launch_bounds__(BLOCK_SIZE) __global__ void applyKernel(
 void invokeFusedTopKTopP(float const* probs, SizeType32 const* topKs, float const* topPs,
                         float* outProbs, void* workspace, SizeType32 batchSize,
                         SizeType32 vocabSize, cudaStream_t mainStream,
-                        cudaStream_t memsetStream) {
+                        cudaStream_t memsetStream, bool enable_pdl) {
     // ── Workspace partitioning ──────────────────────────────────────────────
     size_t airTopkWS = airTopKWorkspaceBytes(batchSize, vocabSize);
     std::vector<size_t> sizes = {
@@ -575,11 +589,11 @@ void invokeFusedTopKTopP(float const* probs, SizeType32 const* topKs, float cons
     air_top_p::resolveWorkspace<float>(batchSize, vocabSize, toppWS, toppCounters,
                                        toppHistograms, toppCountHistograms, toppBuf1, toppBuf2);
 
-    launchPDL(unifiedInitKernel<float, int32_t, air_top_p::NUM_BUCKETS, TOPK_NUM_BUCKETS>,
-              dim3(batchSize), dim3(256), 0, mainStream,
-              topkCounters, topkHistograms,
-              toppCounters, toppHistograms, toppCountHistograms,
-              batchSize, vocabSize, probs, topPs, topKs, K_TOPK_MAX);
+    launchKernel(enable_pdl,
+                 unifiedInitKernel<float, int32_t, air_top_p::NUM_BUCKETS, TOPK_NUM_BUCKETS>,
+                 dim3(batchSize), dim3(256), 0, mainStream, topkCounters, topkHistograms,
+                 toppCounters, toppHistograms, toppCountHistograms, batchSize, vocabSize, probs,
+                 topPs, topKs, K_TOPK_MAX);
 
     // ── Stage 2 on side stream (parallel with stage 1 on main) ──────────────
     // Run the topp radix on the side stream so it overlaps with the topk
@@ -606,6 +620,7 @@ void invokeFusedTopKTopP(float const* probs, SizeType32 const* topKs, float cons
     air_topk_11bits_fused_last<float, int32_t>(topkWS, airTopkWS, probs, batchSize, vocabSize,
                                               K_TOPK_MAX, topKVals, topKIdx,
                                               topKs, K_TOPK_MAX, mainStream,
+                                              enable_pdl,
                                               /*skip_init=*/true);
 
     // ── Sync side stream (memset + topp radix) onto main before apply ───────
@@ -620,9 +635,9 @@ void invokeFusedTopKTopP(float const* probs, SizeType32 const* topKs, float cons
     // ── Stage 3: per-row apply. BLOCK=128, ITEMS=1 → MAX_K=128 sort window,
     //            and 128 threads handle V=160k via stride loops in the top-p
     //            branch (block reduce sized for 128).
-    launchPDL(applyKernel<128, 1>, dim3(batchSize), dim3(128), 0, mainStream,
-              probs, topKVals, topKIdx, topKs, topPs, toppCounters, outProbs, vocabSize,
-              K_TOPK_MAX);
+    launchKernel(enable_pdl, applyKernel<128, 1>, dim3(batchSize), dim3(128), 0, mainStream,
+                 probs, topKVals, topKIdx, topKs, topPs, toppCounters, outProbs, vocabSize,
+                 K_TOPK_MAX, enable_pdl);
 }
 
 }  // namespace fused_topk_topp

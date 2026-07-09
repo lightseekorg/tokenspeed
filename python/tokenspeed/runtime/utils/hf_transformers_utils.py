@@ -104,9 +104,10 @@ def get_hf_text_config(config: PretrainedConfig):
     text_config = None
     if hasattr(config, "text_config"):
         # The code operates under the assumption that text_config should have
-        # `num_attention_heads` (among others). Assert here to fail early
+        # `num_attention_heads` (among others). Check here to fail early
         # if transformers config doesn't align with this assumption.
-        assert hasattr(config.text_config, "num_attention_heads")
+        if not hasattr(config.text_config, "num_attention_heads"):
+            raise AttributeError("text_config must define num_attention_heads.")
         text_config = config.text_config
     if hasattr(config, "language_config"):
         text_config = config.language_config

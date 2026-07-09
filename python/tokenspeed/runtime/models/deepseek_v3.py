@@ -27,11 +27,13 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 from dataclasses import replace
-from typing import Any, Tuple
+from typing import Any
 
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.ops.attention import attn_merge_state
 from tokenspeed_kernel.ops.attention.tokenspeed_mla import mla_kv_pack_quantize_fp8
+from tokenspeed_kernel.ops.embedding import apply_rope_mla
 from tokenspeed_kernel.ops.gemm.cute_dsl import (
     nvfp4_gemm_swiglu_nvfp4_quant,
 )
@@ -40,7 +42,6 @@ from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
 from tokenspeed_kernel.ops.quantization.triton import fp8_quantize
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.thirdparty.cuda import dsv3_router_gemm, moe_finalize_fuse_shared
-from tokenspeed_kernel.thirdparty.cuda.merge_state import merge_state
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -65,6 +66,10 @@ _device_sm = _platform.arch_version.major * 10 + _platform.arch_version.minor
 
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_manager import CommManager
+from tokenspeed.runtime.execution.breakable_cuda_graph import (
+    break_point,
+    scrub_padding_tail,
+)
 from tokenspeed.runtime.execution.context import (
     ForwardContext,
     report_collective_sizing,
@@ -72,9 +77,6 @@ from tokenspeed.runtime.execution.context import (
 from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.activation import SiluAndMul
-from tokenspeed.runtime.layers.attention.mla_fp8_utils import (
-    mla_fused_rope_fp8_quantize,
-)
 from tokenspeed.runtime.layers.dense.nvfp4 import Nvfp4LinearMethod
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
 from tokenspeed.runtime.layers.linear import (
@@ -93,7 +95,6 @@ from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
 from tokenspeed.runtime.layers.quantization.utils import (
     block_dequant,
     should_exclude_quant_module,
-    should_ignore_quant_layer,
 )
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
@@ -316,6 +317,7 @@ class DeepseekV3MoE(nn.Module):
                 "n_group": getattr(config, "n_group", 0),
                 "topk_group": getattr(config, "topk_group", 0),
                 "routed_scaling_factor": getattr(config, "routed_scaling_factor", 1.0),
+                "normalize_topk_weights": config.norm_topk_prob,
                 "correction_bias": self.gate.e_score_correction_bias,
                 "routing_method_type": RoutingMethodType.DeepSeekV3,
             },
@@ -496,7 +498,10 @@ class DeepseekV3AttentionMLA(nn.Module):
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
         self.num_heads = num_heads
-        assert num_heads % self.mapping.attn.tp_size == 0
+        if num_heads % self.mapping.attn.tp_size != 0:
+            raise ValueError(
+                f"num_heads={num_heads} must be divisible by attn_tp_size={self.mapping.attn.tp_size}."
+            )
         self.num_local_heads = num_heads // self.mapping.attn.tp_size
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
@@ -597,8 +602,6 @@ class DeepseekV3AttentionMLA(nn.Module):
                 scaling_factor = rope_scaling["factor"]
                 mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
                 self.scaling = self.scaling * mscale * mscale
-            elif hasattr(self.rotary_emb, "forward_cuda"):
-                self.rotary_emb.forward = self.rotary_emb.forward_cuda
         else:
             self.rotary_emb = None
 
@@ -640,6 +643,19 @@ class DeepseekV3AttentionMLA(nn.Module):
         comm_manager: CommManager,
         block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """MLA attention with a NARROW prefill-graph break.
+
+        The token-shaped input/output projections (q/kv-down, layernorm,
+        q_b_proj, o_proj) stay in the captured prefill graph; only the
+        data-dependent attention -- KV write + varlen prefill / absorb decode
+        kernels + the live prefill/decode split -- runs as the eager break
+        (``_attn``). This keeps the big projection GEMMs graphed instead of
+        dispatch-bound eager, collapsing the inter-segment bubbles a coarse
+        whole-attention break leaves. Outside capture the ``@break_point`` is
+        a direct call, so the eager path is unchanged.
+        """
+        if hidden_states.shape[0] == 0:
+            return hidden_states
         q, latent_cache = self._project_q_latent(
             hidden_states, ctx, comm_manager, block_scale
         )
@@ -653,7 +669,7 @@ class DeepseekV3AttentionMLA(nn.Module):
         ctx: ForwardContext,
         comm_manager: CommManager,
         block_scale: torch.Tensor | None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """QKV projection producing absorbed ``q`` and raw ``latent_cache``."""
         if self.q_lora_rank is not None:
             qkv = self.fused_qkv_a_proj_with_mqa(
@@ -679,6 +695,7 @@ class DeepseekV3AttentionMLA(nn.Module):
             self.kv_a_layernorm(kv_a, inplace=True)
         return q, latent_cache
 
+    @break_point
     def _attn(
         self,
         positions: torch.Tensor,
@@ -687,10 +704,26 @@ class DeepseekV3AttentionMLA(nn.Module):
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
     ) -> torch.Tensor:
-        """Prefill/decode dispatch over the full rows. Subclasses override."""
-        num_decodes = ctx.bs - ctx.num_extends
-        num_decode_tokens = num_decodes * ctx.attn_backend.spec_num_tokens
-        num_prefill_tokens = q.size(0) - num_decode_tokens
+        """The eager break: KV write + varlen prefill / absorb decode attention.
+
+        Prefill/decode dispatch over the full rows; subclasses override (the
+        draft variant narrows to live rows, see ``DeepseekV3DraftAttentionMLA``).
+        The split is recovered from LIVE state -- correct both in eager and
+        under a prefill-graph replay, where ``ctx`` is the live ambient context
+        but ``q`` is padded to the graph bucket (``q.size(0)`` is NOT the real
+        token count). The decode token count comes from the live ctx; the real
+        prefill token count from the live attention metadata (the same source
+        the padding scrub uses). Padded tail rows produce discarded garbage.
+        """
+        spec = ctx.attn_backend.spec_num_tokens or 1
+        num_decodes = max(ctx.bs - ctx.num_extends, 0)
+        num_decode_tokens = num_decodes * spec
+        if ctx.num_extends > 0:
+            cmeta = ctx.attn_backend.chunked_prefill_metadata
+            num_prefill_tokens = int(sum(cmeta.extend_seq_lens_cpu))
+        else:
+            num_prefill_tokens = 0
+        real_total = num_prefill_tokens + num_decode_tokens
         attn_output = torch.empty(
             q.size(0),
             self.num_local_heads * self.v_head_dim,
@@ -698,10 +731,11 @@ class DeepseekV3AttentionMLA(nn.Module):
             device=q.device,
         )
 
-        if ctx.num_extends > 0:
+        if num_prefill_tokens > 0:
             prefill_ctx = replace(
                 ctx,
-                bs=ctx.num_extends,
+                bs=max(ctx.bs - num_decodes, 1),
+                num_extends=max(ctx.bs - num_decodes, 1),
                 input_num_tokens=num_prefill_tokens,
                 forward_mode=ForwardMode.EXTEND,
             )
@@ -714,7 +748,7 @@ class DeepseekV3AttentionMLA(nn.Module):
                 attn_output[:num_prefill_tokens],
             )
 
-        if ctx.num_extends < ctx.bs:
+        if num_decode_tokens > 0:
             decode_ctx = replace(
                 ctx,
                 bs=num_decodes,
@@ -723,12 +757,12 @@ class DeepseekV3AttentionMLA(nn.Module):
                 forward_mode=ForwardMode.DECODE,
             )
             self.forward_absorb(
-                positions[num_prefill_tokens:],
-                q[num_prefill_tokens:],
-                latent_cache[num_prefill_tokens:],
+                positions[num_prefill_tokens:real_total],
+                q[num_prefill_tokens:real_total],
+                latent_cache[num_prefill_tokens:real_total],
                 decode_ctx,
-                out_cache_loc[num_prefill_tokens:],
-                attn_output[num_prefill_tokens:],
+                out_cache_loc[num_prefill_tokens:real_total],
+                attn_output[num_prefill_tokens:real_total],
             )
 
         return attn_output
@@ -758,7 +792,7 @@ class DeepseekV3AttentionMLA(nn.Module):
         positions,
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         q = q.view(-1, self.num_local_heads, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
@@ -799,15 +833,17 @@ class DeepseekV3AttentionMLA(nn.Module):
             k_nope_raw = K[..., : self.kv_lora_rank]
             k_pe_raw = K[..., self.kv_lora_rank :]
 
-            query_fp8, key_fp8 = mla_fused_rope_fp8_quantize(
-                q_nope=q_nope_absorbed,
-                q_pe=q_pe,
-                k_nope=k_nope_raw,
-                k_pe=k_pe_raw,
-                cos_sin_cache=self.rotary_emb.cos_sin_cache,
+            query_fp8, key_fp8 = apply_rope_mla(
                 positions=positions,
+                q_rope=q_pe,
+                k_rope=k_pe_raw,
+                q_nope=q_nope_absorbed,
+                k_nope=k_nope_raw,
+                cos_sin_cache=self.rotary_emb.cos_sin_cache,
                 is_neox=getattr(self.rotary_emb, "is_neox_style", True),
-                k_scale_inv=1.0 / k_scale,
+                quant_scale_q=1.0,
+                quant_scale_kv=k_scale,
+                enable_pdl=pdl_enabled(),
             )
 
             # Write FP8 KV cache (single write, no double-write)
@@ -905,6 +941,10 @@ class DeepseekV3AttentionMLA(nn.Module):
         out_cache_loc: torch.Tensor,
         output: torch.Tensor,
     ) -> torch.Tensor:
+        # Prefill-graph padding contract: zero garbage rows the per-row projections
+        # + FP8 quantize would otherwise touch (see scrub_padding_tail).
+        ntok = sum(ctx.attn_backend.chunked_prefill_metadata.extend_seq_lens_cpu)
+        scrub_padding_tail(ntok, q, latent_cache)
         q, k, v = self.forward_normal_chunked_kv_prepare(
             positions, q, latent_cache, ctx, out_cache_loc
         )
@@ -917,7 +957,7 @@ class DeepseekV3AttentionMLA(nn.Module):
         latent_cache: torch.Tensor,
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         kv_a, k_pe = latent_cache.split(
             [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
         )
@@ -944,15 +984,17 @@ class DeepseekV3AttentionMLA(nn.Module):
             # Expand k_pe from [tokens,1,rope] to [tokens,heads,rope] for GQA
             k_pe_expanded = k_pe.expand(-1, self.num_local_heads, -1)
 
-            q_fp8, k_fp8 = mla_fused_rope_fp8_quantize(
+            q_fp8, k_fp8 = apply_rope_mla(
+                positions=positions,
+                q_rope=q_pe,
+                k_rope=k_pe_expanded,
                 q_nope=q_nope,
-                q_pe=q_pe,
                 k_nope=k_nope,
-                k_pe=k_pe_expanded,
                 cos_sin_cache=self.rotary_emb.cos_sin_cache,
                 is_neox=getattr(self.rotary_emb, "is_neox_style", True),
-                positions=positions,
-                k_scale_inv=1.0 / k_scale,
+                quant_scale_q=1.0,
+                quant_scale_kv=k_scale,
+                enable_pdl=pdl_enabled(),
             )
 
             v_fp8 = fp8_quantize(v, enable_pdl=pdl_enabled())
@@ -1024,7 +1066,7 @@ class DeepseekV3AttentionMLA(nn.Module):
         # Causal self-attention over the new chunk tokens. q_lens == kv_lens ==
         # extend_seq_lens, so cum_seq_lens_q and cum_seq_lens_kv alias the same
         # cum_extend_seq_lens. Causal pass writes directly into output; each
-        # chunk's merge accumulates in place via merge_state(inplace=True).
+        # chunk's merge accumulates in place via attn_merge_state(inplace=True).
         num_extends = chunk_meta.extend_seq_lens.size(0)
         output_view = output.view(-1, self.num_local_heads, self.v_head_dim)
         _, accum_lse = attn_backend.forward_extend_chunked(
@@ -1091,7 +1133,7 @@ class DeepseekV3AttentionMLA(nn.Module):
                 causal=False,
             )
 
-            merge_state(
+            attn_merge_state(
                 output_view,
                 accum_lse,
                 chunk_output,
@@ -1425,7 +1467,7 @@ class DeepseekV3Model(nn.Module):
                 )
         if not ctx.forward_mode.is_idle():
             if not ENABLE_CP:
-                hidden_states = layer.comm_manager.final_norm(
+                hidden_states, _ = layer.comm_manager.final_norm(
                     hidden_states, residual, ctx, self.norm
                 )
             else:
@@ -1679,7 +1721,10 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
             ):
                 weight_block_size = self.quant_config.weight_block_size
                 if weight_block_size is not None:
-                    assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
+                    if not hasattr(self_attn.kv_b_proj, "weight_scale_inv"):
+                        raise RuntimeError(
+                            "kv_b_proj.weight_scale_inv is required for block FP8 dequant."
+                        )
                     dtype = torch.get_default_dtype()
                     w = block_dequant(
                         self_attn.kv_b_proj.weight,
@@ -2106,7 +2151,10 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
         ):
             weight_block_size = self.quant_config.weight_block_size
             if weight_block_size is not None:
-                assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
+                if not hasattr(self_attn.kv_b_proj, "weight_scale_inv"):
+                    raise RuntimeError(
+                        "kv_b_proj.weight_scale_inv is required for block FP8 dequant."
+                    )
                 dtype = torch.get_default_dtype()
                 w = block_dequant(
                     self_attn.kv_b_proj.weight,

@@ -142,6 +142,9 @@ class MoELayer(torch.nn.Module):
         self._n_group = routing_config.get("n_group", 0)
         self._topk_group = routing_config.get("topk_group", 0)
         self._routed_scaling_factor = routing_config.get("routed_scaling_factor", 1.0)
+        self._normalize_topk_weights = routing_config.get(
+            "normalize_topk_weights", True
+        )
 
         # Quantization config. ignored_layers (compressed-tensors) keys the MoE
         # block; exclude_modules (ModelOpt) keys the fused experts.

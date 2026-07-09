@@ -1,10 +1,17 @@
 import unittest
 from unittest import mock
 
+from tokenspeed_kernel.ops.attention import attn_merge_state
+
+from tokenspeed.runtime.models import deepseek_v3
 from tokenspeed.runtime.models.deepseek_v3 import DeepseekV3ForCausalLM
 
 
 class TestDeepseekV3Loader(unittest.TestCase):
+    def test_cached_prefix_merge_uses_attention_dispatcher(self):
+        self.assertIs(deepseek_v3.attn_merge_state, attn_merge_state)
+        self.assertFalse(hasattr(deepseek_v3, "merge_state"))
+
     def test_missing_checkpoint_scale_params_are_silent(self):
         model = object.__new__(DeepseekV3ForCausalLM)
 

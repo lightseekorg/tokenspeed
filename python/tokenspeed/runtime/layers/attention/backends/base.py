@@ -26,6 +26,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
+
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
     from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
@@ -48,6 +50,10 @@ class AttentionBackend(ABC):
         self.head_dim = config.head_dim
         self.is_draft = config.is_draft
         self.spec_num_tokens = config.speculative_num_draft_tokens
+        # True when this backend's CUDA-graph block-table (kv_indices) buffer is
+        # aliased to a peer backend's (e.g. a drafter sharing the target's), so
+        # the replay path skips rebuilding it — the peer already populates it.
+        self._block_table_aliased = False
 
     @contextmanager
     def override_num_extends(self, num_extends: int):
@@ -156,6 +162,7 @@ class AttentionBackend(ABC):
         if record_cache and save_kv_cache:
             self.step_counter.record_cache()
 
+    @break_point
     def forward(
         self,
         q: torch.Tensor,

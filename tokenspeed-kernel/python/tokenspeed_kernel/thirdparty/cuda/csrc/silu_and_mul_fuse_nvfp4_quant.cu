@@ -32,6 +32,7 @@
  * 128x4 swizzled layout. SM100+ required (PTX cvt.rn.satfinite.e2m1x2.f32).
  */
 
+#include <cfloat>
 #include <cuda_runtime.h>
 
 #include "tensorrt_llm/kernels/quantization_utils.cuh"

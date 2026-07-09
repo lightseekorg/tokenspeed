@@ -52,7 +52,7 @@ size_t getWorkspaceSize(SizeType32 batchSize, SizeType32 vocabSize);
 void invokeFusedTopKTopP(float const* probs, SizeType32 const* topKs, float const* topPs,
                         float* outProbs, void* workspace, SizeType32 batchSize,
                         SizeType32 vocabSize, cudaStream_t mainStream,
-                        cudaStream_t memsetStream);
+                        cudaStream_t memsetStream, bool enablePdl);
 
 }  // namespace fused_topk_topp
 

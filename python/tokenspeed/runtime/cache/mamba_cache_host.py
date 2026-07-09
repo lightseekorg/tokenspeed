@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import threading
 from functools import wraps
-from typing import Optional
 
 import torch
 from tokenspeed_kernel.ops.kvcache.cuda import (
@@ -132,7 +131,7 @@ class MambaPoolHost:
         return len(self.free_slots)
 
     @synchronized
-    def alloc(self, need_size: int) -> Optional[torch.Tensor]:
+    def alloc(self, need_size: int) -> torch.Tensor | None:
         if need_size <= 0:
             return torch.empty((0,), dtype=torch.int64)
         if need_size > self.available_size():
@@ -167,7 +166,7 @@ class MambaPoolHost:
         host_indices: torch.Tensor,
         device_indices: torch.Tensor,
         io_backend: str,
-        block_quota: Optional[int] = None,
+        block_quota: int | None = None,
     ) -> None:
         if block_quota is None:
             block_quota = MAMBA_KVSTORE_WRITEBACK_BLOCK_QUOTA

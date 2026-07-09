@@ -1,8 +1,3 @@
-# Adapted from meituan-longcat/SGLang-FluentLLM.
-# This file has been modified for this repository.
-# This file may incorporate material from ModelTC/lightllm,
-# vllm-project/vllm, and sgl-project/sglang, as identified in
-# python/THIRDPARTYNOTICES.
 # Copyright (c) 2026 LightSeek Foundation
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -190,9 +185,8 @@ class CapturableGrammarExecutor:
 
             advance_list = list(advance_mask)
 
-            assert (
-                len(advance_list) == bs
-            ), f"advance_mask length {len(advance_list)} != bs {bs}"
+            if len(advance_list) != bs:
+                raise ValueError(f"advance_mask length {len(advance_list)} != bs {bs}")
 
         completion = GrammarStepCompletion(
             grammars=grammars_list,

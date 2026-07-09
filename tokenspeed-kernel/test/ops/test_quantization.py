@@ -308,7 +308,7 @@ def test_quantize_fp8_with_scale_tensor_and_token(
         assert scale.shape == (x.shape[0], 1)
 
 
-@pytest.mark.parametrize("solution", ["trtllm"])
+@pytest.mark.parametrize("solution", ["trtllm", "triton"])
 def test_quantize_fp8_with_scale_token_group(
     device: str,
     solution: str,

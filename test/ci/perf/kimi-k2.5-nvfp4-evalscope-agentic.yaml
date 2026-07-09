@@ -87,7 +87,7 @@ perf:
     if [ -d "$OUTPUTS_DIR/Kimi-K2.5-NVFP4" ]; then
     mv "$OUTPUTS_DIR/Kimi-K2.5-NVFP4" "$OUTPUTS_DIR/Kimi-K2.5-NVFP4_attn_tp4";
     fi;
-    python3 "$REPO_ROOT/test/agentic_benchmark/tokenspeed/collect_outputs.py" "$OUTPUTS_DIR";
+    python3 "$REPO_ROOT/test/agentic_benchmark/kimi_k2.5/tokenspeed/collect_outputs.py" "$OUTPUTS_DIR";
     PARSE_STATUS=$?;
     if [ "$PERF_STATUS" -ne 0 ]; then exit "$PERF_STATUS"; fi;
     exit "$PARSE_STATUS"

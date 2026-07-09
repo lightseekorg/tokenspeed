@@ -90,7 +90,7 @@ class _AttentionFamilySpec:
 
 
 def override_model_config(model_config, ext_yaml):
-    with open(ext_yaml) as f:
+    with open(ext_yaml, encoding="utf-8") as f:
         ext_config = yaml.safe_load(f)
 
     override_model_config: dict = ext_config.get("override_model_config", {})
@@ -348,6 +348,30 @@ class ModelConfig:
             )
         # ``is_multimodal`` is the architectural fact; this is the runtime gate.
         self.is_multimodal_active = self.is_multimodal and not apply_language_model_only
+        # Vision-only role (EPD encode): the inverse axis of language_model_only.
+        # Build the vision tower (is_multimodal_active stays True) but SKIP LM
+        # construction + LM weight load so a full ViT fits at encode TP=1.
+        encoder_only = (
+            getattr(server_args, "disaggregation_mode", None) == "encode"
+            and not is_draft_worker
+        )
+        if encoder_only and not self.is_multimodal:
+            raise ValueError(
+                "disaggregation_mode=encode requires a multimodal checkpoint."
+            )
+        if encoder_only and apply_language_model_only:
+            raise ValueError(
+                "disaggregation_mode=encode (encoder-only) and language_model_only "
+                "are mutually exclusive."
+            )
+        if encoder_only:
+            # Single model-facing gate: Kimi reads hf_config.encoder_only directly;
+            # Qwen3_5ForConditionalGeneration reads it to skip LM construction.
+            self.hf_config.encoder_only = True
+            logger.info(
+                "Running in encoder-only mode: the language model will not "
+                "be constructed or loaded (encode role)."
+            )
         # Cap gpu_memory_utilization for VLMs in mm mode — the vision encoder
         # needs headroom that the global default doesn't account for.
         if (
@@ -482,12 +506,17 @@ class ModelConfig:
                         allow_patterns=["*.json"],
                         local_files_only=True,
                     )
-                except Exception:
+                except Exception as exc:
+                    logger.debug(
+                        "Unable to resolve local quantization config for %s: %s",
+                        self.model_path,
+                        exc,
+                    )
                     model_dir = None
             if model_dir is not None:
                 hf_quant_path = os.path.join(model_dir, "hf_quant_config.json")
                 if os.path.isfile(hf_quant_path):
-                    with open(hf_quant_path) as f:
+                    with open(hf_quant_path, encoding="utf-8") as f:
                         hf_quant = json.load(f)
                     quant_algo = hf_quant.get("quantization", {}).get("quant_algo", "")
                     if quant_algo:
@@ -597,13 +626,10 @@ def get_hf_text_config(config: PretrainedConfig):
         return config
 
     if hasattr(config, "text_config"):
-        # The code operates under the assumption that text_config should have
-        # `num_attention_heads` (among others). Assert here to fail early
-        # if transformers config doesn't align with this assumption.
-        assert hasattr(config.text_config, "num_attention_heads")
+        if not hasattr(config.text_config, "num_attention_heads"):
+            raise ValueError("text_config must define num_attention_heads")
         return config.text_config
-    else:
-        return config
+    return config
 
 
 _STR_DTYPE_TO_TORCH_DTYPE = {

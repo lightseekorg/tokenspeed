@@ -37,6 +37,7 @@ SUPPORTED_TRIGGERS = {"per-commit", "manual", "nightly", "debug"}
 # 1gpu unit-test for the same b300 box).
 SUPPORTED_PRIORITIES = ("high", "normal", "low")
 DEFAULT_PRIORITY = "normal"
+SUPPORTED_RUNNER_GROUPS = ("all", "amd", "nvidia", "nvidia-arm", "nvidia-x86")
 _PRIORITY_ORDER = {value: index for index, value in enumerate(SUPPORTED_PRIORITIES)}
 B200_RUNNER_LABEL_ENV = "TOKENSPEED_B200_RUNNER_LABEL"
 STALE_PROCESS_PATTERNS = [
@@ -56,6 +57,7 @@ RUNNER_SM_PREFIXES = (
 )
 
 AMD_RUNNER_PREFIXES = ("amd-mi35x-", "amd-mi355-", "amd-mi350-")
+NVIDIA_ARM_RUNNER_PREFIXES = ("gb200",)
 GB200_RUNNER_PREFIXES = ("gb200",)
 NVIDIA_GPU_CLEANUP_RUNNER_PREFIXES = ("gb200", "b300")
 PERF_DIAGNOSTIC_RUNNERS = ("b300-4gpu",)
@@ -63,6 +65,24 @@ PERF_DIAGNOSTIC_RUNNERS = ("b300-4gpu",)
 
 def is_amd_runner(runner: str) -> bool:
     return runner.startswith(AMD_RUNNER_PREFIXES)
+
+
+def is_nvidia_arm_runner(runner: str) -> bool:
+    return runner.startswith(NVIDIA_ARM_RUNNER_PREFIXES)
+
+
+def runner_matches_group(runner: str, runner_group: str) -> bool:
+    if runner_group == "all":
+        return True
+    if runner_group == "amd":
+        return is_amd_runner(runner)
+    if runner_group == "nvidia":
+        return not is_amd_runner(runner)
+    if runner_group == "nvidia-arm":
+        return is_nvidia_arm_runner(runner)
+    if runner_group == "nvidia-x86":
+        return not is_amd_runner(runner) and not is_nvidia_arm_runner(runner)
+    raise ValueError(f"unsupported runner group: {runner_group!r}")
 
 
 def is_gb200_runner(runner: str) -> bool:
@@ -210,7 +230,12 @@ def resolve_priority_for_label(priority: Any, label: str) -> str:
     return DEFAULT_PRIORITY
 
 
-def build_matrix(root: Path, repo_root: Path, trigger: str | None) -> Dict[str, Any]:
+def build_matrix(
+    root: Path,
+    repo_root: Path,
+    trigger: str | None,
+    runner_group: str = "all",
+) -> Dict[str, Any]:
     include = []
     for path in find_task_files(root):
         task = normalize_task(path, repo_root)
@@ -221,12 +246,15 @@ def build_matrix(root: Path, repo_root: Path, trigger: str | None) -> Dict[str, 
             # `priority` keys are the labels as written in YAML, so look
             # up before `resolve_runner_label` rewrites b200 to b200v2.
             effective = resolve_priority_for_label(priority, label)
+            runner = resolve_runner_label(label)
+            if not runner_matches_group(runner, runner_group):
+                continue
             include.append(
                 {
                     "name": task["name"],
                     "type": task["type"],
                     "config": task["_source_path"],
-                    "runner": resolve_runner_label(label),
+                    "runner": runner,
                     "priority": effective,
                 }
             )
@@ -452,14 +480,6 @@ def setup_runner(
     shell_run("sudo apt-get update -q", env=local_env, cwd=cwd, dry_run=dry_run)
     shell_run(
         "sudo apt-get install -y ninja-build",
-        env=local_env,
-        cwd=cwd,
-        dry_run=dry_run,
-    )
-    shell_run(
-        "sudo apt-get install -y libspdlog-dev || "
-        "(git clone --depth 1 https://github.com/gabime/spdlog.git /tmp/spdlog && "
-        "sudo cp -r /tmp/spdlog/include/spdlog /usr/local/include/)",
         env=local_env,
         cwd=cwd,
         dry_run=dry_run,
@@ -1515,6 +1535,12 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         default=".",
         help="Repository root used to emit relative config paths",
     )
+    scan_parser.add_argument(
+        "--runner-group",
+        choices=SUPPORTED_RUNNER_GROUPS,
+        default="all",
+        help="Optional runner group filter",
+    )
 
     execute_parser = subparsers.add_parser("execute", help="Execute one CI task")
     execute_parser.add_argument(
@@ -1564,7 +1590,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     if args.command == "scan":
         repo_root = Path(args.repo_root).resolve()
         root = (repo_root / args.root).resolve()
-        matrix = build_matrix(root, repo_root, args.trigger)
+        matrix = build_matrix(root, repo_root, args.trigger, args.runner_group)
         print(json.dumps(matrix, separators=(",", ":")))
         return 0
 
