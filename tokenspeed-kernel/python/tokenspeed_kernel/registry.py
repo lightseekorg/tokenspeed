@@ -56,6 +56,18 @@ def _normalize_roles(roles: str | Iterable[str]) -> tuple[str, ...]:
     return role_names
 
 
+def _validate_weight_preprocessor(
+    weight_preprocessor: Callable | None,
+) -> Callable | None:
+    if weight_preprocessor is not None and not callable(weight_preprocessor):
+        raise TypeError("weight preprocessor must be callable")
+    return weight_preprocessor
+
+
+def _callable_name(fn: Callable) -> str:
+    return getattr(fn, "__name__", repr(fn))
+
+
 # Hard upper bound on priority values; selection scoring clamps to this range.
 _PRIORITY_MAX = 20
 
@@ -168,6 +180,14 @@ class KernelSpec:
     tags: frozenset[str] = (
         frozenset()
     )  # Standard tags: "throughput", "latency", "determinism", "portability"
+    weight_preprocessor: Callable | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "weight_preprocessor",
+            _validate_weight_preprocessor(self.weight_preprocessor),
+        )
 
     def supports_format_signature(self, format_signature: FormatSignature) -> bool:
         return format_signature in self.format_signatures
@@ -364,6 +384,7 @@ def register_kernel(
     traits: dict[str, frozenset[Any]] | None = None,
     priority: Priority | int = Priority.PERFORMANT + 2,
     tags: set[str] | None = None,
+    weight_preprocessor: Callable | None = None,
 ) -> Callable:
     """Decorator to register a kernel function.
 
@@ -395,6 +416,7 @@ def register_kernel(
             ...
     """
     priority_int = _validate_priority(priority)
+    normalized_weight_preprocessor = _validate_weight_preprocessor(weight_preprocessor)
 
     def decorator(fn: Callable) -> Callable:
         kernel_name = name or f"{solution}_{family}_{mode}"
@@ -410,6 +432,7 @@ def register_kernel(
             traits=traits or {},
             priority=priority_int,
             tags=frozenset(tags or set()),
+            weight_preprocessor=normalized_weight_preprocessor,
         )
 
         KernelRegistry.get().register(spec, fn)
@@ -438,6 +461,12 @@ def describe_kernel(name: str) -> str:
         f"  Platform: {spec.capability}",
         f"  Tags: {', '.join(spec.tags) or 'none'}",
     ]
+    if spec.weight_preprocessor is None:
+        lines.append("  Weight preprocessor: none")
+    else:
+        lines.append(
+            f"  Weight preprocessor: {_callable_name(spec.weight_preprocessor)}"
+        )
     return "\n".join(lines)
 
 
@@ -456,6 +485,7 @@ def load_builtin_kernels() -> None:
     import tokenspeed_kernel.ops.moe  # noqa: F401
     import tokenspeed_kernel.ops.quantization  # noqa: F401
     import tokenspeed_kernel.ops.sampling  # noqa: F401
+    import tokenspeed_kernel.ops.transform  # noqa: F401
 
 
 def error_fn(*args, **kwargs):

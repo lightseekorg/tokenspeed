@@ -10,7 +10,7 @@ COLUMNS = [
     "config",
     "Conc.",
     "Latency (tps/user)",
-    "Throughput (tps/gpu)",
+    "Output Throughput (tps/gpu)",
     "Approx Cache Hit",
     "Decoded Tok/Iter",
 ]
@@ -63,7 +63,7 @@ def collect(sweep_dir: Path, num_gpus: int):
 
         tpot_ms = _float(summary, "TPOT (ms)")
         tps_user = 1000.0 / tpot_ms if tpot_ms else 0.0
-        total_tps = _float(summary, "Total Throughput (tok/s)")
+        output_tps = _float(summary, "Output Throughput (tok/s)")
         cache_hit = _float(summary, "KV Cache Hit Rate (%)")
         decoded_per_iter = _float(summary, "Decoded Tok/Iter") or _float(
             summary, "Avg Decoded Tokens/Iter"
@@ -74,7 +74,7 @@ def collect(sweep_dir: Path, num_gpus: int):
                 "config": config,
                 "Conc.": int(_float(summary, "Concurrency")),
                 "Latency (tps/user)": round(tps_user, 2),
-                "Throughput (tps/gpu)": round(total_tps / num_gpus, 2),
+                "Output Throughput (tps/gpu)": round(output_tps / num_gpus, 2),
                 "Approx Cache Hit": round(cache_hit, 2),
                 "Decoded Tok/Iter": round(decoded_per_iter, 4),
             }

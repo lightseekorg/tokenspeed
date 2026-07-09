@@ -1,8 +1,6 @@
-# Adapted from meituan-longcat/SGLang-FluentLLM.
-# This file has been modified for this repository.
-# Upstream lineage includes ModelTC/lightllm, vllm-project/vllm,
-# and sgl-project/sglang. See python/THIRDPARTYNOTICES.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: MIT AND Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 LightSeek Foundation
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 #
 # Copyright (c) 2026 LightSeek Foundation
 #
@@ -324,7 +322,8 @@ class DefaultModelLoader(BaseModelLoader):
         )
         if self.load_config.load_format == LoadFormat.NPCACHE:
             # Currently np_cache only support *.bin checkpoints
-            assert use_safetensors is False
+            if use_safetensors:
+                raise ValueError("np_cache only supports PyTorch checkpoint shards.")
             weights_iterator = np_cache_weights_iterator(
                 source.model_or_path,
                 self.load_config.download_dir,
@@ -400,6 +399,10 @@ class DefaultModelLoader(BaseModelLoader):
                     with device_loading_context(module, target_device):
                         module.process_weights_after_loading(module)
 
+            post_quant_warmup = getattr(model, "post_quant_warmup", None)
+            if callable(post_quant_warmup):
+                post_quant_warmup()
+
         return model.eval()
 
 
@@ -459,6 +462,10 @@ class DummyModelLoader(BaseModelLoader):
                 process_method = getattr(module, "process_weights_after_loading", None)
                 if process_method is not None:
                     module.process_weights_after_loading(module)
+
+            post_quant_warmup = getattr(model, "post_quant_warmup", None)
+            if callable(post_quant_warmup):
+                post_quant_warmup()
 
             #  For accurate performance evaluation, we assign
             # random values to the weights.
@@ -603,6 +610,11 @@ class ShardedStateLoader(BaseModelLoader):
                         state_dict.pop(key)
             if state_dict:
                 raise ValueError(f"Missing keys {tuple(state_dict)} in loaded state!")
+
+        post_quant_warmup = getattr(model, "post_quant_warmup", None)
+        if callable(post_quant_warmup):
+            post_quant_warmup()
+
         return model.eval()
 
 

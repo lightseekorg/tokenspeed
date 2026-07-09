@@ -12,15 +12,25 @@
 # FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
 
 import math
+import os
+import sys
 import unittest
 
 import torch
+
+# CI Registration (parsed via AST, runtime no-op)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=90, suite="runtime-1gpu")
+
 from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
     has_indexer_mxfp4_paged_gather,
     has_persistent_topk,
     indexer_mxfp4_paged_gather,
     persistent_topk,
 )
+from tokenspeed_kernel.ops.transform import hadamard_transform
 
 from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
     deepseek_v4_swa_scale_dim,
@@ -179,8 +189,6 @@ def _mxfp4_bytes_and_scales(
 
 
 def _hadamard_rotate(row: torch.Tensor) -> torch.Tensor:
-    from tokenspeed_kernel.thirdparty.fast_hadamard_transform import hadamard_transform
-
     shape = row.shape
     return hadamard_transform(
         row.to(torch.bfloat16).reshape(-1, shape[-1]).contiguous(),
@@ -289,10 +297,9 @@ def _expected_overlap_normed(
 
 class DeepseekV4AttentionOpsCpuValidationTest(unittest.TestCase):
     def test_swa_slot_mapping_guard_masks_out_of_range_slots(self):
-        cache = torch.empty((2, 4 * SWA_TOKEN_STRIDE), dtype=torch.uint8)
         slots = torch.tensor([-3, -1, 0, 7, 8, 99], dtype=torch.int64)
 
-        sanitized = _deepseek_v4_sanitize_swa_slot_mapping(slots, cache, 4)
+        sanitized = _deepseek_v4_sanitize_swa_slot_mapping(slots, capacity=2 * 4)
 
         torch.testing.assert_close(
             sanitized,
@@ -300,14 +307,12 @@ class DeepseekV4AttentionOpsCpuValidationTest(unittest.TestCase):
         )
 
     def test_swa_slot_mapping_guard_masks_invalid_graph_tokens(self):
-        cache = torch.empty((2, 4 * SWA_TOKEN_STRIDE), dtype=torch.uint8)
         slots = torch.tensor([0, 1, 2, 9, -1, 3], dtype=torch.int64)
         is_valid_token = torch.tensor([True, False, True, True, True, False])
 
         sanitized = _deepseek_v4_sanitize_swa_slot_mapping(
             slots,
-            cache,
-            4,
+            capacity=2 * 4,
             is_valid_token=is_valid_token,
         )
 
@@ -452,6 +457,121 @@ class DeepseekV4AttentionOpsCpuValidationTest(unittest.TestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class DeepseekV4AttentionOpsTest(unittest.TestCase):
+
+    def test_sanitized_insert_write_safety_under_graph_replay(self):
+        # Full producer -> sanitize -> CUDA graph replay -> cache write path.
+        # Slots and validity mutate between replays through static buffers;
+        # sentinel bytes prove only legal cache slots are ever written.
+        from tokenspeed.runtime.models.deepseek_v4 import (
+            _deepseek_v4_sanitize_swa_slot_mapping,
+        )
+
+        torch.manual_seed(7)
+        device = torch.device("cuda")
+        dtype = torch.bfloat16
+        num_tokens = 4
+        num_heads = 2
+        block_size = 4
+        num_blocks = 2
+        capacity = num_blocks * block_size
+        eps = 1.0e-6
+        sentinel = 0xAB
+        token_bytes = 576
+        scale_bytes = 8
+        block_stride = block_size * (token_bytes + scale_bytes)
+        guard_bytes = 4096
+
+        storage = torch.full(
+            (num_blocks * block_stride + guard_bytes,),
+            sentinel,
+            device=device,
+            dtype=torch.uint8,
+        )
+        cache = storage[: num_blocks * block_stride].view(num_blocks, block_stride)
+        guard = storage[num_blocks * block_stride :]
+
+        q = torch.randn(num_tokens, num_heads, HEAD_DIM, device=device, dtype=dtype)
+        kv = torch.randn(num_tokens, HEAD_DIM, device=device, dtype=dtype)
+        positions = torch.tensor([0, 3, 5, 7], dtype=torch.int64, device=device)
+        cos_sin = torch.randn(16, ROPE_DIM, device=device, dtype=torch.float32) * 0.1
+        raw_slots = torch.zeros(num_tokens, dtype=torch.int64, device=device)
+        is_valid = torch.ones(num_tokens, dtype=torch.bool, device=device)
+
+        def run_once():
+            sanitized = _deepseek_v4_sanitize_swa_slot_mapping(
+                raw_slots, capacity, is_valid
+            )
+            fused_qnorm_rope_kv_insert(
+                q=q,
+                kv=kv,
+                swa_kv_cache_2d=cache,
+                slot_mapping=sanitized,
+                positions=positions,
+                cos_sin_cache=cos_sin,
+                rms_norm_eps=eps,
+                block_size=block_size,
+            )
+
+        stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            try:
+                run_once()
+            except RuntimeError as exc:
+                if "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert" in str(exc):
+                    self.skipTest(str(exc))
+                raise
+            run_once()
+        torch.cuda.current_stream().wait_stream(stream)
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            run_once()
+
+        def written_mask(slots):
+            mask = torch.zeros(storage.numel(), dtype=torch.bool)
+            for slot in slots:
+                if slot < 0 or slot >= capacity:
+                    continue
+                block, pos = divmod(slot, block_size)
+                base = block * block_stride
+                start = base + pos * token_bytes
+                mask[start : start + token_bytes] = True
+                sstart = base + block_size * token_bytes + pos * scale_bytes
+                mask[sstart : sstart + scale_bytes] = True
+            return mask
+
+        replays = [
+            # (raw slots, validity, slots the kernel may legally write)
+            ([0, 5, 99, -1], [True, True, True, True], [0, 5]),
+            ([2, 0, 7, 3], [True, False, True, True], [2, 7, 3]),
+        ]
+        for slots, valid, expected in replays:
+            storage.fill_(sentinel)
+            raw_slots.copy_(torch.tensor(slots, dtype=torch.int64, device=device))
+            is_valid.copy_(torch.tensor(valid, dtype=torch.bool, device=device))
+            graph.replay()
+            torch.cuda.synchronize()
+            host = storage.cpu()
+            allowed = written_mask(expected)
+            outside = host[~allowed]
+            self.assertTrue(
+                bool((outside == sentinel).all()),
+                f"bytes outside legal slots {expected} were modified",
+            )
+            for slot in expected:
+                block, pos = divmod(slot, block_size)
+                region = host[
+                    block * block_stride
+                    + pos * token_bytes : block * block_stride
+                    + (pos + 1) * token_bytes
+                ]
+                self.assertFalse(
+                    bool((region == sentinel).all()),
+                    f"legal slot {slot} was not written",
+                )
+        self.assertTrue(bool((guard.cpu() == sentinel).all()))
+
     def test_fused_qnorm_rope_kv_insert_matches_reference(self):
         torch.manual_seed(1234)
         dtype = torch.bfloat16

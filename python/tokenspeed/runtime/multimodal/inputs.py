@@ -25,7 +25,7 @@ from __future__ import annotations
 import dataclasses
 import uuid
 from enum import Enum, auto
-from typing import Any, List, Optional, Union
+from typing import Any
 
 import numpy as np
 import torch
@@ -68,18 +68,26 @@ class Modality(Enum):
 @dataclasses.dataclass(eq=False)
 class MultimodalDataItem:
     modality: Modality
-    hash: Optional[int] = None
-    pad_value: Optional[int] = None
-    offsets: Optional[list] = None
-    feature: Optional[Union[torch.Tensor, np.ndarray, ShmTensorHandle]] = None
+    hash: int | None = None
+    pad_value: int | None = None
+    offsets: list | None = None
+    feature: torch.Tensor | np.ndarray | ShmTensorHandle | None = None
     model_specific_data: dict[str, Any] = dataclasses.field(default_factory=dict)
     # Encoder output for this item, populated on first encoder pass and reused
     # across chunked-prefill iterations of the owning request. Lifetime is
     # tied to the request: when the request finishes the item is GC'd and
     # these tensors are released. ``encoded_deepstack`` is set only for
     # deepstack-enabled modalities.
-    encoded: Optional[torch.Tensor] = None
-    encoded_deepstack: Optional[torch.Tensor] = None
+    encoded: torch.Tensor | None = None
+    encoded_deepstack: torch.Tensor | None = None
+    # EPD (encode-prefill-decode): when set, this item's embedding is received
+    # from an encode worker over Mooncake into ``encoded`` instead of running the
+    # vision tower. A dict ``{bootstrap_room, bootstrap_host, bootstrap_port}``
+    # naming the encode worker's rendezvous for this item's image (one room per
+    # item: the gateway splits the mm payload one item per image and the encode
+    # worker row-splits the concatenated-subgrid embedding per item). None for
+    # non-EPD items (left to the vision tower).
+    encode_handshake: dict | None = None
 
     def __getattr__(self, name: str):
         if (
@@ -89,15 +97,39 @@ class MultimodalDataItem:
             return self.__dict__["model_specific_data"][name]
         raise AttributeError(f"'{self.__class__.__name__}' has no attribute '{name}'")
 
-    def set_pad_value(self):
-        if self.pad_value is not None:
-            return
+    def ensure_hash(self):
+        """Resolve ``self.hash`` to a concrete content id, lazily.
 
+        The hash is resolved on demand rather than at construction because it
+        is usually supplied by the caller, a SHM-backed feature cannot be
+        hashed here without reading shared memory, and hashing inline bytes is
+        only worth doing once the value is actually needed.
+
+        Resolution order:
+          * ``TOKENSPEED_MM_SKIP_COMPUTE_HASH`` -> a random id (dedup disabled);
+          * an already-set hash (e.g. the gateway-provided ``content_hash`` for
+            image/video) is kept as-is, no recompute;
+          * inline features the gateway does not hash (e.g. audio) are hashed
+            in-engine via ``hash_feature``;
+          * SHM-backed features must carry a caller-provided hash, else raise --
+            we cannot hash a handle without reading shared memory.
+        """
         if envs.TOKENSPEED_MM_SKIP_COMPUTE_HASH.get():
             self.hash = uuid.uuid4().int
         elif self.hash is None:
+            if isinstance(self.feature, ShmTensorHandle):
+                raise ValueError(
+                    "SHM-backed multimodal items must carry content hash or "
+                    "pad_value before TokenSpeed consumes them"
+                )
             self.hash = hash_feature(self.feature)
-        assert self.hash is not None
+        if self.hash is None:
+            raise RuntimeError("Failed to resolve multimodal item hash.")
+
+    def set_pad_value(self):
+        if self.pad_value is not None:
+            return
+        self.ensure_hash()
         self.pad_value = _MM_PAD_BASE + (self.hash & _MM_PAD_HASH_MASK)
 
     def is_modality(self, modality: Modality) -> bool:
@@ -106,12 +138,17 @@ class MultimodalDataItem:
 
 @dataclasses.dataclass(eq=False)
 class MultimodalInputs:
-    mm_items: List[MultimodalDataItem]
-    im_token_id: Optional[int] = None
-    video_token_id: Optional[int] = None
-    mrope_positions: Optional[torch.Tensor] = None
-    mrope_position_delta: Optional[torch.Tensor] = None
-    mrope_position_delta_repeated_cache: Optional[torch.Tensor] = None
+    mm_items: list[MultimodalDataItem]
+    im_token_id: int | None = None
+    video_token_id: int | None = None
+    mrope_positions: torch.Tensor | None = None
+    mrope_position_delta: torch.Tensor | None = None
+    mrope_position_delta_scalar: int | None = None
+    mrope_position_delta_repeated_cache: torch.Tensor | None = None
+
+    def ensure_pad_values(self) -> None:
+        for item in self.mm_items:
+            item.set_pad_value()
 
     def publish_shm_features(self) -> None:
         for item in self.mm_items:
@@ -126,10 +163,11 @@ class MultimodalInputs:
             if isinstance(item.feature, ShmTensorHandle):
                 item.feature.attach()
 
-    def consume_shm_features(self) -> None:
+    def release_shm_features(self) -> None:
         for item in self.mm_items:
             if isinstance(item.feature, ShmTensorHandle):
-                item.feature = item.feature.consume()
+                item.feature.release()
+                item.feature = None
 
     def has_pending_shm_features(self) -> bool:
         return any(isinstance(item.feature, ShmTensorHandle) for item in self.mm_items)
@@ -139,9 +177,9 @@ class MultimodalInputs:
 class MultimodalForwardContext:
     """Per-forward multimodal metadata for prefill embedding replacement."""
 
-    mm_inputs: List[Optional[MultimodalInputs]]
-    extend_prefix_lens: List[int]
-    extend_seq_lens: List[int]
+    mm_inputs: list[MultimodalInputs | None]
+    extend_prefix_lens: list[int]
+    extend_seq_lens: list[int]
 
     def has_inputs(self) -> bool:
         return bool(self.mm_inputs and any(x is not None for x in self.mm_inputs))

@@ -95,17 +95,19 @@ def get_hf_text_config(config: PretrainedConfig):
     if class_name.startswith("Llava") and class_name.endswith("ForCausalLM"):
         # We support non-hf version of llava models, so we do not want to
         # read the wrong values from the unused default text_config.
-        #  We set `torch_dtype` of config to `torch.float16` for the weights, as
-        # `torch.float16` is default used for image features in `python/tokenspeed/runtime/models/llava.py`.
-        setattr(config, "torch_dtype", torch.float16)
+        # We set `dtype` of config to `torch.float16` for the weights, as
+        # `torch.float16` is default used for image features in
+        # `python/tokenspeed/runtime/models/llava.py`.
+        config.dtype = torch.float16
         return config
 
     text_config = None
     if hasattr(config, "text_config"):
         # The code operates under the assumption that text_config should have
-        # `num_attention_heads` (among others). Assert here to fail early
+        # `num_attention_heads` (among others). Check here to fail early
         # if transformers config doesn't align with this assumption.
-        assert hasattr(config.text_config, "num_attention_heads")
+        if not hasattr(config.text_config, "num_attention_heads"):
+            raise AttributeError("text_config must define num_attention_heads.")
         text_config = config.text_config
     if hasattr(config, "language_config"):
         text_config = config.language_config
@@ -113,11 +115,7 @@ def get_hf_text_config(config: PretrainedConfig):
         # qwen2.5 omni
         thinker_config = config.thinker_config
         if hasattr(thinker_config, "text_config"):
-            setattr(
-                thinker_config.text_config,
-                "torch_dtype",
-                getattr(thinker_config, "torch_dtype", None),
-            )
+            thinker_config.text_config.dtype = thinker_config.dtype
             text_config = thinker_config.text_config
         else:
             text_config = thinker_config
@@ -174,6 +172,32 @@ def _materialize_architectures(config: PretrainedConfig, raw_config: dict) -> No
     config.__dict__["architectures"] = list(raw_archs)
 
 
+def _restore_raw_glm_dsa_fields(config: PretrainedConfig, raw_config: dict) -> None:
+    if raw_config.get("architectures") != ["GlmMoeDsaForCausalLM"]:
+        return
+
+    # Transformers may rewrite these GLM DSA dimensions; config.json is authoritative.
+    for key in (
+        "qk_head_dim",
+        "qk_nope_head_dim",
+        "qk_rope_head_dim",
+        "v_head_dim",
+        "kv_lora_rank",
+        "q_lora_rank",
+        "index_topk",
+        "index_head_dim",
+        "index_n_heads",
+        "index_topk_freq",
+        "index_skip_topk_offset",
+        "index_topk_pattern",
+        "indexer_types",
+        "indexer_rope_interleave",
+        "index_share_for_mtp_iteration",
+    ):
+        if key in raw_config:
+            setattr(config, key, raw_config[key])
+
+
 def get_config(
     model: str,
     trust_remote_code: bool,
@@ -212,6 +236,7 @@ def get_config(
             raise e
 
     _materialize_architectures(config, raw_config)
+    _restore_raw_glm_dsa_fields(config, raw_config)
 
     # extract 'text_config'
     text_config = get_hf_text_config(config)
@@ -236,6 +261,7 @@ def get_config(
         and config.architectures
         and "NextN" not in config.architectures[0]
         and "Eagle" not in config.architectures[0]
+        and "DFlash" not in config.architectures[0]
     ):
         if config.architectures[0] == "MiniMaxM2ForCausalLM":
             config.architectures[0] = "LlamaForCausalLMEagle3"

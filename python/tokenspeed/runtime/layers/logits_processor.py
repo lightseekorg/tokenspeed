@@ -26,6 +26,11 @@ import torch
 import triton
 import triton.language as tl
 from tokenspeed_kernel.ops.communication.triton import all_gather_inner, create_state
+from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
+from tokenspeed_kernel.ops.sampling.cute_dsl import (
+    create_dist_argmax_state,
+    distributed_argmax,
+)
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
@@ -58,6 +63,8 @@ class LogitsProcessorOutput:
     ## Part 1: This part will be assigned in python/tokenspeed/runtime/layers/logits_processor.py::LogitsProcessor
     # The logits of the next tokens.       shape: [#seq, vocab_size]
     next_token_logits: torch.Tensor
+    # Used when ``do_argmax=True``.   shape: [#seq]
+    next_token_ids: torch.Tensor | None = None
     # Used by speculative decoding.
     # The last hidden layers
     hidden_states: torch.Tensor | None = None
@@ -138,6 +145,9 @@ def _get_fused_lm_head_gemm():
     global _FUSED_LM_HEAD_GEMM
     if _FUSED_LM_HEAD_GEMM is not None:
         return _FUSED_LM_HEAD_GEMM
+    if not current_platform().is_nvidia:
+        _FUSED_LM_HEAD_GEMM = (None, None)
+        return _FUSED_LM_HEAD_GEMM
     try:
         from tokenspeed_kernel.thirdparty.cuda.lm_head_gemm import (
             lm_head_gemm,
@@ -174,11 +184,17 @@ class LogitsProcessor(nn.Module):
 
     _LOGITS_AG_MAX_TOKENS = 128
     _LOGITS_AG_STATE_UNINITIALIZED = object()
+    _LOGITS_AG_STATES = {}
+
+    _LOGITS_DIST_ARGMAX_MAX_TOKENS = 8192
+    _LOGITS_DIST_ARGMAX_UNINITIALIZED = object()
+    _LOGITS_DIST_ARGMAX_STATES = {}
 
     def __init__(
         self,
         config,
         skip_all_gather: bool = False,
+        do_argmax: bool = False,
         logit_scale: float | None = None,
         tp_rank: int | None = None,
         tp_size: int | None = None,
@@ -187,6 +203,7 @@ class LogitsProcessor(nn.Module):
         super().__init__()
         self.config = config
         self.skip_all_gather = skip_all_gather
+        self.do_argmax = do_argmax
         self.dp_sampling_enabled = False
         self.dp_num_tokens_per_req = 1
         self.dp_sampling_min_bs = 0
@@ -194,14 +211,19 @@ class LogitsProcessor(nn.Module):
         self._logits_layout_executor: LogitsLayoutExecutor | None = None
 
         if tp_rank is None:
-            assert tp_size is None
-            assert tp_group is None
+            if tp_size is not None or tp_group is not None:
+                raise ValueError("tp_size and tp_group require tp_rank.")
             tp_rank, tp_size = 0, 1
-        assert 0 <= tp_rank < tp_size
-        assert tp_size == 1 or tp_group is not None
+        elif tp_size is None:
+            raise ValueError("tp_size is required when tp_rank is provided.")
+        if not 0 <= tp_rank < tp_size:
+            raise ValueError(f"Invalid tensor-parallel rank: {tp_rank}/{tp_size}.")
+        if tp_size != 1 and tp_group is None:
+            raise ValueError("tp_group is required when tp_size > 1.")
         self.tp_rank, self.tp_size, self.tp_group = tp_rank, tp_size, tp_group
 
         self._all_gather_state = self._LOGITS_AG_STATE_UNINITIALIZED
+        self._dist_argmax_state = self._LOGITS_DIST_ARGMAX_UNINITIALIZED
 
         self.final_logit_softcapping = getattr(
             self.config, "final_logit_softcapping", None
@@ -246,14 +268,12 @@ class LogitsProcessor(nn.Module):
     ) -> LogitsLayoutPlan | None:
         if not self.dp_sampling_enabled:
             return None
-        if not (
-            logits_metadata.forward_mode.is_decode()
-            or logits_metadata.forward_mode.is_target_verify()
-        ):
+        if not logits_metadata.forward_mode.is_decode():
             return None
         n = self.dp_num_tokens_per_req
         rows = hidden_states.shape[0]
-        assert rows % n == 0, f"hidden_states have {rows} rows, not divisible by N={n}"
+        if rows % n != 0:
+            raise ValueError(f"hidden_states have {rows} rows, not divisible by N={n}")
         effective_bs = rows // n
         bucket_bs = ((effective_bs + self.tp_size - 1) // self.tp_size) * self.tp_size
         if effective_bs < self.dp_sampling_min_bs:
@@ -276,12 +296,41 @@ class LogitsProcessor(nn.Module):
         if vocab_padded % (self.tp_size * 8) != 0:
             return None
 
-        return create_state(
-            group=pg_manager.get_process_group("nccl", self.tp_group),
-            rank_in_group=self.tp_rank,
-            max_tokens=self._LOGITS_AG_MAX_TOKENS,
-            hidden_size=vocab_padded,
-        )
+        key = (self.tp_group, vocab_padded)
+        if key not in self._LOGITS_AG_STATES:
+            self._LOGITS_AG_STATES[key] = create_state(
+                group=pg_manager.get_process_group("nccl", self.tp_group),
+                rank_in_group=self.tp_rank,
+                max_tokens=self._LOGITS_AG_MAX_TOKENS,
+                hidden_size=vocab_padded,
+            )
+        return self._LOGITS_AG_STATES[key]
+
+    def _init_dist_argmax_state(self, lm_head: VocabParallelEmbedding):
+        if not current_platform().is_nvidia:
+            return None
+
+        if self.tp_size == 1 or self.skip_all_gather or self.dp_sampling_enabled:
+            return None
+
+        vocab_per_rank = lm_head.weight.size(0)
+        if vocab_per_rank * self.tp_size != self.config.vocab_size:
+            return None  # padded vocab: sharded argmax could pick a pad column
+        if vocab_per_rank < 4096 or vocab_per_rank % 32 != 0:
+            return None  # below the kernel's vocab floor / alignment
+
+        key = (self.tp_group, vocab_per_rank)
+        if key not in self._LOGITS_DIST_ARGMAX_STATES:
+            self._LOGITS_DIST_ARGMAX_STATES[key] = create_dist_argmax_state(
+                group=pg_manager.get_process_group("nccl", self.tp_group),
+                rank_in_group=self.tp_rank,
+                max_M=self._LOGITS_DIST_ARGMAX_MAX_TOKENS,
+                dtype=lm_head.weight.dtype,
+                device=lm_head.weight.device,
+                skip_ping_pong=True,
+            )
+
+        return self._LOGITS_DIST_ARGMAX_STATES[key]
 
     def forward(
         self,
@@ -306,9 +355,10 @@ class LogitsProcessor(nn.Module):
                     if aux_hidden_states is not None:
                         aux_pruned_states = [h[gather_ids] for h in aux_hidden_states]
             else:
-                assert (
-                    not logits_metadata.forward_mode.is_extend_or_mixed()
-                ), "EXTEND/MIXED forward must set gather_ids on ForwardContext"
+                if logits_metadata.forward_mode.is_extend_or_mixed():
+                    raise RuntimeError(
+                        "EXTEND/MIXED forward must set gather_ids on ForwardContext"
+                    )
                 pruned_states = hidden_states
                 if aux_hidden_states is not None:
                     aux_pruned_states = list(aux_hidden_states)
@@ -339,7 +389,8 @@ class LogitsProcessor(nn.Module):
 
                 # We always need at least 1 token to sample because that's required
                 # by a caller.
-                assert extend_len > start_len
+                if extend_len <= start_len:
+                    raise RuntimeError("extend_len must be greater than start_len.")
                 pruned_states.append(hidden_states[pt + start_len : pt + extend_len])
                 pt += extend_len
                 sample_index_pt += extend_len - start_len
@@ -404,12 +455,16 @@ class LogitsProcessor(nn.Module):
                         else pruned_states
                     )
             else:
-                assert False, "Should never reach"
+                raise RuntimeError("Should never reach")
 
         if not logits_metadata.extend_return_logprob:
             # Decode mode or extend mode without return_logprob.
+            # Greedy draft path: emit token ids here, fusing the cross-rank
+            # vocab reduction into the argmax when gated on.
+            next_token_ids = self._argmax(sampled_logits) if self.do_argmax else None
             return LogitsProcessorOutput(
                 next_token_logits=sampled_logits,
+                next_token_ids=next_token_ids,
                 hidden_states=hidden_states_to_store,
                 logits_layout_plan=logits_layout_plan,
             )
@@ -484,10 +539,11 @@ class LogitsProcessor(nn.Module):
         guarantee the given hidden_states follow this constraint.
         """
         dp_sampling = plan is not None
-        assert (not dp_sampling) or self.dp_sampling_enabled, (
-            "DP logits layout plan was provided but LogitsProcessor was not "
-            "configured with dp_sampling"
-        )
+        if dp_sampling and not self.dp_sampling_enabled:
+            raise RuntimeError(
+                "DP logits layout plan was provided but LogitsProcessor was not "
+                "configured with dp_sampling"
+            )
 
         if dp_sampling and self.skip_all_gather:
             if self._logits_layout_executor is None:
@@ -518,7 +574,19 @@ class LogitsProcessor(nn.Module):
                     "dp_sampling logits layout executor is not configured"
                 )
             logits = self._logits_layout_executor.swap_batch_vocab(logits, plan)
+
         elif not dp_sampling and self.tp_size > 1 and not self.skip_all_gather:
+            if self.do_argmax:
+                if self._dist_argmax_state is self._LOGITS_DIST_ARGMAX_UNINITIALIZED:
+                    self._dist_argmax_state = self._init_dist_argmax_state(lm_head)
+
+                if (
+                    self._dist_argmax_state is not None
+                    and not self.final_logit_softcapping
+                    and logits.size(0) <= self._LOGITS_DIST_ARGMAX_MAX_TOKENS
+                ):
+                    return logits
+
             if self._all_gather_state is self._LOGITS_AG_STATE_UNINITIALIZED:
                 self._all_gather_state = self._init_all_gather_state(lm_head)
 
@@ -535,18 +603,20 @@ class LogitsProcessor(nn.Module):
                     safe=False,
                 )
             else:
+                num_rows = logits.size(0)
+                local_vocab_size = logits.size(1)
                 gathered_logits = torch.empty(
-                    self.tp_size * logits.size(0),
-                    logits.size(1),
+                    self.tp_size * num_rows,
+                    local_vocab_size,
                     dtype=logits.dtype,
                     device=logits.device,
                 )
                 all_gather_into_tensor(gathered_logits, logits, self.tp_group)
                 logits = (
-                    gathered_logits.view(self.tp_size, logits.size(0), logits.size(1))
+                    gathered_logits.view(self.tp_size, num_rows, local_vocab_size)
                     .transpose(0, 1)
                     .contiguous()
-                    .view(logits.size(0), -1)
+                    .view(num_rows, local_vocab_size * self.tp_size)
                 )
 
         logits = logits[:, : self.config.vocab_size].contiguous()
@@ -555,6 +625,18 @@ class LogitsProcessor(nn.Module):
             fused_softcap_generic(logits, self.final_logit_softcapping)
 
         return logits
+
+    def _argmax(self, logits: torch.Tensor) -> torch.Tensor:
+        if (
+            self._dist_argmax_state
+            not in (self._LOGITS_DIST_ARGMAX_UNINITIALIZED, None)
+            and not self.final_logit_softcapping
+            and logits.size(0) <= self._LOGITS_DIST_ARGMAX_MAX_TOKENS
+        ):
+            _, idx = distributed_argmax(self._dist_argmax_state, logits)
+            return idx
+        else:
+            return sampling_argmax(logits)
 
     @staticmethod
     def get_top_logprobs(all_logprobs: torch.Tensor, logits_metadata: LogitsMetadata):

@@ -49,6 +49,8 @@ from tokenspeed.runtime.engine.io_struct import (
     InitWeightsUpdateGroupReqOutput,
     IsSchedulerPausedReqInput,
     IsSchedulerPausedReqOutput,
+    IsSleepingReqInput,
+    IsSleepingReqOutput,
     PauseMode,
     PauseSchedulerReqInput,
     PauseSchedulerReqOutput,
@@ -91,15 +93,16 @@ class _Communicator(Generic[T]):
         self._result_values: list[T] | None = None
         self._ready_queue: deque[asyncio.Future] = deque()
 
-        assert mode in ["queueing", "watching"]
+        if mode not in ("queueing", "watching"):
+            raise ValueError(f"Invalid communicator mode: {mode}")
 
     async def queueing_call(self, obj: T):
         ready_event = asyncio.Event()
         if self._result_event is not None or len(self._ready_queue) > 0:
             self._ready_queue.append(ready_event)
             await ready_event.wait()
-            assert self._result_event is None
-            assert self._result_values is None
+            if self._result_event is not None or self._result_values is not None:
+                raise RuntimeError("Communicator result state was not reset.")
 
         if obj:
             self._sender.send_pyobj(obj)
@@ -117,7 +120,8 @@ class _Communicator(Generic[T]):
 
     async def watching_call(self, obj):
         if self._result_event is None:
-            assert self._result_values is None
+            if self._result_values is not None:
+                raise RuntimeError("Communicator result values were not reset.")
             self._result_values = []
             self._result_event = asyncio.Event()
 
@@ -174,6 +178,9 @@ class SchedulerControlClient:
             self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
         )
         self.is_scheduler_paused_communicator = _Communicator(
+            self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
+        )
+        self.is_sleeping_communicator = _Communicator(
             self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
         )
         self.profile_communicator = _Communicator(
@@ -239,6 +246,10 @@ class SchedulerControlClient:
                 (
                     IsSchedulerPausedReqOutput,
                     self.is_scheduler_paused_communicator.handle_recv,
+                ),
+                (
+                    IsSleepingReqOutput,
+                    self.is_sleeping_communicator.handle_recv,
                 ),
                 (
                     ProfileReqOutput,
@@ -356,9 +367,8 @@ class SchedulerControlClient:
         obj: InitWeightsUpdateGroupReqInput,
     ) -> tuple[bool, str]:
         self.auto_create_handle_loop()
-        assert (
-            not self.server_args.mapping.attn.has_dp
-        ), "dp_size must be 1 for init parameter update group"
+        if self.server_args.mapping.attn.has_dp:
+            raise RuntimeError("dp_size must be 1 for init parameter update group")
         result = (await self.init_weights_update_group_communicator(obj))[0]
         return result.success, result.message
 
@@ -367,9 +377,8 @@ class SchedulerControlClient:
         obj: UpdateWeightsFromDistributedReqInput,
     ) -> tuple[bool, str]:
         self.auto_create_handle_loop()
-        assert (
-            not self.server_args.mapping.attn.has_dp
-        ), "dp_size must be for update weights from distributed"
+        if self.server_args.mapping.attn.has_dp:
+            raise RuntimeError("dp_size must be 1 for update weights from distributed")
 
         # This means that weight sync
         # cannot run while requests are in progress.
@@ -382,9 +391,8 @@ class SchedulerControlClient:
         obj: UpdateWeightsFromTensorReqInput,
     ) -> tuple[bool, str]:
         self.auto_create_handle_loop()
-        assert (
-            not self.server_args.mapping.attn.has_dp
-        ), "dp_size must be for update weights from distributed"
+        if self.server_args.mapping.attn.has_dp:
+            raise RuntimeError("dp_size must be 1 for update weights from tensor")
 
         # This means that weight sync
         # cannot run while requests are in progress.
@@ -407,16 +415,21 @@ class SchedulerControlClient:
     async def release_memory_occupation(
         self: AsyncLLM,
         obj: ReleaseMemoryOccupationReqInput,
-    ):
+    ) -> ReleaseMemoryOccupationReqOutput:
         self.auto_create_handle_loop()
-        await self.release_memory_occupation_communicator(obj)
+        return (await self.release_memory_occupation_communicator(obj))[0]
 
     async def resume_memory_occupation(
         self: AsyncLLM,
         obj: ResumeMemoryOccupationReqInput,
-    ):
+    ) -> ResumeMemoryOccupationReqOutput:
         self.auto_create_handle_loop()
-        await self.resume_memory_occupation_communicator(obj)
+        return (await self.resume_memory_occupation_communicator(obj))[0]
+
+    async def is_sleeping(self: AsyncLLM) -> bool:
+        self.auto_create_handle_loop()
+        result = (await self.is_sleeping_communicator(IsSleepingReqInput()))[0]
+        return result.is_sleeping
 
     async def get_internal_state(self: AsyncLLM) -> list[dict[Any, Any]]:
         req = GetInternalStateReq()

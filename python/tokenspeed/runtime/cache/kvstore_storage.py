@@ -52,7 +52,7 @@ class KVStoreStorage(ABC):
     It abstracts the underlying storage mechanism, allowing different implementations to be used.
     """
 
-    def register_mem_pool_host(self, mem_pool_host: HostKVCache):
+    def register_mem_pool_host(self, mem_pool_host: HostKVCache) -> None:
         self.mem_pool_host = mem_pool_host
 
     def batch_get_v1(
@@ -155,4 +155,4 @@ class KVStoreStorage(ABC):
         return len(keys)
 
     def clear(self) -> None:
-        pass
+        return None

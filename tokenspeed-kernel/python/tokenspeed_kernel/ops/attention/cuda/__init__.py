@@ -16,8 +16,8 @@ if platform.is_nvidia and platform.is_hopper_plus:
 
     @register_kernel(
         "attention",
-        "mha_merge_state",
-        name="cuda_mha_merge_state",
+        "attn_merge_state",
+        name="cuda_attn_merge_state",
         solution="cuda",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
@@ -30,17 +30,21 @@ if platform.is_nvidia and platform.is_hopper_plus:
         traits={},
         tags={"throughput"},
     )
-    def cuda_mha_merge_state(
+    def cuda_attn_merge_state(
         out_a: torch.Tensor,
         lse_a: torch.Tensor,
         out_b: torch.Tensor,
         lse_b: torch.Tensor,
         lse_scale_log2: float,
+        inplace: bool = False,
+        enable_pdl: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return merge_state(
             out_a,
             lse_a,
             out_b,
             lse_b,
+            inplace=inplace,
             lse_scale_log2=lse_scale_log2,
+            enable_pdl=enable_pdl,
         )

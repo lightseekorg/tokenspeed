@@ -26,6 +26,14 @@ from tokenspeed.runtime.utils.env import envs
 TOKENSPEED_TEST_REQUEST_TIME_STATS = envs.TOKENSPEED_TEST_REQUEST_TIME_STATS.get()
 
 
+def _raise_for_negative_durations(**durations: float) -> None:
+    negative_durations = [
+        f"{name}={duration} < 0" for name, duration in durations.items() if duration < 0
+    ]
+    if negative_durations:
+        raise ValueError(" or ".join(negative_durations))
+
+
 @dataclass
 class TimeStats:
     """
@@ -63,9 +71,10 @@ class TimeStats:
             forward_duration = self.completion_time - self.forward_entry_time
 
             if TOKENSPEED_TEST_REQUEST_TIME_STATS:
-                assert (
-                    queue_duration >= 0 and forward_duration >= 0
-                ), f"queue_duration={queue_duration} < 0 or forward_duration={forward_duration} < 0"
+                _raise_for_negative_durations(
+                    queue_duration=queue_duration,
+                    forward_duration=forward_duration,
+                )
 
             return f"queue_duration={self.format_duration(queue_duration)}, forward_duration={self.format_duration(forward_duration)}, start_time={self.wait_queue_entry_time}"
         if _type == self.RequestType.PREFILL:
@@ -78,11 +87,11 @@ class TimeStats:
             forward_duration = self.completion_time - self.forward_entry_time
 
             if TOKENSPEED_TEST_REQUEST_TIME_STATS:
-                assert (
-                    bootstrap_duration >= 0
-                    and queue_duration >= 0
-                    and forward_duration >= 0
-                ), f"bootstrap_duration={bootstrap_duration} < 0 or queue_duration={queue_duration} < 0 or forward_duration={forward_duration} < 0"
+                _raise_for_negative_durations(
+                    bootstrap_duration=bootstrap_duration,
+                    queue_duration=queue_duration,
+                    forward_duration=forward_duration,
+                )
             return f"bootstrap_duration={self.format_duration(bootstrap_duration)}, queue_duration={self.format_duration(queue_duration)}, forward_duration={self.format_duration(forward_duration)}, start_time={self.prefill_bootstrap_queue_entry_time}"
         # if decode
         if _type == self.RequestType.DECODE:
@@ -98,12 +107,12 @@ class TimeStats:
             forward_duration = self.completion_time - self.forward_entry_time
 
             if TOKENSPEED_TEST_REQUEST_TIME_STATS:
-                assert (
-                    prealloc_duration >= 0
-                    and transfer_duration >= 0
-                    and queue_duration >= 0
-                    and forward_duration >= 0
-                ), f"prealloc_duration={prealloc_duration} < 0 or transfer_duration={transfer_duration} < 0 or queue_duration={queue_duration} < 0 or forward_duration={forward_duration} < 0"
+                _raise_for_negative_durations(
+                    prealloc_duration=prealloc_duration,
+                    transfer_duration=transfer_duration,
+                    queue_duration=queue_duration,
+                    forward_duration=forward_duration,
+                )
 
             return f"prealloc_duration={self.format_duration(prealloc_duration)}, transfer_duration={self.format_duration(transfer_duration)}, queue_duration={self.format_duration(queue_duration)}, forward_duration={self.format_duration(forward_duration)}, start_time={self.decode_prealloc_queue_entry_time}"
         return "Invalid Time Stats"
@@ -230,6 +239,15 @@ class EngineMetrics:
             labelnames=labelnames,
             **kw,
         )
+        self.num_nan_aborted_requests = Counter(
+            name="tokenspeed:num_nan_aborted_requests",
+            documentation=(
+                "Requests terminated by the NaN guard (NaN in logits or an "
+                "out-of-vocab sampled token id)."
+            ),
+            labelnames=labelnames,
+            **kw,
+        )
 
     def set_scheduler_snapshot(
         self, *, running: int, waiting: int, kv_cache_usage_ratio: float
@@ -280,6 +298,11 @@ class EngineMetrics:
         self.spec_decode_num_accepted_tokens.labels(**self.labels).inc(
             max(0, accepted_draft_tokens)
         )
+
+    def record_nan_abort(self) -> None:
+        if not self.enabled:
+            return
+        self.num_nan_aborted_requests.labels(**self.labels).inc()
 
 
 class RequestMetrics:

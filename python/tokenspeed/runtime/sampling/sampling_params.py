@@ -72,6 +72,10 @@ class SamplingParams:
         stream_interval: int | None = None,
         logit_bias: dict[str, float] | None = None,
         seed: int | None = None,
+        # vLLM-style output logprobs. None = off; 0 = the sampled (generated)
+        # token's logprob at each output position. Other values are rejected by
+        # verify().
+        logprobs: int | None = None,
         # OpenAI-compat: `n` is a request-level fanout (number of choices)
         # that the serving layer forwards on every sampling_params dict.
         # TokenSpeed does not multiplex a single request into n completions,
@@ -105,6 +109,7 @@ class SamplingParams:
         self.stream_interval = stream_interval
         self.logit_bias = logit_bias
         self.seed = seed
+        self.logprobs = logprobs
 
         # Process some special cases
         if self.temperature < _SAMPLING_EPS:
@@ -168,6 +173,14 @@ class SamplingParams:
                         f"logit_bias must has keys in [0, {vocab_size - 1}], got "
                         f"{token_id}."
                     )
+
+        if self.logprobs is not None and self.logprobs != 0:
+            # Only the sampled token's logprob (logprobs=0) is materialized;
+            # top-k (>0) and full-vocab (-1) output logprobs are not supported.
+            raise ValueError(
+                f"logprobs={self.logprobs} is not supported; use logprobs=0 "
+                "(the sampled token's logprob)."
+            )
 
         grammars = [
             self.json_schema,

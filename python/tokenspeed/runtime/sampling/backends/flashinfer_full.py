@@ -49,7 +49,6 @@ from tokenspeed.runtime.sampling.backends.flashinfer import (
     FlashInferSamplingBackend,
 )
 from tokenspeed.runtime.sampling.registry import register_backend
-from tokenspeed.runtime.sampling.utils import nan_guard_logits
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.pdl import pdl_enabled
 
@@ -273,9 +272,7 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
         sampling_info: SamplingBatchInfo,
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
-        logits = nan_guard_logits(
-            logits_output.next_token_logits, self.config.enable_nan_detection
-        ).float()
+        logits = logits_output.next_token_logits.float()
 
         # Grammar bitmask apply — captured inside the CUDA graph. Buffer is
         # pre-bound by bind_grammar_mask_buf; non-grammar rows stay all-ones.
@@ -318,7 +315,12 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
             # top_p_renorm_prob(is_deterministic=True) pair. Sentinel
             # K = 1<<30 in top_ks routes per-row through the radix top-p
             # only path.
-            probs = fused_topk_topp_renorm(probs, top_ks, top_ps)
+            probs = fused_topk_topp_renorm(
+                probs,
+                top_ks,
+                top_ps,
+                enable_pdl=pdl_enabled(),
+            )
         else:
             probs = top_k_renorm_prob(probs, top_ks)
             probs = top_p_renorm_prob(probs, top_ps, is_deterministic=True)
@@ -376,9 +378,7 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
         )
         accept_length = self._accept_length_buf[:bs]
 
-        logits = nan_guard_logits(
-            logits_output.next_token_logits, self.config.enable_nan_detection
-        ).float()
+        logits = logits_output.next_token_logits.float()
 
         # Per-draft-position grammar bitmask: buffer shape
         # [bs * num_tokens_per_req, V/32] matches the flat target logits.
@@ -422,7 +422,12 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
             # top_p_renorm_prob(is_deterministic=True) pair. Sentinel
             # K = 1<<30 in top_ks routes per-row through the radix top-p
             # only path.
-            target_probs = fused_topk_topp_renorm(target_probs, top_ks, top_ps)
+            target_probs = fused_topk_topp_renorm(
+                target_probs,
+                top_ks,
+                top_ps,
+                enable_pdl=pdl_enabled(),
+            )
         else:
             target_probs = top_k_renorm_prob(target_probs, top_ks)
             target_probs = top_p_renorm_prob(

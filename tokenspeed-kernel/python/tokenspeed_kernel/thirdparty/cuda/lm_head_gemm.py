@@ -101,7 +101,7 @@ def is_supported(
 
     Capability gate (does the .so have it?), independent of perf:
       * bf16 only
-      * M = num_tokens <= num_tokens_max (default 16)
+      * 0 < M = num_tokens <= num_tokens_max (default 16)
       * (K, N) = (hidden_dim, vocab_shard) matches a compiled instantiation
       * CC >= 9.0 (Hopper or newer; uses HMMA + cp.async + mbarrier + PDL)
     """
@@ -113,7 +113,7 @@ def is_supported(
         return False
     num_tokens, hd_in = hidden_states.shape
     hd_out, hd_in_w = weight.shape
-    if hd_in != hd_in_w or num_tokens > num_tokens_max:
+    if hd_in != hd_in_w or num_tokens <= 0 or num_tokens > num_tokens_max:
         return False
     if (hd_in, hd_out) not in _SUPPORTED_SHAPES:
         return False
@@ -142,7 +142,7 @@ def should_use_fused(
     hd_in = hidden_states.shape[1]
     hd_out = weight.shape[0]
     cap = _FUSED_MAX_TOKENS.get((hd_in, hd_out), 0)
-    return num_tokens <= cap
+    return 0 < num_tokens <= cap
 
 
 def lm_head_gemm(
@@ -178,6 +178,8 @@ def lm_head_gemm(
         assert out.is_contiguous()
         assert out.shape == (num_tokens, hd_out)
         assert out.dtype == torch.bfloat16
+    if num_tokens == 0:
+        return out
     # tile_n=8 is the minimum-latency config for M<=8; tile_n=16 amortizes
     # the store/epilogue when M>8.
     tile_n = 8 if num_tokens <= 8 else 16

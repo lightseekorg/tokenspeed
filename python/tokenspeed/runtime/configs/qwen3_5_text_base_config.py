@@ -1,9 +1,8 @@
-# Adapted from meituan-longcat/SGLang-FluentLLM.
-# This file has been modified for this repository.
-# This file may incorporate material from ModelTC/lightllm,
-# vllm-project/vllm, and sgl-project/sglang, as identified in
-# python/THIRDPARTYNOTICES.
-
+# SPDX-License-Identifier: MIT AND Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 LightSeek Foundation
+# SPDX-FileCopyrightText: Copyright 2025 The Qwen team, Alibaba Group
+# SPDX-FileCopyrightText: Copyright 2025 HuggingFace Inc. team
+#
 # Copyright (c) 2026 LightSeek Foundation
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -90,7 +89,7 @@ class Qwen3_5BaseTextConfig(PretrainedConfig):
             Whether the model's input and output word embeddings should be tied.
         rope_theta (`float`, *optional*, defaults to 10000.0):
             The base period of the RoPE embeddings.
-        rope_scaling (`Dict`, *optional*):
+        rope_parameters (`Dict`, *optional*):
             Dictionary containing the scaling configuration for the RoPE embeddings.  if you apply new rope type
             and you expect the model to work on longer `max_position_embeddings`, we recommend you to update this value
             accordingly.
@@ -201,7 +200,7 @@ class Qwen3_5BaseTextConfig(PretrainedConfig):
         use_cache=True,
         tie_word_embeddings=False,
         rope_theta=10000.0,
-        rope_scaling=None,
+        rope_parameters=None,
         partial_rotary_factor=0.25,
         attention_bias=False,
         attention_dropout=0.0,
@@ -236,7 +235,7 @@ class Qwen3_5BaseTextConfig(PretrainedConfig):
         self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache
         self.rope_theta = rope_theta
-        self.rope_scaling = rope_scaling
+        self.rope_parameters = rope_parameters
         self.partial_rotary_factor = partial_rotary_factor
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout

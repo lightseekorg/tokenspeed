@@ -49,12 +49,16 @@ _is_amd = current_platform().is_amd
 
 if _is_amd:
     from tokenspeed_kernel.ops.layernorm.triton import rmsnorm as triton_rmsnorm
+    from tokenspeed_kernel.ops.layernorm.triton import (
+        rmsnorm_fused_parallel as triton_rmsnorm_fused_parallel,
+    )
 else:
     from tokenspeed_kernel.ops.layernorm.cuda import rmsnorm_fused_parallel
     from tokenspeed_kernel.ops.layernorm.flashinfer import (
         fused_add_rmsnorm,
         gemma_fused_add_rmsnorm,
         gemma_rmsnorm,
+        layernorm,
         rmsnorm,
     )
 
@@ -64,6 +68,28 @@ logger = get_colorful_logger(__name__)
 
 def _get_process_group(group: tuple[int, ...]):
     return pg_manager.get_process_group("nccl", group)
+
+
+class LayerNorm(nn.Module):
+    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=torch.float32))
+        self.bias = nn.Parameter(torch.zeros(hidden_size, dtype=torch.float32))
+        self.variance_epsilon = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # There might be no tokens here (e.g. idle/padded graph rows).
+        if x.shape[0] == 0:
+            return x
+        if current_platform().is_nvidia:
+            return layernorm(x, self.weight, self.bias, self.variance_epsilon)
+        return nn.functional.layer_norm(
+            x.float(),
+            (x.shape[-1],),
+            self.weight,
+            self.bias,
+            self.variance_epsilon,
+        ).to(x.dtype)
 
 
 class RMSNorm(torch.nn.Module):
@@ -91,9 +117,10 @@ class RMSNorm(torch.nn.Module):
 
         if _is_amd:
             if residual is not None:
-                assert (
-                    not inplace
-                ), "fused add rmsnorm does not support inplace operation"
+                if inplace:
+                    raise ValueError(
+                        "fused add rmsnorm does not support inplace operation"
+                    )
                 return triton_rmsnorm(
                     x,
                     self.weight.data,
@@ -108,9 +135,10 @@ class RMSNorm(torch.nn.Module):
             )
         else:
             if residual is not None:
-                assert (
-                    not inplace
-                ), "fused_add_rmsnorm does not support inplace operation"
+                if inplace:
+                    raise ValueError(
+                        "fused_add_rmsnorm does not support inplace operation"
+                    )
                 fused_add_rmsnorm(
                     x,
                     residual,
@@ -150,7 +178,8 @@ class RMSNorm(torch.nn.Module):
                 if _is_amd:
                     allreduce_residual_rmsnorm = triton_allreduce_residual_rmsnorm
                 else:
-                    assert current_platform().is_nvidia
+                    if not current_platform().is_nvidia:
+                        raise RuntimeError("Allreduce RMSNorm requires NVIDIA or AMD.")
                     allreduce_residual_rmsnorm = trtllm_allreduce_residual_rmsnorm
                 fused_result = allreduce_residual_rmsnorm(
                     input_tensor=x,
@@ -227,7 +256,10 @@ class GemmaRMSNorm(torch.nn.Module):
         self.weight.weight_loader = self._weight_loader
 
     def _weight_loader(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
-        assert param.size() == loaded_weight.size()
+        if param.size() != loaded_weight.size():
+            raise ValueError(
+                f"Shape mismatch: {param.size()} != {loaded_weight.size()}."
+            )
         param.data.copy_(loaded_weight)
         self.gemma_weight = param.data + 1.0
 
@@ -301,7 +333,8 @@ class GemmaRMSNorm(torch.nn.Module):
                 if _is_amd:
                     allreduce_residual_rmsnorm = triton_allreduce_residual_rmsnorm
                 else:
-                    assert current_platform().is_nvidia
+                    if not current_platform().is_nvidia:
+                        raise RuntimeError("Allreduce RMSNorm requires NVIDIA or AMD.")
                     allreduce_residual_rmsnorm = trtllm_allreduce_residual_rmsnorm
                 fused_result = allreduce_residual_rmsnorm(
                     input_tensor=x,
@@ -411,7 +444,16 @@ class FusedRMSNorm(nn.Module):
             Tuple of (normalized_q_a, normalized_kv_a)
         """
         if _is_amd:
-            raise NotImplementedError("Fused RMSNorm is not implemented on HIP yet")
+            triton_rmsnorm_fused_parallel(
+                input1=input_q_a,
+                weight1=self.weight_q_a,
+                output1=output_q_a if output_q_a is not None else input_q_a,
+                input2=input_kv_a,
+                weight2=self.weight_kv_a,
+                output2=output_kv_a if output_kv_a is not None else input_kv_a,
+                eps=self.q_a_norm.variance_epsilon,
+                enable_pdl=pdl_enabled(),
+            )
         else:
             rmsnorm_fused_parallel(
                 input1=input_q_a,

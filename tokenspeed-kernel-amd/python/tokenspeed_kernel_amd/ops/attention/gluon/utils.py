@@ -24,6 +24,8 @@ from tokenspeed_kernel_amd._triton import gl, gluon, tl
 
 _INV_LN2_VALUE = 1.4426950408889634
 _INV_LN2 = tl.constexpr(_INV_LN2_VALUE)
+_LN2_VALUE = 0.6931471805599453
+_LN2 = tl.constexpr(_LN2_VALUE)
 
 
 @gluon.jit

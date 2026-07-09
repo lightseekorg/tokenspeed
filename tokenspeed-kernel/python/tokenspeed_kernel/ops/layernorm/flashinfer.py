@@ -23,6 +23,7 @@ from tokenspeed_kernel.registry import error_fn
 fused_add_rmsnorm = error_fn
 gemma_fused_add_rmsnorm = error_fn
 gemma_rmsnorm = error_fn
+layernorm = error_fn
 rmsnorm = error_fn
 
 if current_platform().is_nvidia:
@@ -31,6 +32,7 @@ if current_platform().is_nvidia:
             fused_add_rmsnorm,
             gemma_fused_add_rmsnorm,
             gemma_rmsnorm,
+            layernorm,
             rmsnorm,
         )
     except ImportError:
@@ -40,5 +42,6 @@ __all__ = [
     "fused_add_rmsnorm",
     "gemma_fused_add_rmsnorm",
     "gemma_rmsnorm",
+    "layernorm",
     "rmsnorm",
 ]

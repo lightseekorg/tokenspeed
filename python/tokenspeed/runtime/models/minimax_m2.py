@@ -47,7 +47,7 @@ from tokenspeed.runtime.layers.linear import (
     RowParallelLinear,
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
-from tokenspeed.runtime.layers.moe.checkpoint import (
+from tokenspeed.runtime.layers.moe import (
     ExpertCheckpointSchema,
     build_moe_checkpoint_loader,
 )
@@ -66,7 +66,10 @@ from tokenspeed.runtime.models.base import (
     BaseMoEDecoderLayer,
     BaseTransformerModel,
 )
-from tokenspeed.runtime.models.utils import create_fused_set_kv_buffer_arg
+from tokenspeed.runtime.models.utils import (
+    create_fused_set_kv_buffer_arg,
+    validate_attention_partition,
+)
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.utils import (
     LazyValue,
@@ -81,9 +84,9 @@ logger = logging.getLogger(__name__)
 _is_nvidia = current_platform().is_nvidia
 
 if _is_nvidia:
-    from tokenspeed_kernel.ops.routing.cuda import fp32_router_gemm
+    from tokenspeed_kernel.thirdparty.cuda import fp32_router_gemm
 
-from tokenspeed.runtime.layers.moe.layer import MoELayer as _MoELayer
+from tokenspeed.runtime.layers.moe.expert import MoELayer as _MoELayer
 
 MoELayer = _MoELayer
 
@@ -135,6 +138,7 @@ class MiniMaxM2SparseMoeBlock(nn.Module):
             "n_group": 1,
             "topk_group": 1,
             "routed_scaling_factor": 1.0,
+            "normalize_topk_weights": True,
             "correction_bias": self.routing_bias,
             "routing_method_type": RoutingMethodType.MiniMax2,
         }
@@ -163,9 +167,6 @@ class MiniMaxM2SparseMoeBlock(nn.Module):
             correction_bias=self.routing_bias,
             routed_scaling_factor=1.0,
             output_format=self.experts.topk_output_format,
-            apply_routed_scaling_factor_on_output=(
-                self.experts.apply_routed_scaling_factor_on_output
-            ),
         )
 
     def get_moe_routed_weights(self):
@@ -491,7 +492,10 @@ class MiniMaxM2RMSNormTP(nn.Module):
         eps: float = 1e-6,
     ) -> None:
         super().__init__()
-        assert global_hidden_size % tp_size == 0
+        if global_hidden_size % tp_size != 0:
+            raise ValueError(
+                f"global_hidden_size={global_hidden_size} must be divisible by tp_size={tp_size}."
+            )
         self.local_hidden_size = global_hidden_size // tp_size
         self.tp_rank = tp_rank
         self.tp_size = tp_size
@@ -573,13 +577,13 @@ class MiniMaxM2Attention(nn.Module):
         self.attn_tp_rank = mapping.attn.tp_rank
         self.attn_tp_group = mapping.attn.tp_group
         self.total_num_heads = num_heads
-        assert self.total_num_heads % self.attn_tp_size == 0
-        self.num_heads = self.total_num_heads // self.attn_tp_size
         self.total_num_kv_heads = num_kv_heads
-        if self.total_num_kv_heads >= self.attn_tp_size:
-            assert self.total_num_kv_heads % self.attn_tp_size == 0
-        else:
-            assert self.attn_tp_size % self.total_num_kv_heads == 0
+        validate_attention_partition(
+            self.total_num_heads,
+            self.total_num_kv_heads,
+            self.attn_tp_size,
+        )
+        self.num_heads = self.total_num_heads // self.attn_tp_size
         self.num_kv_heads = max(1, self.total_num_kv_heads // self.attn_tp_size)
         self.head_dim = head_dim or hidden_size // self.total_num_heads
         self.rotary_dim = rotary_dim or self.head_dim

@@ -68,6 +68,8 @@ def create_sampling_backend(
         flashinfer_full as _ff,
     )
     from tokenspeed.runtime.sampling.backends import greedy as _g  # noqa: F401
+    from tokenspeed.runtime.sampling.backends import triton as _t  # noqa: F401
+    from tokenspeed.runtime.sampling.backends import triton_full as _tf  # noqa: F401
 
     name = _resolve_backend_name(server_args)
     if name not in _BACKEND_REGISTRY:

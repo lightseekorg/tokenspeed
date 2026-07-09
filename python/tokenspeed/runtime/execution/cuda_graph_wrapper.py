@@ -31,11 +31,15 @@ import torch
 import torch.distributed as dist
 import tqdm
 
+from tokenspeed.runtime.configs.paged_cache_spec import (
+    compute_max_logical_pages_for_capture,
+)
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from tokenspeed.runtime.sampling.backends.base import CUDA_GRAPH_VARIANT_DEFAULT
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 from tokenspeed.runtime.utils import (
     get_available_gpu_memory,
@@ -61,34 +65,14 @@ def get_is_capture_mode() -> bool:
     return _is_capture_mode
 
 
-def _draft_decode_forward_mode(use_draft_extend: bool) -> ForwardMode:
-    return ForwardMode.DRAFT_EXTEND if use_draft_extend else ForwardMode.DECODE
-
-
 def _should_update_mamba_state_after_mtp_verify(
     drafter, attn_backend, forward_mode: ForwardMode
 ) -> bool:
     return (
         drafter is not None
-        and (forward_mode.is_decode() or forward_mode.is_target_verify())
+        and forward_mode.is_decode()
         and hasattr(attn_backend, "update_mamba_state_after_mtp_verify")
     )
-
-
-def compute_max_logical_pages_for_capture(
-    spec,
-    *,
-    max_context_len: int,
-    max_tokens_per_req: int = 1,
-) -> int:
-    raw_per_page = max(1, int(spec.rows_per_page) * int(spec.entry_stride_tokens))
-    if str(getattr(spec, "retention", "")) == "sliding_window":
-        window = int(getattr(spec, "sliding_window_tokens", 0) or 0)
-        live_tokens = max(1, window - 1 + max(1, int(max_tokens_per_req)))
-        if int(max_context_len) > 0:
-            live_tokens = min(live_tokens, int(max_context_len))
-        return max(1, (live_tokens + raw_per_page - 1) // raw_per_page + 1)
-    return max(1, (max(1, int(max_context_len)) + raw_per_page - 1) // raw_per_page)
 
 
 @contextmanager
@@ -124,7 +108,7 @@ def get_batch_sizes_to_capture(config: ModelExecutorConfig):
         capture_bs = list(sorted(set(capture_bs + [max_bs - 1] + [max_bs])))
 
     effective_max = min(config.max_cudagraph_capture_size, max_bs)
-    capture_bs = [bs for bs in capture_bs if bs <= effective_max]
+    capture_bs = [bs for bs in capture_bs if 0 < bs <= effective_max]
     return capture_bs
 
 
@@ -148,7 +132,7 @@ class DeepEPCudaGraphRunnerAdapter:
     @staticmethod
     def _get_buffer_cls():
         try:
-            from tokenspeed.runtime.layers.moe.dispatcher.deep_ep import (
+            from tokenspeed_kernel.ops.communication.deep_ep import (
                 DeepEPBuffer,
             )
 
@@ -234,7 +218,8 @@ class CudaGraphWrapper:
         self.max_tokens_per_req = (
             config.spec_num_tokens if config.spec_algo is not None else 1
         )
-        self.use_target_verify_forward_mode = config.use_target_verify_forward_mode
+        self.overlap_schedule_depth = config.overlap_schedule_depth
+        self.use_v4_mtp_paged_metadata = config.use_v4_mtp_paged_metadata
         self.dp_size = config.data_parallel_size
         self.world_size = config.world_size
         # Backends alias their cache_seqlens buffer. Draft backend aliases
@@ -246,6 +231,7 @@ class CudaGraphWrapper:
                 self.input_buffers.seq_lens_buf,
                 paged_cache_group_specs=paged_cache_group_specs,
                 max_tokens_per_req=self.max_tokens_per_req,
+                overlap_schedule_depth=self.overlap_schedule_depth,
             )
         except TypeError:
             attn_backend.init_cuda_graph_state(
@@ -262,6 +248,7 @@ class CudaGraphWrapper:
                     self.drafter.draft_seq_lens_buf,
                     paged_cache_group_specs=draft_paged_cache_group_specs,
                     max_tokens_per_req=self.max_tokens_per_req,
+                    overlap_schedule_depth=self.overlap_schedule_depth,
                 )
             except TypeError:
                 draft_attn_backend.init_cuda_graph_state(
@@ -289,8 +276,13 @@ class CudaGraphWrapper:
                 draft_attn_backend.decode_cuda_graph_kv_indices = target_kv
                 draft_attn_backend._block_table_aliased = True
 
-        self.graphs: dict[int, torch.cuda.CUDAGraph] = {}
-        self.output_buffers: dict[int, tuple] = {}
+        self.graph_variants = (
+            sampling_backend.cuda_graph_capture_variants(self.max_tokens_per_req)
+            if sampling_backend is not None
+            else (CUDA_GRAPH_VARIANT_DEFAULT,)
+        )
+        self.graphs: dict[tuple[str, int], torch.cuda.CUDAGraph] = {}
+        self.output_buffers: dict[tuple[str, int], tuple] = {}
 
         self._forward_func: Callable | None = forward_func
         self.disable = config.enforce_eager
@@ -312,29 +304,82 @@ class CudaGraphWrapper:
         rank = self.global_rank
         with freeze_gc(self.enable_cudagraph_gc):
             self.stream = torch.cuda.Stream()
-            capture_range = tqdm.tqdm(self.capture_bs) if rank == 0 else self.capture_bs
+            # Capture backend-declared sampler variants explicitly.
+            capture_items = [
+                (variant, bs)
+                for variant in self._cuda_graph_capture_variants()
+                for bs in self.capture_bs
+            ]
+            capture_range = tqdm.tqdm(capture_items) if rank == 0 else capture_items
             if rank == 0:
                 logger.info("Capturing batches: %s", self.capture_bs)
-            for bs in capture_range:
+            for variant, bs in capture_range:
                 if rank == 0:
                     avail_mem = get_available_gpu_memory(
                         self.device, self.gpu_id, empty_cache=False
                     )
-                    capture_range.set_description(
-                        f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
+                    variant_desc = (
+                        ""
+                        if variant == CUDA_GRAPH_VARIANT_DEFAULT
+                        else f" variant={variant}"
                     )
-                graph, output_buffers = self._capture_one(bs)
-                self.graphs[bs] = graph
-                self.output_buffers[bs] = output_buffers
+                    capture_range.set_description(
+                        f"Capturing batches ({bs=}{variant_desc} {avail_mem=:.2f} GB)"
+                    )
+                graph, output_buffers = self._capture_one(bs, variant=variant)
+                self.graphs[(variant, bs)] = graph
+                self.output_buffers[(variant, bs)] = output_buffers
 
-    def _capture_one(self, bs: int):
+    def _cuda_graph_capture_variants(self) -> tuple[str, ...]:
+        if self.sampling_backend is None:
+            return (CUDA_GRAPH_VARIANT_DEFAULT,)
+        variants = self.sampling_backend.cuda_graph_capture_variants(
+            self.max_tokens_per_req
+        )
+        if not variants:
+            return (CUDA_GRAPH_VARIANT_DEFAULT,)
+        deduped = tuple(dict.fromkeys((CUDA_GRAPH_VARIANT_DEFAULT, *variants)))
+        return deduped
+
+    def _prepare_sampling_capture(self, bs: int, variant: str) -> None:
+        if self.sampling_backend is None:
+            return
+        self.sampling_backend.prepare_capture_variant(
+            bs=bs,
+            num_tokens_per_req=self.max_tokens_per_req,
+            variant=variant,
+        )
+
+    def _cuda_graph_replay_variant(self) -> str:
+        if self.sampling_backend is None:
+            return CUDA_GRAPH_VARIANT_DEFAULT
+        return self.sampling_backend.cuda_graph_replay_variant(self.max_tokens_per_req)
+
+    def _cuda_graph_key(self, bs: int) -> tuple[str, int]:
+        variant = self._cuda_graph_replay_variant()
+        key = (variant, bs)
+        if key in self.graphs:
+            return key
+        if variant != CUDA_GRAPH_VARIANT_DEFAULT:
+            captured_variants = sorted(
+                graph_variant
+                for graph_variant, graph_bs in self.graphs
+                if graph_bs == bs
+            )
+            raise RuntimeError(
+                "Sampling backend requested CUDA graph variant "
+                f"{variant!r} for batch size {bs}, but it was not captured. "
+                f"Captured variants for this batch size: {captured_variants}."
+            )
+        return (CUDA_GRAPH_VARIANT_DEFAULT, bs)
+
+    def _has_cuda_graph_for_bs(self, bs: int) -> bool:
+        return (CUDA_GRAPH_VARIANT_DEFAULT, bs) in self.graphs
+
+    def _capture_one(self, bs: int, variant: str = CUDA_GRAPH_VARIANT_DEFAULT):
         graph = torch.cuda.CUDAGraph()
 
-        capture_forward_mode = (
-            ForwardMode.TARGET_VERIFY
-            if self.drafter is not None and self.use_target_verify_forward_mode
-            else ForwardMode.DECODE
-        )
+        capture_forward_mode = ForwardMode.DECODE
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
             token_to_kv_pool=self.token_to_kv_pool,
@@ -412,10 +457,10 @@ class CudaGraphWrapper:
         for _ in range(4):
             torch.cuda.synchronize()
             dist.barrier()
-            if self.sampling_backend is not None:
-                self.sampling_backend.prepare_capture(
-                    bs=bs, num_tokens_per_req=self.max_tokens_per_req
-                )
+            self._prepare_sampling_capture(bs=bs, variant=variant)
+            # Keep warmup seq_lens >= q_len_per_req so no query row gets an
+            # empty causal span; a stale seq_len of 1 overflows to non-finite KV.
+            self.input_buffers.seq_lens_buf[:bs].fill_(self.max_tokens_per_req)
             self._init_capture_metadata(bs)
             run_once()
 
@@ -427,11 +472,13 @@ class CudaGraphWrapper:
         torch.cuda.synchronize()
         dist.barrier()
 
+        # Warmups can switch a backend back to eager metadata objects. Restore
+        # the graph-backed metadata immediately before capture so replay-time
+        # metadata refreshes update the same tensors recorded by the graph.
+        self._init_capture_metadata(bs)
+
         # Fill sampler buffers OUTSIDE the capture so RNG ops aren't recorded.
-        if self.sampling_backend is not None:
-            self.sampling_backend.prepare_capture(
-                bs=bs, num_tokens_per_req=self.max_tokens_per_req
-            )
+        self._prepare_sampling_capture(bs=bs, variant=variant)
         # Warmup forwards can mutate aliased metadata buffers, so refresh
         # them again immediately before graph capture records the final views.
         self._init_capture_metadata(bs)
@@ -477,6 +524,7 @@ class CudaGraphWrapper:
                     else self.context_len
                 ),
                 max_tokens_per_req=self.max_tokens_per_req,
+                overlap_schedule_depth=self.overlap_schedule_depth,
             )
             out[str(spec.group_id)] = torch.zeros(
                 (bs, max_pages),
@@ -506,6 +554,8 @@ class CudaGraphWrapper:
             )
             if paged_cache_block_tables is not None:
                 capture_kwargs["paged_cache_block_tables"] = paged_cache_block_tables
+                if self.drafter is not None:
+                    capture_kwargs["num_tokens"] = bs * self.max_tokens_per_req
         flat_cache_group_ids = self._flat_cache_group_ids(self.token_to_kv_pool)
         if flat_cache_group_ids:
             capture_kwargs["flat_cache_group_ids"] = flat_cache_group_ids
@@ -513,11 +563,7 @@ class CudaGraphWrapper:
             bs,
             self.input_buffers.req_pool_indices_buf[:bs],
             self.input_buffers.seq_lens_buf[:bs],
-            (
-                ForwardMode.TARGET_VERIFY
-                if self.drafter is not None and self.use_target_verify_forward_mode
-                else ForwardMode.DECODE
-            ),
+            ForwardMode.DECODE,
             **capture_kwargs,
         )
         if self.draft_attn_backend is not None:
@@ -534,12 +580,13 @@ class CudaGraphWrapper:
                     draft_kwargs["paged_cache_block_tables"] = (
                         draft_paged_cache_block_tables
                     )
+                    draft_kwargs["num_tokens"] = bs * self.max_tokens_per_req
             # Drafter mutates seq_lens_buf in place per step; backends alias.
             self.draft_attn_backend.init_forward_metadata_capture_cuda_graph(
                 bs,
                 self.input_buffers.req_pool_indices_buf[:bs],
                 self.input_buffers.seq_lens_buf[:bs],
-                _draft_decode_forward_mode(self.use_target_verify_forward_mode),
+                ForwardMode.DECODE,
                 **draft_kwargs,
             )
 
@@ -682,7 +729,7 @@ class CudaGraphWrapper:
             )
         if self.attn_backend.uses_padded_decode_token_mask:
             kwargs["actual_bs"] = actual_bs
-        if target_uses_paged_groups and forward_mode.is_speculative():
+        if target_uses_paged_groups and getattr(self, "drafter", None) is not None:
             kwargs["num_tokens"] = padded_bs * self.max_tokens_per_req
         self.attn_backend.init_forward_metadata_replay_cuda_graph(
             padded_bs,
@@ -702,15 +749,15 @@ class CudaGraphWrapper:
                     )
             if getattr(self.draft_attn_backend, "uses_padded_decode_token_mask", False):
                 draft_attn_kwargs["actual_bs"] = actual_bs
-            draft_forward_mode = _draft_decode_forward_mode(
-                self.use_target_verify_forward_mode
-            )
-            if draft_uses_paged_groups and draft_forward_mode.is_speculative():
+            draft_forward_mode = ForwardMode.DECODE
+            if draft_uses_paged_groups:
                 draft_attn_kwargs["num_tokens"] = padded_bs * self.max_tokens_per_req
+            draft_seq_lens = self.drafter.draft_seq_lens_buf[:padded_bs]
+            draft_seq_lens.copy_(seq_lens[:padded_bs])
             self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
                 padded_bs,
                 req_pool_indices,
-                seq_lens,
+                draft_seq_lens,
                 req_to_page=self.drafter.req_to_page,
                 forward_mode=draft_forward_mode,
                 **draft_attn_kwargs,
@@ -730,7 +777,8 @@ class CudaGraphWrapper:
         """Eager path — allocate/refresh metadata for the upcoming forward."""
         if (
             getattr(self.attn_backend, "uses_paged_cache_groups", False)
-            and forward_mode.is_speculative()
+            and self.drafter is not None
+            and forward_mode.is_decode()
         ):
             kwargs.setdefault("num_tokens", padded_bs * self.max_tokens_per_req)
         self.attn_backend.init_forward_metadata(
@@ -766,7 +814,7 @@ class CudaGraphWrapper:
                 # metadata, then a separate decode init to prepare the draft
                 # decode metadata from that first-step state.
                 draft_prefill_seq_lens = (
-                    seq_lens if self.use_target_verify_forward_mode else draft_seq_lens
+                    seq_lens if self.use_v4_mtp_paged_metadata else draft_seq_lens
                 )
                 self.draft_attn_backend.init_forward_metadata(
                     bs=padded_bs,
@@ -777,7 +825,7 @@ class CudaGraphWrapper:
                     forward_mode=forward_mode,
                     **kwargs,
                 )
-                if self.use_target_verify_forward_mode:
+                if self.use_v4_mtp_paged_metadata:
                     self.draft_attn_backend.init_forward_metadata(
                         bs=padded_bs,
                         num_extends=0,
@@ -789,15 +837,10 @@ class CudaGraphWrapper:
                     )
             else:
                 draft_metadata_seq_lens = (
-                    seq_lens if self.use_target_verify_forward_mode else draft_seq_lens
+                    seq_lens if self.use_v4_mtp_paged_metadata else draft_seq_lens
                 )
-                draft_forward_mode = _draft_decode_forward_mode(
-                    self.use_target_verify_forward_mode
-                )
-                if (
-                    getattr(self.draft_attn_backend, "uses_paged_cache_groups", False)
-                    and draft_forward_mode.is_speculative()
-                ):
+                draft_forward_mode = ForwardMode.DECODE
+                if getattr(self.draft_attn_backend, "uses_paged_cache_groups", False):
                     draft_kwargs["num_tokens"] = padded_bs * self.max_tokens_per_req
                 self.draft_attn_backend.init_forward_metadata(
                     bs=padded_bs,
@@ -818,7 +861,7 @@ class CudaGraphWrapper:
     def _can_use_graph(self, bs: int, ctx: ForwardContext) -> bool:
         if self.disable:
             return False
-        if not (ctx.forward_mode.is_decode() or ctx.forward_mode.is_target_verify()):
+        if not ctx.forward_mode.is_decode():
             return False
         if self.dp_size > 1:
             if not ctx.all_decode_or_idle:
@@ -827,10 +870,10 @@ class CudaGraphWrapper:
             if global_bs is None or global_bs == 0:
                 return False
             if self.disable_padding:
-                return global_bs in self.graphs
+                return self._has_cuda_graph_for_bs(global_bs)
             return global_bs <= self.max_bs
         if self.disable_padding:
-            return bs in self.graphs
+            return self._has_cuda_graph_for_bs(bs)
         return bs <= self.max_bs
 
     def can_run(self, bs: int, ctx: ForwardContext) -> bool:
@@ -844,6 +887,40 @@ class CudaGraphWrapper:
         target_bs = graph_bs if graph_bs is not None else bs
         index = bisect.bisect_left(self.capture_bs, target_bs)
         return self.capture_bs[index]
+
+    def _pad_graph_req_pool_indices(
+        self, active_req_pool_indices: torch.Tensor, padded_bs: int
+    ) -> torch.Tensor:
+        pad = padded_bs - active_req_pool_indices.shape[0]
+        if pad <= 0:
+            return active_req_pool_indices
+        if self.config.spec_algo == "DFLASH":
+            # Route padding rows to the sentinel req-pool slot
+            # (max_req_pool_size), not slot 0. The DFLASH draft derives each
+            # row's block seq_len from valid_cache_lengths[req_pool], so
+            # padding rows pointing at slot 0 would grow unbounded with
+            # request 0's context and hang the draft block-decode kernel.
+            # The sentinel row stays zero-init (length 0, dummy page 0).
+            sentinel = int(self.config.max_req_pool_size)
+            return torch.cat(
+                [
+                    active_req_pool_indices,
+                    active_req_pool_indices.new_full((pad,), sentinel),
+                ]
+            )
+        return torch.cat(
+            [active_req_pool_indices, active_req_pool_indices.new_zeros(pad)]
+        )
+
+    def _set_graph_state_write_indices(
+        self, active_req_pool_indices: torch.Tensor, padded_bs: int
+    ) -> None:
+        state_indices = self.input_buffers.state_write_req_pool_indices_buf[:padded_bs]
+        active_bs = active_req_pool_indices.shape[0]
+        if active_bs > 0:
+            state_indices[:active_bs].copy_(active_req_pool_indices)
+        if active_bs < padded_bs:
+            state_indices[active_bs:padded_bs].fill_(int(self.config.max_req_pool_size))
 
     def __call__(
         self,
@@ -876,6 +953,7 @@ class CudaGraphWrapper:
         """
         use_graph = self._can_use_graph(bs, ctx)
         padded_bs = self._padded_bs(bs, ctx) if use_graph else bs
+        active_req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
 
         if use_graph and padded_bs != bs:
             ctx.bs = padded_bs
@@ -883,12 +961,17 @@ class CudaGraphWrapper:
             seq_lens = torch.nn.functional.pad(
                 self.input_buffers.seq_lens_buf[:bs], (0, pad), value=1
             )
-            req_pool_indices = torch.nn.functional.pad(
-                self.input_buffers.req_pool_indices_buf[:bs], (0, pad), value=0
+            req_pool_indices = self._pad_graph_req_pool_indices(
+                active_req_pool_indices, padded_bs
             )
+            self.input_buffers.seq_lens_buf[:padded_bs].copy_(seq_lens)
+            self.input_buffers.req_pool_indices_buf[:padded_bs].copy_(req_pool_indices)
             if mamba_pool_indices is not None:
+                # Pad with -1 (PAD_SLOT_ID), NOT 0. Mamba slot 0 is a real
+                # allocatable slot, so padding with 0 aliases a live request's
+                # mamba state and corrupts it. -1 is the kernel-skipped pad id.
                 mamba_pool_indices = torch.nn.functional.pad(
-                    mamba_pool_indices, (0, pad), value=0
+                    mamba_pool_indices, (0, pad), value=-1
                 )
             if mamba_cow_src_indices is not None:
                 mamba_cow_src_indices = torch.nn.functional.pad(
@@ -905,6 +988,9 @@ class CudaGraphWrapper:
         else:
             seq_lens = self.input_buffers.seq_lens_buf[:padded_bs]
             req_pool_indices = self.input_buffers.req_pool_indices_buf[:padded_bs]
+
+        if use_graph:
+            self._set_graph_state_write_indices(active_req_pool_indices, padded_bs)
 
         mamba_kwargs = {}
         if mamba_pool_indices is not None:
@@ -957,12 +1043,15 @@ class CudaGraphWrapper:
             # the per-request generators with the capture-stub generator.
             self.deepep_adapter.replay()
 
+            graph_key = self._cuda_graph_key(padded_bs)
             with nvtx_range("graph_replay", color="red"):
-                self.graphs[padded_bs].replay()
+                self.graphs[graph_key].replay()
 
-            output_tokens, output_lengths, output_logprobs = self.output_buffers[
-                padded_bs
-            ]
+            (
+                output_tokens,
+                output_lengths,
+                output_logprobs,
+            ) = self.output_buffers[graph_key]
 
             result = (
                 output_tokens[: bs * self.max_tokens_per_req],
@@ -994,6 +1083,11 @@ class CudaGraphWrapper:
                     f"({ctx.forward_mode.name}); the single-table fallback "
                     "would use one group's pages for all layers."
                 )
+            metadata_num_tokens = (
+                {"num_tokens": ctx.input_num_tokens}
+                if self.attn_backend.uses_paged_cache_groups
+                else {}
+            )
             self._init_forward_metadata(
                 padded_bs,
                 ctx.num_extends,
@@ -1012,6 +1106,7 @@ class CudaGraphWrapper:
                 all_decode_or_idle=ctx.all_decode_or_idle,
                 capture_hidden_mode=ctx.capture_hidden_mode,
                 spec_info=spec_info,
+                **metadata_num_tokens,
                 paged_cache_block_tables=(
                     paged_cache_block_tables
                     if self.attn_backend.uses_paged_cache_groups
@@ -1031,6 +1126,9 @@ class CudaGraphWrapper:
             )
 
             result = self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
+
+        if use_graph and padded_bs != bs:
+            ctx.bs = bs
 
         # Update mamba/GDN state after speculative verify
         if _should_update_mamba_state_after_mtp_verify(

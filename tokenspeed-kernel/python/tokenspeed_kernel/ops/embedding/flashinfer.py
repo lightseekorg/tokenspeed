@@ -17,15 +17,67 @@
 
 """FlashInfer rotary embedding kernels."""
 
-from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.registry import error_fn
+import torch
+from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
+from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
-mla_rope_quantize_fp8 = error_fn
+platform = current_platform()
 
-if current_platform().is_nvidia:
-    try:
-        from flashinfer.rope import mla_rope_quantize_fp8
-    except ImportError:
-        pass
 
-__all__ = ["mla_rope_quantize_fp8"]
+if platform.is_nvidia:
+    from flashinfer.rope import mla_rope_quantize_fp8
+
+    @register_kernel(
+        "embedding",
+        "rope_mla",
+        name="flashinfer_embedding_rope_mla",
+        solution="flashinfer",
+        capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+        signatures=format_signatures(
+            ("q_rope", "k_rope", "q_nope", "k_nope"),
+            "dense",
+            {torch.float16, torch.bfloat16},
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "is_neox": frozenset({True, False}),
+            "quantize_dtype": frozenset({torch.float8_e4m3fn}),
+            "has_scale_q_tensor": frozenset({False}),
+            "has_scale_kv_tensor": frozenset({False}),
+        },
+    )
+    def flashinfer_embedding_rope_mla(
+        *,
+        positions: torch.Tensor,
+        q_rope: torch.Tensor,
+        k_rope: torch.Tensor,
+        q_nope: torch.Tensor,
+        k_nope: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        q_rope_out: torch.Tensor,
+        k_rope_out: torch.Tensor,
+        q_nope_out: torch.Tensor,
+        k_nope_out: torch.Tensor,
+        is_neox: bool = True,
+        quant_scale_q: float = 1.0,
+        quant_scale_kv: float = 1.0,
+        enable_pdl: bool = False,
+    ) -> None:
+        mla_rope_quantize_fp8(
+            q_rope=q_rope,
+            k_rope=k_rope,
+            q_nope=q_nope,
+            k_nope=k_nope,
+            cos_sin_cache=cos_sin_cache,
+            pos_ids=positions,
+            is_neox=is_neox,
+            quantize_dtype=torch.float8_e4m3fn,
+            q_rope_out=q_rope_out,
+            k_rope_out=k_rope_out,
+            q_nope_out=q_nope_out,
+            k_nope_out=k_nope_out,
+            quant_scale_q=quant_scale_q,
+            quant_scale_kv=quant_scale_kv,
+            enable_pdl=enable_pdl,
+        )

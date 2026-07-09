@@ -20,11 +20,10 @@
 
 from __future__ import annotations
 
-from typing import Dict
-
 import numpy as np
 
-from tokenspeed.runtime.pd.base import BootstrapInfo, KVPoll
+from tokenspeed.runtime.pd.base.bootstrap import BootstrapInfo
+from tokenspeed.runtime.pd.base.status import TransferPoll
 from tokenspeed.runtime.pd.mooncake.prefill import (
     MooncakeKVManagerPrefill,
     MooncakeKVSender,
@@ -53,7 +52,7 @@ class DisaggPrefillExecutor:
                 (Forward.FlatForwardOp, self._decode),
             ]
         )
-        self.senders: Dict[int, MooncakeKVSender] = {}
+        self.senders: dict[int, MooncakeKVSender] = {}
         self.kv_manager = MooncakeKVManagerPrefill(args, kv_args)
         self.gloo_group = gloo_group
         self._local_states = {}
@@ -61,8 +60,8 @@ class DisaggPrefillExecutor:
         self._layerwise_interval = 1
         # request_id -> bootstrap metadata, populated after the prefill forward pass.
         # Request ids and bootstrap rooms are stable across request-pool slot reuse.
-        self._request_token: Dict[str, int] = {}
-        self._request_spec_candidate_ids: Dict[str, list[int]] = {}
+        self._request_token: dict[str, int] = {}
+        self._request_spec_candidate_ids: dict[str, list[int]] = {}
         self._layerwise_token_published = set()
 
     def store_prefill_token(
@@ -85,7 +84,9 @@ class DisaggPrefillExecutor:
                 )
                 return
             self.kv_manager.set_prefill_metadata(
-                sender.bootstrap_room, token, spec_candidate_ids
+                sender.bootstrap_room,
+                token,
+                spec_candidate_ids,
             )
             self._layerwise_token_published.add(request_id)
 
@@ -126,6 +127,30 @@ class DisaggPrefillExecutor:
             return None
         return np.array([slot], dtype=np.int64)
 
+    @staticmethod
+    def _mamba_optional_index(op, attr: str, index: int):
+        indices = getattr(op, attr, None)
+        if indices is None or index >= len(indices):
+            return None
+        slot = int(indices[index])
+        if slot < 0:
+            return None
+        return slot
+
+    @classmethod
+    def _mamba_transfer_indices(cls, op, index: int):
+        working = cls._mamba_indices(op, index)
+        if working is None:
+            return None
+
+        slots = [int(x) for x in working.tolist()]
+        checkpoint_src = cls._mamba_optional_index(
+            op, "mamba_checkpoint_dst_indices", index
+        )
+        if checkpoint_src is not None and checkpoint_src not in slots:
+            slots.append(checkpoint_src)
+        return np.array(slots, dtype=np.int64)
+
     def _decode_prefix_len(self, bootstrap_room: int) -> int:
         transfer_info = next(
             t
@@ -136,9 +161,11 @@ class DisaggPrefillExecutor:
 
     def _prefill_page_window(self, op, index: int, sender):
         decode_prefix_len = self._decode_prefix_len(sender.bootstrap_room)
-        assert (
-            decode_prefix_len % self.page_size == 0
-        ), f"decode_prefix_len % page_size != 0 ! {decode_prefix_len=} {self.page_size=}"
+        if decode_prefix_len % self.page_size != 0:
+            raise ValueError(
+                "decode_prefix_len must be divisible by page_size: "
+                f"{decode_prefix_len=} {self.page_size=}"
+            )
 
         chunk_begin = op.extend_prefix_lens[index]
         chunk_end = chunk_begin + op.input_lengths[index]
@@ -182,7 +209,7 @@ class DisaggPrefillExecutor:
             kv_indices, index_slice, is_last = self._prefill_page_window(op, i, sender)
             if len(kv_indices) == 0 and not is_last:
                 continue
-            mamba_indices = self._mamba_indices(op, i) if is_last else None
+            mamba_indices = self._mamba_transfer_indices(op, i) if is_last else None
             sender.send_layerwise(
                 kv_indices,
                 index_slice,
@@ -212,21 +239,25 @@ class DisaggPrefillExecutor:
             if sender.has_layerwise_transfer():
                 if request_id not in self._layerwise_token_published:
                     self.kv_manager.set_prefill_metadata(
-                        sender.bootstrap_room, bootstrap_token, spec_candidate_ids
+                        sender.bootstrap_room,
+                        bootstrap_token,
+                        spec_candidate_ids,
                     )
                 self._layerwise_token_published.discard(request_id)
                 continue
 
             bootstrap_room = sender.bootstrap_room
             decode_prefix_len = self._decode_prefix_len(bootstrap_room)
-            assert (
-                decode_prefix_len % self.page_size == 0
-            ), f"decode_prefix_len % page_size != 0 ! {decode_prefix_len=} {self.page_size=}"
+            if decode_prefix_len % self.page_size != 0:
+                raise ValueError(
+                    "decode_prefix_len must be divisible by page_size: "
+                    f"{decode_prefix_len=} {self.page_size=}"
+                )
             kv_indices = np.array(
                 op.occupied_pages[i][decode_prefix_len // self.page_size :],
                 dtype=np.int64,
             )
-            mamba_indices = self._mamba_indices(op, i)
+            mamba_indices = self._mamba_transfer_indices(op, i)
             logger.debug(
                 "[prefill][_decode] rid=%s aux_index=%d kv_indices(len=%d)=%s bootstrap_token=%d",
                 request_id,
@@ -245,8 +276,18 @@ class DisaggPrefillExecutor:
             )
 
     def register(self, request_id: str, bootstrap_info: BootstrapInfo):
-        self._local_states[request_id] = KVPoll.Bootstrapping
+        self._local_states[request_id] = TransferPoll.Bootstrapping
         self._bootstrap(request_id, bootstrap_info)
+
+    def abort(self, request_id: str, bootstrap_info: BootstrapInfo) -> None:
+        """EPD: the prefill aborted this request before registering a KV sender
+        (embedding receive timed out). Signal the dual-dispatched decode so its KV
+        receiver fails instead of waiting forever. No sender was registered, so
+        there is nothing to tear down on this side."""
+        self.kv_manager.abort_room(
+            bootstrap_info.bootstrap_room,
+            f"EPD: prefill aborted request {request_id} (embedding receive timed out)",
+        )
 
     def execute(self, op):
         self._dispatcher(op)
@@ -260,25 +301,25 @@ class DisaggPrefillExecutor:
         to_remove = []
         for req_id, poll in zip(list(self.senders.keys()), polls):
             if (
-                self._local_states[req_id] == KVPoll.Bootstrapping
-                and poll == KVPoll.Bootstrapped
+                self._local_states[req_id] == TransferPoll.Bootstrapping
+                and poll == TransferPoll.Bootstrapped
             ):
                 logger.debug(
                     "[prefill][generate_events] rid=%s -> BootstrappedEvent", req_id
                 )
                 events.append(PD.BootstrappedEvent(req_id))
-                self._local_states[req_id] = KVPoll.Bootstrapped
-            elif poll == KVPoll.Failed:
+                self._local_states[req_id] = TransferPoll.Bootstrapped
+            elif poll == TransferPoll.Failed:
                 logger.warning(
                     "[prefill][generate_events] rid=%s -> FailedEvent", req_id
                 )
                 events.append(PD.FailedEvent(req_id))
                 to_remove.append(req_id)
             elif (
-                self._local_states[req_id] == KVPoll.Bootstrapped
-                and poll == KVPoll.Success
+                self._local_states[req_id] == TransferPoll.Bootstrapped
+                and poll == TransferPoll.Success
             ):
-                self._local_states[req_id] = KVPoll.Success
+                self._local_states[req_id] = TransferPoll.Success
                 logger.debug(
                     "[prefill][generate_events] rid=%s -> SucceededEvent", req_id
                 )

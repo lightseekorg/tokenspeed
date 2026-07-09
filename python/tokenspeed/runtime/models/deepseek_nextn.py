@@ -34,7 +34,7 @@ from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
-from tokenspeed.runtime.layers.moe.checkpoint import (
+from tokenspeed.runtime.layers.moe import (
     ExpertCheckpointSchema,
     build_moe_checkpoint_loader,
 )
@@ -142,7 +142,7 @@ class DeepseekModelNextN(nn.Module):
 
         if not ctx.forward_mode.is_idle():
             if not ENABLE_CP:
-                hidden_states = self.decoder.comm_manager.final_norm(
+                hidden_states, _ = self.decoder.comm_manager.final_norm(
                     hidden_states, residual, ctx, self.shared_head.norm
                 )
             else:
@@ -203,6 +203,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         self.logits_processor = LogitsProcessor(
             config,
             skip_all_gather=self.mapping.attn.has_dp,
+            do_argmax=True,
             tp_rank=self.mapping.attn.tp_rank,
             tp_size=self.mapping.attn.tp_size,
             tp_group=self.mapping.attn.tp_group,
@@ -271,7 +272,8 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         for name, loaded_weight in weights:
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers
-                assert num_nextn_layers == 1, "Only 1 nextn layer is supported"
+                if num_nextn_layers != 1:
+                    raise ValueError("Only 1 nextn layer is supported")
                 nextn_layer_prefix = "model.layers.0"
                 if num_nextn_layers != self.config.num_hidden_layers:
                     if name.startswith("model.layers"):

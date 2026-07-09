@@ -1,9 +1,7 @@
-# Adapted from meituan-longcat/SGLang-FluentLLM.
-# This file has been modified for this repository.
-# This file may incorporate material from ModelTC/lightllm,
-# vllm-project/vllm, and sgl-project/sglang, as identified in
-# python/THIRDPARTYNOTICES.
-
+# SPDX-License-Identifier: MIT AND Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 LightSeek Foundation
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
 # Copyright (c) 2026 LightSeek Foundation
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -29,12 +27,10 @@ import torch
 from torch.nn.parameter import Parameter
 
 from tokenspeed.runtime.distributed.comm_ops import all_gather, all_reduce
-from tokenspeed.runtime.distributed.process_group_manager import (
-    process_group_manager as pg_manager,
-)
 from tokenspeed.runtime.distributed.utils import divide, split_tensor_along_last_dim
 from tokenspeed.runtime.layers.dense import (
     Fp8LinearMethod,
+    Mxfp4LinearMethod,
     Nvfp4LinearMethod,
     UnquantizedLinearMethod,
     W8A8Fp8LinearMethod,
@@ -60,7 +56,10 @@ from tokenspeed.runtime.layers.quantization.base_config import (
 from tokenspeed.runtime.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
 )
-from tokenspeed.runtime.layers.quantization.utils import should_ignore_quant_layer
+from tokenspeed.runtime.layers.quantization.utils import (
+    should_exclude_quant_module,
+    should_ignore_quant_layer,
+)
 from tokenspeed.runtime.utils import get_colorful_logger, set_weight_attrs
 
 logger = get_colorful_logger(__name__)
@@ -172,18 +171,22 @@ class LinearBase(torch.nn.Module):
 
         self.quant_config = quant_config
         if quant_config is None or should_ignore_quant_layer(
-            prefix=prefix, ignored_layers=getattr(quant_config, "ignored_layers", [])
+            prefix=prefix, ignored_layers=quant_config.ignored_layers
         ):
             self.quant_method: QuantizeMethodBase | None = UnquantizedLinearMethod()
         elif isinstance(quant_config, Nvfp4Config):
             # For NVFP4, excluded layers use unquantized (bf16)
-            if quant_config.is_layer_excluded(prefix):
+            if should_exclude_quant_module(prefix, quant_config.exclude_modules):
                 self.quant_method = UnquantizedLinearMethod()
             else:
                 self.quant_method = Nvfp4LinearMethod(quant_config)
         elif isinstance(quant_config, Mxfp4Config):
-            # mxfp4 only applies to MoE layers, not dense linear layers
-            self.quant_method = UnquantizedLinearMethod()
+            if getattr(quant_config, "use_dynamic_mxfp4_activations", False):
+                self.quant_method = Mxfp4LinearMethod(quant_config)
+            else:
+                # Existing MXFP4 support applies to MoE weights; dense weights
+                # remain unquantized unless the checkpoint stores dense MXFP4.
+                self.quant_method = UnquantizedLinearMethod()
         elif isinstance(quant_config, CompressedTensorsConfig):
             self.quant_method = quant_config.get_quant_method(self, prefix)
         else:

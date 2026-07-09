@@ -1,8 +1,7 @@
-# Adapted from meituan-longcat/SGLang-FluentLLM.
-# This file has been modified for this repository.
-# This file may incorporate material from ModelTC/lightllm,
-# vllm-project/vllm, and sgl-project/sglang, as identified in
-# python/THIRDPARTYNOTICES.
+# SPDX-License-Identifier: MIT AND Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 LightSeek Foundation
+# SPDX-FileCopyrightText: Copyright 2023-2024 SGLang Team
+#
 # Copyright (c) 2026 LightSeek Foundation
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -149,16 +148,14 @@ class Engine(EngineBase):
         sampling_params: list[dict] | dict | None = None,
         # The token ids for text; one can either specify text or input_ids.
         input_ids: list[list[int]] | list[int] | None = None,
-        # The image input. It can be an image instance, file name, URL, or base64 encoded string.
-        # Can be formatted as:
-        # - Single image for a single request
-        # - List of images (one per request in a batch)
-        # - List of lists of images (multiple images per request)
-        # See also python/tokenspeed/runtime/utils/common.py:load_image for more details.
-        return_logprob: list[bool] | bool | None = False,
+        # SGLang-compatible logprob controls; vLLM-compatible requests use
+        # sampling_params["logprobs"].
+        return_logprob: list[bool] | bool | None = None,
         logprob_start_len: list[int] | int | None = None,
         top_logprobs_num: list[int] | int | None = None,
         token_ids_logprob: list[list[int]] | list[int] | None = None,
+        return_text_in_logprobs: bool = False,
+        logprob_format: list[str | None] | str | None = None,
         custom_logit_processor: list[str] | str | None = None,
         return_hidden_states: bool = False,
         stream: bool = False,
@@ -182,12 +179,6 @@ class Engine(EngineBase):
                     f"data_parallel_rank must be less than dp_size: {self.server_args.mapping.attn.dp_size}"
                 )
 
-        if self.tokenizer_manager.server_args.speculative_algorithm is not None:
-            return_logprob = False
-            logprob_start_len = None
-            top_logprobs_num = None
-            token_ids_logprob = None
-
         obj = GenerateReqInput(
             text=prompt,
             input_ids=input_ids,
@@ -196,6 +187,8 @@ class Engine(EngineBase):
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
             token_ids_logprob=token_ids_logprob,
+            return_text_in_logprobs=return_text_in_logprobs,
+            logprob_format=logprob_format,
             custom_logit_processor=custom_logit_processor,
             return_hidden_states=return_hidden_states,
             stream=stream,
@@ -218,16 +211,13 @@ class Engine(EngineBase):
         input_embeds: torch.Tensor = None,
         input_multi_ids: list[list[int]] = None,
         input_extra_infos: list[dict] = None,
-        # The image input. It can be an image instance, file name, URL, or base64 encoded string.
-        # Can be formatted as:
-        # - Single image for a single request
-        # - List of images (one per request in a batch)
-        # - List of lists of images (multiple images per request)
-        # See also python/tokenspeed/runtime/utils/common.py:load_image for more details.
-        return_logprob: list[bool] | bool | None = False,
+        # Same legacy logprob controls as generate().
+        return_logprob: list[bool] | bool | None = None,
         logprob_start_len: list[int] | int | None = None,
         top_logprobs_num: list[int] | int | None = None,
         token_ids_logprob: list[list[int]] | list[int] | None = None,
+        return_text_in_logprobs: bool = False,
+        logprob_format: list[str | None] | str | None = None,
         custom_logit_processor: list[str] | str | None = None,
         return_hidden_states: bool = False,
         stream: bool = False,
@@ -242,12 +232,6 @@ class Engine(EngineBase):
         Please refer to ``GenerateReqInput`` for the documentation.
         """
 
-        if self.tokenizer_manager.server_args.speculative_algorithm is not None:
-            return_logprob = False
-            logprob_start_len = None
-            top_logprobs_num = None
-            token_ids_logprob = None
-
         obj = GenerateReqInput(
             text=prompt,
             input_ids=input_ids,
@@ -259,6 +243,8 @@ class Engine(EngineBase):
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
             token_ids_logprob=token_ids_logprob,
+            return_text_in_logprobs=return_text_in_logprobs,
+            logprob_format=logprob_format,
             return_hidden_states=return_hidden_states,
             stream=stream,
             custom_logit_processor=custom_logit_processor,
@@ -423,6 +409,10 @@ class Engine(EngineBase):
         obj = ResumeMemoryOccupationReqInput(tags=tags)
         return self.llm.run(self.tokenizer_manager.resume_memory_occupation(obj))
 
+    def is_sleeping(self) -> bool:
+        """Return whether any GPU memory is currently released (data-plane sleep)."""
+        return self.llm.run(self.tokenizer_manager.is_sleeping())
+
     """
     Execute an RPC call on all scheduler processes.
     """
@@ -431,8 +421,10 @@ class Engine(EngineBase):
         obj = RpcReqInput(method=method, parameters=kwargs)
         self.send_to_rpc.send_pyobj(obj)
         recv_req = self.send_to_rpc.recv_pyobj(zmq.BLOCKY)
-        assert isinstance(recv_req, RpcReqOutput)
-        assert recv_req.success, recv_req.message
+        if not isinstance(recv_req, RpcReqOutput):
+            raise TypeError(f"Expected RpcReqOutput, got {type(recv_req).__name__}.")
+        if not recv_req.success:
+            raise RuntimeError(recv_req.message)
 
     def save_remote_model(self, **kwargs):
         self.collective_rpc("save_remote_model", **kwargs)
@@ -447,7 +439,6 @@ def _set_envs_and_config(server_args: ServerArgs):
     os.environ["NCCL_CUMEM_ENABLE"] = str(int(server_args.enable_symm_mem))
     if not server_args.enable_symm_mem:
         os.environ["NCCL_NVLS_ENABLE"] = str(int(server_args.enable_nccl_nvls))
-    os.environ["TORCH_NCCL_AVOID_RECORD_STREAMS"] = "1"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
     os.environ["CUDA_MODULE_LOADING"] = "AUTO"
     if not server_args.disable_tf32:
@@ -546,7 +537,10 @@ def _launch_subprocesses(
 
         for reader in scheduler_pipe_readers:
             data = reader.recv()
-            assert data["status"] == "ready"
+            if data.get("status") != "ready":
+                raise RuntimeError(
+                    "Initialization failed. Please see the error messages above."
+                )
 
         if not envs.TOKENSPEED_BLOCK_NONZERO_RANK_CHILDREN.get():
             # When using `Engine` as a Python API, we don't want to block here.

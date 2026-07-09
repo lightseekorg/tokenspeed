@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from tokenspeed.runtime.execution.weight_loader import WeightLoader
+from tokenspeed.runtime.layers.moe.utils import initialize_moe_config
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.env import global_server_args_dict_update
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -91,8 +92,6 @@ class ModelRunner:
                     )
 
         global_server_args_dict_update(server_args)
-        from tokenspeed.runtime.layers.moe.utils import initialize_moe_config
-
         initialize_moe_config(server_args)
 
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -135,6 +134,7 @@ class ModelRunner:
         seq_lens: torch.Tensor | None = None,
         extend_prefix_lens: torch.Tensor | None = None,
         captured_hidden_states: torch.Tensor | None = None,
+        input_embeds: torch.Tensor | None = None,
         multimodal_context: MultimodalForwardContext | None = None,
         spec_step_idx: int | None = None,
     ) -> LogitsProcessorOutput:
@@ -149,6 +149,8 @@ class ModelRunner:
             kwargs["get_embedding"] = True
         if captured_hidden_states is not None:
             kwargs["captured_hidden_states"] = captured_hidden_states
+        if input_embeds is not None:
+            kwargs["input_embeds"] = input_embeds
         if multimodal_context is not None:
             kwargs["multimodal_context"] = multimodal_context
         if spec_step_idx is not None and getattr(

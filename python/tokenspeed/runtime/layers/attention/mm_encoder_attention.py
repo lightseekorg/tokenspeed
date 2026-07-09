@@ -34,7 +34,8 @@ from __future__ import annotations
 
 import functools
 import logging
-from typing import Any, Callable, Optional, Tuple
+from collections.abc import Callable
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -64,6 +65,10 @@ if _is_nvidia:
     )
 
 from tokenspeed_kernel.ops.attention.triton.context import context_attention_fwd
+from tokenspeed_kernel.ops.attention.triton.qkv_rotary import (
+    packed_qkv_complex_rotary,
+    packed_qkv_neox_rotary,
+)
 
 # CUDA-graph bucketing for the cuDNN vision prefill backend: batch and max
 # seqlen are quantized so a small set of captured graphs covers the request
@@ -99,8 +104,8 @@ def _varlen_metadata(
     seq_len: int,
     *,
     device: torch.device,
-    max_seqlen: Optional[int],
-) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    max_seqlen: int | None,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
     """Resolve cu_seqlens / seq_lens / max_seqlen shared by the varlen backends.
 
     ``max_seqlen`` is honored when the caller supplies it (the capture-safe
@@ -129,8 +134,8 @@ def vision_attn_triton(
     cu_seqlens: torch.Tensor | None,
     bsz: int,
     seq_len: int,
-    softmax_scale: Optional[float] = None,
-    max_seqlen: Optional[int] = None,
+    softmax_scale: float | None = None,
+    max_seqlen: int | None = None,
     **_: Any,
 ) -> torch.Tensor:
     """Triton context attention without a causal mask."""
@@ -160,8 +165,8 @@ def vision_attn_fa3(
     cu_seqlens: torch.Tensor | None,
     bsz: int,
     seq_len: int,
-    softmax_scale: Optional[float] = None,
-    max_seqlen: Optional[int] = None,
+    softmax_scale: float | None = None,
+    max_seqlen: int | None = None,
     **_: Any,
 ) -> torch.Tensor:
     cu_seqlens, _, max_seqlen = _varlen_metadata(
@@ -187,8 +192,8 @@ def vision_attn_fa4(
     cu_seqlens: torch.Tensor | None,
     bsz: int,
     seq_len: int,
-    softmax_scale: Optional[float] = None,
-    max_seqlen: Optional[int] = None,
+    softmax_scale: float | None = None,
+    max_seqlen: int | None = None,
     **_: Any,
 ) -> torch.Tensor:
     cu_seqlens, _, max_seqlen = _varlen_metadata(
@@ -215,10 +220,10 @@ def vision_attn_flashinfer_cudnn(
     v: torch.Tensor,
     *,
     cu_seqlens: torch.Tensor | None,
-    softmax_scale: Optional[float] = None,
+    softmax_scale: float | None = None,
     max_seqlen: Any = None,
-    sequence_lengths: Optional[torch.Tensor] = None,
-    workspace_buffer: Optional[torch.Tensor] = None,
+    sequence_lengths: torch.Tensor | None = None,
+    workspace_buffer: torch.Tensor | None = None,
     **_: Any,
 ) -> torch.Tensor:
     """cuDNN prefill backend. The caller (vision tower with cuDNN graph capture)
@@ -226,11 +231,14 @@ def vision_attn_flashinfer_cudnn(
     ``[qk | v | o]`` of length ``batch+1`` each, plus ``sequence_lengths`` per
     real (un-padded) sequence and ``max_seqlen`` as the bucketed budget.
     """
-    assert (
-        sequence_lengths is not None
-        and max_seqlen is not None
-        and isinstance(cu_seqlens, torch.Tensor)
-    ), "flashinfer_cudnn needs sequence_lengths, max_seqlen, and packed indptrs"
+    if (
+        sequence_lengths is None
+        or max_seqlen is None
+        or not isinstance(cu_seqlens, torch.Tensor)
+    ):
+        raise ValueError(
+            "flashinfer_cudnn needs sequence_lengths, max_seqlen, and packed indptrs"
+        )
 
     # cuDNN wants a python int for the seq budget.
     max_seqlen = int(
@@ -246,7 +254,11 @@ def vision_attn_flashinfer_cudnn(
     seq_lens = sequence_lengths.view(-1).to(device=q.device, dtype=torch.int32)
     batch = seq_lens.numel()
     packed = cu_seqlens.view(-1).to(device=q.device, dtype=torch.int32)
-    assert packed.numel() == 3 * (batch + 1)
+    expected_packed = 3 * (batch + 1)
+    if packed.numel() != expected_packed:
+        raise ValueError(
+            f"Expected packed indptr length {expected_packed}, got {packed.numel()}."
+        )
     chunk = batch + 1
     qk_off = packed[:chunk].view(chunk, 1, 1, 1)
     v_off = packed[chunk : 2 * chunk].view(chunk, 1, 1, 1)
@@ -304,7 +316,7 @@ def _default_vision_attn_backend() -> str:
 
 
 @functools.lru_cache(maxsize=None)
-def _resolve_backend(name: Optional[str]) -> Callable[..., torch.Tensor]:
+def _resolve_backend(name: str | None) -> Callable[..., torch.Tensor]:
     """Resolve a backend name to its dispatch function.
 
     ``None`` falls back to the platform default; an unknown or platform-
@@ -340,15 +352,16 @@ class VisionAttention(nn.Module):
         embed_dim: int,
         num_heads: int,
         mapping: Mapping,
-        head_size: Optional[int] = None,
-        quant_config: Optional[QuantizationConfig] = None,
+        head_size: int | None = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         proj_bias: bool = True,
         qkv_bias: bool = True,
         customized_position_embedding_applier: Callable[
-            [torch.Tensor, torch.Tensor, Any, Any], Tuple[torch.Tensor, torch.Tensor]
+            [torch.Tensor, torch.Tensor, Any, Any], tuple[torch.Tensor, torch.Tensor]
         ] = None,
-        workspace_buffer: Optional[torch.Tensor] = None,
+        position_embedding_mode: str | None = None,
+        workspace_buffer: torch.Tensor | None = None,
         mm_attention_backend: str | None = None,
     ):
         super().__init__()
@@ -370,7 +383,21 @@ class VisionAttention(nn.Module):
         self.customized_position_embedding_applier = (
             customized_position_embedding_applier
         )
+        if position_embedding_mode not in (None, "complex_rope"):
+            raise ValueError(
+                f"Unknown vision position embedding mode: {position_embedding_mode}"
+            )
+        self.position_embedding_mode = position_embedding_mode
         self._backend_fn = _resolve_backend(mm_attention_backend)
+        self._use_packed_qkv_complex_rotary = (
+            self._backend_fn is vision_attn_fa4
+            and self.position_embedding_mode == "complex_rope"
+        )
+        self._use_packed_qkv_rotary = (
+            self._backend_fn is vision_attn_fa4
+            and self.customized_position_embedding_applier is None
+        )
+        self._copy_v_after_packed_qkv_rotary = False
         self._workspace_buffer = workspace_buffer
 
         self.qkv_proj = QKVParallelLinear(
@@ -400,10 +427,10 @@ class VisionAttention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        cu_seqlens: Optional[torch.Tensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        rotary_pos_emb_cos: Optional[torch.Tensor] = None,
-        rotary_pos_emb_sin: Optional[torch.Tensor] = None,
+        cu_seqlens: torch.Tensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        rotary_pos_emb_cos: torch.Tensor | None = None,
+        rotary_pos_emb_sin: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         r"""
@@ -426,27 +453,70 @@ class VisionAttention(nn.Module):
         )
 
         qkv, _ = self.qkv_proj(x)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        q = q.reshape(bsz * s, head, -1).contiguous()
-        k = k.reshape(bsz * s, kv_head, -1).contiguous()
-        v = v.reshape(bsz * s, kv_head, -1).contiguous()
+        use_packed_qkv_rotary = (
+            self._use_packed_qkv_rotary
+            and position_embeddings is None
+            and rotary_pos_emb_cos is not None
+            and rotary_pos_emb_sin is not None
+        )
+        use_packed_qkv_complex_rotary = (
+            self._use_packed_qkv_complex_rotary and position_embeddings is not None
+        )
+        cos = rotary_pos_emb_cos if use_packed_qkv_rotary else None
+        sin = rotary_pos_emb_sin if use_packed_qkv_rotary else None
 
-        cos = None
-        sin = None
+        if use_packed_qkv_rotary:
+            if cos.size(-1) * 2 == self.head_size:
+                cos = torch.cat([cos, cos], dim=-1)
+                sin = torch.cat([sin, sin], dim=-1)
+            q, k, v = packed_qkv_neox_rotary(
+                qkv,
+                self.q_size,
+                self.kv_size,
+                head,
+                self.head_size,
+                cos,
+                sin,
+                copy_v=self._copy_v_after_packed_qkv_rotary,
+            )
+        elif use_packed_qkv_complex_rotary:
+            q, k, v = packed_qkv_complex_rotary(
+                qkv,
+                self.q_size,
+                self.kv_size,
+                head,
+                self.head_size,
+                position_embeddings,
+                copy_v=self._copy_v_after_packed_qkv_rotary,
+            )
+        else:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        if position_embeddings is not None:
-            if self.customized_position_embedding_applier is not None:
-                q, k = self.customized_position_embedding_applier(
-                    q, k, position_embeddings, x_shape
-                )
-            else:
-                cos, sin = position_embeddings
-        elif rotary_pos_emb_cos is not None and rotary_pos_emb_sin is not None:
-            cos = rotary_pos_emb_cos
-            sin = rotary_pos_emb_sin
+            q = q.reshape(bsz * s, head, -1)
+            k = k.reshape(bsz * s, kv_head, -1)
+            v = v.reshape(bsz * s, kv_head, -1)
 
-        if cos is not None and sin is not None:
+            cos = None
+            sin = None
+
+            if position_embeddings is not None:
+                if self.customized_position_embedding_applier is not None:
+                    q, k = self.customized_position_embedding_applier(
+                        q, k, position_embeddings, x_shape
+                    )
+                else:
+                    cos, sin = position_embeddings
+            elif rotary_pos_emb_cos is not None and rotary_pos_emb_sin is not None:
+                cos = rotary_pos_emb_cos
+                sin = rotary_pos_emb_sin
+
+        if (
+            not use_packed_qkv_rotary
+            and not use_packed_qkv_complex_rotary
+            and cos is not None
+            and sin is not None
+        ):
             original_shape = q.shape
 
             # [total_tokens, head, head_size]

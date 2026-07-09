@@ -23,22 +23,24 @@ from tokenspeed_kernel.profiling import bootstrap_profiling_from_env
 bootstrap_profiling_from_env()
 
 from tokenspeed_kernel.ops.attention import (
+    GdnCheckpointLayout,
+    GdnChunkPrefillResult,
     attn_merge_state,
-    mha_decode_scheduler_metadata,
+    dsa_decode,
+    dsa_decode_topk,
+    dsa_plan,
+    dsa_prefill,
+    dsa_prefill_topk,
+    gdn_chunk_prefill,
     mha_decode_with_kvcache,
     mha_extend_with_kvcache,
+    mha_plan,
     mha_prefill,
     mla_decode_with_kvcache,
     mla_prefill,
 )
 from tokenspeed_kernel.ops.gemm import mm
-from tokenspeed_kernel.ops.moe import (
-    moe_combine,
-    moe_dispatch,
-    moe_experts,
-    moe_fused,
-    moe_route,
-)
+from tokenspeed_kernel.ops.moe import moe_apply, moe_plan, moe_process_weights
 from tokenspeed_kernel.ops.quantization import (
     quantize_fp8,
     quantize_fp8_with_scale,
@@ -47,24 +49,34 @@ from tokenspeed_kernel.ops.quantization import (
     quantize_nvfp4,
 )
 from tokenspeed_kernel.ops.sampling import argmax
+from tokenspeed_kernel.ops.transform import hadamard_transform
+from tokenspeed_kernel.selection import NoKernelFoundError
 
 __all__ = [
+    # exceptions
+    "NoKernelFoundError",
     # gemm
     "mm",
-    # moe
-    "moe_route",
-    "moe_dispatch",
-    "moe_experts",
-    "moe_combine",
-    "moe_fused",
     # attention
+    "mha_plan",
     "mha_prefill",
     "mha_extend_with_kvcache",
     "mha_decode_with_kvcache",
     "mla_prefill",
     "mla_decode_with_kvcache",
+    "dsa_prefill",
+    "dsa_decode",
+    "dsa_prefill_topk",
+    "dsa_decode_topk",
+    "dsa_plan",
     "attn_merge_state",
-    "mha_decode_scheduler_metadata",
+    "gdn_chunk_prefill",
+    "GdnCheckpointLayout",
+    "GdnChunkPrefillResult",
+    # moe
+    "moe_apply",
+    "moe_plan",
+    "moe_process_weights",
     # quantization
     "quantize_fp8",
     "quantize_fp8_with_scale",
@@ -73,4 +85,6 @@ __all__ = [
     "quantize_mxfp4",
     # sampling
     "argmax",
+    # transform
+    "hadamard_transform",
 ]

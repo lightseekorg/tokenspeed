@@ -26,6 +26,7 @@ import logging
 import tokenspeed_kernel.numerics.reference.gemm  # noqa: F401
 import tokenspeed_kernel.ops.gemm.deep_gemm  # noqa: F401
 import tokenspeed_kernel.ops.gemm.flashinfer  # noqa: F401
+import tokenspeed_kernel.ops.gemm.gluon  # noqa: F401
 import tokenspeed_kernel.ops.gemm.triton  # noqa: F401
 import tokenspeed_kernel.ops.gemm.trtllm  # noqa: F401
 import torch
@@ -130,6 +131,21 @@ def _gemm_format_signature(
             a=tensor_format("nvfp4", A.dtype, scale=a_scale),
             b=tensor_format("nvfp4", B.dtype, scale=b_scale),
         )
+    if quant == "mxfp4":
+        a_scale = ScaleFormat(
+            storage_dtype=_scale_storage_dtype(A_scales),
+            granularity="block",
+            block_shape=(32,),
+        )
+        b_scale = ScaleFormat(
+            storage_dtype=_scale_storage_dtype(B_scales),
+            granularity="block",
+            block_shape=(32,),
+        )
+        return format_signature(
+            a=tensor_format("mxfp4", A.dtype, scale=a_scale),
+            b=tensor_format("mxfp4", B.dtype, scale=b_scale),
+        )
     return format_signature(
         a=dense_tensor_format(A.dtype), b=dense_tensor_format(B.dtype)
     )
@@ -150,11 +166,22 @@ def _online_quantize_mxfp8(
     def ensure_row_major_scales(
         qA: torch.Tensor,
         A_scales: torch.Tensor,
+        *,
+        group_major_scales: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # On NVIDIA, the TRT-LLM helper used by per_token_group_quant_fp8
         # returns [num_groups, num_tokens] scales. FlashInfer and Triton GEMMs
         # consume [num_tokens, num_groups].
         expected_groups = (qA.shape[-1] + block_k - 1) // block_k
+        if group_major_scales:
+            if A_scales.dim() != 2 or A_scales.shape[0] != expected_groups:
+                raise ValueError(
+                    "TRTLLM per-token-group quantization returned unexpected "
+                    f"scale shape {tuple(A_scales.shape)} for "
+                    f"tokens={qA.shape[0]}, groups={expected_groups}."
+                )
+            A_scales = A_scales.transpose(0, 1).contiguous()
+            return qA, A_scales
         if (
             A_scales.shape[-1] != expected_groups
             and A_scales.shape[0] == expected_groups
@@ -184,13 +211,15 @@ def _online_quantize_mxfp8(
                 A,
                 block_k,
                 column_major_scales=False,
-            )
+            ),
+            group_major_scales=_platform.is_nvidia,
         )
     elif kernel_name == "triton_mm_fp8_blockscale":
         from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
 
         return ensure_row_major_scales(
-            *per_token_group_quant_fp8(A, block_k, column_major_scales=False)
+            *per_token_group_quant_fp8(A, block_k, column_major_scales=False),
+            group_major_scales=_platform.is_nvidia,
         )
     else:
         raise ValueError(f"No online quantization defined for kernel {kernel_name!r}")
@@ -237,7 +266,7 @@ def mm(
         block_size: Block size for block-wise quantization, e.g.
             ``[128, 128]``
         quant: Explicit quant type override.  One of ``"mxfp8"``,
-            ``"fp8"``, ``"nvfp4"``, ``"none"``.
+            ``"fp8"``, ``"nvfp4"``, ``"mxfp4"``, ``"none"``.
             If ``None``, inferred from input dtypes and scales.
         override: Force selection of a specific kernel by name (e.g.
             ``"cublaslt_mm_nvfp4"``). Bypasses heuristic scoring.
@@ -245,15 +274,20 @@ def mm(
     """
     out_dtype = out_dtype or A.dtype
 
-    K = A.shape[-1]
     M = A.shape[0]
-    N = B.shape[-1] if B.shape[0] == K else B.shape[0]
+    if quant == "mxfp4":
+        K = A.shape[-1] * 2
+        N = B.shape[0]
+    else:
+        K = A.shape[-1]
+        N = B.shape[-1] if B.shape[0] == K else B.shape[0]
 
     traits: dict[str, object] = {
         "n_align_16": N % 16 == 0,
         "k_align_16": K % 16 == 0,
         "n_align_64": N % 64 == 0,
         "n_align_128": N % 128 == 0,
+        "k_align_64": K % 64 == 0,
         "k_align_128": K % 128 == 0,
     }
 

@@ -159,7 +159,8 @@ def get_available_gpu_memory(
     """
     if device == "cuda":
         num_gpus = torch.cuda.device_count()
-        assert gpu_id < num_gpus
+        if gpu_id >= num_gpus:
+            raise ValueError(f"gpu_id={gpu_id} must be less than num_gpus={num_gpus}.")
 
         if torch.cuda.current_device() != gpu_id:
             logger.debug(
@@ -258,9 +259,9 @@ def _load_image(
             encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
             image_tensor = decode_jpeg(encoded_image, device="cuda")
             return image_tensor
-        except Exception as e:
+        except Exception as exc:
             logger.warning(
-                f"Failed to decode JPEG on GPU, falling back to CPU. Error: {e}"
+                f"Failed to decode JPEG on GPU, falling back to CPU. Error: {exc}"
             )
     return Image.open(BytesIO(image_bytes))
 
@@ -443,7 +444,7 @@ def configure_logger(server_args, prefix: str = ""):
 
     if TOKENSPEED_LOGGING_CONFIG_PATH := envs.TOKENSPEED_LOGGING_CONFIG_PATH.get():
         if not os.path.exists(TOKENSPEED_LOGGING_CONFIG_PATH):
-            raise Exception(
+            raise FileNotFoundError(
                 "Setting TOKENSPEED_LOGGING_CONFIG_PATH from env with "
                 f"{TOKENSPEED_LOGGING_CONFIG_PATH} but it does not exist!"
             )
@@ -489,7 +490,8 @@ def set_weight_attrs(
     if weight_attrs is None:
         return
     for key, value in weight_attrs.items():
-        assert not hasattr(weight, key), f"Overwriting existing tensor attribute: {key}"
+        if hasattr(weight, key):
+            raise ValueError(f"Overwriting existing tensor attribute: {key}")
         setattr(weight, key, value)
 
 
@@ -719,6 +721,13 @@ def dataclass_to_string_truncated(
 ):
     if skip_names is None:
         skip_names = set()
+    # Summarize tensors/ndarrays by shape — never str() the values (the bare
+    # str() fallthrough below would dump a whole multimodal feature tensor,
+    # bloating the request log).
+    if torch.is_tensor(data):
+        return f"Tensor(shape={tuple(data.shape)}, dtype={data.dtype})"
+    if isinstance(data, np.ndarray):
+        return f"ndarray(shape={tuple(data.shape)}, dtype={data.dtype})"
     if isinstance(data, str):
         if len(data) > max_length:
             half_length = max_length // 2
@@ -726,16 +735,27 @@ def dataclass_to_string_truncated(
         else:
             return f"{repr(data)}"
     elif isinstance(data, (list, tuple)):
+        # Recurse element-wise (was ``str(data)``, which would dump nested
+        # tensors in full) and propagate skip_names.
         if len(data) > max_length:
             half_length = max_length // 2
-            return str(data[:half_length]) + " ... " + str(data[-half_length:])
+            shown = list(data[:half_length]) + ["..."] + list(data[-half_length:])
         else:
-            return str(data)
+            shown = data
+        inner = ", ".join(
+            (
+                "..."
+                if x == "..."
+                else dataclass_to_string_truncated(x, max_length, skip_names)
+            )
+            for x in shown
+        )
+        return "[" + inner + "]"
     elif isinstance(data, dict):
         return (
             "{"
             + ", ".join(
-                f"'{k}': {dataclass_to_string_truncated(v, max_length)}"
+                f"'{k}': {dataclass_to_string_truncated(v, max_length, skip_names)}"
                 for k, v in data.items()
                 if k not in skip_names
             )
@@ -746,7 +766,7 @@ def dataclass_to_string_truncated(
         return (
             f"{data.__class__.__name__}("
             + ", ".join(
-                f"{f.name}={dataclass_to_string_truncated(getattr(data, f.name), max_length)}"
+                f"{f.name}={dataclass_to_string_truncated(getattr(data, f.name), max_length, skip_names)}"
                 for f in fields
                 if f.name not in skip_names
             )
@@ -936,12 +956,14 @@ class Withable(Generic[T]):
 
     @contextmanager
     def with_value(self, new_value: T):
-        assert self._value is None
+        if self._value is not None:
+            raise RuntimeError("Withable value is already set.")
         self._value = new_value
         try:
             yield
         finally:
-            assert self._value is new_value
+            if self._value is not new_value:
+                raise RuntimeError("Withable value changed while context was active.")
             self._value = None
 
 

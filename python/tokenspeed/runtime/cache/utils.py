@@ -50,7 +50,7 @@ def set_mla_kv_buffer_kernel(
     total_dim = nope_dim + rope_dim
     mask = offs < total_dim
 
-    loc = tl.load(loc_ptr + pid_loc)
+    loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
     dst_ptr = kv_buffer_ptr + loc * buffer_stride + offs
 
     if base + BLOCK <= nope_dim:
@@ -99,7 +99,7 @@ def set_mla_kv_buffer_per_loc_kernel(
     pid = tl.program_id(0)
     loc_indices = pid * BLOCK_LOC + tl.arange(0, BLOCK_LOC)
     loc_mask = loc_indices < n_loc
-    locs = tl.load(loc_ptr + loc_indices, mask=loc_mask, other=0)
+    locs = tl.load(loc_ptr + loc_indices, mask=loc_mask, other=0).to(tl.int64)
 
     # Nope tile: [BLOCK_LOC, nope_dim]
     nope_offs = tl.arange(0, nope_dim)
@@ -175,9 +175,10 @@ def set_mla_kv_buffer_triton(
         )
     else:
         BLOCK = 256
-        assert (
-            nope_dim % BLOCK == 0
-        ), f"nope_dim ({nope_dim}) must be a multiple of BLOCK ({BLOCK})"
+        if nope_dim % BLOCK != 0:
+            raise ValueError(
+                f"nope_dim ({nope_dim}) must be a multiple of BLOCK ({BLOCK})"
+            )
         grid = (n_loc, triton.cdiv(nope_dim + rope_dim, BLOCK))
         set_mla_kv_buffer_kernel[grid](
             kv_buffer,
@@ -229,7 +230,7 @@ def get_mla_kv_buffer_kernel(
     total_dim = nope_dim + rope_dim
     mask = offs < total_dim
 
-    loc = tl.load(loc_ptr + pid_loc)
+    loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
     src = tl.load(kv_buffer_ptr + loc * buffer_stride + offs, mask=mask)
 
     if base + BLOCK <= nope_dim:
@@ -269,7 +270,7 @@ def get_mla_kv_buffer_per_loc_kernel(
     pid = tl.program_id(0)
     loc_indices = pid * BLOCK_LOC + tl.arange(0, BLOCK_LOC)
     loc_mask = loc_indices < n_loc
-    locs = tl.load(loc_ptr + loc_indices, mask=loc_mask, other=0)
+    locs = tl.load(loc_ptr + loc_indices, mask=loc_mask, other=0).to(tl.int64)
 
     # Nope tile: [BLOCK_LOC, nope_dim] — gather from kv_buffer at locs.
     nope_offs = tl.arange(0, nope_dim)
@@ -345,9 +346,10 @@ def get_mla_kv_buffer_triton(
         )
     else:
         BLOCK = 256
-        assert (
-            nope_dim % BLOCK == 0
-        ), f"nope_dim ({nope_dim}) must be a multiple of BLOCK ({BLOCK})"
+        if nope_dim % BLOCK != 0:
+            raise ValueError(
+                f"nope_dim ({nope_dim}) must be a multiple of BLOCK ({BLOCK})"
+            )
         grid = (n_loc, triton.cdiv(nope_dim + rope_dim, BLOCK))
         get_mla_kv_buffer_kernel[grid](
             kv_buffer,

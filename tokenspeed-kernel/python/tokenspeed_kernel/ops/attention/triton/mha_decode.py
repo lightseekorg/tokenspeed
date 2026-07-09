@@ -18,8 +18,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import math
+
+import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
+from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 _MIN_BLOCK_KV = 32
 
@@ -52,6 +57,7 @@ def _fwd_kernel_stage1(
     stride_mid_os,
     page_table_stride_b: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
+    MAX_SEQLEN_Q: tl.constexpr,
     WINDOW_LEFT: tl.constexpr,
     kv_group_num: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
@@ -62,7 +68,9 @@ def _fwd_kernel_stage1(
     Lk: tl.constexpr,
     Lv: tl.constexpr,
 ):
-    cur_batch = tl.program_id(0)
+    cur_q = tl.program_id(0)
+    cur_batch = cur_q // MAX_SEQLEN_Q
+    q_pos = cur_q - cur_batch * MAX_SEQLEN_Q
     cur_head = tl.program_id(1)
     split_kv_id = tl.program_id(2)
 
@@ -74,13 +82,17 @@ def _fwd_kernel_stage1(
     mask_dv = offs_dv < Lv
 
     cache_len = tl.load(cache_seqlens + cur_batch)
+    cache_len = cache_len - (MAX_SEQLEN_Q - 1 - q_pos)
+    cache_len = tl.maximum(cache_len, 0)
+    # WINDOW_LEFT is exclusive of the current token, so keep WINDOW_LEFT + 1
+    # keys (window_left left keys plus the current one).
     cur_batch_seq_len = (
-        tl.minimum(cache_len, WINDOW_LEFT) if WINDOW_LEFT >= 0 else cache_len
+        tl.minimum(cache_len, WINDOW_LEFT + 1) if WINDOW_LEFT >= 0 else cache_len
     )
     kv_start_offset = cache_len - cur_batch_seq_len
     kv_splits = tl.load(num_kv_splits + cur_batch)
 
-    off_q = cur_batch * stride_qbs + cur_head * stride_qh + offs_d
+    off_q = cur_q * stride_qbs + cur_head * stride_qh + offs_d
 
     kv_len_per_split = (
         tl.cdiv(tl.cdiv(cur_batch_seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
@@ -104,7 +116,8 @@ def _fwd_kernel_stage1(
                 mask=offs_n < split_kv_end,
                 other=0,
             )
-            kv_loc = physical_pages * PAGE_SIZE + page_offsets
+            # int64 to avoid address overflow for large (>int32 range) KV caches
+            kv_loc = physical_pages.to(tl.int64) * PAGE_SIZE + page_offsets
             offs_buf_k = (
                 kv_loc[:, None] * stride_buf_kbs
                 + cur_kv_head * stride_buf_kh
@@ -144,7 +157,7 @@ def _fwd_kernel_stage1(
             e_max = n_e_max
 
         offs_mid_o = (
-            cur_batch * stride_mid_ob
+            cur_q * stride_mid_ob
             + cur_head * stride_mid_oh
             + split_kv_id * stride_mid_os
             + offs_dv
@@ -157,7 +170,7 @@ def _fwd_kernel_stage1(
         )
 
         offs_mid_o_1 = (
-            cur_batch * stride_mid_ob
+            cur_q * stride_mid_ob
             + cur_head * stride_mid_oh
             + split_kv_id * stride_mid_os
         ) // Lv
@@ -180,6 +193,7 @@ def _decode_att_m_fwd(
     max_kv_splits,
     page_table_stride_b,
     page_size,
+    max_seqlen_q,
     window_left,
     sm_scale,
     logit_cap,
@@ -194,9 +208,9 @@ def _decode_att_m_fwd(
     Lk = k_buffer.shape[-1]
     Lv = v_buffer.shape[-1]
 
-    batch, head_num = cache_seqlens.shape[0], q.shape[1]
+    total_q, head_num = q.shape[0], q.shape[1]
 
-    grid = (batch, head_num, MAX_KV_SPLITS)
+    grid = (total_q, head_num, MAX_KV_SPLITS)
     kv_group_num = q.shape[1] // k_buffer.shape[1]
 
     if kv_group_num == 1:
@@ -230,7 +244,8 @@ def _decode_att_m_fwd(
         att_out.stride(2),
         page_table_stride_b,
         page_size,
-        window_left,
+        MAX_SEQLEN_Q=max_seqlen_q,
+        WINDOW_LEFT=window_left,
         kv_group_num=kv_group_num,
         BLOCK_DMODEL=BLOCK_DMODEL,
         BLOCK_DV=BLOCK_DV,
@@ -266,6 +281,7 @@ def _fwd_grouped_kernel_stage1(
     stride_mid_os,
     page_table_stride_b: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
+    MAX_SEQLEN_Q: tl.constexpr,
     WINDOW_LEFT: tl.constexpr,
     kv_group_num: tl.constexpr,
     q_head_num: tl.constexpr,
@@ -279,7 +295,9 @@ def _fwd_grouped_kernel_stage1(
     Lk: tl.constexpr,
     Lv: tl.constexpr,
 ):
-    cur_batch = tl.program_id(0)
+    cur_q = tl.program_id(0)
+    cur_batch = cur_q // MAX_SEQLEN_Q
+    q_pos = cur_q - cur_batch * MAX_SEQLEN_Q
     cur_head_id = tl.program_id(1)
     cur_kv_head = cur_head_id // tl.cdiv(kv_group_num, BLOCK_H)
     split_kv_id = tl.program_id(2)
@@ -298,20 +316,22 @@ def _fwd_grouped_kernel_stage1(
     mask_dv = offs_dv < Lv
 
     cache_len = tl.load(cache_seqlens + cur_batch)
+    cache_len = cache_len - (MAX_SEQLEN_Q - 1 - q_pos)
+    cache_len = tl.maximum(cache_len, 0)
+    # WINDOW_LEFT is exclusive of the current token, so keep WINDOW_LEFT + 1
+    # keys (window_left left keys plus the current one).
     cur_batch_seq_len = (
-        tl.minimum(cache_len, WINDOW_LEFT) if WINDOW_LEFT >= 0 else cache_len
+        tl.minimum(cache_len, WINDOW_LEFT + 1) if WINDOW_LEFT >= 0 else cache_len
     )
     kv_start_offset = cache_len - cur_batch_seq_len
     kv_splits = tl.load(num_kv_splits + cur_batch)
 
-    offs_q = cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_d[None, :]
+    offs_q = cur_q * stride_qbs + cur_head[:, None] * stride_qh + offs_d[None, :]
 
     if BLOCK_DPE > 0:
         offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
         mask_dpe = offs_dpe < Lk
-        off_qpe = (
-            cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_dpe[None, :]
-        )
+        off_qpe = cur_q * stride_qbs + cur_head[:, None] * stride_qh + offs_dpe[None, :]
 
     kv_len_per_split = (
         tl.cdiv(tl.cdiv(cur_batch_seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
@@ -339,7 +359,8 @@ def _fwd_grouped_kernel_stage1(
                 mask=offs_n < split_kv_end,
                 other=0,
             )
-            kv_loc = physical_pages * PAGE_SIZE + page_offsets
+            # int64 to avoid address overflow for large (>int32 range) KV caches
+            kv_loc = physical_pages.to(tl.int64) * PAGE_SIZE + page_offsets
             offs_buf_k = (
                 kv_loc[None, :] * stride_buf_kbs
                 + cur_kv_head * stride_buf_kh
@@ -393,7 +414,7 @@ def _fwd_grouped_kernel_stage1(
             e_max = n_e_max
 
         offs_mid_o = (
-            cur_batch * stride_mid_ob
+            cur_q * stride_mid_ob
             + cur_head[:, None] * stride_mid_oh
             + split_kv_id * stride_mid_os
             + offs_dv[None, :]
@@ -406,7 +427,7 @@ def _fwd_grouped_kernel_stage1(
         )
 
         offs_mid_o_1 = (
-            cur_batch * stride_mid_ob
+            cur_q * stride_mid_ob
             + cur_head * stride_mid_oh
             + split_kv_id * stride_mid_os
         ) // Lv
@@ -430,6 +451,7 @@ def _decode_grouped_att_m_fwd(
     max_kv_splits,
     page_table_stride_b,
     page_size,
+    max_seqlen_q,
     window_left,
     sm_scale,
     logit_cap,
@@ -455,13 +477,13 @@ def _decode_grouped_att_m_fwd(
         BLOCK_DPE = 0
     BLOCK_DV = triton.next_power_of_2(Lv)
 
-    batch, head_num = cache_seqlens.shape[0], q.shape[1]
+    total_q, head_num = q.shape[0], q.shape[1]
     kv_group_num = q.shape[1] // k_buffer.shape[1]
 
     BLOCK_H = 16
     MAX_KV_SPLITS = max_kv_splits
     grid = (
-        batch,
+        total_q,
         triton.cdiv(head_num, min(BLOCK_H, kv_group_num)),
         MAX_KV_SPLITS,
     )
@@ -493,7 +515,8 @@ def _decode_grouped_att_m_fwd(
         att_out.stride(2),
         page_table_stride_b,
         page_size,
-        window_left,
+        MAX_SEQLEN_Q=max_seqlen_q,
+        WINDOW_LEFT=window_left,
         kv_group_num=kv_group_num,
         q_head_num=head_num,
         BLOCK_DMODEL=BLOCK_DMODEL,
@@ -524,6 +547,7 @@ def _fwd_kernel_stage2(
     stride_mid_os,
     stride_obs,
     stride_oh,
+    MAX_SEQLEN_Q: tl.constexpr,
     MAX_KV_SPLITS: tl.constexpr,
     MIN_BLOCK_KV: tl.constexpr,
     BLOCK_DV: tl.constexpr,
@@ -531,12 +555,18 @@ def _fwd_kernel_stage2(
     WINDOW_LEFT: tl.constexpr,
     HAS_SINK: tl.constexpr,
 ):
-    cur_batch = tl.program_id(0)
+    cur_q = tl.program_id(0)
+    cur_batch = cur_q // MAX_SEQLEN_Q
+    q_pos = cur_q - cur_batch * MAX_SEQLEN_Q
     cur_head = tl.program_id(1)
 
     cache_len = tl.load(cache_seqlens + cur_batch)
+    cache_len = cache_len - (MAX_SEQLEN_Q - 1 - q_pos)
+    cache_len = tl.maximum(cache_len, 0)
+    # WINDOW_LEFT is exclusive of the current token, so keep WINDOW_LEFT + 1
+    # keys (window_left left keys plus the current one).
     cur_batch_seq_len = (
-        tl.minimum(cache_len, WINDOW_LEFT) if WINDOW_LEFT >= 0 else cache_len
+        tl.minimum(cache_len, WINDOW_LEFT + 1) if WINDOW_LEFT >= 0 else cache_len
     )
     kv_splits = tl.load(num_kv_splits + cur_batch)
 
@@ -547,8 +577,8 @@ def _fwd_kernel_stage2(
     e_max = -float("inf")
     acc = tl.zeros([BLOCK_DV], dtype=tl.float32)
 
-    offs_v = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + offs_d
-    offs_logic = (cur_batch * stride_mid_ob + cur_head * stride_mid_oh) // Lv
+    offs_v = cur_q * stride_mid_ob + cur_head * stride_mid_oh + offs_d
+    offs_logic = (cur_q * stride_mid_ob + cur_head * stride_mid_oh) // Lv
     kv_len_per_split = (
         tl.cdiv(tl.cdiv(cur_batch_seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
     )
@@ -577,7 +607,7 @@ def _fwd_kernel_stage2(
         e_sum += tl.exp(cur_sink - e_max)
 
     tl.store(
-        O + cur_batch * stride_obs + cur_head * stride_oh + offs_d,
+        O + cur_q * stride_obs + cur_head * stride_oh + offs_d,
         acc / e_sum,
         mask=mask_d,
     )
@@ -592,11 +622,12 @@ def _decode_softmax_reducev_fwd(
     cache_seqlens,
     num_kv_splits,
     max_kv_splits,
+    max_seqlen_q,
     window_left,
     sinks=None,
 ):
     platform = current_platform()
-    batch, head_num = q.shape[0], q.shape[1]
+    total_q, head_num = q.shape[0], q.shape[1]
     Lv = v_buffer.shape[-1]
     BLOCK_DV = triton.next_power_of_2(Lv)
 
@@ -607,7 +638,7 @@ def _decode_softmax_reducev_fwd(
     if platform.is_amd:
         extra_kargs = {"waves_per_eu": 4, "matrix_instr_nonkdim": 16}
 
-    grid = (batch, head_num)
+    grid = (total_q, head_num)
     _fwd_kernel_stage2[grid](
         logits,
         lse,
@@ -620,6 +651,7 @@ def _decode_softmax_reducev_fwd(
         logits.stride(2),
         o.stride(0),
         o.stride(1),
+        MAX_SEQLEN_Q=max_seqlen_q,
         MAX_KV_SPLITS=MAX_KV_SPLITS,
         MIN_BLOCK_KV=_MIN_BLOCK_KV,
         BLOCK_DV=BLOCK_DV,
@@ -643,6 +675,7 @@ def decode_attention_fwd_normal(
     attn_lse,
     num_kv_splits,
     max_kv_splits,
+    max_seqlen_q,
     page_table_stride_b,
     page_size,
     window_left,
@@ -662,6 +695,7 @@ def decode_attention_fwd_normal(
         max_kv_splits,
         page_table_stride_b,
         page_size,
+        max_seqlen_q,
         window_left,
         sm_scale,
         logit_cap,
@@ -675,6 +709,7 @@ def decode_attention_fwd_normal(
         cache_seqlens,
         num_kv_splits,
         max_kv_splits,
+        max_seqlen_q,
         window_left,
         sinks,
     )
@@ -691,6 +726,7 @@ def decode_attention_fwd_grouped(
     attn_lse,
     num_kv_splits,
     max_kv_splits,
+    max_seqlen_q,
     page_table_stride_b,
     page_size,
     window_left,
@@ -710,6 +746,7 @@ def decode_attention_fwd_grouped(
         max_kv_splits,
         page_table_stride_b,
         page_size,
+        max_seqlen_q,
         window_left,
         sm_scale,
         logit_cap,
@@ -723,6 +760,7 @@ def decode_attention_fwd_grouped(
         cache_seqlens,
         num_kv_splits,
         max_kv_splits,
+        max_seqlen_q,
         window_left,
         sinks,
     )
@@ -739,6 +777,7 @@ def decode_attention_fwd(
     attn_lse,
     num_kv_splits,
     max_kv_splits,
+    max_seqlen_q,
     page_table_stride_b,
     page_size,
     window_left,
@@ -747,7 +786,7 @@ def decode_attention_fwd(
     sinks=None,
 ):
     assert max_kv_splits == attn_logits.shape[2]
-    assert q.shape[0] <= cache_seqlens.shape[0]
+    assert q.shape[0] == cache_seqlens.shape[0] * max_seqlen_q
     assert q.shape[0] <= attn_logits.shape[0]
 
     kv_group_num = q.shape[1] // v_buffer.shape[1]
@@ -765,6 +804,7 @@ def decode_attention_fwd(
             attn_lse,
             num_kv_splits,
             max_kv_splits,
+            max_seqlen_q,
             page_table_stride_b,
             page_size,
             window_left,
@@ -785,6 +825,7 @@ def decode_attention_fwd(
             attn_lse,
             num_kv_splits,
             max_kv_splits,
+            max_seqlen_q,
             page_table_stride_b,
             page_size,
             window_left,
@@ -792,3 +833,76 @@ def decode_attention_fwd(
             logit_cap=logit_cap,
             sinks=sinks,
         )
+
+
+@register_kernel(
+    "attention",
+    "mha_decode_with_kvcache",
+    name="triton_mha_decode_with_kvcache_cached",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=format_signatures(
+        ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
+    ),
+    priority=Priority.PORTABLE,
+    traits={
+        "sliding_window": frozenset({False, True}),
+        "support_sinks": frozenset({False, True}),
+        "support_logit_cap": frozenset({False, True}),
+        "return_lse": frozenset({False}),
+    },
+    tags={"portability"},
+)
+def triton_mha_decode_with_kvcache(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    max_seqlen_k: int,
+    max_seqlen_q: int = 1,
+    window_left: int = -1,
+    logit_cap: float = 0.0,
+    sinks: torch.Tensor | None = None,
+    return_lse: bool = False,
+) -> torch.Tensor:
+    out = torch.empty_like(q)
+    max_kv_splits = 4
+    attn_logits = torch.empty(
+        q.shape[0],
+        q.shape[1],
+        max_kv_splits,
+        q.shape[2],
+        dtype=torch.float32,
+        device=q.device,
+    )
+    attn_lse = torch.empty(
+        q.shape[0],
+        q.shape[1],
+        max_kv_splits,
+        dtype=torch.float32,
+        device=q.device,
+    )
+    num_kv_splits = torch.ones(
+        (cache_seqlens.shape[0],), dtype=torch.int32, device=q.device
+    )
+    decode_attention_fwd(
+        q,
+        k_cache.view(-1, k_cache.shape[2], k_cache.shape[3]),
+        v_cache.view(-1, v_cache.shape[2], v_cache.shape[3]),
+        out,
+        page_table,
+        cache_seqlens,
+        attn_logits,
+        attn_lse,
+        num_kv_splits,
+        max_kv_splits,
+        max_seqlen_q,
+        page_table.stride(0),
+        k_cache.shape[1],
+        window_left,
+        sm_scale=1.0 / math.sqrt(q.shape[-1]),
+        logit_cap=logit_cap,
+        sinks=sinks,
+    )
+    return out

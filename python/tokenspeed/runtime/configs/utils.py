@@ -43,6 +43,15 @@ def get_rope_theta(config, default: float = 10000.0) -> float:
     return default
 
 
+def get_rope_parameters(config):
+    """Return TokenSpeed's full RoPE config, including private extensions."""
+    return (
+        getattr(config, "_tokenspeed_rope_parameters", None)
+        or getattr(config, "rope_parameters", None)
+        or {}
+    )
+
+
 def _compute_default_rope_parameters(
     config: PretrainedConfig | None = None,
     device: "torch.device | None" = None,

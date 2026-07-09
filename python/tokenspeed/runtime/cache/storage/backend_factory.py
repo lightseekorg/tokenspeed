@@ -18,6 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+from __future__ import annotations
+
 import importlib
 import logging
 from typing import Any
@@ -48,14 +50,14 @@ class StorageBackendFactory:
                     f"Backend class {class_name} must inherit from KVStoreStorage"
                 )
             return backend_class
-        except ImportError as e:
+        except ImportError as exc:
             raise ImportError(
-                f"Failed to import backend '{backend_name}' from '{module_path}': {e}"
-            ) from e
-        except AttributeError as e:
+                f"Failed to import backend '{backend_name}' from '{module_path}': {exc}"
+            ) from exc
+        except AttributeError as exc:
             raise AttributeError(
-                f"Class '{class_name}' not found in module '{module_path}': {e}"
-            ) from e
+                f"Class '{class_name}' not found in module '{module_path}': {exc}"
+            ) from exc
 
     @classmethod
     def register_backend(cls, name: str, module_path: str, class_name: str) -> None:
@@ -163,9 +165,9 @@ class StorageBackendFactory:
 
             # Create the backend instance with storage_config
             return backend_class(storage_config, kwargs)
-        except Exception as e:
+        except Exception as exc:
             logger.error(
-                "Failed to create dynamic storage backend '%s': %s", backend_name, e
+                "Failed to create dynamic storage backend '%s': %s", backend_name, exc
             )
             raise
 

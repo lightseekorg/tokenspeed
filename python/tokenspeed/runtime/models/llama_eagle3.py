@@ -43,6 +43,7 @@ from tokenspeed.runtime.layers.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
+from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.vocab_parallel_embedding import ParallelLMHead
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
@@ -99,6 +100,9 @@ class LlamaAttention(BaseLlamaAttention):
                 q_rope = self._fused_rope_kv_write(
                     positions, q, k, fused_kv_arg
                 ).index_select(0, ctx.gather_ids)
+                # record_kv_cache (keyed off the real mode) forces the backend's
+                # PD layerwise cache-step record that the DECODE dispatch would
+                # otherwise skip on an EXTEND/MIXED catch-up.
                 return ctx.attn_backend.forward(
                     q_rope,
                     None,
@@ -109,6 +113,7 @@ class LlamaAttention(BaseLlamaAttention):
                     ForwardMode.DECODE,
                     ctx.bs,
                     save_kv_cache=False,
+                    record_kv_cache=not ctx.forward_mode.is_decode_or_idle(),
                 )
         q, k = self.rotary_emb(positions, q, k)
         return self.attn(q, k, v, ctx=ctx, out_cache_loc=out_cache_loc).index_select(
@@ -126,7 +131,7 @@ class LlamaAttention(BaseLlamaAttention):
         correction = (
             ctx.attn_backend.spec_num_tokens - ctx.accept_lengths[num_extends:]
         ).to(seq_lens_buf.dtype)
-        seq_lens_buf[num_extends : ctx.bs].sub_(correction)
+        seq_lens_buf[num_extends : ctx.bs].sub_(correction).clamp_(min=1)
 
 
 # ---------------------------------------------------------------------------
@@ -429,6 +434,16 @@ class Eagle3LlamaModel(BaseTransformerModel):
             tp_group=self.mapping.attn.tp_group,
         )
 
+        # norm_before_fc: RMSNorm over the concatenated aux states before fc (replicated)
+        self.input_norm = (
+            RMSNorm(
+                config.hidden_size * self.num_fc_input_dim,
+                eps=config.rms_norm_eps,
+            )
+            if getattr(config, "norm_before_fc", False)
+            else None
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -458,6 +473,8 @@ class Eagle3LlamaModel(BaseTransformerModel):
             raise ValueError("Eagle3 forward requires hidden_states")
 
         if hidden_states.size(-1) != embeds.size(-1):
+            if self.input_norm is not None:
+                hidden_states = self.input_norm(hidden_states)
             hidden_states, _ = self.fc(hidden_states)
 
         residual = None
@@ -493,6 +510,7 @@ class Eagle3LlamaModel(BaseTransformerModel):
 
 class LlamaForCausalLMEagle3(BaseCausalLM):
 
+    draft_first_step_reduce_for_catchup = True
     model_cls = Eagle3LlamaModel
 
     def __init__(
@@ -529,7 +547,14 @@ class LlamaForCausalLMEagle3(BaseCausalLM):
                 prefix=add_prefix("lm_head", prefix),
             )
 
-        self.logits_processor = self.resolve_logits_processor(config)
+        self.logits_processor = LogitsProcessor(
+            config,
+            skip_all_gather=self.mapping.attn.has_dp,
+            do_argmax=True,
+            tp_rank=self.mapping.attn.tp_rank,
+            tp_size=self.mapping.attn.tp_size,
+            tp_group=self.mapping.attn.tp_group,
+        )
         self.capture_aux_hidden_states = True
         self.hot_token_id = None
 
@@ -565,6 +590,10 @@ class LlamaForCausalLMEagle3(BaseCausalLM):
         ]
 
         for name, loaded_weight in weights:
+            # some Eagle3 checkpoints name the block "layers.0" not "midlayer"
+            if name.startswith("layers.0."):
+                name = "midlayer." + name[len("layers.0.") :]
+
             if "d2t" in name:
                 self.hot_token_id = loaded_weight + torch.arange(loaded_weight.shape[0])
                 continue

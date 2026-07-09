@@ -29,8 +29,19 @@ import torch
 from torch.nn import Module
 
 from tokenspeed.runtime.layers.quantization.compressed_tensors.scalar_type import (
-    ScalarType,
+    ScalarType as ScalarType,
 )
+
+
+def should_exclude_quant_module(prefix: str, exclude_modules: list[str]) -> bool:
+    """Whether ``prefix`` matches a ModelOpt-style glob in ``exclude_modules``."""
+    if prefix is None or not exclude_modules:
+        return False
+    for pattern in exclude_modules:
+        regex_str = pattern.replace(".", r"\.").replace("*", ".*")
+        if re.fullmatch(regex_str, prefix):
+            return True
+    return False
 
 
 def should_ignore_quant_layer(
@@ -117,7 +128,8 @@ def should_ignore_quant_layer(
                     ]
                 )
 
-    assert should_ignore_layer is not None
+    if should_ignore_layer is None:
+        raise RuntimeError("Layer ignore decision was not initialized.")
     return should_ignore_layer
 
 
@@ -319,7 +331,8 @@ def replace_parameter(
 
 
 def get_pack_factor(num_bits):
-    assert 32 % num_bits == 0, f"Unsupported num_bits = {num_bits}"
+    if num_bits <= 0 or 32 % num_bits != 0:
+        raise ValueError(f"Unsupported num_bits = {num_bits}")
     return 32 // num_bits
 
 
@@ -330,11 +343,14 @@ def unpack_cols(
     size_n: int,
 ):
     pack_factor = get_pack_factor(num_bits)
-    assert size_n % pack_factor == 0
-    assert packed_q_w.shape == (
-        size_k,
-        size_n // pack_factor,
-    ), f"packed_q_w.shape = {packed_q_w.shape} size_k = {size_k}, size_n = {size_n} pack_Factor = {pack_factor}"
+    if size_n % pack_factor != 0:
+        raise ValueError(f"size_n={size_n} must be divisible by {pack_factor}.")
+    expected_shape = (size_k, size_n // pack_factor)
+    if packed_q_w.shape != expected_shape:
+        raise ValueError(
+            f"packed_q_w.shape = {packed_q_w.shape} size_k = {size_k}, "
+            f"size_n = {size_n} pack_Factor = {pack_factor}"
+        )
 
     orig_device = packed_q_w.device
 
@@ -362,8 +378,11 @@ def block_dequant(
     n, k = x_q_block.shape
     n_tiles = (n + block_n - 1) // block_n
     k_tiles = (k + block_k - 1) // block_k
-    assert n_tiles == x_s.shape[0]
-    assert k_tiles == x_s.shape[1]
+    if n_tiles != x_s.shape[0] or k_tiles != x_s.shape[1]:
+        raise ValueError(
+            f"Scale shape {tuple(x_s.shape)} does not match tiles "
+            f"({n_tiles}, {k_tiles})."
+        )
 
     x_dq_block = x_q_block.to(torch.float32)
 

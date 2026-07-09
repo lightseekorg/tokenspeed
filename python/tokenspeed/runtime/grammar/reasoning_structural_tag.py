@@ -59,8 +59,8 @@ _REASONING_PARSER_TO_XGRAMMAR_MODEL: dict[str, str] = {
     "kimi": "kimi",
     "kimi_k25": "kimi",
     "minimax": "minimax",
-    "qwen3": "qwen",
-    "qwen3_thinking": "qwen",
+    "qwen3": "qwen_3",
+    "qwen3_thinking": "qwen_3",
 }
 
 

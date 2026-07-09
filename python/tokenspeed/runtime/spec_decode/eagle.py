@@ -39,29 +39,29 @@ logger = get_colorful_logger(__name__)
 class EagleDraftInput:
     # The inputs for decode
     # shape: (b, topk)
-    topk_p: torch.Tensor = None
-    topk_index: torch.Tensor = None
+    topk_p: torch.Tensor | None = None
+    topk_index: torch.Tensor | None = None
     # shape: (b, hidden_size)
-    hidden_states: torch.Tensor = None
+    hidden_states: torch.Tensor | None = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
     # Inputs for extend
     # shape: (b,)
-    verified_id: torch.Tensor = None
-    accept_length: torch.Tensor = None
-    accept_length_cpu: list[int] = None
-    accept_index: torch.Tensor = None
+    verified_id: torch.Tensor | None = None
+    accept_length: torch.Tensor | None = None
+    accept_length_cpu: list[int] | None = None
+    accept_index: torch.Tensor | None = None
 
     # Inputs for the attention backends
     # shape: (b + 1,)
-    kv_indptr: torch.Tensor = None
-    kv_indices: torch.Tensor = None
+    kv_indptr: torch.Tensor | None = None
+    kv_indices: torch.Tensor | None = None
 
     # For draft extend fast plan
-    qo_indptr_cpu: torch.Tensor = None
-    kv_indptr_cpu: torch.Tensor = None
-    kv_indices_for_extend: torch.Tensor = None
-    kv_len_arr_cpu: torch.Tensor = None
+    qo_indptr_cpu: torch.Tensor | None = None
+    kv_indptr_cpu: torch.Tensor | None = None
+    kv_indices_for_extend: torch.Tensor | None = None
+    kv_len_arr_cpu: torch.Tensor | None = None
 
     draft_token_num: int = 0
 
@@ -109,9 +109,9 @@ class EagleDraftInput:
         if spec_info.hidden_states is None:
             return
         self.hidden_states = torch.cat(
-            [self.hidden_states, spec_info.hidden_states], axis=0
+            [self.hidden_states, spec_info.hidden_states], dim=0
         )
-        self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], axis=0)
+        self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], dim=0)
         if self.topk_p is not None and spec_info.topk_p is not None:
             self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
         self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
@@ -205,8 +205,8 @@ def generate_attn_arg_prefill(
     req_pool_indices: torch.Tensor,
     paged_kernel_lens: torch.Tensor,
     req_to_token: torch.Tensor,
-    kv_indices_buf: torch.Tensor = None,
-    draft_decode_step: int = None,
+    kv_indices_buf: torch.Tensor | None = None,
+    draft_decode_step: int | None = None,
 ):
     batch_size = req_pool_indices.shape[0]
     if draft_decode_step is not None:

@@ -69,12 +69,12 @@ class InputProcessor:
             if isinstance(schema, str):
                 schema = json.loads(schema)
             wrapped = structural_tag_for_reasoning_json_schema(reasoning_parser, schema)
-        except Exception as e:
+        except Exception as exc:
             self.engine.logger.warning(
                 "reasoning-parser=%s: failed to wrap json_schema (%s); "
                 "falling back.",
                 reasoning_parser,
-                e,
+                exc,
             )
             return
         if wrapped is None:
@@ -149,6 +149,7 @@ class InputProcessor:
                     "precomputed_multimodal_inputs is provided for a text-only model."
                 )
             multimodal_inputs = obj.precomputed_multimodal_inputs
+            multimodal_inputs.ensure_pad_values()
             # MRoPE-aware models (Qwen2/3-VL, …) require 3-axis position_ids
             # derived from image_grid_thw + the image_token_id placeholders in
             # input_ids. SMG ships precomputed mm inputs with mrope_* unset; if
@@ -168,15 +169,15 @@ class InputProcessor:
                 )
                 multimodal_inputs.mrope_positions = mrope_positions
                 multimodal_inputs.mrope_position_delta = mrope_position_delta
+                if mrope_position_delta is not None:
+                    multimodal_inputs.mrope_position_delta_scalar = int(
+                        mrope_position_delta.flatten()[0].item()
+                    )
             if input_ids is not None:
                 input_ids_unpadded = list(input_ids)
                 input_ids = pad_input_tokens(list(input_ids), multimodal_inputs)
 
         if self.engine.is_generation:
-            return_logprob = obj.return_logprob
-            logprob_start_len = obj.logprob_start_len
-            top_logprobs_num = obj.top_logprobs_num
-            token_ids_logprob = obj.token_ids_logprob
             session_params = (
                 SessionParams(**obj.session_params) if obj.session_params else None
             )
@@ -189,11 +190,13 @@ class InputProcessor:
             )
 
         max_new_tokens = obj.sampling_params.get("max_new_tokens")
-        if (
-            max_new_tokens is not None
-            and max_new_tokens + input_token_num >= self.engine.context_len
-        ):
-            adjusted_max_new_tokens = self.engine.context_len - input_token_num
+        # Resolve to a finite cap bounded by remaining context. Both
+        # Req.check_finished and RequestState.check_finished read this field;
+        # leaving it None lets a request reach the per-request page-table cap.
+        adjusted_max_new_tokens = self.engine.context_len - input_token_num
+        if max_new_tokens is None:
+            obj.sampling_params.update({"max_new_tokens": adjusted_max_new_tokens})
+        elif max_new_tokens + input_token_num >= self.engine.context_len:
             self.engine.logger.warning(
                 "Requested(rid=%s) token count exceeds the model's maximum context length of %s tokens. You requested a total of %s tokens: %s tokens from the input messages and %s tokens for the completion. The max_new_tokens will be truncated to %s.",
                 obj.rid,
@@ -211,6 +214,41 @@ class InputProcessor:
         sampling_params.resolve_seed(obj.rid)
         sampling_params.normalize(self.engine.tokenizer)
         sampling_params.verify(self.engine.model_config.vocab_size)
+
+        # Output logprobs: two request dialects, one compute path. vLLM uses
+        # sampling_params.logprobs; SGLang uses GenerateReqInput.return_logprob
+        # (+ top_logprobs_num / logprob_start_len / token_ids_logprob). Either way
+        # the scheduler computes only the sampled token's logprob; the response
+        # dialect is chosen at render time. Gate unsupported CAPABILITIES loudly
+        # here rather than silently clamping the request shape.
+        sglang_req = bool(getattr(obj, "return_logprob", False))
+        return_logprob = sampling_params.logprobs is not None or sglang_req
+        # Output logprobs are gated by the static server arg enable_output_logprobs
+        # (the sampler only gathers them when on). Reject loudly instead of
+        # silently returning empty logprobs when the server cannot honor it.
+        if return_logprob and not self.engine.server_args.enable_output_logprobs:
+            raise ValueError(
+                "logprobs were requested but the server was started without "
+                "enable_output_logprobs; restart with enable_output_logprobs=True "
+                "to return output logprobs."
+            )
+        if sglang_req:
+            # vLLM top-k / full-vocab are gated in SamplingParams.verify(); gate
+            # the SGLang capability knobs here for parity.
+            if getattr(obj, "top_logprobs_num", 0):
+                raise ValueError(
+                    "top_logprobs_num > 0 (output top-k logprobs) is not supported "
+                    "yet; use top_logprobs_num=0 (the sampled token's logprob)."
+                )
+            if (getattr(obj, "logprob_start_len", -1) or -1) >= 0:
+                raise ValueError(
+                    "logprob_start_len >= 0 (prompt logprobs) is not supported yet."
+                )
+            if getattr(obj, "token_ids_logprob", None):
+                raise ValueError("token_ids_logprob is not supported yet.")
+        logprob_start_len = -1
+        top_logprobs_num = 0
+        token_ids_logprob = None
 
         if isinstance(obj, GenerateReqInput):
             return TokenizedGenerateReqInput(

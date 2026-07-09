@@ -83,9 +83,8 @@ class CustomAllreduce:
 
         self.group = group
 
-        assert (
-            dist.get_backend(group) != dist.Backend.NCCL
-        ), "CustomAllreduce should be attached to a non-NCCL group."
+        if dist.get_backend(group) == dist.Backend.NCCL:
+            raise ValueError("CustomAllreduce should be attached to a non-NCCL group.")
 
         if not all(in_the_same_node_as(group, source_rank=0)):
             # No need to initialize custom allreduce for multi-node case.
@@ -116,7 +115,10 @@ class CustomAllreduce:
         elif isinstance(device, str):
             device = torch.device(device)
         # now `device` is a `torch.device` object
-        assert isinstance(device, torch.device)
+        if not isinstance(device, torch.device):
+            raise TypeError(
+                f"device must be a torch.device, got {type(device).__name__}"
+            )
         self.device = device
 
         # test nvlink first, this will filter out most of the cases

@@ -1,8 +1,6 @@
-# Adapted from meituan-longcat/SGLang-FluentLLM.
-# This file has been modified for this repository.
-# Upstream lineage includes ModelTC/lightllm, vllm-project/vllm,
-# and sgl-project/sglang. See python/THIRDPARTYNOTICES.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: MIT AND Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 LightSeek Foundation
+# SPDX-FileCopyrightText: Copyright contributors to the FluentLLM project
 #
 # Copyright (c) 2026 LightSeek Foundation
 #
@@ -27,20 +25,21 @@
 import abc
 import threading
 from functools import wraps
-from typing import Optional
+from pathlib import Path
 
 import psutil
 import torch
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
+from tokenspeed.runtime.layers.attention.kv_cache.dsa import DSATokenToKVPool
 from tokenspeed.runtime.layers.attention.kv_cache.mha import MHATokenToKVPool
 from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
-_is_nvidia = current_platform().is_nvidia
-if _is_nvidia:
+_platform = current_platform()
+if _platform.is_nvidia:
     from tokenspeed_kernel.ops.kvcache.cuda import (
         transfer_kv_all_layer_lf_pf,
         transfer_kv_all_layer_lf_ph,
@@ -52,13 +51,69 @@ if _is_nvidia:
         transfer_kv_per_layer_pf_lf,
         transfer_kv_per_layer_ph_lf,
     )
+
 from tokenspeed_kernel.ops.kvcache.triton import (
     transfer_kv_all_layer,
     transfer_kv_per_layer,
 )
 
+if _platform.is_amd:
+    from tokenspeed_kernel.ops.kvcache.triton import (
+        transfer_kv_all_layer_mla,
+        transfer_kv_per_layer_mla,
+    )
+
 MLA_KVSTORE_LOADBACK_BLOCK_QUOTA = 16
 MLA_KVSTORE_WRITEBACK_BLOCK_QUOTA = 16
+
+
+def _read_cgroup_memory_value(path: Path) -> int | None:
+    try:
+        raw = path.read_text().strip()
+    except OSError:
+        return None
+    if not raw or raw == "max":
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    if value <= 0 or value >= (1 << 60):
+        return None
+    return value
+
+
+def get_cgroup_memory_limit_and_current() -> tuple[int, int] | None:
+    """Return the active cgroup memory limit/current bytes, if constrained."""
+
+    limit = _read_cgroup_memory_value(Path("/sys/fs/cgroup/memory.max"))
+    current = _read_cgroup_memory_value(Path("/sys/fs/cgroup/memory.current"))
+    if limit is None or current is None:
+        limit = _read_cgroup_memory_value(
+            Path("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+        )
+        current = _read_cgroup_memory_value(
+            Path("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+        )
+    if limit is None or current is None:
+        return None
+    host_total = psutil.virtual_memory().total
+    if limit >= host_total:
+        return None
+    return limit, current
+
+
+def get_available_host_memory_bytes(
+    reserve_bytes: int,
+) -> tuple[int, int, int | None]:
+    host_available = max(psutil.virtual_memory().available - reserve_bytes, 0)
+    cgroup_available = None
+    cgroup_info = get_cgroup_memory_limit_and_current()
+    if cgroup_info is not None:
+        limit, current = cgroup_info
+        cgroup_available = max(limit - current - reserve_bytes, 0)
+        return min(host_available, cgroup_available), host_available, cgroup_available
+    return host_available, host_available, None
 
 
 def synchronized(func):
@@ -107,11 +162,12 @@ class HostKVCache(abc.ABC):
             )
 
         # Verify there is enough available host memory.
-        host_mem = psutil.virtual_memory()
         requested_bytes = self.size * self.size_per_token
         # preserve at least 10GB for other usage
         ten_gb = 10 * (1024**3)
-        available_bytes = host_mem.available - ten_gb
+        available_bytes, host_available, cgroup_available = (
+            get_available_host_memory_bytes(ten_gb)
+        )
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory available. Requesting "
@@ -127,8 +183,13 @@ class HostKVCache(abc.ABC):
                 self.size_per_token,
                 host_to_device_ratio,
                 device_pool.size,
-                host_mem.available,
+                host_available,
             )
+            if cgroup_available is not None:
+                logger.info(
+                    "KVStore cgroup-aware available host memory: %.2f GB",
+                    cgroup_available / 1e9,
+                )
 
         self.kv_buffer = self.init_kv_buffer()
 
@@ -160,7 +221,7 @@ class HostKVCache(abc.ABC):
         host_indices,
         device_indices,
         io_backend,
-        block_quota: Optional[int] = None,
+        block_quota: int | None = None,
     ) -> None:
         """
         Backup KV data from the device memory pool to the host memory pool for all layers.
@@ -201,10 +262,9 @@ class HostKVCache(abc.ABC):
         return len(self.free_slots)
 
     @synchronized
-    def alloc(self, need_size: int) -> Optional[torch.Tensor]:
-        assert (
-            need_size % self.page_size == 0
-        ), "The requested size should be a multiple of the page size."
+    def alloc(self, need_size: int) -> torch.Tensor | None:
+        if need_size % self.page_size != 0:
+            raise ValueError("The requested size should be a multiple of page_size.")
         if need_size > self.available_size():
             return None
 
@@ -370,7 +430,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         host_indices,
         device_indices,
         io_backend,
-        block_quota: Optional[int] = None,
+        block_quota: int | None = None,
     ):
         if io_backend == "kernel":
             if self.layout == "layer_first":
@@ -476,10 +536,8 @@ class MHATokenToKVPoolHost(HostKVCache):
             raise ValueError(f"Unsupported layout: {self.layout}")
 
     def get_page_buffer_meta(self, indices):
-        """ "
-        meta data for zero copy
-        """
-        assert len(indices) % self.page_size == 0
+        if len(indices) % self.page_size != 0:
+            raise ValueError("indices length must be a multiple of page_size")
         ptr_list = []
         kv_buffer_data_ptr = self.kv_buffer.data_ptr()
         indices = indices.tolist()
@@ -658,7 +716,7 @@ class MLATokenToKVPoolHost(HostKVCache):
         host_indices,
         device_indices,
         io_backend,
-        block_quota: Optional[int] = None,
+        block_quota: int | None = None,
     ):
         if block_quota is None:
             block_quota = MLA_KVSTORE_WRITEBACK_BLOCK_QUOTA
@@ -743,10 +801,8 @@ class MLATokenToKVPoolHost(HostKVCache):
             raise ValueError(f"Unsupported layout: {self.layout}")
 
     def get_page_buffer_meta(self, indices):
-        """ "
-        meta data for zero copy
-        """
-        assert len(indices) % self.page_size == 0
+        if len(indices) % self.page_size != 0:
+            raise ValueError("indices length must be a multiple of page_size")
         ptr_list = []
         kv_buffer_data_ptr = self.kv_buffer.data_ptr()
         indices = indices.tolist()
@@ -790,3 +846,131 @@ class MLATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
         return ptr_list, element_size_list
+
+
+class DSATokenToKVPoolHost(MLATokenToKVPoolHost):
+    """Host (L2) mirror of the GLM DSA KV pool.
+
+    Extends the MLA latent host pool with the DSA FP8 index-K buffer. Both buffers
+    mirror the device row layout and transfer per token. The index-K buffers are
+    in a block-split layout: each page is laid out as
+    ``[page_size * head_dim FP8 values]`` followed by ``[page_size * num_groups FP32 scales]``.
+    Hence, it requires the token indices are built as whole page-expanded blocks
+    (see host_executor.page_ids_to_token_indices); otherwise the D<->H transfer
+    would be corrupted.
+    """
+
+    device_pool: DSATokenToKVPool
+
+    def __init__(
+        self,
+        device_pool: DSATokenToKVPool,
+        host_to_device_ratio: float,
+        host_size: int,
+        page_size: int,
+        layout: str,
+        device: str = "cpu",
+        host_size_tokens: int = 0,
+    ):
+        if device_pool.quant_method == "per_token_head":
+            raise NotImplementedError(
+                "DSA KVStore does not support the per_token_head latent layout."
+            )
+        if layout != "layer_first":
+            raise NotImplementedError(
+                f"DSA KVStore supports only the layer_first host layout, got {layout}."
+            )
+        self.index_k_row_bytes = device_pool.index_k_row_bytes
+        super().__init__(
+            device_pool,
+            host_to_device_ratio,
+            host_size,
+            page_size,
+            layout,
+            device,
+            host_size_tokens=host_size_tokens,
+        )
+        self.index_k_refs = [self.index_k_buffer[i] for i in range(self.layer_num)]
+        platform = current_platform()
+        self.index_k_data_ptrs = torch.tensor(
+            [platform.device_visible_data_ptr(x) for x in self.index_k_refs],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
+
+    def get_size_per_token(self):
+        return super().get_size_per_token() + self.index_k_row_bytes * self.layer_num
+
+    def init_kv_buffer(self):
+        kv_buffer = super().init_kv_buffer()
+        # Mirror the device index-K layout: page p of layer L occupies rows
+        # [p * page_size : (p + 1) * page_size], so a whole page is contiguous
+        # and the block-split FP8/scale bytes within it survive a raw page copy.
+
+        self.index_k_buffer = torch.zeros(
+            (self.layer_num, self.size, self.index_k_row_bytes),
+            dtype=torch.uint8,
+            device=self.device,
+        )
+        current_platform().register_host_tensor_for_gpu_access(self.index_k_buffer)
+        return kv_buffer
+
+    def load_to_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend
+    ):
+        super().load_to_device_per_layer(
+            device_pool, host_indices, device_indices, layer_id, io_backend
+        )
+        if io_backend == "kernel":
+            transfer_kv_per_layer_mla(
+                src=self.index_k_buffer[layer_id],
+                dst=device_pool.index_k_buffer[layer_id],
+                src_indices=host_indices,
+                dst_indices=device_indices,
+                item_size=self.index_k_row_bytes,
+                block_quota=MLA_KVSTORE_LOADBACK_BLOCK_QUOTA,
+            )
+        elif io_backend == "direct":
+            transfer_kv_direct(
+                src_layers=[self.index_k_buffer[layer_id]],
+                dst_layers=[device_pool.index_k_buffer[layer_id]],
+                src_indices=host_indices,
+                dst_indices=device_indices,
+                page_size=self.page_size,
+            )
+        else:
+            raise ValueError(f"Unsupported IO backend: {io_backend}")
+
+    def backup_from_device_all_layer(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        io_backend,
+        block_quota: int | None = None,
+    ):
+        super().backup_from_device_all_layer(
+            device_pool, host_indices, device_indices, io_backend, block_quota
+        )
+        if io_backend == "kernel":
+            if block_quota is None:
+                block_quota = MLA_KVSTORE_WRITEBACK_BLOCK_QUOTA
+            transfer_kv_all_layer_mla(
+                src_layers=device_pool.index_k_data_ptrs,
+                dst_layers=self.index_k_data_ptrs,
+                src_indices=device_indices,
+                dst_indices=host_indices,
+                item_size=self.index_k_row_bytes,
+                num_layers=self.layer_num,
+                block_quota=block_quota,
+            )
+        elif io_backend == "direct":
+            transfer_kv_direct(
+                src_layers=list(device_pool.index_k_buffer),
+                dst_layers=self.index_k_refs,
+                src_indices=device_indices,
+                dst_indices=host_indices,
+                page_size=self.page_size,
+            )
+        else:
+            raise ValueError(f"Unsupported IO backend: {io_backend}")

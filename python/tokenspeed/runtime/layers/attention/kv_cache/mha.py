@@ -230,7 +230,9 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             )
 
     def _create_buffers(self):
-        with self.memory_saver_adapter.region():
+        # Tag as "kv_cache", no CPU backup: KV is discarded on sleep and rebuilt
+        # after wake (paging overwrites; clear_kv_buffers zeros the remapped pages).
+        with self.memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False):
             # Page 0 is the zero-initialized dummy page: padded tokens write
             # there, and kernels may read it past valid seq_len, so its slots
             # must stay finite to keep softmax well-defined.

@@ -34,6 +34,11 @@ from tokenspeed.runtime.engine.request_types import BaseFinishReason
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 
+def _require(condition: bool, message: str) -> None:
+    if not condition:
+        raise ValueError(message)
+
+
 @dataclass
 class BaseReq(ABC):
     rid: str | list[str] | None = field(default=None)
@@ -79,17 +84,24 @@ class GenerateReqInput:
     user_rid: list[str] | str | None = None
     # Routing id; always server-assigned during normalize, never caller-settable.
     rid: list[str] | str | None = field(default=None, init=False)
-    # Whether to return logprobs.
+    # --- Logprob request (two dialects, one compute path) ---
+    # vLLM-compatible requests use ``sampling_params["logprobs"]``;
+    # SGLang-compatible requests use the legacy fields below. A request uses
+    # one dialect; the response is rendered to match (override with
+    # ``logprob_format``).
     return_logprob: list[bool] | bool | None = None
-    # If return logprobs, the start location in the prompt for returning logprobs.
-    # By default, this value is "-1", which means it will only return logprobs for output tokens.
+    # Start location in the prompt for prompt logprobs. -1 (default) = output
+    # tokens only.
     logprob_start_len: list[int] | int | None = None
-    # If return logprobs, the number of top logprobs to return at each position.
+    # Number of top logprobs per position.
     top_logprobs_num: list[int] | int | None = None
-    # If return logprobs, the token ids to return logprob for.
+    # Specific token ids to score per position.
     token_ids_logprob: list[list[int]] | list[int] | None = None
-    # Whether to detokenize tokens in text in the returned logprobs.
+    # Detokenize tokens in the returned logprobs.
     return_text_in_logprobs: bool = False
+    # Output rendering dialect: "vllm" | "sglang" | "both". None = auto (match
+    # the request dialect: vllm if sampling_params.logprobs is set, else sglang).
+    logprob_format: list[str | None] | str | None = None
     # Whether to stream output.
     stream: bool = False
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
@@ -141,15 +153,23 @@ class GenerateReqInput:
                 self.batch_size = len(self.input_ids)
             self.input_embeds = None
         else:
-            assert isinstance(self.input_embeds, list)
+            _require(
+                isinstance(self.input_embeds, list), "input_embeds should be a list."
+            )
             if isinstance(self.input_embeds[0][0], float):
                 # list[list[float]]
                 self.is_single = True
                 self.batch_size = 1
             else:
                 # list[list[list[float]]]
-                assert isinstance(self.input_embeds[0][0], list)
-                assert isinstance(self.input_embeds[0][0][0], float)
+                _require(
+                    isinstance(self.input_embeds[0][0], list),
+                    "input_embeds should be a list of float lists.",
+                )
+                _require(
+                    isinstance(self.input_embeds[0][0][0], float),
+                    "input_embeds should contain floats.",
+                )
                 self.is_single = False
                 self.batch_size = len(self.input_embeds)
 
@@ -163,9 +183,10 @@ class GenerateReqInput:
         else:  # isinstance(self.sampling_params, list):
             self.parallel_sample_num = self.sampling_params[0].get("n", 1)
             for sp in self.sampling_params[1:]:
-                assert self.parallel_sample_num == sp.get(
-                    "n", 1
-                ), "The parallel_sample_num should be the same for all samples in sample params."
+                _require(
+                    self.parallel_sample_num == sp.get("n", 1),
+                    "The parallel_sample_num should be the same for all samples in sample params.",
+                )
 
         if self.parallel_sample_num > 1 and self.is_single:
             self.is_single = False
@@ -188,11 +209,12 @@ class GenerateReqInput:
                 self.user_rid = self.rid
             else:
                 if isinstance(self.user_rid, list):
-                    assert (
-                        len(self.user_rid) == 1
-                    ), "user_rid list should have length 1 for single request."
+                    _require(
+                        len(self.user_rid) == 1,
+                        "user_rid list should have length 1 for single request.",
+                    )
                     self.user_rid = self.user_rid[0]
-                assert isinstance(self.user_rid, str), "user_rid should be a str."
+                _require(isinstance(self.user_rid, str), "user_rid should be a str.")
             if self.return_logprob is None:
                 self.return_logprob = False
             if self.logprob_start_len is None:
@@ -211,43 +233,53 @@ class GenerateReqInput:
                 num = self.batch_size * self.parallel_sample_num
 
             if self.sampling_params is None:
-                self.sampling_params = [{}] * num
+                self.sampling_params = [{} for _ in range(num)]
             elif not isinstance(self.sampling_params, list):
-                self.sampling_params = [self.sampling_params] * num
+                self.sampling_params = [dict(self.sampling_params) for _ in range(num)]
 
             if self.rid is None:
                 self.rid = [uuid.uuid4().hex for _ in range(num)]
             else:
-                assert isinstance(self.rid, list), "The rid should be a list."
+                _require(isinstance(self.rid, list), "The rid should be a list.")
             if self.user_rid is None:
                 self.user_rid = list(self.rid)
             elif isinstance(self.user_rid, str):
                 self.user_rid = [self.user_rid] * num
             else:
-                assert (
-                    isinstance(self.user_rid, list) and len(self.user_rid) == num
-                ), "user_rid should be a str or a list of matching length."
+                _require(
+                    isinstance(self.user_rid, list) and len(self.user_rid) == num,
+                    "user_rid should be a str or a list of matching length.",
+                )
 
             if self.return_logprob is None:
                 self.return_logprob = [False] * num
             elif not isinstance(self.return_logprob, list):
                 self.return_logprob = [self.return_logprob] * num
             else:
-                assert self.parallel_sample_num == 1
+                _require(
+                    self.parallel_sample_num == 1,
+                    "return_logprob cannot be a list when n > 1.",
+                )
 
             if self.logprob_start_len is None:
                 self.logprob_start_len = [-1] * num
             elif not isinstance(self.logprob_start_len, list):
                 self.logprob_start_len = [self.logprob_start_len] * num
             else:
-                assert self.parallel_sample_num == 1
+                _require(
+                    self.parallel_sample_num == 1,
+                    "logprob_start_len cannot be a list when n > 1.",
+                )
 
             if self.top_logprobs_num is None:
                 self.top_logprobs_num = [0] * num
             elif not isinstance(self.top_logprobs_num, list):
                 self.top_logprobs_num = [self.top_logprobs_num] * num
             else:
-                assert self.parallel_sample_num == 1
+                _require(
+                    self.parallel_sample_num == 1,
+                    "top_logprobs_num cannot be a list when n > 1.",
+                )
 
             if not self.token_ids_logprob:  # covers both None and []
                 self.token_ids_logprob = [None] * num
@@ -258,40 +290,60 @@ class GenerateReqInput:
                     copy.deepcopy(self.token_ids_logprob) for _ in range(num)
                 ]
             else:
-                assert self.parallel_sample_num == 1
+                _require(
+                    self.parallel_sample_num == 1,
+                    "token_ids_logprob cannot be nested lists when n > 1.",
+                )
+
+            if self.logprob_format is None or isinstance(self.logprob_format, str):
+                self.logprob_format = [self.logprob_format] * num
 
             if self.custom_logit_processor is None:
                 self.custom_logit_processor = [None] * num
             elif not isinstance(self.custom_logit_processor, list):
                 self.custom_logit_processor = [self.custom_logit_processor] * num
             else:
-                assert self.parallel_sample_num == 1
+                _require(
+                    self.parallel_sample_num == 1,
+                    "custom_logit_processor cannot be a list when n > 1.",
+                )
 
             if self.bootstrap_host is None:
                 self.bootstrap_host = [None] * num
             elif not isinstance(self.bootstrap_host, list):
                 self.bootstrap_host = [self.bootstrap_host] * num
             else:
-                assert self.parallel_sample_num == 1
+                _require(
+                    self.parallel_sample_num == 1,
+                    "bootstrap_host cannot be a list when n > 1.",
+                )
 
             if self.bootstrap_port is None:
                 self.bootstrap_port = [None] * num
             elif not isinstance(self.bootstrap_port, list):
                 self.bootstrap_port = [self.bootstrap_port] * num
             else:
-                assert self.parallel_sample_num == 1
+                _require(
+                    self.parallel_sample_num == 1,
+                    "bootstrap_port cannot be a list when n > 1.",
+                )
 
             if self.bootstrap_room is None:
                 self.bootstrap_room = [None] * num
             elif not isinstance(self.bootstrap_room, list):
                 self.bootstrap_room = [self.bootstrap_room] * num
             else:
-                assert self.parallel_sample_num == 1
+                _require(
+                    self.parallel_sample_num == 1,
+                    "bootstrap_room cannot be a list when n > 1.",
+                )
 
         # Other checks
         if self.session_params is not None:
-            assert isinstance(self.session_params, dict) or isinstance(
-                self.session_params[0], dict
+            _require(
+                isinstance(self.session_params, dict)
+                or isinstance(self.session_params[0], dict),
+                "session_params should be a dict or a list of dicts.",
             )
 
     def regenerate_rid(self):
@@ -325,6 +377,7 @@ class GenerateReqInput:
             top_logprobs_num=self.top_logprobs_num[i],
             token_ids_logprob=self.token_ids_logprob[i],
             return_text_in_logprobs=self.return_text_in_logprobs,
+            logprob_format=self.logprob_format[i],
             stream=self.stream,
             log_metrics=self.log_metrics,
             custom_logit_processor=(
@@ -358,13 +411,15 @@ class TokenizedGenerateReqInput:
     input_ids: list[int]
     # The sampling parameters
     sampling_params: SamplingParams
-    # Whether to return the logprobs
+    # Whether to return the sampled token's logprob for this request.
     return_logprob: bool
-    # If return logprobs, the start location in the prompt for returning logprobs.
+    # Internal carry-over fields kept for pipeline/PD compatibility. The vLLM
+    # output-logprob API only drives ``return_logprob``; InputProcessor sets
+    # these to neutral values (logprob_start_len=-1, top_logprobs_num=0,
+    # token_ids_logprob=None) since prompt logprobs, output top-k, and token-id
+    # logprobs are not supported.
     logprob_start_len: int
-    # If return logprobs, the number of top logprobs to return at each position.
     top_logprobs_num: int
-    # If return logprobs, the token id to return logprob for
     token_ids_logprob: list[int]
     # Whether to stream output
     stream: bool
@@ -447,11 +502,12 @@ class EmbeddingReqInput:
                 self.user_rid = self.rid
             else:
                 if isinstance(self.user_rid, list):
-                    assert (
-                        len(self.user_rid) == 1
-                    ), "user_rid list should have length 1 for single request."
+                    _require(
+                        len(self.user_rid) == 1,
+                        "user_rid list should have length 1 for single request.",
+                    )
                     self.user_rid = self.user_rid[0]
-                assert isinstance(self.user_rid, str), "user_rid should be a str."
+                _require(isinstance(self.user_rid, str), "user_rid should be a str.")
             if self.sampling_params is None:
                 self.sampling_params = {}
             self.sampling_params["max_new_tokens"] = 0
@@ -459,19 +515,20 @@ class EmbeddingReqInput:
             if self.rid is None:
                 self.rid = [uuid.uuid4().hex for _ in range(self.batch_size)]
             else:
-                assert isinstance(self.rid, list), "The rid should be a list."
+                _require(isinstance(self.rid, list), "The rid should be a list.")
             if self.user_rid is None:
                 self.user_rid = list(self.rid)
             elif isinstance(self.user_rid, str):
                 self.user_rid = [self.user_rid] * self.batch_size
             else:
-                assert (
+                _require(
                     isinstance(self.user_rid, list)
-                    and len(self.user_rid) == self.batch_size
-                ), "user_rid should be a str or a list of matching length."
+                    and len(self.user_rid) == self.batch_size,
+                    "user_rid should be a str or a list of matching length.",
+                )
 
             if self.sampling_params is None:
-                self.sampling_params = [{}] * self.batch_size
+                self.sampling_params = [{} for _ in range(self.batch_size)]
             for i in range(self.batch_size):
                 self.sampling_params[i]["max_new_tokens"] = 0
 
@@ -733,22 +790,36 @@ class GetWeightsByNameReqOutput:
 
 @dataclass
 class ReleaseMemoryOccupationReqInput:
-    pass
+    # Memory regions to release. None ⇒ all ("weights" and "kv_cache").
+    tags: list[str] | None = None
 
 
 @dataclass
 class ReleaseMemoryOccupationReqOutput:
-    pass
+    success: bool = True
+    message: str = ""
 
 
 @dataclass
 class ResumeMemoryOccupationReqInput:
-    pass
+    # Memory regions to resume. None ⇒ all previously released tags.
+    tags: list[str] | None = None
 
 
 @dataclass
 class ResumeMemoryOccupationReqOutput:
+    success: bool = True
+    message: str = ""
+
+
+@dataclass
+class IsSleepingReqInput:
     pass
+
+
+@dataclass
+class IsSleepingReqOutput:
+    is_sleeping: bool
 
 
 @dataclass

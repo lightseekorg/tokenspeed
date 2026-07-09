@@ -45,13 +45,13 @@ class Fp8Config(QuantizationConfig):
         weight_block_size: list[int] = None,
         scale_fmt: str | None = None,
     ) -> None:
+        super().__init__(ignored_layers=ignored_layers)
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         if is_checkpoint_fp8_serialized:
             log_info_on_rank0(logger, "Detected fp8 checkpoint.")
         if activation_scheme not in ACTIVATION_SCHEMES:
             raise ValueError(f"Unsupported activation scheme {activation_scheme}")
         self.activation_scheme = activation_scheme
-        self.ignored_layers = ignored_layers or []
         if weight_block_size is not None:
             if not is_checkpoint_fp8_serialized:
                 raise ValueError(

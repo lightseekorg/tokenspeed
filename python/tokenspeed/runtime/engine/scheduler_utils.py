@@ -21,8 +21,8 @@
 """Helper functions for constructing scheduler specs and events."""
 
 import os
-from collections.abc import Sequence
-from typing import Any, Mapping
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 import torch
 from tokenspeed_scheduler import (
@@ -69,6 +69,7 @@ def make_config(
     role: str,
     enable_kv_cache_events: bool = False,
     decode_input_tokens: int = 1,
+    overlap_schedule_depth: int = 0,
     disable_prefix_cache: bool = False,
     enable_mamba: bool = False,
     mamba_cache_chunk_size: int = 64,
@@ -98,6 +99,7 @@ def make_config(
         cfg.role = SchedulerConfig.Role.Fused
     cfg.num_device_pages = num_device_pages
     cfg.decode_input_tokens = decode_input_tokens
+    cfg.overlap_schedule_depth = overlap_schedule_depth
     cfg.disable_prefix_cache = disable_prefix_cache
     cfg.disable_l2_cache = disable_l2_cache
 
@@ -173,16 +175,13 @@ def should_use_overlap_schedule(
     *,
     disable_overlap_schedule: bool,
     disaggregation_mode: str,
-    speculative_algorithm: Any | None,
-    paged_cache_groups: Sequence["PagedCacheGroupConfig"] | None = None,
 ) -> bool:
     """Return whether the runtime can use the overlapped scheduler loop."""
 
     if disable_overlap_schedule:
         return False
-    if disaggregation_mode == "prefill":
-        return False
-    if speculative_algorithm is not None and paged_cache_groups:
+    if disaggregation_mode in ("prefill", "encode"):
+        # prefill drain + KV send run only on the non-overlap loop; encode has no LM loop.
         return False
     return True
 
@@ -196,6 +195,17 @@ def make_extend_result_event(request_id: str, tokens: list[int] = ()) -> None:
 
 def make_finish_event(request_id: str) -> None:
     fe = ForwardEvent.Finish()
+    fe.request_id = request_id
+    return fe
+
+
+def make_abort_event(request_id: str) -> None:
+    """Finish without caching: AbortEvent skips the radix-tree insert and
+    never enters Draining, so no host-KV writeback (target or draft) is
+    issued. Used for numerically-corrupted requests whose KV must not be
+    reused.
+    """
+    fe = ForwardEvent.Abort()
     fe.request_id = request_id
     return fe
 

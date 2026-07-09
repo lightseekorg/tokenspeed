@@ -26,7 +26,6 @@ import torch
 
 from tokenspeed.runtime.execution.cache_loc_kernel import (
     compute_out_cache_loc,
-    compute_out_cache_loc_uniform,
     fused_decode_input_prep,
 )
 from tokenspeed.runtime.execution.forward_batch_info import compute_position_triton
@@ -54,6 +53,7 @@ class InputBuffers:
         max_num_tokens: int,
         page_size: int,
         dummy_kv_slot: int,
+        state_write_padding_pool_index: int,
         device: str = "cuda",
         has_mamba: bool = False,
     ):
@@ -61,6 +61,7 @@ class InputBuffers:
         self.page_size = page_size
         self.max_num_tokens = max_num_tokens
         self.dummy_kv_slot = dummy_kv_slot
+        self.state_write_padding_pool_index = state_write_padding_pool_index
         self.max_bs = max_bs
         self.all_extends_mid_chunk = False
         self.has_mamba = has_mamba
@@ -84,6 +85,9 @@ class InputBuffers:
                 (3, max_num_tokens), dtype=torch.int64
             )
             self.req_pool_indices_buf = torch.zeros((max_bs,), dtype=torch.int64)
+            self.state_write_req_pool_indices_buf = torch.full(
+                (max_bs,), state_write_padding_pool_index, dtype=torch.int64
+            )
             self.seq_lens_buf = torch.ones((max_bs,), dtype=torch.int32)
             # Initialise to dummy_kv_slot so that padding positions (never
             # written by compute_out_cache_loc) always point to the reserved
@@ -137,7 +141,6 @@ class InputBuffers:
         total_tokens: int,
     ):
         batch_size = len(forward_op.request_ids)
-        assert batch_size >= 0
         num_extends = forward_op.num_extends()
 
         # CPU-side fast path: when the scheduler always emits a decode_input_ids
@@ -149,6 +152,10 @@ class InputBuffers:
             forward_op.request_pool_indices, device="cpu", pin_memory=True
         )
         self.req_pool_indices_buf[:batch_size].copy_(
+            req_pool_indices_cpu,
+            non_blocking=True,
+        )
+        self.state_write_req_pool_indices_buf[:batch_size].copy_(
             req_pool_indices_cpu,
             non_blocking=True,
         )
@@ -385,6 +392,9 @@ class InputBuffers:
             self.mrope_positions_buf[:, total_tokens:].zero_()
         if batch_size < self.max_bs:
             self.req_pool_indices_buf[batch_size:].fill_(0)
+            self.state_write_req_pool_indices_buf[batch_size:].fill_(
+                self.state_write_padding_pool_index
+            )
             self.seq_lens_buf[batch_size:].fill_(1)
 
         if (
@@ -434,6 +444,9 @@ class InputBuffers:
             self.mrope_positions_buf[:, :total_tokens].zero_()
         if batch_size > 0:
             self.req_pool_indices_buf[:batch_size].fill_(0)
+            self.state_write_req_pool_indices_buf[:batch_size].fill_(
+                self.state_write_padding_pool_index
+            )
             # seq_lens must be >= spec_num_tokens so the drafter's prewrite
             # correction never goes negative.
             num_tokens_per_req = total_tokens // batch_size if batch_size > 0 else 1

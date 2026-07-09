@@ -40,6 +40,7 @@ from tokenspeed.runtime.configs.qwen3_5_config import (
     Qwen3_5Config,
     Qwen3_5TextConfig,
 )
+from tokenspeed.runtime.configs.utils import get_rope_parameters
 
 # Distributed
 from tokenspeed.runtime.distributed.comm_manager import CommManager
@@ -61,8 +62,8 @@ from tokenspeed.runtime.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
-from tokenspeed.runtime.layers.moe.checkpoint import (
+from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
+from tokenspeed.runtime.layers.moe import (
     ExpertCheckpointSchema,
     build_moe_checkpoint_loader,
 )
@@ -85,6 +86,7 @@ from tokenspeed.runtime.models.qwen3_5_moe import (
     Qwen3_5MoeSparseMoeBlock,
 )
 from tokenspeed.runtime.models.qwen3_vision import Qwen3VLMoeVisionModel
+from tokenspeed.runtime.models.utils import validate_attention_partition
 from tokenspeed.runtime.moe.distribution_recorder import (
     get_global_expert_distribution_recorder,
 )
@@ -94,7 +96,10 @@ from tokenspeed.runtime.multimodal.embedder import (
     VisionEmbedder,
     pad_input_tokens,
 )
-from tokenspeed.runtime.multimodal.encoder_cudagraph import EncoderCudaGraphWrapper
+from tokenspeed.runtime.multimodal.encoder_cudagraph import (
+    EncoderCudaGraphWrapper,
+    VisionEncoderCudaGraphAdapter,
+)
 from tokenspeed.runtime.multimodal.inputs import (
     Modality,
     MultimodalDataItem,
@@ -105,7 +110,7 @@ from tokenspeed.runtime.utils import (
     make_layers,
     set_weight_attrs,
 )
-from tokenspeed.runtime.utils.cuda_stream import StreamFork
+from tokenspeed.runtime.utils.env import envs
 
 logger = logging.getLogger(__name__)
 
@@ -225,7 +230,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             group_size=None,
             norm_before_gate=True,
             device=torch.get_device_module().current_device(),
-            dtype=config.torch_dtype,
+            dtype=config.dtype,
         )
 
         # Output projection
@@ -256,8 +261,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         if hasattr(param, "weight_loader"):
             # Regular parameter/tensor that already has a mutable attr.
-            # Do NOT call set_weight_attrs here, because it asserts when
-            # overwriting an existing attribute.
+            # Do NOT call set_weight_attrs here; overwriting an existing
+            # attribute is rejected.
             param.weight_loader = loader
             return
 
@@ -312,19 +317,21 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
                 if len(loaded_weight.shape) == 0:
                     # Scalar only makes sense for a single logical shard.
-                    assert len(split_sizes) == 1 and split_sizes[0] == 1, (
-                        f"Unexpected scalar for tuple shard load: "
-                        f"{loaded_shard_id=}, {split_sizes=}"
-                    )
+                    if len(split_sizes) != 1 or split_sizes[0] != 1:
+                        raise ValueError(
+                            f"Unexpected scalar for tuple shard load: "
+                            f"{loaded_shard_id=}, {split_sizes=}"
+                        )
                     chunks = [loaded_weight.reshape(1)]
                 else:
                     split_dim = getattr(param, "output_dim", 0)
                     chunks = loaded_weight.split(split_sizes, dim=split_dim)
 
-                assert len(chunks) == len(loaded_shard_id), (
-                    f"Chunk/shard mismatch: {len(chunks)=}, "
-                    f"{len(loaded_shard_id)=}, {split_sizes=}"
-                )
+                if len(chunks) != len(loaded_shard_id):
+                    raise ValueError(
+                        f"Chunk/shard mismatch: {len(chunks)=}, "
+                        f"{len(loaded_shard_id)=}, {split_sizes=}"
+                    )
 
                 for idx, chunk in zip(loaded_shard_id, chunks):
                     # Delegate each chunk to the param's original int-shard loader.
@@ -453,7 +460,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
 
         linear_attn_quant_config = (
             None
-            if quant_config and quant_config.get_name() == "nvfp4"
+            if quant_config and quant_config.get_name() in ("fp8", "nvfp4")
             else quant_config
         )
         self.linear_attn = Qwen3_5GatedDeltaNet(
@@ -578,13 +585,13 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self.attn_tp_size = mapping.attn.tp_size
         self.attn_tp_group = mapping.attn.tp_group
         self.total_num_heads = config.num_attention_heads
-        assert self.total_num_heads % self.attn_tp_size == 0
-        self.num_heads = self.total_num_heads // self.attn_tp_size
         self.total_num_kv_heads = config.num_key_value_heads
-        if self.total_num_kv_heads >= self.attn_tp_size:
-            assert self.total_num_kv_heads % self.attn_tp_size == 0
-        else:
-            assert self.attn_tp_size % self.total_num_kv_heads == 0
+        validate_attention_partition(
+            self.total_num_heads,
+            self.total_num_kv_heads,
+            self.attn_tp_size,
+        )
+        self.num_heads = self.total_num_heads // self.attn_tp_size
         self.num_kv_heads = max(1, self.total_num_kv_heads // self.attn_tp_size)
         self.head_dim = config.head_dim or (self.hidden_size // self.num_heads)
         self.q_size = self.num_heads * self.head_dim
@@ -592,10 +599,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
 
-        if hasattr(config, "rope_parameters"):
-            self.rope_scaling = getattr(config, "rope_parameters", None)
-        else:
-            self.rope_scaling = getattr(config, "rope_scaling", None)
+        self.rope_scaling = get_rope_parameters(config)
 
         self.rope_theta = self.rope_scaling.get("rope_theta", 10000)
         self.partial_rotary_factor = self.rope_scaling.get("partial_rotary_factor", 1.0)
@@ -711,16 +715,13 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             self.q_norm.variance_epsilon,
         )
 
-    def self_attention(
+    def _project_qkv_rope(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
-    ) -> torch.Tensor:
-        """Full attention forward pass."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """qkv_proj + split + rope (+ optional gate). ``gate`` is ``None`` when ``attn_output_gate=False``."""
         qkv, _ = self.qkv_proj(hidden_states)
-
         if self.attn_output_gate:
             q_gate, k, v = qkv.split(
                 [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
@@ -738,22 +739,47 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 self.head_dim,
                 self.rotary_emb.rotary_dim,
             )
-        else:
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            q, k = self._apply_qk_norm(q, k)
-            q, k = self.rotary_emb(positions, q, k)
+            return q, k, v, gate
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k = self._apply_qk_norm(q, k)
+        q, k = self.rotary_emb(positions, q, k)
+        return q, k, v, None
 
+    def _attn(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        gate: torch.Tensor | None,
+        ctx: ForwardContext,
+        out_cache_loc: torch.Tensor,
+    ) -> torch.Tensor:
+        """Backend attention call + optional gate apply. Subclasses override."""
         attn_output = self.attn(q, k, v, ctx, out_cache_loc)
-
-        if self.attn_output_gate:
+        if gate is not None:
             sigmoid_mul(attn_output, gate)
+        return attn_output
 
-        if ctx.draft_first_step_reduce:
-            # Slice attn_output to [bs, H] so o_proj runs on live rows only.
-            attn_output = attn_output.index_select(0, ctx.gather_ids)
-
+    def self_attention(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        ctx: ForwardContext,
+        out_cache_loc: torch.Tensor,
+    ) -> torch.Tensor:
+        """Full attention forward pass."""
+        q, k, v, gate = self._project_qkv_rope(positions, hidden_states)
+        attn_output = self._attn(q, k, v, gate, ctx, out_cache_loc)
         output, _ = self.o_proj(attn_output)
         return output
+
+    def _maybe_narrow_residual(
+        self,
+        residual: torch.Tensor,
+        ctx: ForwardContext,
+    ) -> torch.Tensor:
+        """Hook: subclasses narrow residual to match a sliced attn output."""
+        return residual
 
     def forward(
         self,
@@ -779,9 +805,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 ctx=ctx,
                 out_cache_loc=out_cache_loc,
             )
-            if ctx.draft_first_step_reduce:
-                # Gather residual to self_attention's [bs, H].
-                residual = residual.index_select(0, ctx.gather_ids)
+            residual = self._maybe_narrow_residual(residual, ctx)
             hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
                 hidden_states, residual, ctx
             )
@@ -817,14 +841,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         return hidden_states
 
 
-ALL_DECODER_LAYER_TYPES = {
-    "attention": Qwen3_5AttentionDecoderLayer,
-    "linear_attention": Qwen3_5LinearDecoderLayer,
-}
-
-
 class Qwen3_5ForCausalLM(nn.Module):
     """Qwen3.5 Model with support for dense variant."""
+
+    ATTENTION_LAYER_CLS: type = Qwen3_5AttentionDecoderLayer
+    LINEAR_LAYER_CLS: type = Qwen3_5LinearDecoderLayer
 
     def __init__(
         self,
@@ -850,10 +871,14 @@ class Qwen3_5ForCausalLM(nn.Module):
             tp_group=self.mapping.attn.tp_group,
         )
 
-        # Decoder layers
+        layer_cls_by_type = {
+            "attention": self.ATTENTION_LAYER_CLS,
+            "linear_attention": self.LINEAR_LAYER_CLS,
+        }
+
         def get_layer(idx: int, prefix: str):
             layer_type = config.layers_block_type[idx]
-            layer_class = ALL_DECODER_LAYER_TYPES[layer_type]
+            layer_class = layer_cls_by_type[layer_type]
             if layer_type == "attention":
                 prefix = add_prefix("self_attn", prefix)
             else:
@@ -930,7 +955,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 )
 
         # Apply final normalization with optional allreduce fusion
-        hidden_states = layer.comm_manager.final_norm(
+        hidden_states, _ = layer.comm_manager.final_norm(
             hidden_states, residual, ctx, self.norm
         )
 
@@ -1104,6 +1129,8 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                     mapped_name = moe_loader.load(name, loaded_weight)
                     loaded_params.add(mapped_name)
                     continue
+                if moe_loader.is_expert_checkpoint_weight(name):
+                    continue
 
                 # Skip loading extra parameters for GPTQ/nvfp4 models.
                 if name.endswith(ignore_suffixes) and name not in params_dict:
@@ -1139,11 +1166,10 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             mapping=mapping,
             quant_config=quant_config,
             prefix=prefix,
+            encoder_only=getattr(config, "encoder_only", False),
         )
 
-        rope_config = getattr(self.config, "rope_parameters", None) or getattr(
-            self.config, "rope_scaling", {}
-        )
+        rope_config = get_rope_parameters(self.config)
         self.is_mrope_enabled = "mrope_section" in rope_config
         self.is_multimodal_active = is_multimodal_active
         if not self.is_multimodal_active:
@@ -1164,16 +1190,18 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             )
             self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
             self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
-            # image_encoder may be swapped to a cudagraph wrapper by ModelExecutor.
+            # Encoder callables may be swapped to cudagraph wrappers by
+            # ModelExecutor.
             self.vision_embedder = VisionEmbedder()
             self.image_encoder = self.get_image_feature
             self.video_encoder = self.get_video_feature
 
     def separate_deepstack_embeds(self, embedding: torch.Tensor):
-        assert embedding.shape[-1] % (1 + self.num_deepstack_embeddings) == 0, (
-            f"hidden_state of {embedding.shape} should be divisible by "
-            f"{1 + self.num_deepstack_embeddings}"
-        )
+        divisor = 1 + self.num_deepstack_embeddings
+        if embedding.shape[-1] % divisor != 0:
+            raise ValueError(
+                f"hidden_state of {embedding.shape} should be divisible by {divisor}"
+            )
         separate_index = self.config.hidden_size
         input_embeds = embedding[:, :separate_index]
         input_deepstack_embeds = embedding[:, separate_index:]
@@ -1186,14 +1214,14 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
         """Eager image encode via the ``pre_encode`` / ``forward_blocks`` /
         ``post_encode`` decomposition the cudagraph wrapper uses, so eager
         and captured paths share a single source of truth."""
-        tokens, grid = self.pre_encode(items, grid_attr="image_grid_thw")
+        tokens, grid = self.pre_encode(items)
         metadata = self.visual.prepare_metadata(grid)
         encoded = self.visual.forward_blocks(tokens, metadata)
         return self.post_encode([encoded], grid)
 
     def get_video_feature(self, items: list[MultimodalDataItem]) -> torch.Tensor:
-        """Eager video encode; videos never go through the cudagraph wrapper."""
-        tokens, grid = self.pre_encode(items, grid_attr="video_grid_thw")
+        """Eager video encode; the cudagraph path uses the same pre/post hooks."""
+        tokens, grid = self.pre_encode(items)
         metadata = self.visual.prepare_metadata(grid)
         encoded = self.visual.forward_blocks(tokens, metadata)
         return self.post_encode([encoded], grid)
@@ -1201,19 +1229,35 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
     def pre_encode(
         self,
         items: list[MultimodalDataItem],
-        grid_attr: str = "image_grid_thw",
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Eager patch-embed before the captured region; returns ``(tokens, grid)``.
 
-        ``grid_attr`` selects which grid field on each item to read --
-        ``image_grid_thw`` (default, used by the wrapper) or ``video_grid_thw``.
+        The grid field is selected per item by modality (``video_grid_thw`` for
+        video, ``image_grid_thw`` otherwise) so a single shared encoder cudagraph
+        wrapper can serve both image and video batches.
         """
-        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
-            self.visual.dtype
+        device = self.visual.device
+        pixel_values = torch.cat(
+            [item.feature.to(device, non_blocking=True) for item in items], dim=0
+        ).type(self.visual.dtype)
+        grid = torch.concat(
+            [
+                getattr(
+                    item,
+                    (
+                        "video_grid_thw"
+                        if item.modality == Modality.VIDEO
+                        else "image_grid_thw"
+                    ),
+                )
+                for item in items
+            ],
+            dim=0,
         )
-        grid = torch.concat([getattr(item, grid_attr) for item in items], dim=0)
-        assert pixel_values.dim() == 2, pixel_values.dim()
-        assert grid.dim() == 2, grid.dim()
+        if pixel_values.dim() != 2:
+            raise ValueError(f"pixel_values must be 2D, got {pixel_values.dim()}D.")
+        if grid.dim() != 2:
+            raise ValueError(f"grid must be 2D, got {grid.dim()}D.")
         x = self.visual.prepare_patch_embed(pixel_values, grid)
         return x, grid
 
@@ -1223,22 +1267,60 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
         """Eager step after the captured region; returns features."""
         return torch.cat(encoder_outs, dim=0)
 
-    def make_encoder_cudagraph_wrapper(self, mapping):
+    def _build_encoder_cudagraph_wrapper(
+        self,
+        mapping,
+        *,
+        max_metadata_sequences_per_batch: int | None = None,
+        metadata_sequence_budget_from_encoder_output_budget: bool = False,
+    ):
         # Captured region is ``Qwen3VLMoeVisionModel.forward_blocks`` (blocks +
         # deepstack mergers + merger); the merger applies a
         # ``spatial_merge_size ** 2`` token reduction, so budgets count
         # post-merge tokens while the capture input buffer holds
         # ``spatial_merge_size ** 2 * budget`` patches.
-        return EncoderCudaGraphWrapper(
-            mapping=mapping,
+        adapter = VisionEncoderCudaGraphAdapter(
             tower=self.visual,
             pre_encode=self.pre_encode,
             post_encode=self.post_encode,
             out_div=self.visual.spatial_merge_size**2,
             merge=self.visual.spatial_merge_size,
-            budget_range=(64, 4096),
             input_feature_shape=(1, self.visual.hidden_size),
+            modality_name="vision",
+            capture_tp_size=mapping.vision.tp_size,
+            capture_tp_group=mapping.vision.tp_group,
         )
+        return EncoderCudaGraphWrapper(
+            adapter=adapter,
+            budget_range=(64, 4096),
+            max_metadata_sequences_per_batch=max_metadata_sequences_per_batch,
+            metadata_sequence_budget_from_encoder_output_budget=(
+                metadata_sequence_budget_from_encoder_output_budget
+            ),
+        )
+
+    def make_encoder_cudagraph_wrappers(self, mapping):
+        max_video_metadata_sequences = (
+            envs.TOKENSPEED_MM_VIDEO_ENCODER_CUDA_GRAPH_MAX_SEQUENCES_PER_BATCH.get()
+        )
+        if max_video_metadata_sequences is not None:
+            max_video_metadata_sequences = max(1, max_video_metadata_sequences)
+        # Image and video encode through the identical captured region
+        # (``visual.forward_blocks`` over the same post-merge token buckets), so
+        # one wrapper serves both -- ``pre_encode`` selects the grid field per
+        # item by modality. Sharing a single set of budget graphs (rather than
+        # one set per modality) halves the captured-graph GPU memory. The video
+        # metadata-sequence policy is the superset (a video batch packs more
+        # sequences per item than an image batch at a given token budget), so it
+        # also covers image batches.
+        shared = self._build_encoder_cudagraph_wrapper(
+            mapping,
+            max_metadata_sequences_per_batch=max_video_metadata_sequences,
+            metadata_sequence_budget_from_encoder_output_budget=(
+                max_video_metadata_sequences is None
+            ),
+        )
+        return {"image_encoder": shared, "video_encoder": shared}
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -1334,6 +1416,12 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             if "mtp" in name:
                 continue
             if not self.is_multimodal_active and "visual" in name:
+                continue
+            # Vision-only role: drop every non-visual (LM / lm_head / norm /
+            # embed) weight up front, before any rename or params_dict lookup,
+            # so none is routed into a None module. self.model is None here, so
+            # named_parameters() exposes only visual params.
+            if getattr(self, "encoder_only", False) and "visual" not in name:
                 continue
             if "language_model" in name:
                 name = name.replace(r"model.language_model.", r"model.")
@@ -1455,6 +1543,13 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
                 continue
             if not self.is_multimodal_active and "visual" in name:
                 continue
+            # Vision-only role: drop every non-visual (LM / lm_head / norm /
+            # embed / expert) weight up front, before any rename, params_dict
+            # lookup, or moe_loader.load (which would KeyError on a missing
+            # expert param). self.model is None here, so named_parameters()
+            # exposes only visual params.
+            if getattr(self, "encoder_only", False) and "visual" not in name:
+                continue
             if "language_model" in name:
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
@@ -1487,6 +1582,8 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
                 if moe_loader.matches(name):
                     mapped_name = moe_loader.load(name, loaded_weight)
                     loaded_params.add(mapped_name)
+                    continue
+                if moe_loader.is_expert_checkpoint_weight(name):
                     continue
 
                 # Skip loading extra parameters for GPTQ/nvfp4 models.

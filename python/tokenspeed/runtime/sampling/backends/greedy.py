@@ -34,10 +34,7 @@ from tokenspeed.runtime.sampling.backends.base import (
     SamplingBackendConfig,
 )
 from tokenspeed.runtime.sampling.registry import register_backend
-from tokenspeed.runtime.sampling.utils import (
-    gather_token_logprobs_torch,
-    nan_guard_logits,
-)
+from tokenspeed.runtime.sampling.utils import gather_token_logprobs_torch
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.pdl import pdl_enabled
 
@@ -171,9 +168,7 @@ class GreedySamplingBackend(SamplingBackend):
         sampling_info: SamplingBatchInfo,
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
-        logits = nan_guard_logits(
-            logits_output.next_token_logits, self.config.enable_nan_detection
-        )
+        logits = logits_output.next_token_logits
         # Grammar bitmask apply — captured inside the CUDA graph. Buffer is
         # pre-bound by bind_grammar_mask_buf; non-grammar rows stay all-ones
         # so apply is a no-op.
@@ -183,6 +178,12 @@ class GreedySamplingBackend(SamplingBackend):
             )
         bs = logits.shape[0]
         tokens = sampling_argmax(logits, out=self._sample_token_buf[:bs])
+
+        # TP-rank sync (rank 0 wins), mirrors FlashInferSamplingBackend.sample.
+        # All-gathered logits are not bit-identical across ranks, so per-rank
+        # argmax can diverge; an unsynced token id desyncs batch composition and
+        # deadlocks a downstream model all-reduce.
+        self.maybe_broadcast(tokens)
 
         if self.config.enable_output_logprobs:
             logits_output.next_token_logprobs = gather_token_logprobs_torch(
@@ -210,9 +211,7 @@ class GreedySamplingBackend(SamplingBackend):
         )
         accept_length = self._accept_length_buf[:bs]
 
-        logits = nan_guard_logits(
-            logits_output.next_token_logits, self.config.enable_nan_detection
-        )
+        logits = logits_output.next_token_logits
 
         # Per-draft-position grammar bitmask: buffer shape
         # [bs * num_tokens_per_req, V/32] matches the flat target logits.
@@ -235,6 +234,13 @@ class GreedySamplingBackend(SamplingBackend):
         )
 
         accept_length += 1
+
+        # TP-rank sync on the full verify-output triple, mirrors
+        # FlashInferSamplingBackend.verify. Per-rank argmax / accept-length
+        # divergence (logits not bit-identical across ranks) desyncs batch
+        # composition and deadlocks the model all-reduce. Buffers are laid out
+        # flat so these views are NCCL-contiguous.
+        self.maybe_broadcast(predict, accept_index, accept_length)
 
         if self.config.enable_output_logprobs:
             logits_output.next_token_logprobs = gather_token_logprobs_torch(

@@ -52,6 +52,7 @@ class AttentionConfig:
     PAGE_TABLE_STRIDE: gl.constexpr
     PAGE_SIZE: gl.constexpr
     NUM_KV_SPLITS: gl.constexpr
+    MAX_SEQLEN_Q: gl.constexpr
     NUM_Q_HEADS: gl.constexpr
     NUM_KV_HEADS: gl.constexpr
     HEAD_DIM: gl.constexpr
@@ -81,6 +82,7 @@ class AttentionConfig:
         PAGE_TABLE_STRIDE,
         PAGE_SIZE,
         NUM_KV_SPLITS,
+        MAX_SEQLEN_Q,
         NUM_Q_HEADS,
         NUM_KV_HEADS,
         HEAD_DIM,
@@ -124,6 +126,7 @@ class AttentionConfig:
         self.PAGE_TABLE_STRIDE = gl.constexpr(PAGE_TABLE_STRIDE)
         self.PAGE_SIZE = gl.constexpr(PAGE_SIZE)
         self.NUM_KV_SPLITS = gl.constexpr(NUM_KV_SPLITS)
+        self.MAX_SEQLEN_Q = gl.constexpr(MAX_SEQLEN_Q)
         self.NUM_Q_HEADS = gl.constexpr(NUM_Q_HEADS)
         self.NUM_KV_HEADS = gl.constexpr(NUM_KV_HEADS)
         self.HEAD_DIM = gl.constexpr(HEAD_DIM)
@@ -162,6 +165,7 @@ class AttentionProgram:
     cache_seqlens_ptr: gl.tensor
     mid_o_ptr: gl.tensor
     mid_lse_ptr: gl.tensor
+    q_index: gl.tensor
     batch: gl.tensor
     kv_head: gl.tensor
     group_start: gl.tensor
@@ -182,6 +186,7 @@ class AttentionProgram:
         cache_seqlens_ptr,
         mid_o_ptr,
         mid_lse_ptr,
+        q_index,
         batch,
         kv_head,
         group_start,
@@ -199,6 +204,7 @@ class AttentionProgram:
         self.cache_seqlens_ptr = cache_seqlens_ptr
         self.mid_o_ptr = mid_o_ptr
         self.mid_lse_ptr = mid_lse_ptr
+        self.q_index = q_index
         self.batch = batch
         self.kv_head = kv_head
         self.group_start = group_start
@@ -219,16 +225,25 @@ class AttentionProgram:
         mid_o_ptr,
         mid_lse_ptr,
     ):
-        batch = gl.program_id(0)
+        q_index = gl.program_id(0)
+        batch = q_index // cfg.MAX_SEQLEN_Q
+        q_pos = q_index - batch * cfg.MAX_SEQLEN_Q
         head_block = gl.program_id(1)
         kv_head = head_block // cfg.NUM_GROUPS
         group_block = head_block - kv_head * cfg.NUM_GROUPS
         group_start = group_block * cfg.BLOCK_M
         split_id = gl.program_id(2)
         cache_len = gl.load(cache_seqlens_ptr + batch)
+        cache_len = cache_len - (cfg.MAX_SEQLEN_Q - 1 - q_pos)
+        cache_len = maximum(cache_len, 0)
         if cfg.IS_SLIDING:
-            window_len = min(cache_len, cfg.WINDOW_LEFT)
-            kv_start = cache_len - window_len
+            # WINDOW_LEFT is defined as exclusive (keys strictly to the left, not
+            # counting the current token), so the window is WINDOW_LEFT + 1 keys
+            # once the current token is included. E.g. with
+            # WINDOW_LEFT = 127 and cache_len = 500 (current token at index 499),
+            # kv_start = 500 - (127 + 1) = 372 keeps keys [372, 499] = 128 keys.
+            # Without the + 1, kv_start = 373 would drop the leftmost key.
+            kv_start = cache_len - min(cache_len, cfg.WINDOW_LEFT + 1)
         else:
             kv_start = cache_len - cache_len
         first_page = kv_start // cfg.PAGE_SIZE
@@ -248,6 +263,7 @@ class AttentionProgram:
             cache_seqlens_ptr,
             mid_o_ptr,
             mid_lse_ptr,
+            q_index,
             batch,
             kv_head,
             group_start,
@@ -265,7 +281,7 @@ class AttentionProgram:
         offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.q_layout))
         q_heads = self.kv_head * cfg.GROUP_SIZE + self.group_start + offs_m
         valid = (self.group_start + offs_m) < cfg.GROUP_SIZE
-        offsets = cfg.q_strides.offsets(self.batch, q_heads[:, None], offs_d[None, :])
+        offsets = cfg.q_strides.offsets(self.q_index, q_heads[:, None], offs_d[None, :])
         return cdna4.buffer_load(self.q_ptr, offsets, mask=valid[:, None], other=0.0)
 
     @gluon.jit
@@ -327,7 +343,7 @@ class AttentionProgram:
         cfg = self.cfg
         offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(1, cfg.load_layout))
         offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.load_layout))
-        token_loc = physical_page * cfg.PAGE_SIZE + offs_n
+        token_loc = physical_page.to(gl.int64) * cfg.PAGE_SIZE + offs_n.to(gl.int64)
         offsets = (
             token_loc[:, None] * cfg.NUM_KV_HEADS * cfg.HEAD_DIM
             + self.kv_head * cfg.HEAD_DIM
@@ -342,7 +358,7 @@ class AttentionProgram:
         cfg = self.cfg
         offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(1, cfg.load_layout))
         offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.load_layout))
-        token_loc = physical_page * cfg.PAGE_SIZE + offs_n
+        token_loc = physical_page.to(gl.int64) * cfg.PAGE_SIZE + offs_n.to(gl.int64)
         offsets = (
             token_loc[:, None] * cfg.NUM_KV_HEADS * cfg.HEAD_DIM
             + self.kv_head * cfg.HEAD_DIM
@@ -414,11 +430,11 @@ class AttentionProgram:
         part_o = acc * recip_l_i[:, None]
         part_lse = m_i * cfg.SM_SCALE + gl.log2(l_i)
         mid_o_offsets = (
-            (self.batch * cfg.NUM_Q_HEADS + q_heads[:, None]) * cfg.NUM_KV_SPLITS
+            (self.q_index * cfg.NUM_Q_HEADS + q_heads[:, None]) * cfg.NUM_KV_SPLITS
             + self.split_id
         ) * cfg.HEAD_DIM + offs_d[None, :]
         mid_lse_offsets = (
-            self.batch * cfg.NUM_Q_HEADS + q_heads
+            self.q_index * cfg.NUM_Q_HEADS + q_heads
         ) * cfg.NUM_KV_SPLITS + self.split_id
         cdna4.buffer_store(part_o, self.mid_o_ptr, mid_o_offsets, mask=valid[:, None])
         cdna4.buffer_store(part_lse, self.mid_lse_ptr, mid_lse_offsets, mask=valid)
@@ -434,7 +450,7 @@ class AttentionProgram:
         l_i = gl.convert_layout(l_i, gl.SliceLayout(1, cfg.store_layout))
         output = acc * (1.0 / l_i)[:, None]
         output = output.to(self.mid_o_ptr.dtype.element_ty)
-        offsets = (self.batch * cfg.NUM_Q_HEADS + q_heads[:, None]) * cfg.HEAD_DIM
+        offsets = (self.q_index * cfg.NUM_Q_HEADS + q_heads[:, None]) * cfg.HEAD_DIM
         offsets += offs_d[None, :]
         cdna4.buffer_store(output, self.mid_o_ptr, offsets, mask=valid[:, None])
 
@@ -460,6 +476,7 @@ def _mha_decode_fp16(
     PAGE_TABLE_STRIDE: gl.constexpr,
     PAGE_SIZE: gl.constexpr,
     NUM_KV_SPLITS: gl.constexpr,
+    MAX_SEQLEN_Q: gl.constexpr,
     NUM_Q_HEADS: gl.constexpr,
     NUM_KV_HEADS: gl.constexpr,
     HEAD_DIM: gl.constexpr,
@@ -473,6 +490,7 @@ def _mha_decode_fp16(
         PAGE_TABLE_STRIDE,
         PAGE_SIZE,
         NUM_KV_SPLITS,
+        MAX_SEQLEN_Q,
         NUM_Q_HEADS,
         NUM_KV_HEADS,
         HEAD_DIM,
@@ -540,6 +558,7 @@ def _mha_decode_sliding_fp16(
     SM_SCALE: gl.constexpr,
     PAGE_TABLE_STRIDE: gl.constexpr,
     PAGE_SIZE: gl.constexpr,
+    MAX_SEQLEN_Q: gl.constexpr,
     NUM_Q_HEADS: gl.constexpr,
     NUM_KV_HEADS: gl.constexpr,
     HEAD_DIM: gl.constexpr,
@@ -554,6 +573,7 @@ def _mha_decode_sliding_fp16(
         PAGE_TABLE_STRIDE,
         PAGE_SIZE,
         1,
+        MAX_SEQLEN_Q,
         NUM_Q_HEADS,
         NUM_KV_HEADS,
         HEAD_DIM,
@@ -611,6 +631,7 @@ def _mha_decode_reduce_fp16(
     SM_SCALE: gl.constexpr,
     PAGE_TABLE_STRIDE: gl.constexpr,
     NUM_KV_SPLITS: gl.constexpr,
+    MAX_SEQLEN_Q: gl.constexpr,
     PAGE_SIZE: gl.constexpr,
     NUM_Q_HEADS: gl.constexpr,
     NUM_KV_HEADS: gl.constexpr,
@@ -624,6 +645,7 @@ def _mha_decode_reduce_fp16(
         PAGE_TABLE_STRIDE,
         PAGE_SIZE,
         NUM_KV_SPLITS,
+        MAX_SEQLEN_Q,
         NUM_Q_HEADS,
         NUM_KV_HEADS,
         HEAD_DIM,
@@ -633,9 +655,13 @@ def _mha_decode_reduce_fp16(
         -1,  # WINDOW_LEFT
         InputStrides(1, 1, 1),
     )
-    batch = gl.program_id(0)
+    q_index = gl.program_id(0)
+    batch = q_index // MAX_SEQLEN_Q
+    q_pos = q_index - batch * MAX_SEQLEN_Q
     q_head = gl.program_id(1)
     cache_len = gl.load(cache_seqlens_ptr + batch)
+    cache_len = cache_len - (MAX_SEQLEN_Q - 1 - q_pos)
+    cache_len = maximum(cache_len, 0)
     first_page = 0
     end_page = cdiv(cache_len, cfg.PAGE_SIZE)
     num_pages = end_page - first_page
@@ -656,7 +682,7 @@ def _mha_decode_reduce_fp16(
     split_end_tok = gl.where(split_end_raw < cache_len, split_end_raw, cache_len)
     split_valid = (split_start_tok < split_end_tok) & (offs_s < cfg.NUM_KV_SPLITS)
     # Load every split's partial output and lse.
-    base = (batch * cfg.NUM_Q_HEADS + q_head) * cfg.NUM_KV_SPLITS + offs_s
+    base = (q_index * cfg.NUM_Q_HEADS + q_head) * cfg.NUM_KV_SPLITS + offs_s
     part_lse = gl.load(mid_lse_ptr + base, mask=split_valid, other=-float("inf"))
     o_off = base[:, None] * cfg.HEAD_DIM + offs_d[None, :]
     part_o = cdna4.buffer_load(mid_o_ptr, o_off, mask=split_valid[:, None], other=0.0)
@@ -673,7 +699,7 @@ def _mha_decode_reduce_fp16(
         l_i = l_i + gl.exp2(sink - m_i)
     acc = gl.sum(part_o * beta[:, None], axis=0)
 
-    out_base = (batch * cfg.NUM_Q_HEADS + q_head) * cfg.HEAD_DIM
+    out_base = (q_index * cfg.NUM_Q_HEADS + q_head) * cfg.HEAD_DIM
     output = acc * (1.0 / l_i)
     output = output.to(out_ptr.dtype.element_ty)
     cdna4.buffer_store(output, out_ptr, out_base + offs_d)
@@ -778,11 +804,14 @@ def gluon_mha_decode_fp16_gfx950(
     page_table: torch.Tensor,
     cache_seqlens: torch.Tensor,
     max_seqlen_k: int,
+    max_seqlen_q: int = 1,
     window_left: int = -1,
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
     return_lse: bool = False,
 ) -> torch.Tensor:
+    total_q = q.shape[0]
+
     has_sink = sinks is not None
     sink_arg = sinks if sinks is not None else q
     config = get_config(
@@ -792,12 +821,11 @@ def gluon_mha_decode_fp16_gfx950(
         window_left=window_left,
     )
 
-    batch = q.shape[0]
     output = torch.empty(q.shape, device=q.device, dtype=q.dtype)
 
     if config.is_sliding:
         # No split-k for sliding window attention
-        grid = (batch, config.num_kv_heads * config.num_groups, 1)
+        grid = (total_q, config.num_kv_heads * config.num_groups, 1)
         _mha_decode_sliding_fp16[grid](
             q,
             k_cache,
@@ -812,6 +840,7 @@ def gluon_mha_decode_fp16_gfx950(
             config.sm_scale,
             page_table.stride(0),
             config.page_size,
+            max_seqlen_q,
             config.num_q_heads,
             config.num_kv_heads,
             config.head_dim,
@@ -825,18 +854,18 @@ def gluon_mha_decode_fp16_gfx950(
     else:
         # Always use split-k for full attention
         mid_o = torch.empty(
-            (batch, config.num_q_heads, config.num_kv_splits, config.head_dim),
+            (total_q, config.num_q_heads, config.num_kv_splits, config.head_dim),
             device=q.device,
             dtype=torch.float32,
         )
         mid_lse = torch.empty(
-            (batch, config.num_q_heads, config.num_kv_splits),
+            (total_q, config.num_q_heads, config.num_kv_splits),
             device=q.device,
             dtype=torch.float32,
         )
 
         grid = (
-            batch,
+            total_q,
             config.num_kv_heads * config.num_groups,
             config.num_kv_splits,
         )
@@ -855,6 +884,7 @@ def gluon_mha_decode_fp16_gfx950(
             page_table.stride(0),
             config.page_size,
             config.num_kv_splits,
+            max_seqlen_q,
             config.num_q_heads,
             config.num_kv_heads,
             config.head_dim,
@@ -867,7 +897,7 @@ def gluon_mha_decode_fp16_gfx950(
 
         # Sink is a single global softmax entry, so split-k must merge it once in
         # reduce. Adding it in each split would count the sink once per split.
-        grid = (batch, config.num_q_heads)
+        grid = (total_q, config.num_q_heads)
         _mha_decode_reduce_fp16[grid](
             mid_o,
             mid_lse,
@@ -877,6 +907,7 @@ def gluon_mha_decode_fp16_gfx950(
             config.sm_scale,
             page_table.stride(0),
             config.num_kv_splits,
+            max_seqlen_q,
             config.page_size,
             config.num_q_heads,
             config.num_kv_heads,

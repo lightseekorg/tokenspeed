@@ -27,7 +27,6 @@ from tokenspeed.runtime.utils import crash_on_warnings, get_colorful_logger
 
 logger = get_colorful_logger(__name__)
 
-
 # Smallest positive value per dtype, used as the lower bound for `uniform_`
 # draws that feed rejection-sampling kernels. A coin of exact 0 silently
 # accepts a zero-probability draft in `chain_speculative_sampling_target_only`

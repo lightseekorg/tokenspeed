@@ -23,26 +23,24 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+)
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
-try:
+if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.attention.gluon.mha_decode_fp16_gfx950 import (
         gluon_mha_decode_fp16_gfx950 as _decode_impl,
+    )
+    from tokenspeed_kernel_amd.ops.attention.gluon.mha_extend_fp16_gfx950 import (
+        gluon_mha_extend_fp16_gfx950 as _extend_impl,
     )
     from tokenspeed_kernel_amd.ops.attention.gluon.mha_prefill_fp16_gfx950 import (
         gluon_mha_prefill_fp16_gfx950 as _prefill_impl,
     )
-except ImportError as exc:
-    _IMPORT_ERROR = exc
-    _decode_impl = None
-    _prefill_impl = None
-else:
-    _IMPORT_ERROR = None
-
-
-if _decode_impl is not None:
 
     @register_kernel(
         "attention",
@@ -72,16 +70,6 @@ if _decode_impl is not None:
     def gluon_mha_decode_fp16_gfx950(*args, **kwargs):
         return _decode_impl(*args, **kwargs)
 
-else:
-
-    def gluon_mha_decode_fp16_gfx950(*args, **kwargs):
-        raise ImportError(
-            "gluon_mha_decode_fp16_gfx950 requires tokenspeed-kernel-amd"
-        ) from _IMPORT_ERROR
-
-
-if _prefill_impl is not None:
-
     @register_kernel(
         "attention",
         "mha_prefill",
@@ -107,15 +95,31 @@ if _prefill_impl is not None:
     def gluon_mha_prefill_fp16_gfx950(*args, **kwargs):
         return _prefill_impl(*args, **kwargs)
 
-else:
-
-    def gluon_mha_prefill_fp16_gfx950(*args, **kwargs):
-        raise ImportError(
-            "gluon_mha_prefill_fp16_gfx950 requires tokenspeed-kernel-amd"
-        ) from _IMPORT_ERROR
-
-
-__all__ = [
-    "gluon_mha_decode_fp16_gfx950",
-    "gluon_mha_prefill_fp16_gfx950",
-]
+    @register_kernel(
+        "attention",
+        "mha_extend_with_kvcache",
+        name="gluon_mha_extend_fp16_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=format_signatures(
+            ("q", "k_cache", "v_cache"),
+            "dense",
+            {torch.float16, torch.bfloat16},
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "head_dim": frozenset({64}),
+            "page_size": frozenset({64}),
+            "is_causal": frozenset({False, True}),
+            "sliding_window": frozenset({False, True}),
+            "support_sinks": frozenset({False, True}),
+            "support_logit_cap": frozenset({False}),
+            "return_lse": frozenset({False, True}),
+        },
+    )
+    def gluon_mha_extend_fp16_gfx950(*args, **kwargs):
+        return _extend_impl(*args, **kwargs)

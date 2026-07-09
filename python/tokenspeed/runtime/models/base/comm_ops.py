@@ -28,8 +28,6 @@ adjacent compute modules.
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
-
 import torch
 from torch import nn
 
@@ -47,16 +45,20 @@ from tokenspeed.runtime.models.base.placement import ParallelGroup
 # ---------------------------------------------------------------------------
 
 
-def _scatter_count(num_tokens: int, tp_size: int) -> List[int]:
+def _scatter_count(num_tokens: int, tp_size: int) -> list[int]:
     base, remainder = divmod(num_tokens, tp_size)
     return [base + 1] * remainder + [base] * (tp_size - remainder)
 
 
-def _scattered_num_tokens_all(ctx: ForwardContext, mapping: Mapping) -> List[int]:
+def _scattered_num_tokens_all(ctx: ForwardContext, mapping: Mapping) -> list[int]:
     if ctx.global_num_tokens is not None:
-        scattered: List[int] = []
+        scattered: list[int] = []
         for attn_dp_rank in range(mapping.attn.dp_size):
-            num_tokens = ctx.global_num_tokens[attn_dp_rank * mapping.attn.tp_size]
+            # global_num_tokens is indexed by global rank with dp stride
+            # tp_size * cp_size; cp peers report the same count.
+            num_tokens = ctx.global_num_tokens[
+                attn_dp_rank * mapping.attn.tp_size * mapping.attn.cp_size
+            ]
             scattered.extend(_scatter_count(num_tokens, mapping.attn.tp_size))
         return scattered
     return _scatter_count(ctx.input_num_tokens, mapping.attn.tp_size)
@@ -66,7 +68,7 @@ def _group_scattered_num_tokens(
     ctx: ForwardContext,
     mapping: Mapping,
     group_type: ParallelGroup,
-) -> List[int]:
+) -> list[int]:
     if group_type == ParallelGroup.ATTN_TP:
         start = mapping.attn.tp_size * mapping.attn.dp_rank
         end = start + mapping.attn.tp_size
@@ -77,9 +79,19 @@ def _group_scattered_num_tokens(
         return _scattered_num_tokens_all(ctx, mapping)[start:end]
     elif group_type == ParallelGroup.MOE_TP_EP:
         tp_ep_size = mapping.moe.tp_ep_size
-        if ctx.global_num_tokens is not None:
-            start = mapping.moe.dp_rank * tp_ep_size
-            return list(ctx.global_num_tokens[start : start + tp_ep_size])
+        # Without DP, all ranks share the batch and the scattered table needs
+        # no global metadata, so the lookup below stays valid.
+        if ctx.global_num_tokens is not None or not mapping.attn.has_dp:
+            # After the attention reduce-scatter, each rank holds its
+            # scattered share of its attn dp group's tokens, not the raw
+            # global count; MoE collectives must size from those rows.
+            scattered = _scattered_num_tokens_all(ctx, mapping)
+            return [
+                scattered[mapping.attn.scatter_index(rank)]
+                for rank in mapping.moe.tp_ep_group
+            ]
+        # With DP but no gathered metadata, other dp groups' counts are
+        # unknown; only the local rank's contribution can be reported.
         result = [0] * tp_ep_size
         result[mapping.moe.tp_ep_rank] = ctx.input_num_tokens
         return result
@@ -94,7 +106,7 @@ def _group_scattered_num_tokens(
 
 def _get_group_info(
     mapping: Mapping, group_type: ParallelGroup
-) -> Tuple[int, Tuple[int, ...], bool]:
+) -> tuple[int, tuple[int, ...], bool]:
     """Return (rank, group, has_parallelism) for the given parallel group type."""
     if group_type == ParallelGroup.ATTN_TP:
         return mapping.attn.tp_rank, mapping.attn.tp_group, mapping.has_attn_tp
@@ -147,9 +159,9 @@ class AllReduceOp(CommOp):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
+        residual: torch.Tensor | None,
         ctx: ForwardContext,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if not self._has_parallel:
             return hidden_states, residual
         hidden_states = all_reduce(hidden_states, self._group)
@@ -162,9 +174,9 @@ class ReduceScatterOp(CommOp):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
+        residual: torch.Tensor | None,
         ctx: ForwardContext,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if not self._has_parallel:
             return hidden_states, residual
         scattered_num_tokens = _group_scattered_num_tokens(
@@ -184,9 +196,9 @@ class AllGatherOp(CommOp):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
+        residual: torch.Tensor | None,
         ctx: ForwardContext,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if not self._has_parallel:
             return hidden_states, residual
         scattered_num_tokens = _group_scattered_num_tokens(
@@ -206,9 +218,9 @@ class ResidualAllGatherOp(CommOp):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
+        residual: torch.Tensor | None,
         ctx: ForwardContext,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if not self._has_parallel or residual is None:
             return hidden_states, residual
         scattered_num_tokens = _group_scattered_num_tokens(
@@ -233,9 +245,9 @@ class ResidualSliceOp(CommOp):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
+        residual: torch.Tensor | None,
         ctx: ForwardContext,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if not self._has_parallel or residual is None:
             return hidden_states, residual
         scattered_num_tokens = _group_scattered_num_tokens(
@@ -272,9 +284,9 @@ class FusedReduceNormOp(CommOp):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
+        residual: torch.Tensor | None,
         ctx: ForwardContext,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if residual is None:
             # First layer: no residual to fuse with, just norm
             residual = hidden_states
@@ -313,9 +325,9 @@ class DeferredReduceOp(CommOp):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
+        residual: torch.Tensor | None,
         ctx: ForwardContext,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # Always defer — the downstream norm op handles the reduce.
         return hidden_states, residual
 
@@ -333,7 +345,7 @@ class FinalNormOp(CommOp):
         group_type: ParallelGroup,
         norm_module: nn.Module,
         use_all_reduce_mode: bool,
-        lm_head_group_type: Optional[ParallelGroup] = None,
+        lm_head_group_type: ParallelGroup | None = None,
     ) -> None:
         super().__init__(mapping, group_type)
         self.norm_module = norm_module
@@ -365,22 +377,26 @@ class FinalNormOp(CommOp):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
+        residual: torch.Tensor | None,
         ctx: ForwardContext,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        # Returns (normed hidden states, post-add residual); see
+        # CommManager.final_norm for the residual's meaning.
         if self._should_fuse(hidden_states.shape[0]):
-            hidden_states, *_ = self.norm_module.forward_with_allreduce_fusion(
-                self._rank,
-                self._group,
-                hidden_states,
-                residual,
+            hidden_states, residual_out, *_ = (
+                self.norm_module.forward_with_allreduce_fusion(
+                    self._rank,
+                    self._group,
+                    hidden_states,
+                    residual,
+                )
             )
         else:
             # The preceding DeferredReduceOp always defers, so we must
             # perform the all-reduce here before applying the norm.
             if self._has_parallel and self.use_all_reduce_mode:
                 hidden_states = all_reduce(hidden_states, self._group)
-            hidden_states, _ = self.norm_module(hidden_states, residual)
+            hidden_states, residual_out = self.norm_module(hidden_states, residual)
             # In RSAG mode, all-gather to restore tokens for the LM head.
             # Uses the LM head group (ATTN_TP) which may differ from the
             # scatter group when attn_tp != dense_tp.
@@ -393,4 +409,4 @@ class FinalNormOp(CommOp):
                     group=self._lm_group,
                     scattered_num_tokens=scattered_num_tokens,
                 )
-        return hidden_states
+        return hidden_states, residual_out

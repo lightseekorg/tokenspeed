@@ -26,7 +26,7 @@
 
 from __future__ import annotations
 
-from typing import Generic, List, Optional, Tuple, TypeVar
+from typing import Generic, TypeVar
 
 import torch
 from torch import nn
@@ -50,7 +50,7 @@ from tokenspeed.runtime.models.base.placement import ParallelGroup, Partial, Rep
 def _default_compute_output_placement(
     mapping: Mapping,
     group: ParallelGroup,
-) -> Optional[Partial]:
+) -> Partial | None:
     if group == ParallelGroup.ATTN_TP:
         has_parallel = mapping.has_attn_tp
     elif group == ParallelGroup.DENSE_TP:
@@ -135,8 +135,12 @@ class BaseDecoderLayer(nn.Module, Generic[_C]):
         )
 
         if aux_hidden_states is not None:
-
-            aux_hidden_states.append(residual.clone())
+            # Under RSAG the residual entering this layer is reduce-scattered
+            # across the attn TP group; aux consumers (e.g. the EAGLE3
+            # drafter) expect full rows, so gather before capturing.
+            aux_hidden_states.append(
+                self.comm_manager.gather_residual(residual, ctx).clone()
+            )
 
         hidden_states = self.comm_manager.pre_attn_comm(hidden_states, ctx)
 
@@ -258,7 +262,7 @@ class CompiledDecoderLayer(nn.Module, Generic[_C]):
         self.mapping = mapping
         self.prefix = prefix
 
-        self._compiled: Optional[_CompiledRuntime] = None
+        self._compiled: _CompiledRuntime | None = None
         self._exec_plan = self.build_execution_plan(prefix)
 
     @property
@@ -268,7 +272,7 @@ class CompiledDecoderLayer(nn.Module, Generic[_C]):
     def resolve_norm(self) -> nn.Module:
         return RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
 
-    def build_execution_plan(self, prefix: str) -> List[ExecutionNode]:
+    def build_execution_plan(self, prefix: str) -> list[ExecutionNode]:
         self.input_layernorm = self.resolve_norm()
         self.self_attn = self.resolve_attn(prefix)
         self.post_attention_layernorm = self.resolve_norm()
@@ -338,7 +342,7 @@ class CompiledDecoderLayer(nn.Module, Generic[_C]):
     def resolve_mlp(self, prefix: str) -> nn.Module:
         raise NotImplementedError
 
-    def resolve_exec_plan(self) -> List[ExecutionNode]:
+    def resolve_exec_plan(self) -> list[ExecutionNode]:
         return self._exec_plan
 
     def set_compiled(self, compiled: _CompiledRuntime) -> None:

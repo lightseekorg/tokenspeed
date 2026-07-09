@@ -14,9 +14,10 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from fractions import Fraction
-from typing import Any, Iterable, Optional, Sequence
+from typing import Any
 
 import numpy as np
 import torch
@@ -45,6 +46,7 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
 from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.common import ceil_div
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = get_colorful_logger(__name__)
 
@@ -236,6 +238,8 @@ def profile_deepseek_v4_max_num_pages(
     max_context_len: int,
     available_cache_memory_bytes: int,
     draft_cache_cell_size: int = 0,
+    decode_input_tokens: int = 1,
+    overlap_schedule_depth: int = 0,
 ) -> int:
     """Return the largest scheduler page budget that fits V4 grouped caches."""
     page_size = int(layout.page_size)
@@ -263,6 +267,8 @@ def profile_deepseek_v4_max_num_pages(
             max_scheduled_tokens=max_scheduled_tokens,
             max_total_tokens=num_tokens,
             max_context_len=max_context_len,
+            decode_input_tokens=decode_input_tokens,
+            overlap_schedule_depth=overlap_schedule_depth,
         )
         cache_bytes = sum(
             int(counts[gid]) * bytes_per_page
@@ -289,6 +295,8 @@ def profile_deepseek_v4_max_num_pages(
         max_scheduled_tokens=max_scheduled_tokens,
         max_total_tokens=0,
         max_context_len=max_context_len,
+        decode_input_tokens=decode_input_tokens,
+        overlap_schedule_depth=overlap_schedule_depth,
     )
     fixed_bytes = sum(
         int(fixed_counts[gid]) * bytes_per_page
@@ -713,7 +721,7 @@ def deepseek_v4_cache_layout_from_config(
     hf_config,
     page_size: int,
     use_fp4_indexer_cache: bool,
-    layer_indices: Optional[Iterable[int]] = None,
+    layer_indices: Iterable[int] | None = None,
 ) -> DeepseekV4CacheLayout:
     compress_ratios = tuple(hf_config.compress_ratios)
     if layer_indices is None:
@@ -771,6 +779,8 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
         rank: int,
         hf_config: Any,
         max_scheduled_tokens: int,
+        decode_input_tokens: int = 1,
+        overlap_schedule_depth: int = 0,
     ) -> None:
         if size <= 0:
             raise ValueError(f"DeepSeek V4 KV pool size must be positive, got {size}")
@@ -788,7 +798,11 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
             page_size=page_size,
             rank=rank,
         )
-        del enable_memory_saver
+        # Tag KV allocations as "kv_cache" (no CPU backup: discarded on sleep)
+        # so release/resume_memory_occupation frees them. See memory_occupation.py.
+        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=enable_memory_saver
+        )
         self.model_dtype = model_dtype
         self.layout = layout
         self.layer_num = layer_num
@@ -813,6 +827,8 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
             max_scheduled_tokens=max(0, int(max_scheduled_tokens)),
             max_total_tokens=size,
             max_context_len=max_context_len,
+            decode_input_tokens=decode_input_tokens,
+            overlap_schedule_depth=overlap_schedule_depth,
         )
 
         def _group_rows(group_id: str, default: int) -> int:
@@ -861,95 +877,98 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
             V4_SWA_KV_GROUP_ID,
             self.num_pages,
         )
-        self.swa_kv_buffer = [
-            torch.zeros(
-                (swa_pages, self.swa_block_bytes),
-                dtype=torch.uint8,
-                device=device,
-            )
-            for _ in range(layer_num)
-        ]
-        self.compressed_kv_buffer: list[torch.Tensor | None] = []
-        self.compressor_state_buffer: list[torch.Tensor | None] = []
-        self.indexer_kv_buffer: list[torch.Tensor | None] = []
-        self.indexer_state_buffer: list[torch.Tensor | None] = []
-        for layer_id, ratio in enumerate(layout.layer_ratio):
-            has_compressed = ratio > 1
-            has_indexer = ratio == 4
-            compressed_block_size = self.compressed_block_sizes[layer_id]
-            compressed_group_id = v4_compressed_kv_group_id(ratio)
-            compressed_pages = self.num_pages
-            if has_compressed:
-                compressed_pages = self.paged_cache_group_page_counts.get(
-                    compressed_group_id,
-                    self.num_pages,
-                )
-            self.compressed_kv_buffer.append(
+        with self.memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False):
+            self.swa_kv_buffer = [
                 torch.zeros(
-                    (
-                        compressed_pages,
-                        layout.swa_block_bytes(compressed_block_size),
-                    ),
+                    (swa_pages, self.swa_block_bytes),
                     dtype=torch.uint8,
                     device=device,
                 )
-                if has_compressed
-                else None
-            )
-            compressor_state_block_size = self.compressor_state_block_sizes[layer_id]
-            compressor_state_group_id = v4_compressor_state_group_id(ratio)
-            compressor_state_pages = self.num_pages
-            if has_compressed:
-                compressor_state_pages = self.paged_cache_group_page_counts.get(
-                    compressor_state_group_id,
-                    self.num_pages,
+                for _ in range(layer_num)
+            ]
+            self.compressed_kv_buffer: list[torch.Tensor | None] = []
+            self.compressor_state_buffer: list[torch.Tensor | None] = []
+            self.indexer_kv_buffer: list[torch.Tensor | None] = []
+            self.indexer_state_buffer: list[torch.Tensor | None] = []
+            for layer_id, ratio in enumerate(layout.layer_ratio):
+                has_compressed = ratio > 1
+                has_indexer = ratio == 4
+                compressed_block_size = self.compressed_block_sizes[layer_id]
+                compressed_group_id = v4_compressed_kv_group_id(ratio)
+                compressed_pages = self.num_pages
+                if has_compressed:
+                    compressed_pages = self.paged_cache_group_page_counts.get(
+                        compressed_group_id,
+                        self.num_pages,
+                    )
+                self.compressed_kv_buffer.append(
+                    torch.zeros(
+                        (
+                            compressed_pages,
+                            layout.swa_block_bytes(compressed_block_size),
+                        ),
+                        dtype=torch.uint8,
+                        device=device,
+                    )
+                    if has_compressed
+                    else None
                 )
-            self.compressor_state_buffer.append(
-                torch.empty(
-                    (
-                        compressor_state_pages,
-                        compressor_state_block_size,
-                        layout.state_width(layer_id) * 2,
-                    ),
-                    dtype=torch.float32,
-                    device=device,
+                compressor_state_block_size = self.compressor_state_block_sizes[
+                    layer_id
+                ]
+                compressor_state_group_id = v4_compressor_state_group_id(ratio)
+                compressor_state_pages = self.num_pages
+                if has_compressed:
+                    compressor_state_pages = self.paged_cache_group_page_counts.get(
+                        compressor_state_group_id,
+                        self.num_pages,
+                    )
+                self.compressor_state_buffer.append(
+                    torch.empty(
+                        (
+                            compressor_state_pages,
+                            compressor_state_block_size,
+                            layout.state_width(layer_id) * 2,
+                        ),
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                    if has_compressed
+                    else None
                 )
-                if has_compressed
-                else None
-            )
-            indexer_block_size = self.indexer_block_sizes[layer_id]
-            self.indexer_kv_buffer.append(
-                torch.zeros(
-                    (
-                        compressed_pages,
-                        indexer_block_size * layout.indexer_row_bytes,
-                    ),
-                    dtype=torch.uint8,
-                    device=device,
+                indexer_block_size = self.indexer_block_sizes[layer_id]
+                self.indexer_kv_buffer.append(
+                    torch.zeros(
+                        (
+                            compressed_pages,
+                            indexer_block_size * layout.indexer_row_bytes,
+                        ),
+                        dtype=torch.uint8,
+                        device=device,
+                    )
+                    if has_indexer
+                    else None
                 )
-                if has_indexer
-                else None
-            )
-            indexer_state_block_size = self.indexer_state_block_sizes[layer_id]
-            indexer_state_pages = self.num_pages
-            if has_indexer:
-                indexer_state_pages = self.paged_cache_group_page_counts.get(
-                    V4_INDEXER_COMPRESSOR_STATE_GROUP_ID,
-                    self.num_pages,
+                indexer_state_block_size = self.indexer_state_block_sizes[layer_id]
+                indexer_state_pages = self.num_pages
+                if has_indexer:
+                    indexer_state_pages = self.paged_cache_group_page_counts.get(
+                        V4_INDEXER_COMPRESSOR_STATE_GROUP_ID,
+                        self.num_pages,
+                    )
+                self.indexer_state_buffer.append(
+                    torch.empty(
+                        (
+                            indexer_state_pages,
+                            indexer_state_block_size,
+                            layout.state_width(layer_id, indexer=True) * 2,
+                        ),
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                    if has_indexer
+                    else None
                 )
-            self.indexer_state_buffer.append(
-                torch.empty(
-                    (
-                        indexer_state_pages,
-                        indexer_state_block_size,
-                        layout.state_width(layer_id, indexer=True) * 2,
-                    ),
-                    dtype=torch.float32,
-                    device=device,
-                )
-                if has_indexer
-                else None
-            )
 
         logger.info(
             "Initialized DeepSeek V4 KV pool: %d pages, %d layers, fp4 indexer=%s, compressed block sizes=%s",
@@ -998,6 +1017,19 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
 
     def get_swa_kv_buffer(self, layer_id: int) -> torch.Tensor:
         return self.swa_kv_buffer[layer_id]
+
+    @property
+    def swa_capacity_slots(self) -> int:
+        """Writable SWA cache capacity shared by every layer, in token slots.
+
+        Every layer's SWA buffer is allocated with the same page count, so a
+        single capacity (pages * tokens per block) bounds the write-slot
+        mapping shared across layers. Returns 0 when no SWA buffers exist;
+        callers must then mask all slots rather than skip the bounds check.
+        """
+        if not self.swa_kv_buffer:
+            return 0
+        return int(self.swa_kv_buffer[0].shape[0]) * int(self.swa_block_size)
 
     def get_compressed_kv_buffer_2d(self, layer_id: int) -> torch.Tensor:
         return self._require(self.compressed_kv_buffer, layer_id, "compressed KV")

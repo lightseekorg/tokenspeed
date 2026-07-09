@@ -185,6 +185,15 @@ class AttentionLayerMapping(MappingBase):
             self.rank, self.dp_size, stride=self.tp_size * self.cp_size
         )
 
+    def scatter_index(self, rank: int) -> int:
+        """Index of ``rank`` in a dp-major/tp-minor scattered token count
+        table; cp peers share their dp group's tp split."""
+        tp_rank = _make_parallelism_rank(rank, self.tp_size, stride=1)
+        dp_rank = _make_parallelism_rank(
+            rank, self.dp_size, stride=self.tp_size * self.cp_size
+        )
+        return dp_rank * self.tp_size + tp_rank
+
 
 class MoeLayerMapping(MappingBase):
     def __init__(

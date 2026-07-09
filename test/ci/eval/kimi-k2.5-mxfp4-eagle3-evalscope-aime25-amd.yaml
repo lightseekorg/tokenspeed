@@ -1,0 +1,54 @@
+api_version: ci.tokenspeed.io/v1
+name: eval-kimi-k2.5-mxfp4-aime25-amd
+type: eval
+triggers:
+  - per-commit
+  - manual
+runner:
+  labels:
+    - amd-mi35x-4gpu-test
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps_rocm.sh
+server:
+  command: >-
+    ts serve
+    --model amd/Kimi-K2.5-MXFP4
+    --host 127.0.0.1
+    --port 8000
+    --world-size 4
+    --max-model-len 80000
+    --max-num-seqs 16
+    --trust-remote-code
+    --quantization mxfp4
+    --speculative-algorithm EAGLE3
+    --speculative-draft-model-path lightseekorg/kimi-k2.5-eagle3
+    --speculative-num-steps 1
+    --speculative-eagle-topk 1
+    --speculative-num-draft-tokens 2
+    --speculative-draft-model-quantization unquant
+    --sampling-backend greedy
+    --disable-kvstore
+    --kvstore-ratio 0.0
+    --enable-cache-report
+  ready:
+    url: http://127.0.0.1:8000/readiness
+    timeout: 1800
+    interval: 10
+eval:
+  install:
+    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
+  command: >-
+    /tmp/evalscope-perf/bin/evalscope eval
+    --model amd/Kimi-K2.5-MXFP4
+    --api-url http://127.0.0.1:8000/v1
+    --api-key EMPTY_TOKEN
+    --datasets aime25
+    --limit 4
+    --eval-batch-size 4
+    --stream
+    --generation-config '{"do_sample":false,"temperature":0.0,"max_tokens":8192}'
+report:
+  github_step_summary: true
+score_threshold: 0.75

@@ -41,6 +41,11 @@ cute_dsl = pytest.importorskip("tokenspeed_kernel.ops.sampling.cute_dsl")
 cute_argmax = cute_dsl.argmax
 cute_argmax_pair = cute_dsl.argmax_pair
 
+requires_nvidia = pytest.mark.skipif(
+    not cute_dsl.current_platform().is_nvidia,
+    reason="CuTe DSL argmax kernel is NVIDIA-only",
+)
+
 
 # Vocab sizes for the models tokenspeed actively serves — same list as
 # ``tmp/integrate_cutedsl_argmax/bench_argmax.py::DEFAULT_N``.
@@ -153,6 +158,34 @@ def test_argmax_matches_torch_for_low_precision_dtypes(dtype):
     _need_cuda()
     x = torch.randn(8, 4096, device="cuda", dtype=dtype)
     torch.testing.assert_close(cute_argmax(x), torch.argmax(x, dim=-1), atol=0, rtol=0)
+
+
+def test_argmax_empty_batch_falls_back_to_torch():
+    """M=0 (empty batch) must fall back to torch.argmax instead of launching
+    the CuTe kernel with zero grid blocks, which raises
+    ``CUDA_ERROR_INVALID_VALUE``.
+
+    This path is hit during ``execute_idle_forward()`` in DP/EP configs
+    where an idle rank runs the drafter model with ``bs=0``.
+    """
+    _need_cuda()
+    N = MODEL_VOCABS["qwen3_5"]
+    x = torch.empty((0, N), device="cuda", dtype=torch.float32)
+    out = cute_argmax(x)
+    assert out.shape == (0,)
+    assert out.dtype == torch.int64
+    ref = torch.argmax(x, dim=-1)
+    torch.testing.assert_close(out, ref, atol=0, rtol=0)
+
+    # With caller-provided out buffer.
+    out_buf = torch.empty(0, dtype=torch.int32, device="cuda")
+    ret = cute_argmax(x, out=out_buf)
+    assert ret.data_ptr() == out_buf.data_ptr()
+
+    # argmax_pair must also handle M=0.
+    pair = cute_argmax_pair(x)
+    assert pair.shape == (0, 2)
+    assert pair.dtype == torch.float32
 
 
 def test_argmax_falls_back_for_1d_input():
@@ -284,6 +317,43 @@ def test_argmax_returns_first_index_on_ties_like_torch():
             x[row, pos] = 0.0
     out = cute_argmax(x)
     torch.testing.assert_close(out, torch.argmax(x, dim=-1), atol=0, rtol=0)
+
+
+@requires_nvidia
+@pytest.mark.parametrize(
+    "N", [4096, MODEL_VOCABS["kimi_k2_5"], MODEL_VOCABS["qwen3_5"]]
+)
+def test_argmax_in_range_for_nan_and_neg_inf_rows(N):
+    """A row whose elements never beat ``-inf`` (all-NaN or all ``-inf``) must
+    still yield an *in-range* index, not the ``0xFFFFFFFF`` (-1) sentinel.
+
+    The kernel suppresses NaN (IEEE ``NaN > x`` is false) and the warp/block/
+    cluster max reductions are NaN-suppressing, so NaN never wins; the argmax
+    sentinels are seeded to 0 so such rows resolve to index 0. ``N`` covers both
+    the single-block (``cluster_n == 1``) and the cluster reduction path (fp32
+    ``N > 32K``), since the cluster path has its own sentinel seed.
+    """
+    _need_cuda()
+    x = torch.full((6, N), -100.0, device="cuda", dtype=torch.float32)
+    x[0].fill_(float("nan"))  # all NaN -> sentinel row, must map to a valid index (0)
+    x[1].fill_(float("inf"))  # all inf -> first element wins, so output index 0
+    x[2].fill_(float("-inf"))  # all -inf -> never beats the -inf init, also sentinel
+    x[3, 2000] = 5.0  # mixed: real max at 2000 ...
+    x[3, 100] = float("nan")  # ... plus a NaN the kernel must ignore
+    x[4, 2000] = float("nan")
+    x[4, 100] = 5.0
+    x[5, 1234] = 0.0
+    out = cute_argmax(x)
+
+    assert ((out >= 0) & (out < N)).all(), f"out-of-range index: {out.tolist()}"
+    # Degenerate rows resolve to index 0 (lowest-index tie among equal maxima).
+    assert out[0].item() == 0
+    assert out[1].item() == 0
+    assert out[2].item() == 0
+    # Mixed row: NaN is suppressed, so the kernel returns the finite argmax.
+    assert out[3].item() == 2000
+    assert out[4].item() == 100
+    assert out[5].item() == 1234
 
 
 def test_argmax_mtp_pattern():

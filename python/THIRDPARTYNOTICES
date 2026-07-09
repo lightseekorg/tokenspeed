@@ -8,7 +8,7 @@ Copyright contributors to the TensorRT LLM project
 
 Licensed under the Apache License, Version 2.0, whose full license text is available below.
 
-Notice for meituan-longcat/SGLang-FluentLLM
+Notice for FluentLLM
 -------------------------------
 Apache License, Version 2.0
 
@@ -24,21 +24,45 @@ Copyright contributors to the vLLM project
 
 Licensed under the Apache License, Version 2.0, whose full license text is available below.
 
-Notice for ModelTC/lightllm
+Notice for SGLang
 -------------------------------
 Apache License, Version 2.0
 
-Copyright contributors to the LightLLM project
+Copyright 2023-2024 SGLang Team
 
 Licensed under the Apache License, Version 2.0, whose full license text is available below.
 
-Notice for sgl-project/sglang
+Notice for Qwen
 -------------------------------
 Apache License, Version 2.0
 
-Copyright contributors to the SGLang project
+Copyright 2025 The Qwen team, Alibaba Group
 
 Licensed under the Apache License, Version 2.0, whose full license text is available below.
+
+Notice for deepseek-ai/EPLB
+-------------------------------
+MIT License
+
+Copyright (c) 2025 DeepSeek
+
+Licensed under the MIT License, whose full license text is available in the repository LICENSE file.
+
+Notice for HuggingFace Transformers
+-------------------------------
+Apache License, Version 2.0
+
+Copyright 2025 HuggingFace Inc. team
+
+Licensed under the Apache License, Version 2.0, whose full license text is available below.
+
+Notice for fla-org/flash-linear-attention
+-------------------------------
+MIT License
+
+Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
+
+Licensed under the MIT License, whose full license text is available in the repository LICENSE file.
 
 ================================================================================
                               Apache 2.0 LICENSE

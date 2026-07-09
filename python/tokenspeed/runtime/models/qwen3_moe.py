@@ -25,13 +25,12 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 import torch
-from torch import nn
 
 from tokenspeed.runtime.configs.qwen3_moe_config import Qwen3MoeConfig
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
-from tokenspeed.runtime.layers.moe.checkpoint import (
+from tokenspeed.runtime.layers.moe import (
     ExpertCheckpointSchema,
     build_moe_checkpoint_loader,
 )
@@ -191,7 +190,7 @@ class Qwen3MoeModel(Qwen3Model):
             )
 
         if not ctx.forward_mode.is_idle():
-            hidden_states = layer.comm_manager.final_norm(
+            hidden_states, _ = layer.comm_manager.final_norm(
                 hidden_states, residual, ctx, self.norm
             )
         return hidden_states, None

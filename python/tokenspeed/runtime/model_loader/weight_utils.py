@@ -25,6 +25,7 @@ import concurrent.futures
 import fnmatch
 import glob
 import hashlib
+import importlib.util
 import json
 import os
 import tempfile
@@ -65,13 +66,8 @@ temp_dir = tempfile.gettempdir()
 def enable_hf_transfer():
     """automatically activates hf_transfer"""
     if "HF_HUB_ENABLE_HF_TRANSFER" not in os.environ:
-        try:
-            # enable hf hub transfer if available
-            import hf_transfer  # type: ignore
-
+        if importlib.util.find_spec("hf_transfer") is not None:
             huggingface_hub.constants.HF_HUB_ENABLE_HF_TRANSFER = True
-        except ImportError:
-            pass
 
 
 enable_hf_transfer()
@@ -501,23 +497,19 @@ def pt_weights_iterator(
 
 def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
     """Default weight loader."""
-    try:
-        if param.numel() == 1 and loaded_weight.numel() == 1:
-            # Sometimes scalar values aren't considered tensors with shapes
-            # so if both param and loaded_weight are a scalar,
-            # "broadcast" instead of copy
-            param.data.fill_(loaded_weight.item())
-        else:
-            assert param.size() == loaded_weight.size(), (
+    if param.numel() == 1 and loaded_weight.numel() == 1:
+        # Sometimes scalar values aren't considered tensors with shapes
+        # so if both param and loaded_weight are a scalar,
+        # "broadcast" instead of copy
+        param.data.fill_(loaded_weight.item())
+    else:
+        if param.size() != loaded_weight.size():
+            raise ValueError(
                 f"Attempted to load weight ({loaded_weight.size()}) "
                 f"into parameter ({param.size()})"
             )
 
-            param.data.copy_(loaded_weight)
-    except Exception:
-        #  This exception is added for the purpose of setting breakpoint to
-        # debug weight loading issues.
-        raise
+        param.data.copy_(loaded_weight)
 
 
 LoaderFunction = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
@@ -577,10 +569,11 @@ class KVCacheQuantSchema(BaseModel):
 
     @model_validator(mode="after")
     def check_is_fp8(self) -> "KVCacheQuantSchema":
-        assert self.dtype == "float8_e4m3fn", (
-            "Loaded scaling factors intended for KV cache dtype = "
-            f"{self.dtype} rather than float8_e4m3fn!"
-        )
+        if self.dtype != "float8_e4m3fn":
+            raise ValueError(
+                "Loaded scaling factors intended for KV cache dtype = "
+                f"{self.dtype} rather than float8_e4m3fn!"
+            )
         return self
 
     @model_validator(mode="after")
@@ -589,20 +582,21 @@ class KVCacheQuantSchema(BaseModel):
         if context:
             tp_size = context["tp_size"]
             num_hidden_layers = context["num_hidden_layers"]
-            assert len(self.scaling_factor) == tp_size, (
-                f"Loaded dictionary has TP size {len(self.scaling_factor)} "
-                f"but LLM engine is currently running with TP size {tp_size}."
-            )
-            for tp_rank, layer_maps in self.scaling_factor.items():
-                assert len(layer_maps) == num_hidden_layers, (
-                    f"KV cache scales map for TP rank {tp_rank} is malformed. "
-                    f"Expected {num_hidden_layers} layers, got "
-                    f"{len(layer_maps)}."
+            if len(self.scaling_factor) != tp_size:
+                raise ValueError(
+                    f"Loaded dictionary has TP size {len(self.scaling_factor)} "
+                    f"but LLM engine is currently running with TP size {tp_size}."
                 )
+            for tp_rank, layer_maps in self.scaling_factor.items():
+                if len(layer_maps) != num_hidden_layers:
+                    raise ValueError(
+                        f"KV cache scales map for TP rank {tp_rank} is malformed. "
+                        f"Expected {num_hidden_layers} layers, got "
+                        f"{len(layer_maps)}."
+                    )
             for i in range(tp_size):
-                assert (
-                    i in self.scaling_factor
-                ), f"KV cache scales map for TP rank {i} not found."
+                if i not in self.scaling_factor:
+                    raise ValueError(f"KV cache scales map for TP rank {i} not found.")
         return self
 
     @model_validator(mode="after")
@@ -613,10 +607,11 @@ class KVCacheQuantSchema(BaseModel):
             num_hidden_layers = context["num_hidden_layers"]
             layer_scales_map = self.scaling_factor[tp_rank]
             for i in range(num_hidden_layers):
-                assert i in layer_scales_map, (
-                    f"Could not find KV cache scales for layer {i} in "
-                    f"TP rank {tp_rank}."
-                )
+                if i not in layer_scales_map:
+                    raise ValueError(
+                        f"Could not find KV cache scales for layer {i} in "
+                        f"TP rank {tp_rank}."
+                    )
         return self
 
 
@@ -632,11 +627,12 @@ class QuantParamSchema(BaseModel):
         if context:
             model_type = context.get("model_type", None)
             if model_type is not None:
-                assert model_type == self.model_type, (
-                    f"Model type is {model_type} but loaded "
-                    f"scaling factors belonging to different "
-                    f"model type {self.model_type}!"
-                )
+                if model_type != self.model_type:
+                    raise ValueError(
+                        f"Model type is {model_type} but loaded "
+                        f"scaling factors belonging to different "
+                        f"model type {self.model_type}!"
+                    )
         return self
 
 

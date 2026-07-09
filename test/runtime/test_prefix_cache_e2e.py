@@ -5,7 +5,7 @@ prefix caching at runtime, by checking the ``cached_tokens`` field in
 ``Engine.generate()`` response ``meta_info``.
 
 Runs against two models: ``openai/gpt-oss-20b`` and
-``Qwen/Qwen3.5-35B-A3B``.  Override via the ``ONLY_RUN`` environment
+``txn545/Qwen3.5-35B-A3B-NVFP4``.  Override via the ``ONLY_RUN`` environment
 variable to test a single model, e.g.::
 
     ONLY_RUN=openai/gpt-oss-20b python3 -m unittest test_prefix_cache_e2e -v
@@ -59,13 +59,17 @@ _MODEL_CASES = [
     ModelCase(
         "openai/gpt-oss-20b",
         extra_kwargs={
-            "moe_backend": "flashinfer_mxfp4",
+            "moe_backend": "flashinfer_trtllm",
             "disable_prefill_graph": True,
         },
     ),
     ModelCase(
-        "Qwen/Qwen3.5-35B-A3B",
-        extra_kwargs={"attention_backend": "trtllm"},
+        "txn545/Qwen3.5-35B-A3B-NVFP4",
+        extra_kwargs={
+            "attention_backend": "trtllm",
+            "moe_backend": "flashinfer_trtllm",
+            "quantization": "nvfp4",
+        },
         is_thinking_model=True,
     ),
 ]
@@ -164,7 +168,6 @@ class TestPrefixCacheDisabled(unittest.TestCase):
                             case, "What is 1+1? Reply with just the number."
                         ),
                         sampling_params=sampling,
-                        return_logprob=False,
                         stream=False,
                     )
 
@@ -174,7 +177,6 @@ class TestPrefixCacheDisabled(unittest.TestCase):
                             case, "What is 2+2? Reply with just the number."
                         ),
                         sampling_params=sampling,
-                        return_logprob=False,
                         stream=False,
                     )
                     cached = resp["meta_info"].get("cached_tokens", 0)
@@ -204,7 +206,6 @@ class TestPrefixCacheEnabled(unittest.TestCase):
                             case, "What is 1+1? Reply with just the number."
                         ),
                         sampling_params=sampling,
-                        return_logprob=False,
                         stream=False,
                     )
 
@@ -214,7 +215,6 @@ class TestPrefixCacheEnabled(unittest.TestCase):
                             case, "What is 2+2? Reply with just the number."
                         ),
                         sampling_params=sampling,
-                        return_logprob=False,
                         stream=False,
                     )
                     cached = resp["meta_info"].get("cached_tokens", 0)
@@ -241,7 +241,6 @@ class TestPrefixCacheDisabledOutputQuality(unittest.TestCase):
                             case, "What is 2+2? Reply with just the number."
                         ),
                         sampling_params={"max_new_tokens": 32, "temperature": 0},
-                        return_logprob=False,
                         stream=False,
                     )
                     text = resp["text"].strip()

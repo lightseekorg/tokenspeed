@@ -46,6 +46,7 @@ if TYPE_CHECKING:
 class MLAPrefillMetadata:
     # Device-side metadata for explicit Q/K/V MLA prefill and prefix replay.
     seq_lens: torch.Tensor
+    req_pool_indices: torch.Tensor
     extend_prefix_lens: torch.Tensor
     extend_seq_lens: torch.Tensor
     cum_extend_seq_lens: torch.Tensor
@@ -67,6 +68,14 @@ class MLADecodeMetadata:
     num_extends: int
     page_table: torch.Tensor
     seq_lens: torch.Tensor
+
+    @property
+    def block_kv_indices(self) -> torch.Tensor:
+        return self.page_table
+
+    @property
+    def seq_lens_k(self) -> torch.Tensor:
+        return self.seq_lens
 
 
 class MLAAttnBackend(AttentionBackend):
@@ -182,6 +191,7 @@ class MLAAttnBackend(AttentionBackend):
 
         metadata = MLAPrefillMetadata(
             seq_lens=seq_lens,
+            req_pool_indices=req_pool_indices,
             extend_prefix_lens=extend_prefix_lens,
             extend_seq_lens=extend_seq_lens,
             cum_extend_seq_lens=cum_extend_seq_lens,
@@ -302,17 +312,25 @@ class MLAAttnBackend(AttentionBackend):
         num_extends = metadata.num_extends
         q_len_per_req = q.shape[0] // bs if bs > 0 else 1
 
-        if q_len_per_req > 1 and self.is_draft:
+        if q_len_per_req > 1:
             query = q.view(-1, layer.tp_q_head_num, layer.head_dim).unsqueeze(1)
             page_table = metadata.page_table[num_extends:].repeat_interleave(
                 q_len_per_req, dim=0
             )
-            base_lens = metadata.seq_lens[num_extends:].repeat_interleave(q_len_per_req)
+            cache_seqlens = metadata.seq_lens[num_extends:].repeat_interleave(
+                q_len_per_req
+            )
+            # Draft catch-up starts from the current draft KV length; target
+            # verify starts from the final target KV length and backs up.
+            offset_start = 0 if self.is_draft else 1 - q_len_per_req
             offsets = torch.arange(
-                q_len_per_req, device=base_lens.device, dtype=base_lens.dtype
+                offset_start,
+                offset_start + q_len_per_req,
+                device=cache_seqlens.device,
+                dtype=cache_seqlens.dtype,
             ).repeat(bs)
-            cache_seqlens = base_lens + offsets
-            max_seqlen_k = self.max_context_len + q_len_per_req
+            cache_seqlens = cache_seqlens + offsets
+            max_seqlen_k = self.max_context_len
         else:
             query = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
             page_table = metadata.page_table[num_extends:]

@@ -28,7 +28,6 @@ minimal set of communication operations to transition between them.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional
 
 import torch
 from torch import nn
@@ -73,8 +72,8 @@ from tokenspeed.runtime.models.base.placement import (
 
 @dataclass
 class _TrackedState:
-    hidden: Optional[Placement] = None
-    residual: Optional[Placement] = None
+    hidden: Placement | None = None
+    residual: Placement | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -153,15 +152,15 @@ def _run_hidden_states_only(module: nn.Module, state: ExecutionState) -> Executi
 # ---------------------------------------------------------------------------
 
 
-def _input_group(spec: ModuleSpec) -> Optional[ParallelGroup]:
+def _input_group(spec: ModuleSpec) -> ParallelGroup | None:
     return spec.input_placement.group if spec.input_placement else None
 
 
-def _output_group(spec: ModuleSpec) -> Optional[ParallelGroup]:
+def _output_group(spec: ModuleSpec) -> ParallelGroup | None:
     return spec.output_placement.group if spec.output_placement else None
 
 
-def _find_last_compute_index(exec_plan: List[ExecutionNode]) -> int:
+def _find_last_compute_index(exec_plan: list[ExecutionNode]) -> int:
     """Find the index of the last compute (non-NORM) module in exec_plan."""
     last_idx = -1
     for i, mod in enumerate(exec_plan):
@@ -178,16 +177,16 @@ def _find_last_compute_index(exec_plan: List[ExecutionNode]) -> int:
 
 def compile_decoder_layer(
     layer: nn.Module,
-    exec_plan: List[ExecutionNode],
+    exec_plan: list[ExecutionNode],
     mapping: Mapping,
-    prev_layer_output_group: Optional[ParallelGroup] = None,
-    next_layer_input_group: Optional[ParallelGroup] = None,
+    prev_layer_output_group: ParallelGroup | None = None,
+    next_layer_input_group: ParallelGroup | None = None,
 ) -> CompiledDecoderLayer:
     """Analyse a decoder layer execution plan and produce a CompiledDecoderLayer."""
 
     last_compute_idx = _find_last_compute_index(exec_plan)
 
-    steps: List[ExecutionStep] = []
+    steps: list[ExecutionStep] = []
 
     first_compute_input_group = find_first_compute_input_group(exec_plan)
     state = _TrackedState(
@@ -250,7 +249,7 @@ def _compile_norm_step(
     node: ExecutionNode,
     mapping: Mapping,
     mod_idx: int,
-    exec_plan: List[ExecutionNode],
+    exec_plan: list[ExecutionNode],
     state: _TrackedState,
 ) -> ExecutionStep:
     """Compile a NORM step."""
@@ -300,17 +299,16 @@ def _compile_compute_step(
     node: ExecutionNode,
     mapping: Mapping,
     mod_idx: int,
-    exec_plan: List[ExecutionNode],
+    exec_plan: list[ExecutionNode],
     is_last_compute: bool,
     state: _TrackedState,
-    next_layer_input_group: Optional[ParallelGroup],
+    next_layer_input_group: ParallelGroup | None,
     is_first_layer: bool = False,
 ) -> ExecutionStep:
     """Compile a compute step (ATTENTION / DENSE_MLP / MOE / GENERIC)."""
-    module = node.module
     spec = node.spec
-    pre_comms: List[CommOp] = []
-    post_comms: List[CommOp] = []
+    pre_comms: list[CommOp] = []
+    post_comms: list[CommOp] = []
 
     input_group = _input_group(spec)
     output_group = _output_group(spec)
@@ -386,14 +384,14 @@ def _compile_compute_step(
 
 
 def _insert_last_compute_post_comms(
-    post_comms: List[CommOp],
+    post_comms: list[CommOp],
     spec: ModuleSpec,
     mapping: Mapping,
-    next_layer_input_group: Optional[ParallelGroup],
-    exec_plan: List[ExecutionNode],
+    next_layer_input_group: ParallelGroup | None,
+    exec_plan: list[ExecutionNode],
     state: _TrackedState,
-    hidden_before_input: Optional[Placement],
-    residual_before_output: Optional[Placement],
+    hidden_before_input: Placement | None,
+    residual_before_output: Placement | None,
 ) -> None:
     """Insert post-communication for the last compute module in the layer."""
     output_group = _output_group(spec)
@@ -431,11 +429,11 @@ def _insert_last_compute_post_comms(
 
 
 def _insert_mid_layer_post_comms(
-    post_comms: List[CommOp],
+    post_comms: list[CommOp],
     spec: ModuleSpec,
     mapping: Mapping,
     mod_idx: int,
-    exec_plan: List[ExecutionNode],
+    exec_plan: list[ExecutionNode],
     state: _TrackedState,
 ) -> None:
     """Insert post-communication for a mid-layer compute module."""
@@ -479,7 +477,7 @@ def _insert_mid_layer_post_comms(
 # ---------------------------------------------------------------------------
 
 
-def find_first_compute_input_group(exec_plan: List[ExecutionNode]) -> ParallelGroup:
+def find_first_compute_input_group(exec_plan: list[ExecutionNode]) -> ParallelGroup:
     """Find the input group of the first compute (non-NORM) module in exec_plan."""
     for mod in exec_plan:
         spec = mod.spec
@@ -490,9 +488,9 @@ def find_first_compute_input_group(exec_plan: List[ExecutionNode]) -> ParallelGr
 
 def _initial_hidden_placement(
     mapping: Mapping,
-    prev_layer_output_group: Optional[ParallelGroup],
+    prev_layer_output_group: ParallelGroup | None,
     first_compute_input_group: ParallelGroup,
-) -> Optional[Placement]:
+) -> Placement | None:
     if prev_layer_output_group is None:
         return None
     if not group_has_parallel(mapping, prev_layer_output_group):
@@ -510,9 +508,9 @@ def _initial_hidden_placement(
 
 def _initial_residual_placement(
     mapping: Mapping,
-    prev_layer_output_group: Optional[ParallelGroup],
+    prev_layer_output_group: ParallelGroup | None,
     first_compute_input_group: ParallelGroup,
-) -> Optional[Placement]:
+) -> Placement | None:
     if prev_layer_output_group is None:
         return None
     if not group_has_parallel(mapping, prev_layer_output_group):
@@ -523,9 +521,9 @@ def _initial_residual_placement(
 
 
 def _find_next_compute_input_group(
-    exec_plan: List[ExecutionNode],
+    exec_plan: list[ExecutionNode],
     after_index: int,
-) -> Optional[ParallelGroup]:
+) -> ParallelGroup | None:
     """Find the input group of the next compute module after *after_index*."""
     for i in range(after_index + 1, len(exec_plan)):
         spec = exec_plan[i].spec
@@ -535,7 +533,7 @@ def _find_next_compute_input_group(
 
 
 def _intervening_norm_supports_fusion(
-    exec_plan: List[ExecutionNode],
+    exec_plan: list[ExecutionNode],
     compute_index: int,
 ) -> bool:
     """Check if there's a fusible norm between compute_index and the next compute module."""
@@ -551,7 +549,7 @@ def _intervening_norm_supports_fusion(
 def _compute_final_placement(
     state: _TrackedState,
     mapping: Mapping,
-) -> Optional[Placement]:
+) -> Placement | None:
     """Determine the final Placement based on tracked state."""
     hidden = state.hidden
     if hidden is None:

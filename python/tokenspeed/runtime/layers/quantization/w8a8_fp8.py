@@ -45,6 +45,7 @@ class W8A8Fp8Config(QuantizationConfig):
     """
 
     def __init__(self, is_checkpoint_fp8_serialized: bool = False):
+        super().__init__()
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
 
     @classmethod

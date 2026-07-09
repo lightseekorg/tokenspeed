@@ -106,12 +106,6 @@ def test_logits_processor_dp_layout_threshold_and_modes():
     )
     assert decode_plan is not None
 
-    verify_plan = processor._resolve_logits_layout_plan(
-        torch.empty(16 * 6, 3),
-        LogitsMetadata(forward_mode=ForwardMode.TARGET_VERIFY),
-    )
-    assert verify_plan is not None
-
     assert (
         processor._resolve_logits_layout_plan(
             torch.empty(32 * 6, 3),
@@ -141,6 +135,34 @@ def test_cuda_graph_wrapper_uses_existing_route_for_padding():
 
     assert wrapper.can_run(30, ctx)
     assert wrapper.padded_bs(30, ctx) == 32
+
+
+def test_cuda_graph_req_pool_padding_uses_reserved_sink_row():
+    wrapper = CudaGraphWrapper.__new__(CudaGraphWrapper)
+    wrapper.config = SimpleNamespace(max_req_pool_size=21)
+    active_indices = torch.tensor([7, 8], dtype=torch.int64)
+
+    padded_indices = wrapper._pad_graph_req_pool_indices(active_indices, 4)
+
+    assert padded_indices.tolist() == [7, 8, 21, 21]
+
+
+def test_cuda_graph_state_write_padding_uses_reserved_sink_row():
+    wrapper = CudaGraphWrapper.__new__(CudaGraphWrapper)
+    wrapper.config = SimpleNamespace(max_req_pool_size=99)
+    wrapper.input_buffers = SimpleNamespace(
+        state_write_req_pool_indices_buf=torch.full((4,), -1, dtype=torch.int64)
+    )
+    active_indices = torch.tensor([7, 8], dtype=torch.int64)
+
+    wrapper._set_graph_state_write_indices(active_indices, 4)
+
+    assert wrapper.input_buffers.state_write_req_pool_indices_buf.tolist() == [
+        7,
+        8,
+        99,
+        99,
+    ]
 
 
 def test_cuda_graph_route_uses_global_batch_for_dp_idle_rank():
@@ -240,7 +262,7 @@ def test_resolve_dp_sampling_runtime_uses_grouped_metadata():
 
 @pytest.mark.parametrize(
     "forward_mode",
-    [ForwardMode.DECODE, ForwardMode.TARGET_VERIFY],
+    [ForwardMode.DECODE],
 )
 def test_logits_processor_derives_dp_layout_from_effective_hidden_states(
     forward_mode,

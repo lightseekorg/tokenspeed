@@ -48,6 +48,8 @@ _in_ancestors() {
 }
 
 _section "GPU state BEFORE cleanup"
+# Show AMD device information before any cleanup action.
+_run "rocm-smi --showid" rocm-smi --showid
 _run "rocm-smi --showpids" rocm-smi --showpids
 
 _section "Discovering GPU-holding PIDs"

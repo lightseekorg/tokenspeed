@@ -25,11 +25,11 @@ from collections.abc import Iterable as _Iterable
 import torch
 import torch.nn as nn
 import torch.nn.functional as _F
-from tokenspeed_kernel.ops.moe.cuda import (
+from tokenspeed_kernel.platform import current_platform as _current_platform
+from tokenspeed_kernel.thirdparty.cuda import dsv3_router_gemm as _dsv3_router_gemm
+from tokenspeed_kernel.thirdparty.cuda import (
     moe_finalize_fuse_shared as _moe_finalize_fuse_shared,
 )
-from tokenspeed_kernel.ops.routing.cuda import dsv3_router_gemm as _dsv3_router_gemm
-from tokenspeed_kernel.platform import current_platform as _current_platform
 from transformers import PretrainedConfig as _PretrainedConfig
 
 from tokenspeed.runtime.configs.utils import get_rope_theta as _get_rope_theta
@@ -41,13 +41,13 @@ from tokenspeed.runtime.execution.cuda_graph_wrapper import (
 )
 from tokenspeed.runtime.layers.layernorm import RMSNorm as _RMSNorm
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
-from tokenspeed.runtime.layers.moe.checkpoint import (
+from tokenspeed.runtime.layers.moe import (
     ExpertCheckpointSchema as _ExpertCheckpointSchema,
 )
-from tokenspeed.runtime.layers.moe.checkpoint import (
+from tokenspeed.runtime.layers.moe import (
     build_moe_checkpoint_loader as _build_moe_checkpoint_loader,
 )
-from tokenspeed.runtime.layers.moe.layer import MoELayer as _MoELayer
+from tokenspeed.runtime.layers.moe.expert import MoELayer as _MoELayer
 from tokenspeed.runtime.layers.moe.topk import TopK as _TopK
 from tokenspeed.runtime.layers.moe.topk import TopKOutputFormat as _TopKOutputFormat
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType as _RoutingMethodType
@@ -136,7 +136,7 @@ def _get_longcat_moe_quant_config(
     if quant_config is None:
         return None
 
-    ignored_layers = getattr(quant_config, "ignored_layers", None)
+    ignored_layers = quant_config.ignored_layers
     if not ignored_layers:
         return quant_config
 
@@ -249,6 +249,7 @@ class _RuntimeLongcatMoE(nn.Module):
             zero_expert_type=config.zero_expert_type,
             routing_config={
                 "routed_scaling_factor": self.routed_scaling_factor,
+                "normalize_topk_weights": config.norm_topk_prob,
                 "correction_bias": self.router.e_score_correction_bias[
                     : config.n_routed_experts
                 ],
@@ -265,9 +266,6 @@ class _RuntimeLongcatMoE(nn.Module):
             renormalize=config.norm_topk_prob,
             correction_bias=self.router.e_score_correction_bias,
             routed_scaling_factor=self.routed_scaling_factor,
-            apply_routed_scaling_factor_on_output=(
-                self.experts.apply_routed_scaling_factor_on_output
-            ),
             output_format=_TopKOutputFormat.STANDARD,
             zero_expert_num=config.zero_expert_num,
             topk_indices_dtype=(
@@ -350,8 +348,6 @@ class _RuntimeLongcatMoE(nn.Module):
                 enable_pdl=_pdl_enabled(),
             )
 
-        if not self.experts.apply_routed_scaling_factor_on_output:
-            routed_expert_output *= self.routed_scaling_factor
         if zero_expert_output is not None:
             routed_expert_output = routed_expert_output + zero_expert_output
         return routed_expert_output
@@ -652,7 +648,7 @@ class _RuntimeLongcatModel(nn.Module):
                 )
 
         if not ctx.forward_mode.is_idle() and layer is not None:
-            hidden_states = layer.final_norm_comm.final_norm(
+            hidden_states, _ = layer.final_norm_comm.final_norm(
                 hidden_states,
                 residual,
                 ctx,
@@ -841,7 +837,10 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
                 ):
                     weight_block_size = self.quant_config.weight_block_size
                     if weight_block_size is not None:
-                        assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
+                        if not hasattr(self_attn.kv_b_proj, "weight_scale_inv"):
+                            raise RuntimeError(
+                                "kv_b_proj.weight_scale_inv is required for block FP8 dequant."
+                            )
                         dtype = torch.get_default_dtype()
                         w = _block_dequant(
                             self_attn.kv_b_proj.weight,
