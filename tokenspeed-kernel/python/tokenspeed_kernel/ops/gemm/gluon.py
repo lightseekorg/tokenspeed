@@ -74,8 +74,12 @@ if _dense16_impl is not None:
         alpha: torch.Tensor | None = None,
         block_size: list[int] | None = None,
     ):
-        if A_scales is not None or B_scales is not None or block_size is not None:
-            return None
+        if A_scales is not None:
+            raise ValueError("A_scales are not supported for dense16 Gluon GEMM")
+        if B_scales is not None:
+            raise ValueError("B_scales are not supported for dense16 Gluon GEMM")
+        if block_size is not None:
+            raise ValueError("block_size is not supported for dense16 Gluon GEMM")
 
         output = _dense16_impl(A, B, out_dtype, alpha=alpha)
         if output is not None:

@@ -50,7 +50,6 @@ MFMA_LDS_SPLIT_K = 8
 GROUP_SIZE_M = 2
 MAX_M = 256
 LARGEM_DISPATCH_MIN_M = 2048
-KERNEL_NAME = "gluon_mm_a16w16_gfx950"
 
 _SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
 _partial_cache: dict[tuple[int, int, int, int, int], torch.Tensor] = {}
