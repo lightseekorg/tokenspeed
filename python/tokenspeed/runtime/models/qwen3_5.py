@@ -653,6 +653,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            group_id="full_attention",
         )
 
         # Dense MLP for non-MoE variant
