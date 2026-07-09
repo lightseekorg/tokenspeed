@@ -562,7 +562,11 @@ class MambaAttnBackend(AttentionBackend):
         **kwargs,
     ):
         mamba_pool_indices = kwargs.get("mamba_pool_indices")
-        if mamba_pool_indices is not None:
+        if self.pool is None:
+            # Poolless flat mode: states are addressed via state_in/out_pages;
+            # every consumer of mamba_cache_indices is pool/radix-gated.
+            mamba_cache_indices = None
+        elif mamba_pool_indices is not None:
             mamba_cache_indices = self.pool.get_mamba_indices(mamba_pool_indices[:bs])
         else:
             mamba_cache_indices = self.pool.get_mamba_indices(req_pool_indices[:bs])
@@ -875,7 +879,11 @@ class MambaAttnBackend(AttentionBackend):
         # Reuse the pre-allocated [bs]-length buffer as mamba_indices so the
         # capture path matches the replay path: zero allocation, single write.
         padded_mamba_indices = self.state_indices_list[bs - 1]
-        if mamba_pool_indices is not None:
+        if self.pool is None:
+            # Poolless flat mode: the buffer stays all pad_slot_id (consumers
+            # are pool/radix-gated; states travel via state_in/out_pages).
+            padded_mamba_indices.fill_(self.pad_slot_id)
+        elif mamba_pool_indices is not None:
             padded_mamba_indices[:bs].copy_(
                 self.pool.get_mamba_indices(mamba_pool_indices[:bs])
             )
@@ -950,16 +958,21 @@ class MambaAttnBackend(AttentionBackend):
         # see the full-batch shape with padding rows already set to -1.
         # Zero extra allocations on this hot path.
         padded_mamba_indices = self.state_indices_list[bs - 1]
-        if mamba_pool_indices is not None:
-            padded_mamba_indices[:real_bs].copy_(
-                self.pool.get_mamba_indices(mamba_pool_indices[:real_bs])
-            )
+        if self.pool is None:
+            # Poolless flat mode: the buffer stays all pad_slot_id (consumers
+            # are pool/radix-gated; states travel via state_in/out_pages).
+            padded_mamba_indices.fill_(self.pad_slot_id)
         else:
-            padded_mamba_indices[:real_bs].copy_(
-                self.pool.get_mamba_indices(req_pool_indices[:real_bs])
-            )
-        if num_padding > 0:
-            padded_mamba_indices[real_bs:].fill_(-1)
+            if mamba_pool_indices is not None:
+                padded_mamba_indices[:real_bs].copy_(
+                    self.pool.get_mamba_indices(mamba_pool_indices[:real_bs])
+                )
+            else:
+                padded_mamba_indices[:real_bs].copy_(
+                    self.pool.get_mamba_indices(req_pool_indices[:real_bs])
+                )
+            if num_padding > 0:
+                padded_mamba_indices[real_bs:].fill_(-1)
 
         is_target_verify = (
             forward_mode is not None

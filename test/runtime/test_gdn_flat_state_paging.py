@@ -101,6 +101,116 @@ class ComputeStatePageIndicesTest(unittest.TestCase):
         self.assertEqual(state_out.tolist(), [0])
 
 
+class PoollessFlatMetadataTest(unittest.TestCase):
+    """Flat mode runs without a SimpleMambaPool (the runner no longer creates
+    one), so every metadata entry point must tolerate ``pool is None``.
+    CPU-only: pure index math, no kernels."""
+
+    P = 4  # state page size (tokens)
+
+    def setUp(self):
+        try:
+            import torch
+
+            from tokenspeed.runtime.execution.forward_batch_info import (
+                ForwardMode,
+            )
+            from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (  # noqa: E501
+                MambaAttnBackend,
+            )
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
+        self.torch = torch
+        self.ForwardMode = ForwardMode
+        config = SimpleNamespace(
+            device="cpu",
+            num_attention_heads=16,
+            num_kv_heads=16,
+            attn_tp_size=1,
+            dtype=torch.bfloat16,
+            head_dim=128,
+            is_draft=False,
+            speculative_num_draft_tokens=1,
+        )
+        backend = MambaAttnBackend(config)
+        stub_pool = SimpleNamespace(
+            state_slabs=[(object(), object())],
+            paged_cache_group_specs=(
+                SimpleNamespace(group_id="linear_attention"),
+            ),
+            page_size=self.P,
+        )
+        # set_pool is intentionally never called: flat mode has no
+        # SimpleMambaPool.
+        backend.set_kv_pool(stub_pool)
+        self.assertTrue(backend.flat_state_active)
+        self.assertIsNone(backend.pool)
+        self.backend = backend
+
+    def test_decode_metadata_without_pool(self):
+        torch = self.torch
+        backend = self.backend
+        backend.init_forward_metadata(
+            bs=1,
+            req_pool_indices=torch.tensor([0], dtype=torch.int32),
+            seq_lens=torch.tensor([9], dtype=torch.int32),
+            forward_mode=self.ForwardMode.DECODE,
+            flat_block_tables={
+                "linear_attention": torch.tensor([[1, 2, 3]], dtype=torch.int32)
+            },
+        )
+        md = backend.forward_metadata
+        # before = 8 -> page slot 1 (row 2); after = 9 -> page slot 2 (row 3).
+        self.assertEqual(md.state_in_pages.tolist(), [2])
+        self.assertEqual(md.state_out_pages.tolist(), [3])
+
+    def test_extend_metadata_without_pool(self):
+        torch = self.torch
+        backend = self.backend
+        backend.init_forward_metadata(
+            bs=1,
+            req_pool_indices=torch.tensor([0], dtype=torch.int32),
+            seq_lens=torch.tensor([8], dtype=torch.int32),
+            forward_mode=self.ForwardMode.EXTEND,
+            extend_prefix_lens=torch.zeros(1, dtype=torch.int32),
+            flat_block_tables={
+                "linear_attention": torch.tensor([[1, 2]], dtype=torch.int32)
+            },
+        )
+        md = backend.forward_metadata
+        self.assertEqual(md.state_in_pages.tolist(), [0])
+        self.assertEqual(md.state_out_pages.tolist(), [2])
+
+    def test_capture_replay_metadata_without_pool(self):
+        torch = self.torch
+        backend = self.backend
+        backend.init_cuda_graph_state(max_num_tokens=2)
+        backend.init_forward_metadata_capture_cuda_graph(
+            bs=1,
+            req_pool_indices=torch.tensor([0], dtype=torch.int32),
+            seq_lens=torch.tensor([1], dtype=torch.int32),
+            forward_mode=self.ForwardMode.DECODE,
+            flat_cache_group_ids=("linear_attention",),
+        )
+        md = backend.forward_metadata
+        # Capture binds the persistent pad-filled buffers.
+        self.assertEqual(md.state_in_pages.tolist(), [-1])
+        self.assertEqual(md.state_out_pages.tolist(), [-1])
+
+        backend.init_forward_metadata_replay_cuda_graph(
+            bs=1,
+            req_pool_indices=torch.tensor([0], dtype=torch.int32),
+            seq_lens=torch.tensor([9], dtype=torch.int32),
+            forward_mode=self.ForwardMode.DECODE,
+            flat_block_tables={
+                "linear_attention": torch.tensor([[1, 2, 3]], dtype=torch.int32)
+            },
+        )
+        md = backend.forward_metadata
+        self.assertEqual(md.state_in_pages.tolist(), [2])
+        self.assertEqual(md.state_out_pages.tolist(), [3])
+
+
 class GDNFlatStatePagingGPUTest(unittest.TestCase):
     """MambaAttnBackend in flat mode (paged state slabs, dual-index) vs the
     FLA chunk_gated_delta_rule oracle over the full contiguous sequence."""
