@@ -31,7 +31,7 @@ path otherwise (`decode=None` → on at `num_tokens <= 16`; override with
 | `stage2_kernel.py` | Stage 2: down GEMM + routed-weight scale → `[T,topk,D]` scratch, then a reduce over topk. Auto-dispatches to the atomic path at M=1. |
 | `stage2_decode_kernel.py` | Decode stage 2 (M=1): down GEMM + fp32 `buffer_atomic_add` straight into the output (no scratch, no reduce) — ~1.22x stage-2 win at M=1. |
 | `_grid.py` | XCD-aware PID remap helper. |
-| `tests/` | End-to-end correctness vs an fp32 torch reference. |
+| (tests) | `test/ops/test_moe_gluon_bf16_gfx950.py` — correctness vs an fp32 torch reference. |
 
 ## Design notes
 
@@ -46,12 +46,11 @@ path otherwise (`decode=None` → on at `num_tokens <= 16`; override with
 ## Correctness
 
 ```
-HIP_VISIBLE_DEVICES=0 TRITON_CACHE_DIR=/tmp/tc-moe \
-python -m gluon_bf16_moe.tests.test_bf16_moe
+pytest tokenspeed-kernel-amd/test/ops/test_moe_gluon_bf16_gfx950.py
 ```
 
-Checks end-to-end vs an fp32 torch reference and split-K consistency; all bf16
-GEMM diffs are within tolerance (cos = 1.0 vs the reference).
+Checks end-to-end vs an fp32 torch reference, split-K consistency, and
+warp-decode vs default; all bf16 GEMM diffs are within tolerance (cos = 1.0).
 
 ## Prerequisites
 
