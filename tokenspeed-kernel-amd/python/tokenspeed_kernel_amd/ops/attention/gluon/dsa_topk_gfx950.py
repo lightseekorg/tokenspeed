@@ -23,6 +23,11 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.attention.triton.dsa_topk import (
+    _RADIX_TOPK_MIN_COLS,
+    _topk_with_padding as _triton_topk_with_padding,
+    local_topk_to_global_slots as _triton_local_topk_to_global_slots,
+)
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 
 __all__ = [
@@ -432,6 +437,10 @@ def _validate_topk(topk: int) -> None:
         raise ValueError(f"DSA Gluon top-k requires power-of-two topk, got {topk}")
 
 
+def _use_triton_radix_topk(cols: int) -> bool:
+    return int(cols) >= _RADIX_TOPK_MIN_COLS
+
+
 def gluon_dsa_decode_topk_fp8_gfx950(
     q: torch.Tensor,
     weights: torch.Tensor,
@@ -512,6 +521,17 @@ def gluon_dsa_decode_topk_fp8_gfx950(
         BLOCK_N=block_n,
         num_warps=4,
     )
+    if _use_triton_radix_topk(max_seq_len):
+        local_topk_offsets = _triton_topk_with_padding(logits, topk)
+        return _triton_local_topk_to_global_slots(
+            local_topk_offsets=local_topk_offsets,
+            block_table=block_table,
+            block_size=int(page_size),
+            seq_lens=seq_lens,
+            out=out,
+            lens_out=lens_out,
+        )
+
     select_warps = 8
     select_block = _next_power_of_2(max(max_seq_len, topk))
     _dsa_decode_select_topk_kernel[(q.shape[0],)](
@@ -598,7 +618,14 @@ def gluon_dsa_prefill_topk_fp8_gfx950(
         max_query_rows = max(1, int(max_logits_bytes) // (max(seq_len_sum, 1) * 4))
     block_n = 64
     select_warps = 8
-    select_block = _next_power_of_2(max(seq_len_sum, topk))
+    use_triton_radix_topk = _use_triton_radix_topk(seq_len_sum)
+    if use_triton_radix_topk:
+        candidate_lens = (row_ends - row_starts).clamp_min(0)
+        lens_out.copy_(
+            torch.minimum(candidate_lens, torch.full_like(candidate_lens, topk))
+        )
+    else:
+        select_block = _next_power_of_2(max(seq_len_sum, topk))
     for start in range(0, q.shape[0], max_query_rows):
         end = min(start + max_query_rows, q.shape[0])
         logits = torch.empty(
@@ -626,6 +653,14 @@ def gluon_dsa_prefill_topk_fp8_gfx950(
             BLOCK_N=block_n,
             num_warps=4,
         )
+        if use_triton_radix_topk:
+            workspace_indices = _triton_topk_with_padding(logits, topk)
+            valid = (workspace_indices >= row_starts[start:end, None]) & (
+                workspace_indices < row_ends[start:end, None]
+            )
+            out[start:end].copy_(torch.where(valid, workspace_indices, -1))
+            continue
+
         _dsa_prefill_select_topk_kernel[(end - start,)](
             logits,
             row_starts[start:end],

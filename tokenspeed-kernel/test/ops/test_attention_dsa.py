@@ -768,6 +768,83 @@ def test_dsa_prefill_topk_fp8_glm52_cases(
     _assert_topk_matches(workspace_indices, topk_lens, expected_indices, expected_lens)
 
 
+def test_dsa_decode_topk_gluon_long_row_uses_radix_path(
+    device: str,
+    require,
+) -> None:
+    require("attention", "dsa_decode_topk", "gluon", torch.bfloat16, "q")
+
+    page_size = 64
+    seq_len = 65536
+    topk = 2048
+    head_dim = 128
+    q = torch.ones((1, 1, head_dim), device=device, dtype=torch.bfloat16)
+    weights = torch.ones((1, 1), device=device, dtype=torch.float32)
+    index_k = torch.zeros((seq_len, head_dim), device=device, dtype=torch.bfloat16)
+    index_k[:topk].fill_(1.0)
+    packed_index_k, _ = _pack_index_k_cache(index_k, page_size)
+    seq_lens = torch.tensor([seq_len], device=device, dtype=torch.int32)
+    block_table = torch.arange(
+        seq_len // page_size, device=device, dtype=torch.int32
+    ).reshape(1, -1)
+
+    topk_slots, topk_lens = dsa_decode_topk(
+        q,
+        weights,
+        seq_lens,
+        block_table,
+        page_size=page_size,
+        topk=topk,
+        softmax_scale=head_dim**-0.5,
+        index_k_cache=packed_index_k,
+        solution="gluon",
+    )
+
+    expected = torch.arange(topk, device=device, dtype=torch.int32)
+    torch.testing.assert_close(topk_lens.cpu(), torch.tensor([topk], dtype=torch.int32))
+    torch.testing.assert_close(torch.sort(topk_slots[0]).values.cpu(), expected.cpu())
+
+
+def test_dsa_prefill_topk_gluon_long_row_uses_radix_path(
+    device: str,
+    require,
+) -> None:
+    require("attention", "dsa_prefill_topk", "gluon", torch.bfloat16, "q")
+
+    page_size = 64
+    seq_len = 65536
+    topk = 2048
+    head_dim = 128
+    q = torch.ones((1, 1, head_dim), device=device, dtype=torch.bfloat16)
+    weights = torch.ones((1, 1), device=device, dtype=torch.float32)
+    index_k = torch.zeros((seq_len, head_dim), device=device, dtype=torch.bfloat16)
+    index_k[:topk].fill_(1.0)
+    packed_index_k, _ = _pack_index_k_cache(index_k, page_size)
+    kv_workspace_slots = torch.arange(seq_len, device=device, dtype=torch.int64)
+    row_starts = torch.tensor([0], device=device, dtype=torch.int32)
+    row_ends = torch.tensor([seq_len], device=device, dtype=torch.int32)
+
+    workspace_indices, topk_lens = dsa_prefill_topk(
+        q,
+        weights,
+        kv_workspace_slots,
+        row_starts,
+        row_ends,
+        topk=topk,
+        softmax_scale=head_dim**-0.5,
+        index_k_cache=packed_index_k,
+        page_size=page_size,
+        solution="gluon",
+    )
+
+    expected = torch.arange(topk, device=device, dtype=torch.int32)
+    torch.testing.assert_close(topk_lens.cpu(), torch.tensor([topk], dtype=torch.int32))
+    torch.testing.assert_close(
+        torch.sort(workspace_indices[0]).values.cpu(),
+        expected.cpu(),
+    )
+
+
 def test_dsa_plan_triton(device: str) -> None:
     # The triton decode kernel derives its own causal bounds and ignores the
     # plan, so triton_dsa_plan is a no-op returning an opaque, non-None
