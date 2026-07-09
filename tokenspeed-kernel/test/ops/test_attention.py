@@ -46,7 +46,10 @@ def _randn(shape: tuple[int, ...], *, device: str, dtype: torch.dtype) -> torch.
 
 @pytest.mark.parametrize(
     "dtype,head_dim,num_q_heads,num_kv_heads",
-    [(torch.bfloat16, 64, 8, 2)],
+    [
+        pytest.param(torch.bfloat16, 64, 8, 2, id="bf16-d64"),
+        pytest.param(torch.bfloat16, 128, 8, 2, id="bf16-d128"),
+    ],
 )
 @pytest.mark.parametrize("solution", ["triton", "fa3", "fa4", "gluon"])
 @pytest.mark.parametrize("has_sink", [False, True], ids=["no-sink", "sink"])
@@ -99,7 +102,10 @@ def test_mha_prefill(
 
 @pytest.mark.parametrize(
     "dtype,head_dim,num_q_heads,num_kv_heads",
-    [(torch.bfloat16, 64, 8, 2)],
+    [
+        pytest.param(torch.bfloat16, 64, 8, 2, id="bf16-d64"),
+        pytest.param(torch.bfloat16, 128, 8, 2, id="bf16-d128"),
+    ],
 )
 @pytest.mark.parametrize("solution", ["triton", "gluon"])
 def test_mha_prefill_lse(
@@ -162,7 +168,9 @@ def test_mha_prefill_lse(
     "dtype,head_dim,num_q_heads,num_kv_heads",
     [
         pytest.param(torch.bfloat16, 64, 8, 2, id="bf16"),
+        pytest.param(torch.bfloat16, 128, 8, 2, id="bf16-d128"),
         pytest.param(torch.float8_e4m3fn, 64, 8, 2, id="fp8"),
+        pytest.param(torch.float8_e4m3fn, 128, 8, 2, id="fp8-d128"),
     ],
 )
 @pytest.mark.parametrize("solution", ["triton", "fa3", "fa4", "flashinfer", "gluon"])
@@ -293,7 +301,9 @@ def test_mha_extend_with_kvcache(
     "dtype,head_dim,num_q_heads,num_kv_heads",
     [
         pytest.param(torch.bfloat16, 64, 8, 2, id="bf16"),
+        pytest.param(torch.bfloat16, 128, 8, 2, id="bf16-d128"),
         pytest.param(torch.float8_e4m3fn, 64, 8, 2, id="fp8"),
+        pytest.param(torch.float8_e4m3fn, 128, 8, 2, id="fp8-d128"),
     ],
 )
 @pytest.mark.parametrize("solution", ["triton", "fa3", "fa4", "flashinfer", "gluon"])

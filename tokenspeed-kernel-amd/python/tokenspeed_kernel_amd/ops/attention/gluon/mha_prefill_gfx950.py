@@ -60,6 +60,7 @@ class AttentionConfig:
     WINDOW_LEFT: gl.constexpr
     NUM_XCDS: gl.constexpr
     NUM_BLOCKS: gl.constexpr
+    IS_FP8: gl.constexpr
     q_strides: InputStrides
     k_strides: InputStrides
     v_strides: InputStrides
@@ -88,32 +89,53 @@ class AttentionConfig:
         HAS_SINK,
         HAS_LSE,
         WINDOW_LEFT,
+        IS_FP8,
         q_strides,
         k_strides,
         v_strides,
     ):
-        assert HEAD_DIM == 64
+        assert HEAD_DIM in (64, 128)
         assert NUM_WARPS == 4
 
+        # fp8 has no valid [32,32,16] MFMA; use the [16,16,32] shape which lowers
+        # to the CDNA4 fp8 MFMA with k_width=16.
+        instr_shape = [16, 16, 32] if IS_FP8 else [32, 32, 16]
         qk_layout = gl.amd.AMDMFMALayout(
             version=4,
-            instr_shape=[32, 32, 16],
+            instr_shape=instr_shape,
             transposed=True,
             warps_per_cta=[NUM_WARPS, 1],
         )
         pv_layout = gl.amd.AMDMFMALayout(
             version=4,
-            instr_shape=[32, 32, 16],
+            instr_shape=instr_shape,
             transposed=True,
             warps_per_cta=[NUM_WARPS, 1],
         )
-        load_layout = gl.BlockedLayout([1, 8], [8, 8], [4, 1], [1, 0])
-        store_layout = load_layout
+        # load_vec is the number of elements per lane, depends on the input dtype, same as qk_kw.
+        # load_threads is how many lanes span HEAD_DIM.
+        load_vec = 16 if IS_FP8 else 8
+        load_threads = HEAD_DIM // load_vec
+        load_layout = gl.BlockedLayout(
+            [1, load_vec], [64 // load_threads, load_threads], [4, 1], [1, 0]
+        )
+        # store_vec depends on the output dtype, always 16-bit regardless of input dtype, so 128 / 16 = 8.
+        # store_threads is how many lanes span HEAD_DIM.
+        store_vec = 8
+        store_threads = HEAD_DIM // store_vec
+        store_layout = gl.BlockedLayout(
+            [1, store_vec], [64 // store_threads, store_threads], [4, 1], [1, 0]
+        )
+        # Padding interval is 64 lanes * load_vec elems.
+        pad_interval = 64 * load_vec
+        # Empirically tuned.
+        pad_k = 16 if IS_FP8 else 8
+        pad_v = 16 if IS_FP8 else 32
         k_smem_layout = gl.PaddedSharedLayout.with_identity_for(
-            [[512, 8]], [BLOCK_N, HEAD_DIM], [1, 0]
+            [[pad_interval, pad_k]], [BLOCK_N, HEAD_DIM], [1, 0]
         )
         v_smem_layout = gl.PaddedSharedLayout.with_identity_for(
-            [[512, 32]], [BLOCK_N, HEAD_DIM], [1, 0]
+            [[pad_interval, pad_v]], [BLOCK_N, HEAD_DIM], [1, 0]
         )
         self.N_HEADS = gl.constexpr(N_HEADS)
         self.N_KV_HEADS = gl.constexpr(N_KV_HEADS)
@@ -128,15 +150,20 @@ class AttentionConfig:
         self.WINDOW_LEFT = gl.constexpr(WINDOW_LEFT)
         self.NUM_XCDS = gl.constexpr(8)
         self.NUM_BLOCKS = gl.constexpr(512)
+        self.IS_FP8 = gl.constexpr(IS_FP8)
         self.q_strides = q_strides
         self.k_strides = k_strides
         self.v_strides = v_strides
         self.qk_layout = gl.constexpr(qk_layout)
         self.pv_layout = gl.constexpr(pv_layout)
-        q_layout = gl.DotOperandLayout(0, qk_layout, k_width=8)
-        k_layout = gl.DotOperandLayout(1, qk_layout, k_width=8)
-        p_layout = gl.DotOperandLayout(0, pv_layout, k_width=4)
-        v_layout = gl.DotOperandLayout(1, pv_layout, k_width=4)
+        # qk_kw is derived from a 128-bit load / dtype bitwidth.
+        # pv_kw is empirically tuned.
+        qk_kw = 16 if IS_FP8 else 8
+        pv_kw = 16 if IS_FP8 else 4
+        q_layout = gl.DotOperandLayout(0, qk_layout, k_width=qk_kw)
+        k_layout = gl.DotOperandLayout(1, qk_layout, k_width=qk_kw)
+        p_layout = gl.DotOperandLayout(0, pv_layout, k_width=pv_kw)
+        v_layout = gl.DotOperandLayout(1, pv_layout, k_width=pv_kw)
         self.q_layout = gl.constexpr(q_layout)
         self.k_layout = gl.constexpr(k_layout)
         self.p_layout = gl.constexpr(p_layout)
@@ -865,6 +892,7 @@ def _mha_prefill_fp16(
     HAS_SINK: gl.constexpr,
     HAS_LSE: gl.constexpr,
     WINDOW_LEFT: gl.constexpr,
+    IS_FP8: gl.constexpr,
 ):
     cfg = AttentionConfig(
         N_HEADS,
@@ -878,6 +906,7 @@ def _mha_prefill_fp16(
         HAS_SINK,
         HAS_LSE,
         -1,
+        IS_FP8,
         InputStrides(Q_STRIDE_T, Q_STRIDE_H, Q_STRIDE_D),
         InputStrides(K_STRIDE_T, K_STRIDE_H, K_STRIDE_D),
         InputStrides(V_STRIDE_T, V_STRIDE_H, V_STRIDE_D),
@@ -950,6 +979,7 @@ def _mha_prefill_sliding_fp16(
     HAS_SINK: gl.constexpr,
     HAS_LSE: gl.constexpr,
     WINDOW_LEFT: gl.constexpr,
+    IS_FP8: gl.constexpr,
 ):
     cfg = AttentionConfig(
         N_HEADS,
@@ -963,6 +993,7 @@ def _mha_prefill_sliding_fp16(
         HAS_SINK,
         HAS_LSE,
         WINDOW_LEFT,
+        IS_FP8,
         InputStrides(Q_STRIDE_T, Q_STRIDE_H, Q_STRIDE_D),
         InputStrides(K_STRIDE_T, K_STRIDE_H, K_STRIDE_D),
         InputStrides(V_STRIDE_T, V_STRIDE_H, V_STRIDE_D),
@@ -1044,7 +1075,7 @@ def get_config(
     )
 
 
-def gluon_mha_prefill_fp16_gfx950(
+def gluon_mha_prefill_gfx950(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -1064,7 +1095,9 @@ def gluon_mha_prefill_fp16_gfx950(
         max_seqlen=max_seqlen,
         window_left=window_left,
     )
-    output = torch.empty(q.shape, device=q.device, dtype=q.dtype)
+    is_fp8 = q.dtype == torch.float8_e4m3fn
+    out_dtype = torch.bfloat16 if is_fp8 else q.dtype
+    output = torch.empty(q.shape, device=q.device, dtype=out_dtype)
     lse = (
         torch.empty((total_tokens, n_heads), device=q.device, dtype=torch.float32)
         if return_lse
@@ -1105,6 +1138,7 @@ def gluon_mha_prefill_fp16_gfx950(
         has_sink,
         has_lse,
         config.window_left,
+        is_fp8,
         num_warps=config.num_warps,
     )
     if return_lse:
