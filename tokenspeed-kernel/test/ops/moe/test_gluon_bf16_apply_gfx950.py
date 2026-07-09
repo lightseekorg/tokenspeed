@@ -45,7 +45,9 @@ def test_gluon_bf16_moe_apply_matches_reference(num_tokens):
     dev = "cuda"
     g = torch.Generator(device=dev).manual_seed(0)
     x = torch.randn(num_tokens, D, dtype=torch.bfloat16, device=dev, generator=g)
-    w13 = torch.randn(E, 2 * I_R, D, dtype=torch.bfloat16, device=dev, generator=g) * 0.05
+    w13 = (
+        torch.randn(E, 2 * I_R, D, dtype=torch.bfloat16, device=dev, generator=g) * 0.05
+    )
     w2 = torch.randn(E, D, I_R, dtype=torch.bfloat16, device=dev, generator=g) * 0.05
     logits = torch.randn(num_tokens, E, dtype=torch.float32, device=dev, generator=g)
     probs = torch.softmax(logits, dim=-1)
