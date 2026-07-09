@@ -229,7 +229,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("required_groups", &tokenspeed::PrefixCacheAdjunctSpec::required_groups);
 
     scheduler_config.def(nb::init<>())
-        .def_rw("page_size", &tokenspeed::SchedulerConfig::page_size)
+        .def_rw("block_size", &tokenspeed::SchedulerConfig::block_size)
         .def_rw("max_scheduled_tokens", &tokenspeed::SchedulerConfig::max_scheduled_tokens)
         .def_rw("max_batch_size", &tokenspeed::SchedulerConfig::max_batch_size)
         .def_rw("decode_input_tokens", &tokenspeed::SchedulerConfig::decode_input_tokens)

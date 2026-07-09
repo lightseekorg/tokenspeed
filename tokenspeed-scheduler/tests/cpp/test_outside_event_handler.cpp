@@ -110,9 +110,9 @@ TEST_F(LoadBackDoneTestSuite, LoadBackDone_Success_PrefixLenChangesInForward) {
     auto idx = FindRequestIndex(fwd, "r2");
     ASSERT_GE(idx, 0) << "r2 should be in forward after host cache hit";
 
-    // With page_size=2 and 4 prefill tokens, GetFullPagedTokens(except_last=true)
+    // With block_size=2 and 4 prefill tokens, GetFullPagedTokens(except_last=true)
     // yields 3 tokens → 1 matchable page. Host has 2 pages but only 1 matches.
-    // unscheduled = 4 - 1*2 = 2, so input_length = 2 and extend_prefix_len = 1*page_size = 2.
+    // unscheduled = 4 - 1*2 = 2, so input_length = 2 and extend_prefix_len = 1*block_size = 2.
     EXPECT_EQ(fwd->input_lengths[idx], 2) << "host hit covers 1 page; 2 tokens remain";
 
     if (!fwd->extend_prefix_lens.empty()) {

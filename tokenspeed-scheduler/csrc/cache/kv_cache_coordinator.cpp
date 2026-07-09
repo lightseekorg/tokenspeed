@@ -99,7 +99,7 @@ std::vector<std::vector<std::string>> KvCacheCoordinator::buildGroupKeys(
 
 // The one tier matcher: slots below floor_tokens are assumed valid in a lower tier; per_group
 // blocks are relative to the floor, num_common_tokens is the absolute converged boundary.
-// Boundaries are in TOKENS (the cross-page-size unit); slot math still assumes uniform P.
+// Boundaries are in TOKENS (the cross-block-size unit); slot math still assumes uniform P.
 CoordinatorMatch KvCacheCoordinator::matchTierWithKeys(const BlockPool& pool,
                                                        std::span<const std::vector<std::string>> group_keys,
                                                        std::int32_t total_blocks,
@@ -110,30 +110,30 @@ CoordinatorMatch KvCacheCoordinator::matchTierWithKeys(const BlockPool& pool,
         return out;
     }
     const std::int32_t boundary_tokens = SweepThenConverge(
-        match_order_, groups_, total_blocks * groups_[0].Spec().page_size,
+        match_order_, groups_, total_blocks * groups_[0].Spec().block_size,
         [&](std::size_t i, std::int32_t bound_tokens) {
-            const std::int32_t group_page = groups_[i].Spec().page_size;
-            out.per_group[i] = groups_[i].Manager().Match(pool, group_keys[i], floor_tokens / group_page,
-                                                          bound_tokens / group_page);
+            const std::int32_t group_block_size = groups_[i].Spec().block_size;
+            out.per_group[i] = groups_[i].Manager().Match(pool, group_keys[i], floor_tokens / group_block_size,
+                                                          bound_tokens / group_block_size);
         },
         [&](std::size_t i) {
-            const std::int32_t group_page = groups_[i].Spec().page_size;
-            return (floor_tokens / group_page +
+            const std::int32_t group_block_size = groups_[i].Spec().block_size;
+            return (floor_tokens / group_block_size +
                     static_cast<std::int32_t>(out.per_group[i].blocks.size())) *
-                   group_page;
+                   group_block_size;
         });
 
     // Linear cleanup: closed groups truncate to the converged boundary (any prefix stays
     // valid); non-closed groups are at or under it by construction above.
     for (std::size_t i = 0; i < groups_.size(); ++i) {
-        const std::int32_t group_page = groups_[i].Spec().page_size;
+        const std::int32_t group_block_size = groups_[i].Spec().block_size;
         PrefixMatch& m = out.per_group[i];
-        const std::int32_t floor_blocks = floor_tokens / group_page;
-        if ((floor_blocks + static_cast<std::int32_t>(m.blocks.size())) * group_page <= boundary_tokens) {
+        const std::int32_t floor_blocks = floor_tokens / group_block_size;
+        if ((floor_blocks + static_cast<std::int32_t>(m.blocks.size())) * group_block_size <= boundary_tokens) {
             continue;
         }
         _assert(groups_[i].Manager().MatchIsPrefixClosed(), "window group left above the converged boundary");
-        m.blocks.resize(static_cast<std::size_t>(boundary_tokens / group_page - floor_blocks));
+        m.blocks.resize(static_cast<std::size_t>(boundary_tokens / group_block_size - floor_blocks));
         m.num_hit_blocks = static_cast<std::int32_t>(
             std::ranges::count_if(m.blocks, [](const CacheBlock* b) { return !b->IsNull(); }));
     }
@@ -236,13 +236,13 @@ void KvCacheCoordinator::CacheFullBlocks(std::span<BlockTable> tables,
         if (groups_[i].Manager().RegistersAlignedFinalPageOnly()) {
             // Interior page boundaries never received a state write; only an aligned chunk
             // end holds a real snapshot, and it lives in the final full page of the range.
-            if (end_tokens < 0 || end_tokens % groups_[i].Spec().page_size != 0) {
+            if (end_tokens < 0 || end_tokens % groups_[i].Spec().block_size != 0) {
                 continue;
             }
             group_first_slot = first_slot + static_cast<std::int32_t>(keys.size()) - 1;
             group_keys = group_keys.last(1);
             const bool aligned_range = first_slot + static_cast<std::int32_t>(keys.size()) ==
-                                       end_tokens / groups_[i].Spec().page_size;
+                                       end_tokens / groups_[i].Spec().block_size;
             _assert(aligned_range, "state registration range must end at the aligned boundary");
         }
         std::vector<std::pair<std::string, CacheBlock*>> newly_cached;
@@ -271,19 +271,19 @@ void KvCacheCoordinator::Free(std::span<BlockTable> tables) {
 KvCacheCoordinator MakeCoordinator(std::span<const KvCacheSpec> specs, BlockPool& pool,
                                    const BlockPool* host_pool) {
     _assert(!specs.empty(), "MakeCoordinator requires at least one spec");
-    std::int32_t page_size = specs[0].page_size;
+    std::int32_t block_size = specs[0].block_size;
     std::vector<CacheGroup> groups;
     groups.reserve(specs.size());
     for (std::size_t i = 0; i < specs.size(); ++i) {
         const KvCacheSpec& spec = specs[i];
-        _assert(spec.page_size == page_size, "all groups must share the same page_size");
+        _assert(spec.block_size == block_size, "all groups must share the same block_size");
         std::unique_ptr<KvCacheManager> manager;
         if (spec.kind == AttnKind::kFull) {
-            manager = std::make_unique<FullAttnManager>(spec.page_size);
+            manager = std::make_unique<FullAttnManager>(spec.block_size);
         } else if (spec.kind == AttnKind::kMambaState) {
-            manager = std::make_unique<MambaStateManager>(spec.page_size);
+            manager = std::make_unique<MambaStateManager>(spec.block_size);
         } else {
-            manager = std::make_unique<SwaManager>(spec.page_size, spec.sliding_window);
+            manager = std::make_unique<SwaManager>(spec.block_size, spec.sliding_window);
         }
         groups.emplace_back(spec, static_cast<std::uint32_t>(i), std::move(manager));
     }

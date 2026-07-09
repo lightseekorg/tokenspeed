@@ -115,7 +115,7 @@ Scheduler::FlatAdmissionMatch Scheduler::matchFlatPrefixAtAdmission(Request* req
     }
     // Hash input must be byte-identical to the REGISTRATION form (GetFullPagedTokens(false)); radix's
     // except_last rule (last prompt token recomputed for logits) becomes the page cap, also bounding SWA.
-    const std::int32_t cap_pages = std::max((request->PrefillSize() - 1) / config_.page_size, 0);
+    const std::int32_t cap_pages = std::max((request->PrefillSize() - 1) / config_.block_size, 0);
     std::vector<std::span<const std::int32_t>> paged_tokens = request->GetFullPagedTokens(/*except_last=*/false);
     if (static_cast<std::size_t>(cap_pages) < paged_tokens.size()) {
         paged_tokens.resize(cap_pages);
@@ -128,8 +128,8 @@ Scheduler::FlatAdmissionMatch Scheduler::matchFlatPrefixAtAdmission(Request* req
     // Boundaries are in tokens; the extension hash offsets are in scheduler pages (uniform P,
     // same granularity the hashes were computed at). No host pool -> host boundary 0 -> empty slice.
     const std::int32_t ext_pages =
-        std::max(match.host.num_common_tokens - match.device.num_common_tokens, 0) / config_.page_size;
-    const auto ext_begin = flat_hashes.begin() + match.device.num_common_tokens / config_.page_size;
+        std::max(match.host.num_common_tokens - match.device.num_common_tokens, 0) / config_.block_size;
+    const auto ext_begin = flat_hashes.begin() + match.device.num_common_tokens / config_.block_size;
     match.ext_hashes.assign(ext_begin, ext_begin + ext_pages);
     return match;
 }
@@ -218,13 +218,13 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     const std::int32_t device_matched = match_result.device.DepthInPage();
     const std::int32_t host_matched = match_result.host.DepthInPage();
     if (disable_l2_cache) {
-        unscheduled = request->PrefillSize() - device_matched * config_.page_size;
+        unscheduled = request->PrefillSize() - device_matched * config_.block_size;
     } else {
         loadback_diff = match_result.NodesWithout<ResourceType::Device>();
         if (host_matched > device_matched) {
-            loadback_tokens = config_.page_size * (host_matched - device_matched);
+            loadback_tokens = config_.block_size * (host_matched - device_matched);
         }
-        unscheduled = request->PrefillSize() - std::max(device_matched, host_matched) * config_.page_size;
+        unscheduled = request->PrefillSize() - std::max(device_matched, host_matched) * config_.block_size;
     }
 
     std::int32_t tokens_this_round = std::min(remaining, unscheduled);
@@ -236,7 +236,7 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     }
 
     std::int32_t num_tokens = loadback_tokens + tokens_this_round + decode_input_tokens;
-    std::int32_t device_pages_needed = (num_tokens + config_.page_size - 1) / config_.page_size;
+    std::int32_t device_pages_needed = (num_tokens + config_.block_size - 1) / config_.block_size;
 
     std::unique_ptr<DeviceNodeRef> temp_lock = std::make_unique<DeviceNodeRef>(match_result.device.last_node);
 
@@ -334,7 +334,7 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     std::int32_t unscheduled = request->UnScheduledPrefillSize();
     std::int32_t tokens_this_round = std::min(remaining, unscheduled);
 
-    std::int32_t pages_needed = (tokens_this_round + config_.page_size - 1) / config_.page_size;
+    std::int32_t pages_needed = (tokens_this_round + config_.block_size - 1) / config_.block_size;
 
     if (!kv_prefix_cache_.EnsureCapacityByEvict<ResourceType::Device>(pages_needed)) {
         return {};
@@ -382,7 +382,7 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* reque
                                                                   std::map<std::string, std::int32_t>& simulated_free) {
     std::int32_t tail_available = request->TailPageAvailableTokens();
     std::int32_t extra_tokens = std::max(0, request->GetReserveNumTokensInNextScheduleEvent() - tail_available);
-    std::int32_t pages_needed = (extra_tokens + config_.page_size - 1) / config_.page_size;
+    std::int32_t pages_needed = (extra_tokens + config_.block_size - 1) / config_.block_size;
 
     if (!kv_prefix_cache_.EnsureCapacityByEvict<ResourceType::Device>(pages_needed)) {
         return {};
@@ -455,11 +455,11 @@ std::optional<fsm::ScheduleDecodeFromRetractedEvent> Scheduler::scheduleDecodeFr
     const std::int32_t host_matched2 = match_result.host.DepthInPage();
     std::int32_t num_tokens = 0;
     if (host_matched2 > device_matched2) {
-        num_tokens += (config_.page_size * (host_matched2 - device_matched2)) + config_.decode_input_tokens;
+        num_tokens += (config_.block_size * (host_matched2 - device_matched2)) + config_.decode_input_tokens;
     } else {
         num_tokens += config_.decode_input_tokens;
     }
-    std::int32_t device_pages_needed = (num_tokens + config_.page_size - 1) / config_.page_size;
+    std::int32_t device_pages_needed = (num_tokens + config_.block_size - 1) / config_.block_size;
 
     std::unique_ptr<DeviceNodeRef> temp_lock = std::make_unique<DeviceNodeRef>(match_result.device.last_node);
     if (!kv_prefix_cache_.EnsureCapacityByEvict<ResourceType::Device>(device_pages_needed)) {

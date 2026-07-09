@@ -66,7 +66,7 @@ bool FinalizePrefillAndReserveDecode(KvCacheCoordinator& coordinator, std::vecto
                                      std::span<const std::string> content_hashes, std::int32_t reserve_tokens,
                                      std::int32_t num_computed_tokens);
 
-// One KvCacheSpec per config paged_cache_group (group_id = index); all groups share config.page_size.
+// One KvCacheSpec per config paged_cache_group (group_id = index); all groups share config.block_size.
 std::vector<KvCacheSpec> MakeSpecsFromConfig(const SchedulerConfig& config);
 
 void FreeRequest(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables);

@@ -74,7 +74,7 @@ struct PrefixCacheAdjunctSpec {
 };
 
 struct SchedulerConfig {
-    std::int32_t page_size{};
+    std::int32_t block_size{};
     struct {
         // Flat builds: page 0 is the null placeholder (device convention), so usable = total - 1.
         std::int32_t total_pages{};

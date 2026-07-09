@@ -36,7 +36,7 @@ protected:
     // Subclasses can override this to customize the config.
     virtual SchedulerConfig MakeConfig() {
         SchedulerConfig cfg{};
-        cfg.page_size = 2;
+        cfg.block_size = 2;
         cfg.device_allocator.total_pages = 32;
         cfg.host_allocator.total_pages = 32;
         cfg.max_scheduled_tokens = 64;
@@ -52,7 +52,7 @@ protected:
     }
 
     const SchedulerConfig& Config() const { return config_; }
-    std::int32_t PageSize() const { return config_.page_size; }
+    std::int32_t PageSize() const { return config_.block_size; }
     RequestSpec MakeRequestSpec(const std::string& id, std::int32_t num_pages, token_t start = 1) {
         auto tokens = MakeAlignedTokens(num_pages, PageSize(), start);
         return RequestSpec{

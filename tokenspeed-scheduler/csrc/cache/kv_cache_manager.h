@@ -33,12 +33,12 @@
 
 namespace tokenspeed {
 
-// Pure per-attention-type policy over page_size (+ window): holds no pool, no per-request
+// Pure per-attention-type policy over block_size (+ window): holds no pool, no per-request
 // state -- every operation acts on the pool it is handed, identically for any tier.
 class KvCacheManager {
 public:
-    explicit KvCacheManager(std::int32_t page_size) : page_size_{page_size} {
-        _assert(page_size > 0, "page_size must be > 0");
+    explicit KvCacheManager(std::int32_t block_size) : block_size_{block_size} {
+        _assert(block_size > 0, "block_size must be > 0");
     }
     virtual ~KvCacheManager() = default;
 
@@ -74,7 +74,7 @@ public:
             return true;
         }
         std::int32_t over = num_tokens - table.tail_avail_;
-        std::int32_t num_pages = (over + page_size_ - 1) / page_size_;
+        std::int32_t num_pages = (over + block_size_ - 1) / block_size_;
         std::vector<CacheBlock*> new_blocks = pool.AllocateBlocks(num_pages);
         if (static_cast<std::int32_t>(new_blocks.size()) < num_pages) {
             return false;
@@ -82,8 +82,8 @@ public:
         for (CacheBlock* block : new_blocks) {
             table.blocks_.push_back(BlockRef::Adopt(pool, block));
         }
-        std::int32_t used_in_tail = over % page_size_;
-        table.tail_avail_ = (used_in_tail == 0) ? 0 : page_size_ - used_in_tail;
+        std::int32_t used_in_tail = over % block_size_;
+        table.tail_avail_ = (used_in_tail == 0) ? 0 : block_size_ - used_in_tail;
         return true;
     }
 
@@ -96,7 +96,7 @@ public:
                 table.blocks_.push_back(BlockRef::Share(pool, pool.NullBlock()));
                 continue;
             }
-            const bool acquired = Acquire(pool, table, page_size_);
+            const bool acquired = Acquire(pool, table, block_size_);
             _assert(acquired, "pre-checked Acquire must succeed");
             load_pairs.emplace_back(host_block, table.blocks_.back().Get());
         }
@@ -108,7 +108,7 @@ public:
             return 0;
         }
         std::int32_t over = num_tokens - table.tail_avail_;
-        return (over + page_size_ - 1) / page_size_;
+        return (over + block_size_ - 1) / block_size_;
     }
 
     // State snapshots are only boundary-correct where a forward call ended page-aligned:
@@ -163,7 +163,7 @@ public:
     }
 
 protected:
-    std::int32_t page_size_;
+    std::int32_t block_size_;
 };
 
 }  // namespace tokenspeed

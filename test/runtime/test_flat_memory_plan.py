@@ -36,7 +36,7 @@ def _load(mod_name: str, file_name: str):
 
 _fmp = _load("flat_memory_plan_under_test", "flat_memory_plan.py")
 ComponentSpec = _fmp.ComponentSpec
-PageGeometry = _fmp.PageGeometry
+BlockGeometry = _fmp.BlockGeometry
 solve_page_geometry = _fmp.solve_page_geometry
 plan_tensors = _fmp.plan_tensors
 components_from_layers = _fmp.components_from_layers
@@ -62,7 +62,7 @@ class EqualizerTest(unittest.TestCase):
         ]
         geo = solve_page_geometry(comps, block_size=16, alignment=256)
         self.assertEqual(geo.block_size, 16)
-        self.assertEqual(geo.page_bytes, 16 * 1024)
+        self.assertEqual(geo.block_bytes, 16 * 1024)
 
     def test_qwen35_constant_state_inflates_page_size(self):
         comps = [
@@ -92,7 +92,7 @@ class EqualizerTest(unittest.TestCase):
         # A state layer's components pack into ONE page row ([conv|ssm|pad]),
         # so the constant demand is their SUM: ceil((40+60)KiB / 1KiB) = 100.
         self.assertEqual(geo.block_size, 100)
-        self.assertEqual(geo.page_bytes, 100 * 1024)
+        self.assertEqual(geo.block_bytes, 100 * 1024)
 
     def test_inflation_rounds_up_to_alignment(self):
         comps = [
@@ -110,7 +110,7 @@ class EqualizerTest(unittest.TestCase):
         geo = solve_page_geometry(comps, block_size=16, alignment=16)
         # ceil(101K / 1K) = 101 -> rounded up to the next multiple of 16.
         self.assertEqual(geo.block_size, 112)
-        self.assertEqual(geo.page_bytes, 112 * 1024)
+        self.assertEqual(geo.block_bytes, 112 * 1024)
 
     def test_dsv4_linear_rows_pad_not_inflate(self):
         comps = [
@@ -122,7 +122,7 @@ class EqualizerTest(unittest.TestCase):
         geo = solve_page_geometry(comps, block_size=64, alignment=256)
         self.assertEqual(geo.block_size, 64)
         # Same-layer components pack into one row.
-        self.assertEqual(geo.page_bytes, 64 * (1152 + 132))
+        self.assertEqual(geo.block_bytes, 64 * (1152 + 132))
 
     def test_constant_components_require_a_linear_row(self):
         comps = [
@@ -209,7 +209,7 @@ class PlanTensorsTest(unittest.TestCase):
         full = [b for b in plan.tensors[0].bindings if b.group_id == "full_attention"]
         self.assertEqual(full[0].row_offset, 0)
 
-    def test_num_pages_from_budget_uniform_across_slots(self):
+    def test_num_blocks_from_budget_uniform_across_slots(self):
         plan = plan_tensors(
             self._comps_qwen35(),
             block_size=16,
@@ -218,12 +218,12 @@ class PlanTensorsTest(unittest.TestCase):
         )
         geo = plan.geometry
         self.assertEqual(geo.block_size, 100)  # 等化继承 B2:state 100KiB / 1KiB
-        self.assertEqual(geo.page_bytes, 100 * 1024)
+        self.assertEqual(geo.block_bytes, 100 * 1024)
         self.assertEqual(
-            geo.num_pages, 100 * 1024 * 1024 // (2 * 100 * 1024)
+            geo.num_blocks, 100 * 1024 * 1024 // (2 * 100 * 1024)
         )  # 512
         for t in plan.tensors:
-            self.assertEqual(t.nbytes, geo.num_pages * geo.page_bytes)
+            self.assertEqual(t.nbytes, geo.num_blocks * geo.block_bytes)
 
     def test_gpt_oss_pairing_matches_hybrid_slab(self):
         comps = [
@@ -293,7 +293,7 @@ class GptOssEquivalenceTest(unittest.TestCase):
             comps, block_size=16, alignment=4, budget_bytes=budget
         )
         legacy_pages = budget // (24 * 16 * 1024)  # M12 别名:24 物理槽 × 页字节
-        self.assertEqual(plan.geometry.num_pages, legacy_pages)
+        self.assertEqual(plan.geometry.num_blocks, legacy_pages)
 
 
 class ComponentsFromLayersTest(unittest.TestCase):

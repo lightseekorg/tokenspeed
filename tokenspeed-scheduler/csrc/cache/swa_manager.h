@@ -36,8 +36,8 @@ namespace tokenspeed {
 
 class SwaManager : public KvCacheManager {
 public:
-    SwaManager(std::int32_t page_size, std::int32_t sliding_window)
-        : KvCacheManager(page_size), sliding_window_{sliding_window} {
+    SwaManager(std::int32_t block_size, std::int32_t sliding_window)
+        : KvCacheManager(block_size), sliding_window_{sliding_window} {
         _assert(sliding_window > 0, "sliding_window must be > 0");
     }
 
@@ -109,7 +109,7 @@ public:
 
 private:
     // Cached pages a boundary needs behind it: they cover the window's last (window - 1) tokens.
-    std::int32_t pagesNeededToResume() const { return (sliding_window_ - 1 + page_size_ - 1) / page_size_; }
+    std::int32_t pagesNeededToResume() const { return (sliding_window_ - 1 + block_size_ - 1) / block_size_; }
 
     struct ResumableBoundary {
         std::int32_t boundary;    // == begin_blocks when no boundary qualifies
@@ -145,7 +145,7 @@ private:
         if (skipped <= 0) {
             return 0;  // all tokens still inside the window
         }
-        std::int32_t skipped_blocks = skipped / page_size_;  // only fully-slid-out pages
+        std::int32_t skipped_blocks = skipped / block_size_;  // only fully-slid-out pages
         // Safety cap: FSM-consistent input never engages it.
         return std::min(skipped_blocks, table.NumBlocks());
     }

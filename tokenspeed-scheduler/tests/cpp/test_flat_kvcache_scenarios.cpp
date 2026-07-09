@@ -43,14 +43,14 @@ const FlatForwardOperation* FindFlatOp(const ExecutionPlan& plan) {
     return nullptr;
 }
 
-PagedCacheGroupConfig MakeGroup(const std::string& id, std::int32_t page_size,
+PagedCacheGroupConfig MakeGroup(const std::string& id, std::int32_t block_size,
                                 std::int32_t total_pages,
                                 PagedCacheGroupConfig::Retention retention,
                                 PagedCacheGroupFamily family,
                                 std::int32_t sliding_window_tokens = 0) {
     PagedCacheGroupConfig g;
     g.group_id = id;
-    g.rows_per_page = page_size;
+    g.rows_per_page = block_size;
     g.entry_stride_tokens = 1;
     g.total_pages = total_pages;
     g.retention = retention;
@@ -81,7 +81,7 @@ class FlatChunkedPrefillSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg{};
-        cfg.page_size = 2;
+        cfg.block_size = 2;
         cfg.device_allocator.total_pages = 64;
         cfg.host_allocator.total_pages = 64;
         cfg.max_scheduled_tokens = 4;  // 4 tokens = 2 pages per chunk
@@ -91,10 +91,10 @@ protected:
         cfg.disable_prefix_cache = true;
 
         cfg.paged_cache_groups = {
-            MakeGroup("full", cfg.page_size, cfg.device_allocator.total_pages,
+            MakeGroup("full", cfg.block_size, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::FullHistory,
                       PagedCacheGroupFamily::History),
-            MakeGroup("swa", cfg.page_size, cfg.device_allocator.total_pages,
+            MakeGroup("swa", cfg.block_size, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::SlidingWindow,
                       PagedCacheGroupFamily::State, /*sliding_window_tokens=*/4),
         };
@@ -147,7 +147,7 @@ class FlatThreeGroupSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg{};
-        cfg.page_size = 2;
+        cfg.block_size = 2;
         cfg.device_allocator.total_pages = 96;
         cfg.host_allocator.total_pages = 96;
         cfg.max_scheduled_tokens = 64;
@@ -157,13 +157,13 @@ protected:
         cfg.disable_prefix_cache = true;
 
         cfg.paged_cache_groups = {
-            MakeGroup("full", cfg.page_size, cfg.device_allocator.total_pages,
+            MakeGroup("full", cfg.block_size, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::FullHistory,
                       PagedCacheGroupFamily::History),
-            MakeGroup("swa_small", cfg.page_size, cfg.device_allocator.total_pages,
+            MakeGroup("swa_small", cfg.block_size, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::SlidingWindow,
                       PagedCacheGroupFamily::State, /*sliding_window_tokens=*/4),
-            MakeGroup("swa_big", cfg.page_size, cfg.device_allocator.total_pages,
+            MakeGroup("swa_big", cfg.block_size, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::SlidingWindow,
                       PagedCacheGroupFamily::State, /*sliding_window_tokens=*/8),
         };
@@ -209,7 +209,7 @@ class FlatSubPageWindowSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg{};
-        cfg.page_size = 4;
+        cfg.block_size = 4;
         cfg.device_allocator.total_pages = 96;
         cfg.host_allocator.total_pages = 96;
         cfg.max_scheduled_tokens = 64;
@@ -219,13 +219,13 @@ protected:
         cfg.disable_prefix_cache = true;
 
         cfg.paged_cache_groups = {
-            MakeGroup("full", cfg.page_size, cfg.device_allocator.total_pages,
+            MakeGroup("full", cfg.block_size, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::FullHistory,
                       PagedCacheGroupFamily::History),
-            MakeGroup("swa_w3", cfg.page_size, cfg.device_allocator.total_pages,
+            MakeGroup("swa_w3", cfg.block_size, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::SlidingWindow,
                       PagedCacheGroupFamily::State, /*sliding_window_tokens=*/3),
-            MakeGroup("swa_w5", cfg.page_size, cfg.device_allocator.total_pages,
+            MakeGroup("swa_w5", cfg.block_size, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::SlidingWindow,
                       PagedCacheGroupFamily::State, /*sliding_window_tokens=*/5),
         };
@@ -291,7 +291,7 @@ class FlatAllFullTwoGroupSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg{};
-        cfg.page_size = 2;
+        cfg.block_size = 2;
         cfg.device_allocator.total_pages = 64;
         cfg.host_allocator.total_pages = 64;
         cfg.max_scheduled_tokens = 64;
@@ -301,10 +301,10 @@ protected:
         cfg.disable_prefix_cache = true;
 
         cfg.paged_cache_groups = {
-            MakeGroup("full_a", cfg.page_size, cfg.device_allocator.total_pages,
+            MakeGroup("full_a", cfg.block_size, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::FullHistory,
                       PagedCacheGroupFamily::History),
-            MakeGroup("full_b", cfg.page_size, cfg.device_allocator.total_pages,
+            MakeGroup("full_b", cfg.block_size, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::FullHistory,
                       PagedCacheGroupFamily::History),
         };
@@ -347,7 +347,7 @@ class FlatPoolAccountingSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg{};
-        cfg.page_size = 2;
+        cfg.block_size = 2;
         cfg.device_allocator.total_pages = 64;
         cfg.host_allocator.total_pages = 64;
         cfg.max_scheduled_tokens = 64;
@@ -357,10 +357,10 @@ protected:
         cfg.disable_prefix_cache = true;
 
         cfg.paged_cache_groups = {
-            MakeGroup("full", cfg.page_size, cfg.device_allocator.total_pages,
+            MakeGroup("full", cfg.block_size, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::FullHistory,
                       PagedCacheGroupFamily::History),
-            MakeGroup("swa", cfg.page_size, cfg.device_allocator.total_pages,
+            MakeGroup("swa", cfg.block_size, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::SlidingWindow,
                       PagedCacheGroupFamily::State, /*sliding_window_tokens=*/4),
         };
@@ -402,7 +402,7 @@ TEST_F(FlatPoolAccountingSuite, ThreeRequestsOutOfOrderFinishReclaimExactly) {
 // Chunked prefill slides the SWA window DURING prefill, then decode keeps
 // sliding. Window convention used below: with N = tokens computed BEFORE a
 // round's forward, the pending query at N attends keys [N-W+1, N], so the
-// first kept page is (N-W+1)/page_size and everything below it is freed.
+// first kept page is (N-W+1)/block_size and everything below it is freed.
 TEST_F(FlatChunkedPrefillSuite, ChunkedPrefillThenSwaSlidesToNullHole) {
     const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
 
@@ -531,7 +531,7 @@ class FlatMixedBatchSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg{};
-        cfg.page_size = 2;
+        cfg.block_size = 2;
         cfg.device_allocator.total_pages = 64;
         cfg.host_allocator.total_pages = 64;
         cfg.max_scheduled_tokens = 64;
@@ -542,10 +542,10 @@ protected:
         cfg.enable_mixed_prefill_decode = true;  // decode + prefill in one plan
 
         cfg.paged_cache_groups = {
-            MakeGroup("full", cfg.page_size, cfg.device_allocator.total_pages,
+            MakeGroup("full", cfg.block_size, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::FullHistory,
                       PagedCacheGroupFamily::History),
-            MakeGroup("swa", cfg.page_size, cfg.device_allocator.total_pages,
+            MakeGroup("swa", cfg.block_size, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::SlidingWindow,
                       PagedCacheGroupFamily::State, /*sliding_window_tokens=*/4),
         };
@@ -641,13 +641,13 @@ TEST_F(FlatMixedBatchSuite, PerRequestSwaHoleAtDifferentDecodeDepths) {
 }
 
 // ---------------------------------------------------------------------------
-// page_size = 1: the flat path is not hard-wired to page_size=2.
+// block_size = 1: the flat path is not hard-wired to block_size=2.
 // ---------------------------------------------------------------------------
 class FlatPageSizeOneSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg{};
-        cfg.page_size = 1;
+        cfg.block_size = 1;
         cfg.device_allocator.total_pages = 64;
         cfg.host_allocator.total_pages = 64;
         cfg.max_scheduled_tokens = 64;
@@ -657,10 +657,10 @@ protected:
         cfg.disable_prefix_cache = true;
 
         cfg.paged_cache_groups = {
-            MakeGroup("full", cfg.page_size, cfg.device_allocator.total_pages,
+            MakeGroup("full", cfg.block_size, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::FullHistory,
                       PagedCacheGroupFamily::History),
-            MakeGroup("swa", cfg.page_size, cfg.device_allocator.total_pages,
+            MakeGroup("swa", cfg.block_size, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::SlidingWindow,
                       PagedCacheGroupFamily::State, /*sliding_window_tokens=*/2),
         };
@@ -676,7 +676,7 @@ TEST_F(FlatPageSizeOneSuite, TokenGranularPagesSlideAndReclaim) {
     const FlatForwardOperation* pop = FindFlatOp(prefill);
     ASSERT_NE(pop, nullptr);
     EXPECT_EQ(pop->flat_block_tables.at("full").at(0).size(), 3u)
-        << "page_size=1 -> one page per prompt token";
+        << "block_size=1 -> one page per prompt token";
 
     SendForwardDone("r1", {42});
 
@@ -690,11 +690,11 @@ TEST_F(FlatPageSizeOneSuite, TokenGranularPagesSlideAndReclaim) {
     const FlatForwardOperation* op = FindFlatOp(*last);
     ASSERT_NE(op, nullptr);
     for (std::int32_t id : op->flat_block_tables.at("full").at(0)) {
-        EXPECT_GT(id, 0) << "full group hole-free at page_size=1";
+        EXPECT_GT(id, 0) << "full group hole-free at block_size=1";
     }
     const auto& swa = op->flat_block_tables.at("swa").at(0);
     EXPECT_NE(std::find(swa.begin(), swa.end(), 0), swa.end())
-        << "swa group must develop a null hole at page_size=1 too";
+        << "swa group must develop a null hole at block_size=1 too";
 
     SendFinish("r1");
     PlanOnce();
@@ -713,13 +713,13 @@ void SendAbort(Scheduler& scheduler, const std::string& id) {
 
 // ---------------------------------------------------------------------------
 // Pool-exhaustion admission. The first-chunk gate charges prompt + decode
-// reserve = groups * ceil((tokens + 1) / page_size) blocks.
+// reserve = groups * ceil((tokens + 1) / block_size) blocks.
 // ---------------------------------------------------------------------------
 class FlatTinyPoolSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg{};
-        cfg.page_size = 2;
+        cfg.block_size = 2;
         // 11 physical pages -> 10 usable (page 0 is the null placeholder):
         // one 4-page prompt over 2 groups (8 prefill + 2 reserve) = the pool.
         cfg.device_allocator.total_pages = 11;
@@ -731,10 +731,10 @@ protected:
         cfg.disable_prefix_cache = true;
 
         cfg.paged_cache_groups = {
-            MakeGroup("full", cfg.page_size, cfg.device_allocator.total_pages,
+            MakeGroup("full", cfg.block_size, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::FullHistory,
                       PagedCacheGroupFamily::History),
-            MakeGroup("swa", cfg.page_size, cfg.device_allocator.total_pages,
+            MakeGroup("swa", cfg.block_size, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::SlidingWindow,
                       PagedCacheGroupFamily::State, /*sliding_window_tokens=*/4),
         };
@@ -804,7 +804,7 @@ class FlatPrefillSlideAdmissionSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg{};
-        cfg.page_size = 2;
+        cfg.block_size = 2;
         cfg.device_allocator.total_pages = 13;
         cfg.host_allocator.total_pages = 14;  // 13 usable + the null placeholder (page 0)
         cfg.max_scheduled_tokens = 4;  // 4-token prefill chunks
@@ -814,10 +814,10 @@ protected:
         cfg.disable_prefix_cache = true;
 
         cfg.paged_cache_groups = {
-            MakeGroup("full", cfg.page_size, cfg.device_allocator.total_pages,
+            MakeGroup("full", cfg.block_size, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::FullHistory,
                       PagedCacheGroupFamily::History),
-            MakeGroup("swa", cfg.page_size, cfg.device_allocator.total_pages,
+            MakeGroup("swa", cfg.block_size, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::SlidingWindow,
                       PagedCacheGroupFamily::State, /*sliding_window_tokens=*/4),
         };
@@ -985,7 +985,7 @@ class FlatCollectiveStarvationSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg{};
-        cfg.page_size = 2;
+        cfg.block_size = 2;
         // 13 physical pages -> 12 usable: two 2-page prompts charge
         // 2*ceil(5/2) = 6 blocks each at admission = exactly the pool.
         cfg.device_allocator.total_pages = 13;
@@ -997,10 +997,10 @@ protected:
         cfg.disable_prefix_cache = true;
 
         cfg.paged_cache_groups = {
-            MakeGroup("full_a", cfg.page_size, cfg.device_allocator.total_pages,
+            MakeGroup("full_a", cfg.block_size, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::FullHistory,
                       PagedCacheGroupFamily::History),
-            MakeGroup("full_b", cfg.page_size, cfg.device_allocator.total_pages,
+            MakeGroup("full_b", cfg.block_size, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::FullHistory,
                       PagedCacheGroupFamily::History),
         };
@@ -1104,8 +1104,8 @@ TEST_F(FlatChunkedPrefillSuite, AbortDuringDecodeRestoresPoolBaseline) {
 TEST(FlatEventFailurePath, PrefillChunkFailureReleasesPagesAndAbortStaysClean) {
     BlockPool pool(/*total_num_blocks=*/6);  // 5 usable
     std::vector<KvCacheSpec> specs{
-        KvCacheSpec{AttnKind::kFull, /*page_size=*/2, /*sliding_window=*/0},
-        KvCacheSpec{AttnKind::kSlidingWindow, /*page_size=*/2, /*sliding_window=*/4},
+        KvCacheSpec{AttnKind::kFull, /*block_size=*/2, /*sliding_window=*/0},
+        KvCacheSpec{AttnKind::kSlidingWindow, /*block_size=*/2, /*sliding_window=*/4},
     };
     KvCacheCoordinator coordinator = MakeCoordinator(specs, pool);
     ReqPoolAllocator req_pool{4};
@@ -1137,8 +1137,8 @@ TEST(FlatEventFailurePath, PrefillChunkFailureReleasesPagesAndAbortStaysClean) {
 TEST(FlatEventFailurePath, DecodeStepFailureReleasesPagesAndAbortStaysClean) {
     BlockPool pool(/*total_num_blocks=*/5);  // 4 usable
     std::vector<KvCacheSpec> specs{
-        KvCacheSpec{AttnKind::kFull, /*page_size=*/2, /*sliding_window=*/0},
-        KvCacheSpec{AttnKind::kSlidingWindow, /*page_size=*/2, /*sliding_window=*/4},
+        KvCacheSpec{AttnKind::kFull, /*block_size=*/2, /*sliding_window=*/0},
+        KvCacheSpec{AttnKind::kSlidingWindow, /*block_size=*/2, /*sliding_window=*/4},
     };
     KvCacheCoordinator coordinator = MakeCoordinator(specs, pool);
     ReqPoolAllocator req_pool{4};
@@ -1168,8 +1168,8 @@ TEST(FlatEventFailurePath, DecodeStepFailureReleasesPagesAndAbortStaysClean) {
 TEST(FlatEventFailurePath, MidDecodeStepFailureReleasesPagesAndAbortStaysClean) {
     BlockPool pool(/*total_num_blocks=*/7);  // 6 usable
     std::vector<KvCacheSpec> specs{
-        KvCacheSpec{AttnKind::kFull, /*page_size=*/2, /*sliding_window=*/0},
-        KvCacheSpec{AttnKind::kSlidingWindow, /*page_size=*/2, /*sliding_window=*/4},
+        KvCacheSpec{AttnKind::kFull, /*block_size=*/2, /*sliding_window=*/0},
+        KvCacheSpec{AttnKind::kSlidingWindow, /*block_size=*/2, /*sliding_window=*/4},
     };
     KvCacheCoordinator coordinator = MakeCoordinator(specs, pool);
     ReqPoolAllocator req_pool{4};
@@ -1205,8 +1205,8 @@ TEST(FlatEventFailurePath, MidDecodeStepFailureReleasesPagesAndAbortStaysClean) 
 TEST(FlatEventFailurePath, FirstChunkFailureLeavesPoolBalancedAndAbortStaysClean) {
     BlockPool pool(/*total_num_blocks=*/4);  // 3 usable
     std::vector<KvCacheSpec> specs{
-        KvCacheSpec{AttnKind::kFull, /*page_size=*/2, /*sliding_window=*/0},
-        KvCacheSpec{AttnKind::kSlidingWindow, /*page_size=*/2, /*sliding_window=*/4},
+        KvCacheSpec{AttnKind::kFull, /*block_size=*/2, /*sliding_window=*/0},
+        KvCacheSpec{AttnKind::kSlidingWindow, /*block_size=*/2, /*sliding_window=*/4},
     };
     KvCacheCoordinator coordinator = MakeCoordinator(specs, pool);
     ReqPoolAllocator req_pool{4};
@@ -1234,8 +1234,8 @@ TEST(FlatEventFailurePath, FirstChunkFailureLeavesPoolBalancedAndAbortStaysClean
 TEST(FlatEventFailurePath, ReqPoolExhaustionAtFirstChunkLeavesPoolBalanced) {
     BlockPool pool(/*total_num_blocks=*/32);  // 31 usable: pages are NOT the constraint
     std::vector<KvCacheSpec> specs{
-        KvCacheSpec{AttnKind::kFull, /*page_size=*/2, /*sliding_window=*/0},
-        KvCacheSpec{AttnKind::kSlidingWindow, /*page_size=*/2, /*sliding_window=*/4},
+        KvCacheSpec{AttnKind::kFull, /*block_size=*/2, /*sliding_window=*/0},
+        KvCacheSpec{AttnKind::kSlidingWindow, /*block_size=*/2, /*sliding_window=*/4},
     };
     KvCacheCoordinator coordinator = MakeCoordinator(specs, pool);
     ReqPoolAllocator req_pool{1};
@@ -1265,8 +1265,8 @@ TEST(FlatEventFailurePath, ReqPoolExhaustionAtFirstChunkLeavesPoolBalanced) {
 TEST(FlatSwaWindowBoundary, DecodeStepKeepsOldestInWindowPageAtPageBoundary) {
     BlockPool pool(/*total_num_blocks=*/32);
     std::vector<KvCacheSpec> specs{
-        KvCacheSpec{AttnKind::kFull, /*page_size=*/2, /*sliding_window=*/0},
-        KvCacheSpec{AttnKind::kSlidingWindow, /*page_size=*/2, /*sliding_window=*/4},
+        KvCacheSpec{AttnKind::kFull, /*block_size=*/2, /*sliding_window=*/0},
+        KvCacheSpec{AttnKind::kSlidingWindow, /*block_size=*/2, /*sliding_window=*/4},
     };
     KvCacheCoordinator coordinator = MakeCoordinator(specs, pool);
     ReqPoolAllocator req_pool{4};
@@ -1328,7 +1328,7 @@ class FlatReserveLedgerSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg{};
-        cfg.page_size = 2;
+        cfg.block_size = 2;
         cfg.device_allocator.total_pages = 11;
         cfg.host_allocator.total_pages = 11;
         cfg.max_scheduled_tokens = 64;
@@ -1338,10 +1338,10 @@ protected:
         cfg.disable_prefix_cache = true;
 
         cfg.paged_cache_groups = {
-            MakeGroup("full_a", cfg.page_size, cfg.device_allocator.total_pages,
+            MakeGroup("full_a", cfg.block_size, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::FullHistory,
                       PagedCacheGroupFamily::History),
-            MakeGroup("full_b", cfg.page_size, cfg.device_allocator.total_pages,
+            MakeGroup("full_b", cfg.block_size, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::FullHistory,
                       PagedCacheGroupFamily::History),
         };
@@ -1432,7 +1432,7 @@ protected:
 
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg{};
-        cfg.page_size = 2;
+        cfg.block_size = 2;
         cfg.device_allocator.total_pages = TotalPages();
         cfg.host_allocator.total_pages = TotalPages();
         cfg.max_scheduled_tokens = 64;
@@ -1442,10 +1442,10 @@ protected:
         cfg.disable_prefix_cache = DisablePrefixCache();
 
         cfg.paged_cache_groups = {
-            MakeGroup("full", cfg.page_size, cfg.device_allocator.total_pages,
+            MakeGroup("full", cfg.block_size, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::FullHistory,
                       PagedCacheGroupFamily::History),
-            MakeGroup("swa", cfg.page_size, cfg.device_allocator.total_pages,
+            MakeGroup("swa", cfg.block_size, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::SlidingWindow,
                       PagedCacheGroupFamily::State, SlidingWindowTokens()),
         };
@@ -1538,7 +1538,7 @@ TEST_F(FlatPrefixHitSuite, TwoRequestsSharePrefixReusePages) {
     EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start) << "pool back to baseline after r2 finishes";
 }
 
-// The hit is capped at (PrefillSize-1)/page_size pages so the last token is
+// The hit is capped at (PrefillSize-1)/block_size pages so the last token is
 // always recomputed to produce logits.
 TEST_F(FlatPrefixHitSuite, FullHitCapsAtLastToken) {
     const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
@@ -1796,7 +1796,7 @@ TEST_F(FlatPrefixHitTightPoolSuite, GateChargesFreeHitBlocksClaimWillConsume) {
 // M13 decode-block caching: pages filled DURING decode register via the hash
 // chain (DecodeStep: register -> slide -> acquire), so a later turn hits PAST
 // the previous prompt boundary. Fill timing: a round at container Size s has
-// N = s - 1 computed and registers pages up to N/page_size -- a tail page
+// N = s - 1 computed and registers pages up to N/block_size -- a tail page
 // registers one round late (finishing earlier frees its block hashless).
 // ---------------------------------------------------------------------------
 class FlatDecodeCachingSuite : public FlatPrefixHitSuite {
@@ -2066,7 +2066,7 @@ class FlatStreamingSinkSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg{};
-        cfg.page_size = 2;
+        cfg.block_size = 2;
         cfg.device_allocator.total_pages = 64;
         cfg.host_allocator.total_pages = 9;  // 8 usable + the null placeholder (page 0, device convention)
         cfg.max_scheduled_tokens = 64;
@@ -2076,10 +2076,10 @@ protected:
         cfg.disable_prefix_cache = true;
 
         cfg.paged_cache_groups = {
-            MakeGroup("full", cfg.page_size, cfg.device_allocator.total_pages,
+            MakeGroup("full", cfg.block_size, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::FullHistory,
                       PagedCacheGroupFamily::History),
-            MakeGroup("swa", cfg.page_size, cfg.device_allocator.total_pages,
+            MakeGroup("swa", cfg.block_size, cfg.device_allocator.total_pages,
                       PagedCacheGroupConfig::Retention::SlidingWindow,
                       PagedCacheGroupFamily::State, /*sliding_window_tokens=*/4),
         };

@@ -50,7 +50,7 @@ CacheBlock* CacheOnePage(BlockPool& pool, const std::string& key) {
 
 TEST(SwaManagerTest, ConstructsWithWindow) {
     BlockPool pool(8);
-    SwaManager mgr(/*page_size=*/4, /*sliding_window=*/10);
+    SwaManager mgr(/*block_size=*/4, /*sliding_window=*/10);
     BlockTable table;
     EXPECT_EQ(table.NumBlocks(), 0);
 }
@@ -66,7 +66,7 @@ TEST(SwaManagerTest, MatchAllMissReturnsEmpty) {
 }
 
 TEST(SwaManagerTest, MatchStopsAfterContiguousNeededFromRight) {
-    // page_size 4, window 10 -> pages_needed = ceil(9/4) = 3.
+    // block_size 4, window 10 -> pages_needed = ceil(9/4) = 3.
     BlockPool pool(16);
     SwaManager mgr(4, 10);
     std::string h0 = RealKey({0, 0, 0, 0}, 0);
@@ -294,7 +294,7 @@ TEST(SwaManagerTest, ReclaimExpiredMirrorsVllmBoundarySequence) {
     // Mirrors vLLM test_sliding_window_remove_skipped_blocks.
     // skipped = max(0, n - 4 + 1); skipped_blocks = skipped / 2.
     BlockPool pool(32);
-    SwaManager mgr(/*page_size=*/2, /*sliding_window=*/4);
+    SwaManager mgr(/*block_size=*/2, /*sliding_window=*/4);
     BlockTable table;
     ASSERT_TRUE(mgr.Acquire(pool, table, 10));  // 5 real pages (10 tokens / page 2)
     ASSERT_EQ(table.NumBlocks(), 5);
@@ -412,7 +412,7 @@ TEST(SwaManagerTest, ReclaimExpiredLeavesTailAvailUnchanged) {
 }
 
 TEST(SwaManagerTest, AcquireAdvancePairingKeepsPhysicalPagesBounded) {
-    // Steady state: active pages stay bounded near ceil(window/page_size) = 2.
+    // Steady state: active pages stay bounded near ceil(window/block_size) = 2.
     BlockPool pool(64);
     SwaManager mgr(2, 4);
     BlockTable table;

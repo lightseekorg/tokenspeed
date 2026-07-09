@@ -28,7 +28,7 @@ from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.flat_memory_plan import (
     equalized_block_size,
-    flat_gdn_page_bytes,
+    flat_gdn_block_bytes,
 )
 from tokenspeed.runtime.configs.model_config import AttentionArch, is_deepseek_v4
 from tokenspeed.runtime.configs.paged_cache_spec import (
@@ -436,21 +436,21 @@ def create_attn_components(
         # raises on any mismatch (kv_cache/mha.py).
         conv_bytes = math.prod(config.conv_state_shape) * config.conv_dtype.itemsize
         ssm_bytes = math.prod(config.temporal_state_shape) * config.ssm_dtype.itemsize
-        equalized_page_size = equalized_block_size(
+        equalized_block_size_value = equalized_block_size(
             layer_types=list(config.layer_types),
             kv_bytes_per_slot=config.cache_cell_size(),
             state_const_bytes={"conv": conv_bytes, "ssm": ssm_bytes},
             block_size=server_args.block_size,
         )
-        if equalized_page_size != server_args.block_size:
+        if equalized_block_size_value != server_args.block_size:
             logger.info(
                 "Setting attention block size to %d tokens to cover the GDN "
                 "state row (configured block size %d)",
-                equalized_page_size,
+                equalized_block_size_value,
                 server_args.block_size,
             )
-            server_args.block_size = equalized_page_size
-            config.page_size = equalized_page_size
+            server_args.block_size = equalized_block_size_value
+            config.page_size = equalized_block_size_value
     draft_attn_config = None
     if draft_model_config:
         draft_attn_config = _create_attn_config(
@@ -568,14 +568,14 @@ def create_attn_components(
         # this branch is behind scheduler_ext_flat_kvcache()): the pool
         # covers ALL layers — KV rows on state layers are accepted waste
         # (see _create_hybrid_linear_attn) — plus one constant state row per
-        # state layer, so divide the budget by the honest per-page bytes
+        # state layer, so divide the budget by the honest per-block bytes
         # directly instead of the per-token cell profile. No mamba slot pool
         # on this path (mamba_pool_total_chunks stays 0).
         state_bytes_per_layer = (
             math.prod(config.conv_state_shape) * config.conv_dtype.itemsize
             + math.prod(config.temporal_state_shape) * config.ssm_dtype.itemsize
         )
-        page_bytes = flat_gdn_page_bytes(
+        block_bytes = flat_gdn_block_bytes(
             num_layers=num_layers,
             num_state_layers=len(mamba_cache_params[4]),
             kv_bytes_per_slot=config.cache_cell_size(),
@@ -585,7 +585,7 @@ def create_attn_components(
         if draft_attn_config is not None:
             # Draft (MTP) pool rides the same page-id space: one KV row per
             # draft layer per page.
-            page_bytes += (
+            block_bytes += (
                 _resolve_draft_cache_cell_size_for_profile(
                     draft_attn_config,
                     draft_model_config,
@@ -601,11 +601,11 @@ def create_attn_components(
             total_gpu_memory=gpu_memory,
             world_group=server_args.mapping.world_group,
         )
-        max_total_num_pages = cache_memory // page_bytes
+        max_total_num_pages = cache_memory // block_bytes
         logger.info(
-            "Flat GDN KV profile: page_bytes=%d (num_layers=%d, "
-            "num_state_layers=%d, page_size=%d), max_total_num_pages=%d",
-            page_bytes,
+            "Flat GDN KV profile: block_bytes=%d (num_layers=%d, "
+            "num_state_layers=%d, block_size=%d), max_total_num_pages=%d",
+            block_bytes,
             num_layers,
             len(mamba_cache_params[4]),
             server_args.block_size,

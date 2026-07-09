@@ -35,7 +35,7 @@ class FlatKvCacheLifecycleTestSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg{};
-        cfg.page_size = 2;
+        cfg.block_size = 2;
         cfg.device_allocator.total_pages = 32;
         cfg.host_allocator.total_pages = 32;
         cfg.max_scheduled_tokens = 64;
@@ -46,7 +46,7 @@ protected:
 
         PagedCacheGroupConfig full_grp;
         full_grp.group_id = "full";
-        full_grp.rows_per_page = cfg.page_size;
+        full_grp.rows_per_page = cfg.block_size;
         full_grp.entry_stride_tokens = 1;
         full_grp.total_pages = cfg.device_allocator.total_pages;
         full_grp.retention = PagedCacheGroupConfig::Retention::FullHistory;
@@ -54,7 +54,7 @@ protected:
 
         PagedCacheGroupConfig swa_grp;
         swa_grp.group_id = "swa";
-        swa_grp.rows_per_page = cfg.page_size;
+        swa_grp.rows_per_page = cfg.block_size;
         swa_grp.entry_stride_tokens = 1;
         swa_grp.total_pages = cfg.device_allocator.total_pages;
         swa_grp.retention = PagedCacheGroupConfig::Retention::SlidingWindow;

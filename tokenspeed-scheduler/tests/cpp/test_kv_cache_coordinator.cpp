@@ -60,9 +60,9 @@ CacheBlock* CacheForGroup(BlockPool& pool, const std::string& content_hash, std:
 }
 
 // Asserts no null hole inside the last min(len, pages_needed) blocks.
-void ExpectSwaWindowIntact(const PrefixMatch& m, std::int32_t window, std::int32_t page_size) {
+void ExpectSwaWindowIntact(const PrefixMatch& m, std::int32_t window, std::int32_t block_size) {
     std::int32_t len = static_cast<std::int32_t>(m.blocks.size());
-    std::int32_t pages_needed = (window - 1 + page_size - 1) / page_size;
+    std::int32_t pages_needed = (window - 1 + block_size - 1) / block_size;
     std::int32_t need = std::min(len, pages_needed);
     for (std::int32_t i = len - need; i < len; ++i) {
         EXPECT_FALSE(m.blocks[static_cast<std::size_t>(i)]->IsNull())
@@ -75,7 +75,7 @@ TEST(CacheGroupTest, HoldsSpecGroupIdManager) {
     auto mgr = std::make_unique<FullAttnManager>(4);
     CacheGroup g(KvCacheSpec{AttnKind::kFull, 4, 0}, /*group_id=*/0, std::move(mgr));
     EXPECT_EQ(g.GroupId(), 0u);
-    EXPECT_EQ(g.Spec().page_size, 4);
+    EXPECT_EQ(g.Spec().block_size, 4);
     EXPECT_EQ(g.Spec().kind, AttnKind::kFull);
 }
 
@@ -93,7 +93,7 @@ TEST(MakeCoordinatorTest, RejectsMismatchedPageSize) {
     BlockPool pool(16);
     std::vector<KvCacheSpec> specs = {
         {AttnKind::kFull, 4, 0},
-        {AttnKind::kSlidingWindow, 8, 10},  // different page_size
+        {AttnKind::kSlidingWindow, 8, 10},  // different block_size
     };
     EXPECT_THROW(MakeCoordinator(specs, pool), std::runtime_error);
 }
@@ -377,7 +377,7 @@ TEST(CoordinatorMatchTest, SwaRunCutByFullBoundDropsToNoValidMatch) {
     ASSERT_EQ(m.per_group.size(), 2u);
     EXPECT_TRUE(m.per_group[0].blocks.empty());
     EXPECT_TRUE(m.per_group[1].blocks.empty());
-    ExpectSwaWindowIntact(m.per_group[1], /*window=*/10, /*page_size=*/4);
+    ExpectSwaWindowIntact(m.per_group[1], /*window=*/10, /*block_size=*/4);
 }
 
 TEST(CoordinatorMatchTest, FullShorterThanSwaBoundsSwaWithRunIntact) {
@@ -408,7 +408,7 @@ TEST(CoordinatorMatchTest, FullShorterThanSwaBoundsSwaWithRunIntact) {
     EXPECT_FALSE(m.per_group[1].blocks[2]->IsNull());
     EXPECT_FALSE(m.per_group[1].blocks[3]->IsNull());
     EXPECT_EQ(m.per_group[1].num_hit_blocks, 3);
-    ExpectSwaWindowIntact(m.per_group[1], /*window=*/10, /*page_size=*/4);
+    ExpectSwaWindowIntact(m.per_group[1], /*window=*/10, /*block_size=*/4);
 }
 
 TEST(CoordinatorMatchTest, SwaShorterThanFullTruncatesFull) {
@@ -431,7 +431,7 @@ TEST(CoordinatorMatchTest, SwaShorterThanFullTruncatesFull) {
     ASSERT_EQ(m.per_group[1].blocks.size(), 4u);
     EXPECT_TRUE(m.per_group[1].blocks[0]->IsNull());
     EXPECT_EQ(m.per_group[1].num_hit_blocks, 3);
-    ExpectSwaWindowIntact(m.per_group[1], /*window=*/10, /*page_size=*/4);
+    ExpectSwaWindowIntact(m.per_group[1], /*window=*/10, /*block_size=*/4);
 }
 
 TEST(CoordinatorMatchTest, TwoSwaGroupsSharedBoundaryMatches) {
@@ -462,7 +462,7 @@ TEST(CoordinatorMatchTest, TwoSwaGroupsSharedBoundaryMatches) {
         ASSERT_EQ(m.per_group[i].blocks.size(), 4u) << "group " << i;
         EXPECT_TRUE(m.per_group[i].blocks[0]->IsNull()) << "group " << i;
         EXPECT_EQ(m.per_group[i].num_hit_blocks, 3) << "group " << i;
-        ExpectSwaWindowIntact(m.per_group[i], /*window=*/10, /*page_size=*/4);
+        ExpectSwaWindowIntact(m.per_group[i], /*window=*/10, /*block_size=*/4);
     }
 }
 
@@ -553,8 +553,8 @@ TEST(CoordinatorMatchTest, MultiWindowThreeGroupsSharedBoundary) {
     EXPECT_EQ(m.per_group[1].num_hit_blocks, 3);  // holes at 0,1
     EXPECT_EQ(m.per_group[2].blocks.size(), 5u);
     EXPECT_EQ(m.per_group[2].num_hit_blocks, 1);  // holes at 0..3
-    ExpectSwaWindowIntact(m.per_group[1], /*window=*/6, /*page_size=*/2);
-    ExpectSwaWindowIntact(m.per_group[2], /*window=*/2, /*page_size=*/2);
+    ExpectSwaWindowIntact(m.per_group[1], /*window=*/6, /*block_size=*/2);
+    ExpectSwaWindowIntact(m.per_group[2], /*window=*/2, /*block_size=*/2);
 }
 
 TEST(CoordinatorMatchTest, MultiWindowCascadeToZero) {
@@ -700,7 +700,7 @@ TEST(CoordinatorMatchTest, SwaOnlyConfigKeepsTailRunWithLeadingHoles) {
     EXPECT_TRUE(m.per_group[0].blocks[0]->IsNull());
     EXPECT_TRUE(m.per_group[0].blocks[1]->IsNull());
     EXPECT_EQ(m.per_group[0].num_hit_blocks, 3);
-    ExpectSwaWindowIntact(m.per_group[0], /*window=*/10, /*page_size=*/4);
+    ExpectSwaWindowIntact(m.per_group[0], /*window=*/10, /*block_size=*/4);
 }
 
 TEST(CoordinatorAllocTest, AcquireShortfallLeavesClaimedPrefixForCallerToFree) {
@@ -735,8 +735,8 @@ TEST(CoordinatorAllocTest, AcquireShortfallLeavesClaimedPrefixForCallerToFree) {
 TEST(KvCacheCoordinatorReclaimExpired, OnlySlidingWindowGroupEvicts) {
     BlockPool pool(/*total_num_blocks=*/32, /*enable_caching=*/true);
     std::vector<KvCacheSpec> specs{
-        KvCacheSpec{AttnKind::kFull, /*page_size=*/2, /*sliding_window=*/0},
-        KvCacheSpec{AttnKind::kSlidingWindow, /*page_size=*/2, /*sliding_window=*/4},
+        KvCacheSpec{AttnKind::kFull, /*block_size=*/2, /*sliding_window=*/0},
+        KvCacheSpec{AttnKind::kSlidingWindow, /*block_size=*/2, /*sliding_window=*/4},
     };
     KvCacheCoordinator coordinator = MakeCoordinator(specs, pool);
 
@@ -820,8 +820,8 @@ TEST(CoordinatorMatchTest, ThreeGroupsOneAllMissForcesZeroCommon) {
 TEST(KvCacheCoordinatorStoreCandidates, CollectsPinnedNewRegistrations) {
     BlockPool pool(/*total_num_blocks=*/16, /*enable_caching=*/true);
     std::vector<KvCacheSpec> specs{
-        KvCacheSpec{AttnKind::kFull, /*page_size=*/2, /*sliding_window=*/0},
-        KvCacheSpec{AttnKind::kSlidingWindow, /*page_size=*/2, /*sliding_window=*/4},
+        KvCacheSpec{AttnKind::kFull, /*block_size=*/2, /*sliding_window=*/0},
+        KvCacheSpec{AttnKind::kSlidingWindow, /*block_size=*/2, /*sliding_window=*/4},
     };
     BlockPool host_pool(4);
     KvCacheCoordinator coordinator = MakeCoordinator(specs, pool, &host_pool);
@@ -861,8 +861,8 @@ TEST(KvCacheCoordinatorStoreCandidates, CollectsPinnedNewRegistrations) {
 TEST(KvCacheCoordinatorStoreCandidates, DisabledByDefaultCollectsNothing) {
     BlockPool pool(16, true);
     std::vector<KvCacheSpec> specs{
-        KvCacheSpec{AttnKind::kFull, /*page_size=*/2, /*sliding_window=*/0},
-        KvCacheSpec{AttnKind::kSlidingWindow, /*page_size=*/2, /*sliding_window=*/4},
+        KvCacheSpec{AttnKind::kFull, /*block_size=*/2, /*sliding_window=*/0},
+        KvCacheSpec{AttnKind::kSlidingWindow, /*block_size=*/2, /*sliding_window=*/4},
     };
     KvCacheCoordinator coordinator = MakeCoordinator(specs, pool);
     std::vector<BlockTable> tables(coordinator.NumGroups());
@@ -891,7 +891,7 @@ std::int32_t SlideCredit(const KvCacheCoordinator& coord, std::span<const BlockT
 TEST(KvCacheCoordinatorStoreCandidates, SlideCreditExcludesUncachedOnlyWhenCollecting) {
     BlockPool pool(16, true);
     std::vector<KvCacheSpec> specs{
-        KvCacheSpec{AttnKind::kSlidingWindow, /*page_size=*/2, /*sliding_window=*/4},
+        KvCacheSpec{AttnKind::kSlidingWindow, /*block_size=*/2, /*sliding_window=*/4},
     };
     KvCacheCoordinator off = MakeCoordinator(specs, pool);
     std::vector<BlockTable> tables(off.NumGroups());
@@ -1168,7 +1168,7 @@ TEST(MambaAnalogTest, HitIsSingleSnapshotPlusLeadingHoles) {
     // needed = ceil((5-1)/4) = 1: the match is the RIGHTMOST cached block with
     // null holes below -- byte-identical to MambaManager.find_longest_cache_hit.
     BlockPool pool(16);
-    SwaManager mgr(/*page_size=*/4, /*sliding_window=*/5);
+    SwaManager mgr(/*block_size=*/4, /*sliding_window=*/5);
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}});
     CacheForGroup(pool, ch[0], 0);
     CacheForGroup(pool, ch[1], 0);
@@ -1190,7 +1190,7 @@ TEST(MambaAnalogTest, RetentionKeepsOnlyTheLastStateBlock) {
     // Our slide rule skips n-W+1 tokens, so W=2 IS that policy: at 16 computed
     // tokens pages 0..2 free and only the tail state page survives.
     BlockPool pool(16);
-    SwaManager mgr(/*page_size=*/4, /*sliding_window=*/2);
+    SwaManager mgr(/*block_size=*/4, /*sliding_window=*/2);
     BlockTable table;
     ASSERT_TRUE(mgr.Acquire(pool, table, /*num_tokens=*/16));
     ASSERT_EQ(table.NumBlocks(), 4);

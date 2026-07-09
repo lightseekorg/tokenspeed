@@ -83,7 +83,7 @@ def make_config(
     cfg.num_device_pages = num_device_pages
     cfg.max_scheduled_tokens = max_scheduled_tokens
     cfg.max_batch_size = max_batch_size
-    cfg.page_size = page_size
+    cfg.block_size = page_size
 
     cfg.num_host_pages = num_host_pages
     cfg.enable_l3_storage = enable_l3_storage

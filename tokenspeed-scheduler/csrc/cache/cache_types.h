@@ -37,7 +37,7 @@ enum class AttnKind { kFull, kSlidingWindow, kMambaState };
 
 struct KvCacheSpec {
     AttnKind kind;
-    std::int32_t page_size;
+    std::int32_t block_size;
     std::int32_t sliding_window;  // 0 for full attention
 };
 

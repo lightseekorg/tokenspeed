@@ -1,6 +1,6 @@
 """Flat KV-cache memory plan: pure sizing/binding decisions, no torch.
 
-Components declare per-page bytes as a function of P (block_size):
+Components declare per-block bytes as a function of P (block_size):
 linear components scale (bytes_per_slot > 0), constant components do not
 (const_bytes > 0, mamba state snapshots). Same-(group, layer) components
 pack into one page row ([conv|ssm|pad], the vLLM hybrid layout). Two
@@ -33,10 +33,10 @@ class ComponentSpec:
 
 
 @dataclass(frozen=True)
-class PageGeometry:
+class BlockGeometry:
     block_size: int
-    page_bytes: int
-    num_pages: int = 0  # filled by plan_tensors from the memory budget
+    block_bytes: int
+    num_blocks: int = 0  # filled by plan_tensors from the memory budget
 
 
 def components_from_layers(*, layer_types, kv_bytes_per_slot, state_const_bytes):
@@ -85,8 +85,8 @@ def solve_page_geometry(components, *, block_size, alignment):
         needed = -(-max_const // max_linear)  # exact integer ceil
         if needed > block_size:
             block_size = alignment * math.ceil(needed / alignment)
-    page_bytes = max(max_linear * block_size, max_const)
-    return PageGeometry(block_size=block_size, page_bytes=page_bytes)
+    block_bytes = max(max_linear * block_size, max_const)
+    return BlockGeometry(block_size=block_size, block_bytes=block_bytes)
 
 
 def equalized_block_size(
@@ -118,7 +118,7 @@ def equalized_block_size(
     return geo.block_size
 
 
-def flat_gdn_page_bytes(
+def flat_gdn_block_bytes(
     *,
     num_layers,
     num_state_layers,
@@ -126,7 +126,7 @@ def flat_gdn_page_bytes(
     block_size,
     state_const_bytes_per_layer,
 ):
-    """Honest per-page byte cost of the M17 flat GDN layout: EVERY layer
+    """Honest per-block byte cost of the M17 flat GDN layout: EVERY layer
     keeps a legacy KV row (state layers' KV rows are allocated but never
     written — accepted waste until the plan executor skips them) plus one
     constant state row (conv + ssm) per state layer. The registry's flat
@@ -143,7 +143,7 @@ class LayerBinding:
     group_id: str
     layer: int
     component: str
-    nbytes_per_page: int
+    nbytes_per_block: int
     row_offset: int  # byte offset of this component within its (group, layer) page row
 
 
@@ -156,7 +156,7 @@ class TensorPlan:
 
 @dataclass(frozen=True)
 class FlatMemoryPlan:
-    geometry: PageGeometry
+    geometry: BlockGeometry
     tensors: tuple[TensorPlan, ...]
 
 
@@ -171,10 +171,10 @@ def plan_tensors(components, *, block_size, alignment, budget_bytes):
         if c.layer not in layers:
             layers.append(c.layer)
     num_slots = max(len(v) for v in layers_by_group.values())
-    num_pages = budget_bytes // (num_slots * geo.page_bytes)
-    if num_pages <= 1:
-        raise ValueError("budget too small for one usable page per slot")
-    geo = replace(geo, num_pages=num_pages)
+    num_blocks = budget_bytes // (num_slots * geo.block_bytes)
+    if num_blocks <= 1:
+        raise ValueError("budget too small for one usable block per slot")
+    geo = replace(geo, num_blocks=num_blocks)
 
     tensors = []
     for slot in range(num_slots):
@@ -195,7 +195,7 @@ def plan_tensors(components, *, block_size, alignment, budget_bytes):
         tensors.append(
             TensorPlan(
                 name=f"flat_slab_{slot}",
-                nbytes=num_pages * geo.page_bytes,
+                nbytes=num_blocks * geo.block_bytes,
                 bindings=tuple(bindings),
             )
         )

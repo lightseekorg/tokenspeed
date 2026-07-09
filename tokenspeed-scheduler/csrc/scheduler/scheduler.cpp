@@ -56,8 +56,8 @@ namespace tokenspeed {
 
 Scheduler::Scheduler(SchedulerConfig config)
     : config_{std::move(config)},
-      device_allocator_{config_.page_size, config_.device_allocator.total_pages},
-      host_allocator_{config_.page_size, config_.host_allocator.total_pages},
+      device_allocator_{config_.block_size, config_.device_allocator.total_pages},
+      host_allocator_{config_.block_size, config_.host_allocator.total_pages},
       mamba_allocator_{},
       kv_prefix_cache_{&device_allocator_, &host_allocator_, config_.enable_l3_storage, config_.disable_prefix_cache},
       req_pool_allocator_{config_.max_batch_size}
@@ -161,12 +161,12 @@ std::vector<KvCacheEvent> Scheduler::DrainKvEvents() {
 }
 
 std::vector<std::string> Scheduler::CalcRollingHash(const std::vector<std::int32_t>& input_tokens, bool apply_match) {
-    const std::int32_t page_size = config_.page_size;
-    const std::size_t num_pages = input_tokens.size() / page_size;
+    const std::int32_t block_size = config_.block_size;
+    const std::size_t num_pages = input_tokens.size() / block_size;
     std::vector<std::span<const std::int32_t>> token_pages;
     token_pages.reserve(num_pages);
     for (std::size_t i = 0; i < num_pages; ++i) {
-        token_pages.emplace_back(input_tokens.data() + i * page_size, page_size);
+        token_pages.emplace_back(input_tokens.data() + i * block_size, block_size);
     }
     if (!apply_match) {
         return ComputePagedHashes(token_pages, "");
@@ -185,7 +185,7 @@ std::vector<std::string> Scheduler::CalcRollingHash(const std::vector<std::int32
 
 void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
     for (const auto& spec : request_specs) {
-        auto req = std::make_unique<Request>(spec, config_.page_size, config_.role);
+        auto req = std::make_unique<Request>(spec, config_.block_size, config_.role);
         requests_.emplace(spec.request_id, std::move(req));
     }
 }
@@ -236,7 +236,7 @@ std::size_t Scheduler::AvailableKvPages() const {
     // it would show a permanently-full pool to Python monitoring
     // (event_loop.py's _get_load / _get_scheduler_stats).
     // Report the flat shared BlockPool instead. Units match: one flat block is
-    // one page of page_size tokens, the same unit as device_allocator_ pages
+    // one page of block_size tokens, the same unit as device_allocator_ pages
     // and as Python's max_total_num_tokens // block_size. Block 0 is the
     // pool's never-allocated null placeholder, so an idle pool reports
     // total_pages - 1 (one page permanently "used").

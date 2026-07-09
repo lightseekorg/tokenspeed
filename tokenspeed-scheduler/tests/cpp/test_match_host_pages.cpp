@@ -46,7 +46,7 @@ CacheBlock* Put(BlockPool& host_pool, const std::string& key) {
 
 TEST(HostTierMatchTest, FullWalksContiguousRunFromBegin) {
     BlockPool pool(4);
-    FullAttnManager mgr(/*page_size=*/4);
+    FullAttnManager mgr(/*block_size=*/4);
     EXPECT_TRUE(mgr.MatchIsPrefixClosed());
     BlockPool host_pool(9);
     std::vector<std::string> keys{"k0", "k1", "k2", "k3", "k4"};
@@ -83,7 +83,7 @@ TEST(HostTierMatchTest, FullEmptyOnBeginMissOrEmptyRange) {
 
 TEST(HostTierMatchTest, SwaTrailingRunAtEnd) {
     BlockPool pool(4);
-    // page_size 4, window 10 -> pages_needed = ceil(9/4) = 3.
+    // block_size 4, window 10 -> pages_needed = ceil(9/4) = 3.
     SwaManager mgr(4, /*sliding_window=*/10);
     EXPECT_FALSE(mgr.MatchIsPrefixClosed());
     BlockPool host_pool(9);

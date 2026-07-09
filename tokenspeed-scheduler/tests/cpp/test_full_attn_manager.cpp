@@ -42,7 +42,7 @@ std::string RealKey(const std::vector<std::int32_t>& tokens, uint32_t group_id) 
 
 TEST(FullAttnManagerTest, ConstructsWithPageSize) {
     BlockPool pool(8);
-    FullAttnManager mgr(/*page_size=*/4);
+    FullAttnManager mgr(/*block_size=*/4);
     BlockTable table;
     EXPECT_EQ(table.NumBlocks(), 0);
     EXPECT_EQ(table.TailAvailableTokens(), 0);

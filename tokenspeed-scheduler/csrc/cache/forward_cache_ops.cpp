@@ -73,7 +73,7 @@ std::vector<KvCacheSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
             group.retention != PagedCacheGroupConfig::Retention::SlidingWindow) {
             specs.push_back(KvCacheSpec{
                 .kind = AttnKind::kMambaState,
-                .page_size = config.page_size,
+                .block_size = config.block_size,
                 .sliding_window = 0,
             });
             continue;
@@ -81,7 +81,7 @@ std::vector<KvCacheSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
         const bool is_swa = group.retention == PagedCacheGroupConfig::Retention::SlidingWindow;
         specs.push_back(KvCacheSpec{
             .kind = is_swa ? AttnKind::kSlidingWindow : AttnKind::kFull,
-            .page_size = config.page_size,
+            .block_size = config.block_size,
             .sliding_window = is_swa ? group.sliding_window_tokens.value_or(0) : 0,
         });
     }

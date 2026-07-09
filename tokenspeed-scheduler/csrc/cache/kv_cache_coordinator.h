@@ -33,7 +33,7 @@
 
 namespace tokenspeed {
 
-// num_common_tokens is in TOKENS -- the cross-group unit, since per-group page sizes may
+// num_common_tokens is in TOKENS -- the cross-group unit, since per-group block sizes may
 // differ; per_group[i] is group i's PrefixMatch at exactly that length. Default = the zero hit.
 struct CoordinatorMatch {
     std::int32_t num_common_tokens{0};
@@ -110,7 +110,7 @@ private:
     std::vector<StoreCandidate> pending_stores_;
 };
 
-// One CacheGroup per spec (group_id = index); asserts every spec shares the same page_size.
+// One CacheGroup per spec (group_id = index); asserts every spec shares the same block_size.
 KvCacheCoordinator MakeCoordinator(std::span<const KvCacheSpec> specs, BlockPool& pool,
                                    const BlockPool* host_pool = nullptr);
 
