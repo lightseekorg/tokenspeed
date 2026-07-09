@@ -353,6 +353,33 @@ class CudaGraphWrapper:
             variant=variant,
         )
 
+    def _prepare_attention_capture_buffers(self, bs: int) -> None:
+        """Seed a finite, internally consistent cache state for graph capture."""
+        tokens_per_req = self.max_tokens_per_req
+        self.input_buffers.seq_lens_buf[:bs].fill_(tokens_per_req)
+
+        page_size = self.input_buffers.page_size
+        dummy_slot = int(self.input_buffers.dummy_kv_slot)
+        dummy_page = dummy_slot // page_size
+        for backend in (self.attn_backend, self.draft_attn_backend):
+            if backend is not None:
+                backend.cuda_graph_capture_dummy_page = dummy_page
+        self.input_buffers.out_cache_loc_buf[: bs * tokens_per_req].fill_(dummy_slot)
+
+        dummy_page_start = dummy_page * page_size
+        dummy_page_end = dummy_page_start + page_size
+        for pool in (self.token_to_kv_pool, self.draft_token_to_kv_pool):
+            if pool is None:
+                continue
+            for layer_buf in getattr(pool, "kv_buffer", ()):
+                buffers = (
+                    layer_buf if isinstance(layer_buf, (tuple, list)) else (layer_buf,)
+                )
+                for buffer in buffers:
+                    # Hybrid cache pools use None for state-only layers.
+                    if buffer is not None:
+                        buffer[dummy_page_start:dummy_page_end].zero_()
+
     def _cuda_graph_replay_variant(self) -> str:
         if self.sampling_backend is None:
             return CUDA_GRAPH_VARIANT_DEFAULT
@@ -476,7 +503,7 @@ class CudaGraphWrapper:
                 self._prepare_sampling_capture(bs=bs, variant=variant)
                 # Keep warmup seq_lens >= q_len_per_req so no query row gets an
                 # empty causal span; a stale seq_len of 1 overflows to non-finite KV.
-                self.input_buffers.seq_lens_buf[:bs].fill_(self.max_tokens_per_req)
+                self._prepare_attention_capture_buffers(bs)
                 self._init_capture_metadata(bs)
                 run_once()
             # Order the reset below after the last warmup's stateful kernels.
@@ -493,12 +520,14 @@ class CudaGraphWrapper:
         # Warmups can switch a backend back to eager metadata objects. Restore
         # the graph-backed metadata immediately before capture so replay-time
         # metadata refreshes update the same tensors recorded by the graph.
+        self._prepare_attention_capture_buffers(bs)
         self._init_capture_metadata(bs)
 
         # Fill sampler buffers OUTSIDE the capture so RNG ops aren't recorded.
         self._prepare_sampling_capture(bs=bs, variant=variant)
         # Warmup forwards can mutate aliased metadata buffers, so refresh
         # them again immediately before graph capture records the final views.
+        self._prepare_attention_capture_buffers(bs)
         self._init_capture_metadata(bs)
 
         self.deepep_adapter.capture()
