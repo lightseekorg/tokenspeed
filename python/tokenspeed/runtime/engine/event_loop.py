@@ -1339,6 +1339,38 @@ class EventLoop:
             return None
         return forward_ops[0]
 
+    def _handle_flat_oom_terminals(self, execution_plan) -> None:
+        """Surface flat-KV OOM terminals to their clients as abort finishes.
+
+        The C++ flat scheduler terminalizes a request that can never fit the
+        flat pool (AbortEvent inside the scheduler; the reaper reclaims its
+        resources) and reports its id on ``plan.flat_oom_request_ids``
+        (always empty on radix builds). The scheduler side is already fully
+        torn down — do NOT send a ForwardEvent.Abort back — but the client is
+        still waiting on the response stream, so finish the request with an
+        abort here (mirrors the PD FailedEvent handling above, minus the
+        scheduler abort).
+        """
+        oom_rids = getattr(execution_plan, "flat_oom_request_ids", None)
+        if not oom_rids:
+            return
+        for rid in oom_rids:
+            state = self.output_processor.rid_to_state.get(rid)
+            if state is None or state.finished:
+                # rid already gone (e.g. a client abort raced ahead) or
+                # already carries a finish — nothing left to stream.
+                logger.debug(
+                    "flat OOM terminal for rid=%s: state missing or already "
+                    "finished; skipping",
+                    rid,
+                )
+                continue
+            state.set_finish_with_abort(
+                "flat KV cache cannot fit this request: prompt exceeds pool "
+                "capacity (OOM)"
+            )
+            self.output_processor.publish_finished_at_admission(rid, state)
+
     def _process_kv_transfer_events(self, kv_transfer_events: list) -> list:
         processed = []
         for event in kv_transfer_events:
@@ -1563,6 +1595,7 @@ class EventLoop:
                 continue
             execution_plan = self.scheduler.next_execution_plan()
             self._publish_scheduler_kv_events()
+            self._handle_flat_oom_terminals(execution_plan)
             self._submit_cache_ops(execution_plan)
 
             forward_op = self._get_forward_op(execution_plan)
@@ -1714,6 +1747,7 @@ class EventLoop:
                 continue
             execution_plan = self.scheduler.next_execution_plan()
             self._publish_scheduler_kv_events()
+            self._handle_flat_oom_terminals(execution_plan)
 
             self._submit_cache_ops(execution_plan)
 
