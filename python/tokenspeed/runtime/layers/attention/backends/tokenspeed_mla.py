@@ -178,6 +178,7 @@ class CuteDSLMLABackend(AttentionBackend):
         self.decode_cuda_graph_metadata: dict[int, CuteDSLMLADecodeMetadata] = {}
         self.decode_cuda_graph_kv_indices = None
         self.chunked_prefill_metadata: TRTLLMMLAChunkedPrefillMetadata | None = None
+        self.forward_decode_spec_info = None
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
         """Calculate block count padded to satisfy the fused-kernel constraint."""
@@ -224,6 +225,8 @@ class CuteDSLMLABackend(AttentionBackend):
         spec_info=None,
         **kwargs,
     ):
+        self.forward_decode_spec_info = spec_info
+
         if forward_mode.is_extend_or_mixed():
             self._init_prefill_metadata(
                 seq_lens[:num_extends],
@@ -481,6 +484,8 @@ class CuteDSLMLABackend(AttentionBackend):
 
         custom_mask = kwargs.get("custom_mask")
         cmask_off = kwargs.get("cmask_off")
+        if spec_info is None:
+            spec_info = self.forward_decode_spec_info
         if spec_info is not None:
             if custom_mask is None:
                 custom_mask = getattr(spec_info, "custom_mask", None)
