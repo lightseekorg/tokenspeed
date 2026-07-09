@@ -574,6 +574,27 @@ def mhc_fused_hc(
     return residual_cur, layer_input, post_cur, comb_cur
 
 
+# Above this token count the vendored allinone kernel (TRT-LLM snapshot
+# 54efe57e) dispatches to a tf32 atomic variant with a ~10x per-call cliff
+# (222-240us vs a flat ~23us on B200); the composed two-stage path
+# (post_mapping + prenorm GEMM + big fuse) takes over there.
+_MHC_FUSED_ALLINONE_MAX_TOKENS = 32
+_MHC_FUSED_ROUTING_LOGGED: set[tuple[int, str]] = set()
+
+
+def _log_mhc_fused_routing(num_tokens: int, path: str) -> None:
+    key = (num_tokens, path)
+    if key in _MHC_FUSED_ROUTING_LOGGED:
+        return
+    _MHC_FUSED_ROUTING_LOGGED.add(key)
+    logger.info(
+        "V4 mHC fused_hc routing: num_tokens=%d path=%s threshold=%d",
+        num_tokens,
+        path,
+        _MHC_FUSED_ALLINONE_MAX_TOKENS,
+    )
+
+
 def _trtllm_mhc_fused_hc(
     x_prev: torch.Tensor,
     residual_prev: torch.Tensor,
@@ -610,6 +631,26 @@ def _trtllm_mhc_fused_hc(
                 device=residual_prev.device,
             ),
         )
+
+    if B > _MHC_FUSED_ALLINONE_MAX_TOKENS:
+        # The vendored allinone kernel dispatches to a tf32 atomic variant
+        # above 32 tokens that runs ~10x slower (216-242us vs a flat ~23us
+        # for the composed two-stage path, microbenched on B200). Route large
+        # token counts through post_mapping + prenorm-GEMM + big-fuse instead;
+        # outputs agree within bf16 tolerance across chained layers.
+        _log_mhc_fused_routing(B, "composed")
+        residual_cur = _trtllm_mhc_post(x_prev, residual_prev, post_prev, comb_prev)
+        layer_input, post_cur, comb_cur = _trtllm_mhc_pre(
+            residual_cur,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_eps,
+            sinkhorn_iters,
+        )
+        return residual_cur, layer_input, post_cur, comb_cur
+    _log_mhc_fused_routing(B, "allinone")
 
     x_flat = x_prev.reshape(B, hidden_size).contiguous()
     res_flat = residual_prev.reshape(B, hc_mult, hidden_size).contiguous()
