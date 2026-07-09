@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -104,6 +105,12 @@ def compute_state_page_indices(
             raise ValueError(
                 "state paging: out page slot exceeds flat table width "
                 f"{max_slots} (page_size={page_size})"
+            )
+        if bool((state_in[before > 0] <= 0).any()):
+            raise ValueError(
+                "state paging: in page is a pad (-1) or hole (0) for a "
+                "request with history; reading it would silently resume "
+                f"from the zero state (flat {_STATE_GROUP_ID!r} table)"
             )
         if bool((state_out <= 0).any()):
             raise ValueError(
@@ -519,11 +526,17 @@ class MambaAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         kwargs: dict,
         *,
-        validate: bool = True,
+        validate: bool | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """(state_in, state_out) page ids for this forward, from the flat
         state-group block table. seq_lens counts the tokens computed AFTER
-        this forward (decode: q_len 1; extend: prefix + chunk)."""
+        this forward (decode: q_len 1; extend: prefix + chunk).
+
+        validate: explicit True/False wins; None (the hot-path default)
+        validates only under TOKENSPEED_FLAT_DEBUG=1 (the checks host-sync).
+        """
+        if validate is None:
+            validate = os.environ.get("TOKENSPEED_FLAT_DEBUG") == "1"
         flat_tables = kwargs.get("flat_block_tables")
         if not flat_tables or _STATE_GROUP_ID not in flat_tables:
             raise RuntimeError(
@@ -1479,7 +1492,6 @@ class HybridLinearAttnBackend(AttentionBackend):
             "mamba_cow_src_indices",
             "mamba_branching_seqlens",
             "mamba_track_pool_indices",
-            "mamba_cache_chunk_size",
         }
     )
 
@@ -1501,9 +1513,12 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.full_attn_backend.init_forward_metadata(*args, **common_kw)
         self.linear_attn_backend.init_forward_metadata(*args, **common_kw, **mamba_kw)
 
-    def init_cuda_graph_state(self, max_bs: int, seq_lens_buf: torch.Tensor):
-        for backend in self._backends():
-            backend.init_cuda_graph_state(max_bs, seq_lens_buf)
+    def init_cuda_graph_state(self, max_bs: int, seq_lens_buf: torch.Tensor, **kwargs):
+        # kwargs (e.g. paged_cache_group_specs, so the full backend sheds
+        # state-family groups) ride to the full backend only; the mamba
+        # backend keeps its narrow signature.
+        self.full_attn_backend.init_cuda_graph_state(max_bs, seq_lens_buf, **kwargs)
+        self.linear_attn_backend.init_cuda_graph_state(max_bs, seq_lens_buf)
 
     def register_step_counter(self, step_counter):
         # Hybrid layerwise transfer needs one global step per model layer,
@@ -1553,20 +1568,10 @@ class HybridLinearAttnBackend(AttentionBackend):
     ):
         """Dispatch one layer to its full-attention or GDN backend (the break point).
 
-        This wrapper OVERRIDES the base forward, so it carries its own
-        ``@break_point`` (else its full-attn + GDN layers bypass the base
-        decoration). The handoff buffer is inferred from the actual output --
-        q-shaped for full-attention layers, z-shaped for the GDN path (q=None)
-        -- so no per-branch out-spec is needed. Under a prefill-graph replay
-        the decorated scalar args (``forward_mode``, ``bs``) are frozen to the
-        capture-time dummy (EXTEND, bs=1) and are re-read from the live ambient
-        ctx instead, so a MIXED or bs>1 replay dispatches the per-mode backend
-        (and the GDN scan) correctly. The GDN scan's output rank is
-        canonicalized here to a stable [T, Hv, D] (== z.shape), as the
-        ``@break_point`` handoff buffer requires: ``gdn_chunk_prefill`` mirrors
-        its input rank, returning batched [1, T, Hv, D] on the uniform bs=1
-        path (which the dummy capture batch hits) vs ragged [T, Hv, D]
-        otherwise; full-attention output is 2D and untouched.
+        Overrides the base forward, so it carries its own ``@break_point``;
+        the frozen capture-time scalars (forward_mode/bs) are re-read from the
+        ambient ctx (semantics: see breakable_cuda_graph). The GDN scan's
+        batched [1, T, Hv, D] output is collapsed to z-shaped [T, Hv, D].
         """
         if forward_mode is None:
             return super().forward(

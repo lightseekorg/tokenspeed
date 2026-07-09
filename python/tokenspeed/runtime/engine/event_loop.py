@@ -1356,14 +1356,22 @@ class EventLoop:
             return
         for rid in oom_rids:
             state = self.output_processor.rid_to_state.get(rid)
-            if state is None or state.finished:
-                # rid already gone (e.g. a client abort raced ahead) or
-                # already carries a finish — nothing left to stream.
+            if state is None:
+                # rid already gone (e.g. a client abort raced ahead).
                 logger.debug(
-                    "flat OOM terminal for rid=%s: state missing or already "
-                    "finished; skipping",
-                    rid,
+                    "flat OOM terminal for rid=%s: state missing; skipping", rid
                 )
+                continue
+            if state.finished:
+                # Already carries a finish (an abort raced ahead of the
+                # terminal). C++ reports this rid exactly once and no future
+                # forward op will reap it, so resolve it here (mirrors
+                # _reap_or_keep_buffered_spec): stream the terminating finish
+                # to a passive client, else just drop the registered state.
+                if state.abort_notify_client:
+                    self.output_processor.publish_finished_at_admission(rid, state)
+                else:
+                    self.output_processor.rid_to_state.pop(rid, None)
                 continue
             state.set_finish_with_abort(
                 "flat KV cache cannot fit this request: prompt exceeds pool "

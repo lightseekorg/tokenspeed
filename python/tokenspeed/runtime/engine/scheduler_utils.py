@@ -49,6 +49,16 @@ if hasattr(Cache, "LoadBackDoneEvent"):
     _CACHE_EVENT_TYPES["LoadBackDoneEvent"] = Cache.LoadBackDoneEvent
 _TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 
+# Pool-spec string -> scheduler enum (pool_to_paged_cache_groups).
+_RETENTION_MAP = {
+    "full_history": PagedCacheRetention.FullHistory,
+    "sliding_window": PagedCacheRetention.SlidingWindow,
+}
+_FAMILY_MAP = {
+    "history": PagedCacheGroupFamily.History,
+    "state": PagedCacheGroupFamily.State,
+}
+
 
 def make_spec(rid: str, tokens: list[int]) -> RequestSpec:
     spec = RequestSpec()
@@ -97,7 +107,6 @@ def make_config(
         cfg.role = SchedulerConfig.Role.D
     else:
         cfg.role = SchedulerConfig.Role.Fused
-    cfg.num_device_pages = num_device_pages
     cfg.decode_input_tokens = decode_input_tokens
     cfg.overlap_schedule_depth = overlap_schedule_depth
     cfg.disable_prefix_cache = disable_prefix_cache
@@ -125,24 +134,17 @@ def pool_to_paged_cache_groups(pool: Any) -> list:
     counts = pool.paged_cache_group_page_counts
     out = []
     for spec in specs:
-        if spec.retention == "full_history":
-            retention = PagedCacheRetention.FullHistory
-        elif spec.retention == "sliding_window":
-            retention = PagedCacheRetention.SlidingWindow
-        else:
+        retention = _RETENTION_MAP.get(spec.retention)
+        if retention is None:
             raise ValueError(
                 f"pool_to_paged_cache_groups: unsupported retention "
                 f"{spec.retention!r} for group {spec.group_id!r}"
             )
-        family_str = getattr(spec, "family", "history")
-        if family_str == "history":
-            family = PagedCacheGroupFamily.History
-        elif family_str == "state":
-            family = PagedCacheGroupFamily.State
-        else:
+        family = _FAMILY_MAP.get(spec.family)
+        if family is None:
             raise ValueError(
                 f"pool_to_paged_cache_groups: unsupported family "
-                f"{family_str!r} for group {spec.group_id!r}"
+                f"{spec.family!r} for group {spec.group_id!r}"
             )
         kwargs = dict(
             group_id=spec.group_id,
@@ -186,20 +188,22 @@ def should_use_overlap_schedule(
     return True
 
 
-def make_extend_result_event(request_id: str, tokens: list[int] = ()) -> None:
+def make_extend_result_event(
+    request_id: str, tokens: Sequence[int] = ()
+) -> "ForwardEvent.ExtendResult":
     fe = ForwardEvent.ExtendResult()
     fe.request_id = request_id
     fe.tokens = list(tokens)
     return fe
 
 
-def make_finish_event(request_id: str) -> None:
+def make_finish_event(request_id: str) -> "ForwardEvent.Finish":
     fe = ForwardEvent.Finish()
     fe.request_id = request_id
     return fe
 
 
-def make_abort_event(request_id: str) -> None:
+def make_abort_event(request_id: str) -> "ForwardEvent.Abort":
     """Finish without caching: AbortEvent skips the radix-tree insert and
     never enters Draining, so no host-KV writeback (target or draft) is
     issued. Used for numerically-corrupted requests whose KV must not be
@@ -316,17 +320,18 @@ def _block_tables_from_forward_op(
         if max_pages == 0:
             out[key] = torch.empty((len(rows), 0), dtype=torch.int32, device=device)
             continue
-        flat = torch.full(
-            (len(rows), max_pages),
-            -1,
-            dtype=torch.int32,
-            device="cpu",
-            pin_memory=device.type == "cuda",
+        # One flattened Python list -> single tensor construct (holes stay 0,
+        # ragged tails pad with -1), instead of O(bs) tiny per-row tensors.
+        flat_values: list[int] = []
+        for row in rows:
+            row_values = list(row)
+            flat_values.extend(row_values)
+            flat_values.extend([-1] * (max_pages - len(row_values)))
+        flat = torch.tensor(flat_values, dtype=torch.int32, device="cpu").view(
+            len(rows), max_pages
         )
-        for row_idx, row in enumerate(rows):
-            row_len = len(row)
-            if row_len:
-                flat[row_idx, :row_len] = torch.as_tensor(list(row), dtype=torch.int32)
+        if device.type == "cuda":
+            flat = flat.pin_memory()
         out[key] = flat.to(device, non_blocking=True)
     return out
 

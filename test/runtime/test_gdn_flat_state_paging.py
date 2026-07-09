@@ -90,6 +90,23 @@ class ComputeStatePageIndicesTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._run([[7, 9]], [8], [9])
 
+    def test_in_slot_hole_raises(self):
+        # before=5 -> in slot 1 is a hole (0): a silent zero-state resume
+        # must fail loud like the out-page case.
+        with self.assertRaises(ValueError):
+            self._run([[7, 0, 12]], [5], [6])
+
+    def test_in_slot_pad_raises(self):
+        with self.assertRaises(ValueError):
+            self._run([[7, -1, 12]], [5], [6])
+
+    def test_no_history_null_in_page_passes(self):
+        # before=0 legitimately reads the null page 0 (see
+        # test_first_step_null_in_page); the in-page guard must not fire.
+        state_in, state_out = self._run([[7, 9, 12]], [0], [1])
+        self.assertEqual(state_in.tolist(), [0])
+        self.assertEqual(state_out.tolist(), [7])
+
     def test_validate_off_masks_guards(self):
         torch = self.torch
         state_in, state_out = self.fn(

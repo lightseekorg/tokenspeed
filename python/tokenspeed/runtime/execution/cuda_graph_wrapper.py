@@ -608,10 +608,9 @@ class CudaGraphWrapper:
         padded_bs: int,
         pad_value: int = -1,
     ) -> dict:
-        """Pad each table with dummy ROWS up to padded_bs. Unlike -1 column
-        tails, padded rows' col-0 entry IS dereferenced (seq_lens=1): the
-        flat path passes pad_value=0 to land on the dummy page 0; radix/V4
-        keeps -1 since it masks dummy tokens before any table read.
+        """Pad each table with dummy ROWS up to padded_bs. Flat passes
+        pad_value=0, radix/V4 keeps -1 — see the padding contract at the MHA
+        backend's replay guard (backends/mha.py).
         """
         if padded_bs <= actual_bs:
             return block_tables
@@ -1001,8 +1000,6 @@ class CudaGraphWrapper:
             mamba_kwargs["mamba_branching_seqlens"] = mamba_branching_seqlens
         if mamba_track_pool_indices is not None:
             mamba_kwargs["mamba_track_pool_indices"] = mamba_track_pool_indices
-        if getattr(self.config, "enable_mamba", False):
-            mamba_kwargs["mamba_cache_chunk_size"] = self.config.mamba_cache_chunk_size
 
         if use_graph:
             if (

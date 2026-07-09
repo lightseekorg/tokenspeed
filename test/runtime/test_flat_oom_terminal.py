@@ -137,7 +137,7 @@ def test_flat_oom_terminal_missing_rid_is_skipped():
     assert sender.items == []
 
 
-def test_flat_oom_terminal_already_finished_state_is_skipped():
+def test_flat_oom_terminal_already_finished_state_is_reaped():
     sender = _Sender()
     loop = _make_loop(sender)
     state = _state([1, 2, 3])
@@ -146,10 +146,32 @@ def test_flat_oom_terminal_already_finished_state_is_skipped():
 
     loop._handle_flat_oom_terminals(_Plan(["done"]))
 
-    # Not re-finished, not streamed again, message unchanged.
+    # Not re-finished, not streamed (client-initiated aborts tore down their
+    # own stream), message unchanged — but the state must be reaped: C++
+    # reports the rid exactly once, no future op will pop it.
     assert state.finished_reason.message == "earlier abort"
     assert sender.items == []
-    assert "done" in loop.output_processor.rid_to_state
+    assert "done" not in loop.output_processor.rid_to_state
+
+
+def test_flat_oom_terminal_already_finished_notify_client_is_published():
+    sender = _Sender()
+    loop = _make_loop(sender)
+    state = _state([1, 2, 3])
+    # Pause-initiated abort: the passive client still waits on the stream.
+    state.set_finish_with_abort("pause abort", notify_client=True)
+    loop.output_processor.rid_to_state["paused"] = state
+
+    loop._handle_flat_oom_terminals(_Plan(["paused"]))
+
+    # The existing finish is streamed once and the state reaped; the OOM
+    # terminal must not overwrite the earlier finish reason.
+    assert state.finished_reason.message == "pause abort"
+    assert "paused" not in loop.output_processor.rid_to_state
+    assert len(sender.items) == 1
+    out = sender.items[0]
+    idx = out.rids.index("paused")
+    assert out.finished_reasons[idx]["message"] == "pause abort"
 
 
 def test_plan_without_flat_oom_field_is_noop():

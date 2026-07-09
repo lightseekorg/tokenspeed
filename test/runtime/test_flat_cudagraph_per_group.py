@@ -382,6 +382,8 @@ class _BackendCase(_TorchCase):
         backend = MHAAttnBackend.__new__(MHAAttnBackend)
         backend.spec_num_tokens = 1
         backend.is_draft = False
+        backend.draft_block_decode = False
+        backend.flat_state_group_ids = frozenset()
         backend.max_num_pages = MAX_NUM_PAGES
         backend.page_size = 2
         backend.device = "cpu"
@@ -581,6 +583,96 @@ class BackendReplayFlatTest(_BackendCase):
         self._replay(0)
         for gid, buf in self.backend.cuda_graph_flat_page_tables.items():
             self.assertTrue((buf == before[gid]).all())
+
+
+class BackendStateGroupShedTest(_BackendCase):
+    """family="state" groups (GDN/mamba pages) must never reach MHA's flat
+    buffers, table copies, or write-loc math; the hybrid router still hands
+    the FULL dict to the mamba backend (see test_gdn_flat_state_paging)."""
+
+    _HYBRID_IDS = ("full_attention", "linear_attention")
+
+    def setUp(self):
+        super().setUp()
+        self.backend.flat_state_group_ids = frozenset({"linear_attention"})
+
+    def test_init_cuda_graph_state_learns_state_ids_from_specs(self):
+        torch = self.torch
+        self.backend.init_cuda_graph_state(
+            MAX_BS,
+            torch.ones(MAX_BS, dtype=torch.int32),
+            paged_cache_group_specs=(
+                SimpleNamespace(group_id="full_attention", family="history"),
+                SimpleNamespace(group_id="linear_attention", family="state"),
+            ),
+        )
+        self.assertEqual(
+            self.backend.flat_state_group_ids, frozenset({"linear_attention"})
+        )
+
+    def test_capture_buffers_exclude_state_group(self):
+        metadata = self._capture(2, self._HYBRID_IDS)
+        self.assertEqual(
+            set(self.backend.cuda_graph_flat_page_tables), {"full_attention"}
+        )
+        self.assertEqual(
+            set(self.backend.cuda_graph_flat_out_cache_locs), {"full_attention"}
+        )
+        self.assertEqual(set(metadata.page_tables), {"full_attention"})
+        self.assertEqual(set(metadata.out_cache_locs), {"full_attention"})
+
+    def test_capture_state_only_yields_no_flat_metadata(self):
+        metadata = self._capture(2, ("linear_attention",))
+        self.assertIsNone(metadata.page_tables)
+        self.assertIsNone(metadata.out_cache_locs)
+        self.assertEqual(self.backend.cuda_graph_flat_page_tables, {})
+
+    def test_replay_skips_state_group_delivery(self):
+        torch = self.torch
+        self._capture(2, self._HYBRID_IDS)
+        src = {
+            "full_attention": torch.tensor([[1, 2], [3, 4]], dtype=torch.int32),
+            # Hole-heavy state table: MHA must not copy or derive locs
+            # from it (and has no buffer for it).
+            "linear_attention": torch.tensor([[0, 5], [0, 6]], dtype=torch.int32),
+        }
+        self._replay(2, src)
+        self.assertNotIn(
+            "linear_attention", self.backend.cuda_graph_flat_page_tables
+        )
+        buf = self.backend.cuda_graph_flat_page_tables["full_attention"]
+        self.assertTrue((buf[:2, :2] == src["full_attention"]).all())
+
+    def test_eager_decode_metadata_sheds_state_group(self):
+        torch = self.torch
+        forward_mode = SimpleNamespace(
+            is_mixed=lambda: False,
+            is_extend_or_mixed=lambda: False,
+        )
+        self.backend.init_forward_metadata(
+            bs=2,
+            num_extends=0,
+            req_pool_indices=torch.arange(2, dtype=torch.int64),
+            seq_lens=torch.tensor([3, 4], dtype=torch.int32),
+            req_to_page=torch.zeros((MAX_BS, MAX_NUM_PAGES), dtype=torch.int32),
+            forward_mode=forward_mode,
+            flat_block_tables={
+                "full_attention": torch.tensor(
+                    [[1, 2], [3, 4]], dtype=torch.int32
+                ),
+                "linear_attention": torch.tensor(
+                    [[0, 5], [0, 6]], dtype=torch.int32
+                ),
+            },
+        )
+        metadata = self.backend.forward_decode_metadata
+        self.assertEqual(set(metadata.page_tables), {"full_attention"})
+        self.assertEqual(set(metadata.out_cache_locs), {"full_attention"})
+        # seq_lens [3, 4], page_size 2 -> last pos 2, 3 -> page col 1 ->
+        # pages 2, 4 -> locs 2*2+0=4, 4*2+1=9.
+        self.assertEqual(
+            metadata.out_cache_locs["full_attention"].tolist(), [4, 9]
+        )
 
 
 class BackendReplayNoFlatBuffersTest(_BackendCase):

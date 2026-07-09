@@ -90,16 +90,17 @@ class ComputeFlatOutCacheLocsTest(_MHACase):
 
     def test_extend_locs_formula(self):
         torch = self.torch
-        # r0: prefix 2, seq 5 -> positions 2,3,4; r1: prefix 0, seq 2 -> 0,1.
+        # r0: prefix 2, extend 3 -> positions 2,3,4; r1: prefix 0, extend 2
+        # -> 0,1. Bounds come from the CPU mirrors (no GPU sync).
         tables = {
             "full_attention": torch.tensor(
                 [[1, 2, 3, -1], [4, 8, -1, -1]], dtype=torch.int32
             )
         }
-        seq_lens = torch.tensor([5, 2], dtype=torch.int32)
-        prefix = torch.tensor([2, 0], dtype=torch.int32)
+        prefix_cpu = torch.tensor([2, 0], dtype=torch.int32)
+        extend_cpu = torch.tensor([3, 2], dtype=torch.int32)
         locs = self.MHAAttnBackend._compute_flat_extend_out_cache_locs(
-            tables, seq_lens, prefix, PAGE
+            tables, prefix_cpu, extend_cpu, PAGE
         )
         # r0: pos 2,3,4 -> page_idx 1,1,2 -> pages 2,2,3 ->
         #     locs 2*2+0=4, 2*2+1=5, 3*2+0=6; r1: pages 4,4 -> locs 8, 9.
@@ -160,11 +161,8 @@ class MaybeCheckFlatWriteLocsTest(_MHACase):
 
 
 class InitForwardMetadataAssemblyTest(_MHACase):
-    """Real init_forward_metadata on a __init__-bypassed backend.
-
-    Only _maybe_compute_scheduler_metadata is stubbed (it is a GPU kernel
-    entry point; the assembly under test merely stores its result).
-    """
+    """Real init_forward_metadata on a __init__-bypassed backend (CPU-only:
+    plain tensors, no kernels)."""
 
     def setUp(self):
         super().setUp()
@@ -175,9 +173,10 @@ class InitForwardMetadataAssemblyTest(_MHACase):
         backend.max_num_pages = MAX_NUM_PAGES
         backend.spec_num_tokens = 1
         backend.is_draft = False
+        backend.draft_block_decode = False
+        backend.flat_state_group_ids = frozenset()
         backend.forward_decode_metadata = None
-        backend.forward_prefill_metadata = None
-        backend._maybe_compute_scheduler_metadata = lambda bs, seq_lens: None
+        backend.forward_extend_metadata = None
         self.backend = backend
         self.req_to_page = torch.zeros(
             (MAX_NUM_PAGES, MAX_NUM_PAGES), dtype=torch.int32
@@ -254,7 +253,7 @@ class InitForwardMetadataAssemblyTest(_MHACase):
         self._init(
             _extend_forward_mode(), seq_lens, tables, extend_prefix_lens=prefix
         )
-        md = self.backend.forward_prefill_metadata
+        md = self.backend.forward_extend_metadata
         self.assertIs(md.page_tables, tables)
         # Same hand-derived layout as the formula test: request-order flatten.
         self.assertEqual(md.out_cache_locs["full_attention"].tolist(), [4, 5, 6, 8, 9])
@@ -271,7 +270,7 @@ class InitForwardMetadataAssemblyTest(_MHACase):
             torch.tensor([3, 2], dtype=torch.int32),
             None,
         )
-        md = self.backend.forward_prefill_metadata
+        md = self.backend.forward_extend_metadata
         self.assertIsNone(md.page_tables)
         self.assertIsNone(md.out_cache_locs)
 
@@ -284,7 +283,7 @@ class SelectOutCacheLocTest(_MHACase):
         super().setUp()
         backend = self.MHAAttnBackend.__new__(self.MHAAttnBackend)
         backend.forward_decode_metadata = None
-        backend.forward_prefill_metadata = None
+        backend.forward_extend_metadata = None
         self.backend = backend
 
     def test_select_out_cache_loc_routes_by_group(self):
@@ -370,6 +369,8 @@ class GraphLocBuffersTest(_MHACase):
         backend = self.MHAAttnBackend.__new__(self.MHAAttnBackend)
         backend.spec_num_tokens = 1
         backend.is_draft = False
+        backend.draft_block_decode = False
+        backend.flat_state_group_ids = frozenset()
         backend.max_num_pages = MAX_NUM_PAGES
         backend.page_size = PAGE
         backend.device = "cpu"
