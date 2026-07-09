@@ -1121,12 +1121,7 @@ class EventLoop:
         if state is None:
             return False
         if state.finished:
-            if state.abort_notify_client:
-                self.output_processor.publish_finished_at_admission(
-                    spec.request_id, state
-                )
-            else:
-                self.output_processor.rid_to_state.pop(spec.request_id, None)
+            self.output_processor.reap_finished_orphan(spec.request_id, state)
             return False
         return True
 
@@ -1365,13 +1360,9 @@ class EventLoop:
             if state.finished:
                 # Already carries a finish (an abort raced ahead of the
                 # terminal). C++ reports this rid exactly once and no future
-                # forward op will reap it, so resolve it here (mirrors
-                # _reap_or_keep_buffered_spec): stream the terminating finish
-                # to a passive client, else just drop the registered state.
-                if state.abort_notify_client:
-                    self.output_processor.publish_finished_at_admission(rid, state)
-                else:
-                    self.output_processor.rid_to_state.pop(rid, None)
+                # forward op will reap it, so resolve it here (same orphan
+                # rule as _reap_or_keep_buffered_spec).
+                self.output_processor.reap_finished_orphan(rid, state)
                 continue
             state.set_finish_with_abort(
                 "flat KV cache cannot fit this request: prompt exceeds pool "

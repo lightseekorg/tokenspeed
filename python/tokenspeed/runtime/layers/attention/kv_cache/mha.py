@@ -331,15 +331,6 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             else:
                 self.state_slabs = []
 
-    def _clear_buffers(self):
-        del self.k_buffer
-        del self.v_buffer
-        del self.state_slabs
-        del self.k_data_ptrs
-        del self.v_data_ptrs
-        del self.data_ptrs
-        del self.data_strides
-
     def _init_kv_copy_and_warmup(self):
         _KV_COPY_STRIDE_THRESHOLD_LARGE = 8192
         _KV_COPY_STRIDE_THRESHOLD_MEDIUM = 4096

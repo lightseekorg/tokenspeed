@@ -440,6 +440,19 @@ class OutputProcesser:
             # and a reused rid isn't instantly re-aborted on next register.
             self.pending_aborts.pop(rid, None)
 
+    def reap_finished_orphan(self, rid: str, state: RequestState) -> None:
+        """Resolve a finished request that no future forward op will reap.
+
+        Stream the terminating finish to a passive client (pause-initiated
+        aborts still have the client waiting on the stream); client-initiated
+        aborts already tore down their own state, so just drop the registered
+        state so the rid does not leak.
+        """
+        if state.abort_notify_client:
+            self.publish_finished_at_admission(rid, state)
+        else:
+            self.rid_to_state.pop(rid, None)
+
     def _host_advance_matcher(self, completion, model_execution_results):
         """Host-side fallback for the grammar matcher advance.
 

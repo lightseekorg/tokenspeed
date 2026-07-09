@@ -67,7 +67,7 @@ _LAYER_TYPE_RETENTION: Dict[str, Retention] = {
 }
 
 # Labels whose group is state-family (recurrent state rows, not KV history).
-STATE_LAYER_TYPES = {LINEAR_ATTENTION}
+STATE_LAYER_TYPES = frozenset({LINEAR_ATTENTION})
 
 
 def hybrid_slab_group_size(

@@ -327,11 +327,14 @@ def _block_tables_from_forward_op(
             row_values = list(row)
             flat_values.extend(row_values)
             flat_values.extend([-1] * (max_pages - len(row_values)))
-        flat = torch.tensor(flat_values, dtype=torch.int32, device="cpu").view(
-            len(rows), max_pages
-        )
-        if device.type == "cuda":
-            flat = flat.pin_memory()
+        # pin_memory as a ctor arg: builds the staging tensor pinned in one
+        # pass instead of tensor(...).pin_memory()'s second host copy.
+        flat = torch.tensor(
+            flat_values,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=device.type == "cuda",
+        ).view(len(rows), max_pages)
         out[key] = flat.to(device, non_blocking=True)
     return out
 

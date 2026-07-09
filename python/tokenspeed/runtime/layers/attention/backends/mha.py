@@ -110,8 +110,9 @@ class MHADecodeMetadata:
 class MHAAttnBackend(AttentionBackend):
     """Standard MHA backend that routes through tokenspeed_kernel attention APIs."""
 
-    # Unconditional: safety comes from the publication rule (kv_cache/mha.py)
-    # plus the replay stale-table guard. TODO(radix-removal): drop the flag.
+    # Unconditional: safety comes from the publication rule
+    # (paged_cache_spec.publish_paged_cache_groups) plus the replay
+    # stale-table guard. TODO(radix-removal): drop the flag.
     uses_flat_cache_groups: bool = True
 
     def support_kv_cache_prewrite(
@@ -423,7 +424,15 @@ class MHAAttnBackend(AttentionBackend):
             metadata.seq_lens.fill_(self.spec_num_tokens)
         else:
             metadata = MHADecodeMetadata(
-                page_table=self.cuda_graph_page_table[:bs, :],
+                # Flat captures route reads through the per-group tables and
+                # replay never fills the radix single table, so mirror the
+                # eager flat path: page_table=None instead of a slice of the
+                # never-filled zero buffer.
+                page_table=(
+                    None
+                    if page_tables is not None
+                    else self.cuda_graph_page_table[:bs, :]
+                ),
                 seq_lens=self.cuda_graph_seq_lens[:bs],
                 page_tables=page_tables,
                 out_cache_locs=out_cache_locs,

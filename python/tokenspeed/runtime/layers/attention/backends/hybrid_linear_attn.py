@@ -39,6 +39,7 @@ from tokenspeed_kernel.ops.attention.triton.linear.index import (
     set_total_chunks_hint_uniform,
 )
 
+from tokenspeed.runtime.configs.paged_cache_spec import LINEAR_ATTENTION
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     break_point,
     current_forward_ctx,
@@ -63,8 +64,8 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
-# Flat KV-cache group id carrying GDN/mamba2 state pages (paged_cache_spec).
-_STATE_GROUP_ID = "linear_attention"
+# Flat KV-cache group id carrying GDN/mamba2 state pages.
+_STATE_GROUP_ID = LINEAR_ATTENTION
 
 
 def compute_state_page_indices(
@@ -118,8 +119,8 @@ def compute_state_page_indices(
                 "request's working state page must be present in the flat "
                 f"{_STATE_GROUP_ID!r} table"
             )
-        positive_out = state_out[state_out > 0]
-        if torch.unique(positive_out).numel() != positive_out.numel():
+        # The <= 0 raise above guarantees every state_out entry is positive.
+        if torch.unique(state_out).numel() != state_out.numel():
             raise ValueError("state out pages must be unique per batch")
     return state_in.to(torch.int32), state_out.to(torch.int32)
 
@@ -509,9 +510,9 @@ class MambaAttnBackend(AttentionBackend):
     def set_kv_pool(self, kv_pool) -> None:
         """Bind the (layer-mapped) KV pool. Flat state paging turns on iff the
         pool allocated state slabs AND publishes the state cache group —
-        publication (kv_cache/mha.py) is the upstream signal that flat block
-        tables will actually be delivered (radix ext / spec decode never
-        publish)."""
+        publication (paged_cache_spec.publish_paged_cache_groups) is the
+        upstream signal that flat block tables will actually be delivered
+        (radix ext / spec decode never publish)."""
         self.kv_pool = kv_pool
         specs = getattr(kv_pool, "paged_cache_group_specs", ())
         self.flat_state_active = bool(
@@ -1463,8 +1464,9 @@ class HybridLinearAttnBackend(AttentionBackend):
 
     # Both sub-backends consume flat per-group tables (MHA: KV pages; mamba:
     # dual-index state pages). Safety comes from the publication rule
-    # (kv_cache/mha.py): a radix ext or spec decode never publishes groups,
-    # so no tables (and no flat capture buffers) exist on those paths.
+    # (paged_cache_spec.publish_paged_cache_groups): a radix ext or spec
+    # decode never publishes groups, so no tables (and no flat capture
+    # buffers) exist on those paths.
     uses_flat_cache_groups: bool = True
 
     def __init__(
