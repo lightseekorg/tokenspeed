@@ -323,6 +323,9 @@ def _create_hybrid_linear_attn(
         ),
     )
     linear_attn_backend.set_pool(mamba_pool)
+    # Flat state paging (dual-index) keys off the KV pool's state slabs +
+    # published "linear_attention" group; no-op on the radix path.
+    linear_attn_backend.set_kv_pool(pool)
 
     backend = HybridLinearAttnBackend(
         full_attn_backend, linear_attn_backend, full_attn_layers

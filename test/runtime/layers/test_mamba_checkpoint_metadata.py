@@ -28,6 +28,7 @@ def _new_backend(page_size: int = 64) -> MambaAttnBackend:
     backend.is_draft = False
     backend.spec_num_tokens = 1
     backend.speculative_num_draft_tokens = 0
+    backend.flat_state_active = False
     return backend
 
 
