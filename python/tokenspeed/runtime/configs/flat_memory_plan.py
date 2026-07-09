@@ -1,6 +1,6 @@
 """Flat KV-cache memory plan: pure sizing/binding decisions, no torch.
 
-Components declare per-page bytes as a function of P (page_size_tokens):
+Components declare per-page bytes as a function of P (block_size):
 linear components scale (bytes_per_slot > 0), constant components do not
 (const_bytes > 0, mamba state snapshots). Same-(group, layer) components
 pack into one page row ([conv|ssm|pad], the vLLM hybrid layout). Two
@@ -34,7 +34,7 @@ class ComponentSpec:
 
 @dataclass(frozen=True)
 class PageGeometry:
-    page_size_tokens: int
+    block_size: int
     page_bytes: int
     num_pages: int = 0  # filled by plan_tensors from the memory budget
 
@@ -68,8 +68,8 @@ def _row_demands(components):
     return rows
 
 
-def solve_page_geometry(components, *, page_size_tokens, alignment):
-    """Smallest P >= page_size_tokens (multiple of `alignment` when inflated)
+def solve_page_geometry(components, *, block_size, alignment):
+    """Smallest P >= block_size (multiple of `alignment` when inflated)
     such that the widest linear row covers the widest constant row."""
     rows = _row_demands(components).values()
     # NOTE: a row mixing linear and constant components is not needed by any
@@ -83,24 +83,24 @@ def solve_page_geometry(components, *, page_size_tokens, alignment):
         if max_linear == 0:
             raise ValueError("constant components need a linear row to size P against")
         needed = -(-max_const // max_linear)  # exact integer ceil
-        if needed > page_size_tokens:
-            page_size_tokens = alignment * math.ceil(needed / alignment)
-    page_bytes = max(max_linear * page_size_tokens, max_const)
-    return PageGeometry(page_size_tokens=page_size_tokens, page_bytes=page_bytes)
+        if needed > block_size:
+            block_size = alignment * math.ceil(needed / alignment)
+    page_bytes = max(max_linear * block_size, max_const)
+    return PageGeometry(block_size=block_size, page_bytes=page_bytes)
 
 
-def equalized_page_size_tokens(
+def equalized_block_size(
     *,
     layer_types,
     kv_bytes_per_slot,
     state_const_bytes,
-    page_size_tokens,
+    block_size,
     alignment=None,
 ):
-    """Effective P for a state-hybrid profile: `page_size_tokens` when the
+    """Effective P for a state-hybrid profile: `block_size` when the
     widest KV row already covers the widest constant state row, else the
     smallest multiple of `alignment` that does. `alignment` defaults to the
-    original `page_size_tokens` (the attention backend's page granularity —
+    original `block_size` (the attention backend's page granularity —
     no backend declares a finer one), so the inflated P stays a multiple of
     the configured block size. Pure wrapper over components_from_layers +
     solve_page_geometry so the config-level equalization decision and its
@@ -112,10 +112,10 @@ def equalized_page_size_tokens(
     )
     geo = solve_page_geometry(
         comps,
-        page_size_tokens=page_size_tokens,
-        alignment=alignment if alignment is not None else page_size_tokens,
+        block_size=block_size,
+        alignment=alignment if alignment is not None else block_size,
     )
-    return geo.page_size_tokens
+    return geo.block_size
 
 
 def flat_gdn_page_bytes(
@@ -123,7 +123,7 @@ def flat_gdn_page_bytes(
     num_layers,
     num_state_layers,
     kv_bytes_per_slot,
-    page_size_tokens,
+    block_size,
     state_const_bytes_per_layer,
 ):
     """Honest per-page byte cost of the M17 flat GDN layout: EVERY layer
@@ -132,7 +132,7 @@ def flat_gdn_page_bytes(
     constant state row (conv + ssm) per state layer. The registry's flat
     GDN profile divides the cache budget by exactly this."""
     return (
-        num_layers * kv_bytes_per_slot * page_size_tokens
+        num_layers * kv_bytes_per_slot * block_size
         + num_state_layers * state_const_bytes_per_layer
     )
 
@@ -160,10 +160,10 @@ class FlatMemoryPlan:
     tensors: tuple[TensorPlan, ...]
 
 
-def plan_tensors(components, *, page_size_tokens, alignment, budget_bytes):
+def plan_tensors(components, *, block_size, alignment, budget_bytes):
     """Pair slot j with the j-th layer of every group over one page-id space."""
     geo = solve_page_geometry(
-        components, page_size_tokens=page_size_tokens, alignment=alignment
+        components, block_size=block_size, alignment=alignment
     )
     layers_by_group: dict[str, list[int]] = {}
     for c in components:
@@ -187,7 +187,7 @@ def plan_tensors(components, *, page_size_tokens, alignment, budget_bytes):
             for c in components:
                 if c.group_id != gid or c.layer != layer:
                     continue
-                nbytes = c.bytes_per_slot * geo.page_size_tokens + c.const_bytes
+                nbytes = c.bytes_per_slot * geo.block_size + c.const_bytes
                 bindings.append(
                     LayerBinding(slot, gid, layer, c.component, nbytes, row_offset)
                 )

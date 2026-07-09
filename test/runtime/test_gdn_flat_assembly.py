@@ -2,7 +2,7 @@
 
 Four contracts: the Qwen3.5 config exposes ``layer_types`` in the
 paged-cache label vocabulary; the page-size equalization decision
-(``equalized_page_size_tokens``) inflates P to cover the GDN state row;
+(``equalized_block_size``) inflates P to cover the GDN state row;
 an MHAConfig carrying state shapes builds a full-coverage pool with one
 (conv, ssm) slab pair per state layer, both cache groups published, and
 the ctor geometry check enforcing the equalized P; and the flat GDN
@@ -52,7 +52,7 @@ def _load(mod_name: str, file_name: str):
 
 
 _plan = _load("flat_memory_plan_gdn_assembly_under_test", "flat_memory_plan.py")
-equalized_page_size_tokens = _plan.equalized_page_size_tokens
+equalized_block_size = _plan.equalized_block_size
 flat_gdn_page_bytes = _plan.flat_gdn_page_bytes
 
 
@@ -105,15 +105,15 @@ class Qwen3_5LayerTypesTest(unittest.TestCase):
 class EqualizedPageSizeTest(unittest.TestCase):
     """Pure equalization decision (no torch)."""
 
-    def _equalized(self, page_size_tokens, **kwargs):
-        return equalized_page_size_tokens(
+    def _equalized(self, block_size, **kwargs):
+        return equalized_block_size(
             layer_types=QWEN3_5ISH_LAYER_TYPES,
             kv_bytes_per_slot=QWEN3_5ISH_KV_BYTES_PER_SLOT,
             state_const_bytes={
                 "conv": QWEN3_5ISH_CONV_BYTES,
                 "ssm": QWEN3_5ISH_SSM_BYTES,
             },
-            page_size_tokens=page_size_tokens,
+            block_size=block_size,
             **kwargs,
         )
 
@@ -131,11 +131,11 @@ class EqualizedPageSizeTest(unittest.TestCase):
 
     def test_no_state_layers_is_identity(self):
         self.assertEqual(
-            equalized_page_size_tokens(
+            equalized_block_size(
                 layer_types=["full_attention"] * 4,
                 kv_bytes_per_slot=QWEN3_5ISH_KV_BYTES_PER_SLOT,
                 state_const_bytes={},
-                page_size_tokens=64,
+                block_size=64,
             ),
             64,
         )
@@ -152,7 +152,7 @@ class FlatGdnSizingFormulaTest(unittest.TestCase):
                 num_layers=48,
                 num_state_layers=36,
                 kv_bytes_per_slot=QWEN3_5ISH_KV_BYTES_PER_SLOT,
-                page_size_tokens=1088,
+                block_size=1088,
                 state_const_bytes_per_layer=state_row,
             ),
             48 * 2048 * 1088 + 36 * state_row,
@@ -163,7 +163,7 @@ class FlatGdnSizingFormulaTest(unittest.TestCase):
             num_layers=4,
             num_state_layers=3,
             kv_bytes_per_slot=32,
-            page_size_tokens=8,
+            block_size=8,
             state_const_bytes_per_layer=152,
         )
         self.assertEqual(page_bytes, 4 * 32 * 8 + 3 * 152)
@@ -226,11 +226,11 @@ class GdnFlatPoolAssemblyTest(unittest.TestCase):
 
     def test_equalization_decision_matches_pure_helper(self):
         self.assertEqual(
-            equalized_page_size_tokens(
+            equalized_block_size(
                 layer_types=list(self.LAYER_TYPES),
                 kv_bytes_per_slot=32,
                 state_const_bytes={"conv": 24, "ssm": 128},
-                page_size_tokens=4,
+                block_size=4,
             ),
             8,
         )

@@ -129,12 +129,12 @@ class MHATokenToKVPool(BaseTokenToKVPool):
                 },
             )
             geo = solve_page_geometry(
-                comps, page_size_tokens=self.page_size, alignment=1
+                comps, block_size=self.page_size, alignment=1
             )
-            if geo.page_size_tokens != self.page_size:
+            if geo.block_size != self.page_size:
                 raise ValueError(
                     "page_size must be pre-equalized for state layers; need "
-                    f">= {geo.page_size_tokens} (got {self.page_size})"
+                    f">= {geo.block_size} (got {self.page_size})"
                 )
         self._create_buffers()
 

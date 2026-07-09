@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.flat_memory_plan import (
-    equalized_page_size_tokens,
+    equalized_block_size,
     flat_gdn_page_bytes,
 )
 from tokenspeed.runtime.configs.model_config import AttentionArch, is_deepseek_v4
@@ -436,11 +436,11 @@ def create_attn_components(
         # raises on any mismatch (kv_cache/mha.py).
         conv_bytes = math.prod(config.conv_state_shape) * config.conv_dtype.itemsize
         ssm_bytes = math.prod(config.temporal_state_shape) * config.ssm_dtype.itemsize
-        equalized_page_size = equalized_page_size_tokens(
+        equalized_page_size = equalized_block_size(
             layer_types=list(config.layer_types),
             kv_bytes_per_slot=config.cache_cell_size(),
             state_const_bytes={"conv": conv_bytes, "ssm": ssm_bytes},
-            page_size_tokens=server_args.block_size,
+            block_size=server_args.block_size,
         )
         if equalized_page_size != server_args.block_size:
             logger.info(
@@ -579,7 +579,7 @@ def create_attn_components(
             num_layers=num_layers,
             num_state_layers=len(mamba_cache_params[4]),
             kv_bytes_per_slot=config.cache_cell_size(),
-            page_size_tokens=server_args.block_size,
+            block_size=server_args.block_size,
             state_const_bytes_per_layer=state_bytes_per_layer,
         )
         if draft_attn_config is not None:
