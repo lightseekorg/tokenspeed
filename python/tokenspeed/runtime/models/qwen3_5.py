@@ -36,6 +36,7 @@ from tokenspeed_kernel.ops.layernorm.triton import (
 )
 
 # Configs
+from tokenspeed.runtime.configs.paged_cache_spec import FULL_ATTENTION
 from tokenspeed.runtime.configs.qwen3_5_config import (
     Qwen3_5Config,
     Qwen3_5TextConfig,
@@ -657,7 +658,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
-            group_id="full_attention",
+            group_id=FULL_ATTENTION,
         )
 
         # Dense MLP for non-MoE variant

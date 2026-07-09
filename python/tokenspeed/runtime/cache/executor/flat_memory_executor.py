@@ -205,6 +205,33 @@ class FlatMemoryExecutor:
                 f"flat host tier: unsupported cache op kind {type(op).__name__}"
             )
 
+    def _submit(
+        self,
+        op_ids: Sequence[int],
+        src_pages: Sequence[Sequence[int]],
+        dst_pages: Sequence[Sequence[int]],
+        *,
+        pending_op_ids: list[int],
+        pending_pairs: list[tuple[int, int]],
+        src_is_device: bool,
+    ) -> None:
+        """Stage copies as (device_page, host_page) pairs; fail loud on a
+        ragged wire payload instead of silently dropping trailing ops."""
+        assert len(op_ids) == len(src_pages) == len(dst_pages), (
+            f"flat host tier: ragged cache-op payload (op_ids={len(op_ids)}, "
+            f"src_pages={len(src_pages)}, dst_pages={len(dst_pages)})"
+        )
+        for op_id, src, dst in zip(op_ids, src_pages, dst_pages):
+            assert len(src) == len(dst), (
+                f"flat host tier: op {op_id} src/dst page lists differ "
+                f"({len(src)} vs {len(dst)})"
+            )
+            pending_op_ids.append(int(op_id))
+            device_pages, host_pages = (src, dst) if src_is_device else (dst, src)
+            pending_pairs.extend(
+                (int(d), int(h)) for d, h in zip(device_pages, host_pages)
+            )
+
     def submit_writeback(
         self,
         op_ids: Sequence[int],
@@ -212,13 +239,14 @@ class FlatMemoryExecutor:
         dst_pages: Sequence[Sequence[int]],
     ) -> None:
         """Stage device->host copies: src=device pages, dst=host pages."""
-        for i, op_id in enumerate(op_ids):
-            src = src_pages[i] if i < len(src_pages) else []
-            dst = dst_pages[i] if i < len(dst_pages) else []
-            self._pending_write_op_ids.append(int(op_id))
-            self._pending_write_pairs.extend(
-                (int(d), int(h)) for d, h in zip(src, dst)
-            )
+        self._submit(
+            op_ids,
+            src_pages,
+            dst_pages,
+            pending_op_ids=self._pending_write_op_ids,
+            pending_pairs=self._pending_write_pairs,
+            src_is_device=True,
+        )
 
     def submit_loadback(
         self,
@@ -227,13 +255,14 @@ class FlatMemoryExecutor:
         dst_pages: Sequence[Sequence[int]],
     ) -> None:
         """Stage host->device copies: src=host pages, dst=device pages."""
-        for i, op_id in enumerate(op_ids):
-            src = src_pages[i] if i < len(src_pages) else []
-            dst = dst_pages[i] if i < len(dst_pages) else []
-            self._pending_load_op_ids.append(int(op_id))
-            self._pending_load_pairs.extend(
-                (int(d), int(h)) for h, d in zip(src, dst)
-            )
+        self._submit(
+            op_ids,
+            src_pages,
+            dst_pages,
+            pending_op_ids=self._pending_load_op_ids,
+            pending_pairs=self._pending_load_pairs,
+            src_is_device=False,
+        )
 
     def flush(self) -> None:
         self._start_loading()

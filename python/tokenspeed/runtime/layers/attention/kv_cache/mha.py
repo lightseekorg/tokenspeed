@@ -20,16 +20,20 @@
 
 from __future__ import annotations
 
+from collections import Counter
+
 import numpy as np
 import torch
 from tokenspeed_kernel.ops.kvcache.triton import store_kv_cache
 
+from tokenspeed.runtime.configs import paged_cache_spec
 from tokenspeed.runtime.configs.flat_memory_plan import (
-    components_from_layers,
-    solve_page_geometry,
+    equalized_block_size,
+    occurrence_index,
+    state_const_bytes,
 )
 from tokenspeed.runtime.configs.paged_cache_spec import (
-    _STATE_LAYER_TYPES,
+    STATE_LAYER_TYPES,
     hybrid_slab_group_size,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
@@ -65,7 +69,6 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         sliding_window_tokens: int | tuple[int | None, ...] | None = None,
         max_scheduled_tokens: int = 0,
         speculative_enabled: bool = False,
-        kvstore_enabled: bool = False,
         pd_disaggregation_enabled: bool = False,
         enable_kv_cache_copy: bool = False,
         enable_alt_stream: bool = True,
@@ -85,10 +88,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         self.head_num = head_num
         self.head_dim = head_dim
         self.layer_num = layer_num
-        # hybrid_slab_group_size is the single source for sizing (here and
-        # the registry's KV profile) and layout (_create_buffers).
         self._layer_types = tuple(layer_types or ())
-        self._kvstore_enabled = kvstore_enabled
         self._pd_disaggregation_enabled = pd_disaggregation_enabled
         self._slab_group_size = hybrid_slab_group_size(
             self._layer_types,
@@ -113,28 +113,27 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         ):
             # The flat plan packs [conv|ssm] state rows and KV rows into one
             # page-id space, so P must already cover the widest constant row
-            # (solve_page_geometry would otherwise inflate it behind the
+            # (the equalizer would otherwise inflate it behind the
             # allocator's back).
-            comps = components_from_layers(
+            equalized = equalized_block_size(
                 layer_types=list(self._layer_types),
                 kv_bytes_per_slot=2
                 * head_num
                 * head_dim
                 * self.store_dtype.itemsize,
-                state_const_bytes={
-                    "conv": int(np.prod(self._conv_state_shape))
-                    * self._conv_dtype.itemsize,
-                    "ssm": int(np.prod(self._temporal_state_shape))
-                    * self._ssm_dtype.itemsize,
-                },
+                state_const_bytes=state_const_bytes(
+                    self._conv_state_shape,
+                    self._conv_dtype,
+                    self._temporal_state_shape,
+                    self._ssm_dtype,
+                ),
+                block_size=self.page_size,
+                alignment=1,
             )
-            geo = solve_page_geometry(
-                comps, block_size=self.page_size, alignment=1
-            )
-            if geo.block_size != self.page_size:
+            if equalized != self.page_size:
                 raise ValueError(
                     "page_size must be pre-equalized for state layers; need "
-                    f">= {geo.block_size} (got {self.page_size})"
+                    f">= {equalized} (got {self.page_size})"
                 )
         self._create_buffers()
 
@@ -157,37 +156,25 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             v_size / GB,
         )
 
-        from tokenspeed.runtime.configs.paged_cache_spec import (
-            compute_paged_cache_group_page_counts,
-            group_specs_from_layer_types,
-            scheduler_ext_flat_kvcache,
+        # Publication rule lives in paged_cache_spec.publish_paged_cache_groups
+        # (module-attr call so tests can patch the flat-ext probe at call time).
+        published = paged_cache_spec.publish_paged_cache_groups(
+            layer_types=self._layer_types,
+            sliding_window_tokens=sliding_window_tokens,
+            page_size=page_size,
+            speculative_enabled=speculative_enabled,
+            max_live_requests=max_batch_size,
+            max_scheduled_tokens=max_scheduled_tokens,
+            max_total_tokens=size,
+            max_context_len=max_context_len,
         )
-
-        # Publication rule (canonical): publish groups iff the scheduler ext
-        # is flat-built (a radix ext never delivers flat tables — capture
-        # would bind dead buffers) and spec decode is off (flat tables do not
-        # support spec-expanded metadata; non-empty groups would also disable
-        # the overlap scheduler under spec). Publication is THE upstream signal
-        # every flat consumer keys off. TODO(flat+spec): publish under spec.
-        if speculative_enabled or not scheduler_ext_flat_kvcache():
+        if published is None:
             self.paged_cache_group_specs = ()
             self.paged_cache_group_page_counts = {}
         else:
-            effective_layer_types = layer_types or ("full_attention",)
-            self.paged_cache_group_specs = tuple(
-                group_specs_from_layer_types(
-                    layer_types=effective_layer_types,
-                    sliding_window_tokens=sliding_window_tokens,
-                    page_size=page_size,
-                )
-            )
-            self.paged_cache_group_page_counts = compute_paged_cache_group_page_counts(
-                self.paged_cache_group_specs,
-                max_live_requests=max_batch_size,
-                max_scheduled_tokens=max(0, int(max_scheduled_tokens)),
-                max_total_tokens=size,
-                max_context_len=max_context_len,
-            )
+            specs, counts = published
+            self.paged_cache_group_specs = tuple(specs)
+            self.paged_cache_group_page_counts = counts
         # Slab aliasing is only safe under the single-BlockPool ownership the
         # published groups configure.
         assert self._slab_group_size is None or self.paged_cache_group_specs
@@ -201,16 +188,11 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             f"hybrid slab layout: layer_types has {len(self._layer_types)} "
             f"entries but layer_num={self.layer_num}"
         )
-        occurrence: dict[str, int] = {}
-        pair_index: list[int] = []
-        for label in self._layer_types:
-            idx = occurrence.get(label, 0)
-            occurrence[label] = idx + 1
-            pair_index.append(idx)
+        counts = Counter(self._layer_types)
         assert all(
-            count == self._slab_group_size for count in occurrence.values()
-        ), f"hybrid slab layout: uneven groups {occurrence!r}"
-        return pair_index
+            count == self._slab_group_size for count in counts.values()
+        ), f"hybrid slab layout: uneven groups {dict(counts)!r}"
+        return occurrence_index(self._layer_types)
 
     def _check_slab_guards(self):
         """Refuse features whose per-layer buffer assumptions break when
@@ -236,15 +218,6 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             # Page 0 is the zero-initialized dummy page: padded tokens write
             # there, and kernels may read it past valid seq_len, so its slots
             # must stay finite to keep softmax well-defined.
-            logger.info(
-                "_create_buffers self.size=%r, self.page_size=%r, self.head_num=%r, self.head_dim=%r, self.layer_num=%r",
-                self.size,
-                self.page_size,
-                self.head_num,
-                self.head_dim,
-                self.layer_num,
-            )
-
             def _alloc():
                 return torch.zeros(
                     (self.size + self.page_size, self.head_num, self.head_dim),
@@ -313,23 +286,24 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             # NOTE: the per-layer k/v buffers above still cover state layers
             # (GDN hybrids keep the legacy KV layout today); skipping them
             # is deferred to the full plan executor.
-            from tokenspeed.runtime.configs.paged_cache_spec import (
-                scheduler_ext_flat_kvcache,
-            )
-
-            assert self.size % self.page_size == 0, (
-                "flat pool size must be whole pages"
-            )
-            self.num_pages_with_null = self.size // self.page_size + 1
-            state_layer_count = sum(
-                1 for label in self._layer_types if label in _STATE_LAYER_TYPES
-            )
+            self._layer_state_pair: dict[int, int] = {
+                layer_id: pair
+                for pair, layer_id in enumerate(
+                    layer_id
+                    for layer_id, label in enumerate(self._layer_types)
+                    if label in STATE_LAYER_TYPES
+                )
+            }
             if (
-                state_layer_count > 0
+                self._layer_state_pair
                 and self._conv_state_shape is not None
                 and self._temporal_state_shape is not None
-                and scheduler_ext_flat_kvcache()
+                and paged_cache_spec.scheduler_ext_flat_kvcache()
             ):
+                assert self.size % self.page_size == 0, (
+                    "flat pool size must be whole pages"
+                )
+                self.num_pages_with_null = self.size // self.page_size + 1
                 self.state_slabs: list[tuple[torch.Tensor, torch.Tensor]] = [
                     (
                         torch.zeros(
@@ -346,12 +320,12 @@ class MHATokenToKVPool(BaseTokenToKVPool):
                             device=self.device,
                         ),
                     )
-                    for _ in range(state_layer_count)
+                    for _ in range(len(self._layer_state_pair))
                 ]
                 logger.info(
                     "State slabs: %d (conv, ssm) pairs x %d page rows "
                     "(row 0 = null page)",
-                    state_layer_count,
+                    len(self._layer_state_pair),
                     self.num_pages_with_null,
                 )
             else:
@@ -360,16 +334,11 @@ class MHATokenToKVPool(BaseTokenToKVPool):
     def _clear_buffers(self):
         del self.k_buffer
         del self.v_buffer
-        if hasattr(self, "state_slabs"):
-            del self.state_slabs
-        if hasattr(self, "k_data_ptrs"):
-            del self.k_data_ptrs
-        if hasattr(self, "v_data_ptrs"):
-            del self.v_data_ptrs
-        if hasattr(self, "data_ptrs"):
-            del self.data_ptrs
-        if hasattr(self, "data_strides"):
-            del self.data_strides
+        del self.state_slabs
+        del self.k_data_ptrs
+        del self.v_data_ptrs
+        del self.data_ptrs
+        del self.data_strides
 
     def _init_kv_copy_and_warmup(self):
         _KV_COPY_STRIDE_THRESHOLD_LARGE = 8192
@@ -566,23 +535,19 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         """(conv, ssm) state slab pair for a state layer; the n-th state
         layer (within-state-label occurrence order, the slab pairing order)
         binds pair n. Raises ValueError for non-state layers."""
-        state_index = 0
-        for lid, label in enumerate(self._layer_types):
-            if label not in _STATE_LAYER_TYPES:
-                continue
-            if lid == layer_id:
-                if not self.state_slabs:
-                    raise ValueError(
-                        f"layer {layer_id} is a state layer but no state "
-                        "slabs were allocated (state shapes missing or "
-                        "radix ext)"
-                    )
-                return self.state_slabs[state_index]
-            state_index += 1
-        raise ValueError(
-            f"layer {layer_id} is not a state layer "
-            f"(layer_types={self._layer_types!r})"
-        )
+        pair = self._layer_state_pair.get(layer_id)
+        if pair is None:
+            raise ValueError(
+                f"layer {layer_id} is not a state layer "
+                f"(layer_types={self._layer_types!r})"
+            )
+        if not self.state_slabs:
+            raise ValueError(
+                f"layer {layer_id} is a state layer but no state "
+                "slabs were allocated (state shapes missing or "
+                "radix ext)"
+            )
+        return self.state_slabs[pair]
 
     def set_kv_buffer(
         self,

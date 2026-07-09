@@ -17,7 +17,7 @@ from dataclasses import dataclass, replace
 
 
 # Labels whose group is state-family (recurrent state rows, not KV history).
-# Deliberate one-line duplicate of paged_cache_spec._STATE_LAYER_TYPES: both
+# Deliberate one-line duplicate of paged_cache_spec.STATE_LAYER_TYPES: both
 # modules are direct-loaded standalone by their tests (importlib, no package
 # context), so a cross-module import would break either loader. Keep in sync.
 STATE_LAYER_TYPES = frozenset({"linear_attention"})
@@ -39,17 +39,53 @@ class BlockGeometry:
     num_blocks: int = 0  # filled by plan_tensors from the memory budget
 
 
+def occurrence_index(labels):
+    """Within-label occurrence index per position.
+
+    Args:
+        labels: Iterable of hashable labels (e.g. per-layer type strings).
+
+    Returns:
+        list[int]: out[i] == number of earlier positions carrying the same
+        label as position i — the slab pairing order shared by
+        components_from_layers and the KV pool's slab layout.
+    """
+    counts: dict = {}
+    out: list[int] = []
+    for label in labels:
+        idx = counts.get(label, 0)
+        counts[label] = idx + 1
+        out.append(idx)
+    return out
+
+
+def state_const_bytes(conv_shape, conv_dtype, ssm_shape, ssm_dtype):
+    """Constant per-page state row bytes of one GDN/mamba2 state layer.
+
+    Args:
+        conv_shape / ssm_shape: Per-layer state tensor shapes (the configs'
+            mamba2_cache_params conv and temporal shapes).
+        conv_dtype / ssm_dtype: Matching dtypes (anything with ``itemsize``).
+
+    Returns:
+        dict[str, int]: {"conv": bytes, "ssm": bytes} — the exact
+        ``state_const_bytes`` mapping components_from_layers /
+        equalized_block_size consume (insertion order = row_offset order).
+    """
+    return {
+        "conv": math.prod(conv_shape) * conv_dtype.itemsize,
+        "ssm": math.prod(ssm_shape) * ssm_dtype.itemsize,
+    }
+
+
 def components_from_layers(*, layer_types, kv_bytes_per_slot, state_const_bytes):
     """Per-layer ComponentSpecs: history layers carry one linear kv component;
     state layers one constant component per state tensor. Layer index is the
     within-group occurrence count (the slab pairing order). State component
     order (hence row_offset order downstream) follows state_const_bytes
     insertion order."""
-    counts: dict[str, int] = {}
     comps: list[ComponentSpec] = []
-    for label in layer_types:
-        idx = counts.get(label, 0)
-        counts[label] = idx + 1
+    for label, idx in zip(layer_types, occurrence_index(layer_types)):
         if label in STATE_LAYER_TYPES:
             for name, nbytes in state_const_bytes.items():
                 comps.append(ComponentSpec(label, idx, name, 0, nbytes))

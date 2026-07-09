@@ -51,18 +51,23 @@ def scheduler_ext_flat_kvcache() -> bool:
     return bool(getattr(tokenspeed_scheduler, "FLAT_KVCACHE", False))
 
 
+# Paged-cache label vocabulary (NOT the HF checkpoint's serialized enum:
+# Qwen3.5 checkpoints spell full attention "attention").
+FULL_ATTENTION = "full_attention"
+LINEAR_ATTENTION = "linear_attention"
+
 # layer_type label -> retention. GPT-OSS uses the first two, Qwen3.5 GDN
 # layers use "linear_attention"; unknown labels raise.
 _LAYER_TYPE_RETENTION: Dict[str, Retention] = {
-    "full_attention": "full_history",
+    FULL_ATTENTION: "full_history",
     "sliding_attention": "sliding_window",
     # State groups ride full_history retention: the C++ side keys the
     # mamba-state kind on family == State && retention != SlidingWindow.
-    "linear_attention": "full_history",
+    LINEAR_ATTENTION: "full_history",
 }
 
 # Labels whose group is state-family (recurrent state rows, not KV history).
-_STATE_LAYER_TYPES = {"linear_attention"}
+STATE_LAYER_TYPES = {LINEAR_ATTENTION}
 
 
 def hybrid_slab_group_size(
@@ -92,7 +97,7 @@ def hybrid_slab_group_size(
     counts: dict[str, int] = {}
     for label in layer_types:
         # State rows are not byte-equal with KV rows, so no slab pairing.
-        if label not in _LAYER_TYPE_RETENTION or label in _STATE_LAYER_TYPES:
+        if label not in _LAYER_TYPE_RETENTION or label in STATE_LAYER_TYPES:
             return None
         counts[label] = counts.get(label, 0) + 1
     if len(counts) < 2:
@@ -405,10 +410,61 @@ def group_specs_from_layer_types(
                 rows_per_page=page_size,
                 entry_stride_tokens=1,
                 sliding_window_tokens=window,
-                family="state" if gid in _STATE_LAYER_TYPES else "history",
+                family="state" if gid in STATE_LAYER_TYPES else "history",
             )
         )
     return specs
+
+
+def publish_paged_cache_groups(
+    *,
+    layer_types: Sequence[str],
+    sliding_window_tokens: int | Sequence[int | None] | None,
+    page_size: int,
+    speculative_enabled: bool,
+    max_live_requests: int,
+    max_scheduled_tokens: int,
+    max_total_tokens: int,
+    max_context_len: int,
+) -> tuple[list[PagedCacheGroupSpec], Dict[str, int]] | None:
+    """Publication rule (canonical) for a KV pool's paged-cache groups.
+
+    Publish groups iff the scheduler ext is flat-built (a radix ext never
+    delivers flat tables — capture would bind dead buffers) and spec decode
+    is off (flat tables do not support spec-expanded metadata; non-empty
+    groups would also disable the overlap scheduler under spec). Publication
+    is THE upstream signal every flat consumer keys off.
+    TODO(flat+spec): publish under spec.
+
+    Args:
+        layer_types: Per-layer paged-cache labels (empty -> single
+            full-history group).
+        sliding_window_tokens / page_size: Forwarded to
+            group_specs_from_layer_types.
+        speculative_enabled: Gates publication off.
+        max_live_requests / max_scheduled_tokens / max_total_tokens /
+            max_context_len: Sizing inputs for
+            compute_paged_cache_group_page_counts.
+
+    Returns:
+        (specs, page_counts) when publishing, None when publication is
+        gated off (radix ext or spec decode).
+    """
+    if speculative_enabled or not scheduler_ext_flat_kvcache():
+        return None
+    specs = group_specs_from_layer_types(
+        layer_types=tuple(layer_types) or (FULL_ATTENTION,),
+        sliding_window_tokens=sliding_window_tokens,
+        page_size=page_size,
+    )
+    counts = compute_paged_cache_group_page_counts(
+        specs,
+        max_live_requests=max_live_requests,
+        max_scheduled_tokens=max(0, int(max_scheduled_tokens)),
+        max_total_tokens=max_total_tokens,
+        max_context_len=max_context_len,
+    )
+    return specs, counts
 
 
 def compute_max_logical_pages_for_capture(
@@ -475,13 +531,17 @@ def compute_max_logical_pages_for_capture(
 
 
 __all__ = [
+    "FULL_ATTENTION",
+    "LINEAR_ATTENTION",
     "PagedCacheGroupSpec",
     "Retention",
+    "STATE_LAYER_TYPES",
     "compute_max_logical_pages_for_capture",
     "compute_paged_cache_group_page_counts",
     "group_specs_from_layer_types",
     "hybrid_slab_group_size",
     "layer_group_ids",
+    "publish_paged_cache_groups",
     "scheduler_ext_flat_kvcache",
     "validate_flat_scheduler_config",
 ]

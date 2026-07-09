@@ -26,7 +26,7 @@ import torch
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.configs.paged_cache_spec import (
-    _STATE_LAYER_TYPES,
+    STATE_LAYER_TYPES,
     scheduler_ext_flat_kvcache,
 )
 from tokenspeed.runtime.layers.attention.configs.base import (
@@ -45,11 +45,10 @@ class MHAConfig(BaseAttnConfig):
     sliding_window_tokens: int | tuple[int | None, ...] | None = None
     max_scheduled_tokens: int = 0
     # True iff server_args.speculative_algorithm is set (publication rule:
-    # kv_cache/mha.py).
+    # paged_cache_spec.publish_paged_cache_groups).
     speculative_enabled: bool = False
-    # True iff server_args.enable_kvstore; the pool's slab guards consume it.
-    kvstore_enabled: bool = False
-    # True iff server_args.disaggregation_mode != "null"; same slab guards.
+    # True iff server_args.disaggregation_mode != "null"; the pool's slab
+    # guards consume it.
     pd_disaggregation_enabled: bool = False
     # Mamba2/GDN per-state-layer shapes and dtypes (the configs'
     # mamba2_cache_params), forwarded to the pool's state slabs. Populated
@@ -84,7 +83,7 @@ class MHAConfig(BaseAttnConfig):
         conv_state_shape = temporal_state_shape = None
         conv_dtype = ssm_dtype = None
         if any(
-            label in _STATE_LAYER_TYPES for label in layer_types
+            label in STATE_LAYER_TYPES for label in layer_types
         ) and scheduler_ext_flat_kvcache():
             # GDN hybrid on the flat ext: the KV pool owns the recurrent
             # state (state slabs), so it needs the mamba2 shapes/dtypes.
@@ -122,7 +121,6 @@ class MHAConfig(BaseAttnConfig):
             sliding_window_tokens=sliding_window_tokens,
             max_scheduled_tokens=server_args.chunked_prefill_size,
             speculative_enabled=server_args.speculative_algorithm is not None,
-            kvstore_enabled=server_args.enable_kvstore,
             pd_disaggregation_enabled=server_args.disaggregation_mode != "null",
             conv_state_shape=conv_state_shape,
             temporal_state_shape=temporal_state_shape,
@@ -164,7 +162,6 @@ class MHAConfig(BaseAttnConfig):
             sliding_window_tokens=self.sliding_window_tokens,
             max_scheduled_tokens=self.max_scheduled_tokens,
             speculative_enabled=self.speculative_enabled,
-            kvstore_enabled=self.kvstore_enabled,
             pd_disaggregation_enabled=self.pd_disaggregation_enabled,
             conv_state_shape=self.conv_state_shape,
             temporal_state_shape=self.temporal_state_shape,

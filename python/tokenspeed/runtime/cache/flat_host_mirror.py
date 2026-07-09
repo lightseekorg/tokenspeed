@@ -79,8 +79,9 @@ class FlatHostMirror:
         self.page_size = int(device_kv_pool.page_size)
         self.num_host_pages = int(num_host_pages)
 
-        # Slab layout dedups 24 layer entries to 12 K + 12 V slabs; legacy
-        # layout keeps all per-layer buffers (dead-row copies are harmless).
+        # Slab layout dedups the per-layer entries to one K + one V slab per
+        # paired layer set (layers-per-group slabs); legacy layout keeps all
+        # per-layer buffers (dead-row copies are harmless).
         k_tensors = _identity_dedup(device_kv_pool.k_buffer)
         v_tensors = _identity_dedup(device_kv_pool.v_buffer)
         self.num_k_tensors = len(k_tensors)

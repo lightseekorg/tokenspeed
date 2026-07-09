@@ -399,12 +399,6 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
                 self.assertEqual(len({id(t) for t in pool.v_buffer}), 24)
                 self.assertTrue(pool.supports_hierarchical_kv_cache)
 
-    def test_kvstore_with_slab_allowed(self):
-        # Spec §6 revision: the flat L2 tier mirrors whole slabs byte-blind,
-        # so per-slab copies are group-safe and the guard no longer fires.
-        pool = self._pool(kvstore_enabled=True)
-        self.assertEqual(len({id(t) for t in pool.k_buffer}), 12)
-
     def test_guard_raises_on_pd_with_slab(self):
         with self.assertRaisesRegex(
             RuntimeError,
@@ -414,10 +408,9 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
             self._pool(pd_disaggregation_enabled=True)
 
     def test_no_guard_when_fallback(self):
-        # The flags only conflict with the slab layout, not the legacy one.
+        # The flag only conflicts with the slab layout, not the legacy one.
         pool = self._pool(
             flat_ext=False,
-            kvstore_enabled=True,
             pd_disaggregation_enabled=True,
         )
         self.assertEqual(len({id(t) for t in pool.k_buffer}), 24)

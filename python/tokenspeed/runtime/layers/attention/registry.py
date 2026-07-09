@@ -21,12 +21,12 @@
 from __future__ import annotations
 
 import logging
-import math
 from typing import TYPE_CHECKING
 
 from tokenspeed.runtime.configs.flat_memory_plan import (
     equalized_block_size,
     flat_gdn_block_bytes,
+    state_const_bytes,
 )
 from tokenspeed.runtime.configs.model_config import AttentionArch, is_deepseek_v4
 from tokenspeed.runtime.configs.paged_cache_spec import (
@@ -414,10 +414,23 @@ def create_attn_components(
             server_args.drafter_attention_backend = None
 
     config = _create_attn_config(server_args, model_config)
-    if getattr(config, "conv_state_shape", None) is not None:
-        # GDN page-size equalization CHOKE POINT (state shapes are stamped on
-        # the config only under a flat-built ext, so this whole branch is
-        # behind scheduler_ext_flat_kvcache()). MHAConfig.generate stamped
+    # Flat-GDN marker + single source of the constant state-row bytes: state
+    # shapes are stamped on the config only under a flat-built ext
+    # (MHAConfig.generate), so this one flag gates both the page-size
+    # equalization here and the flat GDN sizing profile below.
+    is_flat_gdn = getattr(config, "conv_state_shape", None) is not None
+    gdn_state_bytes = (
+        state_const_bytes(
+            config.conv_state_shape,
+            config.conv_dtype,
+            config.temporal_state_shape,
+            config.ssm_dtype,
+        )
+        if is_flat_gdn
+        else None
+    )
+    if is_flat_gdn:
+        # GDN page-size equalization CHOKE POINT. MHAConfig.generate stamped
         # config.page_size from server_args.block_size just above, and every
         # OTHER page-size consumer — the sizing profile below, the draft
         # config's generate, event_loop's make_config / ModelExecutorConfig /
@@ -425,12 +438,10 @@ def create_attn_components(
         # function runs, so inflating both here reaches all of them
         # consistently. MHATokenToKVPool's ctor re-derives the geometry and
         # raises on any mismatch (kv_cache/mha.py).
-        conv_bytes = math.prod(config.conv_state_shape) * config.conv_dtype.itemsize
-        ssm_bytes = math.prod(config.temporal_state_shape) * config.ssm_dtype.itemsize
         equalized_block_size_value = equalized_block_size(
             layer_types=list(config.layer_types),
             kv_bytes_per_slot=config.cache_cell_size(),
-            state_const_bytes={"conv": conv_bytes, "ssm": ssm_bytes},
+            state_const_bytes=gdn_state_bytes,
             block_size=server_args.block_size,
         )
         if equalized_block_size_value != server_args.block_size:
@@ -493,7 +504,21 @@ def create_attn_components(
     mamba_cache_params = (
         getattr(text_config, "mamba2_cache_params", None) if text_config else None
     )
-    has_mamba_layers = bool(mamba_cache_params and len(mamba_cache_params[4]) > 0)
+    # Unpack once with names; every consumer below reads these instead of
+    # indexing into the raw tuple.
+    if mamba_cache_params:
+        (
+            mamba_conv_state_shape,
+            mamba_temporal_state_shape,
+            mamba_conv_dtype,
+            mamba_ssm_dtype,
+            mamba_layer_ids,
+        ) = mamba_cache_params
+    else:
+        mamba_conv_state_shape = mamba_temporal_state_shape = None
+        mamba_conv_dtype = mamba_ssm_dtype = None
+        mamba_layer_ids = ()
+    has_mamba_layers = len(mamba_layer_ids) > 0
     has_mamba = getattr(model_config, "mambaish_config", None) is not None or (
         has_mamba_layers
     )
@@ -556,7 +581,7 @@ def create_attn_components(
             server_args.block_size,
             server_args.max_total_tokens,
         )
-    elif has_mamba and getattr(config, "conv_state_shape", None) is not None:
+    elif has_mamba and is_flat_gdn:
         # Flat GDN profile (state shapes are only stamped on a flat ext, so
         # this branch is behind scheduler_ext_flat_kvcache()): the pool
         # covers ALL layers — KV rows on state layers are accepted waste
@@ -564,16 +589,12 @@ def create_attn_components(
         # state layer, so divide the budget by the honest per-block bytes
         # directly instead of the per-token cell profile. No mamba slot pool
         # on this path (mamba_pool_total_chunks stays 0).
-        state_bytes_per_layer = (
-            math.prod(config.conv_state_shape) * config.conv_dtype.itemsize
-            + math.prod(config.temporal_state_shape) * config.ssm_dtype.itemsize
-        )
         block_bytes = flat_gdn_block_bytes(
             num_layers=num_layers,
-            num_state_layers=len(mamba_cache_params[4]),
+            num_state_layers=len(mamba_layer_ids),
             kv_bytes_per_slot=config.cache_cell_size(),
             block_size=server_args.block_size,
-            state_const_bytes_per_layer=state_bytes_per_layer,
+            state_const_bytes_per_layer=sum(gdn_state_bytes.values()),
         )
         if draft_attn_config is not None:
             # Draft (MTP) pool rides the same page-id space: one KV row per
@@ -600,7 +621,7 @@ def create_attn_components(
             "num_state_layers=%d, block_size=%d), max_total_num_pages=%d",
             block_bytes,
             num_layers,
-            len(mamba_cache_params[4]),
+            len(mamba_layer_ids),
             server_args.block_size,
             max_total_num_pages,
         )
@@ -615,7 +636,7 @@ def create_attn_components(
         num_kv_layers = (
             len(full_attn_layer_ids)
             if full_attn_layer_ids is not None
-            else num_layers - len(mamba_cache_params[4])
+            else num_layers - len(mamba_layer_ids)
         )
         max_total_num_pages = profile_max_num_pages(
             **{**_profile_kwargs, "num_attention_layers": num_kv_layers},
@@ -629,27 +650,19 @@ def create_attn_components(
             server_args.max_total_tokens,
         )
     elif has_mamba and server_args.max_mamba_cache_size is None:
-        (
-            conv_state_shape,
-            temporal_state_shape,
-            conv_dtype,
-            ssm_dtype,
-            mamba_layers,
-        ) = mamba_cache_params
-        num_mamba_layers = len(mamba_layers)
-        conv_size = 1
-        for dim in conv_state_shape:
-            conv_size *= dim
-        temporal_size = 1
-        for dim in temporal_state_shape:
-            temporal_size *= dim
+        num_mamba_layers = len(mamba_layer_ids)
         speculative_num_draft_tokens = (
             server_args.speculative_num_draft_tokens
             if server_args.speculative_algorithm is not None
             else 0
         )
-        per_layer_mamba_chunk_memory = (
-            conv_size * conv_dtype.itemsize + temporal_size * ssm_dtype.itemsize
+        per_layer_mamba_chunk_memory = sum(
+            state_const_bytes(
+                mamba_conv_state_shape,
+                mamba_conv_dtype,
+                mamba_temporal_state_shape,
+                mamba_ssm_dtype,
+            ).values()
         ) * (1 + speculative_num_draft_tokens)
         memory_per_mamba_chunk = num_mamba_layers * per_layer_mamba_chunk_memory
         full_attn_layer_ids = getattr(text_config, "full_attention_layer_ids", None)

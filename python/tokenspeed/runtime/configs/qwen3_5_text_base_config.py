@@ -33,6 +33,7 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_rope_utils import rope_config_validation
 from transformers.utils import logging
 
+from tokenspeed.runtime.configs.paged_cache_spec import FULL_ATTENTION
 from tokenspeed.runtime.distributed.utils import divide
 from tokenspeed.runtime.utils.env import envs
 
@@ -285,7 +286,7 @@ class Qwen3_5BaseTextConfig(PretrainedConfig):
         """
         return [
             (
-                "full_attention"
+                FULL_ATTENTION
                 if layer_type == HybridLayerType.full_attention.value
                 else layer_type
             )
