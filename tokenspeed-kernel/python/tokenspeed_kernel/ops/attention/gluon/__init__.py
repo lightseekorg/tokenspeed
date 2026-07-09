@@ -228,14 +228,15 @@ if current_platform().is_amd:
         signatures=frozenset(
             {
                 format_signature(q=dense_tensor_format(torch.bfloat16)),
+                format_signature(q=dense_tensor_format(torch.float8_e4m3fn)),
             }
         ),
         priority=Priority.SPECIALIZED,
         traits={
             "page_size": frozenset({64}),
             "q_len_per_req": frozenset({1, 2, 3, 4, 5, 6}),
-            "qk_nope_head_dim": frozenset({192}),
-            "kv_lora_rank": frozenset({512}),
+            "qk_nope_head_dim": frozenset({128, 192}),
+            "kv_lora_rank": frozenset({128, 512}),
             "qk_rope_head_dim": frozenset({64}),
             "topk": frozenset({512, 1024, 2048}),
             "kv_cache_available": frozenset({False, True}),
@@ -261,14 +262,15 @@ if current_platform().is_amd:
         signatures=frozenset(
             {
                 format_signature(q=dense_tensor_format(torch.bfloat16)),
+                format_signature(q=dense_tensor_format(torch.float8_e4m3fn)),
             }
         ),
         priority=Priority.SPECIALIZED,
         traits={
             "page_size": frozenset({64}),
             "q_len_per_req": frozenset({1}),
-            "qk_nope_head_dim": frozenset({192}),
-            "kv_lora_rank": frozenset({512}),
+            "qk_nope_head_dim": frozenset({128, 192}),
+            "kv_lora_rank": frozenset({128, 512}),
             "qk_rope_head_dim": frozenset({64}),
             "topk": frozenset({512, 1024, 2048}),
             "kv_cache_available": frozenset({False, True}),

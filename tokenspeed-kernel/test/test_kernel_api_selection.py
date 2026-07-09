@@ -1146,7 +1146,7 @@ _CASES = [
         "cdna4",
         "attention",
         "dsa_decode_topk",
-        "triton_dsa_decode_topk_fp8",
+        "gluon_dsa_decode_topk_fp8_gfx950",
         _attention_dsa_decode_topk,
     ),
     _case(
@@ -1154,7 +1154,7 @@ _CASES = [
         "cdna4",
         "attention",
         "dsa_prefill_topk",
-        "triton_dsa_prefill_topk_fp8",
+        "gluon_dsa_prefill_topk_fp8_gfx950",
         _attention_dsa_prefill_topk,
     ),
     _case(

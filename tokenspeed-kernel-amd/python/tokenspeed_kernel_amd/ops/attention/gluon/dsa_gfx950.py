@@ -772,19 +772,28 @@ def _check_inputs(
     qk_rope_head_dim: int,
     page_size: int,
 ) -> None:
-    if q.dtype != torch.bfloat16:
-        raise TypeError(f"Gluon DSA supports BF16 q for this milestone, got {q.dtype}")
+    if q.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+        raise TypeError(f"Gluon DSA supports BF16/FP8 q, got {q.dtype}")
     if page_size != 64:
         raise ValueError(f"Gluon DSA supports page_size=64, got {page_size}")
-    if qk_nope_head_dim != 192:
+    if qk_nope_head_dim not in (128, 192):
         raise ValueError(
-            f"Gluon DSA supports qk_nope_head_dim=192, got {qk_nope_head_dim}"
+            "Gluon DSA supports qk_nope_head_dim in {128, 192}, got "
+            f"{qk_nope_head_dim}"
         )
-    if kv_lora_rank != 512:
-        raise ValueError(f"Gluon DSA supports kv_lora_rank=512, got {kv_lora_rank}")
+    if kv_lora_rank not in (128, 512):
+        raise ValueError(
+            f"Gluon DSA supports kv_lora_rank in {{128, 512}}, got {kv_lora_rank}"
+        )
     if qk_rope_head_dim != 64:
         raise ValueError(
             f"Gluon DSA supports qk_rope_head_dim=64, got {qk_rope_head_dim}"
+        )
+    expected_head_dim = int(kv_lora_rank) + int(qk_rope_head_dim)
+    if q.shape[-1] != expected_head_dim:
+        raise ValueError(
+            "q head dim must equal kv_lora_rank + qk_rope_head_dim, got "
+            f"q={q.shape[-1]}, expected={expected_head_dim}"
         )
     if topk_slots.dtype != torch.int32 or topk_slots.dim() != 2:
         raise ValueError("topk_slots must be int32 with shape [tokens, topk]")
@@ -792,6 +801,10 @@ def _check_inputs(
         raise ValueError("Gluon DSA requires topk_lens for this milestone")
     if topk_lens.dtype != torch.int32 or topk_lens.shape != (topk_slots.shape[0],):
         raise ValueError("topk_lens must be int32 with shape [tokens]")
+
+
+def _output_dtype(q: torch.Tensor) -> torch.dtype:
+    return torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype
 
 
 def _run_dense_kv(
@@ -805,7 +818,9 @@ def _run_dense_kv(
     qk_rope_head_dim: int,
 ) -> torch.Tensor:
     out = torch.empty(
-        (q.shape[0], q.shape[1], kv_lora_rank), dtype=q.dtype, device=q.device
+        (q.shape[0], q.shape[1], kv_lora_rank),
+        dtype=_output_dtype(q),
+        device=q.device,
     )
     grid = lambda meta: (q.shape[0], triton.cdiv(q.shape[1], meta["BLOCK_H"]))
     _dsa_dense_mfma_kv_kernel[grid](
@@ -844,7 +859,9 @@ def _run_dense_kv_scalar(
 ) -> torch.Tensor:
     kv_dim = int(kv_lora_rank) + int(qk_rope_head_dim)
     out = torch.empty(
-        (q.shape[0], q.shape[1], kv_lora_rank), dtype=q.dtype, device=q.device
+        (q.shape[0], q.shape[1], kv_lora_rank),
+        dtype=_output_dtype(q),
+        device=q.device,
     )
     _dsa_dense_kv_kernel[(q.shape[0], q.shape[1], triton.cdiv(kv_lora_rank, 64))](
         q,
@@ -878,7 +895,9 @@ def _run_packed_kv(
 ) -> torch.Tensor:
     row_bytes = int(packed_kv.shape[1])
     out = torch.empty(
-        (q.shape[0], q.shape[1], kv_lora_rank), dtype=q.dtype, device=q.device
+        (q.shape[0], q.shape[1], kv_lora_rank),
+        dtype=_output_dtype(q),
+        device=q.device,
     )
     _dsa_packed_kv_kernel[(q.shape[0], q.shape[1], triton.cdiv(kv_lora_rank, 64))](
         q,
@@ -943,15 +962,31 @@ def _run_dsa(
             qk_rope_head_dim=qk_rope_head_dim,
         )
     elif kv_cache is not None:
-        result = _run_dense_kv(
-            q,
-            _flatten_dense_kv_cache(kv_cache).contiguous(),
-            topk_slots,
-            topk_lens,
-            softmax_scale=softmax_scale,
-            kv_lora_rank=kv_lora_rank,
-            qk_rope_head_dim=qk_rope_head_dim,
-        )
+        dense_kv = _flatten_dense_kv_cache(kv_cache).contiguous()
+        if (
+            q.dtype == torch.bfloat16
+            and dense_kv.dtype == torch.bfloat16
+            and int(kv_lora_rank) == 512
+        ):
+            result = _run_dense_kv(
+                q,
+                dense_kv,
+                topk_slots,
+                topk_lens,
+                softmax_scale=softmax_scale,
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+            )
+        else:
+            result = _run_dense_kv_scalar(
+                q,
+                dense_kv,
+                topk_slots,
+                topk_lens,
+                softmax_scale=softmax_scale,
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+            )
     else:
         raise ValueError("Gluon DSA requires kv_cache or sparse_kv_cache")
     if out is None:

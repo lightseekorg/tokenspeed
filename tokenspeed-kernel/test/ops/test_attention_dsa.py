@@ -1010,7 +1010,7 @@ def _assert_slots_visible(
         pytest.param("prefill", "dsa_prefill", id="prefill"),
     ],
 )
-@pytest.mark.parametrize("solution", ["triton"])
+@pytest.mark.parametrize("solution", ["triton", "gluon"])
 @pytest.mark.parametrize(
     "q_dtype",
     [
@@ -1089,8 +1089,23 @@ def test_dsa_with_kvcache(
         pytest.param(torch.float8_e4m3fn, id="q_fp8"),
     ],
 )
-def test_dsa_decode_dense_kvcache(device: str, q_dtype: torch.dtype, require) -> None:
-    require("attention", "dsa_decode", "triton", q_dtype, "q")
+@pytest.mark.parametrize(
+    "mode,api_name",
+    [
+        pytest.param("decode", "dsa_decode", id="decode"),
+        pytest.param("prefill", "dsa_prefill", id="prefill"),
+    ],
+)
+@pytest.mark.parametrize("solution", ["triton", "gluon"])
+def test_dsa_dense_kvcache(
+    device: str,
+    q_dtype: torch.dtype,
+    mode: str,
+    api_name: str,
+    solution: str,
+    require,
+) -> None:
+    require("attention", api_name, solution, q_dtype, "q")
 
     tokens = 3
     num_heads = 2
@@ -1119,7 +1134,8 @@ def test_dsa_decode_dense_kvcache(device: str, q_dtype: torch.dtype, require) ->
         count = int(topk_lens[token].item())
         topk_slots[token, :count] = torch.randperm(num_slots, device=device)[:count]
 
-    out = dsa_decode(
+    api = dsa_decode if mode == "decode" else dsa_prefill
+    out = api(
         q=q,
         kv_cache=kv_cache,
         sparse_kv_cache=None,
@@ -1131,7 +1147,7 @@ def test_dsa_decode_dense_kvcache(device: str, q_dtype: torch.dtype, require) ->
         qk_rope_head_dim=qk_rope_head_dim,
         softmax_scale=softmax_scale,
         page_size=64,
-        solution="triton",
+        solution=solution,
     )
 
     ref = _dsa_reference(
