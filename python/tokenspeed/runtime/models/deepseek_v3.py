@@ -900,6 +900,7 @@ class DeepseekV3AttentionMLA(nn.Module):
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
         output: torch.Tensor,
+        record_kv_cache: bool | None = None,
     ) -> torch.Tensor:
         # MLA kernel backends: KV cache already written in forward_absorb_qkv_proj.
         # Other backends: write via fused_set_kv_buffer or let backend handle it.
@@ -915,6 +916,7 @@ class DeepseekV3AttentionMLA(nn.Module):
             ctx,
             out_cache_loc,
             save_kv_cache=need_save_kv,
+            record_kv_cache=record_kv_cache,
         )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
         if _is_amd:
@@ -1192,6 +1194,8 @@ class DeepseekV3DraftAttentionMLA(DeepseekV3AttentionMLA):
                 decode_ctx,
                 out_cache_loc,
                 attn_output,
+                # Real-mode record: decode_ctx would skip the PD cache-step here.
+                record_kv_cache=not ctx.forward_mode.is_decode_or_idle(),
             )
         return attn_output
 
