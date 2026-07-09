@@ -12,10 +12,18 @@
 # FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
 
 import math
+import os
+import sys
 import unittest
 
 import torch
+
+# CI Registration (parsed via AST, runtime no-op)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=90, suite="runtime-1gpu")
+
 from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
     has_indexer_mxfp4_paged_gather,
     has_persistent_topk,
@@ -53,8 +61,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
 from tokenspeed.runtime.models.deepseek_v4 import (
     _deepseek_v4_sanitize_swa_slot_mapping,
 )
-
-register_cuda_ci(est_time=90, suite="runtime-1gpu")
 
 HEAD_DIM = 512
 NOPE_DIM = 448

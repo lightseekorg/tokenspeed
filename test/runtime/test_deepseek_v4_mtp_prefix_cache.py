@@ -13,19 +13,24 @@
 
 from __future__ import annotations
 
+import os
+import sys
 from types import SimpleNamespace
 
 import pytest
 import torch
+
+# CI Registration (parsed via AST, runtime no-op)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.model_executor import (
     _draft_idle_global_num_tokens_for_step,
 )
 from tokenspeed.runtime.models.deepseek_v4 import _deepseek_v4_swa_slot_mapping
-
-register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 
 def test_deepseek_v4_swa_slot_mapping_expands_mtp_decode_requests():
@@ -206,3 +211,7 @@ def test_draft_idle_global_num_tokens_match_multi_step_decode_shape():
         _draft_idle_global_num_tokens_for_step(1, global_num_tokens, None)
         is global_num_tokens
     )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
