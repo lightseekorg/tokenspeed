@@ -66,15 +66,17 @@ class ComputeStatePageIndicesTest(unittest.TestCase):
         self.assertEqual(state_out.tolist(), [8])
 
     def test_batch_mixed(self):
+        # Distinct rows per request: out pages are exclusive per batch (the scheduler
+        # invariant the validate path enforces).
         rows = [
             [7, 9, 12],
-            [7, 9, 12],
-            [7, 9, 12],
+            [21, 22, 23],
+            [31, 33, 35],
             [3, 5, 8],
         ]
         state_in, state_out = self._run(rows, [4, 5, 0, 8], [5, 6, 3, 9])
-        self.assertEqual(state_in.tolist(), [7, 9, 0, 5])
-        self.assertEqual(state_out.tolist(), [9, 9, 7, 8])
+        self.assertEqual(state_in.tolist(), [7, 22, 0, 5])
+        self.assertEqual(state_out.tolist(), [9, 22, 31, 8])
 
     def test_out_slot_hole_raises(self):
         with self.assertRaises(ValueError):
@@ -293,7 +295,7 @@ class GDNFlatStatePagingGPUTest(unittest.TestCase):
         from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
             causal_conv1d_fn,
         )
-        from tokenspeed.runtime.layers.attention.linear.chunk import (
+        from tokenspeed.runtime.layers.attention.chunk import (
             chunk_gated_delta_rule,
         )
         from tokenspeed.runtime.layers.attention.linear.gdn import fused_gdn_gating
