@@ -140,7 +140,8 @@ private:
                                                       std::int32_t decode_reserve_tokens,
                                                       std::int32_t num_computed_tokens) const;
     bool flatAdmitDecode(Request* request) const;
-    std::optional<std::size_t> flatStarvationDeadlockRisk(const std::vector<Request*>& candidates) const;
+    bool flatPoolWedged(const std::vector<Request*>& candidates) const;
+    bool resolveFlatStarvation(const std::vector<Request*>& candidates);
 #endif
 
     void check_device_mem();
@@ -193,16 +194,16 @@ private:
     KvCacheCoordinator coordinator_;
     std::vector<std::string> flat_group_ids_;  // group_id per cache group, index-aligned to coordinator groups
     // ExtendResults the executor still owes per request (erased on Finish/Abort/PD-success); non-empty means
-    // an in-flight forward can still free pool pages, which the starvation-deadlock check keys off.
+    // an in-flight forward can still free pool pages, which flatPoolWedged keys off.
     std::unordered_map<std::string, std::int32_t> pending_forward_results_;
     // Reserve ledger: decode pages promised at admission but Acquired only at PrefillDone->Decoding; until
     // then they sit in the free count, so every flat gate subtracts OTHER requests' entries.
     std::unordered_map<std::string, std::int32_t> flat_reserved_pages_;
     // Flat retract requires TWO consecutive starved rounds (an in-flight Finish fakes one)
-    // before releasing a victim; see newForwardOperation.
+    // before releasing a victim; see resolveFlatStarvation.
     std::int32_t flat_starved_rounds_{0};
-    // Requests terminalized because they can never fit the pool (flat OOM, no victim to
-    // retract); drained into the next ExecutionPlan for the client layer to fail them.
+    // Requests terminalized as flat OOM (pool wedged by unretractable mid-prefill holders, no
+    // retract victim); drained into the next ExecutionPlan for the client layer to fail them.
     std::vector<std::string> flat_oom_request_ids_;
 
     struct FlatStoreTicket {

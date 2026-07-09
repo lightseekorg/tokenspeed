@@ -1496,7 +1496,7 @@ TEST(FlatRetractEvent, PrefillDoneVictimReleasesPagesAndRequeues) {
     // The last chunk's ExtendResult lands while still PrefillDone.
     request.Apply(fsm::ExtendResultEvent{"r1", {42}});
 
-    request.Apply(fsm::ScheduleFlatRetractEvent{&coordinator});
+    request.Apply(fsm::FlatRetractEvent{&coordinator});
     EXPECT_TRUE(request.Is<fsm::Submitted>());
     EXPECT_EQ(pool.NumFreeBlocks(), 8) << "the retract must release every page";
     EXPECT_EQ(request.TokenSize(), 5);

@@ -744,8 +744,8 @@ Finished AbortEvent::operator()(Retracted&&) {
 
 #if TOKENSPEED_FLAT_KVCACHE
 template <typename ForwardStateT>
-Submitted ScheduleFlatRetractEvent::applyRetract(ForwardStateT&& state) {
-    _assert(coordinator_ != nullptr, "ScheduleFlatRetractEvent: flat path requires a coordinator");
+Submitted FlatRetractEvent::applyRetract(ForwardStateT&& state) {
+    _assert(coordinator_ != nullptr, "FlatRetractEvent: flat path requires a coordinator");
     TokenContainer* token_container = state.GetTokenContainer();
     const std::int32_t page_size = state.GetPageSize();
     // Generated tokens rebase into the prefill window so the requeued prefill recomputes them.
@@ -755,11 +755,11 @@ Submitted ScheduleFlatRetractEvent::applyRetract(ForwardStateT&& state) {
     return Submitted{token_container, page_size};
 }
 
-Submitted ScheduleFlatRetractEvent::operator()(Decoding&& state) {
+Submitted FlatRetractEvent::operator()(Decoding&& state) {
     return applyRetract(std::move(state));
 }
 
-Submitted ScheduleFlatRetractEvent::operator()(PrefillDone&& state) {
+Submitted FlatRetractEvent::operator()(PrefillDone&& state) {
     return applyRetract(std::move(state));
 }
 #endif

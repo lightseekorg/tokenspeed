@@ -45,8 +45,9 @@ public:
 
     const std::vector<Operation>& Operations() const { return operations_; }
 
-    // Flat KV-cache: requests terminalized this round because their first chunk can never
-    // fit the pool (starvation with no retract victim). Always empty on the radix path.
+    // Flat KV-cache: requests terminalized this round as OOM -- the pool was wedged by
+    // unretractable mid-prefill holders (possibly the request itself, or a mutual wedge)
+    // with no Decoding/PrefillDone victim to retract. Always empty on the radix path.
     std::vector<std::string> flat_oom_request_ids;
 
 private:

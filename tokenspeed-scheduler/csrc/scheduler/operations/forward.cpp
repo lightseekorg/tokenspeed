@@ -118,6 +118,17 @@ std::int32_t FlatSlideCredit(const KvCacheCoordinator& coordinator, std::span<co
     return total_freed;
 }
 
+// Decoding/PrefillDone requests hold pool pages a flat retract can release.
+bool isFlatHolder(const Request* req) {
+    return req->Is<fsm::Decoding>() || req->Is<fsm::PrefillDone>();
+}
+
+// Deferred = schedulable states the forward loop skipped this round for lack of pool pages.
+bool isFlatDeferred(const Request* req) {
+    return isFlatHolder(req) || req->Is<fsm::Submitted>() || req->Is<fsm::PrefetchDone>() ||
+           req->Is<fsm::Prefilling>();
+}
+
 }  // namespace
 
 // One match, one hash pass at admission (vLLM V1 shape): the device match plus its host-tier
@@ -196,25 +207,62 @@ bool Scheduler::flatAdmitDecode(Request* request) const {
     return blocks_needed <= flatFreeBudget(request->Id()) + slide_credit;
 }
 
-// Deferred count when this round can never unwedge itself; fused-only (PD requests hold pages outside both ledgers).
-std::optional<std::size_t> Scheduler::flatStarvationDeadlockRisk(const std::vector<Request*>& candidates) const {
-    std::size_t deferred = 0;
-    for (const Request* req : candidates) {
-        if (req->Is<fsm::Submitted>() || req->Is<fsm::PrefetchDone>() || req->Is<fsm::Prefilling>() ||
-            req->Is<fsm::PrefillDone>() || req->Is<fsm::Decoding>()) {
-            ++deferred;
-        }
-    }
+// True when this round can never unwedge itself; fused-only (PD requests hold pages outside both ledgers).
+bool Scheduler::flatPoolWedged(const std::vector<Request*>& candidates) const {
+    const bool any_deferred = std::any_of(candidates.begin(), candidates.end(), isFlatDeferred);
     // Block 0 is the null placeholder, never allocated.
     const bool pool_pages_held = block_pool_.NumFreeBlocks() < block_pool_.TotalBlocks() - 1;
     // Both ledgers count: an in-flight D2H store OR H2D load (e.g. after an abort-during-load)
-    // still holds pool pages that its Done event will free.
+    // still holds pool pages that its Done event will free. Dispatched mid-prefill chunk ops are
+    // invisible here (they owe no ExtendResult) -- safe: their completion frees no pool pages and
+    // emits no event, and page reuse under a still-executing chunk is stream-ordering safe
+    // (forward_cache_ops.h).
     const bool nothing_in_flight = pending_forward_results_.empty() && cache_op_tracker_.empty() &&
                                    flat_store_ops_.Empty() && flat_load_ops_.empty();
-    if (config_.role != Role::kFused || deferred == 0 || !pool_pages_held || !nothing_in_flight) {
-        return std::nullopt;
+    return config_.role == Role::kFused && any_deferred && pool_pages_held && nothing_in_flight;
+}
+
+// Wedge resolution, escalating on the SECOND consecutive wedged round (an in-flight Finish fakes one):
+// flat-retract the largest Decoding/PrefillDone holder, or -- with no holder -- OOM-terminalize the
+// head-of-line deferred non-holder. Returns whether a retract/OOM action fired.
+bool Scheduler::resolveFlatStarvation(const std::vector<Request*>& candidates) {
+    if (!flatPoolWedged(candidates)) {
+        flat_starved_rounds_ = 0;
+        return false;
     }
-    return deferred;
+    if (++flat_starved_rounds_ < 2) {
+        return false;
+    }
+    flat_starved_rounds_ = 0;
+    std::vector<Request*> holders;
+    for (Request* req : candidates) {
+        if (isFlatHolder(req)) {
+            holders.push_back(req);
+        }
+    }
+    if (!holders.empty()) {
+        Request* victim =
+            *std::max_element(holders.begin(), holders.end(),
+                              [](const Request* a, const Request* b) { return a->TokenSize() < b->TokenSize(); });
+        flat_reserved_pages_.erase(victim->Id());
+        victim->Apply(fsm::FlatRetractEvent{&coordinator_});
+        spdlog::info("[Scheduler] flat retract: released request {} ({} tokens) to unwedge the pool", victim->Id(),
+                     victim->TokenSize());
+        return true;
+    }
+    // No retract victim: the pages are held mid-prefill (a wedged holder, or a mutual wedge among
+    // prefilling requests). Terminalize the head-of-line deferred non-holder to unwedge the pool.
+    for (Request* req : candidates) {
+        if (isFlatDeferred(req) && !isFlatHolder(req)) {
+            req->Apply(fsm::AbortEvent{&coordinator_});
+            flat_oom_request_ids_.push_back(req->Id());
+            spdlog::warn(
+                "[Scheduler] flat OOM: pool wedged by unretractable mid-prefill holders; terminalized request {}",
+                req->Id());
+            return true;
+        }
+    }
+    return false;
 }
 #endif
 
@@ -932,46 +980,9 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
     }
 
 #if TOKENSPEED_FLAT_KVCACHE
-    // Collective starvation: the pool is wedged and nothing in flight can free it. On the
-    // SECOND consecutive starved round (an in-flight Finish fakes one), flat retract fires:
-    // release the largest holder and requeue it as a fresh prefill. With no holder to
-    // release, the head-of-line deferred request can never fit -- terminalize it as OOM.
-    bool starved_this_round = false;
-    if (ops.empty() && !candidates.empty() && flatStarvationDeadlockRisk(candidates)) {
-        starved_this_round = ++flat_starved_rounds_ < 2;
-        if (!starved_this_round) {
-            std::vector<Request*> holders;
-            for (Request* req : candidates) {
-                if (req->Is<fsm::Decoding>() || req->Is<fsm::PrefillDone>()) {
-                    holders.push_back(req);
-                }
-            }
-            if (!holders.empty()) {
-                Request* victim = *std::max_element(
-                    holders.begin(), holders.end(),
-                    [](const Request* a, const Request* b) { return a->TokenSize() < b->TokenSize(); });
-                flat_reserved_pages_.erase(victim->Id());
-                victim->Apply(fsm::ScheduleFlatRetractEvent{&coordinator_});
-                spdlog::info("[Scheduler] flat retract: released request {} ({} tokens) to unwedge the pool",
-                             victim->Id(), victim->TokenSize());
-            } else {
-                // The pages are held by requests that cannot be retracted (mid-prefill), so
-                // the highest-priority deferred candidate is starving against an effectively
-                // unshrinkable pool: it can never fit.
-                for (Request* req : candidates) {
-                    if (req->Is<fsm::Submitted>() || req->Is<fsm::PrefetchDone>() || req->Is<fsm::Prefilling>()) {
-                        flat_reserved_pages_.erase(req->Id());
-                        req->Apply(fsm::AbortEvent{&coordinator_});
-                        flat_oom_request_ids_.push_back(req->Id());
-                        spdlog::warn("[Scheduler] flat OOM: request {} can never fit the pool; terminalized",
-                                     req->Id());
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    if (!starved_this_round) {
+    if (ops.empty()) {
+        resolveFlatStarvation(candidates);
+    } else {
         flat_starved_rounds_ = 0;
     }
 #else
