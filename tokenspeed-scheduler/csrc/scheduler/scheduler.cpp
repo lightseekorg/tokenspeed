@@ -64,7 +64,9 @@ Scheduler::Scheduler(SchedulerConfig config)
 #if TOKENSPEED_FLAT_KVCACHE
       ,
       block_pool_{config_.device_allocator.total_pages},
-      coordinator_{MakeCoordinator(MakeSpecsFromConfig(config_), block_pool_, config_.FlatStreamingSinkEnabled())},
+      flat_host_pool_{config_.FlatStreamingSinkEnabled() ? config_.host_allocator.total_pages : 1},
+      coordinator_{MakeCoordinator(MakeSpecsFromConfig(config_), block_pool_,
+                                   config_.FlatStreamingSinkEnabled() ? &flat_host_pool_ : nullptr)},
       flat_group_ids_{[&] {
           std::vector<std::string> ids;
           ids.reserve(config_.paged_cache_groups.size());
@@ -72,8 +74,7 @@ Scheduler::Scheduler(SchedulerConfig config)
               ids.push_back(g.group_id);
           }
           return ids;
-      }()},
-      flat_host_pool_{config_.FlatStreamingSinkEnabled() ? config_.host_allocator.total_pages : 1}
+      }()}
 #endif
 {
     if (auto* env = std::getenv("SPDLOG_LEVEL")) {

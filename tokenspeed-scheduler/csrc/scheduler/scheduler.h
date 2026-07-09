@@ -187,6 +187,9 @@ private:
 
 #if TOKENSPEED_FLAT_KVCACHE
     BlockPool block_pool_;
+    // Host tier = a second BlockPool, isomorphic to the device pool (block 0 is the null
+    // placeholder there too); the two differ only in which memory the ids index.
+    BlockPool flat_host_pool_;
     KvCacheCoordinator coordinator_;
     std::vector<std::string> flat_group_ids_;  // group_id per cache group, index-aligned to coordinator groups
     // ExtendResults the executor still owes per request (erased on Finish/Abort/PD-success); non-empty means
@@ -198,9 +201,6 @@ private:
     // The deadlock assert requires TWO starved rounds (an in-flight Finish fakes one); a Finish arriving
     // 2+ rounds late still trips it -- residual risk accepted until TODO(flat-retract).
     std::int32_t flat_starved_rounds_{0};
-    // Host tier = a second BlockPool, isomorphic to the device pool (block 0 is the null
-    // placeholder there too); the two differ only in which memory the ids index.
-    BlockPool flat_host_pool_;
 
     struct FlatStoreTicket {
         std::string key;

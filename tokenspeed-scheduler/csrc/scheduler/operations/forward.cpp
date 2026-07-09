@@ -99,7 +99,7 @@ std::int32_t FlatSlideCredit(const KvCacheCoordinator& coordinator, std::span<co
     for (std::int32_t i = 0; i < coordinator.NumGroups(); ++i) {
         total_freed += coordinator.GroupManager(i).BlocksReclaimableAt(
             tables[static_cast<std::size_t>(i)], num_computed_tokens,
-            /*count_uncached=*/!coordinator.CollectsStoreCandidates());
+            /*count_uncached=*/!coordinator.HasHostTier());
     }
     return total_freed;
 }
@@ -122,8 +122,7 @@ Scheduler::FlatAdmissionMatch Scheduler::matchFlatPrefixAtAdmission(Request* req
     }
     const std::vector<std::string> flat_hashes = ComputePagedHashes(paged_tokens, "");
     FlatAdmissionMatch match;
-    auto [device, host] =
-        coordinator_.MatchPrefix(flat_hashes, config_.FlatStreamingSinkEnabled() ? &flat_host_pool_ : nullptr);
+    auto [device, host] = coordinator_.MatchPrefix(flat_hashes);
     match.device = std::move(device);
     match.host = std::move(host);
     // Boundaries are in tokens; the extension hash offsets are in scheduler pages (uniform P,

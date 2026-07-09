@@ -31,8 +31,8 @@
 namespace tokenspeed {
 
 KvCacheCoordinator::KvCacheCoordinator(std::vector<CacheGroup> groups, BlockPool& pool,
-                                       bool collect_store_candidates)
-    : groups_{std::move(groups)}, pool_{pool}, collect_store_candidates_{collect_store_candidates} {
+                                       const BlockPool* host_pool)
+    : groups_{std::move(groups)}, pool_{pool}, host_pool_{host_pool} {
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         if (groups_[i].Manager().MatchIsPrefixClosed()) {
             match_order_.push_back(i);
@@ -141,13 +141,13 @@ CoordinatorMatch KvCacheCoordinator::matchTierWithKeys(const BlockPool& pool,
 }
 
 KvCacheCoordinator::AdmissionMatch KvCacheCoordinator::MatchPrefix(
-    std::span<const std::string> content_hashes, const BlockPool* host_pool) const {
+    std::span<const std::string> content_hashes) const {
     const std::vector<std::vector<std::string>> group_keys = buildGroupKeys(content_hashes);
     const std::int32_t total_blocks = static_cast<std::int32_t>(content_hashes.size());
     AdmissionMatch out;
     out.device = matchTierWithKeys(pool_, group_keys, total_blocks, /*floor_tokens=*/0);
-    if (host_pool != nullptr) {
-        out.host = matchTierWithKeys(*host_pool, group_keys, total_blocks,
+    if (host_pool_ != nullptr) {
+        out.host = matchTierWithKeys(*host_pool_, group_keys, total_blocks,
                                      /*floor_tokens=*/out.device.num_common_tokens);
     }
     return out;
@@ -232,7 +232,7 @@ void KvCacheCoordinator::CacheFullBlocks(std::span<BlockTable> tables,
         std::vector<std::string> keys = keysForGroup(content_hashes, groups_[i].GroupId());
         std::vector<std::pair<std::string, CacheBlock*>> newly_cached;
         groups_[i].Manager().CacheFullBlocks(pool_, tables[i], keys, first_slot,
-                                             collect_store_candidates_ ? &newly_cached : nullptr);
+                                             host_pool_ != nullptr ? &newly_cached : nullptr);
         for (auto& [key, block] : newly_cached) {
             pending_stores_.push_back(StoreCandidate{std::move(key), BlockRef::Share(pool_, block)});
         }
@@ -254,7 +254,7 @@ void KvCacheCoordinator::Free(std::span<BlockTable> tables) {
 }
 
 KvCacheCoordinator MakeCoordinator(std::span<const KvCacheSpec> specs, BlockPool& pool,
-                                   bool collect_store_candidates) {
+                                   const BlockPool* host_pool) {
     _assert(!specs.empty(), "MakeCoordinator requires at least one spec");
     std::int32_t page_size = specs[0].page_size;
     std::vector<CacheGroup> groups;
@@ -273,7 +273,7 @@ KvCacheCoordinator MakeCoordinator(std::span<const KvCacheSpec> specs, BlockPool
         }
         groups.emplace_back(spec, static_cast<std::uint32_t>(i), std::move(manager));
     }
-    return KvCacheCoordinator{std::move(groups), pool, collect_store_candidates};
+    return KvCacheCoordinator{std::move(groups), pool, host_pool};
 }
 
 }  // namespace tokenspeed

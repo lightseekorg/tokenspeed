@@ -823,7 +823,8 @@ TEST(KvCacheCoordinatorStoreCandidates, CollectsPinnedNewRegistrations) {
         KvCacheSpec{AttnKind::kFull, /*page_size=*/2, /*sliding_window=*/0},
         KvCacheSpec{AttnKind::kSlidingWindow, /*page_size=*/2, /*sliding_window=*/4},
     };
-    KvCacheCoordinator coordinator = MakeCoordinator(specs, pool, /*collect_store_candidates=*/true);
+    BlockPool host_pool(4);
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, pool, &host_pool);
     std::vector<BlockTable> tables(coordinator.NumGroups());
     ASSERT_TRUE(coordinator.Acquire(tables, /*num_tokens=*/4));
     std::vector<std::string> hashes = ContentHashes({{1, 2}, {3, 4}});
@@ -879,7 +880,7 @@ std::int32_t SlideCredit(const KvCacheCoordinator& coord, std::span<const BlockT
     for (std::int32_t i = 0; i < coord.NumGroups(); ++i) {
         total_freed += coord.GroupManager(i).BlocksReclaimableAt(
             tables[static_cast<std::size_t>(i)], num_computed_tokens,
-            /*count_uncached=*/!coord.CollectsStoreCandidates());
+            /*count_uncached=*/!coord.HasHostTier());
     }
     return total_freed;
 }
@@ -898,7 +899,8 @@ TEST(KvCacheCoordinatorStoreCandidates, SlideCreditExcludesUncachedOnlyWhenColle
     EXPECT_EQ(SlideCredit(off, tables, 8), 2) << "collection-off counts uncached ref-1 blocks";
     off.Free(tables);
 
-    KvCacheCoordinator on = MakeCoordinator(specs, pool, /*collect_store_candidates=*/true);
+    BlockPool host_pool(4);
+    KvCacheCoordinator on = MakeCoordinator(specs, pool, &host_pool);
     std::vector<BlockTable> tables2(on.NumGroups());
     ASSERT_TRUE(on.Acquire(tables2, 8));
     EXPECT_EQ(SlideCredit(on, tables2, 8), 0) << "collection-on excludes uncached slide-out blocks";
@@ -940,16 +942,16 @@ std::vector<KvCacheSpec> HostExtSpecs() {
 TEST(KvCacheCoordinatorHostExtension, BothGroupsFullyPresent) {
     BlockPool pool(16, true);
     std::vector<KvCacheSpec> specs = HostExtSpecs();
-    KvCacheCoordinator coord = MakeCoordinator(specs, pool);
+    BlockPool host_pool(6);
+    KvCacheCoordinator coord = MakeCoordinator(specs, pool, &host_pool);
     std::vector<std::string> ch = ContentHashes({{0, 0}, {1, 1}, {2, 2}, {3, 3}});
 
-    BlockPool host_pool(6);
     std::vector<CacheBlock*> fp, sp;
     for (int j = 1; j <= 3; ++j) fp.push_back(HostPut(host_pool, ch[static_cast<std::size_t>(j)], 0));
     for (int j = 2; j <= 3; ++j) sp.push_back(HostPut(host_pool, ch[static_cast<std::size_t>(j)], 1));
 
     SeedDeviceFloor(pool, coord, ch, 1);
-    CoordinatorMatch m = coord.MatchPrefix(ch, &host_pool).host;
+    CoordinatorMatch m = coord.MatchPrefix(ch).host;
     EXPECT_EQ(m.num_common_tokens, 8);  // boundary 4 blocks * P=2 (floor 1 + extension 3)
     ASSERT_EQ(m.per_group.size(), 2u);
     EXPECT_EQ(m.per_group[0].blocks, (std::vector<CacheBlock*>{fp[0], fp[1], fp[2]}));
@@ -964,16 +966,16 @@ TEST(KvCacheCoordinatorHostExtension, SwaTailMissShrinksBoundary) {
     // ext = 2, swa start = max(1, 3-2) = 1 = dev -> no holes; full's block-3 page stays unpinned.
     BlockPool pool(16, true);
     std::vector<KvCacheSpec> specs = HostExtSpecs();
-    KvCacheCoordinator coord = MakeCoordinator(specs, pool);
+    BlockPool host_pool(6);
+    KvCacheCoordinator coord = MakeCoordinator(specs, pool, &host_pool);
     std::vector<std::string> ch = ContentHashes({{0, 0}, {1, 1}, {2, 2}, {3, 3}});
 
-    BlockPool host_pool(6);
     std::vector<CacheBlock*> fp, sp;
     for (int j = 1; j <= 3; ++j) fp.push_back(HostPut(host_pool, ch[static_cast<std::size_t>(j)], 0));
     for (int j = 1; j <= 2; ++j) sp.push_back(HostPut(host_pool, ch[static_cast<std::size_t>(j)], 1));
 
     SeedDeviceFloor(pool, coord, ch, 1);
-    CoordinatorMatch m = coord.MatchPrefix(ch, &host_pool).host;
+    CoordinatorMatch m = coord.MatchPrefix(ch).host;
     EXPECT_EQ(m.num_common_tokens, 6);  // boundary 3 blocks * P=2 (floor 1 + extension 2)
     ASSERT_EQ(m.per_group.size(), 2u);
     EXPECT_EQ(m.per_group[0].blocks, (std::vector<CacheBlock*>{fp[0], fp[1]}));
@@ -986,17 +988,17 @@ TEST(KvCacheCoordinatorHostExtension, FullGapCapsExtension) {
     // ext = 1, both groups = {block-1 page}, 2 pins -- swa's deeper blocks 2..3 stay unused.
     BlockPool pool(16, true);
     std::vector<KvCacheSpec> specs = HostExtSpecs();
-    KvCacheCoordinator coord = MakeCoordinator(specs, pool);
+    BlockPool host_pool(6);
+    KvCacheCoordinator coord = MakeCoordinator(specs, pool, &host_pool);
     std::vector<std::string> ch = ContentHashes({{0, 0}, {1, 1}, {2, 2}, {3, 3}});
 
-    BlockPool host_pool(6);
     CacheBlock* fp1 = HostPut(host_pool, ch[1], 0);
     (void)HostPut(host_pool, ch[3], 0);  // gap at block 2
     std::vector<CacheBlock*> sp;
     for (int j = 1; j <= 3; ++j) sp.push_back(HostPut(host_pool, ch[static_cast<std::size_t>(j)], 1));
 
     SeedDeviceFloor(pool, coord, ch, 1);
-    CoordinatorMatch m = coord.MatchPrefix(ch, &host_pool).host;
+    CoordinatorMatch m = coord.MatchPrefix(ch).host;
     EXPECT_EQ(m.num_common_tokens, 4);  // boundary 2 blocks * P=2 (floor 1 + extension 1)
     ASSERT_EQ(m.per_group.size(), 2u);
     EXPECT_EQ(m.per_group[0].blocks, (std::vector<CacheBlock*>{fp1}));
@@ -1006,12 +1008,12 @@ TEST(KvCacheCoordinatorHostExtension, FullGapCapsExtension) {
 TEST(KvCacheCoordinatorHostExtension, EmptyStoreZeroExtension) {
     BlockPool pool(16, true);
     std::vector<KvCacheSpec> specs = HostExtSpecs();
-    KvCacheCoordinator coord = MakeCoordinator(specs, pool);
+    BlockPool host_pool(5);
+    KvCacheCoordinator coord = MakeCoordinator(specs, pool, &host_pool);
     std::vector<std::string> ch = ContentHashes({{0, 0}, {1, 1}, {2, 2}, {3, 3}});
 
-    BlockPool host_pool(5);
     SeedDeviceFloor(pool, coord, ch, 1);
-    CoordinatorMatch m = coord.MatchPrefix(ch, &host_pool).host;
+    CoordinatorMatch m = coord.MatchPrefix(ch).host;
     EXPECT_EQ(m.num_common_tokens, 2) << "no extension: boundary stays at the device floor";
     ASSERT_EQ(m.per_group.size(), 2u);
     EXPECT_TRUE(m.per_group[0].blocks.empty());
@@ -1022,17 +1024,17 @@ TEST(KvCacheCoordinatorHostExtension, DeviceBoundaryRespected) {
     // Host holds only blocks 0..1 (below dev=2): zero extension, and those entries stay unpinned.
     BlockPool pool(16, true);
     std::vector<KvCacheSpec> specs = HostExtSpecs();
-    KvCacheCoordinator coord = MakeCoordinator(specs, pool);
+    BlockPool host_pool(5);
+    KvCacheCoordinator coord = MakeCoordinator(specs, pool, &host_pool);
     std::vector<std::string> ch = ContentHashes({{0, 0}, {1, 1}, {2, 2}, {3, 3}});
 
-    BlockPool host_pool(5);
     for (int j = 0; j <= 1; ++j) {
         (void)HostPut(host_pool, ch[static_cast<std::size_t>(j)], 0);
         (void)HostPut(host_pool, ch[static_cast<std::size_t>(j)], 1);
     }
 
     SeedDeviceFloor(pool, coord, ch, 2);
-    CoordinatorMatch m = coord.MatchPrefix(ch, &host_pool).host;
+    CoordinatorMatch m = coord.MatchPrefix(ch).host;
     EXPECT_EQ(m.num_common_tokens, 4) << "below-floor host pages extend nothing";
     // The below-dev entries were never probed: all four stay evictable.
     EXPECT_EQ(host_pool.NumPinnedCachedBlocks(), 0);
@@ -1042,15 +1044,15 @@ TEST(KvCacheCoordinatorHostExtension, DeviceBoundaryRespected) {
 TEST(KvCacheCoordinatorHostExtension, MatchTakesNoRefsAndLeavesPagesEvictable) {
     BlockPool pool(16, true);
     std::vector<KvCacheSpec> specs = HostExtSpecs();
-    KvCacheCoordinator coord = MakeCoordinator(specs, pool);
+    BlockPool host_pool(6);
+    KvCacheCoordinator coord = MakeCoordinator(specs, pool, &host_pool);
     std::vector<std::string> ch = ContentHashes({{0, 0}, {1, 1}, {2, 2}, {3, 3}});
 
-    BlockPool host_pool(6);
     for (int j = 1; j <= 3; ++j) (void)HostPut(host_pool, ch[static_cast<std::size_t>(j)], 0);
     for (int j = 2; j <= 3; ++j) (void)HostPut(host_pool, ch[static_cast<std::size_t>(j)], 1);
 
     SeedDeviceFloor(pool, coord, ch, 1);
-    CoordinatorMatch m = coord.MatchPrefix(ch, &host_pool).host;
+    CoordinatorMatch m = coord.MatchPrefix(ch).host;
     EXPECT_EQ(m.num_common_tokens, 8);
     // Matching is read-only on both tiers: pins are taken only when the load ticket is built
     // (safe because the sink drain -- the only host evictor -- runs after op building).
@@ -1068,7 +1070,8 @@ TEST(KvCacheCoordinatorHostExtension, DeepCascadeConverges) {
         {AttnKind::kSlidingWindow, 4, 10},
         {AttnKind::kSlidingWindow, 4, 10},
     };
-    KvCacheCoordinator coord = MakeCoordinator(specs, pool);
+    BlockPool host_pool(32);
+    KvCacheCoordinator coord = MakeCoordinator(specs, pool, &host_pool);
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0},
                                                  {1, 1, 1, 1},
                                                  {2, 2, 2, 2},
@@ -1078,12 +1081,11 @@ TEST(KvCacheCoordinatorHostExtension, DeepCascadeConverges) {
                                                  {6, 6, 6, 6},
                                                  {7, 7, 7, 7}});
 
-    BlockPool host_pool(32);
     for (int j = 0; j <= 7; ++j) (void)HostPut(host_pool, ch[static_cast<std::size_t>(j)], 0);
     for (int j : {0, 1, 2, 4, 5, 6}) (void)HostPut(host_pool, ch[static_cast<std::size_t>(j)], 1);
     for (int j : {0, 1, 3, 4, 5}) (void)HostPut(host_pool, ch[static_cast<std::size_t>(j)], 2);
 
-    CoordinatorMatch m = coord.MatchPrefix(ch, &host_pool).host;
+    CoordinatorMatch m = coord.MatchPrefix(ch).host;
     EXPECT_EQ(m.num_common_tokens, 8);  // boundary 2 blocks * P=4 (floor 0)
     ASSERT_EQ(m.per_group.size(), 3u);
     for (std::size_t i = 0; i < 3; ++i) {
@@ -1104,17 +1106,17 @@ TEST(KvCacheCoordinatorHostExtension, MultiWindowGroupsExtendTogether) {
         {AttnKind::kSlidingWindow, 2, 6},
         {AttnKind::kSlidingWindow, 2, 2},
     };
-    KvCacheCoordinator coord = MakeCoordinator(specs, pool);
+    BlockPool host_pool(16);
+    KvCacheCoordinator coord = MakeCoordinator(specs, pool, &host_pool);
     std::vector<std::string> ch = ContentHashes({{0, 0}, {1, 1}, {2, 2}, {3, 3}, {4, 4}, {5, 5}});
 
-    BlockPool host_pool(16);
     std::vector<CacheBlock*> fp, ap;
     for (int j = 1; j <= 4; ++j) fp.push_back(HostPut(host_pool, ch[static_cast<std::size_t>(j)], 0));
     for (int j = 2; j <= 4; ++j) ap.push_back(HostPut(host_pool, ch[static_cast<std::size_t>(j)], 1));
     CacheBlock* bp4 = HostPut(host_pool, ch[4], 2);
 
     SeedDeviceFloor(pool, coord, ch, 1);
-    CoordinatorMatch m = coord.MatchPrefix(ch, &host_pool).host;
+    CoordinatorMatch m = coord.MatchPrefix(ch).host;
     EXPECT_EQ(m.num_common_tokens, 10);  // boundary 5 blocks * P=2 (floor 1 + extension 4)
     ASSERT_EQ(m.per_group.size(), 3u);
     EXPECT_EQ(m.per_group[0].blocks, (std::vector<CacheBlock*>{fp[0], fp[1], fp[2], fp[3]}));
@@ -1135,16 +1137,16 @@ TEST(KvCacheCoordinatorHostExtension, MultiWindowCascadeConvergesToZeroExtension
         {AttnKind::kSlidingWindow, 2, 6},
         {AttnKind::kSlidingWindow, 2, 2},
     };
-    KvCacheCoordinator coord = MakeCoordinator(specs, pool);
+    BlockPool host_pool(16);
+    KvCacheCoordinator coord = MakeCoordinator(specs, pool, &host_pool);
     std::vector<std::string> ch = ContentHashes({{0, 0}, {1, 1}, {2, 2}, {3, 3}, {4, 4}, {5, 5}});
 
-    BlockPool host_pool(16);
     for (int j = 1; j <= 4; ++j) (void)HostPut(host_pool, ch[static_cast<std::size_t>(j)], 0);
     for (int j = 2; j <= 4; ++j) (void)HostPut(host_pool, ch[static_cast<std::size_t>(j)], 1);
     (void)HostPut(host_pool, ch[3], 2);
 
     SeedDeviceFloor(pool, coord, ch, 1);
-    CoordinatorMatch m = coord.MatchPrefix(ch, &host_pool).host;
+    CoordinatorMatch m = coord.MatchPrefix(ch).host;
     EXPECT_EQ(m.num_common_tokens, 2) << "extension converges to zero: boundary = device floor";
     for (const PrefixMatch& g : m.per_group) {
         EXPECT_TRUE(g.blocks.empty());
@@ -1243,16 +1245,16 @@ TEST(MambaAnalogTest, HostTierStoresAndMatchesTheSnapshotOnly) {
         {AttnKind::kFull, 4, 0},
         {AttnKind::kSlidingWindow, 4, 5},
     };
-    KvCacheCoordinator coord = MakeCoordinator(specs, pool);
+    BlockPool host_pool(8);
+    KvCacheCoordinator coord = MakeCoordinator(specs, pool, &host_pool);
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}});
 
-    BlockPool host_pool(8);
     std::vector<CacheBlock*> fp;
     for (int j = 1; j <= 3; ++j) fp.push_back(HostPut(host_pool, ch[static_cast<std::size_t>(j)], 0));
     CacheBlock* snapshot = HostPut(host_pool, ch[3], 1);  // ONLY the boundary snapshot
 
     SeedDeviceFloor(pool, coord, ch, 1);
-    CoordinatorMatch m = coord.MatchPrefix(ch, &host_pool).host;
+    CoordinatorMatch m = coord.MatchPrefix(ch).host;
     EXPECT_EQ(m.num_common_tokens, 16);  // boundary 4 blocks * P=4 (floor 1 + extension 3)
     EXPECT_EQ(m.per_group[0].blocks, (std::vector<CacheBlock*>{fp[0], fp[1], fp[2]}));
     EXPECT_EQ(m.per_group[1].blocks,

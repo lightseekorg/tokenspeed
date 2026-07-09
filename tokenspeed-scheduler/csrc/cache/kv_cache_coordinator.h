@@ -44,8 +44,8 @@ struct CoordinatorMatch {
 // state; the only cross-round mutable state is the streaming-sink mailbox, drained every round.
 class KvCacheCoordinator {
 public:
-    // collect_store_candidates is fixed at construction: on, CacheFullBlocks feeds the sink mailbox.
-    KvCacheCoordinator(std::vector<CacheGroup> groups, BlockPool& pool, bool collect_store_candidates = false);
+    // The host tier is fixed at construction: bound, CacheFullBlocks feeds the sink mailbox.
+    KvCacheCoordinator(std::vector<CacheGroup> groups, BlockPool& pool, const BlockPool* host_pool = nullptr);
 
     std::int32_t NumGroups() const { return static_cast<std::int32_t>(groups_.size()); }
 
@@ -54,15 +54,13 @@ public:
         return groups_[static_cast<std::size_t>(i)].Manager();
     }
 
-    // The admission entry: the device match, plus the host-tier match above the device boundary
-    // when a host pool is supplied. Both tiers are read-only -- pinning happens where the load
-    // ticket is built, before the sink drain (the only host-pool evictor) can run.
+    // The admission entry: the device match, plus the host-tier match above the device boundary when a
+    // host tier is bound. Read-only -- pinning happens at load-ticket build, before the sink drain evicts.
     struct AdmissionMatch {
         CoordinatorMatch device;
         CoordinatorMatch host;
     };
-    AdmissionMatch MatchPrefix(std::span<const std::string> content_hashes,
-                               const BlockPool* host_pool = nullptr) const;
+    AdmissionMatch MatchPrefix(std::span<const std::string> content_hashes) const;
 
     // Pure claim into fresh tables, never fails; a non-empty per_group must be sized to the group count.
     void ClaimCommonPrefix(std::span<BlockTable> tables, const CoordinatorMatch& hit);
@@ -92,8 +90,8 @@ public:
         BlockRef block;   // pinned (Share) until WriteBackDone or a drain-time drop releases the ref
     };
     std::vector<StoreCandidate> TakePendingStores() { return std::exchange(pending_stores_, {}); }
-    // Collection pins what registration touches, so the slide credit flips count_uncached on this.
-    bool CollectsStoreCandidates() const { return collect_store_candidates_; }
+    // Collection/pinning follows host-tier presence, so the slide credit flips count_uncached on this.
+    bool HasHostTier() const { return host_pool_ != nullptr; }
 
 private:
     std::vector<std::string> keysForGroup(std::span<const std::string> content_hashes,
@@ -106,12 +104,12 @@ private:
     // Closed groups first, so non-closed groups match against a settled bound. 
     std::vector<std::size_t> match_order_;
     BlockPool& pool_;
-    bool collect_store_candidates_;
+    const BlockPool* host_pool_{nullptr};
     std::vector<StoreCandidate> pending_stores_;
 };
 
 // One CacheGroup per spec (group_id = index); asserts every spec shares the same page_size.
 KvCacheCoordinator MakeCoordinator(std::span<const KvCacheSpec> specs, BlockPool& pool,
-                                   bool collect_store_candidates = false);
+                                   const BlockPool* host_pool = nullptr);
 
 }  // namespace tokenspeed
