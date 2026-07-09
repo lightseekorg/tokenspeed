@@ -3228,9 +3228,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         if within_kv:
                             if cute.elem_less(cutlass.Int32(-1), cm_idx):
                                 if cute.elem_less(cm_idx, common_params.cmask_len):
-                                    cm_keep = cute.elem_less(
-                                        cutlass.Int32(0),
-                                        cutlass.Int32(common_params.cmask[cm_idx]),
+                                    cm_keep = (
+                                        cutlass.Int32(common_params.cmask[cm_idx])
+                                        != cutlass.Int32(0)
                                     )
                                     tTR_rAcc[i] = (
                                         tTR_rAcc[i]
@@ -3338,9 +3338,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         if within_kv:
                             if cute.elem_less(cutlass.Int32(-1), cm_idx):
                                 if cute.elem_less(cm_idx, common_params.cmask_len):
-                                    cm_keep = cute.elem_less(
-                                        cutlass.Int32(0),
-                                        cutlass.Int32(common_params.cmask[cm_idx]),
+                                    cm_keep = (
+                                        cutlass.Int32(common_params.cmask[cm_idx])
+                                        != cutlass.Int32(0)
                                     )
                                     tTR_rAcc[i] = (
                                         tTR_rAcc[i]
