@@ -80,7 +80,13 @@ class RequestOutputCollector:
         self._pending_owned = False
         return output
 
-    def put(self, output: dict[str, Any], *, stream: bool) -> None:
+    def put(
+        self,
+        output: dict[str, Any],
+        *,
+        stream: bool,
+        output_ids_are_delta: bool = False,
+    ) -> None:
         if self._pending is None or not stream:
             self._pending = output
             self._pending_owned = False
@@ -88,9 +94,11 @@ class RequestOutputCollector:
         if not self._pending_owned:
             self._pending = self._clone_for_merge(self._pending)
             self._pending_owned = True
-        self._merge_into_pending(output)
+        self._merge_into_pending(output, output_ids_are_delta=output_ids_are_delta)
 
-    def _merge_into_pending(self, output: dict[str, Any]) -> None:
+    def _merge_into_pending(
+        self, output: dict[str, Any], *, output_ids_are_delta: bool
+    ) -> None:
         pending = self._pending
         if pending is None:
             raise RuntimeError("Cannot merge output without a pending value.")
@@ -113,7 +121,10 @@ class RequestOutputCollector:
         if output_kind == "text" and "text" in output:
             pending["text"] = output["text"]
 
-        self._extend_sequence(pending, "output_ids", output.get("output_ids"))
+        merge_output_ids = (
+            self._append_sequence if output_ids_are_delta else self._extend_sequence
+        )
+        merge_output_ids(pending, "output_ids", output.get("output_ids"))
 
         if "output_multi_ids" in pending or "output_multi_ids" in output:
             self._extend_sequence(
@@ -144,6 +155,16 @@ class RequestOutputCollector:
                     pending[key] = (pending.get(key) or 0.0) + value
                 continue
             pending[key] = value
+
+    def _append_sequence(self, container: dict[str, Any], key: str, value: Any) -> None:
+        """Append an unambiguously delta-valued output sequence."""
+        if value is None:
+            return
+        existing = container.get(key)
+        if existing is None:
+            container[key] = list(value)
+        else:
+            existing.extend(value)
 
     def _extend_sequence(self, container: dict[str, Any], key: str, value: Any) -> None:
         if value is None:

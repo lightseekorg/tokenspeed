@@ -572,8 +572,8 @@ class BatchTokenIDOut:
     decoded_texts: list[str]
     decode_ids: list[list[int]]
     read_offsets: list[int]
-    # Only used when `--skip-tokenizer-init` is on
-    output_ids: list[int] | None
+    # Per-request sampled-token deltas generated since the previous frame
+    output_ids: list[list[int]]
     output_multi_ids: list[int] | None
     # Detokenization configs
     skip_special_tokens: list[bool]

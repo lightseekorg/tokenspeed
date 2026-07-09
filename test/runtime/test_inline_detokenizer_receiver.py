@@ -146,7 +146,7 @@ def _batch_token_id_out(
     """Build a ``BatchTokenIDOut`` with safe defaults."""
     n = len(rids)
     defaults: Dict[str, Any] = {
-        "output_ids": None,
+        "output_ids": [list(ids) for ids in decode_ids],
         "output_multi_ids": None,
         "prompt_tokens": [0] * n,
         "completion_tokens": [0] * n,
@@ -238,9 +238,8 @@ class TestFlagOffRegression(unittest.TestCase):
     the flag off, the inline helper is never invoked and no
     ``inline_detokenizer`` is lazily created on the request state.
 
-    (The pre-existing raw-token path for ``--skip-tokenizer-init`` requires
-    ``recv_obj.output_ids`` to be populated by the scheduler; we don't
-    exercise that path here — it isn't changed by this PR.)
+    The raw-token path requires ``recv_obj.output_ids`` to be populated by
+    the scheduler.
     """
 
     def test_flag_off_receiver_does_not_take_inline_branch(self):
@@ -272,6 +271,29 @@ class TestFlagOffRegression(unittest.TestCase):
         self.assertEqual(out["meta_info"]["accept_draft_tokens"], 1.5)
         self.assertIsNone(state.inline_detokenizer)
         self.assertEqual(state.text, "")
+
+    def test_raw_token_stream_coalesces_cumulative_output_ids(self):
+        tok = _gpt2_tokenizer()
+        mgr = _StubTokenizerManager(
+            tok,
+            enable_inline_detokenizer=False,
+            stream_output=False,
+        )
+        state = _mk_state(stream=True, rid="r1")
+        _register(mgr, state)
+
+        for output_ids in ([1], [2]):
+            mgr.output_processor.handle_batch_output(
+                _batch_token_id_out(
+                    ["r1"],
+                    decode_ids=[output_ids],
+                    output_ids=[output_ids],
+                )
+            )
+
+        out = state.collector.take()
+        self.assertEqual(out["output_ids"], [1, 2])
+        self.assertEqual(state.output_ids, [1, 2])
 
 
 # ---------------------------------------------------------------------------
@@ -421,6 +443,47 @@ class TestOutputIdsShape(unittest.TestCase):
         # Full copy every frame in non-stream mode.
         self.assertEqual(out1["output_ids"], ids_a)
         self.assertEqual(out2["output_ids"], ids_a + ids_b)
+
+    def test_inline_prefers_output_ids_over_decode_context(self):
+        mgr = _StubTokenizerManager(self.tok, enable_inline_detokenizer=True)
+        state = _mk_state(stream=True, rid="r1")
+        _register(mgr, state)
+
+        prompt_tail_ids = self.tok.encode("prompt tail")
+        output_ids = self.tok.encode(" answer")
+        recv = _batch_token_id_out(
+            ["r1"],
+            decode_ids=[prompt_tail_ids + output_ids],
+            decoded_texts=[""],
+            read_offsets=[len(prompt_tail_ids)],
+            output_ids=[output_ids],
+            finished_reasons=[{"type": "stop", "matched": None}],
+        )
+
+        mgr.output_processor.handle_batch_output(recv)
+        out = state.collector.take()
+
+        self.assertEqual(out["text"], self.tok.decode(output_ids))
+        self.assertEqual(out["output_ids"], output_ids)
+        self.assertEqual(state.output_ids, output_ids)
+
+    def test_stream_mode_coalesces_repeated_output_id_deltas(self):
+        mgr = _StubTokenizerManager(self.tok, enable_inline_detokenizer=True)
+        state = _mk_state(stream=True, rid="r1")
+        _register(mgr, state)
+
+        token_id = self.tok.encode(" hello")[0]
+        for _ in range(2):
+            mgr.output_processor.handle_batch_output(
+                _batch_token_id_out(
+                    ["r1"],
+                    decode_ids=[[token_id]],
+                    output_ids=[[token_id]],
+                )
+            )
+
+        out = state.collector.take()
+        self.assertEqual(out["output_ids"], [token_id, token_id])
 
 
 # ---------------------------------------------------------------------------

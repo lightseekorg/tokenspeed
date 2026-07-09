@@ -167,6 +167,7 @@ class OutputProcessor:
             if getattr(recv_obj, "output_hidden_states", None):
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
 
+            output_ids_are_delta = False
             if isinstance(recv_obj, BatchStrOut):
                 if len(recv_obj.batch_accept_draft_tokens) > 0:
                     meta_info.update(
@@ -174,6 +175,7 @@ class OutputProcessor:
                     )
                 state.text += recv_obj.output_strs[i]
                 if state.obj.stream:
+                    output_ids_are_delta = True
                     state.logprobs_info = logprobs_info
                     state.output_ids.extend(recv_obj.output_ids[i])
                     output_token_ids = state.output_ids[state.last_output_offset :]
@@ -224,13 +226,14 @@ class OutputProcessor:
                         )
                     state.text += incremental_emit
                     if state.obj.stream:
+                        output_ids_are_delta = True
                         state.logprobs_info = logprobs_info
-                        state.output_ids.extend(recv_obj.decode_ids[i])
+                        state.output_ids.extend(recv_obj.output_ids[i])
                         output_token_ids = state.output_ids[state.last_output_offset :]
                         state.last_output_offset = len(state.output_ids)
                     else:
                         state.logprobs_info.update(logprobs_info)
-                        state.output_ids.extend(recv_obj.decode_ids[i])
+                        state.output_ids.extend(recv_obj.output_ids[i])
                         output_token_ids = state.output_ids.copy()
 
                     out_dict = {
@@ -262,6 +265,7 @@ class OutputProcessor:
 
                     output_multi_ids = None
                     if self.engine.server_args.stream_output and state.obj.stream:
+                        output_ids_are_delta = True
                         state.output_ids.extend(recv_obj.output_ids[i])
                         output_token_ids = state.output_ids[state.last_output_offset :]
                         if recv_obj.output_multi_ids is not None:
@@ -307,7 +311,9 @@ class OutputProcessor:
                 meta_info["e2e_latency"] = state.finished_time - state.created_time
 
             state.collector.put(
-                out_dict, stream=bool(getattr(state.obj, "stream", False))
+                out_dict,
+                stream=bool(getattr(state.obj, "stream", False)),
+                output_ids_are_delta=output_ids_are_delta,
             )
             state.event.set()
 
