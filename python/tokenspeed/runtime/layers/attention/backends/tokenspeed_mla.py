@@ -433,6 +433,7 @@ class CuteDSLMLABackend(AttentionBackend):
         token_to_kv_pool,
         bs: int,
         save_kv_cache: bool = True,
+        spec_info=None,
         **kwargs,
     ) -> torch.Tensor:
         # q is whole Q [T, H, head_dim]; k is whole latent [T, 1, head_dim].
@@ -478,6 +479,16 @@ class CuteDSLMLABackend(AttentionBackend):
             query.device, layer.tp_q_head_num, self.kv_lora_rank, query.shape[1]
         )
 
+        custom_mask = kwargs.get("custom_mask")
+        cmask_off = kwargs.get("cmask_off")
+        if spec_info is not None:
+            if custom_mask is None:
+                custom_mask = getattr(spec_info, "custom_mask", None)
+            if cmask_off is None:
+                cmask_off = getattr(spec_info, "cmask_off", None)
+                if cmask_off is None:
+                    cmask_off = getattr(spec_info, "custom_mask_offsets", None)
+
         raw_out = tokenspeed_mla_decode(
             query=query,
             kv_cache=kv_cache,
@@ -489,6 +500,8 @@ class CuteDSLMLABackend(AttentionBackend):
             max_seq_len=metadata.max_seq_len_k,
             softmax_scale=softmax_scale,
             enable_pdl=pdl_enabled(),
+            custom_mask=custom_mask,
+            cmask_off=cmask_off,
         )
 
         return raw_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
