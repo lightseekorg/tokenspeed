@@ -265,6 +265,9 @@ KvCacheCoordinator MakeCoordinator(std::span<const KvCacheSpec> specs, BlockPool
         std::unique_ptr<KvCacheManager> manager;
         if (spec.kind == AttnKind::kFull) {
             manager = std::make_unique<FullAttnManager>(spec.page_size);
+        } else if (spec.kind == AttnKind::kMambaState) {
+            // align semantics: hit = the nearest aligned snapshot, retention = last page only.
+            manager = std::make_unique<SwaManager>(spec.page_size, /*sliding_window=*/2);
         } else {
             manager = std::make_unique<SwaManager>(spec.page_size, spec.sliding_window);
         }

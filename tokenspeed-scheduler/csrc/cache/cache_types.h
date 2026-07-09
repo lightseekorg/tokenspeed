@@ -33,7 +33,7 @@
 
 namespace tokenspeed {
 
-enum class AttnKind { kFull, kSlidingWindow };
+enum class AttnKind { kFull, kSlidingWindow, kMambaState };
 
 struct KvCacheSpec {
     AttnKind kind;

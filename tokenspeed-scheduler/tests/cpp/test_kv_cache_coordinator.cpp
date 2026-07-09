@@ -1260,5 +1260,41 @@ TEST(MambaAnalogTest, HostTierStoresAndMatchesTheSnapshotOnly) {
     EXPECT_EQ(m.per_group[0].num_hit_blocks + m.per_group[1].num_hit_blocks, 4);
 }
 
+// kMambaState is the named form of the analog pinned above: MakeCoordinator maps it to the
+// W=2 machinery, so a mixed full+state model converges with single-snapshot state semantics.
+TEST(MambaStateKindTest, FactoryMapsStateKindToAlignSemantics) {
+    BlockPool pool(32, true);
+    std::vector<KvCacheSpec> specs = {
+        {AttnKind::kFull, 4, 0},
+        {AttnKind::kMambaState, 4, 0},
+    };
+    KvCacheCoordinator coord = MakeCoordinator(specs, pool);
+    std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}});
+    for (int j = 0; j <= 2; ++j) CacheForGroup(pool, ch[static_cast<std::size_t>(j)], 0);
+    CacheForGroup(pool, ch[2], 1);  // ONLY the boundary snapshot for the state group
+
+    CoordinatorMatch m = coord.MatchPrefix(ch).device;
+    EXPECT_EQ(m.num_common_tokens, 12);  // full covers 3 pages; state resumes off snapshot @2
+    ASSERT_EQ(m.per_group.size(), 2u);
+    EXPECT_EQ(m.per_group[1].num_hit_blocks, 1);
+    EXPECT_TRUE(m.per_group[1].blocks[0]->IsNull());
+    EXPECT_TRUE(m.per_group[1].blocks[1]->IsNull());
+    EXPECT_FALSE(m.per_group[1].blocks[2]->IsNull());  // [null, null, snapshot]
+}
+
+TEST(MambaStateKindTest, StateGroupRetentionKeepsOnlyLastPage) {
+    BlockPool pool(32, true);
+    std::vector<KvCacheSpec> specs = {{AttnKind::kMambaState, 4, 0}};
+    KvCacheCoordinator coord = MakeCoordinator(specs, pool);
+    std::vector<BlockTable> tables(coord.NumGroups());
+    ASSERT_TRUE(coord.Acquire(tables, /*num_tokens=*/16));  // 4 pages
+    coord.ReclaimExpired(tables, /*num_computed_tokens=*/16);
+    EXPECT_TRUE(tables[0].Blocks()[0]->IsNull());
+    EXPECT_TRUE(tables[0].Blocks()[1]->IsNull());
+    EXPECT_TRUE(tables[0].Blocks()[2]->IsNull());
+    EXPECT_FALSE(tables[0].Blocks()[3]->IsNull());  // skipped = n-1: only the live state page
+    coord.Free(tables);
+}
+
 }  // namespace
 }  // namespace tokenspeed::test
