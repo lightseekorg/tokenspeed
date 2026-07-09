@@ -16,6 +16,13 @@ from collections import defaultdict
 from dataclasses import dataclass
 
 
+# Labels whose group is state-family (recurrent state rows, not KV history).
+# Deliberate one-line duplicate of paged_cache_spec._STATE_LAYER_TYPES: both
+# modules are direct-loaded standalone by their tests (importlib, no package
+# context), so a cross-module import would break either loader. Keep in sync.
+STATE_LAYER_TYPES = frozenset({"linear_attention"})
+
+
 @dataclass(frozen=True)
 class ComponentSpec:
     group_id: str
@@ -30,6 +37,23 @@ class PageGeometry:
     page_size_tokens: int
     page_bytes: int
     num_pages: int = 0  # filled by plan_tensors from the memory budget
+
+
+def components_from_layers(*, layer_types, kv_bytes_per_slot, state_const_bytes):
+    """Per-layer ComponentSpecs: history layers carry one linear kv component;
+    state layers one constant component per state tensor. Layer index is the
+    within-group occurrence count (the slab pairing order)."""
+    counts: dict[str, int] = {}
+    comps: list[ComponentSpec] = []
+    for label in layer_types:
+        idx = counts.get(label, 0)
+        counts[label] = idx + 1
+        if label in STATE_LAYER_TYPES:
+            for name, nbytes in state_const_bytes.items():
+                comps.append(ComponentSpec(label, idx, name, 0, nbytes))
+        else:
+            comps.append(ComponentSpec(label, idx, "kv", kv_bytes_per_slot, 0))
+    return comps
 
 
 def _row_demands(components):

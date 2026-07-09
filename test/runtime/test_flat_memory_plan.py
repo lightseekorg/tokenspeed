@@ -39,6 +39,7 @@ ComponentSpec = _fmp.ComponentSpec
 PageGeometry = _fmp.PageGeometry
 solve_page_geometry = _fmp.solve_page_geometry
 plan_tensors = _fmp.plan_tensors
+components_from_layers = _fmp.components_from_layers
 
 
 class EqualizerTest(unittest.TestCase):
@@ -293,6 +294,40 @@ class GptOssEquivalenceTest(unittest.TestCase):
         )
         legacy_pages = budget // (24 * 16 * 1024)  # M12 别名:24 物理槽 × 页字节
         self.assertEqual(plan.geometry.num_pages, legacy_pages)
+
+
+class ComponentsFromLayersTest(unittest.TestCase):
+    def test_qwen35_shape(self):
+        comps = components_from_layers(
+            layer_types=["linear_attention", "full_attention", "linear_attention"],
+            kv_bytes_per_slot=1024,
+            state_const_bytes={"conv": 40 * 1024, "ssm": 60 * 1024},
+        )
+        by_key = {(c.group_id, c.layer, c.component): c for c in comps}
+        self.assertIn(("full_attention", 0, "kv"), by_key)
+        self.assertIn(("linear_attention", 0, "conv"), by_key)
+        self.assertIn(("linear_attention", 1, "ssm"), by_key)
+        self.assertEqual(by_key[("full_attention", 0, "kv")].bytes_per_slot, 1024)
+        self.assertEqual(by_key[("linear_attention", 1, "conv")].const_bytes, 40 * 1024)
+
+    def test_pure_attention_model_has_no_state_components(self):
+        comps = components_from_layers(
+            layer_types=["full_attention", "sliding_attention"],
+            kv_bytes_per_slot=512,
+            state_const_bytes={},
+        )
+        self.assertTrue(all(c.const_bytes == 0 for c in comps))
+        self.assertEqual(len(comps), 2)
+
+    def test_plan_end_to_end_from_layers(self):
+        comps = components_from_layers(
+            layer_types=["linear_attention", "full_attention"],
+            kv_bytes_per_slot=1024,
+            state_const_bytes={"conv": 40 * 1024, "ssm": 60 * 1024},
+        )
+        plan = plan_tensors(comps, page_size_tokens=16, alignment=4,
+                            budget_bytes=100 * 1024 * 1024)
+        self.assertEqual(plan.geometry.page_size_tokens, 100)  # inflated by the state row
 
 
 if __name__ == "__main__":
