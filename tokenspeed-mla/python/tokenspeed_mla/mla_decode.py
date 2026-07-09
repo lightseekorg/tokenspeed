@@ -586,6 +586,12 @@ def tokenspeed_mla_decode(
     elif q_dtype == torch.float8_e4m3fn:
         cmask_k, cmask_off_k = _get_dummy_tree_mask_tensors(query.device, B)
 
+    if tree_mask_mode and (cp_world > 1 or causal_seqs is not None):
+        raise ValueError(
+            "custom_mask is not currently supported with decode-context-parallel "
+            "causal bounds (cp_world > 1 or causal_seqs is set)"
+        )
+
     # Runtime validation (int comparisons only, negligible overhead)
     if max_seq_len <= 0:
         raise ValueError(f"max_seq_len must be > 0, got {max_seq_len}")
