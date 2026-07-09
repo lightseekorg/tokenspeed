@@ -28,9 +28,7 @@
 
 namespace tokenspeed {
 
-// One attention group: its spec, its index-derived group_id, and the manager
-// that runs it. Pure data carrier -- all per-attention-type behavior lives
-// inside manager_ (the virtual KvCacheManager). Move-only (owns a unique_ptr).
+// One attention group: spec + index-derived group_id + the manager that runs it.
 class CacheGroup {
 public:
     CacheGroup(KvCacheSpec spec, std::uint32_t group_id, std::unique_ptr<KvCacheManager> manager)

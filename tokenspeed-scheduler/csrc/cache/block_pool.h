@@ -22,6 +22,7 @@
 
 #include <cstdint>
 #include <list>
+#include <ranges>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -29,6 +30,8 @@
 #include "utils.h"
 
 namespace tokenspeed {
+
+class BlockPool;
 
 // Per-block metadata. ref_cnt_==0 does NOT destroy the block: it re-enters the free list hash-intact,
 // so it is both prefix-reusable and an eviction candidate.
@@ -51,14 +54,15 @@ public:
     // BlockHashWithGroupId key (page_hasher.h); empty when nothing is cached.
     const std::string& BlockHash() const { return block_hash_; }
 
+private:
+    friend class BlockPool;
+
+    // ref_cnt_ and in_free_ are one invariant; only the pool may move either.
     void IncrRef() { ++ref_cnt_; }
     void DecrRef() {
         _assert(ref_cnt_ >= 1, "ref_cnt must >= 1 on DecrRef");
         --ref_cnt_;
     }
-
-private:
-    friend class BlockPool;
 
     void SetHash(std::string hash) {
         _assert(block_hash_.empty(), "block already has a hash");
@@ -68,12 +72,17 @@ private:
 
     std::int32_t block_id_{0};
     std::int32_t ref_cnt_{0};
+    const BlockPool* owner_{nullptr};
     std::string block_hash_{};
     bool is_null_{false};
     // Valid only while in_free_: this block's node in BlockPool::free_, for O(1) removal on a prefix hit.
     bool in_free_{false};
     std::list<CacheBlock*>::iterator free_pos_{};
 };
+
+inline auto AllCachedBlocks(const std::unordered_map<std::string, std::vector<CacheBlock*>>& cached) {
+    return cached | std::views::values | std::views::join;
+}
 
 // Flat prefix-cache block pool; owns all blocks for their whole lifetime, the free list and hash map only track state.
 class BlockPool {
@@ -84,6 +93,7 @@ public:
         blocks_.reserve(total_num_blocks);
         for (std::int32_t i = 0; i < total_num_blocks; ++i) {
             blocks_.emplace_back(i);
+            blocks_.back().owner_ = this;
         }
         // Block 0 is the null placeholder: never cached, ref not tracked; all others start free.
         null_block_ = &blocks_[0];
@@ -98,10 +108,10 @@ public:
 
     std::int32_t TotalBlocks() const { return total_num_blocks_; }
     std::int32_t NumFreeBlocks() const { return static_cast<std::int32_t>(free_.size()); }
-    CacheBlock* NullBlock() { return null_block_; }
+    CacheBlock* NullBlock() const { return null_block_; }
 
     // nullptr on miss; does NOT change ref counts -- callers TouchBlock() the result to claim it.
-    CacheBlock* GetCachedBlock(const std::string& block_hash_with_group) {
+    CacheBlock* GetCachedBlock(const std::string& block_hash_with_group) const {
         if (!enable_caching_) {
             return nullptr;
         }
@@ -114,6 +124,7 @@ public:
 
     // Claim a new reference, pulling a ref-0 eviction candidate out of the free list first (vllm BlockPool.touch).
     void TouchBlock(CacheBlock* block) {
+        _assert(block->owner_ == this, "block belongs to another pool");
         if (block->is_null_) {
             return;
         }
@@ -151,12 +162,13 @@ public:
 
     // Blocks reaching ref 0 return hash-intact, in reverse so a chain's tail (more prefix tokens) evicts first.
     void FreeBlocks(const std::vector<CacheBlock*>& blocks) {
-        for (auto it = blocks.rbegin(); it != blocks.rend(); ++it) {
-            FreeBlock(*it);
+        for (CacheBlock* block : blocks | std::views::reverse) {
+            FreeBlock(block);
         }
     }
 
     void FreeBlock(CacheBlock* block) {
+        _assert(block->owner_ == this, "block belongs to another pool");
         if (block->is_null_) {
             return;
         }
@@ -167,6 +179,7 @@ public:
     }
 
     void CacheFullBlock(CacheBlock* block, const std::string& block_hash_with_group) {
+        _assert(block->owner_ == this, "block belongs to another pool");
         if (!enable_caching_ || block->is_null_) {
             return;
         }
@@ -175,36 +188,16 @@ public:
     }
 
     // Test probes (O(cached blocks), off the hot path).
-    std::int32_t NumCachedFreeBlocks() const {
-        std::int32_t n = 0;
-        for (const auto& [key, blocks] : cached_hash_to_blocks_) {
-            for (const CacheBlock* b : blocks) {
-                if (b->ref_cnt_ == 0) {
-                    ++n;
-                }
-            }
-        }
-        return n;
-    }
-
     std::int32_t NumCachedBlocks() const {
-        std::int32_t n = 0;
-        for (const auto& [key, blocks] : cached_hash_to_blocks_) {
-            n += static_cast<std::int32_t>(blocks.size());
-        }
-        return n;
+        return static_cast<std::int32_t>(std::ranges::distance(AllCachedBlocks(cached_hash_to_blocks_)));
     }
-
+    std::int32_t NumCachedFreeBlocks() const {
+        return static_cast<std::int32_t>(std::ranges::count_if(
+            AllCachedBlocks(cached_hash_to_blocks_), [](const CacheBlock* b) { return b->ref_cnt_ == 0; }));
+    }
     std::int32_t NumPinnedCachedBlocks() const {
-        std::int32_t n = 0;
-        for (const auto& [key, blocks] : cached_hash_to_blocks_) {
-            for (const CacheBlock* b : blocks) {
-                if (b->ref_cnt_ > 0) {
-                    ++n;
-                }
-            }
-        }
-        return n;
+        return static_cast<std::int32_t>(std::ranges::count_if(
+            AllCachedBlocks(cached_hash_to_blocks_), [](const CacheBlock* b) { return b->ref_cnt_ > 0; }));
     }
 
 private:

@@ -31,9 +31,9 @@ bool PrefillFirstChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>&
     return coordinator.Acquire(tables, num_new_tokens);
 }
 
-std::vector<std::pair<std::int32_t, CacheBlock*>> LoadHostExtension(KvCacheCoordinator& coordinator,
-                                                                    std::vector<BlockTable>& tables,
-                                                                    const HostMatch& host) {
+std::vector<std::pair<CacheBlock*, CacheBlock*>> LoadHostExtension(KvCacheCoordinator& coordinator,
+                                                                   std::vector<BlockTable>& tables,
+                                                                   const CoordinatorMatch& host) {
     return coordinator.LoadHostExtension(tables, host);
 }
 
@@ -51,9 +51,7 @@ bool DecodeStep(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables
     // ReclaimExpired before Acquire: the slide's freed pages fund this chunk
     // (admission gates credit them via BlocksReclaimableAt in lockstep).
     coordinator.CacheFullBlocks(tables, content_hashes, first_page_slot);
-    for (std::int32_t i = 0; i < coordinator.NumGroups(); ++i) {
-        coordinator.GroupManager(i).ReclaimExpired(tables[static_cast<std::size_t>(i)], num_computed_tokens);
-    }
+    coordinator.ReclaimExpired(tables, num_computed_tokens);
     return coordinator.Acquire(tables, num_tokens);
 }
 

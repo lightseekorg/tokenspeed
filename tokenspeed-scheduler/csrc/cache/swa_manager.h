@@ -36,71 +36,58 @@ namespace tokenspeed {
 
 class SwaManager : public KvCacheManager {
 public:
-    SwaManager(BlockPool& pool, std::int32_t page_size, std::int32_t sliding_window)
-        : KvCacheManager(pool, page_size), sliding_window_{sliding_window} {
+    SwaManager(std::int32_t page_size, std::int32_t sliding_window)
+        : KvCacheManager(page_size), sliding_window_{sliding_window} {
         _assert(sliding_window > 0, "sliding_window must be > 0");
     }
 
     // Non-closed: shortening a match can cut its trailing run below the window, so match bound-first.
     bool MatchIsPrefixClosed() const override { return false; }
 
-    // Right->left scan for a contiguous cached run covering the window; holes left of it stay null_block padding.
-    PrefixMatch MatchPrefix(std::span<const std::string> block_hashes, std::int32_t max_blocks) const override {
-        const std::int32_t n = static_cast<std::int32_t>(
-            std::min(block_hashes.size(), static_cast<std::size_t>(std::max(max_blocks, 0))));
-        std::vector<CacheBlock*> hits(static_cast<std::size_t>(n), pool_.NullBlock());
-        const auto [boundary, run_start] = findTrailingRun(
+    // Right->left scan for a run backing a resumable boundary; slots left of it stay holes.
+    PrefixMatch Match(const BlockPool& pool, std::span<const std::string> keys, std::int32_t begin_blocks,
+                      std::int32_t max_blocks) const override {
+        const std::int32_t end_blocks = static_cast<std::int32_t>(
+            std::min(keys.size(), static_cast<std::size_t>(std::max(max_blocks, 0))));
+        PrefixMatch match;
+        if (begin_blocks >= end_blocks) {
+            return match;
+        }
+        // W == 1: no lookback, so every boundary is resumable with no cached page at all.
+        if (pagesNeededToResume() == 0) {
+            match.blocks.assign(static_cast<std::size_t>(end_blocks - begin_blocks), pool.NullBlock());
+            return match;
+        }
+        std::vector<CacheBlock*> probed(static_cast<std::size_t>(end_blocks), pool.NullBlock());
+        const auto [boundary, hits_begin] = findResumableBoundary(
             [&](std::int32_t i) {
-                CacheBlock* block = pool_.GetCachedBlock(block_hashes[static_cast<std::size_t>(i)]);
+                CacheBlock* block = pool.GetCachedBlock(keys[static_cast<std::size_t>(i)]);
                 if (block != nullptr) {
-                    hits[static_cast<std::size_t>(i)] = block;
+                    probed[static_cast<std::size_t>(i)] = block;
                 }
                 return block != nullptr;
             },
-            0, n);
-        PrefixMatch match;
-        if (boundary == 0) {
+            begin_blocks, end_blocks);
+        if (boundary == begin_blocks) {
             return match;
         }
-        match.blocks.assign(hits.begin(), hits.begin() + boundary);
-        match.num_hit_blocks = boundary - run_start;
+        match.blocks.assign(probed.begin() + begin_blocks, probed.begin() + boundary);
+        match.num_hit_blocks = boundary - hits_begin;
         return match;
     }
 
-    // Host-pool lookup: the same trailing-run scan; nullptr pads [begin, run_start).
-    std::vector<CacheBlock*> MatchHostPages(BlockPool& host_pool, std::span<const std::string> keys,
-                                            std::int32_t begin_blocks, std::int32_t max_blocks) const override {
-        // W == 1: contiguousNeeded() is 0, so any boundary is resumable with no host page at all.
-        if (contiguousNeeded() == 0) {
-            return std::vector<CacheBlock*>(static_cast<std::size_t>(max_blocks - begin_blocks), nullptr);
-        }
-        std::vector<CacheBlock*> found(static_cast<std::size_t>(max_blocks), nullptr);
-        const auto [boundary, run_start] = findTrailingRun(
-            [&](std::int32_t i) {
-                CacheBlock* block = host_pool.GetCachedBlock(keys[static_cast<std::size_t>(i)]);
-                found[static_cast<std::size_t>(i)] = block;
-                return block != nullptr;
-            },
-            begin_blocks, max_blocks);
-        std::vector<CacheBlock*> pages(static_cast<std::size_t>(boundary - begin_blocks), nullptr);
-        for (std::int32_t j = run_start; j < boundary; ++j) {
-            pages[static_cast<std::size_t>(j - begin_blocks)] = found[static_cast<std::size_t>(j)];
-        }
-        return pages;
-    }
-
     // Punches null holes so the table never shrinks (keeps slot alignment); reverse-collect evicts FIFO.
-    void ReclaimExpired(BlockTable& table, std::int32_t num_computed_tokens) override {
+    void ReclaimExpired(BlockPool& pool, BlockTable& table, std::int32_t num_computed_tokens) override {
         std::int32_t skipped_blocks = fullySlidOutBlocks(table, num_computed_tokens);
         std::vector<CacheBlock*> freed;
         for (std::int32_t i = skipped_blocks - 1; i >= 0; --i) {
-            CacheBlock* old = table.EvictToNull(i, pool_.NullBlock());
+            CacheBlock* old = table.EvictToNull(i, pool.NullBlock());
             if (old == nullptr) {
                 break;  // already null -> earlier slots are null too
             }
             freed.push_back(old);
         }
-        pool_.FreeBlocks(freed);
+        pool.FreeBlocks(freed);
     }
 
     // Only blocks whose last reference is this table (RefCount()==1) reach the free list, so shared ones don't count.
@@ -121,37 +108,35 @@ public:
     }
 
 private:
-    // Pages a valid match's trailing run must cover: ceil((window - 1) / page_size).
-    std::int32_t contiguousNeeded() const { return (sliding_window_ - 1 + page_size_ - 1) / page_size_; }
+    // Cached pages a boundary needs behind it: they cover the window's last (window - 1) tokens.
+    std::int32_t pagesNeededToResume() const { return (sliding_window_ - 1 + page_size_ - 1) / page_size_; }
 
-    // Core scan shared by device and host lookup: right->left over [begin, end) for the
-    // highest run of contiguousNeeded() hits -- or a shorter run bottoming at `begin`.
-    // Returns {boundary, run_start}: hits cover [run_start, boundary); boundary == begin
-    // means no acceptable run. Early-exits, so slots below run_start stay unprobed.
-    template <typename Hit>
-    std::pair<std::int32_t, std::int32_t> findTrailingRun(const Hit& hit, std::int32_t begin_blocks,
-                                                          std::int32_t end_blocks) const {
-        const std::int32_t needed = contiguousNeeded();
-        std::int32_t run = 0;
-        std::int32_t run_end = -1;
-        for (std::int32_t i = end_blocks - 1; i >= begin_blocks; --i) {
-            if (!hit(i)) {
-                run = 0;
-                run_end = -1;
-                continue;
+    struct ResumableBoundary {
+        std::int32_t boundary;    // == begin_blocks when no boundary qualifies
+        std::int32_t hits_begin;  // probe hits cover [hits_begin, boundary)
+    };
+
+    // Core scan shared by device and host lookup: the highest boundary backed by enough
+    // consecutive probe hits -- pagesNeededToResume(), or fewer bottoming out at begin_blocks.
+    template <typename Probe>
+    ResumableBoundary findResumableBoundary(const Probe& probe, std::int32_t begin_blocks,
+                                            std::int32_t end_blocks) const {
+        const std::int32_t pages_needed = pagesNeededToResume();
+        for (std::int32_t boundary = end_blocks; boundary > begin_blocks;) {
+            std::int32_t hits_begin = boundary;
+            while (hits_begin > begin_blocks && probe(hits_begin - 1)) {
+                --hits_begin;
+                if (boundary - hits_begin >= pages_needed) {
+                    return {boundary, hits_begin};  // enough pages behind the boundary
+                }
             }
-            if (run == 0) {
-                run_end = i;
+            if (hits_begin == begin_blocks && hits_begin < boundary) {
+                return {boundary, hits_begin};  // fewer, but nothing below begin_blocks is needed
             }
-            ++run;
-            if (run >= needed) {
-                break;
-            }
+            // The miss at hits_begin-1 cuts every boundary in (hits_begin-1, boundary] short -- retry below it.
+            boundary = hits_begin - 1;
         }
-        if (run == 0) {
-            return {begin_blocks, begin_blocks};
-        }
-        return {run_end + 1, run_end + 1 - run};
+        return {begin_blocks, begin_blocks};
     }
 
     // Pages [0, result) fully slid out: the next query reads keys [num_computed - window + 1, num_computed].

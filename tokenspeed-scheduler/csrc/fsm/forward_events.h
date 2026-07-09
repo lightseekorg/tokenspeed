@@ -83,10 +83,9 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
                                    // threads the hit here; the default {} is the canonical zero hit for
                                    // call sites that never match (radix-only paths, tests).
                                    CoordinatorMatch flat_hit = {},
-                                   // Host-tier extension of flat_hit: pages arrive pinned
-                                   // (HostMatch::pinned BlockRefs); pin ownership rides the event
-                                   // until the emission takes the refs -- any other exit releases them.
-                                   HostMatch flat_host = {},
+                                   // Host-tier match above flat_hit's boundary (read-only; the
+                                   // load emission pins both sides when it builds the ticket).
+                                   CoordinatorMatch flat_host = {},
                                    std::vector<std::string> flat_ext_hashes = {}
 #endif
                                    )
@@ -121,10 +120,9 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
 
 #if TOKENSPEED_FLAT_KVCACHE
     // Post-apply channel for the scheduler's LoadBack emission (transition fills the pairs).
-    std::vector<std::pair<std::int32_t, CacheBlock*>> TakeFlatLoadPairs() {
+    std::vector<std::pair<CacheBlock*, CacheBlock*>> TakeFlatLoadPairs() {
         return std::exchange(flat_load_pairs_, {});
     }
-    std::vector<BlockRef> TakeFlatHostPins() { return std::move(flat_host_.pinned); }
 #endif
 
 private:
@@ -143,9 +141,9 @@ private:
 #if TOKENSPEED_FLAT_KVCACHE
     KvCacheCoordinator* coordinator_{};
     CoordinatorMatch flat_hit_{};
-    HostMatch flat_host_{};
+    CoordinatorMatch flat_host_{};
     std::vector<std::string> flat_ext_hashes_{};
-    std::vector<std::pair<std::int32_t, CacheBlock*>> flat_load_pairs_{};
+    std::vector<std::pair<CacheBlock*, CacheBlock*>> flat_load_pairs_{};
 #endif
 };
 

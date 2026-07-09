@@ -86,6 +86,15 @@ struct SchedulerConfig {
 
     std::vector<PagedCacheGroupConfig> paged_cache_groups{};
 
+    // Streaming-sink (flat L2) enablement: an L2 host tier exists (> 1: page 0 is the null
+    // placeholder) and this role writes to it.
+    // Orthogonal to disable_prefix_cache by design: that flag gates MATCHING only, the sink
+    // gates STORING (tests isolate the sink under disable_prefix_cache; a production config
+    // combining them stores pages nothing can ever hit -- pointless but harmless).
+    bool FlatStreamingSinkEnabled() const {
+        return !disable_l2_cache && host_allocator.total_pages > 1 && role == Role::kFused;
+    }
+
     // Unset means paged-cache groups are transport-only.
     std::optional<PrefixCacheAdjunctSpec> prefix_cache_adjunct{};
 

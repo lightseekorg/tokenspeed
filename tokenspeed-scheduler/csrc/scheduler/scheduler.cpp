@@ -64,7 +64,7 @@ Scheduler::Scheduler(SchedulerConfig config)
 #if TOKENSPEED_FLAT_KVCACHE
       ,
       block_pool_{config_.device_allocator.total_pages},
-      coordinator_{MakeCoordinator(MakeSpecsFromConfig(config_), block_pool_)},
+      coordinator_{MakeCoordinator(MakeSpecsFromConfig(config_), block_pool_, config_.FlatStreamingSinkEnabled())},
       flat_group_ids_{[&] {
           std::vector<std::string> ids;
           ids.reserve(config_.paged_cache_groups.size());
@@ -73,14 +73,9 @@ Scheduler::Scheduler(SchedulerConfig config)
           }
           return ids;
       }()},
-      flat_host_pool_{flatStreamingSinkEnabled() ? config_.host_allocator.total_pages : 1}
+      flat_host_pool_{config_.FlatStreamingSinkEnabled() ? config_.host_allocator.total_pages : 1}
 #endif
 {
-#if TOKENSPEED_FLAT_KVCACHE
-    if (flatStreamingSinkEnabled()) {
-        coordinator_.EnableStoreCandidateCollection();
-    }
-#endif
     if (auto* env = std::getenv("SPDLOG_LEVEL")) {
         std::string level_str{env};
         spdlog::level::level_enum level = spdlog::level::from_str(level_str);
@@ -236,9 +231,9 @@ std::size_t Scheduler::RetractedSize() const {
 
 std::size_t Scheduler::AvailableKvPages() const {
 #if TOKENSPEED_FLAT_KVCACHE
-    // TODO(radix-removal): the flat path never draws from the radix
-    // device_allocator_, so reporting it would show a permanently-full pool to
-    // Python monitoring (event_loop.py's _get_load / _get_scheduler_stats).
+    // The flat path never draws from the radix device_allocator_, so reporting
+    // it would show a permanently-full pool to Python monitoring
+    // (event_loop.py's _get_load / _get_scheduler_stats).
     // Report the flat shared BlockPool instead. Units match: one flat block is
     // one page of page_size tokens, the same unit as device_allocator_ pages
     // and as Python's max_total_num_tokens // block_size. Block 0 is the
@@ -373,7 +368,7 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
                               std::make_move_iterator(wb->end()));
     }
 #if TOKENSPEED_FLAT_KVCACHE
-    if (flatStreamingSinkEnabled()) {
+    if (config_.FlatStreamingSinkEnabled()) {
         // Streaming L2 sink: batch this round's newly-registered pages into one D2H op.
         std::vector<TransferPair> pairs;
         std::vector<FlatStoreTicket> tickets;

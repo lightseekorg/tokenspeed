@@ -34,8 +34,8 @@ namespace tokenspeed {
 #if TOKENSPEED_FLAT_KVCACHE
 namespace {
 
-// Batched ref surrender in ticket order: after an abort these pins are the LAST refs,
-// so their push order is recycling order (vector dtor order is impl-defined).
+// Batched ref surrender in ticket order: after an abort these pins are the LAST refs, and
+// FreeBlocks recycles the batch tail-first (vector dtor order is impl-defined, so no per-ref dtors).
 void FreeAll(BlockPool& pool, std::vector<BlockRef>&& refs) {
     std::vector<CacheBlock*> batch;
     batch.reserve(refs.size());

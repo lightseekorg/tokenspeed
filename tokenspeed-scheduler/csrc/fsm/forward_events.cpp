@@ -191,8 +191,8 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()
     }
 
     // The admission match that set tokens_this_round_ also sets window.begin (single source).
-    const std::int32_t hit_tokens =
-        flat_hit_.num_common_tokens + flat_host_.num_extension_blocks * state.GetPageSize();
+    // The host boundary is absolute (floor included); default-constructed (no host pool) it is 0.
+    const std::int32_t hit_tokens = std::max(flat_hit_.num_common_tokens, flat_host_.num_common_tokens);
     TokenContainer::Window window{.begin = hit_tokens, .size = tokens_this_round_};
     bool is_last_chunk = (window.begin + window.size) == token_container->PrefillSize();
     if (is_last_chunk && role_ != Role::kD) {
@@ -437,8 +437,12 @@ Decoding ScheduleDecodeEvent::operator()(Decoding&& state) {
 
     FlatHashChain chain = state.GetFlatHashChain();
     const std::int32_t first_page_slot = chain.num_hashed_pages;
+    const std::int32_t filled_pages = num_computed_tokens / state.GetPageSize();
+    // A page fills only once every page_size steps; skip the O(pages) span walk on the other steps.
     const std::vector<std::string> new_hashes =
-        AdvanceFlatHashChain(chain, state.GetFullPagedTokens(false), num_computed_tokens / state.GetPageSize());
+        filled_pages > chain.num_hashed_pages
+            ? AdvanceFlatHashChain(chain, state.GetFullPagedTokens(false), filled_pages)
+            : std::vector<std::string>{};
 
     auto tables = std::move(state).TakeBlockTables();
     if (!DecodeStep(*coordinator_, tables, new_hashes, first_page_slot, reserve, num_computed_tokens)) {

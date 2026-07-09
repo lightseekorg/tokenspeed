@@ -125,11 +125,11 @@ private:
     std::optional<fsm::ScheduleRetractEvent> scheduleRetract(Request* request);
 
 #if TOKENSPEED_FLAT_KVCACHE
-    // One hash pass at admission: the device match, its host-tier extension
-    // (pages arrive load-pinned) and the extension's hash slice (registration form).
+    // One hash pass at admission: the device match, the read-only host-tier match above its
+    // boundary, and the extension's hash slice (registration form).
     struct FlatAdmissionMatch {
         CoordinatorMatch device;
-        HostMatch host;
+        CoordinatorMatch host;
         std::vector<std::string> ext_hashes;
     };
     FlatAdmissionMatch matchFlatPrefixAtAdmission(Request* request);
@@ -217,7 +217,8 @@ private:
             for (const FlatStoreTicket& t : tickets) {
                 keys_.insert(t.key);
             }
-            ops_.emplace(id, std::move(tickets));
+            const bool inserted = ops_.emplace(id, std::move(tickets)).second;
+            _assert(inserted, "duplicate flat store op id");
         }
         // Empty result: unknown op (the radix WriteBackDone path owns it).
         std::vector<FlatStoreTicket> Retire(cache_op_id id) {
@@ -249,10 +250,6 @@ private:
     // device pages (a freed destination must not be recycled under the copy); LoadBackDone drops both.
     std::unordered_map<cache_op_id, FlatLoadTicket> flat_load_ops_;
 
-    // Single home of the streaming-sink enablement predicate (> 1: page 0 is the null placeholder).
-    bool flatStreamingSinkEnabled() const {
-        return !config_.disable_l2_cache && config_.host_allocator.total_pages > 1 && config_.role == Role::kFused;
-    }
 
     // Sum excluding request_id: a request consuming its own reservation must not be gated by it.
     std::int32_t flatReservedPagesExcept(const std::string& request_id) const {

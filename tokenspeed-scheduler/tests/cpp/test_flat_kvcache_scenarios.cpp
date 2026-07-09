@@ -1670,7 +1670,7 @@ TEST_F(FlatPrefixHitSmallWindowSuite, SwaGroupHitRespectsWindow) {
     ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start);
     ASSERT_EQ(r1_rows.at("swa").size(), 4u);
 
-    // r2: 10 tokens, first 8 == r1's. Fixpoint (W=4, page=2, contiguous_needed
+    // r2: 10 tokens, first 8 == r1's. Fixpoint (W=4, page=2, pages_needed
     // = ceil(3/2) = 2): cap = (10-1)/2 = 4, full matches 4; swa scan stops at
     // run 2 -> keep 4 with 2 holes -> common stays 4 = 8 hit tokens.
     token_vec_t r2_tokens = MakeAlignedTokens(/*num_pages=*/4, PageSize());  // 1..8 == r1's
@@ -1703,7 +1703,7 @@ TEST_F(FlatPrefixHitSmallWindowSuite, SwaGroupHitRespectsWindow) {
     EXPECT_EQ(swa_row[3], r1_rows.at("swa")[3]);
     EXPECT_GT(swa_row[4], 0);
     // Window invariant (mirrors ExpectSwaWindowIntact): the last
-    // contiguous_needed = 2 slots of the claimed prefix must be real.
+    // pages_needed = 2 slots of the claimed prefix must be real.
     for (std::size_t i = 2; i < 4; ++i) {
         EXPECT_GT(swa_row[i], 0) << "null hole inside the last window of the claimed prefix at slot " << i;
     }
@@ -2622,44 +2622,6 @@ TEST_F(FlatChunkedHostHitSuite, ChunkedPrefillAfterHostHit) {
     EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start) << "pool balances after the chunked host hit";
 }
 
-// ---------------------------------------------------------------------------
-// M15-C3 review: until the emission takes the HostMatch pins, the first-chunk
-// EVENT owns them (BlockRef RAII) -- destroying it unconsumed (throwing
-// transition) must release them exactly once, and moving must not double-release.
-// ---------------------------------------------------------------------------
-TEST(FlatFirstChunkEventPinOwnership, DtorReleasesUnconsumedPinsExactlyOnce) {
-    BlockPool host_pool(/*total_num_blocks=*/2);
-    CacheBlock* page = host_pool.AllocateBlocks(1).front();
-    host_pool.CacheFullBlock(page, "k");
-    host_pool.FreeBlocks({page});
-    {
-        HostMatch host;
-        host.num_extension_blocks = 1;
-        host.pinned.push_back(BlockRef::Share(host_pool, host_pool.GetCachedBlock("k")));
-        ASSERT_EQ(host_pool.NumPinnedCachedBlocks(), 1);
-        fsm::SchedulePrefillFirstChunkEvent ev{/*tokens_this_round=*/0,
-                                               /*decode_input_tokens=*/0,
-                                               /*device_allocator=*/nullptr,
-                                               /*req_pool_allocator=*/nullptr,
-                                               MatchResult{},
-                                               Role::kFused,
-                                               /*kv_prefix_cache=*/nullptr,
-                                               /*disable_l2_cache=*/false,
-                                               /*loadback_diff=*/{},
-                                               /*hybrid_prefix_cache=*/nullptr,
-                                               /*mamba_allocator=*/nullptr,
-                                               /*mamba_loadback_nodes=*/{},
-                                               /*coordinator=*/nullptr,
-                                               CoordinatorMatch{},
-                                               std::move(host),
-                                               /*flat_ext_hashes=*/{}};
-        // Vector move must leave the source's pins empty: a double-release would
-        // underflow the ref count and throw from the second dtor.
-        fsm::SchedulePrefillFirstChunkEvent moved{std::move(ev)};
-        EXPECT_EQ(host_pool.NumPinnedCachedBlocks(), 1) << "construction and move must not unpin";
-    }
-    EXPECT_EQ(host_pool.NumPinnedCachedBlocks(), 0) << "the unconsumed event must release its pins";
-}
 
 }  // namespace tokenspeed::test
 

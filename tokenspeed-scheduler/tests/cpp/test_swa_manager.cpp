@@ -50,25 +50,25 @@ CacheBlock* CacheOnePage(BlockPool& pool, const std::string& key) {
 
 TEST(SwaManagerTest, ConstructsWithWindow) {
     BlockPool pool(8);
-    SwaManager mgr(pool, /*page_size=*/4, /*sliding_window=*/10);
+    SwaManager mgr(/*page_size=*/4, /*sliding_window=*/10);
     BlockTable table;
     EXPECT_EQ(table.NumBlocks(), 0);
 }
 
 TEST(SwaManagerTest, MatchAllMissReturnsEmpty) {
     BlockPool pool(8);
-    SwaManager mgr(pool, 4, 10);
+    SwaManager mgr(4, 10);
     std::vector<std::string> hashes = {RealKey({1, 2, 3, 4}, 0), RealKey({5, 6, 7, 8}, 0)};
-    PrefixMatch m = mgr.MatchPrefix(hashes, static_cast<std::int32_t>(hashes.size()));
+    PrefixMatch m = mgr.Match(pool, hashes, 0, static_cast<std::int32_t>(hashes.size()));
     EXPECT_EQ(m.num_hit_blocks, 0);
     EXPECT_TRUE(m.blocks.empty());
     EXPECT_EQ(pool.NumFreeBlocks(), 7);  // read-only, nothing claimed
 }
 
 TEST(SwaManagerTest, MatchStopsAfterContiguousNeededFromRight) {
-    // page_size 4, window 10 -> contiguous_needed = ceil(9/4) = 3.
+    // page_size 4, window 10 -> pages_needed = ceil(9/4) = 3.
     BlockPool pool(16);
-    SwaManager mgr(pool, 4, 10);
+    SwaManager mgr(4, 10);
     std::string h0 = RealKey({0, 0, 0, 0}, 0);
     std::string h1 = RealKey({1, 1, 1, 1}, 0);
     std::string h2 = RealKey({2, 2, 2, 2}, 0);
@@ -79,7 +79,7 @@ TEST(SwaManagerTest, MatchStopsAfterContiguousNeededFromRight) {
     CacheBlock* b3 = CacheOnePage(pool, h3);
 
     std::vector<std::string> keys{h0, h1, h2, h3, h4};
-    PrefixMatch m = mgr.MatchPrefix(keys, 5);
+    PrefixMatch m = mgr.Match(pool, keys, 0, 5);
     // Right->left: h4 miss; h3,h2,h1 hit -> run reaches 3, stop. run_end = 3.
     // keep [0..3] -> [NULL, b1, b2, b3]; num_hit_blocks = 3.
     ASSERT_EQ(m.blocks.size(), 4u);
@@ -91,10 +91,10 @@ TEST(SwaManagerTest, MatchStopsAfterContiguousNeededFromRight) {
 }
 
 TEST(SwaManagerTest, BoundedMatchEnforcesRunAgainstBoundedEnd) {
-    // Tail 3-run {2,3,4}. Bounded to 4 the run {2,3} < contiguous_needed 3 with
+    // Tail 3-run {2,3,4}. Bounded to 4 the run {2,3} < pages_needed 3 with
     // holes at 0,1 -> the bounded overload re-scans and returns empty.
     BlockPool pool(16);
-    SwaManager mgr(pool, 4, 10);
+    SwaManager mgr(4, 10);
     std::string h0 = RealKey({0, 0, 0, 0}, 0);
     std::string h1 = RealKey({1, 1, 1, 1}, 0);
     std::string h2 = RealKey({2, 2, 2, 2}, 0);
@@ -105,28 +105,28 @@ TEST(SwaManagerTest, BoundedMatchEnforcesRunAgainstBoundedEnd) {
     CacheOnePage(pool, h4);
     std::vector<std::string> hashes{h0, h1, h2, h3, h4};
 
-    PrefixMatch unbounded = mgr.MatchPrefix(hashes, /*max_blocks=*/5);
+    PrefixMatch unbounded = mgr.Match(pool, hashes, 0, /*max_blocks=*/5);
     EXPECT_EQ(unbounded.blocks.size(), 5u);
     EXPECT_EQ(unbounded.num_hit_blocks, 3);
 
-    PrefixMatch bounded = mgr.MatchPrefix(hashes, /*max_blocks=*/4);
+    PrefixMatch bounded = mgr.Match(pool, hashes, 0, /*max_blocks=*/4);
     EXPECT_TRUE(bounded.blocks.empty());
     EXPECT_EQ(bounded.num_hit_blocks, 0);
 }
 
 TEST(SwaManagerTest, MatchTrimsTailAfterWindow) {
-    // contiguous_needed = ceil((4-1)/4) = 1 -> any single hit (from the right) suffices.
+    // pages_needed = ceil((4-1)/4) = 1 -> any single hit (from the right) suffices.
     BlockPool pool(16);
-    SwaManager mgr(pool, 4, 4);
+    SwaManager mgr(4, 4);
     std::string h0 = RealKey({0, 0, 0, 0}, 0);
     std::string h1 = RealKey({1, 1, 1, 1}, 0);
     std::string h2 = RealKey({2, 2, 2, 2}, 0);
     CacheBlock* b0 = CacheOnePage(pool, h0);
     CacheBlock* b2 = CacheOnePage(pool, h2);  // h1 left uncached
 
-    // Right->left: h2 hits, run 1 >= contiguous_needed -> keep [0..2].
+    // Right->left: h2 hits, run 1 >= pages_needed -> keep [0..2].
     std::vector<std::string> keys{h0, h1, h2};
-    PrefixMatch m = mgr.MatchPrefix(keys, 3);
+    PrefixMatch m = mgr.Match(pool, keys, 0, 3);
     ASSERT_EQ(m.blocks.size(), 3u);
     EXPECT_TRUE(m.blocks[0]->IsNull());
     EXPECT_TRUE(m.blocks[1]->IsNull());
@@ -136,9 +136,9 @@ TEST(SwaManagerTest, MatchTrimsTailAfterWindow) {
 }
 
 TEST(SwaManagerTest, MatchAcceptsRunShorterThanContiguousNeeded) {
-    // window 10 -> contiguous_needed 3, but prompt is only 2 pages, both cached.
+    // window 10 -> pages_needed 3, but prompt is only 2 pages, both cached.
     BlockPool pool(16);
-    SwaManager mgr(pool, 4, 10);
+    SwaManager mgr(4, 10);
     std::string h0 = RealKey({0, 0, 0, 0}, 0);
     std::string h1 = RealKey({1, 1, 1, 1}, 0);
     CacheBlock* b0 = CacheOnePage(pool, h0);
@@ -146,7 +146,7 @@ TEST(SwaManagerTest, MatchAcceptsRunShorterThanContiguousNeeded) {
 
     // Run reaches the left end at 2 < 3; run > 0 -> accept, keep [b0, b1].
     std::vector<std::string> keys{h0, h1};
-    PrefixMatch m = mgr.MatchPrefix(keys, 2);
+    PrefixMatch m = mgr.Match(pool, keys, 0, 2);
     ASSERT_EQ(m.blocks.size(), 2u);
     EXPECT_EQ(m.blocks[0]->BlockId(), b0->BlockId());
     EXPECT_EQ(m.blocks[1]->BlockId(), b1->BlockId());
@@ -157,7 +157,7 @@ TEST(SwaManagerTest, MatchRequiresContiguityNotAnyHit) {
     // h2 miss splits runs {h3,h4} and {h0,h1}; neither reaches 3, so the
     // surviving run is the LEFT one: keep [0..1] = [b0, b1].
     BlockPool pool(16);
-    SwaManager mgr(pool, 4, 10);
+    SwaManager mgr(4, 10);
     std::string h0 = RealKey({0, 0, 0, 0}, 0);
     std::string h1 = RealKey({1, 1, 1, 1}, 0);
     std::string h2 = RealKey({2, 2, 2, 2}, 0);
@@ -169,22 +169,37 @@ TEST(SwaManagerTest, MatchRequiresContiguityNotAnyHit) {
     CacheOnePage(pool, h4);  // h2 left uncached
 
     std::vector<std::string> keys{h0, h1, h2, h3, h4};
-    PrefixMatch m = mgr.MatchPrefix(keys, 5);
+    PrefixMatch m = mgr.Match(pool, keys, 0, 5);
     ASSERT_EQ(m.blocks.size(), 2u);
     EXPECT_EQ(m.blocks[0]->BlockId(), b0->BlockId());
     EXPECT_EQ(m.blocks[1]->BlockId(), b1->BlockId());
     EXPECT_EQ(m.num_hit_blocks, 2);
 }
 
+// Pins the device-tier W=1 semantic: no lookback means every boundary is resumable,
+// so the match covers the full bounded range with holes and claims no real page.
+TEST(SwaManagerTest, MatchWindowOneCoversAllAsHoles) {
+    BlockPool pool(8);
+    SwaManager mgr(4, /*sliding_window=*/1);  // pages_needed = 0
+    std::string h0 = RealKey({0, 0, 0, 0}, 0);
+    CacheOnePage(pool, h0);  // a real cached page must NOT shrink or anchor the match
+
+    std::vector<std::string> keys{h0, "k1", "k2"};
+    PrefixMatch m = mgr.Match(pool, keys, 0, 3);
+    CacheBlock* hole = pool.NullBlock();
+    EXPECT_EQ(m.blocks, (std::vector<CacheBlock*>{hole, hole, hole}));
+    EXPECT_EQ(m.num_hit_blocks, 0);
+}
+
 TEST(SwaManagerTest, MatchDoesNotChangeRefCount) {
     BlockPool pool(8);
-    SwaManager mgr(pool, 4, 4);
+    SwaManager mgr(4, 4);
     std::string h0 = RealKey({0, 0, 0, 0}, 0);
     CacheBlock* b0 = CacheOnePage(pool, h0);
     EXPECT_EQ(b0->RefCount(), 0);
 
     std::vector<std::string> keys{h0};
-    PrefixMatch m = mgr.MatchPrefix(keys, 1);
+    PrefixMatch m = mgr.Match(pool, keys, 0, 1);
     EXPECT_EQ(m.num_hit_blocks, 1);
     EXPECT_EQ(b0->RefCount(), 0);          // read-only
     EXPECT_EQ(pool.NumFreeBlocks(), 7);
@@ -192,7 +207,7 @@ TEST(SwaManagerTest, MatchDoesNotChangeRefCount) {
 
 TEST(SwaManagerTest, ClaimHitBlocksSkipsNullHoles) {
     BlockPool pool(16);
-    SwaManager mgr(pool, 4, 10);  // contiguous_needed = 3
+    SwaManager mgr(4, 10);  // pages_needed = 3
     std::string h0 = RealKey({0, 0, 0, 0}, 0);
     std::string h1 = RealKey({1, 1, 1, 1}, 0);
     std::string h2 = RealKey({2, 2, 2, 2}, 0);
@@ -203,13 +218,13 @@ TEST(SwaManagerTest, ClaimHitBlocksSkipsNullHoles) {
     std::int32_t free_before = pool.NumFreeBlocks();
 
     std::vector<std::string> keys{h0, h1, h2, h3};
-    PrefixMatch m = mgr.MatchPrefix(keys, 4);
+    PrefixMatch m = mgr.Match(pool, keys, 0, 4);
     ASSERT_EQ(m.blocks.size(), 4u);
     ASSERT_TRUE(m.blocks[0]->IsNull());
     ASSERT_EQ(m.num_hit_blocks, 3);
 
     BlockTable table;
-    mgr.ClaimHitBlocks(table, m);
+    mgr.ClaimHitBlocks(pool, table, m);
 
     // The null hole is preserved to keep logical-page slot alignment.
     EXPECT_EQ(table.NumBlocks(), 4);
@@ -222,38 +237,38 @@ TEST(SwaManagerTest, ClaimHitBlocksSkipsNullHoles) {
 
 TEST(SwaManagerTest, InheritedAcquireAndFreeWork) {
     BlockPool pool(8);
-    SwaManager mgr(pool, 4, 10);
+    SwaManager mgr(4, 10);
     BlockTable table;
 
-    ASSERT_TRUE(mgr.Acquire(table, 8));   // 2 pages
+    ASSERT_TRUE(mgr.Acquire(pool, table, 8));   // 2 pages
     EXPECT_EQ(table.NumBlocks(), 2);
     EXPECT_EQ(pool.NumFreeBlocks(), 5);
 
-    mgr.Free(table);
+    mgr.Free(pool, table);
     EXPECT_EQ(table.NumBlocks(), 0);
     EXPECT_EQ(pool.NumFreeBlocks(), 7);
 }
 
 TEST(SwaManagerTest, InheritedCacheFullBlocksMakesPagesHittable) {
     BlockPool pool(8);
-    SwaManager mgr(pool, 4, 4);  // contiguous_needed = 1
+    SwaManager mgr(4, 4);  // pages_needed = 1
     std::string h0 = RealKey({0, 0, 0, 0}, 0);
 
     BlockTable a;
-    ASSERT_TRUE(mgr.Acquire(a, 4));
-    mgr.CacheFullBlocks(a, std::vector<std::string>{h0});
+    ASSERT_TRUE(mgr.Acquire(pool, a, 4));
+    mgr.CacheFullBlocks(pool, a, std::vector<std::string>{h0});
 
     std::vector<std::string> keys{h0};
-    PrefixMatch m = mgr.MatchPrefix(keys, 1);
+    PrefixMatch m = mgr.Match(pool, keys, 0, 1);
     EXPECT_EQ(m.num_hit_blocks, 1);
     EXPECT_EQ(m.blocks.back()->BlockId(), a.Blocks()[0]->BlockId());
 }
 
 TEST(BlockTableTest, EvictToNullReturnsOldBlockAndPunchesHole) {
     BlockPool pool(8);
-    SwaManager mgr(pool, 4, 4);
+    SwaManager mgr(4, 4);
     BlockTable table;
-    ASSERT_TRUE(mgr.Acquire(table, 8));  // 2 real pages
+    ASSERT_TRUE(mgr.Acquire(pool, table, 8));  // 2 real pages
     ASSERT_EQ(table.NumBlocks(), 2);
     CacheBlock* page0 = table.Blocks()[0];
     ASSERT_FALSE(page0->IsNull());
@@ -266,9 +281,9 @@ TEST(BlockTableTest, EvictToNullReturnsOldBlockAndPunchesHole) {
 
 TEST(BlockTableTest, EvictToNullIsIdempotentOnNullSlot) {
     BlockPool pool(8);
-    SwaManager mgr(pool, 4, 4);
+    SwaManager mgr(4, 4);
     BlockTable table;
-    ASSERT_TRUE(mgr.Acquire(table, 4));  // 1 real page
+    ASSERT_TRUE(mgr.Acquire(pool, table, 4));  // 1 real page
     table.EvictToNull(0, pool.NullBlock());                 // first: punches hole
     CacheBlock* again = table.EvictToNull(0, pool.NullBlock());  // second: already null
     EXPECT_EQ(again, nullptr);                   // returns nullptr on already-null
@@ -279,9 +294,9 @@ TEST(SwaManagerTest, ReclaimExpiredMirrorsVllmBoundarySequence) {
     // Mirrors vLLM test_sliding_window_remove_skipped_blocks.
     // skipped = max(0, n - 4 + 1); skipped_blocks = skipped / 2.
     BlockPool pool(32);
-    SwaManager mgr(pool, /*page_size=*/2, /*sliding_window=*/4);
+    SwaManager mgr(/*page_size=*/2, /*sliding_window=*/4);
     BlockTable table;
-    ASSERT_TRUE(mgr.Acquire(table, 10));  // 5 real pages (10 tokens / page 2)
+    ASSERT_TRUE(mgr.Acquire(pool, table, 10));  // 5 real pages (10 tokens / page 2)
     ASSERT_EQ(table.NumBlocks(), 5);
     CacheBlock* p0 = table.Blocks()[0];
     CacheBlock* p1 = table.Blocks()[1];
@@ -290,35 +305,35 @@ TEST(SwaManagerTest, ReclaimExpiredMirrorsVllmBoundarySequence) {
     CacheBlock* p4 = table.Blocks()[4];
 
     // n=0: skipped 0 -> nothing freed.
-    mgr.ReclaimExpired(table, 0);
+    mgr.ReclaimExpired(pool, table, 0);
     EXPECT_FALSE(table.Blocks()[0]->IsNull());
 
     // n=4: skipped 1, blocks 0 -> page 0 still holds an in-window token, no free.
-    mgr.ReclaimExpired(table, 4);
+    mgr.ReclaimExpired(pool, table, 4);
     EXPECT_FALSE(table.Blocks()[0]->IsNull());
 
     // n=5: skipped 2, blocks 1 -> page 0 fully out -> punched to null.
     std::int32_t free_before5 = pool.NumFreeBlocks();
-    mgr.ReclaimExpired(table, 5);
+    mgr.ReclaimExpired(pool, table, 5);
     EXPECT_TRUE(table.Blocks()[0]->IsNull());
     EXPECT_FALSE(table.Blocks()[1]->IsNull());
     EXPECT_EQ(pool.NumFreeBlocks(), free_before5 + 1);  // p0 returned
 
     // n=6: skipped 3, blocks 1 -> page 1 still in window; no change.
-    mgr.ReclaimExpired(table, 6);
+    mgr.ReclaimExpired(pool, table, 6);
     EXPECT_TRUE(table.Blocks()[0]->IsNull());
     EXPECT_FALSE(table.Blocks()[1]->IsNull());
 
     // n=7: skipped 4, blocks 2 -> page 1 punched; page 0 already null -> break.
     std::int32_t free_before7 = pool.NumFreeBlocks();
-    mgr.ReclaimExpired(table, 7);
+    mgr.ReclaimExpired(pool, table, 7);
     EXPECT_TRUE(table.Blocks()[1]->IsNull());
     EXPECT_FALSE(table.Blocks()[2]->IsNull());
     EXPECT_EQ(pool.NumFreeBlocks(), free_before7 + 1);  // only p1 returned
 
     // n=11: skipped 8, blocks 4 -> pages 2 and 3 punched; page 4 stays.
     std::int32_t free_before11 = pool.NumFreeBlocks();
-    mgr.ReclaimExpired(table, 11);
+    mgr.ReclaimExpired(pool, table, 11);
     EXPECT_TRUE(table.Blocks()[2]->IsNull());
     EXPECT_TRUE(table.Blocks()[3]->IsNull());
     EXPECT_FALSE(table.Blocks()[4]->IsNull());
@@ -330,22 +345,22 @@ TEST(SwaManagerTest, ReclaimExpiredMirrorsVllmBoundarySequence) {
 
 TEST(SwaManagerTest, ReclaimExpiredEarlyReturnInsideWindow) {
     BlockPool pool(32);
-    SwaManager mgr(pool, 4, 16);  // big window
+    SwaManager mgr(4, 16);  // big window
     BlockTable table;
-    ASSERT_TRUE(mgr.Acquire(table, 8));  // 2 pages, 8 tokens <= window
+    ASSERT_TRUE(mgr.Acquire(pool, table, 8));  // 2 pages, 8 tokens <= window
     std::int32_t free_before = pool.NumFreeBlocks();
-    mgr.ReclaimExpired(table, 8);  // skipped = 8 - 16 + 1 < 0 -> early return
+    mgr.ReclaimExpired(pool, table, 8);  // skipped = 8 - 16 + 1 < 0 -> early return
     EXPECT_FALSE(table.Blocks()[0]->IsNull());
     EXPECT_EQ(pool.NumFreeBlocks(), free_before);
 }
 
 TEST(SwaManagerTest, ReclaimExpiredCapsToAllocatedBlocks) {
     BlockPool pool(32);
-    SwaManager mgr(pool, 4, 4);
+    SwaManager mgr(4, 4);
     BlockTable table;
-    ASSERT_TRUE(mgr.Acquire(table, 8));  // 2 pages
+    ASSERT_TRUE(mgr.Acquire(pool, table, 8));  // 2 pages
     // skipped_blocks would exceed NumBlocks(); must cap, not go out of bounds.
-    mgr.ReclaimExpired(table, 1000);
+    mgr.ReclaimExpired(pool, table, 1000);
     EXPECT_TRUE(table.Blocks()[0]->IsNull());
     EXPECT_TRUE(table.Blocks()[1]->IsNull());
     EXPECT_EQ(table.NumBlocks(), 2);  // still 2 slots, both null
@@ -355,12 +370,12 @@ TEST(SwaManagerTest, ReclaimExpiredEvictsFirstSlidOutFirst) {
     // Pool sized to exactly the 4 acquired pages (+1 null): the free list is empty
     // after Acquire, so the next allocation must expose FIFO order among the freed batch.
     BlockPool pool(5);
-    SwaManager mgr(pool, 2, 4);
+    SwaManager mgr(2, 4);
     BlockTable table;
-    ASSERT_TRUE(mgr.Acquire(table, 8));  // 4 pages
+    ASSERT_TRUE(mgr.Acquire(pool, table, 8));  // 4 pages
     CacheBlock* p0 = table.Blocks()[0];
     CacheBlock* p1 = table.Blocks()[1];
-    mgr.ReclaimExpired(table, 8);  // skipped 5, blocks 2 -> free pages 0,1
+    mgr.ReclaimExpired(pool, table, 8);  // skipped 5, blocks 2 -> free pages 0,1
     ASSERT_TRUE(table.Blocks()[0]->IsNull());
     ASSERT_TRUE(table.Blocks()[1]->IsNull());
 
@@ -372,26 +387,26 @@ TEST(SwaManagerTest, ReclaimExpiredEvictsFirstSlidOutFirst) {
 
 TEST(SwaManagerTest, ReclaimExpiredFreedCachedPageStaysPrefixReusable) {
     BlockPool pool(32);
-    SwaManager mgr(pool, 2, 4);
+    SwaManager mgr(2, 4);
     BlockTable table;
-    ASSERT_TRUE(mgr.Acquire(table, 8));  // 4 pages
+    ASSERT_TRUE(mgr.Acquire(pool, table, 8));  // 4 pages
     const std::string h0 = RealKey({1, 1}, 0);
-    mgr.CacheFullBlocks(table, std::vector<std::string>{h0});
+    mgr.CacheFullBlocks(pool, table, std::vector<std::string>{h0});
     CacheBlock* p0 = table.Blocks()[0];
     EXPECT_TRUE(p0->IsCached());
 
-    mgr.ReclaimExpired(table, 8);  // frees pages 0,1; p0 returns with hash intact
+    mgr.ReclaimExpired(pool, table, 8);  // frees pages 0,1; p0 returns with hash intact
     EXPECT_TRUE(table.Blocks()[0]->IsNull());
     EXPECT_EQ(pool.GetCachedBlock(h0), p0);
 }
 
 TEST(SwaManagerTest, ReclaimExpiredLeavesTailAvailUnchanged) {
     BlockPool pool(32);
-    SwaManager mgr(pool, 4, 4);
+    SwaManager mgr(4, 4);
     BlockTable table;
-    ASSERT_TRUE(mgr.Acquire(table, 10));  // 3 pages, last partial: tail_avail = 2
+    ASSERT_TRUE(mgr.Acquire(pool, table, 10));  // 3 pages, last partial: tail_avail = 2
     EXPECT_EQ(table.TailAvailableTokens(), 2);
-    mgr.ReclaimExpired(table, 10);  // skipped 7, blocks 1 -> frees front full page
+    mgr.ReclaimExpired(pool, table, 10);  // skipped 7, blocks 1 -> frees front full page
     EXPECT_TRUE(table.Blocks()[0]->IsNull());
     EXPECT_EQ(table.TailAvailableTokens(), 2);  // tail untouched
 }
@@ -399,14 +414,14 @@ TEST(SwaManagerTest, ReclaimExpiredLeavesTailAvailUnchanged) {
 TEST(SwaManagerTest, AcquireAdvancePairingKeepsPhysicalPagesBounded) {
     // Steady state: active pages stay bounded near ceil(window/page_size) = 2.
     BlockPool pool(64);
-    SwaManager mgr(pool, 2, 4);
+    SwaManager mgr(2, 4);
     BlockTable table;
     std::int32_t n = 0;
     std::int32_t baseline_free = pool.NumFreeBlocks();
     for (int step = 0; step < 20; ++step) {
         n += 2;                          // two new tokens -> one new page
-        ASSERT_TRUE(mgr.Acquire(table, 2));
-        mgr.ReclaimExpired(table, n);
+        ASSERT_TRUE(mgr.Acquire(pool, table, 2));
+        mgr.ReclaimExpired(pool, table, n);
     }
     std::int32_t active = baseline_free - pool.NumFreeBlocks();
     EXPECT_LE(active, 3);
