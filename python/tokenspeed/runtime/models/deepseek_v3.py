@@ -1210,7 +1210,9 @@ class DeepseekV3DraftAttentionMLA(DeepseekV3AttentionMLA):
 
 
 class DeepseekV3DecoderLayer(nn.Module):
-    ATTENTION_CLS: type = DeepseekV3AttentionMLA
+    @property
+    def attention_cls(self) -> type[nn.Module]:
+        return DeepseekV3AttentionMLA
 
     def __init__(
         self,
@@ -1229,7 +1231,7 @@ class DeepseekV3DecoderLayer(nn.Module):
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
 
-        self.self_attn = self.ATTENTION_CLS(
+        self.self_attn = self.attention_cls(
             config=config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,

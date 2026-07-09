@@ -70,7 +70,9 @@ class DeepseekV3DraftDecoderLayer(DeepseekV3DecoderLayer):
     ``ctx.draft_seq_lens_buf`` in place and is not idempotent across layers.
     """
 
-    ATTENTION_CLS: type = DeepseekV3DraftAttentionMLA
+    @property
+    def attention_cls(self) -> type[nn.Module]:
+        return DeepseekV3DraftAttentionMLA
 
     def _maybe_narrow_residual(
         self,
