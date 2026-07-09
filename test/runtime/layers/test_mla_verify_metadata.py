@@ -5,6 +5,9 @@ from types import SimpleNamespace
 import torch
 
 from tokenspeed.runtime.layers.attention.backends import mla as mla_backend
+from tokenspeed.runtime.layers.attention.backends import (
+    tokenspeed_mla as tokenspeed_mla_backend,
+)
 
 
 def _run_mla_decode(
@@ -92,3 +95,70 @@ def test_fp8_decode_dispatches_with_native_fp8_query(monkeypatch):
     )
 
     assert captured["q"].dtype == torch.float8_e4m3fn
+
+
+def test_tokenspeed_mla_forwards_cached_tree_mask_metadata(monkeypatch):
+    captured = {}
+
+    def fake_tokenspeed_mla_decode(**kwargs):
+        captured.update(kwargs)
+        query = kwargs["query"]
+        return torch.zeros(*query.shape[:-1], 4)
+
+    monkeypatch.setattr(
+        tokenspeed_mla_backend,
+        "tokenspeed_mla_decode",
+        fake_tokenspeed_mla_decode,
+    )
+    monkeypatch.setattr(
+        tokenspeed_mla_backend,
+        "get_cutedsl_workspace_buffer",
+        lambda *args, **kwargs: torch.empty(0, dtype=torch.int8),
+    )
+
+    custom_mask = torch.tensor([1, 1, 1, 0], dtype=torch.int8)
+    cmask_off = torch.tensor([0], dtype=torch.int32)
+    backend = object.__new__(tokenspeed_mla_backend.CuteDSLMLABackend)
+    backend.forward_decode_metadata = SimpleNamespace(
+        num_extends=0,
+        block_kv_indices=torch.zeros(1, 1, dtype=torch.int32),
+        seq_lens_k=torch.tensor([4], dtype=torch.int32),
+        max_seq_len_k=4,
+    )
+    backend.forward_decode_spec_info = SimpleNamespace(
+        custom_mask=custom_mask,
+        cmask_off=cmask_off,
+    )
+    backend._cache_groups_bound = False
+    backend.kernel_page_size = 4
+    backend.kv_lora_rank = 2
+    backend.qk_rope_head_dim = 2
+    backend.kv_cache_dim = 4
+    backend.data_type = torch.float32
+    backend.cutedsl_workspace = torch.empty(0, dtype=torch.int8)
+
+    layer = SimpleNamespace(
+        tp_q_head_num=1,
+        head_dim=4,
+        v_head_dim=4,
+        scaling=1.0,
+        k_scale_float=None,
+        layer_id=0,
+    )
+    token_to_kv_pool = SimpleNamespace(
+        get_key_buffer=lambda layer_id: torch.zeros(4, 4)
+    )
+
+    backend.forward_decode(
+        q=torch.zeros(1, 4),
+        k=None,
+        v=None,
+        layer=layer,
+        out_cache_loc=torch.empty(0, dtype=torch.int32),
+        token_to_kv_pool=token_to_kv_pool,
+        bs=1,
+        save_kv_cache=False,
+    )
+
+    assert captured["custom_mask"] is custom_mask
+    assert captured["cmask_off"] is cmask_off
