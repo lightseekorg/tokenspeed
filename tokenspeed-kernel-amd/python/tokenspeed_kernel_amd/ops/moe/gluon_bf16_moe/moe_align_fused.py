@@ -22,9 +22,7 @@ tail. Decode-only (EM_MAX + the O(G^2) rank tile grow with M*topk).
 from __future__ import annotations
 
 import torch
-import triton
-from triton.experimental import gluon
-from triton.experimental.gluon import language as gl
+from tokenspeed_kernel_amd._triton import gl, gluon, triton
 
 
 def _next_pow2(x: int) -> int:

@@ -11,8 +11,7 @@ reuse. See ``v9_beyond_hotloop`` in ROCm/gfx950-gluon-tutorials.
 
 from __future__ import annotations
 
-from triton.experimental import gluon
-from triton.experimental.gluon import language as gl
+from tokenspeed_kernel_amd._triton import gl, gluon
 
 
 @gluon.jit

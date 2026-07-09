@@ -12,9 +12,7 @@ No sort (the expert is read straight from ``topk_ids``), no MFMA, no LDS.
 from __future__ import annotations
 
 import torch
-import triton
-from triton.experimental import gluon
-from triton.experimental.gluon import language as gl
+from tokenspeed_kernel_amd._triton import gl, gluon, triton
 
 _LANES = gl.constexpr(64)  # wavefront width (reduction lanes)
 

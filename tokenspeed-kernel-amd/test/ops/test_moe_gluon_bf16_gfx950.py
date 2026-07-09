@@ -51,9 +51,14 @@ def _torch_moe_ref(hidden, w1, w2, topk_ids, topk_weights) -> torch.Tensor:
 
 def _build(num_tokens: int, seed: int = 0):
     g = torch.Generator(device="cuda").manual_seed(seed)
-    hidden = torch.randn(num_tokens, D, dtype=torch.bfloat16, device="cuda", generator=g)
+    hidden = torch.randn(
+        num_tokens, D, dtype=torch.bfloat16, device="cuda", generator=g
+    )
     # Scale weights down so the fp32 reference stays in a comparable range.
-    w1 = torch.randn(E, 2 * I_R, D, dtype=torch.bfloat16, device="cuda", generator=g) * 0.05
+    w1 = (
+        torch.randn(E, 2 * I_R, D, dtype=torch.bfloat16, device="cuda", generator=g)
+        * 0.05
+    )
     w2 = torch.randn(E, D, I_R, dtype=torch.bfloat16, device="cuda", generator=g) * 0.05
     logits = torch.randn(num_tokens, E, dtype=torch.float32, device="cuda", generator=g)
     topk_ids, topk_weights = _routing_softmax_topk(logits, TOPK)
@@ -76,8 +81,12 @@ def test_bf16_moe_matches_fp32_reference(num_tokens):
 def test_bf16_moe_splitk_consistency(num_tokens):
     """The decode split-K stage-1 path matches the single-launch path."""
     hidden, w1, w2, topk_ids, topk_weights = _build(num_tokens)
-    a = gluon_bf16_moe(hidden, w1, w2, topk_ids, topk_weights, split_k=1, warp_decode=False)
-    b = gluon_bf16_moe(hidden, w1, w2, topk_ids, topk_weights, split_k=8, warp_decode=False)
+    a = gluon_bf16_moe(
+        hidden, w1, w2, topk_ids, topk_weights, split_k=1, warp_decode=False
+    )
+    b = gluon_bf16_moe(
+        hidden, w1, w2, topk_ids, topk_weights, split_k=8, warp_decode=False
+    )
     torch.cuda.synchronize()
     peak = a.float().abs().max().item()
     max_abs = (a.float() - b.float()).abs().max().item()

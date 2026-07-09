@@ -30,9 +30,7 @@ are fp32 (values are small ints, exact in fp32).
 from __future__ import annotations
 
 import torch
-import triton
-from triton.experimental import gluon
-from triton.experimental.gluon import language as gl
+from tokenspeed_kernel_amd._triton import gl, gluon, triton
 
 
 def _next_pow2(x: int) -> int:

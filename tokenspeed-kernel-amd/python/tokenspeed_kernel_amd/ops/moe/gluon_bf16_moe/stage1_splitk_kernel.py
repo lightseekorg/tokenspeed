@@ -27,10 +27,7 @@ split-K is auto-selected only for small M (see ``auto_split_k``).
 from __future__ import annotations
 
 import torch
-import triton
-from triton.experimental import gluon
-from triton.experimental.gluon import language as gl
-from triton.experimental.gluon.language.amd.cdna4 import async_copy as cdna4_async_copy
+from tokenspeed_kernel_amd._triton import cdna4_async_copy, gl, gluon, triton
 
 
 # Valid SPLIT_K values must divide the K-tile count (K // BLOCK_K = 112 for
