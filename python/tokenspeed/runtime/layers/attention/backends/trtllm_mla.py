@@ -344,7 +344,11 @@ class TRTLLMMLABackend(AttentionBackend):
         max_blocks = self._calc_padded_blocks(self.max_context_len)
         block_kv_indices = self.decode_cuda_graph_kv_indices[:bs, :max_blocks]
 
-        # For capture we don't have req_to_page yet; just zero-fill the block indices.
+        # For capture we don't have req_to_page yet. Use the reserved padding
+        # page for all synthetic rows so capture does not depend on extra KV
+        # capacity for private per-request pages.
+        block_kv_indices.fill_(int(getattr(self, "cuda_graph_capture_dummy_page", 0)))
+
         # The actual indices will be filled on replay. seq_lens_k aliases
         # seq_lens_buf (set in init_cuda_graph_state).
         metadata = TRTLLMMLADecodeMetadata(
@@ -420,9 +424,11 @@ class TRTLLMMLABackend(AttentionBackend):
         num_extends = metadata.num_extends
         q_len_per_req = q.shape[0] // bs if bs > 0 else 1
 
-        if q_len_per_req > 1 and self.is_draft:
-            # First draft step catching up its KV after verify: one query entry per token;
-            # per-token seq_lens advance by 1 so each successive token sees its own KV write.
+        if q_len_per_req > 1:
+            # Multi-token decode is used by target verification and by the
+            # draft first-step catch-up path. Flatten to one decode query per
+            # token so each token gets its own causal seq_len instead of using
+            # the grouped decode path with one full-context bound for all rows.
             query = q.view(-1, layer.tp_q_head_num, layer.head_dim).unsqueeze(1)
             block_tables = metadata.block_kv_indices[num_extends:].repeat_interleave(
                 q_len_per_req, dim=0
@@ -430,11 +436,17 @@ class TRTLLMMLABackend(AttentionBackend):
             base_lens = metadata.seq_lens_k[num_extends:].repeat_interleave(
                 q_len_per_req
             )
+            if not self.is_draft:
+                # Target verification receives seq_lens at the end of the
+                # speculative window. Convert to per-token causal bounds.
+                base_lens = torch.clamp(base_lens - (q_len_per_req - 1), min=1)
             offsets = torch.arange(
                 q_len_per_req, device=base_lens.device, dtype=base_lens.dtype
             ).repeat(bs)
             seq_lens = base_lens + offsets
-            max_seq_len = metadata.max_seq_len_k + q_len_per_req
+            max_seq_len = metadata.max_seq_len_k + (
+                q_len_per_req if self.is_draft else 0
+            )
         else:
             # Plain decode (q_len=1) or bs-grouped multi-token decode.
             query = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)

@@ -443,6 +443,35 @@ class CudaGraphWrapper:
             grammar_backend=self.grammar_backend,
         )
 
+        def prepare_attention_capture_buffers():
+            # Spec-decode capture runs a synthetic multi-token decode. Keep the
+            # dummy cache state internally consistent so attention capture does
+            # not depend on impossible q_len > seq_len inputs or private pages.
+            tokens_per_req = self.max_tokens_per_req
+            self.input_buffers.seq_lens_buf[:bs].fill_(tokens_per_req)
+
+            page_size = self.input_buffers.page_size
+            dummy_slot = int(self.input_buffers.dummy_kv_slot)
+            dummy_page = dummy_slot // page_size
+            for backend in (self.attn_backend, self.draft_attn_backend):
+                if backend is not None:
+                    backend.cuda_graph_capture_dummy_page = dummy_page
+            self.input_buffers.out_cache_loc_buf[: bs * tokens_per_req].fill_(
+                dummy_slot
+            )
+
+            dummy_page_start = dummy_page * page_size
+            dummy_page_end = dummy_page_start + page_size
+            for pool in (self.token_to_kv_pool, self.draft_token_to_kv_pool):
+                if pool is None or not hasattr(pool, "kv_buffer"):
+                    continue
+                for layer_buf in pool.kv_buffer:
+                    if isinstance(layer_buf, (tuple, list)):
+                        for sub_buf in layer_buf:
+                            sub_buf[dummy_page_start:dummy_page_end].zero_()
+                    else:
+                        layer_buf[dummy_page_start:dummy_page_end].zero_()
+
         def run_once():
             # Dummy add_batch keeps the grammar queue 1:1 with replays —
             # fetch_batch pops once per forward, so warmup + capture
@@ -460,7 +489,7 @@ class CudaGraphWrapper:
             self._prepare_sampling_capture(bs=bs, variant=variant)
             # Keep warmup seq_lens >= q_len_per_req so no query row gets an
             # empty causal span; a stale seq_len of 1 overflows to non-finite KV.
-            self.input_buffers.seq_lens_buf[:bs].fill_(self.max_tokens_per_req)
+            prepare_attention_capture_buffers()
             self._init_capture_metadata(bs)
             run_once()
 
@@ -475,12 +504,14 @@ class CudaGraphWrapper:
         # Warmups can switch a backend back to eager metadata objects. Restore
         # the graph-backed metadata immediately before capture so replay-time
         # metadata refreshes update the same tensors recorded by the graph.
+        prepare_attention_capture_buffers()
         self._init_capture_metadata(bs)
 
         # Fill sampler buffers OUTSIDE the capture so RNG ops aren't recorded.
         self._prepare_sampling_capture(bs=bs, variant=variant)
         # Warmup forwards can mutate aliased metadata buffers, so refresh
         # them again immediately before graph capture records the final views.
+        prepare_attention_capture_buffers()
         self._init_capture_metadata(bs)
 
         self.deepep_adapter.capture()
