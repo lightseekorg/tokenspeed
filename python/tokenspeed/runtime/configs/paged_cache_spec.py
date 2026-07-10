@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Dict, Literal, Optional
+from typing import Literal
 
 Retention = Literal["full_history", "sliding_window"]
 Family = Literal["history", "state"]
@@ -58,7 +58,7 @@ LINEAR_ATTENTION = "linear_attention"
 
 # layer_type label -> retention. GPT-OSS uses the first two, Qwen3.5 GDN
 # layers use "linear_attention"; unknown labels raise.
-_LAYER_TYPE_RETENTION: Dict[str, Retention] = {
+_LAYER_TYPE_RETENTION: dict[str, Retention] = {
     FULL_ATTENTION: "full_history",
     "sliding_attention": "sliding_window",
     # State groups ride full_history retention: the C++ side keys the
@@ -71,11 +71,11 @@ STATE_LAYER_TYPES = frozenset({LINEAR_ATTENTION})
 
 
 def hybrid_slab_group_size(
-    layer_types: Optional[Sequence[str]],
+    layer_types: Sequence[str] | None,
     *,
     speculative_enabled: bool,
     sliding_window_tokens: int | Sequence[int | None] | None = None,
-) -> Optional[int]:
+) -> int | None:
     """Group size for the hybrid slab KV layout (one layer of EACH group
     shares a K/V slab), or None to keep the legacy per-layer layout.
 
@@ -185,7 +185,7 @@ def compute_paged_cache_group_page_counts(
     decode_input_tokens: int = 1,
     overlap_schedule_depth: int = 0,
     safety_margin: int = 0,
-) -> Dict[str, int]:
+) -> dict[str, int]:
     # Local import: keeps this module torch-free at import time.
     from tokenspeed.runtime.utils.common import ceil_div
 
@@ -427,7 +427,7 @@ def publish_paged_cache_groups(
     max_scheduled_tokens: int,
     max_total_tokens: int,
     max_context_len: int,
-) -> tuple[list[PagedCacheGroupSpec], Dict[str, int]] | None:
+) -> tuple[list[PagedCacheGroupSpec], dict[str, int]] | None:
     """Publication rule (canonical) for a KV pool's paged-cache groups.
 
     Publish groups iff the scheduler ext is flat-built (a radix ext never
