@@ -32,6 +32,22 @@ def has_fused_qnorm_rope_kv_insert() -> bool:
     return hasattr(module, "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert")
 
 
+def has_fused_qnorm_rope_kv_insert_padded() -> bool:
+    """Return whether the optional padded-Q producer symbol is available."""
+
+    try:
+        module = _load_deepseek_v4_attention_module()
+    except Exception:
+        return False
+    return all(
+        hasattr(module, name)
+        for name in (
+            "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
+            "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_padded",
+        )
+    )
+
+
 def has_indexer_topk_prefill() -> bool:
     try:
         module = _load_deepseek_v4_attention_module()
@@ -66,7 +82,29 @@ def fused_qnorm_rope_kv_insert(
     rms_norm_eps: float,
     block_size: int,
     enable_pdl: bool = False,
+    q_out: torch.Tensor | None = None,
 ) -> None:
+    """Normalize Q and insert the normalized/quantized KV into the SWA cache.
+
+    Args:
+        q: Contiguous ``[tokens, local_heads, 512]`` FP16 or BF16 input. It is
+            normalized and rotated in place when ``q_out`` is omitted, and is
+            preserved when ``q_out`` is provided.
+        kv: Contiguous ``[tokens, 512]`` input with the same dtype as ``q``.
+        k_cache: UINT8 paged SWA cache flattened to ``[blocks, block_bytes]``.
+        slot_mapping: Cache slot for each KV row to insert.
+        positions: Absolute position for every Q/KV row.
+        cos_sin_cache: FP32 rotary embedding cache with width 64.
+        rms_norm_eps: Epsilon used by RMS normalization.
+        block_size: Number of cache slots per block.
+        enable_pdl: Whether to enable programmatic dependent launch.
+        q_out: Optional contiguous ``[tokens, padded_heads, 512]`` output. The
+            active heads contain normalized/rotated Q, the padded tail is
+            bitwise +0, and the tensor must not overlap any input tensor.
+
+    Returns:
+        None.
+    """
     if q.dtype not in (torch.float16, torch.bfloat16):
         raise TypeError(f"q must be float16 or bfloat16, got {q.dtype}")
     if kv.dtype != q.dtype:
@@ -75,12 +113,24 @@ def fused_qnorm_rope_kv_insert(
         raise TypeError(f"k_cache must be uint8, got {k_cache.dtype}")
     if cos_sin_cache.dtype != torch.float32:
         raise TypeError(f"cos_sin_cache must be float32, got {cos_sin_cache.dtype}")
+    if q_out is not None:
+        if q_out.dtype != q.dtype:
+            raise TypeError(f"q_out dtype {q_out.dtype} must match q dtype {q.dtype}")
+        if q_out.device != q.device:
+            raise ValueError("q_out must be on the same device as q")
+        if q_out.ndim != 3 or q_out.shape[0] != q.shape[0]:
+            raise ValueError("q_out must be [tokens, padded_heads, head_dim]")
+        if q_out.shape[1] < q.shape[1] or q_out.shape[2] != q.shape[2]:
+            raise ValueError("q_out must preserve all q heads and the q head_dim")
+        if not q_out.is_contiguous():
+            raise ValueError("q_out must be contiguous")
     if slot_mapping.dtype != torch.int64:
         slot_mapping = slot_mapping.to(torch.int64)
     if positions.dtype != torch.int64:
         positions = positions.to(torch.int64)
 
-    _load_deepseek_v4_attention_module().fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+    module = _load_deepseek_v4_attention_module()
+    args = (
         q,
         kv,
         k_cache,
@@ -90,6 +140,19 @@ def fused_qnorm_rope_kv_insert(
         float(rms_norm_eps),
         int(block_size),
         bool(enable_pdl),
+    )
+    if q_out is None:
+        module.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(*args)
+        return
+    if not hasattr(module, "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_padded"):
+        raise RuntimeError(
+            "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_padded is "
+            "unavailable; rebuild tokenspeed-kernel"
+        )
+    module.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_padded(
+        q,
+        q_out,
+        *args[1:],
     )
 
 

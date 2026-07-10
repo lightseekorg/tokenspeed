@@ -169,9 +169,10 @@ __device__ __forceinline__ float warp_sum(float val) {
   return val;
 }
 
-template <typename scalar_t>
+template <typename scalar_t, bool kWritePaddedQ>
 __global__ void fused_qnorm_rope_kv_insert_kernel(
     scalar_t* __restrict__ q,
+    scalar_t* __restrict__ q_out,
     const scalar_t* __restrict__ kv,
     uint8_t* __restrict__ k_cache,
     const int64_t* __restrict__ slot_mapping,
@@ -181,6 +182,7 @@ __global__ void fused_qnorm_rope_kv_insert_kernel(
     int num_tokens_full,
     int num_tokens_insert,
     int num_heads,
+    int padded_heads,
     int cache_block_size,
     int64_t cache_block_stride,
     bool enable_pdl,
@@ -276,11 +278,35 @@ __global__ void fused_qnorm_rope_kv_insert_kernel(
       po0[i] = float_to_scalar<scalar_t>(values[i]);
       po1[i] = float_to_scalar<scalar_t>(values[8 + i]);
     }
-    scalar_t* dst =
-        q + (static_cast<int64_t>(token_idx) * num_heads + task_idx) * kHeadDim +
-        dim_base;
-    *reinterpret_cast<uint4*>(dst) = out0;
-    *reinterpret_cast<uint4*>(dst + 8) = out1;
+    if constexpr (kWritePaddedQ) {
+      scalar_t* q_out_dst =
+          q_out +
+          (static_cast<int64_t>(token_idx) * padded_heads + task_idx) *
+              kHeadDim +
+          dim_base;
+      *reinterpret_cast<uint4*>(q_out_dst) = out0;
+      *reinterpret_cast<uint4*>(q_out_dst + 8) = out1;
+
+      const uint4 zero = make_uint4(0, 0, 0, 0);
+      for (int head_idx = num_heads + task_idx; head_idx < padded_heads;
+           head_idx += num_heads) {
+        scalar_t* padded_dst =
+            q_out +
+            (static_cast<int64_t>(token_idx) * padded_heads + head_idx) *
+                kHeadDim +
+            dim_base;
+        *reinterpret_cast<uint4*>(padded_dst) = zero;
+        *reinterpret_cast<uint4*>(padded_dst + 8) = zero;
+      }
+    } else {
+      scalar_t* dst =
+          q +
+          (static_cast<int64_t>(token_idx) * num_heads + task_idx) *
+              kHeadDim +
+          dim_base;
+      *reinterpret_cast<uint4*>(dst) = out0;
+      *reinterpret_cast<uint4*>(dst + 8) = out1;
+    }
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 12000 && defined(__CUDA_ARCH__) && \
     (__CUDA_ARCH__ >= 900)
     if (enable_pdl) {
@@ -369,9 +395,10 @@ __global__ void fused_qnorm_rope_kv_insert_kernel(
 #endif
 }
 
-template <typename scalar_t>
+template <typename scalar_t, bool kWritePaddedQ>
 void launch_fused_qnorm_rope_kv_insert(
     scalar_t* q,
+    scalar_t* q_out,
     const scalar_t* kv,
     uint8_t* k_cache,
     const int64_t* slot_mapping,
@@ -381,6 +408,7 @@ void launch_fused_qnorm_rope_kv_insert(
     int num_tokens_full,
     int num_tokens_insert,
     int num_heads,
+    int padded_heads,
     int cache_block_size,
     int64_t cache_block_stride,
     bool enable_pdl,
@@ -411,18 +439,21 @@ void launch_fused_qnorm_rope_kv_insert(
       config.attrs = attrs;
       config.numAttrs = 1;
       cudaLaunchKernelEx(
-          &config, fused_qnorm_rope_kv_insert_kernel<scalar_t>, q, kv, k_cache,
-          slot_mapping, positions, cos_sin_cache, rms_norm_eps, num_tokens_full,
-          num_tokens_insert, num_heads, cache_block_size, cache_block_stride, true,
-          max_cache_slots);
+          &config,
+          fused_qnorm_rope_kv_insert_kernel<scalar_t, kWritePaddedQ>, q, q_out,
+          kv, k_cache, slot_mapping, positions, cos_sin_cache, rms_norm_eps,
+          num_tokens_full, num_tokens_insert, num_heads, padded_heads,
+          cache_block_size, cache_block_stride, true, max_cache_slots);
       return;
     }
   }
 #endif
-  fused_qnorm_rope_kv_insert_kernel<scalar_t><<<grid, kThreads, 0, stream>>>(
-      q, kv, k_cache, slot_mapping, positions, cos_sin_cache, rms_norm_eps,
-      num_tokens_full, num_tokens_insert, num_heads, cache_block_size,
-      cache_block_stride, false, max_cache_slots);
+  fused_qnorm_rope_kv_insert_kernel<scalar_t, kWritePaddedQ>
+      <<<grid, kThreads, 0, stream>>>(
+          q, q_out, kv, k_cache, slot_mapping, positions, cos_sin_cache,
+          rms_norm_eps, num_tokens_full, num_tokens_insert, num_heads,
+          padded_heads, cache_block_size, cache_block_stride, false,
+          max_cache_slots);
 }
 
 }  // namespace
@@ -523,8 +554,9 @@ void deepseek_v4_gather_paged_indexer_mxfp4_cache(TensorView kv_cache,
       << cudaGetErrorString(status);
 }
 
-void fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+static void fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_impl(
     TensorView q,
+    const TensorView* q_out,
     TensorView kv,
     TensorView k_cache,
     TensorView slot_mapping,
@@ -534,12 +566,18 @@ void fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
     int64_t cache_block_size,
     bool enable_pdl) {
   CHECK_CUDA(q);
+  if (q_out != nullptr) {
+    CHECK_CUDA((*q_out));
+  }
   CHECK_CUDA(kv);
   CHECK_CUDA(k_cache);
   CHECK_CUDA(slot_mapping);
   CHECK_CUDA(positions);
   CHECK_CUDA(cos_sin_cache);
   CHECK_DIM(3, q);
+  if (q_out != nullptr) {
+    CHECK_DIM(3, (*q_out));
+  }
   CHECK_DIM(2, kv);
   CHECK_DIM(2, k_cache);
   CHECK_DIM(1, slot_mapping);
@@ -547,6 +585,23 @@ void fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
   CHECK_DIM(2, cos_sin_cache);
 
   TVM_FFI_ICHECK(q.IsContiguous()) << "q must be contiguous";
+  TVM_FFI_ICHECK(q.dtype() == dl_float16 || q.dtype() == dl_bfloat16)
+      << "q must be float16 or bfloat16";
+  if (q_out != nullptr) {
+    TVM_FFI_ICHECK(q.size(0) > 0) << "q must contain at least one token";
+    TVM_FFI_ICHECK(q.size(1) > 0) << "q must contain at least one head";
+    TVM_FFI_ICHECK(q_out->IsContiguous()) << "q_out must be contiguous";
+    TVM_FFI_ICHECK(q_out->dtype() == q.dtype())
+        << "q_out dtype must match q dtype";
+    TVM_FFI_ICHECK(q_out->device().device_id == q.device().device_id)
+        << "q_out must be on the same CUDA device as q";
+    TVM_FFI_ICHECK(q_out->size(0) == q.size(0))
+        << "q_out token count must match q";
+    TVM_FFI_ICHECK(q_out->size(1) >= q.size(1))
+        << "q_out must have at least as many heads as q";
+    TVM_FFI_ICHECK(q_out->size(2) == kHeadDim)
+        << "q_out must have head_dim=512";
+  }
   TVM_FFI_ICHECK(kv.IsContiguous()) << "kv must be contiguous";
   TVM_FFI_ICHECK(k_cache.stride(1) == 1) << "k_cache last dim must be contiguous";
   TVM_FFI_ICHECK(slot_mapping.IsContiguous()) << "slot_mapping must be contiguous";
@@ -571,35 +626,128 @@ void fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
   TVM_FFI_ICHECK(k_cache.size(1) >= cache_block_size * (kTokenDataBytes + kScaleBytesPerToken))
       << "k_cache block stride is too small for DeepSeek V4 SWA rows";
 
+  if (q_out != nullptr) {
+    const auto tensor_span_bytes = [](TensorView tensor) -> uintptr_t {
+      uintptr_t last_element_offset = 0;
+      for (int i = 0; i < tensor.ndim(); ++i) {
+        const int64_t size = tensor.size(i);
+        const int64_t stride = tensor.stride(i);
+        TVM_FFI_ICHECK(size >= 0) << "tensor dimensions must be non-negative";
+        TVM_FFI_ICHECK(stride >= 0) << "tensor strides must be non-negative";
+        if (size == 0) {
+          return 0;
+        }
+        const uintptr_t extent = static_cast<uintptr_t>(size - 1);
+        const uintptr_t step = static_cast<uintptr_t>(stride);
+        TVM_FFI_ICHECK(step == 0 || extent <= UINTPTR_MAX / step)
+            << "tensor byte range overflow";
+        const uintptr_t dimension_offset = extent * step;
+        TVM_FFI_ICHECK(dimension_offset <= UINTPTR_MAX - last_element_offset)
+            << "tensor byte range overflow";
+        last_element_offset += dimension_offset;
+      }
+      const uintptr_t element_size =
+          static_cast<uintptr_t>(get_element_size(tensor));
+      TVM_FFI_ICHECK(element_size > 0) << "tensor element size must be positive";
+      TVM_FFI_ICHECK(last_element_offset < UINTPTR_MAX)
+          << "tensor byte range overflow";
+      const uintptr_t span_elements = last_element_offset + 1;
+      TVM_FFI_ICHECK(span_elements <= UINTPTR_MAX / element_size)
+          << "tensor byte range overflow";
+      return span_elements * element_size;
+    };
+    const uintptr_t q_out_bytes = tensor_span_bytes((*q_out));
+    const uintptr_t q_out_begin =
+        reinterpret_cast<uintptr_t>(q_out->data_ptr());
+    TVM_FFI_ICHECK(q_out_bytes <= UINTPTR_MAX - q_out_begin)
+        << "tensor byte range overflow";
+    const uintptr_t q_out_end = q_out_begin + q_out_bytes;
+    const auto check_q_out_does_not_overlap = [&](TensorView input,
+                                                   const char* input_name) {
+      if (q_out->device().device_type != input.device().device_type ||
+          q_out->device().device_id != input.device().device_id) {
+        return;
+      }
+      const uintptr_t input_bytes = tensor_span_bytes(input);
+      if (input_bytes == 0) {
+        return;
+      }
+      const uintptr_t input_begin =
+          reinterpret_cast<uintptr_t>(input.data_ptr());
+      TVM_FFI_ICHECK(input_bytes <= UINTPTR_MAX - input_begin)
+          << "tensor byte range overflow";
+      const uintptr_t input_end = input_begin + input_bytes;
+      TVM_FFI_ICHECK(q_out_end <= input_begin || input_end <= q_out_begin)
+          << "q_out must not overlap " << input_name;
+    };
+    check_q_out_does_not_overlap(q, "q");
+    check_q_out_does_not_overlap(kv, "kv");
+    check_q_out_does_not_overlap(k_cache, "k_cache");
+    check_q_out_does_not_overlap(slot_mapping, "slot_mapping");
+    check_q_out_does_not_overlap(positions, "positions");
+    check_q_out_does_not_overlap(cos_sin_cache, "cos_sin_cache");
+  }
+
   cudaSetDevice(q.device().device_id);
   const cudaStream_t stream = get_stream(q.device());
   const int num_tokens_full = static_cast<int>(q.size(0));
   const int num_tokens_insert = static_cast<int>(slot_mapping.size(0));
   const int num_heads = static_cast<int>(q.size(1));
+  const int padded_heads =
+      q_out == nullptr ? num_heads : static_cast<int>(q_out->size(1));
   const int64_t cache_block_stride = k_cache.stride(0);
   const int64_t max_cache_slots = k_cache.size(0) * cache_block_size;
 
   if (q.dtype() == dl_float16) {
-    launch_fused_qnorm_rope_kv_insert<half>(
-        static_cast<half*>(q.data_ptr()), static_cast<const half*>(kv.data_ptr()),
-        static_cast<uint8_t*>(k_cache.data_ptr()),
-        static_cast<const int64_t*>(slot_mapping.data_ptr()),
-        static_cast<const int64_t*>(positions.data_ptr()),
-        static_cast<const float*>(cos_sin_cache.data_ptr()),
-        static_cast<float>(rms_norm_eps), num_tokens_full, num_tokens_insert,
-        num_heads, static_cast<int>(cache_block_size), cache_block_stride,
-        enable_pdl, max_cache_slots, stream);
+    if (q_out == nullptr) {
+      launch_fused_qnorm_rope_kv_insert<half, false>(
+          static_cast<half*>(q.data_ptr()), nullptr,
+          static_cast<const half*>(kv.data_ptr()),
+          static_cast<uint8_t*>(k_cache.data_ptr()),
+          static_cast<const int64_t*>(slot_mapping.data_ptr()),
+          static_cast<const int64_t*>(positions.data_ptr()),
+          static_cast<const float*>(cos_sin_cache.data_ptr()),
+          static_cast<float>(rms_norm_eps), num_tokens_full, num_tokens_insert,
+          num_heads, num_heads, static_cast<int>(cache_block_size),
+          cache_block_stride, enable_pdl, max_cache_slots, stream);
+    } else {
+      launch_fused_qnorm_rope_kv_insert<half, true>(
+          static_cast<half*>(q.data_ptr()),
+          static_cast<half*>(q_out->data_ptr()),
+          static_cast<const half*>(kv.data_ptr()),
+          static_cast<uint8_t*>(k_cache.data_ptr()),
+          static_cast<const int64_t*>(slot_mapping.data_ptr()),
+          static_cast<const int64_t*>(positions.data_ptr()),
+          static_cast<const float*>(cos_sin_cache.data_ptr()),
+          static_cast<float>(rms_norm_eps), num_tokens_full, num_tokens_insert,
+          num_heads, padded_heads, static_cast<int>(cache_block_size),
+          cache_block_stride, enable_pdl, max_cache_slots, stream);
+    }
   } else if (q.dtype() == dl_bfloat16) {
-    launch_fused_qnorm_rope_kv_insert<nv_bfloat16>(
-        static_cast<nv_bfloat16*>(q.data_ptr()),
-        static_cast<const nv_bfloat16*>(kv.data_ptr()),
-        static_cast<uint8_t*>(k_cache.data_ptr()),
-        static_cast<const int64_t*>(slot_mapping.data_ptr()),
-        static_cast<const int64_t*>(positions.data_ptr()),
-        static_cast<const float*>(cos_sin_cache.data_ptr()),
-        static_cast<float>(rms_norm_eps), num_tokens_full, num_tokens_insert,
-        num_heads, static_cast<int>(cache_block_size), cache_block_stride,
-        enable_pdl, max_cache_slots, stream);
+    if (q_out == nullptr) {
+      launch_fused_qnorm_rope_kv_insert<nv_bfloat16, false>(
+          static_cast<nv_bfloat16*>(q.data_ptr()), nullptr,
+          static_cast<const nv_bfloat16*>(kv.data_ptr()),
+          static_cast<uint8_t*>(k_cache.data_ptr()),
+          static_cast<const int64_t*>(slot_mapping.data_ptr()),
+          static_cast<const int64_t*>(positions.data_ptr()),
+          static_cast<const float*>(cos_sin_cache.data_ptr()),
+          static_cast<float>(rms_norm_eps), num_tokens_full, num_tokens_insert,
+          num_heads, num_heads, static_cast<int>(cache_block_size),
+          cache_block_stride, enable_pdl, max_cache_slots, stream);
+    } else {
+      launch_fused_qnorm_rope_kv_insert<nv_bfloat16, true>(
+          static_cast<nv_bfloat16*>(q.data_ptr()),
+          static_cast<nv_bfloat16*>(q_out->data_ptr()),
+          static_cast<const nv_bfloat16*>(kv.data_ptr()),
+          static_cast<uint8_t*>(k_cache.data_ptr()),
+          static_cast<const int64_t*>(slot_mapping.data_ptr()),
+          static_cast<const int64_t*>(positions.data_ptr()),
+          static_cast<const float*>(cos_sin_cache.data_ptr()),
+          static_cast<float>(rms_norm_eps), num_tokens_full, num_tokens_insert,
+          num_heads, padded_heads, static_cast<int>(cache_block_size),
+          cache_block_stride, enable_pdl, max_cache_slots, stream);
+    }
   } else {
     TVM_FFI_ICHECK(false) << "q/kv dtype must be float16 or bfloat16";
   }
@@ -608,4 +756,35 @@ void fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert failed: "
       << cudaGetErrorString(status);
+}
+
+void fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+    TensorView q,
+    TensorView kv,
+    TensorView k_cache,
+    TensorView slot_mapping,
+    TensorView positions,
+    TensorView cos_sin_cache,
+    double rms_norm_eps,
+    int64_t cache_block_size,
+    bool enable_pdl) {
+  fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_impl(
+      q, nullptr, kv, k_cache, slot_mapping, positions, cos_sin_cache,
+      rms_norm_eps, cache_block_size, enable_pdl);
+}
+
+void fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_padded(
+    TensorView q,
+    TensorView q_out,
+    TensorView kv,
+    TensorView k_cache,
+    TensorView slot_mapping,
+    TensorView positions,
+    TensorView cos_sin_cache,
+    double rms_norm_eps,
+    int64_t cache_block_size,
+    bool enable_pdl) {
+  fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_impl(
+      q, &q_out, kv, k_cache, slot_mapping, positions, cos_sin_cache,
+      rms_norm_eps, cache_block_size, enable_pdl);
 }

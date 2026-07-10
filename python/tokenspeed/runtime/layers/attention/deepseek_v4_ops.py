@@ -31,6 +31,9 @@ from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
 from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
     has_fused_qnorm_rope_kv_insert as _cuda_has_fused_qnorm_rope_kv_insert,
 )
+from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
+    has_fused_qnorm_rope_kv_insert_padded as _cuda_has_fused_qnorm_rope_kv_insert_padded,
+)
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_build_dense_prefill_local_compressed_indices,
     deepseek_v4_combine_dense_swa_indices,
@@ -96,6 +99,7 @@ __all__ = (
     "deepseek_v4_prepare_indexer_q_mxfp4",
     "dequantize_deepseek_v4_fp8_ds_mla_cache",
     "fused_qnorm_rope_kv_insert",
+    "has_fused_qnorm_rope_kv_insert_padded",
     "read_deepseek_v4_indexer_fp8_cache",
     "read_deepseek_v4_indexer_mxfp4_cache",
     "save_deepseek_v4_compressor_state",
@@ -141,6 +145,12 @@ def _indexer_fp8_layout_from_cache(
     return deepseek_v4_indexer_fp8_layout_from_row_bytes(row_bytes)
 
 
+def has_fused_qnorm_rope_kv_insert_padded() -> bool:
+    """Return whether the optional padded-Q producer is available."""
+
+    return _cuda_has_fused_qnorm_rope_kv_insert_padded()
+
+
 def fused_qnorm_rope_kv_insert(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -150,15 +160,27 @@ def fused_qnorm_rope_kv_insert(
     cos_sin_cache: torch.Tensor,
     rms_norm_eps: float,
     block_size: int,
+    q_out: torch.Tensor | None = None,
 ) -> None:
     """Run the DeepSeek V4 fused SWA cache insert op.
 
-    Expected contract:
-    - q: [tokens, local_heads, 512], mutated in place by RMSNorm/RoPE
-    - kv: [tokens, 512], source KV latent before RoPE/quant insert
-    - swa_kv_cache_2d: uint8 cache blocks flattened as [num_blocks, block_bytes]
-    - slot_mapping: output token slots in the paged SWA cache
-    - positions: absolute token positions
+    Args:
+        q: Contiguous ``[tokens, local_heads, 512]`` input. It is normalized and
+            rotated in place when ``q_out`` is omitted, and preserved otherwise.
+        kv: Contiguous ``[tokens, 512]`` KV latent before RoPE/quantization.
+        swa_kv_cache_2d: UINT8 cache blocks flattened to
+            ``[num_blocks, block_bytes]``.
+        slot_mapping: Output token slots in the paged SWA cache.
+        positions: Absolute position for every Q/KV row.
+        cos_sin_cache: FP32 rotary embedding cache with width 64.
+        rms_norm_eps: Epsilon used by RMS normalization.
+        block_size: Number of cache slots per block.
+        q_out: Optional contiguous ``[tokens, padded_heads, 512]`` output. Its
+            active heads contain normalized/rotated Q, its tail is bitwise +0,
+            and it must not overlap any input tensor.
+
+    Returns:
+        None.
     """
 
     if not _cuda_has_fused_qnorm_rope_kv_insert():
@@ -178,6 +200,7 @@ def fused_qnorm_rope_kv_insert(
         cos_sin_cache,
         rms_norm_eps,
         block_size,
+        q_out=q_out,
     )
 
 

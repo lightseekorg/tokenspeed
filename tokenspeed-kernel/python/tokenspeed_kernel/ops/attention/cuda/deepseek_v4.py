@@ -19,6 +19,7 @@ try:
     from tokenspeed_kernel.thirdparty.cuda.deepseek_v4_attention import (
         fused_qnorm_rope_kv_insert,
         has_fused_qnorm_rope_kv_insert,
+        has_fused_qnorm_rope_kv_insert_padded,
         has_indexer_mxfp4_paged_gather,
         has_indexer_topk_prefill,
         has_persistent_topk,
@@ -29,6 +30,9 @@ try:
 except ImportError:
 
     def has_fused_qnorm_rope_kv_insert() -> bool:
+        return False
+
+    def has_fused_qnorm_rope_kv_insert_padded() -> bool:
         return False
 
     def has_indexer_topk_prefill() -> bool:
@@ -48,6 +52,7 @@ except ImportError:
 __all__ = [
     "fused_qnorm_rope_kv_insert",
     "has_fused_qnorm_rope_kv_insert",
+    "has_fused_qnorm_rope_kv_insert_padded",
     "has_indexer_mxfp4_paged_gather",
     "has_indexer_topk_prefill",
     "has_persistent_topk",

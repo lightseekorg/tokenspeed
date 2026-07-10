@@ -33,6 +33,18 @@ void fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
     int64_t cache_block_size,
     bool enable_pdl);
 
+void fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_padded(
+    TensorView q,
+    TensorView q_out,
+    TensorView kv,
+    TensorView k_cache,
+    TensorView slot_mapping,
+    TensorView positions,
+    TensorView cos_sin_cache,
+    double rms_norm_eps,
+    int64_t cache_block_size,
+    bool enable_pdl);
+
 void deepseek_v4_indexer_topk_prefill(TensorView logits,
                                       TensorView row_starts,
                                       TensorView row_ends,
@@ -55,6 +67,9 @@ void deepseek_v4_persistent_topk(TensorView logits,
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
                               fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(
+    fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_padded,
+    fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_padded);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(deepseek_v4_indexer_topk_prefill,
                               deepseek_v4_indexer_topk_prefill);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(deepseek_v4_gather_paged_indexer_mxfp4_cache,

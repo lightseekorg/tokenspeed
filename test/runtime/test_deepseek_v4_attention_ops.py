@@ -13,9 +13,13 @@
 
 import math
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
+from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
+    fused_qnorm_rope_kv_insert as cuda_fused_qnorm_rope_kv_insert,
+)
 from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
     has_indexer_mxfp4_paged_gather,
     has_persistent_topk,
@@ -28,6 +32,7 @@ from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
     deepseek_v4_swa_scale_dim,
     deepseek_v4_swa_token_stride,
 )
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
     deepseek_v4_combine_dense_swa_indices,
     deepseek_v4_combine_topk_swa_indices,
@@ -41,6 +46,7 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
     deepseek_v4_prepare_indexer_q_mxfp4,
     dequantize_deepseek_v4_fp8_ds_mla_cache,
     fused_qnorm_rope_kv_insert,
+    has_fused_qnorm_rope_kv_insert_padded,
     read_deepseek_v4_indexer_fp8_cache,
     read_deepseek_v4_indexer_mxfp4_cache,
     save_deepseek_v4_compressor_state,
@@ -51,8 +57,10 @@ from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
     _mask_invalid_graph_tokens,
 )
 from tokenspeed.runtime.models.deepseek_v4 import (
+    DeepseekV4Attention,
     _deepseek_v4_sanitize_swa_slot_mapping,
 )
+from tokenspeed.runtime.utils.cuda_stream import StreamFork
 
 HEAD_DIM = 512
 NOPE_DIM = 448
@@ -288,6 +296,110 @@ def _expected_overlap_normed(
 
 
 class DeepseekV4AttentionOpsCpuValidationTest(unittest.TestCase):
+    def test_padded_q_runtime_route_is_pure_prefill_only(self):
+        def run_case(
+            mode: ForwardMode,
+            *,
+            capability: bool,
+            padded_heads: int = 64,
+        ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+            attention = object.__new__(DeepseekV4Attention)
+            torch.nn.Module.__init__(attention)
+            attention.attention_kind = "csa"
+            attention.rotary_emb = SimpleNamespace(
+                cos_sin_cache=torch.zeros(1, ROPE_DIM, dtype=torch.float32)
+            )
+            attention.stream_fork = StreamFork(None)
+            attention.compressor = None
+            attention.indexer = None
+            attention.padded_heads = padded_heads
+            attention.cache_layer_index = 0
+            attention.compress_ratio = 4
+            attention.num_local_heads = 16
+            attention.head_dim = HEAD_DIM
+            attention.swa_window = 64
+            attention.scale = 1.0
+            attention.attn_sink = torch.zeros(1)
+
+            q = torch.randn(2, 16, HEAD_DIM, dtype=torch.bfloat16)
+            kv = torch.randn(2, HEAD_DIM, dtype=torch.bfloat16)
+            qr = torch.empty(2, 16, ROPE_DIM, dtype=torch.bfloat16)
+            attention._project_q_kv = mock.Mock(return_value=(q, kv, qr))
+            attention._insert_swa_cache = mock.Mock()
+            attention._project_attention_output = mock.Mock(
+                side_effect=lambda output, *_: output
+            )
+
+            backend_method = {
+                ForwardMode.EXTEND: "forward_deepseek_v4_prefill",
+                ForwardMode.MIXED: "forward_deepseek_v4_mixed",
+                ForwardMode.DECODE: "forward_deepseek_v4_decode",
+            }[mode]
+            backend = SimpleNamespace(
+                forward_metadata=SimpleNamespace(
+                    is_valid_token=None,
+                    token_to_req_indices=None,
+                )
+            )
+            setattr(
+                backend, backend_method, mock.Mock(side_effect=lambda **kw: kw["q"])
+            )
+            pool = SimpleNamespace(
+                swa_block_size=4,
+                get_swa_kv_buffer=mock.Mock(
+                    return_value=torch.empty(1, 4 * 584, dtype=torch.uint8)
+                ),
+            )
+            slots = torch.arange(2, dtype=torch.int64)
+            ctx = SimpleNamespace(
+                dsa_compressor_slot_cache={},
+                dsa_swa_slot_mapping=slots,
+                token_to_kv_pool=pool,
+                attn_backend=backend,
+                forward_mode=mode,
+            )
+            with mock.patch(
+                "tokenspeed.runtime.models.deepseek_v4."
+                "has_fused_qnorm_rope_kv_insert_padded",
+                return_value=capability,
+            ):
+                output = attention(
+                    torch.arange(2, dtype=torch.int64),
+                    torch.empty(2, 1),
+                    ctx,
+                    torch.arange(2, dtype=torch.int64),
+                    swa_slot_mapping=slots,
+                )
+            q_out = attention._insert_swa_cache.call_args.kwargs["q_out"]
+            backend_q = getattr(backend, backend_method).call_args.kwargs["q"]
+            return q, q_out, backend_q
+
+        cases = (
+            (ForwardMode.EXTEND, True, 64, True),
+            (ForwardMode.EXTEND, False, 64, False),
+            (ForwardMode.MIXED, True, 64, False),
+            (ForwardMode.DECODE, True, 64, False),
+            (ForwardMode.EXTEND, True, 16, False),
+        )
+        for mode, capability, padded_heads, expect_padded in cases:
+            with self.subTest(
+                mode=mode,
+                capability=capability,
+                padded_heads=padded_heads,
+            ):
+                q, q_out, backend_q = run_case(
+                    mode,
+                    capability=capability,
+                    padded_heads=padded_heads,
+                )
+                if expect_padded:
+                    self.assertIsNotNone(q_out)
+                    self.assertEqual(q_out.shape, (2, padded_heads, HEAD_DIM))
+                    self.assertIs(backend_q, q_out)
+                else:
+                    self.assertIsNone(q_out)
+                    self.assertIs(backend_q, q)
+
     def test_swa_slot_mapping_guard_masks_out_of_range_slots(self):
         cache = torch.empty((2, 4 * SWA_TOKEN_STRIDE), dtype=torch.uint8)
         slots = torch.tensor([-3, -1, 0, 7, 8, 99], dtype=torch.int64)
@@ -530,6 +642,231 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         # The fourth token was DP-style padding for KV insert: Q is still updated,
         # but no cache row is written for it.
         self.assertEqual(int(cache.view(-1)[3 * 576 : 4 * 576].sum()), 0)
+
+    def test_fused_qnorm_rope_kv_insert_padded_matches_inplace_bitwise(self):
+        self.assertTrue(
+            has_fused_qnorm_rope_kv_insert_padded(),
+            "current tokenspeed-kernel build is missing the padded-Q symbol",
+        )
+
+        device = torch.device("cuda")
+        num_tokens = 9
+        block_size = 4
+        eps = 1.0e-6
+        positions = torch.arange(num_tokens, dtype=torch.int64, device=device)
+        slot_mapping = torch.tensor(
+            [0, 2, -1, 7, 8, 15, 16, 100], dtype=torch.int64, device=device
+        )
+        cos_sin = torch.randn(32, ROPE_DIM, device=device, dtype=torch.float32) * 0.1
+
+        for num_heads, padded_heads in (
+            (16, 64),
+            (24, 64),
+            (32, 64),
+            (64, 64),
+            (65, 128),
+            (96, 128),
+            (128, 128),
+        ):
+            for dtype in (torch.bfloat16, torch.float16):
+                with self.subTest(
+                    dtype=dtype,
+                    num_heads=num_heads,
+                    padded_heads=padded_heads,
+                ):
+                    torch.manual_seed(5678)
+                    q_input = torch.randn(
+                        num_tokens,
+                        num_heads,
+                        HEAD_DIM,
+                        device=device,
+                        dtype=dtype,
+                    )
+                    kv = torch.randn(num_tokens, HEAD_DIM, device=device, dtype=dtype)
+                    q_inplace = q_input.clone()
+                    q_source = q_input.clone()
+                    q_out = torch.full(
+                        (num_tokens, padded_heads, HEAD_DIM),
+                        float("nan"),
+                        device=device,
+                        dtype=dtype,
+                    )
+                    cache_inplace = torch.zeros(
+                        4, block_size * 584, device=device, dtype=torch.uint8
+                    )
+                    cache_padded = torch.zeros_like(cache_inplace)
+
+                    fused_qnorm_rope_kv_insert(
+                        q=q_inplace,
+                        kv=kv,
+                        swa_kv_cache_2d=cache_inplace,
+                        slot_mapping=slot_mapping,
+                        positions=positions,
+                        cos_sin_cache=cos_sin,
+                        rms_norm_eps=eps,
+                        block_size=block_size,
+                    )
+                    fused_qnorm_rope_kv_insert(
+                        q=q_source,
+                        q_out=q_out,
+                        kv=kv,
+                        swa_kv_cache_2d=cache_padded,
+                        slot_mapping=slot_mapping,
+                        positions=positions,
+                        cos_sin_cache=cos_sin,
+                        rms_norm_eps=eps,
+                        block_size=block_size,
+                    )
+                    torch.cuda.synchronize()
+
+                    self.assertTrue(torch.equal(q_source, q_input))
+                    self.assertTrue(torch.equal(q_out[:, :num_heads], q_inplace))
+                    self.assertEqual(
+                        int(
+                            torch.count_nonzero(q_out[:, num_heads:].view(torch.int16))
+                        ),
+                        0,
+                    )
+                    self.assertTrue(torch.equal(cache_padded, cache_inplace))
+
+                    if (
+                        num_heads == 16
+                        and dtype == torch.bfloat16
+                        and torch.cuda.get_device_capability()[0] >= 9
+                    ):
+                        q_pdl_source = q_input.clone()
+                        q_pdl_out = torch.full_like(q_out, float("nan"))
+                        cache_pdl = torch.zeros_like(cache_inplace)
+                        cuda_fused_qnorm_rope_kv_insert(
+                            q=q_pdl_source,
+                            q_out=q_pdl_out,
+                            kv=kv,
+                            k_cache=cache_pdl,
+                            slot_mapping=slot_mapping,
+                            positions=positions,
+                            cos_sin_cache=cos_sin,
+                            rms_norm_eps=eps,
+                            block_size=block_size,
+                            enable_pdl=True,
+                        )
+                        torch.cuda.synchronize()
+                        self.assertTrue(torch.equal(q_pdl_source, q_input))
+                        self.assertTrue(torch.equal(q_pdl_out, q_out))
+                        self.assertTrue(torch.equal(cache_pdl, cache_inplace))
+
+    def test_fused_qnorm_rope_kv_insert_padded_rejects_q_out_overlap(self):
+        self.assertTrue(
+            has_fused_qnorm_rope_kv_insert_padded(),
+            "current tokenspeed-kernel build is missing the padded-Q symbol",
+        )
+
+        device = torch.device("cuda")
+        num_tokens = 1
+        num_heads = 16
+        padded_heads = 64
+        block_size = 4
+        cache_row_bytes = block_size * 584
+        for input_name in (
+            "q",
+            "kv",
+            "k_cache",
+            "slot_mapping",
+            "positions",
+            "cos_sin_cache",
+        ):
+            with self.subTest(input_name=input_name):
+                if input_name == "k_cache":
+                    cache_stride = cache_row_bytes + 128
+                    # Start q_out beyond a naive k_cache.numel() range but
+                    # inside the second strided row's real byte envelope.
+                    q_out_offset = 2 * cache_row_bytes + 32
+                    q_out_num_bytes = (
+                        num_tokens * padded_heads * HEAD_DIM * torch.bfloat16.itemsize
+                    )
+                    shared_storage = torch.empty(
+                        q_out_offset + q_out_num_bytes,
+                        device=device,
+                        dtype=torch.uint8,
+                    )
+                    q_out = (
+                        shared_storage[q_out_offset : q_out_offset + q_out_num_bytes]
+                        .view(torch.bfloat16)
+                        .view(num_tokens, padded_heads, HEAD_DIM)
+                    )
+                    cache_alias = torch.as_strided(
+                        shared_storage,
+                        size=(2, cache_row_bytes),
+                        stride=(cache_stride, 1),
+                    )
+                else:
+                    q_out = torch.empty(
+                        num_tokens,
+                        padded_heads,
+                        HEAD_DIM,
+                        device=device,
+                        dtype=torch.bfloat16,
+                    )
+                    cache_alias = torch.as_strided(
+                        q_out.view(torch.uint8).view(-1),
+                        size=(2, cache_row_bytes),
+                        stride=(cache_row_bytes + 128, 1),
+                    )
+                q_out_flat = q_out.view(-1)
+                q_out_int64 = q_out.view(torch.int64).view(-1)
+                q_out_float32 = q_out.view(torch.float32).view(-1)
+                inputs = {
+                    "q": torch.randn(
+                        num_tokens,
+                        num_heads,
+                        HEAD_DIM,
+                        device=device,
+                        dtype=q_out.dtype,
+                    ),
+                    "kv": torch.randn(
+                        num_tokens,
+                        HEAD_DIM,
+                        device=device,
+                        dtype=q_out.dtype,
+                    ),
+                    "k_cache": torch.zeros(
+                        1,
+                        cache_row_bytes,
+                        device=device,
+                        dtype=torch.uint8,
+                    ),
+                    "slot_mapping": torch.zeros(
+                        num_tokens, device=device, dtype=torch.int64
+                    ),
+                    "positions": torch.zeros(
+                        num_tokens, device=device, dtype=torch.int64
+                    ),
+                    "cos_sin_cache": torch.zeros(
+                        1, ROPE_DIM, device=device, dtype=torch.float32
+                    ),
+                }
+                aliases = {
+                    "q": q_out_flat[: num_tokens * num_heads * HEAD_DIM].view(
+                        num_tokens, num_heads, HEAD_DIM
+                    ),
+                    "kv": q_out_flat[: num_tokens * HEAD_DIM].view(
+                        num_tokens, HEAD_DIM
+                    ),
+                    "k_cache": cache_alias,
+                    "slot_mapping": q_out_int64[:num_tokens],
+                    "positions": q_out_int64[:num_tokens],
+                    "cos_sin_cache": q_out_float32[:ROPE_DIM].view(1, ROPE_DIM),
+                }
+                inputs[input_name] = aliases[input_name]
+
+                with self.assertRaisesRegex(
+                    RuntimeError, f"q_out must not overlap {input_name}"
+                ):
+                    cuda_fused_qnorm_rope_kv_insert(
+                        q_out=q_out,
+                        rms_norm_eps=1.0e-6,
+                        block_size=block_size,
+                        **inputs,
+                    )
 
     def test_hca_compressor_state_insert_matches_reference(self):
         torch.manual_seed(4321)

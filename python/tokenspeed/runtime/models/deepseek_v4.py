@@ -99,6 +99,7 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
     deepseek_v4_hca_compress_kv_cache_insert,
     deepseek_v4_prepare_indexer_q_mxfp4,
     fused_qnorm_rope_kv_insert,
+    has_fused_qnorm_rope_kv_insert_padded,
     save_deepseek_v4_compressor_state,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
@@ -3410,6 +3411,7 @@ class DeepseekV4Attention(nn.Module):
         cos_sin_cache: torch.Tensor,
         block_size: int,
         is_valid_token: torch.Tensor | None = None,
+        q_out: torch.Tensor | None = None,
     ) -> None:
         if q.shape[0] == 0:
             return
@@ -3428,6 +3430,7 @@ class DeepseekV4Attention(nn.Module):
             cos_sin_cache=cos_sin_cache,
             rms_norm_eps=self.q_norm.variance_epsilon,
             block_size=block_size,
+            q_out=q_out,
         )
 
     def _project_attention_output(
@@ -3491,6 +3494,9 @@ class DeepseekV4Attention(nn.Module):
         metadata = ctx.attn_backend.forward_metadata
         if metadata is None:
             raise RuntimeError("DeepSeek V4 attention requires forward metadata")
+        forward_mode = ctx.forward_mode
+        if forward_mode is None:
+            raise RuntimeError("DeepSeek V4 attention requires forward mode")
 
         # --- Phase 1: pre-compute input GEMMs in parallel ---
         # Q/KV projection on main stream; compressor GEMM(s) on aux stream.
@@ -3516,6 +3522,20 @@ class DeepseekV4Attention(nn.Module):
                             self.indexer.compressor.compute_kv_score(hidden_states)
                         )
 
+        padded_q: torch.Tensor | None = None
+        # After the cache insert, q is consumed only by the attention backend;
+        # the indexer uses qr and the compressors use hidden_states.
+        if (
+            forward_mode.is_extend()
+            and self.padded_heads > q.shape[1]
+            and has_fused_qnorm_rope_kv_insert_padded()
+        ):
+            padded_q = torch.empty(
+                (q.shape[0], self.padded_heads, q.shape[2]),
+                dtype=q.dtype,
+                device=q.device,
+            )
+
         if swa_slot_mapping is None:
             swa_slot_mapping = _deepseek_v4_swa_slot_mapping(
                 ctx,
@@ -3539,6 +3559,7 @@ class DeepseekV4Attention(nn.Module):
                     cos_sin_cache=cos_sin_cache,
                     block_size=pool.swa_block_size,
                     is_valid_token=is_valid_token,
+                    q_out=padded_q,
                 )
 
         def run_compressor() -> None:
@@ -3600,9 +3621,8 @@ class DeepseekV4Attention(nn.Module):
                     insert_swa_cache()
         else:
             insert_swa_cache()
-        forward_mode = ctx.forward_mode
-        if forward_mode is None:
-            raise RuntimeError("DeepSeek V4 attention requires forward mode")
+        if padded_q is not None:
+            q = padded_q
         if forward_mode.is_mixed():
             with nvtx_range(f"{profile_prefix}_mixed_backend"):
                 attn_output = ctx.attn_backend.forward_deepseek_v4_mixed(
