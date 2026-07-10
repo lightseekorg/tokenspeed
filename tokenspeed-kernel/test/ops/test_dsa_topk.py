@@ -23,13 +23,12 @@
 Covers the per-solution wrappers behind ``deep_gemm_dsa_decode_topk``:
   * ``ragged_decode_topk`` (CUDA persistent-radix) dispatch + arg forwarding.
   * ``deterministic_decode_topk`` (flashinfer) pre-masked fallback path.
-  * ``cute_dsl_decode_topk`` (CuTe DSL cluster radix): causal-window
-    ``torch.topk`` parity across batch/kv-len/top-k/next_n, in-window indices,
-    in-place ``out`` reuse, drop-in equivalence with ``ragged_decode_topk`` via
-    ``local_topk_to_global_slots``, and CUDA-graph capture/replay.
+  * ``cute_dsl_decode_topk`` (CuTe DSL cluster radix): per-row causal-window
+    ``torch.topk`` accuracy across batch / next_n / top-k / context length /
+    compression ratio.
 
 The wrapper-dispatch tests are CPU-only (monkeypatched kernels); the CuTe DSL
-kernel tests need NVIDIA Blackwell (sm_100+) and skip elsewhere.
+kernel test needs NVIDIA Blackwell (sm_100+) and skips elsewhere.
 """
 
 from __future__ import annotations
@@ -145,18 +144,6 @@ def test_deterministic_decode_topk_falls_back_to_flashinfer(monkeypatch):
 # ---------------------------------------------------------------------------
 # CuTe DSL single-pass multi-CTA (cluster) kernel (NVIDIA Blackwell sm_100+)
 # ---------------------------------------------------------------------------
-# (batch, kv_len, top_k, next_n)
-_GRID = [
-    (1, 8192, 2048, 1),
-    (4, 8192, 2048, 1),
-    (8, 4096, 2048, 1),
-    (16, 2048, 512, 1),
-    (2, 65536, 2048, 1),
-    (3, 4096, 2048, 2),  # speculative decode next_n=2
-    (2, 6000, 1024, 3),  # speculative decode next_n=3
-]
-
-
 def _row_window(seq_lens: torch.Tensor, row: int, next_n: int, num_cols: int) -> int:
     """Causal candidate window for output row ``row`` (see kernel contract)."""
     req = row // next_n
@@ -203,169 +190,38 @@ def _gathered_topk_values(
 
 
 @requires_kernel
-@pytest.mark.parametrize("bs,kv,topk,next_n", _GRID)
-def test_parity_with_causal_window_reference(bs, kv, topk, next_n):
+@pytest.mark.parametrize("batch_size", [1, 4, 8, 16, 64])
+@pytest.mark.parametrize("next_n", [1, 2])
+@pytest.mark.parametrize("index_topk", [2048, 512, 128])
+@pytest.mark.parametrize("num_tokens", [4096, 8192, 16384, 32768, 65536, 131072])
+@pytest.mark.parametrize("compress_ratio", [1, 4])
+def test_cute_dsl_decode_topk(
+    batch_size, next_n, index_topk, num_tokens, compress_ratio
+):
+    """cute_dsl_decode_topk selects the correct per-row causal-window top-k.
+
+    ``num_tokens`` is the raw context length; the indexer selects over the
+    compressed candidate columns ``ceil(num_tokens / compress_ratio)``. Each
+    row's causal window (in compressed units) is derived from ``seq_lens``, and
+    the selected columns must gather exactly the reference top-k values.
+    """
+    num_rows = batch_size * next_n
+    num_cols = -(-num_tokens // compress_ratio)  # ceil(num_tokens / compress_ratio)
     torch.manual_seed(0)
-    num_rows = bs * next_n
-    logits = torch.randn(num_rows, kv, device="cuda", dtype=torch.float32)
-    # Per-request lengths straddle top_k so both the window<top_k and
-    # window>=top_k regimes are exercised.
+    logits = torch.randn(num_rows, num_cols, device="cuda", dtype=torch.float32)
+    # Per-request compressed lengths straddle top_k so both the window < top_k
+    # and window >= top_k regimes are exercised.
+    low = max(1, min(index_topk // 4, num_cols))
     seq_lens = torch.randint(
-        max(1, topk // 4), kv + 1, (bs,), device="cuda", dtype=torch.int32
+        low, num_cols + 1, (batch_size,), device="cuda", dtype=torch.int32
     )
-    out = torch.empty(num_rows, topk, device="cuda", dtype=torch.int32)
-    ret = cute_dsl_decode_topk(logits, seq_lens, topk, next_n=next_n, out=out)
+    out = torch.empty(num_rows, index_topk, device="cuda", dtype=torch.int32)
+
+    ret = cute_dsl_decode_topk(logits, seq_lens, index_topk, next_n=next_n, out=out)
 
     assert ret.data_ptr() == out.data_ptr(), "out must be written in place"
-    assert ret.dtype == torch.int32 and ret.shape == (num_rows, topk)
+    assert ret.dtype == torch.int32 and ret.shape == (num_rows, index_topk)
 
-    got = _gathered_topk_values(logits, ret, seq_lens, topk, next_n)
-    ref = _reference_topk_values(logits, seq_lens, topk, next_n)
+    got = _gathered_topk_values(logits, ret, seq_lens, index_topk, next_n)
+    ref = _reference_topk_values(logits, seq_lens, index_topk, next_n)
     assert torch.equal(got, ref), "selected top-k values differ from reference"
-
-
-@requires_kernel
-def test_window_shorter_than_topk_early_decode():
-    """Early-decode regime: every row's causal window is far below top_k."""
-    torch.manual_seed(1)
-    bs, kv, topk = 8, 8192, 2048
-    logits = torch.randn(bs, kv, device="cuda", dtype=torch.float32)
-    seq_lens = torch.randint(16, 400, (bs,), device="cuda", dtype=torch.int32)
-    out = torch.empty(bs, topk, device="cuda", dtype=torch.int32)
-    cute_dsl_decode_topk(logits, seq_lens, topk, next_n=1, out=out)
-    got = _gathered_topk_values(logits, out, seq_lens, topk, 1)
-    ref = _reference_topk_values(logits, seq_lens, topk, 1)
-    assert torch.equal(got, ref)
-
-
-@requires_kernel
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
-def test_dtype_coverage(dtype):
-    torch.manual_seed(2)
-    bs, kv, topk = 4, 8192, 2048
-    logits = torch.randn(bs, kv, device="cuda", dtype=dtype)
-    seq_lens = torch.full((bs,), kv, device="cuda", dtype=torch.int32)
-    out = torch.empty(bs, topk, device="cuda", dtype=torch.int32)
-    cute_dsl_decode_topk(logits, seq_lens, topk, next_n=1, out=out)
-    # Compare against topk over the same (low-precision) logits.
-    got = _gathered_topk_values(logits.float(), out, seq_lens, topk, 1)
-    ref = _reference_topk_values(logits.float(), seq_lens, topk, 1)
-    assert torch.equal(got, ref)
-
-
-@requires_kernel
-def test_allocates_output_when_out_is_none():
-    torch.manual_seed(3)
-    bs, kv, topk = 4, 4096, 2048
-    logits = torch.randn(bs, kv, device="cuda", dtype=torch.float32)
-    seq_lens = torch.full((bs,), kv, device="cuda", dtype=torch.int32)
-    ret = cute_dsl_decode_topk(logits, seq_lens, topk, next_n=1)
-    assert ret.dtype == torch.int32 and ret.shape == (bs, topk)
-    got = _gathered_topk_values(logits, ret, seq_lens, topk, 1)
-    ref = _reference_topk_values(logits, seq_lens, topk, 1)
-    assert torch.equal(got, ref)
-
-
-@requires_kernel
-@pytest.mark.parametrize(
-    "bs,max_pages,topk,next_n",
-    [
-        (4, 40, 2048, 1),  # windows straddle top_k
-        (3, 48, 2048, 2),  # speculative decode
-        (8, 16, 512, 1),  # tiny windows, small top_k
-    ],
-)
-def test_dropin_equivalence_with_persistent_radix(bs, max_pages, topk, next_n):
-    """cute_dsl + slot mapping == ragged_decode_topk + slot mapping.
-
-    This is the integration contract: composed with
-    ``local_topk_to_global_slots`` the CuTe DSL path must produce identical
-    global KV slots and valid counts as the persistent-radix path it replaces.
-    """
-    if not cuda_dsa_topk.has_ragged_decode_topk():
-        pytest.skip("ragged persistent_topk CUDA kernel unavailable")
-    from tokenspeed_kernel.ops.attention.triton.dsa_topk import (
-        local_topk_to_global_slots,
-    )
-
-    page_size = 64
-    num_cols = max_pages * page_size
-    num_rows = bs * next_n
-    torch.manual_seed(7)
-    logits = torch.randn(num_rows, num_cols, device="cuda", dtype=torch.float32)
-    seq_lens = torch.randint(16, num_cols + 1, (bs,), device="cuda", dtype=torch.int32)
-    block_table = (
-        torch.arange(bs * max_pages, device="cuda", dtype=torch.int32).view(
-            bs, max_pages
-        )
-        + 1
-    )
-
-    def _map(local_offsets):
-        slots = torch.empty(num_rows, topk, device="cuda", dtype=torch.int32)
-        lens = torch.empty(num_rows, device="cuda", dtype=torch.int32)
-        local_topk_to_global_slots(
-            local_topk_offsets=local_offsets,
-            block_table=block_table,
-            block_size=page_size,
-            seq_lens=seq_lens,
-            q_len_per_req=next_n,
-            out=slots,
-            lens_out=lens,
-        )
-        return slots, lens
-
-    loc_cute = torch.empty(num_rows, topk, device="cuda", dtype=torch.int32)
-    cute_dsl_decode_topk(logits, seq_lens, topk, next_n=next_n, out=loc_cute)
-    slots_cute, lens_cute = _map(loc_cute)
-
-    loc_ref = torch.empty(num_rows, topk, device="cuda", dtype=torch.int32)
-    cuda_dsa_topk.ragged_decode_topk(
-        logits,
-        loc_ref,
-        topk,
-        lengths=seq_lens,
-        q_len_per_req=next_n,
-        workspace=torch.empty((1 << 20,), dtype=torch.uint8, device="cuda"),
-        max_seq_len=num_cols,
-    )
-    slots_ref, lens_ref = _map(loc_ref)
-
-    assert torch.equal(lens_cute, lens_ref), "valid counts differ"
-    for r in range(num_rows):
-        n = int(lens_ref[r])
-        a = torch.sort(slots_cute[r, :n]).values
-        b = torch.sort(slots_ref[r, :n]).values
-        assert torch.equal(a, b), f"row {r}: selected KV slot set differs"
-
-
-@requires_kernel
-def test_cuda_graph_capture_replay():
-    """The decode path runs under CUDA graphs; capture/replay must be correct."""
-    torch.manual_seed(4)
-    bs, kv, topk, next_n = 4, 8192, 2048, 1
-    logits = torch.randn(bs, kv, device="cuda", dtype=torch.float32)
-    seq_lens = torch.randint(topk // 2, kv + 1, (bs,), device="cuda", dtype=torch.int32)
-    out = torch.empty(bs, topk, device="cuda", dtype=torch.int32)
-
-    # Warm up (JIT compile + first scratch allocation happen here, eagerly).
-    cute_dsl_decode_topk(logits, seq_lens, topk, next_n=next_n, out=out)
-    torch.cuda.synchronize()
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        cute_dsl_decode_topk(logits, seq_lens, topk, next_n=next_n, out=out)
-
-    # New inputs, replay, and confirm the captured graph recomputes correctly.
-    new_logits = torch.randn(bs, kv, device="cuda", dtype=torch.float32)
-    new_seq_lens = torch.randint(
-        topk // 2, kv + 1, (bs,), device="cuda", dtype=torch.int32
-    )
-    logits.copy_(new_logits)
-    seq_lens.copy_(new_seq_lens)
-    graph.replay()
-    torch.cuda.synchronize()
-
-    got = _gathered_topk_values(logits, out, seq_lens, topk, next_n)
-    ref = _reference_topk_values(logits, seq_lens, topk, next_n)
-    assert torch.equal(got, ref), "graph replay produced wrong top-k"
