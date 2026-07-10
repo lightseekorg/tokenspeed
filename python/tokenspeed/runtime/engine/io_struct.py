@@ -574,7 +574,7 @@ class BatchTokenIDOut:
     read_offsets: list[int]
     # Per-request sampled-token deltas generated since the previous frame
     output_ids: list[list[int]]
-    output_multi_ids: list[int] | None
+    output_multi_ids: list[list[int]] | None
     # Detokenization configs
     skip_special_tokens: list[bool]
     spaces_between_special_tokens: list[bool]
@@ -619,7 +619,7 @@ class BatchStrOut:
     # The output decoded strings
     output_strs: list[str]
     # The token ids
-    output_ids: list[int] | None
+    output_ids: list[list[int]]
 
     # Token counts
     prompt_tokens: list[int]

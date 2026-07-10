@@ -157,7 +157,7 @@ def _batch(
     """
     n = len(rids)
     defaults: Dict[str, Any] = {
-        "output_ids": None,
+        "output_ids": [list(ids) for ids in decode_ids],
         "output_multi_ids": output_multi_ids,
         "prompt_tokens": [0] * n,
         "completion_tokens": [0] * n,

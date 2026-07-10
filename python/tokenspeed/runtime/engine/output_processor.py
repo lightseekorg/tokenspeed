@@ -314,6 +314,7 @@ class OutputProcessor:
                 out_dict,
                 stream=bool(getattr(state.obj, "stream", False)),
                 output_ids_are_delta=output_ids_are_delta,
+                meta_sequences_are_delta=bool(getattr(state.obj, "stream", False)),
             )
             state.event.set()
 

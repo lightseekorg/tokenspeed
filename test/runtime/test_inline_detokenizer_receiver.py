@@ -272,7 +272,7 @@ class TestFlagOffRegression(unittest.TestCase):
         self.assertIsNone(state.inline_detokenizer)
         self.assertEqual(state.text, "")
 
-    def test_raw_token_stream_coalesces_cumulative_output_ids(self):
+    def test_raw_token_stream_coalesces_cumulative_output_ids_and_multi_ids(self):
         tok = _gpt2_tokenizer()
         mgr = _StubTokenizerManager(
             tok,
@@ -282,18 +282,41 @@ class TestFlagOffRegression(unittest.TestCase):
         state = _mk_state(stream=True, rid="r1")
         _register(mgr, state)
 
-        for output_ids in ([1], [2]):
+        for output_ids, output_multi_ids in (([1], [101]), ([2], [101, 102])):
             mgr.output_processor.handle_batch_output(
                 _batch_token_id_out(
                     ["r1"],
                     decode_ids=[output_ids],
                     output_ids=[output_ids],
+                    output_multi_ids=[output_multi_ids],
                 )
             )
 
         out = state.collector.take()
         self.assertEqual(out["output_ids"], [1, 2])
+        self.assertEqual(out["output_multi_ids"], [101, 102])
         self.assertEqual(state.output_ids, [1, 2])
+
+    def test_raw_token_stream_coalesces_repeated_multi_id_deltas(self):
+        tok = _gpt2_tokenizer()
+        mgr = _StubTokenizerManager(tok, enable_inline_detokenizer=False)
+        state = _mk_state(stream=True, rid="r1")
+        _register(mgr, state)
+
+        token_id = tok.encode(" hello")[0]
+        for output_multi_ids in ([token_id], [token_id, token_id]):
+            mgr.output_processor.handle_batch_output(
+                _batch_token_id_out(
+                    ["r1"],
+                    decode_ids=[[token_id]],
+                    output_ids=[[token_id]],
+                    output_multi_ids=[output_multi_ids],
+                )
+            )
+
+        out = state.collector.take()
+        self.assertEqual(out["output_ids"], [token_id, token_id])
+        self.assertEqual(out["output_multi_ids"], [token_id, token_id])
 
 
 # ---------------------------------------------------------------------------
@@ -977,6 +1000,30 @@ class TestInlineLogprobPassThrough(unittest.TestCase):
         self.assertNotIn("logprobs", meta)
         self.assertEqual([e[0] for e in meta["output_token_logprobs"]], [-0.5, -0.6])
         self.assertEqual([e[1] for e in meta["output_token_logprobs"]], [1, 2])
+
+    def test_stream_coalescing_keeps_repeated_logprob_deltas(self):
+        token_id = self.tok.encode(" hello")[0]
+        for fmt, key in (("vllm", "logprobs"), ("sglang", "output_token_logprobs")):
+            with self.subTest(fmt=fmt):
+                mgr = _StubTokenizerManager(self.tok, enable_inline_detokenizer=True)
+                state = _mk_logprob_state(rid="r1", fmt=fmt)
+                _register(mgr, state)
+
+                for _ in range(2):
+                    mgr.output_processor.handle_batch_output(
+                        _batch_token_id_out(
+                            ["r1"],
+                            decode_ids=[[token_id]],
+                            output_ids=[[token_id]],
+                            output_token_logprobs_val=[[-0.5]],
+                            output_token_logprobs_idx=[[token_id]],
+                        )
+                    )
+
+                out = state.collector.take()
+                self.assertEqual(out["output_ids"], [token_id, token_id])
+                self.assertEqual(len(out["meta_info"][key]), 2)
+                self.assertAlmostEqual(out["meta_info"]["cumulative_logprob"], -1.0)
 
 
 if __name__ == "__main__":

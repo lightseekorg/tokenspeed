@@ -29,11 +29,10 @@ from typing import Any
 # of both dialects' per-position list keys; only one dialect is present per
 # request (the renderer emits one), so the union is harmless.
 #
-# Each value is a per-position list that GROWS as frames arrive, so it must be
-# appended rather than overwritten -- hence merged by ``_extend_sequence``. That
-# helper is dict-safe: its prefix check (``_is_prefix``) compares elements only
-# with ``==``, which both ``dict`` and the ``Logprob`` dataclass support, so the
-# entries never need to be hashed or ordered.
+# Each value is a per-position list. Producers can emit it cumulatively or as
+# frame deltas; the caller selects the matching merge policy. Prefix checking
+# in the cumulative policy is dict-safe: ``_is_prefix`` compares elements only
+# with ``==``, which both ``dict`` and the ``Logprob`` dataclass support.
 #
 # ``cumulative_logprob`` is a scalar handled separately (see _SUM_META_KEYS):
 # under streaming each frame recomputes it from a fresh dict, so each frame's
@@ -86,6 +85,7 @@ class RequestOutputCollector:
         *,
         stream: bool,
         output_ids_are_delta: bool = False,
+        meta_sequences_are_delta: bool = False,
     ) -> None:
         if self._pending is None or not stream:
             self._pending = output
@@ -94,10 +94,18 @@ class RequestOutputCollector:
         if not self._pending_owned:
             self._pending = self._clone_for_merge(self._pending)
             self._pending_owned = True
-        self._merge_into_pending(output, output_ids_are_delta=output_ids_are_delta)
+        self._merge_into_pending(
+            output,
+            output_ids_are_delta=output_ids_are_delta,
+            meta_sequences_are_delta=meta_sequences_are_delta,
+        )
 
     def _merge_into_pending(
-        self, output: dict[str, Any], *, output_ids_are_delta: bool
+        self,
+        output: dict[str, Any],
+        *,
+        output_ids_are_delta: bool,
+        meta_sequences_are_delta: bool,
     ) -> None:
         pending = self._pending
         if pending is None:
@@ -116,7 +124,11 @@ class RequestOutputCollector:
             return
 
         pending_meta = pending.setdefault("meta_info", {})
-        self._merge_meta_info_into(pending_meta, output.get("meta_info") or {})
+        self._merge_meta_info_into(
+            pending_meta,
+            output.get("meta_info") or {},
+            sequences_are_delta=meta_sequences_are_delta,
+        )
 
         if output_kind == "text" and "text" in output:
             pending["text"] = output["text"]
@@ -127,7 +139,7 @@ class RequestOutputCollector:
         merge_output_ids(pending, "output_ids", output.get("output_ids"))
 
         if "output_multi_ids" in pending or "output_multi_ids" in output:
-            self._extend_sequence(
+            merge_output_ids(
                 pending, "output_multi_ids", output.get("output_multi_ids")
             )
 
@@ -135,8 +147,15 @@ class RequestOutputCollector:
             pending["output_extra_info"] = output["output_extra_info"]
 
     def _merge_meta_info_into(
-        self, pending: dict[str, Any], output: dict[str, Any]
+        self,
+        pending: dict[str, Any],
+        output: dict[str, Any],
+        *,
+        sequences_are_delta: bool,
     ) -> None:
+        merge_sequence = (
+            self._append_sequence if sequences_are_delta else self._extend_sequence
+        )
         for key, value in output.items():
             if key == "id":
                 existing = pending.get("id")
@@ -148,7 +167,7 @@ class RequestOutputCollector:
                 pending["id"] = value
                 continue
             if key in _APPEND_META_KEYS:
-                self._extend_sequence(pending, key, value)
+                merge_sequence(pending, key, value)
                 continue
             if key in _SUM_META_KEYS:
                 if value is not None:
