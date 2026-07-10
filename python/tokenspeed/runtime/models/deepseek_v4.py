@@ -2596,6 +2596,44 @@ class DeepseekV4MoE(nn.Module):
         )
 
 
+def _deepseek_v4_hca_prefill_max_outputs(
+    metadata: DeepseekV4ForwardMetadata,
+    num_tokens: int,
+) -> int | None:
+    """Return the maximum new C128 windows per request without a GPU sync."""
+
+    num_reqs = int(metadata.num_prefill_reqs)
+    seq_lens_cpu = metadata.seq_lens_cpu
+    query_lens_cpu = metadata.query_lens_cpu
+    if (
+        num_reqs <= 0
+        or seq_lens_cpu is None
+        or query_lens_cpu is None
+        or seq_lens_cpu.device.type != "cpu"
+        or query_lens_cpu.device.type != "cpu"
+        or seq_lens_cpu.numel() < num_reqs
+        or query_lens_cpu.numel() < num_reqs
+    ):
+        return None
+
+    seq_lens = [int(x) for x in seq_lens_cpu[:num_reqs].tolist()]
+    query_lens = [int(x) for x in query_lens_cpu[:num_reqs].tolist()]
+    if any(
+        seq_len < 0 or query_len < 0 or query_len > seq_len
+        for seq_len, query_len in zip(seq_lens, query_lens, strict=True)
+    ):
+        return None
+    if sum(query_lens) != num_tokens:
+        return None
+    return max(
+        (
+            seq_len // 128 - (seq_len - query_len) // 128
+            for seq_len, query_len in zip(seq_lens, query_lens, strict=True)
+        ),
+        default=0,
+    )
+
+
 class DeepseekV4Compressor(nn.Module):
     def __init__(
         self,
@@ -2792,6 +2830,35 @@ class DeepseekV4Compressor(nn.Module):
                 if self.compress_ratio == 4
                 else deepseek_v4_hca_compress_kv_cache_insert
             )
+            hca_prefill_kwargs: dict[str, object] = {}
+            forward_mode = ctx.forward_mode
+            if (
+                self.compress_ratio == 128
+                and forward_mode is not None
+                and forward_mode.is_extend()
+            ):
+                max_outputs_key = ("hca_prefill_max_outputs", 128)
+                if (
+                    compressor_slot_cache is not None
+                    and max_outputs_key in compressor_slot_cache
+                ):
+                    hca_prefill_max_outputs = compressor_slot_cache[max_outputs_key]
+                else:
+                    hca_prefill_max_outputs = _deepseek_v4_hca_prefill_max_outputs(
+                        metadata,
+                        positions.numel(),
+                    )
+                    if compressor_slot_cache is not None:
+                        compressor_slot_cache[max_outputs_key] = hca_prefill_max_outputs
+                if hca_prefill_max_outputs is not None:
+                    hca_prefill_kwargs = {
+                        # save_state has consumed this projection buffer; the
+                        # C128 fast path reuses it as reduction scratch.
+                        "prefill_scratch": kv_score,
+                        "query_start_loc": metadata.query_start_loc,
+                        "seq_lens": metadata.seq_lens,
+                        "max_outputs": hca_prefill_max_outputs,
+                    }
             insert(
                 state_cache=state_cache,
                 token_to_req_indices=metadata.token_to_req_indices[: positions.numel()],
@@ -2807,6 +2874,7 @@ class DeepseekV4Compressor(nn.Module):
                 kv_slot_mapping=compressed_slots,
                 kv_cache_block_size=kv_cache_block_size,
                 compress_ratio=self.compress_ratio,
+                **hca_prefill_kwargs,
             )
         return kv, score
 

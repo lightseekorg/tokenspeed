@@ -62,7 +62,13 @@ from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     write_deepseek_v4_indexer_mxfp4_cache_cuda as _triton_write_indexer_mxfp4_cache_cuda,
 )
 from tokenspeed_kernel.ops.attention.trtllm.deepseek_v4 import (
+    supports_trtllm_deepseek_v4_c128_prefill_compress_cache as _supports_trtllm_c128_prefill_compress_cache,
+)
+from tokenspeed_kernel.ops.attention.trtllm.deepseek_v4 import (
     supports_trtllm_deepseek_v4_indexer_q_prepare as _supports_trtllm_indexer_q_prepare,
+)
+from tokenspeed_kernel.ops.attention.trtllm.deepseek_v4 import (
+    trtllm_deepseek_v4_c128_prefill_compress_cache as _trtllm_c128_prefill_compress_cache,
 )
 from tokenspeed_kernel.ops.attention.trtllm.deepseek_v4 import (
     trtllm_deepseek_v4_indexer_q_prepare_mxfp4 as _trtllm_indexer_q_prepare_mxfp4,
@@ -902,6 +908,10 @@ def deepseek_v4_hca_compress_kv_cache_insert(
     kv_cache_block_size: int,
     compress_ratio: int = 128,
     block_table_base_offsets: torch.Tensor | None = None,
+    prefill_scratch: torch.Tensor | None = None,
+    query_start_loc: torch.Tensor | None = None,
+    seq_lens: torch.Tensor | None = None,
+    max_outputs: int | None = None,
 ) -> None:
     """Compress HCA state, normalize/RoPE/FP8-quantize, and insert KV cache.
 
@@ -947,6 +957,51 @@ def deepseek_v4_hca_compress_kv_cache_insert(
         raise ValueError(
             "deepseek_v4_hca_compress_kv_cache_insert only supports CUDA tensors."
         )
+
+    if (
+        prefill_scratch is not None
+        and query_start_loc is not None
+        and seq_lens is not None
+        and max_outputs is not None
+    ):
+        if max_outputs == 0:
+            return
+        if _supports_trtllm_c128_prefill_compress_cache(
+            state_cache=state_cache,
+            scratch=prefill_scratch,
+            positions=positions,
+            compressor_slot_mapping=compressor_slot_mapping,
+            query_start_loc=query_start_loc,
+            seq_lens=seq_lens,
+            block_table=block_table,
+            rms_norm_weight=rms_norm_weight,
+            cos_sin_cache=cos_sin_cache,
+            kv_cache=kv_cache_2d,
+            kv_slot_mapping=kv_slot_mapping,
+            block_table_base_offsets=block_table_base_offsets,
+            state_block_size=compressor_block_size,
+            kv_block_size=kv_cache_block_size,
+            max_outputs=max_outputs,
+        ):
+            _trtllm_c128_prefill_compress_cache(
+                state_cache=state_cache,
+                scratch=prefill_scratch,
+                positions=positions,
+                compressor_slot_mapping=compressor_slot_mapping,
+                query_start_loc=query_start_loc,
+                seq_lens=seq_lens,
+                block_table=block_table,
+                rms_norm_weight=rms_norm_weight,
+                cos_sin_cache=cos_sin_cache,
+                kv_cache=kv_cache_2d,
+                kv_slot_mapping=kv_slot_mapping,
+                block_table_base_offsets=block_table_base_offsets,
+                state_block_size=compressor_block_size,
+                kv_block_size=kv_cache_block_size,
+                max_outputs=max_outputs,
+                rms_norm_eps=rms_norm_eps,
+            )
+            return
 
     _triton_fused_sparse_compress_cache_insert(
         state_cache=state_cache,

@@ -33,6 +33,10 @@ from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     _deepseek_v4_fused_sparse_compress_cache_kernel,
     _deepseek_v4_gather_launch_config,
 )
+from tokenspeed_kernel.ops.attention.trtllm.deepseek_v4 import (
+    has_trtllm_deepseek_v4_c128_prefill_compress_cache,
+    supports_trtllm_deepseek_v4_c128_prefill_compress_cache,
+)
 from tokenspeed_kernel.ops.transform import hadamard_transform
 
 from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
@@ -1087,6 +1091,404 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
                 )
                 torch.cuda.synchronize()
                 self.assertTrue(torch.equal(candidate_cache, cache))
+
+    def test_hca_trtllm_prefill_dispatches_fallback_and_empty(self):
+        device = torch.device("cuda")
+        common = {
+            "state_cache": torch.zeros(
+                (1, 1, HEAD_DIM * 2),
+                dtype=torch.float32,
+                device=device,
+            ),
+            "token_to_req_indices": torch.zeros(1, dtype=torch.int32, device=device),
+            "positions": torch.zeros(1, dtype=torch.int64, device=device),
+            "compressor_slot_mapping": torch.zeros(1, dtype=torch.int64, device=device),
+            "block_table": torch.zeros((1, 1), dtype=torch.int32, device=device),
+            "compressor_block_size": 1,
+            "rms_norm_weight": torch.ones(HEAD_DIM, device=device),
+            "rms_norm_eps": 1.0e-6,
+            "cos_sin_cache": torch.ones((1, ROPE_DIM), device=device),
+            "kv_cache_2d": torch.zeros(
+                (1, SWA_TOKEN_STRIDE + SWA_SCALE_DIM),
+                dtype=torch.uint8,
+                device=device,
+            ),
+            "kv_slot_mapping": torch.zeros(1, dtype=torch.int64, device=device),
+            "kv_cache_block_size": 1,
+            "prefill_scratch": torch.zeros(
+                (1, HEAD_DIM * 2),
+                dtype=torch.float32,
+                device=device,
+            ),
+            "query_start_loc": torch.tensor([0, 1], dtype=torch.int32, device=device),
+            "seq_lens": torch.ones(1, dtype=torch.int32, device=device),
+        }
+        module = "tokenspeed.runtime.layers.attention.deepseek_v4_ops"
+
+        with (
+            mock.patch(
+                f"{module}._supports_trtllm_c128_prefill_compress_cache",
+                return_value=False,
+            ) as supports,
+            mock.patch(f"{module}._trtllm_c128_prefill_compress_cache") as native,
+            mock.patch(
+                f"{module}._triton_fused_sparse_compress_cache_insert"
+            ) as triton,
+        ):
+            deepseek_v4_hca_compress_kv_cache_insert(**common, max_outputs=1)
+        supports.assert_called_once()
+        native.assert_not_called()
+        triton.assert_called_once()
+
+        with (
+            mock.patch(
+                f"{module}._supports_trtllm_c128_prefill_compress_cache"
+            ) as supports,
+            mock.patch(f"{module}._trtllm_c128_prefill_compress_cache") as native,
+            mock.patch(
+                f"{module}._triton_fused_sparse_compress_cache_insert"
+            ) as triton,
+        ):
+            deepseek_v4_hca_compress_kv_cache_insert(**common, max_outputs=0)
+        supports.assert_not_called()
+        native.assert_not_called()
+        triton.assert_not_called()
+
+    def test_hca_trtllm_prefill_matches_triton_for_varlen_pages(self):
+        torch.manual_seed(20260709)
+        device = torch.device("cuda")
+        major, _minor = torch.cuda.get_device_capability(device)
+        if major != 10 or not has_trtllm_deepseek_v4_c128_prefill_compress_cache():
+            self.skipTest("TRT-LLM C128 prefill op requires SM100 and its native DSO")
+        state_block_size = 32
+        kv_cache_block_size = 8
+        table_width = 128
+        eps = 1.0e-6
+        # (query start position, final sequence length, first logical state page)
+        requests = (
+            (0, 256, 0),
+            (1, 256, 0),
+            (127, 256, 0),
+            (385, 640, 12),
+        )
+        query_lens = [end - start for start, end, _ in requests]
+        query_offsets = [0]
+        for query_len in query_lens:
+            query_offsets.append(query_offsets[-1] + query_len)
+
+        query_start_loc = torch.tensor(
+            query_offsets,
+            dtype=torch.int32,
+            device=device,
+        )
+        seq_lens = torch.tensor(
+            [end for _, end, _ in requests],
+            dtype=torch.int32,
+            device=device,
+        )
+        positions = torch.cat(
+            [
+                torch.arange(start, end, dtype=torch.int64, device=device)
+                for start, end, _ in requests
+            ]
+        )
+        token_to_req = torch.repeat_interleave(
+            torch.arange(len(requests), dtype=torch.int32, device=device),
+            torch.tensor(query_lens, dtype=torch.int64, device=device),
+        )
+
+        block_table = torch.full(
+            (len(requests), table_width),
+            -1,
+            dtype=torch.int32,
+            device=device,
+        )
+        base_offsets = torch.tensor(
+            [base for _, _, base in requests],
+            dtype=torch.int32,
+            device=device,
+        )
+        state_cache = torch.full(
+            (80, state_block_size, HEAD_DIM * 2),
+            float("nan"),
+            dtype=torch.float32,
+            device=device,
+        )
+        next_physical_page = 7
+        dim = torch.arange(HEAD_DIM, dtype=torch.float32, device=device)
+        for req_idx, (start, end, base) in enumerate(requests):
+            first_page = (start // 128) * 128 // state_block_size
+            last_page = end // state_block_size
+            for logical_page in range(first_page, last_page):
+                physical_page = next_physical_page
+                next_physical_page += 2
+                block_table[req_idx, logical_page - base] = physical_page
+                row_positions = torch.arange(
+                    logical_page * state_block_size,
+                    (logical_page + 1) * state_block_size,
+                    dtype=torch.float32,
+                    device=device,
+                )
+                state_cache[physical_page, :, :HEAD_DIM] = (
+                    torch.sin(row_positions[:, None] * 0.013 + dim[None, :] * 0.007)
+                    + req_idx * 0.05
+                )
+                state_cache[physical_page, :, HEAD_DIM:] = 0.7 * torch.cos(
+                    row_positions[:, None] * 0.009 - dim[None, :] * 0.005
+                )
+
+        angles = torch.arange(
+            max(end for _, end, _ in requests) + 1,
+            dtype=torch.float32,
+            device=device,
+        )[:, None] * (
+            0.0003
+            + torch.arange(ROPE_DIM // 2, dtype=torch.float32, device=device)[None, :]
+            * 0.00001
+        )
+        cos_sin = torch.cat((torch.cos(angles), torch.sin(angles)), dim=1)
+        kv_slots = torch.full(
+            (positions.numel(),),
+            -1,
+            dtype=torch.int64,
+            device=device,
+        )
+        boundary_rows: list[int] = []
+        boundary_slots: list[int] = []
+        slot_plan = ((3, 2), (5, 1), (7, 3), (9, 0))
+        for req_idx, (start, end, _) in enumerate(requests):
+            first_window = start // 128
+            for output_idx in range(end // 128 - first_window):
+                boundary_position = (first_window + output_idx + 1) * 128 - 1
+                boundary_row = query_offsets[req_idx] + boundary_position - start
+                page, first_offset = slot_plan[req_idx]
+                slot = page * kv_cache_block_size + first_offset + output_idx
+                kv_slots[boundary_row] = slot
+                boundary_rows.append(boundary_row)
+                boundary_slots.append(slot)
+
+        compressor_slots = torch.zeros_like(kv_slots)
+        invalid_state_row = boundary_rows[2]
+        invalid_state_slot = boundary_slots[2]
+        invalid_kv_row = boundary_rows[4]
+        compressor_slots[invalid_state_row] = -1
+        kv_slots[invalid_kv_row] = -1
+        writable_boundary_rows = [
+            row
+            for row in boundary_rows
+            if row not in (invalid_state_row, invalid_kv_row)
+        ]
+        scratch_source = torch.randn(
+            positions.numel(),
+            HEAD_DIM * 2,
+            dtype=torch.float32,
+            device=device,
+        )
+        base_weight = 0.75 + 0.5 * torch.rand(HEAD_DIM, device=device)
+        writable_boundary_rows_tensor = torch.tensor(
+            writable_boundary_rows,
+            dtype=torch.int64,
+            device=device,
+        )
+        unmodified_rows = torch.ones(
+            positions.numel(),
+            dtype=torch.bool,
+            device=device,
+        )
+        unmodified_rows[writable_boundary_rows_tensor] = False
+
+        for weight_dtype in (torch.bfloat16, torch.float32):
+            with self.subTest(weight_dtype=weight_dtype):
+                rms_weight = base_weight.to(weight_dtype)
+                scratch = scratch_source.clone()
+                candidate_cache = torch.zeros(
+                    16,
+                    kv_cache_block_size * (SWA_TOKEN_STRIDE + SWA_SCALE_DIM),
+                    dtype=torch.uint8,
+                    device=device,
+                )
+                reference_cache = torch.zeros_like(candidate_cache)
+                self.assertTrue(
+                    supports_trtllm_deepseek_v4_c128_prefill_compress_cache(
+                        state_cache,
+                        scratch,
+                        positions,
+                        compressor_slots,
+                        query_start_loc,
+                        seq_lens,
+                        block_table,
+                        rms_weight,
+                        cos_sin,
+                        candidate_cache,
+                        kv_slots,
+                        block_table_base_offsets=base_offsets,
+                        state_block_size=state_block_size,
+                        kv_block_size=kv_cache_block_size,
+                        max_outputs=2,
+                    ),
+                    "legal SM100 fixture must select the native C128 path",
+                )
+
+                deepseek_v4_hca_compress_kv_cache_insert(
+                    state_cache=state_cache,
+                    token_to_req_indices=token_to_req,
+                    positions=positions,
+                    compressor_slot_mapping=compressor_slots,
+                    block_table=block_table,
+                    compressor_block_size=state_block_size,
+                    rms_norm_weight=rms_weight,
+                    rms_norm_eps=eps,
+                    cos_sin_cache=cos_sin,
+                    kv_cache_2d=candidate_cache,
+                    kv_slot_mapping=kv_slots,
+                    kv_cache_block_size=kv_cache_block_size,
+                    prefill_scratch=scratch,
+                    query_start_loc=query_start_loc,
+                    seq_lens=seq_lens,
+                    max_outputs=2,
+                    block_table_base_offsets=base_offsets,
+                )
+                deepseek_v4_hca_compress_kv_cache_insert(
+                    state_cache=state_cache,
+                    token_to_req_indices=token_to_req,
+                    positions=positions,
+                    compressor_slot_mapping=compressor_slots,
+                    block_table=block_table,
+                    compressor_block_size=state_block_size,
+                    rms_norm_weight=rms_weight,
+                    rms_norm_eps=eps,
+                    cos_sin_cache=cos_sin,
+                    kv_cache_2d=reference_cache,
+                    kv_slot_mapping=kv_slots,
+                    kv_cache_block_size=kv_cache_block_size,
+                    block_table_base_offsets=base_offsets,
+                )
+                torch.cuda.synchronize()
+
+                candidate_values = dequantize_deepseek_v4_fp8_ds_mla_cache(
+                    candidate_cache,
+                    kv_slots[kv_slots >= 0],
+                    kv_cache_block_size,
+                    head_dim=HEAD_DIM,
+                    rope_dim=ROPE_DIM,
+                )
+                reference_values = dequantize_deepseek_v4_fp8_ds_mla_cache(
+                    reference_cache,
+                    kv_slots[kv_slots >= 0],
+                    kv_cache_block_size,
+                    head_dim=HEAD_DIM,
+                    rope_dim=ROPE_DIM,
+                )
+                torch.testing.assert_close(
+                    candidate_values,
+                    reference_values,
+                    atol=0.125,
+                    rtol=0.05,
+                )
+                torch.testing.assert_close(
+                    candidate_values[:, NOPE_DIM:],
+                    reference_values[:, NOPE_DIM:],
+                    atol=0.01,
+                    rtol=0.01,
+                )
+                for slot in kv_slots[kv_slots >= 0].tolist():
+                    page = slot // kv_cache_block_size
+                    offset = (
+                        kv_cache_block_size * SWA_TOKEN_STRIDE
+                        + (slot % kv_cache_block_size) * SWA_SCALE_DIM
+                    )
+                    self.assertTrue(
+                        torch.equal(
+                            candidate_cache[page, offset : offset + SWA_SCALE_DIM],
+                            reference_cache[page, offset : offset + SWA_SCALE_DIM],
+                        )
+                    )
+                skipped_value = dequantize_deepseek_v4_fp8_ds_mla_cache(
+                    candidate_cache,
+                    torch.tensor(
+                        [invalid_state_slot],
+                        dtype=torch.int64,
+                        device=device,
+                    ),
+                    kv_cache_block_size,
+                    head_dim=HEAD_DIM,
+                    rope_dim=ROPE_DIM,
+                )
+                self.assertEqual(float(skipped_value.abs().sum()), 0.0)
+                self.assertTrue(
+                    torch.equal(
+                        scratch[unmodified_rows],
+                        scratch_source[unmodified_rows],
+                    )
+                )
+                self.assertTrue(
+                    torch.equal(
+                        scratch[writable_boundary_rows_tensor, HEAD_DIM:],
+                        scratch_source[writable_boundary_rows_tensor, HEAD_DIM:],
+                    )
+                )
+                for req_idx, (start, end, base) in enumerate(requests):
+                    first_window = start // 128
+                    for output_idx in range(end // 128 - first_window):
+                        window_start = (first_window + output_idx) * 128
+                        window_positions = torch.arange(
+                            window_start,
+                            window_start + 128,
+                            dtype=torch.int64,
+                            device=device,
+                        )
+                        logical_pages = torch.div(
+                            window_positions,
+                            state_block_size,
+                            rounding_mode="floor",
+                        )
+                        physical_pages = block_table[req_idx, logical_pages - base].to(
+                            torch.int64
+                        )
+                        rows = state_cache[
+                            physical_pages,
+                            torch.remainder(window_positions, state_block_size),
+                        ]
+                        expected = torch.sum(
+                            rows[:, :HEAD_DIM]
+                            * torch.softmax(rows[:, HEAD_DIM:], dim=0),
+                            dim=0,
+                        )
+                        boundary_position = (first_window + output_idx + 1) * 128 - 1
+                        boundary_row = (
+                            query_offsets[req_idx] + boundary_position - start
+                        )
+                        if boundary_row not in writable_boundary_rows:
+                            continue
+                        torch.testing.assert_close(
+                            scratch[boundary_row, :HEAD_DIM],
+                            expected,
+                            atol=1.0e-6,
+                            rtol=1.0e-5,
+                        )
+
+                first_result = candidate_cache.clone()
+                deepseek_v4_hca_compress_kv_cache_insert(
+                    state_cache=state_cache,
+                    token_to_req_indices=token_to_req,
+                    positions=positions,
+                    compressor_slot_mapping=compressor_slots,
+                    block_table=block_table,
+                    compressor_block_size=state_block_size,
+                    rms_norm_weight=rms_weight,
+                    rms_norm_eps=eps,
+                    cos_sin_cache=cos_sin,
+                    kv_cache_2d=candidate_cache,
+                    kv_slot_mapping=kv_slots,
+                    kv_cache_block_size=kv_cache_block_size,
+                    prefill_scratch=scratch,
+                    query_start_loc=query_start_loc,
+                    seq_lens=seq_lens,
+                    max_outputs=2,
+                    block_table_base_offsets=base_offsets,
+                )
+                torch.cuda.synchronize()
+                self.assertTrue(torch.equal(candidate_cache, first_result))
 
     def test_csa_compressor_state_insert_matches_reference(self):
         torch.manual_seed(5678)

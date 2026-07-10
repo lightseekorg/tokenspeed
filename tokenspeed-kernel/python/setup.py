@@ -331,6 +331,16 @@ KERNEL_GROUPS = [
         # this separately built vendored source without changing other groups.
         ["--ftz=false", "--prec-div=true", "--prec-sqrt=true"],
     ),
+    # TODO: Import this op from tokenspeed_trtllm_kernel once that package
+    # exposes the DeepSeek-V4 C128 pure-prefill compressor, then delete this
+    # standalone source-vendored bridge.
+    (
+        "trtllm_deepseek_v4_c128_prefill",
+        [
+            CUDA_CSRC_DIR / "trtllm_deepseek_v4_c128_prefill.cu",
+        ],
+        [],
+    ),
     # TODO: Import this kernel from tokenspeed_trtllm_kernel instead of
     # compiling this standalone adapter once the project pin moves beyond
     # 1.2.1 and exposes this op with per-call PDL control. Keeping it separate

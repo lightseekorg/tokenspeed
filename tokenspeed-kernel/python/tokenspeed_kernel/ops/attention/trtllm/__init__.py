@@ -19,13 +19,19 @@
 # SOFTWARE.
 
 from tokenspeed_kernel.ops.attention.trtllm.deepseek_v4 import (
+    has_trtllm_deepseek_v4_c128_prefill_compress_cache,
     has_trtllm_deepseek_v4_indexer_q_prepare,
+    supports_trtllm_deepseek_v4_c128_prefill_compress_cache,
     supports_trtllm_deepseek_v4_indexer_q_prepare,
+    trtllm_deepseek_v4_c128_prefill_compress_cache,
     trtllm_deepseek_v4_indexer_q_prepare_mxfp4,
 )
 
 __all__ = [
+    "has_trtllm_deepseek_v4_c128_prefill_compress_cache",
     "has_trtllm_deepseek_v4_indexer_q_prepare",
+    "supports_trtllm_deepseek_v4_c128_prefill_compress_cache",
     "supports_trtllm_deepseek_v4_indexer_q_prepare",
+    "trtllm_deepseek_v4_c128_prefill_compress_cache",
     "trtllm_deepseek_v4_indexer_q_prepare_mxfp4",
 ]

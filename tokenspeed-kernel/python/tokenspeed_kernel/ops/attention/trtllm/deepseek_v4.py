@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""TRT-LLM DeepSeek-V4 sparse-indexer preparation kernels."""
+"""TRT-LLM-inspired DeepSeek-V4 attention preparation kernels."""
 
 from __future__ import annotations
 
@@ -31,6 +31,10 @@ from tokenspeed_kernel.platform import (
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.thirdparty.cuda.trtllm_deepseek_v4_c128_prefill import (
+    has_trtllm_deepseek_v4_c128_prefill_kernels,
+    trtllm_deepseek_v4_c128_prefill_compress_cache_raw,
+)
 from tokenspeed_kernel.thirdparty.cuda.trtllm_deepseek_v4_indexer import (
     has_trtllm_indexer_q_kernels,
     trtllm_fused_cat_fp4,
@@ -40,6 +44,9 @@ from tokenspeed_kernel.thirdparty.cuda.trtllm_deepseek_v4_indexer import (
 _HEAD_DIM = 128
 _ROPE_DIM = 64
 _MXFP4_VALUE_BYTES = _HEAD_DIM // 2
+_C128_HEAD_DIM = 512
+_C128_STATE_ROW_WIDTH = 2 * _C128_HEAD_DIM
+_C128_CACHE_ROW_BYTES = 584
 _BLACKWELL_CAPABILITY = CapabilityRequirement(
     min_arch_version=ArchVersion(10, 0),
     max_arch_version=ArchVersion(10, 9),
@@ -51,6 +58,12 @@ def has_trtllm_deepseek_v4_indexer_q_prepare() -> bool:
     """Return whether the TRT-LLM Q preparation chain is importable."""
 
     return has_trtllm_indexer_q_kernels()
+
+
+def has_trtllm_deepseek_v4_c128_prefill_compress_cache() -> bool:
+    """Return whether the native C128 pure-prefill compressor is built."""
+
+    return has_trtllm_deepseek_v4_c128_prefill_kernels()
 
 
 def supports_trtllm_deepseek_v4_indexer_q_prepare(
@@ -193,6 +206,263 @@ def trtllm_deepseek_v4_indexer_q_prepare_mxfp4(
     ), scaled_weights
 
 
+def supports_trtllm_deepseek_v4_c128_prefill_compress_cache(
+    state_cache: torch.Tensor,
+    scratch: torch.Tensor,
+    positions: torch.Tensor,
+    compressor_slot_mapping: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    rms_norm_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    kv_cache: torch.Tensor,
+    kv_slot_mapping: torch.Tensor,
+    *,
+    block_table_base_offsets: torch.Tensor | None = None,
+    state_block_size: int,
+    kv_block_size: int,
+    max_outputs: int,
+) -> bool:
+    """Return whether inputs satisfy the SM100 C128 pure-prefill contract.
+
+    This predicate is intentionally strict: the launch path never allocates,
+    converts dtypes, or makes a tensor contiguous on behalf of the caller.
+
+    Args:
+        state_cache: FP32 combined state pages shaped
+            ``[blocks, state_block_size, 1024]``.
+        scratch: Mutable contiguous FP32 projection scratch shaped
+            ``[tokens, >=512]``.
+        positions: Contiguous INT64 absolute positions shaped ``[tokens]``.
+        compressor_slot_mapping: Contiguous INT64 compressor-state slots
+            shaped ``[tokens]``. Negative boundary slots suppress outputs.
+        query_start_loc: Contiguous INT32 packed offsets shaped ``[batch+1]``.
+        seq_lens: Contiguous INT32 final sequence lengths shaped ``[batch]``.
+        block_table: Contiguous INT32 compact state table shaped
+            ``[batch, width]``.
+        rms_norm_weight: Contiguous BF16 or FP32 weights shaped ``[512]``.
+        cos_sin_cache: Contiguous FP32 RoPE table shaped ``[maxpos,64]``. It
+            must cover all referenced 128-aligned compressed positions.
+        kv_cache: Mutable contiguous UINT8 fp8_ds_mla pages.
+        kv_slot_mapping: Contiguous INT64 compressed slots shaped ``[tokens]``.
+        block_table_base_offsets: Optional contiguous INT32 logical page bases
+            shaped ``[batch]``.
+        state_block_size: Number of rows per state page.
+        kv_block_size: Number of compressed rows per KV page.
+        max_outputs: Positive per-request launch bound, at most 65535, that
+            must cover every C128 output in the batch; an undersized bound
+            skips outputs.
+
+    Returns:
+        ``True`` only when the native op, SM100-family device, layouts, dtypes,
+        shapes, and scalar launch parameters are all supported.
+    """
+
+    if not has_trtllm_deepseek_v4_c128_prefill_compress_cache():
+        return False
+    tensors = (
+        state_cache,
+        scratch,
+        positions,
+        compressor_slot_mapping,
+        query_start_loc,
+        seq_lens,
+        block_table,
+        rms_norm_weight,
+        cos_sin_cache,
+        kv_cache,
+        kv_slot_mapping,
+    )
+    if any(
+        not tensor.is_cuda
+        or tensor.device != state_cache.device
+        or not tensor.is_contiguous()
+        for tensor in tensors
+    ):
+        return False
+    if block_table_base_offsets is not None and (
+        not block_table_base_offsets.is_cuda
+        or block_table_base_offsets.device != state_cache.device
+        or not block_table_base_offsets.is_contiguous()
+        or block_table_base_offsets.dtype != torch.int32
+        or block_table_base_offsets.ndim != 1
+    ):
+        return False
+    if (
+        state_cache.dtype != torch.float32
+        or state_cache.ndim != 3
+        or state_cache.shape[1] != state_block_size
+        or state_cache.shape[2] != _C128_STATE_ROW_WIDTH
+        or state_cache.data_ptr() % 16 != 0
+        or state_block_size <= 0
+        or kv_block_size <= 0
+        or max_outputs <= 0
+        or max_outputs > 65535
+    ):
+        return False
+    if (
+        scratch.dtype != torch.float32
+        or scratch.ndim != 2
+        or scratch.shape[0] == 0
+        or scratch.shape[1] < _C128_HEAD_DIM
+        or scratch.stride(0) % 4 != 0
+        or scratch.data_ptr() % 16 != 0
+        or positions.dtype != torch.int64
+        or positions.ndim != 1
+        or positions.shape[0] != scratch.shape[0]
+        or compressor_slot_mapping.dtype != torch.int64
+        or compressor_slot_mapping.ndim != 1
+        or compressor_slot_mapping.shape[0] != scratch.shape[0]
+        or kv_slot_mapping.dtype != torch.int64
+        or kv_slot_mapping.ndim != 1
+        or kv_slot_mapping.shape[0] != scratch.shape[0]
+    ):
+        return False
+    batch_size = seq_lens.shape[0] if seq_lens.ndim == 1 else 0
+    if (
+        batch_size == 0
+        or seq_lens.dtype != torch.int32
+        or query_start_loc.dtype != torch.int32
+        or query_start_loc.ndim != 1
+        or query_start_loc.shape[0] != batch_size + 1
+        or block_table.dtype != torch.int32
+        or block_table.ndim != 2
+        or block_table.shape[0] != batch_size
+        or block_table.shape[1] == 0
+        or (
+            block_table_base_offsets is not None
+            and block_table_base_offsets.shape[0] != batch_size
+        )
+    ):
+        return False
+    if (
+        rms_norm_weight.dtype not in (torch.bfloat16, torch.float32)
+        or rms_norm_weight.ndim != 1
+        or rms_norm_weight.shape[0] != _C128_HEAD_DIM
+        or cos_sin_cache.dtype != torch.float32
+        or cos_sin_cache.ndim != 2
+        or cos_sin_cache.shape[0] == 0
+        or cos_sin_cache.shape[1] != _ROPE_DIM
+        or kv_cache.dtype != torch.uint8
+        or kv_cache.ndim != 2
+        or kv_cache.shape[1] < kv_block_size * _C128_CACHE_ROW_BYTES
+        or kv_cache.stride(0) % 16 != 0
+        or kv_cache.data_ptr() % 16 != 0
+    ):
+        return False
+    device_index = state_cache.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    major, _minor = torch.cuda.get_device_capability(device_index)
+    return major == 10
+
+
+def trtllm_deepseek_v4_c128_prefill_compress_cache(
+    *,
+    state_cache: torch.Tensor,
+    scratch: torch.Tensor,
+    positions: torch.Tensor,
+    compressor_slot_mapping: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    rms_norm_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    kv_cache: torch.Tensor,
+    kv_slot_mapping: torch.Tensor,
+    block_table_base_offsets: torch.Tensor | None = None,
+    state_block_size: int,
+    kv_block_size: int,
+    max_outputs: int,
+    rms_norm_eps: float,
+) -> None:
+    """Compress complete C128 prefill windows and scatter fp8_ds_mla rows.
+
+    The first launch reduces already-saved FP32 compressor-state rows with a
+    four-group online softmax and writes each FP32 result into the first 512
+    columns of its boundary row in ``scratch``. The second launch applies
+    RMSNorm, BF16-rounded 64-value E4M3 quantization for the 448 NoPE values,
+    interleaved RoPE for the 64 tail values, and paged cache scatter.
+
+    Args:
+        state_cache: FP32 ``[blocks, state_block_size, 1024]`` combined
+            ``[kv | score+APE]`` state cache.
+        scratch: Mutable contiguous FP32 ``[tokens, >=512]`` buffer. Only
+            boundary rows in ``:512`` are overwritten.
+        positions: Contiguous INT64 absolute positions, ``[tokens]``.
+        compressor_slot_mapping: Contiguous INT64 compressor-state slots,
+            ``[tokens]``. Negative boundary slots suppress outputs.
+        query_start_loc: Contiguous INT32 packed offsets, ``[batch+1]``.
+        seq_lens: Contiguous INT32 final sequence lengths, ``[batch]``.
+        block_table: Contiguous INT32 compact state page table.
+        rms_norm_weight: Contiguous BF16 or FP32 RMSNorm weights, ``[512]``.
+        cos_sin_cache: Contiguous FP32 RoPE table, ``[maxpos,64]``. The table
+            must cover every referenced 128-aligned compressed position; this
+            device-resident bound is a caller precondition.
+        kv_cache: Mutable contiguous UINT8 fp8_ds_mla pages.
+        kv_slot_mapping: Contiguous INT64 compressed output slots, ``[tokens]``.
+        block_table_base_offsets: Optional contiguous INT32 logical-page bases.
+        state_block_size: State page size in token rows.
+        kv_block_size: Compressed KV page size in rows.
+        max_outputs: Positive per-request output launch bound, at most 65535,
+            that must cover every C128 output in the batch; an undersized bound
+            skips outputs.
+        rms_norm_eps: RMSNorm epsilon.
+
+    Returns:
+        ``None``. ``scratch`` and ``kv_cache`` are mutated in place.
+
+    Raises:
+        RuntimeError: If the native op, device, or strict tensor contract is
+            unsupported. Launch errors propagate; there is no post-launch
+            fallback.
+    """
+
+    if not supports_trtllm_deepseek_v4_c128_prefill_compress_cache(
+        state_cache,
+        scratch,
+        positions,
+        compressor_slot_mapping,
+        query_start_loc,
+        seq_lens,
+        block_table,
+        rms_norm_weight,
+        cos_sin_cache,
+        kv_cache,
+        kv_slot_mapping,
+        block_table_base_offsets=block_table_base_offsets,
+        state_block_size=state_block_size,
+        kv_block_size=kv_block_size,
+        max_outputs=max_outputs,
+    ):
+        raise RuntimeError(
+            "TRT-inspired DeepSeek-V4 C128 prefill compression requires the "
+            "built native op, an SM100-family GPU, and exact contiguous "
+            "FP32/INT64/INT32/BF16-or-FP32/UINT8 tensor layouts"
+        )
+    if rms_norm_eps < 0.0:
+        raise ValueError(f"rms_norm_eps must be non-negative, got {rms_norm_eps}")
+    trtllm_deepseek_v4_c128_prefill_compress_cache_raw(
+        state_cache=state_cache,
+        scratch=scratch,
+        positions=positions,
+        compressor_slot_mapping=compressor_slot_mapping,
+        query_start_loc=query_start_loc,
+        seq_lens=seq_lens,
+        block_table=block_table,
+        rms_norm_weight=rms_norm_weight,
+        cos_sin_cache=cos_sin_cache,
+        kv_cache=kv_cache,
+        kv_slot_mapping=kv_slot_mapping,
+        block_table_base_offsets=block_table_base_offsets,
+        state_block_size=state_block_size,
+        kv_block_size=kv_block_size,
+        max_outputs=max_outputs,
+        rms_norm_eps=rms_norm_eps,
+    )
+
+
 if has_trtllm_deepseek_v4_indexer_q_prepare() and current_platform().is_nvidia:
     trtllm_deepseek_v4_indexer_q_prepare_mxfp4 = register_kernel(
         "attention",
@@ -209,3 +479,23 @@ if has_trtllm_deepseek_v4_indexer_q_prepare() and current_platform().is_nvidia:
         priority=Priority.SPECIALIZED,
         tags={"latency", "throughput"},
     )(trtllm_deepseek_v4_indexer_q_prepare_mxfp4)
+
+
+if (
+    has_trtllm_deepseek_v4_c128_prefill_compress_cache()
+    and current_platform().is_nvidia
+):
+    trtllm_deepseek_v4_c128_prefill_compress_cache = register_kernel(
+        "attention",
+        "deepseek_v4_c128_prefill_compress_cache",
+        name="trtllm_deepseek_v4_c128_prefill_compress_cache",
+        solution="trtllm",
+        capability=_BLACKWELL_CAPABILITY,
+        signatures=format_signatures("scratch", "dense", {torch.float32}),
+        traits={
+            "compress_ratio": frozenset({128}),
+            "head_dim": frozenset({_C128_HEAD_DIM}),
+        },
+        priority=Priority.SPECIALIZED,
+        tags={"latency", "throughput"},
+    )(trtllm_deepseek_v4_c128_prefill_compress_cache)

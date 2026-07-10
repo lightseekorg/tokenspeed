@@ -92,12 +92,14 @@ from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
 from tokenspeed.runtime.layers.quantization import QUANTIZATION_METHODS
 from tokenspeed.runtime.models import deepseek_v4 as deepseek_v4_model
 from tokenspeed.runtime.models.deepseek_v4 import (
+    DeepseekV4Compressor,
     DeepseekV4Indexer,
     DeepseekV4MLP,
     DeepseekV4MoE,
     DeepseekV4MoEGate,
     _deepseek_v4_forward_metadata,
     _deepseek_v4_fused_select_experts,
+    _deepseek_v4_hca_prefill_max_outputs,
     _deepseek_v4_indexer_decode_max_len,
     _deepseek_v4_indexer_decode_plan,
     _deepseek_v4_indexer_prefill_max_logits_bytes,
@@ -5017,6 +5019,195 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertEqual(captured["indexer_block_size"], 4)
         self.assertEqual(captured["indexer_cache"].shape, (8, 128))
         self.assertTrue(torch.equal(topk, torch.full((2, 2), 3, dtype=torch.int32)))
+
+    def test_deepseek_v4_hca_prefill_max_outputs_from_cpu_lengths(self):
+        cases = (
+            ([128], [128], 128, 1),
+            ([129], [128], 128, 1),
+            ([255], [128], 128, 1),
+            ([384, 385], [256, 258], 514, 3),
+            ([127], [126], 126, 0),
+        )
+        for seq_lens, query_lens, num_tokens, expected in cases:
+            with self.subTest(
+                seq_lens=seq_lens,
+                query_lens=query_lens,
+                num_tokens=num_tokens,
+            ):
+                metadata = SimpleNamespace(
+                    num_prefill_reqs=len(seq_lens),
+                    seq_lens_cpu=torch.tensor(seq_lens, dtype=torch.int32),
+                    query_lens_cpu=torch.tensor(query_lens, dtype=torch.int32),
+                )
+                self.assertEqual(
+                    _deepseek_v4_hca_prefill_max_outputs(metadata, num_tokens),
+                    expected,
+                )
+
+    def test_deepseek_v4_hca_prefill_max_outputs_rejects_stale_metadata(self):
+        invalid = (
+            SimpleNamespace(
+                num_prefill_reqs=1,
+                seq_lens_cpu=None,
+                query_lens_cpu=torch.tensor([1], dtype=torch.int32),
+            ),
+            SimpleNamespace(
+                num_prefill_reqs=2,
+                seq_lens_cpu=torch.tensor([128], dtype=torch.int32),
+                query_lens_cpu=torch.tensor([128, 0], dtype=torch.int32),
+            ),
+            SimpleNamespace(
+                num_prefill_reqs=1,
+                seq_lens_cpu=torch.tensor([127], dtype=torch.int32),
+                query_lens_cpu=torch.tensor([128], dtype=torch.int32),
+            ),
+        )
+        for metadata in invalid:
+            with self.subTest(metadata=metadata):
+                self.assertIsNone(_deepseek_v4_hca_prefill_max_outputs(metadata, 128))
+
+        metadata = SimpleNamespace(
+            num_prefill_reqs=1,
+            seq_lens_cpu=torch.tensor([128], dtype=torch.int32),
+            query_lens_cpu=torch.tensor([127], dtype=torch.int32),
+        )
+        self.assertIsNone(_deepseek_v4_hca_prefill_max_outputs(metadata, 128))
+
+    def test_deepseek_v4_hca_prefill_kwargs_are_extend_only_and_cached(self):
+        num_tokens = 128
+        positions = torch.arange(num_tokens, dtype=torch.int64)
+        state_block_table = torch.zeros((1, 128), dtype=torch.int32)
+        state_base = torch.zeros(1, dtype=torch.int32)
+        state_slots = torch.zeros(num_tokens, dtype=torch.int64)
+        compressed_slots = torch.zeros(num_tokens, dtype=torch.int64)
+        cache_metadata = SimpleNamespace(
+            compressed_slot_mapping=Mock(return_value=compressed_slots)
+        )
+        metadata = SimpleNamespace(
+            cache=cache_metadata,
+            token_to_req_indices=torch.zeros(num_tokens, dtype=torch.int32),
+            is_valid_token=None,
+            query_start_loc=torch.tensor([0, num_tokens], dtype=torch.int32),
+            seq_lens=torch.tensor([num_tokens], dtype=torch.int32),
+            num_prefill_reqs=1,
+            seq_lens_cpu=torch.tensor([num_tokens], dtype=torch.int32),
+            query_lens_cpu=torch.tensor([num_tokens], dtype=torch.int32),
+        )
+        pool = SimpleNamespace(
+            get_compressed_block_size=Mock(return_value=2),
+            get_compressed_kv_buffer_2d=Mock(
+                return_value=torch.empty((1, 2 * 584), dtype=torch.uint8)
+            ),
+        )
+        compressor = SimpleNamespace(
+            compress_ratio=128,
+            coff=1,
+            head_dim=512,
+            ape=torch.empty((128, 512), dtype=torch.float32),
+            norm=SimpleNamespace(
+                weight=torch.ones(512),
+                variance_epsilon=1.0e-6,
+            ),
+        )
+        kv_score = torch.empty((num_tokens, 1024), dtype=torch.float32)
+
+        for mode, expect_prefill_kwargs in (
+            (ForwardMode.EXTEND, True),
+            (ForwardMode.MIXED, False),
+            (ForwardMode.DECODE, False),
+        ):
+            with self.subTest(mode=mode):
+                ctx = SimpleNamespace(
+                    token_to_kv_pool=pool,
+                    attn_backend=SimpleNamespace(forward_metadata=metadata),
+                    forward_mode=mode,
+                )
+                slot_cache: dict = {}
+                with (
+                    patch.object(
+                        deepseek_v4_model,
+                        "save_deepseek_v4_compressor_state",
+                    ),
+                    patch.object(
+                        deepseek_v4_model,
+                        "deepseek_v4_hca_compress_kv_cache_insert",
+                    ) as insert,
+                    patch.object(
+                        deepseek_v4_model,
+                        "_deepseek_v4_hca_prefill_max_outputs",
+                        wraps=_deepseek_v4_hca_prefill_max_outputs,
+                    ) as max_outputs,
+                ):
+                    for _ in range(2):
+                        DeepseekV4Compressor.forward(
+                            compressor,
+                            hidden_states=torch.empty((num_tokens, 1)),
+                            positions=positions,
+                            ctx=ctx,
+                            out_cache_loc=torch.empty(0, dtype=torch.int64),
+                            layer_index=0,
+                            cos_sin_cache=torch.empty((128, 64)),
+                            state_cache=torch.empty((1, 128, 1024)),
+                            state_block_table=state_block_table,
+                            state_block_size=128,
+                            state_base_logical_page=state_base,
+                            state_slot_mapping=state_slots,
+                            compressor_slot_cache=slot_cache,
+                            kv_score=kv_score,
+                        )
+
+                kwargs = insert.call_args.kwargs
+                self.assertEqual("max_outputs" in kwargs, expect_prefill_kwargs)
+                self.assertEqual("prefill_scratch" in kwargs, expect_prefill_kwargs)
+                if expect_prefill_kwargs:
+                    self.assertEqual(kwargs["max_outputs"], 1)
+                    self.assertIs(kwargs["prefill_scratch"], kv_score)
+                    self.assertIs(kwargs["query_start_loc"], metadata.query_start_loc)
+                    self.assertIs(kwargs["seq_lens"], metadata.seq_lens)
+                    max_outputs.assert_called_once()
+                else:
+                    max_outputs.assert_not_called()
+
+        metadata.query_lens_cpu = torch.tensor([num_tokens - 1], dtype=torch.int32)
+        ctx = SimpleNamespace(
+            token_to_kv_pool=pool,
+            attn_backend=SimpleNamespace(forward_metadata=metadata),
+            forward_mode=ForwardMode.EXTEND,
+        )
+        with (
+            patch.object(
+                deepseek_v4_model,
+                "save_deepseek_v4_compressor_state",
+            ),
+            patch.object(
+                deepseek_v4_model,
+                "deepseek_v4_hca_compress_kv_cache_insert",
+            ) as insert,
+            patch.object(
+                deepseek_v4_model,
+                "_deepseek_v4_hca_prefill_max_outputs",
+                wraps=_deepseek_v4_hca_prefill_max_outputs,
+            ) as max_outputs,
+        ):
+            DeepseekV4Compressor.forward(
+                compressor,
+                hidden_states=torch.empty((num_tokens, 1)),
+                positions=positions,
+                ctx=ctx,
+                out_cache_loc=torch.empty(0, dtype=torch.int64),
+                layer_index=0,
+                cos_sin_cache=torch.empty((128, 64)),
+                state_cache=torch.empty((1, 128, 1024)),
+                state_block_table=state_block_table,
+                state_block_size=128,
+                state_base_logical_page=state_base,
+                state_slot_mapping=state_slots,
+                compressor_slot_cache={},
+                kv_score=kv_score,
+            )
+        max_outputs.assert_called_once()
+        self.assertNotIn("max_outputs", insert.call_args.kwargs)
+        self.assertNotIn("prefill_scratch", insert.call_args.kwargs)
 
     def test_deepseek_v4_indexer_prefill_request_chunks_match_reference(self):
         chunks = _deepseek_v4_indexer_prefill_request_chunks(
