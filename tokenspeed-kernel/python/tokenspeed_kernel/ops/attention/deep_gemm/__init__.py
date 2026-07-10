@@ -3,13 +3,16 @@ from __future__ import annotations
 import os
 
 import torch
+from tokenspeed_kernel.ops.attention.cuda.dsa_topk import (
+    has_ragged_decode_topk,
+    ragged_decode_topk,
+)
 from tokenspeed_kernel.ops.attention.cute_dsl.dsa_topk import (
     cute_dsl_decode_topk,
     has_cute_dsl_decode_topk,
 )
 from tokenspeed_kernel.ops.attention.flashinfer.dsa_topk import (
     deterministic_decode_topk,
-    has_ragged_decode_topk,
 )
 from tokenspeed_kernel.ops.attention.triton.dsa_topk import (
     local_topk_to_global_slots,
@@ -27,7 +30,7 @@ platform = current_platform()
 _PERSISTENT_TOPK_WORKSPACE_BYTES = 1024 * 1024
 
 # Default the DSA decode top-k to the CuTe DSL cluster kernel; set
-# ``TS_DSA_DECODE_TOPK_CUTEDSL=0`` to fall back to ``deterministic_decode_topk``.
+# ``TS_DSA_DECODE_TOPK_CUTEDSL=0`` to fall back to the ragged/persistent path.
 _CUTE_DSL_DECODE_TOPK_ENABLED = os.environ.get("TS_DSA_DECODE_TOPK_CUTEDSL", "1") == "1"
 
 
@@ -235,7 +238,7 @@ if platform.is_nvidia:
                 out=local_topk_offsets,
             )
         elif has_ragged_decode_topk():
-            deterministic_decode_topk(
+            ragged_decode_topk(
                 logits,
                 local_topk_offsets,
                 topk,

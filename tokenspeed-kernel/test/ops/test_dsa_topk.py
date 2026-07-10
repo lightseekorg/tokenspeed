@@ -24,15 +24,14 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.attention.flashinfer import dsa_topk
+from tokenspeed_kernel.ops.attention.cuda import dsa_topk as cuda_dsa_topk
+from tokenspeed_kernel.ops.attention.flashinfer import dsa_topk as fi_dsa_topk
 
 
-def test_decode_topk_uses_ragged_path_when_lengths_and_workspace_are_provided(
-    monkeypatch,
-):
+def test_ragged_decode_topk_delegates_to_persistent_topk(monkeypatch):
     calls = {}
 
-    monkeypatch.setattr(dsa_topk, "has_persistent_topk", lambda: True)
+    monkeypatch.setattr(cuda_dsa_topk, "has_persistent_topk", lambda: True)
 
     def fake_persistent_topk(
         logits, lengths, output, workspace, k, max_seq_len, q_len_per_req=1
@@ -45,14 +44,14 @@ def test_decode_topk_uses_ragged_path_when_lengths_and_workspace_are_provided(
         calls["q_len_per_req"] = q_len_per_req
         output.fill_(7)
 
-    monkeypatch.setattr(dsa_topk, "persistent_topk", fake_persistent_topk)
+    monkeypatch.setattr(cuda_dsa_topk, "persistent_topk", fake_persistent_topk)
 
     logits = torch.randn(2, 8, dtype=torch.float32)
     lengths = torch.tensor([[3], [6]], dtype=torch.int64)
     output = torch.empty(2, 4, dtype=torch.int32)
     workspace = torch.empty(32, dtype=torch.uint8)
 
-    dsa_topk.deterministic_decode_topk(
+    cuda_dsa_topk.ragged_decode_topk(
         logits,
         output,
         4,
@@ -70,8 +69,8 @@ def test_decode_topk_uses_ragged_path_when_lengths_and_workspace_are_provided(
     assert calls["q_len_per_req"] == 1
 
 
-def test_decode_topk_rejects_partial_or_unavailable_ragged_inputs(monkeypatch):
-    monkeypatch.setattr(dsa_topk, "has_persistent_topk", lambda: False)
+def test_ragged_decode_topk_raises_when_persistent_kernel_unavailable(monkeypatch):
+    monkeypatch.setattr(cuda_dsa_topk, "has_persistent_topk", lambda: False)
 
     logits = torch.randn(2, 8, dtype=torch.float32)
     output = torch.empty(2, 4, dtype=torch.int32)
@@ -79,7 +78,7 @@ def test_decode_topk_rejects_partial_or_unavailable_ragged_inputs(monkeypatch):
     workspace = torch.empty(32, dtype=torch.uint8)
 
     with pytest.raises(RuntimeError, match="length-aware"):
-        dsa_topk.deterministic_decode_topk(
+        cuda_dsa_topk.ragged_decode_topk(
             logits,
             output,
             4,
@@ -88,19 +87,8 @@ def test_decode_topk_rejects_partial_or_unavailable_ragged_inputs(monkeypatch):
             max_seq_len=8,
         )
 
-    monkeypatch.setattr(dsa_topk, "has_persistent_topk", lambda: True)
-    with pytest.raises(RuntimeError, match="length-aware"):
-        dsa_topk.deterministic_decode_topk(
-            logits,
-            output,
-            4,
-            lengths=lengths,
-            workspace=None,
-            max_seq_len=8,
-        )
 
-
-def test_decode_topk_falls_back_to_flashinfer_deterministic_topk(monkeypatch):
+def test_deterministic_decode_topk_falls_back_to_flashinfer(monkeypatch):
     calls = {}
     indices = torch.tensor([[1, 0, 3], [2, 4, 1]], dtype=torch.int64)
 
@@ -112,13 +100,13 @@ def test_decode_topk_falls_back_to_flashinfer_deterministic_topk(monkeypatch):
         calls["dsa_graph_safe"] = dsa_graph_safe
         return None, indices
 
-    monkeypatch.setattr(dsa_topk, "top_k", fake_top_k)
-    monkeypatch.setattr(dsa_topk, "TopKTieBreak", SimpleNamespace(SMALL="small"))
+    monkeypatch.setattr(fi_dsa_topk, "top_k", fake_top_k)
+    monkeypatch.setattr(fi_dsa_topk, "TopKTieBreak", SimpleNamespace(SMALL="small"))
 
     logits = torch.randn(2, 8, dtype=torch.float32)
     output = torch.empty(2, 3, dtype=torch.int32)
 
-    dsa_topk.deterministic_decode_topk(logits, output, 3)
+    fi_dsa_topk.deterministic_decode_topk(logits, output, 3)
 
     assert torch.equal(output, indices.to(torch.int32))
     assert calls["logits"].is_contiguous()

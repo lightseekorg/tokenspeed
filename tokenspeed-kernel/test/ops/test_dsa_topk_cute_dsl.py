@@ -22,7 +22,7 @@
 
 Covers causal-window ``torch.topk`` parity across batch/kv-len/top-k/next_n
 (including ``window < top_k`` and speculative ``next_n > 1``), in-window indices,
-in-place ``out`` reuse, drop-in equivalence with the ``deterministic_decode_topk``
+in-place ``out`` reuse, drop-in equivalence with the ``ragged_decode_topk``
 path via ``local_topk_to_global_slots``, and CUDA-graph capture/replay. NVIDIA
 Blackwell (sm_100+) only; skips elsewhere.
 """
@@ -172,16 +172,14 @@ def test_allocates_output_when_out_is_none():
     ],
 )
 def test_dropin_equivalence_with_persistent_radix(bs, max_pages, topk, next_n):
-    """cute_dsl + slot mapping == deterministic_decode_topk + slot mapping.
+    """cute_dsl + slot mapping == ragged_decode_topk + slot mapping.
 
     This is the integration contract: composed with
     ``local_topk_to_global_slots`` the CuTe DSL path must produce identical
     global KV slots and valid counts as the persistent-radix path it replaces.
     """
-    flashinfer_topk = pytest.importorskip(
-        "tokenspeed_kernel.ops.attention.flashinfer.dsa_topk"
-    )
-    if not flashinfer_topk.has_ragged_decode_topk():
+    cuda_topk = pytest.importorskip("tokenspeed_kernel.ops.attention.cuda.dsa_topk")
+    if not cuda_topk.has_ragged_decode_topk():
         pytest.skip("ragged persistent_topk CUDA kernel unavailable")
     from tokenspeed_kernel.ops.attention.triton.dsa_topk import (
         local_topk_to_global_slots,
@@ -219,7 +217,7 @@ def test_dropin_equivalence_with_persistent_radix(bs, max_pages, topk, next_n):
     slots_cute, lens_cute = _map(loc_cute)
 
     loc_ref = torch.empty(num_rows, topk, device="cuda", dtype=torch.int32)
-    flashinfer_topk.deterministic_decode_topk(
+    cuda_topk.ragged_decode_topk(
         logits,
         loc_ref,
         topk,
