@@ -39,10 +39,7 @@ from tokenspeed.runtime.execution.cache_loc_kernel import update_block_table
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
 from tokenspeed.runtime.execution.drafter.dflash import DFlash
-from tokenspeed.runtime.execution.drafter.eagle import (
-    Eagle,
-    draft_model_reduces_first_step_catchup,
-)
+from tokenspeed.runtime.execution.drafter.eagle import Eagle
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
@@ -1295,9 +1292,6 @@ class ModelExecutor:
             idle_forward_steps = getattr(
                 self.drafter, "idle_forward_steps", self.drafter.spec_num_steps
             )
-            draft_reduces_first_step_catchup = draft_model_reduces_first_step_catchup(
-                self.drafter.draft_model_runner.model
-            )
             for step_idx in range(idle_forward_steps or 0):
                 # Mirror active rank's catch-up step: when all non-idle ranks
                 # are decoding, step 0 sizes collectives from bs/global_bs.
@@ -1317,13 +1311,6 @@ class ModelExecutor:
                     global_num_tokens=draft_global_num_tokens,
                     global_bs=global_bs,
                     all_decode_or_idle=all_decode_or_idle,
-                    # Mirror the active-rank broaden in eagle.py: some draft
-                    # models narrow for any non-idle catch-up, so idle peers
-                    # must size collectives the same way.
-                    draft_first_step_reduce=(
-                        step_idx == 0
-                        and (all_decode_or_idle or draft_reduces_first_step_catchup)
-                    ),
                 )
                 self.drafter.draft_model_runner.forward(
                     draft_ctx,

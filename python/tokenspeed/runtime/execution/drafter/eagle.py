@@ -50,11 +50,6 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 
 
-def draft_model_reduces_first_step_catchup(draft_model) -> bool:
-    """Whether a draft first-step catch-up trims activations to one row per request."""
-    return bool(getattr(draft_model, "draft_first_step_reduce_for_catchup", False))
-
-
 def _advance_draft_forward_metadata_if_supported(attn_backend, seq_lens) -> None:
     advance = getattr(attn_backend, "advance_draft_forward_metadata", None)
     if advance is not None:
@@ -272,12 +267,6 @@ class Eagle(BaseDrafter):
         )
         input_ids = maybe_substitute_mm_pad(input_ids, self.mm_pad_substitute_id)
         draft_model = self.draft_model_runner.model
-        # These draft models run first-step catch-up on the full input window,
-        # then narrow to one row per request for sampling and later MTP steps.
-        reduce_first_step_catchup = draft_model_reduces_first_step_catchup(draft_model)
-        draft_first_step_reduce = forward_mode.is_decode() or (
-            reduce_first_step_catchup and not forward_mode.is_idle()
-        )
         input_num_tokens = draft_input.input_num_tokens
 
         ctx = ForwardContext(
@@ -293,7 +282,6 @@ class Eagle(BaseDrafter):
             global_num_tokens=draft_input.global_num_tokens,
             global_bs=draft_input.global_bs,
             all_decode_or_idle=draft_input.all_decode_or_idle,
-            draft_first_step_reduce=draft_first_step_reduce,
             draft_seq_lens_buf=self.draft_seq_lens_buf,
             accept_lengths=draft_input.accept_lengths,
         )

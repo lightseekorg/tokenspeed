@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -50,9 +51,6 @@ class ForwardContext:
     forward_mode: ForwardMode | None
     req_to_page: torch.Tensor | None = None
     capture_hidden_mode: CaptureHiddenMode | None = CaptureHiddenMode.NULL
-    # Legacy draft first-step flag; Qwen / DeepSeek NextN still set this until
-    # their attention subclasses own trim.  Llama Eagle3 uses accept_lengths.
-    draft_first_step_reduce: bool = False
     # Normalized explicit decode input overrides for this forward, if any.
     decode_input_ids: list[int] | None = None
 
@@ -61,6 +59,12 @@ class ForwardContext:
     global_bs: list[int] | None = None
     all_decode_or_idle: bool = False
     all_extend: bool = False
+    # Models that need specific collective sizing (e.g. draft models whose
+    # first-step forward narrows activations) report these via
+    # ``report_collective_sizing``. Unset (None) means comm sizing falls
+    # back to ``input_num_tokens`` / ``global_num_tokens``.
+    collective_num_tokens: int | None = None
+    collective_global_num_tokens: list[int] | None = None
 
     # --- logits processor ---
     gather_ids: torch.Tensor | None = None
@@ -78,3 +82,26 @@ class ForwardContext:
     # DSA SWA slot mapping + compressor memo, computed once per forward, shared across layers.
     dsa_swa_slot_mapping: torch.Tensor | None = None
     dsa_compressor_slot_cache: Any | None = None
+
+
+@contextmanager
+def report_collective_sizing(
+    ctx: ForwardContext,
+    num_tokens: int,
+    global_num_tokens: list[int] | None,
+):
+    """Report model-specific collective sizing for the duration of the scope.
+
+    When a model needs to specify particular collective token counts (e.g.
+    draft models narrowing activations to one row per request), wrap the
+    model forward in this context manager.  Comm collectives will use the
+    reported values instead of ``input_num_tokens`` / ``global_num_tokens``.
+    Automatically cleared on exit so later forwards use the default sizing.
+    """
+    ctx.collective_num_tokens = num_tokens
+    ctx.collective_global_num_tokens = global_num_tokens
+    try:
+        yield
+    finally:
+        ctx.collective_num_tokens = None
+        ctx.collective_global_num_tokens = None

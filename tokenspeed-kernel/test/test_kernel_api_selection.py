@@ -1098,7 +1098,7 @@ _CASES = [
         "cdna4",
         "attention",
         "mha_prefill",
-        "gluon_mha_prefill_fp16_gfx950",
+        "gluon_mha_prefill_gfx950",
         _attention_prefill,
     ),
     _case(
@@ -1106,7 +1106,7 @@ _CASES = [
         "cdna4",
         "attention",
         "mha_extend_with_kvcache",
-        "gluon_mha_extend_fp16_gfx950",
+        "gluon_mha_extend_gfx950",
         _attention_extend,
     ),
     _case(
@@ -1114,7 +1114,7 @@ _CASES = [
         "cdna4",
         "attention",
         "mha_decode_with_kvcache",
-        "gluon_mha_decode_fp16_gfx950",
+        "gluon_mha_decode_gfx950",
         _attention_decode,
     ),
     _case(

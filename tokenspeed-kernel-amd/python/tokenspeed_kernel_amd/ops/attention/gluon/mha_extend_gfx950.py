@@ -106,6 +106,7 @@ class ExtendConfig:
     HAS_SINK: gl.constexpr
     HAS_LSE: gl.constexpr
     WINDOW_LEFT: gl.constexpr
+    IS_FP8: gl.constexpr
     q_strides: InputStrides
     qk_layout: gl.constexpr
     pv_layout: gl.constexpr
@@ -134,26 +135,45 @@ class ExtendConfig:
         HAS_SINK,
         HAS_LSE,
         WINDOW_LEFT,
+        IS_FP8,
         q_strides,
     ):
-        assert HEAD_DIM == 64
+        assert HEAD_DIM in (64, 128)
         assert BLOCK_N == PAGE_SIZE
 
+        instr_shape = [32, 32, 16]
         mfma_layout = gl.amd.AMDMFMALayout(
             version=4,
-            instr_shape=[32, 32, 16],
+            instr_shape=instr_shape,
             transposed=True,
             warps_per_cta=[NUM_WARPS, 1],
         )
         qk_layout = mfma_layout
         pv_layout = mfma_layout
-        load_layout = gl.BlockedLayout([1, 8], [8, 8], [NUM_WARPS, 1], [1, 0])
-        store_layout = load_layout
+        # load_vec is the number of elements per lane, depends on the input dtype, same as qk_kw.
+        # load_threads is how many lanes span HEAD_DIM.
+        load_vec = 16 if IS_FP8 else 8
+        load_threads = HEAD_DIM // load_vec
+        load_layout = gl.BlockedLayout(
+            [1, load_vec], [64 // load_threads, load_threads], [NUM_WARPS, 1], [1, 0]
+        )
+        # store_vec depends on the output dtype, always 16-bit regardless of input dtype, so 128 / 16 = 8.
+        # store_threads is how many lanes span HEAD_DIM.
+        store_vec = 8
+        store_threads = HEAD_DIM // store_vec
+        store_layout = gl.BlockedLayout(
+            [1, store_vec], [64 // store_threads, store_threads], [NUM_WARPS, 1], [1, 0]
+        )
+        # Padding interval is 64 lanes * load_vec elems.
+        pad_interval = 64 * load_vec
+        # Empirically tuned.
+        pad_k = 16 if IS_FP8 else 8
+        pad_v = 16 if IS_FP8 else 32
         k_smem_layout = gl.PaddedSharedLayout.with_identity_for(
-            [[512, 8]], [BLOCK_N, HEAD_DIM], [1, 0]
+            [[pad_interval, pad_k]], [BLOCK_N, HEAD_DIM], [1, 0]
         )
         v_smem_layout = gl.PaddedSharedLayout.with_identity_for(
-            [[512, 32]], [BLOCK_N, HEAD_DIM], [1, 0]
+            [[pad_interval, pad_v]], [BLOCK_N, HEAD_DIM], [1, 0]
         )
 
         self.N_HEADS = gl.constexpr(N_HEADS)
@@ -170,13 +190,18 @@ class ExtendConfig:
         self.HAS_SINK = gl.constexpr(HAS_SINK)
         self.HAS_LSE = gl.constexpr(HAS_LSE)
         self.WINDOW_LEFT = gl.constexpr(WINDOW_LEFT)
+        self.IS_FP8 = gl.constexpr(IS_FP8)
         self.q_strides = q_strides
         self.qk_layout = gl.constexpr(qk_layout)
         self.pv_layout = gl.constexpr(pv_layout)
-        self.q_layout = gl.constexpr(gl.DotOperandLayout(0, qk_layout, k_width=8))
-        self.k_layout = gl.constexpr(gl.DotOperandLayout(1, qk_layout, k_width=8))
-        self.p_layout = gl.constexpr(gl.DotOperandLayout(0, pv_layout, k_width=4))
-        self.v_layout = gl.constexpr(gl.DotOperandLayout(1, pv_layout, k_width=4))
+        # qk_kw is derived from a 128-bit load / dtype bitwidth.
+        # pv_kw is empirically tuned.
+        qk_kw = 16 if IS_FP8 else 8
+        pv_kw = 16 if IS_FP8 else 4
+        self.q_layout = gl.constexpr(gl.DotOperandLayout(0, qk_layout, k_width=qk_kw))
+        self.k_layout = gl.constexpr(gl.DotOperandLayout(1, qk_layout, k_width=qk_kw))
+        self.p_layout = gl.constexpr(gl.DotOperandLayout(0, pv_layout, k_width=pv_kw))
+        self.v_layout = gl.constexpr(gl.DotOperandLayout(1, pv_layout, k_width=pv_kw))
         self.load_layout = gl.constexpr(load_layout)
         self.store_layout = gl.constexpr(store_layout)
         self.k_smem_layout = gl.constexpr(k_smem_layout)
@@ -486,6 +511,7 @@ def _mha_extend_fp16(
     HAS_SINK: gl.constexpr,
     HAS_LSE: gl.constexpr,
     WINDOW_LEFT: gl.constexpr,
+    IS_FP8: gl.constexpr,
 ):
     cfg = ExtendConfig(
         N_HEADS,
@@ -501,6 +527,7 @@ def _mha_extend_fp16(
         HAS_SINK,
         HAS_LSE,
         WINDOW_LEFT,
+        IS_FP8,
         InputStrides(Q_STRIDE_T, Q_STRIDE_H, Q_STRIDE_D),
     )
     program = ExtendProgram.create(
@@ -598,7 +625,7 @@ def _mha_extend_fp16(
     program.store_lse(l_i, m_i)
 
 
-def gluon_mha_extend_fp16_gfx950(
+def gluon_mha_extend_gfx950(
     q: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_kv: torch.Tensor,
@@ -630,7 +657,9 @@ def gluon_mha_extend_fp16_gfx950(
     cu_q_i32 = cu_seqlens_q.to(torch.int32).contiguous()
     cache_i32 = cache_seqlens.to(torch.int32).contiguous()
 
-    output = torch.empty(q.shape, device=q.device, dtype=q.dtype)
+    is_fp8 = q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    out_dtype = torch.bfloat16 if is_fp8 else q.dtype
+    output = torch.empty(q.shape, device=q.device, dtype=out_dtype)
     if return_lse:
         lse = torch.empty((q.shape[0], n_heads), device=q.device, dtype=torch.float32)
         lse_arg = lse
@@ -664,6 +693,7 @@ def gluon_mha_extend_fp16_gfx950(
         has_sink,
         return_lse,
         window_left,
+        is_fp8,
         num_warps=num_warps,
     )
     if return_lse:

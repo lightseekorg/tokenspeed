@@ -60,6 +60,7 @@ class AttentionConfig:
     BLOCK_N: gl.constexpr
     IS_SLIDING: gl.constexpr
     WINDOW_LEFT: gl.constexpr
+    IS_FP8: gl.constexpr
     GROUP_SIZE: gl.constexpr
     NUM_GROUPS: gl.constexpr
     q_strides: InputStrides
@@ -90,10 +91,11 @@ class AttentionConfig:
         BLOCK_N,
         IS_SLIDING,
         WINDOW_LEFT,
+        IS_FP8,
         q_strides,
     ):
         assert NUM_Q_HEADS % NUM_KV_HEADS == 0
-        assert HEAD_DIM == 64
+        assert HEAD_DIM in (64, 128)
         assert BLOCK_N == PAGE_SIZE
         if IS_SLIDING:
             assert WINDOW_LEFT >= 0
@@ -108,18 +110,39 @@ class AttentionConfig:
         )
         qk_layout = mfma_layout
         pv_layout = mfma_layout
-        q_layout = gl.DotOperandLayout(0, qk_layout, k_width=8)
-        k_layout = gl.DotOperandLayout(1, qk_layout, k_width=8)
-        p_layout = gl.DotOperandLayout(0, pv_layout, k_width=4)
-        v_layout = gl.DotOperandLayout(1, pv_layout, k_width=4)
-        load_layout = gl.BlockedLayout([1, 8], [8, 8], [1, 1], [1, 0])
-        store_layout = gl.BlockedLayout([1, 8], [8, 8], [1, 1], [1, 0])
-        reduce_layout = gl.BlockedLayout([1, 1], [1, 64], [1, 1], [1, 0])
+        # qk_kw is derived from a 128-bit load / dtype bitwidth.
+        # pv_kw is empirically tuned.
+        qk_kw = 16 if IS_FP8 else 8
+        pv_kw = 8 if IS_FP8 else 4
+        q_layout = gl.DotOperandLayout(0, qk_layout, k_width=qk_kw)
+        k_layout = gl.DotOperandLayout(1, qk_layout, k_width=qk_kw)
+        p_layout = gl.DotOperandLayout(0, pv_layout, k_width=pv_kw)
+        v_layout = gl.DotOperandLayout(1, pv_layout, k_width=pv_kw)
+        # load_vec is the number of elements per lane, depends on the input dtype, same as qk_kw.
+        # load_threads is how many lanes span HEAD_DIM.
+        load_vec = 16 if IS_FP8 else 8
+        load_threads = HEAD_DIM // load_vec
+        load_layout = gl.BlockedLayout(
+            [1, load_vec], [64 // load_threads, load_threads], [1, 1], [1, 0]
+        )
+        # store_vec depends on the output dtype, always 16-bit regardless of input dtype, so 128 / 16 = 8.
+        # store_threads is how many lanes span HEAD_DIM.
+        store_vec = 8
+        store_threads = HEAD_DIM // store_vec
+        store_layout = gl.BlockedLayout(
+            [1, store_vec], [64 // store_threads, store_threads], [1, 1], [1, 0]
+        )
+        reduce_layout = gl.BlockedLayout([1, HEAD_DIM // 64], [1, 64], [1, 1], [1, 0])
+        # Padding interval is 64 lanes * load_vec elems.
+        pad_interval = 64 * load_vec
+        # Empirically tuned.
+        pad_k = 16 if IS_FP8 else 8
+        pad_v = 32
         k_smem_layout = gl.PaddedSharedLayout.with_identity_for(
-            [[512, 8]], [BLOCK_N, HEAD_DIM], [1, 0]
+            [[pad_interval, pad_k]], [BLOCK_N, HEAD_DIM], [1, 0]
         )
         v_smem_layout = gl.PaddedSharedLayout.with_identity_for(
-            [[512, 32]], [BLOCK_N, HEAD_DIM], [1, 0]
+            [[pad_interval, pad_v]], [BLOCK_N, HEAD_DIM], [1, 0]
         )
 
         self.SM_SCALE = gl.constexpr(SM_SCALE)
@@ -134,6 +157,7 @@ class AttentionConfig:
         self.BLOCK_N = gl.constexpr(BLOCK_N)
         self.IS_SLIDING = gl.constexpr(IS_SLIDING)
         self.WINDOW_LEFT = gl.constexpr(WINDOW_LEFT)
+        self.IS_FP8 = gl.constexpr(IS_FP8)
         self.GROUP_SIZE = gl.constexpr(NUM_Q_HEADS // NUM_KV_HEADS)
         self.NUM_GROUPS = gl.constexpr((self.GROUP_SIZE + BLOCK_M - 1) // BLOCK_M)
         self.q_strides = q_strides
@@ -484,6 +508,7 @@ def _mha_decode_fp16(
     BLOCK_N: gl.constexpr,
     IS_SLIDING: gl.constexpr,
     WINDOW_LEFT: gl.constexpr,
+    IS_FP8: gl.constexpr,
 ):
     cfg = AttentionConfig(
         SM_SCALE,
@@ -498,6 +523,7 @@ def _mha_decode_fp16(
         BLOCK_N,
         IS_SLIDING,
         WINDOW_LEFT,
+        IS_FP8,
         InputStrides(Q_STRIDE_B, Q_STRIDE_H, Q_STRIDE_D),
     )
     program = AttentionProgram.create(
@@ -567,6 +593,7 @@ def _mha_decode_sliding_fp16(
     IS_SLIDING: gl.constexpr,
     WINDOW_LEFT: gl.constexpr,
     HAS_SINK: gl.constexpr,
+    IS_FP8: gl.constexpr,
 ):
     cfg = AttentionConfig(
         SM_SCALE,
@@ -581,6 +608,7 @@ def _mha_decode_sliding_fp16(
         BLOCK_N,
         IS_SLIDING,
         WINDOW_LEFT,
+        IS_FP8,
         InputStrides(Q_STRIDE_B, Q_STRIDE_H, Q_STRIDE_D),
     )
     program = AttentionProgram.create(
@@ -639,6 +667,7 @@ def _mha_decode_reduce_fp16(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     HAS_SINK: gl.constexpr,
+    IS_FP8: gl.constexpr,
 ):
     cfg = AttentionConfig(
         SM_SCALE,
@@ -653,6 +682,7 @@ def _mha_decode_reduce_fp16(
         BLOCK_N,
         False,  # IS_SLIDING
         -1,  # WINDOW_LEFT
+        IS_FP8,
         InputStrides(1, 1, 1),
     )
     q_index = gl.program_id(0)
@@ -797,7 +827,7 @@ def get_config(
     )
 
 
-def gluon_mha_decode_fp16_gfx950(
+def gluon_mha_decode_gfx950(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -821,7 +851,9 @@ def gluon_mha_decode_fp16_gfx950(
         window_left=window_left,
     )
 
-    output = torch.empty(q.shape, device=q.device, dtype=q.dtype)
+    is_fp8 = q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    out_dtype = torch.bfloat16 if is_fp8 else q.dtype
+    output = torch.empty(q.shape, device=q.device, dtype=out_dtype)
 
     if config.is_sliding:
         # No split-k for sliding window attention
@@ -849,6 +881,7 @@ def gluon_mha_decode_fp16_gfx950(
             config.is_sliding,
             config.window_left,
             has_sink,
+            is_fp8,
             num_warps=1,
         )
     else:
@@ -892,6 +925,7 @@ def gluon_mha_decode_fp16_gfx950(
             config.block_n,
             config.is_sliding,
             config.window_left,
+            is_fp8,
             num_warps=1,
         )
 
@@ -915,6 +949,7 @@ def gluon_mha_decode_fp16_gfx950(
             config.block_m,
             config.block_n,
             has_sink,
+            is_fp8,
             num_warps=1,
         )
     return output
