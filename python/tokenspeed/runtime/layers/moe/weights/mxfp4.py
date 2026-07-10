@@ -48,6 +48,13 @@ def create_mxfp4_weight_pair(
     if platform.is_blackwell and solution == "flashinfer_trtllm":
         ispp_padded = round_up(ispp, 256)
         hidden_size_padded = round_up(spec.hidden_size, 256)
+    elif platform.is_blackwell and solution == "trtllm":
+        if spec.hidden_size % 512 != 0:
+            raise ValueError(
+                "native TRT-LLM MXFP4 MoE requires hidden_size divisible by 512"
+            )
+        ispp_padded = round_up(ispp, 128)
+        hidden_size_padded = spec.hidden_size
     else:
         ispp_padded = (
             round_up(ispp, 64) if platform.is_blackwell else round_up(ispp, MXFP4_BLOCK)

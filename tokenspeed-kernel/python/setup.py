@@ -29,6 +29,7 @@ package installs as a pure-Python stub.
 import ctypes
 import importlib
 import os
+import platform as host_platform
 import shutil
 import site
 import subprocess
@@ -50,6 +51,13 @@ BASE_VERSION = "0.1.0"
 BACKEND_ENV = "TOKENSPEED_KERNEL_BACKEND"
 VALID_BACKENDS = {"cuda", "rocm"}
 DEFAULT_CUDA_ARCHS = ("100a", "103a")
+# Temporary source-vendored bridge, enabled by default so regular CUDA builds
+# include the native routed-MoE runner. Once tokenspeed-trtllm-kernel exports
+# this runner, import it from that package and delete this build switch and the
+# vendored TRT-LLM sources below.
+BUILD_TRTLLM_NATIVE_MOE = (
+    os.environ.get("TOKENSPEED_BUILD_TRTLLM_NATIVE_MOE", "1") == "1"
+)
 
 # CUDA kernels source and output directories
 CUDA_CSRC_DIR = THIRDPARTY_DIR / "cuda" / "csrc"
@@ -57,6 +65,10 @@ CUDA_OBJS_DIR = THIRDPARTY_DIR / "cuda" / "objs"
 
 # JIT kernels source directory (no pre-compilation, just need sources available)
 JIT_CSRC_DIR = THIRDPARTY_DIR / "jit_kernel" / "csrc"
+
+# Temporary source-vendored TensorRT-LLM routed-MoE prototype.
+TRTLLM_NATIVE_MOE_DIR = THIRDPARTY_DIR / "trtllm_native_moe"
+TRTLLM_NATIVE_MOE_OBJS_DIR = TRTLLM_NATIVE_MOE_DIR / "objs"
 
 CUDA_HOME = os.environ.get("CUDA_HOME", "/usr/local/cuda")
 NVCC = os.environ.get("FLASHINFER_NVCC", f"{CUDA_HOME}/bin/nvcc")
@@ -303,6 +315,31 @@ KERNEL_GROUPS = [
             CUDA_CSRC_DIR / "deepseek_v4_attention.cu",
             CUDA_CSRC_DIR / "deepseek_v4_topk.cu",
             CUDA_CSRC_DIR / "deepseek_v4_attention_binding.cu",
+        ],
+        [],
+    ),
+    # TODO: Import these kernels from tokenspeed_trtllm_kernel once they are
+    # exposed there, instead of building this standalone vendored extension.
+    (
+        "trtllm_deepseek_v4_indexer_q",
+        [
+            CUDA_CSRC_DIR / "trtllm_deepseek_v4_indexer_q.cu",
+        ],
+        [],
+        # TRT-LLM's fusedCat contract requires IEEE division for bit-exact
+        # DeepGEMM parity. Override TokenSpeed's global fast-math expansion for
+        # this separately built vendored source without changing other groups.
+        ["--ftz=false", "--prec-div=true", "--prec-sqrt=true"],
+    ),
+    # TODO: Import this kernel from tokenspeed_trtllm_kernel instead of
+    # compiling this standalone adapter once the project pin moves beyond
+    # 1.2.1 and exposes this op with per-call PDL control. Keeping it separate
+    # for now avoids coupling this change to the full third-party package
+    # upgrade and its load-order changes.
+    (
+        "trtllm_fp8_quant_packed",
+        [
+            CUDA_CSRC_DIR / "trtllm_fp8_quant_packed.cu",
         ],
         [],
     ),
@@ -735,6 +772,93 @@ class CudaKernelBuilder:
             subprocess.check_call(link_cmd)
 
 
+class TrtllmNativeMoeBuilder:
+    """Build the temporary source-vendored TRT-LLM routed-MoE runner."""
+
+    def __init__(self, verbose: bool):
+        self.verbose = verbose
+
+    @staticmethod
+    def _cutlass_include_dir() -> Path:
+        try:
+            flashinfer = importlib.import_module("flashinfer")
+        except ImportError as exc:
+            raise RuntimeError(
+                "flashinfer is required to locate the vendored CUTLASS headers"
+            ) from exc
+        path = Path(flashinfer.__file__).resolve().parent / "data/cutlass/include"
+        if not (path / "cutlass/cutlass.h").is_file():
+            raise RuntimeError(f"CUTLASS headers not found under {path}")
+        return path
+
+    def run(self):
+        if not BUILD_TRTLLM_NATIVE_MOE:
+            print(
+                "TOKENSPEED_BUILD_TRTLLM_NATIVE_MOE is not 1; "
+                "skipping experimental native MoE"
+            )
+            return
+
+        torch = importlib.import_module("torch")
+        TRTLLM_NATIVE_MOE_OBJS_DIR.mkdir(parents=True, exist_ok=True)
+        build_dir = TRTLLM_NATIVE_MOE_OBJS_DIR / "build"
+        max_jobs = int(os.environ.get("MAX_JOBS", min(os.cpu_count() or 1, 16)))
+        configure_cmd = [
+            "cmake",
+            "-S",
+            str(TRTLLM_NATIVE_MOE_DIR),
+            "-B",
+            str(build_dir),
+            "-G",
+            "Ninja",
+            "-DCMAKE_BUILD_TYPE=Release",
+            "-DCMAKE_CUDA_RUNTIME_LIBRARY=Shared",
+            f"-DCMAKE_CUDA_COMPILER={NVCC}",
+            f"-DCMAKE_CXX_COMPILER={CXX}",
+            f"-DCMAKE_PREFIX_PATH={torch.utils.cmake_prefix_path}",
+            f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={TRTLLM_NATIVE_MOE_OBJS_DIR}",
+            f"-DCUTLASS_INCLUDE_DIR={self._cutlass_include_dir()}",
+            f"-DPython_EXECUTABLE={sys.executable}",
+            f"-DPython3_EXECUTABLE={sys.executable}",
+        ]
+        if self.verbose:
+            print(" ".join(configure_cmd))
+        env = os.environ.copy()
+        cuda_target = {
+            "aarch64": "sbsa-linux",
+            "arm64": "sbsa-linux",
+            "amd64": "x86_64-linux",
+            "x86_64": "x86_64-linux",
+        }.get(host_platform.machine().lower())
+        cuda_static_dirs = []
+        if cuda_target is not None:
+            cuda_static_dirs = [
+                Path(CUDA_HOME) / f"targets/{cuda_target}/lib",
+                *sorted(Path("/usr/local").glob(f"cuda-*/targets/{cuda_target}/lib")),
+            ]
+        for cuda_static_dir in cuda_static_dirs:
+            if (cuda_static_dir / "libcudadevrt.a").is_file():
+                prepend = f"-L{cuda_static_dir}"
+                existing = env.get("NVCC_PREPEND_FLAGS")
+                env["NVCC_PREPEND_FLAGS"] = (
+                    f"{prepend} {existing}" if existing else prepend
+                )
+                break
+        subprocess.check_call(configure_cmd, env=env)
+        subprocess.check_call(
+            [
+                "cmake",
+                "--build",
+                str(build_dir),
+                "--target",
+                "tokenspeed_trtllm_native_moe",
+                "--parallel",
+                str(max_jobs),
+            ],
+            env=env,
+        )
+
+
 class BuildKernels(build_ext):
     """Compile CUDA kernels into .so files for the CUDA backend."""
 
@@ -749,6 +873,7 @@ class BuildKernels(build_ext):
         _ensure_cuda_compiler()
         verbose = bool(getattr(self, "verbose", False))
         CudaKernelBuilder(KERNEL_GROUPS, verbose=verbose).run()
+        TrtllmNativeMoeBuilder(verbose=verbose).run()
 
 
 class BuildNative(Command):
@@ -802,6 +927,27 @@ setup(
     packages=find_packages(),
     package_data={
         "tokenspeed_kernel.thirdparty.cuda": ["objs/**/*.so"],
+        "tokenspeed_kernel.thirdparty.trtllm_native_moe": [
+            "LICENSE.CUTLASS",
+            "LICENSE.NVIDIA",
+            "LICENSE.PYBIND11",
+            "NOTICE",
+            *(
+                ["objs/libtokenspeed_trtllm_native_moe.so"]
+                if BUILD_TRTLLM_NATIVE_MOE
+                else []
+            ),
+        ],
+    },
+    # MANIFEST.in keeps the temporary native runner sources in the sdist so it
+    # remains buildable. Installed wheels need only the DSO and license files.
+    exclude_package_data={
+        "tokenspeed_kernel.thirdparty.trtllm_native_moe": [
+            "CMakeLists.txt",
+            "tactic_abi.cpp",
+            "cmake/*",
+            "csrc/*",
+        ],
     },
     cmdclass={
         "build_native": BuildNative,

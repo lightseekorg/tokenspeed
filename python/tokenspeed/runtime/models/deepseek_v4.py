@@ -548,32 +548,19 @@ def _deepseek_v4_gather_paged_indexer_mxfp4_cache(
     block_table: torch.Tensor,
     cu_seq_lens: torch.Tensor,
     block_size: int,
-    out: tuple[torch.Tensor, torch.Tensor] | None = None,
+    out: tuple[torch.Tensor, torch.Tensor],
 ) -> tuple[torch.Tensor, torch.Tensor]:
     _, value_bytes, scale_bytes = deepseek_v4_indexer_mxfp4_layout_from_row_bytes(
         cache_2d.shape[1] // block_size
     )
-    if out is None:
-        total_rows = int(cu_seq_lens[-1].item()) if cu_seq_lens.numel() else 0
-        values = torch.empty(
-            (total_rows, value_bytes),
-            dtype=torch.uint8,
-            device=cache_2d.device,
+    if out[0].shape[0] != out[1].shape[0]:
+        raise ValueError(
+            "DeepSeek V4 paged gather workspace value/scale rows must match, "
+            f"got values={out[0].shape[0]}, scales={out[1].shape[0]}"
         )
-        scales = torch.empty(
-            (total_rows, scale_bytes),
-            dtype=torch.uint8,
-            device=cache_2d.device,
-        )
-    else:
-        if out[0].shape[0] != out[1].shape[0]:
-            raise ValueError(
-                "DeepSeek V4 paged gather workspace value/scale rows must match, "
-                f"got values={out[0].shape[0]}, scales={out[1].shape[0]}"
-            )
-        total_rows = int(out[0].shape[0])
-        values = out[0][:total_rows]
-        scales = out[1][:total_rows]
+    total_rows = int(out[0].shape[0])
+    values = out[0][:total_rows]
+    scales = out[1][:total_rows]
     if total_rows == 0:
         return values.view(torch.int8), scales.view(torch.int32).squeeze(-1)
 
@@ -766,7 +753,6 @@ def _deepseek_v4_indexer_topk_from_logits_prefill_op(
         )
 
     topk = out[:num_rows]
-    topk.fill_(-1)
     trtllm_ops.indexer_topk_prefill(
         logits,
         row_starts_for_kernel,
@@ -806,7 +792,7 @@ def _deepseek_v4_indexer_prefill_workspace_size(
     context_len = global_server_args_dict.get("max_model_len")
     if isinstance(context_len, int) and context_len > 0:
         return context_len * 40
-    max_seq_len = int(seq_lens_cpu.max().item()) if seq_lens_cpu.numel() else 1
+    max_seq_len = max(seq_lens_cpu.tolist(), default=1)
     return max(1, max_seq_len) * 40
 
 
@@ -825,8 +811,10 @@ def _deepseek_v4_indexer_prefill_request_chunks(
     if num_tokens == 0:
         return []
 
-    seq_lens = seq_lens_cpu.detach().cpu().to(torch.int64)
-    query_lens = query_lens_cpu.detach().cpu().to(torch.int64)
+    if seq_lens_cpu.device.type != "cpu" or query_lens_cpu.device.type != "cpu":
+        raise RuntimeError("DeepSeek V4 indexer chunk planning requires CPU lengths")
+    seq_lens = seq_lens_cpu.to(torch.int64)
+    query_lens = query_lens_cpu.to(torch.int64)
     if seq_lens.numel() != query_lens.numel():
         return []
 
@@ -919,59 +907,72 @@ def _deepseek_v4_indexer_prefill_request_gather_plan(
     *,
     seq_lens_cpu: torch.Tensor,
     query_lens_cpu: torch.Tensor,
-    block_table: torch.Tensor,
-    cache_block_size: int,
+    device: torch.device,
     compress_ratio: int,
     req_start: int,
     req_end: int,
     query_start: int,
     query_end: int,
-    build_slots: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
-    device = block_table.device
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    int,
+    int,
+]:
     num_rows = max(0, int(query_end) - int(query_start))
     if num_rows == 0 or req_end <= req_start:
         empty_i32 = torch.empty(0, dtype=torch.int32, device=device)
-        empty_i64 = torch.empty(0, dtype=torch.int64, device=device)
-        return empty_i64, empty_i32, empty_i32, empty_i32, 0
+        return empty_i32, empty_i32, empty_i32, empty_i32, 0, 0
 
-    seq_lens_list = (
-        seq_lens_cpu.detach().cpu().to(torch.int64)[req_start:req_end].tolist()
-    )
-    query_lens_list = (
-        query_lens_cpu.detach().cpu().to(torch.int64)[req_start:req_end].tolist()
-    )
+    if seq_lens_cpu.device.type != "cpu" or query_lens_cpu.device.type != "cpu":
+        raise RuntimeError(
+            "DeepSeek V4 indexer prefill planning requires CPU length metadata"
+        )
+    seq_lens_list = seq_lens_cpu.to(torch.int64)[req_start:req_end].tolist()
+    query_lens_list = query_lens_cpu.to(torch.int64)[req_start:req_end].tolist()
     if len(seq_lens_list) != len(query_lens_list):
-        empty_i32 = torch.empty(0, dtype=torch.int32, device=device)
-        empty_i64 = torch.empty(0, dtype=torch.int64, device=device)
-        return empty_i64, empty_i32, empty_i32, empty_i32, 0
+        raise RuntimeError(
+            "DeepSeek V4 indexer prefill sequence/query length counts differ: "
+            f"seq_lens={len(seq_lens_list)}, query_lens={len(query_lens_list)}"
+        )
 
     ratio = max(1, int(compress_ratio))
     seq_lens_list = [max(0, int(x)) for x in seq_lens_list]
     query_lens_list = [max(0, int(x)) for x in query_lens_list]
     compressed_lens_list = [seq_len // ratio for seq_len in seq_lens_list]
-    total_k = sum(compressed_lens_list)
+    gather_rows = sum(compressed_lens_list)
 
     query_offsets: list[int] = [0]
     for query_len in query_lens_list:
         query_offsets.append(query_offsets[-1] + query_len)
 
+    query_start = int(query_start)
+    query_end = int(query_end)
+    if query_start < 0 or query_end > query_offsets[-1]:
+        raise RuntimeError(
+            "DeepSeek V4 indexer prefill query span is outside request metadata: "
+            f"query_start={query_start}, query_end={query_end}, "
+            f"query_tokens={query_offsets[-1]}"
+        )
+
     req_local_list: list[int] = []
     row_lens_list: list[int] = []
     req_local = 0
     last_req = max(0, len(query_lens_list) - 1)
-    for row_offset in range(int(query_start), int(query_end)):
+    for row_offset in range(query_start, query_end):
         while req_local < last_req and row_offset >= query_offsets[req_local + 1]:
             req_local += 1
         local_query_offset = row_offset - query_offsets[req_local]
         prefix_len = max(0, seq_lens_list[req_local] - query_lens_list[req_local])
         row_lens_list.append((prefix_len + local_query_offset + 1) // ratio)
         req_local_list.append(req_local)
-    max_len = max(row_lens_list) if row_lens_list else 0
+    max_len = max(row_lens_list, default=0)
 
     compressed_lens = torch.tensor(
         compressed_lens_list,
-        dtype=torch.int64,
+        dtype=torch.int32,
         device=device,
     )
 
@@ -981,53 +982,22 @@ def _deepseek_v4_indexer_prefill_request_gather_plan(
         device=device,
     )
     cu_seq_lens[:1] = 0
-    torch.cumsum(compressed_lens.to(torch.int32), dim=0, out=cu_seq_lens[1:])
+    torch.cumsum(compressed_lens, dim=0, out=cu_seq_lens[1:])
 
     req_local_tensor = torch.tensor(req_local_list, dtype=torch.int64, device=device)
     row_lens = torch.tensor(row_lens_list, dtype=torch.int32, device=device)
     cu_start = cu_seq_lens[:-1][req_local_tensor]
     cu_end = cu_start + row_lens
-
-    if total_k <= 0 or not build_slots:
-        empty_i64 = torch.empty(0, dtype=torch.int64, device=device)
-        return empty_i64, cu_start, cu_end, row_lens, max_len
-
-    req_ids = torch.repeat_interleave(
-        torch.arange(req_start, req_end, device=device, dtype=torch.int64),
-        compressed_lens,
-        output_size=total_k,
-    )
-    req_local_for_k = req_ids - int(req_start)
-    group_bases = cu_seq_lens[:-1][req_local_for_k].to(torch.int64)
-    local = torch.arange(total_k, device=device, dtype=torch.int64) - group_bases
-    pages = torch.div(local, cache_block_size, rounding_mode="floor")
-    page_offsets = local % cache_block_size
-    page_ids = block_table[req_ids, pages.long()].to(torch.int64)
-    slots = page_ids * cache_block_size + page_offsets
-    return slots, cu_start, cu_end, row_lens, max_len
-
-
-def _deepseek_v4_indexer_prefill_chunk_total_rows(
-    *,
-    seq_lens_cpu: torch.Tensor,
-    compress_ratio: int,
-    req_start: int,
-    req_end: int,
-) -> int:
-    ratio = max(1, int(compress_ratio))
-    seq_lens = seq_lens_cpu.detach().cpu().to(torch.int64)[req_start:req_end].tolist()
-    return sum(max(0, int(seq_len)) // ratio for seq_len in seq_lens)
+    return cu_seq_lens, cu_start, cu_end, row_lens, max_len, gather_rows
 
 
 def _deepseek_v4_indexer_prefill_metadata(
     *,
     metadata: DeepseekV4ForwardMetadata,
-    block_table: torch.Tensor,
-    cache_block_size: int,
     compress_ratio: int,
     num_prefill_tokens: int,
 ) -> DeepseekV4IndexerPrefillMetadata:
-    device = block_table.device
+    device = metadata.seq_lens.device
     if num_prefill_tokens <= 0:
         return DeepseekV4IndexerPrefillMetadata.empty(device)
 
@@ -1039,10 +1009,10 @@ def _deepseek_v4_indexer_prefill_metadata(
 
     seq_lens_cpu = seq_lens_cpu[:num_prefill_reqs]
     query_lens_cpu = query_lens_cpu[:num_prefill_reqs]
-    cache_key = (compress_ratio, cache_block_size, num_prefill_tokens)
+    cache_key = (compress_ratio, num_prefill_tokens)
     cache = metadata.indexer.prefill_plan_cache
     cached = cache.get(cache_key)
-    if cached is not None and cached.slots.device == device:
+    if cached is not None and cached.cu_seq_lens.device == device:
         return cached
 
     chunks = _deepseek_v4_indexer_prefill_request_chunks(
@@ -1057,51 +1027,30 @@ def _deepseek_v4_indexer_prefill_metadata(
         return out
 
     chunk_plans: list[DeepseekV4IndexerPrefillChunkPlan] = []
-    slot_parts: list[torch.Tensor] = []
     cu_seq_lens_parts: list[torch.Tensor] = []
     cu_seqlen_k_start_parts: list[torch.Tensor] = []
     cu_seqlen_k_end_parts: list[torch.Tensor] = []
     seq_lens_k_parts: list[torch.Tensor] = []
-    slot_offset = 0
     cu_seq_offset = 0
     row_offset = 0
     for chunk in chunks:
-        slots, cu_seqlen_k_start, cu_seqlen_k_end, seq_lens_k, max_seqlen_k = (
-            _deepseek_v4_indexer_prefill_request_gather_plan(
-                seq_lens_cpu=seq_lens_cpu,
-                query_lens_cpu=query_lens_cpu,
-                block_table=block_table,
-                cache_block_size=cache_block_size,
-                compress_ratio=compress_ratio,
-                req_start=chunk.req_start,
-                req_end=chunk.req_end,
-                query_start=chunk.query_start,
-                query_end=chunk.query_end,
-                build_slots=False,
-            )
-        )
-        slot_count = _deepseek_v4_indexer_prefill_chunk_total_rows(
+        (
+            cu_seq_lens,
+            cu_seqlen_k_start,
+            cu_seqlen_k_end,
+            seq_lens_k,
+            max_seqlen_k,
+            gather_rows,
+        ) = _deepseek_v4_indexer_prefill_request_gather_plan(
             seq_lens_cpu=seq_lens_cpu,
+            query_lens_cpu=query_lens_cpu,
+            device=device,
             compress_ratio=compress_ratio,
             req_start=chunk.req_start,
             req_end=chunk.req_end,
+            query_start=chunk.query_start,
+            query_end=chunk.query_end,
         )
-        compressed_lens = torch.div(
-            seq_lens_cpu[chunk.req_start : chunk.req_end].to(
-                dtype=torch.int32,
-                device=device,
-            ),
-            max(1, int(compress_ratio)),
-            rounding_mode="floor",
-        )
-        cu_seq_lens = torch.empty(
-            compressed_lens.numel() + 1,
-            dtype=torch.int32,
-            device=device,
-        )
-        cu_seq_lens[:1] = 0
-        torch.cumsum(compressed_lens, dim=0, out=cu_seq_lens[1:])
-        slot_end = slot_offset + slot_count
         cu_seq_end = cu_seq_offset + cu_seq_lens.numel()
         row_end = row_offset + seq_lens_k.numel()
         chunk_plans.append(
@@ -1110,8 +1059,7 @@ def _deepseek_v4_indexer_prefill_metadata(
                 token_end=chunk.token_end,
                 request_start=chunk.req_start,
                 request_end=chunk.req_end,
-                slot_start=slot_offset,
-                slot_end=slot_end,
+                gather_rows=gather_rows,
                 gather_row_start=row_offset,
                 gather_row_end=row_end,
                 max_seq_len_k=max_seqlen_k,
@@ -1120,13 +1068,10 @@ def _deepseek_v4_indexer_prefill_metadata(
                 skip_kv_gather=chunk.skip_kv_gather,
             )
         )
-        if slots.numel() > 0:
-            slot_parts.append(slots)
         cu_seq_lens_parts.append(cu_seq_lens)
         cu_seqlen_k_start_parts.append(cu_seqlen_k_start)
         cu_seqlen_k_end_parts.append(cu_seqlen_k_end)
         seq_lens_k_parts.append(seq_lens_k)
-        slot_offset = slot_end
         cu_seq_offset = cu_seq_end
         row_offset = row_end
 
@@ -1149,8 +1094,7 @@ def _deepseek_v4_indexer_prefill_metadata(
         chunk_offsets=torch.tensor(
             [
                 [
-                    chunk.slot_start,
-                    chunk.slot_end,
+                    chunk.gather_rows,
                     chunk.gather_row_start,
                     chunk.gather_row_end,
                     chunk.max_seq_len_k,
@@ -1161,11 +1105,6 @@ def _deepseek_v4_indexer_prefill_metadata(
             ],
             dtype=torch.int64,
             device="cpu",
-        ),
-        slots=(
-            torch.cat(slot_parts, dim=0)
-            if slot_parts
-            else torch.empty(0, dtype=torch.int64, device=device)
         ),
         cu_seq_lens=(
             torch.cat(cu_seq_lens_parts, dim=0)
@@ -1377,6 +1316,7 @@ def _deepseek_v4_indexer_topk_prefill_deepgemm(
     cache_block_size: int,
     topk_tokens: int,
     use_prefill_topk_op: bool,
+    out: torch.Tensor,
     gathered_k: tuple[torch.Tensor, torch.Tensor] | None = None,
     gather_workspace: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
@@ -1386,26 +1326,18 @@ def _deepseek_v4_indexer_topk_prefill_deepgemm(
 
     num_tokens = q_values.shape[0]
     if num_tokens == 0:
-        return (
-            torch.empty(
-                (0, topk_tokens),
-                device=q_values.device,
-                dtype=torch.int32,
-            ),
-            gathered_k,
-        )
+        return out[:0], gathered_k
     if max_len <= 0:
-        return (
-            torch.full(
-                (num_tokens, topk_tokens),
-                -1,
-                device=q_values.device,
-                dtype=torch.int32,
-            ),
-            gathered_k,
-        )
+        target = out[:num_tokens]
+        target.fill_(-1)
+        return target, gathered_k
 
     if gathered_k is None:
+        if gather_workspace is None:
+            raise RuntimeError(
+                "DeepSeek V4 indexer prefill requires a preallocated gather "
+                "workspace"
+            )
         with nvtx_range("indexer_topk_prefill_gather_paged_mxfp4"):
             gathered_k = _deepseek_v4_gather_paged_indexer_mxfp4_cache(
                 cache_2d,
@@ -1435,6 +1367,7 @@ def _deepseek_v4_indexer_topk_prefill_deepgemm(
                 row_lens,
                 topk_tokens,
                 use_prefill_topk_op=use_prefill_topk_op,
+                out=out,
             ),
             gathered_k,
         )
@@ -1457,7 +1390,7 @@ def _deepseek_v4_indexer_topk_from_cache_deepgemm_decode(
     decode_block_table: torch.Tensor | None = None,
     decode_max_context_len: int | None = None,
     is_valid_token: torch.Tensor | None = None,
-    out: torch.Tensor | None = None,
+    out: torch.Tensor,
     persistent_topk_workspace: torch.Tensor | None = None,
 ) -> torch.Tensor:
     q_values, q_scales = index_q
@@ -1466,17 +1399,15 @@ def _deepseek_v4_indexer_topk_from_cache_deepgemm_decode(
 
     num_tokens = positions.numel()
     if num_tokens == 0:
-        if out is not None:
-            return out[:0]
-        return torch.empty((0, topk_tokens), device=positions.device, dtype=torch.int32)
+        return out[:0]
     if decode_context_lens is not None and decode_block_table is not None:
         context_lens = decode_context_lens
         block_tables = decode_block_table
-        max_len = (
-            int(decode_max_context_len)
-            if decode_max_context_len is not None
-            else int(context_lens.max().item())
-        )
+        if decode_max_context_len is None:
+            raise RuntimeError(
+                "DeepSeek V4 decode context metadata requires a host max length"
+            )
+        max_len = int(decode_max_context_len)
     else:
         decode_plan = _deepseek_v4_indexer_decode_plan(
             positions=positions,
@@ -1490,15 +1421,7 @@ def _deepseek_v4_indexer_topk_from_cache_deepgemm_decode(
         context_lens = decode_plan.context_lens
         block_tables = decode_plan.block_table
         max_len = decode_plan.max_context_len
-    topk = (
-        torch.empty(
-            (num_tokens, topk_tokens),
-            device=positions.device,
-            dtype=torch.int32,
-        )
-        if out is None
-        else out[:num_tokens]
-    )
+    topk = out[:num_tokens]
     if max_len <= 0:
         topk.fill_(-1)
         return topk
@@ -1557,11 +1480,8 @@ def _deepseek_v4_sparse_attn_indexer_native(
     positions: torch.Tensor,
     token_to_req_indices: torch.Tensor,
     block_table: torch.Tensor,
-    seq_lens_cpu: torch.Tensor,
-    query_lens_cpu: torch.Tensor,
     prefill_chunk_specs: torch.Tensor,
     prefill_chunk_offsets: torch.Tensor,
-    prefill_slots: torch.Tensor,
     prefill_cu_seq_lens: torch.Tensor,
     prefill_cu_seqlen_k_start: torch.Tensor,
     prefill_cu_seqlen_k_end: torch.Tensor,
@@ -1585,7 +1505,6 @@ def _deepseek_v4_sparse_attn_indexer_native(
 ) -> torch.Tensor:
     total_tokens = positions.numel()
     topk_out = topk_indices_buffer[:total_tokens]
-    topk_out.fill_(-1)
     if total_tokens == 0:
         return topk_out
 
@@ -1610,8 +1529,7 @@ def _deepseek_v4_sparse_attn_indexer_native(
                 skip_kv_gather_raw,
             ) = prefill_chunk_specs[chunk_idx].tolist()
             (
-                slot_start,
-                slot_end,
+                gather_rows,
                 row_start,
                 row_end,
                 max_seqlen_k,
@@ -1619,7 +1537,7 @@ def _deepseek_v4_sparse_attn_indexer_native(
                 cu_seq_end,
             ) = prefill_chunk_offsets[chunk_idx].tolist()
             skip_kv_gather = bool(int(skip_kv_gather_raw))
-            gather_rows = max(0, slot_end - slot_start)
+            gather_rows = max(0, int(gather_rows))
             gather_workspace = None
             if (
                 prefill_gather_values_workspace.numel() > 0
@@ -1640,7 +1558,7 @@ def _deepseek_v4_sparse_attn_indexer_native(
                     raise RuntimeError(
                         "DeepSeek V4 sparse indexer prefill metadata is incomplete"
                     )
-                topk, next_gathered_k = _deepseek_v4_indexer_topk_prefill_deepgemm(
+                _, next_gathered_k = _deepseek_v4_indexer_topk_prefill_deepgemm(
                     cache_2d=cache_2d,
                     block_table=block_table[req_start:req_end],
                     cu_seq_lens=prefill_cu_seq_lens[cu_seq_start:cu_seq_end],
@@ -1658,11 +1576,11 @@ def _deepseek_v4_sparse_attn_indexer_native(
                     use_prefill_topk_op=True,
                     gathered_k=reuse_k,
                     gather_workspace=gather_workspace,
+                    out=topk_out[token_start:token_end],
                 )
                 if next_gathered_k is not None:
                     gather_cache_key = key
                     gathered_k = next_gathered_k
-            topk_out[token_start:token_end].copy_(topk)
 
     def fill_decode() -> None:
         if num_decode_tokens <= 0:
@@ -1705,11 +1623,8 @@ def _deepseek_v4_sparse_attn_indexer_op(
     positions: torch.Tensor,
     token_to_req_indices: torch.Tensor,
     block_table: torch.Tensor,
-    seq_lens_cpu: torch.Tensor,
-    query_lens_cpu: torch.Tensor,
     prefill_chunk_specs: torch.Tensor,
     prefill_chunk_offsets: torch.Tensor,
-    prefill_slots: torch.Tensor,
     prefill_cu_seq_lens: torch.Tensor,
     prefill_cu_seqlen_k_start: torch.Tensor,
     prefill_cu_seqlen_k_end: torch.Tensor,
@@ -1741,11 +1656,8 @@ def _deepseek_v4_sparse_attn_indexer_op(
         positions=positions,
         token_to_req_indices=token_to_req_indices,
         block_table=block_table,
-        seq_lens_cpu=seq_lens_cpu,
-        query_lens_cpu=query_lens_cpu,
         prefill_chunk_specs=prefill_chunk_specs,
         prefill_chunk_offsets=prefill_chunk_offsets,
-        prefill_slots=prefill_slots,
         prefill_cu_seq_lens=prefill_cu_seq_lens,
         prefill_cu_seqlen_k_start=prefill_cu_seqlen_k_start,
         prefill_cu_seqlen_k_end=prefill_cu_seqlen_k_end,
@@ -1774,11 +1686,8 @@ def _deepseek_v4_sparse_attn_indexer_fake(
     positions: torch.Tensor,
     token_to_req_indices: torch.Tensor,
     block_table: torch.Tensor,
-    seq_lens_cpu: torch.Tensor,
-    query_lens_cpu: torch.Tensor,
     prefill_chunk_specs: torch.Tensor,
     prefill_chunk_offsets: torch.Tensor,
-    prefill_slots: torch.Tensor,
     prefill_cu_seq_lens: torch.Tensor,
     prefill_cu_seqlen_k_start: torch.Tensor,
     prefill_cu_seqlen_k_end: torch.Tensor,
@@ -1805,11 +1714,8 @@ def _deepseek_v4_sparse_attn_indexer_fake(
         positions,
         token_to_req_indices,
         block_table,
-        seq_lens_cpu,
-        query_lens_cpu,
         prefill_chunk_specs,
         prefill_chunk_offsets,
-        prefill_slots,
         prefill_cu_seq_lens,
         prefill_cu_seqlen_k_start,
         prefill_cu_seqlen_k_end,
@@ -1898,11 +1804,8 @@ def _deepseek_v4_sparse_attn_indexer(
         positions,
         batch_metadata.token_to_req_indices,
         indexer_block_table,
-        batch_metadata.seq_lens_cpu,
-        batch_metadata.query_lens_cpu,
         prefill_metadata.chunk_specs,
         prefill_metadata.chunk_offsets,
-        prefill_metadata.slots,
         prefill_metadata.cu_seq_lens,
         prefill_metadata.cu_seqlen_k_start,
         prefill_metadata.cu_seqlen_k_end,
@@ -2437,6 +2340,19 @@ class DeepseekV4MegaMoEExperts(nn.Module):
         return y
 
 
+def _deepseek_v4_shared_output_scale(mapping: Mapping) -> float:
+    """Scale dense-TP shared output before a MoE-group reduction."""
+
+    dense_tp_size = mapping.dense.tp_size
+    moe_group_size = mapping.moe.tp_ep_size
+    if moe_group_size % dense_tp_size != 0:
+        raise ValueError(
+            "DeepSeek V4 normal MoE requires the MoE TP/EP group size to be "
+            "divisible by dense TP size when shared experts are enabled"
+        )
+    return dense_tp_size / moe_group_size
+
+
 class DeepseekV4MoE(nn.Module):
     def __init__(
         self,
@@ -2500,6 +2416,11 @@ class DeepseekV4MoE(nn.Module):
             )
         else:
             self.shared_experts = None
+        self.shared_output_scale = (
+            _deepseek_v4_shared_output_scale(mapping)
+            if self.shared_experts is not None and not self.use_mega_moe
+            else 1.0
+        )
 
         if self.use_mega_moe:
             self.experts = DeepseekV4MegaMoEExperts(
@@ -2555,8 +2476,6 @@ class DeepseekV4MoE(nn.Module):
         input_ids: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         router_logits = self.gate(hidden_states)
-        fmt = getattr(self.experts, "topk_output_format", None)
-        need_scores = fmt is not None and not fmt.is_bypassed()
         return deepseek_v4_select_experts(
             router_logits,
             self.config.num_experts_per_tok,
@@ -2564,7 +2483,9 @@ class DeepseekV4MoE(nn.Module):
             correction_bias=self.gate.e_score_correction_bias,
             hash_indices_table=self.gate.tid2eid,
             input_ids=input_ids,
-            need_scores=need_scores,
+            # MoE backends consume the selected ids and weights, not the full
+            # transformed score tensor.
+            need_scores=False,
         )
 
     def _make_topk_output(
@@ -2674,7 +2595,12 @@ class DeepseekV4MoE(nn.Module):
                     routed *= self.routed_scaling_factor
             with fork.branch():
                 shared = self._forward_shared_experts(hidden_states)
-        return routed + shared if shared is not None else routed
+        if shared is None:
+            return routed
+        # post_moe_comm sums across the MoE TP/EP group. Shared experts are
+        # sharded across dense TP and therefore appear once per dense-TP group;
+        # compensate for those replicas without launching a separate scale op.
+        return torch.add(routed, shared, alpha=self.shared_output_scale)
 
     def forward(
         self,
@@ -3099,6 +3025,8 @@ class DeepseekV4Indexer(nn.Module):
         with nvtx_range("indexer_weights_proj"):
             weights, _ = self.weights_proj(hidden_states)
         with nvtx_range("indexer_prepare_mxfp4"):
+            # This call consumes the disposable projection output. The
+            # large-token TRT-LLM kernel path applies RoPE to index_q in place.
             packed_index_q, packed_weights = deepseek_v4_prepare_indexer_q_mxfp4(
                 index_q=index_q,
                 positions=positions,
@@ -3116,25 +3044,12 @@ class DeepseekV4Indexer(nn.Module):
                 "DeepSeek V4 sparse indexer requires DeepGEMM FP4 support"
             )
 
-        empty_cpu = torch.empty(0, dtype=torch.int32, device="cpu")
-        seq_lens_cpu = (
-            metadata.seq_lens_cpu[: metadata.num_prefill_reqs]
-            if metadata.seq_lens_cpu is not None and num_prefill_tokens > 0
-            else empty_cpu
-        )
-        query_lens_cpu = (
-            metadata.query_lens_cpu[: metadata.num_prefill_reqs]
-            if metadata.query_lens_cpu is not None and num_prefill_tokens > 0
-            else empty_cpu
-        )
         indexer_block_table = metadata.cache.compressed_block_table(
             self.compress_ratio,
             indexer_block_size,
         )
         prefill_metadata = _deepseek_v4_indexer_prefill_metadata(
             metadata=metadata,
-            block_table=indexer_block_table,
-            cache_block_size=indexer_block_size,
             compress_ratio=self.compress_ratio,
             num_prefill_tokens=num_prefill_tokens,
         )
@@ -3172,8 +3087,6 @@ class DeepseekV4Indexer(nn.Module):
             batch_metadata=DeepseekV4IndexerBatchMetadata(
                 positions=positions,
                 token_to_req_indices=metadata.token_to_req_indices[:total_tokens],
-                seq_lens_cpu=seq_lens_cpu,
-                query_lens_cpu=query_lens_cpu,
                 num_prefill_tokens=num_prefill_tokens,
                 num_decode_tokens=num_decode_tokens,
             ),

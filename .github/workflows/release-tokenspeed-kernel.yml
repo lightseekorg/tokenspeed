@@ -213,6 +213,7 @@ jobs:
               set -euo pipefail
 
               PYBIN="/opt/python/${PYTHON_TAG}/bin"
+              export PATH="${PYBIN}:${PATH}"
               cd /workspace/tokenspeed-kernel/python
 
               "${PYBIN}/python" -m pip install --upgrade \
@@ -233,6 +234,9 @@ jobs:
                 --remove /output/*.whl
 
               "${PYBIN}/python" -m twine check /output/*.whl
+              "${PYBIN}/python" \
+                /workspace/tokenspeed-kernel/test/check_native_moe_distribution.py \
+                wheel /output/*.whl --load
             '
 
       - name: Upload wheel
@@ -266,6 +270,8 @@ jobs:
           TOKENSPEED_KERNEL_GIT_BRANCH=$GITHUB_REF_NAME \
             python -m build --sdist --no-isolation --outdir ../../dist
           python -m twine check ../../dist/*.tar.gz
+          python ../test/check_native_moe_distribution.py \
+            sdist ../../dist/*.tar.gz --source-root .
 
       - name: Upload source distribution
         uses: actions/upload-artifact@v4

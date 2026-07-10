@@ -666,6 +666,20 @@ class ServerArgs:
         if self.deepseek_v4_prefill_chunk_size <= 0:
             raise ValueError("deepseek_v4_prefill_chunk_size must be positive")
 
+        native_trtllm_moe_selected = "trtllm" in {
+            self.moe_backend,
+            self.draft_moe_backend,
+        }
+        if native_trtllm_moe_selected and (
+            self.ep_num_redundant_experts != 0
+            or self.enable_eplb
+            or self.init_expert_location != "trivial"
+        ):
+            raise ValueError(
+                "native TRT-LLM MoE requires trivial expert placement without "
+                "redundant experts or EPLB"
+            )
+
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
             self.expert_distribution_recorder_mode = "stat"
             logger.info(
@@ -1243,7 +1257,7 @@ class ServerArgs:
             "--moe-backend",
             type=str,
             default=ServerArgs.moe_backend,
-            help="MoE runner backend: auto, triton, gluon, flashinfer_trtllm",
+            help="MoE runner backend: auto, triton, gluon, trtllm, flashinfer_trtllm",
         )
         parser.add_argument(
             "--draft-moe-backend",

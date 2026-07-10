@@ -1,0 +1,23 @@
+TensorRT-LLM native routed-MoE source prototype
+
+The files below csrc/, cmake/tllm_cubin_archive.cmake, and the precompiled
+*.cubin.tar.zst payloads are vendored or minimally adapted from:
+
+  NVIDIA/TensorRT-LLM
+  https://github.com/NVIDIA/TensorRT-LLM
+  commit 54efe57e41f9742d915da977e7701c5cff2b7d6c
+  branch feat/deepseek_v4_bench
+
+They are provided under NVIDIA's Apache-2.0 licensing terms in
+LICENSE.NVIDIA. Local adaptations are identified in their file comments.
+
+The runner is compiled with CUTLASS headers distributed by FlashInfer. CUTLASS
+is provided under the BSD 3-Clause license in LICENSE.CUTLASS.
+
+csrc/cpp/include/tensorrt_llm/common/bindingUtils.h contains code adapted from
+pybind11. pybind11 is provided under the BSD 3-Clause license in
+LICENSE.PYBIND11.
+
+This is a temporary performance experiment. TODO: import
+MxE4m3MxE2m1BlockScaleMoERunner from tokenspeed-trtllm-kernel and delete this
+vendored implementation once that package exports the runner.

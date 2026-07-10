@@ -23,6 +23,7 @@ from typing import Any
 import tokenspeed_kernel.ops.moe.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.moe.gluon  # noqa: F401
 import tokenspeed_kernel.ops.moe.triton  # noqa: F401
+import tokenspeed_kernel.ops.moe.trtllm  # noqa: F401
 import torch
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import select_kernel

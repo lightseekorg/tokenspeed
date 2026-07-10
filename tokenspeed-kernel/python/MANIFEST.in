@@ -1,0 +1,9 @@
+include tokenspeed_kernel/thirdparty/trtllm_native_moe/CMakeLists.txt
+include tokenspeed_kernel/thirdparty/trtllm_native_moe/LICENSE.CUTLASS
+include tokenspeed_kernel/thirdparty/trtllm_native_moe/LICENSE.NVIDIA
+include tokenspeed_kernel/thirdparty/trtllm_native_moe/LICENSE.PYBIND11
+include tokenspeed_kernel/thirdparty/trtllm_native_moe/NOTICE
+include tokenspeed_kernel/thirdparty/trtllm_native_moe/tactic_abi.cpp
+recursive-include tokenspeed_kernel/thirdparty/trtllm_native_moe/cmake *.cmake
+recursive-include tokenspeed_kernel/thirdparty/trtllm_native_moe/csrc *.cpp *.cu *.cuh *.h *.json *.zst
+prune tokenspeed_kernel/thirdparty/trtllm_native_moe/objs

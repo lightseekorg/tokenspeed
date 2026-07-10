@@ -2,6 +2,8 @@
 nvidia-cutlass-dsl==4.5.2
 nvidia-cutlass-dsl-libs-cu13==4.5.2
 torch==2.11.0
+cmake>=3.31.10
+ninja>=1.11
 flashinfer-python==0.6.13
 flashinfer-cubin==0.6.13
 nvidia-ml-py==13.580.82

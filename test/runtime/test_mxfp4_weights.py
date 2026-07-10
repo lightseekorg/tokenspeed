@@ -3,6 +3,7 @@
 import os
 import sys
 import unittest
+from unittest.mock import patch
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -36,6 +37,54 @@ def _mxfp4_spec(num_local_experts: int, hidden_size: int, intermediate_size: int
 
 
 class TestMxfp4Weights(unittest.TestCase):
+    def test_native_trtllm_uses_source_runner_alignment(self):
+        spec = MoELayerSpec(
+            top_k=6,
+            num_experts=384,
+            num_local_experts=1,
+            hidden_size=7168,
+            intermediate_size=3072,
+            activation="swiglu",
+            tp_rank=0,
+            tp_size=8,
+            ep_rank=0,
+            ep_size=1,
+        )
+        native_layer = nn.Module()
+
+        with patch(
+            "tokenspeed.runtime.layers.moe.weights.mxfp4.current_platform"
+        ) as current_platform:
+            current_platform.return_value.is_blackwell = True
+            create_mxfp4_weight_pair(
+                spec,
+                native_layer,
+                solution="trtllm",
+            )
+
+        self.assertEqual(native_layer.w13_weight.shape, (1, 768, 3584))
+        self.assertEqual(native_layer.w13_weight_scale.shape, (1, 768, 224))
+        self.assertEqual(native_layer.w2_weight.shape, (1, 7168, 192))
+        self.assertEqual(native_layer.w2_weight_scale.shape, (1, 7168, 12))
+
+    def test_native_trtllm_requires_512_aligned_hidden_size(self):
+        with (
+            patch(
+                "tokenspeed.runtime.layers.moe.weights.mxfp4.current_platform"
+            ) as current_platform,
+            self.assertRaisesRegex(ValueError, "hidden_size divisible by 512"),
+        ):
+            current_platform.return_value.is_blackwell = True
+            create_mxfp4_weight_pair(
+                _mxfp4_spec(
+                    num_local_experts=1,
+                    hidden_size=640,
+                    intermediate_size=128,
+                ),
+                nn.Module(),
+                solution="trtllm",
+            )
+
     def test_scale_weights_store_checkpoint_bytes(self):
         layer = nn.Module()
         create_mxfp4_weight_pair(

@@ -47,6 +47,7 @@ import tokenspeed_kernel.ops.moe as _moe_pkg
 import tokenspeed_kernel.ops.moe.flashinfer as _moe_flashinfer
 import tokenspeed_kernel.ops.moe.gluon as _moe_gluon
 import tokenspeed_kernel.ops.moe.triton as _moe_triton
+import tokenspeed_kernel.ops.moe.trtllm as _moe_native_trtllm
 import tokenspeed_kernel.ops.sampling as _sampling_pkg
 import tokenspeed_kernel.ops.sampling.cute_dsl as _sampling_cute_dsl
 import tokenspeed_kernel.ops.sampling.gluon as _sampling_gluon
@@ -88,6 +89,7 @@ from tokenspeed_kernel.ops.moe.flashinfer import trtllm_unquant as _moe_trtllm_u
 from tokenspeed_kernel.ops.moe.gluon import mxfp4 as _moe_gluon_mxfp4
 from tokenspeed_kernel.ops.moe.triton import fp8 as _moe_triton_fp8
 from tokenspeed_kernel.ops.moe.triton import mxfp4 as _moe_triton_mxfp4
+from tokenspeed_kernel.ops.moe.trtllm import mxfp4 as _moe_native_trtllm_mxfp4
 from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import SelectedKernel
@@ -134,6 +136,8 @@ _RELOAD_MODULES = [
     _moe_triton_fp8,
     _moe_triton_mxfp4,
     _moe_triton,
+    _moe_native_trtllm_mxfp4,
+    _moe_native_trtllm,
     _moe_pkg,
     # Sampling registration modules.
     _sampling_cute_dsl,

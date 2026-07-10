@@ -15,6 +15,7 @@ import math
 import os
 import sys
 import unittest
+from unittest import mock
 
 import torch
 
@@ -1422,6 +1423,152 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
                 expected_scales.contiguous().view(torch.int32).squeeze(-1).cpu(),
             )
         )
+
+    def test_large_indexer_q_prepare_dispatches_to_trtllm_kernels(self):
+        from tokenspeed_kernel.ops.attention.trtllm.deepseek_v4 import (
+            has_trtllm_deepseek_v4_indexer_q_prepare,
+            trtllm_deepseek_v4_indexer_q_prepare_mxfp4,
+        )
+
+        if (
+            torch.cuda.get_device_capability()[0] != 10
+            or not has_trtllm_deepseek_v4_indexer_q_prepare()
+        ):
+            self.skipTest("TRT-LLM indexer Q kernels require NVIDIA SM100/SM10x")
+
+        torch.manual_seed(9125)
+        num_tokens = 128
+        num_heads = 64
+        index_q = torch.randn(
+            num_tokens,
+            num_heads,
+            128,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        original_q = index_q.clone()
+        expected_q = index_q.clone()
+        positions = torch.arange(num_tokens, device="cuda", dtype=torch.int64)
+        cos_sin = torch.randn(
+            num_tokens,
+            ROPE_DIM,
+            device="cuda",
+            dtype=torch.float32,
+        )
+        weights = torch.randn(
+            num_tokens,
+            num_heads,
+            device="cuda",
+            dtype=torch.float32,
+        )
+        kwargs = {
+            "positions": positions,
+            "cos_sin_cache": cos_sin,
+            "weights": weights,
+            "softmax_scale": 0.25,
+            "head_scale": num_heads**-0.5,
+        }
+
+        expected = trtllm_deepseek_v4_indexer_q_prepare_mxfp4(
+            index_q=expected_q,
+            enable_pdl=True,
+            **kwargs,
+        )
+        actual = deepseek_v4_prepare_indexer_q_mxfp4(
+            index_q=index_q,
+            **kwargs,
+        )
+
+        self.assertTrue(torch.equal(actual[0][0], expected[0][0]))
+        self.assertTrue(torch.equal(actual[0][1], expected[0][1]))
+        self.assertTrue(torch.equal(actual[1], expected[1]))
+        self.assertTrue(torch.equal(index_q, expected_q))
+        self.assertFalse(torch.equal(index_q, original_q))
+
+    def test_small_indexer_q_prepare_keeps_triton_fallback(self):
+        from tokenspeed_kernel.ops.attention.trtllm.deepseek_v4 import (
+            has_trtllm_deepseek_v4_indexer_q_prepare,
+        )
+
+        if (
+            torch.cuda.get_device_capability()[0] != 10
+            or not has_trtllm_deepseek_v4_indexer_q_prepare()
+        ):
+            self.skipTest("TRT-LLM indexer Q kernels require NVIDIA SM100/SM10x")
+
+        torch.manual_seed(9126)
+        num_tokens = 127
+        index_q = torch.randn(
+            num_tokens,
+            64,
+            128,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        original_q = index_q.clone()
+        positions = torch.arange(num_tokens, device="cuda", dtype=torch.int64)
+        cos_sin = torch.randn(
+            num_tokens,
+            ROPE_DIM,
+            device="cuda",
+            dtype=torch.float32,
+        )
+        weights = torch.randn(num_tokens, 64, device="cuda", dtype=torch.float32)
+
+        deepseek_v4_prepare_indexer_q_mxfp4(
+            index_q=index_q,
+            positions=positions,
+            cos_sin_cache=cos_sin,
+            weights=weights,
+            softmax_scale=0.25,
+            head_scale=64**-0.5,
+        )
+
+        self.assertTrue(torch.equal(index_q, original_q))
+
+    def test_large_indexer_q_prepare_keeps_triton_fallback_when_unsupported(self):
+        num_tokens = 128
+        index_q = torch.empty(
+            num_tokens,
+            64,
+            128,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        positions = torch.zeros(num_tokens, device="cuda", dtype=torch.int64)
+        cos_sin = torch.empty(1, ROPE_DIM, device="cuda", dtype=torch.float32)
+        weights = torch.empty(num_tokens, 64, device="cuda", dtype=torch.float32)
+        sentinel = object()
+
+        with (
+            mock.patch(
+                "tokenspeed.runtime.layers.attention.deepseek_v4_ops."
+                "_supports_trtllm_indexer_q_prepare",
+                return_value=False,
+            ) as supports,
+            mock.patch(
+                "tokenspeed.runtime.layers.attention.deepseek_v4_ops."
+                "_trtllm_indexer_q_prepare_mxfp4"
+            ) as trtllm_prepare,
+            mock.patch(
+                "tokenspeed.runtime.layers.attention.deepseek_v4_ops."
+                "_triton_fused_indexer_q_rope_hadamard_mxfp4",
+                return_value=sentinel,
+            ) as triton_prepare,
+        ):
+            actual = deepseek_v4_prepare_indexer_q_mxfp4(
+                index_q,
+                positions,
+                cos_sin,
+                weights,
+                0.25,
+                64**-0.5,
+            )
+
+        self.assertIs(actual, sentinel)
+        supports.assert_called_once()
+        trtllm_prepare.assert_not_called()
+        triton_prepare.assert_called_once()
 
     def test_sparse_prefill_combine_topk_swa_indices_matches_reference(self):
         device = torch.device("cuda")
