@@ -36,7 +36,7 @@ class ComponentSpec:
 class BlockGeometry:
     block_size: int
     block_bytes: int
-    num_blocks: int = 0  # filled by plan_tensors from the memory budget
+    num_blocks: int = 0  # filled by the planners from the memory budget
 
 
 def occurrence_index(labels):
@@ -205,7 +205,8 @@ def plan_component_tensors(
     every tensor keeps today's standalone-slab shape, so kernels, CUDA
     graphs and the host mirror stay untouched. reserved_bytes_per_block
     carries co-resident rows outside these components (the MTP draft
-    pool's KV rows ride the same block-id space)."""
+    pool's KV rows ride the same block-id space). Under this planner each
+    component is its own slot, in input order."""
     row_bytes = [c.bytes_per_slot * block_size + c.const_bytes for c in components]
     per_block = sum(row_bytes) + reserved_bytes_per_block
     num_blocks = budget_bytes // per_block
@@ -239,10 +240,8 @@ def plan_tensors(components, *, block_size, alignment, budget_bytes):
     num_slots = max(len(v) for v in layers_by_group.values())
 
     slot_bindings: list[tuple[LayerBinding, ...]] = []
-    slot_rows: list[int] = []
     for slot in range(num_slots):
         bindings = []
-        row_total = 0
         for gid, layers in layers_by_group.items():
             if slot >= len(layers):
                 continue
@@ -256,9 +255,8 @@ def plan_tensors(components, *, block_size, alignment, budget_bytes):
                     LayerBinding(slot, gid, layer, c.component, nbytes, row_offset)
                 )
                 row_offset += nbytes
-            row_total += row_offset
         slot_bindings.append(tuple(bindings))
-        slot_rows.append(row_total)
+    slot_rows = [sum(b.nbytes_per_block for b in bs) for bs in slot_bindings]
 
     num_blocks = budget_bytes // sum(slot_rows)
     if num_blocks <= 1:

@@ -278,22 +278,20 @@ class PlanTensorsTest(unittest.TestCase):
         self.assertEqual(slot1.nbytes, plan.geometry.num_blocks * 300)
 
 
-QWEN_KV_PER_SLOT = 2048
-QWEN_STATE = {"conv": 848_256, "ssm": 1_298_048}
-QWEN_LAYERS = (["linear_attention"] * 3 + ["full_attention"]) * 12
-
-
 class PlanComponentTensorsTest(unittest.TestCase):
-    def test_component_tensors_qwen_shape(self):
+    def test_qwen_shape(self):
+        kv_per_slot = 2048
+        state = {"conv": 848_256, "ssm": 1_298_048}
+        layers = (["linear_attention"] * 3 + ["full_attention"]) * 12
         comps = components_from_layers(
-            layer_types=QWEN_LAYERS,
-            kv_bytes_per_slot=QWEN_KV_PER_SLOT,
-            state_const_bytes=QWEN_STATE,
+            layer_types=layers,
+            kv_bytes_per_slot=kv_per_slot,
+            state_const_bytes=state,
         )
         plan = plan_component_tensors(
             comps, block_size=1088, budget_bytes=10 * 1024**3
         )
-        row_sum = 12 * 1088 * QWEN_KV_PER_SLOT + 36 * sum(QWEN_STATE.values())
+        row_sum = 12 * 1088 * kv_per_slot + 36 * sum(state.values())
         self.assertEqual(plan.geometry.num_blocks, (10 * 1024**3) // row_sum)
         self.assertGreaterEqual(plan.geometry.num_blocks, 100)
         self.assertEqual(len(plan.tensors), 12 + 72)
@@ -302,7 +300,7 @@ class PlanComponentTensorsTest(unittest.TestCase):
             self.assertEqual(b.row_offset, 0)
             self.assertEqual(t.nbytes, plan.geometry.num_blocks * b.nbytes_per_block)
 
-    def test_component_tensors_reserved_bytes_shrink_blocks(self):
+    def test_reserved_bytes_shrink_blocks(self):
         comps = components_from_layers(
             layer_types=["full_attention"] * 2,
             kv_bytes_per_slot=100,
@@ -315,7 +313,7 @@ class PlanComponentTensorsTest(unittest.TestCase):
         self.assertEqual(base.geometry.num_blocks, 10_000 // 800)
         self.assertEqual(tighter.geometry.num_blocks, 10_000 // 1600)
 
-    def test_component_tensors_budget_too_small_raises(self):
+    def test_budget_too_small_raises(self):
         comps = components_from_layers(
             layer_types=["full_attention"],
             kv_bytes_per_slot=100,
