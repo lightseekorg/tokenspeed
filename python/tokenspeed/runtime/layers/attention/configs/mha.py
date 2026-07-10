@@ -77,7 +77,7 @@ class MHAConfig(BaseAttnConfig):
         if draft_block_decode:
             kv_cache_dtype = "bfloat16"
 
-        hf_config = model_config.hf_config
+        hf_config = getattr(model_config, "hf_config", None)
         layer_types = tuple(getattr(hf_config, "layer_types", None) or ())
         sliding_window_tokens = getattr(hf_config, "sliding_window", None)
         conv_state_shape = temporal_state_shape = None
