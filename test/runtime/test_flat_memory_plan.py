@@ -37,6 +37,7 @@ ComponentSpec = _fmp.ComponentSpec
 BlockGeometry = _fmp.BlockGeometry
 solve_page_geometry = _fmp.solve_page_geometry
 plan_tensors = _fmp.plan_tensors
+plan_component_tensors = _fmp.plan_component_tensors
 components_from_layers = _fmp.components_from_layers
 
 
@@ -260,6 +261,53 @@ class PlanTensorsTest(unittest.TestCase):
                 alignment=4,
                 budget_bytes=100 * 1024,
             )
+
+
+QWEN_KV_PER_SLOT = 2048
+QWEN_STATE = {"conv": 848_256, "ssm": 1_298_048}
+QWEN_LAYERS = (["linear_attention"] * 3 + ["full_attention"]) * 12
+
+
+class PlanComponentTensorsTest(unittest.TestCase):
+    def test_component_tensors_qwen_shape(self):
+        comps = components_from_layers(
+            layer_types=QWEN_LAYERS,
+            kv_bytes_per_slot=QWEN_KV_PER_SLOT,
+            state_const_bytes=QWEN_STATE,
+        )
+        plan = plan_component_tensors(
+            comps, block_size=1088, budget_bytes=10 * 1024**3
+        )
+        row_sum = 12 * 1088 * QWEN_KV_PER_SLOT + 36 * sum(QWEN_STATE.values())
+        self.assertEqual(plan.geometry.num_blocks, (10 * 1024**3) // row_sum)
+        self.assertGreaterEqual(plan.geometry.num_blocks, 100)
+        self.assertEqual(len(plan.tensors), 12 + 72)
+        for t in plan.tensors:
+            (b,) = t.bindings
+            self.assertEqual(b.row_offset, 0)
+            self.assertEqual(t.nbytes, plan.geometry.num_blocks * b.nbytes_per_block)
+
+    def test_component_tensors_reserved_bytes_shrink_blocks(self):
+        comps = components_from_layers(
+            layer_types=["full_attention"] * 2,
+            kv_bytes_per_slot=100,
+            state_const_bytes={},
+        )
+        base = plan_component_tensors(comps, block_size=4, budget_bytes=10_000)
+        tighter = plan_component_tensors(
+            comps, block_size=4, budget_bytes=10_000, reserved_bytes_per_block=800
+        )
+        self.assertEqual(base.geometry.num_blocks, 10_000 // 800)
+        self.assertEqual(tighter.geometry.num_blocks, 10_000 // 1600)
+
+    def test_component_tensors_budget_too_small_raises(self):
+        comps = components_from_layers(
+            layer_types=["full_attention"],
+            kv_bytes_per_slot=100,
+            state_const_bytes={},
+        )
+        with self.assertRaises(ValueError):
+            plan_component_tensors(comps, block_size=4, budget_bytes=500)
 
 
 class GptOssEquivalenceTest(unittest.TestCase):

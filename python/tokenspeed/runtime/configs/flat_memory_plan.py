@@ -196,6 +196,35 @@ class FlatMemoryPlan:
     tensors: tuple[TensorPlan, ...]
 
 
+def plan_component_tensors(
+    components, *, block_size, budget_bytes, reserved_bytes_per_block=0
+):
+    """One tensor per ComponentSpec, honestly sized: row bytes = that
+    component's per-block bytes, num_blocks = budget // (sum of all rows +
+    reserved_bytes_per_block). No cross-component packing, no padding —
+    every tensor keeps today's standalone-slab shape, so kernels, CUDA
+    graphs and the host mirror stay untouched. reserved_bytes_per_block
+    carries co-resident rows outside these components (the MTP draft
+    pool's KV rows ride the same block-id space)."""
+    row_bytes = [c.bytes_per_slot * block_size + c.const_bytes for c in components]
+    per_block = sum(row_bytes) + reserved_bytes_per_block
+    num_blocks = budget_bytes // per_block
+    if num_blocks <= 1:
+        raise ValueError("budget too small for one usable block")
+    geo = BlockGeometry(
+        block_size=block_size, block_bytes=per_block, num_blocks=num_blocks
+    )
+    tensors = tuple(
+        TensorPlan(
+            name=f"flat_{c.group_id}_{c.layer}_{c.component}",
+            nbytes=num_blocks * nbytes,
+            bindings=(LayerBinding(i, c.group_id, c.layer, c.component, nbytes, 0),),
+        )
+        for i, (c, nbytes) in enumerate(zip(components, row_bytes))
+    )
+    return FlatMemoryPlan(geometry=geo, tensors=tensors)
+
+
 def plan_tensors(components, *, block_size, alignment, budget_bytes):
     """Pair slot j with the j-th layer of every group over one page-id space."""
     geo = solve_page_geometry(components, block_size=block_size, alignment=alignment)
