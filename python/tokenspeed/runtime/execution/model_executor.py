@@ -1796,6 +1796,7 @@ class ModelExecutor:
                         paged_cache_block_table_base_offsets=(
                             paged_cache_block_table_base_offsets
                         ),
+                        spec_info=forward_op.spec_info,
                         **mamba_kwargs,
                     )
                     if timing_enabled:
