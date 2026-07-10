@@ -1023,7 +1023,10 @@ class TestInlineLogprobPassThrough(unittest.TestCase):
                 out = state.collector.take()
                 self.assertEqual(out["output_ids"], [token_id, token_id])
                 self.assertEqual(len(out["meta_info"][key]), 2)
-                self.assertAlmostEqual(out["meta_info"]["cumulative_logprob"], -1.0)
+                if fmt == "vllm":
+                    self.assertAlmostEqual(out["meta_info"]["cumulative_logprob"], -1.0)
+                else:
+                    self.assertNotIn("cumulative_logprob", out["meta_info"])
 
 
 if __name__ == "__main__":
