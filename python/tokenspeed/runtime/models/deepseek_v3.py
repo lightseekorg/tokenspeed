@@ -106,9 +106,7 @@ from tokenspeed.runtime.model_loader.weight_utils import (
     kv_cache_scales_loader,
 )
 from tokenspeed.runtime.models.base import BaseCausalLM
-from tokenspeed.runtime.models.utils import (
-    create_fused_set_kv_buffer_arg,
-)
+from tokenspeed.runtime.models.utils import create_fused_mla_set_kv_buffer_arg
 from tokenspeed.runtime.moe.distribution_recorder import (
     get_global_expert_distribution_recorder,
 )
@@ -508,7 +506,7 @@ class DeepseekV3AttentionMLA(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.config = config
         self.alt_stream = alt_stream
-        self.attention_backend = global_server_args_dict["attention_backend"]
+        self.attention_backend = global_server_args_dict["attention_backend"] or "mla"
         self.cli_factor = getattr(config, "cli_factor", 1)
         self.prefix = prefix
 
@@ -604,14 +602,6 @@ class DeepseekV3AttentionMLA(nn.Module):
                 self.scaling = self.scaling * mscale * mscale
         else:
             self.rotary_emb = None
-
-        # Fused RoPE+KV write kernel is incompatible with MLA: it assumes
-        # K and V have the same head_dim, but MLA's KV cache is a single
-        # [latent(512)|rope(64)] buffer where the two dimensions differ.
-        # Passing this to the kernel causes thread overflow and silent
-        # corruption of the latent cache.  All DeepSeek V2/V3 models use
-        # MLA (kv_lora_rank > 0), so we unconditionally disable it here.
-        self.use_fused_set_kv_buffer = False
 
         self.attn_mqa = PagedAttention(
             self.num_local_heads,
@@ -856,34 +846,43 @@ class DeepseekV3AttentionMLA(nn.Module):
             return query_fp8, key_fp8
 
         elif self.rotary_emb is not None and q_nope.size(0) > 0:
-            # Apply RoPE directly on Q and K slices
-            q_pe, k_pe = self.rotary_emb(
-                positions,
-                q_pe,
-                K[..., self.kv_lora_rank :],
-                fused_set_kv_buffer_arg=(
-                    create_fused_set_kv_buffer_arg(
-                        value=K[..., : self.kv_lora_rank],
-                        layer=self.attn_mqa,
-                        out_cache_loc=out_cache_loc,
-                        token_to_kv_pool=ctx.token_to_kv_pool,
-                    )
-                    if self.use_fused_set_kv_buffer
-                    else None
-                ),
+            fused_mla_kv_arg = (
+                create_fused_mla_set_kv_buffer_arg(
+                    k_nope=K[..., : self.kv_lora_rank],
+                    rope_dim=self.qk_rope_head_dim,
+                    out_cache_loc=out_cache_loc,
+                    token_to_kv_pool=ctx.token_to_kv_pool,
+                    layer_id=self.attn_mqa.layer_id,
+                )
+                if _is_amd and self.attention_backend in self._MLA_KERNEL_BACKENDS
+                else None
             )
-            Q[..., self.kv_lora_rank :].copy_(q_pe)
-            K[..., self.kv_lora_rank :].copy_(k_pe)
+            if fused_mla_kv_arg is not None:
+                self.rotary_emb(
+                    positions,
+                    q_pe,
+                    K[..., self.kv_lora_rank :],
+                    fused_mla_set_kv_buffer_arg=fused_mla_kv_arg,
+                    output_q_rope=Q[..., self.kv_lora_rank :],
+                    enable_pdl=pdl_enabled(),
+                )
+                K = None
+            else:
+                # Apply RoPE directly on Q and K slices
+                q_pe, k_pe = self.rotary_emb(
+                    positions,
+                    q_pe,
+                    K[..., self.kv_lora_rank :],
+                )
+                Q[..., self.kv_lora_rank :].copy_(q_pe)
+                K[..., self.kv_lora_rank :].copy_(k_pe)
         else:
             Q[..., self.kv_lora_rank :] = q_pe
 
         # For MLA kernel backends, write KV cache here (model-owned) so the
         # backend never has to. This unifies the FP8 fused path (written above)
         # and the BF16 path into a single ownership model.
-        if (
-            self.attention_backend in self._MLA_KERNEL_BACKENDS
-            and not self.use_fused_set_kv_buffer
-        ):
+        if self.attention_backend in self._MLA_KERNEL_BACKENDS and K is not None:
             ctx.token_to_kv_pool.set_mla_kv_buffer(
                 self.attn_mqa,
                 out_cache_loc,
@@ -903,16 +902,20 @@ class DeepseekV3AttentionMLA(nn.Module):
         record_kv_cache: bool | None = None,
     ) -> torch.Tensor:
         # MLA kernel backends: KV cache already written in forward_absorb_qkv_proj.
-        # Other backends: write via fused_set_kv_buffer or let backend handle it.
+        # Other backends write KV in the attention backend.
         if self.attention_backend in self._MLA_KERNEL_BACKENDS:
             need_save_kv = False
+            k_for_attn = K
+            v_for_attn = K[..., : self.kv_lora_rank] if K is not None else None
         else:
-            need_save_kv = not self.use_fused_set_kv_buffer
+            need_save_kv = True
+            k_for_attn = K
+            v_for_attn = K[..., : self.kv_lora_rank]
 
         attn_output = self.attn_mqa(
             Q,
-            K,
-            K[..., : self.kv_lora_rank],
+            k_for_attn,
+            v_for_attn,
             ctx,
             out_cache_loc,
             save_kv_cache=need_save_kv,
@@ -1019,16 +1022,6 @@ class DeepseekV3AttentionMLA(nn.Module):
                 positions,
                 q_pe,
                 k_pe,
-                fused_set_kv_buffer_arg=(
-                    create_fused_set_kv_buffer_arg(
-                        value=kv_a.unsqueeze(1),
-                        layer=self.attn_mha,
-                        out_cache_loc=out_cache_loc,
-                        token_to_kv_pool=ctx.token_to_kv_pool,
-                    )
-                    if self.use_fused_set_kv_buffer
-                    else None
-                ),
             )
 
         q[..., self.qk_nope_head_dim :] = q_pe
@@ -1036,13 +1029,12 @@ class DeepseekV3AttentionMLA(nn.Module):
         k[..., : self.qk_nope_head_dim] = k_nope
         k[..., self.qk_nope_head_dim :] = k_pe
 
-        if not self.use_fused_set_kv_buffer:
-            ctx.token_to_kv_pool.set_mla_kv_buffer(
-                self.attn_mha,
-                out_cache_loc,
-                cache_k_nope=kv_a.unsqueeze(1),
-                cache_k_rope=k_pe,
-            )
+        ctx.token_to_kv_pool.set_mla_kv_buffer(
+            self.attn_mha,
+            out_cache_loc,
+            cache_k_nope=kv_a.unsqueeze(1),
+            cache_k_rope=k_pe,
+        )
 
         return q, k, v
 
