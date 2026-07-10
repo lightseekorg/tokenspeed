@@ -11,7 +11,7 @@
 #   encode @ GPU0  +  prefill0 @ GPU1  +  prefill1 @ GPU2  +  decode @ GPU3
 # The two prefill workers are independent instances; the gateway round-robins
 # requests across them (--prefill-policy round_robin).
-set -uo pipefail
+set -euo pipefail
 
 MODEL=${MODEL:-nvidia/Qwen3.5-122B-A10B-NVFP4}
 SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-$MODEL}
@@ -37,7 +37,6 @@ DECODE_DIST_PORT=${DECODE_DIST_PORT:-32000}
 LB_HOST=${LB_HOST:-0.0.0.0}
 LB_PORT=${LB_PORT:-12345}
 PROMETHEUS_PORT=${PROMETHEUS_PORT:-29080}
-NIC=${NIC:-mlx5_8}
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.9}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-131072}
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-16}
@@ -46,20 +45,16 @@ KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-fp8_e4m3}
 ATTENTION_BACKEND=${ATTENTION_BACKEND:-trtllm}
 MOE_BACKEND=${MOE_BACKEND:-flashinfer_trtllm}
 KVSTORE_RATIO=${KVSTORE_RATIO:-0.5}
-ENCODE_ROUTING_POLICY=${SMG_ENCODE_ROUTING_POLICY:-cache_affinity}
+ENCODE_ROUTING_POLICY=${ENCODE_ROUTING_POLICY:-consistent_hashing}
 LOG_DIR=${EPD_CI_LOG_DIR:-.ci-artifacts/epd-qwen35-122b-1e2p1d}
 
-# RDMA / Mooncake transport. The E->P embedding ships over Mooncake (the runner
-# must expose an RDMA NIC, like the PD CI does); pixels go inline over gRPC, sized
-# by TOKENSPEED_GRPC_MAX_MESSAGE_BYTES. Set GATEWAY_PIXEL_RDMA=1 + ENCODE_EXTRA_ENV
-# + SMG_RDMA_LISTEN_* for the faster gateway->encode RDMA pixel path.
+# The E->P embedding ships over Mooncake; pixels go inline over gRPC, sized by
+# TOKENSPEED_GRPC_MAX_MESSAGE_BYTES.
 export TOKENSPEED_GRPC_MAX_MESSAGE_BYTES=${TOKENSPEED_GRPC_MAX_MESSAGE_BYTES:-2000000000}
 export TOKENSPEED_SKIP_GRPC_WARMUP=${TOKENSPEED_SKIP_GRPC_WARMUP:-1}
 export EPD_RECV_POOL_SLOT_MB=${EPD_RECV_POOL_SLOT_MB:-256}
-export UCX_NET_DEVICES=${UCX_NET_DEVICES:-${NIC}:1}
-export UCX_TLS=${UCX_TLS:-rc,sm,self}
-export UCX_IB_GID_INDEX=${UCX_IB_GID_INDEX:-3}
 export MC_INTRANODE_NVLINK=${MC_INTRANODE_NVLINK:-1}
+export MC_INTRA_NVLINK=${MC_INTRA_NVLINK:-1}
 export LD_LIBRARY_PATH=/usr/local/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
 export NO_PROXY=${NO_PROXY:-*}
 export no_proxy=${no_proxy:-*}
@@ -94,7 +89,7 @@ PYSNAPSHOT
 MODEL_PATH=${MODEL_PATH:-$(resolve_model_snapshot)}
 echo "[epd-1e2p1d] model=$MODEL served=$SERVED_MODEL_NAME model_path=$MODEL_PATH"
 echo "[epd-1e2p1d] encode=gpu${ENCODE_GPUS}/${ENCODE_PORT} prefill0=gpu${PREFILL0_GPUS}/${PREFILL0_PORT} prefill1=gpu${PREFILL1_GPUS}/${PREFILL1_PORT} decode=gpu${DECODE_GPUS}/${DECODE_PORT} lb=${LB_HOST}:${LB_PORT}"
-echo "[epd-1e2p1d] nic=$NIC encode_routing=$ENCODE_ROUTING_POLICY moe=$MOE_BACKEND attn=$ATTENTION_BACKEND"
+echo "[epd-1e2p1d] encode_routing=$ENCODE_ROUTING_POLICY moe=$MOE_BACKEND attn=$ATTENTION_BACKEND"
 
 pids=()
 cleanup() {
@@ -162,7 +157,6 @@ COMMON_ARGS=(
   --enable-cache-report
   --disaggregation-transfer-backend mooncake
   --disaggregation-layerwise-interval 1
-  --disaggregation-ib-device "$NIC"
   --skip-server-warmup
 )
 
@@ -190,15 +184,8 @@ start_worker() {
   pids+=("$!")
 }
 
-# Encode is LM-free (vision tower only); pixels reach it inline over gRPC by
-# default. For the faster gateway->encode RDMA pixel path used in the perf
-# benches, export before running:
-#   ENCODE_EXTRA_ENV="SMG_MM_PIXEL_RDMA=1 EPD_INGEST_OFFLOOP=1"
-#   GATEWAY_PIXEL_RDMA=1 SMG_RDMA_LISTEN_IP=<nic-ip> SMG_RDMA_LISTEN_PORT=29900 \
-#     SMG_RDMA_SLOT_BYTES=67108864
-ENCODE_EXTRA_ENV=${ENCODE_EXTRA_ENV:-}
-start_worker encode encode "$ENCODE_GPUS" "$ENCODE_WS" "$ENCODE_PORT" "$ENCODE_DIST_PORT" "$ENCODE_BOOTSTRAP_PORT" \
-  $ENCODE_EXTRA_ENV
+# Encode is LM-free (vision tower only); pixels reach it inline over gRPC.
+start_worker encode encode "$ENCODE_GPUS" "$ENCODE_WS" "$ENCODE_PORT" "$ENCODE_DIST_PORT" "$ENCODE_BOOTSTRAP_PORT"
 start_worker prefill0 prefill "$PREFILL0_GPUS" "$PREFILL0_WS" "$PREFILL0_PORT" "$PREFILL0_DIST_PORT" "$PREFILL0_BOOTSTRAP_PORT"
 start_worker prefill1 prefill "$PREFILL1_GPUS" "$PREFILL1_WS" "$PREFILL1_PORT" "$PREFILL1_DIST_PORT" "$PREFILL1_BOOTSTRAP_PORT"
 start_worker decode decode "$DECODE_GPUS" "$DECODE_WS" "$DECODE_PORT" "$DECODE_DIST_PORT" ""
@@ -220,10 +207,6 @@ if [[ -f "$MODEL_PATH/chat_template.jinja" ]]; then
 fi
 
 echo "[epd-1e2p1d] starting smg gateway log=$LOG_DIR/gateway.log"
-# GATEWAY_PIXEL_RDMA=1 switches the gateway->encode pixel path to RDMA (requires
-# SMG_RDMA_LISTEN_IP/PORT/SLOT_BYTES in the env); default is inline-over-gRPC.
-SMG_MM_PIXEL_RDMA=${GATEWAY_PIXEL_RDMA:-0} \
-SMG_ENCODE_ROUTING_POLICY="$ENCODE_ROUTING_POLICY" \
 python3 -m smg launch \
   --epd-disaggregation \
   --encode "grpc://127.0.0.1:${ENCODE_PORT}" "$ENCODE_BOOTSTRAP_PORT" \
@@ -235,6 +218,7 @@ python3 -m smg launch \
   --model-path "$MODEL_PATH" \
   --tokenizer-path "$MODEL_PATH" \
   "${CHAT_TEMPLATE_ARG[@]}" \
+  --encode-policy "$ENCODE_ROUTING_POLICY" \
   --prefill-policy round_robin \
   --decode-policy round_robin \
   --max-payload-size 2000000000 \
