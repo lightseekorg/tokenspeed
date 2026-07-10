@@ -24,8 +24,9 @@ import logging
 from typing import TYPE_CHECKING
 
 from tokenspeed.runtime.configs.flat_memory_plan import (
+    components_from_layers,
     equalized_block_size,
-    flat_gdn_block_bytes,
+    plan_component_tensors,
     state_const_bytes,
 )
 from tokenspeed.runtime.configs.model_config import AttentionArch, is_deepseek_v4
@@ -582,28 +583,15 @@ def create_attn_components(
             server_args.max_total_tokens,
         )
     elif has_mamba and is_flat_gdn:
-        # Flat GDN profile (state shapes are only stamped on a flat ext, so
-        # this branch is behind scheduler_ext_flat_kvcache()): the pool
-        # covers ALL layers — KV rows on state layers are accepted waste
-        # (see _create_hybrid_linear_attn) — plus one constant state row per
-        # state layer, so divide the budget by the honest per-block bytes
-        # directly instead of the per-token cell profile. No mamba slot pool
-        # on this path (mamba_pool_total_chunks stays 0).
-        block_bytes = flat_gdn_block_bytes(
-            num_layers=num_layers,
-            num_state_layers=len(mamba_layer_ids),
-            kv_bytes_per_slot=config.cache_cell_size(),
-            block_size=server_args.block_size,
-            state_const_bytes_per_layer=sum(gdn_state_bytes.values()),
-        )
+        # Flat GDN profile: sizing comes from the component plan — state
+        # layers carry no KV component, so their KV rows are gone from the
+        # per-block account (M18a). The draft (MTP) pool rides the same
+        # block-id space as reserved bytes. No mamba slot pool on this path.
+        draft_row_bytes = 0
         if draft_attn_config is not None:
-            # Draft (MTP) pool rides the same page-id space: one KV row per
-            # draft layer per page.
-            block_bytes += (
+            draft_row_bytes = (
                 _resolve_draft_cache_cell_size_for_profile(
-                    draft_attn_config,
-                    draft_model_config,
-                    draft_profile_cache_cell_size,
+                    draft_attn_config, draft_model_config, draft_profile_cache_cell_size
                 )
                 * server_args.block_size
             )
@@ -615,20 +603,27 @@ def create_attn_components(
             total_gpu_memory=gpu_memory,
             world_group=server_args.mapping.world_group,
         )
-        max_total_num_pages = cache_memory // block_bytes
+        flat_plan = plan_component_tensors(
+            components_from_layers(
+                layer_types=list(config.layer_types),
+                kv_bytes_per_slot=config.cache_cell_size(),
+                state_const_bytes=gdn_state_bytes,
+            ),
+            block_size=server_args.block_size,
+            budget_bytes=cache_memory,
+            reserved_bytes_per_block=draft_row_bytes,
+        )
+        max_total_num_pages = flat_plan.geometry.num_blocks
         logger.info(
-            "Flat GDN KV profile: block_bytes=%d (num_layers=%d, "
-            "num_state_layers=%d, block_size=%d), max_total_num_pages=%d",
-            block_bytes,
-            num_layers,
-            len(mamba_layer_ids),
+            "Flat GDN KV profile: block_bytes=%d (%d component tensors, "
+            "block_size=%d), max_total_num_pages=%d",
+            flat_plan.geometry.block_bytes,
+            len(flat_plan.tensors),
             server_args.block_size,
             max_total_num_pages,
         )
         max_num_tokens = _resolve_max_num_tokens(
-            max_total_num_pages,
-            server_args.block_size,
-            server_args.max_total_tokens,
+            max_total_num_pages, server_args.block_size, server_args.max_total_tokens
         )
     elif has_mamba and server_args.max_mamba_cache_size is not None:
         mamba_pool_total_chunks = server_args.max_mamba_cache_size

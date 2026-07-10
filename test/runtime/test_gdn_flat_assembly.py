@@ -1,13 +1,12 @@
 """Flat assembly line for GDN hybrids (M17 C4).
 
-Four contracts: the Qwen3.5 config exposes ``layer_types`` in the
+Three contracts: the Qwen3.5 config exposes ``layer_types`` in the
 paged-cache label vocabulary; the page-size equalization decision
 (``equalized_block_size``) inflates P to cover the GDN state row;
-an MHAConfig carrying state shapes builds a full-coverage pool with one
-(conv, ssm) slab pair per state layer, both cache groups published, and
-the ctor geometry check enforcing the equalized P; and the flat GDN
-sizing formula (``flat_gdn_block_bytes``) charges every layer a KV row
-plus one constant state row per state layer.
+and an MHAConfig carrying state shapes builds a full-coverage pool with
+one (conv, ssm) slab pair per state layer, both cache groups published,
+and the ctor geometry check enforcing the equalized P. Flat GDN sizing
+itself is plan-driven (plan_component_tensors, test_flat_memory_plan).
 """
 
 from __future__ import annotations
@@ -51,7 +50,6 @@ def _load(mod_name: str, file_name: str):
 
 _plan = _load("flat_memory_plan_gdn_assembly_under_test", "flat_memory_plan.py")
 equalized_block_size = _plan.equalized_block_size
-flat_gdn_block_bytes = _plan.flat_gdn_block_bytes
 
 
 # Qwen3.5-ish interleaving: 3 linear layers then 1 full, times 12 (48 layers).
@@ -137,36 +135,6 @@ class EqualizedPageSizeTest(unittest.TestCase):
             ),
             64,
         )
-
-
-class FlatGdnSizingFormulaTest(unittest.TestCase):
-    """Pin the flat GDN profile: num_pages == cache_memory //
-    (all_layers * kv_row(P) + n_state_layers * (conv + ssm))."""
-
-    def test_block_bytes_formula(self):
-        state_row = QWEN3_5ISH_CONV_BYTES + QWEN3_5ISH_SSM_BYTES
-        self.assertEqual(
-            flat_gdn_block_bytes(
-                num_layers=48,
-                num_state_layers=36,
-                kv_bytes_per_slot=QWEN3_5ISH_KV_BYTES_PER_SLOT,
-                block_size=1088,
-                state_const_bytes_per_layer=state_row,
-            ),
-            48 * 2048 * 1088 + 36 * state_row,
-        )
-
-    def test_num_pages_from_budget(self):
-        block_bytes = flat_gdn_block_bytes(
-            num_layers=4,
-            num_state_layers=3,
-            kv_bytes_per_slot=32,
-            block_size=8,
-            state_const_bytes_per_layer=152,
-        )
-        self.assertEqual(block_bytes, 4 * 32 * 8 + 3 * 152)
-        cache_memory = 10 * block_bytes + block_bytes // 2
-        self.assertEqual(cache_memory // block_bytes, 10)
 
 
 class GdnFlatPoolAssemblyTest(unittest.TestCase):

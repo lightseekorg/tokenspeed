@@ -154,25 +154,6 @@ def equalized_block_size(
     return geo.block_size
 
 
-def flat_gdn_block_bytes(
-    *,
-    num_layers,
-    num_state_layers,
-    kv_bytes_per_slot,
-    block_size,
-    state_const_bytes_per_layer,
-):
-    """Honest per-block byte cost of the M17 flat GDN layout: EVERY layer
-    keeps a legacy KV row (state layers' KV rows are allocated but never
-    written — accepted waste until the plan executor skips them) plus one
-    constant state row (conv + ssm) per state layer. The registry's flat
-    GDN profile divides the cache budget by exactly this."""
-    return (
-        num_layers * kv_bytes_per_slot * block_size
-        + num_state_layers * state_const_bytes_per_layer
-    )
-
-
 @dataclass(frozen=True)
 class LayerBinding:
     slot: int
