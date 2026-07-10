@@ -45,6 +45,20 @@ Typical use: lower a 1gpu kernel unit-test on `b300-1gpu` so the heavier
 b300-4gpu evals that share the same box claim the runner first, without
 disturbing the same task's ordering on the other GPU families.
 
+`optional` marks a task or per-label matrix entry as non-blocking.
+Optional entries are emitted with `matrix.optional: true`, and the PR workflows
+map that to GitHub Actions `continue-on-error`.
+
+```yaml
+# whole task can fail without blocking the workflow
+optional: true
+
+# only the MI355 bench entry is non-blocking; the MI350 entry of the same
+# task still blocks on failure
+optional:
+  amd-mi355-1gpu-bench: true
+```
+
 `b200-<Ngpu>` labels are the default B200 runners. Set the
 `TOKENSPEED_B200_RUNNER_LABEL` repository variable in GitHub Actions
 (`Settings` -> `Secrets and variables` -> `Actions` -> `Variables`) to a

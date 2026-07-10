@@ -395,6 +395,61 @@ def test_validate_task_rejects_unknown_priority(tmp_path):
         validate_task(_yaml.safe_load(path.read_text()), path)
 
 
+def test_validate_task_accepts_boolean_optional(tmp_path):
+    body = _default_body("ut-a", ["b300-1gpu"], extra="optional: true\n")
+    path = _write_task_yaml(tmp_path, "optional.yaml", body)
+    import yaml as _yaml
+
+    validate_task(_yaml.safe_load(path.read_text()), path)
+
+
+def test_validate_task_rejects_non_boolean_optional(tmp_path):
+    body = _default_body("ut-a", ["b300-1gpu"], extra="optional: flaky\n")
+    path = _write_task_yaml(tmp_path, "bad-optional.yaml", body)
+    import yaml as _yaml
+
+    with pytest.raises(ValueError, match=r"optional must be a boolean"):
+        validate_task(_yaml.safe_load(path.read_text()), path)
+
+
+def test_validate_task_accepts_per_label_optional_dict(tmp_path):
+    body = _default_body(
+        "ut-a",
+        ["b300-1gpu", "h100-1gpu"],
+        extra="optional:\n  b300-1gpu: true\n",
+    )
+    path = _write_task_yaml(tmp_path, "per-label-optional.yaml", body)
+    import yaml as _yaml
+
+    validate_task(_yaml.safe_load(path.read_text()), path)
+
+
+def test_validate_task_rejects_per_label_optional_with_unknown_label(tmp_path):
+    body = _default_body(
+        "ut-a",
+        ["b300-1gpu"],
+        extra="optional:\n  h100-1gpu: true\n",
+    )
+    path = _write_task_yaml(tmp_path, "unknown-optional.yaml", body)
+    import yaml as _yaml
+
+    with pytest.raises(ValueError, match=r"optional contains unknown labels"):
+        validate_task(_yaml.safe_load(path.read_text()), path)
+
+
+def test_validate_task_rejects_per_label_optional_with_non_boolean_value(tmp_path):
+    body = _default_body(
+        "ut-a",
+        ["b300-1gpu"],
+        extra="optional:\n  b300-1gpu: flaky\n",
+    )
+    path = _write_task_yaml(tmp_path, "bad-optional-value.yaml", body)
+    import yaml as _yaml
+
+    with pytest.raises(ValueError, match=r"optional values must be booleans"):
+        validate_task(_yaml.safe_load(path.read_text()), path)
+
+
 def test_build_matrix_default_priority_preserves_existing_order(tmp_path):
     # Two tasks; both omit `priority`. Order must match the existing
     # behaviour: alphabetical by file path, then label order from the yaml.
@@ -415,6 +470,7 @@ def test_build_matrix_default_priority_preserves_existing_order(tmp_path):
         ("ut-b", "b200-1gpu"),
     ]
     assert all(e["priority"] == "normal" for e in matrix["include"])
+    assert all(e["optional"] is False for e in matrix["include"])
 
 
 def test_build_matrix_sorts_high_priority_before_low(tmp_path):
@@ -507,6 +563,23 @@ def test_build_matrix_per_label_priority_only_affects_listed_label(tmp_path):
         ("ut-kernel", "h100-1gpu", "normal"),
         ("ut-kernel", "b200-1gpu", "normal"),
         ("ut-kernel", "b300-1gpu", "low"),
+    ]
+
+
+def test_build_matrix_per_label_optional_only_affects_listed_label(tmp_path):
+    _write_task_yaml(
+        tmp_path,
+        "ut-kernel.yaml",
+        _default_body(
+            "ut-kernel",
+            ["h100-1gpu", "amd-mi355-1gpu-bench"],
+            extra="optional:\n  amd-mi355-1gpu-bench: true\n",
+        ),
+    )
+    matrix = build_matrix(tmp_path, tmp_path, trigger="per-commit")
+    assert [(e["runner"], e["optional"]) for e in matrix["include"]] == [
+        ("h100-1gpu", False),
+        ("amd-mi355-1gpu-bench", True),
     ]
 
 
