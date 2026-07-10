@@ -53,6 +53,7 @@ from tokenspeed_kernel_amd.ops.attention.gluon.utils import (
     _INV_LN2_VALUE,
     _LN2,
     InputStrides,
+    attention_layouts,
     max,
     maximum,
 )
@@ -136,44 +137,31 @@ class ExtendConfig:
         HAS_LSE,
         WINDOW_LEFT,
         IS_FP8,
+        KV_DTYPE,
         q_strides,
     ):
         assert HEAD_DIM in (64, 128)
         assert BLOCK_N == PAGE_SIZE
 
-        instr_shape = [32, 32, 16]
-        mfma_layout = gl.amd.AMDMFMALayout(
-            version=4,
-            instr_shape=instr_shape,
-            transposed=True,
-            warps_per_cta=[NUM_WARPS, 1],
-        )
-        qk_layout = mfma_layout
-        pv_layout = mfma_layout
-        # load_vec is the number of elements per lane, depends on the input dtype, same as qk_kw.
-        # load_threads is how many lanes span HEAD_DIM.
-        load_vec = 16 if IS_FP8 else 8
-        load_threads = HEAD_DIM // load_vec
-        load_layout = gl.BlockedLayout(
-            [1, load_vec], [64 // load_threads, load_threads], [NUM_WARPS, 1], [1, 0]
-        )
-        # store_vec depends on the output dtype, always 16-bit regardless of input dtype, so 128 / 16 = 8.
-        # store_threads is how many lanes span HEAD_DIM.
-        store_vec = 8
-        store_threads = HEAD_DIM // store_vec
-        store_layout = gl.BlockedLayout(
-            [1, store_vec], [64 // store_threads, store_threads], [NUM_WARPS, 1], [1, 0]
-        )
-        # Padding interval is 64 lanes * load_vec elems.
-        pad_interval = 64 * load_vec
-        # Empirically tuned.
-        pad_k = 16 if IS_FP8 else 8
-        pad_v = 16 if IS_FP8 else 32
-        k_smem_layout = gl.PaddedSharedLayout.with_identity_for(
-            [[pad_interval, pad_k]], [BLOCK_N, HEAD_DIM], [1, 0]
-        )
-        v_smem_layout = gl.PaddedSharedLayout.with_identity_for(
-            [[pad_interval, pad_v]], [BLOCK_N, HEAD_DIM], [1, 0]
+        # Extend uses a [32, 32, 16] MFMA with NUM_WARPS warp tiling.
+        (
+            qk_layout,
+            pv_layout,
+            q_layout,
+            k_layout,
+            p_layout,
+            v_layout,
+            load_layout,
+            store_layout,
+            k_smem_layout,
+            v_smem_layout,
+        ) = attention_layouts(
+            HEAD_DIM,
+            BLOCK_N,
+            IS_FP8,
+            KV_DTYPE,
+            num_warps=NUM_WARPS,
+            instr_shape=[32, 32, 16],
         )
 
         self.N_HEADS = gl.constexpr(N_HEADS)
@@ -194,14 +182,10 @@ class ExtendConfig:
         self.q_strides = q_strides
         self.qk_layout = gl.constexpr(qk_layout)
         self.pv_layout = gl.constexpr(pv_layout)
-        # qk_kw is derived from a 128-bit load / dtype bitwidth.
-        # pv_kw is empirically tuned.
-        qk_kw = 16 if IS_FP8 else 8
-        pv_kw = 16 if IS_FP8 else 4
-        self.q_layout = gl.constexpr(gl.DotOperandLayout(0, qk_layout, k_width=qk_kw))
-        self.k_layout = gl.constexpr(gl.DotOperandLayout(1, qk_layout, k_width=qk_kw))
-        self.p_layout = gl.constexpr(gl.DotOperandLayout(0, pv_layout, k_width=pv_kw))
-        self.v_layout = gl.constexpr(gl.DotOperandLayout(1, pv_layout, k_width=pv_kw))
+        self.q_layout = gl.constexpr(q_layout)
+        self.k_layout = gl.constexpr(k_layout)
+        self.p_layout = gl.constexpr(p_layout)
+        self.v_layout = gl.constexpr(v_layout)
         self.load_layout = gl.constexpr(load_layout)
         self.store_layout = gl.constexpr(store_layout)
         self.k_smem_layout = gl.constexpr(k_smem_layout)
@@ -485,7 +469,7 @@ class ExtendProgram:
 
 
 @gluon.jit
-def _mha_extend_fp16(
+def _mha_extend(
     q_ptr,
     k_cache_ptr,
     v_cache_ptr,
@@ -528,6 +512,7 @@ def _mha_extend_fp16(
         HAS_LSE,
         WINDOW_LEFT,
         IS_FP8,
+        k_cache_ptr.dtype.element_ty,
         InputStrides(Q_STRIDE_T, Q_STRIDE_H, Q_STRIDE_D),
     )
     program = ExtendProgram.create(
@@ -667,7 +652,7 @@ def gluon_mha_extend_gfx950(
         lse = None
         lse_arg = q
     grid = (blocks_per_req, batch, n_heads)
-    _mha_extend_fp16[grid](
+    _mha_extend[grid](
         q,
         k_cache,
         v_cache,
