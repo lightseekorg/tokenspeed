@@ -288,9 +288,7 @@ class PlanComponentTensorsTest(unittest.TestCase):
             kv_bytes_per_slot=kv_per_slot,
             state_const_bytes=state,
         )
-        plan = plan_component_tensors(
-            comps, block_size=1088, budget_bytes=10 * 1024**3
-        )
+        plan = plan_component_tensors(comps, block_size=1088, budget_bytes=10 * 1024**3)
         row_sum = 12 * 1088 * kv_per_slot + 36 * sum(state.values())
         self.assertEqual(plan.geometry.num_blocks, (10 * 1024**3) // row_sum)
         self.assertGreaterEqual(plan.geometry.num_blocks, 100)
