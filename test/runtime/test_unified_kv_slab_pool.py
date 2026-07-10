@@ -490,8 +490,12 @@ class MHAPoolStateSlabTest(unittest.TestCase):
 
     def test_state_slabs_one_pair_per_state_layer(self):
         pool = self._pool()
-        # KV side stays legacy per-layer for GDN hybrids today (no aliasing).
-        self.assertEqual(len({id(t) for t in pool.k_buffer}), 4)
+        # KV side stays per-layer (no aliasing), but flat GDN state layers
+        # (0/2) carry no KV tensors -- None slots (M18a T4).
+        self.assertEqual(len(pool.k_buffer), 4)
+        self.assertIsNone(pool.k_buffer[0])
+        self.assertIsNone(pool.k_buffer[2])
+        self.assertEqual(len({id(t) for t in pool.k_buffer if t is not None}), 2)
         self.assertEqual(len(pool.state_slabs), 2)
         num_pages_with_null = 32 // 16 + 1  # row 0 = null page
         for conv, ssm in pool.state_slabs:
@@ -534,6 +538,135 @@ class MHAPoolStateSlabTest(unittest.TestCase):
         counts = pool.paged_cache_group_page_counts
         self.assertGreater(counts["linear_attention"], 0)
         self.assertLessEqual(counts["linear_attention"], counts["full_attention"])
+
+
+# Qwen3.5-ish interleaving: 3 linear layers then 1 full, times 12 (48 layers).
+QWEN_LIKE_LAYER_TYPES = (("linear_attention",) * 3 + ("full_attention",)) * 12
+
+
+class FlatGDNStateLayerNoKVTest(unittest.TestCase):
+    """M18a T4: under the flat GDN predicate the pool allocates NO per-layer
+    KV tensors on state layers (`k_buffer[lid] is None`); the component plan
+    (registry sizing) already charges only full-layer KV + state rows, so
+    keeping the tensors would oversubscribe the layout. Every None-exposed
+    surface must either skip (pointer tables, size accounting, clear) or
+    reject loudly (per-layer accessors, PD transfer). Radix pools keep the
+    full per-layer KV coverage (zero impact pin).
+    Constructs a real (tiny, CPU) MHATokenToKVPool; skips without deps.
+    Patch target is the PACKAGE paged_cache_spec probe (see above).
+    """
+
+    CONV_SHAPE = (4, 8)
+    SSM_SHAPE = (2, 4, 4)
+    NUM_LAYERS = 48
+    NUM_FULL = 12
+    SIZE = 32
+    PAGE_SIZE = 16
+
+    def setUp(self):
+        try:
+            import torch
+
+            from tokenspeed.runtime.layers.attention.kv_cache.mha import (
+                MHATokenToKVPool,
+            )
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
+        self.torch = torch
+        self.MHATokenToKVPool = MHATokenToKVPool
+
+    def _pool(self, *, flat_ext: bool = True, **overrides):
+        kwargs = dict(
+            size=self.SIZE,
+            dtype=self.torch.bfloat16,
+            head_num=1,
+            head_dim=8,
+            layer_num=self.NUM_LAYERS,
+            device="cpu",
+            enable_memory_saver=False,
+            max_batch_size=2,
+            max_context_len=64,
+            page_size=self.PAGE_SIZE,
+            rank=0,
+            layer_types=QWEN_LIKE_LAYER_TYPES,
+            sliding_window_tokens=None,
+            enable_alt_stream=False,
+            conv_state_shape=self.CONV_SHAPE,
+            temporal_state_shape=self.SSM_SHAPE,
+            conv_dtype=self.torch.float32,
+            ssm_dtype=self.torch.float32,
+        )
+        kwargs.update(overrides)
+        with mock.patch(_PKG_FLAT_PROBE, return_value=flat_ext):
+            return self.MHATokenToKVPool(**kwargs)
+
+    def test_flat_gdn_state_layers_have_no_kv(self):
+        pool = self._pool()
+        rows = self.SIZE + self.PAGE_SIZE  # +page_size dummy page
+        self.assertEqual(len(pool.k_buffer), self.NUM_LAYERS)
+        self.assertEqual(len(pool.v_buffer), self.NUM_LAYERS)
+        for layer_id, label in enumerate(QWEN_LIKE_LAYER_TYPES):
+            if label == "linear_attention":
+                self.assertIsNone(pool.k_buffer[layer_id])
+                self.assertIsNone(pool.v_buffer[layer_id])
+            else:
+                self.assertEqual(pool.k_buffer[layer_id].shape[0], rows)
+                self.assertEqual(pool.v_buffer[layer_id].shape[0], rows)
+        # State slabs still cover every state layer.
+        self.assertEqual(len(pool.state_slabs), self.NUM_LAYERS - self.NUM_FULL)
+
+    def test_flat_gdn_data_ptrs_exclude_none(self):
+        # _kv_copy launches one block per data_ptrs entry (grid = numel), so
+        # a placeholder entry for a skipped layer would be dereferenced --
+        # the pointer/stride tables must carry the REAL tensors only.
+        pool = self._pool()
+        self.assertEqual(pool.k_data_ptrs.numel(), self.NUM_FULL)
+        self.assertEqual(pool.v_data_ptrs.numel(), self.NUM_FULL)
+        self.assertEqual(pool.data_ptrs.numel(), 2 * self.NUM_FULL)
+        self.assertEqual(pool.data_strides.numel(), 2 * self.NUM_FULL)
+        self.assertTrue(bool((pool.data_strides > 0).all()))
+
+    def test_flat_gdn_kv_size_counts_only_real_tensors(self):
+        pool = self._pool()
+        # (rows, head_num=1, head_dim=8) bf16 per full-attention layer.
+        per_tensor = (self.SIZE + self.PAGE_SIZE) * 1 * 8 * 2
+        k_size, v_size = pool.get_kv_size_bytes()
+        self.assertEqual(k_size, self.NUM_FULL * per_tensor)
+        self.assertEqual(v_size, self.NUM_FULL * per_tensor)
+
+    def test_flat_gdn_get_key_buffer_raises_on_state_layer(self):
+        pool = self._pool()
+        with self.assertRaisesRegex(ValueError, r"state layer"):
+            pool.get_key_buffer(0)
+        with self.assertRaisesRegex(ValueError, r"state layer"):
+            pool.get_value_buffer(0)
+        # Full-attention layers stay served (layer 3 is the first full one).
+        self.assertIsNotNone(pool.get_key_buffer(3))
+        self.assertIsNotNone(pool.get_value_buffer(3))
+
+    def test_flat_gdn_pd_transfer_rejected(self):
+        # PD disaggregation registers per-layer buffer pointers; with state
+        # layers carrying no KV that surface must reject loudly.
+        pool = self._pool()
+        with self.assertRaisesRegex(ValueError, r"PD disaggregation"):
+            pool.get_contiguous_buf_infos()
+
+    def test_flat_gdn_clear_buffers_survives_none(self):
+        pool = self._pool()
+        self.assertIsNone(pool.k_buffer[0])  # None entries really present
+        pool.k_buffer[3].fill_(1.0)
+        pool.clear_kv_buffers()  # sleep/wake repair path; must not raise
+        self.assertEqual(pool.k_buffer[3].abs().sum().item(), 0.0)
+
+    def test_radix_pool_unaffected(self):
+        # Zero-impact pin: without the flat ext the same layer_types keep
+        # full per-layer KV coverage and no state slabs.
+        pool = self._pool(flat_ext=False)
+        self.assertTrue(all(t is not None for t in pool.k_buffer))
+        self.assertTrue(all(t is not None for t in pool.v_buffer))
+        self.assertEqual(pool.data_ptrs.numel(), 2 * self.NUM_LAYERS)
+        self.assertEqual(pool.state_slabs, [])
+        pool.get_contiguous_buf_infos()  # PD surface stays available
 
 
 if __name__ == "__main__":

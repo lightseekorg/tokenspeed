@@ -264,9 +264,9 @@ def _create_hybrid_linear_attn(
         # Flat path: the pool covers ALL layers, so pool indices == global
         # layer ids, its layer_types line up with the state slabs, and the
         # group specs publish both the "full_attention" and
-        # "linear_attention" groups. KV k/v rows on state layers are
-        # allocated but never written (accepted waste for M17; skipping
-        # them belongs to the plan executor). The identity mapping keeps
+        # "linear_attention" groups. State layers carry NO k/v tensors
+        # (None slots, M18a T4) -- matching the plan sizing, which charges
+        # only full-layer KV + state rows. The identity mapping keeps
         # the wrapper type identical to the radix path.
         num_total_layers = len(text_config.layers_block_type)
         inner_pool = config.create_pool(

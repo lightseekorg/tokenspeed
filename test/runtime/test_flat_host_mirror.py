@@ -25,7 +25,8 @@ _PKG_FLAT_PROBE = (
 LAYER_TYPES = ("sliding_attention", "full_attention") * 2
 
 # GDN hybrid: layers 0/2 are state layers (pairs 0/1); linear_attention
-# disables slab pairing, so the KV side stays legacy per-layer.
+# disables slab pairing, so the KV side stays per-layer -- and under the
+# flat GDN predicate the state layers' k/v slots are None (M18a T4).
 GDN_LAYER_TYPES = ("linear_attention", "full_attention") * 2
 
 
@@ -247,17 +248,19 @@ class FlatHostMirrorStateSlabTest(unittest.TestCase):
     def test_state_tensors_follow_kv_in_slab_order(self):
         pool = self._pool()
         mirror = self.FlatHostMirror(pool, num_host_pages=8)
-        # Legacy KV layout (4 K + 4 V), then conv0, ssm0, conv1, ssm1 --
-        # PINNED order: K*, V*, state tensors flattened in slab order.
-        self.assertEqual(mirror.num_k_tensors, 4)
-        self.assertEqual(len(mirror.tensor_pairs), 12)
+        # Flat GDN: state layers carry no KV (k/v slots are None, M18a T4),
+        # so only the 2 attention layers mirror KV (2 K + 2 V), then
+        # conv0, ssm0, conv1, ssm1 -- PINNED order: K*, V*, state tensors
+        # flattened in slab order.
+        self.assertEqual(mirror.num_k_tensors, 2)
+        self.assertEqual(len(mirror.tensor_pairs), 8)
         self.assertEqual(len(pool.state_slabs), 2)
         for n, (conv, ssm) in enumerate(pool.state_slabs):
-            self.assertIs(mirror.tensor_pairs[8 + 2 * n][0], conv)
-            self.assertIs(mirror.tensor_pairs[8 + 2 * n + 1][0], ssm)
+            self.assertIs(mirror.tensor_pairs[4 + 2 * n][0], conv)
+            self.assertIs(mirror.tensor_pairs[4 + 2 * n + 1][0], ssm)
         # Per-pair row spans: page_size token rows for KV, 1 page row for
         # state (state slabs are page-indexed).
-        self.assertEqual(mirror.row_spans, (4,) * 8 + (1,) * 4)
+        self.assertEqual(mirror.row_spans, (4,) * 4 + (1,) * 4)
         for (dev, host), span in zip(mirror.tensor_pairs, mirror.row_spans):
             if span == 1:
                 self.assertEqual(host.shape, (8, *dev.shape[1:]))
@@ -265,11 +268,15 @@ class FlatHostMirrorStateSlabTest(unittest.TestCase):
                 self.assertEqual(host.shape, (8 * 4, *dev.shape[1:]))
 
     def test_bytes_per_host_page_includes_state_rows(self):
+        # Without state shapes the flat GDN predicate is off: all 4 layers
+        # keep KV -> 8 mirrors x page_size 4 x 16 B rows = 512 B.
         base = self.flat_bytes_per_host_page(self._pool(with_state=False))
+        self.assertEqual(base, 512)
+        # Flat GDN: state layers carry no KV -> 4 KV mirrors (256 B) plus
+        # 2 state layers x (conv 2*4 + ssm 2*8) bf16 page rows (2 x 48 B).
         pool = self._pool()
         with_state = self.flat_bytes_per_host_page(pool)
-        # 2 state layers x (conv 2*4 + ssm 2*8) bf16 page rows = 2 x 48 B.
-        self.assertEqual(with_state - base, 96)
+        self.assertEqual(with_state, 4 * 4 * 16 + 96)
         mirror = self.FlatHostMirror(pool, num_host_pages=2)
         self.assertEqual(mirror.bytes_per_host_page(), with_state)
 
@@ -309,15 +316,64 @@ class FlatHostMirrorStateSlabTest(unittest.TestCase):
         pool = self._pool()
         mirror = self.FlatHostMirror(pool, num_host_pages=2)
         # State layers 0/2 bind slab pairs 0/1 -> flattened indices after
-        # the 8 KV mirrors; conv immediately precedes its ssm.
-        self.assertEqual(mirror.state_tensor_indices_of_layer(0), (8, 9))
-        self.assertEqual(mirror.state_tensor_indices_of_layer(2), (10, 11))
+        # the 4 KV mirrors; conv immediately precedes its ssm.
+        self.assertEqual(mirror.state_tensor_indices_of_layer(0), (4, 5))
+        self.assertEqual(mirror.state_tensor_indices_of_layer(2), (6, 7))
         self.assertIsNone(mirror.state_tensor_indices_of_layer(1))
         self.assertIsNone(mirror.state_tensor_indices_of_layer(3))
         # Pools without state slabs expose no state indices for any layer.
         kv_only = self.FlatHostMirror(self._pool(with_state=False), num_host_pages=2)
         for layer_id in range(4):
             self.assertIsNone(kv_only.state_tensor_indices_of_layer(layer_id))
+
+
+class FlatHostMirrorNoneKVTest(unittest.TestCase):
+    """Flat GDN pools carry None k/v slots on state layers (M18a T4): the
+    mirror's identity-dedup walks must skip them and mirror only the real
+    slabs. CPU stub pool, no CUDA, no scheduler ext -- state mirroring via
+    get_state_buffers is a separate surface and unaffected."""
+
+    def setUp(self):
+        try:
+            import torch
+
+            from tokenspeed.runtime.cache.flat_host_mirror import (
+                FlatHostMirror,
+                flat_bytes_per_host_page,
+            )
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs torch: {exc}")
+        self.torch = torch
+        self.FlatHostMirror = FlatHostMirror
+        self.flat_bytes_per_host_page = flat_bytes_per_host_page
+
+    def _stub_pool(self):
+        import types
+
+        torch = self.torch
+        rows = 8
+        kv = [torch.zeros((rows, 1, 8), dtype=torch.bfloat16) for _ in range(4)]
+        return types.SimpleNamespace(
+            page_size=4,
+            k_buffer=[None, kv[0], None, kv[1]],
+            v_buffer=[None, kv[2], None, kv[3]],
+        )
+
+    def test_mirror_skips_none_kv_entries(self):
+        stub = self._stub_pool()
+        # 4 real mirrors x page_size 4 x 16 B rows = 256 B per host page.
+        self.assertEqual(self.flat_bytes_per_host_page(stub), 256)
+        mirror = self.FlatHostMirror(stub, num_host_pages=2)
+        self.assertEqual(mirror.num_k_tensors, 2)
+        self.assertEqual(len(mirror.tensor_pairs), 4)
+        self.assertIs(mirror.tensor_pairs[0][0], stub.k_buffer[1])
+        self.assertIs(mirror.tensor_pairs[1][0], stub.k_buffer[3])
+        # KV layers keep their tensor-index mapping; state layers have no
+        # KV mirror and must fail loud if D2 fencing ever asks for one.
+        self.assertEqual(mirror.tensor_index_of_layer(1), 0)
+        self.assertEqual(mirror.tensor_index_of_layer(3), 1)
+        with self.assertRaisesRegex(ValueError, r"state layer"):
+            mirror.tensor_index_of_layer(0)
 
 
 if __name__ == "__main__":

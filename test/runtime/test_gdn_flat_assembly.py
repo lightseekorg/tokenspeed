@@ -216,9 +216,17 @@ class GdnFlatPoolAssemblyTest(unittest.TestCase):
             sorted(spec.group_id for spec in pool.paged_cache_group_specs),
             ["full_attention", "linear_attention"],
         )
-        # Full coverage: one KV buffer per layer (state layers included —
-        # accepted waste, see registry._create_hybrid_linear_attn).
+        # Plan-sized coverage (M18a T4): the k/v lists stay layer-indexed,
+        # but state layers carry no KV tensors (None slots) -- only the
+        # full-attention layer allocates.
         self.assertEqual(len(pool.k_buffer), len(self.LAYER_TYPES))
+        for layer_id, label in enumerate(self.LAYER_TYPES):
+            if label == "linear_attention":
+                self.assertIsNone(pool.k_buffer[layer_id])
+                self.assertIsNone(pool.v_buffer[layer_id])
+            else:
+                self.assertIsNotNone(pool.k_buffer[layer_id])
+                self.assertIsNotNone(pool.v_buffer[layer_id])
 
     def test_geometry_raises_at_original_page_size(self):
         with self.assertRaisesRegex(ValueError, "pre-equalized"):

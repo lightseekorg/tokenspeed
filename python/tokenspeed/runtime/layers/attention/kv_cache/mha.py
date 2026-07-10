@@ -220,6 +220,29 @@ class MHATokenToKVPool(BaseTokenToKVPool):
                     device=self.device,
                 )
 
+            # layer_id -> state pair index (the n-th state layer binds pair
+            # n). Derives purely from layer_types; shared by the KV skip set
+            # here and the state-slab block below.
+            self._layer_state_pair: dict[int, int] = {
+                layer_id: pair
+                for pair, layer_id in enumerate(
+                    layer_id
+                    for layer_id, label in enumerate(self._layer_types)
+                    if label in STATE_LAYER_TYPES
+                )
+            }
+            # Flat GDN predicate: ONE boolean gates both skipping per-layer
+            # KV on state layers and allocating the state slabs -- the plan
+            # sizing (registry) charges exactly full-layer KV + state rows,
+            # so the two decisions must never diverge.
+            flat_gdn = (
+                bool(self._layer_state_pair)
+                and self._conv_state_shape is not None
+                and self._temporal_state_shape is not None
+                and paged_cache_spec.scheduler_ext_flat_kvcache()
+            )
+            flat_state_layers = set(self._layer_state_pair) if flat_gdn else set()
+
             if self._slab_group_size is not None:
                 # Paired layers alias the same slab tensor; live rows never
                 # overlap (page-ownership contract in hybrid_slab_group_size).
@@ -243,31 +266,48 @@ class MHATokenToKVPool(BaseTokenToKVPool):
                     self.size + self.page_size,
                 )
             else:
-                self.k_buffer = [_alloc() for _ in range(self.layer_num)]
-                self.v_buffer = [_alloc() for _ in range(self.layer_num)]
+                # The hybrid-slab branch above never sees state labels
+                # (hybrid_slab_group_size excludes them), so the skip set
+                # only applies here: flat GDN state layers keep their
+                # layer-indexed slots but carry NO KV tensors (the plan
+                # sizing charges no KV rows for them).
+                self.k_buffer = [
+                    None if layer_id in flat_state_layers else _alloc()
+                    for layer_id in range(self.layer_num)
+                ]
+                self.v_buffer = [
+                    None if layer_id in flat_state_layers else _alloc()
+                    for layer_id in range(self.layer_num)
+                ]
                 logger.info(
-                    "KV layout: per-layer (%d buffers; hybrid slab "
-                    "inactive: predicate returned None -- radix ext, "
+                    "KV layout: per-layer (%d of %d layers carry KV "
+                    "buffers; %d flat GDN state layers carry none; hybrid "
+                    "slab inactive: predicate returned None -- radix ext, "
                     "spec decode, or non-uniform/single-group "
                     "layer_types)",
+                    self.layer_num - len(flat_state_layers),
                     self.layer_num,
+                    len(flat_state_layers),
                 )
+            # Pointer/stride tables carry the REAL tensors only: _kv_copy
+            # launches one block per data_ptrs entry (grid = numel), so a
+            # placeholder entry for a skipped state layer would be
+            # dereferenced.
+            real_k = [x for x in self.k_buffer if x is not None]
+            real_v = [x for x in self.v_buffer if x is not None]
             self.k_data_ptrs = torch.tensor(
-                [x.data_ptr() for x in self.k_buffer],
+                [x.data_ptr() for x in real_k],
                 dtype=torch.uint64,
                 device=self.device,
             )
             self.v_data_ptrs = torch.tensor(
-                [x.data_ptr() for x in self.v_buffer],
+                [x.data_ptr() for x in real_v],
                 dtype=torch.uint64,
                 device=self.device,
             )
             self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
             self.data_strides = torch.tensor(
-                [
-                    np.prod(x.shape[1:]) * x.dtype.itemsize
-                    for x in self.k_buffer + self.v_buffer
-                ],
+                [np.prod(x.shape[1:]) * x.dtype.itemsize for x in real_k + real_v],
                 device=self.device,
             )
 
@@ -275,24 +315,10 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             # per state LAYER (n-th state layer -> pair n), row-indexed by
             # page id over the SAME page-id space as the KV pages; row 0 is
             # the null page, never written -- mirrors the KV buffers'
-            # +page_size dummy-page convention above.
-            # NOTE: the per-layer k/v buffers above still cover state layers
-            # (GDN hybrids keep the legacy KV layout today); skipping them
-            # is deferred to the full plan executor.
-            self._layer_state_pair: dict[int, int] = {
-                layer_id: pair
-                for pair, layer_id in enumerate(
-                    layer_id
-                    for layer_id, label in enumerate(self._layer_types)
-                    if label in STATE_LAYER_TYPES
-                )
-            }
-            if (
-                self._layer_state_pair
-                and self._conv_state_shape is not None
-                and self._temporal_state_shape is not None
-                and paged_cache_spec.scheduler_ext_flat_kvcache()
-            ):
+            # +page_size dummy-page convention above. State layers carry
+            # ONLY these slabs: their per-layer k/v slots are None (same
+            # flat_gdn predicate as the skip set above).
+            if flat_gdn:
                 assert (
                     self.size % self.page_size == 0
                 ), "flat pool size must be whole pages"
@@ -370,7 +396,13 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         # Slab layout: data_ptrs holds duplicated slab entries, so this
         # broadcast re-copies rows. No callers today; re-check before wiring.
         if self._kv_copy_config is None:
-            move_kv_cache_native(self.k_buffer, self.v_buffer, tgt_loc, src_loc)
+            # Real tensors only: flat GDN state layers carry None slots.
+            move_kv_cache_native(
+                [x for x in self.k_buffer if x is not None],
+                [x for x in self.v_buffer if x is not None],
+                tgt_loc,
+                src_loc,
+            )
         else:
             grid = (self.data_ptrs.numel(), self._kv_copy_config["byte_tiles"])
             copy_all_layer_kv_cache_tiled[grid](
@@ -389,12 +421,13 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         assert hasattr(self, "k_buffer")
         assert hasattr(self, "v_buffer")
         # Dedup by tensor identity: the slab layout aliases layers to shared
-        # slabs, and allocated bytes must not be double-counted.
+        # slabs, and allocated bytes must not be double-counted. None slots
+        # (flat GDN state layers carry no KV) are skipped.
         k_size_bytes = 0
-        for k_cache in {id(t): t for t in self.k_buffer}.values():
+        for k_cache in {id(t): t for t in self.k_buffer if t is not None}.values():
             k_size_bytes += np.prod(k_cache.shape) * k_cache.dtype.itemsize
         v_size_bytes = 0
-        for v_cache in {id(t): t for t in self.v_buffer}.values():
+        for v_cache in {id(t): t for t in self.v_buffer if t is not None}.values():
             v_size_bytes += np.prod(v_cache.shape) * v_cache.dtype.itemsize
         return k_size_bytes, v_size_bytes
 
@@ -402,6 +435,15 @@ class MHATokenToKVPool(BaseTokenToKVPool):
     def get_contiguous_buf_infos(self):
         # layer_num x [seq_len, head_num, head_dim]
         # layer_num x [page_num, page_size, head_num, head_dim]
+        if any(x is None for x in self.k_buffer):
+            raise ValueError(
+                "flat GDN layout has no per-layer KV on state layers; "
+                "PD disaggregation unsupported: KV transfer registers "
+                "per-layer buffer pointers, and state layers carry only "
+                "state slabs. Set disaggregation_mode='null' or use a "
+                "radix-built tokenspeed_scheduler extension, which keeps "
+                "the full per-layer KV layout."
+            )
         kv_data_ptrs = [
             self._get_key_buffer(i).data_ptr() for i in range(self.layer_num)
         ] + [self._get_value_buffer(i).data_ptr() for i in range(self.layer_num)]
@@ -487,9 +529,12 @@ class MHATokenToKVPool(BaseTokenToKVPool):
 
     def _get_key_buffer(self, layer_id: int):
         # for internal use of referencing
+        buf = self.k_buffer[layer_id]
+        if buf is None:
+            raise ValueError(f"layer {layer_id} is a state layer; it has no KV buffer")
         if self.store_dtype != self.dtype:
-            return self.k_buffer[layer_id].view(self.dtype)
-        return self.k_buffer[layer_id]
+            return buf.view(self.dtype)
+        return buf
 
     def get_key_buffer(self, layer_id: int):
         # note: get_key_buffer is hooked with synchronization for layer-wise KV cache loading
@@ -501,9 +546,12 @@ class MHATokenToKVPool(BaseTokenToKVPool):
 
     def _get_value_buffer(self, layer_id: int):
         # for internal use of referencing
+        buf = self.v_buffer[layer_id]
+        if buf is None:
+            raise ValueError(f"layer {layer_id} is a state layer; it has no KV buffer")
         if self.store_dtype != self.dtype:
-            return self.v_buffer[layer_id].view(self.dtype)
-        return self.v_buffer[layer_id]
+            return buf.view(self.dtype)
+        return buf
 
     def get_value_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:

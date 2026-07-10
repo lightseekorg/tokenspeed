@@ -150,9 +150,12 @@ class FlatMemoryExecutor:
         # the op's last per-tensor event, which without state slabs is the
         # last layer's V event only if that V mirror is the last KV tensor
         # pair. Holds for both layouts (legacy: identity; slab: last layer
-        # is the last occurrence of its group).
+        # is the last occurrence of its group). A state last layer has no
+        # KV mirror at all -- its copies (state slabs trail every KV
+        # tensor) are covered by the events[-1] pin in _start_loading.
         assert (
-            self.mirror.tensor_index_of_layer(self.layer_num - 1)
+            self.mirror.state_tensor_indices_of_layer(self.layer_num - 1) is not None
+            or self.mirror.tensor_index_of_layer(self.layer_num - 1)
             == self.mirror.num_k_tensors - 1
         ), "flat host tier: last layer's V mirror is not the last KV tensor pair"
 

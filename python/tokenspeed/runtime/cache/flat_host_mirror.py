@@ -29,9 +29,15 @@ from typing import Iterable, Sequence
 import torch
 
 
-def _identity_dedup(tensors: Sequence[torch.Tensor]) -> list[torch.Tensor]:
+def _identity_dedup(
+    tensors: Sequence[torch.Tensor | None],
+) -> list[torch.Tensor]:
+    """Distinct tensors in first-appearance order; None slots (flat GDN
+    state layers carry no KV) are skipped."""
     seen: dict[int, torch.Tensor] = {}
     for t in tensors:
+        if t is None:
+            continue
         seen.setdefault(id(t), t)
     return list(seen.values())
 
@@ -88,11 +94,15 @@ class FlatHostMirror:
 
         k_index = {id(t): i for i, t in enumerate(k_tensors)}
         v_index = {id(t): i for i, t in enumerate(v_tensors)}
-        self._layer_to_k_index = [k_index[id(t)] for t in device_kv_pool.k_buffer]
+        # None entries (flat GDN state layers, no KV) map to None: those
+        # layers fence on state_tensor_indices_of_layer instead.
+        self._layer_to_k_index = [
+            None if t is None else k_index[id(t)] for t in device_kv_pool.k_buffer
+        ]
         # Invariant D2 relies on: a layer's V tensor sits at
         # tensor_index_of_layer(layer) + num_k_tensors.
         assert self._layer_to_k_index == [
-            v_index[id(t)] for t in device_kv_pool.v_buffer
+            None if t is None else v_index[id(t)] for t in device_kv_pool.v_buffer
         ], "flat host mirror: K/V dedup orders diverge"
 
         state_slabs = _state_slabs(device_kv_pool)
@@ -144,8 +154,13 @@ class FlatHostMirror:
 
     def tensor_index_of_layer(self, layer_id: int) -> int:
         """Index of layer_id's K tensor in tensor_pairs (paired slab layers
-        share the index); its V tensor is at index + num_k_tensors."""
-        return self._layer_to_k_index[layer_id]
+        share the index); its V tensor is at index + num_k_tensors.
+        Raises ValueError for flat GDN state layers (no KV tensor); fence
+        those on state_tensor_indices_of_layer instead."""
+        index = self._layer_to_k_index[layer_id]
+        if index is None:
+            raise ValueError(f"layer {layer_id} is a state layer; it has no KV mirror")
+        return index
 
     def state_tensor_indices_of_layer(self, layer_id: int) -> tuple[int, int] | None:
         """(conv_idx, ssm_idx) of layer_id's state slab pair in tensor_pairs

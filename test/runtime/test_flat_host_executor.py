@@ -27,8 +27,9 @@ _PKG_FLAT_PROBE = (
 LAYER_TYPES = ("sliding_attention", "full_attention") * 2
 
 # GDN hybrid: layers 0/2 are state layers (slab pairs 0/1); the KV side
-# stays legacy per-layer (linear_attention disables slab pairing), and the
-# LAST layer is an attention layer -- exercising the finish-event pin.
+# stays per-layer (linear_attention disables slab pairing) but state layers
+# carry no KV tensors under the flat predicate (M18a T4), and the LAST
+# layer is an attention layer -- exercising the finish-event pin.
 GDN_LAYER_TYPES = ("linear_attention", "full_attention") * 2
 
 
@@ -362,8 +363,9 @@ class FlatMemoryExecutorTest(unittest.TestCase):
         pool = self._state_pool()
         executor = self._executor(pool)
         mirror = executor.mirror
-        # Legacy KV (4 K + 4 V) + conv0, ssm0, conv1, ssm1.
-        self.assertEqual(len(mirror.tensor_pairs), 12)
+        # Flat GDN KV (2 K + 2 V; state layers carry no KV, M18a T4) +
+        # conv0, ssm0, conv1, ssm1.
+        self.assertEqual(len(mirror.tensor_pairs), 8)
         self._fill_spans(mirror, [3])
         executor.submit_writeback([1], [[3]], [[0]])
         executor.flush()
@@ -382,16 +384,17 @@ class FlatMemoryExecutorTest(unittest.TestCase):
         executor.submit_loadback([2], [[0]], [[3]])
         executor.flush()
         events = captured["events"]
-        self.assertEqual(len(events), 12)
+        self.assertEqual(len(events), 8)
         producer_idx = executor.get_producer_index(self.CacheKind.KV, 2)
         producer_event = executor._counter.events[producer_idx]
         # State layers 0/2 ack on their ssm event (conv precedes ssm on the
         # serial stream, so it covers the pair); attention layer 1 keeps its
-        # V-tensor event; the LAST layer pins events[-1] so finish_event
-        # (producer-slot reuse fence) covers the trailing state copies.
-        self.assertIs(producer_event.load_events[0], events[9])
-        self.assertIs(producer_event.load_events[1], events[5])
-        self.assertIs(producer_event.load_events[2], events[11])
+        # V-tensor event (num_k=2, k-index 0 -> events[2]); the LAST layer
+        # pins events[-1] so finish_event (producer-slot reuse fence) covers
+        # the trailing state copies.
+        self.assertIs(producer_event.load_events[0], events[5])
+        self.assertIs(producer_event.load_events[1], events[2])
+        self.assertIs(producer_event.load_events[2], events[7])
         self.assertIs(producer_event.load_events[3], events[-1])
         self.torch.cuda.synchronize()
         self.assertTrue(producer_event.finish_event.query())
