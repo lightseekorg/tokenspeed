@@ -499,7 +499,6 @@ def _attention_dsa_decode() -> object:
         qk_rope_head_dim=64,
         softmax_scale=1.0,
         page_size=64,
-        solution="triton",
     )
 
 
@@ -520,7 +519,6 @@ def _attention_dsa_prefill() -> object:
         qk_rope_head_dim=64,
         softmax_scale=1.0,
         page_size=64,
-        solution="triton",
     )
 
 
@@ -1130,7 +1128,7 @@ _CASES = [
         "cdna4",
         "attention",
         "dsa_decode",
-        "triton_dsa_decode",
+        "gluon_dsa_decode_gfx950",
         _attention_dsa_decode,
     ),
     _case(
@@ -1138,7 +1136,7 @@ _CASES = [
         "cdna4",
         "attention",
         "dsa_prefill",
-        "triton_dsa_prefill",
+        "gluon_dsa_prefill_gfx950",
         _attention_dsa_prefill,
     ),
     _case(
