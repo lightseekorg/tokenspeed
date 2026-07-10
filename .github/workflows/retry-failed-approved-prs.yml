@@ -8,7 +8,7 @@ on:
       dry_run:
         description: "Log eligible reruns without starting them"
         required: false
-        default: true
+        default: false
         type: boolean
 
 permissions:
@@ -36,12 +36,11 @@ jobs:
               "pr-test-amd.yml",
               "pr-test-nvidia-arm.yml",
             ];
-            const memberAssociations = new Set(["MEMBER", "OWNER"]);
             const maxAttempts = 3;
             const maxRunAgeMs = 30 * 24 * 60 * 60 * 1000;
             const dryRun =
               context.eventName === "workflow_dispatch" &&
-              context.payload.inputs?.dry_run !== "false";
+              String(context.payload.inputs?.dry_run) === "true";
             const { owner, repo } = context.repo;
 
             async function getPullRequest(number) {
@@ -52,7 +51,6 @@ jobs:
                       state
                       isDraft
                       headRefOid
-                      authorAssociation
                       reviewDecision
                       author {
                         login
@@ -114,14 +112,6 @@ jobs:
                 pullRequest.state !== "OPEN" ||
                 pullRequest.isDraft
               ) {
-                return false;
-              }
-              if (!memberAssociations.has(pullRequest.authorAssociation)) {
-                core.info(
-                  "PR #" + number + ": author " +
-                    (pullRequest.author?.login || "unknown") + " is " +
-                    pullRequest.authorAssociation + ", not an org member.",
-                );
                 return false;
               }
               if (pullRequest.reviewDecision === "APPROVED") {
@@ -227,9 +217,9 @@ jobs:
                   continue;
                 }
 
-                // Keep the approval, author association, and head SHA checks
-                // close to the mutations. A push can still race this small
-                // window, just as it can in the latest-main retry workflow.
+                // Keep the approval and head SHA checks close to the
+                // mutations. A push can still race this small window, just as
+                // it can in the latest-main retry workflow.
                 const currentPullRequest = await getPullRequest(pull.number);
                 if (
                   currentPullRequest?.headRefOid !== pullRequest.headRefOid ||
