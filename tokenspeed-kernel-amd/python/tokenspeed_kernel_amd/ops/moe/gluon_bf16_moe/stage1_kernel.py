@@ -1,3 +1,23 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
 """Gluon bf16 MoE stage 1: gate + up GEMM with fused SwiGLU (gfx950).
 
 For each MoE expert ``e`` and every token routed to it::
@@ -27,8 +47,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel_amd._triton import cdna4_async_copy, gl, gluon, triton
-
-from ._grid import get_pids
+from tokenspeed_kernel_amd.ops.moe.gluon_bf16_moe._grid import get_pids
 
 
 @gluon.jit
@@ -250,7 +269,10 @@ def invoke_stage1(
     assert I_r % BLOCK_N == 0, f"I ({I_r}) must be a multiple of BLOCK_N ({BLOCK_N})"
 
     # Decode split-K dispatch.
-    from .stage1_splitk_kernel import auto_split_k, invoke_stage1_splitk
+    from tokenspeed_kernel_amd.ops.moe.gluon_bf16_moe.stage1_splitk_kernel import (
+        auto_split_k,
+        invoke_stage1_splitk,
+    )
 
     if split_k is None:
         split_k = auto_split_k(num_tokens, D // BLOCK_K)

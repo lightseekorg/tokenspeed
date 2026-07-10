@@ -1,3 +1,23 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
 """End-to-end bf16 Gluon MoE (gfx950): routing-sort -> stage1 -> stage2.
 
 Public entry point ``gluon_bf16_moe`` computes an unquantized bf16 fused MoE
@@ -8,18 +28,23 @@ routed-weight fold in stage 2.
 from __future__ import annotations
 
 import torch
-
-from .moe_align_device import moe_align_block_size_device
-from .moe_align_fused import moe_align_block_size_fused
-from .stage1_kernel import invoke_stage1
-from .stage1_splitk_kernel import invoke_stage1_splitk
-from .stage2_kernel import invoke_stage2
+from tokenspeed_kernel_amd.ops.moe.gluon_bf16_moe.moe_align_device import (
+    moe_align_block_size_device,
+)
+from tokenspeed_kernel_amd.ops.moe.gluon_bf16_moe.moe_align_fused import (
+    moe_align_block_size_fused,
+)
+from tokenspeed_kernel_amd.ops.moe.gluon_bf16_moe.stage1_kernel import invoke_stage1
+from tokenspeed_kernel_amd.ops.moe.gluon_bf16_moe.stage1_splitk_kernel import (
+    invoke_stage1_splitk,
+)
+from tokenspeed_kernel_amd.ops.moe.gluon_bf16_moe.stage2_kernel import invoke_stage2
 
 # Pure-Gluon warp-reduce GEMV decode path (equivalent to the Triton reference).
-from .warp_decode_gluon_kernel import (
+from tokenspeed_kernel_amd.ops.moe.gluon_bf16_moe.warp_decode_gluon_kernel import (
     invoke_stage1_warp_decode_gluon as invoke_stage1_warp_decode,
 )
-from .warp_decode_gluon_kernel import (
+from tokenspeed_kernel_amd.ops.moe.gluon_bf16_moe.warp_decode_gluon_kernel import (
     invoke_stage2_warp_decode_gluon as invoke_stage2_warp_decode,
 )
 
