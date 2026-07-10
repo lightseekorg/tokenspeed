@@ -1216,6 +1216,149 @@ TEST_F(FlatRetractSuite, RetractedRequestPrefillCoversOldTokens) {
     EXPECT_EQ(op->prefill_lengths.at(0), 9) << "PrefillSize rebased to the full token count";
 }
 
+// Chunked re-admission after a retract: with max_scheduled_tokens = 4 the
+// victim's 9-token rebased prefill (RebasePrefill: prompt + generated) takes
+// three chunks. Mid-chunk ops owe NO ExtendResult (the FSM stays Prefilling);
+// the op exposes the rebased prefill_lengths so the runtime can tell.
+class FlatRetractChunkedReadmitSuite : public FlatRetractSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = FlatRetractSuite::MakeConfig();
+        cfg.max_scheduled_tokens = 4;
+        return cfg;
+    }
+
+    // Chunked-prefill twin of DriveToRetractOfA: same wedge and retract of "a"
+    // (9 tokens > b's 7), but "a"'s 6-token prompt prefills in two chunks.
+    // Post: "a" requeued with 9 rebased tokens, "b" finished, pool fully free.
+    void DriveToRetractOfAChunkedAndFreePool() {
+        ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), 14);
+        Submit(MakeRequestSpec("a", /*num_pages=*/3));
+        Submit(MakeRequestSpec("b", /*num_pages=*/2, /*start=*/101));
+
+        // Chunk 1 of "a" (4 of 6 prompt tokens) exhausts the round's budget;
+        // mid-chunk ops owe no result, so nothing is sent back.
+        ExecutionPlan p1 = PlanOnce();
+        const FlatForwardOperation* op1 = FindFlatOp(p1);
+        ASSERT_NE(op1, nullptr);
+        ASSERT_EQ(op1->request_ids.size(), 1u);
+        ASSERT_EQ(op1->request_ids.at(0), "a");
+        ASSERT_EQ(op1->input_lengths.at(0), 4);
+
+        // Chunk 2 completes "a" (owes a result); leftover budget starts "b".
+        ExecutionPlan p2 = PlanOnce();
+        const FlatForwardOperation* op2 = FindFlatOp(p2);
+        ASSERT_NE(op2, nullptr);
+        ASSERT_EQ(op2->request_ids.size(), 2u);
+        SendForwardDone("a", {42});  // 7 tokens
+
+        // "b"'s completing chunk; "a" (PrefillDone) waits behind the prefill.
+        ExecutionPlan p3 = PlanOnce();
+        const FlatForwardOperation* op3 = FindFlatOp(p3);
+        ASSERT_NE(op3, nullptr);
+        ASSERT_EQ(op3->request_ids.size(), 1u);
+        ASSERT_EQ(op3->request_ids.at(0), "b");
+        SendForwardDone("b", {142});  // 5 tokens
+
+        // Both decode transitions consume their reservations: free 0.
+        ExecutionPlan p4 = PlanOnce();
+        const FlatForwardOperation* op4 = FindFlatOp(p4);
+        ASSERT_NE(op4, nullptr);
+        ASSERT_EQ(op4->request_ids.size(), 2u);
+        ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), 0);
+        SendForwardDone("a", {43});   // 8 tokens = a's capacity
+        SendForwardDone("b", {143});  // 6 tokens = b's capacity
+
+        // Tail-page decodes (0 fresh blocks).
+        ExecutionPlan p5 = PlanOnce();
+        const FlatForwardOperation* op5 = FindFlatOp(p5);
+        ASSERT_NE(op5, nullptr);
+        ASSERT_EQ(op5->request_ids.size(), 2u);
+        SendForwardDone("a", {44});   // 9 tokens: past capacity
+        SendForwardDone("b", {144});  // 7 tokens: past capacity
+
+        // Two starved rounds; the second retracts "a" (9 tokens > b's 7).
+        ASSERT_TRUE(FindFlatOp(PlanOnce())->request_ids.empty());
+        ExecutionPlan retract_round = PlanOnce();
+        ASSERT_TRUE(FindFlatOp(retract_round)->request_ids.empty());
+        ASSERT_TRUE(retract_round.flat_oom_request_ids.empty());
+        ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), 8);
+        ASSERT_EQ(scheduler_->WaitingSize(), 1u);
+        ASSERT_EQ(scheduler_->GetRequestTokenSize("a"), 9);
+
+        // Free the survivor so the victim re-admits alone.
+        SendFinish("b");
+        ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), 14);
+    }
+};
+
+TEST_F(FlatRetractChunkedReadmitSuite, MidChunkReadmitOwesNoExtendResult) {
+    DriveToRetractOfAChunkedAndFreePool();
+
+    // First re-admission chunk: the op carries the REBASED prefill length and
+    // its own chunking criterion says mid-chunk -- the runtime must emit no
+    // ExtendResult and stream no token for this slot.
+    ExecutionPlan readmit = PlanOnce();
+    const FlatForwardOperation* op = FindFlatOp(readmit);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->request_ids.size(), 1u);
+    ASSERT_EQ(op->request_ids.at(0), "a");
+    EXPECT_EQ(op->prefill_lengths.at(0), 9) << "rebased prompt+generated length exposed on the op";
+    EXPECT_EQ(op->input_lengths.at(0), 4);
+    EXPECT_LT(op->extend_prefix_lens.at(0) + op->input_lengths.at(0), op->prefill_lengths.at(0))
+        << "mid-chunk by the op's own criterion: no result owed";
+}
+
+// Regression pin for the crash: a forward-done ExtendResult for a mid-chunk
+// re-prefill slot hits a Prefilling FSM state and throws.
+TEST_F(FlatRetractChunkedReadmitSuite, MidChunkReadmitExtendResultThrows) {
+    DriveToRetractOfAChunkedAndFreePool();
+
+    ExecutionPlan readmit = PlanOnce();
+    const FlatForwardOperation* op = FindFlatOp(readmit);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->request_ids.size(), 1u);
+    ASSERT_EQ(op->request_ids.at(0), "a");
+    ASSERT_LT(op->extend_prefix_lens.at(0) + op->input_lengths.at(0), op->prefill_lengths.at(0));
+    EXPECT_THROW(SendForwardDone("a", {45}), std::logic_error)
+        << "the FSM is still Prefilling; the runtime must not send a mid-chunk result";
+}
+
+TEST_F(FlatRetractChunkedReadmitSuite, ChunkedReadmitCompletes) {
+    DriveToRetractOfAChunkedAndFreePool();
+
+    // Chunks 1 and 2 (4 + 4 of 9): mid-chunk, no results sent.
+    ExecutionPlan c1 = PlanOnce();
+    const FlatForwardOperation* op1 = FindFlatOp(c1);
+    ASSERT_NE(op1, nullptr);
+    ASSERT_EQ(op1->request_ids.size(), 1u);
+    ASSERT_LT(op1->extend_prefix_lens.at(0) + op1->input_lengths.at(0), op1->prefill_lengths.at(0));
+
+    ExecutionPlan c2 = PlanOnce();
+    const FlatForwardOperation* op2 = FindFlatOp(c2);
+    ASSERT_NE(op2, nullptr);
+    ASSERT_EQ(op2->request_ids.size(), 1u);
+    EXPECT_EQ(op2->extend_prefix_lens.at(0), 4);
+    ASSERT_LT(op2->extend_prefix_lens.at(0) + op2->input_lengths.at(0), op2->prefill_lengths.at(0));
+
+    // Final chunk (1 token) reaches the rebased length: the result is owed.
+    ExecutionPlan c3 = PlanOnce();
+    const FlatForwardOperation* op3 = FindFlatOp(c3);
+    ASSERT_NE(op3, nullptr);
+    ASSERT_EQ(op3->request_ids.size(), 1u);
+    EXPECT_EQ(op3->extend_prefix_lens.at(0), 8);
+    EXPECT_EQ(op3->input_lengths.at(0), 1);
+    ASSERT_GE(op3->extend_prefix_lens.at(0) + op3->input_lengths.at(0), op3->prefill_lengths.at(0));
+    SendForwardDone("a", {45});  // 10 tokens
+
+    PlanOnce();  // decode transition
+    SendForwardDone("a", {46});
+    SendFinish("a");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), 14) << "pool balances after the chunked re-admission cycle";
+    EXPECT_EQ(scheduler_->WaitingSize(), 0u);
+}
+
 // Exact-fit re-admission after a retract: the whole freed budget (pages AND any
 // stale decode reserve) must be spendable by the next request.
 class FlatRetractExactFitSuite : public FlatRetractSuite {

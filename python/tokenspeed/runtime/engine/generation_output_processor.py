@@ -608,6 +608,11 @@ class OutputProcesser:
             if model_execution_results.output_nan_flags is not None
             else None
         )
+        # Per-slot total prefill length as the OP sees it (C++ Request::PrefillSize()).
+        # After a flat retract the victim's generated tokens are rebased into the
+        # prefill window (RebasePrefill), so this can exceed the original prompt
+        # length that RequestState.prefill_finished compares against.
+        prefill_lengths = getattr(forward_op, "prefill_lengths", None)
         pt = 0
         for i, rid in enumerate(forward_op.request_ids):
             output_length = model_execution_results.output_lengths[i].item()
@@ -631,6 +636,17 @@ class OutputProcesser:
 
             request_state: RequestState = self.rid_to_state[rid]
             # scheduled_time is stamped pre-forward in the event loop (queue end)
+
+            # Mid-chunk extend slot by the op's own prefill_lengths (rebased after
+            # flat retract; C++ owes no result and the sampled token is garbage).
+            # Fresh requests: prefill_length == prompt length, same as the gate below.
+            if (
+                not is_decode_slot
+                and prefill_lengths is not None
+                and forward_op.extend_prefix_lens[i] + forward_op.input_lengths[i]
+                < prefill_lengths[i]
+            ):
+                continue
 
             # Do not output chunking result
             if not request_state.prefill_finished:

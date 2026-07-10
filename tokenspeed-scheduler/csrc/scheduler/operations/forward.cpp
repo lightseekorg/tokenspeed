@@ -244,6 +244,11 @@ void Scheduler::resolveFlatStarvation(const std::vector<Request*>& candidates, b
         Request* victim =
             *std::max_element(holders.begin(), holders.end(),
                               [](const Request* a, const Request* b) { return a->TokenSize() < b->TokenSize(); });
+        // Wedge-gate guarantee (flatPoolWedged: pending_forward_results_.empty()): the runtime owes
+        // the victim nothing, so its re-prefill can never race a stale ExtendResult. If the gate is
+        // ever relaxed, fail loud here instead of corrupting the rebased prefill.
+        _assert(pending_forward_results_.find(victim->Id()) == pending_forward_results_.end(),
+                "retract victim must not owe a forward result");
         flat_reserved_pages_.erase(victim->Id());
         victim->Apply(fsm::FlatRetractEvent{&coordinator_});
         spdlog::info("[Scheduler] flat retract: released request {} ({} tokens) to unwedge the pool", victim->Id(),
