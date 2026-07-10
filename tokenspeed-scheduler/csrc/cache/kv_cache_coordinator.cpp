@@ -32,9 +32,8 @@
 
 namespace tokenspeed {
 
-KvCacheCoordinator::KvCacheCoordinator(std::vector<CacheGroup> groups, BlockPool& pool,
-                                       const BlockPool* host_pool, std::int32_t base_block_size,
-                                       std::int32_t lcm_block_size)
+KvCacheCoordinator::KvCacheCoordinator(std::vector<CacheGroup> groups, BlockPool& pool, const BlockPool* host_pool,
+                                       std::int32_t base_block_size, std::int32_t lcm_block_size)
     : groups_{std::move(groups)},
       pool_{pool},
       host_pool_{host_pool},
@@ -54,8 +53,7 @@ KvCacheCoordinator::KvCacheCoordinator(std::vector<CacheGroup> groups, BlockPool
 }
 
 std::vector<std::string> KvCacheCoordinator::keysForGroup(std::span<const std::string> content_hashes,
-                                                          std::uint32_t group_id,
-                                                          std::int32_t group_block_size,
+                                                          std::uint32_t group_id, std::int32_t group_block_size,
                                                           std::int32_t first_base) const {
     const std::int32_t m = group_block_size / base_block_size_;
     return MakeFoldedGroupKeys(content_hashes, group_id, m, first_base);
@@ -106,8 +104,7 @@ std::vector<std::vector<std::string>> KvCacheCoordinator::buildGroupKeys(
 // TOKENS). num_base_pages = content_hashes.size(); group_keys[i] is folded to group i's blocks.
 CoordinatorMatch KvCacheCoordinator::matchTierWithKeys(const BlockPool& pool,
                                                        std::span<const std::vector<std::string>> group_keys,
-                                                       std::int32_t num_base_pages,
-                                                       std::int32_t floor_tokens) const {
+                                                       std::int32_t num_base_pages, std::int32_t floor_tokens) const {
     CoordinatorMatch out;
     out.per_group.resize(groups_.size());
     if (groups_.empty()) {
@@ -122,8 +119,7 @@ CoordinatorMatch KvCacheCoordinator::matchTierWithKeys(const BlockPool& pool,
         },
         [&](std::size_t i) {
             const std::int32_t group_block_size = groups_[i].Spec().block_size;
-            return (floor_tokens / group_block_size +
-                    static_cast<std::int32_t>(out.per_group[i].blocks.size())) *
+            return (floor_tokens / group_block_size + static_cast<std::int32_t>(out.per_group[i].blocks.size())) *
                    group_block_size;
         });
 
@@ -145,8 +141,7 @@ CoordinatorMatch KvCacheCoordinator::matchTierWithKeys(const BlockPool& pool,
     return out;
 }
 
-KvCacheCoordinator::AdmissionMatch KvCacheCoordinator::MatchPrefix(
-    std::span<const std::string> content_hashes) const {
+KvCacheCoordinator::AdmissionMatch KvCacheCoordinator::MatchPrefix(std::span<const std::string> content_hashes) const {
     const std::vector<std::vector<std::string>> group_keys = buildGroupKeys(content_hashes);
     const std::int32_t num_base_pages = static_cast<std::int32_t>(content_hashes.size());
     AdmissionMatch out;
@@ -170,8 +165,8 @@ void KvCacheCoordinator::ClaimCommonPrefix(std::span<BlockTable> tables, const C
     }
 }
 
-std::vector<std::pair<CacheBlock*, CacheBlock*>> KvCacheCoordinator::LoadHostExtension(
-    std::span<BlockTable> tables, const CoordinatorMatch& host) {
+std::vector<std::pair<CacheBlock*, CacheBlock*>> KvCacheCoordinator::LoadHostExtension(std::span<BlockTable> tables,
+                                                                                       const CoordinatorMatch& host) {
     _assert(tables.size() == groups_.size(), "tables/groups size mismatch");
     std::vector<std::pair<CacheBlock*, CacheBlock*>> pairs;
     if (host.per_group.empty()) {
@@ -226,8 +221,7 @@ bool KvCacheCoordinator::Acquire(std::span<BlockTable> tables, std::int32_t num_
     return true;
 }
 
-void KvCacheCoordinator::CacheFullBlocks(std::span<BlockTable> tables,
-                                         std::span<const std::string> content_hashes,
+void KvCacheCoordinator::CacheFullBlocks(std::span<BlockTable> tables, std::span<const std::string> content_hashes,
                                          std::int32_t first_slot, std::int32_t end_tokens) {
     _assert(tables.size() == groups_.size(), "tables/groups size mismatch");
     if (content_hashes.empty()) {
@@ -277,8 +271,7 @@ void KvCacheCoordinator::Free(std::span<BlockTable> tables) {
     }
 }
 
-KvCacheCoordinator MakeCoordinator(std::span<const KvCacheSpec> specs, BlockPool& pool,
-                                   const BlockPool* host_pool) {
+KvCacheCoordinator MakeCoordinator(std::span<const KvCacheSpec> specs, BlockPool& pool, const BlockPool* host_pool) {
     _assert(!specs.empty(), "MakeCoordinator requires at least one spec");
     std::int32_t base = specs[0].block_size;
     std::int32_t lcm = specs[0].block_size;

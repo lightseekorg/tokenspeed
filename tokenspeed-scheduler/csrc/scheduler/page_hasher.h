@@ -159,8 +159,8 @@ inline constexpr std::size_t kGroupIdHexLen = 8;  // 4-byte group_id as hex
 // index; only complete blocks on the group grid are emitted, so
 // idx = (m - first_base%m) % m skips a leading remainder. Chained via HashPage
 // so order matters and no two runs collide.
-inline std::vector<std::string> FoldBaseHashes(std::span<const std::string> base_hashes,
-                                               std::int32_t first_base, std::int32_t m) {
+inline std::vector<std::string> FoldBaseHashes(std::span<const std::string> base_hashes, std::int32_t first_base,
+                                               std::int32_t m) {
     _assert(m >= 1, "fold factor must be >= 1");
     std::vector<std::string> out;
     out.reserve(base_hashes.size() / m + 1);
@@ -168,8 +168,8 @@ inline std::vector<std::string> FoldBaseHashes(std::span<const std::string> base
     for (; idx + m <= static_cast<std::int32_t>(base_hashes.size()); idx += m) {
         std::string running;
         for (std::int32_t k = 0; k < m; ++k) {
-            running = HashPage(std::span<const std::int32_t>{}, running,
-                               std::vector<std::string>{base_hashes[idx + k]});
+            running =
+                HashPage(std::span<const std::int32_t>{}, running, std::vector<std::string>{base_hashes[idx + k]});
         }
         out.push_back(running);
     }
@@ -192,9 +192,8 @@ inline std::string MakeKeyWithGroupId(const std::string& block_hash, uint32_t gr
 // / base), then wrap each with group_id. m == 1 keeps each base hash verbatim:
 // FoldBaseHashes(m==1) would re-hash through HashPage, so the bypass is what
 // keeps a uniform-block_size group's keys unchanged.
-inline std::vector<std::string> MakeFoldedGroupKeys(std::span<const std::string> base_hashes,
-                                                    std::uint32_t group_id, std::int32_t m,
-                                                    std::int32_t first_base = 0) {
+inline std::vector<std::string> MakeFoldedGroupKeys(std::span<const std::string> base_hashes, std::uint32_t group_id,
+                                                    std::int32_t m, std::int32_t first_base = 0) {
     _assert(m >= 1, "fold factor must be >= 1");
     std::vector<std::string> keys;
     if (m == 1) {

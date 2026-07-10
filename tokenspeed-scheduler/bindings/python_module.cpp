@@ -175,7 +175,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                tokenspeed::PagedCacheGroupConfig::Retention retention,
                std::optional<std::int32_t> sliding_window_tokens, tokenspeed::PagedCacheGroupFamily family) {
                 new (self) tokenspeed::PagedCacheGroupConfig{
-                    std::move(group_id), rows_per_page, entry_stride_tokens, total_pages,
+                    std::move(group_id), rows_per_page, entry_stride_tokens,   total_pages,
                     /*block_size=*/0,    retention,     sliding_window_tokens, family};
             },
             nb::arg("group_id"), nb::arg("rows_per_page"), nb::arg("entry_stride_tokens"), nb::arg("total_pages"),

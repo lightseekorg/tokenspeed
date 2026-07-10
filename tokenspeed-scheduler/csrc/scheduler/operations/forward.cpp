@@ -111,9 +111,9 @@ std::int32_t FlatSlideCredit(const KvCacheCoordinator& coordinator, std::span<co
                              std::int32_t num_computed_tokens) {
     std::int32_t total_freed = 0;
     for (std::int32_t i = 0; i < coordinator.NumGroups(); ++i) {
-        total_freed += coordinator.GroupManager(i).BlocksReclaimableAt(
-            tables[static_cast<std::size_t>(i)], num_computed_tokens,
-            /*count_uncached=*/!coordinator.HasHostTier());
+        total_freed +=
+            coordinator.GroupManager(i).BlocksReclaimableAt(tables[static_cast<std::size_t>(i)], num_computed_tokens,
+                                                            /*count_uncached=*/!coordinator.HasHostTier());
     }
     return total_freed;
 }
@@ -125,8 +125,7 @@ bool isFlatHolder(const Request* req) {
 
 // Deferred = schedulable states the forward loop skipped this round for lack of pool pages.
 bool isFlatDeferred(const Request* req) {
-    return isFlatHolder(req) || req->Is<fsm::Submitted>() || req->Is<fsm::PrefetchDone>() ||
-           req->Is<fsm::Prefilling>();
+    return isFlatHolder(req) || req->Is<fsm::Submitted>() || req->Is<fsm::PrefetchDone>() || req->Is<fsm::Prefilling>();
 }
 
 }  // namespace
@@ -181,8 +180,7 @@ std::optional<std::int32_t> Scheduler::flatAdmitFirstChunk(Request* request, con
 std::optional<std::int32_t> Scheduler::flatAdmitPrefillChunk(Request* request, std::int32_t chunk_tokens,
                                                              std::int32_t decode_reserve_tokens,
                                                              std::int32_t num_computed_tokens) const {
-    const std::int32_t slide_credit =
-        FlatSlideCredit(coordinator_, request->FlatBlockTablesRef(), num_computed_tokens);
+    const std::int32_t slide_credit = FlatSlideCredit(coordinator_, request->FlatBlockTablesRef(), num_computed_tokens);
     const std::int32_t blocks_needed =
         coordinator_.BlocksNeededFor(request->FlatBlockTablesRef(), chunk_tokens + decode_reserve_tokens);
     if (blocks_needed > flatFreeBudget(request->Id()) + slide_credit) {
@@ -197,13 +195,11 @@ std::optional<std::int32_t> Scheduler::flatAdmitPrefillChunk(Request* request, s
 // Gate for the PrefillDone reserve Acquire and each DecodeStep, composed from the transition's own primitives.
 bool Scheduler::flatAdmitDecode(Request* request) const {
     // Same num_computed the transition slides with: Decoding's pending tail is not yet computed.
-    const std::int32_t num_computed_tokens = request->Is<fsm::Decoding>()
-                                                 ? request->TokenSize() - config_.decode_input_tokens
-                                                 : request->PrefillSize();
-    const std::int32_t slide_credit =
-        FlatSlideCredit(coordinator_, request->FlatBlockTablesRef(), num_computed_tokens);
-    const std::int32_t blocks_needed = coordinator_.BlocksNeededFor(
-        request->FlatBlockTablesRef(), request->GetReserveNumTokensInNextScheduleEvent());
+    const std::int32_t num_computed_tokens =
+        request->Is<fsm::Decoding>() ? request->TokenSize() - config_.decode_input_tokens : request->PrefillSize();
+    const std::int32_t slide_credit = FlatSlideCredit(coordinator_, request->FlatBlockTablesRef(), num_computed_tokens);
+    const std::int32_t blocks_needed =
+        coordinator_.BlocksNeededFor(request->FlatBlockTablesRef(), request->GetReserveNumTokensInNextScheduleEvent());
     return blocks_needed <= flatFreeBudget(request->Id()) + slide_credit;
 }
 
@@ -239,9 +235,9 @@ void Scheduler::resolveFlatStarvation(const std::vector<Request*>& candidates, b
         }
     }
     if (!holders.empty()) {
-        Request* victim =
-            *std::max_element(holders.begin(), holders.end(),
-                              [](const Request* a, const Request* b) { return a->TokenSize() < b->TokenSize(); });
+        Request* victim = *std::max_element(holders.begin(), holders.end(), [](const Request* a, const Request* b) {
+            return a->TokenSize() < b->TokenSize();
+        });
         // Wedge-gate guarantee (flatPoolWedged: pending_forward_results_.empty()): the runtime owes
         // the victim nothing, so its re-prefill can never race a stale ExtendResult. If the gate is
         // ever relaxed, fail loud here instead of corrupting the rebased prefill.
@@ -486,8 +482,7 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* reque
         }
     }
 
-    return fsm::ScheduleDecodeEvent{config_.decode_input_tokens,
-                                    hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr
+    return fsm::ScheduleDecodeEvent{config_.decode_input_tokens, hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr
 #if TOKENSPEED_FLAT_KVCACHE
                                     ,
                                     &coordinator_
@@ -677,8 +672,7 @@ std::optional<WriteBackOperation> Scheduler::newRetractOperation(Request* retrac
 // By-reference so the first-chunk caller can harvest the transition's flat load pairs afterwards.
 template <typename Event>
     requires(std::same_as<Event, fsm::SchedulePrefillFirstChunkEvent> || std::same_as<Event, fsm::SchedulePrefillEvent>)
-static PrefillOperation applyPrefillEvent(Request* request, Event& event,
-                                          std::span<const std::string> flat_group_ids) {
+static PrefillOperation applyPrefillEvent(Request* request, Event& event, std::span<const std::string> flat_group_ids) {
     // begin/size are PAGE-space: the occupied_pages slice new this round (Python copies it into req_to_page).
     // A first-chunk prefix hit enters during the event, so begin stays 0 and size counts the hit rows too;
     // the op's token-space INPUT window intentionally starts past the hit.

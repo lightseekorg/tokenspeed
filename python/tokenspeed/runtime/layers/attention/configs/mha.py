@@ -122,7 +122,10 @@ class MHAConfig(BaseAttnConfig):
             sliding_window_tokens=sliding_window_tokens,
             max_scheduled_tokens=getattr(server_args, "chunked_prefill_size", 8192),
             speculative_enabled=server_args.speculative_algorithm is not None,
-            pd_disaggregation_enabled=getattr(server_args, "disaggregation_mode", "null") != "null",
+            pd_disaggregation_enabled=getattr(
+                server_args, "disaggregation_mode", "null"
+            )
+            != "null",
             conv_state_shape=conv_state_shape,
             temporal_state_shape=temporal_state_shape,
             conv_dtype=conv_dtype,

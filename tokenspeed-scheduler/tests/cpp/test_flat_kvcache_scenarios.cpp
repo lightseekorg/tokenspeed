@@ -44,10 +44,8 @@ const FlatForwardOperation* FindFlatOp(const ExecutionPlan& plan) {
     return nullptr;
 }
 
-PagedCacheGroupConfig MakeGroup(const std::string& id, std::int32_t block_size,
-                                std::int32_t total_pages,
-                                PagedCacheGroupConfig::Retention retention,
-                                PagedCacheGroupFamily family,
+PagedCacheGroupConfig MakeGroup(const std::string& id, std::int32_t block_size, std::int32_t total_pages,
+                                PagedCacheGroupConfig::Retention retention, PagedCacheGroupFamily family,
                                 std::int32_t sliding_window_tokens = 0) {
     PagedCacheGroupConfig g;
     g.group_id = id;
@@ -93,11 +91,10 @@ protected:
 
         cfg.paged_cache_groups = {
             MakeGroup("full", cfg.block_size, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory,
-                      PagedCacheGroupFamily::History),
+                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
             MakeGroup("swa", cfg.block_size, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::SlidingWindow,
-                      PagedCacheGroupFamily::State, /*sliding_window_tokens=*/4),
+                      PagedCacheGroupConfig::Retention::SlidingWindow, PagedCacheGroupFamily::State,
+                      /*sliding_window_tokens=*/4),
         };
         return cfg;
     }
@@ -121,8 +118,7 @@ TEST_F(FlatChunkedPrefillSuite, MultiChunkPrefillGrowsFullTableThenDecodes) {
     const FlatForwardOperation* op2 = FindFlatOp(chunk2);
     ASSERT_NE(op2, nullptr);
     const auto& full_c2 = op2->flat_block_tables.at("full").at(0);
-    EXPECT_GT(full_c2.size(), full_after_c1)
-        << "second chunk should extend the full-history block table";
+    EXPECT_GT(full_c2.size(), full_after_c1) << "second chunk should extend the full-history block table";
     for (std::int32_t id : full_c2) {
         EXPECT_GT(id, 0) << "full-history row must have no null hole";
     }
@@ -159,14 +155,13 @@ protected:
 
         cfg.paged_cache_groups = {
             MakeGroup("full", cfg.block_size, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory,
-                      PagedCacheGroupFamily::History),
+                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
             MakeGroup("swa_small", cfg.block_size, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::SlidingWindow,
-                      PagedCacheGroupFamily::State, /*sliding_window_tokens=*/4),
+                      PagedCacheGroupConfig::Retention::SlidingWindow, PagedCacheGroupFamily::State,
+                      /*sliding_window_tokens=*/4),
             MakeGroup("swa_big", cfg.block_size, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::SlidingWindow,
-                      PagedCacheGroupFamily::State, /*sliding_window_tokens=*/8),
+                      PagedCacheGroupConfig::Retention::SlidingWindow, PagedCacheGroupFamily::State,
+                      /*sliding_window_tokens=*/8),
         };
         return cfg;
     }
@@ -221,14 +216,13 @@ protected:
 
         cfg.paged_cache_groups = {
             MakeGroup("full", cfg.block_size, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory,
-                      PagedCacheGroupFamily::History),
+                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
             MakeGroup("swa_w3", cfg.block_size, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::SlidingWindow,
-                      PagedCacheGroupFamily::State, /*sliding_window_tokens=*/3),
+                      PagedCacheGroupConfig::Retention::SlidingWindow, PagedCacheGroupFamily::State,
+                      /*sliding_window_tokens=*/3),
             MakeGroup("swa_w5", cfg.block_size, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::SlidingWindow,
-                      PagedCacheGroupFamily::State, /*sliding_window_tokens=*/5),
+                      PagedCacheGroupConfig::Retention::SlidingWindow, PagedCacheGroupFamily::State,
+                      /*sliding_window_tokens=*/5),
         };
         return cfg;
     }
@@ -303,11 +297,9 @@ protected:
 
         cfg.paged_cache_groups = {
             MakeGroup("full_a", cfg.block_size, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory,
-                      PagedCacheGroupFamily::History),
+                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
             MakeGroup("full_b", cfg.block_size, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory,
-                      PagedCacheGroupFamily::History),
+                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
         };
         return cfg;
     }
@@ -359,11 +351,10 @@ protected:
 
         cfg.paged_cache_groups = {
             MakeGroup("full", cfg.block_size, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory,
-                      PagedCacheGroupFamily::History),
+                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
             MakeGroup("swa", cfg.block_size, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::SlidingWindow,
-                      PagedCacheGroupFamily::State, /*sliding_window_tokens=*/4),
+                      PagedCacheGroupConfig::Retention::SlidingWindow, PagedCacheGroupFamily::State,
+                      /*sliding_window_tokens=*/4),
         };
         return cfg;
     }
@@ -379,8 +370,7 @@ TEST_F(FlatPoolAccountingSuite, ThreeRequestsOutOfOrderFinishReclaimExactly) {
     EXPECT_EQ(scheduler_->WaitingSize(), 0u);
 
     const std::int32_t free_after_prefill = scheduler_->FlatPoolFreeBlocks();
-    EXPECT_LT(free_after_prefill, free_at_start)
-        << "prefill must consume pages from the shared pool";
+    EXPECT_LT(free_after_prefill, free_at_start) << "prefill must consume pages from the shared pool";
 
     SendForwardDone("r1", {42});
     SendForwardDone("r2", {142});
@@ -390,8 +380,7 @@ TEST_F(FlatPoolAccountingSuite, ThreeRequestsOutOfOrderFinishReclaimExactly) {
     PlanOnce();
     SendFinish("r1");
     PlanOnce();
-    EXPECT_LT(scheduler_->FlatPoolFreeBlocks(), free_at_start)
-        << "pool not fully reclaimed while r3 is still live";
+    EXPECT_LT(scheduler_->FlatPoolFreeBlocks(), free_at_start) << "pool not fully reclaimed while r3 is still live";
     SendFinish("r3");
     PlanOnce();
 
@@ -457,9 +446,7 @@ TEST_F(FlatChunkedPrefillSuite, ChunkedPrefillThenSwaSlidesToNullHole) {
         SendForwardDone("r1", {tok++});
     }
 
-    auto null_count = [](const std::vector<std::int32_t>& row) {
-        return std::count(row.begin(), row.end(), 0);
-    };
+    auto null_count = [](const std::vector<std::int32_t>& row) { return std::count(row.begin(), row.end(), 0); };
 
     // Round 0 (finalize): N=12 -> first kept page 4; + reserve page -> 7 slots, 4 holes.
     ASSERT_EQ(swa_rows[0].size(), 7u);
@@ -544,11 +531,10 @@ protected:
 
         cfg.paged_cache_groups = {
             MakeGroup("full", cfg.block_size, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory,
-                      PagedCacheGroupFamily::History),
+                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
             MakeGroup("swa", cfg.block_size, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::SlidingWindow,
-                      PagedCacheGroupFamily::State, /*sliding_window_tokens=*/4),
+                      PagedCacheGroupConfig::Retention::SlidingWindow, PagedCacheGroupFamily::State,
+                      /*sliding_window_tokens=*/4),
         };
         return cfg;
     }
@@ -558,8 +544,8 @@ TEST_F(FlatMixedBatchSuite, PrefillAndDecodeShareOnePlan) {
     const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
 
     Submit(MakeRequestSpec("r1", /*num_pages=*/2));
-    PlanOnce();                       // r1 prefill
-    SendForwardDone("r1", {42});      // r1 -> decode
+    PlanOnce();                   // r1 prefill
+    SendForwardDone("r1", {42});  // r1 -> decode
 
     Submit(MakeRequestSpec("r2", /*num_pages=*/3, /*start=*/101));
     ExecutionPlan mixed = PlanOnce();
@@ -596,7 +582,7 @@ TEST_F(FlatMixedBatchSuite, PrefillAndDecodeShareOnePlan) {
 TEST_F(FlatMixedBatchSuite, PerRequestSwaHoleAtDifferentDecodeDepths) {
     Submit(MakeRequestSpec("r1", /*num_pages=*/2));
     Submit(MakeRequestSpec("r2", /*num_pages=*/2, /*start=*/101));
-    PlanOnce();                    // both prefill together (mixed batch)
+    PlanOnce();  // both prefill together (mixed batch)
     SendForwardDone("r1", {42});
     SendForwardDone("r2", {142});
 
@@ -659,11 +645,10 @@ protected:
 
         cfg.paged_cache_groups = {
             MakeGroup("full", cfg.block_size, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory,
-                      PagedCacheGroupFamily::History),
+                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
             MakeGroup("swa", cfg.block_size, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::SlidingWindow,
-                      PagedCacheGroupFamily::State, /*sliding_window_tokens=*/2),
+                      PagedCacheGroupConfig::Retention::SlidingWindow, PagedCacheGroupFamily::State,
+                      /*sliding_window_tokens=*/2),
         };
         return cfg;
     }
@@ -676,8 +661,7 @@ TEST_F(FlatPageSizeOneSuite, TokenGranularPagesSlideAndReclaim) {
     ExecutionPlan prefill = PlanOnce();
     const FlatForwardOperation* pop = FindFlatOp(prefill);
     ASSERT_NE(pop, nullptr);
-    EXPECT_EQ(pop->flat_block_tables.at("full").at(0).size(), 3u)
-        << "block_size=1 -> one page per prompt token";
+    EXPECT_EQ(pop->flat_block_tables.at("full").at(0).size(), 3u) << "block_size=1 -> one page per prompt token";
 
     SendForwardDone("r1", {42});
 
@@ -733,11 +717,10 @@ protected:
 
         cfg.paged_cache_groups = {
             MakeGroup("full", cfg.block_size, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory,
-                      PagedCacheGroupFamily::History),
+                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
             MakeGroup("swa", cfg.block_size, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::SlidingWindow,
-                      PagedCacheGroupFamily::State, /*sliding_window_tokens=*/4),
+                      PagedCacheGroupConfig::Retention::SlidingWindow, PagedCacheGroupFamily::State,
+                      /*sliding_window_tokens=*/4),
         };
         return cfg;
     }
@@ -808,7 +791,7 @@ protected:
         cfg.block_size = 2;
         cfg.device_allocator.total_pages = 13;
         cfg.host_allocator.total_pages = 14;  // 13 usable + the null placeholder (page 0)
-        cfg.max_scheduled_tokens = 4;  // 4-token prefill chunks
+        cfg.max_scheduled_tokens = 4;         // 4-token prefill chunks
         cfg.max_batch_size = 8;
         cfg.enable_l3_storage = false;
         cfg.disable_l2_cache = true;
@@ -816,11 +799,10 @@ protected:
 
         cfg.paged_cache_groups = {
             MakeGroup("full", cfg.block_size, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory,
-                      PagedCacheGroupFamily::History),
+                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
             MakeGroup("swa", cfg.block_size, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::SlidingWindow,
-                      PagedCacheGroupFamily::State, /*sliding_window_tokens=*/4),
+                      PagedCacheGroupConfig::Retention::SlidingWindow, PagedCacheGroupFamily::State,
+                      /*sliding_window_tokens=*/4),
         };
         return cfg;
     }
@@ -999,11 +981,9 @@ protected:
 
         cfg.paged_cache_groups = {
             MakeGroup("full_a", cfg.block_size, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory,
-                      PagedCacheGroupFamily::History),
+                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
             MakeGroup("full_b", cfg.block_size, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory,
-                      PagedCacheGroupFamily::History),
+                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
         };
         return cfg;
     }
@@ -1113,11 +1093,9 @@ protected:
 
         cfg.paged_cache_groups = {
             MakeGroup("full_a", cfg.block_size, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory,
-                      PagedCacheGroupFamily::History),
+                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
             MakeGroup("full_b", cfg.block_size, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory,
-                      PagedCacheGroupFamily::History),
+                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
         };
         return cfg;
     }
@@ -1388,7 +1366,7 @@ TEST_F(FlatRetractExactFitSuite, ReserveRefundBalances) {
     PlanOnce();                  // tail-page decode (0 fresh blocks)
     SendForwardDone("a", {44});  // 9 tokens: past capacity
 
-    PlanOnce();  // starved round 1
+    PlanOnce();                                // starved round 1
     ExecutionPlan retract_round = PlanOnce();  // starved round 2 -> retract "a"
     ASSERT_TRUE(retract_round.flat_oom_request_ids.empty());
     ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), 8);
@@ -1501,7 +1479,7 @@ TEST_F(FlatRetractTrioSuite, TwoRoundsTwoVictims) {
     SendForwardDone("r1", {43});   // 10 = capacity
     SendForwardDone("r2", {143});  // 8 = capacity
     SendForwardDone("r3", {243});  // 6 = capacity
-    PlanOnce();  // tail-page decodes (0 fresh blocks)
+    PlanOnce();                    // tail-page decodes (0 fresh blocks)
     SendForwardDone("r1", {44});   // 11: past capacity
     SendForwardDone("r2", {144});  // 9: past capacity
     SendForwardDone("r3", {244});  // 7: past capacity
@@ -1570,11 +1548,9 @@ protected:
         cfg.host_allocator.total_pages = 10;
         cfg.paged_cache_groups = {
             MakeGroup("full", cfg.block_size, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory,
-                      PagedCacheGroupFamily::History),
+                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
             MakeGroup("state", cfg.block_size, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory,
-                      PagedCacheGroupFamily::State),
+                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::State),
         };
         return cfg;
     }
@@ -1708,11 +1684,10 @@ TEST(FlatEventFailurePath, PrefillChunkFailureReleasesPagesAndAbortStaysClean) {
     ASSERT_EQ(pool.NumFreeBlocks(), 1);
 
     // Second chunk: 8 tokens -> 8 blocks > 1 free: the Acquire throws.
-    EXPECT_THROW(
-        request.Apply(fsm::SchedulePrefillEvent{/*tokens_this_round=*/8,
-                                                /*reserve_num_tokens_in_next_schedule_event=*/0,
-                                                /*hybrid_prefix_cache=*/nullptr, &coordinator}),
-        std::runtime_error);
+    EXPECT_THROW(request.Apply(fsm::SchedulePrefillEvent{/*tokens_this_round=*/8,
+                                                         /*reserve_num_tokens_in_next_schedule_event=*/0,
+                                                         /*hybrid_prefix_cache=*/nullptr, &coordinator}),
+                 std::runtime_error);
     EXPECT_EQ(pool.NumFreeBlocks(), 5) << "failure path must return the request's pages to the pool";
 
     EXPECT_NO_THROW(request.Apply(fsm::AbortEvent{&coordinator}));
@@ -1925,11 +1900,9 @@ protected:
 
         cfg.paged_cache_groups = {
             MakeGroup("full_a", cfg.block_size, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory,
-                      PagedCacheGroupFamily::History),
+                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
             MakeGroup("full_b", cfg.block_size, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory,
-                      PagedCacheGroupFamily::History),
+                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
         };
         return cfg;
     }
@@ -2029,11 +2002,10 @@ protected:
 
         cfg.paged_cache_groups = {
             MakeGroup("full", cfg.block_size, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory,
-                      PagedCacheGroupFamily::History),
+                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
             MakeGroup("swa", cfg.block_size, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::SlidingWindow,
-                      PagedCacheGroupFamily::State, SlidingWindowTokens()),
+                      PagedCacheGroupConfig::Retention::SlidingWindow, PagedCacheGroupFamily::State,
+                      SlidingWindowTokens()),
         };
         return cfg;
     }
@@ -2663,11 +2635,10 @@ protected:
 
         cfg.paged_cache_groups = {
             MakeGroup("full", cfg.block_size, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::FullHistory,
-                      PagedCacheGroupFamily::History),
+                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
             MakeGroup("swa", cfg.block_size, cfg.device_allocator.total_pages,
-                      PagedCacheGroupConfig::Retention::SlidingWindow,
-                      PagedCacheGroupFamily::State, /*sliding_window_tokens=*/4),
+                      PagedCacheGroupConfig::Retention::SlidingWindow, PagedCacheGroupFamily::State,
+                      /*sliding_window_tokens=*/4),
         };
         return cfg;
     }
@@ -2733,8 +2704,7 @@ TEST_F(FlatStreamingSinkSuite, DuplicateRegistrationsAreDroppedAtDrain) {
     ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start);
 
     ExecutionPlan finalize2 = RunToFinalize(MakeRequestSpec("r2", /*num_pages=*/4));  // identical tokens
-    EXPECT_FALSE(FindFlatWriteBack(finalize2).has_value())
-        << "already-indexed keys must not re-emit a write-back";
+    EXPECT_FALSE(FindFlatWriteBack(finalize2).has_value()) << "already-indexed keys must not re-emit a write-back";
     FinishAndReap("r2");
     EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start)
         << "duplicate candidates are unpinned at drain, pool back to baseline";
@@ -3208,7 +3178,6 @@ TEST_F(FlatChunkedHostHitSuite, ChunkedPrefillAfterHostHit) {
     PlanOnce();  // reap
     EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start) << "pool balances after the chunked host hit";
 }
-
 
 // ---------------------------------------------------------------------------
 // Heterogeneous per-group block_size: specs carry each group's own block_size

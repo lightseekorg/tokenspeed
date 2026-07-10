@@ -201,7 +201,7 @@ TEST(SwaManagerTest, MatchDoesNotChangeRefCount) {
     std::vector<std::string> keys{h0};
     PrefixMatch m = mgr.Match(pool, keys, 0, 1);
     EXPECT_EQ(m.num_hit_blocks, 1);
-    EXPECT_EQ(b0->RefCount(), 0);          // read-only
+    EXPECT_EQ(b0->RefCount(), 0);  // read-only
     EXPECT_EQ(pool.NumFreeBlocks(), 7);
 }
 
@@ -240,7 +240,7 @@ TEST(SwaManagerTest, InheritedAcquireAndFreeWork) {
     SwaManager mgr(4, 10);
     BlockTable table;
 
-    ASSERT_TRUE(mgr.Acquire(pool, table, 8));   // 2 pages
+    ASSERT_TRUE(mgr.Acquire(pool, table, 8));  // 2 pages
     EXPECT_EQ(table.NumBlocks(), 2);
     EXPECT_EQ(pool.NumFreeBlocks(), 5);
 
@@ -274,19 +274,19 @@ TEST(BlockTableTest, EvictToNullReturnsOldBlockAndPunchesHole) {
     ASSERT_FALSE(page0->IsNull());
 
     CacheBlock* old = table.EvictToNull(0, pool.NullBlock());
-    EXPECT_EQ(old, page0);                       // returns the displaced block
-    EXPECT_TRUE(table.Blocks()[0]->IsNull());    // slot is now a null hole
-    EXPECT_EQ(table.NumBlocks(), 2);             // length unchanged (no shrink)
+    EXPECT_EQ(old, page0);                     // returns the displaced block
+    EXPECT_TRUE(table.Blocks()[0]->IsNull());  // slot is now a null hole
+    EXPECT_EQ(table.NumBlocks(), 2);           // length unchanged (no shrink)
 }
 
 TEST(BlockTableTest, EvictToNullIsIdempotentOnNullSlot) {
     BlockPool pool(8);
     SwaManager mgr(4, 4);
     BlockTable table;
-    ASSERT_TRUE(mgr.Acquire(pool, table, 4));  // 1 real page
-    table.EvictToNull(0, pool.NullBlock());                 // first: punches hole
+    ASSERT_TRUE(mgr.Acquire(pool, table, 4));                    // 1 real page
+    table.EvictToNull(0, pool.NullBlock());                      // first: punches hole
     CacheBlock* again = table.EvictToNull(0, pool.NullBlock());  // second: already null
-    EXPECT_EQ(again, nullptr);                   // returns nullptr on already-null
+    EXPECT_EQ(again, nullptr);                                   // returns nullptr on already-null
     EXPECT_TRUE(table.Blocks()[0]->IsNull());
 }
 
@@ -338,9 +338,13 @@ TEST(SwaManagerTest, ReclaimExpiredMirrorsVllmBoundarySequence) {
     EXPECT_TRUE(table.Blocks()[3]->IsNull());
     EXPECT_FALSE(table.Blocks()[4]->IsNull());
     EXPECT_EQ(pool.NumFreeBlocks(), free_before11 + 2);  // p2, p3 returned
-    EXPECT_EQ(table.NumBlocks(), 5);  // length never shrinks
+    EXPECT_EQ(table.NumBlocks(), 5);                     // length never shrinks
 
-    (void)p0; (void)p1; (void)p2; (void)p3; (void)p4;
+    (void)p0;
+    (void)p1;
+    (void)p2;
+    (void)p3;
+    (void)p4;
 }
 
 TEST(SwaManagerTest, ReclaimExpiredEarlyReturnInsideWindow) {
@@ -419,7 +423,7 @@ TEST(SwaManagerTest, AcquireAdvancePairingKeepsPhysicalPagesBounded) {
     std::int32_t n = 0;
     std::int32_t baseline_free = pool.NumFreeBlocks();
     for (int step = 0; step < 20; ++step) {
-        n += 2;                          // two new tokens -> one new page
+        n += 2;  // two new tokens -> one new page
         ASSERT_TRUE(mgr.Acquire(pool, table, 2));
         mgr.ReclaimExpired(pool, table, n);
     }

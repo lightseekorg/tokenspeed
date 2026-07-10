@@ -192,12 +192,12 @@ public:
         return static_cast<std::int32_t>(std::ranges::distance(AllCachedBlocks(cached_hash_to_blocks_)));
     }
     std::int32_t NumCachedFreeBlocks() const {
-        return static_cast<std::int32_t>(std::ranges::count_if(
-            AllCachedBlocks(cached_hash_to_blocks_), [](const CacheBlock* b) { return b->ref_cnt_ == 0; }));
+        return static_cast<std::int32_t>(std::ranges::count_if(AllCachedBlocks(cached_hash_to_blocks_),
+                                                               [](const CacheBlock* b) { return b->ref_cnt_ == 0; }));
     }
     std::int32_t NumPinnedCachedBlocks() const {
-        return static_cast<std::int32_t>(std::ranges::count_if(
-            AllCachedBlocks(cached_hash_to_blocks_), [](const CacheBlock* b) { return b->ref_cnt_ > 0; }));
+        return static_cast<std::int32_t>(std::ranges::count_if(AllCachedBlocks(cached_hash_to_blocks_),
+                                                               [](const CacheBlock* b) { return b->ref_cnt_ > 0; }));
     }
 
 private:

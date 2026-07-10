@@ -51,8 +51,8 @@ public:
 
     // One matcher for every tier: scan `pool` over slots [begin_blocks, max_blocks) of the FULL
     // key sequence. Read-only; blocks are relative to begin_blocks, holes = pool.NullBlock().
-    virtual PrefixMatch Match(const BlockPool& pool, std::span<const std::string> keys,
-                              std::int32_t begin_blocks, std::int32_t max_blocks) const = 0;
+    virtual PrefixMatch Match(const BlockPool& pool, std::span<const std::string> keys, std::int32_t begin_blocks,
+                              std::int32_t max_blocks) const = 0;
 
     // null_block holes are appended as-is (never ref counted) to keep logical-page alignment.
     void ClaimHitBlocks(BlockPool& pool, BlockTable& table, const PrefixMatch& hit) {
@@ -119,9 +119,9 @@ public:
                          std::int32_t first_slot = 0,
                          std::vector<std::pair<std::string, CacheBlock*>>* newly_cached = nullptr) {
         _assert(first_slot >= 0, "first_slot must be >= 0");
-        _assert(static_cast<std::int64_t>(first_slot) + static_cast<std::int64_t>(block_hashes.size()) <=
-                    table.NumBlocks(),
-                "hash range exceeds table size");
+        _assert(
+            static_cast<std::int64_t>(first_slot) + static_cast<std::int64_t>(block_hashes.size()) <= table.NumBlocks(),
+            "hash range exceeds table size");
         for (std::size_t j = 0; j < block_hashes.size(); ++j) {
             CacheBlock* block = table.blocks_[static_cast<std::size_t>(first_slot) + j].Get();
             if (block->IsNull()) {
@@ -141,8 +141,7 @@ public:
     virtual void ReclaimExpired(BlockPool& /*pool*/, BlockTable& /*table*/, std::int32_t /*num_computed_tokens*/) {}
 
     // Pure twin of ReclaimExpired (pages a pending reclaim would free), overridden in lockstep with it.
-    virtual std::int32_t BlocksReclaimableAt(const BlockTable& /*table*/,
-                                             std::int32_t /*num_computed_tokens*/,
+    virtual std::int32_t BlocksReclaimableAt(const BlockTable& /*table*/, std::int32_t /*num_computed_tokens*/,
                                              bool /*count_uncached*/) const {
         return 0;
     }

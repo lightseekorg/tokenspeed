@@ -368,7 +368,7 @@ TEST(ForwardCacheOpsBuildFlatBlockTables, SwaRowGetsNullHoleAfterAdvance) {
     KvCacheCoordinator coordinator = MakeTwoGroup(pool);
     std::vector<BlockTable> tables(coordinator.NumGroups());
     // Window = 4 tokens = 2 pages, so 8 tokens leave earlier pages out of window.
-    ASSERT_TRUE(coordinator.Acquire(tables, /*num_tokens=*/8));      // 4 pages/group
+    ASSERT_TRUE(coordinator.Acquire(tables, /*num_tokens=*/8));  // 4 pages/group
     for (std::int32_t g = 0; g < coordinator.NumGroups(); ++g) {
         coordinator.GroupManager(g).ReclaimExpired(pool, tables[static_cast<std::size_t>(g)],
                                                    /*num_computed_tokens=*/8);

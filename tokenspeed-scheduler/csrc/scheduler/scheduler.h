@@ -113,8 +113,8 @@ private:
     std::optional<fsm::SchedulePrefetchEvent> schedulePrefetch(Request* request, const MatchResult& match);
 
     std::optional<fsm::SchedulePrefillFirstChunkEvent> schedulePrefillFirstChunk(
-        Request* request, std::int32_t remaining, std::int32_t decode_input_tokens,
-        bool disable_l2_cache, std::map<std::string, std::int32_t>& simulated_free);
+        Request* request, std::int32_t remaining, std::int32_t decode_input_tokens, bool disable_l2_cache,
+        std::map<std::string, std::int32_t>& simulated_free);
     std::optional<fsm::SchedulePrefillEvent> schedulePrefill(Request* request, std::int32_t remaining,
                                                              std::int32_t reserve_num_tokens_in_next_schedule_event,
                                                              std::map<std::string, std::int32_t>& simulated_free);

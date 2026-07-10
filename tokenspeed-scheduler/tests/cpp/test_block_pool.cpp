@@ -65,9 +65,9 @@ TEST(BlockPoolTest, AllocateClaimsBlocksWithRefOne) {
 }
 
 TEST(BlockPoolTest, AllocateFailsWhenCapacityShort) {
-    BlockPool pool(4);              // 3 free after null reservation
+    BlockPool pool(4);  // 3 free after null reservation
     auto blocks = pool.AllocateBlocks(4);
-    EXPECT_TRUE(blocks.empty());    // all-or-nothing
+    EXPECT_TRUE(blocks.empty());  // all-or-nothing
     EXPECT_EQ(pool.NumFreeBlocks(), 3);
 }
 
@@ -86,10 +86,10 @@ TEST(BlockPoolTest, RefCountReachesZeroOnlyAfterAllRefsReleased) {
     BlockPool pool(8);
     auto blocks = pool.AllocateBlocks(1);
     CacheBlock* b = blocks.front();
-    pool.TouchBlock(b);             // second reference
+    pool.TouchBlock(b);  // second reference
     EXPECT_EQ(b->RefCount(), 2);
     pool.FreeBlocks({b});
-    EXPECT_EQ(b->RefCount(), 1);    // still referenced -> not back in free queue
+    EXPECT_EQ(b->RefCount(), 1);  // still referenced -> not back in free queue
     EXPECT_EQ(pool.NumFreeBlocks(), 6);
     pool.FreeBlocks({b});
     EXPECT_EQ(b->RefCount(), 0);
@@ -132,7 +132,7 @@ TEST(BlockPoolTest, CachingDisabledNeverHits) {
 
     auto blocks = pool.AllocateBlocks(1);
     CacheBlock* b = blocks.front();
-    pool.CacheFullBlock(b, key);   // no-op when caching is disabled
+    pool.CacheFullBlock(b, key);  // no-op when caching is disabled
     EXPECT_FALSE(b->IsCached());
     EXPECT_EQ(pool.GetCachedBlock(key), nullptr);  // lookups always miss
 }
@@ -157,11 +157,11 @@ TEST(BlockPoolTest, EvictionDropsCachedContentWhenReused) {
     auto first = pool.AllocateBlocks(1);
     CacheBlock* b = first.front();
     pool.CacheFullBlock(b, key);
-    pool.FreeBlocks({b});                       // cached + free
+    pool.FreeBlocks({b});  // cached + free
     EXPECT_EQ(pool.GetCachedBlock(key), b);
 
     auto second = pool.AllocateBlocks(1);
-    EXPECT_EQ(second.front(), b);               // same physical block reused
+    EXPECT_EQ(second.front(), b);  // same physical block reused
     EXPECT_FALSE(b->IsCached());
     EXPECT_EQ(pool.GetCachedBlock(key), nullptr);  // content gone from the map
 }
@@ -169,7 +169,7 @@ TEST(BlockPoolTest, EvictionDropsCachedContentWhenReused) {
 // ---- LRU ordering -------------------------------------------------------
 
 TEST(BlockPoolTest, EvictionPrefersLeastRecentlyFreed) {
-    BlockPool pool(4);              // 3 usable blocks
+    BlockPool pool(4);  // 3 usable blocks
     auto blocks = pool.AllocateBlocks(3);
     CacheBlock* b0 = blocks[0];
     CacheBlock* b1 = blocks[1];

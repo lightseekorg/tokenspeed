@@ -92,8 +92,7 @@ TEST(MakeCoordinatorTest, BuildsOneGroupPerSpec) {
 TEST(MakeCoordinatorTest, AcceptsDivisibleBlockSizesAndFoldsGcdLcm) {
     BlockPool pool(16);
     std::vector<KvCacheSpec> specs = {
-        {AttnKind::kFull, 4, 0},
-        {AttnKind::kSlidingWindow, 8, 10},  // per-group block_size (multiple of base)
+        {AttnKind::kFull, 4, 0}, {AttnKind::kSlidingWindow, 8, 10},  // per-group block_size (multiple of base)
     };
     KvCacheCoordinator coord = MakeCoordinator(specs, pool);
     EXPECT_EQ(coord.BaseBlockSize(), 4);  // gcd(4,8)
@@ -162,7 +161,7 @@ TEST(CoordinatorAllocTest, ColdStartAllocatesAlignedPages) {
     EXPECT_EQ(hit.num_common_tokens, 0);
 
     std::vector<BlockTable> tables(2);
-    coord.ClaimCommonPrefix(tables, hit);              // no hits -> no-op
+    coord.ClaimCommonPrefix(tables, hit);  // no hits -> no-op
     ASSERT_TRUE(coord.Acquire(tables, /*num_tokens=*/8));
     // 8 tokens / page 4 = 2 pages in EACH group; tables aligned.
     EXPECT_EQ(tables[0].NumBlocks(), 2);
@@ -184,7 +183,7 @@ TEST(CoordinatorAllocTest, ClaimsCommonPrefixThenAllocatesRemainder) {
 
     std::vector<BlockTable> tables(2);
     // 8 tokens total, 1 page (4 tokens) common -> 4 uncached tokens -> +1 page each.
-    coord.ClaimCommonPrefix(tables, hit);              // claim the 1 cached page each
+    coord.ClaimCommonPrefix(tables, hit);  // claim the 1 cached page each
     ASSERT_TRUE(coord.Acquire(tables, 8 - hit.num_common_tokens));
     EXPECT_EQ(tables[0].NumBlocks(), 2);  // 1 claimed + 1 allocated
     EXPECT_EQ(tables[1].NumBlocks(), 2);
@@ -201,12 +200,12 @@ TEST(CoordinatorAllocTest, CrossGroupShortfallAllocatesNothing) {
 
     std::vector<BlockTable> tables(2);
     std::int32_t free_before = pool.NumFreeBlocks();
-    coord.ClaimCommonPrefix(tables, hit);          // no hits -> no-op
+    coord.ClaimCommonPrefix(tables, hit);  // no hits -> no-op
     // 12 tokens -> 3 pages per group = 6 needed, only 4 free -> fail, nothing taken.
     EXPECT_FALSE(coord.Acquire(tables, 12));
     EXPECT_EQ(tables[0].NumBlocks(), 0);
     EXPECT_EQ(tables[1].NumBlocks(), 0);
-    EXPECT_EQ(pool.NumFreeBlocks(), free_before);   // untouched, not rolled back
+    EXPECT_EQ(pool.NumFreeBlocks(), free_before);  // untouched, not rolled back
 }
 
 TEST(CoordinatorStepTest, AcquireKeepsGroupsAligned) {
@@ -215,10 +214,10 @@ TEST(CoordinatorStepTest, AcquireKeepsGroupsAligned) {
     KvCacheCoordinator coord = MakeCoordinator(specs, pool);
 
     std::vector<BlockTable> tables(2);
-    ASSERT_TRUE(coord.Acquire(tables, 4));   // 1 page each
+    ASSERT_TRUE(coord.Acquire(tables, 4));  // 1 page each
     EXPECT_EQ(tables[0].NumBlocks(), 1);
     EXPECT_EQ(tables[1].NumBlocks(), 1);
-    ASSERT_TRUE(coord.Acquire(tables, 4));   // 1 more each
+    ASSERT_TRUE(coord.Acquire(tables, 4));  // 1 more each
     EXPECT_EQ(tables[0].NumBlocks(), 2);
     EXPECT_EQ(tables[1].NumBlocks(), 2);
 }
@@ -244,7 +243,7 @@ TEST(CoordinatorStepTest, CacheFullBlocksThenMatchHits) {
 
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}});
     std::vector<BlockTable> tables(2);
-    ASSERT_TRUE(coord.Acquire(tables, 4));   // 1 page each
+    ASSERT_TRUE(coord.Acquire(tables, 4));  // 1 page each
     coord.CacheFullBlocks(tables, ch);
 
     CoordinatorMatch m = coord.MatchPrefix(ch).device;
@@ -257,7 +256,7 @@ TEST(CoordinatorStepTest, FreeReturnsAllGroups) {
     KvCacheCoordinator coord = MakeCoordinator(specs, pool);
 
     std::vector<BlockTable> tables(2);
-    ASSERT_TRUE(coord.Acquire(tables, 8));   // 2 pages each = 4 blocks
+    ASSERT_TRUE(coord.Acquire(tables, 8));  // 2 pages each = 4 blocks
     std::int32_t free_mid = pool.NumFreeBlocks();
     coord.Free(tables);
     EXPECT_EQ(tables[0].NumBlocks(), 0);
@@ -300,11 +299,11 @@ TEST(CoordinatorStepTest, CacheFullBlocksAtSlotOffsetExtendsPrefix) {
     std::vector<KvCacheSpec> specs = {{AttnKind::kFull, 4, 0}, {AttnKind::kSlidingWindow, 4, 4}};
     KvCacheCoordinator coord = MakeCoordinator(specs, pool);
 
-    std::vector<std::string> ch = ContentHashes(
-        {{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}, {4, 4, 4, 4}, {5, 5, 5, 5}});
+    std::vector<std::string> ch =
+        ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}, {4, 4, 4, 4}, {5, 5, 5, 5}});
     std::vector<BlockTable> tables(2);
-    ASSERT_TRUE(coord.Acquire(tables, 24));   // 6 pages each
-    coord.CacheFullBlocks(tables, std::span(ch).first(4));   // prefill path: slots 0..3
+    ASSERT_TRUE(coord.Acquire(tables, 24));                 // 6 pages each
+    coord.CacheFullBlocks(tables, std::span(ch).first(4));  // prefill path: slots 0..3
     coord.CacheFullBlocks(tables, std::span(ch).subspan(4), /*first_slot=*/4);
 
     CoordinatorMatch m = coord.MatchPrefix(ch).device;
@@ -324,10 +323,10 @@ TEST(CoordinatorStepTest, CacheFullBlocksAtOffsetSkipsSwaHoles) {
     std::vector<KvCacheSpec> specs = {{AttnKind::kFull, 4, 0}, {AttnKind::kSlidingWindow, 4, 4}};
     KvCacheCoordinator coord = MakeCoordinator(specs, pool);
 
-    std::vector<std::string> ch = ContentHashes(
-        {{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}, {4, 4, 4, 4}, {5, 5, 5, 5}});
+    std::vector<std::string> ch =
+        ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}, {4, 4, 4, 4}, {5, 5, 5, 5}});
     std::vector<BlockTable> tables(2);
-    ASSERT_TRUE(coord.Acquire(tables, 24));   // 6 pages each
+    ASSERT_TRUE(coord.Acquire(tables, 24));  // 6 pages each
     // num_computed=20 -> swa skipped = 20-4+1 = 17 -> 17/4 = 4 pages punched:
     // swa slots 0..3 are null holes.
     for (std::int32_t g = 0; g < coord.NumGroups(); ++g) {
@@ -353,7 +352,7 @@ TEST(CoordinatorStepTest, CacheFullBlocksRejectsOutOfRangeFirstSlot) {
 
     std::vector<std::string> ch = ContentHashes({{7, 7, 7, 7}});
     std::vector<BlockTable> tables(2);
-    ASSERT_TRUE(coord.Acquire(tables, 8));   // 2 pages each
+    ASSERT_TRUE(coord.Acquire(tables, 8));  // 2 pages each
     EXPECT_THROW(coord.CacheFullBlocks(tables, ch, /*first_slot=*/2), std::runtime_error);
     EXPECT_THROW(coord.CacheFullBlocks(tables, ch, /*first_slot=*/-1), std::runtime_error);
 }
@@ -480,8 +479,8 @@ TEST(CoordinatorMatchTest, TwoSwaGroupsCascadingShrinkConverges) {
     };
     KvCacheCoordinator coord = MakeCoordinator(specs, pool);
 
-    std::vector<std::string> ch = ContentHashes(
-        {{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}, {4, 4, 4, 4}, {5, 5, 5, 5}});
+    std::vector<std::string> ch =
+        ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}, {4, 4, 4, 4}, {5, 5, 5, 5}});
     for (const std::string& h : ch) CacheForGroup(pool, h, 0);
     CacheForGroup(pool, ch[0], 1);
     CacheForGroup(pool, ch[2], 1);
@@ -513,8 +512,8 @@ TEST(CoordinatorMatchTest, SwaGroupOrderDoesNotChangeConvergedCommon) {
     };
     KvCacheCoordinator coord = MakeCoordinator(specs, pool);
 
-    std::vector<std::string> ch = ContentHashes(
-        {{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}, {4, 4, 4, 4}, {5, 5, 5, 5}});
+    std::vector<std::string> ch =
+        ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}, {4, 4, 4, 4}, {5, 5, 5, 5}});
     for (const std::string& h : ch) CacheForGroup(pool, h, 1);
     CacheForGroup(pool, ch[0], 0);
     CacheForGroup(pool, ch[1], 0);
@@ -719,13 +718,13 @@ TEST(CoordinatorAllocTest, AcquireShortfallLeavesClaimedPrefixForCallerToFree) {
     ASSERT_EQ(hit.num_common_tokens, 4);
 
     std::vector<BlockTable> tables(2);
-    coord.ClaimCommonPrefix(tables, hit);   // claim 1 cached page each (2 blocks)
+    coord.ClaimCommonPrefix(tables, hit);  // claim 1 cached page each (2 blocks)
     EXPECT_EQ(tables[0].NumBlocks(), 1);
     EXPECT_EQ(tables[1].NumBlocks(), 1);
 
     // Uncached 8 tokens -> 2 pages/group = 4 needed; 5 usable - 2 claimed = 3 free -> fail.
     EXPECT_FALSE(coord.Acquire(tables, 8));
-    EXPECT_EQ(tables[0].NumBlocks(), 1);    // claimed prefix still there
+    EXPECT_EQ(tables[0].NumBlocks(), 1);  // claimed prefix still there
     EXPECT_EQ(tables[1].NumBlocks(), 1);
 
     coord.Free(tables);
@@ -753,7 +752,8 @@ TEST(KvCacheCoordinatorReclaimExpired, OnlySlidingWindowGroupEvicts) {
 
     // num_computed_tokens=5 -> swa skipped=5-4+1=2 -> skipped_blocks=2/2=1 -> page 0 evicted.
     for (std::int32_t g = 0; g < coordinator.NumGroups(); ++g) {
-        coordinator.GroupManager(g).ReclaimExpired(pool, tables[static_cast<std::size_t>(g)], /*num_computed_tokens=*/5);
+        coordinator.GroupManager(g).ReclaimExpired(pool, tables[static_cast<std::size_t>(g)],
+                                                   /*num_computed_tokens=*/5);
     }
 
     ASSERT_EQ(tables[0].NumBlocks(), 3);
@@ -778,8 +778,7 @@ TEST(CoordinatorMatchTest, ThreeGroupsCommonIsMinCoverageAcrossAll) {
     };
     KvCacheCoordinator coord = MakeCoordinator(specs, pool);
 
-    std::vector<std::string> ch =
-        ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}});
+    std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}});
     // Shortest window group first in index order: group 2's deeper match trims to
     // group 1's bound inside the sweep (the reverse order would be a cascade).
     for (const std::string& h : ch) CacheForGroup(pool, h, 0);
@@ -880,9 +879,9 @@ std::int32_t SlideCredit(const KvCacheCoordinator& coord, std::span<const BlockT
                          std::int32_t num_computed_tokens) {
     std::int32_t total_freed = 0;
     for (std::int32_t i = 0; i < coord.NumGroups(); ++i) {
-        total_freed += coord.GroupManager(i).BlocksReclaimableAt(
-            tables[static_cast<std::size_t>(i)], num_computed_tokens,
-            /*count_uncached=*/!coord.HasHostTier());
+        total_freed +=
+            coord.GroupManager(i).BlocksReclaimableAt(tables[static_cast<std::size_t>(i)], num_computed_tokens,
+                                                      /*count_uncached=*/!coord.HasHostTier());
     }
     return total_freed;
 }
@@ -1328,8 +1327,8 @@ TEST(MambaStateRegistrationTest, UnalignedEndRegistersNoStatePages) {
     ASSERT_TRUE(coord.Acquire(tables, /*num_tokens=*/14));  // 3 full pages + partial tail
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}});
     coord.CacheFullBlocks(tables, ch, /*first_slot=*/0, /*end_tokens=*/14);  // 14 % 4 != 0
-    EXPECT_NE(pool.GetCachedBlock(MakeKeyWithGroupId(ch[2], 0)), nullptr);  // full group unaffected
-    EXPECT_EQ(pool.GetCachedBlock(MakeKeyWithGroupId(ch[2], 1)), nullptr);  // state group skipped
+    EXPECT_NE(pool.GetCachedBlock(MakeKeyWithGroupId(ch[2], 0)), nullptr);   // full group unaffected
+    EXPECT_EQ(pool.GetCachedBlock(MakeKeyWithGroupId(ch[2], 1)), nullptr);   // state group skipped
     coord.Free(tables);
 }
 

@@ -42,8 +42,8 @@ struct SchedulerConfig;
 // On false (pool short) nothing is acquired but the claimed prefix blocks REMAIN -- caller must FreeRequest.
 // SWA peak = ceil((chunk+W-1)/P) pages (chunk fully resident during its forward; pinned by
 // FlatPrefillPlateauSuite -- shrinking it needs a kernel-level ring buffer).
-bool PrefillFirstChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
-                       const CoordinatorMatch& hit, std::int32_t num_new_tokens);
+bool PrefillFirstChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables, const CoordinatorMatch& hit,
+                       std::int32_t num_new_tokens);
 
 // Appends the host extension to each group's table (null-block slots -> device null, real slots
 // Acquire one page); returns (host_block, device_block) pairs group-major -- the load emission
@@ -59,8 +59,8 @@ bool PrefillChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tabl
                   std::int32_t num_computed_tokens);
 
 bool DecodeStep(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
-                std::span<const std::string> content_hashes, std::int32_t first_page_slot,
-                std::int32_t num_tokens, std::int32_t num_computed_tokens);
+                std::span<const std::string> content_hashes, std::int32_t first_page_slot, std::int32_t num_tokens,
+                std::int32_t num_computed_tokens);
 
 bool FinalizePrefillAndReserveDecode(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
                                      std::span<const std::string> content_hashes, std::int32_t reserve_tokens,
@@ -72,7 +72,7 @@ std::vector<KvCacheSpec> MakeSpecsFromConfig(const SchedulerConfig& config);
 void FreeRequest(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables);
 
 // One row per config group_id (page encoding: BlockTablePageIds).
-std::map<std::string, std::vector<std::int32_t>> BuildFlatBlockTables(
-    const std::vector<BlockTable>& tables, std::span<const std::string> group_ids);
+std::map<std::string, std::vector<std::int32_t>> BuildFlatBlockTables(const std::vector<BlockTable>& tables,
+                                                                      std::span<const std::string> group_ids);
 
 }  // namespace tokenspeed

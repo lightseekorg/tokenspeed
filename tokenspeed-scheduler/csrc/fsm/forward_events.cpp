@@ -208,26 +208,13 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()
     TokenContainer::Window window{.begin = hit_tokens, .size = tokens_this_round_};
     bool is_last_chunk = (window.begin + window.size) == token_container->PrefillSize();
     if (is_last_chunk && role_ != Role::kD) {
-        PrefillDone done{token_container,
-                         state.GetPageSize(),
-                         nullptr,
-                         nullptr,
-                         nullptr,
-                         std::move(req_pool_index),
-                         window,
-                         decode_input_tokens_,
-                         nullptr};
+        PrefillDone done{token_container, state.GetPageSize(),  nullptr, nullptr, nullptr, std::move(req_pool_index),
+                         window,          decode_input_tokens_, nullptr};
         done.SetBlockTables(std::move(tables));
         return done;
     }
-    Prefilling prefilling{token_container,
-                          state.GetPageSize(),
-                          nullptr,
-                          nullptr,
-                          nullptr,
-                          std::move(req_pool_index),
-                          window,
-                          nullptr};
+    Prefilling prefilling{token_container, state.GetPageSize(),       nullptr, nullptr,
+                          nullptr,         std::move(req_pool_index), window,  nullptr};
     prefilling.SetBlockTables(std::move(tables));
     return prefilling;
 #else
@@ -296,9 +283,8 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()
 std::variant<PrefillDone, Prefilling> SchedulePrefillEvent::operator()(Prefilling&& state) {
 #if TOKENSPEED_FLAT_KVCACHE
     _assert(coordinator_ != nullptr, "SchedulePrefillEvent: flat path requires a coordinator");
-    const std::vector<std::string> hashes =
-        FlatWindowPageHashes(state.GetFullPagedTokens(false), state.GetPageSize(), state.window.begin,
-                             state.window.size);
+    const std::vector<std::string> hashes = FlatWindowPageHashes(state.GetFullPagedTokens(false), state.GetPageSize(),
+                                                                 state.window.begin, state.window.size);
     // Prior chunks 0..k-1 (state.window is the PREVIOUS chunk); the gate credited this same slide value.
     const std::int32_t num_computed_tokens = state.window.begin + state.window.size;
 
@@ -384,9 +370,8 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillEvent::operator()(Prefillin
 Decoding ScheduleDecodeEvent::operator()(PrefillDone&& state) {
 #if TOKENSPEED_FLAT_KVCACHE
     _assert(coordinator_ != nullptr, "ScheduleDecodeEvent: flat path requires a coordinator");
-    const std::vector<std::string> hashes =
-        FlatWindowPageHashes(state.GetFullPagedTokens(false), state.GetPageSize(), state.window.begin,
-                             state.window.size);
+    const std::vector<std::string> hashes = FlatWindowPageHashes(state.GetFullPagedTokens(false), state.GetPageSize(),
+                                                                 state.window.begin, state.window.size);
     const std::int32_t reserve = state.GetReserveNumTokensInNextScheduleEvent();
     // Full prefill length (window end == PrefillSize()); the PrefillDone gate credited the same value.
     const std::int32_t num_computed_tokens = state.window.begin + state.window.size;
@@ -396,17 +381,11 @@ Decoding ScheduleDecodeEvent::operator()(PrefillDone&& state) {
         _assert(false, "flat path: allocation failure unsupported in C slice");
     }
 
-    Decoding decoding{state.GetTokenContainer(),
-                      state.GetPageSize(),
-                      nullptr,
-                      nullptr,
-                      nullptr,
-                      std::move(state).TakeReqPoolIndex(),
-                      decode_input_tokens_,
-                      nullptr};
+    Decoding decoding{state.GetTokenContainer(),           state.GetPageSize(),  nullptr, nullptr, nullptr,
+                      std::move(state).TakeReqPoolIndex(), decode_input_tokens_, nullptr};
     decoding.SetBlockTables(std::move(tables));
-    decoding.SetFlatHashChain(FlatHashChain{static_cast<std::int32_t>(hashes.size()),
-                                            hashes.empty() ? std::string{} : hashes.back()});
+    decoding.SetFlatHashChain(
+        FlatHashChain{static_cast<std::int32_t>(hashes.size()), hashes.empty() ? std::string{} : hashes.back()});
     return decoding;
 #else
     auto local_kv_allocator = std::move(state).TakeLocalKVAllocator();
@@ -461,14 +440,8 @@ Decoding ScheduleDecodeEvent::operator()(Decoding&& state) {
         _assert(false, "flat path: allocation failure unsupported in C slice");
     }
 
-    Decoding decoding{state.GetTokenContainer(),
-                      state.GetPageSize(),
-                      nullptr,
-                      nullptr,
-                      nullptr,
-                      std::move(state).TakeReqPoolIndex(),
-                      decode_input_tokens_,
-                      nullptr};
+    Decoding decoding{state.GetTokenContainer(),           state.GetPageSize(),  nullptr, nullptr, nullptr,
+                      std::move(state).TakeReqPoolIndex(), decode_input_tokens_, nullptr};
     decoding.SetBlockTables(std::move(tables));
     decoding.SetFlatHashChain(std::move(chain));
     return decoding;

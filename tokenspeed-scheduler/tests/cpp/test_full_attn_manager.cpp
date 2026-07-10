@@ -121,9 +121,9 @@ TEST(FullAttnManagerTest, ClaimHitBlocksClaimsAndAppends) {
 
     EXPECT_EQ(table.NumBlocks(), 1);
     EXPECT_EQ(table.Blocks()[0]->BlockId(), a.front()->BlockId());
-    EXPECT_EQ(a.front()->RefCount(), 1);          // claimed
-    EXPECT_EQ(pool.NumFreeBlocks(), 6);           // pulled out of free list
-    EXPECT_EQ(table.TailAvailableTokens(), 0);    // hit pages are full
+    EXPECT_EQ(a.front()->RefCount(), 1);        // claimed
+    EXPECT_EQ(pool.NumFreeBlocks(), 6);         // pulled out of free list
+    EXPECT_EQ(table.TailAvailableTokens(), 0);  // hit pages are full
 }
 
 TEST(FullAttnManagerTest, ClaimNoHitsIsNoOp) {
@@ -162,8 +162,8 @@ TEST(FullAttnManagerTest, AcquireUsesTailRoomWithoutNewPage) {
     FullAttnManager mgr(4);
     BlockTable table;
 
-    ASSERT_TRUE(mgr.Acquire(pool, table, 3));   // 1 page, tail_avail 1
-    ASSERT_TRUE(mgr.Acquire(pool, table, 1));   // fits in tail -> no new page
+    ASSERT_TRUE(mgr.Acquire(pool, table, 3));  // 1 page, tail_avail 1
+    ASSERT_TRUE(mgr.Acquire(pool, table, 1));  // fits in tail -> no new page
     EXPECT_EQ(table.NumBlocks(), 1);
     EXPECT_EQ(table.TailAvailableTokens(), 0);
     EXPECT_EQ(pool.NumFreeBlocks(), 6);
@@ -174,7 +174,7 @@ TEST(FullAttnManagerTest, AcquireSpillsAcrossMultiplePages) {
     FullAttnManager mgr(4);
     BlockTable table;
 
-    ASSERT_TRUE(mgr.Acquire(pool, table, 2));   // 1 page, tail_avail 2
+    ASSERT_TRUE(mgr.Acquire(pool, table, 2));  // 1 page, tail_avail 2
     // 7 more tokens: 2 fill the tail, 5 remaining -> ceil(5/4) = 2 new pages.
     ASSERT_TRUE(mgr.Acquire(pool, table, 7));
     EXPECT_EQ(table.NumBlocks(), 3);
@@ -192,7 +192,7 @@ TEST(FullAttnManagerTest, AcquireZeroTokensIsNoOp) {
 }
 
 TEST(FullAttnManagerTest, AcquireAllOrNothingOnShortage) {
-    BlockPool pool(3);   // 2 usable blocks after null reservation
+    BlockPool pool(3);  // 2 usable blocks after null reservation
     FullAttnManager mgr(4);
     BlockTable table;
 
@@ -200,7 +200,7 @@ TEST(FullAttnManagerTest, AcquireAllOrNothingOnShortage) {
     EXPECT_FALSE(mgr.Acquire(pool, table, 12));
     EXPECT_EQ(table.NumBlocks(), 0);
     EXPECT_EQ(table.TailAvailableTokens(), 0);
-    EXPECT_EQ(pool.NumFreeBlocks(), 2);   // nothing consumed
+    EXPECT_EQ(pool.NumFreeBlocks(), 2);  // nothing consumed
 }
 
 TEST(FullAttnManagerTest, CacheFullBlocksMakesPagesPrefixHittable) {
@@ -247,9 +247,9 @@ TEST(FullAttnManagerTest, CacheFullBlocksIsIdempotentAcrossCalls) {
 
     BlockTable a;
     ASSERT_TRUE(mgr.Acquire(pool, a, 4));
-    mgr.CacheFullBlocks(pool, a, std::vector<std::string>{k0});           // page 0 cached
-    ASSERT_TRUE(mgr.Acquire(pool, a, 4));         // grow to page 1
-    mgr.CacheFullBlocks(pool, a, std::vector<std::string>{k0, k1});       // must skip already-cached page 0
+    mgr.CacheFullBlocks(pool, a, std::vector<std::string>{k0});      // page 0 cached
+    ASSERT_TRUE(mgr.Acquire(pool, a, 4));                            // grow to page 1
+    mgr.CacheFullBlocks(pool, a, std::vector<std::string>{k0, k1});  // must skip already-cached page 0
 
     EXPECT_TRUE(a.Blocks()[0]->IsCached());
     EXPECT_TRUE(a.Blocks()[1]->IsCached());
@@ -262,14 +262,14 @@ TEST(FullAttnManagerTest, FreeReturnsPagesAndClearsTable) {
     BlockPool pool(8);
     FullAttnManager mgr(4);
     BlockTable table;
-    ASSERT_TRUE(mgr.Acquire(pool, table, 8));   // 2 pages
+    ASSERT_TRUE(mgr.Acquire(pool, table, 8));  // 2 pages
     EXPECT_EQ(pool.NumFreeBlocks(), 5);
 
     mgr.Free(pool, table);
     EXPECT_EQ(table.NumBlocks(), 0);
     EXPECT_EQ(table.TailAvailableTokens(), 0);
     EXPECT_TRUE(table.Blocks().empty());
-    EXPECT_EQ(pool.NumFreeBlocks(), 7);   // all returned
+    EXPECT_EQ(pool.NumFreeBlocks(), 7);  // all returned
 }
 
 TEST(FullAttnManagerTest, FreedCachedPageStaysPrefixReusable) {
@@ -365,7 +365,7 @@ TEST(FullAttnManagerTest, CacheFullBlocksZeroIsNoOp) {
     BlockTable a;
     ASSERT_TRUE(mgr.Acquire(pool, a, 4));
     std::vector<std::string> no_hashes;
-    mgr.CacheFullBlocks(pool, a, no_hashes);      // nothing to register
+    mgr.CacheFullBlocks(pool, a, no_hashes);  // nothing to register
     EXPECT_FALSE(a.Blocks()[0]->IsCached());
 }
 
@@ -373,7 +373,7 @@ TEST(FullAttnManagerTest, ClaimHitBlocksOnNonEmptyTableAsserts) {
     BlockPool pool(8);
     FullAttnManager mgr(4);
     BlockTable table;
-    ASSERT_TRUE(mgr.Acquire(pool, table, 4));     // table now non-empty
+    ASSERT_TRUE(mgr.Acquire(pool, table, 4));  // table now non-empty
     PrefixMatch empty;
     EXPECT_THROW(mgr.ClaimHitBlocks(pool, table, empty), std::runtime_error);
 }

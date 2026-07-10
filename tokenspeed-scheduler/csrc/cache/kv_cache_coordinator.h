@@ -55,9 +55,7 @@ public:
     std::int32_t LcmBlockSize() const { return lcm_block_size_; }
 
     KvCacheManager& GroupManager(std::int32_t i) { return groups_[static_cast<std::size_t>(i)].Manager(); }
-    const KvCacheManager& GroupManager(std::int32_t i) const {
-        return groups_[static_cast<std::size_t>(i)].Manager();
-    }
+    const KvCacheManager& GroupManager(std::int32_t i) const { return groups_[static_cast<std::size_t>(i)].Manager(); }
 
     // The admission entry: the device match, plus the host-tier match above the device boundary when a
     // host tier is bound. Read-only -- pinning happens at load-ticket build, before the sink drain evicts.
@@ -105,12 +103,10 @@ private:
     // group's block_size / base base pages into one coarse block, then wrap with group_id.
     // first_base is content_hashes[0]'s global base-page index, so a chunk starting mid-grid
     // drops its leading remainder (see MakeFoldedGroupKeys).
-    std::vector<std::string> keysForGroup(std::span<const std::string> content_hashes,
-                                          std::uint32_t group_id, std::int32_t group_block_size,
-                                          std::int32_t first_base = 0) const;
+    std::vector<std::string> keysForGroup(std::span<const std::string> content_hashes, std::uint32_t group_id,
+                                          std::int32_t group_block_size, std::int32_t first_base = 0) const;
     std::vector<std::vector<std::string>> buildGroupKeys(std::span<const std::string> content_hashes) const;
-    CoordinatorMatch matchTierWithKeys(const BlockPool& pool,
-                                       std::span<const std::vector<std::string>> group_keys,
+    CoordinatorMatch matchTierWithKeys(const BlockPool& pool, std::span<const std::vector<std::string>> group_keys,
                                        std::int32_t num_base_pages, std::int32_t floor_tokens) const;
     std::vector<CacheGroup> groups_;
     // Closed groups first, so non-closed groups match against a settled bound.

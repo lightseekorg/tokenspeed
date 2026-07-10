@@ -54,8 +54,7 @@ public:
     // Replace slot `index` with a null hole (slot alignment kept) and return the
     // displaced block for the caller to free; nullptr if already a hole.
     CacheBlock* EvictToNull(std::int32_t index, CacheBlock* null_block) {
-        _assert(0 <= index && index < static_cast<std::int32_t>(blocks_.size()),
-                "EvictToNull index out of range");
+        _assert(0 <= index && index < static_cast<std::int32_t>(blocks_.size()), "EvictToNull index out of range");
         BlockRef& slot = blocks_[static_cast<std::size_t>(index)];
         CacheBlock* old = slot.Get();
         _assert(old != nullptr, "EvictToNull on a moved-out slot");

@@ -47,8 +47,8 @@ public:
     // Right->left scan for a run backing a resumable boundary; slots left of it stay holes.
     PrefixMatch Match(const BlockPool& pool, std::span<const std::string> keys, std::int32_t begin_blocks,
                       std::int32_t max_blocks) const override {
-        const std::int32_t end_blocks = static_cast<std::int32_t>(
-            std::min(keys.size(), static_cast<std::size_t>(std::max(max_blocks, 0))));
+        const std::int32_t end_blocks =
+            static_cast<std::int32_t>(std::min(keys.size(), static_cast<std::size_t>(std::max(max_blocks, 0))));
         PrefixMatch match;
         if (begin_blocks >= end_blocks) {
             return match;

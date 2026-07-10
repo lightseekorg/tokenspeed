@@ -25,8 +25,8 @@
 
 namespace tokenspeed {
 
-bool PrefillFirstChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
-                       const CoordinatorMatch& hit, std::int32_t num_new_tokens) {
+bool PrefillFirstChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables, const CoordinatorMatch& hit,
+                       std::int32_t num_new_tokens) {
     coordinator.ClaimCommonPrefix(tables, hit);
     return coordinator.Acquire(tables, num_new_tokens);
 }
@@ -44,8 +44,8 @@ bool PrefillChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tabl
 }
 
 bool DecodeStep(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
-                std::span<const std::string> content_hashes, std::int32_t first_page_slot,
-                std::int32_t num_tokens, std::int32_t num_computed_tokens) {
+                std::span<const std::string> content_hashes, std::int32_t first_page_slot, std::int32_t num_tokens,
+                std::int32_t num_computed_tokens) {
     // CacheFullBlocks before ReclaimExpired: registration skips null holes, so
     // the reverse order would lose the punched pages' hashes forever.
     // ReclaimExpired before Acquire: the slide's freed pages fund this chunk
@@ -96,10 +96,9 @@ void FreeRequest(KvCacheCoordinator& coordinator, std::vector<BlockTable>& table
     coordinator.Free(tables);
 }
 
-std::map<std::string, std::vector<std::int32_t>> BuildFlatBlockTables(
-    const std::vector<BlockTable>& tables, std::span<const std::string> group_ids) {
-    _assert(tables.size() == group_ids.size(),
-            "BuildFlatBlockTables: tables/group_ids size mismatch");
+std::map<std::string, std::vector<std::int32_t>> BuildFlatBlockTables(const std::vector<BlockTable>& tables,
+                                                                      std::span<const std::string> group_ids) {
+    _assert(tables.size() == group_ids.size(), "BuildFlatBlockTables: tables/group_ids size mismatch");
     std::map<std::string, std::vector<std::int32_t>> out;
     for (std::size_t i = 0; i < tables.size(); ++i) {
         out.emplace(group_ids[i], BlockTablePageIds(tables[i]));

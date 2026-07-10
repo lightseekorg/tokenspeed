@@ -121,8 +121,8 @@ TEST(FlatForwardOperation, PrefillBeforeDecodeKeepsRowsAlignedWithRequests) {
 
 TEST(FlatForwardOperation, GroupKeyUnionAcrossRequestsPadsMissingGroup) {
     std::vector<ForwardOperation> ops;
-    ops.emplace_back(MakePrefill("r0", FlatTable{{"full", {10, 11}}}));        // no "swa"
-    ops.emplace_back(MakePrefill("r1", FlatTable{{"swa", {20, 21, 22}}}));     // no "full"
+    ops.emplace_back(MakePrefill("r0", FlatTable{{"full", {10, 11}}}));     // no "swa"
+    ops.emplace_back(MakePrefill("r1", FlatTable{{"swa", {20, 21, 22}}}));  // no "full"
 
     FlatForwardOperation flat_op{std::move(ops)};
 

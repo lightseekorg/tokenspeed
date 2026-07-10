@@ -107,8 +107,7 @@ TEST(HostTierMatchTest, SwaInteriorBoundaryShrink) {
     CacheBlock* p2 = Put(host_pool, keys[2]);
     CacheBlock* p3 = Put(host_pool, keys[3]);
     // Miss at 4 invalidates boundary 5; boundary 4 needs [1, 4), which hits.
-    EXPECT_EQ(mgr.Match(host_pool, keys, 0, 5).blocks,
-              (std::vector<CacheBlock*>{host_pool.NullBlock(), p1, p2, p3}));
+    EXPECT_EQ(mgr.Match(host_pool, keys, 0, 5).blocks, (std::vector<CacheBlock*>{host_pool.NullBlock(), p1, p2, p3}));
 }
 
 TEST(HostTierMatchTest, SwaShortRunAtBottomSuffices) {

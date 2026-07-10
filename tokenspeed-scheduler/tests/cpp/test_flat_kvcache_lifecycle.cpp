@@ -163,10 +163,8 @@ TEST_F(FlatKvCacheLifecycleTestSuite, TwoRequests_BatchedFlatBlockTables) {
 
     EXPECT_EQ(full.at(0).size(), full.at(1).size());
     EXPECT_EQ(swa.at(0).size(), swa.at(1).size());
-    const bool any_pad = std::any_of(full.at(0).begin(), full.at(0).end(),
-                                     [](std::int32_t id) { return id == -1; }) ||
-                         std::any_of(full.at(1).begin(), full.at(1).end(),
-                                     [](std::int32_t id) { return id == -1; });
+    const bool any_pad = std::any_of(full.at(0).begin(), full.at(0).end(), [](std::int32_t id) { return id == -1; }) ||
+                         std::any_of(full.at(1).begin(), full.at(1).end(), [](std::int32_t id) { return id == -1; });
     EXPECT_TRUE(any_pad) << "unequal prompt lengths should force -1 padding in one full row";
 
     auto assert_no_page_collision = [](const std::vector<std::vector<std::int32_t>>& group) {

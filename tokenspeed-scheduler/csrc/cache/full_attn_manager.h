@@ -43,8 +43,8 @@ public:
 
     PrefixMatch Match(const BlockPool& pool, std::span<const std::string> keys, std::int32_t begin_blocks,
                       std::int32_t max_blocks) const override {
-        const std::int32_t end_blocks = static_cast<std::int32_t>(
-            std::min(keys.size(), static_cast<std::size_t>(std::max(max_blocks, 0))));
+        const std::int32_t end_blocks =
+            static_cast<std::int32_t>(std::min(keys.size(), static_cast<std::size_t>(std::max(max_blocks, 0))));
         PrefixMatch match;
         for (std::int32_t j = begin_blocks; j < end_blocks; ++j) {
             CacheBlock* block = pool.GetCachedBlock(keys[static_cast<std::size_t>(j)]);

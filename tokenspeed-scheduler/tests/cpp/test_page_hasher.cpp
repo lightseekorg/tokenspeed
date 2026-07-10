@@ -37,8 +37,12 @@ using key_span = std::span<const std::string>;
 // all-empty input is two zero u32s (8 zero bytes), whose SHA-256 is below.
 constexpr const char* kEmptyFramedSha256 = "af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc";
 
-token_span Tokens(const std::vector<std::int32_t>& v) { return token_span(v.data(), v.size()); }
-key_span Keys(const std::vector<std::string>& v) { return key_span(v.data(), v.size()); }
+token_span Tokens(const std::vector<std::int32_t>& v) {
+    return token_span(v.data(), v.size());
+}
+key_span Keys(const std::vector<std::string>& v) {
+    return key_span(v.data(), v.size());
+}
 
 // ---- hex helpers --------------------------------------------------------
 
@@ -137,10 +141,9 @@ TEST(HashPageTest, FramingDisambiguatesEmptyPriorFromChainedPage) {
 
     std::vector<std::int32_t> toks(8);
     for (std::size_t i = 0; i < 8; ++i) {
-        toks[i] = static_cast<std::int32_t>(static_cast<uint32_t>(pb[4 * i]) |
-                                            (static_cast<uint32_t>(pb[4 * i + 1]) << 8) |
-                                            (static_cast<uint32_t>(pb[4 * i + 2]) << 16) |
-                                            (static_cast<uint32_t>(pb[4 * i + 3]) << 24));
+        toks[i] = static_cast<std::int32_t>(
+            static_cast<uint32_t>(pb[4 * i]) | (static_cast<uint32_t>(pb[4 * i + 1]) << 8) |
+            (static_cast<uint32_t>(pb[4 * i + 2]) << 16) | (static_cast<uint32_t>(pb[4 * i + 3]) << 24));
     }
     std::vector<std::int32_t> none;
     std::string as_page0 = HashPage(Tokens(toks), "");
@@ -158,8 +161,7 @@ TEST(HashPageTest, FramingDisambiguatesTokensFromExtraKeys) {
     std::vector<std::int32_t> long_toks = {9, 8, 1, 4, 0x7a797877};
     std::vector<std::string> no_keys;
 
-    EXPECT_NE(HashPage(Tokens(short_toks), "", Keys(one_key)),
-              HashPage(Tokens(long_toks), "", Keys(no_keys)));
+    EXPECT_NE(HashPage(Tokens(short_toks), "", Keys(one_key)), HashPage(Tokens(long_toks), "", Keys(no_keys)));
 }
 
 // ---- ComputePagedHashes (chaining) -------------------------------------

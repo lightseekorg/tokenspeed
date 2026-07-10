@@ -83,8 +83,7 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
                                    CoordinatorMatch flat_hit = {},
                                    // Host-tier match above flat_hit's boundary (read-only; the
                                    // load emission pins both sides when it builds the ticket).
-                                   CoordinatorMatch flat_host = {},
-                                   std::vector<std::string> flat_ext_hashes = {}
+                                   CoordinatorMatch flat_host = {}, std::vector<std::string> flat_ext_hashes = {}
 #endif
                                    )
         : tokens_this_round_(tokens_this_round),
@@ -106,7 +105,8 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
           flat_host_(std::move(flat_host)),
           flat_ext_hashes_(std::move(flat_ext_hashes))
 #endif
-    {}
+    {
+    }
 
     // Returns PrefillDone (single-chunk or last chunk) or Prefilling (more chunks remain).
     std::variant<PrefillDone, Prefilling> operator()(Submitted&& state);
@@ -118,9 +118,7 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
 
 #if TOKENSPEED_FLAT_KVCACHE
     // Post-apply channel for the scheduler's LoadBack emission (transition fills the pairs).
-    std::vector<std::pair<CacheBlock*, CacheBlock*>> TakeFlatLoadPairs() {
-        return std::exchange(flat_load_pairs_, {});
-    }
+    std::vector<std::pair<CacheBlock*, CacheBlock*>> TakeFlatLoadPairs() { return std::exchange(flat_load_pairs_, {}); }
 #endif
 
 private:
@@ -161,7 +159,8 @@ struct SchedulePrefillEvent : InvalidTransitionHandler<SchedulePrefillEvent> {
           ,
           coordinator_(coordinator)
 #endif
-    {}
+    {
+    }
 
     // Returns PrefillDone (last chunk) or Prefilling (more chunks remain).
     std::variant<PrefillDone, Prefilling> operator()(Prefilling&& state);
@@ -184,12 +183,14 @@ struct ScheduleDecodeEvent : InvalidTransitionHandler<ScheduleDecodeEvent> {
                         KvCacheCoordinator* coordinator = nullptr
 #endif
                         )
-        : decode_input_tokens_(decode_input_tokens), hybrid_prefix_cache_(hybrid_prefix_cache)
+        : decode_input_tokens_(decode_input_tokens),
+          hybrid_prefix_cache_(hybrid_prefix_cache)
 #if TOKENSPEED_FLAT_KVCACHE
           ,
           coordinator_(coordinator)
 #endif
-    {}
+    {
+    }
 
     Decoding operator()(PrefillDone&& state);
     Decoding operator()(Decoding&& state);
@@ -257,7 +258,8 @@ struct FinishEvent : InvalidTransitionHandler<FinishEvent> {
           ,
           coordinator_(coordinator)
 #endif
-    {}
+    {
+    }
 
     // Returns Draining (needs device→host writeback) or Finished.
     std::variant<Draining, Finished> operator()(Decoding&& state);
