@@ -33,10 +33,6 @@ import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 
 
-def _next_pow2(x: int) -> int:
-    return 1 << (x - 1).bit_length()
-
-
 @gluon.jit
 def _add(a, b):
     return a + b
@@ -192,7 +188,7 @@ def moe_align_block_size_device(
 
     EM_max = N + num_experts * block_m
     nb_max = EM_max // block_m + 1
-    BLOCK_E = _next_pow2(num_experts + 1)  # +1 so the dump bin is in-range
+    BLOCK_E = triton.next_power_of_2(num_experts + 1)  # +1 so the dump bin is in-range
 
     sti = torch.empty(EM_max, dtype=torch.int32, device=device)
     sw = torch.empty(EM_max, dtype=torch.float32, device=device)
