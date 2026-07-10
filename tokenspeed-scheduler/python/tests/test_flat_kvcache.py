@@ -141,14 +141,14 @@ def test_decode_slides_swa_window_to_null_hole():
     full_row = list(tables["full"][0])
     # page id 0 is the reserved null-block sentinel: >0 means a real page, 0
     # means a hole. The full-history group should never develop a hole.
-    assert all(page_id > 0 for page_id in full_row), (
-        "full row should keep history with no null/padding hole"
-    )
+    assert all(
+        page_id > 0 for page_id in full_row
+    ), "full row should keep history with no null/padding hole"
 
     swa_row = list(tables["swa"][0])
-    assert 0 in swa_row, (
-        "swa row should contain a null hole after the sliding window slides"
-    )
+    assert (
+        0 in swa_row
+    ), "swa row should contain a null hole after the sliding window slides"
 
 
 def test_two_groups_use_disjoint_pages():
@@ -164,6 +164,6 @@ def test_two_groups_use_disjoint_pages():
     swa_pages = {page_id for page_id in tables["swa"][0] if page_id > 0}
     assert full_pages, "full row should hold at least one real page"
     assert swa_pages, "swa row should hold at least one real page"
-    assert full_pages.isdisjoint(swa_pages), (
-        "groups share a BlockPool but must not double-allocate physical pages"
-    )
+    assert full_pages.isdisjoint(
+        swa_pages
+    ), "groups share a BlockPool but must not double-allocate physical pages"

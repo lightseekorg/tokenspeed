@@ -163,9 +163,7 @@ class PoollessFlatMetadataTest(unittest.TestCase):
         backend = MambaAttnBackend(config)
         stub_pool = SimpleNamespace(
             state_slabs=[(object(), object())],
-            paged_cache_group_specs=(
-                SimpleNamespace(group_id="linear_attention"),
-            ),
+            paged_cache_group_specs=(SimpleNamespace(group_id="linear_attention"),),
             page_size=self.P,
         )
         # set_pool is intentionally never called: flat mode has no
@@ -318,11 +316,12 @@ class GDNFlatStatePagingGPUTest(unittest.TestCase):
     def test_flat_paged_states_match_fla_oracle(self):
         torch = self.torch
         ForwardMode = self.ForwardMode
-        from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
-            causal_conv1d_fn,
-        )
         from tokenspeed_kernel.ops.attention.triton.linear.chunk import (
             chunk_gated_delta_rule,
+        )
+
+        from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
+            causal_conv1d_fn,
         )
         from tokenspeed.runtime.layers.attention.linear.gdn import fused_gdn_gating
 
@@ -334,8 +333,7 @@ class GDNFlatStatePagingGPUTest(unittest.TestCase):
 
         mixed_full = torch.randn(total, conv_dim, device="cuda", dtype=torch.bfloat16)
         conv_weights = (
-            torch.randn(conv_dim, self.WIDTH, device="cuda", dtype=torch.bfloat16)
-            * 0.1
+            torch.randn(conv_dim, self.WIDTH, device="cuda", dtype=torch.bfloat16) * 0.1
         )
         bias = torch.randn(conv_dim, device="cuda", dtype=torch.bfloat16) * 0.1
         A_log = torch.randn(H, device="cuda", dtype=torch.float32) * 0.1
@@ -372,9 +370,7 @@ class GDNFlatStatePagingGPUTest(unittest.TestCase):
             v=v_ref,
             g=g_ref,
             beta=beta_ref,
-            initial_state=torch.zeros(
-                1, H, D, D, device="cuda", dtype=torch.float32
-            ),
+            initial_state=torch.zeros(1, H, D, D, device="cuda", dtype=torch.float32),
             output_final_state=True,
             cu_seqlens=torch.tensor([0, total], device="cuda").long(),
             head_first=False,
@@ -386,9 +382,7 @@ class GDNFlatStatePagingGPUTest(unittest.TestCase):
         conv_slab = torch.zeros(
             num_pages, conv_dim, self.WIDTH - 1, device="cuda", dtype=torch.bfloat16
         )
-        ssm_slab = torch.zeros(
-            num_pages, H, D, D, device="cuda", dtype=torch.float32
-        )
+        ssm_slab = torch.zeros(num_pages, H, D, D, device="cuda", dtype=torch.float32)
         backend = self._make_backend(conv_slab, ssm_slab)
 
         req_pool_indices = torch.tensor([1], dtype=torch.int32, device="cuda")
@@ -420,12 +414,8 @@ class GDNFlatStatePagingGPUTest(unittest.TestCase):
                 )
             },
         )
-        self.assertEqual(
-            backend.forward_metadata.state_in_pages.tolist(), [0]
-        )
-        self.assertEqual(
-            backend.forward_metadata.state_out_pages.tolist(), [2]
-        )
+        self.assertEqual(backend.forward_metadata.state_in_pages.tolist(), [0])
+        self.assertEqual(backend.forward_metadata.state_out_pages.tolist(), [2])
         outputs = [
             backend.forward_extend(
                 None,

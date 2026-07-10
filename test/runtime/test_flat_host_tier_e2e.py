@@ -183,9 +183,7 @@ class TestFlatHostTierE2E(unittest.TestCase):
         engine = _make_engine(host_tier=True)
         try:
             capacity = int(engine.scheduler_info["max_total_num_tokens"])
-            num_prompts = math.ceil(
-                _TARGET_POOL_FILL * capacity / _APPROX_ALLOC_TOKENS
-            )
+            num_prompts = math.ceil(_TARGET_POOL_FILL * capacity / _APPROX_ALLOC_TOKENS)
             if not _NUM_PROMPTS_MIN <= num_prompts <= _NUM_PROMPTS_MAX:
                 self.skipTest(
                     f"measured device pool ({capacity} tokens) needs "
@@ -228,14 +226,10 @@ class TestFlatHostTierE2E(unittest.TestCase):
         try:
             ctrl_capacity = int(engine.scheduler_info["max_total_num_tokens"])
             print(f"[device only] max_total_num_tokens={ctrl_capacity}")
-            r1_ctrl, r2_ctrl, _, _ = _measure_arm(
-                engine, num_prompts, "device only"
-            )
+            r1_ctrl, r2_ctrl, _, _ = _measure_arm(engine, num_prompts, "device only")
         finally:
             engine.shutdown()
-        self.assertEqual(
-            r1_ctrl, 0, f"control round 1 must be cold, got {r1_ctrl:.3f}"
-        )
+        self.assertEqual(r1_ctrl, 0, f"control round 1 must be cold, got {r1_ctrl:.3f}")
         # ~1.44x fill + same-order revisit recycles every cached prefix
         # before reuse; 0.2 is the collapse bound (expected ~0).
         self.assertLessEqual(

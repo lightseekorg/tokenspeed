@@ -22,9 +22,7 @@ _CONFIGS_DIR = (
 
 
 def _load(mod_name: str, file_name: str):
-    spec = importlib.util.spec_from_file_location(
-        mod_name, _CONFIGS_DIR / file_name
-    )
+    spec = importlib.util.spec_from_file_location(mod_name, _CONFIGS_DIR / file_name)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     # Register before exec: on py3.9 @dataclass + `from __future__ import

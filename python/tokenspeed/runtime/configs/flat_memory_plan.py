@@ -9,12 +9,12 @@ covers them (vLLM align); linear rows pad to the widest at binding time.
 plan_tensors then pairs physical slot j with the j-th layer of every
 group over a single page-id space and sizes each slab from the budget.
 """
+
 from __future__ import annotations
 
 import math
 from collections import defaultdict
 from dataclasses import dataclass, replace
-
 
 # Labels whose group is state-family (recurrent state rows, not KV history).
 # Deliberate one-line duplicate of paged_cache_spec.STATE_LAYER_TYPES: both
@@ -198,9 +198,7 @@ class FlatMemoryPlan:
 
 def plan_tensors(components, *, block_size, alignment, budget_bytes):
     """Pair slot j with the j-th layer of every group over one page-id space."""
-    geo = solve_page_geometry(
-        components, block_size=block_size, alignment=alignment
-    )
+    geo = solve_page_geometry(components, block_size=block_size, alignment=alignment)
     layers_by_group: dict[str, list[int]] = {}
     for c in components:
         layers = layers_by_group.setdefault(c.group_id, [])

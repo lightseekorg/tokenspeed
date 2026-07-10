@@ -101,9 +101,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             tuple(conv_state_shape) if conv_state_shape is not None else None
         )
         self._temporal_state_shape = (
-            tuple(temporal_state_shape)
-            if temporal_state_shape is not None
-            else None
+            tuple(temporal_state_shape) if temporal_state_shape is not None else None
         )
         self._conv_dtype = conv_dtype if conv_dtype is not None else dtype
         self._ssm_dtype = ssm_dtype if ssm_dtype is not None else dtype
@@ -117,10 +115,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             # allocator's back).
             equalized = equalized_block_size(
                 layer_types=list(self._layer_types),
-                kv_bytes_per_slot=2
-                * head_num
-                * head_dim
-                * self.store_dtype.itemsize,
+                kv_bytes_per_slot=2 * head_num * head_dim * self.store_dtype.itemsize,
                 state_const_bytes=state_const_bytes(
                     self._conv_state_shape,
                     self._conv_dtype,
@@ -233,12 +228,10 @@ class MHATokenToKVPool(BaseTokenToKVPool):
                 k_slabs = [_alloc() for _ in range(self._slab_group_size)]
                 v_slabs = [_alloc() for _ in range(self._slab_group_size)]
                 self.k_buffer = [
-                    k_slabs[pair_index[layer_id]]
-                    for layer_id in range(self.layer_num)
+                    k_slabs[pair_index[layer_id]] for layer_id in range(self.layer_num)
                 ]
                 self.v_buffer = [
-                    v_slabs[pair_index[layer_id]]
-                    for layer_id in range(self.layer_num)
+                    v_slabs[pair_index[layer_id]] for layer_id in range(self.layer_num)
                 ]
                 # Gates event_loop's retraction offload (built even with the
                 # kvstore off): per-layer host copies would alias shared slabs.
@@ -300,9 +293,9 @@ class MHATokenToKVPool(BaseTokenToKVPool):
                 and self._temporal_state_shape is not None
                 and paged_cache_spec.scheduler_ext_flat_kvcache()
             ):
-                assert self.size % self.page_size == 0, (
-                    "flat pool size must be whole pages"
-                )
+                assert (
+                    self.size % self.page_size == 0
+                ), "flat pool size must be whole pages"
                 self.num_pages_with_null = self.size // self.page_size + 1
                 self.state_slabs: list[tuple[torch.Tensor, torch.Tensor]] = [
                     (
@@ -520,9 +513,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
-    def get_state_buffers(
-        self, layer_id: int
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def get_state_buffers(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
         """(conv, ssm) state slab pair for a state layer; the n-th state
         layer (within-state-label occurrence order, the slab pairing order)
         binds pair n. Raises ValueError for non-state layers."""

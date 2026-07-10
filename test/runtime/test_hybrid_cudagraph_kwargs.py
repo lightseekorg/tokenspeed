@@ -53,9 +53,7 @@ class _NamedExtraBackend:
     def __init__(self):
         self.calls = []
 
-    def init_cuda_graph_state(
-        self, max_bs, seq_lens_buf, paged_cache_group_specs=None
-    ):
+    def init_cuda_graph_state(self, max_bs, seq_lens_buf, paged_cache_group_specs=None):
         self.calls.append((max_bs, seq_lens_buf, paged_cache_group_specs))
 
 

@@ -744,18 +744,18 @@ class MHAAttnBackend(AttentionBackend):
         extend_lens = [int(x) for x in extend_seq_lens_cpu.tolist()]
         out = {gid: [] for gid in page_tables}
         for i, (start, num_new) in enumerate(zip(prefix_lens, extend_lens)):
-            pos = torch.arange(
-                start, start + num_new, dtype=torch.int64, device=device
-            )
+            pos = torch.arange(start, start + num_new, dtype=torch.int64, device=device)
             page_idx = pos // page_size
             off = (pos % page_size).to(torch.int32)
             for gid, table in page_tables.items():
                 pages = table[i].gather(0, page_idx)
                 out[gid].append(pages * page_size + off)
         return {
-            gid: torch.cat(chunks)
-            if chunks
-            else torch.empty(0, dtype=torch.int32, device=device)
+            gid: (
+                torch.cat(chunks)
+                if chunks
+                else torch.empty(0, dtype=torch.int32, device=device)
+            )
             for gid, chunks in out.items()
         }
 
@@ -771,13 +771,13 @@ class MHAAttnBackend(AttentionBackend):
         for gid, locs in out_cache_locs.items():
             pages = (locs // page_size).to(torch.int32)
             table = page_tables[gid]
-            assert (pages != 0).all(), (
-                f"flat write loc in null page 0 for group {gid!r}"
-            )
+            assert (
+                pages != 0
+            ).all(), f"flat write loc in null page 0 for group {gid!r}"
             real = table[table > 0]
-            assert torch.isin(pages, real).all(), (
-                f"flat write pages escape group {gid!r}'s table"
-            )
+            assert torch.isin(
+                pages, real
+            ).all(), f"flat write pages escape group {gid!r}'s table"
 
     def _forward_prefill(
         self,

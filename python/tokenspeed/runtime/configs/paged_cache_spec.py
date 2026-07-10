@@ -167,8 +167,7 @@ def validate_flat_scheduler_config(
                 "mamba/state-only pools)"
             )
             action = (
-                "Use a radix-built tokenspeed_scheduler extension for this "
-                "model."
+                "Use a radix-built tokenspeed_scheduler extension for this " "model."
             )
         raise RuntimeError(
             "flat scheduler build (TOKENSPEED_FLAT_KVCACHE) requires at least "
@@ -352,9 +351,11 @@ def _layer_specs(
     multi_window = len(distinct) > 1
     return [
         (
-            f"{label}_{window}"
-            if multi_window and retention == "sliding_window"
-            else label,
+            (
+                f"{label}_{window}"
+                if multi_window and retention == "sliding_window"
+                else label
+            ),
             retention,
             window,
         )

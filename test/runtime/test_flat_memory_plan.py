@@ -22,9 +22,7 @@ _CONFIGS_DIR = (
 
 
 def _load(mod_name: str, file_name: str):
-    spec = importlib.util.spec_from_file_location(
-        mod_name, _CONFIGS_DIR / file_name
-    )
+    spec = importlib.util.spec_from_file_location(mod_name, _CONFIGS_DIR / file_name)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     # Register before exec: on py3.9 @dataclass + `from __future__ import
@@ -219,9 +217,7 @@ class PlanTensorsTest(unittest.TestCase):
         geo = plan.geometry
         self.assertEqual(geo.block_size, 100)  # 等化继承 B2:state 100KiB / 1KiB
         self.assertEqual(geo.block_bytes, 100 * 1024)
-        self.assertEqual(
-            geo.num_blocks, 100 * 1024 * 1024 // (2 * 100 * 1024)
-        )  # 512
+        self.assertEqual(geo.num_blocks, 100 * 1024 * 1024 // (2 * 100 * 1024))  # 512
         for t in plan.tensors:
             self.assertEqual(t.nbytes, geo.num_blocks * geo.block_bytes)
 
@@ -289,9 +285,7 @@ class GptOssEquivalenceTest(unittest.TestCase):
             for i in range(24)
         ]
         budget = 10 * 1024**3
-        plan = plan_tensors(
-            comps, block_size=16, alignment=4, budget_bytes=budget
-        )
+        plan = plan_tensors(comps, block_size=16, alignment=4, budget_bytes=budget)
         legacy_pages = budget // (24 * 16 * 1024)  # M12 别名:24 物理槽 × 页字节
         self.assertEqual(plan.geometry.num_blocks, legacy_pages)
 
@@ -325,8 +319,9 @@ class ComponentsFromLayersTest(unittest.TestCase):
             kv_bytes_per_slot=1024,
             state_const_bytes={"conv": 40 * 1024, "ssm": 60 * 1024},
         )
-        plan = plan_tensors(comps, block_size=16, alignment=4,
-                            budget_bytes=100 * 1024 * 1024)
+        plan = plan_tensors(
+            comps, block_size=16, alignment=4, budget_bytes=100 * 1024 * 1024
+        )
         self.assertEqual(plan.geometry.block_size, 100)  # inflated by the state row
 
 

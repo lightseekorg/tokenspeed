@@ -168,7 +168,6 @@ class FlatMemoryExecutorTest(unittest.TestCase):
     def setUp(self):
         try:
             import torch
-
             from tokenspeed_scheduler import Cache
 
             from tokenspeed.runtime.cache.executor.flat_memory_executor import (
@@ -211,9 +210,7 @@ class FlatMemoryExecutorTest(unittest.TestCase):
             return self.MHATokenToKVPool(**kwargs)
 
     def _executor(self, pool):
-        return self.FlatMemoryExecutor(
-            device_pool=pool, host_ratio=2.0, host_size_gb=0
-        )
+        return self.FlatMemoryExecutor(device_pool=pool, host_ratio=2.0, host_size_gb=0)
 
     def _fill_device_pages(self, mirror, device_pages):
         p = mirror.page_size
@@ -357,10 +354,7 @@ class FlatMemoryExecutorTest(unittest.TestCase):
 
     def _snapshot_spans(self, mirror, device_pages):
         return [
-            {
-                d: dev[d * span : (d + 1) * span].cpu().clone()
-                for d in device_pages
-            }
+            {d: dev[d * span : (d + 1) * span].cpu().clone() for d in device_pages}
             for (dev, _), span in zip(mirror.tensor_pairs, mirror.row_spans)
         ]
 
@@ -453,9 +447,7 @@ class FlatMemoryExecutorTest(unittest.TestCase):
         executor.flush()
         results = self._drain(executor, 2)
         kinds = {type(r).__name__: int(r.op_id) for r in results}
-        self.assertEqual(
-            kinds, {"WriteBackDoneEvent": 11, "LoadBackDoneEvent": 12}
-        )
+        self.assertEqual(kinds, {"WriteBackDoneEvent": 11, "LoadBackDoneEvent": 12})
 
 
 if __name__ == "__main__":

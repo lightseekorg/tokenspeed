@@ -226,9 +226,7 @@ class InitForwardMetadataAssemblyTest(_MHACase):
         self.assertIs(md.page_tables, tables)
         self.assertEqual(md.out_cache_locs["sliding_attention"].tolist(), [14, 13])
         self.assertEqual(md.out_cache_locs["full_attention"].tolist(), [6, 17])
-        self.assertEqual(
-            md.out_cache_locs["full_attention"].dtype, self.torch.int32
-        )
+        self.assertEqual(md.out_cache_locs["full_attention"].dtype, self.torch.int32)
 
     def test_decode_assembly_none_without_flat_tables(self):
         torch = self.torch
@@ -250,16 +248,12 @@ class InitForwardMetadataAssemblyTest(_MHACase):
         }
         seq_lens = torch.tensor([5, 2], dtype=torch.int32)
         prefix = torch.tensor([2, 0], dtype=torch.int32)
-        self._init(
-            _extend_forward_mode(), seq_lens, tables, extend_prefix_lens=prefix
-        )
+        self._init(_extend_forward_mode(), seq_lens, tables, extend_prefix_lens=prefix)
         md = self.backend.forward_extend_metadata
         self.assertIs(md.page_tables, tables)
         # Same hand-derived layout as the formula test: request-order flatten.
         self.assertEqual(md.out_cache_locs["full_attention"].tolist(), [4, 5, 6, 8, 9])
-        self.assertEqual(
-            md.out_cache_locs["full_attention"].dtype, self.torch.int32
-        )
+        self.assertEqual(md.out_cache_locs["full_attention"].dtype, self.torch.int32)
         # Non-draft extend never fills decode metadata.
         self.assertIsNone(self.backend.forward_decode_metadata)
 
@@ -336,9 +330,7 @@ class SelectOutCacheLocTest(_MHACase):
     def test_public_select_uses_decode_metadata(self):
         torch = self.torch
         self.backend.forward_decode_metadata = SimpleNamespace(
-            out_cache_locs={
-                "full_attention": torch.tensor([6], dtype=torch.int32)
-            }
+            out_cache_locs={"full_attention": torch.tensor([6], dtype=torch.int32)}
         )
         got = self.backend.select_out_cache_loc(
             SimpleNamespace(group_id="full_attention"),
@@ -437,16 +429,12 @@ class GraphLocBuffersTest(_MHACase):
             ptrs,
             {
                 gid: buf.data_ptr()
-                for gid, buf in (
-                    self.backend.cuda_graph_flat_out_cache_locs.items()
-                )
+                for gid, buf in (self.backend.cuda_graph_flat_out_cache_locs.items())
             },
         )
         for gid in _GROUP_IDS:
             self.assertEqual(tuple(second.out_cache_locs[gid].shape), (3,))
-            self.assertEqual(
-                second.out_cache_locs[gid].data_ptr(), ptrs[gid]
-            )
+            self.assertEqual(second.out_cache_locs[gid].data_ptr(), ptrs[gid])
 
     def test_replay_computes_locs_from_persistent_tables(self):
         torch = self.torch

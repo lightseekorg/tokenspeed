@@ -240,10 +240,7 @@ class FlatHostMirrorStateSlabTest(unittest.TestCase):
 
     def _snapshot(self, mirror, device_pages):
         return [
-            {
-                d: dev[d * span : (d + 1) * span].cpu().clone()
-                for d in device_pages
-            }
+            {d: dev[d * span : (d + 1) * span].cpu().clone() for d in device_pages}
             for (dev, _), span in zip(mirror.tensor_pairs, mirror.row_spans)
         ]
 
@@ -318,9 +315,7 @@ class FlatHostMirrorStateSlabTest(unittest.TestCase):
         self.assertIsNone(mirror.state_tensor_indices_of_layer(1))
         self.assertIsNone(mirror.state_tensor_indices_of_layer(3))
         # Pools without state slabs expose no state indices for any layer.
-        kv_only = self.FlatHostMirror(
-            self._pool(with_state=False), num_host_pages=2
-        )
+        kv_only = self.FlatHostMirror(self._pool(with_state=False), num_host_pages=2)
         for layer_id in range(4):
             self.assertIsNone(kv_only.state_tensor_indices_of_layer(layer_id))
 

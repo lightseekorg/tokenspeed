@@ -73,9 +73,7 @@ def flat_num_host_pages(
       ``int(device_pool_size * host_ratio) // page_size + 1``.
     """
     if bytes_per_host_page <= 0:
-        raise ValueError(
-            f"bytes_per_host_page must be > 0, got {bytes_per_host_page}"
-        )
+        raise ValueError(f"bytes_per_host_page must be > 0, got {bytes_per_host_page}")
     if page_size <= 0:
         raise ValueError(f"page_size must be > 0, got {page_size}")
     if host_size_gb > 0:
@@ -188,9 +186,7 @@ class FlatMemoryExecutor:
 
     def submit_plan(self, plan) -> None:
         if plan.cache:
-            logger.debug(
-                "[cache_op] flat submit_plan: %s cache ops", len(plan.cache)
-            )
+            logger.debug("[cache_op] flat submit_plan: %s cache ops", len(plan.cache))
         for op in plan.cache:
             self.submit(op)
         self.flush()

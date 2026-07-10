@@ -13,8 +13,8 @@ register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 def _import_backend():
     from tokenspeed.runtime.layers.attention.backends.mha import (
-        MHADecodeMetadata,
         MHAAttnBackend,
+        MHADecodeMetadata,
     )
 
     return MHAAttnBackend, MHADecodeMetadata
@@ -56,9 +56,7 @@ class SelectPageTableTest(unittest.TestCase):
         meta = self._decode_meta(
             page_tables={"full_attention": full, "sliding_attention": swa}
         )
-        out_full = self.backend._select_page_table(
-            self._layer("full_attention"), meta
-        )
+        out_full = self.backend._select_page_table(self._layer("full_attention"), meta)
         out_swa = self.backend._select_page_table(
             self._layer("sliding_attention"), meta
         )
@@ -90,9 +88,7 @@ class SelectPageTableTest(unittest.TestCase):
         # A group-unaware layer cannot pick between multiple groups:
         # clear error, no silent fallback.
         with self.assertRaisesRegex(KeyError, "group_id=''"):
-            self.backend._select_page_table(
-                self._layer(""), self._multi_group_meta()
-            )
+            self.backend._select_page_table(self._layer(""), self._multi_group_meta())
 
 
 class ValidatePagedCacheGroupIdsTest(unittest.TestCase):

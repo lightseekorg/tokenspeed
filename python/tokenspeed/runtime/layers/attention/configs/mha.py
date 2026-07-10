@@ -82,9 +82,10 @@ class MHAConfig(BaseAttnConfig):
         sliding_window_tokens = getattr(hf_config, "sliding_window", None)
         conv_state_shape = temporal_state_shape = None
         conv_dtype = ssm_dtype = None
-        if any(
-            label in STATE_LAYER_TYPES for label in layer_types
-        ) and scheduler_ext_flat_kvcache():
+        if (
+            any(label in STATE_LAYER_TYPES for label in layer_types)
+            and scheduler_ext_flat_kvcache()
+        ):
             # GDN hybrid on the flat ext: the KV pool owns the recurrent
             # state (state slabs), so it needs the mamba2 shapes/dtypes.
             # Radix branch untouched: SimpleMambaPool owns the state there.

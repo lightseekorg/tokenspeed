@@ -88,9 +88,7 @@ class FlatHostMirror:
 
         k_index = {id(t): i for i, t in enumerate(k_tensors)}
         v_index = {id(t): i for i, t in enumerate(v_tensors)}
-        self._layer_to_k_index = [
-            k_index[id(t)] for t in device_kv_pool.k_buffer
-        ]
+        self._layer_to_k_index = [k_index[id(t)] for t in device_kv_pool.k_buffer]
         # Invariant D2 relies on: a layer's V tensor sits at
         # tensor_index_of_layer(layer) + num_k_tensors.
         assert self._layer_to_k_index == [
@@ -135,8 +133,8 @@ class FlatHostMirror:
             )
             for dev in state_tensors
         ]
-        self.tensor_pairs: tuple[tuple[torch.Tensor, torch.Tensor], ...] = (
-            tuple(kv_pairs + state_pairs)
+        self.tensor_pairs: tuple[tuple[torch.Tensor, torch.Tensor], ...] = tuple(
+            kv_pairs + state_pairs
         )
         # Rows one page spans on each pair: page_size token rows for KV,
         # one page-indexed snapshot row for state slabs.
@@ -149,9 +147,7 @@ class FlatHostMirror:
         share the index); its V tensor is at index + num_k_tensors."""
         return self._layer_to_k_index[layer_id]
 
-    def state_tensor_indices_of_layer(
-        self, layer_id: int
-    ) -> tuple[int, int] | None:
+    def state_tensor_indices_of_layer(self, layer_id: int) -> tuple[int, int] | None:
         """(conv_idx, ssm_idx) of layer_id's state slab pair in tensor_pairs
         (conv immediately precedes its ssm), or None for layers without
         state."""

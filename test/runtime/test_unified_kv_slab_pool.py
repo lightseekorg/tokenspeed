@@ -36,9 +36,7 @@ _CONFIGS_DIR = (
 
 
 def _load(mod_name: str, file_name: str):
-    spec = importlib.util.spec_from_file_location(
-        mod_name, _CONFIGS_DIR / file_name
-    )
+    spec = importlib.util.spec_from_file_location(mod_name, _CONFIGS_DIR / file_name)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     # Register before exec: on py3.9 @dataclass + `from __future__ import
@@ -62,35 +60,27 @@ class HybridSlabGroupSizeTest(unittest.TestCase):
     def _flat_ext(self, value: bool):
         # The predicate resolves the probe from its own module globals at
         # call time, so the patch must target the path-loaded module.
-        with mock.patch.object(
-            _pcs, "scheduler_ext_flat_kvcache", return_value=value
-        ):
+        with mock.patch.object(_pcs, "scheduler_ext_flat_kvcache", return_value=value):
             yield
 
     def test_gpt_oss_shape_returns_group_size(self):
         # gpt-oss: 12 sliding + 12 full, alternating -> 12 layers per group.
         with self._flat_ext(True):
             self.assertEqual(
-                hybrid_slab_group_size(
-                    GPT_OSS_LAYER_TYPES, speculative_enabled=False
-                ),
+                hybrid_slab_group_size(GPT_OSS_LAYER_TYPES, speculative_enabled=False),
                 12,
             )
 
     def test_none_when_radix_ext(self):
         with self._flat_ext(False):
             self.assertIsNone(
-                hybrid_slab_group_size(
-                    GPT_OSS_LAYER_TYPES, speculative_enabled=False
-                )
+                hybrid_slab_group_size(GPT_OSS_LAYER_TYPES, speculative_enabled=False)
             )
 
     def test_none_when_speculative(self):
         with self._flat_ext(True):
             self.assertIsNone(
-                hybrid_slab_group_size(
-                    GPT_OSS_LAYER_TYPES, speculative_enabled=True
-                )
+                hybrid_slab_group_size(GPT_OSS_LAYER_TYPES, speculative_enabled=True)
             )
 
     def test_none_when_single_group(self):
@@ -104,28 +94,20 @@ class HybridSlabGroupSizeTest(unittest.TestCase):
     def test_none_when_unequal_groups(self):
         lt = ("sliding_attention",) * 8 + ("full_attention",) * 16
         with self._flat_ext(True):
-            self.assertIsNone(
-                hybrid_slab_group_size(lt, speculative_enabled=False)
-            )
+            self.assertIsNone(hybrid_slab_group_size(lt, speculative_enabled=False))
 
     def test_none_when_unknown_label(self):
         # Unknown input degrades to None (safe legacy layout), never raises;
         # loud rejection is group_specs_from_layer_types' job.
         lt = GPT_OSS_LAYER_TYPES + ("banana_attention",)
         with self._flat_ext(True):
-            self.assertIsNone(
-                hybrid_slab_group_size(lt, speculative_enabled=False)
-            )
+            self.assertIsNone(hybrid_slab_group_size(lt, speculative_enabled=False))
 
     def test_none_when_empty(self):
         # Plain models pass empty or None layer_types.
         with self._flat_ext(True):
-            self.assertIsNone(
-                hybrid_slab_group_size((), speculative_enabled=False)
-            )
-            self.assertIsNone(
-                hybrid_slab_group_size(None, speculative_enabled=False)
-            )
+            self.assertIsNone(hybrid_slab_group_size((), speculative_enabled=False))
+            self.assertIsNone(hybrid_slab_group_size(None, speculative_enabled=False))
 
     def test_none_when_multi_window_sequence(self):
         # 多种 sliding window:保守退 legacy(M14 spec §2.3)。
@@ -146,8 +128,7 @@ class HybridSlabGroupSizeTest(unittest.TestCase):
     def test_uniform_window_sequence_stays_active(self):
         with self._flat_ext(True):
             windows = [
-                None if t == "full_attention" else 128
-                for t in GPT_OSS_LAYER_TYPES
+                None if t == "full_attention" else 128 for t in GPT_OSS_LAYER_TYPES
             ]
             self.assertEqual(
                 hybrid_slab_group_size(
@@ -207,9 +188,7 @@ class KvProfileLayerDivisorTest(unittest.TestCase):
             import tokenspeed.runtime.configs.paged_cache_spec as pkg_pcs
             from tokenspeed.runtime.layers.attention import registry
         except ImportError as exc:
-            raise unittest.SkipTest(
-                f"real attention registry unimportable here: {exc}"
-            )
+            raise unittest.SkipTest(f"real attention registry unimportable here: {exc}")
         cls._registry = registry
         cls._pkg_pcs = pkg_pcs
 
@@ -286,8 +265,7 @@ class KvProfileLayerDivisorTest(unittest.TestCase):
     def test_group_size_when_uniform_window_sequence(self):
         with self._pkg_flat_ext(True):
             windows = [
-                128 if t == "sliding_attention" else None
-                for t in GPT_OSS_LAYER_TYPES
+                128 if t == "sliding_attention" else None for t in GPT_OSS_LAYER_TYPES
             ]
             self.assertEqual(
                 self._registry._kv_profile_layer_divisor(
@@ -388,8 +366,7 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
                 sliding_window_tokens=None,
             ),
             unequal_groups=dict(
-                layer_types=("sliding_attention",) * 8
-                + ("full_attention",) * 16
+                layer_types=("sliding_attention",) * 8 + ("full_attention",) * 16
             ),
         )
         for name, overrides in cases.items():
@@ -452,9 +429,7 @@ class StatePagedCacheGroupPageCountTest(unittest.TestCase):
     def test_state_count_positive_and_bounded_by_full_history(self):
         counts = self._counts()
         self.assertGreater(counts["linear_attention"], 0)
-        self.assertLessEqual(
-            counts["linear_attention"], counts["full_attention"]
-        )
+        self.assertLessEqual(counts["linear_attention"], counts["full_attention"])
 
     def test_state_branch_departs_from_full_history_formula(self):
         # B=0 with a non-page-multiple T distinguishes the state branch
@@ -520,12 +495,8 @@ class MHAPoolStateSlabTest(unittest.TestCase):
         self.assertEqual(len(pool.state_slabs), 2)
         num_pages_with_null = 32 // 16 + 1  # row 0 = null page
         for conv, ssm in pool.state_slabs:
-            self.assertEqual(
-                conv.shape, (num_pages_with_null, *self.CONV_SHAPE)
-            )
-            self.assertEqual(
-                ssm.shape, (num_pages_with_null, *self.SSM_SHAPE)
-            )
+            self.assertEqual(conv.shape, (num_pages_with_null, *self.CONV_SHAPE))
+            self.assertEqual(ssm.shape, (num_pages_with_null, *self.SSM_SHAPE))
             self.assertEqual(conv.dtype, self.torch.float32)
             self.assertEqual(ssm.dtype, self.torch.float32)
 
@@ -562,9 +533,7 @@ class MHAPoolStateSlabTest(unittest.TestCase):
         pool = self._pool()
         counts = pool.paged_cache_group_page_counts
         self.assertGreater(counts["linear_attention"], 0)
-        self.assertLessEqual(
-            counts["linear_attention"], counts["full_attention"]
-        )
+        self.assertLessEqual(counts["linear_attention"], counts["full_attention"])
 
 
 if __name__ == "__main__":

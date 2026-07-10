@@ -518,9 +518,9 @@ class MambaAttnBackend(AttentionBackend):
         (radix ext / spec decode never publish)."""
         self.kv_pool = kv_pool
         specs = getattr(kv_pool, "paged_cache_group_specs", ())
-        self.flat_state_active = bool(
-            getattr(kv_pool, "state_slabs", None)
-        ) and any(str(spec.group_id) == _STATE_GROUP_ID for spec in specs)
+        self.flat_state_active = bool(getattr(kv_pool, "state_slabs", None)) and any(
+            str(spec.group_id) == _STATE_GROUP_ID for spec in specs
+        )
         self._flat_state_page_size = int(getattr(kv_pool, "page_size", 1))
 
     def _flat_state_pages(
@@ -1172,9 +1172,7 @@ class MambaAttnBackend(AttentionBackend):
             bias,
             activation,
             conv_state_indices=read_indices,
-            output_state_indices=(
-                state_out_pages.view(-1, 1) if use_flat else None
-            ),
+            output_state_indices=(state_out_pages.view(-1, 1) if use_flat else None),
         )
 
         query, key, value = torch.split(

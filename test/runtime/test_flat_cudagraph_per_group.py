@@ -163,12 +163,8 @@ class WrapperReplayFlatTest(_TorchCase):
     def test_flat_replay_path_pads_with_zero(self):
         torch = self.torch
         src = {
-            "sliding_attention": torch.tensor(
-                [[3, 4], [5, 6]], dtype=torch.int32
-            ),
-            "full_attention": torch.tensor(
-                [[7, 8], [9, 1]], dtype=torch.int32
-            ),
+            "sliding_attention": torch.tensor([[3, 4], [5, 6]], dtype=torch.int32),
+            "full_attention": torch.tensor([[7, 8], [9, 1]], dtype=torch.int32),
         }
         recorded = self._run_replay(src, padded_bs=4, actual_bs=2)
         self.assertEqual(recorded["bs"], 4)
@@ -303,9 +299,7 @@ class WrapperEagerFlatGuardTest(_TorchCase):
             bs=2,
             ctx=ctx,
             sampling_info=None,
-            req_to_page=torch.zeros(
-                (MAX_BS, MAX_NUM_PAGES), dtype=torch.int32
-            ),
+            req_to_page=torch.zeros((MAX_BS, MAX_NUM_PAGES), dtype=torch.int32),
             flat_block_tables=flat_block_tables,
         )
         return calls
@@ -354,9 +348,7 @@ class IdleFlatBlockTablesTest(_TorchCase):
         )
 
     def test_page_zero_single_column_per_group(self):
-        out = self.idle(
-            self._wrapper(["sliding_attention", "full_attention"]), 3
-        )
+        out = self.idle(self._wrapper(["sliding_attention", "full_attention"]), 3)
         self.assertEqual(set(out), {"sliding_attention", "full_attention"})
         for table in out.values():
             self.assertEqual(tuple(table.shape), (3, 1))
@@ -484,9 +476,7 @@ class BackendCaptureFlatTest(_BackendCase):
         self.backend.cuda_graph_page_table = torch.zeros(
             (MAX_BS * 2, MAX_NUM_PAGES), dtype=torch.int32
         )
-        self.backend.cuda_graph_seq_lens = torch.zeros(
-            MAX_BS * 2, dtype=torch.int32
-        )
+        self.backend.cuda_graph_seq_lens = torch.zeros(MAX_BS * 2, dtype=torch.int32)
         with self.assertRaisesRegex(AssertionError, "spec_num_tokens"):
             self._capture(2, _GROUP_IDS)
 
@@ -501,12 +491,8 @@ class BackendReplayFlatTest(_BackendCase):
         torch = self.torch
         src = {
             # 0 = null hole (slid-out SWA page); cols narrower than buffer.
-            "sliding_attention": torch.tensor(
-                [[0, 3], [4, 5]], dtype=torch.int32
-            ),
-            "full_attention": torch.tensor(
-                [[1, 2], [6, 7]], dtype=torch.int32
-            ),
+            "sliding_attention": torch.tensor([[0, 3], [4, 5]], dtype=torch.int32),
+            "full_attention": torch.tensor([[1, 2], [6, 7]], dtype=torch.int32),
         }
         self._replay(2, src)
         for gid, expected in src.items():
@@ -556,9 +542,7 @@ class BackendReplayFlatTest(_BackendCase):
         # first); the overwide one trips the width assert.
         torch = self.torch
         src = {
-            "sliding_attention": torch.ones(
-                (2, MAX_NUM_PAGES + 1), dtype=torch.int32
-            ),
+            "sliding_attention": torch.ones((2, MAX_NUM_PAGES + 1), dtype=torch.int32),
             "full_attention": torch.ones((2, 2), dtype=torch.int32),
         }
         with self.assertRaisesRegex(AssertionError, "cols"):
@@ -655,9 +639,7 @@ class BackendStateGroupShedTest(_BackendCase):
             "linear_attention": torch.tensor([[0, 5], [0, 6]], dtype=torch.int32),
         }
         self._replay(2, src)
-        self.assertNotIn(
-            "linear_attention", self.backend.cuda_graph_flat_page_tables
-        )
+        self.assertNotIn("linear_attention", self.backend.cuda_graph_flat_page_tables)
         buf = self.backend.cuda_graph_flat_page_tables["full_attention"]
         self.assertTrue((buf[:2, :2] == src["full_attention"]).all())
 
@@ -675,12 +657,8 @@ class BackendStateGroupShedTest(_BackendCase):
             req_to_page=torch.zeros((MAX_BS, MAX_NUM_PAGES), dtype=torch.int32),
             forward_mode=forward_mode,
             flat_block_tables={
-                "full_attention": torch.tensor(
-                    [[1, 2], [3, 4]], dtype=torch.int32
-                ),
-                "linear_attention": torch.tensor(
-                    [[0, 5], [0, 6]], dtype=torch.int32
-                ),
+                "full_attention": torch.tensor([[1, 2], [3, 4]], dtype=torch.int32),
+                "linear_attention": torch.tensor([[0, 5], [0, 6]], dtype=torch.int32),
             },
         )
         metadata = self.backend.forward_decode_metadata
@@ -688,9 +666,7 @@ class BackendStateGroupShedTest(_BackendCase):
         self.assertEqual(set(metadata.out_cache_locs), {"full_attention"})
         # seq_lens [3, 4], page_size 2 -> last pos 2, 3 -> page col 1 ->
         # pages 2, 4 -> locs 2*2+0=4, 4*2+1=9.
-        self.assertEqual(
-            metadata.out_cache_locs["full_attention"].tolist(), [4, 9]
-        )
+        self.assertEqual(metadata.out_cache_locs["full_attention"].tolist(), [4, 9])
 
 
 class BackendReplayNoFlatBuffersTest(_BackendCase):
@@ -701,9 +677,7 @@ class BackendReplayNoFlatBuffersTest(_BackendCase):
 
         import tokenspeed.runtime.layers.attention.backends.mha as mha_mod
 
-        with mock.patch.object(
-            mha_mod, "gather_page_table_with_padding"
-        ) as gather:
+        with mock.patch.object(mha_mod, "gather_page_table_with_padding") as gather:
             self._replay(bs, flat_block_tables)
         return gather
 
@@ -722,10 +696,7 @@ class BackendReplayNoFlatBuffersTest(_BackendCase):
         self._capture(2, _GROUP_IDS)
         gather = self._replay_with_recorded_gather(
             2,
-            {
-                gid: torch.ones((2, 2), dtype=torch.int32)
-                for gid in _GROUP_IDS
-            },
+            {gid: torch.ones((2, 2), dtype=torch.int32) for gid in _GROUP_IDS},
         )
         gather.assert_not_called()
 

@@ -138,12 +138,8 @@ class MultiWindowPageCountsTest(unittest.TestCase):
 
     def test_safety_margin_added_per_group(self):
         base = self.counts([_spec("full_attention", "full_history")])
-        padded = self.counts(
-            [_spec("full_attention", "full_history")], safety_margin=7
-        )
-        self.assertEqual(
-            padded["full_attention"], base["full_attention"] + 7
-        )
+        padded = self.counts([_spec("full_attention", "full_history")], safety_margin=7)
+        self.assertEqual(padded["full_attention"], base["full_attention"] + 7)
 
     def test_sliding_without_window_raises(self):
         with self.assertRaises(ValueError):
@@ -180,9 +176,7 @@ class SuffixedGroupIdFlowTest(unittest.TestCase):
             set(counts),
             {"full_attention", "sliding_attention_128", "sliding_attention_4"},
         )
-        self.assertGreater(
-            counts["full_attention"], counts["sliding_attention_128"]
-        )
+        self.assertGreater(counts["full_attention"], counts["sliding_attention_128"])
         self.assertGreater(
             counts["sliding_attention_128"], counts["sliding_attention_4"]
         )
