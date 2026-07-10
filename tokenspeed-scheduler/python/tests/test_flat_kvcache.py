@@ -23,7 +23,7 @@ ts = pytest.importorskip("tokenspeed_scheduler")
 
 def _make_config() -> ts.SchedulerConfig:
     cfg = ts.SchedulerConfig()
-    cfg.page_size = 2
+    cfg.block_size = 2
     cfg.num_device_pages = 32
     cfg.num_host_pages = 32
     cfg.max_scheduled_tokens = 64
@@ -34,7 +34,7 @@ def _make_config() -> ts.SchedulerConfig:
 
     full = ts.PagedCacheGroupConfig(
         group_id="full",
-        rows_per_page=cfg.page_size,
+        rows_per_page=cfg.block_size,
         entry_stride_tokens=1,
         total_pages=cfg.num_device_pages,
         retention=ts.PagedCacheRetention.FullHistory,
@@ -42,7 +42,7 @@ def _make_config() -> ts.SchedulerConfig:
     )
     swa = ts.PagedCacheGroupConfig(
         group_id="swa",
-        rows_per_page=cfg.page_size,
+        rows_per_page=cfg.block_size,
         entry_stride_tokens=1,
         total_pages=cfg.num_device_pages,
         retention=ts.PagedCacheRetention.SlidingWindow,
@@ -56,7 +56,7 @@ def _make_config() -> ts.SchedulerConfig:
 def _make_spec(
     request_id: str, num_pages: int, page_size: int = 2, start: int = 1
 ) -> ts.RequestSpec:
-    # page_size must stay in sync with cfg.page_size: the token count below
+    # page_size must stay in sync with cfg.block_size: the token count below
     # (num_pages * page_size) is what determines how many pages get allocated.
     spec = ts.RequestSpec()
     spec.request_id = request_id

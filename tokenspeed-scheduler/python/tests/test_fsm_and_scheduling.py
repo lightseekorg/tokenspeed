@@ -53,7 +53,7 @@ def make_config(
     num_device_pages: int = 1024,
 ) -> SchedulerConfig:
     cfg = SchedulerConfig()
-    cfg.page_size = page_size
+    cfg.block_size = page_size
     cfg.max_scheduled_tokens = max_scheduled_tokens
     cfg.max_batch_size = max_batch_size
     cfg.num_device_pages = num_device_pages
@@ -665,7 +665,7 @@ def _make_retract_config(
 ) -> SchedulerConfig:
     """Config with very limited device pages to force a retract quickly."""
     cfg = SchedulerConfig()
-    cfg.page_size = page_size
+    cfg.block_size = page_size
     cfg.num_device_pages = num_device_pages
     cfg.num_host_pages = num_host_pages
     cfg.max_scheduled_tokens = 512

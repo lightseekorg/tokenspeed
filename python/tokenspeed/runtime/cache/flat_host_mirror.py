@@ -24,7 +24,7 @@ tier (M15 Phase D). Transport mechanism only; scheduler/engine wiring is D2.
 
 from __future__ import annotations
 
-from typing import Iterable, Sequence
+from collections.abc import Iterable, Sequence
 
 import torch
 

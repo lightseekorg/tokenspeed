@@ -29,7 +29,7 @@ C++ scheduler pins source host pages and destination device blocks until a
 from __future__ import annotations
 
 from collections import OrderedDict
-from typing import Iterable, Sequence
+from collections.abc import Iterable, Sequence
 
 import psutil
 import torch
