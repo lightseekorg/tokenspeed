@@ -242,6 +242,11 @@ class MHATokenToKVPool(BaseTokenToKVPool):
                 and paged_cache_spec.scheduler_ext_flat_kvcache()
             )
             flat_state_layers = set(self._layer_state_pair) if flat_gdn else set()
+            if flat_gdn:
+                # Gates event_loop's retraction offload: state layers carry no
+                # per-layer KV, so the radix offload executor (and its host
+                # pool, sized for ALL layers) cannot represent this pool.
+                self.supports_hierarchical_kv_cache = False
 
             if self._slab_group_size is not None:
                 # Paired layers alias the same slab tensor; live rows never

@@ -651,6 +651,15 @@ class FlatGDNStateLayerNoKVTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"PD disaggregation"):
             pool.get_contiguous_buf_infos()
 
+    def test_flat_gdn_disables_hierarchical_offload(self):
+        # Structural pin: event_loop builds the radix MemoryExecutor (even
+        # with the kvstore off, for retraction offload) only when the pool
+        # advertises hierarchical support. State layers carry no per-layer
+        # KV, so the flat GDN pool must opt out rather than rely on
+        # cache-op-kind rejection to keep layer-indexed derefs unreachable.
+        pool = self._pool()
+        self.assertFalse(pool.supports_hierarchical_kv_cache)
+
     def test_flat_gdn_clear_buffers_survives_none(self):
         pool = self._pool()
         self.assertIsNone(pool.k_buffer[0])  # None entries really present
@@ -667,6 +676,7 @@ class FlatGDNStateLayerNoKVTest(unittest.TestCase):
         self.assertEqual(pool.data_ptrs.numel(), 2 * self.NUM_LAYERS)
         self.assertEqual(pool.state_slabs, [])
         pool.get_contiguous_buf_infos()  # PD surface stays available
+        self.assertTrue(pool.supports_hierarchical_kv_cache)
 
 
 if __name__ == "__main__":
