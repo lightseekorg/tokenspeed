@@ -37,11 +37,11 @@ struct SchedulerConfig;
 // Stream-ordering safety: all forwards share one execution stream, so reuse writes of freed/slid-out
 // pages enqueue after in-flight KV kernels, and claimed pages stay ref>1 -- never rewritten from outside.
 // The one out-of-stream writer (load-back H2D) fences before joining: per-layer load events gate the
-// attention reads and loadback is eager-only (flat_memory_executor.py).
+// attention reads and loadback is eager-only.
 
 // On false (pool short) nothing is acquired but the claimed prefix blocks REMAIN -- caller must FreeRequest.
-// SWA peak = ceil((chunk+W-1)/P) pages (chunk fully resident during its forward; same plateau as
-// vLLM; pinned by FlatPrefillPlateauSuite -- shrinking it needs a kernel-level ring buffer).
+// SWA peak = ceil((chunk+W-1)/P) pages (chunk fully resident during its forward; pinned by
+// FlatPrefillPlateauSuite -- shrinking it needs a kernel-level ring buffer).
 bool PrefillFirstChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
                        const CoordinatorMatch& hit, std::int32_t num_new_tokens);
 

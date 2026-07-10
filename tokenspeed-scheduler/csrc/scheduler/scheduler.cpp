@@ -249,14 +249,10 @@ std::size_t Scheduler::RetractedSize() const {
 
 std::size_t Scheduler::AvailableKvPages() const {
 #if TOKENSPEED_FLAT_KVCACHE
-    // The flat path never draws from the radix device_allocator_, so reporting
-    // it would show a permanently-full pool to Python monitoring
-    // (event_loop.py's _get_load / _get_scheduler_stats).
-    // Report the flat shared BlockPool instead. Units match: one flat block is
-    // one page of block_size tokens, the same unit as device_allocator_ pages
-    // and as Python's max_total_num_tokens // block_size. Block 0 is the
-    // pool's never-allocated null placeholder, so an idle pool reports
-    // total_pages - 1 (one page permanently "used").
+    // The flat path never draws from the radix device_allocator_, so reporting it would show a
+    // permanently-full pool to Python monitoring. Report the flat BlockPool instead: one flat block
+    // is one page of block_size tokens, the same unit device_allocator_ uses. Block 0 is the
+    // never-allocated null placeholder, so an idle pool reports total_pages - 1.
     return static_cast<std::size_t>(block_pool_.NumFreeBlocks());
 #else
     return device_allocator_.AvailablePages();
@@ -394,11 +390,10 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
         std::vector<TransferPair> pairs;
         std::vector<FlatStoreTicket> tickets;
         // Same-round twins register the same key twice (batch_keys catches them). Cross-round
-        // recurrence is rare but real: a ticket pins its OWN source hash-intact, yet a device
-        // match can settle below that page once earlier chain pages / SWA run neighbors are
-        // evicted after their ops retire -- the identical request then recomputes and
-        // re-registers a key whose store is still in flight. InFlight() drops it (load-bearing:
-        // without it a key could sit in two ops and Retire would corrupt the ledger's key set).
+        // recurrence is rare but real: a device match can settle below a still-in-flight page after
+        // earlier chain / SWA-neighbor ops retire, and the request re-registers a key whose store is
+        // in flight. InFlight() drops it (load-bearing: else a key sits in two ops and Retire
+        // corrupts the ledger's key set).
         std::unordered_set<std::string> batch_keys;
         for (auto& cand : coordinator_.TakePendingStores()) {
             if (flat_host_pool_.GetCachedBlock(cand.key) != nullptr || flat_store_ops_.InFlight(cand.key) ||

@@ -212,9 +212,8 @@ private:
         BlockRef host_block;    // destination page, unhashed until WriteBackDone publishes it
     };
     // In-flight D2H stores. The host pool is transaction-blind like the device pool, so the
-    // key-dedupe index lives here, paired with the op ledger by construction: Add/Retire are
-    // the only mutation points and the drain emits each key at most once (its batch set),
-    // so the set always equals the union of in-flight ticket keys.
+    // key-dedupe index lives here, paired with the op ledger: Add/Retire are the only mutation
+    // points, so keys_ always equals the union of in-flight ticket keys.
     class FlatStoreLedger {
     public:
         void Add(cache_op_id id, std::vector<FlatStoreTicket> tickets) {

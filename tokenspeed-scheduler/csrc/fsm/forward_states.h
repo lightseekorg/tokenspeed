@@ -115,7 +115,6 @@ public:
     const TreeNode* GetDeviceNode() const { return device_node_ref_->Node(); }
 
     // Null on the flat path (block_tables_ drives allocation), so radix-only publishing branches can skip.
-    // TODO(radix-removal): drop together with the radix device-node publish path.
     bool HasDeviceNodeRef() const { return device_node_ref_ != nullptr; }
 
     std::int32_t TailPageAvailableTokens() const {
@@ -174,10 +173,9 @@ struct ForwardState : public BaseState {
     std::unique_ptr<ReqPoolIndex> TakeReqPoolIndex() && { return std::move(req_pool_index_); }
     std::int32_t GetReqPoolIndex() const { return req_pool_index_ ? req_pool_index_->slot_ : -1; }
 
-    // Flat: a single-group SAMPLE of group 0 (the first CONFIGURED group; page ids differ per group, counts
-    // do not). KV writes use per-group metadata.out_cache_locs derived from each group's own table (M11),
-    // so this sample feeds page counts, one-group stats and the radix-era req_to_page fallback only.
-    // TODO(radix-removal): drop the req_to_page fallback fed by this sample together with the radix path.
+    // Flat: a single-group SAMPLE of group 0 (page ids differ per group, counts do not). KV writes use
+    // per-group metadata.out_cache_locs from each group's own table, so this sample feeds page counts,
+    // one-group stats and the radix-era req_to_page fallback only.
     std::vector<std::int32_t> GetOccupiedPages() const {
         if (!block_tables_.empty()) {
             return BlockTablePageIds(block_tables_[0]);  // flat: first-group sample (see above)
@@ -320,8 +318,8 @@ private:
 
 // Generation finished, host pages allocated, writeback op not yet generated.
 struct Draining {
-    // pages_to_transfer is captured in FinishEvent while the node->page mapping is still stable: storing
-    // concrete pairs makes newWriteBackOperation split-safe (no re-walk after splitChild redistributes pages).
+    // Draining captures concrete page pairs while the node->page mapping is still stable, making
+    // newWriteBackOperation split-safe (no re-walk after splitChild redistributes pages).
     using PagePair = TransferPair;
     Draining(std::vector<PagePair> pages_to_transfer, std::unique_ptr<DeviceNodeRef>&& device_node_ref,
              std::unique_ptr<HostNodeRef>&& host_node_ref, std::vector<TreeNode*> mamba_writeback_nodes = {})

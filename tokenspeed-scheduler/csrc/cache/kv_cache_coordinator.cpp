@@ -67,9 +67,7 @@ namespace {
 // group left above the settled bound -- with 2+ window groups a later group can shrink the
 // bound UNDER an earlier one's boundary-dependent match. A re-matched group lands at or
 // under the current bound and only a further bound drop can lift it back above, so
-// re-matches are finite; single-window models never re-enter, and the result is the
-// greatest boundary every group supports. `match(i, bound_tokens)` stores group i's match;
-// `extent(i)` reads it back as a token extent.
+// re-matches are finite; the result is the greatest boundary every group supports.
 template <typename MatchGroup, typename ExtentTokens>
 std::int32_t SweepThenConverge(std::span<const std::size_t> order, const std::vector<CacheGroup>& groups,
                                std::int32_t bound_tokens, const MatchGroup& match, const ExtentTokens& extent) {
@@ -104,9 +102,8 @@ std::vector<std::vector<std::string>> KvCacheCoordinator::buildGroupKeys(
 }
 
 // The one tier matcher: slots below floor_tokens are assumed valid in a lower tier; per_group
-// blocks are relative to the floor, num_common_tokens is the absolute converged boundary.
-// Boundaries are in TOKENS (the cross-block-size unit). num_base_pages is the base-granularity
-// page count (content_hashes.size()); group_keys[i] is already folded to group i's coarse blocks.
+// blocks are relative to the floor, num_common_tokens is the absolute converged boundary (in
+// TOKENS). num_base_pages = content_hashes.size(); group_keys[i] is folded to group i's blocks.
 CoordinatorMatch KvCacheCoordinator::matchTierWithKeys(const BlockPool& pool,
                                                        std::span<const std::vector<std::string>> group_keys,
                                                        std::int32_t num_base_pages,

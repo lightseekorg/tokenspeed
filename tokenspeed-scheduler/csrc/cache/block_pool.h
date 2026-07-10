@@ -40,8 +40,8 @@ class CacheBlock {
 public:
     explicit CacheBlock(std::int32_t block_id) : block_id_{block_id} {}
 
-    // Copy deleted (free_pos_ points into BlockPool::free_); move defaulted only for
-    // vector::emplace_back and never actually runs (blocks_ is reserve()'d, never reallocates).
+    // Copy deleted (free_pos_ points into BlockPool::free_); move defaulted for
+    // vector::emplace_back but never runs (blocks_ is reserve()'d).
     CacheBlock(const CacheBlock&) = delete;
     CacheBlock& operator=(const CacheBlock&) = delete;
     CacheBlock(CacheBlock&&) = default;
@@ -52,13 +52,12 @@ public:
     bool IsNull() const { return is_null_; }
     bool IsCached() const { return !block_hash_.empty(); }
 
-    // BlockHashWithGroupId key (page_hasher.h); empty when nothing is cached.
+    // BlockHashWithGroupId key (page_hasher.h); empty when uncached.
     const std::string& BlockHash() const { return block_hash_; }
 
 private:
     friend class BlockPool;
 
-    // ref_cnt_ and in_free_ are one invariant; only the pool may move either.
     void IncrRef() { ++ref_cnt_; }
     void DecrRef() {
         _assert(ref_cnt_ >= 1, "ref_cnt must >= 1 on DecrRef");
@@ -85,7 +84,7 @@ inline auto AllCachedBlocks(const std::unordered_map<std::string, std::vector<Ca
     return cached | std::views::values | std::views::join;
 }
 
-// Flat prefix-cache block pool; owns all blocks for their whole lifetime, the free list and hash map only track state.
+// Flat prefix-cache block pool; owns all blocks for their whole lifetime; the free list and hash map only track state.
 class BlockPool {
 public:
     explicit BlockPool(std::int32_t total_num_blocks, bool enable_caching = true)
@@ -123,7 +122,7 @@ public:
         return it->second.front();
     }
 
-    // Claim a new reference, pulling a ref-0 eviction candidate out of the free list first (vllm BlockPool.touch).
+    // Claim a new reference, pulling a ref-0 eviction candidate out of the free list first.
     void TouchBlock(CacheBlock* block) {
         _assert(block->owner_ == this, "block belongs to another pool");
         if (block->is_null_) {
@@ -148,7 +147,7 @@ public:
         return out;
     }
 
-    // Single-block twin (nullptr on shortfall) for allocation-free call sites.
+    // Single-block twin (nullptr on shortfall).
     CacheBlock* AllocateBlock() {
         if (free_.empty()) {
             return nullptr;
@@ -188,7 +187,7 @@ public:
         cached_hash_to_blocks_[block_hash_with_group].push_back(block);
     }
 
-    // Test probes (O(cached blocks), off the hot path).
+    // Test probes (off the hot path).
     std::int32_t NumCachedBlocks() const {
         return static_cast<std::int32_t>(std::ranges::distance(AllCachedBlocks(cached_hash_to_blocks_)));
     }
@@ -202,7 +201,7 @@ public:
     }
 
 private:
-    // std::list gives the O(1) stored-iterator erase a prefix cache needs and a vector/deque stack cannot.
+    // std::list gives the O(1) stored-iterator erase a prefix cache needs; a vector/deque stack cannot.
     void pushToFree(CacheBlock* block) {
         block->free_pos_ = free_.insert(free_.end(), block);
         block->in_free_ = true;

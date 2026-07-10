@@ -131,9 +131,9 @@ bool isFlatDeferred(const Request* req) {
 
 }  // namespace
 
-// One match, one hash pass at admission (vLLM V1 shape): the device match plus its host-tier
-// extension share the token math, the gate charge and window.begin. Claiming in-flight pages is
-// stream-ordering safe (forward_cache_ops.h).
+// One match, one hash pass at admission: the device match plus its host-tier extension share the
+// token math, the gate charge and window.begin. Claiming in-flight pages is stream-ordering safe
+// (forward_cache_ops.h).
 Scheduler::FlatAdmissionMatch Scheduler::matchFlatPrefixAtAdmission(Request* request) {
     if (config_.disable_prefix_cache) {
         return {};
@@ -161,8 +161,6 @@ Scheduler::FlatAdmissionMatch Scheduler::matchFlatPrefixAtAdmission(Request* req
     return match;
 }
 
-// TODO(radix-removal): radix EnsureCapacityByEvict gates never bind on flat builds; the flatAdmit* gates own admission.
-//
 // Returns the decode-reserve pages to record when admitted (0 unless this chunk completes prefill); nullopt = defer.
 std::optional<std::int32_t> Scheduler::flatAdmitFirstChunk(Request* request, const CoordinatorMatch& hit,
                                                            std::int32_t ext_real_pages, std::int32_t chunk_tokens,
@@ -214,11 +212,9 @@ bool Scheduler::flatPoolWedged(const std::vector<Request*>& candidates) const {
     const bool any_deferred = std::any_of(candidates.begin(), candidates.end(), isFlatDeferred);
     // Block 0 is the null placeholder, never allocated.
     const bool pool_pages_held = block_pool_.NumFreeBlocks() < block_pool_.TotalBlocks() - 1;
-    // Both ledgers count: an in-flight D2H store OR H2D load (e.g. after an abort-during-load)
-    // still holds pool pages that its Done event will free. Dispatched mid-prefill chunk ops are
-    // invisible here (they owe no ExtendResult) -- safe: their completion frees no pool pages and
-    // emits no event, and page reuse under a still-executing chunk is stream-ordering safe
-    // (forward_cache_ops.h).
+    // An in-flight D2H store OR H2D load still holds pool pages its Done event will free; both
+    // ledgers must be empty. Dispatched mid-prefill chunk ops are invisible here and safe (they
+    // free no pool pages, emit no event, and page reuse under them is stream-ordering safe).
     const bool nothing_in_flight = pending_forward_results_.empty() && cache_op_tracker_.empty() &&
                                    flat_store_ops_.Empty() && flat_load_ops_.empty();
     return config_.role == Role::kFused && any_deferred && pool_pages_held && nothing_in_flight;
@@ -316,7 +312,7 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
 
 #if TOKENSPEED_FLAT_KVCACHE
     FlatAdmissionMatch flat_match = matchFlatPrefixAtAdmission(request);
-    // Overwrite the radix-sourced locals: the radix tree is never written on flat builds, so its match is empty.
+    // Overwrite the radix-sourced locals: the radix tree is never written on flat builds.
     const std::int32_t flat_hit_tokens =
         std::max(flat_match.device.num_common_tokens, flat_match.host.num_common_tokens);
     unscheduled = request->PrefillSize() - flat_hit_tokens;

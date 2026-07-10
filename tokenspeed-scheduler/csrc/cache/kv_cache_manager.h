@@ -33,7 +33,7 @@
 
 namespace tokenspeed {
 
-// Pure per-attention-type policy over block_size (+ window): holds no pool, no per-request
+// Pure per-attention-type policy over block_size (+ window): holds no pool and no per-request
 // state -- every operation acts on the pool it is handed, identically for any tier.
 class KvCacheManager {
 public:
@@ -50,8 +50,7 @@ public:
     virtual bool MatchIsPrefixClosed() const = 0;
 
     // One matcher for every tier: scan `pool` over slots [begin_blocks, max_blocks) of the FULL
-    // key sequence (index = block index; slots below the floor are assumed valid in a lower
-    // tier). Read-only; blocks are relative to begin_blocks, holes = pool.NullBlock().
+    // key sequence. Read-only; blocks are relative to begin_blocks, holes = pool.NullBlock().
     virtual PrefixMatch Match(const BlockPool& pool, std::span<const std::string> keys,
                               std::int32_t begin_blocks, std::int32_t max_blocks) const = 0;
 
@@ -112,7 +111,7 @@ public:
     }
 
     // State snapshots are only boundary-correct where a forward call ended page-aligned:
-    // such groups register just the final full page of an aligned range (spec M17 §3).
+    // such groups register just the final full page of an aligned range.
     virtual bool RegistersAlignedFinalPageOnly() const { return false; }
 
     // Pages already carrying a hash are skipped; the partial tail is excluded by the caller.

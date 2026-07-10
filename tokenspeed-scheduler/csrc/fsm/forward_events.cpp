@@ -185,21 +185,19 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()
     _assert(coordinator_ != nullptr, "SchedulePrefillFirstChunkEvent: flat path requires a coordinator");
     TokenContainer* token_container = state.GetTokenContainer();
 
-    // Slot first: Allocate() throws on exhaustion; both sides are RAII now, order kept for determinism.
+    // Slot first: Allocate() throws on exhaustion; order kept for determinism.
     auto req_pool_index = std::make_unique<ReqPoolIndex>(req_pool_allocator_->Allocate());
 
     std::vector<BlockTable> tables(coordinator_->NumGroups());
     coordinator_->ClaimCommonPrefix(tables, flat_hit_);
-    // The extension appends between the claim and the fresh acquire so slots stay
-    // [device hit | host ext | new pages]; ext pages are FULL, composing exactly with the gate.
+    // Extension appends between claim and fresh acquire so slots stay
+    // [device hit | host ext | new pages]; ext pages are FULL, composing with the gate.
     flat_load_pairs_ = LoadHostExtension(*coordinator_, tables, flat_host_);
-    // The admission match that set tokens_this_round_ also sets window.begin (single source).
-    // The host boundary is absolute (floor included); default-constructed (no host pool) it is 0.
+    // Host boundary is absolute (floor included); default-constructed (no host pool) it is 0.
     const std::int32_t hit_tokens = std::max(flat_hit_.num_common_tokens, flat_host_.num_common_tokens);
-    // Loaded pages become device-cached now (SWA holes skipped by the IsNull guard);
-    // the sink re-collects them and the drain dedupes against the host index. The extension
-    // ends at the hit boundary (page-aligned by construction), so the state group's final
-    // page is exactly the loaded snapshot.
+    // Loaded pages become device-cached now (SWA holes skipped by the IsNull guard); the sink
+    // re-collects them and the drain dedupes against the host index. The extension ends at the
+    // page-aligned hit boundary, so the state group's final page is exactly the loaded snapshot.
     coordinator_->CacheFullBlocks(tables, flat_ext_hashes_,
                                   /*first_slot=*/flat_hit_.num_common_tokens / state.GetPageSize(),
                                   /*end_tokens=*/hit_tokens);
@@ -445,14 +443,14 @@ Decoding ScheduleDecodeEvent::operator()(Decoding&& state) {
 #if TOKENSPEED_FLAT_KVCACHE
     _assert(coordinator_ != nullptr, "ScheduleDecodeEvent: flat path requires a coordinator");
     const std::int32_t reserve = state.GetReserveNumTokensInNextScheduleEvent();
-    // Size() includes this round's still-pending decode tail; sliding at Size() would free a page its
+    // Size() includes this round's pending decode tail; sliding at Size() would free a page its
     // query still reads. scheduleDecode's gate credited the slide with this same value.
     const std::int32_t num_computed_tokens = state.GetTokenContainer()->Size() - decode_input_tokens_;
 
     FlatHashChain chain = state.GetFlatHashChain();
     const std::int32_t first_page_slot = chain.num_hashed_pages;
     const std::int32_t filled_pages = num_computed_tokens / state.GetPageSize();
-    // A page fills only once every page_size steps; skip the O(pages) span walk on the other steps.
+    // A page fills only once every page_size steps; skip the span walk on the other steps.
     const std::vector<std::string> new_hashes =
         filled_pages > chain.num_hashed_pages
             ? AdvanceFlatHashChain(chain, state.GetFullPagedTokens(false), filled_pages)

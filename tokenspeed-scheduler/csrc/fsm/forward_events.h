@@ -73,15 +73,13 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
                                    MambaChunkAllocator* mamba_allocator = nullptr,
                                    std::vector<TreeNode*> mamba_loadback_nodes = {}
 #if TOKENSPEED_FLAT_KVCACHE
-                                   // coordinator keeps a nullptr default (here and in the events below)
-                                   // because radix-only call sites -- production and tests -- are compiled
-                                   // in flat builds too and legitimately construct events without one.
-                                   // Every flat transition body asserts coordinator_ != nullptr on entry.
+                                   // coordinator defaults to nullptr because radix-only call
+                                   // sites (production and tests) compile in flat builds too;
+                                   // every flat transition body asserts coordinator_ != nullptr.
                                    ,
                                    KvCacheCoordinator* coordinator = nullptr,
-                                   // Admission-layer prefix match: the scheduler matches once and
-                                   // threads the hit here; the default {} is the canonical zero hit for
-                                   // call sites that never match (radix-only paths, tests).
+                                   // Admission-layer prefix match, threaded from the scheduler;
+                                   // default {} is the zero hit for call sites that never match.
                                    CoordinatorMatch flat_hit = {},
                                    // Host-tier match above flat_hit's boundary (read-only; the
                                    // load emission pins both sides when it builds the ticket).
@@ -392,11 +390,8 @@ struct UpdateReserveNumTokensEvent : InvalidTransitionHandler<UpdateReserveNumTo
 
     Retracted operator()(Retracted&& state) { return std::move(state); }
 
-    // Overlap scheduling can commit an already-dispatched decode result after
-    // this request was terminalized (for example retract failure -> AbortEvent).
-    // The reserve hint only affects a future schedule round, so it is stale
-    // once Finished. Other invalid states still fall through to the strict FSM
-    // handler.
+    // Overlap scheduling can commit an already-dispatched decode result after this request was
+    // terminalized. The reserve hint only affects a future round, so it is stale once Finished.
     Finished operator()(Finished&& state) { return std::move(state); }
 
 private:
@@ -441,11 +436,9 @@ public:
         }
 
 #if TOKENSPEED_FLAT_KVCACHE
-        // TODO(radix-removal): the publish body below is radix-only and
-        // unreachable on the flat path (flat states carry no device node;
-        // allocation is driven by block_tables_, and result tokens were already
-        // extended above). This guard shields the GetDeviceNode() null-deref in
-        // that body until the radix path is deleted.
+        // The publish body below is radix-only and unreachable on the flat path (flat states
+        // carry no device node; allocation is driven by block_tables_). This guard shields the
+        // GetDeviceNode() null-deref until the radix path is deleted.
         if (!state.HasDeviceNodeRef()) {
             return std::move(state);
         }
@@ -493,11 +486,8 @@ public:
                         std::move(local_mamba_allocator)};
     }
 
-    // Overlap scheduling can commit an already-dispatched forward result after
-    // this request was terminalized (for example retract failure -> AbortEvent).
-    // The result tokens are stale and must not mutate TokenContainer or revive
-    // the request. Other invalid states still fall through to the strict FSM
-    // handler.
+    // Overlap scheduling can commit an already-dispatched forward result after this request was
+    // terminalized. The result tokens are stale and must not mutate TokenContainer or revive it.
     Finished operator()(Finished&& state) { return std::move(state); }
 
 private:
