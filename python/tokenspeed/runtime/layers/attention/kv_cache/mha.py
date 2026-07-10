@@ -273,9 +273,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             else:
                 # The hybrid-slab branch above never sees state labels
                 # (hybrid_slab_group_size excludes them), so the skip set
-                # only applies here: flat GDN state layers keep their
-                # layer-indexed slots but carry NO KV tensors (the plan
-                # sizing charges no KV rows for them).
+                # only applies here.
                 self.k_buffer = [
                     None if layer_id in flat_state_layers else _alloc()
                     for layer_id in range(self.layer_num)
@@ -284,16 +282,21 @@ class MHATokenToKVPool(BaseTokenToKVPool):
                     None if layer_id in flat_state_layers else _alloc()
                     for layer_id in range(self.layer_num)
                 ]
-                logger.info(
-                    "KV layout: per-layer (%d of %d layers carry KV "
-                    "buffers; %d flat GDN state layers carry none; hybrid "
-                    "slab inactive: predicate returned None -- radix ext, "
-                    "spec decode, or non-uniform/single-group "
-                    "layer_types)",
-                    self.layer_num - len(flat_state_layers),
-                    self.layer_num,
-                    len(flat_state_layers),
-                )
+                if flat_state_layers:
+                    logger.info(
+                        "KV layout: per-layer (%d of %d layers carry KV "
+                        "buffers; state layers carry none)",
+                        self.layer_num - len(flat_state_layers),
+                        self.layer_num,
+                    )
+                else:
+                    logger.info(
+                        "KV layout: per-layer (%d buffers; hybrid slab "
+                        "inactive: predicate returned None -- radix ext, "
+                        "spec decode, or non-uniform/single-group "
+                        "layer_types)",
+                        self.layer_num,
+                    )
             # Pointer/stride tables carry the REAL tensors only: _kv_copy
             # launches one block per data_ptrs entry (grid = numel), so a
             # placeholder entry for a skipped state layer would be
@@ -320,9 +323,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             # per state LAYER (n-th state layer -> pair n), row-indexed by
             # page id over the SAME page-id space as the KV pages; row 0 is
             # the null page, never written -- mirrors the KV buffers'
-            # +page_size dummy-page convention above. State layers carry
-            # ONLY these slabs: their per-layer k/v slots are None (same
-            # flat_gdn predicate as the skip set above).
+            # +page_size dummy-page convention above.
             if flat_gdn:
                 assert (
                     self.size % self.page_size == 0

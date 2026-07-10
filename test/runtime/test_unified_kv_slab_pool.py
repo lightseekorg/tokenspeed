@@ -440,9 +440,9 @@ class StatePagedCacheGroupPageCountTest(unittest.TestCase):
 
 
 class MHAPoolStateSlabTest(unittest.TestCase):
-    """State-slab consumer (kv_cache/mha.py): a GDN hybrid keeps the legacy
-    per-layer KV layout (hybrid_slab_group_size -> None on state labels),
-    but flat ext + provided mamba2 shapes add one (conv, ssm) slab pair per
+    """State-slab consumer (kv_cache/mha.py): a GDN hybrid keeps a per-layer
+    KV layout on attention layers (state layers carry None slots, M18a),
+    and flat ext + provided mamba2 shapes add one (conv, ssm) slab pair per
     state LAYER, row-indexed by page id (row 0 = null page, never written).
     Constructs a real (tiny, CPU) MHATokenToKVPool; skips without deps.
     Patch target is the PACKAGE paged_cache_spec probe (see above).
