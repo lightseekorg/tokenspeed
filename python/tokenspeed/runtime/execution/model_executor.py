@@ -393,10 +393,6 @@ class ModelExecutor:
                 req_to_page=self.req_to_page,
             )
 
-        # Fail fast (before CUDA-graph capture runs the first forward): a
-        # multi-group KV pool requires every PagedAttention layer to route to
-        # its group's page table, so a missing/unknown group_id must surface
-        # here with a clear message, not as a KeyError mid-forward.
         validate_paged_cache_group_ids(
             model_runner.model,
             token_to_kv_pool.paged_cache_group_specs,

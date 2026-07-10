@@ -415,10 +415,6 @@ def create_attn_components(
             server_args.drafter_attention_backend = None
 
     config = _create_attn_config(server_args, model_config)
-    # Flat-GDN marker + single source of the constant state-row bytes: state
-    # shapes are stamped on the config only under a flat-built ext
-    # (MHAConfig.generate), so this one flag gates both the page-size
-    # equalization here and the flat GDN sizing profile below.
     is_flat_gdn = getattr(config, "conv_state_shape", None) is not None
     gdn_state_bytes = (
         state_const_bytes(
@@ -431,14 +427,6 @@ def create_attn_components(
         else None
     )
     if is_flat_gdn:
-        # GDN page-size equalization CHOKE POINT. MHAConfig.generate stamped
-        # config.page_size from server_args.block_size just above, and every
-        # OTHER page-size consumer — the sizing profile below, the draft
-        # config's generate, event_loop's make_config / ModelExecutorConfig /
-        # MemoryExecutorConfig — reads server_args.block_size only AFTER this
-        # function runs, so inflating both here reaches all of them
-        # consistently. MHATokenToKVPool's ctor re-derives the geometry and
-        # raises on any mismatch (kv_cache/mha.py).
         equalized_block_size_value = equalized_block_size(
             layer_types=list(config.layer_types),
             kv_bytes_per_slot=config.cache_cell_size(),
@@ -583,10 +571,6 @@ def create_attn_components(
             server_args.max_total_tokens,
         )
     elif has_mamba and is_flat_gdn:
-        # Flat GDN profile: sizing comes from the component plan — state
-        # layers carry no KV component, so their KV rows are gone from the
-        # per-block account (M18a). The draft (MTP) pool rides the same
-        # block-id space as reserved bytes. No mamba slot pool on this path.
         draft_row_bytes = 0
         if draft_attn_config is not None:
             draft_row_bytes = (

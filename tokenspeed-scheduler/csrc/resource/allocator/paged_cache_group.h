@@ -53,6 +53,9 @@ struct PagedCacheGroupConfig {
     std::int32_t rows_per_page{};
     std::int32_t entry_stride_tokens{};
     std::int32_t total_pages{};
+    // Per-group page granularity in tokens; 0 = unset, falls back to the global
+    // SchedulerConfig::block_size.
+    std::int32_t block_size{0};
     Retention retention{Retention::FullHistory};
     std::optional<std::int32_t> sliding_window_tokens{};
     // History groups form a chain; State groups only need the trailing window.

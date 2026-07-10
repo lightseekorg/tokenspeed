@@ -193,8 +193,16 @@ std::vector<std::string> Scheduler::CalcRollingHash(const std::vector<std::int32
 }
 
 void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
+#if TOKENSPEED_FLAT_KVCACHE
+    // The content-hash chain and base-slot indexing run at base (GCD) granularity; the
+    // coordinator folds base pages up to each group's block_size. Uniform block_size =>
+    // base == block_size.
+    const std::int32_t page_size = config_.BaseBlockSize();
+#else
+    const std::int32_t page_size = config_.block_size;
+#endif
     for (const auto& spec : request_specs) {
-        auto req = std::make_unique<Request>(spec, config_.block_size, config_.role);
+        auto req = std::make_unique<Request>(spec, page_size, config_.role);
         requests_.emplace(spec.request_id, std::move(req));
     }
 }

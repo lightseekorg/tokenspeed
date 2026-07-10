@@ -140,7 +140,7 @@ def equalized_block_size(
     no backend declares a finer one), so the inflated P stays a multiple of
     the configured block size. Pure wrapper over components_from_layers +
     solve_page_geometry so the config-level equalization decision and its
-    tests share one implementation (the vLLM "align" move)."""
+    tests share one implementation."""
     comps = components_from_layers(
         layer_types=layer_types,
         kv_bytes_per_slot=kv_bytes_per_slot,

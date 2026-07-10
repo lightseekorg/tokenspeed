@@ -317,11 +317,6 @@ class EventLoop:
             mamba_l2_io_backend=server_args.mamba_l2_io_backend,
         )
         if scheduler_ext_flat_kvcache() and server_args.enable_kvstore:
-            # Flat ext + kvstore: the L2 tier is the byte-blind FlatHostMirror
-            # driven by Flat{WriteBack,LoadBack} page-id pairs. The radix host
-            # pool's token-indexed transfer kernels do not apply (slab layouts
-            # alias paired layers), and the flat scheduler expects LoadBackDone
-            # acks, which the radix executor never emits.
             if server_args.kvstore_storage_backend is not None:
                 raise NotImplementedError(
                     "flat scheduler build (TOKENSPEED_FLAT_KVCACHE) has no L3 "
@@ -372,10 +367,6 @@ class EventLoop:
 
         # Adjunct enabled only when pool opts in AND prefix-caching switch is on.
         paged_cache_groups = pool_to_paged_cache_groups(token_to_kv_pool)
-        # Fail fast before the C++ ctor: a flat-built ext either silently
-        # mis-drives V4-style paged-group backends (garbage replays) or dies
-        # inside MakeCoordinator with no hint on zero groups (spec decode /
-        # mamba). No-op on a radix build.
         validate_flat_scheduler_config(
             flat_kvcache_ext=scheduler_ext_flat_kvcache(),
             paged_cache_groups=paged_cache_groups,

@@ -89,13 +89,15 @@ TEST(MakeCoordinatorTest, BuildsOneGroupPerSpec) {
     EXPECT_EQ(coord.NumGroups(), 2);
 }
 
-TEST(MakeCoordinatorTest, RejectsMismatchedPageSize) {
+TEST(MakeCoordinatorTest, AcceptsDivisibleBlockSizesAndFoldsGcdLcm) {
     BlockPool pool(16);
     std::vector<KvCacheSpec> specs = {
         {AttnKind::kFull, 4, 0},
-        {AttnKind::kSlidingWindow, 8, 10},  // different block_size
+        {AttnKind::kSlidingWindow, 8, 10},  // per-group block_size (multiple of base)
     };
-    EXPECT_THROW(MakeCoordinator(specs, pool), std::runtime_error);
+    KvCacheCoordinator coord = MakeCoordinator(specs, pool);
+    EXPECT_EQ(coord.BaseBlockSize(), 4);  // gcd(4,8)
+    EXPECT_EQ(coord.LcmBlockSize(), 8);   // lcm(4,8)
 }
 
 TEST(CoordinatorMatchTest, BothGroupsAllMiss) {
@@ -1329,6 +1331,151 @@ TEST(MambaStateRegistrationTest, UnalignedEndRegistersNoStatePages) {
     EXPECT_NE(pool.GetCachedBlock(MakeKeyWithGroupId(ch[2], 0)), nullptr);  // full group unaffected
     EXPECT_EQ(pool.GetCachedBlock(MakeKeyWithGroupId(ch[2], 1)), nullptr);  // state group skipped
     coord.Free(tables);
+}
+
+// ---- Hetero block_size (folded per-group granularity) -------------------
+
+// {4,8}: base=4, group1 folds every 2 base pages into one 8-token coarse block. The
+// converged boundary must be the cross-group min expressed in TOKENS (Step C token bound).
+TEST(HeteroFoldedMatchTest, ConvergedBoundaryIsCrossGroupMinInTokens) {
+    BlockPool pool(64, true);
+    std::vector<KvCacheSpec> specs = {{AttnKind::kFull, 4, 0}, {AttnKind::kFull, 8, 0}};
+    KvCacheCoordinator coord = MakeCoordinator(specs, pool);
+    ASSERT_EQ(coord.BaseBlockSize(), 4);
+
+    // 4 base pages (16 tokens). group0 caches 3 base blocks (12 tokens of coverage);
+    // group1 caches only its first folded coarse block (base pages [0,1] -> 8 tokens).
+    std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}});
+    CacheForGroup(pool, ch[0], 0);
+    CacheForGroup(pool, ch[1], 0);
+    CacheForGroup(pool, ch[2], 0);
+    std::vector<std::string> folded_g1 = FoldBaseHashes(ch, /*first_base=*/0, /*m=*/2);
+    ASSERT_EQ(folded_g1.size(), 2u);
+    CacheForGroup(pool, folded_g1[0], 1);  // gid 1, coarse block 0
+
+    CoordinatorMatch m = coord.MatchPrefix(ch).device;
+    EXPECT_EQ(m.num_common_tokens, 8) << "min(12 tokens, 8 tokens) in TOKENS, not blocks";
+    ASSERT_EQ(m.per_group.size(), 2u);
+    EXPECT_EQ(m.per_group[0].blocks.size(), 2u);  // 8 tokens / 4 = 2 base blocks (truncated from 3)
+    EXPECT_EQ(m.per_group[1].blocks.size(), 1u);  // 8 tokens / 8 = 1 coarse block
+}
+
+// {8,4}: groups_[0].block_size(8) > base(=gcd(8,4)=4). The Step C token bound seeds
+// SweepThenConverge with num_base_pages * base_block_size_; the pre-fix code used
+// num_base_pages * groups_[0].Spec().block_size, which here is DOUBLE the real token count.
+// That wrong bound is only an initial UPPER cap on the converge seed, and every group's
+// Match self-caps at min(keys.size(), max_blocks) and breaks on the first miss -- and
+// keys.size() derives from the request's own content_hashes, so cached availability can
+// never exceed the true request length. The over-loose bound is therefore non-binding in
+// every reachable state and unobservable through MatchPrefix (with {8,4} just as with the
+// {4,8} case above, where buggy == fixed exactly). This is a positive guard: it asserts the
+// CORRECT cross-group-min-in-TOKENS boundary for a group whose block_size exceeds base, so
+// the fold/bound wiring stays correct-by-construction even though the unit bug is unreachable.
+TEST(HeteroFoldedMatchTest, ConvergedBoundaryWithGroup0LargerThanBase) {
+    BlockPool pool(64, true);
+    std::vector<KvCacheSpec> specs = {{AttnKind::kFull, 8, 0}, {AttnKind::kFull, 4, 0}};
+    KvCacheCoordinator coord = MakeCoordinator(specs, pool);
+    ASSERT_EQ(coord.BaseBlockSize(), 4);  // gcd(8,4); groups_[0].block_size(8) is DOUBLE base
+
+    // 4 base pages (16 tokens). group0 (block_size 8) caches only its first folded coarse
+    // block (base pages [0,1] -> 8 tokens); group1 (block_size 4) caches all 4 base blocks.
+    std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}});
+    std::vector<std::string> folded_g0 = FoldBaseHashes(ch, /*first_base=*/0, /*m=*/2);
+    ASSERT_EQ(folded_g0.size(), 2u);
+    CacheForGroup(pool, folded_g0[0], 0);  // gid 0, coarse block 0 only (block 1 misses)
+    for (const std::string& h : ch) CacheForGroup(pool, h, 1);
+
+    CoordinatorMatch m = coord.MatchPrefix(ch).device;
+    EXPECT_EQ(m.num_common_tokens, 8) << "min(8 tokens, 16 tokens) in TOKENS; base-unit bound, not 8*num";
+    ASSERT_EQ(m.per_group.size(), 2u);
+    EXPECT_EQ(m.per_group[0].blocks.size(), 1u);  // 8 tokens / 8 = 1 coarse block
+    EXPECT_EQ(m.per_group[1].blocks.size(), 2u);  // 8 tokens / 4 = 2 base blocks (truncated from 4)
+}
+
+// {4,8}: two full groups over 16 tokens register at their OWN folded granularity, and a
+// second MatchPrefix hits every registered block.
+TEST(HeteroFoldedRegistrationTest, EachGroupRegistersAtOwnGranularityThenHits) {
+    BlockPool pool(64, true);
+    std::vector<KvCacheSpec> specs = {{AttnKind::kFull, 4, 0}, {AttnKind::kFull, 8, 0}};
+    KvCacheCoordinator coord = MakeCoordinator(specs, pool);
+    std::vector<BlockTable> tables(coord.NumGroups());
+    ASSERT_TRUE(coord.Acquire(tables, /*num_tokens=*/16));
+    EXPECT_EQ(tables[0].NumBlocks(), 4);  // 16 / 4
+    EXPECT_EQ(tables[1].NumBlocks(), 2);  // 16 / 8
+
+    std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}});
+    coord.CacheFullBlocks(tables, ch, /*first_slot=*/0, /*end_tokens=*/16);
+
+    // group0: 4 base coarse blocks; group1: 2 folded coarse blocks.
+    std::vector<std::string> folded_g1 = FoldBaseHashes(ch, 0, 2);
+    for (const std::string& h : ch) EXPECT_NE(pool.GetCachedBlock(MakeKeyWithGroupId(h, 0)), nullptr);
+    for (const std::string& h : folded_g1) EXPECT_NE(pool.GetCachedBlock(MakeKeyWithGroupId(h, 1)), nullptr);
+
+    CoordinatorMatch m = coord.MatchPrefix(ch).device;
+    EXPECT_EQ(m.num_common_tokens, 16);
+    ASSERT_EQ(m.per_group.size(), 2u);
+    EXPECT_EQ(m.per_group[0].blocks.size(), 4u);
+    EXPECT_EQ(m.per_group[1].blocks.size(), 2u);
+    coord.Free(tables);
+}
+
+// A mamba (RegistersAlignedFinalPageOnly) group with m>1: only the FINAL aligned folded
+// coarse block registers; the earlier coarse block stays unregistered.
+TEST(HeteroFoldedRegistrationTest, MambaGroupRegistersOnlyFinalFoldedBlock) {
+    BlockPool pool(64, true);
+    std::vector<KvCacheSpec> specs = {{AttnKind::kFull, 4, 0}, {AttnKind::kMambaState, 8, 0}};
+    KvCacheCoordinator coord = MakeCoordinator(specs, pool);
+    ASSERT_EQ(coord.BaseBlockSize(), 4);
+    std::vector<BlockTable> tables(coord.NumGroups());
+    ASSERT_TRUE(coord.Acquire(tables, /*num_tokens=*/16));
+    EXPECT_EQ(tables[1].NumBlocks(), 2);  // 16 / 8, two folded coarse blocks
+
+    std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}});
+    coord.CacheFullBlocks(tables, ch, /*first_slot=*/0, /*end_tokens=*/16);  // 16 % 8 == 0
+
+    std::vector<std::string> folded_g1 = FoldBaseHashes(ch, 0, 2);
+    ASSERT_EQ(folded_g1.size(), 2u);
+    EXPECT_EQ(pool.GetCachedBlock(MakeKeyWithGroupId(folded_g1[0], 1)), nullptr);  // interior: skipped
+    EXPECT_NE(pool.GetCachedBlock(MakeKeyWithGroupId(folded_g1[1], 1)), nullptr);  // aligned end: registered
+    // full group unaffected: all 4 base blocks registered.
+    for (const std::string& h : ch) EXPECT_NE(pool.GetCachedBlock(MakeKeyWithGroupId(h, 0)), nullptr);
+    coord.Free(tables);
+}
+
+// End-to-end: a second request sharing only a prefix converges BOTH groups to the same
+// token boundary despite their different block sizes.
+TEST(HeteroFoldedRegistrationTest, PartialPrefixConvergesInTokens) {
+    BlockPool pool(64, true);
+    std::vector<KvCacheSpec> specs = {{AttnKind::kFull, 4, 0}, {AttnKind::kFull, 8, 0}};
+    KvCacheCoordinator coord = MakeCoordinator(specs, pool);
+    std::vector<BlockTable> tables(coord.NumGroups());
+    ASSERT_TRUE(coord.Acquire(tables, /*num_tokens=*/16));
+    std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}});
+    coord.CacheFullBlocks(tables, ch, /*first_slot=*/0, /*end_tokens=*/16);
+
+    // Second request shares base pages 0,1 (tokens 0..8) then diverges.
+    std::vector<std::string> other = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {9, 9, 9, 9}, {8, 8, 8, 8}});
+    CoordinatorMatch m = coord.MatchPrefix(other).device;
+    EXPECT_EQ(m.num_common_tokens, 8);            // 2 base pages of 4 tokens
+    EXPECT_EQ(m.per_group[0].blocks.size(), 2u);  // 8 / 4
+    EXPECT_EQ(m.per_group[1].blocks.size(), 1u);  // 8 / 8, one folded coarse block
+    coord.Free(tables);
+}
+
+// End-to-end: after a full acquire/register/free cycle the pool returns to baseline
+// (no leaked device blocks across heterogeneous group granularities).
+TEST(HeteroFoldedRegistrationTest, FullCycleRestoresPoolBaseline) {
+    BlockPool pool(64, true);
+    std::vector<KvCacheSpec> specs = {{AttnKind::kFull, 4, 0}, {AttnKind::kFull, 8, 0}};
+    KvCacheCoordinator coord = MakeCoordinator(specs, pool);
+    const std::int32_t free_before = pool.NumFreeBlocks();
+    std::vector<BlockTable> tables(coord.NumGroups());
+    ASSERT_TRUE(coord.Acquire(tables, /*num_tokens=*/16));
+    std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}});
+    coord.CacheFullBlocks(tables, ch, /*first_slot=*/0, /*end_tokens=*/16);
+    coord.Free(tables);
+    // Cached-but-free blocks stay in the free list (evictable), so the count returns to baseline.
+    EXPECT_EQ(pool.NumFreeBlocks(), free_before);
 }
 
 }  // namespace

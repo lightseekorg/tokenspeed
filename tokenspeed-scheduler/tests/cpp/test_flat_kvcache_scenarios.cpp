@@ -30,6 +30,7 @@
 #include <set>
 #include <stdexcept>
 
+#include "cache/forward_cache_ops.h"
 #include "integration_test_helper.h"
 
 namespace tokenspeed::test {
@@ -3208,6 +3209,55 @@ TEST_F(FlatChunkedHostHitSuite, ChunkedPrefillAfterHostHit) {
     EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start) << "pool balances after the chunked host hit";
 }
 
+
+// ---------------------------------------------------------------------------
+// Heterogeneous per-group block_size: specs carry each group's own block_size
+// and BaseBlockSize() folds them via GCD.
+// ---------------------------------------------------------------------------
+TEST(HeteroBlockSize, SpecsCarryPerGroupBlockSize) {
+    SchedulerConfig cfg{};
+    cfg.block_size = 2;
+    cfg.device_allocator.total_pages = 64;
+    cfg.host_allocator.total_pages = 64;
+    cfg.paged_cache_groups = {
+        MakeGroup("full_a", cfg.block_size, cfg.device_allocator.total_pages,
+                  PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
+        MakeGroup("full_b", cfg.block_size, cfg.device_allocator.total_pages,
+                  PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::History),
+    };
+    cfg.paged_cache_groups[0].block_size = 4;
+    cfg.paged_cache_groups[1].block_size = 8;
+
+    std::vector<KvCacheSpec> specs = MakeSpecsFromConfig(cfg);
+    ASSERT_EQ(specs.size(), 2u);
+    EXPECT_EQ(specs[0].block_size, 4);
+    EXPECT_EQ(specs[1].block_size, 8);
+    EXPECT_EQ(cfg.BaseBlockSize(), 4);
+}
+
+// Build one full-attn CacheGroup per block_size and hand the specs to MakeCoordinator,
+// so the coordinator folds GCD/LCM over a heterogeneous block_size set.
+static std::unique_ptr<KvCacheCoordinator> MakeCoordinatorFrom(std::vector<std::int32_t> block_sizes) {
+    static BlockPool pool(/*total_num_blocks=*/256);
+    std::vector<KvCacheSpec> specs;
+    specs.reserve(block_sizes.size());
+    for (std::int32_t bs : block_sizes) {
+        specs.push_back(KvCacheSpec{AttnKind::kFull, /*block_size=*/bs, /*sliding_window=*/0});
+    }
+    return std::make_unique<KvCacheCoordinator>(MakeCoordinator(specs, pool));
+}
+
+TEST(HeteroBlockSize, MakeCoordinatorAcceptsDivisibleBlockSizes) {
+    auto coord = MakeCoordinatorFrom({4, 8});
+    EXPECT_EQ(coord->BaseBlockSize(), 4);  // gcd(4,8)
+    EXPECT_EQ(coord->LcmBlockSize(), 8);   // lcm(4,8)
+}
+
+TEST(HeteroBlockSize, BaseAndLcmForThreeGroups) {
+    auto coord = MakeCoordinatorFrom({4, 6, 8});
+    EXPECT_EQ(coord->BaseBlockSize(), 2);  // gcd(4,6,8)
+    EXPECT_EQ(coord->LcmBlockSize(), 24);  // lcm(4,6,8)
+}
 
 }  // namespace tokenspeed::test
 

@@ -140,7 +140,9 @@ Scheduler::FlatAdmissionMatch Scheduler::matchFlatPrefixAtAdmission(Request* req
     }
     // Hash input must be byte-identical to the REGISTRATION form (GetFullPagedTokens(false)); radix's
     // except_last rule (last prompt token recomputed for logits) becomes the page cap, also bounding SWA.
-    const std::int32_t cap_pages = std::max((request->PrefillSize() - 1) / config_.block_size, 0);
+    // These offsets index the base-granular hash array (GetFullPagedTokens is cut at base).
+    const std::int32_t base_block_size = coordinator_.BaseBlockSize();
+    const std::int32_t cap_pages = std::max((request->PrefillSize() - 1) / base_block_size, 0);
     std::vector<std::span<const std::int32_t>> paged_tokens = request->GetFullPagedTokens(/*except_last=*/false);
     if (static_cast<std::size_t>(cap_pages) < paged_tokens.size()) {
         paged_tokens.resize(cap_pages);
@@ -150,11 +152,11 @@ Scheduler::FlatAdmissionMatch Scheduler::matchFlatPrefixAtAdmission(Request* req
     auto [device, host] = coordinator_.MatchPrefix(flat_hashes);
     match.device = std::move(device);
     match.host = std::move(host);
-    // Boundaries are in tokens; the extension hash offsets are in scheduler pages (uniform P,
-    // same granularity the hashes were computed at). No host pool -> host boundary 0 -> empty slice.
+    // Boundaries are in tokens; the extension hash offsets are in base pages (the granularity the
+    // hashes were computed at). No host pool -> host boundary 0 -> empty slice.
     const std::int32_t ext_pages =
-        std::max(match.host.num_common_tokens - match.device.num_common_tokens, 0) / config_.block_size;
-    const auto ext_begin = flat_hashes.begin() + match.device.num_common_tokens / config_.block_size;
+        std::max(match.host.num_common_tokens - match.device.num_common_tokens, 0) / base_block_size;
+    const auto ext_begin = flat_hashes.begin() + match.device.num_common_tokens / base_block_size;
     match.ext_hashes.assign(ext_begin, ext_begin + ext_pages);
     return match;
 }

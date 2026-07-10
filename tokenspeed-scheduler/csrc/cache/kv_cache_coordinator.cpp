@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <numeric>
 
 #include "cache/full_attn_manager.h"
 #include "cache/mamba_state_manager.h"
@@ -32,8 +33,14 @@
 namespace tokenspeed {
 
 KvCacheCoordinator::KvCacheCoordinator(std::vector<CacheGroup> groups, BlockPool& pool,
-                                       const BlockPool* host_pool)
-    : groups_{std::move(groups)}, pool_{pool}, host_pool_{host_pool} {
+                                       const BlockPool* host_pool, std::int32_t base_block_size,
+                                       std::int32_t lcm_block_size)
+    : groups_{std::move(groups)},
+      pool_{pool},
+      host_pool_{host_pool},
+      base_block_size_{base_block_size},
+      lcm_block_size_{lcm_block_size} {
+    _assert(base_block_size_ > 0 && lcm_block_size_ > 0, "coordinator needs positive base/lcm block sizes");
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         if (groups_[i].Manager().MatchIsPrefixClosed()) {
             match_order_.push_back(i);
@@ -47,13 +54,11 @@ KvCacheCoordinator::KvCacheCoordinator(std::vector<CacheGroup> groups, BlockPool
 }
 
 std::vector<std::string> KvCacheCoordinator::keysForGroup(std::span<const std::string> content_hashes,
-                                                          std::uint32_t group_id) const {
-    std::vector<std::string> keys;
-    keys.reserve(content_hashes.size());
-    for (const std::string& h : content_hashes) {
-        keys.push_back(MakeKeyWithGroupId(h, group_id));
-    }
-    return keys;
+                                                          std::uint32_t group_id,
+                                                          std::int32_t group_block_size,
+                                                          std::int32_t first_base) const {
+    const std::int32_t m = group_block_size / base_block_size_;
+    return MakeFoldedGroupKeys(content_hashes, group_id, m, first_base);
 }
 
 namespace {
@@ -92,17 +97,19 @@ std::vector<std::vector<std::string>> KvCacheCoordinator::buildGroupKeys(
     std::span<const std::string> content_hashes) const {
     std::vector<std::vector<std::string>> group_keys(groups_.size());
     for (std::size_t i = 0; i < groups_.size(); ++i) {
-        group_keys[i] = keysForGroup(content_hashes, groups_[i].GroupId());
+        group_keys[i] = keysForGroup(content_hashes, groups_[i].GroupId(), groups_[i].Spec().block_size,
+                                     /*first_base=*/0);
     }
     return group_keys;
 }
 
 // The one tier matcher: slots below floor_tokens are assumed valid in a lower tier; per_group
 // blocks are relative to the floor, num_common_tokens is the absolute converged boundary.
-// Boundaries are in TOKENS (the cross-block-size unit); slot math still assumes uniform P.
+// Boundaries are in TOKENS (the cross-block-size unit). num_base_pages is the base-granularity
+// page count (content_hashes.size()); group_keys[i] is already folded to group i's coarse blocks.
 CoordinatorMatch KvCacheCoordinator::matchTierWithKeys(const BlockPool& pool,
                                                        std::span<const std::vector<std::string>> group_keys,
-                                                       std::int32_t total_blocks,
+                                                       std::int32_t num_base_pages,
                                                        std::int32_t floor_tokens) const {
     CoordinatorMatch out;
     out.per_group.resize(groups_.size());
@@ -110,7 +117,7 @@ CoordinatorMatch KvCacheCoordinator::matchTierWithKeys(const BlockPool& pool,
         return out;
     }
     const std::int32_t boundary_tokens = SweepThenConverge(
-        match_order_, groups_, total_blocks * groups_[0].Spec().block_size,
+        match_order_, groups_, num_base_pages * base_block_size_,
         [&](std::size_t i, std::int32_t bound_tokens) {
             const std::int32_t group_block_size = groups_[i].Spec().block_size;
             out.per_group[i] = groups_[i].Manager().Match(pool, group_keys[i], floor_tokens / group_block_size,
@@ -144,11 +151,11 @@ CoordinatorMatch KvCacheCoordinator::matchTierWithKeys(const BlockPool& pool,
 KvCacheCoordinator::AdmissionMatch KvCacheCoordinator::MatchPrefix(
     std::span<const std::string> content_hashes) const {
     const std::vector<std::vector<std::string>> group_keys = buildGroupKeys(content_hashes);
-    const std::int32_t total_blocks = static_cast<std::int32_t>(content_hashes.size());
+    const std::int32_t num_base_pages = static_cast<std::int32_t>(content_hashes.size());
     AdmissionMatch out;
-    out.device = matchTierWithKeys(pool_, group_keys, total_blocks, /*floor_tokens=*/0);
+    out.device = matchTierWithKeys(pool_, group_keys, num_base_pages, /*floor_tokens=*/0);
     if (host_pool_ != nullptr) {
-        out.host = matchTierWithKeys(*host_pool_, group_keys, total_blocks,
+        out.host = matchTierWithKeys(*host_pool_, group_keys, num_base_pages,
                                      /*floor_tokens=*/out.device.num_common_tokens);
     }
     return out;
@@ -230,19 +237,24 @@ void KvCacheCoordinator::CacheFullBlocks(std::span<BlockTable> tables,
         return;  // hot decode rounds usually fill no page
     }
     for (std::size_t i = 0; i < groups_.size(); ++i) {
-        std::vector<std::string> keys = keysForGroup(content_hashes, groups_[i].GroupId());
-        std::int32_t group_first_slot = first_slot;
+        const std::int32_t group_block_size = groups_[i].Spec().block_size;
+        const std::int32_t m = group_block_size / base_block_size_;
+        // The first coarse block sits at table slot ceil(first_slot / m): the first grid-aligned
+        // block fully inside the range (fold drops any leading remainder).
+        std::vector<std::string> keys =
+            keysForGroup(content_hashes, groups_[i].GroupId(), group_block_size, /*first_base=*/first_slot);
+        std::int32_t group_first_slot = (first_slot + m - 1) / m;
         std::span<const std::string> group_keys = keys;
         if (groups_[i].Manager().RegistersAlignedFinalPageOnly()) {
-            // Interior page boundaries never received a state write; only an aligned chunk
-            // end holds a real snapshot, and it lives in the final full page of the range.
-            if (end_tokens < 0 || end_tokens % groups_[i].Spec().block_size != 0) {
+            // Interior boundaries never received a state write; only an aligned chunk end holds a
+            // real snapshot, in the final full coarse block.
+            if (end_tokens < 0 || end_tokens % group_block_size != 0 || keys.empty()) {
                 continue;
             }
-            group_first_slot = first_slot + static_cast<std::int32_t>(keys.size()) - 1;
+            const std::int32_t past_end_slot = group_first_slot + static_cast<std::int32_t>(keys.size());
+            group_first_slot = past_end_slot - 1;
             group_keys = group_keys.last(1);
-            const bool aligned_range = first_slot + static_cast<std::int32_t>(keys.size()) ==
-                                       end_tokens / groups_[i].Spec().block_size;
+            const bool aligned_range = past_end_slot == end_tokens / group_block_size;
             _assert(aligned_range, "state registration range must end at the aligned boundary");
         }
         std::vector<std::pair<std::string, CacheBlock*>> newly_cached;
@@ -271,12 +283,17 @@ void KvCacheCoordinator::Free(std::span<BlockTable> tables) {
 KvCacheCoordinator MakeCoordinator(std::span<const KvCacheSpec> specs, BlockPool& pool,
                                    const BlockPool* host_pool) {
     _assert(!specs.empty(), "MakeCoordinator requires at least one spec");
-    std::int32_t block_size = specs[0].block_size;
+    std::int32_t base = specs[0].block_size;
+    std::int32_t lcm = specs[0].block_size;
+    for (const KvCacheSpec& spec : specs) {
+        base = std::gcd(base, spec.block_size);
+        lcm = std::lcm(lcm, spec.block_size);
+    }
     std::vector<CacheGroup> groups;
     groups.reserve(specs.size());
     for (std::size_t i = 0; i < specs.size(); ++i) {
         const KvCacheSpec& spec = specs[i];
-        _assert(spec.block_size == block_size, "all groups must share the same block_size");
+        _assert(spec.block_size % base == 0, "group block_size must be a multiple of base");
         std::unique_ptr<KvCacheManager> manager;
         if (spec.kind == AttnKind::kFull) {
             manager = std::make_unique<FullAttnManager>(spec.block_size);
@@ -287,7 +304,7 @@ KvCacheCoordinator MakeCoordinator(std::span<const KvCacheSpec> specs, BlockPool
         }
         groups.emplace_back(spec, static_cast<std::uint32_t>(i), std::move(manager));
     }
-    return KvCacheCoordinator{std::move(groups), pool, host_pool};
+    return KvCacheCoordinator{std::move(groups), pool, host_pool, base, lcm};
 }
 
 }  // namespace tokenspeed

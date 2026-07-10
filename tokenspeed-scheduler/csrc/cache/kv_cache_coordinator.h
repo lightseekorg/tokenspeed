@@ -45,9 +45,14 @@ struct CoordinatorMatch {
 class KvCacheCoordinator {
 public:
     // The host tier is fixed at construction: bound, CacheFullBlocks feeds the sink mailbox.
-    KvCacheCoordinator(std::vector<CacheGroup> groups, BlockPool& pool, const BlockPool* host_pool = nullptr);
+    KvCacheCoordinator(std::vector<CacheGroup> groups, BlockPool& pool, const BlockPool* host_pool = nullptr,
+                       std::int32_t base_block_size = 0, std::int32_t lcm_block_size = 0);
 
     std::int32_t NumGroups() const { return static_cast<std::int32_t>(groups_.size()); }
+
+    // GCD/LCM of every group's block_size: the granularity keys fold at, and the one they align to.
+    std::int32_t BaseBlockSize() const { return base_block_size_; }
+    std::int32_t LcmBlockSize() const { return lcm_block_size_; }
 
     KvCacheManager& GroupManager(std::int32_t i) { return groups_[static_cast<std::size_t>(i)].Manager(); }
     const KvCacheManager& GroupManager(std::int32_t i) const {
@@ -96,21 +101,28 @@ public:
     bool HasHostTier() const { return host_pool_ != nullptr; }
 
 private:
+    // Base-granularity content_hashes -> the group's coarse-block lookup keys: fold m = the
+    // group's block_size / base base pages into one coarse block, then wrap with group_id.
+    // first_base is content_hashes[0]'s global base-page index, so a chunk starting mid-grid
+    // drops its leading remainder (see MakeFoldedGroupKeys).
     std::vector<std::string> keysForGroup(std::span<const std::string> content_hashes,
-                                          std::uint32_t group_id) const;
+                                          std::uint32_t group_id, std::int32_t group_block_size,
+                                          std::int32_t first_base = 0) const;
     std::vector<std::vector<std::string>> buildGroupKeys(std::span<const std::string> content_hashes) const;
     CoordinatorMatch matchTierWithKeys(const BlockPool& pool,
                                        std::span<const std::vector<std::string>> group_keys,
-                                       std::int32_t total_blocks, std::int32_t floor_tokens) const;
+                                       std::int32_t num_base_pages, std::int32_t floor_tokens) const;
     std::vector<CacheGroup> groups_;
     // Closed groups first, so non-closed groups match against a settled bound.
     std::vector<std::size_t> match_order_;
     BlockPool& pool_;
     const BlockPool* host_pool_{nullptr};
+    std::int32_t base_block_size_{0};
+    std::int32_t lcm_block_size_{0};
     std::vector<StoreCandidate> pending_stores_;
 };
 
-// One CacheGroup per spec (group_id = index); asserts every spec shares the same block_size.
+// One CacheGroup per spec (group_id = index); carries GCD/LCM of the per-group block_sizes.
 KvCacheCoordinator MakeCoordinator(std::span<const KvCacheSpec> specs, BlockPool& pool,
                                    const BlockPool* host_pool = nullptr);
 

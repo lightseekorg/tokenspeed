@@ -28,6 +28,8 @@
 
 #include <openssl/sha.h>
 
+#include "utils.h"
+
 namespace tokenspeed {
 
 // Helper Func: Append each byte of [bytes, bytes+n) to out as two lowercase hex
@@ -159,6 +161,29 @@ inline std::vector<std::string> FlatWindowPageHashes(std::vector<std::span<const
 // as 8 hex characters (64-hex content hash -> 72-hex key).
 inline constexpr std::size_t kGroupIdHexLen = 8;  // 4-byte group_id as hex
 
+// Fold m consecutive base content hashes into one coarse-block content hash
+// (group block_size = m * base), coarsening the once-computed chain per group
+// without re-hashing tokens. first_base is the global base-page index of
+// base_hashes[0]; only complete blocks on the group grid are emitted, so
+// idx = (m - first_base%m) % m skips a leading remainder. Chained via HashPage
+// so order matters and no two runs collide.
+inline std::vector<std::string> FoldBaseHashes(std::span<const std::string> base_hashes,
+                                               std::int32_t first_base, std::int32_t m) {
+    _assert(m >= 1, "fold factor must be >= 1");
+    std::vector<std::string> out;
+    out.reserve(base_hashes.size() / m + 1);
+    std::int32_t idx = (m - first_base % m) % m;
+    for (; idx + m <= static_cast<std::int32_t>(base_hashes.size()); idx += m) {
+        std::string running;
+        for (std::int32_t k = 0; k < m; ++k) {
+            running = HashPage(std::span<const std::int32_t>{}, running,
+                               std::vector<std::string>{base_hashes[idx + k]});
+        }
+        out.push_back(running);
+    }
+    return out;
+}
+
 inline std::string MakeKeyWithGroupId(const std::string& block_hash, uint32_t group_id) {
     std::string key = block_hash;
     uint8_t b[4] = {
@@ -169,6 +194,30 @@ inline std::string MakeKeyWithGroupId(const std::string& block_hash, uint32_t gr
     };
     AppendHexBytes(key, b, 4);
     return key;
+}
+
+// Fold base content hashes into the group's coarse blocks (m = group_block_size
+// / base), then wrap each with group_id. m == 1 keeps each base hash verbatim
+// instead of folding: FoldBaseHashes(m==1) would re-hash through HashPage, so
+// the bypass is what keeps a uniform-block_size group's keys unchanged.
+inline std::vector<std::string> MakeFoldedGroupKeys(std::span<const std::string> base_hashes,
+                                                    std::uint32_t group_id, std::int32_t m,
+                                                    std::int32_t first_base = 0) {
+    _assert(m >= 1, "fold factor must be >= 1");
+    std::vector<std::string> keys;
+    if (m == 1) {
+        keys.reserve(base_hashes.size());
+        for (const std::string& h : base_hashes) {
+            keys.push_back(MakeKeyWithGroupId(h, group_id));
+        }
+        return keys;
+    }
+    std::vector<std::string> folded = FoldBaseHashes(base_hashes, first_base, m);
+    keys.reserve(folded.size());
+    for (const std::string& h : folded) {
+        keys.push_back(MakeKeyWithGroupId(h, group_id));
+    }
+    return keys;
 }
 
 // Recover the content hash (strip the trailing group_id hex characters).

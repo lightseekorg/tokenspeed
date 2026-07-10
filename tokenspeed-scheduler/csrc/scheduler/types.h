@@ -24,6 +24,7 @@
 #include <unordered_map>
 #include <variant>
 #include <cstdint>
+#include <numeric>
 #include <string>
 #include <vector>
 #include <memory>
@@ -85,6 +86,17 @@ struct SchedulerConfig {
     } device_allocator;
 
     std::vector<PagedCacheGroupConfig> paged_cache_groups{};
+
+    // GCD of every group's effective block_size (per-group override, else the global
+    // block_size): the base page granularity all group block sizes are multiples of.
+    std::int32_t BaseBlockSize() const {
+        std::int32_t base = 0;
+        for (const auto& g : paged_cache_groups) {
+            std::int32_t bs = g.block_size > 0 ? g.block_size : block_size;
+            base = base == 0 ? bs : std::gcd(base, bs);
+        }
+        return base == 0 ? block_size : base;
+    }
 
     // Streaming-sink (flat L2) enablement: an L2 host tier exists (> 1: page 0 is the null
     // placeholder) and this role writes to it.

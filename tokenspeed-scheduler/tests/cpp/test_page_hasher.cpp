@@ -300,5 +300,68 @@ TEST(ComputePagedHashesWithGroupTest, GroupDoesNotLeakIntoPrefixChain) {
     }
 }
 
+// ---- FoldBaseHashes ----------------------------------------------------
+
+TEST(FoldBaseHashesTest, IdentityWhenGroupEqualsBase) {
+    std::vector<std::string> base = {"aa", "bb", "cc"};
+    auto folded = FoldBaseHashes(base, /*first_base=*/0, /*m=*/1);
+    ASSERT_EQ(folded.size(), 3u);
+    EXPECT_EQ(folded[0], HashPage(std::span<const std::int32_t>{}, "", std::vector<std::string>{"aa"}));
+}
+
+TEST(FoldBaseHashesTest, FoldsMConsecutiveIntoOneOrderSensitive) {
+    std::vector<std::string> base = {"a0", "a1", "a2", "a3", "a4", "a5"};
+    auto folded = FoldBaseHashes(base, 0, 2);
+    ASSERT_EQ(folded.size(), 3u);
+    std::vector<std::string> swapped = {"a1", "a0", "a2", "a3", "a4", "a5"};
+    auto folded2 = FoldBaseHashes(swapped, 0, 2);
+    EXPECT_NE(folded[0], folded2[0]);
+    EXPECT_EQ(folded[1], folded2[1]);
+}
+
+TEST(FoldBaseHashesTest, DropsIncompleteTrailingGroupBlock) {
+    std::vector<std::string> base = {"a0", "a1", "a2", "a3", "a4"};
+    auto folded = FoldBaseHashes(base, 0, 2);
+    EXPECT_EQ(folded.size(), 2u);
+}
+
+TEST(FoldBaseHashesTest, FirstBaseOffsetShiftsFoldWindow) {
+    // first_base=1, m=2: first_base%m==1 -> drop 1 leading page, [a2,a3] folds into 1 block
+    std::vector<std::string> base = {"a1", "a2", "a3"};
+    auto folded = FoldBaseHashes(base, /*first_base=*/1, /*m=*/2);
+    ASSERT_EQ(folded.size(), 1u);
+}
+
+// ---- MakeFoldedGroupKeys ----------------------------------------------
+
+TEST(MakeFoldedGroupKeysTest, MEqualsOneIsByteIdenticalToRawPerBaseKey) {
+    std::vector<std::string> base = {"aa", "bb", "cc"};
+    auto keys = MakeFoldedGroupKeys(base, /*group_id=*/7, /*m=*/1);
+    ASSERT_EQ(keys.size(), 3u);
+    for (std::size_t i = 0; i < base.size(); ++i) {
+        EXPECT_EQ(keys[i], MakeKeyWithGroupId(base[i], 7)) << "page " << i;
+    }
+}
+
+TEST(MakeFoldedGroupKeysTest, MTwoFoldsThenWrapsGroupId) {
+    std::vector<std::string> base = {"a0", "a1", "a2", "a3"};
+    auto keys = MakeFoldedGroupKeys(base, /*group_id=*/3, /*m=*/2);
+    auto folded = FoldBaseHashes(base, /*first_base=*/0, /*m=*/2);
+    ASSERT_EQ(keys.size(), 2u);
+    ASSERT_EQ(folded.size(), 2u);
+    for (std::size_t i = 0; i < folded.size(); ++i) {
+        EXPECT_EQ(keys[i], MakeKeyWithGroupId(folded[i], 3)) << "coarse block " << i;
+    }
+}
+
+TEST(MakeFoldedGroupKeysTest, FirstBaseOffsetShiftsFoldedKeys) {
+    // first_base=1, m=2 -> drop 1 leading base page, [a2,a3] fold into 1 coarse key.
+    std::vector<std::string> base = {"a1", "a2", "a3"};
+    auto keys = MakeFoldedGroupKeys(base, /*group_id=*/0, /*m=*/2, /*first_base=*/1);
+    auto folded = FoldBaseHashes(base, /*first_base=*/1, /*m=*/2);
+    ASSERT_EQ(keys.size(), 1u);
+    EXPECT_EQ(keys[0], MakeKeyWithGroupId(folded[0], 0));
+}
+
 }  // namespace
 }  // namespace tokenspeed::test
