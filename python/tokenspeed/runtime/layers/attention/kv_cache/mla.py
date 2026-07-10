@@ -80,6 +80,7 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         self.memory_saver_adapter = memory_saver_adapter = (
             TorchMemorySaverAdapter.create(enable=enable_memory_saver)
         )
+        self.page_size_bytes = self._get_page_size_bytes()
 
         with memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False):
             # The padded page 0 is used for writing dummy outputs from padded tokens.
@@ -146,6 +147,62 @@ class MLATokenToKVPool(BaseTokenToKVPool):
             self._init_kv_copy_and_warmup()
         else:
             self._kv_copy_config = None
+
+    def _get_page_size_bytes(self):
+        if self.quant_method == "per_token_head":
+            dim_size_bytes = (
+                self.kv_lora_rank * torch._utils._element_size(self.dtype)
+                + self.qk_rope_head_dim * torch._utils._element_size(self.model_dtype)
+                + 1 * torch._utils._element_size(torch.float32)
+            )
+        else:
+            dim_size_bytes = (
+                self.kv_lora_rank + self.qk_rope_head_dim
+            ) * torch._utils._element_size(self.dtype)
+        return self.page_size * self.layer_num * dim_size_bytes
+
+    def _init_kv_copy_and_warmup(self):
+        # Heuristics for KV copy tiling
+        _KV_COPY_STRIDE_THRESHOLD_LARGE = 8192
+        _KV_COPY_STRIDE_THRESHOLD_MEDIUM = 4096
+        _KV_COPY_TILE_SIZE_LARGE = 512
+        _KV_COPY_TILE_SIZE_MEDIUM = 256
+        _KV_COPY_TILE_SIZE_SMALL = 128
+        _KV_COPY_NUM_WARPS_LARGE_TILE = 8
+        _KV_COPY_NUM_WARPS_SMALL_TILE = 4
+
+        stride_bytes = int(self.data_strides[0].item())
+        if stride_bytes >= _KV_COPY_STRIDE_THRESHOLD_LARGE:
+            bytes_per_tile = _KV_COPY_TILE_SIZE_LARGE
+        elif stride_bytes >= _KV_COPY_STRIDE_THRESHOLD_MEDIUM:
+            bytes_per_tile = _KV_COPY_TILE_SIZE_MEDIUM
+        else:
+            bytes_per_tile = _KV_COPY_TILE_SIZE_SMALL
+
+        self._kv_copy_config = {
+            "bytes_per_tile": bytes_per_tile,
+            "byte_tiles": (stride_bytes + bytes_per_tile - 1) // bytes_per_tile,
+            "num_warps": (
+                _KV_COPY_NUM_WARPS_SMALL_TILE
+                if bytes_per_tile <= _KV_COPY_TILE_SIZE_MEDIUM
+                else _KV_COPY_NUM_WARPS_LARGE_TILE
+            ),
+        }
+
+        dummy_loc = torch.zeros(1, dtype=torch.int32, device=self.device)
+        grid = (self.data_ptrs.numel(), self._kv_copy_config["byte_tiles"])
+
+        copy_all_layer_kv_cache_tiled[grid](
+            self.data_ptrs,
+            self.data_strides,
+            dummy_loc,
+            dummy_loc,
+            1,
+            1,
+            BYTES_PER_TILE=self._kv_copy_config["bytes_per_tile"],
+            num_warps=self._kv_copy_config["num_warps"],
+            num_stages=2,
+        )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         if self._kv_copy_config is None:
