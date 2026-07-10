@@ -1,0 +1,298 @@
+name: Retry Failed Approved PR CI
+
+on:
+  schedule:
+    - cron: "47 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Log eligible reruns without starting them"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  actions: write
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  rerun-failed:
+    name: Rerun failed approved-PR jobs
+    if: github.repository == 'lightseekorg/tokenspeed'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Rerun failed vendor CI jobs
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const workflows = [
+              "pr-test-nvidia.yml",
+              "pr-test-amd.yml",
+              "pr-test-nvidia-arm.yml",
+            ];
+            const memberAssociations = new Set(["MEMBER", "OWNER"]);
+            const maxAttempts = 3;
+            const maxRunAgeMs = 30 * 24 * 60 * 60 * 1000;
+            const dryRun =
+              context.eventName === "workflow_dispatch" &&
+              context.payload.inputs?.dry_run !== "false";
+            const { owner, repo } = context.repo;
+
+            async function getPullRequest(number) {
+              const query = `
+                query($owner: String!, $repo: String!, $number: Int!) {
+                  repository(owner: $owner, name: $repo) {
+                    pullRequest(number: $number) {
+                      state
+                      isDraft
+                      headRefOid
+                      authorAssociation
+                      reviewDecision
+                      author {
+                        login
+                      }
+                    }
+                  }
+                }
+              `;
+              const result = await github.graphql(query, {
+                owner,
+                repo,
+                number,
+              });
+              return result.repository.pullRequest;
+            }
+
+            async function hasFallbackApproval(number, authorLogin) {
+              const reviews = await github.paginate(
+                github.rest.pulls.listReviews,
+                {
+                  owner,
+                  repo,
+                  pull_number: number,
+                  per_page: 100,
+                },
+              );
+              const latestDecisiveReview = new Map();
+
+              for (const review of reviews) {
+                if (
+                  !review.user ||
+                  review.user.login === authorLogin ||
+                  !["APPROVED", "CHANGES_REQUESTED"].includes(review.state)
+                ) {
+                  continue;
+                }
+                const previous = latestDecisiveReview.get(review.user.id);
+                if (
+                  !previous ||
+                  Date.parse(review.submitted_at) >=
+                    Date.parse(previous.submitted_at)
+                ) {
+                  latestDecisiveReview.set(review.user.id, review);
+                }
+              }
+
+              const decisions = [...latestDecisiveReview.values()].map(
+                (review) => review.state,
+              );
+              return (
+                decisions.includes("APPROVED") &&
+                !decisions.includes("CHANGES_REQUESTED")
+              );
+            }
+
+            async function isEligible(number, pullRequest) {
+              if (
+                !pullRequest ||
+                pullRequest.state !== "OPEN" ||
+                pullRequest.isDraft
+              ) {
+                return false;
+              }
+              if (!memberAssociations.has(pullRequest.authorAssociation)) {
+                core.info(
+                  "PR #" + number + ": author " +
+                    (pullRequest.author?.login || "unknown") + " is " +
+                    pullRequest.authorAssociation + ", not an org member.",
+                );
+                return false;
+              }
+              if (pullRequest.reviewDecision === "APPROVED") {
+                return true;
+              }
+              if (pullRequest.reviewDecision !== null) {
+                core.info(
+                  "PR #" + number + ": review decision is " +
+                    pullRequest.reviewDecision + ".",
+                );
+                return false;
+              }
+
+              const approved = await hasFallbackApproval(
+                number,
+                pullRequest.author?.login,
+              );
+              if (!approved) {
+                core.info("PR #" + number + ": no effective approval.");
+              }
+              return approved;
+            }
+
+            const pulls = await github.paginate(github.rest.pulls.list, {
+              owner,
+              repo,
+              state: "open",
+              per_page: 100,
+            });
+
+            core.info(
+              "Scanning " + pulls.length + " open pull request(s)" +
+                (dryRun ? " in dry-run mode." : "."),
+            );
+
+            for (const pull of pulls) {
+              try {
+                const pullRequest = await getPullRequest(pull.number);
+                if (!(await isEligible(pull.number, pullRequest))) {
+                  continue;
+                }
+
+                const selectedRuns = [];
+                for (const workflowId of workflows) {
+                  let runs;
+                  try {
+                    runs = await github.paginate(
+                      github.rest.actions.listWorkflowRuns,
+                      {
+                        owner,
+                        repo,
+                        workflow_id: workflowId,
+                        event: "pull_request",
+                        head_sha: pullRequest.headRefOid,
+                        per_page: 100,
+                      },
+                    );
+                  } catch (error) {
+                    core.warning(
+                      "PR #" + pull.number + ": unable to list runs for " +
+                        workflowId + ": " + error.message,
+                    );
+                    continue;
+                  }
+
+                  const run = runs
+                    .filter(
+                      (candidate) =>
+                        candidate.head_sha === pullRequest.headRefOid &&
+                        candidate.event === "pull_request",
+                    )
+                    .sort(
+                      (left, right) =>
+                        Date.parse(right.created_at) -
+                        Date.parse(left.created_at),
+                    )[0];
+                  if (run) {
+                    selectedRuns.push({ workflowId, run });
+                  } else {
+                    core.info(
+                      "PR #" + pull.number + ": " + workflowId +
+                        " has no run for the current head; not applicable.",
+                    );
+                  }
+                }
+
+                if (selectedRuns.length === 0) {
+                  core.info(
+                    "PR #" + pull.number + ": no vendor CI runs found.",
+                  );
+                  continue;
+                }
+
+                const failedRuns = selectedRuns.filter(
+                  ({ run }) =>
+                    run.status === "completed" &&
+                    run.conclusion === "failure",
+                );
+                if (failedRuns.length === 0) {
+                  core.info(
+                    "PR #" + pull.number + ": vendor CI has no failures.",
+                  );
+                  continue;
+                }
+
+                // Keep the approval, author association, and head SHA checks
+                // close to the mutations. A push can still race this small
+                // window, just as it can in the latest-main retry workflow.
+                const currentPullRequest = await getPullRequest(pull.number);
+                if (
+                  currentPullRequest?.headRefOid !== pullRequest.headRefOid ||
+                  !(await isEligible(pull.number, currentPullRequest))
+                ) {
+                  core.info(
+                    "PR #" + pull.number +
+                      ": eligibility or head changed; skipping reruns.",
+                  );
+                  continue;
+                }
+
+                for (const { workflowId, run } of failedRuns) {
+                  const attempt = run.run_attempt || 1;
+                  if (attempt >= maxAttempts) {
+                    core.warning(
+                      "PR #" + pull.number + ": " + workflowId + " run " +
+                        run.id + " failed on attempt " + attempt +
+                        "; retry limit reached.",
+                    );
+                    continue;
+                  }
+                  if (
+                    Date.now() - Date.parse(run.created_at) >
+                    maxRunAgeMs
+                  ) {
+                    core.warning(
+                      "PR #" + pull.number + ": " + workflowId + " run " +
+                        run.id + " is older than 30 days; skipping.",
+                    );
+                    continue;
+                  }
+
+                  if (dryRun) {
+                    core.notice(
+                      "PR #" + pull.number + ": would rerun failed jobs for " +
+                        workflowId + " run " + run.id + " after attempt " +
+                        attempt + ".",
+                    );
+                    continue;
+                  }
+
+                  try {
+                    await github.request(
+                      "POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun-failed-jobs",
+                      { owner, repo, run_id: run.id },
+                    );
+                    core.notice(
+                      "PR #" + pull.number + ": rerunning failed jobs for " +
+                        workflowId + " run " + run.id + " after attempt " +
+                        attempt + ".",
+                    );
+                  } catch (error) {
+                    core.warning(
+                      "PR #" + pull.number + ": unable to rerun failed jobs " +
+                        "for " + workflowId + " run " + run.id + ": " +
+                        error.message,
+                    );
+                  }
+                }
+              } catch (error) {
+                core.warning(
+                  "PR #" + pull.number + ": scan failed: " + error.message,
+                );
+              }
+            }
