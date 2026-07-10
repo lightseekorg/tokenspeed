@@ -13,7 +13,7 @@
 # limitations under the License.
 #
 # Vendored into tokenspeed-kernel from NVIDIA TensorRT-LLM:
-#   tensorrt_llm/_torch/cute_dsl_kernels/blackwell/top_k/single_pass_multi_cta_radix_topk.py
+#   https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/top_k/single_pass_multi_cta_radix_topk.py
 # The kernel code is unchanged; only this provenance note was added.
 """Single-pass multi-CTA radix top-k kernel using FlashInfer-style fused multi-CTA approach.
 

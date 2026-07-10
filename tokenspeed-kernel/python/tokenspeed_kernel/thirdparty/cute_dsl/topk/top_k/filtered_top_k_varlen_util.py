@@ -13,7 +13,7 @@
 # limitations under the License.
 #
 # Vendored into tokenspeed-kernel from NVIDIA TensorRT-LLM:
-#   tensorrt_llm/_torch/cute_dsl_kernels/blackwell/top_k/filtered_top_k_varlen_util.py
+#   https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/top_k/filtered_top_k_varlen_util.py
 # The kernel code is unchanged; only this provenance note was added.
 
 

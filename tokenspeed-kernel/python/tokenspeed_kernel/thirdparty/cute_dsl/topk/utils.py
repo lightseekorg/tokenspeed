@@ -14,7 +14,7 @@
 # limitations under the License.
 #
 # Vendored into tokenspeed-kernel from NVIDIA TensorRT-LLM:
-#   tensorrt_llm/_torch/cute_dsl_kernels/blackwell/utils.py
+#   https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/cute_dsl_kernels/blackwell/utils.py
 # The kernel code is unchanged; only this provenance note was added.
 
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.

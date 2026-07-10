@@ -13,7 +13,7 @@
 # limitations under the License.
 #
 # Vendored into tokenspeed-kernel from NVIDIA TensorRT-LLM:
-#   tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py
+#   https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py
 # The CuteDSLTopKDecode* runner classes and their helper glue
 # (``_get_num_sms``, ``_TORCH_TO_CUTLASS_DTYPE``) are adapted from the
 # TensorRT-LLM source with logic unchanged (formatting follows the repo style).
