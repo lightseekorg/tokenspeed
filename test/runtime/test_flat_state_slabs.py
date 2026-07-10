@@ -18,9 +18,7 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
-_FLAT_GATE = (
-    "tokenspeed.runtime.configs.paged_cache_spec.scheduler_ext_flat_kvcache"
-)
+_FLAT_GATE = "tokenspeed.runtime.configs.paged_cache_spec.scheduler_ext_flat_kvcache"
 
 
 class FlatStateSlabsTest(unittest.TestCase):

@@ -175,8 +175,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                tokenspeed::PagedCacheGroupConfig::Retention retention,
                std::optional<std::int32_t> sliding_window_tokens, tokenspeed::PagedCacheGroupFamily family) {
                 new (self) tokenspeed::PagedCacheGroupConfig{
-                    std::move(group_id),   rows_per_page, entry_stride_tokens, total_pages, retention,
-                    sliding_window_tokens, family};
+                    std::move(group_id), rows_per_page, entry_stride_tokens, total_pages,
+                    /*block_size=*/0,    retention,     sliding_window_tokens, family};
             },
             nb::arg("group_id"), nb::arg("rows_per_page"), nb::arg("entry_stride_tokens"), nb::arg("total_pages"),
             nb::arg("retention") = tokenspeed::PagedCacheGroupConfig::Retention::FullHistory,
@@ -186,6 +186,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("rows_per_page", &tokenspeed::PagedCacheGroupConfig::rows_per_page)
         .def_rw("entry_stride_tokens", &tokenspeed::PagedCacheGroupConfig::entry_stride_tokens)
         .def_rw("total_pages", &tokenspeed::PagedCacheGroupConfig::total_pages)
+        .def_rw("block_size", &tokenspeed::PagedCacheGroupConfig::block_size)
         .def_rw("retention", &tokenspeed::PagedCacheGroupConfig::retention)
         .def_rw("sliding_window_tokens", &tokenspeed::PagedCacheGroupConfig::sliding_window_tokens)
         .def_rw("family", &tokenspeed::PagedCacheGroupConfig::family)
