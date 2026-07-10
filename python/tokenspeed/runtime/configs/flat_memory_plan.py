@@ -3,11 +3,11 @@
 Components declare per-block bytes as a function of P (block_size):
 linear components scale (bytes_per_slot > 0), constant components do not
 (const_bytes > 0, mamba state snapshots). Same-(group, layer) components
-pack into one page row ([conv|ssm|pad], the vLLM hybrid layout). Two
-equalizer moves: constant rows inflate P until the widest linear row
-covers them (vLLM align); linear rows pad to the widest at binding time.
-plan_tensors then pairs physical slot j with the j-th layer of every
-group over a single page-id space and sizes each slab from the budget.
+pack into one page row ([conv|ssm|pad], the vLLM hybrid layout). One
+equalizer move: constant rows inflate P until the widest linear row
+covers them (vLLM align). plan_tensors then pairs physical slot j with
+the j-th layer of every group over a single page-id space and sizes each
+slab by its own packed row from the budget.
 """
 
 from __future__ import annotations
@@ -226,7 +226,10 @@ def plan_component_tensors(
 
 
 def plan_tensors(components, *, block_size, alignment, budget_bytes):
-    """Pair slot j with the j-th layer of every group over one page-id space."""
+    """Pair slot j with the j-th layer of every group over one page-id space.
+    Each slot tensor is sized by its own packed row (the sum of its bindings'
+    per-block bytes); geometry.block_bytes accounts one block's total across
+    all slots."""
     geo = solve_page_geometry(components, block_size=block_size, alignment=alignment)
     layers_by_group: dict[str, list[int]] = {}
     for c in components:
@@ -234,14 +237,12 @@ def plan_tensors(components, *, block_size, alignment, budget_bytes):
         if c.layer not in layers:
             layers.append(c.layer)
     num_slots = max(len(v) for v in layers_by_group.values())
-    num_blocks = budget_bytes // (num_slots * geo.block_bytes)
-    if num_blocks <= 1:
-        raise ValueError("budget too small for one usable block per slot")
-    geo = replace(geo, num_blocks=num_blocks)
 
-    tensors = []
+    slot_bindings: list[tuple[LayerBinding, ...]] = []
+    slot_rows: list[int] = []
     for slot in range(num_slots):
         bindings = []
+        row_total = 0
         for gid, layers in layers_by_group.items():
             if slot >= len(layers):
                 continue
@@ -255,11 +256,21 @@ def plan_tensors(components, *, block_size, alignment, budget_bytes):
                     LayerBinding(slot, gid, layer, c.component, nbytes, row_offset)
                 )
                 row_offset += nbytes
-        tensors.append(
-            TensorPlan(
-                name=f"flat_slab_{slot}",
-                nbytes=num_blocks * geo.block_bytes,
-                bindings=tuple(bindings),
-            )
+            row_total += row_offset
+        slot_bindings.append(tuple(bindings))
+        slot_rows.append(row_total)
+
+    num_blocks = budget_bytes // sum(slot_rows)
+    if num_blocks <= 1:
+        raise ValueError("budget too small for one usable block per slot")
+    geo = replace(geo, block_bytes=sum(slot_rows), num_blocks=num_blocks)
+
+    tensors = tuple(
+        TensorPlan(
+            name=f"flat_slab_{slot}",
+            nbytes=num_blocks * slot_rows[slot],
+            bindings=bindings,
         )
-    return FlatMemoryPlan(geometry=geo, tensors=tuple(tensors))
+        for slot, bindings in enumerate(slot_bindings)
+    )
+    return FlatMemoryPlan(geometry=geo, tensors=tensors)

@@ -208,7 +208,7 @@ class PlanTensorsTest(unittest.TestCase):
         full = [b for b in plan.tensors[0].bindings if b.group_id == "full_attention"]
         self.assertEqual(full[0].row_offset, 0)
 
-    def test_num_blocks_from_budget_uniform_across_slots(self):
+    def test_num_blocks_from_budget_shared_across_slots(self):
         plan = plan_tensors(
             self._comps_qwen35(),
             block_size=16,
@@ -217,10 +217,12 @@ class PlanTensorsTest(unittest.TestCase):
         )
         geo = plan.geometry
         self.assertEqual(geo.block_size, 100)  # 等化继承 B2:state 100KiB / 1KiB
-        self.assertEqual(geo.block_bytes, 100 * 1024)
-        self.assertEqual(geo.num_blocks, 100 * 1024 * 1024 // (2 * 100 * 1024))  # 512
-        for t in plan.tensors:
-            self.assertEqual(t.nbytes, geo.num_blocks * geo.block_bytes)
+        # 每块总账:槽 0 打包 full 100KiB + state 100KiB,槽 1 只有 full 100KiB
+        self.assertEqual(geo.block_bytes, 300 * 1024)
+        self.assertEqual(geo.num_blocks, 100 * 1024 * 1024 // (300 * 1024))  # 341
+        slot0, slot1 = plan.tensors
+        self.assertEqual(slot0.nbytes, geo.num_blocks * 200 * 1024)
+        self.assertEqual(slot1.nbytes, geo.num_blocks * 100 * 1024)
 
     def test_gpt_oss_pairing_matches_hybrid_slab(self):
         comps = [
@@ -261,6 +263,19 @@ class PlanTensorsTest(unittest.TestCase):
                 alignment=4,
                 budget_bytes=100 * 1024,
             )
+
+    def test_cross_group_rows_sized_by_own_bindings(self):
+        comps = [
+            ComponentSpec("full", 0, "kv", 100, 0),
+            ComponentSpec("state", 0, "conv", 0, 300),
+            ComponentSpec("state", 1, "conv", 0, 300),
+        ]
+        plan = plan_tensors(comps, block_size=4, alignment=1, budget_bytes=100_000)
+        # slot0 packs 100*4 + 300 = 700, slot1 packs 300.
+        self.assertEqual(plan.geometry.num_blocks, 100_000 // 1000)
+        slot0, slot1 = plan.tensors
+        self.assertEqual(slot0.nbytes, plan.geometry.num_blocks * 700)
+        self.assertEqual(slot1.nbytes, plan.geometry.num_blocks * 300)
 
 
 QWEN_KV_PER_SLOT = 2048
@@ -310,8 +325,8 @@ class PlanComponentTensorsTest(unittest.TestCase):
             plan_component_tensors(comps, block_size=4, budget_bytes=500)
 
 
-class GptOssEquivalenceTest(unittest.TestCase):
-    def test_plan_reproduces_m12_capacity(self):
+class GptOssCapacityTest(unittest.TestCase):
+    def test_plan_counts_every_layer_row(self):
         comps = [
             ComponentSpec(
                 "full_attention",
@@ -334,8 +349,8 @@ class GptOssEquivalenceTest(unittest.TestCase):
         ]
         budget = 10 * 1024**3
         plan = plan_tensors(comps, block_size=16, alignment=4, budget_bytes=budget)
-        legacy_pages = budget // (24 * 16 * 1024)  # M12 别名:24 物理槽 × 页字节
-        self.assertEqual(plan.geometry.num_blocks, legacy_pages)
+        # 每槽打包 full + sliding 两行:48 行 × 页字节(不再按 M12 的 24 槽别名计容)
+        self.assertEqual(plan.geometry.num_blocks, budget // (48 * 16 * 1024))
 
 
 class ComponentsFromLayersTest(unittest.TestCase):
