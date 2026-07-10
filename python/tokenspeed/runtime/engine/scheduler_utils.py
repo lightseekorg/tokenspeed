@@ -37,6 +37,11 @@ from tokenspeed_scheduler import (
     SchedulerConfig,
 )
 
+from tokenspeed.runtime.configs.paged_cache_spec import (
+    PagedCacheGroupSpec,
+    compute_paged_cache_block_table_width,
+)
+
 _CACHE_EVENT_TYPES = {
     "WriteBackDoneEvent": Cache.WriteBackDoneEvent,
     "PrefetchDoneEvent": Cache.PrefetchDoneEvent,
@@ -281,6 +286,7 @@ def _block_tables_from_forward_op(
     attr: str,
     device: "torch.device | str",
     num_reqs: int | None,
+    paged_cache_group_specs: Sequence[PagedCacheGroupSpec] | None = None,
 ) -> dict[str, torch.Tensor]:
     raw_tables = getattr(forward_op, attr, None)
     if raw_tables is None:
@@ -291,6 +297,7 @@ def _block_tables_from_forward_op(
         if isinstance(raw_tables, Mapping)
         else list(raw_tables)
     )
+    specs_by_id = {str(spec.group_id): spec for spec in (paged_cache_group_specs or ())}
     out: dict[str, torch.Tensor] = {}
     for key_obj, table in items:
         key = str(key_obj)
@@ -303,6 +310,9 @@ def _block_tables_from_forward_op(
         if not rows:
             continue
         max_pages = max((len(row) for row in rows), default=0)
+        spec = specs_by_id.get(key)
+        if spec is not None:
+            max_pages = compute_paged_cache_block_table_width(spec, max_pages)
         if max_pages == 0:
             out[key] = torch.empty((len(rows), 0), dtype=torch.int32, device=device)
             continue
@@ -326,12 +336,29 @@ def paged_cache_block_tables_from_forward_op(
     device: "torch.device | str",
     *,
     num_reqs: int | None = None,
+    paged_cache_group_specs: Sequence[PagedCacheGroupSpec] | None = None,
 ) -> dict[str, torch.Tensor]:
+    """Materialize per-group block tables for one scheduled forward.
+
+    Args:
+        forward_op: Scheduler forward operation containing grouped page rows.
+        device: Destination device for the dense block tables.
+        num_reqs: Optional expected number of request rows.
+        paged_cache_group_specs: Optional cache-group layout specs. Groups with
+            a ``block_table_power_of_two_min_width`` hint are padded with
+            ``-1`` to the next power of two at or above both their live width
+            and the configured minimum.
+
+    Returns:
+        Dense int32 block tables keyed by cache-group id.
+    """
+
     return _block_tables_from_forward_op(
         forward_op,
         attr="paged_cache_block_tables",
         device=device,
         num_reqs=num_reqs,
+        paged_cache_group_specs=paged_cache_group_specs,
     )
 
 

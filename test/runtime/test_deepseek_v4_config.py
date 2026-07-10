@@ -26,6 +26,7 @@ from tokenspeed_kernel.thirdparty.cuda import (
 )
 
 from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
+    build_v4_cache_specs,
     deepseek_v4_indexer_fp8_row_bytes,
     deepseek_v4_indexer_mxfp4_row_bytes,
     deepseek_v4_nope_dim,
@@ -41,7 +42,14 @@ from tokenspeed.runtime.configs.model_config import (
     is_deepseek_v4,
     is_deepseek_v4_nextn,
 )
+from tokenspeed.runtime.configs.paged_cache_spec import (
+    PagedCacheGroupSpec,
+    compute_paged_cache_block_table_width,
+)
 from tokenspeed.runtime.distributed import Mapping
+from tokenspeed.runtime.engine.scheduler_utils import (
+    paged_cache_block_tables_from_forward_op,
+)
 from tokenspeed.runtime.execution import input_buffer as input_buffer_module
 from tokenspeed.runtime.execution.cuda_graph_wrapper import (
     CudaGraphWrapper,
@@ -263,6 +271,175 @@ def _mhc_post_reference(
 
 
 class TestDeepseekV4Config(unittest.TestCase):
+    def test_v4_cache_specs_own_hca_block_table_bucket(self):
+        specs = build_v4_cache_specs(
+            SimpleNamespace(sliding_window=128),
+            layer_ratio=(1, 4, 128),
+        )
+        min_widths = {
+            spec.group_id: spec.block_table_power_of_two_min_width for spec in specs
+        }
+        self.assertEqual(min_widths["v4.c128a.compressor_state"], 128)
+        self.assertTrue(
+            all(
+                min_width is None
+                for group_id, min_width in min_widths.items()
+                if group_id != "v4.c128a.compressor_state"
+            )
+        )
+
+    def test_paged_cache_block_table_power_of_two_bucketing(self):
+        hca_rows = [list(range(129)), [7, 8, 9]]
+        exact_rows = [list(range(129)), [10, 11, 12]]
+        group_specs = (
+            PagedCacheGroupSpec(
+                group_id="hca",
+                retention="sliding_window",
+                rows_per_page=8,
+                entry_stride_tokens=1,
+                sliding_window_tokens=128,
+                block_table_power_of_two_min_width=128,
+            ),
+            PagedCacheGroupSpec(
+                group_id="exact",
+                retention="sliding_window",
+                rows_per_page=8,
+                entry_stride_tokens=1,
+                sliding_window_tokens=128,
+            ),
+        )
+        forward_op = SimpleNamespace(
+            paged_cache_block_tables=(
+                ("hca", hca_rows),
+                ("exact", exact_rows),
+            )
+        )
+
+        tables = paged_cache_block_tables_from_forward_op(
+            forward_op,
+            device="cpu",
+            num_reqs=2,
+            paged_cache_group_specs=group_specs,
+        )
+
+        self.assertEqual(tables["hca"].shape, (2, 256))
+        self.assertEqual(tables["exact"].shape, (2, 129))
+        self.assertEqual(tables["hca"][0, :129].tolist(), hca_rows[0])
+        self.assertTrue(torch.all(tables["hca"][0, 129:] == -1).item())
+        self.assertEqual(tables["hca"][1, :3].tolist(), hca_rows[1])
+        self.assertTrue(torch.all(tables["hca"][1, 3:] == -1).item())
+
+        empty = paged_cache_block_tables_from_forward_op(
+            SimpleNamespace(paged_cache_block_tables=(("hca", [[], []]),)),
+            device="cpu",
+            num_reqs=2,
+            paged_cache_group_specs=group_specs,
+        )["hca"]
+        self.assertEqual(empty.shape, (2, 128))
+        self.assertTrue(torch.all(empty == -1).item())
+
+        for invalid_min_width in (0, -1):
+            with self.subTest(invalid_min_width=invalid_min_width):
+                invalid_spec = PagedCacheGroupSpec(
+                    group_id="invalid",
+                    retention="sliding_window",
+                    rows_per_page=8,
+                    entry_stride_tokens=1,
+                    sliding_window_tokens=128,
+                    block_table_power_of_two_min_width=invalid_min_width,
+                )
+                with self.assertRaisesRegex(ValueError, "must be positive"):
+                    compute_paged_cache_block_table_width(invalid_spec, 17)
+
+    def test_cuda_graph_capture_block_tables_apply_spec_buckets(self):
+        wrapper = object.__new__(CudaGraphWrapper)
+        wrapper.max_tokens_per_req = 1
+        wrapper.max_bs = 2
+        wrapper.context_len = 4096
+        wrapper.overlap_schedule_depth = 0
+        wrapper.device = torch.device("cpu")
+
+        def spec(group_id, min_width=None):
+            return PagedCacheGroupSpec(
+                group_id=group_id,
+                retention="sliding_window",
+                rows_per_page=8,
+                entry_stride_tokens=1,
+                sliding_window_tokens=128,
+                block_table_power_of_two_min_width=min_width,
+            )
+
+        pool = SimpleNamespace(
+            paged_cache_group_specs=(spec("hca", 128), spec("exact")),
+        )
+
+        tables = wrapper._capture_paged_cache_block_tables(2, pool)
+
+        self.assertEqual(tables["hca"].shape, (2, 128))
+        self.assertEqual(tables["exact"].shape, (2, 17))
+
+    def test_cuda_graph_decode_capture_uses_target_and_draft_pool_specs(self):
+        wrapper = object.__new__(CudaGraphWrapper)
+        wrapper.max_tokens_per_req = 1
+        wrapper.max_bs = 2
+        wrapper.context_len = 4096
+        wrapper.overlap_schedule_depth = 0
+        wrapper.device = torch.device("cpu")
+        wrapper.input_buffers = SimpleNamespace(
+            has_mamba=False,
+            req_pool_indices_buf=torch.zeros(1, dtype=torch.int32),
+            seq_lens_buf=torch.zeros(1, dtype=torch.int32),
+        )
+        wrapper.drafter = None
+
+        # Decode capture owns separate static tables for target and draft.
+        # Eager MTP shares target tables and requires matching group specs.
+        wrapper.token_to_kv_pool = SimpleNamespace(
+            paged_cache_group_specs=(
+                PagedCacheGroupSpec(
+                    group_id="target",
+                    retention="sliding_window",
+                    rows_per_page=8,
+                    entry_stride_tokens=1,
+                    sliding_window_tokens=128,
+                    block_table_power_of_two_min_width=128,
+                ),
+            ),
+        )
+        wrapper.draft_token_to_kv_pool = SimpleNamespace(
+            paged_cache_group_specs=(
+                PagedCacheGroupSpec(
+                    group_id="draft",
+                    retention="sliding_window",
+                    rows_per_page=8,
+                    entry_stride_tokens=1,
+                    sliding_window_tokens=128,
+                    block_table_power_of_two_min_width=256,
+                ),
+            ),
+        )
+        wrapper.attn_backend = SimpleNamespace(
+            uses_paged_cache_groups=True,
+            init_forward_metadata_capture_cuda_graph=Mock(),
+        )
+        wrapper.draft_attn_backend = SimpleNamespace(
+            uses_paged_cache_groups=True,
+            init_forward_metadata_capture_cuda_graph=Mock(),
+        )
+
+        wrapper._init_capture_metadata(1)
+
+        target_call = (
+            wrapper.attn_backend.init_forward_metadata_capture_cuda_graph.call_args
+        )
+        draft_call = (
+            wrapper.draft_attn_backend.init_forward_metadata_capture_cuda_graph.call_args
+        )
+        target_tables = target_call.kwargs["paged_cache_block_tables"]
+        draft_tables = draft_call.kwargs["paged_cache_block_tables"]
+        self.assertEqual(target_tables["target"].shape, (1, 128))
+        self.assertEqual(draft_tables["draft"].shape, (1, 256))
+
     quant_config = {
         "quant_method": "fp8",
         "activation_scheme": "dynamic",
@@ -2222,29 +2399,68 @@ class TestDeepseekV4Config(unittest.TestCase):
                 context_len=4096,
             )
         )
+        group_specs = (
+            PagedCacheGroupSpec(
+                group_id="v4.swa_kv",
+                retention="sliding_window",
+                rows_per_page=64,
+                entry_stride_tokens=1,
+                sliding_window_tokens=128,
+            ),
+            PagedCacheGroupSpec(
+                group_id="v4.c128a.compressor_state",
+                retention="sliding_window",
+                rows_per_page=8,
+                entry_stride_tokens=1,
+                sliding_window_tokens=128,
+                block_table_power_of_two_min_width=128,
+            ),
+        )
         backend.init_cuda_graph_state(
             2,
-            paged_cache_group_specs=(
-                SimpleNamespace(
-                    group_id="v4.swa_kv",
-                    retention="sliding_window",
-                    rows_per_page=64,
-                    entry_stride_tokens=1,
-                    sliding_window_tokens=128,
-                ),
-            ),
+            paged_cache_group_specs=group_specs,
             max_tokens_per_req=1,
         )
+        hca_group = "v4.c128a.compressor_state"
         compact = torch.tensor([[10, 11], [20, -1]], dtype=torch.int32)
+        hca_source_1 = paged_cache_block_tables_from_forward_op(
+            SimpleNamespace(paged_cache_block_tables=((hca_group, [[30, 31], [40]]),)),
+            device="cpu",
+            num_reqs=2,
+            paged_cache_group_specs=group_specs,
+        )[hca_group]
         refreshed = backend._refresh_cuda_graph_paged_cache_block_tables(
             2,
-            {"v4.swa_kv": compact},
+            {"v4.swa_kv": compact, hca_group: hca_source_1},
             pad_value=-1,
         )
 
         table = refreshed["v4.swa_kv"]
         self.assertTrue(torch.equal(table[:, :2], compact))
         self.assertTrue(torch.equal(table[:, 2:], torch.full_like(table[:, 2:], -1)))
+        hca_table = refreshed[hca_group]
+        self.assertEqual(hca_table.shape, (2, 128))
+        self.assertEqual(hca_table.stride(), (128, 1))
+        self.assertTrue(torch.equal(hca_table, hca_source_1))
+        hca_data_ptr = hca_table.data_ptr()
+
+        hca_source_2 = paged_cache_block_tables_from_forward_op(
+            SimpleNamespace(
+                paged_cache_block_tables=((hca_group, [list(range(17)), [50, 51, 52]]),)
+            ),
+            device="cpu",
+            num_reqs=2,
+            paged_cache_group_specs=group_specs,
+        )[hca_group]
+        replayed = backend._refresh_cuda_graph_paged_cache_block_tables(
+            2,
+            {hca_group: hca_source_2},
+            pad_value=-1,
+        )[hca_group]
+        self.assertEqual(replayed.data_ptr(), hca_data_ptr)
+        self.assertEqual(replayed.shape, (2, 128))
+        self.assertEqual(replayed.stride(), (128, 1))
+        self.assertTrue(torch.equal(replayed, hca_source_2))
 
     def test_deepseek_v4_metadata_splits_named_cache_groups(self):
         backend = DeepseekV4AttentionBackend(

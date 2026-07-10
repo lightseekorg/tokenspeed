@@ -20,7 +20,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
 
-from tokenspeed.runtime.utils.common import ceil_div
+from tokenspeed.runtime.utils.common import ceil_div, next_power_of_2
 
 Retention = Literal["full_history", "sliding_window"]
 Family = Literal["history", "state"]
@@ -35,9 +35,42 @@ class PagedCacheGroupSpec:
     sliding_window_tokens: int | None
     # History groups form a chain; State groups only need the trailing window.
     family: Family = "history"
+    # Optional physical block-table bucketing hint for shape-sensitive kernels.
+    # None disables bucketing; a configured minimum must be positive.
+    block_table_power_of_two_min_width: int | None = None
 
 
 _PAGED_CACHE_GROUP_DUMMY_PAGES = 1
+
+
+def compute_paged_cache_block_table_width(
+    spec: PagedCacheGroupSpec,
+    logical_width: int,
+) -> int:
+    """Compute the physical block-table width requested by a cache group.
+
+    Args:
+        spec: Cache-group layout and optional bucketing policy.
+        logical_width: Number of live block-table columns.
+
+    Returns:
+        ``logical_width`` when bucketing is disabled; otherwise the next power
+        of two covering both the logical width and the configured minimum.
+    """
+
+    logical_width = int(logical_width)
+    if logical_width < 0:
+        raise ValueError(f"logical_width must be non-negative, got {logical_width}")
+    min_width = getattr(spec, "block_table_power_of_two_min_width", None)
+    if min_width is None:
+        return logical_width
+    min_width = int(min_width)
+    if min_width <= 0:
+        raise ValueError(
+            "block_table_power_of_two_min_width must be positive when set, "
+            f"got {min_width} for group {spec.group_id!r}"
+        )
+    return next_power_of_2(max(logical_width, min_width))
 
 
 def compute_paged_cache_group_page_counts(
@@ -186,5 +219,6 @@ __all__ = [
     "PagedCacheGroupSpec",
     "Retention",
     "compute_max_logical_pages_for_capture",
+    "compute_paged_cache_block_table_width",
     "compute_paged_cache_group_page_counts",
 ]

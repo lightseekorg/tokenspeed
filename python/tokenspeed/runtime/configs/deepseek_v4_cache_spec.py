@@ -220,6 +220,7 @@ def build_v4_cache_specs(
                 entry_stride_tokens=1,
                 sliding_window_tokens=_COMPRESSOR_STATE_WINDOW_TOKENS[ratio],
                 family="state",
+                block_table_power_of_two_min_width=128 if ratio == 128 else None,
             )
         )
         # Compressed kv: full-history chain (indexer K shares this group).

@@ -37,6 +37,7 @@ from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.configs.paged_cache_spec import (
     compute_max_logical_pages_for_capture,
+    compute_paged_cache_block_table_width,
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
@@ -1347,6 +1348,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 block_table=compressed_block_table,
                 block_size=compressed_block_size,
                 offset=0,
+                max_gather_len=compressed_base,
             )
             deepseek_v4_dequantize_and_gather_k_cache(
                 out=kv_workspace,
@@ -1357,6 +1359,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 block_table_base_offsets=cache_metadata.swa_base_logical_page,
                 block_size=token_to_kv_pool.swa_block_size,
                 offset=compressed_base,
+                max_gather_len=max_gather_len,
             )
             indices, lens = deepseek_v4_combine_topk_swa_indices(
                 topk_indices=topk_indices,
@@ -1395,6 +1398,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 block_table=compressed_block_table,
                 block_size=compressed_block_size,
                 offset=0,
+                max_gather_len=compressed_base,
             )
         deepseek_v4_dequantize_and_gather_k_cache(
             out=kv_workspace,
@@ -1405,6 +1409,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             block_table_base_offsets=cache_metadata.swa_base_logical_page,
             block_size=token_to_kv_pool.swa_block_size,
             offset=compressed_base,
+            max_gather_len=max_gather_len,
         )
         if compress_ratio > 1:
             dense_compressed_indices = self._dense_prefill_local_compressed_indices(
@@ -1789,6 +1794,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 max_tokens_per_req=max_tokens_per_req,
                 overlap_schedule_depth=overlap_schedule_depth,
             )
+            max_pages = compute_paged_cache_block_table_width(spec, max_pages)
             self._cuda_graph_paged_cache_block_tables[gid] = torch.zeros(
                 (max_bs, max_pages),
                 dtype=torch.int32,
@@ -1967,7 +1973,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 str(group_id): table.to(device=self.device, dtype=torch.int32)
                 for group_id, table in paged_cache_block_tables.items()
             },
-            pad_value=0,
+            pad_value=-1,
         )
         metadata_base_offsets = self._refresh_cuda_graph_base_offsets(
             bs,

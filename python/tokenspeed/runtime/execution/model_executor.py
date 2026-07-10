@@ -1696,6 +1696,9 @@ class ModelExecutor:
                         forward_op,
                         device=self.device,
                         num_reqs=bs,
+                        paged_cache_group_specs=(
+                            self.token_to_kv_pool.paged_cache_group_specs
+                        ),
                     )
                     (
                         paged_cache_block_table_base_offsets,

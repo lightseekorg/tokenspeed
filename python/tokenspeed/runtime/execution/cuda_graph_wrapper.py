@@ -33,6 +33,7 @@ import tqdm
 
 from tokenspeed.runtime.configs.paged_cache_spec import (
     compute_max_logical_pages_for_capture,
+    compute_paged_cache_block_table_width,
 )
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import (
@@ -516,6 +517,7 @@ class CudaGraphWrapper:
             return None
         out = {}
         for spec in specs:
+            group_id = str(spec.group_id)
             max_pages = compute_max_logical_pages_for_capture(
                 spec,
                 max_context_len=(
@@ -526,7 +528,8 @@ class CudaGraphWrapper:
                 max_tokens_per_req=self.max_tokens_per_req,
                 overlap_schedule_depth=self.overlap_schedule_depth,
             )
-            out[str(spec.group_id)] = torch.zeros(
+            max_pages = compute_paged_cache_block_table_width(spec, max_pages)
+            out[group_id] = torch.zeros(
                 (bs, max_pages),
                 dtype=torch.int32,
                 device=self.device,

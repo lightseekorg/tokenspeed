@@ -26,6 +26,13 @@ from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
     indexer_mxfp4_paged_gather,
     persistent_topk,
 )
+from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
+    _deepseek_v4_decode_swa_indices_and_lens_kernel,
+    _deepseek_v4_dequantize_and_gather_k_kernel,
+    _deepseek_v4_fused_csa_indexer_mxfp4_cache_kernel,
+    _deepseek_v4_fused_sparse_compress_cache_kernel,
+    _deepseek_v4_gather_launch_config,
+)
 from tokenspeed_kernel.ops.transform import hadamard_transform
 
 from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
@@ -296,6 +303,63 @@ def _expected_overlap_normed(
 
 
 class DeepseekV4AttentionOpsCpuValidationTest(unittest.TestCase):
+    def test_dynamic_block_table_widths_are_not_specialized(self):
+        cases = (
+            (
+                _deepseek_v4_fused_sparse_compress_cache_kernel,
+                ("block_table_stride", "block_table_width"),
+            ),
+            (
+                _deepseek_v4_fused_csa_indexer_mxfp4_cache_kernel,
+                ("block_table_stride", "block_table_width"),
+            ),
+            (
+                _deepseek_v4_dequantize_and_gather_k_kernel,
+                ("block_table_stride", "max_blocks_per_seq"),
+            ),
+            (
+                _deepseek_v4_decode_swa_indices_and_lens_kernel,
+                ("block_table_stride", "max_blocks_per_seq"),
+            ),
+        )
+        for kernel, parameter_names in cases:
+            with self.subTest(kernel=kernel.__name__):
+                parameters = {parameter.name: parameter for parameter in kernel.params}
+                for parameter_name in parameter_names:
+                    parameter = parameters[parameter_name]
+                    self.assertFalse(parameter.is_constexpr)
+                    self.assertTrue(parameter.do_not_specialize)
+
+        hca_capacity = {
+            parameter.name: parameter
+            for parameter in _deepseek_v4_fused_sparse_compress_cache_kernel.params
+        }["HCA_BLOCK_TABLE_CAPACITY"]
+        self.assertTrue(hca_capacity.is_constexpr)
+
+    def test_sparse_prefill_gather_launch_config(self):
+        cases = (
+            (1, 0, (128, 4)),
+            (1, 512, (128, 4)),
+            (1, 513, (512, 1)),
+            (1, 3072, (512, 1)),
+            (1, 3073, (1024, 1)),
+            (1, 6144, (1024, 1)),
+            (1, 6145, (2048, 1)),
+            (2, 6145, (2048, 1)),
+            (3, 6145, (1024, 1)),
+            (4, 8192, (1024, 1)),
+            (4, 12288, (1024, 1)),
+            (4, 12289, (2048, 1)),
+            (8, 2048, (512, 1)),
+            (8, 8192, (2048, 1)),
+        )
+        for num_reqs, max_rows, expected in cases:
+            with self.subTest(num_reqs=num_reqs, max_rows=max_rows):
+                self.assertEqual(
+                    _deepseek_v4_gather_launch_config(num_reqs, max_rows),
+                    expected,
+                )
+
     def test_padded_q_runtime_route_is_pure_prefill_only(self):
         def run_case(
             mode: ForwardMode,
@@ -917,9 +981,11 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         )
 
         token_to_req_indices = torch.zeros(num_tokens, device=device, dtype=torch.int32)
-        block_table = torch.arange(
+        live_block_table = torch.arange(
             num_state_blocks, device=device, dtype=torch.int32
         ).view(1, -1)
+        block_table = torch.full((1, 128), -1, device=device, dtype=torch.int32)
+        block_table[:, : live_block_table.shape[1]].copy_(live_block_table)
         kv_slots = torch.full((num_tokens,), -1, device=device, dtype=torch.int64)
         kv_slots[-2] = 1
         kv_slots[-1] = 0
@@ -990,6 +1056,37 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             int(flat_cache[SWA_TOKEN_STRIDE : 2 * SWA_TOKEN_STRIDE].sum()),
             0,
         )
+
+        for width in (16, 129, 256):
+            with self.subTest(width=width):
+                table_storage = torch.full(
+                    (1, width * 2),
+                    -1,
+                    device=device,
+                    dtype=torch.int32,
+                )
+                candidate_block_table = table_storage[:, ::2]
+                candidate_block_table[:, : live_block_table.shape[1]].copy_(
+                    live_block_table
+                )
+                candidate_cache = torch.zeros_like(cache)
+                deepseek_v4_hca_compress_kv_cache_insert(
+                    state_cache=state_cache,
+                    token_to_req_indices=token_to_req_indices,
+                    positions=positions,
+                    compressor_slot_mapping=state_slots,
+                    block_table=candidate_block_table,
+                    compressor_block_size=state_block_size,
+                    rms_norm_weight=rms_weight,
+                    rms_norm_eps=eps,
+                    cos_sin_cache=cos_sin,
+                    kv_cache_2d=candidate_cache,
+                    kv_slot_mapping=kv_slots,
+                    kv_cache_block_size=kv_cache_block_size,
+                    compress_ratio=compress_ratio,
+                )
+                torch.cuda.synchronize()
+                self.assertTrue(torch.equal(candidate_cache, cache))
 
     def test_csa_compressor_state_insert_matches_reference(self):
         torch.manual_seed(5678)
@@ -1926,11 +2023,12 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         query_start_loc = torch.tensor([0, 1, 2], device=device, dtype=torch.int32)
         seq_lens = torch.tensor([70, 3], device=device, dtype=torch.int32)
         token_to_req_indices = torch.tensor([0, 1], device=device, dtype=torch.int32)
-        block_table = torch.tensor(
-            [[10, 11], [20, 21]],
-            device=device,
-            dtype=torch.int32,
+        block_table_storage = torch.full((2, 4), -1, device=device, dtype=torch.int64)
+        block_table_storage[:, :2].copy_(
+            torch.tensor([[10, 11], [20, 21]], device=device, dtype=torch.int64)
         )
+        block_table = block_table_storage[:, :2]
+        self.assertNotEqual(block_table.stride(0), block_table.shape[1])
         out_indices = torch.empty((2, 4), device=device, dtype=torch.int32)
         out_lens = torch.empty((2,), device=device, dtype=torch.int32)
 
@@ -2033,14 +2131,12 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             dtype=torch.int32,
         )
         token_to_req_indices = torch.tensor([0, 1, 0], device=device, dtype=torch.int32)
-        block_table = torch.tensor(
-            [
-                [10, 11],
-                [20, 21],
-            ],
-            device=device,
-            dtype=torch.int32,
+        block_table_storage = torch.full((2, 4), -1, device=device, dtype=torch.int64)
+        block_table_storage[:, :2].copy_(
+            torch.tensor([[10, 11], [20, 21]], device=device, dtype=torch.int64)
         )
+        block_table = block_table_storage[:, :2]
+        self.assertNotEqual(block_table.stride(0), block_table.shape[1])
 
         actual, actual_lens = deepseek_v4_compute_global_topk_indices_and_lens(
             topk_indices=topk_indices,
@@ -2117,14 +2213,12 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         device = torch.device("cuda")
         query_start_loc = torch.tensor([0, 3, 5], device=device, dtype=torch.int32)
         seq_lens = torch.tensor([8, 6], device=device, dtype=torch.int32)
-        block_table = torch.tensor(
-            [
-                [10, 11, 12],
-                [20, 21, 22],
-            ],
-            device=device,
-            dtype=torch.int32,
+        block_table_storage = torch.full((2, 6), -1, device=device, dtype=torch.int32)
+        block_table_storage[:, ::2].copy_(
+            torch.tensor([[10, 11, 12], [20, 21, 22]], device=device)
         )
+        block_table = block_table_storage[:, ::2]
+        self.assertEqual(block_table.stride(-1), 2)
         out = torch.empty(8, device=device, dtype=torch.int64)
 
         actual = deepseek_v4_compressed_slot_mapping(
@@ -2180,11 +2274,22 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
 
         seq_lens = torch.tensor([9, 8], device=device, dtype=torch.int32)
         gather_lens = torch.tensor([3, 2], device=device, dtype=torch.int32)
-        block_table = torch.tensor([[0, 1], [2, 0]], device=device, dtype=torch.int32)
+        block_table_storage = torch.full((2, 4), -1, device=device, dtype=torch.int32)
+        block_table_storage[:, ::2].copy_(
+            torch.tensor([[0, 1], [2, 0]], device=device, dtype=torch.int32)
+        )
+        block_table = block_table_storage[:, ::2]
+        self.assertEqual(block_table.stride(-1), 2)
         block_table_base_offsets = torch.tensor(
             [1, 1], device=device, dtype=torch.int32
         )
-        out = torch.zeros(2, 5, HEAD_DIM, device=device, dtype=torch.bfloat16)
+        sentinel = 7.0
+        out = torch.full(
+            (2, 5, HEAD_DIM),
+            sentinel,
+            device=device,
+            dtype=torch.bfloat16,
+        )
         deepseek_v4_dequantize_and_gather_k_cache(
             out=out,
             cache_2d=cache,
@@ -2194,6 +2299,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             block_table_base_offsets=block_table_base_offsets,
             block_size=block_size,
             offset=1,
+            max_gather_len=3,
         )
         torch.cuda.synchronize()
 
@@ -2227,6 +2333,144 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
                 expected_rows.float().cpu(),
                 atol=0,
                 rtol=0,
+            )
+            self.assertTrue(torch.all(out[req_idx, 0] == sentinel).item())
+            self.assertTrue(
+                torch.all(out[req_idx, 1 + slots.numel() :] == sentinel).item()
+            )
+
+    def test_sparse_prefill_dequantize_and_gather_long_grid_matches_reference(self):
+        torch.manual_seed(20260709)
+        device = torch.device("cuda")
+        block_size = 64
+        gather_lens = torch.tensor([6145, 3073], device=device, dtype=torch.int32)
+        seq_lens = gather_lens + 128
+        max_pages = math.ceil(int(seq_lens.max().item()) / block_size)
+        num_reqs = int(seq_lens.numel())
+        cache = torch.zeros(
+            (
+                num_reqs * max_pages,
+                block_size * (SWA_TOKEN_STRIDE + SWA_SCALE_DIM),
+            ),
+            device=device,
+            dtype=torch.uint8,
+        )
+        token_data = cache[:, : block_size * SWA_TOKEN_STRIDE].view(
+            num_reqs * max_pages,
+            block_size,
+            SWA_TOKEN_STRIDE,
+        )
+        token_data[:, :, :NOPE_DIM].random_(0, 127)
+        token_data[:, :, NOPE_DIM:].copy_(
+            torch.randn(
+                num_reqs * max_pages,
+                block_size,
+                ROPE_DIM,
+                device=device,
+                dtype=torch.bfloat16,
+            )
+            .view(torch.uint8)
+            .reshape(num_reqs * max_pages, block_size, 2 * ROPE_DIM)
+        )
+        cache[:, block_size * SWA_TOKEN_STRIDE :].random_(124, 131)
+        block_table = torch.arange(
+            num_reqs * max_pages,
+            device=device,
+            dtype=torch.int32,
+        ).view(num_reqs, max_pages)
+        sentinel = 7.0
+        output_offset = 3
+        output_tail = 5
+        out = torch.full(
+            (
+                num_reqs,
+                output_offset + int(gather_lens.max().item()) + output_tail,
+                HEAD_DIM,
+            ),
+            sentinel,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+
+        deepseek_v4_dequantize_and_gather_k_cache(
+            out=out,
+            cache_2d=cache,
+            seq_lens=seq_lens,
+            gather_lens=gather_lens,
+            block_table=block_table,
+            block_size=block_size,
+            offset=output_offset,
+            max_gather_len=int(gather_lens.max().item()),
+        )
+        torch.cuda.synchronize()
+
+        for req_idx, gather_len in enumerate(gather_lens.tolist()):
+            positions = torch.arange(
+                int(seq_lens[req_idx].item()) - gather_len,
+                int(seq_lens[req_idx].item()),
+                device=device,
+                dtype=torch.int64,
+            )
+            slots = (
+                block_table[req_idx, positions // block_size].to(torch.int64)
+                * block_size
+                + positions % block_size
+            )
+            expected = dequantize_deepseek_v4_fp8_ds_mla_cache(
+                cache,
+                slots,
+                block_size,
+                head_dim=HEAD_DIM,
+                rope_dim=ROPE_DIM,
+            )
+            torch.testing.assert_close(
+                out[req_idx, output_offset : output_offset + gather_len].float().cpu(),
+                expected.float().cpu(),
+                atol=0,
+                rtol=0,
+            )
+            self.assertTrue(torch.all(out[req_idx, :output_offset] == sentinel).item())
+            self.assertTrue(
+                torch.all(out[req_idx, output_offset + gather_len :] == sentinel).item()
+            )
+
+        full_out = torch.full(
+            (num_reqs, int(gather_lens.max().item()) + output_tail, HEAD_DIM),
+            sentinel,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        deepseek_v4_dequantize_and_gather_k_cache(
+            out=full_out,
+            cache_2d=cache,
+            seq_lens=gather_lens,
+            gather_lens=None,
+            block_table=block_table,
+            block_size=block_size,
+            offset=0,
+            max_gather_len=int(gather_lens.max().item()),
+        )
+        torch.cuda.synchronize()
+
+        for req_idx, gather_len in enumerate(gather_lens.tolist()):
+            slots = block_table[req_idx, 0].to(torch.int64) * block_size + torch.arange(
+                gather_len, device=device, dtype=torch.int64
+            )
+            expected = dequantize_deepseek_v4_fp8_ds_mla_cache(
+                cache,
+                slots,
+                block_size,
+                head_dim=HEAD_DIM,
+                rope_dim=ROPE_DIM,
+            )
+            torch.testing.assert_close(
+                full_out[req_idx, :gather_len].float().cpu(),
+                expected.float().cpu(),
+                atol=0,
+                rtol=0,
+            )
+            self.assertTrue(
+                torch.all(full_out[req_idx, gather_len:] == sentinel).item()
             )
 
 
