@@ -1148,12 +1148,15 @@ class TestDeepseekV4Config(unittest.TestCase):
                 input_ids=[1] * query_len,
                 shifted_input_ids=[1] * query_len,
             )
-            with patch.object(
-                input_buffer_module,
-                "compute_out_cache_loc",
-            ), patch.object(
-                input_buffer_module,
-                "compute_position_triton",
+            with (
+                patch.object(
+                    input_buffer_module,
+                    "compute_out_cache_loc",
+                ),
+                patch.object(
+                    input_buffer_module,
+                    "compute_position_triton",
+                ),
             ):
                 buffers.fill_input_buffers(
                     forward_op,
@@ -1219,13 +1222,16 @@ class TestDeepseekV4Config(unittest.TestCase):
         def capture_cache_start(**kwargs):
             cache_starts.append(kwargs["cache_start"].clone())
 
-        with patch.object(
-            input_buffer_module,
-            "compute_out_cache_loc",
-            side_effect=capture_cache_start,
-        ), patch.object(
-            input_buffer_module,
-            "compute_position_triton",
+        with (
+            patch.object(
+                input_buffer_module,
+                "compute_out_cache_loc",
+                side_effect=capture_cache_start,
+            ),
+            patch.object(
+                input_buffer_module,
+                "compute_position_triton",
+            ),
         ):
             buffers.fill_input_buffers(
                 forward_op,
@@ -1281,13 +1287,17 @@ class TestDeepseekV4Config(unittest.TestCase):
                 payloads[id(data)] = (kwargs.copy(), tensor)
             return tensor
 
-        with patch.object(
-            torch,
-            "tensor",
-            side_effect=record_payload_tensor,
-        ), patch.object(input_buffer_module, "compute_out_cache_loc"), patch.object(
-            input_buffer_module,
-            "compute_position_triton",
+        with (
+            patch.object(
+                torch,
+                "tensor",
+                side_effect=record_payload_tensor,
+            ),
+            patch.object(input_buffer_module, "compute_out_cache_loc"),
+            patch.object(
+                input_buffer_module,
+                "compute_position_triton",
+            ),
         ):
             buffers.fill_input_buffers(
                 forward_op,
@@ -1505,8 +1515,9 @@ class TestDeepseekV4Config(unittest.TestCase):
             {"init_expert_location": '{"logical_count": [1]}'},
         )
         for options in unsupported:
-            with self.subTest(options=options), self.assertRaisesRegex(
-                ValueError, "requires trivial expert placement"
+            with (
+                self.subTest(options=options),
+                self.assertRaisesRegex(ValueError, "requires trivial expert placement"),
             ):
                 ServerArgs(model="stub", moe_backend="trtllm", **options)
 
@@ -3080,10 +3091,13 @@ class TestDeepseekV4Config(unittest.TestCase):
                 raise AssertionError("CPU query-length upload")
             return original_to(tensor, *args, **kwargs)
 
-        with patch.object(torch.Tensor, "to", new=guarded_to), patch.object(
-            torch.Tensor,
-            "item",
-            side_effect=AssertionError("device-to-host scalar read"),
+        with (
+            patch.object(torch.Tensor, "to", new=guarded_to),
+            patch.object(
+                torch.Tensor,
+                "item",
+                side_effect=AssertionError("device-to-host scalar read"),
+            ),
         ):
             backend.init_forward_metadata(
                 bs=2,
@@ -4756,30 +4770,37 @@ class TestDeepseekV4Config(unittest.TestCase):
             max_context_len=1,
         )
 
-        with patch.object(
-            deepseek_v4_model,
-            "deepseek_v4_prepare_indexer_q_mxfp4",
-            side_effect=fake_prepare_mxfp4,
-        ), patch.object(
-            deepseek_v4_model,
-            "_deepseek_v4_deepgemm_fp4_indexer_available",
-            return_value=True,
-        ), patch.object(
-            deepseek_v4_model,
-            "_deepseek_v4_indexer_prefill_metadata",
-            return_value=empty_prefill_metadata,
-        ), patch.object(
-            deepseek_v4_model,
-            "_deepseek_v4_indexer_decode_plan",
-            return_value=decode_metadata,
-        ), patch.object(
-            deepseek_v4_model,
-            "_deepseek_v4_indexer_decode_schedule_metadata",
-            return_value=None,
-        ), patch.object(
-            deepseek_v4_model,
-            "_deepseek_v4_sparse_attn_indexer",
-            side_effect=fake_sparse_indexer,
+        with (
+            patch.object(
+                deepseek_v4_model,
+                "deepseek_v4_prepare_indexer_q_mxfp4",
+                side_effect=fake_prepare_mxfp4,
+            ),
+            patch.object(
+                deepseek_v4_model,
+                "_deepseek_v4_deepgemm_fp4_indexer_available",
+                return_value=True,
+            ),
+            patch.object(
+                deepseek_v4_model,
+                "_deepseek_v4_indexer_prefill_metadata",
+                return_value=empty_prefill_metadata,
+            ),
+            patch.object(
+                deepseek_v4_model,
+                "_deepseek_v4_indexer_decode_plan",
+                return_value=decode_metadata,
+            ),
+            patch.object(
+                deepseek_v4_model,
+                "_deepseek_v4_indexer_decode_schedule_metadata",
+                return_value=None,
+            ),
+            patch.object(
+                deepseek_v4_model,
+                "_deepseek_v4_sparse_attn_indexer",
+                side_effect=fake_sparse_indexer,
+            ),
         ):
             actual = DeepseekV4Indexer._forward_sparse_indexer_custom_op(
                 self_obj,
