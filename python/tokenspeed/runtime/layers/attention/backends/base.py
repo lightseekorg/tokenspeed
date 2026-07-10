@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import inspect
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
@@ -34,6 +35,28 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
     from tokenspeed.runtime.pd.utils import StepCounter
+
+
+def init_backend_cuda_graph_state(
+    backend: "AttentionBackend",
+    max_bs: int,
+    seq_lens_buf: torch.Tensor,
+    **extras,
+) -> None:
+    """Call ``backend.init_cuda_graph_state`` with only the kwargs its
+    signature accepts (VAR_KEYWORD accepts all of them).
+
+    Signature-probe instead of try/except TypeError: paged_cache_group_specs
+    is load-bearing for the state shed, so a TypeError raised from inside the
+    backend's body must propagate rather than silently retry without specs.
+
+    Shared by the cuda-graph wrapper and by composite backends (hybrid) that
+    forward to user-selectable sub-backends with possibly narrow signatures.
+    """
+    params = inspect.signature(backend.init_cuda_graph_state).parameters
+    if not any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        extras = {k: v for k, v in extras.items() if k in params}
+    backend.init_cuda_graph_state(max_bs, seq_lens_buf, **extras)
 
 
 class AttentionBackend(ABC):

@@ -100,6 +100,15 @@ class ComputeStatePageIndicesTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._run([[7, -1, 12]], [5], [6])
 
+    def test_duplicate_out_pages_raise(self):
+        # req0: before=4 after=5 -> out slot 1 -> page 9; req1: before=0
+        # after=1 -> out slot 0 -> page 9. All other guards pass (pages
+        # positive, in-page valid/no history), so only the batch-uniqueness
+        # invariant fires: two requests writing the same working state page
+        # would silently clobber each other.
+        with self.assertRaisesRegex(ValueError, "unique"):
+            self._run([[7, 9, 12], [9, 22, 23]], [4, 0], [5, 1])
+
     def test_no_history_null_in_page_passes(self):
         # before=0 legitimately reads the null page 0 (see
         # test_first_step_null_in_page); the in-page guard must not fire.
@@ -312,7 +321,7 @@ class GDNFlatStatePagingGPUTest(unittest.TestCase):
         from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
             causal_conv1d_fn,
         )
-        from tokenspeed.runtime.layers.attention.chunk import (
+        from tokenspeed_kernel.ops.attention.triton.linear.chunk import (
             chunk_gated_delta_rule,
         )
         from tokenspeed.runtime.layers.attention.linear.gdn import fused_gdn_gating

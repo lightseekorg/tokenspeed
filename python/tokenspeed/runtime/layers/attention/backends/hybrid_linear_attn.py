@@ -46,7 +46,10 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
     scrub_padding_tail,
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
+from tokenspeed.runtime.layers.attention.backends.base import (
+    AttentionBackend,
+    init_backend_cuda_graph_state,
+)
 from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
@@ -1517,10 +1520,16 @@ class HybridLinearAttnBackend(AttentionBackend):
 
     def init_cuda_graph_state(self, max_bs: int, seq_lens_buf: torch.Tensor, **kwargs):
         # kwargs (e.g. paged_cache_group_specs, so the full backend sheds
-        # state-family groups) ride to the full backend only; the mamba
-        # backend keeps its narrow signature.
-        self.full_attn_backend.init_cuda_graph_state(max_bs, seq_lens_buf, **kwargs)
-        self.linear_attn_backend.init_cuda_graph_state(max_bs, seq_lens_buf)
+        # state-family groups) are forwarded through the shared signature
+        # filter: the full backend is user-selectable and may have a narrow
+        # signature (e.g. TRTLLM MHA takes only (max_bs, seq_lens_buf)), and
+        # the mamba backend keeps its narrow signature today.
+        init_backend_cuda_graph_state(
+            self.full_attn_backend, max_bs, seq_lens_buf, **kwargs
+        )
+        init_backend_cuda_graph_state(
+            self.linear_attn_backend, max_bs, seq_lens_buf, **kwargs
+        )
 
     def register_step_counter(self, step_counter):
         # Hybrid layerwise transfer needs one global step per model layer,

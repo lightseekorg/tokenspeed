@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import bisect
 import gc
-import inspect
 import queue
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -39,6 +38,9 @@ from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
+)
+from tokenspeed.runtime.layers.attention.backends.base import (
+    init_backend_cuda_graph_state,
 )
 from tokenspeed.runtime.sampling.backends.base import CUDA_GRAPH_VARIANT_DEFAULT
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
@@ -58,25 +60,6 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 
 logger = get_colorful_logger(__name__)
-
-
-def _init_backend_cuda_graph_state(
-    backend: "AttentionBackend",
-    max_bs: int,
-    seq_lens_buf: torch.Tensor,
-    **extras,
-) -> None:
-    """Call ``backend.init_cuda_graph_state`` with only the kwargs its
-    signature accepts (VAR_KEYWORD accepts all of them).
-
-    Signature-probe instead of try/except TypeError: paged_cache_group_specs
-    is load-bearing for the state shed, so a TypeError raised from inside the
-    backend's body must propagate rather than silently retry without specs.
-    """
-    params = inspect.signature(backend.init_cuda_graph_state).parameters
-    if not any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
-        extras = {k: v for k, v in extras.items() if k in params}
-    backend.init_cuda_graph_state(max_bs, seq_lens_buf, **extras)
 
 
 _is_capture_mode = False
@@ -245,7 +228,7 @@ class CudaGraphWrapper:
         self.world_size = config.world_size
         # Backends alias their cache_seqlens buffer. Draft backend aliases
         # the drafter-owned draft_seq_lens to keep InputBuffers read-only.
-        _init_backend_cuda_graph_state(
+        init_backend_cuda_graph_state(
             attn_backend,
             self.max_bs,
             self.input_buffers.seq_lens_buf,
@@ -254,7 +237,7 @@ class CudaGraphWrapper:
             overlap_schedule_depth=self.overlap_schedule_depth,
         )
         if draft_attn_backend is not None:
-            _init_backend_cuda_graph_state(
+            init_backend_cuda_graph_state(
                 draft_attn_backend,
                 self.max_bs,
                 self.drafter.draft_seq_lens_buf,

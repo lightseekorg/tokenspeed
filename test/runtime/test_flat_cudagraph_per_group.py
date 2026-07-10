@@ -434,6 +434,24 @@ class BackendCaptureFlatTest(_BackendCase):
         self.assertIsNone(metadata.page_tables)
         self.assertEqual(self.backend.cuda_graph_flat_page_tables, {})
 
+    def test_radix_capture_keeps_single_page_table(self):
+        # Radix/single-table capture: page_table stays a live slice of the
+        # persistent buffer (replay fills it via the gather path).
+        metadata = self._capture(2)
+        self.assertIsNotNone(metadata.page_table)
+        self.assertEqual(tuple(metadata.page_table.shape), (2, MAX_NUM_PAGES))
+        self.assertEqual(
+            metadata.page_table.data_ptr(),
+            self.backend.cuda_graph_page_table.data_ptr(),
+        )
+
+    def test_flat_capture_sheds_single_page_table(self):
+        # Flat captures route reads through per-group tables and replay never
+        # fills the radix single table: page_table must be None, never a
+        # slice of the never-filled zero buffer.
+        metadata = self._capture(2, _GROUP_IDS)
+        self.assertIsNone(metadata.page_table)
+
     def test_allocates_persistent_buffers_and_views(self):
         bs = 2
         metadata = self._capture(bs, _GROUP_IDS)
@@ -676,12 +694,40 @@ class BackendStateGroupShedTest(_BackendCase):
 
 
 class BackendReplayNoFlatBuffersTest(_BackendCase):
+    def _replay_with_recorded_gather(self, bs, flat_block_tables=None):
+        # The radix single-table fill is a GPU Triton kernel; record the call
+        # instead of launching it on this test's CPU tensors.
+        from unittest import mock
+
+        import tokenspeed.runtime.layers.attention.backends.mha as mha_mod
+
+        with mock.patch.object(
+            mha_mod, "gather_page_table_with_padding"
+        ) as gather:
+            self._replay(bs, flat_block_tables)
+        return gather
+
     def test_replay_without_flat_capture_needs_no_tables(self):
         # No flat buffers captured (radix/single-table path): replay without
-        # tables stays valid.
+        # tables stays valid and fills the radix single table.
         self._capture(2)
-        self._replay(2)
+        gather = self._replay_with_recorded_gather(2)
+        gather.assert_called_once()
         self.assertEqual(self.backend.cuda_graph_flat_page_tables, {})
+
+    def test_flat_replay_skips_radix_single_table_fill(self):
+        # Flat captures read only the per-group buffers: filling the radix
+        # single table would be dead work (see init_forward_metadata_replay).
+        torch = self.torch
+        self._capture(2, _GROUP_IDS)
+        gather = self._replay_with_recorded_gather(
+            2,
+            {
+                gid: torch.ones((2, 2), dtype=torch.int32)
+                for gid in _GROUP_IDS
+            },
+        )
+        gather.assert_not_called()
 
 
 if __name__ == "__main__":
