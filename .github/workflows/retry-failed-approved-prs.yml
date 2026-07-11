@@ -42,6 +42,18 @@ jobs:
               context.eventName === "workflow_dispatch" &&
               String(context.payload.inputs?.dry_run) === "true";
             const { owner, repo } = context.repo;
+            const summaryRows = [];
+
+            function addSummaryRow(pull, workflowId, run, result) {
+              summaryRows.push([
+                `<a href="${pull.html_url}">#${pull.number}</a>`,
+                workflowId || "—",
+                run
+                  ? `<a href="${run.html_url}">${run.id}</a>`
+                  : "—",
+                result,
+              ]);
+            }
 
             async function getPullRequest(number) {
               const query = `
@@ -135,12 +147,13 @@ jobs:
               return approved;
             }
 
-            const pulls = await github.paginate(github.rest.pulls.list, {
-              owner,
-              repo,
-              state: "open",
-              per_page: 100,
-            });
+            try {
+              const pulls = await github.paginate(github.rest.pulls.list, {
+                owner,
+                repo,
+                state: "open",
+                per_page: 100,
+              });
 
             core.info(
               "Scanning " + pulls.length + " open pull request(s)" +
@@ -173,6 +186,12 @@ jobs:
                     core.warning(
                       "PR #" + pull.number + ": unable to list runs for " +
                         workflowId + ": " + error.message,
+                    );
+                    addSummaryRow(
+                      pull,
+                      workflowId,
+                      null,
+                      "Failed to inspect",
                     );
                     continue;
                   }
@@ -240,6 +259,12 @@ jobs:
                         run.id + " failed on attempt " + attempt +
                         "; retry limit reached.",
                     );
+                    addSummaryRow(
+                      pull,
+                      workflowId,
+                      run,
+                      "Retry limit reached",
+                    );
                     continue;
                   }
                   if (
@@ -250,6 +275,12 @@ jobs:
                       "PR #" + pull.number + ": " + workflowId + " run " +
                         run.id + " is older than 30 days; skipping.",
                     );
+                    addSummaryRow(
+                      pull,
+                      workflowId,
+                      run,
+                      "Run older than 30 days",
+                    );
                     continue;
                   }
 
@@ -259,6 +290,7 @@ jobs:
                         workflowId + " run " + run.id + " after attempt " +
                         attempt + ".",
                     );
+                    addSummaryRow(pull, workflowId, run, "Dry run");
                     continue;
                   }
 
@@ -272,11 +304,23 @@ jobs:
                         workflowId + " run " + run.id + " after attempt " +
                         attempt + ".",
                     );
+                    addSummaryRow(
+                      pull,
+                      workflowId,
+                      run,
+                      "Rerun started",
+                    );
                   } catch (error) {
                     core.warning(
                       "PR #" + pull.number + ": unable to rerun failed jobs " +
                         "for " + workflowId + " run " + run.id + ": " +
                         error.message,
+                    );
+                    addSummaryRow(
+                      pull,
+                      workflowId,
+                      run,
+                      "Failed to start",
                     );
                   }
                 }
@@ -284,5 +328,23 @@ jobs:
                 core.warning(
                   "PR #" + pull.number + ": scan failed: " + error.message,
                 );
+                addSummaryRow(pull, null, null, "Failed to inspect");
               }
+            }
+            } finally {
+              core.summary.addHeading("Approved PR retry summary");
+              if (summaryRows.length > 0) {
+                core.summary.addTable([
+                  [
+                    { data: "PR", header: true },
+                    { data: "Workflow", header: true },
+                    { data: "Run", header: true },
+                    { data: "Result", header: true },
+                  ],
+                  ...summaryRows,
+                ]);
+              } else {
+                core.summary.addRaw("No reruns were eligible.");
+              }
+              await core.summary.write();
             }
