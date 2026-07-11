@@ -237,7 +237,7 @@ class GptOssAttention(nn.Module):
                 layer=self.attn,
                 # Flat path: prewrite at this layer's group locations.
                 out_cache_loc=ctx.attn_backend.select_out_cache_loc(
-                    self.attn, out_cache_loc
+                    self.attn, out_cache_loc, ctx.forward_mode
                 ),
                 token_to_kv_pool=ctx.token_to_kv_pool,
             )

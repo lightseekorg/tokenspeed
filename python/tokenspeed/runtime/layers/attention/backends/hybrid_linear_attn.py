@@ -487,6 +487,11 @@ class SimpleMambaPool:
 class MambaAttnBackend(AttentionBackend):
     """Attention backend for Mamba/GDN linear attention layers."""
 
+    # Consumes the state group's flat table via dual in/out page indexing
+    # (see _flat_state_pages); declared so the flat config guard's
+    # sub-backend recursion recognizes it as flat-capable.
+    uses_flat_cache_groups: bool = True
+
     def __init__(self, config: BaseAttnConfig):
         super().__init__(config)
         self.pad_slot_id = -1

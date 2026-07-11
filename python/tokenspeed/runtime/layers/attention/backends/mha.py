@@ -20,7 +20,6 @@
 
 from __future__ import annotations
 
-import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import partial
@@ -42,6 +41,9 @@ from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.breakable_cuda_graph import scrub_padding_tail
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
+from tokenspeed.runtime.layers.attention.backends.flat_groups import (
+    FlatCacheGroupsMixin,
+)
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.layers.attention.utils import build_page_table
@@ -107,7 +109,7 @@ class MHADecodeMetadata:
     out_cache_locs: dict[str, torch.Tensor] | None = None
 
 
-class MHAAttnBackend(AttentionBackend):
+class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
     """Standard MHA backend that routes through tokenspeed_kernel attention APIs."""
 
     # Unconditional: safety comes from the publication rule
@@ -155,10 +157,6 @@ class MHAAttnBackend(AttentionBackend):
         # Forward metadata is initialized in the runner per forward call
         self.forward_decode_metadata: MHADecodeMetadata | None = None
         self.forward_extend_metadata: MHAExtendMetadata | None = None
-
-        # family="state" group ids (GDN/mamba state pages) learned from the
-        # pool's specs in init_cuda_graph_state; this backend sheds them.
-        self.flat_state_group_ids: frozenset[str] = frozenset()
 
     # ------------------------------------------------------------------
     # Metadata initialization
@@ -315,11 +313,7 @@ class MHAAttnBackend(AttentionBackend):
         # State-family groups (GDN/mamba pages) belong to the mamba backend;
         # learn their ids from the pool's specs so every flat table/loc path
         # here (eager, capture, replay) sheds them.
-        self.flat_state_group_ids = frozenset(
-            str(spec.group_id)
-            for spec in paged_cache_group_specs
-            if spec.family == "state"
-        )
+        self._learn_flat_state_groups(paged_cache_group_specs)
         assert (
             seq_lens_buf.dtype == torch.int32
             and seq_lens_buf.dim() == 1
@@ -334,9 +328,7 @@ class MHAAttnBackend(AttentionBackend):
         # capture. TODO(radix-removal): parallels cuda_graph_page_table.
         # Initialized before the DFLASH early return: replay reads the dict
         # unconditionally for the stale-table guard.
-        self.cuda_graph_flat_page_tables: dict[str, torch.Tensor] = {}
-        self.cuda_graph_flat_out_cache_locs: dict[str, torch.Tensor] = {}
-        self._cuda_graph_max_bs = max_bs
+        self._init_flat_graph_buffers(max_bs)
         if self.draft_block_decode and self.spec_num_tokens > 1:
             # DFLASH draft block: expand to spec_num_tokens decode rows per
             # request (one row per block position), so max_seqlen_q == 1 per row
@@ -374,8 +366,6 @@ class MHAAttnBackend(AttentionBackend):
         # Real tables only arrive at replay: capture lazily allocates
         # persistent per-group buffers and records metadata views into them,
         # so replay can copy_ fresh data to the graph-recorded addresses.
-        page_tables = None
-        out_cache_locs = None
         if flat_cache_group_ids:
             # Per-group views are bs rows; spec buffers expand to
             # bs * spec_num_tokens rows. TODO(flat+spec).
@@ -383,34 +373,9 @@ class MHAAttnBackend(AttentionBackend):
                 self.spec_num_tokens > 1
                 and (not self.is_draft or self.draft_block_decode)
             ), "flat_cache_group_ids is unsupported with spec_num_tokens > 1"
-            page_tables = {}
-            out_cache_locs = {}
-            for gid in flat_cache_group_ids:
-                if gid in self.flat_state_group_ids:
-                    # State pages ride to the mamba backend; no MHA buffers.
-                    continue
-                buf = self.cuda_graph_flat_page_tables.get(gid)
-                if buf is None:
-                    buf = torch.zeros(
-                        (self._cuda_graph_max_bs, self.max_num_pages),
-                        dtype=torch.int32,
-                        device=self.device,
-                    )
-                    self.cuda_graph_flat_page_tables[gid] = buf
-                loc_buf = self.cuda_graph_flat_out_cache_locs.get(gid)
-                if loc_buf is None:
-                    loc_buf = torch.zeros(
-                        (self._cuda_graph_max_bs,),
-                        dtype=torch.int32,
-                        device=self.device,
-                    )
-                    self.cuda_graph_flat_out_cache_locs[gid] = loc_buf
-                page_tables[gid] = buf[:bs, :]
-                out_cache_locs[gid] = loc_buf[:bs]
-            if not page_tables:
-                # Only state groups delivered: nothing for this backend.
-                page_tables = None
-                out_cache_locs = None
+        page_tables, out_cache_locs = self._flat_capture_group_views(
+            bs, flat_cache_group_ids
+        )
 
         if self.draft_block_decode and self.spec_num_tokens > 1:
             # DFLASH draft block: spec_num_tokens decode rows per request.
@@ -458,25 +423,7 @@ class MHAAttnBackend(AttentionBackend):
         assert not forward_mode.is_extend_or_mixed()
 
         # Fail loudly instead of replaying over stale/zero page tables.
-        # bs == 0 may skip: col-0 buffer entries stay valid (never -1),
-        # outputs are discarded, and only unit tests reach it.
-        if self.cuda_graph_flat_page_tables and bs > 0:
-            if not flat_block_tables:
-                raise RuntimeError(
-                    "MHAAttnBackend replay: flat per-group CUDA-graph buffers "
-                    f"exist for groups "
-                    f"{sorted(self.cuda_graph_flat_page_tables)} "
-                    f"but flat_block_tables is missing/empty at bs={bs}; the "
-                    "captured graph would read stale page tables."
-                )
-            missing = set(self.cuda_graph_flat_page_tables) - set(flat_block_tables)
-            if missing:
-                raise RuntimeError(
-                    "MHAAttnBackend replay: flat_block_tables at bs="
-                    f"{bs} is missing captured groups {sorted(missing)} "
-                    f"(delivered: {sorted(flat_block_tables)}); the captured "
-                    "graph would read stale page tables for those groups."
-                )
+        self._flat_replay_stale_guard(bs, flat_block_tables)
 
         # Flat captures read only the per-group buffers; the radix single
         # table (cuda_graph_page_table) would be dead work there.
@@ -503,45 +450,10 @@ class MHAAttnBackend(AttentionBackend):
                 bs, self.spec_num_tokens, self.max_num_pages
             ).copy_(base_page_table[:, None, :])
 
-        # Padding contract (canonical; bs is the padded bs): dummy ROWS pad
-        # with 0 — replayed at seq_lens=1 they dereference exactly col 0,
-        # the zero-init dummy page. Column tails pad with -1, never read
-        # past cache_seqlens.
+        # cuda_graph_seq_lens aliases the controller's seq_lens_buf, which
+        # input prep fills (current lens + padding 1s) BEFORE this call.
         if flat_block_tables:
-            for gid, src in flat_block_tables.items():
-                if gid in self.flat_state_group_ids:
-                    # State group: the mamba backend consumes it directly.
-                    continue
-                buf = self.cuda_graph_flat_page_tables[gid]
-                cols = src.shape[1]
-                # cols >= 1: a zero-width table would leave dummy rows'
-                # col 0 unwritten.
-                assert 1 <= cols <= buf.shape[1], (
-                    f"flat table for group {gid!r}: {cols} cols outside"
-                    f" [1, {buf.shape[1]}] (CUDA-graph buffer width)"
-                )
-                assert src.shape[0] >= bs, (
-                    f"flat table for group {gid!r} has {src.shape[0]} rows"
-                    f" < padded bs {bs}"
-                )
-                buf[:bs, :cols].copy_(src[:bs, :])
-                if cols < buf.shape[1]:
-                    buf[:bs, cols:].fill_(-1)
-
-            # cuda_graph_seq_lens aliases the controller's seq_lens_buf,
-            # which input prep fills (current lens + padding 1s) BEFORE this
-            # call, so [:bs] is current when recomputing write locs.
-            locs = self._compute_flat_decode_out_cache_locs(
-                {
-                    gid: self.cuda_graph_flat_page_tables[gid][:bs, :]
-                    for gid in flat_block_tables
-                    if gid not in self.flat_state_group_ids
-                },
-                self.cuda_graph_seq_lens[:bs],
-                self.page_size,
-            )
-            for gid, val in locs.items():
-                self.cuda_graph_flat_out_cache_locs[gid][:bs].copy_(val)
+            self._flat_replay_fill(bs, flat_block_tables, self.cuda_graph_seq_lens)
 
         if bs in self.cuda_graph_decode_metadata:
             self.forward_decode_metadata = self.cuda_graph_decode_metadata[bs]
@@ -662,125 +574,6 @@ class MHAAttnBackend(AttentionBackend):
                 save_kv_cache,
                 sinks,
             )
-
-    @staticmethod
-    def _select_group_entry(layer, mapping, what: str):
-        """Pick this layer's entry from a flat per-group dict (page tables or
-        write locs): the layer's group entry, or the sole entry when the
-        layer carries no/unknown group id. TODO(radix-removal): collapses to
-        `mapping[layer.group_id]` once flat is the only path.
-        """
-        group_id = getattr(layer, "group_id", "")
-        if not group_id or group_id not in mapping:
-            if len(mapping) == 1:
-                return next(iter(mapping.values()))
-            raise KeyError(
-                f"{what}: layer group_id={group_id!r} not in flat group "
-                f"keys {sorted(mapping)}"
-            )
-        return mapping[group_id]
-
-    def _select_page_table(self, layer, metadata):
-        if metadata.page_tables is None:
-            return metadata.page_table
-        return self._select_group_entry(layer, metadata.page_tables, "page table")
-
-    def _select_out_cache_loc(self, layer, metadata, out_cache_loc):
-        # KV writes must land in the pages the layer's group reads (M-W1).
-        if metadata.out_cache_locs is None:
-            return out_cache_loc
-        return self._select_group_entry(
-            layer, metadata.out_cache_locs, "flat write locs"
-        )
-
-    def select_out_cache_loc(self, layer, out_cache_loc):
-        """Per-group write locations for out-of-backend KV writers (fused
-        RoPE prewrite); prewrite is decode-only, so reads decode metadata.
-        """
-        metadata = self.forward_decode_metadata
-        if metadata is None or metadata.out_cache_locs is None:
-            return out_cache_loc
-        return self._select_out_cache_loc(layer, metadata, out_cache_loc)
-
-    @staticmethod
-    def _compute_flat_decode_out_cache_locs(page_tables, seq_lens, page_size):
-        """Per-group decode write locs: one token per request at seq_len-1,
-        gathered from the group's own read table (M-W1). The tail page is
-        never a hole (SWA holes sit only at the window front).
-        """
-        pos = (seq_lens - 1).to(torch.int64)
-        page_idx = pos // page_size
-        off = (pos % page_size).to(torch.int32)
-        out = {}
-        for gid, table in page_tables.items():
-            pages = table.gather(1, page_idx.unsqueeze(1)).squeeze(1)
-            out[gid] = pages * page_size + off
-        return out
-
-    def _shed_state_groups(self, tables):
-        """Drop family="state" groups (GDN/mamba state pages, consumed by the
-        mamba backend): computing write locs / capture buffers over the
-        hole-heavy state table writes the dummy page and trips
-        TOKENSPEED_FLAT_DEBUG. Returns None when nothing is left.
-        """
-        if not tables:
-            return None
-        if self.flat_state_group_ids:
-            tables = {
-                gid: table
-                for gid, table in tables.items()
-                if gid not in self.flat_state_group_ids
-            }
-        return tables or None
-
-    @staticmethod
-    def _compute_flat_extend_out_cache_locs(
-        page_tables, extend_prefix_lens_cpu, extend_seq_lens_cpu, page_size
-    ):
-        """Per-group extend write locs: positions [prefix_len, seq_len) per
-        request, flattened in q/k/v token order (cu_extend_seq_lens). Bounds
-        come from the CPU mirrors — no per-request GPU sync.
-        TODO(flat-perf): batch the per-request loop via repeat_interleave.
-        """
-        device = next(iter(page_tables.values())).device
-        prefix_lens = [int(x) for x in extend_prefix_lens_cpu.tolist()]
-        extend_lens = [int(x) for x in extend_seq_lens_cpu.tolist()]
-        out = {gid: [] for gid in page_tables}
-        for i, (start, num_new) in enumerate(zip(prefix_lens, extend_lens)):
-            pos = torch.arange(start, start + num_new, dtype=torch.int64, device=device)
-            page_idx = pos // page_size
-            off = (pos % page_size).to(torch.int32)
-            for gid, table in page_tables.items():
-                pages = table[i].gather(0, page_idx)
-                out[gid].append(pages * page_size + off)
-        return {
-            gid: (
-                torch.cat(chunks)
-                if chunks
-                else torch.empty(0, dtype=torch.int32, device=device)
-            )
-            for gid, chunks in out.items()
-        }
-
-    @staticmethod
-    def _maybe_check_flat_write_locs(page_tables, out_cache_locs, page_size):
-        """TOKENSPEED_FLAT_DEBUG=1 (eager only, GPU sync): write pages must
-        be real and inside the group's table. Not for graph-padded batches —
-        dummy rows would trip the non-hole assert (see the padding contract
-        in init_forward_metadata_replay_cuda_graph).
-        """
-        if os.environ.get("TOKENSPEED_FLAT_DEBUG") != "1":
-            return
-        for gid, locs in out_cache_locs.items():
-            pages = (locs // page_size).to(torch.int32)
-            table = page_tables[gid]
-            assert (
-                pages != 0
-            ).all(), f"flat write loc in null page 0 for group {gid!r}"
-            real = table[table > 0]
-            assert torch.isin(
-                pages, real
-            ).all(), f"flat write pages escape group {gid!r}'s table"
 
     def _forward_prefill(
         self,
