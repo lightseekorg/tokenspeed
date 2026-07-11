@@ -45,7 +45,10 @@ def _reorder_w13(x: torch.Tensor, layout: str, dim: int) -> torch.Tensor:
     if layout == "interleaved":
         shape = list(x.shape)
         paired_shape = shape[:dim] + [size // 2, 2] + shape[dim + 1 :]
-        return x.reshape(paired_shape).flip(dim + 1).reshape(shape).contiguous()
+        paired = x.reshape(paired_shape)
+        w1 = paired.select(dim + 1, 0)
+        w3 = paired.select(dim + 1, 1)
+        return torch.cat((w3, w1), dim=dim).contiguous()
     raise ValueError(f"unknown w13_input_layout: {layout!r}")
 
 
