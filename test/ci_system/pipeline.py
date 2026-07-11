@@ -385,32 +385,6 @@ def create_ci_venv_command(venv_path: str) -> str:
     return f"python3 -m venv {venv_path}"
 
 
-def isolate_ci_venv_environment(env: Dict[str, str]) -> Dict[str, str]:
-    """Remove host Python paths while preserving system CUDA library paths."""
-    isolated = dict(env)
-    isolated["PYTHONNOUSERSITE"] = "1"
-    isolated.pop("PYTHONHOME", None)
-    isolated.pop("PYTHONPATH", None)
-
-    ld_library_path = isolated.get("LD_LIBRARY_PATH", "")
-    if ld_library_path:
-        entries = [entry for entry in ld_library_path.split(os.pathsep) if entry]
-        entries = [
-            entry
-            for entry in entries
-            if not re.search(
-                r"/(?:site|dist)-packages/torch/lib(?:/|$)",
-                entry.replace("\\", "/"),
-            )
-        ]
-        if entries:
-            isolated["LD_LIBRARY_PATH"] = os.pathsep.join(entries)
-        else:
-            isolated.pop("LD_LIBRARY_PATH", None)
-
-    return isolated
-
-
 def _pkill(
     pattern: str,
     signal_name: str,
@@ -490,7 +464,6 @@ def setup_runner(
     pgm: Optional[ProcessGroupManager] = None
 
     if is_gb200_runner(runner):
-        local_env = isolate_ci_venv_environment(local_env)
         pgm = make_manager()
         local_env["CI_RUNNER_ID"] = pgm.runner_id
         print(f"[gb200] runner_id={pgm.runner_id}", flush=True)
