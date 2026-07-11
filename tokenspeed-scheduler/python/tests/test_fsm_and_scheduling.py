@@ -121,6 +121,25 @@ class TestFSMTransitions:
         assert s.prefilling_size() == 0
         assert s.decoding_size() == 0
 
+    def test_pending_prefill_tracks_only_prefill_candidates(self):
+        s = Scheduler(make_config(max_scheduled_tokens=8))
+        assert not s.has_pending_prefill()
+
+        submit(s, "r0", list(range(16)))
+        assert s.has_pending_prefill()
+
+        s.next_execution_plan()  # Submitted -> Prefilling.
+        assert s.has_pending_prefill()
+
+        s.next_execution_plan()  # Prefilling -> PrefillDone.
+        assert not s.has_pending_prefill()
+
+        s.next_execution_plan()  # PrefillDone -> Decoding.
+        assert not s.has_pending_prefill()
+
+        submit(s, "r1", list(range(8)))
+        assert s.has_pending_prefill()
+
     def test_first_plan_moves_submitted_to_prefilling(self):
         """After first next_execution_plan, request leaves Submitted (waiting → 0)."""
         s = Scheduler(make_config())

@@ -1768,7 +1768,11 @@ class EventLoop:
                 prev_forward_op = None
                 continue
 
-            if self.server_args.enable_mixed_batch and prev_results is not None:
+            if (
+                self.server_args.enable_mixed_batch
+                and prev_results is not None
+                and (self.has_dp or self.scheduler.has_pending_prefill())
+            ):
                 request_changes = self._commit_forward_results(
                     prev_forward_op, prev_results
                 )

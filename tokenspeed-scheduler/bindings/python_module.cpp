@@ -449,6 +449,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("waiting_size", &tokenspeed::Scheduler::WaitingSize)
         .def("decoding_size", &tokenspeed::Scheduler::DecodingSize)
         .def("prefilling_size", &tokenspeed::Scheduler::PrefillSize)
+        .def("has_pending_prefill", &tokenspeed::Scheduler::HasPendingPrefill)
         .def("retract_count", &tokenspeed::Scheduler::RetractedSize)
         .def("available_kv_pages", &tokenspeed::Scheduler::AvailableKvPages)
         .def("active_kv_pages", &tokenspeed::Scheduler::ActiveKvPages)

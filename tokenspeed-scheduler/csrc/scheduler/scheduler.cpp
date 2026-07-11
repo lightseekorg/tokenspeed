@@ -237,6 +237,15 @@ std::size_t Scheduler::PrefillSize() const {
     return count;
 }
 
+bool Scheduler::HasPendingPrefill() const {
+    for (const auto& [id, req] : requests_) {
+        if (req->Is<fsm::Submitted>() || req->Is<fsm::PrefetchDone>() || req->Is<fsm::Prefilling>()) {
+            return true;
+        }
+    }
+    return false;
+}
+
 std::size_t Scheduler::RetractedSize() const {
     std::size_t count = 0;
     for (const auto& [id, req] : requests_) {
