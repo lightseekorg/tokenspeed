@@ -19,20 +19,22 @@
 # SOFTWARE.
 
 """
-Qwen3.5-VL EPD (1-encode-2-prefill-1-decode) disaggregation smoke test.
+Qwen3.5-VL EPD (1-encode-1-prefill-2-decode) disaggregation smoke test.
 
 Runs nvidia/Qwen3.5-122B-A10B-NVFP4 by default (override via MODEL) on a 4-GPU
-1E-2P-1D layout: 1 encode + 2 independent prefill instances + 1 decode, all
-TP1, with the gateway round-robining requests across the two prefill workers.
+1E-1P-2D layout: 1 encode + 1 prefill + 2 independent decode instances, all
+TP1, with the gateway round-robining requests across the two decode workers.
 Launches the EPD serve script (encode + prefill + decode workers behind the SMG
 gateway) and validates that the vision path works end to end via the
 /v1/chat/completions API: it posts a self-contained image (rendered with PIL, no
 network fixture) plus a prompt and asserts the model reads it correctly. This is
 the EPD analogue of test_qwen35_pd_1p1d.py -- a functional gate that the
 encode->prefill->decode embedding transfer does not silently corrupt the image.
+The smoke requests disable thinking explicitly so their 32-token budget tests
+the vision result instead of reasoning length; the OCRBench eval remains native-think.
 
 Usage:
-    pytest test/runtime/distributed/test_qwen35_epd_1e2p1d.py -v -s
+    pytest test/runtime/distributed/test_qwen35_epd_1e1p2d.py -v -s
 """
 
 import base64
@@ -52,13 +54,13 @@ SERVE_SCRIPT = os.path.join(
     "..",
     "..",
     "ci_system",
-    "serve_qwen35_122b_nvfp4_epd_1e2p1d.sh",
+    "serve_qwen35_122b_nvfp4_epd_1e1p2d.sh",
 )
 LB_PORT = int(os.environ.get("LB_PORT", "12345"))
 MODEL = os.environ.get("MODEL", "nvidia/Qwen3.5-122B-A10B-NVFP4")
 SERVED_MODEL_NAME = os.environ.get("SERVED_MODEL_NAME", MODEL)
 STARTUP_TIMEOUT = int(os.environ.get("EPD_STARTUP_TIMEOUT", "2400"))
-LOG_DIR = os.environ.get("EPD_CI_LOG_DIR", ".ci-artifacts/epd-qwen35-122b-1e2p1d")
+LOG_DIR = os.environ.get("EPD_CI_LOG_DIR", ".ci-artifacts/epd-qwen35-122b-1e1p2d")
 
 
 def _truetype_font(size: int):
@@ -158,6 +160,7 @@ def _chat(port: int, image: str, prompt: str, max_tokens=32, temperature=0):
             ],
             "max_tokens": max_tokens,
             "temperature": temperature,
+            "chat_template_kwargs": {"enable_thinking": False},
         },
         timeout=300,
     )

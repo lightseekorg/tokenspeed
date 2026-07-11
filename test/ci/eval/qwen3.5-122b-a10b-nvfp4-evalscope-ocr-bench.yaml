@@ -1,0 +1,61 @@
+api_version: ci.tokenspeed.io/v1
+name: eval-qwen3.5-122b-a10b-nvfp4-ocr-bench
+type: eval
+triggers:
+  - per-commit
+  - manual
+runner:
+  labels:
+    - b200-1gpu
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps.sh
+server:
+  command: >-
+    ts serve
+    --model nvidia/Qwen3.5-122B-A10B-NVFP4
+    --tp 1
+    --max-model-len 131072
+    --max-num-seqs 16
+    --chunked-prefill-size 8192
+    --max-prefill-tokens 8192
+    --gpu-memory-utilization 0.9
+    --trust-remote-code
+    --attention-backend trtllm
+    --moe-backend flashinfer_trtllm
+    --sampling-backend flashinfer
+    --quantization nvfp4
+    --kv-cache-dtype fp8_e4m3
+    --load-format auto
+    --speculative-algorithm MTP
+    --speculative-draft-model-path nvidia/Qwen3.5-122B-A10B-NVFP4
+    --speculative-num-steps 3
+    --speculative-eagle-topk 1
+    --speculative-num-draft-tokens 4
+    --drafter-attention-backend trtllm
+    --comm-fusion-max-num-tokens 4096
+    --kvstore-ratio 0.5
+    --enable-prefix-caching
+    --enable-cache-report
+    --skip-server-warmup
+    --host 127.0.0.1
+    --port 8000
+  ready:
+    url: http://127.0.0.1:8000/readiness
+    timeout: 1800
+    interval: 10
+eval:
+  install:
+    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
+  command: >-
+    /tmp/evalscope-perf/bin/evalscope eval
+    --model nvidia/Qwen3.5-122B-A10B-NVFP4
+    --api-url http://127.0.0.1:8000/v1
+    --api-key EMPTY_TOKEN
+    --datasets ocr_bench
+    --eval-batch-size 16
+    --generation-config '{"do_sample":false,"temperature":0.0,"max_tokens":65536}'
+report:
+  github_step_summary: true
+score_threshold: 0.90
