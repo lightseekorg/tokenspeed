@@ -380,11 +380,6 @@ def create_ci_venv_name(runner_name: str | None = None) -> str:
     return f"/tmp/ci-env-{run_id}-{run_attempt}-{os.getpid()}"
 
 
-def create_ci_venv_command(venv_path: str) -> str:
-    """Create an isolated CI venv without inheriting runner Python packages."""
-    return f"python3 -m venv {venv_path}"
-
-
 def _pkill(
     pattern: str,
     signal_name: str,
@@ -491,7 +486,7 @@ def setup_runner(
             shutil.rmtree(venv_path, ignore_errors=True)
         if not reuse_state or not Path(venv_path).exists():
             shell_run(
-                create_ci_venv_command(venv_path),
+                f"python3 -m venv --system-site-packages {venv_path}",
                 env=local_env,
                 cwd=cwd,
                 dry_run=dry_run,
