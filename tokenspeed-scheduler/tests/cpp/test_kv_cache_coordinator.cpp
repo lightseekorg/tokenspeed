@@ -1391,6 +1391,57 @@ TEST(HeteroFoldedMatchTest, ConvergedBoundaryWithGroup0LargerThanBase) {
     EXPECT_EQ(m.per_group[1].blocks.size(), 2u);  // 8 tokens / 4 = 2 base blocks (truncated from 4)
 }
 
+// {8,4} MIRROR: the coarse closed group covers MORE (16) than the fine group (12). Without
+// lcm alignment the boundary settles at 12 while the coarse group floor-truncates to 8,
+// leaving [8,12) neither cached nor recomputed; the boundary must fall to the lcm (8).
+TEST(HeteroFoldedMatchTest, CoarseCoversMoreThanFineAlignsBoundaryToLcm) {
+    BlockPool pool(64, true);
+    std::vector<KvCacheSpec> specs = {{AttnKind::kFull, 8, 0}, {AttnKind::kFull, 4, 0}};
+    KvCacheCoordinator coord = MakeCoordinator(specs, pool);
+    ASSERT_EQ(coord.BaseBlockSize(), 4);
+    ASSERT_EQ(coord.LcmBlockSize(), 8);
+
+    // group0 (bs 8) caches both coarse blocks (16 tokens); group1 (bs 4) caches blocks 0..2 (12).
+    std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}});
+    std::vector<std::string> folded_g0 = FoldBaseHashes(ch, /*first_base=*/0, /*m=*/2);
+    ASSERT_EQ(folded_g0.size(), 2u);
+    CacheForGroup(pool, folded_g0[0], 0);
+    CacheForGroup(pool, folded_g0[1], 0);
+    CacheForGroup(pool, ch[0], 1);
+    CacheForGroup(pool, ch[1], 1);
+    CacheForGroup(pool, ch[2], 1);
+
+    CoordinatorMatch m = coord.MatchPrefix(ch).device;
+    EXPECT_EQ(m.num_common_tokens, 8) << "12 is not a whole coarse block; boundary aligns down to lcm";
+    ASSERT_EQ(m.per_group.size(), 2u);
+    EXPECT_EQ(m.per_group[0].blocks.size(), 1u);  // coarse coverage == boundary, no phantom [8,12)
+    EXPECT_EQ(m.per_group[1].blocks.size(), 2u);  // fine truncated to the boundary
+}
+
+// Two WINDOW groups of different granularity: the fine group drags the aligned bound under
+// the coarse group's first match; the converge loop re-matches BOTH at the lcm-aligned bound.
+TEST(HeteroFoldedMatchTest, CoarseWindowGroupRematchesUnderAlignedBound) {
+    BlockPool pool(64, true);
+    std::vector<KvCacheSpec> specs = {{AttnKind::kSlidingWindow, 8, 8}, {AttnKind::kSlidingWindow, 4, 4}};
+    KvCacheCoordinator coord = MakeCoordinator(specs, pool);
+    ASSERT_EQ(coord.LcmBlockSize(), 8);
+
+    // group0 (coarse swa) caches 16 tokens; group1 (fine swa) caches 12 -> aligned bound 8.
+    std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}});
+    std::vector<std::string> folded_g0 = FoldBaseHashes(ch, /*first_base=*/0, /*m=*/2);
+    CacheForGroup(pool, folded_g0[0], 0);
+    CacheForGroup(pool, folded_g0[1], 0);
+    CacheForGroup(pool, ch[0], 1);
+    CacheForGroup(pool, ch[1], 1);
+    CacheForGroup(pool, ch[2], 1);
+
+    CoordinatorMatch m = coord.MatchPrefix(ch).device;
+    EXPECT_EQ(m.num_common_tokens, 8) << "12 aligns down to 8; both window groups re-match there";
+    ASSERT_EQ(m.per_group.size(), 2u);
+    EXPECT_EQ(m.per_group[0].blocks.size(), 1u);  // re-matched at 8: one coarse block
+    EXPECT_EQ(m.per_group[1].blocks.size(), 2u);  // re-matched at 8: two fine blocks
+}
+
 // {4,8}: two full groups over 16 tokens register at their OWN folded granularity, and a
 // second MatchPrefix hits every registered block.
 TEST(HeteroFoldedRegistrationTest, EachGroupRegistersAtOwnGranularityThenHits) {

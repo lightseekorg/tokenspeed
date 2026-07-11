@@ -2616,6 +2616,371 @@ TEST_F(FlatDecodeCachingSuite, PoolBalanceAcrossDecodeCaching) {
 }
 
 // ---------------------------------------------------------------------------
+// Hetero decode caching: the coarse full group (block_size 4 = 2x base) folds
+// a block completed DURING decode, so a later turn hits past the prefill line.
+// ---------------------------------------------------------------------------
+class FlatHeteroDecodeCachingSuite : public FlatDecodeCachingSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = FlatDecodeCachingSuite::MakeConfig();  // base block_size 2, groups full+swa
+        cfg.paged_cache_groups[0].block_size = 4;                    // full group coarse: m = 2, lcm = 4
+        cfg.paged_cache_groups[0].rows_per_page = 4;
+        return cfg;
+    }
+};
+
+TEST_F(FlatHeteroDecodeCachingSuite, CoarseGroupDecodeBlockFoldsAndBecomesHittable) {
+    const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
+
+    // Turn 1: finalize registers coarse block 0; the +105 round (filled base pages 4)
+    // completes coarse block 1, folded from the chain tail [h2, h3].
+    const auto r1_rows = RunTurnOne();
+    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start) << "r1 must fully reclaim before r2 runs";
+    ASSERT_EQ(r1_rows.at("full").size(), 3u);  // ceil(9 tokens / 4) coarse blocks at the +105 round
+    ASSERT_EQ(r1_rows.at("swa").size(), 5u);
+
+    // Turn 2: first 8 of 10 tokens shared; both coarse blocks hit (block 1 registered
+    // mid-decode), swa keeps 4 base blocks -> lcm-aligned boundary 8.
+    Submit(MakeSpecWithTokens("r2", MakeTurnTwoPrompt()));
+    ExecutionPlan plan = PlanOnce();
+    const FlatForwardOperation* op = FindFlatOp(plan);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->request_ids.size(), 1u);
+
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 8) << "coarse decode block must be hittable";
+    EXPECT_EQ(op->input_lengths.at(0), 2);
+    EXPECT_EQ(op->prefill_lengths.at(0), 10);
+    EXPECT_EQ(op->input_ids, MakeTokens(/*count=*/2, /*start=*/901));
+
+    const std::vector<std::int32_t> full_prefix(r1_rows.at("full").begin(), r1_rows.at("full").begin() + 2);
+    const std::vector<std::int32_t> swa_prefix(r1_rows.at("swa").begin(), r1_rows.at("swa").begin() + 4);
+    ExpectRowPrefixEq(op->flat_block_tables.at("full").at(0), full_prefix, "full row");
+    ExpectRowPrefixEq(op->flat_block_tables.at("swa").at(0), swa_prefix, "swa row");
+
+    // Pool: full claims 2 coarse + swa claims 4 base, then 1 fresh page per group = 8.
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 8);
+
+    SendForwardDone("r2", {199});
+    PlanOnce();
+    SendForwardDone("r2", {200});
+    SendFinish("r2");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start) << "pool back to baseline after r2 finishes";
+}
+
+// ---------------------------------------------------------------------------
+// Hetero mamba-style state group (block_size 4 = 2x base): an aligned decode
+// end folds and registers ONLY the final coarse block -- pins the
+// coordinator's aligned_range assertion.
+// ---------------------------------------------------------------------------
+class FlatHeteroMambaDecodeSuite : public FlatDecodeCachingSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = FlatDecodeCachingSuite::MakeConfig();  // base block_size 2
+        // Swap the swa group for a coarse mamba-style state group: family State
+        // WITHOUT SlidingWindow retention -> kMambaState (see MakeSpecsFromConfig).
+        cfg.paged_cache_groups[1] = MakeGroup("state", /*block_size=*/4, cfg.device_allocator.total_pages,
+                                              PagedCacheGroupConfig::Retention::FullHistory,
+                                              PagedCacheGroupFamily::State);
+        cfg.paged_cache_groups[1].block_size = 4;
+        return cfg;
+    }
+};
+
+TEST_F(FlatHeteroMambaDecodeSuite, CoarseStateGroupRegistersAlignedSnapshotMidDecode) {
+    const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
+
+    // Turn 1: finalize (end=4) registers state block 0; the +105 round (computed 8,
+    // aligned) folds state block 1 from the tail and registers ONLY it.
+    const auto r1_rows = RunTurnOne();
+    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start) << "r1 must fully reclaim before r2 runs";
+    ASSERT_EQ(r1_rows.at("full").size(), 5u);   // m=1: ceil(9 / 2)
+    ASSERT_EQ(r1_rows.at("state").size(), 3u);  // m=2: ceil(9 / 4)
+
+    // Turn 2: first 8 of 10 tokens shared; the state group resumes off its decode-
+    // registered snapshot (slot 0 stays a hole), full hits 4 base blocks -> boundary 8.
+    Submit(MakeSpecWithTokens("r2", MakeTurnTwoPrompt()));
+    ExecutionPlan plan = PlanOnce();
+    const FlatForwardOperation* op = FindFlatOp(plan);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->request_ids.size(), 1u);
+
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 8) << "state snapshot registered mid-decode must back the hit";
+    EXPECT_EQ(op->input_lengths.at(0), 2);
+    EXPECT_EQ(op->input_ids, MakeTokens(/*count=*/2, /*start=*/901));
+
+    const std::vector<std::int32_t> full_prefix(r1_rows.at("full").begin(), r1_rows.at("full").begin() + 4);
+    ExpectRowPrefixEq(op->flat_block_tables.at("full").at(0), full_prefix, "full row");
+    const auto& state_row = op->flat_block_tables.at("state").at(0);
+    ASSERT_GE(state_row.size(), 2u);
+    EXPECT_EQ(state_row[0], 0) << "only the aligned snapshot resumes; earlier state slots are holes";
+    EXPECT_EQ(state_row[1], r1_rows.at("state")[1]) << "the decode-registered snapshot block is claimed back";
+
+    // Pool: full claims 4 + state claims 1 (slot 0 is a hole), then 1 fresh page per group = 7.
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 7);
+
+    SendForwardDone("r2", {199});
+    PlanOnce();
+    SendForwardDone("r2", {200});
+    SendFinish("r2");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start) << "pool back to baseline after r2 finishes";
+}
+
+// ---------------------------------------------------------------------------
+// Three granularities at once -- the "1 full + 5 swa + per-layer conv" model
+// shape scaled down: full block 8 (m=4), swa block 4 (m=2, W=8), conv as a
+// true swa group with block 2 (m=1) and W=2 <= block. base = 2, lcm = 8.
+// ---------------------------------------------------------------------------
+class FlatThreeGranularitySuite : public FlatDecodeCachingSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg{};
+        cfg.block_size = 2;
+        cfg.device_allocator.total_pages = 64;
+        cfg.host_allocator.total_pages = 64;
+        cfg.max_scheduled_tokens = 64;
+        cfg.max_batch_size = 8;
+        cfg.enable_l3_storage = false;
+        cfg.disable_l2_cache = true;
+        cfg.disable_prefix_cache = false;
+
+        cfg.paged_cache_groups = {
+            MakeGroup("full", 8, cfg.device_allocator.total_pages, PagedCacheGroupConfig::Retention::FullHistory,
+                      PagedCacheGroupFamily::History),
+            MakeGroup("swa", 4, cfg.device_allocator.total_pages, PagedCacheGroupConfig::Retention::SlidingWindow,
+                      PagedCacheGroupFamily::State, /*sliding_window_tokens=*/8),
+            MakeGroup("conv", 2, cfg.device_allocator.total_pages, PagedCacheGroupConfig::Retention::SlidingWindow,
+                      PagedCacheGroupFamily::State, /*sliding_window_tokens=*/2),
+        };
+        cfg.paged_cache_groups[0].block_size = 8;
+        cfg.paged_cache_groups[1].block_size = 4;
+        cfg.paged_cache_groups[2].block_size = 2;
+        return cfg;
+    }
+};
+
+TEST_F(FlatThreeGranularitySuite, PrefixHitConvergesAcrossThreeBlockSizes) {
+    const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
+
+    // r1: 16 tokens = 2 full blocks / 4 swa blocks / 8 conv blocks.
+    const token_vec_t prompt = MakeAlignedTokens(/*num_pages=*/8, PageSize());
+    Submit(MakeSpecWithTokens("r1", prompt));
+    ExecutionPlan prefill = PlanOnce();
+    const FlatForwardOperation* r1_op = FindFlatOp(prefill);
+    ASSERT_NE(r1_op, nullptr);
+    const auto full_row = r1_op->flat_block_tables.at("full").at(0);
+    const auto swa_row = r1_op->flat_block_tables.at("swa").at(0);
+    const auto conv_row = r1_op->flat_block_tables.at("conv").at(0);
+    ASSERT_EQ(full_row.size(), 2u);
+    ASSERT_EQ(swa_row.size(), 4u);
+    ASSERT_EQ(conv_row.size(), 8u);
+    SendForwardDone("r1", {9001});
+    PlanOnce();  // finalize registers all three granularities, then windows punch
+    SendForwardDone("r1", {9002});
+    SendFinish("r1");
+    PlanOnce();  // reap
+    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start);
+
+    // r2: same 16 tokens + 4 fresh. All three groups converge on the lcm cut 16.
+    token_vec_t r2_tokens = prompt;
+    const token_vec_t fresh = MakeTokens(/*count=*/4, /*start=*/901);
+    r2_tokens.insert(r2_tokens.end(), fresh.begin(), fresh.end());
+    Submit(MakeSpecWithTokens("r2", r2_tokens));
+    ExecutionPlan plan = PlanOnce();
+    const FlatForwardOperation* op = FindFlatOp(plan);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->request_ids.size(), 1u);
+
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 16);
+    EXPECT_EQ(op->input_lengths.at(0), 4);
+    EXPECT_EQ(op->prefill_lengths.at(0), 20);
+    EXPECT_EQ(op->input_ids, fresh);
+
+    // full reuses both coarse blocks; swa (W=8) claims 2 holes + the trailing run;
+    // conv (W=2 <= block) resumes off the final block alone: 7 holes + 1 real.
+    const std::vector<std::int32_t> full_prefix(full_row.begin(), full_row.begin() + 2);
+    ExpectRowPrefixEq(op->flat_block_tables.at("full").at(0), full_prefix, "full row");
+    const auto& swa2 = op->flat_block_tables.at("swa").at(0);
+    ASSERT_GE(swa2.size(), 4u);
+    EXPECT_EQ(swa2[0], 0);
+    EXPECT_EQ(swa2[1], 0);
+    EXPECT_EQ(swa2[2], swa_row[2]);
+    EXPECT_EQ(swa2[3], swa_row[3]);
+    const auto& conv2 = op->flat_block_tables.at("conv").at(0);
+    ASSERT_GE(conv2.size(), 8u);
+    for (int i = 0; i < 7; ++i) {
+        EXPECT_EQ(conv2[static_cast<std::size_t>(i)], 0) << "conv slot " << i;
+    }
+    EXPECT_EQ(conv2[7], conv_row[7]) << "punched-with-hash conv block claimed back";
+
+    // 5 real claims (2 full + 2 swa + 1 conv) + fresh pages 1/1/2 per group = 9.
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 9);
+
+    SendForwardDone("r2", {199});
+    PlanOnce();
+    SendForwardDone("r2", {200});
+    SendFinish("r2");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start);
+}
+
+// The usable boundary snaps DOWN to the lcm cut: 10 shared tokens serve only 8,
+// because the closed 8-token full group cannot hand over a half block.
+TEST_F(FlatThreeGranularitySuite, PartialPrefixSnapsDownToLcmCut) {
+    const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
+
+    const token_vec_t prompt = MakeAlignedTokens(/*num_pages=*/8, PageSize());  // {1..16}
+    Submit(MakeSpecWithTokens("r1", prompt));
+    ExecutionPlan prefill = PlanOnce();
+    ASSERT_NE(FindFlatOp(prefill), nullptr);
+    SendForwardDone("r1", {9001});
+    PlanOnce();  // finalize registers, windows punch
+    SendForwardDone("r1", {9002});
+    SendFinish("r1");
+    PlanOnce();  // reap
+    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start);
+
+    // r2 shares tokens [0,10) then diverges: 10 is not a whole full block.
+    token_vec_t r2_tokens(prompt.begin(), prompt.begin() + 10);
+    const token_vec_t fresh = MakeTokens(/*count=*/6, /*start=*/901);
+    r2_tokens.insert(r2_tokens.end(), fresh.begin(), fresh.end());
+    Submit(MakeSpecWithTokens("r2", r2_tokens));
+    ExecutionPlan plan = PlanOnce();
+    const FlatForwardOperation* op = FindFlatOp(plan);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->request_ids.size(), 1u);
+
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 8) << "10 shared tokens snap down to the lcm cut";
+    EXPECT_EQ(op->input_lengths.at(0), 8);
+    const token_vec_t expected_input(r2_tokens.begin() + 8, r2_tokens.end());
+    EXPECT_EQ(op->input_ids, expected_input);
+
+    // Claims at the 8-token cut: full 1, swa 2 (punched blocks revived by hash),
+    // conv 1 (trailing block only); fresh for 8 new tokens: 1 + 2 + 4.
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 11);
+
+    SendForwardDone("r2", {199});
+    PlanOnce();
+    SendForwardDone("r2", {200});
+    SendFinish("r2");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start);
+}
+
+TEST_F(FlatThreeGranularitySuite, AbortDuringDecodeRestoresPoolBaseline) {
+    const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
+
+    Submit(MakeSpecWithTokens("r1", MakeAlignedTokens(/*num_pages=*/4, PageSize())));
+    PlanOnce();  // single-chunk prefill
+    SendForwardDone("r1", {42});
+    PlanOnce();  // finalize + decode reserve across all three granularities
+    SendForwardDone("r1", {43});
+    EXPECT_LT(scheduler_->FlatPoolFreeBlocks(), free_at_start);
+
+    SendAbort(*scheduler_, "r1");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start)
+        << "abort must return every page of all three granularities";
+}
+
+// Tight pool: the admission gate charges each granularity at its own block
+// size; the pool fits exactly one 16-token request.
+class FlatThreeGranularityTinyPoolSuite : public FlatThreeGranularitySuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = FlatThreeGranularitySuite::MakeConfig();
+        // 16 tokens = 2 full + 4 swa + 8 conv = 14 blocks, + 1 reserve block per
+        // group = 17; 18 physical pages -> 17 usable (page 0 is the null block).
+        cfg.device_allocator.total_pages = 18;
+        cfg.host_allocator.total_pages = 18;
+        return cfg;
+    }
+};
+
+TEST_F(FlatThreeGranularityTinyPoolSuite, GateDefersSecondRequestPerGroupBlockMath) {
+    const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
+    ASSERT_EQ(free_at_start, 17);
+
+    // r1 gate: 14 prefill + 3 reserve = 17 (exact fit); prefill consumes 14.
+    Submit(MakeSpecWithTokens("r1", MakeAlignedTokens(/*num_pages=*/8, PageSize())));
+    ExecutionPlan plan1 = PlanOnce();
+    ASSERT_NE(FindFlatOp(plan1), nullptr);
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), 3);
+
+    // r2 (8 tokens) needs 1+2+4 prefill + 3 reserve = 10: deferred. r1's
+    // finalize punches 7 conv + 2 swa blocks and acquires the 3-block reserve,
+    // leaving 9 free -- still short of 10.
+    Submit(MakeSpecWithTokens("r2", MakeTokens(/*count=*/8, /*start=*/101)));
+    SendForwardDone("r1", {99});
+    ExecutionPlan starved = PlanOnce();
+    const FlatForwardOperation* starved_op = FindFlatOp(starved);
+    ASSERT_NE(starved_op, nullptr);
+    ASSERT_EQ(starved_op->request_ids.size(), 1u) << "only r1's reserved decode step fits this round";
+    EXPECT_EQ(starved_op->request_ids.at(0), "r1");
+    EXPECT_EQ(scheduler_->WaitingSize(), 1u);
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), 9);
+
+    SendForwardDone("r1", {100});
+    SendFinish("r1");
+    ExecutionPlan plan2 = PlanOnce();
+    const FlatForwardOperation* op2 = FindFlatOp(plan2);
+    ASSERT_NE(op2, nullptr) << "deferred request must be schedulable after pages free up";
+    ASSERT_EQ(op2->request_ids.size(), 1u);
+    EXPECT_EQ(op2->request_ids.at(0), "r2");
+    EXPECT_EQ(scheduler_->WaitingSize(), 0u);
+
+    SendForwardDone("r2", {142});
+    SendFinish("r2");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start);
+}
+
+TEST_F(FlatThreeGranularitySuite, DecodeFoldedCoarseBlockHittableAlongsideWindowGroups) {
+    const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
+
+    // r1: 8-token prompt; decode 101..109 pushes computed to 16, completing full
+    // coarse block 1 (tokens [8,16)) mid-decode -- folded from the chain tail
+    // while both window groups register at their own granularities.
+    const token_vec_t prompt = MakeAlignedTokens(/*num_pages=*/4, PageSize());
+    Submit(MakeSpecWithTokens("r1", prompt));
+    ExecutionPlan prefill = PlanOnce();
+    ASSERT_NE(FindFlatOp(prefill), nullptr);
+    for (token_t t = 101; t <= 109; ++t) {
+        AdvanceOneRound("r1", t);
+    }
+    SendFinish("r1");
+    PlanOnce();  // reap
+    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start);
+
+    // r2: prompt + r1's first 8 generated + 2 fresh = 18 tokens; the hit crosses
+    // r1's prompt line (8) and lands on the lcm cut 16.
+    token_vec_t r2_tokens = prompt;
+    const token_vec_t generated = MakeTokens(/*count=*/8, /*start=*/101);
+    r2_tokens.insert(r2_tokens.end(), generated.begin(), generated.end());
+    const token_vec_t fresh = MakeTokens(/*count=*/2, /*start=*/901);
+    r2_tokens.insert(r2_tokens.end(), fresh.begin(), fresh.end());
+    Submit(MakeSpecWithTokens("r2", r2_tokens));
+    ExecutionPlan plan = PlanOnce();
+    const FlatForwardOperation* op = FindFlatOp(plan);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->request_ids.size(), 1u);
+
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 16) << "decode-folded coarse block must extend the hit past the prompt";
+    EXPECT_EQ(op->input_lengths.at(0), 2);
+    EXPECT_EQ(op->input_ids, fresh);
+    // 5 real claims (2 full + 2 swa + 1 conv) + 1 fresh page per group = 8.
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 8);
+
+    SendForwardDone("r2", {199});
+    PlanOnce();
+    SendForwardDone("r2", {200});
+    SendFinish("r2");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start);
+}
+
+// ---------------------------------------------------------------------------
 // M15 streaming L2 sink: pages registered by a planning round batch into ONE
 // D2H write-back; WriteBackDone commits/aborts the host index and unpins the
 // pinned source blocks. Byte movement itself is Phase D.

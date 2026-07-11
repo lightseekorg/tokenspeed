@@ -66,12 +66,18 @@ namespace {
 // bound UNDER an earlier one's boundary-dependent match. A re-matched group lands at or
 // under the current bound and only a further bound drop can lift it back above, so
 // re-matches are finite; the result is the greatest boundary every group supports.
+//
+// Bounds align DOWN to align_tokens (the groups' lcm): a servable boundary must land on a
+// whole block of EVERY group, else a closed group's floor-truncation drops straddled coverage.
 template <typename MatchGroup, typename ExtentTokens>
 std::int32_t SweepThenConverge(std::span<const std::size_t> order, const std::vector<CacheGroup>& groups,
-                               std::int32_t bound_tokens, const MatchGroup& match, const ExtentTokens& extent) {
+                               std::int32_t bound_tokens, std::int32_t align_tokens, const MatchGroup& match,
+                               const ExtentTokens& extent) {
+    const auto align_down = [align_tokens](std::int32_t tokens) { return tokens - tokens % align_tokens; };
+    bound_tokens = align_down(bound_tokens);
     for (std::size_t i : order) {
         match(i, bound_tokens);
-        bound_tokens = std::min(bound_tokens, extent(i));
+        bound_tokens = std::min(bound_tokens, align_down(extent(i)));
     }
     for (bool changed = true; changed;) {
         changed = false;
@@ -80,7 +86,7 @@ std::int32_t SweepThenConverge(std::span<const std::size_t> order, const std::ve
                 continue;
             }
             match(i, bound_tokens);
-            bound_tokens = std::min(bound_tokens, extent(i));
+            bound_tokens = std::min(bound_tokens, align_down(extent(i)));
             changed = true;
         }
     }
@@ -111,7 +117,7 @@ CoordinatorMatch KvCacheCoordinator::matchTierWithKeys(const BlockPool& pool,
         return out;
     }
     const std::int32_t boundary_tokens = SweepThenConverge(
-        match_order_, groups_, num_base_pages * base_block_size_,
+        match_order_, groups_, num_base_pages * base_block_size_, lcm_block_size_,
         [&](std::size_t i, std::int32_t bound_tokens) {
             const std::int32_t group_block_size = groups_[i].Spec().block_size;
             out.per_group[i] = groups_[i].Manager().Match(pool, group_keys[i], floor_tokens / group_block_size,
@@ -123,8 +129,8 @@ CoordinatorMatch KvCacheCoordinator::matchTierWithKeys(const BlockPool& pool,
                    group_block_size;
         });
 
-    // Linear cleanup: closed groups truncate to the converged boundary (any prefix stays
-    // valid); non-closed groups are at or under it by construction above.
+    // Linear cleanup: closed groups truncate to the converged boundary (any prefix stays valid;
+    // the lcm-aligned boundary cuts on whole blocks); non-closed groups are at or under it.
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         const std::int32_t group_block_size = groups_[i].Spec().block_size;
         PrefixMatch& m = out.per_group[i];
