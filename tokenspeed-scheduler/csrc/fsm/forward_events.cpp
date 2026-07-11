@@ -124,17 +124,16 @@ HashChain MakeHashChain(const std::vector<std::string>& hashes, std::int32_t fol
     const std::int32_t n = static_cast<std::int32_t>(hashes.size());
     const std::int32_t tail_begin = n / fold_align_pages * fold_align_pages;
     return HashChain{.num_hashed_pages = n,
-                         .last_hash = n > 0 ? hashes.back() : std::string{},
-                         .tail_begin_page = tail_begin,
-                         .tail = {hashes.begin() + tail_begin, hashes.end()}};
+                     .last_hash = n > 0 ? hashes.back() : std::string{},
+                     .tail_begin_page = tail_begin,
+                     .tail = {hashes.begin() + tail_begin, hashes.end()}};
 }
 
 // Hash the newly filled pages onto the chain; the returned batch reaches back to the fold grid
 // (fold_align_pages = lcm/base) so coarse groups fold the blocks completed this step. The
 // re-covered overlap is idempotent (m == 1 degenerates to exactly the fresh pages).
-HashesToRegister AdvanceHashChain(HashChain& chain,
-                                          const std::vector<std::span<const std::int32_t>>& paged,
-                                          std::int32_t filled_pages, std::int32_t fold_align_pages) {
+HashesToRegister AdvanceHashChain(HashChain& chain, const std::vector<std::span<const std::int32_t>>& paged,
+                                  std::int32_t filled_pages, std::int32_t fold_align_pages) {
     _assert(filled_pages > chain.num_hashed_pages, "caller must pre-check hash-chain progress");
     _assert(filled_pages <= static_cast<std::int32_t>(paged.size()),
             "flat decode hashing: filled pages exceed the container's full pages");
@@ -410,8 +409,7 @@ Decoding ScheduleDecodeEvent::operator()(PrefillDone&& state) {
     Decoding decoding{state.GetTokenContainer(),           state.GetPageSize(),  nullptr, nullptr, nullptr,
                       std::move(state).TakeReqPoolIndex(), decode_input_tokens_, nullptr};
     decoding.SetBlockTables(std::move(tables));
-    decoding.SetHashChain(
-        MakeHashChain(hashes, coordinator_->LcmBlockSize() / coordinator_->BaseBlockSize()));
+    decoding.SetHashChain(MakeHashChain(hashes, coordinator_->LcmBlockSize() / coordinator_->BaseBlockSize()));
     return decoding;
 #else
     auto local_kv_allocator = std::move(state).TakeLocalKVAllocator();
@@ -458,12 +456,11 @@ Decoding ScheduleDecodeEvent::operator()(Decoding&& state) {
     HashesToRegister to_register{.begin_page = chain.num_hashed_pages};
     if (filled_pages > chain.num_hashed_pages) {
         to_register = AdvanceHashChain(chain, state.GetFullPagedTokens(false), filled_pages,
-                                           coordinator_->LcmBlockSize() / coordinator_->BaseBlockSize());
+                                       coordinator_->LcmBlockSize() / coordinator_->BaseBlockSize());
     }
 
     auto tables = std::move(state).TakeBlockTables();
-    if (!DecodeStep(*coordinator_, tables, to_register.hashes, to_register.begin_page, reserve,
-                    num_computed_tokens)) {
+    if (!DecodeStep(*coordinator_, tables, to_register.hashes, to_register.begin_page, reserve, num_computed_tokens)) {
         _assert(false, "flat path: allocation failure unsupported in C slice");
     }
 

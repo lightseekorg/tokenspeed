@@ -2679,9 +2679,9 @@ protected:
         SchedulerConfig cfg = FlatDecodeCachingSuite::MakeConfig();  // base block_size 2
         // Swap the swa group for a coarse mamba-style state group: family State
         // WITHOUT SlidingWindow retention -> kMambaState (see MakeSpecsFromConfig).
-        cfg.paged_cache_groups[1] = MakeGroup("state", /*block_size=*/4, cfg.device_allocator.total_pages,
-                                              PagedCacheGroupConfig::Retention::FullHistory,
-                                              PagedCacheGroupFamily::State);
+        cfg.paged_cache_groups[1] =
+            MakeGroup("state", /*block_size=*/4, cfg.device_allocator.total_pages,
+                      PagedCacheGroupConfig::Retention::FullHistory, PagedCacheGroupFamily::State);
         cfg.paged_cache_groups[1].block_size = 4;
         return cfg;
     }
