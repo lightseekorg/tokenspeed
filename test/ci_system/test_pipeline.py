@@ -9,6 +9,7 @@ from pipeline import (
     build_step_summary_lines,
     check_eval_score_threshold,
     check_perf_reference,
+    create_ci_venv_command,
     extract_evalscope_score,
     extract_perf_summary_rows,
     format_perf_reference_markdown_table,
@@ -22,6 +23,13 @@ from pipeline import (
     should_run_nvidia_gpu_cleanup,
     validate_task,
 )
+
+
+def test_ci_venv_does_not_inherit_runner_packages():
+    command = create_ci_venv_command("/tmp/ci-env-test")
+
+    assert command == "python3 -m venv /tmp/ci-env-test"
+    assert "--system-site-packages" not in command
 
 
 def test_stale_process_patterns_match_smg_router_proctitle():
