@@ -70,7 +70,6 @@ class GroupSpecsFromLayerTypesTest(unittest.TestCase):
         self.assertEqual(swa.family, "history")
 
     def test_all_full_yields_single_group(self):
-        # 等价于现状的单 group,无回归。
         specs = group_specs_from_layer_types(
             layer_types=["full_attention"] * 8,
             sliding_window_tokens=None,
@@ -146,11 +145,7 @@ class GroupSpecsFromLayerTypesTest(unittest.TestCase):
 
 
 class LayerGroupIdsTest(unittest.TestCase):
-    """layer_group_ids 与 group_specs_from_layer_types 共享同一分组核,
-    模型侧 PagedAttention(group_id=...) 从这里取值。"""
-
     def test_single_window_ids_equal_layer_types(self):
-        # 回归锚:标量路径 id 必须逐元素等于 layer_types,页表 key 零变动。
         layer_types = ["full_attention", "sliding_attention"] * 12
         self.assertEqual(
             layer_group_ids(layer_types=layer_types, sliding_window_tokens=128),
@@ -171,7 +166,6 @@ class LayerGroupIdsTest(unittest.TestCase):
         )
 
     def test_uniform_window_sequence_keeps_bare_labels(self):
-        # 序列形式但只有一种 window -> 与标量等价,不加后缀。
         self.assertEqual(
             layer_group_ids(
                 layer_types=[
@@ -246,7 +240,6 @@ class MultiWindowGroupSpecsTest(unittest.TestCase):
             )
 
     def test_full_layer_with_positive_window_in_sequence_raises(self):
-        # 疑似标错 layer_type:响亮拒绝而非忽略。
         with self.assertRaises(ValueError):
             group_specs_from_layer_types(
                 layer_types=["full_attention", "sliding_attention"],
@@ -317,7 +310,6 @@ class MultiWindowGroupSpecsTest(unittest.TestCase):
             )
 
     def test_scalar_window_with_full_layers_does_not_raise(self):
-        # 标量广播不触发 full-layer 守卫(gpt-oss 现状:标量 128 + full 层共存)。
         specs = group_specs_from_layer_types(
             layer_types=["full_attention", "sliding_attention"],
             sliding_window_tokens=128,

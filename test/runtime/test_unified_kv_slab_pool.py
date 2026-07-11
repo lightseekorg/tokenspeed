@@ -110,7 +110,6 @@ class HybridSlabGroupSizeTest(unittest.TestCase):
             self.assertIsNone(hybrid_slab_group_size(None, speculative_enabled=False))
 
     def test_none_when_multi_window_sequence(self):
-        # 多种 sliding window:保守退 legacy(M14 spec §2.3)。
         with self._flat_ext(True):
             it = itertools.cycle((4, 512))
             windows = [
@@ -151,7 +150,6 @@ class HybridSlabGroupSizeTest(unittest.TestCase):
             )
 
     def test_none_when_window_sequence_length_mismatch(self):
-        # 谓词永不 raise;畸形输入按 None 降级。
         with self._flat_ext(True):
             self.assertIsNone(
                 hybrid_slab_group_size(
@@ -162,7 +160,6 @@ class HybridSlabGroupSizeTest(unittest.TestCase):
             )
 
     def test_garbage_elements_ignored_not_raised(self):
-        # 谓词只看有效 window 的 distinct 数,非 int 元素被忽略。
         with self._flat_ext(True):
             self.assertEqual(
                 hybrid_slab_group_size(

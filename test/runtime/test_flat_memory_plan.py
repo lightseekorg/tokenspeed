@@ -173,8 +173,7 @@ class PlanTensorsTest(unittest.TestCase):
             alignment=4,
             budget_bytes=100 * 1024 * 1024,
         )
-        self.assertEqual(len(plan.tensors), 2)  # max group layer count = full 的 2 层
-        # 每槽每组至多一层:槽 0 绑 full L0 + state L0(conv+ssm 两 binding),槽 1 只绑 full L1
+        self.assertEqual(len(plan.tensors), 2)
         slot0 = plan.tensors[0]
         self.assertEqual(
             {(b.group_id, b.layer) for b in slot0.bindings},
@@ -186,7 +185,6 @@ class PlanTensorsTest(unittest.TestCase):
             {("full_attention", 1)},
         )
         for t in plan.tensors:
-            # 每槽每组唯一层(同层多 component 允许:conv+ssm 各占一 binding)。
             seen = {}
             for b in t.bindings:
                 key = (b.slot, b.group_id)
@@ -216,8 +214,7 @@ class PlanTensorsTest(unittest.TestCase):
             budget_bytes=100 * 1024 * 1024,
         )
         geo = plan.geometry
-        self.assertEqual(geo.block_size, 100)  # 等化继承 B2:state 100KiB / 1KiB
-        # 每块总账:槽 0 打包 full 100KiB + state 100KiB,槽 1 只有 full 100KiB
+        self.assertEqual(geo.block_size, 100)
         self.assertEqual(geo.block_bytes, 300 * 1024)
         self.assertEqual(geo.num_blocks, 100 * 1024 * 1024 // (300 * 1024))  # 341
         slot0, slot1 = plan.tensors
@@ -345,7 +342,6 @@ class GptOssCapacityTest(unittest.TestCase):
         ]
         budget = 10 * 1024**3
         plan = plan_tensors(comps, block_size=16, alignment=4, budget_bytes=budget)
-        # 每槽打包 full + sliding 两行:48 行 × 页字节(不再按 M12 的 24 槽别名计容)
         self.assertEqual(plan.geometry.num_blocks, budget // (48 * 16 * 1024))
 
 
