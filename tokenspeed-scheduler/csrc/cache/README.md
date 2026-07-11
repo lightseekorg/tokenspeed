@@ -124,9 +124,10 @@ ref 归 0 后仍可命中,直到被驱逐)。
 
 约束是"整除 base",不是任意粒度:这样所有组的块边界都落在同一张 base 细网格上,
 哈希只需一条细链、各组在细边界上取子集,省掉了重复 SHA。base(GCD)是折叠和
-索引的粒度;coordinator 还持一个 lcm(各组 block_size 的 LCM),预留给将来需要
-"取整到所有组共同块边界"的对齐点(chunk/reserved 记账),目前 flat 准入路径上
-还没有这样的点,故暂无消费者。
+索引的粒度;lcm(各组 block_size 的 LCM)是**匹配收敛的对齐粒度**:
+`SweepThenConverge` 每次收紧边界都向下取整到 lcm——可服务边界必须落在每个组的
+整块上,否则先匹配的 closed 粗组会在截短时留下"报了命中却没有覆盖"的幽灵区间。
+代价是命中粒度统一到 lcm。
 
 mamba 组的 block_size 若与 base 不同,它的粗块只在自己的对齐边界成块
 (`RegistersAlignedFinalPageOnly` + 折叠),命中粒度天然变粗——这与状态快照

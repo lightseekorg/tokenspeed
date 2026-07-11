@@ -158,9 +158,10 @@ class ValidateFlatSchedulerConfigTest(unittest.TestCase):
                 speculative_enabled=spec,
             )
 
-    def test_backend_without_flags_defaults_safe(self):
-        # Backends predating the class flags (getattr defaults False) must
-        # not trip the layout arm; the zero-group arm still applies.
+    def test_backend_without_flags_single_group_falls_back(self):
+        # Backends predating the class flags (getattr defaults False) may
+        # fall back to the C++ single table when exactly one group is
+        # published: the first-group sample IS the only group.
         class LegacyBackend:
             pass
 
@@ -171,6 +172,71 @@ class ValidateFlatSchedulerConfigTest(unittest.TestCase):
             kv_pool=FakeMHAPool(),
             speculative_enabled=False,
         )
+
+    def test_backend_without_flags_multi_group_rejected(self):
+        # A table-blind backend on a >1-group pool would index every layer
+        # through the first-group sample — silent KV corruption on slab
+        # layouts. Must refuse at startup.
+        class LegacyBackend:
+            pass
+
+        with self.assertRaisesRegex(RuntimeError, "single-table fallback"):
+            _pcs.validate_flat_scheduler_config(
+                flat_kvcache_ext=True,
+                paged_cache_groups=[FakeGroup(), FakeGroup()],
+                attn_backend=LegacyBackend(),
+                kv_pool=FakeMHAPool(),
+                speculative_enabled=False,
+            )
+
+    def test_hybrid_with_flat_capable_full_sub_backend_passes(self):
+        # The GDN-hybrid shape: hybrid wrapper over a flat-capable full
+        # backend, pool publishing KV + state groups. Only the KV-table
+        # consumer (full sub-backend) is checked; the linear side has its
+        # own explicit flat path and is out of scope for this guard.
+        class FlatFull:
+            uses_flat_cache_groups = True
+
+        class LinearWithoutFlag:
+            pass
+
+        class FlatWrapper:
+            uses_flat_cache_groups = True
+
+            def __init__(self):
+                self.full_attn_backend = FlatFull()
+                self.linear_attn_backend = LinearWithoutFlag()
+
+        _pcs.validate_flat_scheduler_config(
+            flat_kvcache_ext=True,
+            paged_cache_groups=[FakeGroup(), FakeGroup()],
+            attn_backend=FlatWrapper(),
+            kv_pool=FakeMHAPool(),
+            speculative_enabled=False,
+        )
+
+    def test_hybrid_full_sub_backend_recursed(self):
+        # The hybrid wrapper is flat-capable, but its user-selectable full
+        # sub-backend must be checked on its own: a table-blind sub-backend
+        # would silently drop the per-group tables from common_kw.
+        class FlatWrapper:
+            uses_flat_cache_groups = True
+
+            def __init__(self, full):
+                self.full_attn_backend = full
+                self.linear_attn_backend = None
+
+        class LegacyFull:
+            pass
+
+        with self.assertRaisesRegex(RuntimeError, "LegacyFull"):
+            _pcs.validate_flat_scheduler_config(
+                flat_kvcache_ext=True,
+                paged_cache_groups=[FakeGroup(), FakeGroup()],
+                attn_backend=FlatWrapper(LegacyFull()),
+                kv_pool=FakeMHAPool(),
+                speculative_enabled=False,
+            )
 
 
 if __name__ == "__main__":

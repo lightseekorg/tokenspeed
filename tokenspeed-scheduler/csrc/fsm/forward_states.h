@@ -119,7 +119,8 @@ public:
 
     std::int32_t TailPageAvailableTokens() const {
         if (!block_tables_.empty()) {
-            // flat: every group Acquires the same token count each step, so tail_avail is identical across groups.
+            // flat: group-0 sample, feeding only the radix-era capacity probe (a flat no-op);
+            // real admission gates on the coordinator's per-group BlocksNeededFor.
             return block_tables_[0].TailAvailableTokens();
         }
         return local_kv_allocator_->TailPageAvailableTokens();  // radix
@@ -173,9 +174,8 @@ struct ForwardState : public BaseState {
     std::unique_ptr<ReqPoolIndex> TakeReqPoolIndex() && { return std::move(req_pool_index_); }
     std::int32_t GetReqPoolIndex() const { return req_pool_index_ ? req_pool_index_->slot_ : -1; }
 
-    // Flat: a single-group SAMPLE of group 0 (page ids differ per group, counts do not). KV writes use
-    // per-group metadata.out_cache_locs from each group's own table, so this sample feeds page counts,
-    // one-group stats and the radix-era req_to_page fallback only.
+    // Flat: group-0 SAMPLE (ids -- and with per-group block sizes, counts -- differ per group);
+    // feeds one-group stats and the radix-era req_to_page fallback, never cross-group accounting.
     std::vector<std::int32_t> GetOccupiedPages() const {
         if (!block_tables_.empty()) {
             return BlockTablePageIds(block_tables_[0]);  // flat: first-group sample (see above)
@@ -271,10 +271,14 @@ private:
 };
 
 #if TOKENSPEED_FLAT_KVCACHE
-// Rolling page-hash chain: pages [0, num_hashed_pages) are registered, last_hash seeds the next increment.
-struct FlatHashChain {
+// Rolling page-hash chain: pages [0, num_hashed_pages) are registered, last_hash seeds the
+// next increment. tail holds pages [tail_begin_page, num_hashed_pages) back to the fold grid
+// (lcm/base) so coarse groups can fold a block completed mid-decode.
+struct HashChain {
     std::int32_t num_hashed_pages{0};
     std::string last_hash;
+    std::int32_t tail_begin_page{0};
+    std::vector<std::string> tail;
 };
 #endif
 
@@ -304,15 +308,15 @@ struct Decoding : public ForwardState {
     std::unique_ptr<HostNodeRef> TakeHostNodeRef() && { return std::move(host_node_ref_); }
 
 #if TOKENSPEED_FLAT_KVCACHE
-    const FlatHashChain& GetFlatHashChain() const { return flat_hash_chain_; }
-    void SetFlatHashChain(FlatHashChain chain) { flat_hash_chain_ = std::move(chain); }
+    HashChain TakeHashChain() && { return std::move(hash_chain_); }
+    void SetHashChain(HashChain chain) { hash_chain_ = std::move(chain); }
 #endif
 
 private:
     std::unique_ptr<HostNodeRef> host_node_ref_{};  // pins host pages until the next state takes ownership
     std::int32_t reserve_num_tokens_in_next_schedule_event_{-1};
 #if TOKENSPEED_FLAT_KVCACHE
-    FlatHashChain flat_hash_chain_{};
+    HashChain hash_chain_{};
 #endif
 };
 

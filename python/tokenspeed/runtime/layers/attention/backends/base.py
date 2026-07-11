@@ -99,9 +99,11 @@ class AttentionBackend(ABC):
     ) -> bool:
         return False
 
-    def select_out_cache_loc(self, layer, out_cache_loc):
-        """Flat per-group write-location hook; identity for backends
-        without flat cache groups (see uses_flat_cache_groups)."""
+    def select_out_cache_loc(self, layer, out_cache_loc, forward_mode=None):
+        """Flat per-group write-location hook for out-of-backend KV writers
+        (fused RoPE prewrite); identity for backends without flat cache
+        groups (see uses_flat_cache_groups). ``forward_mode`` picks the
+        metadata slot for backends that prewrite on extend as well."""
         return out_cache_loc
 
     @property
