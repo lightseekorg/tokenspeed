@@ -73,7 +73,6 @@ STATE_LAYER_TYPES = frozenset({LINEAR_ATTENTION})
 def hybrid_slab_group_size(
     layer_types: Sequence[str] | None,
     *,
-    speculative_enabled: bool,
     sliding_window_tokens: int | Sequence[int | None] | None = None,
 ) -> int | None:
     """Group size for the hybrid slab KV layout (one layer of EACH group
@@ -90,7 +89,7 @@ def hybrid_slab_group_size(
     window) degrade to None: the slab pairing is per raw label, not per
     (retention, window) group.
     """
-    if speculative_enabled or not scheduler_ext_flat_kvcache():
+    if not scheduler_ext_flat_kvcache():
         return None
     if not layer_types:
         return None
@@ -142,7 +141,7 @@ def validate_flat_scheduler_config(
     paged_cache_groups: Sequence[object],
     attn_backend: object,
     kv_pool: object,
-    speculative_enabled: bool,
+    speculative_algorithm: str | None = None,
 ) -> None:
     """Fail fast, before the C++ ``Scheduler`` ctor, when a flat-built ext
     cannot drive this setup: a backend (or hybrid sub-backend) that would not
@@ -166,6 +165,21 @@ def validate_flat_scheduler_config(
             "placeholders. Use a radix-built tokenspeed_scheduler extension "
             "for this model."
         )
+    if speculative_algorithm is not None and not getattr(
+        backend, "flat_spec_capable", True
+    ):
+        raise RuntimeError(
+            "flat scheduler build (TOKENSPEED_FLAT_KVCACHE): attention backend "
+            f"{backend_name} does not support flat cache groups with "
+            "speculative decoding yet. Use the MHA backend or a radix-built "
+            "tokenspeed_scheduler extension."
+        )
+    if speculative_algorithm == "DFLASH":
+        raise RuntimeError(
+            "flat scheduler build (TOKENSPEED_FLAT_KVCACHE): DFLASH block "
+            "decode is unsupported on the flat path. Use a radix-built "
+            "tokenspeed_scheduler extension."
+        )
     if len(paged_cache_groups) > 1 and not uses_flat:
         # A table-blind backend on a multi-group pool would index every
         # layer through the C++ single-table fallback (a first-group
@@ -181,26 +195,11 @@ def validate_flat_scheduler_config(
             "or use a radix-built tokenspeed_scheduler extension."
         )
     if not paged_cache_groups:
-        if speculative_enabled:
-            cause = (
-                "speculative decoding is enabled, which gates paged-cache "
-                "group publication off"
-            )
-            action = (
-                "Disable speculative decoding or use a radix-built "
-                "tokenspeed_scheduler extension."
-            )
-        else:
-            cause = (
-                f"KV pool {pool_name} publishes no paged-cache groups (e.g. "
-                "mamba/state-only pools)"
-            )
-            action = (
-                "Use a radix-built tokenspeed_scheduler extension for this " "model."
-            )
         raise RuntimeError(
             "flat scheduler build (TOKENSPEED_FLAT_KVCACHE) requires at least "
-            f"one paged-cache group, but {cause}. {action}"
+            f"one paged-cache group, but KV pool {pool_name} publishes none "
+            "(e.g. mamba/state-only pools). Use a radix-built "
+            "tokenspeed_scheduler extension for this model."
         )
 
 
@@ -451,7 +450,6 @@ def publish_paged_cache_groups(
     layer_types: Sequence[str],
     sliding_window_tokens: int | Sequence[int | None] | None,
     page_size: int,
-    speculative_enabled: bool,
     max_live_requests: int,
     max_scheduled_tokens: int,
     max_total_tokens: int,
@@ -460,27 +458,25 @@ def publish_paged_cache_groups(
     """Publication rule (canonical) for a KV pool's paged-cache groups.
 
     Publish groups iff the scheduler ext is flat-built (a radix ext never
-    delivers flat tables — capture would bind dead buffers) and spec decode
-    is off (flat tables do not support spec-expanded metadata; non-empty
-    groups would also disable the overlap scheduler under spec). Publication
-    is THE upstream signal every flat consumer keys off.
-    TODO(flat+spec): publish under spec.
+    delivers flat tables — capture would bind dead buffers). Speculative
+    decoding is supported: verify writes per-group [bs*N] locations and the
+    drafter consumes the full-attention group's table (mirrored into
+    req_to_page each step). Publication is THE upstream signal every flat
+    consumer keys off.
 
     Args:
         layer_types: Per-layer paged-cache labels (empty -> single
             full-history group).
         sliding_window_tokens / page_size: Forwarded to
             group_specs_from_layer_types.
-        speculative_enabled: Gates publication off.
         max_live_requests / max_scheduled_tokens / max_total_tokens /
             max_context_len: Sizing inputs for
             compute_paged_cache_group_page_counts.
 
     Returns:
-        (specs, page_counts) when publishing, None when publication is
-        gated off (radix ext or spec decode).
+        (specs, page_counts) when publishing, None on a radix ext.
     """
-    if speculative_enabled or not scheduler_ext_flat_kvcache():
+    if not scheduler_ext_flat_kvcache():
         return None
     specs = group_specs_from_layer_types(
         layer_types=tuple(layer_types) or (FULL_ATTENTION,),

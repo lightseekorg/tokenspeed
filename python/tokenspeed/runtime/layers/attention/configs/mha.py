@@ -44,9 +44,6 @@ class MHAConfig(BaseAttnConfig):
     layer_types: tuple[str, ...] = ()
     sliding_window_tokens: int | tuple[int | None, ...] | None = None
     max_scheduled_tokens: int = 0
-    # True iff server_args.speculative_algorithm is set (publication rule:
-    # paged_cache_spec.publish_paged_cache_groups).
-    speculative_enabled: bool = False
     # True iff server_args.disaggregation_mode != "null"; the pool's slab
     # guards consume it.
     pd_disaggregation_enabled: bool = False
@@ -121,7 +118,6 @@ class MHAConfig(BaseAttnConfig):
             layer_types=layer_types,
             sliding_window_tokens=sliding_window_tokens,
             max_scheduled_tokens=getattr(server_args, "chunked_prefill_size", 8192),
-            speculative_enabled=server_args.speculative_algorithm is not None,
             pd_disaggregation_enabled=getattr(
                 server_args, "disaggregation_mode", "null"
             )
@@ -165,7 +161,6 @@ class MHAConfig(BaseAttnConfig):
             layer_types=self.layer_types,
             sliding_window_tokens=self.sliding_window_tokens,
             max_scheduled_tokens=self.max_scheduled_tokens,
-            speculative_enabled=self.speculative_enabled,
             pd_disaggregation_enabled=self.pd_disaggregation_enabled,
             conv_state_shape=self.conv_state_shape,
             temporal_state_shape=self.temporal_state_shape,

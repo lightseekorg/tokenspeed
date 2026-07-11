@@ -68,6 +68,8 @@ class AttentionBackend(ABC):
     # different hole/index semantics; a group-aware flat backend (Phase 4) sets
     # this True. Default False keeps every existing backend on today's path.
     uses_flat_cache_groups: bool = False
+    # False for flat-capable backends whose spec-verify path is not wired yet.
+    flat_spec_capable: bool = True
     uses_padded_decode_token_mask: bool = False
 
     def __init__(self, config: BaseAttnConfig) -> None:

@@ -49,6 +49,7 @@ class TRTLLMFlatGroupsTest(unittest.TestCase):
         b.forward_prefill_metadata = None
         b.cuda_graph_prefill_metadata = {}
         b.cuda_graph_decode_metadata = {}
+        b.spec_cache_seqlens_buf = self.torch.zeros(8, dtype=self.torch.int32)
         return b
 
     def _layer(self, group_id):
@@ -58,6 +59,8 @@ class TRTLLMFlatGroupsTest(unittest.TestCase):
 
     def test_flag_declared(self):
         self.assertTrue(self.Backend.uses_flat_cache_groups)
+        # Verify path is wired: the startup guard must not reject flat+spec.
+        self.assertTrue(getattr(self.Backend, "flat_spec_capable", True))
 
     def test_select_page_table_routes_by_group(self):
         b = self._bare_backend()
@@ -186,10 +189,96 @@ class TRTLLMFlatGroupsTest(unittest.TestCase):
             [12 * 64 + 0, 0 * 64 + 0],
         )
 
-    def test_flat_with_spec_asserts(self):
+    def test_verify_metadata_expanded_write_locs(self):
+        # Target verify (spec N, not draft): [bs]-row per-group tables in the
+        # prefill slot + [bs*N] token-major write locs (radix verify layout).
         b = self._bare_backend(spec_num_tokens=4)
+        seq_lens = self.torch.tensor([65, 3], dtype=self.torch.int32)
+        tables = {
+            "full_attention": self.torch.tensor(
+                [[11, 12], [13, -1]], dtype=self.torch.int32
+            ),
+            "sliding_attention": self.torch.tensor(
+                [[21, 22], [23, -1]], dtype=self.torch.int32
+            ),
+        }
+        b.init_forward_metadata(
+            bs=2,
+            req_pool_indices=self.torch.tensor([0, 1], dtype=self.torch.int32),
+            seq_lens=seq_lens,
+            forward_mode=_DecodeMode(),
+            req_to_page=None,
+            flat_block_tables=tables,
+        )
+        meta = b.forward_prefill_metadata
+        self.assertIsNone(meta.page_table)
+        self.assertIs(meta.page_tables, tables)
+        # req0 positions 61..64 (pages 11,11,11,12); req1 clamps 0,0,1,2 (page 13).
+        self.assertEqual(
+            meta.out_cache_locs["full_attention"].tolist(),
+            [11 * 64 + 61, 11 * 64 + 62, 11 * 64 + 63, 12 * 64 + 0]
+            + [13 * 64 + 0, 13 * 64 + 0, 13 * 64 + 1, 13 * 64 + 2],
+        )
+        self.assertEqual(
+            meta.out_cache_locs["sliding_attention"].tolist(),
+            [21 * 64 + 61, 21 * 64 + 62, 21 * 64 + 63, 22 * 64 + 0]
+            + [23 * 64 + 0, 23 * 64 + 0, 23 * 64 + 1, 23 * 64 + 2],
+        )
+        # KV seqlens clamped >= N so padded rows avoid empty causal spans.
+        self.assertEqual(meta.cache_seqlens_int32.tolist(), [65, 4])
+
+    def test_verify_capture_replay_expanded_loc_views(self):
+        b = self._bare_backend(spec_num_tokens=4)
+        max_bs, bs = 4, 2
+        b._init_flat_graph_buffers(max_bs)
+        b.cuda_graph_cache_seqlens = self.torch.ones(max_bs, dtype=self.torch.int32)
+        b.init_forward_metadata_capture_cuda_graph(
+            bs,
+            req_pool_indices=self.torch.tensor([0, 1], dtype=self.torch.int32),
+            seq_lens=b.cuda_graph_cache_seqlens[:bs],
+            forward_mode=_DecodeMode(),
+            flat_cache_group_ids=("full_attention",),
+        )
+        meta = b.cuda_graph_prefill_metadata[bs]
+        self.assertIsNone(meta.page_table)
+        self.assertEqual(meta.out_cache_locs["full_attention"].shape[0], bs * 4)
+        # Replay refreshes tables and recomputes [bs*N] locs from live lens.
+        b.cuda_graph_cache_seqlens[:bs] = self.torch.tensor(
+            [65, 1], dtype=self.torch.int32
+        )
+        src = {
+            "full_attention": self.torch.tensor(
+                [[11, 12], [0, -1]], dtype=self.torch.int32
+            )
+        }
+        b.init_forward_metadata_replay_cuda_graph(
+            bs,
+            req_pool_indices=self.torch.tensor([0, 1], dtype=self.torch.int32),
+            seq_lens=b.cuda_graph_cache_seqlens,
+            forward_mode=_DecodeMode(),
+            flat_block_tables=src,
+        )
+        locs = b.cuda_graph_flat_out_cache_locs["full_attention"][: bs * 4]
+        self.assertEqual(
+            locs.tolist(),
+            [11 * 64 + 61, 11 * 64 + 62, 11 * 64 + 63, 12 * 64 + 0] + [0, 0, 0, 0],
+        )
+
+    def test_prewrite_metadata_routes_verify_to_prefill_slot(self):
+        b = self._bare_backend(spec_num_tokens=4)
+        prefill, decode = self.Metadata(), self.Metadata()
+        b.forward_prefill_metadata, b.forward_decode_metadata = prefill, decode
+        # Target verify is DECODE mode; its metadata lives in the prefill slot.
+        self.assertIs(b._prewrite_metadata(_DecodeMode()), prefill)
+        b.is_draft = True
+        self.assertIs(b._prewrite_metadata(_DecodeMode()), decode)
+
+    def test_flat_with_dflash_asserts(self):
+        b = self._bare_backend(spec_num_tokens=4)
+        b.is_draft = True
+        b.draft_block_decode = True
         tables = {"full_attention": self.torch.zeros((1, 1), dtype=self.torch.int32)}
-        with self.assertRaisesRegex(AssertionError, "spec_num_tokens"):
+        with self.assertRaisesRegex(AssertionError, "DFLASH"):
             b.init_forward_metadata(
                 bs=1,
                 req_pool_indices=self.torch.tensor([0], dtype=self.torch.int32),

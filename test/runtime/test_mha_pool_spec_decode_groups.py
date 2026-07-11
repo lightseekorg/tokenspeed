@@ -1,9 +1,10 @@
-"""MHA pool paged-cache group publication vs ext build flavor + spec decode.
+"""MHA pool paged-cache group publication vs ext build flavor.
 
 Rule under test (kv_cache/mha.py): the pool publishes
 paged_cache_group_specs iff the tokenspeed_scheduler ext is flat-built
-(TOKENSPEED_FLAT_KVCACHE) AND speculative decoding is off; radix builds and
-spec decode publish nothing.
+(TOKENSPEED_FLAT_KVCACHE); radix builds publish nothing. Speculative
+decoding does not gate publication (flat+spec is supported); backend
+capability is checked separately by validate_flat_scheduler_config.
 
 The installed ext's real build flavor must not decide these tests, so the
 scheduler_ext_flat_kvcache probe is patched per case; the probe's own
@@ -16,7 +17,6 @@ import os
 import sys
 import types
 import unittest
-from types import SimpleNamespace
 from unittest import mock
 
 # CI Registration (parsed via AST, runtime no-op)
@@ -98,22 +98,6 @@ class MHAPoolGroupPublicationTest(unittest.TestCase):
             {"full_attention", "sliding_attention"},
         )
 
-    def test_spec_decode_plain_publishes_no_groups(self):
-        # Publishing under spec decode would trip the backend's capture
-        # assert and silently disable overlap scheduling.
-        pool = self._pool(speculative_enabled=True)
-        self.assertEqual(pool.paged_cache_group_specs, ())
-        self.assertEqual(pool.paged_cache_group_page_counts, {})
-
-    def test_spec_decode_hybrid_publishes_no_groups(self):
-        pool = self._pool(
-            layer_types=GPT_OSS_LAYER_TYPES,
-            sliding_window_tokens=128,
-            speculative_enabled=True,
-        )
-        self.assertEqual(pool.paged_cache_group_specs, ())
-        self.assertEqual(pool.paged_cache_group_page_counts, {})
-
     def test_radix_ext_plain_publishes_no_groups(self):
         # A radix scheduler never fills flat_block_tables, so publication
         # must stay off or graph capture binds buffers that never refresh.
@@ -127,11 +111,6 @@ class MHAPoolGroupPublicationTest(unittest.TestCase):
             layer_types=GPT_OSS_LAYER_TYPES,
             sliding_window_tokens=128,
         )
-        self.assertEqual(pool.paged_cache_group_specs, ())
-        self.assertEqual(pool.paged_cache_group_page_counts, {})
-
-    def test_radix_ext_with_spec_decode_publishes_no_groups(self):
-        pool = self._pool(flat_ext=False, speculative_enabled=True)
         self.assertEqual(pool.paged_cache_group_specs, ())
         self.assertEqual(pool.paged_cache_group_page_counts, {})
 
@@ -174,66 +153,6 @@ class SchedulerExtFlatKvcacheProbeTest(unittest.TestCase):
         # sys.modules[name] = None makes `import name` raise ImportError.
         with mock.patch.dict(sys.modules, {"tokenspeed_scheduler": None}):
             self.assertFalse(self.probe())
-
-
-class MHAConfigSpecSignalTest(unittest.TestCase):
-    """MHAConfig.generate derives speculative_enabled from
-    server_args.speculative_algorithm — the same authoritative signal the
-    scheduler config (event_loop) and should_use_overlap_schedule read."""
-
-    def setUp(self):
-        try:
-            from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
-        except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs torch: {exc}")
-        self.MHAConfig = MHAConfig
-
-    def _server_args(self, speculative_algorithm):
-        return SimpleNamespace(
-            device="cpu",
-            speculative_algorithm=speculative_algorithm,
-            speculative_num_steps=3,
-            speculative_num_draft_tokens=4,
-            attention_backend="mha",
-            drafter_attention_backend="mha",
-            attn_tp_size=1,
-            mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=1, dp_size=1)),
-            kv_cache_dtype="bfloat16",
-            block_size=16,
-            max_num_seqs=8,
-            data_parallel_size=1,
-            max_cudagraph_capture_size=4,
-            kv_cache_quant_method="",
-            chunked_prefill_size=512,
-            enable_kvstore=False,
-            disaggregation_mode="null",
-        )
-
-    def _model_config(self):
-        import torch
-
-        return SimpleNamespace(
-            hf_config=SimpleNamespace(layer_types=None, sliding_window=None),
-            context_len=64,
-            num_attention_heads=4,
-            num_key_value_heads=4,
-            head_dim=8,
-            dtype=torch.bfloat16,
-        )
-
-    def test_spec_algorithm_sets_speculative_enabled(self):
-        cfg = self.MHAConfig.generate(
-            self._server_args(speculative_algorithm="EAGLE3"),
-            self._model_config(),
-        )
-        self.assertTrue(cfg.speculative_enabled)
-
-    def test_no_spec_algorithm_leaves_speculative_disabled(self):
-        cfg = self.MHAConfig.generate(
-            self._server_args(speculative_algorithm=None),
-            self._model_config(),
-        )
-        self.assertFalse(cfg.speculative_enabled)
 
 
 if __name__ == "__main__":

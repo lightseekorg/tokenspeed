@@ -372,7 +372,7 @@ class EventLoop:
             paged_cache_groups=paged_cache_groups,
             attn_backend=attn_backend,
             kv_pool=token_to_kv_pool,
-            speculative_enabled=server_args.speculative_algorithm is not None,
+            speculative_algorithm=server_args.speculative_algorithm,
         )
         self._paged_cache_groups = paged_cache_groups
         prefix_cache_adjunct = None

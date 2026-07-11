@@ -56,15 +56,12 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
-def _kv_profile_layer_divisor(
-    num_layers, layer_types, *, speculative_enabled, sliding_window_tokens=None
-):
+def _kv_profile_layer_divisor(num_layers, layer_types, *, sliding_window_tokens=None):
     """Attention layers to charge per token in the KV memory profile:
     layers-per-group under the slab layout, else all layers (single
     source: hybrid_slab_group_size)."""
     gs = hybrid_slab_group_size(
         layer_types,
-        speculative_enabled=speculative_enabled,
         sliding_window_tokens=sliding_window_tokens,
     )
     return gs if gs is not None else num_layers
@@ -668,7 +665,6 @@ def create_attn_components(
         slab_divisor = _kv_profile_layer_divisor(
             num_layers,
             getattr(config, "layer_types", None),
-            speculative_enabled=server_args.speculative_algorithm is not None,
             sliding_window_tokens=getattr(config, "sliding_window_tokens", None),
         )
         if profile_cache_cell_size is not None and slab_divisor != num_layers:

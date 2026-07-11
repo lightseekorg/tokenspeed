@@ -187,11 +187,10 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         flat_page_tables = self._shed_state_groups(flat_block_tables)
         flat_out_cache_locs = None
         if flat_page_tables:
-            # Mirrors the capture-time assert: flat + spec is unsupported.
+            # Verify keeps [bs]-row tables; only DFLASH expands rows. TODO(flat+dflash).
             assert not (
-                self.spec_num_tokens > 1
-                and (not self.is_draft or self.draft_block_decode)
-            ), "flat cache groups are unsupported with spec_num_tokens > 1"
+                self.draft_block_decode and self.spec_num_tokens > 1
+            ), "flat cache groups are unsupported with DFLASH block decode"
             # The flat path routes every read/write through the per-group
             # tables; the radix single table would be dead work.
             page_table = None
@@ -205,10 +204,16 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                     self.page_size,
                 )
             else:
+                verify_tokens = (
+                    self.spec_num_tokens
+                    if self.spec_num_tokens > 1 and not self.is_draft
+                    else 1
+                )
                 flat_out_cache_locs = self._compute_flat_decode_out_cache_locs(
                     flat_page_tables,
                     seq_lens,
                     self.page_size,
+                    verify_tokens,
                 )
             self._maybe_check_flat_write_locs(
                 flat_page_tables, flat_out_cache_locs, self.page_size
@@ -367,14 +372,18 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         # persistent per-group buffers and records metadata views into them,
         # so replay can copy_ fresh data to the graph-recorded addresses.
         if flat_cache_group_ids:
-            # Per-group views are bs rows; spec buffers expand to
-            # bs * spec_num_tokens rows. TODO(flat+spec).
+            # Verify keeps [bs]-row tables + [bs*N] loc views. TODO(flat+dflash).
             assert not (
-                self.spec_num_tokens > 1
-                and (not self.is_draft or self.draft_block_decode)
-            ), "flat_cache_group_ids is unsupported with spec_num_tokens > 1"
+                self.draft_block_decode and self.spec_num_tokens > 1
+            ), "flat_cache_group_ids is unsupported with DFLASH block decode"
         page_tables, out_cache_locs = self._flat_capture_group_views(
-            bs, flat_cache_group_ids
+            bs,
+            flat_cache_group_ids,
+            tokens_per_req=(
+                self.spec_num_tokens
+                if self.spec_num_tokens > 1 and not self.is_draft
+                else 1
+            ),
         )
 
         if self.draft_block_decode and self.spec_num_tokens > 1:
@@ -450,10 +459,18 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                 bs, self.spec_num_tokens, self.max_num_pages
             ).copy_(base_page_table[:, None, :])
 
-        # cuda_graph_seq_lens aliases the controller's seq_lens_buf, which
-        # input prep fills (current lens + padding 1s) BEFORE this call.
+        # cuda_graph_seq_lens is filled by input prep / the spec copy above.
         if flat_block_tables:
-            self._flat_replay_fill(bs, flat_block_tables, self.cuda_graph_seq_lens)
+            self._flat_replay_fill(
+                bs,
+                flat_block_tables,
+                self.cuda_graph_seq_lens,
+                tokens_per_req=(
+                    self.spec_num_tokens
+                    if self.spec_num_tokens > 1 and not self.is_draft
+                    else 1
+                ),
+            )
 
         if bs in self.cuda_graph_decode_metadata:
             self.forward_decode_metadata = self.cuda_graph_decode_metadata[bs]
@@ -505,7 +522,10 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         sinks = kwargs.get("sinks")
 
         out_cache_loc = self._select_out_cache_loc(
-            layer, self.forward_decode_metadata, out_cache_loc
+            layer,
+            self.forward_decode_metadata,
+            out_cache_loc,
+            prefer_caller=self.is_draft,
         )
 
         return self._forward_decode(

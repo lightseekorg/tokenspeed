@@ -62,10 +62,19 @@ class FakeV4StyleBackend:
 
 
 class FakeFlatMHABackend:
-    """backends/mha.py shape: flat-group capable."""
+    """backends/mha.py shape: flat-group capable, spec-verify wired."""
 
     uses_paged_cache_groups = False
     uses_flat_cache_groups = True
+
+
+class FakeSpecIncapableBackend:
+    """Flat-capable backend whose spec-verify path is not wired
+    (flat_spec_capable=False); rejected at startup under spec decode."""
+
+    uses_paged_cache_groups = False
+    uses_flat_cache_groups = True
+    flat_spec_capable = False
 
 
 class FakeV4Pool:
@@ -94,7 +103,7 @@ class ValidateFlatSchedulerConfigTest(unittest.TestCase):
                 paged_cache_groups=[FakeGroup()],
                 attn_backend=FakeV4StyleBackend(),
                 kv_pool=FakeV4Pool(),
-                speculative_enabled=False,
+                speculative_algorithm=None,
             )
         msg = str(ctx.exception)
         self.assertIn("does not support this model's cache layout", msg)
@@ -102,21 +111,20 @@ class ValidateFlatSchedulerConfigTest(unittest.TestCase):
         self.assertIn("FakeV4Pool", msg)
         self.assertIn("radix-built", msg)
 
-    def test_flat_ext_zero_groups_spec_decode_names_the_knob(self):
-        # The error must name spec decode as the cause, not surface the
-        # cryptic C++ MakeCoordinator abort.
+    def test_flat_ext_zero_groups_rejected_regardless_of_spec(self):
+        # Spec decode no longer gates publication (flat+spec is supported);
+        # a zero-group pool is rejected with the generic pool-shaped cause.
         with self.assertRaises(RuntimeError) as ctx:
             _pcs.validate_flat_scheduler_config(
                 flat_kvcache_ext=True,
                 paged_cache_groups=[],
                 attn_backend=FakeFlatMHABackend(),
                 kv_pool=FakeMHAPool(),
-                speculative_enabled=True,
+                speculative_algorithm="EAGLE3",
             )
         msg = str(ctx.exception)
         self.assertIn("at least one paged-cache group", msg)
-        self.assertIn("speculative decoding is enabled", msg)
-        self.assertIn("Disable speculative decoding", msg)
+        self.assertIn("publishes none", msg)
 
     def test_flat_ext_zero_groups_groupless_pool_names_the_pool(self):
         # Group-less pools (e.g. mamba) publish nothing without spec decode.
@@ -126,7 +134,7 @@ class ValidateFlatSchedulerConfigTest(unittest.TestCase):
                 paged_cache_groups=[],
                 attn_backend=FakeFlatMHABackend(),
                 kv_pool=FakeMambaPool(),
-                speculative_enabled=False,
+                speculative_algorithm=None,
             )
         msg = str(ctx.exception)
         self.assertIn("at least one paged-cache group", msg)
@@ -140,22 +148,64 @@ class ValidateFlatSchedulerConfigTest(unittest.TestCase):
             paged_cache_groups=[FakeGroup()],
             attn_backend=FakeFlatMHABackend(),
             kv_pool=FakeMHAPool(),
-            speculative_enabled=False,
+            speculative_algorithm=None,
         )
 
     def test_radix_ext_is_a_noop_regardless(self):
         # Every combination the flat arms reject must pass untouched.
         for backend, pool, groups, spec in (
-            (FakeV4StyleBackend(), FakeV4Pool(), [FakeGroup()], False),
-            (FakeFlatMHABackend(), FakeMHAPool(), [], True),
-            (FakeFlatMHABackend(), FakeMambaPool(), [], False),
+            (FakeV4StyleBackend(), FakeV4Pool(), [FakeGroup()], None),
+            (FakeFlatMHABackend(), FakeMHAPool(), [], "EAGLE3"),
+            (FakeSpecIncapableBackend(), FakeMHAPool(), [FakeGroup()], "EAGLE3"),
+            (FakeFlatMHABackend(), FakeMambaPool(), [], "DFLASH"),
         ):
             _pcs.validate_flat_scheduler_config(
                 flat_kvcache_ext=False,
                 paged_cache_groups=groups,
                 attn_backend=backend,
                 kv_pool=pool,
-                speculative_enabled=spec,
+                speculative_algorithm=spec,
+            )
+
+    def test_flat_ext_spec_incapable_backend_rejected_under_spec(self):
+        # Without this guard the server would crash on the backend's
+        # capture/forward spec assert instead of failing at startup.
+        with self.assertRaisesRegex(RuntimeError, "speculative decoding"):
+            _pcs.validate_flat_scheduler_config(
+                flat_kvcache_ext=True,
+                paged_cache_groups=[FakeGroup()],
+                attn_backend=FakeSpecIncapableBackend(),
+                kv_pool=FakeMHAPool(),
+                speculative_algorithm="EAGLE3",
+            )
+
+    def test_flat_ext_spec_incapable_backend_passes_without_spec(self):
+        _pcs.validate_flat_scheduler_config(
+            flat_kvcache_ext=True,
+            paged_cache_groups=[FakeGroup()],
+            attn_backend=FakeSpecIncapableBackend(),
+            kv_pool=FakeMHAPool(),
+            speculative_algorithm=None,
+        )
+
+    def test_flat_ext_spec_capable_backend_passes_under_spec(self):
+        _pcs.validate_flat_scheduler_config(
+            flat_kvcache_ext=True,
+            paged_cache_groups=[FakeGroup()],
+            attn_backend=FakeFlatMHABackend(),
+            kv_pool=FakeMHAPool(),
+            speculative_algorithm="EAGLE3",
+        )
+
+    def test_flat_ext_dflash_rejected_even_on_capable_backend(self):
+        # DFLASH block decode stays asserted-out in the backends.
+        with self.assertRaisesRegex(RuntimeError, "DFLASH"):
+            _pcs.validate_flat_scheduler_config(
+                flat_kvcache_ext=True,
+                paged_cache_groups=[FakeGroup()],
+                attn_backend=FakeFlatMHABackend(),
+                kv_pool=FakeMHAPool(),
+                speculative_algorithm="DFLASH",
             )
 
     def test_backend_without_flags_single_group_falls_back(self):
@@ -170,7 +220,7 @@ class ValidateFlatSchedulerConfigTest(unittest.TestCase):
             paged_cache_groups=[FakeGroup()],
             attn_backend=LegacyBackend(),
             kv_pool=FakeMHAPool(),
-            speculative_enabled=False,
+            speculative_algorithm=None,
         )
 
     def test_backend_without_flags_multi_group_rejected(self):
@@ -186,7 +236,7 @@ class ValidateFlatSchedulerConfigTest(unittest.TestCase):
                 paged_cache_groups=[FakeGroup(), FakeGroup()],
                 attn_backend=LegacyBackend(),
                 kv_pool=FakeMHAPool(),
-                speculative_enabled=False,
+                speculative_algorithm=None,
             )
 
     def test_hybrid_with_flat_capable_full_sub_backend_passes(self):
@@ -212,7 +262,7 @@ class ValidateFlatSchedulerConfigTest(unittest.TestCase):
             paged_cache_groups=[FakeGroup(), FakeGroup()],
             attn_backend=FlatWrapper(),
             kv_pool=FakeMHAPool(),
-            speculative_enabled=False,
+            speculative_algorithm=None,
         )
 
     def test_hybrid_full_sub_backend_recursed(self):
@@ -235,7 +285,7 @@ class ValidateFlatSchedulerConfigTest(unittest.TestCase):
                 paged_cache_groups=[FakeGroup(), FakeGroup()],
                 attn_backend=FlatWrapper(LegacyFull()),
                 kv_pool=FakeMHAPool(),
-                speculative_enabled=False,
+                speculative_algorithm=None,
             )
 
 

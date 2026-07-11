@@ -3,8 +3,8 @@ KV slab pool (M12), and its two consumers (registry sizing divisor and
 MHATokenToKVPool buffer layout).
 
 The predicate returns the common layers-per-group count exactly when the
-slab layout may activate (flat ext, no spec decode, >= 2 equal-size known
-groups) and None otherwise (legacy per-layer layout). The installed ext's
+slab layout may activate (flat ext, >= 2 equal-size known groups) and None
+otherwise (legacy per-layer layout). The installed ext's
 real build flavor must not decide these tests, so the
 scheduler_ext_flat_kvcache probe is patched per case.
 """
@@ -67,47 +67,35 @@ class HybridSlabGroupSizeTest(unittest.TestCase):
         # gpt-oss: 12 sliding + 12 full, alternating -> 12 layers per group.
         with self._flat_ext(True):
             self.assertEqual(
-                hybrid_slab_group_size(GPT_OSS_LAYER_TYPES, speculative_enabled=False),
+                hybrid_slab_group_size(GPT_OSS_LAYER_TYPES),
                 12,
             )
 
     def test_none_when_radix_ext(self):
         with self._flat_ext(False):
-            self.assertIsNone(
-                hybrid_slab_group_size(GPT_OSS_LAYER_TYPES, speculative_enabled=False)
-            )
-
-    def test_none_when_speculative(self):
-        with self._flat_ext(True):
-            self.assertIsNone(
-                hybrid_slab_group_size(GPT_OSS_LAYER_TYPES, speculative_enabled=True)
-            )
+            self.assertIsNone(hybrid_slab_group_size(GPT_OSS_LAYER_TYPES))
 
     def test_none_when_single_group(self):
         with self._flat_ext(True):
-            self.assertIsNone(
-                hybrid_slab_group_size(
-                    ("full_attention",) * 24, speculative_enabled=False
-                )
-            )
+            self.assertIsNone(hybrid_slab_group_size(("full_attention",) * 24))
 
     def test_none_when_unequal_groups(self):
         lt = ("sliding_attention",) * 8 + ("full_attention",) * 16
         with self._flat_ext(True):
-            self.assertIsNone(hybrid_slab_group_size(lt, speculative_enabled=False))
+            self.assertIsNone(hybrid_slab_group_size(lt))
 
     def test_none_when_unknown_label(self):
         # Unknown input degrades to None (safe legacy layout), never raises;
         # loud rejection is group_specs_from_layer_types' job.
         lt = GPT_OSS_LAYER_TYPES + ("banana_attention",)
         with self._flat_ext(True):
-            self.assertIsNone(hybrid_slab_group_size(lt, speculative_enabled=False))
+            self.assertIsNone(hybrid_slab_group_size(lt))
 
     def test_none_when_empty(self):
         # Plain models pass empty or None layer_types.
         with self._flat_ext(True):
-            self.assertIsNone(hybrid_slab_group_size((), speculative_enabled=False))
-            self.assertIsNone(hybrid_slab_group_size(None, speculative_enabled=False))
+            self.assertIsNone(hybrid_slab_group_size(()))
+            self.assertIsNone(hybrid_slab_group_size(None))
 
     def test_none_when_multi_window_sequence(self):
         # 多种 sliding window:保守退 legacy(M14 spec §2.3)。
@@ -120,7 +108,6 @@ class HybridSlabGroupSizeTest(unittest.TestCase):
             self.assertIsNone(
                 hybrid_slab_group_size(
                     GPT_OSS_LAYER_TYPES,
-                    speculative_enabled=False,
                     sliding_window_tokens=windows,
                 )
             )
@@ -133,7 +120,6 @@ class HybridSlabGroupSizeTest(unittest.TestCase):
             self.assertEqual(
                 hybrid_slab_group_size(
                     GPT_OSS_LAYER_TYPES,
-                    speculative_enabled=False,
                     sliding_window_tokens=windows,
                 ),
                 12,
@@ -144,7 +130,6 @@ class HybridSlabGroupSizeTest(unittest.TestCase):
             self.assertEqual(
                 hybrid_slab_group_size(
                     GPT_OSS_LAYER_TYPES,
-                    speculative_enabled=False,
                     sliding_window_tokens=128,
                 ),
                 12,
@@ -156,7 +141,6 @@ class HybridSlabGroupSizeTest(unittest.TestCase):
             self.assertIsNone(
                 hybrid_slab_group_size(
                     GPT_OSS_LAYER_TYPES,
-                    speculative_enabled=False,
                     sliding_window_tokens=[128],
                 )
             )
@@ -167,7 +151,6 @@ class HybridSlabGroupSizeTest(unittest.TestCase):
             self.assertEqual(
                 hybrid_slab_group_size(
                     GPT_OSS_LAYER_TYPES,
-                    speculative_enabled=False,
                     sliding_window_tokens=["a"] * len(GPT_OSS_LAYER_TYPES),
                 ),
                 12,
@@ -203,27 +186,14 @@ class KvProfileLayerDivisorTest(unittest.TestCase):
         # 24 layers, 12+12 alternating -> charge 12 (per-token bytes halve).
         with self._pkg_flat_ext(True):
             self.assertEqual(
-                self._registry._kv_profile_layer_divisor(
-                    24, GPT_OSS_LAYER_TYPES, speculative_enabled=False
-                ),
+                self._registry._kv_profile_layer_divisor(24, GPT_OSS_LAYER_TYPES),
                 12,
             )
 
     def test_all_layers_when_radix_ext(self):
         with self._pkg_flat_ext(False):
             self.assertEqual(
-                self._registry._kv_profile_layer_divisor(
-                    24, GPT_OSS_LAYER_TYPES, speculative_enabled=False
-                ),
-                24,
-            )
-
-    def test_all_layers_when_speculative(self):
-        with self._pkg_flat_ext(True):
-            self.assertEqual(
-                self._registry._kv_profile_layer_divisor(
-                    24, GPT_OSS_LAYER_TYPES, speculative_enabled=True
-                ),
+                self._registry._kv_profile_layer_divisor(24, GPT_OSS_LAYER_TYPES),
                 24,
             )
 
@@ -231,15 +201,11 @@ class KvProfileLayerDivisorTest(unittest.TestCase):
         # () from MHAConfig's default, None from MLA configs via getattr.
         with self._pkg_flat_ext(True):
             self.assertEqual(
-                self._registry._kv_profile_layer_divisor(
-                    24, (), speculative_enabled=False
-                ),
+                self._registry._kv_profile_layer_divisor(24, ()),
                 24,
             )
             self.assertEqual(
-                self._registry._kv_profile_layer_divisor(
-                    24, None, speculative_enabled=False
-                ),
+                self._registry._kv_profile_layer_divisor(24, None),
                 24,
             )
 
@@ -256,7 +222,6 @@ class KvProfileLayerDivisorTest(unittest.TestCase):
                 self._registry._kv_profile_layer_divisor(
                     24,
                     GPT_OSS_LAYER_TYPES,
-                    speculative_enabled=False,
                     sliding_window_tokens=windows,
                 ),
                 24,
@@ -271,7 +236,6 @@ class KvProfileLayerDivisorTest(unittest.TestCase):
                 self._registry._kv_profile_layer_divisor(
                     24,
                     GPT_OSS_LAYER_TYPES,
-                    speculative_enabled=False,
                     sliding_window_tokens=windows,
                 ),
                 12,
@@ -360,7 +324,6 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
     def test_fallback_matrix_keeps_24_buffers(self):
         cases = dict(
             radix_ext=dict(flat_ext=False),
-            spec_decode=dict(speculative_enabled=True),
             single_group=dict(
                 layer_types=("full_attention",) * 24,
                 sliding_window_tokens=None,

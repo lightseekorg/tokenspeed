@@ -470,14 +470,30 @@ class BackendCaptureFlatTest(_BackendCase):
         )
         self.assertIsNot(first, second)
 
-    def test_flat_with_spec_decode_asserts(self):
+    def test_flat_with_spec_verify_records_expanded_loc_views(self):
+        # Verify (spec target) keeps [bs]-row tables but records [bs*N]
+        # write-loc views (token-major), sized off the persistent buffers.
         self.backend.spec_num_tokens = 2
         torch = self.torch
         self.backend.cuda_graph_page_table = torch.zeros(
             (MAX_BS * 2, MAX_NUM_PAGES), dtype=torch.int32
         )
         self.backend.cuda_graph_seq_lens = torch.zeros(MAX_BS * 2, dtype=torch.int32)
-        with self.assertRaisesRegex(AssertionError, "spec_num_tokens"):
+        self._capture(2, _GROUP_IDS)
+        meta = self.backend.forward_decode_metadata
+        for gid in _GROUP_IDS:
+            self.assertEqual(meta.page_tables[gid].shape[0], 2)
+            self.assertEqual(meta.out_cache_locs[gid].shape[0], 2 * 2)
+
+    def test_flat_with_dflash_block_decode_asserts(self):
+        self.backend.spec_num_tokens = 2
+        self.backend.draft_block_decode = True
+        torch = self.torch
+        self.backend.cuda_graph_page_table = torch.zeros(
+            (MAX_BS * 2, MAX_NUM_PAGES), dtype=torch.int32
+        )
+        self.backend.cuda_graph_seq_lens = torch.zeros(MAX_BS * 2, dtype=torch.int32)
+        with self.assertRaisesRegex(AssertionError, "DFLASH"):
             self._capture(2, _GROUP_IDS)
 
 

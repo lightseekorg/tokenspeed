@@ -535,6 +535,30 @@ class CudaGraphWrapper:
             return ()
         return tuple(str(spec.group_id) for spec in pool.paged_cache_group_specs)
 
+    def _draft_flat_group_ids(self) -> tuple[str, ...]:
+        """The draft head shares the target full-attention group's page ids
+        (EAGLE writes its own pool tensors at the same indices), so the
+        drafter consumes exactly that group's table on the flat path."""
+        if self.draft_attn_backend is None or not getattr(
+            self.draft_attn_backend, "uses_flat_cache_groups", False
+        ):
+            return ()
+        return tuple(
+            str(spec.group_id)
+            for spec in self.token_to_kv_pool.paged_cache_group_specs
+            if spec.family != "state" and spec.retention == "full_history"
+        )
+
+    def _draft_flat_tables(self, flat_block_tables):
+        """Subset of the target's per-group tables the drafter consumes."""
+        gids = self._draft_flat_group_ids()
+        if not gids or not flat_block_tables:
+            return None
+        subset = {
+            gid: flat_block_tables[gid] for gid in gids if gid in flat_block_tables
+        }
+        return subset or None
+
     def _init_capture_metadata(self, bs: int):
         capture_kwargs = {}
         if self.input_buffers.has_mamba:
@@ -575,6 +599,9 @@ class CudaGraphWrapper:
                         draft_paged_cache_block_tables
                     )
                     draft_kwargs["num_tokens"] = bs * self.max_tokens_per_req
+            draft_flat_ids = self._draft_flat_group_ids()
+            if draft_flat_ids:
+                draft_kwargs["flat_cache_group_ids"] = draft_flat_ids
             # Drafter mutates seq_lens_buf in place per step; backends alias.
             self.draft_attn_backend.init_forward_metadata_capture_cuda_graph(
                 bs,
@@ -742,6 +769,9 @@ class CudaGraphWrapper:
                     )
             if getattr(self.draft_attn_backend, "uses_padded_decode_token_mask", False):
                 draft_attn_kwargs["actual_bs"] = actual_bs
+            draft_flat = self._draft_flat_tables(kwargs.get("flat_block_tables"))
+            if draft_flat is not None:
+                draft_attn_kwargs["flat_block_tables"] = draft_flat
             draft_forward_mode = ForwardMode.DECODE
             if draft_uses_paged_groups:
                 draft_attn_kwargs["num_tokens"] = padded_bs * self.max_tokens_per_req
@@ -793,6 +823,9 @@ class CudaGraphWrapper:
                     value = kwargs.get(key)
                     if value is not None:
                         draft_kwargs[key] = value
+            draft_flat = self._draft_flat_tables(kwargs.get("flat_block_tables"))
+            if draft_flat is not None:
+                draft_kwargs["flat_block_tables"] = draft_flat
 
             # The drafter mutates draft_seq_lens_buf between MTP draft steps;
             # decode metadata must alias that buffer.
@@ -809,6 +842,12 @@ class CudaGraphWrapper:
                 draft_prefill_seq_lens = (
                     seq_lens if self.use_v4_mtp_paged_metadata else draft_seq_lens
                 )
+                # Drafter consumes only the full group's table (see _draft_flat_tables).
+                draft_extend_kwargs = (
+                    {**kwargs, "flat_block_tables": draft_flat}
+                    if kwargs.get("flat_block_tables") is not None
+                    else kwargs
+                )
                 self.draft_attn_backend.init_forward_metadata(
                     bs=padded_bs,
                     num_extends=num_extends,
@@ -816,7 +855,7 @@ class CudaGraphWrapper:
                     seq_lens=draft_prefill_seq_lens,
                     req_to_page=self.drafter.req_to_page,
                     forward_mode=forward_mode,
-                    **kwargs,
+                    **draft_extend_kwargs,
                 )
                 if self.use_v4_mtp_paged_metadata:
                     self.draft_attn_backend.init_forward_metadata(

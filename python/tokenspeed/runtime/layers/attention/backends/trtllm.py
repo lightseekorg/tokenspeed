@@ -118,8 +118,11 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
 
     def _prewrite_metadata(self, forward_mode):
         # Prewrite fires on extend too (unlike MHA): route it to the slot
-        # init_forward_metadata filled for this forward.
+        # init_forward_metadata filled for this forward. Target verify is
+        # DECODE mode but its multi-token metadata lives in the prefill slot.
         if forward_mode is not None and forward_mode.is_extend_or_mixed():
+            return self.forward_prefill_metadata
+        if self.spec_num_tokens > 1 and not self.is_draft:
             return self.forward_prefill_metadata
         return self.forward_decode_metadata
 
@@ -307,7 +310,9 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                 else self.forward_decode_metadata
             )
 
-        out_cache_loc = self._select_out_cache_loc(layer, metadata, out_cache_loc)
+        out_cache_loc = self._select_out_cache_loc(
+            layer, metadata, out_cache_loc, prefer_caller=self.is_draft
+        )
         q = self._save_kv_and_prepare_q(
             q, k, v, layer, out_cache_loc, token_to_kv_pool, save_kv_cache
         )
@@ -400,12 +405,10 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         flat_page_tables = self._shed_state_groups(flat_block_tables)
         flat_out_cache_locs = None
         if flat_page_tables:
-            # Mirrors the MHA backend: flat + spec is unsupported (the
-            # publication rule never delivers tables under spec decode).
+            # Verify keeps [bs]-row tables; only DFLASH expands rows. TODO(flat+dflash).
             assert not (
-                self.spec_num_tokens > 1
-                and (not self.is_draft or self.draft_block_decode)
-            ), "flat cache groups are unsupported with spec_num_tokens > 1"
+                self.draft_block_decode and self.spec_num_tokens > 1
+            ), "flat cache groups are unsupported with DFLASH block decode"
             if forward_mode.is_extend_or_mixed():
                 assert extend_prefix_lens_cpu is not None
                 assert extend_seq_lens_cpu is not None
@@ -420,6 +423,7 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                     flat_page_tables,
                     seq_lens[:bs],
                     self.page_size,
+                    self._flat_verify_tokens(),
                 )
             self._maybe_check_flat_write_locs(
                 flat_page_tables, flat_out_cache_locs, self.page_size
@@ -456,11 +460,24 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
 
         if self.spec_num_tokens > 1:
             self._init_multi_token_metadata(
-                bs, self.spec_num_tokens, req_pool_indices, seq_lens, req_to_page
+                bs,
+                self.spec_num_tokens,
+                req_pool_indices,
+                seq_lens,
+                req_to_page,
+                flat_page_tables=flat_page_tables,
+                flat_out_cache_locs=flat_out_cache_locs,
             )
             if self.is_draft:
                 # Drafter's N-1 single-token steps after the first.
-                self._init_decode_metadata(bs, req_pool_indices, seq_lens, req_to_page)
+                self._init_decode_metadata(
+                    bs,
+                    req_pool_indices,
+                    seq_lens,
+                    req_to_page,
+                    flat_page_tables=flat_page_tables,
+                    flat_out_cache_locs=flat_out_cache_locs,
+                )
         else:
             self._init_decode_metadata(
                 bs,
@@ -579,6 +596,15 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         torch.clamp_min(seq_lens[:bs], spec_num_tokens, out=dst)
         return dst
 
+    def _flat_verify_tokens(self) -> int:
+        # Write locs per request on the flat path: N for target verify
+        # ([bs*N], token-major), 1 elsewhere (draft chains use caller locs).
+        return (
+            self.spec_num_tokens
+            if self.spec_num_tokens > 1 and not self.is_draft
+            else 1
+        )
+
     def _init_multi_token_metadata(
         self,
         bs: int,
@@ -586,6 +612,8 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         req_to_page: torch.Tensor,
+        flat_page_tables: dict[str, torch.Tensor] | None = None,
+        flat_out_cache_locs: dict[str, torch.Tensor] | None = None,
     ):
         """Prefill-slot metadata for multi-token decode (uniform q_len per
         request). Routes through the decode kernel via q_len_per_req; the
@@ -607,9 +635,15 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                 dtype=torch.int32,
                 device=device,
             ),
-            page_table=self._build_page_table(
-                req_pool_indices, seq_lens, bs, req_to_page, self.page_table_buf
+            page_table=(
+                None
+                if flat_page_tables
+                else self._build_page_table(
+                    req_pool_indices, seq_lens, bs, req_to_page, self.page_table_buf
+                )
             ),
+            page_tables=flat_page_tables,
+            out_cache_locs=flat_out_cache_locs,
         )
 
     def _init_extend_metadata(
@@ -744,12 +778,12 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         # Real tables only arrive at replay: capture lazily allocates
         # persistent per-group buffers and records metadata views into them.
         if flat_cache_group_ids:
+            # Verify keeps [bs]-row tables + [bs*N] loc views. TODO(flat+dflash).
             assert not (
-                self.spec_num_tokens > 1
-                and (not self.is_draft or self.draft_block_decode)
-            ), "flat_cache_group_ids is unsupported with spec_num_tokens > 1"
+                self.draft_block_decode and self.spec_num_tokens > 1
+            ), "flat_cache_group_ids is unsupported with DFLASH block decode"
         page_tables, out_cache_locs = self._flat_capture_group_views(
-            bs, flat_cache_group_ids
+            bs, flat_cache_group_ids, tokens_per_req=self._flat_verify_tokens()
         )
 
         if self.draft_block_decode and self.spec_num_tokens > 1:
@@ -757,9 +791,13 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             return
 
         if self.spec_num_tokens > 1:
-            self._init_multi_token_metadata_capture(bs, self.spec_num_tokens)
+            self._init_multi_token_metadata_capture(
+                bs, self.spec_num_tokens, page_tables, out_cache_locs
+            )
             if self.is_draft:
-                self._init_decode_metadata_capture(bs, seq_lens)
+                self._init_decode_metadata_capture(
+                    bs, seq_lens, page_tables, out_cache_locs
+                )
         else:
             self._init_decode_metadata_capture(
                 bs, seq_lens, page_tables, out_cache_locs
@@ -809,7 +847,13 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         self.cuda_graph_decode_metadata[bs] = metadata
         self.forward_decode_metadata = metadata
 
-    def _init_multi_token_metadata_capture(self, bs: int, spec_num_tokens: int):
+    def _init_multi_token_metadata_capture(
+        self,
+        bs: int,
+        spec_num_tokens: int,
+        page_tables: dict[str, torch.Tensor] | None = None,
+        out_cache_locs: dict[str, torch.Tensor] | None = None,
+    ):
         # Multi-token decode: seed spec_cache_seqlens_buf (clamped to >=
         # spec_num_tokens) at capture so padded rows (seq_len=1) avoid NaN.
         # The replay path refreshes it each step.
@@ -827,7 +871,11 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                 dtype=torch.int32,
                 device=self.device,
             ),
-            page_table=self.cuda_graph_page_table[:bs, :],
+            page_table=(
+                None if page_tables is not None else self.cuda_graph_page_table[:bs, :]
+            ),
+            page_tables=page_tables,
+            out_cache_locs=out_cache_locs,
         )
         self.cuda_graph_prefill_metadata[bs] = metadata
         self.forward_prefill_metadata = metadata
@@ -879,7 +927,12 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         if flat_block_tables:
             # cuda_graph_cache_seqlens aliases the controller's seq_lens_buf,
             # filled by input prep BEFORE this call.
-            self._flat_replay_fill(bs, flat_block_tables, self.cuda_graph_cache_seqlens)
+            self._flat_replay_fill(
+                bs,
+                flat_block_tables,
+                self.cuda_graph_cache_seqlens,
+                tokens_per_req=self._flat_verify_tokens(),
+            )
 
         # Refresh for both verify and draft: draft step 1 is multi-token
         # and reads spec_cache_seqlens_buf; later single-token steps don't.

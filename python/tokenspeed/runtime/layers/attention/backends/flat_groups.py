@@ -67,9 +67,11 @@ class FlatCacheGroupsMixin:
             return metadata.page_table
         return self._select_group_entry(layer, metadata.page_tables, "page table")
 
-    def _select_out_cache_loc(self, layer, metadata, out_cache_loc):
-        # KV writes must land in the pages the layer's group reads (M-W1).
-        if metadata.out_cache_locs is None:
+    def _select_out_cache_loc(
+        self, layer, metadata, out_cache_loc, prefer_caller=False
+    ):
+        # prefer_caller: draft chains own per-step locs; metadata's single loc would pin every step to one slot.
+        if metadata.out_cache_locs is None or prefer_caller:
             return out_cache_loc
         return self._select_group_entry(
             layer, metadata.out_cache_locs, "flat write locs"
@@ -123,17 +125,32 @@ class FlatCacheGroupsMixin:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _compute_flat_decode_out_cache_locs(page_tables, seq_lens, page_size):
-        """Per-group decode write locs: one token per request at seq_len-1,
-        gathered from the group's own read table (M-W1). The tail page is
-        never a hole (SWA holes sit only at the window front).
+    def _compute_flat_decode_out_cache_locs(
+        page_tables, seq_lens, page_size, num_tokens_per_req=1
+    ):
+        """Per-group decode write locs, gathered from the group's own read
+        table (M-W1). Plain decode writes one token per request at seq_len-1;
+        spec verify writes num_tokens_per_req at seq_len-N..seq_len-1,
+        flattened token-major per request ([bs*N], radix verify layout).
+        Positions clamp at 0 for graph-padded rows (seq_len 1 < N), which
+        dereference the dummy page harmlessly. The tail page is never a hole
+        (SWA holes sit only at the window front).
         """
-        pos = (seq_lens - 1).to(torch.int64)
+        n = num_tokens_per_req
+        if n == 1:
+            pos = (seq_lens - 1).to(torch.int64)
+        else:
+            steps = torch.arange(n, device=seq_lens.device, dtype=torch.int64)
+            pos = (seq_lens.to(torch.int64).unsqueeze(1) - n + steps).clamp_min(0)
+            pos = pos.reshape(-1)
         page_idx = pos // page_size
         off = (pos % page_size).to(torch.int32)
         out = {}
         for gid, table in page_tables.items():
-            pages = table.gather(1, page_idx.unsqueeze(1)).squeeze(1)
+            if n == 1:
+                pages = table.gather(1, page_idx.unsqueeze(1)).squeeze(1)
+            else:
+                pages = table.gather(1, page_idx.view(-1, n)).reshape(-1)
             out[gid] = pages * page_size + off
         return out
 
@@ -198,10 +215,14 @@ class FlatCacheGroupsMixin:
         self.cuda_graph_flat_out_cache_locs: dict[str, torch.Tensor] = {}
         self._cuda_graph_max_bs = max_bs
 
-    def _flat_capture_group_views(self, bs: int, flat_cache_group_ids):
+    def _flat_capture_group_views(
+        self, bs: int, flat_cache_group_ids, tokens_per_req: int = 1
+    ):
         """Capture-time (page_tables, out_cache_locs) per-group views into the
         persistent buffers, lazily allocated. Real tables only arrive at
         replay, which copy_s fresh data to these graph-recorded addresses.
+        Verify (tokens_per_req = spec_num_tokens) keeps [bs]-row tables but
+        records [bs*N] write-loc views (token-major, radix verify layout).
         Returns (None, None) when only state groups (or none) are delivered.
         """
         if not flat_cache_group_ids:
@@ -221,15 +242,18 @@ class FlatCacheGroupsMixin:
                 )
                 self.cuda_graph_flat_page_tables[gid] = buf
             loc_buf = self.cuda_graph_flat_out_cache_locs.get(gid)
-            if loc_buf is None:
+            if (
+                loc_buf is None
+                or loc_buf.shape[0] < self._cuda_graph_max_bs * tokens_per_req
+            ):
                 loc_buf = torch.zeros(
-                    (self._cuda_graph_max_bs,),
+                    (self._cuda_graph_max_bs * tokens_per_req,),
                     dtype=torch.int32,
                     device=self.device,
                 )
                 self.cuda_graph_flat_out_cache_locs[gid] = loc_buf
             page_tables[gid] = buf[:bs, :]
-            out_cache_locs[gid] = loc_buf[:bs]
+            out_cache_locs[gid] = loc_buf[: bs * tokens_per_req]
         if not page_tables:
             # Only state groups delivered: nothing for this backend.
             return None, None
@@ -259,9 +283,12 @@ class FlatCacheGroupsMixin:
                 "graph would read stale page tables for those groups."
             )
 
-    def _flat_replay_fill(self, bs: int, flat_block_tables, seq_lens) -> None:
+    def _flat_replay_fill(
+        self, bs: int, flat_block_tables, seq_lens, tokens_per_req: int = 1
+    ) -> None:
         """Copy this replay's tables into the captured buffers and recompute
-        the per-group write locs from the live seq_lens.
+        the per-group write locs from the live seq_lens (tokens_per_req locs
+        per request on the spec-verify path).
 
         Padding contract (canonical; bs is the padded bs): dummy ROWS pad
         with 0 — replayed at seq_lens=1 they dereference exactly col 0,
@@ -298,6 +325,7 @@ class FlatCacheGroupsMixin:
             },
             seq_lens[:bs],
             self.page_size,
+            tokens_per_req,
         )
         for gid, val in locs.items():
-            self.cuda_graph_flat_out_cache_locs[gid][:bs].copy_(val)
+            self.cuda_graph_flat_out_cache_locs[gid][: bs * tokens_per_req].copy_(val)

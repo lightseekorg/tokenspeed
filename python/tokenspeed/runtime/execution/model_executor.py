@@ -29,6 +29,10 @@ from tokenspeed_kernel.ops.tuning import freeze_autotuning
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
+from tokenspeed.runtime.configs.paged_cache_spec import (
+    scheduler_ext_flat_kvcache,
+    validate_flat_scheduler_config,
+)
 from tokenspeed.runtime.configs.utils import get_rope_parameters
 from tokenspeed.runtime.engine.scheduler_utils import (
     flat_block_tables_from_forward_op,
@@ -240,9 +244,34 @@ class ModelExecutor:
         self.sampling_backend = sampling_backend
         self.attn_backend = attn_backend
         self.token_to_kv_pool = token_to_kv_pool
+        # Full-attention group mirrored into req_to_page each step (flat+spec).
+        _group_specs = getattr(token_to_kv_pool, "paged_cache_group_specs", ()) or ()
+        self._flat_full_group_id = next(
+            (
+                str(spec.group_id)
+                for spec in _group_specs
+                if getattr(spec, "family", "history") != "state"
+                and getattr(spec, "retention", None) == "full_history"
+            ),
+            None,
+        )
+        self._mirror_idx_cpu: torch.Tensor | None = None
+        self._mirror_idx_dev: torch.Tensor | None = None
+        self._mirror_row_buf: torch.Tensor | None = None
         self.draft_attn_backend = draft_attn_backend
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self._layerwise_mamba_cow_done = None
+
+        # Must precede CUDA-graph capture: unsupported flat combinations
+        # (e.g. spec on a backend without flat_spec_capable) would otherwise
+        # die on a capture-path assert instead of this actionable error.
+        validate_flat_scheduler_config(
+            flat_kvcache_ext=scheduler_ext_flat_kvcache(),
+            paged_cache_groups=_group_specs,
+            attn_backend=attn_backend,
+            kv_pool=token_to_kv_pool,
+            speculative_algorithm=config.spec_algo,
+        )
 
         if config.spec_algo is not None:
             # The DFLASH overlap scheduler reserves a fresh draft block per
@@ -597,6 +626,54 @@ class ModelExecutor:
             if isinstance(self.grammar_runtime, EagerGrammarBuffers)
             else None
         )
+
+    def _mirror_flat_full_table_into_req_to_page(
+        self, forward_op, flat_block_tables
+    ) -> None:
+        """Flat + spec: scatter the full-attention group's per-batch table
+        into req_to_page rows, restoring the radix contract for every
+        legacy consumer (input prep's out_cache_loc kernels, the drafter's
+        per-step location chains). The flat scheduler never populates
+        req_to_page itself; column tails zero-fill to the dummy page so
+        stale longer rows can't leak."""
+        if (
+            self.drafter is None
+            or not flat_block_tables
+            or self._flat_full_group_id is None
+        ):
+            return
+        table = flat_block_tables.get(self._flat_full_group_id)
+        if table is None:
+            return
+        bs = len(forward_op.request_pool_indices)
+        if self._mirror_idx_cpu is None or self._mirror_idx_cpu.shape[0] < bs:
+            cap = max(bs, self.input_buffers.max_bs)
+            self._mirror_idx_cpu = torch.empty(cap, dtype=torch.long, pin_memory=True)
+            self._mirror_idx_dev = torch.empty(
+                cap, dtype=torch.long, device=self.device
+            )
+        self._mirror_idx_cpu[:bs] = torch.tensor(
+            forward_op.request_pool_indices, dtype=torch.long
+        )
+        self._mirror_idx_dev[:bs].copy_(self._mirror_idx_cpu[:bs], non_blocking=True)
+        idx = self._mirror_idx_dev[:bs]
+        width = table.shape[1]
+        max_width = self.req_to_page.shape[1]
+        if self._mirror_row_buf is None:
+            self._mirror_row_buf = torch.zeros(
+                (self.input_buffers.max_bs, max_width),
+                dtype=self.req_to_page.dtype,
+                device=self.device,
+            )
+        # Staged rows + index_copy_ (advanced-index setitem costs ~150us dispatch).
+        rows = self._mirror_row_buf[:bs]
+        rows[:, :width].copy_(table)
+        rows[:, :width].clamp_min_(
+            0
+        )  # -1 column pads -> dummy page 0 (negative locs otherwise)
+        if width < max_width:
+            rows[:, width:].zero_()
+        self.req_to_page.index_copy_(0, idx, rows)
 
     @nvtx_range("target_forward", color="red")
     def _run_target_forward(self, bs: int, ctx: ForwardContext, req_pool_indices):
@@ -1591,6 +1668,13 @@ class ModelExecutor:
             bs = len(forward_op.request_ids)
             # Outside the graph: in-graph sites only OR into the flag buffer.
             self.nan_guard.reset(bs)
+            # Mirror the full group's flat table into req_to_page (flat+spec).
+            flat_block_tables = flat_block_tables_from_forward_op(
+                forward_op,
+                device=self.device,
+                num_reqs=bs,
+            )
+            self._mirror_flat_full_table_into_req_to_page(forward_op, flat_block_tables)
             decode_input_ids = self.input_buffers.fill_input_buffers(
                 forward_op=forward_op,
                 runtime_states=self.runtime_states,
@@ -1770,11 +1854,7 @@ class ModelExecutor:
                         device=self.device,
                         num_reqs=bs,
                     )
-                    flat_block_tables = flat_block_tables_from_forward_op(
-                        forward_op,
-                        device=self.device,
-                        num_reqs=bs,
-                    )
+                    # flat_block_tables computed once in pre_fill above.
                     (
                         paged_cache_block_table_base_offsets,
                         _paged_cache_block_table_base_offset_max,

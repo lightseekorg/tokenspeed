@@ -64,7 +64,6 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         layer_types: tuple[str, ...] = (),
         sliding_window_tokens: int | tuple[int | None, ...] | None = None,
         max_scheduled_tokens: int = 0,
-        speculative_enabled: bool = False,
         pd_disaggregation_enabled: bool = False,
         enable_kv_cache_copy: bool = False,
         enable_alt_stream: bool = True,
@@ -88,7 +87,6 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         self._pd_disaggregation_enabled = pd_disaggregation_enabled
         self._slab_group_size = hybrid_slab_group_size(
             self._layer_types,
-            speculative_enabled=speculative_enabled,
             sliding_window_tokens=sliding_window_tokens,
         )
         # GDN/mamba2 recurrent state slabs live under this same pool object
@@ -135,7 +133,6 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             layer_types=self._layer_types,
             sliding_window_tokens=sliding_window_tokens,
             page_size=page_size,
-            speculative_enabled=speculative_enabled,
             max_live_requests=max_batch_size,
             max_scheduled_tokens=max_scheduled_tokens,
             max_total_tokens=size,
@@ -255,9 +252,8 @@ class MHATokenToKVPool(BaseTokenToKVPool):
                 else:
                     logger.info(
                         "KV layout: per-layer (%d buffers; hybrid slab "
-                        "inactive: predicate returned None -- radix ext, "
-                        "spec decode, or non-uniform/single-group "
-                        "layer_types)",
+                        "inactive: predicate returned None -- radix ext "
+                        "or non-uniform/single-group layer_types)",
                         self.layer_num,
                     )
             # Pointer/stride tables carry the REAL tensors only: _kv_copy
