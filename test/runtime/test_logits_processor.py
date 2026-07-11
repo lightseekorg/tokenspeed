@@ -90,6 +90,84 @@ def test_tp_logits_all_gather_handles_zero_rows(monkeypatch):
     assert tuple(output.next_token_logits.shape) == (0, 6)
 
 
+def test_sm120_tp_logits_skips_symmetric_memory_states(monkeypatch):
+    processor = LogitsProcessor(
+        config=SimpleNamespace(model_type="test", vocab_size=8192),
+        tp_rank=0,
+        tp_size=2,
+        tp_group=(0, 1),
+    )
+    lm_head = SimpleNamespace(weight=torch.ones((4096, 2), dtype=torch.bfloat16))
+    monkeypatch.setattr(
+        logits_processor_module,
+        "current_platform",
+        lambda: SimpleNamespace(
+            is_nvidia=True,
+            arch_version=SimpleNamespace(major=12),
+        ),
+    )
+    monkeypatch.setattr(logits_processor_module, "supports_triton_rsag", lambda: False)
+    monkeypatch.setattr(
+        logits_processor_module,
+        "create_state",
+        lambda *_args, **_kwargs: pytest.fail(
+            "SM120 logits gather must not create Triton RSAG state"
+        ),
+    )
+    monkeypatch.setattr(
+        logits_processor_module,
+        "create_dist_argmax_state",
+        lambda *_args, **_kwargs: pytest.fail(
+            "SM120 logits argmax must not create symmetric-memory state"
+        ),
+    )
+
+    assert processor._init_all_gather_state(lm_head) is None
+    assert processor._init_dist_argmax_state(lm_head) is None
+
+
+@pytest.mark.parametrize("major", [9, 10], ids=["h100", "b200"])
+def test_existing_nvidia_architectures_keep_tp_logits_fast_path(major, monkeypatch):
+    LogitsProcessor._LOGITS_AG_STATES.clear()
+    processor = LogitsProcessor(
+        config=SimpleNamespace(model_type="test", vocab_size=8192),
+        tp_rank=0,
+        tp_size=2,
+        tp_group=(0, 1),
+    )
+    lm_head = SimpleNamespace(weight=torch.ones((4096, 2), dtype=torch.bfloat16))
+    state = object()
+    calls = {}
+    monkeypatch.setattr(
+        logits_processor_module,
+        "current_platform",
+        lambda: SimpleNamespace(
+            is_nvidia=True,
+            arch_version=SimpleNamespace(major=major),
+        ),
+    )
+    monkeypatch.setattr(logits_processor_module, "supports_triton_rsag", lambda: True)
+    monkeypatch.setattr(
+        logits_processor_module.pg_manager,
+        "get_process_group",
+        lambda backend, group: (backend, group),
+    )
+
+    def fake_create_state(**kwargs):
+        calls.update(kwargs)
+        return state
+
+    monkeypatch.setattr(logits_processor_module, "create_state", fake_create_state)
+
+    assert processor._init_all_gather_state(lm_head) is state
+    assert calls == {
+        "group": ("nccl", (0, 1)),
+        "rank_in_group": 0,
+        "max_tokens": processor._LOGITS_AG_MAX_TOKENS,
+        "hidden_size": 8192,
+    }
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_fused_softcap_handles_large_logits_without_nan():
     cap = 30.0

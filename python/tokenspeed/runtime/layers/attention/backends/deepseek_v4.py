@@ -13,15 +13,13 @@
 
 from __future__ import annotations
 
+import tokenspeed_kernel
 import torch
-from tokenspeed_kernel.ops.attention.flash_mla import (
-    flash_mla_sparse_fwd,
-    flash_mla_with_kvcache,
-    get_mla_metadata,
-)
+from tokenspeed_kernel.ops.attention.flash_mla import flash_mla_sparse_fwd
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_indexer_decode_metadata_compute,
 )
+from tokenspeed_kernel.platform import Platform
 from tokenspeed_kernel.registry import error_fn
 
 try:
@@ -60,6 +58,11 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 DEEPSEEK_V4_DEFAULT_PREFILL_CHUNK_SIZE = 4
+
+
+def _use_flashinfer_sm120_sparse_mla() -> bool:
+    platform = Platform.get()
+    return platform.is_nvidia and platform.arch_version.major == 12
 
 
 def _compressed_block_table_base_offsets(
@@ -265,7 +268,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         self.forward_metadata: DeepseekV4ForwardMetadata | None = None
         self.forward_prefill_metadata: DeepseekV4ForwardMetadata | None = None
         self.forward_decode_metadata: DeepseekV4ForwardMetadata | None = None
-        self._decode_tile_metadata = {}
         self._cuda_graph_metadata = {}
         self._cuda_graph_paged_cache_block_tables: dict[str, torch.Tensor] = {}
         # Per-sliding-group [max_bs] int32 buffers mirroring the block-table
@@ -733,7 +735,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 )
         elif forward_mode is not None and forward_mode.is_extend_or_mixed():
             self.forward_prefill_metadata = self.forward_metadata
-        self._decode_tile_metadata = {}
 
     def _update_decode_swa_metadata(
         self,
@@ -947,24 +948,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             out=out,
         )
 
-    def _get_decode_tile_metadata(self, kind: str, bs: int):
-        phase = (
-            "graph"
-            if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
-            else "eager"
-        )
-        tile_metadata = self._decode_tile_metadata.get((phase, kind, bs))
-        if tile_metadata is not None:
-            return tile_metadata
-        if get_mla_metadata is error_fn:
-            raise RuntimeError(
-                "DeepSeek V4 decode requires FlashMLA latent attention. "
-                "Build/install `tokenspeed-kernel/python` with FlashMLA."
-            )
-        tile_metadata = get_mla_metadata()[0]
-        self._decode_tile_metadata[(phase, kind, bs)] = tile_metadata
-        return tile_metadata
-
     def _fp8_ds_mla_cache_view(
         self,
         cache_2d: torch.Tensor,
@@ -1020,12 +1003,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 f"metadata_tokens={metadata.token_to_req_indices.numel()}, "
                 f"q_tokens={q.shape[0]}"
             )
-        if flash_mla_with_kvcache is error_fn:
-            raise RuntimeError(
-                "DeepSeek V4 decode requires FlashMLA latent attention. "
-                "Build/install `tokenspeed-kernel/python` with FlashMLA."
-            )
-
         if q.shape[1] == padded_heads:
             q_padded = q.contiguous()
         else:
@@ -1071,27 +1048,17 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 compressed_block_size,
             )
 
-        out, _ = flash_mla_with_kvcache(
-            q=q_padded.unsqueeze(1),
-            k_cache=swa_cache,
-            block_table=None,
-            cache_seqlens=None,
-            head_dim_v=head_dim,
-            tile_scheduler_metadata=self._get_decode_tile_metadata(
-                kind,
-                q_padded.shape[0],
-            ),
+        out = tokenspeed_kernel.dsv4_sparse_mla_decode(
+            q=q_padded,
+            swa_kv_cache=swa_cache,
+            swa_indices=swa_indices,
+            swa_topk_lens=swa_lens,
+            compressed_kv_cache=compressed_cache,
+            compressed_indices=extra_indices,
+            compressed_topk_lens=extra_lens,
             softmax_scale=softmax_scale,
-            is_fp8_kvcache=True,
-            indices=swa_indices.unsqueeze(1),
-            attn_sink=attn_sink,
-            extra_k_cache=compressed_cache,
-            extra_indices_in_kvcache=extra_indices,
-            topk_length=swa_lens,
-            extra_topk_length=extra_lens,
+            sinks=attn_sink,
         )
-        if out.dim() == 4:
-            out = out.squeeze(1)
         return out[:, :num_local_heads]
 
     def forward_deepseek_v4_mixed(
@@ -1462,11 +1429,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         metadata = self.forward_metadata
         if metadata is None:
             raise RuntimeError("DeepSeek V4 prefill requires forward metadata")
-        if flash_mla_sparse_fwd is error_fn:
-            raise RuntimeError(
-                "DeepSeek V4 prefill requires FlashMLA sparse attention. "
-                "Build/install `tokenspeed-kernel/python` with FlashMLA."
-            )
 
         with nvtx_range(f"attn_{kind}_prefill_pad_q"):
             if q.shape[1] == padded_heads:
@@ -1478,6 +1440,55 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                     device=q.device,
                 )
                 q_padded[:, : q.shape[1]].copy_(q)
+
+        if _use_flashinfer_sm120_sparse_mla():
+            with nvtx_range(f"attn_{kind}_prefill_sparse_metadata"):
+                swa_block_size = token_to_kv_pool.swa_block_size
+                swa_indices, swa_lens = self._update_decode_swa_metadata(
+                    metadata,
+                    window_size=window_size,
+                    block_size=swa_block_size,
+                )
+                compressed_block_size = token_to_kv_pool.get_compressed_block_size(
+                    layer_id
+                )
+                extra_indices, extra_lens = (
+                    self._decode_compressed_attention_indices_and_lens(
+                        positions,
+                        compress_ratio=compress_ratio,
+                        block_size=compressed_block_size,
+                        topk_indices=topk_indices,
+                    )
+                )
+                swa_cache = self._fp8_ds_mla_cache_view(
+                    token_to_kv_pool.get_swa_kv_buffer(layer_id),
+                    swa_block_size,
+                )
+                compressed_cache = None
+                if compress_ratio > 1:
+                    compressed_cache = self._fp8_ds_mla_cache_view(
+                        token_to_kv_pool.get_compressed_kv_buffer_2d(layer_id),
+                        compressed_block_size,
+                    )
+            with nvtx_range(f"attn_{kind}_prefill_flashinfer"):
+                out = tokenspeed_kernel.dsv4_sparse_mla_decode(
+                    q=q_padded,
+                    swa_kv_cache=swa_cache,
+                    swa_indices=swa_indices,
+                    swa_topk_lens=swa_lens,
+                    compressed_kv_cache=compressed_cache,
+                    compressed_indices=extra_indices,
+                    compressed_topk_lens=extra_lens,
+                    softmax_scale=softmax_scale,
+                    sinks=attn_sink,
+                )
+            return out[:, :num_local_heads]
+
+        if flash_mla_sparse_fwd is error_fn:
+            raise RuntimeError(
+                "DeepSeek V4 prefill requires FlashMLA sparse attention. "
+                "Build/install `tokenspeed-kernel/python` with FlashMLA."
+            )
         with nvtx_range(f"attn_{kind}_prefill_workspace"):
             kv_workspace, indices, lens = self._prefill_workspace(
                 positions=positions,
@@ -1612,7 +1623,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         overlap_schedule_depth: int = 0,
     ):
         del seq_lens_buf
-        self._decode_tile_metadata = {}
         self._cuda_graph_max_tokens_per_req = max(
             1,
             int(max_tokens_per_req),
@@ -2086,7 +2096,6 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         _refresh_decode_indexer_schedule_metadata(metadata)
         self.forward_decode_metadata = metadata
         self.forward_metadata = metadata
-        self._decode_tile_metadata = {}
 
     def forward_decode(self, *args, **kwargs):
         raise NotImplementedError("DeepSeek V4 uses the model-local attention forward")

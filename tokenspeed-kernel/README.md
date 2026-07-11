@@ -34,7 +34,7 @@ choices (still evolving; subject to change):
 ### Layered system
 
 ```
-                       public API  (mha_prefill, mm, moe_fused, ...)
+                       public API  (mha_prefill, mm, mhc_pre, moe_apply, ...)
                                        │
                            ┌───────────┴───────────┐
                            │     select_kernel     │  (family, mode, format_signature, traits, ...)
@@ -45,7 +45,7 @@ choices (still evolving; subject to change):
                             └──────────┬──────────┘
                                        │
        ┌──────────────┬────────────────┼────────────────┬───────────────┐
-   attention         gemm             moe             norm     ...   (op family)
+   attention         gemm             mhc             moe      ...   (op family)
        │              │                │                │
   ┌────┼────┐    ┌────┼────┐      ┌────┼────┐      ┌────┼────┐
   triton         triton           triton           triton             ← in-tree portable JIT
@@ -80,6 +80,7 @@ tokenspeed_kernel/
   ops/
     attention/   { triton/, flash_attn/, ... }
     gemm/        { triton.py, trtllm.py, ... }
+    mhc/         { deep_gemm.py, ... }
     moe/         { triton.py, deepep.py, triton_kernels.py, ... }
     ...
 
@@ -132,12 +133,19 @@ backends. See `tokenspeed_kernel/plugins/README.md`.
 ```python
 from tokenspeed_kernel import (
     mha_prefill, mha_prefill_with_kvcache, mha_decode_with_kvcache,
+    dsv4_sparse_mla_decode,
     gdn_chunk_prefill,
     mm,
+    mhc_pre, mhc_post,
     moe_route, moe_dispatch, moe_experts, moe_combine, moe_fused,
     ...
 )
 ```
+
+`dsv4_sparse_mla_decode` keeps the model runtime independent of the vendor
+library: H100/B200 use the existing FlashMLA solution, while SM120 selects the
+FlashInfer 0.6.14 sparse MLA solution over the same packed SWA/compressed-cache
+contract.
 
 Using the above platform and solution-agnostic public APIs can get the most
 value out of TokenSpeed-kernel; but one can also directly call into a

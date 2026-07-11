@@ -34,6 +34,9 @@ from tokenspeed_kernel.ops.sampling.cute_dsl import (
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
+from tokenspeed.runtime.distributed.comm_backend.triton_rsag import (
+    supports_triton_rsag,
+)
 from tokenspeed.runtime.distributed.comm_ops import all_gather_into_tensor
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -286,7 +289,7 @@ class LogitsProcessor(nn.Module):
         )
 
     def _init_all_gather_state(self, lm_head: VocabParallelEmbedding):
-        if not current_platform().is_nvidia:
+        if not current_platform().is_nvidia or not supports_triton_rsag():
             return None
 
         if self.tp_size == 1 or self.skip_all_gather:
@@ -307,7 +310,7 @@ class LogitsProcessor(nn.Module):
         return self._LOGITS_AG_STATES[key]
 
     def _init_dist_argmax_state(self, lm_head: VocabParallelEmbedding):
-        if not current_platform().is_nvidia:
+        if not current_platform().is_nvidia or not supports_triton_rsag():
             return None
 
         if self.tp_size == 1 or self.skip_all_gather or self.dp_sampling_enabled:

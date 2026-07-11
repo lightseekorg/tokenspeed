@@ -45,8 +45,10 @@ except ImportError:
 
 from tokenspeed_kernel.ops.attention.cuda.deepseek_v4 import (
     has_indexer_mxfp4_paged_gather,
+    has_indexer_topk_prefill,
     has_persistent_topk,
     indexer_mxfp4_paged_gather,
+    indexer_topk_prefill,
     persistent_topk,
 )
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
@@ -712,6 +714,44 @@ def _deepseek_v4_indexer_topk_from_logits(
     return topk
 
 
+def _deepseek_v4_launch_indexer_topk_prefill(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    output: torch.Tensor,
+    topk_tokens: int,
+) -> None:
+    """Launch the architecture-compatible DeepSeek V4 prefill selector."""
+
+    if _platform.is_nvidia and _platform.arch_version.major == 12:
+        if not has_indexer_topk_prefill():
+            raise RuntimeError(
+                "DeepSeek V4 prefill indexer on SM120 requires the "
+                "TokenSpeed CUDA prefill top-k op"
+            )
+        indexer_topk_prefill(
+            logits,
+            row_starts,
+            row_ends,
+            output,
+            topk_tokens,
+        )
+        return
+
+    trtllm_ops = getattr(torch.ops, "trtllm", None)
+    if trtllm_ops is None or not hasattr(trtllm_ops, "indexer_topk_prefill"):
+        raise RuntimeError(
+            "DeepSeek V4 prefill indexer requires the CUDA prefill top-k op"
+        )
+    trtllm_ops.indexer_topk_prefill(
+        logits,
+        row_starts,
+        row_ends,
+        output,
+        topk_tokens,
+    )
+
+
 def _deepseek_v4_indexer_topk_from_logits_prefill_op(
     logits: torch.Tensor,
     length_rows: torch.Tensor,
@@ -721,15 +761,10 @@ def _deepseek_v4_indexer_topk_from_logits_prefill_op(
     row_ends: torch.Tensor | None = None,
     out: torch.Tensor,
 ) -> torch.Tensor:
-    """Use the local TRT-LLM CUDA prefill selector."""
+    """Use the architecture-compatible CUDA prefill selector."""
 
     if not logits.is_cuda or logits.dtype != torch.float32:
         raise RuntimeError("DeepSeek V4 prefill indexer requires CUDA float32 logits")
-    trtllm_ops = getattr(torch.ops, "trtllm", None)
-    if trtllm_ops is None or not hasattr(trtllm_ops, "indexer_topk_prefill"):
-        raise RuntimeError(
-            "DeepSeek V4 prefill indexer requires the CUDA prefill top-k op"
-        )
 
     num_rows = length_rows.numel()
     if num_rows == 0:
@@ -767,7 +802,7 @@ def _deepseek_v4_indexer_topk_from_logits_prefill_op(
 
     topk = out[:num_rows]
     topk.fill_(-1)
-    trtllm_ops.indexer_topk_prefill(
+    _deepseek_v4_launch_indexer_topk_prefill(
         logits,
         row_starts_for_kernel,
         row_ends_for_kernel,
@@ -1379,6 +1414,7 @@ def _deepseek_v4_indexer_topk_prefill_deepgemm(
     use_prefill_topk_op: bool,
     gathered_k: tuple[torch.Tensor, torch.Tensor] | None = None,
     gather_workspace: tuple[torch.Tensor, torch.Tensor] | None = None,
+    out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
     q_values, q_scales = index_q
     if not _deepseek_v4_deepgemm_fp4_indexer_available(q_values):
@@ -1429,15 +1465,14 @@ def _deepseek_v4_indexer_topk_prefill_deepgemm(
         )
 
     with nvtx_range("indexer_topk_prefill_select"):
-        return (
-            _deepseek_v4_indexer_topk_from_logits(
-                logits,
-                row_lens,
-                topk_tokens,
-                use_prefill_topk_op=use_prefill_topk_op,
-            ),
-            gathered_k,
+        topk = _deepseek_v4_indexer_topk_from_logits(
+            logits,
+            row_lens,
+            topk_tokens,
+            use_prefill_topk_op=use_prefill_topk_op,
+            out=out,
         )
+        return topk, gathered_k
 
 
 def _deepseek_v4_indexer_topk_from_cache_deepgemm_decode(
@@ -1640,6 +1675,11 @@ def _deepseek_v4_sparse_attn_indexer_native(
                     raise RuntimeError(
                         "DeepSeek V4 sparse indexer prefill metadata is incomplete"
                     )
+                direct_out = (
+                    topk_out[token_start:token_end]
+                    if _platform.is_nvidia and _platform.arch_version.major == 12
+                    else None
+                )
                 topk, next_gathered_k = _deepseek_v4_indexer_topk_prefill_deepgemm(
                     cache_2d=cache_2d,
                     block_table=block_table[req_start:req_end],
@@ -1658,11 +1698,13 @@ def _deepseek_v4_sparse_attn_indexer_native(
                     use_prefill_topk_op=True,
                     gathered_k=reuse_k,
                     gather_workspace=gather_workspace,
+                    out=direct_out,
                 )
                 if next_gathered_k is not None:
                     gather_cache_key = key
                     gathered_k = next_gathered_k
-            topk_out[token_start:token_end].copy_(topk)
+            if direct_out is None:
+                topk_out[token_start:token_end].copy_(topk)
 
     def fill_decode() -> None:
         if num_decode_tokens <= 0:

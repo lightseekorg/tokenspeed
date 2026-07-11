@@ -65,6 +65,7 @@ __all__ = [
     "mla_decode_with_kvcache",
     "dsa_prefill",
     "dsa_decode",
+    "dsv4_sparse_mla_decode",
     "dsa_prefill_topk",
     "dsa_decode_topk",
     "dsa_plan",
@@ -742,6 +743,131 @@ def mla_decode_with_kvcache(
 # ===-----------------------------------------------------------------------===#
 # DSA Kernels
 # ===-----------------------------------------------------------------------===#
+
+
+def dsv4_sparse_mla_decode(
+    q: torch.Tensor,
+    swa_kv_cache: torch.Tensor,
+    swa_indices: torch.Tensor,
+    swa_topk_lens: torch.Tensor,
+    *,
+    compressed_kv_cache: torch.Tensor | None = None,
+    compressed_indices: torch.Tensor | None = None,
+    compressed_topk_lens: torch.Tensor | None = None,
+    softmax_scale: float,
+    sinks: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> torch.Tensor:
+    """Run DeepSeek V4 sparse MLA over SWA and compressed KV pools.
+
+    FlashInfer 0.6.14 auto-dispatches SM120 calls with more than 64 query
+    tokens to its sparse MLA prefill kernel; smaller calls use sparse decode.
+
+    Args:
+        q: BF16 decode or prefill query shaped ``[tokens, heads, 512]``.
+        swa_kv_cache: Packed ``fp8_ds_mla`` SWA pool shaped
+            ``[pages, 64, 1, 584]`` (NHD layout). A padded physical page stride
+            is allowed.
+        swa_indices: Global SWA slot ids shaped ``[tokens, topk]`` or
+            ``[tokens, 1, topk]``.
+        swa_topk_lens: Active SWA entry count per token, shaped ``[tokens]``.
+        compressed_kv_cache: Optional packed compressed pool in the same NHD
+            layout. DeepSeek V4 C4A uses 64 rows per page and C128A uses 2.
+        compressed_indices: Optional global compressed-pool slot ids.
+        compressed_topk_lens: Active compressed entry count per token.
+        softmax_scale: Scale applied to QK logits.
+        sinks: Optional FP32 attention sink, shaped ``[heads]``.
+        out: Optional BF16 output buffer shaped like ``q``.
+        override: Optional exact kernel override name.
+        solution: Optional kernel solution selected through the registry.
+
+    Returns:
+        BF16 attention output shaped like ``q``.
+    """
+    if q.dim() != 3:
+        raise ValueError(f"q must be [tokens, heads, 512], got {tuple(q.shape)}")
+    if swa_kv_cache.dim() != 4 or swa_kv_cache.shape[2] != 1:
+        raise ValueError(
+            "swa_kv_cache must use NHD [pages, page_size, 1, bytes] layout, "
+            f"got {tuple(swa_kv_cache.shape)}"
+        )
+    compressed_args = (
+        compressed_kv_cache,
+        compressed_indices,
+        compressed_topk_lens,
+    )
+    if any(value is None for value in compressed_args) and any(
+        value is not None for value in compressed_args
+    ):
+        raise ValueError(
+            "compressed_kv_cache, compressed_indices, and "
+            "compressed_topk_lens must be provided together"
+        )
+    if compressed_kv_cache is not None and (
+        compressed_kv_cache.dim() != 4 or compressed_kv_cache.shape[2] != 1
+    ):
+        raise ValueError(
+            "compressed_kv_cache must use NHD [pages, page_size, 1, bytes] "
+            f"layout, got {tuple(compressed_kv_cache.shape)}"
+        )
+
+    compressed_page_size = (
+        0 if compressed_kv_cache is None else int(compressed_kv_cache.shape[1])
+    )
+    traits = {
+        "head_dim": int(q.shape[-1]),
+        "swa_page_size": int(swa_kv_cache.shape[1]),
+        "compressed_page_size": compressed_page_size,
+        "support_sinks": sinks is not None,
+    }
+    signature = _attention_format_signature(q=q)
+    kernel = select_kernel(
+        "attention",
+        "dsv4_sparse_mla_decode",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+    shape_params = {
+        "tokens": int(q.shape[0]),
+        "num_heads": int(q.shape[1]),
+        "head_dim": int(q.shape[2]),
+        "swa_topk": int(swa_indices.shape[-1]),
+        "compressed_topk": (
+            0 if compressed_indices is None else int(compressed_indices.shape[-1])
+        ),
+        "swa_page_size": int(swa_kv_cache.shape[1]),
+        "compressed_page_size": compressed_page_size,
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "dsv4_sparse_mla_decode",
+        kernel.name,
+        q.dtype,
+        shape_params,
+    )
+    with kernel_scope(
+        "attention",
+        "dsv4_sparse_mla_decode",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            q=q,
+            swa_kv_cache=swa_kv_cache,
+            swa_indices=swa_indices,
+            swa_topk_lens=swa_topk_lens,
+            compressed_kv_cache=compressed_kv_cache,
+            compressed_indices=compressed_indices,
+            compressed_topk_lens=compressed_topk_lens,
+            softmax_scale=softmax_scale,
+            sinks=sinks,
+            out=out,
+        )
 
 
 def dsa_decode(

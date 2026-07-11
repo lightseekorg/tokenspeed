@@ -31,6 +31,7 @@ from tokenspeed_kernel.ops.attention import (
     dsa_plan,
     dsa_prefill,
     dsa_prefill_topk,
+    dsv4_sparse_mla_decode,
     gdn_chunk_prefill,
     mha_decode_with_kvcache,
     mha_extend_with_kvcache,
@@ -40,6 +41,7 @@ from tokenspeed_kernel.ops.attention import (
     mla_prefill,
 )
 from tokenspeed_kernel.ops.gemm import mm
+from tokenspeed_kernel.ops.mhc import mhc_plan, mhc_post, mhc_pre
 from tokenspeed_kernel.ops.moe import moe_apply, moe_plan, moe_process_weights
 from tokenspeed_kernel.ops.quantization import (
     quantize_fp8,
@@ -57,6 +59,10 @@ __all__ = [
     "NoKernelFoundError",
     # gemm
     "mm",
+    # mhc
+    "mhc_plan",
+    "mhc_pre",
+    "mhc_post",
     # attention
     "mha_plan",
     "mha_prefill",
@@ -66,6 +72,7 @@ __all__ = [
     "mla_decode_with_kvcache",
     "dsa_prefill",
     "dsa_decode",
+    "dsv4_sparse_mla_decode",
     "dsa_prefill_topk",
     "dsa_decode_topk",
     "dsa_plan",

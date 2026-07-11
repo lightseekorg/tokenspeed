@@ -46,6 +46,7 @@ cudnn_batch_prefill_with_kv_cache = error_fn
 trtllm_batch_context_with_kv_cache = error_fn
 trtllm_batch_decode_with_kv_cache = error_fn
 trtllm_batch_decode_with_kv_cache_mla = error_fn
+trtllm_batch_decode_sparse_mla_dsv4 = error_fn
 trtllm_ragged_attention_deepseek = error_fn
 
 if platform.is_nvidia:
@@ -62,9 +63,10 @@ if platform.is_nvidia:
         trtllm_ragged_attention_deepseek,
     )
 
-if platform.is_blackwell:
+if platform.is_blackwell_plus:
     from flashinfer.mla import (
         BatchMLAPagedAttentionWrapper,
+        trtllm_batch_decode_sparse_mla_dsv4,
         trtllm_batch_decode_with_kv_cache_mla,
     )
 
@@ -123,6 +125,65 @@ def _topk_lens_or_count(
     if topk_lens is not None:
         return topk_lens.to(device=topk_slots.device, dtype=torch.int32).contiguous()
     return (topk_slots >= 0).sum(dim=-1, dtype=torch.int32).contiguous()
+
+
+def _flashinfer_dsv4_sparse_mla_decode(
+    q: torch.Tensor,
+    swa_kv_cache: torch.Tensor,
+    swa_indices: torch.Tensor,
+    swa_topk_lens: torch.Tensor,
+    compressed_kv_cache: torch.Tensor | None,
+    compressed_indices: torch.Tensor | None,
+    compressed_topk_lens: torch.Tensor | None,
+    softmax_scale: float,
+    sinks: torch.Tensor | None,
+    out: torch.Tensor | None,
+) -> torch.Tensor:
+    if trtllm_batch_decode_sparse_mla_dsv4 is error_fn:
+        raise RuntimeError(
+            "FlashInfer was built without the SM120 DeepSeek V4 sparse MLA API"
+        )
+    return trtllm_batch_decode_sparse_mla_dsv4(
+        query=q,
+        swa_kv_cache=swa_kv_cache,
+        workspace_buffer=_get_dsa_sparse_workspace(q.device),
+        sparse_indices=swa_indices,
+        compressed_kv_cache=compressed_kv_cache,
+        swa_topk_lens=swa_topk_lens,
+        extra_sparse_indices=compressed_indices,
+        extra_sparse_topk_lens=compressed_topk_lens,
+        out=out,
+        bmm1_scale=float(softmax_scale),
+        bmm2_scale=1.0,
+        sinks=sinks,
+        kv_layout="NHD",
+    )
+
+
+if (
+    platform.is_nvidia
+    and platform.arch_version >= ArchVersion(12, 0)
+    and trtllm_batch_decode_sparse_mla_dsv4 is not error_fn
+):
+    register_kernel(
+        "attention",
+        "dsv4_sparse_mla_decode",
+        name="flashinfer_dsv4_sparse_mla_decode",
+        solution="flashinfer",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(12, 0),
+            max_arch_version=ArchVersion(12, 99),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=frozenset({format_signature(q=dense_tensor_format(torch.bfloat16))}),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "head_dim": frozenset({512}),
+            "swa_page_size": frozenset({64}),
+            "compressed_page_size": frozenset({0, 2, 64}),
+            "support_sinks": frozenset({False, True}),
+        },
+    )(_flashinfer_dsv4_sparse_mla_decode)
 
 
 if platform.is_nvidia and platform.is_hopper_plus:
@@ -435,5 +496,6 @@ __all__ = [
     "trtllm_batch_context_with_kv_cache",
     "trtllm_batch_decode_with_kv_cache",
     "trtllm_batch_decode_with_kv_cache_mla",
+    "trtllm_batch_decode_sparse_mla_dsv4",
     "trtllm_ragged_attention_deepseek",
 ]
