@@ -236,7 +236,10 @@ def test_mxfp4_cutlass_plan_is_available_on_sm120(
         registry.clear_cache()
 
 
-def test_mxfp4_cutlass_preprocessor_preserves_checkpoint_values() -> None:
+@pytest.mark.parametrize("w13_layout", ["concatenated", "interleaved"])
+def test_mxfp4_cutlass_preprocessor_preserves_checkpoint_values(
+    w13_layout: str,
+) -> None:
     if not hasattr(_moe_cutlass_mxfp4, "flashinfer_cutlass_mxfp4_moe_weights"):
         pytest.skip("FlashInfer CUTLASS MXFP4 is NVIDIA-only")
 
@@ -275,29 +278,42 @@ def test_mxfp4_cutlass_preprocessor_preserves_checkpoint_values() -> None:
     )
     module.swiglu_arg = SimpleNamespace(alpha=None, limit=7.0)
     module.swiglu_beta = None
+    module.w13_input_layout = w13_layout
 
     original_weight = module.w13_weight.detach().clone()
     original_scale = module.w13_weight_scale.detach().clone()
     original_bias = module.w13_weight_bias.detach().clone()
     _moe_cutlass_mxfp4.flashinfer_cutlass_mxfp4_moe_weights({}, module)
 
-    assert torch.equal(
-        module.w13_weight,
-        torch.cat((original_weight[:, 128:], original_weight[:, :128]), dim=1),
-    )
-    assert torch.equal(
-        module.w13_weight_bias,
-        torch.cat((original_bias[:, 128:], original_bias[:, :128]), dim=1),
-    )
+    if w13_layout == "concatenated":
+        expected_weight = torch.cat(
+            (original_weight[:, 128:], original_weight[:, :128]), dim=1
+        )
+        expected_scale = torch.cat(
+            (original_scale[:, 128:], original_scale[:, :128]), dim=1
+        )
+        expected_bias = torch.cat(
+            (original_bias[:, 128:], original_bias[:, :128]), dim=1
+        )
+    else:
+        expected_weight = (
+            original_weight.reshape(1, 128, 2, 64).flip(2).reshape_as(original_weight)
+        )
+        expected_scale = (
+            original_scale.reshape(1, 128, 2, 4).flip(2).reshape_as(original_scale)
+        )
+        expected_bias = (
+            original_bias.reshape(1, 128, 2).flip(2).reshape_as(original_bias)
+        )
+
+    assert torch.equal(module.w13_weight, expected_weight)
+    assert torch.equal(module.w13_weight_bias, expected_bias)
     unswizzled_scale = (
         module.w13_weight_scale.reshape(1, 2, 1, 32, 4, 4)
         .permute(0, 1, 4, 3, 2, 5)
         .reshape(1, 256, 4)
     )
-    assert torch.equal(
-        unswizzled_scale,
-        torch.cat((original_scale[:, 128:], original_scale[:, :128]), dim=1),
-    )
+    assert torch.equal(unswizzled_scale, expected_scale)
     assert module.w13_weight_scale.view(torch.int32).shape == (1, 256, 1)
     assert torch.equal(module.w13_weight_global_scale, torch.ones(1))
     assert torch.equal(module.w2_weight_global_scale, torch.ones(1))

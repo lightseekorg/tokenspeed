@@ -33,12 +33,20 @@ platform = current_platform()
 next_power_of_2 = lambda value: 1 if value <= 1 else 1 << (value - 1).bit_length()
 
 
-def _swap_halves(x: torch.Tensor, dim: int) -> torch.Tensor:
+def _reorder_w13(x: torch.Tensor, layout: str, dim: int) -> torch.Tensor:
+    if dim < 0:
+        dim += x.dim()
     size = x.shape[dim]
     if size % 2 != 0:
         raise ValueError(f"expected even size in dim {dim}, got {size}")
-    first, second = x.split(size // 2, dim=dim)
-    return torch.cat((second, first), dim=dim).contiguous()
+    if layout == "concatenated":
+        first, second = x.split(size // 2, dim=dim)
+        return torch.cat((second, first), dim=dim).contiguous()
+    if layout == "interleaved":
+        shape = list(x.shape)
+        paired_shape = shape[:dim] + [size // 2, 2] + shape[dim + 1 :]
+        return x.reshape(paired_shape).flip(dim + 1).reshape(shape).contiguous()
+    raise ValueError(f"unknown w13_input_layout: {layout!r}")
 
 
 def _swizzle_mxfp4_block_scales(scales: torch.Tensor) -> torch.Tensor:
@@ -107,10 +115,10 @@ if platform.is_nvidia:
                 f"sizes divisible by 128, got {hidden_size} and {intermediate_size}"
             )
 
-        # TokenSpeed checkpoints store [w1 (gate) | w3 (up)]. FlashInfer's
-        # CUTLASS SwiGLU path consumes [w3 (up) | w1 (gate)].
-        w13_weight = _swap_halves(w.w13_weight.data, 1)
-        w13_scale = _swap_halves(w.w13_weight_scale.data, 1)
+        # FlashInfer's CUTLASS SwiGLU path consumes w3 before w1.
+        w13_layout = getattr(w, "w13_input_layout", "concatenated")
+        w13_weight = _reorder_w13(w.w13_weight.data, w13_layout, 1)
+        w13_scale = _reorder_w13(w.w13_weight_scale.data, w13_layout, 1)
         w2_weight = w.w2_weight.data.contiguous()
         w2_scale = w.w2_weight_scale.data.contiguous()
 
@@ -127,7 +135,7 @@ if platform.is_nvidia:
 
         if hasattr(w, "w13_weight_bias"):
             w.w13_weight_bias = torch.nn.Parameter(
-                _swap_halves(w.w13_weight_bias.data, 1),
+                _reorder_w13(w.w13_weight_bias.data, w13_layout, 1),
                 requires_grad=False,
             )
         if hasattr(w, "w2_weight_bias"):
