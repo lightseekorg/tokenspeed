@@ -18,6 +18,7 @@ from pipeline import (
     is_amd_runner,
     is_gb200_runner,
     is_nvidia_arm_runner,
+    isolate_ci_venv_environment,
     resolve_score_threshold_for_runner,
     runner_matches_group,
     should_run_nvidia_gpu_cleanup,
@@ -30,6 +31,37 @@ def test_ci_venv_does_not_inherit_runner_packages():
 
     assert command == "python3 -m venv /tmp/ci-env-test"
     assert "--system-site-packages" not in command
+
+
+def test_ci_venv_environment_filters_only_host_python_paths():
+    env = {
+        "PATH": "/usr/local/bin:/usr/bin",
+        "PYTHONHOME": "/usr/local",
+        "PYTHONPATH": "/usr/local/lib/python3.12/site-packages",
+        "LD_LIBRARY_PATH": (
+            "/usr/local/lib/python3.12/site-packages/torch/lib:"
+            "/root/.local/lib/python3.12/site-packages/torch/lib:"
+            "/usr/local/cuda/lib64:/usr/lib/aarch64-linux-gnu"
+        ),
+    }
+
+    isolated = isolate_ci_venv_environment(env)
+
+    assert isolated["PATH"] == env["PATH"]
+    assert isolated["PYTHONNOUSERSITE"] == "1"
+    assert "PYTHONHOME" not in isolated
+    assert "PYTHONPATH" not in isolated
+    assert isolated["LD_LIBRARY_PATH"] == (
+        "/usr/local/cuda/lib64:/usr/lib/aarch64-linux-gnu"
+    )
+
+
+def test_ci_venv_environment_drops_empty_library_path():
+    isolated = isolate_ci_venv_environment(
+        {"LD_LIBRARY_PATH": "/usr/lib/python3/dist-packages/torch/lib"}
+    )
+
+    assert "LD_LIBRARY_PATH" not in isolated
 
 
 def test_stale_process_patterns_match_smg_router_proctitle():
