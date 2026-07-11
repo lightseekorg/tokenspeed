@@ -26,6 +26,8 @@ SM=${SM:-sm100}
 BUILD_AND_DOWNLOAD_PARALLEL=${BUILD_AND_DOWNLOAD_PARALLEL:-16}
 
 export MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL}
+export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
+export FLASHINFER_NVCC=${FLASHINFER_NVCC:-${CUDA_HOME}/bin/nvcc}
 export CPLUS_INCLUDE_PATH="/usr/local/cuda/include/cccl"
 export C_INCLUDE_PATH="/usr/local/cuda/include/cccl"
 
@@ -161,7 +163,7 @@ pin_version() {
     grep -E "^${pkg}==" "${CUDA_REQ}" | head -n1 | tr -d '[:space:]'
 }
 CUDA_MAJOR="${CUDA_VERSION%%.*}"
-PINNED_KERNEL_DEPS=()
+PINNED_KERNEL_DEPS=("protobuf>=6.30.2,<7")
 for pkg in nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-cu${CUDA_MAJOR} \
            flashinfer-python flashinfer-cubin; do
     spec="$(pin_version "${pkg}")"

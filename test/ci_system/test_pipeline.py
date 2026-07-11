@@ -33,6 +33,17 @@ def test_ci_venv_does_not_inherit_runner_packages():
     assert "--system-site-packages" not in command
 
 
+def test_cuda_jit_uses_system_toolkit_with_isolated_venv():
+    install_script = (Path(__file__).parent / "install_deps.sh").read_text()
+
+    assert "export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}" in install_script
+    assert (
+        "export FLASHINFER_NVCC=${FLASHINFER_NVCC:-${CUDA_HOME}/bin/nvcc}"
+        in install_script
+    )
+    assert 'PINNED_KERNEL_DEPS=("protobuf>=6.30.2,<7")' in install_script
+
+
 def test_ci_venv_environment_filters_only_host_python_paths():
     env = {
         "PATH": "/usr/local/bin:/usr/bin",
