@@ -189,6 +189,32 @@ class ValidateFlatSchedulerConfigTest(unittest.TestCase):
                 speculative_enabled=False,
             )
 
+    def test_hybrid_with_flat_capable_sub_backends_passes(self):
+        # The Qwen3.5 shape: hybrid wrapper over a flat-capable full backend
+        # and the mamba backend (declares uses_flat_cache_groups: it consumes
+        # the state group's table), pool publishing KV + state groups. The
+        # sub-backend recursion must not reject it.
+        class FlatFull:
+            uses_flat_cache_groups = True
+
+        class FlatMamba:
+            uses_flat_cache_groups = True
+
+        class FlatWrapper:
+            uses_flat_cache_groups = True
+
+            def __init__(self):
+                self.full_attn_backend = FlatFull()
+                self.linear_attn_backend = FlatMamba()
+
+        _pcs.validate_flat_scheduler_config(
+            flat_kvcache_ext=True,
+            paged_cache_groups=[FakeGroup(), FakeGroup()],
+            attn_backend=FlatWrapper(),
+            kv_pool=FakeMHAPool(),
+            speculative_enabled=False,
+        )
+
     def test_hybrid_sub_backend_recursed(self):
         # The hybrid wrapper is flat-capable, but its user-selectable full
         # sub-backend must be checked on its own: a table-blind sub-backend
