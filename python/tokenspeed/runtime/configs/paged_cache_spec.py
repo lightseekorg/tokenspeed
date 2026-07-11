@@ -123,19 +123,17 @@ def hybrid_slab_group_size(
     return sizes.pop()
 
 
-def _flat_backend_leaves(attn_backend: object) -> list[object]:
-    """The backends whose table consumption matters for flat safety: the
-    backend itself, plus composite sub-backends (hybrid routes per layer to
-    user-selectable sub-backends, so each must be checked on its own).
+def _flat_kv_backend(attn_backend: object) -> object:
+    """The backend whose KV-table consumption matters for flat safety: the
+    backend itself, or a composite's full-attention sub-backend (hybrid's
+    per-layer KV routing lives there and is user-selectable). The linear
+    side consumes only the state group's table through its own explicit
+    flat path and is out of scope here.
     """
-    leaves = []
-    for sub in (
-        getattr(attn_backend, "full_attn_backend", None),
-        getattr(attn_backend, "linear_attn_backend", None),
-    ):
-        if sub is not None:
-            leaves.extend(_flat_backend_leaves(sub))
-    return leaves or [attn_backend]
+    sub = getattr(attn_backend, "full_attn_backend", None)
+    if sub is not None:
+        return _flat_kv_backend(sub)
+    return attn_backend
 
 
 def validate_flat_scheduler_config(
@@ -154,34 +152,34 @@ def validate_flat_scheduler_config(
     if not flat_kvcache_ext:
         return
     pool_name = type(kv_pool).__name__
-    for backend in _flat_backend_leaves(attn_backend):
-        backend_name = type(backend).__name__
-        uses_paged = bool(getattr(backend, "uses_paged_cache_groups", False))
-        uses_flat = bool(getattr(backend, "uses_flat_cache_groups", False))
-        if uses_paged and not uses_flat:
-            raise RuntimeError(
-                "flat scheduler build (TOKENSPEED_FLAT_KVCACHE) does not support "
-                f"this model's cache layout yet: attention backend {backend_name} "
-                f"(KV pool {pool_name}) consumes paged-cache groups through the "
-                "radix scheduler's populate path, which the flat build compiles "
-                "out — CUDA graphs would silently replay against stale capture "
-                "placeholders. Use a radix-built tokenspeed_scheduler extension "
-                "for this model."
-            )
-        if len(paged_cache_groups) > 1 and not uses_flat:
-            # A table-blind backend on a multi-group pool would index every
-            # layer through the C++ single-table fallback (a first-group
-            # sample) — with slab-aliased layouts that silently corrupts KV
-            # past the sliding window. Refuse at startup instead.
-            raise RuntimeError(
-                "flat scheduler build (TOKENSPEED_FLAT_KVCACHE): KV pool "
-                f"{pool_name} publishes {len(paged_cache_groups)} cache groups "
-                f"but attention backend {backend_name} does not consume flat "
-                "per-group tables (uses_flat_cache_groups=False); the single-"
-                "table fallback would serve one group's pages to every layer, "
-                "silently corrupting KV. Pick a flat-capable attention backend "
-                "or use a radix-built tokenspeed_scheduler extension."
-            )
+    backend = _flat_kv_backend(attn_backend)
+    backend_name = type(backend).__name__
+    uses_paged = bool(getattr(backend, "uses_paged_cache_groups", False))
+    uses_flat = bool(getattr(backend, "uses_flat_cache_groups", False))
+    if uses_paged and not uses_flat:
+        raise RuntimeError(
+            "flat scheduler build (TOKENSPEED_FLAT_KVCACHE) does not support "
+            f"this model's cache layout yet: attention backend {backend_name} "
+            f"(KV pool {pool_name}) consumes paged-cache groups through the "
+            "radix scheduler's populate path, which the flat build compiles "
+            "out — CUDA graphs would silently replay against stale capture "
+            "placeholders. Use a radix-built tokenspeed_scheduler extension "
+            "for this model."
+        )
+    if len(paged_cache_groups) > 1 and not uses_flat:
+        # A table-blind backend on a multi-group pool would index every
+        # layer through the C++ single-table fallback (a first-group
+        # sample) — with slab-aliased layouts that silently corrupts KV
+        # past the sliding window. Refuse at startup instead.
+        raise RuntimeError(
+            "flat scheduler build (TOKENSPEED_FLAT_KVCACHE): KV pool "
+            f"{pool_name} publishes {len(paged_cache_groups)} cache groups "
+            f"but attention backend {backend_name} does not consume flat "
+            "per-group tables (uses_flat_cache_groups=False); the single-"
+            "table fallback would serve one group's pages to every layer, "
+            "silently corrupting KV. Pick a flat-capable attention backend "
+            "or use a radix-built tokenspeed_scheduler extension."
+        )
     if not paged_cache_groups:
         if speculative_enabled:
             cause = (
