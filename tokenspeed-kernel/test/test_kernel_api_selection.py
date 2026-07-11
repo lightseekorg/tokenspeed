@@ -287,14 +287,14 @@ def test_mxfp4_cutlass_preprocessor_preserves_checkpoint_values(
             (original_bias[:, 128:], original_bias[:, :128]), dim=1
         )
     else:
-        expected_weight = (
-            original_weight.reshape(1, 128, 2, 64).flip(2).reshape_as(original_weight)
+        expected_weight = torch.cat(
+            (original_weight[:, 1::2], original_weight[:, 0::2]), dim=1
         )
-        expected_scale = (
-            original_scale.reshape(1, 128, 2, 4).flip(2).reshape_as(original_scale)
+        expected_scale = torch.cat(
+            (original_scale[:, 1::2], original_scale[:, 0::2]), dim=1
         )
-        expected_bias = (
-            original_bias.reshape(1, 128, 2).flip(2).reshape_as(original_bias)
+        expected_bias = torch.cat(
+            (original_bias[:, 1::2], original_bias[:, 0::2]), dim=1
         )
 
     assert torch.equal(module.w13_weight, expected_weight)
