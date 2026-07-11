@@ -250,8 +250,8 @@ std::size_t Scheduler::RetractedSize() const {
 std::size_t Scheduler::AvailableKvPages() const {
 #if TOKENSPEED_FLAT_KVCACHE
     // The flat path never draws from the radix device_allocator_, so reporting it would show a
-    // permanently-full pool to Python monitoring. Report the flat BlockPool instead: one flat block
-    // is one page of block_size tokens, the same unit device_allocator_ uses. Block 0 is the
+    // permanently-full pool to Python monitoring. Report the flat BlockPool instead: one flat
+    // block is one pool row, interpreted at each group's own block_size. Block 0 is the
     // never-allocated null placeholder, so an idle pool reports total_pages - 1.
     return static_cast<std::size_t>(block_pool_.NumFreeBlocks());
 #else
