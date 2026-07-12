@@ -32,7 +32,7 @@ protected:
 
     SchedulerConfig MakeConfig() override {
         auto cfg = SchedulerTestSuite::MakeConfig();
-        cfg.page_size = 2;
+        cfg.block_size = 2;
         cfg.device_allocator.total_pages = 64;
         cfg.host_allocator.total_pages = 64;
         cfg.max_scheduled_tokens = 16;

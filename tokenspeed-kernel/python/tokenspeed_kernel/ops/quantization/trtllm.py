@@ -20,7 +20,11 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+)
 from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
@@ -64,6 +68,10 @@ if platform.is_nvidia:
         "fp8_with_scale",
         name="trtllm_quantize_fp8_with_scale",
         solution="trtllm",
+        capability=CapabilityRequirement(
+            max_arch_version=ArchVersion(10, 9),
+            vendors=frozenset({"nvidia"}),
+        ),
         signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
         traits={
             "granularity": frozenset({"tensor", "token", "token_group_128"}),

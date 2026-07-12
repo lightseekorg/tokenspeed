@@ -32,7 +32,7 @@ class TreeNode;
 class PageContainer {
 public:
     PageContainer(const TreeNode* device_node, const LocalKVAllocator* local_kv_allocator)
-        : node_{device_node}, local_kv_allocator_(local_kv_allocator){};
+        : node_{device_node}, local_kv_allocator_(local_kv_allocator) {}
 
     std::vector<std::int32_t> Pages() const;
 

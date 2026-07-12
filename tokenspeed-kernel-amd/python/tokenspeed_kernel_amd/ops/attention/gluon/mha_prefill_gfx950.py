@@ -32,6 +32,7 @@ from tokenspeed_kernel_amd.ops.attention.gluon.utils import (
     _INV_LN2_VALUE,
     _LN2,
     InputStrides,
+    attention_layouts,
     max,
     maximum,
 )
@@ -90,6 +91,7 @@ class AttentionConfig:
         HAS_LSE,
         WINDOW_LEFT,
         IS_FP8,
+        KV_DTYPE,
         q_strides,
         k_strides,
         v_strides,
@@ -97,43 +99,25 @@ class AttentionConfig:
         assert HEAD_DIM in (64, 128)
         assert NUM_WARPS == 4
 
-        instr_shape = [32, 32, 16]
-        qk_layout = gl.amd.AMDMFMALayout(
-            version=4,
-            instr_shape=instr_shape,
-            transposed=True,
-            warps_per_cta=[NUM_WARPS, 1],
-        )
-        pv_layout = gl.amd.AMDMFMALayout(
-            version=4,
-            instr_shape=instr_shape,
-            transposed=True,
-            warps_per_cta=[NUM_WARPS, 1],
-        )
-        # load_vec is the number of elements per lane, depends on the input dtype, same as qk_kw.
-        # load_threads is how many lanes span HEAD_DIM.
-        load_vec = 16 if IS_FP8 else 8
-        load_threads = HEAD_DIM // load_vec
-        load_layout = gl.BlockedLayout(
-            [1, load_vec], [64 // load_threads, load_threads], [4, 1], [1, 0]
-        )
-        # store_vec depends on the output dtype, always 16-bit regardless of input dtype, so 128 / 16 = 8.
-        # store_threads is how many lanes span HEAD_DIM.
-        store_vec = 8
-        store_threads = HEAD_DIM // store_vec
-        store_layout = gl.BlockedLayout(
-            [1, store_vec], [64 // store_threads, store_threads], [4, 1], [1, 0]
-        )
-        # Padding interval is 64 lanes * load_vec elems.
-        pad_interval = 64 * load_vec
-        # Empirically tuned.
-        pad_k = 16 if IS_FP8 else 8
-        pad_v = 16 if IS_FP8 else 32
-        k_smem_layout = gl.PaddedSharedLayout.with_identity_for(
-            [[pad_interval, pad_k]], [BLOCK_N, HEAD_DIM], [1, 0]
-        )
-        v_smem_layout = gl.PaddedSharedLayout.with_identity_for(
-            [[pad_interval, pad_v]], [BLOCK_N, HEAD_DIM], [1, 0]
+        # Prefill uses a [32, 32, 16] MFMA with NUM_WARPS warp tiling.
+        (
+            qk_layout,
+            pv_layout,
+            q_layout,
+            k_layout,
+            p_layout,
+            v_layout,
+            load_layout,
+            store_layout,
+            k_smem_layout,
+            v_smem_layout,
+        ) = attention_layouts(
+            HEAD_DIM,
+            BLOCK_N,
+            IS_FP8,
+            KV_DTYPE,
+            num_warps=NUM_WARPS,
+            instr_shape=[32, 32, 16],
         )
         self.N_HEADS = gl.constexpr(N_HEADS)
         self.N_KV_HEADS = gl.constexpr(N_KV_HEADS)
@@ -154,14 +138,6 @@ class AttentionConfig:
         self.v_strides = v_strides
         self.qk_layout = gl.constexpr(qk_layout)
         self.pv_layout = gl.constexpr(pv_layout)
-        # qk_kw is derived from a 128-bit load / dtype bitwidth.
-        # pv_kw is empirically tuned.
-        qk_kw = 16 if IS_FP8 else 8
-        pv_kw = 16 if IS_FP8 else 4
-        q_layout = gl.DotOperandLayout(0, qk_layout, k_width=qk_kw)
-        k_layout = gl.DotOperandLayout(1, qk_layout, k_width=qk_kw)
-        p_layout = gl.DotOperandLayout(0, pv_layout, k_width=pv_kw)
-        v_layout = gl.DotOperandLayout(1, pv_layout, k_width=pv_kw)
         self.q_layout = gl.constexpr(q_layout)
         self.k_layout = gl.constexpr(k_layout)
         self.p_layout = gl.constexpr(p_layout)
@@ -861,7 +837,7 @@ def process_sliding_attention_tile(
 
 
 @gluon.jit
-def _mha_prefill_fp16(
+def _mha_prefill(
     q_ptr,
     k_ptr,
     v_ptr,
@@ -905,6 +881,7 @@ def _mha_prefill_fp16(
         HAS_LSE,
         -1,
         IS_FP8,
+        k_ptr.dtype.element_ty,
         InputStrides(Q_STRIDE_T, Q_STRIDE_H, Q_STRIDE_D),
         InputStrides(K_STRIDE_T, K_STRIDE_H, K_STRIDE_D),
         InputStrides(V_STRIDE_T, V_STRIDE_H, V_STRIDE_D),
@@ -948,7 +925,7 @@ def _mha_prefill_fp16(
 
 
 @gluon.jit
-def _mha_prefill_sliding_fp16(
+def _mha_prefill_sliding(
     q_ptr,
     k_ptr,
     v_ptr,
@@ -992,6 +969,7 @@ def _mha_prefill_sliding_fp16(
         HAS_LSE,
         WINDOW_LEFT,
         IS_FP8,
+        k_ptr.dtype.element_ty,
         InputStrides(Q_STRIDE_T, Q_STRIDE_H, Q_STRIDE_D),
         InputStrides(K_STRIDE_T, K_STRIDE_H, K_STRIDE_D),
         InputStrides(V_STRIDE_T, V_STRIDE_H, V_STRIDE_D),
@@ -1106,7 +1084,7 @@ def gluon_mha_prefill_gfx950(
     sink_arg = sinks if sinks is not None else q
     lse_arg = lse if lse is not None else q
 
-    kernel = _mha_prefill_sliding_fp16 if config.window_left >= 0 else _mha_prefill_fp16
+    kernel = _mha_prefill_sliding if config.window_left >= 0 else _mha_prefill
     kernel[config.grid](
         q,
         k,

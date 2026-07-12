@@ -31,6 +31,7 @@ from tokenspeed_kernel_amd.ops.attention.gluon.utils import (
     _INV_LN2,
     _INV_LN2_VALUE,
     InputStrides,
+    attention_layouts,
     max,
     maximum,
 )
@@ -92,6 +93,7 @@ class AttentionConfig:
         IS_SLIDING,
         WINDOW_LEFT,
         IS_FP8,
+        KV_DTYPE,
         q_strides,
     ):
         assert NUM_Q_HEADS % NUM_KV_HEADS == 0
@@ -102,48 +104,27 @@ class AttentionConfig:
         else:
             assert WINDOW_LEFT == -1
 
-        mfma_layout = gl.amd.AMDMFMALayout(
-            version=4,
+        # Decode uses a [16, 16, 32] MFMA with 1-warp tiling.
+        (
+            qk_layout,
+            pv_layout,
+            q_layout,
+            k_layout,
+            p_layout,
+            v_layout,
+            load_layout,
+            store_layout,
+            k_smem_layout,
+            v_smem_layout,
+        ) = attention_layouts(
+            HEAD_DIM,
+            BLOCK_N,
+            IS_FP8,
+            KV_DTYPE,
+            num_warps=1,
             instr_shape=[16, 16, 32],
-            transposed=True,
-            warps_per_cta=[1, 1],
-        )
-        qk_layout = mfma_layout
-        pv_layout = mfma_layout
-        # qk_kw is derived from a 128-bit load / dtype bitwidth.
-        # pv_kw is empirically tuned.
-        qk_kw = 16 if IS_FP8 else 8
-        pv_kw = 8 if IS_FP8 else 4
-        q_layout = gl.DotOperandLayout(0, qk_layout, k_width=qk_kw)
-        k_layout = gl.DotOperandLayout(1, qk_layout, k_width=qk_kw)
-        p_layout = gl.DotOperandLayout(0, pv_layout, k_width=pv_kw)
-        v_layout = gl.DotOperandLayout(1, pv_layout, k_width=pv_kw)
-        # load_vec is the number of elements per lane, depends on the input dtype, same as qk_kw.
-        # load_threads is how many lanes span HEAD_DIM.
-        load_vec = 16 if IS_FP8 else 8
-        load_threads = HEAD_DIM // load_vec
-        load_layout = gl.BlockedLayout(
-            [1, load_vec], [64 // load_threads, load_threads], [1, 1], [1, 0]
-        )
-        # store_vec depends on the output dtype, always 16-bit regardless of input dtype, so 128 / 16 = 8.
-        # store_threads is how many lanes span HEAD_DIM.
-        store_vec = 8
-        store_threads = HEAD_DIM // store_vec
-        store_layout = gl.BlockedLayout(
-            [1, store_vec], [64 // store_threads, store_threads], [1, 1], [1, 0]
         )
         reduce_layout = gl.BlockedLayout([1, HEAD_DIM // 64], [1, 64], [1, 1], [1, 0])
-        # Padding interval is 64 lanes * load_vec elems.
-        pad_interval = 64 * load_vec
-        # Empirically tuned.
-        pad_k = 16 if IS_FP8 else 8
-        pad_v = 32
-        k_smem_layout = gl.PaddedSharedLayout.with_identity_for(
-            [[pad_interval, pad_k]], [BLOCK_N, HEAD_DIM], [1, 0]
-        )
-        v_smem_layout = gl.PaddedSharedLayout.with_identity_for(
-            [[pad_interval, pad_v]], [BLOCK_N, HEAD_DIM], [1, 0]
-        )
 
         self.SM_SCALE = gl.constexpr(SM_SCALE)
         self.PAGE_TABLE_STRIDE = gl.constexpr(PAGE_TABLE_STRIDE)
@@ -485,7 +466,7 @@ class AttentionProgram:
 
 
 @gluon.jit
-def _mha_decode_fp16(
+def _mha_decode(
     q_ptr,
     k_cache_ptr,
     v_cache_ptr,
@@ -524,6 +505,7 @@ def _mha_decode_fp16(
         IS_SLIDING,
         WINDOW_LEFT,
         IS_FP8,
+        k_cache_ptr.dtype.element_ty,
         InputStrides(Q_STRIDE_B, Q_STRIDE_H, Q_STRIDE_D),
     )
     program = AttentionProgram.create(
@@ -570,7 +552,7 @@ def _mha_decode_fp16(
 
 
 @gluon.jit
-def _mha_decode_sliding_fp16(
+def _mha_decode_sliding(
     q_ptr,
     k_cache_ptr,
     v_cache_ptr,
@@ -609,6 +591,7 @@ def _mha_decode_sliding_fp16(
         IS_SLIDING,
         WINDOW_LEFT,
         IS_FP8,
+        k_cache_ptr.dtype.element_ty,
         InputStrides(Q_STRIDE_B, Q_STRIDE_H, Q_STRIDE_D),
     )
     program = AttentionProgram.create(
@@ -650,12 +633,13 @@ def _mha_decode_sliding_fp16(
 
 
 @gluon.jit
-def _mha_decode_reduce_fp16(
+def _mha_decode_reduce(
     mid_o_ptr,
     mid_lse_ptr,
     out_ptr,
     cache_seqlens_ptr,
     sink_ptr,
+    k_cache_ptr,  # unused for loads; only its dtype feeds the shared config
     SM_SCALE: gl.constexpr,
     PAGE_TABLE_STRIDE: gl.constexpr,
     NUM_KV_SPLITS: gl.constexpr,
@@ -683,6 +667,7 @@ def _mha_decode_reduce_fp16(
         False,  # IS_SLIDING
         -1,  # WINDOW_LEFT
         IS_FP8,
+        k_cache_ptr.dtype.element_ty,
         InputStrides(1, 1, 1),
     )
     q_index = gl.program_id(0)
@@ -858,7 +843,7 @@ def gluon_mha_decode_gfx950(
     if config.is_sliding:
         # No split-k for sliding window attention
         grid = (total_q, config.num_kv_heads * config.num_groups, 1)
-        _mha_decode_sliding_fp16[grid](
+        _mha_decode_sliding[grid](
             q,
             k_cache,
             v_cache,
@@ -902,7 +887,7 @@ def gluon_mha_decode_gfx950(
             config.num_kv_heads * config.num_groups,
             config.num_kv_splits,
         )
-        _mha_decode_fp16[grid](
+        _mha_decode[grid](
             q,
             k_cache,
             v_cache,
@@ -932,12 +917,13 @@ def gluon_mha_decode_gfx950(
         # Sink is a single global softmax entry, so split-k must merge it once in
         # reduce. Adding it in each split would count the sink once per split.
         grid = (total_q, config.num_q_heads)
-        _mha_decode_reduce_fp16[grid](
+        _mha_decode_reduce[grid](
             mid_o,
             mid_lse,
             output,
             cache_seqlens,
             sink_arg,
+            k_cache,
             config.sm_scale,
             page_table.stride(0),
             config.num_kv_splits,

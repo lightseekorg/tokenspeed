@@ -41,7 +41,7 @@ def _send_reserve(scheduler: Scheduler, request_id: str, n: int = 0) -> None:
 
 def _base_config(num_device_pages: int = 64) -> SchedulerConfig:
     cfg = SchedulerConfig()
-    cfg.page_size = 64
+    cfg.block_size = 64
     cfg.max_scheduled_tokens = 4096
     cfg.max_batch_size = 8
     cfg.num_device_pages = num_device_pages
@@ -171,7 +171,7 @@ def test_full_history_stride_admission_accounts_partial_entries():
 
 def test_sliding_release_before_admit_prevents_oom():
     cfg = _base_config(num_device_pages=256)
-    cfg.page_size = 16
+    cfg.block_size = 16
     cfg.max_scheduled_tokens = 1024
     cfg.paged_cache_groups = [
         PagedCacheGroupConfig(
@@ -200,7 +200,7 @@ def test_sliding_release_before_admit_prevents_oom():
 
 def test_batch_admission_debits_simulated_free_pages():
     cfg = _base_config(num_device_pages=128)
-    cfg.page_size = 16
+    cfg.block_size = 16
     cfg.max_batch_size = 4
     cfg.max_scheduled_tokens = 512
     cfg.paged_cache_groups = [
@@ -237,7 +237,7 @@ def _transport_state_checkpoint_scheduler(
     num_host_pages: int = 0,
 ) -> Scheduler:
     cfg = _base_config(num_device_pages=256)
-    cfg.page_size = 16
+    cfg.block_size = 16
     cfg.max_scheduled_tokens = max_scheduled_tokens
     cfg.max_batch_size = 2
     cfg.decode_input_tokens = decode_input_tokens
