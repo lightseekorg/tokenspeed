@@ -26,6 +26,11 @@ from tokenspeed.runtime.configs.kimi_k25_config import KimiK25Config
 from tokenspeed.runtime.configs.minimax_m2_config import MiniMaxM2Config
 from tokenspeed.runtime.configs.qwen2_config import Qwen2Config
 from tokenspeed.runtime.configs.qwen3_5_config import Qwen3_5Config, Qwen3_5MoeConfig
+from tokenspeed.runtime.configs.qwen3_asr_config import (
+    Qwen3ASRAudioEncoderConfig,
+    Qwen3ASRConfig,
+    Qwen3ASRThinkerConfig,
+)
 from tokenspeed.runtime.configs.qwen3_config import Qwen3Config
 from tokenspeed.runtime.configs.qwen3_moe_config import Qwen3MoeConfig
 
@@ -36,6 +41,9 @@ __all__ = [
     "Qwen3MoeConfig",
     "Qwen3_5Config",
     "Qwen3_5MoeConfig",
+    "Qwen3ASRAudioEncoderConfig",
+    "Qwen3ASRConfig",
+    "Qwen3ASRThinkerConfig",
     "MiniMaxM2Config",
     "KimiK2Config",
     "KimiK25Config",

@@ -27,7 +27,8 @@ replay by an eager ``embed_tokens`` gather (text) or by precomputed merged
 embeddings (multimodal, via the model's ``multimodal_input_embeds`` seam).
 Constructed after the decode
 :class:`~tokenspeed.runtime.execution.cuda_graph_wrapper.CudaGraphWrapper`,
-borrowing its capture stream so all graphs share one mempool. At serving time
+borrowing its capture stream; buckets share one private mempool, deliberately
+not the decode graphs' pool (see :meth:`capture`). At serving time
 the executor's target-forward dispatch is a flat
 three-way -- decode & captured replays the decode graph (one level up, since
 it captures the whole step), prefill & captured replays here (:meth:`can_run`
@@ -49,7 +50,6 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
-from tokenspeed.runtime.execution import cuda_graph_wrapper as _cuda_graph_wrapper
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     BreakableCapture,
     active_forward,
@@ -272,20 +272,25 @@ class PrefillGraph:
 
         Called from ``__init__``; ``decode_wrapper`` supplies the shared
         capture stream and dummy paged-cache block tables (used here only,
-        not stored). Sharing
-        decode's stream + mempool puts all graphs in one pool-reuse domain
-        (pool blocks are stream-keyed), so graph memory stays ~the largest
-        bucket's peak instead of growing per bucket.
+        not stored). Buckets share one PRIVATE mempool (first capture
+        allocates it), so graph memory stays ~the largest bucket's peak --
+        but never the decode graphs' pool: eager ops cache raw pointers to
+        buffers they lazily allocated inside a decode capture (flashinfer's
+        trtllm-gen MoE runner), and a prefill capture reusing those freed
+        blocks means every replay rewrites them, corrupting the next eager
+        call (IMA; A/B-proven on qwen3.5 MTP).
 
         Runs under inference mode like serving forwards (in-place updates on
-        inference-mode model state buffers are only legal there). OOM
-        propagates -- the buckets genuinely didn't fit, don't silently boot in
-        a slower eager mode. Any other failure means the dummy-batch machinery
-        doesn't cover this model family yet: degrade to eager prefill instead
-        of crashing the server, and agree on that across the world (a MIN
-        all-reduce over the success flag) -- replay force-sets
-        ``global_num_tokens`` on every rank, so one eager rank among replaying
-        peers diverges the token counts and deadlocks the next collective.
+        inference-mode model state buffers are only legal there). OOM fails
+        the boot LOUDLY (the graph pool did not fit next to weights + KV
+        cache; the operator decides: free headroom, lower
+        ``--prefill-graph-max-tokens``, or 0 to disable). Any other failure
+        means the dummy-batch machinery doesn't cover this model family yet:
+        degrade to eager prefill instead of crashing the server, and agree on
+        that across the world (a MIN all-reduce over the success flag) --
+        replay force-sets ``global_num_tokens`` on every rank, so one eager
+        rank among replaying peers diverges the token counts and deadlocks
+        the next collective.
         """
         if self.disable:
             return
@@ -296,12 +301,18 @@ class PrefillGraph:
             dtype=weight.dtype,
             device=weight.device,
         )
-        self._pool = _cuda_graph_wrapper.global_graph_memory_pool
         captured_ok = True
         try:
             with maybe_inference_mode():
                 self._capture_all_buckets(decode_wrapper)
         except torch.cuda.OutOfMemoryError:
+            logger.error(
+                "Prefill graph capture ran out of GPU memory. Free up "
+                "--gpu-memory-utilization headroom, lower "
+                "--prefill-graph-max-tokens (default %d), or set it to 0 to "
+                "disable the prefill graph.",
+                2048,
+            )
             raise
         except (NotImplementedError, AttributeError, KeyError, RuntimeError) as exc:
             logger.warning(

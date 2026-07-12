@@ -364,6 +364,11 @@ class ModelConfig:
                 "disaggregation_mode=encode (encoder-only) and language_model_only "
                 "are mutually exclusive."
             )
+        if encoder_only and self.is_audio_model:
+            raise ValueError(
+                "disaggregation_mode=encode does not support audio models; "
+                "only image/video encoders are currently supported."
+            )
         if encoder_only:
             # Single model-facing gate: Kimi reads hf_config.encoder_only directly;
             # Qwen3_5ForConditionalGeneration reads it to skip LM construction.
@@ -625,6 +630,11 @@ def get_hf_text_config(config: PretrainedConfig):
         config.dtype = torch.float16
         return config
 
+    if hasattr(config, "thinker_config"):
+        thinker_config = config.thinker_config
+        if hasattr(thinker_config, "text_config"):
+            return thinker_config.text_config
+        return thinker_config
     if hasattr(config, "text_config"):
         if not hasattr(config.text_config, "num_attention_heads"):
             raise ValueError("text_config must define num_attention_heads")
@@ -699,6 +709,8 @@ def is_multimodal_model(model_architectures: list[str] | None):
     multimodal_architectures = {
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
+        "Qwen3OmniMoeForConditionalGeneration",
+        "Qwen3ASRForConditionalGeneration",
         "KimiK25ForConditionalGeneration",
     }
     return any(arch in multimodal_architectures for arch in model_architectures or [])
@@ -712,8 +724,12 @@ def is_image_gen_model(model_architectures: list[str]):
     return False
 
 
-def is_audio_model(model_architectures: list[str]):
-    return False
+def is_audio_model(model_architectures: list[str] | None):
+    audio_architectures = {
+        "Qwen3OmniMoeForConditionalGeneration",
+        "Qwen3ASRForConditionalGeneration",
+    }
+    return any(arch in audio_architectures for arch in model_architectures or [])
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
