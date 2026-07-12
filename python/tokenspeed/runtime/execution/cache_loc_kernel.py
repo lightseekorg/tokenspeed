@@ -395,22 +395,33 @@ def update_block_table(forward_op, device, req_to_page):
         tensor = torch.tensor(flat, dtype=dtype, device="cpu", pin_memory=True)
         return tensor.to(device, non_blocking=True)
 
-    # If no row reports a page-table update, the existing device mirror is current.
-    if all(n == 0 for n in forward_op.sizes):
+    max_pages = req_to_page.shape[1]
+    sizes = list(forward_op.sizes)
+    begins = list(forward_op.begins)
+    # new_occupied_pages is a list-of-lists [batch, size_i] of page ids;
+    # take a shallow copy so we can trim the offending request's row.
+    new_occupied_pages = [list(row) for row in forward_op.new_occupied_pages]
+    request_ids = list(forward_op.request_ids)
+    # full_refresh[i]==1 means the op rebuilt/adopted the prefix (non-tail) pages,
+    # so copy the scheduler's full page row from logical page 0 instead of the
+    # begin/size tail delta (a tail-only copy would leave stale/aliased entries).
+    full_refresh = forward_op.full_refresh
+    for i, refresh in enumerate(full_refresh):
+        if refresh:
+            row = list(forward_op.occupied_pages[i])
+            begins[i] = 0
+            sizes[i] = len(row)
+            new_occupied_pages[i] = row
+
+    # sizes[i] is the number of pages to copy for request i (tail delta, or the
+    # whole row for a full-refresh request).
+    if all(n == 0 for n in sizes):
         return
 
-    max_pages = req_to_page.shape[1]
-    # The scheduler owns the authoritative logical page row. Refresh every
-    # updated row from occupied_pages so non-tail page repoints cannot leave
-    # stale or aliased entries in the Python/device mirror.
-    pages_copy_starts = [0 for _ in forward_op.begins]
-    pages_to_copy = [list(row) for row in forward_op.occupied_pages]
-    pages_copy_sizes = [len(row) for row in pages_to_copy]
-    request_ids = list(forward_op.request_ids)
     # Clamp a request that would overflow req_to_page instead of crashing the
     # engine. Happens when MTP accept-rate collapse keeps a request alive past
     # context_len; its KV drops but it will be finished shortly.
-    for i, (begin, size) in enumerate(zip(pages_copy_starts, pages_copy_sizes)):
+    for i, (begin, size) in enumerate(zip(begins, sizes)):
         if begin + size > max_pages:
             clamped = max(0, max_pages - begin)
             logger.warning(
@@ -426,21 +437,21 @@ def update_block_table(forward_op, device, req_to_page):
                 max_pages,
                 clamped,
             )
-            pages_copy_sizes[i] = clamped
-            # Keep pages_to_copy[i] consistent with the clamped size so
+            sizes[i] = clamped
+            # Keep new_occupied_pages[i] consistent with the clamped size so
             # the kernel's cumsum-based offsets stay aligned across the batch.
-            pages_to_copy[i] = pages_to_copy[i][:clamped]
+            new_occupied_pages[i] = new_occupied_pages[i][:clamped]
 
-    pages_to_copy_num = flatten_and_to_device(pages_copy_sizes, dtype=torch.int32)
-    pages_copy_starts_t = flatten_and_to_device(pages_copy_starts, dtype=torch.int32)
-    pages_to_copy_t = flatten_and_to_device(pages_to_copy, dtype=torch.int32)
+    new_occupied_pages_num = flatten_and_to_device(sizes, dtype=torch.int32)
+    pages_copy_starts = flatten_and_to_device(begins, dtype=torch.int32)
+    new_occupied_pages_t = flatten_and_to_device(new_occupied_pages, dtype=torch.int32)
     request_pool_indices = flatten_and_to_device(
         forward_op.request_pool_indices, dtype=torch.int64
     )
     update_req_to_page(
         req_to_page=req_to_page,
         req_pool_indices=request_pool_indices,
-        new_occupied_pages=pages_to_copy_t,
-        new_occupied_pages_num=pages_to_copy_num,
-        pages_copy_starts=pages_copy_starts_t,
+        new_occupied_pages=new_occupied_pages_t,
+        new_occupied_pages_num=new_occupied_pages_num,
+        pages_copy_starts=pages_copy_starts,
     )
