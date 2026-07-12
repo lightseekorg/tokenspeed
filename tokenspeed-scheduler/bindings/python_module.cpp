@@ -74,6 +74,9 @@ void BindForwardCommonFields(Cls& cls) {
             "sizes", [](const Op& op) -> const std::vector<std::int32_t>& { return op.sizes; },
             nb::rv_policy::reference_internal)
         .def_prop_ro(
+            "full_refresh", [](const Op& op) -> const std::vector<std::int32_t>& { return op.full_refresh; },
+            nb::rv_policy::reference_internal)
+        .def_prop_ro(
             "new_occupied_pages",
             [](const Op& op) {
                 std::vector<std::vector<std::int32_t>> result;

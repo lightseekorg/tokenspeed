@@ -395,20 +395,32 @@ def update_block_table(forward_op, device, req_to_page):
         tensor = torch.tensor(flat, dtype=dtype, device="cpu", pin_memory=True)
         return tensor.to(device, non_blocking=True)
 
-    # sizes[i] is the number of newly allocated pages for request i.
-    if all(n == 0 for n in forward_op.sizes):
-        return
-
     max_pages = req_to_page.shape[1]
-    # Clamp a request that would overflow req_to_page instead of crashing the
-    # engine. Happens when MTP accept-rate collapse keeps a request alive past
-    # context_len; its KV drops but it will be finished shortly.
     sizes = list(forward_op.sizes)
     begins = list(forward_op.begins)
     # new_occupied_pages is a list-of-lists [batch, size_i] of page ids;
     # take a shallow copy so we can trim the offending request's row.
     new_occupied_pages = [list(row) for row in forward_op.new_occupied_pages]
     request_ids = list(forward_op.request_ids)
+    # full_refresh[i]==1 means the op rebuilt/adopted the prefix (non-tail) pages,
+    # so copy the scheduler's full page row from logical page 0 instead of the
+    # begin/size tail delta (a tail-only copy would leave stale/aliased entries).
+    full_refresh = forward_op.full_refresh
+    for i, refresh in enumerate(full_refresh):
+        if refresh:
+            row = list(forward_op.occupied_pages[i])
+            begins[i] = 0
+            sizes[i] = len(row)
+            new_occupied_pages[i] = row
+
+    # sizes[i] is the number of pages to copy for request i (tail delta, or the
+    # whole row for a full-refresh request).
+    if all(n == 0 for n in sizes):
+        return
+
+    # Clamp a request that would overflow req_to_page instead of crashing the
+    # engine. Happens when MTP accept-rate collapse keeps a request alive past
+    # context_len; its KV drops but it will be finished shortly.
     for i, (begin, size) in enumerate(zip(begins, sizes)):
         if begin + size > max_pages:
             clamped = max(0, max_pages - begin)

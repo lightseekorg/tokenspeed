@@ -39,6 +39,8 @@ def _make_forward_op(
     new_occupied_pages: list[list[int]] | None = None,
     request_ids: list[str] | None = None,
     request_pool_indices: list[int] | None = None,
+    full_refresh: list[int] | None = None,
+    occupied_pages: list[list[int]] | None = None,
 ) -> SimpleNamespace:
     """Build a minimal forward_op stand-in with just the fields the function reads."""
     if new_occupied_pages is None:
@@ -47,12 +49,20 @@ def _make_forward_op(
         request_ids = [f"req-{i}" for i in range(len(begins))]
     if request_pool_indices is None:
         request_pool_indices = list(range(len(begins)))
+    if full_refresh is None:
+        full_refresh = [0 for _ in begins]
+    if occupied_pages is None:
+        # For tail-only rows occupied_pages is unused; default it to the tail
+        # delta so the field is always present and well-shaped.
+        occupied_pages = [list(row) for row in new_occupied_pages]
     return SimpleNamespace(
         begins=list(begins),
         sizes=list(sizes),
         new_occupied_pages=new_occupied_pages,
         request_ids=request_ids,
         request_pool_indices=request_pool_indices,
+        full_refresh=list(full_refresh),
+        occupied_pages=occupied_pages,
     )
 
 
@@ -221,3 +231,195 @@ def test_update_block_table_logs_warning_on_clamp():
     msgs = [r.getMessage() for r in captured_records]
     assert any("my-bad-req" in m for m in msgs), msgs
     assert any("page copy would exceed req_to_page capacity" in m for m in msgs), msgs
+
+
+def test_update_block_table_full_refresh_copies_whole_row(monkeypatch):
+    """A full_refresh=1 request must copy the scheduler's full occupied_pages
+    row from logical page 0, ignoring the begin/size tail delta; a full_refresh=0
+    request in the same batch keeps the tail-only delta."""
+    from tokenspeed.runtime.execution import cache_loc_kernel
+
+    req_to_page = torch.zeros(8, 513, dtype=torch.int32)
+    # req[0]: full refresh -> whole row from 0, delta fields ignored.
+    # req[1]: tail-only -> begin=200, only the 2-page delta.
+    forward_op = _make_forward_op(
+        begins=[100, 200],
+        sizes=[1, 2],
+        new_occupied_pages=[[999], [50, 51]],
+        occupied_pages=[[10, 11, 12, 13], [40, 41, 42]],
+        full_refresh=[1, 0],
+    )
+
+    captured: dict = {}
+
+    def fake_update_req_to_page(
+        req_to_page,
+        req_pool_indices,
+        new_occupied_pages,
+        new_occupied_pages_num,
+        pages_copy_starts,
+    ):
+        captured["num"] = new_occupied_pages_num.tolist()
+        captured["starts"] = pages_copy_starts.tolist()
+        captured["pages"] = new_occupied_pages.tolist()
+
+    monkeypatch.setattr(cache_loc_kernel, "update_req_to_page", fake_update_req_to_page)
+    cache_loc_kernel.update_block_table(
+        forward_op, device="cpu", req_to_page=req_to_page
+    )
+
+    # req[0] refreshed the whole 4-page row from start 0; req[1] kept its tail delta.
+    assert captured["num"] == [4, 2]
+    assert captured["starts"] == [0, 200]
+    # Flattened: whole row of req[0] then the tail delta of req[1].
+    assert captured["pages"] == [10, 11, 12, 13, 50, 51]
+
+
+def test_update_block_table_full_refresh_respects_clamp(monkeypatch):
+    """A full_refresh row longer than max_pages must still be clamped, not crash."""
+    from tokenspeed.runtime.execution import cache_loc_kernel
+
+    req_to_page = torch.zeros(8, 4, dtype=torch.int32)
+    # Whole row has 6 pages but req_to_page only holds 4 → clamp to 4 at start 0.
+    forward_op = _make_forward_op(
+        begins=[3],
+        sizes=[1],
+        new_occupied_pages=[[999]],
+        occupied_pages=[[10, 11, 12, 13, 14, 15]],
+        full_refresh=[1],
+    )
+
+    captured: dict = {}
+
+    def fake_update_req_to_page(
+        req_to_page,
+        req_pool_indices,
+        new_occupied_pages,
+        new_occupied_pages_num,
+        pages_copy_starts,
+    ):
+        captured["num"] = new_occupied_pages_num.tolist()
+        captured["starts"] = pages_copy_starts.tolist()
+        captured["pages"] = new_occupied_pages.tolist()
+
+    monkeypatch.setattr(cache_loc_kernel, "update_req_to_page", fake_update_req_to_page)
+    cache_loc_kernel.update_block_table(
+        forward_op, device="cpu", req_to_page=req_to_page
+    )
+
+    # Clamped to the first 4 ids. Un-clamped this would be num=[6],
+    # pages=[10,11,12,13,14,15] -> a 2-column OOB write past the width-4 row.
+    assert captured["starts"] == [0]
+    assert captured["num"] == [4]
+    assert captured["pages"] == [10, 11, 12, 13]
+
+
+def test_update_block_table_full_refresh_overrides_zero_size(monkeypatch):
+    """full_refresh=1 must copy the row even when the op's tail size is 0
+    (early-return must be computed on the effective, post-branch sizes)."""
+    from tokenspeed.runtime.execution import cache_loc_kernel
+
+    req_to_page = torch.zeros(8, 513, dtype=torch.int32)
+    forward_op = _make_forward_op(
+        begins=[5],
+        sizes=[0],
+        new_occupied_pages=[[]],
+        occupied_pages=[[10, 11, 12]],
+        full_refresh=[1],
+    )
+
+    captured: dict = {}
+
+    def fake_update_req_to_page(
+        req_to_page,
+        req_pool_indices,
+        new_occupied_pages,
+        new_occupied_pages_num,
+        pages_copy_starts,
+    ):
+        captured["num"] = new_occupied_pages_num.tolist()
+        captured["starts"] = pages_copy_starts.tolist()
+        captured["pages"] = new_occupied_pages.tolist()
+
+    monkeypatch.setattr(cache_loc_kernel, "update_req_to_page", fake_update_req_to_page)
+    cache_loc_kernel.update_block_table(
+        forward_op, device="cpu", req_to_page=req_to_page
+    )
+
+    assert captured["num"] == [3]
+    assert captured["starts"] == [0]
+    assert captured["pages"] == [10, 11, 12]
+
+
+def test_update_block_table_full_refresh_decode_tail_repoints_prefix(monkeypatch):
+    """PrefillDone->Decode can append a decode tail while also repointing
+    completed prefix pages; full_refresh must make that a whole-row copy."""
+    from tokenspeed.runtime.execution import cache_loc_kernel
+
+    req_to_page = torch.zeros(8, 513, dtype=torch.int32)
+    forward_op = _make_forward_op(
+        begins=[3],
+        sizes=[1],
+        new_occupied_pages=[[99]],
+        occupied_pages=[[20, 21, 22, 99]],
+        full_refresh=[1],
+    )
+
+    captured: dict = {}
+
+    def fake_update_req_to_page(
+        req_to_page,
+        req_pool_indices,
+        new_occupied_pages,
+        new_occupied_pages_num,
+        pages_copy_starts,
+    ):
+        captured["num"] = new_occupied_pages_num.tolist()
+        captured["starts"] = pages_copy_starts.tolist()
+        captured["pages"] = new_occupied_pages.tolist()
+
+    monkeypatch.setattr(cache_loc_kernel, "update_req_to_page", fake_update_req_to_page)
+    cache_loc_kernel.update_block_table(
+        forward_op, device="cpu", req_to_page=req_to_page
+    )
+
+    assert captured["num"] == [4]
+    assert captured["starts"] == [0]
+    assert captured["pages"] == [20, 21, 22, 99]
+
+
+def test_update_block_table_full_refresh_prefill_chunk_repoints_prefix(monkeypatch):
+    """Continuation prefill can publish prior chunk pages while adding a new
+    tail chunk; full_refresh must refresh the whole scheduler row."""
+    from tokenspeed.runtime.execution import cache_loc_kernel
+
+    req_to_page = torch.zeros(8, 513, dtype=torch.int32)
+    forward_op = _make_forward_op(
+        begins=[2],
+        sizes=[2],
+        new_occupied_pages=[[80, 81]],
+        occupied_pages=[[30, 31, 80, 81]],
+        full_refresh=[1],
+    )
+
+    captured: dict = {}
+
+    def fake_update_req_to_page(
+        req_to_page,
+        req_pool_indices,
+        new_occupied_pages,
+        new_occupied_pages_num,
+        pages_copy_starts,
+    ):
+        captured["num"] = new_occupied_pages_num.tolist()
+        captured["starts"] = pages_copy_starts.tolist()
+        captured["pages"] = new_occupied_pages.tolist()
+
+    monkeypatch.setattr(cache_loc_kernel, "update_req_to_page", fake_update_req_to_page)
+    cache_loc_kernel.update_block_table(
+        forward_op, device="cpu", req_to_page=req_to_page
+    )
+
+    assert captured["num"] == [4]
+    assert captured["starts"] == [0]
+    assert captured["pages"] == [30, 31, 80, 81]
