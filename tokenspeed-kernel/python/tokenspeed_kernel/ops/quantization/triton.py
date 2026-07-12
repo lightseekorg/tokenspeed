@@ -294,7 +294,7 @@ def triton_quantize_fp8(
     "fp8_with_scale",
     name="triton_quantize_fp8_with_scale",
     solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"amd"})),
+    capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
     signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
     traits={
         "granularity": frozenset({"token_group_128"}),

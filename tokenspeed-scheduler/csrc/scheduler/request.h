@@ -152,6 +152,34 @@ public:
             state_);
     }
 
+    // Flat KV-cache: true when the current state carries no per-group block
+    // tables (radix path, or a non-forward state). Forward states on the flat
+    // path return false once allocation has populated block_tables_.
+    bool FlatBlockTablesEmpty() const {
+        return std::visit(Overloaded{
+            []<typename T>(const T& s) -> bool
+                requires(std::derived_from<T, fsm::ForwardState>)
+            { return s.BlockTables().empty(); },
+            [](const auto&) -> bool { return true; },
+            },
+            state_);
+    }
+
+    // Flat KV-cache: the current forward state's per-group block tables (one
+    // BlockTable per cache group). Throws if called on a non-forward state.
+    const std::vector<BlockTable>& FlatBlockTablesRef() const {
+        return std::visit(Overloaded{
+            []<typename T>(const T& s) -> const std::vector<BlockTable>&
+                requires(std::derived_from<T, fsm::ForwardState>)
+            { return s.BlockTables(); },
+            [this](const auto&) -> const std::vector<BlockTable>& {
+                throw std::logic_error("Request::FlatBlockTablesRef: expected a forward state; got state=" +
+                                       StateName());
+            },
+            },
+            state_);
+    }
+
     const TreeNode* GetDeviceNode() const {
         return std::visit(Overloaded{
             []<typename T>(const T& s) -> const TreeNode*

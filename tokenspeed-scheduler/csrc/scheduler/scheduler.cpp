@@ -56,11 +56,27 @@ namespace tokenspeed {
 
 Scheduler::Scheduler(SchedulerConfig config)
     : config_{std::move(config)},
-      device_allocator_{config_.page_size, config_.device_allocator.total_pages},
-      host_allocator_{config_.page_size, config_.host_allocator.total_pages},
+      device_allocator_{config_.block_size, config_.device_allocator.total_pages},
+      host_allocator_{config_.block_size, config_.host_allocator.total_pages},
       mamba_allocator_{},
       kv_prefix_cache_{&device_allocator_, &host_allocator_, config_.enable_l3_storage, config_.disable_prefix_cache},
-      req_pool_allocator_{config_.max_batch_size} {
+      req_pool_allocator_{config_.max_batch_size}
+#if TOKENSPEED_FLAT_KVCACHE
+      ,
+      block_pool_{config_.device_allocator.total_pages},
+      flat_host_pool_{config_.FlatStreamingSinkEnabled() ? config_.host_allocator.total_pages : 1},
+      coordinator_{MakeCoordinator(MakeSpecsFromConfig(config_), block_pool_,
+                                   config_.FlatStreamingSinkEnabled() ? &flat_host_pool_ : nullptr)},
+      flat_group_ids_{[&] {
+          std::vector<std::string> ids;
+          ids.reserve(config_.paged_cache_groups.size());
+          for (const auto& g : config_.paged_cache_groups) {
+              ids.push_back(g.group_id);
+          }
+          return ids;
+      }()}
+#endif
+{
     if (config_.decode_input_tokens < 0) {
         throw std::invalid_argument("Scheduler: decode_input_tokens must be >= 0");
     }
@@ -154,12 +170,12 @@ std::vector<KvCacheEvent> Scheduler::DrainKvEvents() {
 }
 
 std::vector<std::string> Scheduler::CalcRollingHash(const std::vector<std::int32_t>& input_tokens, bool apply_match) {
-    const std::int32_t page_size = config_.page_size;
-    const std::size_t num_pages = input_tokens.size() / page_size;
+    const std::int32_t block_size = config_.block_size;
+    const std::size_t num_pages = input_tokens.size() / block_size;
     std::vector<std::span<const std::int32_t>> token_pages;
     token_pages.reserve(num_pages);
     for (std::size_t i = 0; i < num_pages; ++i) {
-        token_pages.emplace_back(input_tokens.data() + i * page_size, page_size);
+        token_pages.emplace_back(input_tokens.data() + i * block_size, block_size);
     }
     if (!apply_match) {
         return ComputePagedHashes(token_pages, "");
@@ -177,8 +193,16 @@ std::vector<std::string> Scheduler::CalcRollingHash(const std::vector<std::int32
 }
 
 void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
+#if TOKENSPEED_FLAT_KVCACHE
+    // The content-hash chain and base-slot indexing run at base (GCD) granularity; the
+    // coordinator folds base pages up to each group's block_size. Uniform block_size =>
+    // base == block_size.
+    const std::int32_t page_size = config_.BaseBlockSize();
+#else
+    const std::int32_t page_size = config_.block_size;
+#endif
     for (const auto& spec : request_specs) {
-        auto req = std::make_unique<Request>(spec, config_.page_size, config_.role);
+        auto req = std::make_unique<Request>(spec, page_size, config_.role);
         requests_.emplace(spec.request_id, std::move(req));
     }
 }
@@ -224,7 +248,15 @@ std::size_t Scheduler::RetractedSize() const {
 }
 
 std::size_t Scheduler::AvailableKvPages() const {
+#if TOKENSPEED_FLAT_KVCACHE
+    // The flat path never draws from the radix device_allocator_, so reporting it would show a
+    // permanently-full pool to Python monitoring. Report the flat BlockPool instead: one flat
+    // block is one pool row, interpreted at each group's own block_size. Block 0 is the
+    // never-allocated null placeholder, so an idle pool reports total_pages - 1.
+    return static_cast<std::size_t>(block_pool_.NumFreeBlocks());
+#else
     return device_allocator_.AvailablePages();
+#endif
 }
 
 std::size_t Scheduler::ActiveKvPages() const {
@@ -308,7 +340,11 @@ std::vector<WriteBackOperation> Scheduler::newWriteBackOperation(
                 op_id, std::vector<TransferPair>(pages_to_transfer.begin(), pages_to_transfer.end())});
             req->Apply(fsm::CommitDrainingEvent{});
         } else {
-            req->Apply(fsm::AbortEvent{});
+            req->Apply(fsm::AbortEvent{
+#if TOKENSPEED_FLAT_KVCACHE
+                &coordinator_
+#endif
+            });
         }
     }
     return ops;
@@ -339,12 +375,48 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
 
     auto [fwd_ops, cache_ops] = newForwardOperation(candidates);
     plan.With(FlatForwardOperation{std::move(fwd_ops)});
+#if TOKENSPEED_FLAT_KVCACHE
+    plan.flat_oom_request_ids = std::exchange(flat_oom_request_ids_, {});
+#endif
 
     // Merge retract write-backs (if any) into the Draining write-back list, then emit once.
     if (auto* wb = std::get_if<std::vector<WriteBackOperation>>(&cache_ops)) {
         write_back_ops.insert(write_back_ops.end(), std::make_move_iterator(wb->begin()),
                               std::make_move_iterator(wb->end()));
     }
+#if TOKENSPEED_FLAT_KVCACHE
+    if (config_.FlatStreamingSinkEnabled()) {
+        // Streaming L2 sink: batch this round's newly-registered pages into one D2H op.
+        std::vector<TransferPair> pairs;
+        std::vector<FlatStoreTicket> tickets;
+        // Same-round twins register the same key twice (batch_keys catches them). Cross-round
+        // recurrence is rare but real: a device match can settle below a still-in-flight page after
+        // earlier chain / SWA-neighbor ops retire, and the request re-registers a key whose store is
+        // in flight. InFlight() drops it (load-bearing: else a key sits in two ops and Retire
+        // corrupts the ledger's key set).
+        std::unordered_set<std::string> batch_keys;
+        for (auto& cand : coordinator_.TakePendingStores()) {
+            if (flat_host_pool_.GetCachedBlock(cand.key) != nullptr || flat_store_ops_.InFlight(cand.key) ||
+                !batch_keys.insert(cand.key).second) {
+                cand.block = BlockRef{};  // duplicate: drop + unpin
+                continue;
+            }
+            CacheBlock* host_block = flat_host_pool_.AllocateBlock();
+            if (host_block == nullptr) {
+                cand.block = BlockRef{};  // host full: drop + unpin
+                continue;
+            }
+            pairs.push_back(TransferPair{CacheKind::kKV, cand.block->BlockId(), host_block->BlockId()});
+            tickets.push_back(FlatStoreTicket{std::move(cand.key), std::move(cand.block),
+                                              BlockRef::Adopt(flat_host_pool_, host_block)});
+        }
+        if (!pairs.empty()) {
+            const cache_op_id id = kv_prefix_cache_.AllocateCacheOpId();
+            flat_store_ops_.Add(id, std::move(tickets));
+            write_back_ops.push_back(WriteBackOperation{id, std::move(pairs)});
+        }
+    }
+#endif
     if (!write_back_ops.empty()) {
         plan.With(CacheOperation{FlatWriteBackOperation{write_back_ops}});
     }

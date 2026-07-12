@@ -47,6 +47,10 @@ import tokenspeed_kernel.ops.moe as _moe_pkg
 import tokenspeed_kernel.ops.moe.flashinfer as _moe_flashinfer
 import tokenspeed_kernel.ops.moe.gluon as _moe_gluon
 import tokenspeed_kernel.ops.moe.triton as _moe_triton
+import tokenspeed_kernel.ops.quantization as _quantization_pkg
+import tokenspeed_kernel.ops.quantization.flashinfer as _quantization_flashinfer
+import tokenspeed_kernel.ops.quantization.triton as _quantization_triton
+import tokenspeed_kernel.ops.quantization.trtllm as _quantization_trtllm
 import tokenspeed_kernel.ops.sampling as _sampling_pkg
 import tokenspeed_kernel.ops.sampling.cute_dsl as _sampling_cute_dsl
 import tokenspeed_kernel.ops.sampling.gluon as _sampling_gluon
@@ -135,6 +139,11 @@ _RELOAD_MODULES = [
     _moe_triton_mxfp4,
     _moe_triton,
     _moe_pkg,
+    # Quantization registration modules.
+    _quantization_flashinfer,
+    _quantization_triton,
+    _quantization_trtllm,
+    _quantization_pkg,
     # Sampling registration modules.
     _sampling_cute_dsl,
     _sampling_gluon,

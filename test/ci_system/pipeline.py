@@ -180,6 +180,31 @@ def validate_task(data: Dict[str, Any], path: Path) -> None:
                 f"{path}: priority must be a string or a per-label mapping; "
                 f"got {type(priority).__name__}"
             )
+    if "optional" in data:
+        optional = data["optional"]
+        if isinstance(optional, bool):
+            pass
+        elif isinstance(optional, dict):
+            unknown_labels = sorted(set(optional) - set(labels))
+            if unknown_labels:
+                raise ValueError(
+                    f"{path}: optional contains unknown labels: {unknown_labels}"
+                )
+            bad_values = sorted(
+                label
+                for label, value in optional.items()
+                if not isinstance(value, bool)
+            )
+            if bad_values:
+                raise ValueError(
+                    f"{path}: optional values must be booleans for labels: "
+                    f"{bad_values}"
+                )
+        else:
+            raise ValueError(
+                f"{path}: optional must be a boolean or a per-label mapping; "
+                f"got {type(optional).__name__}"
+            )
 
 
 def normalize_task(path: Path, repo_root: Path) -> Dict[str, Any]:
@@ -230,6 +255,17 @@ def resolve_priority_for_label(priority: Any, label: str) -> str:
     return DEFAULT_PRIORITY
 
 
+def resolve_optional_for_label(optional: Any, label: str) -> bool:
+    """Pick whether ``label`` is allowed to fail from task ``optional`` data."""
+    if optional is None:
+        return False
+    if isinstance(optional, bool):
+        return optional
+    if isinstance(optional, dict):
+        return optional.get(label, False)
+    return False
+
+
 def build_matrix(
     root: Path,
     repo_root: Path,
@@ -242,10 +278,13 @@ def build_matrix(
         if trigger and trigger not in task["triggers"]:
             continue
         priority = task.get("priority")
+        optional = task.get("optional")
         for label in task["runner"]["labels"]:
             # `priority` keys are the labels as written in YAML, so look
-            # up before `resolve_runner_label` rewrites b200 to b200v2.
+            # up per-label metadata before `resolve_runner_label` rewrites
+            # b200 to b200v2.
             effective = resolve_priority_for_label(priority, label)
+            is_optional = resolve_optional_for_label(optional, label)
             runner = resolve_runner_label(label)
             if not runner_matches_group(runner, runner_group):
                 continue
@@ -256,6 +295,7 @@ def build_matrix(
                     "config": task["_source_path"],
                     "runner": runner,
                     "priority": effective,
+                    "optional": is_optional,
                 }
             )
     # Stable sort: tasks at the same priority keep their file-path / label

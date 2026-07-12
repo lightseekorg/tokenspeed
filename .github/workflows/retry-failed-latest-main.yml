@@ -31,8 +31,21 @@ jobs:
             ];
             const maxAttempts = 3;
             const { owner, repo } = context.repo;
+            const summaryRows = [];
+            let stoppedEarly = false;
 
-            const { data: repository } = await github.rest.repos.get({
+            function addSummaryRow(workflowId, run, result) {
+              summaryRows.push([
+                workflowId,
+                run
+                  ? `<a href="${run.html_url}">${run.id}</a>`
+                  : "—",
+                result,
+              ]);
+            }
+
+            try {
+              const { data: repository } = await github.rest.repos.get({
               owner,
               repo,
             });
@@ -68,6 +81,7 @@ jobs:
                 core.warning(
                   "Unable to list runs for " + workflowId + ": " + error.message,
                 );
+                addSummaryRow(workflowId, null, "Failed to inspect");
                 continue;
               }
 
@@ -105,6 +119,7 @@ jobs:
                   workflowId + ": run " + run.id + " failed on attempt " +
                     attempt + "; retry limit reached.",
                 );
+                addSummaryRow(workflowId, run, "Retry limit reached");
                 continue;
               }
 
@@ -123,6 +138,7 @@ jobs:
                   "Unable to recheck latest main: " + error.message +
                     "; stopping this scan.",
                 );
+                stoppedEarly = true;
                 break;
               }
               if (currentSha !== latestSha) {
@@ -130,6 +146,7 @@ jobs:
                   "Main advanced from " + latestSha + " to " + currentSha +
                     "; stopping this scan.",
                 );
+                stoppedEarly = true;
                 break;
               }
 
@@ -142,10 +159,35 @@ jobs:
                   workflowId + ": rerunning failed jobs for run " + run.id +
                     " after attempt " + attempt + ".",
                 );
+                addSummaryRow(workflowId, run, "Rerun started");
               } catch (error) {
                 core.warning(
                   workflowId + ": unable to rerun failed jobs for run " +
                     run.id + ": " + error.message,
                 );
+                addSummaryRow(workflowId, run, "Failed to start");
               }
+            }
+            } finally {
+              core.summary.addHeading("Latest main retry summary");
+              if (summaryRows.length > 0) {
+                core.summary.addTable([
+                  [
+                    { data: "Workflow", header: true },
+                    { data: "Run", header: true },
+                    { data: "Result", header: true },
+                  ],
+                  ...summaryRows,
+                ]);
+              } else {
+                core.summary.addRaw("No reruns were eligible.");
+              }
+              if (stoppedEarly) {
+                core.summary.addBreak();
+                core.summary.addRaw(
+                  "Scan stopped early because main advanced or could not " +
+                    "be re-verified.",
+                );
+              }
+              await core.summary.write();
             }

@@ -74,7 +74,7 @@ TEST_F(MambaIntegrationTest, PrefixSharingWithMamba) {
 
     // R2: same prefix tokens. GetFullPagedTokens(except_last=true) on
     // kPages*PageSize tokens yields (kPages*PageSize - 1) / PageSize pages.
-    // With page_size=2, 4 pages = 8 tokens → except_last → 3 pages.
+    // With block_size=2, 4 pages = 8 tokens → except_last → 3 pages.
     // The mamba checkpoint from R1 sits at depth 4 (inserted during decode
     // transition), but the mamba working slot also at depth 4 (from Finish).
     // R2's match walks 3 pages; FindLastMambaNode walks up — the ancestor

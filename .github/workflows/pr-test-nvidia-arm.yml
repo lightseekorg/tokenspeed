@@ -149,6 +149,7 @@ jobs:
     name: ${{ matrix.name }} (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
+    continue-on-error: ${{ matrix.optional }}
     env:
       # When the scan job determined that this run touched `tokenspeed-mla/`,
       # `install_deps.sh` will reinstall the in-tree source on top of the

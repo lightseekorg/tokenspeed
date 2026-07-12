@@ -49,7 +49,7 @@ def make_config(
     num_device_pages: int = 1024,
 ) -> SchedulerConfig:
     cfg = SchedulerConfig()
-    cfg.page_size = page_size
+    cfg.block_size = page_size
     cfg.max_scheduled_tokens = max_scheduled_tokens
     cfg.max_batch_size = max_batch_size
     cfg.num_device_pages = num_device_pages

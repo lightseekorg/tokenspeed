@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -38,13 +39,17 @@ from tokenspeed_kernel.ops.attention.triton.linear.index import (
     set_total_chunks_hint_uniform,
 )
 
+from tokenspeed.runtime.configs.paged_cache_spec import LINEAR_ATTENTION
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     break_point,
     current_forward_ctx,
     scrub_padding_tail,
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
+from tokenspeed.runtime.layers.attention.backends.base import (
+    AttentionBackend,
+    init_backend_cuda_graph_state,
+)
 from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
@@ -62,6 +67,66 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
+# Flat KV-cache group id carrying GDN/mamba2 state pages.
+_STATE_GROUP_ID = LINEAR_ATTENTION
+
+
+def compute_state_page_indices(
+    rows: torch.Tensor,
+    page_size: int,
+    seq_lens_before: torch.Tensor,
+    seq_lens_after: torch.Tensor,
+    *,
+    validate: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Dual-index state pages: in = page of position n-1 (0/null when no
+    history), out = page of the step's last position. rows: [bs, max_pages]
+    int32 page ids (-1 pad, 0 hole). Within a page in == out (in-place
+    evolution); crossing a boundary reads the old page and writes the new
+    one; resuming from a prefix hit reads the claimed snapshot page and
+    writes the fresh working page.
+    """
+    bs = seq_lens_before.shape[0]
+    rows = rows[:bs]
+    before = seq_lens_before.to(torch.int64)
+    after = seq_lens_after.to(torch.int64)
+    max_slots = rows.shape[1]
+
+    in_slots = torch.div(before - 1, page_size, rounding_mode="floor").clamp_(min=0)
+    out_slots = torch.div(after - 1, page_size, rounding_mode="floor")
+    out_slots_safe = out_slots.clamp(min=0, max=max_slots - 1)
+
+    state_in = rows.gather(1, in_slots.unsqueeze(1)).squeeze(1)
+    state_in = torch.where(before > 0, state_in, torch.zeros_like(state_in))
+    state_out = rows.gather(1, out_slots_safe.unsqueeze(1)).squeeze(1)
+
+    if validate:
+        if bool((after <= 0).any()):
+            raise ValueError(
+                "state paging: seq_lens_after must be >= 1 for every request"
+            )
+        if bool((out_slots >= max_slots).any()):
+            raise ValueError(
+                "state paging: out page slot exceeds flat table width "
+                f"{max_slots} (page_size={page_size})"
+            )
+        if bool((state_in[before > 0] <= 0).any()):
+            raise ValueError(
+                "state paging: in page is a pad (-1) or hole (0) for a "
+                "request with history; reading it would silently resume "
+                f"from the zero state (flat {_STATE_GROUP_ID!r} table)"
+            )
+        if bool((state_out <= 0).any()):
+            raise ValueError(
+                "state paging: out page is a pad (-1) or hole (0); the "
+                "request's working state page must be present in the flat "
+                f"{_STATE_GROUP_ID!r} table"
+            )
+        # The <= 0 raise above guarantees every state_out entry is positive.
+        if torch.unique(state_out).numel() != state_out.numel():
+            raise ValueError("state out pages must be unique per batch")
+    return state_in.to(torch.int32), state_out.to(torch.int32)
+
 
 @dataclass
 class MambaForwardMetadata:
@@ -78,6 +143,9 @@ class MambaForwardMetadata:
     track_conv_indices: torch.Tensor | None = None
     track_ssm_final_src: torch.Tensor | None = None
     track_ssm_final_dst: torch.Tensor | None = None
+    # Flat path (state slabs): dual in/out page indices per request.
+    state_in_pages: torch.Tensor | None = None
+    state_out_pages: torch.Tensor | None = None
 
 
 class LayerMappedKVPool:
@@ -432,9 +500,74 @@ class MambaAttnBackend(AttentionBackend):
             config, "speculative_num_draft_tokens", 0
         )
         self.pool: SimpleMambaPool = None
+        # Flat path (state slabs on the KV pool, dual in/out page indexing).
+        self.kv_pool = None
+        self.flat_state_active = False
+        self._flat_state_page_size = 1
+        self.flat_state_in_list: list[torch.Tensor] = []
+        self.flat_state_out_list: list[torch.Tensor] = []
 
     def set_pool(self, pool: SimpleMambaPool):
         self.pool = pool
+
+    def set_kv_pool(self, kv_pool) -> None:
+        """Bind the (layer-mapped) KV pool. Flat state paging turns on iff the
+        pool allocated state slabs AND publishes the state cache group —
+        publication (paged_cache_spec.publish_paged_cache_groups) is the
+        upstream signal that flat block tables will actually be delivered
+        (radix ext / spec decode never publish)."""
+        self.kv_pool = kv_pool
+        specs = getattr(kv_pool, "paged_cache_group_specs", ())
+        self.flat_state_active = bool(getattr(kv_pool, "state_slabs", None)) and any(
+            str(spec.group_id) == _STATE_GROUP_ID for spec in specs
+        )
+        self._flat_state_page_size = int(getattr(kv_pool, "page_size", 1))
+
+    def _flat_state_pages(
+        self,
+        bs: int,
+        seq_lens: torch.Tensor,
+        forward_mode: ForwardMode,
+        kwargs: dict,
+        *,
+        validate: bool | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """(state_in, state_out) page ids for this forward, from the flat
+        state-group block table. seq_lens counts the tokens computed AFTER
+        this forward (decode: q_len 1; extend: prefix + chunk).
+
+        validate: explicit True/False wins; None (the hot-path default)
+        validates only under TOKENSPEED_FLAT_DEBUG=1 (the checks host-sync).
+        """
+        if validate is None:
+            validate = os.environ.get("TOKENSPEED_FLAT_DEBUG") == "1"
+        flat_tables = kwargs.get("flat_block_tables")
+        if not flat_tables or _STATE_GROUP_ID not in flat_tables:
+            raise RuntimeError(
+                "MambaAttnBackend: flat state paging is active (pool "
+                f"publishes the {_STATE_GROUP_ID!r} group with state slabs) "
+                "but flat_block_tables is missing the group "
+                f"(got {sorted(flat_tables) if flat_tables else flat_tables!r})"
+            )
+        rows = flat_tables[_STATE_GROUP_ID]
+        after = seq_lens[:bs]
+        if forward_mode.is_decode_or_idle():
+            before = after - 1
+        else:
+            extend_prefix_lens = kwargs.get("extend_prefix_lens")
+            if extend_prefix_lens is not None:
+                before = extend_prefix_lens[:bs].to(
+                    device=after.device, dtype=after.dtype
+                )
+            else:
+                before = torch.zeros_like(after)
+        return compute_state_page_indices(
+            rows,
+            self._flat_state_page_size,
+            before,
+            after,
+            validate=validate,
+        )
 
     def reset_current_inputs(
         self, req_pool_indices: torch.Tensor, working_indices: torch.Tensor
@@ -451,7 +584,11 @@ class MambaAttnBackend(AttentionBackend):
         **kwargs,
     ):
         mamba_pool_indices = kwargs.get("mamba_pool_indices")
-        if mamba_pool_indices is not None:
+        if self.pool is None:
+            # Poolless flat mode: states are addressed via state_in/out_pages;
+            # every consumer of mamba_cache_indices is pool/radix-gated.
+            mamba_cache_indices = None
+        elif mamba_pool_indices is not None:
             mamba_cache_indices = self.pool.get_mamba_indices(mamba_pool_indices[:bs])
         else:
             mamba_cache_indices = self.pool.get_mamba_indices(req_pool_indices[:bs])
@@ -531,6 +668,21 @@ class MambaAttnBackend(AttentionBackend):
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
 
+        state_in_pages = None
+        state_out_pages = None
+        # Idle/bs==0 forwards carry no requests and never reach the mamba
+        # forward (router returns early), so no tables are required.
+        if self.flat_state_active and bs > 0 and not forward_mode.is_idle():
+            if is_target_verify or is_draft_extend:
+                raise RuntimeError(
+                    "flat GDN state paging does not support speculative "
+                    "decoding; the pool must not publish flat groups under "
+                    "spec (TODO(flat+spec))"
+                )
+            state_in_pages, state_out_pages = self._flat_state_pages(
+                bs, seq_lens, forward_mode, kwargs
+            )
+
         track_ssm_h_src = None
         track_ssm_h_src_fla = None
         track_ssm_h_dst = None
@@ -538,8 +690,13 @@ class MambaAttnBackend(AttentionBackend):
         track_ssm_final_src = None
         track_ssm_final_dst = None
         if (
-            forward_mode.is_extend_or_mixed() or is_draft_extend
-        ) and not is_target_verify:
+            (forward_mode.is_extend_or_mixed() or is_draft_extend)
+            and not is_target_verify
+            # Radix-only prefix snapshot tracking: flat mode snapshots states
+            # via page claiming (dual-index), and track indices address the
+            # SimpleMambaPool row space, not the state slabs.
+            and not self.flat_state_active
+        ):
             extend_prefix_lens_kw = kwargs.get("extend_prefix_lens")
             mamba_track_pool_indices = kwargs.get("mamba_track_pool_indices")
             if (
@@ -605,6 +762,8 @@ class MambaAttnBackend(AttentionBackend):
             track_conv_indices=track_conv_indices,
             track_ssm_final_src=track_ssm_final_src,
             track_ssm_final_dst=track_ssm_final_dst,
+            state_in_pages=state_in_pages,
+            state_out_pages=state_out_pages,
         )
 
     def _compute_track_conv_indices(
@@ -675,6 +834,23 @@ class MambaAttnBackend(AttentionBackend):
             self.query_start_loc_list.append(
                 torch.empty((i + 2,), dtype=torch.int32, device=self.device)
             )
+            if self.flat_state_active:
+                self.flat_state_in_list.append(
+                    torch.full(
+                        (i + 1,),
+                        self.pad_slot_id,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                )
+                self.flat_state_out_list.append(
+                    torch.full(
+                        (i + 1,),
+                        self.pad_slot_id,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                )
             if self.speculative_num_draft_tokens > 0:
                 self.output_indices_list.append(
                     torch.full(
@@ -734,7 +910,11 @@ class MambaAttnBackend(AttentionBackend):
         # Reuse the pre-allocated [bs]-length buffer as mamba_indices so the
         # capture path matches the replay path: zero allocation, single write.
         padded_mamba_indices = self.state_indices_list[bs - 1]
-        if mamba_pool_indices is not None:
+        if self.pool is None:
+            # Poolless flat mode: the buffer stays all pad_slot_id (consumers
+            # are pool/radix-gated; states travel via state_in/out_pages).
+            padded_mamba_indices.fill_(self.pad_slot_id)
+        elif mamba_pool_indices is not None:
             padded_mamba_indices[:bs].copy_(
                 self.pool.get_mamba_indices(mamba_pool_indices[:bs])
             )
@@ -756,6 +936,28 @@ class MambaAttnBackend(AttentionBackend):
                 out=mamba_output_indices,
             )
             padded_mamba_indices.copy_(mamba_input_indices)
+        state_in_pages = None
+        state_out_pages = None
+        if self.flat_state_active:
+            # Real tables only arrive at replay; capture binds the persistent
+            # buffers (all pad_slot_id: kernels skip reads/writes at capture,
+            # so state slab rows are never dirtied by the capture pass).
+            if is_target_verify or is_draft_extend:
+                raise RuntimeError(
+                    "flat GDN state paging: CUDA-graph capture supports "
+                    "plain decode only (flat+spec unsupported)"
+                )
+            flat_ids = kwargs.get("flat_cache_group_ids", ())
+            if _STATE_GROUP_ID not in flat_ids:
+                raise RuntimeError(
+                    "flat GDN state paging: capture is missing the "
+                    f"{_STATE_GROUP_ID!r} flat cache group id "
+                    f"(got {tuple(flat_ids)!r})"
+                )
+            state_in_pages = self.flat_state_in_list[bs - 1]
+            state_out_pages = self.flat_state_out_list[bs - 1]
+            state_in_pages.fill_(self.pad_slot_id)
+            state_out_pages.fill_(self.pad_slot_id)
         self._qsl_dirty[bs - 1] = False
         self._qsl_last_mode[bs - 1] = (forward_mode, self.spec_num_tokens > 1)
         self.forward_metadata = MambaForwardMetadata(
@@ -763,6 +965,8 @@ class MambaAttnBackend(AttentionBackend):
             mamba_cache_indices=self.state_indices_list[bs - 1],
             mamba_output_indices=mamba_output_indices,
             mamba_req_pool_indices=req_pool_indices[:bs],
+            state_in_pages=state_in_pages,
+            state_out_pages=state_out_pages,
         )
 
     def init_forward_metadata_replay_cuda_graph(
@@ -785,16 +989,21 @@ class MambaAttnBackend(AttentionBackend):
         # see the full-batch shape with padding rows already set to -1.
         # Zero extra allocations on this hot path.
         padded_mamba_indices = self.state_indices_list[bs - 1]
-        if mamba_pool_indices is not None:
-            padded_mamba_indices[:real_bs].copy_(
-                self.pool.get_mamba_indices(mamba_pool_indices[:real_bs])
-            )
+        if self.pool is None:
+            # Poolless flat mode: the buffer stays all pad_slot_id (consumers
+            # are pool/radix-gated; states travel via state_in/out_pages).
+            padded_mamba_indices.fill_(self.pad_slot_id)
         else:
-            padded_mamba_indices[:real_bs].copy_(
-                self.pool.get_mamba_indices(req_pool_indices[:real_bs])
-            )
-        if num_padding > 0:
-            padded_mamba_indices[real_bs:].fill_(-1)
+            if mamba_pool_indices is not None:
+                padded_mamba_indices[:real_bs].copy_(
+                    self.pool.get_mamba_indices(mamba_pool_indices[:real_bs])
+                )
+            else:
+                padded_mamba_indices[:real_bs].copy_(
+                    self.pool.get_mamba_indices(req_pool_indices[:real_bs])
+                )
+            if num_padding > 0:
+                padded_mamba_indices[real_bs:].fill_(-1)
 
         is_target_verify = (
             forward_mode is not None
@@ -859,11 +1068,34 @@ class MambaAttnBackend(AttentionBackend):
             self._qsl_dirty[bs - 1] = True
             self._qsl_last_mode[bs - 1] = (forward_mode, self.spec_num_tokens > 1)
 
+        state_in_pages = None
+        state_out_pages = None
+        if self.flat_state_active:
+            # Decode-only (q_len == 1): before = seq_lens - 1. Padded rows
+            # (zero table rows, seq_lens 1) are overwritten with pad_slot_id
+            # below, so validation is skipped to avoid a host sync.
+            state_in, state_out = self._flat_state_pages(
+                bs,
+                seq_lens,
+                forward_mode,
+                kwargs,
+                validate=False,
+            )
+            state_in_pages = self.flat_state_in_list[bs - 1]
+            state_out_pages = self.flat_state_out_list[bs - 1]
+            state_in_pages[:real_bs].copy_(state_in[:real_bs])
+            state_out_pages[:real_bs].copy_(state_out[:real_bs])
+            if num_padding > 0:
+                state_in_pages[real_bs:].fill_(self.pad_slot_id)
+                state_out_pages[real_bs:].fill_(self.pad_slot_id)
+
         self.forward_metadata = MambaForwardMetadata(
             query_start_loc=self.query_start_loc_list[bs - 1],
             mamba_cache_indices=self.state_indices_list[bs - 1],
             mamba_output_indices=mamba_output_indices,
             mamba_req_pool_indices=req_pool_indices,
+            state_in_pages=state_in_pages,
+            state_out_pages=state_out_pages,
         )
 
     def get_cuda_graph_seq_len_fill_value(self):
@@ -916,9 +1148,22 @@ class MambaAttnBackend(AttentionBackend):
         dt_bias = kwargs["dt_bias"]
         layer_id = kwargs["layer_id"]
 
-        conv_states, ssm_states, *rest = self.pool.get_mamba_params(layer_id)
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
+        state_in_pages = self.forward_metadata.state_in_pages
+        state_out_pages = self.forward_metadata.state_out_pages
+        use_flat = state_in_pages is not None
+
+        if use_flat:
+            # Dual-index: read the page holding position n-1, write the page
+            # holding position n (in == out within a page; a boundary crossing
+            # reads the old page and writes the new one). pad_slot_id rows
+            # (graph padding) are skipped by both kernels.
+            conv_states, ssm_states = self.kv_pool.get_state_buffers(layer_id)
+            read_indices = state_in_pages
+        else:
+            conv_states, ssm_states, *rest = self.pool.get_mamba_params(layer_id)
+            read_indices = cache_indices
 
         mixed_qkv = causal_conv1d_update(
             mixed_qkv,
@@ -926,7 +1171,8 @@ class MambaAttnBackend(AttentionBackend):
             conv_weights,
             bias,
             activation,
-            conv_state_indices=cache_indices,
+            conv_state_indices=read_indices,
+            output_state_indices=(state_out_pages.view(-1, 1) if use_flat else None),
         )
 
         query, key, value = torch.split(
@@ -953,11 +1199,15 @@ class MambaAttnBackend(AttentionBackend):
             a=a,
             b=b,
             initial_state_source=ssm_states,
-            initial_state_indices=cache_indices,
+            initial_state_indices=read_indices,
             cu_seqlens=query_start_loc,
             use_qk_l2norm_in_kernel=True,
             softplus_beta=1.0,
             softplus_threshold=20.0,
+            # Flat: don't write back to the (possibly shared) in page; the
+            # post-step state lands on the out page instead.
+            disable_state_update=use_flat,
+            output_state_indices=state_out_pages if use_flat else None,
         )
         return core_attn_out
 
@@ -1028,7 +1278,22 @@ class MambaAttnBackend(AttentionBackend):
             # needn't contiguous here.
             mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
-            conv_states, ssm_states = self.pool.get_mamba_params(layer_id)
+            state_in_pages = self.forward_metadata.state_in_pages
+            state_out_pages = self.forward_metadata.state_out_pages
+            use_flat = state_in_pages is not None
+            if use_flat:
+                conv_states, ssm_states = self.kv_pool.get_state_buffers(layer_id)
+                state_in_long = state_in_pages.to(torch.int64)
+                state_out_long = state_out_pages.to(torch.int64)
+                # Seed the out page's conv window from the in page (identity
+                # within a page; page 0 is the all-zero null page), then run
+                # the conv read+write entirely on the out page so a shared
+                # snapshot in-page is never written.
+                conv_states[state_out_long] = conv_states[state_in_long]
+                conv_cache_indices = state_out_pages
+            else:
+                conv_states, ssm_states = self.pool.get_mamba_params(layer_id)
+                conv_cache_indices = cache_indices
             extend_prefix_lens = kwargs.get("extend_prefix_lens")
             if extend_prefix_lens is None:
                 extend_prefix_lens = self.forward_metadata.extend_prefix_lens
@@ -1065,7 +1330,7 @@ class MambaAttnBackend(AttentionBackend):
                 activation=activation,
                 conv_states=conv_states,
                 has_initial_state=has_initial_states,
-                cache_indices=cache_indices,
+                cache_indices=conv_cache_indices,
                 query_start_loc=query_start_loc,
                 seq_lens_cpu=extend_seq_lens_cpu,
             ).transpose(0, 1)[:seq_len]
@@ -1113,7 +1378,7 @@ class MambaAttnBackend(AttentionBackend):
             g = g.unsqueeze(0)
             beta = beta.unsqueeze(0)
 
-            recurrent_state = ssm_states[cache_indices]
+            recurrent_state = ssm_states[state_in_long if use_flat else cache_indices]
             need_final_track = (
                 self.forward_metadata.track_ssm_final_src is not None
                 and self.forward_metadata.track_ssm_final_src.numel() > 0
@@ -1169,7 +1434,9 @@ class MambaAttnBackend(AttentionBackend):
                 core_attn_out = gdn_result.out
                 last_recurrent_state = gdn_result.final_state
             last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
-            ssm_states[cache_indices] = last_recurrent_state
+            ssm_states[state_out_long if use_flat else cache_indices] = (
+                last_recurrent_state
+            )
 
             if need_h_track:
                 ssm_states[self.forward_metadata.track_ssm_h_dst] = fi_h_checkpoints[
@@ -1196,6 +1463,13 @@ class MambaAttnBackend(AttentionBackend):
 class HybridLinearAttnBackend(AttentionBackend):
     """Hybrid backend that routes between full attention and linear attention by layer ID."""
 
+    # Both sub-backends consume flat per-group tables (MHA: KV pages; mamba:
+    # dual-index state pages). Safety comes from the publication rule
+    # (paged_cache_spec.publish_paged_cache_groups): a radix ext or spec
+    # decode never publishes groups, so no tables (and no flat capture
+    # buffers) exist on those paths.
+    uses_flat_cache_groups: bool = True
+
     def __init__(
         self,
         full_attn_backend: AttentionBackend,
@@ -1221,7 +1495,6 @@ class HybridLinearAttnBackend(AttentionBackend):
             "mamba_cow_src_indices",
             "mamba_branching_seqlens",
             "mamba_track_pool_indices",
-            "mamba_cache_chunk_size",
         }
     )
 
@@ -1243,9 +1516,18 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.full_attn_backend.init_forward_metadata(*args, **common_kw)
         self.linear_attn_backend.init_forward_metadata(*args, **common_kw, **mamba_kw)
 
-    def init_cuda_graph_state(self, max_bs: int, seq_lens_buf: torch.Tensor):
-        for backend in self._backends():
-            backend.init_cuda_graph_state(max_bs, seq_lens_buf)
+    def init_cuda_graph_state(self, max_bs: int, seq_lens_buf: torch.Tensor, **kwargs):
+        # kwargs (e.g. paged_cache_group_specs, so the full backend sheds
+        # state-family groups) are forwarded through the shared signature
+        # filter: the full backend is user-selectable and may have a narrow
+        # signature (e.g. TRTLLM MHA takes only (max_bs, seq_lens_buf)), and
+        # the mamba backend keeps its narrow signature today.
+        init_backend_cuda_graph_state(
+            self.full_attn_backend, max_bs, seq_lens_buf, **kwargs
+        )
+        init_backend_cuda_graph_state(
+            self.linear_attn_backend, max_bs, seq_lens_buf, **kwargs
+        )
 
     def register_step_counter(self, step_counter):
         # Hybrid layerwise transfer needs one global step per model layer,
@@ -1295,20 +1577,10 @@ class HybridLinearAttnBackend(AttentionBackend):
     ):
         """Dispatch one layer to its full-attention or GDN backend (the break point).
 
-        This wrapper OVERRIDES the base forward, so it carries its own
-        ``@break_point`` (else its full-attn + GDN layers bypass the base
-        decoration). The handoff buffer is inferred from the actual output --
-        q-shaped for full-attention layers, z-shaped for the GDN path (q=None)
-        -- so no per-branch out-spec is needed. Under a prefill-graph replay
-        the decorated scalar args (``forward_mode``, ``bs``) are frozen to the
-        capture-time dummy (EXTEND, bs=1) and are re-read from the live ambient
-        ctx instead, so a MIXED or bs>1 replay dispatches the per-mode backend
-        (and the GDN scan) correctly. The GDN scan's output rank is
-        canonicalized here to a stable [T, Hv, D] (== z.shape), as the
-        ``@break_point`` handoff buffer requires: ``gdn_chunk_prefill`` mirrors
-        its input rank, returning batched [1, T, Hv, D] on the uniform bs=1
-        path (which the dummy capture batch hits) vs ragged [T, Hv, D]
-        otherwise; full-attention output is 2D and untouched.
+        Overrides the base forward, so it carries its own ``@break_point``;
+        the frozen capture-time scalars (forward_mode/bs) are re-read from the
+        ambient ctx (semantics: see breakable_cuda_graph). The GDN scan's
+        batched [1, T, Hv, D] output is collapsed to z-shaped [T, Hv, D].
         """
         if forward_mode is None:
             return super().forward(

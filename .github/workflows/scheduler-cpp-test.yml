@@ -47,3 +47,36 @@ jobs:
 
       - name: Run scheduler C++ tests
         run: ./tokenspeed-scheduler/build/tokenspeed_scheduler_tests
+
+  test-flat:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+          python -m pip install "nanobind>=2.13.0" tokenspeed-spdlog==1.15.1
+
+      - name: Configure scheduler C++ tests (flat KV cache)
+        run: |
+          cmake -S tokenspeed-scheduler -B tokenspeed-scheduler/build-flat \
+            -G Ninja \
+            -DTOKENSPEED_SCHEDULER_BUILD_TESTS=ON \
+            -DTOKENSPEED_SCHEDULER_BUILD_PYTHON=OFF \
+            -DTOKENSPEED_FLAT_KVCACHE=ON
+
+      - name: Build scheduler C++ tests (flat KV cache)
+        run: cmake --build tokenspeed-scheduler/build-flat --target tokenspeed_scheduler_tests
+
+      - name: Run scheduler C++ tests (flat KV cache)
+        run: |
+          FILTER="-$(grep -v '^#' tokenspeed-scheduler/tests/cpp/flat_known_radix_failures.txt | paste -sd: -)"
+          ./tokenspeed-scheduler/build-flat/tokenspeed_scheduler_tests --gtest_filter="$FILTER"

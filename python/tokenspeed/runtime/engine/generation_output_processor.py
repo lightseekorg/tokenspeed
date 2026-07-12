@@ -440,6 +440,19 @@ class OutputProcesser:
             # and a reused rid isn't instantly re-aborted on next register.
             self.pending_aborts.pop(rid, None)
 
+    def reap_finished_orphan(self, rid: str, state: RequestState) -> None:
+        """Resolve a finished request that no future forward op will reap.
+
+        Stream the terminating finish to a passive client (pause-initiated
+        aborts still have the client waiting on the stream); client-initiated
+        aborts already tore down their own state, so just drop the registered
+        state so the rid does not leak.
+        """
+        if state.abort_notify_client:
+            self.publish_finished_at_admission(rid, state)
+        else:
+            self.rid_to_state.pop(rid, None)
+
     def _host_advance_matcher(self, completion, model_execution_results):
         """Host-side fallback for the grammar matcher advance.
 
@@ -595,6 +608,11 @@ class OutputProcesser:
             if model_execution_results.output_nan_flags is not None
             else None
         )
+        # Per-slot total prefill length as the OP sees it (C++ Request::PrefillSize()).
+        # After a flat retract the victim's generated tokens are rebased into the
+        # prefill window (RebasePrefill), so this can exceed the original prompt
+        # length that RequestState.prefill_finished compares against.
+        prefill_lengths = getattr(forward_op, "prefill_lengths", None)
         pt = 0
         for i, rid in enumerate(forward_op.request_ids):
             output_length = model_execution_results.output_lengths[i].item()
@@ -618,6 +636,17 @@ class OutputProcesser:
 
             request_state: RequestState = self.rid_to_state[rid]
             # scheduled_time is stamped pre-forward in the event loop (queue end)
+
+            # Mid-chunk extend slot by the op's own prefill_lengths (rebased after
+            # flat retract; C++ owes no result and the sampled token is garbage).
+            # Fresh requests: prefill_length == prompt length, same as the gate below.
+            if (
+                not is_decode_slot
+                and prefill_lengths is not None
+                and forward_op.extend_prefix_lens[i] + forward_op.input_lengths[i]
+                < prefill_lengths[i]
+            ):
+                continue
 
             # Do not output chunking result
             if not request_state.prefill_finished:

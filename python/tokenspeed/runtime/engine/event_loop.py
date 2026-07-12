@@ -31,12 +31,19 @@ import torch.distributed as dist
 import zmq
 from tokenspeed_scheduler import PD, Cache, ExecutionEvent, ForwardEvent, Scheduler
 
+from tokenspeed.runtime.cache.executor.flat_memory_executor import (
+    FlatMemoryExecutor,
+)
 from tokenspeed.runtime.cache.executor.memory_executor import (
     MemoryExecutor,
     MemoryExecutorConfig,
 )
 from tokenspeed.runtime.cache.transfer.types import CacheKind
 from tokenspeed.runtime.configs.model_config import ModelConfig
+from tokenspeed.runtime.configs.paged_cache_spec import (
+    scheduler_ext_flat_kvcache,
+    validate_flat_scheduler_config,
+)
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -309,7 +316,19 @@ class EventLoop:
             mamba_l2_layout=server_args.mamba_l2_layout,
             mamba_l2_io_backend=server_args.mamba_l2_io_backend,
         )
-        if not token_to_kv_pool.supports_hierarchical_kv_cache:
+        if scheduler_ext_flat_kvcache() and server_args.enable_kvstore:
+            if server_args.kvstore_storage_backend is not None:
+                raise NotImplementedError(
+                    "flat scheduler build (TOKENSPEED_FLAT_KVCACHE) has no L3 "
+                    "storage tier yet; unset --kvstore-storage-backend."
+                )
+            self.memory_executor = FlatMemoryExecutor(
+                device_pool=token_to_kv_pool,
+                host_ratio=server_args.kvstore_ratio,
+                host_size_gb=server_args.kvstore_size,
+            )
+            num_host_pages = self.memory_executor.num_host_pages
+        elif not token_to_kv_pool.supports_hierarchical_kv_cache:
             if server_args.enable_kvstore:
                 raise NotImplementedError(
                     "This KV cache pool does not support hierarchical cache "
@@ -328,6 +347,12 @@ class EventLoop:
             )
             num_host_pages = self.memory_executor.host_pool.page_num
 
+        # Flat host tier acks loadbacks (LoadBackDoneEvent), so they join the
+        # inflight accounting in _submit_cache_ops; radix loadbacks never ack.
+        self._loadback_acks_expected = getattr(
+            self.memory_executor, "emits_loadback_acks", False
+        )
+
         self._kv_events_enabled = (
             EventPublisherFactory.is_enabled(server_args.kv_events_config)
             and attn_tp_rank == 0
@@ -342,6 +367,14 @@ class EventLoop:
 
         # Adjunct enabled only when pool opts in AND prefix-caching switch is on.
         paged_cache_groups = pool_to_paged_cache_groups(token_to_kv_pool)
+        validate_flat_scheduler_config(
+            flat_kvcache_ext=scheduler_ext_flat_kvcache(),
+            paged_cache_groups=paged_cache_groups,
+            attn_backend=attn_backend,
+            kv_pool=token_to_kv_pool,
+            speculative_algorithm=server_args.speculative_algorithm,
+        )
+        self._paged_cache_groups = paged_cache_groups
         prefix_cache_adjunct = None
         required_groups = token_to_kv_pool.prefix_cache_required_group_ids
         if required_groups is not None and server_args.enable_prefix_caching:
@@ -370,13 +403,13 @@ class EventLoop:
             prefix_cache_adjunct=prefix_cache_adjunct,
         )
         logger.info(
-            "Scheduler config: page_size=%s num_device_pages=%s "
+            "Scheduler config: block_size=%s num_device_pages=%s "
             "max_scheduled_tokens=%s decode_input_tokens=%s "
             "overlap_schedule_depth=%s disable_l2_cache=%s "
             "max_batch_size=%s (global max_num_seqs=%s, dp_size=%s) "
             "mamba_pool_total_chunks=%s enable_mamba=%s "
             "disable_prefix_cache=%s paged_cache_groups=%s",
-            scheduler_cfg.page_size,
+            scheduler_cfg.block_size,
             scheduler_cfg.num_device_pages,
             scheduler_cfg.max_scheduled_tokens,
             scheduler_cfg.decode_input_tokens,
@@ -960,7 +993,10 @@ class EventLoop:
             if isinstance(op, Cache.WriteBackOp):
                 self._num_inflight_cache_ops += len(op.op_ids)
             elif isinstance(op, Cache.LoadBackOp):
-                continue
+                # Radix loadbacks are fire-and-forget (no ack, nothing in
+                # flight); the flat host tier acks one LoadBackDone per op_id.
+                if self._loadback_acks_expected:
+                    self._num_inflight_cache_ops += len(op.op_ids)
             elif isinstance(op, (Cache.PrefetchOp, Cache.BackUpOp)):
                 self._num_inflight_cache_ops += 1
             else:
@@ -1076,12 +1112,7 @@ class EventLoop:
         if state is None:
             return False
         if state.finished:
-            if state.abort_notify_client:
-                self.output_processor.publish_finished_at_admission(
-                    spec.request_id, state
-                )
-            else:
-                self.output_processor.rid_to_state.pop(spec.request_id, None)
+            self.output_processor.reap_finished_orphan(spec.request_id, state)
             return False
         return True
 
@@ -1293,6 +1324,42 @@ class EventLoop:
         if len(forward_ops) == 0 or len(forward_ops[0].request_ids) == 0:
             return None
         return forward_ops[0]
+
+    def _handle_flat_oom_terminals(self, execution_plan) -> None:
+        """Surface flat-KV OOM terminals to their clients as abort finishes.
+
+        The C++ flat scheduler terminalizes a request that can never fit the
+        flat pool (AbortEvent inside the scheduler; the reaper reclaims its
+        resources) and reports its id on ``plan.flat_oom_request_ids``
+        (always empty on radix builds). The scheduler side is already fully
+        torn down — do NOT send a ForwardEvent.Abort back — but the client is
+        still waiting on the response stream, so finish the request with an
+        abort here (mirrors the PD FailedEvent handling above, minus the
+        scheduler abort).
+        """
+        oom_rids = getattr(execution_plan, "flat_oom_request_ids", None)
+        if not oom_rids:
+            return
+        for rid in oom_rids:
+            state = self.output_processor.rid_to_state.get(rid)
+            if state is None:
+                # rid already gone (e.g. a client abort raced ahead).
+                logger.debug(
+                    "flat OOM terminal for rid=%s: state missing; skipping", rid
+                )
+                continue
+            if state.finished:
+                # Already carries a finish (an abort raced ahead of the
+                # terminal). C++ reports this rid exactly once and no future
+                # forward op will reap it, so resolve it here (same orphan
+                # rule as _reap_or_keep_buffered_spec).
+                self.output_processor.reap_finished_orphan(rid, state)
+                continue
+            state.set_finish_with_abort(
+                "flat KV cache cannot fit this request: prompt exceeds pool "
+                "capacity (OOM)"
+            )
+            self.output_processor.publish_finished_at_admission(rid, state)
 
     def _process_kv_transfer_events(self, kv_transfer_events: list) -> list:
         processed = []
@@ -1518,6 +1585,7 @@ class EventLoop:
                 continue
             execution_plan = self.scheduler.next_execution_plan()
             self._publish_scheduler_kv_events()
+            self._handle_flat_oom_terminals(execution_plan)
             self._submit_cache_ops(execution_plan)
 
             forward_op = self._get_forward_op(execution_plan)
@@ -1669,6 +1737,7 @@ class EventLoop:
                 continue
             execution_plan = self.scheduler.next_execution_plan()
             self._publish_scheduler_kv_events()
+            self._handle_flat_oom_terminals(execution_plan)
 
             self._submit_cache_ops(execution_plan)
 

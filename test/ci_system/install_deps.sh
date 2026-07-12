@@ -156,14 +156,27 @@ fi
 # ============================================================
 echo "=== Step 8: Pin critical kernel deps ==="
 pin_version() {
-    # Extract "<pkg>==<version>" for an exact-pinned package in cuda.txt.
+    # Extract exact-pinned package specs, including optional extras.
     local pkg="$1"
-    grep -E "^${pkg}==" "${CUDA_REQ}" | head -n1 | tr -d '[:space:]'
+    grep -E "^${pkg}(\[[^]]+\])?==" "${CUDA_REQ}" | head -n1 | tr -d '[:space:]'
 }
 CUDA_MAJOR="${CUDA_VERSION%%.*}"
+CUTLASS_DSL_SPEC="$(pin_version nvidia-cutlass-dsl)"
+if [ -n "${CUTLASS_DSL_SPEC}" ]; then
+    CUTLASS_DSL_VERSION="${CUTLASS_DSL_SPEC##*==}"
+    CUTLASS_DSL_DEPS=(
+        "nvidia-cutlass-dsl==${CUTLASS_DSL_VERSION}"
+        "nvidia-cutlass-dsl-libs-base==${CUTLASS_DSL_VERSION}"
+        "nvidia-cutlass-dsl-libs-core==${CUTLASS_DSL_VERSION}"
+        "nvidia-cutlass-dsl-libs-cu${CUDA_MAJOR}==${CUTLASS_DSL_VERSION}"
+    )
+    echo "Force-reinstalling pinned Cutlass DSL packages: ${CUTLASS_DSL_DEPS[*]}"
+    pip_install_with_retry pip3 install --break-system-packages \
+        --force-reinstall --no-deps "${CUTLASS_DSL_DEPS[@]}"
+fi
+
 PINNED_KERNEL_DEPS=()
-for pkg in nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-cu${CUDA_MAJOR} \
-           flashinfer-python flashinfer-cubin; do
+for pkg in flashinfer-python flashinfer-cubin; do
     spec="$(pin_version "${pkg}")"
     if [ -n "${spec}" ]; then
         PINNED_KERNEL_DEPS+=("${spec}")
