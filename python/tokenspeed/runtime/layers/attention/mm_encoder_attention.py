@@ -18,10 +18,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Cache-less multi-headed attention used by VLM vision encoders.
+"""Cache-less multi-headed attention used by multimodal encoders.
 
-Encode-only attention layer used by Qwen3.5-VL / Kimi-K2.5-VL vision towers,
-plus its backend dispatch table. Backends are free functions (not
+Encode-only attention layer used by vision and audio towers, plus its backend
+dispatch table. Backends are free functions (not
 ``AttentionBackend`` subclasses) because the vision encoder is single-shot
 with no KV cache, no decode/extend split, and no graph capture protocol --
 the ``AttentionBackend`` ABC's prefill/decode/extend lifecycle does not
@@ -73,7 +73,7 @@ from tokenspeed_kernel.ops.attention.triton.qkv_rotary import (
 # CUDA-graph bucketing for the cuDNN vision prefill backend: batch and max
 # seqlen are quantized so a small set of captured graphs covers the request
 # distribution. The consts are consumed by VLM tower models, not by
-# ``VisionAttention`` itself.
+# ``MultimodalEncoderAttention`` itself.
 VIT_CUDNN_WORKSPACE_BYTES = 128 * 1024 * 1024
 VIT_CUDNN_BATCH_BUCKETS: tuple[int, ...] = (8, 16, 32, 64)
 VIT_CUDNN_SEQLEN_BUCKETS: tuple[int, ...] = (4096, 8192, 16384, 32768, 65536, 131072)
@@ -299,7 +299,7 @@ _BACKENDS: dict[str, Callable[..., torch.Tensor]] = {
 }
 
 
-def _default_vision_attn_backend() -> str:
+def _default_multimodal_encoder_attn_backend() -> str:
     """Platform default backend name."""
     if _is_nvidia:
         if _platform.arch_version.major == 9:  # Hopper SM90
@@ -310,7 +310,7 @@ def _default_vision_attn_backend() -> str:
     if _is_amd:
         return "triton_attn"
     raise RuntimeError(
-        f"No default vision attention backend for platform {_platform}; "
+        f"No default multimodal encoder attention backend for platform {_platform}; "
         "set --mm-attention-backend explicitly."
     )
 
@@ -325,27 +325,29 @@ def _resolve_backend(name: str | None) -> Callable[..., torch.Tensor]:
     """
     explicit = name is not None
     if name is None:
-        name = _default_vision_attn_backend()
+        name = _default_multimodal_encoder_attn_backend()
     fn = _BACKENDS.get(name)
     if fn is None:
         raise ValueError(
-            f"Unknown vision attention backend {name!r} "
+            f"Unknown multimodal encoder attention backend {name!r} "
             f"(check --mm-attention-backend); available: {sorted(_BACKENDS)}"
         )
     if name in ("fa3", "fa4", "flashinfer_cudnn") and not _is_nvidia:
         raise ValueError(
-            f"vision attention backend {name!r} is only available on NVIDIA CUDA"
+            f"multimodal encoder attention backend {name!r} is only available "
+            "on NVIDIA CUDA"
         )
     if name == "fa3" and _platform.is_blackwell:
         raise ValueError("The 'fa3' backend is not supported on Blackwell GPUs")
     logger.info(
-        f"vision attention backend: {name} ({'override' if explicit else 'auto'})"
+        f"multimodal encoder attention backend: {name} "
+        f"({'override' if explicit else 'auto'})"
     )
     return fn
 
 
-class VisionAttention(nn.Module):
-    r"""Multi-headed attention without any cache, mostly used for multimodal transformers."""
+class MultimodalEncoderAttention(nn.Module):
+    r"""Multi-headed attention without a KV cache for multimodal encoders."""
 
     def __init__(
         self,
@@ -552,3 +554,7 @@ class VisionAttention(nn.Module):
         output, _ = self.proj(output)
 
         return output
+
+
+# Compatibility alias for existing vision tower implementations.
+VisionAttention = MultimodalEncoderAttention
