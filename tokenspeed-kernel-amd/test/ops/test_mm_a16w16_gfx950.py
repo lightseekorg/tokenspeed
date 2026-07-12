@@ -76,6 +76,39 @@ def test_dense16_kernel_variant_correctness(
     torch.testing.assert_close(out, torch.mm(a, b.T), atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.parametrize("kernel,shape", _CORRECTNESS_CASES)
+def test_dense16_kernel_variant_writes_strided_out(
+    kernel, shape: tuple[int, int, int]
+) -> None:
+    torch.manual_seed(0)
+    dtype = torch.bfloat16
+    m, n, k = shape
+    a = torch.randn((m, k), device="cuda", dtype=dtype) * 0.25
+    b = torch.randn((n, k), device="cuda", dtype=dtype) * 0.25
+    backing = torch.empty((m, n + 17), device="cuda", dtype=dtype)
+    out = backing[:, :n]
+
+    actual = kernel(a, b, dtype, out=out)
+
+    assert actual is out
+    torch.testing.assert_close(out, torch.mm(a, b.T), atol=1e-2, rtol=1e-2)
+
+
+def test_splitk_smallm_out_handles_padded_reducer_rows() -> None:
+    torch.manual_seed(0)
+    dtype = torch.bfloat16
+    m, n, k = 2, 256, 2048
+    a = torch.randn((m, k), device="cuda", dtype=dtype) * 0.25
+    b = torch.randn((n, k), device="cuda", dtype=dtype) * 0.25
+    backing = torch.empty((m, n + 17), device="cuda", dtype=dtype)
+    out = backing[:, :n]
+
+    actual = gluon_mm_a16w16_mfma_lds_smallm_gfx950(a, b, dtype, out=out)
+
+    assert actual is out
+    torch.testing.assert_close(out, torch.mm(a, b.T), atol=1e-2, rtol=1e-2)
+
+
 def test_use_warp_reduce_covers_small_k_decode_shapes() -> None:
     assert _use_warp_reduce_smallm(1, 1280, 1024)
     assert _use_warp_reduce_smallm(2, 2560, 2048)

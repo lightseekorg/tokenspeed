@@ -80,6 +80,7 @@ if fp8_gemm_nt is not None:
         *,
         alpha: torch.Tensor | None = None,
         block_size: list[int] | None = None,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert (
             A_scales is not None
@@ -89,4 +90,8 @@ if fp8_gemm_nt is not None:
         N = B.shape[0]
         C = A.new_empty(A.shape[0], N, dtype=torch.bfloat16)
         fp8_gemm_nt((A, A_scales), (B, B_scales), C)
-        return C.to(out_dtype)
+        output = C.to(out_dtype)
+        if out is not None:
+            out.copy_(output)
+            return out
+        return output

@@ -274,6 +274,12 @@ def _mm_dense_cdna4_aligned() -> torch.Tensor:
     return tokenspeed_kernel.mm(a, b)
 
 
+def _bmm_dense() -> torch.Tensor:
+    a = torch.empty((4, 2, 16), dtype=torch.bfloat16)
+    b = torch.empty((4, 32, 16), dtype=torch.bfloat16)
+    return tokenspeed_kernel.bmm(a, b)
+
+
 def _mm_mxfp8() -> torch.Tensor:
     a = torch.empty((4, 128), dtype=_fp8_dtype())
     b = torch.empty((128, 128), dtype=_fp8_dtype())
@@ -294,6 +300,33 @@ def test_gemm_mxfp8_online_activation_signature_uses_quantized_storage() -> None
     a = torch.empty((4, 128), dtype=torch.bfloat16)
     b = torch.empty((128, 128), dtype=_fp8_dtype())
     b_scales = torch.empty((1, 1), dtype=torch.float32)
+
+    signature = _gemm_pkg._gemm_format_signature(
+        a,
+        b,
+        None,
+        b_scales,
+        torch.bfloat16,
+        "mxfp8",
+        [128, 128],
+    )
+
+    a_format = signature.format_for("a")
+    b_format = signature.format_for("b")
+    assert a_format is not None
+    assert b_format is not None
+    assert a_format.storage_dtype == _fp8_dtype()
+    assert b_format.storage_dtype == _fp8_dtype()
+    assert a_format.scale is not None
+    assert b_format.scale is not None
+    assert a_format.scale.block_shape == (128, 128)
+    assert b_format.scale.block_shape == (128, 128)
+
+
+def test_bmm_mxfp8_online_activation_signature_uses_quantized_storage() -> None:
+    a = torch.empty((2, 4, 128), dtype=torch.bfloat16)
+    b = torch.empty((2, 128, 128), dtype=_fp8_dtype())
+    b_scales = torch.empty((2, 1, 1), dtype=torch.float32)
 
     signature = _gemm_pkg._gemm_format_signature(
         a,
@@ -386,6 +419,32 @@ def test_gemm_fp8_scaled_signature_uses_fp8_format_with_scale() -> None:
         assert tensor_format.scale.storage_dtype == torch.float32
 
 
+def test_bmm_fp8_scaled_signature_uses_fp8_format_with_scale() -> None:
+    a = torch.empty((2, 4, 128), dtype=_fp8_dtype())
+    b = torch.empty((2, 128, 128), dtype=_fp8_dtype())
+    a_scales = torch.empty((1,), dtype=torch.float32)
+    b_scales = torch.empty((1,), dtype=torch.float32)
+
+    signature = _gemm_pkg._gemm_format_signature(
+        a,
+        b,
+        a_scales,
+        b_scales,
+        torch.bfloat16,
+        "fp8",
+        None,
+    )
+
+    for role in ("a", "b"):
+        tensor_format = signature.format_for(role)
+        assert tensor_format is not None
+        assert tensor_format.format == "scaled-fp8"
+        assert tensor_format.storage_dtype == _fp8_dtype()
+        assert tensor_format.scale is not None
+        assert tensor_format.scale.granularity == "tensor"
+        assert tensor_format.scale.storage_dtype == torch.float32
+
+
 def test_gemm_fp8_scaled_signature_uses_channel_granularity() -> None:
     a = torch.empty((4, 128), dtype=_fp8_dtype())
     b = torch.empty((128, 128), dtype=_fp8_dtype())
@@ -407,6 +466,179 @@ def test_gemm_fp8_scaled_signature_uses_channel_granularity() -> None:
         assert tensor_format is not None
         assert tensor_format.scale is not None
         assert tensor_format.scale.granularity == "channel"
+
+
+def test_bmm_fp8_scaled_signature_uses_channel_granularity() -> None:
+    a = torch.empty((4, 2, 128), dtype=_fp8_dtype())
+    b = torch.empty((4, 32, 128), dtype=_fp8_dtype())
+    a_scales = torch.empty((4, 2), dtype=torch.float32)
+    b_scales = torch.empty((4, 32), dtype=torch.float32)
+
+    signature = _gemm_pkg._gemm_format_signature(
+        a,
+        b,
+        a_scales,
+        b_scales,
+        torch.bfloat16,
+        "fp8",
+        None,
+    )
+
+    for role in ("a", "b"):
+        tensor_format = signature.format_for(role)
+        assert tensor_format is not None
+        assert tensor_format.scale is not None
+        assert tensor_format.scale.granularity == "channel"
+
+
+def test_gemm_quantized_reference_dispatches_fp8_inputs() -> None:
+    fp8_dtype = _fp8_dtype()
+    a = torch.zeros((4, 128), dtype=fp8_dtype)
+    a_bf16 = torch.zeros((4, 128), dtype=torch.bfloat16)
+    b = torch.zeros((128, 128), dtype=fp8_dtype)
+    tensor_scales = torch.ones((1,), dtype=torch.float32)
+    block_a_scales = torch.ones((4, 1), dtype=torch.float32)
+    block_b_scales = torch.ones((1, 1), dtype=torch.float32)
+
+    blockscale = tokenspeed_kernel.mm(
+        a,
+        b,
+        A_scales=block_a_scales,
+        B_scales=block_b_scales,
+        out_dtype=torch.bfloat16,
+        block_size=[128, 128],
+        quant="mxfp8",
+        override="torch_mm_fp8_blockscale",
+    )
+    assert blockscale.shape == (4, 128)
+    assert blockscale.dtype == torch.bfloat16
+
+    online_blockscale = tokenspeed_kernel.mm(
+        a_bf16,
+        b,
+        B_scales=block_b_scales,
+        out_dtype=torch.bfloat16,
+        block_size=[128, 128],
+        quant="mxfp8",
+        override="torch_mm_fp8_blockscale",
+    )
+    assert online_blockscale.shape == (4, 128)
+    assert online_blockscale.dtype == torch.bfloat16
+
+    tensor_scaled = tokenspeed_kernel.mm(
+        a,
+        b,
+        A_scales=tensor_scales,
+        B_scales=tensor_scales,
+        out_dtype=torch.bfloat16,
+        quant="fp8",
+        override="torch_mm_fp8_scaled_mnk",
+    )
+    assert tensor_scaled.shape == (4, 128)
+    assert tensor_scaled.dtype == torch.bfloat16
+
+
+def test_bmm_quantized_reference_dispatches_fp8_inputs() -> None:
+    fp8_dtype = _fp8_dtype()
+    a = torch.zeros((2, 4, 128), dtype=fp8_dtype)
+    a_bf16 = torch.zeros((2, 4, 128), dtype=torch.bfloat16)
+    b = torch.zeros((2, 128, 128), dtype=fp8_dtype)
+    tensor_scales = torch.ones((1,), dtype=torch.float32)
+    channel_a_scales = torch.ones((2, 4), dtype=torch.float32)
+    channel_b_scales = torch.ones((2, 128), dtype=torch.float32)
+    block_a_scales = torch.ones((2, 4, 1), dtype=torch.float32)
+    block_b_scales = torch.ones((2, 1, 1), dtype=torch.float32)
+
+    blockscale = tokenspeed_kernel.bmm(
+        a,
+        b,
+        A_scales=block_a_scales,
+        B_scales=block_b_scales,
+        out_dtype=torch.bfloat16,
+        block_size=[128, 128],
+        quant="mxfp8",
+        override="torch_bmm_fp8_blockscale",
+    )
+    assert blockscale.shape == (2, 4, 128)
+    assert blockscale.dtype == torch.bfloat16
+
+    online_blockscale = tokenspeed_kernel.bmm(
+        a_bf16,
+        b,
+        B_scales=block_b_scales,
+        out_dtype=torch.bfloat16,
+        block_size=[128, 128],
+        quant="mxfp8",
+        override="torch_bmm_fp8_blockscale",
+    )
+    assert online_blockscale.shape == (2, 4, 128)
+    assert online_blockscale.dtype == torch.bfloat16
+
+    tensor_scaled = tokenspeed_kernel.bmm(
+        a,
+        b,
+        A_scales=tensor_scales,
+        B_scales=tensor_scales,
+        out_dtype=torch.bfloat16,
+        quant="fp8",
+        override="torch_bmm_fp8_scaled",
+    )
+    assert tensor_scaled.shape == (2, 4, 128)
+    assert tensor_scaled.dtype == torch.bfloat16
+
+    channel_scaled = tokenspeed_kernel.bmm(
+        a,
+        b,
+        A_scales=channel_a_scales,
+        B_scales=channel_b_scales,
+        out_dtype=torch.bfloat16,
+        quant="fp8",
+        override="torch_bmm_fp8_scaled",
+    )
+    assert channel_scaled.shape == (2, 4, 128)
+    assert channel_scaled.dtype == torch.bfloat16
+
+
+def _copy_out_mm_kernel(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scales: torch.Tensor | None,
+    B_scales: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    *,
+    alpha: torch.Tensor | None = None,
+    block_size: list[int] | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    assert A_scales is None
+    assert B_scales is None
+    assert block_size is None
+    output = A @ B.T
+    if alpha is not None:
+        output = output * alpha.to(dtype=output.dtype)
+    output = output.to(out_dtype)
+    if out is not None:
+        out.copy_(output)
+        return out
+    return output
+
+
+def test_mm_non_native_out_kernel_copies_to_out(monkeypatch) -> None:
+    torch.manual_seed(1)
+    a = torch.randn((4, 8), dtype=torch.float32)
+    b = torch.randn((16, 8), dtype=torch.float32)
+    out = torch.empty((4, 16), dtype=torch.float32)
+
+    def select_copy_out_kernel(*args, **kwargs) -> SelectedKernel:
+        return SelectedKernel("test_mm_copy_out_kernel", _copy_out_mm_kernel)
+
+    monkeypatch.setattr(_gemm_pkg, "select_kernel", select_copy_out_kernel)
+
+    actual = tokenspeed_kernel.mm(a, b, out=out, override="test_mm_copy_out_kernel")
+    expected = a @ b.T
+
+    assert actual is out
+    torch.testing.assert_close(out, expected)
 
 
 def _mm_nvfp4() -> torch.Tensor:
@@ -431,6 +663,29 @@ def test_gemm_nvfp4_signature_uses_fixed_block_shape() -> None:
     b = torch.empty((128, 64), dtype=torch.uint8)
     a_scales = torch.empty((4, 1), dtype=torch.float32)
     b_scales = torch.empty((128, 1), dtype=torch.float32)
+
+    signature = _gemm_pkg._gemm_format_signature(
+        a,
+        b,
+        a_scales,
+        b_scales,
+        torch.bfloat16,
+        "nvfp4",
+        None,
+    )
+
+    for role in ("a", "b"):
+        tensor_format = signature.format_for(role)
+        assert tensor_format is not None
+        assert tensor_format.scale is not None
+        assert tensor_format.scale.block_shape == (16,)
+
+
+def test_bmm_nvfp4_signature_uses_fixed_block_shape() -> None:
+    a = torch.empty((2, 4, 64), dtype=torch.uint8)
+    b = torch.empty((2, 128, 64), dtype=torch.uint8)
+    a_scales = torch.empty((2, 4, 1), dtype=torch.float32)
+    b_scales = torch.empty((2, 128, 1), dtype=torch.float32)
 
     signature = _gemm_pkg._gemm_format_signature(
         a,
@@ -1688,6 +1943,14 @@ _CASES = [
     # GEMM API x architecture golden cases.
     _case(_is_supported_gpu, "supported-gpu", "gemm", "mm", "torch_mm", _mm_dense),
     _case(
+        _is_supported_gpu,
+        "supported-gpu",
+        "gemm",
+        "bmm",
+        "torch_bmm",
+        _bmm_dense,
+    ),
+    _case(
         _is_cdna4,
         "cdna4",
         "gemm",
@@ -1921,6 +2184,11 @@ def selected_kernel_spy(monkeypatch):
 
         if case.family == "gemm":
             a, b, _a_scales, _b_scales, out_dtype = args[:5]
+            if case.mode == "bmm":
+                n = b.shape[-2]
+                return torch.empty(
+                    (a.shape[0], a.shape[1], n), dtype=out_dtype, device=a.device
+                )
             n = b.shape[-1] if b.shape[0] == a.shape[-1] else b.shape[0]
             return torch.empty((a.shape[0], n), dtype=out_dtype, device=a.device)
 
