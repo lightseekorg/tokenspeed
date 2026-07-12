@@ -233,20 +233,25 @@ def test_update_block_table_logs_warning_on_clamp():
     assert any("page copy would exceed req_to_page capacity" in m for m in msgs), msgs
 
 
-def test_update_block_table_full_refresh_copies_whole_row(monkeypatch):
-    """A full_refresh=1 request must copy the scheduler's full occupied_pages
-    row from logical page 0, ignoring the begin/size tail delta; a full_refresh=0
-    request in the same batch keeps the tail-only delta."""
+def test_update_block_table_full_refresh_replaces_prefix_page(monkeypatch):
+    """full_refresh must copy repointed non-tail pages, not only append the tail.
+
+    If a prefix page changes from private P0 to canonical CACHED and the freed
+    P0 is immediately reused as the new tail, a tail-only mirror update would
+    leave logical page 0 and logical page 2 pointing at the same physical page.
+    """
     from tokenspeed.runtime.execution import cache_loc_kernel
 
     req_to_page = torch.zeros(8, 513, dtype=torch.int32)
-    # req[0]: full refresh -> whole row from 0, delta fields ignored.
+    # req[0]: old mirror had [10, 11]. The scheduler authoritative row is
+    # [99, 11, 10]: prefix repointed to cached page 99, freed page 10 reused
+    # as the new tail. Copying only begin=2,new=[10] would leave [10, 11, 10].
     # req[1]: tail-only -> begin=200, only the 2-page delta.
     forward_op = _make_forward_op(
-        begins=[100, 200],
+        begins=[2, 200],
         sizes=[1, 2],
-        new_occupied_pages=[[999], [50, 51]],
-        occupied_pages=[[10, 11, 12, 13], [40, 41, 42]],
+        new_occupied_pages=[[10], [50, 51]],
+        occupied_pages=[[99, 11, 10], [40, 41, 42]],
         full_refresh=[1, 0],
     )
 
@@ -268,11 +273,12 @@ def test_update_block_table_full_refresh_copies_whole_row(monkeypatch):
         forward_op, device="cpu", req_to_page=req_to_page
     )
 
-    # req[0] refreshed the whole 4-page row from start 0; req[1] kept its tail delta.
-    assert captured["num"] == [4, 2]
+    # req[0] refreshed the whole 3-page row from start 0; req[1] kept its tail
+    # delta. The flattened full-refresh row must be [99, 11, 10], not the
+    # tail-only aliasing update [10].
+    assert captured["num"] == [3, 2]
     assert captured["starts"] == [0, 200]
-    # Flattened: whole row of req[0] then the tail delta of req[1].
-    assert captured["pages"] == [10, 11, 12, 13, 50, 51]
+    assert captured["pages"] == [99, 11, 10, 50, 51]
 
 
 def test_update_block_table_full_refresh_respects_clamp(monkeypatch):
