@@ -27,6 +27,13 @@ from typing import TYPE_CHECKING
 
 import torch
 import zmq
+from tokenspeed_kernel.profiling import (
+    ProfilingState,
+    profile_config_from_env,
+    proton_available,
+    start_profiling,
+    stop_profiling,
+)
 from viztracer import VizTracer
 
 from tokenspeed.runtime.distributed.process_group_manager import (
@@ -266,8 +273,11 @@ class RequestHandler:
         )
 
     # ------------------------------------------------------------------
-    # Profiling: torch / cuda / viztracer / mem-snapshot, driven by
-    # /start_profile and /stop_profile control requests.
+    # Profiling: torch / cuda / viztracer / mem-snapshot / proton, driven
+    # by /start_profile and /stop_profile control requests. Proton must be
+    # driven from this process (not the frontend): its GPU hooks are
+    # per-process and the scheduler subprocess is torn down with SIGKILL,
+    # so an atexit-based finalize would never write the profile.
     # ------------------------------------------------------------------
 
     def init_profiler(self):
@@ -308,6 +318,29 @@ class RequestHandler:
             output_dir = envs.TOKENSPEED_PROFILER_DIR.get()
         if activities is None:
             activities = ["CPU", "GPU"]
+
+        if "PROTON" in activities:
+            conflicting = sorted({"GPU", "CUDA_PROFILER"} & set(activities))
+            if conflicting:
+                return ProfileReqOutput(
+                    success=False,
+                    message="PROTON cannot be combined with "
+                    f"{', '.join(conflicting)}: CUPTI/roctracer supports only "
+                    "one GPU profiling client per process.",
+                )
+            if not proton_available():
+                return ProfileReqOutput(
+                    success=False,
+                    message="Proton is not available: the installed "
+                    "tokenspeed-triton does not provide a profiler.",
+                )
+            if ProfilingState.get().active:
+                return ProfileReqOutput(
+                    success=False,
+                    message="A Proton session is already active in this "
+                    "process (e.g. via TOKENSPEED_KERNEL_PROFILE); it cannot "
+                    "be controlled through /start_profile.",
+                )
 
         self.profiler_output_dir = output_dir
         self.torch_profiler_with_stack = with_stack
@@ -368,6 +401,15 @@ class RequestHandler:
         if "CUDA_PROFILER" in activities:
             torch.cuda.cudart().cudaProfilerStart()
 
+        if "PROTON" in activities:
+            Path(self.profiler_output_dir).mkdir(parents=True, exist_ok=True)
+            # Proton appends the output format extension (e.g. ".hatchet").
+            proton_output = os.path.join(
+                self.profiler_output_dir,
+                f"{self.profile_id}-TP-{self.attn_tp_rank}{stage_suffix}.proton",
+            )
+            start_profiling(profile_config_from_env(output=proton_output))
+
         if "VIZTRACER" in activities:
             Path(self.profiler_output_dir).mkdir(parents=True, exist_ok=True)
             self.viztracer = VizTracer(
@@ -426,6 +468,11 @@ class RequestHandler:
 
         if "CUDA_PROFILER" in self.profiler_activities:
             torch.cuda.cudart().cudaProfilerStop()
+
+        if "PROTON" in self.profiler_activities:
+            # Finalizes the session and writes the profile now, while this
+            # process is still alive (shutdown is SIGKILL; no atexit).
+            stop_profiling()
 
         if "VIZTRACER" in self.profiler_activities and self.viztracer is not None:
             self.viztracer.stop()
