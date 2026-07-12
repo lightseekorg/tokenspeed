@@ -52,8 +52,8 @@ def _make_forward_op(
     if full_refresh is None:
         full_refresh = [0 for _ in begins]
     if occupied_pages is None:
-        # For tail-only rows occupied_pages is unused; default it to the tail
-        # delta so the field is always present and well-shaped.
+        # Keep a well-shaped authoritative row for tests that do not care
+        # about row-wide refresh semantics.
         occupied_pages = [list(row) for row in new_occupied_pages]
     return SimpleNamespace(
         begins=list(begins),
@@ -74,12 +74,13 @@ def test_update_block_table_does_not_raise_on_overflow(monkeypatch):
     """
     from tokenspeed.runtime.execution import cache_loc_kernel
 
-    # max_pages=513 (the value from the real crash). req[1] is the offender:
-    # begin=513 + size=1 = 514 > 513.
+    # max_pages=513 (the value from the real crash). req[1]'s authoritative
+    # scheduler row is the offender: len(row)=514 > 513.
     req_to_page = torch.zeros(8, 513, dtype=torch.int32)
     forward_op = _make_forward_op(
         begins=[400, 513, 100],
         sizes=[2, 1, 3],
+        occupied_pages=[list(range(2)), list(range(514)), list(range(3))],
     )
 
     captured: dict = {}
@@ -102,14 +103,14 @@ def test_update_block_table_does_not_raise_on_overflow(monkeypatch):
         forward_op, device="cpu", req_to_page=req_to_page
     )
 
-    # The offender (req[1]) got clamped to 0, others unchanged.
-    assert captured["num"] == [2, 0, 3]
-    # begins are unchanged.
-    assert captured["starts"] == [400, 513, 100]
-    # And the flattened pages array dropped the offending request's entry,
+    # The offender (req[1]) got clamped to max row width, others unchanged.
+    assert captured["num"] == [2, 513, 3]
+    # Whole-row refresh always starts at logical page 0.
+    assert captured["starts"] == [0, 0, 0]
+    # And the flattened pages array trimmed the offending request's row,
     # so the cumsum-based offsets the kernel uses stay consistent.
-    # req[0] contributes 2 pages, req[1] contributes 0, req[2] contributes 3 → 5 total.
-    assert len(captured["pages"]) == 5
+    # req[0] contributes 2 pages, req[1] contributes 513, req[2] contributes 3.
+    assert len(captured["pages"]) == 518
 
 
 def test_update_block_table_passthrough_when_no_overflow(monkeypatch):
@@ -142,16 +143,17 @@ def test_update_block_table_passthrough_when_no_overflow(monkeypatch):
     assert captured["num"] == [1, 2, 1]
 
 
-def test_update_block_table_clamp_partial_overflow(monkeypatch):
-    """If begin < max_pages and begin+size > max_pages, clamp to (max - begin)."""
+def test_update_block_table_clamp_oversized_row(monkeypatch):
+    """If the authoritative scheduler row is wider than req_to_page, clamp it."""
     from tokenspeed.runtime.execution import cache_loc_kernel
 
-    req_to_page = torch.zeros(8, 513, dtype=torch.int32)
-    # begin=512 + size=4 = 516 > 513, but begin < 513 → clamp to size=1.
+    req_to_page = torch.zeros(8, 3, dtype=torch.int32)
+    # Whole-row refresh starts at 0, so a 4-page row clamps to width 3.
     forward_op = _make_forward_op(
         begins=[512],
         sizes=[4],
         new_occupied_pages=[[700, 701, 702, 703]],
+        occupied_pages=[[700, 701, 702, 703]],
     )
 
     captured: dict = {}
@@ -171,9 +173,9 @@ def test_update_block_table_clamp_partial_overflow(monkeypatch):
         forward_op, device="cpu", req_to_page=req_to_page
     )
 
-    assert captured["num"] == [1]
-    # Only the first page from new_occupied_pages survives (the one that fits).
-    assert captured["pages"] == [700]
+    assert captured["num"] == [3]
+    # Only the first three pages from the scheduler row fit.
+    assert captured["pages"] == [700, 701, 702]
 
 
 def test_update_block_table_zero_total_returns_early(monkeypatch):
@@ -218,6 +220,7 @@ def test_update_block_table_logs_warning_on_clamp():
             begins=[513],
             sizes=[1],
             request_ids=["my-bad-req"],
+            occupied_pages=[list(range(514))],
         )
         with mock.patch.object(
             cache_loc_kernel, "update_req_to_page", lambda **kw: None
@@ -233,15 +236,13 @@ def test_update_block_table_logs_warning_on_clamp():
     assert any("page copy would exceed req_to_page capacity" in m for m in msgs), msgs
 
 
-def test_update_block_table_full_refresh_copies_whole_row(monkeypatch):
-    """A full_refresh=1 request must copy the scheduler's full occupied_pages
-    row from logical page 0, ignoring the begin/size tail delta; a full_refresh=0
-    request in the same batch keeps the tail-only delta."""
+def test_update_block_table_copies_whole_row_for_updated_requests(monkeypatch):
+    """Every updated request copies the scheduler's full occupied_pages row
+    from logical page 0, ignoring the begin/size tail delta."""
     from tokenspeed.runtime.execution import cache_loc_kernel
 
     req_to_page = torch.zeros(8, 513, dtype=torch.int32)
-    # req[0]: full refresh -> whole row from 0, delta fields ignored.
-    # req[1]: tail-only -> begin=200, only the 2-page delta.
+    # Both rows refresh from occupied_pages, regardless of the full_refresh bit.
     forward_op = _make_forward_op(
         begins=[100, 200],
         sizes=[1, 2],
@@ -268,11 +269,9 @@ def test_update_block_table_full_refresh_copies_whole_row(monkeypatch):
         forward_op, device="cpu", req_to_page=req_to_page
     )
 
-    # req[0] refreshed the whole 4-page row from start 0; req[1] kept its tail delta.
-    assert captured["num"] == [4, 2]
-    assert captured["starts"] == [0, 200]
-    # Flattened: whole row of req[0] then the tail delta of req[1].
-    assert captured["pages"] == [10, 11, 12, 13, 50, 51]
+    assert captured["num"] == [4, 3]
+    assert captured["starts"] == [0, 0]
+    assert captured["pages"] == [10, 11, 12, 13, 40, 41, 42]
 
 
 def test_update_block_table_full_refresh_respects_clamp(monkeypatch):
@@ -314,9 +313,10 @@ def test_update_block_table_full_refresh_respects_clamp(monkeypatch):
     assert captured["pages"] == [10, 11, 12, 13]
 
 
-def test_update_block_table_full_refresh_overrides_zero_size(monkeypatch):
-    """full_refresh=1 must copy the row even when the op's tail size is 0
-    (early-return must be computed on the effective, post-branch sizes)."""
+def test_update_block_table_zero_size_returns_early_even_with_occupied_pages(
+    monkeypatch,
+):
+    """If the scheduler reports no updated rows, keep the existing mirror."""
     from tokenspeed.runtime.execution import cache_loc_kernel
 
     req_to_page = torch.zeros(8, 513, dtype=torch.int32)
@@ -328,27 +328,17 @@ def test_update_block_table_full_refresh_overrides_zero_size(monkeypatch):
         full_refresh=[1],
     )
 
-    captured: dict = {}
+    called = {"v": False}
 
-    def fake_update_req_to_page(
-        req_to_page,
-        req_pool_indices,
-        new_occupied_pages,
-        new_occupied_pages_num,
-        pages_copy_starts,
-    ):
-        captured["num"] = new_occupied_pages_num.tolist()
-        captured["starts"] = pages_copy_starts.tolist()
-        captured["pages"] = new_occupied_pages.tolist()
+    def fake_update_req_to_page(**kwargs):
+        called["v"] = True
 
     monkeypatch.setattr(cache_loc_kernel, "update_req_to_page", fake_update_req_to_page)
     cache_loc_kernel.update_block_table(
         forward_op, device="cpu", req_to_page=req_to_page
     )
 
-    assert captured["num"] == [3]
-    assert captured["starts"] == [0]
-    assert captured["pages"] == [10, 11, 12]
+    assert called["v"] is False
 
 
 def test_update_block_table_full_refresh_decode_tail_repoints_prefix(monkeypatch):
