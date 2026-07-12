@@ -42,6 +42,12 @@ def _env(args: argparse.Namespace) -> None:
     env_main()
 
 
+def _merge_traces(args: argparse.Namespace) -> None:
+    from tokenspeed.trace_merge import main as merge_traces_main
+
+    merge_traces_main(args.merge_args)
+
+
 def _version(args: argparse.Namespace) -> None:
     from tokenspeed.version import __version__
 
@@ -77,6 +83,14 @@ def main() -> None:
     )
     env_parser.set_defaults(func=_env)
 
+    merge_traces_parser = subparsers.add_parser(
+        "merge-traces",
+        add_help=False,
+        help="Merge a Proton chrome trace into a VizTracer report on a "
+        "shared timeline.",
+    )
+    merge_traces_parser.set_defaults(func=_merge_traces, merge_args=[])
+
     version_parser = subparsers.add_parser(
         "version",
         help="Print the TokenSpeed version.",
@@ -91,6 +105,11 @@ def main() -> None:
 
     if args.func is _bench:
         args.bench_args = extra_args
+        args.func(args)
+        return
+
+    if args.func is _merge_traces:
+        args.merge_args = extra_args
         args.func(args)
         return
 
