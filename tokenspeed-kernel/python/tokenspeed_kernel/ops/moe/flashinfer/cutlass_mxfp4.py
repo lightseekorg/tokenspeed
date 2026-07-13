@@ -169,8 +169,9 @@ if platform.is_nvidia:
         w.hidden_size_padded = hidden_size
         w.hidden_size_original = getattr(w, "hidden_size", hidden_size)
 
-        major, minor = torch.cuda.get_device_capability(w.w13_weight.device)
-        get_cutlass_fused_moe_module(f"{major}{minor}")
+        if w.w13_weight.is_cuda:
+            major, minor = torch.cuda.get_device_capability(w.w13_weight.device)
+            get_cutlass_fused_moe_module(f"{major}{minor}")
 
     @register_kernel(
         "moe",
