@@ -98,6 +98,7 @@ class DummyFlatTablesTest(unittest.TestCase):
         backend = SimpleNamespace(
             uses_flat_cache_groups=True,
             page_size=32,
+            max_num_pages=0,  # fall back to bucket-derived width
             flat_state_group_ids=frozenset({"linear_attention"}),
         )
         pool = SimpleNamespace(
@@ -112,6 +113,39 @@ class DummyFlatTablesTest(unittest.TestCase):
         for t in tables.values():
             self.assertEqual(t.shape, (1, 4))  # ceil(100/32)
             self.assertEqual(int(t.abs().sum()), 0)  # null block 0 only
+
+    def test_full_width_for_stride_deriving_backends(self):
+        # trtllm-style: row stride comes from max_kv_len, so dummy tables
+        # must span the full table width, not just the bucket.
+        backend = SimpleNamespace(
+            uses_flat_cache_groups=True,
+            page_size=32,
+            max_num_pages=2500,
+            flat_state_group_ids=frozenset(),
+        )
+        pool = SimpleNamespace(
+            paged_cache_group_specs=(SimpleNamespace(group_id="full_attention"),)
+        )
+        tables = self._bare(backend, pool)._dummy_flat_tables(100)
+        self.assertEqual(tables["full_attention"].shape, (1, 2500))
+
+    def test_composite_wrapper_resolves_flat_child(self):
+        # Hybrid wrappers set the flag but hold the flat KV consumer as
+        # full_attn_backend; the helper must not AttributeError (which would
+        # silently disable the prefill graph via the capture fallback).
+        child = SimpleNamespace(
+            page_size=32, max_num_pages=0, flat_state_group_ids=frozenset()
+        )
+        wrapper = SimpleNamespace(uses_flat_cache_groups=True, full_attn_backend=child)
+        pool = SimpleNamespace(
+            paged_cache_group_specs=(
+                SimpleNamespace(group_id="full_attention"),
+                SimpleNamespace(group_id="linear_attention"),
+            )
+        )
+        tables = self._bare(wrapper, pool)._dummy_flat_tables(64)
+        self.assertEqual(set(tables), {"full_attention", "linear_attention"})
+        self.assertEqual(tables["full_attention"].shape, (1, 2))
 
     def test_non_flat_backend_empty(self):
         backend = SimpleNamespace(uses_flat_cache_groups=False)

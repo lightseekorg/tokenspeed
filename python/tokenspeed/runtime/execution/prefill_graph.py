@@ -402,15 +402,24 @@ class PrefillGraph:
         the reserved null block 0 (the decode-capture convention), one row,
         wide enough for num_tokens. Empty for non-flat backends; state groups
         ride to their own backend and are skipped."""
-        if not getattr(self.attn_backend, "uses_flat_cache_groups", False):
+        backend = self.attn_backend
+        if not getattr(backend, "uses_flat_cache_groups", False):
             return {}
-        width = -(-num_tokens // self.attn_backend.page_size)
+        # Composite wrappers (hybrid) hold the flat KV consumer as a child.
+        if not hasattr(backend, "page_size") and hasattr(backend, "full_attn_backend"):
+            backend = backend.full_attn_backend
+        # Full width: backends that derive the row stride from max_kv_len
+        # (trtllm) index the whole row even when the bucket is small.
+        width = getattr(backend, "max_num_pages", 0) or -(
+            -num_tokens // backend.page_size
+        )
+        state_ids = getattr(backend, "flat_state_group_ids", frozenset())
         return {
             str(spec.group_id): torch.zeros(
                 (1, width), dtype=torch.int32, device=self.config.device
             )
             for spec in getattr(self.token_to_kv_pool, "paged_cache_group_specs", ())
-            if str(spec.group_id) not in self.attn_backend.flat_state_group_ids
+            if str(spec.group_id) not in state_ids
         }
 
     def _make_dummy_batch(
