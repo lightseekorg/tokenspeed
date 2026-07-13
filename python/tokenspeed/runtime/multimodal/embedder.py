@@ -547,13 +547,15 @@ class MultimodalEmbedder:
                 if isinstance(item.feature, ShmTensorHandle):
                     item.feature = item.feature.consume()
 
+        # Keep collectives on the model stream so their ordering matches other
+        # TP collectives queued by the forward pass on every rank.
+        if use_tp_broadcast:
+            self._move_shm_via_tp_broadcast(pending, device)
+            return
+
         h2d = self._h2d_stream_on(device)
         current = torch.cuda.current_stream(device)
         with torch.cuda.stream(h2d):
-            if use_tp_broadcast:
-                self._move_shm_via_tp_broadcast(pending, device)
-                current.wait_stream(h2d)
-                return
             for it in pending:
                 if isinstance(it.feature, ShmTensorHandle):
                     if defer_shm_cleanup:

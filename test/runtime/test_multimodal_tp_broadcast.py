@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from tokenspeed.runtime.multimodal.embedder import VisionEmbedder
@@ -58,3 +59,25 @@ def test_tp_broadcast_rejects_inline_tensors():
     ]
 
     assert not embedder._should_move_shm_via_tp_broadcast(items)
+
+
+def test_tp_broadcast_stays_on_model_stream(monkeypatch):
+    embedder = _embedder(2)
+    items = [_shm_item(128 * 1024 * 1024)]
+    moved = []
+
+    monkeypatch.setattr(
+        embedder,
+        "_move_shm_via_tp_broadcast",
+        lambda pending, device: moved.append((pending, device)),
+    )
+    monkeypatch.setattr(
+        embedder,
+        "_h2d_stream_on",
+        lambda _device: pytest.fail("TP broadcast must not use the H2D stream"),
+    )
+
+    device = torch.device("cuda")
+    embedder._move_features_to_device(items, device)
+
+    assert moved == [(items, device)]
