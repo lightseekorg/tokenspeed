@@ -397,6 +397,22 @@ class PrefillGraph:
         if num_tokens < bucket:
             self._input_embeds_buf[num_tokens:bucket].zero_()
 
+    def _dummy_flat_tables(self, num_tokens: int) -> dict[str, "torch.Tensor"]:
+        """Capture-time flat per-group tables for the dummy batch: all zeros =
+        the reserved null block 0 (the decode-capture convention), one row,
+        wide enough for num_tokens. Empty for non-flat backends; state groups
+        ride to their own backend and are skipped."""
+        if not getattr(self.attn_backend, "uses_flat_cache_groups", False):
+            return {}
+        width = -(-num_tokens // self.attn_backend.page_size)
+        return {
+            str(spec.group_id): torch.zeros(
+                (1, width), dtype=torch.int32, device=self.config.device
+            )
+            for spec in getattr(self.token_to_kv_pool, "paged_cache_group_specs", ())
+            if str(spec.group_id) not in self.attn_backend.flat_state_group_ids
+        }
+
     def _make_dummy_batch(
         self, num_tokens: int, decode_wrapper: CudaGraphWrapper | None
     ) -> ForwardContext:
@@ -455,6 +471,9 @@ class PrefillGraph:
                 extra_metadata_kwargs["paged_cache_block_tables"] = tables
             extra_metadata_kwargs["num_tokens"] = num_tokens
             extra_metadata_kwargs["positions"] = ib.positions_buf[:num_tokens]
+        flat_tables = self._dummy_flat_tables(num_tokens)
+        if flat_tables:
+            extra_metadata_kwargs["flat_block_tables"] = flat_tables
         self.attn_backend.init_forward_metadata(
             bs=1,
             num_extends=1,

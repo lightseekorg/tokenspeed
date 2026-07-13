@@ -722,6 +722,13 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         if k is None:
             return
 
+        # Prefill-graph replay pads k/v rows to the bucket, but flat per-group
+        # write locs cover only the real (leading) rows; drop the padded tail.
+        # No-op off the flat path: the radix loc buffer is bucket-shaped.
+        if k.shape[0] > out_cache_loc.shape[0]:
+            k = k[: out_cache_loc.shape[0]]
+            v = v[: out_cache_loc.shape[0]]
+
         if (
             self.kv_cache_dtype == torch.float8_e4m3fn
             and k.dtype != torch.float8_e4m3fn
