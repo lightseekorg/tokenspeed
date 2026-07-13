@@ -11,6 +11,7 @@ import torch
 import triton
 import triton.language as tl
 from tokenspeed_kernel.ops.mhc import (
+    FUSED_HC_MAX_K_SPLITS,
     deep_gemm_mhc_prenorm_gemm,
     has_deep_gemm_mhc,
     supports_trtllm_mhc,
@@ -399,6 +400,10 @@ class _FusedHcPingPong:
     ):
         n2 = hc_mult * hc_mult
         shape_n = hc_mult * (2 + hc_mult)
+        # The k-split fused_hc backend accumulates num_k_splits x num_tokens
+        # partial rows into y_acc/r_acc, so the accumulator workspaces need
+        # FUSED_HC_MAX_K_SPLITS x max_bs rows, not max_bs like allinone.
+        acc_rows = FUSED_HC_MAX_K_SPLITS * max_bs
         self.bufs = tuple(
             (
                 torch.empty(
@@ -407,9 +412,9 @@ class _FusedHcPingPong:
                 torch.empty(max_bs, hc_mult, dtype=torch.float32, device=device),
                 torch.empty(max_bs, n2, dtype=torch.float32, device=device),
                 torch.empty(max_bs, hidden_size, dtype=torch.bfloat16, device=device),
-                torch.empty(max_bs, shape_n, dtype=torch.float32, device=device),
-                torch.empty(max_bs, dtype=torch.float32, device=device),
-                torch.empty(max_bs, dtype=torch.int32, device=device),
+                torch.empty(acc_rows, shape_n, dtype=torch.float32, device=device),
+                torch.empty(acc_rows, dtype=torch.float32, device=device),
+                torch.empty(acc_rows, dtype=torch.int32, device=device),
             )
             for _ in range(2)
         )
