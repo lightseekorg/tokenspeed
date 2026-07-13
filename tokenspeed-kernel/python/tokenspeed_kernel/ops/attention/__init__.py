@@ -108,6 +108,8 @@ __all__ = [
     "rel_mha_decode_with_kvcache",
     "rel_mha_plan",
     "gdn_chunk_prefill",
+    "gdn_decode_step",
+    "gdn_decode_mtp",
     "GdnCheckpointLayout",
     "GdnChunkPrefillResult",
     "mla_prefill",
@@ -154,7 +156,10 @@ def gdn_chunk_prefill(
         g: Log-space forget gate shaped ``[1, total_tokens, num_v_heads]``.
         beta: Beta gate shaped ``[1, total_tokens, num_v_heads]``.
         scale: Attention scale. ``None`` lets the implementation use its default.
-        initial_state: Recurrent state shaped ``[batch, num_v_heads, head_dim, head_v_dim]``.
+        initial_state: Recurrent state, K-last: ``[batch, num_v_heads,
+            head_v_dim, head_dim]``. This matches flashinfer's native GDN
+            decode/MTP layout (and the runtime's SSM state pool); backends
+            whose own math is FLA-native (e.g. Triton) transpose internally.
         cu_seqlens: Cumulative sequence lengths for variable-length prefill.
         qk_l2norm: Whether the selected kernel should L2-normalize Q/K.
         output_final_state: Whether to return the final recurrent state.
@@ -164,8 +169,9 @@ def gdn_chunk_prefill(
         solution: Optional kernel solution to force through normal selection.
 
     Returns:
-        ``GdnChunkPrefillResult`` with output, final state, and optional
-        backend-native recurrent checkpoints.
+        ``GdnChunkPrefillResult`` with output, final state (K-last, same
+        layout as ``initial_state``), and optional backend-native recurrent
+        checkpoints (also K-last).
     """
     head_dim = q.shape[-1]
     head_v_dim = v.shape[-1]
@@ -224,6 +230,177 @@ def gdn_chunk_prefill(
             qk_l2norm=qk_l2norm,
             output_final_state=output_final_state,
             output_h=output_h,
+        )
+
+
+def gdn_decode_step(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    b: torch.Tensor,
+    initial_state: torch.Tensor,
+    initial_state_indices: torch.Tensor,
+    scale: float | None = None,
+    output_state_indices: torch.Tensor | None = None,
+    use_qk_l2norm: bool = True,
+    override: str | None = None,
+    solution: str | None = None,
+) -> torch.Tensor:
+    """Run one single-token (T=1) GDN decode step through kernel selection.
+
+    Args:
+        q: Query tensor shaped ``[B, 1, num_q_heads, head_dim]``.
+        k: Key tensor shaped ``[B, 1, num_q_heads, head_dim]``.
+        v: Value tensor shaped ``[B, 1, num_v_heads, head_v_dim]``.
+        A_log: Log decay parameter shaped ``[num_v_heads]``.
+        a: Input-dependent decay shaped ``[B, 1, num_v_heads]``.
+        dt_bias: Decay bias shaped ``[num_v_heads]``.
+        b: Update-gate (beta) input shaped ``[B, 1, num_v_heads]``.
+        initial_state: SSM state pool, K-last ``[pool_size, num_v_heads,
+            head_v_dim, head_dim]`` (matches the runtime's SSM state pool).
+        initial_state_indices: Per-batch read row, shaped ``[B]``. ``-1``
+            marks CUDA-graph padding; handled internally, no caller clamp
+            needed.
+        scale: Attention scale. ``None`` lets the implementation use its default.
+        output_state_indices: Per-batch write row, shaped ``[B]``. ``None``
+            writes back to ``initial_state_indices`` (the common, non-flat
+            pool case); pass distinct rows for flat dual-index state paging.
+        use_qk_l2norm: Whether the selected kernel should L2-normalize Q/K.
+        override: Optional kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+
+    Returns:
+        Decode output shaped ``[B, 1, num_v_heads, head_v_dim]`` (q.dtype).
+    """
+    head_dim = q.shape[-1]
+    signature = _attention_format_signature(q=q, k=k, v=v)
+    kernel = select_kernel(
+        "attention",
+        "gdn_decode_step",
+        signature,
+        traits={"head_dim": head_dim},
+        solution=solution,
+        override=override,
+    )
+    with kernel_scope(
+        "attention",
+        "gdn_decode_step",
+        q.dtype,
+        kernel_name=kernel.name,
+        batch_size=q.shape[0],
+        num_v_heads=v.shape[-2],
+        head_dim=head_dim,
+        head_v_dim=v.shape[-1],
+    ):
+        return kernel(
+            q=q,
+            k=k,
+            v=v,
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            b=b,
+            initial_state=initial_state,
+            initial_state_indices=initial_state_indices,
+            scale=scale,
+            output_state_indices=output_state_indices,
+            use_qk_l2norm=use_qk_l2norm,
+        )
+
+
+def gdn_decode_mtp(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    b: torch.Tensor,
+    initial_state: torch.Tensor,
+    initial_state_indices: torch.Tensor,
+    scale: float | None = None,
+    disable_state_update: bool = True,
+    use_qk_l2norm: bool = True,
+    intermediate_states_buffer: torch.Tensor | None = None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> torch.Tensor:
+    """Run one multi-token (T>1) GDN MTP verify step through kernel selection.
+
+    Args:
+        q: Query tensor shaped ``[B, T, num_q_heads, head_dim]``.
+        k: Key tensor shaped ``[B, T, num_q_heads, head_dim]``.
+        v: Value tensor shaped ``[B, T, num_v_heads, head_v_dim]``.
+        A_log: Log decay parameter shaped ``[num_v_heads]``.
+        a: Input-dependent decay shaped ``[B, T, num_v_heads]``.
+        dt_bias: Decay bias shaped ``[num_v_heads]``.
+        b: Update-gate (beta) input shaped ``[B, T, num_v_heads]``.
+        initial_state: SSM state pool, K-last ``[pool_size, num_v_heads,
+            head_v_dim, head_dim]`` (matches the runtime's SSM state pool).
+        initial_state_indices: Per-batch row, shaped ``[B]``, used for both
+            the read and (when ``disable_state_update=False``) the
+            post-verify write-back to that SAME row. Entries must be
+            ``>= 0``: unlike ``gdn_decode_step``, negative indices are not
+            skipped or redirected -- the caller must clamp CUDA-graph padding
+            rows before calling.
+        scale: Attention scale. ``None`` lets the implementation use its default.
+        disable_state_update: When True (default), never write back to
+            ``initial_state_indices``.
+        use_qk_l2norm: Whether the selected kernel should L2-normalize Q/K.
+        intermediate_states_buffer: Optional batch-scoped ``[B, T,
+            num_v_heads, head_v_dim, head_dim]`` (K-last, same dtype as
+            ``initial_state``) buffer that receives every step's post-update
+            state at ``buffer[i_n, step]``. Use this when per-draft-step
+            snapshots at arbitrary pool rows are needed (e.g. speculative
+            decoding's per-request output-index table): every registered
+            kernel for this op fills it the same way, so the caller's
+            post-call scatter into the real pool is solution-agnostic.
+        override: Optional kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+
+    Returns:
+        Decode output shaped ``[B, T, num_v_heads, head_v_dim]`` (q.dtype).
+    """
+    head_dim = q.shape[-1]
+    signature = _attention_format_signature(q=q, k=k, v=v)
+    kernel = select_kernel(
+        "attention",
+        "gdn_decode_mtp",
+        signature,
+        traits={"head_dim": head_dim},
+        solution=solution,
+        override=override,
+    )
+    with kernel_scope(
+        "attention",
+        "gdn_decode_mtp",
+        q.dtype,
+        kernel_name=kernel.name,
+        batch_size=q.shape[0],
+        seq_len=q.shape[1],
+        num_v_heads=v.shape[-2],
+        head_dim=head_dim,
+        head_v_dim=v.shape[-1],
+    ):
+        return kernel(
+            q=q,
+            k=k,
+            v=v,
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            b=b,
+            initial_state=initial_state,
+            initial_state_indices=initial_state_indices,
+            scale=scale,
+            disable_state_update=disable_state_update,
+            use_qk_l2norm=use_qk_l2norm,
+            intermediate_states_buffer=intermediate_states_buffer,
         )
 
 
