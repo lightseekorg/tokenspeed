@@ -23,7 +23,10 @@ import torch
 import torch.nn.functional as F
 
 from tokenspeed.runtime.distributed.comm_ops import all_gather_into_tensor
-from tokenspeed.runtime.execution.cache_loc_kernel import compute_out_cache_loc_uniform
+from tokenspeed.runtime.execution.cache_loc_kernel import (
+    compute_out_cache_loc_uniform,
+    dflash_prepare_decode,
+)
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.drafter._dflash_fused_kv import (
     _fused_norm_rope_stacked,
@@ -805,7 +808,10 @@ class DFlash(BaseDrafter):
 
     @nvtx_range("dflash_native_draft", color="purple")
     def _draft_native(
-        self, current_tokens: torch.Tensor, kv_sync_event: torch.cuda.Event = None
+        self,
+        current_tokens: torch.Tensor,
+        kv_sync_event: torch.cuda.Event = None,
+        prepared: bool = False,
     ) -> torch.Tensor:
         bs = current_tokens.shape[0]
         req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
@@ -816,21 +822,22 @@ class DFlash(BaseDrafter):
         # NOTE: callers (run/_run_overlap) write current_tokens directly into
         # block_ids_buf[:bs, 0] before invoking _draft_native
         block_positions = self.block_positions_buf[:bs]
-        torch.add(
-            prefix_lens.unsqueeze(1),
-            self.block_offsets,
-            out=block_positions,
-        )
-
         cache_locs = self.draft_out_cache_loc_buf[: bs * self.spec_num_tokens]
-        compute_out_cache_loc_uniform(
-            out_cache_loc_ptr=cache_locs,
-            req_pool_indices=req_pool_indices,
-            uniform_input_length=self.spec_num_tokens,
-            cache_start=prefix_lens,
-            req_to_pages=self.req_to_page,
-            page_size=self.page_size,
-        )
+        if not prepared:
+            torch.add(
+                prefix_lens.unsqueeze(1),
+                self.block_offsets,
+                out=block_positions,
+            )
+
+            compute_out_cache_loc_uniform(
+                out_cache_loc_ptr=cache_locs,
+                req_pool_indices=req_pool_indices,
+                uniform_input_length=self.spec_num_tokens,
+                cache_start=prefix_lens,
+                req_to_pages=self.req_to_page,
+                page_size=self.page_size,
+            )
 
         is_capturing = (
             torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
@@ -922,6 +929,27 @@ class DFlash(BaseDrafter):
         self._update_native_cache_from_target(base_ctx, logits_output, accept_lengths)
         bs = base_ctx.bs
         current_tokens = self.block_ids_buf[:bs, 0]
+        if base_ctx.num_extends == 0:
+            draft_cache_locs = self.draft_out_cache_loc_buf[: bs * self.spec_num_tokens]
+            max_draft_prefix = (
+                self.req_to_page.shape[1] * self.page_size - self.spec_num_tokens
+            )
+            dflash_prepare_decode(
+                output_tokens=output_tokens,
+                accept_lengths=accept_lengths[:bs],
+                req_pool_indices=self.input_buffers.req_pool_indices_buf[:bs],
+                valid_cache_lengths=self.runtime_states.valid_cache_lengths,
+                req_to_pages=self.req_to_page,
+                draft_seq_lens=self.draft_seq_lens_buf[:bs],
+                block_ids=self.block_ids_buf[:bs],
+                block_positions=self.block_positions_buf[:bs],
+                out_cache_loc=draft_cache_locs,
+                spec_num_tokens=self.spec_num_tokens,
+                page_size=self.page_size,
+                max_draft_prefix=max_draft_prefix,
+            )
+            return self._draft_native(current_tokens, prepared=True)
+
         self._current_tokens_from_output(
             output_tokens,
             accept_lengths,
@@ -946,17 +974,26 @@ class DFlash(BaseDrafter):
         if hidden is None and not self._incremental_kv_write_done:
             raise RuntimeError("DFLASH requires target hidden states.")
 
-        # draft_seq_lens_buf on main stream (draft block prep depends on it)
         bs = base_ctx.bs
         req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
-        old_lens = self.runtime_states.valid_cache_lengths.index_select(
-            0, req_pool_indices
-        )
         max_draft_prefix = self.req_to_page.shape[1] * self.page_size - self.spec_num_tokens
-        torch.add(
-            old_lens, accept_lengths[:bs], out=self.draft_seq_lens_buf[:bs]
+
+        current_tokens = self.block_ids_buf[:bs, 0]
+        draft_cache_locs = self.draft_out_cache_loc_buf[: bs * self.spec_num_tokens]
+        dflash_prepare_decode(
+            output_tokens=output_tokens,
+            accept_lengths=accept_lengths[:bs],
+            req_pool_indices=req_pool_indices,
+            valid_cache_lengths=self.runtime_states.valid_cache_lengths,
+            req_to_pages=self.req_to_page,
+            draft_seq_lens=self.draft_seq_lens_buf[:bs],
+            block_ids=self.block_ids_buf[:bs],
+            block_positions=self.block_positions_buf[:bs],
+            out_cache_loc=draft_cache_locs,
+            spec_num_tokens=self.spec_num_tokens,
+            page_size=self.page_size,
+            max_draft_prefix=max_draft_prefix,
         )
-        self.draft_seq_lens_buf[:bs].clamp_(max=max_draft_prefix)
 
         if not self._incremental_kv_write_done:
             # Fork: aux stream runs full KV write (project + fused GEMM + scatter)
@@ -977,10 +1014,7 @@ class DFlash(BaseDrafter):
                 self._write_native_cache(hidden, positions, cache_locs, decode_only=True)
                 self._kv_join_event.record(self._kv_aux_stream)
 
-        # Main stream: draft block prep overlaps with aux KV write
-        current_tokens = self.block_ids_buf[:bs, 0]
-        self._current_tokens_from_output(
-            output_tokens, accept_lengths, 0, self.spec_num_tokens,
-            out=current_tokens,
+        # Main stream: draft forward overlaps with aux KV write
+        return self._draft_native(
+            current_tokens, kv_sync_event=self._kv_join_event, prepared=True
         )
-        return self._draft_native(current_tokens, kv_sync_event=self._kv_join_event)
