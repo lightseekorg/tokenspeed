@@ -78,6 +78,17 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _profile_rank_tag(attn_mapping) -> str:
+    """File-name tag identifying this scheduler process's profile outputs."""
+    parts = []
+    if attn_mapping.has_dp:
+        parts.append(f"DP{attn_mapping.dp_rank}")
+    if attn_mapping.has_cp:
+        parts.append(f"CP{attn_mapping.cp_rank}")
+    parts.append(f"TP{attn_mapping.tp_rank}")
+    return "-".join(parts)
+
+
 class RequestHandler:
     """
     1. Recv Reqs from ZMQ
@@ -113,6 +124,7 @@ class RequestHandler:
             "gloo", mapping.attn.tp_group
         )
         self.attn_tp_src_rank = mapping.attn.tp_group[0]
+        self.profile_rank_tag = _profile_rank_tag(mapping.attn)
 
         self.hf_eos_token_id = hf_eos_token_id
         self.max_req_len = max_req_len
@@ -406,7 +418,7 @@ class RequestHandler:
             # Proton appends the output format extension (e.g. ".hatchet").
             proton_output = os.path.join(
                 self.profiler_output_dir,
-                f"{self.profile_id}-TP-{self.attn_tp_rank}{stage_suffix}.proton",
+                f"{self.profile_id}-{self.profile_rank_tag}{stage_suffix}.proton",
             )
             start_profiling(profile_config_from_env(output=proton_output))
 
@@ -415,7 +427,7 @@ class RequestHandler:
             self.viztracer = VizTracer(
                 output_file=os.path.join(
                     self.profiler_output_dir,
-                    f"{self.profile_id}-TP-{self.attn_tp_rank}{stage_suffix}.viztracer.json",
+                    f"{self.profile_id}-{self.profile_rank_tag}{stage_suffix}.viztracer.json",
                 ),
                 min_duration=int(
                     os.environ.get("TOKENSPEED_VIZTRACER_MIN_DURATION_US", "100")
@@ -453,7 +465,7 @@ class RequestHandler:
             self.torch_profiler.export_chrome_trace(
                 os.path.join(
                     self.profiler_output_dir,
-                    f"{self.profile_id}-TP-{self.attn_tp_rank}{stage_suffix}.trace.json.gz",
+                    f"{self.profile_id}-{self.profile_rank_tag}{stage_suffix}.trace.json.gz",
                 )
             )
             torch.distributed.barrier(self.attn_tp_cpu_group)
@@ -461,7 +473,7 @@ class RequestHandler:
         if self.profiler_activities is not None and "MEM" in self.profiler_activities:
             memory_profile_path = os.path.join(
                 self.profiler_output_dir,
-                f"{self.profile_id}-TP-{self.attn_tp_rank}-memory{stage_suffix}.pickle",
+                f"{self.profile_id}-{self.profile_rank_tag}-memory{stage_suffix}.pickle",
             )
             torch.cuda.memory._dump_snapshot(memory_profile_path)
             torch.cuda.memory._record_memory_history(enabled=None)
