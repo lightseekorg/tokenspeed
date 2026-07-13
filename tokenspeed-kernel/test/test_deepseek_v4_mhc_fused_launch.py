@@ -31,14 +31,11 @@ def _is_sm100() -> bool:
 
 
 class TestSelectFusedHcLaunch:
-    def test_small_m_stays_on_allinone_default(self):
-        # The allinone default is at least as fast up to M=12, so the table
-        # only switches organizations where the sweep showed a real win.
-        for m in range(1, 13):
-            assert _select_fused_hc_launch(m) == (3, 1, 1, 0)
-
-    def test_medium_m_uses_ksplit_tile2(self):
-        for m in (13, 16, 24, 32):
+    def test_small_and_medium_m_use_ksplit_tile2(self):
+        # The two-stage path wins at every measured M >= 1 with
+        # contract-sized workspaces (the earlier small-M gate was an
+        # artifact of the workspace undersizing).
+        for m in (1, 2, 4, 8, 12, 13, 16, 24, 32):
             assert _select_fused_hc_launch(m) == (1, 2, 2, 512)
 
     def test_large_m_uses_ksplit_tile4(self):
@@ -136,7 +133,7 @@ class TestFusedHcLaunchTableParityGpu:
         if not has_trtllm_mhc():
             pytest.skip("trtllm mHC kernels unavailable")
 
-    @pytest.mark.parametrize("m", [13, 16, 24, 32, 36, 48, 64])
+    @pytest.mark.parametrize("m", [1, 4, 8, 13, 16, 24, 32, 36, 48, 64])
     def test_selected_launch_matches_allinone_reference(self, m):
         # The allinone-fma backend (3) is the numerically trusted incumbent
         # at every M; the sweep-selected launch must agree with it.

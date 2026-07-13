@@ -98,9 +98,10 @@ def supports_trtllm_mhc(
 #     r_acc workspaces; callers must size them accordingly (see
 #     FUSED_HC_MAX_K_SPLITS). Undersized accumulators corrupt small-M
 #     outputs and crash at scale.
-#   * small token counts stay on the allinone-fma default, which is at
-#     least as fast there.
-_FUSED_HC_SMALL_M_MAX = 12
+#   * the two-stage path wins at every measured M (1..64): 19-24% below
+#     M=13 (e.g. 8.6 vs 11.4us at M=8), 26-35% at M in [16, 32]. The
+#     small-M gate that previously kept M<=12 on the allinone default was
+#     an artifact of the undersized workspace corrupting small-M outputs.
 _FUSED_HC_MEDIUM_M_MAX = 32
 
 FUSED_HC_MAX_K_SPLITS = 2
@@ -123,8 +124,6 @@ def _select_fused_hc_launch(num_tokens: int) -> tuple[int, int, int, int]:
         kernel launch parameters.
     """
 
-    if num_tokens <= _FUSED_HC_SMALL_M_MAX:
-        return 3, 1, 1, 0  # fused_all_fma (allinone) default
     # bigfuse_block_size=512 over the kernel default: 15.1 -> 14.7us at M=32,
     # 11.9 -> 9.6us at M=16 (graph-replay microbench; endpoint-neutral).
     if num_tokens <= _FUSED_HC_MEDIUM_M_MAX:
