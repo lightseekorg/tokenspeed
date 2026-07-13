@@ -73,22 +73,24 @@ class FlatCacheGroupsMixin:
         # prefer_caller: draft chains own per-step locs; metadata's single loc would pin every step to one slot.
         if metadata.out_cache_locs is None or prefer_caller:
             return out_cache_loc
-        locs = metadata.out_cache_locs
-        loc = self._select_group_entry(layer, locs, "flat write locs")
+        return self._select_group_entry(
+            layer, metadata.out_cache_locs, "flat write locs"
+        )
+
+    @staticmethod
+    def _trim_kv_to_locs(out_cache_loc, k, v):
+        """Slice a padded KV write down to the write-loc count.
+
+        Prefill-graph replay pads k/v rows to the bucket while flat per-group
+        locs cover only the real (leading) rows. Trimming beats padding the
+        locs with the null page: backends that don't scrub tail rows (trtllm)
+        would write garbage into page 0, breaking its stays-zero invariant.
+        No-op off the padded path and for backends without flat locs.
+        """
         n = out_cache_loc.shape[0]
-        if loc.shape[0] < n:
-            # Prefill-graph replay pads rows to the bucket while the group's
-            # locs cover only the real tokens: extend with the dummy slot 0
-            # (null page, rows are scrubbed) -- the radix tail convention.
-            # Memoized back into the dict: once per group per forward.
-            padded = torch.zeros(n, dtype=loc.dtype, device=loc.device)
-            padded[: loc.shape[0]].copy_(loc)
-            for gid, v in locs.items():
-                if v is loc:
-                    locs[gid] = padded
-                    break
-            loc = padded
-        return loc
+        if k is not None and k.shape[0] > n:
+            return k[:n], v[:n]
+        return k, v
 
     def _prewrite_metadata(self, forward_mode):
         """Metadata slot the fused prewrite writes against. Default: the

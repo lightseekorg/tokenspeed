@@ -413,13 +413,14 @@ class PrefillGraph:
         width = getattr(backend, "max_num_pages", 0) or -(
             -num_tokens // backend.page_size
         )
-        state_ids = getattr(backend, "flat_state_group_ids", frozenset())
+        # ALL groups, state included: hybrid wrappers forward the dict to the
+        # mamba child, which requires its state group; KV children shed state
+        # groups themselves (_shed_state_groups).
         return {
             str(spec.group_id): torch.zeros(
                 (1, width), dtype=torch.int32, device=self.config.device
             )
             for spec in getattr(self.token_to_kv_pool, "paged_cache_group_specs", ())
-            if str(spec.group_id) not in state_ids
         }
 
     def _make_dummy_batch(

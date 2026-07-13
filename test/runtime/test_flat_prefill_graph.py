@@ -22,57 +22,42 @@ from ci_system.ci_register import register_cuda_ci
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 
-class SelectOutCacheLocPadTest(unittest.TestCase):
-    """_select_out_cache_loc extends flat group locs to the caller's padded
-    row count with dummy slot 0 (the radix tail convention) -- single fix
-    point for every flat-capable backend under the prefill graph."""
+class TrimKvToLocsTest(unittest.TestCase):
+    """_trim_kv_to_locs slices padded k/v tails to the write-loc count --
+    the shared fix point every flat-capable backend's KV write calls.
+    Trimming (not loc-padding) keeps the null page 0 all-zero: trtllm does
+    not scrub padded tail rows before saving KV."""
 
     def setUp(self):
         try:
             import torch
 
-            from tokenspeed.runtime.layers.attention.backends.mha import (
-                MHAAttnBackend,
+            from tokenspeed.runtime.layers.attention.backends.flat_groups import (
+                FlatCacheGroupsMixin,
             )
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
         self.torch = torch
-        self.b = MHAAttnBackend.__new__(MHAAttnBackend)
+        self.trim = FlatCacheGroupsMixin._trim_kv_to_locs
 
-    def _meta(self, locs):
-        return SimpleNamespace(out_cache_locs=locs)
+    def test_padded_tail_trimmed(self):
+        k = self.torch.zeros(16, 2, 8)
+        v = self.torch.zeros(16, 2, 8)
+        locs = self.torch.zeros(5, dtype=self.torch.int32)
+        k2, v2 = self.trim(locs, k, v)
+        self.assertEqual((k2.shape[0], v2.shape[0]), (5, 5))
 
-    def _layer(self, gid="full_attention"):
-        return SimpleNamespace(group_id=gid)
+    def test_equal_rows_identity(self):
+        k = self.torch.zeros(16, 2, 8)
+        v = self.torch.zeros(16, 2, 8)
+        locs = self.torch.zeros(16, dtype=self.torch.int32)
+        k2, v2 = self.trim(locs, k, v)
+        self.assertIs(k2, k)
+        self.assertIs(v2, v)
 
-    def test_padded_caller_extends_locs_with_dummy_slot0(self):
-        real = self.torch.arange(64, 69, dtype=self.torch.int32)  # 5 real locs
-        meta = self._meta({"full_attention": real})
-        caller = self.torch.zeros(16, dtype=self.torch.int32)  # bucket rows
-        out = self.b._select_out_cache_loc(self._layer(), meta, caller)
-        self.assertEqual(out.shape[0], 16)
-        self.assertEqual(out[:5].tolist(), list(range(64, 69)))
-        self.assertEqual(out[5:].abs().sum().item(), 0)  # dummy slot 0 tail
-        # Memoized: the dict now holds the padded tensor (once per forward).
-        self.assertIs(meta.out_cache_locs["full_attention"], out)
-        again = self.b._select_out_cache_loc(self._layer(), meta, caller)
-        self.assertIs(again, out)
-
-    def test_equal_rows_untouched(self):
-        real = self.torch.arange(16, dtype=self.torch.int32)
-        meta = self._meta({"full_attention": real})
-        caller = self.torch.zeros(16, dtype=self.torch.int32)
-        self.assertIs(self.b._select_out_cache_loc(self._layer(), meta, caller), real)
-
-    def test_prefer_caller_wins(self):
-        meta = self._meta({"full_attention": self.torch.zeros(5)})
-        caller = self.torch.zeros(16, dtype=self.torch.int32)
-        self.assertIs(
-            self.b._select_out_cache_loc(
-                self._layer(), meta, caller, prefer_caller=True
-            ),
-            caller,
-        )
+    def test_none_kv_passthrough(self):
+        locs = self.torch.zeros(4, dtype=self.torch.int32)
+        self.assertEqual(self.trim(locs, None, None), (None, None))
 
 
 class DummyFlatTablesTest(unittest.TestCase):
@@ -105,11 +90,14 @@ class DummyFlatTablesTest(unittest.TestCase):
             paged_cache_group_specs=(
                 SimpleNamespace(group_id="full_attention"),
                 SimpleNamespace(group_id="sliding_attention"),
-                SimpleNamespace(group_id="linear_attention"),  # state: skipped
+                SimpleNamespace(group_id="linear_attention"),  # state: included
             )
         )
         tables = self._bare(backend, pool)._dummy_flat_tables(100)
-        self.assertEqual(set(tables), {"full_attention", "sliding_attention"})
+        self.assertEqual(
+            set(tables),
+            {"full_attention", "sliding_attention", "linear_attention"},
+        )
         for t in tables.values():
             self.assertEqual(t.shape, (1, 4))  # ceil(100/32)
             self.assertEqual(int(t.abs().sum()), 0)  # null block 0 only

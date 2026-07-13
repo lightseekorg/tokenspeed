@@ -721,6 +721,7 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
     ) -> None:
         if k is None:
             return
+        k, v = self._trim_kv_to_locs(out_cache_loc, k, v)
 
         if (
             self.kv_cache_dtype == torch.float8_e4m3fn

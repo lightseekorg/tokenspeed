@@ -267,6 +267,7 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
     def _save_kv_and_prepare_q(
         self, q, k, v, layer, out_cache_loc, token_to_kv_pool, save_kv_cache
     ):
+        k, v = self._trim_kv_to_locs(out_cache_loc, k, v)
         if self._should_use_fused_fp8_path(save_kv_cache, k):
             k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
             fused_fp8_set_kv_buffer(
