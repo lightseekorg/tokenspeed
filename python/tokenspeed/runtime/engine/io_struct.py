@@ -729,11 +729,25 @@ class UpdateWeightFromDiskReqOutput:
     num_paused_requests: int | None = 0
 
 
+# Packed-tensor framing defaults. The trainer (producer) and the worker
+# (consumer) must agree on these, so they are part of the wire contract.
+DEFAULT_PACKED_BUFFER_SIZE_BYTES = 1024 * 1024 * 1024  # 1 GiB
+DEFAULT_PACKED_NUM_BUFFERS = 2
+
+
 @dataclass
 class UpdateWeightsFromDistributedReqInput:
-    name: str
-    dtype: str
-    shape: list[int]
+    # Weight-update metadata shared with the trainer's NCCL sender.
+    names: list[str]
+    dtype_names: list[str]
+    shapes: list[list[int]]
+    # Packed (batched small-tensor) broadcast. When True, multiple tensors are
+    # batched into shared buffers before broadcasting to cut NCCL overhead.
+    packed: bool = False
+    packed_buffer_size_bytes: int = DEFAULT_PACKED_BUFFER_SIZE_BYTES
+    packed_num_buffers: int = DEFAULT_PACKED_NUM_BUFFERS
+    group_name: str = "weight_update_group"
+    flush_cache: bool = True
 
 
 @dataclass
@@ -744,7 +758,9 @@ class UpdateWeightsFromDistributedReqOutput:
 
 @dataclass
 class UpdateWeightsFromTensorReqInput:
-    serialized_named_tensors: bytes  # indeed Dict[str, torch.Tensor]
+    # One serialized ``Dict[str, torch.Tensor]`` per world rank (engine.py fans
+    # the payload out across ``mapping.world_size``).
+    serialized_named_tensors: list[bytes]
     load_format: str | None
     flush_cache: bool
 
@@ -773,6 +789,18 @@ class InitWeightsUpdateGroupReqInput:
 
 @dataclass
 class InitWeightsUpdateGroupReqOutput:
+    success: bool
+    message: str
+
+
+@dataclass
+class DestroyWeightsUpdateGroupReqInput:
+    # The group name to tear down (must match the init group_name).
+    group_name: str = "weight_update_group"
+
+
+@dataclass
+class DestroyWeightsUpdateGroupReqOutput:
     success: bool
     message: str
 

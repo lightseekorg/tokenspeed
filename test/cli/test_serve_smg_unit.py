@@ -111,7 +111,10 @@ def test_gateway_args_preserve_user_policy():
 def test_gateway_args_defaults_include_port_and_reasoning_parser():
     gateway_args = _gateway_args_with_defaults(["--model", "/tmp/x"])
 
-    assert gateway_args == [
+    # The Prometheus port is a freshly allocated free port (see
+    # test_gateway_args_default_prometheus_port_is_free_port), so assert the
+    # fixed prefix exactly and the trailing port slot structurally.
+    assert gateway_args[:-1] == [
         "--model",
         "/tmp/x",
         "--port",
@@ -127,8 +130,8 @@ def test_gateway_args_defaults_include_port_and_reasoning_parser():
         "--log-level",
         "warn",
         "--prometheus-port",
-        "8413",
     ]
+    assert gateway_args[-1].isdigit()
 
 
 def test_gateway_args_defaults_inject_passthrough_policy():
@@ -165,10 +168,15 @@ def test_gateway_args_preserve_user_log_level():
     assert gateway_args == ["--log-level", "debug"]
 
 
-def test_gateway_args_default_prometheus_port_is_8413():
+def test_gateway_args_default_prometheus_port_is_free_port():
     gateway_args = _gateway_args_with_default_prometheus_port(["--model", "/tmp/x"])
 
-    assert gateway_args == ["--model", "/tmp/x", "--prometheus-port", "8413"]
+    # A fresh free port is allocated per launch (not a fixed default) so repeated
+    # ``ts serve`` launches -- e.g. as an sglang/slime RL rollout backend -- do
+    # not collide on a port left in TIME_WAIT by the previous run.
+    assert gateway_args[:3] == ["--model", "/tmp/x", "--prometheus-port"]
+    assert gateway_args[3].isdigit()
+    assert 1 <= int(gateway_args[3]) <= 65535
 
 
 def test_gateway_args_preserve_user_prometheus_port():

@@ -165,3 +165,145 @@ class ModelRunner:
             out_cache_loc,
             **kwargs,
         )
+
+    # ------------------------------------------------------------------ #
+    # RL online weight sync: receive NCCL-broadcast weights from a trainer.
+    #
+    # Mirrors the slime/SGLang sender contract: the trainer occupies ranks
+    # ``0..rank_offset-1`` and each inference worker joins at
+    # ``rank_offset + global_rank``. The trainer broadcasts each named weight
+    # from rank 0 (in ``names`` order); this worker receives in the same order
+    # and applies via the model's ``load_weights`` (the same name->param mapping,
+    # including fused/stacked params, used by the initial load).
+    # ------------------------------------------------------------------ #
+
+    def init_weights_update_group(self, obj) -> tuple[bool, str]:
+        """Join the trainer's ``torch.distributed`` NCCL weight-update group.
+
+        The trainer (slime/sglang dialect) creates the peer group with
+        ``init_process_group(init_method="tcp://addr:port", rank=0, world_size)``
+        and pushes weights via ``dist.broadcast(..., src=0)``. We must rendezvous
+        through the *same* torch TCP-store + NCCL-unique-id handshake — a
+        ``StatelessProcessGroup``/``PyNcclCommunicator`` keys its store
+        differently and never forms a joint communicator with a torch group, so
+        the broadcast would deadlock. Build a standalone, non-default group (via
+        the same private helper torch's own ``init_process_group`` uses) so it
+        never collides with the engine's own world.
+        """
+        from packaging.version import parse as _parse_version
+        from torch.distributed.distributed_c10d import (
+            Backend,
+            PrefixStore,
+            _new_process_group_helper,
+            _world,
+            default_pg_timeout,
+            rendezvous,
+        )
+
+        try:
+            rank = int(obj.rank_offset) + self.global_rank
+            world_size = int(obj.world_size)
+            group_name = str(getattr(obj, "group_name", "weight_update_group"))
+            backend = Backend(str(getattr(obj, "backend", "nccl")))
+            device = torch.device(f"cuda:{self.gpu_id}")
+            torch.cuda.set_device(device)
+
+            timeout = default_pg_timeout
+            init_method = f"tcp://{obj.master_address}:{int(obj.master_port)}"
+            store, rank, world_size = next(
+                rendezvous(init_method, rank, world_size, timeout=timeout)
+            )
+            store.set_timeout(timeout)
+            store = PrefixStore(group_name, store)
+            opt = (
+                "backend_options"
+                if _parse_version(torch.__version__) >= _parse_version("2.6")
+                else "pg_options"
+            )
+            pg, _ = _new_process_group_helper(
+                world_size,
+                rank,
+                [],
+                backend,
+                store,
+                group_name=group_name,
+                **{opt: None},
+                timeout=timeout,
+            )
+            _world.pg_group_ranks[pg] = {i: i for i in range(world_size)}
+
+            self._weight_update_pg = pg
+            self._weight_update_device = device
+            logger.info(
+                "weight-update group joined: rank=%d world_size=%d device=%s group=%s",
+                rank,
+                world_size,
+                device,
+                group_name,
+            )
+            return True, "weight update group initialized"
+        except Exception as e:  # noqa: BLE001 - surface to the control plane
+            logger.exception("init_weights_update_group failed")
+            return False, str(e)
+
+    def update_weights_from_distributed(self, obj) -> tuple[bool, str]:
+        """Receive trainer-broadcast weights over the NCCL group and load them."""
+        import torch.distributed as dist
+
+        pg = getattr(self, "_weight_update_pg", None)
+        if pg is None:
+            return False, "weight update group not initialized"
+        try:
+            names = list(obj.names)
+            dtype_names = list(obj.dtype_names)
+            shapes = [tuple(s) for s in obj.shapes]
+            device = self._weight_update_device
+
+            def _recv():
+                # NCCL broadcasts are ordered collectives: receive each weight in
+                # the trainer's send order (rank 0 is the trainer) and hand it to
+                # the model's loader (the same name->param mapping, including
+                # fused/stacked params, used by the initial load).
+                for name, dtype_name, shape in zip(names, dtype_names, shapes):
+                    buf = torch.empty(
+                        shape, dtype=getattr(torch, dtype_name), device=device
+                    )
+                    dist.broadcast(buf, src=0, group=pg)
+                    yield name, buf
+
+            self.model.load_weights(_recv())
+            torch.cuda.synchronize(device)
+            return True, f"updated {len(names)} weights"
+        except Exception as e:  # noqa: BLE001 - surface to the control plane
+            logger.exception("update_weights_from_distributed failed")
+            return False, str(e)
+
+    def destroy_weights_update_group(self, obj) -> tuple[bool, str]:
+        """Tear down the trainer weight-update NCCL group joined in ``init``.
+
+        When a training run ends the trainer drops its end of the group, so the
+        worker must release its side too -- free the NCCL communicator and the
+        torch ``_world`` bookkeeping ``init_weights_update_group`` registered --
+        instead of leaking it until engine shutdown. A fresh run then re-inits a
+        clean group. Idempotent: tearing down when no group is live is a success
+        so a trainer that always calls destroy (e.g. slime) never errors.
+        """
+        pg = getattr(self, "_weight_update_pg", None)
+        if pg is None:
+            return True, "weight update group not initialized"
+
+        import torch.distributed as dist
+        from torch.distributed.distributed_c10d import _world
+
+        try:
+            dist.destroy_process_group(pg)
+            # init() registered this group's rank map via the low-level helper;
+            # drop it explicitly in case destroy_process_group left it behind.
+            _world.pg_group_ranks.pop(pg, None)
+        except Exception as e:  # noqa: BLE001 - surface to the control plane
+            logger.exception("destroy_weights_update_group failed")
+            return False, str(e)
+        self._weight_update_pg = None
+        self._weight_update_device = None
+        logger.info("weight-update group destroyed")
+        return True, "weight update group destroyed"

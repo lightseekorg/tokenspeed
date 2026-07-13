@@ -133,6 +133,17 @@ class ServerArgs:
     enable_cache_report: bool = False
     kv_events_config: str | None = None
 
+    # RL online weight sync (always on / ungated). NOTE: these endpoints can
+    # overwrite model weights, reload checkpoints from disk, and pause/abort
+    # serving, and are exposed on the public control port. See
+    # runtime/engine/weight_transfer/ and runtime/entrypoints/vllm_compat_http.py.
+    weight_transfer_config: str | None = None
+    # Port for the in-engine RL control-plane HTTP app (weight sync + pause/resume
+    # + memory occupation, both the native and SGLang-compatible dialects). Set by
+    # the ``ts serve`` orchestrator (allocated + proxied by the sidecar); None
+    # disables the in-engine app.
+    rl_control_port: int | None = None
+
     # Data parallelism
     data_parallel_size: int | None = None
     load_balance_method: str = "shortest_queue"
@@ -1836,6 +1847,23 @@ class ServerArgs:
             help="The URL of the PD disaggregation load balancer. If set, the prefill/decode server will register with the load balancer.",
         )
 
+        # RL online weight sync (always on / ungated).
+        parser.add_argument(
+            "--weight-transfer-config",
+            type=str,
+            default=ServerArgs.weight_transfer_config,
+            help='JSON config for weight transfer, e.g. \'{"backend":"nccl"}\'. '
+            "Backend is one of 'nccl' (disaggregated) or 'ipc' (colocated).",
+        )
+        parser.add_argument(
+            "--rl-control-port",
+            type=int,
+            default=ServerArgs.rl_control_port,
+            help="Port for the in-engine RL control-plane HTTP app (weight sync, "
+            "pause/resume, memory occupation). Normally allocated automatically "
+            "by the `ts serve` orchestrator.",
+        )
+
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
         args.ep_size = args.expert_parallel_size
@@ -1877,6 +1905,14 @@ class ServerArgs:
         if is_valid_ipv6_address(self.host):
             return f"http://[{self.host}]:{self.port}"
         return f"http://{self.host}:{self.port}"
+
+    def get_weight_transfer_config(self):
+        """Parse ``--weight-transfer-config`` JSON into a ``WeightTransferConfig``."""
+        from tokenspeed.runtime.engine.weight_transfer.config import (
+            WeightTransferConfig,
+        )
+
+        return WeightTransferConfig.from_json(self.weight_transfer_config)
 
 
 def prepare_server_args(argv: list[str]) -> ServerArgs:

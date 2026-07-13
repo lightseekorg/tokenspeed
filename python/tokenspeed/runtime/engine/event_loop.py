@@ -485,6 +485,7 @@ class EventLoop:
             architectures=self.model_config.hf_config.architectures,
             pause_controller=self._pause,
             memory_controller=self._memory,
+            model_runner=target,
         )
 
         self.output_processor = OutputProcesser(

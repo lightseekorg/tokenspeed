@@ -35,12 +35,16 @@ from tokenspeed.runtime.distributed.process_group_manager import (
 from tokenspeed.runtime.engine.generation_output_processor import RequestState
 from tokenspeed.runtime.engine.io_struct import (
     AbortReq,
+    DestroyWeightsUpdateGroupReqInput,
+    DestroyWeightsUpdateGroupReqOutput,
     FlushCacheReqInput,
     FlushCacheReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetLoadReqInput,
     GetLoadReqOutput,
+    InitWeightsUpdateGroupReqInput,
+    InitWeightsUpdateGroupReqOutput,
     IsSchedulerPausedReqInput,
     IsSleepingReqInput,
     PauseSchedulerReqInput,
@@ -53,6 +57,8 @@ from tokenspeed.runtime.engine.io_struct import (
     SetInternalStateReq,
     SetInternalStateReqOutput,
     TokenizedGenerateReqInput,
+    UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromDistributedReqOutput,
 )
 from tokenspeed.runtime.engine.request_types import FINISH_ABORT
 from tokenspeed.runtime.engine.scheduler_utils import make_spec
@@ -89,6 +95,7 @@ class RequestHandler:
         architectures: list[str] | None = None,
         pause_controller=None,
         memory_controller=None,
+        model_runner=None,
     ) -> None:
 
         self.forward_ct = 0
@@ -98,6 +105,9 @@ class RequestHandler:
         # Owns release/resume_memory_occupation (data plane). See
         # memory_occupation.py. Shares the pause controller's drain machinery.
         self.memory_controller = memory_controller
+        # ModelRunner for in-place RL weight sync (NCCL group init + receive).
+        # The scheduler worker passes it in; None elsewhere (e.g. unit tests).
+        self.model_runner = model_runner
 
         mapping = server_args.mapping
         self.attn_tp_size = mapping.attn.tp_size
@@ -209,6 +219,24 @@ class RequestHandler:
                     self.send_func.send_pyobj(self.get_load_fn())
                 else:
                     self.send_func.send_pyobj(GetLoadReqOutput())
+            elif isinstance(recv_req, InitWeightsUpdateGroupReqInput):
+                # RL weight sync: join the trainer's NCCL group on this worker.
+                ok, msg = self.model_runner.init_weights_update_group(recv_req)
+                self.send_func.send_pyobj(
+                    InitWeightsUpdateGroupReqOutput(success=ok, message=msg)
+                )
+            elif isinstance(recv_req, UpdateWeightsFromDistributedReqInput):
+                # RL weight sync: receive broadcast weights + load into the model.
+                ok, msg = self.model_runner.update_weights_from_distributed(recv_req)
+                self.send_func.send_pyobj(
+                    UpdateWeightsFromDistributedReqOutput(success=ok, message=msg)
+                )
+            elif isinstance(recv_req, DestroyWeightsUpdateGroupReqInput):
+                # RL weight sync: tear down the trainer's NCCL group on this worker.
+                ok, msg = self.model_runner.destroy_weights_update_group(recv_req)
+                self.send_func.send_pyobj(
+                    DestroyWeightsUpdateGroupReqOutput(success=ok, message=msg)
+                )
             else:
                 raise NotImplementedError(f"Unsupported request type: {type(recv_req)}")
         return new_req_specs, req_states, bootstrap_infos, abort_rids
