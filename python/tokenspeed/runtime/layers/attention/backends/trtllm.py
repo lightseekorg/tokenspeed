@@ -41,6 +41,9 @@ from tokenspeed_kernel.ops.kvcache.triton import (
 )
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
+from tokenspeed.runtime.execution.breakable_cuda_graph import (
+    is_breakable_capture_active,
+)
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.backends.flat_groups import (
@@ -114,6 +117,12 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
     def support_kv_cache_prewrite(
         self, forward_mode: ForwardMode | None = None
     ) -> bool:
+        # Under a breakable prefill-graph capture the prewrite would bake this
+        # forward's write locations into the graph (stale on every replay;
+        # dummy-page locs on the flat path) -- bake the non-prewrite branch
+        # instead: the eager attention break writes KV from fresh metadata.
+        if is_breakable_capture_active():
+            return False
         return True
 
     def _prewrite_metadata(self, forward_mode):
@@ -258,6 +267,12 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
     def _save_kv_and_prepare_q(
         self, q, k, v, layer, out_cache_loc, token_to_kv_pool, save_kv_cache
     ):
+        # Prefill-graph replay pads k/v rows to the bucket, but flat per-group
+        # write locs cover only the real (leading) rows; drop the padded tail
+        # from the KV write (q keeps the padded shape for the graphed layers).
+        if k is not None and k.shape[0] > out_cache_loc.shape[0]:
+            k = k[: out_cache_loc.shape[0]]
+            v = v[: out_cache_loc.shape[0]]
         if self._should_use_fused_fp8_path(save_kv_cache, k):
             k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
             fused_fp8_set_kv_buffer(

@@ -126,5 +126,56 @@ class DummyFlatTablesTest(unittest.TestCase):
         self.assertEqual(self._bare(backend, pool)._dummy_flat_tables(64), {})
 
 
+class TrtllmPrefillGraphSeamsTest(unittest.TestCase):
+    """trtllm under the prefill graph: the extend prewrite must not bake
+    capture-time write locs into the graph, and the break's KV write must
+    trim padded tails like mha."""
+
+    def setUp(self):
+        try:
+            import torch
+
+            from tokenspeed.runtime.layers.attention.backends import trtllm
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
+        self.torch = torch
+        self.mod = trtllm
+
+    def _bare_backend(self):
+        b = self.mod.TRTLLMMHAAttnBackend.__new__(self.mod.TRTLLMMHAAttnBackend)
+        b.kv_cache_dtype = self.torch.bfloat16
+        return b
+
+    def test_prewrite_disabled_during_breakable_capture(self):
+        from unittest import mock
+
+        b = self._bare_backend()
+        self.assertTrue(b.support_kv_cache_prewrite(None))
+        with mock.patch.object(
+            self.mod, "is_breakable_capture_active", return_value=True
+        ):
+            self.assertFalse(b.support_kv_cache_prewrite(None))
+
+    def test_save_kv_trims_padded_tail(self):
+        b = self._bare_backend()
+        calls = []
+
+        class _Pool:
+            def set_kv_buffer(self, layer, loc, k, v, k_scale, v_scale):
+                calls.append((loc.shape[0], k.shape[0], v.shape[0]))
+
+        k = self.torch.zeros(16, 2, 8, dtype=self.torch.bfloat16)
+        v = self.torch.zeros(16, 2, 8, dtype=self.torch.bfloat16)
+        q = self.torch.zeros(16, 4 * 8, dtype=self.torch.bfloat16)
+        locs = self.torch.zeros(5, dtype=self.torch.int32)
+        layer = SimpleNamespace(
+            layer_id=0, k_scale=None, v_scale=None, tp_q_head_num=4, head_dim=8
+        )
+        out_q = b._save_kv_and_prepare_q(q, k, v, layer, locs, _Pool(), True)
+        self.assertEqual(calls, [(5, 5, 5)])
+        # q keeps the padded rows: the graphed layers expect bucket shape.
+        self.assertEqual(out_q.shape[0], 16)
+
+
 if __name__ == "__main__":
     unittest.main()
