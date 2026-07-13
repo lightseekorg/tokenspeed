@@ -284,7 +284,6 @@ def mm(
     quant: str | None = None,
     enable_pdl: bool = False,
     override: str | None = None,
-    expected_kernel_name: str | None = None,
 ) -> torch.Tensor:
     """Dense matrix multiply with automatic kernel selection.
 
@@ -315,7 +314,6 @@ def mm(
             from kernels that accept it.
         override: Force selection of a specific kernel by name (e.g.
             ``"cublaslt_mm_nvfp4"``). Bypasses heuristic scoring.
-        expected_kernel_name: Debug hint for expected kernel selection.
     """
     out_dtype = out_dtype or (out.dtype if out is not None else A.dtype)
 
@@ -356,7 +354,6 @@ def mm(
         signature,
         traits=traits,
         override=override,
-        expected_kernel_name=expected_kernel_name,
     )
 
     # Online activation quantization
