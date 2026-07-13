@@ -1948,9 +1948,11 @@ class MoESliceMNProgram:
         mfma_idx = 0
 
         # Prologue: NB iters in flight (region 2/3 of iter 0 ds_read
-        # iter 1 W_left / X_top, so NB not NB-1).
+        # iter 1 W_left / X_top, so NB not NB-1). Use the descriptor's
+        # automatic tail-K mask for uneven K shapes; TP8 GPT-OSS GEMM2 has
+        # K=384 with BLOCK_K=256, so the second preload is a K tail.
         for _ in gl.static_range(NB):
-            load_idx = self.issue_global_loads(load_idx, USE_MASK=0)
+            load_idx = self.issue_global_loads(load_idx, USE_MASK=-1)
 
         c_tl = gl.zeros((SUBTILE_M, SUBTILE_N), dtype=gl.float32, layout=cfg.acc_layout)
         c_bl = gl.zeros((SUBTILE_M, SUBTILE_N), dtype=gl.float32, layout=cfg.acc_layout)
@@ -2413,7 +2415,7 @@ class MoESliceNProgram:
         mfma_idx = 0
 
         for _ in gl.static_range(NB):
-            load_idx = self.issue_global_loads(load_idx, USE_MASK=0)
+            load_idx = self.issue_global_loads(load_idx, USE_MASK=-1)
 
         c0 = gl.zeros((cfg.BLOCK_M, SUBTILE_N), dtype=gl.float32, layout=cfg.acc_layout)
         c1 = gl.zeros((cfg.BLOCK_M, SUBTILE_N), dtype=gl.float32, layout=cfg.acc_layout)
@@ -2485,7 +2487,7 @@ class MoESliceNProgram:
         mfma_idx = 0
 
         for _ in gl.static_range(NB):
-            load_idx = self.issue_global_loads(load_idx, USE_MASK=0)
+            load_idx = self.issue_global_loads(load_idx, USE_MASK=-1)
 
         c0 = gl.zeros((cfg.BLOCK_M, SUBTILE_N), dtype=gl.float32, layout=cfg.acc_layout)
         c1 = gl.zeros((cfg.BLOCK_M, SUBTILE_N), dtype=gl.float32, layout=cfg.acc_layout)

@@ -71,6 +71,10 @@ KEY_NUM_TOKENS = [
     pytest.param(4096, id="tokens4096_routedM8192"),
     pytest.param(8192, id="tokens8192_routedM16384"),
 ]
+KEY_INTERMEDIATE_SIZES = [
+    pytest.param(INTERMEDIATE_SIZE, id=f"intermediate{INTERMEDIATE_SIZE}"),
+    pytest.param(384, id="intermediate384_tp8_tail_k"),
+]
 
 
 def test_gluon_dot_preshuffle_records_layout_block_n() -> None:
@@ -291,6 +295,8 @@ class RawMxfp4Weights:
 
 @dataclass
 class Mxfp4Weights:
+    hidden_size: int
+    intermediate_size: int
     w13_weight: Any
     w2_weight: Any
     w13_bias: torch.Tensor | None
@@ -303,6 +309,8 @@ class Mxfp4Weights:
 
 @dataclass
 class Mxfp4WeightVariants:
+    hidden_size: int
+    intermediate_size: int
     raw: RawMxfp4Weights
     nonpreshuffled: Mxfp4Weights
     preshuffled: Mxfp4Weights
@@ -375,33 +383,46 @@ def _make_random_mxfp4_quantized_tensor(
     )
 
 
-def _make_raw_mxfp4_weights() -> RawMxfp4Weights:
+def _make_raw_mxfp4_weights(
+    *,
+    hidden_size: int = HIDDEN_SIZE,
+    intermediate_size: int = INTERMEDIATE_SIZE,
+) -> RawMxfp4Weights:
     device = "cuda"
-    generator = torch.Generator(device=device).manual_seed(20260610)
+    generator = torch.Generator(device=device).manual_seed(
+        20260610 + hidden_size + intermediate_size
+    )
 
     return RawMxfp4Weights(
         w13_weight=_make_mxfp4_weight_bytes(
-            (E, 2 * INTERMEDIATE_SIZE, HIDDEN_SIZE // 2),
+            (E, 2 * intermediate_size, hidden_size // 2),
             device=device,
             generator=generator,
         ),
         w13_scale=_make_e8m0_scales(
-            (E, 2 * INTERMEDIATE_SIZE, HIDDEN_SIZE // MXFP4_BLOCK),
+            (E, 2 * intermediate_size, hidden_size // MXFP4_BLOCK),
             device=device,
             generator=generator,
         ),
         w2_weight=_make_mxfp4_weight_bytes(
-            (E, HIDDEN_SIZE, INTERMEDIATE_SIZE // 2), device=device, generator=generator
+            (E, hidden_size, intermediate_size // 2),
+            device=device,
+            generator=generator,
         ),
         w2_scale=_make_e8m0_scales(
-            (E, HIDDEN_SIZE, INTERMEDIATE_SIZE // MXFP4_BLOCK),
+            (E, hidden_size, intermediate_size // MXFP4_BLOCK),
             device=device,
             generator=generator,
         ),
     )
 
 
-def _make_weight_module(raw: RawMxfp4Weights) -> torch.nn.Module:
+def _make_weight_module(
+    raw: RawMxfp4Weights,
+    *,
+    hidden_size: int = HIDDEN_SIZE,
+    intermediate_size: int = INTERMEDIATE_SIZE,
+) -> torch.nn.Module:
     layer = torch.nn.Module()
     layer.activation = "swiglu"
     layer.swiglu_arg = None
@@ -415,11 +436,11 @@ def _make_weight_module(raw: RawMxfp4Weights) -> torch.nn.Module:
         raw.w2_scale.clone(), requires_grad=False
     )
     layer.w13_weight_bias = torch.nn.Parameter(
-        torch.zeros(E, 2 * INTERMEDIATE_SIZE, device=raw.w13_weight.device),
+        torch.zeros(E, 2 * intermediate_size, device=raw.w13_weight.device),
         requires_grad=False,
     )
     layer.w2_weight_bias = torch.nn.Parameter(
-        torch.zeros(E, HIDDEN_SIZE, device=raw.w13_weight.device),
+        torch.zeros(E, hidden_size, device=raw.w13_weight.device),
         requires_grad=False,
     )
     layer.w13_input_scale = torch.nn.Parameter(
@@ -437,12 +458,20 @@ def _make_preprocessed_weights(
     raw: RawMxfp4Weights,
     *,
     preshuffle: bool,
+    hidden_size: int = HIDDEN_SIZE,
+    intermediate_size: int = INTERMEDIATE_SIZE,
 ) -> Mxfp4Weights:
-    layer = _make_weight_module(raw)
+    layer = _make_weight_module(
+        raw,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
     plan = {"internal_activation_dtype": "fp8"}
     preprocess_gluon_mxfp4_gfx950_moe_weights(plan, layer, preshuffle=preshuffle)
 
     return Mxfp4Weights(
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
         w13_weight=layer.w13_weight_triton_tensor,
         w2_weight=layer.w2_weight_triton_tensor,
         w13_bias=layer.w13_weight_bias,
@@ -510,14 +539,33 @@ def test_preprocess_releases_raw_mxfp4_parameters() -> None:
     assert layer.w2_precision_config.b_mx_scale is not None
 
 
+def _make_mxfp4_weight_variants(intermediate_size: int) -> Mxfp4WeightVariants:
+    raw_weights = _make_raw_mxfp4_weights(intermediate_size=intermediate_size)
+    return Mxfp4WeightVariants(
+        hidden_size=HIDDEN_SIZE,
+        intermediate_size=intermediate_size,
+        raw=raw_weights,
+        nonpreshuffled=_make_preprocessed_weights(
+            raw_weights,
+            intermediate_size=intermediate_size,
+            preshuffle=False,
+        ),
+        preshuffled=_make_preprocessed_weights(
+            raw_weights,
+            intermediate_size=intermediate_size,
+            preshuffle=True,
+        ),
+    )
+
+
 @pytest.fixture(scope="module")
 def mxfp4_weights() -> Mxfp4WeightVariants:
-    raw_weights = _make_raw_mxfp4_weights()
-    return Mxfp4WeightVariants(
-        raw=raw_weights,
-        nonpreshuffled=_make_preprocessed_weights(raw_weights, preshuffle=False),
-        preshuffled=_make_preprocessed_weights(raw_weights, preshuffle=True),
-    )
+    return _make_mxfp4_weight_variants(INTERMEDIATE_SIZE)
+
+
+@pytest.fixture(scope="module", params=KEY_INTERMEDIATE_SIZES)
+def moe_gemm_mxfp4_weights(request: pytest.FixtureRequest) -> Mxfp4WeightVariants:
+    return _make_mxfp4_weight_variants(int(request.param))
 
 
 def test_gluon_preshuffle_keeps_w2_bias_logical_n(
@@ -525,9 +573,9 @@ def test_gluon_preshuffle_keeps_w2_bias_logical_n(
 ) -> None:
     w2_raw = gluon_moe._extract_gluon_raw_w(mxfp4_weights.preshuffled.w2_weight)
     assert mxfp4_weights.preshuffled.w2_bias is not None
-    assert getattr(w2_raw, "original_n") == HIDDEN_SIZE
-    assert w2_raw.shape[-1] > HIDDEN_SIZE
-    assert mxfp4_weights.preshuffled.w2_bias.shape[-1] == HIDDEN_SIZE
+    assert getattr(w2_raw, "original_n") == mxfp4_weights.hidden_size
+    assert w2_raw.shape[-1] >= mxfp4_weights.hidden_size
+    assert mxfp4_weights.preshuffled.w2_bias.shape[-1] == mxfp4_weights.hidden_size
 
 
 def _assert_gluon_route_matches_default(
@@ -617,13 +665,19 @@ def _make_hidden_and_router(num_tokens: int) -> tuple[torch.Tensor, torch.Tensor
     return hidden_states, router_logits
 
 
-def _make_gemm2_input(num_tokens: int, scale: torch.Tensor) -> torch.Tensor:
+def _make_gemm2_input(
+    num_tokens: int,
+    scale: torch.Tensor,
+    *,
+    intermediate_size: int = INTERMEDIATE_SIZE,
+    topk: int = TOPK,
+) -> torch.Tensor:
     generator = torch.Generator(device="cuda").manual_seed(19000 + num_tokens)
     exact_values = (
         torch.randint(
             -4,
             5,
-            (num_tokens * TOPK, INTERMEDIATE_SIZE),
+            (num_tokens * topk, intermediate_size),
             device="cuda",
             generator=generator,
         ).to(torch.float32)
@@ -763,7 +817,7 @@ def _compute_torch_gemm1_reference(
     gather_indx: torch.Tensor,
 ) -> torch.Tensor:
     output = torch.empty(
-        (gather_indx.numel(), INTERMEDIATE_SIZE),
+        (gather_indx.numel(), weights.intermediate_size),
         device=gemm1_input.device,
         dtype=torch.bfloat16,
     )
@@ -790,7 +844,7 @@ def _compute_torch_gemm1_mxfp4_reference(
 ) -> torch.Tensor:
     n_rows = gather_indx.numel() if gather_indx is not None else gemm1_input.shape[0]
     output = torch.empty(
-        (n_rows, INTERMEDIATE_SIZE),
+        (n_rows, weights.intermediate_size),
         device=gemm1_input.device,
         dtype=torch.bfloat16,
     )
@@ -821,7 +875,7 @@ def _compute_torch_gemm2_reference(
     num_tokens: int,
 ) -> torch.Tensor:
     routed = torch.empty(
-        (num_tokens * TOPK, HIDDEN_SIZE),
+        (num_tokens * TOPK, weights.hidden_size),
         device=gemm2_input.device,
         dtype=torch.bfloat16,
     )
@@ -835,7 +889,7 @@ def _compute_torch_gemm2_reference(
             expert_out = expert_out + weights.w2_bias[expert][None, :]
         expert_out = expert_out * gate_scal[start:end].to(torch.float32)[:, None]
         routed[scatter_indx[start:end].long()] = expert_out.to(torch.bfloat16)
-    return routed.view(num_tokens, TOPK, HIDDEN_SIZE).sum(dim=1)
+    return routed.view(num_tokens, TOPK, weights.hidden_size).sum(dim=1)
 
 
 def _recover_topk_from_route(
@@ -1377,7 +1431,11 @@ def _compute_torch_reference(
         hidden_states,
         scale=weights.w13_act_scale,
     )
-    gemm2_input = _make_gemm2_input(num_tokens, weights.w2_act_scale)
+    gemm2_input = _make_gemm2_input(
+        num_tokens,
+        weights.w2_act_scale,
+        intermediate_size=weights.intermediate_size,
+    )
 
     with torch.no_grad():
         gemm1_output = _compute_torch_gemm1_reference(
@@ -1407,12 +1465,14 @@ def _compute_torch_reference(
 
 
 @pytest.fixture(scope="module")
-def torch_references(
-    mxfp4_weights: Mxfp4WeightVariants,
+def moe_gemm_torch_references(
+    moe_gemm_mxfp4_weights: Mxfp4WeightVariants,
 ) -> dict[int, TorchReference]:
     return {
         num_tokens: _compute_torch_reference(
-            num_tokens, mxfp4_weights.raw, mxfp4_weights.nonpreshuffled
+            num_tokens,
+            moe_gemm_mxfp4_weights.raw,
+            moe_gemm_mxfp4_weights.nonpreshuffled,
         )
         for num_tokens in KEY_NUM_TOKEN_VALUES
     }
@@ -1480,13 +1540,13 @@ def _assert_gluon_matches_torch(
 @pytest.mark.parametrize("num_tokens", KEY_NUM_TOKENS)
 def test_gluon_moe_gemms_without_preshuffle_match_torch_gfx950(
     num_tokens: int,
-    mxfp4_weights: Mxfp4WeightVariants,
-    torch_references: dict[int, TorchReference],
+    moe_gemm_mxfp4_weights: Mxfp4WeightVariants,
+    moe_gemm_torch_references: dict[int, TorchReference],
 ) -> None:
     _assert_gluon_matches_torch(
         num_tokens,
-        weights=mxfp4_weights.nonpreshuffled,
-        torch_references=torch_references,
+        weights=moe_gemm_mxfp4_weights.nonpreshuffled,
+        torch_references=moe_gemm_torch_references,
     )
 
 
@@ -1494,13 +1554,13 @@ def test_gluon_moe_gemms_without_preshuffle_match_torch_gfx950(
 @pytest.mark.parametrize("num_tokens", KEY_NUM_TOKENS)
 def test_gluon_moe_gemms_with_preshuffle_match_torch_gfx950(
     num_tokens: int,
-    mxfp4_weights: Mxfp4WeightVariants,
-    torch_references: dict[int, TorchReference],
+    moe_gemm_mxfp4_weights: Mxfp4WeightVariants,
+    moe_gemm_torch_references: dict[int, TorchReference],
 ) -> None:
     _assert_gluon_matches_torch(
         num_tokens,
-        weights=mxfp4_weights.preshuffled,
-        torch_references=torch_references,
+        weights=moe_gemm_mxfp4_weights.preshuffled,
+        torch_references=moe_gemm_torch_references,
     )
 
 
