@@ -267,12 +267,6 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
     def _save_kv_and_prepare_q(
         self, q, k, v, layer, out_cache_loc, token_to_kv_pool, save_kv_cache
     ):
-        # Prefill-graph replay pads k/v rows to the bucket, but flat per-group
-        # write locs cover only the real (leading) rows; drop the padded tail
-        # from the KV write (q keeps the padded shape for the graphed layers).
-        if k is not None and k.shape[0] > out_cache_loc.shape[0]:
-            k = k[: out_cache_loc.shape[0]]
-            v = v[: out_cache_loc.shape[0]]
         if self._should_use_fused_fp8_path(save_kv_cache, k):
             k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
             fused_fp8_set_kv_buffer(

@@ -73,9 +73,22 @@ class FlatCacheGroupsMixin:
         # prefer_caller: draft chains own per-step locs; metadata's single loc would pin every step to one slot.
         if metadata.out_cache_locs is None or prefer_caller:
             return out_cache_loc
-        return self._select_group_entry(
-            layer, metadata.out_cache_locs, "flat write locs"
-        )
+        locs = metadata.out_cache_locs
+        loc = self._select_group_entry(layer, locs, "flat write locs")
+        n = out_cache_loc.shape[0]
+        if loc.shape[0] < n:
+            # Prefill-graph replay pads rows to the bucket while the group's
+            # locs cover only the real tokens: extend with the dummy slot 0
+            # (null page, rows are scrubbed) -- the radix tail convention.
+            # Memoized back into the dict: once per group per forward.
+            padded = torch.zeros(n, dtype=loc.dtype, device=loc.device)
+            padded[: loc.shape[0]].copy_(loc)
+            for gid, v in locs.items():
+                if v is loc:
+                    locs[gid] = padded
+                    break
+            loc = padded
+        return loc
 
     def _prewrite_metadata(self, forward_mode):
         """Metadata slot the fused prewrite writes against. Default: the

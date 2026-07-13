@@ -22,8 +22,10 @@ from ci_system.ci_register import register_cuda_ci
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 
-class SaveKvPadTrimTest(unittest.TestCase):
-    """_save_kv_cache drops padded k/v tail rows beyond the loc count."""
+class SelectOutCacheLocPadTest(unittest.TestCase):
+    """_select_out_cache_loc extends flat group locs to the caller's padded
+    row count with dummy slot 0 (the radix tail convention) -- single fix
+    point for every flat-capable backend under the prefill graph."""
 
     def setUp(self):
         try:
@@ -35,51 +37,42 @@ class SaveKvPadTrimTest(unittest.TestCase):
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
         self.torch = torch
-        self.Backend = MHAAttnBackend
+        self.b = MHAAttnBackend.__new__(MHAAttnBackend)
 
-    def _bare_backend(self):
-        b = self.Backend.__new__(self.Backend)
-        b.kv_cache_dtype = self.torch.bfloat16
-        return b
+    def _meta(self, locs):
+        return SimpleNamespace(out_cache_locs=locs)
 
-    class _RecordingPool:
-        def __init__(self):
-            self.calls = []
+    def _layer(self, gid="full_attention"):
+        return SimpleNamespace(group_id=gid)
 
-        def set_kv_buffer(self, layer, loc, k, v, k_scale, v_scale):
-            self.calls.append((loc.shape[0], k.shape[0], v.shape[0]))
+    def test_padded_caller_extends_locs_with_dummy_slot0(self):
+        real = self.torch.arange(64, 69, dtype=self.torch.int32)  # 5 real locs
+        meta = self._meta({"full_attention": real})
+        caller = self.torch.zeros(16, dtype=self.torch.int32)  # bucket rows
+        out = self.b._select_out_cache_loc(self._layer(), meta, caller)
+        self.assertEqual(out.shape[0], 16)
+        self.assertEqual(out[:5].tolist(), list(range(64, 69)))
+        self.assertEqual(out[5:].abs().sum().item(), 0)  # dummy slot 0 tail
+        # Memoized: the dict now holds the padded tensor (once per forward).
+        self.assertIs(meta.out_cache_locs["full_attention"], out)
+        again = self.b._select_out_cache_loc(self._layer(), meta, caller)
+        self.assertIs(again, out)
 
-    def test_padded_tail_trimmed_to_loc_rows(self):
-        # Bucket-padded replay: 16 k/v rows, 5 real write locs.
-        b = self._bare_backend()
-        pool = self._RecordingPool()
-        k = self.torch.zeros(16, 2, 8, dtype=self.torch.bfloat16)
-        v = self.torch.zeros(16, 2, 8, dtype=self.torch.bfloat16)
-        locs = self.torch.zeros(5, dtype=self.torch.int32)
-        b._save_kv_cache(
-            SimpleNamespace(layer_id=0, k_scale=None, v_scale=None), locs, pool, k, v
+    def test_equal_rows_untouched(self):
+        real = self.torch.arange(16, dtype=self.torch.int32)
+        meta = self._meta({"full_attention": real})
+        caller = self.torch.zeros(16, dtype=self.torch.int32)
+        self.assertIs(self.b._select_out_cache_loc(self._layer(), meta, caller), real)
+
+    def test_prefer_caller_wins(self):
+        meta = self._meta({"full_attention": self.torch.zeros(5)})
+        caller = self.torch.zeros(16, dtype=self.torch.int32)
+        self.assertIs(
+            self.b._select_out_cache_loc(
+                self._layer(), meta, caller, prefer_caller=True
+            ),
+            caller,
         )
-        self.assertEqual(pool.calls, [(5, 5, 5)])
-
-    def test_matching_rows_untouched(self):
-        # Radix / unpadded: loc rows == k rows -> no slicing.
-        b = self._bare_backend()
-        pool = self._RecordingPool()
-        k = self.torch.zeros(16, 2, 8, dtype=self.torch.bfloat16)
-        v = self.torch.zeros(16, 2, 8, dtype=self.torch.bfloat16)
-        locs = self.torch.zeros(16, dtype=self.torch.int32)
-        b._save_kv_cache(
-            SimpleNamespace(layer_id=0, k_scale=None, v_scale=None), locs, pool, k, v
-        )
-        self.assertEqual(pool.calls, [(16, 16, 16)])
-
-    def test_none_k_returns(self):
-        b = self._bare_backend()
-        pool = self._RecordingPool()
-        b._save_kv_cache(
-            SimpleNamespace(layer_id=0), self.torch.zeros(4), pool, None, None
-        )
-        self.assertEqual(pool.calls, [])
 
 
 class DummyFlatTablesTest(unittest.TestCase):
@@ -155,26 +148,6 @@ class TrtllmPrefillGraphSeamsTest(unittest.TestCase):
             self.mod, "is_breakable_capture_active", return_value=True
         ):
             self.assertFalse(b.support_kv_cache_prewrite(None))
-
-    def test_save_kv_trims_padded_tail(self):
-        b = self._bare_backend()
-        calls = []
-
-        class _Pool:
-            def set_kv_buffer(self, layer, loc, k, v, k_scale, v_scale):
-                calls.append((loc.shape[0], k.shape[0], v.shape[0]))
-
-        k = self.torch.zeros(16, 2, 8, dtype=self.torch.bfloat16)
-        v = self.torch.zeros(16, 2, 8, dtype=self.torch.bfloat16)
-        q = self.torch.zeros(16, 4 * 8, dtype=self.torch.bfloat16)
-        locs = self.torch.zeros(5, dtype=self.torch.int32)
-        layer = SimpleNamespace(
-            layer_id=0, k_scale=None, v_scale=None, tp_q_head_num=4, head_dim=8
-        )
-        out_q = b._save_kv_and_prepare_q(q, k, v, layer, locs, _Pool(), True)
-        self.assertEqual(calls, [(5, 5, 5)])
-        # q keeps the padded rows: the graphed layers expect bucket shape.
-        self.assertEqual(out_q.shape[0], 16)
 
 
 if __name__ == "__main__":
