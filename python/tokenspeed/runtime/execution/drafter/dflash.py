@@ -112,6 +112,7 @@ class DFlash(BaseDrafter):
         self._greedy_gathered_ids: torch.Tensor | None = None
         self._greedy_gather_cap = 0
         self._init_fused_kv_helper()
+        self._init_incremental_proj()
 
     def _init_native_buffers(self) -> None:
         if self.input_buffers is None:
@@ -597,6 +598,94 @@ class DFlash(BaseDrafter):
             )
             self._fused_kv_enabled = False
 
+    def _init_incremental_proj(self) -> None:
+        self._incremental_proj_enabled = False
+        self._incremental_kv_write_done = False
+        if not self._fused_kv_enabled:
+            return
+        if self._kv_aux_stream is None:
+            return
+        try:
+            fc = self.draft_model_runner.model.fc
+            hidden_norm = self.draft_model_runner.model.hidden_norm
+            fc_weight = fc.weight.data
+            hidden_size = fc_weight.shape[0]
+            n_captures = len(self.target_layer_ids)
+            in_features = fc_weight.shape[1]
+            if in_features != n_captures * hidden_size:
+                logger.warning(
+                    "Incremental proj disabled: fc.in_features=%d != n_captures(%d) * hidden(%d)",
+                    in_features,
+                    n_captures,
+                    hidden_size,
+                )
+                return
+
+            ws_dtype = fc_weight.dtype
+            max_tokens = self.input_buffers.max_bs * (self.spec_num_tokens + 1)
+            self._incr_n_captures = n_captures
+            self._incr_hidden_norm = hidden_norm
+            self._incr_sub_weights_t = []
+            for i in range(n_captures):
+                sub_w = fc_weight[:, i * hidden_size : (i + 1) * hidden_size]
+                self._incr_sub_weights_t.append(sub_w.t().contiguous())
+
+            self._incr_acc_buf = torch.zeros(
+                (max_tokens, hidden_size), dtype=ws_dtype, device=self.device
+            )
+            self._incr_slot_bufs = [
+                torch.empty((max_tokens, hidden_size), dtype=ws_dtype, device=self.device)
+                for _ in range(n_captures)
+            ]
+            self._incr_capture_events = [torch.cuda.Event() for _ in range(n_captures)]
+            self._incr_num_tokens = 0
+            self._incremental_proj_enabled = True
+            logger.info(
+                "DFLASH incremental projection enabled. "
+                "n_captures=%d, hidden_size=%d, max_tokens=%d",
+                n_captures,
+                hidden_size,
+                max_tokens,
+            )
+        except Exception as e:
+            logger.warning("DFLASH incremental projection init failed: %s", e)
+            self._incremental_proj_enabled = False
+
+    def _prepare_incremental_proj(
+        self, num_tokens: int, positions: torch.Tensor, cache_locs: torch.Tensor
+    ) -> None:
+        self._incr_num_tokens = num_tokens
+        self._incr_positions = positions
+        self._incr_cache_locs = cache_locs
+        self._incremental_kv_write_done = False
+        self._incr_acc_buf[:num_tokens].zero_()
+        self.target_language_model.model._dflash_incr_active = True
+
+    def _on_capture_slot_ready(self, capture_idx: int, num_tokens: int) -> None:
+        event = self._incr_capture_events[capture_idx]
+        event.record(torch.cuda.current_stream())
+
+        with torch.cuda.stream(self._kv_aux_stream):
+            self._kv_aux_stream.wait_event(event)
+            hidden = self._incr_slot_bufs[capture_idx][:num_tokens]
+            acc = self._incr_acc_buf[:num_tokens]
+            torch.addmm(
+                acc,
+                hidden,
+                self._incr_sub_weights_t[capture_idx],
+                beta=1.0,
+                alpha=1.0,
+                out=acc,
+            )
+
+            if capture_idx == self._incr_n_captures - 1:
+                ctx_hidden = self._incr_hidden_norm(acc)
+                self._write_native_cache_fused(
+                    ctx_hidden, self._incr_positions, self._incr_cache_locs
+                )
+                self._incremental_kv_write_done = True
+                self._kv_join_event.record(self._kv_aux_stream)
+
     def _ensure_fused_workspace(self, total_ctx: int, dtype: torch.dtype) -> None:
         """Ensure the projection workspace is large enough.
 
@@ -672,8 +761,8 @@ class DFlash(BaseDrafter):
             self._fused_kv_inv_v_scales,
         )
 
+    @staticmethod
     def _current_tokens_from_output(
-        self,
         output_tokens: torch.Tensor,
         accept_lengths: torch.Tensor,
         num_extends: int,
@@ -681,32 +770,23 @@ class DFlash(BaseDrafter):
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         bs = accept_lengths.shape[0]
-        current = out if out is not None else self.current_tokens_buf[:bs]
+        current = out if out is not None else torch.empty(
+            (bs,), dtype=torch.int32, device=output_tokens.device
+        )
         if num_extends > 0:
             current[:num_extends] = output_tokens[:num_extends]
         num_decodes = bs - num_extends
         if num_decodes > 0:
-            indices = self.gather_indices_buf[:num_decodes]
-            torch.add(
-                self.decode_offsets_buf[:num_decodes],
-                accept_lengths[num_extends:bs],
-                out=indices,
+            offsets = (
+                torch.arange(num_decodes, dtype=torch.int64, device=output_tokens.device)
+                * spec_num_tokens
+                - 1
+                + num_extends
             )
-            if num_extends > 0:
-                indices.add_(num_extends)
-            torch.index_select(
-                output_tokens, 0, indices, out=current[num_extends:]
-            )
-            # ``accept_lengths`` can be clamped to 0 at the context limit.  The
-            # request will be finished by the scheduler, but the drafter still
-            # runs for graph shape. Select a valid in-row dummy token instead of
-            # producing ``row * N - 1`` or crossing into the previous row.
             safe_accept_lengths = (
                 accept_lengths[num_extends:].to(torch.int64).clamp(1, spec_num_tokens)
             )
-            current[num_extends:] = output_tokens[
-                self.decode_offsets_buf[:num_decodes] + num_extends + safe_accept_lengths
-            ]
+            current[num_extends:] = output_tokens[offsets + safe_accept_lengths]
         return current
 
     def get_candidates(self, base_ctx: ForwardContext) -> torch.Tensor | None:
@@ -863,7 +943,7 @@ class DFlash(BaseDrafter):
         satisfied.
         """
         hidden = logits_output.hidden_states
-        if hidden is None:
+        if hidden is None and not self._incremental_kv_write_done:
             raise RuntimeError("DFLASH requires target hidden states.")
 
         # draft_seq_lens_buf on main stream (draft block prep depends on it)
@@ -878,23 +958,24 @@ class DFlash(BaseDrafter):
         )
         self.draft_seq_lens_buf[:bs].clamp_(max=max_draft_prefix)
 
-        # Fork: aux stream runs full KV write (project + fused GEMM + scatter)
-        positions = self.input_buffers.positions_buf[: base_ctx.input_num_tokens]
-        cache_locs = self.input_buffers.out_cache_loc_buf[: base_ctx.input_num_tokens]
-        main_stream = torch.cuda.current_stream()
-        self._kv_fork_event.record(main_stream)
+        if not self._incremental_kv_write_done:
+            # Fork: aux stream runs full KV write (project + fused GEMM + scatter)
+            positions = self.input_buffers.positions_buf[: base_ctx.input_num_tokens]
+            cache_locs = self.input_buffers.out_cache_loc_buf[: base_ctx.input_num_tokens]
+            main_stream = torch.cuda.current_stream()
+            self._kv_fork_event.record(main_stream)
 
-        if not (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()):
-            hidden.record_stream(self._kv_aux_stream)
-            positions.record_stream(self._kv_aux_stream)
-            cache_locs.record_stream(self._kv_aux_stream)
-            if self._fused_kv_proj_workspace is not None:
-                self._fused_kv_proj_workspace.record_stream(self._kv_aux_stream)
+            if not (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()):
+                hidden.record_stream(self._kv_aux_stream)
+                positions.record_stream(self._kv_aux_stream)
+                cache_locs.record_stream(self._kv_aux_stream)
+                if self._fused_kv_proj_workspace is not None:
+                    self._fused_kv_proj_workspace.record_stream(self._kv_aux_stream)
 
-        with torch.cuda.stream(self._kv_aux_stream):
-            self._kv_aux_stream.wait_event(self._kv_fork_event)
-            self._write_native_cache(hidden, positions, cache_locs, decode_only=True)
-            self._kv_join_event.record(self._kv_aux_stream)
+            with torch.cuda.stream(self._kv_aux_stream):
+                self._kv_aux_stream.wait_event(self._kv_fork_event)
+                self._write_native_cache(hidden, positions, cache_locs, decode_only=True)
+                self._kv_join_event.record(self._kv_aux_stream)
 
         # Main stream: draft block prep overlaps with aux KV write
         current_tokens = self.block_ids_buf[:bs, 0]

@@ -387,8 +387,15 @@ class ModelExecutor:
                         "DFLASH requires the target model to support "
                         "set_dflash_layers_to_capture."
                     )
+                incr_callback = None
+                incr_slot_bufs = None
+                if getattr(self.drafter, "_incremental_proj_enabled", False):
+                    incr_callback = self.drafter._on_capture_slot_ready
+                    incr_slot_bufs = self.drafter._incr_slot_bufs
                 self.model_runner.model.set_dflash_layers_to_capture(
-                    self.drafter.target_layer_ids
+                    self.drafter.target_layer_ids,
+                    incremental_callback=incr_callback,
+                    slot_bufs=incr_slot_bufs,
                 )
         else:
             self.drafter = None
@@ -922,7 +929,24 @@ class ModelExecutor:
             )
             self.capturable_grammar.schedule_fill(input_ids_buf_slice=slice_)
 
+        if (
+            self.drafter is not None
+            and getattr(self.drafter, "_incremental_proj_enabled", False)
+            and ctx.num_extends == 0
+        ):
+            self.drafter._prepare_incremental_proj(
+                ctx.input_num_tokens,
+                self.input_buffers.positions_buf[: ctx.input_num_tokens],
+                self.input_buffers.out_cache_loc_buf[: ctx.input_num_tokens],
+            )
+
         logits_output = self._run_target_forward(bs, ctx, req_pool_indices)
+
+        if (
+            self.drafter is not None
+            and getattr(self.drafter, "_incremental_proj_enabled", False)
+        ):
+            self.drafter.target_language_model.model._dflash_incr_active = False
 
         # Flag NaN per request and sanitize in place, before any sampling kernel.
         self.nan_guard.audit_logits(logits_output, ctx)
