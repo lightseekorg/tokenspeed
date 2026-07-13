@@ -39,6 +39,7 @@ from tokenspeed_kernel.ops.attention import (
     mha_prefill,
     mla_decode_with_kvcache,
     mla_prefill,
+    prebuild_dsv4_sparse_mla,
 )
 from tokenspeed_kernel.ops.gemm import mm
 from tokenspeed_kernel.ops.mhc import mhc_plan, mhc_post, mhc_pre
@@ -73,6 +74,7 @@ __all__ = [
     "dsa_prefill",
     "dsa_decode",
     "dsv4_sparse_mla_decode",
+    "prebuild_dsv4_sparse_mla",
     "dsa_prefill_topk",
     "dsa_decode_topk",
     "dsa_plan",

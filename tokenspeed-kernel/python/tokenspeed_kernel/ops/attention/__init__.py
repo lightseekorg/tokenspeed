@@ -31,6 +31,9 @@ import tokenspeed_kernel.ops.attention.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.attention.gluon  # noqa: F401
 import tokenspeed_kernel.ops.attention.triton  # noqa: F401
 import torch
+from tokenspeed_kernel.ops.attention.flashinfer import (
+    prebuild_dsv4_sparse_mla as _prebuild_dsv4_sparse_mla,
+)
 from tokenspeed_kernel.ops.attention.gdn_utils import (
     GdnCheckpointLayout,
     GdnChunkPrefillResult,
@@ -66,6 +69,7 @@ __all__ = [
     "dsa_prefill",
     "dsa_decode",
     "dsv4_sparse_mla_decode",
+    "prebuild_dsv4_sparse_mla",
     "dsa_prefill_topk",
     "dsa_decode_topk",
     "dsa_plan",
@@ -74,6 +78,10 @@ __all__ = [
 ]
 
 LSE_LN = math.log2(math.e)
+
+
+def prebuild_dsv4_sparse_mla() -> None:
+    _prebuild_dsv4_sparse_mla()
 
 
 # ===-----------------------------------------------------------------------===#

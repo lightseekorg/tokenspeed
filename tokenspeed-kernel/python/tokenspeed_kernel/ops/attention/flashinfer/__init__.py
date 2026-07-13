@@ -70,7 +70,6 @@ if platform.is_blackwell_plus:
         trtllm_batch_decode_with_kv_cache_mla,
     )
 
-
 # ------------------------------------------------------------------------------
 # Kernel registration
 # ------------------------------------------------------------------------------
@@ -78,6 +77,17 @@ if platform.is_blackwell_plus:
 _workspace_buffer: torch.Tensor | None = None
 _dsa_sparse_workspace_buffers: dict[torch.device, torch.Tensor] = {}
 _DSA_SPARSE_WORKSPACE_BYTES = 384 * 1024 * 1024
+
+
+def prebuild_dsv4_sparse_mla() -> None:
+    if not platform.is_nvidia or platform.arch_version.major != 12:
+        return
+    if trtllm_batch_decode_sparse_mla_dsv4 is error_fn:
+        raise RuntimeError("FlashInfer SM120 sparse MLA is unavailable")
+
+    from flashinfer.mla._sparse_mla_sm120 import get_sparse_mla_sm120_module
+
+    get_sparse_mla_sm120_module()
 
 
 def _get_dsa_sparse_workspace(device: torch.device | str) -> torch.Tensor:

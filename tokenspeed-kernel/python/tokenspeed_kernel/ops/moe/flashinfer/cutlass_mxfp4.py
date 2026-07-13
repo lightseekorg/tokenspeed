@@ -104,6 +104,9 @@ def _expert_float_parameter(
 if platform.is_nvidia:
     from flashinfer import ActivationType, cutlass_fused_moe, mxfp8_quantize
     from flashinfer.fused_moe.core import get_cutlass_fused_moe_module
+    from flashinfer.quantization.fp8_quantization import (
+        get_mxfp8_quantization_sm100_module,
+    )
 
     def flashinfer_cutlass_mxfp4_moe_weights(
         plan: dict,
@@ -172,6 +175,7 @@ if platform.is_nvidia:
         if w.w13_weight.is_cuda:
             major, minor = torch.cuda.get_device_capability(w.w13_weight.device)
             get_cutlass_fused_moe_module(f"{major}{minor}")
+            get_mxfp8_quantization_sm100_module()
 
     @register_kernel(
         "moe",

@@ -34,6 +34,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel import prebuild_dsv4_sparse_mla
 
 try:
     # Optional dependency; the module-level wrapper imports the external
@@ -4229,6 +4230,7 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
         del params_dict, moe_loader
         self.post_load_weights()
         self.warmup_deep_gemm()
+        self.warmup_flashinfer()
 
     def post_load_weights(self):
         mega_moe_experts: list[DeepseekV4MegaMoEExperts] = []
@@ -4240,6 +4242,11 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
                 mega_moe_experts.append(module)
             elif isinstance(module, MoELayer):
                 module.process_weights_after_loading(module)
+
+    def warmup_flashinfer(self) -> None:
+        platform = current_platform()
+        if platform.is_nvidia and platform.arch_version.major == 12:
+            prebuild_dsv4_sparse_mla()
 
     def warmup_deep_gemm(self) -> None:
         """Pre-compile all DeepGEMM JIT kernels used by this model.
