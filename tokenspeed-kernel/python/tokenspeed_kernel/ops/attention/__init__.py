@@ -1126,6 +1126,7 @@ def mla_decode_with_kvcache(
     traits = {
         "page_size": kv_cache.shape[1],
         "q_len": q.shape[1],
+        "num_q_heads": q.shape[2],
         "qk_nope_head_dim": qk_nope_head_dim,
         "kv_lora_rank": kv_lora_rank,
         "qk_rope_head_dim": qk_rope_head_dim,
