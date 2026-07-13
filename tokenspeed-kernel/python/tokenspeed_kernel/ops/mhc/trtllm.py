@@ -112,21 +112,24 @@ allocate ``FUSED_HC_MAX_K_SPLITS * max_tokens`` rows for them.
 """
 
 
-def _select_fused_hc_launch(num_tokens: int) -> tuple[int, int, int]:
+def _select_fused_hc_launch(num_tokens: int) -> tuple[int, int, int, int]:
     """Pick the fused_hc backend and tile configuration for a token count.
 
     Args:
         num_tokens: Number of tokens (rows) in the fused mHC call.
 
     Returns:
-        Tuple of ``(backend, tile_n, num_k_splits)`` kernel launch parameters.
+        Tuple of ``(backend, tile_n, num_k_splits, bigfuse_block_size)``
+        kernel launch parameters.
     """
 
     if num_tokens <= _FUSED_HC_SMALL_M_MAX:
-        return 3, 1, 1  # fused_all_fma (allinone) default
+        return 3, 1, 1, 0  # fused_all_fma (allinone) default
+    # bigfuse_block_size=512 over the kernel default: 15.1 -> 14.7us at M=32,
+    # 11.9 -> 9.6us at M=16 (graph-replay microbench; endpoint-neutral).
     if num_tokens <= _FUSED_HC_MEDIUM_M_MAX:
-        return 1, 2, 2  # fma_ksplit + big_fuse
-    return 1, 4, 2
+        return 1, 2, 2, 512  # fma_ksplit + big_fuse
+    return 1, 4, 2, 512
 
 
 trtllm_mhc_big_fuse = error_fn
@@ -309,7 +312,9 @@ if _MHC_KERNELS_AVAILABLE and current_platform().is_nvidia:
         """
 
         num_tokens, hc_mult, hidden_size = residual_prev.shape
-        backend, tile_n, num_k_splits = _select_fused_hc_launch(num_tokens)
+        backend, tile_n, num_k_splits, bigfuse_block_size = _select_fused_hc_launch(
+            num_tokens
+        )
         _mhc_fused_hc(
             x_prev,
             residual_prev,
@@ -336,7 +341,7 @@ if _MHC_KERNELS_AVAILABLE and current_platform().is_nvidia:
             backend,
             tile_n,
             num_k_splits,
-            0,
+            bigfuse_block_size,
             1,
             None,
             0.0,

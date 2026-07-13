@@ -35,15 +35,15 @@ class TestSelectFusedHcLaunch:
         # The allinone default is at least as fast up to M=12, so the table
         # only switches organizations where the sweep showed a real win.
         for m in range(1, 13):
-            assert _select_fused_hc_launch(m) == (3, 1, 1)
+            assert _select_fused_hc_launch(m) == (3, 1, 1, 0)
 
     def test_medium_m_uses_ksplit_tile2(self):
         for m in (13, 16, 24, 32):
-            assert _select_fused_hc_launch(m) == (1, 2, 2)
+            assert _select_fused_hc_launch(m) == (1, 2, 2, 512)
 
     def test_large_m_uses_ksplit_tile4(self):
         for m in (33, 36, 48, 64, 128):
-            assert _select_fused_hc_launch(m) == (1, 4, 2)
+            assert _select_fused_hc_launch(m) == (1, 4, 2, 512)
 
     def test_cliff_backend_never_selected(self):
         # backend=2 (allinone tf32 mma) measured 206-241us at every M on
@@ -68,7 +68,7 @@ def _make_inputs(m, dev):
     return x, res, post, comb, fn, scale, base
 
 
-def _raw_fused_hc(inputs, m, backend, tile_n, ksp, acc_rows=None):
+def _raw_fused_hc(inputs, m, backend, tile_n, ksp, bfbs=0, acc_rows=None):
     """Call the raw op with explicit launch params; return outputs and acc."""
 
     x, res, post, comb, fn, scale, base = inputs
@@ -108,7 +108,7 @@ def _raw_fused_hc(inputs, m, backend, tile_n, ksp, acc_rows=None):
         backend,
         tile_n,
         ksp,
-        0,
+        bfbs,
         1,
         None,
         0.0,
@@ -142,8 +142,8 @@ class TestFusedHcLaunchTableParityGpu:
         # at every M; the sweep-selected launch must agree with it.
         inputs = _make_inputs(m, "cuda:0")
         ref, _ = _raw_fused_hc(inputs, m, 3, 1, 1)
-        backend, tile_n, ksp = _select_fused_hc_launch(m)
-        got, _ = _raw_fused_hc(inputs, m, backend, tile_n, ksp)
+        backend, tile_n, ksp, bfbs = _select_fused_hc_launch(m)
+        got, _ = _raw_fused_hc(inputs, m, backend, tile_n, ksp, bfbs=bfbs)
         _assert_close(got, ref)
 
     @pytest.mark.parametrize("m", [16, 32])
@@ -152,10 +152,16 @@ class TestFusedHcLaunchTableParityGpu:
         # num_k_splits x M partial rows -- more than M (so M-row buffers
         # overflow) but never more than FUSED_HC_MAX_K_SPLITS x M.
         inputs = _make_inputs(m, "cuda:0")
-        backend, tile_n, ksp = _select_fused_hc_launch(m)
+        backend, tile_n, ksp, bfbs = _select_fused_hc_launch(m)
         assert backend == 1
         _, (y_acc, r_acc) = _raw_fused_hc(
-            inputs, m, backend, tile_n, ksp, acc_rows=FUSED_HC_MAX_K_SPLITS * m
+            inputs,
+            m,
+            backend,
+            tile_n,
+            ksp,
+            bfbs=bfbs,
+            acc_rows=FUSED_HC_MAX_K_SPLITS * m,
         )
         y_rows = int((y_acc != 12345.678).any(dim=1).sum().item())
         assert y_rows > m
