@@ -42,6 +42,22 @@ inline std::int32_t CeilDivPositive(std::int32_t numer, std::int32_t denom) {
 // State: only the trailing window at the hit depth required.
 enum class PagedCacheGroupFamily { History, State };
 
+// How one group participates in flat-cache prefix reuse. Legacy groups default
+// to HistoryAnchor, preserving the current all-groups prefix matching behavior;
+// model-specific state groups must opt in to exact-boundary continuation.
+enum class PrefixRole {
+    HistoryAnchor,
+    ContinuationState,
+    None,
+};
+
+// Physical block-table representation. Absolute preserves the existing flat
+// table contract; BoundedWindow carries a logical base alongside compact rows.
+enum class TableLayout {
+    Absolute,
+    BoundedWindow,
+};
+
 // One model-defined paged cache group; scheduler treats group_id as opaque.
 struct PagedCacheGroupConfig {
     enum class Retention {
@@ -61,9 +77,24 @@ struct PagedCacheGroupConfig {
     // History groups form a chain; State groups only need the trailing window.
     PagedCacheGroupFamily family{PagedCacheGroupFamily::History};
 
+    // Additive flat-cache metadata. Empty/zero values mean unspecified by the
+    // legacy bridge; flat plan validation resolves them before scheduler use.
+    std::string pool_id{};
+    PrefixRole prefix_role{PrefixRole::HistoryAnchor};
+    TableLayout table_layout{TableLayout::Absolute};
+    // Bounded producer domains, not per-layer tensor-plane bits.
+    std::uint32_t required_producer_domain_mask{0};
+    // Planner-defined target/draft owner bits; zero means legacy/unspecified.
+    std::uint32_t owner_mask{0};
+
     std::int32_t RawTokensPerPage() const { return rows_per_page * entry_stride_tokens; }
 
     void Validate() const;
+
+    // Opt-in strict contract for flat-cache configs. Validate() intentionally
+    // keeps accepting block_size == 0 so radix and legacy flat callers retain
+    // their SchedulerConfig::block_size fallback.
+    void ValidateFlatBlockGeometry() const;
 };
 
 // Group-level allocator: wraps PageAllocator + config + counters. Releases run

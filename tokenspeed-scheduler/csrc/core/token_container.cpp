@@ -21,11 +21,34 @@
 #include "core/token_container.h"
 
 #include <cstddef>
+#include <exception>
+#include <limits>
+#include <stdexcept>
 
 namespace tokenspeed {
 
 void TokenContainer::Extend(const std::vector<std::int32_t>& new_tokens) {
     tokens_.insert(tokens_.end(), new_tokens.begin(), new_tokens.end());
+}
+
+void TokenContainer::ReserveAdditional(std::size_t additional_tokens) {
+    const std::size_t int32_max = static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max());
+    if (additional_tokens > tokens_.max_size() - tokens_.size() || additional_tokens > int32_max - tokens_.size()) {
+        throw std::length_error("TokenContainer prepared extension exceeds its size domain");
+    }
+    tokens_.reserve(tokens_.size() + additional_tokens);
+}
+
+void TokenContainer::ExtendPrepared(std::span<const std::int32_t> new_tokens) noexcept {
+    if (new_tokens.size() > tokens_.capacity() - tokens_.size() ||
+        new_tokens.size() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()) - tokens_.size()) {
+        std::terminate();
+    }
+    for (const std::int32_t token : new_tokens) {
+        // Capacity was fixed by ReserveAdditional. int32 copy construction is
+        // no-throw, so this cannot enter vector growth.
+        tokens_.push_back(token);
+    }
 }
 
 std::vector<std::span<const std::int32_t>> TokenContainer::GetFullPagedTokens(std::int32_t page_size,

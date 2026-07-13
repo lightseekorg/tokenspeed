@@ -21,17 +21,40 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
 
 namespace tokenspeed {
 namespace forward {
+struct FlatKVGroupCompletion {
+    std::string group_id;
+    std::uint32_t completed_domain_mask{};
+    // One exclusive raw end for every set bit in completed_domain_mask,
+    // packed in ascending bit order.
+    std::vector<std::int32_t> domain_valid_ends;
+};
+
+// Fence-ready, host-only POD. CUDA events, tensors, streams, and pointers are
+// deliberately excluded from the scheduler ABI.
+struct FlatKVCompletion {
+    std::string request_id;
+    std::uint64_t table_generation{};
+    std::uint64_t dispatch_seq{};
+    std::int32_t accepted_raw_end{};
+    std::int32_t protected_raw_end{};
+    std::vector<FlatKVGroupCompletion> groups;
+};
+
 struct ExtendResult {
     std::string request_id;
     // Tokens whose KV has already become stable request history.
     // token placeholder should be removed in python
     std::vector<std::int32_t> tokens;
+    // Present only after the executor has made every required KV producer
+    // domain host-visible. nullopt preserves the legacy/radix event ABI.
+    std::optional<FlatKVCompletion> flat_kv_completion;
 };
 
 struct Finish {

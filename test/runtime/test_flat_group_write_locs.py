@@ -80,7 +80,10 @@ class ComputeFlatOutCacheLocsTest(_MHACase):
             ),
         }
         seq_lens = torch.tensor([5, 4], dtype=torch.int32)
-        locs = self.backend._compute_flat_decode_out_cache_locs(tables, seq_lens, PAGE)
+        bases = {gid: torch.zeros(2, dtype=torch.int32) for gid in tables}
+        locs = self.backend._compute_flat_decode_out_cache_locs(
+            tables, bases, seq_lens, PAGE
+        )
         # sliding: r0 page 7*2+0=14; r1 page 6*2+1=13.
         assert locs["sliding_attention"].tolist() == [14, 13]
         # full: r0 3*2+0=6; r1 8*2+1=17.
@@ -99,8 +102,9 @@ class ComputeFlatOutCacheLocsTest(_MHACase):
         }
         prefix_cpu = torch.tensor([2, 0], dtype=torch.int32)
         extend_cpu = torch.tensor([3, 2], dtype=torch.int32)
+        bases = {"full_attention": torch.zeros(2, dtype=torch.int32)}
         locs = self.backend._compute_flat_extend_out_cache_locs(
-            tables, prefix_cpu, extend_cpu, PAGE
+            tables, bases, prefix_cpu, extend_cpu, PAGE
         )
         # r0: pos 2,3,4 -> page_idx 1,1,2 -> pages 2,2,3 ->
         #     locs 2*2+0=4, 2*2+1=5, 3*2+0=6; r1: pages 4,4 -> locs 8, 9.
@@ -114,8 +118,9 @@ class ComputeFlatOutCacheLocsTest(_MHACase):
             "small": torch.tensor([[1, 2, 3]], dtype=torch.int32),
             "large": torch.tensor([[6, 7]], dtype=torch.int32),
         }
+        bases = {gid: torch.zeros(1, dtype=torch.int32) for gid in tables}
         locs = self.backend._compute_flat_decode_out_cache_locs(
-            tables, torch.tensor([5], dtype=torch.int32), PAGE
+            tables, bases, torch.tensor([5], dtype=torch.int32), PAGE
         )
         self.assertEqual(locs["small"].tolist(), [6])
         self.assertEqual(locs["large"].tolist(), [28])
@@ -127,14 +132,54 @@ class ComputeFlatOutCacheLocsTest(_MHACase):
             "small": torch.tensor([[10, 11, 12]], dtype=torch.int32),
             "large": torch.tensor([[20, 21]], dtype=torch.int32),
         }
+        bases = {gid: torch.zeros(1, dtype=torch.int32) for gid in tables}
         locs = self.backend._compute_flat_extend_out_cache_locs(
             tables,
+            bases,
             torch.tensor([3], dtype=torch.int32),
             torch.tensor([3], dtype=torch.int32),
             PAGE,
         )
         self.assertEqual(locs["small"].tolist(), [23, 24, 25])
         self.assertEqual(locs["large"].tolist(), [83, 84, 85])
+
+    def test_decode_locs_use_per_request_logical_base(self):
+        torch = self.torch
+        tables = {
+            "sliding_attention": torch.tensor([[7, 8], [9, 10]], dtype=torch.int32)
+        }
+        # Last logical pages are 3 and 2. Compact row 0 starts at page 3;
+        # row 1 starts at page 1, so the gathers use local columns 0 and 1.
+        bases = {"sliding_attention": torch.tensor([3, 1], dtype=torch.int32)}
+        seq_lens = torch.tensor([8, 6], dtype=torch.int32)
+        locs = self.backend._compute_flat_decode_out_cache_locs(
+            tables, bases, seq_lens, PAGE
+        )
+        self.assertEqual(locs["sliding_attention"].tolist(), [15, 21])
+
+    def test_extend_locs_use_compact_table_base(self):
+        torch = self.torch
+        tables = {"sliding_attention": torch.tensor([[7, 8]], dtype=torch.int32)}
+        bases = {"sliding_attention": torch.tensor([2], dtype=torch.int32)}
+        locs = self.backend._compute_flat_extend_out_cache_locs(
+            tables,
+            bases,
+            torch.tensor([4], dtype=torch.int32),
+            torch.tensor([3], dtype=torch.int32),
+            PAGE,
+        )
+        # Logical positions 4,5,6 -> pages 2,2,3 -> local cols 0,0,1.
+        self.assertEqual(locs["sliding_attention"].tolist(), [14, 15, 16])
+
+    def test_decode_rejects_logical_page_before_base(self):
+        torch = self.torch
+        with self.assertRaisesRegex(RuntimeError, "outside.*sliding_attention"):
+            self.backend._compute_flat_decode_out_cache_locs(
+                {"sliding_attention": torch.tensor([[7]], dtype=torch.int32)},
+                {"sliding_attention": torch.tensor([2], dtype=torch.int32)},
+                torch.tensor([2], dtype=torch.int32),
+                PAGE,
+            )
 
 
 class MaybeCheckFlatWriteLocsTest(_MHACase):
@@ -224,6 +269,7 @@ class InitForwardMetadataAssemblyTest(_MHACase):
         forward_mode,
         seq_lens,
         flat_block_tables,
+        flat_block_table_base_offsets,
         extend_prefix_lens=None,
         extend_seq_lens=None,
     ):
@@ -245,6 +291,7 @@ class InitForwardMetadataAssemblyTest(_MHACase):
             extend_prefix_lens,
             extend_prefix_lens,
             flat_block_tables=flat_block_tables,
+            flat_block_table_base_offsets=flat_block_table_base_offsets,
         )
 
     def test_decode_assembly_populates_out_cache_locs(self):
@@ -257,10 +304,12 @@ class InitForwardMetadataAssemblyTest(_MHACase):
                 [[1, 2, 3, -1], [4, 8, -1, -1]], dtype=torch.int32
             ),
         }
+        bases = {gid: torch.zeros(2, dtype=torch.int32) for gid in tables}
         seq_lens = torch.tensor([5, 4], dtype=torch.int32)
-        self._init(_decode_forward_mode(), seq_lens, tables)
+        self._init(_decode_forward_mode(), seq_lens, tables, bases)
         md = self.backend.forward_decode_metadata
         self.assertIs(md.page_tables, tables)
+        self.assertIs(md.block_table_base_offsets, bases)
         self.assertEqual(md.out_cache_locs["sliding_attention"].tolist(), [14, 13])
         self.assertEqual(md.out_cache_locs["full_attention"].tolist(), [6, 17])
         self.assertEqual(md.out_cache_locs["full_attention"].dtype, self.torch.int32)
@@ -270,6 +319,7 @@ class InitForwardMetadataAssemblyTest(_MHACase):
         self._init(
             _decode_forward_mode(),
             torch.tensor([5, 4], dtype=torch.int32),
+            None,
             None,
         )
         md = self.backend.forward_decode_metadata
@@ -283,9 +333,16 @@ class InitForwardMetadataAssemblyTest(_MHACase):
                 [[1, 2, 3, -1], [4, 8, -1, -1]], dtype=torch.int32
             )
         }
+        bases = {"full_attention": torch.zeros(2, dtype=torch.int32)}
         seq_lens = torch.tensor([5, 2], dtype=torch.int32)
         prefix = torch.tensor([2, 0], dtype=torch.int32)
-        self._init(_extend_forward_mode(), seq_lens, tables, extend_prefix_lens=prefix)
+        self._init(
+            _extend_forward_mode(),
+            seq_lens,
+            tables,
+            bases,
+            extend_prefix_lens=prefix,
+        )
         md = self.backend.forward_extend_metadata
         self.assertIs(md.page_tables, tables)
         # Same hand-derived layout as the formula test: request-order flatten.
@@ -299,6 +356,7 @@ class InitForwardMetadataAssemblyTest(_MHACase):
         self._init(
             _extend_forward_mode(),
             torch.tensor([3, 2], dtype=torch.int32),
+            None,
             None,
         )
         md = self.backend.forward_extend_metadata
@@ -430,7 +488,13 @@ class GraphLocBuffersTest(_MHACase):
         )
         return self.backend.cuda_graph_decode_metadata[bs]
 
-    def _replay(self, bs, flat_block_tables=None, seq_lens=None):
+    def _replay(
+        self,
+        bs,
+        flat_block_tables=None,
+        flat_block_table_base_offsets=None,
+        seq_lens=None,
+    ):
         torch = self.torch
         if seq_lens is not None:
             # Wrapper contract: input prep writes the step's lens (dummy
@@ -441,6 +505,8 @@ class GraphLocBuffersTest(_MHACase):
         kwargs = {}
         if flat_block_tables is not None:
             kwargs["flat_block_tables"] = flat_block_tables
+        if flat_block_table_base_offsets is not None:
+            kwargs["flat_block_table_base_offsets"] = flat_block_table_base_offsets
         self.backend.init_forward_metadata_replay_cuda_graph(
             bs,
             torch.arange(MAX_BS, dtype=torch.int64, device=self.backend.device),
@@ -481,6 +547,18 @@ class GraphLocBuffersTest(_MHACase):
             self.assertEqual(tuple(second.out_cache_locs[gid].shape), (3,))
             self.assertEqual(second.out_cache_locs[gid].data_ptr(), ptrs[gid])
 
+    def test_capture_builds_persistent_base_buffers(self):
+        bs = 2
+        metadata = self._capture(bs, _GROUP_IDS)
+        bufs = self.backend.cuda_graph_flat_block_table_base_offsets
+        self.assertEqual(set(bufs), set(_GROUP_IDS))
+        for gid, buf in bufs.items():
+            self.assertEqual(tuple(buf.shape), (MAX_BS,))
+            self.assertEqual(buf.dtype, self.torch.int32)
+            view = metadata.block_table_base_offsets[gid]
+            self.assertEqual(tuple(view.shape), (bs,))
+            self.assertEqual(view.data_ptr(), buf.data_ptr())
+
     def test_replay_computes_locs_from_persistent_tables(self):
         torch = self.torch
         self._capture(3, _GROUP_IDS)
@@ -502,7 +580,8 @@ class GraphLocBuffersTest(_MHACase):
                 device=self.backend.device,
             ),
         }
-        self._replay(3, tables, seq_lens=[5, 4, 1])
+        bases = {gid: torch.zeros(3, dtype=torch.int32) for gid in tables}
+        self._replay(3, tables, bases, seq_lens=[5, 4, 1])
         locs = self.backend.cuda_graph_flat_out_cache_locs
         # sliding: r0 seq 5 -> pos 4 -> page_idx 2 -> page 7 -> 7*2+0=14;
         #          r1 seq 4 -> pos 3 -> page_idx 1 -> page 6 -> 6*2+1=13;
@@ -518,6 +597,7 @@ class GraphLocBuffersTest(_MHACase):
     def test_capture_without_flat_leaves_metadata_locs_none(self):
         metadata = self._capture(2)
         self.assertIsNone(metadata.out_cache_locs)
+        self.assertIsNone(metadata.block_table_base_offsets)
         self.assertEqual(
             set(self.backend.cuda_graph_flat_out_cache_locs), set(_GROUP_IDS)
         )

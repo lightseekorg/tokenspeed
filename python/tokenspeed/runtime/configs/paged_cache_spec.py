@@ -22,10 +22,21 @@ from typing import Literal
 
 Retention = Literal["full_history", "sliding_window"]
 Family = Literal["history", "state"]
+PrefixRole = Literal["history_anchor", "continuation_state", "none"]
+TableLayout = Literal["absolute", "bounded_window"]
+
+# Owner bits are deliberately independent from producer-domain bits.  The
+# former say which model-side view consumes a group; the latter say which
+# bounded execution domains must finish publishing one page.
+CACHE_OWNER_TARGET = 1 << 0
+CACHE_OWNER_DRAFT = 1 << 1
+_UINT32_MAX = (1 << 32) - 1
 
 
 @dataclass(frozen=True)
 class PagedCacheGroupSpec:
+    """Logical page geometry plus additive flat-pool scheduling metadata."""
+
     group_id: str
     retention: Retention
     rows_per_page: int
@@ -35,6 +46,81 @@ class PagedCacheGroupSpec:
     family: Family = "history"
     # Per-group page tokens; None -> scheduler global block_size, else a multiple of it.
     block_size: int | None = None
+    # Flat-cache metadata is additive: existing positional construction keeps
+    # the legacy single-pool, all-groups-prefix, absolute-table behavior.
+    block_size_tokens: int | None = None
+    pool_id: str = "default"
+    prefix_role: PrefixRole = "history_anchor"
+    table_layout: TableLayout = "absolute"
+    required_producer_domain_mask: int = 0
+    owner_mask: int = 0
+
+    def __post_init__(self) -> None:
+        """Derive raw-token geometry and validate additive flat metadata.
+
+        Existing geometry/retention validation intentionally remains in the
+        sizing helpers: several legacy callers construct specs first and only
+        validate them when selecting a scheduler path.  The new explicit block
+        span, when supplied, must nevertheless agree with that geometry.
+        """
+        derived_block_size = self.rows_per_page * self.entry_stride_tokens
+        if self.block_size is not None and (
+            isinstance(self.block_size, bool)
+            or not isinstance(self.block_size, int)
+            or self.block_size != derived_block_size
+        ):
+            raise ValueError(
+                f"PagedCacheGroupSpec {self.group_id}: block_size must equal "
+                f"rows_per_page * entry_stride_tokens ({derived_block_size}), "
+                f"got {self.block_size!r}"
+            )
+        if self.block_size_tokens is None:
+            object.__setattr__(self, "block_size_tokens", derived_block_size)
+        elif (
+            isinstance(self.block_size_tokens, bool)
+            or not isinstance(self.block_size_tokens, int)
+            or self.block_size_tokens != derived_block_size
+        ):
+            raise ValueError(
+                f"PagedCacheGroupSpec {self.group_id}: block_size_tokens "
+                f"must equal rows_per_page * entry_stride_tokens "
+                f"({derived_block_size}), got {self.block_size_tokens!r}"
+            )
+
+        if not isinstance(self.pool_id, str) or not self.pool_id:
+            raise ValueError(
+                f"PagedCacheGroupSpec {self.group_id}: pool_id must be non-empty"
+            )
+        if self.prefix_role not in (
+            "history_anchor",
+            "continuation_state",
+            "none",
+        ):
+            raise ValueError(
+                f"PagedCacheGroupSpec {self.group_id}: unsupported prefix_role "
+                f"{self.prefix_role!r}"
+            )
+        if self.table_layout not in ("absolute", "bounded_window"):
+            raise ValueError(
+                f"PagedCacheGroupSpec {self.group_id}: unsupported table_layout "
+                f"{self.table_layout!r}"
+            )
+        self._validate_mask(
+            "required_producer_domain_mask", self.required_producer_domain_mask
+        )
+        self._validate_mask("owner_mask", self.owner_mask)
+
+    def _validate_mask(self, name: str, value: int) -> None:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+            or value > _UINT32_MAX
+        ):
+            raise ValueError(
+                f"PagedCacheGroupSpec {self.group_id}: {name} must be uint32, "
+                f"got {value!r}"
+            )
 
 
 _PAGED_CACHE_GROUP_DUMMY_PAGES = 1
@@ -273,7 +359,7 @@ def compute_paged_cache_group_page_counts(
 
     counts: dict[str, int] = {}
     for spec in specs:
-        raw_per_page = spec.rows_per_page * spec.entry_stride_tokens
+        raw_per_page = spec.block_size_tokens
         if raw_per_page <= 0:
             raise ValueError(
                 f"PagedCacheGroupSpec {spec.group_id}: rows_per_page * "
@@ -553,25 +639,29 @@ def publish_paged_cache_groups(
     return specs, counts
 
 
-def compute_max_logical_pages_for_capture(
+def compute_flat_capture_cols(
     spec: PagedCacheGroupSpec,
     *,
     max_context_len: int,
     max_tokens_per_req: int = 1,
+    max_prefill_tokens_per_req: int = 0,
     overlap_schedule_depth: int = 0,
 ) -> int:
-    """Return CUDA Graph block-table width for one paged-cache group.
+    """Return the exact CUDA Graph table width for one cache group.
 
     Decode admission reserves the current verify span plus one span for each
-    overlapped schedule.  Include that complete reservation horizon here: a
-    request close to the model context limit can still expose the reserved
-    pages in its scheduler block-table row before the accepted tokens are
-    truncated by the request-length limit.
+    overlapped schedule.  On the overlap path, the first decode can be planned
+    before the final prefill completion fence is committed, so a sliding row
+    must also retain one final prefill chunk per in-flight predecessor slot.
+    Include both lifetimes here: a request close to the model context limit can
+    expose those pages in its scheduler block-table row before the accepted
+    tokens are truncated or the prefill fence permits reclamation.
 
     Args:
         spec: Paged-cache group layout and retention policy.
         max_context_len: Maximum accepted raw-token context length.
         max_tokens_per_req: Runtime decode/verify width.
+        max_prefill_tokens_per_req: Maximum per-request prefill chunk width.
         overlap_schedule_depth: Number of additionally in-flight decode steps.
 
     Returns:
@@ -584,17 +674,23 @@ def compute_max_logical_pages_for_capture(
         raise ValueError(f"max_context_len must be >= 0, got {max_context_len}")
     if max_tokens_per_req <= 0:
         raise ValueError(f"max_tokens_per_req must be > 0, got {max_tokens_per_req}")
+    if max_prefill_tokens_per_req < 0:
+        raise ValueError(
+            "max_prefill_tokens_per_req must be >= 0, got "
+            f"{max_prefill_tokens_per_req}"
+        )
     if overlap_schedule_depth not in (0, 1):
         raise ValueError(
             f"overlap_schedule_depth must be 0 or 1, got {overlap_schedule_depth}"
         )
-    raw_per_page = spec.rows_per_page * spec.entry_stride_tokens
+    raw_per_page = spec.block_size_tokens
     if raw_per_page <= 0:
         raise ValueError(
             f"PagedCacheGroupSpec {spec.group_id}: rows_per_page * "
             "entry_stride_tokens must be > 0"
         )
     reservation_horizon = (overlap_schedule_depth + 1) * max_tokens_per_req
+    prefill_carry = overlap_schedule_depth * max_prefill_tokens_per_req
     if spec.retention == "sliding_window":
         window = spec.sliding_window_tokens
         if window is None or window <= 0:
@@ -605,7 +701,7 @@ def compute_max_logical_pages_for_capture(
         # Capture uses a conservative metadata bound; it does not change the
         # per-token attention history counted as window - 1 above.
         retention_bound = min(window, max_context_len)
-        live_tokens = retention_bound + reservation_horizon
+        live_tokens = retention_bound + prefill_carry + reservation_horizon
         return ceil_div(live_tokens, raw_per_page) + 1
     if spec.retention == "full_history":
         live_tokens = max_context_len + reservation_horizon
@@ -616,18 +712,126 @@ def compute_max_logical_pages_for_capture(
     )
 
 
+def compute_max_logical_pages_for_capture(
+    spec: PagedCacheGroupSpec,
+    *,
+    max_context_len: int,
+    max_tokens_per_req: int = 1,
+    max_prefill_tokens_per_req: int = 0,
+    overlap_schedule_depth: int = 0,
+) -> int:
+    """Compatibility name for :func:`compute_flat_capture_cols`."""
+    return compute_flat_capture_cols(
+        spec,
+        max_context_len=max_context_len,
+        max_tokens_per_req=max_tokens_per_req,
+        max_prefill_tokens_per_req=max_prefill_tokens_per_req,
+        overlap_schedule_depth=overlap_schedule_depth,
+    )
+
+
+def compute_flat_export_cols(
+    spec: PagedCacheGroupSpec,
+    *,
+    max_context_len: int,
+    max_new_tokens_per_req: int,
+    max_tokens_per_req: int = 1,
+    overlap_schedule_depth: int = 0,
+) -> int:
+    """Return the exact eager/chunk forward-export width for one group.
+
+    Full-history rows are bounded by the model context plus the protected
+    verify horizon. Sliding rows must simultaneously retain the previous
+    trailing window, one chunk for the current dispatch plus one for each
+    overlapped predecessor, and that horizon; the extra column covers a
+    worst-case non-zero logical-start alignment.
+    """
+    from tokenspeed.runtime.utils.common import ceil_div
+
+    if max_context_len < 0:
+        raise ValueError(f"max_context_len must be >= 0, got {max_context_len}")
+    if max_new_tokens_per_req < 0:
+        raise ValueError(
+            "max_new_tokens_per_req must be >= 0, got " f"{max_new_tokens_per_req}"
+        )
+    if max_tokens_per_req <= 0:
+        raise ValueError(f"max_tokens_per_req must be > 0, got {max_tokens_per_req}")
+    if overlap_schedule_depth not in (0, 1):
+        raise ValueError(
+            f"overlap_schedule_depth must be 0 or 1, got {overlap_schedule_depth}"
+        )
+    raw_per_page = spec.block_size_tokens
+    if raw_per_page <= 0:
+        raise ValueError(
+            f"PagedCacheGroupSpec {spec.group_id}: rows_per_page * "
+            "entry_stride_tokens must be > 0"
+        )
+    protected = (overlap_schedule_depth + 1) * max_tokens_per_req
+    if spec.retention == "sliding_window":
+        window = spec.sliding_window_tokens
+        if window is None or window <= 0:
+            raise ValueError(
+                f"PagedCacheGroupSpec {spec.group_id}: sliding group missing "
+                "positive sliding_window_tokens"
+            )
+        retention_bound = min(window, max_context_len)
+        in_flight_prefill = (overlap_schedule_depth + 1) * max_new_tokens_per_req
+        return (
+            ceil_div(
+                retention_bound + in_flight_prefill + protected,
+                raw_per_page,
+            )
+            + 1
+        )
+    if spec.retention == "full_history":
+        return ceil_div(max_context_len + protected, raw_per_page)
+    raise ValueError(
+        f"PagedCacheGroupSpec {spec.group_id}: unsupported retention "
+        f"{spec.retention!r}"
+    )
+
+
+def require_flat_table_cols(
+    *,
+    group_id: str,
+    purpose: str,
+    actual_cols: int,
+    required_cols: int,
+) -> None:
+    """Fail closed unless a table buffer covers its planned column bound."""
+    if not group_id:
+        raise ValueError("flat table group_id must be non-empty")
+    if not purpose:
+        raise ValueError("flat table purpose must be non-empty")
+    for name, value in (("actual_cols", actual_cols), ("required_cols", required_cols)):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{name} must be an integer >= 0, got {value!r}")
+    if actual_cols < required_cols:
+        raise ValueError(
+            f"flat {purpose} table for group {group_id!r} has {actual_cols} "
+            f"columns but plan requires {required_cols}"
+        )
+
+
 __all__ = [
+    "CACHE_OWNER_DRAFT",
+    "CACHE_OWNER_TARGET",
     "FULL_ATTENTION",
     "LINEAR_ATTENTION",
     "PagedCacheGroupSpec",
+    "PrefixRole",
     "Retention",
     "STATE_LAYER_TYPES",
+    "TableLayout",
+    "compute_flat_capture_cols",
+    "compute_flat_export_cols",
     "compute_max_logical_pages_for_capture",
     "compute_paged_cache_group_page_counts",
     "group_specs_from_layer_types",
     "hybrid_slab_group_size",
     "layer_group_ids",
     "publish_paged_cache_groups",
+    "require_flat_table_cols",
     "scheduler_ext_flat_kvcache",
     "validate_flat_scheduler_config",
 ]

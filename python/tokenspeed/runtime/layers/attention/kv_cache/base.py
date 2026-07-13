@@ -40,6 +40,7 @@ class BaseTokenToKVPool:
     paged_cache_group_specs: tuple[PagedCacheGroupSpec, ...] = ()
     paged_cache_group_page_counts: dict[str, int] = {}
     supports_hierarchical_kv_cache: bool = True
+    supports_pd_transfer: bool = True
 
     def __init__(
         self,

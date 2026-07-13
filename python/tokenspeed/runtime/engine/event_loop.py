@@ -39,10 +39,13 @@ from tokenspeed.runtime.cache.executor.memory_executor import (
     MemoryExecutorConfig,
 )
 from tokenspeed.runtime.cache.transfer.types import CacheKind
-from tokenspeed.runtime.configs.model_config import ModelConfig
+from tokenspeed.runtime.configs.model_config import ModelConfig, is_deepseek_v4
 from tokenspeed.runtime.configs.paged_cache_spec import (
     scheduler_ext_flat_kvcache,
     validate_flat_scheduler_config,
+)
+from tokenspeed.runtime.deepseek_v4_cache_capabilities import (
+    validate_deepseek_v4_cache_capabilities,
 )
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -58,6 +61,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     cache_event_to_payload,
     cache_sync_debug_enabled,
     make_config,
+    pool_to_flat_block_pools,
     pool_to_paged_cache_groups,
     pool_to_prefix_cache_adjunct_spec,
     pop_common_cache_event_payloads,
@@ -74,6 +78,7 @@ from tokenspeed.runtime.execution.factory import (
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.types import ModelExecutionResult
+from tokenspeed.runtime.flat_kv_metrics import collect_flat_pool_metrics
 from tokenspeed.runtime.grammar.capturable_grammar import GrammarStepInputs
 from tokenspeed.runtime.layers.attention.registry import create_attn_components
 from tokenspeed.runtime.metrics.collector import EngineMetrics
@@ -175,6 +180,17 @@ class EventLoop:
             )
         else:
             draft_model_config = None
+
+        validate_deepseek_v4_cache_capabilities(
+            target_is_v4=is_deepseek_v4(self.model_config.hf_config),
+            draft_is_v4=(
+                draft_model_config is not None
+                and is_deepseek_v4(draft_model_config.hf_config)
+            ),
+            disaggregation_mode=server_args.disaggregation_mode,
+            flat_kvcache_ext=scheduler_ext_flat_kvcache(),
+            enable_kvstore=server_args.enable_kvstore,
+        )
 
         min_per_gpu_mem = self._init_distributed()
 
@@ -367,6 +383,7 @@ class EventLoop:
 
         # Adjunct enabled only when pool opts in AND prefix-caching switch is on.
         paged_cache_groups = pool_to_paged_cache_groups(token_to_kv_pool)
+        flat_block_pools = pool_to_flat_block_pools(token_to_kv_pool)
         validate_flat_scheduler_config(
             flat_kvcache_ext=scheduler_ext_flat_kvcache(),
             paged_cache_groups=paged_cache_groups,
@@ -380,7 +397,11 @@ class EventLoop:
         if required_groups is not None and server_args.enable_prefix_caching:
             prefix_cache_adjunct = pool_to_prefix_cache_adjunct_spec(required_groups)
         scheduler_cfg = make_config(
-            num_device_pages=self.max_total_num_tokens // server_args.block_size,
+            num_device_pages=(
+                0
+                if flat_block_pools
+                else self.max_total_num_tokens // server_args.block_size
+            ),
             max_scheduled_tokens=server_args.chunked_prefill_size,
             max_batch_size=per_rank_max_batch,
             page_size=server_args.block_size,
@@ -399,7 +420,9 @@ class EventLoop:
             enable_mamba_l2=server_args.enable_mamba_l2,
             mamba_l2_host_slots=mamba_l2_host_slots,
             paged_cache_groups=paged_cache_groups,
+            flat_block_pools=flat_block_pools,
             enable_mixed_prefill_decode=server_args.enable_mixed_batch,
+            enable_structured_flat_kv_completion=bool(flat_block_pools),
             prefix_cache_adjunct=prefix_cache_adjunct,
         )
         logger.info(
@@ -442,13 +465,20 @@ class EventLoop:
         # GPU-memory data plane (release/resume_memory_occupation). Reuses the
         # pause controller's drain machinery; frees memory via the memory-saver
         # adapter once the scheduler drains. See memory_occupation.py.
-        # Releasing KV is only safe if any prefix cache it backs can be cleared:
-        # either prefix caching is off, or the scheduler exposes a reset. Decide
-        # once here (static config) and let the controller reject unsafe releases.
-        kv_cache_release_allowed = (
-            not self.server_args.enable_prefix_caching
-            or callable(getattr(self.scheduler, "reset_prefix_cache", None))
-        )
+        # A canonical V4 flat arena must reset scheduler metadata and advance
+        # the same generation that repairs its device mappings on wake. The
+        # radix path keeps the legacy prefix-cache capability gate.
+        self._flat_kv_release_generation: int | None = None
+        has_v4_flat_arena = bool(self._v4_flat_arenas())
+        if has_v4_flat_arena:
+            kv_cache_release_allowed = callable(
+                getattr(self.scheduler, "reset_flat_kv_cache", None)
+            )
+        else:
+            kv_cache_release_allowed = (
+                not self.server_args.enable_prefix_caching
+                or callable(getattr(self.scheduler, "reset_prefix_cache", None))
+            )
         self._memory = MemoryOccupationController(
             send_func=self.send_to_tokenizer,
             pause_controller=self._pause,
@@ -482,6 +512,7 @@ class EventLoop:
             recv_func=self.recv_from_tokenizer,
             send_func=self.send_to_tokenizer,
             get_load_fn=self._get_load,
+            get_internal_state_fn=self._get_internal_state,
             architectures=self.model_config.hf_config.architectures,
             pause_controller=self._pause,
             memory_controller=self._memory,
@@ -807,9 +838,9 @@ class EventLoop:
         self,
         forward_op,
         sampling_params_list,
-        execution_plan,
+        *,
+        stats,
         dp_metadata=None,
-        stats=None,
         grammar_inputs=None,
     ):
         """Execute one forward step; return (results, on_first_token).
@@ -823,8 +854,11 @@ class EventLoop:
         Path 3 — prefill, decode:    send KV to decode side, return (None, None)
         Path 4 — prefill, extend:    run prefill forward, return (results, on_first_token)
         """
-        if stats is None:
-            stats = {}
+        # Scheduler stats also carry flat-pool observability payloads. Keep the
+        # ModelExecutor boundary limited to the three legacy logging scalars.
+        num_active_pages = stats["num_active_pages"]
+        num_cached_pages = stats["num_cached_pages"]
+        num_queue_reqs = stats["num_queue_reqs"]
         dp_global_num_tokens = (
             dp_metadata.global_num_tokens if dp_metadata is not None else None
         )
@@ -846,13 +880,15 @@ class EventLoop:
                 self.model_executor.execute_forward_op_with_log(
                     forward_op,
                     sampling_params_list,
+                    num_active_pages=num_active_pages,
+                    num_cached_pages=num_cached_pages,
+                    num_queue_reqs=num_queue_reqs,
                     dp_global_num_tokens=dp_global_num_tokens,
                     dp_global_bs=dp_global_bs,
                     dp_all_decode_or_idle=dp_all_decode_or_idle,
                     dp_all_extend=dp_all_extend,
                     grammar_inputs=grammar_inputs,
                     multimodal_context=multimodal_context,
-                    **stats,
                 ),
                 None,
             )
@@ -877,12 +913,14 @@ class EventLoop:
                     self.model_executor.execute_forward_op_with_log(
                         forward_op,
                         sampling_params_list,
+                        num_active_pages=num_active_pages,
+                        num_cached_pages=num_cached_pages,
+                        num_queue_reqs=num_queue_reqs,
                         dp_global_num_tokens=dp_global_num_tokens,
                         dp_global_bs=dp_global_bs,
                         dp_all_decode_or_idle=dp_all_decode_or_idle,
                         dp_all_extend=dp_all_extend,
                         multimodal_context=multimodal_context,
-                        **stats,
                     ),
                     None,
                 )
@@ -907,6 +945,9 @@ class EventLoop:
                     self.model_executor.execute_forward_op_with_log(
                         forward_op,
                         sampling_params_list,
+                        num_active_pages=num_active_pages,
+                        num_cached_pages=num_cached_pages,
+                        num_queue_reqs=num_queue_reqs,
                         dp_global_num_tokens=dp_global_num_tokens,
                         dp_global_bs=dp_global_bs,
                         dp_all_decode_or_idle=dp_all_decode_or_idle,
@@ -914,7 +955,6 @@ class EventLoop:
                         grammar_inputs=grammar_inputs,
                         multimodal_context=multimodal_context,
                         capture_next_input_ids=True,
-                        **stats,
                     ),
                     self.kv_transfer.store_prefill_token,
                 )
@@ -979,10 +1019,9 @@ class EventLoop:
                 cow_dsts.append(working)
         return cow_by_src
 
-    def _submit_cache_ops(self, execution_plan) -> None:
+    def _submit_cache_ops(self, execution_plan, forward_op) -> None:
         if self.memory_executor is None:
             return
-        forward_op = self._get_forward_op(execution_plan)
         mamba_layerwise_cow = self._build_mamba_layerwise_cow(
             execution_plan, forward_op
         )
@@ -1406,13 +1445,110 @@ class EventLoop:
 
         return processed
 
+    def _get_internal_state(self) -> dict:
+        """Return read-only scheduler/cache identity for diagnostics and gates.
+
+        The existing ``GetInternalState`` control request already fans out to
+        every attention rank.  Keeping the snapshot behind that cold control
+        seam avoids adding work to scheduling/model-forward paths while making
+        compile-time flat/radix selection and per-pool reset observable.
+        """
+
+        state = {
+            "scheduler_flat_kvcache": scheduler_ext_flat_kvcache(),
+            "overlap_schedule_depth": int(self.overlap_schedule_depth),
+        }
+        graph_evidence_fn = getattr(
+            getattr(self, "model_executor", None),
+            "cuda_graph_runtime_evidence",
+            None,
+        )
+        if callable(graph_evidence_fn):
+            state["cuda_graph_evidence"] = graph_evidence_fn()
+        if not state["scheduler_flat_kvcache"]:
+            return state
+
+        snapshot_fn = getattr(self.scheduler, "flat_pool_snapshots", None)
+        if callable(snapshot_fn):
+            state["flat_pool_snapshots"] = [
+                {
+                    "pool_id": str(snapshot.pool_id),
+                    **{
+                        name: int(getattr(snapshot, name))
+                        for name in (
+                            "total_blocks",
+                            "usable_blocks",
+                            "free_blocks",
+                            "active_blocks",
+                            "cached_evictable_blocks",
+                            "pinned_cached_blocks",
+                            "reserved_blocks",
+                            "bytes_per_block",
+                        )
+                    },
+                }
+                for snapshot in snapshot_fn()
+            ]
+
+        generation_fn = getattr(self.scheduler, "flat_kv_generation", None)
+        quiescent_fn = getattr(self.scheduler, "flat_kv_cache_quiescent", None)
+        if callable(generation_fn):
+            state["flat_kv_generation"] = int(generation_fn())
+        if callable(quiescent_fn):
+            state["flat_kv_quiescent"] = bool(quiescent_fn())
+
+        arenas = self._v4_flat_arenas()
+        if arenas:
+            state["flat_arena_generation"] = int(arenas[0].arena_generation)
+
+        plan = None
+        for pool in self._kv_pools():
+            candidate = getattr(pool, "flat_memory_plan", None)
+            if candidate is None:
+                continue
+            if plan is not None and candidate is not plan:
+                raise RuntimeError(
+                    "DeepSeek V4 target/draft pools expose different flat plans"
+                )
+            plan = candidate
+        if plan is not None:
+            state["flat_plan_fingerprint"] = str(plan.plan_fingerprint)
+            state["flat_kv_plan"] = {
+                "pools": [
+                    {
+                        "pool_id": str(pool.pool_id),
+                        "total_blocks": int(pool.total_blocks),
+                        "bytes_per_block": int(pool.bytes_per_block),
+                        "storage_schema_hash": str(pool.storage_schema_hash),
+                    }
+                    for pool in plan.pools
+                ],
+                "groups": [
+                    {
+                        "group_id": str(spec.group_id),
+                        "pool_id": str(spec.pool_id),
+                        "rows_per_page": int(spec.rows_per_page),
+                        "entry_stride_tokens": int(spec.entry_stride_tokens),
+                        "owner_mask": int(spec.owner_mask),
+                    }
+                    for spec in plan.scheduler_group_specs
+                ],
+            }
+        return state
+
     def _get_load(self):
         """Return load metrics for the DP load balancer."""
         from tokenspeed.runtime.engine.io_struct import GetLoadReqOutput
 
-        available = self.scheduler.available_kv_pages()
         num_total_pages = self.max_total_num_tokens // self.server_args.block_size
-        num_used_pages = num_total_pages - available
+        flat_summary = self._flat_pool_usage_summary(num_total_pages)
+        if flat_summary is None:
+            available = self.scheduler.available_kv_pages()
+            num_used_pages = num_total_pages - available
+        else:
+            # DP admission pressure is governed by the tightest component
+            # pool, not a sum of unrelated local page-ID domains.
+            num_used_pages = int(flat_summary["pressure_equivalent_pages"])
         num_waiting = self.scheduler.waiting_size()
         # num_reqs: running + waiting (used by SHORTEST_QUEUE balancing)
         num_running = len(self.output_processor.rid_to_state)
@@ -1421,6 +1557,31 @@ class EventLoop:
             num_reqs=num_running + num_waiting,
             num_waiting_reqs=num_waiting,
             num_pages=num_used_pages,
+        )
+
+    def _flat_pool_usage_summary(self, equivalent_total_pages: int):
+        state = self._flat_pool_usage_state(
+            equivalent_total_pages,
+            include_pool_metrics=False,
+        )
+        return None if state is None else state[0]
+
+    def _flat_pool_usage_state(
+        self,
+        equivalent_total_pages: int,
+        *,
+        include_pool_metrics: bool,
+    ):
+        snapshot_fn = getattr(self.scheduler, "flat_pool_snapshots", None)
+        if not callable(snapshot_fn):
+            return None
+        snapshots = snapshot_fn()
+        if not snapshots:
+            return None
+        return collect_flat_pool_metrics(
+            snapshots,
+            equivalent_total_pages=equivalent_total_pages,
+            include_pool_metrics=include_pool_metrics,
         )
 
     def _dp_sync_and_check(self, forward_op) -> DpForwardMetadata:
@@ -1482,13 +1643,27 @@ class EventLoop:
 
     def _get_scheduler_stats(self):
         """Query scheduler for page usage and queue depth."""
-        available = self.scheduler.available_kv_pages()
-        active = self.scheduler.active_kv_pages()
         num_total_pages = self.max_total_num_tokens // self.server_args.block_size
+        flat_state = self._flat_pool_usage_state(
+            num_total_pages,
+            include_pool_metrics=self.metrics.enabled,
+        )
+        if flat_state is None:
+            available = self.scheduler.available_kv_pages()
+            active = self.scheduler.active_kv_pages()
+            cached = num_total_pages - available
+            flat_summary = None
+            flat_pool_metrics = ()
+        else:
+            flat_summary, flat_pool_metrics = flat_state
+            active = int(flat_summary["active_equivalent_pages"])
+            cached = int(flat_summary["pressure_equivalent_pages"])
         return {
             "num_active_pages": active,
-            "num_cached_pages": num_total_pages - available,
+            "num_cached_pages": cached,
             "num_queue_reqs": self.scheduler.waiting_size(),
+            "flat_summary": flat_summary,
+            "flat_pool_metrics": flat_pool_metrics,
         }
 
     def _record_scheduler_iteration_metrics(
@@ -1500,6 +1675,8 @@ class EventLoop:
             num_active_pages=stats["num_active_pages"],
             num_total_pages=self.max_total_num_tokens // self.server_args.block_size,
             num_iteration_tokens=num_iteration_tokens,
+            flat_summary=stats.get("flat_summary"),
+            flat_pool_metrics=stats.get("flat_pool_metrics", ()),
         )
 
     # ------------------------------------------------------------------
@@ -1507,17 +1684,40 @@ class EventLoop:
     # ------------------------------------------------------------------
 
     def _reset_caches_for_release(self) -> None:
-        """Invalidate the prefix/radix cache before KV is discarded on release.
+        """Invalidate cache metadata before KV is discarded on release.
 
-        KV pages are re-mapped + zeroed on wake, so any retained prefix entry
-        would be stale. The unsafe case (prefix caching on with no reset) is
-        rejected up front in ``MemoryOccupationController.handle_release`` via
-        ``kv_cache_release_allowed``, so by the time we get here either a reset
-        exists or prefix caching is off (nothing to invalidate).
+        Radix pools use their legacy prefix-cache reset when available. A V4
+        flat arena instead requires the structured scheduler to be quiescent,
+        invalidate every cached block, and advance its pool-set generation.
+        That generation is retained until the matching wake repairs page 0.
         """
-        reset = getattr(self.scheduler, "reset_prefix_cache", None)
-        if callable(reset):
-            reset()
+        arenas = self._v4_flat_arenas()
+        if not arenas:
+            reset = getattr(self.scheduler, "reset_prefix_cache", None)
+            if callable(reset):
+                reset()
+            return
+        if self._flat_kv_release_generation is not None:
+            raise RuntimeError(
+                "DeepSeek V4 flat KV cache already has an unrepaired release"
+            )
+        reset_flat = getattr(self.scheduler, "reset_flat_kv_cache", None)
+        if not callable(reset_flat):
+            raise RuntimeError(
+                "DeepSeek V4 flat KV release requires scheduler "
+                "reset_flat_kv_cache()"
+            )
+        generation = reset_flat()
+        if (
+            isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation <= 0
+        ):
+            raise RuntimeError(
+                "scheduler reset_flat_kv_cache() returned an invalid generation: "
+                f"{generation!r}"
+            )
+        self._flat_kv_release_generation = generation
 
     def _kv_pools(self) -> list:
         """All KV pools whose pages are tagged ``kv_cache`` — the target pool and
@@ -1530,12 +1730,50 @@ class EventLoop:
                 pools.append(pool)
         return pools
 
+    def _v4_flat_arenas(self) -> list:
+        """Return the unique canonical V4 flat arena, if configured.
+
+        Target and draft pools are owner views over one union plan. Multiple
+        distinct arenas would make scheduler generation/reset ownership
+        ambiguous, so reject that topology before any release mutation.
+        """
+        arenas = {}
+        for pool in self._kv_pools():
+            arena = getattr(pool, "flat_arena_set", None)
+            if arena is not None:
+                arenas[id(arena)] = arena
+        if len(arenas) > 1:
+            raise RuntimeError(
+                "DeepSeek V4 target/draft flat KV pools must share one "
+                "canonical arena"
+            )
+        return list(arenas.values())
+
     def _kv_repair_after_wake(self) -> None:
         """Zero re-mapped KV buffers (garbage after re-map) for every KV pool,
         including the draft pool in spec-decode runs — its allocations are tagged
         ``kv_cache`` too, so a wake that skipped it would feed the draft model
         stale KV. FP8 KV scales ride with the weights region, so no scale reset
         is needed here."""
+        arenas = self._v4_flat_arenas()
+        if arenas:
+            generation = self._flat_kv_release_generation
+            if generation is None:
+                raise RuntimeError(
+                    "DeepSeek V4 flat KV wake has no matching scheduler reset "
+                    "generation"
+                )
+            repaired_generation = arenas[0].repair_after_wake(
+                expected_generation=generation
+            )
+            if repaired_generation != generation:
+                raise RuntimeError(
+                    "DeepSeek V4 flat KV arena returned an unexpected generation: "
+                    f"expected={generation}, actual={repaired_generation!r}"
+                )
+            self._flat_kv_release_generation = None
+            return
+
         for pool in self._kv_pools():
             if hasattr(pool, "clear_kv_buffers"):
                 pool.clear_kv_buffers()
@@ -1587,9 +1825,9 @@ class EventLoop:
             execution_plan = self.scheduler.next_execution_plan()
             self._publish_scheduler_kv_events()
             self._handle_flat_oom_terminals(execution_plan)
-            self._submit_cache_ops(execution_plan)
 
             forward_op = self._get_forward_op(execution_plan)
+            self._submit_cache_ops(execution_plan, forward_op)
             self._flush_mamba_retract_states(forward_op)
 
             stats = self._get_scheduler_stats()
@@ -1619,7 +1857,6 @@ class EventLoop:
                 results, on_first_token = self._dispatch_forward(
                     forward_op,
                     sampling_params_list,
-                    execution_plan,
                     dp_metadata=dp_metadata,
                     stats=stats,
                     grammar_inputs=grammar_inputs,
@@ -1740,9 +1977,8 @@ class EventLoop:
             self._publish_scheduler_kv_events()
             self._handle_flat_oom_terminals(execution_plan)
 
-            self._submit_cache_ops(execution_plan)
-
             forward_op = self._get_forward_op(execution_plan)
+            self._submit_cache_ops(execution_plan, forward_op)
             self._flush_mamba_retract_states(forward_op)
 
             stats = self._get_scheduler_stats()
@@ -1816,7 +2052,6 @@ class EventLoop:
                 curr_results, _ = self._dispatch_forward(
                     forward_op,
                     sampling_params_list,
-                    execution_plan,
                     dp_metadata=dp_metadata,
                     stats=stats,
                     grammar_inputs=grammar_inputs,

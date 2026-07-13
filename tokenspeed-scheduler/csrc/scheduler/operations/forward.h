@@ -21,16 +21,35 @@
 #pragma once
 
 #include <algorithm>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
-#include <array>
+#include <exception>
+#include <limits>
 #include <map>
+#include <optional>
+#include <span>
+#include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
 
+#include "cache/cache_types.h"
+
 namespace tokenspeed {
+
+// Dispatch-time host POD. This is an input to the executor, never evidence
+// that device KV is ready for prefix publication.
+struct FlatKVCompletionInput {
+    std::string request_id;
+    std::uint64_t table_generation{};
+    std::uint64_t dispatch_seq{};
+    std::int32_t dispatch_raw_start{};
+    std::int32_t dispatch_raw_end{};
+    std::int32_t protected_raw_end{};
+};
 
 struct ForwardOperationBase {
     std::string request_id;
@@ -57,11 +76,22 @@ struct ForwardOperationBase {
     // Per-request, per-sliding-group base logical-page offset.
     std::map<std::string, std::int32_t> paged_cache_page_base_offsets;
 
-    // flat KV-cache per-group block table. key = group_id, value = that group's
-    // physical page-id row (null hole = 0, absolute logical-page index, NOT
-    // compacted). Filled only on the flat path; empty on the radix path. Does
-    // not share a contract with paged_cache_pages (radix: compact + offset).
+    // Production flat path: an allocation-free, index-aligned view of the
+    // request's live tables. It is consumed synchronously by
+    // FlatForwardOperation before NextExecutionPlan returns; request state is
+    // never exposed through the public execution-plan ABI.
+    std::span<const BlockTable> flat_block_table_view;
+    std::span<const std::string> flat_block_table_group_ids;
+
+    // Compatibility input for direct/unit construction. The scheduler hot
+    // path leaves these maps empty and uses the row view above, avoiding one
+    // map + nested-vector materialization per request and a second cell copy.
     std::map<std::string, std::vector<std::int32_t>> flat_block_tables;
+    std::map<std::string, std::int32_t> flat_block_table_base_offsets;
+
+    // Populated by the flat scheduler after the table mutation is committed.
+    // Radix operations leave this null so their batched ABI remains empty.
+    std::optional<FlatKVCompletionInput> flat_kv_completion_input;
 
     // Mamba extension (default: inactive)
     std::int32_t mamba_working_idx{-1};
@@ -83,6 +113,99 @@ struct DecodeOperation : public ForwardOperationBase {
 };
 
 using ForwardOperation = std::variant<PrefillOperation, DecodeOperation>;
+
+struct FlatBlockTableExport {
+    using LegacyRows = std::vector<std::vector<std::int32_t>>;
+
+    struct CopyResult {
+        std::size_t rows{};
+        std::size_t cols{};
+    };
+
+    // One allocation each at the exact batch rectangle sizes. ``values`` is
+    // row-major and already padded with -1; ``bases`` is row-aligned with it.
+    std::vector<std::int32_t> values;
+    std::vector<std::int32_t> bases;
+    std::size_t rows{};
+    std::size_t cols{};
+
+    FlatBlockTableExport() = default;
+
+    FlatBlockTableExport(std::size_t row_count, std::size_t col_count)
+        : values(CheckedElementCount(row_count, col_count), -1),
+          bases(row_count, 0),
+          rows(row_count),
+          cols(col_count) {}
+
+    std::span<const std::int32_t> Row(std::size_t row) const {
+        if (row >= rows) {
+            throw std::out_of_range("flat block table export row is out of range");
+        }
+        AssertShape();
+        return std::span<const std::int32_t>{values}.subspan(row * cols, cols);
+    }
+
+    std::size_t size() const noexcept { return rows; }
+    bool empty() const noexcept { return rows == 0; }
+
+    // Explicit compatibility boundary for the legacy Python property only.
+    // The scheduler/binding hot path must use Row()/CopyTo() and never call it.
+    LegacyRows MaterializeRows() const {
+        LegacyRows out;
+        out.reserve(rows);
+        for (std::size_t row = 0; row < rows; ++row) {
+            const std::span<const std::int32_t> source = Row(row);
+            out.emplace_back(source.begin(), source.end());
+        }
+        return out;
+    }
+
+    CopyResult CopyTo(std::span<std::int32_t> table_destination, std::span<std::int32_t> base_destination,
+                      std::int64_t page_id_upper_bound) const {
+        AssertShape();
+        if (page_id_upper_bound < 2) {
+            throw std::invalid_argument("flat block table page-id upper bound must reserve page 0");
+        }
+        if (rows > base_destination.size()) {
+            throw std::invalid_argument("flat block table staging row capacity exceeded");
+        }
+        if (values.size() > table_destination.size()) {
+            throw std::invalid_argument("flat block table staging column capacity exceeded");
+        }
+
+        for (std::size_t row = 0; row < rows; ++row) {
+            const std::int32_t base = bases[row];
+            if (base < 0) {
+                throw std::invalid_argument("flat block table contains a negative logical base");
+            }
+            base_destination[row] = base;
+
+            const std::size_t row_offset = row * cols;
+            for (std::size_t col = 0; col < cols; ++col) {
+                const std::int32_t page_id = values[row_offset + col];
+                if (page_id < -1 || page_id >= page_id_upper_bound) {
+                    throw std::invalid_argument("flat block table contains a page id outside [-1, total_blocks)");
+                }
+                table_destination[row_offset + col] = page_id;
+            }
+        }
+        return CopyResult{.rows = rows, .cols = cols};
+    }
+
+private:
+    static std::size_t CheckedElementCount(std::size_t rows, std::size_t cols) {
+        if (cols != 0 && rows > std::numeric_limits<std::size_t>::max() / cols) {
+            throw std::overflow_error("flat block table export shape overflows size_t");
+        }
+        return rows * cols;
+    }
+
+    void AssertShape() const {
+        if (bases.size() != rows || values.size() != CheckedElementCount(rows, cols)) {
+            throw std::logic_error("flat block table export payload disagrees with its shape");
+        }
+    }
+};
 
 struct FlatForwardOperation {
     std::vector<std::string> request_ids;
@@ -118,22 +241,136 @@ struct FlatForwardOperation {
     // sliding-window groups. Missing key ⇔ offset is 0 for every row.
     std::map<std::string, std::vector<std::int32_t>> paged_cache_block_table_base_offsets;
 
-    // flat KV-cache per-group block table, batched: dict[group_id] =
-    // [num_reqs, max_pages_in_batch] padded with -1. Each row is absolute
-    // (null hole = 0, no compaction); there is no base-offset companion.
-    std::map<std::string, std::vector<std::vector<std::int32_t>>> flat_block_tables;
-    // Contiguous row-major copy of flat_block_tables ([rows * cols], -1
-    // padded), exposed zero-copy to Python as a 2-D ndarray -- the nested
-    // vectors above cost one PyLong per page id at every attribute access.
-    std::map<std::string, std::vector<std::int32_t>> flat_block_tables_contig;
-    std::map<std::string, std::array<std::size_t, 2>> flat_block_tables_dims;
+    // Per-group contiguous export owner. Every value owns one exact row-major
+    // [rows, cols] rectangle and its [rows] bases; no nested row vectors survive
+    // batching. Python exposes this buffer through the mainline zero-copy
+    // ndarray API; legacy properties materialize nested containers lazily.
+    std::map<std::string, FlatBlockTableExport> flat_block_tables;
+
+    // Row-aligned with request_ids. Empty on radix; on flat, every KV-writing
+    // row has exactly one ready-completion seed.
+    std::vector<FlatKVCompletionInput> flat_kv_completion_inputs;
 
     explicit FlatForwardOperation(std::vector<ForwardOperation> ops) {
-        std::stable_partition(ops.begin(), ops.end(),
-                              [](const ForwardOperation& a) { return std::holds_alternative<PrefillOperation>(a); });
-        for (auto& op : ops) {
+        std::map<std::string, std::size_t> flat_widths;
+        bool have_flat_schema = false;
+        bool have_completion_inputs = false;
+        bool miss_completion_input = false;
+        std::size_t total_input_ids = 0;
+        std::size_t total_shifted_input_ids = 0;
+        std::size_t num_prefills = 0;
+        std::size_t num_decodes = 0;
+        for (const auto& op : ops) {
             std::visit(
-                [this](auto& inner) {
+                [&](const auto& inner) {
+                    const bool uses_live_view = !inner.flat_block_table_view.empty() ||
+                                                !inner.flat_block_table_group_ids.empty();
+                    if (uses_live_view) {
+                        // Production rows all use the scheduler-owned group-id
+                        // vector and request-owned table vector. A disagreement
+                        // is an internal invariant violation, not recoverable
+                        // execution-plan input validation after FSM mutation.
+                        if (inner.flat_block_table_view.size() != inner.flat_block_table_group_ids.size() ||
+                            !inner.flat_block_tables.empty() || !inner.flat_block_table_base_offsets.empty()) {
+                            std::terminate();
+                        }
+                        if (!have_flat_schema) {
+                            for (std::size_t i = 0; i < inner.flat_block_table_view.size(); ++i) {
+                                flat_widths.emplace(inner.flat_block_table_group_ids[i],
+                                                    static_cast<std::size_t>(
+                                                        inner.flat_block_table_view[i].NumBlocks()));
+                            }
+                            have_flat_schema = true;
+                        } else {
+                            if (inner.flat_block_table_group_ids.size() != flat_widths.size()) {
+                                std::terminate();
+                            }
+                            for (std::size_t i = 0; i < inner.flat_block_table_view.size(); ++i) {
+                                auto width = flat_widths.find(inner.flat_block_table_group_ids[i]);
+                                if (width == flat_widths.end()) {
+                                    std::terminate();
+                                }
+                                width->second = std::max(
+                                    width->second,
+                                    static_cast<std::size_t>(inner.flat_block_table_view[i].NumBlocks()));
+                            }
+                        }
+                    } else {
+                        // Direct construction keeps the old owned-map input as
+                        // a compatibility/testing seam. It is never populated
+                        // by Scheduler::newForwardOperation.
+                        if (!SameMapKeys(inner.flat_block_tables, inner.flat_block_table_base_offsets)) {
+                            throw std::invalid_argument(
+                                "FlatForwardOperation: every flat block table requires an explicit matching base");
+                        }
+                        if (!have_flat_schema) {
+                            for (const auto& [group_id, pages] : inner.flat_block_tables) {
+                                flat_widths.emplace(group_id, pages.size());
+                            }
+                            have_flat_schema = true;
+                        } else {
+                            if (!SameMapKeys(inner.flat_block_tables, flat_widths)) {
+                                throw std::invalid_argument(
+                                    "FlatForwardOperation: every request row must publish the same flat cache groups");
+                            }
+                            for (const auto& [group_id, pages] : inner.flat_block_tables) {
+                                flat_widths.at(group_id) = std::max(flat_widths.at(group_id), pages.size());
+                            }
+                        }
+                    }
+                    for (const auto& [group_id, _] : inner.paged_cache_pages) {
+                        paged_cache_block_tables.try_emplace(group_id);
+                    }
+                    for (const auto& [group_id, _] : inner.paged_cache_page_base_offsets) {
+                        paged_cache_block_table_base_offsets.try_emplace(group_id);
+                    }
+                    have_completion_inputs = have_completion_inputs || inner.flat_kv_completion_input.has_value();
+                    miss_completion_input = miss_completion_input || !inner.flat_kv_completion_input.has_value();
+                    if constexpr (std::same_as<std::decay_t<decltype(inner)>, PrefillOperation>) {
+                        ++num_prefills;
+                        total_input_ids += inner.input_ids.size();
+                        total_shifted_input_ids += inner.shifted_input_ids.size();
+                    } else {
+                        ++num_decodes;
+                    }
+                },
+                op);
+        }
+        if (have_completion_inputs && miss_completion_input) {
+            throw std::invalid_argument(
+                "FlatForwardOperation: completion inputs must be present for every request row or none");
+        }
+        const std::size_t num_reqs = ops.size();
+        request_ids.reserve(num_reqs);
+        request_pool_indices.reserve(num_reqs);
+        input_lengths.reserve(num_reqs);
+        prefill_lengths.reserve(num_reqs);
+        occupied_pages.reserve(num_reqs);
+        begins.reserve(num_reqs);
+        sizes.reserve(num_reqs);
+        mamba_working_indices.reserve(num_reqs);
+        mamba_checkpoint_dst_indices.reserve(num_reqs);
+        mamba_cow_src_indices.reserve(num_reqs);
+        mamba_branching_seqlens.reserve(num_reqs);
+        flat_kv_completion_inputs.reserve(have_completion_inputs ? num_reqs : 0);
+        input_ids.reserve(total_input_ids);
+        shifted_input_ids.reserve(total_shifted_input_ids);
+        extend_prefix_lens.reserve(num_prefills);
+        decode_input_ids.reserve(num_decodes);
+        hist_token_lens.reserve(num_decodes);
+        for (const auto& [group_id, cols] : flat_widths) {
+            flat_block_tables.emplace(group_id, FlatBlockTableExport{num_reqs, cols});
+        }
+        for (auto& [_, table] : paged_cache_block_tables) {
+            table.assign(num_reqs, std::vector<std::int32_t>{});
+        }
+        for (auto& [_, offsets] : paged_cache_block_table_base_offsets) {
+            offsets.assign(num_reqs, 0);
+        }
+
+        auto append_row = [this](ForwardOperation& op, std::size_t row) {
+            std::visit(
+                [this, row](auto& inner) {
                     request_ids.push_back(std::move(inner.request_id));
                     request_pool_indices.push_back(inner.request_pool_index);
                     input_lengths.push_back(inner.input_length);
@@ -145,72 +382,111 @@ struct FlatForwardOperation {
                     mamba_checkpoint_dst_indices.push_back(inner.mamba_checkpoint_dst_idx);
                     mamba_cow_src_indices.push_back(inner.mamba_cow_src_idx);
                     mamba_branching_seqlens.push_back(inner.mamba_branching_seqlen);
+                    if (!inner.flat_block_table_view.empty() || !inner.flat_block_table_group_ids.empty()) {
+                        for (std::size_t i = 0; i < inner.flat_block_table_view.size(); ++i) {
+                            auto export_it = flat_block_tables.find(inner.flat_block_table_group_ids[i]);
+                            if (export_it == flat_block_tables.end()) {
+                                std::terminate();
+                            }
+                            FlatBlockTableExport& export_owner = export_it->second;
+                            const BlockTable& table = inner.flat_block_table_view[i];
+                            if (static_cast<std::size_t>(table.NumBlocks()) > export_owner.cols) {
+                                std::terminate();
+                            }
+                            std::size_t destination = row * export_owner.cols;
+                            for (CacheBlock* block : table.Blocks()) {
+                                export_owner.values[destination++] = block->IsNull() ? 0 : block->BlockId();
+                            }
+                            export_owner.bases[row] = table.BaseLogicalPage();
+                        }
+                    } else {
+                        for (const auto& [gid, pages] : inner.flat_block_tables) {
+                            FlatBlockTableExport& export_owner = flat_block_tables.at(gid);
+                            if (pages.size() > export_owner.cols) {
+                                throw std::logic_error("flat block table row exceeds its precomputed width");
+                            }
+                            const std::size_t row_offset = row * export_owner.cols;
+                            std::copy(pages.begin(), pages.end(), export_owner.values.begin() + row_offset);
+                            export_owner.bases[row] = inner.flat_block_table_base_offsets.at(gid);
+                        }
+                    }
                     for (auto& [gid, pages] : inner.paged_cache_pages) {
-                        paged_cache_block_tables[gid];
+                        paged_cache_block_tables.at(gid)[row] = std::move(pages);
                     }
-                    for (auto& [gid, pages] : inner.flat_block_tables) {
-                        flat_block_tables[gid];
+                    for (const auto& [gid, offset] : inner.paged_cache_page_base_offsets) {
+                        paged_cache_block_table_base_offsets.at(gid)[row] = offset;
                     }
-                    for (auto& [gid, _] : inner.paged_cache_page_base_offsets) {
-                        paged_cache_block_table_base_offsets[gid];
+                    if (inner.flat_kv_completion_input.has_value()) {
+                        flat_kv_completion_inputs.push_back(std::move(*inner.flat_kv_completion_input));
+                    }
+                    if constexpr (std::same_as<std::decay_t<decltype(inner)>, PrefillOperation>) {
+                        input_ids.insert(input_ids.end(), inner.input_ids.begin(), inner.input_ids.end());
+                        shifted_input_ids.insert(shifted_input_ids.end(), inner.shifted_input_ids.begin(),
+                                                 inner.shifted_input_ids.end());
+                        extend_prefix_lens.push_back(inner.extend_prefix_len);
+                    } else {
+                        decode_input_ids.push_back(inner.decode_input_id);
+                        hist_token_lens.push_back(inner.hist_token_len);
                     }
                 },
                 op);
-            if (auto* prefill = std::get_if<PrefillOperation>(&op)) {
-                input_ids.insert(input_ids.end(), prefill->input_ids.begin(), prefill->input_ids.end());
-                shifted_input_ids.insert(shifted_input_ids.end(), prefill->shifted_input_ids.begin(),
-                                         prefill->shifted_input_ids.end());
-                extend_prefix_lens.push_back(prefill->extend_prefix_len);
-            } else if (auto* decode = std::get_if<DecodeOperation>(&op)) {
-                decode_input_ids.push_back(decode->decode_input_id);
-                hist_token_lens.push_back(decode->hist_token_len);
-            }
-        }
-        const std::size_t num_reqs = request_ids.size();
-        for (auto& [_, table] : paged_cache_block_tables) {
-            table.assign(num_reqs, std::vector<std::int32_t>{});
-        }
-        for (auto& [_, table] : flat_block_tables) {
-            table.assign(num_reqs, std::vector<std::int32_t>{});
-        }
-        for (auto& [_, offsets] : paged_cache_block_table_base_offsets) {
-            offsets.assign(num_reqs, 0);
-        }
+        };
+
+        // Preserve stable prefill-before-decode order without stable_partition:
+        // moving the heavy variants would allocate a temporary buffer and walk
+        // every row before the real SoA/table export.
         std::size_t row = 0;
         for (auto& op : ops) {
-            std::visit(
-                [&](auto& inner) {
-                    for (auto& [gid, pages] : inner.paged_cache_pages) {
-                        paged_cache_block_tables[gid][row] = std::move(pages);
-                    }
-                    for (auto& [gid, pages] : inner.flat_block_tables) {
-                        flat_block_tables[gid][row] = std::move(pages);
-                    }
-                    for (auto& [gid, off] : inner.paged_cache_page_base_offsets) {
-                        paged_cache_block_table_base_offsets[gid][row] = off;
-                    }
-                },
-                op);
-            ++row;
+            if (std::holds_alternative<PrefillOperation>(op)) {
+                append_row(op, row++);
+            }
+        }
+        for (auto& op : ops) {
+            if (std::holds_alternative<DecodeOperation>(op)) {
+                append_row(op, row++);
+            }
+        }
+        if (row != num_reqs) {
+            std::terminate();
         }
         padRectangularMinusOne(paged_cache_block_tables);
-        padRectangularMinusOne(flat_block_tables);
-        for (auto& [gid, table] : flat_block_tables) {
-            const std::size_t rows = table.size();
-            const std::size_t cols = rows ? table.front().size() : 0;
-            auto& buf = flat_block_tables_contig[gid];
-            buf.reserve(rows * cols);
-            for (const auto& row : table) {
-                buf.insert(buf.end(), row.begin(), row.end());
-            }
-            flat_block_tables_dims[gid] = {rows, cols};
-        }
     }
 
     bool empty() const { return request_ids.empty(); }
     std::size_t num_extends() const { return extend_prefix_lens.size(); }
 
+    std::map<std::string, std::vector<std::vector<std::int32_t>>> MaterializeFlatBlockTables() const {
+        std::map<std::string, std::vector<std::vector<std::int32_t>>> out;
+        for (const auto& [group_id, export_owner] : flat_block_tables) {
+            out.emplace(group_id, export_owner.MaterializeRows());
+        }
+        return out;
+    }
+
+    std::map<std::string, std::vector<std::int32_t>> MaterializeFlatBlockTableBaseOffsets() const {
+        std::map<std::string, std::vector<std::int32_t>> out;
+        for (const auto& [group_id, export_owner] : flat_block_tables) {
+            out.emplace(group_id, export_owner.bases);
+        }
+        return out;
+    }
+
 private:
+    template <typename Left, typename Right>
+    static bool SameMapKeys(const std::map<std::string, Left>& left, const std::map<std::string, Right>& right) {
+        if (left.size() != right.size()) {
+            return false;
+        }
+        auto left_it = left.begin();
+        auto right_it = right.begin();
+        for (; left_it != left.end(); ++left_it, ++right_it) {
+            if (left_it->first != right_it->first) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     template <typename Key>
     static void padRectangularMinusOne(std::map<Key, std::vector<std::vector<std::int32_t>>>& tables) {
         for (auto& [_, table] : tables) {

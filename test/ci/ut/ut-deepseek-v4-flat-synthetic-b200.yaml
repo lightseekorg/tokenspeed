@@ -1,0 +1,24 @@
+{
+  "api_version": "ci.tokenspeed.io/v1",
+  "name": "ut-deepseek-v4-flat-synthetic-b200",
+  "type": "ut",
+  "triggers": ["nightly", "manual"],
+  "runner": {
+    "labels": ["b200-1gpu"]
+  },
+  "env": {
+    "CI": "true"
+  },
+  "install": [
+    "bash test/ci_system/install_deps.sh",
+    "bash test/ci_system/install_scheduler_variants.sh"
+  ],
+  "ut": {
+    "commands": [
+      "PYTHONPATH=.ci-artifacts/scheduler-variants/flat:${PYTHONPATH:-} python3 test/runtime/run_ci_suite.py --device cuda --suite deepseek-v4-flat-synthetic --timeout-per-file 1800"
+    ]
+  },
+  "report": {
+    "github_step_summary": true
+  }
+}

@@ -370,7 +370,6 @@ TEST_F(MambaL2CacheTest, PrefillFirstChunkRequiresCheckpointSlot) {
         prefix_cache_.get(),
         false,
         {},
-        hybrid_prefix_cache_.get(),
         &one_slot_mamba_alloc,
     };
 

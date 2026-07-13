@@ -48,6 +48,7 @@ from tokenspeed.runtime.execution.cuda_graph_wrapper import (
 )
 from tokenspeed.runtime.execution.drafter.eagle import (
     _advance_draft_forward_metadata_if_supported,
+    _first_step_covers_all_draft_kv_layers,
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.model_runner import ModelRunner
@@ -81,6 +82,7 @@ from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
 from tokenspeed.runtime.layers.quantization import QUANTIZATION_METHODS
 from tokenspeed.runtime.models import deepseek_v4 as deepseek_v4_model
 from tokenspeed.runtime.models.deepseek_v4 import (
+    DeepseekV4Compressor,
     DeepseekV4Indexer,
     DeepseekV4MLP,
     DeepseekV4MoE,
@@ -199,6 +201,37 @@ def _v4_compressed_kv_tables(
     if c128 is not None:
         tables["v4.c128a.compressed_kv"] = c128
     return tables
+
+
+class _TensorWriteRecorder:
+    """Minimal tensor-shaped spy for CUDA metadata write ranges."""
+
+    def __init__(self, shape, *, writes=None, selection=()):
+        self.shape = shape
+        self.writes = [] if writes is None else writes
+        self.selection = selection
+
+    def __getitem__(self, selection):
+        if not isinstance(selection, tuple):
+            selection = (selection,)
+        return _TensorWriteRecorder(
+            self.shape,
+            writes=self.writes,
+            selection=selection,
+        )
+
+    def fill_(self, value):
+        self.writes.append(("fill", self.selection, value))
+        return self
+
+    def copy_(self, source):
+        del source
+        self.writes.append(("copy", self.selection))
+        return self
+
+    def to(self, *args, **kwargs):
+        del args, kwargs
+        return self
 
 
 def _mhc_sinkhorn_reference(
@@ -1273,6 +1306,34 @@ class TestDeepseekV4Config(unittest.TestCase):
             43,
         )
 
+    def test_v4_eagle_draft_prefix_capability_requires_one_nextn_layer(self):
+        def model_config(architectures, num_attention_layers):
+            return SimpleNamespace(
+                hf_config=SimpleNamespace(architectures=architectures),
+                num_attention_layers=num_attention_layers,
+            )
+
+        self.assertTrue(
+            _first_step_covers_all_draft_kv_layers(
+                model_config(["DeepseekV4ForCausalLMNextN"], 1)
+            )
+        )
+        for num_attention_layers in (0, 2, 3):
+            with self.subTest(num_attention_layers=num_attention_layers):
+                self.assertFalse(
+                    _first_step_covers_all_draft_kv_layers(
+                        model_config(
+                            ["DeepseekV4ForCausalLMNextN"],
+                            num_attention_layers,
+                        )
+                    )
+                )
+        self.assertFalse(
+            _first_step_covers_all_draft_kv_layers(
+                model_config(["DeepseekV4ForCausalLM"], 1)
+            )
+        )
+
     def test_deepseek_v4_mtp_checkpoint_name_remap(self):
         model = object.__new__(DeepseekV4ForCausalLMNextN)
         model.config = SimpleNamespace(
@@ -1828,6 +1889,101 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(torch.equal(table[:, :2], compact))
         self.assertTrue(torch.equal(table[:, 2:], torch.full_like(table[:, 2:], -1)))
 
+    def test_deepseek_v4_flat_graph_refresh_writes_only_table_prefix_and_tail(self):
+        backend = object.__new__(DeepseekV4AttentionBackend)
+        buffer = _TensorWriteRecorder((2, 4))
+        backend._cuda_graph_paged_cache_block_tables = {"v4.swa_kv": buffer}
+        backend._cuda_graph_flat_table_refresh_state = {}
+
+        cases = (
+            (4, [("copy", (slice(None, 2), slice(None, 4)))]),
+            (
+                2,
+                [
+                    ("fill", (slice(None, 2), slice(2, None)), -1),
+                    ("copy", (slice(None, 2), slice(None, 2))),
+                ],
+            ),
+            (2, [("copy", (slice(None, 2), slice(None, 2)))]),
+            (3, [("copy", (slice(None, 2), slice(None, 3)))]),
+            (
+                1,
+                [
+                    ("fill", (slice(None, 2), slice(1, None)), -1),
+                    ("copy", (slice(None, 2), slice(None, 1))),
+                ],
+            ),
+        )
+        for width, expected_writes in cases:
+            buffer.writes.clear()
+            backend._refresh_cuda_graph_paged_cache_block_tables(
+                2,
+                {"v4.swa_kv": _TensorWriteRecorder((2, width))},
+                pad_value=-1,
+                require_all_groups=True,
+            )
+            self.assertEqual(buffer.writes, expected_writes)
+
+    def test_deepseek_v4_graph_refresh_keeps_idle_and_radix_missing_semantics(self):
+        backend = object.__new__(DeepseekV4AttentionBackend)
+        table_buffer = _TensorWriteRecorder((2, 4))
+        base_buffer = _TensorWriteRecorder((2,))
+        backend._cuda_graph_paged_cache_block_tables = {"v4.swa_kv": table_buffer}
+        backend._cuda_graph_paged_cache_base_offsets = {"v4.swa_kv": base_buffer}
+        backend._cuda_graph_flat_table_refresh_state = {}
+
+        backend._refresh_cuda_graph_base_offsets(
+            2,
+            {"v4.swa_kv": _TensorWriteRecorder((2,))},
+            require_all_groups=True,
+        )
+        self.assertEqual(base_buffer.writes, [("copy", (slice(None, 2),))])
+        base_buffer.writes.clear()
+
+        backend._refresh_cuda_graph_paged_cache_block_tables(
+            0,
+            {},
+            pad_value=-1,
+        )
+        backend._refresh_cuda_graph_base_offsets(0, {})
+        self.assertEqual(table_buffer.writes, [])
+        self.assertEqual(base_buffer.writes, [])
+
+        backend._refresh_cuda_graph_paged_cache_block_tables(
+            2,
+            {},
+            pad_value=-1,
+        )
+        backend._refresh_cuda_graph_base_offsets(2, {})
+        self.assertEqual(
+            table_buffer.writes,
+            [("fill", (slice(None, 2),), -1)],
+        )
+        self.assertEqual(base_buffer.writes, [("fill", (slice(None, 2),), 0)])
+
+    def test_deepseek_v4_flat_graph_refresh_handles_width_transitions(self):
+        backend = object.__new__(DeepseekV4AttentionBackend)
+        buffer = torch.full((2, 4), 99, dtype=torch.int32)
+        backend._cuda_graph_paged_cache_block_tables = {"v4.swa_kv": buffer}
+        backend._cuda_graph_flat_table_refresh_state = {}
+
+        cases = ((2, 4, 10), (1, 2, 20), (1, 2, 30), (1, 3, 40), (2, 3, 50))
+        for rows, width, value in cases:
+            source = torch.full((rows, width), value, dtype=torch.int32)
+            backend._refresh_cuda_graph_paged_cache_block_tables(
+                rows,
+                {"v4.swa_kv": source},
+                pad_value=-1,
+                require_all_groups=True,
+            )
+            self.assertTrue(torch.equal(buffer[:rows, :width], source))
+            self.assertTrue(
+                torch.equal(
+                    buffer[:rows, width:],
+                    torch.full_like(buffer[:rows, width:], -1),
+                )
+            )
+
     def test_deepseek_v4_metadata_splits_named_cache_groups(self):
         backend = DeepseekV4AttentionBackend(
             SimpleNamespace(
@@ -2143,6 +2299,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             seq_lens=grouped_metadata.seq_lens,
             compress_ratio=4,
             kv_cache_block_size=64,
+            capacity_pages=64,
         )
         self.assertTrue(
             torch.equal(decode_slots[:5], torch.tensor([-1, -1, 1354, -1, -1]))
@@ -2170,6 +2327,59 @@ class TestDeepseekV4Config(unittest.TestCase):
             torch.equal(compressed_slots, torch.tensor([640, 703, 704, -1]))
         )
 
+        bounded_slots = _group_slot_mapping_from_raw(
+            positions=torch.tensor([0, 64, 128, 192], dtype=torch.int64),
+            req_indices=torch.zeros(4, dtype=torch.int32),
+            block_table=torch.tensor([[0, 3, 4, -1]], dtype=torch.int32),
+            rows_per_page=64,
+            capacity_pages=4,
+        )
+        self.assertTrue(torch.equal(bounded_slots, torch.tensor([-1, 192, -1, -1])))
+
+    def test_deepseek_v4_flat_compressed_slots_require_owner_capacity(self):
+        cache = DeepseekV4CacheMetadata(
+            page_size=8,
+            block_table=torch.empty((1, 0), dtype=torch.int32),
+            table_source_kind="flat",
+            paged_cache_block_tables={
+                "v4.c4a.compressed_kv": torch.tensor([[0, 2, 3]], dtype=torch.int32)
+            },
+        )
+        positions = torch.tensor([3, 7, 11, 19], dtype=torch.int64)
+        token_to_req = torch.zeros(4, dtype=torch.int32)
+
+        with self.assertRaisesRegex(RuntimeError, "owner component page capacity"):
+            cache.compressed_slot_mapping(
+                positions,
+                compress_ratio=4,
+                token_to_req_indices=token_to_req,
+                query_start_loc=torch.tensor([0, 4], dtype=torch.int32),
+                seq_lens=torch.tensor([20], dtype=torch.int32),
+                kv_cache_block_size=2,
+            )
+
+        slots = cache.compressed_slot_mapping(
+            positions,
+            compress_ratio=4,
+            token_to_req_indices=token_to_req,
+            query_start_loc=torch.tensor([0, 4], dtype=torch.int32),
+            seq_lens=torch.tensor([20], dtype=torch.int32),
+            kv_cache_block_size=2,
+            capacity_pages=3,
+        )
+        self.assertTrue(torch.equal(slots, torch.tensor([-1, -1, 4, -1])))
+
+        with self.assertRaisesRegex(RuntimeError, "disagree on page capacity"):
+            cache.compressed_slot_mapping(
+                positions,
+                compress_ratio=4,
+                token_to_req_indices=token_to_req,
+                query_start_loc=torch.tensor([0, 4], dtype=torch.int32),
+                seq_lens=torch.tensor([20], dtype=torch.int32),
+                kv_cache_block_size=4,
+                capacity_pages=4,
+            )
+
     def test_deepseek_v4_slot_mapping_masks_invalid_tokens(self):
         slots = _mask_invalid_graph_tokens(
             torch.tensor([10, 20, -1, 40], dtype=torch.int64),
@@ -2177,6 +2387,117 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
 
         self.assertTrue(torch.equal(slots, torch.tensor([10, -1, -1, -1])))
+
+    def test_deepseek_v4_prefill_chunking_reuses_cpu_query_offsets(self):
+        backend = DeepseekV4AttentionBackend(
+            SimpleNamespace(
+                page_size=64,
+                device="cpu",
+                num_attention_heads=8,
+                num_kv_heads=1,
+                attn_tp_size=1,
+                dtype=torch.bfloat16,
+                is_draft=False,
+                speculative_num_draft_tokens=1,
+                head_dim=576,
+                context_len=256,
+                deepseek_v4_prefill_chunk_size=2,
+            )
+        )
+
+        class NoDeviceToHostQueryStart:
+            def detach(self):
+                raise AssertionError("query_start_loc must not be copied to CPU")
+
+        query_lens = torch.tensor([2, 1, 3, 1, 2], dtype=torch.int32)
+        metadata = DeepseekV4ForwardMetadata(
+            req_pool_indices=torch.arange(5, dtype=torch.int32),
+            seq_lens=query_lens.clone(),
+            query_lens=query_lens,
+            query_start_loc=NoDeviceToHostQueryStart(),
+            query_start_offsets=(0, 2, 3, 6, 7, 9),
+            token_to_req_indices=torch.repeat_interleave(
+                torch.arange(5, dtype=torch.int32), query_lens
+            ),
+            cache=DeepseekV4CacheMetadata(
+                page_size=64,
+                block_table=torch.empty((5, 0), dtype=torch.int32),
+                table_source_kind="flat",
+            ),
+            query_lens_cpu=query_lens.clone(),
+            num_prefill_reqs=5,
+            num_prefill_tokens=9,
+            forward_mode=ForwardMode.EXTEND,
+        )
+        backend.forward_metadata = metadata
+        calls = []
+
+        def fake_prefill_chunk(**kwargs):
+            chunk_metadata = backend.forward_metadata
+            calls.append(
+                (
+                    kwargs["positions"].tolist(),
+                    chunk_metadata.query_start_offsets,
+                )
+            )
+            q = kwargs["q"]
+            return q.new_zeros((q.shape[0], 1, 2))
+
+        backend._forward_deepseek_v4_prefill_chunk = fake_prefill_chunk
+        out = backend.forward_deepseek_v4_prefill(
+            q=torch.empty((9, 1, 2), dtype=torch.bfloat16),
+            positions=torch.arange(9, dtype=torch.int64),
+            token_to_kv_pool=SimpleNamespace(),
+            layer_id=0,
+            kind="test",
+            compress_ratio=1,
+            num_local_heads=1,
+            padded_heads=1,
+            head_dim=2,
+            window_size=64,
+            softmax_scale=1.0,
+            attn_sink=torch.empty((1,), dtype=torch.float32),
+            topk_indices=None,
+        )
+
+        self.assertEqual(tuple(out.shape), (9, 1, 2))
+        self.assertEqual(
+            calls,
+            [
+                ([0, 1, 2], (0, 2, 3)),
+                ([3, 4, 5, 6], (0, 3, 4)),
+                ([7, 8], (0, 2)),
+            ],
+        )
+        self.assertIs(backend.forward_metadata, metadata)
+
+    def test_deepseek_v4_flat_prefill_requires_cpu_query_lengths(self):
+        backend = DeepseekV4AttentionBackend(
+            SimpleNamespace(
+                page_size=64,
+                device="cpu",
+                num_attention_heads=8,
+                num_kv_heads=1,
+                attn_tp_size=1,
+                dtype=torch.bfloat16,
+                is_draft=False,
+                speculative_num_draft_tokens=1,
+                head_dim=576,
+                context_len=256,
+            )
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "requires CPU query lengths"):
+            backend.init_forward_metadata(
+                bs=1,
+                req_pool_indices=torch.tensor([0], dtype=torch.int32),
+                seq_lens=torch.tensor([1], dtype=torch.int32),
+                forward_mode=ForwardMode.EXTEND,
+                flat_block_tables={"v4.swa_kv": torch.tensor([[1]], dtype=torch.int32)},
+                flat_block_table_base_offsets={
+                    "v4.swa_kv": torch.tensor([0], dtype=torch.int32)
+                },
+            )
 
     def test_deepseek_v4_mixed_metadata_splits_prefill_and_decode(self):
         backend = DeepseekV4AttentionBackend(
@@ -2218,7 +2539,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(
             torch.equal(
                 metadata.seq_lens_cpu,
-                torch.tensor([5, 9, 12], dtype=torch.int32),
+                torch.tensor([5], dtype=torch.int32),
             )
         )
         self.assertTrue(
@@ -2227,6 +2548,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 torch.tensor([3, 1, 1], dtype=torch.int32),
             )
         )
+        self.assertEqual(metadata.query_start_offsets, (0, 3, 4, 5))
 
         prefill = backend._metadata_slice(
             metadata,
@@ -2265,6 +2587,8 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(
             torch.equal(decode.query_lens_cpu, torch.tensor([1, 1], dtype=torch.int32))
         )
+        self.assertEqual(prefill.query_start_offsets, (0, 3))
+        self.assertEqual(decode.query_start_offsets, (0, 1, 2))
 
     def test_deepseek_v4_mixed_metadata_accepts_prefill_prefix_lens_only(self):
         backend = DeepseekV4AttentionBackend(
@@ -2301,7 +2625,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(
             torch.equal(
                 metadata.seq_lens_cpu,
-                torch.tensor([5, 9, 12, 6], dtype=torch.int32),
+                torch.tensor([5, 9, 12], dtype=torch.int32),
             )
         )
         self.assertTrue(
@@ -2310,6 +2634,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 torch.tensor([3, 4, 1, 1], dtype=torch.int32),
             )
         )
+        self.assertEqual(metadata.query_start_offsets, (0, 3, 7, 8, 9))
 
     def test_deepseek_v4_mixed_backend_slices_prefill_and_decode(self):
         backend = DeepseekV4AttentionBackend(
@@ -3884,12 +4209,16 @@ class TestDeepseekV4Config(unittest.TestCase):
             captured["indexer_cache"] = kwargs["indexer_cache"]
             return torch.full((2, 2), 3, dtype=torch.int32)
 
+        def fake_cache_insert(**kwargs):
+            captured["indexer_state_slots"] = kwargs["compressor_slot_mapping"].clone()
+            captured["indexer_kv_slots"] = kwargs["kv_slot_mapping"].clone()
+
         self_obj._forward_sparse_indexer_custom_op = fake_custom_op
 
         with patch.object(
             deepseek_v4_model,
             "deepseek_v4_csa_indexer_cache_insert",
-            return_value=None,
+            side_effect=fake_cache_insert,
         ):
             topk = DeepseekV4Indexer.forward(
                 self_obj,
@@ -3905,7 +4234,84 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         self.assertEqual(captured["indexer_block_size"], 4)
         self.assertEqual(captured["indexer_cache"].shape, (8, 128))
+        self.assertTrue(
+            torch.equal(captured["indexer_state_slots"], torch.tensor([-1, -1]))
+        )
+        self.assertTrue(
+            torch.equal(captured["indexer_kv_slots"], torch.tensor([-1, 29]))
+        )
         self.assertTrue(torch.equal(topk, torch.full((2, 2), 3, dtype=torch.int32)))
+
+    def test_deepseek_v4_compressor_writers_mask_owner_out_of_range_pages(self):
+        captured = {}
+        state_cache = torch.empty((2, 4, 2), dtype=torch.float32)
+        compressed_cache = torch.empty((3, 16), dtype=torch.uint8)
+        pool = SimpleNamespace(
+            state_block_size=4,
+            get_compressor_state_buffer=lambda layer_id: state_cache,
+            get_compressor_state_block_size=lambda layer_id: 4,
+            get_compressed_block_size=lambda layer_id: 2,
+            get_compressed_kv_buffer_2d=lambda layer_id: compressed_cache,
+        )
+        metadata = _make_deepseek_v4_forward_metadata(
+            page_size=4,
+            req_pool_indices=torch.tensor([0], dtype=torch.int32),
+            block_table=torch.tensor([[1, 1]], dtype=torch.int32),
+            seq_lens=torch.tensor([8], dtype=torch.int32),
+            query_lens=torch.tensor([2], dtype=torch.int32),
+            query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+            token_to_req_indices=torch.tensor([0, 0], dtype=torch.int32),
+            paged_cache_block_tables={
+                "v4.c4a.compressor_state": torch.tensor([[2, 1]], dtype=torch.int32),
+                "v4.c4a.compressed_kv": torch.tensor([[3]], dtype=torch.int32),
+            },
+        )
+        ctx = SimpleNamespace(
+            token_to_kv_pool=pool,
+            attn_backend=SimpleNamespace(forward_metadata=metadata),
+            forward_mode=ForwardMode.MIXED,
+        )
+        self_obj = SimpleNamespace(
+            compress_ratio=4,
+            coff=1,
+            head_dim=1,
+            ape=torch.empty(0),
+            norm=SimpleNamespace(weight=torch.ones(1), variance_epsilon=1e-6),
+        )
+
+        def fake_save_state(**kwargs):
+            captured["state_slots"] = kwargs["slot_mapping"].clone()
+
+        def fake_compressed_insert(**kwargs):
+            captured["compressed_slots"] = kwargs["kv_slot_mapping"].clone()
+            captured["compressed_cache"] = kwargs["kv_cache_2d"]
+
+        with patch.object(
+            deepseek_v4_model,
+            "save_deepseek_v4_compressor_state",
+            side_effect=fake_save_state,
+        ), patch.object(
+            deepseek_v4_model,
+            "deepseek_v4_csa_compress_kv_cache_insert",
+            side_effect=fake_compressed_insert,
+        ):
+            DeepseekV4Compressor.forward(
+                self_obj,
+                hidden_states=torch.zeros((2, 1)),
+                positions=torch.tensor([3, 7], dtype=torch.int64),
+                ctx=ctx,
+                out_cache_loc=torch.zeros(2, dtype=torch.int64),
+                layer_index=0,
+                cos_sin_cache=torch.empty((1, 1)),
+                compressor_slot_cache={},
+                kv_score=torch.zeros((2, 2)),
+            )
+
+        self.assertTrue(torch.equal(captured["state_slots"], torch.tensor([-1, 7])))
+        self.assertTrue(
+            torch.equal(captured["compressed_slots"], torch.tensor([-1, -1]))
+        )
+        self.assertIs(captured["compressed_cache"], compressed_cache)
 
     def test_deepseek_v4_indexer_prefill_request_chunks_match_reference(self):
         chunks = _deepseek_v4_indexer_prefill_request_chunks(

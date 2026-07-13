@@ -28,11 +28,12 @@
 
 namespace tokenspeed {
 
-// One attention group: spec + index-derived group_id + the manager that runs it.
+// One attention group: scheduling spec, stable device-pool binding, and policy manager.
+// BlockPoolSet owns the pool; CacheGroup only observes it for the coordinator lifetime.
 class CacheGroup {
 public:
-    CacheGroup(KvCacheSpec spec, std::uint32_t group_id, std::unique_ptr<KvCacheManager> manager)
-        : spec_{spec}, group_id_{group_id}, manager_{std::move(manager)} {}
+    CacheGroup(KvCacheSpec spec, std::uint32_t group_id, std::unique_ptr<KvCacheManager> manager, BlockPool& pool)
+        : spec_{spec}, group_id_{group_id}, pool_{&pool}, pool_index_{spec.pool_index}, manager_{std::move(manager)} {}
 
     CacheGroup(const CacheGroup&) = delete;
     CacheGroup& operator=(const CacheGroup&) = delete;
@@ -43,10 +44,15 @@ public:
     const KvCacheManager& Manager() const { return *manager_; }
     const KvCacheSpec& Spec() const { return spec_; }
     std::uint32_t GroupId() const { return group_id_; }
+    BlockPool& Pool() { return *pool_; }
+    const BlockPool& Pool() const { return *pool_; }
+    PoolIndex PoolIndexValue() const { return pool_index_; }
 
 private:
     KvCacheSpec spec_;
     std::uint32_t group_id_;
+    BlockPool* pool_;
+    PoolIndex pool_index_;
     std::unique_ptr<KvCacheManager> manager_;
 };
 

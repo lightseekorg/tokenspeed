@@ -21,7 +21,9 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
+#include <exception>
 #include <memory>
 #include <set>
 #include <span>
@@ -29,12 +31,18 @@
 #include <vector>
 
 #include "cache/block_pool.h"
+#include "cache/block_pool_set.h"
 #include "cache/cache_group.h"
 #include "cache/kv_cache_coordinator.h"
 #include "cache/cache_types.h"
 #include "cache/full_attn_manager.h"
 #include "cache/swa_manager.h"
 #include "scheduler/page_hasher.h"
+
+#if TOKENSPEED_FLAT_KVCACHE
+#include "fsm/forward_events.h"
+#include "resource/allocator/req_pool_allocator.h"
+#endif
 
 namespace tokenspeed::test {
 namespace {
@@ -83,10 +91,102 @@ void ExpectSwaWindowIntact(const PrefixMatch& m, std::int32_t window, std::int32
 TEST(CacheGroupTest, HoldsSpecGroupIdManager) {
     BlockPool pool(8);
     auto mgr = std::make_unique<FullAttnManager>(4);
-    CacheGroup g(KvCacheSpec{AttnKind::kFull, 4, 0}, /*group_id=*/0, std::move(mgr));
+    CacheGroup g(KvCacheSpec{AttnKind::kFull, 4, 0}, /*group_id=*/0, std::move(mgr), pool);
     EXPECT_EQ(g.GroupId(), 0u);
     EXPECT_EQ(g.Spec().block_size, 4);
     EXPECT_EQ(g.Spec().kind, AttnKind::kFull);
+    EXPECT_EQ(g.PoolIndexValue(), 0u);
+    EXPECT_EQ(&g.Pool(), &pool);
+}
+
+TEST(BlockPoolPreparedBindingsTest, LargeBatchCommitsWithoutPerBindingLookupScan) {
+    constexpr std::int32_t kBindingCount = 512;
+    BlockPool pool(/*total_num_blocks=*/kBindingCount + 1);
+    std::vector<CacheBlock*> blocks = pool.AllocateBlocks(kBindingCount);
+    ASSERT_EQ(blocks.size(), static_cast<std::size_t>(kBindingCount));
+    std::vector<BlockPool::CacheBinding> bindings;
+    bindings.reserve(blocks.size());
+    for (std::size_t i = 0; i < blocks.size(); ++i) {
+        bindings.push_back(BlockPool::CacheBinding{
+            .block = blocks[i],
+            .block_hash = "prepared-large-" + std::to_string(i),
+        });
+    }
+
+    auto prepared = pool.PrepareCacheBindings(std::move(bindings));
+    EXPECT_EQ(pool.NumCacheHashKeys(), blocks.size());
+    EXPECT_EQ(pool.NumCacheBindings(), 0);
+    prepared.Commit();
+
+    EXPECT_EQ(pool.NumCacheBindings(), kBindingCount);
+    for (CacheBlock* block : blocks) {
+        EXPECT_TRUE(block->IsCached());
+    }
+    pool.FreeBlocks(blocks);
+}
+
+TEST(BlockPoolPreparedBindingsTest, RollbackErasesEveryNewEmptyHashBucket) {
+    constexpr std::int32_t kBindingCount = 128;
+    BlockPool pool(/*total_num_blocks=*/kBindingCount + 1);
+    std::vector<CacheBlock*> blocks = pool.AllocateBlocks(kBindingCount);
+    ASSERT_EQ(blocks.size(), static_cast<std::size_t>(kBindingCount));
+
+    for (std::int32_t round = 0; round < 4; ++round) {
+        std::vector<BlockPool::CacheBinding> bindings;
+        bindings.reserve(blocks.size());
+        for (std::size_t i = 0; i < blocks.size(); ++i) {
+            bindings.push_back(BlockPool::CacheBinding{
+                .block = blocks[i],
+                .block_hash = "rollback-" + std::to_string(round) + "-" + std::to_string(i),
+            });
+        }
+        {
+            auto prepared = pool.PrepareCacheBindings(std::move(bindings));
+            EXPECT_EQ(pool.NumCacheHashKeys(), blocks.size());
+        }
+        EXPECT_EQ(pool.NumCacheHashKeys(), 0u);
+        EXPECT_EQ(pool.NumCacheBindings(), 0);
+    }
+    pool.FreeBlocks(blocks);
+}
+
+TEST(BlockPoolPreparedBindingsTest, RollbackFindsNewBucketsByHashAndPreservesExistingBucket) {
+    BlockPool pool(/*total_num_blocks=*/4);
+    std::vector<CacheBlock*> blocks = pool.AllocateBlocks(3);
+    ASSERT_EQ(blocks.size(), 3u);
+    pool.CacheFullBlock(blocks[0], "existing-hash");
+
+    {
+        auto prepared = pool.PrepareCacheBindings({
+            BlockPool::CacheBinding{.block = blocks[1], .block_hash = "existing-hash"},
+            BlockPool::CacheBinding{.block = blocks[2], .block_hash = "new-hash"},
+        });
+        EXPECT_EQ(pool.NumCacheHashKeys(), 2u);
+    }
+
+    EXPECT_EQ(pool.NumCacheHashKeys(), 1u);
+    EXPECT_EQ(pool.NumCacheBindings(), 1);
+    EXPECT_EQ(pool.GetCachedBlock("existing-hash"), blocks[0]);
+    EXPECT_EQ(pool.GetCachedBlock("new-hash"), nullptr);
+    EXPECT_FALSE(blocks[1]->IsCached());
+    EXPECT_FALSE(blocks[2]->IsCached());
+    pool.FreeBlocks(blocks);
+}
+
+TEST(BlockPoolPreparedBindingsTest, InterveningPoolMutationFailsStop) {
+    EXPECT_EXIT(
+        {
+            BlockPool pool(/*total_num_blocks=*/3);
+            std::vector<CacheBlock*> blocks = pool.AllocateBlocks(2);
+            auto prepared = pool.PrepareCacheBindings({BlockPool::CacheBinding{
+                .block = blocks[0],
+                .block_hash = "epoch-guard",
+            }});
+            std::set_terminate([] { std::_Exit(89); });
+            pool.TouchBlock(blocks[1]);
+            prepared.Commit();
+        },
+        ::testing::ExitedWithCode(89), "");
 }
 
 TEST(MakeCoordinatorTest, BuildsOneGroupPerSpec) {
@@ -99,14 +199,33 @@ TEST(MakeCoordinatorTest, BuildsOneGroupPerSpec) {
     EXPECT_EQ(coord.NumGroups(), 2);
 }
 
+TEST(KvCacheCoordinatorFreeTest, IsNoexceptAndPreservesTailFirstRecyclingOrder) {
+    BlockPool pool(/*total_num_blocks=*/4);  // three usable blocks
+    std::vector<KvCacheSpec> specs = {{AttnKind::kFull, 1, 0}};
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, pool);
+    std::vector<BlockTable> tables(static_cast<std::size_t>(coordinator.NumGroups()));
+    ASSERT_TRUE(coordinator.Acquire(tables, /*num_tokens=*/3));
+    static_assert(
+        noexcept(std::declval<KvCacheCoordinator&>().Free(std::declval<std::span<BlockTable>>())));
+
+    coordinator.Free(tables);
+    std::vector<CacheBlock*> recycled = pool.AllocateBlocks(3);
+    ASSERT_EQ(recycled.size(), 3u);
+    EXPECT_EQ(recycled[0]->BlockId(), 3);
+    EXPECT_EQ(recycled[1]->BlockId(), 2);
+    EXPECT_EQ(recycled[2]->BlockId(), 1);
+    pool.FreeBlocks(recycled);
+}
+
 TEST(MakeCoordinatorTest, AcceptsDivisibleBlockSizesAndFoldsGcdLcm) {
     BlockPool pool(16);
     std::vector<KvCacheSpec> specs = {
-        {AttnKind::kFull, 4, 0}, {AttnKind::kSlidingWindow, 8, 10},  // per-group block_size (multiple of base)
+        {AttnKind::kFull, 4, 0},
+        {AttnKind::kSlidingWindow, 8, 10},  // per-group block_size (multiple of base)
     };
     KvCacheCoordinator coord = MakeCoordinator(specs, pool);
     EXPECT_EQ(coord.BaseBlockSize(), 4);  // gcd(4,8)
-    EXPECT_EQ(coord.LcmBlockSize(), 8);   // lcm(4,8)
+    EXPECT_EQ(coord.HistoryAlignmentTokens(), 8);  // history lcm(4,8)
 }
 
 TEST(CoordinatorMatchTest, BothGroupsAllMiss) {
@@ -241,6 +360,87 @@ TEST(CoordinatorAllocTest, ClaimsCommonPrefixThenAllocatesRemainder) {
     EXPECT_EQ(tables[0].NumBlocks(), 2);  // 1 claimed + 1 allocated
     EXPECT_EQ(tables[1].NumBlocks(), 2);
 }
+
+TEST(CoordinatorPreparedPrefixTest, CommitsClaimAndFreshTailAsOneOwnedResult) {
+    BlockPool pool(16);
+    std::vector<KvCacheSpec> specs = {{AttnKind::kFull, 4, 0}};
+    KvCacheCoordinator coord = MakeCoordinator(specs, pool);
+    std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
+    CacheForGroup(pool, hashes[0], /*group_id=*/0);
+
+    KvCacheCoordinator::PreparedPrefix prepared = coord.PreparePrefix(hashes);
+    ASSERT_EQ(prepared.HitTokens(), 4);
+    ASSERT_EQ(prepared.ClaimDemand(), (PoolDemand{1}));
+
+    std::optional<KvCacheCoordinator::CommittedPrefix> committed =
+        coord.CommitPreparedPrefix(std::move(prepared), /*num_tokens=*/4);
+
+    ASSERT_TRUE(committed.has_value());
+    ASSERT_EQ(committed->hit_tokens, 4);
+    ASSERT_EQ(committed->tables.size(), 1u);
+    EXPECT_EQ(committed->tables[0].NumBlocks(), 2);
+    coord.Free(committed->tables);
+    EXPECT_EQ(pool.NumFreeBlocks(), pool.TotalBlocks() - 1);
+}
+
+TEST(CoordinatorPreparedPrefixTest, AnyInterveningPoolMutationRejectsBeforeCommit) {
+    BlockPool pool(16);
+    std::vector<KvCacheSpec> specs = {{AttnKind::kFull, 4, 0}};
+    KvCacheCoordinator coord = MakeCoordinator(specs, pool);
+    std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}});
+    CacheForGroup(pool, hashes[0], /*group_id=*/0);
+
+    KvCacheCoordinator::PreparedPrefix prepared = coord.PreparePrefix(hashes);
+    const std::uint64_t prepared_epoch = pool.MutationEpoch();
+    std::vector<CacheBlock*> unrelated = pool.AllocateBlocks(1);
+    pool.FreeBlocks(unrelated);
+    ASSERT_GT(pool.MutationEpoch(), prepared_epoch);
+    const std::int32_t free_before_commit = pool.NumFreeBlocks();
+
+    std::optional<KvCacheCoordinator::CommittedPrefix> committed =
+        coord.CommitPreparedPrefix(std::move(prepared), /*num_tokens=*/4);
+
+    EXPECT_FALSE(committed.has_value());
+    EXPECT_EQ(pool.NumFreeBlocks(), free_before_commit);
+    EXPECT_EQ(pool.NumPinnedCachedBlocks(), 0);
+}
+
+#if TOKENSPEED_FLAT_KVCACHE
+TEST(CoordinatorPreparedPrefixTest, AbandonedCommittedEventRollsBackSlotPagesAndReservation) {
+    BlockPool pool(8);
+    std::vector<KvCacheSpec> specs = {{AttnKind::kFull, 4, 0}};
+    KvCacheCoordinator coord = MakeCoordinator(specs, pool);
+    ReqPoolAllocator req_pool(1);
+    const std::int32_t free_baseline = pool.NumFreeBlocks();
+    const std::int32_t slots_baseline = req_pool.AvailableSlots();
+
+    KvCacheCoordinator::PreparedPrefix prepared = coord.PreparePrefix({});
+    std::optional<KvCacheCoordinator::CommittedPrefix> committed =
+        coord.CommitPreparedPrefix(std::move(prepared), /*num_tokens=*/4);
+    ASSERT_TRUE(committed.has_value());
+    ASSERT_LT(pool.NumFreeBlocks(), free_baseline);
+
+    FlatReservationLedger reservations(/*pool_count=*/1);
+    ASSERT_TRUE(reservations.Prepare("r"));
+    reservations.SetPrepared("r", PoolDemand{1});
+    {
+        fsm::FlatCommittedAdmission admission{std::make_unique<ReqPoolIndex>(req_pool.Allocate()),
+                                              std::move(committed->tables),
+                                              committed->hit_tokens,
+                                              pool.MutationDomain(),
+                                              &reservations,
+                                              "r"};
+        fsm::ScheduleFlatPrefillFirstChunkEvent abandoned{/*tokens_this_round=*/4,
+                                                          /*decode_input_tokens=*/0, Role::kFused,
+                                                          std::move(admission)};
+    }
+
+    EXPECT_EQ(pool.NumFreeBlocks(), free_baseline);
+    EXPECT_EQ(req_pool.AvailableSlots(), slots_baseline);
+    EXPECT_TRUE(reservations.Empty());
+    EXPECT_EQ(reservations.Total(), (PoolDemand{0}));
+}
+#endif
 
 TEST(CoordinatorAllocTest, CrossGroupShortfallAllocatesNothing) {
     BlockPool pool(5);  // 4 usable after null reservation
@@ -1453,7 +1653,7 @@ TEST(HeteroFoldedMatchTest, CoarseCoversMoreThanFineAlignsBoundaryToLcm) {
     std::vector<KvCacheSpec> specs = {{AttnKind::kFull, 8, 0}, {AttnKind::kFull, 4, 0}};
     KvCacheCoordinator coord = MakeCoordinator(specs, pool);
     ASSERT_EQ(coord.BaseBlockSize(), 4);
-    ASSERT_EQ(coord.LcmBlockSize(), 8);
+    ASSERT_EQ(coord.HistoryAlignmentTokens(), 8);
 
     // group0 (bs 8) caches both coarse blocks (16 tokens); group1 (bs 4) caches blocks 0..2 (12).
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}});
@@ -1478,7 +1678,7 @@ TEST(HeteroFoldedMatchTest, CoarseWindowGroupRematchesUnderAlignedBound) {
     BlockPool pool(64, true);
     std::vector<KvCacheSpec> specs = {{AttnKind::kSlidingWindow, 8, 8}, {AttnKind::kSlidingWindow, 4, 4}};
     KvCacheCoordinator coord = MakeCoordinator(specs, pool);
-    ASSERT_EQ(coord.LcmBlockSize(), 8);
+    ASSERT_EQ(coord.HistoryAlignmentTokens(), 8);
 
     // group0 (coarse swa) caches 16 tokens; group1 (fine swa) caches 12 -> aligned bound 8.
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}});
@@ -1580,6 +1780,311 @@ TEST(HeteroFoldedRegistrationTest, FullCycleRestoresPoolBaseline) {
     coord.Free(tables);
     // Cached-but-free blocks stay in the free list (evictable), so the count returns to baseline.
     EXPECT_EQ(pool.NumFreeBlocks(), free_before);
+}
+
+TEST(HeterogeneousPoolCoordinatorTest, DemandAndAllocationUseCanonicalPoolIndices) {
+    BlockPoolSet pools({
+        FlatBlockPoolConfig{.pool_id = "history", .total_blocks = 4, .bytes_per_block = 128},
+        FlatBlockPoolConfig{.pool_id = "state", .total_blocks = 4, .bytes_per_block = 32},
+    });
+    const PoolIndex history = pools.IndexOf("history");
+    const PoolIndex state = pools.IndexOf("state");
+    std::vector<KvCacheSpec> specs = {
+        KvCacheSpec{AttnKind::kFull, 4, 0, history},
+        KvCacheSpec{AttnKind::kFull, 4, 0, state},
+    };
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, pools);
+
+    EXPECT_EQ(coordinator.BlocksNeededByPool(/*num_tokens=*/4), (PoolDemand{1, 1}));
+    EXPECT_EQ(coordinator.BlocksNeededFor(/*num_tokens=*/4), 2);
+
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    ASSERT_TRUE(coordinator.Acquire(tables, /*num_tokens=*/4));
+    ASSERT_EQ(tables[0].NumBlocks(), 1);
+    ASSERT_EQ(tables[1].NumBlocks(), 1);
+    CacheBlock* history_block = *tables[0].Blocks().begin();
+    CacheBlock* state_block = *tables[1].Blocks().begin();
+    EXPECT_EQ(history_block->BlockId(), 1);
+    EXPECT_EQ(state_block->BlockId(), 1);
+    EXPECT_NE(history_block, state_block);
+
+    EXPECT_EQ(coordinator.BlocksNeededByPool(tables, /*num_tokens=*/4), (PoolDemand{1, 1}));
+    coordinator.Free(tables);
+}
+
+TEST(HeterogeneousPoolCoordinatorTest, ShortPoolMakesCrossPoolAcquireAtomic) {
+    BlockPoolSet pools({
+        FlatBlockPoolConfig{.pool_id = "history", .total_blocks = 4, .bytes_per_block = 128},
+        FlatBlockPoolConfig{.pool_id = "state", .total_blocks = 2, .bytes_per_block = 32},
+    });
+    std::vector<KvCacheSpec> specs = {
+        KvCacheSpec{AttnKind::kFull, 4, 0, pools.IndexOf("history")},
+        KvCacheSpec{AttnKind::kFull, 4, 0, pools.IndexOf("state")},
+    };
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, pools);
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    const PoolDemand free_before = pools.FreeBlocks();
+
+    EXPECT_EQ(coordinator.BlocksNeededByPool(tables, /*num_tokens=*/8), (PoolDemand{2, 2}));
+    EXPECT_FALSE(coordinator.Acquire(tables, /*num_tokens=*/8));
+    EXPECT_EQ(tables[0].NumBlocks(), 0);
+    EXPECT_EQ(tables[1].NumBlocks(), 0);
+    EXPECT_EQ(pools.FreeBlocks(), free_before);
+}
+
+TEST(HeterogeneousPoolCoordinatorTest, PrefixClaimAndFreeReturnEveryPoolToBaseline) {
+    BlockPoolSet pools({
+        FlatBlockPoolConfig{.pool_id = "history", .total_blocks = 4, .bytes_per_block = 128},
+        FlatBlockPoolConfig{.pool_id = "state", .total_blocks = 4, .bytes_per_block = 32},
+    });
+    std::vector<KvCacheSpec> specs = {
+        KvCacheSpec{AttnKind::kFull, 4, 0, pools.IndexOf("history")},
+        KvCacheSpec{AttnKind::kFull, 4, 0, pools.IndexOf("state")},
+    };
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, pools);
+    const PoolDemand baseline = pools.FreeBlocks();
+    std::vector<BlockTable> producer(coordinator.NumGroups());
+    ASSERT_TRUE(coordinator.Acquire(producer, /*num_tokens=*/4));
+    const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}});
+    coordinator.CacheFullBlocks(producer, hashes, /*first_slot=*/0, /*end_tokens=*/4);
+    coordinator.Free(producer);
+    EXPECT_EQ(pools.FreeBlocks(), baseline);
+
+    const CoordinatorMatch hit = coordinator.MatchPrefix(hashes).device;
+    ASSERT_EQ(hit.num_common_tokens, 4);
+    EXPECT_EQ(coordinator.BlocksConsumedByClaimByPool(hit), (PoolDemand{1, 1}));
+
+    std::vector<BlockTable> consumer(coordinator.NumGroups());
+    coordinator.ClaimCommonPrefix(consumer, hit);
+    EXPECT_EQ(pools.FreeBlocks(), (PoolDemand{baseline[0] - 1, baseline[1] - 1}));
+    coordinator.Free(consumer);
+    EXPECT_EQ(pools.FreeBlocks(), baseline);
+}
+
+TEST(HeterogeneousPoolCoordinatorTest, FreeReliefCountsOnlyCapacityMadeImmediatelyReusable) {
+    BlockPoolSet pools({
+        FlatBlockPoolConfig{.pool_id = "history", .total_blocks = 4, .bytes_per_block = 128},
+        FlatBlockPoolConfig{.pool_id = "state", .total_blocks = 4, .bytes_per_block = 32},
+    });
+    std::vector<KvCacheSpec> specs = {
+        KvCacheSpec{AttnKind::kFull, 4, 0, pools.IndexOf("history")},
+        KvCacheSpec{AttnKind::kFull, 4, 0, pools.IndexOf("state")},
+    };
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, pools);
+    std::vector<BlockTable> producer(coordinator.NumGroups());
+    ASSERT_TRUE(coordinator.Acquire(producer, /*num_tokens=*/4));
+    EXPECT_EQ(coordinator.BlocksReleasedByFreeByPool(producer), (PoolDemand{1, 1}));
+
+    const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}});
+    coordinator.CacheFullBlocks(producer, hashes, /*first_slot=*/0, /*end_tokens=*/4);
+    const CoordinatorMatch hit = coordinator.MatchPrefix(hashes).device;
+    std::vector<BlockTable> consumer(coordinator.NumGroups());
+    coordinator.ClaimCommonPrefix(consumer, hit);
+
+    // Either request dropping its shared refs leaves refcount one, so neither
+    // page becomes free yet and neither can relieve a bottleneck by itself.
+    EXPECT_EQ(coordinator.BlocksReleasedByFreeByPool(producer), (PoolDemand{0, 0}));
+    EXPECT_EQ(coordinator.BlocksReleasedByFreeByPool(consumer), (PoolDemand{0, 0}));
+
+    coordinator.Free(consumer);
+    EXPECT_EQ(coordinator.BlocksReleasedByFreeByPool(producer), (PoolDemand{1, 1}));
+    coordinator.Free(producer);
+    EXPECT_EQ(pools.FreeBlocks(), pools.TotalUsableBlocks());
+}
+
+TEST(HeterogeneousPoolCoordinatorTest, ReclaimExpiredUsesTheGroupsOwnPool) {
+    BlockPoolSet pools({
+        FlatBlockPoolConfig{.pool_id = "history", .total_blocks = 5, .bytes_per_block = 128},
+        FlatBlockPoolConfig{.pool_id = "state", .total_blocks = 5, .bytes_per_block = 32},
+    });
+    const PoolIndex history = pools.IndexOf("history");
+    const PoolIndex state = pools.IndexOf("state");
+    std::vector<KvCacheSpec> specs = {
+        KvCacheSpec{AttnKind::kFull, 2, 0, history},
+        KvCacheSpec{AttnKind::kSlidingWindow, 2, 4, state},
+    };
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, pools);
+    const PoolDemand baseline = pools.FreeBlocks();
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    ASSERT_TRUE(coordinator.Acquire(tables, /*num_tokens=*/6));
+
+    coordinator.ReclaimExpired(tables, /*num_computed_tokens=*/5);
+
+    EXPECT_FALSE(tables[0].Blocks()[0]->IsNull());
+    EXPECT_EQ(tables[1].Blocks()[0], pools.Pool(state).NullBlock());
+    EXPECT_NE(tables[1].Blocks()[0], pools.Pool(history).NullBlock());
+    EXPECT_EQ(pools.FreeBlocks(), (PoolDemand{baseline[0] - 3, baseline[1] - 2}));
+
+    coordinator.Free(tables);
+    EXPECT_EQ(pools.FreeBlocks(), baseline);
+}
+
+TEST(HeterogeneousPoolCoordinatorTest, RejectsInvalidPoolIndexAndSharedHostTier) {
+    BlockPoolSet pools({
+        FlatBlockPoolConfig{.pool_id = "history", .total_blocks = 4, .bytes_per_block = 128},
+        FlatBlockPoolConfig{.pool_id = "state", .total_blocks = 4, .bytes_per_block = 32},
+    });
+    BlockPool host_pool(8);
+    std::vector<KvCacheSpec> invalid = {
+        KvCacheSpec{AttnKind::kFull, 4, 0, pools.Size()},
+    };
+    EXPECT_THROW(MakeCoordinator(invalid, pools), std::out_of_range);
+
+    std::vector<KvCacheSpec> heterogeneous = {
+        KvCacheSpec{AttnKind::kFull, 4, 0, pools.IndexOf("history")},
+        KvCacheSpec{AttnKind::kFull, 4, 0, pools.IndexOf("state")},
+    };
+    EXPECT_THROW(MakeCoordinator(heterogeneous, pools, &host_pool), std::invalid_argument);
+}
+
+TEST(V4ContinuationPrefixTest, DeepestHistoryRequiresExactTerminalContinuationBundle) {
+    BlockPool pool(/*total_num_blocks=*/32);
+    std::vector<KvCacheSpec> specs = {
+        KvCacheSpec{.kind = AttnKind::kFull,
+                    .block_size = 4,
+                    .sliding_window = 0,
+                    .prefix_role = KvPrefixRole::kHistoryAnchor,
+                    .table_layout = KvTableLayout::kAbsolute},
+        KvCacheSpec{.kind = AttnKind::kSlidingWindow,
+                    .block_size = 4,
+                    .sliding_window = 8,
+                    .prefix_role = KvPrefixRole::kContinuationState,
+                    .table_layout = KvTableLayout::kBoundedWindow},
+    };
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, pool);
+    const std::vector<std::string> hashes = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}});
+    for (const std::string& hash : hashes) {
+        CacheForGroup(pool, hash, /*group_id=*/0);
+    }
+    CacheForGroup(pool, hashes[2], /*group_id=*/1);
+    CacheForGroup(pool, hashes[3], /*group_id=*/1);
+
+    const CoordinatorMatch hit = coordinator.MatchPrefix(hashes).device;
+    ASSERT_EQ(hit.num_common_tokens, 16);
+    ASSERT_EQ(hit.per_group.size(), 2u);
+    EXPECT_EQ(hit.per_group[0].base_logical_page, 0);
+    EXPECT_EQ(hit.per_group[0].blocks.size(), 4u);
+    EXPECT_EQ(hit.per_group[1].base_logical_page, 2);
+    ASSERT_EQ(hit.per_group[1].blocks.size(), 2u);
+    EXPECT_FALSE(hit.per_group[1].blocks[0]->IsNull());
+    EXPECT_FALSE(hit.per_group[1].blocks[1]->IsNull());
+
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    coordinator.ClaimCommonPrefix(tables, hit);
+    EXPECT_EQ(tables[0].BaseLogicalPage(), 0);
+    EXPECT_EQ(tables[0].LogicalEnd(), 4);
+    EXPECT_EQ(tables[1].BaseLogicalPage(), 2);
+    EXPECT_EQ(tables[1].LogicalEnd(), 4);
+    coordinator.Free(tables);
+
+    KvCacheCoordinator::PreparedPrefix prepared = coordinator.PreparePrefix(hashes);
+    std::optional<KvCacheCoordinator::CommittedPrefix> committed =
+        coordinator.CommitPreparedPrefix(std::move(prepared), /*num_tokens=*/4);
+    ASSERT_TRUE(committed.has_value());
+    ASSERT_EQ(committed->hit_tokens, 16);
+    EXPECT_EQ(committed->tables[0].BaseLogicalPage(), 0);
+    EXPECT_EQ(committed->tables[0].LogicalEnd(), 5);
+    EXPECT_EQ(committed->tables[1].BaseLogicalPage(), 2);
+    EXPECT_EQ(committed->tables[1].LogicalEnd(), 5);
+    coordinator.Free(committed->tables);
+}
+
+TEST(V4ContinuationPrefixTest, PublicationSkipsExpiredCompactColumnsAndRemainsExactlyMatchable) {
+    BlockPool pool(/*total_num_blocks=*/32);
+    std::vector<KvCacheSpec> specs = {
+        KvCacheSpec{
+            .kind = AttnKind::kFull, .block_size = 4, .sliding_window = 0, .prefix_role = KvPrefixRole::kHistoryAnchor},
+        KvCacheSpec{.kind = AttnKind::kSlidingWindow,
+                    .block_size = 4,
+                    .sliding_window = 8,
+                    .prefix_role = KvPrefixRole::kContinuationState,
+                    .table_layout = KvTableLayout::kBoundedWindow},
+    };
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, pool);
+    std::vector<BlockTable> producer(coordinator.NumGroups());
+    ASSERT_TRUE(coordinator.Acquire(producer, /*num_tokens=*/16));
+    coordinator.ReclaimExpired(producer, /*num_computed_tokens=*/16);
+    ASSERT_EQ(producer[0].BaseLogicalPage(), 0);
+    ASSERT_EQ(producer[1].BaseLogicalPage(), 2);
+
+    const std::vector<std::string> hashes = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}});
+    EXPECT_NO_THROW(coordinator.CacheFullBlocks(producer, hashes, /*first_slot=*/0, /*end_tokens=*/16));
+    coordinator.Free(producer);
+
+    const CoordinatorMatch hit = coordinator.MatchPrefix(hashes).device;
+    EXPECT_EQ(hit.num_common_tokens, 16);
+    EXPECT_EQ(hit.per_group[1].base_logical_page, 2);
+    EXPECT_EQ(hit.per_group[1].blocks.size(), 2u);
+}
+
+TEST(V4ContinuationPrefixTest, MissingDeepestContinuationFallsBackToRootNotShallowerSnapshot) {
+    BlockPool pool(/*total_num_blocks=*/32);
+    std::vector<KvCacheSpec> specs = {
+        KvCacheSpec{
+            .kind = AttnKind::kFull, .block_size = 4, .sliding_window = 0, .prefix_role = KvPrefixRole::kHistoryAnchor},
+        KvCacheSpec{.kind = AttnKind::kSlidingWindow,
+                    .block_size = 4,
+                    .sliding_window = 8,
+                    .prefix_role = KvPrefixRole::kContinuationState,
+                    .table_layout = KvTableLayout::kBoundedWindow},
+    };
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, pool);
+    const std::vector<std::string> hashes = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}});
+    for (const std::string& hash : hashes) {
+        CacheForGroup(pool, hash, /*group_id=*/0);
+    }
+    // Boundary 12 would be resumable from pages [1, 3), but the deepest
+    // history boundary 16 additionally needs page 3. Exact continuation must
+    // reject the whole hit instead of silently searching left.
+    CacheForGroup(pool, hashes[1], /*group_id=*/1);
+    CacheForGroup(pool, hashes[2], /*group_id=*/1);
+
+    const CoordinatorMatch miss = coordinator.MatchPrefix(hashes).device;
+    EXPECT_EQ(miss.num_common_tokens, 0);
+    ASSERT_EQ(miss.per_group.size(), 2u);
+    EXPECT_TRUE(miss.per_group[0].blocks.empty());
+    EXPECT_TRUE(miss.per_group[1].blocks.empty());
+}
+
+TEST(V4ContinuationPrefixTest, NonParticipatingGroupDoesNotConstrainHistoryBoundary) {
+    BlockPool pool(/*total_num_blocks=*/24);
+    std::vector<KvCacheSpec> specs = {
+        KvCacheSpec{
+            .kind = AttnKind::kFull, .block_size = 4, .sliding_window = 0, .prefix_role = KvPrefixRole::kHistoryAnchor},
+        KvCacheSpec{.kind = AttnKind::kFull, .block_size = 4, .sliding_window = 0, .prefix_role = KvPrefixRole::kNone},
+    };
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, pool);
+    const std::vector<std::string> hashes = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}});
+    CacheForGroup(pool, hashes[0], /*group_id=*/0);
+    CacheForGroup(pool, hashes[1], /*group_id=*/0);
+
+    const CoordinatorMatch hit = coordinator.MatchPrefix(hashes).device;
+    EXPECT_EQ(hit.num_common_tokens, 8);
+    EXPECT_EQ(hit.per_group[0].blocks.size(), 2u);
+    EXPECT_TRUE(hit.per_group[1].blocks.empty());
+}
+
+TEST(V4ContinuationPrefixTest, RejectsContinuationWithoutAlignedHistoryAnchor) {
+    BlockPool pool(/*total_num_blocks=*/16);
+    std::vector<KvCacheSpec> no_history = {
+        KvCacheSpec{.kind = AttnKind::kSlidingWindow,
+                    .block_size = 4,
+                    .sliding_window = 8,
+                    .prefix_role = KvPrefixRole::kContinuationState,
+                    .table_layout = KvTableLayout::kBoundedWindow},
+    };
+    EXPECT_THROW(MakeCoordinator(no_history, pool), std::invalid_argument);
+
+    std::vector<KvCacheSpec> misaligned = {
+        KvCacheSpec{
+            .kind = AttnKind::kFull, .block_size = 6, .sliding_window = 0, .prefix_role = KvPrefixRole::kHistoryAnchor},
+        KvCacheSpec{.kind = AttnKind::kSlidingWindow,
+                    .block_size = 4,
+                    .sliding_window = 8,
+                    .prefix_role = KvPrefixRole::kContinuationState,
+                    .table_layout = KvTableLayout::kBoundedWindow},
+    };
+    EXPECT_THROW(MakeCoordinator(misaligned, pool), std::invalid_argument);
 }
 
 }  // namespace

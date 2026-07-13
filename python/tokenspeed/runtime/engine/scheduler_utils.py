@@ -23,21 +23,31 @@
 import math
 import os
 from collections.abc import Mapping, Sequence
-from typing import Any
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
 from tokenspeed_scheduler import (
     Cache,
     ExecutionEvent,
+    FlatBlockPoolConfig,
     ForwardEvent,
     PagedCacheGroupConfig,
     PagedCacheGroupFamily,
+    PagedCachePrefixRole,
     PagedCacheRetention,
+    PagedCacheTableLayout,
     PrefixCacheAdjunctSpec,
     RequestSpec,
     SchedulerConfig,
 )
+
+from tokenspeed.runtime.configs.paged_cache_spec import require_flat_table_cols
+
+if TYPE_CHECKING:
+    from tokenspeed.runtime.configs.flat_memory_plan import V4FlatMemoryPlan
+    from tokenspeed.runtime.execution.types import FlatKVCompletion
 
 _CACHE_EVENT_TYPES = {
     "WriteBackDoneEvent": Cache.WriteBackDoneEvent,
@@ -59,6 +69,15 @@ _RETENTION_MAP = {
 _FAMILY_MAP = {
     "history": PagedCacheGroupFamily.History,
     "state": PagedCacheGroupFamily.State,
+}
+_PREFIX_ROLE_MAP = {
+    "history_anchor": PagedCachePrefixRole.HistoryAnchor,
+    "continuation_state": PagedCachePrefixRole.ContinuationState,
+    "none": PagedCachePrefixRole.None_,
+}
+_TABLE_LAYOUT_MAP = {
+    "absolute": PagedCacheTableLayout.Absolute,
+    "bounded_window": PagedCacheTableLayout.BoundedWindow,
 }
 
 
@@ -98,9 +117,16 @@ def make_config(
     enable_mamba_l2: bool = False,
     mamba_l2_host_slots: int = 0,
     paged_cache_groups: Sequence["PagedCacheGroupConfig"] | None = None,
+    flat_block_pools: Sequence["FlatBlockPoolConfig"] | None = None,
     enable_mixed_prefill_decode: bool = False,
+    enable_structured_flat_kv_completion: bool = False,
     prefix_cache_adjunct: "PrefixCacheAdjunctSpec | None" = None,
 ) -> SchedulerConfig:
+    if flat_block_pools and num_device_pages != 0:
+        raise ValueError(
+            "explicit flat block pools require num_device_pages=0; "
+            "per-pool total_blocks is the only device page authority"
+        )
     cfg = SchedulerConfig()
     cfg.num_device_pages = num_device_pages
     cfg.max_scheduled_tokens = max_scheduled_tokens
@@ -129,8 +155,11 @@ def make_config(
     cfg.enable_mamba_l2 = enable_mamba_l2
     cfg.mamba_l2_host_slots = mamba_l2_host_slots
     cfg.enable_mixed_prefill_decode = enable_mixed_prefill_decode
+    cfg.enable_structured_flat_kv_completion = enable_structured_flat_kv_completion
     if paged_cache_groups:
         cfg.paged_cache_groups = list(paged_cache_groups)
+    if flat_block_pools:
+        cfg.flat_block_pools = list(flat_block_pools)
     # Opt-in; unset means paged-cache groups are transport-only.
     if prefix_cache_adjunct is not None:
         cfg.prefix_cache_adjunct = prefix_cache_adjunct
@@ -138,11 +167,15 @@ def make_config(
 
 
 def pool_to_paged_cache_groups(pool: Any) -> list:
-    """Convert a KV pool's paged_cache_group_specs to scheduler configs."""
-    specs = pool.paged_cache_group_specs
+    """Convert the pool's scheduler-authoritative group union to configs."""
+    specs = getattr(pool, "scheduler_group_specs", pool.paged_cache_group_specs)
     if not specs:
         return []
-    counts = pool.paged_cache_group_page_counts
+    counts = getattr(
+        pool,
+        "scheduler_group_page_counts",
+        pool.paged_cache_group_page_counts,
+    )
     out = []
     for spec in specs:
         retention = _RETENTION_MAP.get(spec.retention)
@@ -157,6 +190,18 @@ def pool_to_paged_cache_groups(pool: Any) -> list:
                 f"pool_to_paged_cache_groups: unsupported family "
                 f"{spec.family!r} for group {spec.group_id!r}"
             )
+        prefix_role = _PREFIX_ROLE_MAP.get(spec.prefix_role)
+        if prefix_role is None:
+            raise ValueError(
+                "pool_to_paged_cache_groups: unsupported prefix_role "
+                f"{spec.prefix_role!r} for group {spec.group_id!r}"
+            )
+        table_layout = _TABLE_LAYOUT_MAP.get(spec.table_layout)
+        if table_layout is None:
+            raise ValueError(
+                "pool_to_paged_cache_groups: unsupported table_layout "
+                f"{spec.table_layout!r} for group {spec.group_id!r}"
+            )
         kwargs = dict(
             group_id=spec.group_id,
             rows_per_page=int(spec.rows_per_page),
@@ -164,6 +209,12 @@ def pool_to_paged_cache_groups(pool: Any) -> list:
             total_pages=int(counts[spec.group_id]),
             retention=retention,
             family=family,
+            block_size=int(spec.block_size_tokens),
+            pool_id=str(spec.pool_id),
+            prefix_role=prefix_role,
+            table_layout=table_layout,
+            required_producer_domain_mask=int(spec.required_producer_domain_mask),
+            owner_mask=int(spec.owner_mask),
         )
         if spec.retention == "sliding_window":
             kwargs["sliding_window_tokens"] = int(spec.sliding_window_tokens)
@@ -172,6 +223,25 @@ def pool_to_paged_cache_groups(pool: Any) -> list:
         if getattr(spec, "block_size", None):
             cfg.block_size = int(spec.block_size)
         out.append(cfg)
+    return out
+
+
+def pool_to_flat_block_pools(pool: Any) -> list:
+    """Convert a V4 arena plan's canonical physical pools for the scheduler.
+
+    Legacy/radix pools publish no ``flat_memory_plan`` and therefore preserve
+    the existing empty-list fallback to the scheduler's single default pool.
+    """
+    plan = getattr(pool, "flat_memory_plan", None)
+    if plan is None:
+        return []
+    out = []
+    for pool_plan in plan.pools:
+        config = FlatBlockPoolConfig()
+        config.pool_id = str(pool_plan.pool_id)
+        config.total_blocks = int(pool_plan.total_blocks)
+        config.bytes_per_block = int(pool_plan.bytes_per_block)
+        out.append(config)
     return out
 
 
@@ -203,12 +273,50 @@ def should_use_overlap_schedule(
     return True
 
 
+def _bind_flat_kv_completion(
+    request_id: str, completion: "FlatKVCompletion"
+) -> "ForwardEvent.FlatKVCompletion":
+    """Copy a validated runtime POD into explicit nanobind value objects."""
+    if completion.request_id != request_id:
+        raise ValueError(
+            "flat KV completion request_id differs from ExtendResult: "
+            f"{completion.request_id!r} != {request_id!r}"
+        )
+
+    bound_groups = []
+    for group in completion.groups:
+        bound_group = ForwardEvent.FlatKVGroupCompletion()
+        bound_group.group_id = group.group_id
+        bound_group.completed_domain_mask = group.completed_domain_mask
+        bound_group.domain_valid_ends = list(group.domain_valid_ends)
+        bound_groups.append(bound_group)
+
+    bound = ForwardEvent.FlatKVCompletion()
+    bound.request_id = completion.request_id
+    bound.table_generation = completion.table_generation
+    bound.dispatch_seq = completion.dispatch_seq
+    bound.accepted_raw_end = completion.accepted_raw_end
+    bound.protected_raw_end = completion.protected_raw_end
+    bound.groups = bound_groups
+    return bound
+
+
 def make_extend_result_event(
-    request_id: str, tokens: Sequence[int] = ()
+    request_id: str,
+    tokens: Sequence[int] = (),
+    *,
+    flat_kv_completion: "FlatKVCompletion | None" = None,
 ) -> "ForwardEvent.ExtendResult":
+    bound_completion = (
+        _bind_flat_kv_completion(request_id, flat_kv_completion)
+        if flat_kv_completion is not None
+        else None
+    )
     fe = ForwardEvent.ExtendResult()
     fe.request_id = request_id
     fe.tokens = list(tokens)
+    if bound_completion is not None:
+        fe.flat_kv_completion = bound_completion
     return fe
 
 
@@ -301,15 +409,423 @@ def cache_sync_debug_enabled() -> bool:
     return value.strip().lower() in _TRUTHY_ENV_VALUES
 
 
+@dataclass(slots=True)
+class _FlatBlockTableStagingSlot:
+    host_tables: dict[str, torch.Tensor]
+    host_bases: dict[str, torch.Tensor]
+    device_tables: dict[str, torch.Tensor]
+    device_bases: dict[str, torch.Tensor]
+
+
+class FlatBlockTableStagingBuffers:
+    """Persistent table/base H2D buffers for one flat memory plan.
+
+    The scheduler binding writes each rectangular C++ export directly into a
+    planned pinned host slot.  A matching persistent device slot receives the
+    active rectangle with a non-blocking copy.  Slots rotate at the plan's
+    declared forward depth, so Python neither flattens nested rows nor allocates
+    pinned/device table tensors in the per-forward hot path.
+    """
+
+    def __init__(
+        self, plan: "V4FlatMemoryPlan", *, device: "torch.device | str"
+    ) -> None:
+        self._device = torch.device(device) if isinstance(device, str) else device
+        self._depth = self._positive_plan_int(plan, "forward_buffer_depth")
+        self._max_rows = self._positive_plan_int(plan, "max_scheduled_batch_rows")
+        group_plans = tuple(getattr(plan, "group_table_plans", ()))
+        if not group_plans:
+            raise ValueError("flat table staging requires planned cache groups")
+
+        self._max_cols_by_group: dict[str, int] = {}
+        for group_plan in group_plans:
+            group_id = str(group_plan.group_id)
+            if not group_id:
+                raise ValueError("flat table staging group_id must be non-empty")
+            if group_id in self._max_cols_by_group:
+                raise ValueError(f"flat table staging has duplicate group {group_id!r}")
+            max_cols = self._positive_plan_int(group_plan, "max_export_cols")
+            self._max_cols_by_group[group_id] = max_cols
+        self._group_ids = tuple(sorted(self._max_cols_by_group))
+
+        pool_capacity_by_id: dict[str, int] = {}
+        for pool in tuple(getattr(plan, "pools", ())):
+            pool_id = str(pool.pool_id)
+            if not pool_id or pool_id in pool_capacity_by_id:
+                raise ValueError(
+                    f"flat table staging has an invalid/duplicate pool {pool_id!r}"
+                )
+            pool_capacity_by_id[pool_id] = self._positive_plan_int(pool, "total_blocks")
+        self._page_id_upper_bound_by_group: dict[str, int] = {}
+        for spec in tuple(getattr(plan, "scheduler_group_specs", ())):
+            group_id = str(spec.group_id)
+            pool_id = str(spec.pool_id)
+            if group_id in self._page_id_upper_bound_by_group:
+                raise ValueError(
+                    f"flat table staging has duplicate scheduler group {group_id!r}"
+                )
+            if pool_id not in pool_capacity_by_id:
+                raise ValueError(
+                    f"flat table staging group {group_id!r} refers to unknown "
+                    f"pool {pool_id!r}"
+                )
+            self._page_id_upper_bound_by_group[group_id] = pool_capacity_by_id[pool_id]
+        if set(self._page_id_upper_bound_by_group) != set(self._group_ids):
+            raise ValueError(
+                "flat table staging group plans and scheduler groups differ: "
+                f"tables={sorted(self._group_ids)}, "
+                f"scheduler={sorted(self._page_id_upper_bound_by_group)}"
+            )
+
+        planned_bytes = (
+            4
+            * self._depth
+            * self._max_rows
+            * sum(self._max_cols_by_group[group_id] + 1 for group_id in self._group_ids)
+        )
+        for field in ("forward_input_bytes", "cpu_forward_staging_bytes"):
+            actual = getattr(plan, field, None)
+            if isinstance(actual, bool) or not isinstance(actual, int):
+                raise ValueError(f"flat memory plan {field} must be an integer")
+            if actual != planned_bytes:
+                raise RuntimeError(
+                    f"flat table staging bytes disagree with plan {field}: "
+                    f"shape_bytes={planned_bytes}, plan={actual}"
+                )
+
+        pin_memory = self._device.type == "cuda"
+        self._slots: list[_FlatBlockTableStagingSlot] = []
+        for _ in range(self._depth):
+            host_tables = {
+                group_id: torch.full(
+                    (self._max_rows * self._max_cols_by_group[group_id],),
+                    -1,
+                    dtype=torch.int32,
+                    device="cpu",
+                    pin_memory=pin_memory,
+                )
+                for group_id in self._group_ids
+            }
+            host_bases = {
+                group_id: torch.zeros(
+                    (self._max_rows,),
+                    dtype=torch.int32,
+                    device="cpu",
+                    pin_memory=pin_memory,
+                )
+                for group_id in self._group_ids
+            }
+            device_tables = {
+                group_id: torch.empty(
+                    (self._max_rows * self._max_cols_by_group[group_id],),
+                    dtype=torch.int32,
+                    device=self._device,
+                )
+                for group_id in self._group_ids
+            }
+            device_bases = {
+                group_id: torch.empty(
+                    (self._max_rows,),
+                    dtype=torch.int32,
+                    device=self._device,
+                )
+                for group_id in self._group_ids
+            }
+            if pin_memory and not all(
+                tensor.is_pinned()
+                for tensor in (*host_tables.values(), *host_bases.values())
+            ):
+                raise RuntimeError(
+                    "flat CUDA table staging must use pinned host tensors"
+                )
+            self._slots.append(
+                _FlatBlockTableStagingSlot(
+                    host_tables=host_tables,
+                    host_bases=host_bases,
+                    device_tables=device_tables,
+                    device_bases=device_bases,
+                )
+            )
+
+        actual_host_bytes = sum(
+            self._tensor_nbytes(tensor)
+            for slot in self._slots
+            for tensor in (*slot.host_tables.values(), *slot.host_bases.values())
+        )
+        actual_device_bytes = sum(
+            self._tensor_nbytes(tensor)
+            for slot in self._slots
+            for tensor in (*slot.device_tables.values(), *slot.device_bases.values())
+        )
+        if actual_host_bytes != planned_bytes or actual_device_bytes != planned_bytes:
+            raise RuntimeError(
+                "flat table staging allocation bytes disagree with memory plan: "
+                f"host={actual_host_bytes}, device={actual_device_bytes}, "
+                f"expected_each={planned_bytes}"
+            )
+
+        self._next_slot = 0
+        self._current_slot: int | None = None
+        self._current_rows = 0
+        self._current_cols_by_group: dict[str, int] = {}
+
+    @staticmethod
+    def _positive_plan_int(owner: Any, field: str) -> int:
+        value = getattr(owner, field, None)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"flat memory plan {field} must be a positive integer")
+        return value
+
+    @staticmethod
+    def _tensor_nbytes(tensor: torch.Tensor) -> int:
+        return int(tensor.numel()) * int(tensor.element_size())
+
+    def validate_forward_op_schema(self, forward_op: Any, *, num_reqs: int) -> None:
+        """Validate the cheap group header without materializing table rows."""
+        if num_reqs == 0:
+            return
+        group_ids_fn = getattr(forward_op, "flat_block_table_group_ids", None)
+        if not callable(group_ids_fn):
+            raise RuntimeError(
+                "planned flat table staging requires a scheduler binding with "
+                "flat_block_table_group_ids()"
+            )
+        actual_list = [str(group_id) for group_id in group_ids_fn()]
+        if len(actual_list) != len(set(actual_list)):
+            raise RuntimeError("flat forward export contains duplicate group ids")
+        actual = set(actual_list)
+        expected = set(self._group_ids)
+        if actual != expected:
+            raise RuntimeError(
+                "flat forward export groups disagree with the memory plan: "
+                f"missing={sorted(expected - actual)}, "
+                f"extra={sorted(actual - expected)}"
+            )
+
+    def stage(
+        self, forward_op: Any, *, num_reqs: int
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        """Copy one forward's atomic table/base union into the next ring slot."""
+        if isinstance(num_reqs, bool) or not isinstance(num_reqs, int) or num_reqs < 0:
+            raise ValueError("flat table staging num_reqs must be an integer >= 0")
+        if num_reqs > self._max_rows:
+            raise ValueError(
+                "flat table staging row capacity exceeded: "
+                f"rows={num_reqs}, capacity={self._max_rows}"
+            )
+        self.validate_forward_op_schema(forward_op, num_reqs=num_reqs)
+
+        slot_index = self._next_slot
+        slot = self._slots[slot_index]
+        cols_by_group: dict[str, int] = {}
+        if num_reqs == 0:
+            # CUDA graph idle replay needs a real page-0 column.  The padded
+            # rows are filled in-place by pad_current_for_graph().
+            cols_by_group = {group_id: 1 for group_id in self._group_ids}
+        else:
+            copy_to = getattr(forward_op, "copy_flat_block_table_to", None)
+            if not callable(copy_to):
+                raise RuntimeError(
+                    "planned flat table staging requires a scheduler binding "
+                    "with copy_flat_block_table_to()"
+                )
+            for group_id in self._group_ids:
+                copied = copy_to(
+                    group_id,
+                    slot.host_tables[group_id],
+                    slot.host_bases[group_id],
+                    self._page_id_upper_bound_by_group[group_id],
+                )
+                if not isinstance(copied, Sequence) or len(copied) != 2:
+                    raise RuntimeError(
+                        f"flat staging copy for {group_id!r} returned an invalid header"
+                    )
+                rows, cols = copied
+                if any(
+                    isinstance(value, bool) or not isinstance(value, int)
+                    for value in (rows, cols)
+                ):
+                    raise RuntimeError(
+                        f"flat staging copy for {group_id!r} returned non-integer metadata"
+                    )
+                if rows != num_reqs:
+                    raise RuntimeError(
+                        f"flat staging copy for {group_id!r} returned {rows} "
+                        f"rows, expected {num_reqs}"
+                    )
+                capacity = self._max_cols_by_group[group_id]
+                if cols < 0 or cols > capacity:
+                    raise RuntimeError(
+                        f"flat staging copy for {group_id!r} returned {cols} "
+                        f"columns outside [0, {capacity}]"
+                    )
+                cols_by_group[group_id] = cols
+
+                active_values = num_reqs * cols
+                slot.device_tables[group_id][:active_values].copy_(
+                    slot.host_tables[group_id][:active_values],
+                    non_blocking=self._device.type == "cuda",
+                )
+                slot.device_bases[group_id][:num_reqs].copy_(
+                    slot.host_bases[group_id][:num_reqs],
+                    non_blocking=self._device.type == "cuda",
+                )
+
+        self._current_slot = slot_index
+        self._current_rows = num_reqs
+        self._current_cols_by_group = cols_by_group
+        self._next_slot = (slot_index + 1) % self._depth
+        return self._current_device_views()
+
+    def stage_idle(
+        self, *, padded_rows: int
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        """Prepare a graph-idle page-0/base-0 view without allocating tensors.
+
+        An idle DP rank has no ``FlatForwardOperation`` and therefore cannot use
+        :meth:`stage`. Rotate the same lifetime ring as active forwards, then
+        expose one persistent page-0 column per group. This is valid both before
+        the first active forward and while an earlier slot remains in flight.
+        """
+
+        if (
+            isinstance(padded_rows, bool)
+            or not isinstance(padded_rows, int)
+            or padded_rows <= 0
+        ):
+            raise ValueError("flat table idle padded_rows must be a positive integer")
+        if padded_rows > self._max_rows:
+            raise ValueError(
+                "flat table idle row capacity exceeded: "
+                f"rows={padded_rows}, capacity={self._max_rows}"
+            )
+
+        slot_index = self._next_slot
+        slot = self._slots[slot_index]
+        for group_id in self._group_ids:
+            # One column is sufficient for an idle dummy row. Page/base zero is
+            # the canonical non-owning mapping in every local pool.
+            slot.device_tables[group_id][:padded_rows].zero_()
+            slot.device_bases[group_id][:padded_rows].zero_()
+
+        self._current_slot = slot_index
+        self._current_rows = 0
+        self._current_cols_by_group = {group_id: 1 for group_id in self._group_ids}
+        self._next_slot = (slot_index + 1) % self._depth
+        return (
+            {
+                group_id: slot.device_tables[group_id][:padded_rows].view(
+                    padded_rows, 1
+                )
+                for group_id in self._group_ids
+            },
+            {
+                group_id: slot.device_bases[group_id][:padded_rows]
+                for group_id in self._group_ids
+            },
+        )
+
+    def _current_device_views(
+        self,
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        if self._current_slot is None:
+            raise RuntimeError("flat table staging has no current forward slot")
+        slot = self._slots[self._current_slot]
+        tables = {
+            group_id: slot.device_tables[group_id][
+                : self._current_rows * self._current_cols_by_group[group_id]
+            ].view(self._current_rows, self._current_cols_by_group[group_id])
+            for group_id in self._group_ids
+        }
+        bases = {
+            group_id: slot.device_bases[group_id][: self._current_rows]
+            for group_id in self._group_ids
+        }
+        return tables, bases
+
+    def pad_current_for_graph(
+        self,
+        flat_block_tables: Mapping[str, torch.Tensor],
+        flat_block_table_base_offsets: Mapping[str, torch.Tensor],
+        *,
+        actual_rows: int,
+        padded_rows: int,
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        """Return padded views backed by the current persistent device slot."""
+        if self._current_slot is None:
+            raise RuntimeError("flat table graph padding has no staged forward")
+        if actual_rows != self._current_rows:
+            raise RuntimeError(
+                "flat table graph padding rows disagree with staged forward: "
+                f"actual={actual_rows}, staged={self._current_rows}"
+            )
+        if padded_rows < actual_rows or padded_rows > self._max_rows:
+            raise RuntimeError(
+                "flat table graph padded rows exceed the planned staging shape: "
+                f"actual={actual_rows}, padded={padded_rows}, "
+                f"capacity={self._max_rows}"
+            )
+        if set(flat_block_tables) != set(self._group_ids) or set(
+            flat_block_table_base_offsets
+        ) != set(self._group_ids):
+            raise RuntimeError(
+                "flat table graph padding did not receive the staged group union"
+            )
+
+        slot = self._slots[self._current_slot]
+        for group_id in self._group_ids:
+            cols = self._current_cols_by_group[group_id]
+            table = flat_block_tables[group_id]
+            bases = flat_block_table_base_offsets[group_id]
+            expected_table_shape = (actual_rows, cols)
+            if tuple(table.shape) != expected_table_shape or tuple(bases.shape) != (
+                actual_rows,
+            ):
+                raise RuntimeError(
+                    f"flat graph input shape for {group_id!r} is not the "
+                    f"current staging view: table={tuple(table.shape)}, "
+                    f"base={tuple(bases.shape)}, expected={expected_table_shape}"
+                )
+            if table.data_ptr() != slot.device_tables[group_id].data_ptr() or (
+                bases.data_ptr() != slot.device_bases[group_id].data_ptr()
+            ):
+                raise RuntimeError(
+                    f"flat graph input for {group_id!r} is not backed by the "
+                    "current persistent staging slot"
+                )
+            if padded_rows > actual_rows:
+                # Page 0/base 0 is the canonical dummy row for graph padding.
+                slot.device_tables[group_id][
+                    actual_rows * cols : padded_rows * cols
+                ].zero_()
+                slot.device_bases[group_id][actual_rows:padded_rows].zero_()
+
+        return (
+            {
+                group_id: slot.device_tables[group_id][
+                    : padded_rows * self._current_cols_by_group[group_id]
+                ].view(padded_rows, self._current_cols_by_group[group_id])
+                for group_id in self._group_ids
+            },
+            {
+                group_id: slot.device_bases[group_id][:padded_rows]
+                for group_id in self._group_ids
+            },
+        )
+
+
 def _block_tables_from_forward_op(
     forward_op: Any,
     *,
     attr: str,
     device: "torch.device | str",
     num_reqs: int | None,
+    max_cols_by_group: Mapping[str, int] | None = None,
 ) -> dict[str, torch.Tensor]:
     raw_tables = getattr(forward_op, attr, None)
     if raw_tables is None:
+        if max_cols_by_group is not None and (num_reqs or 0) > 0:
+            raise ValueError(f"{attr} is missing for a planned flat cache batch")
         return {}
     device = torch.device(device) if isinstance(device, str) else device
     items = (
@@ -317,6 +833,15 @@ def _block_tables_from_forward_op(
         if isinstance(raw_tables, Mapping)
         else list(raw_tables)
     )
+    if max_cols_by_group is not None and (num_reqs or 0) > 0:
+        actual_groups = {str(key) for key, _ in items}
+        planned_groups = {str(key) for key in max_cols_by_group}
+        if actual_groups != planned_groups:
+            raise ValueError(
+                f"{attr} groups do not match the memory plan: "
+                f"missing={sorted(planned_groups - actual_groups)}, "
+                f"extra={sorted(actual_groups - planned_groups)}"
+            )
     # One packed pinned H2D for all groups; reuse is safe — every step ends in a commit sync.
     flat_values: list[int] = []
     spans: list[tuple[str, int, int, int]] = []  # key, offset, rows, cols
@@ -335,6 +860,13 @@ def _block_tables_from_forward_op(
             # Idle/empty op: callers treat the resulting {} as "no tables".
             continue
         max_pages = max((len(row) for row in rows), default=0)
+        if max_cols_by_group is not None:
+            require_flat_table_cols(
+                group_id=key,
+                purpose="forward export",
+                actual_cols=int(max_cols_by_group[key]),
+                required_cols=max_pages,
+            )
         if max_pages == 0:
             out[key] = torch.empty((len(rows), 0), dtype=torch.int32, device=device)
             continue
@@ -390,10 +922,13 @@ def flat_block_tables_from_forward_op(
     device: "torch.device | str",
     *,
     num_reqs: int | None = None,
+    max_cols_by_group: Mapping[str, int] | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Bridge the flat per-group block tables to GPU int32 tensors: absolute
-    page indices, null hole = 0 preserved, ragged-row padding -1. No
-    base-offset companion -- the flat path never compacts.
+    """Bridge flat per-group live tables to packed GPU int32 tensors.
+
+    Null hole 0 and ragged-row padding -1 are preserved. Pair the result with
+    :func:`flat_block_table_base_offsets_from_forward_op`; a row column is
+    relative to that request/group's logical base.
 
     All groups stage into ONE pinned buffer and ride ONE H2D copy; the
     returned per-group views share a single storage, which is the
@@ -404,9 +939,42 @@ def flat_block_tables_from_forward_op(
     """
     arrays = getattr(forward_op, "flat_block_tables_arrays", None)
     if not callable(arrays):
-        if getattr(forward_op, "flat_block_tables", None) is None:
+        legacy_tables = getattr(forward_op, "flat_block_tables", None)
+        if legacy_tables is None:
             # Radix builds / idle ops carry no flat tables at all.
+            if max_cols_by_group is not None and (num_reqs or 0) > 0:
+                raise ValueError(
+                    "flat_block_tables_arrays is missing for a planned flat "
+                    "cache batch"
+                )
             return {}
+        # Preserve plan validation as a fail-closed diagnostic even when an old
+        # extension only exposes the removed nested-list ABI. A valid payload
+        # still fails below and requires rebuilding the scheduler extension.
+        legacy_items = (
+            list(legacy_tables.items())
+            if isinstance(legacy_tables, Mapping)
+            else list(legacy_tables)
+        )
+        if max_cols_by_group is not None and (num_reqs or 0) > 0:
+            actual_groups = {str(key) for key, _ in legacy_items}
+            planned_groups = {str(key) for key in max_cols_by_group}
+            if actual_groups != planned_groups:
+                raise ValueError(
+                    "flat_block_tables groups do not match the memory plan: "
+                    f"missing={sorted(planned_groups - actual_groups)}, "
+                    f"extra={sorted(actual_groups - planned_groups)}"
+                )
+            for key_obj, table in legacy_items:
+                key = str(key_obj)
+                rows = list(table)
+                required_cols = max((len(row) for row in rows), default=0)
+                require_flat_table_cols(
+                    group_id=key,
+                    purpose="forward export",
+                    actual_cols=int(max_cols_by_group[key]),
+                    required_cols=required_cols,
+                )
         raise RuntimeError(
             "flat scheduler ext does not expose flat_block_tables_arrays; "
             "rebuild tokenspeed-scheduler (the per-element nested-list export "
@@ -416,7 +984,17 @@ def flat_block_tables_from_forward_op(
     out: dict[str, torch.Tensor] = {}
     packable: list[tuple[str, Any, int]] = []
     total = 0
-    for key_obj, arr in arrays().items():
+    array_items = list(arrays().items())
+    if max_cols_by_group is not None and (num_reqs or 0) > 0:
+        actual_groups = {str(key) for key, _ in array_items}
+        planned_groups = {str(key) for key in max_cols_by_group}
+        if actual_groups != planned_groups:
+            raise ValueError(
+                "flat_block_tables_arrays groups do not match the memory plan: "
+                f"missing={sorted(planned_groups - actual_groups)}, "
+                f"extra={sorted(actual_groups - planned_groups)}"
+            )
+    for key_obj, arr in array_items:
         key = str(key_obj)
         if num_reqs is not None and arr.shape[0] != num_reqs:
             raise ValueError(
@@ -425,6 +1003,13 @@ def flat_block_tables_from_forward_op(
             )
         if arr.shape[0] == 0:
             continue
+        if max_cols_by_group is not None:
+            require_flat_table_cols(
+                group_id=key,
+                purpose="forward export",
+                actual_cols=int(max_cols_by_group[key]),
+                required_cols=int(arr.shape[1]),
+            )
         if arr.shape[1] == 0:
             # Kept out of the pack: a zero-width table must stay loud in the
             # replay fill's cols >= 1 assert, not be silently tail-padded.
@@ -447,19 +1032,14 @@ def flat_block_tables_from_forward_op(
     return out
 
 
-def paged_cache_block_table_base_offsets_from_forward_op(
+def _block_table_base_offsets_from_forward_op(
     forward_op: Any,
     device: "torch.device | str",
     *,
+    attr: str,
     num_reqs: int | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, int]]:
-    """Convert forward op compact-table base offsets to int32 tensors.
-
-    Returns (gpu_offsets_per_group, cpu_max_per_group). The CPU max is captured
-    before H2D so callers can size graph-replay buffers without a GPU max + D2H
-    sync. Empty rows yield max=0; missing keys are absent from the max dict.
-    """
-    raw = getattr(forward_op, "paged_cache_block_table_base_offsets", None)
+    raw = getattr(forward_op, attr, None)
     if raw is None:
         return {}, {}
     device = torch.device(device) if isinstance(device, str) else device
@@ -469,14 +1049,16 @@ def paged_cache_block_table_base_offsets_from_forward_op(
     for key_obj, offsets in items:
         key = str(key_obj)
         rows = list(offsets)
-        if num_reqs is not None and rows and len(rows) != num_reqs:
+        if num_reqs is not None and len(rows) != num_reqs:
             raise ValueError(
-                f"paged_cache_block_table_base_offsets[{key}] has {len(rows)} "
+                f"{attr}[{key}] has {len(rows)} "
                 f"rows but forward op reported num_reqs={num_reqs}"
             )
         if not rows:
             max_per_group[key] = 0
             continue
+        if any(int(offset) < 0 for offset in rows):
+            raise ValueError(f"{attr}[{key}] contains a negative logical base")
         max_per_group[key] = int(max(rows))
         cpu = torch.tensor(rows, dtype=torch.int32, device="cpu")
         if device.type == "cuda":
@@ -484,3 +1066,33 @@ def paged_cache_block_table_base_offsets_from_forward_op(
         else:
             out[key] = cpu.to(device)
     return out, max_per_group
+
+
+def paged_cache_block_table_base_offsets_from_forward_op(
+    forward_op: Any,
+    device: "torch.device | str",
+    *,
+    num_reqs: int | None = None,
+) -> tuple[dict[str, torch.Tensor], dict[str, int]]:
+    """Convert radix compact-table bases; missing full-history keys mean zero."""
+    return _block_table_base_offsets_from_forward_op(
+        forward_op,
+        attr="paged_cache_block_table_base_offsets",
+        device=device,
+        num_reqs=num_reqs,
+    )
+
+
+def flat_block_table_base_offsets_from_forward_op(
+    forward_op: Any,
+    device: "torch.device | str",
+    *,
+    num_reqs: int | None = None,
+) -> tuple[dict[str, torch.Tensor], dict[str, int]]:
+    """Convert flat bases; every delivered flat group must have a key."""
+    return _block_table_base_offsets_from_forward_op(
+        forward_op,
+        attr="flat_block_table_base_offsets",
+        device=device,
+        num_reqs=num_reqs,
+    )

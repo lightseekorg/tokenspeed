@@ -63,6 +63,7 @@ add_library(tokenspeed_scheduler_core STATIC
     csrc/scheduler/operations/forward.cpp
 
     csrc/scheduler/kv_cache_events.cpp
+    csrc/scheduler/flat_kv_completion_ledger.cpp
     csrc/scheduler/request.cpp
     csrc/scheduler/outside_event_handler.cpp
     csrc/scheduler/scheduler.cpp
@@ -124,14 +125,20 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
 
     add_executable(tokenspeed_scheduler_tests
         tests/cpp/test_page_hasher.cpp
+        tests/cpp/test_paged_cache_group_config.cpp
         tests/cpp/test_block_pool.cpp
+        tests/cpp/test_block_pool_set.cpp
+        tests/cpp/test_flat_reservation_ledger.cpp
         tests/cpp/test_block_ref.cpp
+        tests/cpp/test_block_table.cpp
         tests/cpp/test_full_attn_manager.cpp
         tests/cpp/test_swa_manager.cpp
         tests/cpp/test_match_host_pages.cpp
         tests/cpp/test_kv_cache_coordinator.cpp
         tests/cpp/test_forward_cache_ops.cpp
         tests/cpp/test_flat_forward_operation.cpp
+        tests/cpp/test_flat_kv_completion_ledger.cpp
+        tests/cpp/test_flat_kv_completion_scheduler.cpp
         tests/cpp/test_flat_kvcache_lifecycle.cpp
         tests/cpp/test_flat_kvcache_scenarios.cpp
         tests/cpp/test_scheduler_plan.cpp

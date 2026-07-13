@@ -70,6 +70,8 @@ def _load(mod_name: str, file_name: str):
 
 _pcs = _load("paged_cache_spec_for_page_counts", "paged_cache_spec.py")
 compute_paged_cache_group_page_counts = _pcs.compute_paged_cache_group_page_counts
+compute_flat_capture_cols = _pcs.compute_flat_capture_cols
+compute_flat_export_cols = _pcs.compute_flat_export_cols
 group_specs_from_layer_types = _pcs.group_specs_from_layer_types
 PagedCacheGroupSpec = _pcs.PagedCacheGroupSpec
 DUMMY = _pcs._PAGED_CACHE_GROUP_DUMMY_PAGES
@@ -179,6 +181,50 @@ class SuffixedGroupIdFlowTest(unittest.TestCase):
         self.assertGreater(counts["full_attention"], counts["sliding_attention_128"])
         self.assertGreater(
             counts["sliding_attention_128"], counts["sliding_attention_4"]
+        )
+
+
+class OverlapTableWidthTest(unittest.TestCase):
+    def test_sliding_export_covers_current_and_overlapped_prefill_chunks(self):
+        spec = _spec("state", "sliding_window", window=8, rows_per_page=4)
+
+        self.assertEqual(
+            compute_flat_export_cols(
+                spec,
+                max_context_len=16_384,
+                max_new_tokens_per_req=8_192,
+                max_tokens_per_req=1,
+                overlap_schedule_depth=1,
+            ),
+            math.ceil((8 + 2 * 8_192 + 2) / 4) + 1,
+        )
+
+    def test_sliding_decode_capture_covers_final_prefill_predecessor(self):
+        spec = _spec("state", "sliding_window", window=8, rows_per_page=4)
+
+        self.assertEqual(
+            compute_flat_capture_cols(
+                spec,
+                max_context_len=16_384,
+                max_tokens_per_req=1,
+                max_prefill_tokens_per_req=8_192,
+                overlap_schedule_depth=1,
+            ),
+            math.ceil((8 + 8_192 + 2) / 4) + 1,
+        )
+
+    def test_nonoverlap_capture_does_not_charge_committed_prefill(self):
+        spec = _spec("state", "sliding_window", window=8, rows_per_page=4)
+
+        self.assertEqual(
+            compute_flat_capture_cols(
+                spec,
+                max_context_len=16_384,
+                max_tokens_per_req=1,
+                max_prefill_tokens_per_req=8_192,
+                overlap_schedule_depth=0,
+            ),
+            math.ceil((8 + 1) / 4) + 1,
         )
 
 

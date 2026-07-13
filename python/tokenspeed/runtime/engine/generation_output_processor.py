@@ -545,6 +545,39 @@ class OutputProcesser:
             if rs := self.rid_to_state.get(rid):
                 rs.cached_tokens += max(0, prefix_len - rs.computed_length)
 
+    @staticmethod
+    def _materialize_ready_flat_kv_completions(
+        forward_op, model_execution_results: ModelExecutionResult
+    ):
+        """Materialize the host-POD completion side channel after sync.
+
+        The payload is created for every flat KV-writing row, including a
+        mid-chunk extend whose sampled token is intentionally suppressed.
+        """
+        materialize = getattr(
+            model_execution_results, "materialize_flat_kv_completions", None
+        )
+        if materialize is not None:
+            return materialize(forward_op)
+        if getattr(forward_op, "flat_kv_completion_inputs", None):
+            raise RuntimeError(
+                "forward op carries flat_kv_completion_inputs but the execution "
+                "result cannot materialize ready-only completions"
+            )
+        return ()
+
+    @staticmethod
+    def _make_extend_result_with_flat_kv_completion(
+        request_id, tokens, flat_kv_completion
+    ):
+        if flat_kv_completion is None:
+            return make_extend_result_event(request_id, tokens)
+        return make_extend_result_event(
+            request_id,
+            tokens,
+            flat_kv_completion=flat_kv_completion,
+        )
+
     def post_process_forward_op(
         self,
         forward_op,
@@ -558,6 +591,18 @@ class OutputProcesser:
         )
         with nvtx_range("commit:sync", color="red"):
             model_execution_results.sync()
+
+        # This must remain immediately after the execution-result fence. No
+        # completion object exists before sync, and the POD produced here owns
+        # no CUDA event, tensor, stream, or device pointer.
+        flat_kv_completions = self._materialize_ready_flat_kv_completions(
+            forward_op, model_execution_results
+        )
+        flat_kv_completion_by_rid = {
+            completion.request_id: completion for completion in flat_kv_completions
+        }
+        if len(flat_kv_completion_by_rid) != len(flat_kv_completions):
+            raise ValueError("flat KV completions contain duplicate request ids")
 
         self._emit_spec_decode_metrics(forward_op, model_execution_results)
 
@@ -615,6 +660,7 @@ class OutputProcesser:
         prefill_lengths = getattr(forward_op, "prefill_lengths", None)
         pt = 0
         for i, rid in enumerate(forward_op.request_ids):
+            flat_kv_completion = flat_kv_completion_by_rid.get(rid)
             output_length = model_execution_results.output_lengths[i].item()
             model_output_ids = model_execution_results.output_tokens.tolist()[
                 pt : pt + output_length
@@ -632,24 +678,43 @@ class OutputProcesser:
 
             if rid not in self.rid_to_state:
                 # means it's delayed token, do not process
+                if flat_kv_completion is not None:
+                    request_changes.append(
+                        self._make_extend_result_with_flat_kv_completion(
+                            rid, (), flat_kv_completion
+                        )
+                    )
                 continue
 
             request_state: RequestState = self.rid_to_state[rid]
             # scheduled_time is stamped pre-forward in the event loop (queue end)
 
             # Mid-chunk extend slot by the op's own prefill_lengths (rebased after
-            # flat retract; C++ owes no result and the sampled token is garbage).
-            # Fresh requests: prefill_length == prompt length, same as the gate below.
+            # flat retract). The sampled token is garbage, but a flat KV row
+            # still owes its producer completion. Fresh requests:
+            # prefill_length == prompt length, same as the gate below.
             if (
                 not is_decode_slot
                 and prefill_lengths is not None
                 and forward_op.extend_prefix_lens[i] + forward_op.input_lengths[i]
                 < prefill_lengths[i]
             ):
+                if flat_kv_completion is not None:
+                    request_changes.append(
+                        self._make_extend_result_with_flat_kv_completion(
+                            rid, (), flat_kv_completion
+                        )
+                    )
                 continue
 
             # Do not output chunking result
             if not request_state.prefill_finished:
+                if flat_kv_completion is not None:
+                    request_changes.append(
+                        self._make_extend_result_with_flat_kv_completion(
+                            rid, (), flat_kv_completion
+                        )
+                    )
                 continue
 
             request_state.stats.mark_prefill_done(stats_now)
@@ -752,12 +817,22 @@ class OutputProcesser:
             if request_state.output_ids:
                 request_state.stats.mark_first_token(stats_now)
 
+            if is_decode_slot and flat_kv_completion is not None:
+                flat_kv_completion = flat_kv_completion.rewind_to_host_accepted_tokens(
+                    device_accepted_tokens=int(output_length),
+                    host_accepted_tokens=len(new_ids),
+                )
+
             # For aborted requests, skip output to detokenizer (the tokenizer
             # manager already cleaned up), just notify the scheduler to finish.
             # Exception: pause-initiated aborts (abort_notify_client) leave a
             # passive client that still needs a terminating finish streamed.
             if request_state.to_abort and request_state.finished:
-                request_changes.append(make_extend_result_event(rid, new_ids))
+                request_changes.append(
+                    self._make_extend_result_with_flat_kv_completion(
+                        rid, new_ids, flat_kv_completion
+                    )
+                )
                 request_changes.append(make_finish_event(rid))
                 if request_state.abort_notify_client:
                     stream_out_rids.append(rid)
@@ -767,7 +842,23 @@ class OutputProcesser:
                 self.rid_to_state.pop(rid)
                 continue
 
-            request_changes.append(make_extend_result_event(rid, new_ids))
+            structured_nan_abort = (
+                flat_kv_completion is not None
+                and nan_detected
+                and request_state.finished
+                and not is_prefill_instance
+            )
+            if structured_nan_abort:
+                # Cancel every outstanding dispatch before this execution
+                # fence reaches the scheduler. The completion still retires
+                # debt, but canceled records cannot mutate tokens or publish
+                # the suspect KV that triggered the numerical abort.
+                request_changes.append(make_abort_event(rid))
+            request_changes.append(
+                self._make_extend_result_with_flat_kv_completion(
+                    rid, new_ids, flat_kv_completion
+                )
+            )
             if is_prefill_instance:
                 # Prefill instances: never stream intermediate output to detokenizer.
                 # The finish packet is sent exactly once by finish_prefill_request()
@@ -779,9 +870,12 @@ class OutputProcesser:
                 stream_out_rids.append(rid)
                 stream_out_states.append(request_state)
                 # Abort (vs Finish) keeps corrupted KV out of the prefix caches.
-                request_changes.append(
-                    make_abort_event(rid) if nan_detected else make_finish_event(rid)
-                )
+                if not structured_nan_abort:
+                    request_changes.append(
+                        make_abort_event(rid)
+                        if nan_detected
+                        else make_finish_event(rid)
+                    )
                 self._log_request_stats(rid, request_state, stats_now)
                 request_state.release_pending_multimodal_features()
                 self.rid_to_state.pop(rid)

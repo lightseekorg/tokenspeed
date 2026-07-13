@@ -48,8 +48,17 @@ class _Sender:
 class _FakeScheduler:
     """Implements just the four size accessors the drain check reads."""
 
-    def __init__(self, waiting=0, decoding=0, prefilling=0, retract=0):
+    def __init__(
+        self,
+        waiting=0,
+        decoding=0,
+        prefilling=0,
+        retract=0,
+        flat_quiescent=None,
+    ):
         self._w, self._d, self._p, self._r = waiting, decoding, prefilling, retract
+        if flat_quiescent is not None:
+            self.flat_kv_cache_quiescent = lambda: flat_quiescent
 
     def waiting_size(self):
         return self._w
@@ -78,6 +87,8 @@ def test_scheduler_drained_predicate():
     assert not scheduler_drained(_FakeScheduler(decoding=1))
     assert not scheduler_drained(_FakeScheduler(prefilling=1))
     assert not scheduler_drained(_FakeScheduler(retract=1))
+    assert scheduler_drained(_FakeScheduler(flat_quiescent=True))
+    assert not scheduler_drained(_FakeScheduler(flat_quiescent=False))
 
 
 # --- keep mode ---------------------------------------------------------------

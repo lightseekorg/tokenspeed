@@ -195,6 +195,60 @@ class EngineMetrics:
             multiprocess_mode="livemax",
             **kw,
         )
+        flat_pool_labelnames = [*labelnames, "flat_pool_id"]
+        self.flat_kv_pool_blocks = Gauge(
+            name="tokenspeed:flat_kv_pool_blocks",
+            documentation=(
+                "Per-pool heterogeneous flat KV block counters, selected by state."
+            ),
+            labelnames=[*flat_pool_labelnames, "state"],
+            multiprocess_mode="livemax",
+            **kw,
+        )
+        self.flat_kv_pool_bytes_per_block = Gauge(
+            name="tokenspeed:flat_kv_pool_bytes_per_block",
+            documentation="Device payload bytes represented by one block in a flat KV pool.",
+            labelnames=flat_pool_labelnames,
+            multiprocess_mode="livemax",
+            **kw,
+        )
+        self.flat_kv_pool_pressure = Gauge(
+            name="tokenspeed:flat_kv_pool_pressure",
+            documentation=(
+                "Per-pool active-plus-reserved pressure in the range [0, 1]."
+            ),
+            labelnames=flat_pool_labelnames,
+            multiprocess_mode="livemax",
+            **kw,
+        )
+        self.flat_kv_active_bytes = Gauge(
+            name="tokenspeed:flat_kv_active_bytes",
+            documentation="Byte-weighted active payload across all flat KV pools.",
+            labelnames=labelnames,
+            multiprocess_mode="livemax",
+            **kw,
+        )
+        self.flat_kv_capacity_bytes = Gauge(
+            name="tokenspeed:flat_kv_capacity_bytes",
+            documentation="Total usable device payload bytes across all flat KV pools.",
+            labelnames=labelnames,
+            multiprocess_mode="livemax",
+            **kw,
+        )
+        self.flat_kv_byte_utilization = Gauge(
+            name="tokenspeed:flat_kv_byte_utilization",
+            documentation="Byte-weighted active utilization across flat KV pools.",
+            labelnames=labelnames,
+            multiprocess_mode="livemax",
+            **kw,
+        )
+        self.flat_kv_bottleneck_pressure = Gauge(
+            name="tokenspeed:flat_kv_bottleneck_pressure",
+            documentation="Maximum active-plus-reserved pressure among flat KV pools.",
+            labelnames=labelnames,
+            multiprocess_mode="livemax",
+            **kw,
+        )
         self.iteration_tokens_total = Histogram(
             name="tokenspeed:iteration_tokens_total",
             documentation="Tokens scheduled in one scheduler forward step.",
@@ -258,6 +312,49 @@ class EngineMetrics:
         self.num_requests_waiting.labels(**self.labels).set(waiting)
         self.kv_cache_usage_ratio.labels(**self.labels).set(kv_cache_usage_ratio)
 
+    def record_flat_kv_snapshot(
+        self,
+        *,
+        pool_metrics=(),
+        summary: dict[str, int | float] | None = None,
+    ) -> None:
+        """Publish source-domain counters plus byte and bottleneck aggregates."""
+        if not self.enabled or summary is None:
+            return
+        block_states = (
+            "usable_blocks",
+            "free_blocks",
+            "active_blocks",
+            "cached_evictable_blocks",
+            "pinned_cached_blocks",
+            "reserved_blocks",
+        )
+        for row in pool_metrics:
+            pool_labels = {**self.labels, "flat_pool_id": str(row["pool_id"])}
+            for state in block_states:
+                self.flat_kv_pool_blocks.labels(
+                    **pool_labels,
+                    state=state.removesuffix("_blocks"),
+                ).set(int(row[state]))
+            self.flat_kv_pool_bytes_per_block.labels(**pool_labels).set(
+                int(row["bytes_per_block"])
+            )
+            self.flat_kv_pool_pressure.labels(**pool_labels).set(float(row["pressure"]))
+
+        aggregate_labels = self.labels
+        self.flat_kv_active_bytes.labels(**aggregate_labels).set(
+            int(summary["active_bytes"])
+        )
+        self.flat_kv_capacity_bytes.labels(**aggregate_labels).set(
+            int(summary["capacity_bytes"])
+        )
+        self.flat_kv_byte_utilization.labels(**aggregate_labels).set(
+            float(summary["byte_utilization"])
+        )
+        self.flat_kv_bottleneck_pressure.labels(**aggregate_labels).set(
+            float(summary["pressure"])
+        )
+
     def observe_iteration_tokens(self, num_tokens: float) -> None:
         if self.enabled and num_tokens >= 0:
             self.iteration_tokens_total.labels(**self.labels).observe(num_tokens)
@@ -270,6 +367,8 @@ class EngineMetrics:
         num_active_pages: int,
         num_total_pages: int,
         num_iteration_tokens: int,
+        flat_pool_metrics=(),
+        flat_summary: dict[str, int | float] | None = None,
     ) -> None:
         if not self.enabled:
             return
@@ -278,6 +377,10 @@ class EngineMetrics:
             running=running,
             waiting=waiting,
             kv_cache_usage_ratio=ratio,
+        )
+        self.record_flat_kv_snapshot(
+            pool_metrics=flat_pool_metrics,
+            summary=flat_summary,
         )
         if num_iteration_tokens > 0:
             self.observe_iteration_tokens(float(num_iteration_tokens))

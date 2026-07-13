@@ -21,6 +21,7 @@
 #include "resource/allocator/paged_cache_group.h"
 
 #include <algorithm>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 
@@ -43,6 +44,50 @@ void PagedCacheGroupConfig::Validate() const {
     }
     if (retention == Retention::SlidingWindow && (!sliding_window_tokens.has_value() || *sliding_window_tokens <= 0)) {
         throw std::invalid_argument("PagedCacheGroupConfig: sliding_window_tokens must be > 0 for sliding groups");
+    }
+}
+
+void PagedCacheGroupConfig::ValidateFlatBlockGeometry() const {
+    Validate();
+    if (block_size <= 0) {
+        throw std::invalid_argument("PagedCacheGroupConfig: flat block_size must be > 0; group=" + group_id);
+    }
+
+    const std::int64_t raw_tokens_per_page =
+        static_cast<std::int64_t>(rows_per_page) * static_cast<std::int64_t>(entry_stride_tokens);
+    if (raw_tokens_per_page > std::numeric_limits<std::int32_t>::max()) {
+        throw std::invalid_argument(
+            "PagedCacheGroupConfig: flat rows_per_page * entry_stride_tokens overflows int32; "
+            "group=" +
+            group_id);
+    }
+    if (block_size != static_cast<std::int32_t>(raw_tokens_per_page)) {
+        throw std::invalid_argument(
+            "PagedCacheGroupConfig: flat block_size must equal rows_per_page * entry_stride_tokens; group=" + group_id +
+            "; block_size=" + std::to_string(block_size) +
+            "; raw_tokens_per_page=" + std::to_string(raw_tokens_per_page));
+    }
+    if (table_layout == TableLayout::BoundedWindow && retention != Retention::SlidingWindow) {
+        throw std::invalid_argument("PagedCacheGroupConfig: bounded-window layout requires sliding retention; group=" +
+                                    group_id);
+    }
+    if (prefix_role == PrefixRole::ContinuationState) {
+        if (family != PagedCacheGroupFamily::State || retention != Retention::SlidingWindow ||
+            table_layout != TableLayout::BoundedWindow) {
+            throw std::invalid_argument(
+                "PagedCacheGroupConfig: continuation state requires State family, sliding retention, and "
+                "bounded-window layout; group=" +
+                group_id);
+        }
+        if (!sliding_window_tokens.has_value() || *sliding_window_tokens % block_size != 0) {
+            throw std::invalid_argument("PagedCacheGroupConfig: continuation window must be page-aligned; group=" +
+                                        group_id);
+        }
+        if (required_producer_domain_mask == 0 || owner_mask == 0) {
+            throw std::invalid_argument(
+                "PagedCacheGroupConfig: continuation state requires producer-domain and owner masks; group=" +
+                group_id);
+        }
     }
 }
 

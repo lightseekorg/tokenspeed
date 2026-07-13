@@ -46,7 +46,7 @@ std::optional<fsm::SchedulePrefetchEvent> Scheduler::schedulePrefetch(Request* r
     }
 
     const std::int32_t num_pages_to_fetch = storage.hit_pages;
-    if (!kv_prefix_cache_.EnsureCapacityByEvict<ResourceType::Host>(num_pages_to_fetch)) {
+    if (!radixPrefixCache().EnsureCapacityByEvict<ResourceType::Host>(num_pages_to_fetch)) {
         return {};
     }
 
@@ -64,7 +64,7 @@ PrefetchOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Sche
     request->Apply(event);
 
     // After Apply, request is in Prefetching state; read back the allocated host pages.
-    cache_op_id op_id = kv_prefix_cache_.AllocateCacheOpId();
+    cache_op_id op_id = radixPrefixCache().AllocateCacheOpId();
 
     CacheOpSpec spec;
     spec.request_id = request->Id();

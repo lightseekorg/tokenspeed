@@ -2018,11 +2018,20 @@ def _deepseek_v4_swa_slot_mapping(
     cache_metadata = metadata.cache
     token_to_req_indices = metadata.token_to_req_indices[: positions.numel()]
     if cache_metadata.swa_block_table is None:
+        if cache_metadata.table_source_kind == "flat":
+            raise RuntimeError(
+                "DeepSeek V4 flat cache metadata is missing the SWA group table"
+            )
         slot_mapping = out_cache_loc
     elif token_to_req_indices.numel() != positions.numel() and (
         token_to_req_indices.numel() <= 0
         or positions.numel() % token_to_req_indices.numel() != 0
     ):
+        if cache_metadata.table_source_kind == "flat":
+            raise RuntimeError(
+                "DeepSeek V4 flat SWA slot mapping has incompatible token/request "
+                "metadata; generic out_cache_loc fallback is forbidden"
+            )
         slot_mapping = out_cache_loc
     else:
         slot_mapping = _group_slot_mapping_from_raw(
@@ -2031,6 +2040,7 @@ def _deepseek_v4_swa_slot_mapping(
             cache_metadata.swa_block_table,
             ctx.token_to_kv_pool.swa_block_size,
             base_offsets=cache_metadata.swa_base_logical_page,
+            capacity_pages=ctx.token_to_kv_pool.swa_capacity_pages,
         )
     is_valid_token = getattr(metadata, "is_valid_token", None)
     if is_valid_token is not None:
@@ -2796,6 +2806,7 @@ class DeepseekV4Compressor(nn.Module):
         kv, score = kv_score.split([self.coff * self.head_dim] * 2, dim=-1)
         if state_cache is None:
             state_cache = pool.get_compressor_state_buffer(layer_index)
+        state_capacity_pages = int(state_cache.shape[0])
         cache_metadata = metadata.cache
         # state/compressed slot mappings depend only on (per-step state, ratio), so reuse
         # them across layers of the same ratio within a step. Attn-compressor path only:
@@ -2826,7 +2837,18 @@ class DeepseekV4Compressor(nn.Module):
                 memo.get(("state", self.compress_ratio)) if memo is not None else None
             )
             if state_hit is not None:
-                state_slot_mapping, state_block_table = state_hit
+                (
+                    state_slot_mapping,
+                    state_block_table,
+                    cached_state_capacity_pages,
+                ) = state_hit
+                if cached_state_capacity_pages != state_capacity_pages:
+                    raise RuntimeError(
+                        "DeepSeek V4 co-indexed compressor-state components "
+                        "disagree on page capacity: "
+                        f"first={cached_state_capacity_pages}, "
+                        f"current={state_capacity_pages}"
+                    )
             else:
                 if state_block_table is None:
                     raise RuntimeError(
@@ -2839,6 +2861,7 @@ class DeepseekV4Compressor(nn.Module):
                     state_block_table,
                     state_block_size,
                     base_offsets=state_base_logical_page,
+                    capacity_pages=state_capacity_pages,
                 )
                 state_slot_mapping = _mask_invalid_graph_tokens(
                     state_slot_mapping,
@@ -2848,6 +2871,7 @@ class DeepseekV4Compressor(nn.Module):
                     memo[("state", self.compress_ratio)] = (
                         state_slot_mapping,
                         state_block_table,
+                        state_capacity_pages,
                     )
         with nvtx_range(f"{profile_prefix}_save_state"):
             save_deepseek_v4_compressor_state(
@@ -2864,11 +2888,20 @@ class DeepseekV4Compressor(nn.Module):
             return kv, score
 
         kv_cache_block_size = pool.get_compressed_block_size(layer_index)
+        compressed_cache = pool.get_compressed_kv_buffer_2d(layer_index)
+        compressed_capacity_pages = int(compressed_cache.shape[0])
         compressed_hit = (
             memo.get(("compressed", self.compress_ratio)) if memo is not None else None
         )
         if compressed_hit is not None:
-            compressed_slots = compressed_hit
+            compressed_slots, cached_compressed_capacity_pages = compressed_hit
+            if cached_compressed_capacity_pages != compressed_capacity_pages:
+                raise RuntimeError(
+                    "DeepSeek V4 co-indexed compressed components disagree on "
+                    "page capacity: "
+                    f"first={cached_compressed_capacity_pages}, "
+                    f"current={compressed_capacity_pages}"
+                )
         else:
             with nvtx_range(f"{profile_prefix}_compressed_slot_mapping"):
                 compressed_slots = cache_metadata.compressed_slot_mapping(
@@ -2880,13 +2913,17 @@ class DeepseekV4Compressor(nn.Module):
                     query_start_loc=metadata.query_start_loc,
                     seq_lens=metadata.seq_lens,
                     kv_cache_block_size=kv_cache_block_size,
+                    capacity_pages=compressed_capacity_pages,
                     use_decode_cache=(
                         ctx.forward_mode is not None and ctx.forward_mode.is_decode()
                     ),
                     is_valid_token=valid_token,
                 )
             if memo is not None:
-                memo[("compressed", self.compress_ratio)] = compressed_slots
+                memo[("compressed", self.compress_ratio)] = (
+                    compressed_slots,
+                    compressed_capacity_pages,
+                )
         with nvtx_range(f"{profile_prefix}_cache_insert"):
             insert = (
                 deepseek_v4_csa_compress_kv_cache_insert
@@ -2904,7 +2941,7 @@ class DeepseekV4Compressor(nn.Module):
                 rms_norm_weight=self.norm.weight,
                 rms_norm_eps=self.norm.variance_epsilon,
                 cos_sin_cache=cos_sin_cache,
-                kv_cache_2d=pool.get_compressed_kv_buffer_2d(layer_index),
+                kv_cache_2d=compressed_cache,
                 kv_slot_mapping=compressed_slots,
                 kv_cache_block_size=kv_cache_block_size,
                 compress_ratio=self.compress_ratio,
@@ -3229,6 +3266,7 @@ class DeepseekV4Indexer(nn.Module):
             raise RuntimeError("DeepSeek V4 indexer requires forward metadata")
         cache_metadata = metadata.cache
         indexer_state = pool.get_indexer_state_buffer(layer_index)
+        indexer_state_capacity_pages = int(indexer_state.shape[0])
         valid_token = (
             metadata.is_valid_token[: positions.numel()]
             if getattr(metadata, "is_valid_token", None) is not None
@@ -3245,7 +3283,15 @@ class DeepseekV4Indexer(nn.Module):
                 indexer_state_block_table,
                 indexer_state_block_size,
                 indexer_state_base_logical_page,
+                cached_indexer_state_capacity_pages,
             ) = idx_hit
+            if cached_indexer_state_capacity_pages != indexer_state_capacity_pages:
+                raise RuntimeError(
+                    "DeepSeek V4 co-indexed indexer-state components disagree "
+                    "on page capacity: "
+                    f"first={cached_indexer_state_capacity_pages}, "
+                    f"current={indexer_state_capacity_pages}"
+                )
         else:
             indexer_state_block_table = cache_metadata.indexer_state_block_table
             indexer_state_base_logical_page = (
@@ -3263,6 +3309,7 @@ class DeepseekV4Indexer(nn.Module):
                 indexer_state_block_table,
                 indexer_state_block_size,
                 base_offsets=indexer_state_base_logical_page,
+                capacity_pages=indexer_state_capacity_pages,
             )
             indexer_state_slot_mapping = _mask_invalid_graph_tokens(
                 indexer_state_slot_mapping,
@@ -3274,6 +3321,7 @@ class DeepseekV4Indexer(nn.Module):
                     indexer_state_block_table,
                     indexer_state_block_size,
                     indexer_state_base_logical_page,
+                    indexer_state_capacity_pages,
                 )
         with nvtx_range("indexer_compressor_total"):
             self.compressor(
@@ -3293,6 +3341,8 @@ class DeepseekV4Indexer(nn.Module):
             )
         with nvtx_range("indexer_compressed_slot_mapping"):
             indexer_block_size = pool.get_indexer_block_size(layer_index)
+            indexer_cache = pool.get_indexer_kv_buffer_2d(layer_index)
+            indexer_capacity_pages = int(indexer_cache.shape[0])
             compressed_slots = cache_metadata.compressed_slot_mapping(
                 positions,
                 self.compress_ratio,
@@ -3300,6 +3350,7 @@ class DeepseekV4Indexer(nn.Module):
                 query_start_loc=metadata.query_start_loc,
                 seq_lens=metadata.seq_lens,
                 kv_cache_block_size=indexer_block_size,
+                capacity_pages=indexer_capacity_pages,
                 use_decode_cache=(
                     ctx.forward_mode is not None and ctx.forward_mode.is_decode()
                 ),
@@ -3317,7 +3368,7 @@ class DeepseekV4Indexer(nn.Module):
                 rms_norm_weight=self.compressor.norm.weight,
                 rms_norm_eps=self.compressor.norm.variance_epsilon,
                 cos_sin_cache=cos_sin_cache,
-                kv_cache_2d=pool.get_indexer_kv_buffer_2d(layer_index),
+                kv_cache_2d=indexer_cache,
                 kv_slot_mapping=compressed_slots,
                 kv_cache_block_size=indexer_block_size,
                 use_fp4_cache=self.use_fp4_cache,
@@ -3329,7 +3380,7 @@ class DeepseekV4Indexer(nn.Module):
             positions=positions,
             metadata=metadata,
             ctx=ctx,
-            indexer_cache=pool.get_indexer_kv_buffer_2d(layer_index),
+            indexer_cache=indexer_cache,
             indexer_block_size=indexer_block_size,
             cos_sin_cache=cos_sin_cache,
         )

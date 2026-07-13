@@ -52,7 +52,7 @@ class Request {
 public:
     Request(const RequestSpec& spec, std::int32_t page_size, Role role);
 
-    std::string Id() const { return id_; }
+    const std::string& Id() const noexcept { return id_; }
 
     // Keep Apply the only non-const function in Request
     // The wrapper lambda converts any concrete state type returned by event's operator()
@@ -94,6 +94,39 @@ public:
 
     std::int32_t TokenSize() const { return token_container_.Size(); }
     std::int32_t GetLastToken() const { return token_container_.LastToken(); }
+    std::span<const std::int32_t> GetTokenSlice(TokenContainer::Window window) const {
+        if (window.begin < 0 || window.size < 0 || window.begin > TokenSize() - window.size) {
+            throw std::out_of_range("Request token slice is outside the stable token range");
+        }
+        return token_container_.GetTokenSlice(window);
+    }
+
+    // Structured flat completion uses a two-step token append so allocation
+    // and FSM-state validation happen before the ledger progress commit. The
+    // returned flag preserves ExtendResult's Finished-state no-op behavior.
+    bool PrepareFlatResultAppend(std::size_t additional_tokens) {
+        const bool append = std::visit(Overloaded{
+            []<typename T>(const T&) -> bool
+                requires(std::same_as<T, fsm::PrefillDone> || std::same_as<T, fsm::Decoding> ||
+                         std::same_as<T, fsm::Retracting> || std::same_as<T, fsm::Retracted>)
+            { return true; },
+            [](const fsm::Finished&) -> bool { return false; },
+            [this](const auto&) -> bool {
+                throw std::logic_error("flat completion result is invalid for request state=" + StateName());
+            },
+            },
+            state_);
+        if (append) {
+            token_container_.ReserveAdditional(additional_tokens);
+        }
+        return append;
+    }
+
+    void CommitFlatResultAppend(std::span<const std::int32_t> tokens, bool append) noexcept {
+        if (append) {
+            token_container_.ExtendPrepared(tokens);
+        }
+    }
 
     PrefillInfo GetPrefillInfo() const;
 
@@ -189,6 +222,19 @@ public:
                 requires(std::derived_from<T, fsm::ForwardState>)
             { return s.BlockTables(); },
             [this](const auto&) -> const std::vector<BlockTable>& {
+                throw std::logic_error("Request::FlatBlockTablesRef: expected a forward state; got state=" +
+                                       StateName());
+            },
+            },
+            state_);
+    }
+
+    std::vector<BlockTable>& FlatBlockTablesRef() {
+        return std::visit(Overloaded{
+            []<typename T>(T& s) -> std::vector<BlockTable>&
+                requires(std::derived_from<T, fsm::ForwardState>)
+            { return s.BlockTables(); },
+            [this](auto&) -> std::vector<BlockTable>& {
                 throw std::logic_error("Request::FlatBlockTablesRef: expected a forward state; got state=" +
                                        StateName());
             },

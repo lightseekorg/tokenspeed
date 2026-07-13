@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from tokenspeed.runtime.engine.scheduler_utils import FlatBlockTableStagingBuffers
 from tokenspeed.runtime.execution.cache_loc_kernel import (
     compute_out_cache_loc,
     fused_decode_input_prep,
@@ -33,6 +34,7 @@ from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.configs.flat_memory_plan import V4FlatMemoryPlan
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 
 
@@ -56,6 +58,8 @@ class InputBuffers:
         state_write_padding_pool_index: int,
         device: str = "cuda",
         has_mamba: bool = False,
+        uses_group_keyed_cache_locs: bool = False,
+        flat_memory_plan: V4FlatMemoryPlan | None = None,
     ):
         self.device = device
         self.page_size = page_size
@@ -65,6 +69,12 @@ class InputBuffers:
         self.max_bs = max_bs
         self.all_extends_mid_chunk = False
         self.has_mamba = has_mamba
+        self.uses_group_keyed_cache_locs = uses_group_keyed_cache_locs
+        self.flat_block_table_staging = (
+            FlatBlockTableStagingBuffers(flat_memory_plan, device=device)
+            if flat_memory_plan is not None
+            else None
+        )
 
         with torch.device(device):
             # Initialise buffers to the *padding* values the captured graph
@@ -272,7 +282,7 @@ class InputBuffers:
         # positions, and seq_lens in a single launch and reads
         # valid_cache_lengths[pool_idx] directly, so the indexSelect + cumsum
         # path + compute_position + seq_lens add are all gone.
-        if num_extends == 0 and batch_size > 0:
+        if num_extends == 0 and batch_size > 0 and not self.uses_group_keyed_cache_locs:
             fused_decode_input_prep(
                 out_cache_loc_ptr=self.out_cache_loc_buf[:total_tokens],
                 positions_ptr=self.positions_buf[:total_tokens],
@@ -286,20 +296,25 @@ class InputBuffers:
             # Decode path's seq_lens / positions / out_cache_loc are done.
             valid_cache_lengths = None
         else:
-            # Mixed / pure-prefill: keep the per-kernel pipeline. indexSelect
-            # for valid_cache_lengths is required because compute_position and
-            # the seq_lens add use it.
+            # Mixed / pure-prefill and V4-flat decode keep the per-kernel
+            # position pipeline. V4 flat intentionally has no scalar page
+            # domain: out_cache_loc remains a page-0 compatibility sentinel,
+            # while every real KV writer consumes its group-keyed table/base
+            # metadata from the attention backend.
             valid_cache_lengths = runtime_states.valid_cache_lengths.index_select(
                 0, req_pool_indices_device
             )
-            compute_out_cache_loc(
-                out_cache_loc_ptr=self.out_cache_loc_buf[:total_tokens],
-                req_pool_indices=req_pool_indices_device,
-                input_lengths=input_lengths_device,
-                cache_start=valid_cache_lengths,
-                req_to_pages=req_to_page,
-                page_size=self.page_size,
-            )
+            if self.uses_group_keyed_cache_locs:
+                self.out_cache_loc_buf[:total_tokens].fill_(self.dummy_kv_slot)
+            else:
+                compute_out_cache_loc(
+                    out_cache_loc_ptr=self.out_cache_loc_buf[:total_tokens],
+                    req_pool_indices=req_pool_indices_device,
+                    input_lengths=input_lengths_device,
+                    cache_start=valid_cache_lengths,
+                    req_to_pages=req_to_page,
+                    page_size=self.page_size,
+                )
 
             # Compute positions. In mixed batches, prefill rows use their extend
             # prefix lengths while decode rows use the current valid cache lengths.

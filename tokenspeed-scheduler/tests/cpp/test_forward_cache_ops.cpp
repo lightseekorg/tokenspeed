@@ -22,7 +22,9 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "cache/block_pool.h"
@@ -333,6 +335,122 @@ TEST(ForwardCacheOpsSpecs, StateFamilyMapsToMambaStateKind) {
     EXPECT_EQ(specs[1].sliding_window, 0);
 }
 
+TEST(ForwardCacheOpsSpecs, CanonicalFlatConfigMapsPrefixRolesByCacheMode) {
+    SchedulerConfig config;
+    config.block_size = 8;
+    config.disable_prefix_cache = false;
+    config.flat_block_pools = {
+        FlatBlockPoolConfig{.pool_id = "v4.state", .total_blocks = 9, .bytes_per_block = 64},
+    };
+    PagedCacheGroupConfig state;
+    state.group_id = "v4.target.state";
+    state.rows_per_page = 4;
+    state.entry_stride_tokens = 2;
+    state.total_pages = 9;
+    state.block_size = 8;
+    state.retention = PagedCacheGroupConfig::Retention::SlidingWindow;
+    state.sliding_window_tokens = 16;
+    state.family = PagedCacheGroupFamily::State;
+    state.pool_id = "v4.state";
+    state.prefix_role = PrefixRole::ContinuationState;
+    state.table_layout = TableLayout::BoundedWindow;
+    state.required_producer_domain_mask = 0b101;
+    state.owner_mask = 0b010;
+    config.paged_cache_groups = {state};
+
+    BlockPoolSet pools(MakeFlatBlockPoolConfigs(config));
+    const std::vector<KvCacheSpec> specs = MakeSpecsFromConfig(config, pools);
+
+    ASSERT_EQ(specs.size(), 1u);
+    EXPECT_EQ(specs[0].kind, AttnKind::kSlidingWindow);
+    EXPECT_EQ(specs[0].block_size, 8);
+    EXPECT_EQ(specs[0].sliding_window, 16);
+    EXPECT_EQ(specs[0].pool_index, pools.IndexOf("v4.state"));
+    EXPECT_EQ(specs[0].prefix_role, KvPrefixRole::kContinuationState);
+    EXPECT_EQ(specs[0].table_layout, KvTableLayout::kBoundedWindow);
+    EXPECT_EQ(specs[0].required_producer_domain_mask, 0b101u);
+    EXPECT_EQ(specs[0].owner_mask, 0b010u);
+    EXPECT_THROW(MakeCoordinator(specs, pools), std::invalid_argument);
+
+    config.disable_prefix_cache = true;
+    const std::vector<KvCacheSpec> cold_specs = MakeSpecsFromConfig(config, pools);
+    ASSERT_EQ(cold_specs.size(), 1u);
+    EXPECT_EQ(cold_specs[0].prefix_role, KvPrefixRole::kNone);
+    EXPECT_EQ(cold_specs[0].kind, AttnKind::kSlidingWindow);
+    EXPECT_EQ(cold_specs[0].block_size, 8);
+    EXPECT_EQ(cold_specs[0].sliding_window, 16);
+    EXPECT_EQ(cold_specs[0].pool_index, pools.IndexOf("v4.state"));
+    EXPECT_EQ(cold_specs[0].table_layout, KvTableLayout::kBoundedWindow);
+    EXPECT_EQ(cold_specs[0].required_producer_domain_mask, 0b101u);
+    EXPECT_EQ(cold_specs[0].owner_mask, 0b010u);
+    EXPECT_NO_THROW(MakeCoordinator(cold_specs, pools));
+
+    config.disable_l2_cache = false;
+    config.host_allocator.total_pages = 4;
+    config.role = Role::kFused;
+    ASSERT_TRUE(config.FlatStreamingSinkEnabled());
+    const std::vector<KvCacheSpec> sink_specs = MakeSpecsFromConfig(config, pools);
+    ASSERT_EQ(sink_specs.size(), 1u);
+    EXPECT_EQ(sink_specs[0].prefix_role, KvPrefixRole::kContinuationState);
+    BlockPool host_pool(config.host_allocator.total_pages);
+    EXPECT_THROW(MakeCoordinator(sink_specs, pools, &host_pool), std::invalid_argument);
+}
+
+TEST(ForwardCacheOpsSpecs, CanonicalFlatConfigRejectsInvalidGeometryBeforeCoordinator) {
+    SchedulerConfig config;
+    config.block_size = 8;
+    config.flat_block_pools = {
+        FlatBlockPoolConfig{.pool_id = "v4.state", .total_blocks = 9, .bytes_per_block = 64},
+    };
+    PagedCacheGroupConfig state;
+    state.group_id = "v4.target.state";
+    state.rows_per_page = 4;
+    state.entry_stride_tokens = 2;
+    state.total_pages = 9;
+    state.block_size = 7;  // Must equal 4 * 2 raw tokens per page.
+    state.retention = PagedCacheGroupConfig::Retention::SlidingWindow;
+    state.sliding_window_tokens = 16;
+    state.family = PagedCacheGroupFamily::State;
+    state.pool_id = "v4.state";
+    state.prefix_role = PrefixRole::ContinuationState;
+    state.table_layout = TableLayout::BoundedWindow;
+    state.required_producer_domain_mask = 1;
+    state.owner_mask = 1;
+    config.paged_cache_groups = {state};
+
+    EXPECT_THROW(MakeFlatBlockPoolConfigs(config), std::invalid_argument);
+}
+
+TEST(ForwardCacheOpsSpecs, ExplicitPoolsRejectScalarAndGroupCapacityDrift) {
+    SchedulerConfig config;
+    config.block_size = 8;
+    config.flat_block_pools = {
+        FlatBlockPoolConfig{.pool_id = "v4.history", .total_blocks = 9, .bytes_per_block = 64},
+    };
+    PagedCacheGroupConfig group;
+    group.group_id = "v4.history";
+    group.rows_per_page = 4;
+    group.entry_stride_tokens = 2;
+    group.total_pages = 9;
+    group.block_size = 8;
+    group.pool_id = "v4.history";
+    config.paged_cache_groups = {group};
+
+    config.device_allocator.total_pages = 9;
+    EXPECT_THROW(MakeFlatBlockPoolConfigs(config), std::invalid_argument);
+
+    config.device_allocator.total_pages = 0;
+    config.paged_cache_groups[0].total_pages = 8;
+    EXPECT_THROW(MakeFlatBlockPoolConfigs(config), std::invalid_argument);
+
+    config.paged_cache_groups[0].total_pages = 9;
+    config.paged_cache_groups[0].pool_id = "unknown";
+    EXPECT_THROW(MakeFlatBlockPoolConfigs(config), std::invalid_argument);
+
+    config.paged_cache_groups[0].pool_id.clear();
+    EXPECT_THROW(MakeFlatBlockPoolConfigs(config), std::invalid_argument);
+}
+
 TEST(ForwardCacheOpsBuildFlatBlockTables, TwoGroupsRowsAndIds) {
     BlockPool pool(/*total_num_blocks=*/32, /*enable_caching=*/true);
     KvCacheCoordinator coordinator = MakeTwoGroup(pool);
@@ -426,6 +544,24 @@ TEST(ForwardCacheOpsBuildFlatBlockTables, KeyMatchesSuppliedGroupIdStrings) {
     EXPECT_TRUE(built.count("beta"));
     const std::vector<std::int32_t> expected_alpha = BlockTablePageIds(tables[0]);
     EXPECT_EQ(built.at("alpha"), expected_alpha);
+}
+
+TEST(ForwardCacheOpsBuildFlatBlockTables, ExportsExplicitBaseForEveryGroup) {
+    BlockPool pool(/*total_num_blocks=*/8, /*enable_caching=*/true);
+    std::vector<BlockTable> tables(2);
+    auto blocks = pool.AllocateBlocks(2);
+    ASSERT_EQ(blocks.size(), 2u);
+    std::vector<BlockRef> refs;
+    refs.reserve(blocks.size());
+    for (CacheBlock* block : blocks) {
+        refs.push_back(BlockRef::Adopt(pool, block));
+    }
+    tables[1].InitRange(/*base_logical_page=*/9, std::move(refs));
+
+    std::vector<std::string> group_ids{"full", "state"};
+    auto bases = BuildFlatBlockTableBaseOffsets(tables, group_ids);
+
+    EXPECT_EQ(bases, (std::map<std::string, std::int32_t>{{"full", 0}, {"state", 9}}));
 }
 
 }  // namespace

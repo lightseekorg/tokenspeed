@@ -31,6 +31,9 @@ import torch
 import torch.distributed as dist
 import tqdm
 
+from tokenspeed.runtime.configs.flat_memory_plan import (
+    validate_v4_flat_graph_owner_allocation,
+)
 from tokenspeed.runtime.configs.paged_cache_spec import (
     compute_max_logical_pages_for_capture,
 )
@@ -231,6 +234,19 @@ class CudaGraphWrapper:
         self.use_v4_mtp_paged_metadata = config.use_v4_mtp_paged_metadata
         self.dp_size = config.data_parallel_size
         self.world_size = config.world_size
+        self._target_flat_group_ids = CudaGraphWrapper._resolve_flat_cache_group_ids(
+            token_to_kv_pool,
+            attn_backend,
+        )
+        self._draft_flat_group_ids = CudaGraphWrapper._resolve_flat_cache_group_ids(
+            draft_token_to_kv_pool,
+            draft_attn_backend,
+        )
+        target_flat_graph_plan_kwargs = CudaGraphWrapper._flat_graph_plan_init_kwargs(
+            token_to_kv_pool,
+            owner="target",
+            max_bs=self.max_bs,
+        )
         # Backends alias their cache_seqlens buffer. Draft backend aliases
         # the drafter-owned draft_seq_lens to keep InputBuffers read-only.
         init_backend_cuda_graph_state(
@@ -240,8 +256,16 @@ class CudaGraphWrapper:
             paged_cache_group_specs=tuple(token_to_kv_pool.paged_cache_group_specs),
             max_tokens_per_req=self.max_tokens_per_req,
             overlap_schedule_depth=self.overlap_schedule_depth,
+            **target_flat_graph_plan_kwargs,
         )
         if draft_attn_backend is not None:
+            draft_flat_graph_plan_kwargs = (
+                CudaGraphWrapper._flat_graph_plan_init_kwargs(
+                    draft_token_to_kv_pool,
+                    owner="draft",
+                    max_bs=self.max_bs,
+                )
+            )
             init_backend_cuda_graph_state(
                 draft_attn_backend,
                 self.max_bs,
@@ -251,36 +275,53 @@ class CudaGraphWrapper:
                 ),
                 max_tokens_per_req=self.max_tokens_per_req,
                 overlap_schedule_depth=self.overlap_schedule_depth,
+                **draft_flat_graph_plan_kwargs,
             )
-            # Drafter reads the TARGET's flat tables (_draft_flat_tables):
-            # its page-size view must match the target's hetero geometry.
+            # Generic draft groups that reuse target group ids must keep the
+            # target's heterogeneous geometry. Owner-local V4-only ids retain
+            # the geometry learned from the draft pool itself.
             target_ps = getattr(attn_backend, "flat_group_page_sizes", None)
             draft_ps = getattr(draft_attn_backend, "flat_group_page_sizes", None)
             if target_ps and draft_ps is not None:
-                for gid in self._draft_flat_group_ids():
+                for gid in self._draft_flat_group_ids:
                     if gid in target_ps:
                         draft_ps[gid] = target_ps[gid]
 
-            # Drafter (Eagle) is constructed with the target's req_to_page
-            # (ModelExecutor passes the same self.req_to_page to both), and the
-            # replay path hands both backends the same req_pool_indices. The
-            # block-table gather is req_to_page[req_pool_indices] (see
+            # Legacy drafter backends are constructed with the target's
+            # req_to_page, and the replay path hands both backends the same
+            # req_pool_indices. Their block-table gather is
+            # req_to_page[req_pool_indices] (see
             # _create_block_kv_indices; it does not depend on seq_lens), so both
             # backends would compute identical block_kv_indices. When the backing
             # buffer shapes/dtypes also line up, point the draft backend at the
             # target's buffer and skip its gather+copy in the replay path: the
             # target's metadata prep runs first and populates the shared buffer
-            # (see init_forward_metadata_replay_cuda_graph).
+            # (see init_forward_metadata_replay_cuda_graph). V4 flat is
+            # deliberately excluded: target/draft consume distinct owner-local
+            # subsets of the scheduler union and have no canonical req_to_page.
             target_kv = getattr(attn_backend, "decode_cuda_graph_kv_indices", None)
             draft_kv = getattr(draft_attn_backend, "decode_cuda_graph_kv_indices", None)
+            target_group_keyed = bool(
+                getattr(attn_backend, "requires_group_keyed_cache_locs", False)
+                and getattr(token_to_kv_pool, "flat_memory_plan", None) is not None
+            )
+            draft_group_keyed = bool(
+                getattr(draft_attn_backend, "requires_group_keyed_cache_locs", False)
+                and getattr(draft_token_to_kv_pool, "flat_memory_plan", None)
+                is not None
+            )
             if (
-                target_kv is not None
+                not target_group_keyed
+                and not draft_group_keyed
+                and target_kv is not None
                 and draft_kv is not None
                 and target_kv.shape == draft_kv.shape
                 and target_kv.dtype == draft_kv.dtype
             ):
                 draft_attn_backend.decode_cuda_graph_kv_indices = target_kv
                 draft_attn_backend._block_table_aliased = True
+
+        CudaGraphWrapper._validate_v4_flat_graph_metadata_accounting(self)
 
         self.graph_variants = (
             sampling_backend.cuda_graph_capture_variants(self.max_tokens_per_req)
@@ -289,6 +330,11 @@ class CudaGraphWrapper:
         )
         self.graphs: dict[tuple[str, int], torch.cuda.CUDAGraph] = {}
         self.output_buffers: dict[tuple[str, int], tuple] = {}
+        # Cold acceptance evidence.  These booleans flip only on the first
+        # successful replay of each route, so the steady-state hot path pays a
+        # predictable boolean branch rather than a counter/hash update.
+        self._decode_graph_replayed = False
+        self._idle_graph_replayed = False
 
         self._forward_func: Callable | None = forward_func
         self.disable = config.enforce_eager
@@ -545,52 +591,190 @@ class CudaGraphWrapper:
             )
         return out
 
-    def _flat_cache_group_ids(self, pool) -> tuple[str, ...]:
+    @staticmethod
+    def _flat_graph_plan_init_kwargs(pool, *, owner: str, max_bs: int) -> dict:
+        """Bind one owner backend to the pool's canonical graph table plan."""
+        if pool is None:
+            return {}
+        plan = getattr(pool, "flat_memory_plan", None)
+        if plan is None:
+            return {}
+        pool_owner = getattr(pool, "cache_owner", None)
+        if pool_owner != owner:
+            raise RuntimeError(
+                "DeepSeek V4 flat CUDA graph pool owner mismatch: "
+                f"expected={owner!r}, actual={pool_owner!r}"
+            )
+        canonical_cols = plan.graph_capture_cols_by_group(owner)
+        pool_cols = getattr(pool, "flat_capture_cols_by_group", None)
+        if pool_cols is None:
+            raise RuntimeError(f"DeepSeek V4 {owner} flat pool is missing capture cols")
+        normalized_pool_cols = {
+            str(group_id): cols for group_id, cols in pool_cols.items()
+        }
+        if normalized_pool_cols != canonical_cols:
+            raise RuntimeError(
+                f"DeepSeek V4 {owner} pool capture cols disagree with plan: "
+                f"pool={normalized_pool_cols}, plan={canonical_cols}"
+            )
+        owner_group_ids = {str(spec.group_id) for spec in pool.paged_cache_group_specs}
+        if owner_group_ids != set(canonical_cols):
+            raise RuntimeError(
+                f"DeepSeek V4 {owner} graph groups disagree with owner-local "
+                f"pool specs: plan={sorted(canonical_cols)}, "
+                f"pool={sorted(owner_group_ids)}"
+            )
+        planned_rows = plan.graph_batch_rows(owner)
+        # Eager-only plans deliberately budget zero graph rows even though the
+        # wrapper still initializes generic backend state with a nominal max_bs.
+        if planned_rows not in (0, int(max_bs)):
+            raise RuntimeError(
+                f"DeepSeek V4 {owner} CUDA graph rows disagree with plan: "
+                f"wrapper={max_bs}, plan={planned_rows}"
+            )
+        return {
+            "flat_capture_cols_by_group": canonical_cols,
+            "flat_graph_batch_rows": planned_rows,
+        }
+
+    @staticmethod
+    def _actual_flat_graph_metadata_bytes(backend, plan, *, owner: str) -> int:
+        """Validate and total the backend's actual persistent table/base tensors."""
+        canonical_cols = plan.graph_capture_cols_by_group(owner)
+        rows = plan.graph_batch_rows(owner)
+        tables = getattr(backend, "_cuda_graph_paged_cache_block_tables", None)
+        bases = getattr(backend, "_cuda_graph_paged_cache_base_offsets", None)
+        if not isinstance(tables, dict) or not isinstance(bases, dict):
+            raise RuntimeError(
+                f"DeepSeek V4 {owner} backend did not publish graph table/base tensors"
+            )
+        return validate_v4_flat_graph_owner_allocation(
+            owner=owner,
+            capture_cols_by_group=canonical_cols,
+            batch_rows=rows,
+            table_shapes={gid: tensor.shape for gid, tensor in tables.items()},
+            base_shapes={gid: tensor.shape for gid, tensor in bases.items()},
+            table_nbytes={
+                gid: int(tensor.numel()) * int(tensor.element_size())
+                for gid, tensor in tables.items()
+            },
+            base_nbytes={
+                gid: int(tensor.numel()) * int(tensor.element_size())
+                for gid, tensor in bases.items()
+            },
+        )
+
+    def _validate_v4_flat_graph_metadata_accounting(self) -> None:
+        """Cross-check target+draft actual tensors against one shared plan."""
+        target_plan = getattr(self.token_to_kv_pool, "flat_memory_plan", None)
+        draft_plan = getattr(
+            getattr(self, "draft_token_to_kv_pool", None),
+            "flat_memory_plan",
+            None,
+        )
+        if target_plan is None:
+            if draft_plan is not None:
+                raise RuntimeError(
+                    "DeepSeek V4 draft flat graph plan exists without target plan"
+                )
+            return
+        if draft_plan is not None and (
+            draft_plan.plan_fingerprint != target_plan.plan_fingerprint
+        ):
+            raise RuntimeError(
+                "DeepSeek V4 target/draft CUDA graph pools disagree on flat plan: "
+                f"target={target_plan.plan_fingerprint}, "
+                f"draft={draft_plan.plan_fingerprint}"
+            )
+
+        target_actual_bytes = CudaGraphWrapper._actual_flat_graph_metadata_bytes(
+            self.attn_backend,
+            target_plan,
+            owner="target",
+        )
+        draft_cols = target_plan.graph_capture_cols_by_group("draft")
+        if draft_cols:
+            if self.draft_attn_backend is None or draft_plan is None:
+                raise RuntimeError(
+                    "DeepSeek V4 flat plan budgets draft graph metadata but the "
+                    "draft backend/pool is missing"
+                )
+            draft_actual_bytes = CudaGraphWrapper._actual_flat_graph_metadata_bytes(
+                self.draft_attn_backend,
+                target_plan,
+                owner="draft",
+            )
+        else:
+            if draft_plan is not None:
+                raise RuntimeError(
+                    "DeepSeek V4 draft flat pool exists without draft graph groups"
+                )
+            draft_actual_bytes = 0
+        target_plan.validate_graph_metadata_allocation(
+            target_actual_bytes=target_actual_bytes,
+            draft_actual_bytes=draft_actual_bytes,
+        )
+
+    @staticmethod
+    def _uses_flat_table_source(pool, backend) -> bool:
+        """Whether this backend/pool pair is actively driven by flat tables.
+
+        Generic flat-only backends do not consume radix paged groups.  V4 is a
+        dual-source backend, so its shared arena plan selects flat while the
+        legacy per-pool allocation keeps selecting radix.
+        """
+        if not getattr(backend, "uses_flat_cache_groups", False):
+            return False
+        return (
+            not getattr(backend, "uses_paged_cache_groups", False)
+            or getattr(pool, "flat_memory_plan", None) is not None
+        )
+
+    @staticmethod
+    def _resolve_flat_cache_group_ids(pool, backend) -> tuple[str, ...]:
         """Group ids for flat per-group CUDA-graph capture: real tables only
         arrive at replay, so capture needs just the ids to allocate its
         persistent per-group buffers."""
-        if not getattr(self.attn_backend, "uses_flat_cache_groups", False):
+        if pool is None or backend is None:
+            return ()
+        if not CudaGraphWrapper._uses_flat_table_source(pool, backend):
             return ()
         return tuple(str(spec.group_id) for spec in pool.paged_cache_group_specs)
 
-    def _draft_flat_group_ids(self) -> tuple[str, ...]:
-        """Per-group flat page tables the drafter consumes.
-
-        The draft head shares the TARGET's page-id space (EAGLE writes its
-        own pool tensors at the same indices), so each draft group consumes
-        the target table of the SAME group id. A draft pool that publishes
-        its own specs (Inkling MTP: mixed full/SWA depths) names exactly the
-        groups its layers carry — all of which exist in the target's table
-        set by construction (same label vocabulary, same window). Older
-        draft paths without a separate pool keep the full-history fallback.
-        """
-        if self.draft_attn_backend is None or not getattr(
-            self.draft_attn_backend, "uses_flat_cache_groups", False
-        ):
-            return ()
-        if self.draft_token_to_kv_pool is not None and getattr(
-            self.draft_token_to_kv_pool, "paged_cache_group_specs", ()
-        ):
-            return tuple(
-                str(spec.group_id)
-                for spec in self.draft_token_to_kv_pool.paged_cache_group_specs
-                if spec.family != "state"
+    @staticmethod
+    def _owner_flat_inputs(
+        flat_block_tables,
+        flat_block_table_base_offsets,
+        group_ids,
+        *,
+        owner: str,
+    ):
+        """Subset one owner's atomic table/base pair with one group scan."""
+        if not group_ids:
+            return None, None
+        if flat_block_tables is None or flat_block_table_base_offsets is None:
+            raise RuntimeError(
+                f"{owner} flat cache input is missing required table/base maps"
             )
-        return tuple(
-            str(spec.group_id)
-            for spec in self.token_to_kv_pool.paged_cache_group_specs
-            if spec.family != "state" and spec.retention == "full_history"
-        )
-
-    def _draft_flat_tables(self, flat_block_tables):
-        """Subset of the target's per-group tables the drafter consumes."""
-        gids = self._draft_flat_group_ids()
-        if not gids or not flat_block_tables:
-            return None
-        subset = {
-            gid: flat_block_tables[gid] for gid in gids if gid in flat_block_tables
-        }
-        return subset or None
+        missing_tables = []
+        missing_bases = []
+        owner_tables = {}
+        owner_bases = {}
+        for group_id in group_ids:
+            if group_id not in flat_block_tables:
+                missing_tables.append(group_id)
+            else:
+                owner_tables[group_id] = flat_block_tables[group_id]
+            if group_id not in flat_block_table_base_offsets:
+                missing_bases.append(group_id)
+            else:
+                owner_bases[group_id] = flat_block_table_base_offsets[group_id]
+        if missing_tables or missing_bases:
+            raise RuntimeError(
+                f"{owner} flat cache input is missing required groups: "
+                f"tables={sorted(missing_tables)}, bases={sorted(missing_bases)}"
+            )
+        return owner_tables, owner_bases
 
     def _init_capture_metadata(self, bs: int):
         capture_kwargs = {}
@@ -598,16 +782,21 @@ class CudaGraphWrapper:
             capture_kwargs["mamba_pool_indices"] = (
                 self.input_buffers.mamba_pool_indices_buf[:bs]
             )
-        if self.attn_backend.uses_paged_cache_groups:
+        target_uses_flat_source = CudaGraphWrapper._uses_flat_table_source(
+            self.token_to_kv_pool, self.attn_backend
+        )
+        if self.attn_backend.uses_paged_cache_groups and not target_uses_flat_source:
             paged_cache_block_tables = self._capture_paged_cache_block_tables(
                 bs,
                 self.token_to_kv_pool,
             )
             if paged_cache_block_tables is not None:
                 capture_kwargs["paged_cache_block_tables"] = paged_cache_block_tables
-                if self.drafter is not None:
-                    capture_kwargs["num_tokens"] = bs * self.max_tokens_per_req
-        flat_cache_group_ids = self._flat_cache_group_ids(self.token_to_kv_pool)
+        # Packed speculative decode is a token-shape contract, independent of
+        # whether grouped cache metadata comes from radix or flat tables.
+        if self.attn_backend.uses_paged_cache_groups and self.drafter is not None:
+            capture_kwargs["num_tokens"] = bs * self.max_tokens_per_req
+        flat_cache_group_ids = self._target_flat_group_ids
         if flat_cache_group_ids:
             capture_kwargs["flat_cache_group_ids"] = flat_cache_group_ids
         self.attn_backend.init_forward_metadata_capture_cuda_graph(
@@ -619,9 +808,16 @@ class CudaGraphWrapper:
         )
         if self.draft_attn_backend is not None:
             draft_kwargs = {}
+            draft_uses_flat_source = (
+                self.draft_token_to_kv_pool is not None
+                and CudaGraphWrapper._uses_flat_table_source(
+                    self.draft_token_to_kv_pool, self.draft_attn_backend
+                )
+            )
             if (
                 self.draft_token_to_kv_pool is not None
                 and self.draft_attn_backend.uses_paged_cache_groups
+                and not draft_uses_flat_source
             ):
                 draft_paged_cache_block_tables = self._capture_paged_cache_block_tables(
                     bs,
@@ -631,8 +827,9 @@ class CudaGraphWrapper:
                     draft_kwargs["paged_cache_block_tables"] = (
                         draft_paged_cache_block_tables
                     )
-                    draft_kwargs["num_tokens"] = bs * self.max_tokens_per_req
-            draft_flat_ids = self._draft_flat_group_ids()
+            if self.draft_attn_backend.uses_paged_cache_groups:
+                draft_kwargs["num_tokens"] = bs * self.max_tokens_per_req
+            draft_flat_ids = self._draft_flat_group_ids
             if draft_flat_ids:
                 draft_kwargs["flat_cache_group_ids"] = draft_flat_ids
             # Drafter mutates seq_lens_buf in place per step; backends alias.
@@ -648,7 +845,13 @@ class CudaGraphWrapper:
         """Minimal per-group tables for the bs==0 idle replay: all rows are
         dummy rows, so one column of page-0 entries per group is valid.
         None when the pool publishes no groups."""
-        specs = tuple(self.token_to_kv_pool.paged_cache_group_specs)
+        specs = tuple(
+            getattr(
+                self.token_to_kv_pool,
+                "scheduler_group_specs",
+                self.token_to_kv_pool.paged_cache_group_specs,
+            )
+        )
         if not specs:
             return None
         table = torch.zeros((padded_bs, 1), dtype=torch.int32, device=self.device)
@@ -683,6 +886,46 @@ class CudaGraphWrapper:
                 value=pad_value,
             )
         return out
+
+    def _idle_flat_block_table_base_offsets(
+        self, padded_bs: int, flat_block_tables: dict
+    ) -> dict:
+        """Pair idle dummy table rows with explicit logical base zero."""
+        return {
+            gid: torch.zeros(
+                (padded_bs,),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            for gid in flat_block_tables
+        }
+
+    @staticmethod
+    def _validate_flat_table_base_offsets(
+        flat_block_tables: dict | None,
+        flat_block_table_base_offsets: dict | None,
+        *,
+        where: str,
+    ) -> None:
+        """Flat table rows and logical bases are one atomic group-keyed ABI."""
+        table_keys = set(flat_block_tables or {})
+        base_keys = set(flat_block_table_base_offsets or {})
+        if table_keys != base_keys:
+            raise RuntimeError(
+                f"{where}: flat block table/base group mismatch: "
+                f"tables={sorted(table_keys)}, bases={sorted(base_keys)}"
+            )
+        for gid in table_keys:
+            table = flat_block_tables[gid]
+            offsets = flat_block_table_base_offsets[gid]
+            if isinstance(table, torch.Tensor) and isinstance(offsets, torch.Tensor):
+                table_rows = int(table.shape[0])
+                offset_rows = int(offsets.shape[0])
+                if table_rows != offset_rows:
+                    raise RuntimeError(
+                        f"{where}: flat group {gid!r} has {table_rows} table "
+                        f"rows but {offset_rows} base rows"
+                    )
 
     @staticmethod
     def _pad_offsets_to_padded_bs(
@@ -727,13 +970,30 @@ class CudaGraphWrapper:
             "paged_cache_block_table_base_offsets", None
         )
         flat_block_tables = kwargs.pop("flat_block_tables", None)
-        target_uses_paged_groups = getattr(
-            self.attn_backend,
-            "uses_paged_cache_groups",
-            False,
+        flat_block_table_base_offsets = kwargs.pop(
+            "flat_block_table_base_offsets", None
         )
-        draft_uses_paged_groups = self.draft_attn_backend is not None and getattr(
-            self.draft_attn_backend, "uses_paged_cache_groups", False
+        self._validate_flat_table_base_offsets(
+            flat_block_tables,
+            flat_block_table_base_offsets,
+            where="CUDA graph replay",
+        )
+        target_uses_flat_source = flat_block_tables is not None and bool(
+            self._target_flat_group_ids
+        )
+        target_uses_paged_groups = (
+            getattr(self.attn_backend, "uses_paged_cache_groups", False)
+            and not target_uses_flat_source
+        )
+        draft_uses_flat_source = (
+            flat_block_tables is not None
+            and self.draft_attn_backend is not None
+            and bool(self._draft_flat_group_ids)
+        )
+        draft_uses_paged_groups = (
+            self.draft_attn_backend is not None
+            and getattr(self.draft_attn_backend, "uses_paged_cache_groups", False)
+            and not draft_uses_flat_source
         )
         if paged_cache_block_tables is not None and (
             target_uses_paged_groups or draft_uses_paged_groups
@@ -763,30 +1023,79 @@ class CudaGraphWrapper:
                     kwargs["paged_cache_block_table_base_offsets"] = (
                         paged_cache_block_table_base_offsets
                     )
-        if flat_block_tables is not None and getattr(
-            self.attn_backend, "uses_flat_cache_groups", False
-        ):
-            flat_table_bs = next(
-                (
-                    int(table.shape[0])
-                    for table in flat_block_tables.values()
-                    if isinstance(table, torch.Tensor)
-                ),
-                int(req_pool_indices.shape[0]),
-            )
-            if getattr(self.attn_backend, "flat_tables_self_padding", False):
-                # Backend pads dummy rows itself; F.pad would reallocate tables and break storage sharing.
-                kwargs["flat_block_tables"] = flat_block_tables
+        scheduler_flat_block_tables = None
+        scheduler_flat_block_table_base_offsets = None
+        if target_uses_flat_source:
+            flat_staging = getattr(self.input_buffers, "flat_block_table_staging", None)
+            if flat_staging is not None:
+                if actual_bs == 0:
+                    # stage_idle already returned padded views backed by the
+                    # newly rotated slot. There is no active-row shape to pad.
+                    scheduler_flat_block_tables = flat_block_tables
+                    scheduler_flat_block_table_base_offsets = (
+                        flat_block_table_base_offsets
+                    )
+                else:
+                    (
+                        scheduler_flat_block_tables,
+                        scheduler_flat_block_table_base_offsets,
+                    ) = flat_staging.pad_current_for_graph(
+                        flat_block_tables,
+                        flat_block_table_base_offsets,
+                        actual_rows=actual_bs,
+                        padded_rows=padded_bs,
+                    )
             else:
-                kwargs["flat_block_tables"] = self._pad_block_tables_to_padded_bs(
-                    flat_block_tables,
-                    actual_bs=flat_table_bs,
-                    padded_bs=padded_bs,
-                    pad_value=0,
+                flat_table_bs = next(
+                    (
+                        int(table.shape[0])
+                        for table in flat_block_tables.values()
+                        if isinstance(table, torch.Tensor)
+                    ),
+                    int(req_pool_indices.shape[0]),
                 )
+                flat_consumers = [self.attn_backend]
+                if draft_uses_flat_source:
+                    flat_consumers.append(self.draft_attn_backend)
+                if all(
+                    getattr(backend, "flat_tables_self_padding", False)
+                    for backend in flat_consumers
+                ):
+                    # Preserve the packed/staged storage identity; these
+                    # backends fill dummy rows in their persistent stacks.
+                    scheduler_flat_block_tables = flat_block_tables
+                    scheduler_flat_block_table_base_offsets = (
+                        flat_block_table_base_offsets
+                    )
+                else:
+                    scheduler_flat_block_tables = self._pad_block_tables_to_padded_bs(
+                        flat_block_tables,
+                        actual_bs=flat_table_bs,
+                        padded_bs=padded_bs,
+                        pad_value=0,
+                    )
+                    scheduler_flat_block_table_base_offsets = (
+                        self._pad_offsets_to_padded_bs(
+                            flat_block_table_base_offsets,
+                            actual_bs=actual_bs,
+                            padded_bs=padded_bs,
+                        )
+                    )
+            (
+                kwargs["flat_block_tables"],
+                kwargs["flat_block_table_base_offsets"],
+            ) = CudaGraphWrapper._owner_flat_inputs(
+                scheduler_flat_block_tables,
+                scheduler_flat_block_table_base_offsets,
+                self._target_flat_group_ids,
+                owner="target",
+            )
         if self.attn_backend.uses_padded_decode_token_mask:
             kwargs["actual_bs"] = actual_bs
-        if target_uses_paged_groups and getattr(self, "drafter", None) is not None:
+        if (
+            self.attn_backend.uses_paged_cache_groups
+            and getattr(self, "drafter", None) is not None
+        ):
             kwargs["num_tokens"] = padded_bs * self.max_tokens_per_req
         self.attn_backend.init_forward_metadata_replay_cuda_graph(
             padded_bs,
@@ -806,11 +1115,17 @@ class CudaGraphWrapper:
                     )
             if getattr(self.draft_attn_backend, "uses_padded_decode_token_mask", False):
                 draft_attn_kwargs["actual_bs"] = actual_bs
-            draft_flat = self._draft_flat_tables(kwargs.get("flat_block_tables"))
+            draft_flat, draft_flat_bases = CudaGraphWrapper._owner_flat_inputs(
+                scheduler_flat_block_tables,
+                scheduler_flat_block_table_base_offsets,
+                self._draft_flat_group_ids,
+                owner="draft",
+            )
             if draft_flat is not None:
                 draft_attn_kwargs["flat_block_tables"] = draft_flat
+                draft_attn_kwargs["flat_block_table_base_offsets"] = draft_flat_bases
             draft_forward_mode = ForwardMode.DECODE
-            if draft_uses_paged_groups:
+            if getattr(self.draft_attn_backend, "uses_paged_cache_groups", False):
                 draft_attn_kwargs["num_tokens"] = padded_bs * self.max_tokens_per_req
             draft_seq_lens = self.drafter.draft_seq_lens_buf[:padded_bs]
             draft_seq_lens.copy_(seq_lens[:padded_bs])
@@ -841,6 +1156,34 @@ class CudaGraphWrapper:
             and forward_mode.is_decode()
         ):
             kwargs.setdefault("num_tokens", padded_bs * self.max_tokens_per_req)
+        scheduler_flat_tables = kwargs.get("flat_block_tables")
+        scheduler_flat_bases = kwargs.get("flat_block_table_base_offsets")
+        if not scheduler_flat_tables:
+            # The model executor's source-neutral bridge returns an empty map
+            # when a radix operation has no flat ABI. Do not pass that empty
+            # placeholder alongside radix paged tables: V4 deliberately
+            # rejects dual-source metadata, and capability does not imply that
+            # flat is active for its legacy per-pool allocation.
+            kwargs = {**kwargs}
+            kwargs.pop("flat_block_tables", None)
+            kwargs.pop("flat_block_table_base_offsets", None)
+            scheduler_flat_tables = None
+            scheduler_flat_bases = None
+        target_kwargs = kwargs
+        if scheduler_flat_tables is not None:
+            target_flat, target_flat_bases = CudaGraphWrapper._owner_flat_inputs(
+                scheduler_flat_tables,
+                scheduler_flat_bases,
+                self._target_flat_group_ids,
+                owner="target",
+            )
+            target_kwargs = {
+                **kwargs,
+                "flat_block_tables": target_flat,
+                "flat_block_table_base_offsets": target_flat_bases,
+            }
+            target_kwargs.pop("paged_cache_block_tables", None)
+            target_kwargs.pop("paged_cache_block_table_base_offsets", None)
         self.attn_backend.init_forward_metadata(
             bs=padded_bs,
             num_extends=num_extends,
@@ -848,11 +1191,19 @@ class CudaGraphWrapper:
             seq_lens=seq_lens,
             req_to_page=req_to_page,
             forward_mode=forward_mode,
-            **kwargs,
+            **target_kwargs,
         )
         if self.draft_attn_backend is not None:
             draft_kwargs = {}
-            if getattr(self.draft_attn_backend, "uses_paged_cache_groups", False):
+            draft_flat, draft_flat_bases = CudaGraphWrapper._owner_flat_inputs(
+                scheduler_flat_tables,
+                scheduler_flat_bases,
+                self._draft_flat_group_ids,
+                owner="draft",
+            )
+            if draft_flat is None and getattr(
+                self.draft_attn_backend, "uses_paged_cache_groups", False
+            ):
                 for key in (
                     "paged_cache_block_tables",
                     "paged_cache_block_table_base_offsets",
@@ -860,9 +1211,9 @@ class CudaGraphWrapper:
                     value = kwargs.get(key)
                     if value is not None:
                         draft_kwargs[key] = value
-            draft_flat = self._draft_flat_tables(kwargs.get("flat_block_tables"))
             if draft_flat is not None:
                 draft_kwargs["flat_block_tables"] = draft_flat
+                draft_kwargs["flat_block_table_base_offsets"] = draft_flat_bases
 
             # The drafter mutates draft_seq_lens_buf between MTP draft steps;
             # decode metadata must alias that buffer.
@@ -879,12 +1230,19 @@ class CudaGraphWrapper:
                 draft_prefill_seq_lens = (
                     seq_lens if self.use_v4_mtp_paged_metadata else draft_seq_lens
                 )
-                # Drafter consumes its own groups' tables (see _draft_flat_tables).
-                draft_extend_kwargs = (
-                    {**kwargs, "flat_block_tables": draft_flat}
-                    if kwargs.get("flat_block_tables") is not None
-                    else kwargs
-                )
+                # The draft backend consumes its owner-local table/base subset.
+                draft_extend_kwargs = {**kwargs}
+                if draft_flat is not None:
+                    draft_extend_kwargs.pop("paged_cache_block_tables", None)
+                    draft_extend_kwargs.pop(
+                        "paged_cache_block_table_base_offsets", None
+                    )
+                    draft_extend_kwargs.update(
+                        flat_block_tables=draft_flat,
+                        flat_block_table_base_offsets=draft_kwargs.get(
+                            "flat_block_table_base_offsets"
+                        ),
+                    )
                 self.draft_attn_backend.init_forward_metadata(
                     bs=padded_bs,
                     num_extends=num_extends,
@@ -1015,6 +1373,7 @@ class CudaGraphWrapper:
         paged_cache_block_tables: dict | None = None,
         paged_cache_block_table_base_offsets: dict | None = None,
         flat_block_tables: dict | None = None,
+        flat_block_table_base_offsets: dict | None = None,
     ):
         """
         Unified forward entry point.
@@ -1026,6 +1385,11 @@ class CudaGraphWrapper:
         use_graph = self._can_use_graph(bs, ctx)
         padded_bs = self._padded_bs(bs, ctx) if use_graph else bs
         active_req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
+        target_uses_flat_source = bool(self._target_flat_group_ids)
+        target_uses_paged_groups = bool(
+            getattr(self.attn_backend, "uses_paged_cache_groups", False)
+            and not target_uses_flat_source
+        )
 
         if use_graph and padded_bs != bs:
             ctx.bs = padded_bs
@@ -1078,7 +1442,7 @@ class CudaGraphWrapper:
             if (
                 bs == 0
                 and paged_cache_block_tables is None
-                and self.attn_backend.uses_paged_cache_groups
+                and target_uses_paged_groups
             ):
                 paged_cache_block_tables = self._capture_paged_cache_block_tables(
                     padded_bs,
@@ -1086,12 +1450,22 @@ class CudaGraphWrapper:
                 )
             # The backend's stale-table guard also covers the bs==0 idle
             # replay: synthesize minimal valid tables for it.
-            if (
-                bs == 0
-                and not flat_block_tables
-                and getattr(self.attn_backend, "uses_flat_cache_groups", False)
-            ):
-                flat_block_tables = self._idle_flat_block_tables(padded_bs)
+            if bs == 0 and not flat_block_tables and target_uses_flat_source:
+                flat_staging = getattr(
+                    self.input_buffers, "flat_block_table_staging", None
+                )
+                if flat_staging is not None:
+                    (
+                        flat_block_tables,
+                        flat_block_table_base_offsets,
+                    ) = flat_staging.stage_idle(padded_rows=padded_bs)
+                else:
+                    flat_block_tables = self._idle_flat_block_tables(padded_bs)
+                    flat_block_table_base_offsets = (
+                        self._idle_flat_block_table_base_offsets(
+                            padded_bs, flat_block_tables
+                        )
+                    )
             self._init_replay_metadata(
                 padded_bs,
                 bs,
@@ -1105,6 +1479,7 @@ class CudaGraphWrapper:
                     paged_cache_block_table_base_offsets
                 ),
                 flat_block_tables=flat_block_tables,
+                flat_block_table_base_offsets=(flat_block_table_base_offsets),
                 **mamba_kwargs,
             )
 
@@ -1116,6 +1491,11 @@ class CudaGraphWrapper:
             graph_key = self._cuda_graph_key(padded_bs)
             with nvtx_range("graph_replay", color="red"):
                 self.graphs[graph_key].replay()
+            if bs == 0:
+                if not self._idle_graph_replayed:
+                    self._idle_graph_replayed = True
+            elif not self._decode_graph_replayed:
+                self._decode_graph_replayed = True
 
             (
                 output_tokens,
@@ -1134,6 +1514,11 @@ class CudaGraphWrapper:
             )
 
         else:
+            self._validate_flat_table_base_offsets(
+                flat_block_tables,
+                flat_block_table_base_offsets,
+                where="CudaGraphWrapper eager forward",
+            )
             # Eager parity with the replay stale-table guard: with >1 group
             # the single-table fallback would serve first-group pages to
             # every layer. Idle/bs==0 forwards carry no requests (exempt);
@@ -1142,7 +1527,7 @@ class CudaGraphWrapper:
                 bs > 0
                 and not ctx.forward_mode.is_idle()
                 and not flat_block_tables
-                and getattr(self.attn_backend, "uses_flat_cache_groups", False)
+                and target_uses_flat_source
                 and len(self.token_to_kv_pool.paged_cache_group_specs) > 1
             ):
                 raise RuntimeError(
@@ -1154,9 +1539,7 @@ class CudaGraphWrapper:
                     "would use one group's pages for all layers."
                 )
             metadata_num_tokens = (
-                {"num_tokens": ctx.input_num_tokens}
-                if self.attn_backend.uses_paged_cache_groups
-                else {}
+                {"num_tokens": ctx.input_num_tokens} if target_uses_paged_groups else {}
             )
             self._init_forward_metadata(
                 padded_bs,
@@ -1177,19 +1560,18 @@ class CudaGraphWrapper:
                 capture_hidden_mode=ctx.capture_hidden_mode,
                 **metadata_num_tokens,
                 paged_cache_block_tables=(
-                    paged_cache_block_tables
-                    if self.attn_backend.uses_paged_cache_groups
-                    else None
+                    paged_cache_block_tables if target_uses_paged_groups else None
                 ),
                 paged_cache_block_table_base_offsets=(
                     paged_cache_block_table_base_offsets
-                    if self.attn_backend.uses_paged_cache_groups
+                    if target_uses_paged_groups
                     else None
                 ),
                 flat_block_tables=(
-                    flat_block_tables
-                    if self.attn_backend.uses_flat_cache_groups
-                    else None
+                    flat_block_tables if target_uses_flat_source else None
+                ),
+                flat_block_table_base_offsets=(
+                    flat_block_table_base_offsets if target_uses_flat_source else None
                 ),
                 **mamba_kwargs,
             )
@@ -1207,3 +1589,15 @@ class CudaGraphWrapper:
             self.attn_backend.update_mamba_state_after_mtp_verify(accept_lengths, None)
 
         return result
+
+    def runtime_evidence(self) -> dict[str, object]:
+        """Return cold, JSON-safe proof of actual decode/idle graph use."""
+
+        return {
+            "captured_keys": [
+                {"variant": str(variant), "batch_size": int(batch_size)}
+                for variant, batch_size in sorted(self.graphs)
+            ],
+            "decode_replayed": bool(self._decode_graph_replayed),
+            "idle_replayed": bool(self._idle_graph_replayed),
+        }

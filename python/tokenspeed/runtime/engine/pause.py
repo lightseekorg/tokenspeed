@@ -86,15 +86,21 @@ def scheduler_drained(scheduler) -> bool:
     """True when the scheduler holds no requests that need a forward pass.
 
     Covers every active lifecycle state (waiting/submitted, prefilling,
-    decoding, retracted). Post-finish writeback states are async teardown and
-    do not run forward work, so they do not block a drain.
+    decoding, retracted). A structured flat-KV scheduler also owns completion
+    fences and page references after the last forward pass, so its optional
+    quiescence predicate joins the drain boundary. Legacy schedulers have no
+    such predicate and retain the original forward-work-only behavior.
     """
-    return (
+    forward_drained = (
         scheduler.waiting_size() == 0
         and scheduler.decoding_size() == 0
         and scheduler.prefilling_size() == 0
         and scheduler.retract_count() == 0
     )
+    if not forward_drained:
+        return False
+    flat_quiescent = getattr(scheduler, "flat_kv_cache_quiescent", None)
+    return not callable(flat_quiescent) or bool(flat_quiescent())
 
 
 class PauseController:

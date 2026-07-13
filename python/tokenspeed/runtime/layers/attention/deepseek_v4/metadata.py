@@ -145,6 +145,10 @@ class DeepseekV4ForwardMetadata:
     # forcing another device-to-host sync in the model path.
     seq_lens_cpu: torch.Tensor | None = None
     query_lens_cpu: torch.Tensor | None = None
+    # Host prefix sums derived once from query_lens_cpu. Per-layer prefill
+    # chunking consumes this immutable tuple instead of synchronizing the CUDA
+    # query_start_loc tensor back to the host.
+    query_start_offsets: tuple[int, ...] | None = None
     # Cached split boundary derived from scheduler num_extends/query_lens.
     num_prefill_reqs: int = 0
     num_prefill_tokens: int = 0

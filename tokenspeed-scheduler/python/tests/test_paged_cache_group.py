@@ -2,8 +2,11 @@ import pytest
 from tokenspeed_scheduler import (
     PagedCacheGroupAllocator,
     PagedCacheGroupConfig,
+    PagedCacheGroupFamily,
     PagedCacheGroupTable,
+    PagedCachePrefixRole,
     PagedCacheRetention,
+    PagedCacheTableLayout,
 )
 
 
@@ -26,6 +29,52 @@ def _sliding_config(rows_per_page=2, entry_stride_tokens=1, total_pages=8, windo
         retention=PagedCacheRetention.SlidingWindow,
         sliding_window_tokens=window,
     )
+
+
+def test_flat_group_metadata_round_trip_and_strict_geometry_validation():
+    config = PagedCacheGroupConfig(
+        group_id="v4.c4.state",
+        rows_per_page=1,
+        entry_stride_tokens=4,
+        total_pages=32,
+        retention=PagedCacheRetention.SlidingWindow,
+        sliding_window_tokens=128,
+        family=PagedCacheGroupFamily.State,
+        block_size=4,
+        pool_id="v4.c4.state",
+        prefix_role=PagedCachePrefixRole.ContinuationState,
+        table_layout=PagedCacheTableLayout.BoundedWindow,
+        required_producer_domain_mask=0b0011,
+        owner_mask=0b0011,
+    )
+
+    config.validate_flat_block_geometry()
+    assert config.block_size == 4
+    assert config.pool_id == "v4.c4.state"
+    assert config.prefix_role == PagedCachePrefixRole.ContinuationState
+    assert config.table_layout == PagedCacheTableLayout.BoundedWindow
+    assert config.required_producer_domain_mask == 0b0011
+    assert config.owner_mask == 0b0011
+
+
+def test_legacy_group_constructor_keeps_unset_flat_metadata():
+    config = PagedCacheGroupConfig(
+        "legacy",
+        64,
+        4,
+        10,
+        PagedCacheRetention.FullHistory,
+        None,
+        PagedCacheGroupFamily.History,
+    )
+
+    config.validate()
+    assert config.block_size == 0
+    assert config.pool_id == ""
+    assert config.prefix_role == PagedCachePrefixRole.HistoryAnchor
+    assert config.table_layout == PagedCacheTableLayout.Absolute
+    with pytest.raises(ValueError, match="flat block_size must be > 0"):
+        config.validate_flat_block_geometry()
 
 
 def test_full_history_release_skipped_is_noop():

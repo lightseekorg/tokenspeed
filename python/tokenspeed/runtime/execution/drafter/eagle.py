@@ -27,6 +27,7 @@ import torch
 from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
 from typing_extensions import override
 
+from tokenspeed.runtime.configs.model_config import is_deepseek_v4_nextn
 from tokenspeed.runtime.execution.cache_loc_kernel import (
     compute_out_cache_loc_uniform,
 )
@@ -54,6 +55,17 @@ def _advance_draft_forward_metadata_if_supported(attn_backend, seq_lens) -> None
     advance = getattr(attn_backend, "advance_draft_forward_metadata", None)
     if advance is not None:
         advance(seq_lens)
+
+
+def _first_step_covers_all_draft_kv_layers(model_config: Any) -> bool:
+    """Whether one Eagle invocation writes a continuous prefix for every draft layer."""
+
+    hf_config = getattr(model_config, "hf_config", None)
+    return bool(
+        hf_config is not None
+        and is_deepseek_v4_nextn(hf_config)
+        and getattr(model_config, "num_attention_layers", 0) == 1
+    )
 
 
 @dataclass
@@ -138,6 +150,14 @@ class Eagle(BaseDrafter):
         # VLM placeholder ids plumbed by ModelExecutor; empty for text-only targets.
         self.mm_pad_substitute_ids: dict[Modality, int] = {}
         hf_config = getattr(draft_model_runner.model_config, "hf_config", None)
+        # V4 NextN selects layer `spec_step_idx % num_mtp_layers`. With one
+        # layer every speculative iteration extends the same draft KV plane,
+        # so the completed Eagle invocation covers a continuous prefix. With
+        # multiple layers the round-robin writes are sparse per layer and must
+        # remain fail-closed until a dense catch-up path exists.
+        self.first_step_covers_all_draft_kv_layers = (
+            _first_step_covers_all_draft_kv_layers(draft_model_runner.model_config)
+        )
         self._dsa_reuse_mtp_topk = bool(
             getattr(hf_config, "index_share_for_mtp_iteration", False)
         )
@@ -365,14 +385,20 @@ class Eagle(BaseDrafter):
 
         # Write cache slots for steps 1..N-1.
         cache_locs = self.draft_out_cache_loc_buf[: bs * (self.spec_num_steps - 1)]
-        compute_out_cache_loc_uniform(
-            out_cache_loc_ptr=cache_locs,
-            req_pool_indices=req_pool_indices,
-            uniform_input_length=self.spec_num_steps - 1,
-            cache_start=cache_start,
-            req_to_pages=self.req_to_page,
-            page_size=self.page_size,
-        )
+        if self.input_buffers.uses_group_keyed_cache_locs:
+            # Group-keyed flat draft writes are resolved by the already-initialized
+            # owner-local backend metadata. A scalar cache loc cannot encode
+            # (group_id, local_page_id), so pass only the page-0 sentinel.
+            cache_locs.fill_(self.input_buffers.dummy_kv_slot)
+        else:
+            compute_out_cache_loc_uniform(
+                out_cache_loc_ptr=cache_locs,
+                req_pool_indices=req_pool_indices,
+                uniform_input_length=self.spec_num_steps - 1,
+                cache_start=cache_start,
+                req_to_pages=self.req_to_page,
+                page_size=self.page_size,
+            )
         cache_locs = cache_locs.view(bs, self.spec_num_steps - 1)
         # +1 is the kernel's read-inclusive convention; advanced per iter.
         draft_seq_lens = self.draft_seq_lens_buf[:bs]

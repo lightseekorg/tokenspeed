@@ -20,6 +20,10 @@
 
 #pragma once
 
+#include <cstddef>
+#include <exception>
+#include <type_traits>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -29,17 +33,15 @@ namespace tokenspeed {
 
 class ExecutionPlan {
 public:
-    template <typename OperationType>
-    ExecutionPlan& With(OperationType operation) {
-        operations_.emplace_back(operation);
-        return *this;
-    }
+    void ReserveOperations(std::size_t capacity) { operations_.reserve(capacity); }
 
     template <typename OperationType>
-    ExecutionPlan& With(std::vector<OperationType> ops) {
-        for (auto& op : ops) {
-            operations_.emplace_back(std::move(op));
+    ExecutionPlan& With(OperationType operation) noexcept {
+        static_assert(std::is_nothrow_constructible_v<Operation, OperationType&&>);
+        if (operations_.size() == operations_.capacity()) {
+            std::terminate();
         }
+        operations_.emplace_back(std::move(operation));
         return *this;
     }
 
@@ -49,6 +51,10 @@ public:
     // unretractable mid-prefill holders (possibly the request itself, or a mutual wedge)
     // with no Decoding/PrefillDone victim to retract. Always empty on the radix path.
     std::vector<std::string> flat_oom_request_ids;
+
+    void TakeFlatOomRequestIds(std::vector<std::string>& outbox) noexcept {
+        flat_oom_request_ids.swap(outbox);
+    }
 
 private:
     std::vector<Operation> operations_;

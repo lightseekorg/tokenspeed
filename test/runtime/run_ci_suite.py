@@ -39,6 +39,7 @@ PER_COMMIT_SUITES = {
         "runtime-1gpu",
         "runtime-2gpu",
         "runtime-prefix-cache-e2e",
+        "deepseek-v4-flat-synthetic",
     ],
 }
 

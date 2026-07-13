@@ -1,0 +1,24 @@
+{
+  "api_version": "ci.tokenspeed.io/v1",
+  "name": "ut-deepseek-v4-flat-differential-flash-dp4-ep",
+  "type": "ut",
+  "triggers": ["nightly", "manual"],
+  "runner": {
+    "labels": ["b200-4gpu"]
+  },
+  "env": {
+    "CI": "true"
+  },
+  "install": [
+    "bash test/ci_system/install_deps.sh",
+    "bash test/ci_system/install_scheduler_variants.sh"
+  ],
+  "ut": {
+    "commands": [
+      "python3 test/ci_system/deepseek_v4_flat_differential.py --manifest test/ci/deepseek-v4-flat-differential-manifest.json --topology flash-dp4-ep --scenario-set core --scenario-set mtp"
+    ]
+  },
+  "report": {
+    "github_step_summary": true
+  }
+}

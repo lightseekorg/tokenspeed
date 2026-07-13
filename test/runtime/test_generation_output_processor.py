@@ -162,6 +162,15 @@ def test_nan_flag_finishes_request_with_numerical_error():
     abort_events = [e for e in events if type(e).__name__ == "Abort"]
     assert [e.request_id for e in abort_events] == ["decode"]
     assert not [e for e in events if type(e).__name__ == "Finish"]
+    decode_event_types = [
+        type(event).__name__
+        for event in events
+        if getattr(event, "request_id", None) == "decode"
+    ]
+    # Legacy/radix has no completion debt to defer Abort against. Keep its
+    # existing result-before-terminal order; Abort-first is only safe for a
+    # structured flat completion that the scheduler can cancel and retire.
+    assert decode_event_types == ["ExtendResult", "Abort"]
     assert metrics.nan_aborts == 1
 
     # Unflagged request keeps running untouched.

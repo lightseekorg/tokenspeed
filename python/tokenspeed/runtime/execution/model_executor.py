@@ -34,7 +34,12 @@ from tokenspeed.runtime.configs.paged_cache_spec import (
     validate_flat_scheduler_config,
 )
 from tokenspeed.runtime.configs.utils import get_rope_parameters
+from tokenspeed.runtime.deepseek_v4_cache_tables import (
+    legacy_flat_loc_group_id,
+    resolve_deepseek_v4_flat_loc_policy,
+)
 from tokenspeed.runtime.engine.scheduler_utils import (
+    flat_block_table_base_offsets_from_forward_op,
     flat_block_tables_from_forward_op,
     paged_cache_block_table_base_offsets_from_forward_op,
     paged_cache_block_tables_from_forward_op,
@@ -45,6 +50,10 @@ from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
 from tokenspeed.runtime.execution.drafter.dflash import DFlash
 from tokenspeed.runtime.execution.drafter.eagle import Eagle
 from tokenspeed.runtime.execution.drafter.mtp import Mtp
+from tokenspeed.runtime.execution.flat_kv_progress import (
+    FlatKVExecutionTracker,
+    FlatKVProgressSchema,
+)
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
@@ -276,20 +285,7 @@ class ModelExecutor:
         self.sampling_backend = sampling_backend
         self.attn_backend = attn_backend
         self.token_to_kv_pool = token_to_kv_pool
-        # Full-attention group mirrored into req_to_page each step (flat+spec).
         _group_specs = getattr(token_to_kv_pool, "paged_cache_group_specs", ()) or ()
-        self._flat_full_group_id = next(
-            (
-                str(spec.group_id)
-                for spec in _group_specs
-                if getattr(spec, "family", "history") != "state"
-                and getattr(spec, "retention", None) == "full_history"
-            ),
-            None,
-        )
-        self._mirror_idx_cpu: torch.Tensor | None = None
-        self._mirror_idx_dev: torch.Tensor | None = None
-        self._mirror_row_buf: torch.Tensor | None = None
         self.draft_attn_backend = draft_attn_backend
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self._layerwise_mamba_cow_done = None
@@ -305,7 +301,53 @@ class ModelExecutor:
             speculative_algorithm=config.spec_algo,
         )
 
-        if config.spec_algo is not None:
+        self._flat_v4_loc_policy = resolve_deepseek_v4_flat_loc_policy(
+            target_backend=attn_backend,
+            target_pool=token_to_kv_pool,
+            draft_backend=draft_attn_backend,
+            draft_pool=draft_token_to_kv_pool,
+            speculative_algorithm=config.spec_algo,
+        )
+        self._uses_group_keyed_cache_locs = self._flat_v4_loc_policy is not None
+        self._legacy_flat_loc_group_id = (
+            None
+            if self._uses_group_keyed_cache_locs
+            else legacy_flat_loc_group_id(
+                _group_specs,
+                legacy_page_size=config.block_size,
+            )
+        )
+        self._mirror_idx_cpu: torch.Tensor | None = None
+        self._mirror_idx_dev: torch.Tensor | None = None
+        self._mirror_row_buf: torch.Tensor | None = None
+
+        flat_source_active = bool(
+            scheduler_ext_flat_kvcache()
+            and getattr(attn_backend, "uses_flat_cache_groups", False)
+            and (
+                not getattr(attn_backend, "uses_paged_cache_groups", False)
+                or getattr(token_to_kv_pool, "flat_memory_plan", None) is not None
+            )
+        )
+        if (
+            config.spec_algo is not None
+            and flat_source_active
+            and not self._uses_group_keyed_cache_locs
+            and self._legacy_flat_loc_group_id is None
+        ):
+            raise RuntimeError(
+                "flat speculative cache locations require either a group-keyed "
+                "backend or exactly one stride-1 full-history cache group whose "
+                "block span equals the legacy page size; refusing to mirror an "
+                "arbitrary group into req_to_page"
+            )
+
+        if self._uses_group_keyed_cache_locs:
+            # V4 flat has no canonical scalar page domain. Keep a one-column
+            # page-0 sentinel solely for source-neutral call signatures; all
+            # real target/draft tables and write locations are group-keyed.
+            max_num_pages_per_req = 1
+        elif config.spec_algo is not None:
             # The DFLASH overlap scheduler reserves a fresh draft block per
             # decode step a request stays scheduled, including the few steps it
             # lingers between finishing and eviction, so peak page count runs
@@ -329,6 +371,22 @@ class ModelExecutor:
             ) // config.block_size
 
         max_bs = config.max_num_seqs // max(config.data_parallel_size, 1)
+
+        self.flat_kv_execution_tracker: FlatKVExecutionTracker | None = None
+        if flat_source_active:
+            schema = FlatKVProgressSchema.from_runtime_pool(token_to_kv_pool)
+            self.flat_kv_execution_tracker = FlatKVExecutionTracker(schema)
+            if draft_token_to_kv_pool is not None:
+                target_plan = getattr(token_to_kv_pool, "flat_memory_plan", None)
+                draft_plan = getattr(draft_token_to_kv_pool, "flat_memory_plan", None)
+                if (
+                    target_plan is not None
+                    and draft_plan is not None
+                    and target_plan.plan_fingerprint != draft_plan.plan_fingerprint
+                ):
+                    raise ValueError(
+                        "target and draft flat KV progress plans must match"
+                    )
 
         self.req_to_page = torch.zeros(
             (config.max_req_pool_size + 1, max_num_pages_per_req),
@@ -356,6 +414,8 @@ class ModelExecutor:
             state_write_padding_pool_index=config.max_req_pool_size,
             device=self.device,
             has_mamba=(mamba_pool is not None),
+            uses_group_keyed_cache_locs=self._uses_group_keyed_cache_locs,
+            flat_memory_plan=getattr(token_to_kv_pool, "flat_memory_plan", None),
         )
         self.runtime_states = RuntimeStates(
             req_pool_size=config.max_req_pool_size,
@@ -424,6 +484,21 @@ class ModelExecutor:
                 )
         else:
             self.drafter = None
+
+        # Static host-only capability: a successful first draft step may retire
+        # producer debt only when it covers every planned draft KV layer. Cache
+        # it once so the forward hot path neither probes Python attributes nor
+        # risks coercing a device-backed value.
+        draft_prefix_capability = getattr(
+            self.drafter,
+            "first_step_covers_all_draft_kv_layers",
+            False,
+        )
+        if type(draft_prefix_capability) is not bool:
+            raise TypeError(
+                "first_step_covers_all_draft_kv_layers must be a host Python bool"
+            )
+        self._draft_first_step_covers_all_kv_layers = draft_prefix_capability
 
         # Single grammar handle: CapturableGrammarExecutor on CUDA (uses
         # cudaLaunchHostFunc on a side stream so the xgrammar fill +
@@ -674,24 +749,30 @@ class ModelExecutor:
             else None
         )
 
-    def _mirror_flat_full_table_into_req_to_page(
+    def _mirror_legacy_flat_table_into_req_to_page(
         self, forward_op, flat_block_tables
     ) -> None:
-        """Flat + spec: scatter the full-attention group's per-batch table
-        into req_to_page rows, restoring the radix contract for every
-        legacy consumer (input prep's out_cache_loc kernels, the drafter's
-        per-step location chains). The flat scheduler never populates
-        req_to_page itself; column tails zero-fill to the dummy page so
-        stale longer rows can't leak."""
+        """Restore the scalar radix ABI for its one safe legacy flat shape.
+
+        The selected group is proven to be the only owner group, stride 1,
+        absolute full-history, and byte-for-byte aligned with the configured
+        scalar page size. V4 flat never enters this path: its local page ids
+        require a group identity and are delivered directly to owner-local
+        backend metadata.
+        """
         if (
             self.drafter is None
             or not flat_block_tables
-            or self._flat_full_group_id is None
+            or self._legacy_flat_loc_group_id is None
         ):
             return
-        table = flat_block_tables.get(self._flat_full_group_id)
+        table = flat_block_tables.get(self._legacy_flat_loc_group_id)
         if table is None:
-            return
+            raise RuntimeError(
+                "legacy flat req_to_page mirror is missing its validated group "
+                f"{self._legacy_flat_loc_group_id!r}; delivered groups="
+                f"{sorted(flat_block_tables)}"
+            )
         bs = len(forward_op.request_pool_indices)
         if self._mirror_idx_cpu is None or self._mirror_idx_cpu.shape[0] < bs:
             cap = max(bs, self.input_buffers.max_bs)
@@ -1356,6 +1437,15 @@ class ModelExecutor:
 
         return result
 
+    def cuda_graph_runtime_evidence(self) -> dict[str, object]:
+        """Return cold capture/replay evidence for acceptance gates."""
+
+        return {
+            "decode": self.forward_step.runtime_evidence(),
+            "prefill": self.prefill_graph.runtime_evidence(),
+            "drafter_present": self.drafter is not None,
+        }
+
     def execute_idle_forward(
         self,
         global_num_tokens: list[int],
@@ -1464,6 +1554,13 @@ class ModelExecutor:
         # Update page tables on the default stream before switching to execution stream.
         # HostTodevice segment begins
         with nvtx_range("update_block_table", color="cyan"):
+            if self._uses_group_keyed_cache_locs:
+                # Never feed FlatForwardOperation.occupied_pages into the
+                # radix mirror: it is only a first-group compatibility sample
+                # and its local ids are meaningless in every other V4 pool.
+                # The single schema guard lives in staging.stage(), immediately
+                # before the atomic table/base copy on the execution path.
+                return
             update_block_table(
                 forward_op=forward_op,
                 device=self.device,
@@ -1718,6 +1815,9 @@ class ModelExecutor:
         output_d2h_ms = 0.0
         graph_capable = False
         graph_padded_bs = 0
+        flat_kv_execution_evidence = None
+        target_forward_enqueued = False
+        draft_continuous_prefix_enqueued = False
 
         with nvtx_range("pre_fill_setup", color="orange"):
             has_retract = self._contains_retracted_decode(forward_op)
@@ -1729,15 +1829,48 @@ class ModelExecutor:
             self.execution_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.execution_stream):
             bs = len(forward_op.request_ids)
+            if self.flat_kv_execution_tracker is not None:
+                self.flat_kv_execution_tracker.begin_dispatch(
+                    getattr(forward_op, "flat_kv_completion_inputs", None),
+                    request_ids=forward_op.request_ids,
+                )
             # Outside the graph: in-graph sites only OR into the flag buffer.
             self.nan_guard.reset(bs)
-            # Mirror the full group's flat table into req_to_page (flat+spec).
-            flat_block_tables = flat_block_tables_from_forward_op(
-                forward_op,
-                device=self.device,
-                num_reqs=bs,
+            # Export the scheduler union once. V4 target/draft consumers take
+            # owner-local subsets in CudaGraphWrapper; only the explicitly
+            # validated one-group legacy ABI is mirrored into req_to_page.
+            flat_staging = self.input_buffers.flat_block_table_staging
+            if flat_staging is not None:
+                flat_block_tables, flat_block_table_base_offsets = flat_staging.stage(
+                    forward_op, num_reqs=bs
+                )
+            else:
+                flat_block_tables = flat_block_tables_from_forward_op(
+                    forward_op,
+                    device=self.device,
+                    num_reqs=bs,
+                    max_cols_by_group=getattr(
+                        self.token_to_kv_pool,
+                        "flat_max_export_cols_by_group",
+                        None,
+                    ),
+                )
+                flat_block_table_base_offsets, _ = (
+                    flat_block_table_base_offsets_from_forward_op(
+                        forward_op,
+                        device=self.device,
+                        num_reqs=bs,
+                    )
+                )
+            if set(flat_block_tables) != set(flat_block_table_base_offsets):
+                raise ValueError(
+                    "flat block table/base group mismatch: "
+                    f"tables={sorted(flat_block_tables)}, "
+                    f"bases={sorted(flat_block_table_base_offsets)}"
+                )
+            self._mirror_legacy_flat_table_into_req_to_page(
+                forward_op, flat_block_tables
             )
-            self._mirror_flat_full_table_into_req_to_page(forward_op, flat_block_tables)
             decode_input_ids = self.input_buffers.fill_input_buffers(
                 forward_op=forward_op,
                 runtime_states=self.runtime_states,
@@ -1959,7 +2092,17 @@ class ModelExecutor:
                             paged_cache_block_table_base_offsets
                         ),
                         flat_block_tables=flat_block_tables,
+                        flat_block_table_base_offsets=(flat_block_table_base_offsets),
                         **mamba_kwargs,
+                    )
+                    # Successful return proves the eager/breakable path ran, or
+                    # the full decode graph enqueued, its complete captured
+                    # target forward and the complete captured draft first step.
+                    # The cached capability is true only when that draft step
+                    # includes all-layer dense KV catch-up.
+                    target_forward_enqueued = True
+                    draft_continuous_prefix_enqueued = (
+                        self._draft_first_step_covers_all_kv_layers
                     )
                     if timing_enabled:
                         forward_step_ms = (
@@ -1987,6 +2130,16 @@ class ModelExecutor:
                     output_lengths,
                     bs,
                     num_extends,
+                )
+
+            if self.flat_kv_execution_tracker is not None:
+                flat_kv_execution_evidence = (
+                    self.flat_kv_execution_tracker.finish_dispatch(
+                        target_forward_enqueued=target_forward_enqueued,
+                        draft_continuous_prefix_enqueued=(
+                            draft_continuous_prefix_enqueued
+                        ),
+                    )
                 )
 
             with nvtx_range("output_d2h", color="green"):
@@ -2082,6 +2235,7 @@ class ModelExecutor:
             grammar_completion=grammar_completion,
             next_input_ids=next_input_ids,
             output_nan_flags=output_nan_flags,
+            _flat_kv_execution_evidence=flat_kv_execution_evidence,
         )
 
     def write_remote_spec_candidate_ids(

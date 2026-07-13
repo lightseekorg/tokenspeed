@@ -70,6 +70,11 @@ class AttentionBackend(ABC):
     uses_flat_cache_groups: bool = False
     # False for flat-capable backends whose spec-verify path is not wired yet.
     flat_spec_capable: bool = True
+    # True only when a flat page id is meaningful exclusively together with
+    # its cache group. Such backends must not consume the radix-era scalar
+    # req_to_page/out_cache_loc ABI; every write location comes from named
+    # group tables and their per-row logical bases.
+    requires_group_keyed_cache_locs: bool = False
     uses_padded_decode_token_mask: bool = False
 
     def __init__(self, config: BaseAttnConfig) -> None:
@@ -153,6 +158,7 @@ class AttentionBackend(ABC):
         forward_mode: ForwardMode = None,
         req_to_page: torch.Tensor = None,
         flat_block_tables: dict[str, torch.Tensor] | None = None,
+        flat_block_table_base_offsets: dict[str, torch.Tensor] | None = None,
         **kwargs,
     ):
         """Update pre-allocated CUDA-graph metadata buffers in-place before replay.
@@ -160,9 +166,11 @@ class AttentionBackend(ABC):
         Called instead of init_forward_metadata when use_cuda_graph=True, so
         that the captured kernels (which hold pointers into the pre-allocated
         buffers) see the current batch's data without any new allocations.
-        ``flat_block_tables`` carries the per-group flat page tables
-        (group_id -> [>=bs, cols]) for flat-capable backends; a backend that
-        captured flat buffers must be handed non-empty tables whenever bs > 0.
+        ``flat_block_tables`` and ``flat_block_table_base_offsets`` carry the
+        atomic per-group flat page-table ABI (group_id -> [>=bs, cols] and
+        group_id -> [>=bs]); their group keys and row counts must match. A
+        backend that captured flat buffers must be handed non-empty tables and
+        bases whenever bs > 0.
         Default: fall back to init_forward_metadata (correct but may not work
         for all backends that use separate cuda-graph buffer pools).
         """
