@@ -19,6 +19,7 @@
 # SOFTWARE.
 
 import dataclasses
+import json
 import struct
 
 import numpy as np
@@ -29,6 +30,78 @@ from tokenspeed.runtime.pd.transfer_plan import (
     decode_transfer_fragments,
 )
 from tokenspeed.runtime.pd.utils import PageTransferMetadata
+
+_PAGED_CACHE_PAGES_PREFIX = b"tokenspeed-paged-cache-pages-v1:"
+
+
+@dataclasses.dataclass(frozen=True)
+class PagedCachePages:
+    page_ids: npt.NDArray[np.int64]
+    base_logical_page: int = 0
+
+
+def paged_cache_pages_from_forward_op(
+    op,
+    index: int,
+    tokens_per_page: dict[str, int] | None = None,
+    token_begin: int | None = None,
+    token_end: int | None = None,
+    include_partial_page: bool = True,
+) -> dict[str, PagedCachePages]:
+    tables = dict(getattr(op, "paged_cache_block_tables", {}))
+    base_offsets = dict(getattr(op, "paged_cache_block_table_base_offsets", {}))
+    pages: dict[str, PagedCachePages] = {}
+    for group_id, table in tables.items():
+        row = np.asarray(table[index], dtype=np.int64)
+        row = row[row >= 0]
+        offsets = base_offsets.get(group_id)
+        base = int(offsets[index]) if offsets is not None else 0
+        group_id = str(group_id)
+        page_tokens = (tokens_per_page or {}).get(group_id)
+        if (
+            page_tokens is not None
+            and token_begin is not None
+            and token_end is not None
+        ):
+            logical_begin = token_begin // page_tokens
+            if include_partial_page:
+                logical_end = (token_end + page_tokens - 1) // page_tokens
+            else:
+                logical_end = token_end // page_tokens
+            selected_begin = max(logical_begin, base)
+            selected_end = min(logical_end, base + len(row))
+            if selected_begin >= selected_end:
+                pages[group_id] = PagedCachePages(
+                    np.array([], dtype=np.int64), selected_begin
+                )
+                continue
+            row_begin = selected_begin - base
+            row = row[row_begin : row_begin + selected_end - selected_begin]
+            base = selected_begin
+        pages[group_id] = PagedCachePages(row, base)
+    return pages
+
+
+def encode_paged_cache_pages(pages: dict[str, PagedCachePages]) -> bytes:
+    payload = {
+        group_id: [entry.base_logical_page, entry.page_ids.tolist()]
+        for group_id, entry in pages.items()
+    }
+    return _PAGED_CACHE_PAGES_PREFIX + json.dumps(
+        payload, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+
+
+def decode_paged_cache_pages(frame: bytes) -> dict[str, PagedCachePages]:
+    if not frame.startswith(_PAGED_CACHE_PAGES_PREFIX):
+        return {}
+    payload = json.loads(frame[len(_PAGED_CACHE_PAGES_PREFIX) :].decode("utf-8"))
+    return {
+        str(group_id): PagedCachePages(
+            np.asarray(entry[1], dtype=np.int64), int(entry[0])
+        )
+        for group_id, entry in payload.items()
+    }
 
 
 @dataclasses.dataclass
@@ -47,6 +120,10 @@ class KVArgs:
     draft_layer_num: int
     kv_layer_ids: list[int] = dataclasses.field(default_factory=list)
     kv_unit_lens: list[int] = dataclasses.field(default_factory=list)
+    kv_group_ids: list[str | None] = dataclasses.field(default_factory=list)
+    paged_cache_group_tokens_per_page: dict[str, int] = dataclasses.field(
+        default_factory=dict
+    )
     state_data_ptrs: list[int] = dataclasses.field(default_factory=list)
     state_data_lens: list[int] = dataclasses.field(default_factory=list)
     state_item_lens: list[int] = dataclasses.field(default_factory=list)
@@ -88,6 +165,9 @@ class TransferKVChunk:
     layerwise_interval: int = 1
     wait_for_bootstrap_token: bool = False
     spec_candidate_ids: list[int] | None = None
+    prefill_paged_cache_pages: dict[str, PagedCachePages] = dataclasses.field(
+        default_factory=dict
+    )
 
 
 @dataclasses.dataclass
@@ -114,10 +194,14 @@ class TransferInfo:
     dst_mamba_indices: npt.NDArray[np.int64] | None
     is_dummy: bool
     transfer_fragments: tuple[TransferFragment, ...] = ()
+    dst_paged_cache_pages: dict[str, PagedCachePages] = dataclasses.field(
+        default_factory=dict
+    )
 
     @classmethod
     def from_zmq(cls, msg: list[bytes]):
         transfer_fragments = ()
+        dst_paged_cache_pages = decode_paged_cache_pages(msg[-1]) if msg else {}
         if msg[4] == b"" and msg[5] == b"":
             dst_kv_indices = np.array([], dtype=np.int64)
             dst_aux_index = None
@@ -172,6 +256,7 @@ class TransferInfo:
             dst_mamba_indices=dst_mamba_indices,
             is_dummy=is_dummy,
             transfer_fragments=transfer_fragments,
+            dst_paged_cache_pages=dst_paged_cache_pages,
         )
 
 

@@ -30,6 +30,7 @@ import numpy.typing as npt
 from tokenspeed.runtime.pd.base.status import TransferPoll
 from tokenspeed.runtime.pd.mooncake.entities import (
     KVArgs,
+    PagedCachePages,
     TransferInfo,
     TransferKVChunk,
 )
@@ -54,6 +55,9 @@ class WriteRequest:
     dst_ranks_info: tuple[str, int, int]
     prefill_kv_blocks: npt.NDArray[np.int64]
     dst_kv_blocks: npt.NDArray[np.int64]
+    paged_cache_blocks: dict[str, tuple[list, list]] = dataclasses.field(
+        default_factory=dict
+    )
     submit_bids: list[int] = dataclasses.field(default_factory=list)
 
 
@@ -166,13 +170,13 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
         is_last: bool,
         aux_index: int | None = None,
         mla_l1_5_args: tuple[Any, Any] | None = None,
+        paged_cache_pages: dict[str, PagedCachePages] | None = None,
     ):
         logger.debug("async manager add_transfer_request")
         if self.disaggregation_mode != DisaggregationMode.PREFILL:
             raise RuntimeError("Transfer requests can only be added in prefill mode.")
         if is_last and aux_index is None:
             raise ValueError("aux_index must be set for the last transfer chunk.")
-
         if (
             bootstrap_room not in self.request_status
             or self.check_status(bootstrap_room) == TransferPoll.Failed
@@ -202,6 +206,7 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
             is_last=is_last,
             prefill_aux_index=aux_index,
             mla_l1_5_args=mla_l1_5_args,
+            prefill_paged_cache_pages=paged_cache_pages or {},
         )
         self.current_transfer_batch.append((kv_chunk, shard_idx))
 
@@ -243,6 +248,7 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
         end_layer_id: int,
         prefill_kv_blocks: npt.NDArray[np.int64],
         dst_kv_blocks: npt.NDArray[np.int64],
+        paged_cache_blocks: dict[str, tuple[list, list]],
     ) -> int:
         dst_kv_ptrs = self.decode_kv_args_table[mooncake_session_id].dst_kv_ptrs
         transfer_blocks = []
@@ -251,7 +257,21 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
             src_ptr = self.kv_args.kv_data_ptrs[ptr_offset]
             dst_ptr = dst_kv_ptrs[ptr_offset]
             item_len = self.kv_args.kv_item_lens[ptr_offset]
-            for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
+            buffer_group_id = (
+                self.kv_args.kv_group_ids[ptr_offset]
+                if ptr_offset < len(self.kv_args.kv_group_ids)
+                else None
+            )
+            src_blocks = prefill_kv_blocks
+            dst_blocks = dst_kv_blocks
+            if buffer_group_id is not None:
+                group_blocks = paged_cache_blocks.get(buffer_group_id)
+                if group_blocks is None:
+                    raise RuntimeError(
+                        f"Missing transfer blocks for paged-cache group {buffer_group_id!r}"
+                    )
+                src_blocks, dst_blocks = group_blocks
+            for prefill_index, decode_index in zip(src_blocks, dst_blocks):
                 src_addr = src_ptr + int(prefill_index[0]) * item_len
                 dst_addr = dst_ptr + int(decode_index[0]) * item_len
                 length = item_len * len(prefill_index)
@@ -355,6 +375,7 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
                             break
 
                     resolved = self.resolve_transfer_indices(kv_chunk, req)
+                    paged_cache_blocks = self.resolve_paged_cache_blocks(kv_chunk, req)
 
                     # Group by indices
                     prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
@@ -366,6 +387,7 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
                             dst_ranks_info=(req.endpoint, req.dst_port, req.room),
                             prefill_kv_blocks=prefill_kv_blocks,
                             dst_kv_blocks=dst_kv_blocks,
+                            paged_cache_blocks=paged_cache_blocks,
                         )
                     )
 
@@ -395,6 +417,7 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
                                 task.next_layer_id + 1,
                                 req.prefill_kv_blocks,
                                 req.dst_kv_blocks,
+                                req.paged_cache_blocks,
                             )
 
                             if ret != 0:

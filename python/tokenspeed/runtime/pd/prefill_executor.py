@@ -24,6 +24,9 @@ import numpy as np
 
 from tokenspeed.runtime.pd.base.bootstrap import BootstrapInfo
 from tokenspeed.runtime.pd.base.status import TransferPoll
+from tokenspeed.runtime.pd.mooncake.entities import (
+    paged_cache_pages_from_forward_op,
+)
 from tokenspeed.runtime.pd.mooncake.prefill import (
     MooncakeKVManagerPrefill,
     MooncakeKVSender,
@@ -54,6 +57,9 @@ class DisaggPrefillExecutor:
         )
         self.senders: dict[int, MooncakeKVSender] = {}
         self.kv_manager = MooncakeKVManagerPrefill(args, kv_args)
+        self._paged_cache_group_tokens_per_page = (
+            kv_args.paged_cache_group_tokens_per_page
+        )
         self.gloo_group = gloo_group
         self._local_states = {}
         self._layerwise_enabled = False
@@ -207,7 +213,23 @@ class DisaggPrefillExecutor:
                 self._drop_request_state(request_id)
                 continue
             kv_indices, index_slice, is_last = self._prefill_page_window(op, i, sender)
-            if len(kv_indices) == 0 and not is_last:
+            chunk_begin = int(op.extend_prefix_lens[i])
+            chunk_end = chunk_begin + int(op.input_lengths[i])
+            grouped_begin = self._decode_prefix_len(sender.bootstrap_room) + (
+                sender.curr_idx * self.page_size
+            )
+            paged_cache_pages = paged_cache_pages_from_forward_op(
+                op,
+                i,
+                self._paged_cache_group_tokens_per_page,
+                grouped_begin,
+                chunk_end,
+                include_partial_page=is_last,
+            )
+            has_paged_cache_pages = any(
+                entry.page_ids.size > 0 for entry in paged_cache_pages.values()
+            )
+            if len(kv_indices) == 0 and not is_last and not has_paged_cache_pages:
                 continue
             mamba_indices = self._mamba_transfer_indices(op, i) if is_last else None
             sender.send_layerwise(
@@ -219,6 +241,7 @@ class DisaggPrefillExecutor:
                 layerwise_interval=self._layerwise_interval,
                 wait_for_bootstrap_token=is_last,
                 mamba_indices=mamba_indices,
+                paged_cache_pages=paged_cache_pages,
             )
 
     def _decode(self, op):
@@ -258,6 +281,13 @@ class DisaggPrefillExecutor:
                 dtype=np.int64,
             )
             mamba_indices = self._mamba_transfer_indices(op, i)
+            paged_cache_pages = paged_cache_pages_from_forward_op(
+                op,
+                i,
+                self._paged_cache_group_tokens_per_page,
+                decode_prefix_len,
+                int(op.prefill_lengths[i]),
+            )
             logger.debug(
                 "[prefill][_decode] rid=%s aux_index=%d kv_indices(len=%d)=%s bootstrap_token=%d",
                 request_id,
@@ -273,6 +303,7 @@ class DisaggPrefillExecutor:
                 bootstrap_token=bootstrap_token,
                 spec_candidate_ids=spec_candidate_ids,
                 mamba_indices=mamba_indices,
+                paged_cache_pages=paged_cache_pages,
             )
 
     def register(self, request_id: str, bootstrap_info: BootstrapInfo):

@@ -26,6 +26,9 @@ from tokenspeed_scheduler import PD, Forward
 from tokenspeed.runtime.pd.base.bootstrap import BootstrapInfo
 from tokenspeed.runtime.pd.base.status import TransferPoll
 from tokenspeed.runtime.pd.mooncake.decode import MooncakeKVManagerDecode
+from tokenspeed.runtime.pd.mooncake.entities import (
+    paged_cache_pages_from_forward_op,
+)
 from tokenspeed.runtime.pd.mooncake.receiver import MooncakeKVReceiver
 from tokenspeed.runtime.pd.utils import (
     TransferBackend,
@@ -123,6 +126,7 @@ class DisaggDecodeExecutor:
             )
             aux_index = op.request_pool_indices[i]
             mamba_indices = self._mamba_transfer_indices(op, i)
+            paged_cache_pages = paged_cache_pages_from_forward_op(op, i)
             self._request_pool_indices[request_id] = aux_index
             self.receivers[request_id].prefill(
                 kv_indices,
@@ -130,6 +134,7 @@ class DisaggDecodeExecutor:
                 extend_prefix_len,
                 None,  # mla_l1_5_args
                 mamba_indices,
+                paged_cache_pages,
             )
 
     def register(self, request_id: str, bootstrap_info: BootstrapInfo):

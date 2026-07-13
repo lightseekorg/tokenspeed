@@ -29,7 +29,11 @@ import requests
 import zmq
 
 from tokenspeed.runtime.pd.base.status import TransferPoll
-from tokenspeed.runtime.pd.mooncake.entities import KVTransferError
+from tokenspeed.runtime.pd.mooncake.entities import (
+    KVTransferError,
+    PagedCachePages,
+    encode_paged_cache_pages,
+)
 from tokenspeed.runtime.pd.transfer_plan import (
     BufferKind,
     BufferLayout,
@@ -601,6 +605,7 @@ class MooncakeKVReceiver:
         decode_prefix_len: int | None = 0,
         mla_l1_5_args: PageTransferMetadata | None = None,
         mamba_indices: npt.NDArray[np.int64] | None = None,
+        paged_cache_pages: dict[str, PagedCachePages] | None = None,
     ):
         logger.info(
             "[MooncakeKVReceiver.init] bootstrap_room=%s kv_indices_len=%d aux_index=%s decode_prefix_len=%s",
@@ -673,6 +678,8 @@ class MooncakeKVReceiver:
                 transfer_fragments = bootstrap_info.get("transfer_fragments", ())
                 if not is_dummy and transfer_fragments:
                     message_parts.extend(encode_transfer_fragments(transfer_fragments))
+                if not is_dummy and paged_cache_pages:
+                    message_parts.append(encode_paged_cache_pages(paged_cache_pages))
                 sock.send_multipart(message_parts)
             self.init_time = time.time()
 

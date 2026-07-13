@@ -1220,20 +1220,26 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
                     rows = buf.view(-1, buf.shape[-1])
                     rows[tgt_loc.long()] = rows[src_loc.long()]
 
-    def _all_buffers(self) -> list[torch.Tensor]:
-        out: list[torch.Tensor] = []
-        for layer_id in range(self.layer_num):
-            out.append(self.swa_kv_buffer[layer_id])
-            for buffers in (
-                self.compressed_kv_buffer,
-                self.compressor_state_buffer,
-                self.indexer_kv_buffer,
-                self.indexer_state_buffer,
+    def _all_buffer_entries(self) -> list[tuple[torch.Tensor, str]]:
+        entries: list[tuple[torch.Tensor, str]] = []
+        for layer_id, ratio in enumerate(self.layout.layer_ratio):
+            entries.append((self.swa_kv_buffer[layer_id], V4_SWA_KV_GROUP_ID))
+            for buffers, group_id in (
+                (self.compressed_kv_buffer, v4_compressed_kv_group_id(ratio)),
+                (self.compressor_state_buffer, v4_compressor_state_group_id(ratio)),
+                (self.indexer_kv_buffer, v4_compressed_kv_group_id(ratio)),
+                (
+                    self.indexer_state_buffer,
+                    V4_INDEXER_COMPRESSOR_STATE_GROUP_ID,
+                ),
             ):
                 buf = buffers[layer_id]
                 if buf is not None:
-                    out.append(buf)
-        return out
+                    entries.append((buf, group_id))
+        return entries
+
+    def _all_buffers(self) -> list[torch.Tensor]:
+        return [buffer for buffer, _ in self._all_buffer_entries()]
 
     def get_kv_size_bytes(self) -> int:
         return int(
@@ -1247,6 +1253,9 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
             [buf.nbytes for buf in buffers],
             [buf[0].nbytes for buf in buffers],
         )
+
+    def get_contiguous_buf_group_ids(self) -> list[str]:
+        return [group_id for _, group_id in self._all_buffer_entries()]
 
     def get_layerwise_buf_info_offsets(self, start_idx=0):
         offsets = []
