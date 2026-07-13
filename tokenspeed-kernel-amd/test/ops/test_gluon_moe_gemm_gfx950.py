@@ -155,6 +155,18 @@ def test_preshuffled_layout_selection_clamps_when_slicen_is_incompatible() -> No
     assert use_slice_n is False
 
 
+def test_single_k_tile_gate_matches_k_iters_one_gfx950() -> None:
+    from tokenspeed_kernel_amd.ops.moe import fused_mxfp_gfx950 as gluon_moe
+
+    # A single BLOCK_K tile (K_ITERS == 1) must be flagged so the host disables
+    # SliceN and routes the shape to the full-N decode schedule.
+    assert gluon_moe._is_single_k_tile(256, 256) is True
+    assert gluon_moe._is_single_k_tile(128, 256) is True
+    # Two or more K tiles keep the pipelined/SliceN schedules.
+    assert gluon_moe._is_single_k_tile(257, 256) is False
+    assert gluon_moe._is_single_k_tile(512, 256) is False
+
+
 def test_autotune_block_promotes_small_dispatch_shape() -> None:
     block_m, block_n, _block_k, _num_warps, use_slice_n, small = (
         gluon_moe._autotune_block(
@@ -1159,7 +1171,10 @@ def test_dynamic_route_without_topk_normalization_uses_full_softmax_gfx950() -> 
     )
 
 
-def test_gluon_dynamic_mxfp4_moe_concatenated_silu_matches_torch_gfx950() -> None:
+@pytest.mark.parametrize("intermediate_size", [256, 512])
+def test_gluon_dynamic_mxfp4_moe_concatenated_silu_matches_torch_gfx950(
+    intermediate_size: int,
+) -> None:
     from tokenspeed_kernel_amd.ops.moe.fused_mxfp_gfx950 import (
         _quantize_mxfp4_activation,
     )
@@ -1167,7 +1182,7 @@ def test_gluon_dynamic_mxfp4_moe_concatenated_silu_matches_torch_gfx950() -> Non
     torch.manual_seed(20260630)
     device = "cuda"
     generator = torch.Generator(device=device).manual_seed(20260631)
-    m, e, h, i, topk = 4, 8, 512, 512, 2
+    m, e, h, i, topk = 4, 8, 512, intermediate_size, 2
     n_group, topk_group = 2, 1
     hidden = (
         torch.randn((m, h), device=device, dtype=torch.bfloat16) * 0.1

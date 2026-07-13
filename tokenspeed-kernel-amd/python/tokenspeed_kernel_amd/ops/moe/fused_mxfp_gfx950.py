@@ -1441,6 +1441,17 @@ class MoEPipelinedProgram:
         return x, w, scale_x, scale_w
 
     @gluon.jit
+    def run(self, loop_k, USE_WARP_PIPELINE: gl.constexpr):
+        # A single BLOCK_K tile cannot fill the double-buffered pipelines, so
+        # route it to the decode schedule; otherwise pick warp vs local-prefetch.
+        cfg = self.cfg
+        if cfg.K_ITERS == 1:
+            return self.decode_pipeline(loop_k)
+        if USE_WARP_PIPELINE:
+            return self.warp_pipeline(loop_k)
+        return self.pipeline(loop_k)
+
+    @gluon.jit
     def decode_pipeline(self, loop_k):
         cfg = self.cfg
         EVEN_K: gl.constexpr = cfg.EVEN_K
@@ -2579,6 +2590,11 @@ class MoESliceNProgram:
             NB == 2,
             "current SliceN local-prefetch pipeline requires exactly two LDS buffers",
         )
+        gl.static_assert(
+            cfg.K_ITERS != 1,
+            "SliceN requires K_ITERS >= 2; single BLOCK_K tile shapes must route "
+            "to the full-N decode schedule (see _is_single_k_tile host gate)",
+        )
 
         if self.bottom_valid:
             return self._pipeline_full(loop_k)
@@ -3260,9 +3276,7 @@ def _run_moe_tile_w_via_vgpr(
         pgm = MoEPipelinedProgram.initialize(
             cfg, x_desc, w_desc, x_scale_desc, w_scale_desc
         )
-        if USE_WARP_PIPELINE:
-            return pgm.warp_pipeline(K)
-        return pgm.pipeline(K)
+        return pgm.run(K, USE_WARP_PIPELINE)
 
 
 @gluon.jit
@@ -3418,9 +3432,7 @@ def _run_moe_tile_preshuffled_lds_w(
     pgm = MoEPipelinedProgram.initialize(
         cfg, x_desc, w_desc, x_scale_desc, w_scale_desc
     )
-    if USE_WARP_PIPELINE:
-        return pgm.warp_pipeline(K)
-    return pgm.pipeline(K)
+    return pgm.run(K, USE_WARP_PIPELINE)
 
 
 @gluon.jit
@@ -3567,9 +3579,7 @@ def _run_moe_tile_transposed_w(
     pgm = MoEPipelinedProgram.initialize(
         cfg, x_desc, w_desc, x_scale_desc, w_scale_desc
     )
-    if USE_WARP_PIPELINE:
-        return pgm.warp_pipeline(K)
-    return pgm.pipeline(K)
+    return pgm.run(K, USE_WARP_PIPELINE)
 
 
 @gluon.jit
@@ -3716,9 +3726,7 @@ def _run_moe_tile_ncontig_w(
     pgm = MoEPipelinedProgram.initialize(
         cfg, x_desc, w_desc, x_scale_desc, w_scale_desc
     )
-    if USE_WARP_PIPELINE:
-        return pgm.warp_pipeline(K)
-    return pgm.pipeline(K)
+    return pgm.run(K, USE_WARP_PIPELINE)
 
 
 @gluon.jit
@@ -6085,6 +6093,16 @@ def _resolve_prefill_slice_modes(
     return use_slice_mn_resolved, use_slice_n_resolved
 
 
+def _is_single_k_tile(k: int, block_k: int) -> bool:
+    """Whether the K reduction fits in a single BLOCK_K tile (K_ITERS == 1).
+
+    The SliceN and pipelined schedules are double-buffered and require at least
+    two K tiles; a single tile has no dedicated SliceN path, so such shapes must
+    run on the full-N decode schedule instead.
+    """
+    return (k + block_k - 1) // block_k == 1
+
+
 def gluon_mxfp_dispatch_swiglu(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -6181,6 +6199,9 @@ def gluon_mxfp_dispatch_swiglu(
         and a_ragged_metadata is not None
     ):
         use_slice_n = False
+    if _is_single_k_tile(K, block_k):
+        use_slice_n = False
+        use_slice_mn = False
     if w_preshuffle:
         block_n, use_slice_mn, use_slice_n = _align_block_n_to_preshuffled_layout(
             w,
@@ -6362,6 +6383,9 @@ def gluon_mxfp_combine(
         use_slice_n = False
         use_slice_mn = False
         use_small_prefill_m = False
+    if _is_single_k_tile(K, block_k):
+        use_slice_n = False
+        use_slice_mn = False
     if w_preshuffle:
         block_n, use_slice_mn, use_slice_n = _align_block_n_to_preshuffled_layout(
             w,
