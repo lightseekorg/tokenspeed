@@ -324,13 +324,14 @@ class RequestHandler:
                 message="Profiling is already in progress. Call /stop_profile first.",
             )
 
-        self.profile_by_stage = profile_by_stage
-
         if output_dir is None:
             output_dir = envs.TOKENSPEED_PROFILER_DIR.get()
         if activities is None:
             activities = ["CPU", "GPU"]
 
+        # All validation must precede any state mutation: the event loop runs
+        # _profile_batch_predicate on every batch, so a rejected request that
+        # left partial profiler state behind would crash the scheduler.
         if "PROTON" in activities:
             conflicting = sorted({"GPU", "CUDA_PROFILER"} & set(activities))
             if conflicting:
@@ -354,6 +355,7 @@ class RequestHandler:
                     "be controlled through /start_profile.",
                 )
 
+        self.profile_by_stage = profile_by_stage
         self.profiler_output_dir = output_dir
         self.torch_profiler_with_stack = with_stack
         self.torch_profiler_record_shapes = record_shapes

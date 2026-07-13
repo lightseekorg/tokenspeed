@@ -8,6 +8,7 @@ from tokenspeed_kernel import profiling
 from tokenspeed.runtime.engine import request_handler as request_handler_mod
 from tokenspeed.runtime.engine.io_struct import ProfileReq, ProfileReqType
 from tokenspeed.runtime.engine.request_handler import RequestHandler
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 
 
 def _attn_mapping(
@@ -70,6 +71,18 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
             for activity in conflicting:
                 self.assertIn(activity, result.message)
             self.assertFalse(self.handler.profile_in_progress)
+
+    def test_rejected_request_leaves_profiler_state_untouched(self):
+        req = _start_req(self.output_dir, profile_by_stage=True, num_steps=2)
+        req.activities = ["PROTON", "GPU"]
+
+        result = self.handler.profile(req)
+
+        self.assertFalse(result.success)
+        self.assertFalse(self.handler.profile_by_stage)
+        self.handler.forward_ct = 1
+        self.handler._profile_batch_predicate(ForwardMode.EXTEND)
+        self.assertFalse(self.handler.profile_in_progress)
 
     def test_init_allows_proton_with_host_side_profilers(self):
         req = _start_req(self.output_dir)
