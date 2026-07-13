@@ -515,6 +515,7 @@ class RequestHandler:
             # Finalizes the session and writes the profile now, while this
             # process is still alive (shutdown is SIGKILL; no atexit).
             stop_profiling()
+            torch.distributed.barrier(self.attn_tp_cpu_group)
 
         if "VIZTRACER" in self.profiler_activities and self.viztracer is not None:
             self.viztracer.stop()

@@ -28,6 +28,7 @@ def _make_handler(attn_mapping: SimpleNamespace | None = None) -> RequestHandler
     handler.forward_ct = 0
     attn_mapping = attn_mapping or _attn_mapping()
     handler.attn_tp_rank = attn_mapping.tp_rank
+    handler.attn_tp_cpu_group = None
     handler.profile_rank_tag = request_handler_mod._profile_rank_tag(attn_mapping)
     handler.init_profiler()
     return handler
@@ -49,6 +50,13 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
         self.output_dir = tempfile.mkdtemp()
         profiling.ProfilingState.reset()
         self.addCleanup(profiling.ProfilingState.reset)
+        # stop_profile barriers the attn-TP CPU group; there is no real
+        # process group in unit tests.
+        barrier_patcher = mock.patch.object(
+            request_handler_mod.torch.distributed, "barrier"
+        )
+        self.barrier = barrier_patcher.start()
+        self.addCleanup(barrier_patcher.stop)
 
     def test_init_fails_when_proton_unavailable(self):
         with mock.patch.object(
@@ -176,6 +184,25 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
         self.assertNotEqual(outputs[0], outputs[1])
         self.assertTrue(outputs[0].endswith("test-profile-DP0-TP0.proton"))
         self.assertTrue(outputs[1].endswith("test-profile-DP1-TP0.proton"))
+
+    def test_stop_profile_barriers_tp_peers_after_proton_finalize(self):
+        # Only attn-TP rank 0 replies to /stop_profile; the reply must wait
+        # until every TP peer has finalized its proton file.
+        self.handler.attn_tp_cpu_group = object()
+
+        with mock.patch.object(
+            request_handler_mod, "proton_available", return_value=True
+        ), mock.patch.object(request_handler_mod, "start_profiling"), mock.patch.object(
+            request_handler_mod, "stop_profiling"
+        ) as stop_profiling:
+            self.barrier.side_effect = lambda group: self.assertTrue(
+                stop_profiling.called
+            )
+            self.handler.profile(_start_req(self.output_dir))
+            result = self.handler.profile(ProfileReq(type=ProfileReqType.STOP_PROFILE))
+
+        self.assertTrue(result.success)
+        self.barrier.assert_called_once_with(self.handler.attn_tp_cpu_group)
 
     def test_num_steps_window_finalizes_proton(self):
         with mock.patch.object(
