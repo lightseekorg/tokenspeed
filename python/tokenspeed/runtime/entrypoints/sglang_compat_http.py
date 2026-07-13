@@ -39,8 +39,9 @@ as the rest of the RL plumbing.
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
