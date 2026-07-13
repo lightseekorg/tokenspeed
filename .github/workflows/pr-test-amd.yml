@@ -71,6 +71,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.scan.outputs.matrix }}
+      has_tasks: ${{ steps.scan.outputs.has_tasks }}
       install_tokenspeed_mla_from_source: ${{ steps.detect_mla.outputs.changed }}
     steps:
       - name: Checkout code
@@ -89,12 +90,15 @@ jobs:
 
       - name: Build task matrix
         id: scan
+        env:
+          TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS: ${{ vars.TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS }}
         run: |
           MATRIX=$(python3 test/ci_system/pipeline.py scan \
             --root test/ci \
             --trigger "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.trigger || 'per-commit' }}" \
             --runner-group "amd")
           echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
+          printf '%s' "$MATRIX" | python3 -c "import json, sys; print('has_tasks=' + ('true' if json.load(sys.stdin).get('include') else 'false'))" >> "$GITHUB_OUTPUT"
 
       # Compute this once on the hosted runner (where `gh` is pre-installed)
       # and propagate the result to every matrix job via job output. The
@@ -134,6 +138,7 @@ jobs:
   unit-test:
     needs: scan
     if: |
+      needs.scan.outputs.has_tasks == 'true' &&
       (github.event_name != 'pull_request' || github.event.action != 'closed') &&
       (
         github.event_name == 'pull_request' ||
