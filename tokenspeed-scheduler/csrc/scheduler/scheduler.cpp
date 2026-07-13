@@ -260,10 +260,14 @@ std::size_t Scheduler::AvailableKvPages() const {
 }
 
 std::size_t Scheduler::ActiveKvPages() const {
+    // Distinct pages pinned by running requests, in the same units as AvailableKvPages():
+    // flat pool ids across ALL groups (a group-0 sample here understated the ratio that
+    // Python monitoring derives against the whole pool), radix device pages otherwise.
+    // The set dedups pages shared between requests via prefix hits.
     std::unordered_set<std::int32_t> active_pages;
     for (const auto& [_, req] : requests_) {
         if (req->Is<fsm::Prefilling>() || req->Is<fsm::PrefillDone>() || req->Is<fsm::Decoding>()) {
-            for (std::int32_t page : req->GetOccupiedPages()) {
+            for (std::int32_t page : req->GetOccupiedPagesAllGroups()) {
                 active_pages.insert(page);
             }
         }

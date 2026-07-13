@@ -152,6 +152,22 @@ public:
             state_);
     }
 
+    // Pool-wide occupancy: every group's real pages on the flat path (radix: same as
+    // GetOccupiedPages). Forward states only — the occupancy stats that need this never
+    // query queued or terminal requests.
+    std::vector<std::int32_t> GetOccupiedPagesAllGroups() const {
+        return std::visit(Overloaded{
+            []<typename T>(const T& s) -> std::vector<std::int32_t>
+                requires std::derived_from<T, fsm::ForwardState>
+            { return s.GetOccupiedPagesAllGroups(); },
+            [this](const auto&) -> std::vector<std::int32_t> {
+                throw std::logic_error("Request::GetOccupiedPagesAllGroups: expected a forward state; got state=" +
+                                       StateName());
+            },
+            },
+            state_);
+    }
+
     // Flat KV-cache: true when the current state carries no per-group block
     // tables (radix path, or a non-forward state). Forward states on the flat
     // path return false once allocation has populated block_tables_.
