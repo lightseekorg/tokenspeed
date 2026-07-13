@@ -124,13 +124,8 @@ iteration.
   `{"activities": ["PROTON"]}`). Each scheduler process — the process where
   kernels actually launch — runs its own Proton session and finalizes it on
   `/stop_profile`, writing `<output_dir>/<profile_id>-TP-<rank>.proton.<fmt>`
-  per rank. `TOKENSPEED_KERNEL_PROFILE_DATA/BACKEND/MODE/...` still select
-  the Proton data/backend/mode. `PROTON` composes with host-side activities
-  (`CPU`, `MEM`, `VIZTRACER`) but is rejected alongside `GPU` or
-  `CUDA_PROFILER` — CUPTI/roctracer allows one GPU profiling client per
-  process. The import-time `TOKENSPEED_KERNEL_PROFILE=1`
-  bootstrap only suits single-process scripts: serving schedulers are torn
-  down with SIGKILL, so its atexit finalize never writes a profile there.
+  per rank. `PROTON` composes only with host-side activities (`CPU`, `MEM`,
+  `VIZTRACER`).
 
 ### Plugins
 
