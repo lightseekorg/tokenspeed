@@ -25,6 +25,7 @@ from tokenspeed_kernel.ops.mhc.deep_gemm import (
     has_deep_gemm_mhc,
 )
 from tokenspeed_kernel.ops.mhc.trtllm import (
+    FUSED_HC_MAX_K_SPLITS,
     has_trtllm_mhc,
     supports_trtllm_mhc,
     trtllm_mhc_big_fuse,
@@ -33,6 +34,7 @@ from tokenspeed_kernel.ops.mhc.trtllm import (
 )
 
 __all__ = [
+    "FUSED_HC_MAX_K_SPLITS",
     "deep_gemm_mhc_prenorm_gemm",
     "has_deep_gemm_mhc",
     "has_trtllm_mhc",

@@ -110,3 +110,22 @@ def test_fused_hc_routing_logs_once_per_shape(caplog):
         _call(m)
     routing_logs = [r for r in caplog.records if "fused_hc routing" in r.getMessage()]
     assert len(routing_logs) == 1
+
+
+def test_fused_workspace_accumulators_sized_for_k_splits():
+    # The k-split fused_hc backend writes FUSED_HC_MAX_K_SPLITS x num_tokens
+    # partial rows into y_acc/r_acc. Accumulators sized to max_bs rows
+    # overflow into neighboring allocations (observed as a production
+    # cudaErrorIllegalAddress before the sizing was fixed).
+    from tokenspeed_kernel.ops.mhc import FUSED_HC_MAX_K_SPLITS
+
+    max_bs, hidden = 32, 64
+    pp = mhc._FusedHcPingPong(max_bs, HC, hidden, torch.device("cpu"))
+    for bufs in pp.bufs:
+        residual_cur, post_cur, comb_cur, layer_input, y_acc, r_acc, dc = bufs
+        assert residual_cur.shape[0] == max_bs
+        assert layer_input.shape[0] == max_bs
+        expected = FUSED_HC_MAX_K_SPLITS * max_bs
+        assert y_acc.shape[0] == expected
+        assert r_acc.shape[0] == expected
+        assert dc.shape[0] == expected

@@ -88,6 +88,47 @@ def supports_trtllm_mhc(
     return _is_blackwell_device(device_index)
 
 
+# fused_hc launch table, selected by a B200 sweep over the vendored kernel's
+# backend/tile/k-split parameters (all 768 combinations, graph-replay timed,
+# parity-checked against the composed post_mapping + prenorm-GEMM + big_fuse
+# path). backend=1 is the two-stage fma_ksplit + big_fuse organization; it
+# beats the allinone default by ~31% at M=32 (15.2us vs 22.2us) and stays
+# flat past the M>32 allinone-mma cliff. Two constraints shape the table:
+#   * backend=1 accumulates num_k_splits x M partial rows into the y_acc and
+#     r_acc workspaces; callers must size them accordingly (see
+#     FUSED_HC_MAX_K_SPLITS). Undersized accumulators corrupt small-M
+#     outputs and crash at scale.
+#   * small token counts stay on the allinone-fma default, which is at
+#     least as fast there.
+_FUSED_HC_SMALL_M_MAX = 12
+_FUSED_HC_MEDIUM_M_MAX = 32
+
+FUSED_HC_MAX_K_SPLITS = 2
+"""Largest ``num_k_splits`` the launch table may select.
+
+The two-stage k-split backend writes ``num_k_splits * num_tokens`` partial
+rows into the ``y_acc``/``r_acc`` accumulator workspaces, so callers must
+allocate ``FUSED_HC_MAX_K_SPLITS * max_tokens`` rows for them.
+"""
+
+
+def _select_fused_hc_launch(num_tokens: int) -> tuple[int, int, int]:
+    """Pick the fused_hc backend and tile configuration for a token count.
+
+    Args:
+        num_tokens: Number of tokens (rows) in the fused mHC call.
+
+    Returns:
+        Tuple of ``(backend, tile_n, num_k_splits)`` kernel launch parameters.
+    """
+
+    if num_tokens <= _FUSED_HC_SMALL_M_MAX:
+        return 3, 1, 1  # fused_all_fma (allinone) default
+    if num_tokens <= _FUSED_HC_MEDIUM_M_MAX:
+        return 1, 2, 2  # fma_ksplit + big_fuse
+    return 1, 4, 2
+
+
 trtllm_mhc_big_fuse = error_fn
 trtllm_mhc_fused_hc = error_fn
 trtllm_mhc_post_mapping = error_fn
@@ -268,10 +309,7 @@ if _MHC_KERNELS_AVAILABLE and current_platform().is_nvidia:
         """
 
         num_tokens, hc_mult, hidden_size = residual_prev.shape
-        if num_tokens <= 32:
-            backend, tile_n = 3, 1  # fused_all_fma
-        else:
-            backend, tile_n = 2, 0  # fused_all_mma
+        backend, tile_n, num_k_splits = _select_fused_hc_launch(num_tokens)
         _mhc_fused_hc(
             x_prev,
             residual_prev,
@@ -297,7 +335,7 @@ if _MHC_KERNELS_AVAILABLE and current_platform().is_nvidia:
             sinkhorn_iters,
             backend,
             tile_n,
-            1,
+            num_k_splits,
             0,
             1,
             None,
