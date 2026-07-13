@@ -18,8 +18,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import math
+
+import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
+from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 
 @triton.jit
@@ -447,3 +452,145 @@ def prefill_attention_fwd(
         num_stages=num_stages,
         **extra_kargs,
     )
+
+
+@register_kernel(
+    "attention",
+    "mha_prefill",
+    name="triton_mha_prefill",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=format_signatures(
+        ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
+    ),
+    priority=Priority.PORTABLE,
+    traits={
+        "sliding_window": frozenset({False, True}),
+        "support_sinks": frozenset({False, True}),
+        "support_logit_cap": frozenset({False, True}),
+        "return_lse": frozenset({False, True}),
+    },
+    tags={"portability"},
+)
+def triton_mha_prefill(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_cpu: list[int],
+    max_seqlen: int,
+    window_left: int = -1,
+    logit_cap: float = 0.0,
+    sinks: torch.Tensor | None = None,
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    out = torch.empty_like(q)
+    lse = (
+        torch.empty((q.shape[0], q.shape[1]), dtype=torch.float32, device=q.device)
+        if return_lse
+        else None
+    )
+    cache_seqlens = torch.empty((0,), dtype=torch.int32, device=q.device)
+    empty_k = torch.empty((0, k.shape[1], k.shape[2]), dtype=k.dtype, device=k.device)
+    empty_v = torch.empty((0, v.shape[1], v.shape[2]), dtype=v.dtype, device=v.device)
+    prefill_attention_fwd(
+        q,
+        k,
+        v,
+        out,
+        empty_k,
+        empty_v,
+        cu_seqlens,
+        cache_seqlens,
+        None,
+        True,
+        max_seqlen,
+        sm_scale=1.0 / math.sqrt(q.shape[-1]),
+        logit_cap=logit_cap,
+        sliding_window_size=window_left,
+        sinks=sinks,
+        has_kv_cache=False,
+        lse_extend=lse,
+    )
+    if return_lse:
+        return out, lse
+    return out
+
+
+@register_kernel(
+    "attention",
+    "mha_extend_with_kvcache",
+    name="triton_mha_extend_with_kvcache",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=format_signatures(
+        ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
+    ),
+    priority=Priority.PORTABLE,
+    traits={
+        "is_causal": frozenset({False, True}),
+        "sliding_window": frozenset({False, True}),
+        "support_sinks": frozenset({False, True}),
+        "support_logit_cap": frozenset({False, True}),
+        "return_lse": frozenset({False, True}),
+    },
+    tags={"portability"},
+)
+def triton_mha_extend_with_kvcache(
+    q: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_kv: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    is_causal: bool = False,
+    window_left: int = -1,
+    logit_cap: float = 0.0,
+    sinks: torch.Tensor | None = None,
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    k = torch.empty(
+        (0, k_cache.shape[2], k_cache.shape[3]),
+        dtype=k_cache.dtype,
+        device=k_cache.device,
+    )
+    v = torch.empty(
+        (0, v_cache.shape[2], v_cache.shape[3]),
+        dtype=v_cache.dtype,
+        device=v_cache.device,
+    )
+
+    out = torch.empty_like(q)
+    lse = (
+        torch.empty((q.shape[0], q.shape[1]), dtype=torch.float32, device=q.device)
+        if return_lse
+        else None
+    )
+    prefill_attention_fwd(
+        q,
+        k,
+        v,
+        out,
+        k_cache.view(-1, k_cache.shape[2], k_cache.shape[3]),
+        v_cache.view(-1, v_cache.shape[2], v_cache.shape[3]),
+        cu_seqlens_q,
+        cache_seqlens,
+        None,
+        is_causal,
+        max_seqlen_q,
+        sm_scale=1.0 / math.sqrt(q.shape[-1]),
+        logit_cap=logit_cap,
+        sliding_window_size=window_left,
+        sinks=sinks,
+        page_table=page_table,
+        page_table_stride_b=page_table.stride(0),
+        page_size=k_cache.shape[1],
+        has_kv_cache=True,
+        lse_extend=lse,
+    )
+    if return_lse:
+        return out, lse
+    return out

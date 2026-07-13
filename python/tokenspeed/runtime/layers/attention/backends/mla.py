@@ -46,6 +46,7 @@ if TYPE_CHECKING:
 class MLAPrefillMetadata:
     # Device-side metadata for explicit Q/K/V MLA prefill and prefix replay.
     seq_lens: torch.Tensor
+    req_pool_indices: torch.Tensor
     extend_prefix_lens: torch.Tensor
     extend_seq_lens: torch.Tensor
     cum_extend_seq_lens: torch.Tensor
@@ -67,6 +68,14 @@ class MLADecodeMetadata:
     num_extends: int
     page_table: torch.Tensor
     seq_lens: torch.Tensor
+
+    @property
+    def block_kv_indices(self) -> torch.Tensor:
+        return self.page_table
+
+    @property
+    def seq_lens_k(self) -> torch.Tensor:
+        return self.seq_lens
 
 
 class MLAAttnBackend(AttentionBackend):
@@ -182,6 +191,7 @@ class MLAAttnBackend(AttentionBackend):
 
         metadata = MLAPrefillMetadata(
             seq_lens=seq_lens,
+            req_pool_indices=req_pool_indices,
             extend_prefix_lens=extend_prefix_lens,
             extend_seq_lens=extend_seq_lens,
             cum_extend_seq_lens=cum_extend_seq_lens,

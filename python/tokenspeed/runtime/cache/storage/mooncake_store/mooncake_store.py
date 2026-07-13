@@ -43,7 +43,7 @@ SETUP_TIMEOUT = 600  # 10min
 logger = logging.getLogger(__name__)
 
 
-def _parse_global_segment_size(value) -> int:
+def _parse_global_segment_size(value: int | str) -> int:
     if isinstance(value, int):
         return value
     if isinstance(value, str):
@@ -81,8 +81,10 @@ class MooncakeStoreConfig:
         try:
             with open(file_path) as fin:
                 config = json.load(fin)
-        except Exception as e:
-            raise RuntimeError(f"Failed to load config from {file_path}: {str(e)}")
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"Failed to load config from {file_path}: {exc}"
+            ) from exc
 
         if "master_server_address" not in config:
             raise ValueError("master_server_address is required in config file")
@@ -176,12 +178,12 @@ class MooncakeStore(KVStoreStorage):
     def __init__(self, storage_config: KVStoreStorageConfig = None):
         try:
             from mooncake.store import MooncakeDistributedStore
-        except ImportError as e:
+        except ImportError as exc:
             raise ImportError(
                 "Please install mooncake by following the instructions at "
                 "https://kvcache-ai.github.io/Mooncake/getting_started/build.html"
                 "to run TokenSpeed with MooncakeConnector."
-            ) from e
+            ) from exc
 
         try:
             self.store = MooncakeDistributedStore()
@@ -270,8 +272,8 @@ class MooncakeStore(KVStoreStorage):
                 self.is_mla_backend = False
                 self.local_rank = 0
 
-        except ValueError as e:
-            logger.error("Configuration loading failed: %s", e)
+        except ValueError as exc:
+            logger.error("Configuration loading failed: %s", exc)
             raise
         except Exception as exc:
             logger.error("An error occurred while loading the configuration: %s", exc)
@@ -286,7 +288,7 @@ class MooncakeStore(KVStoreStorage):
         while time.perf_counter() - start_time < SETUP_TIMEOUT:
             try:
                 check_segments_resp = requests.get(segments_url, timeout=3)
-            except Exception:
+            except requests.RequestException:
                 logger.info(
                     "waiting mooncake store server started, cost_time: %.2f seconds.",
                     time.perf_counter() - start_time,
@@ -320,15 +322,17 @@ class MooncakeStore(KVStoreStorage):
                 put_result,
             )
             return
-        assert self.store.is_exist(warmup_key) == 1
-        assert self.store.get(warmup_key) == warmup_value
+        if self.store.is_exist(warmup_key) != 1:
+            raise RuntimeError("Mooncake store warmup key was not persisted")
+        if self.store.get(warmup_key) != warmup_value:
+            raise RuntimeError("Mooncake store warmup value mismatch")
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
-        assert self.mem_pool_host.layout in [
-            "page_first",
-            "page_head",
-        ], "mooncake store storage backend only supports page_first or page_head layout"
+        if self.mem_pool_host.layout not in ("page_first", "page_head"):
+            raise ValueError(
+                "mooncake store storage backend only supports page_first or page_head layout"
+            )
         buffer = self.mem_pool_host.kv_buffer
         try:
             buffer_ptr = buffer.data_ptr()
@@ -349,7 +353,8 @@ class MooncakeStore(KVStoreStorage):
         for key_ in keys:
             key_list.append(f"{key_}_{self.local_rank}_k")
             key_list.append(f"{key_}_{self.local_rank}_v")
-        assert len(key_list) == len(ptr_list)
+        if len(key_list) != len(ptr_list):
+            raise ValueError("MHA key metadata does not match buffer metadata")
         return key_list, ptr_list, element_size_list
 
     def _expand_query_keys(self, keys: list[str]) -> tuple[list[str], int, bool]:
@@ -392,12 +397,15 @@ class MooncakeStore(KVStoreStorage):
         key_list = []
         for key_ in keys:
             key_list.append(f"{key_}_k")
-        assert len(key_list) == len(ptr_list)
+        if len(key_list) != len(ptr_list):
+            raise ValueError("MLA key metadata does not match buffer metadata")
         return key_list, ptr_list, element_size_list
 
     def _batch_preprocess(self, keys, host_indices):
-        assert len(keys) > 0
-        assert len(keys) == len(host_indices) // self.mem_pool_host.page_size
+        if not keys:
+            raise ValueError("keys must not be empty")
+        if len(keys) != len(host_indices) // self.mem_pool_host.page_size:
+            raise ValueError("keys length must match host_indices page count")
         if self.is_mla_backend:
             return self._get_mla_buffer_meta(keys, host_indices)
         else:
@@ -487,7 +495,8 @@ class MooncakeStore(KVStoreStorage):
         target_sizes: list[int] | None = None,
     ) -> bool:
         # Only support zero copy set for now
-        assert target_location is not None and target_sizes is not None
+        if target_location is None or target_sizes is None:
+            raise ValueError("target_location and target_sizes are required")
         # Format key with local_rank suffix for non-MLA backend
         if self.is_mla_backend:
             query_keys = [f"{key}_k"]
@@ -536,8 +545,12 @@ class MooncakeStore(KVStoreStorage):
         target_sizes: list[int] | None = None,
     ) -> bool:
         # Only support zero copy set for now
-        assert target_locations is not None and target_sizes is not None
-        assert len(keys) == len(target_locations) == len(target_sizes)
+        if target_locations is None or target_sizes is None:
+            raise ValueError("target_locations and target_sizes are required")
+        if len(keys) != len(target_locations) or len(keys) != len(target_sizes):
+            raise ValueError(
+                "keys, target_locations, and target_sizes must have matching lengths"
+            )
 
         if not keys:
             return False
@@ -593,7 +606,8 @@ class MooncakeStore(KVStoreStorage):
         target_location: Any | None = None,
         target_sizes: Any | None = None,
     ) -> bool:
-        assert target_location is not None and target_sizes is not None
+        if target_location is None or target_sizes is None:
+            raise ValueError("target_location and target_sizes are required")
         # Format key with local_rank suffix for non-MLA backend
         if self.is_mla_backend:
             query_keys = [f"{key}_k"]
@@ -627,7 +641,12 @@ class MooncakeStore(KVStoreStorage):
         target_locations: Any | None = None,
         target_sizes: Any | None = None,
     ) -> int:
-        assert len(keys) == len(target_locations) == len(target_sizes)
+        if target_locations is None or target_sizes is None:
+            raise ValueError("target_locations and target_sizes are required")
+        if len(keys) != len(target_locations) or len(keys) != len(target_sizes):
+            raise ValueError(
+                "keys, target_locations, and target_sizes must have matching lengths"
+            )
         if not keys:
             return 0
 
@@ -677,7 +696,7 @@ class MooncakeStore(KVStoreStorage):
     def close(self):
         # MooncakeDistributedStore will automatically call the destructor, so
         # it is unnecessary to close it manually.
-        pass
+        return None
 
     def clear(self) -> None:
         self.store.remove_all()

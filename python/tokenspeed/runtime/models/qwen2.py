@@ -50,6 +50,7 @@ from tokenspeed.runtime.model_loader.weight_utils import (
     kv_cache_scales_loader,
 )
 from tokenspeed.runtime.models.base import BaseCausalLM
+from tokenspeed.runtime.models.utils import validate_attention_partition
 from tokenspeed.runtime.utils import add_prefix, make_layers
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
@@ -121,13 +122,13 @@ class Qwen2Attention(nn.Module):
         self.tp_rank = self.mapping.attn.tp_rank
         self.tp_size = self.mapping.attn.tp_size
         self.total_num_heads = num_heads
-        assert self.total_num_heads % self.tp_size == 0
-        self.num_heads = self.total_num_heads // self.tp_size
         self.total_num_kv_heads = num_kv_heads
-        if self.total_num_kv_heads >= self.tp_size:
-            assert self.total_num_kv_heads % self.tp_size == 0
-        else:
-            assert self.tp_size % self.total_num_kv_heads == 0
+        validate_attention_partition(
+            self.total_num_heads,
+            self.total_num_kv_heads,
+            self.tp_size,
+        )
+        self.num_heads = self.total_num_heads // self.tp_size
         self.num_kv_heads = max(1, self.total_num_kv_heads // self.tp_size)
         self.head_dim = head_dim or hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
@@ -205,9 +206,10 @@ class Qwen2DecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.mapping = mapping
-        assert (
-            self.mapping.attn.tp_size == self.mapping.dense.tp_size
-        ), "Qwen2 does not use CommManager and assumes attn_tp_size == dense_tp_size"
+        if self.mapping.attn.tp_size != self.mapping.dense.tp_size:
+            raise ValueError(
+                "Qwen2 does not use CommManager and assumes attn_tp_size == dense_tp_size"
+            )
         self.hidden_size = config.hidden_size
         rope_theta = get_rope_theta(config, 1000000)
         rope_scaling = getattr(config, "rope_scaling", None)

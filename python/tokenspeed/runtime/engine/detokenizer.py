@@ -112,7 +112,8 @@ def trim_matched_stop(
 
     # Trim stop token.
     if isinstance(matched, int) and isinstance(output, list):
-        assert len(output) > 0
+        if not output:
+            return output
         return output[:-1]
     return output
 

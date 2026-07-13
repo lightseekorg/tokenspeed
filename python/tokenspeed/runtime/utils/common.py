@@ -159,7 +159,8 @@ def get_available_gpu_memory(
     """
     if device == "cuda":
         num_gpus = torch.cuda.device_count()
-        assert gpu_id < num_gpus
+        if gpu_id >= num_gpus:
+            raise ValueError(f"gpu_id={gpu_id} must be less than num_gpus={num_gpus}.")
 
         if torch.cuda.current_device() != gpu_id:
             logger.debug(
@@ -258,9 +259,9 @@ def _load_image(
             encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
             image_tensor = decode_jpeg(encoded_image, device="cuda")
             return image_tensor
-        except Exception as e:
+        except Exception as exc:
             logger.warning(
-                f"Failed to decode JPEG on GPU, falling back to CPU. Error: {e}"
+                f"Failed to decode JPEG on GPU, falling back to CPU. Error: {exc}"
             )
     return Image.open(BytesIO(image_bytes))
 
@@ -443,7 +444,7 @@ def configure_logger(server_args, prefix: str = ""):
 
     if TOKENSPEED_LOGGING_CONFIG_PATH := envs.TOKENSPEED_LOGGING_CONFIG_PATH.get():
         if not os.path.exists(TOKENSPEED_LOGGING_CONFIG_PATH):
-            raise Exception(
+            raise FileNotFoundError(
                 "Setting TOKENSPEED_LOGGING_CONFIG_PATH from env with "
                 f"{TOKENSPEED_LOGGING_CONFIG_PATH} but it does not exist!"
             )
@@ -489,7 +490,8 @@ def set_weight_attrs(
     if weight_attrs is None:
         return
     for key, value in weight_attrs.items():
-        assert not hasattr(weight, key), f"Overwriting existing tensor attribute: {key}"
+        if hasattr(weight, key):
+            raise ValueError(f"Overwriting existing tensor attribute: {key}")
         setattr(weight, key, value)
 
 
@@ -954,12 +956,14 @@ class Withable(Generic[T]):
 
     @contextmanager
     def with_value(self, new_value: T):
-        assert self._value is None
+        if self._value is not None:
+            raise RuntimeError("Withable value is already set.")
         self._value = new_value
         try:
             yield
         finally:
-            assert self._value is new_value
+            if self._value is not new_value:
+                raise RuntimeError("Withable value changed while context was active.")
             self._value = None
 
 

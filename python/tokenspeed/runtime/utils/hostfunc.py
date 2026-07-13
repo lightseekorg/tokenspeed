@@ -183,10 +183,12 @@ def launch_hostfunc(fn: Callable, *args: Any, **kwargs: Any) -> int | None:
         stream.cuda_stream, not is_capturing, fn, *args, **kwargs
     )
     if is_capturing:
-        assert handle is not None
+        if handle is None:
+            raise RuntimeError("hostfunc launch did not return a capture handle.")
         _USER_DATA_HANDLES.add(handle)
     else:
-        assert handle is None
+        if handle is not None:
+            raise RuntimeError("hostfunc eager launch unexpectedly returned a handle.")
     return handle
 
 

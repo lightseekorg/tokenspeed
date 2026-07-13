@@ -103,9 +103,9 @@ async def _grpc_call(coro) -> JSONResponse:
     errors to a clean 503 instead of an unhandled 500 + stack trace."""
     try:
         resp = await coro
-    except grpc.aio.AioRpcError as e:
+    except grpc.aio.AioRpcError as exc:
         return JSONResponse(
-            {"error": "engine unavailable", "detail": e.details()},
+            {"error": "engine unavailable", "detail": exc.details()},
             status_code=503,
         )
     return JSONResponse(MessageToDict(resp, preserving_proto_field_name=True))

@@ -26,7 +26,6 @@ import torch
 
 from tokenspeed.runtime.execution.cache_loc_kernel import (
     compute_out_cache_loc,
-    compute_out_cache_loc_uniform,
     fused_decode_input_prep,
 )
 from tokenspeed.runtime.execution.forward_batch_info import compute_position_triton
@@ -142,7 +141,6 @@ class InputBuffers:
         total_tokens: int,
     ):
         batch_size = len(forward_op.request_ids)
-        assert batch_size >= 0
         num_extends = forward_op.num_extends()
 
         # CPU-side fast path: when the scheduler always emits a decode_input_ids

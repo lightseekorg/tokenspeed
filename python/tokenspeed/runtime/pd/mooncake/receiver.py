@@ -22,16 +22,13 @@ import struct
 import threading
 import time
 from dataclasses import dataclass
-from typing import Optional
 
 import numpy as np
 import numpy.typing as npt
 import requests
 import zmq
 
-from tokenspeed.runtime.pd.base.conn import (
-    KVPoll,
-)
+from tokenspeed.runtime.pd.base.status import TransferPoll
 from tokenspeed.runtime.pd.mooncake.entities import KVTransferError
 from tokenspeed.runtime.pd.transfer_plan import (
     BufferKind,
@@ -59,7 +56,7 @@ from tokenspeed.runtime.pd.mooncake.decode import (
 
 def _get_prefill_parallel_info_from_server(
     bootstrap_addr,
-) -> Optional[PrefillParallelInfo]:
+) -> PrefillParallelInfo | None:
     """Fetch the prefill parallel info from the bootstrap server."""
     try:
         url = f"http://{bootstrap_addr}/route?engine_rank={-1}&target_dp_group={-1}"
@@ -92,8 +89,8 @@ def _get_prefill_parallel_info_from_server(
                 response.text,
             )
             return None
-    except Exception as e:
-        logger.error("Error fetching prefill parallel info from bootstrap: %s", e)
+    except Exception as exc:
+        logger.error("Error fetching prefill parallel info from bootstrap: %s", exc)
         return None
 
 
@@ -112,8 +109,8 @@ def _get_bootstrap_info_from_server(bootstrap_addr, engine_rank, target_dp_group
                 response.text,
             )
             return None
-    except Exception as e:
-        logger.error("Error fetching prefill info from bootstrap: %s", e)
+    except Exception as exc:
+        logger.error("Error fetching prefill info from bootstrap: %s", exc)
         return None
 
 
@@ -370,7 +367,10 @@ def _calc(kv_mgr, prefill_parallel_info: PrefillParallelInfo) -> ReceiverRoutePl
     local_tp_size_per_dp_rank = kv_mgr.world_size // kv_mgr.dp_size
 
     if prefill_parallel_info.enable_mla_l1_5_cache:
-        assert kv_mgr.is_mla_backend, "PD with  is not yet supported for non-MLA models"
+        if not kv_mgr.is_mla_backend:
+            raise RuntimeError(
+                "PD with MLA L1.5 cache is not yet supported for non-MLA models"
+            )
         return _legacy_mla_route_plan(
             target_tp_rank=None,
             target_tp_ranks=range(prefill_tp_size_per_dp_rank),
@@ -437,7 +437,7 @@ class MooncakeKVReceiver:
         self.prefill_enable_mla_l1_5_cache = None
         self.dst_enable_mla_l1_5_cache = False
 
-        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
+        self.kv_mgr.update_status(self.bootstrap_room, TransferPoll.Bootstrapping)
         logger.info(
             "[MooncakeKVReceiver.__init__] bootstrap_addr=%s bootstrap_room=%s session_id=%s",
             bootstrap_addr,
@@ -451,7 +451,7 @@ class MooncakeKVReceiver:
                 self.bootstrap_room,
                 f"Could not fetch prefill parallel info from bootstrap_addr: {self.bootstrap_addr}",
             )
-            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            self.kv_mgr.update_status(self.bootstrap_room, TransferPoll.Failed)
 
         route_plan = _calc(self.kv_mgr, prefill_parallel_info)
         self.route_plan = route_plan
@@ -472,9 +472,10 @@ class MooncakeKVReceiver:
                     self.bootstrap_room,
                     f"Could not fetch bootstrap info for engine rank: {self.kv_mgr.kv_args.engine_rank} and target_dp_group: {target_dp_group}",
                 )
-                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                self.kv_mgr.update_status(self.bootstrap_room, TransferPoll.Failed)
             else:
-                assert len(bootstrap_infos) > 0
+                if not bootstrap_infos:
+                    raise RuntimeError("Could not fetch bootstrap info.")
                 self.bootstrap_infos = bootstrap_infos
                 self.kv_mgr.connection_pool[bootstrap_key] = self.bootstrap_infos
                 # Register kv_args only once to prefill KVManager according to the info fetched from the bootstrap server
@@ -483,7 +484,7 @@ class MooncakeKVReceiver:
             self.bootstrap_infos = self.kv_mgr.connection_pool[bootstrap_key]
 
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
-        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapped)
+        self.kv_mgr.update_status(self.bootstrap_room, TransferPoll.Bootstrapped)
         logger.info(
             "[MooncakeKVReceiver.__init__] done, status set to Bootstrapped. "
             "bootstrap_room=%s bootstrap_addr=%s session_id=%s",
@@ -596,10 +597,10 @@ class MooncakeKVReceiver:
     def prefill(
         self,
         kv_indices: npt.NDArray[np.int64],
-        aux_index: Optional[int] = None,
-        decode_prefix_len: Optional[int] = 0,
-        mla_l1_5_args: Optional[PageTransferMetadata] = None,
-        mamba_indices: Optional[npt.NDArray[np.int64]] = None,
+        aux_index: int | None = None,
+        decode_prefix_len: int | None = 0,
+        mla_l1_5_args: PageTransferMetadata | None = None,
+        mamba_indices: npt.NDArray[np.int64] | None = None,
     ):
         logger.info(
             "[MooncakeKVReceiver.init] bootstrap_room=%s kv_indices_len=%d aux_index=%s decode_prefix_len=%s",
@@ -675,12 +676,12 @@ class MooncakeKVReceiver:
                 sock.send_multipart(message_parts)
             self.init_time = time.time()
 
-    def poll(self) -> KVPoll:
+    def poll(self) -> TransferPoll:
         if self.conclude_state is None:
             status = self.kv_mgr.check_status(self.bootstrap_room)
-            if status in (KVPoll.Success, KVPoll.Failed):
+            if status in (TransferPoll.Success, TransferPoll.Failed):
                 self.conclude_state = status
-            elif status == KVPoll.WaitingForInput:
+            elif status == TransferPoll.WaitingForInput:
                 if self.init_time is not None:
                     now = time.time()
                     elapsed = now - self.init_time
@@ -691,11 +692,11 @@ class MooncakeKVReceiver:
                         )
                         self.kv_mgr.record_failure(
                             self.bootstrap_room,
-                            f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s in KVPoll.WaitingForInput",
+                            f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s in TransferPoll.WaitingForInput",
                         )
-                        self.conclude_state = KVPoll.Failed
-                        return KVPoll.Failed
-            elif status == KVPoll.Transferring:
+                        self.conclude_state = TransferPoll.Failed
+                        return TransferPoll.Failed
+            elif status == TransferPoll.Transferring:
                 logger.warning(
                     "Req(room=%s) in Transferring, which is unexpected",
                     self.bootstrap_room,
@@ -718,7 +719,7 @@ class MooncakeKVReceiver:
     def failure_exception(self):
         # Explicitly set the status to failure since this request has failed in another rank
         if self.conclude_state is None:
-            self.conclude_state = KVPoll.Failed
+            self.conclude_state = TransferPoll.Failed
 
         self.clear()
 

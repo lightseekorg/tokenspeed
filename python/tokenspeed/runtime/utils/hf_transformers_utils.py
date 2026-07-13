@@ -50,6 +50,7 @@ from tokenspeed.runtime.configs import (
     Qwen2Config,
     Qwen3_5Config,
     Qwen3_5MoeConfig,
+    Qwen3ASRConfig,
     Qwen3Config,
     Qwen3MoeConfig,
 )
@@ -59,6 +60,7 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     Qwen2Config.model_type: Qwen2Config,
     Qwen3Config.model_type: Qwen3Config,
     Qwen3MoeConfig.model_type: Qwen3MoeConfig,
+    Qwen3ASRConfig.model_type: Qwen3ASRConfig,
     DeepseekV4Config.model_type: DeepseekV4Config,
     Qwen3_5Config.model_type: Qwen3_5Config,
     Qwen3_5MoeConfig.model_type: Qwen3_5MoeConfig,
@@ -104,14 +106,15 @@ def get_hf_text_config(config: PretrainedConfig):
     text_config = None
     if hasattr(config, "text_config"):
         # The code operates under the assumption that text_config should have
-        # `num_attention_heads` (among others). Assert here to fail early
+        # `num_attention_heads` (among others). Check here to fail early
         # if transformers config doesn't align with this assumption.
-        assert hasattr(config.text_config, "num_attention_heads")
+        if not hasattr(config.text_config, "num_attention_heads"):
+            raise AttributeError("text_config must define num_attention_heads.")
         text_config = config.text_config
     if hasattr(config, "language_config"):
         text_config = config.language_config
     if hasattr(config, "thinker_config"):
-        # qwen2.5 omni
+        # Qwen Omni wrappers keep the language model below thinker_config.
         thinker_config = config.thinker_config
         if hasattr(thinker_config, "text_config"):
             thinker_config.text_config.dtype = thinker_config.dtype
@@ -281,6 +284,10 @@ def get_config(
         "Qwen3_5MoeConfig",
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5ForConditionalGenerationNextN",
+        "Qwen3OmniMoeForConditionalGeneration",
+        "Qwen3OmniMoeConfig",
+        "Qwen3ASRForConditionalGeneration",
+        "Qwen3ASRConfig",
     ]:
         config.text_config = text_config
         return config

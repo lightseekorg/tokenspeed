@@ -22,10 +22,35 @@
 
 import torch
 from tokenspeed_kernel.ops.embedding import FusedSetKVBufferArg
-from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.utils import print_warning_once
+
+
+def validate_attention_partition(
+    total_num_heads: int,
+    total_num_kv_heads: int,
+    tp_size: int,
+) -> None:
+    if tp_size <= 0:
+        raise ValueError(f"tp_size must be positive, got {tp_size}.")
+    if total_num_heads % tp_size != 0:
+        raise ValueError(
+            f"num_attention_heads={total_num_heads} must be divisible by tp_size={tp_size}."
+        )
+    if total_num_kv_heads <= 0:
+        raise ValueError(
+            f"num_key_value_heads must be positive, got {total_num_kv_heads}."
+        )
+    if total_num_kv_heads >= tp_size:
+        if total_num_kv_heads % tp_size != 0:
+            raise ValueError(
+                f"num_key_value_heads={total_num_kv_heads} must be divisible by tp_size={tp_size}."
+            )
+    elif tp_size % total_num_kv_heads != 0:
+        raise ValueError(
+            f"tp_size={tp_size} must be divisible by num_key_value_heads={total_num_kv_heads}."
+        )
 
 
 def create_fused_set_kv_buffer_arg(

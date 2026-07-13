@@ -23,7 +23,8 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from typing import Iterable, NamedTuple
+from collections.abc import Iterable
+from typing import NamedTuple
 
 import torch
 from tokenspeed_scheduler import Cache

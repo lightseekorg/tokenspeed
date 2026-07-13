@@ -132,6 +132,7 @@ backends. See `tokenspeed_kernel/plugins/README.md`.
 ```python
 from tokenspeed_kernel import (
     mha_prefill, mha_prefill_with_kvcache, mha_decode_with_kvcache,
+    gdn_chunk_prefill,
     mm,
     moe_route, moe_dispatch, moe_experts, moe_combine, moe_fused,
     ...

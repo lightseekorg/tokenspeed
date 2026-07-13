@@ -20,8 +20,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
@@ -40,13 +41,13 @@ from tokenspeed.runtime.models.base.placement import Placement
 class ExecutionNode:
     module: nn.Module
     spec: ModuleSpec
-    name: Optional[str] = None
+    name: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class ExecutionState:
     hidden_states: torch.Tensor
-    residual: Optional[torch.Tensor]
+    residual: torch.Tensor | None
     ctx: ForwardContext
     out_cache_loc: torch.Tensor
 
@@ -57,21 +58,21 @@ StepRunner = Callable[[ExecutionState, torch.Tensor], ExecutionState]
 @dataclass
 class ExecutionStep:
     runner: StepRunner
-    module: Optional[nn.Module] = None
-    pre_comms: List[CommOp] = field(default_factory=list)
-    post_comms: List[CommOp] = field(default_factory=list)
+    module: nn.Module | None = None
+    pre_comms: list[CommOp] = field(default_factory=list)
+    post_comms: list[CommOp] = field(default_factory=list)
     spec: ModuleSpec = field(default_factory=ModuleSpec)
     kind: ModuleKind = ModuleKind.GENERIC
     captures_aux: bool = False
     skip_on_idle: bool = False
-    name: Optional[str] = None
+    name: str | None = None
 
 
 class CompiledDecoderLayer(nn.Module):
     def __init__(
         self,
-        steps: List[ExecutionStep],
-        final_placement: Optional[Placement],
+        steps: list[ExecutionStep],
+        final_placement: Placement | None,
         mapping: Mapping,
     ) -> None:
         from tokenspeed.runtime.models.base.comm_ops import (
@@ -136,9 +137,9 @@ class CompiledDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
-        residual: Optional[torch.Tensor],
-        aux_hidden_states: Optional[list] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        residual: torch.Tensor | None,
+        aux_hidden_states: list | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         num_global_tokens = self._num_global_tokens(ctx)
         is_idle = ctx.forward_mode.is_idle() if ctx.forward_mode else False
 

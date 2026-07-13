@@ -15,6 +15,7 @@ on:
       - "test/**"
       - ".github/workflows/pr-test-amd.yml"
       - ".github/workflows/pr-test-nvidia.yml"
+      - ".github/workflows/pr-test-nvidia-arm.yml"
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, closed]
     branches: [main]
@@ -28,6 +29,7 @@ on:
       - "test/**"
       - ".github/workflows/pr-test-amd.yml"
       - ".github/workflows/pr-test-nvidia.yml"
+      - ".github/workflows/pr-test-nvidia-arm.yml"
   workflow_dispatch:
     inputs:
       trigger:
@@ -91,7 +93,7 @@ jobs:
           MATRIX=$(python3 test/ci_system/pipeline.py scan \
             --root test/ci \
             --trigger "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.trigger || 'per-commit' }}" \
-            --runner-group "nvidia")
+            --runner-group "nvidia-x86")
           echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
 
       # Compute this once on the hosted runner (where `gh` is pre-installed)
@@ -147,6 +149,7 @@ jobs:
     name: ${{ matrix.name }} (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
+    continue-on-error: ${{ matrix.optional }}
     env:
       # When the scan job determined that this run touched `tokenspeed-mla/`,
       # `install_deps.sh` will reinstall the in-tree source on top of the

@@ -1,9 +1,7 @@
-# Adapted from meituan-longcat/SGLang-FluentLLM.
-# This file has been modified for this repository.
-# This file may incorporate material from ModelTC/lightllm,
-# vllm-project/vllm, and sgl-project/sglang, as identified in
-# python/THIRDPARTYNOTICES.
-
+# SPDX-License-Identifier: MIT AND Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 LightSeek Foundation
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
 # Copyright (c) 2026 LightSeek Foundation
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -49,9 +47,8 @@ def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> list[bool]:
     as the source rank. It tests if processes are attached to the same
     memory system (shared access to shared memory).
     """
-    assert (
-        torch.distributed.get_backend(pg) != torch.distributed.Backend.NCCL
-    ), "in_the_same_node_as should be tested with a non-NCCL group."
+    if torch.distributed.get_backend(pg) == torch.distributed.Backend.NCCL:
+        raise ValueError("in_the_same_node_as should be tested with a non-NCCL group.")
     # local rank inside the group
     rank = torch.distributed.get_rank(group=pg)
     world_size = torch.distributed.get_world_size(group=pg)
@@ -92,8 +89,8 @@ def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> list[bool]:
                     shm = shared_memory.SharedMemory(name=name)
                 if shm.buf[: len(magic_message)] == magic_message:
                     is_in_the_same_node[rank] = 1
-    except Exception as e:
-        logger.error("Error ignored in is_in_the_same_node: %s", e)
+    except Exception as exc:
+        logger.error("Error ignored in is_in_the_same_node: %s", exc)
     finally:
         if shm:
             shm.close()

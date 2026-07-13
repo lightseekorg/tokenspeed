@@ -20,6 +20,8 @@
 
 """Paged attention."""
 
+from collections.abc import Sequence
+
 import torch
 from torch import nn
 
@@ -41,6 +43,7 @@ class PagedAttention(nn.Module):
         logit_cap: float = 0.0,
         v_head_dim: int = -1,
         sliding_window_size: int = -1,
+        group_id: str = "",
     ):
         super().__init__()
         self.tp_q_head_num = num_heads
@@ -53,6 +56,9 @@ class PagedAttention(nn.Module):
         self.layer_id = layer_id
         self.logit_cap = logit_cap
         self.sliding_window_size = sliding_window_size or -1
+        # Flat KV-cache group ("" -> single-table fallback in the backend).
+        # TODO(radix-removal): make group_id mandatory once flat is the only path.
+        self.group_id = group_id
         self.k_scale = None
         self.v_scale = None
 
@@ -68,7 +74,8 @@ class PagedAttention(nn.Module):
     ):
         if k is not None:
             # For cross-layer sharing, kv can be None
-            assert v is not None
+            if v is None:
+                raise ValueError("v must be provided when k is provided.")
             if "k_pe" not in kwargs:
                 k = k.view(-1, self.tp_k_head_num, self.qk_head_dim)
                 v = v.view(-1, self.tp_v_head_num, self.v_head_dim)
@@ -88,3 +95,35 @@ class PagedAttention(nn.Module):
             save_kv_cache,
             **kwargs,
         )
+
+
+def validate_paged_cache_group_ids(
+    model: nn.Module,
+    paged_cache_group_specs: Sequence,
+) -> None:
+    """Fail fast (ValueError) when a pool publishing more than one paged-cache
+    group meets a PagedAttention layer whose group_id is empty or unknown --
+    instead of a KeyError deep in the backend, possibly during graph capture.
+    """
+    group_ids = {str(spec.group_id) for spec in paged_cache_group_specs}
+    if len(group_ids) <= 1:
+        return
+    model_name = type(model).__name__
+    for name, module in model.named_modules():
+        if not isinstance(module, PagedAttention):
+            continue
+        if not module.group_id:
+            raise ValueError(
+                f"{model_name}: attention layer {name!r} (layer_id="
+                f"{module.layer_id}) has empty group_id but the KV pool "
+                f"publishes {len(group_ids)} paged-cache groups "
+                f"{sorted(group_ids)}; pass group_id=<layer_type> to "
+                "PagedAttention (see gpt_oss.py)."
+            )
+        if module.group_id not in group_ids:
+            raise ValueError(
+                f"{model_name}: attention layer {name!r} (layer_id="
+                f"{module.layer_id}) has group_id={module.group_id!r} which "
+                "is not among the KV pool's paged-cache groups "
+                f"{sorted(group_ids)}."
+            )

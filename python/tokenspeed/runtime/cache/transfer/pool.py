@@ -20,7 +20,7 @@
 
 from __future__ import annotations
 
-from typing import Optional, Protocol
+from typing import Protocol
 
 import torch
 
@@ -57,7 +57,7 @@ class CachePool(Protocol):
 
     def local_layer_idx(self, global_layer_id: int) -> int: ...
 
-    def alloc_host(self, n: int) -> Optional[torch.Tensor]: ...
+    def alloc_host(self, n: int) -> torch.Tensor | None: ...
 
     def free_host(self, indices: torch.Tensor) -> None: ...
 

@@ -88,21 +88,23 @@ def test_preprocess_gluon_mxfp4_gfx950_mutates_module_state(monkeypatch):
     w2_storage = module.w2_weight_triton_tensor
     assert w13_storage.dtype == torch.uint8
     assert w2_storage.dtype == torch.uint8
-    assert module.w13_weight_triton_tensor.shape == (2, 32, 256)
-    assert module.w2_weight_triton_tensor.shape == (2, 64, 128)
-    assert module.w13_weight_triton_tensor.stride(-2) == 1
-    assert module.w2_weight_triton_tensor.stride(-2) == 1
+    assert module.w13_weight_triton_tensor.shape == (2, 128, 256)
+    assert module.w2_weight_triton_tensor.shape == (2, 128, 128)
     assert module._w2_logical_n == 64
     assert module.w2_weight_bias.shape == (2, 64)
 
-    assert hasattr(w13_storage, "_gluon_shuffled")
-    assert hasattr(w2_storage, "_gluon_shuffled")
-    assert hasattr(module.w13_weight_triton_tensor, "_gluon_shuffled")
-    assert hasattr(module.w2_weight_triton_tensor, "_gluon_shuffled")
+    assert w13_storage.is_shuffled_for_gluon_dot is True
+    assert w2_storage.is_shuffled_for_gluon_dot is True
+    assert w13_storage.original_k_pk == 32
+    assert w2_storage.original_k_pk == 64
+    assert w13_storage.gluon_dot_block_k_pk == 128
+    assert w2_storage.gluon_dot_block_k_pk == 128
+    assert w13_storage.gluon_dot_block_n == 128
+    assert w2_storage.gluon_dot_block_n == 128
+    assert not hasattr(w13_storage, "_gluon_shuffled")
+    assert not hasattr(w2_storage, "_gluon_shuffled")
     assert w2_storage.original_n == 64
     assert module.w2_weight_triton_tensor.original_n == 64
-    assert w2_storage._gluon_shuffled.original_n == 64
-    assert module.w2_weight_triton_tensor._gluon_shuffled.original_n == 64
 
     w13_config = module.w13_precision_config
     w2_config = module.w2_precision_config

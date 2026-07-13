@@ -53,6 +53,9 @@ struct PagedCacheGroupConfig {
     std::int32_t rows_per_page{};
     std::int32_t entry_stride_tokens{};
     std::int32_t total_pages{};
+    // Per-group page granularity in tokens; 0 = unset, falls back to the global
+    // SchedulerConfig::block_size.
+    std::int32_t block_size{0};
     Retention retention{Retention::FullHistory};
     std::optional<std::int32_t> sliding_window_tokens{};
     // History groups form a chain; State groups only need the trailing window.
@@ -101,7 +104,8 @@ private:
 
 // One per request, per group. Two storage segments (no refcounts):
 //   - `borrowed_page_ids_`: page ids only; physical ownership lives in a
-//     TreeNode's PagedCacheSnapshot, pinned via the request's DeviceNodeRef.
+//     TreeNode's PagedCacheSnapshot. HybridPrefixCache treats these ids as an
+//     explicit borrow when deciding whether that snapshot can be reclaimed.
 //   - `owned_pages_`: RAII back to the allocator on release or moved to a
 //     snapshot via CommitHistoryToSnapshot / CheckpointStateToSnapshot.
 // PageIds() = borrowed ++ owned, where column c == absolute logical page
@@ -160,17 +164,21 @@ public:
     // Borrowed prefix pages and already committed pages are retained.
     std::vector<std::int32_t> RewindTail(std::int32_t target_raw_tokens_exclusive);
 
-    // Release everything; owned via RAII, borrowed by clearing. Used by finish/abort/retract.
+    // Release everything; owned via RAII, borrowed by clearing. Used when a
+    // request finishes or aborts; retraction preserves the table for recovery.
     std::vector<std::int32_t> ReleaseAll();
 
     // Compact: PageIds()[c] = absolute logical page BaseLogicalPage() + c.
     const std::vector<std::int32_t>& PageIds() const { return page_ids_view_; }
+    const std::vector<std::int32_t>& BorrowedPageIds() const { return borrowed_page_ids_; }
     std::int32_t Size() const { return static_cast<std::int32_t>(borrowed_page_ids_.size()) + owned_pages_.Size(); }
     std::int32_t ActivePagesCount() const { return Size(); }
     std::int32_t OwnedPagesCount() const { return owned_pages_.Size(); }
     std::int32_t BorrowedPagesCount() const { return static_cast<std::int32_t>(borrowed_page_ids_.size()); }
     std::int32_t ReleasedPagesCount() const { return base_logical_page_; }
     std::int32_t BaseLogicalPage() const { return base_logical_page_; }
+    // Exclusive logical reservation horizon. Under overlap this may be ahead
+    // of the accepted or snapshot-published token boundary.
     std::int32_t RawTokenCursor() const { return raw_token_cursor_; }
 
     // Independent of base_logical_page_; sliding ReleaseSkipped does not move this.

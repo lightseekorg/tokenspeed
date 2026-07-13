@@ -74,4 +74,59 @@ TEST_F(PagedCacheEvictionTest, PassiveEvictionReleasesPagedCachePages) {
     EXPECT_EQ(swa_alloc_->AvailablePages(), swa_before);
 }
 
+TEST_F(PagedCacheEvictionTest, BorrowedSnapshotSurvivesDeviceEviction) {
+    InsertDevicePages(/*num_pages=*/2, /*token_start=*/1);                   // branch A
+    auto* leaf_b = InsertDevicePages(/*num_pages=*/2, /*token_start=*/100);  // branch B
+    ASSERT_NE(leaf_b, nullptr);
+
+    TreeNode* attach_a = kv_cache_->GetRadixTree().SplitAt(
+        kv_cache_->Match(MakeAlignedTokens(2, kPageSize, /*start=*/1)).device.last_node, kLcm);
+    ASSERT_NE(attach_a, nullptr);
+
+    PageAllocator host_alloc{kPageSize, /*total_pages=*/8};
+    const auto host_pages = static_cast<std::int32_t>(attach_a->Tokens().size()) / kPageSize;
+    attach_a->AttachResource(std::make_unique<NodeResource<ResourceType::Host>>(host_alloc.Allocate(host_pages)));
+    auto host_ref = std::make_unique<HostNodeRef>(attach_a);
+
+    const std::int32_t fh_before = fh_alloc_->AvailablePages();
+    const std::int32_t swa_before = swa_alloc_->AvailablePages();
+    hybrid_->AttachPagedCacheSnapshotToNode(attach_a, MakeCompleteSnapshot(kLcm));
+    const std::int32_t fh_pinned = fh_alloc_->AvailablePages();
+    const std::int32_t swa_pinned = swa_alloc_->AvailablePages();
+    ASSERT_LT(fh_pinned, fh_before);
+    ASSERT_LT(swa_pinned, swa_before);
+
+    auto match_a = hybrid_->Match(MakeAlignedTokens(2, kPageSize, /*start=*/1));
+    ASSERT_EQ(match_a.paged_cache.prefix_len_tokens, kLcm);
+    hybrid_->AcquireForRequest("retracted", /*first_raw_position_of_op=*/0,
+                               /*target_raw_tokens_exclusive=*/kLcm, match_a.paged_cache);
+
+    auto match_b = kv_cache_->Match(MakeAlignedTokens(2, kPageSize, /*start=*/100));
+    DeviceNodeRef ref_b{match_b.device.last_node};
+    const std::int32_t target_available = device_alloc_->AvailablePages() + 1;
+    ASSERT_TRUE(kv_cache_->EnsureCapacityByEvict<ResourceType::Device>(target_available));
+
+    // Device eviction must not free side-cache pages still borrowed by a
+    // retracted/loadback request's retained table.
+    EXPECT_FALSE(attach_a->OnDevice());
+    EXPECT_TRUE(attach_a->HasPagedCacheSnapshot());
+    EXPECT_EQ(fh_alloc_->AvailablePages(), fh_pinned);
+    EXPECT_EQ(swa_alloc_->AvailablePages(), swa_pinned);
+    EXPECT_THROW(hybrid_->OnNodeDestroyed(attach_a), std::runtime_error);
+    EXPECT_TRUE(attach_a->HasPagedCacheSnapshot());
+
+    // Once the request table drops the borrow, the normal eviction callback
+    // can reclaim the snapshot and return its pages.
+    hybrid_->ReleaseRequest("retracted");
+    hybrid_->OnKVEvict(attach_a);
+    EXPECT_FALSE(attach_a->HasPagedCacheSnapshot());
+    EXPECT_EQ(fh_alloc_->AvailablePages(), fh_before);
+    EXPECT_EQ(swa_alloc_->AvailablePages(), swa_before);
+
+    // Destroy the manually attached host resource before its local allocator.
+    host_ref.reset();
+    auto host_resource = attach_a->DetachResource<ResourceType::Host>();
+    ASSERT_NE(host_resource, nullptr);
+}
+
 }  // namespace tokenspeed::test

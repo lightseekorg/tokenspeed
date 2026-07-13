@@ -24,8 +24,7 @@ import torch
 from tokenspeed_kernel.ops.attention.triton.gdn_qkv_split import (
     fused_qkv_split_gdn_prefill,
 )
-
-from tokenspeed.runtime.layers.attention.linear.l2norm import l2norm_fwd
+from tokenspeed_kernel.ops.attention.triton.linear.l2norm import l2norm_fwd
 
 # Qwen3.5 production shapes
 CONFIGS = [

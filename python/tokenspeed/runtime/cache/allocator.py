@@ -138,9 +138,11 @@ class KVAllocator:
     def free_with_diff(self, new_prefix_page_ids, old_page_ids):
         # New KV pages come from the prefix tree and are already cached, so only
         # release the pages that differ from the old allocation.
-        assert len(new_prefix_page_ids) == len(
-            old_page_ids
-        ), "[free with diff] new_prefix_page_ids and old_page_ids should have the same length"
+        if len(new_prefix_page_ids) != len(old_page_ids):
+            raise ValueError(
+                "[free with diff] new_prefix_page_ids and old_page_ids "
+                "should have the same length"
+            )
         diff = new_prefix_page_ids != old_page_ids
         if torch.any(diff):
             logger.debug(

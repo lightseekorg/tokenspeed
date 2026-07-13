@@ -16,7 +16,7 @@ MAX_SCHEDULED_TOKENS = 32
 
 def _scheduler_config() -> SchedulerConfig:
     cfg = SchedulerConfig()
-    cfg.page_size = PAGE_SIZE
+    cfg.block_size = PAGE_SIZE
     cfg.max_scheduled_tokens = MAX_SCHEDULED_TOKENS
     cfg.max_batch_size = 4
     cfg.num_device_pages = 64

@@ -30,7 +30,10 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from tokenspeed.runtime.distributed.mapping import Mapping
-from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.context import (
+    ForwardContext,
+    report_collective_sizing,
+)
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
@@ -137,11 +140,12 @@ class Qwen3_5DraftForCausalLM(Qwen3_5ForCausalLM):
         quant_config=None,
         prefix: str = "",
     ) -> None:
-        assert config.num_hidden_layers == 1, (
-            "Qwen3_5DraftForCausalLM requires num_hidden_layers == 1 "
-            f"(got {config.num_hidden_layers}); _apply_correction is not "
-            "idempotent across layers."
-        )
+        if config.num_hidden_layers != 1:
+            raise ValueError(
+                "Qwen3_5DraftForCausalLM requires num_hidden_layers == 1 "
+                f"(got {config.num_hidden_layers}); _apply_correction is not "
+                "idempotent across layers."
+            )
         super().__init__(config, mapping, quant_config=quant_config, prefix=prefix)
 
 
@@ -206,7 +210,6 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
         self.logits_processor = LogitsProcessor(
             config,
             skip_all_gather=self.mapping.attn.has_dp,
-            do_argmax=True,
             tp_rank=self.mapping.attn.tp_rank,
             tp_size=self.mapping.attn.tp_size,
             tp_group=self.mapping.attn.tp_group,
@@ -252,7 +255,8 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
                 dtype=self.model.embed_tokens.weight.dtype,
             )
         else:
-            assert input_embeds is None
+            if input_embeds is not None:
+                raise ValueError("input_embeds is not supported for nextn forward.")
             input_embeds = self.model.embed_tokens(input_ids)
             hidden_states = captured_hidden_states
             input_embeds = self.pre_fc_norm_embedding(input_embeds)
@@ -261,13 +265,14 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
 
         hidden_states = self.fc(hidden_states)
 
-        hidden_states, _ = self.model(
-            input_ids,
-            positions,
-            ctx,
-            out_cache_loc,
-            input_embeds=hidden_states,
-        )
+        with report_collective_sizing(ctx, ctx.bs, ctx.global_bs):
+            hidden_states, _ = self.model(
+                input_ids,
+                positions,
+                ctx,
+                out_cache_loc,
+                input_embeds=hidden_states,
+            )
 
         logits_metadata = LogitsMetadata.from_forward_context(ctx)
         return self.logits_processor(
@@ -372,10 +377,13 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith((".bias", "_bias")) and name not in params_dict:
                     continue
-                if moe_loader is not None and moe_loader.matches(name):
-                    mapped_name = moe_loader.load(name, loaded_weight)
-                    loaded_params.add(mapped_name)
-                    continue
+                if moe_loader is not None:
+                    if moe_loader.matches(name):
+                        mapped_name = moe_loader.load(name, loaded_weight)
+                        loaded_params.add(mapped_name)
+                        continue
+                    if moe_loader.is_expert_checkpoint_weight(name):
+                        continue
 
                 # Skip loading extra parameters for GPTQ/nvfp4 models.
                 if name.endswith(ignore_suffixes) and name not in params_dict:

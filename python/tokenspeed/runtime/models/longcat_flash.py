@@ -249,6 +249,7 @@ class _RuntimeLongcatMoE(nn.Module):
             zero_expert_type=config.zero_expert_type,
             routing_config={
                 "routed_scaling_factor": self.routed_scaling_factor,
+                "normalize_topk_weights": config.norm_topk_prob,
                 "correction_bias": self.router.e_score_correction_bias[
                     : config.n_routed_experts
                 ],
@@ -836,7 +837,10 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
                 ):
                     weight_block_size = self.quant_config.weight_block_size
                     if weight_block_size is not None:
-                        assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
+                        if not hasattr(self_attn.kv_b_proj, "weight_scale_inv"):
+                            raise RuntimeError(
+                                "kv_b_proj.weight_scale_inv is required for block FP8 dequant."
+                            )
                         dtype = torch.get_default_dtype()
                         w = _block_dequant(
                             self_attn.kv_b_proj.weight,

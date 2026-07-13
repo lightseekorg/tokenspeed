@@ -1,9 +1,7 @@
-# Adapted from meituan-longcat/SGLang-FluentLLM.
-# This file has been modified for this repository.
-# This file may incorporate material from ModelTC/lightllm,
-# vllm-project/vllm, and sgl-project/sglang, as identified in
-# python/THIRDPARTYNOTICES.
-
+# SPDX-License-Identifier: MIT AND Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 LightSeek Foundation
+# SPDX-FileCopyrightText: Copyright contributors to the FluentLLM project
+#
 # Copyright (c) 2026 LightSeek Foundation
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -104,7 +102,7 @@ class ExpertDistributionRecorder(ABC):
         return False
 
     def _on_not_implemented(self):
-        raise Exception(
+        raise RuntimeError(
             "Please set ServerArgs.expert_distribution_recorder_mode to use ExpertDistributionRecorder."
         )
 
@@ -203,9 +201,8 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     def _reset(self):
         """Reset the expert distribution recorder."""
         logger.info("Resetting ExpertDistributionRecorder...")
-        assert (
-            self._current_layer_idx.value is None
-        ), f"{self._current_layer_idx.value=}"
+        if self._current_layer_idx.value is not None:
+            raise RuntimeError(f"{self._current_layer_idx.value=}")
         for gatherer in self._single_pass_gatherers.values():
             gatherer.reset()
         self._accumulator.reset()
@@ -321,7 +318,8 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
         self._misc_objects: list[dict[str, Any]] = []
 
     def on_forward_pass_start(self, metadata: dict[str, Any] | None = None):
-        assert self._metadata is None
+        if self._metadata is not None:
+            raise RuntimeError("forward pass metadata was not collected before reset.")
         self._metadata = dict(metadata or {})
 
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
@@ -366,7 +364,10 @@ class _LayerBasedCpuSinglePassGatherer(_SinglePassGatherer):
         self._objects_of_layer = {}
 
     def _on_layer_data(self, layer_idx: int, objects: list[int]):
-        assert 0 <= layer_idx < self._expert_location_metadata.num_layers
+        if not 0 <= layer_idx < self._expert_location_metadata.num_layers:
+            raise ValueError(
+                f"layer_idx={layer_idx} is outside [0, {self._expert_location_metadata.num_layers})."
+            )
         if layer_idx in self._objects_of_layer:
             self._objects_of_layer[layer_idx] = _list_sum(
                 self._objects_of_layer[layer_idx], objects
@@ -459,7 +460,11 @@ class _DeepepNormalSinglePassGatherer(_LayerBasedCpuSinglePassGatherer):
         num_tokens_per_rdma_rank,
         num_tokens_per_expert,
     ):
-        assert isinstance(local_physical_count_of_layer, list)
+        if not isinstance(local_physical_count_of_layer, list):
+            raise TypeError(
+                "local_physical_count_of_layer must be a list, got "
+                f"{type(local_physical_count_of_layer).__name__}."
+            )
         self._on_layer_data(layer_idx, local_physical_count_of_layer)
 
     def collect(self) -> dict:
@@ -662,7 +667,8 @@ class _DetailAccumulator(_UtilizationRateAccumulator):
         self._records.clear()
 
     def dump(self, output_mode: _OutputMode):
-        assert output_mode == "file"
+        if output_mode != "file":
+            raise ValueError(f"Unsupported output_mode: {output_mode}")
         output = dict(
             records=self._records,
             #  This may change during recording, so here we say it is the "last" one

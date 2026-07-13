@@ -104,6 +104,41 @@ def _build_default_expert_plan(
     return expert_plan
 
 
+def _build_global_expert_name_plan(
+    schema: ExpertCheckpointSchema,
+    *,
+    num_experts: int,
+) -> list[CheckpointPlanEntry]:
+    expert_plan: list[CheckpointPlanEntry] = []
+    for expert_id in range(num_experts):
+        expert_plan.extend(
+            (
+                CheckpointPlanEntry(
+                    param_name="",
+                    checkpoint_weight_name=schema.make_expert_weight_name(
+                        expert_id, "gate_proj"
+                    ),
+                    shard_id="",
+                ),
+                CheckpointPlanEntry(
+                    param_name="",
+                    checkpoint_weight_name=schema.make_expert_weight_name(
+                        expert_id, "up_proj"
+                    ),
+                    shard_id="",
+                ),
+                CheckpointPlanEntry(
+                    param_name="",
+                    checkpoint_weight_name=schema.make_expert_weight_name(
+                        expert_id, "down_proj"
+                    ),
+                    shard_id="",
+                ),
+            )
+        )
+    return expert_plan
+
+
 def _build_default_fused_plan(
     schema: ExpertCheckpointSchema,
     *,
@@ -233,6 +268,7 @@ class MoECheckpointLoader:
         *,
         params_dict: dict[str, nn.Parameter],
         expert_plan: Sequence[ExpertWeightPlanEntry] = (),
+        global_expert_plan: Sequence[CheckpointPlanEntry] = (),
         fused_plan: Sequence[FusedExpertWeightPlanEntry] = (),
         num_experts: int | None = None,
         ep_rank: int = 0,
@@ -242,6 +278,7 @@ class MoECheckpointLoader:
     ) -> None:
         self._params_dict = params_dict
         self._expert_plan = tuple(expert_plan)
+        self._global_expert_plan = tuple(global_expert_plan)
         self._fused_plan = tuple(fused_plan)
         self._num_experts = num_experts
         self._ep_rank = ep_rank
@@ -261,6 +298,21 @@ class MoECheckpointLoader:
     def matches(self, name: str) -> bool:
         return self._matches_plan(self._fused_plan, name) or self._matches_plan(
             self._expert_plan, name
+        )
+
+    def is_expert_checkpoint_weight(self, name: str) -> bool:
+        """Return whether ``name`` belongs to this loader's MoE checkpoint schema.
+
+        Args:
+            name: Checkpoint tensor name after any model-specific remapping.
+
+        Returns:
+            ``True`` for local, non-local, or fused expert checkpoint tensors
+            that this loader is responsible for; ``False`` for unrelated
+            checkpoint tensors.
+        """
+        return self._matches_plan(self._fused_plan, name) or self._matches_plan(
+            self._global_expert_plan, name
         )
 
     def _load_expert(self, name: str, loaded_weight: torch.Tensor) -> str | None:
@@ -391,6 +443,7 @@ def build_moe_checkpoint_loader(
     transpose_local_tensor_non_bias: bool = False,
 ) -> MoECheckpointLoader:
     expert_plan: Sequence[ExpertWeightPlanEntry] = ()
+    global_expert_plan: Sequence[CheckpointPlanEntry] = ()
     if expert_schema is not None:
         if num_experts is None:
             raise ValueError("num_experts is required when expert_schema is used")
@@ -399,6 +452,10 @@ def build_moe_checkpoint_loader(
             num_experts=num_experts,
             ep_rank=ep_rank,
             ep_size=ep_size,
+        )
+        global_expert_plan = _build_global_expert_name_plan(
+            expert_schema,
+            num_experts=num_experts,
         )
 
     fused_plan: Sequence[FusedExpertWeightPlanEntry] = ()
@@ -412,6 +469,7 @@ def build_moe_checkpoint_loader(
     return MoECheckpointLoader(
         params_dict=params_dict,
         expert_plan=expert_plan,
+        global_expert_plan=global_expert_plan,
         fused_plan=fused_plan,
         num_experts=num_experts,
         ep_rank=ep_rank,

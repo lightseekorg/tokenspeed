@@ -70,7 +70,7 @@ class NanGuard:
         guard.reset(bs)                    # outside the graph
         ... per forward cycle (in-graph):
             guard.audit_logits(logits_output, ctx)     # pre-sampling
-            guard.merge_oov(tokens, ctx, vocab_size)   # pre-clamp
+            guard.merge_oov(tokens, ctx, vocab_size)   # OOV backstop
         flags = guard.flags_cpu            # with the output D2H batch
     """
 
@@ -108,8 +108,7 @@ class NanGuard:
         """Backstop: flag requests whose sampled ids fall outside [0, vocab).
 
         Catches corruption past the logits (sampler/verify kernel output) and
-        covers DP-sharded steps. Must run before the in-vocab clamps — they
-        erase the evidence. Token ids are already rank-synced here.
+        covers DP-sharded steps. Token ids are already rank-synced here.
         """
         self._or_per_request((output_tokens < 0) | (output_tokens >= vocab_size), ctx)
 
