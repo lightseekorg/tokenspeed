@@ -65,6 +65,43 @@ def test_vllm_style_enable_kv_cache_events_config_is_accepted() -> None:
     )
 
 
+def test_kv_events_config_from_cli_accepts_full_mooncake_deployment_json() -> None:
+    """Smoke-parse the recommended Mooncake --kv-events-config from the plan."""
+    config = KVEventsConfig.from_cli("""{
+          "enable_kv_cache_events": true,
+          "publisher": "zmq",
+          "endpoint": "tcp://*:5557",
+          "replay_endpoint": "tcp://*:5558",
+          "buffer_steps": 10000,
+          "hwm": 100000,
+          "max_queue_size": 100000,
+          "topic": "kv-events",
+          "wire_format": "rfc1527",
+          "backend_id": "ts-worker-0",
+          "tenant_id": "default",
+          "model_name": "Qwen3-8B",
+          "publish_medium": true,
+          "publish_tiers": ["gpu", "cpu", "disk"],
+          "hash_mode": "xxh3"
+        }""")
+
+    assert config.enable_kv_cache_events is True
+    assert config.publisher == "zmq"
+    assert config.endpoint == "tcp://*:5557"
+    assert config.replay_endpoint == "tcp://*:5558"
+    assert config.buffer_steps == 10_000
+    assert config.hwm == 100_000
+    assert config.max_queue_size == 100_000
+    assert config.topic == "kv-events"
+    assert config.wire_format == "rfc1527"
+    assert config.backend_id == "ts-worker-0"
+    assert config.tenant_id == "default"
+    assert config.model_name == "Qwen3-8B"
+    assert config.publish_medium is True
+    assert config.publish_tiers == ["gpu", "cpu", "disk"]
+    assert config.hash_mode == "xxh3"
+
+
 def test_factory_returns_null_publisher_when_events_are_disabled() -> None:
     publisher = EventPublisherFactory.create(
         '{"publisher":"zmq","endpoint":"tcp://*:5557","enable_kv_cache_events":false}',

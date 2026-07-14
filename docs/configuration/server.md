@@ -148,7 +148,7 @@ draft model, and token count together.
 | `--metrics-reporters` | Metrics reporter, such as `prometheus`. |
 | `--decode-log-interval` | Decode batch log interval. |
 | `--enable-cache-report` | Include cached-token counts in OpenAI-compatible usage details. |
-| `--kv-events-config` | JSON config for KV cache mutation events. Set `enable_kv_cache_events` and a publisher such as `zmq` to publish device prefix-cache stores and removals. |
+| `--kv-events-config` | JSON config for KV cache mutation events (`KVEventsConfig`). Keys: `enable_kv_cache_events`, `publisher`, `endpoint`, `replay_endpoint`, `buffer_steps`, `hwm`, `max_queue_size`, `topic`, `wire_format`, `backend_id`, `tenant_id`, `model_name`, `publish_medium`, `publish_tiers`, `hash_mode`. See [KV Cache Events](#kv-cache-events). |
 
 ### Per-Request Stats
 
@@ -185,10 +185,52 @@ scheduler path (device/GPU and host/CPU tiers) and, when enabled, Mooncake L3
 so publishing a stored block uses the parent node's cached hash instead of
 rebuilding the full ancestor prefix.
 
-Example:
+`--kv-events-config` accepts a JSON object with these `KVEventsConfig` keys:
+
+| Key | Default | Purpose |
+| --- | --- | --- |
+| `enable_kv_cache_events` | `false` | Publish scheduler KV cache mutation events. |
+| `publisher` | `zmq` when enabled, else `null` | Event publisher (`zmq` or `null`). |
+| `endpoint` | `tcp://*:5557` | ZMQ PUB bind address. |
+| `replay_endpoint` | unset | Optional ZMQ endpoint for event replay. |
+| `buffer_steps` | `10000` | Steps retained for the replay endpoint. |
+| `hwm` | `100000` | ZMQ high water mark (events drop if consumers lag). |
+| `max_queue_size` | `100000` | Max queued events waiting to publish. |
+| `topic` | `""` | ZMQ topic subscribers filter on. |
+| `wire_format` | `legacy` | `legacy` (Dynamo-compat) or `rfc1527` envelopes. |
+| `backend_id` | env / hostname | Worker id shared across all tier publishes. |
+| `tenant_id` | `default` | Multi-tenant indexer isolation. |
+| `model_name` | unset | Model name in RFC #1527 envelopes when set. |
+| `publish_medium` | `true` | Include `medium` in RFC #1527 envelopes. |
+| `publish_tiers` | `["gpu"]` | Tiers to publish: `gpu`, `cpu`, `disk`. |
+| `hash_mode` | `fnv` | Block hash mode (`fnv` or `xxh3`). |
+
+Minimal example:
 
 ```bash
 --kv-events-config '{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://*:5557","topic":"kv-events"}'
+```
+
+Recommended Mooncake multi-tier deployment:
+
+```bash
+--kv-events-config '{
+  "enable_kv_cache_events": true,
+  "publisher": "zmq",
+  "endpoint": "tcp://*:5557",
+  "replay_endpoint": "tcp://*:5558",
+  "buffer_steps": 10000,
+  "hwm": 100000,
+  "max_queue_size": 100000,
+  "topic": "kv-events",
+  "wire_format": "rfc1527",
+  "backend_id": "ts-worker-0",
+  "tenant_id": "default",
+  "model_name": "Qwen3-8B",
+  "publish_medium": true,
+  "publish_tiers": ["gpu", "cpu", "disk"],
+  "hash_mode": "xxh3"
+}'
 ```
 
 The ZMQ publisher sends three frames: topic bytes, an 8-byte big-endian sequence
@@ -251,8 +293,13 @@ checklist.
   "enable_kv_cache_events":true,
   "publisher":"zmq",
   "endpoint":"tcp://*:5557",
+  "replay_endpoint":"tcp://*:5558",
+  "topic":"kv-events",
   "wire_format":"rfc1527",
   "backend_id":"ts-worker-0",
+  "tenant_id":"default",
+  "model_name":"YOUR_MODEL",
+  "publish_medium":true,
   "publish_tiers":["gpu","cpu","disk"],
   "hash_mode":"xxh3"
 }'
@@ -310,6 +357,16 @@ Under a natural offload pipeline (device → host → disk), tier counts are
 equal to each instance's per-`dp_rank` `gpu` count. Because TokenSpeed emits
 one event per tier with a shared `backend_id`, the indexer aggregates those
 events into a single instance entry rather than duplicate radix workers.
+
+##### Follow-up: `/v1/tokenize` with chat `messages`
+
+TokenSpeed does **not** yet expose `/v1/tokenize` that accepts ChatCompletion-style
+`messages` (HTTP `/v1/*` is proxied to the SMG gateway today). Routers that need
+template-identical token IDs for indexer `/query` should track adding that API
+following the [SGLang PR #23981](https://github.com/sgl-project/sglang/pull/23981)
+pattern; it requires SMG/gateway changes outside the KV-events Mooncake Store
+scope. Until then, pass pre-tokenized `input_ids` / `token_ids`, or apply the
+engine's chat template offline before querying the indexer.
 
 #### Mooncake master publisher relay (scaffold)
 

@@ -404,16 +404,23 @@ python -m dynamo.indexer --zmq-endpoint tcp://ts-worker-0:5557
 
 ### Task 5.2: Tokenize API for routing (SGLang PR #23981 pattern)
 
+**Status: deferred** — Audit found TokenSpeed `http_server.py` proxies `/v1/*` to
+the SMG gateway; there is no `/v1/tokenize` with ChatCompletion-style `messages`.
+Implementing it requires SMG/gateway changes outside KV-events Mooncake Store
+scope. Documented the gap under Dynamo E2E in `docs/configuration/server.md`
+(Follow-up). Until then: use pre-tokenized `input_ids` / `token_ids`, or match
+the engine chat template offline. Track SGLang PR #23981 for the intended API.
+
 **Files:**
 - Create or extend TokenSpeed HTTP `/v1/tokenize` to accept chat `messages` (if not present)
 
-- [ ] **Step 1: Audit existing tokenize endpoint**
+- [x] **Step 1: Audit existing tokenize endpoint** — no native `/v1/tokenize` with `messages`; `/v1/*` is SMG-proxied
 
-- [ ] **Step 2: Add ChatCompletion-style messages input so routers can hash the same token sequence the engine will run**
+- [ ] **Step 2: Add ChatCompletion-style messages input so routers can hash the same token sequence the engine will run** *(deferred: needs SMG/gateway)*
 
-- [ ] **Step 3: Document usage with Dynamo indexer query flow**
+- [x] **Step 3: Document usage with Dynamo indexer query flow** — Follow-up note in `docs/configuration/server.md`; interim: pre-tokenized IDs / offline template
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 4: Commit** *(implementation deferred; doc gap committed with Phase 6)*
 
 ---
 
@@ -427,16 +434,25 @@ python -m dynamo.indexer --zmq-endpoint tcp://ts-worker-0:5557
   "publisher": "zmq",
   "endpoint": "tcp://*:5557",
   "replay_endpoint": "tcp://*:5558",
+  "buffer_steps": 10000,
+  "hwm": 100000,
+  "max_queue_size": 100000,
+  "topic": "kv-events",
   "wire_format": "rfc1527",
   "backend_id": "ts-worker-0",
   "tenant_id": "default",
   "model_name": "Qwen3-8B",
+  "publish_medium": true,
   "publish_tiers": ["gpu", "cpu", "disk"],
   "hash_mode": "xxh3"
 }'
 ```
 
-`publish_tiers` defaults to `["gpu"]` for backward compatibility; Mooncake Store deployments should set `["gpu","cpu","disk"]`.
+Full `KVEventsConfig` keys: `enable_kv_cache_events`, `publisher`, `endpoint`,
+`replay_endpoint`, `buffer_steps`, `hwm`, `max_queue_size`, `topic`,
+`wire_format`, `backend_id`, `tenant_id`, `model_name`, `publish_medium`,
+`publish_tiers`, `hash_mode`. `publish_tiers` defaults to `["gpu"]` for backward
+compatibility; Mooncake Store deployments should set `["gpu","cpu","disk"]`.
 
 ### Environment variables (Mooncake Store — existing + new)
 
