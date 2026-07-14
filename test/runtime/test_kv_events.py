@@ -74,6 +74,10 @@ def test_block_stored_carries_token_ids_for_xxh3_mode() -> None:
 
     assert wire_event.token_ids == [1, 2, 3, 4]
 
+    wire_event_xxh3 = scheduler_kv_event_to_wire_event(event, hash_mode="xxh3")
+
+    assert wire_event_xxh3.token_ids == [1, 2, 3, 4]
+
     bad = SimpleNamespace(
         kind="BlockStored",
         block_hashes=[123],

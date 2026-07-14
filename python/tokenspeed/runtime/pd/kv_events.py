@@ -86,7 +86,7 @@ class KVEventBatch(EventBatch):
 
 def scheduler_kv_event_to_wire_event(
     event: Any,
-    hash_mode: str = "fnv",
+    hash_mode: Literal["fnv", "xxh3"] = "fnv",
 ) -> Union[BlockStored, BlockRemoved]:
     """Translate a scheduler-native KV event into the ZMQ wire struct."""
     kind = event.kind
@@ -115,7 +115,7 @@ def scheduler_kv_event_to_wire_event(
 
 def scheduler_kv_events_to_wire_events(
     events: Iterable[Any],
-    hash_mode: str = "fnv",
+    hash_mode: Literal["fnv", "xxh3"] = "fnv",
 ) -> list[Union[BlockStored, BlockRemoved]]:
     return [
         scheduler_kv_event_to_wire_event(event, hash_mode=hash_mode) for event in events
