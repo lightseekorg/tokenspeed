@@ -125,6 +125,45 @@ BenchMeasurement MeasureLegacyAncestorRehashWork(std::int32_t page_count, std::i
 
 }  // namespace
 
+TEST(KvHashTest, FirstBlockMatchesRfcExample) {
+    // Golden from Dynamo/RFC #1527 XXH3-64 seed 1337 on LE u32 tokens {1,2,3,4}.
+    constexpr std::uint64_t kExpected = 14643705804678351452ull;
+    const std::vector<std::int32_t> tokens = {1, 2, 3, 4};
+    const auto h = HashKvBlockXxh3(tokens, std::nullopt);
+    EXPECT_EQ(h, kExpected);
+}
+
+TEST(KvHashTest, SecondBlockRollsWithParent) {
+    // Block0 local = seq; block1 seq = XXH3(parent_le || local_le, 1337).
+    constexpr std::uint64_t kFirst = 14643705804678351452ull;
+    constexpr std::uint64_t kExpectedSecond = 4945711292740353085ull;
+    const std::vector<std::int32_t> second_tokens = {5, 6, 7, 8};
+    const auto h = HashKvBlockXxh3(second_tokens, kFirst);
+    EXPECT_EQ(h, kExpectedSecond);
+}
+
+TEST(KvHashTest, UseXxh3FlagDefaultsFalseAndIsToggleable) {
+    EXPECT_FALSE(UseXxh3BlockHash());
+    SetUseXxh3BlockHash(true);
+    EXPECT_TRUE(UseXxh3BlockHash());
+    SetUseXxh3BlockHash(false);
+    EXPECT_FALSE(UseXxh3BlockHash());
+}
+
+TEST_F(KVPrefixCacheEventTestSuite, UseXxh3FlagSwitchesPublishedBlockHashes) {
+    SetUseXxh3BlockHash(true);
+    const token_vec_t tokens = MakeAlignedTokens(1, kPageSize);
+    InsertDevicePages(tokens, 1);
+
+    ASSERT_EQ(events_.size(), 1u);
+    const auto& stored = AsStored(events_[0]);
+    const std::uint64_t fnv_hash = HashKvBlock(std::span<const std::int32_t>(tokens.data(), kPageSize));
+    const std::uint64_t xxh3_hash = HashKvBlockXxh3(std::span<const std::int32_t>(tokens.data(), kPageSize));
+    EXPECT_NE(fnv_hash, xxh3_hash);
+    EXPECT_EQ(stored.block_hashes, std::vector<std::uint64_t>{xxh3_hash});
+    SetUseXxh3BlockHash(false);
+}
+
 TEST_F(KVPrefixCacheEventTestSuite, InsertOnePageEmitsBlockStored) {
     const token_vec_t tokens = MakeAlignedTokens(1, kPageSize);
     InsertDevicePages(tokens, 1);

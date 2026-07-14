@@ -22,14 +22,20 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <optional>
 #include <span>
+#include <vector>
+
+#include "scheduler/xxhash3.h"
 
 namespace tokenspeed {
 namespace {
 
 constexpr std::uint64_t kFnvOffsetBasis = 14695981039346656037ull;
 constexpr std::uint64_t kFnvPrime = 1099511628211ull;
+
+bool g_use_xxh3_block_hash = false;
 
 void MixByte(std::uint64_t& hash, std::uint8_t byte) {
     hash ^= byte;
@@ -49,6 +55,26 @@ void MixInt32(std::uint64_t& hash, std::int32_t value) {
     }
 }
 
+std::vector<std::uint8_t> TokenIdsToLittleEndianBytes(std::span<const std::int32_t> token_ids) {
+    std::vector<std::uint8_t> bytes(token_ids.size() * sizeof(std::uint32_t));
+    for (std::size_t i = 0; i < token_ids.size(); ++i) {
+        const auto raw = static_cast<std::uint32_t>(token_ids[i]);
+        std::memcpy(bytes.data() + i * sizeof(raw), &raw, sizeof(raw));
+    }
+    return bytes;
+}
+
+void AppendUint64LittleEndian(std::vector<std::uint8_t>& bytes, std::uint64_t value) {
+    for (std::size_t i = 0; i < sizeof(value); ++i) {
+        bytes.push_back(static_cast<std::uint8_t>((value >> (i * 8)) & 0xffu));
+    }
+}
+
+std::uint64_t LocalBlockHashXxh3(std::span<const std::int32_t> token_ids) {
+    const std::vector<std::uint8_t> token_bytes = TokenIdsToLittleEndianBytes(token_ids);
+    return Xxh3Hash64WithSeed(token_bytes.data(), token_bytes.size(), kKvBlockXxh3Seed);
+}
+
 }  // namespace
 
 std::uint64_t HashKvBlock(std::span<const std::int32_t> token_ids, std::optional<std::uint64_t> parent_hash) {
@@ -62,6 +88,31 @@ std::uint64_t HashKvBlock(std::span<const std::int32_t> token_ids, std::optional
         MixInt32(hash, token_id);
     }
     return hash;
+}
+
+std::uint64_t HashKvBlockXxh3(std::span<const std::int32_t> token_ids, std::optional<std::uint64_t> parent_hash) {
+    const std::uint64_t local_hash = LocalBlockHashXxh3(token_ids);
+    if (!parent_hash.has_value()) {
+        return local_hash;
+    }
+
+    std::vector<std::uint8_t> combined;
+    combined.reserve(2 * sizeof(std::uint64_t));
+    AppendUint64LittleEndian(combined, *parent_hash);
+    AppendUint64LittleEndian(combined, local_hash);
+    return Xxh3Hash64WithSeed(combined.data(), combined.size(), kKvBlockXxh3Seed);
+}
+
+bool UseXxh3BlockHash() { return g_use_xxh3_block_hash; }
+
+void SetUseXxh3BlockHash(const bool enabled) { g_use_xxh3_block_hash = enabled; }
+
+std::uint64_t HashKvBlockForEvents(std::span<const std::int32_t> token_ids,
+                                   std::optional<std::uint64_t> parent_hash) {
+    if (UseXxh3BlockHash()) {
+        return HashKvBlockXxh3(token_ids, parent_hash);
+    }
+    return HashKvBlock(token_ids, parent_hash);
 }
 
 }  // namespace tokenspeed

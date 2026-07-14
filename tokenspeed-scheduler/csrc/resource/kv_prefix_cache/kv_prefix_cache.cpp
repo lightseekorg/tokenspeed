@@ -66,7 +66,7 @@ std::vector<std::uint64_t> BuildBlockHashesForTokens(const token_vec_t& tokens, 
     for (std::int32_t page = 0; page < page_count; ++page) {
         const auto begin = tokens.begin() + page * page_size;
         token_slice token_page{&*begin, static_cast<std::size_t>(page_size)};
-        parent_hash = HashKvBlock(token_page, parent_hash);
+        parent_hash = HashKvBlockForEvents(token_page, parent_hash);
         block_hashes.push_back(*parent_hash);
     }
     return block_hashes;

@@ -49,4 +49,17 @@ using KvCacheEvent = std::variant<KvBlockStoredEvent, KvBlockRemovedEvent>;
 std::uint64_t HashKvBlock(std::span<const std::int32_t> token_ids,
                           std::optional<std::uint64_t> parent_hash = std::nullopt);
 
+// RFC #1527 rolling sequence hash using XXH3-64 seed 1337.
+// When parent_hash is nullopt, returns the local block hash only.
+std::uint64_t HashKvBlockXxh3(std::span<const std::int32_t> token_ids,
+                              std::optional<std::uint64_t> parent_hash = std::nullopt);
+
+// Global toggle for BuildBlockHashesForNode; defaults to false for FNV backward compatibility.
+bool UseXxh3BlockHash();
+void SetUseXxh3BlockHash(bool enabled);
+
+// Selects HashKvBlock or HashKvBlockXxh3 based on UseXxh3BlockHash().
+std::uint64_t HashKvBlockForEvents(std::span<const std::int32_t> token_ids,
+                                   std::optional<std::uint64_t> parent_hash = std::nullopt);
+
 }  // namespace tokenspeed
