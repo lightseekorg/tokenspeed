@@ -75,7 +75,11 @@ def _load_mooncake_store_config_cls():
                     else (
                         "tcp"
                         if "PROTOCOL" in name
-                        else ("" if "DEVICE" in name else (9003 if "METRICS" in name else True))
+                        else (
+                            ""
+                            if "DEVICE" in name
+                            else (9003 if "METRICS" in name else True)
+                        )
                     )
                 )
             )

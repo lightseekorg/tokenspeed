@@ -236,6 +236,81 @@ spans, so disk hashes may intentionally differ from GPU/CPU hashes until that
 plumbing lands; identity for multi-tier aggregation still relies on the shared
 `backend_id`.
 
+#### Dynamo standalone indexer (end-to-end)
+
+To validate multi-tier KV events against NVIDIA Dynamo's standalone indexer
+(`python -m dynamo.indexer`), run TokenSpeed with RFC #1527 envelopes and all
+three publish tiers, then point the indexer at the worker's ZMQ PUB endpoint.
+Dynamo is an external dependency and is **not** required in TokenSpeed CI —
+see `test/integration/test_kv_events_dynamo_indexer.py` for the manual
+checklist.
+
+```bash
+# TokenSpeed worker
+--kv-events-config '{
+  "enable_kv_cache_events":true,
+  "publisher":"zmq",
+  "endpoint":"tcp://*:5557",
+  "wire_format":"rfc1527",
+  "backend_id":"ts-worker-0",
+  "publish_tiers":["gpu","cpu","disk"],
+  "hash_mode":"xxh3"
+}'
+--kvstore-storage-backend mooncake
+--kvstore-storage-backend-extra-config '{"master_server_address":"HOST:PORT"}'
+
+# Dynamo indexer (separate process)
+python -m dynamo.indexer --zmq-endpoint tcp://ts-worker-0:5557
+```
+
+Register the worker (or pass `--workers` / `--zmq-endpoint` at indexer startup
+per your Dynamo version), drive traffic that stores prefixes on GPU, host, and
+Mooncake, then query overlap:
+
+```bash
+curl -X POST http://localhost:8090/query \
+  -H 'Content-Type: application/json' \
+  -d '{"token_ids": [/* prompt tokens */], "model_name": "YOUR_MODEL"}'
+```
+
+##### Expected `/query` per-instance tier breakdown
+
+[Dynamo PR #8912](https://github.com/ai-dynamo/dynamo/pull/8912) aligns the
+standalone indexer's HTTP API with [Mooncake RFC
+#1403](https://github.com/kvcache-ai/Mooncake/issues/1403). Successful
+multi-tier publish yields an `instances` map keyed by instance id. Example
+shape (counts are **matched tokens** = block overlap × block size):
+
+```json
+{
+  "scores": {"1": {"0": 32}},
+  "frequencies": [1],
+  "instances": {
+    "1": {
+      "longest_matched": 48,
+      "gpu": 32,
+      "dp": {"0": 32},
+      "cpu": 48,
+      "disk": 48
+    }
+  }
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `gpu` | Tokens matched on the device tier (longest device-tier prefix across DP ranks). |
+| `dp` | Per-`dp_rank` device-tier match counts. |
+| `cpu` | Cumulative through device → host-pinned (includes everything in `gpu` plus host extension). |
+| `disk` | Cumulative through device → host → disk/external. |
+| `longest_matched` | `max(gpu, cpu, disk)` — best prefix length for gateway ranking. |
+
+Under a natural offload pipeline (device → host → disk), tier counts are
+**cumulative**: `gpu ≤ cpu ≤ disk` for every instance. Legacy `scores` remain
+equal to each instance's per-`dp_rank` `gpu` count. Because TokenSpeed emits
+one event per tier with a shared `backend_id`, the indexer aggregates those
+events into a single instance entry rather than duplicate radix workers.
+
 #### Mooncake master publisher relay (scaffold)
 
 For DaemonSet / decoupled cache topologies, Mooncake master can publish RFC
