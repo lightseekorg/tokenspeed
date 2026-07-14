@@ -123,6 +123,21 @@ BenchMeasurement MeasureLegacyAncestorRehashWork(std::int32_t page_count, std::i
     return measurement;
 }
 
+class ScopedXxh3BlockHashFlag {
+public:
+    explicit ScopedXxh3BlockHashFlag(bool enabled) {
+        previous_ = UseXxh3BlockHash();
+        SetUseXxh3BlockHash(enabled);
+    }
+    ~ScopedXxh3BlockHashFlag() { SetUseXxh3BlockHash(previous_); }
+
+    ScopedXxh3BlockHashFlag(const ScopedXxh3BlockHashFlag&) = delete;
+    ScopedXxh3BlockHashFlag& operator=(const ScopedXxh3BlockHashFlag&) = delete;
+
+private:
+    bool previous_{};
+};
+
 }  // namespace
 
 TEST(KvHashTest, FirstBlockMatchesRfcExample) {
@@ -144,14 +159,15 @@ TEST(KvHashTest, SecondBlockRollsWithParent) {
 
 TEST(KvHashTest, UseXxh3FlagDefaultsFalseAndIsToggleable) {
     EXPECT_FALSE(UseXxh3BlockHash());
-    SetUseXxh3BlockHash(true);
-    EXPECT_TRUE(UseXxh3BlockHash());
-    SetUseXxh3BlockHash(false);
+    {
+        ScopedXxh3BlockHashFlag guard(true);
+        EXPECT_TRUE(UseXxh3BlockHash());
+    }
     EXPECT_FALSE(UseXxh3BlockHash());
 }
 
 TEST_F(KVPrefixCacheEventTestSuite, UseXxh3FlagSwitchesPublishedBlockHashes) {
-    SetUseXxh3BlockHash(true);
+    ScopedXxh3BlockHashFlag guard(true);
     const token_vec_t tokens = MakeAlignedTokens(1, kPageSize);
     InsertDevicePages(tokens, 1);
 
@@ -161,7 +177,6 @@ TEST_F(KVPrefixCacheEventTestSuite, UseXxh3FlagSwitchesPublishedBlockHashes) {
     const std::uint64_t xxh3_hash = HashKvBlockXxh3(std::span<const std::int32_t>(tokens.data(), kPageSize));
     EXPECT_NE(fnv_hash, xxh3_hash);
     EXPECT_EQ(stored.block_hashes, std::vector<std::uint64_t>{xxh3_hash});
-    SetUseXxh3BlockHash(false);
 }
 
 TEST_F(KVPrefixCacheEventTestSuite, InsertOnePageEmitsBlockStored) {

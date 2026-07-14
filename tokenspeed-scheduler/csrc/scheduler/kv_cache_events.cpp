@@ -20,6 +20,7 @@
 
 #include "scheduler/kv_cache_events.h"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -35,7 +36,7 @@ namespace {
 constexpr std::uint64_t kFnvOffsetBasis = 14695981039346656037ull;
 constexpr std::uint64_t kFnvPrime = 1099511628211ull;
 
-bool g_use_xxh3_block_hash = false;
+std::atomic<bool> g_use_xxh3_block_hash{false};
 
 void MixByte(std::uint64_t& hash, std::uint8_t byte) {
     hash ^= byte;
@@ -103,9 +104,9 @@ std::uint64_t HashKvBlockXxh3(std::span<const std::int32_t> token_ids, std::opti
     return Xxh3Hash64WithSeed(combined.data(), combined.size(), kKvBlockXxh3Seed);
 }
 
-bool UseXxh3BlockHash() { return g_use_xxh3_block_hash; }
+bool UseXxh3BlockHash() { return g_use_xxh3_block_hash.load(); }
 
-void SetUseXxh3BlockHash(const bool enabled) { g_use_xxh3_block_hash = enabled; }
+void SetUseXxh3BlockHash(const bool enabled) { g_use_xxh3_block_hash.store(enabled); }
 
 std::uint64_t HashKvBlockForEvents(std::span<const std::int32_t> token_ids,
                                    std::optional<std::uint64_t> parent_hash) {
