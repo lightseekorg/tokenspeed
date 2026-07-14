@@ -521,6 +521,7 @@ def process_query_block(
         # Fully-visible key tiles for every row of this block, then the diagonal
         # band (and tail) as masked tiles.
         main_end = (program.q_causal_start + program.q_start) // cfg.BLOCK_N
+        main_end = gl.minimum(main_end, program.kv_len // cfg.BLOCK_N)
         visible = program.q_causal_start + program.q_start + cfg.BLOCK_M
         visible = gl.minimum(visible, program.kv_len)
         rem_end = (visible + cfg.BLOCK_N - 1) // cfg.BLOCK_N
