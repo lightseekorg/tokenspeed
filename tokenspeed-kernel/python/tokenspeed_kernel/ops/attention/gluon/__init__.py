@@ -36,6 +36,9 @@ from tokenspeed_kernel.signature import (
 )
 
 if current_platform().is_amd:
+    _DSA_FULL_TOPK_WIDTHS = frozenset({512, 1024, 2048})
+    _DSA_PREFILL_TOPK_WIDTHS = _DSA_FULL_TOPK_WIDTHS
+
     from tokenspeed_kernel_amd.ops.attention.gluon.dsa_gfx950 import (
         gluon_dsa_decode_gfx950 as _dsa_decode_impl,
     )
@@ -238,7 +241,7 @@ if current_platform().is_amd:
             "qk_nope_head_dim": frozenset({128, 192}),
             "kv_lora_rank": frozenset({128, 512}),
             "qk_rope_head_dim": frozenset({64}),
-            "topk": frozenset({512, 1024, 2048}),
+            "topk": _DSA_FULL_TOPK_WIDTHS,
             "kv_cache_available": frozenset({False, True}),
             "sparse_kv_cache_available": frozenset({False, True}),
             "topk_layout": frozenset({"global_slots"}),
@@ -262,7 +265,6 @@ if current_platform().is_amd:
         signatures=frozenset(
             {
                 format_signature(q=dense_tensor_format(torch.bfloat16)),
-                format_signature(q=dense_tensor_format(torch.float8_e4m3fn)),
             }
         ),
         priority=Priority.SPECIALIZED,
@@ -272,7 +274,7 @@ if current_platform().is_amd:
             "qk_nope_head_dim": frozenset({128, 192}),
             "kv_lora_rank": frozenset({128, 512}),
             "qk_rope_head_dim": frozenset({64}),
-            "topk": frozenset({512, 1024, 2048}),
+            "topk": _DSA_PREFILL_TOPK_WIDTHS,
             "kv_cache_available": frozenset({False, True}),
             "sparse_kv_cache_available": frozenset({False, True}),
             "topk_layout": frozenset({"global_slots"}),

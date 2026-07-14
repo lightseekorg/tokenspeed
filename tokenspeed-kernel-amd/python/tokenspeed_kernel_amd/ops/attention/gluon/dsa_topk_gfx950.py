@@ -120,6 +120,7 @@ def _dsa_decode_select_topk_kernel(
     block_table_cols: gl.constexpr,
     page_size: gl.constexpr,
     topk: gl.constexpr,
+    q_len_per_req: gl.constexpr,
     BLOCK_N: gl.constexpr,
     LOAD_ELEMS: gl.constexpr,
     TOPK_LOAD_ELEMS: gl.constexpr,
@@ -129,7 +130,11 @@ def _dsa_decode_select_topk_kernel(
     topk_layout: gl.constexpr = _vector_layout(topk, gl.num_warps(), TOPK_LOAD_ELEMS)
     offsets = gl.arange(0, BLOCK_N, layout=layout)
     top_offsets = gl.arange(0, topk, layout=topk_layout)
-    seq_len = gl.load(seq_lens + row).to(gl.int32)
+    req = row // q_len_per_req
+    q_offset = row - req * q_len_per_req
+    seq_len = gl.load(seq_lens + req).to(gl.int32)
+    if q_len_per_req != 1:
+        seq_len = seq_len - (q_len_per_req - 1) + q_offset
     lens = gl.minimum(seq_len, topk).to(gl.int32)
     gl.store(lens_out + row, lens)
     gl.store(out + row * out_stride + top_offsets, -1)
@@ -140,7 +145,7 @@ def _dsa_decode_select_topk_kernel(
         block_idx = local // page_size
         block_offset = local - block_idx * page_size
         page = gl.load(
-            block_table + row * block_table_stride + block_idx,
+            block_table + req * block_table_stride + block_idx,
             mask=valid_top & (block_idx < block_table_cols),
             other=0,
         ).to(gl.int32)
@@ -160,20 +165,26 @@ def _dsa_decode_select_topk_kernel(
     )
     threshold = _find_topk_threshold_key(values, valid, topk, BLOCK_N, layout)
     keys = _fp32_to_ordered_key(values)
-    selected = valid & (keys >= threshold)
-    selected_i32 = selected.to(gl.int32)
-    selected_pos = gl.associative_scan(selected_i32, 0, _topk_add) - 1
-    write = selected & (selected_pos < topk)
+    greater = valid & (keys > threshold)
+    equal = valid & (keys == threshold)
+    greater_i32 = greater.to(gl.int32)
+    equal_i32 = equal.to(gl.int32)
+    count_greater = gl.sum(greater_i32, axis=0).to(gl.int32)
+    greater_pos = gl.associative_scan(greater_i32, 0, _topk_add) - 1
+    equal_pos = count_greater + gl.associative_scan(equal_i32, 0, _topk_add) - 1
+    greater_write = greater & (greater_pos < topk)
+    equal_write = equal & (equal_pos < topk)
     local = offsets.to(gl.int32)
     block_idx = local // page_size
     block_offset = local - block_idx * page_size
     page = gl.load(
-        block_table + row * block_table_stride + block_idx,
-        mask=write & (block_idx < block_table_cols),
+        block_table + req * block_table_stride + block_idx,
+        mask=(greater_write | equal_write) & (block_idx < block_table_cols),
         other=0,
     ).to(gl.int32)
     slots = page * page_size + block_offset
-    gl.store(out + row * out_stride + selected_pos, slots, mask=write)
+    gl.store(out + row * out_stride + greater_pos, slots, mask=greater_write)
+    gl.store(out + row * out_stride + equal_pos, slots, mask=equal_write)
 
 
 @gluon.jit
@@ -220,11 +231,18 @@ def _dsa_prefill_select_topk_kernel(
     )
     threshold = _find_topk_threshold_key(values, valid, topk, BLOCK_N, layout)
     keys = _fp32_to_ordered_key(values)
-    selected = valid & (keys >= threshold)
-    selected_i32 = selected.to(gl.int32)
-    selected_pos = gl.associative_scan(selected_i32, 0, _topk_add) - 1
-    write = selected & (selected_pos < topk)
-    gl.store(out + row * out_stride + selected_pos, offsets.to(gl.int32), mask=write)
+    greater = valid & (keys > threshold)
+    equal = valid & (keys == threshold)
+    greater_i32 = greater.to(gl.int32)
+    equal_i32 = equal.to(gl.int32)
+    count_greater = gl.sum(greater_i32, axis=0).to(gl.int32)
+    greater_pos = gl.associative_scan(greater_i32, 0, _topk_add) - 1
+    equal_pos = count_greater + gl.associative_scan(equal_i32, 0, _topk_add) - 1
+    greater_write = greater & (greater_pos < topk)
+    equal_write = equal & (equal_pos < topk)
+    local = offsets.to(gl.int32)
+    gl.store(out + row * out_stride + greater_pos, local, mask=greater_write)
+    gl.store(out + row * out_stride + equal_pos, local, mask=equal_write)
 
 
 @gluon.jit
@@ -237,12 +255,17 @@ def _dsa_decode_radix_init_kernel(
     counters,
     out_stride: gl.constexpr,
     topk: gl.constexpr,
+    q_len_per_req: gl.constexpr,
     TOPK_LOAD_ELEMS: gl.constexpr,
 ):
     row = gl.program_id(0)
     top_layout: gl.constexpr = _vector_layout(topk, gl.num_warps(), TOPK_LOAD_ELEMS)
     top_offsets = gl.arange(0, topk, layout=top_layout)
-    seq_len = gl.load(seq_lens + row).to(gl.int32)
+    req = row // q_len_per_req
+    q_offset = row - req * q_len_per_req
+    seq_len = gl.load(seq_lens + req).to(gl.int32)
+    if q_len_per_req != 1:
+        seq_len = seq_len - (q_len_per_req - 1) + q_offset
     lens = gl.minimum(seq_len, topk).to(gl.int32)
     gl.store(lens_out + row, lens)
     gl.store(prefixes + row, 0)
@@ -377,6 +400,7 @@ def _dsa_decode_radix_scatter_slots_kernel(
     n_cols: gl.constexpr,
     page_size: gl.constexpr,
     topk: gl.constexpr,
+    q_len_per_req: gl.constexpr,
     BLOCK_N: gl.constexpr,
     LOAD_ELEMS: gl.constexpr,
 ):
@@ -384,7 +408,11 @@ def _dsa_decode_radix_scatter_slots_kernel(
     tile = gl.program_id(1)
     layout: gl.constexpr = _vector_layout(BLOCK_N, gl.num_warps(), LOAD_ELEMS)
     offsets = tile * BLOCK_N + gl.arange(0, BLOCK_N, layout=layout)
-    seq_len = gl.load(seq_lens + row).to(gl.int32)
+    req = row // q_len_per_req
+    q_offset = row - req * q_len_per_req
+    seq_len = gl.load(seq_lens + req).to(gl.int32)
+    if q_len_per_req != 1:
+        seq_len = seq_len - (q_len_per_req - 1) + q_offset
     mask = (offsets < n_cols) & (offsets < seq_len)
     values = gl.load(
         logits + row * logits_stride + offsets,
@@ -420,7 +448,7 @@ def _dsa_decode_radix_scatter_slots_kernel(
     block_idx = offsets.to(gl.int32) // page_size
     block_offset = offsets.to(gl.int32) - block_idx * page_size
     page = gl.load(
-        block_table + row * block_table_stride + block_idx,
+        block_table + req * block_table_stride + block_idx,
         mask=(greater_write | equal_write) & (block_idx < block_table_cols),
         other=0,
     ).to(gl.int32)
@@ -567,6 +595,7 @@ def _dsa_decode_radix_topk_slots(
     *,
     page_size: int,
     topk: int,
+    q_len_per_req: int,
     out: torch.Tensor,
     lens_out: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -583,6 +612,7 @@ def _dsa_decode_radix_topk_slots(
         counters,
         out.stride(0),
         topk=topk,
+        q_len_per_req=q_len_per_req,
         TOPK_LOAD_ELEMS=_load_elems(topk, 8),
         num_warps=8,
     )
@@ -611,6 +641,7 @@ def _dsa_decode_radix_topk_slots(
         n_cols=cols,
         page_size=int(page_size),
         topk=topk,
+        q_len_per_req=q_len_per_req,
         BLOCK_N=_RADIX_TOPK_BLOCK_N,
         LOAD_ELEMS=_load_elems(_RADIX_TOPK_BLOCK_N, 8),
         num_warps=8,
@@ -684,24 +715,34 @@ def gluon_dsa_decode_topk_fp8_gfx950(
     softmax_scale: float,
     q_len_per_req: int = 1,
     index_k_cache: torch.Tensor | None = None,
+    seq_lens_2d: torch.Tensor | None = None,
     plan: object | None = None,
     out: torch.Tensor | None = None,
     lens_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    del plan, q_len_per_req
+    del plan, seq_lens_2d
     topk = int(topk)
+    q_len_per_req = int(q_len_per_req)
     _validate_topk(topk)
+    if not 1 <= q_len_per_req <= 6:
+        raise ValueError(f"q_len_per_req must be in [1, 6], got {q_len_per_req}")
     if index_k_cache is None:
         raise RuntimeError("Gluon DSA paged top-k requires packed FP8 index_k_cache")
     row_bytes = _check_packed_fp8_inputs(q, index_k_cache, weights, int(page_size))
-    if seq_lens.dim() != 1 or seq_lens.numel() != q.shape[0]:
+    if seq_lens.dim() != 1:
         raise ValueError(
-            "seq_lens must be [tokens], got "
-            f"{tuple(seq_lens.shape)} for q={tuple(q.shape)}"
+            f"seq_lens must be 1-D, got {tuple(seq_lens.shape)} for q={tuple(q.shape)}"
         )
-    if block_table.dim() != 2 or block_table.shape[0] < q.shape[0]:
+    expected_tokens = int(seq_lens.numel()) * q_len_per_req
+    if expected_tokens != q.shape[0]:
         raise ValueError(
-            "block_table must have at least one row per token, got "
+            "q rows must equal seq_lens rows times q_len_per_req, got "
+            f"q={tuple(q.shape)}, seq_lens={tuple(seq_lens.shape)}, "
+            f"q_len_per_req={q_len_per_req}"
+        )
+    if block_table.dim() != 2 or block_table.shape[0] < seq_lens.numel():
+        raise ValueError(
+            "block_table must have at least one row per request, got "
             f"block_table={tuple(block_table.shape)}, q={tuple(q.shape)}"
         )
     if q.shape[0] == 0:
@@ -750,6 +791,7 @@ def gluon_dsa_decode_topk_fp8_gfx950(
         head_dim=q.shape[2],
         num_groups=q.shape[2] // 128,
         softmax_scale=float(softmax_scale),
+        q_len_per_req=q_len_per_req,
         BLOCK_N=block_n,
         BLOCK_D=128,
         num_warps=4,
@@ -761,6 +803,7 @@ def gluon_dsa_decode_topk_fp8_gfx950(
             seq_lens,
             page_size=int(page_size),
             topk=topk,
+            q_len_per_req=q_len_per_req,
             out=out,
             lens_out=lens_out,
         )
@@ -779,6 +822,7 @@ def gluon_dsa_decode_topk_fp8_gfx950(
         block_table.shape[1],
         page_size=int(page_size),
         topk=topk,
+        q_len_per_req=q_len_per_req,
         BLOCK_N=select_block,
         LOAD_ELEMS=_load_elems(select_block, select_warps),
         TOPK_LOAD_ELEMS=_load_elems(topk, select_warps),

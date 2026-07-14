@@ -30,6 +30,8 @@ __all__ = [
     "gluon_dsa_prefill_gfx950",
 ]
 
+_REGISTERED_TOPK_WIDTHS = (512, 1024, 2048)
+
 
 @gluon.constexpr_function
 def _value_layout(
@@ -807,6 +809,22 @@ def _output_dtype(q: torch.Tensor) -> torch.dtype:
     return torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype
 
 
+def _trim_topk_slots_for_context(
+    topk_slots: torch.Tensor,
+    max_seqlen_k: int,
+) -> torch.Tensor:
+    topk = int(topk_slots.shape[1])
+    effective_topk = topk
+    # Keep launch shapes on the widths registered by tokenspeed-kernel.
+    for supported_topk in _REGISTERED_TOPK_WIDTHS:
+        if max_seqlen_k <= supported_topk <= topk:
+            effective_topk = supported_topk
+            break
+    if effective_topk < int(topk_slots.shape[1]):
+        return topk_slots[:, :effective_topk].contiguous()
+    return topk_slots
+
+
 def _run_dense_kv(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -935,6 +953,7 @@ def _run_dsa(
     page_size: int,
     k_scale: float,
     out: torch.Tensor | None,
+    max_seqlen_k: int,
 ) -> torch.Tensor:
     _check_inputs(
         q,
@@ -948,6 +967,7 @@ def _run_dsa(
     q = _flatten_query(q).contiguous()
     topk_slots = topk_slots.contiguous()
     topk_lens = topk_lens.contiguous()
+    topk_slots = _trim_topk_slots_for_context(topk_slots, max_seqlen_k)
     softmax_scale = float(softmax_scale) * float(k_scale)
     # The AITER-style tiled kernel maps to dense BF16 KV. TokenSpeed's packed
     # sparse FP8 rows use a different physical layout and stay on the scalar path.
@@ -1014,7 +1034,7 @@ def gluon_dsa_decode_gfx950(
     return_lse: bool = False,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    del max_seqlen_k, q_len_per_req
+    del q_len_per_req
     if logit_cap != 0.0 or return_lse:
         raise ValueError("Gluon DSA does not support logit_cap or return_lse")
     return _run_dsa(
@@ -1030,6 +1050,7 @@ def gluon_dsa_decode_gfx950(
         page_size=page_size,
         k_scale=k_scale,
         out=out,
+        max_seqlen_k=max_seqlen_k,
     )
 
 
@@ -1051,7 +1072,7 @@ def gluon_dsa_prefill_gfx950(
     return_lse: bool = False,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    del max_seqlen_k, q_len_per_req
+    del q_len_per_req
     if logit_cap != 0.0 or return_lse:
         raise ValueError("Gluon DSA does not support logit_cap or return_lse")
     return _run_dsa(
@@ -1067,4 +1088,5 @@ def gluon_dsa_prefill_gfx950(
         page_size=page_size,
         k_scale=k_scale,
         out=out,
+        max_seqlen_k=max_seqlen_k,
     )

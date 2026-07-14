@@ -59,6 +59,7 @@ def _dsa_decode_logits_fp8_kernel(
     head_dim: gl.constexpr,
     num_groups: gl.constexpr,
     softmax_scale: gl.constexpr,
+    q_len_per_req: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_D: gl.constexpr,
 ):
@@ -69,13 +70,17 @@ def _dsa_decode_logits_fp8_kernel(
     dim_layout: gl.constexpr = gl.SliceLayout(0, layout)
     offsets = block_id * BLOCK_N + gl.arange(0, BLOCK_N, layout=row_layout)
     dim_offsets = gl.arange(0, BLOCK_D, layout=dim_layout)
-    seq_len = gl.load(seq_lens + token).to(gl.int32)
+    req = token // q_len_per_req
+    q_offset = token - req * q_len_per_req
+    seq_len = gl.load(seq_lens + req).to(gl.int32)
+    if q_len_per_req != 1:
+        seq_len = seq_len - (q_len_per_req - 1) + q_offset
     valid = (offsets < seq_len) & (offsets < max_seq_len)
     block_idx = offsets // page_size
     block_offset = offsets - block_idx * page_size
     page = gl.amd.cdna4.buffer_load(
         ptr=block_table,
-        offsets=(token * block_table_stride + block_idx).to(gl.int32),
+        offsets=(req * block_table_stride + block_idx).to(gl.int32),
         mask=valid,
         other=0,
     ).to(gl.int64)
