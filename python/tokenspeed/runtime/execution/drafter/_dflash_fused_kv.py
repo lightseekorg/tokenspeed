@@ -92,8 +92,12 @@ def _fused_norm_rope_scatter_kernel(
     v_base = kv_base + kv_size + head_id * head_dim
 
     if IS_FP8:
-        k_buf_ptr = tl.load(k_buf_ptrs_ptr + layer_id).to(tl.pointer_type(tl.float8e4nv))
-        v_buf_ptr = tl.load(v_buf_ptrs_ptr + layer_id).to(tl.pointer_type(tl.float8e4nv))
+        k_buf_ptr = tl.load(k_buf_ptrs_ptr + layer_id).to(
+            tl.pointer_type(tl.float8e4nv)
+        )
+        v_buf_ptr = tl.load(v_buf_ptrs_ptr + layer_id).to(
+            tl.pointer_type(tl.float8e4nv)
+        )
     else:
         k_buf_ptr = tl.load(k_buf_ptrs_ptr + layer_id).to(tl.pointer_type(tl.bfloat16))
         v_buf_ptr = tl.load(v_buf_ptrs_ptr + layer_id).to(tl.pointer_type(tl.bfloat16))

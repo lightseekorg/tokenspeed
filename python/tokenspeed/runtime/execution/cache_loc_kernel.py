@@ -371,13 +371,17 @@ def dflash_prepare_decode_kernel(
     tl.store(draft_seq_lens_ptr + req_idx, prefix_len)
 
     safe_accept = tl.minimum(tl.maximum(accept_len, 1), spec_num_tokens)
-    current_token = tl.load(output_tokens_ptr + req_idx * spec_num_tokens + safe_accept - 1)
+    current_token = tl.load(
+        output_tokens_ptr + req_idx * spec_num_tokens + safe_accept - 1
+    )
     tl.store(block_ids_ptr + req_idx * block_ids_stride, current_token)
 
     offsets = tl.arange(0, BLOCK_SIZE)
     mask = offsets < spec_num_tokens
     positions = prefix_len + offsets
-    tl.store(block_positions_ptr + req_idx * spec_num_tokens + offsets, positions, mask=mask)
+    tl.store(
+        block_positions_ptr + req_idx * spec_num_tokens + offsets, positions, mask=mask
+    )
 
     page_indices = positions // page_size
     overflow = page_indices >= max_pages
@@ -387,7 +391,9 @@ def dflash_prepare_decode_kernel(
     page_ids = tl.load(page_ptrs, mask=mask, other=0)
     cache_locs = page_ids * page_size + offsets_in_page
     cache_locs = tl.where(overflow, 0, cache_locs)
-    tl.store(out_cache_loc_ptr + req_idx * spec_num_tokens + offsets, cache_locs, mask=mask)
+    tl.store(
+        out_cache_loc_ptr + req_idx * spec_num_tokens + offsets, cache_locs, mask=mask
+    )
 
 
 def dflash_prepare_decode(

@@ -373,9 +373,7 @@ class DFlash(BaseDrafter):
             self.draft_seq_lens_buf[:bs].copy_(
                 old_lens.to(torch.int32) + accept_lengths[:bs].to(torch.int32)
             )
-            self._write_native_cache(
-                hidden, positions, cache_locs, decode_only=True
-            )
+            self._write_native_cache(hidden, positions, cache_locs, decode_only=True)
             return
 
         hidden_chunks = torch.split(hidden, lengths.detach().cpu().tolist(), dim=0)
@@ -592,7 +590,9 @@ class DFlash(BaseDrafter):
             logger.info(
                 "DFLASH fused KV materialization enabled. "
                 "n_layers=%d, num_kv_heads=%d, head_dim=%d",
-                n_layers, num_kv_heads, head_dim,
+                n_layers,
+                num_kv_heads,
+                head_dim,
             )
         except Exception as e:
             logger.warning(
@@ -637,7 +637,9 @@ class DFlash(BaseDrafter):
                 (max_tokens, hidden_size), dtype=ws_dtype, device=self.device
             )
             self._incr_slot_bufs = [
-                torch.empty((max_tokens, hidden_size), dtype=ws_dtype, device=self.device)
+                torch.empty(
+                    (max_tokens, hidden_size), dtype=ws_dtype, device=self.device
+                )
                 for _ in range(n_captures)
             ]
             self._incr_capture_events = [torch.cuda.Event() for _ in range(n_captures)]
@@ -773,15 +775,19 @@ class DFlash(BaseDrafter):
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         bs = accept_lengths.shape[0]
-        current = out if out is not None else torch.empty(
-            (bs,), dtype=torch.int32, device=output_tokens.device
+        current = (
+            out
+            if out is not None
+            else torch.empty((bs,), dtype=torch.int32, device=output_tokens.device)
         )
         if num_extends > 0:
             current[:num_extends] = output_tokens[:num_extends]
         num_decodes = bs - num_extends
         if num_decodes > 0:
             offsets = (
-                torch.arange(num_decodes, dtype=torch.int64, device=output_tokens.device)
+                torch.arange(
+                    num_decodes, dtype=torch.int64, device=output_tokens.device
+                )
                 * spec_num_tokens
                 - 1
                 + num_extends
@@ -910,10 +916,14 @@ class DFlash(BaseDrafter):
         if not hasattr(self, "target_model"):
             raise RuntimeError("DFLASH drafter is not bound to a target model.")
 
-        from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_cuda_graph_phase
+        from tokenspeed.runtime.execution.cuda_graph_wrapper import (
+            get_is_cuda_graph_phase,
+        )
 
         decode_only = base_ctx.num_extends == 0
-        capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        capturing = (
+            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        )
         can_overlap = (
             decode_only
             and self._fused_kv_enabled
@@ -976,7 +986,9 @@ class DFlash(BaseDrafter):
 
         bs = base_ctx.bs
         req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
-        max_draft_prefix = self.req_to_page.shape[1] * self.page_size - self.spec_num_tokens
+        max_draft_prefix = (
+            self.req_to_page.shape[1] * self.page_size - self.spec_num_tokens
+        )
 
         current_tokens = self.block_ids_buf[:bs, 0]
         draft_cache_locs = self.draft_out_cache_loc_buf[: bs * self.spec_num_tokens]
@@ -998,11 +1010,15 @@ class DFlash(BaseDrafter):
         if not self._incremental_kv_write_done:
             # Fork: aux stream runs full KV write (project + fused GEMM + scatter)
             positions = self.input_buffers.positions_buf[: base_ctx.input_num_tokens]
-            cache_locs = self.input_buffers.out_cache_loc_buf[: base_ctx.input_num_tokens]
+            cache_locs = self.input_buffers.out_cache_loc_buf[
+                : base_ctx.input_num_tokens
+            ]
             main_stream = torch.cuda.current_stream()
             self._kv_fork_event.record(main_stream)
 
-            if not (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()):
+            if not (
+                torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+            ):
                 hidden.record_stream(self._kv_aux_stream)
                 positions.record_stream(self._kv_aux_stream)
                 cache_locs.record_stream(self._kv_aux_stream)
@@ -1011,7 +1027,9 @@ class DFlash(BaseDrafter):
 
             with torch.cuda.stream(self._kv_aux_stream):
                 self._kv_aux_stream.wait_event(self._kv_fork_event)
-                self._write_native_cache(hidden, positions, cache_locs, decode_only=True)
+                self._write_native_cache(
+                    hidden, positions, cache_locs, decode_only=True
+                )
                 self._kv_join_event.record(self._kv_aux_stream)
 
         # Main stream: draft forward overlaps with aux KV write

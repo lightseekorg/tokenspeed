@@ -942,9 +942,8 @@ class ModelExecutor:
 
         logits_output = self._run_target_forward(bs, ctx, req_pool_indices)
 
-        if (
-            self.drafter is not None
-            and getattr(self.drafter, "_incremental_proj_enabled", False)
+        if self.drafter is not None and getattr(
+            self.drafter, "_incremental_proj_enabled", False
         ):
             self.drafter.target_language_model.model._dflash_incr_active = False
 

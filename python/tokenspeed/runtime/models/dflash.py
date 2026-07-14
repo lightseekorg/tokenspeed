@@ -25,6 +25,8 @@ from typing import Any, Optional
 
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.ops.kvcache.triton import fused_fp8_set_kv_buffer
+from tokenspeed_kernel.ops.layernorm.triton import fused_qk_rmsnorm_rope
 from torch import nn
 
 from tokenspeed.runtime.distributed.comm_ops import all_reduce
@@ -42,8 +44,6 @@ from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
-from tokenspeed_kernel.ops.layernorm.triton import fused_qk_rmsnorm_rope
-from tokenspeed_kernel.ops.kvcache.triton import fused_fp8_set_kv_buffer
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.utils import validate_attention_partition
 from tokenspeed.runtime.utils import add_prefix
@@ -530,9 +530,7 @@ def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
     return int(sliding_window) - 1
 
 
-def _get_dflash_layer_attention_params(
-    config, layer_id: int
-) -> tuple[int, bool]:
+def _get_dflash_layer_attention_params(config, layer_id: int) -> tuple[int, bool]:
     layer_types = get_dflash_layer_types(config)
     if layer_types is None:
         return -1, False
