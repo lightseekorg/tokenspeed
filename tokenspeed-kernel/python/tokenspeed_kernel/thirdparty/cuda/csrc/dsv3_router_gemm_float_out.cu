@@ -27,8 +27,11 @@ __device__ __forceinline__ void bf16_uint4_to_float8(uint4 const& vec, float* ds
   }
 }
 
-template <typename ADtype, typename BDtype, int VPT, int kBlockSize, int kNumTokens, int kNumExperts, int kHiddenDim>
-__global__ __launch_bounds__(128, 1) void router_gemm_kernel_float_output(float* out, ADtype const* mat_a, BDtype const* mat_b) {
+// num_experts is a runtime argument: it only sets the output row stride (and
+// the launch grid = one block per expert row), so specializing on it buys no
+// performance and would force per-expert-count instantiations.
+template <typename ADtype, typename BDtype, int VPT, int kBlockSize, int kNumTokens, int kHiddenDim>
+__global__ __launch_bounds__(128, 1) void router_gemm_kernel_float_output(float* out, ADtype const* mat_a, BDtype const* mat_b, int num_experts) {
   int const n_idx = blockIdx.x;
   int const tid = threadIdx.x;
   constexpr int kWarpSize = 32;
@@ -121,7 +124,7 @@ __global__ __launch_bounds__(128, 1) void router_gemm_kernel_float_output(float*
   if (tid == 0) {
 #pragma unroll
     for (int m_idx = 0; m_idx < kNumTokens; m_idx++) {
-      out[m_idx * kNumExperts + n_idx] = sm_reduction[m_idx][0];
+      out[m_idx * num_experts + n_idx] = sm_reduction[m_idx][0];
     }
   }
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -129,14 +132,14 @@ __global__ __launch_bounds__(128, 1) void router_gemm_kernel_float_output(float*
 #endif
 }
 
-template <typename ADtype, typename BDtype, int kNumTokens, int kNumExperts, int kHiddenDim>
-void invokeRouterGemmFloatOutput(float* output, ADtype const* mat_a, BDtype const* mat_b, bool enable_pdl, cudaStream_t stream) {
+template <typename ADtype, typename BDtype, int kNumTokens, int kHiddenDim>
+void invokeRouterGemmFloatOutput(float* output, ADtype const* mat_a, BDtype const* mat_b, int num_experts, bool enable_pdl, cudaStream_t stream) {
   static_assert(kHiddenDim % 1024 == 0);
   constexpr int VPT = 8;
   constexpr int kBlockSize = 128;
-  dim3 grid(kNumExperts);
+  dim3 grid(num_experts);
   dim3 block(kBlockSize);
-  auto kernel = router_gemm_kernel_float_output<ADtype, BDtype, VPT, kBlockSize, kNumTokens, kNumExperts, kHiddenDim>;
+  auto kernel = router_gemm_kernel_float_output<ADtype, BDtype, VPT, kBlockSize, kNumTokens, kHiddenDim>;
 
   cudaLaunchConfig_t config;
   config.gridDim = grid;
@@ -149,64 +152,49 @@ void invokeRouterGemmFloatOutput(float* output, ADtype const* mat_a, BDtype cons
   config.numAttrs = 1;
   config.attrs = attrs;
 
-  cudaLaunchKernelEx(&config, kernel, output, mat_a, mat_b);
+  cudaLaunchKernelEx(&config, kernel, output, mat_a, mat_b, num_experts);
 }
 
-// Explicit instantiations for the expected kernel layout.
-#define INSTANTIATE_RANGE(ADtype, BDtype, M, K)                                  \
-  template void invokeRouterGemmFloatOutput<ADtype, BDtype, 1, M, K>(            \
-      float*, ADtype const*, BDtype const*, bool, cudaStream_t);                 \
-  template void invokeRouterGemmFloatOutput<ADtype, BDtype, 2, M, K>(            \
-      float*, ADtype const*, BDtype const*, bool, cudaStream_t);                 \
-  template void invokeRouterGemmFloatOutput<ADtype, BDtype, 3, M, K>(            \
-      float*, ADtype const*, BDtype const*, bool, cudaStream_t);                 \
-  template void invokeRouterGemmFloatOutput<ADtype, BDtype, 4, M, K>(            \
-      float*, ADtype const*, BDtype const*, bool, cudaStream_t);                 \
-  template void invokeRouterGemmFloatOutput<ADtype, BDtype, 5, M, K>(            \
-      float*, ADtype const*, BDtype const*, bool, cudaStream_t);                 \
-  template void invokeRouterGemmFloatOutput<ADtype, BDtype, 6, M, K>(            \
-      float*, ADtype const*, BDtype const*, bool, cudaStream_t);                 \
-  template void invokeRouterGemmFloatOutput<ADtype, BDtype, 7, M, K>(            \
-      float*, ADtype const*, BDtype const*, bool, cudaStream_t);                 \
-  template void invokeRouterGemmFloatOutput<ADtype, BDtype, 8, M, K>(            \
-      float*, ADtype const*, BDtype const*, bool, cudaStream_t);                 \
-  template void invokeRouterGemmFloatOutput<ADtype, BDtype, 9, M, K>(            \
-      float*, ADtype const*, BDtype const*, bool, cudaStream_t);                 \
-  template void invokeRouterGemmFloatOutput<ADtype, BDtype, 10, M, K>(           \
-      float*, ADtype const*, BDtype const*, bool, cudaStream_t);                 \
-  template void invokeRouterGemmFloatOutput<ADtype, BDtype, 11, M, K>(           \
-      float*, ADtype const*, BDtype const*, bool, cudaStream_t);                 \
-  template void invokeRouterGemmFloatOutput<ADtype, BDtype, 12, M, K>(           \
-      float*, ADtype const*, BDtype const*, bool, cudaStream_t);                 \
-  template void invokeRouterGemmFloatOutput<ADtype, BDtype, 13, M, K>(           \
-      float*, ADtype const*, BDtype const*, bool, cudaStream_t);                 \
-  template void invokeRouterGemmFloatOutput<ADtype, BDtype, 14, M, K>(           \
-      float*, ADtype const*, BDtype const*, bool, cudaStream_t);                 \
-  template void invokeRouterGemmFloatOutput<ADtype, BDtype, 15, M, K>(           \
-      float*, ADtype const*, BDtype const*, bool, cudaStream_t);                 \
-  template void invokeRouterGemmFloatOutput<ADtype, BDtype, 16, M, K>(           \
-      float*, ADtype const*, BDtype const*, bool, cudaStream_t);
+// Explicit instantiations for the expected kernel layout (num_experts is a
+// runtime argument, so only token count and hidden dim are specialized).
+#define INSTANTIATE_RANGE(ADtype, BDtype, K)                                     \
+  template void invokeRouterGemmFloatOutput<ADtype, BDtype, 1, K>(               \
+      float*, ADtype const*, BDtype const*, int, bool, cudaStream_t);            \
+  template void invokeRouterGemmFloatOutput<ADtype, BDtype, 2, K>(               \
+      float*, ADtype const*, BDtype const*, int, bool, cudaStream_t);            \
+  template void invokeRouterGemmFloatOutput<ADtype, BDtype, 3, K>(               \
+      float*, ADtype const*, BDtype const*, int, bool, cudaStream_t);            \
+  template void invokeRouterGemmFloatOutput<ADtype, BDtype, 4, K>(               \
+      float*, ADtype const*, BDtype const*, int, bool, cudaStream_t);            \
+  template void invokeRouterGemmFloatOutput<ADtype, BDtype, 5, K>(               \
+      float*, ADtype const*, BDtype const*, int, bool, cudaStream_t);            \
+  template void invokeRouterGemmFloatOutput<ADtype, BDtype, 6, K>(               \
+      float*, ADtype const*, BDtype const*, int, bool, cudaStream_t);            \
+  template void invokeRouterGemmFloatOutput<ADtype, BDtype, 7, K>(               \
+      float*, ADtype const*, BDtype const*, int, bool, cudaStream_t);            \
+  template void invokeRouterGemmFloatOutput<ADtype, BDtype, 8, K>(               \
+      float*, ADtype const*, BDtype const*, int, bool, cudaStream_t);            \
+  template void invokeRouterGemmFloatOutput<ADtype, BDtype, 9, K>(               \
+      float*, ADtype const*, BDtype const*, int, bool, cudaStream_t);            \
+  template void invokeRouterGemmFloatOutput<ADtype, BDtype, 10, K>(              \
+      float*, ADtype const*, BDtype const*, int, bool, cudaStream_t);            \
+  template void invokeRouterGemmFloatOutput<ADtype, BDtype, 11, K>(              \
+      float*, ADtype const*, BDtype const*, int, bool, cudaStream_t);            \
+  template void invokeRouterGemmFloatOutput<ADtype, BDtype, 12, K>(              \
+      float*, ADtype const*, BDtype const*, int, bool, cudaStream_t);            \
+  template void invokeRouterGemmFloatOutput<ADtype, BDtype, 13, K>(              \
+      float*, ADtype const*, BDtype const*, int, bool, cudaStream_t);            \
+  template void invokeRouterGemmFloatOutput<ADtype, BDtype, 14, K>(              \
+      float*, ADtype const*, BDtype const*, int, bool, cudaStream_t);            \
+  template void invokeRouterGemmFloatOutput<ADtype, BDtype, 15, K>(              \
+      float*, ADtype const*, BDtype const*, int, bool, cudaStream_t);            \
+  template void invokeRouterGemmFloatOutput<ADtype, BDtype, 16, K>(              \
+      float*, ADtype const*, BDtype const*, int, bool, cudaStream_t);
 
-INSTANTIATE_RANGE(__nv_bfloat16, __nv_bfloat16, 256, 3072)
-INSTANTIATE_RANGE(__nv_bfloat16, __nv_bfloat16, 384, 3072)
-INSTANTIATE_RANGE(__nv_bfloat16, __nv_bfloat16, 768, 3072)
+INSTANTIATE_RANGE(__nv_bfloat16, __nv_bfloat16, 3072)
+INSTANTIATE_RANGE(__nv_bfloat16, __nv_bfloat16, 6144)
+INSTANTIATE_RANGE(__nv_bfloat16, __nv_bfloat16, 7168)
 
-INSTANTIATE_RANGE(__nv_bfloat16, __nv_bfloat16, 256, 6144)
-INSTANTIATE_RANGE(__nv_bfloat16, __nv_bfloat16, 384, 6144)
-INSTANTIATE_RANGE(__nv_bfloat16, __nv_bfloat16, 768, 6144)
-
-INSTANTIATE_RANGE(__nv_bfloat16, __nv_bfloat16, 256, 7168)
-INSTANTIATE_RANGE(__nv_bfloat16, __nv_bfloat16, 384, 7168)
-INSTANTIATE_RANGE(__nv_bfloat16, __nv_bfloat16, 768, 7168)
-
-INSTANTIATE_RANGE(__nv_bfloat16, float, 256, 3072)
-INSTANTIATE_RANGE(__nv_bfloat16, float, 384, 3072)
-INSTANTIATE_RANGE(__nv_bfloat16, float, 768, 3072)
-
-INSTANTIATE_RANGE(__nv_bfloat16, float, 256, 6144)
-INSTANTIATE_RANGE(__nv_bfloat16, float, 384, 6144)
-INSTANTIATE_RANGE(__nv_bfloat16, float, 768, 6144)
-
-INSTANTIATE_RANGE(__nv_bfloat16, float, 256, 7168)
-INSTANTIATE_RANGE(__nv_bfloat16, float, 384, 7168)
-INSTANTIATE_RANGE(__nv_bfloat16, float, 768, 7168)
+INSTANTIATE_RANGE(__nv_bfloat16, float, 3072)
+INSTANTIATE_RANGE(__nv_bfloat16, float, 6144)
+INSTANTIATE_RANGE(__nv_bfloat16, float, 7168)
