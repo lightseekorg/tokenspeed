@@ -266,7 +266,7 @@ InsertResult KVPrefixCache::Insert(const token_vec_t& token_ids, const std::vect
     }
 
     insert_result.last_node = current;
-    if constexpr (RType == ResourceType::Device) {
+    if constexpr (RType == ResourceType::Device || RType == ResourceType::Host) {
         if (kv_event_sink_) {
             EnsureBlockHashesTo(current, page_size);
         }

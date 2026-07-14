@@ -292,6 +292,32 @@ TEST_F(KVPrefixCacheEventTestSuite, HostInsertEmitsBlockStored) {
     EXPECT_EQ(AsStored(events_[1]).tier, KvEventTier::kHost);
 }
 
+TEST_F(KVPrefixCacheEventTestSuite, HostChildInsertUsesCachedParentBlockHash) {
+    PageAllocator device_allocator{kPageSize, 8};
+    PageAllocator host_allocator{kPageSize, 8};
+    KVPrefixCache cache{&device_allocator, &host_allocator};
+
+    // Parent host pages inserted without a sink leave nodes without cached block hashes.
+    const token_vec_t parent_tokens = MakeAlignedTokens(1, kPageSize);
+    cache.Insert<ResourceType::Host>(parent_tokens, {}, host_allocator.Allocate(1));
+
+    std::vector<KvCacheEvent> events;
+    cache.SetKvEventSink([&](KvCacheEvent event) { events.push_back(std::move(event)); });
+    const token_vec_t child_tokens = MakeAlignedTokens(2, kPageSize);
+    cache.Insert<ResourceType::Host>(child_tokens, {}, host_allocator.Allocate(2));
+
+    const std::uint64_t parent_hash =
+        HashKvBlock(std::span<const std::int32_t>(parent_tokens.data(), kPageSize));
+    const std::uint64_t child_hash =
+        HashKvBlock(std::span<const std::int32_t>(child_tokens.data() + kPageSize, kPageSize), parent_hash);
+
+    ASSERT_EQ(events.size(), 1u);
+    const auto& stored = AsStored(events[0]);
+    EXPECT_EQ(stored.block_hashes, std::vector<std::uint64_t>{child_hash});
+    EXPECT_EQ(stored.parent_block_hash, parent_hash);
+    EXPECT_EQ(stored.tier, KvEventTier::kHost);
+}
+
 TEST_F(KVPrefixCacheEventTestSuite, HostEvictEmitsBlockRemoved) {
     const token_vec_t tokens = MakeAlignedTokens(2, kPageSize);
     cache_.Insert<ResourceType::Host>(tokens, {}, host_allocator_.Allocate(2));
