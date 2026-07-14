@@ -7,11 +7,13 @@ from tokenspeed.runtime.pd.kv_events import (
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
+    EventIdAllocator,
     EventPublisherFactory,
     KVEventBatch,
     KVEventsConfig,
     NullEventPublisher,
     apply_envelope,
+    assign_event_ids,
     drain_scheduler_kv_events,
     scheduler_kv_event_to_wire_event,
     scheduler_kv_events_to_wire_events,
@@ -403,6 +405,127 @@ def test_apply_envelope_rfc1527_cleared_event() -> None:
     assert annotated.backend_id == "w"
     assert annotated.tenant_id == "t"
     assert annotated.medium == "gpu"
+
+
+def test_event_id_allocator_starts_at_zero_and_increments() -> None:
+    """RFC #1527 event_id is monotonic per stream; Dynamo-style start at 0."""
+    allocator = EventIdAllocator()
+    key = ("m", 16, "backend-0", "gpu", 0)
+
+    assert allocator.next(key) == 0
+    assert allocator.next(key) == 1
+    assert allocator.next(key) == 2
+
+
+def test_event_id_allocator_independent_streams() -> None:
+    allocator = EventIdAllocator()
+    stream_a = ("m", 16, "backend-0", "gpu", 0)
+    stream_b = ("m", 16, "backend-0", "cpu", 0)
+
+    assert allocator.next(stream_a) == 0
+    assert allocator.next(stream_b) == 0
+    assert allocator.next(stream_a) == 1
+    assert allocator.next(stream_b) == 1
+
+
+def _rfc1527_stored(*, block_size: int = 16) -> BlockStored:
+    return BlockStored(
+        block_hashes=[123],
+        parent_block_hash=None,
+        token_ids=[1, 2],
+        block_size=block_size,
+    )
+
+
+def test_assign_event_ids_two_publishes_increment() -> None:
+    """Two successive assign/publish cycles on the same stream increment event_id."""
+    allocator = EventIdAllocator()
+    config = KVEventsConfig(
+        wire_format="rfc1527",
+        backend_id="worker-0",
+        model_name="test-model",
+        publish_medium=True,
+    )
+
+    first = apply_envelope(_rfc1527_stored(), config, medium="gpu", dp_rank=0)
+    assign_event_ids([first], config, allocator)
+    assert first.event_id == 0
+
+    second = apply_envelope(_rfc1527_stored(), config, medium="gpu", dp_rank=0)
+    assign_event_ids([second], config, allocator)
+    assert second.event_id == 1
+
+
+def test_assign_event_ids_legacy_leaves_event_id_unset() -> None:
+    allocator = EventIdAllocator()
+    config = KVEventsConfig(wire_format="legacy", backend_id="worker-0")
+    event = _rfc1527_stored()
+
+    assign_event_ids([event], config, allocator)
+
+    assert event.event_id is None
+    assert allocator.next(("x", None, None, None, None)) == 0  # unused
+
+
+def test_assign_event_ids_block_removed_uses_none_block_size() -> None:
+    """BlockRemoved has no block_size; stream key uses None for that dimension."""
+    allocator = EventIdAllocator()
+    config = KVEventsConfig(
+        wire_format="rfc1527",
+        backend_id="worker-0",
+        model_name="m",
+    )
+    removed = apply_envelope(
+        BlockRemoved(block_hashes=[1]), config, medium="gpu", dp_rank=0
+    )
+    stored = apply_envelope(
+        _rfc1527_stored(block_size=16), config, medium="gpu", dp_rank=0
+    )
+
+    assign_event_ids([removed], config, allocator)
+    assign_event_ids([stored], config, allocator)
+
+    # Different block_size dimension → independent streams both start at 0
+    assert removed.event_id == 0
+    assert stored.event_id == 0
+
+    assign_event_ids(
+        [
+            apply_envelope(
+                BlockRemoved(block_hashes=[2]), config, medium="gpu", dp_rank=0
+            )
+        ],
+        config,
+        allocator,
+    )
+    # Same (model, None, backend, medium, dp) stream as first removed
+    assert allocator.next(("m", None, "worker-0", "gpu", 0)) == 2
+
+
+def test_apply_envelope_sets_dp_rank() -> None:
+    event = _rfc1527_stored()
+    config = KVEventsConfig(wire_format="rfc1527", backend_id="w")
+
+    annotated = apply_envelope(event, config, medium="gpu", dp_rank=3)
+
+    assert annotated.dp_rank == 3
+
+
+def test_scheduler_kv_events_to_wire_events_passes_dp_rank() -> None:
+    raw = SimpleNamespace(
+        kind="BlockStored",
+        block_hashes=[123],
+        parent_block_hash=None,
+        token_ids=[1, 2],
+        block_size=2,
+    )
+    config = KVEventsConfig(wire_format="rfc1527", backend_id="worker-0")
+
+    events = scheduler_kv_events_to_wire_events(
+        [raw], config=config, medium="gpu", dp_rank=2
+    )
+
+    assert events[0].dp_rank == 2
 
 
 def test_kv_event_batch_msgpack_shape_is_dynamo_compatible() -> None:

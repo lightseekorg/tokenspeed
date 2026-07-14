@@ -114,6 +114,42 @@ class KVEventBatch(EventBatch):
     events: list[Union[BlockStored, BlockRemoved, AllBlocksCleared]]
 
 
+class EventIdAllocator:
+    """Monotonic ``event_id`` counters keyed by RFC #1527 stream dimensions.
+
+    Each stream is identified by
+    ``(model_name, block_size, backend_id, medium, dp_rank)``. Counters start
+    at ``0`` (Dynamo sequence style) and increase by one per assignment.
+    """
+
+    def __init__(self) -> None:
+        self._counters: dict[tuple, int] = {}
+
+    def next(self, key: tuple) -> int:
+        """Return the next ``event_id`` for ``key``, starting at 0."""
+        value = self._counters.get(key, 0)
+        self._counters[key] = value + 1
+        return value
+
+
+def stream_key_for_event(
+    event: Union[BlockStored, BlockRemoved, AllBlocksCleared],
+) -> tuple:
+    """Build the RFC #1527 stream key for an envelope-annotated event.
+
+    ``BlockRemoved`` / ``AllBlocksCleared`` have no ``block_size``; that
+    dimension is ``None`` so they do not share a stream with ``BlockStored``
+    events that carry a concrete block size.
+    """
+    return (
+        event.model_name,
+        getattr(event, "block_size", None),
+        event.backend_id,
+        event.medium,
+        event.dp_rank,
+    )
+
+
 def apply_envelope(
     event: Union[BlockStored, BlockRemoved, AllBlocksCleared],
     config: "KVEventsConfig",
@@ -153,6 +189,32 @@ def apply_envelope(
     return event
 
 
+def assign_event_ids(
+    events: list[Union[BlockStored, BlockRemoved, AllBlocksCleared]],
+    config: "KVEventsConfig",
+    allocator: EventIdAllocator,
+) -> list[Union[BlockStored, BlockRemoved, AllBlocksCleared]]:
+    """Assign monotonic ``event_id`` values when ``wire_format == "rfc1527"``.
+
+    Call after ``apply_envelope`` so stream-key dimensions are populated.
+    Under ``legacy``, events are returned unchanged and ``event_id`` stays
+    unset so msgspec omits it from the wire payload.
+
+    Args:
+        events: Envelope-annotated wire events (mutated in place).
+        config: Publisher KV events config.
+        allocator: Per-publisher stream counter store.
+
+    Returns:
+        The same ``events`` list after optional ``event_id`` assignment.
+    """
+    if config.wire_format != "rfc1527":
+        return events
+    for event in events:
+        event.event_id = allocator.next(stream_key_for_event(event))
+    return events
+
+
 def scheduler_kv_event_to_wire_event(
     event: Any,
     hash_mode: Literal["fnv", "xxh3"] = "fnv",
@@ -187,6 +249,7 @@ def scheduler_kv_events_to_wire_events(
     hash_mode: Literal["fnv", "xxh3"] = "fnv",
     config: Optional["KVEventsConfig"] = None,
     medium: Optional[str] = None,
+    dp_rank: Optional[int] = None,
 ) -> list[Union[BlockStored, BlockRemoved]]:
     """Translate scheduler events and optionally apply the RFC #1527 envelope.
 
@@ -198,6 +261,7 @@ def scheduler_kv_events_to_wire_events(
             Callers must pass this explicitly for tiered events; default ``None``
             leaves ``medium`` unset. Ignored when ``config`` is ``None`` or
             ``wire_format=legacy``.
+        dp_rank: Optional data-parallel rank forwarded to ``apply_envelope``.
 
     Returns:
         Wire event structs ready for ``KVEventBatch`` publishing.
@@ -207,7 +271,10 @@ def scheduler_kv_events_to_wire_events(
     ]
     if config is None:
         return wire_events
-    return [apply_envelope(event, config, medium=medium) for event in wire_events]
+    return [
+        apply_envelope(event, config, medium=medium, dp_rank=dp_rank)
+        for event in wire_events
+    ]
 
 
 def drain_scheduler_kv_events(scheduler: Any, enabled: bool) -> list[Any]:
