@@ -192,12 +192,20 @@ Example:
 ```
 
 The ZMQ publisher sends three frames: topic bytes, an 8-byte big-endian sequence
-number, and a msgpack payload. The payload is an array-like `KVEventBatch`:
+number, and a msgpack payload. The payload is an array-like `KVEventBatch`
+(`[ts, events, attn_dp_rank]`). Individual events are tagged **maps** (not
+positional arrays), which Dynamo's ZMQ relay accepts:
 
 ```python
-[timestamp, [["BlockStored", [block_hash], parent_hash, token_ids, block_size]], attn_dp_rank]
-[timestamp, [["BlockRemoved", [block_hash]]], attn_dp_rank]
+[timestamp, [{"type": "BlockStored", "block_hashes": [...], "parent_block_hash": ..., "token_ids": [...], "block_size": N}], attn_dp_rank]
+[timestamp, [{"type": "BlockRemoved", "block_hashes": [...]}], attn_dp_rank]
 ```
+
+Unset optional fields are omitted via msgspec `omit_defaults`. With
+`wire_format=rfc1527`, RFC #1527 envelope fields (`backend_id`, `medium`,
+`dp_rank`, `model_name`, `tenant_id`, `event_id`) may also appear on events.
+The default `wire_format=legacy` leaves those fields unset so payloads stay
+Dynamo-compatible.
 
 With attention data parallelism, each attention DP rank publishes on an offset
 port from the configured endpoint.

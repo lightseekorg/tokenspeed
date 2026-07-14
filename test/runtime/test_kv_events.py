@@ -4,12 +4,14 @@ import msgspec
 import pytest
 
 from tokenspeed.runtime.pd.kv_events import (
+    AllBlocksCleared,
     BlockRemoved,
     BlockStored,
     EventPublisherFactory,
     KVEventBatch,
     KVEventsConfig,
     NullEventPublisher,
+    apply_envelope,
     drain_scheduler_kv_events,
     scheduler_kv_event_to_wire_event,
 )
@@ -223,7 +225,88 @@ def test_factory_pops_rfc1527_config_fields() -> None:
     assert "hash_mode" not in publisher.kwargs
 
 
+def test_apply_envelope_legacy_leaves_fields_unset() -> None:
+    event = BlockStored(
+        block_hashes=[123],
+        parent_block_hash=None,
+        token_ids=[1, 2],
+        block_size=2,
+    )
+    config = KVEventsConfig(
+        wire_format="legacy",
+        backend_id="worker-0",
+        tenant_id="t1",
+        model_name="m",
+    )
+
+    annotated = apply_envelope(event, config)
+
+    assert annotated.backend_id is None
+    assert annotated.medium is None
+    assert annotated.model_name is None
+    assert annotated.tenant_id is None
+    # omit_defaults must keep Dynamo map payload free of envelope keys
+    decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(annotated))
+    assert "backend_id" not in decoded
+    assert "medium" not in decoded
+
+
+def test_apply_envelope_rfc1527_sets_fields_from_config() -> None:
+    event = BlockStored(
+        block_hashes=[123],
+        parent_block_hash=None,
+        token_ids=[1, 2],
+        block_size=2,
+    )
+    config = KVEventsConfig(
+        wire_format="rfc1527",
+        backend_id="worker-0",
+        tenant_id="t1",
+        model_name="test-model",
+        publish_medium=True,
+    )
+
+    annotated = apply_envelope(event, config, medium="gpu")
+
+    assert annotated.backend_id == "worker-0"
+    assert annotated.tenant_id == "t1"
+    assert annotated.model_name == "test-model"
+    assert annotated.medium == "gpu"
+
+
+def test_apply_envelope_rfc1527_skips_medium_when_disabled() -> None:
+    event = BlockRemoved(block_hashes=[99])
+    config = KVEventsConfig(
+        wire_format="rfc1527",
+        backend_id="worker-1",
+        publish_medium=False,
+    )
+
+    annotated = apply_envelope(event, config, medium="cpu")
+
+    assert annotated.backend_id == "worker-1"
+    assert annotated.medium is None
+
+
+def test_apply_envelope_rfc1527_cleared_event() -> None:
+    event = AllBlocksCleared()
+    config = KVEventsConfig(wire_format="rfc1527", backend_id="w", tenant_id="t")
+
+    annotated = apply_envelope(event, config, medium="gpu")
+
+    assert annotated.backend_id == "w"
+    assert annotated.tenant_id == "t"
+    assert annotated.medium == "gpu"
+
+
 def test_kv_event_batch_msgpack_shape_is_dynamo_compatible() -> None:
+    """Dynamo ZMQ relay accepts tagged **map** events (vLLM-style), not
+    TokenSpeed's older ``array_like`` positional arrays.
+
+    ``array_like`` was dropped because msgspec ``omit_defaults`` cannot strip
+    trailing ``None`` defaults from positional arrays; map encoding lets unset
+    RFC #1527 envelope fields disappear so legacy payloads stay Dynamo-safe.
+    """
     payload = msgspec.msgpack.encode(
         KVEventBatch(
             ts=1.5,
@@ -242,8 +325,7 @@ def test_kv_event_batch_msgpack_shape_is_dynamo_compatible() -> None:
 
     decoded = msgspec.msgpack.decode(payload)
 
-    # Legacy fields only: envelope defaults must be omitted so Dynamo ZMQ relay
-    # still receives the legacy event shape (map-encoded events, array batch).
+    # Batch remains array-like; events are tagged maps without envelope keys.
     assert decoded == [
         1.5,
         [

@@ -110,6 +110,45 @@ class KVEventBatch(EventBatch):
     events: list[Union[BlockStored, BlockRemoved, AllBlocksCleared]]
 
 
+def apply_envelope(
+    event: Union[BlockStored, BlockRemoved, AllBlocksCleared],
+    config: "KVEventsConfig",
+    *,
+    medium: Optional[str] = None,
+    dp_rank: Optional[int] = None,
+) -> Union[BlockStored, BlockRemoved, AllBlocksCleared]:
+    """Apply RFC #1527 envelope fields from ``config`` when enabled.
+
+    When ``wire_format == "legacy"``, envelope fields are left unset (``None``)
+    so msgspec ``omit_defaults`` drops them from the wire payload.
+
+    When ``wire_format == "rfc1527"``, sets ``backend_id``, ``tenant_id``,
+    ``model_name``, and optionally ``medium`` / ``dp_rank`` from config and
+    call-site arguments.
+
+    Args:
+        event: Wire event struct to annotate (mutated in place).
+        config: Publisher KV events config.
+        medium: Storage tier label (``"gpu"`` | ``"cpu"`` | ``"disk"``). Used
+            only when ``config.publish_medium`` is true.
+        dp_rank: Optional data-parallel rank for the envelope.
+
+    Returns:
+        The same ``event`` instance after annotation.
+    """
+    if config.wire_format == "legacy":
+        return event
+
+    event.backend_id = config.backend_id
+    event.tenant_id = config.tenant_id
+    event.model_name = config.model_name
+    if config.publish_medium and medium is not None:
+        event.medium = medium
+    if dp_rank is not None:
+        event.dp_rank = dp_rank
+    return event
+
+
 def scheduler_kv_event_to_wire_event(
     event: Any,
     hash_mode: Literal["fnv", "xxh3"] = "fnv",
