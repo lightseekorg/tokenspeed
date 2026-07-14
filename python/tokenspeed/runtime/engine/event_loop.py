@@ -19,6 +19,7 @@
 # SOFTWARE.
 
 import faulthandler
+import queue
 import signal
 import time
 from collections import OrderedDict
@@ -81,8 +82,10 @@ from tokenspeed.runtime.pd.kv_events import (
     KVEventBatch,
     KVEventsConfig,
     NullEventPublisher,
+    apply_envelope,
     assign_event_ids,
     drain_scheduler_kv_events,
+    l3_storage_keys_to_disk_events,
     scheduler_kv_events_to_wire_events,
 )
 from tokenspeed.runtime.pd.mooncake.entities import ManagerArgs
@@ -289,6 +292,35 @@ class EventLoop:
             mamba_l2_layout=server_args.mamba_l2_layout,
             mamba_l2_io_backend=server_args.mamba_l2_io_backend,
         )
+        # Parse KV events config before MemoryExecutor so L3 disk callbacks can
+        # be wired at construction time. Publishing stays on attn_tp_rank == 0.
+        self._kv_events_enabled = (
+            EventPublisherFactory.is_enabled(server_args.kv_events_config)
+            and attn_tp_rank == 0
+        )
+        # Retain full config: EventPublisherFactory.create pops wire_format /
+        # hash_mode / envelope fields that the publish path still needs.
+        self._kv_events_config: KVEventsConfig | None = (
+            KVEventsConfig.from_cli(server_args.kv_events_config)
+            if server_args.kv_events_config
+            else None
+        )
+        # Per-stream RFC #1527 event_id counters (model, block_size, backend,
+        # medium, dp_rank). Unused under wire_format=legacy. Mutated only from
+        # the event-loop thread (L3 backups enqueue on a worker thread).
+        self._kv_event_id_allocator = EventIdAllocator()
+        # Thread-safe queue of rolling_page_hashes from successful L3 backups.
+        # Drained on the event-loop thread in ``_publish_scheduler_kv_events``
+        # so EventIdAllocator stays single-threaded.
+        self._pending_l3_kv_events: queue.Queue[list[str]] = queue.Queue()
+        on_l3_blocks_stored = None
+        if (
+            self._kv_events_enabled
+            and self._kv_events_config is not None
+            and "disk" in self._kv_events_config.publish_tiers
+        ):
+            on_l3_blocks_stored = self._enqueue_l3_blocks_stored
+
         if not token_to_kv_pool.supports_hierarchical_kv_cache:
             if server_args.enable_kvstore:
                 raise NotImplementedError(
@@ -305,6 +337,7 @@ class EventLoop:
                 tp_group=self.attn_tp_cpu_group,
                 draft_device_pool=draft_token_to_kv_pool,
                 mamba_pool=mamba_pool,
+                on_l3_blocks_stored=on_l3_blocks_stored,
             )
             num_host_pages = self.memory_executor.host_pool.page_num
 
@@ -313,20 +346,6 @@ class EventLoop:
         # req_pool_slots based on this value, so it must match the
         # per-DP-rank budget (same division used in cuda_graph_wrapper).
         per_rank_max_batch = server_args.max_num_seqs // max(self.dp_size, 1)
-        self._kv_events_enabled = (
-            EventPublisherFactory.is_enabled(server_args.kv_events_config)
-            and attn_tp_rank == 0
-        )
-        # Retain full config: EventPublisherFactory.create pops wire_format /
-        # hash_mode / envelope fields that the publish path still needs.
-        self._kv_events_config: KVEventsConfig | None = (
-            KVEventsConfig.from_cli(server_args.kv_events_config)
-            if server_args.kv_events_config
-            else None
-        )
-        # Per-stream RFC #1527 event_id counters (model, block_size, backend,
-        # medium, dp_rank). Unused under wire_format=legacy.
-        self._kv_event_id_allocator = EventIdAllocator()
 
         if has_mamba and server_args.max_mamba_cache_size is None:
             logger.info(
@@ -561,25 +580,61 @@ class EventLoop:
         logger.debug("[cache_poll] scheduler.advance() done")
         self._publish_scheduler_kv_events()
 
+    def _enqueue_l3_blocks_stored(self, rolling_page_hashes: list[str]) -> None:
+        """Thread-safe enqueue from StorageExecutor backup-done callback."""
+        if rolling_page_hashes:
+            self._pending_l3_kv_events.put(list(rolling_page_hashes))
+
+    def _drain_pending_l3_disk_events(self) -> list:
+        """Convert queued L3 backup hashes to ``BlockStored`` ``medium=disk``.
+
+        Runs on the event-loop thread only. Always drains the queue so failed
+        or disabled publishes do not retain hashes indefinitely. Events are
+        produced only when KV events are enabled and ``"disk"`` is in
+        ``publish_tiers``.
+        """
+        config = self._kv_events_config
+        publish_disk = (
+            self._kv_events_enabled
+            and config is not None
+            and "disk" in config.publish_tiers
+        )
+        block_size = self.server_args.block_size
+        events = []
+        while True:
+            try:
+                hashes = self._pending_l3_kv_events.get_nowait()
+            except queue.Empty:
+                break
+            if not publish_disk or not hashes:
+                continue
+            disk_events = l3_storage_keys_to_disk_events(hashes, block_size=block_size)
+            for event in disk_events:
+                apply_envelope(event, config, medium="disk", dp_rank=self.dp_rank)
+            events.extend(disk_events)
+        return events
+
     def _publish_scheduler_kv_events(self) -> None:
         raw_events = drain_scheduler_kv_events(
             self.scheduler,
             enabled=self._kv_events_enabled,
         )
-        if not raw_events:
-            return
-
         config = self._kv_events_config
         hash_mode = config.hash_mode if config is not None else "fnv"
         # medium="gpu" is the fallback for events without tier (older bindings);
         # host-tiered events override to medium="cpu" via _tier_to_medium.
-        events = scheduler_kv_events_to_wire_events(
-            raw_events,
-            hash_mode=hash_mode,
-            config=config,
-            medium="gpu",
-            dp_rank=self.dp_rank,
-        )
+        events = []
+        if raw_events:
+            events.extend(
+                scheduler_kv_events_to_wire_events(
+                    raw_events,
+                    hash_mode=hash_mode,
+                    config=config,
+                    medium="gpu",
+                    dp_rank=self.dp_rank,
+                )
+            )
+        events.extend(self._drain_pending_l3_disk_events())
         if not events:
             return
         if config is not None:

@@ -312,6 +312,67 @@ def drain_scheduler_kv_events(scheduler: Any, enabled: bool) -> list[Any]:
     return list(drain_kv_events())
 
 
+_L3_HASH_SEED = 1337
+
+
+def _xxh3_64(data: bytes, seed: int = _L3_HASH_SEED) -> int:
+    """XXH3-64 digest used for interim L3 disk block hashes."""
+    try:
+        import xxhash
+    except ImportError as exc:  # pragma: no cover - exercised when dep missing
+        raise ImportError(
+            "xxhash is required to derive L3 disk KV block hashes from Mooncake "
+            "storage keys; install the xxhash package"
+        ) from exc
+    return int(xxhash.xxh3_64_intdigest(data, seed=seed))
+
+
+def l3_storage_keys_to_disk_events(
+    rolling_page_hashes: list[str],
+    *,
+    block_size: int = 0,
+) -> list[BlockStored]:
+    """Map Mooncake L3 SHA256 hex storage keys to ``BlockStored`` wire events.
+
+    **Interim mapping:** ``BackUpOperation`` currently carries only
+    ``rolling_page_hashes`` (hex storage keys) and no ``token_ids``. Until C++
+    plan generation includes token page spans, each hex key string is treated
+    as UTF-8 bytes and hashed with XXH3-64 seed 1337 to produce a stable u64
+    ``block_hash`` for Dynamo multi-tier indexing. Parent links form a chain:
+    the first page has ``parent_block_hash=None``; each subsequent page's
+    parent is the previous page's block hash.
+
+    ``token_ids`` is always ``[]``. Callers should construct envelope fields
+    via ``apply_envelope(..., medium="disk")`` and skip
+    ``scheduler_kv_event_to_wire_event`` (which would reject empty token_ids
+    under ``hash_mode=xxh3``).
+
+    Args:
+        rolling_page_hashes: Mooncake SHA256 hex storage keys from a successful
+            backup op, in page order.
+        block_size: Token page / block size for the wire event (engine
+            ``page_size`` / ``block_size``).
+
+    Returns:
+        One ``BlockStored`` event per storage key, ready for envelope
+        annotation. Empty input yields an empty list.
+    """
+    events: list[BlockStored] = []
+    parent: Optional[int] = None
+    for key in rolling_page_hashes:
+        block_hash = _xxh3_64(key.encode("utf-8"))
+        events.append(
+            BlockStored(
+                block_hashes=[block_hash],
+                parent_block_hash=parent,
+                token_ids=[],
+                block_size=int(block_size),
+            )
+        )
+        parent = block_hash
+    return events
+
+
 class EventPublisher(ABC):
     """Lightweight publisher for ``EventBatch`` batches with DP attention.
 
@@ -636,6 +697,15 @@ class KVEventsConfig(BaseModel):
     publish_medium: bool = True
     """Whether to include ``medium`` in published RFC #1527 envelope fields."""
 
+    publish_tiers: list[str] = Field(default_factory=lambda: ["gpu"])
+    """Which storage tiers to publish (``"gpu"`` | ``"cpu"`` | ``"disk"``).
+
+    Defaults to ``["gpu"]`` for backward compatibility. Mooncake Store
+    deployments that want host/disk indexing should set
+    ``["gpu", "cpu", "disk"]``. L3 backup success events are published only
+    when ``"disk"`` is present.
+    """
+
     @classmethod
     def from_cli(cls, cli_value: str) -> "KVEventsConfig":
         """Parse the CLI value for the event publisher config."""
@@ -669,6 +739,7 @@ class EventPublisherFactory:
             "model_name",
             "wire_format",
             "publish_medium",
+            "publish_tiers",
         ):
             config_dict.pop(config_only_field, None)
         if not enabled:

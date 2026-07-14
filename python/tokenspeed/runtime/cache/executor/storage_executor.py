@@ -27,7 +27,7 @@ import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from queue import Empty, Queue
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 import torch.distributed as dist
@@ -117,10 +117,14 @@ class StorageExecutor:
         is_dp_attention_enabled: bool = False,
         storage_batch_size: int = 128,
         tp_group=None,
+        on_l3_blocks_stored: Callable[[list[str]], None] | None = None,
     ):
         self.page_size = page_size
         self.host_pool = host_pool
         self.storage_batch_size = storage_batch_size
+        self._on_l3_blocks_stored = on_l3_blocks_stored
+        # op_id → rolling_page_hashes retained until backup completion callback.
+        self._backup_hashes: dict[int, list[str]] = {}
         (
             extra_config_dict,
             _prefetch_threshold,
@@ -230,6 +234,7 @@ class StorageExecutor:
             evt.success = False
             self._results.put(evt)
             return
+        self._backup_hashes[op.op_id] = list(op.rolling_page_hashes)
         future = self._executor.submit(self._run_backup, op)
         future.add_done_callback(
             lambda fut, oid=op.op_id: self._on_backup_done(oid, fut)
@@ -435,6 +440,7 @@ class StorageExecutor:
     def _on_backup_done(self, op_id: int, future) -> None:
         evt = Cache.BackUpDoneEvent()
         evt.op_id = op_id
+        hashes = self._backup_hashes.pop(op_id, [])
         try:
             future.result()
             evt.success = True
@@ -442,6 +448,11 @@ class StorageExecutor:
             evt.success = False
             logger.error("backup op %s failed: %s", op_id, exc)
         self._results.put(evt)
+        if evt.success and self._on_l3_blocks_stored and hashes:
+            try:
+                self._on_l3_blocks_stored(hashes)
+            except Exception:
+                logger.exception("L3 KV event callback failed")
 
     def drain(self) -> list:
         results = []

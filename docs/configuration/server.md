@@ -212,6 +212,12 @@ the publisher fallback (`gpu` for device-path publishes).
 The default `wire_format=legacy` leaves those fields unset so payloads stay
 Dynamo-compatible.
 
+`publish_tiers` (default `["gpu"]`) selects which storage tiers to publish.
+Include `"disk"` (e.g. `["gpu","cpu","disk"]`) to emit `medium="disk"`
+`BlockStored` events when Mooncake L3 backup succeeds. Disk hashes are an
+interim mapping from Mooncake SHA256 hex storage keys via XXH3-64 seed 1337
+(empty `token_ids`) until `BackUpOp` carries token page spans.
+
 With attention data parallelism, each attention DP rank publishes on an offset
 port from the configured endpoint.
 
