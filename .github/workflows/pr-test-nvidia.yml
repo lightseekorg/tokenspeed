@@ -61,12 +61,14 @@ jobs:
 
   scan:
     # Closed PRs only need cancel-on-close. For all other events, run jobs for
-    # pull_request events or for push/manual events in lightseekorg/tokenspeed.
+    # pull_request events or for push/manual events in the official repository
+    # or a repository whose full name matches TOKENSPEED_CI_REPOSITORY.
     if: |
       (github.event_name != 'pull_request' || github.event.action != 'closed') &&
       (
         github.event_name == 'pull_request' ||
-        github.repository == 'lightseekorg/tokenspeed'
+        github.repository == 'lightseekorg/tokenspeed' ||
+        github.repository == vars.TOKENSPEED_CI_REPOSITORY
       )
     runs-on: ubuntu-latest
     outputs:
@@ -142,7 +144,8 @@ jobs:
       (github.event_name != 'pull_request' || github.event.action != 'closed') &&
       (
         github.event_name == 'pull_request' ||
-        github.repository == 'lightseekorg/tokenspeed'
+        github.repository == 'lightseekorg/tokenspeed' ||
+        github.repository == vars.TOKENSPEED_CI_REPOSITORY
       ) &&
       (
         github.event_name != 'pull_request' ||
@@ -237,7 +240,8 @@ jobs:
       (github.event_name != 'pull_request' || github.event.action != 'closed') &&
       (
         github.event_name == 'pull_request' ||
-        github.repository == 'lightseekorg/tokenspeed'
+        github.repository == 'lightseekorg/tokenspeed' ||
+        github.repository == vars.TOKENSPEED_CI_REPOSITORY
       )
     needs: [unit-test]
     runs-on: ubuntu-latest
