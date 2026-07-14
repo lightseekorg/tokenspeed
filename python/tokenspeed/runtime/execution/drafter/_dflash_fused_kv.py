@@ -9,8 +9,6 @@ Adapted from sglang's `fused_kv_materialize.py`. Provides two variants:
 
 from __future__ import annotations
 
-from typing import Optional
-
 import torch
 import triton
 import triton.language as tl
@@ -179,8 +177,8 @@ def _fused_norm_rope_stacked_scatter(
     num_kv_heads: int,
     head_dim: int,
     rotary_dim: int,
-    inv_k_scales: Optional[torch.Tensor] = None,
-    inv_v_scales: Optional[torch.Tensor] = None,
+    inv_k_scales: torch.Tensor | None = None,
+    inv_v_scales: torch.Tensor | None = None,
 ) -> None:
     """Fused RMSNorm + RoPE + scatter into KV pool for all layers in one launch.
 
@@ -357,8 +355,8 @@ def _fused_norm_rope_stacked(
     num_kv_heads: int,
     head_dim: int,
     rotary_dim: int,
-    k_out: Optional[torch.Tensor] = None,
-    v_out: Optional[torch.Tensor] = None,
+    k_out: torch.Tensor | None = None,
+    v_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused RMSNorm + RoPE materialization for all layers (workspace variant)."""
     if kv.ndim != 3:

@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
-from typing import Any, Optional
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -500,7 +500,7 @@ def _get_text_config(config: Any) -> Any:
     return config
 
 
-def get_dflash_layer_types(config: Any) -> Optional[Sequence[str]]:
+def get_dflash_layer_types(config: Any) -> Sequence[str] | None:
     text_config = _get_text_config(config)
     layer_types = _cfg_get(text_config, "layer_types", _cfg_get(config, "layer_types"))
     if layer_types is None:
@@ -512,7 +512,7 @@ def get_dflash_layer_types(config: Any) -> Optional[Sequence[str]]:
     return layer_types
 
 
-def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
+def get_dflash_attention_sliding_window_size(config: Any) -> int | None:
     layer_types = get_dflash_layer_types(config)
     if layer_types is None or "sliding_attention" not in layer_types:
         return None

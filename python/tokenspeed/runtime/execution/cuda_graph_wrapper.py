@@ -492,12 +492,6 @@ class CudaGraphWrapper:
                 )
             return self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
 
-        from tokenspeed.runtime.execution.drafter.dflash import DFlash
-
-        is_dflash = (
-            isinstance(self.drafter, DFlash) if self.drafter is not None else False
-        )
-
         global _is_cuda_graph_phase
         _is_cuda_graph_phase = True
 

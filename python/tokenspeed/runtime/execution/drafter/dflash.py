@@ -20,7 +20,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-import torch.nn.functional as F
 
 from tokenspeed.runtime.distributed.comm_ops import all_gather_into_tensor
 from tokenspeed.runtime.execution.cache_loc_kernel import (
@@ -29,7 +28,6 @@ from tokenspeed.runtime.execution.cache_loc_kernel import (
 )
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.drafter._dflash_fused_kv import (
-    _fused_norm_rope_stacked,
     _fused_norm_rope_stacked_scatter,
     _get_kv_buffer_ptrs,
 )
