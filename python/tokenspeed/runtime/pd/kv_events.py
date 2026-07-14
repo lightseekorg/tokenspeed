@@ -28,6 +28,7 @@
 
 import atexit
 import logging
+import os
 import queue
 import threading
 import time
@@ -39,9 +40,13 @@ from typing import Any, Callable, Iterable, Literal, Optional, Union
 
 import msgspec
 import zmq
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
+
+
+def _default_kv_events_backend_id() -> str:
+    return os.getenv("TOKENSPEED_KV_EVENTS_BACKEND_ID") or "tokenspeed-worker"
 
 
 class EventBatch(
@@ -57,12 +62,16 @@ class EventBatch(
 
 class KVCacheEvent(
     msgspec.Struct,
-    array_like=True,  # type: ignore[call-arg]
     omit_defaults=True,  # type: ignore[call-arg]
     gc=False,  # type: ignore[call-arg]
     tag=True,
 ):
-    """Base class for all KV cache-related events."""
+    """Base class for all KV cache-related events.
+
+    Events use map encoding (not ``array_like``) so ``omit_defaults`` can drop
+    unset RFC #1527 envelope fields while preserving Dynamo-compatible legacy
+    payloads when those fields are left at their defaults.
+    """
 
 
 class BlockStored(KVCacheEvent):
@@ -70,14 +79,31 @@ class BlockStored(KVCacheEvent):
     parent_block_hash: Optional[int]
     token_ids: list[int]
     block_size: int
+    backend_id: Optional[str] = None
+    medium: Optional[str] = None  # "gpu" | "cpu" | "disk"
+    dp_rank: Optional[int] = None
+    model_name: Optional[str] = None
+    tenant_id: Optional[str] = None
+    event_id: Optional[int] = None
 
 
 class BlockRemoved(KVCacheEvent):
     block_hashes: list[int]
+    backend_id: Optional[str] = None
+    medium: Optional[str] = None  # "gpu" | "cpu" | "disk"
+    dp_rank: Optional[int] = None
+    model_name: Optional[str] = None
+    tenant_id: Optional[str] = None
+    event_id: Optional[int] = None
 
 
 class AllBlocksCleared(KVCacheEvent):
-    pass
+    backend_id: Optional[str] = None
+    medium: Optional[str] = None  # "gpu" | "cpu" | "disk"
+    dp_rank: Optional[int] = None
+    model_name: Optional[str] = None
+    tenant_id: Optional[str] = None
+    event_id: Optional[int] = None
 
 
 class KVEventBatch(EventBatch):
@@ -445,6 +471,21 @@ class KVEventsConfig(BaseModel):
     events require non-empty ``token_ids`` so consumers can recompute hashes.
     """
 
+    backend_id: str = Field(default_factory=_default_kv_events_backend_id)
+    """Backend identifier for RFC #1527 envelope fields."""
+
+    tenant_id: str = "default"
+    """Tenant identifier for multi-tenant KV event indexing."""
+
+    model_name: Optional[str] = None
+    """Model name included in RFC #1527 envelope fields when set."""
+
+    wire_format: Literal["legacy", "rfc1527"] = "legacy"
+    """Wire encoding mode. ``legacy`` omits envelope fields for Dynamo compat."""
+
+    publish_medium: bool = True
+    """Whether to include ``medium`` in published RFC #1527 envelope fields."""
+
     @classmethod
     def from_cli(cls, cli_value: str) -> "KVEventsConfig":
         """Parse the CLI value for the event publisher config."""
@@ -471,7 +512,15 @@ class EventPublisherFactory:
         config = KVEventsConfig.from_cli(config)
         config_dict = config.model_dump()
         enabled = bool(config_dict.pop("enable_kv_cache_events", False))
-        config_dict.pop("hash_mode", None)
+        for config_only_field in (
+            "hash_mode",
+            "backend_id",
+            "tenant_id",
+            "model_name",
+            "wire_format",
+            "publish_medium",
+        ):
+            config_dict.pop(config_only_field, None)
         if not enabled:
             return NullEventPublisher(attn_dp_rank=attn_dp_rank)
 

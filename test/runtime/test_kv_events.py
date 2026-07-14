@@ -153,6 +153,76 @@ def test_drain_scheduler_kv_events_returns_scheduler_events() -> None:
     assert drain_scheduler_kv_events(scheduler, enabled=True) == [event]
 
 
+def test_rfc1527_envelope_on_block_stored() -> None:
+    batch = KVEventBatch(
+        ts=1.0,
+        events=[
+            BlockStored(
+                block_hashes=[123],
+                parent_block_hash=None,
+                token_ids=[1, 2],
+                block_size=2,
+                backend_id="worker-0",
+                medium="gpu",
+                dp_rank=0,
+                model_name="test-model",
+            )
+        ],
+        attn_dp_rank=0,
+    )
+    decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(batch))
+
+    # Tagged BlockStored with new optional fields; unset envelope fields omitted.
+    assert decoded == [
+        1.0,
+        [
+            {
+                "type": "BlockStored",
+                "block_hashes": [123],
+                "parent_block_hash": None,
+                "token_ids": [1, 2],
+                "block_size": 2,
+                "backend_id": "worker-0",
+                "medium": "gpu",
+                "dp_rank": 0,
+                "model_name": "test-model",
+            },
+        ],
+        0,
+    ]
+
+
+def test_kv_events_config_rfc1527_defaults() -> None:
+    config = KVEventsConfig()
+
+    assert config.backend_id == "tokenspeed-worker"
+    assert config.tenant_id == "default"
+    assert config.model_name is None
+    assert config.wire_format == "legacy"
+    assert config.publish_medium is True
+
+
+def test_factory_pops_rfc1527_config_fields() -> None:
+    original = EventPublisherFactory._registry["zmq"]
+    EventPublisherFactory._registry["zmq"] = _FakePublisher
+    try:
+        publisher = EventPublisherFactory.create(
+            '{"enable_kv_cache_events":true,"backend_id":"worker-1",'
+            '"tenant_id":"t1","wire_format":"rfc1527","publish_medium":false}',
+            attn_dp_rank=0,
+        )
+    finally:
+        EventPublisherFactory._registry["zmq"] = original
+
+    assert isinstance(publisher, _FakePublisher)
+    assert "backend_id" not in publisher.kwargs
+    assert "tenant_id" not in publisher.kwargs
+    assert "wire_format" not in publisher.kwargs
+    assert "publish_medium" not in publisher.kwargs
+    assert "model_name" not in publisher.kwargs
+    assert "hash_mode" not in publisher.kwargs
+
+
 def test_kv_event_batch_msgpack_shape_is_dynamo_compatible() -> None:
     payload = msgspec.msgpack.encode(
         KVEventBatch(
@@ -172,11 +242,22 @@ def test_kv_event_batch_msgpack_shape_is_dynamo_compatible() -> None:
 
     decoded = msgspec.msgpack.decode(payload)
 
+    # Legacy fields only: envelope defaults must be omitted so Dynamo ZMQ relay
+    # still receives the legacy event shape (map-encoded events, array batch).
     assert decoded == [
         1.5,
         [
-            ["BlockStored", [123], None, [1, 2], 2],
-            ["BlockRemoved", [123]],
+            {
+                "type": "BlockStored",
+                "block_hashes": [123],
+                "parent_block_hash": None,
+                "token_ids": [1, 2],
+                "block_size": 2,
+            },
+            {
+                "type": "BlockRemoved",
+                "block_hashes": [123],
+            },
         ],
         2,
     ]
