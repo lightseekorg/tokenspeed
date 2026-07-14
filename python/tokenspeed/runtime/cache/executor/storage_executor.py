@@ -25,9 +25,9 @@ from __future__ import annotations
 import json
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
-from collections.abc import Callable
 from queue import Empty, Queue
 
 import torch

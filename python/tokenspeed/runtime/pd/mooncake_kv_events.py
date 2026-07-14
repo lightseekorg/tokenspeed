@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Literal, Optional, Union
+from typing import Literal
 
 from tokenspeed.runtime.pd.kv_events import (
     AllBlocksCleared,
@@ -66,12 +66,12 @@ class MooncakeKvEventsConfig:
     """
 
     source: MooncakeKvEventsSource = "engine"
-    master_subscribe_endpoint: Optional[str] = None
-    backend_id: Optional[str] = None
+    master_subscribe_endpoint: str | None = None
+    backend_id: str | None = None
 
 
 def parse_mooncake_kv_events_config(
-    extra_config: Optional[dict],
+    extra_config: dict | None,
 ) -> MooncakeKvEventsConfig:
     """Parse nested ``kv_events`` from Mooncake ``extra_config``.
 
@@ -135,7 +135,7 @@ def engine_publishes_l3_disk(config: MooncakeKvEventsConfig) -> bool:
 
 def normalize_master_event(
     raw: dict,
-) -> Union[BlockStored, BlockRemoved, AllBlocksCleared]:
+) -> BlockStored | BlockRemoved | AllBlocksCleared:
     """Map RFC #1527 / legacy master JSON fields onto TokenSpeed wire structs.
 
     Accepts synthetic dicts for unit tests. Recognizes both RFC names

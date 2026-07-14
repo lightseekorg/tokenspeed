@@ -34,7 +34,7 @@ from collections import deque
 from collections.abc import Callable, Iterable
 from itertools import count
 from queue import Queue
-from typing import Any, Literal, Optional, Union
+from typing import Any, Literal, Optional
 
 import msgspec
 import zmq
@@ -82,31 +82,31 @@ class BlockStored(KVCacheEvent):
     parent_block_hash: int | None
     token_ids: list[int]
     block_size: int
-    backend_id: Optional[str] = None
-    medium: Optional[str] = None  # "gpu" | "cpu" | "disk"
-    dp_rank: Optional[int] = None
-    model_name: Optional[str] = None
-    tenant_id: Optional[str] = None
-    event_id: Optional[int] = None
+    backend_id: str | None = None
+    medium: str | None = None  # "gpu" | "cpu" | "disk"
+    dp_rank: int | None = None
+    model_name: str | None = None
+    tenant_id: str | None = None
+    event_id: int | None = None
 
 
 class BlockRemoved(KVCacheEvent):
     block_hashes: list[int]
-    backend_id: Optional[str] = None
-    medium: Optional[str] = None  # "gpu" | "cpu" | "disk"
-    dp_rank: Optional[int] = None
-    model_name: Optional[str] = None
-    tenant_id: Optional[str] = None
-    event_id: Optional[int] = None
+    backend_id: str | None = None
+    medium: str | None = None  # "gpu" | "cpu" | "disk"
+    dp_rank: int | None = None
+    model_name: str | None = None
+    tenant_id: str | None = None
+    event_id: int | None = None
 
 
 class AllBlocksCleared(KVCacheEvent):
-    backend_id: Optional[str] = None
-    medium: Optional[str] = None  # "gpu" | "cpu" | "disk"
-    dp_rank: Optional[int] = None
-    model_name: Optional[str] = None
-    tenant_id: Optional[str] = None
-    event_id: Optional[int] = None
+    backend_id: str | None = None
+    medium: str | None = None  # "gpu" | "cpu" | "disk"
+    dp_rank: int | None = None
+    model_name: str | None = None
+    tenant_id: str | None = None
+    event_id: int | None = None
 
 
 class KVEventBatch(EventBatch):
@@ -132,7 +132,7 @@ class EventIdAllocator:
 
 
 def stream_key_for_event(
-    event: Union[BlockStored, BlockRemoved, AllBlocksCleared],
+    event: BlockStored | BlockRemoved | AllBlocksCleared,
 ) -> tuple:
     """Build the RFC #1527 stream key for an envelope-annotated event.
 
@@ -150,12 +150,12 @@ def stream_key_for_event(
 
 
 def apply_envelope(
-    event: Union[BlockStored, BlockRemoved, AllBlocksCleared],
+    event: BlockStored | BlockRemoved | AllBlocksCleared,
     config: "KVEventsConfig",
     *,
-    medium: Optional[str] = None,
-    dp_rank: Optional[int] = None,
-) -> Union[BlockStored, BlockRemoved, AllBlocksCleared]:
+    medium: str | None = None,
+    dp_rank: int | None = None,
+) -> BlockStored | BlockRemoved | AllBlocksCleared:
     """Apply RFC #1527 envelope fields from ``config`` when enabled.
 
     When ``wire_format == "legacy"``, envelope fields are left unset (``None``)
@@ -189,10 +189,10 @@ def apply_envelope(
 
 
 def assign_event_ids(
-    events: list[Union[BlockStored, BlockRemoved, AllBlocksCleared]],
+    events: list[BlockStored | BlockRemoved | AllBlocksCleared],
     config: "KVEventsConfig",
     allocator: EventIdAllocator,
-) -> list[Union[BlockStored, BlockRemoved, AllBlocksCleared]]:
+) -> list[BlockStored | BlockRemoved | AllBlocksCleared]:
     """Assign monotonic ``event_id`` values when ``wire_format == "rfc1527"``.
 
     Call after ``apply_envelope`` so stream-key dimensions are populated.
@@ -243,7 +243,7 @@ def scheduler_kv_event_to_wire_event(
     raise TypeError(f"Unsupported scheduler KV event kind: {kind}")
 
 
-def _tier_to_medium(event: Any) -> Optional[str]:
+def _tier_to_medium(event: Any) -> str | None:
     """Map scheduler ``KvEventTier`` to RFC #1527 wire ``medium``.
 
     ``KvEventTier.kDevice`` / ``0`` / default → ``"gpu"``.
@@ -264,8 +264,8 @@ def scheduler_kv_events_to_wire_events(
     events: Iterable[Any],
     hash_mode: Literal["fnv", "xxh3"] = "fnv",
     config: Optional["KVEventsConfig"] = None,
-    medium: Optional[str] = None,
-    dp_rank: Optional[int] = None,
+    medium: str | None = None,
+    dp_rank: int | None = None,
 ) -> list[BlockStored | BlockRemoved]:
     """Translate scheduler events and optionally apply the RFC #1527 envelope.
 
@@ -357,7 +357,7 @@ def l3_storage_keys_to_disk_events(
         annotation. Empty input yields an empty list.
     """
     events: list[BlockStored] = []
-    parent: Optional[int] = None
+    parent: int | None = None
     for key in rolling_page_hashes:
         block_hash = _xxh3_64(key.encode("utf-8"))
         events.append(
@@ -689,7 +689,7 @@ class KVEventsConfig(BaseModel):
     tenant_id: str = "default"
     """Tenant identifier for multi-tenant KV event indexing."""
 
-    model_name: Optional[str] = None
+    model_name: str | None = None
     """Model name included in RFC #1527 envelope fields when set."""
 
     wire_format: Literal["legacy", "rfc1527"] = "legacy"
