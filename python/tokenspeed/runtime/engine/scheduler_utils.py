@@ -24,6 +24,7 @@ import os
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+import numpy as np
 import torch
 from tokenspeed_scheduler import (
     Cache,
@@ -363,12 +364,39 @@ def flat_block_tables_from_forward_op(
     page indices, null hole = 0 preserved, ragged-row padding -1. No
     base-offset companion -- the flat path never compacts.
     """
-    return _block_tables_from_forward_op(
-        forward_op,
-        attr="flat_block_tables",
-        device=device,
-        num_reqs=num_reqs,
-    )
+    arrays = getattr(forward_op, "flat_block_tables_arrays", None)
+    if not callable(arrays):
+        if getattr(forward_op, "flat_block_tables", None) is None:
+            # Radix builds / idle ops carry no flat tables at all.
+            return {}
+        raise RuntimeError(
+            "flat scheduler ext does not expose flat_block_tables_arrays; "
+            "rebuild tokenspeed-scheduler (the per-element nested-list export "
+            "path was removed)."
+        )
+    device = torch.device(device) if isinstance(device, str) else device
+    out: dict[str, torch.Tensor] = {}
+    for key_obj, arr in arrays().items():
+        key = str(key_obj)
+        if num_reqs is not None and arr.shape[0] != num_reqs:
+            raise ValueError(
+                f"flat_block_tables_arrays[{key}] has {arr.shape[0]} rows "
+                f"but forward op reported num_reqs={num_reqs}"
+            )
+        if arr.shape[0] == 0:
+            continue
+        if arr.shape[1] == 0:
+            out[key] = torch.empty((arr.shape[0], 0), dtype=torch.int32, device=device)
+            continue
+        # Fresh pinned stage per step (event-fenced; reuse races overlap).
+        # arr is a read-only zero-copy view over the C++ buffer; np.copyto
+        # reads it into our own writable pinned tensor (never writes back).
+        staged = torch.empty(
+            arr.shape, dtype=torch.int32, pin_memory=device.type == "cuda"
+        )
+        np.copyto(staged.numpy(), arr)
+        out[key] = staged.to(device, non_blocking=True)
+    return out
 
 
 def paged_cache_block_table_base_offsets_from_forward_op(
