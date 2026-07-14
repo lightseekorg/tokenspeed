@@ -23,6 +23,7 @@ if not _is_gfx950():
 from tokenspeed_kernel_amd.ops.moe import fused_mxfp_gfx950  # noqa: E402
 from tokenspeed_kernel_amd.ops.moe.fused_mxfp_gfx950 import (  # noqa: E402
     gluon_mxfp_dynamic_mxfp4_fused_moe,
+    gluon_mxfp_precomputed_mxfp4_fused_moe,
 )
 from tokenspeed_kernel_amd.ops.moe.gluon_a4w4_gfx950 import (  # noqa: E402
     gluon_mxfp4_moe_decode,
@@ -698,13 +699,16 @@ def test_package_mxfp4_decode_matches_reference_mfma_exact(num_tokens: int):
     torch.testing.assert_close(out.float(), expected.float(), rtol=0.0, atol=0.0)
 
 
-@pytest.mark.parametrize("num_tokens", [4, 8])
+@pytest.mark.parametrize("num_tokens", [3, 4, 8])
 def test_dynamic_mxfp4_dispatch_uses_mfma_with_topk(
     num_tokens: int,
     monkeypatch: pytest.MonkeyPatch,
 ):
     # At M in the precomputed-MFMA decode range the dispatch must route to the
-    # MFMA decode kernel and match it bit-exactly.
+    # MFMA decode kernel and match it bit-exactly. M=3 is the previously-gapped
+    # interval (_DIRECT_DECODE_MAX_M, _PRECOMPUTED_MFMA_MIN_M): the apply
+    # wrapper now forwards precomputed top-k for it too, so it must also match
+    # the MFMA reference exactly rather than falling back to logit routing.
     hidden_size = 1024
     intermediate_size = 512
     num_experts = 8
@@ -1156,3 +1160,226 @@ def test_dynamic_mxfp4_route_owned_kimi_sigmoid_mfma_decode(
         topk=topk,
     )
     torch.testing.assert_close(out.float(), expected.float(), rtol=0.0, atol=0.0)
+
+
+# ---------------------------------------------------------------------------
+# Precomputed entry point (``gluon_mxfp_precomputed_mxfp4_fused_moe``) dispatch.
+#
+# This is the entry consumed by ``gluon_mxfp4_precomputed_moe_apply`` (the
+# ``routing_mode="precomputed_topk"`` registered kernel). These tests pin down
+# its *current* dispatch behavior so we can validate the observation that,
+# unlike ``gluon_mxfp_dynamic_mxfp4_fused_moe``, it does NOT route to the decode
+# or package-prefill fast paths: every batch size falls through to the generic
+# ragged path. If we later wire the fast paths into this entry, these tests are
+# the ones that must change.
+# ---------------------------------------------------------------------------
+
+
+def _spy_precomputed_entry_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[dict[str, int], object]:
+    """Install spies on every dispatch helper the precomputed entry could hit.
+
+    Returns ``(counters, sentinel)`` where ``counters`` maps each helper to its
+    call count and ``sentinel`` is the object the stubbed ragged path returns.
+    The generic ragged path is stubbed so no real kernel launches are needed;
+    the decode / package-prefill helpers raise if the precomputed entry ever
+    reaches them.
+    """
+
+    counters: dict[str, int] = {
+        "package_prefill": 0,
+        "direct_decode": 0,
+        "mfma_decode": 0,
+        "fused_route": 0,
+        "route_from_topk": 0,
+        "ragged": 0,
+    }
+
+    def fail_package_prefill(*args, **kwargs):
+        counters["package_prefill"] += 1
+        raise AssertionError(
+            "precomputed entry unexpectedly reached the package-prefill path"
+        )
+
+    def fail_direct_decode(*args, **kwargs):
+        counters["direct_decode"] += 1
+        raise AssertionError(
+            "precomputed entry unexpectedly reached the direct MFMA decode path"
+        )
+
+    def fail_mfma_decode(*args, **kwargs):
+        counters["mfma_decode"] += 1
+        raise AssertionError(
+            "precomputed entry unexpectedly reached the precomputed-MFMA decode path"
+        )
+
+    def fake_fused_route(*args, **kwargs):
+        counters["fused_route"] += 1
+        return None, None, None, None
+
+    def fake_route_from_topk(*args, **kwargs):
+        counters["route_from_topk"] += 1
+        return None, None, None, None
+
+    sentinel = object()
+
+    def fake_ragged(*args, **kwargs):
+        counters["ragged"] += 1
+        return sentinel
+
+    monkeypatch.setattr(
+        fused_mxfp_gfx950, "_maybe_gluon_package_mxfp4_prefill", fail_package_prefill
+    )
+    monkeypatch.setattr(
+        fused_mxfp_gfx950,
+        "_maybe_precomputed_mxfp4_direct_mfma_decode",
+        fail_direct_decode,
+    )
+    monkeypatch.setattr(
+        fused_mxfp_gfx950,
+        "_maybe_precomputed_mxfp4_mfma_decode",
+        fail_mfma_decode,
+    )
+    monkeypatch.setattr(
+        fused_mxfp_gfx950, "gluon_precomputed_topk_fused_route", fake_fused_route
+    )
+    monkeypatch.setattr(fused_mxfp_gfx950, "_route_from_topk", fake_route_from_topk)
+    monkeypatch.setattr(
+        fused_mxfp_gfx950,
+        "_gluon_mxfp_dynamic_mxfp4_fused_moe_from_route",
+        fake_ragged,
+    )
+    return counters, sentinel
+
+
+def _make_dummy_weights_1x4(device: str = "cuda"):
+    # Rank-3 expert weight tensor so ``_extract_gluon_raw_w_unshuffled`` accepts
+    # it; the ragged path is stubbed so contents never get read.
+    w = torch.empty((1, 4, 4), device=device, dtype=torch.uint8)
+    scale = torch.empty((1, 4, 1), device=device, dtype=torch.uint8)
+    return w, scale
+
+
+@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8])
+def test_precomputed_entry_decode_sizes_use_ragged_not_fast_paths(
+    num_tokens: int,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Decode-sized batches must NOT reach decode/package-prefill from this entry.
+
+    This documents the gap versus ``gluon_mxfp_dynamic_mxfp4_fused_moe``: the
+    precomputed entry ignores the tuned decode kernels and always builds ragged
+    metadata + runs the generic matmul.
+    """
+    counters, sentinel = _spy_precomputed_entry_dispatch(monkeypatch)
+    w, scale = _make_dummy_weights_1x4()
+    topk_weights = torch.ones((num_tokens, 1), device="cuda", dtype=torch.float32)
+    topk_ids = torch.zeros((num_tokens, 1), device="cuda", dtype=torch.int32)
+    hidden = torch.empty((num_tokens, 8), device="cuda", dtype=torch.bfloat16)
+
+    out = gluon_mxfp_precomputed_mxfp4_fused_moe(
+        hidden,
+        topk_weights,
+        topk_ids,
+        w,
+        w,
+        w13_mx_scale=scale,
+        w2_mx_scale=scale,
+    )
+
+    assert out is sentinel
+    assert counters["ragged"] == 1
+    # The fast paths are never consulted.
+    assert counters["package_prefill"] == 0
+    assert counters["direct_decode"] == 0
+    assert counters["mfma_decode"] == 0
+    # Small-M uses the single-kernel fused route; either way we routed exactly
+    # once and never recomputed from logits.
+    assert counters["fused_route"] + counters["route_from_topk"] == 1
+
+
+def test_precomputed_entry_prefill_size_uses_ragged_not_package_prefill(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Prefill-sized batches must NOT reach the package-prefill path either."""
+    counters, sentinel = _spy_precomputed_entry_dispatch(monkeypatch)
+    w, scale = _make_dummy_weights_1x4()
+    num_tokens = 128
+    topk_weights = torch.ones((num_tokens, 1), device="cuda", dtype=torch.float32)
+    topk_ids = torch.zeros((num_tokens, 1), device="cuda", dtype=torch.int32)
+    hidden = torch.empty((num_tokens, 8), device="cuda", dtype=torch.bfloat16)
+
+    out = gluon_mxfp_precomputed_mxfp4_fused_moe(
+        hidden,
+        topk_weights,
+        topk_ids,
+        w,
+        w,
+        w13_mx_scale=scale,
+        w2_mx_scale=scale,
+    )
+
+    assert out is sentinel
+    assert counters["ragged"] == 1
+    assert counters["package_prefill"] == 0
+    assert counters["direct_decode"] == 0
+    assert counters["mfma_decode"] == 0
+    # Large M builds ragged metadata via the generic host route helper.
+    assert counters["route_from_topk"] == 1
+    assert counters["fused_route"] == 0
+
+
+def test_precomputed_entry_small_m_uses_fused_route(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Small-M precomputed entry uses the single-kernel fused route helper."""
+    counters, _sentinel = _spy_precomputed_entry_dispatch(monkeypatch)
+    w, scale = _make_dummy_weights_1x4()
+    # M=2, top_k=1 -> M < SMALLM_MAX_M and M*top_k <= GLUON_ROUTE_MAX_G.
+    topk_weights = torch.ones((2, 1), device="cuda", dtype=torch.float32)
+    topk_ids = torch.zeros((2, 1), device="cuda", dtype=torch.int32)
+    hidden = torch.empty((2, 8), device="cuda", dtype=torch.bfloat16)
+
+    gluon_mxfp_precomputed_mxfp4_fused_moe(
+        hidden,
+        topk_weights,
+        topk_ids,
+        w,
+        w,
+        w13_mx_scale=scale,
+        w2_mx_scale=scale,
+    )
+
+    assert counters["fused_route"] == 1
+    assert counters["route_from_topk"] == 0
+
+
+def test_precomputed_entry_rejects_missing_or_mismatched_topk():
+    """Shape/None validation on the precomputed entry."""
+    w, scale = _make_dummy_weights_1x4()
+    hidden = torch.empty((2, 8), device="cuda", dtype=torch.bfloat16)
+
+    # rank-1 topk_ids is rejected.
+    with pytest.raises(ValueError, match="rank-2"):
+        gluon_mxfp_precomputed_mxfp4_fused_moe(
+            hidden,
+            torch.ones((2,), device="cuda", dtype=torch.float32),
+            torch.zeros((2,), device="cuda", dtype=torch.int32),
+            w,
+            w,
+            w13_mx_scale=scale,
+            w2_mx_scale=scale,
+        )
+
+    # mismatched weights/ids shapes are rejected.
+    with pytest.raises(ValueError, match="same shape"):
+        gluon_mxfp_precomputed_mxfp4_fused_moe(
+            hidden,
+            torch.ones((2, 2), device="cuda", dtype=torch.float32),
+            torch.zeros((2, 1), device="cuda", dtype=torch.int32),
+            w,
+            w,
+            w13_mx_scale=scale,
+            w2_mx_scale=scale,
+        )

@@ -637,6 +637,162 @@ def test_gluon_mxfp4_swiglu_args_default_missing_values_to_standard_swiglu() -> 
     assert _moe_gluon_mxfp4._swiglu_args(w) == (1.702, 7.0, 1.0)
 
 
+def test_gluon_mxfp4_apply_priority_prefers_dynamic_over_precomputed() -> None:
+    """The dynamic gluon mxfp4 apply outranks the precomputed one.
+
+    ``moe_plan`` never requests a ``routing_mode`` trait, so both the
+    ``kernel_routing`` (dynamic) and ``precomputed_topk`` apply kernels match a
+    gluon mxfp4 plan's traits. Selection therefore falls to declared priority.
+    The dynamic entry (``SPECIALIZED + 3``) is the one that forwards caller
+    top-k into BOTH the decode and package-prefill fast paths, so it must win
+    over the precomputed entry (``SPECIALIZED + 2``), which only runs the
+    generic ragged path. This test pins that ordering so a future priority
+    bump doesn't silently route the AMD mxfp4 MoE onto the slower entry.
+    """
+    registry = KernelRegistry.get()
+    dynamic = registry.get_by_name("gluon_mxfp4_dynamic_moe_apply")
+    precomputed = registry.get_by_name("gluon_mxfp4_precomputed_moe_apply")
+    if dynamic is None or precomputed is None:
+        pytest.skip("gluon mxfp4 apply kernels are AMD-only")
+
+    # Trait profiles differ only by routing_mode; everything else that gates
+    # selection is identical, so priority is the tiebreaker.
+    assert dynamic.traits.get("routing_mode") == frozenset({"kernel_routing"})
+    assert precomputed.traits.get("routing_mode") == frozenset({"precomputed_topk"})
+    for trait in (
+        "weight_dtype",
+        "activation",
+        "internal_activation_dtype",
+        "supports_bias",
+        "ispp_alignment",
+    ):
+        assert dynamic.traits.get(trait) == precomputed.traits.get(trait)
+    assert dynamic.priority > precomputed.priority
+
+
+def test_gluon_mxfp4_plan_selects_dynamic_apply_on_cdna4(
+    mi350_platform: PlatformInfo,
+) -> None:
+    """A CDNA4 gluon mxfp4 plan resolves to the dynamic apply, not precomputed.
+
+    This is the end-to-end confirmation of the priority test above: with the
+    platform overridden to CDNA4 (so both AMD apply kernels satisfy their
+    capability gate), ``moe_plan`` picks ``gluon_mxfp4_dynamic_moe_apply``.
+    That is the entry whose decode + package-prefill paths honor precomputed
+    ``topk_weights`` / ``topk_ids``.
+    """
+    registry = KernelRegistry.get()
+    if registry.get_by_name("gluon_mxfp4_dynamic_moe_apply") is None:
+        pytest.skip("gluon mxfp4 apply kernels are AMD-only")
+
+    real_platform = Platform.get()
+    try:
+        Platform.override(mi350_platform)
+        registry.clear_cache()
+        plan = tokenspeed_kernel.moe_plan(
+            "mxfp4",
+            input_dtype=torch.bfloat16,
+            activation="swiglu",
+            ispp=128,
+            internal_activation_dtype="input",
+            with_bias=True,
+            solution="gluon",
+        )
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
+
+    _assert_moe_plan(
+        plan,
+        apply="gluon_mxfp4_dynamic_moe_apply",
+        preprocessor="gluon_mxfp4_gfx950_moe_weights",
+    )
+    # support_routing is True because the selected (dynamic) kernel advertises
+    # kernel_routing; precomputed top-k is still forwarded as an optimization.
+    assert plan["support_routing"] is True
+
+
+def _make_fake_gluon_mxfp4_layer(top_k: int) -> torch.nn.Module:
+    """Minimal ``w`` exposing only the attributes the apply wrapper reads.
+
+    The downstream ``gluon_mxfp_dynamic_mxfp4_fused_moe`` is spied on, so the
+    weight/scale tensors are never dereferenced by a real kernel launch.
+    """
+    w = torch.nn.Module()
+    w.top_k = top_k
+    w.w13_weight_triton_tensor = object()
+    w.w2_weight_triton_tensor = object()
+    w.w13_precision_config = type("PC", (), {"b_mx_scale": object()})()
+    w.w2_precision_config = type(
+        "PC", (), {"b_mx_scale": object(), "out_dtype": torch.bfloat16}
+    )()
+    return w
+
+
+@pytest.mark.parametrize(
+    "num_tokens, expect_forwarded",
+    [
+        (1, True),  # M <= _DIRECT_DECODE_MAX_M -> direct decode
+        (2, True),  # M == _DIRECT_DECODE_MAX_M -> direct decode
+        (3, True),  # previously-gapped interval (2, 4): now forwarded too
+        (4, True),  # M >= _PRECOMPUTED_MFMA_MIN_M -> precomputed MFMA decode
+        (16, True),  # large M still forwards for the generic precomputed route
+    ],
+)
+def test_gluon_mxfp4_dynamic_apply_forwards_precomputed_topk_by_batch_size(
+    num_tokens: int,
+    expect_forwarded: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for precomputed-top-k forwarding across batch sizes.
+
+    ``gluon_mxfp4_dynamic_moe_apply`` now forwards the caller's precomputed
+    ``topk_weights`` / ``topk_ids`` for every batch size when they are
+    supplied, and lets the downstream dispatch pick the tuned kernel. This
+    guards against regressing the old M=3 gap, where batches in the open
+    interval (_DIRECT_DECODE_MAX_M, _PRECOMPUTED_MFMA_MIN_M) silently dropped
+    the precomputed top-k and recomputed routing from ``router_logits``.
+    """
+    if not hasattr(_moe_gluon_mxfp4, "gluon_mxfp4_dynamic_moe_apply"):
+        pytest.skip("gluon mxfp4 dynamic apply is AMD-only")
+
+    captured: dict[str, object] = {}
+
+    def fake_fused_moe(*args, **kwargs):
+        captured["precomputed_topk_weights"] = kwargs.get("precomputed_topk_weights")
+        captured["precomputed_topk_ids"] = kwargs.get("precomputed_topk_ids")
+        return "sentinel"
+
+    monkeypatch.setattr(
+        _moe_gluon_mxfp4, "gluon_mxfp_dynamic_mxfp4_fused_moe", fake_fused_moe
+    )
+
+    w = _make_fake_gluon_mxfp4_layer(top_k=1)
+    x = torch.empty((num_tokens, 16), dtype=torch.bfloat16)
+    router_logits = torch.empty((num_tokens, 8), dtype=torch.float32)
+    topk_weights = torch.ones((num_tokens, 1), dtype=torch.float32)
+    topk_ids = torch.zeros((num_tokens, 1), dtype=torch.int32)
+
+    out = _moe_gluon_mxfp4.gluon_mxfp4_dynamic_moe_apply(
+        {},
+        x,
+        w,
+        router_logits,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+    )
+
+    assert out == "sentinel"
+    if expect_forwarded:
+        assert captured["precomputed_topk_weights"] is topk_weights
+        assert captured["precomputed_topk_ids"] is topk_ids
+    else:
+        # Reserved for batch sizes that intentionally drop precomputed top-k;
+        # currently none do, so this branch guards against a future regression.
+        assert captured["precomputed_topk_weights"] is None
+        assert captured["precomputed_topk_ids"] is None
+
+
 def _moe_apply_unquant_trtllm() -> object:
     plan = tokenspeed_kernel.moe_plan(
         "unquant",
