@@ -571,7 +571,8 @@ class EventLoop:
 
         config = self._kv_events_config
         hash_mode = config.hash_mode if config is not None else "fnv"
-        # Device-tier scheduler events are GPU; host/disk come in later phases.
+        # medium="gpu" is the fallback for events without tier (older bindings);
+        # host-tiered events override to medium="cpu" via _tier_to_medium.
         events = scheduler_kv_events_to_wire_events(
             raw_events,
             hash_mode=hash_mode,

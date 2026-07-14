@@ -244,6 +244,23 @@ def scheduler_kv_event_to_wire_event(
     raise TypeError(f"Unsupported scheduler KV event kind: {kind}")
 
 
+def _tier_to_medium(event: Any) -> Optional[str]:
+    """Map scheduler ``KvEventTier`` to RFC #1527 wire ``medium``.
+
+    ``KvEventTier.kDevice`` / ``0`` / default → ``"gpu"``.
+    ``KvEventTier.kHost`` / ``1`` → ``"cpu"``.
+    Missing ``tier`` (older bindings) → ``None`` so callers can fall back.
+    """
+    tier = getattr(event, "tier", None)
+    if tier is None:
+        return None
+    # nanobind may expose the enum as either the enum type or an int
+    value = int(tier) if not isinstance(tier, int) else tier
+    if value == 1:  # Host
+        return "cpu"
+    return "gpu"  # Device default
+
+
 def scheduler_kv_events_to_wire_events(
     events: Iterable[Any],
     hash_mode: Literal["fnv", "xxh3"] = "fnv",
@@ -257,24 +274,28 @@ def scheduler_kv_events_to_wire_events(
         events: Scheduler-native KV events (e.g. from ``drain_kv_events``).
         hash_mode: Block hash mode passed through to the translator.
         config: When set, each wire event is annotated via ``apply_envelope``.
-        medium: Storage tier for the envelope (``"gpu"`` | ``"cpu"`` | ``"disk"``).
-            Callers must pass this explicitly for tiered events; default ``None``
-            leaves ``medium`` unset. Ignored when ``config`` is ``None`` or
-            ``wire_format=legacy``.
+        medium: Fallback storage tier for the envelope when an event has no
+            ``tier`` (``"gpu"`` | ``"cpu"`` | ``"disk"``). Per-event
+            ``tier`` overrides this via ``_tier_to_medium``. Default ``None``
+            leaves ``medium`` unset when tier is also absent. Ignored when
+            ``config`` is ``None`` or ``wire_format=legacy``.
         dp_rank: Optional data-parallel rank forwarded to ``apply_envelope``.
 
     Returns:
         Wire event structs ready for ``KVEventBatch`` publishing.
     """
-    wire_events = [
-        scheduler_kv_event_to_wire_event(event, hash_mode=hash_mode) for event in events
-    ]
     if config is None:
-        return wire_events
-    return [
-        apply_envelope(event, config, medium=medium, dp_rank=dp_rank)
-        for event in wire_events
-    ]
+        return [
+            scheduler_kv_event_to_wire_event(event, hash_mode=hash_mode)
+            for event in events
+        ]
+    wire_events: list[Union[BlockStored, BlockRemoved]] = []
+    for raw in events:
+        wire = scheduler_kv_event_to_wire_event(raw, hash_mode=hash_mode)
+        event_medium = _tier_to_medium(raw) or medium
+        apply_envelope(wire, config, medium=event_medium, dp_rank=dp_rank)
+        wire_events.append(wire)
+    return wire_events
 
 
 def drain_scheduler_kv_events(scheduler: Any, enabled: bool) -> list[Any]:

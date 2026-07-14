@@ -342,6 +342,112 @@ def test_scheduler_kv_events_to_wire_events_tags_medium_gpu_for_rfc1527() -> Non
     assert events[0].model_name == "m"
 
 
+def test_scheduler_kv_events_tier_host_maps_to_medium_cpu() -> None:
+    """KvEventTier.kHost / 1 → wire medium=cpu under rfc1527."""
+    raw = SimpleNamespace(
+        kind="BlockStored",
+        block_hashes=[456],
+        parent_block_hash=None,
+        token_ids=[1, 2],
+        block_size=2,
+        tier=1,  # KvEventTier.kHost
+    )
+    config = KVEventsConfig(
+        wire_format="rfc1527",
+        backend_id="worker-0",
+        publish_medium=True,
+    )
+
+    events = scheduler_kv_events_to_wire_events([raw], config=config, medium="gpu")
+
+    assert events[0].medium == "cpu"
+
+
+def test_scheduler_kv_events_tier_device_maps_to_medium_gpu() -> None:
+    """KvEventTier.kDevice / 0 → wire medium=gpu when caller passes medium=gpu."""
+    raw = SimpleNamespace(
+        kind="BlockStored",
+        block_hashes=[789],
+        parent_block_hash=None,
+        token_ids=[3, 4],
+        block_size=2,
+        tier=0,  # KvEventTier.kDevice
+    )
+    config = KVEventsConfig(
+        wire_format="rfc1527",
+        backend_id="worker-0",
+        publish_medium=True,
+    )
+
+    events = scheduler_kv_events_to_wire_events([raw], config=config, medium="gpu")
+
+    assert events[0].medium == "gpu"
+
+
+def test_scheduler_kv_events_missing_tier_uses_caller_medium_fallback() -> None:
+    """Older bindings without tier fall back to the caller's medium= argument."""
+    raw = SimpleNamespace(
+        kind="BlockRemoved",
+        block_hashes=[1, 2],
+        # no tier attribute
+    )
+    config = KVEventsConfig(
+        wire_format="rfc1527",
+        backend_id="worker-0",
+        publish_medium=True,
+    )
+
+    events = scheduler_kv_events_to_wire_events([raw], config=config, medium="gpu")
+
+    assert events[0].medium == "gpu"
+
+
+def test_scheduler_kv_events_mixed_device_and_host_tiers() -> None:
+    """Batch of device + host stored events get correct per-event mediums."""
+
+    class _FakeTier:
+        """Stand-in for nanobind enum that is not an int but coerces via int()."""
+
+        def __init__(self, value: int) -> None:
+            self._value = value
+
+        def __int__(self) -> int:
+            return self._value
+
+    device = SimpleNamespace(
+        kind="BlockStored",
+        block_hashes=[111],
+        parent_block_hash=None,
+        token_ids=[1],
+        block_size=1,
+        tier=0,
+    )
+    host = SimpleNamespace(
+        kind="BlockStored",
+        block_hashes=[222],
+        parent_block_hash=111,
+        token_ids=[2],
+        block_size=1,
+        tier=1,
+    )
+    host_enum = SimpleNamespace(
+        kind="BlockRemoved",
+        block_hashes=[222],
+        tier=_FakeTier(1),
+    )
+    config = KVEventsConfig(
+        wire_format="rfc1527",
+        backend_id="worker-0",
+        publish_medium=True,
+    )
+
+    events = scheduler_kv_events_to_wire_events(
+        [device, host, host_enum], config=config, medium="gpu"
+    )
+
+    assert [e.medium for e in events] == ["gpu", "cpu", "cpu"]
+
+
 def test_scheduler_kv_events_to_wire_events_default_medium_is_none() -> None:
     """Callers must pass medium explicitly; default leaves the field unset."""
     raw = SimpleNamespace(

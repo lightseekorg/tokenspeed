@@ -204,6 +204,9 @@ positional arrays), which Dynamo's ZMQ relay accepts:
 Unset optional fields are omitted via msgspec `omit_defaults`. With
 `wire_format=rfc1527`, RFC #1527 envelope fields (`backend_id`, `medium`,
 `dp_rank`, `model_name`, `tenant_id`, `event_id`) may also appear on events.
+`medium` is derived from the scheduler event `tier` when present
+(`device`/`0` → `gpu`, `host`/`1` → `cpu`); older events without `tier` keep
+the publisher fallback (`gpu` for device-path publishes).
 `event_id` is assigned monotonically per stream keyed by
 `(model_name, block_size, backend_id, medium, dp_rank)`, starting at `0`.
 The default `wire_format=legacy` leaves those fields unset so payloads stay
