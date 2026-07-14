@@ -514,6 +514,28 @@ def _assert_topk_matches(
         assert (actual[token, count:] == -1).all()
 
 
+def _strided_last_dim(tensor: torch.Tensor) -> torch.Tensor:
+    backing = torch.empty(
+        (*tensor.shape[:-1], tensor.shape[-1] * 2),
+        device=tensor.device,
+        dtype=tensor.dtype,
+    )
+    view = backing[..., ::2]
+    view.copy_(tensor)
+    return view
+
+
+def _strided_1d(tensor: torch.Tensor) -> torch.Tensor:
+    backing = torch.empty(
+        (tensor.shape[0] * 2,),
+        device=tensor.device,
+        dtype=tensor.dtype,
+    )
+    view = backing[::2]
+    view.copy_(tensor)
+    return view
+
+
 @pytest.mark.parametrize(
     "case",
     _GLM52_TOPK_DECODE_CASES,
@@ -561,6 +583,57 @@ def test_dsa_decode_topk_fp8_glm52_cases(case: _TopKDecodeCase) -> None:
         topk=case.topk,
         softmax_scale=softmax_scale,
         q_len_per_req=case.q_len_per_req,
+    )
+
+    _assert_topk_matches(topk_slots, topk_lens, expected_slots, expected_lens)
+
+
+def test_dsa_decode_topk_fp8_accepts_strided_inputs() -> None:
+    device = "cuda"
+    page_size = 64
+    head_dim = 128
+    topk = 512
+    softmax_scale = head_dim**-0.5
+    gen = _generator(device, 121)
+    seq_lens_tuple = (640, 704)
+    block_table, num_slots = _make_decode_block_table(seq_lens_tuple, page_size, device)
+    tokens = len(seq_lens_tuple)
+    q = _strided_last_dim(
+        _randn_bf16((tokens, 1, head_dim), device=device, generator=gen)
+    )
+    weights = _strided_last_dim(
+        _normal_weights((tokens, 1), device=device, generator=gen)
+    )
+    packed_index_k, index_k = _pack_index_k_cache(
+        _randn_bf16((num_slots, head_dim), device=device, generator=gen),
+        page_size,
+    )
+    seq_lens = _strided_1d(
+        torch.tensor(seq_lens_tuple, device=device, dtype=torch.int32)
+    )
+    block_table = _strided_last_dim(block_table)
+    packed_index_k = _strided_last_dim(packed_index_k)
+
+    topk_slots, topk_lens = gluon_dsa_decode_topk_fp8_gfx950(
+        q,
+        weights,
+        seq_lens,
+        block_table,
+        page_size=page_size,
+        topk=topk,
+        softmax_scale=softmax_scale,
+        q_len_per_req=1,
+        index_k_cache=packed_index_k,
+    )
+    expected_slots, expected_lens = _reference_decode_topk(
+        q,
+        weights,
+        index_k,
+        seq_lens,
+        block_table,
+        page_size=page_size,
+        topk=topk,
+        softmax_scale=softmax_scale,
     )
 
     _assert_topk_matches(topk_slots, topk_lens, expected_slots, expected_lens)

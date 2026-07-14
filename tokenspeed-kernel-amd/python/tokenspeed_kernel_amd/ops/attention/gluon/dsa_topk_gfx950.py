@@ -69,19 +69,20 @@ def _find_topk_threshold_key(
     layout: gl.constexpr,
 ):
     keys = _fp32_to_ordered_key(values)
-    prefix = gl.full((), 0, dtype=gl.uint32)
-    remaining = gl.full((), topk, dtype=gl.int32)
+    prefix = 0
+    remaining = topk
 
+    # Ordered FP32 keys are searched from the most-significant 4-bit nibble down.
     for shift in gl.static_range(28, -1, -4):
         if shift == 28:
             prefix_match = valid
         else:
             prefix_match = valid & ((keys >> (shift + 4)) == prefix)
         bucket = (keys >> shift) & 0xF
-        cumulative = gl.full((), 0, dtype=gl.int32)
-        selected = gl.full((), 0, dtype=gl.uint32)
+        cumulative = 0
+        selected = 0
         selected_remaining = remaining
-        found = gl.full((), 0, dtype=gl.int32)
+        found = 0
 
         for bucket_id in gl.static_range(15, -1, -1):
             in_bucket = prefix_match & (bucket == bucket_id)
@@ -360,10 +361,10 @@ def _dsa_radix_update_kernel(
     tile_mask = tile_offsets < hist_tiles
     row_hist = hist + row * hist_tiles * 16
     kth = gl.load(remaining + row).to(gl.int32)
-    cumulative = gl.full((), 0, dtype=gl.int32)
-    selected = gl.full((), 0, dtype=gl.uint32)
+    cumulative = 0
+    selected = 0
     selected_remaining = kth
-    found = gl.full((), 0, dtype=gl.int32)
+    found = 0
 
     for bucket_desc in gl.static_range(0, 16):
         bucket_id = 15 - bucket_desc
@@ -515,14 +516,22 @@ def _dsa_prefill_radix_scatter_kernel(
     gl.store(out + row * out_stride + equal_pos, local, mask=equal_write)
 
 
-def _next_power_of_2(value: int) -> int:
-    if value <= 1:
-        return 1
-    return 1 << (int(value) - 1).bit_length()
-
-
 def _load_elems(block: int, num_warps: int) -> int:
     return max(1, triton.cdiv(int(block), 64 * int(num_warps)))
+
+
+def _contiguous(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor if tensor.is_contiguous() else tensor.contiguous()
+
+
+def _to_contiguous(
+    tensor: torch.Tensor,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    tensor = tensor.to(device=device, dtype=dtype)
+    return _contiguous(tensor)
 
 
 def _validate_topk(topk: int) -> None:
@@ -547,7 +556,7 @@ def _dsa_radix_scratch(
     prefixes = torch.empty((rows,), dtype=torch.int32, device=device)
     remaining = torch.empty((rows,), dtype=torch.int32, device=device)
     counters = torch.empty((rows, 2), dtype=torch.int32, device=device)
-    block_tiles = _next_power_of_2(tiles)
+    block_tiles = triton.next_power_of_2(tiles)
     return hist, prefixes, remaining, counters, tiles, block_tiles
 
 
@@ -564,6 +573,7 @@ def _run_radix_prefix_passes(
 ) -> None:
     hist_load_elems = _load_elems(_RADIX_TOPK_BLOCK_N, 8)
     update_load_elems = _load_elems(block_tiles, 8)
+    # Ordered FP32 keys have 8 nibbles; each pass fixes one more prefix nibble.
     for shift in range(28, -1, -4):
         _dsa_radix_hist_kernel[(rows, tiles)](
             logits,
@@ -757,14 +767,11 @@ def gluon_dsa_decode_topk_fp8_gfx950(
             else lens_out
         )
         return empty_out, empty_lens
-    if not q.is_cuda:
-        raise RuntimeError("DSA Gluon FP8 decode top-k requires CUDA tensors")
-
-    q = q.contiguous()
-    index_k_cache = index_k_cache.contiguous()
-    weights = weights.contiguous()
-    seq_lens = seq_lens.to(device=q.device, dtype=torch.int32).contiguous()
-    block_table = block_table.to(device=q.device, dtype=torch.int32).contiguous()
+    q = _contiguous(q)
+    index_k_cache = _contiguous(index_k_cache)
+    weights = _contiguous(weights)
+    seq_lens = _to_contiguous(seq_lens, device=q.device, dtype=torch.int32)
+    block_table = _to_contiguous(block_table, device=q.device, dtype=torch.int32)
     max_seq_len = int(block_table.shape[1]) * int(page_size)
     if out is None:
         out = torch.empty((q.shape[0], topk), dtype=torch.int32, device=q.device)
@@ -809,7 +816,7 @@ def gluon_dsa_decode_topk_fp8_gfx950(
         )
 
     select_warps = 8
-    select_block = _next_power_of_2(max(max_seq_len, topk))
+    select_block = triton.next_power_of_2(max(max_seq_len, topk))
     _dsa_decode_select_topk_kernel[(q.shape[0],)](
         logits,
         block_table,
@@ -872,17 +879,14 @@ def gluon_dsa_prefill_topk_fp8_gfx950(
         lens_out = torch.empty((q.shape[0],), dtype=torch.int32, device=q.device)
     if q.shape[0] == 0:
         return out, lens_out
-    if not q.is_cuda:
-        raise RuntimeError("DSA Gluon FP8 prefill top-k requires CUDA tensors")
-
-    q = q.contiguous()
-    index_k_cache = index_k_cache.contiguous()
-    weights = weights.contiguous()
-    kv_workspace_slots = kv_workspace_slots.to(
-        device=q.device, dtype=torch.int64
-    ).contiguous()
-    row_starts = row_starts.to(device=q.device, dtype=torch.int32).contiguous()
-    row_ends = row_ends.to(device=q.device, dtype=torch.int32).contiguous()
+    q = _contiguous(q)
+    index_k_cache = _contiguous(index_k_cache)
+    weights = _contiguous(weights)
+    kv_workspace_slots = _to_contiguous(
+        kv_workspace_slots, device=q.device, dtype=torch.int64
+    )
+    row_starts = _to_contiguous(row_starts, device=q.device, dtype=torch.int32)
+    row_ends = _to_contiguous(row_ends, device=q.device, dtype=torch.int32)
     seq_len_sum = int(kv_workspace_slots.numel())
     if seq_len_sum == 0:
         out.fill_(-1)
@@ -895,7 +899,7 @@ def gluon_dsa_prefill_topk_fp8_gfx950(
         max_query_rows = max(1, int(max_logits_bytes) // (max(seq_len_sum, 1) * 4))
     block_n = 32
     select_warps = 8
-    select_block = _next_power_of_2(max(seq_len_sum, topk))
+    select_block = triton.next_power_of_2(max(seq_len_sum, topk))
     for start in range(0, q.shape[0], max_query_rows):
         end = min(start + max_query_rows, q.shape[0])
         logits = torch.empty(
