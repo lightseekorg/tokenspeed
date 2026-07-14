@@ -508,6 +508,16 @@ async def health_generate(request: Request):
     return await _proxy_to_rl_control(request)
 
 
+@app.get("/get_weight_version")
+async def get_weight_version(request: Request):
+    return await _proxy_to_rl_control(request)
+
+
+@app.post("/update_weight_version")
+async def update_weight_version(request: Request):
+    return await _proxy_to_rl_control(request)
+
+
 # ---------------------------------------------------------------------------
 # Server lifecycle
 # ---------------------------------------------------------------------------

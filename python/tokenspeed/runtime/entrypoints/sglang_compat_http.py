@@ -169,8 +169,13 @@ async def update_weights_from_distributed(request: Request) -> JSONResponse:
             shapes=shapes,
             group_name=str(body.get("group_name", "weight_update_group")),
             flush_cache=bool(body.get("flush_cache", False)),
+            weight_version=body.get("weight_version"),
         )
         success, message = await _llm(request).update_weights_from_distributed(obj)
+        if success and obj.weight_version is not None:
+            llm = _llm(request)
+            llm.server_args.weight_version = obj.weight_version
+            message += f" Weight version updated to {obj.weight_version}."
         return {"success": success, "message": message}
 
     return await _guarded(_do)
@@ -185,8 +190,13 @@ async def update_weights_from_tensor(request: Request) -> JSONResponse:
             serialized_named_tensors=body["serialized_named_tensors"],
             load_format=body.get("load_format"),
             flush_cache=bool(body.get("flush_cache", False)),
+            weight_version=body.get("weight_version"),
         )
         success, message = await _llm(request).update_weights_from_tensor(obj)
+        if success and obj.weight_version is not None:
+            llm = _llm(request)
+            llm.server_args.weight_version = obj.weight_version
+            message += f" Weight version updated to {obj.weight_version}."
         return {"success": success, "message": message}
 
     return await _guarded(_do)
@@ -200,8 +210,13 @@ async def update_weights_from_disk(request: Request) -> JSONResponse:
         obj = UpdateWeightFromDiskReqInput(
             model_path=str(body["model_path"]),
             load_format=body.get("load_format"),
+            weight_version=body.get("weight_version"),
         )
         success, message, *_ = await _llm(request).update_weights_from_disk(obj)
+        if success and obj.weight_version is not None:
+            llm = _llm(request)
+            llm.server_args.weight_version = obj.weight_version
+            message += f" Weight version updated to {obj.weight_version}."
         return {"success": success, "message": message}
 
     return await _guarded(_do)
@@ -290,6 +305,42 @@ async def abort_request(request: Request) -> JSONResponse:
 @router.get("/health_generate")
 async def health_generate() -> JSONResponse:
     return JSONResponse({"status": "ok"})
+
+
+@router.get("/get_weight_version")
+async def get_weight_version(request: Request) -> JSONResponse:
+    llm = _llm(request)
+    return JSONResponse({"weight_version": llm.server_args.weight_version})
+
+
+@router.post("/update_weight_version")
+async def update_weight_version(request: Request) -> JSONResponse:
+    body = await request.json()
+
+    async def _do() -> dict[str, Any]:
+        new_version = body.get("new_version")
+        if new_version is None:
+            raise ValueError("Missing 'new_version' in request body")
+        llm = _llm(request)
+        llm.server_args.weight_version = str(new_version)
+        return {
+            "success": True,
+            "message": f"Weight version updated to {new_version}",
+            "new_version": str(new_version),
+        }
+
+    return await _guarded(_do)
+
+
+@router.get("/model_info")
+async def model_info(request: Request) -> JSONResponse:
+    llm = _llm(request)
+    return JSONResponse(
+        {
+            "model_path": llm.server_args.model,
+            "weight_version": llm.server_args.weight_version,
+        }
+    )
 
 
 # --------------------------------------------------------------------------- #
