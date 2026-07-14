@@ -236,6 +236,36 @@ spans, so disk hashes may intentionally differ from GPU/CPU hashes until that
 plumbing lands; identity for multi-tier aggregation still relies on the shared
 `backend_id`.
 
+#### Mooncake master publisher relay (scaffold)
+
+For DaemonSet / decoupled cache topologies, Mooncake master can publish RFC
+#1527 KV events (PR
+[#2214](https://github.com/kvcache-ai/Mooncake/pull/2214)). TokenSpeed accepts
+an optional nested `kv_events` object inside
+`--kvstore-storage-backend-extra-config`:
+
+```json
+{
+  "master_server_address": "mooncake-master:50051",
+  "kv_events": {
+    "source": "engine|master|both",
+    "master_subscribe_endpoint": "tcp://mooncake-master:6000",
+    "backend_id": "node-3-cache-daemon"
+  }
+}
+```
+
+- `source=engine` (default): engine publishes L3/disk events (current
+  behavior). Master subscribe is not attempted.
+- `source=master`: skip engine L3 disk publish; attempt master SUB relay.
+- `source=both`: keep engine L3 publish and also attempt master SUB.
+
+Master relay is a **safe scaffold** pending Mooncake master publisher
+availability in the installed SDK: if the subscribe endpoint is missing or the
+event API is unavailable, TokenSpeed logs a warning and stays idle
+(fail-open) without crashing the engine. A production ZMQ poll loop will land
+once the master publisher is ready.
+
 With attention data parallelism, each attention DP rank publishes on an offset
 port from the configured endpoint.
 

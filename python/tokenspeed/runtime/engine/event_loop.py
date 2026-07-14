@@ -19,6 +19,7 @@
 # SOFTWARE.
 
 import faulthandler
+import json
 import queue
 import signal
 import time
@@ -90,6 +91,11 @@ from tokenspeed.runtime.pd.kv_events import (
     scheduler_kv_events_to_wire_events,
 )
 from tokenspeed.runtime.pd.mooncake.entities import ManagerArgs
+from tokenspeed.runtime.pd.mooncake_kv_events import (
+    MooncakeMasterEventSubscriber,
+    engine_publishes_l3_disk,
+    parse_mooncake_kv_events_config,
+)
 from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 from tokenspeed.runtime.utils import (
@@ -321,12 +327,37 @@ class EventLoop:
         # ``_publish_scheduler_kv_events`` so EventIdAllocator stays
         # single-threaded.
         self._pending_l3_kv_events: queue.Queue = queue.Queue()
+        # Mooncake L3 source: engine (default), master, or both. When
+        # source=master, skip engine L3 callbacks to avoid duplicate disk
+        # events once the master publisher (PR #2214) is the authority.
+        mooncake_extra: dict = {}
+        raw_extra = server_args.kvstore_storage_backend_extra_config
+        if raw_extra:
+            try:
+                parsed = json.loads(raw_extra)
+                if isinstance(parsed, dict):
+                    mooncake_extra = parsed
+            except json.JSONDecodeError:
+                logger.warning(
+                    "Invalid kvstore_storage_backend_extra_config JSON; "
+                    "mooncake kv_events defaults to source=engine."
+                )
+        self._mooncake_kv_events_config = parse_mooncake_kv_events_config(
+            mooncake_extra
+        )
+        self._mooncake_master_kv_subscriber = MooncakeMasterEventSubscriber(
+            self._mooncake_kv_events_config
+        )
+        if self._kv_events_enabled:
+            self._mooncake_master_kv_subscriber.start()
+
         on_l3_blocks_stored = None
         on_l3_all_cleared = None
         if (
             self._kv_events_enabled
             and self._kv_events_config is not None
             and "disk" in self._kv_events_config.publish_tiers
+            and engine_publishes_l3_disk(self._mooncake_kv_events_config)
         ):
             on_l3_blocks_stored = self._enqueue_l3_blocks_stored
             on_l3_all_cleared = self._enqueue_l3_all_cleared
@@ -613,6 +644,7 @@ class EventLoop:
             self._kv_events_enabled
             and config is not None
             and "disk" in config.publish_tiers
+            and engine_publishes_l3_disk(self._mooncake_kv_events_config)
         )
         block_size = self.server_args.block_size
         events = []

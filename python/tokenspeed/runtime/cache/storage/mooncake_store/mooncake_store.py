@@ -69,6 +69,11 @@ class MooncakeStoreConfig:
     master_server_address: str
     master_metrics_port: int
     check_server: bool
+    # Optional nested ``extra_config["kv_events"]`` (RFC #1527 / PR #2214).
+    # Defaults keep engine-side L3 publish; see mooncake_kv_events.py.
+    kv_events_source: str = "engine"
+    kv_events_master_subscribe_endpoint: str | None = None
+    kv_events_backend_id: str | None = None
 
     @staticmethod
     def from_file() -> "MooncakeStoreConfig":
@@ -148,6 +153,14 @@ class MooncakeStoreConfig:
         if "master_server_address" not in extra_config:
             raise ValueError("master_server_address is required in extra_config")
 
+        # Lazy import: keep torch-free unit tests and avoid a hard cycle with
+        # pd.mooncake_kv_events → kv_events.
+        from tokenspeed.runtime.pd.mooncake_kv_events import (
+            parse_mooncake_kv_events_config,
+        )
+
+        kv_events = parse_mooncake_kv_events_config(extra_config)
+
         return MooncakeStoreConfig(
             local_hostname=extra_config.get(
                 "local_hostname", envs.MOONCAKE_LOCAL_HOSTNAME.default
@@ -169,6 +182,9 @@ class MooncakeStoreConfig:
             check_server=extra_config.get(
                 "check_server", envs.MOONCAKE_CHECK_SERVER.default
             ),
+            kv_events_source=kv_events.source,
+            kv_events_master_subscribe_endpoint=kv_events.master_subscribe_endpoint,
+            kv_events_backend_id=kv_events.backend_id,
         )
 
 
