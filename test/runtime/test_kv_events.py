@@ -340,6 +340,27 @@ def test_scheduler_kv_events_to_wire_events_tags_medium_gpu_for_rfc1527() -> Non
     assert events[0].model_name == "m"
 
 
+def test_scheduler_kv_events_to_wire_events_default_medium_is_none() -> None:
+    """Callers must pass medium explicitly; default leaves the field unset."""
+    raw = SimpleNamespace(
+        kind="BlockStored",
+        block_hashes=[123],
+        parent_block_hash=None,
+        token_ids=[1, 2],
+        block_size=2,
+    )
+    config = KVEventsConfig(
+        wire_format="rfc1527",
+        backend_id="worker-0",
+        publish_medium=True,
+    )
+
+    events = scheduler_kv_events_to_wire_events([raw], config=config)
+
+    assert events[0].backend_id == "worker-0"
+    assert events[0].medium is None
+
+
 def test_scheduler_kv_events_to_wire_events_legacy_omits_medium() -> None:
     raw = SimpleNamespace(
         kind="BlockStored",
