@@ -179,11 +179,11 @@ Req: chatcmpl-019ef6b7 Finish! RequestStats(status='finished', reason='stop', pr
 
 ### KV Cache Events
 
-KV cache events publish reusable device prefix-cache mutations from the live
-C++ scheduler path. Host/L2 loadback events are not published by this initial
-stream. Block hash lineage is cached on prefix-cache nodes, so publishing a
-stored block uses the parent node's cached hash instead of rebuilding the full
-ancestor prefix.
+KV cache events publish reusable prefix-cache mutations from the live C++
+scheduler path (device/GPU and host/CPU tiers) and, when enabled, Mooncake L3
+(disk) backup/clear paths. Block hash lineage is cached on prefix-cache nodes,
+so publishing a stored block uses the parent node's cached hash instead of
+rebuilding the full ancestor prefix.
 
 Example:
 
@@ -206,19 +206,35 @@ Unset optional fields are omitted via msgspec `omit_defaults`. With
 `dp_rank`, `model_name`, `tenant_id`, `event_id`) may also appear on events.
 `medium` is derived from the scheduler event `tier` when present
 (`device`/`0` → `gpu`, `host`/`1` → `cpu`); older events without `tier` keep
-the publisher fallback (`gpu` for device-path publishes).
-`event_id` is assigned monotonically per stream keyed by
-`(model_name, block_size, backend_id, medium, dp_rank)`, starting at `0`.
-The default `wire_format=legacy` leaves those fields unset so payloads stay
-Dynamo-compatible.
+the publisher fallback (`gpu` for device-path publishes). Disk-path publishes
+set `medium="disk"` explicitly. `event_id` is assigned monotonically per stream
+keyed by `(model_name, block_size, backend_id, medium, dp_rank)`, starting at
+`0`. The default `wire_format=legacy` leaves those fields unset so payloads
+stay Dynamo-compatible.
+
+#### Multi-tier deduplication (gpu / cpu / disk)
+
+Each tier publish is **independent**: when the same logical block is present on
+GPU, host, and Mooncake at once, TokenSpeed emits a separate event per tier
+(distinct `medium`). Indexers that follow [Dynamo PR
+#8912](https://github.com/ai-dynamo/dynamo/pull/8912) **aggregate those events
+cumulatively** as per-instance tier counts — they must not open duplicate
+radix entries for the same worker. That contract requires a single shared
+`backend_id` across all tier publish paths for one worker (set once on
+`KVEventsConfig` / `TOKENSPEED_KV_EVENTS_BACKEND_ID` and applied by
+`apply_envelope` for every medium). Do not configure different `backend_id`
+values for GPU, host, and disk on the same worker.
 
 `publish_tiers` (default `["gpu"]`) selects which storage tiers to publish.
 Include `"disk"` (e.g. `["gpu","cpu","disk"]`) to emit `medium="disk"`
 `BlockStored` events when Mooncake L3 backup succeeds, and
 `AllBlocksCleared` when the Mooncake store is cleared (`remove_all`).
-Disk hashes are an
-interim mapping from Mooncake SHA256 hex storage keys via XXH3-64 seed 1337
-(empty `token_ids`) until `BackUpOp` carries token page spans.
+GPU and host events for the same token page share scheduler `block_hashes`.
+Disk hashes are an interim mapping from Mooncake SHA256 hex storage keys via
+XXH3-64 seed 1337 (empty `token_ids`) until `BackUpOp` carries token page
+spans, so disk hashes may intentionally differ from GPU/CPU hashes until that
+plumbing lands; identity for multi-tier aggregation still relies on the shared
+`backend_id`.
 
 With attention data parallelism, each attention DP rank publishes on an offset
 port from the configured endpoint.

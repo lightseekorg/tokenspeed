@@ -17,6 +17,7 @@ from tokenspeed.runtime.pd.kv_events import (
     KVEventsConfig,
     apply_envelope,
     l3_storage_keys_to_disk_events,
+    scheduler_kv_events_to_wire_events,
 )
 
 
@@ -333,3 +334,85 @@ def test_apply_envelope_all_blocks_cleared_medium_disk() -> None:
 
     assert annotated.medium == "disk"
     assert annotated.backend_id == "w"
+
+
+def test_apply_envelope_same_backend_id_across_gpu_cpu_disk() -> None:
+    """Shared KVEventsConfig → identical backend_id for every medium."""
+    config = KVEventsConfig(
+        wire_format="rfc1527",
+        backend_id="worker-0",
+        publish_medium=True,
+        model_name="test-model",
+    )
+
+    annotated = []
+    for medium in ("gpu", "cpu", "disk"):
+        event = BlockStored(
+            block_hashes=[0xABC],
+            parent_block_hash=None,
+            token_ids=[1, 2, 3, 4] if medium != "disk" else [],
+            block_size=4,
+        )
+        annotated.append(apply_envelope(event, config, medium=medium))
+
+    assert [e.backend_id for e in annotated] == ["worker-0"] * 3
+    assert [e.medium for e in annotated] == ["gpu", "cpu", "disk"]
+    assert len({e.backend_id for e in annotated}) == 1
+
+
+def test_same_logical_block_gpu_cpu_disk_publish_sequence() -> None:
+    """Conceptual multi-tier publish: gpu then cpu then disk for one page.
+
+    Indexers (Dynamo PR #8912) accumulate per-tier presence under one
+    ``backend_id``. GPU/CPU share scheduler ``block_hashes`` for the same
+    token page. Disk interim hashes (Task 3.1) intentionally differ until
+    token plumbing exists — this test asserts backend_id identity across all
+    three and matching gpu/cpu hashes only.
+    """
+    config = KVEventsConfig(
+        wire_format="rfc1527",
+        backend_id="ts-worker-0",
+        publish_medium=True,
+        publish_tiers=["gpu", "cpu", "disk"],
+        model_name="test-model",
+    )
+    token_ids = [10, 20, 30, 40]
+    block_size = 4
+    seq_hash = 0xDEADBEEF
+
+    gpu_raw = SimpleNamespace(
+        kind="BlockStored",
+        block_hashes=[seq_hash],
+        parent_block_hash=None,
+        token_ids=token_ids,
+        block_size=block_size,
+        tier=0,  # KvEventTier.kDevice → gpu
+    )
+    cpu_raw = SimpleNamespace(
+        kind="BlockStored",
+        block_hashes=[seq_hash],
+        parent_block_hash=None,
+        token_ids=token_ids,
+        block_size=block_size,
+        tier=1,  # KvEventTier.kHost → cpu
+    )
+    gpu_event, cpu_event = scheduler_kv_events_to_wire_events(
+        [gpu_raw, cpu_raw], config=config, medium="gpu"
+    )
+
+    disk_key = "ab" * 32
+    disk_event = apply_envelope(
+        l3_storage_keys_to_disk_events([disk_key], block_size=block_size)[0],
+        config,
+        medium="disk",
+    )
+
+    assert gpu_event.backend_id == "ts-worker-0"
+    assert cpu_event.backend_id == "ts-worker-0"
+    assert disk_event.backend_id == "ts-worker-0"
+    assert gpu_event.medium == "gpu"
+    assert cpu_event.medium == "cpu"
+    assert disk_event.medium == "disk"
+    assert gpu_event.block_hashes == cpu_event.block_hashes == [seq_hash]
+    # Interim disk hashes intentionally differ from GPU/CPU seq hashes.
+    assert disk_event.block_hashes != gpu_event.block_hashes
