@@ -463,15 +463,24 @@ __launch_bounds__(BLOCK_SIZE) __global__ void applyKernel(
     } else {
         // ── Mode 3.2: top-P only (radix top-p threshold) ────────────────────
         // Vectorized V-scan with float4: each thread reads/writes 16B per
-        // iteration, 4× fewer transactions than scalar. Row base is always
-        // 16B-aligned (PyTorch tensors are 256B-aligned). The tail (vocab_size
-        // not divisible by 4) is handled by a scalar epilogue.
+        // iteration, 4× fewer transactions than scalar. A float4 access must be
+        // naturally aligned, and a 16B-aligned row base is NOT guaranteed:
+        //   1. `probs`/`out_probs` may be views whose data_ptr is only 4B-aligned
+        //      (any slice or offset gather off a larger buffer), and
+        //   2. vocab_size % 4 != 0 pushes every row b >= 1 off a 16B boundary
+        //      even when the base allocation is 256B-aligned.
+        // Either one faults with "misaligned address". Gate the vector path on
+        // the actual row alignment; vec_count = 0 makes the scalar loop below
+        // cover the whole row [0, vocab_size), which is numerically identical.
         const float threshold =
             air_top_p::twiddleOut<float>(topp_counters[b].kthValueBits, false);
 
         float const* in_row = probs + b * vocab_size;
         float* out_row = out_probs + b * vocab_size;
-        const int vec_count = vocab_size / 4;            // # of float4 lanes
+        const bool vec_ok = ((reinterpret_cast<uintptr_t>(in_row) |
+                              reinterpret_cast<uintptr_t>(out_row)) &
+                             0xF) == 0;
+        const int vec_count = vec_ok ? (vocab_size / 4) : 0;  // # of float4 lanes
         const int vec_tail_start = vec_count * 4;        // start of scalar tail
 
         float4 const* in_row_v = reinterpret_cast<float4 const*>(in_row);
