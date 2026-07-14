@@ -77,6 +77,14 @@ def _llm(request: Request) -> "AsyncLLM":
     return async_llm
 
 
+def _stamp_weight_version(request: Request, version: str | None, message: str) -> str:
+    """Apply weight_version to server_args on success, return updated message."""
+    if version is not None:
+        _llm(request).server_args.weight_version = version
+        message += f" Weight version updated to {version}."
+    return message
+
+
 async def _guarded(
     build_payload: Callable[[], Awaitable[dict[str, Any]]],
 ) -> JSONResponse:
@@ -172,10 +180,8 @@ async def update_weights_from_distributed(request: Request) -> JSONResponse:
             weight_version=body.get("weight_version"),
         )
         success, message = await _llm(request).update_weights_from_distributed(obj)
-        if success and obj.weight_version is not None:
-            llm = _llm(request)
-            llm.server_args.weight_version = obj.weight_version
-            message += f" Weight version updated to {obj.weight_version}."
+        if success:
+            message = _stamp_weight_version(request, obj.weight_version, message)
         return {"success": success, "message": message}
 
     return await _guarded(_do)
@@ -193,10 +199,8 @@ async def update_weights_from_tensor(request: Request) -> JSONResponse:
             weight_version=body.get("weight_version"),
         )
         success, message = await _llm(request).update_weights_from_tensor(obj)
-        if success and obj.weight_version is not None:
-            llm = _llm(request)
-            llm.server_args.weight_version = obj.weight_version
-            message += f" Weight version updated to {obj.weight_version}."
+        if success:
+            message = _stamp_weight_version(request, obj.weight_version, message)
         return {"success": success, "message": message}
 
     return await _guarded(_do)
@@ -213,10 +217,8 @@ async def update_weights_from_disk(request: Request) -> JSONResponse:
             weight_version=body.get("weight_version"),
         )
         success, message, *_ = await _llm(request).update_weights_from_disk(obj)
-        if success and obj.weight_version is not None:
-            llm = _llm(request)
-            llm.server_args.weight_version = obj.weight_version
-            message += f" Weight version updated to {obj.weight_version}."
+        if success:
+            message = _stamp_weight_version(request, obj.weight_version, message)
         return {"success": success, "message": message}
 
     return await _guarded(_do)
