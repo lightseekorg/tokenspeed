@@ -33,15 +33,22 @@ enum class KvCacheEventKind {
     kBlockRemoved,
 };
 
+enum class KvEventTier {
+    kDevice = 0,
+    kHost = 1,
+};
+
 struct KvBlockStoredEvent {
     std::vector<std::uint64_t> block_hashes;
     std::optional<std::uint64_t> parent_block_hash;
     std::vector<std::int32_t> token_ids;
     std::int32_t block_size;
+    KvEventTier tier{KvEventTier::kDevice};
 };
 
 struct KvBlockRemovedEvent {
     std::vector<std::uint64_t> block_hashes;
+    KvEventTier tier{KvEventTier::kDevice};
 };
 
 using KvCacheEvent = std::variant<KvBlockStoredEvent, KvBlockRemovedEvent>;

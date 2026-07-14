@@ -129,16 +129,21 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .value("decode", tokenspeed::DisaggregationMode::kDecode);
 
     nb::module_ kv_event = m.def_submodule("KVEvent");
+    nb::enum_<tokenspeed::KvEventTier>(kv_event, "Tier")
+        .value("device", tokenspeed::KvEventTier::kDevice)
+        .value("host", tokenspeed::KvEventTier::kHost);
     nb::class_<tokenspeed::KvBlockStoredEvent>(kv_event, "BlockStored")
         .def_prop_ro("kind", [](const tokenspeed::KvBlockStoredEvent&) { return "BlockStored"; })
         .def_ro("block_hashes", &tokenspeed::KvBlockStoredEvent::block_hashes)
         .def_ro("parent_block_hash", &tokenspeed::KvBlockStoredEvent::parent_block_hash)
         .def_ro("token_ids", &tokenspeed::KvBlockStoredEvent::token_ids)
-        .def_ro("block_size", &tokenspeed::KvBlockStoredEvent::block_size);
+        .def_ro("block_size", &tokenspeed::KvBlockStoredEvent::block_size)
+        .def_ro("tier", &tokenspeed::KvBlockStoredEvent::tier);
 
     nb::class_<tokenspeed::KvBlockRemovedEvent>(kv_event, "BlockRemoved")
         .def_prop_ro("kind", [](const tokenspeed::KvBlockRemovedEvent&) { return "BlockRemoved"; })
-        .def_ro("block_hashes", &tokenspeed::KvBlockRemovedEvent::block_hashes);
+        .def_ro("block_hashes", &tokenspeed::KvBlockRemovedEvent::block_hashes)
+        .def_ro("tier", &tokenspeed::KvBlockRemovedEvent::tier);
 
     auto scheduler_config = nb::class_<tokenspeed::SchedulerConfig>(m, "SchedulerConfig");
 
