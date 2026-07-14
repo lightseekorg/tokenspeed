@@ -9,8 +9,6 @@ from queue import Queue
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import pytest
-
 from tokenspeed.runtime.pd.kv_events import (
     BlockStored,
     KVEventsConfig,
