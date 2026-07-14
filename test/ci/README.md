@@ -69,7 +69,7 @@ use the default `b200-<Ngpu>` labels.
 To enable `push` and `workflow_dispatch` runs of the three PR test workflows
 outside the official repository, set the `TOKENSPEED_CI_REPOSITORY` repository
 variable at the same settings path to the configured repository's exact
-`owner/repo` name, such as `my-org/tokenspeed-private`. The official
+`owner/repo` name. The official
 `lightseekorg/tokenspeed` repository remains enabled without this variable.
 Leave it unset or empty to keep push/manual GPU CI disabled in other
 repositories. `pull_request` runs keep their existing behavior. The configured
