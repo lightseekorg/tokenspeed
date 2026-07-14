@@ -330,9 +330,7 @@ class MiniMaxM3Attention(nn.Module):
             mapping.attn.tp_size,
         )
         self.num_heads = config.num_attention_heads // mapping.attn.tp_size
-        self.num_kv_heads = max(
-            1, config.num_key_value_heads // mapping.attn.tp_size
-        )
+        self.num_kv_heads = max(1, config.num_key_value_heads // mapping.attn.tp_size)
         self.head_dim = config.head_dim
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
@@ -507,10 +505,10 @@ class MiniMaxM3Attention(nn.Module):
             metadata = ctx.attn_backend.forward_extend_metadata
             if metadata is None or metadata.page_table is None:
                 raise RuntimeError("MiniMax-M3 MSA prefill requires paged metadata.")
-            max_seq_len = (
-                metadata.max_extend_prefix_len + metadata.max_extend_seq_len
-            )
-            max_blocks = (max_seq_len + self.sparse_block_size - 1) // self.sparse_block_size
+            max_seq_len = metadata.max_extend_prefix_len + metadata.max_extend_seq_len
+            max_blocks = (
+                max_seq_len + self.sparse_block_size - 1
+            ) // self.sparse_block_size
             selected_blocks = minimax_m3_msa_indexer(
                 index_q,
                 index_k,
@@ -652,8 +650,12 @@ class MiniMaxM3SparseForCausalLM(BaseCausalLM):
 
             name = name.replace(".block_sparse_moe", ".mlp")
             name = name.replace(".e_score_correction_bias", ".routing_bias")
-            name = name.replace(".self_attn.index_q_proj", ".self_attn.indexer.index_q_proj")
-            name = name.replace(".self_attn.index_k_proj", ".self_attn.indexer.index_k_proj")
+            name = name.replace(
+                ".self_attn.index_q_proj", ".self_attn.indexer.index_q_proj"
+            )
+            name = name.replace(
+                ".self_attn.index_k_proj", ".self_attn.indexer.index_k_proj"
+            )
             name = name.replace(".self_attn.index_q_norm", ".self_attn.indexer.q_norm")
             name = name.replace(".self_attn.index_k_norm", ".self_attn.indexer.k_norm")
 

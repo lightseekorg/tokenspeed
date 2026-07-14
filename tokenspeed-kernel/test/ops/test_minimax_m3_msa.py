@@ -87,8 +87,7 @@ def test_minimax_m3_msa_prefill_and_decode_after_2048() -> None:
         )[None]
         positions = torch.arange(prefill_len, device="cuda")
         slot_mapping = (
-            (positions // _BLOCK_SIZE + 1) * _BLOCK_SIZE
-            + positions % _BLOCK_SIZE
+            (positions // _BLOCK_SIZE + 1) * _BLOCK_SIZE + positions % _BLOCK_SIZE
         ).to(torch.int32)
         index_query = torch.randn(
             prefill_len,
@@ -110,9 +109,7 @@ def test_minimax_m3_msa_prefill_and_decode_after_2048() -> None:
             device="cuda",
         )
         seq_lens = torch.tensor([prefill_len], dtype=torch.int32, device="cuda")
-        cu_seqlens = torch.tensor(
-            [0, prefill_len], dtype=torch.int32, device="cuda"
-        )
+        cu_seqlens = torch.tensor([0, prefill_len], dtype=torch.int32, device="cuda")
         prefix_lens = torch.zeros(1, dtype=torch.int32, device="cuda")
 
         selected = minimax_m3_msa_indexer(

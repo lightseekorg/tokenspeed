@@ -11,7 +11,6 @@ softmax states, preserving exact attention over the selected tokens.
 from __future__ import annotations
 
 import torch
-
 from tokenspeed_kernel._triton import tl, triton
 
 from .indexer import SPARSE_BLOCK_SIZE
@@ -93,9 +92,7 @@ def _sparse_prefill_kernel(
     accumulator = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
     key_offsets = tl.arange(0, BLOCK_K)
     block_table_row = block_table + request * stride_bt_b
-    selected_ptr = (
-        selected_blocks + token * stride_t_n + kv_head * stride_t_h
-    )
+    selected_ptr = selected_blocks + token * stride_t_n + kv_head * stride_t_h
     visible_blocks = (query_position + BLOCK_K) // BLOCK_K
     selected_count = tl.minimum(topk, visible_blocks)
     scale_log2e = scale * 1.4426950408889634
@@ -152,9 +149,7 @@ def _sparse_prefill_kernel(
 @triton.heuristics(
     {
         "BLOCK_D": lambda args: triton.next_power_of_2(args["head_dim"]),
-        "BLOCK_H": lambda args: max(
-            16, triton.next_power_of_2(args["gqa_group_size"])
-        ),
+        "BLOCK_H": lambda args: max(16, triton.next_power_of_2(args["gqa_group_size"])),
     }
 )
 @triton.jit(do_not_specialize=["decode_query_len"])
@@ -211,9 +206,7 @@ def _sparse_decode_kernel(
     visible_blocks = (query_position + BLOCK_K) // BLOCK_K
     selected_count = tl.minimum(topk, visible_blocks)
 
-    selected_per_chunk: tl.constexpr = (
-        topk + NUM_CHUNKS - 1
-    ) // NUM_CHUNKS
+    selected_per_chunk: tl.constexpr = (topk + NUM_CHUNKS - 1) // NUM_CHUNKS
     selected_start = selected_per_chunk * chunk
     selected_end = tl.minimum(selected_start + selected_per_chunk, selected_count)
     first_head = kv_head * gqa_group_size
@@ -235,9 +228,7 @@ def _sparse_decode_kernel(
     accumulator = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
     key_offsets = tl.arange(0, BLOCK_K)
     block_table_row = block_table + request * stride_bt_b
-    selected_ptr = (
-        selected_blocks + token * stride_t_n + kv_head * stride_t_h
-    )
+    selected_ptr = selected_blocks + token * stride_t_n + kv_head * stride_t_h
     scale_log2e = scale * 1.4426950408889634
 
     for selected_offset in tl.range(selected_start, selected_end):
@@ -303,9 +294,7 @@ def _sparse_decode_kernel(
     )
 
 
-@triton.heuristics(
-    {"BLOCK_D": lambda args: triton.next_power_of_2(args["head_dim"])}
-)
+@triton.heuristics({"BLOCK_D": lambda args: triton.next_power_of_2(args["head_dim"])})
 @triton.jit
 def _merge_decode_kernel(
     partial_output,
@@ -330,10 +319,7 @@ def _merge_decode_kernel(
     chunks = tl.arange(0, NUM_CHUNKS)
     dims = tl.arange(0, BLOCK_D)
     lse = tl.load(
-        partial_lse
-        + chunks * stride_l_c
-        + token * stride_l_n
-        + head * stride_l_h
+        partial_lse + chunks * stride_l_c + token * stride_l_n + head * stride_l_h
     )
     max_lse = tl.max(lse, axis=0)
     weights = tl.exp2(lse - max_lse)
@@ -349,10 +335,7 @@ def _merge_decode_kernel(
     )
     merged = tl.sum(partials * weights[:, None], axis=0)
     tl.store(
-        output
-        + token * stride_out_n
-        + head * stride_out_h
-        + dims * stride_out_d,
+        output + token * stride_out_n + head * stride_out_h + dims * stride_out_d,
         merged,
         mask=dims < head_dim,
     )
@@ -450,9 +433,7 @@ def minimax_m3_msa_sparse_attention(
     if decode_query_len:
         decode_query_len = int(decode_query_len)
         if tokens != seq_lens.numel() * decode_query_len:
-            raise ValueError(
-                "decode tokens must equal requests * decode_query_len"
-            )
+            raise ValueError("decode tokens must equal requests * decode_query_len")
         target_grid = 256
         target_chunks = max(
             1,
@@ -536,12 +517,8 @@ def minimax_m3_msa_sparse_attention(
             "sparse prefill requires cu_seqlens_q, prefix_lens, and "
             "positive max_query_len"
         )
-    cu_seqlens_q = cu_seqlens_q.to(
-        device=query.device, dtype=torch.int32
-    ).contiguous()
-    prefix_lens = prefix_lens.to(
-        device=query.device, dtype=torch.int32
-    ).contiguous()
+    cu_seqlens_q = cu_seqlens_q.to(device=query.device, dtype=torch.int32).contiguous()
+    prefix_lens = prefix_lens.to(device=query.device, dtype=torch.int32).contiguous()
     batch = cu_seqlens_q.numel() - 1
     _sparse_prefill_kernel[(int(max_query_len), num_kv_heads, batch)](
         query,

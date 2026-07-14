@@ -134,8 +134,7 @@ def test_minimax_m3_tp4_meta_layout_and_loader(monkeypatch: pytest.MonkeyPatch) 
                 torch.empty(8, dtype=torch.float32, device="meta"),
             ),
             (
-                "language_model.model.layers.3.block_sparse_moe."
-                "experts.0.w1.weight",
+                "language_model.model.layers.3.block_sparse_moe." "experts.0.w1.weight",
                 torch.empty(128, 128, dtype=torch.float8_e4m3fn, device="meta"),
             ),
             (

@@ -5,7 +5,6 @@ import torch
 from tokenspeed_kernel import mm
 from tokenspeed_kernel.platform import current_platform
 
-
 pytestmark = pytest.mark.skipif(
     not current_platform().is_nvidia,
     reason="MiniMax-M3 MXFP8 checkpoint support targets NVIDIA GPUs.",

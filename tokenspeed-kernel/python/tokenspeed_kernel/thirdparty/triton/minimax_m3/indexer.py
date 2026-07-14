@@ -12,7 +12,6 @@ the selected set.  The code is adapted to TokenSpeed's paged-cache layout.
 from __future__ import annotations
 
 import torch
-
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.triton.dsa_topk import _topk_with_padding
 
@@ -124,9 +123,7 @@ def _prefill_block_score_kernel(
         block_scores = tl.max(logits, axis=1)
         query_blocks = query_positions // BLOCK_K
         forced_init = block < init_blocks
-        forced_local = (block <= query_blocks) & (
-            block > query_blocks - local_blocks
-        )
+        forced_local = (block <= query_blocks) & (block > query_blocks - local_blocks)
         block_scores = tl.where(
             forced_init | forced_local,
             float("inf"),
@@ -183,9 +180,7 @@ def _decode_block_score_kernel(
     query_positions = seq_len - decode_query_len + query_offsets
     visible_lens = tl.maximum(query_positions + 1, 0)
     visible_blocks_per_query = (visible_lens + BLOCK_K - 1) // BLOCK_K
-    visible_blocks = tl.max(
-        tl.where(query_mask, visible_blocks_per_query, 0), axis=0
-    )
+    visible_blocks = tl.max(tl.where(query_mask, visible_blocks_per_query, 0), axis=0)
 
     blocks_per_chunk = (max_blocks + num_chunks - 1) // num_chunks
     chunk_start = chunk * blocks_per_chunk
@@ -216,17 +211,14 @@ def _decode_block_score_kernel(
         )
         logits = tl.dot(key, query, out_dtype=tl.float32) * scale
         logits = tl.where(
-            (key_positions[:, None] < visible_lens[None, :])
-            & query_mask[None, :],
+            (key_positions[:, None] < visible_lens[None, :]) & query_mask[None, :],
             logits,
             -float("inf"),
         )
         block_scores = tl.max(logits, axis=0)
         forced_init = block < init_blocks
         local_start = tl.maximum(0, visible_blocks_per_query - local_blocks)
-        forced_local = (block >= local_start) & (
-            block < visible_blocks_per_query
-        )
+        forced_local = (block >= local_start) & (block < visible_blocks_per_query)
         block_scores = tl.where(
             forced_init | forced_local,
             float("inf"),
@@ -347,7 +339,9 @@ def minimax_m3_msa_indexer(
 
     index_q = index_q.contiguous()
     index_k = index_k.contiguous()
-    slot_mapping = slot_mapping.to(device=index_q.device, dtype=torch.int32).contiguous()
+    slot_mapping = slot_mapping.to(
+        device=index_q.device, dtype=torch.int32
+    ).contiguous()
     block_table = block_table.to(device=index_q.device, dtype=torch.int32).contiguous()
     seq_lens = seq_lens.to(device=index_q.device, dtype=torch.int32).contiguous()
     block_d = triton.next_power_of_2(head_dim)
