@@ -185,10 +185,29 @@ def scheduler_kv_event_to_wire_event(
 def scheduler_kv_events_to_wire_events(
     events: Iterable[Any],
     hash_mode: Literal["fnv", "xxh3"] = "fnv",
+    config: Optional["KVEventsConfig"] = None,
+    medium: Optional[str] = "gpu",
 ) -> list[Union[BlockStored, BlockRemoved]]:
-    return [
+    """Translate scheduler events and optionally apply the RFC #1527 envelope.
+
+    Args:
+        events: Scheduler-native KV events (e.g. from ``drain_kv_events``).
+        hash_mode: Block hash mode passed through to the translator.
+        config: When set, each wire event is annotated via ``apply_envelope``.
+            Device-tier events from the C++ scheduler use ``medium="gpu"``.
+        medium: Storage tier for the envelope (default ``"gpu"`` for device
+            stream). Ignored when ``config`` is ``None`` or
+            ``wire_format=legacy``.
+
+    Returns:
+        Wire event structs ready for ``KVEventBatch`` publishing.
+    """
+    wire_events = [
         scheduler_kv_event_to_wire_event(event, hash_mode=hash_mode) for event in events
     ]
+    if config is None:
+        return wire_events
+    return [apply_envelope(event, config, medium=medium) for event in wire_events]
 
 
 def drain_scheduler_kv_events(scheduler: Any, enabled: bool) -> list[Any]:

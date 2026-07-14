@@ -14,6 +14,7 @@ from tokenspeed.runtime.pd.kv_events import (
     apply_envelope,
     drain_scheduler_kv_events,
     scheduler_kv_event_to_wire_event,
+    scheduler_kv_events_to_wire_events,
 )
 
 
@@ -294,6 +295,68 @@ def test_apply_envelope_rfc1527_sets_fields_from_config() -> None:
     assert annotated.tenant_id == "t1"
     assert annotated.model_name == "test-model"
     assert annotated.medium == "gpu"
+
+
+def test_apply_envelope_medium_gpu_under_rfc1527() -> None:
+    event = BlockStored(
+        block_hashes=[1],
+        parent_block_hash=None,
+        token_ids=[1],
+        block_size=1,
+    )
+    config = KVEventsConfig(wire_format="rfc1527", backend_id="w", publish_medium=True)
+
+    annotated = apply_envelope(event, config, medium="gpu")
+
+    assert annotated.medium == "gpu"
+
+
+def test_scheduler_kv_events_to_wire_events_tags_medium_gpu_for_rfc1527() -> None:
+    """Device-tier scheduler events are GPU; wire path must set medium=gpu."""
+    raw = SimpleNamespace(
+        kind="BlockStored",
+        block_hashes=[123],
+        parent_block_hash=None,
+        token_ids=[1, 2, 3, 4],
+        block_size=4,
+    )
+    config = KVEventsConfig(
+        wire_format="rfc1527",
+        backend_id="worker-0",
+        tenant_id="t1",
+        model_name="m",
+        publish_medium=True,
+    )
+
+    events = scheduler_kv_events_to_wire_events(
+        [raw], hash_mode=config.hash_mode, config=config, medium="gpu"
+    )
+
+    assert len(events) == 1
+    assert isinstance(events[0], BlockStored)
+    assert events[0].medium == "gpu"
+    assert events[0].backend_id == "worker-0"
+    assert events[0].tenant_id == "t1"
+    assert events[0].model_name == "m"
+
+
+def test_scheduler_kv_events_to_wire_events_legacy_omits_medium() -> None:
+    raw = SimpleNamespace(
+        kind="BlockStored",
+        block_hashes=[123],
+        parent_block_hash=None,
+        token_ids=[1, 2],
+        block_size=2,
+    )
+    config = KVEventsConfig(wire_format="legacy", backend_id="worker-0")
+
+    events = scheduler_kv_events_to_wire_events([raw], config=config, medium="gpu")
+
+    assert events[0].medium is None
+    assert events[0].backend_id is None
+    decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(events[0]))
+    assert "medium" not in decoded
+    assert "backend_id" not in decoded
 
 
 def test_apply_envelope_rfc1527_skips_medium_when_disabled() -> None:
