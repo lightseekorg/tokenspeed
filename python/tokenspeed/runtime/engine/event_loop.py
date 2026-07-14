@@ -77,6 +77,10 @@ from tokenspeed.runtime.execution.types import ModelExecutionResult
 from tokenspeed.runtime.grammar.capturable_grammar import GrammarStepInputs
 from tokenspeed.runtime.layers.attention.registry import create_attn_components
 from tokenspeed.runtime.metrics.collector import EngineMetrics
+from tokenspeed.runtime.multimodal.warmup import (
+    install_encoder_cudagraph_wrappers,
+    prewarm_multimodal_encoders,
+)
 from tokenspeed.runtime.pd.decode_executor import DisaggDecodeExecutor
 from tokenspeed.runtime.pd.factory import (
     create_kv_transfer,
@@ -180,6 +184,14 @@ class EventLoop:
 
         target, draft = create_model_runner(
             server_args, self.model_config, draft_model_config, gpu_id, global_rank
+        )
+        install_encoder_cudagraph_wrappers(
+            target.model, server_args.mm_attention_backend
+        )
+        prewarm_multimodal_encoders(
+            target.model,
+            skip_server_warmup=server_args.skip_server_warmup,
+            device=f"cuda:{gpu_id}",
         )
         self.use_overlap_schedule = should_use_overlap_schedule(
             disable_overlap_schedule=server_args.disable_overlap_schedule,

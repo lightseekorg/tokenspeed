@@ -788,7 +788,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
                 self.vision_tower = self.vision_tower.to(dtype=target_dtype)
                 self.mm_projector = self.mm_projector.to(dtype=target_dtype)
 
-            # image_encoder may be swapped to a cudagraph wrapper by ModelExecutor.
+            # image_encoder may be swapped to a cudagraph wrapper during startup.
             self.vision_embedder = VisionEmbedder()
             self.image_encoder = self.get_image_feature
         else:
@@ -806,6 +806,45 @@ class KimiK25ForConditionalGeneration(nn.Module):
         # per-image consumption (mirrors ``out_squeeze_dim=0`` in the
         # cudagraph wrapper).
         return self.post_encode([encoded.squeeze(0)], grid_thws)
+
+    def make_encoder_warmup_items(
+        self, patches_per_side: int
+    ) -> dict[Modality, list[MultimodalDataItem]]:
+        """Build one synthetic image batch for startup encoder warmup.
+
+        Args:
+            patches_per_side: Number of vision patches along each spatial axis.
+
+        Returns:
+            An image-modality batch accepted by :meth:`get_image_feature`.
+        """
+        merge_h, merge_w = self.vision_tower.merge_kernel_size
+        if patches_per_side % merge_h or patches_per_side % merge_w:
+            raise ValueError(
+                f"Kimi encoder warmup patches_per_side={patches_per_side} must be "
+                f"divisible by merge_kernel_size={(merge_h, merge_w)}"
+            )
+        patch_embed = self.vision_tower.patch_embed
+        patch_height, patch_width = patch_embed.patch_size
+        feature = torch.zeros(
+            patches_per_side * patches_per_side,
+            3,
+            patch_height,
+            patch_width,
+            dtype=patch_embed.proj.weight.dtype,
+        )
+        grid_thws = torch.tensor(
+            [[1, patches_per_side, patches_per_side]], dtype=torch.long
+        )
+        return {
+            Modality.IMAGE: [
+                MultimodalDataItem(
+                    modality=Modality.IMAGE,
+                    feature=feature,
+                    model_specific_data={"grid_thws": grid_thws},
+                )
+            ]
+        }
 
     def pre_encode(
         self, items: list[MultimodalDataItem]

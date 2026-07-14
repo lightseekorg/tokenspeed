@@ -538,36 +538,6 @@ class ModelExecutor:
             decode_wrapper=self.forward_step,
         )
 
-        # Encoder CUDA graph: install model-built wrappers by overriding
-        # modality encoder callables (e.g. ``image_encoder``, ``video_encoder``).
-        # Multimodal-encoder analogue of ``forward_step``'s ``CudaGraphWrapper``.
-        self.encoder_graph_wrappers = {}
-        _mm_model = self.model_runner.model
-        if (
-            hasattr(_mm_model, "make_encoder_cudagraph_wrappers")
-            and getattr(_mm_model, "is_multimodal_active", True)
-            and envs.TOKENSPEED_MM_ENABLE_ENCODER_CUDA_GRAPH.get()
-            and self.model_runner.server_args.mm_attention_backend != "flashinfer_cudnn"
-        ):
-            self.encoder_graph_wrappers = _mm_model.make_encoder_cudagraph_wrappers(
-                _mm_model.mapping
-            )
-
-            active_encoder_graph_wrappers = {}
-            for encoder_attr, wrapper in self.encoder_graph_wrappers.items():
-                if not hasattr(_mm_model, encoder_attr):
-                    logger.warning(
-                        "Skipping encoder CUDA graph wrapper for missing attribute %s",
-                        encoder_attr,
-                    )
-                    continue
-                setattr(_mm_model, encoder_attr, wrapper)
-                active_encoder_graph_wrappers[encoder_attr] = wrapper
-
-            self.encoder_graph_wrappers = active_encoder_graph_wrappers
-
-        self._prewarm_multimodal_vision_encoder(_mm_model)
-
         self.execution_stream = torch.cuda.Stream()
         self.log_step = 0
         self._seen_prefill_ids: set[str] = set()
@@ -605,64 +575,6 @@ class ModelExecutor:
         freeze_autotuning()
 
         logger.info("ModelExecutor initialized")
-
-    def _prewarm_multimodal_vision_encoder(self, model) -> None:
-        if not envs.TOKENSPEED_MM_ENABLE_VISION_PREWARM.get():
-            return
-        if getattr(self.model_runner.server_args, "skip_server_warmup", False):
-            return
-        if not getattr(model, "is_multimodal_active", False):
-            return
-        image_encoder = getattr(model, "image_encoder", None)
-        vision_tower = getattr(model, "vision_tower", None)
-        vision_config = getattr(getattr(model, "config", None), "vision_config", None)
-        if image_encoder is None or vision_tower is None or vision_config is None:
-            return
-        if not hasattr(vision_tower, "patch_embed"):
-            return
-
-        patch_size = int(getattr(vision_config, "patch_size", 14))
-        patches_per_side = envs.TOKENSPEED_MM_VISION_PREWARM_PATCHES_PER_SIDE.get()
-        if patches_per_side <= 0:
-            return
-
-        try:
-            from tokenspeed.runtime.multimodal.inputs import Modality, MultimodalDataItem
-
-            device = torch.device(self.device)
-            dtype = getattr(vision_tower, "dtype", torch.bfloat16)
-            feature = torch.zeros(
-                patches_per_side * patches_per_side,
-                3,
-                patch_size,
-                patch_size,
-                dtype=dtype,
-            )
-            grid_thws = torch.tensor(
-                [[1, patches_per_side, patches_per_side]],
-                dtype=torch.long,
-            )
-            item = MultimodalDataItem(
-                modality=Modality.IMAGE,
-                feature=feature,
-                model_specific_data={"grid_thws": grid_thws},
-            )
-
-            start = time.perf_counter()
-            with torch.inference_mode():
-                _ = image_encoder([item])
-                if device.type == "cuda":
-                    torch.cuda.synchronize(device)
-            logger.info(
-                "Multimodal vision prewarm complete: patches_per_side=%d "
-                "patch_size=%d elapsed=%.3f ms",
-                patches_per_side,
-                patch_size,
-                (time.perf_counter() - start) * 1000.0,
-            )
-        except Exception:
-            logger.exception("Multimodal vision prewarm failed")
-            raise
 
     @staticmethod
     def _make_mrope_decode_deltas_cpu(size: int) -> torch.Tensor:
