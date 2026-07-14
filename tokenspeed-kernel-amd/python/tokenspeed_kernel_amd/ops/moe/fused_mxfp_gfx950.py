@@ -7707,7 +7707,7 @@ def gluon_mxfp_fused_moe(
 
     gemm1_input = x_fp8
 
-    intermediate_cache, gemm2_scale = gluon_mxfp_ragged_matmul(
+    intermediate_cache = gluon_mxfp_ragged_matmul(
         gemm1_input,
         w13_weight,
         w13_bias,
