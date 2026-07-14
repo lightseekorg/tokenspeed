@@ -134,9 +134,18 @@ async def update_weights(raw_request: Request) -> JSONResponse:
 
 @router.post("/finish_weight_update")
 async def finish_weight_update(raw_request: Request) -> JSONResponse:
-    body = (
-        await _read_json(raw_request) if raw_request.headers.get("content-type") else {}
-    )
+    # Tolerant body parsing: accept empty bodies (backward compat with trainers
+    # that POST with no payload) and JSON bodies (new: carries weight_version).
+    raw = await raw_request.body()
+    if raw:
+        try:
+            body = json.loads(raw)
+            if not isinstance(body, dict):
+                body = {}
+        except (json.JSONDecodeError, ValueError):
+            body = {}
+    else:
+        body = {}
     await _manager(raw_request).finish_update(weight_version=body.get("weight_version"))
     return JSONResponse(content={"message": "Weight update finished"})
 

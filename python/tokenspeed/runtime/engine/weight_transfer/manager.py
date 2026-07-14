@@ -81,9 +81,10 @@ class WeightTransferManager:
         # Lifecycle state.
         self._engine_inited = False
         self._update_active = False
-        # Monotonic counter for auto-incrementing weight versions when the
-        # trainer does not supply an explicit version string.
-        self._auto_version_counter = 0
+        # Tracks whether an explicit weight_version was set during the current
+        # update cycle (via chunk metadata or finish_update arg).
+        self._version_set_this_update = False
+        self._pending_weight_version: str | None = None
 
     # ------------------------------------------------------------------ #
     # Introspection
@@ -148,6 +149,7 @@ class WeightTransferManager:
             )
         self._update_active = True
         self._version_set_this_update = False
+        self._pending_weight_version: str | None = None
         logger.info("Weight update started")
 
     async def update(self, update_info: dict[str, Any]) -> None:
@@ -166,9 +168,13 @@ class WeightTransferManager:
             )
             if not success:
                 raise RuntimeError(f"Failed to update weights: {message}")
-            # If the trainer passed a weight_version with this update chunk,
-            # apply it immediately (same semantics as sglang).
-            self._apply_weight_version_if_provided(update_info.get("weight_version"))
+            # Record the weight_version from this chunk for deferred application
+            # at finish_update (not applied mid-update to avoid stamping responses
+            # while the model holds partially-updated weights).
+            version = update_info.get("weight_version")
+            if version is not None:
+                self._pending_weight_version = version
+                self._version_set_this_update = True
         else:  # ipc
             self._parse_ipc_update(update_info)
             # The CUDA-IPC receive path (rebuild_cuda_tensor + load_weights on the
@@ -190,8 +196,10 @@ class WeightTransferManager:
 
         Args:
             weight_version: If provided, set the weight version explicitly.
-                If None and no version was set during the update chunks,
-                auto-increments a monotonic counter.
+                The version is only updated when the trainer supplies one —
+                either here or during the update chunks. If no version was
+                provided at any point, the existing version is left unchanged
+                (same semantics as SGLang).
         """
         if not self._update_active:
             raise WeightTransferStateError(
@@ -199,14 +207,12 @@ class WeightTransferManager:
             )
         self._update_active = False
 
-        # Apply the weight version: explicit finish arg > set-during-chunks > auto.
+        # Apply the weight version: explicit finish arg > pending from chunks > unchanged.
         if weight_version is not None:
             self._apply_weight_version(weight_version)
-        elif not self._version_set_this_update:
-            # No explicit version was provided at any point in this update cycle;
-            # auto-increment so staleness is always detectable.
-            self._auto_version_counter += 1
-            self._apply_weight_version(str(self._auto_version_counter))
+        elif self._version_set_this_update and self._pending_weight_version is not None:
+            self._apply_weight_version(self._pending_weight_version)
+        # else: trainer chose not to supply a version (leave as-is).
 
         logger.info(
             "Weight update finished (weight_version=%s)",
