@@ -186,8 +186,8 @@ void KVPrefixCache::recordHostBlockRemoved(TreeNode* node) {
         }
     }
     if (!removed_hashes.empty()) {
-        kv_event_sink_(KvCacheEvent{KvBlockRemovedEvent{.block_hashes = std::move(removed_hashes),
-                                                       .tier = KvEventTier::kHost}});
+        kv_event_sink_(
+            KvCacheEvent{KvBlockRemovedEvent{.block_hashes = std::move(removed_hashes), .tier = KvEventTier::kHost}});
     }
 }
 

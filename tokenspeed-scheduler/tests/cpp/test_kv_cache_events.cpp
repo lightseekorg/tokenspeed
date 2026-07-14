@@ -306,8 +306,7 @@ TEST_F(KVPrefixCacheEventTestSuite, HostChildInsertUsesCachedParentBlockHash) {
     const token_vec_t child_tokens = MakeAlignedTokens(2, kPageSize);
     cache.Insert<ResourceType::Host>(child_tokens, {}, host_allocator.Allocate(2));
 
-    const std::uint64_t parent_hash =
-        HashKvBlock(std::span<const std::int32_t>(parent_tokens.data(), kPageSize));
+    const std::uint64_t parent_hash = HashKvBlock(std::span<const std::int32_t>(parent_tokens.data(), kPageSize));
     const std::uint64_t child_hash =
         HashKvBlock(std::span<const std::int32_t>(child_tokens.data() + kPageSize, kPageSize), parent_hash);
 
