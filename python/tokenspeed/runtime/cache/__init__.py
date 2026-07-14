@@ -21,5 +21,6 @@
 """Runtime cache subsystem.
 
 This package groups KV cache data structures, allocators, storage backends,
-and cache-operation executors under one top-level domain.
+and cache-operation executors under one top-level domain. It also holds the
+vision-embedding cache used by the EPD encode stage (:mod:`embedding_cache`).
 """

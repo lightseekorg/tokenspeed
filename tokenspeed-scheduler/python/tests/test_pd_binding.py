@@ -31,7 +31,7 @@ from tokenspeed_scheduler import (
 
 def make_scheduler() -> Scheduler:
     cfg = SchedulerConfig()
-    cfg.page_size = 16
+    cfg.block_size = 16
     cfg.max_scheduled_tokens = 32
     cfg.max_batch_size = 4
     cfg.num_device_pages = 1024

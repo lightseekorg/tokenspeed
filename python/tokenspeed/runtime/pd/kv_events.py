@@ -1,8 +1,6 @@
-# Adapted from meituan-longcat/SGLang-FluentLLM.
-# This file has been modified for this repository.
-# Upstream lineage includes ModelTC/lightllm, vllm-project/vllm,
-# and sgl-project/sglang. See python/THIRDPARTYNOTICES.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: MIT AND Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 LightSeek Foundation
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 #
 # Copyright (c) 2026 LightSeek Foundation
 #
@@ -33,9 +31,10 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from collections import deque
+from collections.abc import Callable, Iterable
 from itertools import count
 from queue import Queue
-from typing import Any, Callable, Iterable, Literal, Optional, Union
+from typing import Any, Literal, Optional, Union
 
 import msgspec
 import zmq
@@ -61,7 +60,7 @@ class EventBatch(
 ):
     ts: float
     events: list[Any]
-    attn_dp_rank: Optional[int] = None
+    attn_dp_rank: int | None = None
 
 
 class KVCacheEvent(
@@ -80,7 +79,7 @@ class KVCacheEvent(
 
 class BlockStored(KVCacheEvent):
     block_hashes: list[int]
-    parent_block_hash: Optional[int]
+    parent_block_hash: int | None
     token_ids: list[int]
     block_size: int
     backend_id: Optional[str] = None
@@ -111,7 +110,7 @@ class AllBlocksCleared(KVCacheEvent):
 
 
 class KVEventBatch(EventBatch):
-    events: list[Union[BlockStored, BlockRemoved, AllBlocksCleared]]
+    events: list[BlockStored | BlockRemoved | AllBlocksCleared]
 
 
 class EventIdAllocator:
@@ -218,7 +217,7 @@ def assign_event_ids(
 def scheduler_kv_event_to_wire_event(
     event: Any,
     hash_mode: Literal["fnv", "xxh3"] = "fnv",
-) -> Union[BlockStored, BlockRemoved]:
+) -> BlockStored | BlockRemoved:
     """Translate a scheduler-native KV event into the ZMQ wire struct."""
     kind = event.kind
     if kind == "BlockStored":
@@ -267,7 +266,7 @@ def scheduler_kv_events_to_wire_events(
     config: Optional["KVEventsConfig"] = None,
     medium: Optional[str] = None,
     dp_rank: Optional[int] = None,
-) -> list[Union[BlockStored, BlockRemoved]]:
+) -> list[BlockStored | BlockRemoved]:
     """Translate scheduler events and optionally apply the RFC #1527 envelope.
 
     Args:
@@ -289,7 +288,7 @@ def scheduler_kv_events_to_wire_events(
             scheduler_kv_event_to_wire_event(event, hash_mode=hash_mode)
             for event in events
         ]
-    wire_events: list[Union[BlockStored, BlockRemoved]] = []
+    wire_events: list[BlockStored | BlockRemoved] = []
     for raw in events:
         wire = scheduler_kv_event_to_wire_event(raw, hash_mode=hash_mode)
         event_medium = _tier_to_medium(raw) or medium
@@ -442,7 +441,7 @@ class ZmqEventPublisher(EventPublisher):
         self,
         attn_dp_rank: int,
         endpoint: str = "tcp://*:5557",
-        replay_endpoint: Optional[str] = None,
+        replay_endpoint: str | None = None,
         buffer_steps: int = 10_000,
         hwm: int = 100_000,
         max_queue_size: int = 100_000,
@@ -450,13 +449,13 @@ class ZmqEventPublisher(EventPublisher):
     ) -> None:
         # Storage
         super().__init__(attn_dp_rank)
-        self._event_queue = Queue[Optional[EventBatch]](maxsize=max_queue_size)
+        self._event_queue = Queue[EventBatch | None](maxsize=max_queue_size)
         self._buffer = deque[tuple[int, bytes]](maxlen=buffer_steps)
 
         # ZMQ sockets
         self._ctx = zmq.Context.instance()
-        self._pub: Optional[zmq.Socket] = None
-        self._replay: Optional[zmq.Socket] = None
+        self._pub: zmq.Socket | None = None
+        self._replay: zmq.Socket | None = None
         self._dp_rank = attn_dp_rank
         self._endpoint = self.offset_endpoint_port(endpoint, self._dp_rank)
         self._replay_endpoint = self.offset_endpoint_port(
@@ -550,15 +549,16 @@ class ZmqEventPublisher(EventPublisher):
         """Background thread that processes the event queue."""
         self._pack = msgspec.msgpack.Encoder()
 
-        assert self._pub is not None  # narrows type for mypy
+        if self._pub is None:
+            raise RuntimeError("Publisher socket is not initialized.")
 
         while self._running or self._event_queue.qsize() > 0:
             # --- replay (non-critical) ---------------------------------
             if self._replay is not None and self._replay.poll(0):
                 try:
                     self._service_replay()
-                except Exception as e:
-                    logger.exception("Error in replay: %s", e)
+                except Exception as exc:
+                    logger.exception("Error in replay: %s", exc)
 
             # --- main queue (critical) ---------------------------------
             try:
@@ -578,14 +578,15 @@ class ZmqEventPublisher(EventPublisher):
                 self._buffer.append((seq, payload))
                 self._event_queue.task_done()
 
-            except Exception as e:
+            except Exception as exc:
                 # Publishing failed;  back-off a bit to avoid a tight error loop
-                logger.exception("Error in publisher thread: %s", e)
+                logger.exception("Error in publisher thread: %s", exc)
                 time.sleep(0.1)
 
     def _service_replay(self) -> None:
         """If a replay request is waiting, send buffered batches."""
-        assert self._replay is not None  # narrows type for mypy
+        if self._replay is None:
+            raise RuntimeError("Replay socket is not initialized.")
 
         frame = self._replay.recv_multipart()
         if len(frame) != 3:
@@ -608,8 +609,8 @@ class ZmqEventPublisher(EventPublisher):
 
     @staticmethod
     def offset_endpoint_port(
-        endpoint: Optional[str], data_parallel_rank: int
-    ) -> Optional[str]:
+        endpoint: str | None, data_parallel_rank: int
+    ) -> str | None:
         """Offset the port in an endpoint by the data parallel rank.
 
         Args:
@@ -642,7 +643,7 @@ class ZmqEventPublisher(EventPublisher):
 class KVEventsConfig(BaseModel):
     """Configuration for KV event publishing."""
 
-    publisher: Optional[str] = None
+    publisher: str | None = None
     """The publisher to use for publishing kv events. Can be "null", "zmq".
     Defaults to "zmq" when events are enabled and "null" otherwise.
     """
@@ -651,7 +652,7 @@ class KVEventsConfig(BaseModel):
     """The zmq endpoint to use for publishing kv events.
     """
 
-    replay_endpoint: Optional[str] = None
+    replay_endpoint: str | None = None
     """The zmq endpoint to use for replaying kv events.
     """
 
@@ -725,7 +726,7 @@ class EventPublisherFactory:
         cls._registry[name] = ctor
 
     @classmethod
-    def create(cls, config: Optional[str], attn_dp_rank: int = 0) -> EventPublisher:
+    def create(cls, config: str | None, attn_dp_rank: int = 0) -> EventPublisher:
         """Create publisher from a config mapping."""
         if not config:
             return NullEventPublisher(attn_dp_rank=attn_dp_rank)
@@ -757,7 +758,7 @@ class EventPublisherFactory:
         return constructor(attn_dp_rank=attn_dp_rank, **config_dict)
 
     @classmethod
-    def is_enabled(cls, config: Optional[str]) -> bool:
+    def is_enabled(cls, config: str | None) -> bool:
         if not config:
             return False
         return KVEventsConfig.from_cli(config).enable_kv_cache_events

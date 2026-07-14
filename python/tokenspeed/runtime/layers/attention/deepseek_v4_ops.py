@@ -58,22 +58,43 @@ from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     write_deepseek_v4_indexer_mxfp4_cache_cuda as _triton_write_indexer_mxfp4_cache_cuda,
 )
+from tokenspeed_kernel.ops.transform import hadamard_transform
 
 from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
     DEEPSEEK_V4_FP8_MAX,
     DEEPSEEK_V4_FP8_QUANT_BLOCK,
     DEEPSEEK_V4_MXFP4_BLOCK_SIZE,
-    DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT,
     deepseek_v4_indexer_fp8_layout_from_row_bytes,
     deepseek_v4_indexer_fp8_row_bytes,
     deepseek_v4_indexer_fp8_scale_bytes,
     deepseek_v4_indexer_mxfp4_layout_from_row_bytes,
     deepseek_v4_indexer_mxfp4_row_bytes,
-    deepseek_v4_indexer_mxfp4_value_bytes,
     deepseek_v4_nope_dim,
     deepseek_v4_swa_row_bytes,
     deepseek_v4_swa_scale_dim,
     deepseek_v4_swa_token_stride,
+)
+
+__all__ = (
+    "deepseek_v4_build_dense_prefill_local_compressed_indices",
+    "deepseek_v4_combine_dense_swa_indices",
+    "deepseek_v4_combine_topk_swa_indices",
+    "deepseek_v4_compressed_slot_mapping",
+    "deepseek_v4_compute_global_topk_indices_and_lens",
+    "deepseek_v4_decode_swa_indices_and_lens",
+    "deepseek_v4_dequantize_and_gather_k_cache",
+    "deepseek_v4_fused_inv_rope_fp8_quant",
+    "deepseek_v4_csa_compress_kv_cache_insert",
+    "deepseek_v4_csa_indexer_cache_insert",
+    "deepseek_v4_hca_compress_kv_cache_insert",
+    "deepseek_v4_prepare_indexer_q_mxfp4",
+    "dequantize_deepseek_v4_fp8_ds_mla_cache",
+    "fused_qnorm_rope_kv_insert",
+    "read_deepseek_v4_indexer_fp8_cache",
+    "read_deepseek_v4_indexer_mxfp4_cache",
+    "save_deepseek_v4_compressor_state",
+    "write_deepseek_v4_indexer_fp8_cache",
+    "write_deepseek_v4_indexer_mxfp4_cache",
 )
 
 
@@ -185,16 +206,6 @@ def _e2m1_values(nibbles: torch.Tensor) -> torch.Tensor:
 
 
 def _deepseek_v4_hadamard_rotate(x: torch.Tensor) -> torch.Tensor:
-    try:
-        from tokenspeed_kernel.thirdparty.fast_hadamard_transform import (
-            hadamard_transform,
-        )
-    except Exception as exc:
-        raise RuntimeError(
-            "DeepSeek V4 CSA indexer requires fast_hadamard_transform. "
-            "Build/install `tokenspeed-kernel/python` before serving V4."
-        ) from exc
-
     shape = x.shape
     rotated = hadamard_transform(
         x.to(torch.bfloat16).reshape(-1, shape[-1]).contiguous(),

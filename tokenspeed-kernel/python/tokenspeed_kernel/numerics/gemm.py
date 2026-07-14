@@ -72,7 +72,8 @@ def tolerance(
     - fp32: error grows as sqrt(K) under fp32 accumulation noise.
     - fp16/bf16: K-independent — fp32 accumulation is well below the output
       dtype's rounding floor, so error is dominated by the final cast.
-    - fp8: error grows linearly with K for blockwise kernels.
+    - fp8: error grows linearly with K for blockwise kernels, with a floor for
+      the output dtype rounding error on small K.
     """
     if dtype not in _ATOL:
         raise KeyError(f"No GEMM tolerance baseline for dtype={dtype}")
@@ -84,7 +85,8 @@ def tolerance(
 
     base = _ATOL[dtype]
     if dtype in _FP8_DTYPES:
-        scale = max(K, 1) / 128.0
+        output_rounding_floor = max(_ATOL[d] for d in _BF16_FP16_DTYPES)
+        scale = max(base * max(K, 1) / 128.0, output_rounding_floor) / base
     elif dtype in _BF16_FP16_DTYPES:
         scale = 1.0
     else:

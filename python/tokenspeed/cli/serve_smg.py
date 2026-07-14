@@ -55,7 +55,6 @@ DEEPSEEK_V4_TOOL_CALL_PARSER = "deepseek_v4"
 GLM_REASONING_PARSER = "glm45"
 GLM_TOOL_CALL_PARSER = "glm47_moe"
 DEFAULT_SMG_LOG_LEVEL = "warn"
-DEFAULT_SMG_PROMETHEUS_PORT = 8413
 # smg routing policy for ``ts serve``. Distinct from DEFAULT_REASONING_PARSER,
 # which happens to share the "passthrough" string but configures an unrelated
 # flag (--reasoning-parser).
@@ -194,19 +193,22 @@ def _gateway_args_with_default_log_level(gateway_args: list[str]) -> list[str]:
 
 
 def _gateway_args_with_default_prometheus_port(gateway_args: list[str]) -> list[str]:
-    """Pin the smg Prometheus exporter to ``DEFAULT_SMG_PROMETHEUS_PORT``.
+    """Bind the smg Prometheus exporter to a freshly allocated free port.
 
-    smg's own default (``29000``) collides easily when multiple ``ts serve``
-    instances share a host or when a previous run hasn't released the
-    port yet — the gateway then exits early and the tokenizer
-    registration job never runs, surfacing later as
-    ``tokenizer_not_found`` on the first request. Pinning a tokenspeed-
-    specific default keeps the port stable for our deployments while
-    still allowing an explicit override.
+    smg's own default (``29000``) — and any *fixed* port — collides when
+    multiple ``ts serve`` instances share a host, or when a previous run
+    left the port in ``TIME_WAIT`` (smg binds without ``SO_REUSEADDR``, so
+    the bind panics with ``AddrInUse`` even though no process holds it).
+    A dead metrics server makes the gateway exit during startup, the
+    tokenizer registration job never runs, and the first request surfaces
+    ``tokenizer_not_found`` / ``no worker available``. Allocating a fresh
+    free port per launch (like the engine and control ports) avoids every
+    collision; callers that need a stable scrape target can still pass an
+    explicit ``--prometheus-port``.
     """
     if "--prometheus-port" in gateway_args:
         return gateway_args
-    return [*gateway_args, "--prometheus-port", str(DEFAULT_SMG_PROMETHEUS_PORT)]
+    return [*gateway_args, "--prometheus-port", str(get_free_port())]
 
 
 def _user_model_id(gateway_args: list[str]) -> str | None:
@@ -282,12 +284,20 @@ def _args_with_default_model_parsers(
     name to defer json_schema grammars past the reasoning channel.
     """
     model_id = _user_model_id(gateway_args) or _user_model_id(engine_args)
-    if not _is_deepseek_v4_model(model_id):
-        if not _is_glm_dsa_model(model_id):
-            return engine_args, gateway_args
+    engine_result = list(engine_args)
+    gateway_result = list(gateway_args)
 
-        engine_result = list(engine_args)
-        gateway_result = list(gateway_args)
+    if _is_deepseek_v4_model(model_id):
+        if (
+            "--reasoning-parser" not in engine_result
+            and "--reasoning-parser" not in gateway_result
+        ):
+            engine_result.extend(["--reasoning-parser", DEEPSEEK_V4_REASONING_PARSER])
+            gateway_result.extend(["--reasoning-parser", DEEPSEEK_V4_REASONING_PARSER])
+        if "--tool-call-parser" not in gateway_result:
+            gateway_result.extend(["--tool-call-parser", DEEPSEEK_V4_TOOL_CALL_PARSER])
+
+    elif _is_glm_dsa_model(model_id):
         if (
             "--reasoning-parser" not in engine_result
             and "--reasoning-parser" not in gateway_result
@@ -296,20 +306,7 @@ def _args_with_default_model_parsers(
             gateway_result.extend(["--reasoning-parser", GLM_REASONING_PARSER])
         if "--tool-call-parser" not in gateway_result:
             gateway_result.extend(["--tool-call-parser", GLM_TOOL_CALL_PARSER])
-        if "--disable-kvstore" not in engine_result:
-            engine_result.append("--disable-kvstore")
-        return engine_result, gateway_result
 
-    engine_result = list(engine_args)
-    gateway_result = list(gateway_args)
-    if (
-        "--reasoning-parser" not in engine_result
-        and "--reasoning-parser" not in gateway_result
-    ):
-        engine_result.extend(["--reasoning-parser", DEEPSEEK_V4_REASONING_PARSER])
-        gateway_result.extend(["--reasoning-parser", DEEPSEEK_V4_REASONING_PARSER])
-    if "--tool-call-parser" not in gateway_result:
-        gateway_result.extend(["--tool-call-parser", DEEPSEEK_V4_TOOL_CALL_PARSER])
     return engine_result, gateway_result
 
 
@@ -353,10 +350,26 @@ def _gateway_args_with_defaults(gateway_args: list[str]) -> list[str]:
     return _gateway_args_with_default_prometheus_port(gateway_args)
 
 
+def _add_rl_control_port(engine_args: list[str]) -> tuple[list[str], str]:
+    """Wire the in-engine RL control-plane port for the sidecar to proxy.
+
+    The control plane is ungated (always on); ensure ``--rl-control-port``
+    is present in the engine argv (allocating a free port if the user did not pin
+    one) and return the matching ``rl_control_url``.
+    """
+    if "--rl-control-port" in engine_args:
+        idx = engine_args.index("--rl-control-port")
+        port = int(engine_args[idx + 1])
+        return engine_args, f"http://127.0.0.1:{port}"
+    port = get_free_port()
+    return [*engine_args, "--rl-control-port", str(port)], (f"http://127.0.0.1:{port}")
+
+
 async def _start_control_server(
     *,
     gateway_url: str,
     engine_grpc_addr: str,
+    rl_control_url: str = "",
     host: str,
     port: int,
     timeout: float = 30.0,
@@ -370,11 +383,12 @@ async def _start_control_server(
     """
     import threading
 
-    from tokenspeed.runtime.entrypoints.http_server import build_server
+    from tokenspeed.runtime.entrypoints.control_server import build_control_server
 
-    server = build_server(
+    server = build_control_server(
         gateway_url=gateway_url,
         engine_grpc_addr=engine_grpc_addr,
+        rl_control_url=rl_control_url,
         host=host,
         port=port,
     )
@@ -476,6 +490,10 @@ async def run_smg(
     try:
         engine_port = get_free_port()
 
+        # Wire the in-engine RL control-plane port (always on). Must happen
+        # before spawn_engine.
+        engine_args, rl_control_url = _add_rl_control_port(engine_args)
+
         engine = await spawn_engine(engine_args, host="127.0.0.1", port=engine_port)
         engine_log = asyncio.create_task(_stream_to(engine, ENGINE_TAG))
 
@@ -513,6 +531,7 @@ async def run_smg(
         control_ok = await _start_control_server(
             gateway_url=f"http://{user_host}:{user_port}",
             engine_grpc_addr=f"127.0.0.1:{engine_port}",
+            rl_control_url=rl_control_url,
             host=user_host,
             port=control_port,
         )

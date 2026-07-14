@@ -22,16 +22,20 @@
 """Rotary Positional Embeddings."""
 
 import itertools
+import logging
 import math
-from typing import Any, Tuple
+from typing import Any
 
 import torch
 import torch.nn as nn
-from tokenspeed_kernel.ops.embedding import FusedSetKVBufferArg, apply_rope
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.ops.embedding import (
+    FusedMLASetKVBufferArg,
+    FusedSetKVBufferArg,
+    apply_rope,
+)
 from tokenspeed_kernel.torch_compile import get_compiler_backend
 
-_is_nvidia = current_platform().is_nvidia
+logger = logging.getLogger(__name__)
 
 
 def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
@@ -91,7 +95,7 @@ def apply_rotary_pos_emb_native(
     cos: torch.Tensor,
     sin: torch.Tensor,
     unsqueeze_dim=1,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     orig_q_dtype = q.dtype
     orig_k_dtype = k.dtype
     q, k = q.float(), k.float()
@@ -171,22 +175,24 @@ class RotaryEmbedding(torch.nn.Module):
         key: torch.Tensor,
         offsets: torch.Tensor | None = None,
         fused_set_kv_buffer_arg: FusedSetKVBufferArg | None = None,
+        fused_mla_set_kv_buffer_arg: FusedMLASetKVBufferArg | None = None,
         output_q_rope: torch.Tensor | None = None,
         output_k_rope: torch.Tensor | None = None,
         enable_pdl: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if offsets is not None:
+            raise ValueError("embedding.rope does not support offsets")
         return apply_rope(
             positions=positions,
-            query=query,
-            key=key,
+            q=query,
+            k=key,
             head_size=self.head_size,
             cos_sin_cache=self.cos_sin_cache,
             is_neox=self.is_neox_style,
-            offsets=offsets,
-            rotary_dim=self.rotary_dim,
             fused_set_kv_buffer_arg=fused_set_kv_buffer_arg,
-            output_q_rope=output_q_rope,
-            output_k_rope=output_k_rope,
+            fused_mla_set_kv_buffer_arg=fused_mla_set_kv_buffer_arg,
+            q_rope_out=output_q_rope,
+            k_rope_out=output_k_rope,
             enable_pdl=enable_pdl,
         )
 
@@ -238,7 +244,7 @@ class LinearScalingRotaryEmbedding(RotaryEmbedding):
     ) -> None:
         if isinstance(scaling_factors, float):
             scaling_factors = [scaling_factors]
-        self.scaling_factors: List[float] = scaling_factors
+        self.scaling_factors: list[float] = scaling_factors
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
@@ -276,7 +282,8 @@ class LinearScalingRotaryEmbedding(RotaryEmbedding):
             float(scaling_factor): offsets[i]
             for i, scaling_factor in enumerate(self.scaling_factors)
         }
-        assert len(self.scaling_factors) == len(offsets)
+        if len(self.scaling_factors) != len(offsets):
+            raise RuntimeError("scaling factor offsets were not initialized correctly.")
         return torch.cat(cache_list, dim=0)
 
     @property
@@ -669,17 +676,30 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         query: torch.Tensor,
         key: torch.Tensor,
         fused_set_kv_buffer_arg=None,
+        fused_mla_set_kv_buffer_arg=None,
         output_q_rope=None,
         offsets: torch.Tensor | None = None,
+        enable_pdl: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if _is_nvidia:
+        if offsets is None:
             return super().forward(
                 positions=positions,
                 query=query,
                 key=key,
                 fused_set_kv_buffer_arg=fused_set_kv_buffer_arg,
+                fused_mla_set_kv_buffer_arg=fused_mla_set_kv_buffer_arg,
                 output_q_rope=output_q_rope,
                 offsets=offsets,
+                enable_pdl=enable_pdl,
+            )
+        if (
+            fused_set_kv_buffer_arg is not None
+            or fused_mla_set_kv_buffer_arg is not None
+            or output_q_rope is not None
+        ):
+            raise ValueError(
+                "DeepseekScalingRotaryEmbedding offset path does not support "
+                "fused KV writes or output_q_rope"
             )
 
         dtype = query.dtype
@@ -824,7 +844,7 @@ class MRotaryEmbedding(RotaryEmbedding):
             expected_sum = rotary_dim // 2
             actual_sum = sum(self.mrope_section)
             if actual_sum != expected_sum:
-                print(
+                logger.warning(
                     f"MRoPE section sum mismatch: expected {expected_sum}, got {actual_sum}. "
                     f"Adjusting mrope_section to match rotary_dim // 2 = {expected_sum}"
                 )
@@ -849,7 +869,7 @@ class MRotaryEmbedding(RotaryEmbedding):
                     for i in range(remainder):
                         self.mrope_section[i] += 1
 
-                print(
+                logger.warning(
                     f"Corrected mrope_section: {self.mrope_section} (sum={sum(self.mrope_section)})"
                 )
 
@@ -870,16 +890,17 @@ class MRotaryEmbedding(RotaryEmbedding):
             query: [num_tokens, num_heads * head_size]
             key: [num_tokens, num_kv_heads * head_size]
         """
-        assert (
-            fused_set_kv_buffer_arg is None
-        ), "save kv cache is not supported for MRotaryEmbedding."
-        assert positions.ndim == 1 or positions.ndim == 2
+        if fused_set_kv_buffer_arg is not None:
+            raise ValueError("save kv cache is not supported for MRotaryEmbedding.")
+        if positions.ndim not in (1, 2):
+            raise ValueError(f"positions must be 1D or 2D, got ndim={positions.ndim}.")
 
         num_tokens = positions.shape[-1]
         cos_sin = self.cos_sin_cache[positions]
         cos, sin = cos_sin.chunk(2, dim=-1)
         if positions.ndim == 2:
-            assert self.mrope_section
+            if not self.mrope_section:
+                raise RuntimeError("mrope_section must be set for 2D M-RoPE.")
 
             if self.mrope_interleaved:
                 cos = apply_interleaved_rope(cos, self.mrope_section)

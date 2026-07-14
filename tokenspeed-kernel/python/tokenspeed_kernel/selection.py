@@ -484,9 +484,9 @@ def spec_matches_shape_traits(spec: KernelSpec, shape: dict[str, Any]) -> bool:
         "n_align_64": ("N", 64),
         "n_align_128": ("N", 128),
         "k_align_16": ("K", 16),
+        "k_align_64": ("K", 64),
         "k_align_128": ("K", 128),
     }
-
     for trait_name, (dim_name, alignment) in alignment_traits.items():
         values = spec.traits.get(trait_name)
         if values is None or True not in values:

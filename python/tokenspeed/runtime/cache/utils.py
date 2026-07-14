@@ -175,9 +175,10 @@ def set_mla_kv_buffer_triton(
         )
     else:
         BLOCK = 256
-        assert (
-            nope_dim % BLOCK == 0
-        ), f"nope_dim ({nope_dim}) must be a multiple of BLOCK ({BLOCK})"
+        if nope_dim % BLOCK != 0:
+            raise ValueError(
+                f"nope_dim ({nope_dim}) must be a multiple of BLOCK ({BLOCK})"
+            )
         grid = (n_loc, triton.cdiv(nope_dim + rope_dim, BLOCK))
         set_mla_kv_buffer_kernel[grid](
             kv_buffer,
@@ -345,9 +346,10 @@ def get_mla_kv_buffer_triton(
         )
     else:
         BLOCK = 256
-        assert (
-            nope_dim % BLOCK == 0
-        ), f"nope_dim ({nope_dim}) must be a multiple of BLOCK ({BLOCK})"
+        if nope_dim % BLOCK != 0:
+            raise ValueError(
+                f"nope_dim ({nope_dim}) must be a multiple of BLOCK ({BLOCK})"
+            )
         grid = (n_loc, triton.cdiv(nope_dim + rope_dim, BLOCK))
         get_mla_kv_buffer_kernel[grid](
             kv_buffer,

@@ -130,7 +130,8 @@ class EnvField:
     def get(self) -> Any:
         value = os.getenv(self.name)
         if self._set_to_none:
-            assert value is None
+            if value is not None:
+                raise RuntimeError(f"{self.name} is set while marked as None.")
             return None
 
         if value is None:
@@ -259,6 +260,13 @@ class Envs:
     TOKENSPEED_DISAGGREGATION_THREAD_POOL_SIZE = EnvInt(-1)
     TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT = EnvInt(120)
     TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
+    TOKENSPEED_EPD_ENCODE_RING_SLOTS = EnvInt(64)
+    TOKENSPEED_EPD_ENCODE_RING_SLOT_MB = EnvInt(None)
+    TOKENSPEED_EPD_ENCODE_EMBED_CACHE_MB = EnvInt(4096)
+    TOKENSPEED_EPD_ENCODE_EMBED_CACHE_DRAM_MB = EnvInt(0)
+    TOKENSPEED_EPD_RECV_POOL_SLOTS = EnvInt(16)
+    TOKENSPEED_EPD_RECV_POOL_SLOT_MB = EnvInt(256)
+    TOKENSPEED_EPD_EMBEDDING_SHARD = EnvBool(True)
     TOKENSPEED_PD_LAYERWISE_DEBUG = EnvBool(False)
     TOKENSPEED_PD_PREFILL_METADATA_TIMEOUT = EnvFloat(5.0)
     TOKENSPEED_KV_EVENTS_BACKEND_ID = EnvStr("tokenspeed-worker")

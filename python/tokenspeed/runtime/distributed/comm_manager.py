@@ -60,10 +60,10 @@ class CommManager:
         return sum(scattered), max(scattered)
 
     def scattered_num_tokens(self, ctx: ForwardContext) -> list[int]:
-        # Under draft first-step reduce, comm operates on bs / global_bs since
-        # the midlayer pruned activations to one row per request.
         global_counts = (
-            ctx.global_bs if ctx.draft_first_step_reduce else ctx.global_num_tokens
+            ctx.collective_global_num_tokens
+            if ctx.collective_global_num_tokens is not None
+            else ctx.global_num_tokens
         )
         if global_counts is not None:
             scattered = []
@@ -77,7 +77,11 @@ class CommManager:
                     self._scatter_count(num_tokens, self.mapping.attn.tp_size)
                 )
             return scattered
-        num_tokens = ctx.bs if ctx.draft_first_step_reduce else ctx.input_num_tokens
+        num_tokens = (
+            ctx.collective_num_tokens
+            if ctx.collective_num_tokens is not None
+            else ctx.input_num_tokens
+        )
         return self._scatter_count(num_tokens, self.mapping.attn.tp_size)
 
     def attn_tp_group_scattered_num_tokens(self, ctx: ForwardContext) -> list[int]:
@@ -92,10 +96,10 @@ class CommManager:
 
     def moe_tp_ep_group_scattered_num_tokens(self, ctx: ForwardContext) -> list[int]:
         tp_ep_size = self.mapping.moe.tp_ep_size
-        # Under draft first-step reduce, the midlayer pruned activations to bs
-        # rows before pre_moe_comm; MoE collectives must size accordingly.
         global_counts = (
-            ctx.global_bs if ctx.draft_first_step_reduce else ctx.global_num_tokens
+            ctx.collective_global_num_tokens
+            if ctx.collective_global_num_tokens is not None
+            else ctx.global_num_tokens
         )
         # Without DP, all ranks share the batch and the scattered table needs
         # no global metadata, so the lookup below stays valid.
@@ -110,7 +114,11 @@ class CommManager:
             ]
         # With DP but no gathered metadata, other dp groups' counts are
         # unknown; only the local rank's contribution can be reported.
-        num_tokens = ctx.bs if ctx.draft_first_step_reduce else ctx.input_num_tokens
+        num_tokens = (
+            ctx.collective_num_tokens
+            if ctx.collective_num_tokens is not None
+            else ctx.input_num_tokens
+        )
         result = [0] * tp_ep_size
         result[self.mapping.moe.tp_ep_rank] = num_tokens
         return result

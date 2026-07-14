@@ -53,7 +53,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 from tokenspeed.runtime.pd.disaggregation_decode_scheduler import (
-    DisaggregationDecodeScheduler,
+    DisaggDecodeScheduler,
 )
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -69,7 +69,7 @@ bid = 0
 
 
 @dataclasses.dataclass
-class ScheduleBatch(DisaggregationDecodeScheduler):
+class ScheduleBatch(DisaggDecodeScheduler):
     """Store all information of a batch on the scheduler."""
 
     # Request, memory pool, and cache

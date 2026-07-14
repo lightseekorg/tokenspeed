@@ -32,7 +32,7 @@ implementation detail.
 """
 
 import hashlib
-from typing import Iterable, Union
+from collections.abc import Iterable
 
 import numpy as np
 import torch
@@ -42,7 +42,7 @@ from tokenspeed.runtime.utils import flatten_nested_list
 # blake2b emits an 8-byte digest natively, which is exactly our key width.
 _KEY_BYTES = 8
 
-ByteChunk = Union[bytes, bytearray, memoryview]
+ByteChunk = bytes | bytearray | memoryview
 
 
 def _fold(chunks: Iterable[ByteChunk]) -> int:
@@ -53,7 +53,7 @@ def _fold(chunks: Iterable[ByteChunk]) -> int:
     return int.from_bytes(digest.digest(), byteorder="big")
 
 
-def _raw_bytes(buffer: Union[torch.Tensor, np.ndarray]) -> memoryview:
+def _raw_bytes(buffer: torch.Tensor | np.ndarray) -> memoryview:
     """Contiguous byte view of a tensor/array; CUDA tensors are pulled to host."""
     if isinstance(buffer, torch.Tensor):
         if buffer.is_cuda:

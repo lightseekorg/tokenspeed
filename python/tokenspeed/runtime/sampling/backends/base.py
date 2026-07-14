@@ -36,12 +36,15 @@ if TYPE_CHECKING:
 
 
 DEFAULT_RANDOM_SEED = 48
+CUDA_GRAPH_VARIANT_DEFAULT = "default"
 SPECULATIVE_ACCEPT_THRESHOLD_SINGLE = 1.0
 SPECULATIVE_ACCEPT_THRESHOLD_ACC = 1.0
 
 
 @dataclass
 class SamplingBackendConfig:
+
+    enable_nan_detection: bool = False
 
     # Optional logprob features — OFF by default. These are checked at server
     # start / graph capture time so the fast path has zero extra compute.
@@ -81,6 +84,7 @@ class SamplingBackendConfig:
     ) -> SamplingBackendConfig:
 
         return cls(
+            enable_nan_detection=server_args.enable_nan_detection,
             enable_output_logprobs=server_args.enable_output_logprobs,
             max_bs=max_bs,
             max_draft_tokens_per_req=max(max_draft_tokens_per_req, 1),
@@ -215,6 +219,23 @@ class SamplingBackend(ABC):
             bs=bs,
             request_pool_indices=None,
         )
+
+    def cuda_graph_capture_variants(self, num_tokens_per_req: int) -> tuple[str, ...]:
+        """Return sampler-specific CUDA graph variants to capture."""
+        return (CUDA_GRAPH_VARIANT_DEFAULT,)
+
+    def prepare_capture_variant(
+        self,
+        bs: int,
+        num_tokens_per_req: int,
+        variant: str,
+    ) -> None:
+        if variant != CUDA_GRAPH_VARIANT_DEFAULT:
+            raise ValueError(f"Unsupported CUDA graph variant: {variant}")
+        self.prepare_capture(bs=bs, num_tokens_per_req=num_tokens_per_req)
+
+    def cuda_graph_replay_variant(self, num_tokens_per_req: int) -> str:
+        return CUDA_GRAPH_VARIANT_DEFAULT
 
     def _prepare_step_hook(
         self,

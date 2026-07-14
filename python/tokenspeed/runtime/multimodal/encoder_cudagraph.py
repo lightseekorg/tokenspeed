@@ -28,9 +28,10 @@ fallback. Model/modality-specific input layout is supplied by an adapter object.
 from __future__ import annotations
 
 import contextlib
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import cached_property
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 import torch
 

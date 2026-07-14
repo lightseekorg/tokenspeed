@@ -1,9 +1,7 @@
-# Adapted from meituan-longcat/SGLang-FluentLLM.
-# This file has been modified for this repository.
-# This file may incorporate material from ModelTC/lightllm,
-# vllm-project/vllm, and sgl-project/sglang, as identified in
-# python/THIRDPARTYNOTICES.
-
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: Copyright (c) 2026 LightSeek Foundation
+# SPDX-FileCopyrightText: Copyright (c) 2025 DeepSeek
+#
 # Copyright (c) 2026 LightSeek Foundation
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -43,7 +41,10 @@ def balanced_packing(
         rank_in_pack: [X, n], the rank of the item in the pack
     """
     num_layers, num_groups = weight.shape
-    assert num_groups % num_packs == 0
+    if num_packs <= 0 or num_groups % num_packs != 0:
+        raise ValueError(
+            f"num_groups={num_groups} must be divisible by num_packs={num_packs}."
+        )
     groups_per_pack = num_groups // num_packs
 
     if groups_per_pack == 1:
@@ -64,7 +65,8 @@ def balanced_packing(
                 (i for i in range(num_packs) if pack_items[i] < groups_per_pack),
                 key=pack_weights.__getitem__,
             )
-            assert pack_items[pack] < groups_per_pack
+            if pack_items[pack] >= groups_per_pack:
+                raise RuntimeError("balanced_packing selected a full pack.")
             pack_index[i, group] = pack
             rank_in_pack[i, group] = pack_items[pack]
             pack_weights[pack] += weight[i, group]
@@ -89,7 +91,10 @@ def replicate_experts(
     """
     n, num_log = weight.shape
     num_redundant = num_phy - num_log
-    assert num_redundant >= 0
+    if num_redundant < 0:
+        raise ValueError(
+            f"num_phy={num_phy} must be greater than or equal to num_log={num_log}."
+        )
     device = weight.device
     phy2log = torch.arange(num_phy, dtype=torch.int64, device=device).repeat(n, 1)
     rank = torch.zeros(n, num_phy, dtype=torch.int64, device=device)
@@ -124,12 +129,24 @@ def rebalance_experts_hierarchical(
         logical_count: [num_moe_layers, num_logical_experts]
     """
     num_layers, num_logical_experts = weight.shape
-    assert num_logical_experts % num_groups == 0
+    if num_groups <= 0 or num_logical_experts % num_groups != 0:
+        raise ValueError(
+            f"num_logical_experts={num_logical_experts} must be divisible by num_groups={num_groups}."
+        )
     group_size = num_logical_experts // num_groups
-    assert num_groups % num_nodes == 0
+    if num_nodes <= 0 or num_groups % num_nodes != 0:
+        raise ValueError(
+            f"num_groups={num_groups} must be divisible by num_nodes={num_nodes}."
+        )
     groups_per_node = num_groups // num_nodes
-    assert num_gpus % num_nodes == 0
-    assert num_physical_experts % num_gpus == 0
+    if num_gpus <= 0 or num_gpus % num_nodes != 0:
+        raise ValueError(
+            f"num_gpus={num_gpus} must be divisible by num_nodes={num_nodes}."
+        )
+    if num_physical_experts % num_gpus != 0:
+        raise ValueError(
+            f"num_physical_experts={num_physical_experts} must be divisible by num_gpus={num_gpus}."
+        )
     phy_experts_per_gpu = num_physical_experts // num_gpus
 
     def inverse(perm: torch.Tensor) -> torch.Tensor:

@@ -92,7 +92,8 @@ class RequestOutputCollector:
 
     def _merge_into_pending(self, output: dict[str, Any]) -> None:
         pending = self._pending
-        assert pending is not None  # guarded by put()
+        if pending is None:
+            raise RuntimeError("Cannot merge output without a pending value.")
         pending_kind = self._output_kind(pending)
         output_kind = self._output_kind(output)
         if pending_kind != output_kind:

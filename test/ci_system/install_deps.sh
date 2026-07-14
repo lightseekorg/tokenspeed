@@ -30,6 +30,7 @@ export CPLUS_INCLUDE_PATH="/usr/local/cuda/include/cccl"
 export C_INCLUDE_PATH="/usr/local/cuda/include/cccl"
 
 WORKSPACE=${WORKSPACE:-$(pwd)}
+CUDA_REQ="${WORKSPACE}/tokenspeed-kernel/python/requirements/cuda.txt"
 
 # Wrap pip install in a retry loop. PyPI's CDN occasionally returns a
 # bad Content-Type for /simple/<pkg>/ pages (most recently observed for
@@ -53,6 +54,23 @@ pip_install_with_retry() {
         attempt=$((attempt + 1))
         delay=$((delay * 2))
     done
+}
+
+ensure_flashinfer_jit_cache_for_gb200() {
+    if [[ "${CI_RUNNER_LABEL:-}" != gb200* ]]; then
+        return 0
+    fi
+
+    local wheel_url
+    wheel_url="$(python3 "${SCRIPT_DIR}/flashinfer_jit_cache_installer.py" \
+        --requirements "${CUDA_REQ}" \
+        --cuda-index "${CUINDEX}")"
+    if [ -z "${wheel_url}" ]; then
+        return 0
+    fi
+
+    pip_install_with_retry pip3 install --break-system-packages \
+        --force-reinstall --no-deps "${wheel_url}"
 }
 
 echo "=========================================="
@@ -87,25 +105,31 @@ echo "=== Step 2: Upgrade pip/setuptools/wheel ==="
 python3 -m pip install --upgrade pip setuptools wheel
 
 # ============================================================
-# Step 3: Install tokenspeed-kernel
+# Step 3: Sync FlashInfer JIT cache on GB200
 # ============================================================
-echo "=== Step 3: Install tokenspeed-kernel ==="
+echo "=== Step 3: Sync FlashInfer JIT cache on GB200 ==="
+ensure_flashinfer_jit_cache_for_gb200
+
+# ============================================================
+# Step 4: Install tokenspeed-kernel
+# ============================================================
+echo "=== Step 4: Install tokenspeed-kernel ==="
 cd ${WORKSPACE}
 export PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cu${CUINDEX}"
 TOKENSPEED_KERNEL_BACKEND=cuda FLASHINFER_CUDA_ARCH_LIST="${FI_ARCH}" \
 pip_install_with_retry pip3 install tokenspeed-kernel/python/ --no-build-isolation -v
 
 # ============================================================
-# Step 4: Install TokenSpeed Scheduler (C++)
+# Step 5: Install TokenSpeed Scheduler (C++)
 # ============================================================
-echo "=== Step 4: Install TokenSpeed Scheduler ==="
+echo "=== Step 5: Install TokenSpeed Scheduler ==="
 pip_install_with_retry pip3 install cmake ninja
 pip_install_with_retry pip3 install tokenspeed-scheduler/
 
 # ============================================================
-# Step 5: Install TokenSpeed
+# Step 6: Install TokenSpeed
 # ============================================================
-echo "=== Step 5: Install TokenSpeed ==="
+echo "=== Step 6: Install TokenSpeed ==="
 # tokenspeed-smg / -grpc-servicer / -grpc-proto are pinned in
 # python/pyproject.toml; pip resolves them from PyPI as part of the
 # editable install below.
@@ -113,7 +137,7 @@ pip_install_with_retry pip3 install -e "./python" \
     --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX}
 
 # ============================================================
-# Step 6: Optionally override tokenspeed-mla with in-tree source
+# Step 7: Optionally override tokenspeed-mla with in-tree source
 # ============================================================
 # Set by `.github/workflows/pr-test-amd.yml` and
 # `.github/workflows/pr-test-nvidia.yml` when the diff touches
@@ -122,25 +146,37 @@ pip_install_with_retry pip3 install -e "./python" \
 # `tokenspeed-kernel/python/requirements/cuda-thirdparty.txt` and the
 # in-tree change is silently ignored.
 if [ "${INSTALL_TOKENSPEED_MLA_FROM_SOURCE:-0}" = "1" ]; then
-    echo "=== Step 6: Reinstall tokenspeed-mla from in-tree source ==="
+    echo "=== Step 7: Reinstall tokenspeed-mla from in-tree source ==="
     pip_install_with_retry pip3 install --break-system-packages \
         --force-reinstall --no-deps "${WORKSPACE}/tokenspeed-mla"
 fi
 
 # ============================================================
-# Step 7: Pin critical kernel deps to exact versions
+# Step 8: Pin critical kernel deps to exact versions
 # ============================================================
-echo "=== Step 7: Pin critical kernel deps ==="
-CUDA_REQ="${WORKSPACE}/tokenspeed-kernel/python/requirements/cuda.txt"
+echo "=== Step 8: Pin critical kernel deps ==="
 pin_version() {
-    # Extract "<pkg>==<version>" for an exact-pinned package in cuda.txt.
+    # Extract exact-pinned package specs, including optional extras.
     local pkg="$1"
-    grep -E "^${pkg}==" "${CUDA_REQ}" | head -n1 | tr -d '[:space:]'
+    grep -E "^${pkg}(\[[^]]+\])?==" "${CUDA_REQ}" | head -n1 | tr -d '[:space:]'
 }
 CUDA_MAJOR="${CUDA_VERSION%%.*}"
+CUTLASS_DSL_SPEC="$(pin_version nvidia-cutlass-dsl)"
+if [ -n "${CUTLASS_DSL_SPEC}" ]; then
+    CUTLASS_DSL_VERSION="${CUTLASS_DSL_SPEC##*==}"
+    CUTLASS_DSL_DEPS=(
+        "nvidia-cutlass-dsl==${CUTLASS_DSL_VERSION}"
+        "nvidia-cutlass-dsl-libs-base==${CUTLASS_DSL_VERSION}"
+        "nvidia-cutlass-dsl-libs-core==${CUTLASS_DSL_VERSION}"
+        "nvidia-cutlass-dsl-libs-cu${CUDA_MAJOR}==${CUTLASS_DSL_VERSION}"
+    )
+    echo "Force-reinstalling pinned Cutlass DSL packages: ${CUTLASS_DSL_DEPS[*]}"
+    pip_install_with_retry pip3 install --break-system-packages \
+        --force-reinstall --no-deps "${CUTLASS_DSL_DEPS[@]}"
+fi
+
 PINNED_KERNEL_DEPS=()
-for pkg in nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-cu${CUDA_MAJOR} \
-           flashinfer-python flashinfer-cubin; do
+for pkg in flashinfer-python flashinfer-cubin; do
     spec="$(pin_version "${pkg}")"
     if [ -n "${spec}" ]; then
         PINNED_KERNEL_DEPS+=("${spec}")
@@ -155,9 +191,9 @@ else
 fi
 
 # ============================================================
-# Step 8: Fix Triton ptxas (CUDA 13+ only)
+# Step 9: Fix Triton ptxas (CUDA 13+ only)
 # ============================================================
-echo "=== Step 8: Fix Triton ptxas ==="
+echo "=== Step 9: Fix Triton ptxas ==="
 if [ "${CUDA_VERSION%%.*}" = "13" ]; then
     TRITON_BIN="/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin"
     if [ -d "${TRITON_BIN}" ]; then

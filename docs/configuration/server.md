@@ -95,7 +95,7 @@ different process groups.
 | `--draft-moe-backend` | MoE backend for the speculative decoding draft model. |
 | `--all2all-backend` | MoE all-to-all backend. |
 | `--deepep-mode` | DeepEP mode: `auto`, `normal`, or `low_latency`. |
-| `--sampling-backend` | Sampling backend: `greedy`, `flashinfer`, or `flashinfer_full`. |
+| `--sampling-backend` | Sampling backend: `greedy`, `flashinfer`, `flashinfer_full`, `triton`, or `triton_full`. |
 
 Set backend choices explicitly in production. `auto` is useful for bring-up, but
 explicit values make benchmark comparisons and regressions easier to reason

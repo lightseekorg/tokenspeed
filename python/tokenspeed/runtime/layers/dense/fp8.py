@@ -1,9 +1,7 @@
-# Adapted from meituan-longcat/SGLang-FluentLLM.
-# This file has been modified for this repository.
-# This file may incorporate material from ModelTC/lightllm,
-# vllm-project/vllm, and sgl-project/sglang, as identified in
-# python/THIRDPARTYNOTICES.
-
+# SPDX-License-Identifier: MIT AND Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 LightSeek Foundation
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
 # Copyright (c) 2026 LightSeek Foundation
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -150,9 +148,15 @@ class Fp8LinearMethod(LinearMethodBase):
             # WEIGHT SCALE
             if self.block_quant:
                 if hasattr(self.quant_config, "activation_scheme"):
-                    assert self.quant_config.activation_scheme == "dynamic"
+                    if self.quant_config.activation_scheme != "dynamic":
+                        raise ValueError(
+                            "Block FP8 requires dynamic activation quantization."
+                        )
                 elif hasattr(self.quant_config, "linear_activation_scheme"):
-                    assert self.quant_config.linear_activation_scheme == "dynamic"
+                    if self.quant_config.linear_activation_scheme != "dynamic":
+                        raise ValueError(
+                            "Block FP8 requires dynamic linear activation quantization."
+                        )
                 scale = BlockQuantScaleParameter(
                     data=torch.empty(
                         (output_size_per_partition + block_n - 1) // block_n,
@@ -351,7 +355,10 @@ class Fp8LinearMethod(LinearMethodBase):
             output_shape = [*input.shape[:-1], weight.shape[1]]
 
             if input_scale is not None:
-                assert input_scale.numel() == 1
+                if input_scale.numel() != 1:
+                    raise ValueError(
+                        f"input_scale must contain exactly one value, got {input_scale.numel()}."
+                    )
                 qinput, x_scale = static_quant_fp8(input_2d, input_scale)
             else:
                 qinput, x_scale = per_token_quant_fp8(input_2d)

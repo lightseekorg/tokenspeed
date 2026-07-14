@@ -20,15 +20,16 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel import (
-    attn_plan,
     mha_decode_with_kvcache,
     mha_extend_with_kvcache,
+    mha_plan,
     mha_prefill,
 )
 from tokenspeed_kernel.ops.kvcache.triton import (
@@ -37,8 +38,12 @@ from tokenspeed_kernel.ops.kvcache.triton import (
 )
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
+from tokenspeed.runtime.execution.breakable_cuda_graph import scrub_padding_tail
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
+from tokenspeed.runtime.layers.attention.backends.flat_groups import (
+    FlatCacheGroupsMixin,
+)
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.layers.attention.utils import build_page_table
@@ -57,6 +62,15 @@ _KERNEL_SOLUTION_BY_BACKEND = {
 }
 
 
+def _scrub_extend_padding(metadata, q, k, v) -> None:
+    """Zero the q/k/v rows beyond the real (unpadded) token count under a prefill graph.
+
+    Reads the count from the pinned CPU cu-seqlens mirror (sync-free) and delegates the
+    zeroing to the shared prefill-graph padding helper. No-op on normal unpadded forwards.
+    """
+    scrub_padding_tail(metadata.cu_extend_seq_lens_cpu[-1], q, k, v)
+
+
 @dataclass(kw_only=True)
 class MHAExtendMetadata:
     # Device-side metadata:
@@ -66,28 +80,42 @@ class MHAExtendMetadata:
     #   cu_seqlens_kv: the cumsum version of seq_lens
     # - extend_prefix_lens: length of the cached prefix tokens
     # seq_lens[i] = extend_prefix_lens[i] + extend_seq_lens[i]
-    page_table: torch.Tensor
+    # page_table is None on the flat path (per-group page_tables route reads).
+    page_table: torch.Tensor | None
     seq_lens: torch.Tensor
     extend_seq_lens: torch.Tensor
     cu_extend_seq_lens: torch.Tensor
     cu_seqlens_kv: torch.Tensor
     extend_prefix_lens: torch.Tensor
-    # Host-side metadata:
     extend_seq_lens_cpu: list[int]
     cu_extend_seq_lens_cpu: list[int]
     max_extend_seq_len: int
     max_extend_prefix_len: int = 0
+    # Flat per-group page tables (group_id -> [num_reqs, max_pages]); None on
+    # the single-table path. TODO(radix-removal): drop the single page_table.
+    page_tables: dict[str, torch.Tensor] | None = None
+    # Flat per-group KV write locations (group_id -> [num_tokens] int32),
+    # built with page_tables — same groups, same lifecycle.
+    out_cache_locs: dict[str, torch.Tensor] | None = None
 
 
 @dataclass(kw_only=True)
 class MHADecodeMetadata:
-    # Device-side metadata.
-    page_table: torch.Tensor
+    # page_table is None on the flat path (per-group page_tables route reads).
+    page_table: torch.Tensor | None
     seq_lens: torch.Tensor
+    # Flat per-group tables/write-locs; see MHAExtendMetadata.
+    page_tables: dict[str, torch.Tensor] | None = None
+    out_cache_locs: dict[str, torch.Tensor] | None = None
 
 
-class MHAAttnBackend(AttentionBackend):
+class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
     """Standard MHA backend that routes through tokenspeed_kernel attention APIs."""
+
+    # Unconditional: safety comes from the publication rule
+    # (paged_cache_spec.publish_paged_cache_groups) plus the replay
+    # stale-table guard. TODO(radix-removal): drop the flag.
+    uses_flat_cache_groups: bool = True
 
     def support_kv_cache_prewrite(
         self, forward_mode: ForwardMode | None = None
@@ -111,10 +139,13 @@ class MHAAttnBackend(AttentionBackend):
         self.head_dim = config.head_dim
         self.qkv_dtype = config.dtype
         self.kv_cache_dtype = config.kv_cache_dtype
-        self.is_fp8 = self.kv_cache_dtype == torch.float8_e4m3fn
+        self.is_fp8 = self.kv_cache_dtype in (
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        )
         self.plan = partial(
-            attn_plan,
-            dtype=torch.float8_e4m3fn if self.is_fp8 else self.qkv_dtype,
+            mha_plan,
+            dtype=self.kv_cache_dtype if self.is_fp8 else self.qkv_dtype,
             head_dim=self.head_dim,
             return_lse=False,
             solution=self.kernel_solution,
@@ -146,17 +177,54 @@ class MHAAttnBackend(AttentionBackend):
         extend_seq_lens_cpu: torch.Tensor | None = None,
         extend_prefix_lens: torch.Tensor | None = None,
         extend_prefix_lens_cpu: torch.Tensor | None = None,
+        flat_block_tables: dict[str, torch.Tensor] | None = None,
         **kwargs,
     ):
         assert not forward_mode.is_mixed(), "mha backend does not support mixed batch"
 
         seq_lens = seq_lens[:bs]
-        page_table = build_page_table(
-            req_pool_indices[:bs],
-            req_to_page,
-            self.page_size,
-            self.max_context_len,
-        )
+
+        flat_page_tables = self._shed_state_groups(flat_block_tables)
+        flat_out_cache_locs = None
+        if flat_page_tables:
+            # Verify keeps [bs]-row tables; only DFLASH expands rows. TODO(flat+dflash).
+            assert not (
+                self.draft_block_decode and self.spec_num_tokens > 1
+            ), "flat cache groups are unsupported with DFLASH block decode"
+            # The flat path routes every read/write through the per-group
+            # tables; the radix single table would be dead work.
+            page_table = None
+            if forward_mode.is_extend_or_mixed():
+                assert extend_prefix_lens_cpu is not None
+                assert extend_seq_lens_cpu is not None
+                flat_out_cache_locs = self._compute_flat_extend_out_cache_locs(
+                    flat_page_tables,
+                    extend_prefix_lens_cpu[:bs],
+                    extend_seq_lens_cpu[:bs],
+                    self.page_size,
+                )
+            else:
+                verify_tokens = (
+                    self.spec_num_tokens
+                    if self.spec_num_tokens > 1 and not self.is_draft
+                    else 1
+                )
+                flat_out_cache_locs = self._compute_flat_decode_out_cache_locs(
+                    flat_page_tables,
+                    seq_lens,
+                    self.page_size,
+                    verify_tokens,
+                )
+            self._maybe_check_flat_write_locs(
+                flat_page_tables, flat_out_cache_locs, self.page_size
+            )
+        else:
+            page_table = build_page_table(
+                req_pool_indices[:bs],
+                req_to_page,
+                self.page_size,
+                self.max_context_len,
+            )
 
         if forward_mode.is_extend_or_mixed():
             assert extend_seq_lens is not None
@@ -193,15 +261,18 @@ class MHAAttnBackend(AttentionBackend):
                 cu_extend_seq_lens_cpu=cu_extend_seq_lens_cpu,
                 max_extend_seq_len=max_extend_seq_len,
                 max_extend_prefix_len=max_extend_prefix_len,
+                page_tables=flat_page_tables,
+                out_cache_locs=flat_out_cache_locs,
             )
 
-            # Drafter: also fill decode_metadata so step 1+ multi-step has
-            # metadata under EXTEND/MIXED target. seq_lens is the drafter's
-            # live alias buffer (wrapper pre-writes it before this call).
+            # Drafter step 1+ decodes under an EXTEND/MIXED target; seq_lens
+            # aliases the drafter's live buffer (pre-written by the wrapper).
             if self.is_draft:
                 self.forward_decode_metadata = MHADecodeMetadata(
                     page_table=page_table,
                     seq_lens=seq_lens,
+                    page_tables=flat_page_tables,
+                    out_cache_locs=flat_out_cache_locs,
                 )
         else:
             if self.draft_block_decode and self.spec_num_tokens > 1:
@@ -226,14 +297,28 @@ class MHAAttnBackend(AttentionBackend):
                 self.forward_decode_metadata = MHADecodeMetadata(
                     page_table=expanded_page_table,
                     seq_lens=expanded_seq_lens,
+                    page_tables=flat_page_tables,
+                    out_cache_locs=flat_out_cache_locs,
                 )
             else:
                 self.forward_decode_metadata = MHADecodeMetadata(
                     page_table=page_table,
                     seq_lens=seq_lens,
+                    page_tables=flat_page_tables,
+                    out_cache_locs=flat_out_cache_locs,
                 )
 
-    def init_cuda_graph_state(self, max_bs: int, seq_lens_buf: torch.Tensor):
+    def init_cuda_graph_state(
+        self,
+        max_bs: int,
+        seq_lens_buf: torch.Tensor,
+        paged_cache_group_specs: Sequence = (),
+        **kwargs,
+    ):
+        # State-family groups (GDN/mamba pages) belong to the mamba backend;
+        # learn their ids from the pool's specs so every flat table/loc path
+        # here (eager, capture, replay) sheds them.
+        self._learn_flat_state_groups(paged_cache_group_specs)
         assert (
             seq_lens_buf.dtype == torch.int32
             and seq_lens_buf.dim() == 1
@@ -244,6 +329,11 @@ class MHAAttnBackend(AttentionBackend):
         )
 
         self.cuda_graph_decode_metadata = {}
+        # Flat per-group persistent buffers, lazily allocated at first
+        # capture. TODO(radix-removal): parallels cuda_graph_page_table.
+        # Initialized before the DFLASH early return: replay reads the dict
+        # unconditionally for the stale-table guard.
+        self._init_flat_graph_buffers(max_bs)
         if self.draft_block_decode and self.spec_num_tokens > 1:
             # DFLASH draft block: expand to spec_num_tokens decode rows per
             # request (one row per block position), so max_seqlen_q == 1 per row
@@ -273,8 +363,28 @@ class MHAAttnBackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
+        flat_cache_group_ids: tuple[str, ...] = (),
+        **kwargs,
     ):
         assert not forward_mode.is_extend_or_mixed()
+
+        # Real tables only arrive at replay: capture lazily allocates
+        # persistent per-group buffers and records metadata views into them,
+        # so replay can copy_ fresh data to the graph-recorded addresses.
+        if flat_cache_group_ids:
+            # Verify keeps [bs]-row tables + [bs*N] loc views. TODO(flat+dflash).
+            assert not (
+                self.draft_block_decode and self.spec_num_tokens > 1
+            ), "flat_cache_group_ids is unsupported with DFLASH block decode"
+        page_tables, out_cache_locs = self._flat_capture_group_views(
+            bs,
+            flat_cache_group_ids,
+            tokens_per_req=(
+                self.spec_num_tokens
+                if self.spec_num_tokens > 1 and not self.is_draft
+                else 1
+            ),
+        )
 
         if self.draft_block_decode and self.spec_num_tokens > 1:
             # DFLASH draft block: spec_num_tokens decode rows per request.
@@ -282,6 +392,8 @@ class MHAAttnBackend(AttentionBackend):
             metadata = MHADecodeMetadata(
                 page_table=self.cuda_graph_page_table[:expanded_bs, :],
                 seq_lens=self.cuda_graph_seq_lens[:expanded_bs],
+                page_tables=page_tables,
+                out_cache_locs=out_cache_locs,
             )
             # Uniform non-causal seq_lens are written by the drafter inside the
             # captured graph (see fill_block_decode_seq_lens); seed a safe
@@ -289,8 +401,18 @@ class MHAAttnBackend(AttentionBackend):
             metadata.seq_lens.fill_(self.spec_num_tokens)
         else:
             metadata = MHADecodeMetadata(
-                page_table=self.cuda_graph_page_table[:bs, :],
+                # Flat captures route reads through the per-group tables and
+                # replay never fills the radix single table, so mirror the
+                # eager flat path: page_table=None instead of a slice of the
+                # never-filled zero buffer.
+                page_table=(
+                    None
+                    if page_tables is not None
+                    else self.cuda_graph_page_table[:bs, :]
+                ),
                 seq_lens=self.cuda_graph_seq_lens[:bs],
+                page_tables=page_tables,
+                out_cache_locs=out_cache_locs,
             )
             if self.spec_num_tokens > 1 and not self.is_draft:
                 metadata.seq_lens.copy_(seq_lens[:bs].clamp_min(self.spec_num_tokens))
@@ -304,20 +426,27 @@ class MHAAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         req_to_page: torch.Tensor,
         forward_mode: ForwardMode,
+        flat_block_tables: dict[str, torch.Tensor] | None = None,
         **kwargs,
     ):
         assert not forward_mode.is_extend_or_mixed()
 
-        gather_page_table_with_padding(
-            req_to_page=req_to_page,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            out=self.cuda_graph_page_table,
-            bs=bs,
-            max_num_pages=self.max_num_pages,
-            page_size=self.page_size,
-            dummy_slot=0,
-        )
+        # Fail loudly instead of replaying over stale/zero page tables.
+        self._flat_replay_stale_guard(bs, flat_block_tables)
+
+        # Flat captures read only the per-group buffers; the radix single
+        # table (cuda_graph_page_table) would be dead work there.
+        if not self.cuda_graph_flat_page_tables:
+            gather_page_table_with_padding(
+                req_to_page=req_to_page,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                out=self.cuda_graph_page_table,
+                bs=bs,
+                max_num_pages=self.max_num_pages,
+                page_size=self.page_size,
+                dummy_slot=0,
+            )
         if self.spec_num_tokens > 1 and not self.is_draft:
             self.cuda_graph_seq_lens[:bs].copy_(seq_lens[:bs])
         elif self.draft_block_decode:
@@ -329,6 +458,19 @@ class MHAAttnBackend(AttentionBackend):
             self.cuda_graph_page_table[: bs * self.spec_num_tokens, :].view(
                 bs, self.spec_num_tokens, self.max_num_pages
             ).copy_(base_page_table[:, None, :])
+
+        # cuda_graph_seq_lens is filled by input prep / the spec copy above.
+        if flat_block_tables:
+            self._flat_replay_fill(
+                bs,
+                flat_block_tables,
+                self.cuda_graph_seq_lens,
+                tokens_per_req=(
+                    self.spec_num_tokens
+                    if self.spec_num_tokens > 1 and not self.is_draft
+                    else 1
+                ),
+            )
 
         if bs in self.cuda_graph_decode_metadata:
             self.forward_decode_metadata = self.cuda_graph_decode_metadata[bs]
@@ -379,6 +521,13 @@ class MHAAttnBackend(AttentionBackend):
             v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
         sinks = kwargs.get("sinks")
 
+        out_cache_loc = self._select_out_cache_loc(
+            layer,
+            self.forward_decode_metadata,
+            out_cache_loc,
+            prefer_caller=self.is_draft,
+        )
+
         return self._forward_decode(
             q,
             k,
@@ -413,6 +562,7 @@ class MHAAttnBackend(AttentionBackend):
 
         metadata = self.forward_extend_metadata
         sinks = kwargs.get("sinks")
+        out_cache_loc = self._select_out_cache_loc(layer, metadata, out_cache_loc)
         plan = self.plan(
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
@@ -457,11 +607,12 @@ class MHAAttnBackend(AttentionBackend):
         save_kv_cache: bool,
         sinks: torch.Tensor | None,
     ) -> torch.Tensor:
+        _scrub_extend_padding(metadata, q, k, v)
         # TODO: use a custom kernel to do downcast
         if self.is_fp8:
-            q = q.to(torch.float8_e4m3fn)
-            k = k.to(torch.float8_e4m3fn)
-            v = v.to(torch.float8_e4m3fn)
+            q = q.to(self.kv_cache_dtype)
+            k = k.to(self.kv_cache_dtype)
+            v = v.to(self.kv_cache_dtype)
 
         output = mha_prefill(
             q=q,
@@ -492,11 +643,12 @@ class MHAAttnBackend(AttentionBackend):
         save_kv_cache: bool,
         sinks: torch.Tensor | None,
     ) -> torch.Tensor:
+        _scrub_extend_padding(metadata, q, k, v)
         if save_kv_cache:
             self._save_kv_cache(layer, out_cache_loc, token_to_kv_pool, k, v)
 
         if self.is_fp8:
-            q = q.to(torch.float8_e4m3fn)
+            q = q.to(self.kv_cache_dtype)
 
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
         output = mha_extend_with_kvcache(
@@ -505,7 +657,7 @@ class MHAAttnBackend(AttentionBackend):
             cu_seqlens_kv=metadata.cu_seqlens_kv,
             k_cache=k_cache,
             v_cache=v_cache,
-            page_table=metadata.page_table,
+            page_table=self._select_page_table(layer, metadata),
             cache_seqlens=metadata.seq_lens,
             max_seqlen_q=metadata.max_extend_seq_len,
             max_seqlen_k=self.max_context_len,
@@ -536,7 +688,7 @@ class MHAAttnBackend(AttentionBackend):
             self._save_kv_cache(layer, out_cache_loc, token_to_kv_pool, k, v)
 
         if self.is_fp8:
-            q = q.to(torch.float8_e4m3fn)
+            q = q.to(self.kv_cache_dtype)
 
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
         max_seqlen_q = q.shape[0] // metadata.seq_lens.shape[0]
@@ -544,7 +696,7 @@ class MHAAttnBackend(AttentionBackend):
             q=q,
             k_cache=k_cache,
             v_cache=v_cache,
-            page_table=metadata.page_table,
+            page_table=self._select_page_table(layer, metadata),
             cache_seqlens=metadata.seq_lens,
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
@@ -569,8 +721,12 @@ class MHAAttnBackend(AttentionBackend):
     ) -> None:
         if k is None:
             return
+        k, v = self._trim_kv_to_locs(out_cache_loc, k, v)
 
-        if self.is_fp8 and k.dtype != torch.float8_e4m3fn:
+        if (
+            self.kv_cache_dtype == torch.float8_e4m3fn
+            and k.dtype != torch.float8_e4m3fn
+        ):
             k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
             fused_fp8_set_kv_buffer(
                 k=k,

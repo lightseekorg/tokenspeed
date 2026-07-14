@@ -210,7 +210,7 @@ TEST_F(RetractAbortPagesSuite, RetractAbort_NewRequestReusesPages) {
 // Acquire.  If the new tokens cross a page boundary and device is full,
 // scheduleRetract must not crash on pages < full_paged_tokens.
 TEST_F(RetractAbortPagesSuite, Retract_AfterExtendResult_NoPageMismatchCrash) {
-    // Config: page_size=2, device_total=4 (3 usable), decode_input_tokens=0
+    // Config: block_size=2, device_total=4 (3 usable), decode_input_tokens=0
     // r1 uses 1 page; fill remaining 2 pages with r2 so device is full.
     BringToDecoding("r1", 1, 1);  // tokens=[1,2,42], 1 page, tail=0
     BringToDecoding("r2", 2, 3);  // tokens=[3,4,5,6,42], 2 pages, tail=0

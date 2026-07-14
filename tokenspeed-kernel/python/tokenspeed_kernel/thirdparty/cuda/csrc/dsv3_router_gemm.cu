@@ -12,8 +12,8 @@
 
 using tvm::ffi::Tensor;
 
-template <typename ADtype, typename BDtype, int kNumTokens, int kNumExperts, int kHiddenDim>
-void invokeRouterGemmFloatOutput(float* output, ADtype const* mat_a, BDtype const* mat_b, bool enable_pdl, cudaStream_t stream);
+template <typename ADtype, typename BDtype, int kNumTokens, int kHiddenDim>
+void invokeRouterGemmFloatOutput(float* output, ADtype const* mat_a, BDtype const* mat_b, int num_experts, bool enable_pdl, cudaStream_t stream);
 
 static inline int get_sm_version(int device_id) {
   int sm_major = 0;
@@ -95,30 +95,54 @@ static void cublas_fallback_router_gemm(
   }
 }
 
-template <int kBegin, int kEnd, int kNumExperts, int kHiddenDim, typename ADtype, typename BDtype>
+template <int kBegin, int kEnd, int kHiddenDim, typename ADtype, typename BDtype>
 struct LoopUnroller {
   static void unroll_float_output(
-      int num_tokens, float* output, ADtype const* input, BDtype const* weights, bool enable_pdl, cudaStream_t stream) {
+      int num_tokens, float* output, ADtype const* input, BDtype const* weights, int num_experts, bool enable_pdl, cudaStream_t stream) {
     if (num_tokens == kBegin) {
-      invokeRouterGemmFloatOutput<ADtype, BDtype, kBegin, kNumExperts, kHiddenDim>(output, input, weights, enable_pdl, stream);
+      invokeRouterGemmFloatOutput<ADtype, BDtype, kBegin, kHiddenDim>(output, input, weights, num_experts, enable_pdl, stream);
     } else {
-      LoopUnroller<kBegin + 1, kEnd, kNumExperts, kHiddenDim, ADtype, BDtype>::unroll_float_output(
-          num_tokens, output, input, weights, enable_pdl, stream);
+      LoopUnroller<kBegin + 1, kEnd, kHiddenDim, ADtype, BDtype>::unroll_float_output(
+          num_tokens, output, input, weights, num_experts, enable_pdl, stream);
     }
   }
 };
 
-template <int kEnd, int kNumExperts, int kHiddenDim, typename ADtype, typename BDtype>
-struct LoopUnroller<kEnd, kEnd, kNumExperts, kHiddenDim, ADtype, BDtype> {
+template <int kEnd, int kHiddenDim, typename ADtype, typename BDtype>
+struct LoopUnroller<kEnd, kEnd, kHiddenDim, ADtype, BDtype> {
   static void unroll_float_output(
-      int num_tokens, float* output, ADtype const* input, BDtype const* weights, bool enable_pdl, cudaStream_t stream) {
+      int num_tokens, float* output, ADtype const* input, BDtype const* weights, int num_experts, bool enable_pdl, cudaStream_t stream) {
     if (num_tokens == kEnd) {
-      invokeRouterGemmFloatOutput<ADtype, BDtype, kEnd, kNumExperts, kHiddenDim>(output, input, weights, enable_pdl, stream);
+      invokeRouterGemmFloatOutput<ADtype, BDtype, kEnd, kHiddenDim>(output, input, weights, num_experts, enable_pdl, stream);
     } else {
       throw std::invalid_argument("Invalid num_tokens, only supports 1 to 16");
     }
   }
 };
+
+// Dispatch on hidden_dim only: the custom kernel launches one block per
+// expert row, so any expert count is supported at runtime.
+template <typename BDtype>
+static bool dispatch_custom_kernel(
+    int num_tokens, int hidden_dim, float* output, __nv_bfloat16 const* mat_a, BDtype const* mat_b,
+    int num_experts, bool enable_pdl, cudaStream_t stream) {
+  switch (hidden_dim) {
+    case 3072:
+      LoopUnroller<1, 16, 3072, __nv_bfloat16, BDtype>::unroll_float_output(
+          num_tokens, output, mat_a, mat_b, num_experts, enable_pdl, stream);
+      return true;
+    case 6144:
+      LoopUnroller<1, 16, 6144, __nv_bfloat16, BDtype>::unroll_float_output(
+          num_tokens, output, mat_a, mat_b, num_experts, enable_pdl, stream);
+      return true;
+    case 7168:
+      LoopUnroller<1, 16, 7168, __nv_bfloat16, BDtype>::unroll_float_output(
+          num_tokens, output, mat_a, mat_b, num_experts, enable_pdl, stream);
+      return true;
+    default:
+      return false;
+  }
+}
 
 void dsv3_router_gemm(TensorView output, TensorView mat_a, TensorView mat_b, bool enable_pdl) {
   CHECK_CUDA(output);
@@ -149,174 +173,23 @@ void dsv3_router_gemm(TensorView output, TensorView mat_a, TensorView mat_b, boo
   cudaStream_t stream = get_stream(device);
 
   bool use_custom_kernel = (num_tokens >= 1 && num_tokens <= 8);
-  bool supported_experts = (num_experts == 256 || num_experts == 384 || num_experts == 768);
   bool supported_hidden = (hidden_dim == 3072 || hidden_dim == 6144 || hidden_dim == 7168);
 
-  if (use_custom_kernel && supported_experts && supported_hidden) {
+  if (use_custom_kernel && supported_hidden) {
     if (mat_b.dtype() == dl_bfloat16) {
-      if (num_experts == 256 && hidden_dim == 3072) {
-        LoopUnroller<1, 16, 256, 3072, __nv_bfloat16, __nv_bfloat16>::unroll_float_output(
-            num_tokens,
-            static_cast<float*>(output.data_ptr()),
-            static_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
-            static_cast<__nv_bfloat16 const*>(mat_b.data_ptr()),
-            enable_pdl,
-            stream);
-        return;
-      }
-      if (num_experts == 384 && hidden_dim == 3072) {
-        LoopUnroller<1, 16, 384, 3072, __nv_bfloat16, __nv_bfloat16>::unroll_float_output(
-            num_tokens, static_cast<float*>(output.data_ptr()),
-            static_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
-            static_cast<__nv_bfloat16 const*>(mat_b.data_ptr()),
-            enable_pdl,
-            stream);
-        return;
-      }
-      if (num_experts == 768 && hidden_dim == 3072) {
-        LoopUnroller<1, 16, 768, 3072, __nv_bfloat16, __nv_bfloat16>::unroll_float_output(
-            num_tokens, static_cast<float*>(output.data_ptr()),
-            static_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
-            static_cast<__nv_bfloat16 const*>(mat_b.data_ptr()),
-            enable_pdl,
-            stream);
-        return;
-      }
-      if (num_experts == 256 && hidden_dim == 6144) {
-        LoopUnroller<1, 16, 256, 6144, __nv_bfloat16, __nv_bfloat16>::unroll_float_output(
-            num_tokens, static_cast<float*>(output.data_ptr()),
-            static_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
-            static_cast<__nv_bfloat16 const*>(mat_b.data_ptr()),
-            enable_pdl,
-            stream);
-        return;
-      }
-      if (num_experts == 384 && hidden_dim == 6144) {
-        LoopUnroller<1, 16, 384, 6144, __nv_bfloat16, __nv_bfloat16>::unroll_float_output(
-            num_tokens, static_cast<float*>(output.data_ptr()),
-            static_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
-            static_cast<__nv_bfloat16 const*>(mat_b.data_ptr()),
-            enable_pdl,
-            stream);
-        return;
-      }
-      if (num_experts == 768 && hidden_dim == 6144) {
-        LoopUnroller<1, 16, 768, 6144, __nv_bfloat16, __nv_bfloat16>::unroll_float_output(
-            num_tokens, static_cast<float*>(output.data_ptr()),
-            static_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
-            static_cast<__nv_bfloat16 const*>(mat_b.data_ptr()),
-            enable_pdl,
-            stream);
-        return;
-      }
-      if (num_experts == 256 && hidden_dim == 7168) {
-        LoopUnroller<1, 16, 256, 7168, __nv_bfloat16, __nv_bfloat16>::unroll_float_output(
-            num_tokens, static_cast<float*>(output.data_ptr()),
-            static_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
-            static_cast<__nv_bfloat16 const*>(mat_b.data_ptr()),
-            enable_pdl,
-            stream);
-        return;
-      }
-      if (num_experts == 384 && hidden_dim == 7168) {
-        LoopUnroller<1, 16, 384, 7168, __nv_bfloat16, __nv_bfloat16>::unroll_float_output(
-            num_tokens, static_cast<float*>(output.data_ptr()),
-            static_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
-            static_cast<__nv_bfloat16 const*>(mat_b.data_ptr()),
-            enable_pdl,
-            stream);
-        return;
-      }
-      if (num_experts == 768 && hidden_dim == 7168) {
-        LoopUnroller<1, 16, 768, 7168, __nv_bfloat16, __nv_bfloat16>::unroll_float_output(
-            num_tokens, static_cast<float*>(output.data_ptr()),
-            static_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
-            static_cast<__nv_bfloat16 const*>(mat_b.data_ptr()),
-            enable_pdl,
-            stream);
+      if (dispatch_custom_kernel<__nv_bfloat16>(
+              num_tokens, hidden_dim, static_cast<float*>(output.data_ptr()),
+              static_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
+              static_cast<__nv_bfloat16 const*>(mat_b.data_ptr()),
+              num_experts, enable_pdl, stream)) {
         return;
       }
     } else {
-      // mat_b float32
-      if (num_experts == 256 && hidden_dim == 7168) {
-        LoopUnroller<1, 16, 256, 7168, __nv_bfloat16, float>::unroll_float_output(
-            num_tokens, static_cast<float*>(output.data_ptr()),
-            static_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
-            static_cast<float const*>(mat_b.data_ptr()),
-            enable_pdl,
-            stream);
-        return;
-      }
-      if (num_experts == 384 && hidden_dim == 7168) {
-        LoopUnroller<1, 16, 384, 7168, __nv_bfloat16, float>::unroll_float_output(
-            num_tokens, static_cast<float*>(output.data_ptr()),
-            static_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
-            static_cast<float const*>(mat_b.data_ptr()),
-            enable_pdl,
-            stream);
-        return;
-      }
-      if (num_experts == 768 && hidden_dim == 7168) {
-        LoopUnroller<1, 16, 768, 7168, __nv_bfloat16, float>::unroll_float_output(
-            num_tokens, static_cast<float*>(output.data_ptr()),
-            static_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
-            static_cast<float const*>(mat_b.data_ptr()),
-            enable_pdl,
-            stream);
-        return;
-      }
-      if (num_experts == 256 && hidden_dim == 6144) {
-        LoopUnroller<1, 16, 256, 6144, __nv_bfloat16, float>::unroll_float_output(
-            num_tokens, static_cast<float*>(output.data_ptr()),
-            static_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
-            static_cast<float const*>(mat_b.data_ptr()),
-            enable_pdl,
-            stream);
-        return;
-      }
-      if (num_experts == 384 && hidden_dim == 6144) {
-        LoopUnroller<1, 16, 384, 6144, __nv_bfloat16, float>::unroll_float_output(
-            num_tokens, static_cast<float*>(output.data_ptr()),
-            static_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
-            static_cast<float const*>(mat_b.data_ptr()),
-            enable_pdl,
-            stream);
-        return;
-      }
-      if (num_experts == 768 && hidden_dim == 6144) {
-        LoopUnroller<1, 16, 768, 6144, __nv_bfloat16, float>::unroll_float_output(
-            num_tokens, static_cast<float*>(output.data_ptr()),
-            static_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
-            static_cast<float const*>(mat_b.data_ptr()),
-            enable_pdl,
-            stream);
-        return;
-      }
-      if (num_experts == 256 && hidden_dim == 3072) {
-        LoopUnroller<1, 16, 256, 3072, __nv_bfloat16, float>::unroll_float_output(
-            num_tokens, static_cast<float*>(output.data_ptr()),
-            static_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
-            static_cast<float const*>(mat_b.data_ptr()),
-            enable_pdl,
-            stream);
-        return;
-      }
-      if (num_experts == 384 && hidden_dim == 3072) {
-        LoopUnroller<1, 16, 384, 3072, __nv_bfloat16, float>::unroll_float_output(
-            num_tokens, static_cast<float*>(output.data_ptr()),
-            static_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
-            static_cast<float const*>(mat_b.data_ptr()),
-            enable_pdl,
-            stream);
-        return;
-      }
-      if (num_experts == 768 && hidden_dim == 3072) {
-        LoopUnroller<1, 16, 768, 3072, __nv_bfloat16, float>::unroll_float_output(
-            num_tokens, static_cast<float*>(output.data_ptr()),
-            static_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
-            static_cast<float const*>(mat_b.data_ptr()),
-            enable_pdl,
-            stream);
+      if (dispatch_custom_kernel<float>(
+              num_tokens, hidden_dim, static_cast<float*>(output.data_ptr()),
+              static_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
+              static_cast<float const*>(mat_b.data_ptr()),
+              num_experts, enable_pdl, stream)) {
         return;
       }
     }

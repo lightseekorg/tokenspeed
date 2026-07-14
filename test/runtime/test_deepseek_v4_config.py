@@ -1640,6 +1640,155 @@ class TestDeepseekV4Config(unittest.TestCase):
             [0, 0, 0, 0, 0, 0, 0, 1, 2],
         )
 
+    def test_deepseek_v4_mixed_metadata_uses_runtime_verify_width(self):
+        for verify_width in (1, 2, 4, 8):
+            with self.subTest(verify_width=verify_width):
+                backend = DeepseekV4AttentionBackend(
+                    SimpleNamespace(
+                        page_size=64,
+                        device="cpu",
+                        num_attention_heads=64,
+                        num_kv_heads=1,
+                        attn_tp_size=1,
+                        dtype=torch.bfloat16,
+                        is_draft=False,
+                        speculative_num_draft_tokens=verify_width,
+                        head_dim=512,
+                        context_len=16384,
+                    )
+                )
+                prefill_tokens = 8192 - 2 * verify_width
+                total_tokens = prefill_tokens + 2 * verify_width
+                backend.init_forward_metadata(
+                    bs=3,
+                    num_tokens=total_tokens,
+                    req_pool_indices=torch.tensor([0, 1, 2], dtype=torch.int64),
+                    seq_lens=torch.tensor(
+                        [prefill_tokens, 100, 200], dtype=torch.int32
+                    ),
+                    forward_mode=ForwardMode.MIXED,
+                    req_to_page=torch.zeros((3, 256), dtype=torch.int32),
+                    extend_seq_lens_cpu=torch.tensor(
+                        [prefill_tokens], dtype=torch.int32
+                    ),
+                    num_extends=1,
+                )
+
+                metadata = backend.forward_metadata
+                self.assertIsNotNone(metadata)
+                assert metadata is not None
+                self.assertEqual(
+                    metadata.query_lens.tolist(),
+                    [prefill_tokens, verify_width, verify_width],
+                )
+                self.assertEqual(
+                    metadata.query_lens_cpu.tolist(),
+                    [prefill_tokens, verify_width, verify_width],
+                )
+                self.assertEqual(
+                    metadata.query_start_loc.tolist(),
+                    [
+                        0,
+                        prefill_tokens,
+                        prefill_tokens + verify_width,
+                        total_tokens,
+                    ],
+                )
+                self.assertEqual(metadata.token_to_req_indices.numel(), total_tokens)
+                self.assertEqual(
+                    metadata.token_to_req_indices[-2 * verify_width :].tolist(),
+                    [1] * verify_width + [2] * verify_width,
+                )
+
+    def test_deepseek_v4_mixed_metadata_rejects_packed_token_mismatch(self):
+        backend = DeepseekV4AttentionBackend(
+            SimpleNamespace(
+                page_size=64,
+                device="cpu",
+                num_attention_heads=64,
+                num_kv_heads=1,
+                attn_tp_size=1,
+                dtype=torch.bfloat16,
+                is_draft=False,
+                speculative_num_draft_tokens=4,
+                head_dim=512,
+                context_len=4096,
+            )
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "mixed metadata token count mismatch",
+        ):
+            backend.init_forward_metadata(
+                bs=2,
+                num_tokens=10,
+                req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+                seq_lens=torch.tensor([7, 20], dtype=torch.int32),
+                forward_mode=ForwardMode.MIXED,
+                req_to_page=torch.zeros((2, 64), dtype=torch.int32),
+                extend_seq_lens_cpu=torch.tensor([7], dtype=torch.int32),
+                num_extends=1,
+            )
+
+    def test_deepseek_v4_draft_keeps_mixed_step0_and_decode_step_metadata(self):
+        verify_width = 4
+        backend = DeepseekV4AttentionBackend(
+            SimpleNamespace(
+                page_size=64,
+                device="cpu",
+                num_attention_heads=64,
+                num_kv_heads=1,
+                attn_tp_size=1,
+                dtype=torch.bfloat16,
+                is_draft=True,
+                speculative_num_draft_tokens=verify_width,
+                head_dim=512,
+                context_len=4096,
+            )
+        )
+        req_pool_indices = torch.tensor([0, 1], dtype=torch.int64)
+        seq_lens = torch.tensor([7, 20], dtype=torch.int32)
+        req_to_page = torch.zeros((2, 64), dtype=torch.int32)
+        backend.init_forward_metadata(
+            bs=2,
+            num_tokens=7 + verify_width,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            forward_mode=ForwardMode.MIXED,
+            req_to_page=req_to_page,
+            extend_seq_lens_cpu=torch.tensor([7], dtype=torch.int32),
+            num_extends=1,
+        )
+        mixed_metadata = backend.forward_metadata
+        self.assertIsNotNone(mixed_metadata)
+        self.assertIs(backend.forward_prefill_metadata, mixed_metadata)
+
+        backend.init_forward_metadata(
+            bs=2,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            forward_mode=ForwardMode.DECODE,
+            req_to_page=req_to_page,
+            num_extends=0,
+        )
+        decode_metadata = backend.forward_metadata
+        self.assertIs(backend.forward_decode_metadata, decode_metadata)
+        self.assertEqual(decode_metadata.query_lens.tolist(), [1, 1])
+
+        mixed_ctx = SimpleNamespace(
+            attn_backend=backend,
+            forward_mode=ForwardMode.MIXED,
+            input_num_tokens=7 + verify_width,
+        )
+        decode_ctx = SimpleNamespace(
+            attn_backend=backend,
+            forward_mode=ForwardMode.DECODE,
+            input_num_tokens=2,
+        )
+        self.assertIs(_deepseek_v4_forward_metadata(mixed_ctx), mixed_metadata)
+        self.assertIs(_deepseek_v4_forward_metadata(decode_ctx), decode_metadata)
+
     def test_deepseek_v4_cuda_graph_refresh_keeps_compact_table_columns(self):
         backend = DeepseekV4AttentionBackend(
             SimpleNamespace(
@@ -2256,7 +2405,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertTrue(torch.equal(out[:3], torch.ones((3, 2, 4))))
         self.assertTrue(torch.equal(out[3:], torch.full((2, 2, 4), 2.0)))
 
-    def test_deepseek_v4_mixed_prefill_uses_current_slice(self):
+    def test_deepseek_v4_mixed_prefill_replaces_stale_slice(self):
         backend = DeepseekV4AttentionBackend(
             SimpleNamespace(
                 page_size=64,
@@ -2290,7 +2439,8 @@ class TestDeepseekV4Config(unittest.TestCase):
             num_extends=1,
         )
         mixed_metadata = backend.forward_metadata
-        self.assertIs(backend.forward_prefill_metadata, stale_prefill_metadata)
+        self.assertIs(backend.forward_prefill_metadata, mixed_metadata)
+        self.assertIsNot(backend.forward_prefill_metadata, stale_prefill_metadata)
 
         calls = []
 

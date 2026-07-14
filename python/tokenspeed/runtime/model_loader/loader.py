@@ -1,8 +1,6 @@
-# Adapted from meituan-longcat/SGLang-FluentLLM.
-# This file has been modified for this repository.
-# Upstream lineage includes ModelTC/lightllm, vllm-project/vllm,
-# and sgl-project/sglang. See python/THIRDPARTYNOTICES.
-# Licensed under the Apache License, Version 2.0
+# SPDX-License-Identifier: MIT AND Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 LightSeek Foundation
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 #
 # Copyright (c) 2026 LightSeek Foundation
 #
@@ -324,7 +322,8 @@ class DefaultModelLoader(BaseModelLoader):
         )
         if self.load_config.load_format == LoadFormat.NPCACHE:
             # Currently np_cache only support *.bin checkpoints
-            assert use_safetensors is False
+            if use_safetensors:
+                raise ValueError("np_cache only supports PyTorch checkpoint shards.")
             weights_iterator = np_cache_weights_iterator(
                 source.model_or_path,
                 self.load_config.download_dir,

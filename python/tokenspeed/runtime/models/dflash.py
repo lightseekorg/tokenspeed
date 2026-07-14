@@ -21,7 +21,6 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import Optional
 
 import torch
 from torch import nn
@@ -41,6 +40,7 @@ from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
+from tokenspeed.runtime.models.utils import validate_attention_partition
 from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
@@ -63,12 +63,11 @@ class DFlashAttention(nn.Module):
         self.total_num_kv_heads = int(
             getattr(config, "num_key_value_heads", self.total_num_heads)
         )
-        assert self.total_num_heads % self.tp_size == 0
-        if self.total_num_kv_heads >= self.tp_size:
-            assert self.total_num_kv_heads % self.tp_size == 0
-        else:
-            assert self.tp_size % self.total_num_kv_heads == 0
-
+        validate_attention_partition(
+            self.total_num_heads,
+            self.total_num_kv_heads,
+            self.tp_size,
+        )
         self.num_heads = self.total_num_heads // self.tp_size
         self.num_kv_heads = max(1, self.total_num_kv_heads // self.tp_size)
         self.head_dim = int(
@@ -264,7 +263,7 @@ class DFlashDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
-        residual: Optional[torch.Tensor],
+        residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if ctx.forward_mode.is_idle():
             hidden_states = self.mlp(hidden_states)

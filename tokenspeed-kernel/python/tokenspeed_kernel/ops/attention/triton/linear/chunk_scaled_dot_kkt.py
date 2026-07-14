@@ -1,0 +1,161 @@
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: Copyright (c) 2026 LightSeek Foundation
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
+#
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+# -*- coding: utf-8 -*-
+
+
+import torch
+from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.attention.triton.linear.index import prepare_chunk_indices
+from tokenspeed_kernel.ops.attention.triton.linear.op import safe_exp
+
+
+@triton.heuristics(
+    {
+        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+        "USE_G": lambda args: args["g_cumsum"] is not None,
+    }
+)
+@triton.jit(do_not_specialize=["T"])
+def chunk_scaled_dot_kkt_fwd_kernel(
+    k,
+    beta,
+    g_cumsum,
+    A,
+    cu_seqlens,
+    chunk_indices,
+    T,
+    H: tl.constexpr,
+    Hg: tl.constexpr,
+    K: tl.constexpr,
+    BT: tl.constexpr,
+    BK: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+    USE_G: tl.constexpr,
+):
+    i_t, i_bh = tl.program_id(0), tl.program_id(1)
+    i_b, i_h = i_bh // H, i_bh % H
+    if IS_VARLEN:
+        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(
+            chunk_indices + i_t * 2 + 1
+        ).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
+            cu_seqlens + i_n + 1
+        ).to(tl.int32)
+        T = eos - bos
+    else:
+        bos, eos = i_b * T, i_b * T + T
+    o_t = tl.arange(0, BT)
+
+    p_beta = tl.make_block_ptr(
+        beta + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,)
+    )
+    b_beta = tl.load(p_beta, boundary_check=(0,))
+
+    b_A = tl.zeros([BT, BT], dtype=tl.float32)
+    for i_k in range(tl.cdiv(K, BK)):
+        p_k = tl.make_block_ptr(
+            k + (bos * Hg + i_h // (H // Hg)) * K,
+            (T, K),
+            (Hg * K, 1),
+            (i_t * BT, i_k * BK),
+            (BT, BK),
+            (1, 0),
+        )
+        b_k = tl.load(p_k, boundary_check=(0, 1))
+        b_kb = b_k * b_beta[:, None]
+        b_A += tl.dot(b_kb.to(b_k.dtype), tl.trans(b_k))
+
+    if USE_G:
+        p_g = tl.make_block_ptr(
+            g_cumsum + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,)
+        )
+        b_g = tl.load(p_g, boundary_check=(0,))
+        b_g_diff = b_g[:, None] - b_g[None, :]
+        b_A = b_A * safe_exp(b_g_diff)
+
+    b_A = tl.where(o_t[:, None] > o_t[None, :], b_A, 0)
+    p_A = tl.make_block_ptr(
+        A + (bos * H + i_h) * BT, (T, BT), (BT * H, 1), (i_t * BT, 0), (BT, BT), (1, 0)
+    )
+    tl.store(p_A, b_A.to(p_A.dtype.element_ty), boundary_check=(0, 1))
+
+
+def chunk_scaled_dot_kkt_fwd(
+    k: torch.Tensor,
+    beta: torch.Tensor,
+    g_cumsum: torch.Tensor | None = None,
+    cu_seqlens: torch.LongTensor | None = None,
+    chunk_size: int = 64,
+    output_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    r"""
+    Compute beta * K * K^T.
+
+    Args:
+        k (torch.Tensor):
+            The key tensor of shape `[B, T, H, K]`.
+        beta (torch.Tensor):
+            The beta tensor of shape `[B, T, H]`.
+        g_cumsum (torch.Tensor):
+            The cumulative sum of the gate tensor of shape `[B, T, H]`.
+            Default: None
+        cu_seqlens (torch.LongTensor):
+            The cumulative sequence lengths of the input tensor.
+            Default: None
+        chunk_size (int):
+            The chunk size. Default: 64.
+        output_dtype (torch.dtype):
+            The dtype of the output tensor. Default: `torch.float32`
+
+    Returns:
+        beta * K * K^T of shape `[B, T, H, BT]` where `BT` is the chunk size.
+    """
+
+    B, T, Hg, K = k.shape
+
+    H = beta.shape[-1]
+    BT = chunk_size
+    chunk_indices = (
+        prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
+    )
+    NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
+    A = torch.empty(B, T, H, BT, device=k.device, dtype=output_dtype)
+    chunk_scaled_dot_kkt_fwd_kernel[(NT, B * H)](
+        k=k,
+        beta=beta,
+        g_cumsum=g_cumsum,
+        A=A,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        T=T,
+        H=H,
+        Hg=Hg,
+        K=K,
+        BT=BT,
+        BK=64,
+        num_warps=8,
+        num_stages=3,
+    )
+    return A

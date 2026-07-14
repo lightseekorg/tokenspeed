@@ -1,8 +1,7 @@
-# Adapted from meituan-longcat/SGLang-FluentLLM.
-# This file has been modified for this repository.
-# This file may incorporate material from ModelTC/lightllm,
-# vllm-project/vllm, and sgl-project/sglang, as identified in
-# python/THIRDPARTYNOTICES.
+# SPDX-License-Identifier: MIT AND Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 LightSeek Foundation
+# SPDX-FileCopyrightText: Copyright 2023-2024 SGLang Team
+#
 # Copyright (c) 2026 LightSeek Foundation
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -62,6 +61,7 @@ from tokenspeed.runtime.engine.data_parallel_controller import (
 )
 from tokenspeed.runtime.engine.event_loop import run_event_loop
 from tokenspeed.runtime.engine.io_struct import (
+    DestroyWeightsUpdateGroupReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -149,7 +149,8 @@ class Engine(EngineBase):
         sampling_params: list[dict] | dict | None = None,
         # The token ids for text; one can either specify text or input_ids.
         input_ids: list[list[int]] | list[int] | None = None,
-        # SGLang-dialect output logprobs (vLLM dialect: sampling_params["logprobs"]).
+        # SGLang-compatible logprob controls; vLLM-compatible requests use
+        # sampling_params["logprobs"].
         return_logprob: list[bool] | bool | None = None,
         logprob_start_len: list[int] | int | None = None,
         top_logprobs_num: list[int] | int | None = None,
@@ -211,7 +212,7 @@ class Engine(EngineBase):
         input_embeds: torch.Tensor = None,
         input_multi_ids: list[list[int]] = None,
         input_extra_infos: list[dict] = None,
-        # SGLang-dialect output logprobs (vLLM dialect: sampling_params["logprobs"]).
+        # Same legacy logprob controls as generate().
         return_logprob: list[bool] | bool | None = None,
         logprob_start_len: list[int] | int | None = None,
         top_logprobs_num: list[int] | int | None = None,
@@ -342,6 +343,14 @@ class Engine(EngineBase):
         )
         return self.llm.run(self.tokenizer_manager.init_weights_update_group(obj))
 
+    def destroy_weights_update_group(
+        self,
+        group_name: str = "weight_update_group",
+    ):
+        """Destroy the parameter update group."""
+        obj = DestroyWeightsUpdateGroupReqInput(group_name=group_name)
+        return self.llm.run(self.tokenizer_manager.destroy_weights_update_group(obj))
+
     def update_weights_from_distributed(
         self,
         names: list[str],
@@ -353,7 +362,7 @@ class Engine(EngineBase):
         """Update weights from distributed source."""
         obj = UpdateWeightsFromDistributedReqInput(
             names=names,
-            dtypes=dtypes,
+            dtype_names=dtypes,
             shapes=shapes,
             group_name=group_name,
             flush_cache=flush_cache,
@@ -421,8 +430,10 @@ class Engine(EngineBase):
         obj = RpcReqInput(method=method, parameters=kwargs)
         self.send_to_rpc.send_pyobj(obj)
         recv_req = self.send_to_rpc.recv_pyobj(zmq.BLOCKY)
-        assert isinstance(recv_req, RpcReqOutput)
-        assert recv_req.success, recv_req.message
+        if not isinstance(recv_req, RpcReqOutput):
+            raise TypeError(f"Expected RpcReqOutput, got {type(recv_req).__name__}.")
+        if not recv_req.success:
+            raise RuntimeError(recv_req.message)
 
     def save_remote_model(self, **kwargs):
         self.collective_rpc("save_remote_model", **kwargs)
@@ -535,7 +546,10 @@ def _launch_subprocesses(
 
         for reader in scheduler_pipe_readers:
             data = reader.recv()
-            assert data["status"] == "ready"
+            if data.get("status") != "ready":
+                raise RuntimeError(
+                    "Initialization failed. Please see the error messages above."
+                )
 
         if not envs.TOKENSPEED_BLOCK_NONZERO_RANK_CHILDREN.get():
             # When using `Engine` as a Python API, we don't want to block here.

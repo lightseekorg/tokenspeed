@@ -61,5 +61,6 @@ class ModelExecutionResult:
     output_nan_flags: torch.Tensor | None = None
 
     def sync(self) -> None:
-        assert self.copy_event is not None
+        if self.copy_event is None:
+            raise RuntimeError("copy_event is required before synchronizing results.")
         self.copy_event.synchronize()

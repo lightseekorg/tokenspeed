@@ -9,16 +9,25 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(TOKENSPEED_SCHEDULER_BUILD_PYTHON "Build Python bindings" OFF)
 option(TOKENSPEED_SCHEDULER_BUILD_TESTS "Build tests" OFF)
+option(TOKENSPEED_FLAT_KVCACHE "Use the new flat KV-cache (KvCacheCoordinator) path in the FSM instead of the radix LocalKVAllocator path" OFF)
 
 include(FetchContent)
-FetchContent_Declare(
-    spdlog
-    GIT_REPOSITORY https://github.com/gabime/spdlog.git
-    GIT_TAG        v1.15.1
-)
-FetchContent_MakeAvailable(spdlog)
 
+set(Python_FIND_VIRTUALENV FIRST)
 find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
+execute_process(
+    COMMAND "${Python_EXECUTABLE}" -c "import tokenspeed_spdlog; print(tokenspeed_spdlog.cmake_prefix_path())"
+    OUTPUT_VARIABLE tokenspeed_spdlog_ROOT
+    ERROR_VARIABLE tokenspeed_spdlog_ERROR
+    RESULT_VARIABLE tokenspeed_spdlog_RESULT
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+if(NOT tokenspeed_spdlog_RESULT EQUAL 0)
+    message(FATAL_ERROR "tokenspeed-spdlog is required. Install it with `pip install tokenspeed-spdlog`. ${tokenspeed_spdlog_ERROR}")
+endif()
+list(PREPEND CMAKE_PREFIX_PATH "${tokenspeed_spdlog_ROOT}")
+find_package(spdlog CONFIG REQUIRED)
+
 execute_process(
     COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir
     OUTPUT_STRIP_TRAILING_WHITESPACE OUTPUT_VARIABLE nanobind_ROOT
@@ -58,6 +67,9 @@ add_library(tokenspeed_scheduler_core STATIC
     csrc/scheduler/request.cpp
     csrc/scheduler/outside_event_handler.cpp
     csrc/scheduler/scheduler.cpp
+
+    csrc/cache/kv_cache_coordinator.cpp
+    csrc/cache/forward_cache_ops.cpp
 )
 
 target_include_directories(tokenspeed_scheduler_core
@@ -70,6 +82,17 @@ target_link_libraries(tokenspeed_scheduler_core
         OpenSSL::Crypto
         spdlog::spdlog
 )
+
+# OpenSSL 3.0 deprecates the one-shot SHA256_* API in favor of EVP_*. We keep
+# the SHA256_* calls in page_hasher.h; suppress the deprecation warnings.
+target_compile_definitions(tokenspeed_scheduler_core
+    PUBLIC
+        OPENSSL_SUPPRESS_DEPRECATED
+)
+
+if(TOKENSPEED_FLAT_KVCACHE)
+    target_compile_definitions(tokenspeed_scheduler_core PUBLIC TOKENSPEED_FLAT_KVCACHE=1)
+endif()
 
 if(TOKENSPEED_SCHEDULER_BUILD_PYTHON)
     nanobind_add_module(tokenspeed_scheduler_ext
@@ -100,6 +123,17 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
     FetchContent_MakeAvailable(googletest)
 
     add_executable(tokenspeed_scheduler_tests
+        tests/cpp/test_page_hasher.cpp
+        tests/cpp/test_block_pool.cpp
+        tests/cpp/test_block_ref.cpp
+        tests/cpp/test_full_attn_manager.cpp
+        tests/cpp/test_swa_manager.cpp
+        tests/cpp/test_match_host_pages.cpp
+        tests/cpp/test_kv_cache_coordinator.cpp
+        tests/cpp/test_forward_cache_ops.cpp
+        tests/cpp/test_flat_forward_operation.cpp
+        tests/cpp/test_flat_kvcache_lifecycle.cpp
+        tests/cpp/test_flat_kvcache_scenarios.cpp
         tests/cpp/test_scheduler_plan.cpp
         tests/cpp/test_outside_event_handler.cpp
         tests/cpp/test_write_back.cpp
@@ -128,6 +162,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_kv_cache_events.cpp
         tests/cpp/test_eviction_lru.cpp
         tests/cpp/test_host_node_ref_lifetime.cpp
+        tests/cpp/test_hybrid_takefirst_overflow.cpp
     )
 
     target_link_libraries(tokenspeed_scheduler_tests

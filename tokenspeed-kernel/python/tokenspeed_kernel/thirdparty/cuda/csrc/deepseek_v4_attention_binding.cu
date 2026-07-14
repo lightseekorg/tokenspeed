@@ -51,7 +51,8 @@ void deepseek_v4_persistent_topk(TensorView logits,
                                  TensorView output,
                                  TensorView workspace,
                                  int64_t k,
-                                 int64_t max_seq_len);
+                                 int64_t max_seq_len,
+                                 int64_t q_len_per_req);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
                               fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert);

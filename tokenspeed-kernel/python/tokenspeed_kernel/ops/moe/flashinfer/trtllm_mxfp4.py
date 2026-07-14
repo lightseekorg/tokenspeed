@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.tuning import autotune_frozen
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -420,10 +421,15 @@ if platform.is_nvidia:
             x_quant.shape[0], h_dim, dtype=torch.bfloat16, device=x_quant.device
         )
 
-        if not getattr(w, "_flashinfer_trtllm_autotuned", False):
+        # Autotune per pow-2 token class, frozen once serving starts (see ops.tuning).
+        if not hasattr(w, "_flashinfer_trtllm_autotuned_sizes"):
+            w._flashinfer_trtllm_autotuned_sizes = set()
+        tuned_sizes = w._flashinfer_trtllm_autotuned_sizes
+        size_class = next_power_of_2(x_quant.shape[0])
+        if size_class not in tuned_sizes and not autotune_frozen():
             with autotune():
                 _call_mxfp4_moe(w, router_logits, x_quant, x_scale, output)
-            w._flashinfer_trtllm_autotuned = True
+            tuned_sizes.add(size_class)
 
         result = _call_mxfp4_moe(w, router_logits, x_quant, x_scale, output)
         if hidden_original != hidden_padded:

@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT AND Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 LightSeek Foundation
+# SPDX-FileCopyrightText: Copyright contributors to the FluentLLM project
+#
 # Copyright (c) 2026 LightSeek Foundation
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -37,7 +41,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
-class DisaggregationDecodeScheduler:
+class DisaggDecodeScheduler:
 
     def prepare_for_prebuilt_extend(self: ScheduleBatch):
         """
@@ -64,9 +68,12 @@ class DisaggregationDecodeScheduler:
             chunk = self.req_to_token_pool.req_to_token[req.req_pool_idx][
                 : req.extend_input_len
             ]
-            assert (
-                offset + req.extend_input_len <= total_size
-            ), f"Exceeds total size: offset={offset}, req.extend_input_len={req.extend_input_len}, total_size={total_size}"
+            if offset + req.extend_input_len > total_size:
+                raise RuntimeError(
+                    "Exceeds total size: "
+                    f"offset={offset}, req.extend_input_len={req.extend_input_len}, "
+                    f"total_size={total_size}"
+                )
             out_cache_loc[offset : offset + req.extend_input_len] = chunk
             offset += req.extend_input_len
 
@@ -74,9 +81,11 @@ class DisaggregationDecodeScheduler:
             seq_len = len(req.origin_input_ids) + max(0, len(req.output_ids) - 1)
             seq_lens.append(seq_len)
             if len(req.output_ids) == 0:
-                assert (
-                    seq_len - pre_len == req.extend_input_len
-                ), f"seq_len={seq_len}, pre_len={pre_len}, req.extend_input_len={req.extend_input_len}"
+                if seq_len - pre_len != req.extend_input_len:
+                    raise RuntimeError(
+                        f"seq_len={seq_len}, pre_len={pre_len}, "
+                        f"req.extend_input_len={req.extend_input_len}"
+                    )
 
             req.cached_tokens += pre_len - req.already_computed
             req.already_computed = seq_len
@@ -148,7 +157,8 @@ class DisaggregationDecodeScheduler:
 
             self.prealloc_for_draft_decode(is_disaggregation_decode=True)
             b, topk = len(self.reqs), server_args.speculative_eagle_topk
-            assert topk == 1, "Tree attention is abandoned for now"
+            if topk != 1:
+                raise ValueError("Tree attention is abandoned for now")
             last_verified_ids, token_list = self.output_ids, []
 
             for _ in range(server_args.speculative_num_steps):

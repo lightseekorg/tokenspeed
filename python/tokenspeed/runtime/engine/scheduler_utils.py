@@ -21,8 +21,8 @@
 """Helper functions for constructing scheduler specs and events."""
 
 import os
-from collections.abc import Sequence
-from typing import Any, Mapping
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 import torch
 from tokenspeed_scheduler import (
@@ -41,7 +41,23 @@ _CACHE_EVENT_TYPES = {
     "WriteBackDoneEvent": Cache.WriteBackDoneEvent,
     "PrefetchDoneEvent": Cache.PrefetchDoneEvent,
 }
+# Emitted only by the flat host tier (FlatMemoryExecutor); the radix executors
+# never produce it, so radix behavior is unchanged. hasattr-guarded: the flat
+# tier requires a flat-built (post-C3) ext anyway, and an older radix ext must
+# keep importing this module.
+if hasattr(Cache, "LoadBackDoneEvent"):
+    _CACHE_EVENT_TYPES["LoadBackDoneEvent"] = Cache.LoadBackDoneEvent
 _TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
+
+# Pool-spec string -> scheduler enum (pool_to_paged_cache_groups).
+_RETENTION_MAP = {
+    "full_history": PagedCacheRetention.FullHistory,
+    "sliding_window": PagedCacheRetention.SlidingWindow,
+}
+_FAMILY_MAP = {
+    "history": PagedCacheGroupFamily.History,
+    "state": PagedCacheGroupFamily.State,
+}
 
 
 def make_spec(rid: str, tokens: list[int]) -> RequestSpec:
@@ -63,6 +79,7 @@ def make_config(
     role: str,
     enable_kv_cache_events: bool = False,
     decode_input_tokens: int = 1,
+    overlap_schedule_depth: int = 0,
     disable_prefix_cache: bool = False,
     enable_mamba: bool = False,
     mamba_cache_chunk_size: int = 64,
@@ -77,7 +94,7 @@ def make_config(
     cfg.num_device_pages = num_device_pages
     cfg.max_scheduled_tokens = max_scheduled_tokens
     cfg.max_batch_size = max_batch_size
-    cfg.page_size = page_size
+    cfg.block_size = page_size
 
     cfg.num_host_pages = num_host_pages
     cfg.enable_l3_storage = enable_l3_storage
@@ -90,8 +107,8 @@ def make_config(
         cfg.role = SchedulerConfig.Role.D
     else:
         cfg.role = SchedulerConfig.Role.Fused
-    cfg.num_device_pages = num_device_pages
     cfg.decode_input_tokens = decode_input_tokens
+    cfg.overlap_schedule_depth = overlap_schedule_depth
     cfg.disable_prefix_cache = disable_prefix_cache
     cfg.disable_l2_cache = disable_l2_cache
 
@@ -117,24 +134,17 @@ def pool_to_paged_cache_groups(pool: Any) -> list:
     counts = pool.paged_cache_group_page_counts
     out = []
     for spec in specs:
-        if spec.retention == "full_history":
-            retention = PagedCacheRetention.FullHistory
-        elif spec.retention == "sliding_window":
-            retention = PagedCacheRetention.SlidingWindow
-        else:
+        retention = _RETENTION_MAP.get(spec.retention)
+        if retention is None:
             raise ValueError(
                 f"pool_to_paged_cache_groups: unsupported retention "
                 f"{spec.retention!r} for group {spec.group_id!r}"
             )
-        family_str = getattr(spec, "family", "history")
-        if family_str == "history":
-            family = PagedCacheGroupFamily.History
-        elif family_str == "state":
-            family = PagedCacheGroupFamily.State
-        else:
+        family = _FAMILY_MAP.get(spec.family)
+        if family is None:
             raise ValueError(
                 f"pool_to_paged_cache_groups: unsupported family "
-                f"{family_str!r} for group {spec.group_id!r}"
+                f"{spec.family!r} for group {spec.group_id!r}"
             )
         kwargs = dict(
             group_id=spec.group_id,
@@ -167,34 +177,33 @@ def should_use_overlap_schedule(
     *,
     disable_overlap_schedule: bool,
     disaggregation_mode: str,
-    speculative_algorithm: Any | None,
-    paged_cache_groups: Sequence["PagedCacheGroupConfig"] | None = None,
 ) -> bool:
     """Return whether the runtime can use the overlapped scheduler loop."""
 
     if disable_overlap_schedule:
         return False
-    if disaggregation_mode == "prefill":
-        return False
-    if speculative_algorithm is not None and paged_cache_groups:
+    if disaggregation_mode in ("prefill", "encode"):
+        # prefill drain + KV send run only on the non-overlap loop; encode has no LM loop.
         return False
     return True
 
 
-def make_extend_result_event(request_id: str, tokens: list[int] = ()) -> None:
+def make_extend_result_event(
+    request_id: str, tokens: Sequence[int] = ()
+) -> "ForwardEvent.ExtendResult":
     fe = ForwardEvent.ExtendResult()
     fe.request_id = request_id
     fe.tokens = list(tokens)
     return fe
 
 
-def make_finish_event(request_id: str) -> None:
+def make_finish_event(request_id: str) -> "ForwardEvent.Finish":
     fe = ForwardEvent.Finish()
     fe.request_id = request_id
     return fe
 
 
-def make_abort_event(request_id: str) -> None:
+def make_abort_event(request_id: str) -> "ForwardEvent.Abort":
     """Finish without caching: AbortEvent skips the radix-tree insert and
     never enters Draining, so no host-KV writeback (target or draft) is
     issued. Used for numerically-corrupted requests whose KV must not be
@@ -297,28 +306,35 @@ def _block_tables_from_forward_op(
     for key_obj, table in items:
         key = str(key_obj)
         rows = list(table)
-        if num_reqs is not None and rows and len(rows) != num_reqs:
+        if num_reqs is not None and len(rows) != num_reqs:
+            # No exemption for empty row lists: a silently dropped group
+            # would hand the flat CUDA-graph replay a per-group hole.
             raise ValueError(
                 f"{attr}[{key}] has {len(rows)} rows but forward op reported "
                 f"num_reqs={num_reqs}"
             )
         if not rows:
+            # Idle/empty op: callers treat the resulting {} as "no tables".
             continue
         max_pages = max((len(row) for row in rows), default=0)
         if max_pages == 0:
             out[key] = torch.empty((len(rows), 0), dtype=torch.int32, device=device)
             continue
-        flat = torch.full(
-            (len(rows), max_pages),
-            -1,
+        # One flattened Python list -> single tensor construct (holes stay 0,
+        # ragged tails pad with -1), instead of O(bs) tiny per-row tensors.
+        flat_values: list[int] = []
+        for row in rows:
+            row_values = list(row)
+            flat_values.extend(row_values)
+            flat_values.extend([-1] * (max_pages - len(row_values)))
+        # pin_memory as a ctor arg: builds the staging tensor pinned in one
+        # pass instead of tensor(...).pin_memory()'s second host copy.
+        flat = torch.tensor(
+            flat_values,
             dtype=torch.int32,
             device="cpu",
             pin_memory=device.type == "cuda",
-        )
-        for row_idx, row in enumerate(rows):
-            row_len = len(row)
-            if row_len:
-                flat[row_idx, :row_len] = torch.as_tensor(list(row), dtype=torch.int32)
+        ).view(len(rows), max_pages)
         out[key] = flat.to(device, non_blocking=True)
     return out
 
@@ -332,6 +348,24 @@ def paged_cache_block_tables_from_forward_op(
     return _block_tables_from_forward_op(
         forward_op,
         attr="paged_cache_block_tables",
+        device=device,
+        num_reqs=num_reqs,
+    )
+
+
+def flat_block_tables_from_forward_op(
+    forward_op: Any,
+    device: "torch.device | str",
+    *,
+    num_reqs: int | None = None,
+) -> dict[str, torch.Tensor]:
+    """Bridge the flat per-group block tables to GPU int32 tensors: absolute
+    page indices, null hole = 0 preserved, ragged-row padding -1. No
+    base-offset companion -- the flat path never compacts.
+    """
+    return _block_tables_from_forward_op(
+        forward_op,
+        attr="flat_block_tables",
         device=device,
         num_reqs=num_reqs,
     )

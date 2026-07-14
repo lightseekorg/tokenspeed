@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
+from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
 from typing_extensions import override
 
 from tokenspeed.runtime.execution.cache_loc_kernel import (
@@ -35,13 +36,8 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
-from tokenspeed.runtime.models.llama_eagle3 import LlamaForCausalLMEagle3
-from tokenspeed.runtime.models.qwen3_5_nextn import Qwen3_5ForConditionalGenerationNextN
 from tokenspeed.runtime.multimodal.inputs import maybe_substitute_mm_pad
-from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
-
-logger = get_colorful_logger(__name__)
 
 DsaTopKState = tuple[Any | None, Any | None]
 
@@ -146,6 +142,30 @@ class Eagle(BaseDrafter):
             getattr(hf_config, "index_share_for_mtp_iteration", False)
         )
 
+    def _accepted_output_indices(
+        self,
+        accept_lengths: torch.Tensor,
+        row_count: int,
+        *,
+        base_offset: int = 0,
+    ) -> torch.Tensor:
+        """Return safe flat output-token indices for each decode request.
+
+        ``accept_lengths`` is the number of tokens that may be committed.  When
+        the context-length cap reduces a row to 0 there is no real newly
+        committed output token, but the drafter still runs to preserve graph
+        shape.  Use the row's first verify output as a valid dummy source rather
+        than producing ``row * N - 1``.
+        """
+        safe_accept_lengths = (
+            accept_lengths[:row_count].to(torch.int64).clamp(1, self.spec_num_tokens)
+        )
+        return (
+            self.padded_gather_ids_offsets_buf[:row_count]
+            + safe_accept_lengths
+            + base_offset
+        )
+
     def set_mm_pad_substitute_id(self, token_id: int) -> None:
         self.mm_pad_substitute_id = token_id
 
@@ -216,15 +236,18 @@ class Eagle(BaseDrafter):
                 gather_ids = torch.cat(
                     [
                         gather_ids,
-                        self.padded_gather_ids_offsets_buf[:num_decodes]
-                        + draft_input.accept_lengths[num_extends:]
-                        + num_prefill_tokens,
+                        self._accepted_output_indices(
+                            draft_input.accept_lengths[num_extends:],
+                            num_decodes,
+                            base_offset=num_prefill_tokens,
+                        ),
                     ]
                 )
         else:
             input_ids = draft_input.base_model_output
-            gather_ids = (
-                self.padded_gather_ids_offsets_buf[:bs] + draft_input.accept_lengths
+            gather_ids = self._accepted_output_indices(
+                draft_input.accept_lengths,
+                bs,
             )
 
         return input_ids, gather_ids
@@ -244,17 +267,6 @@ class Eagle(BaseDrafter):
         )
         input_ids = maybe_substitute_mm_pad(input_ids, self.mm_pad_substitute_id)
         draft_model = self.draft_model_runner.model
-        # These draft models run first-step catch-up on the full input window,
-        # then narrow to one row per request for sampling and later MTP steps.
-        reduce_first_step_catchup = bool(
-            getattr(draft_model, "draft_first_step_reduce_for_catchup", False)
-        ) or isinstance(
-            draft_model,
-            (LlamaForCausalLMEagle3, Qwen3_5ForConditionalGenerationNextN),
-        )
-        draft_first_step_reduce = forward_mode.is_decode() or (
-            reduce_first_step_catchup and not forward_mode.is_idle()
-        )
         input_num_tokens = draft_input.input_num_tokens
 
         ctx = ForwardContext(
@@ -270,7 +282,6 @@ class Eagle(BaseDrafter):
             global_num_tokens=draft_input.global_num_tokens,
             global_bs=draft_input.global_bs,
             all_decode_or_idle=draft_input.all_decode_or_idle,
-            draft_first_step_reduce=draft_first_step_reduce,
             draft_seq_lens_buf=self.draft_seq_lens_buf,
             accept_lengths=draft_input.accept_lengths,
         )
@@ -397,8 +408,10 @@ class Eagle(BaseDrafter):
                 dsa_topk = self._extract_dsa_topk(ctx, dsa_topk)
 
             with nvtx_range("draft_sample", color="yellow"):
-                draft_ids = logits_output.next_token_ids
-                draft_ids.clamp_(min=0)
+                if logits_output.next_token_ids is not None:
+                    draft_ids = logits_output.next_token_ids
+                else:
+                    draft_ids = sampling_argmax(logits_output.next_token_logits)
                 # Column 0 holds last_verified_ids; drafter writes step `i` into column `i + 1`.
                 next_tokens[:, i + 1] = self._map_hot(draft_ids)
                 if i + 1 < self.spec_num_steps:
@@ -447,9 +460,9 @@ class Eagle(BaseDrafter):
         if num_extends > 0:
             next_tokens[:num_extends, 0] = draft_input.base_model_output[:num_extends]
         if num_decodes > 0:
-            indices = (
-                self.padded_gather_ids_offsets_buf[:num_decodes]
-                + draft_input.accept_lengths[num_extends:]
+            indices = self._accepted_output_indices(
+                draft_input.accept_lengths[num_extends:],
+                num_decodes,
             )
             if num_extends > 0:
                 indices.add_(num_extends)
@@ -469,8 +482,10 @@ class Eagle(BaseDrafter):
         # down to `[bs, ...]`, so logits/hidden_states arrive here already aligned to one row per request.
         logits_output, dsa_topk = self._run_first_step(bs, draft_input)
 
-        draft_ids = logits_output.next_token_ids
-        draft_ids.clamp_(min=0)
+        if logits_output.next_token_ids is not None:
+            draft_ids = logits_output.next_token_ids
+        else:
+            draft_ids = sampling_argmax(logits_output.next_token_logits)
         next_tokens[:, 1] = self._map_hot(draft_ids)
 
         if self.spec_num_steps <= 1:

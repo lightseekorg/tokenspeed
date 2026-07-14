@@ -12,6 +12,9 @@
 
 * Add tests and update docs for the changed code.
 * Before creating commits, run `pre-commit run --all-files` to format.
+* Do not substitute a narrower lint command for the repository hook before
+  committing. Always run the exact `pre-commit run --all-files` command and
+  commit any formatter changes it makes.
 * When creating commits, perform sign off on behalf of the author.
 
 ## Dependency boundaries

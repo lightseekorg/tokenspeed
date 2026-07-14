@@ -22,7 +22,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
@@ -199,6 +199,177 @@ def _rope_apply_kernel(
         )
 
 
+@triton.jit
+def _mla_rope_set_kv_buffer_kernel(
+    q_rope_ptr,
+    k_nope_ptr,
+    k_rope_ptr,
+    q_out_rope_ptr,
+    kv_buffer_ptr,
+    loc_ptr,
+    cos_sin_cache_ptr,
+    positions_ptr,
+    q_rope_stride_t: tl.constexpr,
+    q_rope_stride_h: tl.constexpr,
+    k_nope_stride_t: tl.constexpr,
+    k_rope_stride_t: tl.constexpr,
+    q_out_rope_stride_t: tl.constexpr,
+    q_out_rope_stride_h: tl.constexpr,
+    kv_buffer_stride_t: tl.constexpr,
+    cos_sin_stride_p: tl.constexpr,
+    num_q_heads: tl.constexpr,
+    nope_dim: tl.constexpr,
+    rope_dim: tl.constexpr,
+    NOPE_BLOCK: tl.constexpr,
+    HALF_BLOCK: tl.constexpr,
+    IS_NEOX: tl.constexpr,
+    POSITION_INT64: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+    half = rope_dim // 2
+    half_offsets = tl.arange(0, HALF_BLOCK)
+    half_mask = half_offsets < half
+
+    if POSITION_INT64:
+        pos = tl.load(positions_ptr + token_idx).to(tl.int64)
+    else:
+        pos = tl.load(positions_ptr + token_idx).to(tl.int32)
+
+    cos = tl.load(
+        cos_sin_cache_ptr + pos * cos_sin_stride_p + half_offsets,
+        mask=half_mask,
+        other=0.0,
+    ).to(tl.float32)
+    sin = tl.load(
+        cos_sin_cache_ptr + pos * cos_sin_stride_p + half + half_offsets,
+        mask=half_mask,
+        other=0.0,
+    ).to(tl.float32)
+
+    if head_idx < num_q_heads:
+        q_base = q_rope_ptr + token_idx * q_rope_stride_t + head_idx * q_rope_stride_h
+        q_out_base = (
+            q_out_rope_ptr
+            + token_idx * q_out_rope_stride_t
+            + head_idx * q_out_rope_stride_h
+        )
+        if IS_NEOX:
+            q1_offsets = half_offsets
+            q2_offsets = half + half_offsets
+        else:
+            q1_offsets = half_offsets * 2
+            q2_offsets = half_offsets * 2 + 1
+
+        q1 = tl.load(q_base + q1_offsets, mask=half_mask, other=0.0)
+        q2 = tl.load(q_base + q2_offsets, mask=half_mask, other=0.0)
+        q1_f = q1.to(tl.float32)
+        q2_f = q2.to(tl.float32)
+        q_out_1 = q1_f * cos - q2_f * sin
+        q_out_2 = q2_f * cos + q1_f * sin
+        tl.store(q_out_base + q1_offsets, q_out_1, mask=half_mask)
+        tl.store(q_out_base + q2_offsets, q_out_2, mask=half_mask)
+    else:
+        loc = tl.load(loc_ptr + token_idx).to(tl.int64)
+        kv_base = kv_buffer_ptr + loc * kv_buffer_stride_t
+
+        nope_offsets = tl.arange(0, NOPE_BLOCK)
+        nope_mask = nope_offsets < nope_dim
+        k_nope = tl.load(
+            k_nope_ptr + token_idx * k_nope_stride_t + nope_offsets,
+            mask=nope_mask,
+            other=0.0,
+        )
+        tl.store(kv_base + nope_offsets, k_nope, mask=nope_mask)
+
+        k_base = k_rope_ptr + token_idx * k_rope_stride_t
+        if IS_NEOX:
+            k1_offsets = half_offsets
+            k2_offsets = half + half_offsets
+        else:
+            k1_offsets = half_offsets * 2
+            k2_offsets = half_offsets * 2 + 1
+
+        k1 = tl.load(k_base + k1_offsets, mask=half_mask, other=0.0)
+        k2 = tl.load(k_base + k2_offsets, mask=half_mask, other=0.0)
+        k1_f = k1.to(tl.float32)
+        k2_f = k2.to(tl.float32)
+        k_out_1 = k1_f * cos - k2_f * sin
+        k_out_2 = k2_f * cos + k1_f * sin
+        tl.store(kv_base + nope_dim + k1_offsets, k_out_1, mask=half_mask)
+        tl.store(kv_base + nope_dim + k2_offsets, k_out_2, mask=half_mask)
+
+
+def apply_rope_mla_set_kv_buffer_triton(
+    positions: torch.Tensor,
+    q_rope: torch.Tensor,
+    k_rope: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+    fused_mla_set_kv_buffer_arg,
+    q_rope_out: torch.Tensor | None,
+) -> None:
+    """Apply MLA RoPE while writing Q rope and dense MLA KV cache outputs."""
+    q_rope_out = q_rope if q_rope_out is None else q_rope_out
+    k_nope = fused_mla_set_kv_buffer_arg.k_nope
+    kv_buffer = fused_mla_set_kv_buffer_arg.kv_buffer
+    loc = fused_mla_set_kv_buffer_arg.cache_loc
+
+    num_tokens = q_rope.shape[0]
+    if num_tokens == 0:
+        return
+
+    assert q_rope.ndim == 3
+    assert k_nope.ndim == 3 and k_nope.shape[1] == 1
+    assert k_rope.ndim == 3 and k_rope.shape[1] == 1
+    assert q_rope_out.shape == q_rope.shape
+    assert kv_buffer.ndim == 2
+    assert loc.numel() == num_tokens
+    assert positions.numel() == num_tokens
+    assert q_rope.dtype == k_nope.dtype == k_rope.dtype == q_rope_out.dtype
+    assert kv_buffer.dtype == q_rope.dtype
+
+    num_q_heads = q_rope.shape[1]
+    rope_dim = q_rope.shape[2]
+    nope_dim = k_nope.shape[2]
+    assert k_rope.shape == (num_tokens, 1, rope_dim)
+    assert kv_buffer.shape[1] == nope_dim + rope_dim
+    assert rope_dim % 2 == 0
+    assert cos_sin_cache.shape[-1] == rope_dim
+    assert loc.dtype in (torch.int32, torch.int64)
+    assert positions.dtype in (torch.int32, torch.int64)
+
+    half_block = max(_next_power_of_2(rope_dim // 2), 16)
+    nope_block = max(_next_power_of_2(nope_dim), 16)
+    grid = (num_tokens, num_q_heads + 1)
+    _mla_rope_set_kv_buffer_kernel[grid](
+        q_rope,
+        k_nope,
+        k_rope,
+        q_rope_out,
+        kv_buffer,
+        loc,
+        cos_sin_cache,
+        positions,
+        q_rope.stride(0),
+        q_rope.stride(1),
+        k_nope.stride(0),
+        k_rope.stride(0),
+        q_rope_out.stride(0),
+        q_rope_out.stride(1),
+        kv_buffer.stride(0),
+        cos_sin_cache.stride(0),
+        num_q_heads,
+        nope_dim,
+        rope_dim,
+        NOPE_BLOCK=nope_block,
+        HALF_BLOCK=half_block,
+        IS_NEOX=bool(is_neox),
+        POSITION_INT64=positions.dtype == torch.int64,
+        num_warps=4,
+    )
+
+
 def apply_rope_triton(
     positions: torch.Tensor,
     query: torch.Tensor,
@@ -206,11 +377,12 @@ def apply_rope_triton(
     head_size: int,
     cos_sin_cache: torch.Tensor,
     is_neox: bool = True,
-    offsets: Optional[torch.Tensor] = None,
-    rotary_dim: Optional[int] = None,
+    offsets: torch.Tensor | None = None,
+    rotary_dim: int | None = None,
     fused_set_kv_buffer_arg=None,
-    output_q_rope: Optional[torch.Tensor] = None,
-    output_k_rope: Optional[torch.Tensor] = None,
+    fused_mla_set_kv_buffer_arg=None,
+    output_q_rope: torch.Tensor | None = None,
+    output_k_rope: torch.Tensor | None = None,
 ) -> None:
     """Apply rotary positional embedding to query and key in-place.
 
@@ -254,6 +426,22 @@ def apply_rope_triton(
 
     num_tokens = positions.shape[0]
     if num_tokens == 0:
+        return
+
+    if fused_mla_set_kv_buffer_arg is not None:
+        if offsets is not None:
+            raise ValueError("MLA fused KV write does not support offsets")
+        if output_k_rope is not None:
+            raise ValueError("MLA fused KV write stores rotated K directly in cache")
+        apply_rope_mla_set_kv_buffer_triton(
+            positions=positions,
+            q_rope=query,
+            k_rope=key,
+            cos_sin_cache=cos_sin_cache,
+            is_neox=is_neox,
+            fused_mla_set_kv_buffer_arg=fused_mla_set_kv_buffer_arg,
+            q_rope_out=output_q_rope,
+        )
         return
 
     q_view = query.view(num_tokens, -1, head_size)
@@ -356,20 +544,137 @@ def apply_rope_triton(
     )
 
 
+@triton.jit
+def _fp8_quantize_kernel(
+    x,
+    out,
+    scale,
+    x_stride_t: tl.constexpr,
+    x_stride_h: tl.constexpr,
+    out_stride_t: tl.constexpr,
+    out_stride_h: tl.constexpr,
+    num_heads: tl.constexpr,
+    n_cols: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HAS_SCALE_TENSOR: tl.constexpr,
+):
+    token = tl.program_id(0)
+    head = tl.program_id(1)
+    offsets = tl.arange(0, BLOCK_N)
+    mask = offsets < n_cols
+    values = tl.load(
+        x + token * x_stride_t + head * x_stride_h + offsets,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    if HAS_SCALE_TENSOR:
+        scale = tl.load(scale)
+    values = values * scale
+    values_fp8 = values.to(tl.float8e4nv)
+    tl.store(
+        out + token * out_stride_t + head * out_stride_h + offsets,
+        values_fp8,
+        mask=(head < num_heads) & mask,
+    )
+
+
+def _fp8_quantize(
+    x: torch.Tensor,
+    out: torch.Tensor,
+    scale: float | torch.Tensor,
+    *,
+    enable_pdl: bool,
+) -> None:
+    if x.dim() != 3 or out.dim() != 3:
+        raise ValueError(
+            f"MLA FP8 quantize expects rank-3 tensors, got {x.shape} and {out.shape}"
+        )
+    if x.shape != out.shape:
+        raise ValueError(f"MLA FP8 quantize shape mismatch: {x.shape} vs {out.shape}")
+    if out.dtype != torch.float8_e4m3fn:
+        raise TypeError(f"MLA FP8 quantize output must be e4m3fn, got {out.dtype}")
+    if isinstance(scale, torch.Tensor):
+        scale = scale.contiguous()
+    block_n = max(16, _next_power_of_2(x.shape[-1]))
+    extra_kwargs = {"launch_pdl": True} if enable_pdl else {}
+    _fp8_quantize_kernel[(x.shape[0], x.shape[1])](
+        x,
+        out,
+        scale,
+        x.stride(0),
+        x.stride(1),
+        out.stride(0),
+        out.stride(1),
+        num_heads=x.shape[1],
+        n_cols=x.shape[2],
+        BLOCK_N=block_n,
+        HAS_SCALE_TENSOR=isinstance(scale, torch.Tensor),
+        num_warps=4,
+        num_stages=1,
+        **extra_kwargs,
+    )
+
+
+def mla_rope_quantize_fp8_triton(
+    *,
+    positions: torch.Tensor,
+    q_rope: torch.Tensor,
+    k_rope: torch.Tensor,
+    q_nope: torch.Tensor,
+    k_nope: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    q_rope_out: torch.Tensor,
+    k_rope_out: torch.Tensor,
+    q_nope_out: torch.Tensor,
+    k_nope_out: torch.Tensor,
+    is_neox: bool = True,
+    quant_scale_q: float | torch.Tensor = 1.0,
+    quant_scale_kv: float | torch.Tensor = 1.0,
+    enable_pdl: bool = False,
+) -> None:
+    if q_rope.shape[-1] != k_rope.shape[-1]:
+        raise ValueError(
+            "q_rope and k_rope must have the same rope dim, got "
+            f"{q_rope.shape[-1]} and {k_rope.shape[-1]}"
+        )
+    if q_rope.shape[0] != k_rope.shape[0] or q_rope.shape[0] != positions.numel():
+        raise ValueError(
+            "MLA RoPE token count mismatch: "
+            f"q={q_rope.shape[0]}, k={k_rope.shape[0]}, pos={positions.numel()}"
+        )
+
+    q_rope_tmp = torch.empty(q_rope.shape, dtype=q_rope.dtype, device=q_rope.device)
+    k_rope_tmp = torch.empty(k_rope.shape, dtype=k_rope.dtype, device=k_rope.device)
+    apply_rope_triton(
+        positions=positions,
+        query=q_rope,
+        key=k_rope,
+        head_size=q_rope.shape[-1],
+        cos_sin_cache=cos_sin_cache,
+        is_neox=is_neox,
+        rotary_dim=q_rope.shape[-1],
+        output_q_rope=q_rope_tmp,
+        output_k_rope=k_rope_tmp,
+    )
+    _fp8_quantize(q_rope_tmp, q_rope_out, quant_scale_q, enable_pdl=enable_pdl)
+    _fp8_quantize(k_rope_tmp, k_rope_out, quant_scale_kv, enable_pdl=enable_pdl)
+    _fp8_quantize(q_nope, q_nope_out, quant_scale_q, enable_pdl=enable_pdl)
+    _fp8_quantize(k_nope, k_nope_out, quant_scale_kv, enable_pdl=enable_pdl)
+
+
 @register_kernel(
     "embedding",
     "rope",
     name="triton_embedding_rope",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
-    signatures=format_signatures(
-        ("query", "key"), "dense", {torch.float16, torch.bfloat16}
-    ),
+    signatures=format_signatures(("q", "k"), "dense", {torch.float16, torch.bfloat16}),
     priority=Priority.PORTABLE,
     traits={
         "partial_rotary": frozenset({True, False}),
         "is_neox": frozenset({True, False}),
         "has_fused_kv": frozenset({True, False}),
+        "has_fused_mla_kv": frozenset({True, False}),
         "has_q_out": frozenset({True, False}),
         "has_k_out": frozenset({True, False}),
     },
@@ -378,26 +683,81 @@ def apply_rope_triton(
 def triton_embedding_rope(
     *,
     positions: torch.Tensor,
-    query: torch.Tensor,
-    key: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
     head_size: int,
     cos_sin_cache: torch.Tensor,
     is_neox: bool = True,
-    rotary_dim: int | None = None,
     fused_set_kv_buffer_arg: Any = None,
-    output_q_rope: torch.Tensor | None = None,
-    output_k_rope: torch.Tensor | None = None,
+    fused_mla_set_kv_buffer_arg: Any = None,
+    q_rope_out: torch.Tensor | None = None,
+    k_rope_out: torch.Tensor | None = None,
     enable_pdl: bool = False,
 ) -> None:
     apply_rope_triton(
         positions=positions,
-        query=query,
-        key=key,
+        query=q,
+        key=k,
         head_size=head_size,
         cos_sin_cache=cos_sin_cache,
         is_neox=is_neox,
-        rotary_dim=rotary_dim,
         fused_set_kv_buffer_arg=fused_set_kv_buffer_arg,
-        output_q_rope=output_q_rope,
-        output_k_rope=output_k_rope,
+        fused_mla_set_kv_buffer_arg=fused_mla_set_kv_buffer_arg,
+        output_q_rope=q_rope_out,
+        output_k_rope=k_rope_out,
+    )
+
+
+@register_kernel(
+    "embedding",
+    "rope_mla",
+    name="triton_embedding_rope_mla",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
+    signatures=format_signatures(
+        ("q_rope", "k_rope", "q_nope", "k_nope"),
+        "dense",
+        {torch.float16, torch.bfloat16},
+    ),
+    priority=Priority.PORTABLE,
+    traits={
+        "is_neox": frozenset({True, False}),
+        "quantize_dtype": frozenset({torch.float8_e4m3fn}),
+        "has_scale_q_tensor": frozenset({True, False}),
+        "has_scale_kv_tensor": frozenset({True, False}),
+    },
+    tags={"portability"},
+)
+def triton_embedding_rope_mla(
+    *,
+    positions: torch.Tensor,
+    q_rope: torch.Tensor,
+    k_rope: torch.Tensor,
+    q_nope: torch.Tensor,
+    k_nope: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    q_rope_out: torch.Tensor,
+    k_rope_out: torch.Tensor,
+    q_nope_out: torch.Tensor,
+    k_nope_out: torch.Tensor,
+    is_neox: bool = True,
+    quant_scale_q: float | torch.Tensor = 1.0,
+    quant_scale_kv: float | torch.Tensor = 1.0,
+    enable_pdl: bool = False,
+) -> None:
+    mla_rope_quantize_fp8_triton(
+        positions=positions,
+        q_rope=q_rope,
+        k_rope=k_rope,
+        q_nope=q_nope,
+        k_nope=k_nope,
+        cos_sin_cache=cos_sin_cache,
+        q_rope_out=q_rope_out,
+        k_rope_out=k_rope_out,
+        q_nope_out=q_nope_out,
+        k_nope_out=k_nope_out,
+        is_neox=is_neox,
+        quant_scale_q=quant_scale_q,
+        quant_scale_kv=quant_scale_kv,
+        enable_pdl=enable_pdl,
     )

@@ -140,7 +140,7 @@ DeepSeek V4 needs FP8 KV cache, the DeepGEMM `mega_moe` experts, and the FP4
 indexer cache. `tokenspeed serve` auto-selects `--reasoning-parser deepseek_v31`
 and `--tool-call-parser deepseek_v4`, and auto-sets `block_size=256` (pass
 `--block-size N` with `N != 64` to override). Requires
-`tokenspeed-deepgemm>=2.5.0.post20260604` and `tokenspeed-flashmla`.
+`tokenspeed-deepgemm>=2.5.0.post20260629` and `tokenspeed-flashmla`.
 
 **V4-Flash** — 4× B200 (SM100), data-parallel + expert-parallel:
 
