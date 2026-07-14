@@ -41,6 +41,11 @@ _MXFP8_BLOCK_SCALE = ScaleFormat(
     granularity="block",
     block_shape=(128, 128),
 )
+_MXFP8_UE8M0_SCALE = ScaleFormat(
+    storage_dtype=torch.uint8,
+    granularity="block",
+    block_shape=(1, 32),
+)
 _FP8_TENSOR_SCALE = ScaleFormat(
     storage_dtype=torch.float32,
     granularity="tensor",
@@ -51,7 +56,7 @@ _FP8_CHANNEL_SCALE = ScaleFormat(
 )
 _MXFP8_FORMAT_SIGNATURES = format_signatures(
     ("a", "b"), "mxfp8", {_fp8_dtype}, scale=_MXFP8_BLOCK_SCALE
-)
+) | format_signatures(("a", "b"), "mxfp8", {_fp8_dtype}, scale=_MXFP8_UE8M0_SCALE)
 _FP8_SCALED_FORMAT_SIGNATURES = format_signatures(
     ("a", "b"), "scaled-fp8", {_fp8_dtype}, scale=_FP8_TENSOR_SCALE
 ) | format_signatures(("a", "b"), "scaled-fp8", {_fp8_dtype}, scale=_FP8_CHANNEL_SCALE)
@@ -87,6 +92,8 @@ def prepare_block_fp8_matmul_inputs(
         assert (
             triton.cdiv(triton.cdiv(A.shape[-1], block_k), 4) == As.shape[-1]
         ), f"{A.shape=} {As.shape=} {block_size=}"
+    elif As.dtype == torch.uint8:
+        assert triton.cdiv(A.shape[-1], block_k) == As.shape[-1]
     else:
         raise NotImplementedError
 
@@ -105,6 +112,9 @@ def prepare_block_fp8_matmul_inputs(
         assert (
             triton.cdiv(triton.cdiv(K, block_k), 4) == Bs.shape[1]
         ), f"{B.shape=} {Bs.shape=} {block_size=}"
+    elif Bs.dtype == torch.uint8:
+        assert triton.cdiv(N, block_n) == Bs.shape[0]
+        assert triton.cdiv(K, block_k) == Bs.shape[1]
     else:
         raise NotImplementedError
 
@@ -225,6 +235,10 @@ def _w8a8_block_fp8_matmul(
         offs_ks = k_start // group_k
         a_s = tl.load(As_ptrs + offs_ks * stride_As_k)
         b_s = tl.load(Bs_ptrs + offs_ks * stride_Bs_k)
+        if As.dtype.element_ty == tl.uint8:
+            a_s = tl.exp2(a_s.to(tl.float32) - 127.0)
+        if Bs.dtype.element_ty == tl.uint8:
+            b_s = tl.exp2(b_s.to(tl.float32) - 127.0)
 
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
@@ -460,7 +474,7 @@ def w8a8_block_fp8_matmul_triton(
         else:
             config = {
                 "BLOCK_SIZE_M": 64,
-                "BLOCK_SIZE_N": block_size[0],
+                "BLOCK_SIZE_N": max(64, block_size[0]),
                 "BLOCK_SIZE_K": block_size[1],
                 "GROUP_SIZE_M": 32,
                 "num_warps": 4,

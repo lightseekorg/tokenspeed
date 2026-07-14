@@ -98,7 +98,7 @@ class BaseDecoderLayer(nn.Module, Generic[_C]):
             mapping=self.mapping,
             layer_id=layer_id,
             is_moe=self.is_moe_layer,
-            prev_is_moe=self.is_moe_layer,
+            prev_is_moe=self.previous_is_moe_layer,
             input_layernorm=self.input_layernorm,
             post_attn_layernorm=self.post_attention_layernorm,
         )
@@ -107,6 +107,12 @@ class BaseDecoderLayer(nn.Module, Generic[_C]):
     def is_moe_layer(self) -> bool:
 
         return False
+
+    @property
+    def previous_is_moe_layer(self) -> bool:
+        """Whether the preceding decoder layer uses MoE communication."""
+
+        return self.is_moe_layer
 
     def resolve_norm(self) -> nn.Module:
 

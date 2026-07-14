@@ -733,6 +733,7 @@ def is_multimodal_model(model_architectures: list[str] | None):
         "Qwen3ASRForConditionalGeneration",
         "KimiK25ForConditionalGeneration",
         "InklingForConditionalGeneration",
+        "MiniMaxM3SparseForConditionalGeneration",
     }
     return any(arch in multimodal_architectures for arch in model_architectures or [])
 

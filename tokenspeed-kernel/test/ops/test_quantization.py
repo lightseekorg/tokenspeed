@@ -308,10 +308,14 @@ def test_quantize_fp8_with_scale_tensor_and_token(
         assert scale.shape == (x.shape[0], 1)
 
 
-@pytest.mark.parametrize("solution", ["trtllm", "triton"])
+@pytest.mark.parametrize(
+    "solution,group_size",
+    [("trtllm", 128), ("triton", 128), ("triton", 32)],
+)
 def test_quantize_fp8_with_scale_token_group(
     device: str,
     solution: str,
+    group_size: int,
     require,
 ) -> None:
     torch.manual_seed(5)
@@ -324,7 +328,7 @@ def test_quantize_fp8_with_scale_token_group(
     out, scale = quantize_fp8_with_scale(
         x,
         granularity="token_group",
-        group_size=128,
+        group_size=group_size,
         solution=solution,
     )
     torch.cuda.synchronize()
@@ -332,7 +336,10 @@ def test_quantize_fp8_with_scale_token_group(
     assert out.shape == x.shape
     assert out.dtype == fp8.dtype
     assert scale.dtype == torch.float32
-    assert scale.numel() > 0
+    expected_num_scales = x.shape[0] * (x.shape[1] // group_size)
+    assert scale.numel() == expected_num_scales
+    if solution == "triton":
+        assert scale.shape == (x.shape[0], x.shape[1] // group_size)
 
 
 @pytest.mark.parametrize("solution", ["flashinfer"])

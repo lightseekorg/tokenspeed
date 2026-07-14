@@ -44,6 +44,7 @@ class Fp8Config(QuantizationConfig):
         ignored_layers: list[str] | None = None,
         weight_block_size: list[int] = None,
         scale_fmt: str | None = None,
+        quant_method: str = "fp8",
     ) -> None:
         super().__init__(ignored_layers=ignored_layers)
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
@@ -67,6 +68,7 @@ class Fp8Config(QuantizationConfig):
                 )
         self.weight_block_size = weight_block_size
         self.scale_fmt = scale_fmt.lower() if scale_fmt is not None else None
+        self.quant_method = quant_method.lower()
 
     @classmethod
     def get_name(cls) -> str:
@@ -92,12 +94,15 @@ class Fp8Config(QuantizationConfig):
         ignored_layers = cls.get_from_keys_or(config, ["ignored_layers"], None)
         weight_block_size = cls.get_from_keys_or(config, ["weight_block_size"], None)
         scale_fmt = cls.get_from_keys_or(config, ["scale_fmt"], None)
+        if quant_method == "mxfp8" and scale_fmt is None:
+            scale_fmt = "ue8m0"
         return cls(
             is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
             activation_scheme=activation_scheme,
             ignored_layers=ignored_layers,
             weight_block_size=weight_block_size,
             scale_fmt=scale_fmt,
+            quant_method=quant_method,
         )
 
     def get_scaled_act_names(self) -> list[str]:

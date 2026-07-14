@@ -6,6 +6,7 @@ from tokenspeed_kernel.ops.activation.triton import (
     fused_gate_sigmoid_mul_add,
     sigmoid_mul,
     silu_and_mul,
+    swiglu_oai,
 )
 from tokenspeed_kernel.platform import current_platform
 
@@ -151,6 +152,18 @@ def test_silu_and_mul_rejects_bad_output_shape(device: str) -> None:
     out = torch.empty(4, 128, device=device, dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="out shape"):
         silu_and_mul(x, out)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_swiglu_oai_matches_reference(dtype: torch.dtype, device: str) -> None:
+    x = torch.randn(17, 256, device=device, dtype=dtype)
+    gate, up = x.float().chunk(2, dim=-1)
+    gate = gate.clamp(max=7.0)
+    ref = (gate * torch.sigmoid(1.702 * gate) * (up.clamp(-7.0, 7.0) + 1.0)).to(dtype)
+
+    out = swiglu_oai(x, alpha=1.702, limit=7.0)
+
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
 
 
 # --- fused_gate_sigmoid_mul_add tests ---

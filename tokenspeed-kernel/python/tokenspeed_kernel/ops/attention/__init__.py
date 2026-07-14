@@ -117,11 +117,206 @@ __all__ = [
     "dsa_prefill_topk",
     "dsa_decode_topk",
     "dsa_plan",
+    "minimax_m3_msa_indexer",
+    "minimax_m3_msa_sparse_attention",
     "attn_merge_state",
     "mha_plan",
 ]
 
 LSE_LN = math.log2(math.e)
+
+
+def minimax_m3_msa_indexer(
+    index_q: torch.Tensor,
+    index_k: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    topk: int,
+    scale: float,
+    init_blocks: int,
+    local_blocks: int,
+    decode_query_len: int = 0,
+    cu_seqlens_q: torch.Tensor | None = None,
+    prefix_lens: torch.Tensor | None = None,
+    max_query_len: int = 0,
+    max_blocks: int | None = None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> torch.Tensor:
+    """Select MiniMax-M3 MSA blocks and update the index-key side cache.
+
+    Args:
+        index_q: Index queries shaped ``[tokens, local_groups, 128]``.
+        index_k: Shared index keys shaped ``[tokens, 128]``.
+        index_k_cache: Per-layer side cache shaped ``[slots, 128]``.
+        slot_mapping: Cache slot for each input token.
+        block_table: Logical-to-physical 128-token page table.
+        seq_lens: Total sequence lengths after the current step.
+        topk: Selected block count. MiniMax-M3 uses 16.
+        scale: Index score scale.
+        init_blocks: Leading blocks forced into the selected set.
+        local_blocks: Recent blocks forced into the selected set.
+        decode_query_len: Uniform decode queries per request, or zero for prefill.
+        cu_seqlens_q: Prefill cumulative query lengths.
+        prefix_lens: Prefill prefix lengths.
+        max_query_len: Maximum prefill query length.
+        max_blocks: Current score-column upper bound.
+        override: Optional exact registered kernel name.
+        solution: Optional registered solution selector.
+
+    Returns:
+        Logical block ids shaped ``[tokens, local_groups, topk]``.
+    """
+    decode = int(decode_query_len) > 0
+    traits = {
+        "head_dim": int(index_q.shape[-1]),
+        "page_size": 128,
+        "topk": int(topk),
+        "decode": decode,
+    }
+    signature = _attention_format_signature(
+        index_q=index_q,
+        index_k=index_k,
+        index_k_cache=index_k_cache,
+    )
+    kernel = select_kernel(
+        "attention",
+        "minimax_m3_msa_indexer",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+    shape_params = {
+        "tokens": index_q.shape[0],
+        "num_heads": index_q.shape[1],
+        "head_dim": index_q.shape[2],
+        "topk": int(topk),
+        "decode": decode,
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "minimax_m3_msa_indexer",
+        kernel.name,
+        index_q.dtype,
+        shape_params,
+    )
+    with kernel_scope(
+        "attention",
+        "minimax_m3_msa_indexer",
+        index_q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            index_q,
+            index_k,
+            index_k_cache,
+            slot_mapping,
+            block_table,
+            seq_lens,
+            topk=topk,
+            scale=scale,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+            decode_query_len=decode_query_len,
+            cu_seqlens_q=cu_seqlens_q,
+            prefix_lens=prefix_lens,
+            max_query_len=max_query_len,
+            max_blocks=max_blocks,
+        )
+
+
+def minimax_m3_msa_sparse_attention(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    selected_blocks: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    scale: float,
+    decode_query_len: int = 0,
+    cu_seqlens_q: torch.Tensor | None = None,
+    prefix_lens: torch.Tensor | None = None,
+    max_query_len: int = 0,
+    override: str | None = None,
+    solution: str | None = None,
+) -> torch.Tensor:
+    """Run MiniMax-M3 exact block-sparse GQA over selected logical blocks.
+
+    Args:
+        q: Main queries shaped ``[tokens, local_heads, 128]``.
+        k_cache: Key cache shaped ``[pages, local_kv_heads, 128, 128]``.
+        v_cache: Value cache with the same shape as ``k_cache``.
+        selected_blocks: Logical block ids from :func:`minimax_m3_msa_indexer`.
+        block_table: Logical-to-physical 128-token page table.
+        seq_lens: Total sequence lengths after the current step.
+        scale: Main attention softmax scale.
+        decode_query_len: Uniform decode queries per request, or zero for prefill.
+        cu_seqlens_q: Prefill cumulative query lengths.
+        prefix_lens: Prefill prefix lengths.
+        max_query_len: Maximum prefill query length.
+        override: Optional exact registered kernel name.
+        solution: Optional registered solution selector.
+
+    Returns:
+        Attention output with the same shape and dtype as ``q``.
+    """
+    decode = int(decode_query_len) > 0
+    traits = {
+        "head_dim": int(q.shape[-1]),
+        "page_size": int(k_cache.shape[2]),
+        "topk": int(selected_blocks.shape[-1]),
+        "decode": decode,
+    }
+    signature = _attention_format_signature(q=q, k_cache=k_cache, v_cache=v_cache)
+    kernel = select_kernel(
+        "attention",
+        "minimax_m3_msa_sparse_attention",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+    shape_params = {
+        "tokens": q.shape[0],
+        "num_heads": q.shape[1],
+        "num_kv_heads": k_cache.shape[1],
+        "head_dim": q.shape[2],
+        "topk": selected_blocks.shape[-1],
+        "decode": decode,
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "minimax_m3_msa_sparse_attention",
+        kernel.name,
+        q.dtype,
+        shape_params,
+    )
+    with kernel_scope(
+        "attention",
+        "minimax_m3_msa_sparse_attention",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            q,
+            k_cache,
+            v_cache,
+            selected_blocks,
+            block_table,
+            seq_lens,
+            scale=scale,
+            decode_query_len=decode_query_len,
+            cu_seqlens_q=cu_seqlens_q,
+            prefix_lens=prefix_lens,
+            max_query_len=max_query_len,
+        )
 
 
 # ===-----------------------------------------------------------------------===#

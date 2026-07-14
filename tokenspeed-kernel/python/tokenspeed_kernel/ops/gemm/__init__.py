@@ -165,6 +165,17 @@ def _online_quantize_mxfp8(
     """
     block_k = block_size[1]
 
+    if kernel_name == "triton_mm_fp8_blockscale" and block_k == 32:
+        from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
+
+        return quantize_fp8_with_scale(
+            A,
+            granularity="token_group",
+            group_size=block_k,
+            scale_encoding="float32",
+            solution="triton",
+        )
+
     if (
         kernel_name in {"flashinfer_mm_fp8_blockscale", "triton_mm_fp8_blockscale"}
         and _platform.is_nvidia
