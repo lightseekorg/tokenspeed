@@ -37,6 +37,9 @@ from tokenspeed_kernel.ops.communication.trtllm import (
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.comm_backend.base import CommBackend, Group
+from tokenspeed.runtime.utils import get_colorful_logger
+
+logger = get_colorful_logger(__name__)
 
 _MAX_ONESHOT_BYTES = 2 * 1024 * 1024
 
@@ -109,6 +112,31 @@ class TrtllmAllReduceBackend(CommBackend):
         except Exception:
 
             return False
+
+    def configure_tp_groups(self, mapping, hidden_size: int) -> None:
+        """Arm one-shot workspaces for the mapping's TP groups (attn + moe).
+
+        The token window is bounded so the largest one-shot payload is
+        ``_MAX_ONESHOT_BYTES`` of bf16 activations -- larger all-reduces
+        dispatch to the fallback anyway (see :meth:`all_reduce`). Size-1
+        groups are skipped; a group whose workspace cannot be created
+        degrades to the fallback with a log line. Collective: every rank
+        must call this at the same point (IPC handle exchange).
+        """
+        max_token_num = max(1, _MAX_ONESHOT_BYTES // max(hidden_size * 2, 1))
+        for group in {mapping.attn.tp_group, mapping.moe.tp_ep_group}:
+            if len(group) > 1:
+                ok = self.configure_group(
+                    rank=group.index(mapping.rank),
+                    group=group,
+                    max_token_num=max_token_num,
+                    hidden_dim=hidden_size,
+                )
+                logger.info(
+                    "trtllm one-shot all-reduce for group %s: %s",
+                    group,
+                    "enabled" if ok else "unavailable (fallback)",
+                )
 
     def has_trtllm_ar(self, group: Group) -> bool:
         return group in self._resources
