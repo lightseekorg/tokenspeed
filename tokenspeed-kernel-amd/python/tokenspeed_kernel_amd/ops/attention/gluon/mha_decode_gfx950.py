@@ -778,6 +778,7 @@ def get_config(
     k_cache: torch.Tensor,
     max_seqlen_k: int,
     window_left: int,
+    softmax_scale: float | None,
 ) -> LaunchConfig:
     head_dim = q.shape[2]
     page_size = k_cache.shape[1]
@@ -787,7 +788,8 @@ def get_config(
     num_groups = math.ceil(group_size / block_m)
     is_sliding = window_left >= 0
     window_left = window_left if is_sliding else -1
-    sm_scale = 1.0 / math.sqrt(head_dim)
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(head_dim)
     effective_seqlen_k = min(max_seqlen_k, window_left) if is_sliding else max_seqlen_k
     num_pages = (effective_seqlen_k + page_size - 1) // page_size
     num_kv_splits = _select_num_kv_splits(
@@ -806,7 +808,7 @@ def get_config(
         num_kv_splits=num_kv_splits,
         block_m=block_m,
         block_n=block_n,
-        sm_scale=sm_scale * _INV_LN2_VALUE,
+        sm_scale=softmax_scale * _INV_LN2_VALUE,
         is_sliding=is_sliding,
         window_left=window_left,
     )
@@ -824,6 +826,10 @@ def gluon_mha_decode_gfx950(
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
     return_lse: bool = False,
+    softmax_scale: float | None = None,
+    q_scale: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     total_q = q.shape[0]
 
@@ -834,6 +840,7 @@ def gluon_mha_decode_gfx950(
         k_cache=k_cache,
         max_seqlen_k=max_seqlen_k,
         window_left=window_left,
+        softmax_scale=softmax_scale,
     )
 
     is_fp8 = q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)

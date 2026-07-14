@@ -625,13 +625,19 @@ def gluon_mha_extend_gfx950(
     return_lse: bool = False,
     max_seqlen_q: int = 1,
     max_seqlen_k: int = 1,
+    softmax_scale: float | None = None,
+    q_scale: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     head_dim = q.shape[2]
     n_heads = q.shape[1]
     n_kv_heads = k_cache.shape[2]
     page_size = k_cache.shape[1]
     block_m, block_n, num_warps = _select_extend_tile(max_seqlen_q)
-    sm_scale = (1.0 / math.sqrt(head_dim)) * _INV_LN2_VALUE
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(head_dim)
+    sm_scale = softmax_scale * _INV_LN2_VALUE
 
     # max_seqlen_q must be >= the true max query length; extra tiles early-exit.
     batch = cu_seqlens_q.shape[0] - 1

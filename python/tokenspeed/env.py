@@ -77,6 +77,7 @@ PACKAGE_LIST = [
     "pytest-asyncio",
     "python-multipart",
     "pyzmq",
+    "quack-kernels",
     "requests",
     "setproctitle",
     "tiktoken",

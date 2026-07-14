@@ -483,7 +483,13 @@ def triton_mha_prefill(
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
     return_lse: bool = False,
+    softmax_scale: float | None = None,
+    q_scale: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(q.shape[-1])
     out = torch.empty_like(q)
     lse = (
         torch.empty((q.shape[0], q.shape[1]), dtype=torch.float32, device=q.device)
@@ -505,7 +511,7 @@ def triton_mha_prefill(
         None,
         True,
         max_seqlen,
-        sm_scale=1.0 / math.sqrt(q.shape[-1]),
+        sm_scale=softmax_scale,
         logit_cap=logit_cap,
         sliding_window_size=window_left,
         sinks=sinks,
@@ -551,7 +557,13 @@ def triton_mha_extend_with_kvcache(
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
     return_lse: bool = False,
+    softmax_scale: float | None = None,
+    q_scale: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(q.shape[-1])
     k = torch.empty(
         (0, k_cache.shape[2], k_cache.shape[3]),
         dtype=k_cache.dtype,
@@ -581,7 +593,7 @@ def triton_mha_extend_with_kvcache(
         None,
         is_causal,
         max_seqlen_q,
-        sm_scale=1.0 / math.sqrt(q.shape[-1]),
+        sm_scale=softmax_scale,
         logit_cap=logit_cap,
         sliding_window_size=window_left,
         sinks=sinks,
