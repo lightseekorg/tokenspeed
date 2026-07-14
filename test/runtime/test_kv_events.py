@@ -21,6 +21,12 @@ class _FakePublisher(NullEventPublisher):
         self.kwargs = kwargs
 
 
+def test_kv_events_config_defaults_hash_mode_to_fnv() -> None:
+    config = KVEventsConfig()
+
+    assert config.hash_mode == "fnv"
+
+
 def test_vllm_style_enable_kv_cache_events_config_is_accepted() -> None:
     config = KVEventsConfig.from_cli(
         '{"publisher":"zmq","endpoint":"tcp://*:5557","enable_kv_cache_events":true}'
@@ -53,6 +59,40 @@ def test_enable_only_config_defaults_to_zmq_publisher() -> None:
         EventPublisherFactory._registry["zmq"] = original
 
     assert isinstance(publisher, _FakePublisher)
+
+
+def test_block_stored_carries_token_ids_for_xxh3_mode() -> None:
+    event = SimpleNamespace(
+        kind="BlockStored",
+        block_hashes=[123],
+        parent_block_hash=None,
+        token_ids=[1, 2, 3, 4],
+        block_size=4,
+    )
+
+    wire_event = scheduler_kv_event_to_wire_event(event)
+
+    assert wire_event.token_ids == [1, 2, 3, 4]
+
+    bad = SimpleNamespace(
+        kind="BlockStored",
+        block_hashes=[123],
+        parent_block_hash=None,
+        token_ids=[],
+        block_size=4,
+    )
+    with pytest.raises(ValueError, match="token_ids"):
+        scheduler_kv_event_to_wire_event(bad, hash_mode="xxh3")
+
+    bad_none = SimpleNamespace(
+        kind="BlockStored",
+        block_hashes=[123],
+        parent_block_hash=None,
+        token_ids=None,
+        block_size=4,
+    )
+    with pytest.raises(ValueError, match="token_ids"):
+        scheduler_kv_event_to_wire_event(bad_none, hash_mode="xxh3")
 
 
 def test_scheduler_block_stored_translation() -> None:

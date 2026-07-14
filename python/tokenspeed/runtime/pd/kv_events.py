@@ -35,7 +35,7 @@ from abc import ABC, abstractmethod
 from collections import deque
 from itertools import count
 from queue import Queue
-from typing import Any, Callable, Iterable, Optional, Union
+from typing import Any, Callable, Iterable, Literal, Optional, Union
 
 import msgspec
 import zmq
@@ -86,10 +86,16 @@ class KVEventBatch(EventBatch):
 
 def scheduler_kv_event_to_wire_event(
     event: Any,
+    hash_mode: str = "fnv",
 ) -> Union[BlockStored, BlockRemoved]:
     """Translate a scheduler-native KV event into the ZMQ wire struct."""
     kind = event.kind
     if kind == "BlockStored":
+        token_ids = event.token_ids
+        if hash_mode == "xxh3" and not token_ids:
+            raise ValueError(
+                "BlockStored events require non-empty token_ids when hash_mode=xxh3"
+            )
         return BlockStored(
             block_hashes=[int(block_hash) for block_hash in event.block_hashes],
             parent_block_hash=(
@@ -97,7 +103,7 @@ def scheduler_kv_event_to_wire_event(
                 if event.parent_block_hash is None
                 else int(event.parent_block_hash)
             ),
-            token_ids=[int(token_id) for token_id in event.token_ids],
+            token_ids=[int(token_id) for token_id in token_ids],
             block_size=int(event.block_size),
         )
     if kind == "BlockRemoved":
@@ -109,8 +115,11 @@ def scheduler_kv_event_to_wire_event(
 
 def scheduler_kv_events_to_wire_events(
     events: Iterable[Any],
+    hash_mode: str = "fnv",
 ) -> list[Union[BlockStored, BlockRemoved]]:
-    return [scheduler_kv_event_to_wire_event(event) for event in events]
+    return [
+        scheduler_kv_event_to_wire_event(event, hash_mode=hash_mode) for event in events
+    ]
 
 
 def drain_scheduler_kv_events(scheduler: Any, enabled: bool) -> list[Any]:
@@ -431,6 +440,11 @@ class KVEventsConfig(BaseModel):
     enable_kv_cache_events: bool = False
     """Whether to publish scheduler KV cache mutation events."""
 
+    hash_mode: Literal["fnv", "xxh3"] = "fnv"
+    """Block hash mode used by the scheduler. When ``xxh3``, BlockStored wire
+    events require non-empty ``token_ids`` so consumers can recompute hashes.
+    """
+
     @classmethod
     def from_cli(cls, cli_value: str) -> "KVEventsConfig":
         """Parse the CLI value for the event publisher config."""
@@ -457,6 +471,7 @@ class EventPublisherFactory:
         config = KVEventsConfig.from_cli(config)
         config_dict = config.model_dump()
         enabled = bool(config_dict.pop("enable_kv_cache_events", False))
+        config_dict.pop("hash_mode", None)
         if not enabled:
             return NullEventPublisher(attn_dp_rank=attn_dp_rank)
 
