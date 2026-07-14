@@ -86,6 +86,7 @@ class MemoryExecutor:
         draft_device_pool=None,
         mamba_pool=None,
         on_l3_blocks_stored: Callable[[list[str]], None] | None = None,
+        on_l3_all_cleared: Callable[[], None] | None = None,
     ):
         self.page_size = config.page_size
 
@@ -239,6 +240,7 @@ class MemoryExecutor:
             is_dp_attention_enabled=is_dp_attention_enabled,
             tp_group=tp_group,
             on_l3_blocks_stored=on_l3_blocks_stored,
+            on_l3_all_cleared=on_l3_all_cleared,
         )
         self._pending_mamba_layerwise_cow: dict[int, list[int]] | None = None
 

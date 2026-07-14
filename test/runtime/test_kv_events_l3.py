@@ -1,17 +1,21 @@
-"""Tests for Mooncake L3 (disk-tier) KV event publishing on backup success."""
+"""Tests for Mooncake L3 (disk-tier) KV event publishing on backup/clear."""
 
 from __future__ import annotations
 
+import importlib.util
 import sys
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
+from pathlib import Path
 from queue import Queue
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from tokenspeed.runtime.pd.kv_events import (
+    AllBlocksCleared,
     BlockStored,
     KVEventsConfig,
+    apply_envelope,
     l3_storage_keys_to_disk_events,
 )
 
@@ -175,3 +179,157 @@ def test_backup_done_skips_callback_on_failure() -> None:
     assert results[0].success is False
     assert received == []
     assert 7 not in executor._backup_hashes
+
+
+_MISSING = object()
+
+
+def _load_mooncake_store_cls():
+    """Load MooncakeStore without importing the stubbed ``cache.storage`` package."""
+    import types
+
+    sys.modules.setdefault("torch", MagicMock())
+    sys.modules.setdefault("requests", MagicMock())
+    sys.modules.setdefault("tokenspeed_kernel", MagicMock())
+    sys.modules.setdefault("tokenspeed_kernel.platform", MagicMock())
+    sys.modules.setdefault("tokenspeed.runtime.cache.kv_cache_host", MagicMock())
+
+    mod_name = "mooncake_store_kv_events_l3"
+    existing = sys.modules.get(mod_name)
+    if existing is not None and hasattr(existing, "MooncakeStore"):
+        return existing.MooncakeStore
+
+    path = (
+        Path(__file__).resolve().parents[2]
+        / "python"
+        / "tokenspeed"
+        / "runtime"
+        / "cache"
+        / "storage"
+        / "mooncake_store"
+        / "mooncake_store.py"
+    )
+
+    # Temporarily stub import deps for this load only, then restore so sibling
+    # tests (e.g. ``test_kv_events.py``) can still import real ``utils.env``.
+    saved: dict[str, object] = {}
+    kvstore = types.ModuleType("tokenspeed.runtime.cache.kvstore_storage")
+    kvstore.KVStoreStorage = object
+    kvstore.KVStoreStorageConfig = type("KVStoreStorageConfig", (), {})
+    kvstore.KVStoreStorageExtraInfo = type("KVStoreStorageExtraInfo", (), {})
+
+    env_mod = types.ModuleType("tokenspeed.runtime.utils.env")
+    env_mod.envs = MagicMock()
+
+    stubs = {
+        "tokenspeed.runtime.cache.kvstore_storage": kvstore,
+        "tokenspeed.runtime.utils.env": env_mod,
+    }
+
+    for key, stub in stubs.items():
+        saved[key] = sys.modules.get(key, _MISSING)
+        sys.modules[key] = stub
+
+    try:
+        spec = importlib.util.spec_from_file_location(mod_name, path)
+        assert spec is not None and spec.loader is not None
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[mod_name] = mod
+        spec.loader.exec_module(mod)
+        return mod.MooncakeStore
+    finally:
+        for key, prev in saved.items():
+            if prev is _MISSING:
+                sys.modules.pop(key, None)
+            else:
+                sys.modules[key] = prev
+
+
+def test_mooncake_store_clear_invokes_on_clear_callback() -> None:
+    """MooncakeStore.clear() calls optional on_clear after store.remove_all()."""
+    MooncakeStore = _load_mooncake_store_cls()
+
+    store = object.__new__(MooncakeStore)
+    store.store = MagicMock()
+    called: list[bool] = []
+    store.on_clear = lambda: called.append(True)
+
+    store.clear()
+
+    store.store.remove_all.assert_called_once_with()
+    assert called == [True]
+
+
+def test_mooncake_store_clear_without_on_clear_is_safe() -> None:
+    MooncakeStore = _load_mooncake_store_cls()
+
+    store = object.__new__(MooncakeStore)
+    store.store = MagicMock()
+    store.on_clear = None
+
+    store.clear()
+
+    store.store.remove_all.assert_called_once_with()
+
+
+def test_storage_executor_wires_on_l3_all_cleared_to_backend() -> None:
+    """StorageExecutor assigns on_l3_all_cleared onto backend.on_clear."""
+    _stub_storage_executor_deps()
+    from tokenspeed.runtime.cache.executor.storage_executor import StorageExecutor
+
+    received: list[bool] = []
+
+    def on_cleared() -> None:
+        received.append(True)
+
+    executor = object.__new__(StorageExecutor)
+    executor._on_l3_all_cleared = on_cleared
+    backend = SimpleNamespace(on_clear=None)
+    executor.storage_backend = backend
+    executor._wire_l3_clear_callback()
+
+    assert backend.on_clear is on_cleared
+    backend.on_clear()
+    assert received == [True]
+
+
+def test_mooncake_clear_enqueues_all_blocks_cleared_via_callback() -> None:
+    """End-to-end: Mooncake clear → on_clear → pending AllBlocksCleared(disk)."""
+    MooncakeStore = _load_mooncake_store_cls()
+
+    pending: Queue = Queue()
+
+    def on_l3_all_cleared() -> None:
+        pending.put(AllBlocksCleared())
+
+    store = object.__new__(MooncakeStore)
+    store.store = MagicMock()
+    store.on_clear = on_l3_all_cleared
+
+    store.clear()
+
+    event = pending.get_nowait()
+    assert isinstance(event, AllBlocksCleared)
+    config = KVEventsConfig(
+        wire_format="rfc1527",
+        backend_id="worker-0",
+        publish_medium=True,
+        publish_tiers=["gpu", "disk"],
+    )
+    apply_envelope(event, config, medium="disk", dp_rank=0)
+    assert event.medium == "disk"
+    assert event.backend_id == "worker-0"
+
+
+def test_apply_envelope_all_blocks_cleared_medium_disk() -> None:
+    event = AllBlocksCleared()
+    config = KVEventsConfig(
+        wire_format="rfc1527",
+        backend_id="w",
+        publish_medium=True,
+    )
+
+    annotated = apply_envelope(event, config, medium="disk", dp_rank=0)
+
+    assert annotated.medium == "disk"
+    assert annotated.backend_id == "w"

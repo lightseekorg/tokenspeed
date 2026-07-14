@@ -214,7 +214,9 @@ Dynamo-compatible.
 
 `publish_tiers` (default `["gpu"]`) selects which storage tiers to publish.
 Include `"disk"` (e.g. `["gpu","cpu","disk"]`) to emit `medium="disk"`
-`BlockStored` events when Mooncake L3 backup succeeds. Disk hashes are an
+`BlockStored` events when Mooncake L3 backup succeeds, and
+`AllBlocksCleared` when the Mooncake store is cleared (`remove_all`).
+Disk hashes are an
 interim mapping from Mooncake SHA256 hex storage keys via XXH3-64 seed 1337
 (empty `token_ids`) until `BackUpOp` carries token page spans.
 

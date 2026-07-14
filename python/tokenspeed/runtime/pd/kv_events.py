@@ -702,8 +702,8 @@ class KVEventsConfig(BaseModel):
 
     Defaults to ``["gpu"]`` for backward compatibility. Mooncake Store
     deployments that want host/disk indexing should set
-    ``["gpu", "cpu", "disk"]``. L3 backup success events are published only
-    when ``"disk"`` is present.
+    ``["gpu", "cpu", "disk"]``. L3 backup success and store-clear events are
+    published only when ``"disk"`` is present.
     """
 
     @classmethod
