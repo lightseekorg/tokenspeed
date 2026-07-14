@@ -19,6 +19,7 @@
 // SOFTWARE.
 
 #include <nanobind/nanobind.h>
+#include <nanobind/ndarray.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/map.h>
@@ -366,6 +367,20 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                 return op.flat_block_tables;
             },
             nb::rv_policy::reference_internal)
+        .def("flat_block_tables_arrays",
+             [](nb::handle self) {
+                 // Zero-copy 2-D int32 views over the contiguous export
+                 // buffers; `self` as owner pins the op alive. Callers must
+                 // stage-copy before the next plan mutates the op.
+                 auto& op = nb::cast<tokenspeed::FlatForwardOperation&>(self);
+                 nb::dict out;
+                 for (auto& [gid, buf] : op.flat_block_tables_contig) {
+                     const auto& dims = op.flat_block_tables_dims.at(gid);
+                     out[nb::str(gid.c_str())] =
+                         nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<2>>(buf.data(), {dims[0], dims[1]}, self);
+                 }
+                 return out;
+             })
         .def("num_extends", &tokenspeed::FlatForwardOperation::num_extends)
         .def_ro("mamba_pool_indices", &tokenspeed::FlatForwardOperation::mamba_working_indices)
         .def_ro("mamba_checkpoint_dst_indices", &tokenspeed::FlatForwardOperation::mamba_checkpoint_dst_indices)

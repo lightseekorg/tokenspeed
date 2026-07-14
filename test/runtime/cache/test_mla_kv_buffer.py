@@ -22,6 +22,10 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.embedding import (
+    FusedMLASetKVBufferArg,
+    apply_rope,
+)
 
 from tokenspeed.runtime.cache.utils import (
     get_mla_kv_buffer_triton,
@@ -89,6 +93,29 @@ def _torch_get_reference(kv: torch.Tensor, loc) -> tuple[torch.Tensor, torch.Ten
         kv[loc, :NOPE_DIM].unsqueeze(1).contiguous(),
         kv[loc, NOPE_DIM:].unsqueeze(1).contiguous(),
     )
+
+
+def _rotate_rope_reference(
+    x: torch.Tensor,
+    cos_sin: torch.Tensor,
+    positions: torch.Tensor,
+    is_neox: bool,
+) -> torch.Tensor:
+    cos, sin = cos_sin[positions].chunk(2, dim=-1)
+    half = x.shape[-1] // 2
+    x_float = x.float()
+    cos = cos.float().unsqueeze(-2)
+    sin = sin.float().unsqueeze(-2)
+    if is_neox:
+        x1 = x_float[..., :half]
+        x2 = x_float[..., half:]
+        out = torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1)
+    else:
+        x1 = x_float[..., 0::2]
+        x2 = x_float[..., 1::2]
+        out = torch.stack((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1)
+        out = out.flatten(-2)
+    return out.to(x.dtype)
 
 
 # ─── set ─────────────────────────────────────────────────────────────
@@ -202,3 +229,55 @@ def test_set_then_get_round_trip(n_loc, dtype):
 
     assert _bitwise_equal(k_nope_out, k_nope_in)
     assert _bitwise_equal(k_rope_out, k_rope_in)
+
+
+@pytest.mark.parametrize("is_neox", [False, True])
+@pytest.mark.parametrize("loc_dtype", [torch.int32, torch.int64])
+def test_mla_rope_set_kv_buffer_matches_reference(is_neox, loc_dtype):
+    torch.manual_seed(0)
+    n_loc = 17
+    num_heads = 3
+    max_position = 128
+    device = "cuda"
+    dtype = torch.bfloat16
+
+    q_rope = torch.randn(n_loc, num_heads, ROPE_DIM, device=device, dtype=dtype)
+    k_nope = torch.randn(n_loc, 1, NOPE_DIM, device=device, dtype=dtype)
+    k_rope = torch.randn(n_loc, 1, ROPE_DIM, device=device, dtype=dtype)
+    q_out_rope = torch.empty_like(q_rope)
+    kv = _empty_kv(dtype)
+    loc = torch.randperm(NUM_PAGES, device=device, dtype=loc_dtype)[:n_loc]
+    positions = torch.randint(
+        0, max_position, (n_loc,), device=device, dtype=torch.int64
+    )
+
+    angles = torch.randn(max_position, ROPE_DIM, device=device, dtype=torch.float32)
+    cos_sin = torch.cat(
+        (torch.cos(angles[:, : ROPE_DIM // 2]), torch.sin(angles[:, : ROPE_DIM // 2])),
+        dim=-1,
+    )
+
+    q_ref = _rotate_rope_reference(q_rope, cos_sin, positions, is_neox)
+    k_rope_ref = _rotate_rope_reference(k_rope, cos_sin, positions, is_neox)
+    kv_ref = kv.clone()
+    kv_ref[loc.long(), :NOPE_DIM] = k_nope[:, 0, :]
+    kv_ref[loc.long(), NOPE_DIM:] = k_rope_ref[:, 0, :]
+
+    apply_rope(
+        cos_sin_cache=cos_sin,
+        fused_mla_set_kv_buffer_arg=FusedMLASetKVBufferArg(
+            k_nope=k_nope,
+            kv_buffer=kv,
+            cache_loc=loc,
+        ),
+        head_size=ROPE_DIM,
+        positions=positions,
+        q=q_rope,
+        k=k_rope,
+        q_rope_out=q_out_rope,
+        is_neox=is_neox,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(q_out_rope, q_ref, atol=0.01, rtol=0.01)
+    torch.testing.assert_close(kv[loc.long()], kv_ref[loc.long()], atol=0.01, rtol=0.01)

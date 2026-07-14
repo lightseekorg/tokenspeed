@@ -21,6 +21,7 @@
 from dataclasses import dataclass
 
 import torch
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -149,12 +150,20 @@ class DistributedInitializer:
         else:
             dist_init_method = f"tcp://127.0.0.1:{config.nccl_port}"
 
+        # Device-scoped NCCL init is only required and tested on AMD.
+        device_id = (
+            torch.device(config.device, config.gpu_id)
+            if current_platform().is_amd
+            else None
+        )
+
         # Initialize distributed via the mapping-based process group manager
         pg_manager.init_distributed(
             config.mapping,
             backend=backend,
             distributed_init_method=dist_init_method,
             timeout=config.distributed_timeout_seconds,
+            device_id=device_id,
         )
         pg_manager.init_process_group(config.mapping.world_group)
         pg_manager.init_process_group(config.mapping.attn.tp_group)

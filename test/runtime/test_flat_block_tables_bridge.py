@@ -36,7 +36,17 @@ class FlatBlockTablesBridgeTest(unittest.TestCase):
     def _make_op(self, flat_block_tables):
         from types import SimpleNamespace
 
-        return SimpleNamespace(flat_block_tables=flat_block_tables)
+        import numpy as np
+
+        def rect(v):
+            a = np.asarray(v, dtype=np.int32)
+            return a if a.ndim == 2 else a.reshape(len(v), 0)
+
+        arrays = {k: rect(v) for k, v in flat_block_tables.items()}
+        return SimpleNamespace(
+            flat_block_tables=flat_block_tables,
+            flat_block_tables_arrays=lambda: arrays,
+        )
 
     def test_two_groups_shape_and_null_hole_preserved(self):
         op = self._make_op(
@@ -57,12 +67,7 @@ class FlatBlockTablesBridgeTest(unittest.TestCase):
         self.assertEqual(tuple(swa.shape), (2, 1))
         self.assertEqual(swa.tolist(), [[21], [0]])
 
-    def test_ragged_rows_padded_with_minus_one(self):
-        op = self._make_op({"full": [[1, 2, 3], [9]]})
-        out = self.bridge(op, device="cpu", num_reqs=2)
-        self.assertEqual(out["full"].tolist(), [[1, 2, 3], [9, -1, -1]])
-
-    def test_missing_attribute_returns_empty(self):
+    def test_radix_op_without_flat_attrs_returns_empty(self):
         from types import SimpleNamespace
 
         op = SimpleNamespace()
