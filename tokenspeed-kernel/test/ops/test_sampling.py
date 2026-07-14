@@ -281,6 +281,10 @@ def _offset_view(t: torch.Tensor, off: int) -> torch.Tensor:
         (2, 0, 8192, "probs-view-off-8B"),
         (0, 1, 8192, "out-view-off-4B"),
         (1, 1, 8192, "both-views-off-4B"),
+        # probs and out land in *different* 16B phases, so no single peel can
+        # align both: the kernel keeps vectorized loads and writes kept lanes
+        # scalar. Exercises that store path specifically.
+        (1, 2, 8192, "views-out-of-phase"),
         # (2) vocab_size % 4 != 0 pushes every row b >= 1 off a 16B boundary even
         # when the base allocation is 256B-aligned.
         (0, 0, 8191, "odd-vocab"),
