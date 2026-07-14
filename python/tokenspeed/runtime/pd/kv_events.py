@@ -28,7 +28,6 @@
 
 import atexit
 import logging
-import os
 import queue
 import threading
 import time
@@ -46,7 +45,12 @@ logger = logging.getLogger(__name__)
 
 
 def _default_kv_events_backend_id() -> str:
-    return os.getenv("TOKENSPEED_KV_EVENTS_BACKEND_ID") or "tokenspeed-worker"
+    # Lazy import: utils/__init__ pulls heavy runtime deps needed by env.py.
+    try:
+        from tokenspeed.runtime.utils.env import envs
+    except ImportError:
+        return "tokenspeed-worker"
+    return envs.TOKENSPEED_KV_EVENTS_BACKEND_ID.get()
 
 
 class EventBatch(

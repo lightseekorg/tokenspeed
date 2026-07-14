@@ -23,6 +23,28 @@ class _FakePublisher(NullEventPublisher):
         self.kwargs = kwargs
 
 
+def test_backend_id_default_reads_envs(monkeypatch) -> None:
+    import sys
+    import types
+
+    from tokenspeed.runtime.pd import kv_events as kv_events_mod
+
+    utils_pkg = types.ModuleType("tokenspeed.runtime.utils")
+    utils_pkg.__path__ = []  # mark as package
+    env_mod = types.ModuleType("tokenspeed.runtime.utils.env")
+
+    class _Field:
+        def get(self) -> str:
+            return "from-envs"
+
+    env_mod.envs = types.SimpleNamespace(TOKENSPEED_KV_EVENTS_BACKEND_ID=_Field())
+    monkeypatch.setitem(sys.modules, "tokenspeed.runtime.utils", utils_pkg)
+    monkeypatch.setitem(sys.modules, "tokenspeed.runtime.utils.env", env_mod)
+
+    assert kv_events_mod._default_kv_events_backend_id() == "from-envs"
+    assert KVEventsConfig().backend_id == "from-envs"
+
+
 def test_kv_events_config_defaults_hash_mode_to_fnv() -> None:
     config = KVEventsConfig()
 
