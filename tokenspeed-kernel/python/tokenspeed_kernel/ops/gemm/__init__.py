@@ -99,15 +99,22 @@ def _gemm_format_signature(
     if quant == "mxfp8":
         if block_size is None:
             raise ValueError("mxfp8 format selection requires block_size")
-        scale = ScaleFormat(
-            storage_dtype=_scale_storage_dtype(A_scales, B_scales),
+        if B_scales is None:
+            raise ValueError("mxfp8 format selection requires B_scales")
+        a_scale = ScaleFormat(
+            storage_dtype=(A_scales.dtype if A_scales is not None else torch.float32),
+            granularity="block",
+            block_shape=tuple(block_size),
+        )
+        b_scale = ScaleFormat(
+            storage_dtype=B_scales.dtype,
             granularity="block",
             block_shape=tuple(block_size),
         )
         a_storage_dtype = _fp8_dtype if A_scales is None else A.dtype
         return format_signature(
-            a=tensor_format("mxfp8", a_storage_dtype, scale=scale),
-            b=tensor_format("mxfp8", B.dtype, scale=scale),
+            a=tensor_format("mxfp8", a_storage_dtype, scale=a_scale),
+            b=tensor_format("mxfp8", B.dtype, scale=b_scale),
         )
     if quant == "fp8":
         scale = ScaleFormat(
@@ -379,7 +386,19 @@ def mm(
         assert (
             block_size is not None
         ), "block_size is required for online activation quantization"
-        A, A_scales = _online_quantize_mxfp8(A, block_size, kernel.name)
+        a_format = signature.format_for("a")
+        assert a_format is not None and a_format.scale is not None
+        A, A_scales = _online_quantize_mxfp8(
+            A,
+            block_size,
+            kernel.name,
+        )
+        if A_scales.dtype != a_format.scale.storage_dtype:
+            raise RuntimeError(
+                f"{kernel.name} online MXFP8 quantization returned "
+                f"{A_scales.dtype} scales, expected "
+                f"{a_format.scale.storage_dtype} from its selected format"
+            )
 
     kernel_args = (A, B, A_scales, B_scales, out_dtype)
     kernel_kwargs: dict[str, object] = {

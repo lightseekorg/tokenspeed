@@ -22,13 +22,13 @@
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Iterable
 
 import torch
 from tokenspeed_kernel import (
     minimax_m3_msa_indexer,
     minimax_m3_msa_sparse_attention,
+    minimax_m3_topk,
 )
 from tokenspeed_kernel.ops.activation.triton import swiglu_oai
 from tokenspeed_kernel.ops.layernorm.triton import qk_rmsnorm
@@ -38,7 +38,13 @@ from tokenspeed.runtime.configs.minimax_m3_config import (
     MiniMaxM3TextConfig,
     MiniMaxM3VLConfig,
 )
+from tokenspeed.runtime.configs.paged_cache_spec import FULL_ATTENTION
 from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.execution.breakable_cuda_graph import (
+    break_point,
+    current_forward_ctx,
+    slice_to_real_tokens,
+)
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
 from tokenspeed.runtime.layers.linear import (
@@ -69,9 +75,19 @@ from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
-logger = logging.getLogger(__name__)
-
 _MSA_BLOCK_SIZE = 128
+
+
+def _msa_score_block_upper_bound(
+    max_prefix_len: int,
+    max_extend_len: int,
+    block_size: int,
+    page_table_cols: int,
+) -> int:
+    """Bound batched MSA scoring without exceeding the page-table width."""
+    max_seq_len = int(max_prefix_len) + int(max_extend_len)
+    estimated_blocks = (max_seq_len + int(block_size) - 1) // int(block_size)
+    return min(estimated_blocks, int(page_table_cols))
 
 
 class MiniMaxM3MLP(nn.Module):
@@ -167,7 +183,7 @@ class MiniMaxM3SparseMoeBlock(nn.Module):
             "routed_scaling_factor": config.routed_scaling_factor,
             "normalize_topk_weights": True,
             "correction_bias": self.routing_bias,
-            "routing_method_type": RoutingMethodType.MiniMax2,
+            "routing_method_type": RoutingMethodType.FP32SigmoidBias,
         }
         self.experts = MoELayer(
             top_k=config.num_experts_per_tok,
@@ -190,16 +206,13 @@ class MiniMaxM3SparseMoeBlock(nn.Module):
             swiglu_beta=1.0,
             w13_input_layout="concatenated",
             routing_config=routing_config,
-            solution="triton" if quant_config is not None else None,
+            solution="triton",
         )
+        self.routed_scaling_factor = config.routed_scaling_factor
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
             renormalize=True,
-            use_grouped_topk=True,
-            num_expert_group=1,
-            topk_group=1,
-            correction_bias=self.routing_bias,
-            routed_scaling_factor=config.routed_scaling_factor,
+            custom_routing_function=self._route_topk,
             output_format=self.experts.topk_output_format,
         )
         self.shared_experts = MiniMaxM3MLP(
@@ -208,6 +221,24 @@ class MiniMaxM3SparseMoeBlock(nn.Module):
             mapping=mapping,
             quant_config=quant_config,
             prefix=add_prefix("shared_experts", prefix),
+        )
+
+    def _route_topk(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        gating_output: torch.Tensor,
+        topk: int,
+        renormalize: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return minimax_m3_topk(
+            hidden_states,
+            gating_output,
+            self.routing_bias,
+            topk=topk,
+            renormalize=renormalize,
+            routed_scaling_factor=self.routed_scaling_factor,
+            solution="triton",
         )
 
     def forward(
@@ -262,13 +293,13 @@ class MiniMaxM3Indexer(nn.Module):
                 f"{total_index_heads} index heads cannot be sharded over "
                 f"TP={mapping.attn.tp_size}."
             )
-        self.num_index_heads = total_index_heads // mapping.attn.tp_size
+        self.num_index_heads = total_index_heads
         self.head_dim = int(sparse_config["sparse_index_dim"])
-        self.q_size = self.num_index_heads * self.head_dim
         self.index_q_proj = ColumnParallelLinear(
             config.hidden_size,
             total_index_heads * self.head_dim,
             bias=False,
+            gather_output=True,
             quant_config=quant_config,
             tp_rank=mapping.attn.tp_rank,
             tp_size=mapping.attn.tp_size,
@@ -340,6 +371,11 @@ class MiniMaxM3Attention(nn.Module):
         self.sparse_block_size = int(sparse_config["sparse_block_size"])
         self.sparse_init_blocks = int(sparse_config["sparse_init_block"])
         self.sparse_local_blocks = int(sparse_config["sparse_local_block"])
+        if self.is_sparse and sparse_config["sparse_score_type"] != "max":
+            raise ValueError(
+                "MiniMax-M3 MSA requires sparse_score_type='max', got "
+                f"{sparse_config['sparse_score_type']!r}."
+            )
         if self.is_sparse and self.sparse_block_size != _MSA_BLOCK_SIZE:
             raise ValueError(
                 f"MiniMax-M3 MSA requires block size {_MSA_BLOCK_SIZE}, got "
@@ -393,6 +429,7 @@ class MiniMaxM3Attention(nn.Module):
             self.head_dim**-0.5,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            group_id=FULL_ATTENTION,
         )
 
     def forward(
@@ -450,10 +487,92 @@ class MiniMaxM3Attention(nn.Module):
         if self.indexer is None:
             raise RuntimeError("Sparse MiniMax-M3 attention requires an indexer.")
         index_q, index_k = self.indexer(positions, hidden_states)
+        attn_output = self._sparse_attention(
+            q,
+            k,
+            v,
+            index_q,
+            index_k,
+            ctx,
+            out_cache_loc,
+        )
+        output, _ = self.o_proj(attn_output.flatten(1))
+        return output
+
+    @staticmethod
+    def _select_cache_io(metadata, out_cache_loc):
+        """Return one strict full-attention page table and its write slots."""
+        if metadata.page_tables is None:
+            if metadata.page_table is None:
+                raise RuntimeError("MiniMax-M3 MSA requires paged metadata.")
+            return metadata.page_table, out_cache_loc
+        if metadata.out_cache_locs is None:
+            raise RuntimeError("MiniMax-M3 flat paged metadata has no write slots.")
+        if FULL_ATTENTION not in metadata.page_tables:
+            raise KeyError(
+                "MiniMax-M3 flat page tables do not contain "
+                f"{FULL_ATTENTION!r}: {sorted(metadata.page_tables)}"
+            )
+        if FULL_ATTENTION not in metadata.out_cache_locs:
+            raise KeyError(
+                "MiniMax-M3 flat write slots do not contain "
+                f"{FULL_ATTENTION!r}: {sorted(metadata.out_cache_locs)}"
+            )
+        return (
+            metadata.page_tables[FULL_ATTENTION],
+            metadata.out_cache_locs[FULL_ATTENTION],
+        )
+
+    @break_point
+    def _sparse_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        index_q: torch.Tensor,
+        index_k: torch.Tensor,
+        ctx: ForwardContext,
+        out_cache_loc: torch.Tensor,
+    ) -> torch.Tensor:
+        """Write caches and run MSA eagerly inside a breakable prefill graph."""
+        if self.indexer is None:
+            raise RuntimeError("Sparse MiniMax-M3 attention requires an indexer.")
+        if current_forward_ctx() is not None:
+            metadata = ctx.attn_backend.forward_extend_metadata
+            if metadata is None:
+                raise RuntimeError("MiniMax-M3 graph replay requires prefill metadata.")
+            num_real_tokens = metadata.cu_extend_seq_lens_cpu[-1]
+            q, k, v, index_q, index_k, out_cache_loc = slice_to_real_tokens(
+                num_real_tokens,
+                q,
+                k,
+                v,
+                index_q,
+                index_k,
+                out_cache_loc,
+            )
+
         pool = ctx.token_to_kv_pool
+        if ctx.forward_mode.is_decode():
+            metadata = ctx.attn_backend.forward_decode_metadata
+            if metadata is None:
+                raise RuntimeError("MiniMax-M3 MSA decode requires paged metadata.")
+            page_table, cache_locs = self._select_cache_io(metadata, out_cache_loc)
+            decode_query_len = q.shape[0] // metadata.seq_lens.shape[0]
+        elif ctx.forward_mode.is_extend_or_mixed():
+            metadata = ctx.attn_backend.forward_extend_metadata
+            if metadata is None:
+                raise RuntimeError("MiniMax-M3 MSA prefill requires paged metadata.")
+            page_table, cache_locs = self._select_cache_io(metadata, out_cache_loc)
+            decode_query_len = 0
+        else:
+            raise RuntimeError(
+                f"MiniMax-M3 MSA does not support forward mode {ctx.forward_mode}."
+            )
+
         pool.set_kv_buffer(
             self.attn,
-            out_cache_loc,
+            cache_locs,
             k,
             v,
             self.attn.k_scale,
@@ -470,51 +589,47 @@ class MiniMaxM3Attention(nn.Module):
         value_cache = value_cache.permute(0, 2, 1, 3)
         index_k_cache = pool.get_index_k_buffer(self.attn.layer_id)
 
-        if ctx.forward_mode.is_decode():
-            metadata = ctx.attn_backend.forward_decode_metadata
-            if metadata is None or metadata.page_table is None:
-                raise RuntimeError("MiniMax-M3 MSA decode requires paged metadata.")
-            decode_query_len = q.shape[0] // metadata.seq_lens.shape[0]
+        if decode_query_len:
             selected_blocks = minimax_m3_msa_indexer(
                 index_q,
                 index_k,
                 index_k_cache,
-                out_cache_loc,
-                metadata.page_table,
+                cache_locs,
+                page_table,
                 metadata.seq_lens,
                 topk=self.sparse_topk,
                 scale=self.indexer.head_dim**-0.5,
                 init_blocks=self.sparse_init_blocks,
                 local_blocks=self.sparse_local_blocks,
                 decode_query_len=decode_query_len,
-                max_blocks=metadata.page_table.shape[1],
+                max_blocks=page_table.shape[1],
                 solution="triton",
             )
-            attn_output = minimax_m3_msa_sparse_attention(
+            return minimax_m3_msa_sparse_attention(
                 q,
                 key_cache,
                 value_cache,
                 selected_blocks,
-                metadata.page_table,
+                page_table,
                 metadata.seq_lens,
                 scale=self.head_dim**-0.5,
                 decode_query_len=decode_query_len,
                 solution="triton",
             )
-        elif ctx.forward_mode.is_extend_or_mixed():
-            metadata = ctx.attn_backend.forward_extend_metadata
-            if metadata is None or metadata.page_table is None:
-                raise RuntimeError("MiniMax-M3 MSA prefill requires paged metadata.")
-            max_seq_len = metadata.max_extend_prefix_len + metadata.max_extend_seq_len
-            max_blocks = (
-                max_seq_len + self.sparse_block_size - 1
-            ) // self.sparse_block_size
+
+        if ctx.forward_mode.is_extend_or_mixed():
+            max_blocks = _msa_score_block_upper_bound(
+                metadata.max_extend_prefix_len,
+                metadata.max_extend_seq_len,
+                self.sparse_block_size,
+                page_table.shape[1],
+            )
             selected_blocks = minimax_m3_msa_indexer(
                 index_q,
                 index_k,
                 index_k_cache,
-                out_cache_loc,
-                metadata.page_table,
+                cache_locs,
+                page_table,
                 metadata.seq_lens,
                 topk=self.sparse_topk,
                 scale=self.indexer.head_dim**-0.5,
@@ -526,12 +641,12 @@ class MiniMaxM3Attention(nn.Module):
                 max_blocks=max_blocks,
                 solution="triton",
             )
-            attn_output = minimax_m3_msa_sparse_attention(
+            return minimax_m3_msa_sparse_attention(
                 q,
                 key_cache,
                 value_cache,
                 selected_blocks,
-                metadata.page_table,
+                page_table,
                 metadata.seq_lens,
                 scale=self.head_dim**-0.5,
                 cu_seqlens_q=metadata.cu_extend_seq_lens,
@@ -539,13 +654,7 @@ class MiniMaxM3Attention(nn.Module):
                 max_query_len=metadata.max_extend_seq_len,
                 solution="triton",
             )
-        else:
-            raise RuntimeError(
-                f"MiniMax-M3 MSA does not support forward mode {ctx.forward_mode}."
-            )
-
-        output, _ = self.o_proj(attn_output.flatten(1))
-        return output
+        raise AssertionError("unreachable MiniMax-M3 MSA mode")
 
 
 class MiniMaxM3DecoderLayer(BaseDecoderLayer[MiniMaxM3TextConfig]):

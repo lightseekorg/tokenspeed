@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import pytest
-import tokenspeed_kernel.thirdparty.triton as triton_topk
 import torch
+from tokenspeed_kernel import minimax_m3_topk
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.layers.moe import topk as topk_module
@@ -53,31 +53,20 @@ def test_correction_bias_route_forwards_renormalize(
     not current_platform().is_nvidia or not torch.cuda.is_available(),
     reason="MiniMax top-4 Triton routing requires an NVIDIA GPU.",
 )
-def test_minimax_top4_uses_native_triton_kernel(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_minimax_m3_top4_uses_native_triton_kernel() -> None:
     torch.manual_seed(7)
     hidden_states = torch.randn(23, 64, device="cuda", dtype=torch.bfloat16)
     router_logits = torch.randn(23, 128, device="cuda", dtype=torch.float32)
     correction_bias = torch.randn(128, device="cuda", dtype=torch.float32) * 0.05
 
-    def fail_reference(*_args, **_kwargs):
-        raise AssertionError("PyTorch routing fallback was used")
-
-    monkeypatch.setattr(
-        triton_topk,
-        "_biased_grouped_topk_reference",
-        fail_reference,
-    )
-    weights, ids = triton_topk.minimax_biased_grouped_topk(
+    weights, ids = minimax_m3_topk(
         hidden_states,
         router_logits,
         correction_bias,
         topk=4,
         renormalize=True,
-        num_expert_group=1,
-        topk_group=1,
         routed_scaling_factor=2.0,
+        solution="triton",
     )
 
     scores = router_logits.sigmoid()

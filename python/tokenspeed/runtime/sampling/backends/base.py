@@ -37,6 +37,7 @@ if TYPE_CHECKING:
 
 DEFAULT_RANDOM_SEED = 48
 CUDA_GRAPH_VARIANT_DEFAULT = "default"
+CUDA_GRAPH_VARIANT_GREEDY = "greedy"
 SPECULATIVE_ACCEPT_THRESHOLD_SINGLE = 1.0
 SPECULATIVE_ACCEPT_THRESHOLD_ACC = 1.0
 
@@ -118,10 +119,12 @@ class SamplingBackend(ABC):
     # a no-op.
     _HAS_POOL_STATE: bool = False
     _SUPPORTS_DP_VERIFY: bool = False
+    _SUPPORTS_GREEDY_GRAPH_VARIANT: bool = False
 
     def __init__(self, config: SamplingBackendConfig) -> None:
 
         self.config = config
+        self._cuda_graph_is_all_greedy = False
 
         # Sentinel of "which rid currently owns each slot from this backend's
         # point of view". rid is just a comparison value here, not a lookup
@@ -180,6 +183,11 @@ class SamplingBackend(ABC):
         Stateless backends (greedy) short-circuit both phases.
         """
 
+        if self._SUPPORTS_GREEDY_GRAPH_VARIANT:
+            self._cuda_graph_is_all_greedy = bool(sampling_params_list) and all(
+                sampling_params.top_k <= 1 for sampling_params in sampling_params_list
+            )
+
         if not self._HAS_POOL_STATE:
             return
 
@@ -222,6 +230,8 @@ class SamplingBackend(ABC):
 
     def cuda_graph_capture_variants(self, num_tokens_per_req: int) -> tuple[str, ...]:
         """Return sampler-specific CUDA graph variants to capture."""
+        if self._SUPPORTS_GREEDY_GRAPH_VARIANT:
+            return (CUDA_GRAPH_VARIANT_DEFAULT, CUDA_GRAPH_VARIANT_GREEDY)
         return (CUDA_GRAPH_VARIANT_DEFAULT,)
 
     def prepare_capture_variant(
@@ -230,11 +240,16 @@ class SamplingBackend(ABC):
         num_tokens_per_req: int,
         variant: str,
     ) -> None:
-        if variant != CUDA_GRAPH_VARIANT_DEFAULT:
+        supported_variants = {CUDA_GRAPH_VARIANT_DEFAULT}
+        if self._SUPPORTS_GREEDY_GRAPH_VARIANT:
+            supported_variants.add(CUDA_GRAPH_VARIANT_GREEDY)
+        if variant not in supported_variants:
             raise ValueError(f"Unsupported CUDA graph variant: {variant}")
         self.prepare_capture(bs=bs, num_tokens_per_req=num_tokens_per_req)
 
     def cuda_graph_replay_variant(self, num_tokens_per_req: int) -> str:
+        if self._SUPPORTS_GREEDY_GRAPH_VARIANT and self._cuda_graph_is_all_greedy:
+            return CUDA_GRAPH_VARIANT_GREEDY
         return CUDA_GRAPH_VARIANT_DEFAULT
 
     def _prepare_step_hook(

@@ -46,7 +46,12 @@ from tokenspeed_kernel.ops.attention import (
     rel_mha_prefill,
 )
 from tokenspeed_kernel.ops.gemm import bmm, mm
-from tokenspeed_kernel.ops.moe import moe_apply, moe_plan, moe_process_weights
+from tokenspeed_kernel.ops.moe import (
+    minimax_m3_topk,
+    moe_apply,
+    moe_plan,
+    moe_process_weights,
+)
 from tokenspeed_kernel.ops.quantization import (
     quantize_fp8,
     quantize_fp8_with_scale,
@@ -87,6 +92,7 @@ __all__ = [
     "GdnCheckpointLayout",
     "GdnChunkPrefillResult",
     # moe
+    "minimax_m3_topk",
     "moe_apply",
     "moe_plan",
     "moe_process_weights",

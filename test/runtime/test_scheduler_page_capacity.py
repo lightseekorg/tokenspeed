@@ -18,7 +18,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-import tokenspeed_kernel.ops.moe.triton.fp8  # noqa: F401
-import tokenspeed_kernel.ops.moe.triton.inkling_topk  # noqa: F401
-import tokenspeed_kernel.ops.moe.triton.minimax_m3  # noqa: F401
-import tokenspeed_kernel.ops.moe.triton.mxfp4  # noqa: F401
+from tokenspeed.runtime.engine.scheduler_utils import scheduler_num_device_pages
+
+
+def test_scheduler_page_count_includes_reserved_null_page():
+    usable_pages = 1_048_576 // 128
+
+    assert usable_pages == 8192
+    assert scheduler_num_device_pages(usable_pages) == 8193

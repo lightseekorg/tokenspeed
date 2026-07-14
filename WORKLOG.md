@@ -31,15 +31,15 @@ from `origin/main`; resume from the feature branch above.
 | Area | Status | Evidence / remaining work |
 | --- | --- | --- |
 | Language-model config and weight loading | Implemented | Dedicated `minimax_m3.py`, TP=4 layout, MXFP8 checkpoint mapping, and meta-device loader tests are present. |
-| Text generation | Smoke passed | The four-GPU language-only server started and produced normal text. A fresh-machine rerun at `5f1d78c6` returned identical output IDs for two temperature-zero requests. This is not an accuracy benchmark. |
-| Native MiniMax Sparse Attention | Implemented | Native Triton indexer and sparse attention, 128-token pages, block Top-16, BF16 index-key side cache, prefill and decode tests. Incompatible dtypes/page sizes fail closed. |
-| Torch fallback | Not used by the M3 path | MSA, SwiGLU-OAI, Top-4 routing, MXFP8 GEMM, and MXFP8 MoE go through `tokenspeed-kernel`. The routing test explicitly fails if its Torch reference is called. |
-| MXFP8 | Initial support implemented | 1x32 UE8M0 scales are loaded as `uint8`; projection, activation quantization, and MoE kernels have targeted tests. Whole-model benchmark accuracy is pending. |
-| Paged cache and chunked prefill | Single-request 1M passed | The 1M request completed 127 full 8192-token chunks plus the final 7616-token chunk and returned an output token. Multi-request, eviction, and reuse integration coverage is still needed. |
-| Prefix cache | Not accepted yet | Existing runtime infrastructure is reused, but M3 eviction/reuse and non-zero-prefix cases need integration tests. |
-| 1M context | **Runtime pass; reference accuracy pending** | On 2026-07-14, a 1,048,000-token request returned HTTP 200 and one output token in 410.36 s with no worker restart and bounded memory. Reference logits/benchmark comparison is still pending. |
-| CUDA Graph / B200 tuning | Not accepted yet | Graph-safe capture/replay and performance work remain. The current MSA kernels allocate score/partial buffers dynamically. |
-| Benchmark accuracy | Not run | Compare logits and benchmark results against the reference implementation/checkpoint. |
+| Text generation | Validated | Four-GPU eager and CUDA Graph servers produced stable greedy text and logprobs. The final graph smoke reproduced all four `n=4` replicas exactly across two rounds. |
+| Native MiniMax Sparse Attention | Implemented and aligned | Native Triton indexer and sparse attention, 128-token pages, shared block Top-16 after max-reducing all four index heads, BF16 index-key side cache, prefill and decode tests. TP-sharded index-query projection gathers the small activation before scoring; incompatible contracts fail closed. |
+| Torch fallback | Not used by the M3 path | MSA, SwiGLU-OAI, Top-4 routing, MXFP8 GEMM, and MXFP8 MoE go through `tokenspeed-kernel`. The routing test explicitly selects the registered Triton solution and validates its output. |
+| MXFP8 | Implemented and validated | 1x32 UE8M0 scales stay `uint8`; projection, activation quantization, routing, and MoE use native Triton kernels. Targeted tests and whole-model HF comparisons passed the acceptance checks below. |
+| Paged cache and chunked prefill | Exact boundary passed | With corrected shared-index-head selection, a 1,048,575-token prompt completed 127 full 8192-token chunks plus the final 8191-token chunk and returned one output token. The scheduler null-page and radix-tail exact-capacity regressions are covered. |
+| Prefix cache | Single-request path validated | Warm/hit runs reported 8192 cached tokens; eager, decode-graph, and chunked-prefill paths returned identical token IDs. Broader concurrent eviction pressure remains follow-up coverage. |
+| 1M context | **Exact maximum pass** | The corrected four-index-head 1,048,575 + 1 request returned HTTP 200 in 223.00 s with stable memory, no OOM/restart/transport failure, and post-request readiness/health 200. |
+| CUDA Graph / B200 tuning | Validated | Default and strict-greedy variants captured batch sizes 1/2/4. A post-fix TP4 run additionally captured 1/2/3/4 with the index-query all-gather. Graph/eager A/B improved output throughput by 1.66x at concurrency 1 and 1.71x at concurrency 4. |
+| Benchmark accuracy | Aligned | HF teacher-forced comparison matched 39/40 greedy tokens; TokenSpeed's token was in HF top-5 for 40/40, with mean absolute shared-token logprob delta 0.0504. Four of five autoregressive prompts matched all eight generated tokens. |
 | ViT | Not implemented | The conditional-generation architecture is recognized, but active multimodal input intentionally raises instead of silently dropping vision data. |
 
 ## Design checkpoint
@@ -48,7 +48,8 @@ from `origin/main`; resume from the feature branch above.
   quantization, scheduler, and cache infrastructure.
 - Layers 0-2 use dense GQA. Layers 3-59 use native MSA.
 - MSA uses 128-token logical/physical pages, a BF16 key-only index cache with
-  dimension 128, and Top-16 selected blocks.
+  dimension 128, and one shared Top-16 block set selected after max-reducing
+  scores across all four index-query heads, matching `sparse_score_type=max`.
 - The indexer and sparse-attention implementations live under
   `tokenspeed-kernel/thirdparty/triton/minimax_m3/`, are imported into
   `tokenspeed-kernel/ops/attention/`, and are selected through the registered
@@ -58,6 +59,121 @@ from `origin/main`; resume from the feature branch above.
   dense or Torch attention.
 - The entry point is deliberately language-only until the ViT/projector path
   is implemented.
+
+## Phase 3 final validation
+
+All persistent artifacts from the final-machine run are under:
+
+```text
+/raid/flamingo/runs/minimax_m3_phase3_graph_797ce7e3c4f_20260714T172549Z/
+```
+
+The temporary Python probe scripts were deleted after validation; JSON, CSV,
+and server-log evidence remains.
+
+### Exact 1M boundary
+
+- Request: 1,048,575 input token IDs plus one generated token, exactly the
+  1,048,576-token model context.
+- Result: HTTP 200, `output_ids=[123]`, text `{`, elapsed 223.00 s with the
+  corrected shared four-index-head selection.
+- Chunk sequence: 127 x 8192 tokens, then one final 8191-token chunk.
+- Maximum observed memory on physical GPUs 4-7: 156208, 156240, 156080,
+  and 156240 MiB.
+- Post-request `/readiness`: HTTP 200 with one healthy worker; `/health`:
+  HTTP 200.
+- OOM, worker restart, or transport failure: none.
+- Evidence: `final_shared_index_max_exact_1048575_response.json` and
+  `final_shared_index_max_exact_1048575_server.log`. The earlier
+  `final_1048575_*` artifacts remain useful for scheduler-boundary diagnosis,
+  but predate the four-index-head semantic correction and are not the final
+  accuracy acceptance result.
+
+Two exact-capacity scheduler bugs were exposed before the pass:
+
+1. `SchedulerConfig.num_device_pages` counts page 0, which both the radix
+   `PageAllocator` and flat `BlockPool` reserve as the null page. Runtime KV
+   pool size counts usable pages. EventLoop now passes usable pages + 1 while
+   model allocation and metrics continue using the usable-page count.
+2. The radix first chunk reserves the decode token and can leave a partial
+   tail page. The later chunk gate used to charge `ceil(chunk / page_size)`
+   instead of consuming that tail first. It now mirrors `LocalKVAllocator`
+   page math; a 7-token/page-size-4 exact-capacity regression locks this down.
+
+The two stopped attempts are retained as
+`failed_exact_boundary_null_page_*` and
+`failed_exact_boundary_radix_tail_*`. In each case the process group was
+stopped only after all four GPUs had remained at 0% utilization for more than
+three minutes.
+
+### Shared index-head correctness correction
+
+The final audit found that the first MSA implementation selected Top-16
+independently for each local index head. The checkpoint specifies
+`sparse_score_type=max`, and Transformers first max-reduces block scores over
+all four index heads before selecting one shared block set. Under TP4, the old
+code left one index head on each rank and could therefore select four different
+sets once more than 16 blocks were visible.
+
+The index-query projection remains column-sharded, but now all-gathers its
+small BF16 activation. The Triton prefill and decode score kernels max-reduce
+the four heads before Top-K and return a single shared block set; sparse GQA
+broadcasts that set across local KV heads. This avoids all-reducing the much
+larger `[tokens, blocks]` score matrix.
+
+Validation after the correction:
+
+- The permanent Triton numerical test uses four deliberately divergent index
+  heads at 2305 tokens and matches a PyTorch reference for prefill and decode.
+- A real TP4 server captured default and strict-greedy CUDA Graphs for batch
+  sizes 1, 2, 3, and 4, then completed uncached 2305-token requests and an
+  `n=4` eight-token replica probe without runtime errors.
+- For the deterministic 2305-token uncached prompt, TokenSpeed selected token
+  10. The official Transformers TP4 model also ranked token 10 first with
+  logprob -5.71344. Evidence is in
+  `final_shared_index_max_tp4_graph_server.log` and
+  `hf_shared_index_max_reference.log`; the temporary reference script was
+  deleted.
+- The corrected exact 1M rerun completed 127 x 8192 plus 8191 tokens, returned
+  HTTP 200, and left all four GPUs at 0 MiB after shutdown.
+
+### CUDA Graph and prefix cache
+
+- Decode CUDA Graph captured default and strict-greedy variants for batch
+  sizes 1, 2, and 4.
+- After the shared-index-head correction, a fresh TP4 launch captured both
+  variants for batch sizes 1, 2, 3, and 4, proving the added collective is
+  graph-capturable.
+- The final post-scheduler smoke ran two `n=4`, temperature-zero rounds. Token
+  IDs and sampled logprobs were exact across all four replicas and across both
+  rounds (`post_scheduler_graph_smoke_n4_replica_probe.json`).
+- Graph/eager output-throughput A/B at input 256/output 32:
+  - concurrency 1: 11.03 vs 6.63 token/s (1.66x)
+  - concurrency 4: 44.49 vs 26.04 token/s (1.71x)
+- The longer graph benchmark completed 32/32 requests with no failures:
+  - concurrency 1: 11.44 output token/s, P50/P99 TPOT 85.41/86.57 ms
+  - concurrency 4: 46.40 output token/s, P50/P99 TPOT 83.96/84.03 ms
+- Prefix warm/hit validation reported 8192 cached tokens. Eager and graph
+  outputs matched exactly; chunked-prefill parity also preserved output IDs.
+
+### Accuracy alignment
+
+The local Transformers TP4 reference and TokenSpeed used the same MXFP8
+snapshot. `final_hf_tokenspeed_graph_comparison.json` records:
+
+- teacher-forced greedy-token matches: 39/40
+- TokenSpeed token present in HF top-5/top-20: 40/40 and 40/40
+- mean/max absolute logprob delta for the shared token: 0.05044/0.36791
+- autoregressive common-prefix lengths across five eight-token prompts:
+  1, 8, 8, 8, and 8
+
+The sole teacher-forced mismatch selected HF rank 2, not a token outside the
+reference distribution. Eager and graph comparisons produced the same
+summary.
+
+The post-audit 2305-token sparse-regime comparison additionally matched HF's
+rank-1 token exactly, so the accuracy evidence now crosses the 2048-token
+point where Top-16 block eviction begins.
 
 ## Last machine environment
 
@@ -71,12 +187,12 @@ from `origin/main`; resume from the feature branch above.
 - Triton: 3.6.0
 - Transformers: 5.12.0
 - TokenSpeed: 0.1.0
-- tokenspeed-smg: 1.5.0.post20260622
-- tokenspeed-smg-grpc-servicer: 0.5.6.post20260622
+- tokenspeed-smg: 1.7.0.post20260710
+- tokenspeed-smg-grpc-servicer: 0.6.0.post20260710
 
-At handoff, all M3/TokenSpeed/SMG processes had exited. GPUs 4-7 had returned
-to 4 MiB used each; GPUs 0-3 belonged to other workloads. Do not assume the
-same GPU indices are free on the next host.
+At final validation, all M3/TokenSpeed/SMG processes had exited and GPUs 4-7
+had returned to 0 MiB used with no compute processes. Do not assume the same
+GPU indices are free on the next host.
 
 ## Cold start on a new machine
 
@@ -192,7 +308,8 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 tokenspeed serve \
   --port 8123
 ```
 
-Send exactly 1,048,000 input token IDs and request one output token:
+Send exactly 1,048,575 input token IDs and request one output token. This is
+the strict context boundary, not merely an approximately-1M request:
 
 ```bash
 python - <<'PY'
@@ -200,7 +317,7 @@ import time
 
 import requests
 
-token_count = 1_048_000
+token_count = 1_048_575
 payload = {
     "model": "minimax-m3",
     "input_ids": [1] * token_count,
@@ -233,22 +350,22 @@ The exact model snapshot was cached at revision
 TokenSpeed SMG `1.7.0.post20260710`, gRPC servicer
 `0.6.0.post20260710`, gRPC health/reflection `1.81.1`, and Protobuf `6.33.6`.
 
-The language smoke passed twice with identical text and output IDs. The 1M
-request then completed successfully:
+The initial language smoke and 1,048,000-token request passed at `5f1d78c6`.
+Phase 3 subsequently validated the exact maximum boundary with the corrected
+shared-index-head code:
 
-- prompt tokens: 1,048,000
+- prompt tokens: 1,048,575
 - completion tokens: 1 (`output_ids=[123]`, text `{`)
 - HTTP status: 200
-- elapsed time: 410.36 s
+- elapsed time: 223.00 s
 - post-request readiness: HTTP 200, one healthy worker
-- maximum observed memory on GPUs 4-7: 156202, 156234, 156074, and 156234 MiB
+- maximum observed memory on GPUs 4-7: 156208, 156240, 156080, and 156240 MiB
 - worker restarts or transport errors during the request: none
 
 Persistent artifacts are under
-`/raid/cache/tokenspeed-runs/minimax_m3_1m_5f1d78c6_20260714T1641Z/`:
-`server.log`, `client.log`, `gpu_trace.csv`, and the startup-attempt log. This
-establishes a runtime/transport pass for 1M context. It does not complete the
-reference logits or benchmark-accuracy requirement.
+`/raid/flamingo/runs/minimax_m3_phase3_graph_797ce7e3c4f_20260714T172549Z/`.
+The earlier 1,048,000-token artifacts remain under
+`/raid/cache/tokenspeed-runs/minimax_m3_1m_5f1d78c6_20260714T1641Z/`.
 
 ## Previous 1M failure
 
@@ -276,22 +393,24 @@ measurements above are copied here intentionally.
 
 ## Validation commands
 
-Handoff validation on 2026-07-14 UTC:
+Final-machine validation on 2026-07-14 UTC:
 
-- `python -m compileall` for the new M3 runtime/kernel files: **PASS**
-- `git diff --check`: **PASS**
+- Root targeted scheduler/sampling/logits/CLI/MoE tests: **75 passed**
+- Scheduler Python FSM suite: **35 passed**
+- M3 model/meta-loader tests after the final correction: **5 passed**
+- Kernel API selection: **27 passed, 29 skipped**
+- MSA numerical test, including four-head 2305-token prefill/decode: **1 passed**
+- MXFP8 GEMM numerical test: **1 passed**
+- Routing, activation, and quantization groups: **81 passed, 5 skipped**
+- Changed-file `py_compile` and `git diff --check`: **PASS**
+- Real TP4 graph capture, uncached 2305-token sparse-regime request, HF TP4
+  rank/top-20 comparison, and corrected exact 1M request: **PASS**
 - `pre-commit run --all-files`: **PASS**
-- Pytest with all GPUs hidden: **NOT RUN**; collection stopped at the expected
-  `tokenspeed-kernel` platform check described below
-- GPU pytest: **NOT RUN** while GPUs 4-7 remain reserved by the 1M service
-- End-to-end language smoke and single-request 1M runtime validation: **PASS**
 
 The M3 model tests import `tokenspeed-kernel`, whose platform detection requires
-a visible NVIDIA or AMD GPU even for meta-device cases. An attempted handoff
-run with `CUDA_VISIBLE_DEVICES=''` therefore stopped during collection with
-`tokenspeed-kernel requires an NVIDIA CUDA or AMD ROCm GPU`; it did not execute
-any tests. Do not treat that collection error as an M3 regression, and do not
-occupy an unreserved GPU merely to bypass it.
+a visible NVIDIA or AMD GPU even for meta-device cases. Run those tests with an
+explicitly reserved GPU rather than treating an all-GPUs-hidden collection
+error as a model regression.
 
 Syntax-only validation can run without a GPU:
 
@@ -325,17 +444,15 @@ pre-commit run --all-files
 
 ## Next acceptance steps
 
-1. Compare the successful 1M output and model logits against the reference,
-   then run the benchmark-accuracy suite.
-2. Run the targeted GPU pytest coverage from the validation section when a
-   separate test GPU is reserved.
-3. Add MSA coverage for non-contiguous page tables, non-zero prefixes,
-   multi-request scheduling, repeated chunked prefill, cache move/clear, and
-   prefix-cache eviction/reuse.
-4. Make MSA allocations graph-safe, validate CUDA Graph capture/replay, and
-   collect B200 throughput/latency numbers.
-5. Implement the ViT/projector path and multimodal preprocessing; remove the
+1. Implement the ViT/projector path and multimodal preprocessing; remove the
    deliberate language-only rejection only after end-to-end image tests pass.
+2. Expand concurrent prefix-cache eviction/reuse and mixed-request MSA tests,
+   especially skewed non-zero prefixes and non-contiguous page tables.
+3. Add a permanent end-to-end MXFP8 MoE apply numerical test; current coverage
+   validates GEMM, routing metadata, and reduction separately.
+4. If further 1M prefill optimization is needed, benchmark a distributed
+   candidate-Top-K merge against the current small index-query all-gather. The
+   current correct path completed the exact boundary in 223.00 s.
 
 ## Safe shutdown
 

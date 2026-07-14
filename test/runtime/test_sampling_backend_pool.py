@@ -46,6 +46,7 @@ from tokenspeed.runtime.layers.logits_processor import (  # noqa: E402
 )
 from tokenspeed.runtime.sampling.backends.base import (  # noqa: E402
     CUDA_GRAPH_VARIANT_DEFAULT,
+    CUDA_GRAPH_VARIANT_GREEDY,
     SamplingBackendConfig,
 )
 from tokenspeed.runtime.sampling.backends.flashinfer import (  # noqa: E402
@@ -145,6 +146,51 @@ class TestFlashInferFlipDetection(unittest.TestCase):
         self.assertIsNone(self.backend._predict_local_buf)
         self.assertIsNone(self.backend._accept_index_local_buf)
         self.assertIsNone(self.backend._accept_length_local_buf)
+
+    def test_cuda_graph_uses_strict_greedy_variant(self):
+        self.assertEqual(
+            self.backend.cuda_graph_capture_variants(num_tokens_per_req=1),
+            (CUDA_GRAPH_VARIANT_DEFAULT, CUDA_GRAPH_VARIANT_GREEDY),
+        )
+        self.backend.prepare_step(
+            request_ids=["greedy"],
+            request_pool_indices=[1],
+            sampling_params_list=[_sp("greedy", temperature=0.0)],
+        )
+        self.assertEqual(
+            self.backend.cuda_graph_replay_variant(num_tokens_per_req=1),
+            CUDA_GRAPH_VARIANT_GREEDY,
+        )
+        self.backend.prepare_step(
+            request_ids=["sample"],
+            request_pool_indices=[2],
+            sampling_params_list=[_sp("sample", top_k=50)],
+        )
+        self.assertEqual(
+            self.backend.cuda_graph_replay_variant(num_tokens_per_req=1),
+            CUDA_GRAPH_VARIANT_DEFAULT,
+        )
+        self.backend.prepare_step(
+            request_ids=[],
+            request_pool_indices=[],
+            sampling_params_list=[],
+        )
+        self.assertEqual(
+            self.backend.cuda_graph_replay_variant(num_tokens_per_req=1),
+            CUDA_GRAPH_VARIANT_DEFAULT,
+        )
+        self.backend.prepare_step(
+            request_ids=["greedy", "sample"],
+            request_pool_indices=[1, 2],
+            sampling_params_list=[
+                _sp("greedy", temperature=0.0),
+                _sp("sample", top_k=50),
+            ],
+        )
+        self.assertEqual(
+            self.backend.cuda_graph_replay_variant(num_tokens_per_req=1),
+            CUDA_GRAPH_VARIANT_DEFAULT,
+        )
 
     def test_first_admission_flips_and_scatters(self):
         sp_a = _sp("a", temperature=0.7, top_k=50, top_p=0.9, seed=42)
@@ -285,6 +331,7 @@ class TestTritonRouteSelection(unittest.TestCase):
             self.backend.cuda_graph_capture_variants(num_tokens_per_req=1),
             (
                 CUDA_GRAPH_VARIANT_DEFAULT,
+                CUDA_GRAPH_VARIANT_GREEDY,
                 CUDA_GRAPH_VARIANT_TRITON_NO_FILTER,
                 CUDA_GRAPH_VARIANT_TRITON_TOP_P,
                 CUDA_GRAPH_VARIANT_TRITON_TOP_K,
@@ -295,12 +342,24 @@ class TestTritonRouteSelection(unittest.TestCase):
             self.backend.cuda_graph_capture_variants(num_tokens_per_req=4),
             (
                 CUDA_GRAPH_VARIANT_DEFAULT,
+                CUDA_GRAPH_VARIANT_GREEDY,
                 CUDA_GRAPH_VARIANT_TRITON_NO_FILTER,
                 CUDA_GRAPH_VARIANT_TRITON_TOP_P,
                 CUDA_GRAPH_VARIANT_TRITON_TOP_K,
                 CUDA_GRAPH_VARIANT_TRITON_TOP_K_TOP_P,
                 CUDA_GRAPH_VARIANT_TRITON_VERIFY_NO_FILTER,
             ),
+        )
+
+        self.backend.prepare_step(
+            request_ids=["greedy"],
+            request_pool_indices=[1],
+            sampling_params_list=[_sp("greedy", temperature=0.0)],
+            num_tokens_per_req=1,
+        )
+        self.assertEqual(
+            self.backend.cuda_graph_replay_variant(num_tokens_per_req=1),
+            CUDA_GRAPH_VARIANT_GREEDY,
         )
 
         self.backend.prepare_step(
@@ -823,6 +882,12 @@ class TestFlashInferFullFlipExtended(unittest.TestCase):
     def setUp(self):
         self.backend = FlashInferFullSamplingBackend(_make_config())
 
+    def test_full_backend_does_not_claim_strict_greedy_graph(self):
+        self.assertNotIn(
+            CUDA_GRAPH_VARIANT_GREEDY,
+            self.backend.cuda_graph_capture_variants(num_tokens_per_req=1),
+        )
+
     def test_penalty_scalars_scattered(self):
         sp = _sp(
             "a",
@@ -935,6 +1000,7 @@ class TestTritonFullIndependentState(unittest.TestCase):
 
     def test_min_p_cuda_graph_routes_have_dedicated_variants(self):
         variants = self.backend.cuda_graph_capture_variants(num_tokens_per_req=4)
+        self.assertNotIn(CUDA_GRAPH_VARIANT_GREEDY, variants)
         self.assertIn(CUDA_GRAPH_VARIANT_TRITON_FULL_MIN_P, variants)
         self.assertIn(CUDA_GRAPH_VARIANT_TRITON_FULL_TOP_K_TOP_P_MIN_P, variants)
 

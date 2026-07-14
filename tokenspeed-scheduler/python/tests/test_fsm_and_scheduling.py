@@ -190,6 +190,25 @@ class TestFSMTransitions:
 
 
 class TestChunkedPrefill:
+    def test_final_chunk_reuses_reserved_decode_tail_at_exact_capacity(self):
+        """A final partial chunk can consume the decode reservation's tail page."""
+        s = Scheduler(
+            make_config(
+                max_scheduled_tokens=4,
+                max_batch_size=1,
+                page_size=4,
+                num_device_pages=3,
+            )
+        )
+        submit(s, "r0", list(range(7)))
+
+        first = s.next_execution_plan()
+        assert first.forward[0].input_lengths == [4]
+        assert s.available_kv_pages() == 0
+
+        final = s.next_execution_plan()
+        assert final.forward[0].input_lengths == [3]
+
     def test_large_request_split_across_plans(self):
         """budget=10, request=30 tokens: takes 3 Prefilling steps to finish prefill."""
         s = Scheduler(make_config(max_scheduled_tokens=10))

@@ -4,9 +4,10 @@
 """MiniMax-M3 index-key cache, block scoring, and block Top-K kernels.
 
 The implementation follows MiniMax Sparse Attention's inference algorithm:
-one index-query head per GQA group scores a shared index-key head, token scores
-are max-reduced inside 128-token blocks, and the current block is forced into
-the selected set.  The code is adapted to TokenSpeed's paged-cache layout.
+four index-query heads score a shared index-key head, scores are max-reduced
+across both the tokens in each 128-token block and all index heads, and the
+current block is forced into the selected set.  The code is adapted to
+TokenSpeed's paged-cache layout.
 """
 
 from __future__ import annotations
@@ -54,10 +55,11 @@ def _prefill_block_score_kernel(
     cu_seqlens_q,
     seq_lens,
     prefix_lens,
-    num_index_heads,
+    num_index_heads: tl.constexpr,
     scale,
     init_blocks: tl.constexpr,
     local_blocks: tl.constexpr,
+    num_chunks: tl.constexpr,
     stride_q_n,
     stride_q_h,
     stride_q_d,
@@ -65,7 +67,6 @@ def _prefill_block_score_kernel(
     stride_k_pos,
     stride_k_d,
     stride_s_n,
-    stride_s_h,
     stride_s_b,
     stride_bt_b,
     head_dim: tl.constexpr,
@@ -73,9 +74,7 @@ def _prefill_block_score_kernel(
     BLOCK_K: tl.constexpr,
 ):
     query_tile = tl.program_id(0)
-    batch_head = tl.program_id(1)
-    request = batch_head // num_index_heads
-    head = batch_head % num_index_heads
+    request = tl.program_id(1)
 
     query_start = tl.load(cu_seqlens_q + request)
     query_len = tl.load(cu_seqlens_q + request + 1) - query_start
@@ -85,17 +84,22 @@ def _prefill_block_score_kernel(
     seq_len = tl.load(seq_lens + request)
     prefix_len = tl.load(prefix_lens + request)
     query_offsets = query_tile * BLOCK_Q + tl.arange(0, BLOCK_Q)
-    query_positions = prefix_len + query_offsets
     query_mask = query_offsets < query_len
+    packed_width: tl.constexpr = num_index_heads * BLOCK_Q
+    packed_offsets = tl.arange(0, packed_width)
+    head_offsets = packed_offsets // BLOCK_Q
+    packed_query_offsets = query_tile * BLOCK_Q + packed_offsets % BLOCK_Q
+    packed_query_positions = prefix_len + packed_query_offsets
+    packed_query_mask = packed_query_offsets < query_len
     dims = tl.arange(0, head_dim)
     key_offsets = tl.arange(0, BLOCK_K)
 
     query = tl.load(
         index_q
-        + (query_start + query_offsets[:, None]) * stride_q_n
-        + head * stride_q_h
+        + (query_start + packed_query_offsets[:, None]) * stride_q_n
+        + head_offsets[:, None] * stride_q_h
         + dims[None, :] * stride_q_d,
-        mask=query_mask[:, None],
+        mask=packed_query_mask[:, None],
         other=0.0,
     )
     block_table_row = block_table + request * stride_bt_b
@@ -103,11 +107,17 @@ def _prefill_block_score_kernel(
         seq_len,
         prefix_len + (query_tile + 1) * BLOCK_Q,
     )
+    visible_blocks = (visible_end + BLOCK_K - 1) // BLOCK_K
+    chunk = tl.program_id(2)
+    blocks_per_chunk = (visible_blocks + num_chunks - 1) // num_chunks
+    chunk_start = chunk * blocks_per_chunk
+    chunk_end = tl.minimum(chunk_start + blocks_per_chunk, visible_blocks)
+    if chunk_start >= chunk_end:
+        return
 
-    for key_start in tl.range(0, visible_end, BLOCK_K):
-        block = key_start // BLOCK_K
+    for block in tl.range(chunk_start, chunk_end):
         page = tl.load(block_table_row + block).to(tl.int64)
-        key_positions = key_start + key_offsets
+        key_positions = block * BLOCK_K + key_offsets
         key = tl.load(
             index_k_cache
             + page * stride_k_page
@@ -116,12 +126,12 @@ def _prefill_block_score_kernel(
         )
         logits = tl.dot(query, key, out_dtype=tl.float32) * scale
         logits = tl.where(
-            query_positions[:, None] >= key_positions[None, :],
+            packed_query_positions[:, None] >= key_positions[None, :],
             logits,
             -float("inf"),
         )
         block_scores = tl.max(logits, axis=1)
-        query_blocks = query_positions // BLOCK_K
+        query_blocks = packed_query_positions // BLOCK_K
         forced_init = block < init_blocks
         forced_local = (block <= query_blocks) & (block > query_blocks - local_blocks)
         block_scores = tl.where(
@@ -129,11 +139,12 @@ def _prefill_block_score_kernel(
             float("inf"),
             block_scores,
         )
+        block_scores = tl.max(
+            tl.reshape(block_scores, (num_index_heads, BLOCK_Q)),
+            axis=0,
+        )
         tl.store(
-            scores
-            + (query_start + query_offsets) * stride_s_n
-            + head * stride_s_h
-            + block * stride_s_b,
+            scores + (query_start + query_offsets) * stride_s_n + block * stride_s_b,
             block_scores,
             mask=query_mask,
         )
@@ -160,7 +171,6 @@ def _decode_block_score_kernel(
     stride_k_pos,
     stride_k_d,
     stride_s_n,
-    stride_s_h,
     stride_s_b,
     stride_bt_b,
     head_dim: tl.constexpr,
@@ -175,6 +185,9 @@ def _decode_block_score_kernel(
     query_offsets = packed_offsets % BLOCK_Q
     query_mask = query_offsets < decode_query_len
     query_ids = request * decode_query_len + query_offsets
+    output_query_offsets = tl.arange(0, BLOCK_Q)
+    output_query_mask = output_query_offsets < decode_query_len
+    output_query_ids = request * decode_query_len + output_query_offsets
 
     seq_len = tl.load(seq_lens + request)
     query_positions = seq_len - decode_query_len + query_offsets
@@ -224,13 +237,14 @@ def _decode_block_score_kernel(
             float("inf"),
             block_scores,
         )
+        block_scores = tl.max(
+            tl.reshape(block_scores, (num_index_heads, BLOCK_Q)),
+            axis=0,
+        )
         tl.store(
-            scores
-            + query_ids * stride_s_n
-            + head_offsets * stride_s_h
-            + block * stride_s_b,
+            scores + output_query_ids * stride_s_n + block * stride_s_b,
             block_scores,
-            mask=query_mask,
+            mask=output_query_mask,
         )
 
 
@@ -264,6 +278,10 @@ def _validate_inputs(
     if topk <= 0 or topk & (topk - 1):
         raise ValueError(f"topk must be a power of two, got {topk}")
     tokens, num_heads, head_dim = index_q.shape
+    if num_heads <= 0 or num_heads & (num_heads - 1):
+        raise ValueError(
+            f"MiniMax-M3 index head count must be a power of two, got {num_heads}"
+        )
     if head_dim != 128:
         raise ValueError(f"MiniMax-M3 index head dim must be 128, got {head_dim}")
     return tokens, num_heads, head_dim
@@ -292,7 +310,7 @@ def minimax_m3_msa_indexer(
 
     Args:
         index_q: Normalized and rotary-embedded index queries shaped
-            ``[tokens, local_index_heads, 128]``.
+            ``[tokens, all_index_heads, 128]``.
         index_k: Normalized and rotary-embedded shared index keys shaped
             ``[tokens, 128]``.
         index_k_cache: Per-layer side cache shaped ``[slots, 128]``.
@@ -313,7 +331,8 @@ def minimax_m3_msa_indexer(
             upper bound to avoid allocating scores for the full 1M context.
 
     Returns:
-        Selected logical block ids shaped ``[tokens, local_index_heads, topk]``.
+        Shared logical block ids shaped ``[tokens, 1, topk]`` after max-reducing
+        scores across all index heads.
     """
     tokens, num_heads, head_dim = _validate_inputs(
         index_q,
@@ -326,7 +345,7 @@ def minimax_m3_msa_indexer(
     )
     if tokens == 0:
         return torch.empty(
-            (0, num_heads, int(topk)),
+            (0, 1, int(topk)),
             dtype=torch.int32,
             device=index_q.device,
         )
@@ -364,7 +383,7 @@ def minimax_m3_msa_indexer(
             f"max_blocks must be in [1, {block_table.shape[1]}], got {max_blocks}"
         )
     scores = torch.full(
-        (tokens, num_heads, max_blocks),
+        (tokens, max_blocks),
         -float("inf"),
         dtype=torch.float32,
         device=index_q.device,
@@ -400,8 +419,7 @@ def minimax_m3_msa_indexer(
             stride_k_pos=cache_pages.stride(1),
             stride_k_d=cache_pages.stride(2),
             stride_s_n=scores.stride(0),
-            stride_s_h=scores.stride(1),
-            stride_s_b=scores.stride(2),
+            stride_s_b=scores.stride(1),
             stride_bt_b=block_table.stride(0),
             head_dim=head_dim,
             BLOCK_Q=block_q,
@@ -423,8 +441,15 @@ def minimax_m3_msa_indexer(
         ).contiguous()
         batch = cu_seqlens_q.numel() - 1
         block_q = 64
+        base_programs = triton.cdiv(int(max_query_len), block_q) * batch
+        target_chunks = min(max_blocks, 256, max(1, 512 // base_programs))
+        num_chunks = 1 << (target_chunks.bit_length() - 1)
         _prefill_block_score_kernel[
-            (triton.cdiv(int(max_query_len), block_q), batch * num_heads)
+            (
+                triton.cdiv(int(max_query_len), block_q),
+                batch,
+                num_chunks,
+            )
         ](
             index_q,
             cache_pages,
@@ -437,6 +462,7 @@ def minimax_m3_msa_indexer(
             float(scale),
             init_blocks=int(init_blocks),
             local_blocks=int(local_blocks),
+            num_chunks=num_chunks,
             stride_q_n=index_q.stride(0),
             stride_q_h=index_q.stride(1),
             stride_q_d=index_q.stride(2),
@@ -444,8 +470,7 @@ def minimax_m3_msa_indexer(
             stride_k_pos=cache_pages.stride(1),
             stride_k_d=cache_pages.stride(2),
             stride_s_n=scores.stride(0),
-            stride_s_h=scores.stride(1),
-            stride_s_b=scores.stride(2),
+            stride_s_b=scores.stride(1),
             stride_bt_b=block_table.stride(0),
             head_dim=head_dim,
             BLOCK_Q=block_q,
@@ -454,8 +479,8 @@ def minimax_m3_msa_indexer(
             num_stages=2,
         )
 
-    selected = _topk_with_padding(scores.view(tokens * num_heads, max_blocks), topk)
-    return selected.view(tokens, num_heads, int(topk))
+    selected = _topk_with_padding(scores, topk)
+    return selected.unsqueeze(1)
 
 
 __all__ = ["SPARSE_BLOCK_SIZE", "minimax_m3_msa_indexer"]

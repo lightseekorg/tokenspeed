@@ -29,16 +29,20 @@ def _reference_selected_blocks(
     keys: torch.Tensor,
     query_position: int,
 ) -> torch.Tensor:
+    if query.dim() == 1:
+        query = query.unsqueeze(0)
     visible_keys = keys[: query_position + 1]
     scores = query.float() @ visible_keys.float().T
     scores *= _HEAD_DIM**-0.5
     num_blocks = math.ceil((query_position + 1) / _BLOCK_SIZE)
     scores = torch.nn.functional.pad(
         scores,
-        (0, num_blocks * _BLOCK_SIZE - scores.numel()),
+        (0, num_blocks * _BLOCK_SIZE - scores.shape[-1]),
         value=-torch.inf,
     )
-    block_scores = scores.view(num_blocks, _BLOCK_SIZE).amax(dim=-1)
+    block_scores = (
+        scores.view(query.shape[0], num_blocks, _BLOCK_SIZE).amax(dim=-1).amax(dim=0)
+    )
     block_scores[query_position // _BLOCK_SIZE] = torch.inf
     return block_scores.topk(min(_TOPK, num_blocks)).indices
 
@@ -91,7 +95,7 @@ def test_minimax_m3_msa_prefill_and_decode_after_2048() -> None:
         ).to(torch.int32)
         index_query = torch.randn(
             prefill_len,
-            1,
+            4,
             _HEAD_DIM,
             dtype=torch.bfloat16,
             device="cuda",
@@ -129,15 +133,30 @@ def test_minimax_m3_msa_prefill_and_decode_after_2048() -> None:
             max_blocks=num_blocks,
             solution="triton",
         )
+        assert selected.shape == (prefill_len, 1, _TOPK)
 
         for query_position in (0, 127, 128, 2047, 2048, prefill_len - 1):
             expected = _reference_selected_blocks(
-                index_query[query_position, 0],
+                index_query[query_position],
                 index_key,
                 query_position,
             )
             actual = selected[query_position, 0, : expected.numel()]
             assert set(actual.cpu().tolist()) == set(expected.cpu().tolist())
+
+        per_head_sets = {
+            tuple(
+                sorted(
+                    _reference_selected_blocks(
+                        index_query[-1, head], index_key, prefill_len - 1
+                    )
+                    .cpu()
+                    .tolist()
+                )
+            )
+            for head in range(index_query.shape[1])
+        }
+        assert len(per_head_sets) > 1
 
         key_cache = torch.randn(
             num_pages,
@@ -187,7 +206,7 @@ def test_minimax_m3_msa_prefill_and_decode_after_2048() -> None:
 
         decode_position = prefill_len
         decode_index_query = torch.randn(
-            1, 1, _HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+            1, 4, _HEAD_DIM, dtype=torch.bfloat16, device="cuda"
         )
         decode_index_key = torch.randn(
             1, _HEAD_DIM, dtype=torch.bfloat16, device="cuda"
@@ -217,7 +236,7 @@ def test_minimax_m3_msa_prefill_and_decode_after_2048() -> None:
         )
         all_index_keys = torch.cat([index_key, decode_index_key], dim=0)
         decode_expected = _reference_selected_blocks(
-            decode_index_query[0, 0],
+            decode_index_query[0],
             all_index_keys,
             decode_position,
         )

@@ -149,7 +149,7 @@ def minimax_m3_msa_indexer(
     """Select MiniMax-M3 MSA blocks and update the index-key side cache.
 
     Args:
-        index_q: Index queries shaped ``[tokens, local_groups, 128]``.
+        index_q: Gathered index queries shaped ``[tokens, all_groups, 128]``.
         index_k: Shared index keys shaped ``[tokens, 128]``.
         index_k_cache: Per-layer side cache shaped ``[slots, 128]``.
         slot_mapping: Cache slot for each input token.
@@ -168,7 +168,7 @@ def minimax_m3_msa_indexer(
         solution: Optional registered solution selector.
 
     Returns:
-        Logical block ids shaped ``[tokens, local_groups, topk]``.
+        Shared logical block ids shaped ``[tokens, 1, topk]``.
     """
     decode = int(decode_query_len) > 0
     traits = {

@@ -61,6 +61,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     pool_to_paged_cache_groups,
     pool_to_prefix_cache_adjunct_spec,
     pop_common_cache_event_payloads,
+    scheduler_num_device_pages,
     should_use_overlap_schedule,
 )
 from tokenspeed.runtime.execution.distributed_initializer import (
@@ -380,7 +381,9 @@ class EventLoop:
         if required_groups is not None and server_args.enable_prefix_caching:
             prefix_cache_adjunct = pool_to_prefix_cache_adjunct_spec(required_groups)
         scheduler_cfg = make_config(
-            num_device_pages=self.max_total_num_tokens // server_args.block_size,
+            # The KV pool reports usable rows; both scheduler allocators reserve
+            # page 0 as a null placeholder and therefore count one extra page.
+            num_device_pages=scheduler_num_device_pages(num_total_pages),
             max_scheduled_tokens=server_args.chunked_prefill_size,
             max_batch_size=per_rank_max_batch,
             page_size=server_args.block_size,

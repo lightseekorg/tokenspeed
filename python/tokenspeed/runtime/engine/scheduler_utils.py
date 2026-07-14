@@ -78,6 +78,11 @@ def make_spec(rid: str, tokens: list[int]) -> RequestSpec:
     return spec
 
 
+def scheduler_num_device_pages(num_usable_pages: int) -> int:
+    """Include the scheduler's reserved null page in its device-page count."""
+    return num_usable_pages + 1
+
+
 def make_config(
     num_device_pages: int,
     max_scheduled_tokens: int,

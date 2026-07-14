@@ -17,6 +17,7 @@ from tokenspeed.runtime.models.minimax_m3 import (
     MiniMaxM3MLP,
     MiniMaxM3SparseForConditionalGeneration,
     MiniMaxM3SparseMoeBlock,
+    _msa_score_block_upper_bound,
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
@@ -125,6 +126,9 @@ def test_minimax_m3_tp4_meta_layout_and_loader(monkeypatch: pytest.MonkeyPatch) 
     assert experts.w13_weight_scale_inv.dtype == torch.uint8
     assert experts.w2_weight.shape == (8, 128, 32)
     assert experts.w2_weight_scale_inv.shape == (8, 128, 1)
+    indexer = model.model.layers[3].self_attn.indexer
+    assert indexer.num_index_heads == 4
+    assert indexer.index_q_proj.gather_output
 
     loaded = model.load_weights(
         [
@@ -262,3 +266,10 @@ def test_minimax_m3_mha_cache_contract() -> None:
             _msa_server_args(kv_cache_dtype="fp8"),
             _msa_model_config(),
         )
+
+
+def test_msa_score_block_upper_bound_clamps_skewed_mixed_batch() -> None:
+    # Request A contributes max_prefix_len and request B max_extend_len. Their
+    # sum can exceed the table even though each request individually fits.
+    assert _msa_score_block_upper_bound(32700, 8192, 128, 256) == 256
+    assert _msa_score_block_upper_bound(1024, 512, 128, 256) == 12

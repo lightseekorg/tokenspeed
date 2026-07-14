@@ -138,6 +138,7 @@ class MoELayer(torch.nn.Module):
         if self._routing_method_type in (
             RoutingMethodType.DeepSeekV3,
             RoutingMethodType.MiniMax2,
+            RoutingMethodType.FP32SigmoidBias,
         ):
             self._routing_logits_dtype = torch.float32
         self._n_group = routing_config.get("n_group", 0)

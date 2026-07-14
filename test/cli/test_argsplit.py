@@ -105,6 +105,12 @@ def test_engine_only_flag_routes_to_engine():
     assert r.gateway == []
 
 
+def test_prefill_graph_capture_sizes_route_as_one_multi_value_flag():
+    r = _split(["--prefill-graph-capture-sizes", "128", "512"])
+    assert r.engine == ["--prefill-graph-capture-sizes", "128", "512"]
+    assert r.gateway == []
+
+
 def test_dp_sampling_routes_to_engine():
     r = _split(["--dp-sampling"])
     assert r.engine == ["--dp-sampling"]

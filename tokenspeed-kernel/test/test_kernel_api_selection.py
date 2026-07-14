@@ -350,6 +350,33 @@ def test_bmm_mxfp8_online_activation_signature_uses_quantized_storage() -> None:
     assert b_format.scale.block_shape == (128, 128)
 
 
+def test_gemm_mxfp8_online_activation_uses_mixed_scale_formats() -> None:
+    a = torch.empty((4, 128), dtype=torch.bfloat16)
+    b = torch.empty((128, 128), dtype=_fp8_dtype())
+    b_scales = torch.empty((128, 4), dtype=torch.uint8)
+
+    signature = _gemm_pkg._gemm_format_signature(
+        a,
+        b,
+        None,
+        b_scales,
+        torch.bfloat16,
+        "mxfp8",
+        [1, 32],
+    )
+
+    a_format = signature.format_for("a")
+    b_format = signature.format_for("b")
+    assert a_format is not None and a_format.scale is not None
+    assert b_format is not None and b_format.scale is not None
+    assert a_format.storage_dtype == _fp8_dtype()
+    assert b_format.storage_dtype == _fp8_dtype()
+    assert a_format.scale.storage_dtype == torch.float32
+    assert b_format.scale.storage_dtype == torch.uint8
+    assert a_format.scale.block_shape == (1, 32)
+    assert b_format.scale.block_shape == (1, 32)
+
+
 def test_gemm_mxfp8_online_activation_preserves_repeated_rows() -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for online mxfp8 GEMM verification")

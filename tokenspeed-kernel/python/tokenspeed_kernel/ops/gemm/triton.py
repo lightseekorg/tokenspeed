@@ -31,7 +31,12 @@ import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, Platform
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import ScaleFormat, format_signatures
+from tokenspeed_kernel.signature import (
+    ScaleFormat,
+    format_signature,
+    format_signatures,
+    tensor_format,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +51,11 @@ _MXFP8_UE8M0_SCALE = ScaleFormat(
     granularity="block",
     block_shape=(1, 32),
 )
+_MXFP8_FLOAT_1X32_SCALE = ScaleFormat(
+    storage_dtype=torch.float32,
+    granularity="block",
+    block_shape=(1, 32),
+)
 _FP8_TENSOR_SCALE = ScaleFormat(
     storage_dtype=torch.float32,
     granularity="tensor",
@@ -54,9 +64,18 @@ _FP8_CHANNEL_SCALE = ScaleFormat(
     storage_dtype=torch.float32,
     granularity="channel",
 )
-_MXFP8_FORMAT_SIGNATURES = format_signatures(
-    ("a", "b"), "mxfp8", {_fp8_dtype}, scale=_MXFP8_BLOCK_SCALE
-) | format_signatures(("a", "b"), "mxfp8", {_fp8_dtype}, scale=_MXFP8_UE8M0_SCALE)
+_MXFP8_FORMAT_SIGNATURES = (
+    format_signatures(("a", "b"), "mxfp8", {_fp8_dtype}, scale=_MXFP8_BLOCK_SCALE)
+    | format_signatures(("a", "b"), "mxfp8", {_fp8_dtype}, scale=_MXFP8_UE8M0_SCALE)
+    | frozenset(
+        {
+            format_signature(
+                a=tensor_format("mxfp8", _fp8_dtype, scale=_MXFP8_FLOAT_1X32_SCALE),
+                b=tensor_format("mxfp8", _fp8_dtype, scale=_MXFP8_UE8M0_SCALE),
+            )
+        }
+    )
+)
 _FP8_SCALED_FORMAT_SIGNATURES = format_signatures(
     ("a", "b"), "scaled-fp8", {_fp8_dtype}, scale=_FP8_TENSOR_SCALE
 ) | format_signatures(("a", "b"), "scaled-fp8", {_fp8_dtype}, scale=_FP8_CHANNEL_SCALE)
@@ -461,7 +480,7 @@ def w8a8_block_fp8_matmul_triton(
         config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
     else:
         # Default config
-        # Block-wise quant: BLOCK_SIZE_K must be divisible by block_size[1]
+        # Each K tile consumes one scale, so its width must equal the scale group.
         if Platform.get().is_amd:
             config = {
                 "BLOCK_SIZE_M": 32,
@@ -480,6 +499,13 @@ def w8a8_block_fp8_matmul_triton(
                 "num_warps": 4,
                 "num_stages": 3,
             }
+
+    if config["BLOCK_SIZE_K"] != block_k:
+        raise ValueError(
+            "block-scaled FP8 GEMM requires BLOCK_SIZE_K to match the scale "
+            f"group exactly, got BLOCK_SIZE_K={config['BLOCK_SIZE_K']} and "
+            f"group_k={block_k}"
+        )
 
     kernel = _w8a8_block_fp8_matmul
     if Platform.get().is_amd and config["BLOCK_SIZE_N"] == block_size[0]:
@@ -781,6 +807,8 @@ def triton_mm_fp8_blockscale(
     assert (
         A_scales is not None
     ), "A_scales is required; online quantization should be done by the caller"
+    if B_scales is None:
+        raise ValueError("B_scales is required for triton MXFP8 GEMM")
     return w8a8_block_fp8_matmul_triton(
         A,
         B,
