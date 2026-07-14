@@ -15,7 +15,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""sm100 GDN fast-path must match the Triton FLA reference it replaces."""
+"""flashinfer GDN fast-path (Hopper sm90 / Blackwell sm100) must match the Triton FLA reference it replaces."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ import torch.nn.functional as F
 from tokenspeed_kernel.ops.attention.flashinfer import gated_delta_rule as gdn
 
 pytestmark = pytest.mark.skipif(
-    not gdn.is_available(), reason="sm100 GDN kernel unavailable"
+    not gdn.is_available(), reason="flashinfer GDN prefill kernel unavailable"
 )
 
 
@@ -87,7 +87,7 @@ def test_matches_fla(
         head_first=False,
         use_qk_l2norm_in_kernel=True,
     )
-    o_fi, st_fi = gdn.gdn_chunk_prefill(
+    result = gdn.gdn_chunk_prefill(
         l2norm_fwd(q),
         l2norm_fwd(k),
         v,
@@ -97,6 +97,7 @@ def test_matches_fla(
         initial_state=h0.clone(),
         cu_seqlens=cu,
     )
+    o_fi, st_fi = result.out, result.final_state
 
     assert o_fi.shape == o_ref.shape
     assert o_fi.dtype == o_ref.dtype

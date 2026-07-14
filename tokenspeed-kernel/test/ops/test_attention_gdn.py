@@ -332,3 +332,34 @@ def test_gdn_chunk_prefill_output_h_contract(device: str, solution: str, require
 
     assert result.out.shape == v.shape
     assert result.final_state.shape == initial_state.shape
+
+
+def test_gdn_chunk_prefill_prefers_flashinfer_when_available(device: str):
+    # On any arch where the flashinfer GDN prefill fast-path is available
+    # (Hopper sm90 or Blackwell sm100/sm103), default selection must pick the
+    # SPECIALIZED flashinfer kernel over the PORTABLE triton fallback.
+    from tokenspeed_kernel.ops.attention import _attention_format_signature
+    from tokenspeed_kernel.ops.attention.flashinfer import (
+        gated_delta_rule as gdn_flashinfer,
+    )
+    from tokenspeed_kernel.selection import select_kernel
+
+    if not gdn_flashinfer.is_available():
+        pytest.skip("flashinfer GDN prefill kernel unavailable on this platform")
+
+    q, k, v, _, _, _, _ = _make_inputs(device=device, dtype=torch.bfloat16)
+    signature = _attention_format_signature(q=q, k=k, v=v)
+    kernel = select_kernel(
+        "attention",
+        "gdn_chunk_prefill",
+        signature,
+        traits={
+            "head_dim": q.shape[-1],
+            "head_v_dim": v.shape[-1],
+            "head_v_eq_head_k": v.shape[-1] == k.shape[-1],
+            "num_v_gte_num_q": v.shape[-2] >= q.shape[-2],
+            "qk_l2norm": True,
+            "output_h": False,
+        },
+    )
+    assert kernel.name == "flashinfer_gdn_chunk_prefill"

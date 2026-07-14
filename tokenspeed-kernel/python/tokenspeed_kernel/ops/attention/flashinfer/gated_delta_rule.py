@@ -15,17 +15,20 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""FlashInfer Blackwell (sm100) gated delta net chunked prefill.
+"""FlashInfer gated delta net chunked prefill (Hopper sm90 + Blackwell sm100/sm103).
 
-Fast-path for GDN prefill on Blackwell (sm100/sm103) + CUDA 13 + bf16 +
-head_dim==128. The caller gates on ``is_supported`` and must fail fast when the
-fast-path is unavailable;
-this module has no Triton fallback.
+Fast-path for GDN prefill on bf16 + head_dim==128. flashinfer's
+``chunk_gated_delta_rule`` is a unified API that dispatches by architecture under
+the hood to a CuTe DSL kernel per SM generation (``chunk_gated_delta_rule_sm90``
+on Hopper, ``chunk_gated_delta_rule_sm100`` on Blackwell). Both share the same
+input/output conventions and both support state checkpointing (the ``output_h``
+path). The caller gates on ``is_supported`` and must fail fast when the fast-path
+is unavailable; this module has no Triton fallback.
 
-Convention vs the Triton FLA path (verified equal to bf16 on B200):
-- q, k must be L2-normalized by the caller (the sm100 kernel ignores its own
+Convention vs the Triton FLA path (verified equal to bf16 on B200 and H200):
+- q, k must be L2-normalized by the caller (the kernel ignores its own
   use_qk_l2norm flag).
-- g is the FLA log-space forget gate; the sm100 kernel takes log internally, so
+- g is the FLA log-space forget gate; the kernel takes log internally, so
   we pass alpha = exp(g).
 - beta is cast to float32 (flashinfer passes it through without casting).
 - the recurrent state is stored transposed (K<->V) vs FLA, so we transpose the
@@ -53,13 +56,17 @@ platform = current_platform()
 SUPPORTED_HEAD_DIM = 128
 
 _chunk_gated_delta_rule = error_fn
-_has_blackwell_prefill = False
+_fi_sm90 = None
+_fi_sm100 = None
 
-if platform.is_blackwell:
+if platform.is_hopper or platform.is_blackwell:
     try:
-        from flashinfer.gdn_kernels import (
-            _has_blackwell_prefill,
-        )
+        # flashinfer >= 0.6.14 dispatches inside chunk_gated_delta_rule by
+        # architecture to a per-SM CuTe DSL kernel. Each kernel symbol is None
+        # when its module failed to import (e.g. missing nvidia-cutlass-dsl), so
+        # probe the one that matches this platform rather than assuming presence.
+        from flashinfer.gdn_kernels import chunk_gated_delta_rule_sm90 as _fi_sm90
+        from flashinfer.gdn_kernels import chunk_gated_delta_rule_sm100 as _fi_sm100
         from flashinfer.gdn_prefill import chunk_gated_delta_rule as _fi_chunk
 
         _chunk_gated_delta_rule = _fi_chunk
@@ -68,18 +75,17 @@ if platform.is_blackwell:
 
 
 def is_available() -> bool:
-    """Whether the sm100 GDN kernel can run on this platform."""
-    cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
-    # flashinfer's gdn_prefill treats compute-capability major 10 as the
-    # Blackwell path (sm100 B200/GB200, sm103 B300), gated on CUDA>=13 and the
-    # prefill kernel being present; it raises NotImplementedError otherwise.
-    # Mirror that here so the caller does not commit to a crashing fast-path.
-    return (
-        _chunk_gated_delta_rule is not error_fn
-        and platform.is_blackwell
-        and cuda_major >= 13
-        and _has_blackwell_prefill
-    )
+    """Whether the flashinfer GDN prefill kernel can run on this platform."""
+    if _chunk_gated_delta_rule is error_fn:
+        return False
+    if platform.is_hopper:
+        # sm90 Hopper CuTe DSL kernel.
+        return _fi_sm90 is not None
+    if platform.is_blackwell:
+        # sm100/sm103 Blackwell CuTe DSL kernel needs CUDA>=13.
+        cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
+        return _fi_sm100 is not None and cuda_major >= 13
+    return False
 
 
 def is_supported(
@@ -109,7 +115,7 @@ if is_available():
         name="flashinfer_gdn_chunk_prefill",
         solution="flashinfer",
         capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(10, 0),
+            min_arch_version=ArchVersion(9, 0),
             max_arch_version=ArchVersion(10, 3),
             vendors=frozenset({"nvidia"}),
         ),
@@ -123,7 +129,7 @@ if is_available():
             "qk_l2norm": frozenset({False, True}),
             "output_h": frozenset({False, True}),
         },
-        tags={"blackwell", "latency"},
+        tags={"hopper", "blackwell", "latency"},
     )
     def gdn_chunk_prefill(
         q: torch.Tensor,
@@ -139,7 +145,7 @@ if is_available():
         output_final_state: bool = True,
         output_h: bool = False,
     ):
-        """Run one chunked GDN prefill on the sm100 kernel.
+        """Run one chunked GDN prefill on the flashinfer CuTe DSL kernel.
 
         q, k, v are [B, T, H, D] (B==1) or [T, H, D]; q/k already L2-normalized.
         g, beta are [B, T, H] or [T, H]; g in log space. initial_state is the FLA
