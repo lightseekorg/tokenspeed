@@ -125,6 +125,7 @@ class OutputProcessor:
                 "id": rid,
                 "finish_reason": recv_obj.finished_reasons[i],
                 "prompt_tokens": recv_obj.prompt_tokens[i],
+                "weight_version": self.engine.server_args.weight_version,
             }
             logprobs_info = state.logprobs_info if not state.obj.stream else {}
 
