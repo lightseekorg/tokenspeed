@@ -1026,6 +1026,7 @@ def get_config(
     cu_seqlens_q: torch.Tensor,
     max_seqlen: int,
     window_left: int,
+    softmax_scale: float | None,
 ) -> LaunchConfig:
     n_heads = q.shape[1]
     n_kv_heads = k.shape[1]
@@ -1035,7 +1036,9 @@ def get_config(
     num_warps = 4
     batch_size = cu_seqlens_q.numel() - 1
     window_left = window_left if window_left >= 0 else -1
-    sm_scale = (1.0 / math.sqrt(head_dim)) * _INV_LN2_VALUE
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(head_dim)
+    sm_scale = softmax_scale * _INV_LN2_VALUE
     return LaunchConfig(
         n_heads=n_heads,
         n_kv_heads=n_kv_heads,
@@ -1062,6 +1065,7 @@ def gluon_mha_prefill_gfx950(
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
     return_lse: bool = False,
+    softmax_scale: float | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     total_tokens, n_heads, _ = q.shape
     config = get_config(
@@ -1070,6 +1074,7 @@ def gluon_mha_prefill_gfx950(
         cu_seqlens_q=cu_seqlens,
         max_seqlen=max_seqlen,
         window_left=window_left,
+        softmax_scale=softmax_scale,
     )
     is_fp8 = q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
     out_dtype = torch.bfloat16 if is_fp8 else q.dtype
