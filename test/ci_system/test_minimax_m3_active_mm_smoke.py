@@ -11,7 +11,7 @@ from minimax_m3_active_mm_smoke import (
 )
 
 
-def _graph_log() -> str:
+def _graph_log(*, detailed: bool = False) -> str:
     lines = []
     budgets = ", ".join(str(value) for value in ENCODER_GRAPH_BUDGETS)
     for rank in range(4):
@@ -20,11 +20,12 @@ def _graph_log() -> str:
             f"modality=image, budgets=[{budgets}], max_batch_size=10, "
             "max_metadata_sequences_per_batch=encoder_output_token_budget, encoder_tp=4"
         )
-        for budget in ENCODER_GRAPH_BUDGETS:
-            lines.append(
-                f"Captured encoder cudagraph: modality=image, budget={budget}, "
-                "max_batch_size=10, metadata_sequence_budget=1, buffers={}"
-            )
+        if detailed:
+            for budget in ENCODER_GRAPH_BUDGETS:
+                lines.append(
+                    f"Captured encoder cudagraph: modality=image, budget={budget}, "
+                    "max_batch_size=10, metadata_sequence_budget=1, buffers={}"
+                )
         lines.append(
             "Encoder CUDA graph capture complete: modality=image, 9 budget graphs."
         )
@@ -46,19 +47,54 @@ def _reference() -> dict:
     }
 
 
-def test_graph_summary_requires_four_ranks_and_every_budget() -> None:
+def test_graph_summary_accepts_default_info_capture_evidence() -> None:
     summary = summarize_encoder_graph_log(_graph_log())
-    recaptured = summarize_encoder_graph_log(
-        _graph_log() + "Captured encoder cudagraph: modality=image, budget=16, "
-        "max_batch_size=10, metadata_sequence_budget=1, buffers={}\n"
-    )
 
     assert summary["failures"] == []
     assert summary["initialized"] == 4
     assert summary["captured_total"] == 36
+    assert summary["capture_details_available"] is False
+    assert summary["capture_details_total"] == 0
+    assert summary["captures_by_budget"] is None
+
+
+def test_graph_summary_cross_checks_optional_debug_details() -> None:
+    summary = summarize_encoder_graph_log(_graph_log(detailed=True))
+    recaptured = summarize_encoder_graph_log(
+        _graph_log(detailed=True)
+        + "Captured encoder cudagraph: modality=image, budget=16, "
+        "max_batch_size=10, metadata_sequence_budget=1, buffers={}\n"
+    )
+
+    assert summary["failures"] == []
+    assert summary["captured_total"] == 36
+    assert summary["capture_details_available"] is True
+    assert summary["capture_details_total"] == 36
     assert all(value == 4 for value in summary["captures_by_budget"].values())
-    assert recaptured["captured_total"] == 37
+    assert recaptured["captured_total"] == 36
+    assert recaptured["capture_details_total"] == 37
     assert recaptured["failures"]
+
+
+@pytest.mark.parametrize(
+    "log_text",
+    [
+        _graph_log().replace(
+            "Encoder CUDA graph capture complete: modality=image, 9 budget graphs.",
+            "Encoder CUDA graph capture complete: modality=image, 8 budget graphs.",
+            1,
+        ),
+        _graph_log().replace(
+            "Encoder CUDA graph capture complete: modality=image, 9 budget graphs.\n",
+            "",
+            1,
+        ),
+    ],
+)
+def test_graph_summary_rejects_incomplete_info_capture_evidence(log_text: str) -> None:
+    summary = summarize_encoder_graph_log(log_text)
+
+    assert summary["failures"]
 
 
 class _FakeResponse:
@@ -195,8 +231,8 @@ def test_request_time_recapture_is_blocking(tmp_path: Path) -> None:
         if len(session.payloads) == 2:
             config.server_log.write_text(
                 config.server_log.read_text()
-                + "Captured encoder cudagraph: modality=image, budget=16, "
-                "max_batch_size=10, metadata_sequence_budget=1, buffers={}\n"
+                + "Encoder CUDA graph capture complete: modality=image, "
+                "9 budget graphs.\n"
             )
         return response
 

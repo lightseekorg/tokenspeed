@@ -101,25 +101,6 @@ def summarize_encoder_graph_log(text: str) -> dict[str, Any]:
                 f"encoder wrapper initialization {rank_index} has budgets {budgets!r}"
             )
 
-    captured_budgets = [int(value) for value in _CAPTURED_RE.findall(text)]
-    captured_by_budget = Counter(captured_budgets)
-    expected_capture_total = EXPECTED_TP_RANKS * len(ENCODER_GRAPH_BUDGETS)
-    if len(captured_budgets) != expected_capture_total:
-        failures.append(
-            f"expected {expected_capture_total} captured budget graphs, "
-            f"found {len(captured_budgets)}"
-        )
-    unexpected_budgets = sorted(set(captured_budgets) - set(ENCODER_GRAPH_BUDGETS))
-    if unexpected_budgets:
-        failures.append(f"captured unexpected encoder budgets: {unexpected_budgets}")
-    for budget in ENCODER_GRAPH_BUDGETS:
-        count = captured_by_budget[budget]
-        if count != EXPECTED_TP_RANKS:
-            failures.append(
-                f"encoder budget {budget} was captured {count} times; "
-                f"expected {EXPECTED_TP_RANKS}"
-            )
-
     complete_values = [int(value) for value in _COMPLETE_RE.findall(text)]
     if len(complete_values) != EXPECTED_TP_RANKS:
         failures.append(
@@ -131,6 +112,33 @@ def summarize_encoder_graph_log(text: str) -> dict[str, Any]:
             f"encoder capture completion reported wrong graph count: {complete_values}"
         )
 
+    # Per-budget capture messages include tensor-buffer details and are DEBUG
+    # logs. The stable INFO contract is the exact initialized budget list plus
+    # one completion count per TP rank. Cross-check DEBUG details when present,
+    # but do not require a production server to run at DEBUG level.
+    captured_budgets = [int(value) for value in _CAPTURED_RE.findall(text)]
+    captured_by_budget = Counter(captured_budgets)
+    capture_details_available = bool(captured_budgets)
+    expected_capture_total = EXPECTED_TP_RANKS * len(ENCODER_GRAPH_BUDGETS)
+    if capture_details_available:
+        if len(captured_budgets) != expected_capture_total:
+            failures.append(
+                f"expected {expected_capture_total} detailed budget capture events, "
+                f"found {len(captured_budgets)}"
+            )
+        unexpected_budgets = sorted(set(captured_budgets) - set(ENCODER_GRAPH_BUDGETS))
+        if unexpected_budgets:
+            failures.append(
+                f"captured unexpected encoder budgets: {unexpected_budgets}"
+            )
+        for budget in ENCODER_GRAPH_BUDGETS:
+            count = captured_by_budget[budget]
+            if count != EXPECTED_TP_RANKS:
+                failures.append(
+                    f"encoder budget {budget} had {count} detailed capture events; "
+                    f"expected {EXPECTED_TP_RANKS}"
+                )
+
     installed = len(_INSTALLED_RE.findall(text))
     if installed != EXPECTED_TP_RANKS:
         failures.append(
@@ -140,10 +148,17 @@ def summarize_encoder_graph_log(text: str) -> dict[str, Any]:
         "initialized": initialized,
         "capture_complete": len(complete_values),
         "installed": installed,
-        "captured_total": len(captured_budgets),
-        "captures_by_budget": {
-            str(budget): captured_by_budget[budget] for budget in ENCODER_GRAPH_BUDGETS
-        },
+        "captured_total": sum(complete_values),
+        "capture_details_available": capture_details_available,
+        "capture_details_total": len(captured_budgets),
+        "captures_by_budget": (
+            {
+                str(budget): captured_by_budget[budget]
+                for budget in ENCODER_GRAPH_BUDGETS
+            }
+            if capture_details_available
+            else None
+        ),
         "failures": failures,
     }
 

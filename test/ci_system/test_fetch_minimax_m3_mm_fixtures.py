@@ -4,7 +4,6 @@ import hashlib
 import io
 
 import pytest
-
 from fetch_minimax_m3_mm_fixtures import Fixture, fetch_fixture
 
 
