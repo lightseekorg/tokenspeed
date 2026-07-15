@@ -78,6 +78,8 @@ class FakeHttpClient:
             "server_args": {
                 "enable_output_logprobs": True,
                 "kv_cache_dtype": self.kv_cache_dtype,
+                "port": 48100 if self.kv_cache_dtype == "auto" else 48200,
+                "rl_control_port": (49100 if self.kv_cache_dtype == "auto" else 49200),
                 "model": "/models/minimax-m3",
                 "revision": "c5454eb0",
                 "attn_tp_size": 4,
@@ -174,6 +176,10 @@ def test_collect_checkpoints_all_requests_with_fixed_sampling_and_provenance(tmp
     assert len(persisted["teacher_forced"]) == 40
     assert persisted["server"]["sha"] == "abc123"
     assert persisted["server"]["args"]["kv_cache_dtype"] == "auto"
+    assert "port" not in persisted["server"]["args"]
+    assert "rl_control_port" not in persisted["server"]["args"]
+    assert persisted["server"]["raw_info"]["server_args"]["port"] == 48100
+    assert persisted["server"]["raw_info"]["server_args"]["rl_control_port"] == 49100
     assert persisted["reference"]["sha256"] == quality._sha256(reference_path)
     assert persisted["client_config"] == {
         "autoregressive_repeats": 3,

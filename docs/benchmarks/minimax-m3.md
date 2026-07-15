@@ -165,6 +165,9 @@ model name, and otherwise identical CLI arguments. The collector fixes
 three eight-token autoregressive repetitions for each of five prompts plus 40
 one-step teacher-forced contexts. Every response is checkpointed atomically
 with its raw IDs/logprobs, server args, server SHA, and reference SHA256.
+Pin `--seed 20260715` on both server launches. The comparable server-args copy
+excludes only the process-local internal gRPC and RL-control ports allocated by
+`tokenspeed serve`; both values remain in the raw server-info payload.
 
 ```bash
 .venv/bin/python test/quality_benchmark/tokenspeed/minimax_m3_fixed_reference.py collect \
@@ -314,6 +317,8 @@ tokenspeed serve MiniMaxAI/MiniMax-M3-MXFP8 \
   --attention-backend mha \
   --mm-attention-backend triton_attn \
   --moe-backend triton \
+  --sampling-backend greedy \
+  --seed 20260715 \
   --enable-mm-encoder-cuda-graph \
   --disable-kvstore \
   --health-check-interval-secs 1800 \

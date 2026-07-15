@@ -28,6 +28,7 @@ server:
     --attention-backend mha
     --moe-backend triton
     --sampling-backend greedy
+    --seed 20260715
     --no-enable-prefix-caching
     --disable-kvstore
     --host 127.0.0.1

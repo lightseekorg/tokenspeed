@@ -208,8 +208,11 @@ The reusable harness is
 `test/quality_benchmark/tokenspeed/minimax_m3_fixed_reference.py`. Start BF16
 and FP8 servers separately from the same committed SHA with release-default
 overlap and `--enable-output-logprobs`. Their normalized server args must be
-identical except for `kv_cache_dtype`; the compare step also rejects a SHA,
-reference, arm-label, or cache-dtype mismatch.
+identical except for `kv_cache_dtype`; pin `--seed 20260715` on both launches.
+The normalized copy excludes only the process-local internal gRPC and
+RL-control ports allocated by `tokenspeed serve`, while raw server info keeps
+both. The compare step also rejects a SHA, reference, arm-label, or cache-dtype
+mismatch.
 
 ```bash
 .venv/bin/python test/quality_benchmark/tokenspeed/minimax_m3_fixed_reference.py collect \

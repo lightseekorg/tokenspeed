@@ -34,6 +34,7 @@ EXPECTED_STEPS_PER_PROMPT = 8
 EXPECTED_TEACHER_CONTEXTS = EXPECTED_PROMPTS * EXPECTED_STEPS_PER_PROMPT
 EXPECTED_AUTOREGRESSIVE_REPEATS = 3
 ALLOWED_SERVER_ARG_DIFFERENCES = frozenset({"kv_cache_dtype"})
+EPHEMERAL_SERVER_ARGS = frozenset({"port", "rl_control_port"})
 
 
 class BenchmarkError(RuntimeError):
@@ -409,6 +410,20 @@ def parse_generation_response(raw_response: Any) -> dict[str, Any]:
     }
 
 
+def _normalize_server_args(server_args: Mapping[str, Any]) -> dict[str, Any]:
+    """Drop process-local transport ports from the comparable server config.
+
+    ``tokenspeed serve`` allocates the internal gRPC and RL-control ports on
+    every launch. They remain in ``server.raw_info`` for provenance but cannot
+    be part of a cross-restart BF16/FP8 configuration comparison.
+    """
+    return {
+        key: value
+        for key, value in server_args.items()
+        if key not in EPHEMERAL_SERVER_ARGS
+    }
+
+
 def _extract_server_args(raw_info: Any) -> tuple[dict[str, Any], dict[str, Any]]:
     info = _require_mapping(raw_info, "get_server_info response")
     server_args = _require_mapping(info.get("server_args"), "server_info.server_args")
@@ -416,7 +431,7 @@ def _extract_server_args(raw_info: Any) -> tuple[dict[str, Any], dict[str, Any]]
         raise BenchmarkError(
             "Server must report enable_output_logprobs=true before quality collection"
         )
-    return info, server_args
+    return info, _normalize_server_args(server_args)
 
 
 def _request_body(

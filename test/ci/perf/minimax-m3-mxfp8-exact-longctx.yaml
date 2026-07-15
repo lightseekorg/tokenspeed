@@ -28,6 +28,7 @@ server:
     --attention-backend mha
     --moe-backend triton
     --sampling-backend greedy
+    --seed 20260715
     --enforce-eager
     --disable-kvstore
     --health-check-interval-secs 1800
