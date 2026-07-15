@@ -54,7 +54,7 @@ from tokenspeed.runtime.layers.moe.utils import (
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
-from tokenspeed.runtime.utils.env import envs, global_server_args_dict
+from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 _is_blackwell = current_platform().is_blackwell
@@ -132,8 +132,7 @@ class Qwen3_5MoeMLP(nn.Module):
         self.act_fn = SiluAndMul()
 
         self._use_nvfp4_gemm_swiglu_nvfp4_quant = (
-            envs.TOKENSPEED_NVFP4_GEMM_SWIGLU_NVFP4_QUANT.get()
-            and _is_blackwell
+            _is_blackwell
             and isinstance(self.gate_up_proj.quant_method, Nvfp4LinearMethod)
             and isinstance(self.down_proj.quant_method, Nvfp4LinearMethod)
         )

@@ -1047,8 +1047,15 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
 
     def _register_to_bootstrap(self):
         """Register KVSender to bootstrap server via HTTP POST."""
+        advertised_ip = (
+            get_ip(self.args.advertised_host)
+            if self.args.advertised_host is not None
+            else get_local_ip_by_remote()
+        )
         if self.dist_init_addr:
             ip_address = socket.gethostbyname(self.dist_init_addr.split(":")[0])
+        elif self.args.advertised_host is not None:
+            ip_address = advertised_ip
         else:
             ip_address = get_ip()
 
@@ -1058,7 +1065,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             "role": "Prefill",
             "world_size": self.world_size,
             "dp_size": self.dp_size,
-            "rank_ip": get_local_ip_by_remote(),
+            "rank_ip": advertised_ip,
             "rank_port": self.rank_port,
             "engine_rank": self.kv_args.engine_rank,
             "enable_mla_l1_5_cache": self.args.enable_mla_l1_5_cache,

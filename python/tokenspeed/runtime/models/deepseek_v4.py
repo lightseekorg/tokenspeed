@@ -27,7 +27,6 @@ until the HCA/CSA cache kernels are wired into TokenSpeed.
 
 from __future__ import annotations
 
-import os
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -145,8 +144,9 @@ from tokenspeed.runtime.utils import (
 )
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.custom_ops import direct_register_custom_op
-from tokenspeed.runtime.utils.env import global_server_args_dict, pdl_enabled
+from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.nvtx import nvtx_range
+from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 _platform = current_platform()
 
@@ -4217,8 +4217,6 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
         self._warmup_prefill_jit()
 
     def _warmup_mega_moe_jit(self) -> None:
-        if os.environ.get("TOKENSPEED_DISABLE_MEGA_MOE_WARMUP") == "1":
-            return
         for module in self.modules():
             if not isinstance(module, DeepseekV4MegaMoEExperts):
                 continue

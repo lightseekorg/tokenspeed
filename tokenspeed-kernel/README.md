@@ -75,7 +75,7 @@ tokenspeed_kernel/
   signature.py           # TensorFormat, ScaleFormat, FormatSignature
   registry.py            # KernelRegistry, register_kernel, Priority bands
   selection.py           # select_kernel, oracles, overrides
-  profiling.py           # ShapeCapture, kernel_scope, Proton bootstrap
+  profiling.py           # Explicit shape capture and Proton sessions
   _triton.py             # Single import point for the vendored Triton fork
 
   ops/
@@ -120,6 +120,26 @@ iteration.
   (FLOPs / bytes) per op family, tabular reports, and Proton integration.
 - Runtime shape capture feeds replay and tuning workflows; `kernel_scope`
   scopes are visible in Proton/Chrome traces.
+- Standalone users configure profiling and shape capture through Python APIs;
+  importing `tokenspeed_kernel` never starts either facility:
+
+  ```python
+  from tokenspeed_kernel.profiling import (
+      ProfilingConfig,
+      profiling,
+      shape_capture,
+  )
+
+  config = ProfilingConfig(
+      output="profiles/rank0",
+      data="trace",
+      backend="cupti",
+      output_format="chrome_trace",
+  )
+  with profiling(config), shape_capture("profiles/rank0-shapes.json"):
+      run_workload()
+  ```
+
 - End-to-end serving: pass `--profile --profile-activities PROTON` to
   `tokenspeed bench serve` (or POST `/start_profile` / `/stop_profile` with
   `{"activities": ["PROTON"]}`). Each scheduler process — the process where
@@ -132,6 +152,27 @@ iteration.
   (`TOKENSPEED_KERNEL_PROFILE_DATA=trace`,
   `TOKENSPEED_KERNEL_PROFILE_OUTPUT_FORMAT=chrome_trace`), then merge the
   traces with `tokenspeed merge-traces`.
+
+### Environment boundary
+
+TokenSpeed-kernel runtime features use explicit Python configuration rather
+than TokenSpeed-owned environment variables. This includes profiling, shape
+capture, plugin disabling, kernel selection, and custom NCCL/RCCL paths. For
+example, select a non-default collective library with
+`NCCLLibrary(so_file="/opt/nccl/lib/libnccl.so.2")`.
+
+The remaining environment access under the installed package is limited to
+vendor and toolchain protocols in `thirdparty/`:
+
+- `CUDA_HOME`, `CPATH`, and `PATH` let the DeepGEMM JIT locate CUDA headers and
+  `nvcc`.
+- `TRTLLM_ENABLE_PDL` is consumed by the vendored TRT-LLM/CuTe DSL kernel.
+- `CUDA_LAUNCH_BLOCKING` is consumed by vendored FlashInfer/TRT-LLM debug code
+  and follows CUDA's standard runtime contract.
+
+The package build script also consumes compiler, architecture, version, and CI
+metadata variables while producing a wheel. Those build-time inputs are not
+runtime product configuration.
 
 ### Plugins
 

@@ -101,6 +101,7 @@ jobs:
           TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS: ${{ vars.TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS }}
         run: |
           set -euo pipefail
+          python3 test/ci_system/product_env_guard.py
           TASK_FILTER_ARGS=()
           if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
             TASK_FILTER_ARGS=(--task-names "$CI_SELECTED_TASK_NAMES")
@@ -135,6 +136,11 @@ jobs:
               files=$(gh api \
                 "/repos/${{ github.repository }}/compare/${{ github.event.before }}...${{ github.event.after }}" \
                 -q '.files[].filename')
+              ;;
+            workflow_dispatch)
+              # A targeted manual run validates the checked-out branch. It has
+              # no PR/push diff payload, so always install the in-tree MLA.
+              files="tokenspeed-mla/"
               ;;
             *)
               files=""

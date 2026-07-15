@@ -39,6 +39,27 @@ including hidden files, rather than guessing workload-specific filenames.
 Workload validators should write durable JSON, logs, and memory samples below
 that directory even when validation fails.
 
+## Product environment contract
+
+Every PR workflow runs `test/ci_system/product_env_guard.py` in the matrix-scan
+job, before any accelerator task is dispatched. The AST-based check rejects
+first-party `os.getenv`/`os.environ` reads, dynamic keys, `setdefault`, and
+`envs.FIELD` configuration unless the exact source file, variable name, and
+read/write direction are reviewed as an external protocol.
+
+The small allowlist covers authentication, standard distributed-launcher and
+Prometheus contracts, plus deterministic writes that project explicit typed
+configuration into CUDA/NCCL/Torch/TRT-LLM process APIs. Product namespaces
+such as `TOKENSPEED_*`, `TS_*`, `SMG_*`, and `EPD_*` are never allowlisted.
+Add a typed CLI/config/API field instead of extending the process environment.
+
+Runtime CI can enable NVIDIA exception dumps explicitly with
+`test/runtime/run_ci_suite.py --cuda-coredump-dir PATH`. The helper projects
+that reviewed CLI value into the CUDA driver's required `CUDA_*` protocol for
+child processes; there is no TokenSpeed environment switch or import-time
+activation. NVIDIA runtime-suite tasks write those dumps below
+`.ci-artifacts/cuda-coredumps`, which the PR workflows retain on failure.
+
 ## Targeted manual dispatch
 
 Manual dispatches of `PR Test NVIDIA`, `PR Test NVIDIA ARM`, and `PR Test AMD`

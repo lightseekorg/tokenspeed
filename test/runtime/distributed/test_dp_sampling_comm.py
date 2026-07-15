@@ -70,18 +70,20 @@ def _onesided_available_for_test(group) -> bool:
         return False
 
 
-def test_env_override_controls_backend(monkeypatch):
-    monkeypatch.setenv("TOKENSPEED_DP_SAMPLING_BACKEND", "nccl")
+def test_backend_resolution_ignores_process_environment(monkeypatch):
+    monkeypatch.setenv("TOKENSPEED_DP_SAMPLING_BACKEND", "bogus")
+    monkeypatch.setattr(
+        "tokenspeed.runtime.distributed.dp_sampling_comm._onesided_available",
+        lambda group: False,
+    )
 
     assert _resolve_backend("auto", (0, 1)) == "nccl"
-    assert _resolve_backend("onesided", (0, 1)) == "nccl"
+    assert _resolve_backend("nccl", (0, 1)) == "nccl"
 
 
-def test_env_override_rejects_invalid_backend(monkeypatch):
-    monkeypatch.setenv("TOKENSPEED_DP_SAMPLING_BACKEND", "bogus")
-
-    with pytest.raises(ValueError, match="TOKENSPEED_DP_SAMPLING_BACKEND"):
-        _resolve_backend("auto", (0, 1))
+def test_backend_resolution_rejects_invalid_explicit_value():
+    with pytest.raises(ValueError, match="backend='bogus'"):
+        _resolve_backend("bogus", (0, 1))
 
 
 def _build_comm(rank, world_size, group, *, pad_bs, n, vocab, dtype, backend):

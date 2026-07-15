@@ -16,7 +16,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional
 from urllib.error import URLError
 from urllib.parse import urlparse
 from urllib.request import urlopen
@@ -46,6 +46,9 @@ SUPPORTED_RUNNER_GROUPS = ("all", "amd", "nvidia", "nvidia-arm", "nvidia-x86")
 _PRIORITY_ORDER = {value: index for index, value in enumerate(SUPPORTED_PRIORITIES)}
 B200_RUNNER_LABEL_ENV = "TOKENSPEED_B200_RUNNER_LABEL"
 EXCLUDED_RUNNER_LABELS_ENV = "TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS"
+PIPELINE_CONTROL_ENV_KEYS = frozenset(
+    {B200_RUNNER_LABEL_ENV, EXCLUDED_RUNNER_LABELS_ENV}
+)
 STALE_PROCESS_PATTERNS = [
     r"ts serve",
     r"python.*-m\s+smg(\s|\.launch|$)",
@@ -507,9 +510,24 @@ def shell_run(
     }
 
 
-def merge_env(task_env: Dict[str, Any]) -> Dict[str, str]:
-    env = os.environ.copy()
+def merge_env(
+    task_env: Dict[str, Any],
+    *,
+    inherited_env: Mapping[str, str] | None = None,
+) -> Dict[str, str]:
+    """Build a child-workload environment without matrix-scan controls.
+
+    Runner-label remapping and exclusion variables configure the pipeline
+    process itself.  They must not leak into install, server, or benchmark
+    subprocesses, where release preflight correctly treats every
+    ``TOKENSPEED_*`` variable as hidden product configuration.  Remove these
+    keys after merging task configuration so a task cannot reintroduce them.
+    """
+
+    env = dict(os.environ if inherited_env is None else inherited_env)
     env.update({key: str(value) for key, value in task_env.items()})
+    for key in PIPELINE_CONTROL_ENV_KEYS:
+        env.pop(key, None)
     return env
 
 
@@ -530,6 +548,23 @@ def get_runner_specific_env(task: Dict[str, Any], runner: str) -> Dict[str, str]
             return dict(runner_env.get(label, {}))
 
     return {}
+
+
+def build_workload_env(
+    task: Dict[str, Any],
+    runner: str,
+    *,
+    inherited_env: Mapping[str, str] | None = None,
+) -> Dict[str, str]:
+    """Build the final environment inherited by one task's subprocesses."""
+
+    task_env = dict(task.get("env", {}))
+    task_env["CI_TASK_NAME"] = str(task["name"])
+    task_env["CI_TASK_TYPE"] = str(task["type"])
+    task_env["CI_RUNNER_LABEL"] = runner
+    task_env.update(get_default_runner_env(runner))
+    task_env.update(get_runner_specific_env(task, runner))
+    return merge_env(task_env, inherited_env=inherited_env)
 
 
 def create_ci_venv_name(runner_name: str | None = None) -> str:
@@ -1670,12 +1705,7 @@ def execute_task(
         )
     targets = summarize_task_targets(task, repo_root)
 
-    env = merge_env(task.get("env", {}))
-    env["CI_TASK_NAME"] = str(task["name"])
-    env["CI_TASK_TYPE"] = str(task["type"])
-    env["CI_RUNNER_LABEL"] = runner
-    env.update(get_default_runner_env(runner))
-    env.update(get_runner_specific_env(task, runner))
+    env = build_workload_env(task, runner)
 
     stages = filter_stage_commands(
         get_stage_commands(task),

@@ -96,6 +96,7 @@ class ServerArgs:
     chunked_prefill_size: int | None = None
     max_prefill_tokens: int = 8192
     enable_mixed_batch: bool = False
+    scheduler_memory_debug_checks: bool = False
     block_size: int = 64
     # special kv cache
     mamba_ssm_dtype: str = "float32"
@@ -193,6 +194,7 @@ class ServerArgs:
         Literal["stat", "stat_approx", "per_pass", "per_token"] | None
     ) = None
     expert_distribution_recorder_buffer_size: int | None = None
+    expert_distribution_recorder_output_dir: str = "/tmp"
     enable_expert_distribution_metrics: bool = False
     enable_eplb: bool = False
 
@@ -217,6 +219,7 @@ class ServerArgs:
     dist_init_addr: str | None = None
     nnodes: int = 1
     node_rank: int = 0
+    block_nonzero_rank_children: bool = True
 
     # Hugging Face model config overrides in JSON
     hf_overrides: str = "{}"
@@ -225,6 +228,8 @@ class ServerArgs:
     # Kernel backend
     attention_backend: str | None = None
     drafter_attention_backend: str | None = None
+    tokenspeed_mla_prefill_backend: Literal["cutedsl", "binary"] = "cutedsl"
+    tokenspeed_mla_prefill_binary_so_path: str | None = None
     sampling_backend: str | None = None
     dp_sampling: bool = False
     dp_sampling_min_bs: int | None = None
@@ -327,6 +332,7 @@ class ServerArgs:
     disaggregation_failed_session_ttl: int = 30
     disaggregation_heartbeat_interval: float = 5.0
     disaggregation_heartbeat_max_failures: int = 2
+    disaggregation_advertised_host: str | None = None
     pd_layerwise_debug: bool = False
     pd_prefill_metadata_wait_log_interval: float = 5.0
     epd_encode_ring_slots: int = 64
@@ -495,6 +501,27 @@ class ServerArgs:
         # attention_backend default is NOT set here — deferred to
         # AttnInitializer.modify_args where both hardware and model arch are known.
 
+        if self.tokenspeed_mla_prefill_backend not in {"cutedsl", "binary"}:
+            raise ValueError(
+                "tokenspeed_mla_prefill_backend must be 'cutedsl' or 'binary'"
+            )
+        if self.tokenspeed_mla_prefill_binary_so_path is not None:
+            if (
+                not isinstance(self.tokenspeed_mla_prefill_binary_so_path, str)
+                or not self.tokenspeed_mla_prefill_binary_so_path.strip()
+            ):
+                raise ValueError(
+                    "tokenspeed_mla_prefill_binary_so_path must be a non-empty path"
+                )
+            if self.tokenspeed_mla_prefill_backend != "binary":
+                raise ValueError(
+                    "--tokenspeed-mla-prefill-binary-so-path requires "
+                    "--tokenspeed-mla-prefill-backend binary"
+                )
+            self.tokenspeed_mla_prefill_binary_so_path = (
+                self.tokenspeed_mla_prefill_binary_so_path.strip()
+            )
+
         if self.sampling_backend is None:
             # ``flashinfer`` is the only built-in backend that respects per-request
             # ``temperature`` / ``top_p`` / ``top_k``. ``greedy`` is argmax-only
@@ -661,6 +688,18 @@ class ServerArgs:
             )
 
     def resolve_disaggregation(self):
+        if self.disaggregation_advertised_host is not None:
+            if (
+                not isinstance(self.disaggregation_advertised_host, str)
+                or not self.disaggregation_advertised_host.strip()
+            ):
+                raise ValueError(
+                    "disaggregation_advertised_host must be a non-empty string"
+                )
+            self.disaggregation_advertised_host = (
+                self.disaggregation_advertised_host.strip()
+            )
+
         # Constructing the typed snapshot validates every PD/EPD tuning field at
         # startup, before any transport thread or large buffer is created.
         _ = self.disaggregation_config
@@ -1459,6 +1498,12 @@ class ServerArgs:
             help="Circular buffer size of expert distribution recorder. Set to -1 to denote infinite buffer.",
         )
         parser.add_argument(
+            "--expert-distribution-recorder-output-dir",
+            type=str,
+            default=ServerArgs.expert_distribution_recorder_output_dir,
+            help="Directory for expert distribution recorder file dumps.",
+        )
+        parser.add_argument(
             "--enable-expert-distribution-metrics",
             action="store_true",
             help="Enable logging metrics for expert balancedness",
@@ -1513,6 +1558,16 @@ class ServerArgs:
         parser.add_argument(
             "--node-rank", type=int, default=ServerArgs.node_rank, help="The node rank."
         )
+        parser.add_argument(
+            "--block-nonzero-rank-children",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.block_nonzero_rank_children,
+            help=(
+                "Keep non-zero-rank launch processes alive after their workers "
+                "become ready. Disable only for an embedding API that owns the "
+                "worker lifecycle itself."
+            ),
+        )
 
         # Model override args
         parser.add_argument(
@@ -1557,6 +1612,23 @@ class ServerArgs:
             "If not specified, uses the same backend as the main model (attention_backend).",
         )
         parser.add_argument(
+            "--tokenspeed-mla-prefill-backend",
+            choices=["cutedsl", "binary"],
+            default=ServerArgs.tokenspeed_mla_prefill_backend,
+            help=(
+                "Explicit TokenSpeed MLA prefill implementation. The default "
+                "uses CuTe DSL JIT; binary selects a packaged or custom AOT module."
+            ),
+        )
+        parser.add_argument(
+            "--tokenspeed-mla-prefill-binary-so-path",
+            default=ServerArgs.tokenspeed_mla_prefill_binary_so_path,
+            help=(
+                "Optional custom TokenSpeed MLA prefill AOT module path. "
+                "Requires --tokenspeed-mla-prefill-backend binary."
+            ),
+        )
+        parser.add_argument(
             "--sampling-backend",
             type=str,
             choices=[
@@ -1585,8 +1657,8 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.dp_sampling,
             help=(
-                "Enable Batch-DP spec-verify sampling. Backend selection defaults "
-                "to auto; override with TOKENSPEED_DP_SAMPLING_BACKEND."
+                "Enable Batch-DP spec-verify sampling. Communication backend "
+                "selection uses the stable automatic policy."
             ),
         )
         parser.add_argument(
@@ -1817,6 +1889,12 @@ class ServerArgs:
             help="Disable the overlap scheduler, which overlaps the CPU scheduler with GPU model worker.",
         )
         parser.add_argument(
+            "--scheduler-memory-debug-checks",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.scheduler_memory_debug_checks,
+            help="Run scheduler page-accounting invariants after each plan.",
+        )
+        parser.add_argument(
             "--disable-tf32",
             action="store_true",
             help="Disable forcing TF32 on for cuBLAS/cuDNN. By default the server sets "
@@ -1873,8 +1951,7 @@ class ServerArgs:
             action="store_true",
             help="Emit NVTX ranges around input_prep / target_forward / "
             "sampling / drafter stages for nsys profiling. Off by default "
-            "(true no-op — no NVTX calls are made). Also enabled by "
-            "TOKENSPEED_NVTX=1.",
+            "(true no-op — no NVTX calls are made).",
         )
         parser.add_argument(
             "--enable-p2p-check",
@@ -2144,6 +2221,15 @@ class ServerArgs:
             type=int,
             default=ServerArgs.disaggregation_heartbeat_max_failures,
             help="Consecutive prefill heartbeat failures before requests are failed.",
+        )
+        parser.add_argument(
+            "--disaggregation-advertised-host",
+            type=str,
+            default=ServerArgs.disaggregation_advertised_host,
+            help=(
+                "Host or IP advertised by PD transport endpoints. By default, "
+                "TokenSpeed discovers the local address."
+            ),
         )
         parser.add_argument(
             "--pd-layerwise-debug",

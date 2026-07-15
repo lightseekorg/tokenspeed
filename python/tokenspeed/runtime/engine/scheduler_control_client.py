@@ -73,7 +73,6 @@ from tokenspeed.runtime.engine.io_struct import (
     UpdateWeightsFromTensorReqOutput,
 )
 from tokenspeed.runtime.utils.dispatch import TypeBasedDispatcher
-from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 if TYPE_CHECKING:
@@ -323,18 +322,19 @@ class SchedulerControlClient:
 
     async def start_profile(
         self: AsyncLLM,
-        output_dir: str | None = None,
+        output_dir: str | None = "/tmp",
         start_step: int | None = None,
         num_steps: int | None = None,
         activities: list[str] | None = None,
-        with_stack: bool | None = None,
-        record_shapes: bool | None = None,
+        with_stack: bool | None = True,
+        record_shapes: bool | None = False,
         profile_by_stage: bool = False,
         profile_id: str | None = None,
     ):
         self.auto_create_handle_loop()
-        env_with_stack = envs.TOKENSPEED_PROFILE_WITH_STACK.get()
-        with_stack = False if with_stack is False or env_with_stack is False else True
+        output_dir = "/tmp" if output_dir is None else output_dir
+        with_stack = True if with_stack is None else with_stack
+        record_shapes = False if record_shapes is None else record_shapes
         req = ProfileReq(
             type=ProfileReqType.START_PROFILE,
             output_dir=output_dir,

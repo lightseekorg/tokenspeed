@@ -23,12 +23,15 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
+import inspect
 import json
 import os
 import sys
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
+import numpy as np
 import pytest
 import torch
 
@@ -47,12 +50,18 @@ from tokenspeed.runtime.multimodal.inputs import (
     MultimodalInputs,
 )
 from tokenspeed.runtime.utils.common import (
+    DEFAULT_AUDIO_REQUEST_TIMEOUT_SECONDS,
+    DEFAULT_IMAGE_REQUEST_TIMEOUT_SECONDS,
     configure_logger,
+    get_bool_env_var,
+    get_image_bytes,
+    load_audio,
     maybe_inference_mode,
     maybe_model_redirect,
     maybe_set_numa_aware_cpu_affinity,
     prepare_model_and_tokenizer,
 )
+from tokenspeed.runtime.utils.network import get_ip
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
@@ -282,3 +291,278 @@ def test_logging_config_ignores_the_legacy_environment(tmp_path) -> None:
 
     basic_config.assert_called_once()
     dict_config.assert_not_called()
+
+
+def test_vendor_environment_projection_overrides_inherited_values() -> None:
+    from tokenspeed.runtime.entrypoints.engine import _set_envs_and_config
+
+    inherited = {
+        "NCCL_NVLS_ENABLE": "1",
+        "NVIDIA_TF32_OVERRIDE": "1",
+        "TORCH_ALLOW_TF32_CUBLAS_OVERRIDE": "1",
+    }
+    args = SimpleNamespace(
+        enable_symm_mem=True,
+        enable_nccl_nvls=False,
+        disable_tf32=True,
+        enable_metrics=False,
+    )
+    with (
+        patch.dict(os.environ, inherited, clear=False),
+        patch("tokenspeed.runtime.entrypoints.engine.set_ulimit"),
+        patch("tokenspeed.runtime.entrypoints.engine.signal.signal"),
+        patch("tokenspeed.runtime.entrypoints.engine.mp.set_start_method"),
+    ):
+        _set_envs_and_config(args)
+
+        assert os.environ["NCCL_CUMEM_ENABLE"] == "1"
+        assert os.environ["NCCL_NVLS_ENABLE"] == "1"
+        assert os.environ["NVIDIA_TF32_OVERRIDE"] == "0"
+        assert os.environ["TORCH_ALLOW_TF32_CUBLAS_OVERRIDE"] == "0"
+
+
+def test_network_discovery_ignores_legacy_host_environment() -> None:
+    with (
+        patch.dict(
+            os.environ,
+            {"TOKENSPEED_HOST_IP": "198.51.100.1", "HOST_IP": "198.51.100.2"},
+        ),
+        patch(
+            "tokenspeed.runtime.utils.network.socket.gethostname", return_value="node"
+        ),
+        patch(
+            "tokenspeed.runtime.utils.network.socket.gethostbyname",
+            return_value="192.0.2.10",
+        ),
+    ):
+        assert get_ip() == "192.0.2.10"
+
+    assert get_ip("203.0.113.7") == "203.0.113.7"
+    with pytest.raises(ValueError, match="non-empty string"):
+        get_ip("  ")
+
+
+def test_mooncake_prefill_registration_prefers_explicit_advertised_host() -> None:
+    from tokenspeed.runtime.pd.mooncake.prefill import MooncakeKVManagerPrefill
+
+    manager = MooncakeKVManagerPrefill.__new__(MooncakeKVManagerPrefill)
+    manager.dist_init_addr = "198.51.100.10:29500"
+    manager.bootstrap_port = 8998
+    manager.world_size = 4
+    manager.dp_size = 1
+    manager.rank_port = 9001
+    manager.args = SimpleNamespace(
+        advertised_host="203.0.113.7",
+        enable_mla_l1_5_cache=False,
+    )
+    manager.kv_args = SimpleNamespace(
+        engine_rank=0,
+        kv_item_lens=[],
+        kv_unit_lens=[],
+        state_item_lens=[],
+        state_unit_lens=[],
+    )
+    response = SimpleNamespace(status_code=200, text="")
+
+    with (
+        patch(
+            "tokenspeed.runtime.pd.mooncake.prefill.get_local_ip_by_remote",
+            return_value="192.0.2.8",
+        ),
+        patch(
+            "tokenspeed.runtime.pd.mooncake.prefill.requests.put",
+            return_value=response,
+        ) as put,
+    ):
+        manager._register_to_bootstrap()
+
+    assert put.call_args.args[0] == "http://198.51.100.10:8998/route"
+    assert put.call_args.kwargs["json"]["rank_ip"] == "203.0.113.7"
+
+
+def test_remote_image_timeout_is_an_explicit_api() -> None:
+    response = Mock(content=b"image")
+    with (
+        patch.dict(os.environ, {"REQUEST_TIMEOUT": "99"}),
+        patch(
+            "tokenspeed.runtime.utils.common.requests.get", return_value=response
+        ) as request,
+    ):
+        assert get_image_bytes("https://example.test/image") == b"image"
+
+    request.assert_called_once_with(
+        "https://example.test/image",
+        timeout=DEFAULT_IMAGE_REQUEST_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status.assert_called_once_with()
+    response.close.assert_called_once_with()
+
+
+def test_remote_audio_timeout_is_an_explicit_api() -> None:
+    response = Mock(content=b"audio")
+    audio = np.array([0.0, 0.5], dtype=np.float32)
+    soundfile = SimpleNamespace(read=Mock(return_value=(audio, 16000)))
+    with (
+        patch.dict(os.environ, {"REQUEST_TIMEOUT": "99"}),
+        patch.dict(sys.modules, {"soundfile": soundfile}),
+        patch(
+            "tokenspeed.runtime.utils.common.requests.get", return_value=response
+        ) as request,
+    ):
+        output = load_audio(
+            "https://example.test/audio",
+            request_timeout=7.5,
+        )
+
+    request.assert_called_once_with(
+        "https://example.test/audio", stream=True, timeout=7.5
+    )
+    np.testing.assert_array_equal(output, audio)
+    response.raise_for_status.assert_called_once_with()
+    response.close.assert_called_once_with()
+
+
+def test_environment_boolean_reader_is_limited_to_ci_contracts() -> None:
+    with pytest.raises(ValueError, match="Unsupported environment boolean"):
+        get_bool_env_var("TOKENSPEED_HIDDEN_FEATURE")
+
+
+def test_expert_recorder_file_dump_uses_explicit_directory(tmp_path) -> None:
+    from tokenspeed.runtime.moe.distribution_recorder import _dump_to_file
+
+    output_dir = tmp_path / "expert-records"
+    with patch("tokenspeed.runtime.moe.distribution_recorder.torch.save") as save:
+        _dump_to_file("record.pt", {"count": 1}, str(output_dir))
+
+    save.assert_called_once_with({"count": 1}, str(output_dir / "record.pt"))
+    assert output_dir.is_dir()
+
+
+def test_new_scheduler_and_mooncake_options_preserve_positional_compatibility():
+    from tokenspeed.runtime.engine.scheduler_utils import make_config
+    from tokenspeed.runtime.pd.mooncake.entities import KVManagerArgs
+
+    parameters = list(inspect.signature(make_config).parameters)
+    assert parameters[-2:] == [
+        "prefix_cache_adjunct",
+        "enable_memory_debug_checks",
+    ]
+
+    fields = [field.name for field in dataclasses.fields(KVManagerArgs)]
+    assert fields[-2:] == ["runtime_config", "advertised_host"]
+
+
+def _tokenspeed_mla_config(*, prefill_backend: str, binary_so_path=None):
+    from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+
+    return MLAConfig(
+        device="cpu",
+        backend_name="tokenspeed_mla",
+        num_attention_heads=2,
+        num_kv_heads=2,
+        head_dim=4,
+        attn_tp_size=1,
+        dtype=torch.bfloat16,
+        kv_cache_dtype=torch.float8_e4m3fn,
+        page_size=64,
+        context_len=1024,
+        max_bs=4,
+        max_graph_bs=4,
+        kv_cache_quant_method="none",
+        kv_lora_rank=2,
+        qk_nope_head_dim=2,
+        qk_rope_head_dim=2,
+        v_head_dim=3,
+        scaling=0.5,
+        kv_cache_dim=4,
+        tokenspeed_mla_prefill_backend=prefill_backend,
+        tokenspeed_mla_prefill_binary_so_path=binary_so_path,
+    )
+
+
+def test_tokenspeed_mla_binary_prefill_skips_cutedsl_warmup_and_is_wired():
+    from tokenspeed.runtime.layers.attention.backends import (
+        tokenspeed_mla as backend_mod,
+    )
+
+    config = _tokenspeed_mla_config(
+        prefill_backend="binary",
+        binary_so_path="/opt/tokenspeed/fmha.so",
+    )
+    workspace = torch.empty(1, dtype=torch.int8)
+    with (
+        patch.dict(
+            backend_mod.global_server_args_dict,
+            {"kv_cache_dtype": "fp8_e4m3"},
+        ),
+        patch.object(
+            backend_mod,
+            "get_cutedsl_workspace_buffer",
+            return_value=workspace,
+        ),
+        patch.object(
+            backend_mod,
+            "has_binary_prefill",
+            return_value=True,
+        ) as has_binary,
+        patch.object(backend_mod, "warmup_compile_prefill") as warmup,
+    ):
+        backend = backend_mod.CuteDSLMLABackend(config)
+
+    has_binary.assert_called_once_with("/opt/tokenspeed/fmha.so")
+    warmup.assert_not_called()
+
+    query = torch.zeros((2, 2, 4), dtype=torch.bfloat16)
+    key = torch.zeros_like(query)
+    value = torch.zeros((2, 2, 3), dtype=torch.bfloat16)
+    expected = torch.zeros_like(value)
+    cumulative = torch.tensor([0, 2], dtype=torch.int32)
+    sequence_lengths = torch.tensor([2], dtype=torch.int32)
+    with patch.object(
+        backend_mod,
+        "tokenspeed_mla_prefill",
+        return_value=(expected, None),
+    ) as prefill:
+        output, _ = backend.forward_extend_chunked(
+            query,
+            key,
+            value,
+            scaling=0.5,
+            logits_soft_cap=None,
+            cum_seq_lens_q=cumulative,
+            cum_seq_lens_kv=cumulative,
+            max_q_len=2,
+            max_kv_len=2,
+            seq_lens=sequence_lengths,
+            batch_size=1,
+            causal=False,
+        )
+
+    assert output is expected
+    assert prefill.call_args.kwargs["backend"] == "binary"
+    assert prefill.call_args.kwargs["binary_so_path"] == "/opt/tokenspeed/fmha.so"
+
+
+def test_tokenspeed_mla_cutedsl_prefill_keeps_explicit_warmup():
+    from tokenspeed.runtime.layers.attention.backends import (
+        tokenspeed_mla as backend_mod,
+    )
+
+    config = _tokenspeed_mla_config(prefill_backend="cutedsl")
+    with (
+        patch.dict(
+            backend_mod.global_server_args_dict,
+            {"kv_cache_dtype": "fp8_e4m3"},
+        ),
+        patch.object(
+            backend_mod,
+            "get_cutedsl_workspace_buffer",
+            return_value=torch.empty(1, dtype=torch.int8),
+        ),
+        patch.object(backend_mod, "has_binary_prefill") as has_binary,
+        patch.object(backend_mod, "warmup_compile_prefill") as warmup,
+    ):
+        backend_mod.CuteDSLMLABackend(config)
+
+    has_binary.assert_not_called()
+    warmup.assert_called_once()

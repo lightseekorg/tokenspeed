@@ -36,7 +36,6 @@ import torch.distributed
 
 from tokenspeed.runtime.moe.expert_location import ExpertLocationMetadata
 from tokenspeed.runtime.utils import Withable
-from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -675,7 +674,9 @@ class _DetailAccumulator(_UtilizationRateAccumulator):
             last_physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
         )
         _dump_to_file(
-            f"expert_distribution_recorder_{time.time()}_{self._rank}.pt", output
+            f"expert_distribution_recorder_{time.time()}_{self._rank}.pt",
+            output,
+            self._server_args.expert_distribution_recorder_output_dir,
         )
 
 
@@ -733,15 +734,19 @@ class _StatAccumulator(_UtilizationRateAccumulator):
 
         if output_mode == "file":
             if self._rank == 0:
-                _dump_to_file(f"expert_distribution_recorder_{time.time()}.pt", output)
+                _dump_to_file(
+                    f"expert_distribution_recorder_{time.time()}.pt",
+                    output,
+                    self._server_args.expert_distribution_recorder_output_dir,
+                )
         elif output_mode == "object":
             return output
         else:
             raise NotImplementedError
 
 
-def _dump_to_file(name, data):
-    save_dir = Path(envs.TOKENSPEED_EXPERT_DISTRIBUTION_RECORDER_DIR.get())
+def _dump_to_file(name, data, output_dir: str):
+    save_dir = Path(output_dir)
     path_output = save_dir / name
     logger.info("Write expert distribution to %s", path_output)
     if not save_dir.exists():

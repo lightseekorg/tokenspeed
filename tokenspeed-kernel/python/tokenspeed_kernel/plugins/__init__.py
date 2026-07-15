@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import importlib.metadata as importlib_metadata
 import logging
-import os
 import warnings
 from dataclasses import dataclass, field
 
@@ -40,12 +39,10 @@ from tokenspeed_kernel.registry import KernelRegistry
 logger = logging.getLogger(__name__)
 
 ENTRY_POINT_GROUP = "tokenspeed_kernel.plugins"
-DISABLE_ENV_VAR = "TOKENSPEED_KERNEL_DISABLE_PLUGINS"
 
 __all__ = [
     "PluginInfo",
     "ENTRY_POINT_GROUP",
-    "DISABLE_ENV_VAR",
     "discover_plugins",
     "list_plugins",
     "disable_plugin",
@@ -67,11 +64,6 @@ class PluginInfo:
 
 _loaded_plugins: dict[str, PluginInfo] = {}
 _disabled_plugins: set[str] = set()
-
-
-def _disabled_from_env() -> set[str]:
-    raw = os.environ.get(DISABLE_ENV_VAR, "")
-    return {part.strip() for part in raw.split(",") if part.strip()}
 
 
 def disable_plugin(name: str) -> None:
@@ -153,14 +145,19 @@ def _check_priority_collisions(
 def discover_plugins(*, force: bool = False) -> list[PluginInfo]:
     """Discover and load installed kernel plugins via entry points.
 
-    Plugins disabled via :func:`disable_plugin` or the
-    ``TOKENSPEED_KERNEL_DISABLE_PLUGINS`` env var are skipped.
+    Plugins disabled via :func:`disable_plugin` are skipped.
 
     Already-loaded plugins are skipped unless ``force=True``, in which case
     their ``register()`` is invoked again (useful for tests that reset the
     registry).
+
+    Args:
+        force: Reload plugins already tracked as loaded.
+
+    Returns:
+        Metadata for plugins loaded by this call.
     """
-    disabled = _disabled_plugins | _disabled_from_env()
+    disabled = _disabled_plugins
     registry = KernelRegistry.get()
     loaded: list[PluginInfo] = []
 

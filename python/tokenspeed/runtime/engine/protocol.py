@@ -208,13 +208,14 @@ class EngineClient(Protocol):
 
     async def start_profile(
         self,
-        output_dir: str | None = None,
+        output_dir: str | None = "/tmp",
         start_step: int | None = None,
         num_steps: int | None = None,
         activities: list[str] | None = None,
-        with_stack: bool | None = None,
-        record_shapes: bool | None = None,
+        with_stack: bool | None = True,
+        record_shapes: bool | None = False,
         profile_by_stage: bool = False,
+        profile_id: str | None = None,
     ) -> Any: ...
 
     async def stop_profile(self) -> Any: ...

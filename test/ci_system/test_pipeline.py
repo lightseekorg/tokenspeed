@@ -10,6 +10,7 @@ from pipeline import (
     STALE_PROCESS_PATTERNS,
     build_matrix,
     build_step_summary_lines,
+    build_workload_env,
     check_eval_score_threshold,
     check_perf_reference,
     check_server_log_patterns,
@@ -373,6 +374,48 @@ def test_excluded_runner_labels_parse_comma_separated_terms(monkeypatch):
 
     monkeypatch.delenv("TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS")
     assert get_excluded_runner_labels() == []
+
+
+def test_workload_env_removes_pipeline_controls_before_runtime_preflight(tmp_path):
+    from runtime_env_preflight import audit_environment
+
+    inherited = {
+        "HOME": str(tmp_path),
+        "PATH": "/usr/bin",
+        pipeline_module.B200_RUNNER_LABEL_ENV: "blackwell",
+        pipeline_module.EXCLUDED_RUNNER_LABELS_ENV: "b300",
+    }
+    task = {
+        "name": "runtime-preflight",
+        "type": "perf",
+        "env": {
+            "SAFE_TASK_SETTING": "kept",
+            pipeline_module.B200_RUNNER_LABEL_ENV: "task-override",
+            pipeline_module.EXCLUDED_RUNNER_LABELS_ENV: "task-override",
+        },
+        "runner": {
+            "labels": ["h100-1gpu"],
+            "env": {
+                # Runner-specific task configuration is merged last and must
+                # not be able to reintroduce matrix-scan controls either.
+                "h100-1gpu": {
+                    pipeline_module.B200_RUNNER_LABEL_ENV: "runner-override",
+                    pipeline_module.EXCLUDED_RUNNER_LABELS_ENV: "runner-override",
+                }
+            },
+        },
+    }
+
+    workload_env = build_workload_env(
+        task,
+        "h100-1gpu",
+        inherited_env=inherited,
+    )
+
+    assert workload_env["SAFE_TASK_SETTING"] == "kept"
+    assert pipeline_module.B200_RUNNER_LABEL_ENV not in workload_env
+    assert pipeline_module.EXCLUDED_RUNNER_LABELS_ENV not in workload_env
+    assert audit_environment(workload_env, home=tmp_path)["ok"] is True
 
 
 def test_extract_evalscope_score_from_pipe_table():

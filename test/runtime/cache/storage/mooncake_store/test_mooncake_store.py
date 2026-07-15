@@ -25,9 +25,9 @@
 import uuid
 
 import torch
-from mooncake_store import MooncakeStore
 
 from tokenspeed.runtime.cache.kvstore_storage import KVStoreStorageConfig
+from tokenspeed.runtime.cache.storage.mooncake_store.mooncake_store import MooncakeStore
 from tokenspeed.runtime.utils import get_colorful_logger
 
 # logging.basicConfig(
@@ -77,14 +77,14 @@ def create_mock_host_kv_cache(buffer_size, dtype=torch.float32):
     return MockHostKVCache(buffer), buffer
 
 
-def test_single_operation():
+def test_single_operation(mooncake_storage_config):
     """Test the set API with a single key-value pair."""
     print("=" * 100)
     print("Testing single operation")
 
     buffer_size = 1024 * 1024 * 16  # 16MB
     value_elements = 1024
-    store = MooncakeStore()
+    store = MooncakeStore(mooncake_storage_config)
     mock_host_kv_cache, buffer = create_mock_host_kv_cache(buffer_size)
 
     # Register the memory pool host - this is the proper workflow
@@ -117,22 +117,24 @@ def test_single_operation():
     logger.info(f"✅ Single operation passed")
 
 
-def test_batch_operation(config: KVStoreStorageConfig):
+def test_batch_operation(mooncake_storage_config: KVStoreStorageConfig):
     """Test the batch set/get APIs with multiple key-value pairs."""
     print("=" * 100)
-    print(f"Testing batch operation with config: {config}")
+    print(f"Testing batch operation with config: {mooncake_storage_config}")
 
     buffer_size = 1024 * 1024 * 16  # 16MB
     value_elements = 256
     kv_num = 13
-    store = MooncakeStore(config)
+    store = MooncakeStore(mooncake_storage_config)
     mock_host_kv_cache, buffer = create_mock_host_kv_cache(buffer_size)
 
     store.register_mem_pool_host(mock_host_kv_cache)
 
     value_size = value_elements * buffer.element_size()
 
-    set_keys, get_keys, exist_keys = generate_batch_query_keys(kv_num, config)
+    set_keys, get_keys, exist_keys = generate_batch_query_keys(
+        kv_num, mooncake_storage_config
+    )
     set_slices = [
         buffer[i * value_elements : (i + 1) * value_elements]
         for i in range(len(set_keys))
@@ -171,45 +173,3 @@ def test_batch_operation(config: KVStoreStorageConfig):
         ), f"❌batch get operation failed for key: {get_keys[i]}"
 
     logger.info(f"✅ Batch operation passed")
-
-
-if __name__ == "__main__":
-    test_single_operation()
-    test_batch_operation(
-        KVStoreStorageConfig(
-            is_mla_model=False,
-            tp_rank=0,
-            tp_size=1,
-            model_name=None,
-            is_page_first_layout=True,
-        )
-    )
-    test_batch_operation(
-        KVStoreStorageConfig(
-            is_mla_model=True,
-            tp_rank=0,
-            tp_size=1,
-            model_name=None,
-            is_page_first_layout=True,
-        )
-    )
-    test_batch_operation(
-        KVStoreStorageConfig(
-            is_mla_model=False,
-            tp_rank=1,
-            tp_size=4,
-            model_name=None,
-            is_page_first_layout=True,
-        )
-    )
-    test_batch_operation(
-        KVStoreStorageConfig(
-            is_mla_model=True,
-            tp_rank=3,
-            tp_size=8,
-            model_name=None,
-            is_page_first_layout=True,
-        )
-    )
-    logger.info(f"✅ All tests passed")
-    print("all passed")

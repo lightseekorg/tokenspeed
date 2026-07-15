@@ -76,27 +76,38 @@ logger = logging.getLogger(__name__)
 
 time_infos = {}
 
+DEFAULT_IMAGE_REQUEST_TIMEOUT_SECONDS = 3.0
+DEFAULT_AUDIO_REQUEST_TIMEOUT_SECONDS = 5.0
+
 
 _warned_bool_env_var_keys = set()
 
 
 def get_bool_env_var(name: str, default: str = "false") -> bool:
-    # Runtime env helpers still read a few legacy keys directly until the
-    # central env module owns all boolean parsing.
-    value = os.getenv(name, default)
+    """Read the two standard CI boolean contracts used by test tooling.
+
+    Product behavior must use typed configuration, so this deliberately is
+    not a general environment-variable reader.
+    """
+    if name == "CI":
+        value = os.getenv("CI", default)
+    elif name == "GITHUB_ACTIONS":
+        value = os.getenv("GITHUB_ACTIONS", default)
+    else:
+        raise ValueError(f"Unsupported environment boolean: {name}")
     value = value.lower()
 
     truthy_values = ("true", "1")
     falsy_values = ("false", "0")
 
     if (value not in truthy_values) and (value not in falsy_values):
-        if value not in _warned_bool_env_var_keys:
+        if name not in _warned_bool_env_var_keys:
             logger.warning(
                 "get_bool_env_var(%s) see non-understandable value=%s and treat as false",
                 name,
                 value,
             )
-        _warned_bool_env_var_keys.add(value)
+        _warned_bool_env_var_keys.add(name)
 
     return value in truthy_values
 
@@ -244,13 +255,14 @@ def _load_image(
     image_bytes: bytes = b"",
     image_file: str = "",
     gpu_image_decode: bool = True,
+    request_timeout: float = DEFAULT_IMAGE_REQUEST_TIMEOUT_SECONDS,
 ) -> torch.Tensor | Image.Image:
     """
     Try to decode JPEG with nvJPEG on GPU and return a torch device tensor,
     otherwise fallback to decode with PIL on CPU and return a PIL Image.
     """
     if image_file != "":
-        image_bytes = get_image_bytes(image_file)
+        image_bytes = get_image_bytes(image_file, request_timeout=request_timeout)
     if is_jpeg_with_cuda(image_bytes, gpu_image_decode):
         try:
             from torchvision.io import decode_jpeg
@@ -268,6 +280,8 @@ def _load_image(
 def load_image(
     image_file: Image.Image | str | ImageData | bytes,
     gpu_image_decode: bool = True,
+    *,
+    request_timeout: float = DEFAULT_IMAGE_REQUEST_TIMEOUT_SECONDS,
 ) -> tuple[torch.Tensor | Image.Image, tuple[int, int] | None]:
     """
     Load image from multiple input formats, including:
@@ -282,35 +296,59 @@ def load_image(
         image = image_file
         image_size = (image.width, image.height)
     elif isinstance(image_file, bytes):
-        image = _load_image(image_bytes=image_file, gpu_image_decode=gpu_image_decode)
+        image = _load_image(
+            image_bytes=image_file,
+            gpu_image_decode=gpu_image_decode,
+            request_timeout=request_timeout,
+        )
     elif isinstance(image_file, str) and image_file.startswith(("http://", "https://")):
-        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
+        image = _load_image(
+            image_file=image_file,
+            gpu_image_decode=gpu_image_decode,
+            request_timeout=request_timeout,
+        )
     elif isinstance(image_file, str) and image_file.startswith("file://"):
         image = _load_image(
             image_file=unquote(urlparse(image_file).path),
             gpu_image_decode=gpu_image_decode,
+            request_timeout=request_timeout,
         )
     elif isinstance(image_file, str) and image_file.lower().endswith(
         image_extension_names
     ):
-        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
+        image = _load_image(
+            image_file=image_file,
+            gpu_image_decode=gpu_image_decode,
+            request_timeout=request_timeout,
+        )
     elif isinstance(image_file, str) and image_file.startswith("data:"):
-        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
+        image = _load_image(
+            image_file=image_file,
+            gpu_image_decode=gpu_image_decode,
+            request_timeout=request_timeout,
+        )
     elif isinstance(image_file, str):
-        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
+        image = _load_image(
+            image_file=image_file,
+            gpu_image_decode=gpu_image_decode,
+            request_timeout=request_timeout,
+        )
     else:
         raise ValueError(f"Invalid image: {image_file}")
 
     return image, image_size
 
 
-def get_image_bytes(image_file: str | bytes) -> bytes:
+def get_image_bytes(
+    image_file: str | bytes,
+    *,
+    request_timeout: float = DEFAULT_IMAGE_REQUEST_TIMEOUT_SECONDS,
+) -> bytes:
     """Normalize various image inputs into raw bytes."""
     if isinstance(image_file, bytes):
         return image_file
     if image_file.startswith(("http://", "https://")):
-        timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
-        response = requests.get(image_file, timeout=timeout)
+        response = requests.get(image_file, timeout=request_timeout)
         try:
             response.raise_for_status()
             result = response.content
@@ -338,6 +376,8 @@ def load_audio(
     audio_file: str | bytes,
     sr: int | None = None,
     mono: bool = True,
+    *,
+    request_timeout: float = DEFAULT_AUDIO_REQUEST_TIMEOUT_SECONDS,
 ) -> np.ndarray:
     # Use soundfile directly; librosa delegates to it and is moving away from
     # audio loading support.
@@ -355,8 +395,7 @@ def load_audio(
             BytesIO(pybase64.b64decode(encoded, validate=True))
         )
     elif audio_file.startswith(("http://", "https://")):
-        timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
-        response = requests.get(audio_file, stream=True, timeout=timeout)
+        response = requests.get(audio_file, stream=True, timeout=request_timeout)
         try:
             response.raise_for_status()
             audio, original_sr = sf.read(BytesIO(response.content))

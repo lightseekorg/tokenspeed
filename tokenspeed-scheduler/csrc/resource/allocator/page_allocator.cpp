@@ -22,7 +22,6 @@
 #include "resource/allocator/page_allocator.h"
 
 #include <algorithm>
-#include <cstdlib>
 #include <utility>
 
 #include <spdlog/spdlog.h>
@@ -43,7 +42,7 @@ OwnedPages PageAllocator::Allocate(std::int32_t num_pages) {
         return {};
     }
     std::vector<std::int32_t> pages;
-    if (std::getenv("DEBUG_MEM")) {
+    if (spdlog::should_log(spdlog::level::debug)) {
         spdlog::debug("Free Pages Before Allocate: {}", free_pages_.size());
     }
     pages.reserve(static_cast<std::size_t>(num_pages));
@@ -51,7 +50,7 @@ OwnedPages PageAllocator::Allocate(std::int32_t num_pages) {
         pages.push_back(free_pages_.back());
         free_pages_.pop_back();
     }
-    if (std::getenv("DEBUG_MEM")) {
+    if (spdlog::should_log(spdlog::level::debug)) {
         spdlog::debug("Free Pages After Allocate: {}", free_pages_.size());
         spdlog::debug("Allocated pages: [{}]", fmt::join(pages, ", "));
     }
@@ -59,12 +58,12 @@ OwnedPages PageAllocator::Allocate(std::int32_t num_pages) {
 }
 
 void PageAllocator::Deallocate(const std::vector<std::int32_t>& pages) {
-    if (std::getenv("DEBUG_MEM")) {
+    if (spdlog::should_log(spdlog::level::debug)) {
         spdlog::debug("Pages to Deallocate: [{}]", fmt::join(pages, ", "));
         spdlog::debug("Free Pages Before Deallocate: {}", free_pages_.size());
     }
     free_pages_.insert(free_pages_.end(), pages.begin(), pages.end());
-    if (std::getenv("DEBUG_MEM")) {
+    if (spdlog::should_log(spdlog::level::debug)) {
         spdlog::debug("Free Pages After Deallocate: {}", free_pages_.size());
     }
 }

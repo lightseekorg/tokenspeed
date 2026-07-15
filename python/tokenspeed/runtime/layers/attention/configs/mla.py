@@ -20,7 +20,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -41,6 +41,14 @@ class MLAConfig(BaseAttnConfig):
     v_head_dim: int
     scaling: float
     kv_cache_dim: int
+    tokenspeed_mla_prefill_backend: str = field(
+        default="cutedsl",
+        kw_only=True,
+    )
+    tokenspeed_mla_prefill_binary_so_path: str | None = field(
+        default=None,
+        kw_only=True,
+    )
 
     @classmethod
     def generate(
@@ -78,6 +86,10 @@ class MLAConfig(BaseAttnConfig):
             v_head_dim=model_config.v_head_dim,
             scaling=model_config.scaling,
             kv_cache_dim=model_config.kv_lora_rank + model_config.qk_rope_head_dim,
+            tokenspeed_mla_prefill_backend=(server_args.tokenspeed_mla_prefill_backend),
+            tokenspeed_mla_prefill_binary_so_path=(
+                server_args.tokenspeed_mla_prefill_binary_so_path
+            ),
             **kwargs,
         )
 

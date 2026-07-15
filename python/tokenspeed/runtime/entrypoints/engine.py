@@ -83,7 +83,6 @@ from tokenspeed.runtime.utils import (
     set_prometheus_multiproc_dir,
     set_ulimit,
 )
-from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.process import kill_process_tree
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -446,15 +445,14 @@ def _set_envs_and_config(server_args: ServerArgs):
     # Set global environments
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
     os.environ["NCCL_CUMEM_ENABLE"] = str(int(server_args.enable_symm_mem))
-    if not server_args.enable_symm_mem:
-        os.environ["NCCL_NVLS_ENABLE"] = str(int(server_args.enable_nccl_nvls))
+    os.environ["NCCL_NVLS_ENABLE"] = str(
+        int(server_args.enable_nccl_nvls or server_args.enable_symm_mem)
+    )
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
     os.environ["CUDA_MODULE_LOADING"] = "AUTO"
-    if not server_args.disable_tf32:
-        # Force TF32 on for cuBLAS/cuDNN matmuls. setdefault so a user's
-        # explicit env wins; --disable-tf32 is the documented opt-out.
-        os.environ.setdefault("NVIDIA_TF32_OVERRIDE", "1")
-        os.environ.setdefault("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", "1")
+    tf32_enabled = str(int(not server_args.disable_tf32))
+    os.environ["NVIDIA_TF32_OVERRIDE"] = tf32_enabled
+    os.environ["TORCH_ALLOW_TF32_CUBLAS_OVERRIDE"] = tf32_enabled
 
     # Set prometheus env vars
     if server_args.enable_metrics:
@@ -553,7 +551,7 @@ def _launch_subprocesses(
                     "Initialization failed. Please see the error messages above."
                 )
 
-        if not envs.TOKENSPEED_BLOCK_NONZERO_RANK_CHILDREN.get():
+        if not server_args.block_nonzero_rank_children:
             # When using `Engine` as a Python API, we don't want to block here.
             return None, None, None
 

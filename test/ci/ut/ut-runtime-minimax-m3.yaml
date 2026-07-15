@@ -23,6 +23,9 @@ ut:
       test/runtime/distributed/test_process_group_manager.py
       test/runtime/test_cli_config_compat.py
       test/runtime/test_explicit_runtime_flags.py
+      test/runtime/test_logging.py
+      test/runtime/test_request_handler_profile.py
+      test/runtime/cache/storage/mooncake_store/test_mooncake_store_config.py
       test/runtime/test_event_loop_overlap_terminal.py
       test/runtime/test_generation_output_processor.py::test_prefill_first_token_checks_spec_candidate_bootstrap
       test/runtime/test_kv_cache_scales_loader.py
@@ -35,6 +38,8 @@ ut:
       test/quality_benchmark/tokenspeed/test_minimax_m3_fixed_reference.py
       test/random_benchmark/tokenspeed/test_collect_outputs.py
       test/ci_system/test_fetch_minimax_m3_mm_fixtures.py
+      test/ci_system/test_cuda_coredump.py
+      test/ci_system/test_product_env_guard.py
       test/ci_system/test_runtime_env_preflight.py
       test/ci_system/test_minimax_m3_gsm8k.py
       test/ci_system/test_minimax_m3_exact_longctx.py
@@ -44,6 +49,10 @@ ut:
       python3 -m pytest -q
       tokenspeed-kernel/test/ops/test_minimax_m3_msa.py
       tokenspeed-kernel/test/test_mha_fp8_cache_scaling.py
+      tokenspeed-kernel/test/test_nccl_config.py
+      tokenspeed-kernel/test/test_plugins.py
+      tokenspeed-kernel/test/test_profiling.py
+    - python3 -m pytest -q tokenspeed-mla/tests/test_explicit_config.py
     - >-
       python3 -m pytest -q
       tokenspeed-kernel/test/ops/test_mxfp8_gemm.py

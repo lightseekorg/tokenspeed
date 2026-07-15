@@ -56,7 +56,6 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     cache_event_from_payload,
     cache_event_key,
     cache_event_to_payload,
-    cache_sync_debug_enabled,
     make_config,
     pool_to_paged_cache_groups,
     pool_to_prefix_cache_adjunct_spec,
@@ -439,6 +438,7 @@ class EventLoop:
             mamba_l2_host_slots=mamba_l2_host_slots,
             paged_cache_groups=paged_cache_groups,
             enable_mixed_prefill_decode=server_args.enable_mixed_batch,
+            enable_memory_debug_checks=server_args.scheduler_memory_debug_checks,
             prefix_cache_adjunct=prefix_cache_adjunct,
         )
         logger.info(
@@ -567,6 +567,7 @@ class EventLoop:
                 app_key=server_args.app_key,
                 metrics_reporters=server_args.metrics_reporters,
                 enable_dp_attention=self.has_dp,
+                advertised_host=server_args.disaggregation_advertised_host,
                 runtime_config=server_args.disaggregation_config,
             )
             self.kv_transfer = create_kv_transfer(
@@ -824,21 +825,6 @@ class EventLoop:
                 group=self.attn_tp_cpu_group,
             )
             ready_payloads = pop_common_cache_event_payloads(gathered_payloads)
-            if self.attn_tp_rank == 0 and cache_sync_debug_enabled():
-                pending_ops = [
-                    [(payload["kind"], payload["op_id"]) for payload in rank_payloads]
-                    for rank_payloads in gathered_payloads
-                ]
-                if len({tuple(rank_ops) for rank_ops in pending_ops}) > 1:
-                    logger.info(
-                        "[cache_sync] rank=%s pending_ops=%s ready_ops=%s",
-                        self.global_rank,
-                        pending_ops,
-                        [
-                            (payload["kind"], payload["op_id"])
-                            for payload in ready_payloads
-                        ],
-                    )
 
         for payload in ready_payloads:
             self._pending_cache_event_payloads.pop(cache_event_key(payload), None)

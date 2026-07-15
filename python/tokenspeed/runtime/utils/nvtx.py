@@ -20,7 +20,7 @@
 
 """Zero-overhead NVTX range wrapper.
 
-Off by default. Enable via `--enable-nvtx` or `TOKENSPEED_NVTX=1`.
+Off by default. Enable via the explicit ``--enable-nvtx`` server argument.
 `nvtx_range(...)` is dual-purpose — context manager or decorator:
 
     @nvtx_range("forward", color="blue")
@@ -39,8 +39,6 @@ import functools
 
 from tokenspeed_kernel.platform import current_platform
 
-from tokenspeed.runtime.utils.env import envs
-
 if current_platform().is_nvidia:
     import nvtx
     from nvtx.colors import _NVTX_COLORS
@@ -56,7 +54,7 @@ NVTX_DOMAIN: str = "tokenspeed"
 _VALID_COLORS = frozenset(c for c in _NVTX_COLORS if c is not None)
 
 _nvtx_available = nvtx is not None
-_enabled: bool = _nvtx_available and envs.TOKENSPEED_NVTX.get()
+_enabled = False
 
 
 def set_nvtx_enabled(enabled: bool) -> None:

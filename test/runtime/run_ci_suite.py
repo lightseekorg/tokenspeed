@@ -182,6 +182,7 @@ def run_a_suite(args):
         enable_retry=args.enable_retry,
         max_attempts=args.max_attempts,
         retry_wait_seconds=args.retry_wait_seconds,
+        cuda_coredump_dir=args.cuda_coredump_dir,
     )
 
 
@@ -245,6 +246,14 @@ def main():
         type=int,
         default=600,
         help="Additional timeout in seconds when retry is enabled (default: 600).",
+    )
+    parser.add_argument(
+        "--cuda-coredump-dir",
+        default=None,
+        help=(
+            "Explicitly enable lightweight NVIDIA CUDA exception dumps and "
+            "write them below this directory."
+        ),
     )
     args = parser.parse_args()
 

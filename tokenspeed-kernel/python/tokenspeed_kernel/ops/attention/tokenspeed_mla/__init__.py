@@ -25,6 +25,7 @@ from tokenspeed_kernel.registry import error_fn
 try:
     from tokenspeed_mla import (
         get_num_sm,
+        has_binary_prefill,
         mla_kv_pack_quantize_fp8,
         tokenspeed_mla_decode,
         tokenspeed_mla_prefill,
@@ -32,6 +33,7 @@ try:
     )
 except ImportError:
     get_num_sm = error_fn
+    has_binary_prefill = error_fn
     mla_kv_pack_quantize_fp8 = error_fn
     tokenspeed_mla_decode = error_fn
     tokenspeed_mla_prefill = error_fn
@@ -39,6 +41,7 @@ except ImportError:
 
 __all__ = [
     "get_num_sm",
+    "has_binary_prefill",
     "mla_kv_pack_quantize_fp8",
     "tokenspeed_mla_decode",
     "tokenspeed_mla_prefill",

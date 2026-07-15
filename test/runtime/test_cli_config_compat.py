@@ -337,11 +337,64 @@ print(server_args.mapping.attn.tp_size, server_args.mapping.attn.cp_size)
         args = self._parse_args(["--model", "test/model", "--max-num-seqs", "256"])
         self.assertEqual(args.max_num_seqs, 256)
 
-    def test_dp_sampling_backend_arg_removed(self):
+    def test_dp_sampling_backend_remains_an_internal_auto_policy(self):
+        # The original DP-sampling change deliberately rejected this CLI.
+        # Keep one stable automatic production policy instead of replacing its
+        # removed public surface with an environment override.
         with self.assertRaises(SystemExit):
             self._parse_args(
                 ["--model", "test/model", "--dp-sampling-backend", "onesided"]
             )
+
+    def test_nonzero_rank_child_lifecycle_is_explicit(self):
+        default_args = self._parse_args(["--model", "test/model"])
+        embedded_args = self._parse_args(
+            ["--model", "test/model", "--no-block-nonzero-rank-children"]
+        )
+
+        self.assertTrue(default_args.block_nonzero_rank_children)
+        self.assertFalse(embedded_args.block_nonzero_rank_children)
+
+    def test_disaggregation_advertised_host_is_explicit(self):
+        args = self._parse_args(
+            [
+                "--model",
+                "test/model",
+                "--disaggregation-advertised-host",
+                "203.0.113.7",
+            ]
+        )
+        server_args = self._from_cli_args_no_init(args)
+
+        self.assertEqual(
+            server_args.disaggregation_advertised_host,
+            "203.0.113.7",
+        )
+
+    def test_scheduler_memory_debug_checks_are_explicit(self):
+        default_args = self._parse_args(["--model", "test/model"])
+        debug_args = self._parse_args(
+            ["--model", "test/model", "--scheduler-memory-debug-checks"]
+        )
+
+        self.assertFalse(default_args.scheduler_memory_debug_checks)
+        self.assertTrue(debug_args.scheduler_memory_debug_checks)
+
+    def test_expert_recorder_output_directory_is_explicit(self):
+        args = self._parse_args(
+            [
+                "--model",
+                "test/model",
+                "--expert-distribution-recorder-output-dir",
+                "/var/tmp/expert-records",
+            ]
+        )
+        server_args = self._from_cli_args_no_init(args)
+
+        self.assertEqual(
+            server_args.expert_distribution_recorder_output_dir,
+            "/var/tmp/expert-records",
+        )
 
     def test_max_prefill_tokens_arg(self):
         args = self._parse_args(
@@ -427,6 +480,40 @@ print(server_args.mapping.attn.tp_size, server_args.mapping.attn.cp_size)
                 ["--model", "test/model", "--sampling-backend", backend]
             )
             self.assertEqual(args.sampling_backend, backend)
+
+    def test_tokenspeed_mla_prefill_backend_is_explicit(self):
+        args = self._parse_args(
+            [
+                "--model",
+                "test/model",
+                "--tokenspeed-mla-prefill-backend",
+                "binary",
+                "--tokenspeed-mla-prefill-binary-so-path",
+                "/opt/tokenspeed/fmha.so",
+            ]
+        )
+        server_args = self._from_cli_args_no_init(args)
+        server_args.resolve_kernel_backends()
+
+        self.assertEqual(server_args.tokenspeed_mla_prefill_backend, "binary")
+        self.assertEqual(
+            server_args.tokenspeed_mla_prefill_binary_so_path,
+            "/opt/tokenspeed/fmha.so",
+        )
+
+    def test_tokenspeed_mla_binary_path_requires_binary_backend(self):
+        args = self._parse_args(
+            [
+                "--model",
+                "test/model",
+                "--tokenspeed-mla-prefill-binary-so-path",
+                "/opt/tokenspeed/fmha.so",
+            ]
+        )
+        server_args = self._from_cli_args_no_init(args)
+
+        with self.assertRaisesRegex(ValueError, "requires.*backend binary"):
+            server_args.resolve_kernel_backends()
 
     def test_all2all_backend_arg(self):
         args = self._parse_args(

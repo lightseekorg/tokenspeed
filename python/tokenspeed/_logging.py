@@ -19,7 +19,6 @@
 # SOFTWARE.
 
 import logging
-import os
 import warnings
 from importlib import import_module
 
@@ -86,8 +85,6 @@ def _suppress_flash_attn_jit_cache_debug_log():
 
 
 def suppress_noisy_third_party_logs():
-    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
-    os.environ.setdefault("TLLM_LOG_LEVEL", "WARNING")
     _suppress_cutlass_dsl_warnings()
 
     for logger_name in (

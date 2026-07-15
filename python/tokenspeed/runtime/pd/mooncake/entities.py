@@ -239,3 +239,4 @@ class KVManagerArgs:
     runtime_config: DisaggregationRuntimeConfig = dataclasses.field(
         default_factory=DisaggregationRuntimeConfig
     )
+    advertised_host: str | None = None

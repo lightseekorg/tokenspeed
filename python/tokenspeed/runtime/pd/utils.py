@@ -241,13 +241,18 @@ class PDRegistryRequest:
 
 
 def register_disaggregation_server(
-    mode: str, server_port: int, bootstrap_port: int, pdlb_url: str
+    mode: str,
+    server_port: int,
+    bootstrap_port: int,
+    pdlb_url: str,
+    *,
+    advertised_host: str | None = None,
 ):
     pdlb_url = pdlb_url.rstrip("/")
     registered_bootstrap_port = bootstrap_port if mode == "prefill" else None
     registry_request = PDRegistryRequest(
         mode=mode,
-        registry_url=f"http://{get_ip()}:{server_port}",
+        registry_url=f"http://{get_ip(advertised_host)}:{server_port}",
         bootstrap_port=registered_bootstrap_port,
     )
     res = requests.post(

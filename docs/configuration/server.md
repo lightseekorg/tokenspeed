@@ -4,6 +4,13 @@ This page documents the parameters operators usually set directly. TokenSpeed
 uses familiar serving parameter names where the semantics match and keeps
 TokenSpeed-specific knobs for runtime features with different meaning.
 
+First-party runtime behavior is configured through typed CLI, config, or Python
+API values. TokenSpeed does not use product environment variables as a second
+configuration channel. A small reviewed boundary remains for external
+protocols such as authentication, distributed-launch ranks, Prometheus, and
+vendor libraries; CI enforces that boundary by exact source path, variable
+name, and read/write direction.
+
 For a compact compatibility table, see
 [Compatible Parameters](./compatible-parameters.md).
 
@@ -75,6 +82,7 @@ file are present.
 | `--max-total-tokens` | Override the automatically calculated token pool size. |
 | `--block-size` | KV cache block size. |
 | `--enable-prefix-caching` / `--no-enable-prefix-caching` | Enable or disable prefix cache reuse. |
+| `--scheduler-memory-debug-checks` | Run expensive scheduler device-memory consistency checks. Disabled by default; use only for diagnosis. |
 | `--enforce-eager` | Disable language-model CUDA Graph execution. An explicitly enabled multimodal encoder graph remains independent. |
 | `--max-cudagraph-capture-size` | Largest batch size to capture with CUDA graphs. |
 | `--cudagraph-capture-sizes` | Explicit CUDA graph capture sizes. |
@@ -88,6 +96,39 @@ test; there is no separate CI-only KV-size environment override.
 Longer-context override is an explicit CLI setting with no environment-variable
 alias. Enable it only when the checkpoint is known to support the requested
 length; an invalid override can produce incorrect output or CUDA errors.
+
+### Mooncake KV Storage
+
+Mooncake storage is configured through
+`--kvstore-storage-backend-extra-config`; TokenSpeed does not read Mooncake or
+host-name environment variables. The smallest inline configuration names the
+Mooncake master explicitly:
+
+```bash
+--kvstore-storage-backend mooncake \
+--kvstore-storage-backend-extra-config \
+'{"master_server_address":"10.0.0.1:50051"}'
+```
+
+Inline fields are `local_hostname` (default `localhost`), `metadata_server`
+(default `P2PHANDSHAKE`), `global_segment_size` (default 4 GiB), `protocol`
+(default `tcp`), `device_name` (default empty), `master_metrics_port` (default
+`9003`), `check_server` (default `false`), and the optional key-prefix
+`extra_backend_tag`. `master_server_address` has no default and is always
+required.
+
+For a checked-in or mounted JSON document, pass an explicit path inside the
+same argument:
+
+```bash
+--kvstore-storage-backend-extra-config \
+'{"config_path":"/etc/tokenspeed/mooncake.json"}'
+```
+
+`config_path` and inline Mooncake fields are mutually exclusive. Missing,
+unknown, or ill-typed settings fail startup instead of falling back to process
+environment state. `global_segment_size=0` remains a supported registered-host-
+buffer-only mode; negative sizes are rejected.
 
 ## Parallelism
 
@@ -106,6 +147,7 @@ length; an invalid override can produce incorrect output or CUDA errors.
 | `--nnodes` | Number of nodes. |
 | `--node-rank` | Rank of the current node. |
 | `--dist-init-addr` | Distributed initialization address. |
+| `--block-nonzero-rank-children` / `--no-block-nonzero-rank-children` | Keep non-zero-rank launcher processes alive after workers become ready. Enabled by default; disable only when an embedding API owns those workers' lifecycle. |
 | `--base-gpu-id` | First local GPU index assigned to the server. |
 | `--gpu-id-step` | Distance between assigned local GPU indices. For example, base `0` and step `2` selects `0,2,4,...`. |
 | `--enable-numa-aware-worker-affinity` / `--no-enable-numa-aware-worker-affinity` | Enable or disable NVIDIA worker pinning to the GPU-local CPU set. Enabled by default. |
@@ -126,12 +168,20 @@ read `ENABLE_CP` from the process environment.
 | `--moe-backend` | MoE backend. |
 | `--draft-moe-backend` | MoE backend for the speculative decoding draft model. |
 | `--all2all-backend` | MoE all-to-all backend. |
+| `--tokenspeed-mla-prefill-backend` | TokenSpeed MLA prefill implementation: `cutedsl` (default) or `binary`. |
+| `--tokenspeed-mla-prefill-binary-so-path` | Optional custom AOT module path for the TokenSpeed MLA binary prefill backend. |
 | `--deepep-mode` | DeepEP mode: `auto`, `normal`, or `low_latency`. |
 | `--sampling-backend` | Sampling backend: `greedy`, `flashinfer`, `flashinfer_full`, `triton`, or `triton_full`. |
 
 Set backend choices explicitly in production. `auto` is useful for bring-up, but
 explicit values make benchmark comparisons and regressions easier to reason
 about.
+
+The TokenSpeed MLA binary prefill backend is fail-closed: select it explicitly,
+and optionally provide a custom `.so` path. Each worker verifies that the
+packaged or custom module is loadable during backend initialization; CuTe DSL
+prefill warmup is skipped in that mode. A custom path is rejected with the
+default `cutedsl` selection.
 
 FlashInfer's generic workspace reservation is a stable runtime constant.
 Kernel-selection experiments use the explicit `override=` argument,
@@ -175,7 +225,12 @@ image items only; video items are rejected.
 
 When `--dp-sampling` is enabled, the logits processor owns the per-forward
 logits layout decision and carries the resulting plan to the sampling backend
-with the logits output.
+with the logits output. Its communication backend follows a stable automatic
+policy; there is no environment override.
+
+Remote image and audio helpers use explicit Python API timeouts, defaulting to
+3 and 5 seconds respectively. Callers that need different limits pass
+`request_timeout=` directly; process environment state is not consulted.
 
 ## PD and EPD Transport
 
@@ -184,6 +239,7 @@ settings has an environment-variable alias.
 
 | Parameter | Purpose |
 | --- | --- |
+| `--disaggregation-advertised-host` | Host or address that a prefill node advertises to decode peers. When omitted, TokenSpeed discovers the local address. |
 | `--disaggregation-queue-size` | Number of room-affine transfer queues. Defaults to `4`. |
 | `--disaggregation-thread-pool-size` | Total transfer worker threads. When omitted, TokenSpeed derives a bounded value from the available CPUs. |
 | `--disaggregation-bootstrap-timeout` | Bootstrap registration timeout in seconds. Defaults to `120`. |
@@ -266,6 +322,7 @@ draft model, and token count together.
 | `--log-requests-level` | Request logging verbosity. |
 | `--enable-log-request-stats` | Log a one-line per-request performance summary on finish/abort (see below). |
 | `--enable-log-mm-timing` | Log detailed multimodal SHM, encoder, embedding, and forward timings. |
+| `--expert-distribution-recorder-output-dir` | Directory for expert-distribution recorder dumps. Defaults to `/tmp`. |
 | `--enable-metrics` | Enable metrics reporting. |
 | `--metrics-reporters` | Metrics reporter, such as `prometheus`. |
 | `--decode-log-interval` | Decode batch log interval. |
@@ -276,6 +333,32 @@ draft model, and token count together.
 It is an explicit per-server setting; environment variables do not enable it.
 The encoder timing path may synchronize CUDA, so leave it disabled for normal
 throughput measurements.
+
+### On-Demand Profiling
+
+`/start_profile` accepts profiling configuration in its request body. Defaults
+are explicit and stable: `output_dir` is `/tmp`, `with_stack` is `true`,
+and `record_shapes` is `false`. Existing request fields are `output_dir`,
+`start_step`, `num_steps`, `activities`, `with_stack`, `record_shapes`, and
+`profile_by_stage`; internal clients may also provide a `profile_id` for output
+names. TokenSpeed does not merge profiler environment variables into the request.
+`profile_by_stage=true` requires `num_steps` and cannot be combined with
+`start_step`, because stage-based counting starts at the next eligible batch.
+
+For example:
+
+```json
+{
+  "activities": ["PROTON"],
+  "output_dir": "/var/log/tokenspeed/profiles",
+  "with_stack": true
+}
+```
+
+Proton cannot share CUPTI/roctracer with the torch GPU or CUDA profilers in one
+request. Invalid profiler values are rejected before any profiling state is
+started. Proton uses `ProfilingConfig` defaults, and VizTracer's minimum event
+duration is a stable 100 microseconds; neither is an additional request field.
 
 Model execution always enters `torch.inference_mode`; this is a stable runtime
 policy rather than an operator-controlled environment switch. The detokenizer

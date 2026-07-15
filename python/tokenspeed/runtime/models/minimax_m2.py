@@ -76,7 +76,7 @@ from tokenspeed.runtime.utils import (
     add_prefix,
     set_weight_attrs,
 )
-from tokenspeed.runtime.utils.env import envs, global_server_args_dict
+from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 logger = logging.getLogger(__name__)
@@ -425,9 +425,6 @@ class _MinimaxARWorkspace:
 _minimax_ar_workspace = _MinimaxARWorkspace()
 
 
-_FORCE_TRITON_AR_RMSNORM = envs.TOKENSPEED_MINIMAX_AR_USE_TRITON.get()
-
-
 def fused_qk_rmsnorm(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -441,11 +438,9 @@ def fused_qk_rmsnorm(
     eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Route to the Lamport fused-AR QK RMSNorm kernel when its shape
-    constraints hold, else fall back to the Triton sumsq/apply path.
-    Setting TOKENSPEED_MINIMAX_AR_USE_TRITON=1 forces the Triton path (A/B debug)."""
+    constraints hold, else fall back to the portable Triton sumsq/apply path."""
     if (
-        not _FORCE_TRITON_AR_RMSNORM
-        and q_weight_bf16 is not None
+        q_weight_bf16 is not None
         and k_weight_bf16 is not None
         and _minimax_fast_path_available(q, k, tp_size)
     ):

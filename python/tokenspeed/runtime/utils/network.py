@@ -23,7 +23,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import socket
 import warnings
 
@@ -92,12 +91,21 @@ def get_local_ip_by_remote() -> str | None:
         raise ValueError("Can not get local ip")
 
 
-def get_ip() -> str:
-    from tokenspeed.runtime.utils.env import envs
+def get_ip(advertised_host: str | None = None) -> str:
+    """Return an explicit advertised host or discover this machine's IP.
 
-    host_ip = envs.TOKENSPEED_HOST_IP.get() or os.getenv("HOST_IP", "")
-    if host_ip:
-        return host_ip
+    Args:
+        advertised_host: Host/IP to publish to peers. ``None`` performs local
+            discovery; process environment variables are never consulted.
+
+    Returns:
+        The explicit host, a discovered local IP, or ``0.0.0.0`` when
+        discovery fails.
+    """
+    if advertised_host is not None:
+        if not isinstance(advertised_host, str) or not advertised_host.strip():
+            raise ValueError("advertised_host must be a non-empty string")
+        return advertised_host.strip()
 
     try:
         hostname = socket.gethostname()
@@ -122,9 +130,8 @@ def get_ip() -> str:
         pass
 
     warnings.warn(
-        "Failed to get the IP address, using 0.0.0.0 by default."
-        "The value can be set by the environment variable"
-        " TOKENSPEED_HOST_IP or HOST_IP.",
+        "Failed to get the IP address, using 0.0.0.0 by default. Pass an "
+        "explicit advertised_host when automatic discovery is unsuitable.",
         stacklevel=2,
     )
     return "0.0.0.0"

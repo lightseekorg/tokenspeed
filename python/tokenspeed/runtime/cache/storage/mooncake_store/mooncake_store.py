@@ -20,10 +20,10 @@
 
 import json
 import logging
-import os
 import time
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import requests
@@ -35,18 +35,38 @@ from tokenspeed.runtime.cache.kvstore_storage import (
     KVStoreStorageConfig,
     KVStoreStorageExtraInfo,
 )
-from tokenspeed.runtime.utils.env import envs
 
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
 SETUP_TIMEOUT = 600  # 10min
+DEFAULT_LOCAL_HOSTNAME = "localhost"
+DEFAULT_METADATA_SERVER = "P2PHANDSHAKE"
+DEFAULT_GLOBAL_SEGMENT_SIZE = 4 * 1024 * 1024 * 1024
+DEFAULT_PROTOCOL = "tcp"
+DEFAULT_DEVICE_NAME = ""
+DEFAULT_MASTER_METRICS_PORT = 9003
+DEFAULT_CHECK_SERVER = False
+
+_CONFIG_FIELDS = {
+    "local_hostname",
+    "metadata_server",
+    "global_segment_size",
+    "protocol",
+    "device_name",
+    "master_server_address",
+    "master_metrics_port",
+    "check_server",
+}
+_EXTRA_CONFIG_CONTROL_FIELDS = {"config_path", "extra_backend_tag"}
 
 logger = logging.getLogger(__name__)
 
 
 def _parse_global_segment_size(value: int | str) -> int:
+    if isinstance(value, bool):
+        raise ValueError("global_segment_size must be an integer or size string")
     if isinstance(value, int):
-        return value
-    if isinstance(value, str):
+        size = value
+    elif isinstance(value, str):
         s = value.strip().lower()
         if s.endswith("gb"):
             num = s[:-2].strip()
@@ -54,9 +74,23 @@ def _parse_global_segment_size(value: int | str) -> int:
                 raise ValueError(
                     "Invalid global_segment_size: missing number before 'gb'"
                 )
-            return int(num) * 1024 * 1024 * 1024
-        return int(s)
-    return int(value)
+            size = int(num) * 1024 * 1024 * 1024
+        else:
+            size = int(s)
+    else:
+        raise ValueError("global_segment_size must be an integer or size string")
+    # Zero is a supported zero-copy-only mode: the registered host KV buffers
+    # remain available even though Mooncake owns no global allocation.
+    if size < 0:
+        raise ValueError("global_segment_size must be non-negative")
+    return size
+
+
+def _require_non_empty_string(config: dict[str, Any], name: str) -> str:
+    value = config[name]
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string")
+    return value
 
 
 @dataclass
@@ -70,112 +104,125 @@ class MooncakeStoreConfig:
     master_metrics_port: int
     check_server: bool
 
-    @staticmethod
-    def from_file() -> "MooncakeStoreConfig":
-        """Load the config from a JSON file."""
-        if not envs.TOKENSPEED_KVSTORE_MOONCAKE_CONFIG_PATH.is_set():
-            raise RuntimeError(
-                f"Config file path not set. Please set {envs.TOKENSPEED_KVSTORE_MOONCAKE_CONFIG_PATH.name}"
-            )
-        file_path = envs.TOKENSPEED_KVSTORE_MOONCAKE_CONFIG_PATH.value
+    @classmethod
+    def from_file(cls, file_path: str | Path) -> "MooncakeStoreConfig":
+        """Load Mooncake settings from an explicit JSON file path."""
+        if not isinstance(file_path, (str, Path)) or not str(file_path).strip():
+            raise ValueError("config_path must be a non-empty path")
+        path = Path(file_path)
         try:
-            with open(file_path) as fin:
+            with path.open(encoding="utf-8") as fin:
                 config = json.load(fin)
         except (OSError, json.JSONDecodeError) as exc:
-            raise RuntimeError(
-                f"Failed to load config from {file_path}: {exc}"
-            ) from exc
+            raise RuntimeError(f"Failed to load config from {path}: {exc}") from exc
+        if not isinstance(config, dict):
+            raise ValueError(f"Mooncake config file {path} must contain a JSON object")
+        return cls._from_mapping(config, source=f"config file {path}")
 
-        if "master_server_address" not in config:
-            raise ValueError("master_server_address is required in config file")
+    @classmethod
+    def load_from_extra_config(
+        cls, extra_config: dict[str, Any]
+    ) -> "MooncakeStoreConfig":
+        """Load settings from the explicit storage-backend extra config.
 
-        return MooncakeStoreConfig(
-            local_hostname=config.get(
-                "local_hostname", envs.MOONCAKE_LOCAL_HOSTNAME.default
-            ),
-            metadata_server=config.get(
-                "metadata_server", envs.MOONCAKE_TE_META_DATA_SERVER.default
-            ),
-            global_segment_size=_parse_global_segment_size(
-                config.get(
-                    "global_segment_size", envs.MOONCAKE_GLOBAL_SEGMENT_SIZE.default
-                )
-            ),
-            protocol=config.get("protocol", envs.MOONCAKE_PROTOCOL.default),
-            device_name=config.get("device_name", envs.MOONCAKE_DEVICE.default),
-            master_server_address=config.get("master_server_address"),
-            master_metrics_port=config.get(
-                "master_metrics_port", envs.MOONCAKE_MASTER_METRICS_PORT.default
-            ),
-            check_server=config.get("check_server", envs.MOONCAKE_CHECK_SERVER.default),
-        )
-
-    @staticmethod
-    def load_from_env() -> "MooncakeStoreConfig":
-        """Load config from a file specified in the environment variable.
-        export MOONCAKE_MASTER=10.13.3.232:50051
-        export MOONCAKE_PROTOCOL="rdma"
-        export MOONCAKE_DEVICE=""
-        export MOONCAKE_TE_META_DATA_SERVER="P2PHANDSHAKE"
+        ``extra_config`` can contain inline Mooncake fields or a ``config_path``
+        pointing to a JSON object. Mixing a file with inline Mooncake fields is
+        rejected so configuration precedence is never implicit.
         """
-        # other required environment variables...
-        if not envs.MOONCAKE_MASTER.is_set():
-            raise ValueError("The environment variable 'MOONCAKE_MASTER' is not set.")
+        if not isinstance(extra_config, dict) or not extra_config:
+            raise ValueError("Mooncake requires a non-empty extra_config object")
 
-        # Prefer the namespaced Mooncake env var, but keep the older
-        # LOCAL_HOSTNAME fallback working for existing deployments.
-        if envs.MOONCAKE_LOCAL_HOSTNAME.is_set():
-            local_hostname = envs.MOONCAKE_LOCAL_HOSTNAME.value
-        else:
-            local_hostname = os.getenv(
-                "LOCAL_HOSTNAME", envs.MOONCAKE_LOCAL_HOSTNAME.default
+        unknown = set(extra_config) - _CONFIG_FIELDS - _EXTRA_CONFIG_CONTROL_FIELDS
+        if unknown:
+            raise ValueError(
+                "Unknown Mooncake extra_config field(s): " + ", ".join(sorted(unknown))
             )
+        extra_backend_tag = extra_config.get("extra_backend_tag")
+        if extra_backend_tag is not None and (
+            not isinstance(extra_backend_tag, str) or not extra_backend_tag.strip()
+        ):
+            raise ValueError("extra_backend_tag must be a non-empty string")
 
-        return MooncakeStoreConfig(
-            local_hostname=local_hostname,
-            metadata_server=envs.MOONCAKE_TE_META_DATA_SERVER.value,
-            global_segment_size=_parse_global_segment_size(
-                envs.MOONCAKE_GLOBAL_SEGMENT_SIZE.value
-            ),
-            protocol=envs.MOONCAKE_PROTOCOL.value,
-            device_name=envs.MOONCAKE_DEVICE.value,
-            master_server_address=envs.MOONCAKE_MASTER.value,
-            master_metrics_port=envs.MOONCAKE_MASTER_METRICS_PORT.value,
-            check_server=envs.MOONCAKE_CHECK_SERVER.value,
-        )
-
-    @staticmethod
-    def load_from_extra_config(extra_config: dict) -> "MooncakeStoreConfig":
-        """Load config from extra_config dictionary."""
-        if "master_server_address" not in extra_config:
-            raise ValueError("master_server_address is required in extra_config")
-
-        return MooncakeStoreConfig(
-            local_hostname=extra_config.get(
-                "local_hostname", envs.MOONCAKE_LOCAL_HOSTNAME.default
-            ),
-            metadata_server=extra_config.get(
-                "metadata_server", envs.MOONCAKE_TE_META_DATA_SERVER.default
-            ),
-            global_segment_size=_parse_global_segment_size(
-                extra_config.get(
-                    "global_segment_size", envs.MOONCAKE_GLOBAL_SEGMENT_SIZE.default
+        config_path = extra_config.get("config_path")
+        inline_fields = set(extra_config) & _CONFIG_FIELDS
+        if config_path is not None:
+            if inline_fields:
+                raise ValueError(
+                    "config_path cannot be combined with inline Mooncake fields: "
+                    + ", ".join(sorted(inline_fields))
                 )
+            return cls.from_file(config_path)
+
+        inline_config = {
+            name: value
+            for name, value in extra_config.items()
+            if name in _CONFIG_FIELDS
+        }
+        return cls._from_mapping(inline_config, source="extra_config")
+
+    @classmethod
+    def _from_mapping(
+        cls, config: dict[str, Any], *, source: str
+    ) -> "MooncakeStoreConfig":
+        unknown = set(config) - _CONFIG_FIELDS
+        if unknown:
+            raise ValueError(
+                f"Unknown Mooncake {source} field(s): " + ", ".join(sorted(unknown))
+            )
+        if "master_server_address" not in config:
+            raise ValueError(f"master_server_address is required in {source}")
+
+        values = {
+            "local_hostname": config.get("local_hostname", DEFAULT_LOCAL_HOSTNAME),
+            "metadata_server": config.get("metadata_server", DEFAULT_METADATA_SERVER),
+            "protocol": config.get("protocol", DEFAULT_PROTOCOL),
+            "master_server_address": config["master_server_address"],
+        }
+        for name in values:
+            values[name] = _require_non_empty_string(values, name)
+
+        device_name = config.get("device_name", DEFAULT_DEVICE_NAME)
+        if not isinstance(device_name, str):
+            raise ValueError("device_name must be a string")
+
+        master_metrics_port = config.get(
+            "master_metrics_port", DEFAULT_MASTER_METRICS_PORT
+        )
+        if (
+            not isinstance(master_metrics_port, int)
+            or isinstance(master_metrics_port, bool)
+            or not 1 <= master_metrics_port <= 65535
+        ):
+            raise ValueError("master_metrics_port must be an integer in [1, 65535]")
+
+        check_server = config.get("check_server", DEFAULT_CHECK_SERVER)
+        if not isinstance(check_server, bool):
+            raise ValueError("check_server must be a boolean")
+
+        return cls(
+            local_hostname=values["local_hostname"],
+            metadata_server=values["metadata_server"],
+            global_segment_size=_parse_global_segment_size(
+                config.get("global_segment_size", DEFAULT_GLOBAL_SEGMENT_SIZE)
             ),
-            protocol=extra_config.get("protocol", envs.MOONCAKE_PROTOCOL.default),
-            device_name=extra_config.get("device_name", envs.MOONCAKE_DEVICE.default),
-            master_server_address=extra_config["master_server_address"],
-            master_metrics_port=extra_config.get(
-                "master_metrics_port", envs.MOONCAKE_MASTER_METRICS_PORT.default
-            ),
-            check_server=extra_config.get(
-                "check_server", envs.MOONCAKE_CHECK_SERVER.default
-            ),
+            protocol=values["protocol"],
+            device_name=device_name,
+            master_server_address=values["master_server_address"],
+            master_metrics_port=master_metrics_port,
+            check_server=check_server,
         )
 
 
 class MooncakeStore(KVStoreStorage):
-    def __init__(self, storage_config: KVStoreStorageConfig = None):
+    def __init__(self, storage_config: KVStoreStorageConfig | None = None):
+        if storage_config is None or not storage_config.extra_config:
+            raise ValueError(
+                "Mooncake requires explicit configuration via "
+                "--kvstore-storage-backend-extra-config"
+            )
+        extra_config = storage_config.extra_config
+        self.config = MooncakeStoreConfig.load_from_extra_config(extra_config)
+
         try:
             from mooncake.store import MooncakeDistributedStore
         except ImportError as exc:
@@ -187,41 +234,17 @@ class MooncakeStore(KVStoreStorage):
 
         try:
             self.store = MooncakeDistributedStore()
+            logger.info("Mooncake configuration loaded from extra_config.")
 
-            extra_config = (
-                getattr(storage_config, "extra_config", None)
-                if storage_config
-                else None
-            )
-            # Load configuration with master_server_address prioritized from extra_config if available
-            if (
-                extra_config is not None
-                and extra_config.get("master_server_address") is not None
-            ):
-                # Load from extra_config
-                self.config = MooncakeStoreConfig.load_from_extra_config(extra_config)
-                logger.info(
-                    "Mooncake Configuration loaded from extra_config successfully."
-                )
-            elif envs.TOKENSPEED_KVSTORE_MOONCAKE_CONFIG_PATH.is_set():
-                # Load from config file
-                self.config = MooncakeStoreConfig.from_file()
-                logger.info("Mooncake Configuration loaded from file successfully.")
-            else:
-                # Load from environment variables
-                self.config = MooncakeStoreConfig.load_from_env()
-                logger.info("Mooncake Configuration loaded from env successfully.")
-
-            tp_scale_factor = 1 if storage_config is None else storage_config.tp_size
+            tp_scale_factor = storage_config.tp_size
 
             per_tp_global_segment_size = (
                 self.config.global_segment_size // tp_scale_factor
             )
 
             # Check if extra_backend_tag should be passed to MooncakeDistributedStore
-            self.extra_backend_tag = None
-            if extra_config and "extra_backend_tag" in extra_config:
-                self.extra_backend_tag = extra_config["extra_backend_tag"]
+            self.extra_backend_tag = extra_config.get("extra_backend_tag")
+            if self.extra_backend_tag is not None:
                 logger.info("Using extra_backend_tag: %s", self.extra_backend_tag)
 
             # Check server status
@@ -233,14 +256,11 @@ class MooncakeStore(KVStoreStorage):
             if device_name and device_name.strip().startswith("{"):
                 try:
                     device_config = json.loads(device_name)
-                    if storage_config and hasattr(storage_config, "tp_rank"):
-                        tp_rank = storage_config.tp_rank
-                        # Try both integer and string keys since JSON parsing may convert keys
-                        device_name = device_config.get(tp_rank) or device_config.get(
-                            str(tp_rank), ""
-                        )
-                    else:
-                        device_name = ""
+                    tp_rank = storage_config.tp_rank
+                    # Try both integer and string keys since JSON parsing may convert keys
+                    device_name = device_config.get(tp_rank) or device_config.get(
+                        str(tp_rank), ""
+                    )
                 except (json.JSONDecodeError, AttributeError):
                     logger.warning(
                         "Failed to parse device_name as JSON: %s", device_name
@@ -265,12 +285,8 @@ class MooncakeStore(KVStoreStorage):
             self.warmup()
             logger.info("Mooncake store warmup successfully.")
 
-            if storage_config is not None:
-                self.is_mla_backend = storage_config.is_mla_model
-                self.local_rank = storage_config.tp_rank
-            else:
-                self.is_mla_backend = False
-                self.local_rank = 0
+            self.is_mla_backend = storage_config.is_mla_model
+            self.local_rank = storage_config.tp_rank
 
         except ValueError as exc:
             logger.error("Configuration loading failed: %s", exc)

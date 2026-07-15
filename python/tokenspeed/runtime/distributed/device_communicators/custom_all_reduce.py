@@ -33,7 +33,7 @@ from tokenspeed.runtime.distributed.device_communicators.utils import (
     in_the_same_node_as,
 )
 from tokenspeed.runtime.utils import get_colorful_logger
-from tokenspeed.runtime.utils.env import envs, global_server_args_dict
+from tokenspeed.runtime.utils.env import global_server_args_dict
 
 logger = get_colorful_logger(__name__)
 
@@ -128,8 +128,6 @@ class CustomAllreduce:
         full_nvlink = (
             interconnect is not None and interconnect.topology == "nvlink_full"
         )
-        if not full_nvlink and envs.TOKENSPEED_FORCE_FAKE_FULL_NVLINK.get():
-            full_nvlink = True
 
         if world_size > 2 and not full_nvlink:
             logger.warning(
