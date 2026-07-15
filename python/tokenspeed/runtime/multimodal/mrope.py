@@ -244,10 +244,7 @@ def compute_mrope_positions(hf_config, input_ids, mm_items):
         return None, None
 
     if any(arch in _QWEN3_OMNI_ARCHITECTURES for arch in architectures):
-        positions, delta = _compute_qwen3_omni_mrope_positions(
-            hf_config, input_ids, mm_items
-        )
-        return positions, delta, _mrope_delta_scalar_from_tensor(delta)
+        return _compute_qwen3_omni_mrope_positions(hf_config, input_ids, mm_items)
 
     model_type = getattr(hf_config, "model_type", None)
     if model_type in ("qwen3_5", "qwen3_5_moe"):
