@@ -1,3 +1,4 @@
+import hashlib
 import json
 from pathlib import Path
 
@@ -207,6 +208,19 @@ def test_six_request_contract_passes_without_recapture(tmp_path: Path) -> None:
     assert session.payloads[4]["max_tokens"] == 1
     assert session.payloads[4]["logprobs"] is True
     assert session.payloads[5]["messages"][0]["content"][0]["type"] == "video_url"
+    log_provenance = result["provenance"]["server_log"]
+    log_snapshot = Path(log_provenance["path"])
+    assert log_snapshot == config.output_dir / "server_log_at_validation.log"
+    assert log_provenance["source_path"] == str(config.server_log)
+    assert log_provenance["snapshot_at_validation"] is True
+    assert log_provenance["size_bytes"] == log_snapshot.stat().st_size
+    assert (
+        log_provenance["sha256"]
+        == hashlib.sha256(log_snapshot.read_bytes()).hexdigest()
+    )
+    snapshot_bytes = log_snapshot.read_bytes()
+    config.server_log.write_text(config.server_log.read_text() + "shutdown appended\n")
+    assert log_snapshot.read_bytes() == snapshot_bytes
     assert "data:image" not in (config.output_dir / "validation.json").read_text()
 
 

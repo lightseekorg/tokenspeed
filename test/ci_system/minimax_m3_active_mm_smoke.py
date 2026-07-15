@@ -11,6 +11,7 @@ import math
 import mimetypes
 import os
 import re
+import shutil
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -43,6 +44,14 @@ def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
     temporary = path.with_name(f".{path.name}.tmp")
     temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     os.replace(temporary, path)
+
+
+def _copy_file_atomic(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.tmp")
+    with source.open("rb") as source_handle, temporary.open("wb") as output_handle:
+        shutil.copyfileobj(source_handle, output_handle)
+    os.replace(temporary, destination)
 
 
 def _append_failure(failures: list[str], message: str) -> None:
@@ -516,7 +525,12 @@ def run(
         if owned_session:
             http.close()
 
-    after = summarize_encoder_graph_log(config.server_log.read_text(errors="replace"))
+    # The live server log continues to grow during shutdown. Preserve the exact
+    # bytes used for the request-time graph validation so provenance remains
+    # stable after the final lifecycle messages are appended.
+    server_log_snapshot = config.output_dir / "server_log_at_validation.log"
+    _copy_file_atomic(config.server_log, server_log_snapshot)
+    after = summarize_encoder_graph_log(server_log_snapshot.read_text(errors="replace"))
     failures.extend(f"after requests: {failure}" for failure in after.pop("failures"))
     counts_unchanged = before == after
     if not counts_unchanged:
@@ -525,6 +539,14 @@ def run(
     provenance = {
         label: {"path": str(path), "sha256": _sha256(path)}
         for label, path in required_paths.items()
+        if label != "server_log"
+    }
+    provenance["server_log"] = {
+        "path": str(server_log_snapshot),
+        "source_path": str(config.server_log),
+        "sha256": _sha256(server_log_snapshot),
+        "size_bytes": server_log_snapshot.stat().st_size,
+        "snapshot_at_validation": True,
     }
     result = {
         "schema_version": 1,
