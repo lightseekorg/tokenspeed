@@ -8,7 +8,7 @@ and backend choices against the build you deploy.
 
 ## Inkling
 
-Blog: https://lightseek.org/blog/lightseek-tokenspeed.html
+Blog: https://lightseek.org/blog/tokenspeed-inkling.html
 
 ```bash
 ## Docker
