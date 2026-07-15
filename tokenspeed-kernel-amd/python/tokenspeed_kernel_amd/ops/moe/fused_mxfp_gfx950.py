@@ -8555,7 +8555,7 @@ def gluon_mxfp_dynamic_mxfp4_fused_moe(
                     return decode_out
 
     else:
-        if int(n_tokens) <= _ROUTE_OWNED_DECODE_MAX_M:
+        if int(n_tokens) <= _DECODE_MAX_M:
             decode_out = _maybe_route_owned_mxfp4_mfma_decode(
                 hidden_states,
                 router_logits,
@@ -8573,11 +8573,11 @@ def gluon_mxfp_dynamic_mxfp4_fused_moe(
                 w13_bias=w13_bias,
                 w2_bias=w2_bias,
                 out_dtype=out_dtype,
-                max_m=_ROUTE_OWNED_DECODE_MAX_M,
+                max_m=_DECODE_MAX_M,
                 swiglu_alpha=swiglu_alpha,
                 swiglu_limit=swiglu_limit,
                 swiglu_beta=swiglu_beta,
-                allow_generic_fallback=False,
+                allow_generic_fallback=True,
             )
             if decode_out is not None:
                 return decode_out

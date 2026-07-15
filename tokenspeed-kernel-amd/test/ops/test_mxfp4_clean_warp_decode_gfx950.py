@@ -1002,7 +1002,7 @@ def test_dynamic_mxfp4_generic_path_consumes_precomputed_topk(
     assert matmul_calls == 2
 
 
-@pytest.mark.parametrize("num_tokens", [1, 2])
+@pytest.mark.parametrize("num_tokens", [1, 2, 3, 4, 8])
 def test_dynamic_mxfp4_route_owned_softmax_mfma_decode(
     num_tokens: int,
     monkeypatch: pytest.MonkeyPatch,
@@ -1076,7 +1076,7 @@ def test_dynamic_mxfp4_route_owned_softmax_mfma_decode(
     torch.testing.assert_close(out.float(), expected.float(), rtol=0.0, atol=0.0)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 2])
+@pytest.mark.parametrize("num_tokens", [1, 2, 3, 4, 8])
 def test_dynamic_mxfp4_route_owned_kimi_sigmoid_mfma_decode(
     num_tokens: int,
     monkeypatch: pytest.MonkeyPatch,
@@ -1383,3 +1383,71 @@ def test_precomputed_entry_rejects_missing_or_mismatched_topk():
             w13_mx_scale=scale,
             w2_mx_scale=scale,
         )
+
+
+@pytest.mark.parametrize("num_tokens", [1, 2, 3, 4, 8])
+def test_kernel_routing_decode_reaches_route_owned_up_to_decode_max_m(
+    num_tokens: int,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Kernel-routing (no precomputed top-k) must hit route-owned decode M<=8.
+
+    This pins the dispatch cap lift: without precomputed top-k, batches up to
+    ``_DECODE_MAX_M`` must be handed to ``_maybe_route_owned_mxfp4_mfma_decode``
+    (which routes in-kernel and dispatches to the tuned decode kernels) rather
+    than falling through to the generic ragged GEMM. Previously only M <=
+    ``_ROUTE_OWNED_DECODE_MAX_M`` (=2) reached it, so Kimi-style M=8 decode
+    silently used the slow ragged path.
+    """
+    assert num_tokens <= fused_mxfp_gfx950._DECODE_MAX_M
+    hidden = torch.empty((num_tokens, 8), device="cuda", dtype=torch.bfloat16)
+    router = torch.empty((num_tokens, 4), device="cuda", dtype=torch.float32)
+    dummy_w = torch.empty((1, 4, 4), device="cuda", dtype=torch.uint8)
+    dummy_scale = torch.empty((1, 4, 1), device="cuda", dtype=torch.uint8)
+    sentinel = torch.empty_like(hidden)
+    route_owned_calls = 0
+    captured = {}
+
+    def fake_route_owned(*args, **kwargs):
+        nonlocal route_owned_calls
+        route_owned_calls += 1
+        captured["max_m"] = kwargs.get("max_m")
+        captured["allow_generic_fallback"] = kwargs.get("allow_generic_fallback")
+        return sentinel
+
+    def fail_route(*args, **kwargs):
+        raise AssertionError(
+            "kernel-routing decode fell through to the ragged reference path"
+        )
+
+    monkeypatch.setattr(
+        fused_mxfp_gfx950,
+        "_maybe_route_owned_mxfp4_mfma_decode",
+        fake_route_owned,
+    )
+    monkeypatch.setattr(fused_mxfp_gfx950, "_dynamic_mxfp4_route", fail_route)
+
+    out = fused_mxfp_gfx950.gluon_mxfp_dynamic_mxfp4_fused_moe(
+        hidden,
+        router,
+        dummy_w,
+        dummy_w,
+        w13_mx_scale=dummy_scale,
+        w2_mx_scale=dummy_scale,
+        top_k=1,
+        correction_bias=None,
+        n_group=1,
+        topk_group=1,
+        routed_scaling_factor=1.0,
+        normalize_topk_weights=True,
+        routing_method_type=0,
+        w13_bias=None,
+        w2_bias=None,
+    )
+
+    assert out is sentinel
+    assert route_owned_calls == 1
+    # The cap lift forwards the full decode ceiling and lets route-owned reach
+    # the precomputed-MFMA decode kernel for the M=3..8 range.
+    assert captured["max_m"] == fused_mxfp_gfx950._DECODE_MAX_M
+    assert captured["allow_generic_fallback"] is True
