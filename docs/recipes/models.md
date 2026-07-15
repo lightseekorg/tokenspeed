@@ -83,37 +83,9 @@ tokenspeed serve zai-org/GLM-5.2-FP8 \
   --max-model-len 262144 \
   --chunked-prefill-size 8192 \
   --max-num-seqs 128 \
-To enable a compatible DFlash draft model, keep the target launch shape and add
-the draft model path plus DFlash speculative decoding options:
-
-```bash
-tokenspeed serve nvidia/Kimi-K2.6-NVFP4 \
-  --served-model-name kimi-k2.6 \
-  --trust-remote-code \
-  --max-model-len 262144 \
-  --kv-cache-dtype fp8 \
-  --quantization nvfp4 \
-  --tensor-parallel-size 4 \
-  --enable-expert-parallel \
-  --chunked-prefill-size 8192 \
-  --max-num-seqs 256 \
-  --attention-backend tokenspeed_mla \
-  --moe-backend flashinfer_trtllm \
-  --reasoning-parser kimi_k25 \
-  --tool-call-parser kimik2 \
-  --speculative-algorithm DFLASH \
-  --speculative-draft-model-path /path/to/kimi-k2.6-dflash \
-  --speculative-num-draft-tokens 8 \
-  --speculative-num-steps 7 \
-  --drafter-attention-backend fa4 \
   --host 0.0.0.0 \
   --port 8000
 ```
-
-Known limitation: native TokenSpeed DFlash currently uses full-history draft
-attention. It does not yet expose an equivalent of SGLang's
-`--speculative-dflash-draft-window-size`; add such a flag before relying on
-bounded draft attention for long-context deployments.
 
 ## Qwen3 Dense / Qwen3 30B-A3B
 
