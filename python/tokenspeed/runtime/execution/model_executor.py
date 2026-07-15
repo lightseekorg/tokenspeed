@@ -70,7 +70,6 @@ from tokenspeed.runtime.sampling.dp_sampling_config import (
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 from tokenspeed.runtime.utils import get_colorful_logger, set_random_seed
 from tokenspeed.runtime.utils.common import maybe_inference_mode
-from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
@@ -82,7 +81,6 @@ if TYPE_CHECKING:
 logger = get_colorful_logger(__name__)
 
 _DRAFTER_MAPPING = {"EAGLE3": Eagle, "MTP": Eagle, "DFLASH": DFlash}
-LOG_MM_TIMING = envs.TOKENSPEED_LOG_MM_TIMING.get()
 
 
 def _eagle_aux_layer_ids(hf_config) -> list[int] | None:
@@ -151,6 +149,7 @@ class ModelExecutorConfig:
     max_cudagraph_capture_size: int
     model_is_mrope: bool
     enable_nan_detection: bool = False
+    enable_log_mm_timing: bool = False
 
     # ====== DP =========
     data_parallel_size: int = 1
@@ -231,6 +230,7 @@ class ModelExecutorConfig:
             dp_sampling=server_args.dp_sampling,
             dp_sampling_min_bs=server_args.dp_sampling_min_bs,
             enable_nan_detection=server_args.enable_nan_detection,
+            enable_log_mm_timing=server_args.enable_log_mm_timing,
             use_v4_mtp_paged_metadata=model_config.use_v4_mtp_paged_metadata,
             grammar_backend=server_args.grammar_backend,
             disable_capturable_grammar=server_args.disable_capturable_grammar,
@@ -1693,7 +1693,7 @@ class ModelExecutor:
         total_tokens = sum(forward_op.input_lengths)
         self._active_multimodal_context = multimodal_context
         self._active_positions_override = None
-        timing_enabled = LOG_MM_TIMING
+        timing_enabled = self.config.enable_log_mm_timing
         timing_start = time.perf_counter() if timing_enabled else 0.0
         input_fill_ms = 0.0
         mrope_ms = 0.0
@@ -1831,6 +1831,7 @@ class ModelExecutor:
                     ),
                     gather_ids=gather_ids,
                     decode_input_ids=decode_input_ids,
+                    enable_log_mm_timing=timing_enabled,
                 )
                 if self.config.data_parallel_size > 1:
                     if dp_global_num_tokens is None:

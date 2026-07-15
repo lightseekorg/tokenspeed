@@ -36,6 +36,10 @@ E4M3 merely because its cache is E4M3:
   cache, static K/V scales, and BF16 output.
 - Decode uses the TensorRT-LLM paged-MHA path with the same BF16-Q/E4M3-KV
   mixed signature, scale compensation, and BF16 output.
+- FlashInfer FA2 and TensorRT-LLM paged-MHA plans use the same 512 MiB
+  per-device workspace contract. This covers the large split-K temporary
+  buffers used by the pinned prefill buckets without replacing the workspace
+  pointer held by a cached plan or adding an environment-variable override.
 - The default breakable prefill graph remains enabled. Its bucket-padded Q/K/V
   and cache-location tensors are sliced to the real-token prefix before the
   eager FA2 attention break, so padding neither violates FA2 metadata nor
@@ -47,6 +51,14 @@ E4M3 merely because its cache is E4M3:
 Because this changes the numerical path exercised by the earlier measurements,
 the fixed-reference quality A/B, random BF16/FP8 sweep, and exact 1M boundary
 must all be rerun from the final committed SHA.
+
+The first fixed-SHA FP8 rerun exposed the workspace contract before producing
+release evidence: the former 128 MiB FA2 allocation reached readiness and
+passed the fixed-reference quality probe, but a 1,024-token random prefill
+required a 256 MiB temporary value buffer and failed during planning. Startup
+prefill-graph planning independently requested about 288 MiB. The failed
+random run is retained as diagnostic evidence only; all release rows must be
+rerun after the 512 MiB fix.
 
 ## Pinned Workloads
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -323,6 +324,31 @@ def test_minimax_m3_rejects_nonpositive_or_nonfinite_kv_cache_scale(
     # Validation is atomic: an invalid later layer must not apply earlier scales.
     assert all(attention.k_scale is None for attention in attentions)
     assert all(attention.v_scale is None for attention in attentions)
+
+
+def test_minimax_m3_forwards_explicit_mm_timing_to_embedder() -> None:
+    expected = torch.zeros((1, 2))
+    apply = Mock(return_value=(expected, {}))
+    model = SimpleNamespace(
+        vision_embedder=SimpleNamespace(apply=apply),
+        image_encoder=lambda items: items,
+        get_input_embeddings=lambda: torch.nn.Embedding(2, 2),
+    )
+    ctx = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_decode_or_idle=lambda: False),
+        enable_log_mm_timing=True,
+    )
+    multimodal_context = SimpleNamespace(has_extend_inputs=lambda: True)
+
+    actual = MiniMaxM3SparseForConditionalGeneration.multimodal_input_embeds(
+        model,
+        torch.tensor([0]),
+        ctx,
+        multimodal_context,
+    )
+
+    assert actual is expected
+    assert apply.call_args.kwargs["log_timing"] is True
 
 
 def test_minimax_m3_builds_active_multimodal_runtime(

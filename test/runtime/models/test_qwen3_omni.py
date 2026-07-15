@@ -29,6 +29,7 @@ from tokenspeed.runtime.multimodal.inputs import (
     MultimodalInputs,
 )
 from tokenspeed.runtime.multimodal.mrope import compute_mrope_positions
+from tokenspeed.runtime.multimodal.shm_transport import sync_shm_features
 
 
 def _omni_config():
@@ -171,6 +172,56 @@ class TestQwen3OmniMultimodalEmbedder(unittest.TestCase):
             image_kwargs["input_deepstack_embeds"],
             image.encoded_deepstack,
         )
+
+    def test_embedder_timing_is_controlled_per_forward(self):
+        def apply(log_timing: bool):
+            item = MultimodalDataItem(
+                modality=Modality.IMAGE,
+                offsets=[(0, 0)],
+                encoded=torch.tensor([[1.0, 2.0]]),
+            )
+            ctx = MultimodalForwardContext(
+                mm_inputs=[MultimodalInputs(mm_items=[item])],
+                extend_prefix_lens=[0],
+                extend_seq_lens=[1],
+            )
+            return MultimodalEmbedder().apply(
+                input_ids=torch.tensor([0]),
+                text_embedding=nn.Embedding(2, 2),
+                ctx=ctx,
+                encoders={Modality.IMAGE: EncoderSpec(fn=lambda _: torch.empty(0, 2))},
+                multimodal_model=SimpleNamespace(),
+                log_timing=log_timing,
+            )
+
+        with patch("tokenspeed.runtime.multimodal.embedder.logger.info") as log_info:
+            apply(log_timing=False)
+            log_info.assert_not_called()
+
+            apply(log_timing=True)
+            log_info.assert_called_once()
+            self.assertIn("mm_timing", log_info.call_args.args[0])
+
+    def test_shm_attach_timing_is_controlled_per_receive(self):
+        attached = []
+        mm_inputs = SimpleNamespace(
+            has_pending_shm_features=lambda: True,
+            attach_shm_features=lambda: attached.append(True),
+            mm_items=[object()],
+        )
+        reqs = [SimpleNamespace(multimodal_inputs=mm_inputs)]
+
+        with patch(
+            "tokenspeed.runtime.multimodal.shm_transport.logger.info"
+        ) as log_info:
+            sync_shm_features(reqs, group=None, group_size=1, log_timing=False)
+            log_info.assert_not_called()
+
+            sync_shm_features(reqs, group=None, group_size=1, log_timing=True)
+            log_info.assert_called_once()
+            self.assertIn("mm_timing", log_info.call_args.args[0])
+
+        self.assertEqual(len(attached), 2)
 
 
 class TestQwen3OmniMrope(unittest.TestCase):

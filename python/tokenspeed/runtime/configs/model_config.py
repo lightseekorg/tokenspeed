@@ -34,7 +34,6 @@ from transformers import PretrainedConfig
 
 from tokenspeed.runtime.layers.quantization import QUANTIZATION_METHODS
 from tokenspeed.runtime.utils import get_colorful_logger
-from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.hf_transformers_utils import (
     get_config,
     get_context_length,
@@ -417,7 +416,7 @@ class ModelConfig:
         derived_context_len = get_context_length(self.hf_text_config)
         if context_length is not None:
             if context_length > derived_context_len:
-                if envs.TOKENSPEED_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.get():
+                if server_args.allow_overwrite_longer_context_len:
                     logger.warning(
                         "User-specified context_length (%s) is greater than the derived "
                         "context_length (%s). This may lead to incorrect model outputs or "
@@ -430,7 +429,8 @@ class ModelConfig:
                     raise ValueError(
                         f"User-specified context_length ({context_length}) is greater than the derived context_length ({derived_context_len}). "
                         f"This may lead to incorrect model outputs or CUDA errors. Note that the derived context_length may differ from max_position_embeddings in the model's config. "
-                        f"To allow overriding this maximum, set the env var TOKENSPEED_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"
+                        "To allow overriding this maximum, pass "
+                        "--allow-overwrite-longer-context-len."
                     )
             else:
                 self.context_len = context_length

@@ -72,6 +72,7 @@ class ServerArgs:
     quantization: str | None = None
     quantization_param_path: nullable_str = None
     max_model_len: int | None = None
+    allow_overwrite_longer_context_len: bool = False
     device: str = "cuda"
     served_model_name: str | None = None
     revision: str | None = None
@@ -121,6 +122,7 @@ class ServerArgs:
     enable_log_requests: bool = False
     log_requests_level: int = 0
     enable_log_request_stats: bool = False
+    enable_log_mm_timing: bool = False
     enable_metrics: bool = False
     decode_log_interval: int = 40
     metrics_reporters: list[str] | None = None
@@ -282,6 +284,7 @@ class ServerArgs:
 
     mla_chunk_multiplier: int = 4
     mm_attention_backend: str | None = None
+    mm_skip_compute_hash: bool = False
     enable_mm_encoder_cuda_graph: bool = False
     mm_encoder_cudagraph_max_metadata_sequences_per_batch: int | None = None
 
@@ -840,6 +843,16 @@ class ServerArgs:
             help="The model's maximum context length. Defaults to None (will use the value from the model's config.json instead).",
         )
         parser.add_argument(
+            "--allow-overwrite-longer-context-len",
+            action="store_true",
+            default=ServerArgs.allow_overwrite_longer_context_len,
+            help=(
+                "Allow --max-model-len to exceed the context length derived "
+                "from the model config. This may produce incorrect outputs or "
+                "CUDA errors."
+            ),
+        )
+        parser.add_argument(
             "--device",
             type=str,
             default="cuda",
@@ -1116,6 +1129,16 @@ class ServerArgs:
                 "token counts (prompt/cache/output), cache-hit rate, decode "
                 "throughput, and spec-decode acceptance. Measured entirely on the "
                 "host (no GPU sync), so it adds no engine slowdown."
+            ),
+        )
+        parser.add_argument(
+            "--enable-log-mm-timing",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.enable_log_mm_timing,
+            help=(
+                "Log detailed multimodal transport, encoder, embedding, and "
+                "forward timings. This diagnostic mode may synchronize CUDA "
+                "and reduce throughput."
             ),
         )
         parser.add_argument(
@@ -1796,6 +1819,16 @@ class ServerArgs:
             choices=mm_attention_backend_choices,
             default=ServerArgs.mm_attention_backend,
             help="Set multimodal attention backend.",
+        )
+        parser.add_argument(
+            "--mm-skip-compute-hash",
+            action="store_true",
+            default=ServerArgs.mm_skip_compute_hash,
+            help=(
+                "Assign each multimodal item a random hash instead of using its "
+                "content hash. This disables multimodal deduplication and "
+                "content-aware prefix reuse."
+            ),
         )
         parser.add_argument(
             "--enable-mm-encoder-cuda-graph",

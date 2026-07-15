@@ -53,6 +53,7 @@ alias.
 | Parameter | Purpose |
 | --- | --- |
 | `--max-model-len` | Maximum sequence length. If omitted, TokenSpeed uses the model config. |
+| `--allow-overwrite-longer-context-len` | Allow `--max-model-len` to exceed the model-derived context length, with a warning. Disabled by default. |
 | `--gpu-memory-utilization` | Fraction of GPU memory used for model weights and KV cache. Lower it to leave headroom. |
 | `--max-num-seqs` | Maximum number of active sequences the scheduler may process concurrently. |
 | `--chunked-prefill-size` | Token budget the scheduler may issue in one iteration. Defaults to `8192`. Set `-1` to disable chunked prefill. |
@@ -67,6 +68,10 @@ alias.
 `--chunked-prefill-size` is intentionally separate from
 `--max-num-batched-tokens`: in TokenSpeed it is the scheduler's per-iteration
 issue budget, while `--max-total-tokens` controls the global token pool.
+
+Longer-context override is an explicit CLI setting with no environment-variable
+alias. Enable it only when the checkpoint is known to support the requested
+length; an invalid override can produce incorrect output or CUDA errors.
 
 ## Parallelism
 
@@ -116,6 +121,7 @@ about.
 | Parameter | Purpose |
 | --- | --- |
 | `--mm-attention-backend` | Attention backend used inside supported multimodal encoders, such as `fa3`, `fa4`, or `triton_attn`. |
+| `--mm-skip-compute-hash` | Replace multimodal content hashes with random per-item IDs, disabling content deduplication and content-aware prefix reuse. Disabled by default. |
 | `--enable-mm-encoder-cuda-graph` / `--no-enable-mm-encoder-cuda-graph` | Capture supported multimodal encoders during startup and replay matching input budgets. Disabled by default. |
 | `--mm-encoder-cudagraph-max-metadata-sequences-per-batch` | Explicit maximum number of attention-metadata sequences captured per encoder batch. Supported models derive it from the token budget when omitted. |
 | `--language-model-only` | Disable the active multimodal model path and reject multimodal requests. |
@@ -129,6 +135,10 @@ capture-size options.
 
 Encoder-graph enablement and metadata sizing are CLI settings. They do not
 have environment-variable aliases.
+
+Multimodal hash policy is also an explicit CLI setting with no
+environment-variable alias. Leave content hashing enabled unless intentionally
+diagnosing deduplication or prefix-reuse behavior.
 
 Multimodal modalities remain model-specific. MiniMax-M3 currently supports
 image items only; video items are rejected.
@@ -176,11 +186,17 @@ draft model, and token count together.
 | `--enable-log-requests` | Log request metadata and optionally payloads. |
 | `--log-requests-level` | Request logging verbosity. |
 | `--enable-log-request-stats` | Log a one-line per-request performance summary on finish/abort (see below). |
+| `--enable-log-mm-timing` | Log detailed multimodal SHM, encoder, embedding, and forward timings. |
 | `--enable-metrics` | Enable metrics reporting. |
 | `--metrics-reporters` | Metrics reporter, such as `prometheus`. |
 | `--decode-log-interval` | Decode batch log interval. |
 | `--enable-cache-report` | Include cached-token counts in OpenAI-compatible usage details. |
 | `--kv-events-config` | JSON config for KV cache mutation events. Set `enable_kv_cache_events` and a publisher such as `zmq` to publish device prefix-cache stores and removals. |
+
+`--enable-log-mm-timing` is disabled by default and is intended for diagnostics.
+It is an explicit per-server setting; environment variables do not enable it.
+The encoder timing path may synchronize CUDA, so leave it disabled for normal
+throughput measurements.
 
 ### Per-Request Stats
 

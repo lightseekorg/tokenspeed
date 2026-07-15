@@ -1153,6 +1153,7 @@ class MiniMaxM3SparseForConditionalGeneration(MiniMaxM3SparseForCausalLM):
             encoders={Modality.IMAGE: EncoderSpec(self.image_encoder)},
             multimodal_model=self,
             is_decode_or_idle=ctx.forward_mode.is_decode_or_idle(),
+            log_timing=ctx.enable_log_mm_timing,
         )
         if model_kwargs:
             raise RuntimeError("MiniMax-M3 multimodal path must remain embeds-only.")

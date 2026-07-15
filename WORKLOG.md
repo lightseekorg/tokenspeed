@@ -46,9 +46,10 @@ from `origin/main`; resume from the feature branch above.
 | CUDA Graph / B200 tuning | Validated | Default and strict-greedy variants captured batch sizes 1/2/4. A post-fix TP4 run additionally captured 1/2/3/4 with the index-query all-gather. Graph/eager A/B improved output throughput by 1.66x at concurrency 1 and 1.71x at concurrency 4. |
 | Phase 3 BF16 benchmark accuracy | Aligned | HF teacher-forced comparison matched 39/40 greedy tokens; TokenSpeed's token was in HF top-5 for 40/40, with mean absolute shared-token logprob delta 0.0504. Four of five autoregressive prompts matched all eight generated tokens. |
 | ViT and image requests | Implemented and validated | The 32-block vision tower, partial 3D RoPE, dynamic resolution, 2x2 patch merge, projector, SMG processor, and embeds-only LM splice are active. Single-image visual logits match the native Transformers TP4 reference; single-image, two-image, and text requests passed on the active-MM server. |
-| FP8 KV/index cache | Implemented; candidate quality/perf/1M reruns pending | Blackwell uses E4M3 main K/V storage and index cache. The current M3 dense path keeps BF16 Q, uses native FA2 mixed extend and TensorRT-LLM mixed decode, and returns BF16. Earlier random, quality, and exact-1M artifacts predate this path and are historical only. |
+| FP8 KV/index cache | Implemented; post-workspace-fix reruns pending | Blackwell uses E4M3 main K/V storage and index cache. The current M3 dense path keeps BF16 Q, uses native FA2 mixed extend and TensorRT-LLM mixed decode, and returns BF16. FA2 and TensorRT-LLM paged-MHA now share a 512 MiB per-device workspace contract; the earlier 128 MiB FA2 allocation was insufficient for release prefill buckets. |
 | Vision encoder CUDA Graph | Real capture and active-MM smoke passed | Explicit CLI enablement captured nine budgets per TP rank, installed `image_encoder`, and served text, one-image, and two-image requests. Dynamic 3D RoPE packed-order parity passed without recapture. Unsupported models/backends still fail closed. |
 | CLI-only GPU placement | Cold-start validation passed | Worker placement uses `--base-gpu-id`/`--gpu-id-step`, and NCCL process groups bind the mapped CUDA device. The TP4 cold start created compute contexts only on GPUs 4-7; GPUs 0-3 remained at 4 MiB with no compute process. |
+| Explicit runtime configuration | Implemented; fixed-SHA process audit pending | Context-length override, multimodal hash policy, MM timing, Mamba SSM dtype, CP topology, FP8 cache, and encoder graphs are all `ServerArgs`/CLI settings. The former `TOKENSPEED_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN`, `TOKENSPEED_MM_SKIP_COMPUTE_HASH`, `TOKENSPEED_LOG_MM_TIMING`, `TOKENSPEED_MAMBA_SSM_DTYPE`, and `ENABLE_CP` product channels are not read by runtime code. |
 | Video | Unsupported by design | MiniMax-M3 basic support covers images. Video items are rejected explicitly and are not part of the Phase 5 acceptance matrix. |
 | CI and release benchmark | Historical random baseline retained; candidate eval/perf/CI pending | The pre-candidate FP8 and BF16 sweeps each completed 188/188 requests. The UT task now includes fixed-reference quality-harness and random-collector CPU tests, but the final-SHA random matrix, language eval, exact 1M, and B200 task executions remain pending. |
 | Published SMG dependency | **Release blocker** | The candidate checked `tokenspeed-smg==1.7.0.post20260714`; it predates the MiniMax-M3 image processor. A clean active-MM install cannot be declared supported until a compatible package is published. |
@@ -79,6 +80,14 @@ from `origin/main`; resume from the feature branch above.
   token prefix before the FA2 attention break and cache write.
 - This mixed signature is restricted to the indexed MiniMax-M3 contract.
   Other models retain the legacy same-dtype FP8 query/cache behavior unchanged.
+- FlashInfer FA2 and TensorRT-LLM paged-MHA plans share a stable 512 MiB
+  per-device workspace. Cached wrappers retain that pointer for their lifetime;
+  the runtime does not resize it live or configure it through an environment
+  variable.
+- Product behavior is configured through `ServerArgs`: longer-context override,
+  multimodal hash policy, multimodal timing, Mamba SSM dtype, and CP topology
+  have explicit CLI/data-flow paths. Legacy environment-variable names remain
+  only in regression tests that prove they no longer affect runtime behavior.
 - The conditional-generation entry point follows the shared
   `MultimodalEmbedder` and `VisionEncoderCudaGraphAdapter` seams. The released
   checkpoint's 523 visual tensors stream directly into 395 fused/TP-sharded
@@ -90,6 +99,33 @@ from `origin/main`; resume from the feature branch above.
   equivalent to one reference-tower call per image and prevents images from
   unrelated batched requests from attending to each other or making
   content-addressed image embeddings request-dependent.
+
+## Phase 5 workspace diagnostic
+
+The first fixed-SHA release run used TokenSpeed
+`dda9513850fdc1a2539d792842b23cd5c588bc90` on physical GPUs 4-7. The BF16
+arm completed all eight random cells with 188/188 requests and no workload
+errors. Both BF16 and FP8 fixed-reference quality arms also passed their
+provisional gates.
+
+The FP8 random arm then failed closed on its first 1,024-token prefill. The
+mixed FlashInfer FA2 wrapper had a dedicated 128 MiB workspace, while that
+runtime plan required a 256 MiB temporary value buffer; startup prefill-graph
+planning had already requested about 288 MiB and fallen back to eager. The
+four schedulers exited with the same `AlignedAllocator` overflow. This was not
+a device-memory OOM or an SMG preprocessing failure.
+
+The implementation now gives mixed FA2 the same stable 512 MiB per-device
+workspace used by TensorRT-LLM paged MHA. The failed FP8 random directory is
+diagnostic only and must not be counted as Phase 5 evidence. Retained artifacts
+are under:
+
+```text
+/raid/flamingo/runs/minimax_m3_phase5_20260715/candidate_dda9513850f/
+```
+
+After committing the fix, rerun both cache arms, GSM8K, exact 1M, and active
+vision from the new fixed SHA.
 
 ## Phase 4 final validation
 

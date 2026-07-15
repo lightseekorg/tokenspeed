@@ -22,7 +22,9 @@ ut:
       test/runtime/distributed/test_mapping.py
       test/runtime/distributed/test_process_group_manager.py
       test/runtime/test_cli_config_compat.py
+      test/runtime/test_explicit_runtime_flags.py
       test/runtime/test_event_loop_overlap_terminal.py
+      test/runtime/test_generation_output_processor.py::test_prefill_first_token_checks_spec_candidate_bootstrap
       test/runtime/test_kv_cache_scales_loader.py
       test/runtime/layers/test_moe_topk.py
       test/quality_benchmark/tokenspeed/test_minimax_m3_fixed_reference.py

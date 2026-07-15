@@ -340,6 +340,7 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3MoeForCausalLM):
             },
             multimodal_model=self,
             is_decode_or_idle=ctx.forward_mode.is_decode_or_idle(),
+            log_timing=ctx.enable_log_mm_timing,
         )
         hidden_states, aux_hidden_states = self.model(
             input_ids,

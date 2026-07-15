@@ -118,6 +118,7 @@ class RequestHandler:
 
         self.forward_ct = 0
         self.server_args = server_args
+        self.log_mm_timing = server_args.enable_log_mm_timing
         # Owns pause/resume state; shared with the event loop. See pause.py.
         self.pause_controller = pause_controller
         # Owns release/resume_memory_occupation (data plane). See
@@ -185,7 +186,12 @@ class RequestHandler:
             )
 
         if recv_reqs:
-            sync_shm_features(recv_reqs, self.attn_tp_cpu_group, self.attn_tp_size)
+            sync_shm_features(
+                recv_reqs,
+                self.attn_tp_cpu_group,
+                self.attn_tp_size,
+                log_timing=self.log_mm_timing,
+            )
 
         return recv_reqs
 

@@ -222,7 +222,15 @@ def _build_encode_worker(server_args, port_args, gpu_id, global_rank):
         max_tokens_per_batch=server_args.chunked_prefill_size or 8192,
         max_items_per_batch=server_args.max_num_seqs,
     )
-    return EncodeWorker(executor, scheduler, cache), model_config
+    return (
+        EncodeWorker(
+            executor,
+            scheduler,
+            cache,
+            log_mm_timing=server_args.enable_log_mm_timing,
+        ),
+        model_config,
+    )
 
 
 def run_encode_loop(server_args, port_args, pipe_writer, gpu_id, global_rank):

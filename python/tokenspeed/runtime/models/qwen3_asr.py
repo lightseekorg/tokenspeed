@@ -196,6 +196,7 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
                 },
                 multimodal_model=self,
                 is_decode_or_idle=ctx.forward_mode.is_decode_or_idle(),
+                log_timing=ctx.enable_log_mm_timing,
             )
             kwargs.update(model_kwargs)
             if input_embeds is not None:

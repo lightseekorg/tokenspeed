@@ -276,6 +276,24 @@ print(server_args.mapping.attn.tp_size, server_args.mapping.attn.cp_size)
         args = self._parse_args(["--model", "test/model", "--max-model-len", "4096"])
         self.assertEqual(args.max_model_len, 4096)
 
+    def test_longer_context_override_is_explicit_and_default_off(self):
+        default_args = self._parse_args(["--model", "test/model"])
+        enabled_args = self._parse_args(
+            ["--model", "test/model", "--allow-overwrite-longer-context-len"]
+        )
+
+        self.assertFalse(default_args.allow_overwrite_longer_context_len)
+        self.assertTrue(enabled_args.allow_overwrite_longer_context_len)
+
+    def test_multimodal_hash_skip_is_explicit_and_default_off(self):
+        default_args = self._parse_args(["--model", "test/model"])
+        enabled_args = self._parse_args(
+            ["--model", "test/model", "--mm-skip-compute-hash"]
+        )
+
+        self.assertFalse(default_args.mm_skip_compute_hash)
+        self.assertTrue(enabled_args.mm_skip_compute_hash)
+
     def test_gpu_memory_utilization_arg(self):
         args = self._parse_args(
             ["--model", "test/model", "--gpu-memory-utilization", "0.9"]
@@ -421,6 +439,20 @@ print(server_args.mapping.attn.tp_size, server_args.mapping.attn.cp_size)
             ["--model", "test/model", "--no-enable-mm-encoder-cuda-graph"]
         )
         self.assertFalse(args.enable_mm_encoder_cuda_graph)
+
+    def test_mm_timing_logging_is_explicit_and_default_off(self):
+        with patch.dict(os.environ, {"TOKENSPEED_LOG_MM_TIMING": "1"}):
+            default_args = self._parse_args(["--model", "test/model"])
+        enabled_args = self._parse_args(
+            ["--model", "test/model", "--enable-log-mm-timing"]
+        )
+        disabled_args = self._parse_args(
+            ["--model", "test/model", "--no-enable-log-mm-timing"]
+        )
+
+        self.assertFalse(default_args.enable_log_mm_timing)
+        self.assertTrue(enabled_args.enable_log_mm_timing)
+        self.assertFalse(disabled_args.enable_log_mm_timing)
 
     def test_mm_encoder_cudagraph_metadata_sequence_limit_arg(self):
         args = self._parse_args(

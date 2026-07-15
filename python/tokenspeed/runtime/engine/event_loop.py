@@ -538,6 +538,7 @@ class EventLoop:
             ),
             stream_interval=self.server_args.stream_interval,
             enable_log_request_stats=self.server_args.enable_log_request_stats,
+            enable_log_mm_timing=self.server_args.enable_log_mm_timing,
             metrics=self.metrics,
         )
         self.prefetch_threshold = scheduler_cfg.prefetch_threshold

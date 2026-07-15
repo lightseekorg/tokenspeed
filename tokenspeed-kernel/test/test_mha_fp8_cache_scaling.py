@@ -203,6 +203,10 @@ def test_flashinfer_fa2_extend_uses_native_fp8_cache_and_reuses_plan(
     kernel = _require_flashinfer_mha("flashinfer_fa2_mixed_mha_extend_with_kvcache")
     instances = []
 
+    # Do not reserve the production 512 MiB workspace in this CPU lifecycle
+    # test. The separate capacity assertion below protects that contract.
+    monkeypatch.setattr(flashinfer_ops, "_PAGED_MHA_WORKSPACE_BYTES", 64)
+
     class FakePagedPrefillWrapper:
         def __init__(self, workspace, kv_layout, backend):
             self.init_args = (workspace, kv_layout, backend)
@@ -260,6 +264,7 @@ def test_flashinfer_fa2_extend_uses_native_fp8_cache_and_reuses_plan(
 
     assert len(instances) == 1
     wrapper = instances[0]
+    assert wrapper.init_args[0].numel() == 64
     assert wrapper.init_args[1:] == ("NHD", "fa2")
     assert len(wrapper.plan_calls) == 1
     plan_args, plan_kwargs = wrapper.plan_calls[0]
@@ -331,6 +336,10 @@ def test_flashinfer_fa2_extend_uses_native_fp8_cache_and_reuses_plan(
     assert len(instances) == 1
     assert len(wrapper.plan_calls) == 2
     assert len(wrapper.run_calls) == 3
+
+
+def test_flashinfer_paged_mha_workspace_covers_large_split_k_plans() -> None:
+    assert flashinfer_ops._PAGED_MHA_WORKSPACE_BYTES == 512 * 1024 * 1024
 
 
 def test_flashinfer_fa2_mixed_extend_fails_closed_for_sinks() -> None:
