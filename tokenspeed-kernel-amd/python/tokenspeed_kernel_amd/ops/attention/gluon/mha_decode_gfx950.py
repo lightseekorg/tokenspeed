@@ -31,6 +31,7 @@ from tokenspeed_kernel_amd.ops.attention.gluon.utils import (
     _INV_LN2,
     _INV_LN2_VALUE,
     InputStrides,
+    attention_layouts,
     max,
     maximum,
 )
@@ -60,6 +61,7 @@ class AttentionConfig:
     BLOCK_N: gl.constexpr
     IS_SLIDING: gl.constexpr
     WINDOW_LEFT: gl.constexpr
+    IS_FP8: gl.constexpr
     GROUP_SIZE: gl.constexpr
     NUM_GROUPS: gl.constexpr
     q_strides: InputStrides
@@ -90,37 +92,39 @@ class AttentionConfig:
         BLOCK_N,
         IS_SLIDING,
         WINDOW_LEFT,
+        IS_FP8,
+        KV_DTYPE,
         q_strides,
     ):
         assert NUM_Q_HEADS % NUM_KV_HEADS == 0
-        assert HEAD_DIM == 64
+        assert HEAD_DIM in (64, 128)
         assert BLOCK_N == PAGE_SIZE
         if IS_SLIDING:
             assert WINDOW_LEFT >= 0
         else:
             assert WINDOW_LEFT == -1
 
-        mfma_layout = gl.amd.AMDMFMALayout(
-            version=4,
+        # Decode uses a [16, 16, 32] MFMA with 1-warp tiling.
+        (
+            qk_layout,
+            pv_layout,
+            q_layout,
+            k_layout,
+            p_layout,
+            v_layout,
+            load_layout,
+            store_layout,
+            k_smem_layout,
+            v_smem_layout,
+        ) = attention_layouts(
+            HEAD_DIM,
+            BLOCK_N,
+            IS_FP8,
+            KV_DTYPE,
+            num_warps=1,
             instr_shape=[16, 16, 32],
-            transposed=True,
-            warps_per_cta=[1, 1],
         )
-        qk_layout = mfma_layout
-        pv_layout = mfma_layout
-        q_layout = gl.DotOperandLayout(0, qk_layout, k_width=8)
-        k_layout = gl.DotOperandLayout(1, qk_layout, k_width=8)
-        p_layout = gl.DotOperandLayout(0, pv_layout, k_width=4)
-        v_layout = gl.DotOperandLayout(1, pv_layout, k_width=4)
-        load_layout = gl.BlockedLayout([1, 8], [8, 8], [1, 1], [1, 0])
-        store_layout = gl.BlockedLayout([1, 8], [8, 8], [1, 1], [1, 0])
-        reduce_layout = gl.BlockedLayout([1, 1], [1, 64], [1, 1], [1, 0])
-        k_smem_layout = gl.PaddedSharedLayout.with_identity_for(
-            [[512, 8]], [BLOCK_N, HEAD_DIM], [1, 0]
-        )
-        v_smem_layout = gl.PaddedSharedLayout.with_identity_for(
-            [[512, 32]], [BLOCK_N, HEAD_DIM], [1, 0]
-        )
+        reduce_layout = gl.BlockedLayout([1, HEAD_DIM // 64], [1, 64], [1, 1], [1, 0])
 
         self.SM_SCALE = gl.constexpr(SM_SCALE)
         self.PAGE_TABLE_STRIDE = gl.constexpr(PAGE_TABLE_STRIDE)
@@ -134,6 +138,7 @@ class AttentionConfig:
         self.BLOCK_N = gl.constexpr(BLOCK_N)
         self.IS_SLIDING = gl.constexpr(IS_SLIDING)
         self.WINDOW_LEFT = gl.constexpr(WINDOW_LEFT)
+        self.IS_FP8 = gl.constexpr(IS_FP8)
         self.GROUP_SIZE = gl.constexpr(NUM_Q_HEADS // NUM_KV_HEADS)
         self.NUM_GROUPS = gl.constexpr((self.GROUP_SIZE + BLOCK_M - 1) // BLOCK_M)
         self.q_strides = q_strides
@@ -461,7 +466,7 @@ class AttentionProgram:
 
 
 @gluon.jit
-def _mha_decode_fp16(
+def _mha_decode(
     q_ptr,
     k_cache_ptr,
     v_cache_ptr,
@@ -484,6 +489,7 @@ def _mha_decode_fp16(
     BLOCK_N: gl.constexpr,
     IS_SLIDING: gl.constexpr,
     WINDOW_LEFT: gl.constexpr,
+    IS_FP8: gl.constexpr,
 ):
     cfg = AttentionConfig(
         SM_SCALE,
@@ -498,6 +504,8 @@ def _mha_decode_fp16(
         BLOCK_N,
         IS_SLIDING,
         WINDOW_LEFT,
+        IS_FP8,
+        k_cache_ptr.dtype.element_ty,
         InputStrides(Q_STRIDE_B, Q_STRIDE_H, Q_STRIDE_D),
     )
     program = AttentionProgram.create(
@@ -544,7 +552,7 @@ def _mha_decode_fp16(
 
 
 @gluon.jit
-def _mha_decode_sliding_fp16(
+def _mha_decode_sliding(
     q_ptr,
     k_cache_ptr,
     v_cache_ptr,
@@ -567,6 +575,7 @@ def _mha_decode_sliding_fp16(
     IS_SLIDING: gl.constexpr,
     WINDOW_LEFT: gl.constexpr,
     HAS_SINK: gl.constexpr,
+    IS_FP8: gl.constexpr,
 ):
     cfg = AttentionConfig(
         SM_SCALE,
@@ -581,6 +590,8 @@ def _mha_decode_sliding_fp16(
         BLOCK_N,
         IS_SLIDING,
         WINDOW_LEFT,
+        IS_FP8,
+        k_cache_ptr.dtype.element_ty,
         InputStrides(Q_STRIDE_B, Q_STRIDE_H, Q_STRIDE_D),
     )
     program = AttentionProgram.create(
@@ -622,12 +633,13 @@ def _mha_decode_sliding_fp16(
 
 
 @gluon.jit
-def _mha_decode_reduce_fp16(
+def _mha_decode_reduce(
     mid_o_ptr,
     mid_lse_ptr,
     out_ptr,
     cache_seqlens_ptr,
     sink_ptr,
+    k_cache_ptr,  # unused for loads; only its dtype feeds the shared config
     SM_SCALE: gl.constexpr,
     PAGE_TABLE_STRIDE: gl.constexpr,
     NUM_KV_SPLITS: gl.constexpr,
@@ -639,6 +651,7 @@ def _mha_decode_reduce_fp16(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     HAS_SINK: gl.constexpr,
+    IS_FP8: gl.constexpr,
 ):
     cfg = AttentionConfig(
         SM_SCALE,
@@ -653,6 +666,8 @@ def _mha_decode_reduce_fp16(
         BLOCK_N,
         False,  # IS_SLIDING
         -1,  # WINDOW_LEFT
+        IS_FP8,
+        k_cache_ptr.dtype.element_ty,
         InputStrides(1, 1, 1),
     )
     q_index = gl.program_id(0)
@@ -763,6 +778,7 @@ def get_config(
     k_cache: torch.Tensor,
     max_seqlen_k: int,
     window_left: int,
+    softmax_scale: float | None,
 ) -> LaunchConfig:
     head_dim = q.shape[2]
     page_size = k_cache.shape[1]
@@ -772,7 +788,8 @@ def get_config(
     num_groups = math.ceil(group_size / block_m)
     is_sliding = window_left >= 0
     window_left = window_left if is_sliding else -1
-    sm_scale = 1.0 / math.sqrt(head_dim)
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(head_dim)
     effective_seqlen_k = min(max_seqlen_k, window_left) if is_sliding else max_seqlen_k
     num_pages = (effective_seqlen_k + page_size - 1) // page_size
     num_kv_splits = _select_num_kv_splits(
@@ -791,13 +808,13 @@ def get_config(
         num_kv_splits=num_kv_splits,
         block_m=block_m,
         block_n=block_n,
-        sm_scale=sm_scale * _INV_LN2_VALUE,
+        sm_scale=softmax_scale * _INV_LN2_VALUE,
         is_sliding=is_sliding,
         window_left=window_left,
     )
 
 
-def gluon_mha_decode_fp16_gfx950(
+def gluon_mha_decode_gfx950(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -809,6 +826,10 @@ def gluon_mha_decode_fp16_gfx950(
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
     return_lse: bool = False,
+    softmax_scale: float | None = None,
+    q_scale: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     total_q = q.shape[0]
 
@@ -819,14 +840,17 @@ def gluon_mha_decode_fp16_gfx950(
         k_cache=k_cache,
         max_seqlen_k=max_seqlen_k,
         window_left=window_left,
+        softmax_scale=softmax_scale,
     )
 
-    output = torch.empty(q.shape, device=q.device, dtype=q.dtype)
+    is_fp8 = q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    out_dtype = torch.bfloat16 if is_fp8 else q.dtype
+    output = torch.empty(q.shape, device=q.device, dtype=out_dtype)
 
     if config.is_sliding:
         # No split-k for sliding window attention
         grid = (total_q, config.num_kv_heads * config.num_groups, 1)
-        _mha_decode_sliding_fp16[grid](
+        _mha_decode_sliding[grid](
             q,
             k_cache,
             v_cache,
@@ -849,6 +873,7 @@ def gluon_mha_decode_fp16_gfx950(
             config.is_sliding,
             config.window_left,
             has_sink,
+            is_fp8,
             num_warps=1,
         )
     else:
@@ -869,7 +894,7 @@ def gluon_mha_decode_fp16_gfx950(
             config.num_kv_heads * config.num_groups,
             config.num_kv_splits,
         )
-        _mha_decode_fp16[grid](
+        _mha_decode[grid](
             q,
             k_cache,
             v_cache,
@@ -892,18 +917,20 @@ def gluon_mha_decode_fp16_gfx950(
             config.block_n,
             config.is_sliding,
             config.window_left,
+            is_fp8,
             num_warps=1,
         )
 
         # Sink is a single global softmax entry, so split-k must merge it once in
         # reduce. Adding it in each split would count the sink once per split.
         grid = (total_q, config.num_q_heads)
-        _mha_decode_reduce_fp16[grid](
+        _mha_decode_reduce[grid](
             mid_o,
             mid_lse,
             output,
             cache_seqlens,
             sink_arg,
+            k_cache,
             config.sm_scale,
             page_table.stride(0),
             config.num_kv_splits,
@@ -915,6 +942,7 @@ def gluon_mha_decode_fp16_gfx950(
             config.block_m,
             config.block_n,
             has_sink,
+            is_fp8,
             num_warps=1,
         )
     return output

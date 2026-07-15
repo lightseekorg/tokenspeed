@@ -38,7 +38,7 @@ class PagedCacheTerminalSchedulerTest : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         auto cfg = SchedulerTestSuite::MakeConfig();
-        cfg.page_size = 2;
+        cfg.block_size = 2;
         cfg.device_allocator.total_pages = 64;
         cfg.host_allocator.total_pages = 64;
         cfg.max_scheduled_tokens = 64;
@@ -96,7 +96,7 @@ class PagedCacheDecodePublishTest : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         auto cfg = SchedulerTestSuite::MakeConfig();
-        cfg.page_size = 1;
+        cfg.block_size = 1;
         cfg.device_allocator.total_pages = 64;
         cfg.host_allocator.total_pages = 64;
         cfg.max_scheduled_tokens = 64;
@@ -133,7 +133,7 @@ class PagedCacheOverlapSchedulerTest
 protected:
     SchedulerConfig MakeConfig() override {
         auto cfg = SchedulerTestSuite::MakeConfig();
-        cfg.page_size = 64;
+        cfg.block_size = 64;
         cfg.device_allocator.total_pages = 256;
         cfg.host_allocator.total_pages = 256;
         cfg.max_scheduled_tokens = 256;
@@ -177,7 +177,7 @@ class PagedCacheOverlapRetractTest
 protected:
     SchedulerConfig MakeConfig() override {
         auto cfg = SchedulerTestSuite::MakeConfig();
-        cfg.page_size = 2;
+        cfg.block_size = 2;
         cfg.device_allocator.total_pages = 10;
         cfg.host_allocator.total_pages = 64;
         cfg.max_scheduled_tokens = 64;

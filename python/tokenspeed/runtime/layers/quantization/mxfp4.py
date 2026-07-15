@@ -99,6 +99,10 @@ def _iter_ignored_layer_pattern_aliases(raw: str):
         yield raw.removeprefix("language_model.")
         return
 
+    if "model.language_model." in raw:
+        yield raw.replace("model.language_model.", "model.")
+        return
+
     if raw.startswith("re:"):
         regex = raw[3:]
         for prefix in ("language_model.", re.escape("language_model.")):

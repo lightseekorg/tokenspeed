@@ -1,0 +1,51 @@
+api_version: ci.tokenspeed.io/v1
+name: eval-qwen3.5-397b-a17b-mxfp4-aime25
+type: eval
+triggers:
+  - per-commit
+  - manual
+runner:
+  labels:
+    - amd-mi35x-4gpu-test
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps.sh
+server:
+  command: >-
+    ts serve
+    --model amd/Qwen3.5-397B-A17B-MXFP4
+    --tp 4
+    --max-model-len 80000
+    --max-num-seqs 16
+    --trust-remote-code
+    --quantization mxfp4
+    --weight-loader-prefetch-checkpoints
+    --sampling-backend greedy
+    --disable-kvstore
+    --kvstore-ratio 0.0
+    --enable-cache-report
+    --host 127.0.0.1
+    --port 8000
+    --policy round_robin
+    --gateway-startup-timeout 600
+  ready:
+    url: http://127.0.0.1:8000/readiness
+    timeout: 1800
+    interval: 10
+eval:
+  install:
+    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
+  command: >-
+    /tmp/evalscope-perf/bin/evalscope eval
+    --model amd/Qwen3.5-397B-A17B-MXFP4
+    --api-url http://127.0.0.1:8000/v1
+    --api-key EMPTY_TOKEN
+    --datasets aime25
+    --limit 8
+    --eval-batch-size 8
+    --stream
+    --generation-config '{"do_sample":false,"temperature":0.0,"max_tokens":16384}'
+report:
+  github_step_summary: true
+score_threshold: 0.75

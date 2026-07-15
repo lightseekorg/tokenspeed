@@ -53,6 +53,7 @@ from tokenspeed_kernel_amd.ops.attention.gluon.utils import (
     _INV_LN2_VALUE,
     _LN2,
     InputStrides,
+    attention_layouts,
     max,
     maximum,
 )
@@ -106,6 +107,7 @@ class ExtendConfig:
     HAS_SINK: gl.constexpr
     HAS_LSE: gl.constexpr
     WINDOW_LEFT: gl.constexpr
+    IS_FP8: gl.constexpr
     q_strides: InputStrides
     qk_layout: gl.constexpr
     pv_layout: gl.constexpr
@@ -134,26 +136,32 @@ class ExtendConfig:
         HAS_SINK,
         HAS_LSE,
         WINDOW_LEFT,
+        IS_FP8,
+        KV_DTYPE,
         q_strides,
     ):
-        assert HEAD_DIM == 64
+        assert HEAD_DIM in (64, 128)
         assert BLOCK_N == PAGE_SIZE
 
-        mfma_layout = gl.amd.AMDMFMALayout(
-            version=4,
+        # Extend uses a [32, 32, 16] MFMA with NUM_WARPS warp tiling.
+        (
+            qk_layout,
+            pv_layout,
+            q_layout,
+            k_layout,
+            p_layout,
+            v_layout,
+            load_layout,
+            store_layout,
+            k_smem_layout,
+            v_smem_layout,
+        ) = attention_layouts(
+            HEAD_DIM,
+            BLOCK_N,
+            IS_FP8,
+            KV_DTYPE,
+            num_warps=NUM_WARPS,
             instr_shape=[32, 32, 16],
-            transposed=True,
-            warps_per_cta=[NUM_WARPS, 1],
-        )
-        qk_layout = mfma_layout
-        pv_layout = mfma_layout
-        load_layout = gl.BlockedLayout([1, 8], [8, 8], [NUM_WARPS, 1], [1, 0])
-        store_layout = load_layout
-        k_smem_layout = gl.PaddedSharedLayout.with_identity_for(
-            [[512, 8]], [BLOCK_N, HEAD_DIM], [1, 0]
-        )
-        v_smem_layout = gl.PaddedSharedLayout.with_identity_for(
-            [[512, 32]], [BLOCK_N, HEAD_DIM], [1, 0]
         )
 
         self.N_HEADS = gl.constexpr(N_HEADS)
@@ -170,13 +178,14 @@ class ExtendConfig:
         self.HAS_SINK = gl.constexpr(HAS_SINK)
         self.HAS_LSE = gl.constexpr(HAS_LSE)
         self.WINDOW_LEFT = gl.constexpr(WINDOW_LEFT)
+        self.IS_FP8 = gl.constexpr(IS_FP8)
         self.q_strides = q_strides
         self.qk_layout = gl.constexpr(qk_layout)
         self.pv_layout = gl.constexpr(pv_layout)
-        self.q_layout = gl.constexpr(gl.DotOperandLayout(0, qk_layout, k_width=8))
-        self.k_layout = gl.constexpr(gl.DotOperandLayout(1, qk_layout, k_width=8))
-        self.p_layout = gl.constexpr(gl.DotOperandLayout(0, pv_layout, k_width=4))
-        self.v_layout = gl.constexpr(gl.DotOperandLayout(1, pv_layout, k_width=4))
+        self.q_layout = gl.constexpr(q_layout)
+        self.k_layout = gl.constexpr(k_layout)
+        self.p_layout = gl.constexpr(p_layout)
+        self.v_layout = gl.constexpr(v_layout)
         self.load_layout = gl.constexpr(load_layout)
         self.store_layout = gl.constexpr(store_layout)
         self.k_smem_layout = gl.constexpr(k_smem_layout)
@@ -460,7 +469,7 @@ class ExtendProgram:
 
 
 @gluon.jit
-def _mha_extend_fp16(
+def _mha_extend(
     q_ptr,
     k_cache_ptr,
     v_cache_ptr,
@@ -486,6 +495,7 @@ def _mha_extend_fp16(
     HAS_SINK: gl.constexpr,
     HAS_LSE: gl.constexpr,
     WINDOW_LEFT: gl.constexpr,
+    IS_FP8: gl.constexpr,
 ):
     cfg = ExtendConfig(
         N_HEADS,
@@ -501,6 +511,8 @@ def _mha_extend_fp16(
         HAS_SINK,
         HAS_LSE,
         WINDOW_LEFT,
+        IS_FP8,
+        k_cache_ptr.dtype.element_ty,
         InputStrides(Q_STRIDE_T, Q_STRIDE_H, Q_STRIDE_D),
     )
     program = ExtendProgram.create(
@@ -598,7 +610,7 @@ def _mha_extend_fp16(
     program.store_lse(l_i, m_i)
 
 
-def gluon_mha_extend_fp16_gfx950(
+def gluon_mha_extend_gfx950(
     q: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_kv: torch.Tensor,
@@ -613,13 +625,19 @@ def gluon_mha_extend_fp16_gfx950(
     return_lse: bool = False,
     max_seqlen_q: int = 1,
     max_seqlen_k: int = 1,
+    softmax_scale: float | None = None,
+    q_scale: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     head_dim = q.shape[2]
     n_heads = q.shape[1]
     n_kv_heads = k_cache.shape[2]
     page_size = k_cache.shape[1]
     block_m, block_n, num_warps = _select_extend_tile(max_seqlen_q)
-    sm_scale = (1.0 / math.sqrt(head_dim)) * _INV_LN2_VALUE
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(head_dim)
+    sm_scale = softmax_scale * _INV_LN2_VALUE
 
     # max_seqlen_q must be >= the true max query length; extra tiles early-exit.
     batch = cu_seqlens_q.shape[0] - 1
@@ -630,7 +648,9 @@ def gluon_mha_extend_fp16_gfx950(
     cu_q_i32 = cu_seqlens_q.to(torch.int32).contiguous()
     cache_i32 = cache_seqlens.to(torch.int32).contiguous()
 
-    output = torch.empty(q.shape, device=q.device, dtype=q.dtype)
+    is_fp8 = q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    out_dtype = torch.bfloat16 if is_fp8 else q.dtype
+    output = torch.empty(q.shape, device=q.device, dtype=out_dtype)
     if return_lse:
         lse = torch.empty((q.shape[0], n_heads), device=q.device, dtype=torch.float32)
         lse_arg = lse
@@ -638,7 +658,7 @@ def gluon_mha_extend_fp16_gfx950(
         lse = None
         lse_arg = q
     grid = (blocks_per_req, batch, n_heads)
-    _mha_extend_fp16[grid](
+    _mha_extend[grid](
         q,
         k_cache,
         v_cache,
@@ -664,6 +684,7 @@ def gluon_mha_extend_fp16_gfx950(
         has_sink,
         return_lse,
         window_left,
+        is_fp8,
         num_warps=num_warps,
     )
     if return_lse:

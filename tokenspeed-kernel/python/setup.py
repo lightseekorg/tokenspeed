@@ -508,19 +508,38 @@ class CudaKernelBuilder:
                 dirs.append(path_str)
                 seen.add(path_str)
 
+        def _is_complete_cuda_include(path: Path) -> bool:
+            return all(
+                (path / header).exists() for header in ("cuda_runtime.h", "cublas_v2.h")
+            )
+
+        found_toolkit_headers = False
         for cuda_root in self._cuda_toolkit_roots():
             cuda_include = cuda_root / "include"
-            if (cuda_include / "cuda_runtime.h").exists():
-                _add_dir(cuda_include)
+            if not _is_complete_cuda_include(cuda_include):
+                continue
+            _add_dir(cuda_include)
             if (cuda_include / "cccl").exists():
                 _add_dir(cuda_include / "cccl")
+            found_toolkit_headers = True
+            break
 
-        for base_path in self._site_paths():
-            for candidate in sorted(base_path.glob("nvidia/cu*/include"), reverse=True):
-                if (candidate / "cuda_runtime.h").exists():
+        # Do not mix wheel CUDA headers with an available toolkit.
+        if not found_toolkit_headers:
+            found_wheel_headers = False
+            for base_path in self._site_paths():
+                for candidate in sorted(
+                    base_path.glob("nvidia/cu*/include"), reverse=True
+                ):
+                    if not _is_complete_cuda_include(candidate):
+                        continue
                     _add_dir(candidate)
-                if (candidate / "cccl").exists():
-                    _add_dir(candidate / "cccl")
+                    if (candidate / "cccl").exists():
+                        _add_dir(candidate / "cccl")
+                    found_wheel_headers = True
+                    break
+                if found_wheel_headers:
+                    break
 
         try:
             tvm_ffi = importlib.import_module("tvm_ffi")

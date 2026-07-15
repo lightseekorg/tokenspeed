@@ -199,6 +199,46 @@ def test_bootstrap_reads_env_and_only_runs_once(monkeypatch):
     assert len(registrations) == 2
 
 
+def test_proton_available_reflects_import(monkeypatch):
+    monkeypatch.setattr(profiling, "_HAS_PROTON", True)
+    assert profiling.proton_available()
+
+    monkeypatch.setattr(profiling, "_HAS_PROTON", False)
+    assert not profiling.proton_available()
+
+
+def test_profile_config_from_env_defaults(monkeypatch):
+    for env in (
+        "TOKENSPEED_KERNEL_PROFILE_OUTPUT",
+        "TOKENSPEED_KERNEL_PROFILE_DATA",
+        "TOKENSPEED_KERNEL_PROFILE_BACKEND",
+        "TOKENSPEED_KERNEL_PROFILE_MODE",
+        "TOKENSPEED_KERNEL_PROFILE_HOOK",
+        "TOKENSPEED_KERNEL_PROFILE_OUTPUT_FORMAT",
+    ):
+        monkeypatch.delenv(env, raising=False)
+
+    cfg = profiling.profile_config_from_env()
+    assert cfg == profiling.ProfilingConfig()
+
+
+def test_profile_config_from_env_output_override_wins(monkeypatch):
+    monkeypatch.setenv("TOKENSPEED_KERNEL_PROFILE_OUTPUT", "env_profile")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_PROFILE_DATA", "trace")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_PROFILE_BACKEND", "roctracer")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_PROFILE_MODE", "periodic_flushing")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_PROFILE_OUTPUT_FORMAT", "chrome_trace")
+
+    cfg = profiling.profile_config_from_env(output="rank0/step5.proton")
+
+    assert cfg.output == "rank0/step5.proton"
+    assert cfg.data == "trace"
+    assert cfg.backend == "roctracer"
+    assert cfg.mode == "periodic_flushing"
+    assert cfg.hook == "triton"
+    assert cfg.output_format == "chrome_trace"
+
+
 def test_shape_capture_records_dump_and_clear(tmp_path):
     output = tmp_path / "shapes.json"
 

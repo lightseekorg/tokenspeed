@@ -22,6 +22,7 @@
 
 from datetime import timedelta
 
+import torch
 import torch.distributed as dist
 
 from tokenspeed.runtime.distributed.mapping import Group, Mapping
@@ -52,6 +53,7 @@ class ProcessGroupManager:
         distributed_init_method: str = "env://",
         backend: str = "nccl",
         timeout: int | None = None,
+        device_id: "torch.device | None" = None,
     ) -> None:
         if not dist.is_initialized():
             if distributed_init_method is None:
@@ -71,6 +73,7 @@ class ProcessGroupManager:
                 world_size=mapping.world_size,
                 rank=mapping.rank,
                 timeout=timeout,
+                device_id=device_id,
             )
 
     def register_process_group(

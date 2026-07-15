@@ -27,7 +27,8 @@ replay by an eager ``embed_tokens`` gather (text) or by precomputed merged
 embeddings (multimodal, via the model's ``multimodal_input_embeds`` seam).
 Constructed after the decode
 :class:`~tokenspeed.runtime.execution.cuda_graph_wrapper.CudaGraphWrapper`,
-borrowing its capture stream so all graphs share one mempool. At serving time
+borrowing its capture stream; buckets share one private mempool, deliberately
+not the decode graphs' pool (see :meth:`capture`). At serving time
 the executor's target-forward dispatch is a flat
 three-way -- decode & captured replays the decode graph (one level up, since
 it captures the whole step), prefill & captured replays here (:meth:`can_run`
@@ -49,7 +50,6 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
-from tokenspeed.runtime.execution import cuda_graph_wrapper as _cuda_graph_wrapper
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     BreakableCapture,
     active_forward,
@@ -272,20 +272,25 @@ class PrefillGraph:
 
         Called from ``__init__``; ``decode_wrapper`` supplies the shared
         capture stream and dummy paged-cache block tables (used here only,
-        not stored). Sharing
-        decode's stream + mempool puts all graphs in one pool-reuse domain
-        (pool blocks are stream-keyed), so graph memory stays ~the largest
-        bucket's peak instead of growing per bucket.
+        not stored). Buckets share one PRIVATE mempool (first capture
+        allocates it), so graph memory stays ~the largest bucket's peak --
+        but never the decode graphs' pool: eager ops cache raw pointers to
+        buffers they lazily allocated inside a decode capture (flashinfer's
+        trtllm-gen MoE runner), and a prefill capture reusing those freed
+        blocks means every replay rewrites them, corrupting the next eager
+        call (IMA; A/B-proven on qwen3.5 MTP).
 
         Runs under inference mode like serving forwards (in-place updates on
-        inference-mode model state buffers are only legal there). OOM
-        propagates -- the buckets genuinely didn't fit, don't silently boot in
-        a slower eager mode. Any other failure means the dummy-batch machinery
-        doesn't cover this model family yet: degrade to eager prefill instead
-        of crashing the server, and agree on that across the world (a MIN
-        all-reduce over the success flag) -- replay force-sets
-        ``global_num_tokens`` on every rank, so one eager rank among replaying
-        peers diverges the token counts and deadlocks the next collective.
+        inference-mode model state buffers are only legal there). OOM fails
+        the boot LOUDLY (the graph pool did not fit next to weights + KV
+        cache; the operator decides: free headroom, lower
+        ``--prefill-graph-max-tokens``, or 0 to disable). Any other failure
+        means the dummy-batch machinery doesn't cover this model family yet:
+        degrade to eager prefill instead of crashing the server, and agree on
+        that across the world (a MIN all-reduce over the success flag) --
+        replay force-sets ``global_num_tokens`` on every rank, so one eager
+        rank among replaying peers diverges the token counts and deadlocks
+        the next collective.
         """
         if self.disable:
             return
@@ -296,12 +301,18 @@ class PrefillGraph:
             dtype=weight.dtype,
             device=weight.device,
         )
-        self._pool = _cuda_graph_wrapper.global_graph_memory_pool
         captured_ok = True
         try:
             with maybe_inference_mode():
                 self._capture_all_buckets(decode_wrapper)
         except torch.cuda.OutOfMemoryError:
+            logger.error(
+                "Prefill graph capture ran out of GPU memory. Free up "
+                "--gpu-memory-utilization headroom, lower "
+                "--prefill-graph-max-tokens (default %d), or set it to 0 to "
+                "disable the prefill graph.",
+                2048,
+            )
             raise
         except (NotImplementedError, AttributeError, KeyError, RuntimeError) as exc:
             logger.warning(
@@ -386,6 +397,32 @@ class PrefillGraph:
         if num_tokens < bucket:
             self._input_embeds_buf[num_tokens:bucket].zero_()
 
+    def _dummy_flat_tables(self, num_tokens: int) -> dict[str, "torch.Tensor"]:
+        """Capture-time flat per-group tables for the dummy batch: all zeros =
+        the reserved null block 0 (the decode-capture convention), one row,
+        wide enough for num_tokens. Empty for non-flat backends; state groups
+        ride to their own backend and are skipped."""
+        backend = self.attn_backend
+        if not getattr(backend, "uses_flat_cache_groups", False):
+            return {}
+        # Composite wrappers (hybrid) hold the flat KV consumer as a child.
+        if not hasattr(backend, "page_size") and hasattr(backend, "full_attn_backend"):
+            backend = backend.full_attn_backend
+        # Full width: backends that derive the row stride from max_kv_len
+        # (trtllm) index the whole row even when the bucket is small.
+        width = getattr(backend, "max_num_pages", 0) or -(
+            -num_tokens // backend.page_size
+        )
+        # ALL groups, state included: hybrid wrappers forward the dict to the
+        # mamba child, which requires its state group; KV children shed state
+        # groups themselves (_shed_state_groups).
+        return {
+            str(spec.group_id): torch.zeros(
+                (1, width), dtype=torch.int32, device=self.config.device
+            )
+            for spec in getattr(self.token_to_kv_pool, "paged_cache_group_specs", ())
+        }
+
     def _make_dummy_batch(
         self, num_tokens: int, decode_wrapper: CudaGraphWrapper | None
     ) -> ForwardContext:
@@ -444,6 +481,9 @@ class PrefillGraph:
                 extra_metadata_kwargs["paged_cache_block_tables"] = tables
             extra_metadata_kwargs["num_tokens"] = num_tokens
             extra_metadata_kwargs["positions"] = ib.positions_buf[:num_tokens]
+        flat_tables = self._dummy_flat_tables(num_tokens)
+        if flat_tables:
+            extra_metadata_kwargs["flat_block_tables"] = flat_tables
         self.attn_backend.init_forward_metadata(
             bs=1,
             num_extends=1,
@@ -545,7 +585,7 @@ class PrefillGraph:
         split itself, while the captured token-shaped compute is uniform over
         all rows (pure decode is the decode graph's job). Two ctx fields are
         baked into the captured segments rather than rebound at replay -- the
-        ``draft_first_step_reduce`` in-graph row reduction and the
+        draft first-step row narrowing (keyed on ``accept_lengths``) and the
         ``capture_hidden_mode`` aux-hidden capture -- so a live forward carrying
         different values falls back to eager rather than silently dropping the
         reduce / mismatching aux. Prefix caching (cache hits and chunked-prefill
@@ -560,7 +600,7 @@ class PrefillGraph:
             return None
         if not (ctx.forward_mode.is_extend() or ctx.forward_mode.is_mixed()):
             return None
-        if ctx.draft_first_step_reduce:
+        if ctx.accept_lengths is not None:
             return None
         if ctx.capture_hidden_mode != self._captured_hidden_mode:
             return None

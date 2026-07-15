@@ -27,6 +27,13 @@ from typing import TYPE_CHECKING
 
 import torch
 import zmq
+from tokenspeed_kernel.profiling import (
+    ProfilingState,
+    profile_config_from_env,
+    proton_available,
+    start_profiling,
+    stop_profiling,
+)
 from viztracer import VizTracer
 
 from tokenspeed.runtime.distributed.process_group_manager import (
@@ -35,12 +42,16 @@ from tokenspeed.runtime.distributed.process_group_manager import (
 from tokenspeed.runtime.engine.generation_output_processor import RequestState
 from tokenspeed.runtime.engine.io_struct import (
     AbortReq,
+    DestroyWeightsUpdateGroupReqInput,
+    DestroyWeightsUpdateGroupReqOutput,
     FlushCacheReqInput,
     FlushCacheReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetLoadReqInput,
     GetLoadReqOutput,
+    InitWeightsUpdateGroupReqInput,
+    InitWeightsUpdateGroupReqOutput,
     IsSchedulerPausedReqInput,
     IsSleepingReqInput,
     PauseSchedulerReqInput,
@@ -53,6 +64,8 @@ from tokenspeed.runtime.engine.io_struct import (
     SetInternalStateReq,
     SetInternalStateReqOutput,
     TokenizedGenerateReqInput,
+    UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromDistributedReqOutput,
 )
 from tokenspeed.runtime.engine.request_types import FINISH_ABORT
 from tokenspeed.runtime.engine.scheduler_utils import make_spec
@@ -69,6 +82,17 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+
+def _profile_rank_tag(attn_mapping) -> str:
+    """File-name tag identifying this scheduler process's profile outputs."""
+    parts = []
+    if attn_mapping.has_dp:
+        parts.append(f"DP{attn_mapping.dp_rank}")
+    if attn_mapping.has_cp:
+        parts.append(f"CP{attn_mapping.cp_rank}")
+    parts.append(f"TP{attn_mapping.tp_rank}")
+    return "-".join(parts)
 
 
 class RequestHandler:
@@ -89,6 +113,7 @@ class RequestHandler:
         architectures: list[str] | None = None,
         pause_controller=None,
         memory_controller=None,
+        model_runner=None,
     ) -> None:
 
         self.forward_ct = 0
@@ -98,6 +123,9 @@ class RequestHandler:
         # Owns release/resume_memory_occupation (data plane). See
         # memory_occupation.py. Shares the pause controller's drain machinery.
         self.memory_controller = memory_controller
+        # ModelRunner for in-place RL weight sync (NCCL group init + receive).
+        # The scheduler worker passes it in; None elsewhere (e.g. unit tests).
+        self.model_runner = model_runner
 
         mapping = server_args.mapping
         self.attn_tp_size = mapping.attn.tp_size
@@ -106,6 +134,7 @@ class RequestHandler:
             "gloo", mapping.attn.tp_group
         )
         self.attn_tp_src_rank = mapping.attn.tp_group[0]
+        self.profile_rank_tag = _profile_rank_tag(mapping.attn)
 
         self.hf_eos_token_id = hf_eos_token_id
         self.max_req_len = max_req_len
@@ -209,6 +238,24 @@ class RequestHandler:
                     self.send_func.send_pyobj(self.get_load_fn())
                 else:
                     self.send_func.send_pyobj(GetLoadReqOutput())
+            elif isinstance(recv_req, InitWeightsUpdateGroupReqInput):
+                # RL weight sync: join the trainer's NCCL group on this worker.
+                ok, msg = self.model_runner.init_weights_update_group(recv_req)
+                self.send_func.send_pyobj(
+                    InitWeightsUpdateGroupReqOutput(success=ok, message=msg)
+                )
+            elif isinstance(recv_req, UpdateWeightsFromDistributedReqInput):
+                # RL weight sync: receive broadcast weights + load into the model.
+                ok, msg = self.model_runner.update_weights_from_distributed(recv_req)
+                self.send_func.send_pyobj(
+                    UpdateWeightsFromDistributedReqOutput(success=ok, message=msg)
+                )
+            elif isinstance(recv_req, DestroyWeightsUpdateGroupReqInput):
+                # RL weight sync: tear down the trainer's NCCL group on this worker.
+                ok, msg = self.model_runner.destroy_weights_update_group(recv_req)
+                self.send_func.send_pyobj(
+                    DestroyWeightsUpdateGroupReqOutput(success=ok, message=msg)
+                )
             else:
                 raise NotImplementedError(f"Unsupported request type: {type(recv_req)}")
         return new_req_specs, req_states, bootstrap_infos, abort_rids
@@ -266,8 +313,11 @@ class RequestHandler:
         )
 
     # ------------------------------------------------------------------
-    # Profiling: torch / cuda / viztracer / mem-snapshot, driven by
-    # /start_profile and /stop_profile control requests.
+    # Profiling: torch / cuda / viztracer / mem-snapshot / proton, driven
+    # by /start_profile and /stop_profile control requests. Proton must be
+    # driven from this process (not the frontend): its GPU hooks are
+    # per-process and the scheduler subprocess is torn down with SIGKILL,
+    # so an atexit-based finalize would never write the profile.
     # ------------------------------------------------------------------
 
     def init_profiler(self):
@@ -302,13 +352,38 @@ class RequestHandler:
                 message="Profiling is already in progress. Call /stop_profile first.",
             )
 
-        self.profile_by_stage = profile_by_stage
-
         if output_dir is None:
             output_dir = envs.TOKENSPEED_PROFILER_DIR.get()
         if activities is None:
             activities = ["CPU", "GPU"]
 
+        # All validation must precede any state mutation: the event loop runs
+        # _profile_batch_predicate on every batch, so a rejected request that
+        # left partial profiler state behind would crash the scheduler.
+        if "PROTON" in activities:
+            conflicting = sorted({"GPU", "CUDA_PROFILER"} & set(activities))
+            if conflicting:
+                return ProfileReqOutput(
+                    success=False,
+                    message="PROTON cannot be combined with "
+                    f"{', '.join(conflicting)}: CUPTI/roctracer supports only "
+                    "one GPU profiling client per process.",
+                )
+            if not proton_available():
+                return ProfileReqOutput(
+                    success=False,
+                    message="Proton is not available: the installed "
+                    "tokenspeed-triton does not provide a profiler.",
+                )
+            if ProfilingState.get().active:
+                return ProfileReqOutput(
+                    success=False,
+                    message="A Proton session is already active in this "
+                    "process (e.g. via TOKENSPEED_KERNEL_PROFILE); it cannot "
+                    "be controlled through /start_profile.",
+                )
+
+        self.profile_by_stage = profile_by_stage
         self.profiler_output_dir = output_dir
         self.torch_profiler_with_stack = with_stack
         self.torch_profiler_record_shapes = record_shapes
@@ -368,12 +443,21 @@ class RequestHandler:
         if "CUDA_PROFILER" in activities:
             torch.cuda.cudart().cudaProfilerStart()
 
+        if "PROTON" in activities:
+            Path(self.profiler_output_dir).mkdir(parents=True, exist_ok=True)
+            # Proton appends the output format extension (e.g. ".hatchet").
+            proton_output = os.path.join(
+                self.profiler_output_dir,
+                f"{self.profile_id}-{self.profile_rank_tag}{stage_suffix}.proton",
+            )
+            start_profiling(profile_config_from_env(output=proton_output))
+
         if "VIZTRACER" in activities:
             Path(self.profiler_output_dir).mkdir(parents=True, exist_ok=True)
             self.viztracer = VizTracer(
                 output_file=os.path.join(
                     self.profiler_output_dir,
-                    f"{self.profile_id}-TP-{self.attn_tp_rank}{stage_suffix}.viztracer.json",
+                    f"{self.profile_id}-{self.profile_rank_tag}{stage_suffix}.viztracer.json",
                 ),
                 min_duration=int(
                     os.environ.get("TOKENSPEED_VIZTRACER_MIN_DURATION_US", "100")
@@ -411,7 +495,7 @@ class RequestHandler:
             self.torch_profiler.export_chrome_trace(
                 os.path.join(
                     self.profiler_output_dir,
-                    f"{self.profile_id}-TP-{self.attn_tp_rank}{stage_suffix}.trace.json.gz",
+                    f"{self.profile_id}-{self.profile_rank_tag}{stage_suffix}.trace.json.gz",
                 )
             )
             torch.distributed.barrier(self.attn_tp_cpu_group)
@@ -419,13 +503,18 @@ class RequestHandler:
         if self.profiler_activities is not None and "MEM" in self.profiler_activities:
             memory_profile_path = os.path.join(
                 self.profiler_output_dir,
-                f"{self.profile_id}-TP-{self.attn_tp_rank}-memory{stage_suffix}.pickle",
+                f"{self.profile_id}-{self.profile_rank_tag}-memory{stage_suffix}.pickle",
             )
             torch.cuda.memory._dump_snapshot(memory_profile_path)
             torch.cuda.memory._record_memory_history(enabled=None)
 
         if "CUDA_PROFILER" in self.profiler_activities:
             torch.cuda.cudart().cudaProfilerStop()
+
+        if "PROTON" in self.profiler_activities:
+            # Finalizes the session and writes the profile now, while this
+            # process is still alive (shutdown is SIGKILL; no atexit).
+            stop_profiling()
 
         if "VIZTRACER" in self.profiler_activities and self.viztracer is not None:
             self.viztracer.stop()

@@ -884,7 +884,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 topk_lens=topk_lens,
             )
 
-        if ctx.draft_first_step_reduce:
+        if ctx.accept_lengths is not None:
             attn_output = attn_output.index_select(0, ctx.gather_ids)
         output, _ = self.o_proj(attn_output)
         return output
@@ -1099,7 +1099,7 @@ class GlmMoeDsaDecoderLayer(DeepseekV3DecoderLayer):
                 out_cache_loc=out_cache_loc,
                 comm_manager=self.comm_manager,
             )
-            if ctx.draft_first_step_reduce:
+            if ctx.accept_lengths is not None:
                 residual = residual.index_select(0, ctx.gather_ids)
             hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
                 hidden_states, residual, ctx

@@ -19,6 +19,7 @@
 // SOFTWARE.
 
 #include <nanobind/nanobind.h>
+#include <nanobind/ndarray.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/map.h>
@@ -107,6 +108,17 @@ void BindCacheCommonFields(Cls& cls) {
 NB_MODULE(tokenspeed_scheduler_ext, m) {
     m.doc() = "TokenSpeed scheduler bindings";
 
+    // Build-time KV-cache path of this extension: true when compiled with
+    // TOKENSPEED_FLAT_KVCACHE (flat KvCacheCoordinator FSM path), false for the
+    // default radix LocalKVAllocator build. Python gates paged-cache group
+    // publication — and therefore the flat CUDA-graph capture path — on this
+    // flag; a radix build never populates flat_block_tables.
+#if TOKENSPEED_FLAT_KVCACHE
+    m.attr("FLAT_KVCACHE") = true;
+#else
+    m.attr("FLAT_KVCACHE") = false;
+#endif
+
     nb::class_<tokenspeed::SchedulerStats>(m, "SchedulerStats")
         .def(nb::init<>())
         .def_ro("total_batches", &tokenspeed::SchedulerStats::total_batches)
@@ -164,8 +176,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                tokenspeed::PagedCacheGroupConfig::Retention retention,
                std::optional<std::int32_t> sliding_window_tokens, tokenspeed::PagedCacheGroupFamily family) {
                 new (self) tokenspeed::PagedCacheGroupConfig{
-                    std::move(group_id),   rows_per_page, entry_stride_tokens, total_pages, retention,
-                    sliding_window_tokens, family};
+                    std::move(group_id), rows_per_page, entry_stride_tokens,   total_pages,
+                    /*block_size=*/0,    retention,     sliding_window_tokens, family};
             },
             nb::arg("group_id"), nb::arg("rows_per_page"), nb::arg("entry_stride_tokens"), nb::arg("total_pages"),
             nb::arg("retention") = tokenspeed::PagedCacheGroupConfig::Retention::FullHistory,
@@ -175,6 +187,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("rows_per_page", &tokenspeed::PagedCacheGroupConfig::rows_per_page)
         .def_rw("entry_stride_tokens", &tokenspeed::PagedCacheGroupConfig::entry_stride_tokens)
         .def_rw("total_pages", &tokenspeed::PagedCacheGroupConfig::total_pages)
+        .def_rw("block_size", &tokenspeed::PagedCacheGroupConfig::block_size)
         .def_rw("retention", &tokenspeed::PagedCacheGroupConfig::retention)
         .def_rw("sliding_window_tokens", &tokenspeed::PagedCacheGroupConfig::sliding_window_tokens)
         .def_rw("family", &tokenspeed::PagedCacheGroupConfig::family)
@@ -218,7 +231,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("required_groups", &tokenspeed::PrefixCacheAdjunctSpec::required_groups);
 
     scheduler_config.def(nb::init<>())
-        .def_rw("page_size", &tokenspeed::SchedulerConfig::page_size)
+        .def_rw("block_size", &tokenspeed::SchedulerConfig::block_size)
         .def_rw("max_scheduled_tokens", &tokenspeed::SchedulerConfig::max_scheduled_tokens)
         .def_rw("max_batch_size", &tokenspeed::SchedulerConfig::max_batch_size)
         .def_rw("decode_input_tokens", &tokenspeed::SchedulerConfig::decode_input_tokens)
@@ -288,6 +301,11 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("op_id", &tokenspeed::cache::WriteBackDone::op_id)
         .def_rw("success", &tokenspeed::cache::WriteBackDone::success);
 
+    nb::class_<tokenspeed::cache::LoadBackDone>(cache, "LoadBackDoneEvent")
+        .def(nb::init<>())
+        .def_rw("op_id", &tokenspeed::cache::LoadBackDone::op_id)
+        .def_rw("success", &tokenspeed::cache::LoadBackDone::success);
+
     nb::class_<tokenspeed::pd::BootstrappedEvent>(pd, "BootstrappedEvent")
         .def(nb::init<std::string>(), nb::arg("request_id"))
         .def_ro("request_id", &tokenspeed::pd::BootstrappedEvent::request_id);
@@ -342,6 +360,27 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                 return op.paged_cache_block_table_base_offsets;
             },
             nb::rv_policy::reference_internal)
+        .def_prop_ro(
+            "flat_block_tables",
+            [](const tokenspeed::FlatForwardOperation& op)
+                -> const std::map<std::string, std::vector<std::vector<std::int32_t>>>& {
+                return op.flat_block_tables;
+            },
+            nb::rv_policy::reference_internal)
+        .def("flat_block_tables_arrays",
+             [](nb::handle self) {
+                 // Zero-copy 2-D int32 views over the contiguous export
+                 // buffers; `self` as owner pins the op alive. Callers must
+                 // stage-copy before the next plan mutates the op.
+                 auto& op = nb::cast<tokenspeed::FlatForwardOperation&>(self);
+                 nb::dict out;
+                 for (auto& [gid, buf] : op.flat_block_tables_contig) {
+                     const auto& dims = op.flat_block_tables_dims.at(gid);
+                     out[nb::str(gid.c_str())] =
+                         nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<2>>(buf.data(), {dims[0], dims[1]}, self);
+                 }
+                 return out;
+             })
         .def("num_extends", &tokenspeed::FlatForwardOperation::num_extends)
         .def_ro("mamba_pool_indices", &tokenspeed::FlatForwardOperation::mamba_working_indices)
         .def_ro("mamba_checkpoint_dst_indices", &tokenspeed::FlatForwardOperation::mamba_checkpoint_dst_indices)
@@ -402,7 +441,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     nb::class_<tokenspeed::ExecutionPlan>(m, "ExecutionPlan")
         .def(nb::init<>())
         .def_prop_ro("forward", collect_forward)
-        .def_prop_ro("cache", collect_cache);
+        .def_prop_ro("cache", collect_cache)
+        .def_ro("flat_oom_request_ids", &tokenspeed::ExecutionPlan::flat_oom_request_ids);
 
     nb::class_<tokenspeed::Scheduler>(m, "Scheduler")
         .def(nb::init<tokenspeed::SchedulerConfig>(), nb::arg("config") = tokenspeed::SchedulerConfig{})

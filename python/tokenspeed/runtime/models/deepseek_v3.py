@@ -70,7 +70,10 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
     break_point,
     scrub_padding_tail,
 )
-from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.context import (
+    ForwardContext,
+    report_collective_sizing,
+)
 from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.activation import SiluAndMul
@@ -103,9 +106,7 @@ from tokenspeed.runtime.model_loader.weight_utils import (
     kv_cache_scales_loader,
 )
 from tokenspeed.runtime.models.base import BaseCausalLM
-from tokenspeed.runtime.models.utils import (
-    create_fused_set_kv_buffer_arg,
-)
+from tokenspeed.runtime.models.utils import create_fused_mla_set_kv_buffer_arg
 from tokenspeed.runtime.moe.distribution_recorder import (
     get_global_expert_distribution_recorder,
 )
@@ -505,7 +506,7 @@ class DeepseekV3AttentionMLA(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.config = config
         self.alt_stream = alt_stream
-        self.attention_backend = global_server_args_dict["attention_backend"]
+        self.attention_backend = global_server_args_dict["attention_backend"] or "mla"
         self.cli_factor = getattr(config, "cli_factor", 1)
         self.prefix = prefix
 
@@ -602,14 +603,6 @@ class DeepseekV3AttentionMLA(nn.Module):
         else:
             self.rotary_emb = None
 
-        # Fused RoPE+KV write kernel is incompatible with MLA: it assumes
-        # K and V have the same head_dim, but MLA's KV cache is a single
-        # [latent(512)|rope(64)] buffer where the two dimensions differ.
-        # Passing this to the kernel causes thread overflow and silent
-        # corruption of the latent cache.  All DeepSeek V2/V3 models use
-        # MLA (kv_lora_rank > 0), so we unconditionally disable it here.
-        self.use_fused_set_kv_buffer = False
-
         self.attn_mqa = PagedAttention(
             self.num_local_heads,
             self.kv_lora_rank + self.qk_rope_head_dim,
@@ -646,13 +639,28 @@ class DeepseekV3AttentionMLA(nn.Module):
         q_b_proj, o_proj) stay in the captured prefill graph; only the
         data-dependent attention -- KV write + varlen prefill / absorb decode
         kernels + the live prefill/decode split -- runs as the eager break
-        (``_attention_core``). This keeps the big projection GEMMs graphed
-        instead of dispatch-bound eager, collapsing the inter-segment bubbles a
-        coarse whole-attention break leaves. Outside capture the
-        ``@break_point`` is a direct call, so the eager path is unchanged.
+        (``_attn``). This keeps the big projection GEMMs graphed instead of
+        dispatch-bound eager, collapsing the inter-segment bubbles a coarse
+        whole-attention break leaves. Outside capture the ``@break_point`` is
+        a direct call, so the eager path is unchanged.
         """
         if hidden_states.shape[0] == 0:
             return hidden_states
+        q, latent_cache = self._project_q_latent(
+            hidden_states, ctx, comm_manager, block_scale
+        )
+        attn_output = self._attn(positions, q, latent_cache, ctx, out_cache_loc)
+        output, _ = self.o_proj(attn_output)
+        return output
+
+    def _project_q_latent(
+        self,
+        hidden_states: torch.Tensor,
+        ctx: ForwardContext,
+        comm_manager: CommManager,
+        block_scale: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """QKV projection producing absorbed ``q`` and raw ``latent_cache``."""
         if self.q_lora_rank is not None:
             qkv = self.fused_qkv_a_proj_with_mqa(
                 hidden_states, block_scale, torch.bfloat16
@@ -675,19 +683,10 @@ class DeepseekV3AttentionMLA(nn.Module):
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
             kv_a = latent_cache[..., : self.kv_lora_rank]
             self.kv_a_layernorm(kv_a, inplace=True)
-
-        attn_output = self._attention_core(
-            positions, q, latent_cache, ctx, out_cache_loc
-        )
-
-        if ctx.draft_first_step_reduce:
-            # KV already written; keep one live row per request for o_proj/MLP.
-            attn_output = attn_output.index_select(0, ctx.gather_ids)
-        output, _ = self.o_proj(attn_output)
-        return output
+        return q, latent_cache
 
     @break_point
-    def _attention_core(
+    def _attn(
         self,
         positions: torch.Tensor,
         q: torch.Tensor,
@@ -697,13 +696,14 @@ class DeepseekV3AttentionMLA(nn.Module):
     ) -> torch.Tensor:
         """The eager break: KV write + varlen prefill / absorb decode attention.
 
-        The prefill/decode split is recovered from LIVE state -- correct both
-        in eager and under a prefill-graph replay, where ``ctx`` is the live
-        ambient context but ``q`` is padded to the graph bucket (``q.size(0)``
-        is NOT the real token count). The decode token count comes from the
-        live ctx; the real prefill token count from the live attention
-        metadata (the same source the padding scrub uses). Padded tail rows
-        produce discarded garbage.
+        Prefill/decode dispatch over the full rows; subclasses override (the
+        draft variant narrows to live rows, see ``DeepseekV3DraftAttentionMLA``).
+        The split is recovered from LIVE state -- correct both in eager and
+        under a prefill-graph replay, where ``ctx`` is the live ambient context
+        but ``q`` is padded to the graph bucket (``q.size(0)`` is NOT the real
+        token count). The decode token count comes from the live ctx; the real
+        prefill token count from the live attention metadata (the same source
+        the padding scrub uses). Padded tail rows produce discarded garbage.
         """
         spec = ctx.attn_backend.spec_num_tokens or 1
         num_decodes = max(ctx.bs - ctx.num_extends, 0)
@@ -846,34 +846,43 @@ class DeepseekV3AttentionMLA(nn.Module):
             return query_fp8, key_fp8
 
         elif self.rotary_emb is not None and q_nope.size(0) > 0:
-            # Apply RoPE directly on Q and K slices
-            q_pe, k_pe = self.rotary_emb(
-                positions,
-                q_pe,
-                K[..., self.kv_lora_rank :],
-                fused_set_kv_buffer_arg=(
-                    create_fused_set_kv_buffer_arg(
-                        value=K[..., : self.kv_lora_rank],
-                        layer=self.attn_mqa,
-                        out_cache_loc=out_cache_loc,
-                        token_to_kv_pool=ctx.token_to_kv_pool,
-                    )
-                    if self.use_fused_set_kv_buffer
-                    else None
-                ),
+            fused_mla_kv_arg = (
+                create_fused_mla_set_kv_buffer_arg(
+                    k_nope=K[..., : self.kv_lora_rank],
+                    rope_dim=self.qk_rope_head_dim,
+                    out_cache_loc=out_cache_loc,
+                    token_to_kv_pool=ctx.token_to_kv_pool,
+                    layer_id=self.attn_mqa.layer_id,
+                )
+                if _is_amd and self.attention_backend in self._MLA_KERNEL_BACKENDS
+                else None
             )
-            Q[..., self.kv_lora_rank :].copy_(q_pe)
-            K[..., self.kv_lora_rank :].copy_(k_pe)
+            if fused_mla_kv_arg is not None:
+                self.rotary_emb(
+                    positions,
+                    q_pe,
+                    K[..., self.kv_lora_rank :],
+                    fused_mla_set_kv_buffer_arg=fused_mla_kv_arg,
+                    output_q_rope=Q[..., self.kv_lora_rank :],
+                    enable_pdl=pdl_enabled(),
+                )
+                K = None
+            else:
+                # Apply RoPE directly on Q and K slices
+                q_pe, k_pe = self.rotary_emb(
+                    positions,
+                    q_pe,
+                    K[..., self.kv_lora_rank :],
+                )
+                Q[..., self.kv_lora_rank :].copy_(q_pe)
+                K[..., self.kv_lora_rank :].copy_(k_pe)
         else:
             Q[..., self.kv_lora_rank :] = q_pe
 
         # For MLA kernel backends, write KV cache here (model-owned) so the
         # backend never has to. This unifies the FP8 fused path (written above)
         # and the BF16 path into a single ownership model.
-        if (
-            self.attention_backend in self._MLA_KERNEL_BACKENDS
-            and not self.use_fused_set_kv_buffer
-        ):
+        if self.attention_backend in self._MLA_KERNEL_BACKENDS and K is not None:
             ctx.token_to_kv_pool.set_mla_kv_buffer(
                 self.attn_mqa,
                 out_cache_loc,
@@ -890,21 +899,27 @@ class DeepseekV3AttentionMLA(nn.Module):
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
         output: torch.Tensor,
+        record_kv_cache: bool | None = None,
     ) -> torch.Tensor:
         # MLA kernel backends: KV cache already written in forward_absorb_qkv_proj.
-        # Other backends: write via fused_set_kv_buffer or let backend handle it.
+        # Other backends write KV in the attention backend.
         if self.attention_backend in self._MLA_KERNEL_BACKENDS:
             need_save_kv = False
+            k_for_attn = K
+            v_for_attn = K[..., : self.kv_lora_rank] if K is not None else None
         else:
-            need_save_kv = not self.use_fused_set_kv_buffer
+            need_save_kv = True
+            k_for_attn = K
+            v_for_attn = K[..., : self.kv_lora_rank]
 
         attn_output = self.attn_mqa(
             Q,
-            K,
-            K[..., : self.kv_lora_rank],
+            k_for_attn,
+            v_for_attn,
             ctx,
             out_cache_loc,
             save_kv_cache=need_save_kv,
+            record_kv_cache=record_kv_cache,
         )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
         if _is_amd:
@@ -1007,16 +1022,6 @@ class DeepseekV3AttentionMLA(nn.Module):
                 positions,
                 q_pe,
                 k_pe,
-                fused_set_kv_buffer_arg=(
-                    create_fused_set_kv_buffer_arg(
-                        value=kv_a.unsqueeze(1),
-                        layer=self.attn_mha,
-                        out_cache_loc=out_cache_loc,
-                        token_to_kv_pool=ctx.token_to_kv_pool,
-                    )
-                    if self.use_fused_set_kv_buffer
-                    else None
-                ),
             )
 
         q[..., self.qk_nope_head_dim :] = q_pe
@@ -1024,13 +1029,12 @@ class DeepseekV3AttentionMLA(nn.Module):
         k[..., : self.qk_nope_head_dim] = k_nope
         k[..., self.qk_nope_head_dim :] = k_pe
 
-        if not self.use_fused_set_kv_buffer:
-            ctx.token_to_kv_pool.set_mla_kv_buffer(
-                self.attn_mha,
-                out_cache_loc,
-                cache_k_nope=kv_a.unsqueeze(1),
-                cache_k_rope=k_pe,
-            )
+        ctx.token_to_kv_pool.set_mla_kv_buffer(
+            self.attn_mha,
+            out_cache_loc,
+            cache_k_nope=kv_a.unsqueeze(1),
+            cache_k_rope=k_pe,
+        )
 
         return q, k, v
 
@@ -1135,7 +1139,77 @@ class DeepseekV3AttentionMLA(nn.Module):
         return output
 
 
+class DeepseekV3DraftAttentionMLA(DeepseekV3AttentionMLA):
+    """Draft variant of MLA shared by the NextN and Eagle3 MLA drafters.
+
+    On the active first draft step the full ``latent_cache`` (N rows) is
+    projected so every KV cache entry is written, but only the live query rows
+    (``ctx.gather_ids``) run the absorbed decode attention, narrowing the output
+    to ``[bs, H]``.  Multi-step decode and target paths delegate to the base.
+    Single-layer only, so dropping the dead rows has no downstream consumer.
+    """
+
+    def _attn(
+        self,
+        positions: torch.Tensor,
+        q: torch.Tensor,
+        latent_cache: torch.Tensor,
+        ctx: ForwardContext,
+        out_cache_loc: torch.Tensor,
+    ) -> torch.Tensor:
+        if ctx.accept_lengths is None:
+            return super()._attn(positions, q, latent_cache, ctx, out_cache_loc)
+
+        self._apply_correction(ctx)
+
+        # Full q/latent_cache write all KV cache rows; only the live rows
+        # (ctx.gather_ids) run the absorbed decode attention, so the output is
+        # narrowed to [bs, H] for o_proj / MLP / post-norms.
+        decode_ctx = replace(ctx, forward_mode=ForwardMode.DECODE)
+        Q, K = self.forward_absorb_qkv_proj(
+            q,
+            latent_cache,
+            positions,
+            decode_ctx,
+            out_cache_loc,
+        )
+        Q = Q.index_select(0, ctx.gather_ids)
+        attn_output = q.new_empty(ctx.bs, self.num_local_heads * self.v_head_dim)
+        # gather_ids keeps one live row per request, so the decode runs on the
+        # full bs -- the page table and seq lens must span the same rows. Drop
+        # the [num_extends:] slice a MIXED target's first-step metadata sets up
+        # (mirrors the multi-step drafter loop's override_num_extends(0)).
+        with ctx.attn_backend.override_num_extends(0):
+            self.forward_absorb_attn_v_proj(
+                Q,
+                K,
+                decode_ctx,
+                out_cache_loc,
+                attn_output,
+                # Real-mode record: decode_ctx would skip the PD cache-step here.
+                record_kv_cache=not ctx.forward_mode.is_decode_or_idle(),
+            )
+        return attn_output
+
+    def _apply_correction(self, ctx: ForwardContext) -> None:
+        """Trim decode rows' cache_seqlens by ``spec_num_tokens - accept_lengths``."""
+        seq_lens_buf = ctx.draft_seq_lens_buf
+        if seq_lens_buf is None or ctx.accept_lengths is None:
+            return
+        num_extends = ctx.num_extends
+        if num_extends >= ctx.bs:
+            return
+        correction = (
+            ctx.attn_backend.spec_num_tokens - ctx.accept_lengths[num_extends:]
+        ).to(seq_lens_buf.dtype)
+        seq_lens_buf[num_extends : ctx.bs].sub_(correction).clamp_(min=1)
+
+
 class DeepseekV3DecoderLayer(nn.Module):
+    @property
+    def attention_cls(self) -> type[nn.Module]:
+        return DeepseekV3AttentionMLA
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -1153,7 +1227,7 @@ class DeepseekV3DecoderLayer(nn.Module):
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
 
-        self.self_attn = DeepseekV3AttentionMLA(
+        self.self_attn = self.attention_cls(
             config=config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -1257,9 +1331,6 @@ class DeepseekV3DecoderLayer(nn.Module):
                 out_cache_loc=out_cache_loc,
                 comm_manager=self.comm_manager,
             )
-            if ctx.draft_first_step_reduce:
-                # Gather residual to self_attn's [bs, H].
-                residual = residual.index_select(0, ctx.gather_ids)
             hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
                 hidden_states, residual, ctx
             )
@@ -1732,7 +1803,7 @@ class Eagle3MlaDecoderLayer(nn.Module):
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
 
-        self.self_attn = DeepseekV3AttentionMLA(
+        self.self_attn = DeepseekV3DraftAttentionMLA(
             config=config,
             mapping=self.mapping,
             hidden_size=self.hidden_size,
@@ -1830,8 +1901,9 @@ class Eagle3MlaDecoderLayer(nn.Module):
                 comm_manager=self.comm_manager,
             )
 
-            if ctx.draft_first_step_reduce:
-                # Gather residual to self_attn's [bs, H].
+            # Active first draft step narrows attn output to [bs, H]; align the
+            # residual to the same live rows before the post-attn reduce-norm.
+            if ctx.accept_lengths is not None:
                 residual = residual.index_select(0, ctx.gather_ids)
             hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
                 hidden_states, residual, ctx
@@ -1964,8 +2036,6 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
     concatenated [embeds || hidden_states] as input.
     """
 
-    draft_first_step_reduce_for_catchup = True
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -2017,6 +2087,17 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
         )
         self.capture_aux_hidden_states = True
         self.hot_token_id = None
+
+    def forward(
+        self,
+        ctx: ForwardContext,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        with report_collective_sizing(ctx, ctx.bs, ctx.global_bs):
+            return super().forward(ctx, input_ids, positions, out_cache_loc, **kwargs)
 
     def prepare_model_kwargs(
         self, ctx: ForwardContext, input_ids: torch.Tensor, kwargs: dict

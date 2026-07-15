@@ -43,6 +43,12 @@ Forward = _ext.Forward
 ForwardEvent = _ext.ForwardEvent
 KVEvent = _ext.KVEvent
 
+# True iff the extension was compiled with TOKENSPEED_FLAT_KVCACHE (flat
+# KvCacheCoordinator scheduler); False for the default radix build. Older
+# extensions predate the attribute — default False, which matches their radix
+# behavior.
+FLAT_KVCACHE: bool = bool(getattr(_ext, "FLAT_KVCACHE", False))
+
 
 def _flat_forward_op_repr(self):
     return (
@@ -76,6 +82,7 @@ __all__ = [
     "PagedCacheGroupFamily",
     "PagedCacheGroupTable",
     "PrefixCacheAdjunctSpec",
+    "FLAT_KVCACHE",
     # Execution plan & operations
     "ExecutionPlan",
     "Forward",

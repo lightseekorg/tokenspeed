@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import inspect
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
@@ -36,10 +37,39 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.pd.utils import StepCounter
 
 
+def init_backend_cuda_graph_state(
+    backend: "AttentionBackend",
+    max_bs: int,
+    seq_lens_buf: torch.Tensor,
+    **extras,
+) -> None:
+    """Call ``backend.init_cuda_graph_state`` with only the kwargs its
+    signature accepts (VAR_KEYWORD accepts all of them).
+
+    Signature-probe instead of try/except TypeError: paged_cache_group_specs
+    is load-bearing for the state shed, so a TypeError raised from inside the
+    backend's body must propagate rather than silently retry without specs.
+
+    Shared by the cuda-graph wrapper and by composite backends (hybrid) that
+    forward to user-selectable sub-backends with possibly narrow signatures.
+    """
+    params = inspect.signature(backend.init_cuda_graph_state).parameters
+    if not any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        extras = {k: v for k, v in extras.items() if k in params}
+    backend.init_cuda_graph_state(max_bs, seq_lens_buf, **extras)
+
+
 class AttentionBackend(ABC):
     """The base class of attention backends"""
 
     uses_paged_cache_groups: bool = False
+    # Flat KV-cache per-group block tables (absolute index, null hole = 0). A
+    # separate flag from uses_paged_cache_groups because the two mechanisms have
+    # different hole/index semantics; a group-aware flat backend (Phase 4) sets
+    # this True. Default False keeps every existing backend on today's path.
+    uses_flat_cache_groups: bool = False
+    # False for flat-capable backends whose spec-verify path is not wired yet.
+    flat_spec_capable: bool = True
     uses_padded_decode_token_mask: bool = False
 
     def __init__(self, config: BaseAttnConfig) -> None:
@@ -71,6 +101,13 @@ class AttentionBackend(ABC):
     ) -> bool:
         return False
 
+    def select_out_cache_loc(self, layer, out_cache_loc, forward_mode=None):
+        """Flat per-group write-location hook for out-of-backend KV writers
+        (fused RoPE prewrite); identity for backends without flat cache
+        groups (see uses_flat_cache_groups). ``forward_mode`` picks the
+        metadata slot for backends that prewrite on extend as well."""
+        return out_cache_loc
+
     @property
     def sinks_dtype(self) -> torch.dtype:
         return torch.bfloat16
@@ -96,8 +133,16 @@ class AttentionBackend(ABC):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
+        flat_cache_group_ids: tuple[str, ...] = (),
+        **kwargs,
     ):
-        """Init the metadata for a forward pass for capturing a cuda graph."""
+        """Init the metadata for a forward pass for capturing a cuda graph.
+
+        ``flat_cache_group_ids`` names the flat KV-cache groups whose page
+        tables arrive at replay; a flat-capable backend (uses_flat_cache_groups)
+        allocates its persistent per-group buffers from these ids — no table
+        data exists at capture time. Empty tuple for non-flat backends.
+        """
         raise NotImplementedError()
 
     def init_forward_metadata_replay_cuda_graph(
@@ -107,6 +152,7 @@ class AttentionBackend(ABC):
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode = None,
         req_to_page: torch.Tensor = None,
+        flat_block_tables: dict[str, torch.Tensor] | None = None,
         **kwargs,
     ):
         """Update pre-allocated CUDA-graph metadata buffers in-place before replay.
@@ -114,6 +160,9 @@ class AttentionBackend(ABC):
         Called instead of init_forward_metadata when use_cuda_graph=True, so
         that the captured kernels (which hold pointers into the pre-allocated
         buffers) see the current batch's data without any new allocations.
+        ``flat_block_tables`` carries the per-group flat page tables
+        (group_id -> [>=bs, cols]) for flat-capable backends; a backend that
+        captured flat buffers must be handed non-empty tables whenever bs > 0.
         Default: fall back to init_forward_metadata (correct but may not work
         for all backends that use separate cuda-graph buffer pools).
         """

@@ -33,6 +33,7 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_rope_utils import rope_config_validation
 from transformers.utils import logging
 
+from tokenspeed.runtime.configs.paged_cache_spec import FULL_ATTENTION
 from tokenspeed.runtime.distributed.utils import divide
 from tokenspeed.runtime.utils.env import envs
 
@@ -271,6 +272,26 @@ class Qwen3_5BaseTextConfig(PretrainedConfig):
                 layer_type_list.append(HybridLayerType.linear_attention.value)
 
         return layer_type_list
+
+    @property
+    def layer_types(self):
+        """Per-layer paged-cache labels: "full_attention" / "linear_attention".
+
+        Same interleaving as ``layers_block_type``, translated to the label
+        vocabulary of ``paged_cache_spec`` (``HybridLayerType.full_attention``
+        serializes as the checkpoint's "attention", which the KV-cache layer
+        has no retention entry for). A property rather than an ``__init__``
+        attribute because NextN drafts overwrite ``full_attention_interval``
+        after construction (models/qwen3_5_nextn.py).
+        """
+        return [
+            (
+                FULL_ATTENTION
+                if layer_type == HybridLayerType.full_attention.value
+                else layer_type
+            )
+            for layer_type in self.layers_block_type
+        ]
 
     @property
     def linear_layer_ids(self):

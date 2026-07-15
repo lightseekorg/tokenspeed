@@ -215,6 +215,7 @@ def preprocess_gluon_mxfp4_gfx950_moe_weights(
 
     w13_weight = w.w13_weight
     w13_weight_scale = w.w13_weight_scale
+
     if w13_layout == "concatenated":
         w13_weight = torch.nn.Parameter(
             _interleave_gate_up_rows(w13_weight.data, dim=-2),
@@ -231,9 +232,13 @@ def preprocess_gluon_mxfp4_gfx950_moe_weights(
         w13_weight_bias = w.w13_weight_bias.to(torch.float32)
         if w13_layout == "concatenated":
             w13_weight_bias = _interleave_gate_up_rows(w13_weight_bias, dim=-1)
+        w._gluon_w13_bias_is_zero = not bool(
+            torch.count_nonzero(w13_weight_bias).item()
+        )
         w.w13_weight_bias = torch.nn.Parameter(w13_weight_bias, requires_grad=False)
     if hasattr(w, "w2_weight_bias"):
         w2_weight_bias = w.w2_weight_bias.to(torch.float32)
+        w._gluon_w2_bias_is_zero = not bool(torch.count_nonzero(w2_weight_bias).item())
         w.w2_weight_bias = torch.nn.Parameter(w2_weight_bias, requires_grad=False)
 
     num_warps = 8
@@ -302,5 +307,15 @@ def preprocess_gluon_mxfp4_gfx950_moe_weights(
 
     if preshuffle:
         _attach_gluon_preshuffle(w)
+
+    # Attach the gluon_a4w4_gfx950 package-prefill aliases whenever preshuffle
+    # produced the gdot128 layout. They are metadata-only views over that storage
+    # (no second model-sized copy), so attaching them is free. When preshuffle is
+    # disabled the package path cannot run anyway (the dynamic entry returns None
+    # without these aliases and falls back to the reference path).
+    if preshuffle:
+        from tokenspeed_kernel_amd.ops.moe import gluon_a4w4_gfx950
+
+        gluon_a4w4_gfx950.attach_prefill_aliases(w, w13_scale, w2_scale)
 
     torch.cuda.empty_cache()

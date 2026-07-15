@@ -1,0 +1,193 @@
+name: Retry Failed Latest Main CI
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  rerun-failed:
+    name: Rerun failed latest-main jobs
+    if: github.repository == 'lightseekorg/tokenspeed'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Rerun failed vendor CI jobs
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const workflows = [
+              "pr-test-nvidia.yml",
+              "pr-test-amd.yml",
+              "pr-test-nvidia-arm.yml",
+            ];
+            const maxAttempts = 3;
+            const { owner, repo } = context.repo;
+            const summaryRows = [];
+            let stoppedEarly = false;
+
+            function addSummaryRow(workflowId, run, result) {
+              summaryRows.push([
+                workflowId,
+                run
+                  ? `<a href="${run.html_url}">${run.id}</a>`
+                  : "—",
+                result,
+              ]);
+            }
+
+            try {
+              const { data: repository } = await github.rest.repos.get({
+              owner,
+              repo,
+            });
+            const branch = repository.default_branch;
+            const { data: commit } = await github.rest.repos.getCommit({
+              owner,
+              repo,
+              ref: branch,
+            });
+            const latestSha = commit.sha;
+
+            core.info(
+              "Scanning " + owner + "/" + repo + "@" + latestSha +
+                " on " + branch,
+            );
+
+            for (const workflowId of workflows) {
+              let runs;
+              try {
+                runs = await github.paginate(
+                  github.rest.actions.listWorkflowRuns,
+                  {
+                    owner,
+                    repo,
+                    workflow_id: workflowId,
+                    branch,
+                    event: "push",
+                    head_sha: latestSha,
+                    per_page: 100,
+                  },
+                );
+              } catch (error) {
+                core.warning(
+                  "Unable to list runs for " + workflowId + ": " + error.message,
+                );
+                addSummaryRow(workflowId, null, "Failed to inspect");
+                continue;
+              }
+
+              const run = runs
+                .filter(
+                  (candidate) =>
+                    candidate.head_sha === latestSha &&
+                    candidate.head_branch === branch &&
+                    candidate.event === "push",
+                )
+                .sort(
+                  (left, right) =>
+                    Date.parse(right.created_at) - Date.parse(left.created_at),
+                )[0];
+
+              if (!run) {
+                core.info(workflowId + ": no run for latest main; skipping.");
+                continue;
+              }
+              if (run.status !== "completed") {
+                core.info(workflowId + ": run " + run.id + " is " + run.status + ".");
+                continue;
+              }
+              if (run.conclusion !== "failure") {
+                core.info(
+                  workflowId + ": run " + run.id + " concluded " +
+                    run.conclusion + "; skipping.",
+                );
+                continue;
+              }
+
+              const attempt = run.run_attempt || 1;
+              if (attempt >= maxAttempts) {
+                core.warning(
+                  workflowId + ": run " + run.id + " failed on attempt " +
+                    attempt + "; retry limit reached.",
+                );
+                addSummaryRow(workflowId, run, "Retry limit reached");
+                continue;
+              }
+
+              // Best-effort guard against main advancing during this scan.
+              let currentSha;
+              try {
+                const { data: currentCommit } =
+                  await github.rest.repos.getCommit({
+                    owner,
+                    repo,
+                    ref: branch,
+                  });
+                currentSha = currentCommit.sha;
+              } catch (error) {
+                core.warning(
+                  "Unable to recheck latest main: " + error.message +
+                    "; stopping this scan.",
+                );
+                stoppedEarly = true;
+                break;
+              }
+              if (currentSha !== latestSha) {
+                core.info(
+                  "Main advanced from " + latestSha + " to " + currentSha +
+                    "; stopping this scan.",
+                );
+                stoppedEarly = true;
+                break;
+              }
+
+              try {
+                await github.request(
+                  "POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun-failed-jobs",
+                  { owner, repo, run_id: run.id },
+                );
+                core.notice(
+                  workflowId + ": rerunning failed jobs for run " + run.id +
+                    " after attempt " + attempt + ".",
+                );
+                addSummaryRow(workflowId, run, "Rerun started");
+              } catch (error) {
+                core.warning(
+                  workflowId + ": unable to rerun failed jobs for run " +
+                    run.id + ": " + error.message,
+                );
+                addSummaryRow(workflowId, run, "Failed to start");
+              }
+            }
+            } finally {
+              core.summary.addHeading("Latest main retry summary");
+              if (summaryRows.length > 0) {
+                core.summary.addTable([
+                  [
+                    { data: "Workflow", header: true },
+                    { data: "Run", header: true },
+                    { data: "Result", header: true },
+                  ],
+                  ...summaryRows,
+                ]);
+              } else {
+                core.summary.addRaw("No reruns were eligible.");
+              }
+              if (stoppedEarly) {
+                core.summary.addBreak();
+                core.summary.addRaw(
+                  "Scan stopped early because main advanced or could not " +
+                    "be re-verified.",
+                );
+              }
+              await core.summary.write();
+            }

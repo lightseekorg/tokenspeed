@@ -40,7 +40,7 @@ protected:
 };
 
 TEST_F(ChunkedPrefillTestSuite, ChunkedPrefill_SplitsAcrossPlans) {
-    // page_size=2, max_scheduled_tokens=4 → each chunk handles 4 tokens (2 pages).
+    // block_size=2, max_scheduled_tokens=4 → each chunk handles 4 tokens (2 pages).
     // 8 tokens = 2 chunks.
     Submit(MakeRequestSpec("r1", 4));  // 4 pages = 8 tokens
     auto plan1 = PlanOnce();

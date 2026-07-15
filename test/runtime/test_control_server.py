@@ -1,4 +1,4 @@
-"""Tests for the HTTP server sidecar (``tokenspeed.runtime.entrypoints.http_server``).
+"""Tests for the HTTP server sidecar (``tokenspeed.runtime.entrypoints.control_server``).
 
 These run entirely against a mock smg backend — no engine, smg, or GPU needed.
 They are written as regression guards for the bugs found while building the
@@ -92,7 +92,7 @@ class TestProxyPassthrough(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        from tokenspeed.runtime.entrypoints import http_server as hs
+        from tokenspeed.runtime.entrypoints import control_server as hs
 
         cls.hs = hs
         hs._gateway_url = f"http://127.0.0.1:{cls.MOCK_PORT}"
@@ -226,13 +226,26 @@ class TestGrpcDirect(unittest.TestCase):
     """Unit tests for the gRPC-direct path (no live engine)."""
 
     def setUp(self):
-        from tokenspeed.runtime.entrypoints import http_server as hs
+        from tokenspeed.runtime.entrypoints import control_server as hs
 
         self.hs = hs
+        # Give this test a fresh, current event loop so ``grpc.aio.insecure_channel``
+        # binds to a live loop regardless of loop state left behind by earlier
+        # tests in the suite (e.g. asyncio.run / uvicorn threads elsewhere).
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
         # Reset the cached channel/stub between tests.
         hs._grpc_channel = None
         hs._grpc_stub = None
         hs._engine_grpc_addr = "127.0.0.1:1"
+
+    def tearDown(self):
+        # Drop the cached channel/stub and restore loop state so we neither leak
+        # the channel nor leave a closed loop as "current" for later tests.
+        self.hs._grpc_channel = None
+        self.hs._grpc_stub = None
+        asyncio.set_event_loop(None)
+        self._loop.close()
 
     # -- bug 3: gRPC channel reuse ------------------------------------------
 
@@ -270,7 +283,7 @@ class TestProxyTimeout(unittest.TestCase):
     off long but healthy streaming generations (P2 review fix)."""
 
     def test_no_total_cap_but_inactivity_bounded(self):
-        from tokenspeed.runtime.entrypoints import http_server as hs
+        from tokenspeed.runtime.entrypoints import control_server as hs
 
         self.assertIsNone(
             hs._PROXY_TIMEOUT.total,

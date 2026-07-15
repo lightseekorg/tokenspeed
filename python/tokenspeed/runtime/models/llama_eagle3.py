@@ -33,7 +33,10 @@ from torch import nn
 from transformers import LlamaConfig
 
 from tokenspeed.runtime.distributed.mapping import Mapping
-from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.context import (
+    ForwardContext,
+    report_collective_sizing,
+)
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.activation import SiluAndMul
 from tokenspeed.runtime.layers.common import concat
@@ -510,7 +513,6 @@ class Eagle3LlamaModel(BaseTransformerModel):
 
 class LlamaForCausalLMEagle3(BaseCausalLM):
 
-    draft_first_step_reduce_for_catchup = True
     model_cls = Eagle3LlamaModel
 
     def __init__(
@@ -557,6 +559,17 @@ class LlamaForCausalLMEagle3(BaseCausalLM):
         )
         self.capture_aux_hidden_states = True
         self.hot_token_id = None
+
+    def forward(
+        self,
+        ctx: ForwardContext,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        with report_collective_sizing(ctx, ctx.bs, ctx.global_bs):
+            return super().forward(ctx, input_ids, positions, out_cache_loc, **kwargs)
 
     def prepare_model_kwargs(
         self, ctx: ForwardContext, input_ids: torch.Tensor, kwargs: dict

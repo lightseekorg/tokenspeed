@@ -188,6 +188,19 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         self.model_update_result: Awaitable[UpdateWeightFromDiskReqOutput] | None = None
         self.asyncio_tasks = set()
 
+        # RL weight-transfer admission gate (pause/resume). Set means new
+        # requests may be admitted; WeightTransferManager.pause()
+        # clears it and resume() sets it. Generation awaits it at intake so a
+        # pause halts new work; when not paused the hot-path cost is one
+        # ``is_set()`` check. Must be toggled on this object's event loop.
+        self._wt_admit = asyncio.Event()
+        self._wt_admit.set()
+        # Created below once server_args is bound, only when the weight-transfer
+        # control plane is enabled. The in-engine HTTP app is launched lazily on
+        # this object's event loop (see auto_create_handle_loop).
+        self.weight_transfer_manager = None
+        self._rl_control_task = None
+
         # For session info
         self.session_futures = {}  # session_id -> asyncio event
 
@@ -244,6 +257,16 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
 
         self.init_communicators(server_args)
 
+        # RL weight-transfer control plane (always on / ungated). The in-engine
+        # HTTP app reaches it via this attribute.
+        from tokenspeed.runtime.engine.weight_transfer.manager import (
+            WeightTransferManager,
+        )
+
+        self.weight_transfer_manager = WeightTransferManager(
+            self, server_args.get_weight_transfer_config()
+        )
+
         # Tokenization lives in :class:`InputProcessor`; see
         # :meth:`_tokenize_one_request` for the delegation.
         self.input_processor = InputProcessor(self)
@@ -255,6 +278,11 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         created_time = time.time()
 
         self.auto_create_handle_loop()
+
+        # RL weight-transfer pause gate: block new admission while paused.
+        # No-op cost when not paused.
+        if not self._wt_admit.is_set():
+            await self._wt_admit.wait()
 
         self.input_processor.validate_request(obj)
 
@@ -501,6 +529,29 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         req = AbortReq(rid)
         self.engine_core_client.send_to_scheduler.send_pyobj(req)
 
+    # ---- RL weight-transfer admission gate ------------------------------
+    # Toggled by WeightTransferManager (pause/resume) to halt new generation
+    # while weights are updated. All of these must run on this object's loop.
+
+    def weight_transfer_admission_paused(self) -> bool:
+        return not self._wt_admit.is_set()
+
+    def weight_transfer_block_admission(self) -> None:
+        self._wt_admit.clear()
+
+    def weight_transfer_allow_admission(self) -> None:
+        self._wt_admit.set()
+
+    def weight_transfer_abort_inflight(self) -> None:
+        for rid in list(self.rid_to_state.keys()):
+            self.abort_request(rid)
+
+    async def weight_transfer_drain_inflight(self) -> None:
+        # Acquiring the writer lock blocks until every in-flight generation
+        # (each holds a reader lock for its full stream) has completed.
+        async with self.model_update_lock.writer_lock:
+            pass
+
     async def update_weights_from_disk(
         self,
         obj: UpdateWeightFromDiskReqInput,
@@ -624,7 +675,7 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
 
     # ---- Server lifecycle / health -------------------------------
     # Intent-revealing wrappers around the private ``server_status``
-    # field. Callers (notably ``http_server.py``) drive transitions
+    # field. Callers (notably ``control_server.py``) drive transitions
     # through these methods so the ``ServerStatus`` enum and the
     # attribute name stay implementation-private.
 
@@ -656,6 +707,7 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.handle_loop))
         )
+        self._maybe_launch_rl_control_plane(loop)
 
         # We cannot add signal handler when the tokenizer manager is not in
         # the main thread due to the CPython limitation.
@@ -674,6 +726,55 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.watch_load_thread))
         )
+
+    def _maybe_launch_rl_control_plane(self, loop):
+        """Launch the in-engine RL control-plane HTTP app on this loop.
+
+        Serves both the native and SGLang-compatible weight-sync dialects.
+        Best-effort: comes up the first time AsyncLLM's loop is active and a
+        ``--rl-control-port`` was configured. Runs on AsyncLLM's loop so the
+        manager's loop-bound primitives (admission gate, scheduler communicators)
+        are toggled/awaited correctly. For guaranteed availability before the very
+        first request, an engine bootstrap may call this directly.
+        """
+        if self._rl_control_task is not None:
+            return
+        manager = self.weight_transfer_manager
+        port = getattr(self.server_args, "rl_control_port", None)
+        if manager is None or not port:
+            return
+        self._rl_control_task = loop.create_task(
+            self._serve_rl_control_plane(manager, port)
+        )
+
+    async def _serve_rl_control_plane(self, manager, port: int):
+        # Serves both the vLLM-native and SGLang-compatible RL endpoints on a
+        # single app/port. A control-plane crash must not take down the engine,
+        # so this does not use print_exception_wrapper (which kills the tree).
+        try:
+            import uvicorn
+
+            from tokenspeed.runtime.entrypoints.sglang_compat_http import (
+                router as sglang_router,
+            )
+            from tokenspeed.runtime.entrypoints.vllm_compat_http import (
+                build_vllm_compat_app,
+            )
+
+            # vLLM-compatible endpoints (driven by the manager) + SGLang-compatible
+            # endpoints (driven by AsyncLLM directly), on one app/port.
+            app = build_vllm_compat_app(manager)
+            app.state.async_llm = self
+            app.include_router(sglang_router)
+
+            server = uvicorn.Server(
+                uvicorn.Config(
+                    app, host=self.server_args.host, port=port, log_level="warning"
+                )
+            )
+            await server.serve()
+        except Exception as e:  # noqa: BLE001
+            logger.error("RL control plane stopped: %s", e)
 
     async def sigterm_watchdog(self):
         while not self.gracefully_exit:
