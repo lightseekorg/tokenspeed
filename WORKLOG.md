@@ -265,14 +265,14 @@ and its metadata-sequence cap are explicit CLI fields; both legacy environment
 keys were removed. Preflight also rejects visible-device masks, inherited TF32
 and FlashInfer workspace overrides, every inherited `TOKENSPEED_*`, `SMG_*`,
 `EPD_*`, and `TS_*` variable, and a persistent override YAML. Vendor plumbing created
-internally by engine workers is recorded separately from user configuration. A
-repository-wide audit found additional product variables in unrelated runtime
-features. Release jobs reject the complete product namespaces rather than
-treating those variables as supported configuration. The PD/EPD/SMG/RDMA paths
-exercised by this release use typed CLI state, including their former
-heartbeat, failure-injection, timeout, ring/cache, and receive-pool settings.
-This is a release-path guarantee, not a claim that unrelated legacy source has
-no environment-variable reads.
+internally by engine workers is recorded separately from user configuration.
+The repository guard covers first-party TokenSpeed runtime, CUDA/AMD kernel,
+MLA, and scheduler Python/C++/binding sources (including `.cu`/`.cuh`) and
+reports zero unreviewed accesses; its small allowlist is limited to reviewed
+vendor or external protocol plumbing. The M3 SMG image/transport path also uses
+typed CLI/RouterConfig state, including its former timeout, timing, cache, SHM,
+and RDMA settings. Unrelated SMG video/audio legacy paths are outside the basic
+image-support contract and are not covered by this claim.
 
 ### Post-candidate Phase 5 release hardening
 
