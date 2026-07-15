@@ -46,6 +46,7 @@ from tokenspeed_kernel.ops.moe.flashinfer import (
     cutedsl_deepep_nvfp4 as _moe_cutedsl_deepep_nvfp4,
 )
 from tokenspeed_kernel.ops.moe.flashinfer import cutlass_fp8 as _moe_cutlass_fp8
+from tokenspeed_kernel.ops.moe.flashinfer import cutlass_mxfp4 as _moe_cutlass_mxfp4
 from tokenspeed_kernel.ops.moe.flashinfer import cutlass_nvfp4 as _moe_cutlass_nvfp4
 from tokenspeed_kernel.ops.moe.flashinfer import cutlass_unquant as _moe_cutlass_unquant
 from tokenspeed_kernel.ops.moe.flashinfer import trtllm_mxfp4 as _moe_trtllm_mxfp4
@@ -68,6 +69,7 @@ _RELOAD_MODULES = [
     # MoE
     _moe_cutedsl_deepep_nvfp4,
     _moe_cutlass_fp8,
+    _moe_cutlass_mxfp4,
     _moe_cutlass_nvfp4,
     _moe_cutlass_unquant,
     _moe_trtllm_mxfp4,

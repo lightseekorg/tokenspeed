@@ -42,6 +42,13 @@ from tokenspeed.runtime.utils import ceil_div
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
+def supports_triton_rsag() -> bool:
+    platform = current_platform()
+    # The current NVIDIA multimem implementation is qualified on Hopper and
+    # datacenter Blackwell. Its SM120/SM121 launch corrupts CUDA state.
+    return not (platform.is_nvidia and platform.arch_version.major == 12)
+
+
 class TritonRSAGBackend:
     """Backend using TritonRSAG for token-aware reduce_scatter / all_gather.
 
@@ -54,6 +61,12 @@ class TritonRSAGBackend:
         self._fallback = fallback
         # (group_tuple, hidden_size) -> Triton RS/AG state
         self._instances = {}
+
+    @staticmethod
+    def _is_supported_platform() -> bool:
+        # Keep token-aware collectives on the existing NCCL uneven-token path
+        # when the Triton symmetric-memory implementation is unavailable.
+        return supports_triton_rsag()
 
     def _get_or_create(self, group: Group, hidden_size: int):
         key = (group, hidden_size)
@@ -76,6 +89,8 @@ class TritonRSAGBackend:
         group: Group,
         dim: int = 0,
     ) -> torch.Tensor:
+        if not self._is_supported_platform():
+            return self._fallback.all_gather(tensor, group=group, dim=dim)
         if tensor.dim() != 2:
             return self._fallback.all_gather(tensor, group=group, dim=dim)
 
@@ -109,6 +124,12 @@ class TritonRSAGBackend:
         group: Group,
         scattered_num_tokens: list[int],
     ) -> torch.Tensor:
+        if not self._is_supported_platform():
+            return self._fallback.token_all_gather(
+                tensor,
+                group=group,
+                scattered_num_tokens=scattered_num_tokens,
+            )
         state = self._get_or_create(group, tensor.size(-1))
         return all_gather(state, tensor, token_list_in_group=scattered_num_tokens)
 
@@ -118,6 +139,12 @@ class TritonRSAGBackend:
         group: Group,
         scattered_num_tokens: list[int],
     ) -> torch.Tensor:
+        if not self._is_supported_platform():
+            return self._fallback.token_reduce_scatter(
+                tensor,
+                group=group,
+                scattered_num_tokens=scattered_num_tokens,
+            )
         state = self._get_or_create(group, tensor.size(-1))
         return reduce_scatter(state, tensor, token_list_in_group=scattered_num_tokens)
 

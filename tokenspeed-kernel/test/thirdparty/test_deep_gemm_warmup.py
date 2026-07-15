@@ -18,15 +18,38 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-import tokenspeed_kernel.ops.moe.flashinfer.cutedsl_deepep_nvfp4  # noqa: F401
-import tokenspeed_kernel.ops.moe.flashinfer.cutlass_fp8  # noqa: F401
-import tokenspeed_kernel.ops.moe.flashinfer.cutlass_mxfp4  # noqa: F401
-import tokenspeed_kernel.ops.moe.flashinfer.cutlass_nvfp4  # noqa: F401
-import tokenspeed_kernel.ops.moe.flashinfer.cutlass_unquant  # noqa: F401
-import tokenspeed_kernel.ops.moe.flashinfer.trtllm_fp8  # noqa: F401
-import tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4  # noqa: F401
-import tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxint4  # noqa: F401
-import tokenspeed_kernel.ops.moe.flashinfer.trtllm_nvfp4  # noqa: F401
-import tokenspeed_kernel.ops.moe.flashinfer.trtllm_unquant  # noqa: F401
+from __future__ import annotations
 
-__all__ = []
+import torch
+from tokenspeed_kernel.thirdparty.deep_gemm import warmup
+
+
+def test_prefill_warmup_keeps_deep_gemm_mhc_enabled_by_default(monkeypatch) -> None:
+    calls: list[tuple[list[dict], int, torch.device]] = []
+
+    def fake_prenorm_warmup(shapes, max_tokens, device):
+        calls.append((shapes, max_tokens, device))
+
+    monkeypatch.setattr(
+        warmup,
+        "_warmup_tf32_hc_prenorm_gemm",
+        fake_prenorm_warmup,
+    )
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    device = torch.device("cuda", 0)
+
+    warmup.warmup_prefill_jit(
+        hidden_size=64,
+        num_attention_heads=8,
+        hc_mult=4,
+        max_tokens=32,
+        device=device,
+    )
+
+    assert calls == [
+        (
+            [{"hc_hidden_size": 256, "mix_hc": 24, "hc_dim": 256}],
+            32,
+            device,
+        )
+    ]

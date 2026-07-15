@@ -189,6 +189,7 @@ if (
         solution="flashmla",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
+            max_arch_version=ArchVersion(11, 99),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=frozenset({format_signature(q=dense_tensor_format(torch.bfloat16))}),
@@ -261,6 +262,89 @@ if (
             result = result[:, :actual_heads, :]
         if out is not None:
             out.reshape_as(result).copy_(result)
+            return out
+        return result
+
+
+if (
+    platform.is_nvidia
+    and platform.is_hopper_plus
+    and flash_mla_with_kvcache is not error_fn
+):
+
+    @register_kernel(
+        "attention",
+        "dsv4_sparse_mla_decode",
+        name="flashmla_dsv4_sparse_mla_decode",
+        solution="flashmla",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 0),
+            max_arch_version=ArchVersion(11, 99),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=frozenset({format_signature(q=dense_tensor_format(torch.bfloat16))}),
+        priority=Priority.PERFORMANT,
+        traits={
+            "head_dim": frozenset({512}),
+            "swa_page_size": frozenset({64}),
+            "compressed_page_size": frozenset({0, 2, 64}),
+            "support_sinks": frozenset({False, True}),
+        },
+    )
+    def flashmla_dsv4_sparse_mla_decode(
+        q: torch.Tensor,
+        swa_kv_cache: torch.Tensor,
+        swa_indices: torch.Tensor,
+        swa_topk_lens: torch.Tensor,
+        compressed_kv_cache: torch.Tensor | None,
+        compressed_indices: torch.Tensor | None,
+        compressed_topk_lens: torch.Tensor | None,
+        softmax_scale: float,
+        sinks: torch.Tensor | None,
+        out: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if q.dim() != 3:
+            raise ValueError(
+                "FlashMLA DeepSeek V4 decode q must be [tokens, heads, dim], "
+                f"got {tuple(q.shape)}"
+            )
+        q_kernel = q.unsqueeze(1)
+        swa_indices_kernel = (
+            swa_indices.unsqueeze(1) if swa_indices.dim() == 2 else swa_indices
+        )
+        compressed_indices_kernel = (
+            compressed_indices.unsqueeze(1)
+            if compressed_indices is not None and compressed_indices.dim() == 2
+            else compressed_indices
+        )
+        result, _ = flash_mla_with_kvcache(
+            q=q_kernel,
+            k_cache=swa_kv_cache,
+            block_table=None,
+            cache_seqlens=None,
+            head_dim_v=q.shape[-1],
+            tile_scheduler_metadata=_get_decode_sched_meta(
+                q=q_kernel,
+                num_reqs=q.shape[0],
+                q_len_per_req=1,
+                actual_heads=q.shape[1],
+                topk=swa_indices.shape[-1],
+                kv_lora_rank=q.shape[-1],
+                qk_rope_head_dim=64,
+            ),
+            softmax_scale=float(softmax_scale),
+            is_fp8_kvcache=True,
+            indices=swa_indices_kernel,
+            attn_sink=sinks,
+            extra_k_cache=compressed_kv_cache,
+            extra_indices_in_kvcache=compressed_indices_kernel,
+            topk_length=swa_topk_lens,
+            extra_topk_length=compressed_topk_lens,
+        )
+        if result.dim() == 4:
+            result = result.squeeze(1)
+        if out is not None:
+            out.copy_(result)
             return out
         return result
 
