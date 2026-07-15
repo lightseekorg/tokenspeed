@@ -35,6 +35,8 @@ class PagedCacheGroupSpec:
     family: Family = "history"
     # Per-group page tokens; None -> scheduler global block_size, else a multiple of it.
     block_size: int | None = None
+    # Sliding-only: real pages for the live tail + LCM-boundary resume pages, holes elsewhere (paged conv state only).
+    live_tail_alloc: bool = False
 
 
 _PAGED_CACHE_GROUP_DUMMY_PAGES = 1
