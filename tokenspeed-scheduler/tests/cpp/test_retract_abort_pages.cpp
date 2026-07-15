@@ -240,4 +240,95 @@ TEST_F(RetractAbortPagesSuite, Retract_AfterExtendResult_NoPageMismatchCrash) {
     EXPECT_GE(scheduler_->RetractedSize(), 1u);
 }
 
+// scheduleRetract() must not mutate the request/tree state (TakeFirstPages +
+// Insert<Device>) before EnsureCapacityByEvict<Host>() has confirmed there is
+// room for the write-back. Every other scheduleXxx() in forward.cpp checks
+// capacity first and mutates only once every gate passes; scheduleRetract()
+// used to be the exception, mutating unconditionally and only then bailing
+// out via `return {}` if the host-side check failed -- leaving the request's
+// local KV allocator already shrunk while the tree already owned those
+// pages, with no ScheduleRetractEvent ever applied to reconcile the two.
+class RetractHostCapacityExhaustedSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = SchedulerTestSuite::MakeConfig();
+        cfg.decode_input_tokens = 0;
+        cfg.block_size = 2;
+        cfg.device_allocator.total_pages = 4;  // 3 usable -> forces a retract under pressure
+        cfg.host_allocator.total_pages = 1;    // 0 usable -> EnsureCapacityByEvict<Host> can never succeed
+        cfg.enable_l3_storage = false;
+        return cfg;
+    }
+
+    void BringToDecoding(const std::string& id, std::int32_t num_pages = 1, token_t start = 1) {
+        Submit(MakeRequestSpec(id, num_pages, start));
+        PlanOnce();
+        SendForwardDone(id, {42});
+        PlanOnce();
+    }
+
+    void SendReserveNumTokens(const std::string& id, std::int32_t n) {
+        ExecutionEvent event;
+        event.With(ForwardEvent{forward::UpdateReserveNumTokens{
+            .request_id = id,
+            .reserve_num_tokens_in_next_schedule_event = n,
+        }});
+        scheduler_->Advance(std::move(event));
+    }
+
+    static const FlatWriteBackOperation* GetWriteBack(const ExecutionPlan& plan) {
+        for (const auto& op : plan.Operations()) {
+            if (auto* cop = std::get_if<CacheOperation>(&op)) {
+                if (auto* wb = std::get_if<FlatWriteBackOperation>(cop)) {
+                    return wb;
+                }
+            }
+        }
+        return nullptr;
+    }
+};
+
+TEST_F(RetractHostCapacityExhaustedSuite, FailedHostCapacityCheck_DoesNotLeakDevicePages) {
+    // Same overlap-scheduling setup as Retract_AfterExtendResult_NoPageMismatchCrash
+    // above (which reliably forces a retract with alloc_count > 0), just with the
+    // host pool shrunk to 0 usable pages so EnsureCapacityByEvict<Host> must fail.
+    BringToDecoding("r1", 1, 1);  // tokens=[1,2,42], 1 page, tail=0
+    BringToDecoding("r2", 2, 3);  // tokens=[3,4,5,6,42], 2 pages, tail=0
+    // 3 of 3 usable device pages consumed, 0 free.
+
+    // Overlap: ExtendResult arrives before the next Acquire, growing r1 past
+    // what its local allocator currently holds (alloc_count > 0 at retract time).
+    SendForwardDone("r1", {43, 44, 45, 46});
+    SendReserveNumTokens("r1", 4);
+    SendReserveNumTokens("r2", 1);
+
+    ASSERT_NO_THROW({ PlanOnce(); });
+
+    // r1's retract attempt failed the host-capacity check and r1 was
+    // aborted as a result (see Scheduler::newRetractOperation). If the
+    // pre-fix ordering bug fired, r1's local allocator was already emptied
+    // into the tree via TakeFirstPages()+Insert<Device>() before that abort,
+    // but the ScheduleRetractEvent that would have updated r1's
+    // device_node_ref_ to match was never applied -- so the abort path
+    // reconciles pages against a stale (shallower) node while the deeper
+    // node now silently owns pages nobody's ref count accounts for.
+    //
+    // Finish r2 as well: its 2 pages are retained in the prefix cache (that's
+    // the point of prefix caching), so with clean accounting exactly 1 of
+    // the 3 usable device pages should be free afterwards (r1's single page,
+    // once correctly reclaimed by the abort). A leaked or double-owned page
+    // from the premature mutation shows up as fewer pages than that.
+    SendFinish("r2");
+    PlanOnce();
+    auto wb2 = GetWriteBack(PlanOnce());
+    if (wb2 != nullptr && !wb2->op_ids.empty()) {
+        SendWriteBackDone(wb2->op_ids[0]);
+    }
+    PlanOnce();
+
+    EXPECT_EQ(scheduler_->AvailableKvPages(), 1)
+        << "device pages not fully reclaimed after both requests finished/aborted -- "
+           "a page was leaked or double-owned by the failed retract's premature mutation";
+}
+
 }  // namespace tokenspeed::test
