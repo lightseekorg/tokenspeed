@@ -626,6 +626,10 @@ def gluon_mxfp4_moe_stage1_kernel(
         B_SCALE_K_STEP: gl.constexpr = 1024
     b_scale_static_offs_gate = b_n_part_gate_scale + b_k_lane_offsets
     b_scale_static_offs_up = b_n_part_up_scale + b_k_lane_offsets
+
+    b_off_gate = b_scale_static_offs_gate
+    b_off_up = b_scale_static_offs_up
+
     b_scales_ptr_e = b_scales_ptr + off_experts.to(gl.int64) * stride_bse_e
 
     # ---- LDS allocation (2 A-data slots, ping-pong) --------------------
@@ -680,18 +684,8 @@ def gluon_mxfp4_moe_stage1_kernel(
         offs_b_up,
         0,
     )
-    b_scale_gate = _load_b_scale_vgpr(
-        b_scales_ptr_e,
-        b_scale_static_offs_gate,
-        0,
-        B_SCALE_K_STEP,
-    )
-    b_scale_up = _load_b_scale_vgpr(
-        b_scales_ptr_e,
-        b_scale_static_offs_up,
-        0,
-        B_SCALE_K_STEP,
-    )
+    b_scale_gate = _load_b_scale_vgpr(b_scales_ptr_e, b_off_gate, 0, B_SCALE_K_STEP)
+    b_scale_up = _load_b_scale_vgpr(b_scales_ptr_e, b_off_up, 0, B_SCALE_K_STEP)
 
     cdna4_async_copy.wait_group(0)
     cur_a_group0 = _read_a_lds_group(
@@ -780,16 +774,10 @@ def gluon_mxfp4_moe_stage1_kernel(
             nxt_b_data_off,
         )
         next_bsc_gate = _load_b_scale_vgpr(
-            b_scales_ptr_e,
-            b_scale_static_offs_gate,
-            nxt_b_scale_k,
-            B_SCALE_K_STEP,
+            b_scales_ptr_e, b_off_gate, nxt_b_scale_k, B_SCALE_K_STEP
         )
         next_bsc_up = _load_b_scale_vgpr(
-            b_scales_ptr_e,
-            b_scale_static_offs_up,
-            nxt_b_scale_k,
-            B_SCALE_K_STEP,
+            b_scales_ptr_e, b_off_up, nxt_b_scale_k, B_SCALE_K_STEP
         )
 
         # MFMA groups 0,1 with current A[k] + current B[k].
@@ -952,16 +940,10 @@ def gluon_mxfp4_moe_stage1_kernel(
             nxt_b_data_off,
         )
         next_bsc_gate = _load_b_scale_vgpr(
-            b_scales_ptr_e,
-            b_scale_static_offs_gate,
-            nxt_b_scale_k,
-            B_SCALE_K_STEP,
+            b_scales_ptr_e, b_off_gate, nxt_b_scale_k, B_SCALE_K_STEP
         )
         next_bsc_up = _load_b_scale_vgpr(
-            b_scales_ptr_e,
-            b_scale_static_offs_up,
-            nxt_b_scale_k,
-            B_SCALE_K_STEP,
+            b_scales_ptr_e, b_off_up, nxt_b_scale_k, B_SCALE_K_STEP
         )
 
         gate_acc_group0 = _compute_mxfp4_group(
@@ -1117,16 +1099,10 @@ def gluon_mxfp4_moe_stage1_kernel(
             nxt_b_data_off,
         )
         next_bsc_gate = _load_b_scale_vgpr(
-            b_scales_ptr_e,
-            b_scale_static_offs_gate,
-            nxt_b_scale_k,
-            B_SCALE_K_STEP,
+            b_scales_ptr_e, b_off_gate, nxt_b_scale_k, B_SCALE_K_STEP
         )
         next_bsc_up = _load_b_scale_vgpr(
-            b_scales_ptr_e,
-            b_scale_static_offs_up,
-            nxt_b_scale_k,
-            B_SCALE_K_STEP,
+            b_scales_ptr_e, b_off_up, nxt_b_scale_k, B_SCALE_K_STEP
         )
 
         gate_acc_group0 = _compute_mxfp4_group(

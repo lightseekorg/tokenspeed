@@ -25,10 +25,24 @@ from typing import Any
 
 import torch
 
-_MXFP_BLOCK_SIZE = 32
+# CDNA4 MXFP4 scale layout is defined once in mxfp4_cdna4_scale_layout so the
+# weight-scale (B) preshuffle here and the activation-scale (A) gather in
+# gluon_a4w4_gfx950.scale stay in lock-step. Local aliases preserve the
+# historical private names used throughout this module.
+from tokenspeed_kernel_amd.ops.moe.mxfp4_cdna4_scale_layout import (
+    CDNA4_SCALE_K_BLOCK as _CDNA4_SCALE_K_BLOCK,
+)
+from tokenspeed_kernel_amd.ops.moe.mxfp4_cdna4_scale_layout import (
+    CDNA4_SCALE_N_BLOCK as _CDNA4_SCALE_N_BLOCK,
+)
+from tokenspeed_kernel_amd.ops.moe.mxfp4_cdna4_scale_layout import (
+    MXFP4_BLOCK as _MXFP_BLOCK_SIZE,
+)
+from tokenspeed_kernel_amd.ops.moe.mxfp4_cdna4_scale_layout import (
+    swizzle_cdna4_mxfp4_scale as _swizzle_cdna4_mxfp4_scale,
+)
+
 _GLUON_COMBINE_BLOCK_N = 128
-_CDNA4_SCALE_N_BLOCK = 32
-_CDNA4_SCALE_K_BLOCK = 8
 
 
 @dataclass
@@ -71,32 +85,6 @@ def _make_k_packed_mxfp4_weight(quant_tensor: torch.Tensor) -> torch.Tensor:
     )
     out.copy_(quant_tensor.transpose(-2, -1))
     return out
-
-
-def _swizzle_cdna4_mxfp4_scale(scale: torch.Tensor) -> torch.Tensor:
-    """Match triton_kernels' CDNA4MXScaleLayout byte swizzle using PyTorch ops."""
-    if scale.ndim < 2:
-        raise ValueError("MXFP4 scale tensor must have at least 2 dimensions")
-    scale = scale.transpose(-2, -1).contiguous()
-    *leading_shape, k_scale, n = scale.shape
-    leading = 1
-    for dim in leading_shape:
-        leading *= dim
-    k_scale_pad = (k_scale + _CDNA4_SCALE_K_BLOCK - 1) // _CDNA4_SCALE_K_BLOCK
-    k_scale_pad *= _CDNA4_SCALE_K_BLOCK
-    n_pad = (n + _CDNA4_SCALE_N_BLOCK - 1) // _CDNA4_SCALE_N_BLOCK
-    n_pad *= _CDNA4_SCALE_N_BLOCK
-
-    scale = scale.mT.contiguous().mT
-    scale = torch.nn.functional.pad(scale, (0, n_pad - n, 0, k_scale_pad - k_scale))
-    scale = scale.transpose(-1, -2)
-    scale = scale.reshape(leading, n_pad, k_scale_pad)
-    scale = scale.view(leading, n_pad // 32, 2, 16, k_scale_pad // 8, 2, 4, 1)
-    scale = scale.permute(0, 1, 4, 6, 3, 5, 2, 7).contiguous()
-    scale = scale.reshape(leading, n_pad // 32, k_scale_pad * 32)
-    scale = scale.transpose(-1, -2)
-    assert scale.stride(-2) == 1
-    return scale
 
 
 def _swizzle_mxfp4(quant_tensor: torch.Tensor, scale: torch.Tensor, num_warps: int):
