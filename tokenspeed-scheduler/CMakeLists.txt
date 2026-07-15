@@ -127,6 +127,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_block_ref.cpp
         tests/cpp/test_full_attn_manager.cpp
         tests/cpp/test_swa_manager.cpp
+        tests/cpp/test_swa_live_alloc.cpp
         tests/cpp/test_match_host_pages.cpp
         tests/cpp/test_kv_cache_coordinator.cpp
         tests/cpp/test_forward_cache_ops.cpp

@@ -296,7 +296,9 @@ KvCacheCoordinator MakeCoordinator(std::span<const KvCacheSpec> specs, BlockPool
         } else if (spec.kind == AttnKind::kMambaState) {
             manager = std::make_unique<MambaStateManager>(spec.block_size);
         } else {
-            manager = std::make_unique<SwaManager>(spec.block_size, spec.sliding_window);
+            // Live-tail groups keep resume pages behind every LCM-aligned boundary (matches the engine lcm_align persist set).
+            manager = std::make_unique<SwaManager>(spec.block_size, spec.sliding_window,
+                                                   spec.live_tail_alloc ? lcm : 0);
         }
         groups.emplace_back(spec, static_cast<std::uint32_t>(i), std::move(manager));
     }

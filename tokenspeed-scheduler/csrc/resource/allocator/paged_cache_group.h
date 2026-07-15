@@ -60,6 +60,8 @@ struct PagedCacheGroupConfig {
     std::optional<std::int32_t> sliding_window_tokens{};
     // History groups form a chain; State groups only need the trailing window.
     PagedCacheGroupFamily family{PagedCacheGroupFamily::History};
+    // Sliding-only: real pages for the live tail + LCM-boundary resume pages, holes elsewhere (paged conv state only).
+    bool live_tail_alloc{false};
 
     std::int32_t RawTokensPerPage() const { return rows_per_page * entry_stride_tokens; }
 
