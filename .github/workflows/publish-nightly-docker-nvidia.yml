@@ -109,6 +109,7 @@ jobs:
           for digest in "${RUNNER_TEMP}"/digests/*; do
             refs+=("${IMAGE}@sha256:$(basename "${digest}")")
           done
+          short_sha="${GITHUB_SHA::6}"
           docker buildx imagetools create \
-            --tag "${IMAGE}:nightly-${GITHUB_SHA}" \
+            --tag "${IMAGE}:nightly-${short_sha}" \
             "${refs[@]}"

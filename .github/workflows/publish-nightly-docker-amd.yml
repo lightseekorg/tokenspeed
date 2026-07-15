@@ -43,6 +43,10 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Derive image tag
+        id: tag
+        run: echo "tag=nightly-${GITHUB_SHA::6}" >> "$GITHUB_OUTPUT"
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
@@ -50,6 +54,6 @@ jobs:
           file: docker/Dockerfile.amd
           platforms: linux/amd64
           push: true
-          tags: ${{ env.IMAGE }}:nightly-${{ github.sha }}
+          tags: ${{ env.IMAGE }}:${{ steps.tag.outputs.tag }}
           no-cache: true
           provenance: false
