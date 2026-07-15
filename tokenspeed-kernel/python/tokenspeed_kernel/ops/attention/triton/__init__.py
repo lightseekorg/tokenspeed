@@ -29,3 +29,4 @@ import tokenspeed_kernel.ops.attention.triton.mha_decode  # noqa: F401
 import tokenspeed_kernel.ops.attention.triton.mha_prefill  # noqa: F401
 import tokenspeed_kernel.ops.attention.triton.mla_decode  # noqa: F401
 import tokenspeed_kernel.ops.attention.triton.mla_prefill  # noqa: F401
+import tokenspeed_kernel.ops.attention.triton.rel_mha  # noqa: F401

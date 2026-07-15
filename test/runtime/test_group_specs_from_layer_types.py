@@ -91,6 +91,39 @@ class GroupSpecsFromLayerTypesTest(unittest.TestCase):
             ["sliding_attention", "full_attention"],
         )
 
+    def test_sliding_subgroups_yield_one_spec_per_subgroup(self):
+        # Inkling step 2.5 shape: 5 sliding sub-groups + full -> 6 specs,
+        # first-appearance order, all sliding specs share the one window.
+        block = [f"sliding_attention_{k}" for k in range(5)] + ["full_attention"]
+        specs = group_specs_from_layer_types(
+            layer_types=block * 2,
+            sliding_window_tokens=512,
+            page_size=128,
+        )
+        self.assertEqual(
+            [s.group_id for s in specs],
+            block,
+        )
+        for s in specs[:5]:
+            self.assertEqual(s.retention, "sliding_window")
+            self.assertEqual(s.sliding_window_tokens, 512)
+            self.assertEqual(s.family, "history")
+        self.assertEqual(specs[5].retention, "full_history")
+        self.assertIsNone(specs[5].sliding_window_tokens)
+        # Single window: group ids stay equal to the raw labels.
+        self.assertEqual(
+            layer_group_ids(layer_types=block * 2, sliding_window_tokens=512),
+            block * 2,
+        )
+
+    def test_sliding_subgroup_nondigit_suffix_raises(self):
+        with self.assertRaises(ValueError):
+            group_specs_from_layer_types(
+                layer_types=["full_attention", "sliding_attention_x"],
+                sliding_window_tokens=64,
+                page_size=16,
+            )
+
     def test_unknown_layer_type_raises(self):
         with self.assertRaises(ValueError):
             group_specs_from_layer_types(

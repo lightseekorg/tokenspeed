@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.platform import current_platform
 
 
 @triton.jit
@@ -145,6 +146,7 @@ def _fused_qk_rmsnorm_kernel(
     head_dim: tl.constexpr,
     eps: tl.constexpr,
     BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     # 2D grid: (token, head). Heads in [0, num_q_heads) handle q rows;
     # heads in [num_q_heads, num_q_heads + num_kv_heads) handle k rows.
@@ -175,11 +177,20 @@ def _fused_qk_rmsnorm_kernel(
         )
         w_addrs = q_weight_ptr + offsets
 
+    # Weights are parameters nothing in the decode graph writes; safe to load before the PDL wait.
+    w = tl.load(w_addrs, mask=mask, other=0.0).to(tl.float32)
+
+    if ENABLE_PDL:
+        # Wait for the producer's stores before the first dependent load.
+        tl.extra.cuda.gdc_wait()
+
     x = tl.load(in_addrs, mask=mask, other=0.0).to(tl.float32)
     var = tl.sum(x * x, axis=0) / head_dim
     x = x * tl.rsqrt(var + eps)
-    w = tl.load(w_addrs, mask=mask, other=0.0).to(tl.float32)
     tl.store(out_addrs, x * w, mask=mask)
+    if ENABLE_PDL:
+        # All stores issued; let the dependent kernel begin its prologue.
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def qk_rmsnorm(
@@ -188,6 +199,7 @@ def qk_rmsnorm(
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
     eps: float,
+    enable_pdl: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-head RMSNorm of q and k in a single kernel launch.
 
@@ -218,6 +230,9 @@ def qk_rmsnorm(
     q_out = torch.empty((n_tokens, q.shape[-1]), dtype=q.dtype, device=q.device)
     k_out = torch.empty((n_tokens, k.shape[-1]), dtype=k.dtype, device=k.device)
 
+    kwargs = {}
+    if current_platform().is_nvidia:
+        kwargs["launch_pdl"] = enable_pdl
     _fused_qk_rmsnorm_kernel[(n_tokens, num_q_heads + num_kv_heads)](
         q,
         k,
@@ -234,6 +249,8 @@ def qk_rmsnorm(
         head_dim,
         eps,
         BLOCK=block,
+        ENABLE_PDL=enable_pdl,
+        **kwargs,
     )
     return q_out, k_out
 

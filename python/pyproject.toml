@@ -95,3 +95,6 @@ license-files = ["LICENSE", "THIRDPARTYNOTICES"]
 
 [tool.setuptools.packages.find]
 include = ["tokenspeed*"]
+
+[tool.setuptools.package-data]
+tokenspeed = ["runtime/chat_templates/*.jinja"]

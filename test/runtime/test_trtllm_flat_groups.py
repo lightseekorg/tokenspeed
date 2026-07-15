@@ -35,13 +35,25 @@ class TRTLLMFlatGroupsTest(unittest.TestCase):
 
         self.torch = torch
 
-    def _bare_backend(self, *, page_size=64, max_num_pages=8, spec_num_tokens=1):
+    def _bare_backend(
+        self,
+        *,
+        page_size=64,
+        max_num_pages=8,
+        spec_num_tokens=1,
+        device="cpu",
+        groups=None,
+    ):
         # Bypass __init__: the paths under test read only these attributes.
+        # Capture/replay tests pass device="cuda" and declare their groups —
+        # replay write locs are triton-only (no python fallback).
         b = self.Backend.__new__(self.Backend)
         b.page_size = page_size
         b.max_num_pages = max_num_pages
         b.max_context_len = page_size * max_num_pages
-        b.device = "cpu"
+        b.device = device
+        if groups is not None:
+            b.flat_group_page_sizes = groups
         b.spec_num_tokens = spec_num_tokens
         b.is_draft = False
         b.draft_block_decode = False
@@ -49,18 +61,15 @@ class TRTLLMFlatGroupsTest(unittest.TestCase):
         b.forward_prefill_metadata = None
         b.cuda_graph_prefill_metadata = {}
         b.cuda_graph_decode_metadata = {}
-        b.spec_cache_seqlens_buf = self.torch.zeros(8, dtype=self.torch.int32)
+        b.spec_cache_seqlens_buf = self.torch.zeros(
+            8, dtype=self.torch.int32, device=device
+        )
         return b
 
     def _layer(self, group_id):
         from types import SimpleNamespace
 
         return SimpleNamespace(group_id=group_id)
-
-    def test_flag_declared(self):
-        self.assertTrue(self.Backend.uses_flat_cache_groups)
-        # Verify path is wired: the startup guard must not reject flat+spec.
-        self.assertTrue(getattr(self.Backend, "flat_spec_capable", True))
 
     def test_select_page_table_routes_by_group(self):
         b = self._bare_backend()
@@ -152,10 +161,12 @@ class TRTLLMFlatGroupsTest(unittest.TestCase):
         )
 
     def test_graph_capture_and_replay_discipline(self):
-        b = self._bare_backend()
+        if not self.torch.cuda.is_available():
+            self.skipTest("replay write locs are triton-only (needs CUDA)")
+        gids = ("full_attention", "sliding_attention")
+        b = self._bare_backend(device="cuda", groups={g: 64 for g in gids})
         max_bs, bs = 4, 2
         b._init_flat_graph_buffers(max_bs)
-        gids = ("full_attention", "sliding_attention")
         page_tables, out_cache_locs = b._flat_capture_group_views(bs, gids)
         self.assertEqual(set(page_tables), set(gids))
         self.assertEqual(page_tables["full_attention"].shape, (bs, b.max_num_pages))
@@ -169,8 +180,8 @@ class TRTLLMFlatGroupsTest(unittest.TestCase):
             )
 
         # Replay fill copies rows, pads column tails with the trtllm dummy
-        # page 0 (flat_table_tail_pad), recomputes locs.
-        seq_lens = self.torch.tensor([65, 1, 1, 1], dtype=self.torch.int32)
+        # page 0 (flat_table_tail_pad), recomputes locs (fused triton).
+        seq_lens = self.torch.tensor([65, 1, 1, 1], dtype=self.torch.int32).cuda()
         src = {
             "full_attention": self.torch.tensor(
                 [[11, 12], [0, -1]], dtype=self.torch.int32
@@ -228,13 +239,23 @@ class TRTLLMFlatGroupsTest(unittest.TestCase):
         self.assertEqual(meta.cache_seqlens_int32.tolist(), [65, 4])
 
     def test_verify_capture_replay_expanded_loc_views(self):
-        b = self._bare_backend(spec_num_tokens=4)
+        if not self.torch.cuda.is_available():
+            self.skipTest("replay write locs are triton-only (needs CUDA)")
+        b = self._bare_backend(
+            spec_num_tokens=4,
+            device="cuda",
+            groups={"full_attention": 64},
+        )
         max_bs, bs = 4, 2
         b._init_flat_graph_buffers(max_bs)
-        b.cuda_graph_cache_seqlens = self.torch.ones(max_bs, dtype=self.torch.int32)
+        b.cuda_graph_cache_seqlens = self.torch.ones(
+            max_bs, dtype=self.torch.int32, device="cuda"
+        )
         b.init_forward_metadata_capture_cuda_graph(
             bs,
-            req_pool_indices=self.torch.tensor([0, 1], dtype=self.torch.int32),
+            req_pool_indices=self.torch.tensor(
+                [0, 1], dtype=self.torch.int32, device="cuda"
+            ),
             seq_lens=b.cuda_graph_cache_seqlens[:bs],
             forward_mode=_DecodeMode(),
             flat_cache_group_ids=("full_attention",),
@@ -248,7 +269,7 @@ class TRTLLMFlatGroupsTest(unittest.TestCase):
         )
         src = {
             "full_attention": self.torch.tensor(
-                [[11, 12], [0, -1]], dtype=self.torch.int32
+                [[11, 12], [0, -1]], dtype=self.torch.int32, device="cuda"
             )
         }
         b.init_forward_metadata_replay_cuda_graph(

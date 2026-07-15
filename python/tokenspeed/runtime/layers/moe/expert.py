@@ -65,6 +65,7 @@ class MoELayer(torch.nn.Module):
         w13_input_layout: str = "concatenated",
         with_bias=False,
         routing_config: dict = {},
+        routing_mode: str | None = None,
     ):
         super().__init__()
         self.layer_index = layer_index
@@ -187,6 +188,8 @@ class MoELayer(torch.nn.Module):
             self._quant_kind,
             input_dtype=input_dtype,
             activation=self.activation,
+            # e.g. "precomputed_topk" when fused kernels cannot reproduce the routing; None = unconstrained.
+            routing_mode=routing_mode,
             a2a_backend=self._spec.a2a_backend,
             ep_size=self.ep_size,
             ispp=self.intermediate_size // self.tp_size,

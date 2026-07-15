@@ -51,6 +51,12 @@ hybrid_slab_group_size = _pcs.hybrid_slab_group_size
 
 GPT_OSS_LAYER_TYPES = ("sliding_attention", "full_attention") * 12
 
+# One Inkling-style layer block: 5 sliding sub-groups + 1 full layer.
+# Repeated N times, all 6 groups have equal count N (fully bound slabs).
+SUBGROUP_LAYER_BLOCK = tuple(f"sliding_attention_{k}" for k in range(5)) + (
+    "full_attention",
+)
+
 
 class HybridSlabGroupSizeTest(unittest.TestCase):
     """Each case pins exactly ONE reason the predicate returns None (or the
@@ -79,8 +85,29 @@ class HybridSlabGroupSizeTest(unittest.TestCase):
         with self._flat_ext(True):
             self.assertIsNone(hybrid_slab_group_size(("full_attention",) * 24))
 
-    def test_none_when_unequal_groups(self):
+    def test_unequal_groups_return_largest_count(self):
+        # Unequal groups (e.g. Inkling: 55 sliding + 11 full): the slab
+        # count is the largest group's layer count; slabs past the smaller
+        # group's count are single-layer.
         lt = ("sliding_attention",) * 8 + ("full_attention",) * 16
+        with self._flat_ext(True):
+            self.assertEqual(hybrid_slab_group_size(lt), 16)
+        lt_inkling = ("sliding_attention",) * 55 + ("full_attention",) * 11
+        with self._flat_ext(True):
+            self.assertEqual(hybrid_slab_group_size(lt_inkling), 55)
+
+    def test_sliding_subgroups_return_group_size(self):
+        # Inkling step 2.5: 5 sliding sub-groups + full, all count 11 ->
+        # 11 slabs, every slab bound by one layer of each of the 6 groups.
+        lt = SUBGROUP_LAYER_BLOCK * 11
+        with self._flat_ext(True):
+            self.assertEqual(
+                hybrid_slab_group_size(lt, sliding_window_tokens=512),
+                11,
+            )
+
+    def test_none_when_subgroup_suffix_not_digit(self):
+        lt = GPT_OSS_LAYER_TYPES + ("sliding_attention_x",)
         with self._flat_ext(True):
             self.assertIsNone(hybrid_slab_group_size(lt))
 
@@ -325,9 +352,6 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
                 layer_types=("full_attention",) * 24,
                 sliding_window_tokens=None,
             ),
-            unequal_groups=dict(
-                layer_types=("sliding_attention",) * 8 + ("full_attention",) * 16
-            ),
         )
         for name, overrides in cases.items():
             with self.subTest(name):
@@ -335,6 +359,45 @@ class MHAPoolSlabLayoutTest(unittest.TestCase):
                 self.assertEqual(len({id(t) for t in pool.k_buffer}), 24)
                 self.assertEqual(len({id(t) for t in pool.v_buffer}), 24)
                 self.assertTrue(pool.supports_hierarchical_kv_cache)
+
+    def test_unequal_groups_pair_smaller_into_larger(self):
+        # 8 sliding + 16 full -> 16 slabs: the 8 sliding layers alias the
+        # first 8 full layers' slabs; full layers 8..15 keep solo slabs
+        # (the Inkling shape, 55 sliding + 11 full, scaled down).
+        pool = self._pool(
+            layer_types=("sliding_attention",) * 8 + ("full_attention",) * 16
+        )
+        self.assertEqual(len(pool.k_buffer), 24)
+        self.assertEqual(len({id(t) for t in pool.k_buffer}), 16)
+        self.assertEqual(len({id(t) for t in pool.v_buffer}), 16)
+        for i in range(8):
+            # sliding layer i (id i) pairs full layer i (id 8 + i).
+            self.assertIs(pool.k_buffer[i], pool.k_buffer[8 + i])
+            self.assertIs(pool.v_buffer[i], pool.v_buffer[8 + i])
+        solo = [id(t) for t in pool.k_buffer[16:]]
+        self.assertEqual(len(set(solo)), 8)
+        self.assertFalse(pool.supports_hierarchical_kv_cache)
+
+    def test_sliding_subgroups_six_way_binding(self):
+        # (s0..s4, full) x 2 -> 6 groups of 2 layers -> 2 slabs, each bound
+        # by one layer of every group (the Inkling 5+1 shape, scaled down).
+        pool = self._pool(
+            layer_num=12,
+            layer_types=SUBGROUP_LAYER_BLOCK * 2,
+            sliding_window_tokens=512,
+        )
+        self.assertEqual(len(pool.k_buffer), 12)
+        self.assertEqual(len({id(t) for t in pool.k_buffer}), 2)
+        self.assertEqual(len({id(t) for t in pool.v_buffer}), 2)
+        # Occurrence pairing: layers 0..5 (first occurrence of each label)
+        # bind slab 0; layers 6..11 bind slab 1.
+        for i in range(6):
+            self.assertIs(pool.k_buffer[i], pool.k_buffer[0])
+            self.assertIs(pool.k_buffer[6 + i], pool.k_buffer[6])
+            self.assertIs(pool.v_buffer[i], pool.v_buffer[0])
+            self.assertIs(pool.v_buffer[6 + i], pool.v_buffer[6])
+        self.assertIsNot(pool.k_buffer[0], pool.k_buffer[6])
+        self.assertFalse(pool.supports_hierarchical_kv_cache)
 
     def test_guard_raises_on_pd_with_slab(self):
         with self.assertRaisesRegex(

@@ -326,6 +326,26 @@ class ModelConfig:
         )
 
         self.hf_text_config = get_hf_text_config(self.hf_config)
+        if (
+            is_draft_worker
+            and resolve_architecture(self.hf_config)
+            == "InklingForConditionalGenerationNextN"
+        ):
+            # The MTP head's depth blocks have their own local/full attention
+            # pattern (mtp_config.local_layer_ids) and only depths
+            # 0..steps-1 ever run; swap in the depth-specialized (and
+            # steps-pruned) text config so layer construction, attention
+            # metadata, and paged-cache layout all derive from it.
+            from tokenspeed.runtime.configs.inkling_config import (
+                inkling_mtp_text_config,
+            )
+
+            self.hf_text_config = inkling_mtp_text_config(
+                self.hf_text_config,
+                num_steps=getattr(server_args, "speculative_num_steps", None),
+            )
+            if hasattr(self.hf_config, "text_config"):
+                self.hf_config.text_config = self.hf_text_config
 
         # Check model type
         self.is_generation = is_generation_model(self.hf_config.architectures)
@@ -712,6 +732,7 @@ def is_multimodal_model(model_architectures: list[str] | None):
         "Qwen3OmniMoeForConditionalGeneration",
         "Qwen3ASRForConditionalGeneration",
         "KimiK25ForConditionalGeneration",
+        "InklingForConditionalGeneration",
     }
     return any(arch in multimodal_architectures for arch in model_architectures or [])
 
@@ -726,6 +747,7 @@ def is_image_gen_model(model_architectures: list[str]):
 
 def is_audio_model(model_architectures: list[str] | None):
     audio_architectures = {
+        "InklingForConditionalGeneration",
         "Qwen3OmniMoeForConditionalGeneration",
         "Qwen3ASRForConditionalGeneration",
     }

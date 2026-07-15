@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
@@ -33,6 +33,8 @@ class PagedCacheGroupSpec:
     sliding_window_tokens: int | None
     # History groups form a chain; State groups only need the trailing window.
     family: Family = "history"
+    # Per-group page tokens; None -> scheduler global block_size, else a multiple of it.
+    block_size: int | None = None
 
 
 _PAGED_CACHE_GROUP_DUMMY_PAGES = 1
@@ -69,21 +71,53 @@ _LAYER_TYPE_RETENTION: dict[str, Retention] = {
 # Labels whose group is state-family (recurrent state rows, not KV history).
 STATE_LAYER_TYPES = frozenset({LINEAR_ATTENTION})
 
+# Sliding sub-groups make each slab bound by one layer of every group — no dead slab rows.
+_SLIDING_SUBGROUP_PREFIX = "sliding_attention_"
+
+
+def _retention_for_label(label: str) -> Retention | None:
+    """Retention for a paged-cache layer_type label, or None if unknown.
+
+    Args:
+        label: A layer_type label — one of the exact vocabulary in
+            ``_LAYER_TYPE_RETENTION``, or a sliding sub-group label
+            ``sliding_attention_<k>`` (k a decimal index).
+
+    Returns:
+        The label's retention, or None for labels outside the vocabulary.
+    """
+    retention = _LAYER_TYPE_RETENTION.get(label)
+    if retention is not None:
+        return retention
+    if (
+        label.startswith(_SLIDING_SUBGROUP_PREFIX)
+        and label[len(_SLIDING_SUBGROUP_PREFIX) :].isdigit()
+    ):
+        return "sliding_window"
+    return None
+
 
 def hybrid_slab_group_size(
     layer_types: Sequence[str] | None,
     *,
     sliding_window_tokens: int | Sequence[int | None] | None = None,
 ) -> int | None:
-    """Group size for the hybrid slab KV layout (one layer of EACH group
-    shares a K/V slab), or None to keep the legacy per-layer layout.
+    """Slab count for the hybrid slab KV layout (the i-th layer of EACH
+    group shares slab i), or None to keep the legacy per-layer layout.
 
     Single source (canonical) for both the sizing divisor (registry KV
     profile) and the buffer layout (_create_buffers) -- the two must never
     disagree. Safe only with the flat ext (its single BlockPool owns each
     page id by at most one group, so paired layers' live rows never
-    overlap) and equal group sizes. Unknown labels degrade to None -- the
-    predicate gates an optimization, so it must not raise.
+    overlap). Unknown labels degrade to None -- the predicate gates an
+    optimization, so it must not raise.
+
+    Groups may be unequal in size (e.g. Inkling's 55 sliding + 11 full):
+    the slab count is the LARGEST group's layer count; slabs beyond a
+    smaller group's count are single-layer. Equal groups keep the original
+    gpt-oss pairing (count == group size). Sliding sub-group labels
+    ("sliding_attention_<k>") count as separate groups — equal-count
+    sub-groups make every slab fully bound (Inkling 5x11 + 11 -> 11 slabs).
 
     Multi-window models (a per-layer window sequence with >1 distinct
     window) degrade to None: the slab pairing is per raw label, not per
@@ -96,7 +130,7 @@ def hybrid_slab_group_size(
     counts: dict[str, int] = {}
     for label in layer_types:
         # State rows are not byte-equal with KV rows, so no slab pairing.
-        if label not in _LAYER_TYPE_RETENTION or label in STATE_LAYER_TYPES:
+        if _retention_for_label(label) is None or label in STATE_LAYER_TYPES:
             return None
         counts[label] = counts.get(label, 0) + 1
     if len(counts) < 2:
@@ -109,17 +143,14 @@ def hybrid_slab_group_size(
         distinct = {
             w
             for label, w in zip(layer_types, sliding_window_tokens)
-            if _LAYER_TYPE_RETENTION[label] == "sliding_window"
+            if _retention_for_label(label) == "sliding_window"
             and isinstance(w, int)
             and not isinstance(w, bool)
             and w > 0
         }
         if len(distinct) > 1:
             return None
-    sizes = set(counts.values())
-    if len(sizes) != 1:
-        return None
-    return sizes.pop()
+    return max(counts.values())
 
 
 def _flat_kv_backend(attn_backend: object) -> object:
@@ -349,11 +380,12 @@ def _layer_specs(
             )
     rows: list[tuple[str, Retention, int | None]] = []
     for i, (label, raw) in enumerate(zip(layer_types, windows)):
-        retention = _LAYER_TYPE_RETENTION.get(label)
+        retention = _retention_for_label(label)
         if retention is None:
             raise ValueError(
                 f"_layer_specs: unknown layer_type {label!r} at layer {i}; "
-                f"expected one of {sorted(_LAYER_TYPE_RETENTION)}"
+                f"expected one of {sorted(_LAYER_TYPE_RETENTION)} or a "
+                f"sliding sub-group label '{_SLIDING_SUBGROUP_PREFIX}<k>'"
             )
         if raw is not None and (isinstance(raw, bool) or not isinstance(raw, int)):
             raise ValueError(
@@ -408,6 +440,7 @@ def group_specs_from_layer_types(
     layer_types: Sequence[str],
     sliding_window_tokens: int | Sequence[int | None] | None,
     page_size: int,
+    page_sizes: Mapping[str, int] | None = None,
 ) -> list[PagedCacheGroupSpec]:
     """Derive paged-cache group specs from per-layer attention types.
 
@@ -416,32 +449,48 @@ def group_specs_from_layer_types(
 
     Args:
         layer_types: Per-layer labels: "full_attention" / "sliding_attention"
-            / "linear_attention" (state-family, e.g. Qwen3.5 GDN).
+            (or sliding sub-group labels "sliding_attention_<k>") /
+            "linear_attention" (state-family, e.g. Qwen3.5 GDN).
         sliding_window_tokens: One window for all sliding layers (today's HF
             scalar), or a per-layer sequence (multi-window models; full-layer
             positions must be None).
-        page_size: Tokens per page (uniform across groups).
+        page_size: Tokens per page (the scheduler's base block size).
+        page_sizes: Per-group page sizes keyed by group id (heterogeneous
+            block sizes); values must be positive multiples of page_size.
+            Groups not listed use page_size.
 
     Raises:
         ValueError: unknown label; window sequence length mismatch; sliding
             layer without a positive window; full layer carrying a window.
     """
+    sizes = dict(page_sizes or {})
+    for gid, ps in sizes.items():
+        if ps <= 0 or ps % page_size:
+            raise ValueError(
+                f"page_sizes[{gid!r}] = {ps} must be a positive "
+                f"multiple of page_size {page_size}"
+            )
     specs: list[PagedCacheGroupSpec] = []
     seen: set[str] = set()
     for gid, retention, window in _layer_specs(layer_types, sliding_window_tokens):
         if gid in seen:
             continue
         seen.add(gid)
+        ps = sizes.pop(gid, None) or page_size
         specs.append(
             PagedCacheGroupSpec(
                 group_id=gid,
                 retention=retention,
-                rows_per_page=page_size,
+                rows_per_page=ps,
                 entry_stride_tokens=1,
                 sliding_window_tokens=window,
                 family="state" if gid in STATE_LAYER_TYPES else "history",
+                # Always explicit: unset groups inherit the C++ gcd base, which a finer extra group silently lowers.
+                block_size=ps,
             )
         )
+    if sizes:
+        raise ValueError(f"page_sizes for unknown groups: {sorted(sizes)}")
     return specs
 
 
@@ -450,6 +499,8 @@ def publish_paged_cache_groups(
     layer_types: Sequence[str],
     sliding_window_tokens: int | Sequence[int | None] | None,
     page_size: int,
+    page_sizes: Mapping[str, int] | None = None,
+    extra_groups: Sequence[PagedCacheGroupSpec] = (),
     max_live_requests: int,
     max_scheduled_tokens: int,
     max_total_tokens: int,
@@ -482,7 +533,16 @@ def publish_paged_cache_groups(
         layer_types=tuple(layer_types) or (FULL_ATTENTION,),
         sliding_window_tokens=sliding_window_tokens,
         page_size=page_size,
+        page_sizes=page_sizes,
     )
+    # Model-declared groups outside the layer-type vocabulary (e.g. paged sconv columns).
+    for spec in extra_groups:
+        if any(sp.group_id == spec.group_id for sp in specs):
+            raise ValueError(f"extra_groups: duplicate group id {spec.group_id!r}")
+        # Smaller extra-group blocks lower the gcd base by design; MakeCoordinator asserts divisibility.
+        if spec.block_size is not None and spec.block_size <= 0:
+            raise ValueError(f"extra_groups[{spec.group_id!r}]: block_size must be > 0")
+        specs.append(spec)
     counts = compute_paged_cache_group_page_counts(
         specs,
         max_live_requests=max_live_requests,

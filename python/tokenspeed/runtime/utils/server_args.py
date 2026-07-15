@@ -803,8 +803,11 @@ class ServerArgs:
             "--kv-cache-dtype",
             type=str,
             default=ServerArgs.kv_cache_dtype,
-            choices=["auto", "fp8", "fp8_e4m3"],
-            help='Data type for kv cache storage. "auto" will use model data type. "fp8" is an alias for "fp8_e4m3".',
+            choices=["auto", "fp8", "fp8_e4m3", "mxfp8"],
+            help='Data type for kv cache storage. "auto" will use model data type. '
+            '"fp8" is an alias for "fp8_e4m3" (per-tensor scales). "mxfp8" stores '
+            "block-scaled fp8-e4m3 (one UE8M0 scale per 32 head_dim elements) and "
+            "requires --block-size 128 with an MHA attention backend.",
         )
         parser.add_argument(
             "--kv-cache-quant-method",

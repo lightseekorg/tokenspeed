@@ -303,6 +303,15 @@ class PrefillGraph:
         )
         captured_ok = True
         try:
+            # Seam: backends alloc static buffers or refuse capture; kept outside inference mode (in-place refresh).
+            init_pfg_state = getattr(
+                self.attn_backend, "init_prefill_graph_state", None
+            )
+            if init_pfg_state is not None:
+                init_pfg_state(
+                    max_num_tokens=max(self.capture_buckets),
+                    max_bs=int(self.req_to_page.shape[0]),
+                )
             with maybe_inference_mode():
                 self._capture_all_buckets(decode_wrapper)
         except torch.cuda.OutOfMemoryError:
@@ -398,10 +407,7 @@ class PrefillGraph:
             self._input_embeds_buf[num_tokens:bucket].zero_()
 
     def _dummy_flat_tables(self, num_tokens: int) -> dict[str, "torch.Tensor"]:
-        """Capture-time flat per-group tables for the dummy batch: all zeros =
-        the reserved null block 0 (the decode-capture convention), one row,
-        wide enough for num_tokens. Empty for non-flat backends; state groups
-        ride to their own backend and are skipped."""
+        """Dummy batch must carry flat tables (else the non-flat path gets captured); zeros = null block 0."""
         backend = self.attn_backend
         if not getattr(backend, "uses_flat_cache_groups", False):
             return {}
@@ -564,6 +570,15 @@ class PrefillGraph:
             input_embeds if input_embeds is not None else self._embed_tokens(input_ids),
             bucket,
         )
+        # Re-pad tail rows: they hold the previous forward's residue, which captured kernels consume.
+        if num_tokens < bucket:
+            ib = self.input_buffers
+            ib.input_ids_buf[num_tokens:bucket].fill_(1)
+            ib.out_cache_loc_buf[num_tokens:bucket].fill_(ib.dummy_kv_slot)
+            if self.config.model_is_mrope:
+                ib.mrope_positions_buf[:, num_tokens:bucket].zero_()
+            else:
+                ib.positions_buf[num_tokens:bucket].zero_()
         with self._padded_to(ctx, bucket):
             self._captures[bucket].replay()
         hidden_states, aux_hidden_states = self._outputs[bucket].sliced(num_tokens)

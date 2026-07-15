@@ -39,6 +39,7 @@ if platform.is_nvidia:
         nvfp4_block_scale_interleave,
         trtllm_fp4_block_scale_moe,
     )
+    from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
     from flashinfer.fused_moe.core import (
         _maybe_get_cached_w3_w1_permute_indices as maybe_get_cached_w3_w1_permute_indices,
     )
@@ -214,6 +215,117 @@ if platform.is_nvidia:
         if _correction_bias is not None:
             _correction_bias = _correction_bias.to(_routing_logits_dtype)
 
+    def _flashinfer_trtllm_nvfp4_moe_apply(
+        x: torch.Tensor,
+        w: torch.nn.Module,
+        router_logits: torch.Tensor,
+        topk_weights: torch.Tensor | None,
+        topk_ids: torch.Tensor | None,
+        do_finalize: bool,
+        enable_pdl: bool,
+        routed: bool,
+    ):
+        """Shared body for the in-kernel-routing and precomputed-topk variants.
+
+        ``routed`` selects between ``trtllm_fp4_block_scale_moe`` (in-kernel
+        routing from ``router_logits``) and ``trtllm_fp4_block_scale_routed_moe``
+        (precomputed ``topk_ids``/``topk_weights``); everything else is
+        identical.
+        """
+        _spec = getattr(w, "_spec", None)
+
+        num_tokens = x.shape[0]
+        # Idle DP ranks pass 0 tokens and the fused kernel divides by token count on host; skip experts.
+        if num_tokens == 0:
+            if do_finalize:
+                return x
+            return (
+                x,
+                x.new_empty((0, _spec.top_k), dtype=torch.bfloat16),
+                # moe_finalize_fuse_shared expects a 1-D [num_tokens * top_k] permute map.
+                x.new_empty((0,), dtype=torch.int32),
+            )
+
+        # Quantize input to FP4 using the fused-kernel scale layout.
+        hs_fp4, hs_scale = fp4_quantize(
+            x,
+            w.w13_input_scale_quant,
+            is_sf_swizzled_layout=False,
+            enable_pdl=enable_pdl,
+        )
+
+        # GEMM and scale arguments shared by both kernel entry points.
+        common_kwargs = dict(
+            hidden_states=hs_fp4,
+            hidden_states_scale=hs_scale.view(torch.float8_e4m3fn),
+            gemm1_weights=w.gemm1_weights_fp4_shuffled.data,
+            gemm1_weights_scale=w.gemm1_scales_fp4_shuffled.data.view(
+                torch.float8_e4m3fn
+            ),
+            gemm1_bias=None,
+            gemm1_alpha=None,
+            gemm1_beta=None,
+            gemm1_clamp_limit=None,
+            gemm2_weights=w.gemm2_weights_fp4_shuffled.data,
+            gemm2_weights_scale=w.gemm2_scales_fp4_shuffled.data.view(
+                torch.float8_e4m3fn
+            ),
+            gemm2_bias=None,
+            output1_scale_scalar=w.g1_scale_c.data,
+            output1_scale_gate_scalar=w.g1_alphas.data,
+            output2_scale_scalar=w.g2_alphas.data,
+            num_experts=_spec.num_experts,
+            top_k=_spec.top_k,
+            intermediate_size=w.intermediate_size_per_partition,
+            local_expert_offset=_spec.ep_rank * _spec.num_local_experts,
+            local_num_experts=_spec.num_local_experts,
+            do_finalize=do_finalize,
+            tune_max_num_tokens=next_power_of_2(num_tokens),
+        )
+
+        if routed:
+            # Weights apply verbatim at finalize (pre-fold route_scale); deferred never reads them.
+            topk = (
+                topk_ids.to(torch.int32),
+                topk_weights.to(torch.bfloat16) if do_finalize else topk_weights,
+            )
+            result = trtllm_fp4_block_scale_routed_moe(
+                topk_ids=topk,
+                routing_bias=None,
+                n_group=None,
+                topk_group=None,
+                routed_scaling_factor=None,
+                **common_kwargs,
+            )
+        else:
+            _routing_logits_dtype = getattr(w, "_routing_logits_dtype", torch.bfloat16)
+            result = trtllm_fp4_block_scale_moe(
+                routing_logits=router_logits.to(_routing_logits_dtype),
+                routing_bias=getattr(w, "_correction_bias", None),
+                n_group=getattr(w, "_n_group", 0),
+                topk_group=getattr(w, "_topk_group", 0),
+                routed_scaling_factor=getattr(w, "_routed_scaling_factor", 1.0),
+                routing_method_type=getattr(w, "_routing_method_type", 0),
+                **common_kwargs,
+            )
+        if do_finalize:
+            return result[0]
+        # Deferred: [gemm2_out, expert_weights, expanded_idx_to_permuted_idx]
+        gemm2_out, expert_weights, expanded_idx = result
+        if routed:
+            # expert_weights just echoes the caller's input; shared-sink callers drop it and pass their own.
+            return (gemm2_out, expert_weights, expanded_idx)
+        # Flashinfer's Python wrapper allocates expert_weights with
+        # ``routing_logits.dtype`` (fp32 for DSv3), but the C++ routing
+        # kernel writes bf16 contiguously for DeepSeekV3 routing
+        # into the buffer. Only the first half holds valid data; reading
+        # as fp32 interprets two adjacent bf16s as one fp32. Reinterpret
+        # to bf16 and keep the live prefix.
+        if expert_weights.dtype == torch.float32:
+            n, k = expert_weights.size()
+            expert_weights = expert_weights.view(torch.bfloat16).view(-1, k)[:n]
+        return (gemm2_out, expert_weights, expanded_idx)
+
     @register_kernel(
         "moe",
         "apply",
@@ -255,84 +367,69 @@ if platform.is_nvidia:
         do_finalize: bool = True,
         enable_pdl: bool = False,
     ):
-        _spec = getattr(w, "_spec", None)
-        _correction_bias = getattr(w, "_correction_bias", None)
-        _routing_logits_dtype = getattr(w, "_routing_logits_dtype", torch.bfloat16)
-        _n_group = getattr(w, "_n_group", 0)
-        _topk_group = getattr(w, "_topk_group", 0)
-        _routed_scaling_factor = getattr(w, "_routed_scaling_factor", 1.0)
-        _routing_method_type = getattr(w, "_routing_method_type", 0)
-
-        num_tokens = x.shape[0]
-        # Idle DP ranks run a dummy forward with 0 tokens. The fused
-        # kernel divides by the token count on the host and SIGFPEs on
-        # empty input, so skip the experts entirely.
-        if num_tokens == 0:
-            if do_finalize:
-                return x
-            return (
-                x,
-                x.new_empty((0, _spec.top_k), dtype=torch.bfloat16),
-                # moe_finalize_fuse_shared expects a 1-D
-                # [num_tokens * top_k] permute map.
-                x.new_empty((0,), dtype=torch.int32),
-            )
-
-        # Quantize input to FP4 using the fused-kernel scale layout.
-        hs_fp4, hs_scale = fp4_quantize(
+        return _flashinfer_trtllm_nvfp4_moe_apply(
             x,
-            w.w13_input_scale_quant,
-            is_sf_swizzled_layout=False,
-            enable_pdl=enable_pdl,
+            w,
+            router_logits,
+            topk_weights,
+            topk_ids,
+            do_finalize,
+            enable_pdl,
+            routed=False,
         )
 
-        routing_bias = _correction_bias
-        routing_logits = router_logits.to(_routing_logits_dtype)
-
-        result = trtllm_fp4_block_scale_moe(
-            routing_logits=routing_logits,
-            routing_bias=routing_bias,
-            hidden_states=hs_fp4,
-            hidden_states_scale=hs_scale.view(torch.float8_e4m3fn),
-            gemm1_weights=w.gemm1_weights_fp4_shuffled.data,
-            gemm1_weights_scale=w.gemm1_scales_fp4_shuffled.data.view(
-                torch.float8_e4m3fn
-            ),
-            gemm1_bias=None,
-            gemm1_alpha=None,
-            gemm1_beta=None,
-            gemm1_clamp_limit=None,
-            gemm2_weights=w.gemm2_weights_fp4_shuffled.data,
-            gemm2_weights_scale=w.gemm2_scales_fp4_shuffled.data.view(
-                torch.float8_e4m3fn
-            ),
-            gemm2_bias=None,
-            output1_scale_scalar=w.g1_scale_c.data,
-            output1_scale_gate_scalar=w.g1_alphas.data,
-            output2_scale_scalar=w.g2_alphas.data,
-            num_experts=_spec.num_experts,
-            top_k=_spec.top_k,
-            n_group=_n_group,
-            topk_group=_topk_group,
-            intermediate_size=w.intermediate_size_per_partition,
-            local_expert_offset=_spec.ep_rank * _spec.num_local_experts,
-            local_num_experts=_spec.num_local_experts,
-            routed_scaling_factor=_routed_scaling_factor,
-            routing_method_type=_routing_method_type,
-            do_finalize=do_finalize,
-            tune_max_num_tokens=next_power_of_2(num_tokens),
+    @register_kernel(
+        "moe",
+        "apply",
+        name="flashinfer_trtllm_nvfp4_routed_moe_apply",
+        solution="flashinfer_trtllm",
+        weight_preprocessor=flashinfer_trtllm_nvfp4_moe_weights,
+        capability=CapabilityRequirement(
+            vendors=frozenset({"nvidia"}),
+            min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 3),
+        ),
+        signatures=format_signatures(
+            "x",
+            "dense",
+            {torch.float16, torch.bfloat16},
+        ),
+        traits={
+            "weight_dtype": frozenset({"nvfp4"}),
+            "activation": frozenset({"silu", "swiglu"}),
+            "routing_mode": frozenset({"precomputed_topk"}),
+            "supports_deferred_finalize": frozenset({True}),
+            "supports_ep": frozenset({True}),
+            "supports_all_to_all_ep": frozenset({False}),
+            "ispp_alignment": frozenset({1}),
+            "internal_activation_dtype": frozenset({"input"}),
+            "supports_bias": frozenset({False}),
+        },
+        # One below in-kernel routing: this wins only for plans with routing_mode="precomputed_topk".
+        priority=Priority.PERFORMANT + 3,
+    )
+    def flashinfer_trtllm_nvfp4_routed_moe_apply(
+        plan: dict,
+        x: torch.Tensor,
+        w: torch.nn.Module,
+        router_logits: torch.Tensor,
+        topk_weights: torch.Tensor | None = None,
+        topk_ids: torch.Tensor | None = None,
+        num_tokens_global: int | None = None,
+        max_num_tokens_per_gpu: int | None = None,
+        do_finalize: bool = True,
+        enable_pdl: bool = False,
+    ):
+        assert (
+            topk_weights is not None and topk_ids is not None
+        ), "precomputed_topk plan requires topk_weights and topk_ids"
+        return _flashinfer_trtllm_nvfp4_moe_apply(
+            x,
+            w,
+            router_logits,
+            topk_weights,
+            topk_ids,
+            do_finalize,
+            enable_pdl,
+            routed=True,
         )
-        if do_finalize:
-            return result[0]
-        # Deferred: [gemm2_out, expert_weights, expanded_idx_to_permuted_idx]
-        gemm2_out, expert_weights, expanded_idx = result
-        # Flashinfer's Python wrapper allocates expert_weights with
-        # ``routing_logits.dtype`` (fp32 for DSv3), but the C++ routing
-        # kernel writes bf16 contiguously for DeepSeekV3 routing
-        # into the buffer. Only the first half holds valid data; reading
-        # as fp32 interprets two adjacent bf16s as one fp32. Reinterpret
-        # to bf16 and keep the live prefix.
-        if expert_weights.dtype == torch.float32:
-            n, k = expert_weights.size()
-            expert_weights = expert_weights.view(torch.bfloat16).view(-1, k)[:n]
-        return (gemm2_out, expert_weights, expanded_idx)

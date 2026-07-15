@@ -148,7 +148,9 @@ def get_quant_config(
         config = json.load(f)
 
         if model_config.quantization == "nvfp4":
-            if config["producer"]["name"] == "modelopt":
+            # The nested-"quantization" schema is ModelOpt's; some exports (e.g. Inkling) omit producer.
+            producer = config.get("producer", {}).get("name", "modelopt")
+            if producer == "modelopt":
                 return quant_cls.from_config(config)
             else:
                 raise ValueError(

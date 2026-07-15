@@ -78,6 +78,7 @@ from tokenspeed_kernel.ops.attention.triton import (
 from tokenspeed_kernel.ops.attention.triton import (
     mla_prefill as _attention_triton_mla_prefill,
 )
+from tokenspeed_kernel.ops.attention.triton import rel_mha as _attention_triton_rel_mha
 from tokenspeed_kernel.ops.moe.flashinfer import (
     cutedsl_deepep_nvfp4 as _moe_cutedsl_deepep_nvfp4,
 )
@@ -108,6 +109,7 @@ _RELOAD_MODULES = [
     _attention_triton_mha_decode,
     _attention_triton_mla_prefill,
     _attention_triton_mla_decode,
+    _attention_triton_rel_mha,
     _attention_triton_merge_state,
     _attention_triton_dsa,
     _attention_triton_dsa_topk,
@@ -257,7 +259,7 @@ def _mm_dense() -> torch.Tensor:
     return tokenspeed_kernel.mm(a, b)
 
 
-def _mm_dense_gluon_gfx950() -> torch.Tensor:
+def _mm_dense_cdna4_aligned() -> torch.Tensor:
     a = torch.empty((16, 64), dtype=torch.bfloat16)
     b = torch.empty((128, 64), dtype=torch.bfloat16)
     return tokenspeed_kernel.mm(a, b)
@@ -488,6 +490,141 @@ def _attention_decode() -> object:
         cache_seqlens,
         max_seqlen_k=128,
         max_seqlen_q=1,
+    )
+
+
+def _attention_rel_prefill() -> object:
+    q = torch.empty((4, 16, 64), dtype=torch.bfloat16)
+    k = torch.empty((4, 8, 64), dtype=torch.bfloat16)
+    v = torch.empty((4, 8, 64), dtype=torch.bfloat16)
+    rel_logits = torch.empty((4, 16, 64), dtype=torch.bfloat16)
+    cu_seqlens = torch.tensor([0, 4], dtype=torch.int32)
+    return tokenspeed_kernel.rel_mha_prefill(
+        q,
+        k,
+        v,
+        rel_logits,
+        cu_seqlens,
+        cu_seqlens_cpu=[0, 4],
+        max_seqlen=4,
+        softmax_scale=1.0 / 64,
+    )
+
+
+def _attention_rel_extend() -> object:
+    q = torch.empty((4, 16, 64), dtype=torch.bfloat16)
+    rel_logits = torch.empty((4, 16, 64), dtype=torch.bfloat16)
+    cu_seqlens_q = torch.tensor([0, 2, 4], dtype=torch.int32)
+    cu_seqlens_kv = torch.tensor([0, 64, 192], dtype=torch.int32)
+    k_cache = torch.empty((8, 64, 8, 64), dtype=torch.bfloat16)
+    v_cache = torch.empty((8, 64, 8, 64), dtype=torch.bfloat16)
+    page_table = torch.empty((2, 4), dtype=torch.int32)
+    cache_seqlens = torch.tensor([64, 128], dtype=torch.int32)
+    return tokenspeed_kernel.rel_mha_extend_with_kvcache(
+        q=q,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_kv=cu_seqlens_kv,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        max_seqlen_q=2,
+        max_seqlen_k=128,
+        rel_logits=rel_logits,
+        softmax_scale=1.0 / 64,
+    )
+
+
+def _attention_rel_extend_page256_sliding() -> object:
+    q = torch.empty((4, 16, 128), dtype=torch.bfloat16)
+    rel_logits = torch.empty((4, 16, 512), dtype=torch.bfloat16)
+    cu_seqlens_q = torch.tensor([0, 2, 4], dtype=torch.int32)
+    cu_seqlens_kv = torch.tensor([0, 256, 768], dtype=torch.int32)
+    k_cache = torch.empty((4, 256, 8, 128), dtype=torch.bfloat16)
+    v_cache = torch.empty((4, 256, 8, 128), dtype=torch.bfloat16)
+    page_table = torch.empty((2, 3), dtype=torch.int32)
+    cache_seqlens = torch.tensor([256, 512], dtype=torch.int32)
+    return tokenspeed_kernel.rel_mha_extend_with_kvcache(
+        q=q,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_kv=cu_seqlens_kv,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        max_seqlen_q=2,
+        max_seqlen_k=512,
+        rel_logits=rel_logits,
+        window_left=255,
+        softmax_scale=1.0 / 128,
+    )
+
+
+def _attention_rel_decode() -> object:
+    q = torch.empty((2, 16, 64), dtype=torch.bfloat16)
+    rel_logits = torch.empty((2, 16, 64), dtype=torch.bfloat16)
+    k_cache = torch.empty((8, 64, 8, 64), dtype=torch.bfloat16)
+    v_cache = torch.empty((8, 64, 8, 64), dtype=torch.bfloat16)
+    page_table = torch.empty((2, 4), dtype=torch.int32)
+    cache_seqlens = torch.tensor([64, 128], dtype=torch.int32)
+    cu_seqlens_q = torch.tensor([0, 1, 2], dtype=torch.int32)
+    return tokenspeed_kernel.rel_mha_decode_with_kvcache(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        max_seqlen_k=128,
+        rel_logits=rel_logits,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=1,
+        softmax_scale=1.0 / 64,
+    )
+
+
+def _attention_rel_decode_page128_sliding() -> object:
+    q = torch.empty((2, 16, 128), dtype=torch.bfloat16)
+    rel_logits = torch.empty((2, 16, 128), dtype=torch.bfloat16)
+    k_cache = torch.empty((4, 128, 8, 128), dtype=torch.bfloat16)
+    v_cache = torch.empty((4, 128, 8, 128), dtype=torch.bfloat16)
+    page_table = torch.empty((2, 2), dtype=torch.int32)
+    cache_seqlens = torch.tensor([128, 256], dtype=torch.int32)
+    cu_seqlens_q = torch.tensor([0, 1, 2], dtype=torch.int32)
+    return tokenspeed_kernel.rel_mha_decode_with_kvcache(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        max_seqlen_k=256,
+        rel_logits=rel_logits,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=1,
+        window_left=127,
+        softmax_scale=1.0 / 128,
+    )
+
+
+def _attention_rel_decode_page256_sliding() -> object:
+    q = torch.empty((2, 16, 128), dtype=torch.bfloat16)
+    rel_logits = torch.empty((2, 16, 512), dtype=torch.bfloat16)
+    k_cache = torch.empty((4, 256, 8, 128), dtype=torch.bfloat16)
+    v_cache = torch.empty((4, 256, 8, 128), dtype=torch.bfloat16)
+    page_table = torch.empty((2, 2), dtype=torch.int32)
+    cache_seqlens = torch.tensor([256, 512], dtype=torch.int32)
+    cu_seqlens_q = torch.tensor([0, 1, 2], dtype=torch.int32)
+    return tokenspeed_kernel.rel_mha_decode_with_kvcache(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        max_seqlen_k=512,
+        rel_logits=rel_logits,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=1,
+        window_left=255,
+        softmax_scale=1.0 / 128,
     )
 
 
@@ -924,6 +1061,92 @@ def _moe_apply_nvfp4_cutlass() -> object:
     return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
 
 
+def _moe_apply_nvfp4_trtllm_routed() -> object:
+    plan = tokenspeed_kernel.moe_plan(
+        "nvfp4",
+        input_dtype=torch.bfloat16,
+        activation="swiglu",
+        routing_mode="precomputed_topk",
+        ep_size=2,
+        ispp=128,
+        internal_activation_dtype="input",
+        solution="flashinfer_trtllm",
+    )
+    _assert_moe_plan(
+        plan,
+        apply="flashinfer_trtllm_nvfp4_routed_moe_apply",
+        preprocessor="flashinfer_trtllm_nvfp4_moe_weights",
+    )
+    assert plan["support_routing"] is False
+    x = torch.empty((4, 16), dtype=torch.bfloat16)
+    router_logits = torch.empty((4, 8), dtype=torch.float32)
+    topk_weights = torch.empty((4, 2), dtype=torch.float32)
+    topk_ids = torch.empty((4, 2), dtype=torch.int32)
+    return tokenspeed_kernel.moe_apply(
+        plan,
+        x,
+        torch.nn.Module(),
+        router_logits,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+    )
+
+
+def _moe_apply_nvfp4_trtllm_unconstrained_routing() -> object:
+    # No routing_mode requested: the kernel-routing registration must keep
+    # winning under solution "flashinfer_trtllm" (its callers pass only
+    # router_logits), so the routed variant sits at a lower priority.
+    plan = tokenspeed_kernel.moe_plan(
+        "nvfp4",
+        input_dtype=torch.bfloat16,
+        activation="swiglu",
+        ep_size=2,
+        ispp=128,
+        internal_activation_dtype="input",
+        solution="flashinfer_trtllm",
+    )
+    _assert_moe_plan(
+        plan,
+        apply="flashinfer_trtllm_nvfp4_moe_apply",
+        preprocessor="flashinfer_trtllm_nvfp4_moe_weights",
+    )
+    assert plan["support_routing"] is True
+    x = torch.empty((4, 16), dtype=torch.bfloat16)
+    router_logits = torch.empty((4, 8), dtype=torch.float32)
+    return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
+
+
+def _moe_apply_unquant_trtllm_routed() -> object:
+    plan = tokenspeed_kernel.moe_plan(
+        "unquant",
+        input_dtype=torch.bfloat16,
+        activation="swiglu",
+        routing_mode="precomputed_topk",
+        ep_size=2,
+        ispp=128,
+        internal_activation_dtype="input",
+        solution="flashinfer_trtllm",
+    )
+    _assert_moe_plan(
+        plan,
+        apply="flashinfer_trtllm_unquant_routed_moe_apply",
+        preprocessor="flashinfer_trtllm_unquant_moe_weights",
+    )
+    assert plan["support_routing"] is False
+    x = torch.empty((4, 16), dtype=torch.bfloat16)
+    router_logits = torch.empty((4, 8), dtype=torch.float32)
+    topk_weights = torch.empty((4, 2), dtype=torch.float32)
+    topk_ids = torch.empty((4, 2), dtype=torch.int32)
+    return tokenspeed_kernel.moe_apply(
+        plan,
+        x,
+        torch.nn.Module(),
+        router_logits,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+    )
+
+
 def _moe_apply_nvfp4_deepep_cutedsl() -> object:
     plan = tokenspeed_kernel.moe_plan(
         "nvfp4",
@@ -1286,6 +1509,54 @@ _CASES = [
         _is_cdna4,
         "cdna4",
         "attention",
+        "rel_mha_prefill",
+        "gluon_rel_mha_prefill_gfx950",
+        _attention_rel_prefill,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "rel_mha_extend_with_kvcache",
+        "gluon_rel_mha_extend_gfx950",
+        _attention_rel_extend,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "rel_mha_decode_with_kvcache",
+        "gluon_rel_mha_decode_gfx950",
+        _attention_rel_decode,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "rel_mha_decode_with_kvcache_page128_sliding",
+        "gluon_rel_mha_decode_gfx950",
+        _attention_rel_decode_page128_sliding,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "rel_mha_extend_with_kvcache_page256_sliding",
+        "gluon_rel_mha_extend_gfx950",
+        _attention_rel_extend_page256_sliding,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "rel_mha_decode_with_kvcache_page256_sliding",
+        "gluon_rel_mha_decode_gfx950",
+        _attention_rel_decode_page256_sliding,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
         "attn_merge_state",
         "triton_attn_merge_state",
         _attention_merge_state,
@@ -1345,8 +1616,8 @@ _CASES = [
         "cdna4",
         "gemm",
         "mm",
-        "gluon_mm_a16w16_gfx950",
-        _mm_dense_gluon_gfx950,
+        "torch_mm",
+        _mm_dense_cdna4_aligned,
     ),
     _case(
         _is_hopper,
@@ -1445,6 +1716,30 @@ _CASES = [
         "apply",
         "flashinfer_cutlass_nvfp4_moe_apply",
         _moe_apply_nvfp4_cutlass,
+    ),
+    _case(
+        _is_blackwell_sm100,
+        "blackwell-sm100",
+        "moe",
+        "apply",
+        "flashinfer_trtllm_nvfp4_routed_moe_apply",
+        _moe_apply_nvfp4_trtllm_routed,
+    ),
+    _case(
+        _is_blackwell_sm100,
+        "blackwell-sm100",
+        "moe",
+        "apply",
+        "flashinfer_trtllm_nvfp4_moe_apply",
+        _moe_apply_nvfp4_trtllm_unconstrained_routing,
+    ),
+    _case(
+        _is_blackwell_sm100,
+        "blackwell-sm100",
+        "moe",
+        "apply",
+        "flashinfer_trtllm_unquant_routed_moe_apply",
+        _moe_apply_unquant_trtllm_routed,
     ),
     _case(
         _is_blackwell_plus,

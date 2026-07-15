@@ -1,0 +1,177 @@
+{#- Inkling chat template — validated against the reference TMLv0 renderer snapshot.
+    Multipart content is an internal contract: gateway adapters normalize it
+    to text/image/audio before rendering. Media parts emit one structural
+    anchor each; the MM processor expands them to per-feature spans after
+    tokenization. The template alone emits audio_end, once per audio part.
+
+    TML completion prompts end at the last rendered input frame. The model
+    samples its own message_model header, so add_generation_prompt deliberately
+    emits no suffix. Historical model turns are instead terminated with the
+    content_model_end_sampling stop token.
+
+    Kept to the common subset of jinja2 (transformers) and minijinja (SMG): no
+    inline-if inside call kwargs, trailing commas, str methods, or format filter. -#}
+
+{%- macro render_message(message) -%}
+    {%- if message.role == "tool" -%}
+        {%- set ns = namespace(tname="") -%}
+        {%- if message.name -%}
+            {%- set ns.tname = message.name -%}
+        {%- endif -%}
+        <|message_tool|>{{ ns.tname }}<|content_text|>{{ message.content or "" }}<|end_message|>
+    {%- elif message.role == "system" or message.role == "user" or message.role == "assistant" -%}
+        {%- if message.role == "system" -%}
+            {%- set role_token = "<|message_system|>" -%}
+        {%- elif message.role == "user" -%}
+            {%- set role_token = "<|message_user|>" -%}
+        {%- else -%}
+            {%- set role_token = "<|message_model|>" -%}
+        {%- endif -%}
+        {%- set rendered = namespace(any=false) -%}
+        {%- if message.role == "assistant" and message.reasoning_content -%}
+            {{ role_token }}<|content_thinking|>{{ message.reasoning_content }}<|end_message|>
+            {%- set rendered.any = true -%}
+        {%- endif -%}
+        {%- if message.content is string -%}
+            {#- The OpenAI bridge may normalize null assistant content to an
+                empty string. Native TML omits that empty Text frame when the
+                turn already carries reasoning or tool calls. -#}
+            {%- if message.content or message.role != "assistant" or (not message.tool_calls and not message.reasoning_content) -%}
+                {{ role_token }}<|content_text|>{{ message.content }}<|end_message|>
+                {%- set rendered.any = true -%}
+            {%- endif -%}
+        {%- elif message.content is not defined or message.content is none -%}
+            {#- OpenAI null/missing content maps to Text(""). A model tool-call
+                or reasoning-only message already has content and gets no extra
+                empty text frame. -#}
+            {%- if message.role != "assistant" or (not message.tool_calls and not message.reasoning_content) -%}
+                {{ role_token }}<|content_text|><|end_message|>
+                {%- set rendered.any = true -%}
+            {%- endif -%}
+        {%- else -%}
+            {%- for part in message.content -%}
+                {%- if part.type is not defined or part.type is none -%}
+                    {{ raise_exception("Inkling content parts require a canonical type") }}
+                {%- elif part.type == "text" -%}
+                    {%- set ptext = part.text or "" -%}
+                    {{ role_token }}<|content_text|>{{ ptext }}<|end_message|>
+                {%- elif part.type == "image" -%}
+                    {{ role_token }}<|content_image|><|end_message|>
+                {%- elif part.type == "audio" -%}
+                    {{ role_token }}<|content_audio_input|><|audio_end|><|end_message|>
+                {%- else -%}
+                    {{ raise_exception("unsupported canonical Inkling content part type: " ~ part.type) }}
+                {%- endif -%}
+                {%- set rendered.any = true -%}
+            {%- endfor -%}
+        {%- endif -%}
+        {%- if message.role == "assistant" and message.tool_calls -%}
+            {%- for tc in message.tool_calls -%}
+                {%- set fn = tc.function or tc -%}
+                {%- if fn.arguments is string -%}
+                    {%- set args_json = fn.arguments or "{}" -%}
+                    {{ role_token }}{{ fn.name }}<|content_invoke_tool_json|>{"name":{{ fn.name | tojson(ensure_ascii=False) }},"args":{{ args_json }}}<|end_message|>
+                {%- else -%}
+                    {{ role_token }}{{ fn.name }}<|content_invoke_tool_json|>{"name":{{ fn.name | tojson(ensure_ascii=False) }},"args":{{ (fn.arguments or {}) | tojson(ensure_ascii=False, sort_keys=True, separators=[",", ":"]) }}}<|end_message|>
+                {%- endif -%}
+                {%- set rendered.any = true -%}
+            {%- endfor -%}
+        {%- endif -%}
+        {%- if message.role == "assistant" and rendered.any -%}
+            <|content_model_end_sampling|>
+        {%- endif -%}
+    {%- else -%}
+        {{ raise_exception("unsupported Inkling message role: " ~ message.role) }}
+    {%- endif -%}
+{%- endmacro -%}
+
+{#- render_for_completion_with_effort accepts an explicit value only. Omitted
+    or null effort uses render_for_completion and inserts no synthetic message.
+    Product policy intentionally caps valid effort at 0.99. -#}
+{%- set effort = namespace(enabled=false, value=none) -%}
+{%- if reasoning_effort is defined and reasoning_effort is not none -%}
+    {%- set effort.enabled = true -%}
+    {%- if reasoning_effort is string and (reasoning_effort == "none" or reasoning_effort == "minimal") -%}
+        {%- set effort.value = 0.0 -%}
+    {%- elif reasoning_effort is string and reasoning_effort == "low" -%}
+        {%- set effort.value = 0.2 -%}
+    {%- elif reasoning_effort is string and reasoning_effort == "medium" -%}
+        {%- set effort.value = 0.7 -%}
+    {%- elif reasoning_effort is string and reasoning_effort == "high" -%}
+        {%- set effort.value = 0.9 -%}
+    {%- elif reasoning_effort is string and (reasoning_effort == "xhigh" or reasoning_effort == "max") -%}
+        {%- set effort.value = 0.99 -%}
+    {%- elif reasoning_effort is boolean -%}
+        {{ raise_exception("Inkling reasoning_effort must be a number in [0, 0.99] or a supported named level") }}
+    {%- elif reasoning_effort is string -%}
+        {#- Minijinja's float filter raises on an invalid numeric string, while
+            Jinja2 returns 0. Reject non-canonical zero strings explicitly so
+            both runtimes enforce the same input contract without relying on
+            Jinja2's filter-only default argument. -#}
+        {%- set effort.value = reasoning_effort | float -%}
+        {%- if effort.value == 0 and reasoning_effort not in ["0", "0.0", "0.00", "+0", "+0.0", "-0", "-0.0"] -%}
+            {{ raise_exception("Inkling reasoning_effort must be a finite number in [0, 0.99]") }}
+        {%- endif -%}
+    {%- elif reasoning_effort is number -%}
+        {%- set effort.value = reasoning_effort | float -%}
+    {%- else -%}
+        {{ raise_exception("Inkling reasoning_effort must be a number in [0, 0.99] or a supported named level") }}
+    {%- endif -%}
+    {%- if effort.value is none or effort.value != effort.value or effort.value < 0 or effort.value > 0.99 -%}
+        {{ raise_exception("Inkling reasoning_effort must be a finite number in [0, 0.99]") }}
+    {%- endif -%}
+{%- endif -%}
+
+{#- Tool declarations lead the prompt prefix, followed by all caller-supplied
+    leading system messages. Native effort insertion comes after both, directly
+    before the first non-system message. -#}
+{%- if tools -%}
+    <|message_system|>tool_declare<|content_xml|>[
+    {%- for tool in tools -%}
+        {%- set fn = tool.function or tool -%}
+        {{ {"description": fn.description or "", "name": fn.name, "parameters": fn.parameters or {}, "type": tool.type or "function"} | tojson(ensure_ascii=False, sort_keys=True, separators=[",", ":"]) }}{%- if not loop.last -%},{%- endif -%}
+    {%- endfor -%}]<|end_message|>
+{%- endif -%}
+{%- set leading = namespace(open=true) -%}
+{%- for message in messages -%}
+    {%- if leading.open -%}
+        {%- if message.role == "system" -%}
+            {{ render_message(message) }}
+        {%- else -%}
+            {%- set leading.open = false -%}
+        {%- endif -%}
+    {%- endif -%}
+{%- endfor -%}
+{%- if effort.enabled -%}
+    {#- Native TML first quantizes the float to integer millieffort, then
+        displays it to two decimal places. Both stages use ties-to-even. Spell
+        them out because Jinja2 and Minijinja disagree on the round filter. -#}
+    {%- set scaled_millieffort = effort.value * 1000 -%}
+    {%- set rounded_milli = namespace(value=scaled_millieffort | int) -%}
+    {%- set milli_remainder = scaled_millieffort - rounded_milli.value -%}
+    {%- if milli_remainder > 0.5 or (milli_remainder == 0.5 and rounded_milli.value % 2 == 1) -%}
+        {%- set rounded_milli.value = rounded_milli.value + 1 -%}
+    {%- endif -%}
+    {#- Preserve the native f64 operation order here: (milli / 1000) * 100.
+        It is observably different from the algebraic milli / 10 at a couple
+        of binary floating-point boundaries (for example 0.545 and 0.575). -#}
+    {%- set scaled_cents = (rounded_milli.value / 1000) * 100 -%}
+    {%- set rounded_cents = namespace(value=scaled_cents | int) -%}
+    {%- set cent_remainder = scaled_cents - rounded_cents.value -%}
+    {%- if cent_remainder > 0.5 or (cent_remainder == 0.5 and rounded_cents.value % 2 == 1) -%}
+        {%- set rounded_cents.value = rounded_cents.value + 1 -%}
+    {%- endif -%}
+    {%- set cents = rounded_cents.value -%}
+    {%- set frac = cents % 100 -%}
+    <|message_system|><|content_text|>Thinking effort level: {% if frac == 0 %}{{ cents // 100 }}{% elif frac % 10 == 0 %}{{ cents // 100 }}.{{ frac // 10 }}{% elif frac < 10 %}{{ cents // 100 }}.0{{ frac }}{% else %}{{ cents // 100 }}.{{ frac }}{% endif %}<|end_message|>
+{%- endif -%}
+{%- set remaining = namespace(leading=true) -%}
+{%- for message in messages -%}
+    {%- if remaining.leading and message.role == "system" -%}
+        {#- already rendered above -#}
+    {%- else -%}
+        {%- set remaining.leading = false -%}
+        {{ render_message(message) }}
+    {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}{#- TML samples its own message_model header. -#}{%- endif -%}
