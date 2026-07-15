@@ -30,6 +30,7 @@ import subprocess
 import sys
 import time
 
+import psutil
 import pytest
 
 pytest.importorskip("smg")
@@ -106,6 +107,10 @@ def test_orchestrator_runs_against_fake_engine():
                 f"stderr:\n{stderr.decode()}"
             )
 
+        descendants = [
+            (child.pid, child.create_time())
+            for child in psutil.Process(proc.pid).children(recursive=True)
+        ]
         proc.send_signal(signal.SIGTERM)
         try:
             rc = proc.wait(timeout=30)
@@ -117,6 +122,20 @@ def test_orchestrator_runs_against_fake_engine():
                 f"stderr:\n{stderr.decode()}"
             )
         assert rc == 0, f"non-zero rc={rc}"
+        stdout, stderr = proc.communicate(timeout=5)
+        logs = stdout.decode() + stderr.decode()
+        assert "CancelledError" not in logs
+        assert "Task was destroyed" not in logs
+
+        leaked = []
+        for pid, create_time in descendants:
+            try:
+                child = psutil.Process(pid)
+                if child.create_time() == create_time:
+                    leaked.append((pid, child.status()))
+            except psutil.NoSuchProcess:
+                pass
+        assert not leaked, f"orchestrator descendants survived shutdown: {leaked}"
     finally:
         if proc.returncode is None:
             proc.kill()

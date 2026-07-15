@@ -23,6 +23,8 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
+import sys
 from unittest.mock import MagicMock
 
 import pytest
@@ -98,3 +100,50 @@ async def test_terminate_then_kill_noop_on_already_dead():
     await terminate_then_kill(proc, drain_timeout=0.5)
     proc.terminate.assert_not_called()
     proc.kill.assert_not_called()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux process reaping contract")
+def test_kill_process_tree_reaps_owned_nested_children():
+    """Killed children and grandchildren must not escape to a non-reaping PID 1."""
+    script = """
+import subprocess
+import sys
+import time
+
+import psutil
+
+from tokenspeed.runtime.utils.process import kill_process_tree
+
+parent = subprocess.Popen([
+    sys.executable,
+    "-c",
+    "import subprocess, sys, time; "
+    "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+    "time.sleep(60)",
+])
+deadline = time.monotonic() + 5
+descendants = []
+while time.monotonic() < deadline:
+    descendants = psutil.Process().children(recursive=True)
+    if len(descendants) == 2:
+        break
+    time.sleep(0.01)
+if len(descendants) != 2:
+    raise SystemExit(f"nested process did not start: {descendants}")
+owned_pids = {process.pid for process in descendants}
+kill_process_tree(None, include_parent=False, wait_timeout=5.0)
+remaining = psutil.Process().children(recursive=True)
+if remaining:
+    raise SystemExit(f"unreaped children: {[(p.pid, p.status()) for p in remaining]}")
+escaped = [pid for pid in owned_pids if psutil.pid_exists(pid)]
+if escaped:
+    raise SystemExit(f"descendants escaped reaping: {escaped}")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

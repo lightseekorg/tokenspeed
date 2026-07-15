@@ -26,11 +26,71 @@ import logging
 import os
 import signal
 import sys
-import threading
+import time
+from ctypes import CDLL, get_errno
 
 import psutil
 
 logger = logging.getLogger(__name__)
+
+_PR_SET_CHILD_SUBREAPER = 36
+
+
+def _enable_child_subreaper() -> bool:
+    """Ask Linux to adopt orphaned descendants so this process can reap them."""
+
+    if sys.platform != "linux":
+        return False
+    libc = CDLL(None, use_errno=True)
+    if libc.prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) == 0:
+        return True
+    logger.warning("Could not enable child subreaper: errno=%s", get_errno())
+    return False
+
+
+def _descendant_depths(
+    descendants: list[psutil.Process], root_pid: int
+) -> dict[int, int]:
+    parent_by_pid = {}
+    for process in descendants:
+        try:
+            parent_by_pid[process.pid] = process.ppid()
+        except psutil.NoSuchProcess:
+            continue
+
+    depths = {}
+    for pid in parent_by_pid:
+        depth = 0
+        current = pid
+        seen = set()
+        while current != root_pid and current in parent_by_pid and current not in seen:
+            seen.add(current)
+            current = parent_by_pid[current]
+            depth += 1
+        depths[pid] = depth
+    return depths
+
+
+def _wait_and_reap_owned(processes: list[psutil.Process], timeout: float) -> list[int]:
+    """Wait for captured PIDs and reap each one if it becomes our child."""
+
+    pending = {process.pid for process in processes}
+    deadline = time.monotonic() + timeout
+    while pending and time.monotonic() < deadline:
+        for pid in tuple(pending):
+            try:
+                waited_pid, _ = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                if not psutil.pid_exists(pid):
+                    pending.discard(pid)
+            else:
+                if waited_pid == pid:
+                    pending.discard(pid)
+            if pid in pending and not psutil.pid_exists(pid):
+                pending.discard(pid)
+        if pending:
+            time.sleep(0.01)
+    return sorted(pending)
 
 
 def register_usr_signal():
@@ -43,11 +103,27 @@ def register_usr_signal():
     signal.signal(signal.SIGUSR1, signal_handler)
 
 
-def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
-    """Kill the target process and all of its child processes."""
-    if threading.current_thread() is threading.main_thread():
-        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+def kill_process_tree(
+    parent_pid: int | None,
+    include_parent: bool = True,
+    skip_pid: int | None = None,
+    wait_timeout: float = 5.0,
+) -> None:
+    """Kill a process tree and reap children before returning.
 
+    Descendants are killed deepest-first. On Linux, the caller becomes a child
+    subreaper before termination, so orphaned scheduler grandchildren are
+    adopted and can be waited by exact PID instead of escaping to container
+    PID 1. TokenSpeed owns these scheduler and ``resource_tracker`` processes;
+    leaving them to a minimal non-reaping PID 1 is unsafe.
+
+    Args:
+        parent_pid: Root of the tree. ``None`` means the current process while
+            implicitly excluding that process itself.
+        include_parent: Whether to kill the root after its descendants.
+        skip_pid: Optional descendant PID to leave untouched.
+        wait_timeout: Total number of seconds to wait for killed descendants.
+    """
     if parent_pid is None:
         parent_pid = os.getpid()
         include_parent = False
@@ -57,14 +133,25 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
     except psutil.NoSuchProcess:
         return
 
-    children = itself.children(recursive=True)
+    _enable_child_subreaper()
+    children = [
+        child for child in itself.children(recursive=True) if child.pid != skip_pid
+    ]
+    depths = _descendant_depths(children, parent_pid)
+    children.sort(key=lambda child: depths.get(child.pid, 0), reverse=True)
     for child in children:
-        if child.pid == skip_pid:
-            continue
         try:
             child.kill()
         except psutil.NoSuchProcess:
             pass
+
+    if children:
+        pending = _wait_and_reap_owned(children, wait_timeout)
+        if pending:
+            logger.warning(
+                "Timed out waiting for descendant PIDs to exit: %s",
+                pending,
+            )
 
     if include_parent:
         try:
@@ -73,6 +160,8 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
                 sys.exit(0)
 
             itself.kill()
-            itself.send_signal(signal.SIGQUIT)
+            pending = _wait_and_reap_owned([itself], wait_timeout)
+            if pending:
+                logger.warning("Timed out waiting for root PID to exit: %s", pending)
         except psutil.NoSuchProcess:
             pass

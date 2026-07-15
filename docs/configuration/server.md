@@ -161,6 +161,54 @@ When `--dp-sampling` is enabled, the logits processor owns the per-forward
 logits layout decision and carries the resulting plan to the sampling backend
 with the logits output.
 
+## PD and EPD Transport
+
+PD/EPD transport tuning is part of the server argument snapshot. None of these
+settings has an environment-variable alias.
+
+| Parameter | Purpose |
+| --- | --- |
+| `--disaggregation-queue-size` | Number of room-affine transfer queues. Defaults to `4`. |
+| `--disaggregation-thread-pool-size` | Total transfer worker threads. When omitted, TokenSpeed derives a bounded value from the available CPUs. |
+| `--disaggregation-bootstrap-timeout` | Bootstrap registration timeout in seconds. Defaults to `120`. |
+| `--disaggregation-waiting-timeout` | Completed-transfer wait timeout in seconds. Defaults to `300`. |
+| `--disaggregation-failed-session-ttl` | Failed-session quarantine in seconds. Defaults to `30`; `0` disables quarantine. |
+| `--disaggregation-heartbeat-interval` | Decode-side prefill heartbeat interval in seconds. Defaults to `5`. |
+| `--disaggregation-heartbeat-max-failures` | Consecutive heartbeat failures before affected requests fail. Defaults to `2`. |
+| `--pd-layerwise-debug` / `--no-pd-layerwise-debug` | Enable additional layerwise transfer consistency checks. Disabled by default. |
+| `--pd-prefill-metadata-wait-log-interval` | Debug-log interval while waiting for prefill metadata. Defaults to `5` seconds. |
+| `--epd-encode-ring-slots` | Pre-registered encode bounce-buffer slots. Defaults to `64`. |
+| `--epd-encode-ring-slot-mb` | Capacity of each encode bounce-buffer slot in MiB. Defaults to `256`. |
+| `--epd-encode-embedding-cache-mb` | Per-encode-process VRAM embedding-cache budget in MiB. Defaults to `4096`. |
+| `--epd-encode-embedding-cache-dram-mb` | Per-encode-process host embedding-cache budget in MiB. Defaults to `0` (disabled). |
+| `--epd-recv-pool-slots` | Lifetime-registered prefill receive slots. Defaults to `16`; `0` selects per-request buffers. |
+| `--epd-recv-pool-slot-mb` | Capacity of each prefill receive slot in MiB. Defaults to `256`; `0` also disables the pool. |
+| `--epd-embedding-shard` / `--no-epd-embedding-shard` | Shard image-embedding rows across prefill attention-TP ranks. Enabled by default. |
+
+The encode ring and receive pool reserve their configured capacities per
+process. Size them for the largest post-merge image embedding and multiply the
+memory budget by the number of co-located TP ranks. At the defaults, each
+encode rank reserves a 16 GiB main ring and a 4 GiB L1 embedding cache; each
+prefill rank reserves a 4 GiB receive pool. A model with a deepstack embedding
+path may allocate a second encode ring.
+
+## SMG Process Integration
+
+SMG launch behavior is also explicit server configuration: use
+`--grpc-max-message-bytes`, `--skip-grpc-warmup`,
+`--health-check-timeout`, `--log-mm-tensor-data`, `--enable-log-mm-timing`,
+`--unlink-mm-shm-after-read`, `--epd-pixel-shm`, and
+`--epd-ingest-offloop` (including each Boolean option's `--no-...` form).
+These settings are propagated to the SMG TokenSpeed gRPC adapter without
+feature environment variables.
+
+Shared multimodal RDMA is configured with `--mm-pixel-rdma`,
+`--mm-rdma-slot-bytes`, `--mm-rdma-landing-slots`,
+`--mm-rdma-landing-wait-seconds`, and
+`--mm-rdma-read-timeout-seconds`. Metadata sending is tri-state:
+omit `--mm-rdma-send-metadata` for automatic behavior, or use its positive or
+`--no-mm-rdma-send-metadata` form to force the choice.
+
 ## Reasoning And Tool Calling
 
 | Parameter | Purpose |
@@ -281,5 +329,6 @@ features directly:
 - `--kv-events-config`
 - `--mla-chunk-multiplier`
 - `--disaggregation-*`
+- `--epd-*`
 - `--comm-fusion-max-num-tokens`
 - `--enable-allreduce-fusion`

@@ -30,7 +30,10 @@ import logging
 import os
 import signal
 import sys
+import threading
+from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from tokenspeed_kernel.platform import current_platform
 
@@ -46,6 +49,9 @@ from tokenspeed.cli._proc import (
 )
 from tokenspeed.runtime.utils.network import get_free_port
 from tokenspeed.runtime.utils.process import kill_process_tree
+
+if TYPE_CHECKING:
+    import uvicorn
 
 logger = logging.getLogger(__name__)
 
@@ -414,6 +420,42 @@ def _add_rl_control_port(engine_args: list[str]) -> tuple[list[str], str]:
     return [*engine_args, "--rl-control-port", str(port)], (f"http://127.0.0.1:{port}")
 
 
+@dataclass(frozen=True)
+class _ControlServerHandle:
+    server: uvicorn.Server
+    thread: threading.Thread
+
+
+def _run_control_server(server: uvicorn.Server) -> None:
+    """Run Uvicorn without leaking its bind-failure ``SystemExit`` from a thread."""
+    try:
+        server.run()
+    except SystemExit:
+        # Uvicorn logs the concrete bind/startup error before raising.  A
+        # SystemExit escaping a worker thread only adds an unhandled-thread
+        # traceback and does not communicate the failure to the orchestrator;
+        # _start_control_server observes the stopped thread instead.
+        pass
+
+
+async def _stop_control_server(
+    handle: _ControlServerHandle | None, *, timeout: float = 10.0
+) -> None:
+    """Request a clean Uvicorn shutdown and join its owner thread."""
+    if handle is None:
+        return
+    handle.server.should_exit = True
+    await asyncio.to_thread(handle.thread.join, timeout)
+    if handle.thread.is_alive():
+        logger.warning(
+            "control server did not stop within %.1fs; forcing exit", timeout
+        )
+        handle.server.force_exit = True
+        await asyncio.to_thread(handle.thread.join, 1.0)
+    if handle.thread.is_alive():
+        logger.error("control server thread is still alive after forced shutdown")
+
+
 async def _start_control_server(
     *,
     gateway_url: str,
@@ -422,16 +464,15 @@ async def _start_control_server(
     host: str,
     port: int,
     timeout: float = 30.0,
-) -> bool:
+) -> _ControlServerHandle | None:
     """Start the control HTTP server in a daemon thread and wait for it to bind.
 
     Runs uvicorn alongside smg without blocking the orchestrator event loop.
-    Returns True once the server is accepting connections, or False if it
+    Returns a lifecycle handle once the server is accepting connections, or
+    ``None`` if it
     failed to bind (e.g. the port is already in use) or did not come up within
     ``timeout`` seconds. Non-fatal: the smg gateway runs independently.
     """
-    import threading
-
     from tokenspeed.runtime.entrypoints.control_server import build_control_server
 
     server = build_control_server(
@@ -441,7 +482,13 @@ async def _start_control_server(
         host=host,
         port=port,
     )
-    thread = threading.Thread(target=server.run, daemon=True, name="ts-http-server")
+    thread = threading.Thread(
+        target=_run_control_server,
+        args=(server,),
+        daemon=True,
+        name="ts-http-server",
+    )
+    handle = _ControlServerHandle(server=server, thread=thread)
     thread.start()
 
     # uvicorn sets `started = True` only after the socket is bound and serving.
@@ -450,12 +497,13 @@ async def _start_control_server(
     deadline = start + timeout
     while not server.started:
         if not thread.is_alive():
-            return False  # uvicorn raised during startup (e.g. AddrInUse)
+            return None  # uvicorn raised during startup (e.g. AddrInUse)
         if loop.time() >= deadline:
-            return False
+            await _stop_control_server(handle)
+            return None
         await asyncio.sleep(0.05)
     logger.info("control server bound in %.2fs", loop.time() - start)
-    return True
+    return handle
 
 
 async def _stream_to(proc, tag: str) -> None:
@@ -470,6 +518,7 @@ async def _drain_log(task: asyncio.Task, timeout: float = 2.0) -> None:
         await asyncio.wait_for(task, timeout=timeout)
     except (asyncio.TimeoutError, asyncio.CancelledError):
         task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 class _ShutdownDuringStartup(Exception):
@@ -500,6 +549,8 @@ async def _probe_or_stop(
     done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
     for t in pending:
         t.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
     if proc_task is not None and proc_task in done:
         rc = proc_task.result()
         raise _ChildExitedDuringStartup(
@@ -525,6 +576,7 @@ async def run_smg(
     gateway = None
     engine_log: asyncio.Task | None = None
     gateway_log: asyncio.Task | None = None
+    control: _ControlServerHandle | None = None
 
     # Install signal handlers before spawning any subprocess so a Ctrl-C
     # during the readiness probe doesn't skip terminate_then_kill.
@@ -577,14 +629,14 @@ async def run_smg(
         control_port = (
             opts.control_port if opts.control_port is not None else user_port + 1
         )
-        control_ok = await _start_control_server(
+        control = await _start_control_server(
             gateway_url=f"http://{user_host}:{user_port}",
             engine_grpc_addr=f"127.0.0.1:{engine_port}",
             rl_control_url=rl_control_url,
             host=user_host,
             port=control_port,
         )
-        if control_ok:
+        if control is not None:
             sys.stdout.write(
                 f"ts control server ready on http://{user_host}:{control_port}\n"
             )
@@ -607,6 +659,8 @@ async def run_smg(
 
         for task in pending:
             task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
         rc_engine = engine.returncode if engine.returncode is not None else 0
         rc_gateway = gateway.returncode if gateway.returncode is not None else 0
@@ -629,7 +683,10 @@ async def run_smg(
         logger.info("interrupted; exiting cleanly")
         return 0
     finally:
-        # Shutdown order: gateway first, then engine.
+        # Stop the in-process sidecar before the subprocesses it proxies.
+        await _stop_control_server(control)
+
+        # Shutdown order for subprocesses: gateway first, then engine.
         if gateway is not None:
             await terminate_then_kill(gateway, drain_timeout=opts.drain_timeout)
         if engine is not None:

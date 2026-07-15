@@ -34,7 +34,6 @@ from tokenspeed.runtime.pd.base.status import TransferPoll
 from tokenspeed.runtime.pd.epd.embedding_transfer import (
     MooncakeEmbeddingSender,
 )
-from tokenspeed.runtime.utils.env import envs
 
 logger = logging.getLogger(__name__)
 
@@ -113,16 +112,16 @@ class DisaggEncodeExecutor:
         # others. Collapse every send through a fixed ring of pre-registered bounce
         # buffers: each slot is registered once at a fixed size (never grows, never
         # overlaps), and ``item.encoded`` is copied into a slot before its async
-        # send. ``ring_slots`` / ``ring_bytes`` are injectable for tests and
-        # env-tunable; total reservation is slots * slot_bytes PER ring (main, plus
-        # deepstack if present), so depth and per-slot bytes must be sized to the
-        # model and peak concurrency.
-        self._ring_slots = int(
-            envs.TOKENSPEED_EPD_ENCODE_RING_SLOTS.get_set_value_or(ring_slots)
-        )
-        slot_mb = envs.TOKENSPEED_EPD_ENCODE_RING_SLOT_MB.get()
-        # Env override is in whole MiB; unset -> keep the exact ``ring_bytes`` arg.
-        self._ring_bytes = slot_mb * 1024 * 1024 if slot_mb else ring_bytes
+        # send. ``ring_slots`` / ``ring_bytes`` come from explicit runtime config
+        # and remain injectable for tests. Total reservation is slots * slot_bytes
+        # PER ring (main, plus deepstack if present), so depth and per-slot bytes
+        # must be sized to the model and peak concurrency.
+        self._ring_slots = int(ring_slots)
+        self._ring_bytes = int(ring_bytes)
+        if self._ring_slots <= 0:
+            raise ValueError(f"ring_slots must be > 0, got {self._ring_slots}")
+        if self._ring_bytes <= 0:
+            raise ValueError(f"ring_bytes must be > 0, got {self._ring_bytes}")
         self._main_ring = None  # lazily allocated on first send (device live by then)
         self._deep_ring = None
         self._ring_idx = 0
@@ -186,8 +185,8 @@ class DisaggEncodeExecutor:
         if nbytes > self._ring_bytes:
             raise RuntimeError(
                 f"EPD encode embedding {nbytes} B exceeds ring slot "
-                f"{self._ring_bytes} B; raise TOKENSPEED_EPD_ENCODE_RING_SLOT_MB "
-                "or the ring_bytes constructor argument"
+                f"{self._ring_bytes} B; raise --epd-encode-ring-slot-mb or the "
+                "ring_bytes constructor argument"
             )
         buf = ring[slot]
         buf[:nbytes].view(src.dtype).copy_(src.reshape(-1))

@@ -26,14 +26,14 @@
 
 from __future__ import annotations
 
-import os
-
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import current_platform
 
-_PER_LAYER_GRID_CAP = int(os.environ.get("TOKENSPEED_KV_GRID_CAP", "64"))
-_ALL_LAYER_GRID_CAP = int(os.environ.get("TOKENSPEED_KV_ALL_LAYER_GRID_CAP", "32"))
+# Stable launch caps. Kernel launch geometry is implementation state, not a
+# process-environment configuration surface.
+_PER_LAYER_GRID_CAP = 64
+_ALL_LAYER_GRID_CAP = 32
 
 _is_nvidia = current_platform().is_nvidia
 

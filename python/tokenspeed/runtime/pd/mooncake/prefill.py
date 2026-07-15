@@ -19,7 +19,6 @@
 # SOFTWARE.
 
 import concurrent.futures
-import os
 import socket
 import threading
 import time
@@ -53,7 +52,6 @@ from tokenspeed.runtime.pd.utils import (
 from tokenspeed.runtime.utils import (
     get_colorful_logger,
 )
-from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.network import (
     get_free_port,
     get_ip,
@@ -77,9 +75,8 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         self._register_to_bootstrap()
         self.session_failures = defaultdict(int)
         self.failed_sessions: dict[str, float] = {}
-        self.failed_session_ttl = max(
-            envs.TOKENSPEED_DISAGGREGATION_FAILED_SESSION_TTL.get(), 0
-        )
+        runtime_config = args.runtime_config
+        self.failed_session_ttl = runtime_config.failed_session_ttl_s
         self.session_lock = threading.Lock()
         self.kv_layer_ids = list(
             getattr(self.kv_args, "kv_layer_ids", None)
@@ -95,7 +92,10 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             for i, layer_id in enumerate(self.kv_layer_ids[: len(self.kv_args.offsets)])
         }
         self.layerwise_interval = 1
-        self.layerwise_debug = envs.TOKENSPEED_PD_LAYERWISE_DEBUG.get()
+        self.layerwise_debug = runtime_config.layerwise_debug
+        self.prefill_metadata_wait_log_interval = (
+            runtime_config.prefill_metadata_wait_log_interval_s
+        )
         self.step_counter = None
         # room -> (bootstrap_token, spec_candidate_ids). Published after the prefill
         # forward; the transfer thread reads it on the wait_for_bootstrap_token path.
@@ -103,21 +103,10 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         self.expired_prefill_metadata_rooms: set[int] = set()
         self.bootstrap_token_cond = threading.Condition()
         # Determine the number of threads to use for kv sender
-        cpu_count = os.cpu_count()
-        transfer_thread_pool_size = (
-            envs.TOKENSPEED_DISAGGREGATION_THREAD_POOL_SIZE.get_set_value_or(
-                min(max(4, int(0.75 * cpu_count) // 8), 12)
-            )
-        )
-        transfer_queue_size = envs.TOKENSPEED_DISAGGREGATION_QUEUE_SIZE.get()
-        if transfer_thread_pool_size < transfer_queue_size:
-            raise ValueError(
-                "TOKENSPEED_DISAGGREGATION_THREAD_POOL_SIZE="
-                f"{transfer_thread_pool_size} must be greater than or equal to "
-                f"TOKENSPEED_DISAGGREGATION_QUEUE_SIZE={transfer_queue_size}."
-            )
+        transfer_thread_pool_size = runtime_config.resolved_thread_pool_size()
+        transfer_queue_size = runtime_config.queue_size
         self.start_transfer_thread(transfer_thread_pool_size, transfer_queue_size)
-        self.bootstrap_time_out = envs.TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
+        self.bootstrap_time_out = runtime_config.bootstrap_timeout_s
 
     def register_layerwise_step_counter(
         self, step_counter: StepCounter, interval: int
@@ -169,7 +158,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
     ) -> tuple[int, list[int] | None]:
         if room is None or fallback_token != -1:
             return fallback_token, fallback_candidate_ids
-        wait_log_interval = max(envs.TOKENSPEED_PD_PREFILL_METADATA_TIMEOUT.get(), 0.01)
+        wait_log_interval = self.prefill_metadata_wait_log_interval
         start_time = time.monotonic()
         next_log_time = start_time + wait_log_interval
         with self.bootstrap_token_cond:

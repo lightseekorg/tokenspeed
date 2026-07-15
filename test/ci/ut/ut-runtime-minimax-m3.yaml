@@ -27,8 +27,14 @@ ut:
       test/runtime/test_generation_output_processor.py::test_prefill_first_token_checks_spec_candidate_bootstrap
       test/runtime/test_kv_cache_scales_loader.py
       test/runtime/layers/test_moe_topk.py
+      test/runtime/test_async_llm_cancel.py
+      test/runtime/test_control_server.py
+      test/cli/test_proc.py
+      test/cli/test_serve_smg_unit.py
+      test/cli/test_serve_smg_integration.py
       test/quality_benchmark/tokenspeed/test_minimax_m3_fixed_reference.py
       test/random_benchmark/tokenspeed/test_collect_outputs.py
+      test/ci_system/test_fetch_minimax_m3_mm_fixtures.py
       test/ci_system/test_runtime_env_preflight.py
       test/ci_system/test_minimax_m3_gsm8k.py
       test/ci_system/test_minimax_m3_exact_longctx.py

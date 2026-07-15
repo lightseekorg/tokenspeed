@@ -21,24 +21,24 @@ The durable evidence root is:
 - FP8 cache: E4M3 main K/V and index cache, static main-cache K/V scales
 - Vision: images supported; video explicitly unsupported
 - EvalScope: 1.8.0
-- Local source integration: `FlamingoPg/smg@b7402c47759067e2f2a8840eaf7e81e239ca79b5`
+- Release-hardening source dependency:
+  `FlamingoPg/smg@6e0cb7acd62a8b8abe4d426a1289ff659e9a7844`
 
 Runtime feature choices are CLI arguments. The release commands do not use
 feature environment variables, visible-device masks, TF32 override variables,
-or a FlashInfer workspace override. The runtime preflight also rejects
-every inherited `TOKENSPEED_*` variable (including future or legacy EPD and
-kernel variables) and a persistent
+or a FlashInfer workspace override. The runtime preflight also rejects every
+inherited `TOKENSPEED_*`, `SMG_*`, `EPD_*`, or `TS_*` variable (including
+future or legacy transport and kernel variables) and a persistent
 `~/.config/tokenspeed-kernel/overrides.yaml`.
 
 CUDA, NCCL, Torch, and TensorRT-LLM may create vendor plumbing inside worker
 processes after launch. That internal plumbing is audited separately and is
 not a supported product configuration interface.
 
-The repository still contains legacy environment reads in the independent EPD
-encode-to-prefill implementation. They are not used by this aggregated TP4
-MiniMax-M3 image path and are rejected by the release preflight; removing those
-legacy EPD interfaces is tracked separately rather than treating them as a
-MiniMax-M3 configuration surface.
+PD/EPD queueing, timeout, encode-ring/cache, receive-pool, and embedding-shard
+settings are explicit `ServerArgs`/CLI state. Their former `TOKENSPEED_*`
+configuration aliases have been removed. KV transfer kernel launch caps are
+stable implementation constants rather than environment overrides.
 
 ## Acceptance matrix
 
@@ -55,9 +55,9 @@ MiniMax-M3 configuration surface.
 | Unsupported video | Explicit structured client error, never silently treated as an image | PASS; HTTP 400 `invalid_multimodal_request` |
 | Feature environment audit | No inherited product feature/configuration variables or persistent kernel override file | PASS |
 | CI definitions | Tasks parse/dry-run locally; strict timeouts, artifacts, result validation, and server-log gates are present | Local/static validation only; hosted B200 execution pending |
-| Source SMG integration | Clean pinned SMG source builds and serves MiniMax-M3 images | PASS |
+| Source SMG integration | Fixed source serves MiniMax-M3 images and shuts down cleanly | Historical runtime PASS at `b7402c4`; final `6e0cb7a` hardening smoke pending |
 | Published SMG package | A clean published dependency contains the MiniMax-M3 processor | **BLOCKED**; latest inspected package does not contain it |
-| Clean shutdown | Server exits without lifecycle traceback or unreaped children | **BLOCKED**; Starlette/Uvicorn emits `CancelledError` and PID 1 retains zombies |
+| Clean shutdown | Server exits without lifecycle traceback or unreaped children | Lifecycle fix is implemented and CPU-tested; final fixed-SHA TP4 proof pending |
 
 Video is not required for basic image support. Its acceptance contract is a
 clear rejection.
@@ -176,8 +176,10 @@ requests, proving that inference did not trigger a recapture.
 
 Peak memory was `112382 / 112446 / 112126 / 112446` MiB. Focused CUDA tests
 for independent two-image parity and dynamic 3D RoPE graph replay passed 2/2.
-The active smoke harness is intentionally not a runnable CI task until the
-published SMG package contains the MiniMax-M3 processor.
+The active smoke is a runnable manual B200 CI task. It deliberately installs
+the published dependency set, so it remains a release gate until the official
+SMG package contains the MiniMax-M3 processor and lifecycle/configuration
+delta.
 
 ## CI tasks
 
@@ -188,6 +190,7 @@ The repository defines these reproducible entry points:
 - `test/ci/perf/minimax-m3-bf16-evalscope-random.yaml`
 - `test/ci/perf/minimax-m3-mxfp8-evalscope-random.yaml`
 - `test/ci/perf/minimax-m3-mxfp8-exact-longctx.yaml`
+- `test/ci/perf/minimax-m3-mxfp8-active-mm.yaml`
 
 The random collector rejects missing, duplicate, extra, failed, non-finite, or
 non-positive cells and requires the exact 188-request matrix. GSM8K and exact
@@ -240,10 +243,11 @@ Do not announce published basic support until all of these are closed:
 1. Publish a `tokenspeed-smg` package containing the pinned MiniMax-M3 image
    processor and pass a clean-environment image smoke without `.pth` or source
    checkout shadowing.
-2. Execute the five task specs on hosted B200 runners and retain their complete
+2. Execute the six task specs on hosted B200 runners and retain their complete
    `.ci-artifacts/` output.
-3. Fix the shutdown lifecycle so a normal stop emits no cancellation traceback
-   and leaves no unreaped children.
+3. Validate the implemented shutdown lifecycle at the final fixed SHA: no
+   cancellation traceback, live descendant, new zombie, bound port, or retained
+   GPU allocation.
 4. Rebuild the final release environment so `pip check` passes the repository's
    pinned `tokenspeed-smg` dependency.
 

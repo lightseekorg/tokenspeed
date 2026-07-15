@@ -29,7 +29,6 @@ import threading
 import pytest
 import torch
 
-import tokenspeed.runtime.pd.epd.encode_loop as encode_loop
 from tokenspeed.runtime.cache.embedding_cache import (
     EmbeddingCache,
     TieredEmbeddingCache,
@@ -482,18 +481,16 @@ def test_scheduler_rejects_bad_budgets():
 # --------------------------------------------------------------------------- #
 # _embedding_cache_bytes
 # --------------------------------------------------------------------------- #
-def test_bytes_override(monkeypatch):
-    env_field = encode_loop.envs.TOKENSPEED_EPD_ENCODE_EMBED_CACHE_MB
-    monkeypatch.setenv(env_field.name, "8")
-    assert _embedding_cache_bytes(env_field) == 8 * 1024 * 1024
+def test_cache_mebibytes_convert_to_bytes():
+    assert _embedding_cache_bytes(8, "--epd-encode-embedding-cache-mb") == (
+        8 * 1024 * 1024
+    )
 
 
-def test_bytes_negative_raises_with_env_name(monkeypatch):
-    env_field = encode_loop.envs.TOKENSPEED_EPD_ENCODE_EMBED_CACHE_MB
-    monkeypatch.setenv(env_field.name, "-5")
+def test_negative_cache_mebibytes_raise_with_option_name():
     with pytest.raises(ValueError) as exc:
-        _embedding_cache_bytes(env_field)
-    assert env_field.name in str(exc.value)
+        _embedding_cache_bytes(-5, "--epd-encode-embedding-cache-mb")
+    assert "--epd-encode-embedding-cache-mb" in str(exc.value)
 
 
 # --------------------------------------------------------------------------- #

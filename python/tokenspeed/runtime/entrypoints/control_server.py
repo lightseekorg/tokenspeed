@@ -35,6 +35,8 @@ Architecture::
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 import aiohttp
 import grpc
@@ -50,8 +52,6 @@ from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
 
-app = FastAPI()
-
 # Set by start() before uvicorn.run().
 _gateway_url: str = ""
 _engine_grpc_addr: str = ""
@@ -61,6 +61,29 @@ _engine_grpc_addr: str = ""
 _rl_control_url: str = ""
 _grpc_channel: grpc.aio.Channel | None = None
 _grpc_stub: pb_grpc.TokenSpeedSchedulerStub | None = None
+_served_model_id: str | None = None
+
+
+async def _close_shared_clients() -> None:
+    """Close and reset process-wide clients owned by the sidecar app."""
+    global _grpc_channel, _grpc_stub, _served_model_id
+    channel = _grpc_channel
+    _grpc_channel = None
+    _grpc_stub = None
+    _served_model_id = None
+    if channel is not None:
+        await channel.close()
+
+
+@asynccontextmanager
+async def _lifespan(_: FastAPI) -> AsyncIterator[None]:
+    try:
+        yield
+    finally:
+        await _close_shared_clients()
+
+
+app = FastAPI(lifespan=_lifespan)
 
 _STREAM_CHUNK_SIZE = 8192
 
@@ -210,9 +233,6 @@ async def _proxy_request(
 # "sampling_params"} with no `model` field; the smg gateway needs `model` to
 # select a tokenizer/worker (else `tokenizer_not_found`). Default it to the
 # single served model so tokenspeed is a drop-in sglang generation endpoint.
-_served_model_id: str | None = None
-
-
 async def _served_model() -> str | None:
     """Lazily fetch + cache the served model id from the engine (gRPC)."""
     global _served_model_id

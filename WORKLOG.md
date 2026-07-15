@@ -18,7 +18,10 @@ a different machine without relying on `/tmp` files or shell history.
   `c5454eb03678d8710e54a4e0fc681b9f3b4a3dba`
 - SMG processor repository: `https://github.com/FlamingoPg/smg.git`, branch
   `flamingo/minimax_m3`, revision
-  `b7402c47759067e2f2a8840eaf7e81e239ca79b5`
+  `6e0cb7acd62a8b8abe4d426a1289ff659e9a7844`. MiniMax-M3 processing
+  originally landed at `b7402c47759067e2f2a8840eaf7e81e239ca79b5`;
+  `6e0cb7a` adds the explicit configuration and orderly TokenSpeed serving
+  lifecycle used by the release-hardening candidate.
 
 Do not push this work directly to `flamingopg/main`. That branch has diverged
 from `origin/main`; resume from the feature branch above.
@@ -49,11 +52,12 @@ from `origin/main`; resume from the feature branch above.
 | FP8 KV/index cache | Implemented and fixed-candidate validated | E4M3 main K/V and index cache passed quality, exact 1M, and the full 8-cell random matrix. The M3 dense path keeps BF16 Q, uses native FA2 mixed extend and TensorRT-LLM mixed decode, and returns BF16 from a shared stable 512 MiB workspace. |
 | Vision encoder CUDA Graph | Real capture and active-MM smoke passed | Explicit CLI enablement captured nine budgets per TP rank (36 total), installed `image_encoder`, and served text, single-image, two-image, and unseen-reference requests without recapture. Dynamic 3D RoPE parity passed 2/2; video was rejected explicitly. |
 | CLI-only GPU placement | Cold-start validation passed | Worker placement uses `--base-gpu-id`/`--gpu-id-step`, and NCCL process groups bind the mapped CUDA device. The TP4 cold start created compute contexts only on GPUs 4-7; GPUs 0-3 remained at 4 MiB with no compute process. |
-| Explicit runtime configuration | Fixed-candidate source/process audit passed | Context length, multimodal hash/timing, Mamba dtype, CP topology, FP8 cache, GPU placement, and encoder graphs are CLI settings. No product feature env, visible-device mask, inherited TF32/workspace override, or persistent kernel override file was present; release preflight rejects every inherited `TOKENSPEED_*` key. |
+| Explicit runtime configuration | Release-hardening implementation and CPU regression passed; final fixed-SHA TP4 validation pending | SMG launch, multimodal SHM/RDMA, PD/EPD queueing, timeouts, heartbeat/failure policy, ring/cache, receive-pool, and sharding settings flow through typed `ServerArgs` configuration. Release preflight rejects inherited `TOKENSPEED_*`, `SMG_*`, `EPD_*`, and `TS_*` namespaces plus the reviewed exact overrides. |
 | Video | Unsupported by design | MiniMax-M3 basic support covers images. Video items are rejected explicitly and are not part of the Phase 5 acceptance matrix. |
-| CI and release benchmark | Fixed-candidate workloads passed; hosted CI pending | Quality passed 14/14, random passed 188/188 per arm, GSM8K scored 0.976497, and exact 1M passed. Strict task validators and artifacts are present; hosted B200 task execution is still required. |
-| Published SMG dependency | **Release blocker** | The candidate checked `tokenspeed-smg==1.7.0.post20260714`; it predates the MiniMax-M3 image processor. A clean active-MM install cannot be declared supported until a compatible package is published. |
-| Clean shutdown | **Release blocker** | Normal SIGINT frees GPUs and closes ports, but the launcher emits a Starlette/Uvicorn `CancelledError` and PID 1 retains unreaped zombies. |
+| CI and release benchmark | Six task specs pass local/static validation; hosted CI pending | Quality passed 14/14, random passed 188/188 per arm, GSM8K scored 0.976497, exact 1M passed, and the active-MM task checks 36 captures, no recapture, dynamic image/text behavior, visual parity, structured video rejection, and clean shutdown logs. No hosted B200 artifacts exist yet. |
+| Source SMG integration | Current source fix pushed; final fixed-SHA active-MM smoke pending | `FlamingoPg/smg@6e0cb7acd62a8b8abe4d426a1289ff659e9a7844` contains M3 processing plus explicit config and orderly engine shutdown. Historical active-image evidence used `b7402c4`; rerun against the final TokenSpeed SHA before closing this row. |
+| Published SMG dependency | **Release blocker** | No inspected official package contains the MiniMax-M3 processor and the lifecycle/configuration delta. A clean published-package image smoke therefore cannot pass yet. |
+| Clean shutdown | Fix implemented and CPU-tested; final TP4 proof pending | TokenSpeed and SMG now stop Uvicorn/control tasks, drain and cancel background tasks, terminate and reap owned scheduler descendants, and avoid competing signal ownership. Final fixed-SHA TP4 shutdown must prove no `CancelledError`, destroyed task, live descendant, new zombie, bound port, or retained GPU memory. |
 | Clean release environment | **Release blocker** | The current development `.venv` exposes system/user packages and a local SMG `.pth`; `pip check` fails the pinned published-SMG requirement. |
 
 ## Design checkpoint
@@ -216,6 +220,7 @@ test/ci/eval/minimax-m3-mxfp8-evalscope-gsm8k.yaml
 test/ci/perf/minimax-m3-bf16-evalscope-random.yaml
 test/ci/perf/minimax-m3-mxfp8-evalscope-random.yaml
 test/ci/perf/minimax-m3-mxfp8-exact-longctx.yaml
+test/ci/perf/minimax-m3-mxfp8-active-mm.yaml
 ```
 
 | Phase 5 gate | Result | Evidence to retain |
@@ -230,27 +235,53 @@ test/ci/perf/minimax-m3-mxfp8-exact-longctx.yaml
 | Language evaluation | PASS locally | GSM8K 1288/1319 = 0.976497, above reviewed 0.971 floor; all 1319 outputs/reviews validated |
 | Random throughput sweep | PASS at fixed SHA | FP8 and BF16 each 8/8 cells, 188/188/0; FP8/BF16 ratio 0.970625–0.994717 and 5488 MiB/GPU saved |
 | Environment configuration | PASS | No product feature env, visible-device mask, inherited TF32/workspace override, or persistent kernel override file |
-| CI task parsing/execution | Local/static pending final rerun; hosted execution pending | Strict validators, timeouts, full artifact upload, and post-stop log gates are implemented; hosted B200 artifacts still required |
-| Clean source SMG integration | PASS | `FlamingoPg/smg@b7402c4`, clean rebuild and active image smoke |
+| CI task parsing/execution | PASS local/static; hosted execution pending | All six specs pass local task discovery/schema/helper validation; strict validators, timeouts, full artifact upload, and post-stop log gates are implemented. Hosted B200 artifacts are still required. |
+| Clean source SMG integration | Historical runtime PASS; hardening rerun pending | Historical active image evidence used `b7402c4`; explicit configuration and orderly shutdown are pushed at `6e0cb7a`. |
 | Published SMG with M3 processor | **Blocked externally** | Latest inspected official package lacks the M3 processor; clean-package image smoke cannot pass yet |
-| Clean server shutdown | **Blocked** | Workloads pass, but normal SIGINT emits Starlette/Uvicorn `CancelledError` and leaves PID 1-owned zombies |
+| Clean server shutdown | Fix implemented; final TP4 proof pending | CPU lifecycle regression passes; cold fixed-SHA TP4 must prove clean descendants, logs, ports, and GPU release. |
 
 The language-only eval, perf, and long-context tasks deliberately avoid
 claiming multimodal packaging coverage. Active-MM release remains blocked until
 the published SMG dependency contains the processor currently pinned at
-`FlamingoPg/smg@b7402c47759067e2f2a8840eaf7e81e239ca79b5`.
+`FlamingoPg/smg@6e0cb7acd62a8b8abe4d426a1289ff659e9a7844`.
 
 All M3 runtime feature configuration is expressed as CLI arguments. The M3
 recipes and CI server commands use no feature environment variables; TP4 GPU
 placement uses `--base-gpu-id` and `--gpu-id-step`. Encoder-graph enablement
 and its metadata-sequence cap are explicit CLI fields; both legacy environment
 keys were removed. Preflight also rejects visible-device masks, inherited TF32
-and FlashInfer workspace overrides, every inherited `TOKENSPEED_*` variable,
-and a persistent override YAML. Vendor plumbing created internally by engine
-workers is recorded separately from user configuration. A repository-wide
-audit also found legacy `TOKENSPEED_*` reads in the independent EPD
-encode-to-prefill implementation; the aggregated MiniMax-M3 path does not use
-them, and release jobs now fail closed if any are inherited.
+and FlashInfer workspace overrides, every inherited `TOKENSPEED_*`, `SMG_*`,
+`EPD_*`, and `TS_*` variable, and a persistent override YAML. Vendor plumbing created
+internally by engine workers is recorded separately from user configuration. A
+repository-wide audit found additional product variables in unrelated runtime
+features. Release jobs reject the complete product namespaces rather than
+treating those variables as supported configuration. The PD/EPD/SMG/RDMA paths
+exercised by this release use typed CLI state, including their former
+heartbeat, failure-injection, timeout, ring/cache, and receive-pool settings.
+
+### Post-candidate Phase 5 release hardening
+
+The performance, quality, exact-1M, and encoder-graph evidence below remains
+pinned to TokenSpeed `70daee236dd4a5958393f1f365ff0e41271e64b9`. It does not
+validate the later lifecycle and explicit-configuration delta. The SMG side of
+that delta is committed and pushed at
+`6e0cb7acd62a8b8abe4d426a1289ff659e9a7844`; the final TokenSpeed hardening SHA
+is pending.
+
+The hardening implementation passed the recorded CPU lifecycle,
+configuration, EPD, CI-helper, and SMG regression suites. TokenSpeed's combined
+pre-hardening regression had 317 passing tests plus six passing subtests; the
+post-change focused lifecycle suite has 63 passing tests, and the explicit
+configuration/EPD regression has 158 passing tests plus six passing subtests.
+The full SMG Python suite has 122 passing and one skipped test. SMG's Python
+pre-commit hooks passed; Rust hooks could not run because this machine has no
+`cargo`, and are not recorded as passing.
+
+A cold TP4 source smoke from the final TokenSpeed SHA and SMG `6e0cb7a` is
+still required to validate active images, encoder graph capture/replay, clean
+process teardown, closed ports, and released GPUs. A clean isolated source
+install and `pip check` are also pending. These source checks cannot close the
+separate published-package or hosted-CI gates.
 
 ### Fixed-candidate Phase 5 evidence
 

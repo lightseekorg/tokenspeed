@@ -122,6 +122,8 @@ class TestProxyPassthrough(unittest.TestCase):
     def tearDownClass(cls):
         cls._mock_server.should_exit = True
         cls._sidecar_server.should_exit = True
+        cls._t_mock.join(timeout=5)
+        cls._t_side.join(timeout=5)
 
     def _url(self, path):
         return f"http://127.0.0.1:{self.SIDECAR_PORT}{path}"
@@ -240,10 +242,9 @@ class TestGrpcDirect(unittest.TestCase):
         hs._engine_grpc_addr = "127.0.0.1:1"
 
     def tearDown(self):
-        # Drop the cached channel/stub and restore loop state so we neither leak
-        # the channel nor leave a closed loop as "current" for later tests.
-        self.hs._grpc_channel = None
-        self.hs._grpc_stub = None
+        # Close the cached channel and restore loop state so we neither leak the
+        # channel nor leave a closed loop as "current" for later tests.
+        self._loop.run_until_complete(self.hs._close_shared_clients())
         asyncio.set_event_loop(None)
         self._loop.close()
 
@@ -300,10 +301,13 @@ class TestControlServerReadiness(unittest.TestCase):
     ready, and report failure when the port is unavailable (P2 review fix)."""
 
     def test_reports_ready_after_bind(self):
-        from tokenspeed.cli.serve_smg import _start_control_server
+        from tokenspeed.cli.serve_smg import (
+            _start_control_server,
+            _stop_control_server,
+        )
 
         port = 28330
-        ok = asyncio.run(
+        handle = asyncio.run(
             _start_control_server(
                 gateway_url="http://127.0.0.1:1",
                 engine_grpc_addr="127.0.0.1:1",
@@ -312,9 +316,14 @@ class TestControlServerReadiness(unittest.TestCase):
                 timeout=15,
             )
         )
-        self.assertTrue(ok)
-        # The socket must really be accepting connections now.
-        self.assertTrue(_wait(port, "/health", timeout=2))
+        self.assertIsNotNone(handle)
+        try:
+            # The socket must really be accepting connections now.
+            self.assertTrue(_wait(port, "/health", timeout=2))
+        finally:
+            asyncio.run(_stop_control_server(handle))
+        self.assertFalse(handle.thread.is_alive())
+        self.assertFalse(_wait(port, "/health", timeout=0.5))
 
     def test_reports_failure_when_port_in_use(self):
         from tokenspeed.cli.serve_smg import _start_control_server
@@ -328,7 +337,7 @@ class TestControlServerReadiness(unittest.TestCase):
         sock.bind(("127.0.0.1", port))
         sock.listen(1)
         try:
-            ok = asyncio.run(
+            handle = asyncio.run(
                 _start_control_server(
                     gateway_url="http://127.0.0.1:1",
                     engine_grpc_addr="127.0.0.1:1",
@@ -337,7 +346,7 @@ class TestControlServerReadiness(unittest.TestCase):
                     timeout=5,
                 )
             )
-            self.assertFalse(ok, "should report failure when port is occupied")
+            self.assertIsNone(handle, "should report failure when port is occupied")
         finally:
             sock.close()
 

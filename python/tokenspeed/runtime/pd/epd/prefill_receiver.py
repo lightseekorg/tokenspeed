@@ -59,10 +59,13 @@ logger = logging.getLogger(__name__)
 from tokenspeed.runtime.multimodal.embedder import _item_token_count
 from tokenspeed.runtime.multimodal.inputs import MultimodalDataItem
 from tokenspeed.runtime.pd.base.status import TransferPoll
+from tokenspeed.runtime.pd.config import (
+    DisaggregationRuntimeConfig,
+    EpdRuntimeConfig,
+)
 from tokenspeed.runtime.pd.epd.embedding_transfer import (
     MooncakeEmbeddingReceiver,
 )
-from tokenspeed.runtime.utils.env import envs
 
 # (manager, bootstrap_addr, bootstrap_room) -> receiver. Defaults to the real
 # MooncakeEmbeddingReceiver; overridden in tests with a fake.
@@ -193,12 +196,19 @@ class _RecvBufferPool:
 _POOLS: dict = {}
 
 
-def _get_pool(engine: Any, device: Any) -> _RecvBufferPool | None:
-    key = (id(engine), str(device))
+def _get_pool(
+    engine: Any, device: Any, config: EpdRuntimeConfig
+) -> _RecvBufferPool | None:
+    key = (
+        id(engine),
+        str(device),
+        config.recv_pool_slots,
+        config.recv_pool_slot_mb,
+    )
     pool = _POOLS.get(key)
     if pool is None:
-        n_slots = envs.TOKENSPEED_EPD_RECV_POOL_SLOTS.get()
-        slot_mb = envs.TOKENSPEED_EPD_RECV_POOL_SLOT_MB.get()
+        n_slots = config.recv_pool_slots
+        slot_mb = config.recv_pool_slot_mb
         if n_slots <= 0 or slot_mb <= 0:
             pool = False
         else:
@@ -318,8 +328,8 @@ class EmbeddingReceiveJob:
     lifetime-registered :class:`_RecvBufferPool`; on DONE the landed rows are
     cloned onto ``item.encoded`` and the slot is reused after that copy completes
     (no MR churn, see the pool docstring). Deepstack models, oversized items, pool
-    exhaustion, or ``TOKENSPEED_EPD_RECV_POOL_SLOTS=0`` fall back to a per-request
-    buffer registered on start and lazily deregistered after publish. Pooled
+    exhaustion, or ``--epd-recv-pool-slots 0`` fall back to a per-request buffer
+    registered on start and lazily deregistered after publish. Pooled
     slots stay leased until the CUDA copy into ``item.encoded`` has completed,
     so a following request cannot overwrite rows still being cloned. The GPU cost
     per request is roughly ``n_tokens * hidden * dtype.itemsize`` (plus ``* (1 +
@@ -343,6 +353,7 @@ class EmbeddingReceiveJob:
         receiver_factory: ReceiverFactory | None = None,
         shard_rank: int = 0,
         shard_size: int = 1,
+        epd_config: EpdRuntimeConfig | None = None,
     ):
         self.manager = manager
         self.hidden = hidden
@@ -354,6 +365,7 @@ class EmbeddingReceiveJob:
         # shard_size <= 1 is a plain full copy (no reassemble).
         self._shard_rank = shard_rank
         self._shard_size = shard_size
+        self._epd_config = epd_config or EpdRuntimeConfig()
         # torch.dtype is used for buffer allocation (no dtype lost in a string
         # round-trip); the string is only the encode-side wire contract in pre_alloc.
         self.dtype = dtype
@@ -452,7 +464,7 @@ class EmbeddingReceiveJob:
             # _RecvBufferPool for why per-request register/deregister kills QPs).
             # Deepstack models keep the legacy path (a second buffer per item,
             # out of the pool's scope).
-            pool = _get_pool(self.manager.engine, device)
+            pool = _get_pool(self.manager.engine, device, self._epd_config)
             if pool is not None:
                 pool_slot = pool.lease(nbytes)
                 if pool_slot is not None:
@@ -775,6 +787,7 @@ def start_embedding_receive(
     receiver_factory: ReceiverFactory | None = None,
     shard_rank: int = 0,
     shard_size: int = 1,
+    epd_config: EpdRuntimeConfig | None = None,
 ) -> EmbeddingReceiveJob:
     """Begin (non-blocking) the per-item EPD embedding receive for one request.
 
@@ -796,6 +809,7 @@ def start_embedding_receive(
         receiver_factory=receiver_factory,
         shard_rank=shard_rank,
         shard_size=shard_size,
+        epd_config=epd_config,
     )
 
 
@@ -809,6 +823,7 @@ def receive_encoded_embeddings(
     device: torch.device | str,
     timeout: float = 60.0,
     receiver_factory: ReceiverFactory | None = None,
+    epd_config: EpdRuntimeConfig | None = None,
 ) -> None:
     """BLOCKING wrapper: fill ``item.encoded`` from the per-item transfers.
 
@@ -831,6 +846,7 @@ def receive_encoded_embeddings(
         dtype=dtype,
         device=device,
         receiver_factory=receiver_factory,
+        epd_config=epd_config,
     )
     deadline = time.monotonic() + timeout
     while True:
@@ -867,6 +883,7 @@ def build_prefill_embedding_manager(server_args, global_rank, is_multimodal_acti
     emb_mgr_args = EmbeddingManagerArgs(
         bootstrap_port=server_args.disaggregation_bootstrap_port,
         tp_size=server_args.mapping.attn.tp_size,
+        runtime_config=server_args.disaggregation_config,
     )
     emb_args = EmbeddingArgs(
         engine_rank=global_rank,
@@ -906,6 +923,7 @@ class EpdPrefillAdmission:
         attn_tp_cpu_group,
         attn_tp_group,
         pg_manager,
+        runtime_config: DisaggregationRuntimeConfig,
     ):
         self._manager = manager
         self._device = device
@@ -915,6 +933,7 @@ class EpdPrefillAdmission:
         self._attn_tp_rank = attn_tp_rank
         self._attn_tp_size = attn_tp_size
         self._attn_tp_cpu_group = attn_tp_cpu_group
+        self._epd_config = runtime_config.epd
         # Requests whose per-image encode->prefill embeddings are still arriving:
         # registered but NOT yet submitted to the scheduler; drain() polls them each
         # cycle and admits (rank-synced) only once ready. Rank-identical in
@@ -926,9 +945,7 @@ class EpdPrefillAdmission:
         # wait knob (default 300s): the prefill waiting on the encode->prefill
         # embedding transfer is the direct analog of the decode waiting on the
         # prefill->decode KV transfer, so one operator knob covers both.
-        self._embed_timeout: float = float(
-            envs.TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT.get()
-        )
+        self._embed_timeout = float(runtime_config.waiting_timeout_s)
 
         # EPD embedding row-sharding: each attn-TP rank receives only 1/N of every
         # image's rows over the wire; the full embedding is rebuilt by an NCCL
@@ -941,8 +958,8 @@ class EpdPrefillAdmission:
         self._group_ranks = tuple(attn_tp_group)
         shard_flag = False
         if attn_tp_size > 1:
-            shard_flag = bool(envs.TOKENSPEED_EPD_EMBEDDING_SHARD.get())
-            # The flag is a per-process env read but gates a GROUP collective:
+            shard_flag = runtime_config.epd.embedding_shard
+            # The flag is process-local but gates a GROUP collective:
             # torn across ranks (e.g. set on one node of a multi-node prefill),
             # flag-on ranks would join the warmup broadcast below while flag-off
             # ranks never do -- a silent boot hang. Agree first, loud.
@@ -952,8 +969,8 @@ class EpdPrefillAdmission:
             dist.all_reduce(flag_t, op=dist.ReduceOp.MIN, group=attn_tp_cpu_group)
             if flag_t[0].item() != -flag_t[1].item():
                 raise RuntimeError(
-                    "TOKENSPEED_EPD_EMBEDDING_SHARD differs across attn-TP ranks; "
-                    "set it identically on every node of the prefill engine"
+                    "--epd-embedding-shard differs across attn-TP ranks; set it "
+                    "identically on every node of the prefill engine"
                 )
         if shard_flag:
             self._nccl_group = pg_manager.get_process_group("nccl", attn_tp_group)
@@ -986,6 +1003,7 @@ class EpdPrefillAdmission:
             device=self._device,
             shard_rank=self._attn_tp_rank,
             shard_size=self._attn_tp_size if self._shard_embeddings else 1,
+            epd_config=self._epd_config,
         )
         self._pending.append((request_id, job, time.time()))
 
@@ -1089,4 +1107,5 @@ def make_epd_prefill_admission(
         attn_tp_cpu_group=attn_tp_cpu_group,
         attn_tp_group=mapping.attn.tp_group,
         pg_manager=pg_manager,
+        runtime_config=server_args.disaggregation_config,
     )

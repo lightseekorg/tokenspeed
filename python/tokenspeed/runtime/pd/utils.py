@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import ctypes
 import dataclasses
-import os
 import random
 import threading
 import warnings
@@ -45,8 +44,6 @@ from tokenspeed.runtime.utils.network import get_ip
 if TYPE_CHECKING:
     from tokenspeed.runtime.engine.request import Req
 
-# env var for testing failure, convert to float explicitly
-FAILURE_PROB = float(os.getenv("DISAGGREGATION_TEST_FAILURE_PROB", 0))
 logger = get_colorful_logger(__name__)
 
 
@@ -85,16 +82,27 @@ class FastQueue:
             return self._buf.popleft()
 
 
-def poll_and_all_reduce(pollers, gloo_group):
-    """Poll transfer state and all-reduce the result across the gloo group."""
+def poll_and_all_reduce(pollers, gloo_group, *, failure_probability: float = 0.0):
+    """Poll transfer state and all-reduce the result across the gloo group.
+
+    ``failure_probability`` is an explicit test hook. Production callers leave
+    it at zero; tests may inject transfer failures without mutating process
+    environment state.
+    """
+
+    if not 0.0 <= failure_probability <= 1.0:
+        raise ValueError(
+            "failure_probability must be between 0 and 1, got " f"{failure_probability}"
+        )
+
     # At a certain probability, mark the poll as failed to simulate failure.
-    if FAILURE_PROB > 0:
+    if failure_probability > 0:
         from tokenspeed.runtime.pd.base.status import TransferPoll
 
         polls = [
             (
                 int(TransferPoll.Failed)
-                if random.random() < FAILURE_PROB
+                if random.random() < failure_probability
                 else int(poller.poll())
             )
             for poller in pollers

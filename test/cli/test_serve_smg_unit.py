@@ -579,8 +579,8 @@ async def test_engine_start_timeout_kills_engine_and_exits_nonzero():
 
 
 @pytest.mark.asyncio
-async def test_gateway_first_then_engine_on_clean_shutdown():
-    """Gateway is SIGTERMed before the engine (front before back)."""
+async def test_control_then_gateway_then_engine_on_clean_shutdown():
+    """Stop proxy layers from the outside in before the engine."""
     engine = _make_proc(returncode=0)
     gateway = _make_proc(returncode=0)
     call_order: list[str] = []
@@ -590,6 +590,12 @@ async def test_gateway_first_then_engine_on_clean_shutdown():
             call_order.append("gateway")
         elif proc is engine:
             call_order.append("engine")
+
+    control = MagicMock()
+
+    async def tracked_control_stop(handle):
+        assert handle is control
+        call_order.append("control")
 
     startup_done = asyncio.Event()
 
@@ -621,6 +627,12 @@ async def test_gateway_first_then_engine_on_clean_shutdown():
         "tokenspeed.cli.serve_smg.wait_http_ready",
         side_effect=probe_then_schedule_release,
     ), patch(
+        "tokenspeed.cli.serve_smg._start_control_server",
+        AsyncMock(return_value=control),
+    ), patch(
+        "tokenspeed.cli.serve_smg._stop_control_server",
+        side_effect=tracked_control_stop,
+    ), patch(
         "tokenspeed.cli.serve_smg.terminate_then_kill", side_effect=tracked_term
     ):
         rc = await run_smg(
@@ -630,7 +642,7 @@ async def test_gateway_first_then_engine_on_clean_shutdown():
             user_host="127.0.0.1",
             user_port=8000,
         )
-    assert call_order == ["gateway", "engine"]
+    assert call_order == ["control", "gateway", "engine"]
     assert rc == 0
 
 
@@ -830,7 +842,8 @@ def test_run_smg_from_args_sets_process_title(monkeypatch):
     captured = {}
     monkeypatch.delenv(GRPC_MAX_MESSAGE_BYTES_ENV, raising=False)
 
-    def fake_run(*a, **kw):
+    def fake_run(coro):
+        coro.close()
         return 0
 
     monkeypatch.setattr("tokenspeed.cli.serve_smg.asyncio.run", fake_run)

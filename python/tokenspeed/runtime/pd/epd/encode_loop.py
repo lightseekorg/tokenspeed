@@ -57,26 +57,20 @@ from tokenspeed.runtime.multimodal.encoder_cudagraph import (
 from tokenspeed.runtime.pd.epd.encode_scheduler import EncodeScheduler
 from tokenspeed.runtime.pd.epd.encode_worker import EncodeWorker
 from tokenspeed.runtime.utils import get_colorful_logger, get_zmq_socket
-from tokenspeed.runtime.utils.env import envs
 
 logger = get_colorful_logger(__name__)
 
 
 # Vision-embedding cache capacity. L1 lives in GPU VRAM; the optional L2 lives in
 # host DRAM and catches L1 evictions so duplicate images skip the tower even past
-# the VRAM working set. Both are whole-MiB env overrides. L2 defaults to 0
-# (disabled): the host tier is opt-in. NOTE both knobs are PER ENCODE PROCESS (per
-# TP rank): at encode TP>1, every co-located rank allocates its own L1+L2, so
-# budget host DRAM as tp_size * EMBED_CACHE_DRAM_MB.
-def _embedding_cache_bytes(env_field) -> int:
-    """Whole-MiB env field -> bytes.
+# the VRAM working set. L2 defaults to 0 (disabled): the host tier is opt-in.
+# Both knobs are PER ENCODE PROCESS (per TP rank): at encode TP>1, every
+# co-located rank allocates its own L1+L2.
+def _embedding_cache_bytes(mb: int, option_name: str) -> int:
+    """Convert a nonnegative whole-MiB cache setting to bytes."""
 
-    EnvField handles parsing and defaults; negative capacities are rejected here
-    with an env-named error.
-    """
-    mb = env_field.get()
     if mb < 0:
-        raise ValueError(f"{env_field.name} must be >= 0 MiB, got {mb}")
+        raise ValueError(f"{option_name} must be >= 0 MiB, got {mb}")
     return mb * 1024 * 1024
 
 
@@ -119,6 +113,7 @@ def _build_manager_args(server_args, mapping):
         bootstrap_port=server_args.disaggregation_bootstrap_port,
         tp_size=mapping.attn.tp_size,
         bootstrap_host=bootstrap_host,
+        runtime_config=server_args.disaggregation_config,
     )
 
 
@@ -196,6 +191,8 @@ def _build_encode_worker(server_args, port_args, gpu_id, global_rank):
     # which the encode worker bypasses by never building a ModelExecutor).
     _maybe_install_encoder_cudagraph(model, server_args)
 
+    runtime_config = server_args.disaggregation_config
+    epd_config = runtime_config.epd
     manager_args = _build_manager_args(server_args, mapping)
     embedding_args = EmbeddingArgs(
         engine_rank=global_rank,
@@ -213,10 +210,22 @@ def _build_encode_worker(server_args, port_args, gpu_id, global_rank):
     if attn_tp_rank == 0:
         MooncakeEmbeddingBootstrapServer(server_args.disaggregation_bootstrap_port)
     manager = MooncakeEmbeddingManagerEncode(manager_args, embedding_args)
-    executor = DisaggEncodeExecutor(manager, model, device=device)
+    executor = DisaggEncodeExecutor(
+        manager,
+        model,
+        device=device,
+        ring_slots=epd_config.encode_ring_slots,
+        ring_bytes=epd_config.encode_ring_slot_mb << 20,
+    )
 
-    l1_bytes = _embedding_cache_bytes(envs.TOKENSPEED_EPD_ENCODE_EMBED_CACHE_MB)
-    l2_bytes = _embedding_cache_bytes(envs.TOKENSPEED_EPD_ENCODE_EMBED_CACHE_DRAM_MB)
+    l1_bytes = _embedding_cache_bytes(
+        epd_config.encode_embedding_cache_mb,
+        "--epd-encode-embedding-cache-mb",
+    )
+    l2_bytes = _embedding_cache_bytes(
+        epd_config.encode_embedding_cache_dram_mb,
+        "--epd-encode-embedding-cache-dram-mb",
+    )
     cache = _make_embedding_cache(l1_bytes, l2_bytes, device)
     scheduler = EncodeScheduler(
         max_tokens_per_batch=server_args.chunked_prefill_size or 8192,

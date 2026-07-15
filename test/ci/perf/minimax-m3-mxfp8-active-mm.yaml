@@ -1,0 +1,78 @@
+api_version: ci.tokenspeed.io/v1
+name: perf-minimax-m3-mxfp8-active-mm
+type: perf
+timeout_minutes: 120
+triggers:
+  - manual
+runner:
+  labels:
+    - b200-4gpu
+install:
+  - bash test/ci_system/install_deps.sh
+  - >-
+    python3 test/ci_system/runtime_env_preflight.py
+    --output .ci-artifacts/minimax-m3-active-mm/runtime_environment.json
+  - >-
+    python3 test/ci_system/fetch_minimax_m3_mm_fixtures.py
+    --output-dir .ci-artifacts/minimax-m3-active-mm/fixtures
+server:
+  command: >-
+    tokenspeed serve MiniMaxAI/MiniMax-M3-MXFP8
+    --revision c5454eb03678d8710e54a4e0fc681b9f3b4a3dba
+    --served-model-name minimax-m3
+    --trust-remote-code
+    --tensor-parallel-size 4
+    --base-gpu-id 0
+    --gpu-id-step 1
+    --max-model-len 32768
+    --max-total-tokens 32768
+    --max-num-seqs 2
+    --chunked-prefill-size 4096
+    --max-prefill-tokens 8192
+    --block-size 128
+    --kv-cache-dtype fp8_e4m3
+    --kv-cache-quant-method none
+    --attention-backend mha
+    --mm-attention-backend triton_attn
+    --moe-backend triton
+    --sampling-backend greedy
+    --seed 20260715
+    --enable-mm-encoder-cuda-graph
+    --enforce-eager
+    --disable-prefill-graph
+    --no-enable-prefix-caching
+    --disable-kvstore
+    --enable-output-logprobs
+    --host 127.0.0.1
+    --port 8000
+    --control-port 8001
+  ready:
+    url: http://127.0.0.1:8000/readiness
+    timeout: 3600
+    interval: 10
+  forbidden_log_patterns:
+    - 'Prefill graph capture failed'
+    - 'Encoder CUDA graph capture failed'
+    - 'Scheduler hit an exception:'
+    - 'Buffer overflow when allocating memory'
+    - 'CUDA out of memory'
+    - 'OutOfMemoryError'
+    - 'Retract failed'
+    - 'NCCL.*(?:abort|unhandled)'
+    - 'CancelledError'
+    - 'Task was destroyed'
+perf:
+  command: >-
+    python3 test/ci_system/minimax_m3_active_mm_smoke.py
+    --base-url http://127.0.0.1:8000
+    --control-url http://127.0.0.1:8001
+    --model minimax-m3
+    --dog .ci-artifacts/minimax-m3-active-mm/fixtures/dog.jpg
+    --pug .ci-artifacts/minimax-m3-active-mm/fixtures/pug.jpg
+    --banner assets/banner/tokenspeed-banner.png
+    --reference test/ci/reference/minimax_m3_dog_visual_reference.json
+    --server-log .ci-artifacts/server.log
+    --output-dir .ci-artifacts/minimax-m3-active-mm
+    --request-timeout-seconds 600
+report:
+  github_step_summary: true

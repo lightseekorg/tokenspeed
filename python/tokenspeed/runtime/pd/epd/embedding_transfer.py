@@ -34,7 +34,6 @@ importable and unit-testable on CPU.
 from __future__ import annotations
 
 import concurrent.futures
-import os
 import threading
 import time
 from typing import TYPE_CHECKING
@@ -57,7 +56,6 @@ from tokenspeed.runtime.pd.epd.entities import (
 )
 from tokenspeed.runtime.pd.utils import DisaggregationMode, FastQueue
 from tokenspeed.runtime.utils import get_colorful_logger
-from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.network import get_free_port, get_local_ip_by_remote
 
 logger = get_colorful_logger(__name__)
@@ -247,8 +245,9 @@ class MooncakeEmbeddingManagerEncode(MooncakeEmbeddingManagerBase):
         super().__init__(args, embedding_args, DisaggregationMode.ENCODE)
         # room -> {receiver_session -> EmbeddingTransferInfo}
         self.transfer_infos: dict[int, dict[str, EmbeddingTransferInfo]] = {}
+        runtime_config = args.runtime_config
         # Bootstrap registration-wait timeout (default 120s).
-        self.bootstrap_time_out = envs.TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
+        self.bootstrap_time_out = runtime_config.bootstrap_timeout_s
         # room -> [(deadline, chunk), ...] chunks popped before the receiver
         # registered; flushed by the bootstrap thread once its info arrives.
         self._pending: dict[int, list[tuple]] = {}
@@ -263,15 +262,8 @@ class MooncakeEmbeddingManagerEncode(MooncakeEmbeddingManagerBase):
         # Each queue's worker uses a pool to issue one room's per-receiver writes
         # concurrently (each prefill rank is a distinct Mooncake session, so a
         # single batch call cannot span them).
-        cpu_count = os.cpu_count() or 8
-        pool_size = envs.TOKENSPEED_DISAGGREGATION_THREAD_POOL_SIZE.get_set_value_or(
-            min(max(4, int(0.75 * cpu_count) // 8), 12)
-        )
-        queue_count = envs.TOKENSPEED_DISAGGREGATION_QUEUE_SIZE.get()
-        assert pool_size >= queue_count, (
-            f"TOKENSPEED_DISAGGREGATION_THREAD_POOL_SIZE={pool_size} must be >= "
-            f"TOKENSPEED_DISAGGREGATION_QUEUE_SIZE={queue_count}"
-        )
+        pool_size = runtime_config.resolved_thread_pool_size()
+        queue_count = runtime_config.queue_size
         self._queues: list[FastQueue] = [FastQueue() for _ in range(queue_count)]
         self._executors = [
             concurrent.futures.ThreadPoolExecutor(max(1, pool_size // queue_count))

@@ -24,17 +24,22 @@ FORBIDDEN_EXACT_KEYS = frozenset(
         "FLASHINFER_WORKSPACE_SIZE",
         "HIP_VISIBLE_DEVICES",
         "NVIDIA_TF32_OVERRIDE",
+        "REQUEST_TIMEOUT",
         "ROCR_VISIBLE_DEVICES",
+        "SINGLE_WORKER_ID",
+        "TLLM_LOG_LEVEL",
         "TORCH_ALLOW_TF32_CUBLAS_OVERRIDE",
+        "TORCHINDUCTOR_ENABLE_PDL",
+        "TRTLLM_ENABLE_PDL",
         "TS_DEBUG_CACHE_SYNC",
         "TS_SERVE_ENGINE_MODULE",
     }
 )
-# Release workloads are deliberately fail-closed: every TokenSpeed product,
+# Release workloads are deliberately fail-closed: every TokenSpeed/SMG product,
 # debug, placement, or kernel variable is rejected, including keys introduced
 # after this checker. Runtime behavior must be expressed through reviewed CLI
-# arguments or task data instead of an inherited ``TOKENSPEED_*`` namespace.
-FORBIDDEN_PREFIXES = ("TOKENSPEED_",)
+# arguments or task data instead of an inherited product namespace.
+FORBIDDEN_PREFIXES = ("TOKENSPEED_", "SMG_", "EPD_", "TS_")
 DEFAULT_OVERRIDE_RELATIVE_PATH = Path(".config/tokenspeed-kernel/overrides.yaml")
 
 

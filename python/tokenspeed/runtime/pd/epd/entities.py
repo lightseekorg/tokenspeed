@@ -24,6 +24,8 @@ import dataclasses
 import struct
 from typing import TYPE_CHECKING
 
+from tokenspeed.runtime.pd.config import DisaggregationRuntimeConfig
+
 if TYPE_CHECKING:
     import torch
 
@@ -247,3 +249,6 @@ class EmbeddingManagerArgs:
     bootstrap_port: int
     tp_size: int
     bootstrap_host: str | None = None
+    runtime_config: DisaggregationRuntimeConfig = dataclasses.field(
+        default_factory=DisaggregationRuntimeConfig
+    )

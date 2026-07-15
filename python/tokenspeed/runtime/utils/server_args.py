@@ -23,6 +23,7 @@
 import argparse
 import dataclasses
 import json
+import math
 import os
 import random
 from typing import Literal
@@ -33,6 +34,10 @@ from tokenspeed_kernel.ops.attention.triton.linear.chunk_delta_h import (
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.mapping import Mapping, _resolve_parallelism_sizes
+from tokenspeed.runtime.pd.config import (
+    DisaggregationRuntimeConfig,
+    EpdRuntimeConfig,
+)
 from tokenspeed.runtime.utils import (
     get_amdgpu_memory_capacity,
     get_colorful_logger,
@@ -127,6 +132,23 @@ class ServerArgs:
     decode_log_interval: int = 40
     metrics_reporters: list[str] | None = None
     app_key: str | None = None
+
+    # Gateway-servicer integration. These are explicit launch settings rather
+    # than process-environment aliases so one ServerArgs snapshot owns the
+    # serving configuration.
+    grpc_max_message_bytes: int = 268435456
+    skip_grpc_warmup: bool = False
+    health_check_timeout: float = 20.0
+    log_mm_tensor_data: bool = False
+    unlink_mm_shm_after_read: bool = True
+    epd_pixel_shm: bool = True
+    epd_ingest_offloop: bool = True
+    mm_pixel_rdma: bool = False
+    mm_rdma_slot_bytes: int = 33_554_432
+    mm_rdma_landing_slots: int = 64
+    mm_rdma_send_metadata: bool | None = None
+    mm_rdma_landing_wait_seconds: float = 120.0
+    mm_rdma_read_timeout_seconds: float = 60.0
 
     # API related
     api_key: str | None = None
@@ -294,6 +316,22 @@ class ServerArgs:
     disaggregation_transfer_backend: str = "mooncake"
     disaggregation_ib_device: str | None = None
     disaggregation_layerwise_interval: int = 1
+    disaggregation_queue_size: int = 4
+    disaggregation_thread_pool_size: int | None = None
+    disaggregation_bootstrap_timeout: int = 120
+    disaggregation_waiting_timeout: int = 300
+    disaggregation_failed_session_ttl: int = 30
+    disaggregation_heartbeat_interval: float = 5.0
+    disaggregation_heartbeat_max_failures: int = 2
+    pd_layerwise_debug: bool = False
+    pd_prefill_metadata_wait_log_interval: float = 5.0
+    epd_encode_ring_slots: int = 64
+    epd_encode_ring_slot_mb: int = 256
+    epd_encode_embedding_cache_mb: int = 4096
+    epd_encode_embedding_cache_dram_mb: int = 0
+    epd_recv_pool_slots: int = 16
+    epd_recv_pool_slot_mb: int = 256
+    epd_embedding_shard: bool = True
     pdlb_url: str | None = None
 
     skip_server_warmup: bool = False
@@ -307,6 +345,35 @@ class ServerArgs:
     @property
     def mamba_cache_chunk_size(self) -> int:
         return max(FLA_CHUNK_SIZE, self.block_size)
+
+    @property
+    def disaggregation_config(self) -> DisaggregationRuntimeConfig:
+        """Return the validated typed PD/EPD runtime configuration."""
+
+        return DisaggregationRuntimeConfig(
+            queue_size=self.disaggregation_queue_size,
+            thread_pool_size=self.disaggregation_thread_pool_size,
+            bootstrap_timeout_s=self.disaggregation_bootstrap_timeout,
+            waiting_timeout_s=self.disaggregation_waiting_timeout,
+            failed_session_ttl_s=self.disaggregation_failed_session_ttl,
+            heartbeat_interval_s=self.disaggregation_heartbeat_interval,
+            heartbeat_max_failures=self.disaggregation_heartbeat_max_failures,
+            layerwise_debug=self.pd_layerwise_debug,
+            prefill_metadata_wait_log_interval_s=(
+                self.pd_prefill_metadata_wait_log_interval
+            ),
+            epd=EpdRuntimeConfig(
+                encode_ring_slots=self.epd_encode_ring_slots,
+                encode_ring_slot_mb=self.epd_encode_ring_slot_mb,
+                encode_embedding_cache_mb=self.epd_encode_embedding_cache_mb,
+                encode_embedding_cache_dram_mb=(
+                    self.epd_encode_embedding_cache_dram_mb
+                ),
+                recv_pool_slots=self.epd_recv_pool_slots,
+                recv_pool_slot_mb=self.epd_recv_pool_slot_mb,
+                embedding_shard=self.epd_embedding_shard,
+            ),
+        )
 
     def __post_init__(self):
         self.resolve_basic_defaults()
@@ -590,6 +657,10 @@ class ServerArgs:
             )
 
     def resolve_disaggregation(self):
+        # Constructing the typed snapshot validates every PD/EPD tuning field at
+        # startup, before any transport thread or large buffer is created.
+        _ = self.disaggregation_config
+
         # PD disaggregation
         if self.disaggregation_mode == "prefill":
             self.enforce_eager = True
@@ -657,6 +728,28 @@ class ServerArgs:
             )
 
     def validate(self):
+        if not 0 < self.grpc_max_message_bytes <= 2147483647:
+            raise ValueError(
+                "grpc_max_message_bytes must be in [1, 2147483647], got "
+                f"{self.grpc_max_message_bytes}"
+            )
+        if (
+            not math.isfinite(self.health_check_timeout)
+            or self.health_check_timeout <= 0
+        ):
+            raise ValueError(
+                f"health_check_timeout must be > 0, got {self.health_check_timeout}"
+            )
+        positive_mm_rdma_settings = {
+            "mm_rdma_slot_bytes": self.mm_rdma_slot_bytes,
+            "mm_rdma_landing_slots": self.mm_rdma_landing_slots,
+            "mm_rdma_landing_wait_seconds": self.mm_rdma_landing_wait_seconds,
+            "mm_rdma_read_timeout_seconds": self.mm_rdma_read_timeout_seconds,
+        }
+        for name, value in positive_mm_rdma_settings.items():
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be > 0, got {value}")
+
         if (
             self.max_num_seqs is not None
             and self.max_num_seqs < self.mapping.attn.dp_size
@@ -691,11 +784,12 @@ class ServerArgs:
                 "EPLB is enabled or init_expert_location is provided. ep_dispatch_algorithm is configured."
             )
 
-        if not self.disable_pdl:
-            os.environ.setdefault("TORCHINDUCTOR_ENABLE_PDL", "1")
-            # Enable PDL for fused attention kernels.
-            os.environ.setdefault("TRTLLM_ENABLE_PDL", "1")
-        os.environ.setdefault("TLLM_LOG_LEVEL", "INFO")
+        pdl_enabled = str(int(not self.disable_pdl))
+        os.environ["TORCHINDUCTOR_ENABLE_PDL"] = pdl_enabled
+        # Enable or disable PDL for fused attention kernels from the same
+        # explicit ServerArgs state instead of inherited process settings.
+        os.environ["TRTLLM_ENABLE_PDL"] = pdl_enabled
+        os.environ["TLLM_LOG_LEVEL"] = "INFO"
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -1140,6 +1234,88 @@ class ServerArgs:
                 "forward timings. This diagnostic mode may synchronize CUDA "
                 "and reduce throughput."
             ),
+        )
+        parser.add_argument(
+            "--grpc-max-message-bytes",
+            type=int,
+            default=ServerArgs.grpc_max_message_bytes,
+            help="Maximum SMG gRPC request/response size in bytes.",
+        )
+        parser.add_argument(
+            "--skip-grpc-warmup",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.skip_grpc_warmup,
+            help="Skip the SMG engine gRPC warmup request.",
+        )
+        parser.add_argument(
+            "--health-check-timeout",
+            type=float,
+            default=ServerArgs.health_check_timeout,
+            help="Seconds to wait for each SMG component health check.",
+        )
+        parser.add_argument(
+            "--log-mm-tensor-data",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.log_mm_tensor_data,
+            help="Allow SMG to log multimodal tensor data for diagnostics.",
+        )
+        parser.add_argument(
+            "--unlink-mm-shm-after-read",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.unlink_mm_shm_after_read,
+            help="Unlink SMG multimodal shared memory after it is consumed.",
+        )
+        parser.add_argument(
+            "--epd-pixel-shm",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.epd_pixel_shm,
+            help="Use shared memory for EPD pixel payloads.",
+        )
+        parser.add_argument(
+            "--epd-ingest-offloop",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.epd_ingest_offloop,
+            help="Run EPD input ingestion away from the gateway event loop.",
+        )
+        parser.add_argument(
+            "--mm-pixel-rdma",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.mm_pixel_rdma,
+            help="Use SMG's RDMA transport for multimodal pixel payloads.",
+        )
+        parser.add_argument(
+            "--mm-rdma-slot-bytes",
+            type=int,
+            default=ServerArgs.mm_rdma_slot_bytes,
+            help="Capacity in bytes of each shared SMG RDMA slot.",
+        )
+        parser.add_argument(
+            "--mm-rdma-landing-slots",
+            type=int,
+            default=ServerArgs.mm_rdma_landing_slots,
+            help="Number of shared SMG RDMA landing slots.",
+        )
+        parser.add_argument(
+            "--mm-rdma-send-metadata",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.mm_rdma_send_metadata,
+            help=(
+                "Control SMG RDMA metadata sends. Omit for automatic behavior; "
+                "use --mm-rdma-send-metadata or --no-mm-rdma-send-metadata "
+                "to force the choice."
+            ),
+        )
+        parser.add_argument(
+            "--mm-rdma-landing-wait-seconds",
+            type=float,
+            default=ServerArgs.mm_rdma_landing_wait_seconds,
+            help="Seconds to wait for an SMG RDMA landing slot.",
+        )
+        parser.add_argument(
+            "--mm-rdma-read-timeout-seconds",
+            type=float,
+            default=ServerArgs.mm_rdma_read_timeout_seconds,
+            help="Seconds to wait for an SMG RDMA payload read.",
         )
         parser.add_argument(
             "--enable-metrics",
@@ -1895,6 +2071,105 @@ class ServerArgs:
             type=int,
             default=ServerArgs.disaggregation_layerwise_interval,
             help="The interval of layerwise transfer for disaggregation. Default is 1.",
+        )
+        parser.add_argument(
+            "--disaggregation-queue-size",
+            type=int,
+            default=ServerArgs.disaggregation_queue_size,
+            help="Number of room-affine PD/EPD transfer queues.",
+        )
+        parser.add_argument(
+            "--disaggregation-thread-pool-size",
+            type=int,
+            default=ServerArgs.disaggregation_thread_pool_size,
+            help=(
+                "Total PD/EPD transfer worker threads. By default the runtime "
+                "derives a bounded value from the available CPU count."
+            ),
+        )
+        parser.add_argument(
+            "--disaggregation-bootstrap-timeout",
+            type=int,
+            default=ServerArgs.disaggregation_bootstrap_timeout,
+            help="Seconds to wait for PD/EPD bootstrap registration.",
+        )
+        parser.add_argument(
+            "--disaggregation-waiting-timeout",
+            type=int,
+            default=ServerArgs.disaggregation_waiting_timeout,
+            help="Seconds to wait for a bootstrapped PD/EPD transfer to finish.",
+        )
+        parser.add_argument(
+            "--disaggregation-failed-session-ttl",
+            type=int,
+            default=ServerArgs.disaggregation_failed_session_ttl,
+            help="Seconds to quarantine a failed PD transfer session; 0 disables quarantine.",
+        )
+        parser.add_argument(
+            "--disaggregation-heartbeat-interval",
+            type=float,
+            default=ServerArgs.disaggregation_heartbeat_interval,
+            help="Seconds between decode-side checks of registered prefill servers.",
+        )
+        parser.add_argument(
+            "--disaggregation-heartbeat-max-failures",
+            type=int,
+            default=ServerArgs.disaggregation_heartbeat_max_failures,
+            help="Consecutive prefill heartbeat failures before requests are failed.",
+        )
+        parser.add_argument(
+            "--pd-layerwise-debug",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.pd_layerwise_debug,
+            help="Enable additional layerwise PD transfer consistency checks.",
+        )
+        parser.add_argument(
+            "--pd-prefill-metadata-wait-log-interval",
+            type=float,
+            default=ServerArgs.pd_prefill_metadata_wait_log_interval,
+            help="Seconds between debug logs while waiting for prefill metadata.",
+        )
+        parser.add_argument(
+            "--epd-encode-ring-slots",
+            type=int,
+            default=ServerArgs.epd_encode_ring_slots,
+            help="Number of pre-registered EPD encode bounce-buffer slots.",
+        )
+        parser.add_argument(
+            "--epd-encode-ring-slot-mb",
+            type=int,
+            default=ServerArgs.epd_encode_ring_slot_mb,
+            help="Capacity in MiB of each EPD encode bounce-buffer slot.",
+        )
+        parser.add_argument(
+            "--epd-encode-embedding-cache-mb",
+            type=int,
+            default=ServerArgs.epd_encode_embedding_cache_mb,
+            help="Per-process EPD encoder embedding-cache VRAM budget in MiB.",
+        )
+        parser.add_argument(
+            "--epd-encode-embedding-cache-dram-mb",
+            type=int,
+            default=ServerArgs.epd_encode_embedding_cache_dram_mb,
+            help="Per-process EPD encoder embedding-cache host budget in MiB.",
+        )
+        parser.add_argument(
+            "--epd-recv-pool-slots",
+            type=int,
+            default=ServerArgs.epd_recv_pool_slots,
+            help="Number of lifetime-registered EPD prefill receive slots; 0 disables the pool.",
+        )
+        parser.add_argument(
+            "--epd-recv-pool-slot-mb",
+            type=int,
+            default=ServerArgs.epd_recv_pool_slot_mb,
+            help="Capacity in MiB of each EPD prefill receive slot.",
+        )
+        parser.add_argument(
+            "--epd-embedding-shard",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.epd_embedding_shard,
+            help="Shard each received image embedding across prefill attention-TP ranks.",
         )
         parser.add_argument(
             "--pdlb-url",

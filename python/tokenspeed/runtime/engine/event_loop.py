@@ -567,6 +567,7 @@ class EventLoop:
                 app_key=server_args.app_key,
                 metrics_reporters=server_args.metrics_reporters,
                 enable_dp_attention=self.has_dp,
+                runtime_config=server_args.disaggregation_config,
             )
             self.kv_transfer = create_kv_transfer(
                 mode=server_args.disaggregation_mode,

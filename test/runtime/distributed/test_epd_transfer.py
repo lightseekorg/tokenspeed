@@ -33,7 +33,9 @@ from tokenspeed.runtime.multimodal.inputs import (
     Modality,
     MultimodalDataItem,
 )
+from tokenspeed.runtime.pd import utils as pd_utils
 from tokenspeed.runtime.pd.base.status import TransferPoll
+from tokenspeed.runtime.pd.config import EpdRuntimeConfig
 from tokenspeed.runtime.pd.epd.embedding_transfer import (
     MooncakeEmbeddingSender,
     shard_payload,
@@ -53,22 +55,30 @@ from tokenspeed.runtime.pd.epd.prefill_receiver import (
     start_embedding_receive,
 )
 
-# Each merged concern keeps its own per-test setup (the shard
-# pointer-math tests need the TOKENSPEED_EPD_RECV_POOL_SLOTS=0 path, the
-# receive tests need a small pool); route by test name.
-_RECV_TESTS = {
-    "test_receive_sizes_buffers_per_item_no_deepstack",
-    "test_receive_allocates_deepstack_columns",
-    "test_receive_skips_already_encoded_item_on_recall",
-}
+_SHARD_CONFIG = EpdRuntimeConfig(recv_pool_slots=0)
+_RECV_CONFIG = EpdRuntimeConfig(recv_pool_slots=4, recv_pool_slot_mb=1)
 
 
 @pytest.fixture(autouse=True)
-def _epd_transfer_env(request, monkeypatch):
-    if request.node.name in _RECV_TESTS:
-        _recv_setup(monkeypatch)
-    else:
-        _shard_setup(monkeypatch)
+def _reset_epd_transfer_state():
+    _shard_setup()
+    _recv_setup()
+
+
+def test_pd_failure_injection_is_explicit(monkeypatch):
+    class _Poller:
+        def poll(self):
+            return TransferPoll.Success
+
+    monkeypatch.setattr(pd_utils.random, "random", lambda: 0.0)
+    monkeypatch.setattr(pd_utils.dist, "all_reduce", lambda *_args, **_kwargs: None)
+
+    assert pd_utils.poll_and_all_reduce([_Poller()], None) == [TransferPoll.Success]
+    assert pd_utils.poll_and_all_reduce([_Poller()], None, failure_probability=1.0) == [
+        TransferPoll.Failed
+    ]
+    with pytest.raises(ValueError, match="failure_probability"):
+        pd_utils.poll_and_all_reduce([_Poller()], None, failure_probability=1.1)
 
 
 # A high device VA to catch any 32-bit truncation / wrong struct format.
@@ -361,7 +371,7 @@ class _ShardReceiver:
         self.pre_alloc_kwargs = kwargs
 
 
-def _shard_setup(monkeypatch):
+def _shard_setup():
     import tokenspeed.runtime.pd.epd.prefill_receiver as er
 
     _ShardReceiver.created.clear()
@@ -369,7 +379,6 @@ def _shard_setup(monkeypatch):
     # compare pre_alloc destinations against item.encoded, which on the pooled
     # path is a post-DONE CLONE at a different address. Pool+shard interplay is
     # covered separately by test_pool_shard_reassembles_into_published_clone.
-    monkeypatch.setenv("TOKENSPEED_EPD_RECV_POOL_SLOTS", "0")
     er._POOLS.clear()
 
 
@@ -401,6 +410,7 @@ def _start(items, shard_rank, shard_size, factory=_ShardReceiver, num_deepstack=
         receiver_factory=factory,
         shard_rank=shard_rank,
         shard_size=shard_size,
+        epd_config=_SHARD_CONFIG,
     )
 
 
@@ -505,15 +515,13 @@ def _epd(item: MultimodalDataItem, *, room: int, host: str, port: int):
     return item
 
 
-def _recv_setup(monkeypatch):
+def _recv_setup():
     import tokenspeed.runtime.pd.epd.prefill_receiver as er
 
     _FakeReceiver.created.clear()
     # Small pool defaults so each test's fresh fake engine doesn't allocate
     # the production 16x256MB region; pools are keyed by engine identity, so
     # clear them (and the lazy-dereg queue) between tests.
-    monkeypatch.setenv("TOKENSPEED_EPD_RECV_POOL_SLOTS", "4")
-    monkeypatch.setenv("TOKENSPEED_EPD_RECV_POOL_SLOT_MB", "1")
     er._POOLS.clear()
     er._pending_dereg.clear()
 
@@ -554,6 +562,7 @@ def test_receive_sizes_buffers_per_item_no_deepstack():
         dtype=torch.bfloat16,
         device="cpu",
         receiver_factory=_FakeReceiver,
+        epd_config=_RECV_CONFIG,
     )
 
     assert items[0].encoded.shape == (6, 2048)
@@ -583,6 +592,7 @@ def test_receive_allocates_deepstack_columns():
         dtype=torch.float32,
         device="cpu",
         receiver_factory=_FakeReceiver,
+        epd_config=_RECV_CONFIG,
     )
 
     assert items[0].encoded.shape == (5, 128)
@@ -606,6 +616,7 @@ def test_receive_skips_already_encoded_item_on_recall():
         dtype=torch.float32,
         device="cpu",
         receiver_factory=_FakeReceiver,
+        epd_config=_RECV_CONFIG,
     )
 
     receive_encoded_embeddings([item], **common)

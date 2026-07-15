@@ -31,6 +31,11 @@ def test_clean_environment_allows_vendor_and_packaging_plumbing(tmp_path: Path) 
         "NVIDIA_TF32_OVERRIDE",
         "TORCH_ALLOW_TF32_CUBLAS_OVERRIDE",
         "FLASHINFER_WORKSPACE_SIZE",
+        "TORCHINDUCTOR_ENABLE_PDL",
+        "TRTLLM_ENABLE_PDL",
+        "TLLM_LOG_LEVEL",
+        "SINGLE_WORKER_ID",
+        "REQUEST_TIMEOUT",
     ],
 )
 def test_exact_forbidden_key_fails_even_when_empty(tmp_path: Path, key: str) -> None:
@@ -49,6 +54,12 @@ def test_exact_forbidden_key_fails_even_when_empty(tmp_path: Path, key: str) -> 
         "TOKENSPEED_KERNEL_CAPTURE_SHAPES_OUTPUT",
         "TOKENSPEED_EPD_ENCODE_RING_SLOTS",
         "TOKENSPEED_FUTURE_UNLISTED_TOGGLE",
+        "SMG_MM_PIXEL_RDMA",
+        "SMG_FUTURE_UNLISTED_TOGGLE",
+        "EPD_PIXEL_SHM",
+        "EPD_FUTURE_UNLISTED_TOGGLE",
+        "TS_DSA_DECODE_TOPK_CUTEDSL",
+        "TS_FUTURE_UNLISTED_TOGGLE",
     ],
 )
 def test_forbidden_prefix_key_fails(tmp_path: Path, key: str) -> None:

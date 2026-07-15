@@ -468,6 +468,223 @@ print(server_args.mapping.attn.tp_size, server_args.mapping.attn.cp_size)
             17,
         )
 
+    def test_disaggregation_runtime_config_is_explicit_cli_state(self):
+        args = self._parse_args(
+            [
+                "--model",
+                "test/model",
+                "--disaggregation-queue-size",
+                "6",
+                "--disaggregation-thread-pool-size",
+                "12",
+                "--disaggregation-bootstrap-timeout",
+                "45",
+                "--disaggregation-waiting-timeout",
+                "90",
+                "--disaggregation-failed-session-ttl",
+                "12",
+                "--disaggregation-heartbeat-interval",
+                "7.5",
+                "--disaggregation-heartbeat-max-failures",
+                "4",
+                "--pd-layerwise-debug",
+                "--pd-prefill-metadata-wait-log-interval",
+                "2.5",
+                "--epd-encode-ring-slots",
+                "8",
+                "--epd-encode-ring-slot-mb",
+                "32",
+                "--epd-encode-embedding-cache-mb",
+                "128",
+                "--epd-encode-embedding-cache-dram-mb",
+                "256",
+                "--epd-recv-pool-slots",
+                "4",
+                "--epd-recv-pool-slot-mb",
+                "16",
+                "--no-epd-embedding-shard",
+            ]
+        )
+        sa = self._from_cli_args_no_init(args)
+        config = sa.disaggregation_config
+
+        self.assertEqual(config.queue_size, 6)
+        self.assertEqual(config.thread_pool_size, 12)
+        self.assertEqual(config.bootstrap_timeout_s, 45)
+        self.assertEqual(config.waiting_timeout_s, 90)
+        self.assertEqual(config.failed_session_ttl_s, 12)
+        self.assertEqual(config.heartbeat_interval_s, 7.5)
+        self.assertEqual(config.heartbeat_max_failures, 4)
+        self.assertTrue(config.layerwise_debug)
+        self.assertEqual(config.prefill_metadata_wait_log_interval_s, 2.5)
+        self.assertEqual(config.epd.encode_ring_slots, 8)
+        self.assertEqual(config.epd.encode_ring_slot_mb, 32)
+        self.assertEqual(config.epd.encode_embedding_cache_mb, 128)
+        self.assertEqual(config.epd.encode_embedding_cache_dram_mb, 256)
+        self.assertEqual(config.epd.recv_pool_slots, 4)
+        self.assertEqual(config.epd.recv_pool_slot_mb, 16)
+        self.assertFalse(config.epd.embedding_shard)
+
+    def test_disaggregation_runtime_config_rejects_invalid_values(self):
+        args = self._parse_args(
+            [
+                "--model",
+                "test/model",
+                "--disaggregation-queue-size",
+                "8",
+                "--disaggregation-thread-pool-size",
+                "4",
+            ]
+        )
+        sa = self._from_cli_args_no_init(args)
+        with self.assertRaisesRegex(ValueError, "thread_pool_size"):
+            _ = sa.disaggregation_config
+
+        invalid_arguments = (
+            (["--disaggregation-failed-session-ttl", "-1"], "failed_session_ttl"),
+            (["--disaggregation-heartbeat-interval", "1.5"], "heartbeat_interval"),
+            (
+                ["--disaggregation-heartbeat-max-failures", "0"],
+                "heartbeat_max_failures",
+            ),
+            (
+                ["--pd-prefill-metadata-wait-log-interval", "0"],
+                "prefill_metadata_wait_log_interval",
+            ),
+        )
+        for invalid_argv, expected_error in invalid_arguments:
+            with self.subTest(arguments=invalid_argv):
+                args = self._parse_args(["--model", "test/model", *invalid_argv])
+                sa = self._from_cli_args_no_init(args)
+                with self.assertRaisesRegex(ValueError, expected_error):
+                    _ = sa.disaggregation_config
+
+    def test_legacy_disaggregation_environment_is_not_configuration(self):
+        legacy_environment = {
+            "TOKENSPEED_DISAGGREGATION_QUEUE_SIZE": "99",
+            "TOKENSPEED_DISAGGREGATION_THREAD_POOL_SIZE": "99",
+            "TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "99",
+            "TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT": "99",
+            "TOKENSPEED_DISAGGREGATION_FAILED_SESSION_TTL": "99",
+            "TOKENSPEED_DISAGGREGATION_HEARTBEAT_INTERVAL": "99",
+            "TOKENSPEED_DISAGGREGATION_HEARTBEAT_MAX_FAILURE": "99",
+            "TOKENSPEED_PD_LAYERWISE_DEBUG": "1",
+            "TOKENSPEED_PD_PREFILL_METADATA_TIMEOUT": "99",
+            "TOKENSPEED_EPD_ENCODE_RING_SLOTS": "99",
+            "TOKENSPEED_EPD_ENCODE_RING_SLOT_MB": "99",
+            "TOKENSPEED_EPD_ENCODE_EMBED_CACHE_MB": "99",
+            "TOKENSPEED_EPD_ENCODE_EMBED_CACHE_DRAM_MB": "99",
+            "TOKENSPEED_EPD_RECV_POOL_SLOTS": "99",
+            "TOKENSPEED_EPD_RECV_POOL_SLOT_MB": "99",
+            "TOKENSPEED_EPD_EMBEDDING_SHARD": "0",
+        }
+        with patch.dict(os.environ, legacy_environment):
+            args = self._parse_args(["--model", "test/model"])
+            config = self._from_cli_args_no_init(args).disaggregation_config
+
+        self.assertEqual(config.queue_size, 4)
+        self.assertIsNone(config.thread_pool_size)
+        self.assertEqual(config.bootstrap_timeout_s, 120)
+        self.assertEqual(config.waiting_timeout_s, 300)
+        self.assertEqual(config.failed_session_ttl_s, 30)
+        self.assertEqual(config.heartbeat_interval_s, 5.0)
+        self.assertEqual(config.heartbeat_max_failures, 2)
+        self.assertFalse(config.layerwise_debug)
+        self.assertEqual(config.prefill_metadata_wait_log_interval_s, 5.0)
+        self.assertEqual(config.epd.encode_ring_slots, 64)
+        self.assertEqual(config.epd.encode_ring_slot_mb, 256)
+        self.assertEqual(config.epd.encode_embedding_cache_mb, 4096)
+        self.assertEqual(config.epd.encode_embedding_cache_dram_mb, 0)
+        self.assertEqual(config.epd.recv_pool_slots, 16)
+        self.assertEqual(config.epd.recv_pool_slot_mb, 256)
+        self.assertTrue(config.epd.embedding_shard)
+
+    def test_smg_runtime_config_is_explicit_cli_state(self):
+        args = self._parse_args(
+            [
+                "--model",
+                "test/model",
+                "--grpc-max-message-bytes",
+                "1048576",
+                "--skip-grpc-warmup",
+                "--health-check-timeout",
+                "7.5",
+                "--log-mm-tensor-data",
+                "--enable-log-mm-timing",
+                "--no-unlink-mm-shm-after-read",
+                "--no-epd-pixel-shm",
+                "--no-epd-ingest-offloop",
+                "--mm-pixel-rdma",
+                "--mm-rdma-slot-bytes",
+                "4096",
+                "--mm-rdma-landing-slots",
+                "3",
+                "--no-mm-rdma-send-metadata",
+                "--mm-rdma-landing-wait-seconds",
+                "4.5",
+                "--mm-rdma-read-timeout-seconds",
+                "2.5",
+            ]
+        )
+        sa = self._from_cli_args_no_init(args)
+
+        self.assertEqual(sa.grpc_max_message_bytes, 1048576)
+        self.assertTrue(sa.skip_grpc_warmup)
+        self.assertEqual(sa.health_check_timeout, 7.5)
+        self.assertTrue(sa.log_mm_tensor_data)
+        self.assertTrue(sa.enable_log_mm_timing)
+        self.assertFalse(sa.unlink_mm_shm_after_read)
+        self.assertFalse(sa.epd_pixel_shm)
+        self.assertFalse(sa.epd_ingest_offloop)
+        self.assertTrue(sa.mm_pixel_rdma)
+        self.assertEqual(sa.mm_rdma_slot_bytes, 4096)
+        self.assertEqual(sa.mm_rdma_landing_slots, 3)
+        self.assertFalse(sa.mm_rdma_send_metadata)
+        self.assertEqual(sa.mm_rdma_landing_wait_seconds, 4.5)
+        self.assertEqual(sa.mm_rdma_read_timeout_seconds, 2.5)
+
+        automatic = self._from_cli_args_no_init(
+            self._parse_args(["--model", "test/model"])
+        )
+        forced = self._from_cli_args_no_init(
+            self._parse_args(["--model", "test/model", "--mm-rdma-send-metadata"])
+        )
+        self.assertIsNone(automatic.mm_rdma_send_metadata)
+        self.assertTrue(forced.mm_rdma_send_metadata)
+
+    def test_smg_runtime_config_validation(self):
+        args = self._parse_args(["--model", "test/model"])
+        sa = self._from_cli_args_no_init(args)
+        sa.mapping = SimpleNamespace(
+            attn=SimpleNamespace(dp_size=1),
+            has_attn_cp=False,
+            has_attn_dp=False,
+        )
+        sa.grpc_max_message_bytes = 0
+        with self.assertRaisesRegex(ValueError, "grpc_max_message_bytes"):
+            sa.validate()
+
+        sa.grpc_max_message_bytes = 1
+        for invalid_timeout in (0, float("nan")):
+            with self.subTest(health_check_timeout=invalid_timeout):
+                sa.health_check_timeout = invalid_timeout
+                with self.assertRaisesRegex(ValueError, "health_check_timeout"):
+                    sa.validate()
+
+        sa.health_check_timeout = 1
+        for field in (
+            "mm_rdma_slot_bytes",
+            "mm_rdma_landing_slots",
+            "mm_rdma_landing_wait_seconds",
+            "mm_rdma_read_timeout_seconds",
+        ):
+            with self.subTest(field=field):
+                original = getattr(sa, field)
+                setattr(sa, field, 0)
+                with self.assertRaisesRegex(ValueError, field):
+                    sa.validate()
+                setattr(sa, field, original)
+
     def test_tokenizer_mode_deepseek_v4_arg(self):
         args = self._parse_args(
             ["--model", "test/model", "--tokenizer-mode", "deepseek_v4"]

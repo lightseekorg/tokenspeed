@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "model": "MiniMaxAI/MiniMax-M3-MXFP8",
+  "revision": "c5454eb03678d8710e54a4e0fc681b9f3b4a3dba",
+  "fixture": {
+    "name": "dog.jpg",
+    "sha256": "e1cd91db28149f21f3c410ffa074d0fb8bc8950740ba140c7eaae130f0493464"
+  },
+  "prompt": "What animal is in this image? Reply with one word.",
+  "input_contract": {
+    "input_ids": [1, 254],
+    "pixel_values": [308, 1176],
+    "image_grid_thw": [[1, 14, 22]],
+    "merged_image_tokens": 77
+  },
+  "reference_logits": {
+    "top_tokens": ["Dog"],
+    "top_logprobs": [-0.001004667836241424]
+  }
+}
