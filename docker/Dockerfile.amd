@@ -1,0 +1,40 @@
+FROM lightseekorg/tokenspeed-runner-amd:rocm7.2.4-pytorch-2.11.0-gfx950
+
+USER root
+
+ARG MAX_JOBS=16
+
+ENV PIP_BREAK_SYSTEM_PACKAGES=1 \
+    PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/rocm7.2
+
+WORKDIR /workspace
+
+# Match the ROCm CI dependencies. libnuma1 is also needed at runtime by
+# torch_memory_saver, a TokenSpeed dependency.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        openmpi-bin \
+        libopenmpi-dev \
+        libssl-dev \
+        libnuma1 \
+        pkg-config && \
+    rm -rf /var/lib/apt/lists/*
+
+# Native builds use the environment's setuptools because build isolation is
+# disabled. Keep it below 82, as required by the ROCm installation path.
+RUN python3 -m pip install --upgrade pip "setuptools<82" wheel && \
+    python3 -m pip install cmake ninja
+
+COPY . /workspace
+
+# Install every TokenSpeed package from this checkout. tokenspeed-kernel-amd
+# must be present before tokenspeed-kernel resolves its ROCm requirements.
+RUN MAX_JOBS=${MAX_JOBS} \
+    python3 -m pip install --force-reinstall --no-deps \
+        ./tokenspeed-kernel-amd --no-build-isolation && \
+    MAX_JOBS=${MAX_JOBS} \
+    TOKENSPEED_KERNEL_BACKEND=rocm \
+    python3 -m pip install tokenspeed-kernel/python/ --no-build-isolation && \
+    python3 -m pip install tokenspeed-scheduler/ && \
+    python3 -m pip install ./python --no-build-isolation
+
+CMD ["/bin/bash"]
