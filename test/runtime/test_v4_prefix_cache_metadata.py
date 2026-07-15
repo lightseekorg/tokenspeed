@@ -50,7 +50,7 @@ pytestmark = pytest.mark.skipif(
 
 def _make_two_group_config() -> "SchedulerConfig":
     cfg = SchedulerConfig()
-    cfg.page_size = 2
+    cfg.block_size = 2
     cfg.num_device_pages = 64
     cfg.num_host_pages = 64
     cfg.max_scheduled_tokens = 16

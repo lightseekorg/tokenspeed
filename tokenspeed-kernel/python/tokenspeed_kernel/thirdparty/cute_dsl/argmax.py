@@ -128,7 +128,7 @@ def store_shared_remote(
 
 @cute.jit
 def predicate_k(tAcA: cute.Tensor, limit: cutlass.Int32) -> cute.Tensor:
-    tApA = cute.make_fragment(
+    tApA = cute.make_rmem_tensor(
         cute.make_layout(
             (
                 cute.size(tAcA, mode=[0, 1]),

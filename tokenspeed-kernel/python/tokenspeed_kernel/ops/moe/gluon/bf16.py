@@ -57,10 +57,10 @@ if platform.is_amd:
             "supports_deferred_finalize": frozenset({False}),
             "supports_ep": frozenset({False}),
             "supports_all_to_all_ep": frozenset({False}),
-            # warp-decode stage 2 tiles the I_r reduction at BLOCK_K=256 and the
-            # warp path is auto-on for small M, so I_r (intermediate-size-per-
-            # partition) must be a multiple of 256; other ispp falls back.
-            "ispp_alignment": frozenset({256}),
+            # Stage 1 prefill tiles I_r at BLOCK_N=128. The optional warp-decode
+            # shortcut still needs I_r % 256 == 0 and is gated inside the AMD
+            # entry point.
+            "ispp_alignment": frozenset({128}),
             "internal_activation_dtype": frozenset({"input"}),
             "supports_bias": frozenset({False}),
         },

@@ -41,7 +41,7 @@ inline std::int32_t FindRequestIndex(const FlatForwardOperation* fwd, const std:
 
 // SetupHostCache creates a host-only cache entry for tokens [1,2,3,4] (2 pages).
 //
-// Config: page_size=2, decode_input_tokens=0, device_total=5 (4 usable), host_total=32.
+// Config: block_size=2, decode_input_tokens=0, device_total=5 (4 usable), host_total=32.
 //
 // Steps:
 //   r1 (2 pages, tokens [1,2,3,4]):
@@ -159,7 +159,7 @@ TEST_F(LoadBackTestSuite, LoadBack_PrefillInputLengthReduced) {
     ASSERT_NE(fwd, nullptr);
     std::int32_t idx = FindRequestIndex(fwd, "r2");
     ASSERT_GE(idx, 0);
-    // With page_size=2 and 4 prefill tokens, GetFullPagedTokens(except_last=true)
+    // With block_size=2 and 4 prefill tokens, GetFullPagedTokens(except_last=true)
     // yields 3 tokens → 1 matchable page [[1,2]].  The host cache has 2 pages
     // (inserted at FinishEvent time with 5 tokens → 2 full pages), but only 1 matches.
     // unscheduled = PrefillSize(4) - max(0,1)*2 = 2, so input_length = 2.

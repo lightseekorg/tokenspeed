@@ -133,6 +133,17 @@ class ServerArgs:
     enable_cache_report: bool = False
     kv_events_config: str | None = None
 
+    # RL online weight sync (always on / ungated). NOTE: these endpoints can
+    # overwrite model weights, reload checkpoints from disk, and pause/abort
+    # serving, and are exposed on the public control port. See
+    # runtime/engine/weight_transfer/ and runtime/entrypoints/vllm_compat_http.py.
+    weight_transfer_config: str | None = None
+    # Port for the in-engine RL control-plane HTTP app (weight sync + pause/resume
+    # + memory occupation, both the native and SGLang-compatible dialects). Set by
+    # the ``ts serve`` orchestrator (allocated + proxied by the sidecar); None
+    # disables the in-engine app.
+    rl_control_port: int | None = None
+
     # Data parallelism
     data_parallel_size: int | None = None
     load_balance_method: str = "shortest_queue"
@@ -245,8 +256,8 @@ class ServerArgs:
     low_latency_max_num_tokens_per_gpu: int = 256
     max_cudagraph_capture_size: int | None = None
     disable_prefill_graph: bool | None = False
-    # Breakable prefill CUDA graph, opt-in: > 0 enables and caps the largest bucket.
-    prefill_graph_max_tokens: int | None = 0
+    # Breakable prefill graph bucket cap: None = auto min(2048, chunk); 0 disables.
+    prefill_graph_max_tokens: int | None = None
     # Explicit prefill bucket list; unset = the relative-stride ladder (see get_prefill_token_buckets).
     prefill_graph_capture_sizes: list[int] | None = None
     cudagraph_capture_sizes: list[int] | None = None
@@ -1610,8 +1621,9 @@ class ServerArgs:
             "--prefill-graph-max-tokens",
             type=int,
             default=ServerArgs.prefill_graph_max_tokens,
-            help="Enable the breakable prefill CUDA graph and cap the largest "
-            "captured token bucket. 0 (default) disables it (opt-in).",
+            help="Largest token bucket captured by the breakable prefill CUDA "
+            "graph. Default (unset) = min(2048, chunked-prefill size); "
+            "0 disables.",
         )
         parser.add_argument(
             "--prefill-graph-capture-sizes",
@@ -1835,6 +1847,23 @@ class ServerArgs:
             help="The URL of the PD disaggregation load balancer. If set, the prefill/decode server will register with the load balancer.",
         )
 
+        # RL online weight sync (always on / ungated).
+        parser.add_argument(
+            "--weight-transfer-config",
+            type=str,
+            default=ServerArgs.weight_transfer_config,
+            help='JSON config for weight transfer, e.g. \'{"backend":"nccl"}\'. '
+            "Backend is one of 'nccl' (disaggregated) or 'ipc' (colocated).",
+        )
+        parser.add_argument(
+            "--rl-control-port",
+            type=int,
+            default=ServerArgs.rl_control_port,
+            help="Port for the in-engine RL control-plane HTTP app (weight sync, "
+            "pause/resume, memory occupation). Normally allocated automatically "
+            "by the `ts serve` orchestrator.",
+        )
+
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
         args.ep_size = args.expert_parallel_size
@@ -1876,6 +1905,14 @@ class ServerArgs:
         if is_valid_ipv6_address(self.host):
             return f"http://[{self.host}]:{self.port}"
         return f"http://{self.host}:{self.port}"
+
+    def get_weight_transfer_config(self):
+        """Parse ``--weight-transfer-config`` JSON into a ``WeightTransferConfig``."""
+        from tokenspeed.runtime.engine.weight_transfer.config import (
+            WeightTransferConfig,
+        )
+
+        return WeightTransferConfig.from_json(self.weight_transfer_config)
 
 
 def prepare_server_args(argv: list[str]) -> ServerArgs:

@@ -36,7 +36,7 @@ protected:
     // Subclasses can override this to customize the config.
     virtual SchedulerConfig MakeConfig() {
         SchedulerConfig cfg{};
-        cfg.page_size = 2;
+        cfg.block_size = 2;
         cfg.device_allocator.total_pages = 32;
         cfg.host_allocator.total_pages = 32;
         cfg.max_scheduled_tokens = 64;
@@ -52,7 +52,7 @@ protected:
     }
 
     const SchedulerConfig& Config() const { return config_; }
-    std::int32_t PageSize() const { return config_.page_size; }
+    std::int32_t PageSize() const { return config_.block_size; }
     RequestSpec MakeRequestSpec(const std::string& id, std::int32_t num_pages, token_t start = 1) {
         auto tokens = MakeAlignedTokens(num_pages, PageSize(), start);
         return RequestSpec{
@@ -107,6 +107,15 @@ protected:
     void SendWriteBackDone(cache_op_id op_id, bool success = true) {
         ExecutionEvent event;
         event.With(CacheEvent{cache::WriteBackDone{
+            .op_id = op_id,
+            .success = success,
+        }});
+        scheduler_->Advance(std::move(event));
+    }
+
+    void SendLoadBackDone(cache_op_id op_id, bool success = true) {
+        ExecutionEvent event;
+        event.With(CacheEvent{cache::LoadBackDone{
             .op_id = op_id,
             .success = success,
         }});

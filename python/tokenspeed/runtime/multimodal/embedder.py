@@ -18,14 +18,14 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""VisionEmbedder: assemble LM input embeddings with vision tokens spliced in.
+"""Assemble LM input embeddings with multimodal encoder tokens spliced in.
 
 Three sequential phases:
 
   1. ``_plan`` walks the active multimodal inputs in the current forward
      batch and emits an :class:`EncodePlan` listing (a) the unique items
      that still need to be encoded this iteration and (b) every flat
-     position in ``input_ids`` that should be filled from a vision token,
+     position in ``input_ids`` that should be filled from an encoder token,
      along with the source range inside the owning item's encoded tensor.
 
   2. ``_encode`` invokes the model-supplied encoder once per modality with
@@ -34,7 +34,7 @@ Three sequential phases:
      ``item.encoded_deepstack``).
 
   3. ``_assemble`` runs the text-token embedding lookup and slices the
-     vision-token ranges into the right positions using the plan's
+     encoder-token ranges into the right positions using the plan's
      :class:`ScatterRange` records.
 
 Per-item encoded tensors live on the :class:`MultimodalDataItem` itself,
@@ -44,10 +44,10 @@ released by GC. Across chunked-prefill iterations of the same request the
 item is identical Python object, so the second chunk sees ``item.encoded``
 already set and skips re-encoding.
 
-Within a single forward batch we still de-duplicate by ``item.hash``: if
-two requests reference the same image content, only the first item is
-fed to the encoder; the second request's scatter ranges read from the
-first item's ``encoded`` tensor.
+Within a single forward batch we still de-duplicate by modality and
+``item.hash``: if two requests reference the same media content using
+the same modality, only the first item is fed to the encoder; the second
+request's scatter ranges read from the first item's ``encoded`` tensor.
 """
 
 from __future__ import annotations
@@ -129,7 +129,7 @@ def pad_input_tokens(input_ids: list[int], mm_inputs: MultimodalInputs) -> list[
 
 @dataclass(frozen=True)
 class ScatterRange:
-    """One contiguous range to fill with vision tokens.
+    """One contiguous range to fill with multimodal encoder tokens.
 
     ``flat_dst_*`` are positions in the batch-flat ``input_ids`` tensor
     (inclusive on both ends). ``item_src_*`` are positions within
@@ -150,8 +150,8 @@ class EncodePlan:
     """Work to do this prefill iteration.
 
     ``misses_by_modality`` lists the canonical items the encoder needs to
-    process; each unique content hash appears at most once.
-    ``scatter_ranges`` describes every place a vision token must land.
+    process; each modality/content-hash pair appears at most once.
+    ``scatter_ranges`` describes every place an encoder token must land.
     """
 
     misses_by_modality: dict[Modality, list[MultimodalDataItem]] = field(
@@ -175,12 +175,12 @@ def _item_token_count(item: MultimodalDataItem) -> int:
 
 
 # ---------------------------------------------------------------------------
-# VisionEmbedder
+# MultimodalEmbedder
 # ---------------------------------------------------------------------------
 
 
-class VisionEmbedder:
-    """Vision-aware input embedding pipeline for one model executor."""
+class MultimodalEmbedder:
+    """Multimodal input embedding pipeline for one model executor."""
 
     def __init__(self) -> None:
         self._h2d_stream: torch.cuda.Stream | None = None
@@ -196,7 +196,7 @@ class VisionEmbedder:
         multimodal_model: nn.Module,
         is_decode_or_idle: bool = False,
     ) -> tuple[torch.Tensor | None, dict[str, Any]]:
-        """Compose LM input embeddings with vision tokens scattered in.
+        """Compose LM input embeddings with encoder tokens scattered in.
 
         Returns ``(None, {})`` when there is nothing multimodal to do this
         forward (decode iteration, or no active multimodal inputs). The
@@ -243,7 +243,7 @@ class VisionEmbedder:
         )
 
         cleanup_started = time.perf_counter() if LOG_MM_TIMING else None
-        released_encoded_features = self._drop_encoded_pixel_features(ctx)
+        released_encoded_features = self._drop_encoded_features(ctx)
         cleanup_elapsed_ms = (
             (time.perf_counter() - cleanup_started) * 1000
             if cleanup_started is not None
@@ -256,7 +256,7 @@ class VisionEmbedder:
                 if items
             }
             logger.info(
-                "mm_timing vision_embedder_apply_ms total=%.3f plan=%.3f "
+                "mm_timing multimodal_embedder_apply_ms total=%.3f plan=%.3f "
                 "encode=%.3f alias=%.3f assemble=%.3f feature_cleanup=%.3f "
                 "scatter_ranges=%d misses=%s input_rows=%d aliases=%d "
                 "released_alias_features=%d released_encoded_features=%d",
@@ -282,9 +282,9 @@ class VisionEmbedder:
         if not ctx.mm_inputs:
             return plan
 
-        # Within-batch dedup: first item per content hash is canonical;
-        # duplicates reuse its encoded tensor.
-        canonical_by_hash: dict[int, MultimodalDataItem] = {}
+        # Within-batch dedup: first item per modality and content hash is
+        # canonical; duplicates reuse its encoded tensor.
+        canonical_by_key: dict[tuple[Modality, int], MultimodalDataItem] = {}
         scheduled: set[MultimodalDataItem] = set()
 
         # Walk the FULL batch (including text-only / decode requests)
@@ -312,12 +312,15 @@ class VisionEmbedder:
 
                 if item.encoded is not None:
                     canonical = item
-                elif item.hash is not None and item.hash in canonical_by_hash:
-                    canonical = canonical_by_hash[item.hash]
+                elif (
+                    item.hash is not None
+                    and (item.modality, item.hash) in canonical_by_key
+                ):
+                    canonical = canonical_by_key[(item.modality, item.hash)]
                 else:
                     canonical = item
                     if item.hash is not None:
-                        canonical_by_hash[item.hash] = item
+                        canonical_by_key[(item.modality, item.hash)] = item
 
                 if canonical is not item:
                     plan.aliases_by_canonical[canonical].append(item)
@@ -365,11 +368,11 @@ class VisionEmbedder:
             spec = encoders.get(modality)
             if spec is None:
                 raise RuntimeError(
-                    f"VisionEmbedder: no encoder registered for {modality}"
+                    f"MultimodalEmbedder: no encoder registered for {modality}"
                 )
 
             move_started = time.perf_counter() if LOG_MM_TIMING else None
-            self._move_pixel_features_to_device(items, device)
+            self._move_features_to_device(items, device)
             move_elapsed_ms = (
                 (time.perf_counter() - move_started) * 1000
                 if move_started is not None
@@ -441,7 +444,10 @@ class VisionEmbedder:
 
         kwargs: dict[str, Any] = {}
         deepstack_buffer: torch.Tensor | None = None
-        if any(spec.deepstack for spec in encoders.values()):
+        deepstack_modalities = {
+            modality for modality, spec in encoders.items() if spec.deepstack
+        }
+        if any(r.item.modality in deepstack_modalities for r in plan.scatter_ranges):
             num_deepstack = len(multimodal_model.deepstack_visual_indexes)
             shape = input_embeds.shape[:-1] + (input_embeds.shape[-1] * num_deepstack,)
             deepstack_buffer = torch.zeros(
@@ -453,7 +459,7 @@ class VisionEmbedder:
             main = r.item.encoded
             if main is None:
                 raise RuntimeError(
-                    "VisionEmbedder: item scheduled for encode has no "
+                    "MultimodalEmbedder: item scheduled for encode has no "
                     "encoded tensor after _encode; this is a bug"
                 )
             src = main[r.item_src_start : r.item_src_end + 1]
@@ -478,10 +484,10 @@ class VisionEmbedder:
             self._h2d_stream = torch.cuda.Stream(device=device)
         return self._h2d_stream
 
-    def _move_pixel_features_to_device(
+    def _move_features_to_device(
         self, items: list[MultimodalDataItem], device: torch.device
     ) -> None:
-        """Stage pixel features onto ``device`` on a dedicated H2D stream.
+        """Stage encoder features onto ``device`` on a dedicated H2D stream.
 
         Inputs that originate from the SHM transport are pinned, so the
         H2D copy can actually run async with respect to the LM kernels
@@ -526,12 +532,16 @@ class VisionEmbedder:
         return True
 
     @staticmethod
-    def _drop_encoded_pixel_features(ctx: MultimodalForwardContext) -> int:
+    def _drop_encoded_features(ctx: MultimodalForwardContext) -> int:
         released = 0
         for mm in ctx.mm_inputs:
             if mm is None:
                 continue
             for it in mm.mm_items:
-                if it.encoded is not None and VisionEmbedder._drop_raw_feature(it):
+                if it.encoded is not None and MultimodalEmbedder._drop_raw_feature(it):
                     released += 1
         return released
+
+
+# Compatibility alias for model implementations that predate audio support.
+VisionEmbedder = MultimodalEmbedder

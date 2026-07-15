@@ -61,6 +61,7 @@ from tokenspeed.runtime.engine.data_parallel_controller import (
 )
 from tokenspeed.runtime.engine.event_loop import run_event_loop
 from tokenspeed.runtime.engine.io_struct import (
+    DestroyWeightsUpdateGroupReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -342,6 +343,14 @@ class Engine(EngineBase):
         )
         return self.llm.run(self.tokenizer_manager.init_weights_update_group(obj))
 
+    def destroy_weights_update_group(
+        self,
+        group_name: str = "weight_update_group",
+    ):
+        """Destroy the parameter update group."""
+        obj = DestroyWeightsUpdateGroupReqInput(group_name=group_name)
+        return self.llm.run(self.tokenizer_manager.destroy_weights_update_group(obj))
+
     def update_weights_from_distributed(
         self,
         names: list[str],
@@ -353,7 +362,7 @@ class Engine(EngineBase):
         """Update weights from distributed source."""
         obj = UpdateWeightsFromDistributedReqInput(
             names=names,
-            dtypes=dtypes,
+            dtype_names=dtypes,
             shapes=shapes,
             group_name=group_name,
             flush_cache=flush_cache,

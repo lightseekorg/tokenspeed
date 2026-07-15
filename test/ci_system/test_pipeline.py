@@ -13,6 +13,7 @@ from pipeline import (
     extract_perf_summary_rows,
     format_perf_reference_markdown_table,
     format_perf_reference_table,
+    get_excluded_runner_labels,
     get_runner_specific_env,
     is_amd_runner,
     is_gb200_runner,
@@ -121,6 +122,17 @@ def test_runner_specific_env_prefers_exact_label(monkeypatch):
     }
 
     assert get_runner_specific_env(task, "b200v2-2gpu") == {"MODEL": "exact"}
+
+
+def test_excluded_runner_labels_parse_comma_separated_terms(monkeypatch):
+    monkeypatch.setenv("TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS", " B300, mi355, ,")
+    assert get_excluded_runner_labels() == ["b300", "mi355"]
+
+    monkeypatch.setenv("TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS", " , , ")
+    assert get_excluded_runner_labels() == []
+
+    monkeypatch.delenv("TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS")
+    assert get_excluded_runner_labels() == []
 
 
 def test_extract_evalscope_score_from_pipe_table():
@@ -395,6 +407,61 @@ def test_validate_task_rejects_unknown_priority(tmp_path):
         validate_task(_yaml.safe_load(path.read_text()), path)
 
 
+def test_validate_task_accepts_boolean_optional(tmp_path):
+    body = _default_body("ut-a", ["b300-1gpu"], extra="optional: true\n")
+    path = _write_task_yaml(tmp_path, "optional.yaml", body)
+    import yaml as _yaml
+
+    validate_task(_yaml.safe_load(path.read_text()), path)
+
+
+def test_validate_task_rejects_non_boolean_optional(tmp_path):
+    body = _default_body("ut-a", ["b300-1gpu"], extra="optional: flaky\n")
+    path = _write_task_yaml(tmp_path, "bad-optional.yaml", body)
+    import yaml as _yaml
+
+    with pytest.raises(ValueError, match=r"optional must be a boolean"):
+        validate_task(_yaml.safe_load(path.read_text()), path)
+
+
+def test_validate_task_accepts_per_label_optional_dict(tmp_path):
+    body = _default_body(
+        "ut-a",
+        ["b300-1gpu", "h100-1gpu"],
+        extra="optional:\n  b300-1gpu: true\n",
+    )
+    path = _write_task_yaml(tmp_path, "per-label-optional.yaml", body)
+    import yaml as _yaml
+
+    validate_task(_yaml.safe_load(path.read_text()), path)
+
+
+def test_validate_task_rejects_per_label_optional_with_unknown_label(tmp_path):
+    body = _default_body(
+        "ut-a",
+        ["b300-1gpu"],
+        extra="optional:\n  h100-1gpu: true\n",
+    )
+    path = _write_task_yaml(tmp_path, "unknown-optional.yaml", body)
+    import yaml as _yaml
+
+    with pytest.raises(ValueError, match=r"optional contains unknown labels"):
+        validate_task(_yaml.safe_load(path.read_text()), path)
+
+
+def test_validate_task_rejects_per_label_optional_with_non_boolean_value(tmp_path):
+    body = _default_body(
+        "ut-a",
+        ["b300-1gpu"],
+        extra="optional:\n  b300-1gpu: flaky\n",
+    )
+    path = _write_task_yaml(tmp_path, "bad-optional-value.yaml", body)
+    import yaml as _yaml
+
+    with pytest.raises(ValueError, match=r"optional values must be booleans"):
+        validate_task(_yaml.safe_load(path.read_text()), path)
+
+
 def test_build_matrix_default_priority_preserves_existing_order(tmp_path):
     # Two tasks; both omit `priority`. Order must match the existing
     # behaviour: alphabetical by file path, then label order from the yaml.
@@ -415,6 +482,79 @@ def test_build_matrix_default_priority_preserves_existing_order(tmp_path):
         ("ut-b", "b200-1gpu"),
     ]
     assert all(e["priority"] == "normal" for e in matrix["include"])
+    assert all(e["optional"] is False for e in matrix["include"])
+
+
+def test_build_matrix_excludes_runner_label_substrings_case_insensitively(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS", " B300, mi355, ,")
+    _write_task_yaml(
+        tmp_path,
+        "mixed.yaml",
+        _default_body(
+            "mixed",
+            [
+                "b300-1gpu",
+                "gb300-4gpu",
+                "amd-mi355-1gpu-bench",
+                "h100-1gpu",
+            ],
+        ),
+    )
+
+    matrix = build_matrix(tmp_path, tmp_path, trigger="per-commit")
+
+    assert [entry["runner"] for entry in matrix["include"]] == ["h100-1gpu"]
+
+
+def test_build_matrix_excludes_resolved_runner_label(monkeypatch, tmp_path):
+    monkeypatch.setenv("TOKENSPEED_B200_RUNNER_LABEL", "blackwell")
+    monkeypatch.setenv("TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS", "blackwell")
+    _write_task_yaml(
+        tmp_path,
+        "mixed.yaml",
+        _default_body("mixed", ["b200-1gpu", "h100-1gpu"]),
+    )
+
+    matrix = build_matrix(tmp_path, tmp_path, trigger="per-commit")
+
+    assert [entry["runner"] for entry in matrix["include"]] == ["h100-1gpu"]
+
+
+def test_build_matrix_empty_exclusion_restores_all_runners(monkeypatch, tmp_path):
+    monkeypatch.setenv("TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS", " , , ")
+    _write_task_yaml(
+        tmp_path,
+        "mixed.yaml",
+        _default_body(
+            "mixed",
+            ["b300-1gpu", "amd-mi355-1gpu-bench"],
+        ),
+    )
+
+    matrix = build_matrix(tmp_path, tmp_path, trigger="per-commit")
+
+    assert [entry["runner"] for entry in matrix["include"]] == [
+        "b300-1gpu",
+        "amd-mi355-1gpu-bench",
+    ]
+
+
+def test_build_matrix_all_excluded_returns_empty_include(monkeypatch, tmp_path):
+    monkeypatch.setenv("TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS", "gpu")
+    _write_task_yaml(
+        tmp_path,
+        "mixed.yaml",
+        _default_body(
+            "mixed",
+            ["b300-1gpu", "amd-mi355-1gpu-bench"],
+        ),
+    )
+
+    matrix = build_matrix(tmp_path, tmp_path, trigger="per-commit")
+
+    assert matrix == {"include": []}
 
 
 def test_build_matrix_sorts_high_priority_before_low(tmp_path):
@@ -507,6 +647,23 @@ def test_build_matrix_per_label_priority_only_affects_listed_label(tmp_path):
         ("ut-kernel", "h100-1gpu", "normal"),
         ("ut-kernel", "b200-1gpu", "normal"),
         ("ut-kernel", "b300-1gpu", "low"),
+    ]
+
+
+def test_build_matrix_per_label_optional_only_affects_listed_label(tmp_path):
+    _write_task_yaml(
+        tmp_path,
+        "ut-kernel.yaml",
+        _default_body(
+            "ut-kernel",
+            ["h100-1gpu", "amd-mi355-1gpu-bench"],
+            extra="optional:\n  amd-mi355-1gpu-bench: true\n",
+        ),
+    )
+    matrix = build_matrix(tmp_path, tmp_path, trigger="per-commit")
+    assert [(e["runner"], e["optional"]) for e in matrix["include"]] == [
+        ("h100-1gpu", False),
+        ("amd-mi355-1gpu-bench", True),
     ]
 
 

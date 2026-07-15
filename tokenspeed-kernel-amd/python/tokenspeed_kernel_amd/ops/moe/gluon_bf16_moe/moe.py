@@ -114,7 +114,7 @@ def gluon_bf16_moe(
     if decode is None:
         decode = num_tokens <= DECODE_MAX_M
     if warp_decode is None:
-        warp_decode = decode and num_tokens <= WARP_DECODE_MAX_M
+        warp_decode = decode and num_tokens <= WARP_DECODE_MAX_M and I_r % 256 == 0
     if decode:
         block_m = DECODE_BLOCK_M
 

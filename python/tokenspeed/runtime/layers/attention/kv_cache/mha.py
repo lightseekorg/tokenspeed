@@ -18,12 +18,21 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+from __future__ import annotations
+
+from collections import Counter
 
 import numpy as np
 import torch
 from tokenspeed_kernel.ops.kvcache.triton import store_kv_cache
 
+from tokenspeed.runtime.configs import paged_cache_spec
+from tokenspeed.runtime.configs.flat_memory_plan import occurrence_index
+from tokenspeed.runtime.configs.paged_cache_spec import hybrid_slab_group_size
 from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
+from tokenspeed.runtime.layers.attention.kv_cache.flat_state_slabs import (
+    FlatStateSlabs,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.utils import (
     copy_all_layer_kv_cache_tiled,
     move_kv_cache_native,
@@ -52,8 +61,16 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         max_context_len: int,
         page_size: int,
         rank: int,
+        layer_types: tuple[str, ...] = (),
+        sliding_window_tokens: int | tuple[int | None, ...] | None = None,
+        max_scheduled_tokens: int = 0,
+        pd_disaggregation_enabled: bool = False,
         enable_kv_cache_copy: bool = False,
         enable_alt_stream: bool = True,
+        conv_state_shape: tuple[int, ...] | None = None,
+        temporal_state_shape: tuple[int, ...] | None = None,
+        conv_dtype: torch.dtype | None = None,
+        ssm_dtype: torch.dtype | None = None,
     ):
         super().__init__(
             size, dtype, device, max_batch_size, max_context_len, page_size, rank
@@ -66,7 +83,29 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         self.head_num = head_num
         self.head_dim = head_dim
         self.layer_num = layer_num
-        self.page_size_bytes = self._get_page_size_bytes()
+        self._layer_types = tuple(layer_types or ())
+        self._pd_disaggregation_enabled = pd_disaggregation_enabled
+        self._slab_group_size = hybrid_slab_group_size(
+            self._layer_types,
+            sliding_window_tokens=sliding_window_tokens,
+        )
+        # GDN/mamba2 recurrent state slabs live under this same pool object
+        # (one page-id space with the KV pages), but their bookkeeping is
+        # owned by FlatStateSlabs. Constructing it here runs the
+        # equalization pre-check (same trigger, same ValueError) before any
+        # buffer allocation; slabs themselves are allocated in
+        # _create_buffers inside the memory-saver region.
+        self._state = FlatStateSlabs(
+            layer_types=self._layer_types,
+            conv_state_shape=conv_state_shape,
+            temporal_state_shape=temporal_state_shape,
+            conv_dtype=conv_dtype,
+            ssm_dtype=ssm_dtype,
+            default_dtype=dtype,
+            page_size=self.page_size,
+            size=self.size,
+            kv_bytes_per_slot=2 * head_num * head_dim * self.store_dtype.itemsize,
+        )
         self._create_buffers()
 
         self.device_module = torch.get_device_module(self.device)
@@ -88,79 +127,162 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             v_size / GB,
         )
 
-    def _get_page_size_bytes(self):
-        return (
-            2
-            * self.page_size
-            * self.layer_num
-            * self.head_num
-            * self.head_dim
-            * torch._utils._element_size(self.dtype)
+        # Publication rule lives in paged_cache_spec.publish_paged_cache_groups
+        # (module-attr call so tests can patch the flat-ext probe at call time).
+        published = paged_cache_spec.publish_paged_cache_groups(
+            layer_types=self._layer_types,
+            sliding_window_tokens=sliding_window_tokens,
+            page_size=page_size,
+            max_live_requests=max_batch_size,
+            max_scheduled_tokens=max_scheduled_tokens,
+            max_total_tokens=size,
+            max_context_len=max_context_len,
         )
+        if published is None:
+            self.paged_cache_group_specs = ()
+            self.paged_cache_group_page_counts = {}
+        else:
+            specs, counts = published
+            self.paged_cache_group_specs = tuple(specs)
+            self.paged_cache_group_page_counts = counts
+        # Slab aliasing is only safe under the single-BlockPool ownership the
+        # published groups configure.
+        assert self._slab_group_size is None or self.paged_cache_group_specs
+
+    def _slab_pair_index(self) -> list[int]:
+        """Map layer_id -> slab index: the i-th layer of every group binds
+        slab i (first-appearance order, as in group_specs_from_layer_types).
+        """
+        assert self._slab_group_size is not None
+        assert len(self._layer_types) == self.layer_num, (
+            f"hybrid slab layout: layer_types has {len(self._layer_types)} "
+            f"entries but layer_num={self.layer_num}"
+        )
+        counts = Counter(self._layer_types)
+        assert all(
+            count == self._slab_group_size for count in counts.values()
+        ), f"hybrid slab layout: uneven groups {dict(counts)!r}"
+        return occurrence_index(self._layer_types)
+
+    def _check_slab_guards(self):
+        """Refuse features whose per-layer buffer assumptions break when
+        paired layers alias the same slab tensor."""
+        # kvstore is allowed (spec §6 revision): the flat L2 tier mirrors
+        # whole slabs byte-blind, so per-slab copies are group-safe.
+        if self._pd_disaggregation_enabled:
+            raise RuntimeError(
+                "hybrid slab KV layout is incompatible with PD "
+                "disaggregation: KV transfer registers per-layer buffer "
+                "pointers (get_contiguous_buf_infos), and paired layers "
+                "alias the same slab, so per-layer transfers would send "
+                "the same bytes twice and clobber the peer's pairing. Set "
+                "disaggregation_mode='null' or use a radix-built "
+                "tokenspeed_scheduler extension, which keeps the legacy "
+                "per-layer layout."
+            )
 
     def _create_buffers(self):
         # Tag as "kv_cache", no CPU backup: KV is discarded on sleep and rebuilt
         # after wake (paging overwrites; clear_kv_buffers zeros the remapped pages).
         with self.memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False):
-            # [size, head_num, head_dim] for each layer.
-            # The padded page 0 is used for writing dummy outputs from padded tokens.
-            # Zero-init: attention kernels may read block_table entries beyond the
-            # valid seq_len (pointing at page 0), so the slots must be finite to
-            # keep softmax well-defined.
-            logger.info(
-                "_create_buffers self.size=%r, self.page_size=%r, self.head_num=%r, self.head_dim=%r, self.layer_num=%r",
-                self.size,
-                self.page_size,
-                self.head_num,
-                self.head_dim,
-                self.layer_num,
-            )
-            self.k_buffer = [
-                torch.zeros(
+            # Page 0 is the zero-initialized dummy page: padded tokens write
+            # there, and kernels may read it past valid seq_len, so its slots
+            # must stay finite to keep softmax well-defined.
+            def _alloc():
+                return torch.zeros(
                     (self.size + self.page_size, self.head_num, self.head_dim),
                     dtype=self.store_dtype,
                     device=self.device,
                 )
-                for _ in range(self.layer_num)
-            ]
-            self.v_buffer = [
-                torch.zeros(
-                    (self.size + self.page_size, self.head_num, self.head_dim),
-                    dtype=self.store_dtype,
-                    device=self.device,
+
+            # State-layer bookkeeping lives in FlatStateSlabs. The KV skip
+            # set below (which layers carry None KV) and the state-slab
+            # allocation are gated by the SAME flat-GDN predicate -- the plan
+            # sizing (registry) charges exactly full-layer KV + state rows,
+            # so the two decisions must never diverge. state_layer_ids is
+            # empty unless the gate is on, so non-flat profiles keep full KV.
+            flat_state_layers = set(self._state.state_layer_ids)
+            if self._state.is_active:
+                # Gates event_loop's retraction offload: state layers carry no
+                # per-layer KV, so the radix offload executor (and its host
+                # pool, sized for ALL layers) cannot represent this pool.
+                self.supports_hierarchical_kv_cache = False
+
+            if self._slab_group_size is not None:
+                # Paired layers alias the same slab tensor; live rows never
+                # overlap (page-ownership contract in hybrid_slab_group_size).
+                self._check_slab_guards()
+                pair_index = self._slab_pair_index()
+                k_slabs = [_alloc() for _ in range(self._slab_group_size)]
+                v_slabs = [_alloc() for _ in range(self._slab_group_size)]
+                self.k_buffer = [
+                    k_slabs[pair_index[layer_id]] for layer_id in range(self.layer_num)
+                ]
+                self.v_buffer = [
+                    v_slabs[pair_index[layer_id]] for layer_id in range(self.layer_num)
+                ]
+                # Gates event_loop's retraction offload (built even with the
+                # kvstore off): per-layer host copies would alias shared slabs.
+                self.supports_hierarchical_kv_cache = False
+                logger.info(
+                    "KV layout: hybrid slab (%d slabs x %d rows; paired "
+                    "layers share storage; M12)",
+                    self._slab_group_size,
+                    self.size + self.page_size,
                 )
-                for _ in range(self.layer_num)
-            ]
+            else:
+                # The hybrid-slab branch above never sees state labels
+                # (hybrid_slab_group_size excludes them), so the skip set
+                # only applies here.
+                self.k_buffer = [
+                    None if layer_id in flat_state_layers else _alloc()
+                    for layer_id in range(self.layer_num)
+                ]
+                self.v_buffer = [
+                    None if layer_id in flat_state_layers else _alloc()
+                    for layer_id in range(self.layer_num)
+                ]
+                if flat_state_layers:
+                    logger.info(
+                        "KV layout: per-layer (%d of %d layers carry KV "
+                        "buffers; state layers carry none)",
+                        self.layer_num - len(flat_state_layers),
+                        self.layer_num,
+                    )
+                else:
+                    logger.info(
+                        "KV layout: per-layer (%d buffers; hybrid slab "
+                        "inactive: predicate returned None -- radix ext "
+                        "or non-uniform/single-group layer_types)",
+                        self.layer_num,
+                    )
+            # Pointer/stride tables carry the REAL tensors only: _kv_copy
+            # launches one block per data_ptrs entry (grid = numel), so a
+            # placeholder entry for a skipped state layer would be
+            # dereferenced.
+            real_k = [x for x in self.k_buffer if x is not None]
+            real_v = [x for x in self.v_buffer if x is not None]
             self.k_data_ptrs = torch.tensor(
-                [x.data_ptr() for x in self.k_buffer],
+                [x.data_ptr() for x in real_k],
                 dtype=torch.uint64,
                 device=self.device,
             )
             self.v_data_ptrs = torch.tensor(
-                [x.data_ptr() for x in self.v_buffer],
+                [x.data_ptr() for x in real_v],
                 dtype=torch.uint64,
                 device=self.device,
             )
             self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
             self.data_strides = torch.tensor(
-                [
-                    np.prod(x.shape[1:]) * x.dtype.itemsize
-                    for x in self.k_buffer + self.v_buffer
-                ],
+                [np.prod(x.shape[1:]) * x.dtype.itemsize for x in real_k + real_v],
                 device=self.device,
             )
 
-    def _clear_buffers(self):
-        del self.k_buffer
-        del self.v_buffer
-        if hasattr(self, "k_data_ptrs"):
-            del self.k_data_ptrs
-        if hasattr(self, "v_data_ptrs"):
-            del self.v_data_ptrs
-        if hasattr(self, "data_ptrs"):
-            del self.data_ptrs
-        if hasattr(self, "data_strides"):
-            del self.data_strides
+            # State slabs (GDN/mamba2 conv+ssm rows) share this pool's
+            # memory-saver region so they follow the KV discard-on-sleep
+            # policy. FlatStateSlabs.allocate is a no-op (leaving
+            # state_slabs == []) unless the flat-GDN gate is on.
+            self._state.allocate(self.device)
 
     def _init_kv_copy_and_warmup(self):
         _KV_COPY_STRIDE_THRESHOLD_LARGE = 8192
@@ -205,8 +327,16 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        # Slab layout: data_ptrs holds duplicated slab entries, so this
+        # broadcast re-copies rows. No callers today; re-check before wiring.
         if self._kv_copy_config is None:
-            move_kv_cache_native(self.k_buffer, self.v_buffer, tgt_loc, src_loc)
+            # Real tensors only: flat GDN state layers carry None slots.
+            move_kv_cache_native(
+                [x for x in self.k_buffer if x is not None],
+                [x for x in self.v_buffer if x is not None],
+                tgt_loc,
+                src_loc,
+            )
         else:
             grid = (self.data_ptrs.numel(), self._kv_copy_config["byte_tiles"])
             copy_all_layer_kv_cache_tiled[grid](
@@ -224,11 +354,14 @@ class MHATokenToKVPool(BaseTokenToKVPool):
     def get_kv_size_bytes(self):
         assert hasattr(self, "k_buffer")
         assert hasattr(self, "v_buffer")
+        # Dedup by tensor identity: the slab layout aliases layers to shared
+        # slabs, and allocated bytes must not be double-counted. None slots
+        # (flat GDN state layers carry no KV) are skipped.
         k_size_bytes = 0
-        for k_cache in self.k_buffer:
+        for k_cache in {id(t): t for t in self.k_buffer if t is not None}.values():
             k_size_bytes += np.prod(k_cache.shape) * k_cache.dtype.itemsize
         v_size_bytes = 0
-        for v_cache in self.v_buffer:
+        for v_cache in {id(t): t for t in self.v_buffer if t is not None}.values():
             v_size_bytes += np.prod(v_cache.shape) * v_cache.dtype.itemsize
         return k_size_bytes, v_size_bytes
 
@@ -236,6 +369,15 @@ class MHATokenToKVPool(BaseTokenToKVPool):
     def get_contiguous_buf_infos(self):
         # layer_num x [seq_len, head_num, head_dim]
         # layer_num x [page_num, page_size, head_num, head_dim]
+        if any(x is None for x in self.k_buffer):
+            raise ValueError(
+                "flat GDN layout has no per-layer KV on state layers; "
+                "PD disaggregation unsupported: KV transfer registers "
+                "per-layer buffer pointers, and state layers carry only "
+                "state slabs. Set disaggregation_mode='null' or use a "
+                "radix-built tokenspeed_scheduler extension, which keeps "
+                "the full per-layer KV layout."
+            )
         kv_data_ptrs = [
             self._get_key_buffer(i).data_ptr() for i in range(self.layer_num)
         ] + [self._get_value_buffer(i).data_ptr() for i in range(self.layer_num)]
@@ -321,9 +463,12 @@ class MHATokenToKVPool(BaseTokenToKVPool):
 
     def _get_key_buffer(self, layer_id: int):
         # for internal use of referencing
+        buf = self.k_buffer[layer_id]
+        if buf is None:
+            raise ValueError(f"layer {layer_id} is a state layer; it has no KV buffer")
         if self.store_dtype != self.dtype:
-            return self.k_buffer[layer_id].view(self.dtype)
-        return self.k_buffer[layer_id]
+            return buf.view(self.dtype)
+        return buf
 
     def get_key_buffer(self, layer_id: int):
         # note: get_key_buffer is hooked with synchronization for layer-wise KV cache loading
@@ -335,9 +480,12 @@ class MHATokenToKVPool(BaseTokenToKVPool):
 
     def _get_value_buffer(self, layer_id: int):
         # for internal use of referencing
+        buf = self.v_buffer[layer_id]
+        if buf is None:
+            raise ValueError(f"layer {layer_id} is a state layer; it has no KV buffer")
         if self.store_dtype != self.dtype:
-            return self.v_buffer[layer_id].view(self.dtype)
-        return self.v_buffer[layer_id]
+            return buf.view(self.dtype)
+        return buf
 
     def get_value_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
@@ -347,6 +495,21 @@ class MHATokenToKVPool(BaseTokenToKVPool):
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
+    @property
+    def state_slabs(self) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """(conv, ssm) state slab pairs; [] when no state slabs are active.
+
+        Forwarding property: FlatStateSlabs owns the slabs, but the flat
+        host mirror and hybrid-linear-attn backend probe pool.state_slabs
+        directly (getattr), so keep the attribute on the pool."""
+        return self._state.state_slabs
+
+    def get_state_buffers(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """(conv, ssm) state slab pair for a state layer; the n-th state
+        layer (within-state-label occurrence order, the slab pairing order)
+        binds pair n. Raises ValueError for non-state layers."""
+        return self._state.get_state_buffers(layer_id)
+
     def set_kv_buffer(
         self,
         layer: PagedAttention,
@@ -355,12 +518,8 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         cache_v: torch.Tensor,
         k_scale: float | None = None,
         v_scale: float | None = None,
-        layer_id_override: int = None,
     ):
-        if layer_id_override is not None:
-            layer_id = layer_id_override
-        else:
-            layer_id = layer.layer_id
+        layer_id = layer.layer_id
         if cache_k.dtype != self.dtype:
             if k_scale is not None:
                 cache_k.div_(k_scale)
@@ -374,143 +533,3 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         store_kv_cache(
             cache_k, cache_v, self.k_buffer[layer_id], self.v_buffer[layer_id], loc
         )
-
-
-class SWAKVPool(BaseTokenToKVPool):
-    """KV cache with separate pools for full and SWA attention layers."""
-
-    def __init__(
-        self,
-        size: int,
-        size_swa: int,
-        dtype: torch.dtype,
-        head_num: int,
-        head_dim: int,
-        swa_attention_layer_ids: list[int],
-        full_attention_layer_ids: list[int],
-        enable_kvcache_transpose: bool,
-        device: str,
-    ):
-        self.size = size
-        self.size_swa = size_swa
-        self.dtype = dtype
-        self.device = device
-        self.swa_layer_nums = len(swa_attention_layer_ids)
-        self.full_layer_nums = len(full_attention_layer_ids)
-        self.page_size = 1
-        assert not enable_kvcache_transpose
-        TokenToKVPoolClass = MHATokenToKVPool
-        self.swa_kv_pool = TokenToKVPoolClass(
-            size=size_swa,
-            page_size=self.page_size,
-            dtype=dtype,
-            head_num=head_num,
-            head_dim=head_dim,
-            layer_num=self.swa_layer_nums,
-            device=device,
-            enable_memory_saver=False,
-        )
-        self.full_kv_pool = TokenToKVPoolClass(
-            size=size,
-            page_size=self.page_size,
-            dtype=dtype,
-            head_num=head_num,
-            head_dim=head_dim,
-            layer_num=self.full_layer_nums,
-            device=device,
-            enable_memory_saver=False,
-        )
-        self.layers_mapping: dict[int, tuple[int, bool]] = {}
-        for full_attn_layer_id, global_layer_id in enumerate(full_attention_layer_ids):
-            self.layers_mapping[global_layer_id] = (full_attn_layer_id, False)
-        for swa_layer_id, global_layer_id in enumerate(swa_attention_layer_ids):
-            self.layers_mapping[global_layer_id] = (swa_layer_id, True)
-        self.full_to_swa_index_mapping: torch.Tensor | None = None
-
-        k_size, v_size = self.get_kv_size_bytes()
-        self.mem_usage = (k_size + v_size) / GB
-
-    def get_kv_size_bytes(self):
-        k_size, v_size = self.full_kv_pool.get_kv_size_bytes()
-        k_size_swa, v_size_swa = self.swa_kv_pool.get_kv_size_bytes()
-        return k_size + k_size_swa, v_size + v_size_swa
-
-    def get_contiguous_buf_infos(self):
-        full_kv_data_ptrs, full_kv_data_lens, full_kv_item_lens = (
-            self.full_kv_pool.get_contiguous_buf_infos()
-        )
-        swa_kv_data_ptrs, swa_kv_data_lens, swa_kv_item_lens = (
-            self.swa_kv_pool.get_contiguous_buf_infos()
-        )
-
-        kv_data_ptrs = full_kv_data_ptrs + swa_kv_data_ptrs
-        kv_data_lens = full_kv_data_lens + swa_kv_data_lens
-        kv_item_lens = full_kv_item_lens + swa_kv_item_lens
-
-        return kv_data_ptrs, kv_data_lens, kv_item_lens
-
-    def get_contiguous_buf_unit_lens(self):
-        return (
-            self.full_kv_pool.get_contiguous_buf_unit_lens()
-            + self.swa_kv_pool.get_contiguous_buf_unit_lens()
-        )
-
-    def get_key_buffer(self, layer_id: int):
-        layer_id_pool, is_swa = self.layers_mapping[layer_id]
-        if is_swa:
-            return self.swa_kv_pool.get_key_buffer(layer_id_pool)
-        else:
-            return self.full_kv_pool.get_key_buffer(layer_id_pool)
-
-    def get_value_buffer(self, layer_id: int):
-        layer_id_pool, is_swa = self.layers_mapping[layer_id]
-        if is_swa:
-            return self.swa_kv_pool.get_value_buffer(layer_id_pool)
-        else:
-            return self.full_kv_pool.get_value_buffer(layer_id_pool)
-
-    def get_kv_buffer(self, layer_id: int):
-        layer_id_pool, is_swa = self.layers_mapping[layer_id]
-        if is_swa:
-            return self.swa_kv_pool.get_kv_buffer(layer_id_pool)
-        else:
-            return self.full_kv_pool.get_kv_buffer(layer_id_pool)
-
-    def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
-        assert self.full_to_swa_index_mapping is not None
-        return self.full_to_swa_index_mapping[kv_indices].to(torch.int32)
-
-    def set_kv_buffer(
-        self,
-        layer: PagedAttention,
-        loc: torch.Tensor,
-        cache_k: torch.Tensor,
-        cache_v: torch.Tensor,
-        k_scale: float = 1.0,
-        v_scale: float = 1.0,
-    ):
-
-        layer_id = layer.layer_id
-        layer_id_pool, is_swa = self.layers_mapping[layer_id]
-        if is_swa:
-            if self.full_to_swa_index_mapping is not None:
-                loc = self.translate_loc_from_full_to_swa(loc)
-            self.swa_kv_pool.set_kv_buffer(
-                None,
-                loc,
-                cache_k,
-                cache_v,
-                k_scale,
-                v_scale,
-                layer_id_override=layer_id_pool,
-            )
-        else:
-            self.full_kv_pool.set_kv_buffer(
-                None,
-                loc,
-                cache_k,
-                cache_v,
-                k_scale,
-                v_scale,
-                layer_id_override=layer_id_pool,
-            )

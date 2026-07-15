@@ -344,6 +344,95 @@ def fused_decode_input_prep(
     )
 
 
+@triton.jit
+def dflash_prepare_decode_kernel(
+    output_tokens_ptr,
+    accept_lengths_ptr,
+    req_pool_indices_ptr,
+    valid_cache_lengths_ptr,
+    req_to_pages_ptr,
+    draft_seq_lens_ptr,
+    block_ids_ptr,
+    block_positions_ptr,
+    out_cache_loc_ptr,
+    spec_num_tokens: tl.constexpr,
+    page_size: tl.constexpr,
+    max_pages: tl.constexpr,
+    max_draft_prefix,
+    block_ids_stride: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    req_idx = tl.program_id(0)
+    pool_idx = tl.load(req_pool_indices_ptr + req_idx)
+    accept_len = tl.load(accept_lengths_ptr + req_idx)
+    old_len = tl.load(valid_cache_lengths_ptr + pool_idx)
+    prefix_len = old_len + accept_len
+    prefix_len = tl.minimum(prefix_len, max_draft_prefix)
+    tl.store(draft_seq_lens_ptr + req_idx, prefix_len)
+
+    safe_accept = tl.minimum(tl.maximum(accept_len, 1), spec_num_tokens)
+    current_token = tl.load(
+        output_tokens_ptr + req_idx * spec_num_tokens + safe_accept - 1
+    )
+    tl.store(block_ids_ptr + req_idx * block_ids_stride, current_token)
+
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < spec_num_tokens
+    positions = prefix_len + offsets
+    tl.store(
+        block_positions_ptr + req_idx * spec_num_tokens + offsets, positions, mask=mask
+    )
+
+    page_indices = positions // page_size
+    overflow = page_indices >= max_pages
+    page_indices = tl.minimum(page_indices, max_pages - 1)
+    offsets_in_page = positions % page_size
+    page_ptrs = req_to_pages_ptr + pool_idx * max_pages + page_indices
+    page_ids = tl.load(page_ptrs, mask=mask, other=0)
+    cache_locs = page_ids * page_size + offsets_in_page
+    cache_locs = tl.where(overflow, 0, cache_locs)
+    tl.store(
+        out_cache_loc_ptr + req_idx * spec_num_tokens + offsets, cache_locs, mask=mask
+    )
+
+
+def dflash_prepare_decode(
+    output_tokens: torch.Tensor,
+    accept_lengths: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    valid_cache_lengths: torch.Tensor,
+    req_to_pages: torch.Tensor,
+    draft_seq_lens: torch.Tensor,
+    block_ids: torch.Tensor,
+    block_positions: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    spec_num_tokens: int,
+    page_size: int,
+    max_draft_prefix: int,
+) -> None:
+    batch_size = req_pool_indices.shape[0]
+    max_pages = req_to_pages.shape[1]
+    BLOCK_SIZE = triton.next_power_of_2(spec_num_tokens)
+    grid = (batch_size,)
+    dflash_prepare_decode_kernel[grid](
+        output_tokens,
+        accept_lengths,
+        req_pool_indices,
+        valid_cache_lengths,
+        req_to_pages,
+        draft_seq_lens,
+        block_ids,
+        block_positions,
+        out_cache_loc,
+        spec_num_tokens=spec_num_tokens,
+        page_size=page_size,
+        max_pages=max_pages,
+        max_draft_prefix=max_draft_prefix,
+        block_ids_stride=block_ids.stride(0),
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+
+
 def compute_out_cache_loc_uniform(
     out_cache_loc_ptr,
     req_pool_indices: torch.Tensor,  # [batch_size]

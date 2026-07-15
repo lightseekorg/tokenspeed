@@ -1,9 +1,18 @@
 from __future__ import annotations
 
+import os
+
 import torch
+from tokenspeed_kernel.ops.attention.cuda.dsa_topk import (
+    has_ragged_decode_topk,
+    ragged_decode_topk,
+)
+from tokenspeed_kernel.ops.attention.cute_dsl.dsa_topk import (
+    cute_dsl_decode_topk,
+    has_cute_dsl_decode_topk,
+)
 from tokenspeed_kernel.ops.attention.flashinfer.dsa_topk import (
     deterministic_decode_topk,
-    has_ragged_decode_topk,
 )
 from tokenspeed_kernel.ops.attention.triton.dsa_topk import (
     local_topk_to_global_slots,
@@ -19,6 +28,15 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 platform = current_platform()
 _PERSISTENT_TOPK_WORKSPACE_BYTES = 1024 * 1024
+
+# Default the DSA decode top-k to the CuTe DSL cluster kernel; set
+# ``TS_DSA_DECODE_TOPK_CUTEDSL=0`` to fall back to the ragged/persistent path.
+_CUTE_DSL_DECODE_TOPK_ENABLED = os.environ.get("TS_DSA_DECODE_TOPK_CUTEDSL", "1") == "1"
+
+
+def _use_cute_dsl_decode_topk() -> bool:
+    """Whether the DSA decode top-k should use the CuTe DSL cluster kernel."""
+    return _CUTE_DSL_DECODE_TOPK_ENABLED and has_cute_dsl_decode_topk()
 
 
 def _check_out(
@@ -209,8 +227,18 @@ if platform.is_nvidia:
             nan=float("-inf"), posinf=float("-inf"), neginf=float("-inf")
         )
         local_topk_offsets = torch.empty_like(out)
-        if has_ragged_decode_topk():
-            deterministic_decode_topk(
+        if _use_cute_dsl_decode_topk():
+            # CuTe DSL cluster radix top-k: length-aware via seq_lens/q_len_per_req,
+            # so no pre-masking needed; same local offsets as the ragged path.
+            cute_dsl_decode_topk(
+                logits,
+                seq_lens,
+                topk,
+                next_n=q_len_per_req,
+                out=local_topk_offsets,
+            )
+        elif has_ragged_decode_topk():
+            ragged_decode_topk(
                 logits,
                 local_topk_offsets,
                 topk,

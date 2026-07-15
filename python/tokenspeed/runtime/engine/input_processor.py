@@ -141,7 +141,7 @@ class InputProcessor:
             # built by an upstream preprocessor and the input_ids carry the
             # expanded placeholder tokens (im_token_id) at the right offsets.
             # We still need to run pad_input_tokens so the engine's
-            # VisionEmbedder can plan vision-token scatter ranges from each
+            # MultimodalEmbedder can plan encoder-token scatter ranges from each
             # item's offsets — the bare placeholder token alone would not
             # encode per-item uniqueness needed by the radix prefix layer.
             if not self.engine.model_config.is_multimodal_active:

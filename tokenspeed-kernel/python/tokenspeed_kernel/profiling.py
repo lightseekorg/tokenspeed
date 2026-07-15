@@ -42,7 +42,9 @@ __all__ = [
     "ShapeCapture",
     "bootstrap_profiling_from_env",
     "kernel_scope",
+    "profile_config_from_env",
     "profiling",
+    "proton_available",
     "shape_capture",
     "start_shape_capture",
     "start_profiling",
@@ -193,9 +195,32 @@ def _is_truthy(value: str | None) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _profile_config_from_env() -> ProfilingConfig:
+def proton_available() -> bool:
+    """Report whether the Proton profiler can be used in this process.
+
+    Returns:
+        True if the vendored Triton distribution provides
+        ``tokenspeed_triton.profiler``; False otherwise (profiling calls
+        become no-ops with a warning).
+    """
+    return _HAS_PROTON
+
+
+def profile_config_from_env(output: str | None = None) -> ProfilingConfig:
+    """Build a :class:`ProfilingConfig` from ``TOKENSPEED_KERNEL_PROFILE_*``.
+
+    Args:
+        output: Optional Proton output prefix/path. When provided it takes
+            precedence over ``TOKENSPEED_KERNEL_PROFILE_OUTPUT``; callers that
+            profile multiple processes (e.g. one scheduler per rank) use this
+            to give each process a distinct output file.
+
+    Returns:
+        A :class:`ProfilingConfig` with ``data``/``backend``/``mode``/``hook``/
+        ``output_format`` sourced from the environment.
+    """
     return ProfilingConfig(
-        output=os.environ.get(_ENV_PROFILE_OUTPUT, "profile"),
+        output=output or os.environ.get(_ENV_PROFILE_OUTPUT, "profile"),
         data=os.environ.get(_ENV_PROFILE_DATA, "tree"),
         backend=os.environ.get(_ENV_PROFILE_BACKEND),
         mode=os.environ.get(_ENV_PROFILE_MODE),
@@ -316,7 +341,7 @@ def bootstrap_profiling_from_env() -> None:
     _BOOTSTRAPPED = True
 
     if _is_truthy(os.environ.get(_ENV_PROFILE)):
-        start_profiling(_profile_config_from_env())
+        start_profiling(profile_config_from_env())
     if _is_truthy(os.environ.get(_ENV_CAPTURE_SHAPES)):
         start_shape_capture()
 

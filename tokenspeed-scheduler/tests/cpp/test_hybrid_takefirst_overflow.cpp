@@ -35,7 +35,7 @@ protected:
         cfg.enable_mamba = true;
         cfg.mamba_pool_total_chunks = 16;
         cfg.decode_input_tokens = 0;
-        cfg.page_size = 2;
+        cfg.block_size = 2;
         cfg.device_allocator.total_pages = 64;  // ample, so the only possible failure is count > size
         cfg.host_allocator.total_pages = 64;
         cfg.enable_l3_storage = false;
@@ -126,7 +126,7 @@ protected:
         cfg.enable_mamba = true;
         cfg.mamba_pool_total_chunks = 16;
         cfg.decode_input_tokens = 0;
-        cfg.page_size = 2;
+        cfg.block_size = 2;
         cfg.device_allocator.total_pages = 6;  // small, so the device exhausts and a retract is forced
         cfg.host_allocator.total_pages = 6;
         cfg.enable_l3_storage = false;

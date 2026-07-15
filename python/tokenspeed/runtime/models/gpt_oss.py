@@ -211,6 +211,7 @@ class GptOssAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
             sliding_window_size=(sliding_window_size if use_sliding_window else -1),
+            group_id=layer_type,
         )
         self.layer_id = layer_id
 
@@ -234,7 +235,10 @@ class GptOssAttention(nn.Module):
             fused_kv_arg = create_fused_set_kv_buffer_arg(
                 value=v_3d,
                 layer=self.attn,
-                out_cache_loc=out_cache_loc,
+                # Flat path: prewrite at this layer's group locations.
+                out_cache_loc=ctx.attn_backend.select_out_cache_loc(
+                    self.attn, out_cache_loc, ctx.forward_mode
+                ),
                 token_to_kv_pool=ctx.token_to_kv_pool,
             )
 

@@ -119,6 +119,14 @@ iteration.
   (FLOPs / bytes) per op family, tabular reports, and Proton integration.
 - Runtime shape capture feeds replay and tuning workflows; `kernel_scope`
   scopes are visible in Proton/Chrome traces.
+- End-to-end serving: pass `--profile --profile-activities PROTON` to
+  `tokenspeed bench serve` (or POST `/start_profile` / `/stop_profile` with
+  `{"activities": ["PROTON"]}`). Each scheduler process — the process where
+  kernels actually launch — runs its own Proton session and finalizes it on
+  `/stop_profile`, writing
+  `<output_dir>/<profile_id>[-DP<rank>][-CP<rank>]-TP<rank>.proton.<fmt>`
+  per rank. `PROTON` composes only with host-side activities (`CPU`, `MEM`,
+  `VIZTRACER`).
 
 ### Plugins
 

@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <array>
 #include <map>
 #include <string>
 #include <utility>
@@ -53,6 +54,12 @@ struct ForwardOperationBase {
     std::map<std::string, std::vector<std::int32_t>> paged_cache_pages;
     // Per-request, per-sliding-group base logical-page offset.
     std::map<std::string, std::int32_t> paged_cache_page_base_offsets;
+
+    // flat KV-cache per-group block table. key = group_id, value = that group's
+    // physical page-id row (null hole = 0, absolute logical-page index, NOT
+    // compacted). Filled only on the flat path; empty on the radix path. Does
+    // not share a contract with paged_cache_pages (radix: compact + offset).
+    std::map<std::string, std::vector<std::int32_t>> flat_block_tables;
 
     // Mamba extension (default: inactive)
     std::int32_t mamba_working_idx{-1};
@@ -109,6 +116,16 @@ struct FlatForwardOperation {
     // sliding-window groups. Missing key ⇔ offset is 0 for every row.
     std::map<std::string, std::vector<std::int32_t>> paged_cache_block_table_base_offsets;
 
+    // flat KV-cache per-group block table, batched: dict[group_id] =
+    // [num_reqs, max_pages_in_batch] padded with -1. Each row is absolute
+    // (null hole = 0, no compaction); there is no base-offset companion.
+    std::map<std::string, std::vector<std::vector<std::int32_t>>> flat_block_tables;
+    // Contiguous row-major copy of flat_block_tables ([rows * cols], -1
+    // padded), exposed zero-copy to Python as a 2-D ndarray -- the nested
+    // vectors above cost one PyLong per page id at every attribute access.
+    std::map<std::string, std::vector<std::int32_t>> flat_block_tables_contig;
+    std::map<std::string, std::array<std::size_t, 2>> flat_block_tables_dims;
+
     explicit FlatForwardOperation(std::vector<ForwardOperation> ops) {
         std::stable_partition(ops.begin(), ops.end(),
                               [](const ForwardOperation& a) { return std::holds_alternative<PrefillOperation>(a); });
@@ -129,6 +146,9 @@ struct FlatForwardOperation {
                     for (auto& [gid, pages] : inner.paged_cache_pages) {
                         paged_cache_block_tables[gid];
                     }
+                    for (auto& [gid, pages] : inner.flat_block_tables) {
+                        flat_block_tables[gid];
+                    }
                     for (auto& [gid, _] : inner.paged_cache_page_base_offsets) {
                         paged_cache_block_table_base_offsets[gid];
                     }
@@ -148,6 +168,9 @@ struct FlatForwardOperation {
         for (auto& [_, table] : paged_cache_block_tables) {
             table.assign(num_reqs, std::vector<std::int32_t>{});
         }
+        for (auto& [_, table] : flat_block_tables) {
+            table.assign(num_reqs, std::vector<std::int32_t>{});
+        }
         for (auto& [_, offsets] : paged_cache_block_table_base_offsets) {
             offsets.assign(num_reqs, 0);
         }
@@ -158,6 +181,9 @@ struct FlatForwardOperation {
                     for (auto& [gid, pages] : inner.paged_cache_pages) {
                         paged_cache_block_tables[gid][row] = std::move(pages);
                     }
+                    for (auto& [gid, pages] : inner.flat_block_tables) {
+                        flat_block_tables[gid][row] = std::move(pages);
+                    }
                     for (auto& [gid, off] : inner.paged_cache_page_base_offsets) {
                         paged_cache_block_table_base_offsets[gid][row] = off;
                     }
@@ -166,6 +192,17 @@ struct FlatForwardOperation {
             ++row;
         }
         padRectangularMinusOne(paged_cache_block_tables);
+        padRectangularMinusOne(flat_block_tables);
+        for (auto& [gid, table] : flat_block_tables) {
+            const std::size_t rows = table.size();
+            const std::size_t cols = rows ? table.front().size() : 0;
+            auto& buf = flat_block_tables_contig[gid];
+            buf.reserve(rows * cols);
+            for (const auto& row : table) {
+                buf.insert(buf.end(), row.begin(), row.end());
+            }
+            flat_block_tables_dims[gid] = {rows, cols};
+        }
     }
 
     bool empty() const { return request_ids.empty(); }

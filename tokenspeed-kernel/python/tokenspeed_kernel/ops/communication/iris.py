@@ -243,6 +243,7 @@ class IrisRSAG(object):
         out_view = self._out_buff[:total_num_tokens, : self.hidden_size]
         in_view.copy_(hidden_states)
 
+        # Ensure every rank's shared input copy is visible before peer loads begin.
         self._ctx.device_barrier()
 
         config = self._make_config(local_num_tokens, self.hidden_size)
@@ -640,6 +641,8 @@ class IrisAllReduceResidualRMSNorm(object):
             EPS=eps,
             num_warps=8,
         )
+        # Ensure all peer loads finish before the next call reuses _input_buf.
+        self._ctx.device_barrier()
         return norm_out, residual_out
 
 

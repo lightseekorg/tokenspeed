@@ -169,7 +169,7 @@ def moe_align_block_size_fused(
         EP=EP,
         NB_MAX=NB_MAX,
         EM_MAX=EM_MAX,
-        INIT_TILE=min(1024, EM_MAX),
+        INIT_TILE=_next_pow2(min(1024, EM_MAX)),
         num_warps=4,
     )
     return sti, sei, sw, nv
