@@ -47,7 +47,6 @@ from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfi
 from tokenspeed.runtime.layers.quantization.utils import block_dequant
 from tokenspeed.runtime.layers.utils import (
     CP_METADATA,
-    ENABLE_CP,
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_data,
 )
@@ -162,7 +161,7 @@ class GlmMoeDsaModelNextN(nn.Module):
         )
 
         if not ctx.forward_mode.is_idle():
-            if not ENABLE_CP:
+            if not self.mapping.attn.has_cp:
                 hidden_states, _ = self.decoder.comm_manager.final_norm(
                     hidden_states, residual, ctx, self.shared_head.norm
                 )

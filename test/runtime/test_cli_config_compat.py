@@ -16,6 +16,7 @@ register_cuda_ci(est_time=10, suite="runtime-1gpu")
 import argparse
 import contextlib
 import io
+import subprocess
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -138,6 +139,118 @@ class TestCLIConfigCompat(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             self._from_cli_args_no_init(args)
+
+    def test_attention_context_parallel_size(self):
+        self.assertEqual(
+            self._parallelism_snapshot(
+                ["--model", "test/model", "--attn-cp-size", "4"]
+            ),
+            (4, 1, 4, 1, 4, 1, 4, 1, 1),
+        )
+
+    def test_context_parallel_default_preserves_data_parallel_inference(self):
+        self.assertEqual(
+            self._parallelism_snapshot(
+                [
+                    "--model",
+                    "test/model",
+                    "--world-size",
+                    "8",
+                    "--attn-tp-size",
+                    "2",
+                ]
+            ),
+            (8, 2, 1, 4, 8, 1, 8, 1, 1),
+        )
+
+    def test_attention_tensor_and_context_parallel_sizes(self):
+        self.assertEqual(
+            self._parallelism_snapshot(
+                [
+                    "--model",
+                    "test/model",
+                    "--world-size",
+                    "8",
+                    "--attn-tp-size",
+                    "2",
+                    "--attn-cp-size",
+                    "2",
+                ]
+            ),
+            (8, 2, 2, 2, 8, 1, 8, 1, 1),
+        )
+
+    def test_enable_cp_environment_no_longer_changes_parallelism(self):
+        script = """
+from unittest.mock import patch
+
+from tokenspeed.runtime.utils.server_args import ServerArgs
+
+with patch.object(ServerArgs, "__post_init__"):
+    server_args = ServerArgs(model="test/model", attn_tp_size=4)
+server_args.resolve_parallelism()
+print(server_args.mapping.attn.tp_size, server_args.mapping.attn.cp_size)
+"""
+        env = os.environ.copy()
+        env["ENABLE_CP"] = "1"
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        self.assertEqual(result.stdout.strip().splitlines()[-1], "4 1")
+
+    def test_mamba_ssm_dtype_uses_process_config_not_environment(self):
+        import torch
+
+        from tokenspeed.runtime.configs.qwen3_5_text_base_config import (
+            Qwen3_5BaseTextConfig,
+        )
+        from tokenspeed.runtime.utils.env import (
+            global_server_args_dict,
+            global_server_args_dict_update,
+        )
+
+        args = self._parse_args(
+            ["--model", "test/model", "--mamba-ssm-dtype", "bfloat16"]
+        )
+        server_args = self._from_cli_args_no_init(args)
+        server_args.resolve_basic_defaults()
+        server_args.resolve_parallelism()
+
+        with patch.dict(
+            os.environ, {"TOKENSPEED_MAMBA_SSM_DTYPE": "float32"}
+        ), patch.dict(global_server_args_dict, {}, clear=False):
+            global_server_args_dict_update(server_args)
+            config = Qwen3_5BaseTextConfig(
+                num_hidden_layers=4,
+                full_attention_interval=4,
+            )
+
+            self.assertIs(config.mamba2_cache_params[3], torch.bfloat16)
+            self.assertEqual(os.environ["TOKENSPEED_MAMBA_SSM_DTYPE"], "float32")
+
+    def test_mamba_ssm_dtype_default_is_preserved(self):
+        args = self._parse_args(["--model", "test/model"])
+        server_args = self._from_cli_args_no_init(args)
+        self.assertEqual(server_args.mamba_ssm_dtype, "float32")
+
+    def test_validation_does_not_write_mamba_ssm_dtype_environment(self):
+        args = self._parse_args(
+            ["--model", "test/model", "--mamba-ssm-dtype", "bfloat16"]
+        )
+        server_args = self._from_cli_args_no_init(args)
+        server_args.resolve_basic_defaults()
+        server_args.resolve_parallelism()
+        server_args.max_num_seqs = 1
+        server_args.chunked_prefill_size = 1
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("TOKENSPEED_MAMBA_SSM_DTYPE", None)
+            server_args.validate()
+            self.assertNotIn("TOKENSPEED_MAMBA_SSM_DTYPE", os.environ)
 
     # ---- Enable expert parallel ----
 

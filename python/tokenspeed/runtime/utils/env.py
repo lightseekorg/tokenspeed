@@ -56,6 +56,7 @@ global_server_args_dict: dict = {
     "max_prefill_tokens": ServerArgs.max_prefill_tokens,
     "max_model_len": ServerArgs.max_model_len,
     "max_num_seqs": ServerArgs.max_num_seqs,
+    "mamba_ssm_dtype": ServerArgs.mamba_ssm_dtype,
     "moe_backend": ServerArgs.moe_backend,
     "enforce_eager": ServerArgs.enforce_eager,
     "max_cudagraph_capture_size": ServerArgs.max_cudagraph_capture_size,
@@ -105,6 +106,7 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "max_prefill_tokens": server_args.max_prefill_tokens,
             "max_model_len": server_args.max_model_len,
             "max_num_seqs": server_args.max_num_seqs,
+            "mamba_ssm_dtype": server_args.mamba_ssm_dtype,
             "moe_backend": server_args.moe_backend,
             "enforce_eager": server_args.enforce_eager,
             "max_cudagraph_capture_size": server_args.max_cudagraph_capture_size,
@@ -288,7 +290,6 @@ class Envs:
     TOKENSPEED_HEALTH_CHECK_TIMEOUT = EnvInt(20)
     TOKENSPEED_HOST_IP = EnvStr("")
     TOKENSPEED_LOGGING_CONFIG_PATH = EnvStr(None)
-    TOKENSPEED_MAMBA_SSM_DTYPE = EnvStr("float32")
     TOKENSPEED_MODEL_REDIRECT_PATH = EnvStr(None)
     TOKENSPEED_MOE_PADDING = EnvBool(False)
     TOKENSPEED_MOE_CONFIG_DIR = EnvStr(None)

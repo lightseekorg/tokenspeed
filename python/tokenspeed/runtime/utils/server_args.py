@@ -45,8 +45,6 @@ from tokenspeed.runtime.utils.network import is_port_available
 
 logger = get_colorful_logger(__name__)
 
-ENABLE_CP = os.environ.get("ENABLE_CP", "false").lower() in ("true", "1")
-
 
 def str_to_bool(value: str | bool) -> bool:
     if isinstance(value, bool):
@@ -277,6 +275,7 @@ class ServerArgs:
     nprocs_per_node: int | None = None
     world_size: int | None = None
     attn_tp_size: int | None = None
+    attn_cp_size: int = 1
     dense_tp_size: int | None = None
     moe_tp_size: int | None = None
     mapping: Mapping | None = None
@@ -444,12 +443,8 @@ class ServerArgs:
         nnodes = 1 if self.nnodes is None else self.nnodes
 
         attn_tp_size = self.attn_tp_size
+        attn_cp_size = self.attn_cp_size
         attn_dp_size = self.data_parallel_size
-
-        # ``ENABLE_CP`` interprets attention TP size as CP size.
-        attn_cp_size = 1
-        if ENABLE_CP:
-            attn_cp_size, attn_tp_size = attn_tp_size, 1
 
         if world_size is None:
             world_size = 1
@@ -693,9 +688,6 @@ class ServerArgs:
                 "EPLB is enabled or init_expert_location is provided. ep_dispatch_algorithm is configured."
             )
 
-        from tokenspeed.runtime.utils.env import envs
-
-        envs.TOKENSPEED_MAMBA_SSM_DTYPE.set(self.mamba_ssm_dtype)
         if not self.disable_pdl:
             os.environ.setdefault("TORCHINDUCTOR_ENABLE_PDL", "1")
             # Enable PDL for fused attention kernels.
@@ -1732,6 +1724,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.attn_tp_size,
             help="Specify tp size for attn part",
+        )
+        parser.add_argument(
+            "--attn-cp-size",
+            type=int,
+            default=ServerArgs.attn_cp_size,
+            help="Specify context-parallel size for the attention part",
         )
         parser.add_argument(
             "--dense-tp-size",

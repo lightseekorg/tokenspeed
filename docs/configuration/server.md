@@ -31,6 +31,10 @@ For a compact compatibility table, see
 | `--kv-cache-quant-method` | KV cache quantization method. |
 | `--quantization` | Weight quantization mode such as `fp8`, `nvfp4`, `w8a8_fp8`, or `compressed-tensors`. |
 | `--quantization-param-path` | JSON file for KV cache scaling factors, commonly needed with FP8 KV cache. |
+| `--mamba-ssm-dtype` | Recurrent Mamba SSM-state dtype: `float32` (default) or `bfloat16`. |
+
+Mamba state precision is an explicit CLI setting and has no environment-variable
+alias.
 
 ## API Surface
 
@@ -70,6 +74,7 @@ issue budget, while `--max-total-tokens` controls the global token pool.
 | --- | --- |
 | `--tensor-parallel-size`, `--tp` | Familiar alias for setting attention tensor parallel size. |
 | `--attn-tp-size` | Tensor parallel size for attention. |
+| `--attn-cp-size` | Context parallel size for attention. Defaults to 1 after parallelism resolution. |
 | `--dense-tp-size` | Tensor parallel size for dense layers. |
 | `--moe-tp-size` | Tensor parallel size for MoE layers. |
 | `--data-parallel-size` | Number of data-parallel replicas. |
@@ -86,6 +91,9 @@ issue budget, while `--max-total-tokens` controls the global token pool.
 Use `--tensor-parallel-size` for simple launches. Use the
 TokenSpeed-specific split knobs when attention, dense, and MoE layers need
 different process groups.
+
+Parallel topology is configured through CLI arguments; TokenSpeed does not
+read `ENABLE_CP` from the process environment.
 
 ## Backend Selection
 

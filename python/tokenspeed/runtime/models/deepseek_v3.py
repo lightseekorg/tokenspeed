@@ -53,7 +53,6 @@ from tokenspeed.runtime.layers.moe import (
 )
 from tokenspeed.runtime.layers.utils import (
     CP_METADATA,
-    ENABLE_CP,
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_data,
     get_layer_id,
@@ -1465,7 +1464,7 @@ class DeepseekV3Model(nn.Module):
                     residual,
                 )
         if not ctx.forward_mode.is_idle():
-            if not ENABLE_CP:
+            if not self.mapping.attn.has_cp:
                 hidden_states, _ = layer.comm_manager.final_norm(
                     hidden_states, residual, ctx, self.norm
                 )
