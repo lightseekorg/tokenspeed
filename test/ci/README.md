@@ -19,7 +19,25 @@ Supported task types:
 Currently configured task directories:
 
 - `eval`
+- `perf`
 - `ut`
+
+Every task has a normalized `timeout_minutes`. It defaults to `60` and accepts
+an integer from `1` through `360`; booleans and out-of-range values are invalid.
+The normalized value is copied into each matrix entry and becomes the GitHub
+job timeout, so a long benchmark must declare its real upper bound in the task
+spec instead of relying on a workflow-wide constant.
+
+Eval and perf server tasks may declare a list of regular expressions under
+`server.forbidden_log_patterns`. The runner scans `.ci-artifacts/server.log`
+after the server has stopped and cleanup has completed. A log violation cannot
+replace an earlier workload error, and a missing log fails only when the server
+stage actually ran. Match details are bounded in the result JSON.
+
+The three PR workflows upload the complete `.ci-artifacts/` directory,
+including hidden files, rather than guessing workload-specific filenames.
+Workload validators should write durable JSON, logs, and memory samples below
+that directory even when validation fails.
 
 Each task expands into one matrix entry per runner label. Add a top-level
 `priority` to a task YAML to bias dispatch order. GitHub Actions starts matrix

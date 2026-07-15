@@ -37,6 +37,11 @@ SUPPORTED_TRIGGERS = {"per-commit", "manual", "nightly", "debug"}
 # 1gpu unit-test for the same b300 box).
 SUPPORTED_PRIORITIES = ("high", "normal", "low")
 DEFAULT_PRIORITY = "normal"
+DEFAULT_TIMEOUT_MINUTES = 60
+MIN_TIMEOUT_MINUTES = 1
+MAX_TIMEOUT_MINUTES = 360
+MAX_SERVER_LOG_MATCH_DETAILS = 20
+MAX_SERVER_LOG_LINE_CHARS = 500
 SUPPORTED_RUNNER_GROUPS = ("all", "amd", "nvidia", "nvidia-arm", "nvidia-x86")
 _PRIORITY_ORDER = {value: index for index, value in enumerate(SUPPORTED_PRIORITIES)}
 B200_RUNNER_LABEL_ENV = "TOKENSPEED_B200_RUNNER_LABEL"
@@ -115,6 +120,17 @@ def validate_task(data: Dict[str, Any], path: Path) -> None:
         raise ValueError(f"{path}: unsupported api_version {data['api_version']!r}")
     if data["type"] not in SUPPORTED_TYPES:
         raise ValueError(f"{path}: unsupported type {data['type']!r}")
+    timeout_minutes = data.get("timeout_minutes", DEFAULT_TIMEOUT_MINUTES)
+    if (
+        isinstance(timeout_minutes, bool)
+        or not isinstance(timeout_minutes, int)
+        or not MIN_TIMEOUT_MINUTES <= timeout_minutes <= MAX_TIMEOUT_MINUTES
+    ):
+        raise ValueError(
+            f"{path}: timeout_minutes must be an integer from "
+            f"{MIN_TIMEOUT_MINUTES} to {MAX_TIMEOUT_MINUTES}; "
+            f"got {timeout_minutes!r}"
+        )
     triggers = data["triggers"]
     if not isinstance(triggers, list) or not triggers:
         raise ValueError(f"{path}: triggers must be a non-empty list")
@@ -206,11 +222,35 @@ def validate_task(data: Dict[str, Any], path: Path) -> None:
                 f"{path}: optional must be a boolean or a per-label mapping; "
                 f"got {type(optional).__name__}"
             )
+    if "server" in data:
+        server = data["server"]
+        if not isinstance(server, dict):
+            raise ValueError(f"{path}: server must be a mapping")
+        if "forbidden_log_patterns" in server:
+            patterns = server["forbidden_log_patterns"]
+            if not isinstance(patterns, list):
+                raise ValueError(
+                    f"{path}: server.forbidden_log_patterns must be a regex list"
+                )
+            for index, pattern in enumerate(patterns):
+                if not isinstance(pattern, str) or not pattern:
+                    raise ValueError(
+                        f"{path}: server.forbidden_log_patterns[{index}] "
+                        "must be a non-empty regex string"
+                    )
+                try:
+                    re.compile(pattern)
+                except re.error as exc:
+                    raise ValueError(
+                        f"{path}: server.forbidden_log_patterns[{index}] is not "
+                        f"a valid regex {pattern!r}: {exc}"
+                    ) from exc
 
 
 def normalize_task(path: Path, repo_root: Path) -> Dict[str, Any]:
     data = load_yaml(path)
     validate_task(data, path)
+    data.setdefault("timeout_minutes", DEFAULT_TIMEOUT_MINUTES)
     data["_source_path"] = path.relative_to(repo_root).as_posix()
     return data
 
@@ -313,6 +353,7 @@ def build_matrix(
                     "runner": runner,
                     "priority": effective,
                     "optional": is_optional,
+                    "timeout_minutes": task["timeout_minutes"],
                 }
             )
     # Stable sort: tasks at the same priority keep their file-path / label
@@ -1169,6 +1210,58 @@ def clean_log_line(line: str) -> str:
     return line.rstrip()
 
 
+def check_server_log_patterns(
+    task: Dict[str, Any],
+    stages_run: Iterable[str],
+    server_log_path: Path | None,
+    *,
+    dry_run: bool = False,
+) -> Dict[str, Any] | None:
+    """Check a completed server stage log for configured forbidden regexes."""
+    patterns = task.get("server", {}).get("forbidden_log_patterns", [])
+    if dry_run or "server" not in stages_run or not patterns:
+        return None
+
+    result: Dict[str, Any] = {
+        "passed": False,
+        "log_path": str(server_log_path) if server_log_path is not None else None,
+        "patterns": list(patterns),
+        "match_count": 0,
+        "matches": [],
+        "omitted_match_count": 0,
+    }
+    if server_log_path is None or not server_log_path.is_file():
+        result["error"] = f"server log is missing: {server_log_path}"
+        return result
+
+    compiled_patterns = [(pattern, re.compile(pattern)) for pattern in patterns]
+    try:
+        with server_log_path.open(errors="replace") as handle:
+            for line_number, raw_line in enumerate(handle, start=1):
+                line = clean_log_line(raw_line)
+                for pattern, compiled_pattern in compiled_patterns:
+                    if compiled_pattern.search(line) is None:
+                        continue
+                    result["match_count"] += 1
+                    if len(result["matches"]) < MAX_SERVER_LOG_MATCH_DETAILS:
+                        result["matches"].append(
+                            {
+                                "pattern": pattern,
+                                "line_number": line_number,
+                                "line": line[:MAX_SERVER_LOG_LINE_CHARS],
+                            }
+                        )
+    except OSError as exc:
+        result["error"] = f"failed to read server log {server_log_path}: {exc}"
+        return result
+
+    result["omitted_match_count"] = max(
+        0, result["match_count"] - len(result["matches"])
+    )
+    result["passed"] = result["match_count"] == 0
+    return result
+
+
 def extract_evalscope_table(output: str, marker: str) -> str | None:
     marker_index = output.find(marker)
     if marker_index < 0:
@@ -1196,7 +1289,9 @@ def build_step_summary_lines(result: Dict[str, Any]) -> List[str]:
     lines = [
         f"## CI Task `{result['task']}`",
         "",
+        f"- Config: `{result['config']}`",
         f"- Runner: `{result['runner']}`",
+        f"- Timeout: `{result['timeout_minutes']} minutes`",
         f"- Status: `{'success' if result['ok'] else 'failure'}`",
         f"- Executed stages: `{', '.join(result['executed_stages']) if result['executed_stages'] else 'none'}`",
     ]
@@ -1239,6 +1334,13 @@ def build_step_summary_lines(result: Dict[str, Any]) -> List[str]:
         lines.append(
             f"- Eval accept rate: `{accept_rate['accept_rate']:g}` "
             f"({accept_rate['samples']} samples)"
+        )
+    if result.get("server_log_check"):
+        check = result["server_log_check"]
+        status = "pass" if check["passed"] else "fail"
+        lines.append(
+            f"- Server log check: `{status}` "
+            f"({check['match_count']} forbidden matches)"
         )
 
     command_results = result.get("command_results", [])
@@ -1484,6 +1586,7 @@ def execute_task(
                     "type": task["type"],
                     "config": config,
                     "runner": runner,
+                    "timeout_minutes": task["timeout_minutes"],
                     "stages": [name for name, _ in stages],
                     "targets": targets,
                 },
@@ -1502,6 +1605,7 @@ def execute_task(
     eval_score_check: Dict[str, Any] | None = None
     eval_accept_rate: Dict[str, Any] | None = None
     perf_reference_check: Dict[str, Any] | None = None
+    server_log_check: Dict[str, Any] | None = None
     server_process = None
     server_log_path: Path | None = None
     error: str | None = None
@@ -1603,6 +1707,22 @@ def execute_task(
         if enable_perf_diagnostics:
             run_perf_diagnostics("after cleanup", runner_env, repo_root, dry_run)
 
+    server_log_check = check_server_log_patterns(
+        task,
+        stages_run,
+        server_log_path,
+        dry_run=dry_run,
+    )
+    server_log_error: str | None = None
+    if server_log_check is not None and not server_log_check["passed"]:
+        if server_log_check.get("error"):
+            server_log_error = f"server log check failed: {server_log_check['error']}"
+        else:
+            server_log_error = (
+                "server log check failed: "
+                f"{server_log_check['match_count']} forbidden matches"
+            )
+
     if error is None:
         try:
             perf_reference_check = check_perf_reference(
@@ -1616,11 +1736,16 @@ def execute_task(
         except Exception as exc:
             error = str(exc)
 
+    if error is None and server_log_error is not None:
+        error = server_log_error
+
     result = {
         "ok": error is None,
         "task": task["name"],
         "type": task["type"],
+        "config": config,
         "runner": runner,
+        "timeout_minutes": task["timeout_minutes"],
         "executed_stages": stages_run,
         "targets": targets,
         "command_results": command_results,
@@ -1633,6 +1758,8 @@ def execute_task(
         result["perf_reference_check"] = perf_reference_check
     if eval_accept_rate is not None:
         result["eval_accept_rate"] = eval_accept_rate
+    if server_log_check is not None:
+        result["server_log_check"] = server_log_check
     if task.get("report", {}).get("github_step_summary"):
         write_detailed_step_summary(result)
     write_result(result_json, result)

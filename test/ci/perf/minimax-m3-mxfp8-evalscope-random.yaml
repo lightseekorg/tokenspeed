@@ -1,6 +1,7 @@
 api_version: ci.tokenspeed.io/v1
 name: perf-minimax-m3-mxfp8-random
 type: perf
+timeout_minutes: 120
 triggers:
   - manual
 runner:
@@ -8,6 +9,9 @@ runner:
     - b200-4gpu
 install:
   - bash test/ci_system/install_deps.sh
+  - >-
+    python3 test/ci_system/runtime_env_preflight.py
+    --output .ci-artifacts/minimax-m3-fp8-random/runtime_environment.json
 server:
   command: >-
     tokenspeed serve MiniMaxAI/MiniMax-M3-MXFP8
@@ -37,6 +41,14 @@ server:
     url: http://127.0.0.1:8000/readiness
     timeout: 1800
     interval: 10
+  forbidden_log_patterns:
+    - 'Prefill graph capture failed'
+    - 'Scheduler hit an exception:'
+    - 'Buffer overflow when allocating memory'
+    - 'CUDA out of memory'
+    - 'OutOfMemoryError'
+    - 'Retract failed'
+    - 'NCCL.*(?:abort|unhandled)'
 perf:
   install:
     - python3 -m uv venv --seed --clear /tmp/evalscope-minimax-m3 && python3 -m uv pip install --python /tmp/evalscope-minimax-m3/bin/python 'evalscope[perf]==1.8.0'
@@ -53,15 +65,18 @@ perf:
       revision="c5454eb03678d8710e54a4e0fc681b9f3b4a3dba",
       allow_patterns=["*.json","*.jinja","*.txt","*.py"]);
       target.symlink_to(snapshot, target_is_directory=True)'
-  # Add perf_reference only after the pinned sweep has a reviewed baseline.
   command: >-
-    rm -rf /tmp/tokenspeed-minimax-m3-random;
-    rm -f /tmp/tokenspeed-minimax-m3-fp8-memory.csv;
+    artifact_dir=.ci-artifacts/minimax-m3-fp8-random;
+    sweep_dir="$artifact_dir/sweep";
+    memory_csv="$artifact_dir/gpu-memory.csv";
+    rm -rf "$sweep_dir";
+    rm -f "$memory_csv" "$artifact_dir/validation.json";
+    mkdir -p "$sweep_dir";
     nvidia-smi -i 0,1,2,3
     --query-gpu=index,memory.used
     --format=csv,noheader,nounits
     -l 1
-    -f /tmp/tokenspeed-minimax-m3-fp8-memory.csv &
+    -f "$memory_csv" &
     memory_monitor_pid=$!;
     trap 'kill "$memory_monitor_pid" 2>/dev/null || true' EXIT;
     set +e;
@@ -85,7 +100,7 @@ perf:
     --dataset-offset 0
     --temperature 0
     --stream
-    --outputs-dir /tmp/tokenspeed-minimax-m3-random/input_1k
+    --outputs-dir "$sweep_dir/input_1k"
     --no-timestamp
     --extra-args '{"ignore_eos":true}' &&
     /tmp/evalscope-minimax-m3/bin/evalscope perf
@@ -107,7 +122,7 @@ perf:
     --dataset-offset 100000
     --temperature 0
     --stream
-    --outputs-dir /tmp/tokenspeed-minimax-m3-random/input_8k
+    --outputs-dir "$sweep_dir/input_8k"
     --no-timestamp
     --extra-args '{"ignore_eos":true}' &&
     /tmp/evalscope-minimax-m3/bin/evalscope perf
@@ -129,28 +144,56 @@ perf:
     --dataset-offset 200000
     --temperature 0
     --stream
-    --outputs-dir /tmp/tokenspeed-minimax-m3-random/input_32k
+    --outputs-dir "$sweep_dir/input_32k"
     --no-timestamp
-    --extra-args '{"ignore_eos":true}' &&
-    python3 test/random_benchmark/tokenspeed/collect_outputs.py
-    /tmp/tokenspeed-minimax-m3-random
-    --num-gpus 4
+    --extra-args '{"ignore_eos":true}'
     );
-    perf_status=$?;
+    benchmark_status=$?;
+    python3 test/random_benchmark/tokenspeed/collect_outputs.py
+    "$sweep_dir"
+    --num-gpus 4
+    --expect-cell input_1k:1:4
+    --expect-cell input_1k:4:16
+    --expect-cell input_1k:16:64
+    --expect-cell input_8k:1:4
+    --expect-cell input_8k:4:16
+    --expect-cell input_8k:16:64
+    --expect-cell input_32k:1:4
+    --expect-cell input_32k:4:16
+    --validation-json "$artifact_dir/validation.json";
+    validation_status=$?;
     kill "$memory_monitor_pid" 2>/dev/null || true;
     wait "$memory_monitor_pid" 2>/dev/null || true;
     trap - EXIT;
     python3 -c 'import json;
+    import sys;
     from pathlib import Path;
     pairs = [(int(index.strip()), int(value.strip()))
-    for line in Path("/tmp/tokenspeed-minimax-m3-fp8-memory.csv").read_text().splitlines()
+    for line in Path(sys.argv[1]).read_text().splitlines()
     if "," in line for index, value in [line.split(",", 1)]];
     assert pairs, "no GPU memory samples";
     peaks = {index: max(value for sample_index, value in pairs
     if sample_index == index) for index in sorted({index for index, _ in pairs})};
-    print("Peak GPU memory (MiB): " + json.dumps(peaks, sort_keys=True))';
+    assert set(peaks) == {0, 1, 2, 3}, f"missing GPU memory samples: {peaks}";
+    print("Peak GPU memory (MiB): " + json.dumps(peaks, sort_keys=True))'
+    "$memory_csv";
     memory_status=$?;
-    if [ "$perf_status" -ne 0 ]; then exit "$perf_status"; fi;
+    if [ "$benchmark_status" -ne 0 ]; then exit "$benchmark_status"; fi;
+    if [ "$validation_status" -ne 0 ]; then exit "$validation_status"; fi;
     exit "$memory_status"
 report:
   github_step_summary: true
+perf_threshold: 0.9
+# Values are [Latency (tps/user), Throughput (tps/gpu)].
+perf_reference:
+  input_1k:
+    1: [11.49, 2.85]
+    4: [11.63, 11.36]
+    16: [10.58, 39.44]
+  input_8k:
+    1: [11.50, 2.74]
+    4: [11.10, 9.78]
+    16: [8.24, 25.08]
+  input_32k:
+    1: [11.47, 2.39]
+    4: [9.17, 6.48]

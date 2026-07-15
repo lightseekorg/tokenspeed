@@ -29,6 +29,11 @@ ut:
       test/runtime/layers/test_moe_topk.py
       test/quality_benchmark/tokenspeed/test_minimax_m3_fixed_reference.py
       test/random_benchmark/tokenspeed/test_collect_outputs.py
+      test/ci_system/test_runtime_env_preflight.py
+      test/ci_system/test_minimax_m3_gsm8k.py
+      test/ci_system/test_minimax_m3_exact_longctx.py
+      test/ci_system/test_minimax_m3_active_mm_smoke.py
+      test/ci_system/test_pipeline.py
     - >-
       python3 -m pytest -q
       tokenspeed-kernel/test/ops/test_minimax_m3_msa.py

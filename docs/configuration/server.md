@@ -36,6 +36,14 @@ For a compact compatibility table, see
 Mamba state precision is an explicit CLI setting and has no environment-variable
 alias.
 
+For MiniMax-M3 release runs, cache dtype, quantization, GPU placement, and
+workspace behavior are CLI/code configuration. Do not use
+`FLASHINFER_WORKSPACE_SIZE`, visible-device masks, TF32 override variables, or
+TokenSpeed feature environment variables. The mixed BF16-Q/E4M3-KV path owns a
+stable 512 MiB planning workspace internally. CI preflight fails when those
+inherited configuration channels or a persistent TokenSpeed-kernel override
+file are present.
+
 ## API Surface
 
 | Parameter | Purpose |
@@ -135,6 +143,12 @@ capture-size options.
 
 Encoder-graph enablement and metadata sizing are CLI settings. They do not
 have environment-variable aliases.
+
+MiniMax-M3 captures image budgets `[16, 32, 64, 128, 256, 512, 1024, 2048,
+2304]` at startup. A fixed-candidate TP4 validation captured all nine budgets
+on every rank and replayed differently sized single- and multi-image requests
+without request-time recapture. This is real encoder execution capture; it is
+not merely a graph wrapper around an eager tower.
 
 Multimodal hash policy is also an explicit CLI setting with no
 environment-variable alias. Leave content hashing enabled unless intentionally

@@ -1,6 +1,7 @@
 api_version: ci.tokenspeed.io/v1
 name: perf-minimax-m3-mxfp8-exact-longctx
 type: perf
+timeout_minutes: 180
 triggers:
   - manual
 runner:
@@ -8,6 +9,9 @@ runner:
     - b200-4gpu
 install:
   - bash test/ci_system/install_deps.sh
+  - >-
+    python3 test/ci_system/runtime_env_preflight.py
+    --output .ci-artifacts/minimax-m3-exact-longctx/runtime_environment.json
 server:
   command: >-
     tokenspeed serve MiniMaxAI/MiniMax-M3-MXFP8
@@ -34,57 +38,29 @@ server:
     --health-check-interval-secs 1800
     --host 127.0.0.1
     --port 8000
+    --control-port 8001
   ready:
     url: http://127.0.0.1:8000/readiness
     timeout: 3600
     interval: 10
+  forbidden_log_patterns:
+    - Prefill graph capture failed
+    - "Scheduler hit an exception:"
+    - Buffer overflow when allocating memory
+    - CUDA out of memory
+    - OutOfMemoryError
+    - Retract failed
+    - "NCCL.*(?:abort|unhandled)"
 perf:
   command: >-
-    rm -f /tmp/tokenspeed-minimax-m3-exact-longctx-memory.csv;
-    nvidia-smi -i 0,1,2,3
-    --query-gpu=index,memory.used
-    --format=csv,noheader,nounits
-    -l 1
-    -f /tmp/tokenspeed-minimax-m3-exact-longctx-memory.csv &
-    memory_monitor_pid=$!;
-    trap 'kill "$memory_monitor_pid" 2>/dev/null || true' EXIT;
-    set +e;
-    python3 -c 'import time; import requests;
-    started = time.perf_counter();
-    response = requests.post(
-    "http://127.0.0.1:8000/generate",
-    json={"model":"minimax-m3","input_ids":[1] * 1048575,
-    "sampling_params":{"temperature":0,"max_new_tokens":1}},
-    timeout=3600);
-    elapsed = time.perf_counter() - started;
-    print("status=", response.status_code, "elapsed_s=", elapsed);
-    print(response.text[:2000]);
-    response.raise_for_status();
-    body = response.json();
-    assert isinstance(body, list) and len(body) == 1, body;
-    output_ids = body[0].get("output_ids");
-    assert output_ids == [123], output_ids;
-    meta = body[0].get("meta_info", {});
-    assert meta.get("prompt_tokens") == 1048575, meta;
-    assert meta.get("completion_tokens") == 1, meta;
-    health = requests.get("http://127.0.0.1:8000/readiness", timeout=30);
-    print("post_request_readiness=", health.status_code);
-    health.raise_for_status()';
-    request_status=$?;
-    kill "$memory_monitor_pid" 2>/dev/null || true;
-    wait "$memory_monitor_pid" 2>/dev/null || true;
-    trap - EXIT;
-    python3 -c 'import json;
-    from pathlib import Path;
-    pairs = [(int(index.strip()), int(value.strip()))
-    for line in Path("/tmp/tokenspeed-minimax-m3-exact-longctx-memory.csv").read_text().splitlines()
-    if "," in line for index, value in [line.split(",", 1)]];
-    assert pairs, "no GPU memory samples";
-    peaks = {index: max(value for sample_index, value in pairs
-    if sample_index == index) for index in sorted({index for index, _ in pairs})};
-    print("Peak GPU memory (MiB): " + json.dumps(peaks, sort_keys=True))';
-    memory_status=$?;
-    if [ "$request_status" -ne 0 ]; then exit "$request_status"; fi;
-    exit "$memory_status"
+    python3 test/ci_system/minimax_m3_exact_longctx.py
+    --model minimax-m3
+    --base-url http://127.0.0.1:8000
+    --control-url http://127.0.0.1:8001
+    --server-log .ci-artifacts/server.log
+    --output-dir .ci-artifacts/minimax-m3-exact-longctx
+    --gpu-ids 0,1,2,3
+    --request-timeout-seconds 3600
+    --memory-limit-mib 140000
 report:
   github_step_summary: true

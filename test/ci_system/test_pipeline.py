@@ -1,8 +1,10 @@
 import importlib.util
+import json
 import re
 import textwrap
 from pathlib import Path
 
+import pipeline as pipeline_module
 import pytest
 from pipeline import (
     STALE_PROCESS_PATTERNS,
@@ -10,6 +12,7 @@ from pipeline import (
     build_step_summary_lines,
     check_eval_score_threshold,
     check_perf_reference,
+    check_server_log_patterns,
     extract_evalscope_score,
     extract_perf_summary_rows,
     format_perf_reference_markdown_table,
@@ -19,6 +22,7 @@ from pipeline import (
     is_amd_runner,
     is_gb200_runner,
     is_nvidia_arm_runner,
+    normalize_task,
     resolve_score_threshold_for_runner,
     runner_matches_group,
     should_run_nvidia_gpu_cleanup,
@@ -45,29 +49,192 @@ PR_TEST_WORKFLOWS = (
 
 
 @pytest.mark.parametrize("workflow_path", PR_TEST_WORKFLOWS)
-def test_pr_workflows_upload_server_log_with_result(workflow_path):
+def test_pr_workflows_use_matrix_timeout_and_upload_all_ci_artifacts(workflow_path):
     import yaml as _yaml
 
     workflow = _yaml.safe_load((REPO_ROOT / workflow_path).read_text())
+    job = workflow["jobs"]["unit-test"]
     upload_step = next(
         step
-        for step in workflow["jobs"]["unit-test"]["steps"]
+        for step in job["steps"]
         if step.get("uses") == "actions/upload-artifact@v4"
     )
 
-    assert upload_step["with"]["path"].splitlines() == [
-        "${{ env.WORK_DIR }}/.ci-artifacts/result.json",
-        "${{ env.WORK_DIR }}/.ci-artifacts/server.log",
-    ]
+    assert job["timeout-minutes"] == "${{ matrix.timeout_minutes }}"
+    assert upload_step["with"]["path"] == "${{ env.WORK_DIR }}/.ci-artifacts/"
+    assert upload_step["with"]["include-hidden-files"] is True
 
 
 def test_minimax_m3_exact_longctx_locks_known_output_token():
     import yaml as _yaml
+    from minimax_m3_exact_longctx import EXPECTED_OUTPUT_IDS
 
     task_path = REPO_ROOT / "test/ci/perf/minimax-m3-mxfp8-exact-longctx.yaml"
     task = _yaml.safe_load(task_path.read_text())
 
-    assert "assert output_ids == [123], output_ids" in task["perf"]["command"]
+    assert (
+        "python3 test/ci_system/minimax_m3_exact_longctx.py" in task["perf"]["command"]
+    )
+    assert EXPECTED_OUTPUT_IDS == (123,)
+
+
+def test_server_log_check_passes_without_forbidden_matches(tmp_path):
+    log_path = tmp_path / "server.log"
+    log_path.write_text(
+        "server ready\nTraceback during shutdown\nasyncio.exceptions.CancelledError\n"
+    )
+    task = {
+        "server": {
+            "forbidden_log_patterns": [
+                r"CUDA out of memory",
+                r"NCCL.*(?:abort|unhandled)",
+            ]
+        }
+    }
+
+    check = check_server_log_patterns(task, ["server", "perf"], log_path)
+
+    assert check is not None
+    assert check["passed"] is True
+    assert check["match_count"] == 0
+    assert check["matches"] == []
+    assert check["omitted_match_count"] == 0
+
+
+def test_server_log_check_caps_match_details_and_line_length(tmp_path):
+    log_path = tmp_path / "server.log"
+    log_path.write_text(
+        "".join(f"CUDA out of memory {i} " + "x" * 600 + "\n" for i in range(25))
+    )
+    task = {"server": {"forbidden_log_patterns": [r"CUDA out of memory"]}}
+
+    check = check_server_log_patterns(task, ["server"], log_path)
+
+    assert check is not None
+    assert check["passed"] is False
+    assert check["match_count"] == 25
+    assert len(check["matches"]) == 20
+    assert check["omitted_match_count"] == 5
+    assert all(len(match["line"]) <= 500 for match in check["matches"])
+
+
+def test_server_log_check_fails_when_executed_server_log_is_missing(tmp_path):
+    missing_path = tmp_path / "missing.log"
+    task = {"server": {"forbidden_log_patterns": [r"fatal"]}}
+
+    check = check_server_log_patterns(task, ["server"], missing_path)
+
+    assert check is not None
+    assert check["passed"] is False
+    assert check["match_count"] == 0
+    assert "server log is missing" in check["error"]
+
+
+@pytest.mark.parametrize(
+    ("stages_run", "dry_run"),
+    [
+        (["install"], False),
+        (["server"], True),
+    ],
+)
+def test_server_log_check_skips_install_only_and_dry_run(tmp_path, stages_run, dry_run):
+    task = {"server": {"forbidden_log_patterns": [r"fatal"]}}
+
+    check = check_server_log_patterns(
+        task,
+        stages_run,
+        tmp_path / "missing.log",
+        dry_run=dry_run,
+    )
+
+    assert check is None
+
+
+def test_execute_task_scans_after_cleanup_and_preserves_workload_error(
+    tmp_path, monkeypatch
+):
+    config_path = tmp_path / "task.yaml"
+    config_path.write_text(textwrap.dedent("""\
+            api_version: ci.tokenspeed.io/v1
+            name: perf-server-log-order
+            type: perf
+            timeout_minutes: 75
+            triggers:
+              - manual
+            runner:
+              labels:
+                - h100-1gpu
+            server:
+              command: fake-server
+              forbidden_log_patterns:
+                - CUDA out of memory
+              ready:
+                url: http://127.0.0.1:8000/readiness
+            perf:
+              command: fake-workload
+            """))
+    result_path = tmp_path / "result.json"
+    server_log_path = tmp_path / ".ci-artifacts" / "server.log"
+    events = []
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "setup_runner",
+        lambda *args, **kwargs: ({}, None),
+    )
+    monkeypatch.setattr(
+        pipeline_module, "kill_ready_port_listener", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        pipeline_module, "start_server", lambda *args, **kwargs: object()
+    )
+    monkeypatch.setattr(pipeline_module, "poll_readiness", lambda *args, **kwargs: None)
+
+    def fail_workload(command, **kwargs):
+        events.append("workload")
+        raise RuntimeError("workload boom")
+
+    def stop_server(_process):
+        events.append("stop")
+        with server_log_path.open("a") as handle:
+            handle.write("CUDA out of memory during shutdown\n")
+
+    def cleanup_runner(*args, **kwargs):
+        events.append("cleanup")
+
+    original_check = check_server_log_patterns
+
+    def tracked_check(task, stages_run, log_path, *, dry_run=False):
+        events.append("scan")
+        return original_check(
+            task,
+            stages_run,
+            log_path,
+            dry_run=dry_run,
+        )
+
+    monkeypatch.setattr(pipeline_module, "shell_run", fail_workload)
+    monkeypatch.setattr(pipeline_module, "stop_server", stop_server)
+    monkeypatch.setattr(pipeline_module, "cleanup_runner", cleanup_runner)
+    monkeypatch.setattr(pipeline_module, "check_server_log_patterns", tracked_check)
+
+    returncode = pipeline_module.execute_task(
+        config=config_path.name,
+        runner="h100-1gpu",
+        work_dir=str(tmp_path),
+        dry_run=False,
+        print_plan=False,
+        result_json=str(result_path),
+    )
+
+    result = json.loads(result_path.read_text())
+    assert returncode == 1
+    assert events == ["workload", "stop", "cleanup", "scan"]
+    assert result["error"] == "workload boom"
+    assert result["config"] == config_path.name
+    assert result["timeout_minutes"] == 75
+    assert result["server_log_check"]["passed"] is False
+    assert result["server_log_check"]["match_count"] == 1
 
 
 def test_stale_process_patterns_match_smg_router_proctitle():
@@ -393,7 +560,9 @@ def _base_result(**extras):
     base = {
         "ok": True,
         "task": "perf-task",
+        "config": "test/ci/perf/perf-task.yaml",
         "runner": "b200-4gpu",
+        "timeout_minutes": 60,
         "executed_stages": ["server", "perf.install", "perf"],
         "targets": {},
         "command_results": [],
@@ -533,6 +702,135 @@ def _default_body(name: str, labels: list[str], extra: str = "") -> str:
     if extra:
         body += extra
     return body
+
+
+def test_normalize_task_defaults_timeout_minutes_to_60(tmp_path):
+    path = _write_task_yaml(
+        tmp_path,
+        "default-timeout.yaml",
+        _default_body("ut-default-timeout", ["b300-1gpu"]),
+    )
+
+    task = normalize_task(path, tmp_path)
+
+    assert task["timeout_minutes"] == 60
+
+
+@pytest.mark.parametrize("timeout_minutes", [1, 60, 360])
+def test_validate_task_accepts_timeout_minutes_bounds(tmp_path, timeout_minutes):
+    import yaml as _yaml
+
+    path = tmp_path / "timeout.yaml"
+    task = _yaml.safe_load(_default_body("ut-timeout", ["b300-1gpu"]))
+    task["timeout_minutes"] = timeout_minutes
+
+    validate_task(task, path)
+
+
+@pytest.mark.parametrize(
+    "timeout_minutes",
+    [True, False, 0, 361, 60.0, "60", None],
+)
+def test_validate_task_rejects_invalid_timeout_minutes(tmp_path, timeout_minutes):
+    import yaml as _yaml
+
+    path = tmp_path / "invalid-timeout.yaml"
+    task = _yaml.safe_load(_default_body("ut-timeout", ["b300-1gpu"]))
+    task["timeout_minutes"] = timeout_minutes
+
+    with pytest.raises(ValueError, match=r"timeout_minutes must be an integer"):
+        validate_task(task, path)
+
+
+def test_build_matrix_emits_default_and_explicit_timeout_minutes(tmp_path):
+    _write_task_yaml(
+        tmp_path,
+        "a-default.yaml",
+        _default_body("ut-default", ["b300-1gpu"]),
+    )
+    _write_task_yaml(
+        tmp_path,
+        "b-explicit.yaml",
+        _default_body(
+            "ut-explicit",
+            ["b300-1gpu"],
+            extra="timeout_minutes: 120\n",
+        ),
+    )
+
+    matrix = build_matrix(tmp_path, tmp_path, trigger="per-commit")
+
+    assert {entry["name"]: entry["timeout_minutes"] for entry in matrix["include"]} == {
+        "ut-default": 60,
+        "ut-explicit": 120,
+    }
+
+
+def test_execute_task_print_plan_includes_config_and_timeout(tmp_path, capsys):
+    config_path = _write_task_yaml(
+        tmp_path,
+        "plan.yaml",
+        _default_body(
+            "ut-plan",
+            ["b300-1gpu"],
+            extra="timeout_minutes: 90\n",
+        ),
+    )
+
+    returncode = pipeline_module.execute_task(
+        config=config_path.name,
+        runner="b300-1gpu",
+        work_dir=str(tmp_path),
+        dry_run=True,
+        print_plan=True,
+        result_json=None,
+    )
+
+    plan = json.loads(capsys.readouterr().out)
+    assert returncode == 0
+    assert plan["config"] == config_path.name
+    assert plan["timeout_minutes"] == 90
+
+
+def test_validate_task_accepts_compilable_forbidden_log_patterns(tmp_path):
+    import yaml as _yaml
+
+    path = tmp_path / "patterns.yaml"
+    task = _yaml.safe_load(_default_body("ut-patterns", ["b300-1gpu"]))
+    task["server"] = {
+        "forbidden_log_patterns": [
+            r"CUDA out of memory",
+            r"NCCL.*(?:abort|unhandled)",
+        ]
+    }
+
+    validate_task(task, path)
+
+
+@pytest.mark.parametrize(
+    "patterns",
+    ["fatal", [1], [""]],
+)
+def test_validate_task_rejects_malformed_forbidden_log_patterns(tmp_path, patterns):
+    import yaml as _yaml
+
+    path = tmp_path / "invalid-patterns.yaml"
+    task = _yaml.safe_load(_default_body("ut-patterns", ["b300-1gpu"]))
+    task["server"] = {"forbidden_log_patterns": patterns}
+
+    with pytest.raises(ValueError, match=r"server\.forbidden_log_patterns"):
+        validate_task(task, path)
+
+
+def test_validate_task_rejects_invalid_forbidden_log_regex(tmp_path):
+    import yaml as _yaml
+
+    path = tmp_path / "invalid-regex.yaml"
+    task = _yaml.safe_load(_default_body("ut-patterns", ["b300-1gpu"]))
+    task["server"] = {"forbidden_log_patterns": ["["]}
+
+    with pytest.raises(ValueError, match=r"is not a valid regex"):
+        validate_task(task, path)
 
 
 def test_validate_task_accepts_known_priorities(tmp_path):

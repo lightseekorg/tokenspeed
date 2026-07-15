@@ -1,6 +1,7 @@
 api_version: ci.tokenspeed.io/v1
 name: eval-minimax-m3-mxfp8-gsm8k
 type: eval
+timeout_minutes: 180
 triggers:
   - manual
 runner:
@@ -8,6 +9,9 @@ runner:
     - b200-4gpu
 install:
   - bash test/ci_system/install_deps.sh
+  - >-
+    python3 test/ci_system/runtime_env_preflight.py
+    --output .ci-artifacts/minimax-m3-gsm8k/runtime_environment.json
 server:
   command: >-
     tokenspeed serve MiniMaxAI/MiniMax-M3-MXFP8
@@ -32,22 +36,35 @@ server:
     --disable-kvstore
     --host 127.0.0.1
     --port 8000
+    --control-port 8001
   ready:
     url: http://127.0.0.1:8000/readiness
     timeout: 1800
     interval: 10
+  forbidden_log_patterns:
+    - Prefill graph capture failed
+    - "Scheduler hit an exception:"
+    - Buffer overflow when allocating memory
+    - CUDA out of memory
+    - OutOfMemoryError
+    - Retract failed
+    - "NCCL.*(?:abort|unhandled)"
 eval:
   install:
     - python3 -m uv venv --seed --clear /tmp/evalscope-minimax-m3 && python3 -m uv pip install --python /tmp/evalscope-minimax-m3/bin/python 'evalscope[perf]==1.8.0'
-  # Add score_threshold only after a pinned baseline has been reviewed.
   command: >-
-    /tmp/evalscope-minimax-m3/bin/evalscope eval
+    python3 test/ci_system/minimax_m3_gsm8k.py
+    --evalscope /tmp/evalscope-minimax-m3/bin/evalscope
     --model minimax-m3
-    --api-url http://127.0.0.1:8000/v1
-    --api-key EMPTY_TOKEN
-    --datasets gsm8k
+    --base-url http://127.0.0.1:8000
+    --control-url http://127.0.0.1:8001
+    --output-dir .ci-artifacts/minimax-m3-gsm8k
+    --gpu-ids 0,1,2,3
+    --expected-samples 1319
+    --minimum-score 0.971
     --eval-batch-size 8
-    --stream
-    --generation-config '{"do_sample":false,"temperature":0,"max_tokens":8192}'
+    --max-tokens 8192
+    --seed 42
+score_threshold: 0.971
 report:
   github_step_summary: true

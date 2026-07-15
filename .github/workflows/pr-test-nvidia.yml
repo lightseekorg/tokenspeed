@@ -156,7 +156,7 @@ jobs:
       matrix: ${{ fromJson(needs.scan.outputs.matrix) }}
     name: ${{ matrix.name }} (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    timeout-minutes: ${{ matrix.timeout_minutes }}
     continue-on-error: ${{ matrix.optional }}
     env:
       # When the scan job determined that this run touched `tokenspeed-mla/`,
@@ -228,9 +228,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: pr-test-${{ matrix.name }}-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            ${{ env.WORK_DIR }}/.ci-artifacts/result.json
-            ${{ env.WORK_DIR }}/.ci-artifacts/server.log
+          path: ${{ env.WORK_DIR }}/.ci-artifacts/
+          include-hidden-files: true
 
       - name: Cleanup work directory
         if: always()
