@@ -112,6 +112,9 @@ class MHADecodeMetadata:
 class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
     """Standard MHA backend that routes through tokenspeed_kernel attention APIs."""
 
+    # Unconditional: safety comes from the publication rule
+    # (paged_cache_spec.publish_paged_cache_groups) plus the replay
+    # stale-table guard. TODO(radix-removal): drop the flag.
     uses_flat_cache_groups: bool = True
 
     def support_kv_cache_prewrite(
@@ -540,8 +543,8 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
     def forward_extend(
         self,
         q: torch.Tensor,
-        k: torch.Tensor | None,
-        v: torch.Tensor | None,
+        k: torch.Tensor,
+        v: torch.Tensor,
         layer: PagedAttention,
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
@@ -551,12 +554,11 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
     ) -> torch.Tensor:
         assert layer.qk_head_dim == layer.v_head_dim
         assert (k is None) == (v is None)
-        has_kv = k is not None
+        assert k is not None
 
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
-        if has_kv:
-            k = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
-            v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
+        k = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+        v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
 
         metadata = self.forward_extend_metadata
         sinks = kwargs.get("sinks")
