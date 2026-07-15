@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import importlib
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Callable
 
 import pytest
@@ -82,6 +83,7 @@ from tokenspeed_kernel.ops.moe.flashinfer import (
     cutedsl_deepep_nvfp4 as _moe_cutedsl_deepep_nvfp4,
 )
 from tokenspeed_kernel.ops.moe.flashinfer import cutlass_fp8 as _moe_cutlass_fp8
+from tokenspeed_kernel.ops.moe.flashinfer import cutlass_mxfp4 as _moe_cutlass_mxfp4
 from tokenspeed_kernel.ops.moe.flashinfer import cutlass_nvfp4 as _moe_cutlass_nvfp4
 from tokenspeed_kernel.ops.moe.flashinfer import cutlass_unquant as _moe_cutlass_unquant
 from tokenspeed_kernel.ops.moe.flashinfer import trtllm_fp8 as _moe_trtllm_fp8
@@ -125,6 +127,7 @@ _RELOAD_MODULES = [
     # MoE registration modules.
     _moe_cutedsl_deepep_nvfp4,
     _moe_cutlass_fp8,
+    _moe_cutlass_mxfp4,
     _moe_cutlass_nvfp4,
     _moe_cutlass_unquant,
     _moe_trtllm_fp8,
@@ -198,6 +201,125 @@ def test_moe_process_weights_dispatches_plan_preprocessor_callable():
 
     assert result is None
     assert calls == [(plan, module)]
+
+
+def test_mxfp4_cutlass_plan_is_available_on_sm120(
+    sm120_platform: PlatformInfo,
+) -> None:
+    if not hasattr(_moe_cutlass_mxfp4, "flashinfer_cutlass_mxfp4_moe_apply"):
+        pytest.skip("FlashInfer CUTLASS MXFP4 is NVIDIA-only")
+
+    registry = KernelRegistry.get()
+    real_platform = Platform.get()
+    try:
+        Platform.override(sm120_platform)
+        registry.clear_cache()
+
+        plan = tokenspeed_kernel.moe_plan(
+            "mxfp4",
+            input_dtype=torch.bfloat16,
+            activation="swiglu",
+            ep_size=4,
+            ispp=18432,
+            internal_activation_dtype="input",
+            with_bias=True,
+            solution="flashinfer_cutlass",
+        )
+
+        _assert_moe_plan(
+            plan,
+            apply="flashinfer_cutlass_mxfp4_moe_apply",
+            preprocessor="flashinfer_cutlass_mxfp4_moe_weights",
+        )
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
+
+
+@pytest.mark.parametrize("w13_layout", ["concatenated", "interleaved"])
+def test_mxfp4_cutlass_preprocessor_preserves_checkpoint_values(
+    w13_layout: str,
+) -> None:
+    if not hasattr(_moe_cutlass_mxfp4, "flashinfer_cutlass_mxfp4_moe_weights"):
+        pytest.skip("FlashInfer CUTLASS MXFP4 is NVIDIA-only")
+
+    module = torch.nn.Module()
+    module.hidden_size = 128
+    module.w13_weight = torch.nn.Parameter(
+        torch.arange(1 * 256 * 64, dtype=torch.int64)
+        .remainder(256)
+        .to(torch.uint8)
+        .reshape(1, 256, 64),
+        requires_grad=False,
+    )
+    module.w13_weight_scale = torch.nn.Parameter(
+        torch.arange(1 * 256 * 4, dtype=torch.int64)
+        .remainder(256)
+        .to(torch.uint8)
+        .reshape(1, 256, 4),
+        requires_grad=False,
+    )
+    module.w2_weight = torch.nn.Parameter(
+        torch.zeros((1, 128, 64), dtype=torch.uint8), requires_grad=False
+    )
+    module.w2_weight_scale = torch.nn.Parameter(
+        torch.arange(1 * 128 * 4, dtype=torch.int64)
+        .remainder(256)
+        .to(torch.uint8)
+        .reshape(1, 128, 4),
+        requires_grad=False,
+    )
+    module.w13_weight_bias = torch.nn.Parameter(
+        torch.arange(256, dtype=torch.bfloat16).reshape(1, 256),
+        requires_grad=False,
+    )
+    module.w2_weight_bias = torch.nn.Parameter(
+        torch.zeros((1, 128), dtype=torch.bfloat16), requires_grad=False
+    )
+    module.swiglu_arg = SimpleNamespace(alpha=None, limit=7.0)
+    module.swiglu_beta = None
+    module.w13_input_layout = w13_layout
+
+    original_weight = module.w13_weight.detach().clone()
+    original_scale = module.w13_weight_scale.detach().clone()
+    original_bias = module.w13_weight_bias.detach().clone()
+    _moe_cutlass_mxfp4.flashinfer_cutlass_mxfp4_moe_weights({}, module)
+
+    if w13_layout == "concatenated":
+        expected_weight = torch.cat(
+            (original_weight[:, 128:], original_weight[:, :128]), dim=1
+        )
+        expected_scale = torch.cat(
+            (original_scale[:, 128:], original_scale[:, :128]), dim=1
+        )
+        expected_bias = torch.cat(
+            (original_bias[:, 128:], original_bias[:, :128]), dim=1
+        )
+    else:
+        expected_weight = torch.cat(
+            (original_weight[:, 1::2], original_weight[:, 0::2]), dim=1
+        )
+        expected_scale = torch.cat(
+            (original_scale[:, 1::2], original_scale[:, 0::2]), dim=1
+        )
+        expected_bias = torch.cat(
+            (original_bias[:, 1::2], original_bias[:, 0::2]), dim=1
+        )
+
+    assert torch.equal(module.w13_weight, expected_weight)
+    assert torch.equal(module.w13_weight_bias, expected_bias)
+    unswizzled_scale = (
+        module.w13_weight_scale.reshape(1, 2, 1, 32, 4, 4)
+        .permute(0, 1, 4, 3, 2, 5)
+        .reshape(1, 256, 4)
+    )
+    assert torch.equal(unswizzled_scale, expected_scale)
+    assert module.w13_weight_scale.view(torch.int32).shape == (1, 256, 1)
+    assert torch.equal(module.w13_weight_global_scale, torch.ones(1))
+    assert torch.equal(module.w2_weight_global_scale, torch.ones(1))
+    assert module.gemm1_alpha is None
+    assert module.gemm1_beta is None
+    assert torch.equal(module.gemm1_clamp_limit, torch.tensor([7.0]))
 
 
 @dataclass(frozen=True)

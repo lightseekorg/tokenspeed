@@ -198,6 +198,33 @@ def b200_platform() -> PlatformInfo:
 
 
 @pytest.fixture
+def sm120_platform() -> PlatformInfo:
+    return PlatformInfo(
+        vendor="nvidia",
+        arch_version=ArchVersion(12, 0),
+        device_name="NVIDIA RTX PRO 6000 Blackwell Server Edition",
+        device_count=4,
+        total_memory=96 * (1024**3),
+        memory_bandwidth=1792.0,
+        sm_count=188,
+        max_threads_per_sm=1536,
+        max_shared_memory_per_sm=102400,
+        sm_features=frozenset(
+            {
+                "tensor_core:f16",
+                "tensor_core:int8",
+                "tensor_core:f8",
+                "tensor_core:f4",
+                "memory:async_copy",
+                "memory:tma",
+            }
+        ),
+        runtime_features=frozenset({"runtime:cuda_graph"}),
+        interconnect=InterconnectInfo(topology="pcie"),
+    )
+
+
+@pytest.fixture
 def fresh_registry():
     KernelRegistry.reset()
     clear_config_overrides()
