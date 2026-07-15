@@ -49,7 +49,7 @@ from `origin/main`; resume from the feature branch above.
 | FP8 KV/index cache | Implemented and fixed-candidate validated | E4M3 main K/V and index cache passed quality, exact 1M, and the full 8-cell random matrix. The M3 dense path keeps BF16 Q, uses native FA2 mixed extend and TensorRT-LLM mixed decode, and returns BF16 from a shared stable 512 MiB workspace. |
 | Vision encoder CUDA Graph | Real capture and active-MM smoke passed | Explicit CLI enablement captured nine budgets per TP rank (36 total), installed `image_encoder`, and served text, single-image, two-image, and unseen-reference requests without recapture. Dynamic 3D RoPE parity passed 2/2; video was rejected explicitly. |
 | CLI-only GPU placement | Cold-start validation passed | Worker placement uses `--base-gpu-id`/`--gpu-id-step`, and NCCL process groups bind the mapped CUDA device. The TP4 cold start created compute contexts only on GPUs 4-7; GPUs 0-3 remained at 4 MiB with no compute process. |
-| Explicit runtime configuration | Fixed-candidate source/process audit passed | Context length, multimodal hash/timing, Mamba dtype, CP topology, FP8 cache, GPU placement, and encoder graphs are CLI settings. No product feature env, visible-device mask, inherited TF32/workspace override, or persistent kernel override file was present. |
+| Explicit runtime configuration | Fixed-candidate source/process audit passed | Context length, multimodal hash/timing, Mamba dtype, CP topology, FP8 cache, GPU placement, and encoder graphs are CLI settings. No product feature env, visible-device mask, inherited TF32/workspace override, or persistent kernel override file was present; release preflight rejects every inherited `TOKENSPEED_*` key. |
 | Video | Unsupported by design | MiniMax-M3 basic support covers images. Video items are rejected explicitly and are not part of the Phase 5 acceptance matrix. |
 | CI and release benchmark | Fixed-candidate workloads passed; hosted CI pending | Quality passed 14/14, random passed 188/188 per arm, GSM8K scored 0.976497, and exact 1M passed. Strict task validators and artifacts are present; hosted B200 task execution is still required. |
 | Published SMG dependency | **Release blocker** | The candidate checked `tokenspeed-smg==1.7.0.post20260714`; it predates the MiniMax-M3 image processor. A clean active-MM install cannot be declared supported until a compatible package is published. |
@@ -245,9 +245,12 @@ recipes and CI server commands use no feature environment variables; TP4 GPU
 placement uses `--base-gpu-id` and `--gpu-id-step`. Encoder-graph enablement
 and its metadata-sequence cap are explicit CLI fields; both legacy environment
 keys were removed. Preflight also rejects visible-device masks, inherited TF32
-and FlashInfer workspace overrides, kernel override/profile variables, and a
-persistent override YAML. Vendor plumbing created internally by engine workers
-is recorded separately from user configuration.
+and FlashInfer workspace overrides, every inherited `TOKENSPEED_*` variable,
+and a persistent override YAML. Vendor plumbing created internally by engine
+workers is recorded separately from user configuration. A repository-wide
+audit also found legacy `TOKENSPEED_*` reads in the independent EPD
+encode-to-prefill implementation; the aggregated MiniMax-M3 path does not use
+them, and release jobs now fail closed if any are inherited.
 
 ### Fixed-candidate Phase 5 evidence
 

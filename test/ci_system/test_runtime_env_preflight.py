@@ -47,6 +47,8 @@ def test_exact_forbidden_key_fails_even_when_empty(tmp_path: Path, key: str) -> 
         "TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_DECODE",
         "TOKENSPEED_KERNEL_PROFILE_OUTPUT",
         "TOKENSPEED_KERNEL_CAPTURE_SHAPES_OUTPUT",
+        "TOKENSPEED_EPD_ENCODE_RING_SLOTS",
+        "TOKENSPEED_FUTURE_UNLISTED_TOGGLE",
     ],
 )
 def test_forbidden_prefix_key_fails(tmp_path: Path, key: str) -> None:

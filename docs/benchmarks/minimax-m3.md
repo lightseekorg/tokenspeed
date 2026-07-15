@@ -26,12 +26,19 @@ The durable evidence root is:
 Runtime feature choices are CLI arguments. The release commands do not use
 feature environment variables, visible-device masks, TF32 override variables,
 or a FlashInfer workspace override. The runtime preflight also rejects
-TokenSpeed kernel override/profile variables and a persistent
+every inherited `TOKENSPEED_*` variable (including future or legacy EPD and
+kernel variables) and a persistent
 `~/.config/tokenspeed-kernel/overrides.yaml`.
 
 CUDA, NCCL, Torch, and TensorRT-LLM may create vendor plumbing inside worker
 processes after launch. That internal plumbing is audited separately and is
 not a supported product configuration interface.
+
+The repository still contains legacy environment reads in the independent EPD
+encode-to-prefill implementation. They are not used by this aggregated TP4
+MiniMax-M3 image path and are rejected by the release preflight; removing those
+legacy EPD interfaces is tracked separately rather than treating them as a
+MiniMax-M3 configuration surface.
 
 ## Acceptance matrix
 

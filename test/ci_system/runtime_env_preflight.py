@@ -25,28 +25,16 @@ FORBIDDEN_EXACT_KEYS = frozenset(
         "HIP_VISIBLE_DEVICES",
         "NVIDIA_TF32_OVERRIDE",
         "ROCR_VISIBLE_DEVICES",
-        "TOKENSPEED_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN",
-        "TOKENSPEED_BLOCK_NONZERO_RANK_CHILDREN",
-        "TOKENSPEED_CI_SMALL_KV_SIZE",
-        "TOKENSPEED_ENABLE_TORCH_INFERENCE_MODE",
-        "TOKENSPEED_FLAT_DEBUG",
-        "TOKENSPEED_FORCE_FAKE_FULL_NVLINK",
-        "TOKENSPEED_KERNEL_OVERRIDES_FILE",
-        "TOKENSPEED_KERNEL_VERBOSE",
-        "TOKENSPEED_LOG_MM_TIMING",
-        "TOKENSPEED_MAMBA_SSM_DTYPE",
-        "TOKENSPEED_MM_SKIP_COMPUTE_HASH",
-        "TOKENSPEED_NUMA_AWARE_WORKER_AFFINITY",
         "TORCH_ALLOW_TF32_CUBLAS_OVERRIDE",
         "TS_DEBUG_CACHE_SYNC",
         "TS_SERVE_ENGINE_MODULE",
     }
 )
-FORBIDDEN_PREFIXES = (
-    "TOKENSPEED_KERNEL_CAPTURE_SHAPES",
-    "TOKENSPEED_KERNEL_OVERRIDE_",
-    "TOKENSPEED_KERNEL_PROFILE",
-)
+# Release workloads are deliberately fail-closed: every TokenSpeed product,
+# debug, placement, or kernel variable is rejected, including keys introduced
+# after this checker. Runtime behavior must be expressed through reviewed CLI
+# arguments or task data instead of an inherited ``TOKENSPEED_*`` namespace.
+FORBIDDEN_PREFIXES = ("TOKENSPEED_",)
 DEFAULT_OVERRIDE_RELATIVE_PATH = Path(".config/tokenspeed-kernel/overrides.yaml")
 
 
