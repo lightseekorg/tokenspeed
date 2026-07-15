@@ -1,8 +1,6 @@
 name: Publish NVIDIA Nightly Docker Image
 
 on:
-  schedule:
-    - cron: "0 0 * * *"
   workflow_dispatch:
 
 concurrency:
@@ -17,7 +15,7 @@ env:
 
 jobs:
   build:
-    if: github.repository == 'lightseekorg/tokenspeed' && github.ref == 'refs/heads/main'
+    if: github.repository == 'lightseekorg/tokenspeed'
     name: Build ${{ matrix.platform }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 360
@@ -82,7 +80,7 @@ jobs:
           retention-days: 1
 
   merge:
-    if: github.repository == 'lightseekorg/tokenspeed' && github.ref == 'refs/heads/main'
+    if: github.repository == 'lightseekorg/tokenspeed'
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 30
