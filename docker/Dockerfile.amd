@@ -34,7 +34,8 @@ RUN MAX_JOBS=${MAX_JOBS} \
     MAX_JOBS=${MAX_JOBS} \
     TOKENSPEED_KERNEL_BACKEND=rocm \
     python3 -m pip install tokenspeed-kernel/python/ --no-build-isolation && \
-    python3 -m pip install tokenspeed-scheduler/ && \
+    python3 -m pip install tokenspeed-scheduler/ \
+        --config-settings=cmake.define.TOKENSPEED_FLAT_KVCACHE=ON && \
     python3 -m pip install ./python --no-build-isolation
 
 CMD ["/bin/bash"]

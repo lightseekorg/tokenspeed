@@ -31,7 +31,8 @@ RUN python3 -m pip install cmake ninja && \
     FLASHINFER_CUDA_ARCH_LIST="${CUDA_ARCH_LIST}" \
     TOKENSPEED_KERNEL_BACKEND=cuda \
     python3 -m pip install tokenspeed-kernel/python/ --no-build-isolation && \
-    python3 -m pip install tokenspeed-scheduler/ && \
+    python3 -m pip install tokenspeed-scheduler/ \
+        --config-settings=cmake.define.TOKENSPEED_FLAT_KVCACHE=ON && \
     python3 -m pip install ./python --no-build-isolation
 
 CMD ["/bin/bash"]
