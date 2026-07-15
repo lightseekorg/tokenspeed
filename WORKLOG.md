@@ -13,6 +13,12 @@ a different machine without relying on `/tmp` files or shell history.
 - Base: `origin/main@f35ea4ef2ed70173aadd63dcdf7d2f5714f6b9da`
 - Handoff revision: the checked-out branch HEAD; record it with
   `git rev-parse HEAD` after cloning
+- Final source-smoke revision:
+  `ca511c64516f26b1851fcf59c566de7e71c32e22`. The implementation ancestry is
+  `b5dd5fc1a989126d1a1f82ce16a4b3ffc4b0393e` for runtime lifecycle and
+  explicit-configuration hardening, `14cfcb4b9940f803c41b9ba72d2b89143f61e515`
+  for INFO-level encoder-capture validation, and `ca511c6` for immutable
+  pre-shutdown server-log provenance.
 - Model: `MiniMaxAI/MiniMax-M3-MXFP8`
 - Model revision used for the current config:
   `c5454eb03678d8710e54a4e0fc681b9f3b4a3dba`
@@ -52,12 +58,12 @@ from `origin/main`; resume from the feature branch above.
 | FP8 KV/index cache | Implemented and fixed-candidate validated | E4M3 main K/V and index cache passed quality, exact 1M, and the full 8-cell random matrix. The M3 dense path keeps BF16 Q, uses native FA2 mixed extend and TensorRT-LLM mixed decode, and returns BF16 from a shared stable 512 MiB workspace. |
 | Vision encoder CUDA Graph | Real capture and active-MM smoke passed | Explicit CLI enablement captured nine budgets per TP rank (36 total), installed `image_encoder`, and served text, single-image, two-image, and unseen-reference requests without recapture. Dynamic 3D RoPE parity passed 2/2; video was rejected explicitly. |
 | CLI-only GPU placement | Cold-start validation passed | Worker placement uses `--base-gpu-id`/`--gpu-id-step`, and NCCL process groups bind the mapped CUDA device. The TP4 cold start created compute contexts only on GPUs 4-7; GPUs 0-3 remained at 4 MiB with no compute process. |
-| Explicit runtime configuration | Release-hardening implementation and CPU regression passed; final fixed-SHA TP4 validation pending | SMG launch, multimodal SHM/RDMA, PD/EPD queueing, timeouts, heartbeat/failure policy, ring/cache, receive-pool, and sharding settings flow through typed `ServerArgs` configuration. Release preflight rejects inherited `TOKENSPEED_*`, `SMG_*`, `EPD_*`, and `TS_*` namespaces plus the reviewed exact overrides. |
+| Explicit runtime configuration | Fixed-SHA source smoke passed | SMG launch, multimodal SHM/RDMA, PD/EPD queueing, timeouts, heartbeat/failure policy, ring/cache, receive-pool, and sharding settings flow through typed `ServerArgs` configuration. The `ca511c6` TP4 preflight rejected inherited `TOKENSPEED_*`, `SMG_*`, `EPD_*`, and `TS_*` namespaces plus the reviewed exact overrides before a successful active-MM run. |
 | Video | Unsupported by design | MiniMax-M3 basic support covers images. Video items are rejected explicitly and are not part of the Phase 5 acceptance matrix. |
 | CI and release benchmark | Six task specs pass local/static validation; hosted CI pending | Quality passed 14/14, random passed 188/188 per arm, GSM8K scored 0.976497, exact 1M passed, and the active-MM task checks 36 captures, no recapture, dynamic image/text behavior, visual parity, structured video rejection, and clean shutdown logs. No hosted B200 artifacts exist yet. |
-| Source SMG integration | Current source fix pushed; final fixed-SHA active-MM smoke pending | `FlamingoPg/smg@6e0cb7acd62a8b8abe4d426a1289ff659e9a7844` contains M3 processing plus explicit config and orderly engine shutdown. Historical active-image evidence used `b7402c4`; rerun against the final TokenSpeed SHA before closing this row. |
+| Source SMG integration | Fixed-SHA active-MM smoke passed | TokenSpeed `ca511c6` with `FlamingoPg/smg@6e0cb7acd62a8b8abe4d426a1289ff659e9a7844` passed all six request contracts, 36 encoder captures with no recapture, health checks, and orderly source shutdown. |
 | Published SMG dependency | **Release blocker** | No inspected official package contains the MiniMax-M3 processor and the lifecycle/configuration delta. A clean published-package image smoke therefore cannot pass yet. |
-| Clean shutdown | Fix implemented and CPU-tested; final TP4 proof pending | TokenSpeed and SMG now stop Uvicorn/control tasks, drain and cancel background tasks, terminate and reap owned scheduler descendants, and avoid competing signal ownership. Final fixed-SHA TP4 shutdown must prove no `CancelledError`, destroyed task, live descendant, new zombie, bound port, or retained GPU memory. |
+| Clean shutdown | Fixed-SHA TP4 proof passed | Root-only SIGTERM exited zero in 9.47 s. All captured descendants and the exact process group disappeared, ports 8123/8124 closed, GPUs 4-7 returned to 0 MiB with no compute PID, no new TokenSpeed/SMG zombie appeared, and no forbidden lifecycle pattern was logged. |
 | Clean release environment | **Release blocker** | The current development `.venv` exposes system/user packages and a local SMG `.pth`; `pip check` fails the pinned published-SMG requirement. |
 
 ## Design checkpoint
@@ -90,10 +96,11 @@ from `origin/main`; resume from the feature branch above.
   per-device workspace. Cached wrappers retain that pointer for their lifetime;
   the runtime does not resize it live or configure it through an environment
   variable.
-- Product behavior is configured through `ServerArgs`: longer-context override,
-  multimodal hash policy, multimodal timing, Mamba SSM dtype, and CP topology
-  have explicit CLI/data-flow paths. Legacy environment-variable names remain
-  only in regression tests that prove they no longer affect runtime behavior.
+- MiniMax-M3 product behavior is configured through `ServerArgs`:
+  longer-context override, multimodal hash policy, multimodal timing, Mamba SSM
+  dtype, and CP topology have explicit CLI/data-flow paths. Their former
+  environment-variable names remain only in regression tests that prove they
+  no longer affect this runtime path.
 - The conditional-generation entry point follows the shared
   `MultimodalEmbedder` and `VisionEncoderCudaGraphAdapter` seams. The released
   checkpoint's 523 visual tensors stream directly into 395 fused/TP-sharded
@@ -208,8 +215,10 @@ TokenSpeed SHA `70daee236dd4a5958393f1f365ff0e41271e64b9`; their durable evidenc
 is under
 `/raid/flamingo/runs/minimax_m3_phase5_20260715/candidate_70daee236dd/`.
 Quality, FP8/BF16 random, GSM8K, exact 1M, and active encoder CUDA Graph all
-passed. Hosted CI, published SMG packaging, and clean shutdown remain open, so
-this is still a release candidate rather than published basic support.
+passed. The later fixed-SHA source smoke also closed explicit-configuration,
+source-SMG, and clean-shutdown gates. Hosted CI and published SMG packaging
+remain open, so this is still a release candidate rather than published basic
+support.
 
 The public matrix and exact launch contract live in
 `docs/benchmarks/minimax-m3.md`. CI entry points are:
@@ -236,9 +245,9 @@ test/ci/perf/minimax-m3-mxfp8-active-mm.yaml
 | Random throughput sweep | PASS at fixed SHA | FP8 and BF16 each 8/8 cells, 188/188/0; FP8/BF16 ratio 0.970625–0.994717 and 5488 MiB/GPU saved |
 | Environment configuration | PASS | No product feature env, visible-device mask, inherited TF32/workspace override, or persistent kernel override file |
 | CI task parsing/execution | PASS local/static; hosted execution pending | All six specs pass local task discovery/schema/helper validation; strict validators, timeouts, full artifact upload, and post-stop log gates are implemented. Hosted B200 artifacts are still required. |
-| Clean source SMG integration | Historical runtime PASS; hardening rerun pending | Historical active image evidence used `b7402c4`; explicit configuration and orderly shutdown are pushed at `6e0cb7a`. |
+| Source SMG integration | PASS at fixed source SHA | TokenSpeed `ca511c6` plus SMG `6e0cb7a` passed 6/6 active-MM contracts, health probes, encoder replay, and root-only orderly shutdown. |
 | Published SMG with M3 processor | **Blocked externally** | Latest inspected official package lacks the M3 processor; clean-package image smoke cannot pass yet |
-| Clean server shutdown | Fix implemented; final TP4 proof pending | CPU lifecycle regression passes; cold fixed-SHA TP4 must prove clean descendants, logs, ports, and GPU release. |
+| Clean server shutdown | PASS at fixed source SHA | Root-only SIGTERM exited zero in 9.47 s; descendants/PGID, ports, GPU contexts, forbidden lifecycle logs, and new relevant zombies were all clean. |
 
 The language-only eval, perf, and long-context tasks deliberately avoid
 claiming multimodal packaging coverage. Active-MM release remains blocked until
@@ -258,15 +267,19 @@ features. Release jobs reject the complete product namespaces rather than
 treating those variables as supported configuration. The PD/EPD/SMG/RDMA paths
 exercised by this release use typed CLI state, including their former
 heartbeat, failure-injection, timeout, ring/cache, and receive-pool settings.
+This is a release-path guarantee, not a claim that unrelated legacy source has
+no environment-variable reads.
 
 ### Post-candidate Phase 5 release hardening
 
 The performance, quality, exact-1M, and encoder-graph evidence below remains
 pinned to TokenSpeed `70daee236dd4a5958393f1f365ff0e41271e64b9`. It does not
-validate the later lifecycle and explicit-configuration delta. The SMG side of
-that delta is committed and pushed at
-`6e0cb7acd62a8b8abe4d426a1289ff659e9a7844`; the final TokenSpeed hardening SHA
-is pending.
+validate the later lifecycle and explicit-configuration delta. The final
+source-integration smoke tested TokenSpeed
+`ca511c64516f26b1851fcf59c566de7e71c32e22` (runtime hardening ancestor
+`b5dd5fc1a989126d1a1f82ce16a4b3ffc4b0393e`) with
+`FlamingoPg/smg@6e0cb7acd62a8b8abe4d426a1289ff659e9a7844`. Durable evidence is under
+`/raid/flamingo/runs/minimax_m3_phase5_20260715/hardening_ca511c64516_smg_6e0cb7a/`.
 
 The hardening implementation passed the recorded CPU lifecycle,
 configuration, EPD, CI-helper, and SMG regression suites. TokenSpeed's combined
@@ -277,11 +290,26 @@ The full SMG Python suite has 122 passing and one skipped test. SMG's Python
 pre-commit hooks passed; Rust hooks could not run because this machine has no
 `cargo`, and are not recorded as passing.
 
-A cold TP4 source smoke from the final TokenSpeed SHA and SMG `6e0cb7a` is
-still required to validate active images, encoder graph capture/replay, clean
-process teardown, closed ports, and released GPUs. A clean isolated source
-install and `pip check` are also pending. These source checks cannot close the
-separate published-package or hosted-CI gates.
+Runtime preflight passed with no inherited product feature/configuration
+variable, visible-device mask, reviewed exact override, or persistent kernel
+override file. All six active-MM contracts passed. Every TP rank initialized
+the same nine encoder budgets and reported nine captured graphs, for 36 total;
+the count was unchanged after the requests. The unseen-dog logprob absolute
+delta was `0.0005637303`, and all three post-request health probes returned
+HTTP 200.
+
+A SIGTERM sent only to the orchestrator root PID produced exit code zero in
+9.47 seconds. All 44 processes captured at signal time (the root plus 43
+descendants) and the complete process group disappeared, ports 8123/8124
+closed, GPUs 4-7 returned to 0 MiB, no new TokenSpeed/SMG-related zombie
+appeared, and the shutdown log contained no forbidden lifecycle pattern.
+`active_mm/validation.json` and
+`shutdown_validation.json` both record `ok=true`. The immutable validation-time
+log snapshot has SHA256
+`257b02561382f45a4117793f4e4db2f7fed1163bdf25f92078d3b935ee44d2dd`;
+it remained unchanged through shutdown and is an exact prefix of the final
+server log. This closes the source integration and shutdown gates; it does not
+close the published-package or hosted-CI gates.
 
 ### Fixed-candidate Phase 5 evidence
 
@@ -323,22 +351,24 @@ All results in this subsection use TokenSpeed
   persistent kernel override file. Source audit found no environment reads in
   the M3/vision/encoder-graph/kernel implementation scope.
 
-Workload execution and shutdown are recorded separately. GSM8K, exact 1M, and
-active-MM all released GPU memory and closed their ports, but each normal stop
-still emitted one Starlette/Uvicorn lifespan `CancelledError` and left PID
-1-owned zombies. This lifecycle defect is a release blocker even though the
-workload gates pass.
+At historical candidate `70daee2`, GSM8K, exact 1M, and active-MM released GPU
+memory and closed their ports, but each normal stop emitted one
+Starlette/Uvicorn lifespan `CancelledError` and left PID 1-owned zombies. The
+`b5dd5fc1` lifecycle hardening plus the `ca511c6` fixed-SHA source smoke above
+supersede that shutdown result and close the source lifecycle defect.
 
 Packaging was audited independently. A clean rebuild of
 `FlamingoPg/smg@b7402c47759067e2f2a8840eaf7e81e239ca79b5` produced an active
 binding and the source-integration smoke passed. The official
-`tokenspeed-smg==1.7.0.post20260714` sdist inspected on 2026-07-15 contained no
-MiniMax-M3 processor entries, so the clean published-package row remains
-blocked. The current `.venv` is also unsuitable as release proof: it exposes
-system/user site packages, has an `smg.pth` pointing at the local source tree,
-and its installed metadata does not satisfy TokenSpeed's pinned SMG version.
-`pip check` therefore fails. Do not replace the clean-package gate with this
-development environment.
+published private `tokenspeed-smg`, `tokenspeed-smg-grpc-proto`, and
+`tokenspeed-smg-grpc-servicer` artifacts inspected on 2026-07-15 do not contain
+the complete processor/configuration/lifecycle delta, so the clean
+published-package row remains blocked. The fixed SMG source builds upstream
+distribution names (`smg`, `smg-grpc-proto`, and `smg-grpc-servicer`) rather
+than satisfying TokenSpeed's private distribution pins. The current `.venv`
+also contains source integration and dual package ownership, so it is not a
+clean-install or `pip check` release proof. Do not replace the clean-package
+gate with this development environment.
 
 Overall Phase 5 status: `release_eligible=false`. Runtime source integration is
 accepted; published basic support is not declared.
@@ -608,9 +638,14 @@ point where Top-16 block eviction begins.
 - Triton: 3.6.0
 - Transformers: 5.12.0
 - TokenSpeed: 0.1.0
-- SMG Python binding: locally built from
-  `FlamingoPg/smg@b7402c47759067e2f2a8840eaf7e81e239ca79b5`
-- tokenspeed-smg-grpc-servicer: 0.6.0.post20260710
+- Final source smoke: `FlamingoPg/smg@6e0cb7acd62a8b8abe4d426a1289ff659e9a7844`
+- Source distributions: `smg==1.7.0`, `smg-grpc-proto==0.4.14`, and
+  `smg-grpc-servicer==0.6.0`, built from that checkout
+- The development environment also retained the private
+  `tokenspeed-smg-grpc-proto==0.4.12.post20260710` and
+  `tokenspeed-smg-grpc-servicer==0.6.0.post20260710` distribution metadata.
+  This dual ownership is source-integration evidence only, not a clean-package
+  release proof.
 
 At final validation, all M3/TokenSpeed/SMG/Transformers reference processes had
 exited. All eight GPUs reported 0% utilization, GPUs 4-7 had returned to 0 MiB
@@ -657,10 +692,19 @@ cd ..
 git clone --branch flamingo/minimax_m3 \
   https://github.com/FlamingoPg/smg.git
 cd smg
-git checkout b7402c47759067e2f2a8840eaf7e81e239ca79b5
+git checkout 6e0cb7acd62a8b8abe4d426a1289ff659e9a7844
 
 python -m pip install maturin
-python -m pip uninstall -y tokenspeed-smg
+python -m pip uninstall -y \
+  tokenspeed-smg \
+  tokenspeed-smg-grpc-proto \
+  tokenspeed-smg-grpc-servicer \
+  smg \
+  smg-grpc-proto \
+  smg-grpc-servicer
+python -m pip install --force-reinstall --no-deps \
+  ./crates/grpc_client/python \
+  ./grpc_servicer
 cd bindings/python
 PROTOC="$(python -c \
   'from pathlib import Path; import torch; print(Path(torch.__file__).parent / "bin/protoc")')" \
@@ -668,17 +712,35 @@ PROTOC_INCLUDE=/opt/jd_packages/grpc_tools/_proto \
   maturin develop --features vendored-openssl
 
 python - <<'PY'
+from importlib import metadata
 from pathlib import Path
+
 import smg
+import smg_grpc_proto
+import smg_grpc_servicer
 
 print(Path(smg.__file__).resolve())
+print(Path(smg_grpc_proto.__file__).resolve())
+print(Path(smg_grpc_servicer.__file__).resolve())
+for name, version in (
+    ("smg", "1.7.0"),
+    ("smg-grpc-proto", "0.4.14"),
+    ("smg-grpc-servicer", "0.6.0"),
+):
+    actual = metadata.version(name)
+    if actual != version:
+        raise RuntimeError(f"{name}: expected {version}, found {actual}")
 PY
 ```
 
 On a host where the protobuf include directory differs, point
 `PROTOC_INCLUDE` at that host's `grpc_tools/_proto`. Verify that `smg.__file__`
 resolves inside the cloned source tree; otherwise an older user-site package
-may still be shadowing the local build.
+may still be shadowing the local build. The source-only overlay intentionally
+does not satisfy TokenSpeed's differently named private distribution pins, so
+a subsequent `pip check` is expected to report those missing pins. It can
+reproduce source integration, but it cannot close the clean-package release
+gate.
 
 Confirm ownership and available memory before selecting GPUs:
 
@@ -1002,26 +1064,25 @@ pre-commit run --all-files
 
 ## Next acceptance steps
 
-1. Execute all five task specs on hosted B200 runners and retain the complete
+1. Execute all six task specs on hosted B200 runners and retain the complete
    hidden `.ci-artifacts/` tree. Local schema/tests/dry-runs do not close this
    row.
-2. Publish a `tokenspeed-smg` containing the pinned MiniMax-M3 processor, then
-   repeat the active-MM TP4 image smoke in a clean environment with no source
-   `.pth`; require `pip check` to pass.
-3. Fix the launcher/control-server shutdown lifecycle so normal SIGINT emits no
-   Starlette/Uvicorn cancellation traceback and leaves no unreaped children.
-4. If runtime code changes beyond CI/docs/harnesses, repeat quality, both random
+2. Publish matching `tokenspeed-smg`, `tokenspeed-smg-grpc-proto`, and
+   `tokenspeed-smg-grpc-servicer` packages containing the pinned processor,
+   configuration, and lifecycle changes. Then repeat active-MM in an isolated
+   environment with no source shadowing and require `pip check` to pass.
+3. If runtime code changes beyond CI/docs/harnesses, repeat quality, both random
    arms, GSM8K, exact 1M, and active-MM at one new fixed runtime SHA.
-5. Keep video explicitly unsupported and covered by rejection tests; it is not
+4. Keep video explicitly unsupported and covered by rejection tests; it is not
    part of MiniMax-M3 basic image support.
-6. Track the direct Transformers multi-image-call semantic difference. The
+5. Track the direct Transformers multi-image-call semantic difference. The
    serving path deliberately isolates each image to preserve request isolation,
    chunked-prefill reuse, and content-addressed embedding reuse.
-7. Expand concurrent prefix-cache eviction/reuse and mixed-request MSA tests,
+6. Expand concurrent prefix-cache eviction/reuse and mixed-request MSA tests,
    especially skewed non-zero prefixes and non-contiguous page tables.
-8. Add a permanent end-to-end MXFP8 MoE apply numerical test; current coverage
+7. Add a permanent end-to-end MXFP8 MoE apply numerical test; current coverage
    validates GEMM, routing metadata, and reduction separately.
-9. If further 1M prefill optimization is needed, benchmark a distributed
+8. If further 1M prefill optimization is needed, benchmark a distributed
    candidate-Top-K merge against the current small index-query all-gather. The
    accepted Phase 3 BF16 path completed the exact boundary in 223.00 s; the
    fixed-candidate Phase 5 FP8 path completed it in 282.517 s without a request
@@ -1029,19 +1090,88 @@ pre-commit run --all-files
 
 ## Safe shutdown
 
-Record the process-group ID when launching rather than using a broad `pkill`
-pattern that could stop another user's server. One safe pattern is:
+Record both the root PID and process-group ID when launching rather than using
+a broad `pkill` pattern that could stop another user's server. Normal shutdown
+must signal only the orchestrator root so its lifecycle code is exercised;
+the exact PGID is an emergency fallback after a bounded wait.
 
-```bash
-setsid tokenspeed serve ... \
-  --tensor-parallel-size 4 \
-  --base-gpu-id 4 \
-  --gpu-id-step 1 \
-  >minimax_m3_server.log 2>&1 &
-server_pgid=$!
-printf '%s\n' "$server_pgid" > /tmp/minimax_m3_server.pgid
+```python
+import os
+import signal
+import subprocess
+import time
 
-kill -TERM -- "-$(cat /tmp/minimax_m3_server.pgid)"
+import psutil
+
+
+def process_group_members(pgid):
+    members = []
+    for process in psutil.process_iter(["pid", "create_time"]):
+        try:
+            if os.getpgid(process.pid) == pgid:
+                members.append(process.info)
+        except (ProcessLookupError, PermissionError, psutil.NoSuchProcess):
+            pass
+    return members
+
+
+def wait_process_group_empty(pgid, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not process_group_members(pgid):
+            return True
+        time.sleep(0.1)
+    return not process_group_members(pgid)
+
+
+command = [
+    "tokenspeed",
+    "serve",
+    "...",
+    "--tensor-parallel-size",
+    "4",
+    "--base-gpu-id",
+    "4",
+    "--gpu-id-step",
+    "1",
+]
+with open("minimax_m3_server.log", "w") as server_log:
+    server = subprocess.Popen(
+        command,
+        stdout=server_log,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    server_pid = server.pid
+    server_create_time = psutil.Process(server_pid).create_time()
+    server_pgid = os.getpgid(server_pid)
+
+    # Run bounded readiness and workload checks here, then exercise the
+    # orchestrator's own shutdown path. Guard against PID reuse first.
+    current = psutil.Process(server_pid)
+    if current.create_time() != server_create_time:
+        raise RuntimeError("server PID was reused before shutdown")
+    os.kill(server_pid, signal.SIGTERM)
+    try:
+        return_code = server.wait(timeout=120)
+    except subprocess.TimeoutExpired:
+        os.killpg(server_pgid, signal.SIGTERM)
+        try:
+            server.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            os.killpg(server_pgid, signal.SIGKILL)
+            server.wait(timeout=10)
+        raise
+
+    if not wait_process_group_empty(server_pgid, 10):
+        members = process_group_members(server_pgid)
+        os.killpg(server_pgid, signal.SIGTERM)
+        if not wait_process_group_empty(server_pgid, 10):
+            os.killpg(server_pgid, signal.SIGKILL)
+            wait_process_group_empty(server_pgid, 10)
+        raise RuntimeError(f"server process group survived shutdown: {members}")
+    if return_code != 0:
+        raise RuntimeError(f"server exited with status {return_code}")
 ```
 
 After shutdown, verify both the process list and GPU compute-process list before
