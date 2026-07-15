@@ -133,6 +133,42 @@ def _forward_op_executes_model_forward(forward_op, *, is_disagg_decode: bool) ->
     return True
 
 
+def _overlap_result_will_hit_length_limit(forward_op, rid_to_state) -> bool:
+    """Return whether an in-flight result is certain to finish by length.
+
+    Every output-bearing LM forward produces at least one token.  When a
+    request has at most one token left, its delayed overlap result must
+    therefore be committed before planning another forward.  Intermediate
+    prefill chunks are excluded because their sampled token is intentionally
+    discarded.
+    """
+    if forward_op is None:
+        return False
+
+    num_extends = forward_op.num_extends()
+    prefill_lengths = getattr(forward_op, "prefill_lengths", None)
+    for i, rid in enumerate(forward_op.request_ids):
+        state = rid_to_state.get(rid)
+        if state is None:
+            continue
+
+        if i < num_extends:
+            prefill_length = (
+                prefill_lengths[i]
+                if prefill_lengths is not None
+                else state.input_length
+            )
+            chunk_end = forward_op.extend_prefix_lens[i] + forward_op.input_lengths[i]
+            if chunk_end < prefill_length:
+                continue
+
+        max_new_tokens = state.sampling_params.max_new_tokens
+        if max_new_tokens is not None and state.output_length + 1 >= max_new_tokens:
+            return True
+
+    return False
+
+
 class _NullSender:
     """No-op ZMQ sender for non-rank-0 workers."""
 
@@ -1322,6 +1358,41 @@ class EventLoop:
 
         return request_changes
 
+    def _commit_length_terminal_overlap_result(
+        self,
+        forward_op,
+        results: ModelExecutionResult | None,
+    ) -> bool:
+        """Commit a delayed result before it can be spuriously rescheduled.
+
+        The overlap loop normally plans the next forward before synchronizing
+        the previous result.  At a known length boundary that would let the
+        scheduler request one impossible extra decode step.  In an exact-fit
+        cache this falls into retract and can abort the request before Python
+        reports the already-produced final token.
+
+        Synchronizing only this terminal boundary preserves normal overlap.
+        ``post_process_forward_op`` emits ExtendResult before Finish, so the
+        sampled token reaches the scheduler before Finish releases its cache.
+        """
+        if results is None or not _overlap_result_will_hit_length_limit(
+            forward_op, self.output_processor.rid_to_state
+        ):
+            return False
+
+        request_changes = self._commit_forward_results(forward_op, results)
+        if request_changes:
+            advance_forward(self.scheduler, request_changes)
+            self._publish_scheduler_kv_events()
+        return True
+
+    def _next_overlap_execution_plan(self, prev_forward_op, prev_results):
+        """Commit a known terminal result, then plan the next overlap step."""
+        terminal_result_committed = self._commit_length_terminal_overlap_result(
+            prev_forward_op, prev_results
+        )
+        return self.scheduler.next_execution_plan(), terminal_result_committed
+
     def _get_forward_op(self, execution_plan):
         """Return the next forward op from the given plan, or None if there is nothing to run."""
         forward_ops = execution_plan.forward
@@ -1739,7 +1810,18 @@ class EventLoop:
                 prev_results = None
                 prev_forward_op = None
                 continue
-            execution_plan = self.scheduler.next_execution_plan()
+
+            # A one-token-remaining request is certain to finish when its
+            # delayed result is consumed.  Commit it before asking the
+            # scheduler for another plan; otherwise an exact-fit context can
+            # spuriously enter retract while this final token is still in
+            # flight from the scheduler's point of view.
+            execution_plan, terminal_result_committed = (
+                self._next_overlap_execution_plan(prev_forward_op, prev_results)
+            )
+            if terminal_result_committed:
+                prev_results = None
+                prev_forward_op = None
             self._publish_scheduler_kv_events()
             self._handle_flat_oom_terminals(execution_plan)
 
@@ -1857,7 +1939,7 @@ def run_event_loop(
     pipe_writer,
 ):
     mapping = server_args.mapping
-    gpu_id = mapping.rank % mapping.nprocs_per_node + server_args.base_gpu_id
+    gpu_id = mapping.gpu_id
     attn_tp_rank = mapping.attn.tp_rank
     dp_rank = mapping.attn.dp_rank
     global_rank = mapping.rank

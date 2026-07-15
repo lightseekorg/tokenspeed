@@ -557,7 +557,7 @@ class MiniMaxM3VisionTower(nn.Module):
             grid_thw,
             spatial_merge_size=self.spatial_merge_size,
         )
-        position_embeddings = self.rotary_emb(
+        rotary_pos_emb_cos, rotary_pos_emb_sin = self.rotary_emb(
             grids,
             device=self.device,
             dtype=self.dtype,
@@ -603,7 +603,12 @@ class MiniMaxM3VisionTower(nn.Module):
             )
 
         return {
-            "position_embeddings": position_embeddings,
+            # Keep graph-varying tensors at the top level. The generic encoder
+            # CUDA-graph wrapper owns and refreshes top-level tensor buffers on
+            # replay; nesting these in a tuple would bake the synthetic capture
+            # grid's 3D RoPE into every real image.
+            "rotary_pos_emb_cos": rotary_pos_emb_cos,
+            "rotary_pos_emb_sin": rotary_pos_emb_sin,
             "cu_seqlens": cu_seqlens,
             "max_seqlen": max_seqlen,
             "sequence_lengths": sequence_lengths,
@@ -621,7 +626,10 @@ class MiniMaxM3VisionTower(nn.Module):
                 f"{tuple(hidden_states.shape)}."
             )
 
-        position_embeddings = metadata["position_embeddings"]
+        position_embeddings = (
+            metadata["rotary_pos_emb_cos"],
+            metadata["rotary_pos_emb_sin"],
+        )
         cu_seqlens = metadata["cu_seqlens"]
         max_seqlen = metadata["max_seqlen"]
         sequence_lengths = metadata["sequence_lengths"]

@@ -283,6 +283,8 @@ class ServerArgs:
 
     mla_chunk_multiplier: int = 4
     mm_attention_backend: str | None = None
+    enable_mm_encoder_cuda_graph: bool = False
+    mm_encoder_cudagraph_max_metadata_sequences_per_batch: int | None = None
 
     # For PD/EPD disaggregation: "null", "prefill", "decode", or "encode" (vision-tower-only).
     disaggregation_mode: str = "null"
@@ -1796,6 +1798,26 @@ class ServerArgs:
             choices=mm_attention_backend_choices,
             default=ServerArgs.mm_attention_backend,
             help="Set multimodal attention backend.",
+        )
+        parser.add_argument(
+            "--enable-mm-encoder-cuda-graph",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.enable_mm_encoder_cuda_graph,
+            help=(
+                "Capture and replay supported multimodal encoders with CUDA "
+                "Graph. The encoder falls back to eager execution for inputs "
+                "outside its captured budgets."
+            ),
+        )
+        parser.add_argument(
+            "--mm-encoder-cudagraph-max-metadata-sequences-per-batch",
+            type=int,
+            default=(ServerArgs.mm_encoder_cudagraph_max_metadata_sequences_per_batch),
+            help=(
+                "Maximum number of attention metadata sequences captured per "
+                "multimodal encoder batch. By default, supported models derive "
+                "this limit from the graph token budget."
+            ),
         )
         # Disaggregation
         parser.add_argument(

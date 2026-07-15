@@ -123,7 +123,7 @@ def _prefill_block_score_kernel(
             + page * stride_k_page
             + key_offsets[None, :] * stride_k_pos
             + dims[:, None] * stride_k_d,
-        )
+        ).to(tl.bfloat16)
         logits = tl.dot(query, key, out_dtype=tl.float32) * scale
         logits = tl.where(
             packed_query_positions[:, None] >= key_positions[None, :],
@@ -221,7 +221,7 @@ def _decode_block_score_kernel(
             + page * stride_k_page
             + key_offsets[:, None] * stride_k_pos
             + dims[None, :] * stride_k_d,
-        )
+        ).to(tl.bfloat16)
         logits = tl.dot(key, query, out_dtype=tl.float32) * scale
         logits = tl.where(
             (key_positions[:, None] < visible_lens[None, :]) & query_mask[None, :],
@@ -349,10 +349,14 @@ def minimax_m3_msa_indexer(
             dtype=torch.int32,
             device=index_q.device,
         )
-    if index_q.dtype != torch.bfloat16 or index_k_cache.dtype != torch.bfloat16:
-        raise TypeError("MiniMax-M3 Triton indexer requires BF16 query/key cache")
+    if index_q.dtype != torch.bfloat16:
+        raise TypeError("MiniMax-M3 Triton indexer requires BF16 index queries")
     if index_k.dtype != torch.bfloat16:
         raise TypeError("MiniMax-M3 Triton indexer requires BF16 index keys")
+    if index_k_cache.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+        raise TypeError(
+            "MiniMax-M3 Triton indexer requires a BF16 or FP8 E4M3 index cache"
+        )
     if index_k_cache.shape[0] % SPARSE_BLOCK_SIZE:
         raise ValueError("index_k_cache slot count must be divisible by 128")
 

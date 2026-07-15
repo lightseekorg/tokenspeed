@@ -51,6 +51,9 @@ from tokenspeed.runtime.cache.embedding_cache import (
     EmbeddingCache,
     TieredEmbeddingCache,
 )
+from tokenspeed.runtime.multimodal.encoder_cudagraph import (
+    install_encoder_cudagraph_wrappers,
+)
 from tokenspeed.runtime.pd.epd.encode_scheduler import EncodeScheduler
 from tokenspeed.runtime.pd.epd.encode_worker import EncodeWorker
 from tokenspeed.runtime.utils import get_colorful_logger, get_zmq_socket
@@ -120,28 +123,23 @@ def _build_manager_args(server_args, mapping):
 
 
 def _maybe_install_encoder_cudagraph(model, server_args) -> bool:
-    """Install the vision-encoder CUDA-graph wrapper as ``model.image_encoder``,
-    mirroring the aggregated path's hook in ``execution/model_executor.py``.
+    """Install the image CUDA-graph wrapper exposed by the model.
 
     The encode loop never builds a ModelExecutor, so this is where the encode
-    worker opts into capture/replay of the tower instead of running it eager. Same
-    gate as the aggregated install: the model exposes the builder, multimodal is
-    active, the env flag is on, and the attention backend is graph-capturable. The
-    wrapper IS the model's ``image_encoder`` seam (lazy capture on first encode);
-    the executor's IMAGE path dispatches through ``model.image_encoder`` and falls
-    back to eager ``get_image_feature`` (the default) when this returns False.
-    Returns whether the wrapper was installed.
+    worker opts into capture/replay of the tower instead of running it eager.
+    The gate and plural wrapper-builder contract match the aggregated executor.
+    The executor's IMAGE path dispatches through ``model.image_encoder`` and
+    retains the eager model method when this function returns ``False``.
     """
-    if not (
-        hasattr(model, "make_encoder_cudagraph_wrapper")
-        and getattr(model, "is_multimodal_active", True)
-        and envs.TOKENSPEED_MM_ENABLE_ENCODER_CUDA_GRAPH.get()
-        and server_args.mm_attention_backend != "flashinfer_cudnn"
-    ):
-        return False
-    model.image_encoder = model.make_encoder_cudagraph_wrapper(model.mapping)
-    logger.info("EPD encode worker: vision-encoder CUDA graph installed")
-    return True
+    wrappers = install_encoder_cudagraph_wrappers(
+        model,
+        enabled=server_args.enable_mm_encoder_cuda_graph,
+        mm_attention_backend=server_args.mm_attention_backend,
+        max_metadata_sequences_per_batch=(
+            server_args.mm_encoder_cudagraph_max_metadata_sequences_per_batch
+        ),
+    )
+    return "image_encoder" in wrappers
 
 
 def _build_encode_worker(server_args, port_args, gpu_id, global_rank):

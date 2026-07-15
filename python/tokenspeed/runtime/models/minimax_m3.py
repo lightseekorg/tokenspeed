@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable
 
 import torch
@@ -64,7 +65,10 @@ from tokenspeed.runtime.layers.moe.utils import RoutingMethodType
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
-from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
+from tokenspeed.runtime.model_loader.weight_utils import (
+    default_weight_loader,
+    kv_cache_scales_loader,
+)
 from tokenspeed.runtime.models.base import (
     BaseCausalLM,
     BaseDecoderLayer,
@@ -607,6 +611,9 @@ class MiniMaxM3Attention(nn.Module):
         key_cache = key_cache.permute(0, 2, 1, 3)
         value_cache = value_cache.permute(0, 2, 1, 3)
         index_k_cache = pool.get_index_k_buffer(self.attn.layer_id)
+        fp8_cache = key_cache.dtype == torch.float8_e4m3fn
+        k_scale = self.attn.k_scale if fp8_cache else None
+        v_scale = self.attn.v_scale if fp8_cache else None
 
         if decode_query_len:
             selected_blocks = minimax_m3_msa_indexer(
@@ -632,6 +639,8 @@ class MiniMaxM3Attention(nn.Module):
                 page_table,
                 metadata.seq_lens,
                 scale=self.head_dim**-0.5,
+                k_scale=k_scale,
+                v_scale=v_scale,
                 decode_query_len=decode_query_len,
                 solution="triton",
             )
@@ -668,6 +677,8 @@ class MiniMaxM3Attention(nn.Module):
                 page_table,
                 metadata.seq_lens,
                 scale=self.head_dim**-0.5,
+                k_scale=k_scale,
+                v_scale=v_scale,
                 cu_seqlens_q=metadata.cu_extend_seq_lens,
                 prefix_lens=metadata.extend_prefix_lens,
                 max_query_len=metadata.max_extend_seq_len,
@@ -744,6 +755,40 @@ class MiniMaxM3SparseForCausalLM(BaseCausalLM):
 
         del checkpoint_name, loaded_weight, params_dict
         return None
+
+    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
+        """Load one static FP8 KV-cache scale per local attention layer."""
+
+        if self.model is None:
+            return
+        tp_rank = self.mapping.attn.tp_rank
+        loaded_scales = list(
+            kv_cache_scales_loader(
+                quantization_param_path,
+                tp_rank,
+                self.mapping.attn.tp_size,
+                self.config.num_hidden_layers,
+                self.config.__class__.model_type,
+                strict=True,
+            )
+        )
+        validated_scales: list[tuple[int, float]] = []
+        for layer_idx, scaling_factor in loaded_scales:
+            scale = float(scaling_factor)
+            if not math.isfinite(scale) or scale <= 0:
+                raise ValueError(
+                    "MiniMax-M3 KV-cache scale must be finite and greater than "
+                    f"zero, got {scaling_factor!r} for TP rank {tp_rank}, "
+                    f"layer {layer_idx} in {quantization_param_path!r}."
+                )
+            validated_scales.append((layer_idx, scale))
+
+        # Validate every scale before mutating any layer so a bad calibration
+        # file cannot leave the model partially configured.
+        for layer_idx, scaling_factor in validated_scales:
+            attention = self.model.layers[layer_idx].self_attn.attn
+            attention.k_scale = scaling_factor
+            attention.v_scale = scaling_factor
 
     def load_weights(
         self,
@@ -1045,7 +1090,10 @@ class MiniMaxM3SparseForConditionalGeneration(MiniMaxM3SparseForCausalLM):
         return output
 
     def make_encoder_cudagraph_wrappers(
-        self, mapping: Mapping
+        self,
+        mapping: Mapping,
+        *,
+        max_metadata_sequences_per_batch: int | None = None,
     ) -> dict[str, EncoderCudaGraphWrapper]:
         """Build the standard token-preserving ViT CUDA-graph wrapper."""
 
@@ -1071,6 +1119,7 @@ class MiniMaxM3SparseForConditionalGeneration(MiniMaxM3SparseForCausalLM):
                 # at most 2304 patches per image at 672 x 672.
                 budget_range=(16, 2304),
                 max_batch_size=10,
+                max_metadata_sequences_per_batch=max_metadata_sequences_per_batch,
             )
         }
 

@@ -67,38 +67,17 @@ from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from tokenspeed.runtime.utils.env import envs
 
-# Streaming HTTP timeouts. ``total=6h`` keeps the session umbrella generous so
-# whole-run benches don't get cut off; the per-socket sub-timeouts catch a
-# legitimately stuck stream without false-failing slow legitimate prefills.
-#
-# ``sock_read`` defaults to 30 minutes — well above the largest TTFT one would
-# expect on real hardware (a 64k-context prefill on a single-GPU consumer card
-# is still well under 10 minutes) yet far below ``total``, so an indefinitely
-# silent socket still surfaces as a ``aiohttp.ServerTimeoutError`` rather than
-# blocking the outer ``asyncio.gather`` at high concurrency. Long-haul or
-# pathologically large prefill workloads can bump it via env. ``sock_connect``
-# is the dial-tone timeout for the TCP handshake itself.
-AIOHTTP_TOTAL_TIMEOUT_SEC = float(
-    os.environ.get("TOKENSPEED_BENCH_TOTAL_TIMEOUT_SEC", str(6 * 60 * 60))
-)
-AIOHTTP_SOCK_CONNECT_TIMEOUT_SEC = float(
-    os.environ.get("TOKENSPEED_BENCH_SOCK_CONNECT_TIMEOUT_SEC", "30")
-)
-AIOHTTP_SOCK_READ_TIMEOUT_SEC = float(
-    os.environ.get("TOKENSPEED_BENCH_SOCK_READ_TIMEOUT_SEC", str(30 * 60))
-)
-AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(
-    total=AIOHTTP_TOTAL_TIMEOUT_SEC,
-    sock_connect=AIOHTTP_SOCK_CONNECT_TIMEOUT_SEC,
-    sock_read=AIOHTTP_SOCK_READ_TIMEOUT_SEC,
-)
-# Per-request hard ceiling so a single misbehaving stream cannot block the
-# whole gather. 1h is generous enough for the longest practical decode and
-# still bounded for CI / smoke benches. Override via env when running
-# unusually long sequences.
-PER_REQUEST_TIMEOUT_SEC = float(
-    os.environ.get("TOKENSPEED_BENCH_PER_REQUEST_TIMEOUT_SEC", str(60 * 60))
-)
+# Streaming HTTP timeout defaults. ``total=6h`` keeps the session umbrella
+# generous so whole-run benches don't get cut off. ``sock_read=30m`` is well
+# above the largest expected TTFT while still surfacing a silent socket, and
+# ``sock_connect=30s`` bounds the TCP handshake. The separate 1h per-request
+# ceiling prevents one misbehaving stream from blocking the outer gather.
+# All four values are explicit CLI options so benchmark configuration is
+# visible in the invocation rather than hidden in process environment state.
+DEFAULT_HTTP_TOTAL_TIMEOUT_SEC = float(6 * 60 * 60)
+DEFAULT_HTTP_SOCK_CONNECT_TIMEOUT_SEC = 30.0
+DEFAULT_HTTP_SOCK_READ_TIMEOUT_SEC = float(30 * 60)
+DEFAULT_PER_REQUEST_TIMEOUT_SEC = float(60 * 60)
 DEFAULT_NUM_PROMPTS = 1000
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
 SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
@@ -119,6 +98,19 @@ def _print_metric_row(label: str, value: Any, precision: int | None = None) -> N
         f"{value:<10}" if precision is None else f"{value:<10.{precision}f}"
     )
     print(f"{label:<40} {formatted_value}")
+
+
+def make_http_timeout(
+    total_timeout_sec: float,
+    sock_connect_timeout_sec: float,
+    sock_read_timeout_sec: float,
+) -> aiohttp.ClientTimeout:
+    """Build the streaming HTTP timeout from explicit benchmark options."""
+    return aiohttp.ClientTimeout(
+        total=total_timeout_sec,
+        sock_connect=sock_connect_timeout_sec,
+        sock_read=sock_read_timeout_sec,
+    )
 
 
 class StreamedResponseHandler:
@@ -205,9 +197,10 @@ async def await_with_per_request_timeout(
     coro: Coroutine[Any, Any, RequestFuncOutput],
     *,
     prompt_len: int,
+    timeout_sec: float,
     pbar: tqdm | None = None,
 ) -> RequestFuncOutput:
-    """Run a request coroutine under :data:`PER_REQUEST_TIMEOUT_SEC`.
+    """Run a request coroutine under an explicit timeout.
 
     Wraps the per-request ``asyncio.wait_for`` so a single stuck stream
     cannot deadlock the outer ``asyncio.gather`` in :func:`benchmark`.  On
@@ -216,14 +209,13 @@ async def await_with_per_request_timeout(
     complete and the metrics output reports the failure normally.
     """
     try:
-        return await asyncio.wait_for(coro, timeout=PER_REQUEST_TIMEOUT_SEC)
+        return await asyncio.wait_for(coro, timeout=timeout_sec)
     except asyncio.TimeoutError:
         output = RequestFuncOutput()
         output.prompt_len = prompt_len
         output.success = False
         output.error = (
-            f"per-request timeout {PER_REQUEST_TIMEOUT_SEC:.1f}s "
-            "(TOKENSPEED_BENCH_PER_REQUEST_TIMEOUT_SEC)"
+            f"per-request timeout {timeout_sec:.1f}s " "(--per-request-timeout-sec)"
         )
         if pbar is not None:
             pbar.update(1)
@@ -1419,6 +1411,10 @@ async def benchmark(
     ramp_up_end_rps: int | None = None,
     ready_check_timeout_sec: int = 600,
     ssl_context: ssl.SSLContext | bool | None = None,
+    http_total_timeout_sec: float = DEFAULT_HTTP_TOTAL_TIMEOUT_SEC,
+    http_sock_connect_timeout_sec: float = DEFAULT_HTTP_SOCK_CONNECT_TIMEOUT_SEC,
+    http_sock_read_timeout_sec: float = DEFAULT_HTTP_SOCK_READ_TIMEOUT_SEC,
+    per_request_timeout_sec: float = DEFAULT_PER_REQUEST_TIMEOUT_SEC,
 ) -> dict[str, Any]:
     try:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -1427,7 +1423,13 @@ async def benchmark(
 
     connector = aiohttp.TCPConnector(ssl=ssl_context)
     session = aiohttp.ClientSession(
-        connector=connector, trust_env=True, timeout=AIOHTTP_TIMEOUT
+        connector=connector,
+        trust_env=True,
+        timeout=make_http_timeout(
+            http_total_timeout_sec,
+            http_sock_connect_timeout_sec,
+            http_sock_read_timeout_sec,
+        ),
     )
 
     test_request = input_requests[0]
@@ -1531,6 +1533,7 @@ async def benchmark(
             return await await_with_per_request_timeout(
                 coro,
                 prompt_len=request_func_input.prompt_len,
+                timeout_sec=per_request_timeout_sec,
                 pbar=pbar,
             )
 
@@ -1725,6 +1728,13 @@ def parse_goodput(slo_pairs: list[str] | None) -> dict[str, float]:
     return goodput_config_dict
 
 
+def _positive_float(value: str) -> float:
+    parsed = float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
+
+
 def compute_result_filename(
     args: argparse.Namespace, model_id: str, label: str | None, current_dt: str
 ) -> str | None:
@@ -1798,6 +1808,30 @@ def add_serving_cli_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-concurrency", type=int, default=None)
     parser.add_argument("--num-warmups", type=int, default=0)
     parser.add_argument("--ready-check-timeout-sec", type=int, default=600)
+    parser.add_argument(
+        "--http-total-timeout-sec",
+        type=_positive_float,
+        default=DEFAULT_HTTP_TOTAL_TIMEOUT_SEC,
+        help="Total timeout for the benchmark HTTP session (default: 21600).",
+    )
+    parser.add_argument(
+        "--http-sock-connect-timeout-sec",
+        type=_positive_float,
+        default=DEFAULT_HTTP_SOCK_CONNECT_TIMEOUT_SEC,
+        help="TCP connection timeout for benchmark requests (default: 30).",
+    )
+    parser.add_argument(
+        "--http-sock-read-timeout-sec",
+        type=_positive_float,
+        default=DEFAULT_HTTP_SOCK_READ_TIMEOUT_SEC,
+        help="Maximum silence between streamed response reads (default: 1800).",
+    )
+    parser.add_argument(
+        "--per-request-timeout-sec",
+        type=_positive_float,
+        default=DEFAULT_PER_REQUEST_TIMEOUT_SEC,
+        help="Hard timeout for each measured request (default: 3600).",
+    )
     parser.add_argument("--disable-tqdm", action="store_true")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--profile-num-steps", type=int, default=None)
@@ -1951,6 +1985,10 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         ramp_up_end_rps=args.ramp_up_end_rps,
         ready_check_timeout_sec=args.ready_check_timeout_sec,
         ssl_context=ssl_context,
+        http_total_timeout_sec=args.http_total_timeout_sec,
+        http_sock_connect_timeout_sec=args.http_sock_connect_timeout_sec,
+        http_sock_read_timeout_sec=args.http_sock_read_timeout_sec,
+        per_request_timeout_sec=args.per_request_timeout_sec,
     )
 
     current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")

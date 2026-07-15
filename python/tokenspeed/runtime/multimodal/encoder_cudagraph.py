@@ -381,7 +381,8 @@ class EncoderCudaGraphWrapper:
 
     def capture(self) -> None:
         for encoder_output_token_budget in self.encoder_output_token_budgets:
-            self._capture_one(encoder_output_token_budget)
+            if encoder_output_token_budget not in self.budget_graphs:
+                self._capture_one(encoder_output_token_budget)
         logger.info(
             "Encoder CUDA graph capture complete: modality=%s, %d budget graphs.",
             self.modality_name,
@@ -642,3 +643,90 @@ class EncoderCudaGraphWrapper:
                 )
 
         return [outputs_by_orig_idx[i] for i in range(num_items)]
+
+
+def install_encoder_cudagraph_wrappers(
+    model: Any,
+    *,
+    enabled: bool,
+    mm_attention_backend: str | None,
+    max_metadata_sequences_per_batch: int | None,
+) -> dict[str, EncoderCudaGraphWrapper]:
+    """Build, capture, and install all encoder CUDA-graph wrappers for a model.
+
+    Explicit enablement is fail-closed: readiness must not succeed with an
+    eager encoder when the requested model or attention backend cannot be
+    captured. Shared wrappers (for example one graph serving image and video)
+    are captured only once.
+
+    Args:
+        model: Multimodal runtime model exposing
+            ``make_encoder_cudagraph_wrappers(mapping)``.
+        enabled: Whether encoder CUDA Graph was requested by server config.
+        mm_attention_backend: Selected multimodal attention backend.
+        max_metadata_sequences_per_batch: Explicit upper bound for captured
+            attention metadata sequences, or ``None`` for the model default.
+
+    Returns:
+        Installed wrappers keyed by the model attribute they replace.
+
+    Raises:
+        ValueError: If graph execution was requested for an incompatible model
+            or backend, or if the model returns an invalid wrapper mapping.
+    """
+
+    if not enabled:
+        return {}
+    if mm_attention_backend == "flashinfer_cudnn":
+        raise ValueError(
+            "--enable-mm-encoder-cuda-graph is incompatible with "
+            "--mm-attention-backend flashinfer_cudnn."
+        )
+    if (
+        max_metadata_sequences_per_batch is not None
+        and max_metadata_sequences_per_batch <= 0
+    ):
+        raise ValueError(
+            "--mm-encoder-cudagraph-max-metadata-sequences-per-batch must be "
+            "positive."
+        )
+    if not getattr(model, "is_multimodal_active", True):
+        raise ValueError(
+            "--enable-mm-encoder-cuda-graph requires an active multimodal model."
+        )
+    builder = getattr(model, "make_encoder_cudagraph_wrappers", None)
+    if builder is None:
+        raise ValueError(
+            f"{type(model).__name__} does not support multimodal encoder CUDA Graph."
+        )
+
+    wrappers = builder(
+        model.mapping,
+        max_metadata_sequences_per_batch=max_metadata_sequences_per_batch,
+    )
+    if not wrappers:
+        raise ValueError(
+            f"{type(model).__name__} did not provide any encoder CUDA-graph wrappers."
+        )
+
+    installed: dict[str, EncoderCudaGraphWrapper] = {}
+    captured: set[int] = set()
+    for encoder_attr, wrapper in wrappers.items():
+        if not hasattr(model, encoder_attr):
+            raise ValueError(
+                f"{type(model).__name__} returned an encoder CUDA-graph wrapper "
+                f"for missing attribute {encoder_attr!r}."
+            )
+        wrapper_id = id(wrapper)
+        if wrapper_id not in captured:
+            wrapper.capture()
+            captured.add(wrapper_id)
+        setattr(model, encoder_attr, wrapper)
+        installed[encoder_attr] = wrapper
+
+    logger.info(
+        "Installed encoder CUDA graphs for %s: %s",
+        type(model).__name__,
+        sorted(installed),
+    )
+    return installed

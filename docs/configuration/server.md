@@ -56,7 +56,7 @@ For a compact compatibility table, see
 | `--max-total-tokens` | Override the automatically calculated token pool size. |
 | `--block-size` | KV cache block size. |
 | `--enable-prefix-caching` / `--no-enable-prefix-caching` | Enable or disable prefix cache reuse. |
-| `--enforce-eager` | Disable CUDA graph execution. |
+| `--enforce-eager` | Disable language-model CUDA Graph execution. An explicitly enabled multimodal encoder graph remains independent. |
 | `--max-cudagraph-capture-size` | Largest batch size to capture with CUDA graphs. |
 | `--cudagraph-capture-sizes` | Explicit CUDA graph capture sizes. |
 
@@ -80,6 +80,8 @@ issue budget, while `--max-total-tokens` controls the global token pool.
 | `--nnodes` | Number of nodes. |
 | `--node-rank` | Rank of the current node. |
 | `--dist-init-addr` | Distributed initialization address. |
+| `--base-gpu-id` | First local GPU index assigned to the server. |
+| `--gpu-id-step` | Distance between assigned local GPU indices. For example, base `0` and step `2` selects `0,2,4,...`. |
 
 Use `--tensor-parallel-size` for simple launches. Use the
 TokenSpeed-specific split knobs when attention, dense, and MoE layers need
@@ -100,6 +102,28 @@ different process groups.
 Set backend choices explicitly in production. `auto` is useful for bring-up, but
 explicit values make benchmark comparisons and regressions easier to reason
 about.
+
+## Multimodal Execution
+
+| Parameter | Purpose |
+| --- | --- |
+| `--mm-attention-backend` | Attention backend used inside supported multimodal encoders, such as `fa3`, `fa4`, or `triton_attn`. |
+| `--enable-mm-encoder-cuda-graph` / `--no-enable-mm-encoder-cuda-graph` | Capture supported multimodal encoders during startup and replay matching input budgets. Disabled by default. |
+| `--mm-encoder-cudagraph-max-metadata-sequences-per-batch` | Explicit maximum number of attention-metadata sequences captured per encoder batch. Supported models derive it from the token budget when omitted. |
+| `--language-model-only` | Disable the active multimodal model path and reject multimodal requests. |
+
+Encoder CUDA Graph enablement is fail-closed: startup fails if the active model
+does not provide an encoder graph adapter or the selected multimodal attention
+backend cannot be captured. A supported model may still execute inputs outside
+its captured budget range eagerly. This graph is separate from the
+language-model graph controlled by `--enforce-eager` and the language-model
+capture-size options.
+
+Encoder-graph enablement and metadata sizing are CLI settings. They do not
+have environment-variable aliases.
+
+Multimodal modalities remain model-specific. MiniMax-M3 currently supports
+image items only; video items are rejected.
 
 When `--dp-sampling` is enabled, the logits processor owns the per-forward
 logits layout decision and carries the resulting plan to the sampling backend
@@ -215,6 +239,7 @@ features directly:
 - `--moe-tp-size`
 - `--kvstore-*`
 - `--enable-mla-l1-5-cache`
+- `--enable-mm-encoder-cuda-graph`
 - `--kv-events-config`
 - `--mla-chunk-multiplier`
 - `--disaggregation-*`

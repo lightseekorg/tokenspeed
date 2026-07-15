@@ -10,7 +10,11 @@ from tokenspeed.runtime.configs.minimax_m3_config import (
     MiniMaxM3VisionConfig,
     MiniMaxM3VLConfig,
 )
-from tokenspeed.runtime.configs.model_config import is_multimodal_model
+from tokenspeed.runtime.configs.model_config import (
+    _ATTENTION_FAMILY_SPECS,
+    _apply_attention_family_defaults,
+    is_multimodal_model,
+)
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
@@ -121,6 +125,35 @@ def test_minimax_m3_config_describes_msa_contract() -> None:
         MiniMaxM3TextConfig(num_hidden_layers=4, moe_layer_freq=[0, 1])
 
 
+def test_minimax_m3_fp8_selects_dense_cache_backend_without_env() -> None:
+    spec = next(spec for spec in _ATTENTION_FAMILY_SPECS if spec.name == "MiniMax M3")
+
+    fp8_args = SimpleNamespace(
+        attention_backend=None,
+        block_size=64,
+        kv_cache_dtype="fp8",
+    )
+    _apply_attention_family_defaults(fp8_args, spec)
+    assert fp8_args.attention_backend == "mha"
+    assert fp8_args.block_size == 128
+
+    bf16_args = SimpleNamespace(
+        attention_backend=None,
+        block_size=64,
+        kv_cache_dtype="auto",
+    )
+    _apply_attention_family_defaults(bf16_args, spec)
+    assert bf16_args.attention_backend == "triton"
+
+    explicit_args = SimpleNamespace(
+        attention_backend="flashinfer",
+        block_size=128,
+        kv_cache_dtype="fp8",
+    )
+    _apply_attention_family_defaults(explicit_args, spec)
+    assert explicit_args.attention_backend == "flashinfer"
+
+
 def test_minimax_m3_tp4_meta_layout_and_loader(monkeypatch: pytest.MonkeyPatch) -> None:
     mapping = _tp4_mapping()
     monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
@@ -225,6 +258,72 @@ def test_minimax_m3_tp4_meta_layout_and_loader(monkeypatch: pytest.MonkeyPatch) 
         "model.layers.3.self_attn.indexer.q_norm.weight",
     }
 
+    scale_loader_call = None
+
+    def _fake_scale_loader(*args, **kwargs):
+        nonlocal scale_loader_call
+        scale_loader_call = (args, kwargs)
+        return [(0, 0.25), (3, 0.5)]
+
+    monkeypatch.setattr(
+        "tokenspeed.runtime.models.minimax_m3.kv_cache_scales_loader",
+        _fake_scale_loader,
+    )
+    model.load_kv_cache_scales("scales.json")
+    assert scale_loader_call == (
+        ("scales.json", 0, 4, 4, "minimax_m3_text"),
+        {"strict": True},
+    )
+    assert model.model.layers[0].self_attn.attn.k_scale == 0.25
+    assert model.model.layers[0].self_attn.attn.v_scale == 0.25
+    assert model.model.layers[3].self_attn.attn.k_scale == 0.5
+    assert model.model.layers[3].self_attn.attn.v_scale == 0.5
+
+
+@pytest.mark.parametrize(
+    "bad_scale",
+    [0.0, -0.25, float("inf"), float("-inf"), float("nan")],
+    ids=["zero", "negative", "positive-inf", "negative-inf", "nan"],
+)
+def test_minimax_m3_rejects_nonpositive_or_nonfinite_kv_cache_scale(
+    monkeypatch: pytest.MonkeyPatch,
+    bad_scale: float,
+) -> None:
+    class _FakeConfig:
+        model_type = "minimax_m3_text"
+        num_hidden_layers = 2
+
+    attentions = [
+        SimpleNamespace(k_scale=None, v_scale=None),
+        SimpleNamespace(k_scale=None, v_scale=None),
+    ]
+    model = SimpleNamespace(
+        model=SimpleNamespace(
+            layers=[
+                SimpleNamespace(self_attn=SimpleNamespace(attn=attention))
+                for attention in attentions
+            ]
+        ),
+        mapping=SimpleNamespace(attn=SimpleNamespace(tp_rank=0, tp_size=1)),
+        config=_FakeConfig(),
+    )
+    monkeypatch.setattr(
+        "tokenspeed.runtime.models.minimax_m3.kv_cache_scales_loader",
+        lambda *_args, **_kwargs: [(0, 0.25), (1, bad_scale)],
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"finite and greater than zero.*TP rank 0, layer 1",
+    ):
+        MiniMaxM3SparseForConditionalGeneration.load_kv_cache_scales(
+            model, "scales.json"
+        )
+
+    # Validation is atomic: an invalid later layer must not apply earlier scales.
+    assert all(attention.k_scale is None for attention in attentions)
+    assert all(attention.v_scale is None for attention in attentions)
+
 
 def test_minimax_m3_builds_active_multimodal_runtime(
     monkeypatch: pytest.MonkeyPatch,
@@ -320,6 +419,12 @@ def test_minimax_m3_builds_active_multimodal_runtime(
         "patch_merge_mlp.linear_1.weight",
     }
 
+    monkeypatch.setattr(
+        "tokenspeed.runtime.models.minimax_m3.kv_cache_scales_loader",
+        lambda *_args: pytest.fail("encoder-only model must not load KV scales"),
+    )
+    model.load_kv_cache_scales("unused.json")
+
 
 def test_minimax_m3_image_encoder_enforces_grid_and_placeholder_contract() -> None:
     config = _tiny_config()
@@ -352,11 +457,21 @@ def test_minimax_m3_image_encoder_enforces_grid_and_placeholder_contract() -> No
     with pytest.raises(TypeError, match="integer dtype"):
         model.get_image_feature([item])
 
+    item.modality = Modality.VIDEO
+    with pytest.raises(ValueError, match="accepts image items only"):
+        model.get_image_feature([item])
 
-def _msa_server_args(*, block_size: int = 128, kv_cache_dtype: str = "auto"):
+
+def _msa_server_args(
+    *,
+    block_size: int = 128,
+    kv_cache_dtype: str = "auto",
+    kv_cache_quant_method: str = "none",
+    attention_backend: str = "mha",
+):
     return SimpleNamespace(
         device="cuda",
-        attention_backend="mha",
+        attention_backend=attention_backend,
         drafter_attention_backend=None,
         attn_tp_size=4,
         mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=4, dp_size=1)),
@@ -365,7 +480,7 @@ def _msa_server_args(*, block_size: int = 128, kv_cache_dtype: str = "auto"):
         data_parallel_size=None,
         block_size=block_size,
         max_cudagraph_capture_size=8,
-        kv_cache_quant_method="none",
+        kv_cache_quant_method=kv_cache_quant_method,
         speculative_algorithm=None,
         chunked_prefill_size=8192,
         disaggregation_mode="null",
@@ -384,7 +499,11 @@ def _msa_model_config():
     )
 
 
-def test_minimax_m3_mha_cache_contract() -> None:
+def test_minimax_m3_mha_cache_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "tokenspeed.runtime.layers.attention.configs.mha.current_platform",
+        lambda: SimpleNamespace(is_blackwell=True),
+    )
     config = MHAConfig.generate(_msa_server_args(), _msa_model_config())
 
     assert config.page_size == 128
@@ -397,7 +516,45 @@ def test_minimax_m3_mha_cache_contract() -> None:
             _msa_server_args(block_size=64),
             _msa_model_config(),
         )
-    with pytest.raises(ValueError, match="BF16 KV cache"):
+    fp8_config = MHAConfig.generate(
+        _msa_server_args(kv_cache_dtype="fp8"),
+        _msa_model_config(),
+    )
+    assert fp8_config.kv_cache_dtype == torch.float8_e4m3fn
+    assert fp8_config.cache_cell_size() == 384
+
+    with pytest.raises(ValueError, match="static-scale"):
+        MHAConfig.generate(
+            _msa_server_args(
+                kv_cache_dtype="fp8",
+                kv_cache_quant_method="per_token_head",
+            ),
+            _msa_model_config(),
+        )
+    for unsupported_backend in ("fa3", "fa4", "triton", "trtllm"):
+        with pytest.raises(ValueError, match="automatic MHA backend"):
+            MHAConfig.generate(
+                _msa_server_args(
+                    kv_cache_dtype="fp8",
+                    attention_backend=unsupported_backend,
+                ),
+                _msa_model_config(),
+            )
+
+    for supported_backend in ("mha", "flashinfer"):
+        MHAConfig.generate(
+            _msa_server_args(
+                kv_cache_dtype="fp8",
+                attention_backend=supported_backend,
+            ),
+            _msa_model_config(),
+        )
+
+    monkeypatch.setattr(
+        "tokenspeed.runtime.layers.attention.configs.mha.current_platform",
+        lambda: SimpleNamespace(is_blackwell=False),
+    )
+    with pytest.raises(ValueError, match="requires NVIDIA Blackwell"):
         MHAConfig.generate(
             _msa_server_args(kv_cache_dtype="fp8"),
             _msa_model_config(),

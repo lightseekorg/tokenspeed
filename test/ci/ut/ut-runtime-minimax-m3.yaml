@@ -1,0 +1,43 @@
+api_version: ci.tokenspeed.io/v1
+name: ut-runtime-minimax-m3
+type: ut
+triggers:
+  - per-commit
+  - manual
+runner:
+  labels:
+    - b200-1gpu
+install:
+  - bash test/ci_system/install_deps.sh
+ut:
+  commands:
+    - >-
+      python3 -m pytest -q
+      test/runtime/models/test_minimax_m3.py
+      test/runtime/models/test_minimax_m3_vision.py
+      test/runtime/models/test_minimax_m3_vision_parity.py
+      test/runtime/cache/test_indexed_mha_kv_buffer.py
+      test/runtime/test_mha_fp8_cache_read.py
+      test/runtime/distributed/test_epd_encode.py
+      test/runtime/distributed/test_mapping.py
+      test/runtime/distributed/test_process_group_manager.py
+      test/runtime/test_cli_config_compat.py
+      test/runtime/test_event_loop_overlap_terminal.py
+      test/runtime/test_kv_cache_scales_loader.py
+      test/runtime/layers/test_moe_topk.py
+      test/quality_benchmark/tokenspeed/test_minimax_m3_fixed_reference.py
+      test/random_benchmark/tokenspeed/test_collect_outputs.py
+    - >-
+      python3 -m pytest -q
+      tokenspeed-kernel/test/ops/test_minimax_m3_msa.py
+      tokenspeed-kernel/test/test_mha_fp8_cache_scaling.py
+    - >-
+      python3 -m pytest -q
+      tokenspeed-kernel/test/ops/test_mxfp8_gemm.py
+      tokenspeed-kernel/test/ops/test_quantization.py::test_quantize_mxfp8_shape_and_scale
+      tokenspeed-kernel/test/test_kernel_api_selection.py::test_gemm_mxfp8_online_activation_signature_uses_quantized_storage
+      tokenspeed-kernel/test/test_kernel_api_selection.py::test_gemm_mxfp8_online_activation_uses_mixed_scale_formats
+      tokenspeed-kernel/test/test_kernel_api_selection.py::test_gemm_mxfp8_online_activation_preserves_repeated_rows
+      tokenspeed-kernel/test/test_kernel_api_selection.py::test_triton_mxfp8_native_weights_do_not_fall_back_to_requantization
+report:
+  github_step_summary: true

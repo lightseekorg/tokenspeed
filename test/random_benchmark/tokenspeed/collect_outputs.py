@@ -2,6 +2,7 @@
 """Collect random perf sweeps into one CI summary table."""
 
 import argparse
+import csv
 import json
 import sys
 from pathlib import Path
@@ -10,7 +11,7 @@ COLUMNS = [
     "config",
     "Conc.",
     "Latency (tps/user)",
-    "Output Throughput (tps/gpu)",
+    "Throughput (tps/gpu)",
     "Approx Cache Hit",
     "Decoded Tok/Iter",
 ]
@@ -20,6 +21,7 @@ INPUT_ORDER = {
     "input_2k": 2048,
     "input_4k": 4096,
     "input_8k": 8192,
+    "input_32k": 32768,
 }
 
 
@@ -74,7 +76,7 @@ def collect(sweep_dir: Path, num_gpus: int):
                 "config": config,
                 "Conc.": int(_float(summary, "Concurrency")),
                 "Latency (tps/user)": round(tps_user, 2),
-                "Output Throughput (tps/gpu)": round(output_tps / num_gpus, 2),
+                "Throughput (tps/gpu)": round(output_tps / num_gpus, 2),
                 "Approx Cache Hit": round(cache_hit, 2),
                 "Decoded Tok/Iter": round(decoded_per_iter, 4),
             }
@@ -84,19 +86,12 @@ def collect(sweep_dir: Path, num_gpus: int):
 
 
 def print_table(rows):
-    # The CI pipeline recognizes this marker and adds the following block to
-    # the GitHub step summary.
+    # The CI pipeline recognizes this marker, parses the following CSV for
+    # perf-reference checks, and adds the block to the GitHub step summary.
     print("\nOverall perf table:")
-    widths = {
-        column: max(len(column), *(len(str(row[column])) for row in rows))
-        for column in COLUMNS
-    }
-    header = "  ".join(column.rjust(widths[column]) for column in COLUMNS)
-    sep = "  ".join("-" * widths[column] for column in COLUMNS)
-    print(header)
-    print(sep)
-    for row in rows:
-        print("  ".join(str(row[column]).rjust(widths[column]) for column in COLUMNS))
+    writer = csv.DictWriter(sys.stdout, fieldnames=COLUMNS, lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(rows)
 
 
 def main():

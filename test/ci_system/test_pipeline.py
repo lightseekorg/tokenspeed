@@ -1,3 +1,4 @@
+import importlib.util
 import re
 import textwrap
 from pathlib import Path
@@ -21,8 +22,52 @@ from pipeline import (
     resolve_score_threshold_for_runner,
     runner_matches_group,
     should_run_nvidia_gpu_cleanup,
+    summarize_command_output,
     validate_task,
 )
+
+RANDOM_COLLECTOR_PATH = (
+    Path(__file__).parents[1] / "random_benchmark/tokenspeed/collect_outputs.py"
+)
+RANDOM_COLLECTOR_SPEC = importlib.util.spec_from_file_location(
+    "ci_random_benchmark_collect_outputs", RANDOM_COLLECTOR_PATH
+)
+assert RANDOM_COLLECTOR_SPEC is not None and RANDOM_COLLECTOR_SPEC.loader is not None
+random_collect_outputs = importlib.util.module_from_spec(RANDOM_COLLECTOR_SPEC)
+RANDOM_COLLECTOR_SPEC.loader.exec_module(random_collect_outputs)
+
+REPO_ROOT = Path(__file__).parents[2]
+PR_TEST_WORKFLOWS = (
+    ".github/workflows/pr-test-nvidia.yml",
+    ".github/workflows/pr-test-nvidia-arm.yml",
+    ".github/workflows/pr-test-amd.yml",
+)
+
+
+@pytest.mark.parametrize("workflow_path", PR_TEST_WORKFLOWS)
+def test_pr_workflows_upload_server_log_with_result(workflow_path):
+    import yaml as _yaml
+
+    workflow = _yaml.safe_load((REPO_ROOT / workflow_path).read_text())
+    upload_step = next(
+        step
+        for step in workflow["jobs"]["unit-test"]["steps"]
+        if step.get("uses") == "actions/upload-artifact@v4"
+    )
+
+    assert upload_step["with"]["path"].splitlines() == [
+        "${{ env.WORK_DIR }}/.ci-artifacts/result.json",
+        "${{ env.WORK_DIR }}/.ci-artifacts/server.log",
+    ]
+
+
+def test_minimax_m3_exact_longctx_locks_known_output_token():
+    import yaml as _yaml
+
+    task_path = REPO_ROOT / "test/ci/perf/minimax-m3-mxfp8-exact-longctx.yaml"
+    task = _yaml.safe_load(task_path.read_text())
+
+    assert "assert output_ids == [123], output_ids" in task["perf"]["command"]
 
 
 def test_stale_process_patterns_match_smg_router_proctitle():
@@ -169,6 +214,12 @@ attn_tp4_moe_tp4,16,30.0,24000.0,82.5,3.1
 2026-05-08 12:00:00 - root - INFO - done
 """
 
+PERF_MULTI_CONFIG_CSV_FIXTURE = """\
+config,Conc.,Latency (tps/user),Throughput (tps/gpu),Approx Cache Hit,Decoded Tok/Iter
+input_1k,16,100.0,1000.0,80.0,1.0
+input_4k,16,50.0,500.0,70.0,1.0
+"""
+
 
 def test_extract_perf_summary_rows_parses_csv_block():
     rows = extract_perf_summary_rows(PERF_CSV_FIXTURE)
@@ -181,6 +232,47 @@ def test_extract_perf_summary_rows_parses_csv_block():
 
 def test_extract_perf_summary_rows_returns_none_when_missing():
     assert extract_perf_summary_rows("nothing relevant here") is None
+
+
+def test_random_collector_output_is_parsed_and_gated_by_config(capsys):
+    collector_rows = [
+        {
+            "config": "input_1k",
+            "Conc.": 16,
+            "Latency (tps/user)": 100.0,
+            "Throughput (tps/gpu)": 1000.0,
+            "Approx Cache Hit": 80.0,
+            "Decoded Tok/Iter": 1.0,
+        },
+        {
+            "config": "input_32k",
+            "Conc.": 16,
+            "Latency (tps/user)": 25.0,
+            "Throughput (tps/gpu)": 250.0,
+            "Approx Cache Hit": 60.0,
+            "Decoded Tok/Iter": 1.0,
+        },
+    ]
+    random_collect_outputs.print_table(collector_rows)
+    output = capsys.readouterr().out
+
+    command_summary = summarize_command_output("collect random sweep", output)
+    parsed_rows = command_summary["perf_summary_rows"]
+    assert [(row["config"], row["Conc."]) for row in parsed_rows] == [
+        ("input_1k", "16"),
+        ("input_32k", "16"),
+    ]
+
+    task = {
+        "perf_threshold": 1.0,
+        "perf_reference": {
+            "input_1k": {16: [100.0, 1000.0]},
+            "input_32k": {16: [25.0, 250.0]},
+        },
+    }
+    result = check_perf_reference(task, [command_summary], ["perf"])
+    assert result is not None
+    assert result["passed"] is True
 
 
 def _command_results_with(rows):
@@ -211,6 +303,53 @@ def test_check_perf_reference_fails_when_metric_below_floor():
     assert any("Latency (tps/user)" in f for f in result["failures"])
 
 
+def test_check_perf_reference_matches_config_and_concurrency():
+    rows = extract_perf_summary_rows(PERF_MULTI_CONFIG_CSV_FIXTURE)
+    task = {
+        "perf_threshold": 1.0,
+        "perf_reference": {
+            "input_1k": {16: [100.0, 1000.0]},
+            "input_4k": {16: [50.0, 500.0]},
+        },
+    }
+
+    result = check_perf_reference(task, _command_results_with(rows), ["perf"])
+
+    assert result is not None
+    assert result["passed"] is True
+    assert [check["config"] for check in result["checks"]] == [
+        "input_1k",
+        "input_4k",
+    ]
+
+
+def test_check_perf_reference_config_failure_identifies_reference_point():
+    rows = extract_perf_summary_rows(PERF_MULTI_CONFIG_CSV_FIXTURE)
+    task = {
+        "perf_threshold": 1.0,
+        "perf_reference": {"input_4k": {16: [60.0, 500.0]}},
+    }
+
+    result = check_perf_reference(task, _command_results_with(rows), ["perf"])
+
+    assert result is not None
+    assert result["passed"] is False
+    assert any("config=input_4k, conc=16" in failure for failure in result["failures"])
+
+
+def test_check_perf_reference_reports_missing_config_row():
+    rows = extract_perf_summary_rows(PERF_MULTI_CONFIG_CSV_FIXTURE)
+    task = {"perf_reference": {"input_8k": {16: [10.0, 100.0]}}}
+
+    result = check_perf_reference(task, _command_results_with(rows), ["perf"])
+
+    assert result is not None
+    assert result["passed"] is False
+    assert result["failures"] == [
+        "config=input_8k, conc=16: no matching row in perf summary"
+    ]
+
+
 def test_check_perf_reference_reports_missing_row():
     rows = extract_perf_summary_rows(PERF_CSV_FIXTURE)
     task = {"perf_reference": {64: [10.0, 100.0]}}
@@ -239,6 +378,13 @@ def test_check_perf_reference_raises_when_no_rows_found():
 def test_check_perf_reference_raises_on_malformed_pair():
     rows = extract_perf_summary_rows(PERF_CSV_FIXTURE)
     task = {"perf_reference": {16: [40.0]}}
+    with pytest.raises(ValueError, match=r"\[tps_user, tps_gpu\]"):
+        check_perf_reference(task, _command_results_with(rows), ["perf"])
+
+
+def test_check_perf_reference_raises_on_malformed_config_pair():
+    rows = extract_perf_summary_rows(PERF_MULTI_CONFIG_CSV_FIXTURE)
+    task = {"perf_reference": {"input_1k": {16: [40.0]}}}
     with pytest.raises(ValueError, match=r"\[tps_user, tps_gpu\]"):
         check_perf_reference(task, _command_results_with(rows), ["perf"])
 
@@ -771,6 +917,27 @@ def test_format_perf_reference_table_empty_when_no_checks():
     assert format_perf_reference_table([]) == []
 
 
+def test_format_perf_reference_tables_include_config_for_nested_references():
+    rows = extract_perf_summary_rows(PERF_MULTI_CONFIG_CSV_FIXTURE)
+    task = {
+        "perf_threshold": 1.0,
+        "perf_reference": {
+            "input_1k": {16: [100.0, 1000.0]},
+            "input_4k": {16: [50.0, 500.0]},
+        },
+    }
+    check = check_perf_reference(task, _command_results_with(rows), ["perf"])
+    assert check is not None
+
+    text_table = format_perf_reference_table(check["checks"])
+    markdown_table = format_perf_reference_markdown_table(check["checks"])
+
+    assert "Config" in text_table[0]
+    assert "input_1k" in text_table[2]
+    assert markdown_table[0].startswith("| Conc | Config |")
+    assert "input_4k" in markdown_table[-1]
+
+
 def test_format_perf_reference_markdown_table_has_header_and_alignment():
     lines = format_perf_reference_markdown_table(_checks_fixture())
     assert lines[0].startswith("| Conc |")
@@ -812,6 +979,23 @@ def test_step_summary_embeds_perf_reference_table():
     assert "Thru actual/ref" in summary
     assert "| 16 |" in summary
     assert "%" in summary
+
+
+def test_step_summary_counts_config_concurrency_points():
+    rows = extract_perf_summary_rows(PERF_MULTI_CONFIG_CSV_FIXTURE)
+    task = {
+        "perf_threshold": 1.0,
+        "perf_reference": {
+            "input_1k": {16: [100.0, 1000.0]},
+            "input_4k": {16: [50.0, 500.0]},
+        },
+    }
+    check = check_perf_reference(task, _command_results_with(rows), ["perf"])
+    summary = "\n".join(
+        build_step_summary_lines(_base_result(perf_reference_check=check))
+    )
+
+    assert "2 config/concurrency points" in summary
 
 
 def test_perf_reference_table_rendered_for_passing_check(capsys):

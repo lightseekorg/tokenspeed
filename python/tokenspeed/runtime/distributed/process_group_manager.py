@@ -46,6 +46,7 @@ def _make_all_groups(group: Group) -> list[Group]:
 class ProcessGroupManager:
     def __init__(self):
         self._process_groups: dict[str, dict[Group, dist.ProcessGroup]] = {}
+        self._nccl_device_id: torch.device | None = None
 
     def init_distributed(
         self,
@@ -55,6 +56,7 @@ class ProcessGroupManager:
         timeout: int | None = None,
         device_id: "torch.device | None" = None,
     ) -> None:
+        self._nccl_device_id = device_id if backend == "nccl" else None
         if not dist.is_initialized():
             if distributed_init_method is None:
                 raise ValueError(
@@ -67,14 +69,16 @@ class ProcessGroupManager:
                     raise ValueError("timeout must be positive")
                 timeout = timedelta(seconds=timeout)
 
-            dist.init_process_group(
+            init_kwargs = dict(
                 backend=backend,
                 init_method=distributed_init_method,
                 world_size=mapping.world_size,
                 rank=mapping.rank,
                 timeout=timeout,
-                device_id=device_id,
             )
+            if self._nccl_device_id is not None:
+                init_kwargs["device_id"] = self._nccl_device_id
+            dist.init_process_group(**init_kwargs)
 
     def register_process_group(
         self, backend: str, group: Group, process_group: dist.ProcessGroup
@@ -105,7 +109,10 @@ class ProcessGroupManager:
             if self.has_process_group(backend, group):
                 continue
             for g in _make_all_groups(group):
-                pg = dist.new_group(g, backend=backend)
+                group_kwargs = {"backend": backend}
+                if backend == "nccl" and self._nccl_device_id is not None:
+                    group_kwargs["device_id"] = self._nccl_device_id
+                pg = dist.new_group(g, **group_kwargs)
                 if g == group:
                     self.register_process_group(backend, g, pg)
 

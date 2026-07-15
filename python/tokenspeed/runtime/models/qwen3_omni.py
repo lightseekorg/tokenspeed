@@ -61,7 +61,6 @@ from tokenspeed.runtime.multimodal.inputs import (
     MultimodalDataItem,
     MultimodalInputs,
 )
-from tokenspeed.runtime.utils.env import envs
 
 logger = logging.getLogger(__name__)
 
@@ -290,17 +289,17 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3MoeForCausalLM):
             ),
         )
 
-    def make_encoder_cudagraph_wrappers(self, mapping: Mapping) -> dict:
-        max_video_sequences = (
-            envs.TOKENSPEED_MM_VIDEO_ENCODER_CUDA_GRAPH_MAX_SEQUENCES_PER_BATCH.get()
-        )
-        if max_video_sequences is not None:
-            max_video_sequences = max(1, max_video_sequences)
+    def make_encoder_cudagraph_wrappers(
+        self,
+        mapping: Mapping,
+        *,
+        max_metadata_sequences_per_batch: int | None = None,
+    ) -> dict:
         shared = self._build_encoder_cudagraph_wrapper(
             mapping,
-            max_metadata_sequences_per_batch=max_video_sequences,
+            max_metadata_sequences_per_batch=max_metadata_sequences_per_batch,
             metadata_sequence_budget_from_encoder_output_budget=(
-                max_video_sequences is None
+                max_metadata_sequences_per_batch is None
             ),
         )
         return {"image_encoder": shared, "video_encoder": shared}

@@ -942,6 +942,35 @@ def extract_perf_summary_rows(output: str) -> List[Dict[str, str]] | None:
     return list(csv.DictReader(io.StringIO("\n".join(lines))))
 
 
+def _iter_perf_reference_points(
+    reference: Dict[Any, Any],
+) -> Iterable[tuple[str | None, Any, Any]]:
+    """Yield ``(config, concurrency, metrics)`` reference points.
+
+    The original schema maps concurrency directly to the metric pair. The
+    config-aware schema nests those pairs under the summary row's ``config``
+    value, allowing one sweep to gate several input shapes independently.
+    """
+    for key, value in reference.items():
+        if isinstance(value, list):
+            yield None, key, value
+            continue
+        if not isinstance(value, dict) or not value:
+            raise ValueError(
+                "perf_reference values must be [tps_user, tps_gpu] or a "
+                f"non-empty config mapping; got {key!r}: {value!r}"
+            )
+        config = str(key)
+        for conc_key, ref_pair in value.items():
+            yield config, conc_key, ref_pair
+
+
+def _perf_reference_label(config: str | None, conc: int) -> str:
+    if config is None:
+        return f"conc={conc}"
+    return f"config={config}, conc={conc}"
+
+
 def check_perf_reference(
     task: Dict[str, Any],
     command_results: List[Dict[str, Any]],
@@ -975,23 +1004,43 @@ def check_perf_reference(
 
     failures: List[str] = []
     checks: List[Dict[str, Any]] = []
-    for conc_key, ref_pair in reference.items():
+    for config, conc_key, ref_pair in _iter_perf_reference_points(reference):
         try:
             conc = int(conc_key)
         except (TypeError, ValueError) as exc:
+            location = (
+                f"perf_reference[{config!r}]"
+                if config is not None
+                else "perf_reference"
+            )
             raise ValueError(
-                f"perf_reference key must be an int concurrency: got {conc_key!r}"
+                f"{location} key must be an int concurrency: got {conc_key!r}"
             ) from exc
         if not isinstance(ref_pair, list) or len(ref_pair) != 2:
-            raise ValueError(
-                f"perf_reference[{conc_key}] must be [tps_user, tps_gpu]; "
-                f"got {ref_pair!r}"
+            location = (
+                f"perf_reference[{config!r}][{conc_key}]"
+                if config is not None
+                else f"perf_reference[{conc_key}]"
             )
-        match = next((r for r in rows if int(r["Conc."]) == conc), None)
+            raise ValueError(
+                f"{location} must be [tps_user, tps_gpu]; " f"got {ref_pair!r}"
+            )
+        match = next(
+            (
+                row
+                for row in rows
+                if int(row["Conc."]) == conc
+                and (config is None or row.get("config") == config)
+            ),
+            None,
+        )
+        point_label = _perf_reference_label(config, conc)
         if match is None:
-            failures.append(f"conc={conc}: no matching row in perf summary")
+            failures.append(f"{point_label}: no matching row in perf summary")
             continue
         entry: Dict[str, Any] = {"conc": conc}
+        if config is not None:
+            entry["config"] = config
         for metric, ref in zip(PERF_REFERENCE_METRICS, ref_pair):
             ref_v = float(ref)
             actual = float(match[metric])
@@ -1005,7 +1054,7 @@ def check_perf_reference(
             }
             if not passed_metric:
                 failures.append(
-                    f"conc={conc}: {metric} {actual:g} < {floor:g} "
+                    f"{point_label}: {metric} {actual:g} < {floor:g} "
                     f"({threshold * 100:g}% of {ref_v:g})"
                 )
         checks.append(entry)
@@ -1042,8 +1091,14 @@ def format_perf_reference_table(checks: List[Dict[str, Any]]) -> List[str]:
     ``[perf-ref]`` for stdout). Empty when ``checks`` has no entries."""
     if not checks:
         return []
+    has_config = any("config" in entry for entry in checks)
+    config_width = max(
+        [len("Config"), *(len(str(entry.get("config", "-"))) for entry in checks)]
+    )
+    config_header = f"{'Config':<{config_width}}  " if has_config else ""
     header = (
         f"{'Conc':>4}  "
+        f"{config_header}"
         f"{'Lat actual':>10} {'Lat ref':>9} {'Lat floor':>10} {'Lat actual/ref':>14}  "
         f"{'Thru actual':>12} {'Thru ref':>10} {'Thru floor':>11} {'Thru actual/ref':>15}"
     )
@@ -1052,8 +1107,10 @@ def format_perf_reference_table(checks: List[Dict[str, Any]]) -> List[str]:
     for entry in checks:
         lat = entry.get("Latency (tps/user)") or {}
         thru = entry.get("Throughput (tps/gpu)") or {}
-        lines.append(
-            f"{entry['conc']:>4}  "
+        prefix = f"{entry['conc']:>4}  "
+        if has_config:
+            prefix += f"{str(entry.get('config', '-')):<{config_width}}  "
+        metrics = (
             f"{lat.get('actual', 0):>10.2f} "
             f"{lat.get('ref', 0):>9.2f} "
             f"{lat.get('floor', 0):>10.2f} "
@@ -1063,6 +1120,7 @@ def format_perf_reference_table(checks: List[Dict[str, Any]]) -> List[str]:
             f"{thru.get('floor', 0):>11.2f} "
             f"{_ratio_pct(thru.get('actual', 0), thru.get('ref', 0)):>15}"
         )
+        lines.append(prefix + metrics)
     return lines
 
 
@@ -1073,17 +1131,22 @@ def format_perf_reference_markdown_table(checks: List[Dict[str, Any]]) -> List[s
     percentage against ref). Empty when ``checks`` has no entries."""
     if not checks:
         return []
+    has_config = any("config" in entry for entry in checks)
+    config_header = " Config |" if has_config else ""
+    config_rule = ":-------|" if has_config else ""
     lines = [
-        "| Conc | Lat actual | Lat ref | Lat floor | Lat actual/ref "
+        f"| Conc |{config_header} Lat actual | Lat ref | Lat floor | Lat actual/ref "
         "| Thru actual | Thru ref | Thru floor | Thru actual/ref |",
-        "|-----:|-----------:|--------:|----------:|---------------:"
+        f"|-----:|{config_rule}-----------:|--------:|----------:|---------------:"
         "|------------:|---------:|-----------:|----------------:|",
     ]
     for entry in checks:
         lat = entry.get("Latency (tps/user)") or {}
         thru = entry.get("Throughput (tps/gpu)") or {}
+        config_cell = f"| {entry.get('config', '-')} " if has_config else ""
         lines.append(
             f"| {entry['conc']} "
+            f"{config_cell}"
             f"| {lat.get('actual', 0):.2f} "
             f"| {lat.get('ref', 0):.2f} "
             f"| {lat.get('floor', 0):.2f} "
@@ -1156,10 +1219,15 @@ def build_step_summary_lines(result: Dict[str, Any]) -> List[str]:
     if result.get("perf_reference_check"):
         check = result["perf_reference_check"]
         status = "pass" if check["passed"] else "fail"
+        point_kind = (
+            "config/concurrency points"
+            if any("config" in entry for entry in check["checks"])
+            else "concurrency levels"
+        )
         lines.append(
             f"- Perf reference: `{status}` "
             f"(threshold `{check['threshold']:g}`, "
-            f"{len(check['checks'])} concurrency levels)"
+            f"{len(check['checks'])} {point_kind})"
         )
         md_table = format_perf_reference_markdown_table(check["checks"])
         if md_table:

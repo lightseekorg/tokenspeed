@@ -75,7 +75,23 @@ def _reference_sparse_attention(
 
 
 @requires_cuda
-def test_minimax_m3_msa_prefill_and_decode_after_2048() -> None:
+@pytest.mark.parametrize(
+    ("cache_dtype", "k_scale", "v_scale"),
+    [
+        pytest.param(torch.bfloat16, None, None, id="bf16-cache"),
+        pytest.param(torch.float8_e4m3fn, 0.25, 0.5, id="fp8-cache"),
+    ],
+)
+def test_minimax_m3_msa_prefill_and_decode_after_2048(
+    cache_dtype: torch.dtype,
+    k_scale: float | None,
+    v_scale: float | None,
+) -> None:
+    if (
+        cache_dtype == torch.float8_e4m3fn
+        and torch.cuda.get_device_capability()[0] < 10
+    ):
+        pytest.skip("MiniMax-M3 FP8 cache kernels require NVIDIA Blackwell")
     torch.manual_seed(20260714)
     old_tf32 = torch.backends.cuda.matmul.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -109,7 +125,7 @@ def test_minimax_m3_msa_prefill_and_decode_after_2048() -> None:
         index_key_cache = torch.zeros(
             num_pages * _BLOCK_SIZE,
             _HEAD_DIM,
-            dtype=torch.bfloat16,
+            dtype=cache_dtype,
             device="cuda",
         )
         seq_lens = torch.tensor([prefill_len], dtype=torch.int32, device="cuda")
@@ -135,10 +151,11 @@ def test_minimax_m3_msa_prefill_and_decode_after_2048() -> None:
         )
         assert selected.shape == (prefill_len, 1, _TOPK)
 
+        cached_index_key = index_key.to(cache_dtype).to(torch.bfloat16)
         for query_position in (0, 127, 128, 2047, 2048, prefill_len - 1):
             expected = _reference_selected_blocks(
                 index_query[query_position],
-                index_key,
+                cached_index_key,
                 query_position,
             )
             actual = selected[query_position, 0, : expected.numel()]
@@ -148,7 +165,7 @@ def test_minimax_m3_msa_prefill_and_decode_after_2048() -> None:
             tuple(
                 sorted(
                     _reference_selected_blocks(
-                        index_query[-1, head], index_key, prefill_len - 1
+                        index_query[-1, head], cached_index_key, prefill_len - 1
                     )
                     .cpu()
                     .tolist()
@@ -158,7 +175,7 @@ def test_minimax_m3_msa_prefill_and_decode_after_2048() -> None:
         }
         assert len(per_head_sets) > 1
 
-        key_cache = torch.randn(
+        key_source = torch.randn(
             num_pages,
             1,
             _BLOCK_SIZE,
@@ -166,7 +183,18 @@ def test_minimax_m3_msa_prefill_and_decode_after_2048() -> None:
             dtype=torch.bfloat16,
             device="cuda",
         )
-        value_cache = torch.randn_like(key_cache)
+        value_source = torch.randn_like(key_source)
+        if cache_dtype == torch.bfloat16:
+            key_cache = key_source
+            value_cache = value_source
+        else:
+            assert k_scale is not None and v_scale is not None
+            key_cache = (key_source / k_scale).to(cache_dtype)
+            value_cache = (value_source / v_scale).to(cache_dtype)
+        reference_key_cache = key_cache.float() * (1.0 if k_scale is None else k_scale)
+        reference_value_cache = value_cache.float() * (
+            1.0 if v_scale is None else v_scale
+        )
         query = torch.randn(
             1,
             16,
@@ -182,6 +210,8 @@ def test_minimax_m3_msa_prefill_and_decode_after_2048() -> None:
             block_table,
             seq_lens,
             scale=_HEAD_DIM**-0.5,
+            k_scale=k_scale,
+            v_scale=v_scale,
             cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
             prefix_lens=torch.tensor(
                 [prefill_len - 1], dtype=torch.int32, device="cuda"
@@ -191,8 +221,8 @@ def test_minimax_m3_msa_prefill_and_decode_after_2048() -> None:
         )
         prefill_reference = _reference_sparse_attention(
             query,
-            key_cache,
-            value_cache,
+            reference_key_cache,
+            reference_value_cache,
             selected[-1, 0],
             block_table[0],
             prefill_len - 1,
@@ -234,7 +264,13 @@ def test_minimax_m3_msa_prefill_and_decode_after_2048() -> None:
             max_blocks=num_blocks,
             solution="triton",
         )
-        all_index_keys = torch.cat([index_key, decode_index_key], dim=0)
+        all_index_keys = torch.cat(
+            [
+                cached_index_key,
+                decode_index_key.to(cache_dtype).to(torch.bfloat16),
+            ],
+            dim=0,
+        )
         decode_expected = _reference_selected_blocks(
             decode_index_query[0],
             all_index_keys,
@@ -259,13 +295,15 @@ def test_minimax_m3_msa_prefill_and_decode_after_2048() -> None:
             block_table,
             decode_seq_lens,
             scale=_HEAD_DIM**-0.5,
+            k_scale=k_scale,
+            v_scale=v_scale,
             decode_query_len=1,
             solution="triton",
         )
         decode_reference = _reference_sparse_attention(
             decode_query,
-            key_cache,
-            value_cache,
+            reference_key_cache,
+            reference_value_cache,
             decode_selected[0, 0],
             block_table[0],
             decode_position,

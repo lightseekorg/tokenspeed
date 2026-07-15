@@ -42,7 +42,13 @@ import numpy as np
 import safetensors.torch
 import torch
 from huggingface_hub import HfFileSystem, hf_hub_download, snapshot_download
-from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    ValidationError,
+    ValidationInfo,
+    model_validator,
+)
 from tqdm.auto import tqdm
 
 from tokenspeed.runtime.configs.load_config import LoadConfig
@@ -644,35 +650,65 @@ def kv_cache_scales_loader(
     tp_size: int,
     num_hidden_layers: int,
     model_type: str | None,
+    *,
+    strict: bool = False,
 ) -> Iterable[tuple[int, float]]:
-    """
-    A simple utility to read in KV cache scaling factors that have been
-    previously serialized to disk. Used by the model to populate the appropriate
-    KV cache scaling factors. The serialization should represent a dictionary
-    whose keys are the TP ranks and values are another dictionary mapping layers
-    to their KV cache scaling factors.
+    """Read serialized KV-cache scaling factors for one tensor-parallel rank.
+
+    Args:
+        filename: Path to the serialized JSON scale file.
+        tp_rank: Tensor-parallel rank whose scales should be returned.
+        tp_size: Number of tensor-parallel ranks represented by the file.
+        num_hidden_layers: Number of model layers expected in the file.
+        model_type: Model type expected in the file, or ``None`` to skip that
+            check.
+        strict: Raise on missing or invalid input instead of preserving the
+            legacy fallback to empty scales.
+
+    Returns:
+        An iterable of ``(layer_index, scale)`` pairs. In non-strict mode,
+        errors are logged and an empty iterable is returned.
+
+    Raises:
+        FileNotFoundError: If ``strict`` is true and ``filename`` is missing.
+        ValueError: If ``strict`` is true and the JSON or schema is invalid.
     """
     try:
         with open(filename) as f:
-            context = {
-                "model_type": model_type,
-                "num_hidden_layers": num_hidden_layers,
-                "tp_rank": tp_rank,
-                "tp_size": tp_size,
-            }
             schema_dct = json.load(f)
-            schema = QuantParamSchema.model_validate(schema_dct, context=context)
-            layer_scales_map = schema.kv_cache.scaling_factor[tp_rank]
-            return layer_scales_map.items()
-    except FileNotFoundError:
+        context = {
+            "model_type": model_type,
+            "num_hidden_layers": num_hidden_layers,
+            "tp_rank": tp_rank,
+            "tp_size": tp_size,
+        }
+        schema = QuantParamSchema.model_validate(schema_dct, context=context)
+        layer_scales_map = schema.kv_cache.scaling_factor[tp_rank]
+        return layer_scales_map.items()
+    except FileNotFoundError as exc:
+        if strict:
+            raise FileNotFoundError(
+                f"KV-cache scale file does not exist: {filename!r}."
+            ) from exc
         logger.error("File or directory '%s' not found.", filename)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
+        if strict:
+            raise ValueError(
+                f"KV-cache scale file {filename!r} is not valid JSON "
+                f"(line {exc.lineno}, column {exc.colno})."
+            ) from exc
         logger.error("Error decoding JSON in file '%s'.", filename)
-    except Exception:
+    except ValidationError as exc:
+        if strict:
+            raise ValueError(
+                f"KV-cache scale file {filename!r} failed schema validation: " f"{exc}"
+            ) from exc
         logger.error("An error occurred while reading '%s'.", filename)
-    # This section is reached if and only if any of the excepts are hit
-    # Return an empty iterable (list) => no KV cache scales are loaded
-    # which ultimately defaults to 1.0 scales
+    except Exception:
+        if strict:
+            raise
+        logger.error("An error occurred while reading '%s'.", filename)
+
     logger.warning(
         "Defaulting to KV cache scaling factors = 1.0 for all "
         "layers in TP rank %d as an error occurred during loading.",

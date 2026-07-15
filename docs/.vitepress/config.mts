@@ -25,6 +25,7 @@ export default defineConfig({
       { text: "Getting Started", link: "/guides/getting-started" },
       { text: "Launching", link: "/guides/launching" },
       { text: "Recipes", link: "/recipes/models" },
+      { text: "Benchmarks", link: "/benchmarks/minimax-m3" },
       { text: "Configuration", link: "/configuration/server" },
       { text: "GitHub", link: "https://github.com/lightseekorg/tokenspeed" }
     ],
@@ -53,6 +54,15 @@ export default defineConfig({
       {
         text: "Recipes",
         items: [{ text: "Model Recipes", link: "/recipes/models" }]
+      },
+      {
+        text: "Benchmarks",
+        items: [
+          {
+            text: "MiniMax-M3 Release Benchmark",
+            link: "/benchmarks/minimax-m3"
+          }
+        ]
       },
       {
         text: "Serving",

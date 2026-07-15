@@ -223,12 +223,14 @@ jobs:
             --reuse-runner-state \
             --result-json .ci-artifacts/result.json
 
-      - name: Upload task result
+      - name: Upload task artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: pr-test-${{ matrix.name }}-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ env.WORK_DIR }}/.ci-artifacts/result.json
+          path: |
+            ${{ env.WORK_DIR }}/.ci-artifacts/result.json
+            ${{ env.WORK_DIR }}/.ci-artifacts/server.log
 
       - name: Cleanup work directory
         if: always()

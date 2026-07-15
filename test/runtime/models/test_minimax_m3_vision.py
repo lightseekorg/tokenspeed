@@ -257,6 +257,7 @@ def test_multi_image_metadata_isolates_attention_and_matches_merge_group_rope() 
         dtype=torch.float32,
     )
     expected_angles = coordinates.repeat(1, 2)
-    cos, sin = metadata["position_embeddings"]
+    cos = metadata["rotary_pos_emb_cos"]
+    sin = metadata["rotary_pos_emb_sin"]
     torch.testing.assert_close(cos, expected_angles.cos())
     torch.testing.assert_close(sin, expected_angles.sin())

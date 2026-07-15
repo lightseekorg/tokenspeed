@@ -28,6 +28,7 @@ it surfaces as a normal ``RequestFuncOutput`` marked failed.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import time
 
@@ -36,17 +37,27 @@ import pytest
 from tokenspeed import bench
 
 
-def test_aiohttp_timeout_has_sock_subtimeouts():
+def _parse_serving_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    bench.add_serving_cli_args(parser)
+    return parser.parse_args(argv)
+
+
+def test_aiohttp_timeout_defaults_have_sock_subtimeouts():
     """Regression guard: a future refactor must keep ``sock_read`` set.
 
     Without ``sock_read``, ``aiohttp.StreamReader._wait`` awaits forever on
     a silent socket and one stuck stream-response future blocks the entire
-    benchmark's ``asyncio.gather`` at high concurrency. The exact value is
-    user-tunable via env; we only assert it's bounded and strictly tighter
-    than ``total`` so an indefinitely silent socket still surfaces.
+    benchmark's ``asyncio.gather`` at high concurrency. We assert that the
+    explicit CLI defaults are bounded and strictly tighter than ``total`` so
+    an indefinitely silent socket still surfaces.
     """
-    timeout = bench.AIOHTTP_TIMEOUT
-    assert timeout.sock_read is not None, "AIOHTTP_TIMEOUT must set sock_read"
+    timeout = bench.make_http_timeout(
+        bench.DEFAULT_HTTP_TOTAL_TIMEOUT_SEC,
+        bench.DEFAULT_HTTP_SOCK_CONNECT_TIMEOUT_SEC,
+        bench.DEFAULT_HTTP_SOCK_READ_TIMEOUT_SEC,
+    )
+    assert timeout.sock_read is not None
     assert timeout.total is not None
     assert 0 < timeout.sock_read < timeout.total, (
         f"sock_read {timeout.sock_read} must be smaller than total "
@@ -54,27 +65,64 @@ def test_aiohttp_timeout_has_sock_subtimeouts():
     )
     assert (
         timeout.sock_connect is not None
-    ), "AIOHTTP_TIMEOUT must also set sock_connect"
+    ), "benchmark HTTP timeout must also set sock_connect"
     assert 0 < timeout.sock_connect <= timeout.sock_read
 
 
-def test_per_request_timeout_constant_is_positive():
-    assert bench.PER_REQUEST_TIMEOUT_SEC > 0
+def test_timeout_cli_defaults_do_not_read_legacy_environment(monkeypatch):
+    monkeypatch.setenv("TOKENSPEED_BENCH_TOTAL_TIMEOUT_SEC", "1")
+    monkeypatch.setenv("TOKENSPEED_BENCH_SOCK_CONNECT_TIMEOUT_SEC", "2")
+    monkeypatch.setenv("TOKENSPEED_BENCH_SOCK_READ_TIMEOUT_SEC", "3")
+    monkeypatch.setenv("TOKENSPEED_BENCH_PER_REQUEST_TIMEOUT_SEC", "4")
+
+    args = _parse_serving_args([])
+
+    assert args.http_total_timeout_sec == bench.DEFAULT_HTTP_TOTAL_TIMEOUT_SEC
+    assert (
+        args.http_sock_connect_timeout_sec
+        == bench.DEFAULT_HTTP_SOCK_CONNECT_TIMEOUT_SEC
+    )
+    assert args.http_sock_read_timeout_sec == bench.DEFAULT_HTTP_SOCK_READ_TIMEOUT_SEC
+    assert args.per_request_timeout_sec == bench.DEFAULT_PER_REQUEST_TIMEOUT_SEC
+
+
+def test_timeout_cli_accepts_explicit_values():
+    args = _parse_serving_args(
+        [
+            "--http-total-timeout-sec",
+            "120",
+            "--http-sock-connect-timeout-sec",
+            "4",
+            "--http-sock-read-timeout-sec",
+            "30",
+            "--per-request-timeout-sec",
+            "60",
+        ]
+    )
+
+    assert args.http_total_timeout_sec == 120
+    assert args.http_sock_connect_timeout_sec == 4
+    assert args.http_sock_read_timeout_sec == 30
+    assert args.per_request_timeout_sec == 60
+
+
+def test_timeout_cli_rejects_non_positive_values():
+    with pytest.raises(SystemExit):
+        _parse_serving_args(["--per-request-timeout-sec", "0"])
 
 
 @pytest.mark.asyncio
-async def test_await_with_per_request_timeout_returns_failed_output_on_hang(
-    monkeypatch,
-):
+async def test_await_with_per_request_timeout_returns_failed_output_on_hang():
     """A stuck request must time out instead of blocking forever."""
-    monkeypatch.setattr(bench, "PER_REQUEST_TIMEOUT_SEC", 0.1)
 
     async def stuck_request() -> bench.RequestFuncOutput:
         await asyncio.sleep(60)  # would block past the gather without the wrap
         return bench.RequestFuncOutput()  # pragma: no cover
 
     start = time.perf_counter()
-    output = await bench.await_with_per_request_timeout(stuck_request(), prompt_len=42)
+    output = await bench.await_with_per_request_timeout(
+        stuck_request(), prompt_len=42, timeout_sec=0.1
+    )
     elapsed = time.perf_counter() - start
 
     assert elapsed < 1.0, f"expected sub-second timeout, took {elapsed:.2f}s"
@@ -84,9 +132,8 @@ async def test_await_with_per_request_timeout_returns_failed_output_on_hang(
 
 
 @pytest.mark.asyncio
-async def test_await_with_per_request_timeout_passes_through_success(monkeypatch):
+async def test_await_with_per_request_timeout_passes_through_success():
     """The wrap must not perturb a request that completes normally."""
-    monkeypatch.setattr(bench, "PER_REQUEST_TIMEOUT_SEC", 5.0)
 
     async def fast_request() -> bench.RequestFuncOutput:
         output = bench.RequestFuncOutput()
@@ -95,16 +142,17 @@ async def test_await_with_per_request_timeout_passes_through_success(monkeypatch
         output.generated_text = "hello"
         return output
 
-    result = await bench.await_with_per_request_timeout(fast_request(), prompt_len=13)
+    result = await bench.await_with_per_request_timeout(
+        fast_request(), prompt_len=13, timeout_sec=5.0
+    )
 
     assert result.success is True
     assert result.generated_text == "hello"
 
 
 @pytest.mark.asyncio
-async def test_concurrent_stuck_request_does_not_block_gather(monkeypatch):
+async def test_concurrent_stuck_request_does_not_block_gather():
     """End-to-end shape: stuck + healthy requests gather together cleanly."""
-    monkeypatch.setattr(bench, "PER_REQUEST_TIMEOUT_SEC", 0.2)
 
     async def stuck() -> bench.RequestFuncOutput:
         await asyncio.sleep(60)
@@ -118,10 +166,14 @@ async def test_concurrent_stuck_request_does_not_block_gather(monkeypatch):
 
     start = time.perf_counter()
     results = await asyncio.gather(
-        bench.await_with_per_request_timeout(stuck(), prompt_len=1),
-        bench.await_with_per_request_timeout(healthy(0.05), prompt_len=2),
-        bench.await_with_per_request_timeout(stuck(), prompt_len=3),
-        bench.await_with_per_request_timeout(healthy(0.05), prompt_len=4),
+        bench.await_with_per_request_timeout(stuck(), prompt_len=1, timeout_sec=0.2),
+        bench.await_with_per_request_timeout(
+            healthy(0.05), prompt_len=2, timeout_sec=0.2
+        ),
+        bench.await_with_per_request_timeout(stuck(), prompt_len=3, timeout_sec=0.2),
+        bench.await_with_per_request_timeout(
+            healthy(0.05), prompt_len=4, timeout_sec=0.2
+        ),
     )
     elapsed = time.perf_counter() - start
 

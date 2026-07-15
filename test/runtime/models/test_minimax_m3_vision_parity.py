@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -26,6 +27,10 @@ from tokenspeed.runtime.models.minimax_m3_vision import (
     MiniMaxM3MultiModalProjector,
     MiniMaxM3PatchMergeMLP,
     MiniMaxM3VisionTower,
+)
+from tokenspeed.runtime.multimodal.encoder_cudagraph import (
+    EncoderCudaGraphWrapper,
+    VisionEncoderCudaGraphAdapter,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -273,9 +278,7 @@ def test_minimax_m3_tiny_multi_image_pipeline_matches_independent_references() -
         parameter.dtype is torch.bfloat16 for parameter in runtime_merger.parameters()
     )
 
-    grid_thw = torch.tensor(
-        [[1, 4, 4], [1, 2, 4]], dtype=torch.int64, device=device
-    )
+    grid_thw = torch.tensor([[1, 4, 4], [1, 2, 4]], dtype=torch.int64, device=device)
     pixel_values = torch.randn(24, 3 * 2 * 2 * 2, dtype=torch.float32, device=device)
 
     reference_patches = reference_tower.embeddings(pixel_values)
@@ -336,3 +339,99 @@ def test_minimax_m3_tiny_multi_image_pipeline_matches_independent_references() -
         rtol=2e-2,
         atol=2e-2,
     )
+
+
+@torch.inference_mode()
+def test_minimax_m3_encoder_cudagraph_replays_dynamic_3d_rope() -> None:
+    """Replay one graph across aspect ratios and packed image orderings."""
+
+    torch.manual_seed(20260715)
+    device = torch.device("cuda", torch.cuda.current_device())
+    config = _runtime_config()
+    with _default_dtype(torch.bfloat16), torch.device(device):
+        tower = MiniMaxM3VisionTower(
+            config.vision_config,
+            mapping=Mapping(rank=0, world_size=1),
+            mm_attention_backend="triton_attn",
+        ).eval()
+
+    # Runtime parameters are allocated with ``torch.empty`` because production
+    # immediately loads checkpoint weights. Give this standalone graph test
+    # deterministic finite weights instead of depending on allocator contents
+    # left by an earlier CUDA test.
+    for parameter in tower.parameters():
+        torch.nn.init.normal_(parameter, mean=0.0, std=0.02)
+    for module in tower.modules():
+        if isinstance(module, torch.nn.LayerNorm):
+            torch.nn.init.ones_(module.weight)
+            torch.nn.init.zeros_(module.bias)
+
+    items = [
+        SimpleNamespace(
+            tokens=torch.randn(
+                16,
+                1,
+                tower.hidden_size,
+                dtype=tower.dtype,
+                device=device,
+            ),
+            grid=torch.tensor([[1, 4, 4]], dtype=torch.int64, device=device),
+        ),
+        SimpleNamespace(
+            tokens=torch.randn(
+                8,
+                1,
+                tower.hidden_size,
+                dtype=tower.dtype,
+                device=device,
+            ),
+            grid=torch.tensor([[1, 2, 4]], dtype=torch.int64, device=device),
+        ),
+    ]
+
+    def pre_encode(selected_items):
+        return (
+            torch.cat([item.tokens for item in selected_items]),
+            torch.cat([item.grid for item in selected_items]),
+        )
+
+    def post_encode(encoder_outs, _grid):
+        return torch.cat(encoder_outs).squeeze(1)
+
+    wrapper = EncoderCudaGraphWrapper(
+        adapter=VisionEncoderCudaGraphAdapter(
+            tower=tower,
+            pre_encode=pre_encode,
+            post_encode=post_encode,
+            out_div=1,
+            merge=tower.spatial_merge_size,
+            input_feature_shape=(1, tower.hidden_size),
+            modality_name="image",
+            input_dtype=tower.dtype,
+        ),
+        # One 24-patch graph deliberately replays both a 16+8 packed batch and
+        # the opposite ordering. Its synthetic capture grid is neither real
+        # grid, which makes stale capture-time RoPE immediately observable.
+        budget_range=(24, 24),
+        max_batch_size=2,
+    )
+
+    def eager(selected_items):
+        tokens, grid = pre_encode(selected_items)
+        return tower.forward_blocks(tokens, tower.prepare_metadata(grid)).squeeze(1)
+
+    expected = eager(items)
+    actual = wrapper(items)
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+    assert set(wrapper.budget_graphs) == {24}
+
+    reversed_items = list(reversed(items))
+    expected_reversed = eager(reversed_items)
+    actual_reversed = wrapper(reversed_items)
+    torch.testing.assert_close(
+        actual_reversed,
+        expected_reversed,
+        rtol=2e-2,
+        atol=2e-2,
+    )
+    assert set(wrapper.budget_graphs) == {24}

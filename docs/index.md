@@ -32,6 +32,7 @@ features:
 - [Getting Started](./guides/getting-started.md)
 - [Launching a Server](./guides/launching.md)
 - [Model Recipes](./recipes/models.md)
+- [MiniMax-M3 Release Benchmark](./benchmarks/minimax-m3.md)
 - [Server Parameters](./configuration/server.md)
 - [Compatible Parameters](./configuration/compatible-parameters.md)
 - [Parallelism](./serving/parallelism.md)

@@ -11,7 +11,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.mha import MHATokenToKVPool
 
 
 class IndexedMHATokenToKVPool(MHATokenToKVPool):
-    """Standard paged K/V plus one BF16 index-key vector per layer and token."""
+    """Standard paged K/V plus one matching-dtype index-key vector per token."""
 
     def __init__(
         self,
@@ -22,8 +22,21 @@ class IndexedMHATokenToKVPool(MHATokenToKVPool):
     ) -> None:
         self.index_head_dim = int(index_head_dim)
         self.index_dtype = index_dtype
+        self.index_store_dtype = (
+            torch.uint8
+            if index_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+            else index_dtype
+        )
         self.index_k_buffer: list[torch.Tensor] = []
         super().__init__(*args, **kwargs)
+        # Radix-cache host offload and PD transfer currently describe only the
+        # main K/V tensors; exposing them without the side cache would be wrong.
+        self.supports_hierarchical_kv_cache = False
+
+    def _create_buffers(self) -> None:
+        """Allocate main K/V and index K before the parent reports pool size."""
+
+        super()._create_buffers()
         with self.memory_saver_adapter.region(
             tag="kv_cache",
             enable_cpu_backup=False,
@@ -31,20 +44,20 @@ class IndexedMHATokenToKVPool(MHATokenToKVPool):
             self.index_k_buffer = [
                 torch.zeros(
                     (self.size + self.page_size, self.index_head_dim),
-                    dtype=self.index_dtype,
+                    dtype=self.index_store_dtype,
                     device=self.device,
                 )
                 for _ in range(self.layer_num)
             ]
-        # Radix-cache host offload and PD transfer currently describe only the
-        # main K/V tensors; exposing them without the side cache would be wrong.
-        self.supports_hierarchical_kv_cache = False
 
     def get_index_k_buffer(self, layer_id: int) -> torch.Tensor:
         """Return the key-only side cache for ``layer_id``."""
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id)
-        return self.index_k_buffer[layer_id]
+        buffer = self.index_k_buffer[layer_id]
+        if self.index_store_dtype != self.index_dtype:
+            return buffer.view(self.index_dtype)
+        return buffer
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor) -> None:
         super().move_kv_cache(tgt_loc, src_loc)

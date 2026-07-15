@@ -297,6 +297,32 @@ class TestCLIConfigCompat(unittest.TestCase):
         sa.resolve_basic_defaults()
         self.assertEqual(sa.kv_cache_dtype, "fp8_e4m3")
 
+    def test_mm_encoder_cuda_graph_arg(self):
+        args = self._parse_args(
+            ["--model", "test/model", "--enable-mm-encoder-cuda-graph"]
+        )
+        self.assertTrue(args.enable_mm_encoder_cuda_graph)
+
+    def test_no_mm_encoder_cuda_graph_arg(self):
+        args = self._parse_args(
+            ["--model", "test/model", "--no-enable-mm-encoder-cuda-graph"]
+        )
+        self.assertFalse(args.enable_mm_encoder_cuda_graph)
+
+    def test_mm_encoder_cudagraph_metadata_sequence_limit_arg(self):
+        args = self._parse_args(
+            [
+                "--model",
+                "test/model",
+                "--mm-encoder-cudagraph-max-metadata-sequences-per-batch",
+                "17",
+            ]
+        )
+        self.assertEqual(
+            args.mm_encoder_cudagraph_max_metadata_sequences_per_batch,
+            17,
+        )
+
     def test_tokenizer_mode_deepseek_v4_arg(self):
         args = self._parse_args(
             ["--model", "test/model", "--tokenizer-mode", "deepseek_v4"]

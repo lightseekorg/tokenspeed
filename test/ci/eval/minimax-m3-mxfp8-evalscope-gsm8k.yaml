@@ -1,0 +1,52 @@
+api_version: ci.tokenspeed.io/v1
+name: eval-minimax-m3-mxfp8-gsm8k
+type: eval
+triggers:
+  - manual
+runner:
+  labels:
+    - b200-4gpu
+install:
+  - bash test/ci_system/install_deps.sh
+server:
+  command: >-
+    tokenspeed serve MiniMaxAI/MiniMax-M3-MXFP8
+    --revision c5454eb03678d8710e54a4e0fc681b9f3b4a3dba
+    --served-model-name minimax-m3
+    --trust-remote-code
+    --language-model-only
+    --tensor-parallel-size 4
+    --base-gpu-id 0
+    --gpu-id-step 1
+    --max-model-len 131072
+    --max-total-tokens 262144
+    --max-num-seqs 16
+    --chunked-prefill-size 8192
+    --block-size 128
+    --kv-cache-dtype fp8_e4m3
+    --kv-cache-quant-method none
+    --attention-backend mha
+    --moe-backend triton
+    --sampling-backend greedy
+    --disable-kvstore
+    --host 127.0.0.1
+    --port 8000
+  ready:
+    url: http://127.0.0.1:8000/readiness
+    timeout: 1800
+    interval: 10
+eval:
+  install:
+    - python3 -m uv venv --seed --clear /tmp/evalscope-minimax-m3 && python3 -m uv pip install --python /tmp/evalscope-minimax-m3/bin/python 'evalscope[perf]==1.8.0'
+  # Add score_threshold only after a pinned baseline has been reviewed.
+  command: >-
+    /tmp/evalscope-minimax-m3/bin/evalscope eval
+    --model minimax-m3
+    --api-url http://127.0.0.1:8000/v1
+    --api-key EMPTY_TOKEN
+    --datasets gsm8k
+    --eval-batch-size 8
+    --stream
+    --generation-config '{"do_sample":false,"temperature":0,"max_tokens":8192}'
+report:
+  github_step_summary: true
