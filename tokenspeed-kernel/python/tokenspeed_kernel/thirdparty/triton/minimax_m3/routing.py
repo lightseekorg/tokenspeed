@@ -37,9 +37,7 @@ def _minimax_m3_topk_kernel(
     expert_mask = expert_offsets < num_experts
 
     logits = tl.load(
-        gating_output_ptr
-        + token_id * stride_gm
-        + expert_offsets * stride_ge,
+        gating_output_ptr + token_id * stride_gm + expert_offsets * stride_ge,
         mask=expert_mask,
         other=-float("inf"),
     ).to(tl.float32)
@@ -73,15 +71,11 @@ def _minimax_m3_topk_kernel(
         weights_sum += best_weight
 
         tl.store(
-            topk_ids_ptr
-            + token_id * stride_im
-            + topk_offset * stride_ik,
+            topk_ids_ptr + token_id * stride_im + topk_offset * stride_ik,
             best_expert.to(tl.int32),
         )
         tl.store(
-            topk_weights_ptr
-            + token_id * stride_wm
-            + topk_offset * stride_wk,
+            topk_weights_ptr + token_id * stride_wm + topk_offset * stride_wk,
             best_weight,
         )
         choice_scores = tl.where(
@@ -93,15 +87,11 @@ def _minimax_m3_topk_kernel(
     denominator = tl.where(weights_sum != 0.0, weights_sum, 1.0)
     for topk_offset in tl.static_range(0, TOPK):
         weight = tl.load(
-            topk_weights_ptr
-            + token_id * stride_wm
-            + topk_offset * stride_wk
+            topk_weights_ptr + token_id * stride_wm + topk_offset * stride_wk
         )
         weight = weight / denominator * routed_scaling_factor
         tl.store(
-            topk_weights_ptr
-            + token_id * stride_wm
-            + topk_offset * stride_wk,
+            topk_weights_ptr + token_id * stride_wm + topk_offset * stride_wk,
             weight,
         )
 
@@ -225,9 +215,7 @@ def _validate_route_inputs(
             f"{tuple(topk_weights.shape)} and {tuple(topk_ids.shape)}."
         )
     if topk_ids.dtype != torch.int32:
-        raise TypeError(
-            f"MiniMax-M3 route ids must use INT32, got {topk_ids.dtype}."
-        )
+        raise TypeError(f"MiniMax-M3 route ids must use INT32, got {topk_ids.dtype}.")
     if topk_weights.dtype != torch.float32:
         raise TypeError(
             f"MiniMax-M3 route weights must use FP32, got {topk_weights.dtype}."
@@ -287,9 +275,7 @@ def minimax_m3_route_order(
             f"with shape {(num_experts + 1,)}, got shape={tuple(slice_offs.shape)}, "
             f"dtype={slice_offs.dtype}, device={slice_offs.device}."
         )
-    gather_indx = torch.empty(
-        (num_routes,), dtype=torch.int32, device=topk_ids.device
-    )
+    gather_indx = torch.empty((num_routes,), dtype=torch.int32, device=topk_ids.device)
     scatter_indx = torch.empty_like(gather_indx)
     gate_scal = torch.empty_like(topk_weights).reshape(-1)
     if num_routes:
@@ -332,9 +318,7 @@ def minimax_m3_reduce_topk(expert_output: torch.Tensor) -> torch.Tensor:
     )
     if num_tokens:
         block_h = 1024
-        _minimax_m3_reduce_topk_kernel[
-            (num_tokens, triton.cdiv(hidden_size, block_h))
-        ](
+        _minimax_m3_reduce_topk_kernel[(num_tokens, triton.cdiv(hidden_size, block_h))](
             expert_output,
             output,
             hidden_size,

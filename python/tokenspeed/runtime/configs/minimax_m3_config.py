@@ -160,12 +160,30 @@ class MiniMaxM3VisionConfig(PretrainedConfig):
         vision_segment_max_frames: int = 4,
         **kwargs,
     ) -> None:
+        compression_config = img_token_compression_config or {
+            "image_token_compression_method": "patch_merge",
+            "spatial_merge_size": 2,
+            "temporal_patch_size": 2,
+        }
+        spatial_merge_size = int(compression_config["spatial_merge_size"])
+        temporal_patch_size = int(compression_config["temporal_patch_size"])
+        if hidden_size % num_attention_heads != 0:
+            raise ValueError(
+                "MiniMax-M3 vision hidden_size must be divisible by "
+                f"num_attention_heads, got {hidden_size} and {num_attention_heads}."
+            )
+        if spatial_merge_size <= 0 or temporal_patch_size <= 0:
+            raise ValueError("MiniMax-M3 patch merge sizes must be positive.")
+
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
+        self.head_dim = hidden_size // num_attention_heads
         self.image_size = image_size
         self.patch_size = patch_size
+        self.temporal_patch_size = temporal_patch_size
+        self.spatial_merge_size = spatial_merge_size
         self.num_channels = num_channels
         self.projection_dim = projection_dim
         self.position_embedding_type = position_embedding_type
@@ -176,11 +194,7 @@ class MiniMaxM3VisionConfig(PretrainedConfig):
         self.initializer_factor = initializer_factor
         self.initializer_range = initializer_range
         self.layer_norm_eps = layer_norm_eps
-        self.img_token_compression_config = img_token_compression_config or {
-            "image_token_compression_method": "patch_merge",
-            "spatial_merge_size": 2,
-            "temporal_patch_size": 2,
-        }
+        self.img_token_compression_config = compression_config
         self.vision_segment_max_frames = vision_segment_max_frames
         super().__init__(**kwargs)
 
@@ -205,28 +219,55 @@ class MiniMaxM3VLConfig(PretrainedConfig):
         process_image_mode: str = "dynamic_res",
         projector_hidden_act: str = "gelu",
         projector_hidden_size: int = 6144,
+        merged_hidden_size: int | None = None,
         multimodal_projector_bias: bool = True,
         vision_feature_layer: int = -1,
         vision_feature_select_strategy: str = "full",
         img_token_compression_config: dict | None = None,
         image_grid_pinpoints: str | None = None,
         num_reward_heads: int = 0,
+        encoder_only: bool = False,
         **kwargs,
     ) -> None:
         self.text_config = self._make_text_config(text_config)
         self.vision_config = self._make_vision_config(vision_config)
+        compression_config = (
+            img_token_compression_config
+            or self.vision_config.img_token_compression_config
+        )
+        spatial_merge_size = int(compression_config["spatial_merge_size"])
+        if spatial_merge_size != self.vision_config.spatial_merge_size:
+            raise ValueError(
+                "MiniMax-M3 top-level and vision spatial_merge_size must match."
+            )
         self.image_token_index = image_token_index
         self.video_token_index = video_token_index
+        self.image_token_id = image_token_index
+        self.video_token_id = video_token_index
         self.image_seq_length = image_seq_length
         self.process_image_mode = process_image_mode
         self.projector_hidden_act = projector_hidden_act
         self.projector_hidden_size = projector_hidden_size
+        expected_merged_hidden_size = (
+            self.text_config.hidden_size * spatial_merge_size**2
+        )
+        if (
+            merged_hidden_size is not None
+            and merged_hidden_size != expected_merged_hidden_size
+        ):
+            raise ValueError(
+                "MiniMax-M3 merged_hidden_size must equal text hidden_size times "
+                f"spatial_merge_size squared ({expected_merged_hidden_size}), got "
+                f"{merged_hidden_size}."
+            )
+        self.merged_hidden_size = expected_merged_hidden_size
         self.multimodal_projector_bias = multimodal_projector_bias
         self.vision_feature_layer = vision_feature_layer
         self.vision_feature_select_strategy = vision_feature_select_strategy
-        self.img_token_compression_config = img_token_compression_config or {}
+        self.img_token_compression_config = compression_config
         self.image_grid_pinpoints = image_grid_pinpoints
         self.num_reward_heads = num_reward_heads
+        self.encoder_only = encoder_only
         super().__init__(**kwargs)
 
     @staticmethod

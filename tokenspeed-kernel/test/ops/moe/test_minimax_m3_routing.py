@@ -19,7 +19,6 @@ with redirect_triton_to_tokenspeed_triton():
 
 from triton_kernels.tensor import make_ragged_tensor_metadata
 
-
 pytestmark = pytest.mark.skipif(
     not current_platform().is_nvidia,
     reason="MiniMax-M3 native routing targets NVIDIA GPUs.",

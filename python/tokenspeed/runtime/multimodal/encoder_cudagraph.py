@@ -187,6 +187,7 @@ class VisionEncoderCudaGraphAdapter:
     out_squeeze_dim: int | None = None
     capture_tp_size: int = 1
     capture_tp_group: Any | None = None
+    input_dtype: torch.dtype | None = None
 
     @cached_property
     def _param(self) -> torch.nn.Parameter:
@@ -198,7 +199,7 @@ class VisionEncoderCudaGraphAdapter:
 
     @property
     def dtype(self) -> torch.dtype:
-        return self._param.dtype
+        return self.input_dtype or self._param.dtype
 
     def synthetic_grid(self, encoder_output_token_budget: int) -> list[list[int]]:
         n_patches = encoder_output_token_budget * self.out_div

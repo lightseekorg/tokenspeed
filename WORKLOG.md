@@ -1,6 +1,6 @@
 # MiniMax M3 Handoff Worklog
 
-Last updated: 2026-07-14 UTC
+Last updated: 2026-07-15 UTC
 
 This file is the cold-start handoff for the MiniMax M3 basic-support branch. It
 records what is implemented, what was actually validated, and how to resume on
@@ -16,6 +16,9 @@ a different machine without relying on `/tmp` files or shell history.
 - Model: `MiniMaxAI/MiniMax-M3-MXFP8`
 - Model revision used for the current config:
   `c5454eb03678d8710e54a4e0fc681b9f3b4a3dba`
+- SMG processor repository: `https://github.com/FlamingoPg/smg.git`, branch
+  `flamingo/minimax_m3`, revision
+  `b7402c47759067e2f2a8840eaf7e81e239ca79b5`
 
 Do not push this work directly to `flamingopg/main`. That branch has diverged
 from `origin/main`; resume from the feature branch above.
@@ -40,7 +43,7 @@ from `origin/main`; resume from the feature branch above.
 | 1M context | **Exact maximum pass** | The corrected four-index-head 1,048,575 + 1 request returned HTTP 200 in 223.00 s with stable memory, no OOM/restart/transport failure, and post-request readiness/health 200. |
 | CUDA Graph / B200 tuning | Validated | Default and strict-greedy variants captured batch sizes 1/2/4. A post-fix TP4 run additionally captured 1/2/3/4 with the index-query all-gather. Graph/eager A/B improved output throughput by 1.66x at concurrency 1 and 1.71x at concurrency 4. |
 | Benchmark accuracy | Aligned | HF teacher-forced comparison matched 39/40 greedy tokens; TokenSpeed's token was in HF top-5 for 40/40, with mean absolute shared-token logprob delta 0.0504. Four of five autoregressive prompts matched all eight generated tokens. |
-| ViT | Not implemented | The conditional-generation architecture is recognized, but active multimodal input intentionally raises instead of silently dropping vision data. |
+| ViT and image requests | Implemented and validated | The 32-block vision tower, partial 3D RoPE, dynamic resolution, 2x2 patch merge, projector, SMG processor, and embeds-only LM splice are active. Single-image visual logits match the native Transformers TP4 reference; single-image, two-image, and text requests passed on the active-MM server. |
 
 ## Design checkpoint
 
@@ -57,8 +60,83 @@ from `origin/main`; resume from the feature branch above.
 - The current MSA contract requires BF16 activations, BF16 KV cache, and
   `--block-size 128`. Unsupported settings raise an error rather than using
   dense or Torch attention.
-- The entry point is deliberately language-only until the ViT/projector path
-  is implemented.
+- The conditional-generation entry point follows the shared
+  `MultimodalEmbedder` and `VisionEncoderCudaGraphAdapter` seams. The released
+  checkpoint's 523 visual tensors stream directly into 395 fused/TP-sharded
+  runtime parameters without buffering the full vision state dict.
+- The patch Conv3d remains FP32, while the ViT blocks, projector, and patch
+  merge MLP remain BF16. Visual checkpoint modules do not inherit the text
+  MXFP8 quantization config.
+- Every `grid_thw` row is an independent varlen attention sequence. This is
+  equivalent to one reference-tower call per image and prevents images from
+  unrelated batched requests from attending to each other or making
+  content-addressed image embeddings request-dependent.
+
+## Phase 4 final validation
+
+Persistent Phase 4 artifacts are under:
+
+```text
+/raid/flamingo/runs/minimax_m3_phase4_20260715T062209Z/
+```
+
+### Vision implementation and preprocessing
+
+- The CLIP-style tower has 32 transformer blocks at hidden size 1280, with
+  16 heads of width 80. MiniMax partial 3D RoPE rotates 26 dimensions for
+  each of T/H/W and leaves the final two head dimensions unchanged.
+- The image processor uses patch size 14, temporal patch size 2, spatial
+  merge size 2, CLIP normalization, PIL-compatible bicubic resize, and the
+  checkpoint's dynamic 28-pixel factor with 3136/451584 min/max pixel
+  budgets. It emits merge-grouped flat patches plus integer
+  `image_grid_thw` metadata.
+- Projection is 1280 -> 6144 -> 6144. Four consecutive projected patches are
+  flattened to 24576 and reduced through the patch-merge MLP to one 6144-wide
+  LM token.
+- A real TP4 meta load consumed all 523 raw visual tensors and populated all
+  395 runtime visual parameters with zero missing or extra mappings.
+
+### End-to-end image requests
+
+- A single pug image returned HTTP 200 and described a pug wrapped in a plaid
+  blanket. Its processor grid was `[1, 14, 22]`: 308 input patches and 77
+  merged visual tokens (`pug_chat_response.json`).
+- A two-image request combined the pug with the TokenSpeed banner, returned
+  HTTP 200, and identified both the pug and “TokenSpeed / Tokens at the speed
+  of light” (`two_image_chat_response_128.json`). The second image exercised
+  the maximum `[1, 24, 96]` grid: 2304 patches and 576 merged tokens.
+- A text-only request against the same active multimodal server returned HTTP
+  200 with the exact requested phrase, so enabling vision did not regress the
+  text path (`text_chat_response_80.json`).
+
+### Visual reference alignment
+
+The dog-image acceptance request used the exact same rendered chat template,
+254 input tokens, FP32 `[308, 1176]` pixels, grid `[[1, 14, 22]]`, and 77
+merged image tokens in TokenSpeed and native Transformers 5.12 TP4:
+
+- Both implementations selected `Dog` (token ID 75382) as rank 1.
+- TokenSpeed sampled logprob: `-0.000986447`.
+- Transformers reference logprob: `-0.001004667836241424`.
+- TokenSpeed minus reference delta: `0.000018220836241424`.
+- The native projected visual output was finite BF16 `[77, 6144]`; the load
+  assertions confirmed FP32 patch Conv3d and BF16 tower/projector weights.
+- Evidence: `tokenspeed_dog_first_token_logprob.json`,
+  `hf_phase4_visual_reference.json`, and
+  `hf_phase4_visual_reference.log`.
+
+Permanent CUDA parity uses two differently sized images packed as independent
+varlen sequences and compares their patch, tower, projector, and merge outputs
+against two independent native Transformers calls. This matches TokenSpeed's
+serving/batching contract. Transformers 5.12 instead permits cross-image
+attention when multiple grids are concatenated into one direct model call;
+that direct-call multi-image behavior is intentionally not used as a serving
+batch reference.
+
+The MiniMax encoder CUDA-graph adapter and capture budgets are wired and unit
+tested, but a real capture/replay was not run in Phase 4. All acceptance
+requests used eager vision execution; keep real encoder graph capture as an
+explicit follow-up rather than treating wrapper construction as validation.
 
 ## Phase 3 final validation
 
@@ -177,7 +255,7 @@ point where Top-16 block eviction begins.
 
 ## Last machine environment
 
-- Host date: 2026-07-14 UTC
+- Host date: 2026-07-15 UTC
 - GPUs: 8 x NVIDIA B200, 183359 MiB each, full NVLink connectivity
 - GPUs used for M3: physical 4,5,6,7
 - Driver: 580.126.20
@@ -187,12 +265,14 @@ point where Top-16 block eviction begins.
 - Triton: 3.6.0
 - Transformers: 5.12.0
 - TokenSpeed: 0.1.0
-- tokenspeed-smg: 1.7.0.post20260710
+- SMG Python binding: locally built from
+  `FlamingoPg/smg@b7402c47759067e2f2a8840eaf7e81e239ca79b5`
 - tokenspeed-smg-grpc-servicer: 0.6.0.post20260710
 
-At final validation, all M3/TokenSpeed/SMG processes had exited and GPUs 4-7
-had returned to 0 MiB used with no compute processes. Do not assume the same
-GPU indices are free on the next host.
+At final validation, all M3/TokenSpeed/SMG/Transformers reference processes had
+exited. All eight GPUs reported 0% utilization, GPUs 4-7 had returned to 0 MiB
+used, and there were no live compute processes. Do not assume the same GPU
+indices are free on the next host.
 
 ## Cold start on a new machine
 
@@ -224,6 +304,38 @@ The explicit build tools are needed because a fresh Python 3.12 virtual
 environment may not contain `setuptools`. The gRPC helper pins keep their
 generated code compatible with Protobuf 6, which is required by CUTLASS DSL
 4.6, while satisfying the current TokenSpeed SMG servicer requirement.
+
+The published `tokenspeed-smg` build predates MiniMax-M3 preprocessing. Build
+the fixed SMG branch into the same virtual environment before starting an
+active multimodal server:
+
+```bash
+cd ..
+git clone --branch flamingo/minimax_m3 \
+  https://github.com/FlamingoPg/smg.git
+cd smg
+git checkout b7402c47759067e2f2a8840eaf7e81e239ca79b5
+
+python -m pip install maturin
+python -m pip uninstall -y tokenspeed-smg
+cd bindings/python
+PROTOC="$(python -c \
+  'from pathlib import Path; import torch; print(Path(torch.__file__).parent / "bin/protoc")')" \
+PROTOC_INCLUDE=/opt/jd_packages/grpc_tools/_proto \
+  maturin develop --features vendored-openssl
+
+python - <<'PY'
+from pathlib import Path
+import smg
+
+print(Path(smg.__file__).resolve())
+PY
+```
+
+On a host where the protobuf include directory differs, point
+`PROTOC_INCLUDE` at that host's `grpc_tools/_proto`. Verify that `smg.__file__`
+resolves inside the cloned source tree; otherwise an older user-site package
+may still be shadowing the local build.
 
 Confirm ownership and available memory before selecting GPUs:
 
@@ -280,6 +392,77 @@ curl -sS http://127.0.0.1:8123/generate \
 With TokenSpeed SMG 1.7, `/generate` requests must include the served model
 name. Omitting `"model": "minimax-m3"` produces `tokenizer_not_found` for
 model `unknown`.
+
+## Active multimodal smoke test
+
+Use the locally built SMG binding and omit `--language-model-only`:
+
+```bash
+MODEL=/path/to/models--MiniMaxAI--MiniMax-M3-MXFP8/snapshots/\
+c5454eb03678d8710e54a4e0fc681b9f3b4a3dba
+
+CUDA_VISIBLE_DEVICES=4,5,6,7 tokenspeed serve "$MODEL" \
+  --tokenizer "$MODEL" \
+  --served-model-name minimax-m3 \
+  --trust-remote-code \
+  --tensor-parallel-size 4 \
+  --max-model-len 32768 \
+  --max-total-tokens 32768 \
+  --max-num-seqs 2 \
+  --chunked-prefill-size 4096 \
+  --max-prefill-tokens 8192 \
+  --block-size 128 \
+  --attention-backend triton \
+  --mm-attention-backend triton_attn \
+  --moe-backend triton \
+  --enforce-eager \
+  --disable-prefill-graph \
+  --disable-kvstore \
+  --enable-output-logprobs \
+  --host 127.0.0.1 \
+  --port 8123
+```
+
+After readiness, send the image through the OpenAI-compatible chat endpoint:
+
+```bash
+python - <<'PY'
+import base64
+from pathlib import Path
+
+import requests
+
+image_path = Path("/path/to/dog.jpg")
+data_url = "data:image/jpeg;base64," + base64.b64encode(
+    image_path.read_bytes()
+).decode()
+payload = {
+    "model": "minimax-m3",
+    "messages": [{
+        "role": "user",
+        "content": [
+            {"type": "image_url", "image_url": {"url": data_url}},
+            {"type": "text", "text": "What animal is in this image? Reply with one word."},
+        ],
+    }],
+    "chat_template_kwargs": {"thinking_mode": "disabled"},
+    "temperature": 0,
+    "max_tokens": 1,
+    "logprobs": True,
+    "top_logprobs": 0,
+}
+response = requests.post(
+    "http://127.0.0.1:8123/v1/chat/completions",
+    json=payload,
+    timeout=300,
+)
+print(response.status_code, response.text)
+response.raise_for_status()
+PY
+```
+
+For Phase 4, `/v1/chat/completions` is the validated image route. The legacy
+`/generate` `image_data` path was not used as multimodal acceptance evidence.
 
 ## 1M reproduction
 
@@ -393,6 +576,21 @@ measurements above are copied here intentionally.
 
 ## Validation commands
 
+Phase 4 validation on 2026-07-15 UTC:
+
+- MiniMax model/config/loader, CPU vision-contract, and CUDA Transformers
+  parity tests: **14 passed**.
+- SMG full `llm-multimodal` library suite: **246 passed**.
+- SMG nightly `cargo fmt --all -- --check` and stable clippy with
+  `-D warnings`: **PASS**.
+- Real active-MM TP4 single-image, two-image, and text requests: **HTTP 200**.
+- Native Transformers TP4 dog-image first-token/logprob comparison: **rank-1
+  token exact**, absolute logprob delta `1.8221e-05`.
+- Formatter-affected MiniMax routing tests: **8 passed**; exact
+  `pre-commit run --all-files`: **PASS**.
+- Changed-file `compileall`, both repositories' `git diff --check`, and final
+  GPU/process shutdown check: **PASS**.
+
 Final-machine validation on 2026-07-14 UTC:
 
 - Root targeted scheduler/sampling/logits/CLI/MoE tests: **75 passed**
@@ -428,6 +626,8 @@ When a GPU is reserved for this task, run the model and native-kernel coverage:
 ```bash
 CUDA_VISIBLE_DEVICES=4 python -m pytest -q \
   test/runtime/models/test_minimax_m3.py \
+  test/runtime/models/test_minimax_m3_vision.py \
+  test/runtime/models/test_minimax_m3_vision_parity.py \
   tokenspeed-kernel/test/ops/test_minimax_m3_msa.py \
   tokenspeed-kernel/test/ops/test_mxfp8_gemm.py \
   tokenspeed-kernel/test/ops/test_activation.py \
@@ -444,13 +644,18 @@ pre-commit run --all-files
 
 ## Next acceptance steps
 
-1. Implement the ViT/projector path and multimodal preprocessing; remove the
-   deliberate language-only rejection only after end-to-end image tests pass.
-2. Expand concurrent prefix-cache eviction/reuse and mixed-request MSA tests,
+1. Run a real MiniMax vision-encoder CUDA Graph capture/replay test; Phase 4
+   validated wrapper construction and eager execution only.
+2. Add video preprocessing and request support if MiniMax-M3 video is brought
+   into scope; Phase 4 intentionally accepts image items only.
+3. Track the direct Transformers multi-image-call semantic difference. The
+   serving path deliberately isolates each image to preserve request isolation,
+   chunked-prefill reuse, and content-addressed embedding reuse.
+4. Expand concurrent prefix-cache eviction/reuse and mixed-request MSA tests,
    especially skewed non-zero prefixes and non-contiguous page tables.
-3. Add a permanent end-to-end MXFP8 MoE apply numerical test; current coverage
+5. Add a permanent end-to-end MXFP8 MoE apply numerical test; current coverage
    validates GEMM, routing metadata, and reduction separately.
-4. If further 1M prefill optimization is needed, benchmark a distributed
+6. If further 1M prefill optimization is needed, benchmark a distributed
    candidate-Top-K merge against the current small index-query all-gather. The
    current correct path completed the exact boundary in 223.00 s.
 

@@ -7,6 +7,7 @@ import torch
 
 from tokenspeed.runtime.configs.minimax_m3_config import (
     MiniMaxM3TextConfig,
+    MiniMaxM3VisionConfig,
     MiniMaxM3VLConfig,
 )
 from tokenspeed.runtime.configs.model_config import is_multimodal_model
@@ -19,6 +20,7 @@ from tokenspeed.runtime.models.minimax_m3 import (
     MiniMaxM3SparseMoeBlock,
     _msa_score_block_upper_bound,
 )
+from tokenspeed.runtime.multimodal.inputs import Modality, MultimodalDataItem
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
@@ -40,7 +42,23 @@ def _tiny_config() -> MiniMaxM3VLConfig:
             num_experts_per_tok=4,
             moe_layer_freq=[0, 0, 0, 1],
             dtype="bfloat16",
-        )
+        ),
+        vision_config=MiniMaxM3VisionConfig(
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            image_size=8,
+            patch_size=2,
+            num_channels=3,
+            projection_dim=128,
+            img_token_compression_config={
+                "image_token_compression_method": "patch_merge",
+                "spatial_merge_size": 2,
+                "temporal_patch_size": 2,
+            },
+        ),
+        projector_hidden_size=128,
     )
 
 
@@ -91,6 +109,12 @@ def test_minimax_m3_config_describes_msa_contract() -> None:
         0,
         0,
     ]
+    assert config.vision_config.temporal_patch_size == 2
+    assert config.vision_config.spatial_merge_size == 2
+    assert config.vision_config.head_dim == 80
+    assert config.image_token_id == config.image_token_index == 200025
+    assert config.video_token_id == config.video_token_index == 200026
+    assert config.merged_hidden_size == 24576
     assert is_multimodal_model(["MiniMaxM3SparseForConditionalGeneration"])
 
     with pytest.raises(ValueError, match="one entry per decoder layer"):
@@ -202,19 +226,131 @@ def test_minimax_m3_tp4_meta_layout_and_loader(monkeypatch: pytest.MonkeyPatch) 
     }
 
 
-def test_minimax_m3_rejects_active_multimodal_runtime(
+def test_minimax_m3_builds_active_multimodal_runtime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     mapping = _tp4_mapping()
     monkeypatch.setitem(global_server_args_dict, "max_model_len", 2048)
+    config = _tiny_config()
+    config.encoder_only = True
 
-    with pytest.raises(ValueError, match="language-only"):
-        MiniMaxM3SparseForConditionalGeneration(
-            _tiny_config(),
-            mapping,
-            quant_config=None,
-            is_multimodal_active=True,
-        )
+    old_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        with torch.device("meta"):
+            model = MiniMaxM3SparseForConditionalGeneration(
+                config,
+                mapping,
+                quant_config=None,
+                is_multimodal_active=True,
+            )
+    finally:
+        torch.set_default_dtype(old_dtype)
+
+    assert model.model is None
+    assert model.vision_tower is not None
+    assert model.multi_modal_projector is not None
+    assert model.patch_merge_mlp is not None
+    assert model.image_encoder is not None
+    assert model.vision_tower.embeddings.patch_embedding.weight.dtype is torch.float32
+    assert model.vision_tower.dtype is torch.bfloat16
+
+    wrappers = model.make_encoder_cudagraph_wrappers(mapping)
+    assert set(wrappers) == {"image_encoder"}
+    assert wrappers["image_encoder"].adapter.out_div == 1
+    assert wrappers["image_encoder"].adapter.merge == 2
+    assert wrappers["image_encoder"].adapter.dtype == model.vision_tower.dtype
+    assert wrappers["image_encoder"].encoder_output_token_budgets == [
+        16,
+        32,
+        64,
+        128,
+        256,
+        512,
+        1024,
+        2048,
+        2304,
+    ]
+    assert wrappers["image_encoder"].max_batch_size == 10
+
+    loaded = model.load_weights(
+        [
+            (
+                "vision_tower.vision_model.embeddings.patch_embedding.weight",
+                torch.empty(32, 3, 2, 2, 2, device="meta"),
+            ),
+            (
+                "vision_tower.vision_model.pre_layrnorm.weight",
+                torch.empty(32, device="meta"),
+            ),
+            (
+                "vision_tower.vision_model.encoder.layers.0.self_attn.q_proj.weight",
+                torch.empty(32, 32, device="meta"),
+            ),
+            (
+                "vision_tower.vision_model.encoder.layers.0.self_attn.q_proj.bias",
+                torch.empty(32, device="meta"),
+            ),
+            (
+                "vision_tower.vision_model.encoder.layers.0.self_attn.out_proj.weight",
+                torch.empty(32, 32, device="meta"),
+            ),
+            (
+                "vision_tower.vision_model.encoder.layers.0.mlp.fc1.weight",
+                torch.empty(64, 32, device="meta"),
+            ),
+            (
+                "multi_modal_projector.linear_1.weight",
+                torch.empty(128, 32, device="meta"),
+            ),
+            (
+                "patch_merge_mlp.linear_1.weight",
+                torch.empty(128, 512, device="meta"),
+            ),
+        ]
+    )
+    assert loaded == {
+        "vision_tower.embeddings.patch_embedding.weight",
+        "vision_tower.pre_layrnorm.weight",
+        "vision_tower.layers.0.self_attn.qkv_proj.weight",
+        "vision_tower.layers.0.self_attn.qkv_proj.bias",
+        "vision_tower.layers.0.self_attn.proj.weight",
+        "vision_tower.layers.0.mlp.fc1.weight",
+        "multi_modal_projector.linear_1.weight",
+        "patch_merge_mlp.linear_1.weight",
+    }
+
+
+def test_minimax_m3_image_encoder_enforces_grid_and_placeholder_contract() -> None:
+    config = _tiny_config()
+    config.encoder_only = True
+    config.vision_config.num_hidden_layers = 0
+    model = MiniMaxM3SparseForConditionalGeneration(
+        config,
+        Mapping(rank=0, world_size=1),
+        is_multimodal_active=True,
+        mm_attention_backend="triton_attn",
+    ).eval()
+    item = MultimodalDataItem(
+        modality=Modality.IMAGE,
+        feature=torch.randn(4, 3 * 2 * 2 * 2),
+        offsets=[(3, 3)],
+        model_specific_data={
+            "image_grid_thw": torch.tensor([[1, 2, 2]], dtype=torch.int64)
+        },
+    )
+
+    with torch.inference_mode():
+        output = model.get_image_feature([item])
+    assert output.shape == (1, config.text_config.hidden_size)
+
+    item.offsets = [(3, 4)]
+    with pytest.raises(ValueError, match="placeholder lengths"):
+        model.get_image_feature([item])
+
+    item.model_specific_data["image_grid_thw"] = torch.tensor([[1.0, 2.0, 2.0]])
+    with pytest.raises(TypeError, match="integer dtype"):
+        model.get_image_feature([item])
 
 
 def _msa_server_args(*, block_size: int = 128, kv_cache_dtype: str = "auto"):

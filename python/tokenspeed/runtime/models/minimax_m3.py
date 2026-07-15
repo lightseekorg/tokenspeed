@@ -70,8 +70,27 @@ from tokenspeed.runtime.models.base import (
     BaseDecoderLayer,
     BaseTransformerModel,
 )
+from tokenspeed.runtime.models.minimax_m3_vision import (
+    MiniMaxM3MultiModalProjector,
+    MiniMaxM3PatchMergeMLP,
+    MiniMaxM3VisionTower,
+)
 from tokenspeed.runtime.models.utils import validate_attention_partition
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
+from tokenspeed.runtime.multimodal.embedder import (
+    EncoderSpec,
+    MultimodalEmbedder,
+    pad_input_tokens,
+)
+from tokenspeed.runtime.multimodal.encoder_cudagraph import (
+    EncoderCudaGraphWrapper,
+    VisionEncoderCudaGraphAdapter,
+)
+from tokenspeed.runtime.multimodal.inputs import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
 from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
@@ -715,6 +734,17 @@ class MiniMaxM3SparseForCausalLM(BaseCausalLM):
     model_cls = MiniMaxM3Model
     fall_back_to_pt_during_load = False
 
+    def _load_vision_weight(
+        self,
+        checkpoint_name: str,
+        loaded_weight: torch.Tensor,
+        params_dict: dict[str, nn.Parameter],
+    ) -> str | None:
+        """Load one visual checkpoint tensor, if this model has a vision path."""
+
+        del checkpoint_name, loaded_weight, params_dict
+        return None
+
     def load_weights(
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
@@ -748,9 +778,19 @@ class MiniMaxM3SparseForCausalLM(BaseCausalLM):
             elif checkpoint_name.startswith(
                 ("vision_tower.", "multi_modal_projector.", "patch_merge_mlp.")
             ):
+                loaded_name = self._load_vision_weight(
+                    checkpoint_name,
+                    loaded_weight,
+                    params_dict,
+                )
+                if loaded_name is not None:
+                    loaded_params.add(loaded_name)
                 continue
             else:
                 name = checkpoint_name
+
+            if self.encoder_only:
+                continue
 
             if name.startswith("model.mtp."):
                 continue
@@ -814,7 +854,7 @@ class MiniMaxM3SparseForCausalLM(BaseCausalLM):
 
 
 class MiniMaxM3SparseForConditionalGeneration(MiniMaxM3SparseForCausalLM):
-    """Language-only MiniMax-M3 entry point with native MSA."""
+    """MiniMax-M3 vision-language model with native MSA text decoding."""
 
     def __init__(
         self,
@@ -825,19 +865,309 @@ class MiniMaxM3SparseForConditionalGeneration(MiniMaxM3SparseForCausalLM):
         is_multimodal_active: bool = True,
         mm_attention_backend: str | None = None,
     ) -> None:
-        del mm_attention_backend
-        if is_multimodal_active:
-            raise ValueError(
-                "MiniMax-M3 is currently language-only. Start TokenSpeed with "
-                "--language-model-only."
-            )
-        self.is_multimodal_active = False
+        self.vl_config = config
+        self.is_multimodal_active = is_multimodal_active
         super().__init__(
             config=config.text_config,
             mapping=mapping,
             quant_config=quant_config,
             prefix=prefix,
+            encoder_only=bool(config.encoder_only),
         )
+
+        if not is_multimodal_active:
+            self.vision_tower = None
+            self.multi_modal_projector = None
+            self.patch_merge_mlp = None
+            self.vision_embedder = None
+            self.image_encoder = None
+            return
+
+        # The released MXFP8 checkpoint keeps the vision path unquantized
+        # (FP32 patch convolution, BF16 blocks/projectors). Do not pass the text
+        # quantization config through this boundary.
+        self.vision_tower = MiniMaxM3VisionTower(
+            config.vision_config,
+            mapping=mapping,
+            prefix=add_prefix("vision_tower", prefix),
+            mm_attention_backend=mm_attention_backend,
+        )
+        self.multi_modal_projector = MiniMaxM3MultiModalProjector(
+            config,
+            mapping=mapping,
+            prefix=add_prefix("multi_modal_projector", prefix),
+        )
+        self.patch_merge_mlp = MiniMaxM3PatchMergeMLP(
+            config,
+            mapping=mapping,
+            prefix=add_prefix("patch_merge_mlp", prefix),
+        )
+        self.vision_embedder = MultimodalEmbedder()
+        self.image_encoder = self.get_image_feature
+
+    def pad_input_ids(
+        self, input_ids: list[int], mm_inputs: MultimodalInputs
+    ) -> list[int]:
+        """Replace image placeholders with content-derived prefix-cache IDs."""
+
+        return pad_input_tokens(input_ids, mm_inputs)
+
+    @staticmethod
+    def _image_grid(item: MultimodalDataItem) -> torch.Tensor:
+        """Read and validate the explicit SMG grid contract for one image."""
+
+        try:
+            grid = item.model_specific_data["image_grid_thw"]
+        except KeyError as error:
+            raise ValueError(
+                "MiniMax-M3 image input is missing image_grid_thw."
+            ) from error
+        if not isinstance(grid, torch.Tensor):
+            raise TypeError(
+                "MiniMax-M3 image_grid_thw must be a torch.Tensor, got "
+                f"{type(grid).__name__}."
+            )
+        if grid.dtype == torch.bool or grid.is_floating_point() or grid.is_complex():
+            raise TypeError(
+                "MiniMax-M3 image_grid_thw must use an integer dtype, got "
+                f"{grid.dtype}."
+            )
+        if grid.ndim != 2 or grid.shape[1] != 3:
+            raise ValueError(
+                "MiniMax-M3 image_grid_thw must have shape [num_images, 3], "
+                f"got {tuple(grid.shape)}."
+            )
+        if bool((grid <= 0).any()):
+            raise ValueError("MiniMax-M3 image_grid_thw values must be positive.")
+        return grid
+
+    def _validate_image_item(
+        self, item: MultimodalDataItem, grid: torch.Tensor
+    ) -> None:
+        if not isinstance(item.feature, torch.Tensor):
+            raise TypeError(
+                "MiniMax-M3 image features must be materialized torch tensors "
+                f"before encoding, got {type(item.feature).__name__}."
+            )
+        if item.feature.ndim != 2:
+            raise ValueError(
+                "MiniMax-M3 pixel_values must be 2D, got shape "
+                f"{tuple(item.feature.shape)}."
+            )
+
+        patch_counts = grid.to(dtype=torch.int64).prod(dim=1)
+        expected_patches = int(patch_counts.sum().item())
+        if item.feature.shape[0] != expected_patches:
+            raise ValueError(
+                "MiniMax-M3 pixel row count must equal image_grid_thw product, "
+                f"got {item.feature.shape[0]} and {expected_patches}."
+            )
+
+        merge = self.vl_config.vision_config.spatial_merge_size
+        if bool((grid[:, 1:] % merge != 0).any()):
+            raise ValueError(
+                "MiniMax-M3 image grid height and width must be divisible by "
+                f"spatial_merge_size={merge}."
+            )
+        if not item.offsets or len(item.offsets) != grid.shape[0]:
+            raise ValueError(
+                "MiniMax-M3 requires one placeholder offset range per image grid."
+            )
+        expected_tokens = (patch_counts // (merge**2)).tolist()
+        actual_tokens = [end - start + 1 for start, end in item.offsets]
+        if actual_tokens != expected_tokens:
+            raise ValueError(
+                "MiniMax-M3 image placeholder lengths do not match merged grid "
+                f"tokens: got {actual_tokens}, expected {expected_tokens}."
+            )
+
+    def pre_encode(
+        self, items: list[MultimodalDataItem]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Validate image payloads and apply the Conv3d patch embedding."""
+
+        if self.vision_tower is None:
+            raise RuntimeError("MiniMax-M3 vision tower is not initialized.")
+        if not items:
+            raise ValueError("MiniMax-M3 image encoder received an empty batch.")
+
+        grids = []
+        pixels = []
+        for item in items:
+            if item.modality is not Modality.IMAGE:
+                raise ValueError(
+                    "MiniMax-M3 vision tower currently accepts image items only."
+                )
+            grid = self._image_grid(item)
+            self._validate_image_item(item, grid)
+            grids.append(grid)
+            pixels.append(item.feature)
+
+        device = self.vision_tower.device
+        pixel_values = torch.cat(pixels, dim=0).to(
+            device=device,
+            non_blocking=True,
+        )
+        grid_thw = torch.cat(grids, dim=0).to(
+            device=device, dtype=torch.int64, non_blocking=True
+        )
+        return self.vision_tower.prepare_patch_embed(pixel_values, grid_thw), grid_thw
+
+    def post_encode(
+        self, encoder_outs: list[torch.Tensor], grid_thw: torch.Tensor
+    ) -> torch.Tensor:
+        """Project patches, then merge each processor-grouped 2x2 block."""
+
+        del grid_thw
+        if self.multi_modal_projector is None or self.patch_merge_mlp is None:
+            raise RuntimeError("MiniMax-M3 multimodal projectors are not initialized.")
+        vision_features = torch.cat(encoder_outs, dim=0)
+        if vision_features.ndim == 3 and vision_features.shape[1] == 1:
+            vision_features = vision_features.squeeze(1)
+        projected = self.multi_modal_projector(vision_features)
+        return self.patch_merge_mlp(projected)
+
+    def get_image_feature(self, items: list[MultimodalDataItem]) -> torch.Tensor:
+        """Encode a batch of dynamically sized images into LM embeddings."""
+
+        tokens, grid_thw = self.pre_encode(items)
+        metadata = self.vision_tower.prepare_metadata(grid_thw)
+        encoded = self.vision_tower.forward_blocks(tokens, metadata)
+        output = self.post_encode([encoded], grid_thw)
+        expected_tokens = sum(
+            sum(end - start + 1 for start, end in item.offsets or []) for item in items
+        )
+        if output.shape[0] != expected_tokens:
+            raise RuntimeError(
+                "MiniMax-M3 vision output token count does not match placeholders: "
+                f"got {output.shape[0]}, expected {expected_tokens}."
+            )
+        return output
+
+    def make_encoder_cudagraph_wrappers(
+        self, mapping: Mapping
+    ) -> dict[str, EncoderCudaGraphWrapper]:
+        """Build the standard token-preserving ViT CUDA-graph wrapper."""
+
+        if self.vision_tower is None:
+            return {}
+        return {
+            "image_encoder": EncoderCudaGraphWrapper(
+                adapter=VisionEncoderCudaGraphAdapter(
+                    tower=self.vision_tower,
+                    pre_encode=self.pre_encode,
+                    post_encode=self.post_encode,
+                    out_div=1,
+                    merge=self.vision_tower.spatial_merge_size,
+                    input_feature_shape=(1, self.vision_tower.hidden_size),
+                    modality_name="image",
+                    capture_tp_size=mapping.vision.tp_size,
+                    capture_tp_group=mapping.vision.tp_group,
+                    # The patch Conv3d is FP32, but pre_encode applies the
+                    # BF16 pre-LayerNorm before entering the captured blocks.
+                    input_dtype=self.vision_tower.dtype,
+                ),
+                # The processor emits 16 patches at its minimum resolution and
+                # at most 2304 patches per image at 672 x 672.
+                budget_range=(16, 2304),
+                max_batch_size=10,
+            )
+        }
+
+    def get_input_embeddings(self) -> nn.Module:
+        if self.model is None:
+            raise RuntimeError(
+                "MiniMax-M3 input embeddings are unavailable in encoder-only mode."
+            )
+        return self.model.embed_tokens
+
+    @torch.no_grad()
+    def multimodal_input_embeds(
+        self,
+        input_ids: torch.Tensor,
+        ctx: ForwardContext,
+        multimodal_context,
+    ) -> torch.Tensor | None:
+        """Assemble text and vision embeddings for a multimodal prefill."""
+
+        if (
+            multimodal_context is None
+            or self.vision_embedder is None
+            or not multimodal_context.has_extend_inputs()
+            or ctx.forward_mode.is_decode_or_idle()
+        ):
+            return None
+        input_embeds, model_kwargs = self.vision_embedder.apply(
+            input_ids=input_ids,
+            text_embedding=self.get_input_embeddings(),
+            ctx=multimodal_context,
+            encoders={Modality.IMAGE: EncoderSpec(self.image_encoder)},
+            multimodal_model=self,
+            is_decode_or_idle=ctx.forward_mode.is_decode_or_idle(),
+        )
+        if model_kwargs:
+            raise RuntimeError("MiniMax-M3 multimodal path must remain embeds-only.")
+        return input_embeds
+
+    @torch.no_grad()
+    def forward(
+        self,
+        ctx: ForwardContext,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        if self.encoder_only:
+            raise RuntimeError("MiniMax-M3 encoder-only workers cannot run LM forward.")
+        multimodal_context = kwargs.pop("multimodal_context", None)
+        input_embeds = self.multimodal_input_embeds(input_ids, ctx, multimodal_context)
+        if input_embeds is not None:
+            kwargs["input_embeds"] = input_embeds
+        return super().forward(ctx, input_ids, positions, out_cache_loc, **kwargs)
+
+    def _load_vision_weight(
+        self,
+        checkpoint_name: str,
+        loaded_weight: torch.Tensor,
+        params_dict: dict[str, nn.Parameter],
+    ) -> str | None:
+        """Load one unquantized visual tensor without buffering the checkpoint."""
+
+        if not self.is_multimodal_active:
+            return None
+
+        stacked_attention = {
+            ".self_attn.q_proj": (".self_attn.qkv_proj", "q"),
+            ".self_attn.k_proj": (".self_attn.qkv_proj", "k"),
+            ".self_attn.v_proj": (".self_attn.qkv_proj", "v"),
+        }
+        name = checkpoint_name.replace("vision_tower.vision_model.", "vision_tower.", 1)
+        name = name.replace(".encoder.layers.", ".layers.")
+        name = name.replace(".self_attn.out_proj", ".self_attn.proj")
+
+        for weight_name, (param_name, shard_id) in stacked_attention.items():
+            if weight_name not in name:
+                continue
+            mapped_name = name.replace(weight_name, param_name)
+            param = params_dict.get(mapped_name)
+            if param is None:
+                raise KeyError(
+                    f"MiniMax-M3 vision parameter {checkpoint_name!r} maps to "
+                    f"missing runtime parameter {mapped_name!r}."
+                )
+            param.weight_loader(param, loaded_weight, shard_id)
+            return mapped_name
+
+        param = params_dict.get(name)
+        if param is None:
+            raise KeyError(
+                f"MiniMax-M3 vision checkpoint parameter {checkpoint_name!r} "
+                "has no runtime mapping."
+            )
+        weight_loader = getattr(param, "weight_loader", default_weight_loader)
+        weight_loader(param, loaded_weight)
+        return name
 
 
 EntryClass = [MiniMaxM3SparseForConditionalGeneration]
