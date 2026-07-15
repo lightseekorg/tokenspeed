@@ -5,14 +5,14 @@ support. The runtime acceptance workloads below passed at TokenSpeed commit
 `70daee236dd4a5958393f1f365ff0e41271e64b9`, but publication remains blocked
 by the clean-package and hosted-CI rows in the acceptance matrix. The later
 source lifecycle/configuration smoke passed at
-`ca511c64516f26b1851fcf59c566de7e71c32e22` with runtime-hardening ancestor
-`b5dd5fc1a989126d1a1f82ce16a4b3ffc4b0393e`.
+`7cf79d8ce55b268be5edd46260e44267bda30b60` with SMG source revision
+`9eb6802a626cec1dfe7fc392455caa43bfa5c0b1`.
 
 The durable evidence root is:
 
 ```text
 /raid/flamingo/runs/minimax_m3_phase5_20260715/candidate_70daee236dd/
-/raid/flamingo/runs/minimax_m3_phase5_20260715/hardening_ca511c64516_smg_6e0cb7a/
+/raid/flamingo/runs/minimax_m3_phase5_20260715/final_7cf79d8ce55_smg_9eb6802a626/
 ```
 
 ## Pinned setup
@@ -26,7 +26,7 @@ The durable evidence root is:
 - Vision: images supported; video explicitly unsupported
 - EvalScope: 1.8.0
 - Release-hardening source dependency:
-  `FlamingoPg/smg@6e0cb7acd62a8b8abe4d426a1289ff659e9a7844`
+  `FlamingoPg/smg@9eb6802a626cec1dfe7fc392455caa43bfa5c0b1`
 
 Runtime feature choices are CLI arguments. The release commands do not use
 feature environment variables, visible-device masks, TF32 override variables,
@@ -57,11 +57,11 @@ stable implementation constants rather than environment overrides.
 | Encoder CUDA Graph parity | Dynamic 3D RoPE and packed multi-image replay match independent eager references | PASS; focused CUDA tests 2/2 |
 | Active encoder graph | TP4 startup capture, text/single-image/two-image requests, visual reference, and no request-time recapture | PASS; 4 ranks x 9 budgets = 36 graphs and 6/6 request contracts |
 | Unsupported video | Explicit structured client error, never silently treated as an image | PASS; HTTP 400 `invalid_multimodal_request` |
-| Feature environment audit | No inherited product feature/configuration variables or persistent kernel override file | PASS at `ca511c6`; `runtime_environment.json` records zero forbidden keys and no override file |
+| Feature environment audit | No inherited product feature/configuration variables or persistent kernel override file | PASS at `7cf79d8c`; `runtime_environment.json` records zero forbidden keys and no override file |
 | CI definitions | Tasks parse/dry-run locally; strict timeouts, artifacts, result validation, and server-log gates are present | Local/static validation only; hosted B200 execution pending |
-| Source SMG integration | Fixed source serves MiniMax-M3 images and shuts down cleanly | PASS at TokenSpeed `ca511c6` + SMG `6e0cb7a` |
+| Source SMG integration | Fixed source serves MiniMax-M3 images and shuts down cleanly | PASS at TokenSpeed `7cf79d8c` + SMG `9eb6802a` |
 | Published SMG package | A clean published dependency contains the MiniMax-M3 processor | **BLOCKED**; latest inspected package does not contain it |
-| Clean shutdown | Server exits without lifecycle traceback or unreaped children | PASS; root-only SIGTERM exited zero in 9.47 s with descendants, PGID, ports, and GPUs clean |
+| Clean shutdown | Server exits without lifecycle traceback or unreaped children | PASS; root-only SIGTERM exited zero in 9.57 s with descendants, PGID, ports, and GPUs clean |
 
 Video is not required for basic image support. Its acceptance contract is a
 clear rejection.
@@ -158,7 +158,7 @@ errors, and finite binary review scores. It scored 1,288/1,319
 
 ## Real vision encoder CUDA Graph
 
-The final source smoke used TokenSpeed `ca511c6` with SMG `6e0cb7a`; its
+The final source smoke used TokenSpeed `7cf79d8c` with SMG `9eb6802a`; its
 artifacts are under the hardening evidence root above. On that fresh active
 multimodal TP4 server, every rank initialized and reported capture completion
 for exactly these nine image budgets during startup:
@@ -185,12 +185,12 @@ The earlier fixed-candidate run recorded peak memory
 two-image parity and dynamic 3D RoPE graph replay passed 2/2.
 The fixed-SHA source smoke's unseen-dog logprob delta was
 `0.0005637302637585759`, and all three post-request health probes returned
-HTTP 200. Root-only SIGTERM then exited zero in 9.47 seconds; all 44 captured
-processes (the root plus 43 descendants) and the process group disappeared,
+HTTP 200. Root-only SIGTERM then exited zero in 9.57 seconds; all 12 captured
+processes and the process group disappeared,
 ports 8123/8124 closed, GPUs 4-7 returned to 0 MiB with no compute process, no
 new TokenSpeed/SMG zombie appeared, and no forbidden lifecycle pattern was
 logged. The immutable validation-time server-log snapshot has SHA256
-`257b02561382f45a4117793f4e4db2f7fed1163bdf25f92078d3b935ee44d2dd` and
+`0b2c3c126239132f13671fc8b8b828f68b202235a235fce42cb826553adb210b` and
 remained unchanged through shutdown as an exact prefix of the final log.
 
 The active smoke is also a runnable manual B200 CI task. That task deliberately
@@ -248,6 +248,14 @@ tokenspeed serve MiniMaxAI/MiniMax-M3-MXFP8 \
   --enforce-eager \
   --disable-prefill-graph \
   --disable-kvstore \
+  --epd-pixel-shm \
+  --epd-ingest-offloop \
+  --unlink-mm-shm-after-read \
+  --multimodal-tensor-transport shm \
+  --multimodal-shm-min-bytes 65536 \
+  --multimodal-pixel-cache-mb 0 \
+  --multimodal-image-max-input-bytes 268435456 \
+  --multimodal-image-encoder-input-dtype bfloat16 \
   --host 127.0.0.1 \
   --port 8123
 ```

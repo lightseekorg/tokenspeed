@@ -47,6 +47,14 @@ server:
     --no-enable-prefix-caching
     --disable-kvstore
     --enable-output-logprobs
+    --epd-pixel-shm
+    --epd-ingest-offloop
+    --unlink-mm-shm-after-read
+    --multimodal-tensor-transport shm
+    --multimodal-shm-min-bytes 65536
+    --multimodal-pixel-cache-mb 0
+    --multimodal-image-max-input-bytes 268435456
+    --multimodal-image-encoder-input-dtype bfloat16
     --host 127.0.0.1
     --port 8000
     --control-port 8001

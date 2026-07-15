@@ -40,7 +40,10 @@ EXCLUDED_PARTS = frozenset({"thirdparty", "vendor", "__pycache__"})
 READ_ALLOWLIST = frozenset(
     {
         ("python/tokenspeed/bench.py", "OPENAI_API_KEY"),
-        ("python/tokenspeed/runtime/model_loader/weight_utils.py", "HF_HUB_ENABLE_HF_TRANSFER"),
+        (
+            "python/tokenspeed/runtime/model_loader/weight_utils.py",
+            "HF_HUB_ENABLE_HF_TRANSFER",
+        ),
         ("python/tokenspeed/runtime/model_loader/weight_utils.py", "LOCAL_RANK"),
         ("python/tokenspeed/runtime/model_loader/weight_utils.py", "LOCAL_WORLD_SIZE"),
         ("python/tokenspeed/runtime/utils/common.py", "CI"),
@@ -56,13 +59,19 @@ READ_ALLOWLIST = frozenset(
 WRITE_ALLOWLIST = frozenset(
     {
         ("python/tokenspeed/runtime/engine/async_llm.py", "TOKENIZERS_PARALLELISM"),
-        ("python/tokenspeed/runtime/entrypoints/engine.py", "CUDA_DEVICE_MAX_CONNECTIONS"),
+        (
+            "python/tokenspeed/runtime/entrypoints/engine.py",
+            "CUDA_DEVICE_MAX_CONNECTIONS",
+        ),
         ("python/tokenspeed/runtime/entrypoints/engine.py", "CUDA_MODULE_LOADING"),
         ("python/tokenspeed/runtime/entrypoints/engine.py", "NCCL_CUMEM_ENABLE"),
         ("python/tokenspeed/runtime/entrypoints/engine.py", "NCCL_NVLS_ENABLE"),
         ("python/tokenspeed/runtime/entrypoints/engine.py", "NVIDIA_TF32_OVERRIDE"),
         ("python/tokenspeed/runtime/entrypoints/engine.py", "TF_CPP_MIN_LOG_LEVEL"),
-        ("python/tokenspeed/runtime/entrypoints/engine.py", "TORCH_ALLOW_TF32_CUBLAS_OVERRIDE"),
+        (
+            "python/tokenspeed/runtime/entrypoints/engine.py",
+            "TORCH_ALLOW_TF32_CUBLAS_OVERRIDE",
+        ),
         ("python/tokenspeed/runtime/utils/common.py", "PROMETHEUS_MULTIPROC_DIR"),
         ("python/tokenspeed/runtime/utils/common.py", "TORCH_CUDA_ARCH_LIST"),
         ("python/tokenspeed/runtime/utils/server_args.py", "TLLM_LOG_LEVEL"),
@@ -204,10 +213,7 @@ class _EnvironmentVisitor(ast.NodeVisitor):
                 self._record(node, "dynamic", None)
             else:
                 self._record(node, f"method:{method}", key)
-        elif (
-            isinstance(node.func, ast.Name)
-            and node.func.id == "get_bool_env_var"
-        ):
+        elif isinstance(node.func, ast.Name) and node.func.id == "get_bool_env_var":
             key = _literal_key(node.args[0]) if node.args else None
             self._record(node, "read", key)
         elif (
@@ -487,14 +493,10 @@ def audit_repository(repo_root: Path) -> dict[str, object]:
     accesses.sort()
     violations = [access for access in accesses if not is_allowed(access)]
     observed_reads = {
-        (access.path, access.key)
-        for access in accesses
-        if access.operation == "read"
+        (access.path, access.key) for access in accesses if access.operation == "read"
     }
     observed_writes = {
-        (access.path, access.key)
-        for access in accesses
-        if access.operation == "write"
+        (access.path, access.key) for access in accesses if access.operation == "write"
     }
     stale_allowlist = [
         {"operation": "read", "path": path, "key": key}
@@ -525,7 +527,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=Path(__file__).resolve().parents[2],
     )
-    parser.add_argument("--json", action="store_true", help="Print the full JSON audit.")
+    parser.add_argument(
+        "--json", action="store_true", help="Print the full JSON audit."
+    )
     return parser.parse_args(argv)
 
 

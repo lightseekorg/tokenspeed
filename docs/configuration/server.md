@@ -274,6 +274,22 @@ SMG launch behavior is also explicit server configuration: use
 These settings are propagated to the SMG TokenSpeed gRPC adapter without
 feature environment variables.
 
+Image preprocessing and tensor transport at the SMG gateway are configured by
+gateway-owned flags. `tokenspeed serve` forwards these flags to SMG:
+
+| Parameter | Purpose |
+| --- | --- |
+| `--multimodal-tensor-transport` | Select `inline`, `shm`, `auto`, or `rdma`. |
+| `--multimodal-shm-min-bytes` | Minimum encoded tensor size before the `shm` path is used. |
+| `--multimodal-pixel-cache-mb` | Host pixel-cache budget in MiB; `0` disables the cache. |
+| `--multimodal-log-timing` | Enable gateway preprocessing/transport timing. Disabled by default. |
+| `--multimodal-image-max-input-bytes` | Reject an encoded image larger than this byte limit before decode. |
+| `--multimodal-image-encoder-input-dtype` | Explicit TokenSpeed encoder wire dtype: `float32`, `bfloat16`, or `float16`. |
+
+These TokenSpeed image/transport settings use RouterConfig and CLI state, not
+product environment variables. Video/audio paths are outside the MiniMax-M3
+basic image-support contract.
+
 Shared multimodal RDMA is configured with `--mm-pixel-rdma`,
 `--mm-rdma-slot-bytes`, `--mm-rdma-landing-slots`,
 `--mm-rdma-landing-wait-seconds`, and

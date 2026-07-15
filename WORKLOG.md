@@ -14,20 +14,23 @@ a different machine without relying on `/tmp` files or shell history.
 - Handoff revision: the checked-out branch HEAD; record it with
   `git rev-parse HEAD` after cloning
 - Final source-smoke revision:
-  `ca511c64516f26b1851fcf59c566de7e71c32e22`. The implementation ancestry is
+  `7cf79d8ce55b268be5edd46260e44267bda30b60`. The implementation ancestry is
   `b5dd5fc1a989126d1a1f82ce16a4b3ffc4b0393e` for runtime lifecycle and
-  explicit-configuration hardening, `14cfcb4b9940f803c41b9ba72d2b89143f61e515`
-  for INFO-level encoder-capture validation, and `ca511c6` for immutable
-  pre-shutdown server-log provenance.
+  initial explicit-configuration hardening, `14cfcb4b9940f803c41b9ba72d2b89143f61e515`
+  for INFO-level encoder-capture validation, `ca511c6` for immutable
+  pre-shutdown server-log provenance, and `7cf79d8c` for the repository-wide
+  product-environment guard plus the remaining typed runtime/kernel/MLA
+  configuration.
 - Model: `MiniMaxAI/MiniMax-M3-MXFP8`
 - Model revision used for the current config:
   `c5454eb03678d8710e54a4e0fc681b9f3b4a3dba`
 - SMG processor repository: `https://github.com/FlamingoPg/smg.git`, branch
   `flamingo/minimax_m3`, revision
-  `6e0cb7acd62a8b8abe4d426a1289ff659e9a7844`. MiniMax-M3 processing
+  `9eb6802a626cec1dfe7fc392455caa43bfa5c0b1`. MiniMax-M3 processing
   originally landed at `b7402c47759067e2f2a8840eaf7e81e239ca79b5`;
-  `6e0cb7a` adds the explicit configuration and orderly TokenSpeed serving
-  lifecycle used by the release-hardening candidate.
+  `6e0cb7a` added the initial explicit configuration and orderly TokenSpeed
+  lifecycle, while `9eb6802a` removes the remaining M3 image/transport product
+  environment fallbacks and exposes typed RouterConfig/CLI/PyO3 fields.
 
 Do not push this work directly to `flamingopg/main`. That branch has diverged
 from `origin/main`; resume from the feature branch above.
@@ -58,12 +61,12 @@ from `origin/main`; resume from the feature branch above.
 | FP8 KV/index cache | Implemented and fixed-candidate validated | E4M3 main K/V and index cache passed quality, exact 1M, and the full 8-cell random matrix. The M3 dense path keeps BF16 Q, uses native FA2 mixed extend and TensorRT-LLM mixed decode, and returns BF16 from a shared stable 512 MiB workspace. |
 | Vision encoder CUDA Graph | Real capture and active-MM smoke passed | Explicit CLI enablement captured nine budgets per TP rank (36 total), installed `image_encoder`, and served text, single-image, two-image, and unseen-reference requests without recapture. Dynamic 3D RoPE parity passed 2/2; video was rejected explicitly. |
 | CLI-only GPU placement | Cold-start validation passed | Worker placement uses `--base-gpu-id`/`--gpu-id-step`, and NCCL process groups bind the mapped CUDA device. The TP4 cold start created compute contexts only on GPUs 4-7; GPUs 0-3 remained at 4 MiB with no compute process. |
-| Explicit runtime configuration | Fixed-SHA source smoke passed | SMG launch, multimodal SHM/RDMA, PD/EPD queueing, timeouts, heartbeat/failure policy, ring/cache, receive-pool, and sharding settings flow through typed `ServerArgs` configuration. The `ca511c6` TP4 preflight rejected inherited `TOKENSPEED_*`, `SMG_*`, `EPD_*`, and `TS_*` namespaces plus the reviewed exact overrides before a successful active-MM run. |
+| Explicit runtime configuration | Fixed-SHA source smoke passed | SMG launch, multimodal SHM/RDMA, PD/EPD queueing, timeouts, heartbeat/failure policy, ring/cache, receive-pool, sharding, profiler, coredump, scheduler, MLA backend, and kernel settings use typed configuration. The `7cf79d8c` TP4 preflight recorded zero inherited `TOKENSPEED_*`, `SMG_*`, `EPD_*`, or `TS_*` keys, no visible-device/TF32/workspace override, and no persistent kernel override before a successful active-MM run. |
 | Video | Unsupported by design | MiniMax-M3 basic support covers images. Video items are rejected explicitly and are not part of the Phase 5 acceptance matrix. |
 | CI and release benchmark | Six task specs pass local/static validation; hosted CI pending | Quality passed 14/14, random passed 188/188 per arm, GSM8K scored 0.976497, exact 1M passed, and the active-MM task checks 36 captures, no recapture, dynamic image/text behavior, visual parity, structured video rejection, and clean shutdown logs. No hosted B200 artifacts exist yet. |
-| Source SMG integration | Fixed-SHA active-MM smoke passed | TokenSpeed `ca511c6` with `FlamingoPg/smg@6e0cb7acd62a8b8abe4d426a1289ff659e9a7844` passed all six request contracts, 36 encoder captures with no recapture, health checks, and orderly source shutdown. |
+| Source SMG integration | Fixed-SHA active-MM smoke passed | TokenSpeed `7cf79d8c` with `FlamingoPg/smg@9eb6802a626cec1dfe7fc392455caa43bfa5c0b1` passed all six request contracts, 36 encoder captures with no recapture, health checks, explicit SHM/image configuration, and orderly source shutdown. |
 | Published SMG dependency | **Release blocker** | No inspected official package contains the MiniMax-M3 processor and the lifecycle/configuration delta. A clean published-package image smoke therefore cannot pass yet. |
-| Clean shutdown | Fixed-SHA TP4 proof passed | Root-only SIGTERM exited zero in 9.47 s. All captured descendants and the exact process group disappeared, ports 8123/8124 closed, GPUs 4-7 returned to 0 MiB with no compute PID, no new TokenSpeed/SMG zombie appeared, and no forbidden lifecycle pattern was logged. |
+| Clean shutdown | Fixed-SHA TP4 proof passed | Root-only SIGTERM exited zero in 9.57 s. All 12 captured processes and the exact process group disappeared, ports 8123/8124 closed, GPUs 4-7 returned to 0 MiB with no compute PID, no new TokenSpeed/SMG zombie appeared, and no forbidden lifecycle pattern was logged. |
 | Clean release environment | **Release blocker** | The current development `.venv` exposes system/user packages and a local SMG `.pth`; `pip check` fails the pinned published-SMG requirement. |
 
 ## Design checkpoint
@@ -245,14 +248,15 @@ test/ci/perf/minimax-m3-mxfp8-active-mm.yaml
 | Random throughput sweep | PASS at fixed SHA | FP8 and BF16 each 8/8 cells, 188/188/0; FP8/BF16 ratio 0.970625–0.994717 and 5488 MiB/GPU saved |
 | Environment configuration | PASS | No product feature env, visible-device mask, inherited TF32/workspace override, or persistent kernel override file |
 | CI task parsing/execution | PASS local/static; hosted execution pending | All six specs pass local task discovery/schema/helper validation; strict validators, timeouts, full artifact upload, and post-stop log gates are implemented. Hosted B200 artifacts are still required. |
-| Source SMG integration | PASS at fixed source SHA | TokenSpeed `ca511c6` plus SMG `6e0cb7a` passed 6/6 active-MM contracts, health probes, encoder replay, and root-only orderly shutdown. |
+| Source SMG integration | PASS at fixed source SHA | TokenSpeed `7cf79d8c` plus SMG `9eb6802a` passed 6/6 active-MM contracts, health probes, encoder replay, explicit image/transport configuration, and root-only orderly shutdown. |
 | Published SMG with M3 processor | **Blocked externally** | Latest inspected official package lacks the M3 processor; clean-package image smoke cannot pass yet |
-| Clean server shutdown | PASS at fixed source SHA | Root-only SIGTERM exited zero in 9.47 s; descendants/PGID, ports, GPU contexts, forbidden lifecycle logs, and new relevant zombies were all clean. |
+| Clean server shutdown | PASS at fixed source SHA | Root-only SIGTERM exited zero in 9.57 s; descendants/PGID, ports, GPU contexts, forbidden lifecycle logs, and new relevant zombies were all clean. |
 
 The language-only eval, perf, and long-context tasks deliberately avoid
 claiming multimodal packaging coverage. Active-MM release remains blocked until
-the published SMG dependency contains the processor currently pinned at
-`FlamingoPg/smg@6e0cb7acd62a8b8abe4d426a1289ff659e9a7844`.
+the published SMG dependency contains the processor and configuration delta
+currently validated at
+`FlamingoPg/smg@9eb6802a626cec1dfe7fc392455caa43bfa5c0b1`.
 
 All M3 runtime feature configuration is expressed as CLI arguments. The M3
 recipes and CI server commands use no feature environment variables; TP4 GPU
@@ -276,19 +280,25 @@ The performance, quality, exact-1M, and encoder-graph evidence below remains
 pinned to TokenSpeed `70daee236dd4a5958393f1f365ff0e41271e64b9`. It does not
 validate the later lifecycle and explicit-configuration delta. The final
 source-integration smoke tested TokenSpeed
-`ca511c64516f26b1851fcf59c566de7e71c32e22` (runtime hardening ancestor
-`b5dd5fc1a989126d1a1f82ce16a4b3ffc4b0393e`) with
-`FlamingoPg/smg@6e0cb7acd62a8b8abe4d426a1289ff659e9a7844`. Durable evidence is under
-`/raid/flamingo/runs/minimax_m3_phase5_20260715/hardening_ca511c64516_smg_6e0cb7a/`.
+`7cf79d8ce55b268be5edd46260e44267bda30b60` with
+`FlamingoPg/smg@9eb6802a626cec1dfe7fc392455caa43bfa5c0b1`. Durable evidence is under
+`/raid/flamingo/runs/minimax_m3_phase5_20260715/final_7cf79d8ce55_smg_9eb6802a626/`.
+It supersedes the earlier `ca511c6` + `6e0cb7a` source smoke while preserving
+the fixed-candidate performance evidence.
 
 The hardening implementation passed the recorded CPU lifecycle,
-configuration, EPD, CI-helper, and SMG regression suites. TokenSpeed's combined
-pre-hardening regression had 317 passing tests plus six passing subtests; the
-post-change focused lifecycle suite has 63 passing tests, and the explicit
-configuration/EPD regression has 158 passing tests plus six passing subtests.
-The full SMG Python suite has 122 passing and one skipped test. SMG's Python
-pre-commit hooks passed; Rust hooks could not run because this machine has no
-`cargo`, and are not recorded as passing.
+configuration, EPD, CI-helper, scheduler, kernel, MLA, and SMG regression
+suites. The final combined TokenSpeed CI-system/CLI/MLA run had 322 passing
+tests plus ten passing subtests; the focused kernel configuration run had 31
+passing tests. The scheduler C++ executable passed 408 tests, and the Python
+extension smoke passed. TokenSpeed's exact `pre-commit run --all-files`
+completed successfully after formatter changes were retested. SMG passed its
+55-test multimodal suite, targeted validation/CLI/image-limit tests, and the
+28-pass/one-skip Python parser suite; Rust package checks and formatting also
+passed. SMG's full-workspace all-feature clippy hook could not reach linting on
+this host because the optional OpenCV feature requires unavailable
+`pkg-config`/`opencv4.pc`; targeted clippy for the three changed packages
+passed apart from one explicitly allowed unrelated pre-existing lint.
 
 Runtime preflight passed with no inherited product feature/configuration
 variable, visible-device mask, reviewed exact override, or persistent kernel
@@ -296,17 +306,20 @@ override file. All six active-MM contracts passed. Every TP rank initialized
 the same nine encoder budgets and reported nine captured graphs, for 36 total;
 the count was unchanged after the requests. The unseen-dog logprob absolute
 delta was `0.0005637303`, and all three post-request health probes returned
-HTTP 200.
+HTTP 200. The launch exercised explicit SMG `shm` transport, SHM threshold,
+pixel-cache budget, image-size limit, and encoder-input dtype together with
+typed TokenSpeed SHM lifecycle flags; no product configuration environment
+variable was inherited.
 
 A SIGTERM sent only to the orchestrator root PID produced exit code zero in
-9.47 seconds. All 44 processes captured at signal time (the root plus 43
-descendants) and the complete process group disappeared, ports 8123/8124
+9.57 seconds. All 12 processes captured at signal time and the complete
+process group disappeared, ports 8123/8124
 closed, GPUs 4-7 returned to 0 MiB, no new TokenSpeed/SMG-related zombie
 appeared, and the shutdown log contained no forbidden lifecycle pattern.
 `active_mm/validation.json` and
 `shutdown_validation.json` both record `ok=true`. The immutable validation-time
 log snapshot has SHA256
-`257b02561382f45a4117793f4e4db2f7fed1163bdf25f92078d3b935ee44d2dd`;
+`0b2c3c126239132f13671fc8b8b828f68b202235a235fce42cb826553adb210b`;
 it remained unchanged through shutdown and is an exact prefix of the final
 server log. This closes the source integration and shutdown gates; it does not
 close the published-package or hosted-CI gates.
@@ -354,8 +367,9 @@ All results in this subsection use TokenSpeed
 At historical candidate `70daee2`, GSM8K, exact 1M, and active-MM released GPU
 memory and closed their ports, but each normal stop emitted one
 Starlette/Uvicorn lifespan `CancelledError` and left PID 1-owned zombies. The
-`b5dd5fc1` lifecycle hardening plus the `ca511c6` fixed-SHA source smoke above
-supersede that shutdown result and close the source lifecycle defect.
+`b5dd5fc1` lifecycle hardening plus the final `7cf79d8c` + `9eb6802a`
+fixed-SHA source smoke above supersede that shutdown result and close the
+source lifecycle defect.
 
 Packaging was audited independently. A clean rebuild of
 `FlamingoPg/smg@b7402c47759067e2f2a8840eaf7e81e239ca79b5` produced an active
@@ -638,7 +652,7 @@ point where Top-16 block eviction begins.
 - Triton: 3.6.0
 - Transformers: 5.12.0
 - TokenSpeed: 0.1.0
-- Final source smoke: `FlamingoPg/smg@6e0cb7acd62a8b8abe4d426a1289ff659e9a7844`
+- Final source smoke: `FlamingoPg/smg@9eb6802a626cec1dfe7fc392455caa43bfa5c0b1`
 - Source distributions: `smg==1.7.0`, `smg-grpc-proto==0.4.14`, and
   `smg-grpc-servicer==0.6.0`, built from that checkout
 - The development environment also retained the private
@@ -669,6 +683,7 @@ python -m pip install "setuptools==69.5.1" wheel
 python -m pip install -e "./python" --no-build-isolation
 python -m pip install -e tokenspeed-kernel/python/ --no-build-isolation
 python -m pip install -e tokenspeed-scheduler/
+python -m pip install --force-reinstall --no-deps ./tokenspeed-mla
 python -m pip install \
   "grpcio-health-checking==1.81.1" \
   "grpcio-reflection==1.81.1"
@@ -692,7 +707,7 @@ cd ..
 git clone --branch flamingo/minimax_m3 \
   https://github.com/FlamingoPg/smg.git
 cd smg
-git checkout 6e0cb7acd62a8b8abe4d426a1289ff659e9a7844
+git checkout 9eb6802a626cec1dfe7fc392455caa43bfa5c0b1
 
 python -m pip install maturin
 python -m pip uninstall -y \

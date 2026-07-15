@@ -1,9 +1,7 @@
 from pathlib import Path
 
 import pytest
-
-from tokenspeed_mla import fmha_binary
-from tokenspeed_mla import mla_prefill
+from tokenspeed_mla import fmha_binary, mla_prefill
 
 
 def test_cutedsl_is_the_stable_default_even_with_legacy_environment(
