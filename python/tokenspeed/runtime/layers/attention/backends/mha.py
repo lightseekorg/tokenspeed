@@ -113,7 +113,6 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
     """Standard MHA backend that routes through tokenspeed_kernel attention APIs."""
 
     uses_flat_cache_groups: bool = True
-    draft_block_use_extend: bool = True
 
     def support_kv_cache_prewrite(
         self, forward_mode: ForwardMode | None = None
