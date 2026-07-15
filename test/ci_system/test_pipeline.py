@@ -23,6 +23,7 @@ from pipeline import (
     is_gb200_runner,
     is_nvidia_arm_runner,
     normalize_task,
+    normalize_task_names,
     resolve_score_threshold_for_runner,
     runner_matches_group,
     should_run_nvidia_gpu_cleanup,
@@ -63,6 +64,33 @@ def test_pr_workflows_use_matrix_timeout_and_upload_all_ci_artifacts(workflow_pa
     assert job["timeout-minutes"] == "${{ matrix.timeout_minutes }}"
     assert upload_step["with"]["path"] == "${{ env.WORK_DIR }}/.ci-artifacts/"
     assert upload_step["with"]["include-hidden-files"] is True
+
+
+@pytest.mark.parametrize("workflow_path", PR_TEST_WORKFLOWS)
+def test_pr_workflows_require_fail_closed_manual_task_names(workflow_path):
+    import yaml as _yaml
+
+    workflow = _yaml.safe_load((REPO_ROOT / workflow_path).read_text())
+    # PyYAML 1.1 parses the unquoted workflow key `on` as boolean true.
+    events = workflow.get("on", workflow.get(True))
+    task_names_input = events["workflow_dispatch"]["inputs"]["task_names"]
+    build_step = next(
+        step
+        for step in workflow["jobs"]["scan"]["steps"]
+        if step.get("name") == "Build task matrix"
+    )
+
+    assert task_names_input["required"] is True
+    assert task_names_input["type"] == "string"
+    assert (
+        build_step["env"]["CI_SELECTED_TASK_NAMES"]
+        == "${{ github.event.inputs.task_names }}"
+    )
+    assert 'if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]' in build_step["run"]
+    assert (
+        'TASK_FILTER_ARGS=(--task-names "$CI_SELECTED_TASK_NAMES")' in build_step["run"]
+    )
+    assert '"${TASK_FILTER_ARGS[@]}"' in build_step["run"]
 
 
 def test_minimax_m3_exact_longctx_locks_known_output_token():
@@ -716,6 +744,18 @@ def test_normalize_task_defaults_timeout_minutes_to_60(tmp_path):
     assert task["timeout_minutes"] == 60
 
 
+@pytest.mark.parametrize("name", ["", " task-a", "task-a ", "task,a", ["task-a"]])
+def test_validate_task_rejects_name_incompatible_with_exact_filter(tmp_path, name):
+    import yaml as _yaml
+
+    path = tmp_path / "invalid-name.yaml"
+    task = _yaml.safe_load(_default_body("task-a", ["b300-1gpu"]))
+    task["name"] = name
+
+    with pytest.raises(ValueError, match=r"name must be a non-empty string"):
+        validate_task(task, path)
+
+
 @pytest.mark.parametrize("timeout_minutes", [1, 60, 360])
 def test_validate_task_accepts_timeout_minutes_bounds(tmp_path, timeout_minutes):
     import yaml as _yaml
@@ -764,6 +804,146 @@ def test_build_matrix_emits_default_and_explicit_timeout_minutes(tmp_path):
         "ut-default": 60,
         "ut-explicit": 120,
     }
+
+
+def test_scan_task_names_parser_normalizes_exact_comma_separated_names():
+    args = pipeline_module.parse_args(["scan", "--task-names", " task-a,task-b "])
+
+    assert args.task_names == ["task-a", "task-b"]
+
+
+@pytest.mark.parametrize(
+    "task_names",
+    [[], [""], ["task-a", ""], ["task-a", "task-a"]],
+)
+def test_normalize_task_names_rejects_empty_or_duplicate_selection(task_names):
+    with pytest.raises(ValueError):
+        normalize_task_names(task_names)
+
+
+def test_build_matrix_filters_exact_task_names(tmp_path):
+    _write_task_yaml(
+        tmp_path,
+        "a.yaml",
+        _default_body("task-a", ["b200-1gpu"]),
+    )
+    _write_task_yaml(
+        tmp_path,
+        "b.yaml",
+        _default_body("task-b", ["b200-1gpu"]),
+    )
+
+    matrix = build_matrix(
+        tmp_path,
+        tmp_path,
+        trigger="per-commit",
+        task_names=["task-b"],
+    )
+
+    assert [entry["name"] for entry in matrix["include"]] == ["task-b"]
+
+
+def test_build_matrix_rejects_any_unknown_selected_task(tmp_path):
+    _write_task_yaml(
+        tmp_path,
+        "known.yaml",
+        _default_body("known", ["b200-1gpu"]),
+    )
+
+    with pytest.raises(ValueError, match=r"unknown task names: \['missing'\]"):
+        build_matrix(
+            tmp_path,
+            tmp_path,
+            trigger="per-commit",
+            task_names=["known", "missing"],
+        )
+
+
+def test_build_matrix_rejects_selected_task_without_requested_trigger(tmp_path):
+    _write_task_yaml(
+        tmp_path,
+        "known.yaml",
+        _default_body("known", ["b200-1gpu"]),
+    )
+
+    with pytest.raises(ValueError, match=r"do not support trigger 'manual'"):
+        build_matrix(
+            tmp_path,
+            tmp_path,
+            trigger="manual",
+            task_names=["known"],
+        )
+
+
+def test_build_matrix_rejects_partial_runner_group_match(tmp_path):
+    _write_task_yaml(
+        tmp_path,
+        "amd.yaml",
+        _default_body("amd", ["amd-mi35x-1gpu-test"]),
+    )
+    _write_task_yaml(
+        tmp_path,
+        "nvidia.yaml",
+        _default_body("nvidia", ["b200-1gpu"]),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"no matrix entries.*\['amd'\]",
+    ):
+        build_matrix(
+            tmp_path,
+            tmp_path,
+            trigger="per-commit",
+            runner_group="nvidia-x86",
+            task_names=["nvidia", "amd"],
+        )
+
+
+def test_build_matrix_rejects_selected_task_excluded_from_all_runners(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS", "b200")
+    _write_task_yaml(
+        tmp_path,
+        "known.yaml",
+        _default_body("known", ["b200-1gpu"]),
+    )
+
+    with pytest.raises(ValueError, match=r"no matrix entries.*\['known'\]"):
+        build_matrix(
+            tmp_path,
+            tmp_path,
+            trigger="per-commit",
+            task_names=["known"],
+        )
+
+
+def test_scan_main_returns_nonzero_for_unknown_selected_task(tmp_path, capsys):
+    _write_task_yaml(
+        tmp_path,
+        "known.yaml",
+        _default_body("known", ["b200-1gpu"]),
+    )
+
+    returncode = pipeline_module.main(
+        [
+            "scan",
+            "--repo-root",
+            str(tmp_path),
+            "--root",
+            ".",
+            "--trigger",
+            "per-commit",
+            "--task-names",
+            "missing",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert returncode == 2
+    assert captured.out == ""
+    assert "unknown task names: ['missing']" in captured.err
 
 
 def test_execute_task_print_plan_includes_config_and_timeout(tmp_path, capsys):

@@ -118,6 +118,12 @@ def validate_task(data: Dict[str, Any], path: Path) -> None:
         raise ValueError(f"{path}: missing required keys: {missing}")
     if data["api_version"] != "ci.tokenspeed.io/v1":
         raise ValueError(f"{path}: unsupported api_version {data['api_version']!r}")
+    name = data["name"]
+    if not isinstance(name, str) or not name or name != name.strip() or "," in name:
+        raise ValueError(
+            f"{path}: name must be a non-empty string without surrounding "
+            f"whitespace or commas; got {name!r}"
+        )
     if data["type"] not in SUPPORTED_TYPES:
         raise ValueError(f"{path}: unsupported type {data['type']!r}")
     timeout_minutes = data.get("timeout_minutes", DEFAULT_TIMEOUT_MINUTES)
@@ -291,6 +297,48 @@ def find_task_files(root: Path) -> List[Path]:
     return sorted(root.rglob("*.yaml"))
 
 
+def normalize_task_names(task_names: Iterable[str]) -> List[str]:
+    """Validate and normalize an exact CI task-name selection.
+
+    Task filters are intentionally strict because they control which hosted
+    jobs consume accelerator capacity. Empty entries and duplicates usually
+    indicate a malformed manual dispatch, so rejecting them is safer than
+    silently broadening or partially applying the selection.
+    """
+
+    normalized = []
+    for task_name in task_names:
+        if not isinstance(task_name, str):
+            raise ValueError("task names must be strings")
+        normalized.append(task_name.strip())
+
+    if not normalized or any(not task_name for task_name in normalized):
+        raise ValueError(
+            "task names must be a non-empty comma-separated list without "
+            "empty entries"
+        )
+
+    seen = set()
+    duplicates = []
+    for task_name in normalized:
+        if task_name in seen and task_name not in duplicates:
+            duplicates.append(task_name)
+        seen.add(task_name)
+    if duplicates:
+        raise ValueError(f"duplicate task names are not allowed: {duplicates}")
+
+    return normalized
+
+
+def parse_task_names(value: str) -> List[str]:
+    """Parse a comma-separated ``--task-names`` command-line value."""
+
+    try:
+        return normalize_task_names(value.split(","))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
 def resolve_priority_for_label(priority: Any, label: str) -> str:
     """Pick the effective priority for ``label`` from the task's ``priority``.
 
@@ -325,11 +373,56 @@ def build_matrix(
     repo_root: Path,
     trigger: str | None,
     runner_group: str = "all",
+    task_names: Iterable[str] | None = None,
 ) -> Dict[str, Any]:
+    requested_names = (
+        normalize_task_names(task_names) if task_names is not None else None
+    )
+    tasks = [normalize_task(path, repo_root) for path in find_task_files(root)]
+
+    if requested_names is not None:
+        sources_by_name: Dict[str, List[str]] = {}
+        for task in tasks:
+            sources_by_name.setdefault(task["name"], []).append(task["_source_path"])
+
+        unknown_names = [
+            task_name
+            for task_name in requested_names
+            if task_name not in sources_by_name
+        ]
+        if unknown_names:
+            raise ValueError(f"unknown task names: {unknown_names}")
+
+        ambiguous_names = {
+            task_name: sources_by_name[task_name]
+            for task_name in requested_names
+            if len(sources_by_name[task_name]) != 1
+        }
+        if ambiguous_names:
+            raise ValueError(
+                "selected task names must identify exactly one task spec: "
+                f"{ambiguous_names}"
+            )
+
+        trigger_mismatches = [
+            task_name
+            for task_name in requested_names
+            if trigger is not None
+            and trigger
+            not in next(task["triggers"] for task in tasks if task["name"] == task_name)
+        ]
+        if trigger_mismatches:
+            raise ValueError(
+                f"selected task names do not support trigger {trigger!r}: "
+                f"{trigger_mismatches}"
+            )
+
+    requested_name_set = set(requested_names) if requested_names is not None else None
     include = []
     excluded_runner_labels = get_excluded_runner_labels()
-    for path in find_task_files(root):
-        task = normalize_task(path, repo_root)
+    for task in tasks:
+        if requested_name_set is not None and task["name"] not in requested_name_set:
+            continue
         if trigger and trigger not in task["triggers"]:
             continue
         priority = task.get("priority")
@@ -360,6 +453,18 @@ def build_matrix(
     # order, so tasks that omit `priority` see no change from the previous
     # behaviour.
     include.sort(key=lambda entry: _PRIORITY_ORDER[entry["priority"]])
+
+    if requested_names is not None:
+        emitted_names = {entry["name"] for entry in include}
+        unmatched_names = [
+            task_name for task_name in requested_names if task_name not in emitted_names
+        ]
+        if unmatched_names:
+            raise ValueError(
+                "selected task names produced no matrix entries after runner-group "
+                f"and runner-exclusion filtering: {unmatched_names}"
+            )
+
     return {"include": include}
 
 
@@ -1793,6 +1898,16 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         default="all",
         help="Optional runner group filter",
     )
+    scan_parser.add_argument(
+        "--task-names",
+        type=parse_task_names,
+        default=None,
+        metavar="NAME[,NAME...]",
+        help=(
+            "Optional comma-separated exact task-name filter. Every selected "
+            "task must exist and emit at least one matrix entry."
+        ),
+    )
 
     execute_parser = subparsers.add_parser("execute", help="Execute one CI task")
     execute_parser.add_argument(
@@ -1842,7 +1957,17 @@ def main(argv: Iterable[str] | None = None) -> int:
     if args.command == "scan":
         repo_root = Path(args.repo_root).resolve()
         root = (repo_root / args.root).resolve()
-        matrix = build_matrix(root, repo_root, args.trigger, args.runner_group)
+        try:
+            matrix = build_matrix(
+                root,
+                repo_root,
+                args.trigger,
+                args.runner_group,
+                args.task_names,
+            )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
         print(json.dumps(matrix, separators=(",", ":")))
         return 0
 

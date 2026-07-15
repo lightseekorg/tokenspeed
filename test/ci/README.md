@@ -39,6 +39,42 @@ including hidden files, rather than guessing workload-specific filenames.
 Workload validators should write durable JSON, logs, and memory samples below
 that directory even when validation fails.
 
+## Targeted manual dispatch
+
+Manual dispatches of `PR Test NVIDIA`, `PR Test NVIDIA ARM`, and `PR Test AMD`
+require the `task_names` input. It is a comma-separated list of exact,
+case-sensitive task names from the YAML `name` fields; wildcards and substring
+matching are not supported. The filter applies only to `workflow_dispatch`.
+Push and pull-request scans continue to select tasks solely from their trigger
+and runner group.
+
+Selection is fail-closed. The scan exits unsuccessfully if the list is empty,
+contains an empty or duplicate entry, names an unknown task, selects a task
+that does not support the requested trigger, or leaves any selected task with
+no matrix entry after runner-group and runner-exclusion filtering. It never
+silently expands an invalid selection to the full manual matrix or runs only
+the valid subset of a partially invalid selection.
+
+For example, this dispatch selects only the six MiniMax-M3 release tasks:
+
+```bash
+gh workflow run pr-test-nvidia.yml \
+  --repo lightseekorg/tokenspeed \
+  --ref <upstream-branch> \
+  -f trigger=manual \
+  -f task_names='eval-minimax-m3-mxfp8-gsm8k,perf-minimax-m3-bf16-cache-random,perf-minimax-m3-mxfp8-active-mm,perf-minimax-m3-mxfp8-random,perf-minimax-m3-mxfp8-exact-longctx,ut-runtime-minimax-m3'
+```
+
+The equivalent local matrix check is:
+
+```bash
+python3 test/ci_system/pipeline.py scan \
+  --root test/ci \
+  --trigger manual \
+  --runner-group nvidia-x86 \
+  --task-names 'eval-minimax-m3-mxfp8-gsm8k,perf-minimax-m3-bf16-cache-random,perf-minimax-m3-mxfp8-active-mm,perf-minimax-m3-mxfp8-random,perf-minimax-m3-mxfp8-exact-longctx,ut-runtime-minimax-m3'
+```
+
 Each task expands into one matrix entry per runner label. Add a top-level
 `priority` to a task YAML to bias dispatch order. GitHub Actions starts matrix
 jobs in include-list order, so `high` entries reach a contended runner pool

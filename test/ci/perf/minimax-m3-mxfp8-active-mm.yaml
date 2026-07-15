@@ -13,6 +13,10 @@ install:
     python3 test/ci_system/runtime_env_preflight.py
     --output .ci-artifacts/minimax-m3-active-mm/runtime_environment.json
   - >-
+    python3 test/ci_system/minimax_m3_smg_package_preflight.py
+    --pyproject python/pyproject.toml
+    --output .ci-artifacts/minimax-m3-active-mm/smg_packages.json
+  - >-
     python3 test/ci_system/fetch_minimax_m3_mm_fixtures.py
     --output-dir .ci-artifacts/minimax-m3-active-mm/fixtures
 server:

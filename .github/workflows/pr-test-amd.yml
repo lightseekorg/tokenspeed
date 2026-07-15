@@ -40,6 +40,10 @@ on:
         options:
           - manual
           - debug
+      task_names:
+        description: "Comma-separated exact CI task names (required; no wildcards)"
+        required: true
+        type: string
 
 env:
   PIP_BREAK_SYSTEM_PACKAGES: 1
@@ -93,12 +97,19 @@ jobs:
       - name: Build task matrix
         id: scan
         env:
+          CI_SELECTED_TASK_NAMES: ${{ github.event.inputs.task_names }}
           TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS: ${{ vars.TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS }}
         run: |
+          set -euo pipefail
+          TASK_FILTER_ARGS=()
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            TASK_FILTER_ARGS=(--task-names "$CI_SELECTED_TASK_NAMES")
+          fi
           MATRIX=$(python3 test/ci_system/pipeline.py scan \
             --root test/ci \
             --trigger "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.trigger || 'per-commit' }}" \
-            --runner-group "amd")
+            --runner-group "amd" \
+            "${TASK_FILTER_ARGS[@]}")
           echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
           printf '%s' "$MATRIX" | python3 -c "import json, sys; print('has_tasks=' + ('true' if json.load(sys.stdin).get('include') else 'false'))" >> "$GITHUB_OUTPUT"
 
