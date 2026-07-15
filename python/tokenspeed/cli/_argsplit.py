@@ -53,6 +53,10 @@ _ORCH_FLAGS = {
     "--control-port",
 }
 
+_ORCH_BOOL_FLAGS = {
+    "--disable-logo",
+}
+
 _FANOUT_FLAGS = {"--model", "--reasoning-parser"}
 
 _ALIASES = {
@@ -93,6 +97,7 @@ class OrchestratorOpts:
     gateway_startup_timeout: int = 60
     drain_timeout: int = 30
     control_port: int | None = None
+    disable_logo: bool = False
 
 
 @dataclass
@@ -197,6 +202,12 @@ def split_argv(argv: list[str]) -> SplitResult:
     engine_flags = _engine_recognized_flags()
 
     for name, value in items:
+        if name in _ORCH_BOOL_FLAGS:
+            if value is not None:
+                raise ValueError(f"{name} does not take a value")
+            setattr(result.opts, name[2:].replace("-", "_"), True)
+            continue
+
         if name in _ORCH_FLAGS:
             if value is None or value == "":
                 raise ValueError(f"{name} requires a positive integer (seconds)")

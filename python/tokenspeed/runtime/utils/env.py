@@ -233,16 +233,12 @@ class EnvFloat(EnvField):
 class Envs:
     # fmt: off
 
-    # Model download
-    TOKENSPEED_USE_MODELSCOPE = EnvBool(False)
-
     # Test and debug
     TOKENSPEED_CUDA_COREDUMP = EnvBool(False)
     TOKENSPEED_CUDA_COREDUMP_DIR = EnvStr("/tmp/tokenspeed_cuda_coredumps")
     TOKENSPEED_PROFILE_WITH_STACK = EnvBool(True)
     TOKENSPEED_TEST_REQUEST_TIME_STATS = EnvBool(False)
     TOKENSPEED_PROFILER_DIR = EnvStr("/tmp")
-    TOKENSPEED_CI_SMALL_KV_SIZE = EnvInt(-1)
     TOKENSPEED_NVTX = EnvBool(False)
     TOKENSPEED_DP_SAMPLING_BACKEND = EnvStr(None)
 
@@ -267,16 +263,11 @@ class Envs:
     TOKENSPEED_EXPERT_DISTRIBUTION_RECORDER_DIR = EnvStr("/tmp")
 
     # Runtime behavior
-    TOKENSPEED_DETOKENIZER_MAX_STATES = EnvInt(1 << 16)
     TOKENSPEED_FORCE_FAKE_FULL_NVLINK = EnvBool(False)
     TOKENSPEED_HEALTH_CHECK_TIMEOUT = EnvInt(20)
     TOKENSPEED_HOST_IP = EnvStr("")
-    TOKENSPEED_LOGGING_CONFIG_PATH = EnvStr(None)
-    TOKENSPEED_MODEL_REDIRECT_PATH = EnvStr(None)
     TOKENSPEED_MOE_PADDING = EnvBool(False)
     TOKENSPEED_MOE_CONFIG_DIR = EnvStr(None)
-    TOKENSPEED_ENABLE_TORCH_INFERENCE_MODE = EnvBool(True)
-    TOKENSPEED_NUMA_AWARE_WORKER_AFFINITY = EnvBool(True)
     TOKENSPEED_REQUEST_CONVERSION_WORKERS = EnvInt(8)
 
     # fmt: on

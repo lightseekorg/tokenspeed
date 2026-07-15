@@ -82,6 +82,8 @@ class ServerArgs:
     served_model_name: str | None = None
     revision: str | None = None
     language_model_only: bool = False
+    use_modelscope: bool = False
+    model_redirect_path: str | None = None
 
     # Port for the HTTP server
     host: str = "127.0.0.1"
@@ -124,6 +126,7 @@ class ServerArgs:
     # Logging
     log_level: str = "info"
     log_level_http: str | None = None
+    logging_config_path: str | None = None
     enable_log_requests: bool = False
     log_requests_level: int = 0
     enable_log_request_stats: bool = False
@@ -270,6 +273,7 @@ class ServerArgs:
     enable_cudagraph_gc: bool = False
     enable_nccl_nvls: bool = False
     enable_symm_mem: bool = False
+    enable_numa_aware_worker_affinity: bool = True
     disable_custom_all_reduce: bool = False
     disable_overlap_schedule: bool = False
     disable_tf32: bool = False
@@ -387,7 +391,7 @@ class ServerArgs:
         self.validate()
 
     def resolve_basic_defaults(self):
-        self.model = maybe_model_redirect(self.model)
+        self.model = maybe_model_redirect(self.model, self.model_redirect_path)
 
         if self.kv_cache_dtype == "fp8":
             self.kv_cache_dtype = "fp8_e4m3"
@@ -847,6 +851,18 @@ class ServerArgs:
             help="Skip vision/audio encoders on a multimodal checkpoint and "
             "run text-only. Multimodal requests are rejected.",
         )
+        parser.add_argument(
+            "--use-modelscope",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.use_modelscope,
+            help="Download remote model and tokenizer artifacts from ModelScope instead of Hugging Face.",
+        )
+        parser.add_argument(
+            "--model-redirect-path",
+            type=str,
+            default=ServerArgs.model_redirect_path,
+            help="Optional JSON or whitespace-delimited model-name redirect file.",
+        )
         parser.add_argument("--ext-yaml", type=str, default=None)
         parser.add_argument(
             "--load-format",
@@ -1199,6 +1215,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.log_level_http,
             help="The logging level of HTTP server. If not set, reuse --log-level by default.",
+        )
+        parser.add_argument(
+            "--logging-config-path",
+            type=str,
+            default=ServerArgs.logging_config_path,
+            help="Path to a JSON logging.dictConfig configuration file.",
         )
         parser.add_argument(
             "--enable-log-requests",
@@ -1777,6 +1799,12 @@ class ServerArgs:
             "--enable-symm-mem",
             action="store_true",
             help="Enable NCCL symmetric memory for fast collectives.",
+        )
+        parser.add_argument(
+            "--enable-numa-aware-worker-affinity",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.enable_numa_aware_worker_affinity,
+            help="Pin NVIDIA worker processes to the CPU set local to their GPU when process affinity is otherwise unconstrained.",
         )
         parser.add_argument(
             "--disable-custom-all-reduce",

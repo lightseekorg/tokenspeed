@@ -106,6 +106,11 @@ def test_timeout_cli_accepts_explicit_values():
     assert args.per_request_timeout_sec == 60
 
 
+def test_modelscope_selection_is_an_explicit_benchmark_flag():
+    assert _parse_serving_args([]).use_modelscope is False
+    assert _parse_serving_args(["--use-modelscope"]).use_modelscope is True
+
+
 def test_timeout_cli_rejects_non_positive_values():
     with pytest.raises(SystemExit):
         _parse_serving_args(["--per-request-timeout-sec", "0"])

@@ -41,6 +41,19 @@ def test_orchestrator_default_timeouts():
     assert r.opts.engine_startup_timeout == 1800
     assert r.opts.gateway_startup_timeout == 60
     assert r.opts.drain_timeout == 30
+    assert r.opts.disable_logo is False
+
+
+def test_disable_logo_is_consumed_by_orchestrator():
+    r = _split(["--disable-logo"])
+    assert r.engine == []
+    assert r.gateway == []
+    assert r.opts.disable_logo is True
+
+
+def test_disable_logo_rejects_a_value():
+    with pytest.raises(ValueError, match="does not take a value"):
+        _split(["--disable-logo=true"])
 
 
 def test_model_fans_out_to_both():

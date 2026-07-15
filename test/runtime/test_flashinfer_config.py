@@ -18,9 +18,22 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-DEFAULT_FLASHINFER_WORKSPACE_SIZE = 384 * 1024 * 1024
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=5, suite="runtime-1gpu")
+
+from tokenspeed.runtime.utils.flashinfer_config import (
+    DEFAULT_FLASHINFER_WORKSPACE_SIZE,
+    get_flashinfer_workspace_size,
+)
 
 
-def get_flashinfer_workspace_size() -> int:
-    """Return TokenSpeed's fixed FlashInfer workspace reservation in bytes."""
-    return DEFAULT_FLASHINFER_WORKSPACE_SIZE
+def test_flashinfer_workspace_uses_stable_runtime_default(monkeypatch):
+    monkeypatch.setenv("FLASHINFER_WORKSPACE_SIZE", "1")
+
+    assert get_flashinfer_workspace_size() == DEFAULT_FLASHINFER_WORKSPACE_SIZE
+    assert get_flashinfer_workspace_size() == 384 * 1024 * 1024

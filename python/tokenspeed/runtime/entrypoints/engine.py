@@ -496,7 +496,9 @@ def _launch_subprocesses(
 
     # If using model from www.modelscope.cn, first download the model.
     server_args.model, server_args.tokenizer = prepare_model_and_tokenizer(
-        server_args.model, server_args.tokenizer
+        server_args.model,
+        server_args.tokenizer,
+        use_modelscope=server_args.use_modelscope,
     )
 
     scheduler_procs = []

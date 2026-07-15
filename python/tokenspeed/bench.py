@@ -65,8 +65,6 @@ import requests
 from tqdm.asyncio import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
-from tokenspeed.runtime.utils.env import envs
-
 # Streaming HTTP timeout defaults. ``total=6h`` keeps the session umbrella
 # generous so whole-run benches don't get cut off. ``sock_read=30m`` is well
 # above the largest expected TTFT while still surfacing a silent socket, and
@@ -544,8 +542,10 @@ ASYNC_REQUEST_FUNCS = {
 }
 
 
-def get_model(pretrained_model_name_or_path: str) -> str:
-    if envs.TOKENSPEED_USE_MODELSCOPE.get():
+def get_model(
+    pretrained_model_name_or_path: str, *, use_modelscope: bool = False
+) -> str:
+    if use_modelscope:
         import huggingface_hub.constants
         from modelscope import snapshot_download
 
@@ -559,11 +559,16 @@ def get_model(pretrained_model_name_or_path: str) -> str:
 
 def get_tokenizer(
     pretrained_model_name_or_path: str,
+    *,
+    use_modelscope: bool = False,
 ) -> PreTrainedTokenizerBase:
     if pretrained_model_name_or_path is not None and not os.path.exists(
         pretrained_model_name_or_path
     ):
-        pretrained_model_name_or_path = get_model(pretrained_model_name_or_path)
+        pretrained_model_name_or_path = get_model(
+            pretrained_model_name_or_path,
+            use_modelscope=use_modelscope,
+        )
     return AutoTokenizer.from_pretrained(
         pretrained_model_name_or_path, trust_remote_code=True
     )
@@ -1801,6 +1806,12 @@ def add_serving_cli_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--model", type=str, default=None)
     parser.add_argument("--served-model-name", type=str, default=None)
     parser.add_argument("--tokenizer", type=str, default=None)
+    parser.add_argument(
+        "--use-modelscope",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Download a remote benchmark tokenizer from ModelScope instead of Hugging Face.",
+    )
     parser.add_argument("--skip-tokenizer-init", action="store_true")
     parser.add_argument("--trust-remote-code", action="store_true", default=True)
     parser.add_argument("--request-rate", type=float, default=float("inf"))
@@ -1940,7 +1951,10 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
     tokenizer_id = None
     if not args.skip_tokenizer_init:
         tokenizer_id = args.tokenizer or model_id
-        tokenizer = get_tokenizer(tokenizer_id)
+        tokenizer = get_tokenizer(
+            tokenizer_id,
+            use_modelscope=args.use_modelscope,
+        )
 
     if args.dataset_name == "random" and args.backend in OPENAI_COMPATIBLE_BACKENDS:
         args.ignore_eos = True

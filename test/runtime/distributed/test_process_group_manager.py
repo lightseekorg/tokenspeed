@@ -1,12 +1,13 @@
 from datetime import timedelta
 from types import SimpleNamespace
-from unittest.mock import Mock, call
+from unittest.mock import Mock, call, patch
 
 import torch
 
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.distributed.process_group_manager import ProcessGroupManager
 from tokenspeed.runtime.execution import distributed_initializer
+from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
 def _mapping(world_size: int = 4) -> Mapping:
@@ -106,6 +107,26 @@ def test_non_nccl_groups_do_not_receive_device_id(monkeypatch):
     new_group.assert_called_once_with((0,), backend="gloo")
 
 
+def test_distributed_config_carries_explicit_numa_setting():
+    with patch.object(ServerArgs, "__post_init__"):
+        server_args = ServerArgs(
+            model="stub",
+            enable_numa_aware_worker_affinity=False,
+        )
+    server_args.mapping = _mapping(world_size=1)
+
+    config = distributed_initializer.DistributedConfig.from_server_args(
+        server_args,
+        SimpleNamespace(nccl_port=12345),
+        gpu_id=0,
+        global_rank=0,
+        hidden_size=128,
+        max_num_tokens=1024,
+    )
+
+    assert config.enable_numa_aware_worker_affinity is False
+
+
 def test_distributed_initializer_uses_physical_cuda_device(monkeypatch):
     mapping = _mapping(world_size=1)
     device_module = SimpleNamespace(set_device=Mock())
@@ -119,8 +140,11 @@ def test_distributed_initializer_uses_physical_cuda_device(monkeypatch):
     monkeypatch.setattr(
         distributed_initializer, "get_available_gpu_memory", lambda *args, **kwargs: 80
     )
+    set_numa_affinity = Mock()
     monkeypatch.setattr(
-        distributed_initializer, "maybe_set_numa_aware_cpu_affinity", Mock()
+        distributed_initializer,
+        "maybe_set_numa_aware_cpu_affinity",
+        set_numa_affinity,
     )
     monkeypatch.setattr(distributed_initializer, "pg_manager", pg_manager)
     config = distributed_initializer.DistributedConfig(
@@ -142,6 +166,7 @@ def test_distributed_initializer_uses_physical_cuda_device(monkeypatch):
     assert distributed_initializer.DistributedInitializer.initialize(config) == 80
 
     device_module.set_device.assert_called_once_with(4)
+    set_numa_affinity.assert_called_once_with(4, enabled=True)
     pg_manager.init_distributed.assert_called_once_with(
         mapping,
         backend="nccl",

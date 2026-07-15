@@ -25,7 +25,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import os
 import sys
 import time
 
@@ -43,11 +42,10 @@ async def spawn_engine(
     port: int,
 ) -> asyncio.subprocess.Process:
     """Spawn the engine subprocess with PIPE stdio."""
-    module = os.environ.get("TS_SERVE_ENGINE_MODULE", _ENGINE_MODULE_DEFAULT)
     cmd = [
         sys.executable,
         "-m",
-        module,
+        _ENGINE_MODULE_DEFAULT,
         "--host",
         host,
         "--port",

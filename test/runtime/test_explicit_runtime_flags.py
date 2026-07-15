@@ -23,10 +23,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
-from types import SimpleNamespace
-from unittest.mock import patch
+from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -44,6 +45,13 @@ from tokenspeed.runtime.multimodal.inputs import (
     Modality,
     MultimodalDataItem,
     MultimodalInputs,
+)
+from tokenspeed.runtime.utils.common import (
+    configure_logger,
+    maybe_inference_mode,
+    maybe_model_redirect,
+    maybe_set_numa_aware_cpu_affinity,
+    prepare_model_and_tokenizer,
 )
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
@@ -171,3 +179,106 @@ def test_input_processor_propagates_explicit_multimodal_hash_policy() -> None:
 
     assert item.hash == random_hash
     assert output.input_ids[1] == item.pad_value
+
+
+def test_model_redirect_uses_only_the_explicit_path(tmp_path) -> None:
+    redirect_path = tmp_path / "redirects.json"
+    redirect_path.write_text(json.dumps({"source/model": "/models/local"}))
+
+    with patch.dict(
+        os.environ,
+        {"TOKENSPEED_MODEL_REDIRECT_PATH": str(redirect_path)},
+    ):
+        assert maybe_model_redirect("source/model") == "source/model"
+    assert maybe_model_redirect("source/model", str(redirect_path)) == "/models/local"
+
+    with patch.object(ServerArgs, "__post_init__"):
+        server_args = ServerArgs(
+            model="source/model",
+            model_redirect_path=str(redirect_path),
+        )
+    server_args.resolve_basic_defaults()
+    assert server_args.model == "/models/local"
+    assert server_args.tokenizer == "/models/local"
+
+
+def test_modelscope_download_is_explicit() -> None:
+    snapshot_download = Mock(side_effect=["/cache/model", "/cache/tokenizer"])
+    modelscope = ModuleType("modelscope")
+    modelscope.snapshot_download = snapshot_download
+
+    with patch.dict(os.environ, {"TOKENSPEED_USE_MODELSCOPE": "1"}):
+        assert prepare_model_and_tokenizer(
+            "remote/model",
+            "remote/tokenizer",
+        ) == ("remote/model", "remote/tokenizer")
+
+    with (
+        patch.dict(sys.modules, {"modelscope": modelscope}),
+        patch("tokenspeed.runtime.utils.common.os.path.exists", return_value=False),
+    ):
+        resolved = prepare_model_and_tokenizer(
+            "remote/model",
+            "remote/tokenizer",
+            use_modelscope=True,
+        )
+
+    assert resolved == ("/cache/model", "/cache/tokenizer")
+    assert snapshot_download.call_args_list[0].args == ("remote/model",)
+    assert snapshot_download.call_args_list[1].args == ("remote/tokenizer",)
+
+
+def test_inference_context_is_a_stable_runtime_policy() -> None:
+    assert not torch.is_inference_mode_enabled()
+    with patch.dict(os.environ, {"TOKENSPEED_ENABLE_TORCH_INFERENCE_MODE": "0"}):
+        with maybe_inference_mode():
+            assert torch.is_inference_mode_enabled()
+
+
+def test_numa_affinity_can_be_disabled_explicitly() -> None:
+    with patch("tokenspeed.runtime.utils.common.current_platform") as platform:
+        maybe_set_numa_aware_cpu_affinity(0, enabled=False)
+
+    platform.assert_not_called()
+
+
+def test_logging_config_uses_the_explicit_path(tmp_path) -> None:
+    config = {
+        "version": 1,
+        "handlers": {"null": {"class": "logging.NullHandler"}},
+        "root": {"handlers": ["null"], "level": "INFO"},
+    }
+    config_path = tmp_path / "logging.json"
+    config_path.write_text(json.dumps(config))
+    server_args = SimpleNamespace(
+        log_level="info",
+        logging_config_path=str(config_path),
+    )
+
+    with (
+        patch("logging.config.dictConfig") as dict_config,
+        patch("tokenspeed._logging.suppress_noisy_third_party_logs"),
+    ):
+        configure_logger(server_args)
+
+    dict_config.assert_called_once_with(config)
+
+
+def test_logging_config_ignores_the_legacy_environment(tmp_path) -> None:
+    config_path = tmp_path / "logging.json"
+    config_path.write_text(json.dumps({"version": 1}))
+    server_args = SimpleNamespace(log_level="info", logging_config_path=None)
+
+    with (
+        patch.dict(
+            os.environ,
+            {"TOKENSPEED_LOGGING_CONFIG_PATH": str(config_path)},
+        ),
+        patch("logging.basicConfig") as basic_config,
+        patch("logging.config.dictConfig") as dict_config,
+        patch("tokenspeed._logging.suppress_noisy_third_party_logs"),
+    ):
+        configure_logger(server_args)
+
+    basic_config.assert_called_once()
+    dict_config.assert_not_called()

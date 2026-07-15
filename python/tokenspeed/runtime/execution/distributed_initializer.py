@@ -82,6 +82,7 @@ class DistributedConfig:
     # Feature flags
     disable_custom_all_reduce: bool = False
     force_deterministic_rsag: bool = False
+    enable_numa_aware_worker_affinity: bool = True
 
     # The full Mapping object for pg_manager initialization
     mapping: object = None
@@ -122,6 +123,9 @@ class DistributedConfig:
             max_num_tokens=max_num_tokens,
             disable_custom_all_reduce=server_args.disable_custom_all_reduce,
             force_deterministic_rsag=server_args.force_deterministic_rsag,
+            enable_numa_aware_worker_affinity=(
+                server_args.enable_numa_aware_worker_affinity
+            ),
             mapping=mapping,
         )
 
@@ -135,7 +139,10 @@ class DistributedInitializer:
             get_available_gpu_memory(config.device, config.gpu_id),
         )
         if config.device == "cuda":
-            maybe_set_numa_aware_cpu_affinity(config.gpu_id)
+            maybe_set_numa_aware_cpu_affinity(
+                config.gpu_id,
+                enabled=config.enable_numa_aware_worker_affinity,
+            )
 
         # Determine backend
         if config.device == "cuda":

@@ -63,7 +63,8 @@ choices (still evolving; subject to change):
   ranks the survivors with an optional per-family `SelectionOracle` and
   priority, and returns a callable. Selection accepts an objective (latency,
   throughput, determinism, portability) and supports per-call `override=` plus
-  config-file overrides for development.
+  explicitly loaded config-file overrides for development. It never reads
+  kernel-selection environment variables or a per-user default override file.
 
 ### Directory structure
 
@@ -157,7 +158,14 @@ specific solution under `ops/<family>/`, or manually `select_kernel` with
 targeted filters:
 
 ```python
-from tokenspeed_kernel.selection import select_kernel, kernel_override
+from tokenspeed_kernel.selection import (
+    kernel_override,
+    load_config_overrides,
+    select_kernel,
+)
+
+# Development-only process-wide configuration is opt-in and path-explicit.
+load_config_overrides("/path/to/overrides.yaml")
 ```
 
 For platform checks:

@@ -63,7 +63,6 @@ def test_orchestrator_runs_against_fake_engine():
     user_port = _free_port()
 
     env = os.environ.copy()
-    env["TS_SERVE_ENGINE_MODULE"] = "test.cli._fixtures.fake_engine"
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
     env["PYTHONPATH"] = repo_root + os.pathsep + env.get("PYTHONPATH", "")
 
@@ -71,7 +70,7 @@ def test_orchestrator_runs_against_fake_engine():
         [
             sys.executable,
             "-m",
-            "tokenspeed.cli",
+            "test.cli._fixtures.fake_orchestrator",
             "serve",
             "--model",
             "/fake",

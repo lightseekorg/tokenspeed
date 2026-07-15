@@ -81,6 +81,35 @@ class TestCLIConfigCompat(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._from_cli_args_no_init(args)
 
+    def test_explicit_runtime_configuration_flags(self):
+        args = self._parse_args(
+            [
+                "--model",
+                "test/model",
+                "--use-modelscope",
+                "--model-redirect-path",
+                "/tmp/model-redirects.json",
+                "--logging-config-path",
+                "/tmp/logging.json",
+                "--no-enable-numa-aware-worker-affinity",
+            ]
+        )
+        sa = self._from_cli_args_no_init(args)
+
+        self.assertTrue(sa.use_modelscope)
+        self.assertEqual(sa.model_redirect_path, "/tmp/model-redirects.json")
+        self.assertEqual(sa.logging_config_path, "/tmp/logging.json")
+        self.assertFalse(sa.enable_numa_aware_worker_affinity)
+
+    def test_runtime_configuration_defaults_are_stable(self):
+        args = self._parse_args(["--model", "test/model"])
+        sa = self._from_cli_args_no_init(args)
+
+        self.assertFalse(sa.use_modelscope)
+        self.assertIsNone(sa.model_redirect_path)
+        self.assertIsNone(sa.logging_config_path)
+        self.assertTrue(sa.enable_numa_aware_worker_affinity)
+
     # ---- Tensor parallel size ----
 
     def test_tensor_parallel_size_maps_to_attn_tp_size(self):

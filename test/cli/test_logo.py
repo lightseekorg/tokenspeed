@@ -66,8 +66,7 @@ def test_render_logo_monochrome_omits_escape_codes():
     assert "Tokens at the speed of light · v0.0.0" in out
 
 
-def test_print_logo_writes_to_stream_with_color_on_tty(monkeypatch):
-    monkeypatch.delenv("TOKENSPEED_DISABLE_LOGO", raising=False)
+def test_print_logo_writes_to_stream_with_color_on_tty():
     buf = _TTYBuffer()
 
     print_logo("1.2.3", stream=buf)
@@ -77,8 +76,7 @@ def test_print_logo_writes_to_stream_with_color_on_tty(monkeypatch):
     assert "Tokens at the speed of light · v1.2.3" in buf.getvalue()
 
 
-def test_print_logo_omits_color_on_non_tty(monkeypatch):
-    monkeypatch.delenv("TOKENSPEED_DISABLE_LOGO", raising=False)
+def test_print_logo_omits_color_on_non_tty():
     buf = io.StringIO()  # isatty() -> False by default
 
     print_logo("1.2.3", stream=buf)
@@ -87,19 +85,17 @@ def test_print_logo_omits_color_on_non_tty(monkeypatch):
     assert "Tokens at the speed of light · v1.2.3" in buf.getvalue()
 
 
-def test_print_logo_disabled_via_env(monkeypatch):
+def test_print_logo_can_be_disabled_explicitly():
     buf = _TTYBuffer()
-    monkeypatch.setenv("TOKENSPEED_DISABLE_LOGO", "1")
 
-    print_logo("1.2.3", stream=buf)
+    print_logo("1.2.3", stream=buf, disabled=True)
 
     assert buf.getvalue() == ""
 
 
-def test_print_logo_zero_value_is_not_disabled(monkeypatch):
-    # "0" / "false" / "" must NOT count as "disabled" — only truthy strings.
+def test_print_logo_ignores_the_legacy_environment(monkeypatch):
     buf = _TTYBuffer()
-    monkeypatch.setenv("TOKENSPEED_DISABLE_LOGO", "0")
+    monkeypatch.setenv("TOKENSPEED_DISABLE_LOGO", "1")
 
     print_logo("1.2.3", stream=buf)
 

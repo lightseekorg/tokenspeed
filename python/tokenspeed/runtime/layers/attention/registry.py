@@ -47,11 +47,8 @@ from tokenspeed.runtime.layers.attention.utils import (
     profile_cache_budget,
     profile_max_num_pages,
 )
-from tokenspeed.runtime.utils.env import envs
 
 logger = logging.getLogger(__name__)
-
-_CI_SMALL_KV_SIZE = envs.TOKENSPEED_CI_SMALL_KV_SIZE.get_set_value_or(None)
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.configs.model_config import ModelConfig
@@ -939,8 +936,6 @@ def create_attn_components(
             server_args.max_total_tokens,
         )
 
-    if _CI_SMALL_KV_SIZE is not None and int(_CI_SMALL_KV_SIZE) > 0:
-        max_num_tokens = int(_CI_SMALL_KV_SIZE)
     if max_num_tokens <= 0:
         raise ValueError(
             f"KV cache token pool size must be positive, got {max_num_tokens}"

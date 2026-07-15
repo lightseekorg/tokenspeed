@@ -30,9 +30,29 @@ from unittest.mock import MagicMock
 import pytest
 
 from tokenspeed.cli._proc import (
+    spawn_engine,
     spawn_gateway,
     terminate_then_kill,
 )
+
+
+@pytest.mark.asyncio
+async def test_spawn_engine_uses_the_production_module_constant(monkeypatch):
+    captured = {}
+
+    async def fake_exec(*cmd, **kwargs):
+        captured["cmd"] = cmd
+        return object()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setenv("TS_SERVE_ENGINE_MODULE", "test.cli._fixtures.fake_engine")
+    await spawn_engine(["--model", "m"], host="127.0.0.1", port=12345)
+
+    assert captured["cmd"][:3] == (
+        sys.executable,
+        "-m",
+        "smg_grpc_servicer.tokenspeed",
+    )
 
 
 @pytest.mark.asyncio

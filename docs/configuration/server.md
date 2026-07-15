@@ -21,6 +21,11 @@ For a compact compatibility table, see
 | `--revision` | Model branch, tag, or commit. |
 | `--download-dir` | Hugging Face download/cache directory. |
 | `--hf-overrides` | JSON overrides for model configuration values. |
+| `--use-modelscope` / `--no-use-modelscope` | Select ModelScope instead of Hugging Face for remote model and tokenizer downloads. Disabled by default. |
+| `--model-redirect-path` | Explicit JSON or whitespace-delimited mapping from model IDs to local paths. |
+
+Hub selection and model redirection are request-independent server arguments;
+TokenSpeed does not infer either setting from the process environment.
 
 ## Precision And Quantization
 
@@ -55,6 +60,7 @@ file are present.
 | `--chat-template` | Built-in chat template name or template file path (handled by the smg gateway). |
 | `--stream-interval` | Streaming buffer interval in generated tokens. Smaller values stream more frequently. |
 | `--stream-output` | Return generated text as disjoint streaming segments. |
+| `--disable-logo` | Suppress the `ts serve` startup banner in non-interactive launchers. |
 
 ## Scheduler And Memory
 
@@ -76,6 +82,8 @@ file are present.
 `--chunked-prefill-size` is intentionally separate from
 `--max-num-batched-tokens`: in TokenSpeed it is the scheduler's per-iteration
 issue budget, while `--max-total-tokens` controls the global token pool.
+Use `--max-total-tokens` when a small deterministic token pool is needed for a
+test; there is no separate CI-only KV-size environment override.
 
 Longer-context override is an explicit CLI setting with no environment-variable
 alias. Enable it only when the checkpoint is known to support the requested
@@ -100,6 +108,7 @@ length; an invalid override can produce incorrect output or CUDA errors.
 | `--dist-init-addr` | Distributed initialization address. |
 | `--base-gpu-id` | First local GPU index assigned to the server. |
 | `--gpu-id-step` | Distance between assigned local GPU indices. For example, base `0` and step `2` selects `0,2,4,...`. |
+| `--enable-numa-aware-worker-affinity` / `--no-enable-numa-aware-worker-affinity` | Enable or disable NVIDIA worker pinning to the GPU-local CPU set. Enabled by default. |
 
 Use `--tensor-parallel-size` for simple launches. Use the
 TokenSpeed-specific split knobs when attention, dense, and MoE layers need
@@ -123,6 +132,13 @@ read `ENABLE_CP` from the process environment.
 Set backend choices explicitly in production. `auto` is useful for bring-up, but
 explicit values make benchmark comparisons and regressions easier to reason
 about.
+
+FlashInfer's generic workspace reservation is a stable runtime constant.
+Kernel-selection experiments use the explicit `override=` argument,
+`kernel_override(...)` context manager, or
+`load_config_overrides("/path/to/overrides.yaml")`. TokenSpeed-kernel does not
+read per-op override environment variables or automatically load a per-user
+override file.
 
 ## Multimodal Execution
 
@@ -245,6 +261,7 @@ draft model, and token count together.
 | --- | --- |
 | `--log-level` | Runtime log level. |
 | `--log-level-http` | HTTP server log level. Defaults to `--log-level` when unset. |
+| `--logging-config-path` | Explicit path to a JSON `logging.dictConfig` document. |
 | `--enable-log-requests` | Log request metadata and optionally payloads. |
 | `--log-requests-level` | Request logging verbosity. |
 | `--enable-log-request-stats` | Log a one-line per-request performance summary on finish/abort (see below). |
@@ -259,6 +276,10 @@ draft model, and token count together.
 It is an explicit per-server setting; environment variables do not enable it.
 The encoder timing path may synchronize CUDA, so leave it disabled for normal
 throughput measurements.
+
+Model execution always enters `torch.inference_mode`; this is a stable runtime
+policy rather than an operator-controlled environment switch. The detokenizer
+also uses a stable 65,536-request state capacity.
 
 ### Per-Request Stats
 

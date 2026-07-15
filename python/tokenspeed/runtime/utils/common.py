@@ -108,23 +108,22 @@ def get_device_module():
 
 
 def maybe_inference_mode():
-    from tokenspeed.runtime.utils.env import envs
+    """Return the production inference context.
 
-    if envs.TOKENSPEED_ENABLE_TORCH_INFERENCE_MODE.get():
-        return torch.inference_mode()
-    else:
-        return torch.no_grad()
+    TokenSpeed model execution always runs in inference mode. Keeping this as
+    a function preserves the decorator/context-manager call sites without a
+    hidden process-environment switch.
+    """
+    return torch.inference_mode()
 
 
-def maybe_set_numa_aware_cpu_affinity(device_id: int) -> None:
+def maybe_set_numa_aware_cpu_affinity(device_id: int, *, enabled: bool = True) -> None:
     """Pin the current process to ``device_id``'s NUMA-local CPU set.
 
-    NVIDIA-only optimization. No-op if the env var is False, the platform is not
-    NVIDIA, or the process already has a constrained affinity (e.g., taskset).
+    NVIDIA-only optimization. No-op when explicitly disabled, the platform is
+    not NVIDIA, or the process already has a constrained affinity (e.g., taskset).
     """
-    from tokenspeed.runtime.utils.env import envs
-
-    if not envs.TOKENSPEED_NUMA_AWARE_WORKER_AFFINITY.get():
+    if not enabled:
         return
     platform = current_platform()
     if not platform.is_nvidia:
@@ -416,10 +415,13 @@ def add_api_key_middleware(app, api_key: str):
         return await call_next(request)
 
 
-def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):
-    from tokenspeed.runtime.utils.env import envs
-
-    if envs.TOKENSPEED_USE_MODELSCOPE.get():
+def prepare_model_and_tokenizer(
+    model_path: str,
+    tokenizer_path: str,
+    *,
+    use_modelscope: bool = False,
+):
+    if use_modelscope:
         if not os.path.exists(model_path):
             from modelscope import snapshot_download
 
@@ -438,17 +440,15 @@ def configure_logger(server_args, prefix: str = ""):
     LOG_LEVEL = server_args.log_level.upper()
 
     from tokenspeed._logging import suppress_noisy_third_party_logs
-    from tokenspeed.runtime.utils.env import envs
 
     suppress_noisy_third_party_logs()
 
-    if TOKENSPEED_LOGGING_CONFIG_PATH := envs.TOKENSPEED_LOGGING_CONFIG_PATH.get():
-        if not os.path.exists(TOKENSPEED_LOGGING_CONFIG_PATH):
+    if logging_config_path := server_args.logging_config_path:
+        if not os.path.exists(logging_config_path):
             raise FileNotFoundError(
-                "Setting TOKENSPEED_LOGGING_CONFIG_PATH from env with "
-                f"{TOKENSPEED_LOGGING_CONFIG_PATH} but it does not exist!"
+                f"--logging-config-path does not exist: {logging_config_path}"
             )
-        with open(TOKENSPEED_LOGGING_CONFIG_PATH, encoding="utf-8") as file:
+        with open(logging_config_path, encoding="utf-8") as file:
             custom_config = json.loads(file.read())
         logging.config.dictConfig(custom_config)
         suppress_noisy_third_party_logs()
@@ -1144,17 +1144,13 @@ def _maybe_space_split_dict(path: str | os.PathLike) -> dict[str, str]:
     return parsed_dict
 
 
-def maybe_model_redirect(model: str) -> str:
+def maybe_model_redirect(model: str, model_redirect_path: str | None = None) -> str:
     """
     Use model_redirect to redirect the model name to a local folder.
 
     :param model: hf model name
     :return: maybe redirect to a local folder
     """
-
-    from tokenspeed.runtime.utils.env import envs
-
-    model_redirect_path = envs.TOKENSPEED_MODEL_REDIRECT_PATH.get()
 
     if not model_redirect_path:
         return model

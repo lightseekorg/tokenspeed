@@ -18,9 +18,18 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-DEFAULT_FLASHINFER_WORKSPACE_SIZE = 384 * 1024 * 1024
+"""Test-only ``ts serve`` entry point that injects the fake gRPC engine."""
+
+from tokenspeed.cli import _proc
 
 
-def get_flashinfer_workspace_size() -> int:
-    """Return TokenSpeed's fixed FlashInfer workspace reservation in bytes."""
-    return DEFAULT_FLASHINFER_WORKSPACE_SIZE
+def main() -> None:
+    _proc._ENGINE_MODULE_DEFAULT = "test.cli._fixtures.fake_engine"
+
+    from tokenspeed.cli.__main__ import main as cli_main
+
+    cli_main()
+
+
+if __name__ == "__main__":
+    main()

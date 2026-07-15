@@ -720,10 +720,9 @@ def run_smg_from_args(args: argparse.Namespace, raw_argv: list[str]) -> None:
     except ImportError:
         pass
 
-    print_logo()
-
     _check_serve_extra_installed()
     split = split_argv(raw_argv)
+    print_logo(disabled=split.opts.disable_logo)
     engine_args, gateway_args = _args_with_default_model_parsers(
         split.engine, split.gateway
     )
