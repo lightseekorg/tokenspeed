@@ -16,7 +16,7 @@ permissions:
   contents: read
 
 env:
-  IMAGE: lightseek/tokenspeed-amd
+  IMAGE: lightseekorg/tokenspeed-amd
 
 jobs:
   build-and-push:
