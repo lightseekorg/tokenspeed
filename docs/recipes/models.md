@@ -6,6 +6,65 @@ set only the parameters that change runtime behavior.
 The commands below are templates. Validate exact model IDs, checkpoint formats,
 and backend choices against the build you deploy.
 
+## Inkling
+
+Blog: https://lightseek.org/blog/lightseek-tokenspeed.html
+
+```bash
+## Docker
+
+### nvidia
+docker pull lightseekorg/tokenspeed:tml
+### amd
+docker pull lightseekorg/tokenspeed-amd:tml
+
+## Launch command
+
+# nvidia
+ts serve \
+    --model thinkingmachines/Inkling-NVFP4 \
+    --attn-tp-size 4 \
+    --moe-tp-size 4 \
+    --max-model-len 81920 \
+    --max-num-seqs 16 \
+    --max-prefill-tokens 8192 \
+    --chunked-prefill-size 8192 \
+    --gpu-memory-utilization 0.95 \
+    --disable-cuda-graph-padding \
+    --trust-remote-code \
+    --attention-backend fa4 \
+    --moe-backend flashinfer_trtllm \
+    --enable-prefix-caching \
+    --disable-kvstore \
+    --block-size 128 \
+    --enable-cache-report \
+    --speculative-algorithm MTP \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4
+
+# amd
+ts serve \
+    --model lightseekorg/Inkling-MXFP4 \
+    --attn-tp-size 4 \
+    --moe-tp-size 4 \
+    --max-model-len 81920 \
+    --max-num-seqs 16 \
+    --max-prefill-tokens 8192 \
+    --chunked-prefill-size 8192 \
+    --gpu-memory-utilization 0.95 \
+    --disable-cuda-graph-padding \
+    --trust-remote-code \
+    --enable-prefix-caching \
+    --disable-kvstore \
+    --block-size 128 \
+    --enable-cache-report \
+    --speculative-algorithm MTP \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4
+```
+
 ## Kimi K2.5 / K2.6
 
 Kimi-style MoE launches usually need remote code, long context, reasoning and
