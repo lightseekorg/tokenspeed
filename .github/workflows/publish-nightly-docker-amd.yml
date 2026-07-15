@@ -2,6 +2,11 @@ name: Publish AMD Nightly Docker Image
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Optional Docker image tag. Defaults to nightly-<short SHA>.
+        required: false
+        type: string
 
 concurrency:
   group: publish-nightly-docker-amd-${{ github.ref }}
@@ -45,7 +50,15 @@ jobs:
 
       - name: Derive image tag
         id: tag
-        run: echo "tag=nightly-${GITHUB_SHA::6}" >> "$GITHUB_OUTPUT"
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          tag="${INPUT_TAG:-nightly-${GITHUB_SHA::6}}"
+          if [[ ! "$tag" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+            echo "::error::Invalid image tag: ${tag}" >&2
+            exit 1
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
 
       - name: Build and push
         uses: docker/build-push-action@v6

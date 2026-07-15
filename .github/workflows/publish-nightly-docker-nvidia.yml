@@ -2,6 +2,11 @@ name: Publish NVIDIA Nightly Docker Image
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Optional Docker image tag. Defaults to nightly-<short SHA>.
+        required: false
+        type: string
 
 concurrency:
   group: publish-nightly-docker-nvidia-${{ github.ref }}
@@ -103,13 +108,26 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Derive image tag
+        id: tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          tag="${INPUT_TAG:-nightly-${GITHUB_SHA::6}}"
+          if [[ ! "$tag" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+            echo "::error::Invalid image tag: ${tag}" >&2
+            exit 1
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
       - name: Create multi-platform manifest
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
         run: |
           refs=()
           for digest in "${RUNNER_TEMP}"/digests/*; do
             refs+=("${IMAGE}@sha256:$(basename "${digest}")")
           done
-          short_sha="${GITHUB_SHA::6}"
           docker buildx imagetools create \
-            --tag "${IMAGE}:nightly-${short_sha}" \
+            --tag "${IMAGE}:${TAG}" \
             "${refs[@]}"
