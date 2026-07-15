@@ -85,6 +85,7 @@ class CollectConfig:
     server_info_timeout_seconds: float
     autoregressive_repeats: int = 3
     seed: int = 20260715
+    server_info_base_url: str | None = None
 
     def validate(self) -> None:
         if not self.arm.strip():
@@ -93,6 +94,12 @@ class CollectConfig:
             raise BenchmarkError("--model must not be empty")
         if not self.base_url.startswith(("http://", "https://")):
             raise BenchmarkError("--base-url must start with http:// or https://")
+        if self.server_info_base_url is not None and not (
+            self.server_info_base_url.startswith(("http://", "https://"))
+        ):
+            raise BenchmarkError(
+                "--server-info-base-url must start with http:// or https://"
+            )
         if not self.server_sha.strip():
             raise BenchmarkError("--server-sha must not be empty")
         if self.request_timeout_seconds <= 0:
@@ -375,9 +382,14 @@ def _parse_sampled_logprobs(
             raise BenchmarkError(
                 f"output logprob at position {position} has an unsupported shape"
             )
-        if isinstance(token_id, bool) or not isinstance(token_id, int):
+        if isinstance(token_id, bool) or not isinstance(token_id, (int, float)):
             raise BenchmarkError(
-                f"output logprob token ID at position {position} is not an integer"
+                f"output logprob token ID at position {position} is not numeric"
+            )
+        normalized_token_id = int(token_id)
+        if float(normalized_token_id) != float(token_id):
+            raise BenchmarkError(
+                f"output logprob token ID at position {position} is not integral"
             )
         if isinstance(logprob, bool) or not isinstance(logprob, (int, float)):
             raise BenchmarkError(
@@ -386,12 +398,12 @@ def _parse_sampled_logprobs(
         value = float(logprob)
         if not math.isfinite(value):
             raise BenchmarkError(f"output logprob at position {position} is non-finite")
-        if token_id != output_ids[position]:
+        if normalized_token_id != output_ids[position]:
             raise BenchmarkError(
                 f"output ID/logprob token mismatch at position {position}: "
                 f"{output_ids[position]} versus {token_id}"
             )
-        parsed.append({"token_id": token_id, "logprob": value})
+        parsed.append({"token_id": normalized_token_id, "logprob": value})
     return parsed
 
 
@@ -458,7 +470,8 @@ def collect_arm(config: CollectConfig, http_client: HttpClient | None = None) ->
     config.validate()
     reference = load_reference(config.reference_path)
     client = http_client or UrlLibJsonClient()
-    info_url = _join_url(config.base_url, config.server_info_path)
+    server_info_base_url = config.server_info_base_url or config.base_url
+    info_url = _join_url(server_info_base_url, config.server_info_path)
     generate_url = _join_url(config.base_url, config.generate_path)
     raw_info = client.get_json(info_url, config.server_info_timeout_seconds)
     server_info, server_args = _extract_server_args(raw_info)
@@ -483,6 +496,7 @@ def collect_arm(config: CollectConfig, http_client: HttpClient | None = None) ->
             "base_url": config.base_url,
             "generate_url": generate_url,
             "server_info_url": info_url,
+            "server_info_base_url": server_info_base_url,
             "request_timeout_seconds": config.request_timeout_seconds,
             "server_info_timeout_seconds": config.server_info_timeout_seconds,
             "autoregressive_repeats": config.autoregressive_repeats,
@@ -1071,6 +1085,10 @@ def build_parser() -> argparse.ArgumentParser:
     collect_parser.add_argument("--reference", required=True, type=Path)
     collect_parser.add_argument("--output", required=True, type=Path)
     collect_parser.add_argument("--base-url", required=True)
+    collect_parser.add_argument(
+        "--server-info-base-url",
+        help="base URL for TokenSpeed control-plane provenance; defaults to --base-url",
+    )
     collect_parser.add_argument("--generate-path", default="/generate")
     collect_parser.add_argument("--server-info-path", default="/get_server_info")
     collect_parser.add_argument("--server-sha", required=True)
@@ -1111,6 +1129,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 server_info_timeout_seconds=args.server_info_timeout_seconds,
                 autoregressive_repeats=args.autoregressive_repeats,
                 seed=args.seed,
+                server_info_base_url=args.server_info_base_url,
             )
             artifact = collect_arm(config)
             summary = {

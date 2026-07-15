@@ -109,7 +109,7 @@ class FakeHttpClient:
         else:
             output_ids = list(self.autoregressive[input_ids])
         logprobs = [
-            [-0.2 - position * 0.01 + self.logprob_offset, token_id, None]
+            [-0.2 - position * 0.01 + self.logprob_offset, float(token_id), None]
             for position, token_id in enumerate(output_ids)
         ]
         return {
@@ -135,6 +135,7 @@ def _collect(tmp_path, arm, dtype, reference_path, logprob_offset=0.0):
         server_info_timeout_seconds=7,
         autoregressive_repeats=3,
         seed=20260715,
+        server_info_base_url="http://127.0.0.1:8124",
     )
     artifact = quality.collect_arm(config, client)
     return output_path, artifact, client
@@ -152,7 +153,7 @@ def test_loads_fixed_reference_and_singleton_generation_response(tmp_path):
         [
             {
                 "output_ids": [17],
-                "meta_info": {"output_token_logprobs": [[-0.25, 17, None]]},
+                "meta_info": {"output_token_logprobs": [[-0.25, 17.0, None]]},
             }
         ]
     )
@@ -162,6 +163,14 @@ def test_loads_fixed_reference_and_singleton_generation_response(tmp_path):
     assert len(reference.sha256) == 64
     assert parsed["output_ids"] == [17]
     assert parsed["sampled_logprobs"] == [{"token_id": 17, "logprob": -0.25}]
+
+    with pytest.raises(quality.BenchmarkError, match="not integral"):
+        quality.parse_generation_response(
+            {
+                "output_ids": [17],
+                "meta_info": {"output_token_logprobs": [[-0.25, 17.5, None]]},
+            }
+        )
 
 
 def test_collect_checkpoints_all_requests_with_fixed_sampling_and_provenance(tmp_path):
@@ -190,7 +199,8 @@ def test_collect_checkpoints_all_requests_with_fixed_sampling_and_provenance(tmp
         "request_timeout_seconds": 11,
         "seed": 20260715,
         "server_info_timeout_seconds": 7,
-        "server_info_url": "http://127.0.0.1:8123/get_server_info",
+        "server_info_base_url": "http://127.0.0.1:8124",
+        "server_info_url": "http://127.0.0.1:8124/get_server_info",
         "temperature": 0,
         "top_k": 1,
     }

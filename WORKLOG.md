@@ -212,7 +212,9 @@ identical except for `kv_cache_dtype`; pin `--seed 20260715` on both launches.
 The normalized copy excludes only the process-local internal gRPC and
 RL-control ports allocated by `tokenspeed serve`, while raw server info keeps
 both. The compare step also rejects a SHA, reference, arm-label, or cache-dtype
-mismatch.
+mismatch. The SMG user gateway serves generation on 8123, while TokenSpeed's
+control server serves provenance on 8124; the harness accepts both URLs
+explicitly.
 
 ```bash
 .venv/bin/python test/quality_benchmark/tokenspeed/minimax_m3_fixed_reference.py collect \
@@ -221,6 +223,7 @@ mismatch.
   --reference /raid/flamingo/runs/minimax_m3_phase3_graph_797ce7e3c4f_20260714T172549Z/hf_reference_tp4_results.json \
   --output /raid/flamingo/runs/minimax_m3_phase5_20260715/quality_bf16.json \
   --base-url http://127.0.0.1:8123 \
+  --server-info-base-url http://127.0.0.1:8124 \
   --server-sha "$(git rev-parse HEAD)" \
   --seed 20260715 \
   --request-timeout-seconds 600 \

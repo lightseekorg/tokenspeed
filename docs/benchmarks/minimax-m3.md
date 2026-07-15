@@ -168,6 +168,9 @@ with its raw IDs/logprobs, server args, server SHA, and reference SHA256.
 Pin `--seed 20260715` on both server launches. The comparable server-args copy
 excludes only the process-local internal gRPC and RL-control ports allocated by
 `tokenspeed serve`; both values remain in the raw server-info payload.
+With the SMG launcher, generation uses the user gateway (8123 in this example)
+while provenance comes from the TokenSpeed control server (8124), so pass both
+base URLs explicitly.
 
 ```bash
 .venv/bin/python test/quality_benchmark/tokenspeed/minimax_m3_fixed_reference.py collect \
@@ -176,6 +179,7 @@ excludes only the process-local internal gRPC and RL-control ports allocated by
   --reference /raid/flamingo/runs/minimax_m3_phase3_graph_797ce7e3c4f_20260714T172549Z/hf_reference_tp4_results.json \
   --output /raid/flamingo/runs/minimax_m3_phase5_20260715/quality_bf16.json \
   --base-url http://127.0.0.1:8123 \
+  --server-info-base-url http://127.0.0.1:8124 \
   --server-sha "$(git rev-parse HEAD)" \
   --seed 20260715 \
   --request-timeout-seconds 600 \
