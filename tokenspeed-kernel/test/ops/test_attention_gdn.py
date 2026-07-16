@@ -431,6 +431,9 @@ def _make_decode_inputs(
     num_v_heads: int = 8,
     head_dim: int = 128,
     pool_size: int = 16,
+    state_dtype: torch.dtype | None = None,
+    parameter_dtype: torch.dtype = torch.float32,
+    parameter_requires_grad: bool = False,
 ):
     torch.manual_seed(7)
     q = torch.randn(batch, T, num_q_heads, head_dim, device=device, dtype=dtype)
@@ -438,12 +441,21 @@ def _make_decode_inputs(
     v = torch.randn(batch, T, num_v_heads, head_dim, device=device, dtype=dtype) * 0.5
     a = torch.randn(batch, T, num_v_heads, device=device, dtype=torch.float32)
     b = torch.randn(batch, T, num_v_heads, device=device, dtype=torch.float32)
-    A_log = torch.randn(num_v_heads, device=device, dtype=torch.float32)
-    dt_bias = torch.randn(num_v_heads, device=device, dtype=torch.float32)
+    A_log = torch.randn(num_v_heads, device=device, dtype=parameter_dtype)
+    dt_bias = torch.randn(num_v_heads, device=device, dtype=parameter_dtype)
+    if parameter_requires_grad:
+        A_log = torch.nn.Parameter(A_log)
+        dt_bias = torch.nn.Parameter(dt_bias)
     # K-last pool [pool_size, HV, V, K], small values to keep the recurrence stable.
+    state_dtype = dtype if state_dtype is None else state_dtype
     pool = (
         torch.randn(
-            pool_size, num_v_heads, head_dim, head_dim, device=device, dtype=dtype
+            pool_size,
+            num_v_heads,
+            head_dim,
+            head_dim,
+            device=device,
+            dtype=state_dtype,
         )
         * 0.02
     )
@@ -451,12 +463,32 @@ def _make_decode_inputs(
 
 
 @pytest.mark.parametrize("solution", ["triton", "flashinfer"])
-def test_gdn_decode_step_matches_torch_reference(device: str, solution: str, require):
+@pytest.mark.parametrize(
+    ("state_dtype", "parameter_dtype", "parameter_requires_grad"),
+    [
+        (torch.bfloat16, torch.float32, False),
+        (torch.float32, torch.bfloat16, True),
+        (torch.float32, torch.float32, True),
+    ],
+)
+def test_gdn_decode_step_matches_torch_reference(
+    device: str,
+    solution: str,
+    state_dtype: torch.dtype,
+    parameter_dtype: torch.dtype,
+    parameter_requires_grad: bool,
+    require,
+):
     # T=1 decode step, in-place state update (output_state_indices=None).
     require("attention", "gdn_decode_step", solution, torch.bfloat16, "q")
 
     q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
-        device=device, dtype=torch.bfloat16, T=1
+        device=device,
+        dtype=torch.bfloat16,
+        T=1,
+        state_dtype=state_dtype,
+        parameter_dtype=parameter_dtype,
+        parameter_requires_grad=parameter_requires_grad,
     )
     read_idx = torch.tensor([1, 3, 5, 7], device=device, dtype=torch.int32)
     scale = q.shape[-1] ** -0.5
@@ -616,8 +648,21 @@ def test_gdn_decode_step_padding_index_is_isolated(device: str, solution: str, r
 
 
 @pytest.mark.parametrize("solution", ["triton", "flashinfer"])
+@pytest.mark.parametrize(
+    ("state_dtype", "parameter_dtype", "parameter_requires_grad"),
+    [
+        (torch.bfloat16, torch.float32, False),
+        (torch.float32, torch.bfloat16, True),
+        (torch.float32, torch.float32, True),
+    ],
+)
 def test_gdn_decode_mtp_intermediate_states_buffer_matches_reference(
-    device: str, solution: str, require
+    device: str,
+    solution: str,
+    state_dtype: torch.dtype,
+    parameter_dtype: torch.dtype,
+    parameter_requires_grad: bool,
+    require,
 ):
     # T>1 MTP verify: every step's post-update state must land in
     # intermediate_states_buffer[i_n, step], and the pool itself must stay
@@ -626,7 +671,12 @@ def test_gdn_decode_mtp_intermediate_states_buffer_matches_reference(
 
     T = 3
     q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
-        device=device, dtype=torch.bfloat16, T=T
+        device=device,
+        dtype=torch.bfloat16,
+        T=T,
+        state_dtype=state_dtype,
+        parameter_dtype=parameter_dtype,
+        parameter_requires_grad=parameter_requires_grad,
     )
     read_idx = torch.tensor([1, 3, 5, 7], device=device, dtype=torch.int32)
     scale = q.shape[-1] ** -0.5

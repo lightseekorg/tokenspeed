@@ -256,9 +256,11 @@ def gdn_decode_step(
         q: Query tensor shaped ``[B, 1, num_q_heads, head_dim]``.
         k: Key tensor shaped ``[B, 1, num_q_heads, head_dim]``.
         v: Value tensor shaped ``[B, 1, num_v_heads, head_v_dim]``.
-        A_log: Log decay parameter shaped ``[num_v_heads]``.
+        A_log: Floating-point log decay parameter shaped ``[num_v_heads]``.
+            Backends that require FP32 normalize it internally.
         a: Input-dependent decay shaped ``[B, 1, num_v_heads]``.
-        dt_bias: Decay bias shaped ``[num_v_heads]``.
+        dt_bias: Floating-point decay bias shaped ``[num_v_heads]``. Backends
+            that require FP32 normalize it internally.
         b: Update-gate (beta) input shaped ``[B, 1, num_v_heads]``.
         initial_state: SSM state pool, K-last ``[pool_size, num_v_heads,
             head_v_dim, head_dim]`` (matches the runtime's SSM state pool).
@@ -336,9 +338,11 @@ def gdn_decode_mtp(
         q: Query tensor shaped ``[B, T, num_q_heads, head_dim]``.
         k: Key tensor shaped ``[B, T, num_q_heads, head_dim]``.
         v: Value tensor shaped ``[B, T, num_v_heads, head_v_dim]``.
-        A_log: Log decay parameter shaped ``[num_v_heads]``.
+        A_log: Floating-point log decay parameter shaped ``[num_v_heads]``.
+            Backends that require FP32 normalize it internally.
         a: Input-dependent decay shaped ``[B, T, num_v_heads]``.
-        dt_bias: Decay bias shaped ``[num_v_heads]``.
+        dt_bias: Floating-point decay bias shaped ``[num_v_heads]``. Backends
+            that require FP32 normalize it internally.
         b: Update-gate (beta) input shaped ``[B, T, num_v_heads]``.
         initial_state: SSM state pool, K-last ``[pool_size, num_v_heads,
             head_v_dim, head_dim]`` (matches the runtime's SSM state pool).
