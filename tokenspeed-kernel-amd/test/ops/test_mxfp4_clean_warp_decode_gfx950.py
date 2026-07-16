@@ -1541,3 +1541,167 @@ def test_package_prefill_stage2_bm128_matches_ragged_reference(
     torch.cuda.synchronize()
 
     torch.testing.assert_close(out.float(), ref.float(), rtol=0.0, atol=0.0)
+
+
+@pytest.mark.parametrize(
+    "normalize, rsf, expect_bail",
+    [
+        (False, 2.5, True),  # divergent: grouped-one-group, unnormalized, rsf!=1
+        (True, 2.5, False),  # normalized -> gluon kernel matches generic
+        (False, 1.0, False),  # rsf==1 -> scaling is a no-op, matches generic
+    ],
+)
+def test_route_owned_bails_on_unnormalized_grouped_scaling(
+    normalize: bool,
+    rsf: float,
+    expect_bail: bool,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Route-owned decode must defer the grouped-one-group unnormalized-scaling
+    case to the generic path.
+
+    For n_group == topk_group == 1 with no correction bias, the generic path
+    (default_grouped_route -> _grouped_topk_reference) does NOT apply
+    routed_scaling_factor when weights are unnormalized
+    (scale_when_unnormalized=False), but invoke_softmax_topk_route_gluon always
+    multiplies by ROUTED_SCALING_FACTOR. Route-owned decode must return None
+    (bail to generic) in that config, and must NOT bail when the config is safe
+    (normalized, or routed_scaling_factor == 1).
+    """
+    n_tokens = 8
+    hidden = torch.empty((n_tokens, 8), device="cuda", dtype=torch.bfloat16)
+    router = torch.randn((n_tokens, 8), device="cuda", dtype=torch.bfloat16)
+    dummy_w = torch.empty((1, 4, 4), device="cuda", dtype=torch.uint8)
+    dummy_scale = torch.empty((1, 4, 1), device="cuda", dtype=torch.uint8)
+
+    route_called = 0
+
+    def spy_softmax_route(*args, **kwargs):
+        nonlocal route_called
+        route_called += 1
+        # Return shape-correct dummies so the (unused for this assertion)
+        # downstream decode returns None on the dummy weights.
+        ids = torch.zeros((n_tokens, 2), device="cuda", dtype=torch.int32)
+        wts = torch.ones((n_tokens, 2), device="cuda", dtype=torch.float32)
+        return ids, wts
+
+    import tokenspeed_kernel_amd.ops.moe.gluon_a4w4_gfx950.routing as routing_mod
+
+    monkeypatch.setattr(
+        routing_mod, "invoke_softmax_topk_route_gluon", spy_softmax_route
+    )
+
+    out = fused_mxfp_gfx950._maybe_route_owned_mxfp4_mfma_decode(
+        hidden,
+        router,
+        dummy_w,
+        dummy_w,
+        w13_mx_scale=dummy_scale,
+        w2_mx_scale=dummy_scale,
+        top_k=2,
+        correction_bias=None,
+        n_group=1,
+        topk_group=1,
+        routed_scaling_factor=rsf,
+        normalize_topk_weights=normalize,
+        routing_method_type=0,
+        w13_bias=None,
+        w2_bias=None,
+        out_dtype=torch.bfloat16,
+        max_m=fused_mxfp_gfx950._DECODE_MAX_M,
+        swiglu_alpha=1.702,
+        swiglu_limit=7.0,
+        swiglu_beta=1.0,
+        allow_generic_fallback=False,
+    )
+
+    if expect_bail:
+        # Guard fired before routing: no gluon route call, returns None.
+        assert out is None
+        assert route_called == 0
+    else:
+        # Safe config: the guard did not fire, so the gluon route ran (the
+        # decode then returns None on the dummy weights, which is fine here --
+        # we only assert the guard let it through to routing).
+        assert route_called == 1
+
+
+@pytest.mark.parametrize("num_tokens", [4, 8])
+def test_route_owned_grouped_unnormalized_matches_generic(num_tokens: int):
+    """End-to-end: the divergent config must match the generic path exactly.
+
+    With the guard in place, the grouped-one-group unnormalized-scaling config
+    is deferred to the generic route, so gluon_mxfp_dynamic_mxfp4_fused_moe must
+    produce the same result as the generic ragged path (decode disabled).
+    """
+    hidden_size = 1024
+    intermediate_size = 512
+    num_experts = 8
+    topk = 2
+    rsf = 2.5
+    device = "cuda"
+    gen = torch.Generator(device=device).manual_seed(20260716 + num_tokens)
+    hidden = (
+        torch.randn(
+            (num_tokens, hidden_size),
+            device=device,
+            dtype=torch.bfloat16,
+            generator=gen,
+        )
+        * 0.01
+    ).contiguous()
+    router = torch.randn(
+        (num_tokens, num_experts), device=device, dtype=torch.bfloat16, generator=gen
+    )
+    w13, w13_scale, w2, w2_scale = _make_weights(
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        device=device,
+    )
+    layer = _make_preprocessed_layer(
+        w13,
+        w13_scale,
+        w2,
+        w2_scale,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        device=device,
+    )
+
+    def run():
+        return fused_mxfp_gfx950.gluon_mxfp_dynamic_mxfp4_fused_moe(
+            hidden,
+            router,
+            layer.w13_weight_triton_tensor,
+            layer.w2_weight_triton_tensor,
+            w13_mx_scale=layer.w13_precision_config.b_mx_scale,
+            w2_mx_scale=layer.w2_precision_config.b_mx_scale,
+            top_k=topk,
+            correction_bias=None,
+            n_group=1,
+            topk_group=1,
+            routed_scaling_factor=rsf,
+            normalize_topk_weights=False,
+            routing_method_type=0,
+            w13_bias=None,
+            w2_bias=None,
+        )
+
+    # Reference: force the fully-generic path (no decode fast path).
+    import unittest.mock as _mock
+
+    with _mock.patch.object(
+        fused_mxfp_gfx950,
+        "_maybe_route_owned_mxfp4_mfma_decode",
+        lambda *a, **k: None,
+    ):
+        ref = run()
+        torch.cuda.synchronize()
+
+    # Real path: the guard should defer this config to the same generic route.
+    out = run()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(out.float(), ref.float(), rtol=0.0, atol=0.0)

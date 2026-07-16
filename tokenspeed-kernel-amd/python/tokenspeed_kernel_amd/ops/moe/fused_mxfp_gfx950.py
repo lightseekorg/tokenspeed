@@ -8145,6 +8145,24 @@ def _maybe_route_owned_mxfp4_mfma_decode(
             return None
         if correction_bias is not None and (n_group != 0 or topk_group != 0):
             return None
+        # Scaling-semantics guard. For the grouped-one-group config
+        # (n_group == topk_group == 1) the generic path routes through
+        # ``default_grouped_route`` -> ``_grouped_topk_reference``, which does
+        # NOT apply ``routed_scaling_factor`` when weights are left unnormalized
+        # (scale_when_unnormalized=False). ``invoke_softmax_topk_route_gluon``
+        # always multiplies by ROUTED_SCALING_FACTOR, so those two disagree by
+        # exactly ``routed_scaling_factor`` for unnormalized weights. Defer that
+        # case to the generic path so results are unchanged. (The non-grouped
+        # n_group==topk_group==0 case uses default_scaled_route ->
+        # _softmax_topk_reference with scale_when_unnormalized=True, which
+        # matches the gluon kernel, so it is safe here.)
+        uses_grouped = _uses_grouped_routing(n_group, topk_group)
+        if (
+            uses_grouped
+            and not normalize_topk_weights
+            and float(routed_scaling_factor) != 1.0
+        ):
+            return None
         topk_ids, topk_weights = invoke_softmax_topk_route_gluon(
             router_logits,
             top_k,
