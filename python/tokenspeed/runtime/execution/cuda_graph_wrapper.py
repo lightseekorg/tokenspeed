@@ -63,10 +63,15 @@ logger = get_colorful_logger(__name__)
 
 
 _is_capture_mode = False
+_is_cuda_graph_phase = False
 
 
 def get_is_capture_mode() -> bool:
     return _is_capture_mode
+
+
+def get_is_cuda_graph_phase() -> bool:
+    return _is_cuda_graph_phase
 
 
 def _should_update_mamba_state_after_mtp_verify(
@@ -455,6 +460,9 @@ class CudaGraphWrapper:
                 )
             return self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
 
+        global _is_cuda_graph_phase
+        _is_cuda_graph_phase = True
+
         # Warm up before capture.
         for _ in range(4):
             torch.cuda.synchronize()
@@ -496,6 +504,7 @@ class CudaGraphWrapper:
         torch.cuda.synchronize()
         dist.barrier()
         _is_capture_mode = False
+        _is_cuda_graph_phase = False
 
         # Graph capture records the hostfunc launches without invoking
         # them, so the dummy run_once pushed stays queued — drain it, and
@@ -510,6 +519,7 @@ class CudaGraphWrapper:
             self.capturable_grammar.reset_state()
 
         global_graph_memory_pool = graph.pool()
+
         return graph, out
 
     def _capture_paged_cache_block_tables(self, bs: int, pool) -> dict | None:
@@ -895,6 +905,10 @@ class CudaGraphWrapper:
                         **draft_kwargs,
                     )
             else:
+                from tokenspeed.runtime.execution.drafter.dflash import DFlash
+
+                if isinstance(self.drafter, DFlash):
+                    return
                 draft_metadata_seq_lens = (
                     seq_lens if self.use_v4_mtp_paged_metadata else draft_seq_lens
                 )

@@ -902,6 +902,15 @@ class Qwen3_5ForCausalLM(nn.Module):
         # Final normalization
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        # For DFLASH speculative decoding: set of layer indices whose
+        # *input* hidden states are captured. Populated by
+        # set_eagle3_layers_to_capture() / set_dflash_layers_to_capture().
+        self.layers_to_capture: set = set()
+        self._dflash_incremental_callback = None
+        self._dflash_slot_bufs = None
+        self._dflash_capture_idx_map = {}
+        self._dflash_incr_active = False
+
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
 
@@ -930,9 +939,32 @@ class Qwen3_5ForCausalLM(nn.Module):
             hidden_states = input_embeds
             residual = None
 
+        aux_hidden_states = [] if self.layers_to_capture else None
+
         # Pass through decoder layers
         for layer_idx in range(len(self.layers)):
             layer = self.layers[layer_idx]
+            if aux_hidden_states is not None and layer_idx in self.layers_to_capture:
+                # Under RSAG the inter-layer hidden/residual are reduce-scattered
+                # across the attn TP group; aux consumers (e.g. the DFLASH
+                # drafter) expect full rows, so gather before capturing.
+                aux = (
+                    hidden_states + residual if residual is not None else hidden_states
+                )
+                gathered = layer.comm_manager.gather_residual(aux, ctx)
+                capture_idx = self._dflash_capture_idx_map.get(layer_idx)
+                if (
+                    self._dflash_incr_active
+                    and self._dflash_incremental_callback is not None
+                    and self._dflash_slot_bufs is not None
+                    and capture_idx is not None
+                ):
+                    num_tokens = gathered.shape[0]
+                    self._dflash_slot_bufs[capture_idx][:num_tokens].copy_(gathered)
+                    self._dflash_incremental_callback(capture_idx, num_tokens)
+                aux_hidden_states.append(
+                    gathered if gathered is aux else gathered.clone()
+                )
             with get_global_expert_distribution_recorder().with_current_layer(
                 layer_idx
             ):
@@ -960,7 +992,7 @@ class Qwen3_5ForCausalLM(nn.Module):
             hidden_states, residual, ctx, self.norm
         )
 
-        return hidden_states, None
+        return hidden_states, aux_hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -1325,6 +1357,32 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
+
+    def set_dflash_layers_to_capture(
+        self,
+        layer_ids: list[int],
+        incremental_callback=None,
+        slot_bufs: list | None = None,
+    ) -> None:
+        # DFLASH checkpoints name 0-indexed target layer outputs. The capture
+        # check runs before layer i, so capture at i + 1 for layer i's output.
+        num_layers = len(self.model.layers)
+        if len(set(layer_ids)) != len(layer_ids):
+            raise ValueError("DFLASH target_layer_ids must be unique.")
+        invalid = [val for val in layer_ids if val < 0 or val + 1 >= num_layers]
+        if invalid:
+            raise ValueError(
+                "DFLASH target_layer_ids must map to capturable target layer "
+                f"outputs. Got invalid ids {invalid}; valid range is "
+                f"[0, {num_layers - 2}] for {num_layers} target layers."
+            )
+        self.model.layers_to_capture = {val + 1 for val in layer_ids}
+        sorted_capture_layers = sorted(self.model.layers_to_capture)
+        self.model._dflash_capture_idx_map = {
+            layer_idx: i for i, layer_idx in enumerate(sorted_capture_layers)
+        }
+        self.model._dflash_incremental_callback = incremental_callback
+        self.model._dflash_slot_bufs = slot_bufs
 
     @torch.no_grad()
     def forward(
