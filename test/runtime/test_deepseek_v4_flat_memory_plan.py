@@ -42,6 +42,7 @@ def _load(mod_name: str, file_name: str):
     return mod
 
 
+_contract = _load("tokenspeed.runtime.configs.flat_kv_contract", "flat_kv_contract.py")
 _generic = _load("tokenspeed.runtime.configs.paged_cache_spec", "paged_cache_spec.py")
 _v4 = _load("deepseek_v4_cache_spec_flat_plan_test", "deepseek_v4_cache_spec.py")
 _plan = _load("flat_memory_plan_v4_test", "flat_memory_plan.py")

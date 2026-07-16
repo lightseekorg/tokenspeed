@@ -327,6 +327,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("enable_mixed_prefill_decode", &tokenspeed::SchedulerConfig::enable_mixed_prefill_decode)
         .def_rw("enable_structured_flat_kv_completion",
                 &tokenspeed::SchedulerConfig::enable_structured_flat_kv_completion)
+        .def_prop_ro("uses_structured_flat_admission", &tokenspeed::SchedulerConfig::UsesStructuredFlatAdmission)
         .def_rw("disable_prefix_cache", &tokenspeed::SchedulerConfig::disable_prefix_cache)
         .def_rw("enable_mamba", &tokenspeed::SchedulerConfig::enable_mamba)
         .def_rw("mamba_cache_chunk_size", &tokenspeed::SchedulerConfig::mamba_cache_chunk_size)

@@ -96,6 +96,13 @@ class _SchedulerConfig:
         D = "decode"
         Fused = "fused"
 
+    @property
+    def uses_structured_flat_admission(self) -> bool:
+        return bool(
+            getattr(self, "enable_structured_flat_kv_completion", False)
+            and getattr(self, "flat_block_pools", ())
+        )
+
 
 def _install_scheduler_stubs() -> None:
     torch = types.ModuleType("torch")
@@ -142,6 +149,10 @@ def _install_scheduler_stubs() -> None:
 
 
 _install_scheduler_stubs()
+_contract = _load(
+    "tokenspeed.runtime.configs.flat_kv_contract",
+    _CONFIGS_DIR / "flat_kv_contract.py",
+)
 _paged = _load(
     "paged_cache_spec_v4_scheduler_bridge_test",
     _CONFIGS_DIR / "paged_cache_spec.py",
@@ -332,6 +343,7 @@ class TestV4SchedulerPlanBridge(unittest.TestCase):
             enable_structured_flat_kv_completion=True,
         )
         self.assertTrue(structured_config.enable_structured_flat_kv_completion)
+        self.assertTrue(structured_config.uses_structured_flat_admission)
 
         with self.assertRaisesRegex(ValueError, "only device page authority"):
             _bridge.make_config(
@@ -410,6 +422,32 @@ class TestV4SchedulerPlanBridge(unittest.TestCase):
         self.assertEqual(num_device_pages.test.id, "flat_block_pools")
         self.assertIsInstance(num_device_pages.body, ast.Constant)
         self.assertEqual(num_device_pages.body.value, 0)
+
+    def test_scheduler_observability_uses_native_config_authority(self):
+        self.assertEqual(_bridge.scheduler_backend_identity(True), ("flat", "ON"))
+        self.assertEqual(_bridge.scheduler_backend_identity(False), ("radix", "OFF"))
+
+        self.assertEqual(
+            _bridge.scheduler_admission_path(
+                flat_kvcache_ext=True,
+                config=SimpleNamespace(uses_structured_flat_admission=True),
+            ),
+            "structured-flat",
+        )
+        self.assertEqual(
+            _bridge.scheduler_admission_path(
+                flat_kvcache_ext=True,
+                config=SimpleNamespace(uses_structured_flat_admission=False),
+            ),
+            "legacy-flat-compat",
+        )
+        self.assertEqual(
+            _bridge.scheduler_admission_path(
+                flat_kvcache_ext=False,
+                config=object(),
+            ),
+            "radix",
+        )
 
     def test_forward_bridge_fails_before_allocating_past_plan_width(self):
         forward_op = SimpleNamespace(

@@ -166,6 +166,22 @@ def make_config(
     return cfg
 
 
+def scheduler_backend_identity(flat_kvcache_ext: bool) -> tuple[str, str]:
+    """Return the loaded scheduler backend name and its compile-option value."""
+
+    return ("flat", "ON") if flat_kvcache_ext else ("radix", "OFF")
+
+
+def scheduler_admission_path(*, flat_kvcache_ext: bool, config: SchedulerConfig) -> str:
+    """Describe the admission lane selected by the native scheduler config."""
+
+    if not flat_kvcache_ext:
+        return "radix"
+    if config.uses_structured_flat_admission:
+        return "structured-flat"
+    return "legacy-flat-compat"
+
+
 def pool_to_paged_cache_groups(pool: Any) -> list:
     """Convert the pool's scheduler-authoritative group union to configs."""
     specs = getattr(pool, "scheduler_group_specs", pool.paged_cache_group_specs)

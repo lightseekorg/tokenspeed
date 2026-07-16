@@ -204,6 +204,10 @@ def _install_stubs() -> _FakeTorch:
 
 
 _torch = _install_stubs()
+_contract = _load(
+    "tokenspeed.runtime.configs.flat_kv_contract",
+    _CONFIGS_DIR / "flat_kv_contract.py",
+)
 _paged = _load(
     "tokenspeed.runtime.configs.paged_cache_spec",
     _CONFIGS_DIR / "paged_cache_spec.py",

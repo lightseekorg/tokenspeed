@@ -40,14 +40,14 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Literal
 
+from tokenspeed.runtime.configs.flat_kv_contract import (
+    CACHE_OWNER_DRAFT,
+    CACHE_OWNER_TARGET,
+    STATE_LAYER_TYPES,
+)
+
 if TYPE_CHECKING:
     from tokenspeed.runtime.configs.paged_cache_spec import PagedCacheGroupSpec
-
-# Labels whose group is state-family (recurrent state rows, not KV history).
-# Deliberate one-line duplicate of paged_cache_spec.STATE_LAYER_TYPES: both
-# modules are direct-loaded standalone by their tests (importlib, no package
-# context), so a cross-module import would break either loader. Keep in sync.
-STATE_LAYER_TYPES = frozenset({"linear_attention"})
 
 
 @dataclass(frozen=True)
@@ -293,12 +293,6 @@ V4_CPU_BLOCK_REF_BYTES_ESTIMATE = 16
 V4_CPU_EXPORT_GROUP_HEADER_BYTES_ESTIMATE = 64
 V4_CPU_POOL_FIXED_BYTES_ESTIMATE = 256
 V4_CPU_POOL_METADATA_BYTES_PER_BLOCK_ESTIMATE = 192
-
-# Keep these local so this historically standalone-loadable module does not
-# acquire a package import at runtime.  They mirror paged_cache_spec's public
-# owner bits; producer-domain masks remain model-defined and opaque here.
-_CACHE_OWNER_TARGET = 1 << 0
-_CACHE_OWNER_DRAFT = 1 << 1
 
 
 @dataclass(frozen=True)
@@ -1286,12 +1280,12 @@ def build_v4_flat_memory_plan(
     target_specs = _normalize_owner_specs(
         target_group_specs,
         owner="target",
-        owner_bit=_CACHE_OWNER_TARGET,
+        owner_bit=CACHE_OWNER_TARGET,
     )
     draft_specs = _normalize_owner_specs(
         draft_group_specs,
         owner="draft",
-        owner_bit=_CACHE_OWNER_DRAFT,
+        owner_bit=CACHE_OWNER_DRAFT,
     )
     scheduler_specs = _merge_scheduler_specs(target_specs, draft_specs)
     if not scheduler_specs:

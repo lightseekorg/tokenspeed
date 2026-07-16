@@ -24,11 +24,14 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <deque>
 #include <initializer_list>
-#include <map>
+#include <span>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "cache/kv_cache_coordinator.h"
@@ -37,50 +40,106 @@
 namespace tokenspeed::test {
 namespace {
 
-using FlatTable = std::map<std::string, std::vector<std::int32_t>>;
-using FlatBase = std::map<std::string, std::int32_t>;
+struct TableShape {
+    std::int32_t size{};
+    std::int32_t base{};
+    std::vector<std::int32_t> null_slots;
+};
 
-FlatBase ZeroBases(const FlatTable& flat) {
-    FlatBase bases;
-    for (const auto& [group_id, _] : flat) {
-        bases.emplace(group_id, 0);
+// Test rows use the same BlockTable view consumed by Scheduler production.
+// The deque keeps every table vector stable until FlatForwardOperation has
+// copied it into its contiguous export owner.
+class LiveTableRows {
+public:
+    explicit LiveTableRows(std::vector<std::string> group_ids)
+        : pool_{/*total_num_blocks=*/256}, group_ids_{std::move(group_ids)} {}
+
+    template <typename Operation>
+    void Attach(Operation& op, std::vector<TableShape> shapes) {
+        if (shapes.size() != group_ids_.size()) {
+            throw std::invalid_argument("test flat row shape differs from group schema");
+        }
+        rows_.emplace_back();
+        std::vector<BlockTable>& tables = rows_.back();
+        tables.reserve(shapes.size());
+        for (const TableShape& shape : shapes) {
+            if (shape.size < 0 || shape.base < 0) {
+                throw std::invalid_argument("test flat table shape must be non-negative");
+            }
+            std::vector<bool> is_null(static_cast<std::size_t>(shape.size), false);
+            for (std::int32_t slot : shape.null_slots) {
+                if (slot < 0 || slot >= shape.size || is_null[static_cast<std::size_t>(slot)]) {
+                    throw std::invalid_argument("test flat table has an invalid null slot");
+                }
+                is_null[static_cast<std::size_t>(slot)] = true;
+            }
+            const std::int32_t real_count = shape.size - static_cast<std::int32_t>(shape.null_slots.size());
+            std::vector<CacheBlock*> blocks = pool_.AllocateBlocks(real_count);
+            if (static_cast<std::int32_t>(blocks.size()) != real_count) {
+                throw std::runtime_error("test flat block pool exhausted");
+            }
+            std::vector<BlockRef> refs;
+            refs.reserve(static_cast<std::size_t>(shape.size));
+            std::size_t block_index = 0;
+            for (bool null_slot : is_null) {
+                refs.push_back(null_slot ? BlockRef::Share(pool_, pool_.NullBlock())
+                                         : BlockRef::Adopt(pool_, blocks[block_index++]));
+            }
+            BlockTable table;
+            table.InitRange(shape.base, std::move(refs));
+            tables.push_back(std::move(table));
+        }
+        op.flat_block_table_view = tables;
+        op.flat_block_table_group_ids = group_ids_;
     }
-    return bases;
-}
+
+    std::vector<std::int32_t> PageIds(std::size_t row, std::size_t group) const {
+        return BlockTablePageIds(rows_.at(row).at(group));
+    }
+
+private:
+    BlockPool pool_;
+    std::vector<std::string> group_ids_;
+    std::deque<std::vector<BlockTable>> rows_;
+};
 
 void ExpectRowEq(std::span<const std::int32_t> actual, std::initializer_list<std::int32_t> expected) {
     ASSERT_EQ(actual.size(), expected.size());
     EXPECT_TRUE(std::equal(actual.begin(), actual.end(), expected.begin(), expected.end()));
 }
 
-PrefillOperation MakePrefill(std::string id, FlatTable flat, std::vector<std::int32_t> input_ids = {},
-                             std::int32_t pool_index = 0, std::int32_t extend_prefix_len = 0, FlatBase bases = {}) {
+PrefillOperation MakePrefill(std::string id, std::vector<std::int32_t> input_ids = {}, std::int32_t pool_index = 0,
+                             std::int32_t extend_prefix_len = 0) {
     PrefillOperation op;
     op.request_id = std::move(id);
     op.request_pool_index = pool_index;
     op.input_length = static_cast<std::int32_t>(input_ids.size());
-    if (bases.empty()) {
-        bases = ZeroBases(flat);
-    }
-    op.flat_block_tables = std::move(flat);
-    op.flat_block_table_base_offsets = std::move(bases);
     op.input_ids = std::move(input_ids);
     op.extend_prefix_len = extend_prefix_len;
     return op;
 }
 
-DecodeOperation MakeDecode(std::string id, FlatTable flat, std::int32_t decode_input_id = -1,
-                           std::int32_t pool_index = 0, FlatBase bases = {}) {
+DecodeOperation MakeDecode(std::string id, std::int32_t decode_input_id = -1, std::int32_t pool_index = 0) {
     DecodeOperation op;
     op.request_id = std::move(id);
     op.request_pool_index = pool_index;
     op.input_length = 1;
-    if (bases.empty()) {
-        bases = ZeroBases(flat);
-    }
-    op.flat_block_tables = std::move(flat);
-    op.flat_block_table_base_offsets = std::move(bases);
     op.decode_input_id = decode_input_id;
+    return op;
+}
+
+PrefillOperation MakeFlatPrefill(LiveTableRows& rows, std::string id, std::vector<TableShape> shapes,
+                                 std::vector<std::int32_t> input_ids = {}, std::int32_t pool_index = 0,
+                                 std::int32_t extend_prefix_len = 0) {
+    PrefillOperation op = MakePrefill(std::move(id), std::move(input_ids), pool_index, extend_prefix_len);
+    rows.Attach(op, std::move(shapes));
+    return op;
+}
+
+DecodeOperation MakeFlatDecode(LiveTableRows& rows, std::string id, std::vector<TableShape> shapes,
+                               std::int32_t decode_input_id = -1, std::int32_t pool_index = 0) {
+    DecodeOperation op = MakeDecode(std::move(id), decode_input_id, pool_index);
+    rows.Attach(op, std::move(shapes));
     return op;
 }
 
@@ -95,9 +154,12 @@ TEST(FlatForwardOperation, EmptyOpsProducesEmpty) {
 }
 
 TEST(FlatForwardOperation, MultiRequestPadsRaggedRowsWithMinusOne) {
+    LiveTableRows rows{{"full"}};
     std::vector<ForwardOperation> ops;
-    ops.emplace_back(MakePrefill("r0", FlatTable{{"full", {10, 11, 12}}}));
-    ops.emplace_back(MakePrefill("r1", FlatTable{{"full", {20}}}));
+    ops.emplace_back(MakeFlatPrefill(rows, "r0", {{.size = 3}}));
+    ops.emplace_back(MakeFlatPrefill(rows, "r1", {{.size = 1}}));
+    const std::vector<std::int32_t> first = rows.PageIds(0, 0);
+    const std::vector<std::int32_t> second = rows.PageIds(1, 0);
 
     FlatForwardOperation flat_op{std::move(ops)};
 
@@ -106,32 +168,38 @@ TEST(FlatForwardOperation, MultiRequestPadsRaggedRowsWithMinusOne) {
     ASSERT_EQ(full.size(), 2u);
     EXPECT_EQ(full.rows, 2u);
     EXPECT_EQ(full.cols, 3u);
-    EXPECT_EQ(full.values, (std::vector<std::int32_t>{10, 11, 12, 20, -1, -1}));
-    ExpectRowEq(full.Row(0), {10, 11, 12});
-    ExpectRowEq(full.Row(1), {20, -1, -1});
+    EXPECT_EQ(full.values, (std::vector<std::int32_t>{first[0], first[1], first[2], second[0], -1, -1}));
+    EXPECT_TRUE(std::equal(full.Row(0).begin(), full.Row(0).end(), first.begin(), first.end()));
+    ExpectRowEq(full.Row(1), {second[0], -1, -1});
     EXPECT_EQ(full.Row(1).data(), full.Row(0).data() + full.cols);
 }
 
 // Flat contract: 0 = real null-block hole, -1 = absent (pad) column.
 TEST(FlatForwardOperation, NullHoleZeroDistinctFromPadMinusOne) {
+    LiveTableRows rows{{"swa"}};
     std::vector<ForwardOperation> ops;
-    ops.emplace_back(MakePrefill("r0", FlatTable{{"swa", {0, 31, 32}}}));
-    ops.emplace_back(MakePrefill("r1", FlatTable{{"swa", {40}}}));
+    ops.emplace_back(MakeFlatPrefill(rows, "r0", {{.size = 3, .null_slots = {0}}}));
+    ops.emplace_back(MakeFlatPrefill(rows, "r1", {{.size = 1}}));
+    const std::vector<std::int32_t> first = rows.PageIds(0, 0);
+    const std::vector<std::int32_t> second = rows.PageIds(1, 0);
 
     FlatForwardOperation flat_op{std::move(ops)};
 
     const auto& swa = flat_op.flat_block_tables.at("swa");
     ASSERT_EQ(swa.size(), 2u);
-    ExpectRowEq(swa.Row(0), {0, 31, 32});
-    ExpectRowEq(swa.Row(1), {40, -1, -1});
+    EXPECT_TRUE(std::equal(swa.Row(0).begin(), swa.Row(0).end(), first.begin(), first.end()));
+    ExpectRowEq(swa.Row(1), {second[0], -1, -1});
     EXPECT_EQ(swa.Row(0)[0], 0);
     EXPECT_EQ(swa.Row(1)[1], -1);
 }
 
 TEST(FlatForwardOperation, PrefillBeforeDecodeKeepsRowsAlignedWithRequests) {
+    LiveTableRows rows{{"full"}};
     std::vector<ForwardOperation> ops;
-    ops.emplace_back(MakeDecode("d", FlatTable{{"full", {20}}}, /*decode_input_id=*/99));
-    ops.emplace_back(MakePrefill("p", FlatTable{{"full", {10, 11}}}, /*input_ids=*/{7, 8}));
+    ops.emplace_back(MakeFlatDecode(rows, "d", {{.size = 1}}, /*decode_input_id=*/99));
+    ops.emplace_back(MakeFlatPrefill(rows, "p", {{.size = 2}}, /*input_ids=*/{7, 8}));
+    const std::vector<std::int32_t> decode = rows.PageIds(0, 0);
+    const std::vector<std::int32_t> prefill = rows.PageIds(1, 0);
 
     FlatForwardOperation flat_op{std::move(ops)};
 
@@ -141,8 +209,8 @@ TEST(FlatForwardOperation, PrefillBeforeDecodeKeepsRowsAlignedWithRequests) {
 
     const auto& full = flat_op.flat_block_tables.at("full");
     ASSERT_EQ(full.size(), 2u);
-    ExpectRowEq(full.Row(0), {10, 11});
-    ExpectRowEq(full.Row(1), {20, -1});
+    ExpectRowEq(full.Row(0), {prefill[0], prefill[1]});
+    ExpectRowEq(full.Row(1), {decode[0], -1});
 
     EXPECT_EQ(flat_op.num_extends(), 1u);
     EXPECT_EQ(flat_op.input_ids, (std::vector<std::int32_t>{7, 8}));
@@ -151,7 +219,7 @@ TEST(FlatForwardOperation, PrefillBeforeDecodeKeepsRowsAlignedWithRequests) {
 
 TEST(FlatForwardOperation, CompletionInputsStayAlignedAcrossStablePartition) {
     std::vector<ForwardOperation> ops;
-    auto decode = MakeDecode("d", FlatTable{{"full", {20}}});
+    auto decode = MakeDecode("d");
     decode.flat_kv_completion_input = FlatKVCompletionInput{
         .request_id = "d",
         .table_generation = 11,
@@ -160,7 +228,7 @@ TEST(FlatForwardOperation, CompletionInputsStayAlignedAcrossStablePartition) {
         .dispatch_raw_end = 8,
         .protected_raw_end = 9,
     };
-    auto prefill = MakePrefill("p", FlatTable{{"full", {10}}});
+    auto prefill = MakePrefill("p");
     prefill.flat_kv_completion_input = FlatKVCompletionInput{
         .request_id = "p",
         .table_generation = 22,
@@ -181,7 +249,7 @@ TEST(FlatForwardOperation, CompletionInputsStayAlignedAcrossStablePartition) {
 
 TEST(FlatForwardOperation, MixedPresenceOfCompletionInputsFailsClosed) {
     std::vector<ForwardOperation> ops;
-    auto first = MakePrefill("a", FlatTable{{"full", {10}}});
+    auto first = MakePrefill("a");
     first.flat_kv_completion_input = FlatKVCompletionInput{
         .request_id = "a",
         .table_generation = 1,
@@ -191,25 +259,28 @@ TEST(FlatForwardOperation, MixedPresenceOfCompletionInputsFailsClosed) {
         .protected_raw_end = 1,
     };
     ops.emplace_back(std::move(first));
-    ops.emplace_back(MakePrefill("b", FlatTable{{"full", {20}}}));
+    ops.emplace_back(MakePrefill("b"));
 
     EXPECT_THROW(FlatForwardOperation(std::move(ops)), std::invalid_argument);
 }
 
 TEST(FlatForwardOperation, MissingRequiredGroupFailsClosed) {
+    LiveTableRows full_rows{{"full"}};
+    LiveTableRows swa_rows{{"swa"}};
     std::vector<ForwardOperation> ops;
-    ops.emplace_back(MakePrefill("r0", FlatTable{{"full", {10, 11}}}));     // no "swa"
-    ops.emplace_back(MakePrefill("r1", FlatTable{{"swa", {20, 21, 22}}}));  // no "full"
+    ops.emplace_back(MakeFlatPrefill(full_rows, "r0", {{.size = 2}}));
+    ops.emplace_back(MakeFlatPrefill(swa_rows, "r1", {{.size = 3}}));
 
-    EXPECT_THROW(FlatForwardOperation(std::move(ops)), std::invalid_argument);
+    EXPECT_DEATH({ FlatForwardOperation flat_op{std::move(ops)}; }, "");
 }
 
 TEST(FlatForwardOperation, BaseOffsetsStayAlignedAcrossStablePartition) {
+    LiveTableRows rows{{"full", "state"}};
     std::vector<ForwardOperation> ops;
-    ops.emplace_back(MakeDecode("d", FlatTable{{"full", {20}}, {"state", {30}}}, /*decode_input_id=*/99,
-                                /*pool_index=*/0, FlatBase{{"full", 0}, {"state", 7}}));
-    ops.emplace_back(MakePrefill("p", FlatTable{{"full", {10}}, {"state", {40}}}, /*input_ids=*/{7},
-                                 /*pool_index=*/0, /*extend_prefix_len=*/0, FlatBase{{"full", 0}, {"state", 3}}));
+    ops.emplace_back(MakeFlatDecode(rows, "d", {{.size = 1}, {.size = 1, .base = 7}},
+                                    /*decode_input_id=*/99));
+    ops.emplace_back(MakeFlatPrefill(rows, "p", {{.size = 1}, {.size = 1, .base = 3}},
+                                     /*input_ids=*/{7}));
 
     FlatForwardOperation flat_op{std::move(ops)};
 
@@ -218,24 +289,21 @@ TEST(FlatForwardOperation, BaseOffsetsStayAlignedAcrossStablePartition) {
     EXPECT_EQ(flat_op.flat_block_tables.at("state").bases, (std::vector<std::int32_t>{3, 7}));
 }
 
-TEST(FlatForwardOperation, MissingBaseForAnyFlatGroupFailsClosed) {
-    PrefillOperation op;
-    op.request_id = "r";
-    op.flat_block_tables = {{"full", {10}}, {"state", {20}}};
-    op.flat_block_table_base_offsets = {{"full", 0}};
+TEST(FlatForwardOperation, MismatchedLiveViewAndGroupIdsFailsClosed) {
+    LiveTableRows rows{{"full"}};
+    PrefillOperation op = MakeFlatPrefill(rows, "r", {{.size = 1}});
+    op.flat_block_table_group_ids = {};
     std::vector<ForwardOperation> ops;
     ops.emplace_back(std::move(op));
 
-    EXPECT_THROW(FlatForwardOperation(std::move(ops)), std::invalid_argument);
+    EXPECT_DEATH({ FlatForwardOperation flat_op{std::move(ops)}; }, "");
 }
 
 TEST(FlatForwardOperation, ScalarFieldsTrackPerRequestRows) {
     std::vector<ForwardOperation> ops;
-    auto p0 = MakePrefill("r0", FlatTable{{"full", {10}}}, /*input_ids=*/{1, 2, 3},
-                          /*pool_index=*/5);
+    auto p0 = MakePrefill("r0", /*input_ids=*/{1, 2, 3}, /*pool_index=*/5);
     p0.occupied_pages = {10};
-    auto p1 = MakePrefill("r1", FlatTable{{"full", {20, 21}}}, /*input_ids=*/{4, 5},
-                          /*pool_index=*/7);
+    auto p1 = MakePrefill("r1", /*input_ids=*/{4, 5}, /*pool_index=*/7);
     p1.occupied_pages = {20, 21};
     ops.emplace_back(std::move(p0));
     ops.emplace_back(std::move(p1));
@@ -251,16 +319,19 @@ TEST(FlatForwardOperation, ScalarFieldsTrackPerRequestRows) {
 }
 
 TEST(FlatForwardOperation, EqualLengthRowsUnchanged) {
+    LiveTableRows rows{{"full"}};
     std::vector<ForwardOperation> ops;
-    ops.emplace_back(MakePrefill("r0", FlatTable{{"full", {10, 11}}}));
-    ops.emplace_back(MakePrefill("r1", FlatTable{{"full", {20, 21}}}));
+    ops.emplace_back(MakeFlatPrefill(rows, "r0", {{.size = 2}}));
+    ops.emplace_back(MakeFlatPrefill(rows, "r1", {{.size = 2}}));
+    const std::vector<std::int32_t> first = rows.PageIds(0, 0);
+    const std::vector<std::int32_t> second = rows.PageIds(1, 0);
 
     FlatForwardOperation flat_op{std::move(ops)};
 
     const auto& full = flat_op.flat_block_tables.at("full");
     ASSERT_EQ(full.size(), 2u);
-    ExpectRowEq(full.Row(0), {10, 11});
-    ExpectRowEq(full.Row(1), {20, 21});
+    ExpectRowEq(full.Row(0), {first[0], first[1]});
+    ExpectRowEq(full.Row(1), {second[0], second[1]});
 }
 
 TEST(FlatForwardOperation, LiveRowViewCopiesDirectlyIntoOneContiguousOwner) {
@@ -280,8 +351,6 @@ TEST(FlatForwardOperation, LiveRowViewCopiesDirectlyIntoOneContiguousOwner) {
     op.request_id = "r";
     op.flat_block_table_view = tables;
     op.flat_block_table_group_ids = group_ids;
-    ASSERT_TRUE(op.flat_block_tables.empty());
-    ASSERT_TRUE(op.flat_block_table_base_offsets.empty());
     std::vector<ForwardOperation> ops;
     ops.emplace_back(std::move(op));
 
@@ -297,11 +366,10 @@ TEST(FlatForwardOperation, LiveRowViewCopiesDirectlyIntoOneContiguousOwner) {
 }
 
 TEST(FlatForwardOperation, EmptyRowsKeepZeroWidthAndCopyOnlyBases) {
+    LiveTableRows rows{{"full"}};
     std::vector<ForwardOperation> ops;
-    ops.emplace_back(MakePrefill("r0", FlatTable{{"full", {}}}, /*input_ids=*/{}, /*pool_index=*/0,
-                                 /*extend_prefix_len=*/0, FlatBase{{"full", 5}}));
-    ops.emplace_back(MakePrefill("r1", FlatTable{{"full", {}}}, /*input_ids=*/{}, /*pool_index=*/0,
-                                 /*extend_prefix_len=*/0, FlatBase{{"full", 7}}));
+    ops.emplace_back(MakeFlatPrefill(rows, "r0", {{.size = 0, .base = 5}}));
+    ops.emplace_back(MakeFlatPrefill(rows, "r1", {{.size = 0, .base = 7}}));
 
     FlatForwardOperation flat_op{std::move(ops)};
     const FlatBlockTableExport& full = flat_op.flat_block_tables.at("full");
@@ -323,11 +391,12 @@ TEST(FlatForwardOperation, EmptyRowsKeepZeroWidthAndCopyOnlyBases) {
 }
 
 TEST(FlatForwardOperation, CopyToUsesContiguousRectangleAndHonorsCapacity) {
+    LiveTableRows rows{{"full"}};
     std::vector<ForwardOperation> ops;
-    ops.emplace_back(MakePrefill("r0", FlatTable{{"full", {0, 3, 4}}}, /*input_ids=*/{}, /*pool_index=*/0,
-                                 /*extend_prefix_len=*/0, FlatBase{{"full", 0}}));
-    ops.emplace_back(MakePrefill("r1", FlatTable{{"full", {5}}}, /*input_ids=*/{}, /*pool_index=*/0,
-                                 /*extend_prefix_len=*/0, FlatBase{{"full", 7}}));
+    ops.emplace_back(MakeFlatPrefill(rows, "r0", {{.size = 3, .null_slots = {0}}}));
+    ops.emplace_back(MakeFlatPrefill(rows, "r1", {{.size = 1, .base = 7}}));
+    const std::vector<std::int32_t> first = rows.PageIds(0, 0);
+    const std::vector<std::int32_t> second = rows.PageIds(1, 0);
 
     FlatForwardOperation flat_op{std::move(ops)};
     const FlatBlockTableExport& full = flat_op.flat_block_tables.at("full");
@@ -339,7 +408,7 @@ TEST(FlatForwardOperation, CopyToUsesContiguousRectangleAndHonorsCapacity) {
 
     EXPECT_EQ(copied.rows, 2u);
     EXPECT_EQ(copied.cols, 3u);
-    EXPECT_EQ(table_destination, (std::vector<std::int32_t>{0, 3, 4, 5, -1, -1, 99, 99}));
+    EXPECT_EQ(table_destination, (std::vector<std::int32_t>{first[0], first[1], first[2], second[0], -1, -1, 99, 99}));
     EXPECT_EQ(base_destination, (std::vector<std::int32_t>{0, 7, 99}));
 
     std::vector<std::int32_t> short_table(5, 0);

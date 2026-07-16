@@ -32,6 +32,7 @@ def _load(mod_name: str, file_name: str):
     return mod
 
 
+_contract = _load("tokenspeed.runtime.configs.flat_kv_contract", "flat_kv_contract.py")
 _fmp = _load("flat_memory_plan_under_test", "flat_memory_plan.py")
 ComponentSpec = _fmp.ComponentSpec
 BlockGeometry = _fmp.BlockGeometry

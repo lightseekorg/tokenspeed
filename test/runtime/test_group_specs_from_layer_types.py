@@ -32,6 +32,7 @@ def _load(mod_name: str, file_name: str):
     return mod
 
 
+_contract = _load("tokenspeed.runtime.configs.flat_kv_contract", "flat_kv_contract.py")
 _pcs = _load("paged_cache_spec_under_test", "paged_cache_spec.py")
 group_specs_from_layer_types = _pcs.group_specs_from_layer_types
 layer_group_ids = _pcs.layer_group_ids

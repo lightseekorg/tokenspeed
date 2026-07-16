@@ -52,6 +52,16 @@ types_spec.loader.exec_module(execution_types)
 if _REMOVE_FAKE_TORCH:
     sys.modules.pop("torch", None)
 
+contract_path = _ROOT / "python/tokenspeed/runtime/configs/flat_kv_contract.py"
+contract_spec = importlib.util.spec_from_file_location(
+    "tokenspeed.runtime.configs.flat_kv_contract",
+    contract_path,
+)
+assert contract_spec is not None and contract_spec.loader is not None
+contract = importlib.util.module_from_spec(contract_spec)
+sys.modules[contract_spec.name] = contract
+contract_spec.loader.exec_module(contract)
+
 progress_path = _ROOT / "python/tokenspeed/runtime/execution/flat_kv_progress.py"
 progress_spec = importlib.util.spec_from_file_location(
     "flat_kv_progress_test_module",

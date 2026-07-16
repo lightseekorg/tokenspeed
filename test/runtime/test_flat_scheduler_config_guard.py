@@ -42,6 +42,23 @@ def _load_paged_cache_spec():
             "configs",
             "paged_cache_spec.py",
         )
+        contract_path = os.path.join(
+            repo_root,
+            "python",
+            "tokenspeed",
+            "runtime",
+            "configs",
+            "flat_kv_contract.py",
+        )
+        contract_name = "tokenspeed.runtime.configs.flat_kv_contract"
+        if contract_name not in sys.modules:
+            contract_spec = importlib.util.spec_from_file_location(
+                contract_name, contract_path
+            )
+            assert contract_spec is not None and contract_spec.loader is not None
+            contract = importlib.util.module_from_spec(contract_spec)
+            sys.modules[contract_name] = contract
+            contract_spec.loader.exec_module(contract)
         spec = importlib.util.spec_from_file_location("_paged_cache_spec_guard", path)
         module = importlib.util.module_from_spec(spec)
         # dataclass processing resolves cls.__module__ through sys.modules, so

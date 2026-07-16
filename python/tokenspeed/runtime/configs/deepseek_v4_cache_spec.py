@@ -19,6 +19,12 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
+from tokenspeed.runtime.configs.flat_kv_contract import (
+    V4_PRODUCER_DRAFT_INDEXER,
+    V4_PRODUCER_DRAFT_MAIN,
+    V4_PRODUCER_TARGET_INDEXER,
+    V4_PRODUCER_TARGET_MAIN,
+)
 from tokenspeed.runtime.configs.paged_cache_spec import (
     CACHE_OWNER_DRAFT,
     CACHE_OWNER_TARGET,
@@ -35,13 +41,6 @@ V4_C128_STATE_POOL_ID = "v4.c128.state"
 V4_C128_HISTORY_POOL_ID = "v4.c128.history"
 V4_INDEX_STATE_POOL_ID = "v4.index.state"
 
-# Producer domains are bounded executor-visible completion domains, not one bit
-# per layer/tensor.  They intentionally occupy a different namespace from the
-# target/draft owner mask above.
-V4_PRODUCER_TARGET_MAIN = 1 << 0
-V4_PRODUCER_TARGET_INDEXER = 1 << 1
-V4_PRODUCER_DRAFT_MAIN = 1 << 2
-V4_PRODUCER_DRAFT_INDEXER = 1 << 3
 DEEPSEEK_V4_FP8_MAX = 448.0
 DEEPSEEK_V4_FP8_BLOCK_SIZE = 128
 DEEPSEEK_V4_FP8_QUANT_BLOCK = 64

@@ -1,5 +1,7 @@
 import pytest
 from tokenspeed_scheduler import (
+    FLAT_KVCACHE,
+    FlatBlockPoolConfig,
     PagedCacheGroupAllocator,
     PagedCacheGroupConfig,
     PagedCacheGroupFamily,
@@ -7,6 +9,7 @@ from tokenspeed_scheduler import (
     PagedCachePrefixRole,
     PagedCacheRetention,
     PagedCacheTableLayout,
+    SchedulerConfig,
 )
 
 
@@ -29,6 +32,25 @@ def _sliding_config(rows_per_page=2, entry_stride_tokens=1, total_pages=8, windo
         retention=PagedCacheRetention.SlidingWindow,
         sliding_window_tokens=window,
     )
+
+
+def test_scheduler_config_reports_compiled_structured_flat_admission():
+    config = SchedulerConfig()
+    pool = FlatBlockPoolConfig()
+    pool.pool_id = "pool"
+    pool.total_blocks = 2
+    pool.bytes_per_block = 1
+
+    config.enable_structured_flat_kv_completion = True
+    config.flat_block_pools = [pool]
+    assert config.uses_structured_flat_admission is FLAT_KVCACHE
+
+    config.enable_structured_flat_kv_completion = False
+    assert config.uses_structured_flat_admission is False
+
+    config.enable_structured_flat_kv_completion = True
+    config.flat_block_pools = []
+    assert config.uses_structured_flat_admission is False
 
 
 def test_flat_group_metadata_round_trip_and_strict_geometry_validation():

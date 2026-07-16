@@ -20,16 +20,18 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
+from tokenspeed.runtime.configs.flat_kv_contract import (
+    CACHE_OWNER_DRAFT,
+    CACHE_OWNER_TARGET,
+    LINEAR_ATTENTION,
+    STATE_LAYER_TYPES,
+)
+
 Retention = Literal["full_history", "sliding_window"]
 Family = Literal["history", "state"]
 PrefixRole = Literal["history_anchor", "continuation_state", "none"]
 TableLayout = Literal["absolute", "bounded_window"]
 
-# Owner bits are deliberately independent from producer-domain bits.  The
-# former say which model-side view consumes a group; the latter say which
-# bounded execution domains must finish publishing one page.
-CACHE_OWNER_TARGET = 1 << 0
-CACHE_OWNER_DRAFT = 1 << 1
 _UINT32_MAX = (1 << 32) - 1
 
 
@@ -142,7 +144,6 @@ def scheduler_ext_flat_kvcache() -> bool:
 # Paged-cache label vocabulary (NOT the HF checkpoint's serialized enum:
 # Qwen3.5 checkpoints spell full attention "attention").
 FULL_ATTENTION = "full_attention"
-LINEAR_ATTENTION = "linear_attention"
 
 # layer_type label -> retention. GPT-OSS uses the first two, Qwen3.5 GDN
 # layers use "linear_attention"; unknown labels raise.
@@ -153,9 +154,6 @@ _LAYER_TYPE_RETENTION: dict[str, Retention] = {
     # mamba-state kind on family == State && retention != SlidingWindow.
     LINEAR_ATTENTION: "full_history",
 }
-
-# Labels whose group is state-family (recurrent state rows, not KV history).
-STATE_LAYER_TYPES = frozenset({LINEAR_ATTENTION})
 
 # Sliding sub-groups make each slab bound by one layer of every group — no dead slab rows.
 _SLIDING_SUBGROUP_PREFIX = "sliding_attention_"

@@ -83,12 +83,6 @@ struct ForwardOperationBase {
     std::span<const BlockTable> flat_block_table_view;
     std::span<const std::string> flat_block_table_group_ids;
 
-    // Compatibility input for direct/unit construction. The scheduler hot
-    // path leaves these maps empty and uses the row view above, avoiding one
-    // map + nested-vector materialization per request and a second cell copy.
-    std::map<std::string, std::vector<std::int32_t>> flat_block_tables;
-    std::map<std::string, std::int32_t> flat_block_table_base_offsets;
-
     // Populated by the flat scheduler after the table mutation is committed.
     // Radix operations leave this null so their batched ABI remains empty.
     std::optional<FlatKVCompletionInput> flat_kv_completion_input;
@@ -254,6 +248,7 @@ struct FlatForwardOperation {
     explicit FlatForwardOperation(std::vector<ForwardOperation> ops) {
         std::map<std::string, std::size_t> flat_widths;
         bool have_flat_schema = false;
+        bool miss_flat_schema = false;
         bool have_completion_inputs = false;
         bool miss_completion_input = false;
         std::size_t total_input_ids = 0;
@@ -263,22 +258,24 @@ struct FlatForwardOperation {
         for (const auto& op : ops) {
             std::visit(
                 [&](const auto& inner) {
-                    const bool uses_live_view = !inner.flat_block_table_view.empty() ||
-                                                !inner.flat_block_table_group_ids.empty();
+                    const bool uses_live_view =
+                        !inner.flat_block_table_view.empty() || !inner.flat_block_table_group_ids.empty();
                     if (uses_live_view) {
                         // Production rows all use the scheduler-owned group-id
                         // vector and request-owned table vector. A disagreement
                         // is an internal invariant violation, not recoverable
                         // execution-plan input validation after FSM mutation.
-                        if (inner.flat_block_table_view.size() != inner.flat_block_table_group_ids.size() ||
-                            !inner.flat_block_tables.empty() || !inner.flat_block_table_base_offsets.empty()) {
+                        if (inner.flat_block_table_view.size() != inner.flat_block_table_group_ids.size()) {
                             std::terminate();
                         }
                         if (!have_flat_schema) {
                             for (std::size_t i = 0; i < inner.flat_block_table_view.size(); ++i) {
-                                flat_widths.emplace(inner.flat_block_table_group_ids[i],
-                                                    static_cast<std::size_t>(
-                                                        inner.flat_block_table_view[i].NumBlocks()));
+                                const auto [_, inserted] = flat_widths.emplace(
+                                    inner.flat_block_table_group_ids[i],
+                                    static_cast<std::size_t>(inner.flat_block_table_view[i].NumBlocks()));
+                                if (!inserted) {
+                                    std::terminate();
+                                }
                             }
                             have_flat_schema = true;
                         } else {
@@ -290,33 +287,13 @@ struct FlatForwardOperation {
                                 if (width == flat_widths.end()) {
                                     std::terminate();
                                 }
-                                width->second = std::max(
-                                    width->second,
-                                    static_cast<std::size_t>(inner.flat_block_table_view[i].NumBlocks()));
+                                width->second =
+                                    std::max(width->second,
+                                             static_cast<std::size_t>(inner.flat_block_table_view[i].NumBlocks()));
                             }
                         }
                     } else {
-                        // Direct construction keeps the old owned-map input as
-                        // a compatibility/testing seam. It is never populated
-                        // by Scheduler::newForwardOperation.
-                        if (!SameMapKeys(inner.flat_block_tables, inner.flat_block_table_base_offsets)) {
-                            throw std::invalid_argument(
-                                "FlatForwardOperation: every flat block table requires an explicit matching base");
-                        }
-                        if (!have_flat_schema) {
-                            for (const auto& [group_id, pages] : inner.flat_block_tables) {
-                                flat_widths.emplace(group_id, pages.size());
-                            }
-                            have_flat_schema = true;
-                        } else {
-                            if (!SameMapKeys(inner.flat_block_tables, flat_widths)) {
-                                throw std::invalid_argument(
-                                    "FlatForwardOperation: every request row must publish the same flat cache groups");
-                            }
-                            for (const auto& [group_id, pages] : inner.flat_block_tables) {
-                                flat_widths.at(group_id) = std::max(flat_widths.at(group_id), pages.size());
-                            }
-                        }
+                        miss_flat_schema = true;
                     }
                     for (const auto& [group_id, _] : inner.paged_cache_pages) {
                         paged_cache_block_tables.try_emplace(group_id);
@@ -335,6 +312,9 @@ struct FlatForwardOperation {
                     }
                 },
                 op);
+        }
+        if (have_flat_schema && miss_flat_schema) {
+            std::terminate();
         }
         if (have_completion_inputs && miss_completion_input) {
             throw std::invalid_argument(
@@ -382,33 +362,21 @@ struct FlatForwardOperation {
                     mamba_checkpoint_dst_indices.push_back(inner.mamba_checkpoint_dst_idx);
                     mamba_cow_src_indices.push_back(inner.mamba_cow_src_idx);
                     mamba_branching_seqlens.push_back(inner.mamba_branching_seqlen);
-                    if (!inner.flat_block_table_view.empty() || !inner.flat_block_table_group_ids.empty()) {
-                        for (std::size_t i = 0; i < inner.flat_block_table_view.size(); ++i) {
-                            auto export_it = flat_block_tables.find(inner.flat_block_table_group_ids[i]);
-                            if (export_it == flat_block_tables.end()) {
-                                std::terminate();
-                            }
-                            FlatBlockTableExport& export_owner = export_it->second;
-                            const BlockTable& table = inner.flat_block_table_view[i];
-                            if (static_cast<std::size_t>(table.NumBlocks()) > export_owner.cols) {
-                                std::terminate();
-                            }
-                            std::size_t destination = row * export_owner.cols;
-                            for (CacheBlock* block : table.Blocks()) {
-                                export_owner.values[destination++] = block->IsNull() ? 0 : block->BlockId();
-                            }
-                            export_owner.bases[row] = table.BaseLogicalPage();
+                    for (std::size_t i = 0; i < inner.flat_block_table_view.size(); ++i) {
+                        auto export_it = flat_block_tables.find(inner.flat_block_table_group_ids[i]);
+                        if (export_it == flat_block_tables.end()) {
+                            std::terminate();
                         }
-                    } else {
-                        for (const auto& [gid, pages] : inner.flat_block_tables) {
-                            FlatBlockTableExport& export_owner = flat_block_tables.at(gid);
-                            if (pages.size() > export_owner.cols) {
-                                throw std::logic_error("flat block table row exceeds its precomputed width");
-                            }
-                            const std::size_t row_offset = row * export_owner.cols;
-                            std::copy(pages.begin(), pages.end(), export_owner.values.begin() + row_offset);
-                            export_owner.bases[row] = inner.flat_block_table_base_offsets.at(gid);
+                        FlatBlockTableExport& export_owner = export_it->second;
+                        const BlockTable& table = inner.flat_block_table_view[i];
+                        if (static_cast<std::size_t>(table.NumBlocks()) > export_owner.cols) {
+                            std::terminate();
                         }
+                        std::size_t destination = row * export_owner.cols;
+                        for (CacheBlock* block : table.Blocks()) {
+                            export_owner.values[destination++] = block->IsNull() ? 0 : block->BlockId();
+                        }
+                        export_owner.bases[row] = table.BaseLogicalPage();
                     }
                     for (auto& [gid, pages] : inner.paged_cache_pages) {
                         paged_cache_block_tables.at(gid)[row] = std::move(pages);
@@ -472,21 +440,6 @@ struct FlatForwardOperation {
     }
 
 private:
-    template <typename Left, typename Right>
-    static bool SameMapKeys(const std::map<std::string, Left>& left, const std::map<std::string, Right>& right) {
-        if (left.size() != right.size()) {
-            return false;
-        }
-        auto left_it = left.begin();
-        auto right_it = right.begin();
-        for (; left_it != left.end(); ++left_it, ++right_it) {
-            if (left_it->first != right_it->first) {
-                return false;
-            }
-        }
-        return true;
-    }
-
     template <typename Key>
     static void padRectangularMinusOne(std::map<Key, std::vector<std::vector<std::int32_t>>>& tables) {
         for (auto& [_, table] : tables) {

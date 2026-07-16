@@ -40,6 +40,13 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from tokenspeed.runtime.configs.flat_kv_contract import (
+    V4_PRODUCER_DRAFT_INDEXER,
+    V4_PRODUCER_DRAFT_MAIN,
+    V4_PRODUCER_TARGET_INDEXER,
+    V4_PRODUCER_TARGET_MAIN,
+)
+
 if TYPE_CHECKING:
     from tokenspeed.runtime.configs.flat_memory_plan import V4FlatMemoryPlan
     from tokenspeed.runtime.execution.types import (
@@ -48,13 +55,6 @@ if TYPE_CHECKING:
     )
 
 _UINT32_MAX = 0xFFFFFFFF
-# Keep these bounded completion-ABI bits in sync with
-# configs.deepseek_v4_cache_spec.  This helper is intentionally import-light:
-# execution.types and its fallback tests can be loaded without transformers.
-V4_PRODUCER_TARGET_MAIN = 1 << 0
-V4_PRODUCER_TARGET_INDEXER = 1 << 1
-V4_PRODUCER_DRAFT_MAIN = 1 << 2
-V4_PRODUCER_DRAFT_INDEXER = 1 << 3
 _TARGET_DOMAIN_MASK = V4_PRODUCER_TARGET_MAIN | V4_PRODUCER_TARGET_INDEXER
 _DRAFT_DOMAIN_MASK = V4_PRODUCER_DRAFT_MAIN | V4_PRODUCER_DRAFT_INDEXER
 _V4_DOMAIN_MASK = _TARGET_DOMAIN_MASK | _DRAFT_DOMAIN_MASK

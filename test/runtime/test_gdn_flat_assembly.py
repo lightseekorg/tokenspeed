@@ -48,6 +48,7 @@ def _load(mod_name: str, file_name: str):
     return mod
 
 
+_contract = _load("tokenspeed.runtime.configs.flat_kv_contract", "flat_kv_contract.py")
 _plan = _load("flat_memory_plan_gdn_assembly_under_test", "flat_memory_plan.py")
 equalized_block_size = _plan.equalized_block_size
 

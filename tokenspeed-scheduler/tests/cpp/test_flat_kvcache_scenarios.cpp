@@ -75,7 +75,7 @@ std::vector<std::int32_t> RealPages(const FlatBlockTableExport& group) {
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// Chunked prefill: PrefillFirstChunk then PrefillChunk per chunk.
+// Chunked prefill: first admission followed by AdvanceRequest per chunk.
 // ---------------------------------------------------------------------------
 class FlatChunkedPrefillSuite : public SchedulerTestSuite {
 protected:
@@ -2375,7 +2375,7 @@ TEST_F(FlatPrefixHitTightPoolSuite, GateChargesFreeHitBlocksClaimWillConsume) {
 
 // ---------------------------------------------------------------------------
 // M13 decode-block caching: pages filled DURING decode register via the hash
-// chain (DecodeStep: register -> slide -> acquire), so a later turn hits PAST
+// chain (AdvanceRequest: register -> slide -> acquire), so a later turn hits PAST
 // the previous prompt boundary. Fill timing: a round at container Size s has
 // N = s - 1 computed and registers pages up to N/block_size -- a tail page
 // registers one round late (finishing earlier frees its block hashless).
@@ -2534,7 +2534,7 @@ TEST_F(FlatDecodeCachingSuite, MultiTurnConversationReusesResponsePages) {
     EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start) << "pool back to baseline after all three turns";
 }
 
-// A decode page REGISTERS (DecodeStep registers before the slide) and a later
+// A decode page REGISTERS (AdvanceRequest registers before the slide) and a later
 // ReclaimExpired punches it: the punch frees the block WITH its hash intact.
 class FlatDecodeCachingSmallWindowSuite : public FlatDecodeCachingSuite {
 protected:
@@ -3763,7 +3763,8 @@ TEST(HeteroBlockSize, SpecsCarryPerGroupBlockSize) {
     cfg.paged_cache_groups[0].block_size = 4;
     cfg.paged_cache_groups[1].block_size = 8;
 
-    std::vector<KvCacheSpec> specs = MakeSpecsFromConfig(cfg);
+    BlockPoolSet pools(MakeFlatBlockPoolConfigs(cfg));
+    std::vector<KvCacheSpec> specs = MakeSpecsFromConfig(cfg, pools);
     ASSERT_EQ(specs.size(), 2u);
     EXPECT_EQ(specs[0].block_size, 4);
     EXPECT_EQ(specs[1].block_size, 8);
@@ -3783,13 +3784,13 @@ static std::unique_ptr<KvCacheCoordinator> MakeCoordinatorFrom(std::vector<std::
 
 TEST(HeteroBlockSize, MakeCoordinatorAcceptsDivisibleBlockSizes) {
     auto coord = MakeCoordinatorFrom({4, 8});
-    EXPECT_EQ(coord->BaseBlockSize(), 4);  // gcd(4,8)
+    EXPECT_EQ(coord->BaseBlockSize(), 4);           // gcd(4,8)
     EXPECT_EQ(coord->HistoryAlignmentTokens(), 8);  // history lcm(4,8)
 }
 
 TEST(HeteroBlockSize, BaseAndLcmForThreeGroups) {
     auto coord = MakeCoordinatorFrom({4, 6, 8});
-    EXPECT_EQ(coord->BaseBlockSize(), 2);  // gcd(4,6,8)
+    EXPECT_EQ(coord->BaseBlockSize(), 2);            // gcd(4,6,8)
     EXPECT_EQ(coord->HistoryAlignmentTokens(), 24);  // history lcm(4,6,8)
 }
 

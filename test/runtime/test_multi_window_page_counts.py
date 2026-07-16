@@ -68,6 +68,7 @@ def _load(mod_name: str, file_name: str):
     return mod
 
 
+_contract = _load("tokenspeed.runtime.configs.flat_kv_contract", "flat_kv_contract.py")
 _pcs = _load("paged_cache_spec_for_page_counts", "paged_cache_spec.py")
 compute_paged_cache_group_page_counts = _pcs.compute_paged_cache_group_page_counts
 compute_flat_capture_cols = _pcs.compute_flat_capture_cols
