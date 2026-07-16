@@ -311,6 +311,8 @@ def mm(
         quant: Explicit quant type override.  One of ``"mxfp8"``,
             ``"fp8"``, ``"nvfp4"``, ``"mxfp4"``, ``"none"``.
             If ``None``, inferred from input dtypes and scales.
+        enable_pdl: Whether to request Programmatic Dependent Launch support
+            from kernels that accept it.
         override: Force selection of a specific kernel by name (e.g.
             ``"cublaslt_mm_nvfp4"``). Bypasses heuristic scoring.
         expected_kernel_name: Debug hint for expected kernel selection.
@@ -433,6 +435,31 @@ def bmm(
     If ``out`` is provided, kernels that support direct output write into that
     buffer. The output may be a strided view but must have contiguous rows
     (``stride(-1) == 1``).
+
+    Args:
+        A: Activation batch ``[batch, M, K]``.
+        B: Weight batch ``[batch, N, K]``.
+        A_scales: Activation scales.
+        B_scales: Weight scales (layout depends on quant type).
+        bias: Optional bias vector of shape ``[N]`` or per-batch bias matrix
+            of shape ``[batch, N]`` added to the output. When the selected
+            kernel supports a fused bias epilogue (see
+            ``_KERNELS_WITH_FUSED_BIAS``) it is passed into the kernel;
+            otherwise it is added after the BMM.
+        out: Optional output buffer. The output may be a strided view
+            but must have contiguous rows (``stride(-1) == 1``).
+        out_dtype: Output dtype (defaults to ``A.dtype``).
+        alpha: Global scaling factor (nvfp4 only).
+        block_size: Block size for block-wise quantization, e.g.
+            ``[128, 128]``.
+        quant: Explicit quant type override. One of ``"mxfp8"``,
+            ``"fp8"``, ``"nvfp4"``, ``"mxfp4"``, ``"none"``.
+            If ``None``, inferred from input dtypes and scales.
+        enable_pdl: Whether to request Programmatic Dependent Launch support
+            from kernels that accept it.
+        override: Force selection of a specific kernel by name. Bypasses
+            heuristic scoring.
+        expected_kernel_name: Debug hint for expected kernel selection.
     """
     out_dtype = out_dtype or (out.dtype if out is not None else A.dtype)
     if A.ndim != 3:
