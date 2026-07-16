@@ -321,13 +321,11 @@ class TestInklingLoadWeights(unittest.TestCase):
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs a CUDA device")
-class TestInklingMoeBlockDeferredFinalize(unittest.TestCase):
-    """The sparse block's deferred branch (routed trtllm do_finalize=False +
-    moe_finalize_fuse_shared with the gate's full [T, k+S] weights) must
-    match the fallback branch (in-kernel finalize + separate shared add) on
-    the same weights."""
+class TestInklingUnquantMoeBlock(unittest.TestCase):
+    """The unquant sparse block (checkpoint bf16 experts) routes to the cutlass
+    kernel; it must load weights and run a forward to a finite output."""
 
-    def test_deferred_matches_fallback(self):
+    def test_unquant_moe_forward(self):
         from tokenspeed_kernel.platform import ArchVersion, current_platform
 
         plat = current_platform()
@@ -364,7 +362,10 @@ class TestInklingMoeBlockDeferredFinalize(unittest.TestCase):
                     block = InklingSparseMoeBlock(text, mapping, layer_id=2)
                 finally:
                     torch.set_default_dtype(torch.float32)
-            self.assertTrue(block.experts.supports_deferred_finalize)
+            # The unquant path routes to the cutlass kernel (the vendor cubin
+            # warp-illegal-addresses at small batch; see trtllm_unquant.py), so
+            # it finalizes in-kernel and never defers.
+            self.assertFalse(block.experts.supports_deferred_finalize)
             self.assertFalse(block.experts.support_routing)
 
             with torch.no_grad():
@@ -378,21 +379,9 @@ class TestInklingMoeBlockDeferredFinalize(unittest.TestCase):
             )
             block.comm_manager.get_num_tokens = lambda ctx: (num_tokens, num_tokens)
 
-            out_deferred = block(x, ctx=None)
-
-            # Same block, same weights, forced down the fallback branch.
-            block.experts.plan["supports_deferred_finalize"] = False
-            try:
-                out_fallback = block(x, ctx=None)
-            finally:
-                block.experts.plan["supports_deferred_finalize"] = True
-
-            self.assertEqual(out_deferred.shape, out_fallback.shape)
-            # The two branches round differently (f32 vs bf16 weight
-            # application, gamma pre- vs post-down-proj); tolerate bf16 noise.
-            torch.testing.assert_close(
-                out_deferred.float(), out_fallback.float(), atol=3e-2, rtol=3e-2
-            )
+            out = block(x, ctx=None)
+            self.assertEqual(out.shape, x.shape)
+            self.assertTrue(torch.isfinite(out).all())
         finally:
             moe_utils.MOE_BACKEND = saved_backend
             if saved_torch_moe is not None:

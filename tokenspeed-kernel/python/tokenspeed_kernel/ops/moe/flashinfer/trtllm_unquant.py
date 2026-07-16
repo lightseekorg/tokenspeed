@@ -32,6 +32,10 @@ from tokenspeed_kernel.signature import format_signatures
 platform = current_platform()
 next_power_of_2 = lambda value: 1 if value <= 1 else 1 << (value - 1).bit_length()
 
+# The trtllm-gen bf16 MoE cubin warp-illegal-addresses at small batch; route the
+# unquant path through cutlass until the vendor kernel is fixed.
+_USE_TRTLLM_UNQUANT = False
+
 
 if platform.is_nvidia:
     from flashinfer import trtllm_bf16_moe
@@ -42,6 +46,10 @@ if platform.is_nvidia:
     from flashinfer.fused_moe.core import (
         convert_to_block_layout,
         get_w2_permute_indices_with_cache,
+    )
+    from tokenspeed_kernel.ops.moe.flashinfer.cutlass_unquant import (
+        flashinfer_cutlass_unquant_moe_apply,
+        flashinfer_cutlass_unquant_moe_weights,
     )
 
     def flashinfer_trtllm_unquant_moe_weights(plan: dict, w: torch.nn.Module):
@@ -117,6 +125,19 @@ if platform.is_nvidia:
         ``router_logits``) and ``trtllm_bf16_routed_moe`` (precomputed
         ``topk_ids``/``topk_weights``); everything else is identical.
         """
+        if not _USE_TRTLLM_UNQUANT:
+            # Known-bad vendor cubin at small batch (see module note); the
+            # registrations pinned the cutlass weight layout at plan time.
+            return flashinfer_cutlass_unquant_moe_apply(
+                {},
+                x,
+                w,
+                router_logits,
+                topk_weights,
+                topk_ids,
+                do_finalize=do_finalize,
+            )
+
         if x.shape[0] == 0:
             # Idle DP ranks run a dummy forward with 0 tokens; the fused kernel
             # divides by the token count on the host. Skip the experts entirely.
@@ -209,7 +230,11 @@ if platform.is_nvidia:
         "apply",
         name="flashinfer_trtllm_unquant_moe_apply",
         solution="flashinfer_trtllm",
-        weight_preprocessor=flashinfer_trtllm_unquant_moe_weights,
+        weight_preprocessor=(
+            flashinfer_trtllm_unquant_moe_weights
+            if _USE_TRTLLM_UNQUANT
+            else flashinfer_cutlass_unquant_moe_weights
+        ),
         capability=CapabilityRequirement(
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(10, 0),
@@ -224,7 +249,7 @@ if platform.is_nvidia:
             "weight_dtype": frozenset({"unquant"}),
             "activation": frozenset({"silu", "swiglu"}),
             "routing_mode": frozenset({"kernel_routing"}),
-            "supports_deferred_finalize": frozenset({True}),
+            "supports_deferred_finalize": frozenset({_USE_TRTLLM_UNQUANT}),
             "supports_ep": frozenset({True}),
             "supports_all_to_all_ep": frozenset({False}),
             "ispp_alignment": frozenset({128}),
@@ -260,7 +285,11 @@ if platform.is_nvidia:
         "apply",
         name="flashinfer_trtllm_unquant_routed_moe_apply",
         solution="flashinfer_trtllm",
-        weight_preprocessor=flashinfer_trtllm_unquant_moe_weights,
+        weight_preprocessor=(
+            flashinfer_trtllm_unquant_moe_weights
+            if _USE_TRTLLM_UNQUANT
+            else flashinfer_cutlass_unquant_moe_weights
+        ),
         capability=CapabilityRequirement(
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(10, 0),
@@ -275,7 +304,7 @@ if platform.is_nvidia:
             "weight_dtype": frozenset({"unquant"}),
             "activation": frozenset({"silu", "swiglu"}),
             "routing_mode": frozenset({"precomputed_topk"}),
-            "supports_deferred_finalize": frozenset({True}),
+            "supports_deferred_finalize": frozenset({_USE_TRTLLM_UNQUANT}),
             "supports_ep": frozenset({True}),
             "supports_all_to_all_ep": frozenset({False}),
             "ispp_alignment": frozenset({128}),
