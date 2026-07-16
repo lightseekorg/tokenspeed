@@ -43,7 +43,7 @@ This module is intentionally a leaf (only depends on ``torch``) so every
 producer/consumer can import it without pulling in the Triton stage kernels.
 
 
-Why a swizzle at all
+Why swizzle at all
 --------------------
 An MXFP4 tensor carries one e8m0 block scale per 32 elements along K. The
 gfx950 ``v_mfma_scale_f32_*`` instructions consume those block scales from a
