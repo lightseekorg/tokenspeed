@@ -29,6 +29,7 @@ from tokenspeed_triton.experimental import gluon
 from tokenspeed_triton.experimental.gluon.language.amd.cdna4 import (
     async_copy as cdna4_async_copy,
 )
+from tokenspeed_triton.experimental.gluon.language.amd.gfx1250 import tdm as gfx1250_tdm
 from tokenspeed_triton.language.core import _aggregate as aggregate
 
 __all__ = [
@@ -36,6 +37,7 @@ __all__ = [
     "cdna4_async_copy",
     "gl",
     "gluon",
+    "gfx1250_tdm",
     "tl",
     "triton",
 ]
