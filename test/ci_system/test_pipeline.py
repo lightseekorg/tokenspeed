@@ -1,8 +1,15 @@
 import importlib.util
 import json
+import os
 import re
+import shlex
+import signal
+import subprocess
+import sys
 import textwrap
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pipeline as pipeline_module
 import pytest
@@ -65,6 +72,13 @@ def test_pr_workflows_use_matrix_timeout_and_upload_all_ci_artifacts(workflow_pa
     assert job["timeout-minutes"] == "${{ matrix.timeout_minutes }}"
     assert upload_step["with"]["path"] == "${{ env.WORK_DIR }}/.ci-artifacts/"
     assert upload_step["with"]["include-hidden-files"] is True
+
+
+def test_nvidia_workflow_keeps_install_and_execute_results_separate():
+    workflow = (REPO_ROOT / ".github/workflows/pr-test-nvidia.yml").read_text()
+
+    assert "--result-json .ci-artifacts/install-result.json" in workflow
+    assert workflow.count("--result-json .ci-artifacts/result.json") == 1
 
 
 @pytest.mark.parametrize("workflow_path", PR_TEST_WORKFLOWS)
@@ -179,7 +193,7 @@ def test_server_log_check_skips_install_only_and_dry_run(tmp_path, stages_run, d
     assert check is None
 
 
-def test_execute_task_scans_after_cleanup_and_preserves_workload_error(
+def test_execute_task_scans_after_shutdown_and_preserves_workload_error(
     tmp_path, monkeypatch
 ):
     config_path = tmp_path / "task.yaml"
@@ -258,12 +272,586 @@ def test_execute_task_scans_after_cleanup_and_preserves_workload_error(
 
     result = json.loads(result_path.read_text())
     assert returncode == 1
-    assert events == ["workload", "stop", "cleanup", "scan"]
+    assert events == ["workload", "stop", "scan", "cleanup"]
     assert result["error"] == "workload boom"
     assert result["config"] == config_path.name
     assert result["timeout_minutes"] == 75
     assert result["server_log_check"]["passed"] is False
     assert result["server_log_check"]["match_count"] == 1
+
+
+def test_execute_task_records_failed_typed_shutdown_before_runner_cleanup(
+    tmp_path, monkeypatch
+):
+    config_path = tmp_path / "task.yaml"
+    config_path.write_text(textwrap.dedent("""\
+            api_version: ci.tokenspeed.io/v1
+            name: perf-managed-shutdown
+            type: perf
+            triggers: [manual]
+            runner:
+              labels: [h100-1gpu]
+            server:
+              command: fake-server
+              ready:
+                url: http://127.0.0.1:8000/readiness
+              shutdown:
+                target: root
+                signal: SIGTERM
+                timeout_seconds: 10
+                expected_exit_code: 0
+                ports: [8000, 8001]
+                gpu_indices: [0]
+                max_memory_mib: 4
+                output: .ci-artifacts/shutdown.json
+              forbidden_log_patterns: [fatal]
+            perf:
+              command: fake-workload
+            """))
+    result_path = tmp_path / "result.json"
+    events = []
+
+    monkeypatch.setattr(
+        pipeline_module, "setup_runner", lambda *args, **kwargs: ({}, None)
+    )
+    monkeypatch.setattr(
+        pipeline_module, "kill_ready_port_listener", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "start_managed_server",
+        lambda *args, **kwargs: SimpleNamespace(process=object()),
+    )
+    monkeypatch.setattr(pipeline_module, "poll_readiness", lambda *args, **kwargs: None)
+
+    def run(command, **kwargs):
+        events.append("workload")
+        return {"command": command, "returncode": 0, "output": "ok"}
+
+    def shutdown(*args, **kwargs):
+        events.append("shutdown")
+        return {
+            "passed": False,
+            "failures": ["child PID 42 survived"],
+            "fallback_used": True,
+        }
+
+    original_check = check_server_log_patterns
+
+    def scan(task, stages_run, log_path, *, dry_run=False):
+        events.append("scan")
+        return original_check(task, stages_run, log_path, dry_run=dry_run)
+
+    def cleanup(*args, **kwargs):
+        events.append("cleanup")
+
+    monkeypatch.setattr(pipeline_module, "shell_run", run)
+    monkeypatch.setattr(pipeline_module, "stop_managed_server", shutdown)
+    monkeypatch.setattr(pipeline_module, "check_server_log_patterns", scan)
+    monkeypatch.setattr(pipeline_module, "cleanup_runner", cleanup)
+
+    returncode = pipeline_module.execute_task(
+        config=config_path.name,
+        runner="h100-1gpu",
+        work_dir=str(tmp_path),
+        dry_run=False,
+        print_plan=False,
+        result_json=str(result_path),
+    )
+
+    result = json.loads(result_path.read_text())
+    assert returncode == 1
+    assert events == ["workload", "shutdown", "scan", "cleanup"]
+    assert result["server_shutdown_check"]["fallback_used"] is True
+    assert result["error"] == "server shutdown check failed: child PID 42 survived"
+
+
+def test_execute_task_aborts_managed_server_when_typed_shutdown_raises(
+    tmp_path, monkeypatch
+):
+    config_path = tmp_path / "task.yaml"
+    config_path.write_text(textwrap.dedent("""\
+            api_version: ci.tokenspeed.io/v1
+            name: perf-managed-shutdown-exception
+            type: perf
+            triggers: [manual]
+            runner:
+              labels: [h100-1gpu]
+            server:
+              command: fake-server
+              ready:
+                url: http://127.0.0.1:8000/readiness
+              shutdown:
+                target: root
+                signal: SIGTERM
+                timeout_seconds: 10
+                expected_exit_code: 0
+                ports: [8000]
+                gpu_indices: [0]
+                max_memory_mib: 4
+                output: .ci-artifacts/shutdown.json
+            perf:
+              command: fake-workload
+            """))
+    result_path = tmp_path / "result.json"
+    managed = SimpleNamespace(process=object())
+    events = []
+
+    monkeypatch.setattr(
+        pipeline_module, "setup_runner", lambda *args, **kwargs: ({}, None)
+    )
+    monkeypatch.setattr(
+        pipeline_module, "kill_ready_port_listener", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        pipeline_module, "start_managed_server", lambda *args, **kwargs: managed
+    )
+    monkeypatch.setattr(pipeline_module, "poll_readiness", lambda *args, **kwargs: None)
+
+    def run(command, **kwargs):
+        events.append("workload")
+        return {"command": command, "returncode": 0, "output": "ok"}
+
+    def shutdown(*args, **kwargs):
+        events.append("shutdown")
+        raise RuntimeError("simulated artifact write failure")
+
+    def abort(server):
+        assert server is managed
+        events.append("abort")
+        return {"passed": True, "failures": [], "survivors": []}
+
+    def scan(*args, **kwargs):
+        events.append("scan")
+        return None
+
+    def cleanup(*args, **kwargs):
+        events.append("cleanup")
+
+    monkeypatch.setattr(pipeline_module, "shell_run", run)
+    monkeypatch.setattr(pipeline_module, "stop_managed_server", shutdown)
+    monkeypatch.setattr(pipeline_module, "abort_managed_server", abort)
+    monkeypatch.setattr(pipeline_module, "check_server_log_patterns", scan)
+    monkeypatch.setattr(pipeline_module, "cleanup_runner", cleanup)
+
+    returncode = pipeline_module.execute_task(
+        config=config_path.name,
+        runner="h100-1gpu",
+        work_dir=str(tmp_path),
+        dry_run=False,
+        print_plan=False,
+        result_json=str(result_path),
+    )
+
+    result = json.loads(result_path.read_text())
+    assert returncode == 1
+    assert events == ["workload", "shutdown", "abort", "scan", "cleanup"]
+    assert result["server_shutdown_check"]["abort"]["passed"] is True
+    assert result["error"].startswith("server shutdown check raised an exception")
+
+
+def test_before_cleanup_diagnostics_failure_cannot_skip_managed_shutdown(
+    tmp_path, monkeypatch
+):
+    config_path = tmp_path / "task.yaml"
+    config_path.write_text(textwrap.dedent("""\
+            api_version: ci.tokenspeed.io/v1
+            name: perf-diagnostics-shutdown-order
+            type: perf
+            triggers: [manual]
+            runner:
+              labels: [b300-4gpu]
+            server:
+              command: fake-server
+              ready:
+                url: http://127.0.0.1:8000/readiness
+              shutdown:
+                target: root
+                signal: SIGTERM
+                timeout_seconds: 10
+                expected_exit_code: 0
+                ports: [8000]
+                gpu_indices: [0]
+                max_memory_mib: 4
+                output: .ci-artifacts/shutdown.json
+            perf:
+              command: fake-workload
+            """))
+    result_path = tmp_path / "result.json"
+    managed = SimpleNamespace(process=object())
+    events = []
+
+    monkeypatch.setattr(
+        pipeline_module, "setup_runner", lambda *args, **kwargs: ({}, None)
+    )
+    monkeypatch.setattr(
+        pipeline_module, "kill_ready_port_listener", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        pipeline_module, "start_managed_server", lambda *args, **kwargs: managed
+    )
+    monkeypatch.setattr(pipeline_module, "poll_readiness", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        pipeline_module,
+        "shell_run",
+        lambda command, **kwargs: {
+            "command": command,
+            "returncode": 0,
+            "output": "ok",
+        },
+    )
+
+    def diagnostics(label, *args, **kwargs):
+        events.append(label)
+        if label == "before cleanup":
+            raise RuntimeError("diagnostics boom")
+
+    def shutdown(*args, **kwargs):
+        events.append("shutdown")
+        return {"passed": True, "failures": [], "fallback_used": False}
+
+    def cleanup(*args, **kwargs):
+        events.append("cleanup")
+
+    monkeypatch.setattr(pipeline_module, "run_perf_diagnostics", diagnostics)
+    monkeypatch.setattr(pipeline_module, "stop_managed_server", shutdown)
+    monkeypatch.setattr(
+        pipeline_module, "check_server_log_patterns", lambda *a, **k: None
+    )
+    monkeypatch.setattr(pipeline_module, "cleanup_runner", cleanup)
+
+    returncode = pipeline_module.execute_task(
+        config=config_path.name,
+        runner="b300-4gpu",
+        work_dir=str(tmp_path),
+        dry_run=False,
+        print_plan=False,
+        result_json=str(result_path),
+    )
+
+    result = json.loads(result_path.read_text())
+    assert returncode == 1
+    assert events.index("before cleanup") < events.index("shutdown")
+    assert events.index("shutdown") < events.index("cleanup")
+    assert result["error"] == ("before_cleanup_diagnostics failed: diagnostics boom")
+    assert result["cleanup_errors"] == [
+        {
+            "phase": "before_cleanup_diagnostics",
+            "exception_type": "RuntimeError",
+            "error": "diagnostics boom",
+        }
+    ]
+
+
+def test_cleanup_failures_are_recorded_without_overwriting_workload_error(
+    tmp_path, monkeypatch
+):
+    config_path = tmp_path / "task.yaml"
+    config_path.write_text(textwrap.dedent("""\
+            api_version: ci.tokenspeed.io/v1
+            name: perf-cleanup-errors
+            type: perf
+            triggers: [manual]
+            runner:
+              labels: [b300-4gpu]
+            perf:
+              command: fake-workload
+            """))
+    result_path = tmp_path / "result.json"
+    events = []
+
+    class FailingManager:
+        def run(self, *args, **kwargs):
+            events.append("workload")
+            raise RuntimeError("workload boom")
+
+        def terminate_all(self, *args, **kwargs):
+            events.append("pgm terminate")
+            raise RuntimeError("pgm cleanup boom")
+
+    manager = FailingManager()
+    monkeypatch.setattr(
+        pipeline_module,
+        "setup_runner",
+        lambda *args, **kwargs: ({}, manager),
+    )
+
+    def diagnostics(label, *args, **kwargs):
+        events.append(label)
+        if label == "before cleanup":
+            raise RuntimeError("before diagnostics boom")
+        if label == "after cleanup":
+            raise RuntimeError("after diagnostics boom")
+
+    def cleanup(*args, **kwargs):
+        events.append("cleanup")
+        raise RuntimeError("runner cleanup boom")
+
+    monkeypatch.setattr(pipeline_module, "run_perf_diagnostics", diagnostics)
+    monkeypatch.setattr(pipeline_module, "cleanup_runner", cleanup)
+
+    returncode = pipeline_module.execute_task(
+        config=config_path.name,
+        runner="b300-4gpu",
+        work_dir=str(tmp_path),
+        dry_run=False,
+        print_plan=False,
+        result_json=str(result_path),
+    )
+
+    result = json.loads(result_path.read_text())
+    phases = [item["phase"] for item in result["cleanup_errors"]]
+    assert returncode == 1
+    assert result["error"] == "workload boom"
+    assert phases == [
+        "before_cleanup_diagnostics",
+        "process_group_termination",
+        "process_group_hygiene",
+        "runner_cleanup",
+        "after_cleanup_diagnostics",
+    ]
+    assert events.count("pgm terminate") == 2
+    assert events[-2:] == ["cleanup", "after cleanup"]
+
+
+def test_shell_run_sigterm_terminates_and_reaps_entire_stage_process_group(tmp_path):
+    stage_pid_path = tmp_path / "stage.pid"
+    descendant_pid_path = tmp_path / "descendant.pid"
+    payload = textwrap.dedent(f"""
+        import os
+        import subprocess
+        import sys
+        import time
+        from pathlib import Path
+
+        Path({str(stage_pid_path)!r}).write_text(str(os.getpid()))
+        child = subprocess.Popen([
+            sys.executable,
+            "-c",
+            "import time; time.sleep(999)",
+        ])
+        Path({str(descendant_pid_path)!r}).write_text(str(child.pid))
+        time.sleep(999)
+        """)
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(payload)}"
+    helper_path = tmp_path / "shell_run_helper.py"
+    helper_path.write_text(textwrap.dedent(f"""
+            import os
+            import sys
+            from pathlib import Path
+
+            sys.path.insert(0, {str(Path(pipeline_module.__file__).parent)!r})
+            from pipeline import shell_run
+
+            shell_run(
+                {command!r},
+                env=dict(os.environ),
+                cwd=Path({str(tmp_path)!r}),
+                dry_run=False,
+            )
+            """))
+    helper = subprocess.Popen(
+        [sys.executable, str(helper_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    recorded_pids = []
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if stage_pid_path.exists() and descendant_pid_path.exists():
+                break
+            if helper.poll() is not None:
+                output = helper.stdout.read() if helper.stdout else ""
+                raise AssertionError(f"shell_run helper exited early: {output}")
+            time.sleep(0.02)
+        assert stage_pid_path.exists() and descendant_pid_path.exists()
+        recorded_pids = [
+            int(stage_pid_path.read_text()),
+            int(descendant_pid_path.read_text()),
+        ]
+
+        os.kill(helper.pid, signal.SIGTERM)
+        helper.wait(timeout=10)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and any(
+            Path(f"/proc/{pid}").exists() for pid in recorded_pids
+        ):
+            time.sleep(0.02)
+
+        output = helper.stdout.read() if helper.stdout else ""
+        assert helper.returncode == 128 + signal.SIGTERM, output
+        remaining = {
+            pid: Path(f"/proc/{pid}/stat").read_text()
+            for pid in recorded_pids
+            if Path(f"/proc/{pid}/stat").exists()
+        }
+        assert not remaining, remaining
+    finally:
+        if helper.poll() is None:
+            helper.kill()
+            helper.wait(timeout=5)
+        for pid in recorded_pids:
+            if Path(f"/proc/{pid}").exists():
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+
+def test_shell_run_defers_sigterm_until_popen_result_can_be_cleaned(tmp_path):
+    stage_pid_path = tmp_path / "spawn-window-stage.pid"
+    helper_path = tmp_path / "spawn_window_helper.py"
+    payload = "import time; time.sleep(999)"
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(payload)}"
+    helper_path.write_text(textwrap.dedent(f"""
+            import os
+            import signal
+            import sys
+            from pathlib import Path
+
+            sys.path.insert(0, {str(Path(pipeline_module.__file__).parent)!r})
+            import pipeline
+
+            real_popen = pipeline.subprocess.Popen
+
+            def signal_before_return(*args, **kwargs):
+                process = real_popen(*args, **kwargs)
+                Path({str(stage_pid_path)!r}).write_text(str(process.pid))
+                os.kill(os.getpid(), signal.SIGTERM)
+                return process
+
+            pipeline.subprocess.Popen = signal_before_return
+            pipeline.shell_run(
+                {command!r},
+                env=dict(os.environ),
+                cwd=Path({str(tmp_path)!r}),
+                dry_run=False,
+            )
+            """))
+    helper = subprocess.Popen(
+        [sys.executable, str(helper_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    stage_pid = None
+    try:
+        helper.wait(timeout=10)
+        output = helper.stdout.read() if helper.stdout else ""
+        assert helper.returncode == 128 + signal.SIGTERM, output
+        assert stage_pid_path.exists(), output
+        stage_pid = int(stage_pid_path.read_text())
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and Path(f"/proc/{stage_pid}").exists():
+            time.sleep(0.02)
+        assert not Path(f"/proc/{stage_pid}").exists()
+    finally:
+        if helper.poll() is None:
+            helper.kill()
+            helper.wait(timeout=5)
+        if stage_pid is not None and Path(f"/proc/{stage_pid}").exists():
+            try:
+                os.kill(stage_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def test_shell_run_term_grace_allows_stage_to_clean_escaped_child(tmp_path):
+    stage_pid_path = tmp_path / "nested-stage.pid"
+    escaped_pid_path = tmp_path / "nested-escaped.pid"
+    ready_path = tmp_path / "nested-stage.ready"
+    payload = textwrap.dedent(f"""
+        import os
+        import signal
+        import subprocess
+        import sys
+        import time
+        from pathlib import Path
+
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(999)"],
+            start_new_session=True,
+        )
+        Path({str(stage_pid_path)!r}).write_text(str(os.getpid()))
+        Path({str(escaped_pid_path)!r}).write_text(str(child.pid))
+
+        def shutdown(*_args):
+            # Model the bounded managed-server abort path.  The escaped child
+            # is deliberately outside this stage PGID.
+            time.sleep(0.5)
+            child.terminate()
+            child.wait(timeout=5)
+            raise SystemExit(128 + signal.SIGTERM)
+
+        signal.signal(signal.SIGTERM, shutdown)
+        Path({str(ready_path)!r}).write_text("ready")
+        while True:
+            time.sleep(1)
+        """)
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(payload)}"
+    helper_path = tmp_path / "nested_cleanup_helper.py"
+    helper_path.write_text(textwrap.dedent(f"""
+            import os
+            import sys
+            from pathlib import Path
+
+            sys.path.insert(0, {str(Path(pipeline_module.__file__).parent)!r})
+            from pipeline import shell_run
+
+            shell_run(
+                {command!r},
+                env=dict(os.environ),
+                cwd=Path({str(tmp_path)!r}),
+                dry_run=False,
+            )
+            """))
+    helper = subprocess.Popen(
+        [sys.executable, str(helper_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    recorded_pids = []
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not ready_path.exists():
+            if helper.poll() is not None:
+                output = helper.stdout.read() if helper.stdout else ""
+                raise AssertionError(f"nested cleanup helper exited early: {output}")
+            time.sleep(0.02)
+        assert ready_path.exists()
+        recorded_pids = [
+            int(stage_pid_path.read_text()),
+            int(escaped_pid_path.read_text()),
+        ]
+
+        os.kill(helper.pid, signal.SIGTERM)
+        helper.wait(timeout=10)
+        output = helper.stdout.read() if helper.stdout else ""
+        assert helper.returncode == 128 + signal.SIGTERM, output
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and any(
+            Path(f"/proc/{pid}").exists() for pid in recorded_pids
+        ):
+            time.sleep(0.02)
+        remaining = {
+            pid: Path(f"/proc/{pid}/stat").read_text()
+            for pid in recorded_pids
+            if Path(f"/proc/{pid}/stat").exists()
+        }
+        assert not remaining, remaining
+    finally:
+        if helper.poll() is None:
+            helper.kill()
+            helper.wait(timeout=5)
+        for pid in recorded_pids:
+            if Path(f"/proc/{pid}").exists():
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
 
 def test_stale_process_patterns_match_smg_router_proctitle():
@@ -317,7 +905,7 @@ def test_nvidia_runner_groups_split_arm_from_x86():
     assert not runner_matches_group("amd-mi35x-1gpu-test", "nvidia-x86")
 
 
-def test_nvidia_gpu_cleanup_runner_prefixes_cover_gb200_and_b300():
+def test_nvidia_gpu_cleanup_runner_prefixes_cover_blackwell_runners():
     assert is_gb200_runner("gb200-1gpu")
     assert is_gb200_runner("gb200-4gpu-perf")
     assert not is_gb200_runner("b300-4gpu")
@@ -325,7 +913,7 @@ def test_nvidia_gpu_cleanup_runner_prefixes_cover_gb200_and_b300():
     assert should_run_nvidia_gpu_cleanup("gb200-1gpu")
     assert should_run_nvidia_gpu_cleanup("gb200-4gpu-perf")
     assert should_run_nvidia_gpu_cleanup("b300-4gpu")
-    assert not should_run_nvidia_gpu_cleanup("b200-4gpu")
+    assert should_run_nvidia_gpu_cleanup("b200-4gpu")
     assert not should_run_nvidia_gpu_cleanup("h100-1gpu")
     assert not should_run_nvidia_gpu_cleanup("amd-mi35x-2gpu-test")
     assert not should_run_nvidia_gpu_cleanup("amd-mi355-1gpu-bench")
@@ -416,6 +1004,153 @@ def test_workload_env_removes_pipeline_controls_before_runtime_preflight(tmp_pat
     assert pipeline_module.B200_RUNNER_LABEL_ENV not in workload_env
     assert pipeline_module.EXCLUDED_RUNNER_LABELS_ENV not in workload_env
     assert audit_environment(workload_env, home=tmp_path)["ok"] is True
+
+
+def _write_fake_venv(venv_path: Path, *, system_site_packages: bool = False) -> None:
+    (venv_path / "bin").mkdir(parents=True, exist_ok=True)
+    (venv_path / "bin/python").write_text("")
+    (venv_path / "pyvenv.cfg").write_text(
+        "include-system-site-packages = "
+        f"{'true' if system_site_packages else 'false'}\n"
+    )
+
+
+def test_setup_runner_recovers_durable_managed_servers_before_other_cleanup(
+    tmp_path, monkeypatch
+):
+    events = []
+
+    def recover(env, *, dry_run=False):
+        events.append(("recover", dict(env), dry_run))
+        return []
+
+    def run(command, **kwargs):
+        events.append(("command", command))
+        return {"command": command, "returncode": 0, "output": ""}
+
+    monkeypatch.setattr(pipeline_module, "cleanup_stale_managed_servers", recover)
+    monkeypatch.setattr(pipeline_module, "shell_run", run)
+
+    pipeline_module.setup_runner(
+        "h100-1gpu",
+        {"PATH": "/usr/bin", "RUNNER_NAME": "runner-1"},
+        tmp_path,
+        True,
+    )
+
+    assert events[0] == (
+        "recover",
+        {"PATH": "/usr/bin", "RUNNER_NAME": "runner-1"},
+        True,
+    )
+    assert any(event[0] == "command" for event in events[1:])
+
+
+def test_setup_runner_creates_strict_task_venv_and_scrubs_python_overlays(
+    tmp_path, monkeypatch
+):
+    commands = []
+    venv_path = pipeline_module.create_isolated_venv_path(
+        tmp_path, "perf-active-mm", "amd-mi350-1gpu-bench"
+    )
+
+    def run(command, **kwargs):
+        commands.append(command)
+        if command.startswith("python3 -m venv --clear"):
+            _write_fake_venv(venv_path)
+        return {"command": command, "returncode": 0, "output": ""}
+
+    monkeypatch.setattr(pipeline_module, "shell_run", run)
+
+    environment, manager = pipeline_module.setup_runner(
+        "amd-mi350-1gpu-bench",
+        {
+            "PATH": "/usr/bin",
+            "PYTHONHOME": "/old/python",
+            "PYTHONPATH": "/source/overlay",
+            "PIP_INDEX_URL": "https://unreviewed.example/simple",
+            "PIP_USER": "1",
+            "PIP_TARGET": "/tmp/target",
+            "PIP_PREFIX": "/tmp/prefix",
+            "VIRTUAL_ENV": "/old/venv",
+        },
+        tmp_path,
+        False,
+        isolated_python=True,
+        task_name="perf-active-mm",
+    )
+
+    assert manager is None
+    assert commands[0].startswith("python3 -m venv --clear")
+    assert all("--system-site-packages" not in command for command in commands)
+    assert environment["CI_VENV_PATH"] == str(venv_path)
+    assert environment["VIRTUAL_ENV"] == str(venv_path)
+    assert environment["PATH"].startswith(f"{venv_path}/bin:")
+    assert environment["PYTHONNOUSERSITE"] == "1"
+    assert environment["PIP_REQUIRE_VIRTUALENV"] == "1"
+    for key in (
+        "PYTHONHOME",
+        "PYTHONPATH",
+        "PIP_INDEX_URL",
+        "PIP_USER",
+        "PIP_TARGET",
+        "PIP_PREFIX",
+    ):
+        assert key not in environment
+
+
+def test_setup_runner_reuses_only_existing_strict_task_venv(tmp_path, monkeypatch):
+    venv_path = pipeline_module.create_isolated_venv_path(
+        tmp_path, "perf-active-mm", "amd-mi350-1gpu-bench"
+    )
+    _write_fake_venv(venv_path)
+    commands = []
+
+    def run(command, **kwargs):
+        commands.append(command)
+        return {"command": command, "returncode": 0, "output": ""}
+
+    monkeypatch.setattr(pipeline_module, "shell_run", run)
+
+    environment, _ = pipeline_module.setup_runner(
+        "amd-mi350-1gpu-bench",
+        {"PATH": "/usr/bin"},
+        tmp_path,
+        False,
+        reuse_state=True,
+        isolated_python=True,
+        task_name="perf-active-mm",
+    )
+
+    assert environment["CI_VENV_PATH"] == str(venv_path)
+    assert not any(command.startswith("python3 -m venv") for command in commands)
+
+
+def test_setup_runner_fails_closed_when_reused_venv_exposes_system_packages(
+    tmp_path,
+):
+    venv_path = pipeline_module.create_isolated_venv_path(
+        tmp_path, "perf-active-mm", "amd-mi350-1gpu-bench"
+    )
+    _write_fake_venv(venv_path, system_site_packages=True)
+
+    with pytest.raises(RuntimeError, match="include-system-site-packages = false"):
+        pipeline_module.setup_runner(
+            "amd-mi350-1gpu-bench",
+            {"PATH": "/usr/bin"},
+            tmp_path,
+            False,
+            reuse_state=True,
+            isolated_python=True,
+            task_name="perf-active-mm",
+        )
+
+
+def test_cuda13_ptxas_fix_uses_active_python_triton_install():
+    install_script = (REPO_ROOT / "test/ci_system/install_deps.sh").read_text()
+
+    assert 'importlib.util.find_spec("triton")' in install_script
+    assert "/usr/local/lib/python3.12/dist-packages/triton" not in install_script
 
 
 def test_extract_evalscope_score_from_pipe_table():
@@ -822,6 +1557,162 @@ def test_validate_task_rejects_invalid_timeout_minutes(tmp_path, timeout_minutes
     task["timeout_minutes"] = timeout_minutes
 
     with pytest.raises(ValueError, match=r"timeout_minutes must be an integer"):
+        validate_task(task, path)
+
+
+def test_validate_active_mm_task_uses_strict_python_and_typed_shutdown():
+    import yaml as _yaml
+
+    path = REPO_ROOT / "test/ci/perf/minimax-m3-mxfp8-active-mm.yaml"
+    task = _yaml.safe_load(path.read_text())
+
+    validate_task(task, path)
+
+    assert task["isolated_python"] is True
+    package_preflight = next(
+        command
+        for command in task["install"]
+        if "minimax_m3_smg_package_preflight.py" in command
+    )
+    assert "--install-published" in package_preflight
+    assert "--pip-install-report" in package_preflight
+    assert task["preflight"] == [
+        "python3 test/ci_system/runtime_env_preflight.py "
+        "--output .ci-artifacts/minimax-m3-active-mm/runtime_environment.json"
+    ]
+    stages = pipeline_module.get_stage_commands(task)
+    assert [name for name, _ in stages] == [
+        "install",
+        "preflight",
+        "server",
+        "perf",
+    ]
+    assert task["server"]["shutdown"] == {
+        "target": "root",
+        "signal": "SIGTERM",
+        "timeout_seconds": 120,
+        "expected_exit_code": 0,
+        "ports": [8000, 8001],
+        "gpu_indices": [0, 1, 2, 3],
+        "max_memory_mib": 16,
+        "output": ".ci-artifacts/minimax-m3-active-mm/shutdown_validation.json",
+    }
+
+
+def test_encoder_graph_ab_task_keeps_default_physical_gpu_placement():
+    import yaml as _yaml
+
+    path = REPO_ROOT / "test/ci/perf/minimax-m3-mxfp8-encoder-graph-ab.yaml"
+    task = _yaml.safe_load(path.read_text())
+
+    validate_task(task, path)
+
+    assert task["isolated_python"] is True
+    assert task["preflight"] == [
+        "python3 test/ci_system/runtime_env_preflight.py "
+        "--output .ci-artifacts/minimax-m3-encoder-graph-ab/"
+        "runtime-environment.json"
+    ]
+    assert not any("runtime_env_preflight.py" in command for command in task["install"])
+    command = task["perf"]["command"]
+    assert "--base-gpu-id" not in command
+    assert "--gpu-id-step" not in command
+    assert "CUDA_VISIBLE_DEVICES" not in command
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "test/ci/eval/minimax-m3-mxfp8-evalscope-gsm8k.yaml",
+        "test/ci/perf/minimax-m3-bf16-evalscope-random.yaml",
+        "test/ci/perf/minimax-m3-mxfp8-active-mm.yaml",
+        "test/ci/perf/minimax-m3-mxfp8-evalscope-random.yaml",
+        "test/ci/perf/minimax-m3-mxfp8-exact-longctx.yaml",
+    ],
+)
+def test_minimax_m3_release_servers_preflight_real_env_and_use_typed_shutdown(
+    relative_path,
+):
+    import yaml as _yaml
+
+    path = REPO_ROOT / relative_path
+    task = _yaml.safe_load(path.read_text())
+
+    validate_task(task, path)
+    stages = pipeline_module.get_stage_commands(task)
+    stage_names = [name for name, _ in stages]
+    assert stage_names.index("preflight") < stage_names.index("server")
+    assert any("runtime_env_preflight.py" in command for command in task["preflight"])
+    assert not any("runtime_env_preflight.py" in command for command in task["install"])
+    shutdown = task["server"]["shutdown"]
+    assert shutdown["target"] == "root"
+    assert shutdown["signal"] == "SIGTERM"
+    assert shutdown["expected_exit_code"] == 0
+    assert shutdown["ports"] == [8000, 8001]
+    assert shutdown["gpu_indices"] == [0, 1, 2, 3]
+    assert shutdown["max_memory_mib"] == 16
+    patterns = task["server"]["forbidden_log_patterns"]
+    assert "CancelledError" in patterns
+    assert "resource_tracker:.*leaked" in patterns
+
+
+def test_get_stage_commands_rejects_malformed_preflight():
+    task = {
+        "name": "invalid-preflight",
+        "type": "perf",
+        "runner": {"labels": ["b200-4gpu"]},
+        "preflight": "python audit.py",
+    }
+
+    with pytest.raises(ValueError, match="preflight must be a string list"):
+        pipeline_module.get_stage_commands(task)
+
+
+@pytest.mark.parametrize("isolated_python", ["true", 1, [], None])
+def test_validate_task_rejects_non_boolean_isolated_python(tmp_path, isolated_python):
+    import yaml as _yaml
+
+    path = tmp_path / "isolated.yaml"
+    task = _yaml.safe_load(_default_body("ut-isolated", ["b200-1gpu"]))
+    task["isolated_python"] = isolated_python
+
+    with pytest.raises(ValueError, match="isolated_python must be a boolean"):
+        validate_task(task, path)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("target", "process-group"),
+        ("signal", "SIGKILL"),
+        ("timeout_seconds", True),
+        ("expected_exit_code", 7),
+        ("ports", [0]),
+        ("gpu_indices", [0, 0]),
+        ("max_memory_mib", -1),
+        ("output", "../shutdown.json"),
+    ],
+)
+def test_validate_task_rejects_invalid_typed_shutdown(tmp_path, field, value):
+    import yaml as _yaml
+
+    path = tmp_path / "shutdown.yaml"
+    task = _yaml.safe_load(_default_body("perf-shutdown", ["b200-4gpu"]))
+    task["server"] = {
+        "shutdown": {
+            "target": "root",
+            "signal": "SIGTERM",
+            "timeout_seconds": 120,
+            "expected_exit_code": 0,
+            "ports": [8000, 8001],
+            "gpu_indices": [0, 1, 2, 3],
+            "max_memory_mib": 16,
+            "output": ".ci-artifacts/shutdown.json",
+        }
+    }
+    task["server"]["shutdown"][field] = value
+
+    with pytest.raises(ValueError, match=r"server\.shutdown"):
         validate_task(task, path)
 
 

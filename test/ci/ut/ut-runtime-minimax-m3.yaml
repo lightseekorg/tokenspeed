@@ -36,6 +36,7 @@ ut:
       test/cli/test_serve_smg_unit.py
       test/cli/test_serve_smg_integration.py
       test/quality_benchmark/tokenspeed/test_minimax_m3_fixed_reference.py
+      test/quality_benchmark/tokenspeed/test_minimax_m3_encoder_graph_ab.py
       test/random_benchmark/tokenspeed/test_collect_outputs.py
       test/ci_system/test_fetch_minimax_m3_mm_fixtures.py
       test/ci_system/test_cuda_coredump.py
@@ -44,6 +45,8 @@ ut:
       test/ci_system/test_minimax_m3_gsm8k.py
       test/ci_system/test_minimax_m3_exact_longctx.py
       test/ci_system/test_minimax_m3_active_mm_smoke.py
+      test/ci_system/test_minimax_m3_encoder_graph_ab_ci.py
+      test/ci_system/test_server_lifecycle.py
       test/ci_system/test_pipeline.py
     - >-
       python3 -m pytest -q

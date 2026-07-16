@@ -9,6 +9,7 @@ runner:
     - b200-4gpu
 install:
   - bash test/ci_system/install_deps.sh
+preflight:
   - >-
     python3 test/ci_system/runtime_env_preflight.py
     --output .ci-artifacts/minimax-m3-exact-longctx/runtime_environment.json
@@ -43,6 +44,15 @@ server:
     url: http://127.0.0.1:8000/readiness
     timeout: 3600
     interval: 10
+  shutdown:
+    target: root
+    signal: SIGTERM
+    timeout_seconds: 120
+    expected_exit_code: 0
+    ports: [8000, 8001]
+    gpu_indices: [0, 1, 2, 3]
+    max_memory_mib: 16
+    output: .ci-artifacts/minimax-m3-exact-longctx/shutdown_validation.json
   forbidden_log_patterns:
     - Prefill graph capture failed
     - "Scheduler hit an exception:"
@@ -51,6 +61,12 @@ server:
     - OutOfMemoryError
     - Retract failed
     - "NCCL.*(?:abort|unhandled)"
+    - CancelledError
+    - Task was destroyed
+    - "Traceback \\(most recent call last\\)"
+    - Exception ignored in
+    - "unhandled exception during asyncio.run\\(\\) shutdown"
+    - "resource_tracker:.*leaked"
 perf:
   command: >-
     python3 test/ci_system/minimax_m3_exact_longctx.py

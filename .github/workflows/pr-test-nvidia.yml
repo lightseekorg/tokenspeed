@@ -225,7 +225,7 @@ jobs:
             --print-plan \
             --only-stage install \
             --keep-runner-state \
-            --result-json .ci-artifacts/result.json
+            --result-json .ci-artifacts/install-result.json
 
       - name: Execute CI task
         run: |

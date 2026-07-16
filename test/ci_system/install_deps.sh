@@ -199,7 +199,15 @@ fi
 # ============================================================
 echo "=== Step 9: Fix Triton ptxas ==="
 if [ "${CUDA_VERSION%%.*}" = "13" ]; then
-    TRITON_BIN="/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin"
+    TRITON_BIN="$(python3 - <<'PY'
+import importlib.util
+from pathlib import Path
+
+spec = importlib.util.find_spec("triton")
+if spec is not None and spec.origin is not None:
+    print(Path(spec.origin).parent / "backends/nvidia/bin")
+PY
+)"
     if [ -d "${TRITON_BIN}" ]; then
         rm -f "${TRITON_BIN}/ptxas" 2>/dev/null || sudo rm -f "${TRITON_BIN}/ptxas" 2>/dev/null || true
         ln -sf /usr/local/cuda/bin/ptxas "${TRITON_BIN}/ptxas" 2>/dev/null || sudo ln -sf /usr/local/cuda/bin/ptxas "${TRITON_BIN}/ptxas" 2>/dev/null || true

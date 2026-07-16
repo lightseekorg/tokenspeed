@@ -1,6 +1,6 @@
 # MiniMax M3 Handoff Worklog
 
-Last updated: 2026-07-15 UTC
+Last updated: 2026-07-16 UTC
 
 This file is the cold-start handoff for the MiniMax M3 basic-support branch. It
 records what is implemented, what was actually validated, and how to resume on
@@ -13,6 +13,12 @@ a different machine without relying on `/tmp` files or shell history.
 - Base: `origin/main@f35ea4ef2ed70173aadd63dcdf7d2f5714f6b9da`
 - Handoff revision: the checked-out branch HEAD; record it with
   `git rev-parse HEAD` after cloning
+- Final language/cache evidence base:
+  `0c73a2e351ae3629c6ab668112c5c25f39f30be8`, with runtime-bearing content at
+  `7cf79d8ce55b268be5edd46260e44267bda30b60`. Durable evidence is under
+  `/raid/flamingo/runs/minimax_m3_phase5_20260715/final_runtime_7cf79d8_cihead_0c73a2e_20260715/`;
+  `release_manifest.json` is PASS and its verified `SHA256SUMS` covers the
+  manifest plus 163 underlying files (164 total).
 - Final source-smoke revision:
   `7cf79d8ce55b268be5edd46260e44267bda30b60`. The implementation ancestry is
   `b5dd5fc1a989126d1a1f82ce16a4b3ffc4b0393e` for runtime lifecycle and
@@ -52,21 +58,21 @@ from `origin/main`; resume from the feature branch above.
 | Native MiniMax Sparse Attention | Implemented and aligned | Native Triton indexer and sparse attention, 128-token pages, shared block Top-16 after max-reducing all four index heads, BF16 or FP8 E4M3 index-key side cache, and prefill/decode tests. TP-sharded index-query projection gathers the small activation before scoring; incompatible contracts fail closed. |
 | Torch fallback | Not used by the M3 path | MSA, SwiGLU-OAI, Top-4 routing, MXFP8 GEMM, and MXFP8 MoE go through `tokenspeed-kernel`. The routing test explicitly selects the registered Triton solution and validates its output. |
 | MXFP8 | Implemented and validated | 1x32 UE8M0 scales stay `uint8`; projection, activation quantization, routing, and MoE use native Triton kernels. Targeted tests and whole-model HF comparisons passed the acceptance checks below. |
-| Paged cache and chunked prefill | Fixed-candidate exact boundary passed | The 1,048,575 + 1 FP8 run completed 127 full chunks plus the 8191-token tail, returned the exact response, and had zero critical request-log matches. |
+| Paged cache and chunked prefill | Final-runtime exact boundary passed | The 1,048,575 + 1 FP8 run completed 127 full chunks plus the 8191-token tail, returned the exact response, and had zero critical request-log matches. |
 | Prefix cache | Single-request path validated | Warm/hit runs reported 8192 cached tokens; eager, decode-graph, and chunked-prefill paths returned identical token IDs. Broader concurrent eviction pressure remains follow-up coverage. |
-| 1M context | Fixed-candidate pass | HTTP 200 in 282.517 s with output `[123]`, text `{`, peak below 140000 MiB, no terminal retract warning, and all post-request health probes 200. |
+| 1M context | Final-runtime pass | HTTP 200 in 282.473 s with output `[123]`, text `{`, peak below 140000 MiB, no terminal retract warning, all post-request health probes 200, and strict root-only shutdown clean. |
 | CUDA Graph / B200 tuning | Validated | Default and strict-greedy variants captured batch sizes 1/2/4. A post-fix TP4 run additionally captured 1/2/3/4 with the index-query all-gather. Graph/eager A/B improved output throughput by 1.66x at concurrency 1 and 1.71x at concurrency 4. |
 | Phase 3 BF16 benchmark accuracy | Aligned | HF teacher-forced comparison matched 39/40 greedy tokens; TokenSpeed's token was in HF top-5 for 40/40, with mean absolute shared-token logprob delta 0.0504. Four of five autoregressive prompts matched all eight generated tokens. |
 | ViT and image requests | Implemented and validated | The 32-block vision tower, partial 3D RoPE, dynamic resolution, 2x2 patch merge, projector, SMG processor, and embeds-only LM splice are active. Single-image visual logits match the native Transformers TP4 reference; single-image, two-image, and text requests passed on the active-MM server. |
-| FP8 KV/index cache | Implemented and fixed-candidate validated | E4M3 main K/V and index cache passed quality, exact 1M, and the full 8-cell random matrix. The M3 dense path keeps BF16 Q, uses native FA2 mixed extend and TensorRT-LLM mixed decode, and returns BF16 from a shared stable 512 MiB workspace. |
+| FP8 KV/index cache | Implemented and final-runtime validated | E4M3 main K/V and index cache passed quality, exact 1M, and the full 8-cell random matrix. The M3 dense path keeps BF16 Q, uses native FA2 mixed extend and TensorRT-LLM mixed decode, and returns BF16 from a shared stable 512 MiB workspace. |
 | Vision encoder CUDA Graph | Real capture and active-MM smoke passed | Explicit CLI enablement captured nine budgets per TP rank (36 total), installed `image_encoder`, and served text, single-image, two-image, and unseen-reference requests without recapture. Dynamic 3D RoPE parity passed 2/2; video was rejected explicitly. |
 | CLI-only GPU placement | Cold-start validation passed | Worker placement uses `--base-gpu-id`/`--gpu-id-step`, and NCCL process groups bind the mapped CUDA device. The TP4 cold start created compute contexts only on GPUs 4-7; GPUs 0-3 remained at 4 MiB with no compute process. |
-| Explicit runtime configuration | Fixed-SHA source smoke passed | SMG launch, multimodal SHM/RDMA, PD/EPD queueing, timeouts, heartbeat/failure policy, ring/cache, receive-pool, sharding, profiler, coredump, scheduler, MLA backend, and kernel settings use typed configuration. The `7cf79d8c` TP4 preflight recorded zero inherited `TOKENSPEED_*`, `SMG_*`, `EPD_*`, or `TS_*` keys, no visible-device/TF32/workspace override, and no persistent kernel override before a successful active-MM run. |
-| Video | Unsupported by design | MiniMax-M3 basic support covers images. Video items are rejected explicitly and are not part of the Phase 5 acceptance matrix. |
-| CI and release benchmark | Six task specs pass local/static validation; hosted CI pending | Quality passed 14/14, random passed 188/188 per arm, GSM8K scored 0.976497, exact 1M passed, and the active-MM task checks 36 captures, no recapture, dynamic image/text behavior, visual parity, structured video rejection, and clean shutdown logs. No hosted B200 artifacts exist yet. |
+| Explicit runtime configuration | Fixed-SHA source and final-runtime checks passed | SMG launch, multimodal SHM/RDMA, PD/EPD queueing, timeouts, heartbeat/failure policy, ring/cache, receive-pool, sharding, profiler, coredump, scheduler, MLA backend, and kernel settings use typed configuration. The source active-MM and actual final GSM8K/1M roots recorded zero inherited product keys, no visible-device/TF32/workspace override, and no persistent kernel override. |
+| Video | Unsupported by design | Video support is outside MiniMax-M3 basic image support; explicit structured rejection is part of the Phase 5 acceptance contract. |
+| CI and release benchmark | Seven task specs pass local/static validation; hosted CI pending | Quality passed 14/14, random passed 188/188 per arm, final-runtime GSM8K scored 0.977255, exact 1M passed, and the active-MM task checks 36 captures, no recapture, dynamic image/text behavior, visual parity, structured video rejection, and clean shutdown logs. No hosted B200 artifacts exist yet. |
 | Source SMG integration | Fixed-SHA active-MM smoke passed | TokenSpeed `7cf79d8c` with `FlamingoPg/smg@9eb6802a626cec1dfe7fc392455caa43bfa5c0b1` passed all six request contracts, 36 encoder captures with no recapture, health checks, explicit SHM/image configuration, and orderly source shutdown. |
 | Published SMG dependency | **Release blocker** | No inspected official package contains the MiniMax-M3 processor and the lifecycle/configuration delta. A clean published-package image smoke therefore cannot pass yet. |
-| Clean shutdown | Fixed-SHA TP4 proof passed | Root-only SIGTERM exited zero in 9.57 s. All 12 captured processes and the exact process group disappeared, ports 8123/8124 closed, GPUs 4-7 returned to 0 MiB with no compute PID, no new TokenSpeed/SMG zombie appeared, and no forbidden lifecycle pattern was logged. |
+| Clean shutdown | Source and final-runtime TP4 proofs passed | Source active-MM exited zero in 9.57 s; final exact 1M exited zero in 10.042 s. Root-only SIGTERM removed every captured descendant and PGID; ports, GPUs, registry, zombie, output-capture, and forbidden-log checks were clean. |
 | Clean release environment | **Release blocker** | The current development `.venv` exposes system/user packages and a local SMG `.pth`; `pip check` fails the pinned published-SMG requirement. |
 
 ## Design checkpoint
@@ -213,12 +219,13 @@ explicit follow-up rather than treating wrapper construction as validation.
 
 Phase 5 adds FP8 K/V plus index cache, a real encoder CUDA Graph path, public
 benchmark documentation, and dedicated CI task specs. Only checks that ran on
-the current candidate may close a row. Runtime workloads were rerun at fixed
-TokenSpeed SHA `70daee236dd4a5958393f1f365ff0e41271e64b9`; their durable evidence
-is under
-`/raid/flamingo/runs/minimax_m3_phase5_20260715/candidate_70daee236dd/`.
+the current candidate may close a row. The final language/cache workloads were
+rerun from TokenSpeed base SHA
+`0c73a2e351ae3629c6ab668112c5c25f39f30be8`, whose runtime-bearing content is
+`7cf79d8ce55b268be5edd46260e44267bda30b60`. Their durable evidence is under
+`/raid/flamingo/runs/minimax_m3_phase5_20260715/final_runtime_7cf79d8_cihead_0c73a2e_20260715/`.
 Quality, FP8/BF16 random, GSM8K, exact 1M, and active encoder CUDA Graph all
-passed. The later fixed-SHA source smoke also closed explicit-configuration,
+passed. The fixed-SHA source smoke also closed explicit-configuration,
 source-SMG, and clean-shutdown gates. Hosted CI and published SMG packaging
 remain open, so this is still a release candidate rather than published basic
 support.
@@ -233,6 +240,7 @@ test/ci/perf/minimax-m3-bf16-evalscope-random.yaml
 test/ci/perf/minimax-m3-mxfp8-evalscope-random.yaml
 test/ci/perf/minimax-m3-mxfp8-exact-longctx.yaml
 test/ci/perf/minimax-m3-mxfp8-active-mm.yaml
+test/ci/perf/minimax-m3-mxfp8-encoder-graph-ab.yaml
 ```
 
 | Phase 5 gate | Result | Evidence to retain |
@@ -240,14 +248,14 @@ test/ci/perf/minimax-m3-mxfp8-active-mm.yaml
 | Targeted M3 model/vision/cache/kernel tests | PASS locally; hosted CI pending | Existing M3 suites passed; fixed-candidate encoder CUDA parity adds 2/2 real GPU tests |
 | FP8 indexer and sparse-attention numerical parity | PASS | Real 2,305-token BF16 and E4M3 cases with non-trivial K/V scales, 2 passed |
 | FP8 TP4 text and logprob quality | PASS at fixed SHA | 14/14 gates; teacher 39/40, HF Top-5 40/40 for both arms, AR 4/5 and 36/40 common prefix |
-| FP8 exact 1,048,575 + 1 boundary | PASS at fixed SHA | HTTP 200, `[123]`, 127 x 8192 + 8191, no critical request-log match, peak under 140000 MiB |
+| FP8 exact 1,048,575 + 1 boundary | PASS at final runtime | HTTP 200 in 282.473 s, `[123]`, 127 x 8192 + 8191, no critical request-log match, peak under 140000 MiB, strict shutdown clean |
 | Real encoder graph replay across dynamic grids | PASS | Independent two-image and dynamic 3D RoPE CUDA parity, 2/2 |
 | Active TP4 image request with encoder graph | PASS | 9 budgets x 4 ranks captured once; text, two-image, banner, pug, dog-reference and video rejection contracts pass without recapture |
 | CLI-only TP4 device binding | PASS | Compute PIDs only on GPUs 4-7; GPUs 0-3 remained at 4 MiB without contexts; 75 tests passed |
-| Language evaluation | PASS locally | GSM8K 1288/1319 = 0.976497, above reviewed 0.971 floor; all 1319 outputs/reviews validated |
-| Random throughput sweep | PASS at fixed SHA | FP8 and BF16 each 8/8 cells, 188/188/0; FP8/BF16 ratio 0.970625–0.994717 and 5488 MiB/GPU saved |
-| Environment configuration | PASS | No product feature env, visible-device mask, inherited TF32/workspace override, or persistent kernel override file |
-| CI task parsing/execution | PASS local/static; hosted execution pending | All six specs pass local task discovery/schema/helper validation; strict validators, timeouts, full artifact upload, and post-stop log gates are implemented. Hosted B200 artifacts are still required. |
+| Language evaluation | PASS locally | Final-runtime GSM8K 1289/1319 = 0.977255, above reviewed 0.971 floor; all 1319 outputs/reviews validated |
+| Random throughput sweep | PASS at fixed SHA | FP8 and BF16 each 8/8 cells, 188/188/0; FP8/BF16 ratio 0.972145–0.995981 and 5248 MiB/GPU saved |
+| Environment configuration | PASS | Launch and actual server-root audits found no product feature env, visible-device mask, inherited TF32/workspace override, or persistent kernel override file |
+| CI task parsing/execution | PASS local/static; hosted execution pending | All seven specs pass local task discovery/schema/helper validation; strict validators, timeouts, full artifact upload, and post-stop log gates are implemented. Hosted B200 artifacts are still required. |
 | Source SMG integration | PASS at fixed source SHA | TokenSpeed `7cf79d8c` plus SMG `9eb6802a` passed 6/6 active-MM contracts, health probes, encoder replay, explicit image/transport configuration, and root-only orderly shutdown. |
 | Published SMG with M3 processor | **Blocked externally** | Latest inspected official package lacks the M3 processor; clean-package image smoke cannot pass yet |
 | Clean server shutdown | PASS at fixed source SHA | Root-only SIGTERM exited zero in 9.57 s; descendants/PGID, ports, GPU contexts, forbidden lifecycle logs, and new relevant zombies were all clean. |
@@ -276,15 +284,17 @@ image-support contract and are not covered by this claim.
 
 ### Post-candidate Phase 5 release hardening
 
-The performance, quality, exact-1M, and encoder-graph evidence below remains
-pinned to TokenSpeed `70daee236dd4a5958393f1f365ff0e41271e64b9`. It does not
-validate the later lifecycle and explicit-configuration delta. The final
-source-integration smoke tested TokenSpeed
+The final language/cache performance and quality evidence below was rerun from
+TokenSpeed base `0c73a2e351ae3629c6ab668112c5c25f39f30be8`, with
+runtime-bearing content at `7cf79d8ce55b268be5edd46260e44267bda30b60`.
+The final source-integration smoke tested TokenSpeed
 `7cf79d8ce55b268be5edd46260e44267bda30b60` with
 `FlamingoPg/smg@9eb6802a626cec1dfe7fc392455caa43bfa5c0b1`. Durable evidence is under
+`/raid/flamingo/runs/minimax_m3_phase5_20260715/final_runtime_7cf79d8_cihead_0c73a2e_20260715/`
+and
 `/raid/flamingo/runs/minimax_m3_phase5_20260715/final_7cf79d8ce55_smg_9eb6802a626/`.
 It supersedes the earlier `ca511c6` + `6e0cb7a` source smoke while preserving
-the fixed-candidate performance evidence.
+the historical candidate evidence for diagnosis only.
 
 The hardening implementation passed the recorded CPU lifecycle,
 configuration, EPD, CI-helper, scheduler, kernel, MLA, and SMG regression
@@ -299,6 +309,11 @@ passed. SMG's full-workspace all-feature clippy hook could not reach linting on
 this host because the optional OpenCV feature requires unavailable
 `pkg-config`/`opencv4.pc`; targeted clippy for the three changed packages
 passed apart from one explicitly allowed unrelated pre-existing lint.
+
+After the final CI lifecycle and encoder A/B hardening, the complete
+`test/ci_system` suite passed 303 tests. An independent focused review reran
+230 tests and reported no findings. The product-environment guard passed all
+39 checks, and all seven task specs passed schema scan and dry-run validation.
 
 Runtime preflight passed with no inherited product feature/configuration
 variable, visible-device mask, reviewed exact override, or persistent kernel
@@ -324,10 +339,11 @@ it remained unchanged through shutdown and is an exact prefix of the final
 server log. This closes the source integration and shutdown gates; it does not
 close the published-package or hosted-CI gates.
 
-### Fixed-candidate Phase 5 evidence
+### Final-runtime Phase 5 evidence
 
-All results in this subsection use TokenSpeed
-`70daee236dd4a5958393f1f365ff0e41271e64b9` and the pinned model revision.
+All language/cache results in this subsection use the working tree based on
+TokenSpeed `0c73a2e351ae3629c6ab668112c5c25f39f30be8`, runtime content
+`7cf79d8ce55b268be5edd46260e44267bda30b60`, and the pinned model revision.
 
 - Fixed-reference BF16/FP8 comparison: PASS 14/14. Teacher agreement was
   39/40, both arms were in HF Top-5 for 40/40, matched logprob absolute
@@ -337,20 +353,25 @@ All results in this subsection use TokenSpeed
 - Random benchmark: FP8 and BF16 each completed the exact eight cells and
   188/188 successful requests with zero failures and zero critical log matches.
   The minimum/maximum FP8-to-BF16 output-throughput ratios were
-  `0.970625 / 0.994717`, above the reviewed 0.90 floor. FP8 peaks on GPUs 4-7
-  were `119628 / 119692 / 119372 / 119692` MiB; BF16 peaks were
-  `125116 / 125180 / 124860 / 125180` MiB, saving 5,488 MiB per GPU.
+  `0.972145 / 0.995981`, above the reviewed 0.90 floor. FP8 peaks on GPUs 4-7
+  were `119866 / 119930 / 119610 / 119930` MiB; BF16 peaks were
+  `125114 / 125178 / 124858 / 125178` MiB, saving 5,248 MiB per GPU.
 - GSM8K: EvalScope exited zero; predictions and reviews each contained exactly
   1,319 unique indices `0..1318`, all outputs were non-empty, all usage values
   were positive, all review scores were finite binary values, and model errors
-  were zero. Score was 1,288/1,319 = `0.976497346474602`, above the reviewed CI
-  minimum `0.971`. Three health endpoints returned HTTP 200.
+  were zero. Score was 1,289/1,319 = `0.9772554965883244`, above the reviewed CI
+  minimum `0.971`. Three health endpoints returned HTTP 200. Root-only SIGTERM
+  exited zero; 11 descendants, the PGID, ports 8223/8224, GPU contexts, zombie
+  checks, and forbidden-log checks were all clean.
 - Exact 1M: a `[1] * 1048575` prompt plus one output returned HTTP 200,
   `output_ids=[123]`, text `{`, usage `1048575/1/0`, and completed in
-  282.517 seconds. The request log contained exactly 127 full 8,192-token
+  282.473 seconds. The request log contained exactly 127 full 8,192-token
   chunks plus one 8,191-token tail and a finish line, with no critical match.
   Peak memory was `134648 / 134712 / 134392 / 134712` MiB and all three health
-  endpoints returned HTTP 200.
+  endpoints returned HTTP 200. The actual root environment contained zero
+  forbidden keys. Root-only SIGTERM exited zero in 10.042 seconds without
+  fallback; all 11 descendants, the PGID, ports 8323/8324, GPU contexts,
+  registry, zombie, output-capture, and forbidden-log checks were clean.
 - Real encoder CUDA Graph: every TP rank initialized one wrapper, captured nine
   budgets `[16,32,64,128,256,512,1024,2048,2304]`, completed capture, and
   installed `image_encoder`: 36 graphs total. Counts were identical before and
@@ -361,7 +382,7 @@ All results in this subsection use TokenSpeed
   `invalid_multimodal_request`. Focused CUDA parity passed 2/2.
 - Runtime environment audit: the launch inherited no product feature variable,
   visible-device mask, TF32 override, FlashInfer workspace override, or
-  persistent kernel override file. Source audit found no environment reads in
+  persistent kernel override file. Source audit found no environment accesses in
   the M3/vision/encoder-graph/kernel implementation scope.
 
 At historical candidate `70daee2`, GSM8K, exact 1M, and active-MM released GPU
@@ -373,16 +394,35 @@ source lifecycle defect.
 
 Packaging was audited independently. A clean rebuild of
 `FlamingoPg/smg@b7402c47759067e2f2a8840eaf7e81e239ca79b5` produced an active
-binding and the source-integration smoke passed. The official
-published private `tokenspeed-smg`, `tokenspeed-smg-grpc-proto`, and
-`tokenspeed-smg-grpc-servicer` artifacts inspected on 2026-07-15 do not contain
-the complete processor/configuration/lifecycle delta, so the clean
-published-package row remains blocked. The fixed SMG source builds upstream
+binding and the source-integration smoke passed. The latest private artifacts
+inspected on 2026-07-15 were `tokenspeed-smg==1.7.0.post20260715`,
+`tokenspeed-smg-grpc-proto==0.4.14.post20260715`, and
+`tokenspeed-smg-grpc-servicer==0.6.0.post20260715`; they do not contain the
+complete processor/configuration/lifecycle delta. The TokenSpeed branch still
+pins the older `post20260710` triplet and must not move to the incomplete
+`post20260715` artifacts. The clean published-package row therefore remains
+blocked. The fixed SMG source builds upstream
 distribution names (`smg`, `smg-grpc-proto`, and `smg-grpc-servicer`) rather
 than satisfying TokenSpeed's private distribution pins. The current `.venv`
 also contains source integration and dual package ownership, so it is not a
 clean-install or `pip check` release proof. Do not replace the clean-package
 gate with this development environment.
+
+The isolated package preflight scanned nine Python files in the supported
+release surface and found 14 product-environment accesses in four files: two
+in `encoder_servicer.py`, two in `server.py`, four in `servicer.py`, and six in
+`mm_rdma.py`. Those published-wheel violations must reach zero; source-only
+cleanup cannot close the package gate.
+
+The canonical private handoff is retained at
+`/raid/flamingo/runs/minimax_m3_phase5_20260715/release_handoff_smg_private_20260715/`.
+It starts from canonical `main@72ec2bfa677a703b907c493792bc19768bd9c678`,
+preserves `inkling@b80dbd8a63b20a532553885be9b64c5b38dcfa54`, and contains four
+ordered, checksummed patches plus a maintainer request. Local verification
+produced combined SHA `2f3925d85b563f4c374bba1b95e5f14f0ab30c75`, but that SHA is
+local-only and is not a publishable source reference. A canonical maintainer
+must import the series and return a remote immutable SHA before the private
+packages can be built.
 
 Overall Phase 5 status: `release_eligible=false`. Runtime source integration is
 accepted; published basic support is not declared.
@@ -1079,29 +1119,41 @@ pre-commit run --all-files
 
 ## Next acceptance steps
 
-1. Execute all six task specs on hosted B200 runners and retain the complete
-   hidden `.ci-artifacts/` tree. Local schema/tests/dry-runs do not close this
-   row.
-2. Publish matching `tokenspeed-smg`, `tokenspeed-smg-grpc-proto`, and
-   `tokenspeed-smg-grpc-servicer` packages containing the pinned processor,
-   configuration, and lifecycle changes. Then repeat active-MM in an isolated
-   environment with no source shadowing and require `pip check` to pass.
-3. If runtime code changes beyond CI/docs/harnesses, repeat quality, both random
-   arms, GSM8K, exact 1M, and active-MM at one new fixed runtime SHA.
-4. Keep video explicitly unsupported and covered by rejection tests; it is not
+1. Have a canonical SMG maintainer import the checksummed private handoff and
+   return one remote immutable combined Inkling + MiniMax-M3 SHA.
+2. From that canonical SHA publish matching `tokenspeed-smg-grpc-proto`,
+   `tokenspeed-smg-grpc-servicer` (pinned to the new proto), and
+   `tokenspeed-smg` packages, in that order, using `post20260716` or later.
+   Update all three TokenSpeed pins only after the artifacts have been
+   inspected.
+3. Repeat package preflight, `pip check`, root-only graceful-shutdown
+   validation, and active-MM in an isolated environment with no SMG source
+   shadowing or dual package ownership.
+4. If runtime code changes beyond CI/docs/harnesses, repeat quality, both random
+   arms, GSM8K, exact 1M, and active-MM at one new fixed runtime SHA. The
+   language/cache matrix is pinned to base `0c73a2e` with runtime content
+   `7cf79d8c`; the source active-MM smoke is pinned to `7cf79d8c` +
+   `9eb6802a`.
+5. Execute all seven task specs at the final CI-ready TokenSpeed SHA on hosted
+   B200 runners and retain the complete hidden `.ci-artifacts/` tree. The
+   active-MM task intentionally validates the published pins, so it cannot run
+   successfully before steps 1-3. A fork-only commit requires a target-repo
+   ref, such as an approved temporary upstream tag; delete that tag only after
+   the complete run finishes.
+6. Keep video explicitly unsupported and covered by rejection tests; it is not
    part of MiniMax-M3 basic image support.
-5. Track the direct Transformers multi-image-call semantic difference. The
+7. Track the direct Transformers multi-image-call semantic difference. The
    serving path deliberately isolates each image to preserve request isolation,
    chunked-prefill reuse, and content-addressed embedding reuse.
-6. Expand concurrent prefix-cache eviction/reuse and mixed-request MSA tests,
+8. Expand concurrent prefix-cache eviction/reuse and mixed-request MSA tests,
    especially skewed non-zero prefixes and non-contiguous page tables.
-7. Add a permanent end-to-end MXFP8 MoE apply numerical test; current coverage
+9. Add a permanent end-to-end MXFP8 MoE apply numerical test; current coverage
    validates GEMM, routing metadata, and reduction separately.
-8. If further 1M prefill optimization is needed, benchmark a distributed
+10. If further 1M prefill optimization is needed, benchmark a distributed
    candidate-Top-K merge against the current small index-query all-gather. The
    accepted Phase 3 BF16 path completed the exact boundary in 223.00 s; the
-   fixed-candidate Phase 5 FP8 path completed it in 282.517 s without a request
-   warning.
+   final-runtime Phase 5 FP8 path completed it in 282.473 s without a request
+   warning or critical request-log match.
 
 ## Safe shutdown
 

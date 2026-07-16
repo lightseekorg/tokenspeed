@@ -2,6 +2,7 @@ api_version: ci.tokenspeed.io/v1
 name: perf-minimax-m3-mxfp8-active-mm
 type: perf
 timeout_minutes: 120
+isolated_python: true
 triggers:
   - manual
 runner:
@@ -10,15 +11,18 @@ runner:
 install:
   - bash test/ci_system/install_deps.sh
   - >-
-    python3 test/ci_system/runtime_env_preflight.py
-    --output .ci-artifacts/minimax-m3-active-mm/runtime_environment.json
-  - >-
     python3 test/ci_system/minimax_m3_smg_package_preflight.py
     --pyproject python/pyproject.toml
+    --install-published
+    --pip-install-report .ci-artifacts/minimax-m3-active-mm/smg_pip_install.json
     --output .ci-artifacts/minimax-m3-active-mm/smg_packages.json
   - >-
     python3 test/ci_system/fetch_minimax_m3_mm_fixtures.py
     --output-dir .ci-artifacts/minimax-m3-active-mm/fixtures
+preflight:
+  - >-
+    python3 test/ci_system/runtime_env_preflight.py
+    --output .ci-artifacts/minimax-m3-active-mm/runtime_environment.json
 server:
   command: >-
     tokenspeed serve MiniMaxAI/MiniMax-M3-MXFP8
@@ -62,6 +66,21 @@ server:
     url: http://127.0.0.1:8000/readiness
     timeout: 3600
     interval: 10
+  shutdown:
+    target: root
+    signal: SIGTERM
+    timeout_seconds: 120
+    expected_exit_code: 0
+    ports:
+      - 8000
+      - 8001
+    gpu_indices:
+      - 0
+      - 1
+      - 2
+      - 3
+    max_memory_mib: 16
+    output: .ci-artifacts/minimax-m3-active-mm/shutdown_validation.json
   forbidden_log_patterns:
     - 'Prefill graph capture failed'
     - 'Encoder CUDA graph capture failed'
@@ -73,6 +92,10 @@ server:
     - 'NCCL.*(?:abort|unhandled)'
     - 'CancelledError'
     - 'Task was destroyed'
+    - 'Traceback \(most recent call last\)'
+    - 'Exception ignored in'
+    - 'unhandled exception during asyncio.run\(\) shutdown'
+    - 'resource_tracker:.*leaked'
 perf:
   command: >-
     python3 test/ci_system/minimax_m3_active_mm_smoke.py

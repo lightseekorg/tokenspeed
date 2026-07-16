@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import ast
 import csv
+import ctypes
 import glob
 import io
 import json
@@ -14,6 +15,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional
@@ -22,6 +24,13 @@ from urllib.parse import urlparse
 from urllib.request import urlopen
 
 from process_group_manager import ProcessGroupManager, make_manager
+from server_lifecycle import (
+    ManagedServer,
+    abort_managed_server,
+    cleanup_stale_managed_servers,
+    start_managed_server,
+    stop_managed_server,
+)
 
 try:
     import yaml
@@ -42,6 +51,9 @@ MIN_TIMEOUT_MINUTES = 1
 MAX_TIMEOUT_MINUTES = 360
 MAX_SERVER_LOG_MATCH_DETAILS = 20
 MAX_SERVER_LOG_LINE_CHARS = 500
+PR_SET_CHILD_SUBREAPER = 36
+PR_GET_CHILD_SUBREAPER = 37
+STAGE_TERM_GRACE_SECONDS = 15.0
 SUPPORTED_RUNNER_GROUPS = ("all", "amd", "nvidia", "nvidia-arm", "nvidia-x86")
 _PRIORITY_ORDER = {value: index for index, value in enumerate(SUPPORTED_PRIORITIES)}
 B200_RUNNER_LABEL_ENV = "TOKENSPEED_B200_RUNNER_LABEL"
@@ -68,8 +80,121 @@ RUNNER_SM_PREFIXES = (
 AMD_RUNNER_PREFIXES = ("amd-mi35x-", "amd-mi355-", "amd-mi350-")
 NVIDIA_ARM_RUNNER_PREFIXES = ("gb200",)
 GB200_RUNNER_PREFIXES = ("gb200",)
-NVIDIA_GPU_CLEANUP_RUNNER_PREFIXES = ("gb200", "b300")
+NVIDIA_GPU_CLEANUP_RUNNER_PREFIXES = ("b200", "gb200", "b300")
 PERF_DIAGNOSTIC_RUNNERS = ("b300-4gpu",)
+ISOLATED_PYTHON_ENV_KEYS = (
+    "PYTHONHOME",
+    "PYTHONPATH",
+    "PIP_BREAK_SYSTEM_PACKAGES",
+    "PIP_CONFIG_FILE",
+    "PIP_EXTRA_INDEX_URL",
+    "PIP_FIND_LINKS",
+    "PIP_INDEX_URL",
+    "PIP_NO_INDEX",
+    "PIP_TRUSTED_HOST",
+    "PIP_USER",
+    "PIP_TARGET",
+    "PIP_PREFIX",
+    "VIRTUAL_ENV",
+)
+
+
+def _validate_int(
+    value: Any,
+    *,
+    field: str,
+    path: Path,
+    minimum: int,
+    maximum: int | None = None,
+) -> None:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < minimum
+        or (maximum is not None and value > maximum)
+    ):
+        bounds = f"at least {minimum}"
+        if maximum is not None:
+            bounds = f"from {minimum} to {maximum}"
+        raise ValueError(f"{path}: {field} must be an integer {bounds}; got {value!r}")
+
+
+def _validate_server_shutdown(shutdown: Any, path: Path) -> None:
+    field = "server.shutdown"
+    if not isinstance(shutdown, dict):
+        raise ValueError(f"{path}: {field} must be a mapping")
+    required = {
+        "target",
+        "signal",
+        "timeout_seconds",
+        "expected_exit_code",
+        "ports",
+        "gpu_indices",
+        "max_memory_mib",
+        "output",
+    }
+    missing = sorted(required - set(shutdown))
+    if missing:
+        raise ValueError(f"{path}: {field} is missing required keys: {missing}")
+    unknown = sorted(set(shutdown) - required)
+    if unknown:
+        raise ValueError(f"{path}: {field} contains unknown keys: {unknown}")
+    if shutdown["target"] != "root":
+        raise ValueError(f"{path}: {field}.target must be 'root'")
+    if shutdown["signal"] != "SIGTERM":
+        raise ValueError(f"{path}: {field}.signal must be 'SIGTERM'")
+    _validate_int(
+        shutdown["timeout_seconds"],
+        field=f"{field}.timeout_seconds",
+        path=path,
+        minimum=1,
+        maximum=600,
+    )
+    if (
+        isinstance(shutdown["expected_exit_code"], bool)
+        or not isinstance(shutdown["expected_exit_code"], int)
+        or shutdown["expected_exit_code"] != 0
+    ):
+        raise ValueError(f"{path}: {field}.expected_exit_code must be integer 0")
+    _validate_int(
+        shutdown["max_memory_mib"],
+        field=f"{field}.max_memory_mib",
+        path=path,
+        minimum=0,
+    )
+    for list_field, minimum, maximum in (
+        ("ports", 1, 65535),
+        ("gpu_indices", 0, None),
+    ):
+        values = shutdown[list_field]
+        if not isinstance(values, list) or not values:
+            raise ValueError(f"{path}: {field}.{list_field} must be a non-empty list")
+        for index, value in enumerate(values):
+            _validate_int(
+                value,
+                field=f"{field}.{list_field}[{index}]",
+                path=path,
+                minimum=minimum,
+                maximum=maximum,
+            )
+        if len(values) != len(set(values)):
+            raise ValueError(
+                f"{path}: {field}.{list_field} must not contain duplicates"
+            )
+    output = shutdown["output"]
+    if not isinstance(output, str) or not output.strip():
+        raise ValueError(f"{path}: {field}.output must be a non-empty relative path")
+    output_path = Path(output)
+    if (
+        output_path.is_absolute()
+        or ".." in output_path.parts
+        or len(output_path.parts) < 2
+        or output_path.parts[0] != ".ci-artifacts"
+        or output_path.suffix != ".json"
+    ):
+        raise ValueError(
+            f"{path}: {field}.output must be inside the .ci-artifacts directory"
+        )
 
 
 def is_amd_runner(runner: str) -> bool:
@@ -129,6 +254,8 @@ def validate_task(data: Dict[str, Any], path: Path) -> None:
         )
     if data["type"] not in SUPPORTED_TYPES:
         raise ValueError(f"{path}: unsupported type {data['type']!r}")
+    if "isolated_python" in data and not isinstance(data["isolated_python"], bool):
+        raise ValueError(f"{path}: isolated_python must be a boolean")
     timeout_minutes = data.get("timeout_minutes", DEFAULT_TIMEOUT_MINUTES)
     if (
         isinstance(timeout_minutes, bool)
@@ -235,6 +362,8 @@ def validate_task(data: Dict[str, Any], path: Path) -> None:
         server = data["server"]
         if not isinstance(server, dict):
             raise ValueError(f"{path}: server must be a mapping")
+        if "shutdown" in server:
+            _validate_server_shutdown(server["shutdown"], path)
         if "forbidden_log_patterns" in server:
             patterns = server["forbidden_log_patterns"]
             if not isinstance(patterns, list):
@@ -471,6 +600,27 @@ def build_matrix(
     return {"include": include}
 
 
+def _set_child_subreaper(enabled: bool) -> bool:
+    if sys.platform != "linux":
+        return False
+    libc = ctypes.CDLL(None, use_errno=True)
+    result = libc.prctl(PR_SET_CHILD_SUBREAPER, int(enabled), 0, 0, 0)
+    return result == 0
+
+
+def _enable_child_subreaper() -> bool | None:
+    if sys.platform != "linux":
+        return None
+    libc = ctypes.CDLL(None, use_errno=True)
+    current = ctypes.c_int()
+    if libc.prctl(PR_GET_CHILD_SUBREAPER, ctypes.byref(current), 0, 0, 0) != 0:
+        return None
+    previous = bool(current.value)
+    if not previous and not _set_child_subreaper(True):
+        return None
+    return previous
+
+
 def shell_run(
     command: str,
     *,
@@ -482,22 +632,76 @@ def shell_run(
     print(f"$ {command}", flush=True)
     if dry_run:
         return {"command": command, "returncode": 0, "output": "", "dry_run": True}
-    process = subprocess.Popen(
-        command,
-        shell=True,
-        cwd=cwd,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        errors="ignore",
-    )
+
+    previous_handlers: dict[int, Any] = {}
+    pending_signals: List[tuple[int, Any]] = []
+    spawn_in_progress = True
+
+    def relay_signal(signum: int, frame: Any) -> None:
+        if spawn_in_progress:
+            pending_signals.append((signum, frame))
+            return
+        previous = previous_handlers.get(signum, signal.SIG_DFL)
+        if previous == signal.SIG_IGN:
+            return
+        if signum == signal.SIGINT:
+            raise KeyboardInterrupt
+        raise SystemExit(128 + signum)
+
+    on_main_thread = threading.current_thread() is threading.main_thread()
+    previous_subreaper = _enable_child_subreaper() if on_main_thread else None
+    if on_main_thread and sys.platform == "linux" and previous_subreaper is None:
+        raise RuntimeError("cannot enable child-subreaper protection for stage command")
+    if on_main_thread:
+        try:
+            for signum in (signal.SIGTERM, signal.SIGINT):
+                previous_handlers[signum] = signal.getsignal(signum)
+                signal.signal(signum, relay_signal)
+        except BaseException:
+            for signum, previous in previous_handlers.items():
+                if signal.getsignal(signum) is relay_signal:
+                    signal.signal(signum, previous)
+            if previous_subreaper is not None and not previous_subreaper:
+                _set_child_subreaper(False)
+            raise
+
+    process: subprocess.Popen[str] | None = None
     output_lines: List[str] = []
-    assert process.stdout is not None
-    for line in process.stdout:
-        print(line, end="")
-        output_lines.append(line)
-    process.wait()
+    try:
+        process = subprocess.Popen(
+            command,
+            shell=True,
+            cwd=cwd,
+            env=env,
+            start_new_session=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+        )
+        spawn_in_progress = False
+        assert process.stdout is not None
+        if pending_signals:
+            signum, frame = pending_signals[0]
+            relay_signal(signum, frame)
+        for line in process.stdout:
+            print(line, end="")
+            output_lines.append(line)
+        process.wait()
+    except BaseException:
+        spawn_in_progress = False
+        if process is not None:
+            _abort_stage_process(process)
+        raise
+    finally:
+        spawn_in_progress = False
+        for signum, previous in previous_handlers.items():
+            if signal.getsignal(signum) is relay_signal:
+                signal.signal(signum, previous)
+        if previous_subreaper is not None and not previous_subreaper:
+            _set_child_subreaper(False)
+
+    assert process is not None
     completed = process
     if check and completed.returncode != 0:
         raise RuntimeError(
@@ -508,6 +712,105 @@ def shell_run(
         "returncode": completed.returncode,
         "output": "".join(output_lines),
     }
+
+
+def _abort_stage_process(process: subprocess.Popen[str]) -> None:
+    """Terminate and reap a shell-run process group without raising."""
+
+    previous_mask: set[signal.Signals] | None = None
+    if threading.current_thread() is threading.main_thread() and hasattr(
+        signal, "pthread_sigmask"
+    ):
+        try:
+            previous_mask = signal.pthread_sigmask(
+                signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT}
+            )
+        except BaseException:
+            previous_mask = None
+    try:
+        _abort_stage_process_uninterrupted(process)
+    finally:
+        if previous_mask is not None:
+            try:
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+            except BaseException:
+                pass
+
+
+def _abort_stage_process_uninterrupted(process: subprocess.Popen[str]) -> None:
+    """Emergency cleanup body called with cancellation signals blocked."""
+
+    try:
+        if process.stdout is not None:
+            process.stdout.close()
+    except BaseException:
+        pass
+    if process.returncode is not None:
+        _reap_stage_process_group(process.pid, timeout=1)
+        return
+
+    # The direct child is an unreaped process-group leader, so its numeric
+    # PGID cannot be reused while these signals are delivered.
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+    # A stage can be an orchestrator (for example the encoder A/B driver) that
+    # owns a managed GPU server in a separate session.  Give its TERM handler
+    # enough time to finish identity-safe inner cleanup and remove the durable
+    # registry before KILLing the stage group.
+    deadline = time.monotonic() + STAGE_TERM_GRACE_SECONDS
+    while time.monotonic() < deadline:
+        direct_exited = process.poll() is not None
+        if direct_exited:
+            _reap_available_stage_children(process.pid)
+        if direct_exited and not _stage_process_group_exists(process.pid):
+            return
+        time.sleep(0.05)
+
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        process.wait(timeout=5)
+    except BaseException:
+        pass
+    _reap_stage_process_group(process.pid, timeout=5)
+
+
+def _stage_process_group_exists(process_group: int) -> bool:
+    try:
+        os.killpg(process_group, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _reap_available_stage_children(process_group: int) -> None:
+    while True:
+        try:
+            pid, _ = os.waitpid(-process_group, os.WNOHANG)
+        except (ChildProcessError, ProcessLookupError):
+            return
+        if pid == 0:
+            return
+
+
+def _reap_stage_process_group(process_group: int, *, timeout: float) -> None:
+    """Reap descendants adopted while the pipeline is a child subreaper."""
+
+    deadline = time.monotonic() + timeout
+    while True:
+        _reap_available_stage_children(process_group)
+        if not _stage_process_group_exists(process_group):
+            return
+        if time.monotonic() >= deadline:
+            return
+        time.sleep(0.02)
 
 
 def merge_env(
@@ -646,15 +949,93 @@ def kill_ready_port_listener(
     kill_port_listeners(port, env, cwd, dry_run)
 
 
+def create_isolated_venv_path(cwd: Path, task_name: str, runner: str) -> Path:
+    """Return the stable per-task venv shared by split install/execute steps."""
+
+    safe_task = re.sub(r"[^A-Za-z0-9_.-]", "_", task_name)
+    safe_runner = re.sub(r"[^A-Za-z0-9_.-]", "_", runner)
+    return cwd / ".ci-state" / f"{safe_task}-{safe_runner}" / "venv"
+
+
+def _validate_isolated_venv(venv_path: Path) -> None:
+    python = venv_path / "bin" / "python"
+    config = venv_path / "pyvenv.cfg"
+    if not python.is_file() or not config.is_file():
+        raise RuntimeError(f"isolated Python environment is incomplete: {venv_path}")
+    settings: dict[str, str] = {}
+    for line in config.read_text().splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            settings[key.strip().lower()] = value.strip().lower()
+    if settings.get("include-system-site-packages") != "false":
+        raise RuntimeError(
+            "isolated Python environment must set "
+            f"include-system-site-packages = false: {config}"
+        )
+
+
+def _setup_isolated_python(
+    env: Dict[str, str],
+    *,
+    cwd: Path,
+    task_name: str,
+    runner: str,
+    dry_run: bool,
+    reuse_state: bool,
+) -> Dict[str, str]:
+    local_env = dict(env)
+    for key in ISOLATED_PYTHON_ENV_KEYS:
+        local_env.pop(key, None)
+
+    venv_path = create_isolated_venv_path(cwd, task_name, runner)
+    if reuse_state:
+        if not dry_run:
+            _validate_isolated_venv(venv_path)
+    else:
+        shell_run(
+            f"python3 -m venv --clear {shlex.quote(str(venv_path))}",
+            env=local_env,
+            cwd=cwd,
+            dry_run=dry_run,
+        )
+        if not dry_run:
+            _validate_isolated_venv(venv_path)
+
+    local_env["CI_VENV_PATH"] = str(venv_path)
+    local_env["VIRTUAL_ENV"] = str(venv_path)
+    local_env["PATH"] = f"{venv_path}/bin:{local_env.get('PATH', '')}"
+    local_env["PYTHONNOUSERSITE"] = "1"
+    local_env["PIP_REQUIRE_VIRTUALENV"] = "1"
+    return local_env
+
+
 def setup_runner(
     runner: str,
     env: Dict[str, str],
     cwd: Path,
     dry_run: bool,
     reuse_state: bool = False,
-) -> Dict[str, str]:
+    *,
+    isolated_python: bool = False,
+    task_name: str = "task",
+) -> tuple[Dict[str, str], Optional[ProcessGroupManager]]:
     local_env = dict(env)
     pgm: Optional[ProcessGroupManager] = None
+
+    # Recover only process identities durably recorded by an earlier pipeline
+    # run on this runner.  This executes before broad name-based cleanup so a
+    # cancelled managed server is reaped without trusting a reused PID/PGID.
+    cleanup_stale_managed_servers(local_env, dry_run=dry_run)
+
+    if isolated_python:
+        local_env = _setup_isolated_python(
+            local_env,
+            cwd=cwd,
+            task_name=task_name,
+            runner=runner,
+            dry_run=dry_run,
+            reuse_state=reuse_state,
+        )
 
     if is_gb200_runner(runner):
         pgm = make_manager()
@@ -671,27 +1052,27 @@ def setup_runner(
             check=False,
         )
 
-        venv_path = create_ci_venv_name(runner_name=pgm.runner_id)
-
         # Per-runner HOME isolates flashinfer JIT cache between runners
         runner_home = f"/mnt/workspace/ts-ci-homes/{pgm.runner_id}"
         Path(runner_home).mkdir(parents=True, exist_ok=True)
         local_env["HOME"] = runner_home
 
-        # Recreate venv at fixed path unless a previous CI step already did it.
-        if Path(venv_path).exists() and not dry_run and not reuse_state:
-            print(f"[gb200] removing old venv: {venv_path}", flush=True)
-            shutil.rmtree(venv_path, ignore_errors=True)
-        if not reuse_state or not Path(venv_path).exists():
-            shell_run(
-                f"python3 -m venv --system-site-packages {venv_path}",
-                env=local_env,
-                cwd=cwd,
-                dry_run=dry_run,
-            )
-        local_env["CI_VENV_PATH"] = venv_path
-        local_env["PATH"] = f"{venv_path}/bin:{local_env.get('PATH', '')}"
-        local_env["PIP_BREAK_SYSTEM_PACKAGES"] = "1"
+        if not isolated_python:
+            venv_path = create_ci_venv_name(runner_name=pgm.runner_id)
+            # Recreate venv at fixed path unless a previous CI step already did it.
+            if Path(venv_path).exists() and not dry_run and not reuse_state:
+                print(f"[gb200] removing old venv: {venv_path}", flush=True)
+                shutil.rmtree(venv_path, ignore_errors=True)
+            if not reuse_state or not Path(venv_path).exists():
+                shell_run(
+                    f"python3 -m venv --system-site-packages {venv_path}",
+                    env=local_env,
+                    cwd=cwd,
+                    dry_run=dry_run,
+                )
+            local_env["CI_VENV_PATH"] = venv_path
+            local_env["PATH"] = f"{venv_path}/bin:{local_env.get('PATH', '')}"
+            local_env["PIP_BREAK_SYSTEM_PACKAGES"] = "1"
         local_env["PIP_TRUSTED_HOST"] = (
             "pypi.org pypi.python.org files.pythonhosted.org github.com "
             "objects.githubusercontent.com"
@@ -1482,6 +1863,13 @@ def build_step_summary_lines(result: Dict[str, Any]) -> List[str]:
             f"- Server log check: `{status}` "
             f"({check['match_count']} forbidden matches)"
         )
+    if result.get("server_shutdown_check"):
+        check = result["server_shutdown_check"]
+        status = "pass" if check["passed"] else "fail"
+        lines.append(
+            f"- Server shutdown check: `{status}` "
+            f"(fallback used: `{check.get('fallback_used', False)}`)"
+        )
 
     command_results = result.get("command_results", [])
     if command_results:
@@ -1548,7 +1936,11 @@ def write_result(path: str | None, payload: Dict[str, Any]) -> None:
     result_path.write_text(json.dumps(payload, indent=2) + "\n")
 
 
-def poll_readiness(ready: Dict[str, Any], dry_run: bool) -> None:
+def poll_readiness(
+    ready: Dict[str, Any],
+    dry_run: bool,
+    process: subprocess.Popen[str] | None = None,
+) -> None:
     url = str(ready["url"])
     timeout_seconds = int(ready.get("timeout", 600))
     interval_seconds = int(ready.get("interval", 10))
@@ -1560,6 +1952,10 @@ def poll_readiness(ready: Dict[str, Any], dry_run: bool) -> None:
 
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
+        if process is not None and process.poll() is not None:
+            raise RuntimeError(
+                f"server exited with code {process.returncode} before readiness"
+            )
         try:
             with urlopen(url, timeout=5) as response:
                 if response.status == expected_status:
@@ -1619,6 +2015,19 @@ def get_stage_commands(task: Dict[str, Any]) -> List[tuple[str, Any]]:
         ):
             raise ValueError("install must be a string list")
         stages.append(("install", install))
+
+    # Release preflights deliberately run after package installation but before
+    # a server is allowed to touch a GPU.  Keeping this as a distinct stage is
+    # important for workflows that split install and execute across GitHub
+    # steps: the execute process rebuilds its environment, so an install-time
+    # environment audit cannot attest what the server will actually inherit.
+    preflight = task.get("preflight", [])
+    if preflight:
+        if not isinstance(preflight, list) or not all(
+            isinstance(item, str) for item in preflight
+        ):
+            raise ValueError("preflight must be a string list")
+        stages.append(("preflight", preflight))
 
     task_type = task["type"]
     if task_type == "ut":
@@ -1732,7 +2141,13 @@ def execute_task(
             return 0
 
     runner_env, pgm = setup_runner(
-        runner, env, repo_root, dry_run, reuse_state=reuse_runner_state
+        runner,
+        env,
+        repo_root,
+        dry_run,
+        reuse_state=reuse_runner_state,
+        isolated_python=task.get("isolated_python", False),
+        task_name=task["name"],
     )
     enable_perf_diagnostics = should_run_perf_diagnostics(task, runner)
     stages_run: List[str] = []
@@ -1741,10 +2156,27 @@ def execute_task(
     eval_accept_rate: Dict[str, Any] | None = None
     perf_reference_check: Dict[str, Any] | None = None
     server_log_check: Dict[str, Any] | None = None
-    server_process = None
+    server_shutdown_check: Dict[str, Any] | None = None
+    server_process: subprocess.Popen[str] | None = None
+    managed_server: ManagedServer | None = None
     server_log_path: Path | None = None
     error: str | None = None
     error_reported = False
+    cancellation: BaseException | None = None
+    cleanup_errors: List[Dict[str, str]] = []
+
+    def capture_cleanup_exception(phase: str, exc: BaseException) -> None:
+        nonlocal cancellation
+        if isinstance(exc, Exception):
+            cleanup_errors.append(
+                {
+                    "phase": phase,
+                    "exception_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+            )
+        elif cancellation is None:
+            cancellation = exc
 
     try:
         if enable_perf_diagnostics:
@@ -1763,7 +2195,21 @@ def execute_task(
                 kill_ready_port_listener(
                     stage_payload["ready"], runner_env, repo_root, dry_run
                 )
-                if pgm is not None:
+                shutdown = stage_payload.get("shutdown")
+                if shutdown is not None:
+                    managed_server = start_managed_server(
+                        stage_payload["command"],
+                        env=runner_env,
+                        cwd=repo_root,
+                        log_path=server_log_path,
+                        gpu_indices=shutdown["gpu_indices"],
+                        max_baseline_memory_mib=shutdown["max_memory_mib"],
+                        dry_run=dry_run,
+                    )
+                    server_process = (
+                        managed_server.process if managed_server is not None else None
+                    )
+                elif pgm is not None:
                     server_process = pgm.start(
                         wrap_command_with_log(
                             stage_payload["command"],
@@ -1783,7 +2229,7 @@ def execute_task(
                         repo_root,
                         dry_run,
                     )
-                poll_readiness(stage_payload["ready"], dry_run)
+                poll_readiness(stage_payload["ready"], dry_run, server_process)
                 if enable_perf_diagnostics:
                     run_perf_diagnostics(
                         "after server ready", runner_env, repo_root, dry_run
@@ -1830,33 +2276,115 @@ def execute_task(
             )
     except Exception as exc:
         error = str(exc)
+    except BaseException as exc:
+        cancellation = exc
     finally:
-        if enable_perf_diagnostics:
-            run_perf_diagnostics("before cleanup", runner_env, repo_root, dry_run)
-        if pgm is not None:
-            pgm.terminate_all(dry_run=dry_run)
-        else:
-            stop_server(server_process)
-        if not keep_runner_state:
-            cleanup_runner(runner_env, repo_root, dry_run, pgm)
-        if enable_perf_diagnostics:
-            run_perf_diagnostics("after cleanup", runner_env, repo_root, dry_run)
+        if enable_perf_diagnostics and cancellation is None:
+            try:
+                run_perf_diagnostics("before cleanup", runner_env, repo_root, dry_run)
+            except BaseException as exc:
+                capture_cleanup_exception("before_cleanup_diagnostics", exc)
 
-    server_log_check = check_server_log_patterns(
-        task,
-        stages_run,
-        server_log_path,
-        dry_run=dry_run,
-    )
-    server_log_error: str | None = None
-    if server_log_check is not None and not server_log_check["passed"]:
-        if server_log_check.get("error"):
-            server_log_error = f"server log check failed: {server_log_check['error']}"
-        else:
-            server_log_error = (
-                "server log check failed: "
-                f"{server_log_check['match_count']} forbidden matches"
+        shutdown_error: str | None = None
+        pgm_termination_failed = False
+        shutdown_phase = "server_shutdown"
+        try:
+            if (
+                "server" in stages_run
+                and task.get("server", {}).get("shutdown") is not None
+            ):
+                server_shutdown_check = stop_managed_server(
+                    managed_server,
+                    task["server"]["shutdown"],
+                    cwd=repo_root,
+                    dry_run=dry_run,
+                )
+                if not server_shutdown_check["passed"]:
+                    shutdown_error = "server shutdown check failed: " + "; ".join(
+                        server_shutdown_check["failures"]
+                    )
+            elif pgm is not None:
+                shutdown_phase = "process_group_termination"
+                pgm.terminate_all(dry_run=dry_run)
+            else:
+                stop_server(server_process)
+        except BaseException as exc:
+            capture_cleanup_exception(shutdown_phase, exc)
+            pgm_termination_failed = shutdown_phase == "process_group_termination"
+            abort_result: dict[str, Any] | None = None
+            try:
+                abort_result = abort_managed_server(managed_server)
+            except BaseException as abort_exc:
+                capture_cleanup_exception("managed_server_abort", abort_exc)
+            if isinstance(exc, Exception):
+                shutdown_error = f"server shutdown check raised an exception: {exc}"
+                server_shutdown_check = {
+                    "passed": False,
+                    "failures": [str(exc)],
+                    "fallback_used": True,
+                    "abort": abort_result,
+                }
+
+        # Shutdown output belongs to the server log, so scan it before broad
+        # runner cleanup can kill or reap anything and obscure the evidence.
+        if cancellation is None:
+            try:
+                server_log_check = check_server_log_patterns(
+                    task,
+                    stages_run,
+                    server_log_path,
+                    dry_run=dry_run,
+                )
+            except BaseException as exc:
+                capture_cleanup_exception("server_log_scan", exc)
+                if isinstance(exc, Exception):
+                    server_log_check = {
+                        "passed": False,
+                        "match_count": 0,
+                        "error": str(exc),
+                    }
+
+        server_log_error: str | None = None
+        if server_log_check is not None and not server_log_check["passed"]:
+            if server_log_check.get("error"):
+                server_log_error = (
+                    f"server log check failed: {server_log_check['error']}"
+                )
+            else:
+                server_log_error = (
+                    "server log check failed: "
+                    f"{server_log_check['match_count']} forbidden matches"
+                )
+
+        # A managed shutdown has already been judged above.  Any process-group
+        # cleanup from here on is hygiene and cannot turn that result into a pass.
+        if pgm is not None and (managed_server is not None or pgm_termination_failed):
+            try:
+                pgm.terminate_all(dry_run=dry_run)
+            except BaseException as exc:
+                capture_cleanup_exception("process_group_hygiene", exc)
+        if not keep_runner_state:
+            try:
+                cleanup_runner(runner_env, repo_root, dry_run, pgm)
+            except BaseException as exc:
+                capture_cleanup_exception("runner_cleanup", exc)
+        if enable_perf_diagnostics and cancellation is None:
+            try:
+                run_perf_diagnostics("after cleanup", runner_env, repo_root, dry_run)
+            except BaseException as exc:
+                capture_cleanup_exception("after_cleanup_diagnostics", exc)
+
+        if error is None:
+            error = shutdown_error or server_log_error
+        if error is None and cleanup_errors:
+            first_cleanup_error = cleanup_errors[0]
+            error = (
+                f"{first_cleanup_error['phase']} failed: "
+                f"{first_cleanup_error['error']}"
             )
+
+    if cancellation is not None:
+        raise cancellation
 
     if error is None:
         try:
@@ -1870,9 +2398,6 @@ def execute_task(
                 error_reported = True
         except Exception as exc:
             error = str(exc)
-
-    if error is None and server_log_error is not None:
-        error = server_log_error
 
     result = {
         "ok": error is None,
@@ -1895,6 +2420,10 @@ def execute_task(
         result["eval_accept_rate"] = eval_accept_rate
     if server_log_check is not None:
         result["server_log_check"] = server_log_check
+    if server_shutdown_check is not None:
+        result["server_shutdown_check"] = server_shutdown_check
+    if cleanup_errors:
+        result["cleanup_errors"] = cleanup_errors
     if task.get("report", {}).get("github_step_summary"):
         write_detailed_step_summary(result)
     write_result(result_json, result)

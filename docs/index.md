@@ -33,6 +33,7 @@ features:
 - [Launching a Server](./guides/launching.md)
 - [Model Recipes](./recipes/models.md)
 - [MiniMax-M3 Release Benchmark](./benchmarks/minimax-m3.md)
+- [MiniMax-M3 Encoder Graph A/B](./benchmarks/minimax-m3-encoder-graph-ab.md)
 - [Server Parameters](./configuration/server.md)
 - [Compatible Parameters](./configuration/compatible-parameters.md)
 - [Parallelism](./serving/parallelism.md)
