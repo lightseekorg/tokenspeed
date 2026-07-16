@@ -27,8 +27,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.cute.testing as testing
-from cutlass.cute.nvgpu import tcgen05
-from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
+from cutlass.cute.nvgpu import OperandMajorMode, tcgen05
 
 # Compat shim: setmaxregister_{decrease,increase} added in cutlass-dsl 4.4;
 # older versions only have the deprecated warpgroup_reg_{dealloc,alloc}.

@@ -50,7 +50,7 @@ def _skip_unless_supported() -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     if torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("tokenspeed-mha decode kernel is SM100-only")
+        pytest.skip("tokenspeed-mha decode kernel requires SM10x Blackwell")
 
 
 def _ref_row(q_row, k, v, rel_row, rel_extent, window_left, pos):
@@ -380,7 +380,9 @@ def test_v1_native_prediction_mxfp8(window_left) -> None:
     for b, n in enumerate(pages_per):
         table[b, :n] = torch.arange(nxt, nxt + n, device=device)
         nxt += n
-    paged = lambda t: t.reshape(num_pages, page, NUM_KV_HEADS, HEAD_DIM)
+
+    def paged(t):
+        return t.reshape(num_pages, page, NUM_KV_HEADS, HEAD_DIM)
 
     q16 = (
         torch.randn(B * k_new, NUM_Q_HEADS, HEAD_DIM, device=device, dtype=DTYPE) * 0.5

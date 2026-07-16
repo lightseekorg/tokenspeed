@@ -46,9 +46,11 @@ from tokenspeed_kernel.signature import format_signatures
 
 
 @pytest.fixture
-def fresh_plugins():
+def fresh_plugins(monkeypatch: pytest.MonkeyPatch):
     """Reset registry and plugin state before/after each test."""
-    KernelRegistry.reset()
+    # Preserve the process-wide built-in registry for tests collected after
+    # this module; monkeypatch restores it after this fixture tears down.
+    monkeypatch.setattr(KernelRegistry, "_instance", None)
     reset_plugins()
     yield
     KernelRegistry.reset()

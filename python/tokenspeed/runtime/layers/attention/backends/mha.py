@@ -346,8 +346,8 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         )
 
         self.cuda_graph_decode_metadata = {}
-        # Flat per-group persistent buffers, lazily allocated at first
-        # capture. TODO(radix-removal): parallels cuda_graph_page_table.
+        # Flat per-group persistent buffers. TODO(radix-removal): parallels
+        # cuda_graph_page_table.
         # Initialized before the DFLASH early return: replay reads the dict
         # unconditionally for the stale-table guard.
         self._init_flat_graph_buffers(max_bs)
@@ -385,9 +385,9 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
     ):
         assert not forward_mode.is_extend_or_mixed()
 
-        # Real tables only arrive at replay: capture lazily allocates
-        # persistent per-group buffers and records metadata views into them,
-        # so replay can copy_ fresh data to the graph-recorded addresses.
+        # Real tables only arrive at replay; capture records metadata views
+        # into the persistent per-group buffers so replay can copy_ fresh data
+        # to the graph-recorded addresses.
         if flat_cache_group_ids:
             # Verify keeps [bs]-row tables + [bs*N] loc views. TODO(flat+dflash).
             assert not (

@@ -785,8 +785,8 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                 f"trtllm CUDA graph capture not supported for {forward_mode}"
             )
 
-        # Real tables only arrive at replay: capture lazily allocates
-        # persistent per-group buffers and records metadata views into them.
+        # Real tables only arrive at replay; capture records metadata views
+        # into the persistent per-group buffers.
         if flat_cache_group_ids:
             # Verify keeps [bs]-row tables + [bs*N] loc views. TODO(flat+dflash).
             assert not (
