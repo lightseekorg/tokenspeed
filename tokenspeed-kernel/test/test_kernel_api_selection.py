@@ -508,7 +508,6 @@ def _attention_dsa_decode() -> object:
         qk_rope_head_dim=64,
         softmax_scale=1.0,
         page_size=64,
-        solution="triton",
     )
 
 
@@ -529,7 +528,26 @@ def _attention_dsa_prefill() -> object:
         qk_rope_head_dim=64,
         softmax_scale=1.0,
         page_size=64,
-        solution="triton",
+    )
+
+
+def _attention_dsa_prefill_fp8_dense() -> object:
+    q = torch.empty((2, 8, 576), dtype=torch.float8_e4m3fn)
+    kv_cache = torch.empty((64, 576), dtype=torch.float8_e4m3fn)
+    topk_slots = torch.empty((2, 1024), dtype=torch.int32)
+    topk_lens = torch.empty((2,), dtype=torch.int32)
+    return tokenspeed_kernel.dsa_prefill(
+        q=q,
+        kv_cache=kv_cache,
+        sparse_kv_cache=None,
+        topk_slots=topk_slots,
+        topk_lens=topk_lens,
+        max_seqlen_k=64,
+        qk_nope_head_dim=192,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        softmax_scale=1.0,
+        page_size=64,
     )
 
 
@@ -1295,7 +1313,7 @@ _CASES = [
         "cdna4",
         "attention",
         "dsa_decode",
-        "triton_dsa_decode",
+        "gluon_dsa_decode_gfx950",
         _attention_dsa_decode,
     ),
     _case(
@@ -1303,15 +1321,23 @@ _CASES = [
         "cdna4",
         "attention",
         "dsa_prefill",
-        "triton_dsa_prefill",
+        "gluon_dsa_prefill_gfx950",
         _attention_dsa_prefill,
     ),
     _case(
         _is_cdna4,
         "cdna4",
         "attention",
+        "dsa_prefill",
+        "triton_dsa_prefill",
+        _attention_dsa_prefill_fp8_dense,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
         "dsa_decode_topk",
-        "triton_dsa_decode_topk_fp8",
+        "gluon_dsa_decode_topk_fp8_gfx950",
         _attention_dsa_decode_topk,
     ),
     _case(
@@ -1319,7 +1345,7 @@ _CASES = [
         "cdna4",
         "attention",
         "dsa_prefill_topk",
-        "triton_dsa_prefill_topk_fp8",
+        "gluon_dsa_prefill_topk_fp8_gfx950",
         _attention_dsa_prefill_topk,
     ),
     _case(
