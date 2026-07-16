@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.kvcache.triton import index_k_block_split_scatter
 from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
 
 from tokenspeed.runtime.layers.attention.configs.dsa import dsa_index_k_row_bytes
@@ -59,6 +60,12 @@ class DSATokenToKVPool(MLATokenToKVPool):
             dtype=torch.uint64,
             device=self.device,
         )
+
+        # (loc, loc._version, page, slot_in_page) memo for the index-K write;
+        # see _index_k_page_slot.
+        self._index_k_loc_cache: (
+            tuple[torch.Tensor, int, torch.Tensor, torch.Tensor] | None
+        ) = None
 
     def _get_page_size_bytes(self):
         index_size_bytes = self.index_k_row_bytes
@@ -180,6 +187,28 @@ class DSATokenToKVPool(MLATokenToKVPool):
         k_scale = scale_view[page, slot_in_page]
         return k_fp8, k_scale
 
+    def _index_k_page_slot(
+        self, loc: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Map ``loc`` to ``(page, slot_in_page)``, memoized on ``loc``.
+
+        ``loc`` is the step's ``out_cache_loc``, shared by every indexer layer,
+        so the cast/floor-div/remainder fire once per forward instead of per
+        layer. Keyed on object identity *and* ``_version`` so an in-place
+        ``loc.copy_()`` (same object, new content) correctly misses; recycled
+        storage in a fresh object also misses (identity differs), and under
+        CUDA-graph replay this Python does not run. Numerically identical to the
+        inline computation.
+        """
+        cached = self._index_k_loc_cache
+        if cached is not None and cached[0] is loc and cached[1] == loc._version:
+            return cached[2], cached[3]
+        loc_long = loc.to(torch.long)
+        page = loc_long // self.page_size
+        slot_in_page = loc_long % self.page_size
+        self._index_k_loc_cache = (loc, loc._version, page, slot_in_page)
+        return page, slot_in_page
+
     def _set_index_k_buffer(
         self,
         layer_id: int,
@@ -194,13 +223,17 @@ class DSATokenToKVPool(MLATokenToKVPool):
             scale_encoding="float32",
         )
 
-        fp8_view, scale_view = self._index_k_block_views(buf)
-        loc = loc.to(torch.long)
-        page = loc // self.page_size
-        slot_in_page = loc % self.page_size
-        fp8_view[page, slot_in_page] = index_k_fp8.view(-1, self.index_head_dim)
-        scale_view[page, slot_in_page] = index_k_scale.view(
-            -1, self.index_head_dim // _INDEX_K_FP8_GROUP_SIZE
+        # One fused scatter, byte-exact with the two index_put writes it replaces.
+        page, slot_in_page = self._index_k_page_slot(loc)
+        index_k_block_split_scatter(
+            buf,
+            index_k_fp8,
+            index_k_scale,
+            page,
+            slot_in_page,
+            page_size=self.page_size,
+            head_dim=self.index_head_dim,
+            group_size=_INDEX_K_FP8_GROUP_SIZE,
         )
 
     def get_contiguous_buf_infos(self):

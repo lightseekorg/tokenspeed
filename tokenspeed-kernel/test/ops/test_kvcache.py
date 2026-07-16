@@ -20,8 +20,10 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 from tokenspeed_kernel.ops.kvcache.triton import (
+    index_k_block_split_scatter,
     transfer_kv_all_layer,
     transfer_kv_all_layer_mla,
     transfer_kv_per_layer,
@@ -228,3 +230,90 @@ def test_transfer_kv_all_layer_mla(device: str) -> None:
 
     for layer_idx in range(num_layers):
         assert torch.equal(layers_dst[layer_idx], expected[layer_idx])
+
+
+# index_k_block_split_scatter (GLM-5 DSA index-K cache write, 组C)
+
+
+def _index_k_block_views(buf, num_pages, page_size, head_dim, num_groups):
+    row = head_dim + num_groups * 4
+    page_bytes = page_size * row
+    flat = buf.reshape(-1)
+    fp8_view = torch.as_strided(
+        flat.view(torch.float8_e4m3fn),
+        (num_pages, page_size, head_dim),
+        (page_bytes, head_dim, 1),
+    )
+    scale_view = torch.as_strided(
+        flat.view(torch.float32),
+        (num_pages, page_size, num_groups),
+        (page_bytes // 4, num_groups, 1),
+        (page_size * head_dim) // 4,
+    )
+    return fp8_view, scale_view
+
+
+@pytest.mark.parametrize(
+    "head_dim,group_size",
+    [
+        (128, 128),  # NG=1
+        (128, 64),  # NG=2
+        (256, 128),  # NG=2
+        (384, 128),  # NG=3: non-power-of-2 head_dim and NG
+        (384, 64),  # NG=6: non-power-of-2 NG
+    ],
+)
+@pytest.mark.parametrize("tokens", [1, 7, 16, 64])
+def test_index_k_block_split_scatter_matches_index_put(
+    device: str, head_dim: int, group_size: int, tokens: int
+) -> None:
+    torch.manual_seed(head_dim + group_size + tokens)
+    page_size, num_pages = 64, 32
+    num_slots = num_pages * page_size
+    ng = head_dim // group_size
+    row = head_dim + ng * 4
+
+    k_fp8 = torch.randn(tokens, head_dim, device=device).to(torch.float8_e4m3fn)
+    k_scale = torch.rand(tokens, ng, device=device, dtype=torch.float32) + 0.1
+    loc = torch.randperm(num_slots, device=device)[:tokens].to(torch.int64)
+    page, slot = loc // page_size, loc % page_size
+
+    buf_ref = torch.zeros(num_slots, row, dtype=torch.uint8, device=device)
+    buf_k = torch.zeros(num_slots, row, dtype=torch.uint8, device=device)
+
+    fp8_view, scale_view = _index_k_block_views(
+        buf_ref, num_pages, page_size, head_dim, ng
+    )
+    fp8_view[page, slot] = k_fp8.view(-1, head_dim)
+    scale_view[page, slot] = k_scale.view(-1, ng)
+
+    index_k_block_split_scatter(
+        buf_k,
+        k_fp8,
+        k_scale,
+        page,
+        slot,
+        page_size=page_size,
+        head_dim=head_dim,
+        group_size=group_size,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(buf_ref, buf_k)
+
+
+def test_index_k_block_split_scatter_empty_is_noop(device: str) -> None:
+    buf = torch.zeros(64, 132, dtype=torch.uint8, device=device)
+    empty_fp8 = torch.empty(0, 128, device=device, dtype=torch.float8_e4m3fn)
+    empty_scale = torch.empty(0, 1, device=device, dtype=torch.float32)
+    empty_idx = torch.empty(0, dtype=torch.int64, device=device)
+    index_k_block_split_scatter(
+        buf,
+        empty_fp8,
+        empty_scale,
+        empty_idx,
+        empty_idx,
+        page_size=64,
+        head_dim=128,
+        group_size=128,
+    )
+    assert torch.count_nonzero(buf) == 0
