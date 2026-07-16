@@ -1451,3 +1451,93 @@ def test_kernel_routing_decode_reaches_route_owned_up_to_decode_max_m(
     # the precomputed-MFMA decode kernel for the M=3..8 range.
     assert captured["max_m"] == fused_mxfp_gfx950._DECODE_MAX_M
     assert captured["allow_generic_fallback"] is True
+
+
+@pytest.mark.parametrize("num_tokens", [16, 64, 256])
+def test_package_prefill_stage2_bm128_matches_ragged_reference(
+    num_tokens: int,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Package prefill (flat stage2 BLOCK_M=128) must match the ragged reference.
+
+    The package-prefill path (stage1/stage2 kernels, stage2 down-proj at the
+    tuned flat BLOCK_M=128) must be bit-exact against the generic ragged
+    reference (``_gluon_mxfp_dynamic_mxfp4_fused_moe_from_route`` reached by
+    disabling package prefill). This pins the correctness of the BLOCK_M=128
+    tuning change: it is 10-17% faster on Kimi with no gpt-oss regression, and
+    here we confirm it does not change the MoE result.
+    """
+    hidden_size = 1024
+    intermediate_size = 512
+    num_experts = 16
+    topk = 4
+    device = "cuda"
+    gen = torch.Generator(device=device).manual_seed(20260716 + num_tokens)
+    hidden = (
+        torch.randn(
+            (num_tokens, hidden_size),
+            device=device,
+            dtype=torch.bfloat16,
+            generator=gen,
+        )
+        * 0.01
+    ).contiguous()
+    router = torch.randn(
+        (num_tokens, num_experts), device=device, dtype=torch.bfloat16, generator=gen
+    )
+    topk_weights, topk_ids = torch.topk(torch.softmax(router.float(), dim=-1), topk)
+    topk_ids = topk_ids.to(torch.int32).contiguous()
+    topk_weights = topk_weights.to(torch.float32).contiguous()
+    w13, w13_scale, w2, w2_scale = _make_weights(
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        device=device,
+    )
+    layer = _make_preprocessed_layer(
+        w13,
+        w13_scale,
+        w2,
+        w2_scale,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        device=device,
+    )
+
+    def run():
+        return fused_mxfp_gfx950.gluon_mxfp_dynamic_mxfp4_fused_moe(
+            hidden,
+            router,
+            layer.w13_weight_triton_tensor,
+            layer.w2_weight_triton_tensor,
+            w13_mx_scale=layer.w13_precision_config.b_mx_scale,
+            w2_mx_scale=layer.w2_precision_config.b_mx_scale,
+            top_k=topk,
+            correction_bias=None,
+            n_group=1,
+            topk_group=1,
+            routed_scaling_factor=1.0,
+            normalize_topk_weights=True,
+            routing_method_type=0,
+            out_dtype=torch.bfloat16,
+            precomputed_topk_weights=topk_weights,
+            precomputed_topk_ids=topk_ids,
+        )
+
+    # Reference: disable package prefill so the dispatch falls to the generic
+    # ragged path (the trusted MXFP4 MoE reference).
+    monkeypatch.setattr(
+        fused_mxfp_gfx950,
+        "_maybe_gluon_package_mxfp4_prefill",
+        lambda *args, **kwargs: None,
+    )
+    ref = run()
+    torch.cuda.synchronize()
+
+    # Package prefill (flat stage2 BLOCK_M=128).
+    monkeypatch.undo()
+    out = run()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(out.float(), ref.float(), rtol=0.0, atol=0.0)

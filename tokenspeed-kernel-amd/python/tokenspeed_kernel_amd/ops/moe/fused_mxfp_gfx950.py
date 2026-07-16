@@ -8382,34 +8382,21 @@ def _maybe_gluon_package_mxfp4_prefill(
 
     q_inter, q_inter_scale = _quantize_mxfp4_activation(inter_flat)
 
-    # Stage 2 uses its own, smaller-block sort at small M. When tokens spread
-    # across many experts (e.g. top-8 over 384 experts at M<=512), a 128-row
-    # per-expert pad inflates the routed extent ~40x, so the down-projection
-    # GEMM burns almost all of its MFMA cycles on padding rows. A 32/64 sort
-    # block cuts that padding proportionally. Stage 1 keeps the 128 layout its
-    # kernel requires; stage 2 is free to use a different layout because it
-    # indexes ``inter_flat`` by ``(token, slot)``, not by stage-1 sorted slot.
-    stage2_block_m = 32 if n_tokens <= 512 else (64 if n_tokens <= 1024 else 128)
-    if stage2_block_m == sort_block_m:
-        s2_sorted_ids = sorted_ids
-        s2_sorted_weights = sorted_weights
-        s2_sorted_expert_ids = sorted_expert_ids
-        s2_num_valid_ids = num_valid_ids
-    else:
-        (
-            s2_sorted_ids,
-            s2_sorted_weights,
-            s2_sorted_expert_ids,
-            s2_num_valid_ids,
-            _,
-        ) = gluon_moe_sorting(
-            topk_ids,
-            topk_weights,
-            n_experts,
-            hidden_dim,
-            out_dtype,
-            stage2_block_m,
-        )
+    # Stage 2 down-projection block size. A smaller block reduces per-expert
+    # 128-row sort padding (top-8 over 384 experts), but on gfx950 the
+    # MFMA-utilization win of the 128-row tile dominates that padding cost.
+    # Sweep-tuned on the Kimi TP4 shard (E=384, D=7168, I=512, topk=8),
+    # BLOCK_M=128 is 10-17% faster than the old 32/64 tiers at M<=1024 and is
+    # fastest at every M; on the gpt-oss shape (E=128, topk=4) it is within ~1%
+    # of the old tiers (no regression). Forcing sort_block_m<128 at large M also
+    # overflows the routed buffers (illegal access), so a flat 128 is both
+    # faster and safer. It also matches ``sort_block_m``, so stage 2 reuses the
+    # stage-1 sort directly (no second moe_sorting pass).
+    stage2_block_m = 128
+    s2_sorted_ids = sorted_ids
+    s2_sorted_weights = sorted_weights
+    s2_sorted_expert_ids = sorted_expert_ids
+    s2_num_valid_ids = num_valid_ids
 
     stage2_scale = gather_package_cdna4_scale(
         q_inter_scale,
