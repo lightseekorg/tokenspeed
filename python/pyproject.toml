@@ -39,6 +39,9 @@ dependencies = [
     "dill",
     "einops",
     "fastapi",
+    # 1.82+ ships protobuf-7.35 gencode; nvidia-cutlass-dsl caps protobuf<7.
+    "grpcio-health-checking==1.81.1",
+    "grpcio-reflection==1.81.1",
     "hf_transfer",
     "huggingface_hub",
     "modelscope",
