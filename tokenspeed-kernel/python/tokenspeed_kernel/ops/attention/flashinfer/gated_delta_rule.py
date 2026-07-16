@@ -358,6 +358,9 @@ if is_decode_available():
 
         Returns the [B, 1, HV, V] decode output (q.dtype).
         """
+        # Normalize decay inputs for FlashInfer's FP32 CuteDSL/DLPack boundary.
+        A_log = A_log.detach().float()
+        dt_bias = dt_bias.detach().float()
         out, _ = _gated_delta_rule_decode_pretranspose(
             q=q,
             k=k,
@@ -440,6 +443,9 @@ if is_decode_available():
 
         Returns the [B, T, HV, V] decode output (q.dtype).
         """
+        # Normalize decay inputs for FlashInfer's FP32 CuteDSL/DLPack boundary.
+        A_log = A_log.detach().float()
+        dt_bias = dt_bias.detach().float()
         K_dim = q.shape[-1]
         V_dim = v.shape[-1]
         use_bf16_state = (
