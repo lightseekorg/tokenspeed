@@ -27,7 +27,7 @@ import json
 import os
 import signal
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -388,6 +388,10 @@ def test_local_inkling_config_is_detected(tmp_path):
     assert not _is_inkling_model(None)
 
 
+@patch(
+    "tokenspeed.cli.serve_smg.current_platform",
+    new=lambda: SimpleNamespace(is_nvidia=True),
+)
 @patch("tokenspeed.cli.serve_smg._smg_supports_inkling_parsers", return_value=True)
 def test_remote_inkling_model_ids_get_defaults(mock_supports_inkling_parsers):
     for model in ("org/Inkling-Chat",):
@@ -436,6 +440,10 @@ def test_smg_inkling_parser_capability_requires_complete_pair(
     assert _smg_supports_inkling_parsers() is expected
 
 
+@patch(
+    "tokenspeed.cli.serve_smg.current_platform",
+    new=lambda: SimpleNamespace(is_nvidia=True),
+)
 @patch("tokenspeed.cli.serve_smg._smg_supports_inkling_parsers", return_value=False)
 def test_inkling_parser_defaults_fall_back_for_older_smg(
     mock_supports_inkling_parsers, tmp_path, caplog
@@ -504,6 +512,10 @@ def test_inkling_reasoning_effort_accepts_none_and_numeric_string():
     assert _render_inkling_template_with_effort("0.75") == prefix + "0.75" + suffix
 
 
+@patch(
+    "tokenspeed.cli.serve_smg.current_platform",
+    new=lambda: SimpleNamespace(is_nvidia=True),
+)
 @patch("tokenspeed.cli.serve_smg._smg_supports_inkling_parsers", return_value=True)
 def test_inkling_model_gets_default_chat_template_and_parsers(
     mock_supports_inkling_parsers, tmp_path
@@ -533,6 +545,10 @@ def test_inkling_model_gets_default_chat_template_and_parsers(
     mock_supports_inkling_parsers.assert_called_once_with()
 
 
+@patch(
+    "tokenspeed.cli.serve_smg.current_platform",
+    new=lambda: SimpleNamespace(is_nvidia=True),
+)
 def test_inkling_defaults_preserve_explicit_user_values(tmp_path):
     model = _make_inkling_model_dir(tmp_path)
 
@@ -583,6 +599,10 @@ def test_inkling_defaults_preserve_explicit_user_values(tmp_path):
     ]
 
 
+@patch(
+    "tokenspeed.cli.serve_smg.current_platform",
+    new=lambda: SimpleNamespace(is_nvidia=True),
+)
 def test_inkling_rejects_incompatible_attention_backend(tmp_path):
     model = _make_inkling_model_dir(tmp_path)
 
