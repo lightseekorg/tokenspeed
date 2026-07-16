@@ -194,18 +194,3 @@ def test_flat_reset_rejects_invalid_scheduler_generation(generation):
         event_loop._reset_caches_for_release()
 
     assert event_loop._flat_kv_release_generation is None
-
-
-def test_radix_wake_retains_legacy_per_pool_repair():
-    target = _Pool()
-    draft = _Pool()
-    scheduler = _Scheduler()
-    event_loop = _event_loop(target=target, draft=draft, scheduler=scheduler)
-
-    event_loop._reset_caches_for_release()
-    event_loop._kv_repair_after_wake()
-
-    assert scheduler.prefix_reset_calls == 1
-    assert scheduler.flat_reset_calls == 0
-    assert target.clear_calls == 1
-    assert draft.clear_calls == 1

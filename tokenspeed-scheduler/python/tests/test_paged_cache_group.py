@@ -34,27 +34,18 @@ def _sliding_config(rows_per_page=2, entry_stride_tokens=1, total_pages=8, windo
     )
 
 
-def test_scheduler_config_reports_compiled_structured_flat_admission():
-    config = SchedulerConfig()
+def _flat_pool(
+    pool_id: str, total_blocks: int, bytes_per_block: int
+) -> FlatBlockPoolConfig:
     pool = FlatBlockPoolConfig()
-    pool.pool_id = "pool"
-    pool.total_blocks = 2
-    pool.bytes_per_block = 1
-
-    config.enable_structured_flat_kv_completion = True
-    config.flat_block_pools = [pool]
-    assert config.uses_structured_flat_admission is FLAT_KVCACHE
-
-    config.enable_structured_flat_kv_completion = False
-    assert config.uses_structured_flat_admission is False
-
-    config.enable_structured_flat_kv_completion = True
-    config.flat_block_pools = []
-    assert config.uses_structured_flat_admission is False
+    pool.pool_id = pool_id
+    pool.total_blocks = total_blocks
+    pool.bytes_per_block = bytes_per_block
+    return pool
 
 
-def test_flat_group_metadata_round_trip_and_strict_geometry_validation():
-    config = PagedCacheGroupConfig(
+def _v4_state_group() -> PagedCacheGroupConfig:
+    return PagedCacheGroupConfig(
         group_id="v4.c4.state",
         rows_per_page=1,
         entry_stride_tokens=4,
@@ -70,32 +61,47 @@ def test_flat_group_metadata_round_trip_and_strict_geometry_validation():
         owner_mask=0b0011,
     )
 
-    config.validate_flat_block_geometry()
-    assert config.block_size == 4
-    assert config.pool_id == "v4.c4.state"
-    assert config.prefix_role == PagedCachePrefixRole.ContinuationState
-    assert config.table_layout == PagedCacheTableLayout.BoundedWindow
-    assert config.required_producer_domain_mask == 0b0011
-    assert config.owner_mask == 0b0011
 
+def test_v4_explicit_flat_pool_and_group_binding_round_trip():
+    config = SchedulerConfig()
+    config.enable_structured_flat_kv_completion = True
+    config.flat_block_pools = [
+        _flat_pool("v4.swa", total_blocks=32, bytes_per_block=64),
+        _flat_pool("v4.c4.state", total_blocks=16, bytes_per_block=128),
+    ]
+    config.paged_cache_groups = [_v4_state_group()]
 
-def test_legacy_group_constructor_keeps_unset_flat_metadata():
-    config = PagedCacheGroupConfig(
-        "legacy",
-        64,
-        4,
-        10,
-        PagedCacheRetention.FullHistory,
-        None,
-        PagedCacheGroupFamily.History,
+    assert [
+        (pool.pool_id, pool.total_blocks, pool.bytes_per_block)
+        for pool in config.flat_block_pools
+    ] == [("v4.swa", 32, 64), ("v4.c4.state", 16, 128)]
+    assert config.uses_structured_flat_admission is FLAT_KVCACHE
+
+    group = config.paged_cache_groups[0]
+    group.validate_flat_block_geometry()
+    assert (group.block_size, group.pool_id) == (4, "v4.c4.state")
+    assert (group.prefix_role, group.table_layout) == (
+        PagedCachePrefixRole.ContinuationState,
+        PagedCacheTableLayout.BoundedWindow,
     )
+    assert (group.required_producer_domain_mask, group.owner_mask) == (0b0011, 0b0011)
 
-    config.validate()
-    assert config.block_size == 0
-    assert config.pool_id == ""
-    assert config.prefix_role == PagedCachePrefixRole.HistoryAnchor
-    assert config.table_layout == PagedCacheTableLayout.Absolute
-    with pytest.raises(ValueError, match="flat block_size must be > 0"):
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        ("block_size", 8, "block_size must equal"),
+        ("sliding_window_tokens", 126, "window must be page-aligned"),
+        ("owner_mask", 0, "producer-domain and owner masks"),
+    ],
+)
+def test_v4_flat_group_rejects_invalid_geometry(
+    field: str, value: int, error: str
+) -> None:
+    config = _v4_state_group()
+    setattr(config, field, value)
+
+    with pytest.raises(ValueError, match=error):
         config.validate_flat_block_geometry()
 
 

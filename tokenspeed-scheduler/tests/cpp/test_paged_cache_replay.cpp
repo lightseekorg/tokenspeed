@@ -708,10 +708,6 @@ TEST(PagedCacheRewindTest, RewindRequestReleasesRejectedTailAndKeepsCommittedPre
 }
 
 TEST_F(PagedCacheDecodePublishTest, ContinuingDecodePublishesAcceptedPagesOnly) {
-#if TOKENSPEED_FLAT_KVCACHE
-    GTEST_SKIP() << "radix-adjunct fixture replaced by "
-                    "FlatKVAcceptedPublicationTest.DecodePublishesOnlyAcceptedHistoryAndExactContinuationBundle";
-#endif
     Submit(RequestSpec{.request_id = "r1", .tokens = {1, 2}});
     ASSERT_NE(GetForwardOp(PlanOnce()), nullptr);
 
@@ -746,9 +742,6 @@ TEST_F(PagedCacheDecodePublishTest, ContinuingDecodePublishesAcceptedPagesOnly) 
 }
 
 TEST_P(PagedCacheOverlapSchedulerTest, DynamicVerifyWidthRetainsAlreadyDispatchedRange) {
-#if TOKENSPEED_FLAT_KVCACHE
-    GTEST_SKIP() << "radix-adjunct fixture replaced by the FlatV4VerifyWidthsAndAcceptLengths flat-native matrix";
-#endif
     const auto [verify_width, accepted_length, overlap_depth] = GetParam();
     Submit(RequestSpec{.request_id = "r", .tokens = {1, 2}});
     ASSERT_NE(GetForwardOp(PlanOnce()), nullptr);
@@ -895,10 +888,6 @@ INSTANTIATE_TEST_SUITE_P(VerifyWidthsAndAcceptLengths, PagedCacheOverlapSchedule
                                            std::make_tuple(8, 7, 1), std::make_tuple(8, 8, 1)));
 
 TEST_F(PagedCacheTerminalMixedSchedulerTest, MixedPrefillDecodePagedTablesCoverScheduledTokens) {
-#if TOKENSPEED_FLAT_KVCACHE
-    GTEST_SKIP() << "radix-adjunct fixture replaced by "
-                    "FlatKVStructuredMixedBatchTest.PrefillAndDecodeRowsCarryEveryGroupTableAndCompletionSeed";
-#endif
     std::vector<std::string> decode_ids;
     for (int i = 0; i < 5; ++i) {
         decode_ids.push_back("decode_" + std::to_string(i));

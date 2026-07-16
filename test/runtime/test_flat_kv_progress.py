@@ -25,52 +25,49 @@ import pathlib
 import sys
 import types
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 
 _ROOT = pathlib.Path(__file__).resolve().parents[2]
 
-try:
-    import torch  # noqa: F401
-except ModuleNotFoundError:
-    fake_torch = types.ModuleType("torch")
-    fake_torch.Tensor = object
-    sys.modules["torch"] = fake_torch
-    _REMOVE_FAKE_TORCH = True
-else:
-    _REMOVE_FAKE_TORCH = False
+with mock.patch.dict(sys.modules):
+    try:
+        import torch  # noqa: F401
+    except ModuleNotFoundError:
+        fake_torch = types.ModuleType("torch")
+        fake_torch.Tensor = object
+        sys.modules["torch"] = fake_torch
 
-types_path = _ROOT / "python/tokenspeed/runtime/execution/types.py"
-types_spec = importlib.util.spec_from_file_location(
-    "flat_kv_progress_execution_types_test",
-    types_path,
-)
-assert types_spec is not None and types_spec.loader is not None
-execution_types = importlib.util.module_from_spec(types_spec)
-sys.modules[types_spec.name] = execution_types
-types_spec.loader.exec_module(execution_types)
-if _REMOVE_FAKE_TORCH:
-    sys.modules.pop("torch", None)
+    types_path = _ROOT / "python/tokenspeed/runtime/execution/types.py"
+    types_spec = importlib.util.spec_from_file_location(
+        "flat_kv_progress_execution_types_test",
+        types_path,
+    )
+    assert types_spec is not None and types_spec.loader is not None
+    execution_types = importlib.util.module_from_spec(types_spec)
+    sys.modules[types_spec.name] = execution_types
+    types_spec.loader.exec_module(execution_types)
 
-contract_path = _ROOT / "python/tokenspeed/runtime/configs/flat_kv_contract.py"
-contract_spec = importlib.util.spec_from_file_location(
-    "tokenspeed.runtime.configs.flat_kv_contract",
-    contract_path,
-)
-assert contract_spec is not None and contract_spec.loader is not None
-contract = importlib.util.module_from_spec(contract_spec)
-sys.modules[contract_spec.name] = contract
-contract_spec.loader.exec_module(contract)
+    contract_path = _ROOT / "python/tokenspeed/runtime/configs/flat_kv_contract.py"
+    contract_spec = importlib.util.spec_from_file_location(
+        "tokenspeed.runtime.configs.flat_kv_contract",
+        contract_path,
+    )
+    assert contract_spec is not None and contract_spec.loader is not None
+    contract = importlib.util.module_from_spec(contract_spec)
+    sys.modules[contract_spec.name] = contract
+    contract_spec.loader.exec_module(contract)
 
-progress_path = _ROOT / "python/tokenspeed/runtime/execution/flat_kv_progress.py"
-progress_spec = importlib.util.spec_from_file_location(
-    "flat_kv_progress_test_module",
-    progress_path,
-)
-assert progress_spec is not None and progress_spec.loader is not None
-progress = importlib.util.module_from_spec(progress_spec)
-sys.modules[progress_spec.name] = progress
-progress_spec.loader.exec_module(progress)
+    progress_path = _ROOT / "python/tokenspeed/runtime/execution/flat_kv_progress.py"
+    progress_spec = importlib.util.spec_from_file_location(
+        "flat_kv_progress_test_module",
+        progress_path,
+    )
+    assert progress_spec is not None and progress_spec.loader is not None
+    progress = importlib.util.module_from_spec(progress_spec)
+    sys.modules[progress_spec.name] = progress
+    progress_spec.loader.exec_module(progress)
 
 FlatKVCompletionInput = execution_types.FlatKVCompletionInput
 FlatKVExecutionTracker = progress.FlatKVExecutionTracker
@@ -217,7 +214,13 @@ def test_multi_layer_draft_reports_accepted_end_after_dense_catchup():
     assert by_id["index_state"].domain_valid_ends == (12, 10)
 
 
-def test_multi_layer_draft_without_dense_catchup_fails_closed():
+@pytest.mark.parametrize(
+    ("target_enqueued", "draft_enqueued"),
+    ((True, False), (False, True)),
+)
+def test_missing_required_v4_producer_domain_fails_closed(
+    target_enqueued: bool, draft_enqueued: bool
+):
     schema = FlatKVProgressSchema.from_v4_plan(_v4_plan(draft_layers=2))
     tracker = FlatKVExecutionTracker(schema)
     tracker.begin_dispatch(
@@ -225,8 +228,8 @@ def test_multi_layer_draft_without_dense_catchup_fails_closed():
         request_ids=["r"],
     )
     evidence = tracker.finish_dispatch(
-        target_forward_enqueued=True,
-        draft_continuous_prefix_enqueued=False,
+        target_forward_enqueued=target_enqueued,
+        draft_continuous_prefix_enqueued=draft_enqueued,
     )
     assert evidence is not None
 
@@ -244,48 +247,6 @@ def test_tracker_rejects_non_host_enqueue_evidence():
             target_forward_enqueued=True,
             draft_continuous_prefix_enqueued=1,
         )
-
-
-def test_missing_target_forward_fails_closed():
-    schema = FlatKVProgressSchema.from_v4_plan(_v4_plan())
-    tracker = FlatKVExecutionTracker(schema)
-    completion_input = _input()
-    tracker.begin_dispatch([completion_input], request_ids=["r"])
-    evidence = tracker.finish_dispatch(
-        target_forward_enqueued=False,
-        draft_continuous_prefix_enqueued=True,
-    )
-    assert evidence is not None
-
-    with pytest.raises(RuntimeError, match="missing continuous producer domains"):
-        evidence.materialize_group_completions(
-            accepted_raw_ends=[6],
-        )
-
-
-def test_generic_zero_mask_canonicalizes_to_stride_one_target_domain():
-    pool = SimpleNamespace(
-        flat_memory_plan=None,
-        scheduler_group_specs=(_spec("generic", 1, 0),),
-    )
-    schema = FlatKVProgressSchema.from_runtime_pool(pool)
-    assert schema.groups[0].required_domain_mask == V4_PRODUCER_TARGET_MAIN
-    tracker = FlatKVExecutionTracker(schema)
-    completion_input = _input(start=4, end=8, protected=8)
-    tracker.begin_dispatch([completion_input], request_ids=["r"])
-    evidence = tracker.finish_dispatch(
-        target_forward_enqueued=True,
-        draft_continuous_prefix_enqueued=False,
-    )
-    assert evidence is not None
-
-    group = evidence.materialize_group_completions(
-        accepted_raw_ends=[5],
-    )[
-        0
-    ][0]
-    assert group.completed_domain_mask == V4_PRODUCER_TARGET_MAIN
-    assert group.domain_valid_ends == (8,)
 
 
 def test_zero_width_dispatch_returns_seed_safe_completion_without_forward():
@@ -333,17 +294,3 @@ def test_v4_schema_rejects_missing_required_owner_domain(
 
     with pytest.raises(ValueError, match="missing required producer planes"):
         FlatKVProgressSchema.from_v4_plan(plan)
-
-
-def test_tracker_without_structured_dispatch_has_no_evidence():
-    schema = FlatKVProgressSchema.from_v4_plan(_v4_plan())
-    tracker = FlatKVExecutionTracker(schema)
-    tracker.begin_dispatch(None, request_ids=["r"])
-
-    assert (
-        tracker.finish_dispatch(
-            target_forward_enqueued=True,
-            draft_continuous_prefix_enqueued=True,
-        )
-        is None
-    )

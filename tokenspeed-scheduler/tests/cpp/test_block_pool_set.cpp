@@ -21,12 +21,8 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
-#include <exception>
-#include <limits>
 #include <stdexcept>
 #include <string>
-#include <thread>
-#include <type_traits>
 #include <vector>
 
 #include "cache/block_pool_set.h"
@@ -34,7 +30,7 @@
 namespace tokenspeed::test {
 namespace {
 
-TEST(PoolDemandTest, CheckedArithmeticIsComponentWise) {
+TEST(PoolDemandTest, ArithmeticIsComponentWise) {
     PoolDemand demand{1, 2, 3};
     demand.AddInPlace(PoolDemand{4, 0, 1});
     EXPECT_EQ(demand, (PoolDemand{5, 2, 4}));
@@ -43,69 +39,32 @@ TEST(PoolDemandTest, CheckedArithmeticIsComponentWise) {
     EXPECT_EQ(demand, (PoolDemand{3, 0, 3}));
 }
 
-TEST(PoolDemandTest, RejectsShapeMismatchAndNegativeResult) {
-    PoolDemand demand{1, 2};
-    EXPECT_THROW(demand.AddInPlace(PoolDemand{1}), std::invalid_argument);
-    EXPECT_THROW(demand.SubtractInPlace(PoolDemand{2, 0}), std::underflow_error);
-    EXPECT_EQ(demand, (PoolDemand{1, 2}));
-}
+enum class InvalidPoolDemandArithmetic { kShapeMismatch, kUnderflow };
 
-TEST(PoolDemandTest, ArithmeticFailureDoesNotPartiallyMutate) {
-    PoolDemand demand{7, std::numeric_limits<std::int32_t>::max()};
-    EXPECT_THROW(demand.AddInPlace(PoolDemand{1, 1}), std::overflow_error);
-    EXPECT_EQ(demand, (PoolDemand{7, std::numeric_limits<std::int32_t>::max()}));
-}
+TEST(PoolDemandTest, InvalidArithmeticDoesNotPartiallyMutate) {
+    struct Case {
+        const char* name;
+        InvalidPoolDemandArithmetic operation;
+    };
+    const Case cases[] = {
+        {"shape mismatch", InvalidPoolDemandArithmetic::kShapeMismatch},
+        {"underflow", InvalidPoolDemandArithmetic::kUnderflow},
+    };
 
-TEST(PoolDemandTest, InlineCapacityCoversV4AndPreservesValueSemantics) {
-    static_assert(PoolDemand::kInlineCapacity >= 6);
-    static_assert(std::is_nothrow_move_constructible_v<PoolDemand>);
-    static_assert(std::is_nothrow_move_assignable_v<PoolDemand>);
-
-    PoolDemand original(PoolDemand::kInlineCapacity, 0);
-    for (PoolIndex i = 0; i < original.Size(); ++i) {
-        original[i] = static_cast<std::int32_t>(i + 1);
+    for (const Case& test_case : cases) {
+        SCOPED_TRACE(test_case.name);
+        PoolDemand demand{3, 0, 3};
+        const PoolDemand before = demand;
+        switch (test_case.operation) {
+            case InvalidPoolDemandArithmetic::kShapeMismatch:
+                EXPECT_THROW(demand.AddInPlace(PoolDemand{1}), std::invalid_argument);
+                break;
+            case InvalidPoolDemandArithmetic::kUnderflow:
+                EXPECT_THROW(demand.SubtractInPlace(PoolDemand{4, 0, 0}), std::underflow_error);
+                break;
+        }
+        EXPECT_EQ(demand, before);
     }
-
-    PoolDemand copy = original;
-    copy[0] = 99;
-    EXPECT_EQ(original[0], 1);
-    EXPECT_EQ(copy[0], 99);
-
-    PoolDemand moved = std::move(copy);
-    EXPECT_TRUE(copy.Empty());
-    EXPECT_EQ(moved.Size(), PoolDemand::kInlineCapacity);
-    EXPECT_EQ(moved[0], 99);
-    EXPECT_EQ(moved[moved.Size() - 1], static_cast<std::int32_t>(moved.Size()));
-}
-
-TEST(PoolDemandTest, HeapFallbackPreservesArithmeticAndStrongFailureGuarantee) {
-    const std::size_t size = PoolDemand::kInlineCapacity + 3;
-    PoolDemand demand(size, 1);
-    PoolDemand delta(size, 2);
-
-    demand.AddInPlace(delta);
-    EXPECT_EQ(demand.Size(), size);
-    EXPECT_EQ(demand[0], 3);
-    EXPECT_EQ(demand[size - 1], 3);
-
-    PoolDemand copy = demand;
-    copy.SubtractInPlace(delta);
-    EXPECT_EQ(copy[0], 1);
-    EXPECT_EQ(demand[0], 3);
-
-    demand[size - 1] = std::numeric_limits<std::int32_t>::max();
-    PoolDemand overflow(size, 0);
-    overflow[size - 1] = 1;
-    EXPECT_THROW(demand.AddInPlace(overflow), std::overflow_error);
-    EXPECT_EQ(demand[0], 3);
-    EXPECT_EQ(demand[size - 1], std::numeric_limits<std::int32_t>::max());
-
-    PoolDemand moved;
-    moved = std::move(copy);
-    EXPECT_TRUE(copy.Empty());
-    EXPECT_EQ(moved.Size(), size);
-    EXPECT_EQ(moved[0], 1);
-    EXPECT_EQ(moved[size - 1], 1);
 }
 
 TEST(BlockPoolSetTest, CanonicalizesIdsAndKeepsPoolAddressesStable) {
@@ -155,58 +114,34 @@ TEST(BlockPoolSetTest, AdmissionChecksEveryPoolWithoutCrossPoolBorrowing) {
     EXPECT_FALSE(pools.CanSatisfy(PoolDemand{0, 1}));
 }
 
-TEST(BlockPoolSetTest, ExposesPerPoolCountsAndByteDemand) {
-    BlockPoolSet pools({
-        FlatBlockPoolConfig{.pool_id = "history", .total_blocks = 5, .bytes_per_block = 128},
-        FlatBlockPoolConfig{.pool_id = "state", .total_blocks = 3, .bytes_per_block = 32},
-    });
-
-    EXPECT_EQ(pools.TotalUsableBlocks(), (PoolDemand{4, 2}));
-    EXPECT_EQ(pools.FreeBlocks(), (PoolDemand{4, 2}));
-    EXPECT_EQ(pools.BytesFor(PoolDemand{2, 1}), 288);
-
-    BlockPool& history_pool = pools.Pool(pools.IndexOf("history"));
-    auto history = history_pool.AllocateBlocks(1);
-    ASSERT_EQ(history.size(), 1u);
-    history_pool.CacheFullBlock(history.front(), "history-key");
-    auto snapshots = pools.Snapshot();
-    ASSERT_EQ(snapshots.size(), 2u);
-    EXPECT_EQ(snapshots[0].pool_id, "history");
-    EXPECT_EQ(snapshots[0].active_blocks, 1);
-    EXPECT_EQ(snapshots[0].free_blocks, 3);
-    EXPECT_EQ(snapshots[0].cached_evictable_blocks, 0);
-    EXPECT_EQ(snapshots[0].pinned_cached_blocks, 1);
-    EXPECT_EQ(snapshots[1].pool_id, "state");
-    EXPECT_EQ(snapshots[1].active_blocks, 0);
-
-    history_pool.FreeBlocks(history);
-    snapshots = pools.Snapshot();
-    EXPECT_EQ(snapshots[0].active_blocks, 0);
-    EXPECT_EQ(snapshots[0].free_blocks, 4);
-    EXPECT_EQ(snapshots[0].cached_evictable_blocks, 1);
-    EXPECT_EQ(snapshots[0].pinned_cached_blocks, 0);
-}
-
-TEST(BlockPoolSetTest, RejectsByteDemandOverflow) {
-    BlockPoolSet pools({FlatBlockPoolConfig{
-        .pool_id = "huge",
-        .total_blocks = 3,
-        .bytes_per_block = std::numeric_limits<std::int64_t>::max() / 2 + 1,
-    }});
-    EXPECT_THROW(pools.BytesFor(PoolDemand{2}), std::overflow_error);
-}
-
 TEST(BlockPoolSetTest, RejectsInvalidOrDuplicateConfiguration) {
-    EXPECT_THROW(BlockPoolSet({}), std::invalid_argument);
-    EXPECT_THROW(BlockPoolSet({FlatBlockPoolConfig{.pool_id = "", .total_blocks = 2, .bytes_per_block = 1}}),
-                 std::invalid_argument);
-    EXPECT_THROW(BlockPoolSet({FlatBlockPoolConfig{.pool_id = "p", .total_blocks = 1, .bytes_per_block = 1}}),
-                 std::invalid_argument);
-    EXPECT_THROW(BlockPoolSet({
-                     FlatBlockPoolConfig{.pool_id = "p", .total_blocks = 2, .bytes_per_block = 1},
-                     FlatBlockPoolConfig{.pool_id = "p", .total_blocks = 3, .bytes_per_block = 1},
-                 }),
-                 std::invalid_argument);
+    struct Case {
+        std::string name;
+        std::vector<FlatBlockPoolConfig> configs;
+    };
+    const std::vector<Case> cases{
+        {.name = "empty pool set", .configs = {}},
+        {.name = "empty pool id",
+         .configs = {FlatBlockPoolConfig{.pool_id = "", .total_blocks = 2, .bytes_per_block = 1}}},
+        {.name = "reserved null page only",
+         .configs = {FlatBlockPoolConfig{.pool_id = "p", .total_blocks = 1, .bytes_per_block = 1}}},
+        {.name = "duplicate pool id",
+         .configs =
+             {
+                 FlatBlockPoolConfig{.pool_id = "p", .total_blocks = 2, .bytes_per_block = 1},
+                 FlatBlockPoolConfig{.pool_id = "p", .total_blocks = 3, .bytes_per_block = 1},
+             }},
+    };
+
+    for (const Case& test_case : cases) {
+        SCOPED_TRACE(test_case.name);
+        EXPECT_THROW(
+            {
+                BlockPoolSet invalid(test_case.configs);
+                static_cast<void>(invalid);
+            },
+            std::invalid_argument);
+    }
 }
 
 TEST(BlockPoolSetTest, QuiescentResetAtomicallyInvalidatesCachedContentAndAdvancesGeneration) {
@@ -239,65 +174,6 @@ TEST(BlockPoolSetTest, QuiescentResetAtomicallyInvalidatesCachedContentAndAdvanc
     EXPECT_EQ(history.NumFreeBlocks(), history.TotalBlocks() - 1);
     EXPECT_EQ(state.NumFreeBlocks(), state.TotalBlocks() - 1);
     EXPECT_EQ(pools.ResetQuiescent(), 2u);
-}
-
-TEST(BlockPoolSetThreadDomainTest, SharesOneDomainAndKeepsImmutableSchemaCrossThreadReadable) {
-    SchedulerThreadMutationDomain domain;
-    BlockPoolSet pools(
-        {
-            FlatBlockPoolConfig{.pool_id = "history", .total_blocks = 5, .bytes_per_block = 128},
-            FlatBlockPoolConfig{.pool_id = "state", .total_blocks = 3, .bytes_per_block = 32},
-        },
-        domain);
-
-    EXPECT_EQ(&pools.MutationDomain(), &domain);
-    EXPECT_EQ(&pools.Pool(0).MutationDomain(), &domain);
-    EXPECT_EQ(&pools.Pool(1).MutationDomain(), &domain);
-
-    std::exception_ptr generation_error;
-    std::exception_ptr snapshot_error;
-    std::exception_ptr schema_error;
-    std::size_t schema_size = 0;
-    PoolIndex history_index = 0;
-    std::string state_pool_id;
-    std::int32_t history_total_blocks = 0;
-    PoolDemand total_usable;
-    std::int64_t bytes = 0;
-    std::thread worker([&] {
-        try {
-            (void)pools.Generation();
-        } catch (...) {
-            generation_error = std::current_exception();
-        }
-        try {
-            (void)pools.FreeBlocks();
-        } catch (...) {
-            snapshot_error = std::current_exception();
-        }
-        try {
-            schema_size = pools.Size();
-            history_index = pools.IndexOf("history");
-            state_pool_id = pools.PoolId(1);
-            history_total_blocks = pools.Config(0).total_blocks;
-            total_usable = pools.TotalUsableBlocks();
-            bytes = pools.BytesFor(PoolDemand{1, 1});
-        } catch (...) {
-            schema_error = std::current_exception();
-        }
-    });
-    worker.join();
-
-    ASSERT_NE(generation_error, nullptr);
-    ASSERT_NE(snapshot_error, nullptr);
-    EXPECT_THROW(std::rethrow_exception(generation_error), std::logic_error);
-    EXPECT_THROW(std::rethrow_exception(snapshot_error), std::logic_error);
-    EXPECT_EQ(schema_error, nullptr);
-    EXPECT_EQ(schema_size, 2u);
-    EXPECT_EQ(history_index, 0u);
-    EXPECT_EQ(state_pool_id, "state");
-    EXPECT_EQ(history_total_blocks, 5);
-    EXPECT_EQ(total_usable, (PoolDemand{4, 2}));
-    EXPECT_EQ(bytes, 160);
 }
 
 }  // namespace

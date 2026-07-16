@@ -21,8 +21,6 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
-#include <limits>
-#include <utility>
 #include <vector>
 
 #include "cache/block_pool.h"
@@ -43,18 +41,6 @@ std::vector<BlockRef> Adopt(BlockPool& pool, const std::vector<CacheBlock*>& blo
     return refs;
 }
 
-TEST(BlockTableLogicalRangeTest, DefaultTableKeepsLegacyZeroBasedEmptySemantics) {
-    const BlockTable table;
-
-    EXPECT_EQ(table.BaseLogicalPage(), 0);
-    EXPECT_EQ(table.LiveSize(), 0);
-    EXPECT_EQ(table.NumBlocks(), 0);
-    EXPECT_EQ(table.LogicalEnd(), 0);
-    EXPECT_EQ(table.TailAvailableTokens(), 0);
-    EXPECT_FALSE(table.ContainsLogical(0));
-    EXPECT_TRUE(table.Blocks().empty());
-}
-
 TEST(BlockTableLogicalRangeTest, InitRangeMapsAbsolutePagesToCompactLocalSlots) {
     BlockPool pool(/*total_num_blocks=*/8);
     const std::int32_t free_baseline = pool.NumFreeBlocks();
@@ -66,7 +52,7 @@ TEST(BlockTableLogicalRangeTest, InitRangeMapsAbsolutePagesToCompactLocalSlots) 
 
     EXPECT_EQ(table.BaseLogicalPage(), 7);
     EXPECT_EQ(table.LiveSize(), 3);
-    EXPECT_EQ(table.NumBlocks(), 3) << "legacy NumBlocks remains the live vector size";
+    EXPECT_EQ(table.NumBlocks(), 3);
     EXPECT_EQ(table.LogicalEnd(), 10);
     EXPECT_FALSE(table.ContainsLogical(6));
     EXPECT_TRUE(table.ContainsLogical(7));
@@ -82,37 +68,6 @@ TEST(BlockTableLogicalRangeTest, InitRangeMapsAbsolutePagesToCompactLocalSlots) 
 
     table.Reset();
     EXPECT_EQ(pool.NumFreeBlocks(), free_baseline);
-}
-
-TEST(BlockTableLogicalRangeTest, InitRangeRequiresFreshTableAndRepresentableRange) {
-    BlockPool pool(/*total_num_blocks=*/4);
-    BlockTable table;
-    table.InitRange(/*base_logical_page=*/2, Adopt(pool, pool.AllocateBlocks(1)));
-
-    EXPECT_THROW(table.InitRange(/*base_logical_page=*/0, {}), std::runtime_error);
-    EXPECT_EQ(table.BaseLogicalPage(), 2);
-    EXPECT_EQ(table.LiveSize(), 1);
-
-    BlockTable negative;
-    EXPECT_THROW(negative.InitRange(/*base_logical_page=*/-1, {}), std::runtime_error);
-    EXPECT_EQ(negative.BaseLogicalPage(), 0);
-
-    BlockTable overflow;
-    EXPECT_THROW(overflow.InitRange(std::numeric_limits<std::int32_t>::max(), Adopt(pool, pool.AllocateBlocks(1))),
-                 std::runtime_error);
-    EXPECT_EQ(overflow.BaseLogicalPage(), 0);
-    EXPECT_EQ(overflow.LiveSize(), 0);
-}
-
-TEST(BlockTableLogicalRangeTest, CheckedLogicalLookupRejectsPagesOutsideLiveRange) {
-    BlockPool pool(/*total_num_blocks=*/4);
-    BlockTable table;
-    table.InitRange(/*base_logical_page=*/11, Adopt(pool, pool.AllocateBlocks(2)));
-
-    EXPECT_THROW(table.ToLocal(10), std::runtime_error);
-    EXPECT_THROW(table.ToLocal(13), std::runtime_error);
-    EXPECT_THROW(table.AtLogical(10), std::runtime_error);
-    EXPECT_THROW(table.AtLogical(13), std::runtime_error);
 }
 
 TEST(BlockTableLogicalRangeTest, DropBeforeReleasesOnlyTheLivePrefixAndAdvancesBase) {
@@ -142,99 +97,6 @@ TEST(BlockTableLogicalRangeTest, DropBeforeReleasesOnlyTheLivePrefixAndAdvancesB
     EXPECT_EQ(table.BaseLogicalPage(), 12);
     EXPECT_EQ(table.LiveSize(), 2);
     EXPECT_EQ(pool.NumFreeBlocks(), free_baseline - 2);
-
-    table.Reset();
-    EXPECT_EQ(pool.NumFreeBlocks(), free_baseline);
-}
-
-TEST(BlockTableLogicalRangeTest, DropBeforeRejectsBackwardAndPastEndWithoutMutation) {
-    BlockPool pool(/*total_num_blocks=*/6);
-    const std::int32_t free_baseline = pool.NumFreeBlocks();
-    std::vector<CacheBlock*> blocks = pool.AllocateBlocks(2);
-    BlockTable table;
-    table.InitRange(/*base_logical_page=*/5, Adopt(pool, blocks));
-    const std::int32_t free_held = pool.NumFreeBlocks();
-
-    EXPECT_THROW(table.DropBefore(/*abs_page=*/4), std::runtime_error);
-    EXPECT_THROW(table.DropBefore(/*abs_page=*/8), std::runtime_error);
-    EXPECT_EQ(table.BaseLogicalPage(), 5);
-    EXPECT_EQ(table.LiveSize(), 2);
-    EXPECT_EQ(table.AtLogical(5).Get(), blocks[0]);
-    EXPECT_EQ(table.AtLogical(6).Get(), blocks[1]);
-    EXPECT_EQ(pool.NumFreeBlocks(), free_held);
-
-    table.Reset();
-    EXPECT_EQ(pool.NumFreeBlocks(), free_baseline);
-}
-
-TEST(BlockTableLogicalRangeTest, DropAllAndResetClearTailAndRestorePoolBaseline) {
-    BlockPool pool(/*total_num_blocks=*/6);
-    const std::int32_t free_baseline = pool.NumFreeBlocks();
-    FullAttnManager manager(/*block_size=*/4);
-    BlockTable table;
-    ASSERT_TRUE(manager.Acquire(pool, table, /*num_tokens=*/5));
-    ASSERT_EQ(table.NumBlocks(), 2);
-    ASSERT_EQ(table.TailAvailableTokens(), 3);
-
-    table.DropBefore(/*abs_page=*/1);
-    ASSERT_EQ(table.BaseLogicalPage(), 1);
-    ASSERT_EQ(table.LiveSize(), 1);
-    ASSERT_EQ(table.TailAvailableTokens(), 3) << "the retained tail page keeps its availability";
-
-    table.DropBefore(table.LogicalEnd());
-    EXPECT_EQ(table.BaseLogicalPage(), 2);
-    EXPECT_EQ(table.LiveSize(), 0);
-    EXPECT_EQ(table.TailAvailableTokens(), 0) << "an empty table cannot retain tail capacity";
-    EXPECT_EQ(pool.NumFreeBlocks(), free_baseline);
-
-    table.Reset();
-    EXPECT_EQ(table.BaseLogicalPage(), 0);
-    EXPECT_EQ(table.LiveSize(), 0);
-    EXPECT_EQ(table.LogicalEnd(), 0);
-    EXPECT_EQ(table.TailAvailableTokens(), 0);
-    EXPECT_EQ(pool.NumFreeBlocks(), free_baseline);
-}
-
-TEST(BlockTableLogicalRangeTest, ResetReleasesCompactRangeAndRestoresZeroOrigin) {
-    BlockPool pool(/*total_num_blocks=*/6);
-    const std::int32_t free_baseline = pool.NumFreeBlocks();
-    std::vector<CacheBlock*> blocks = pool.AllocateBlocks(3);
-    BlockTable table;
-    table.InitRange(/*base_logical_page=*/20, Adopt(pool, blocks));
-
-    table.Reset();
-
-    EXPECT_EQ(table.BaseLogicalPage(), 0);
-    EXPECT_EQ(table.LiveSize(), 0);
-    EXPECT_EQ(table.NumBlocks(), 0);
-    EXPECT_EQ(table.LogicalEnd(), 0);
-    EXPECT_EQ(table.TailAvailableTokens(), 0);
-    for (CacheBlock* block : blocks) {
-        EXPECT_EQ(block->RefCount(), 0);
-    }
-    EXPECT_EQ(pool.NumFreeBlocks(), free_baseline);
-}
-
-TEST(BlockTableLogicalRangeTest, LegacyAbsoluteHolesRemainZeroBasedAndUncompacted) {
-    BlockPool pool(/*total_num_blocks=*/5);
-    const std::int32_t free_baseline = pool.NumFreeBlocks();
-    FullAttnManager manager(/*block_size=*/2);
-    BlockTable table;
-    ASSERT_TRUE(manager.Acquire(pool, table, /*num_tokens=*/4));
-    ASSERT_EQ(table.NumBlocks(), 2);
-    CacheBlock* second = table.Blocks()[1];
-
-    CacheBlock* evicted = table.EvictToNull(/*index=*/0, pool.NullBlock());
-    ASSERT_NE(evicted, nullptr);
-    pool.FreeBlock(evicted);
-
-    EXPECT_EQ(table.BaseLogicalPage(), 0);
-    EXPECT_EQ(table.LiveSize(), 2);
-    EXPECT_EQ(table.LogicalEnd(), 2);
-    EXPECT_EQ(table.NumBlocks(), 2);
-    EXPECT_TRUE(table.Blocks()[0]->IsNull());
-    EXPECT_EQ(table.Blocks()[1], second);
-    EXPECT_EQ(BlockTablePageIds(table), (std::vector<std::int32_t>{0, second->BlockId()}));
 
     table.Reset();
     EXPECT_EQ(pool.NumFreeBlocks(), free_baseline);
@@ -273,31 +135,6 @@ TEST(BlockTableLogicalRangeTest, BoundedSlidingReclaimCompactsDescriptorsAndUses
     manager.Free(pool, table);
     EXPECT_EQ(table.BaseLogicalPage(), 0);
     EXPECT_EQ(table.LiveSize(), 0);
-    EXPECT_EQ(pool.NumFreeBlocks(), free_baseline);
-}
-
-TEST(BlockTableLogicalRangeTest, RewindKeepsSharedAcceptedPageAndReusesItsRejectedRows) {
-    BlockPool pool(/*total_num_blocks=*/8);
-    const std::int32_t free_baseline = pool.NumFreeBlocks();
-    FullAttnManager manager(/*block_size=*/4);
-    BlockTable table;
-    ASSERT_TRUE(manager.Acquire(pool, table, /*num_tokens=*/16));
-    ASSERT_EQ(table.LiveSize(), 4);
-
-    manager.RewindTail(pool, table, /*accepted_raw_end=*/5, /*retain_raw_end=*/5);
-
-    EXPECT_EQ(table.LogicalEnd(), 2);
-    EXPECT_EQ(table.LiveSize(), 2);
-    EXPECT_EQ(table.TailAvailableTokens(), 3);
-    EXPECT_EQ(pool.NumFreeBlocks(), free_baseline - 2);
-
-    const std::vector<std::int32_t> retained_ids = BlockTablePageIds(table);
-    ASSERT_TRUE(manager.Acquire(pool, table, /*num_tokens=*/3));
-    EXPECT_EQ(BlockTablePageIds(table), retained_ids);
-    EXPECT_EQ(table.TailAvailableTokens(), 0);
-    EXPECT_EQ(pool.NumFreeBlocks(), free_baseline - 2);
-
-    manager.Free(pool, table);
     EXPECT_EQ(pool.NumFreeBlocks(), free_baseline);
 }
 

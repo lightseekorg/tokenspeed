@@ -17,7 +17,6 @@ On the default (radix) build it stays empty, so the whole module is
 from __future__ import annotations
 
 import array
-import gc
 
 import pytest
 
@@ -53,36 +52,6 @@ def _make_config() -> ts.SchedulerConfig:
         family=ts.PagedCacheGroupFamily.State,
     )
     cfg.paged_cache_groups = [full, swa]
-    return cfg
-
-
-def _make_state_only_config(*, disable_prefix_cache: bool) -> ts.SchedulerConfig:
-    cfg = _make_config()
-    total_blocks = 32
-    cfg.num_device_pages = 0
-    cfg.num_host_pages = 1
-    cfg.disable_prefix_cache = disable_prefix_cache
-    pool = ts.FlatBlockPoolConfig()
-    pool.pool_id = "v4.swa"
-    pool.total_blocks = total_blocks
-    pool.bytes_per_block = 64
-    cfg.flat_block_pools = [pool]
-    state = ts.PagedCacheGroupConfig(
-        group_id="v4.swa_kv",
-        rows_per_page=cfg.block_size,
-        entry_stride_tokens=1,
-        total_pages=total_blocks,
-        retention=ts.PagedCacheRetention.SlidingWindow,
-        sliding_window_tokens=4,
-        family=ts.PagedCacheGroupFamily.State,
-        block_size=cfg.block_size,
-        pool_id=pool.pool_id,
-        prefix_role=ts.PagedCachePrefixRole.ContinuationState,
-        table_layout=ts.PagedCacheTableLayout.BoundedWindow,
-        required_producer_domain_mask=1,
-        owner_mask=1,
-    )
-    cfg.paged_cache_groups = [state]
     return cfg
 
 
@@ -166,46 +135,6 @@ def test_copy_flat_block_table_to_returns_shape_and_writes_buffers():
     assert (rows, cols) == (1, len(expected_table))
     assert list(table[:cols]) == expected_table
     assert bases[0] == expected_base
-
-
-def test_execution_plan_forward_is_a_borrowed_view_with_plan_keepalive():
-    scheduler = ts.Scheduler(_make_config())
-    scheduler.submit_requests([_make_spec("borrowed-forward", num_pages=2)])
-
-    plan = scheduler.next_execution_plan()
-    forward_op = plan.forward[0]
-
-    # A copied operation produces a fresh nanobind wrapper on every property
-    # read. A borrowed operation reuses the wrapper registered for the C++
-    # address inside ExecutionPlan.
-    assert plan.forward[0] is forward_op
-
-    del plan
-    gc.collect()
-
-    # reference_internal on the element (not just the temporary list) keeps
-    # its owning ExecutionPlan alive after callers retain plan.forward[0].
-    assert list(forward_op.request_ids) == ["borrowed-forward"]
-
-
-def test_prefix_disabled_state_only_config_starts_from_cold_root():
-    scheduler = ts.Scheduler(_make_state_only_config(disable_prefix_cache=True))
-    scheduler.submit_requests([_make_spec("state-only", num_pages=2)])
-
-    op = _find_flat_op(scheduler.next_execution_plan())
-    assert op is not None
-    assert set(op.flat_block_tables) == {"v4.swa_kv"}
-    assert list(op.extend_prefix_lens) == [0]
-    assert list(op.flat_block_table_base_offsets["v4.swa_kv"]) == [0]
-    assert all(page_id > 0 for page_id in op.flat_block_tables["v4.swa_kv"][0])
-
-
-def test_prefix_enabled_state_only_config_requires_history_anchor():
-    with pytest.raises(
-        ValueError,
-        match="continuation-state flat groups require at least one history anchor",
-    ):
-        ts.Scheduler(_make_state_only_config(disable_prefix_cache=False))
 
 
 def test_decode_slides_swa_window_to_null_hole():

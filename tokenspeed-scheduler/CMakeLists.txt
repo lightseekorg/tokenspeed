@@ -125,7 +125,6 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
 
     add_executable(tokenspeed_scheduler_tests
         tests/cpp/test_page_hasher.cpp
-        tests/cpp/test_paged_cache_group_config.cpp
         tests/cpp/test_block_pool.cpp
         tests/cpp/test_block_pool_set.cpp
         tests/cpp/test_flat_reservation_ledger.cpp

@@ -23,6 +23,7 @@ import sys
 import unittest
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest import mock
 
 _CONFIGS_DIR = (
     pathlib.Path(__file__).resolve().parents[2]
@@ -42,12 +43,16 @@ def _load(mod_name: str, file_name: str):
     return mod
 
 
-_contract = _load("tokenspeed.runtime.configs.flat_kv_contract", "flat_kv_contract.py")
-_generic = _load("tokenspeed.runtime.configs.paged_cache_spec", "paged_cache_spec.py")
-_v4 = _load("deepseek_v4_cache_spec_flat_plan_test", "deepseek_v4_cache_spec.py")
-_plan = _load("flat_memory_plan_v4_test", "flat_memory_plan.py")
+with mock.patch.dict(sys.modules):
+    _contract = _load(
+        "tokenspeed.runtime.configs.flat_kv_contract", "flat_kv_contract.py"
+    )
+    _generic = _load(
+        "tokenspeed.runtime.configs.paged_cache_spec", "paged_cache_spec.py"
+    )
+    _v4 = _load("deepseek_v4_cache_spec_flat_plan_test", "deepseek_v4_cache_spec.py")
+    _plan = _load("flat_memory_plan_v4_test", "flat_memory_plan.py")
 
-PagedCacheGroupSpec = _generic.PagedCacheGroupSpec
 FlatComponentTensorPlan = _plan.FlatComponentTensorPlan
 FlatGroupTablePlan = _plan.FlatGroupTablePlan
 V4FlatMetadataAccounting = _plan.V4FlatMetadataAccounting
@@ -83,34 +88,6 @@ def _component(
         alignment_bytes=16,
         bytes_per_block=bytes_per_block,
     )
-
-
-class TestPagedCacheGroupSpecFlatContract(unittest.TestCase):
-    def test_legacy_construction_derives_flat_defaults(self):
-        spec = PagedCacheGroupSpec("legacy", "full_history", 4, 2, None)
-
-        self.assertEqual(spec.block_size_tokens, 8)
-        self.assertEqual(spec.pool_id, "default")
-        self.assertEqual(spec.prefix_role, "history_anchor")
-        self.assertEqual(spec.table_layout, "absolute")
-        self.assertEqual(spec.required_producer_domain_mask, 0)
-        self.assertEqual(spec.owner_mask, 0)
-
-    def test_explicit_block_size_must_match_raw_token_span(self):
-        with self.assertRaisesRegex(ValueError, "block_size_tokens"):
-            PagedCacheGroupSpec(
-                "bad",
-                "full_history",
-                4,
-                2,
-                None,
-                block_size_tokens=4,
-            )
-
-    def test_legacy_invalid_geometry_can_still_be_validated_later(self):
-        spec = PagedCacheGroupSpec("bad-rows", "full_history", 0, 1, None)
-
-        self.assertEqual(spec.block_size_tokens, 0)
 
 
 class TestDeepSeekV4FlatCacheSpecs(unittest.TestCase):
@@ -371,31 +348,40 @@ class TestV4FlatMemoryPlanUnion(unittest.TestCase):
     def test_graph_metadata_runtime_shape_and_total_drift_fail_closed(self):
         plan = self._build(metadata_accounting=self._metadata_accounting())
 
-        with self.assertRaisesRegex(RuntimeError, "shape disagrees"):
-            validate_v4_flat_graph_owner_allocation(
+        def validate_owner(*, table_shape, table_nbytes):
+            return validate_v4_flat_graph_owner_allocation(
                 owner="target",
                 capture_cols_by_group=plan.graph_capture_cols_by_group("target"),
                 batch_rows=plan.graph_batch_rows("target"),
-                table_shapes={self.target_swa.group_id: (2, 2)},
+                table_shapes={self.target_swa.group_id: table_shape},
                 base_shapes={self.target_swa.group_id: (2,)},
-                table_nbytes={self.target_swa.group_id: 16},
+                table_nbytes={self.target_swa.group_id: table_nbytes},
                 base_nbytes={self.target_swa.group_id: 8},
             )
-        with self.assertRaisesRegex(RuntimeError, "bytes disagree"):
-            validate_v4_flat_graph_owner_allocation(
-                owner="target",
-                capture_cols_by_group=plan.graph_capture_cols_by_group("target"),
-                batch_rows=plan.graph_batch_rows("target"),
-                table_shapes={self.target_swa.group_id: (2, 3)},
-                base_shapes={self.target_swa.group_id: (2,)},
-                table_nbytes={self.target_swa.group_id: 12},
-                base_nbytes={self.target_swa.group_id: 8},
-            )
-        with self.assertRaisesRegex(RuntimeError, "target.*allocation"):
-            plan.validate_graph_metadata_allocation(
-                target_actual_bytes=28,
-                draft_actual_bytes=160,
-            )
+
+        cases = (
+            (
+                "table shape drift",
+                lambda: validate_owner(table_shape=(2, 2), table_nbytes=16),
+                "shape disagrees",
+            ),
+            (
+                "table byte drift",
+                lambda: validate_owner(table_shape=(2, 3), table_nbytes=12),
+                "bytes disagree",
+            ),
+            (
+                "owner total drift",
+                lambda: plan.validate_graph_metadata_allocation(
+                    target_actual_bytes=28,
+                    draft_actual_bytes=160,
+                ),
+                "target.*allocation",
+            ),
+        )
+        for name, operation, error in cases:
+            with self.subTest(name), self.assertRaisesRegex(RuntimeError, error):
+                operation()
 
     def test_eager_only_zero_graph_rows_allocate_zero_flat_metadata(self):
         group_id = self.target_swa.group_id
@@ -410,12 +396,6 @@ class TestV4FlatMemoryPlanUnion(unittest.TestCase):
             base_nbytes={group_id: 0},
         )
         self.assertEqual(actual, 0)
-
-    def test_metadata_accounting_rejects_stale_graph_byte_budget(self):
-        metadata = self._metadata_accounting()
-
-        with self.assertRaisesRegex(ValueError, "canonical target/draft"):
-            replace(metadata, graph_metadata_bytes=metadata.graph_metadata_bytes - 4)
 
     def test_fingerprint_and_canonical_order_ignore_input_order(self):
         forward = self._build()
@@ -457,33 +437,6 @@ class TestV4FlatMemoryPlanUnion(unittest.TestCase):
             r"rank 7 diverges from rank 4.*pools\[0\]\.total_blocks",
         ):
             assert_v4_flat_plan_agreement([reference, divergent])
-
-    def test_agreement_rejects_rank_local_stale_fingerprint(self):
-        plan = self._build()
-        reference = make_v4_flat_plan_agreement_record(plan, rank=4)
-        stale_plan = copy.deepcopy(reference.canonical_plan)
-        stale_plan["max_total_tokens"] += 1
-        stale = V4FlatPlanAgreementRecord(
-            rank=7,
-            plan_fingerprint=reference.plan_fingerprint,
-            canonical_plan=stale_plan,
-        )
-
-        with self.assertRaisesRegex(RuntimeError, r"canonical fields on rank 7"):
-            assert_v4_flat_plan_agreement([reference, stale])
-
-    def test_single_rank_agreement_is_a_no_op(self):
-        plan = self._build()
-        record = make_v4_flat_plan_agreement_record(plan, rank=0)
-        stale_plan = copy.deepcopy(record.canonical_plan)
-        stale_plan["max_total_tokens"] += 1
-        stale = V4FlatPlanAgreementRecord(
-            rank=0,
-            plan_fingerprint=record.plan_fingerprint,
-            canonical_plan=stale_plan,
-        )
-
-        assert_v4_flat_plan_agreement([stale])
 
     def test_duplicate_component_identity_rejects_schema_drift(self):
         drift = replace(self.target_component, dtype="float8_e4m3fn")

@@ -6,9 +6,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("triton")
-cache_loc_kernel = pytest.importorskip(
-    "tokenspeed.runtime.execution.cache_loc_kernel"
-)
+cache_loc_kernel = pytest.importorskip("tokenspeed.runtime.execution.cache_loc_kernel")
 
 
 class _FakeKernelLauncher:
@@ -26,7 +24,24 @@ class _FakeKernelLauncher:
         self.kwargs = kwargs
 
 
-def test_fused_decode_wrapper_forwards_group_keyed_dummy_mode(monkeypatch):
+@pytest.mark.parametrize(
+    ("mode_kwargs", "expected_dummy_slot", "expected_dummy_mode"),
+    (
+        pytest.param(
+            {"use_dummy_cache_loc": True, "dummy_kv_slot": 23},
+            23,
+            True,
+            id="group-keyed-dummy",
+        ),
+        pytest.param({}, 0, False, id="legacy"),
+    ),
+)
+def test_fused_decode_wrapper_forwards_cache_loc_mode(
+    monkeypatch,
+    mode_kwargs,
+    expected_dummy_slot,
+    expected_dummy_mode,
+):
     launcher = _FakeKernelLauncher()
     monkeypatch.setattr(
         cache_loc_kernel,
@@ -45,34 +60,34 @@ def test_fused_decode_wrapper_forwards_group_keyed_dummy_mode(monkeypatch):
         4,
         req_to_pages,
         16,
-        use_dummy_cache_loc=True,
-        dummy_kv_slot=23,
+        **mode_kwargs,
     )
 
     assert launcher.grid == (2,)
-    assert launcher.args[7] == 23
-    assert launcher.kwargs["USE_DUMMY_CACHE_LOC"] is True
+    assert launcher.args[7] == expected_dummy_slot
+    assert launcher.kwargs["USE_DUMMY_CACHE_LOC"] is expected_dummy_mode
     assert launcher.kwargs["max_pages"] == 7
-
-    cache_loc_kernel.fused_decode_input_prep(
-        object(),
-        object(),
-        object(),
-        req_pool_indices,
-        object(),
-        1,
-        req_to_pages,
-        16,
-    )
-    assert launcher.args[7] == 0
-    assert launcher.kwargs["USE_DUMMY_CACHE_LOC"] is False
 
 
 @pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="fused decode input preparation requires CUDA",
 )
-def test_fused_decode_input_prep_reuses_position_path_with_dummy_cache_locs():
+@pytest.mark.parametrize(
+    ("mode_kwargs", "expected_cache_locs"),
+    (
+        pytest.param(
+            {"use_dummy_cache_loc": True, "dummy_kv_slot": 23},
+            [23, 23],
+            id="group-keyed-dummy",
+        ),
+        pytest.param({}, [11, 21], id="legacy"),
+    ),
+)
+def test_fused_decode_input_prep_reuses_position_path(
+    mode_kwargs,
+    expected_cache_locs,
+):
     req_pool_indices = torch.tensor([0, 1], dtype=torch.int64, device="cuda")
     valid_cache_lengths = torch.tensor([3, 5, 0], dtype=torch.int32, device="cuda")
     req_to_pages = torch.tensor(
@@ -97,25 +112,9 @@ def test_fused_decode_input_prep_reuses_position_path_with_dummy_cache_locs():
         1,
         req_to_pages,
         4,
-        use_dummy_cache_loc=True,
-        dummy_kv_slot=23,
+        **mode_kwargs,
     )
 
-    assert cache_locs.tolist() == [23, 23]
-    assert positions.tolist() == [3, 5]
-    assert seq_lens.tolist() == [4, 6]
-
-    cache_loc_kernel.fused_decode_input_prep(
-        cache_locs,
-        positions,
-        seq_lens,
-        req_pool_indices,
-        valid_cache_lengths,
-        1,
-        req_to_pages,
-        4,
-    )
-
-    assert cache_locs.tolist() == [11, 21]
+    assert cache_locs.tolist() == expected_cache_locs
     assert positions.tolist() == [3, 5]
     assert seq_lens.tolist() == [4, 6]

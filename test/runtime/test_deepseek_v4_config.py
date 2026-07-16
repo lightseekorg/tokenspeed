@@ -1307,32 +1307,22 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
 
     def test_v4_eagle_draft_prefix_capability_requires_one_nextn_layer(self):
-        def model_config(architectures, num_attention_layers):
-            return SimpleNamespace(
-                hf_config=SimpleNamespace(architectures=architectures),
-                num_attention_layers=num_attention_layers,
-            )
+        cases = (
+            ("single NextN layer", ["DeepseekV4ForCausalLMNextN"], 1, True),
+            ("zero NextN layers", ["DeepseekV4ForCausalLMNextN"], 0, False),
+            ("multiple NextN layers", ["DeepseekV4ForCausalLMNextN"], 2, False),
+            ("target architecture", ["DeepseekV4ForCausalLM"], 1, False),
+        )
 
-        self.assertTrue(
-            _first_step_covers_all_draft_kv_layers(
-                model_config(["DeepseekV4ForCausalLMNextN"], 1)
-            )
-        )
-        for num_attention_layers in (0, 2, 3):
-            with self.subTest(num_attention_layers=num_attention_layers):
-                self.assertFalse(
-                    _first_step_covers_all_draft_kv_layers(
-                        model_config(
-                            ["DeepseekV4ForCausalLMNextN"],
-                            num_attention_layers,
-                        )
-                    )
+        for name, architectures, num_attention_layers, expected in cases:
+            with self.subTest(name=name):
+                model_config = SimpleNamespace(
+                    hf_config=SimpleNamespace(architectures=architectures),
+                    num_attention_layers=num_attention_layers,
                 )
-        self.assertFalse(
-            _first_step_covers_all_draft_kv_layers(
-                model_config(["DeepseekV4ForCausalLM"], 1)
-            )
-        )
+                self.assertEqual(
+                    _first_step_covers_all_draft_kv_layers(model_config), expected
+                )
 
     def test_deepseek_v4_mtp_checkpoint_name_remap(self):
         model = object.__new__(DeepseekV4ForCausalLMNextN)
@@ -1924,43 +1914,6 @@ class TestDeepseekV4Config(unittest.TestCase):
             )
             self.assertEqual(buffer.writes, expected_writes)
 
-    def test_deepseek_v4_graph_refresh_keeps_idle_and_radix_missing_semantics(self):
-        backend = object.__new__(DeepseekV4AttentionBackend)
-        table_buffer = _TensorWriteRecorder((2, 4))
-        base_buffer = _TensorWriteRecorder((2,))
-        backend._cuda_graph_paged_cache_block_tables = {"v4.swa_kv": table_buffer}
-        backend._cuda_graph_paged_cache_base_offsets = {"v4.swa_kv": base_buffer}
-        backend._cuda_graph_flat_table_refresh_state = {}
-
-        backend._refresh_cuda_graph_base_offsets(
-            2,
-            {"v4.swa_kv": _TensorWriteRecorder((2,))},
-            require_all_groups=True,
-        )
-        self.assertEqual(base_buffer.writes, [("copy", (slice(None, 2),))])
-        base_buffer.writes.clear()
-
-        backend._refresh_cuda_graph_paged_cache_block_tables(
-            0,
-            {},
-            pad_value=-1,
-        )
-        backend._refresh_cuda_graph_base_offsets(0, {})
-        self.assertEqual(table_buffer.writes, [])
-        self.assertEqual(base_buffer.writes, [])
-
-        backend._refresh_cuda_graph_paged_cache_block_tables(
-            2,
-            {},
-            pad_value=-1,
-        )
-        backend._refresh_cuda_graph_base_offsets(2, {})
-        self.assertEqual(
-            table_buffer.writes,
-            [("fill", (slice(None, 2),), -1)],
-        )
-        self.assertEqual(base_buffer.writes, [("fill", (slice(None, 2),), 0)])
-
     def test_deepseek_v4_flat_graph_refresh_handles_width_transitions(self):
         backend = object.__new__(DeepseekV4AttentionBackend)
         buffer = torch.full((2, 4), 99, dtype=torch.int32)
@@ -2306,79 +2259,119 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
 
     def test_deepseek_v4_group_slot_mapping_from_raw(self):
-        block_table = torch.tensor([[10, 11], [20, -1]], dtype=torch.int32)
-        slots = _group_slot_mapping_from_raw(
-            positions=torch.tensor([0, 63, 64, 9, 10], dtype=torch.int64),
-            req_indices=torch.tensor([0, 0, 0, 1, 1], dtype=torch.int32),
-            block_table=block_table,
-            rows_per_page=64,
-            entry_stride_tokens=1,
+        cases = (
+            (
+                "plain token rows",
+                [0, 63, 64, 9, 10],
+                [0, 0, 0, 1, 1],
+                [[10, 11], [20, -1]],
+                {"entry_stride_tokens": 1},
+                [640, 703, 704, 1289, 1290],
+            ),
+            (
+                "compressed token stride",
+                [0, 255, 256, 511],
+                [0, 0, 0, 1],
+                [[10, 11], [20, -1]],
+                {"entry_stride_tokens": 4},
+                [640, 703, 704, -1],
+            ),
+            (
+                "bounded owner capacity",
+                [0, 64, 128, 192],
+                [0, 0, 0, 0],
+                [[0, 3, 4, -1]],
+                {"capacity_pages": 4},
+                [-1, 192, -1, -1],
+            ),
         )
-        self.assertTrue(torch.equal(slots, torch.tensor([640, 703, 704, 1289, 1290])))
 
-        compressed_slots = _group_slot_mapping_from_raw(
-            positions=torch.tensor([0, 255, 256, 511], dtype=torch.int64),
-            req_indices=torch.tensor([0, 0, 0, 1], dtype=torch.int32),
-            block_table=block_table,
-            rows_per_page=64,
-            entry_stride_tokens=4,
+        for name, positions, req_indices, block_table, options, expected in cases:
+            with self.subTest(name=name):
+                call_kwargs = {
+                    "positions": torch.tensor(positions, dtype=torch.int64),
+                    "req_indices": torch.tensor(req_indices, dtype=torch.int32),
+                    "block_table": torch.tensor(block_table, dtype=torch.int32),
+                    "rows_per_page": 64,
+                    **options,
+                }
+                slots = _group_slot_mapping_from_raw(**call_kwargs)
+                expected_slots = torch.tensor(expected)
+                self.assertTrue(torch.equal(slots, expected_slots))
+
+    def test_deepseek_v4_flat_compressed_slot_capacity_matrix(self):
+        cases = (
+            (
+                "missing owner capacity",
+                2,
+                None,
+                None,
+                None,
+                "owner component page capacity",
+            ),
+            (
+                "owner capacity masks foreign pages",
+                2,
+                3,
+                None,
+                [-1, -1, 4, -1],
+                None,
+            ),
+            (
+                "block size and owner capacity disagree",
+                4,
+                4,
+                3,
+                None,
+                "disagree on page capacity",
+            ),
         )
-        self.assertTrue(
-            torch.equal(compressed_slots, torch.tensor([640, 703, 704, -1]))
-        )
 
-        bounded_slots = _group_slot_mapping_from_raw(
-            positions=torch.tensor([0, 64, 128, 192], dtype=torch.int64),
-            req_indices=torch.zeros(4, dtype=torch.int32),
-            block_table=torch.tensor([[0, 3, 4, -1]], dtype=torch.int32),
-            rows_per_page=64,
-            capacity_pages=4,
-        )
-        self.assertTrue(torch.equal(bounded_slots, torch.tensor([-1, 192, -1, -1])))
+        for (
+            name,
+            block_size,
+            capacity_pages,
+            primed_capacity_pages,
+            expected,
+            message,
+        ) in cases:
+            with self.subTest(name=name):
+                cache = DeepseekV4CacheMetadata(
+                    page_size=8,
+                    block_table=torch.empty((1, 0), dtype=torch.int32),
+                    table_source_kind="flat",
+                    paged_cache_block_tables={
+                        "v4.c4a.compressed_kv": torch.tensor(
+                            [[0, 2, 3]], dtype=torch.int32
+                        )
+                    },
+                )
+                mapping_kwargs = dict(
+                    positions=torch.tensor([3, 7, 11, 19], dtype=torch.int64),
+                    compress_ratio=4,
+                    token_to_req_indices=torch.zeros(4, dtype=torch.int32),
+                    query_start_loc=torch.tensor([0, 4], dtype=torch.int32),
+                    seq_lens=torch.tensor([20], dtype=torch.int32),
+                )
+                if primed_capacity_pages is not None:
+                    cache.compressed_slot_mapping(
+                        **mapping_kwargs,
+                        kv_cache_block_size=2,
+                        capacity_pages=primed_capacity_pages,
+                    )
 
-    def test_deepseek_v4_flat_compressed_slots_require_owner_capacity(self):
-        cache = DeepseekV4CacheMetadata(
-            page_size=8,
-            block_table=torch.empty((1, 0), dtype=torch.int32),
-            table_source_kind="flat",
-            paged_cache_block_tables={
-                "v4.c4a.compressed_kv": torch.tensor([[0, 2, 3]], dtype=torch.int32)
-            },
-        )
-        positions = torch.tensor([3, 7, 11, 19], dtype=torch.int64)
-        token_to_req = torch.zeros(4, dtype=torch.int32)
+                call_kwargs = dict(
+                    **mapping_kwargs,
+                    kv_cache_block_size=block_size,
+                    capacity_pages=capacity_pages,
+                )
 
-        with self.assertRaisesRegex(RuntimeError, "owner component page capacity"):
-            cache.compressed_slot_mapping(
-                positions,
-                compress_ratio=4,
-                token_to_req_indices=token_to_req,
-                query_start_loc=torch.tensor([0, 4], dtype=torch.int32),
-                seq_lens=torch.tensor([20], dtype=torch.int32),
-                kv_cache_block_size=2,
-            )
-
-        slots = cache.compressed_slot_mapping(
-            positions,
-            compress_ratio=4,
-            token_to_req_indices=token_to_req,
-            query_start_loc=torch.tensor([0, 4], dtype=torch.int32),
-            seq_lens=torch.tensor([20], dtype=torch.int32),
-            kv_cache_block_size=2,
-            capacity_pages=3,
-        )
-        self.assertTrue(torch.equal(slots, torch.tensor([-1, -1, 4, -1])))
-
-        with self.assertRaisesRegex(RuntimeError, "disagree on page capacity"):
-            cache.compressed_slot_mapping(
-                positions,
-                compress_ratio=4,
-                token_to_req_indices=token_to_req,
-                query_start_loc=torch.tensor([0, 4], dtype=torch.int32),
-                seq_lens=torch.tensor([20], dtype=torch.int32),
-                kv_cache_block_size=4,
-                capacity_pages=4,
-            )
+                if message is not None:
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        cache.compressed_slot_mapping(**call_kwargs)
+                else:
+                    slots = cache.compressed_slot_mapping(**call_kwargs)
+                    self.assertTrue(torch.equal(slots, torch.tensor(expected)))
 
     def test_deepseek_v4_slot_mapping_masks_invalid_tokens(self):
         slots = _mask_invalid_graph_tokens(

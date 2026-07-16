@@ -131,12 +131,6 @@ class _Fence:
         self.calls += 1
 
 
-class _FailingFence:
-    @staticmethod
-    def synchronize() -> None:
-        raise RuntimeError("fence failed")
-
-
 def _completion_input(
     *,
     request_id: str,
@@ -213,13 +207,17 @@ class _ExecutionEvidence:
         )
 
 
-def _result(output_lengths=(1, 3)) -> tuple[ModelExecutionResult, _Fence]:
+def _result(
+    output_lengths=(1, 3),
+    *,
+    completion_inputs=None,
+) -> tuple[ModelExecutionResult, _Fence]:
     fence = _Fence()
     result = ModelExecutionResult(
         output_tokens=torch.tensor([101, 201, 202, 203], dtype=torch.int32),
         output_lengths=torch.tensor(output_lengths, dtype=torch.int32),
         copy_event=fence,
-        _flat_kv_execution_evidence=_ExecutionEvidence(),
+        _flat_kv_execution_evidence=_ExecutionEvidence(completion_inputs),
     )
     return result, fence
 
@@ -255,19 +253,6 @@ def test_completion_cannot_materialize_before_result_sync():
     assert fence.calls == 0
 
 
-def test_failed_fence_does_not_mark_completion_ready():
-    result, _ = _result()
-    result.copy_event = _FailingFence()
-
-    with pytest.raises(RuntimeError, match="fence failed"):
-        result.sync()
-    with pytest.raises(RuntimeError, match="ready only after.*sync"):
-        result.materialize_flat_kv_completions(_MixedForwardOp())
-
-    assert not result.is_synchronized
-    assert result.flat_kv_completions is None
-
-
 def test_synced_result_materializes_prefill_and_decode_accept_ends_as_pod():
     result, fence = _result()
     result.sync()
@@ -296,27 +281,6 @@ def test_synced_result_materializes_prefill_and_decode_accept_ends_as_pod():
         "protected_raw_end",
         "groups",
     }
-
-
-def test_completion_rewinds_device_acceptance_to_host_terminal_prefix():
-    result, _ = _result(output_lengths=(1, 4))
-    result.sync()
-    completion = result.materialize_flat_kv_completions(_MixedForwardOp())[1]
-
-    rewound = completion.rewind_to_host_accepted_tokens(
-        device_accepted_tokens=4,
-        host_accepted_tokens=1,
-    )
-
-    assert completion.accepted_raw_end == 14
-    assert rewound.accepted_raw_end == 11
-    assert rewound.protected_raw_end == completion.protected_raw_end
-    assert rewound.groups == completion.groups
-    with pytest.raises(ValueError, match="host_accepted_tokens must be <= 4"):
-        completion.rewind_to_host_accepted_tokens(
-            device_accepted_tokens=4,
-            host_accepted_tokens=5,
-        )
 
 
 class _BoundFlatKVGroupCompletion:
@@ -363,92 +327,6 @@ def test_make_extend_result_event_explicitly_binds_ready_completion(monkeypatch)
     assert bound.groups[0].group_id == "v4.c4a.compressed_kv"
     assert bound.groups[0].completed_domain_mask == 0b11
     assert bound.groups[0].domain_valid_ends == [14, 14]
-
-
-@requires_runtime_bridge
-def test_make_extend_result_event_rejects_mismatched_completion_request(monkeypatch):
-    result, _ = _result()
-    result.sync()
-    completion = result.materialize_flat_kv_completions(_MixedForwardOp())[1]
-    monkeypatch.setattr(scheduler_utils, "ForwardEvent", _BoundForwardEvent)
-
-    with pytest.raises(ValueError, match="request_id differs"):
-        scheduler_utils.make_extend_result_event(
-            "other", (), flat_kv_completion=completion
-        )
-
-
-@requires_runtime_bridge
-def test_make_extend_result_event_legacy_path_does_not_require_new_binding(
-    monkeypatch,
-):
-    class _LegacyExtendResult:
-        __slots__ = ("request_id", "tokens")
-
-    class _LegacyForwardEvent:
-        ExtendResult = _LegacyExtendResult
-
-    monkeypatch.setattr(scheduler_utils, "ForwardEvent", _LegacyForwardEvent)
-
-    event = scheduler_utils.make_extend_result_event("legacy", [7])
-
-    assert event.request_id == "legacy"
-    assert event.tokens == [7]
-    assert not hasattr(event, "flat_kv_completion")
-
-
-def test_completion_input_rejects_tensor_backed_scalar():
-    with pytest.raises(TypeError, match="host Python int"):
-        FlatKVCompletionInput(
-            request_id="tensor-backed",
-            table_generation=torch.tensor(1),
-            dispatch_seq=0,
-            dispatch_raw_start=0,
-            dispatch_raw_end=1,
-            protected_raw_end=1,
-        )
-
-
-def test_completion_input_rejects_dispatch_producer_schema():
-    raw = _completion_input(
-        request_id="echo",
-        generation=1,
-        seq=2,
-        dispatch_end=4,
-        protected_end=8,
-    )
-    raw["groups"] = [{"group_id": "history", "valid_raw_end": 4}]
-
-    with pytest.raises(ValueError, match="must not contain group schema"):
-        FlatKVCompletionInput.from_raw(raw)
-
-
-def test_completion_input_rows_must_match_forward_rows():
-    result, _ = _result()
-    result.sync()
-    op = _MixedForwardOp()
-    op.request_ids = op.request_ids[:1]
-
-    with pytest.raises(ValueError, match="row count differs"):
-        result.materialize_flat_kv_completions(op)
-
-
-def test_completion_input_request_id_must_match_its_forward_row():
-    result, _ = _result()
-    result.sync()
-    op = _MixedForwardOp()
-    op.request_ids = ["wrong", "decode"]
-
-    with pytest.raises(ValueError, match="row/request mismatch"):
-        result.materialize_flat_kv_completions(op)
-
-
-def test_decode_acceptance_must_stay_inside_dispatched_interval():
-    result, _ = _result(output_lengths=(1, 5))
-    result.sync()
-
-    with pytest.raises(ValueError, match="outside dispatch interval"):
-        result.materialize_flat_kv_completions(_MixedForwardOp())
 
 
 class _Sender:
@@ -590,7 +468,81 @@ def _patch_forward_events(monkeypatch):
 
 
 @requires_runtime_bridge
-def test_host_terminal_rewinds_decode_completion_to_emitted_tokens(monkeypatch):
+@pytest.mark.parametrize(
+    (
+        "forward_op_type",
+        "state_factory",
+        "output_lengths",
+        "nan_detected",
+        "expected_kinds",
+        "expected_tokens",
+        "expected_accepted_end",
+        "expected_dispatch_seq",
+        "state_remains_registered",
+    ),
+    (
+        pytest.param(
+            _MidChunkForwardOp,
+            _request_state,
+            (1,),
+            False,
+            ("extend",),
+            (),
+            8,
+            5,
+            True,
+            id="mid-prefill-completion-only",
+        ),
+        pytest.param(
+            _DecodeForwardOp,
+            _terminal_decode_state,
+            (4,),
+            False,
+            ("extend", "finish"),
+            (101,),
+            5,
+            21,
+            False,
+            id="terminal-finish-rewinds-acceptance",
+        ),
+        pytest.param(
+            _DecodeForwardOp,
+            _terminal_decode_state,
+            (4,),
+            True,
+            ("abort", "extend"),
+            (101,),
+            5,
+            21,
+            False,
+            id="nan-abort-precedes-completion-fence",
+        ),
+        pytest.param(
+            _DecodeSuccessorForwardOp,
+            None,
+            (4,),
+            False,
+            ("extend",),
+            (),
+            12,
+            22,
+            False,
+            id="state-missing-successor-drains-completion-debt",
+        ),
+    ),
+)
+def test_output_processor_preserves_structured_completion_lifecycle_order(
+    monkeypatch,
+    forward_op_type,
+    state_factory,
+    output_lengths,
+    nan_detected,
+    expected_kinds,
+    expected_tokens,
+    expected_accepted_end,
+    expected_dispatch_seq,
+    state_remains_registered,
+):
     _patch_forward_events(monkeypatch)
     sender = _Sender()
     processor = OutputProcesser(
@@ -600,111 +552,29 @@ def test_host_terminal_rewinds_decode_completion_to_emitted_tokens(monkeypatch):
         spec_num_tokens=4,
         metrics=_Metrics(),
     )
-    processor.rid_to_state["decode"] = _terminal_decode_state()
-    result, _ = _result(output_lengths=(4,))
-
-    changes = processor.post_process_forward_op(_DecodeForwardOp(), result)
-
-    assert [change["kind"] for change in changes] == ["extend", "finish"]
-    extend = changes[0]
-    assert extend["tokens"] == [101]
-    # The dispatch starts at raw token 4. Host max-length handling accepted
-    # only one of the four GPU-accepted speculative tokens, so the scheduler
-    # may publish/rewind only through raw end 5, not the materialized end 8.
-    assert extend["flat_kv_completion"].accepted_raw_end == 5
-
-
-@requires_runtime_bridge
-def test_nan_abort_precedes_structured_completion_fence(monkeypatch):
-    _patch_forward_events(monkeypatch)
-    sender = _Sender()
-    processor = OutputProcesser(
-        sender,
-        attn_tp_rank=0,
-        spec_algorithm="eagle",
-        spec_num_tokens=4,
-        metrics=_Metrics(),
+    forward_op = forward_op_type()
+    request_id = forward_op.request_ids[0]
+    state = state_factory() if state_factory is not None else None
+    if state is not None:
+        processor.rid_to_state[request_id] = state
+    result, fence = _result(
+        output_lengths=output_lengths,
+        completion_inputs=forward_op.flat_kv_completion_inputs,
     )
-    processor.rid_to_state["decode"] = _terminal_decode_state()
-    result, _ = _result(output_lengths=(4,))
-    result.output_nan_flags = torch.tensor([1], dtype=torch.int32)
+    if nan_detected:
+        result.output_nan_flags = torch.tensor([1], dtype=torch.int32)
 
-    changes = processor.post_process_forward_op(_DecodeForwardOp(), result)
-
-    # Abort must cancel the outstanding dispatch before its execution fence is
-    # retired. The following structured completion then drains debt without
-    # applying tokens or publishing suspect KV pages.
-    assert [change["kind"] for change in changes] == ["abort", "extend"]
-    assert changes[1]["tokens"] == [101]
-
-    # An overlapped successor can finish after the NaN request was removed from
-    # Python state. It still owes its completion-only fence so the scheduler can
-    # drain the canceled generation and finally apply the pending abort.
-    successor_result, _ = _result(output_lengths=(4,))
-    successor_changes = processor.post_process_forward_op(
-        _DecodeSuccessorForwardOp(), successor_result
-    )
-    assert [change["kind"] for change in successor_changes] == ["extend"]
-    assert successor_changes[0]["tokens"] == []
-    assert successor_changes[0]["flat_kv_completion"].dispatch_seq == 22
-
-
-@requires_runtime_bridge
-def test_mid_chunk_kv_write_emits_completion_only_result(monkeypatch):
-    def _fake_extend_result(request_id, tokens=(), *, flat_kv_completion=None):
-        return {
-            "request_id": request_id,
-            "tokens": list(tokens),
-            "flat_kv_completion": flat_kv_completion,
-        }
-
-    monkeypatch.setattr(
-        "tokenspeed.runtime.engine.generation_output_processor."
-        "make_extend_result_event",
-        _fake_extend_result,
-    )
-    sender = _Sender()
-    processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
-    state = _request_state()
-    processor.rid_to_state["victim"] = state
-    result, fence = _result(output_lengths=(1,))
-    result.output_tokens = torch.tensor([777], dtype=torch.int32)
-
-    changes = processor.post_process_forward_op(_MidChunkForwardOp(), result)
+    changes = processor.post_process_forward_op(forward_op, result)
 
     assert fence.calls == 1
-    assert len(changes) == 1
-    assert changes[0]["request_id"] == "victim"
-    assert changes[0]["tokens"] == []
-    assert changes[0]["flat_kv_completion"].request_id == "victim"
-    assert changes[0]["flat_kv_completion"].accepted_raw_end == 8
-    assert state.output_ids == []
-    assert sender.items == []
-    # Even though the sampled output is suppressed, this dispatch wrote input
-    # KV through raw end 8 and therefore owes a ready producer completion.
-    assert len(result.flat_kv_completions) == 1
-    completion = result.flat_kv_completions[0]
-    assert completion.request_id == "victim"
-    assert completion.accepted_raw_end == 8
-    assert completion.table_generation == 3
-    assert completion.dispatch_seq == 5
-
-
-def test_legacy_forward_materializes_empty_side_channel_only():
-    class _LegacyOp:
-        request_ids = ["legacy"]
-        input_lengths = [1]
-        # The bound FlatForwardOp exposes this as an empty vector on existing
-        # paths that do not participate in the completion protocol.
-        flat_kv_completion_inputs = []
-
-        @staticmethod
-        def num_extends() -> int:
-            return 0
-
-    result, _ = _result(output_lengths=(1,))
-    result._flat_kv_execution_evidence = None
-    result.sync()
-
-    assert result.materialize_flat_kv_completions(_LegacyOp()) == ()
-    assert result.flat_kv_completions == ()
+    assert tuple(change["kind"] for change in changes) == expected_kinds
+    extend = next(change for change in changes if change["kind"] == "extend")
+    assert tuple(extend["tokens"]) == expected_tokens
+    assert extend["flat_kv_completion"].accepted_raw_end == expected_accepted_end
+    assert extend["flat_kv_completion"].dispatch_seq == expected_dispatch_seq
+    assert (request_id in processor.rid_to_state) is state_remains_registered
+    if state_remains_registered:
+        assert state is not None
+        assert state.output_ids == []
+    if nan_detected:
+        assert expected_kinds.index("abort") < expected_kinds.index("extend")

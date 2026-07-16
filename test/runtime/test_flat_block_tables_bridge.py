@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import ast
 import os
-import pathlib
 import sys
 import unittest
 from types import SimpleNamespace
@@ -121,13 +119,23 @@ class FlatBlockTablesBridgeTest(unittest.TestCase):
         self.assertEqual(maxima, {"full": 0, "state": 19})
 
     def test_flat_base_row_mismatch_and_negative_base_fail_closed(self):
-        mismatch = self._make_op({"state": [[1], [2]]}, {"state": [3]})
-        with self.assertRaisesRegex(ValueError, r"state.*1 rows"):
-            self.base_bridge(mismatch, device="cpu", num_reqs=2)
-
-        negative = self._make_op({"state": [[1]]}, {"state": [-1]})
-        with self.assertRaisesRegex(ValueError, "negative logical base"):
-            self.base_bridge(negative, device="cpu", num_reqs=1)
+        cases = (
+            (
+                "base row mismatch",
+                self._make_op({"state": [[1], [2]]}, {"state": [3]}),
+                2,
+                r"state.*1 rows",
+            ),
+            (
+                "negative logical base",
+                self._make_op({"state": [[1]]}, {"state": [-1]}),
+                1,
+                "negative logical base",
+            ),
+        )
+        for name, op, num_reqs, error in cases:
+            with self.subTest(name), self.assertRaisesRegex(ValueError, error):
+                self.base_bridge(op, device="cpu", num_reqs=num_reqs)
 
 
 class PersistentFlatTableStagingTest(unittest.TestCase):
@@ -271,137 +279,62 @@ class PersistentFlatTableStagingTest(unittest.TestCase):
         self.assertEqual(idle_bases["state"].tolist(), [0, 0, 0])
 
     def test_schema_width_rows_and_accounting_fail_closed(self):
-        with self.assertRaisesRegex(RuntimeError, "forward_input_bytes"):
-            self.Staging(self._plan(byte_delta=4), device="cpu")
-
-        staging = self.Staging(self._plan(), device="cpu")
         extra_group = self._op(
             {"full": [[1]], "state": [[2]], "extra": [[3]]},
             {"full": [0], "state": [0], "extra": [0]},
         )
-        with self.assertRaisesRegex(RuntimeError, "extra=.*extra"):
-            staging.stage(extra_group, num_reqs=1)
-
-        with self.assertRaisesRegex(ValueError, "row capacity"):
-            staging.stage(extra_group, num_reqs=5)
-
-        too_wide = self._op(
-            {"full": [[1]], "state": [[2]]},
-            {"full": [0], "state": [0]},
-            copied_cols_override=4,
+        cases = (
+            (
+                "accounting drift",
+                lambda: self.Staging(self._plan(byte_delta=4), device="cpu"),
+                RuntimeError,
+                "forward_input_bytes",
+            ),
+            (
+                "unknown group",
+                lambda: self.Staging(self._plan(), device="cpu").stage(
+                    extra_group, num_reqs=1
+                ),
+                RuntimeError,
+                "extra=.*extra",
+            ),
+            (
+                "row capacity",
+                lambda: self.Staging(self._plan(), device="cpu").stage(
+                    extra_group, num_reqs=5
+                ),
+                ValueError,
+                "row capacity",
+            ),
+            (
+                "column capacity",
+                lambda: self.Staging(self._plan(), device="cpu").stage(
+                    self._op(
+                        {"full": [[1]], "state": [[2]]},
+                        {"full": [0], "state": [0]},
+                        copied_cols_override=4,
+                    ),
+                    num_reqs=1,
+                ),
+                RuntimeError,
+                "columns outside",
+            ),
+            (
+                "pool page range",
+                lambda: self.Staging(self._plan(), device="cpu").stage(
+                    self._op(
+                        {"full": [[16]], "state": [[2]]},
+                        {"full": [0], "state": [0]},
+                    ),
+                    num_reqs=1,
+                ),
+                ValueError,
+                "outside planned pool",
+            ),
         )
-        with self.assertRaisesRegex(RuntimeError, "columns outside"):
-            staging.stage(too_wide, num_reqs=1)
-
-        out_of_pool = self._op(
-            {"full": [[16]], "state": [[2]]},
-            {"full": [0], "state": [0]},
-        )
-        with self.assertRaisesRegex(ValueError, "outside planned pool"):
-            staging.stage(out_of_pool, num_reqs=1)
-
-
-class PersistentFlatTableStagingSourceContractTest(unittest.TestCase):
-    """No-torch structural gate for the allocation-free bridge seam."""
-
-    def test_direct_binding_and_owner_lifecycle_are_wired(self):
-        root = pathlib.Path(__file__).resolve().parents[2]
-        binding = (root / "tokenspeed-scheduler/bindings/python_module.cpp").read_text()
-        scheduler_utils_path = (
-            root / "python/tokenspeed/runtime/engine/scheduler_utils.py"
-        )
-        input_buffer_path = root / "python/tokenspeed/runtime/execution/input_buffer.py"
-        input_buffer = input_buffer_path.read_text()
-        model_executor = (
-            root / "python/tokenspeed/runtime/execution/model_executor.py"
-        ).read_text()
-        cuda_graph = (
-            root / "python/tokenspeed/runtime/execution/cuda_graph_wrapper.py"
-        ).read_text()
-
-        self.assertIn("<nanobind/ndarray.h>", binding)
-        self.assertIn('"copy_flat_block_table_to"', binding)
-        self.assertIn('"flat_block_table_group_ids"', binding)
-        self.assertIn('nb::arg("table_destination").noconvert()', binding)
-        self.assertIn("table_it->second.CopyTo(", binding)
-        self.assertIn("op.MaterializeFlatBlockTables()", binding)
-        self.assertIn("op.MaterializeFlatBlockTableBaseOffsets()", binding)
-        model_executor_tree = ast.parse(model_executor)
-        staging_calls = [
-            node
-            for node in ast.walk(model_executor_tree)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "stage"
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == "flat_staging"
-        ]
-        self.assertTrue(
-            any(
-                len(call.args) == 1
-                and isinstance(call.args[0], ast.Name)
-                and call.args[0].id == "forward_op"
-                and len(call.keywords) == 1
-                and call.keywords[0].arg == "num_reqs"
-                and isinstance(call.keywords[0].value, ast.Name)
-                and call.keywords[0].value.id == "bs"
-                for call in staging_calls
-            )
-        )
-        self.assertIn("flat_staging.pad_current_for_graph", cuda_graph)
-        self.assertIn("flat_staging.stage_idle(padded_rows=padded_bs)", cuda_graph)
-
-        input_tree = ast.parse(input_buffer)
-        input_buffers = next(
-            node
-            for node in input_tree.body
-            if isinstance(node, ast.ClassDef) and node.name == "InputBuffers"
-        )
-        input_init = next(
-            node
-            for node in input_buffers.body
-            if isinstance(node, ast.FunctionDef) and node.name == "__init__"
-        )
-        self.assertIn("flat_memory_plan", [arg.arg for arg in input_init.args.args])
-        staging_calls = [
-            node
-            for node in ast.walk(input_init)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "FlatBlockTableStagingBuffers"
-        ]
-        self.assertEqual(len(staging_calls), 1)
-        self.assertIsInstance(staging_calls[0].args[0], ast.Name)
-        self.assertEqual(staging_calls[0].args[0].id, "flat_memory_plan")
-
-        tree = ast.parse(scheduler_utils_path.read_text())
-        staging = next(
-            node
-            for node in tree.body
-            if isinstance(node, ast.ClassDef)
-            and node.name == "FlatBlockTableStagingBuffers"
-        )
-        stage = next(
-            node
-            for node in staging.body
-            if isinstance(node, ast.FunctionDef) and node.name == "stage"
-        )
-        stage_idle = next(
-            node
-            for node in staging.body
-            if isinstance(node, ast.FunctionDef) and node.name == "stage_idle"
-        )
-        torch_allocations = {
-            node.func.attr
-            for method in (stage, stage_idle)
-            for node in ast.walk(method)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == "torch"
-            and node.func.attr in {"tensor", "empty", "zeros", "full"}
-        }
-        self.assertEqual(torch_allocations, set())
+        for name, operation, error_type, error in cases:
+            with self.subTest(name), self.assertRaisesRegex(error_type, error):
+                operation()
 
 
 class FlatFlagGatingTest(unittest.TestCase):

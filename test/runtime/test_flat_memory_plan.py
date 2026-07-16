@@ -5,6 +5,7 @@ import os
 import pathlib
 import sys
 import unittest
+from unittest import mock
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -32,8 +33,11 @@ def _load(mod_name: str, file_name: str):
     return mod
 
 
-_contract = _load("tokenspeed.runtime.configs.flat_kv_contract", "flat_kv_contract.py")
-_fmp = _load("flat_memory_plan_under_test", "flat_memory_plan.py")
+with mock.patch.dict(sys.modules):
+    _contract = _load(
+        "tokenspeed.runtime.configs.flat_kv_contract", "flat_kv_contract.py"
+    )
+    _fmp = _load("flat_memory_plan_under_test", "flat_memory_plan.py")
 ComponentSpec = _fmp.ComponentSpec
 BlockGeometry = _fmp.BlockGeometry
 solve_page_geometry = _fmp.solve_page_geometry

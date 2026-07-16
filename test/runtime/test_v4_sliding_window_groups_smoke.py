@@ -41,12 +41,17 @@ def _load(mod_name: str, file_name: str):
     return mod
 
 
-_contract = _load("tokenspeed.runtime.configs.flat_kv_contract", "flat_kv_contract.py")
-_generic = _load("tokenspeed.runtime.configs.paged_cache_spec", "paged_cache_spec.py")
-_v4 = _load(
-    "tokenspeed_runtime_configs_deepseek_v4_cache_spec_smoke",
-    "deepseek_v4_cache_spec.py",
-)
+with patch.dict(sys.modules):
+    _contract = _load(
+        "tokenspeed.runtime.configs.flat_kv_contract", "flat_kv_contract.py"
+    )
+    _generic = _load(
+        "tokenspeed.runtime.configs.paged_cache_spec", "paged_cache_spec.py"
+    )
+    _v4 = _load(
+        "tokenspeed_runtime_configs_deepseek_v4_cache_spec_smoke",
+        "deepseek_v4_cache_spec.py",
+    )
 
 build_v4_cache_specs = _v4.build_v4_cache_specs
 compute_max_logical_pages_for_capture = _generic.compute_max_logical_pages_for_capture

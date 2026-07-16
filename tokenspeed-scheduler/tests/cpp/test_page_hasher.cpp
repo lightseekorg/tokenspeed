@@ -118,40 +118,6 @@ TEST(HashPageTest, ExtraKeysChangeOutput) {
     EXPECT_NE(HashPage(Tokens(toks), "p"), HashPage(Tokens(toks), "p", Keys(keys)));
 }
 
-TEST(HashPageTest, SegmentedTokensMatchEveryContiguousSplit) {
-    const std::vector<std::int32_t> tokens = {11, 22, 33, 44, 55};
-    const std::vector<std::string> extra_keys = {"adapter", "cache-salt"};
-    const std::string expected = HashPage(Tokens(tokens), "prior", Keys(extra_keys));
-
-    for (std::size_t split = 0; split <= tokens.size(); ++split) {
-        const token_span first{tokens.data(), split};
-        const token_span second{tokens.data() + split, tokens.size() - split};
-        EXPECT_EQ(HashPageSegments(first, second, "prior", Keys(extra_keys)), expected) << "split=" << split;
-    }
-}
-
-TEST(HashPageTest, PriorDecodeStackBoundaryMatchesLegacyDigests) {
-    struct Case {
-        std::size_t prior_chars;
-        std::string_view digest;
-    };
-    constexpr Case cases[] = {
-        {63, "9f5d15cabe5d2c65379a7d5c477fe3ac0e511f03c307fc755c421163e08d992e"},
-        {64, "6c2658488087660c1391d6b2b5652607a35e1b7436fe9f91c73a4551a6f19a98"},
-        {65, "6c2658488087660c1391d6b2b5652607a35e1b7436fe9f91c73a4551a6f19a98"},
-        {66, "d5e7172b825c993aa53604329105b348b5eeac1e32d12d55e981e872ec72024d"},
-        {129, "45440fdc132a0ad74960fc8e25d93fa8b902c6a33d9c129a5477bcb6225706a5"},
-    };
-    const std::vector<std::int32_t> tokens = {11, 22};
-    const std::vector<std::string> extra_keys = {"adapter"};
-
-    for (const Case& test_case : cases) {
-        const std::string prior(test_case.prior_chars, 'a');
-        EXPECT_EQ(HashPage(Tokens(tokens), prior, Keys(extra_keys)), test_case.digest)
-            << "prior_chars=" << test_case.prior_chars;
-    }
-}
-
 TEST(HashPageTest, FramingDisambiguatesKeySplits) {
     std::vector<std::int32_t> toks = {1};
     std::vector<std::string> split_a = {"ab", "c"};

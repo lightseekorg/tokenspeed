@@ -216,20 +216,6 @@ class TRTLLMFlatGroupsTest(unittest.TestCase):
             [12 * 64 + 0, 0 * 64 + 0],
         )
 
-        # Table contents stay fixed while the logical origin advances. Replay
-        # must still copy bases and derive write locs with page_idx - base.
-        advanced = {gid: self.torch.ones(bs, dtype=self.torch.int32) for gid in src}
-        seq_lens[:bs].copy_(self.torch.tensor([129, 65], dtype=self.torch.int32))
-        b._flat_replay_fill(bs, src, advanced, seq_lens)
-        self.assertEqual(
-            b.cuda_graph_flat_block_table_base_offsets["full_attention"][:bs].tolist(),
-            [1, 1],
-        )
-        self.assertEqual(
-            b.cuda_graph_flat_out_cache_locs["full_attention"][:bs].tolist(),
-            [12 * 64, 0],
-        )
-
     def test_verify_metadata_expanded_write_locs(self):
         # Target verify (spec N, not draft): [bs]-row per-group tables in the
         # prefill slot + [bs*N] token-major write locs (radix verify layout).

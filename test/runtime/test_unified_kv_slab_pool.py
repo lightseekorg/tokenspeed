@@ -46,8 +46,11 @@ def _load(mod_name: str, file_name: str):
     return mod
 
 
-_contract = _load("tokenspeed.runtime.configs.flat_kv_contract", "flat_kv_contract.py")
-_pcs = _load("paged_cache_spec_slab_under_test", "paged_cache_spec.py")
+with mock.patch.dict(sys.modules):
+    _contract = _load(
+        "tokenspeed.runtime.configs.flat_kv_contract", "flat_kv_contract.py"
+    )
+    _pcs = _load("paged_cache_spec_slab_under_test", "paged_cache_spec.py")
 hybrid_slab_group_size = _pcs.hybrid_slab_group_size
 
 GPT_OSS_LAYER_TYPES = ("sliding_attention", "full_attention") * 12

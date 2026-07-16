@@ -19,10 +19,8 @@ nanobind direct-copy API fills persistent pinned staging; the real V4 backend
 normalizes those tables into metadata; and the production TokenSpeed-kernel
 writers/readers touch the five physical V4 data classes.
 
-The deterministic MTP acceptance matrix is injected at the scheduler's public
-structured-completion ABI.  That is the same fence-ready POD seam used by the
-runtime, but it avoids relying on checkpoint logits to happen to produce
-zero/partial/full acceptance.
+Structured acceptance permutations are covered by the scheduler completion
+ledger; this hardware test keeps one end-to-end cache-write confinement smoke.
 """
 
 from __future__ import annotations
@@ -36,8 +34,13 @@ import tokenspeed_scheduler as ts
 import torch
 
 # CI registration is parsed from the AST; the marker is a runtime no-op.
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from ci_system.ci_register import register_cuda_ci
+_TEST_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _TEST_ROOT)
+try:
+    from ci_system.ci_register import register_cuda_ci
+finally:
+    assert sys.path[0] == _TEST_ROOT
+    sys.path.pop(0)
 
 register_cuda_ci(est_time=240, suite="deepseek-v4-flat-synthetic")
 
@@ -211,24 +214,23 @@ def _v4_groups() -> list[ts.PagedCacheGroupConfig]:
     ]
 
 
-def _scheduler_config(
-    *, structured: bool = False, overlap_depth: int = 0
-) -> ts.SchedulerConfig:
+def _scheduler_config() -> ts.SchedulerConfig:
     config = ts.SchedulerConfig()
     config.block_size = PAGE_SIZE
     config.num_device_pages = 0
     config.num_host_pages = 0
     config.max_scheduled_tokens = 512
     config.max_batch_size = 8
-    config.decode_input_tokens = 4 if structured else 1
-    config.overlap_schedule_depth = overlap_depth
+    config.decode_input_tokens = 1
+    config.overlap_schedule_depth = 0
     config.disable_l2_cache = True
     config.enable_l3_storage = False
     config.disable_prefix_cache = True
     config.enable_mixed_prefill_decode = True
-    config.enable_structured_flat_kv_completion = structured
+    config.enable_structured_flat_kv_completion = True
     config.flat_block_pools = [_pool_config(pool_id) for pool_id in POOL_IDS]
     config.paged_cache_groups = _v4_groups()
+    assert config.uses_structured_flat_admission
     return config
 
 
@@ -246,10 +248,40 @@ def _only_forward(plan):
     return op
 
 
-def _advance_legacy(scheduler: ts.Scheduler, request_id: str, tokens: list[int]):
+def _advance_ready(
+    scheduler: ts.Scheduler,
+    op,
+    request_id: str,
+    tokens: list[int],
+) -> None:
+    completion_input = next(
+        item for item in op.flat_kv_completion_inputs if item.request_id == request_id
+    )
+    completion = ts.ForwardEvent.FlatKVCompletion()
+    completion.request_id = request_id
+    completion.table_generation = completion_input.table_generation
+    completion.dispatch_seq = completion_input.dispatch_seq
+    completion.accepted_raw_end = completion_input.dispatch_raw_end
+    completion.protected_raw_end = completion_input.protected_raw_end
+    groups = []
+    for group_config in _v4_groups():
+        group = ts.ForwardEvent.FlatKVGroupCompletion()
+        group.group_id = group_config.group_id
+        required_mask = group_config.required_producer_domain_mask
+        valid_end = (
+            completion_input.dispatch_raw_end
+            // group_config.entry_stride_tokens
+            * group_config.entry_stride_tokens
+        )
+        group.completed_domain_mask = required_mask
+        group.domain_valid_ends = [valid_end] * required_mask.bit_count()
+        groups.append(group)
+    completion.groups = groups
+
     result = ts.ForwardEvent.ExtendResult()
     result.request_id = request_id
     result.tokens = tokens
+    result.flat_kv_completion = completion
     event = ts.ExecutionEvent()
     event.add_event(result)
     scheduler.advance(event)
@@ -390,49 +422,6 @@ def _run_confined_write(
             assert torch.equal(
                 planes[name], snapshot
             ), f"{target} writer corrupted component plane {name}"
-
-
-def _completion_from_input(completion_input, accepted_raw_end: int):
-    completion = ts.ForwardEvent.FlatKVCompletion()
-    completion.request_id = completion_input.request_id
-    completion.table_generation = completion_input.table_generation
-    completion.dispatch_seq = completion_input.dispatch_seq
-    completion.accepted_raw_end = accepted_raw_end
-    completion.protected_raw_end = completion_input.protected_raw_end
-    groups = []
-    for group_schema in _v4_groups():
-        group = ts.ForwardEvent.FlatKVGroupCompletion()
-        group.group_id = group_schema.group_id
-        group.completed_domain_mask = group_schema.required_producer_domain_mask
-        aligned_dispatch_end = (
-            completion_input.dispatch_raw_end
-            // group_schema.entry_stride_tokens
-            * group_schema.entry_stride_tokens
-        )
-        group.domain_valid_ends = [
-            aligned_dispatch_end
-        ] * group.completed_domain_mask.bit_count()
-        groups.append(group)
-    completion.groups = groups
-    return completion
-
-
-def _send_ready_completion(
-    scheduler: ts.Scheduler,
-    completion_input,
-    *,
-    tokens: list[int],
-    accepted_raw_end: int,
-) -> None:
-    result = ts.ForwardEvent.ExtendResult()
-    result.request_id = completion_input.request_id
-    result.tokens = tokens
-    result.flat_kv_completion = _completion_from_input(
-        completion_input, accepted_raw_end
-    )
-    event = ts.ExecutionEvent()
-    event.add_event(result)
-    scheduler.advance(event)
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -748,7 +737,7 @@ def test_real_flat_scheduler_to_v4_five_plane_kernel_chain():
     # The second direct-copy ring slot is then a true mixed op whose compact SWA
     # base has rolled, while the c4 history page IDs for B@3 and A@255 are
     # deliberately non-contiguous (physical adjacency is never assumed).
-    _advance_legacy(scheduler, "decode", [10_000])
+    _advance_ready(scheduler, initial_op, "decode", [10_000])
     scheduler.submit_requests([_request("prefill", list(range(20_000, 20_004)))])
     mixed_op = _only_forward(scheduler.next_execution_plan())
     assert list(mixed_op.request_ids) == ["prefill", "decode"]
@@ -810,76 +799,3 @@ def test_real_flat_scheduler_to_v4_five_plane_kernel_chain():
             block_size=PAGE_SIZE,
         ),
     )
-
-
-@pytest.mark.parametrize("overlap_depth", [0, 1])
-@pytest.mark.parametrize(
-    ("acceptance", "accepted_length"),
-    [("zero", 0), ("partial", 2), ("full", 4)],
-)
-def test_mtp_acceptance_matrix_at_structured_completion_seam(
-    overlap_depth: int, acceptance: str, accepted_length: int
-):
-    del acceptance
-    scheduler = ts.Scheduler(
-        _scheduler_config(structured=True, overlap_depth=overlap_depth)
-    )
-    scheduler.submit_requests([_request("mtp", [1, 2])])
-    prefill_op = _only_forward(scheduler.next_execution_plan())
-    prefill = prefill_op.flat_kv_completion_inputs[0]
-    _send_ready_completion(
-        scheduler,
-        prefill,
-        tokens=[3],
-        accepted_raw_end=prefill.dispatch_raw_end,
-    )
-    assert scheduler.get_request_token_size("mtp") == 3
-
-    first_op = _only_forward(scheduler.next_execution_plan())
-    first = first_op.flat_kv_completion_inputs[0]
-    first_start = first.dispatch_raw_start
-    successor = None
-    if overlap_depth == 1:
-        successor_op = _only_forward(scheduler.next_execution_plan())
-        successor = successor_op.flat_kv_completion_inputs[0]
-        assert successor.dispatch_raw_end == first.dispatch_raw_end + 4
-        assert successor.protected_raw_end == first.protected_raw_end
-        _send_ready_completion(
-            scheduler,
-            successor,
-            tokens=[20, 21, 22, 23],
-            accepted_raw_end=successor.dispatch_raw_end,
-        )
-        # A ready dependent successor cannot mutate request state before its
-        # predecessor closes the dispatch-sequence gap.
-        assert scheduler.get_request_token_size("mtp") == 3
-
-    _send_ready_completion(
-        scheduler,
-        first,
-        tokens=list(range(10, 10 + accepted_length)),
-        accepted_raw_end=first_start + accepted_length,
-    )
-    successor_survives = overlap_depth == 1 and accepted_length == 4
-    expected_size = 3 + accepted_length + (4 if successor_survives else 0)
-    assert scheduler.get_request_token_size("mtp") == expected_size
-
-    recovered_op = _only_forward(scheduler.next_execution_plan())
-    recovered = recovered_op.flat_kv_completion_inputs[0]
-    assert recovered.dispatch_raw_end == expected_size - 1 + 4
-    if successor is not None and accepted_length < 4:
-        assert recovered.dispatch_seq > successor.dispatch_seq
-
-    # All exact acceptance cases stay inside the same c4/c128 history tail
-    # pages.  Rewind adjusts valid extent; it must not free the shared page.
-    for group_id in (
-        v4_compressed_kv_group_id(C4_RATIO),
-        v4_compressed_kv_group_id(C128_RATIO),
-    ):
-        first_pages = {
-            page for page in first_op.flat_block_tables[group_id][0] if page > 0
-        }
-        recovered_pages = {
-            page for page in recovered_op.flat_block_tables[group_id][0] if page > 0
-        }
-        assert first_pages & recovered_pages

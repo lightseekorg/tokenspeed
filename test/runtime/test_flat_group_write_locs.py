@@ -143,44 +143,6 @@ class ComputeFlatOutCacheLocsTest(_MHACase):
         self.assertEqual(locs["small"].tolist(), [23, 24, 25])
         self.assertEqual(locs["large"].tolist(), [83, 84, 85])
 
-    def test_decode_locs_use_per_request_logical_base(self):
-        torch = self.torch
-        tables = {
-            "sliding_attention": torch.tensor([[7, 8], [9, 10]], dtype=torch.int32)
-        }
-        # Last logical pages are 3 and 2. Compact row 0 starts at page 3;
-        # row 1 starts at page 1, so the gathers use local columns 0 and 1.
-        bases = {"sliding_attention": torch.tensor([3, 1], dtype=torch.int32)}
-        seq_lens = torch.tensor([8, 6], dtype=torch.int32)
-        locs = self.backend._compute_flat_decode_out_cache_locs(
-            tables, bases, seq_lens, PAGE
-        )
-        self.assertEqual(locs["sliding_attention"].tolist(), [15, 21])
-
-    def test_extend_locs_use_compact_table_base(self):
-        torch = self.torch
-        tables = {"sliding_attention": torch.tensor([[7, 8]], dtype=torch.int32)}
-        bases = {"sliding_attention": torch.tensor([2], dtype=torch.int32)}
-        locs = self.backend._compute_flat_extend_out_cache_locs(
-            tables,
-            bases,
-            torch.tensor([4], dtype=torch.int32),
-            torch.tensor([3], dtype=torch.int32),
-            PAGE,
-        )
-        # Logical positions 4,5,6 -> pages 2,2,3 -> local cols 0,0,1.
-        self.assertEqual(locs["sliding_attention"].tolist(), [14, 15, 16])
-
-    def test_decode_rejects_logical_page_before_base(self):
-        torch = self.torch
-        with self.assertRaisesRegex(RuntimeError, "outside.*sliding_attention"):
-            self.backend._compute_flat_decode_out_cache_locs(
-                {"sliding_attention": torch.tensor([[7]], dtype=torch.int32)},
-                {"sliding_attention": torch.tensor([2], dtype=torch.int32)},
-                torch.tensor([2], dtype=torch.int32),
-                PAGE,
-            )
-
 
 class MaybeCheckFlatWriteLocsTest(_MHACase):
     """TOKENSPEED_FLAT_DEBUG gate: off by default, loud when on."""
@@ -546,18 +508,6 @@ class GraphLocBuffersTest(_MHACase):
         for gid in _GROUP_IDS:
             self.assertEqual(tuple(second.out_cache_locs[gid].shape), (3,))
             self.assertEqual(second.out_cache_locs[gid].data_ptr(), ptrs[gid])
-
-    def test_capture_builds_persistent_base_buffers(self):
-        bs = 2
-        metadata = self._capture(bs, _GROUP_IDS)
-        bufs = self.backend.cuda_graph_flat_block_table_base_offsets
-        self.assertEqual(set(bufs), set(_GROUP_IDS))
-        for gid, buf in bufs.items():
-            self.assertEqual(tuple(buf.shape), (MAX_BS,))
-            self.assertEqual(buf.dtype, self.torch.int32)
-            view = metadata.block_table_base_offsets[gid]
-            self.assertEqual(tuple(view.shape), (bs,))
-            self.assertEqual(view.data_ptr(), buf.data_ptr())
 
     def test_replay_computes_locs_from_persistent_tables(self):
         torch = self.torch

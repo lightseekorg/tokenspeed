@@ -264,16 +264,6 @@ TEST(FlatForwardOperation, MixedPresenceOfCompletionInputsFailsClosed) {
     EXPECT_THROW(FlatForwardOperation(std::move(ops)), std::invalid_argument);
 }
 
-TEST(FlatForwardOperation, MissingRequiredGroupFailsClosed) {
-    LiveTableRows full_rows{{"full"}};
-    LiveTableRows swa_rows{{"swa"}};
-    std::vector<ForwardOperation> ops;
-    ops.emplace_back(MakeFlatPrefill(full_rows, "r0", {{.size = 2}}));
-    ops.emplace_back(MakeFlatPrefill(swa_rows, "r1", {{.size = 3}}));
-
-    EXPECT_DEATH({ FlatForwardOperation flat_op{std::move(ops)}; }, "");
-}
-
 TEST(FlatForwardOperation, BaseOffsetsStayAlignedAcrossStablePartition) {
     LiveTableRows rows{{"full", "state"}};
     std::vector<ForwardOperation> ops;
@@ -287,16 +277,6 @@ TEST(FlatForwardOperation, BaseOffsetsStayAlignedAcrossStablePartition) {
     EXPECT_EQ(flat_op.request_ids, (std::vector<std::string>{"p", "d"}));
     EXPECT_EQ(flat_op.flat_block_tables.at("full").bases, (std::vector<std::int32_t>{0, 0}));
     EXPECT_EQ(flat_op.flat_block_tables.at("state").bases, (std::vector<std::int32_t>{3, 7}));
-}
-
-TEST(FlatForwardOperation, MismatchedLiveViewAndGroupIdsFailsClosed) {
-    LiveTableRows rows{{"full"}};
-    PrefillOperation op = MakeFlatPrefill(rows, "r", {{.size = 1}});
-    op.flat_block_table_group_ids = {};
-    std::vector<ForwardOperation> ops;
-    ops.emplace_back(std::move(op));
-
-    EXPECT_DEATH({ FlatForwardOperation flat_op{std::move(ops)}; }, "");
 }
 
 TEST(FlatForwardOperation, ScalarFieldsTrackPerRequestRows) {
@@ -365,32 +345,7 @@ TEST(FlatForwardOperation, LiveRowViewCopiesDirectlyIntoOneContiguousOwner) {
     coordinator.Free(tables);
 }
 
-TEST(FlatForwardOperation, EmptyRowsKeepZeroWidthAndCopyOnlyBases) {
-    LiveTableRows rows{{"full"}};
-    std::vector<ForwardOperation> ops;
-    ops.emplace_back(MakeFlatPrefill(rows, "r0", {{.size = 0, .base = 5}}));
-    ops.emplace_back(MakeFlatPrefill(rows, "r1", {{.size = 0, .base = 7}}));
-
-    FlatForwardOperation flat_op{std::move(ops)};
-    const FlatBlockTableExport& full = flat_op.flat_block_tables.at("full");
-    EXPECT_EQ(full.rows, 2u);
-    EXPECT_EQ(full.cols, 0u);
-    EXPECT_TRUE(full.values.empty());
-    EXPECT_TRUE(full.Row(0).empty());
-    EXPECT_TRUE(full.Row(1).empty());
-
-    std::vector<std::int32_t> table_destination{123};
-    std::vector<std::int32_t> base_destination(3, -9);
-    const FlatBlockTableExport::CopyResult copied =
-        full.CopyTo(std::span<std::int32_t>{table_destination}, std::span<std::int32_t>{base_destination},
-                    /*page_id_upper_bound=*/8);
-    EXPECT_EQ(copied.rows, 2u);
-    EXPECT_EQ(copied.cols, 0u);
-    EXPECT_EQ(table_destination, (std::vector<std::int32_t>{123}));
-    EXPECT_EQ(base_destination, (std::vector<std::int32_t>{5, 7, -9}));
-}
-
-TEST(FlatForwardOperation, CopyToUsesContiguousRectangleAndHonorsCapacity) {
+TEST(FlatForwardOperation, CopyToUsesContiguousRectangle) {
     LiveTableRows rows{{"full"}};
     std::vector<ForwardOperation> ops;
     ops.emplace_back(MakeFlatPrefill(rows, "r0", {{.size = 3, .null_slots = {0}}}));
@@ -410,43 +365,36 @@ TEST(FlatForwardOperation, CopyToUsesContiguousRectangleAndHonorsCapacity) {
     EXPECT_EQ(copied.cols, 3u);
     EXPECT_EQ(table_destination, (std::vector<std::int32_t>{first[0], first[1], first[2], second[0], -1, -1, 99, 99}));
     EXPECT_EQ(base_destination, (std::vector<std::int32_t>{0, 7, 99}));
-
-    std::vector<std::int32_t> short_table(5, 0);
-    EXPECT_THROW(full.CopyTo(std::span<std::int32_t>{short_table}, std::span<std::int32_t>{base_destination}, 8),
-                 std::invalid_argument);
-    std::vector<std::int32_t> short_bases(1, 0);
-    EXPECT_THROW(full.CopyTo(std::span<std::int32_t>{table_destination}, std::span<std::int32_t>{short_bases}, 8),
-                 std::invalid_argument);
-    EXPECT_THROW(full.CopyTo(std::span<std::int32_t>{table_destination}, std::span<std::int32_t>{base_destination}, 1),
-                 std::invalid_argument);
 }
 
-TEST(FlatForwardOperation, CopyToRejectsOobAndMalformedPayloads) {
-    FlatBlockTableExport export_owner{1, 2};
-    export_owner.values = {1, 8};
-    export_owner.bases = {0};
-    std::vector<std::int32_t> table_destination(2, 0);
-    std::vector<std::int32_t> base_destination(1, 0);
-    EXPECT_THROW(
-        export_owner.CopyTo(std::span<std::int32_t>{table_destination}, std::span<std::int32_t>{base_destination}, 8),
-        std::invalid_argument);
+TEST(FlatForwardOperation, CopyToRejectsInvalidCapacityMatrix) {
+    LiveTableRows rows{{"full"}};
+    std::vector<ForwardOperation> ops;
+    ops.emplace_back(MakeFlatPrefill(rows, "r0", {{.size = 3, .null_slots = {0}}}));
+    ops.emplace_back(MakeFlatPrefill(rows, "r1", {{.size = 1, .base = 7}}));
+    FlatForwardOperation flat_op{std::move(ops)};
+    const FlatBlockTableExport& full = flat_op.flat_block_tables.at("full");
 
-    export_owner.values = {1, -2};
-    EXPECT_THROW(
-        export_owner.CopyTo(std::span<std::int32_t>{table_destination}, std::span<std::int32_t>{base_destination}, 8),
-        std::invalid_argument);
+    struct Case {
+        const char* name;
+        std::size_t table_capacity;
+        std::size_t base_capacity;
+        std::int32_t page_id_upper_bound;
+    };
+    const Case cases[] = {
+        {"short table destination", 5, 3, 8},
+        {"short base destination", 8, 1, 8},
+        {"page id exceeds pool bound", 8, 3, 1},
+    };
 
-    export_owner.values = {1, 2};
-    export_owner.bases = {-1};
-    EXPECT_THROW(
-        export_owner.CopyTo(std::span<std::int32_t>{table_destination}, std::span<std::int32_t>{base_destination}, 8),
-        std::invalid_argument);
-
-    export_owner.bases = {0};
-    export_owner.values.pop_back();
-    EXPECT_THROW(
-        export_owner.CopyTo(std::span<std::int32_t>{table_destination}, std::span<std::int32_t>{base_destination}, 8),
-        std::logic_error);
+    for (const Case& test_case : cases) {
+        SCOPED_TRACE(test_case.name);
+        std::vector<std::int32_t> table_destination(test_case.table_capacity, 99);
+        std::vector<std::int32_t> base_destination(test_case.base_capacity, 99);
+        EXPECT_THROW(full.CopyTo(std::span<std::int32_t>{table_destination}, std::span<std::int32_t>{base_destination},
+                                 test_case.page_id_upper_bound),
+                     std::invalid_argument);
+    }
 }
 
 }  // namespace

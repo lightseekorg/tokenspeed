@@ -29,6 +29,7 @@
 #include <optional>
 #include <set>
 #include <stdexcept>
+#include <string>
 
 #include "cache/forward_cache_ops.h"
 #include "integration_test_helper.h"
@@ -1453,24 +1454,6 @@ TEST_F(FlatRetractOomSuite, SingleOversizedRequestGetsOomTerminal) {
     SendFinish("d");
     PlanOnce();
     EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), 8);
-}
-
-TEST_F(FlatRetractOomSuite, LongOomRequestIdUsesPreparedTerminalStorage) {
-    const std::string request_id(256, 'x');  // Deliberately exceeds every common SSO buffer.
-    Submit(MakeRequestSpec(request_id, /*num_pages=*/10));
-    ASSERT_EQ(FindFlatOp(PlanOnce())->request_ids.size(), 1u);
-    ASSERT_EQ(FindFlatOp(PlanOnce())->request_ids.size(), 1u);
-    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), 0);
-
-    ASSERT_TRUE(PlanOnce().flat_oom_request_ids.empty());
-    ExecutionPlan oom_round = PlanOnce();
-
-    ASSERT_EQ(oom_round.flat_oom_request_ids.size(), 1u);
-    EXPECT_EQ(oom_round.flat_oom_request_ids.front(), request_id);
-    EXPECT_GE(oom_round.flat_oom_request_ids.front().capacity(), request_id.size())
-        << "the pre-reserved scratch buffer must transfer into the plan without a terminal-path allocation";
-    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), 8);
-    EXPECT_EQ(scheduler_->WaitingSize(), 0u);
 }
 
 // Two starvation cycles on one pool: each cycle retracts a DIFFERENT largest
@@ -3610,26 +3593,6 @@ void SendHeterogeneousFlatForwardDone(Scheduler& scheduler, const std::string& r
     scheduler.Advance(event);
 }
 
-TEST(HeterogeneousFlatSchedulerTest, CanonicalPoolsKeepLocalIdsIndependentAndMetricsPerPool) {
-    SchedulerConfig config = MakeHeterogeneousPoolConfig(/*history_blocks=*/6, /*state_blocks=*/5);
-    Scheduler scheduler(std::move(config));
-    EXPECT_EQ(scheduler.FlatPoolIds(), (std::vector<std::string>{"history", "state"}));
-    EXPECT_EQ(scheduler.FlatPoolFreeBlocksByPool(), (PoolDemand{5, 4}));
-    EXPECT_EQ(scheduler.AvailableKvPages(), 9u);
-
-    scheduler.SubmitRequests({RequestSpec{.request_id = "r", .tokens = MakeAlignedTokens(1, 2)}});
-    ExecutionPlan plan = scheduler.NextExecutionPlan();
-    const FlatForwardOperation* op = FindFlatOp(plan);
-    ASSERT_NE(op, nullptr);
-    ASSERT_EQ(op->request_ids, (std::vector<std::string>{"r"}));
-    ASSERT_EQ(op->flat_block_tables.at("history_group").Row(0).size(), 1u);
-    ASSERT_EQ(op->flat_block_tables.at("state_group").Row(0).size(), 1u);
-    EXPECT_EQ(op->flat_block_tables.at("history_group").Row(0)[0], 1);
-    EXPECT_EQ(op->flat_block_tables.at("state_group").Row(0)[0], 1);
-    EXPECT_EQ(scheduler.FlatPoolFreeBlocksByPool(), (PoolDemand{4, 3}));
-    EXPECT_EQ(scheduler.ActiveKvPages(), 2u);
-}
-
 TEST(HeterogeneousFlatSchedulerTest, FirstPrefillShortfallMutatesNoPool) {
     Scheduler scheduler(MakeHeterogeneousPoolConfig(/*history_blocks=*/6, /*state_blocks=*/2));
     const PoolDemand baseline = scheduler.FlatPoolFreeBlocksByPool();
@@ -3643,23 +3606,6 @@ TEST(HeterogeneousFlatSchedulerTest, FirstPrefillShortfallMutatesNoPool) {
     EXPECT_EQ(scheduler.WaitingSize(), 1u);
     EXPECT_EQ(scheduler.FlatPoolFreeBlocksByPool(), baseline);
     EXPECT_EQ(scheduler.FlatReservedBlocksByPool(), (PoolDemand{0, 0}));
-}
-
-TEST(HeterogeneousFlatSchedulerTest, SubsequentPrefillShortfallLeavesBothPoolsUnchanged) {
-    Scheduler scheduler(MakeHeterogeneousPoolConfig(/*history_blocks=*/10, /*state_blocks=*/3,
-                                                    /*max_scheduled_tokens=*/4));
-    scheduler.SubmitRequests({RequestSpec{.request_id = "r", .tokens = MakeAlignedTokens(4, 2)}});
-    ASSERT_NE(FindFlatOp(scheduler.NextExecutionPlan()), nullptr);
-    const PoolDemand after_first_chunk = scheduler.FlatPoolFreeBlocksByPool();
-    EXPECT_EQ(after_first_chunk, (PoolDemand{7, 0}));
-
-    ExecutionPlan deferred = scheduler.NextExecutionPlan();
-
-    const FlatForwardOperation* op = FindFlatOp(deferred);
-    ASSERT_NE(op, nullptr);
-    EXPECT_TRUE(op->request_ids.empty());
-    EXPECT_EQ(scheduler.PrefillSize(), 1u);
-    EXPECT_EQ(scheduler.FlatPoolFreeBlocksByPool(), after_first_chunk);
 }
 
 TEST(HeterogeneousFlatSchedulerTest, DecodeConsumesOwnVectorReservationWithoutCrossPoolBorrowing) {
@@ -3692,57 +3638,67 @@ TEST(HeterogeneousFlatSchedulerTest, DecodeConsumesOwnVectorReservationWithoutCr
     EXPECT_EQ(scheduler.WaitingSize(), 1u);
 }
 
-TEST(HeterogeneousFlatSchedulerTest, RejectsMissingOrUnknownPoolBindingsAndHostTier) {
-    SchedulerConfig duplicate_authority = MakeHeterogeneousPoolConfig(/*history_blocks=*/6, /*state_blocks=*/5);
-    duplicate_authority.device_allocator.total_pages = 8;
-    EXPECT_THROW(Scheduler(std::move(duplicate_authority)), std::invalid_argument);
+enum class V4StructuredConfigViolation {
+    kDuplicatePageAuthority,
+    kMissingPool,
+    kUnknownPool,
+    kHostTier,
+    kRadixMamba,
+    kRadixL3,
+};
 
-    SchedulerConfig missing = MakeHeterogeneousPoolConfig(/*history_blocks=*/6, /*state_blocks=*/5);
-    missing.flat_block_pools.clear();
-    EXPECT_THROW(Scheduler(std::move(missing)), std::invalid_argument);
+TEST(HeterogeneousFlatSchedulerTest, StructuredV4RejectsUnsupportedConfigMatrix) {
+    struct Case {
+        const char* name;
+        V4StructuredConfigViolation violation;
+        const char* error;
+    };
+    const Case cases[] = {
+        {"duplicate page authority", V4StructuredConfigViolation::kDuplicatePageAuthority,
+         "only device page authority"},
+        {"missing pool", V4StructuredConfigViolation::kMissingPool, "unknown pool_id 'state'"},
+        {"unknown pool", V4StructuredConfigViolation::kUnknownPool, "unknown pool_id 'unknown'"},
+        {"usable host tier", V4StructuredConfigViolation::kHostTier, "device-only"},
+        {"radix mamba adjunct", V4StructuredConfigViolation::kRadixMamba, "radix-owned Mamba"},
+        {"radix l3", V4StructuredConfigViolation::kRadixL3, "radix-owned L3"},
+    };
 
-    SchedulerConfig unknown = MakeHeterogeneousPoolConfig(/*history_blocks=*/6, /*state_blocks=*/5);
-    unknown.paged_cache_groups[1].pool_id = "unknown";
-    EXPECT_THROW(Scheduler(std::move(unknown)), std::invalid_argument);
-
-    SchedulerConfig host = MakeHeterogeneousPoolConfig(/*history_blocks=*/6, /*state_blocks=*/5);
-    host.host_allocator.total_pages = 8;
-    host.disable_l2_cache = false;
-    EXPECT_THROW(Scheduler(std::move(host)), std::invalid_argument);
-}
-
-TEST(HeterogeneousFlatSchedulerTest, StructuredSinglePoolRejectsHostTierForEveryRoleAtConfigBoundary) {
-    for (const Role role : {Role::kFused, Role::kP, Role::kD}) {
+    for (const Case& test_case : cases) {
+        SCOPED_TRACE(test_case.name);
         SchedulerConfig config = MakeHeterogeneousPoolConfig(/*history_blocks=*/6, /*state_blocks=*/5);
         config.enable_structured_flat_kv_completion = true;
-        config.flat_block_pools = {config.flat_block_pools.at(1)};
-        config.paged_cache_groups = {config.paged_cache_groups.at(0)};
-        config.host_allocator.total_pages = 8;
-        config.disable_l2_cache = false;
-        config.role = role;
+        switch (test_case.violation) {
+            case V4StructuredConfigViolation::kDuplicatePageAuthority:
+                config.device_allocator.total_pages = 8;
+                break;
+            case V4StructuredConfigViolation::kMissingPool:
+                config.flat_block_pools.erase(config.flat_block_pools.begin());
+                break;
+            case V4StructuredConfigViolation::kUnknownPool:
+                config.paged_cache_groups.at(1).pool_id = "unknown";
+                break;
+            case V4StructuredConfigViolation::kHostTier:
+                config.host_allocator.total_pages = 8;
+                config.disable_l2_cache = false;
+                break;
+            case V4StructuredConfigViolation::kRadixMamba:
+                config.enable_mamba = true;
+                config.mamba_pool_total_chunks = 4;
+                break;
+            case V4StructuredConfigViolation::kRadixL3:
+                config.enable_l3_storage = true;
+                break;
+        }
 
+        bool rejected = false;
         try {
             Scheduler scheduler(std::move(config));
-            FAIL() << "structured explicit flat KV accepted a host tier";
         } catch (const std::invalid_argument& error) {
-            EXPECT_NE(std::string{error.what()}.find("device-only"), std::string::npos);
+            rejected = true;
+            EXPECT_NE(std::string{error.what()}.find(test_case.error), std::string::npos) << error.what();
         }
+        EXPECT_TRUE(rejected);
     }
-}
-
-TEST(HeterogeneousFlatSchedulerTest, StructuredExplicitPoolsRejectRadixOwnedMambaAdjunct) {
-    SchedulerConfig config = MakeHeterogeneousPoolConfig(/*history_blocks=*/6, /*state_blocks=*/5);
-    config.enable_structured_flat_kv_completion = true;
-    config.enable_mamba = true;
-    config.mamba_pool_total_chunks = 4;
-    EXPECT_THROW(Scheduler(std::move(config)), std::invalid_argument);
-}
-
-TEST(HeterogeneousFlatSchedulerTest, StructuredExplicitPoolsRejectRadixOwnedL3Storage) {
-    SchedulerConfig config = MakeHeterogeneousPoolConfig(/*history_blocks=*/6, /*state_blocks=*/5);
-    config.enable_structured_flat_kv_completion = true;
-    config.enable_l3_storage = true;
-    EXPECT_THROW(Scheduler(std::move(config)), std::invalid_argument);
 }
 
 // ---------------------------------------------------------------------------

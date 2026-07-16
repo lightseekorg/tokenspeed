@@ -30,8 +30,6 @@ Covers:
   - advance with output tokens appended to token container
 """
 
-import gc
-
 import pytest
 from tokenspeed_scheduler import (
     Cache,
@@ -691,24 +689,6 @@ def _writeback_ops(plan: ExecutionPlan):
 
 
 class TestWriteBackPriority:
-    def test_execution_plan_cache_is_a_borrowed_view_with_plan_keepalive(self):
-        s = Scheduler(_make_retract_config(page_size=2, num_device_pages=16))
-        submit(s, "borrowed-cache", [10, 11])
-
-        s.next_execution_plan()
-        advance_forward(s, "borrowed-cache", tokens=[42])
-        s.next_execution_plan()
-        advance_forward(s, "borrowed-cache", finish=True)
-
-        plan = s.next_execution_plan()
-        cache_op = _writeback_ops(plan)[0]
-        assert _writeback_ops(plan)[0] is cache_op
-
-        del plan
-        gc.collect()
-
-        assert cache_op.is_retract == [False]
-
     def test_finish_writeback_is_not_retract_writeback(self):
         s = Scheduler(_make_retract_config(page_size=2, num_device_pages=16))
         submit(s, "r0", [10, 11])

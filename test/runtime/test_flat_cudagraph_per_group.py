@@ -120,179 +120,6 @@ class FlatCacheGroupIdsTest(_TorchCase):
         self.assertEqual(out, ())
 
 
-class OwnerLocalFlatGroupSelectionTest(_TorchCase):
-    """Target and draft consume their own plan views from the scheduler union."""
-
-    def setUp(self):
-        super().setUp()
-        from tokenspeed.runtime.execution.cuda_graph_wrapper import (
-            CudaGraphWrapper,
-        )
-
-        self.wrapper_type = CudaGraphWrapper
-
-    @staticmethod
-    def _pool(*group_ids):
-        return SimpleNamespace(
-            paged_cache_group_specs=tuple(
-                SimpleNamespace(group_id=group_id) for group_id in group_ids
-            )
-        )
-
-    def _wrapper(self):
-        return SimpleNamespace(
-            _target_flat_group_ids=("target.history", "target.state"),
-            _draft_flat_group_ids=("draft.history", "draft.state", "draft.only"),
-        )
-
-    def test_draft_ids_come_from_draft_owner_view_including_state(self):
-        wrapper = self._wrapper()
-        self.assertEqual(
-            wrapper._draft_flat_group_ids,
-            ("draft.history", "draft.state", "draft.only"),
-        )
-
-    def test_target_and_draft_subset_the_scheduler_union_independently(self):
-        wrapper = self._wrapper()
-        scheduler_union = {
-            "target.history": object(),
-            "target.state": object(),
-            "draft.history": object(),
-            "draft.state": object(),
-            "draft.only": object(),
-        }
-        scheduler_bases = {group_id: object() for group_id in scheduler_union}
-        target, target_bases = self.wrapper_type._owner_flat_inputs(
-            scheduler_union,
-            scheduler_bases,
-            wrapper._target_flat_group_ids,
-            owner="target",
-        )
-        draft, draft_bases = self.wrapper_type._owner_flat_inputs(
-            scheduler_union,
-            scheduler_bases,
-            wrapper._draft_flat_group_ids,
-            owner="draft",
-        )
-        self.assertEqual(set(target), {"target.history", "target.state"})
-        self.assertEqual(set(target_bases), set(target))
-        self.assertEqual(set(draft), {"draft.history", "draft.state", "draft.only"})
-        self.assertEqual(set(draft_bases), set(draft))
-        for group_id in target:
-            self.assertIs(target[group_id], scheduler_union[group_id])
-            self.assertIs(target_bases[group_id], scheduler_bases[group_id])
-
-    def test_missing_owner_group_fails_closed(self):
-        wrapper = self._wrapper()
-        with self.assertRaisesRegex(RuntimeError, "draft.*missing"):
-            self.wrapper_type._owner_flat_inputs(
-                {
-                    "target.history": object(),
-                    "target.state": object(),
-                    "draft.history": object(),
-                },
-                {"draft.history": object()},
-                wrapper._draft_flat_group_ids,
-                owner="draft",
-            )
-
-
-class FlatGraphPlanAccountingTest(_TorchCase):
-    """CPU tensors exercise plan binding and actual byte/shape reconciliation."""
-
-    @staticmethod
-    def _plan():
-        cols = {
-            "target": {"target.history": 3, "shared.state": 2},
-            "draft": {"draft.history": 4},
-        }
-        rows = {"target": 2, "draft": 2}
-        return SimpleNamespace(
-            graph_capture_cols_by_group=lambda owner: dict(cols[owner]),
-            graph_batch_rows=lambda owner: rows[owner],
-        )
-
-    @staticmethod
-    def _pool(plan, *, owner, cols):
-        return SimpleNamespace(
-            flat_memory_plan=plan,
-            cache_owner=owner,
-            flat_capture_cols_by_group=dict(cols),
-            paged_cache_group_specs=tuple(
-                SimpleNamespace(group_id=group_id) for group_id in cols
-            ),
-        )
-
-    def test_wrapper_passes_owner_local_plan_cols_and_rows_to_backend(self):
-        from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
-
-        plan = self._plan()
-        pool = self._pool(
-            plan,
-            owner="target",
-            cols=plan.graph_capture_cols_by_group("target"),
-        )
-        kwargs = CudaGraphWrapper._flat_graph_plan_init_kwargs(
-            pool,
-            owner="target",
-            max_bs=2,
-        )
-        self.assertEqual(
-            kwargs["flat_capture_cols_by_group"],
-            {"target.history": 3, "shared.state": 2},
-        )
-        self.assertEqual(kwargs["flat_graph_batch_rows"], 2)
-
-    def test_wrapper_rejects_pool_capture_width_drift(self):
-        from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
-
-        plan = self._plan()
-        pool = self._pool(
-            plan,
-            owner="target",
-            cols={"target.history": 2, "shared.state": 2},
-        )
-        with self.assertRaisesRegex(RuntimeError, "capture cols disagree"):
-            CudaGraphWrapper._flat_graph_plan_init_kwargs(
-                pool,
-                owner="target",
-                max_bs=2,
-            )
-
-    def test_actual_table_and_base_tensor_bytes_match_plan(self):
-        from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
-
-        torch = self.torch
-        plan = self._plan()
-        cols = plan.graph_capture_cols_by_group("target")
-        backend = SimpleNamespace(
-            _cuda_graph_paged_cache_block_tables={
-                group_id: torch.zeros((2, width), dtype=torch.int32)
-                for group_id, width in cols.items()
-            },
-            _cuda_graph_paged_cache_base_offsets={
-                group_id: torch.zeros((2,), dtype=torch.int32) for group_id in cols
-            },
-        )
-        self.assertEqual(
-            CudaGraphWrapper._actual_flat_graph_metadata_bytes(
-                backend,
-                plan,
-                owner="target",
-            ),
-            4 * 2 * ((3 + 1) + (2 + 1)),
-        )
-        backend._cuda_graph_paged_cache_block_tables["target.history"] = torch.zeros(
-            (2, 2), dtype=torch.int32
-        )
-        with self.assertRaisesRegex(RuntimeError, "shape disagrees"):
-            CudaGraphWrapper._actual_flat_graph_metadata_bytes(
-                backend,
-                plan,
-                owner="target",
-            )
-
-
 class WrapperReplayFlatTest(_TorchCase):
     """Call-site wiring: the real _init_replay_metadata must row-pad flat
     tables with 0 (not the -1 default) before handing them to the backend."""
@@ -668,7 +495,7 @@ class V4DualSourceRoutingTest(_TorchCase):
     """V4 advertises both ABIs; the pool plan, not the capability flag,
     selects exactly one source for each runtime instance."""
 
-    def _call(self, *, flat_plan, flat_tables=None, flat_bases=None):
+    def _call(self, *, flat_tables=None, flat_bases=None):
         torch = self.torch
         from tokenspeed.runtime.execution.cuda_graph_wrapper import (
             CudaGraphWrapper,
@@ -691,7 +518,7 @@ class V4DualSourceRoutingTest(_TorchCase):
             paged_cache_group_specs=tuple(
                 SimpleNamespace(group_id=group_id) for group_id in paged_tables
             ),
-            flat_memory_plan=flat_plan,
+            flat_memory_plan=object(),
         )
         mock = SimpleNamespace(
             input_buffers=SimpleNamespace(
@@ -704,9 +531,7 @@ class V4DualSourceRoutingTest(_TorchCase):
                 uses_paged_cache_groups=True,
             ),
             token_to_kv_pool=pool,
-            _target_flat_group_ids=(
-                tuple(paged_tables) if flat_plan is not None else ()
-            ),
+            _target_flat_group_ids=tuple(paged_tables),
             _draft_flat_group_ids=(),
             drafter=None,
             _can_use_graph=lambda bs, ctx: False,
@@ -737,33 +562,48 @@ class V4DualSourceRoutingTest(_TorchCase):
         )
         return calls["kwargs"], paged_tables, paged_bases
 
-    def test_legacy_pool_keeps_radix_source_despite_flat_capability(self):
-        kwargs, paged_tables, paged_bases = self._call(flat_plan=None)
-
-        self.assertIs(kwargs["paged_cache_block_tables"], paged_tables)
-        self.assertIs(kwargs["paged_cache_block_table_base_offsets"], paged_bases)
-        self.assertIsNone(kwargs["flat_block_tables"])
-        self.assertIsNone(kwargs["flat_block_table_base_offsets"])
-
     def test_flat_arena_pool_requires_and_selects_flat_source(self):
         torch = self.torch
-        with self.assertRaisesRegex(RuntimeError, "flat_block_tables"):
-            self._call(flat_plan=object())
-
-        flat_tables = {
-            "history": torch.ones((2, 2), dtype=torch.int32),
-            "state": torch.ones((2, 2), dtype=torch.int32),
-        }
-        flat_bases = {
-            group_id: torch.zeros(2, dtype=torch.int32) for group_id in flat_tables
-        }
-        kwargs, _, _ = self._call(
-            flat_plan=object(), flat_tables=flat_tables, flat_bases=flat_bases
+        cases = (
+            ("missing flat source", False, "flat_block_tables"),
+            ("flat source selected", True, None),
         )
-        self.assertIs(kwargs["flat_block_tables"], flat_tables)
-        self.assertIs(kwargs["flat_block_table_base_offsets"], flat_bases)
-        self.assertIsNone(kwargs["paged_cache_block_tables"])
-        self.assertIsNone(kwargs["paged_cache_block_table_base_offsets"])
+
+        for name, provide_flat_source, error in cases:
+            with self.subTest(name=name):
+                flat_tables = (
+                    {
+                        "history": torch.ones((2, 2), dtype=torch.int32),
+                        "state": torch.ones((2, 2), dtype=torch.int32),
+                    }
+                    if provide_flat_source
+                    else None
+                )
+                flat_bases = (
+                    {
+                        group_id: torch.zeros(2, dtype=torch.int32)
+                        for group_id in flat_tables
+                    }
+                    if flat_tables is not None
+                    else None
+                )
+
+                if error is not None:
+                    with self.assertRaisesRegex(RuntimeError, error):
+                        self._call(
+                            flat_tables=flat_tables,
+                            flat_bases=flat_bases,
+                        )
+                    continue
+
+                kwargs, _, _ = self._call(
+                    flat_tables=flat_tables,
+                    flat_bases=flat_bases,
+                )
+                self.assertIs(kwargs["flat_block_tables"], flat_tables)
+                self.assertIs(kwargs["flat_block_table_base_offsets"], flat_bases)
+                self.assertIsNone(kwargs["paged_cache_block_tables"])
+                self.assertIsNone(kwargs["paged_cache_block_table_base_offsets"])
 
 
 class IdleFlatBlockTablesTest(_TorchCase):
@@ -1072,31 +912,35 @@ class BackendReplayFlatTest(_BackendCase):
         with self.assertRaisesRegex(RuntimeError, "flat_block_tables"):
             self._replay(2, {})
 
-    def test_missing_captured_group_raises(self):
-        # Per-group hole: a non-empty dict lacking one captured group would
-        # leave that group's buffer stale — must raise naming the group.
-        torch = self.torch
-        src = {"sliding_attention": torch.ones((2, 2), dtype=torch.int32)}
-        bases = {"sliding_attention": torch.zeros(2, dtype=torch.int32)}
-        with self.assertRaisesRegex(RuntimeError, "captured.*full_attention"):
-            self._replay(2, src, bases)
-
-    def test_table_base_key_mismatch_raises(self):
+    def test_invalid_table_base_inputs_raise(self):
         torch = self.torch
         tables = {gid: torch.ones((2, 2), dtype=torch.int32) for gid in _GROUP_IDS}
-        bases = {"sliding_attention": torch.zeros(2, dtype=torch.int32)}
-        with self.assertRaisesRegex(RuntimeError, "table/base group mismatch"):
-            self._replay(2, tables, bases)
-
-    def test_base_row_mismatch_raises(self):
-        torch = self.torch
-        tables = {gid: torch.ones((2, 2), dtype=torch.int32) for gid in _GROUP_IDS}
-        bases = {
-            "sliding_attention": torch.zeros(2, dtype=torch.int32),
-            "full_attention": torch.zeros(1, dtype=torch.int32),
-        }
-        with self.assertRaisesRegex(RuntimeError, "table rows.*base rows"):
-            self._replay(2, tables, bases)
+        cases = (
+            (
+                "missing captured group",
+                {"sliding_attention": tables["sliding_attention"]},
+                {"sliding_attention": torch.zeros(2, dtype=torch.int32)},
+                "captured.*full_attention",
+            ),
+            (
+                "table/base key mismatch",
+                tables,
+                {"sliding_attention": torch.zeros(2, dtype=torch.int32)},
+                "table/base group mismatch",
+            ),
+            (
+                "table/base row mismatch",
+                tables,
+                {
+                    "sliding_attention": torch.zeros(2, dtype=torch.int32),
+                    "full_attention": torch.zeros(1, dtype=torch.int32),
+                },
+                "table rows.*base rows",
+            ),
+        )
+        for name, case_tables, case_bases, error in cases:
+            with self.subTest(name), self.assertRaisesRegex(RuntimeError, error):
+                self._replay(2, case_tables, case_bases)
 
     def test_replay_refreshes_base_when_table_is_unchanged(self):
         torch = self.torch

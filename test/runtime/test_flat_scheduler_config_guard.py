@@ -15,6 +15,7 @@ import importlib.util
 import os
 import sys
 import unittest
+from unittest import mock
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -50,21 +51,24 @@ def _load_paged_cache_spec():
             "configs",
             "flat_kv_contract.py",
         )
-        contract_name = "tokenspeed.runtime.configs.flat_kv_contract"
-        if contract_name not in sys.modules:
-            contract_spec = importlib.util.spec_from_file_location(
-                contract_name, contract_path
+        with mock.patch.dict(sys.modules):
+            contract_name = "tokenspeed.runtime.configs.flat_kv_contract"
+            if contract_name not in sys.modules:
+                contract_spec = importlib.util.spec_from_file_location(
+                    contract_name, contract_path
+                )
+                assert contract_spec is not None and contract_spec.loader is not None
+                contract = importlib.util.module_from_spec(contract_spec)
+                sys.modules[contract_name] = contract
+                contract_spec.loader.exec_module(contract)
+            spec = importlib.util.spec_from_file_location(
+                "_paged_cache_spec_guard", path
             )
-            assert contract_spec is not None and contract_spec.loader is not None
-            contract = importlib.util.module_from_spec(contract_spec)
-            sys.modules[contract_name] = contract
-            contract_spec.loader.exec_module(contract)
-        spec = importlib.util.spec_from_file_location("_paged_cache_spec_guard", path)
-        module = importlib.util.module_from_spec(spec)
-        # dataclass processing resolves cls.__module__ through sys.modules, so
-        # the module must be registered before exec.
-        sys.modules[spec.name] = module
-        spec.loader.exec_module(module)
+            module = importlib.util.module_from_spec(spec)
+            # dataclass processing resolves cls.__module__ through sys.modules, so
+            # the module must be registered before exec.
+            sys.modules[spec.name] = module
+            spec.loader.exec_module(module)
         return module
 
 
