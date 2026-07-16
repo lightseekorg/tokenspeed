@@ -416,8 +416,9 @@ class FlatCacheGroupsMixin:
         self, bs: int, flat_cache_group_ids, tokens_per_req: int = 1
     ):
         """Capture-time (page_tables, out_cache_locs) per-group views into the
-        persistent buffers, lazily allocated. Real tables only arrive at
-        replay, which copy_s fresh data to these graph-recorded addresses.
+        persistent buffers initialized by :meth:`_init_flat_graph_buffers`.
+        Real tables only arrive at replay, which copies fresh data to these
+        graph-recorded addresses.
         Verify (tokens_per_req = spec_num_tokens) keeps [bs]-row tables but
         records [bs*N] write-loc views (token-major, radix verify layout).
         Returns (None, None) when only state groups (or none) are delivered.

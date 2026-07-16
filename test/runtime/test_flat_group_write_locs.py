@@ -1,10 +1,9 @@
 """M11: flat per-group KV write-location derivation tests.
 
-CPU-only (plain tensors): the pure loc-computation helpers, the
-TOKENSPEED_FLAT_DEBUG write-invariant checker, the eager
-init_forward_metadata assembly, the _select_out_cache_loc /
-select_out_cache_loc routing seams, and the CUDA-graph persistent
-per-group loc buffers (capture views, replay recompute).
+Plain CPU tensors cover the pure loc-computation helpers, the
+TOKENSPEED_FLAT_DEBUG write-invariant checker, eager metadata assembly, and
+the out-cache-loc routing seams. CUDA covers persistent graph-buffer views and
+the fused replay recomputation.
 """
 
 from __future__ import annotations
@@ -50,7 +49,7 @@ class _TorchCase(unittest.TestCase):
 
 
 class _MHACase(_TorchCase):
-    """Cases against MHAAttnBackend staticmethods (called on the class)."""
+    """Cases against MHAAttnBackend helpers on a minimally initialized instance."""
 
     def setUp(self):
         super().setUp()
@@ -61,6 +60,9 @@ class _MHACase(_TorchCase):
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs tokenspeed_kernel: {exc}")
         self.MHAAttnBackend = MHAAttnBackend
+        self.backend = MHAAttnBackend.__new__(MHAAttnBackend)
+        self.backend.page_size = PAGE
+        self.backend.flat_group_page_sizes = {}
 
 
 class ComputeFlatOutCacheLocsTest(_MHACase):
@@ -78,9 +80,7 @@ class ComputeFlatOutCacheLocsTest(_MHACase):
             ),
         }
         seq_lens = torch.tensor([5, 4], dtype=torch.int32)
-        locs = self.MHAAttnBackend._compute_flat_decode_out_cache_locs(
-            tables, seq_lens, PAGE
-        )
+        locs = self.backend._compute_flat_decode_out_cache_locs(tables, seq_lens, PAGE)
         # sliding: r0 page 7*2+0=14; r1 page 6*2+1=13.
         assert locs["sliding_attention"].tolist() == [14, 13]
         # full: r0 3*2+0=6; r1 8*2+1=17.
@@ -99,13 +99,42 @@ class ComputeFlatOutCacheLocsTest(_MHACase):
         }
         prefix_cpu = torch.tensor([2, 0], dtype=torch.int32)
         extend_cpu = torch.tensor([3, 2], dtype=torch.int32)
-        locs = self.MHAAttnBackend._compute_flat_extend_out_cache_locs(
+        locs = self.backend._compute_flat_extend_out_cache_locs(
             tables, prefix_cpu, extend_cpu, PAGE
         )
         # r0: pos 2,3,4 -> page_idx 1,1,2 -> pages 2,2,3 ->
         #     locs 2*2+0=4, 2*2+1=5, 3*2+0=6; r1: pages 4,4 -> locs 8, 9.
         assert locs["full_attention"].tolist() == [4, 5, 6, 8, 9]
         assert locs["full_attention"].dtype == torch.int32
+
+    def test_decode_locs_honor_group_page_sizes(self):
+        torch = self.torch
+        self.backend.flat_group_page_sizes = {"small": 2, "large": 4}
+        tables = {
+            "small": torch.tensor([[1, 2, 3]], dtype=torch.int32),
+            "large": torch.tensor([[6, 7]], dtype=torch.int32),
+        }
+        locs = self.backend._compute_flat_decode_out_cache_locs(
+            tables, torch.tensor([5], dtype=torch.int32), PAGE
+        )
+        self.assertEqual(locs["small"].tolist(), [6])
+        self.assertEqual(locs["large"].tolist(), [28])
+
+    def test_extend_locs_honor_group_page_sizes(self):
+        torch = self.torch
+        self.backend.flat_group_page_sizes = {"small": 2, "large": 4}
+        tables = {
+            "small": torch.tensor([[10, 11, 12]], dtype=torch.int32),
+            "large": torch.tensor([[20, 21]], dtype=torch.int32),
+        }
+        locs = self.backend._compute_flat_extend_out_cache_locs(
+            tables,
+            torch.tensor([3], dtype=torch.int32),
+            torch.tensor([3], dtype=torch.int32),
+            PAGE,
+        )
+        self.assertEqual(locs["small"].tolist(), [23, 24, 25])
+        self.assertEqual(locs["large"].tolist(), [83, 84, 85])
 
 
 class MaybeCheckFlatWriteLocsTest(_MHACase):
@@ -124,7 +153,7 @@ class MaybeCheckFlatWriteLocsTest(_MHACase):
         bad = {"sliding_attention": torch.tensor([0], dtype=torch.int32)}
         with mock.patch.dict(os.environ):
             os.environ.pop("TOKENSPEED_FLAT_DEBUG", None)
-            self.MHAAttnBackend._maybe_check_flat_write_locs(
+            self.backend._maybe_check_flat_write_locs(
                 self._table_with_front_hole(), bad, PAGE
             )
 
@@ -135,7 +164,7 @@ class MaybeCheckFlatWriteLocsTest(_MHACase):
         with mock.patch.dict(
             os.environ, {"TOKENSPEED_FLAT_DEBUG": "1"}
         ), self.assertRaisesRegex(AssertionError, "null page.*sliding_attention"):
-            self.MHAAttnBackend._maybe_check_flat_write_locs(
+            self.backend._maybe_check_flat_write_locs(
                 self._table_with_front_hole(), bad, PAGE
             )
 
@@ -146,7 +175,7 @@ class MaybeCheckFlatWriteLocsTest(_MHACase):
         with mock.patch.dict(
             os.environ, {"TOKENSPEED_FLAT_DEBUG": "1"}
         ), self.assertRaisesRegex(AssertionError, "escape.*sliding_attention"):
-            self.MHAAttnBackend._maybe_check_flat_write_locs(
+            self.backend._maybe_check_flat_write_locs(
                 self._table_with_front_hole(), bad, PAGE
             )
 
@@ -155,9 +184,17 @@ class MaybeCheckFlatWriteLocsTest(_MHACase):
         # Pages 2 and 3 are real table entries; hole 0 / pad -1 excluded.
         good = {"sliding_attention": torch.tensor([4, 5, 6], dtype=torch.int32)}
         with mock.patch.dict(os.environ, {"TOKENSPEED_FLAT_DEBUG": "1"}):
-            self.MHAAttnBackend._maybe_check_flat_write_locs(
+            self.backend._maybe_check_flat_write_locs(
                 self._table_with_front_hole(), good, PAGE
             )
+
+    def test_debug_honors_group_page_size(self):
+        torch = self.torch
+        self.backend.flat_group_page_sizes = {"wide": 4}
+        tables = {"wide": torch.tensor([[2, 3]], dtype=torch.int32)}
+        locs = {"wide": torch.tensor([11, 15], dtype=torch.int32)}
+        with mock.patch.dict(os.environ, {"TOKENSPEED_FLAT_DEBUG": "1"}):
+            self.backend._maybe_check_flat_write_locs(tables, locs, PAGE)
 
 
 class InitForwardMetadataAssemblyTest(_MHACase):
@@ -358,32 +395,36 @@ class GraphLocBuffersTest(_MHACase):
     def setUp(self):
         super().setUp()
         torch = self.torch
+        if not torch.cuda.is_available():
+            self.skipTest("stacked replay write locations require CUDA")
         backend = self.MHAAttnBackend.__new__(self.MHAAttnBackend)
         backend.spec_num_tokens = 1
         backend.is_draft = False
         backend.draft_block_decode = False
         backend.flat_state_group_ids = frozenset()
+        backend.flat_engine_owned_group_ids = frozenset()
+        backend.flat_group_page_sizes = {gid: PAGE for gid in _GROUP_IDS}
         backend.max_num_pages = MAX_NUM_PAGES
         backend.page_size = PAGE
-        backend.device = "cpu"
+        backend.device = "cuda"
         backend.cuda_graph_decode_metadata = {}
         backend.cuda_graph_page_table = torch.zeros(
-            (MAX_BS, MAX_NUM_PAGES), dtype=torch.int32
+            (MAX_BS, MAX_NUM_PAGES), dtype=torch.int32, device=backend.device
         )
         # Stand-in for the controller's seq_lens_buf; tests pre-write it
         # before replay exactly like the wrapper's input prep does.
-        backend.cuda_graph_seq_lens = torch.ones(MAX_BS, dtype=torch.int32)
-        backend.cuda_graph_flat_page_tables = {}
-        backend.cuda_graph_flat_out_cache_locs = {}
-        backend._cuda_graph_max_bs = MAX_BS
+        backend.cuda_graph_seq_lens = torch.ones(
+            MAX_BS, dtype=torch.int32, device=backend.device
+        )
+        backend._init_flat_graph_buffers(MAX_BS)
         self.backend = backend
 
     def _capture(self, bs, flat_cache_group_ids=()):
         torch = self.torch
         self.backend.init_forward_metadata_capture_cuda_graph(
             bs,
-            torch.arange(bs, dtype=torch.int64),
-            torch.ones(bs, dtype=torch.int32),
+            torch.arange(bs, dtype=torch.int64, device=self.backend.device),
+            torch.ones(bs, dtype=torch.int32, device=self.backend.device),
             _decode_forward_mode(),
             flat_cache_group_ids=flat_cache_group_ids,
         )
@@ -395,16 +436,20 @@ class GraphLocBuffersTest(_MHACase):
             # Wrapper contract: input prep writes the step's lens (dummy
             # tail = 1) into seq_lens_buf BEFORE replay runs.
             self.backend.cuda_graph_seq_lens[: len(seq_lens)] = torch.tensor(
-                seq_lens, dtype=torch.int32
+                seq_lens, dtype=torch.int32, device=self.backend.device
             )
         kwargs = {}
         if flat_block_tables is not None:
             kwargs["flat_block_tables"] = flat_block_tables
         self.backend.init_forward_metadata_replay_cuda_graph(
             bs,
-            torch.arange(MAX_BS, dtype=torch.int64),
-            torch.ones(MAX_BS, dtype=torch.int32),
-            torch.zeros((MAX_BS, MAX_NUM_PAGES), dtype=torch.int32),
+            torch.arange(MAX_BS, dtype=torch.int64, device=self.backend.device),
+            torch.ones(MAX_BS, dtype=torch.int32, device=self.backend.device),
+            torch.zeros(
+                (MAX_BS, MAX_NUM_PAGES),
+                dtype=torch.int32,
+                device=self.backend.device,
+            ),
             _decode_forward_mode(),
             **kwargs,
         )
@@ -449,10 +494,12 @@ class GraphLocBuffersTest(_MHACase):
             "sliding_attention": torch.tensor(
                 [[0, 5, 7, -1], [0, 6, -1, -1], [0, 0, 0, 0]],
                 dtype=torch.int32,
+                device=self.backend.device,
             ),
             "full_attention": torch.tensor(
                 [[1, 2, 3, -1], [4, 8, -1, -1], [0, 0, 0, 0]],
                 dtype=torch.int32,
+                device=self.backend.device,
             ),
         }
         self._replay(3, tables, seq_lens=[5, 4, 1])
@@ -468,10 +515,12 @@ class GraphLocBuffersTest(_MHACase):
             # Rows beyond bs untouched (still the sentinel).
             self.assertTrue((buf[3:] == 99).all())
 
-    def test_capture_without_flat_leaves_locs_none(self):
+    def test_capture_without_flat_leaves_metadata_locs_none(self):
         metadata = self._capture(2)
         self.assertIsNone(metadata.out_cache_locs)
-        self.assertEqual(self.backend.cuda_graph_flat_out_cache_locs, {})
+        self.assertEqual(
+            set(self.backend.cuda_graph_flat_out_cache_locs), set(_GROUP_IDS)
+        )
 
 
 class BaseSelectOutCacheLocTest(_TorchCase):

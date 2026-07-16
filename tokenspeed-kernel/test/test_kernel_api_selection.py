@@ -221,6 +221,10 @@ def _is_blackwell_sm100(platform: PlatformInfo) -> bool:
     return platform.is_blackwell and platform.arch_version == ArchVersion(10, 0)
 
 
+def _is_blackwell_sm103(platform: PlatformInfo) -> bool:
+    return platform.is_blackwell and platform.arch_version == ArchVersion(10, 3)
+
+
 def _is_blackwell_non_sm100(platform: PlatformInfo) -> bool:
     return platform.is_blackwell and platform.arch_version != ArchVersion(10, 0)
 
@@ -251,6 +255,11 @@ def _is_supported_gpu(platform: PlatformInfo) -> bool:
 
 def _fp8_dtype() -> torch.dtype:
     return Platform.get().fp8e4m3fn.dtype
+
+
+def _quantize_mxfp8() -> tuple[torch.Tensor, torch.Tensor]:
+    x = torch.empty((4, 128), dtype=torch.bfloat16)
+    return tokenspeed_kernel.quantize_mxfp8(x)
 
 
 def _mm_dense() -> torch.Tensor:
@@ -603,6 +612,39 @@ def _attention_rel_decode_page128_sliding() -> object:
         window_left=127,
         softmax_scale=1.0 / 128,
     )
+
+
+def _attention_rel_decode_multiquery(window_left: int) -> object:
+    batch = 2
+    prediction = 4
+    q = torch.empty((batch * prediction, 8, 128), dtype=torch.bfloat16)
+    rel_logits = torch.empty((batch * prediction, 8, 512), dtype=torch.bfloat16)
+    k_cache = torch.empty((12, 128, 2, 128), dtype=torch.bfloat16)
+    v_cache = torch.empty((12, 128, 2, 128), dtype=torch.bfloat16)
+    page_table = torch.empty((batch, 6), dtype=torch.int32)
+    cache_seqlens = torch.tensor([300, 641], dtype=torch.int32)
+    cu_seqlens_q = torch.tensor([0, prediction, 2 * prediction], dtype=torch.int32)
+    return tokenspeed_kernel.rel_mha_decode_with_kvcache(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        max_seqlen_k=641,
+        rel_logits=rel_logits,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=prediction,
+        window_left=window_left,
+        softmax_scale=1.0 / 128,
+    )
+
+
+def _attention_rel_decode_multiquery_sliding() -> object:
+    return _attention_rel_decode_multiquery(window_left=511)
+
+
+def _attention_rel_decode_multiquery_full() -> object:
+    return _attention_rel_decode_multiquery(window_left=-1)
 
 
 def _attention_rel_decode_page256_sliding() -> object:
@@ -1500,6 +1542,14 @@ _CASES = [
         _attention_merge_state,
     ),
     _case(
+        _is_blackwell_sm103,
+        "blackwell-sm103",
+        "attention",
+        "rel_mha_decode_with_kvcache",
+        "fa4_rel_mha_decode_with_kvcache",
+        _attention_rel_decode_multiquery_sliding,
+    ),
+    _case(
         _is_cdna4,
         "cdna4",
         "attention",
@@ -1676,6 +1726,23 @@ _CASES = [
         "mm",
         "triton_mm_fp8_blockscale",
         _mm_mxfp8,
+    ),
+    # Quantization API x architecture golden cases.
+    _case(
+        _is_hopper,
+        "hopper",
+        "quantization",
+        "mxfp8",
+        "triton_quantize_mxfp8",
+        _quantize_mxfp8,
+    ),
+    _case(
+        _is_blackwell_sm100,
+        "blackwell-sm100",
+        "quantization",
+        "mxfp8",
+        "flashinfer_quantize_mxfp8",
+        _quantize_mxfp8,
     ),
     # Sampling API x architecture golden cases.
     _case(
@@ -1898,6 +1965,76 @@ def _find_case(*, arch: str, family: str, mode: str) -> KernelApiSelectionCase:
         if case.arch == arch and case.family == family and case.mode == mode:
             return case
     raise AssertionError(f"missing golden case for {arch}/{family}.{mode}")
+
+
+def test_mxfp8_quantizer_capabilities_match_architecture(
+    h100_platform: PlatformInfo,
+    b200_platform: PlatformInfo,
+) -> None:
+    if not Platform.get().is_nvidia:
+        pytest.skip("FlashInfer quantization kernels are registered only on NVIDIA")
+
+    registry = KernelRegistry.get()
+    h100_names = {
+        spec.name
+        for spec in registry.get_for_operator(
+            "quantization", "mxfp8", platform=h100_platform
+        )
+    }
+    b200_names = {
+        spec.name
+        for spec in registry.get_for_operator(
+            "quantization", "mxfp8", platform=b200_platform
+        )
+    }
+
+    assert "flashinfer_quantize_mxfp8" not in h100_names
+    assert "triton_quantize_mxfp8" in h100_names
+    assert "flashinfer_quantize_mxfp8" in b200_names
+    assert "triton_quantize_mxfp8" in b200_names
+
+
+def test_b300_rel_decode_registration_and_selection(
+    b300_platform: PlatformInfo,
+    selected_kernel_spy,
+) -> None:
+    if (
+        not Platform.get().is_nvidia
+        or importlib.util.find_spec("flash_attn.cute") is None
+    ):
+        pytest.skip("B300 registration simulation requires NVIDIA FA4")
+
+    case = _find_case(
+        arch="blackwell-sm103",
+        family="attention",
+        mode="rel_mha_decode_with_kvcache",
+    )
+    real_platform = Platform.get()
+    active_case, calls = selected_kernel_spy
+    active_case["case"] = case
+
+    try:
+        Platform.override(b300_platform)
+        KernelRegistry.reset()
+        importlib.reload(_attention_flash_attn)
+        registry = KernelRegistry.get()
+
+        expected_spec = registry.get_by_name(case.expected)
+        assert expected_spec is not None
+        assert expected_spec.capability.satisfied_by(b300_platform)
+
+        plain_decode = registry.get_by_name("fa4_mha_decode_with_kvcache")
+        assert plain_decode is not None
+        assert not plain_decode.capability.satisfied_by(b300_platform)
+
+        case.invoke()
+        _attention_rel_decode_multiquery_full()
+
+        assert calls == [case.expected, case.expected]
+    finally:
+        Platform.override(real_platform)
+        KernelRegistry.reset()
+        importlib.reload(_attention_flash_attn)
 
 
 def test_attn_merge_state_routes_to_triton_on_cdna4(

@@ -198,8 +198,38 @@ def b200_platform() -> PlatformInfo:
 
 
 @pytest.fixture
-def fresh_registry():
-    KernelRegistry.reset()
+def b300_platform() -> PlatformInfo:
+    return PlatformInfo(
+        vendor="nvidia",
+        arch_version=ArchVersion(10, 3),
+        device_name="NVIDIA B300",
+        device_count=8,
+        total_memory=288 * (1024**3),
+        memory_bandwidth=8000.0,
+        sm_count=160,
+        max_threads_per_sm=2048,
+        max_shared_memory_per_sm=262144,
+        sm_features=frozenset(
+            {
+                "tensor_core:f16",
+                "tensor_core:int8",
+                "tensor_core:f8",
+                "tensor_core:f4",
+                "memory:async_copy",
+                "memory:tma",
+                "compute:cluster",
+            }
+        ),
+        runtime_features=frozenset({"runtime:cuda_graph"}),
+        interconnect=InterconnectInfo(topology="nvlink_full"),
+    )
+
+
+@pytest.fixture
+def fresh_registry(monkeypatch: pytest.MonkeyPatch):
+    # Isolate tests with an empty singleton while preserving the built-in
+    # registry for later integration tests in the same pytest process.
+    monkeypatch.setattr(KernelRegistry, "_instance", None)
     clear_config_overrides()
     _oracles.clear()
     _global_overrides.clear()

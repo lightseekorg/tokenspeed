@@ -324,7 +324,9 @@ def test_rel_mha_decode_with_kvcache(
 
 def test_mha_ops_interface_has_no_rel_args(device: str, require) -> None:
     """The plain mha ops must not accept relative-bias arguments — that is
-    the rel_mha family's contract. Regression guard for interface creep."""
+    the rel_mha family's contract. Use default dispatch so each architecture
+    exercises a supported plain-MHA backend. Regression guard for interface
+    creep."""
     _require_fa4(require)
     q_lens = [70, 130]
     kv_lens = [198, 130]
@@ -365,7 +367,6 @@ def test_mha_ops_interface_has_no_rel_args(device: str, require) -> None:
         max_seqlen_q=max(q_lens),
         max_seqlen_k=max(kv_lens),
         is_causal=True,
-        solution="fa4",
     )
     assert out.shape == q.shape
     assert not torch.isnan(out).any()
@@ -379,7 +380,6 @@ def test_mha_ops_interface_has_no_rel_args(device: str, require) -> None:
         cache_seqlens=cache_seqlens,
         max_seqlen_k=max(kv_lens),
         max_seqlen_q=1,
-        solution="fa4",
     )
     assert out.shape == q_decode.shape
     assert not torch.isnan(out).any()

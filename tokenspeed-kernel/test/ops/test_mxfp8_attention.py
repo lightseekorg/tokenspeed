@@ -30,15 +30,22 @@ import math
 
 import pytest
 import torch
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import ArchVersion, current_platform
+
+platform = current_platform()
 
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device"),
     pytest.mark.skipif(
-        current_platform().is_amd,
-        reason="MXFP8 attention kernels are not registered on AMD yet",
+        not platform.is_blackwell,
+        reason="MXFP8 attention kernels require SM10x Blackwell",
     ),
 ]
+
+requires_sm100 = pytest.mark.skipif(
+    platform.arch_version != ArchVersion(10, 0),
+    reason="plain FA4 MXFP8 kernels require SM100 Blackwell",
+)
 
 PAGE = 128
 HEAD_DIM = 128
@@ -99,7 +106,9 @@ def _build_paged_cache(seq_lens: list[int], seed: int):
         page_table[b, :n] = torch.arange(next_page, next_page + n, device="cuda")
         next_page += n
 
-    paged = lambda t: t.reshape(num_pages, PAGE, HEADS_KV, HEAD_DIM)
+    def paged(t):
+        return t.reshape(num_pages, PAGE, HEADS_KV, HEAD_DIM)
+
     # Dequantized-bf16 reference caches: isolates the kernel under test from
     # k/v quantization error (the fp8 path sees exactly these values).
     k_dq = _dequant(k_fp8, k_sf_tok)
@@ -131,6 +140,7 @@ def _check(out: torch.Tensor, ref: torch.Tensor):
 
 
 @pytest.mark.parametrize("window_left", [-1, 511])
+@requires_sm100
 def test_decode_mxfp8_matches_bf16(window_left: int):
     _require_blockscaled_fa4()
     from tokenspeed_kernel.ops.attention import mha_decode_with_kvcache
@@ -174,6 +184,7 @@ def test_decode_mxfp8_matches_bf16(window_left: int):
 
 
 @pytest.mark.parametrize("window_left", [-1, 511])
+@requires_sm100
 def test_extend_mxfp8_matches_bf16(window_left: int):
     _require_blockscaled_fa4()
     from tokenspeed_kernel.ops.attention import mha_extend_with_kvcache
