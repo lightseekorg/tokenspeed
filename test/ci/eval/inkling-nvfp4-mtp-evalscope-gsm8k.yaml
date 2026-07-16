@@ -12,7 +12,6 @@ env:
   TOKENSPEED_FLAT_KV: ON
 install:
   - bash test/ci_system/install_deps.sh
-  - pip install tokenspeed-scheduler==0.1.2 --force-reinstall
 server:
   command: >-
     ts serve
