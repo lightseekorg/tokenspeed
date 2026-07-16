@@ -323,20 +323,6 @@ def _smg_supports_inkling_parsers() -> bool:
     )
 
 
-def _inkling_chat_template_path() -> str | None:
-    """Packaged Inkling chat template (token-exact port of the reference
-    renderer; see runtime/chat_templates/inkling.jinja). The checkpoint ships
-    no tokenizer chat_template, so the gateway cannot serve /v1/chat without
-    one."""
-    path = (
-        Path(__file__).resolve().parent.parent
-        / "runtime"
-        / "chat_templates"
-        / "inkling.jinja"
-    )
-    return str(path) if path.is_file() else None
-
-
 def _args_with_default_model_parsers(
     engine_args: list[str], gateway_args: list[str]
 ) -> tuple[list[str], list[str]]:
@@ -371,11 +357,11 @@ def _args_with_default_model_parsers(
             gateway_result.extend(["--tool-call-parser", GLM_TOOL_CALL_PARSER])
 
     elif _is_inkling_model(model_id):
-        # The Inkling checkpoint declares no tokenizer chat_template; default
-        # to the packaged token-exact template so /v1/chat works out of the
-        # box. Newer SMG builds advertise Inkling reasoning and tool parsers;
-        # older pinned builds must keep their prior passthrough behavior rather
-        # than failing argparse validation on an unknown parser name.
+        # Use the checkpoint-provided Inkling template instead of maintaining
+        # a second protocol copy in TokenSpeed. Newer SMG builds advertise
+        # Inkling reasoning and tool parsers; older pinned builds must keep
+        # their prior passthrough behavior rather than failing argparse
+        # validation on an unknown parser name.
         needs_reasoning_default = (
             "--reasoning-parser" not in engine_result
             and "--reasoning-parser" not in gateway_result
@@ -403,11 +389,6 @@ def _args_with_default_model_parsers(
                     "defaults are disabled and the gateway will fall back to "
                     "passthrough. Explicit parser arguments are preserved."
                 )
-        if "--chat-template" not in gateway_result:
-            template = _inkling_chat_template_path()
-            if template is not None:
-                gateway_result.extend(["--chat-template", template])
-
         if current_platform().is_nvidia:
             # Inkling's NVIDIA rel-bias attention requires FA4; reject bad explicit backends before workers start.
             if "--attention-backend" in engine_result:
@@ -429,7 +410,7 @@ def _args_with_default_model_parsers(
 
 
 def _prewarm_hf_tokenizer(model_id: str) -> None:
-    """Download tokenizer artifacts to the HF cache before the gateway boots.
+    """Download tokenizer and chat-template assets before the gateway boots.
 
     smg fires its ``AddTokenizer`` job asynchronously after the engine
     reports SERVING. On fast runners (e.g. b300) the first eval request
@@ -451,6 +432,7 @@ def _prewarm_hf_tokenizer(model_id: str) -> None:
                 "special_tokens_map*",
                 "vocab*",
                 "merges*",
+                "chat_template*",
                 "*.json",
             ],
         )

@@ -126,8 +126,8 @@ class TestInklingMultimodalConfig(unittest.TestCase):
 
     def test_placeholder_token_ids(self):
         from tokenspeed.runtime.configs.inkling_config import (
-            INKLING_AUDIO_TOKEN_ID,
-            INKLING_CONTENT_IMAGE_TOKEN_ID,
+            INKLING_AUDIO_PLACEHOLDER_TOKEN_ID,
+            INKLING_IMAGE_PLACEHOLDER_TOKEN_ID,
             INKLING_MODEL_END_SAMPLING_TOKEN_ID,
             InklingMMConfig,
         )
@@ -142,13 +142,17 @@ class TestInklingMultimodalConfig(unittest.TestCase):
         # Explicit checkpoint EOS remains authoritative for tiny fixtures.
         self.assertEqual(cfg.eos_token_id, 1)
         self.assertEqual(cfg.text_config.eos_token_id, 1)
-        # The fixed TMLv0 IDs also give the text-only MTP draft safe,
-        # modality-specific embeddings for typed media positions.
+        # Checkpoint soft-placeholder IDs also give the text-only MTP draft
+        # safe, modality-specific embeddings for media feature positions.
         default = InklingMMConfig()
         self.assertEqual(
-            default.image_placeholder_token_id, INKLING_CONTENT_IMAGE_TOKEN_ID
+            default.image_placeholder_token_id,
+            INKLING_IMAGE_PLACEHOLDER_TOKEN_ID,
         )
-        self.assertEqual(default.audio_placeholder_token_id, INKLING_AUDIO_TOKEN_ID)
+        self.assertEqual(
+            default.audio_placeholder_token_id,
+            INKLING_AUDIO_PLACEHOLDER_TOKEN_ID,
+        )
         self.assertEqual(default.eos_token_id, INKLING_MODEL_END_SAMPLING_TOKEN_ID)
         self.assertEqual(
             default.text_config.eos_token_id,
@@ -158,8 +162,7 @@ class TestInklingMultimodalConfig(unittest.TestCase):
         self.assertIsNone(default.vision_config.decoder_dmodel)
         self.assertEqual(default.audio_config.dmel_min_value, -7.0)
         self.assertEqual(default.audio_config.audio_rms_norm_floor, 0.01)
-        # TokenSpeed input_ids are unsigned; the reference's negative
-        # sentinel ids must be rejected.
+        # Transport placeholder IDs must remain valid unsigned token IDs.
         with self.assertRaises(ValueError):
             InklingMMConfig(image_placeholder_token_id=-1)
 

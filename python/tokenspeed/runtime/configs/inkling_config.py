@@ -42,13 +42,16 @@ from typing import Any, Literal
 
 from transformers.configuration_utils import PretrainedConfig
 
-# Fixed TMLv0 special-token IDs used as the text-only MTP approximation for
-# typed media span positions. The target path replaces these positions with
-# actual encoder embeddings; the draft path restores these in-vocab IDs before
-# its embedding lookup.
+# TMLv0 marker/target IDs retained for compatibility.
 INKLING_CONTENT_IMAGE_TOKEN_ID = 200005
 INKLING_MODEL_END_SAMPLING_TOKEN_ID = 200006
 INKLING_AUDIO_TOKEN_ID = 200023
+
+# Checkpoint-provided soft-placeholder IDs. The target path overwrites these
+# positions with encoder embeddings; the MTP draft path restores the same
+# in-vocab IDs before its embedding lookup.
+INKLING_IMAGE_PLACEHOLDER_TOKEN_ID = 200054
+INKLING_AUDIO_PLACEHOLDER_TOKEN_ID = 200053
 
 
 class InklingConvStream(enum.IntEnum):
@@ -485,13 +488,13 @@ class InklingMMConfig(PretrainedConfig):
         audio_config: dict[str, Any] | InklingAudioConfig | None = None,
         vision_config: dict[str, Any] | InklingVisionConfig | None = None,
         mtp_config: dict[str, Any] | None = None,
-        image_placeholder_token_id: int | None = INKLING_CONTENT_IMAGE_TOKEN_ID,
-        audio_placeholder_token_id: int | None = INKLING_AUDIO_TOKEN_ID,
+        image_placeholder_token_id: int | None = INKLING_IMAGE_PLACEHOLDER_TOKEN_ID,
+        audio_placeholder_token_id: int | None = INKLING_AUDIO_PLACEHOLDER_TOKEN_ID,
         tie_word_embeddings: bool = False,
         eos_token_id: int | list[int] | None = None,
         **kwargs: Any,
     ) -> None:
-        # Gateway-expanded per media item; unsigned input_ids forbid the reference's negative sentinels.
+        # Gateway-expanded per media item; transport input_ids are unsigned.
         if image_placeholder_token_id is not None and image_placeholder_token_id < 0:
             raise ValueError("image_placeholder_token_id must be a non-negative id")
         if audio_placeholder_token_id is not None and audio_placeholder_token_id < 0:
