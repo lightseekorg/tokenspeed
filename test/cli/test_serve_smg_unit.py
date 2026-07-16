@@ -53,7 +53,6 @@ from tokenspeed.cli.serve_smg import (
     _gateway_args_with_default_reasoning_parser,
     _gateway_args_with_defaults,
     _gateway_args_with_smg_disable_defaults,
-    _inkling_chat_template_path,
     _is_deepseek_v4_model,
     _is_inkling_model,
     _prewarm_hf_tokenizer,
@@ -413,7 +412,7 @@ def test_remote_inkling_model_ids_get_defaults(mock_supports_inkling_parsers):
             gateway_args[gateway_args.index("--tool-call-parser") + 1]
             == INKLING_TOOL_CALL_PARSER
         )
-        assert "--chat-template" in gateway_args
+        assert "--chat-template" not in gateway_args
     assert mock_supports_inkling_parsers.call_count == 1
 
 
@@ -462,54 +461,9 @@ def test_inkling_parser_defaults_fall_back_for_older_smg(
     assert engine_args[engine_args.index("--attention-backend") + 1] == (
         INKLING_ATTENTION_BACKEND
     )
-    assert "--chat-template" in gateway_args
+    assert "--chat-template" not in gateway_args
     assert "automatic Inkling parser defaults are disabled" in caplog.text
     mock_supports_inkling_parsers.assert_called_once_with()
-
-
-def test_inkling_chat_template_is_packaged():
-    path = _inkling_chat_template_path()
-    assert path is not None
-    with open(path) as f:
-        template = f.read()
-    # framing markers the renderer requires
-    for marker in (
-        "<|message_user|>",
-        "<|content_text|>",
-        "<|end_message|>",
-        "<|message_model|>",
-        "add_generation_prompt",
-    ):
-        assert marker in template
-
-
-def _render_inkling_template_with_effort(reasoning_effort):
-    import jinja2
-
-    env = jinja2.Environment()
-
-    def raise_exception(message):
-        raise ValueError(message)
-
-    env.globals["raise_exception"] = raise_exception
-    path = _inkling_chat_template_path()
-    assert path is not None
-    with open(path, encoding="utf-8") as f:
-        template = env.from_string(f.read())
-    return template.render(
-        messages=[],
-        tools=[],
-        add_generation_prompt=False,
-        reasoning_effort=reasoning_effort,
-    )
-
-
-def test_inkling_reasoning_effort_accepts_none_and_numeric_string():
-    prefix = "<|message_system|><|content_text|>Thinking effort level: "
-    suffix = "<|end_message|>"
-
-    assert _render_inkling_template_with_effort("none") == prefix + "0" + suffix
-    assert _render_inkling_template_with_effort("0.75") == prefix + "0.75" + suffix
 
 
 @patch(
@@ -517,7 +471,7 @@ def test_inkling_reasoning_effort_accepts_none_and_numeric_string():
     new=lambda: SimpleNamespace(is_nvidia=True),
 )
 @patch("tokenspeed.cli.serve_smg._smg_supports_inkling_parsers", return_value=True)
-def test_inkling_model_gets_default_chat_template_and_parsers(
+def test_inkling_model_gets_default_parsers_without_overriding_checkpoint_template(
     mock_supports_inkling_parsers, tmp_path
 ):
     model = _make_inkling_model_dir(tmp_path)
@@ -536,8 +490,7 @@ def test_inkling_model_gets_default_chat_template_and_parsers(
         INKLING_ATTENTION_BACKEND,
     ]
     assert gateway_args[:2] == ["--model", model]
-    idx = gateway_args.index("--chat-template")
-    assert gateway_args[idx + 1] == _inkling_chat_template_path()
+    assert "--chat-template" not in gateway_args
     reasoning_idx = gateway_args.index("--reasoning-parser")
     assert gateway_args[reasoning_idx + 1] == INKLING_REASONING_PARSER
     tool_idx = gateway_args.index("--tool-call-parser")
@@ -653,6 +606,7 @@ def test_prewarm_fetches_tokenizer_artifacts_for_hf_id():
     # avoid pulling weight files (no `*.safetensors` etc.).
     patterns = set(kwargs["allow_patterns"])
     assert "tokenizer*" in patterns
+    assert "chat_template*" in patterns
     assert "*.json" in patterns
 
 
