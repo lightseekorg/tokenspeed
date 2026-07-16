@@ -8145,6 +8145,24 @@ def _maybe_route_owned_mxfp4_mfma_decode(
             return None
         if correction_bias is not None and (n_group != 0 or topk_group != 0):
             return None
+        # Scaling-semantics guard. For the grouped-one-group config
+        # (n_group == topk_group == 1) the generic path routes through
+        # ``default_grouped_route`` -> ``_grouped_topk_reference``, which does
+        # NOT apply ``routed_scaling_factor`` when weights are left unnormalized
+        # (scale_when_unnormalized=False). ``invoke_softmax_topk_route_gluon``
+        # always multiplies by ROUTED_SCALING_FACTOR, so those two disagree by
+        # exactly ``routed_scaling_factor`` for unnormalized weights. Defer that
+        # case to the generic path so results are unchanged. (The non-grouped
+        # n_group==topk_group==0 case uses default_scaled_route ->
+        # _softmax_topk_reference with scale_when_unnormalized=True, which
+        # matches the gluon kernel, so it is safe here.)
+        uses_grouped = _uses_grouped_routing(n_group, topk_group)
+        if (
+            uses_grouped
+            and not normalize_topk_weights
+            and float(routed_scaling_factor) != 1.0
+        ):
+            return None
         topk_ids, topk_weights = invoke_softmax_topk_route_gluon(
             router_logits,
             top_k,
@@ -8382,34 +8400,21 @@ def _maybe_gluon_package_mxfp4_prefill(
 
     q_inter, q_inter_scale = _quantize_mxfp4_activation(inter_flat)
 
-    # Stage 2 uses its own, smaller-block sort at small M. When tokens spread
-    # across many experts (e.g. top-8 over 384 experts at M<=512), a 128-row
-    # per-expert pad inflates the routed extent ~40x, so the down-projection
-    # GEMM burns almost all of its MFMA cycles on padding rows. A 32/64 sort
-    # block cuts that padding proportionally. Stage 1 keeps the 128 layout its
-    # kernel requires; stage 2 is free to use a different layout because it
-    # indexes ``inter_flat`` by ``(token, slot)``, not by stage-1 sorted slot.
-    stage2_block_m = 32 if n_tokens <= 512 else (64 if n_tokens <= 1024 else 128)
-    if stage2_block_m == sort_block_m:
-        s2_sorted_ids = sorted_ids
-        s2_sorted_weights = sorted_weights
-        s2_sorted_expert_ids = sorted_expert_ids
-        s2_num_valid_ids = num_valid_ids
-    else:
-        (
-            s2_sorted_ids,
-            s2_sorted_weights,
-            s2_sorted_expert_ids,
-            s2_num_valid_ids,
-            _,
-        ) = gluon_moe_sorting(
-            topk_ids,
-            topk_weights,
-            n_experts,
-            hidden_dim,
-            out_dtype,
-            stage2_block_m,
-        )
+    # Stage 2 down-projection block size. A smaller block reduces per-expert
+    # 128-row sort padding (top-8 over 384 experts), but on gfx950 the
+    # MFMA-utilization win of the 128-row tile dominates that padding cost.
+    # Sweep-tuned on the Kimi TP4 shard (E=384, D=7168, I=512, topk=8),
+    # BLOCK_M=128 is 10-17% faster than the old 32/64 tiers at M<=1024 and is
+    # fastest at every M; on the gpt-oss shape (E=128, topk=4) it is within ~1%
+    # of the old tiers (no regression). Forcing sort_block_m<128 at large M also
+    # overflows the routed buffers (illegal access), so a flat 128 is both
+    # faster and safer. It also matches ``sort_block_m``, so stage 2 reuses the
+    # stage-1 sort directly (no second moe_sorting pass).
+    stage2_block_m = 128
+    s2_sorted_ids = sorted_ids
+    s2_sorted_weights = sorted_weights
+    s2_sorted_expert_ids = sorted_expert_ids
+    s2_num_valid_ids = num_valid_ids
 
     stage2_scale = gather_package_cdna4_scale(
         q_inter_scale,
@@ -8555,7 +8560,7 @@ def gluon_mxfp_dynamic_mxfp4_fused_moe(
                     return decode_out
 
     else:
-        if int(n_tokens) <= _ROUTE_OWNED_DECODE_MAX_M:
+        if int(n_tokens) <= _DECODE_MAX_M:
             decode_out = _maybe_route_owned_mxfp4_mfma_decode(
                 hidden_states,
                 router_logits,
@@ -8573,11 +8578,11 @@ def gluon_mxfp_dynamic_mxfp4_fused_moe(
                 w13_bias=w13_bias,
                 w2_bias=w2_bias,
                 out_dtype=out_dtype,
-                max_m=_ROUTE_OWNED_DECODE_MAX_M,
+                max_m=_DECODE_MAX_M,
                 swiglu_alpha=swiglu_alpha,
                 swiglu_limit=swiglu_limit,
                 swiglu_beta=swiglu_beta,
-                allow_generic_fallback=False,
+                allow_generic_fallback=True,
             )
             if decode_out is not None:
                 return decode_out

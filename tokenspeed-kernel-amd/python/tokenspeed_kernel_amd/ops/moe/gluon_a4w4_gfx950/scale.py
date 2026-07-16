@@ -37,12 +37,18 @@ import torch
 import triton
 import triton.language as tl
 
-# MXFP4 microblock size and the CDNA4 scale-swizzle alignment. These are fixed
-# properties of the CDNA4 MXFP4 scale layout, kept local so the package is
-# self-contained.
-_MXFP4_BLOCK = 32
-_NON_K_PRESHUFFLE_BLOCK_SIZE = 32
-_ALIGN_K_SCALE_SWIZZLE = 8
+# MXFP4 microblock size and the CDNA4 scale-swizzle alignment are defined once in
+# mxfp4_cdna4_scale_layout, shared with the weight-scale (B) preshuffle in the
+# preprocessor. Local aliases preserve the names used throughout this module.
+from tokenspeed_kernel_amd.ops.moe.mxfp4_cdna4_scale_layout import (
+    CDNA4_SCALE_K_BLOCK as _ALIGN_K_SCALE_SWIZZLE,
+)
+from tokenspeed_kernel_amd.ops.moe.mxfp4_cdna4_scale_layout import (
+    CDNA4_SCALE_N_BLOCK as _NON_K_PRESHUFFLE_BLOCK_SIZE,
+)
+from tokenspeed_kernel_amd.ops.moe.mxfp4_cdna4_scale_layout import (
+    MXFP4_BLOCK as _MXFP4_BLOCK,
+)
 
 
 @triton.jit
