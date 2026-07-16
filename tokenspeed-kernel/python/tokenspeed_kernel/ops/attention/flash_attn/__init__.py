@@ -54,14 +54,12 @@ if platform.is_blackwell_plus:
         flash_attn_varlen_func,
     )
 
-if (
-    platform.is_nvidia
-    and platform.is_blackwell
-    and platform.arch_version == ArchVersion(10, 0)
-):
+if platform.is_nvidia and platform.is_blackwell:
     # FA4 on Blackwell supports prefill head_dim in [8, 256] divisible by 8,
     # but the 256-wide MHA path mishandles non-contiguous V split views, so we
     # restrict it to <256 for now until that is resolved.
+    # Relative-attention kernels support both SM100 and SM103. Keep the plain
+    # MHA registrations capped at SM100 so B300 retains its FlashInfer route.
     _FA4_BLACKWELL_PREFILL_HEAD_DIMS = frozenset(range(8, 256, 8))
     _FA4_BLACKWELL_DECODE_HEAD_DIMS = frozenset(range(8, 129, 8))
 
@@ -147,6 +145,7 @@ if (
         solution="fa4",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 0),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=format_signatures(
@@ -203,6 +202,7 @@ if (
         solution="fa4",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 0),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=format_signatures(
@@ -266,6 +266,7 @@ if (
         solution="fa4",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 0),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=format_signatures(
@@ -344,6 +345,7 @@ if (
             solution="fa4",
             capability=CapabilityRequirement(
                 min_arch_version=ArchVersion(10, 0),
+                max_arch_version=ArchVersion(10, 0),
                 vendors=frozenset({"nvidia"}),
             ),
             signatures=_MXFP8_ATTENTION_SIGNATURES,
@@ -409,6 +411,7 @@ if (
             solution="fa4",
             capability=CapabilityRequirement(
                 min_arch_version=ArchVersion(10, 0),
+                max_arch_version=ArchVersion(10, 0),
                 vendors=frozenset({"nvidia"}),
             ),
             signatures=_MXFP8_ATTENTION_SIGNATURES,
