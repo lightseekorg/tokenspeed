@@ -240,6 +240,7 @@ if (
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if softmax_scale is None:
             softmax_scale = 1.0 / math.sqrt(q.shape[-1])
+        window_size = (window_left, 0) if window_left >= 0 else (-1, -1)
         out, lse = flash_attn_varlen_func(
             q=q,
             k=k_cache,
@@ -251,7 +252,7 @@ if (
             max_seqlen_k=max_seqlen_k,
             softmax_scale=softmax_scale,
             causal=is_causal,
-            window_size=((window_left, 0) if window_left >= 0 else (None, None)),
+            window_size=window_size,
             return_lse=return_lse,
         )
         if return_lse:
@@ -298,9 +299,9 @@ if (
     ) -> torch.Tensor:
         if softmax_scale is None:
             softmax_scale = 1.0 / math.sqrt(q.shape[-1])
-        window_size = (window_left, 0) if window_left >= 0 else (None, None)
         batch_size = cache_seqlens.shape[0]
         q_reshaped = q.view(batch_size, max_seqlen_q, q.shape[1], q.shape[2])
+        window_size = (window_left, 0) if window_left >= 0 else (-1, -1)
         out, _ = flash_attn_varlen_func(
             q=q_reshaped,
             k=k_cache,
