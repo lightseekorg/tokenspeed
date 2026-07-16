@@ -27,6 +27,7 @@ import torch
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.configs.paged_cache_spec import (
     STATE_LAYER_TYPES,
+    PagedCacheGroupSpec,
     scheduler_ext_flat_kvcache,
 )
 from tokenspeed.runtime.layers.attention.configs.base import (

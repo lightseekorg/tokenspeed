@@ -1577,7 +1577,6 @@ class InklingForConditionalGeneration(nn.Module):
         # Towers are attention-free; the knob is just a VLM-wrapper interface requirement.
         del mm_attention_backend
         super().__init__()
-        from tokenspeed.runtime.utils.env import global_server_args_dict
 
         self.config = config
         self.mapping = mapping
