@@ -1,4 +1,5 @@
 import argparse
+import inspect
 import os
 import sys
 import unittest
@@ -3593,30 +3594,37 @@ class TestDeepseekV4Config(unittest.TestCase):
             max_context_len=1,
         )
 
-        with patch.object(
-            deepseek_v4_model,
-            "deepseek_v4_prepare_indexer_q_mxfp4",
-            side_effect=fake_prepare_mxfp4,
-        ), patch.object(
-            deepseek_v4_model,
-            "_deepseek_v4_deepgemm_fp4_indexer_available",
-            return_value=True,
-        ), patch.object(
-            deepseek_v4_model,
-            "_deepseek_v4_indexer_prefill_metadata",
-            return_value=empty_prefill_metadata,
-        ), patch.object(
-            deepseek_v4_model,
-            "_deepseek_v4_indexer_decode_plan",
-            return_value=decode_metadata,
-        ), patch.object(
-            deepseek_v4_model,
-            "_deepseek_v4_indexer_decode_schedule_metadata",
-            return_value=None,
-        ), patch.object(
-            deepseek_v4_model,
-            "_deepseek_v4_sparse_attn_indexer",
-            side_effect=fake_sparse_indexer,
+        with (
+            patch.object(
+                deepseek_v4_model,
+                "deepseek_v4_prepare_indexer_q_mxfp4",
+                side_effect=fake_prepare_mxfp4,
+            ),
+            patch.object(
+                deepseek_v4_model,
+                "_deepseek_v4_deepgemm_fp4_indexer_available",
+                return_value=True,
+            ),
+            patch.object(
+                deepseek_v4_model,
+                "_deepseek_v4_indexer_prefill_metadata",
+                return_value=empty_prefill_metadata,
+            ),
+            patch.object(
+                deepseek_v4_model,
+                "_deepseek_v4_indexer_decode_plan",
+                return_value=decode_metadata,
+            ),
+            patch.object(
+                deepseek_v4_model,
+                "_deepseek_v4_indexer_decode_schedule_metadata",
+                return_value=None,
+            ),
+            patch.object(
+                deepseek_v4_model,
+                "_deepseek_v4_sparse_attn_indexer",
+                side_effect=fake_sparse_indexer,
+            ),
         ):
             actual = DeepseekV4Indexer._forward_sparse_indexer_custom_op(
                 self_obj,
@@ -4011,7 +4019,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             mhc_post(hidden_states, residual, post, comb)
 
-    def test_mhc_post_uses_triton_for_unsupported_trtllm_shape(self):
+    def test_mhc_post_auto_falls_back_for_unsupported_trtllm_shape(self):
         if not torch.cuda.is_available():
             self.skipTest("CUDA is required for the fast mHC fallback")
 
@@ -4027,10 +4035,205 @@ class TestDeepseekV4Config(unittest.TestCase):
         post = torch.randn(tokens, hc_mult, 1, dtype=torch.float32, device=device)
         comb = torch.randn(tokens, hc_mult, hc_mult, dtype=torch.float32, device=device)
 
-        actual = deepseek_v4_mhc.mhc_post(hidden_states, residual, post, comb)
+        with deepseek_v4_mhc.envs.TOKENSPEED_V4_MHC_BACKEND.override("auto"):
+            actual = deepseek_v4_mhc.mhc_post(
+                hidden_states, residual, post, comb, allow_trtllm_auto=True
+            )
         expected = _mhc_post_reference(hidden_states, residual, post, comb)
 
         torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+    def test_mhc_backend_native_disables_trtllm(self):
+        with (
+            deepseek_v4_mhc.envs.TOKENSPEED_V4_MHC_BACKEND.override("native"),
+            patch.object(
+                deepseek_v4_mhc, "supports_trtllm_mhc", return_value=True
+            ) as supports,
+        ):
+            self.assertFalse(
+                deepseek_v4_mhc._use_trtllm_mhc(torch.device("cuda"), 4, 7168, True)
+            )
+        supports.assert_not_called()
+
+    def test_mhc_backend_auto_falls_back_when_shape_is_unsupported(self):
+        with (
+            deepseek_v4_mhc.envs.TOKENSPEED_V4_MHC_BACKEND.override("auto"),
+            patch.object(deepseek_v4_mhc, "supports_trtllm_mhc", return_value=False),
+        ):
+            self.assertFalse(
+                deepseek_v4_mhc._use_trtllm_mhc(torch.device("cuda"), 4, 7168, True)
+            )
+
+    def test_mhc_backend_startup_auto_does_not_require_trtllm(self):
+        with (
+            deepseek_v4_mhc.envs.TOKENSPEED_V4_MHC_BACKEND.override("auto"),
+            patch.object(
+                deepseek_v4_mhc, "supports_trtllm_mhc", return_value=False
+            ) as supports,
+        ):
+            deepseek_v4_mhc._validate_mhc_backend_config(torch.device("cpu"), 4, 7168)
+        supports.assert_not_called()
+
+    def test_mhc_backend_validation_runs_during_model_init(self):
+        config = SimpleNamespace(
+            hc_mult=4,
+            hc_eps=1e-6,
+            rms_norm_eps=1e-6,
+            index_topk=2,
+            vocab_size=128,
+            hidden_size=7168,
+            num_hidden_layers=0,
+        )
+        mapping = SimpleNamespace(
+            attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=None)
+        )
+        expected_device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if torch.cuda.is_available()
+            else torch.device("cpu")
+        )
+
+        with (
+            patch.object(deepseek_v4_model, "_validate_mhc_backend_config") as validate,
+            patch.object(
+                deepseek_v4_model,
+                "VocabParallelEmbedding",
+                return_value=torch.nn.Identity(),
+            ),
+            patch.object(
+                deepseek_v4_model, "RMSNorm", return_value=torch.nn.Identity()
+            ),
+        ):
+            deepseek_v4_model.DeepseekV4Model(config, mapping)
+
+        validate.assert_called_once_with(expected_device, 4, 7168)
+
+    def test_mhc_backend_trtllm_rejects_unavailable_shape(self):
+        with (
+            deepseek_v4_mhc.envs.TOKENSPEED_V4_MHC_BACKEND.override("trtllm"),
+            patch.object(deepseek_v4_mhc, "supports_trtllm_mhc", return_value=False),
+            self.assertRaisesRegex(RuntimeError, "TRT-LLM mHC was requested"),
+        ):
+            deepseek_v4_mhc._use_trtllm_mhc(torch.device("cuda"), 4, 7168, True)
+
+    def test_mhc_backend_startup_rejects_unavailable_forced_backend(self):
+        with (
+            deepseek_v4_mhc.envs.TOKENSPEED_V4_MHC_BACKEND.override("trtllm"),
+            patch.object(deepseek_v4_mhc, "supports_trtllm_mhc", return_value=False),
+            self.assertRaisesRegex(RuntimeError, "TRT-LLM mHC was requested"),
+        ):
+            deepseek_v4_mhc._validate_mhc_backend_config(torch.device("cpu"), 4, 7168)
+
+    def test_mhc_backend_auto_uses_trtllm_when_enabled(self):
+        with (
+            deepseek_v4_mhc.envs.TOKENSPEED_V4_MHC_BACKEND.override("auto"),
+            patch.object(deepseek_v4_mhc, "supports_trtllm_mhc", return_value=True),
+        ):
+            self.assertTrue(
+                deepseek_v4_mhc._use_trtllm_mhc(torch.device("cuda"), 4, 7168, True)
+            )
+
+    def test_mhc_backend_selection_logs_each_path_once(self):
+        selections = deepseek_v4_mhc._MHC_BACKEND_SELECTIONS_LOGGED
+        selections.clear()
+        self.addCleanup(selections.clear)
+
+        with (
+            deepseek_v4_mhc.envs.TOKENSPEED_V4_MHC_BACKEND.override("auto"),
+            patch.object(deepseek_v4_mhc, "supports_trtllm_mhc", return_value=True),
+            self.assertLogs(deepseek_v4_mhc.logger, level="INFO") as logs,
+        ):
+            for _ in range(2):
+                self.assertTrue(
+                    deepseek_v4_mhc._use_trtllm_mhc(torch.device("cuda"), 4, 7168, True)
+                )
+            self.assertFalse(
+                deepseek_v4_mhc._use_trtllm_mhc(torch.device("cuda"), 4, 7168)
+            )
+            self.assertTrue(
+                deepseek_v4_mhc._use_trtllm_mhc(torch.device("cuda"), 4, 4096, True)
+            )
+
+        self.assertEqual(
+            sum("selected=trtllm" in message for message in logs.output), 2
+        )
+        self.assertEqual(
+            sum("selected=native" in message for message in logs.output), 1
+        )
+        self.assertTrue(
+            any("supported=not-probed" in message for message in logs.output)
+        )
+        self.assertTrue(any("hidden_size=4096" in message for message in logs.output))
+        self.assertTrue(any("hidden_size=7168" in message for message in logs.output))
+
+    def test_mhc_backend_auto_fails_closed_when_flag_is_omitted(self):
+        with (
+            deepseek_v4_mhc.envs.TOKENSPEED_V4_MHC_BACKEND.override("auto"),
+            patch.object(
+                deepseek_v4_mhc, "supports_trtllm_mhc", return_value=True
+            ) as supports,
+        ):
+            self.assertFalse(
+                deepseek_v4_mhc._use_trtllm_mhc(torch.device("cuda"), 4, 7168)
+            )
+        supports.assert_not_called()
+
+    def test_mhc_wrapper_auto_flags_default_to_false(self):
+        functions = (
+            deepseek_v4_mhc.mhc_pre,
+            deepseek_v4_mhc.mhc_post,
+            deepseek_v4_mhc.mhc_fused_hc,
+            deepseek_v4_model.mhc_pre,
+            deepseek_v4_model.mhc_post,
+            deepseek_v4_model.mhc_fused_hc,
+        )
+        for function in functions:
+            with self.subTest(function=function.__qualname__):
+                parameter = inspect.signature(function).parameters["allow_trtllm_auto"]
+                self.assertIs(parameter.default, False)
+
+    def test_mhc_model_wrappers_forward_auto_flag(self):
+        cases = (
+            ("fast_mhc_pre", deepseek_v4_model.mhc_pre, (object(),) * 7),
+            ("fast_mhc_post", deepseek_v4_model.mhc_post, (object(),) * 4),
+            (
+                "fast_mhc_fused_hc",
+                deepseek_v4_model.mhc_fused_hc,
+                (object(),) * 11,
+            ),
+        )
+        for target, wrapper, args in cases:
+            with (
+                self.subTest(wrapper=wrapper.__qualname__),
+                patch.object(
+                    deepseek_v4_model, target, return_value=object()
+                ) as fast_mhc,
+            ):
+                wrapper(*args, allow_trtllm_auto=True)
+                self.assertTrue(fast_mhc.call_args.kwargs["allow_trtllm_auto"])
+
+    def test_mhc_backend_auto_is_decode_only(self):
+        for mode in (ForwardMode.DECODE, ForwardMode.IDLE):
+            with self.subTest(mode=mode):
+                self.assertTrue(
+                    deepseek_v4_model._use_trtllm_mhc_auto(
+                        SimpleNamespace(forward_mode=mode)
+                    )
+                )
+        for mode in (ForwardMode.EXTEND, ForwardMode.MIXED, None):
+            with self.subTest(mode=mode):
+                self.assertFalse(
+                    deepseek_v4_model._use_trtllm_mhc_auto(
+                        SimpleNamespace(forward_mode=mode)
+                    )
+                )
+
+    def test_mhc_backend_rejects_invalid_override(self):
+        with (
+            deepseek_v4_mhc.envs.TOKENSPEED_V4_MHC_BACKEND.override("unknown"),
+            self.assertRaisesRegex(ValueError, "TOKENSPEED_V4_MHC_BACKEND"),
+        ):
+            deepseek_v4_mhc._validate_mhc_backend_config(torch.device("cpu"), 4, 7168)
 
     def test_mhc_fused_workspace_separates_capture_and_eager_buffers(self):
         if not torch.cuda.is_available():
@@ -4241,7 +4444,8 @@ class TestDeepseekV4Config(unittest.TestCase):
                 sentinel_expected=sentinel_expected,
             )
 
-        small = capture_bucket(1)
+        with deepseek_v4_mhc.envs.TOKENSPEED_V4_MHC_BACKEND.override("trtllm"):
+            small = capture_bucket(1)
         small_pp = next(iter(workspace._captured.values()))
         small_ptrs = {
             tensor.data_ptr() for buffer_set in small_pp.bufs for tensor in buffer_set
@@ -4253,7 +4457,8 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
         del small_pp
 
-        large = capture_bucket(33, sentinel_specs)
+        with deepseek_v4_mhc.envs.TOKENSPEED_V4_MHC_BACKEND.override("trtllm"):
+            large = capture_bucket(33, sentinel_specs)
         self.assertEqual(len(workspace._retired_captured), 1)
         self.assertEqual(
             next(iter(workspace._captured.values())).bufs[0][0].shape[0], 64
@@ -4330,6 +4535,65 @@ class TestDeepseekV4Config(unittest.TestCase):
             empty_x, empty_residual, empty_post, empty_comb
         )
         self.assertEqual(tuple(empty_post_result.shape), (0, hc_mult, hidden_size))
+
+    def test_mhc_trtllm_zero_token_early_returns(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required for TRT-LLM mHC")
+
+        device = torch.device("cuda")
+        hc_mult, hidden_size = 4, 4096
+        if not supports_trtllm_mhc(device, hc_mult, hidden_size):
+            self.skipTest("TRT-LLM mHC requires a supported SM100 installation")
+
+        mix_hc = hc_mult * (2 + hc_mult)
+        empty_x = torch.empty(0, hidden_size, dtype=torch.bfloat16, device=device)
+        empty_residual = torch.empty(
+            0, hc_mult, hidden_size, dtype=torch.bfloat16, device=device
+        )
+        empty_post = torch.empty(0, hc_mult, 1, dtype=torch.float32, device=device)
+        empty_comb = torch.empty(
+            0, hc_mult, hc_mult, dtype=torch.float32, device=device
+        )
+        weight = torch.empty(
+            mix_hc, hc_mult * hidden_size, dtype=torch.float32, device=device
+        )
+        scale = torch.ones(3, dtype=torch.float32, device=device)
+        base = torch.zeros(mix_hc, dtype=torch.float32, device=device)
+        workspace = deepseek_v4_mhc.MhcFusedWorkspace()
+
+        with (
+            deepseek_v4_mhc.envs.TOKENSPEED_V4_MHC_BACKEND.override("trtllm"),
+            patch.object(deepseek_v4_mhc, "trtllm_mhc_fused_hc") as fused_kernel,
+            patch.object(deepseek_v4_mhc, "trtllm_mhc_big_fuse") as pre_kernel,
+            patch.object(deepseek_v4_mhc, "trtllm_mhc_post_mapping") as post_kernel,
+        ):
+            state = deepseek_v4_mhc.mhc_fused_hc(
+                empty_x,
+                empty_residual,
+                empty_post,
+                empty_comb,
+                weight,
+                scale,
+                base,
+                1e-6,
+                1e-6,
+                2,
+                workspace,
+            )
+            pre = deepseek_v4_mhc.mhc_pre(
+                empty_residual, weight, scale, base, 1e-6, 1e-6, 2
+            )
+            post = deepseek_v4_mhc.mhc_post(
+                empty_x, empty_residual, empty_post, empty_comb
+            )
+
+        fused_kernel.assert_not_called()
+        pre_kernel.assert_not_called()
+        post_kernel.assert_not_called()
+        self.assertEqual(tuple(state[0].shape), tuple(empty_residual.shape))
+        self.assertEqual(tuple(state[1].shape), tuple(empty_x.shape))
+        self.assertEqual(tuple(pre[0].shape), tuple(empty_x.shape))
+        self.assertEqual(tuple(post.shape), tuple(empty_residual.shape))
 
     def test_hc_head_matches_shape_contract(self):
         tokens, hc_mult, hidden = 2, 4, 6

@@ -51,6 +51,7 @@ from tokenspeed.runtime.models.deepseek_v4 import (
     DeepseekV4DecoderLayer,
     DeepseekV4MegaMoEExperts,
     _deepseek_v4_swa_slot_mapping,
+    _use_trtllm_mhc_auto,
     hc_head,
     mhc_post,
 )
@@ -190,7 +191,13 @@ class DeepseekV4MultiTokenPredictorLayer(nn.Module):
             input_ids,
             swa_slot_mapping,
         )
-        return mhc_post(x_def, residual, post_def, comb_def)
+        return mhc_post(
+            x_def,
+            residual,
+            post_def,
+            comb_def,
+            allow_trtllm_auto=_use_trtllm_mhc_auto(ctx),
+        )
 
     def compute_logits_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = hidden_states.view(-1, self.hc_mult, self.config.hidden_size)

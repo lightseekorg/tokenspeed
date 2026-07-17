@@ -108,6 +108,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
 )
 from tokenspeed.runtime.layers.deepseek_v4_mhc import (
     MhcFusedWorkspace,
+    _validate_mhc_backend_config,
 )
 from tokenspeed.runtime.layers.deepseek_v4_mhc import mhc_fused_hc as fast_mhc_fused_hc
 from tokenspeed.runtime.layers.deepseek_v4_mhc import mhc_post as fast_mhc_post
@@ -362,6 +363,12 @@ def _deepseek_v4_reorder_c4_ape_2604(ape: torch.Tensor) -> torch.Tensor:
     return torch.cat([older, newer], dim=0).reshape_as(ape)
 
 
+def _use_trtllm_mhc_auto(ctx: ForwardContext) -> bool:
+    """Use the TRT-LLM mHC backend only for decode-shaped V4 batches."""
+
+    return ctx.forward_mode is not None and ctx.forward_mode.is_decode_or_idle()
+
+
 def mhc_pre(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -370,6 +377,8 @@ def mhc_pre(
     rms_eps: float,
     hc_eps: float,
     sinkhorn_iters: int,
+    *,
+    allow_trtllm_auto: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return fast_mhc_pre(
         residual,
@@ -379,6 +388,7 @@ def mhc_pre(
         rms_eps,
         hc_eps,
         sinkhorn_iters,
+        allow_trtllm_auto=allow_trtllm_auto,
     )
 
 
@@ -387,8 +397,12 @@ def mhc_post(
     residual: torch.Tensor,
     post: torch.Tensor,
     comb: torch.Tensor,
+    *,
+    allow_trtllm_auto: bool = False,
 ) -> torch.Tensor:
-    return fast_mhc_post(hidden_states, residual, post, comb)
+    return fast_mhc_post(
+        hidden_states, residual, post, comb, allow_trtllm_auto=allow_trtllm_auto
+    )
 
 
 def mhc_fused_hc(
@@ -403,6 +417,8 @@ def mhc_fused_hc(
     hc_eps: float,
     sinkhorn_iters: int,
     workspace: MhcFusedWorkspace,
+    *,
+    allow_trtllm_auto: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return fast_mhc_fused_hc(
         x_prev,
@@ -416,6 +432,7 @@ def mhc_fused_hc(
         hc_eps,
         sinkhorn_iters,
         workspace,
+        allow_trtllm_auto=allow_trtllm_auto,
     )
 
 
@@ -3869,6 +3886,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         hc_post_prev: torch.Tensor | None = None,
         hc_comb_prev: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        allow_trtllm_auto = _use_trtllm_mhc_auto(ctx)
         if hc_x_prev is not None:
             with nvtx_range("hc_fused_attn_pre"):
                 residual, hidden_states, post, comb = mhc_fused_hc(
@@ -3883,6 +3901,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                     self.hc_eps,
                     self.hc_sinkhorn_iters,
                     self.mhc_workspace,
+                    allow_trtllm_auto=allow_trtllm_auto,
                 )
         else:
             residual = hidden_states
@@ -3895,6 +3914,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                     self.rms_norm_eps,
                     self.hc_eps,
                     self.hc_sinkhorn_iters,
+                    allow_trtllm_auto=allow_trtllm_auto,
                 )
         with nvtx_range("attn_norm"):
             hidden_states = self.attn_norm(hidden_states)
@@ -3922,6 +3942,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_eps,
                 self.hc_sinkhorn_iters,
                 self.mhc_workspace,
+                allow_trtllm_auto=allow_trtllm_auto,
             )
         with nvtx_range("ffn_norm"):
             hidden_states = self.ffn_norm(hidden_states)
@@ -3977,6 +3998,12 @@ class DeepseekV4Model(nn.Module):
         self.hc_mult = config.hc_mult
         self.hc_eps = config.hc_eps
         self.rms_norm_eps = config.rms_norm_eps
+        mhc_device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if torch.cuda.is_available()
+            else torch.device("cpu")
+        )
+        _validate_mhc_backend_config(mhc_device, self.hc_mult, config.hidden_size)
         self.aux_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
         self.topk_indices_buffer = _DeepseekV4TopKBuffer(int(config.index_topk))
         self.mhc_workspace = MhcFusedWorkspace()
@@ -4061,7 +4088,11 @@ class DeepseekV4Model(nn.Module):
             )
         with nvtx_range("hc_ffn_post_final"):
             hidden_states = mhc_post(
-                hc_x_prev, hidden_states, hc_post_prev, hc_comb_prev
+                hc_x_prev,
+                hidden_states,
+                hc_post_prev,
+                hc_comb_prev,
+                allow_trtllm_auto=_use_trtllm_mhc_auto(ctx),
             )
         aux_hidden_states = None
         if (

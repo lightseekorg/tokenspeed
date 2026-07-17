@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import logging
 from functools import cache
 
 import torch
@@ -19,6 +20,84 @@ from tokenspeed_kernel.ops.mhc import (
 )
 
 from tokenspeed.runtime.utils import ceil_div
+from tokenspeed.runtime.utils.env import envs
+
+_MHC_BACKEND_ENV = "TOKENSPEED_V4_MHC_BACKEND"
+_MHC_BACKEND_SELECTIONS_LOGGED: set[tuple[str, bool, bool, torch.device, int, int]] = (
+    set()
+)
+logger = logging.getLogger(__name__)
+
+
+def _mhc_backend() -> str:
+    backend = envs.TOKENSPEED_V4_MHC_BACKEND.get().strip().lower()
+    if backend not in {"auto", "native", "trtllm"}:
+        raise ValueError(
+            f"{_MHC_BACKEND_ENV}={backend!r} must be one of " "'auto'|'native'|'trtllm'"
+        )
+    return backend
+
+
+def _validate_mhc_backend_config(
+    device: torch.device,
+    hc_mult: int,
+    hidden_size: int,
+) -> None:
+    """Validate static mHC backend configuration before model construction."""
+
+    backend = _mhc_backend()
+    if backend == "trtllm" and not supports_trtllm_mhc(device, hc_mult, hidden_size):
+        raise RuntimeError(
+            "TRT-LLM mHC was requested but is unavailable for "
+            f"device={device}, hc_mult={hc_mult}, hidden_size={hidden_size}"
+        )
+
+
+def _use_trtllm_mhc(
+    device: torch.device,
+    hc_mult: int,
+    hidden_size: int,
+    allow_trtllm_auto: bool = False,
+) -> bool:
+    """Resolve the experimental V4 mHC backend for one supported tensor shape."""
+
+    backend = _mhc_backend()
+    supported: bool | None = None
+    if backend == "native":
+        selected = False
+    elif backend == "auto" and not allow_trtllm_auto:
+        selected = False
+    else:
+        supported = supports_trtllm_mhc(device, hc_mult, hidden_size)
+        if backend == "trtllm" and not supported:
+            raise RuntimeError(
+                "TRT-LLM mHC was requested but is unavailable for "
+                f"device={device}, hc_mult={hc_mult}, hidden_size={hidden_size}"
+            )
+        selected = supported
+
+    selection = (
+        backend,
+        allow_trtllm_auto,
+        selected,
+        device,
+        hc_mult,
+        hidden_size,
+    )
+    if selection not in _MHC_BACKEND_SELECTIONS_LOGGED:
+        _MHC_BACKEND_SELECTIONS_LOGGED.add(selection)
+        logger.info(
+            "V4 mHC backend selection: requested=%s selected=%s "
+            "allow_trtllm_auto=%s supported=%s device=%s hc_mult=%d hidden_size=%d",
+            backend,
+            "trtllm" if selected else "native",
+            allow_trtllm_auto,
+            supported if supported is not None else "not-probed",
+            device,
+            hc_mult,
+            hidden_size,
+        )
+    return selected
 
 
 @cache
@@ -425,6 +504,8 @@ def mhc_fused_hc(
     hc_eps: float,
     sinkhorn_iters: int,
     workspace: MhcFusedWorkspace,
+    *,
+    allow_trtllm_auto: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused post_mapping(prev) + pre_mapping(curr).
 
@@ -440,6 +521,7 @@ def mhc_fused_hc(
         hc_eps: Hyper-connection normalization epsilon.
         sinkhorn_iters: Number of Sinkhorn normalization iterations.
         workspace: Model-owned serial fused-mHC workspace.
+        allow_trtllm_auto: Allow the experimental backend when mode is `auto`.
 
     Returns:
         ``(residual_cur, layer_input, post_cur, comb_cur)``. The TRT-LLM path
@@ -458,7 +540,7 @@ def mhc_fused_hc(
         or comb_prev.dtype != torch.float32
     ):
         raise RuntimeError("fast mHC requires bf16 states and fp32 weights/mixes")
-    if supports_trtllm_mhc(residual_prev.device, hc_mult, hidden_size):
+    if _use_trtllm_mhc(residual_prev.device, hc_mult, hidden_size, allow_trtllm_auto):
         return _trtllm_mhc_fused_hc(
             x_prev,
             residual_prev,
@@ -472,7 +554,13 @@ def mhc_fused_hc(
             sinkhorn_iters,
             workspace,
         )
-    residual_cur = mhc_post(x_prev, residual_prev, post_prev, comb_prev)
+    residual_cur = mhc_post(
+        x_prev,
+        residual_prev,
+        post_prev,
+        comb_prev,
+        allow_trtllm_auto=allow_trtllm_auto,
+    )
     layer_input, post_cur, comb_cur = mhc_pre(
         residual_cur,
         fn,
@@ -481,6 +569,7 @@ def mhc_fused_hc(
         rms_eps,
         hc_eps,
         sinkhorn_iters,
+        allow_trtllm_auto=allow_trtllm_auto,
     )
     return residual_cur, layer_input, post_cur, comb_cur
 
@@ -676,6 +765,8 @@ def mhc_pre(
     rms_eps: float,
     hc_eps: float,
     sinkhorn_iters: int,
+    *,
+    allow_trtllm_auto: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     hc_mult = residual.shape[-2]
     hidden_size = residual.shape[-1]
@@ -686,7 +777,7 @@ def mhc_pre(
         or hc_base.dtype != torch.float32
     ):
         raise RuntimeError("fast mHC requires bf16 residual and fp32 weights")
-    if supports_trtllm_mhc(residual.device, hc_mult, hidden_size):
+    if _use_trtllm_mhc(residual.device, hc_mult, hidden_size, allow_trtllm_auto):
         return _trtllm_mhc_pre(
             residual, fn, hc_scale, hc_base, rms_eps, hc_eps, sinkhorn_iters
         )
@@ -797,6 +888,8 @@ def mhc_post(
     residual: torch.Tensor,
     post: torch.Tensor,
     comb: torch.Tensor,
+    *,
+    allow_trtllm_auto: bool = False,
 ) -> torch.Tensor:
     hc_mult = residual.shape[-2]
     hidden_size = residual.shape[-1]
@@ -807,7 +900,7 @@ def mhc_post(
         or comb.dtype != torch.float32
     ):
         raise RuntimeError("fast mHC requires bf16 states and fp32 mixes")
-    if supports_trtllm_mhc(residual.device, hc_mult, hidden_size):
+    if _use_trtllm_mhc(residual.device, hc_mult, hidden_size, allow_trtllm_auto):
         return _trtllm_mhc_post(hidden_states, residual, post, comb)
     if not hidden_states.is_cuda:
         raise RuntimeError("fast mHC requires CUDA tensors")

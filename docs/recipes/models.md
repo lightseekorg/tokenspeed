@@ -203,6 +203,19 @@ speculative decoding and paged-cache groups are both active — and prefix cachi
 stays on by default. Add `--enable-metrics` to read `Decoded Tok/Iter` and the
 speculative accept rate from the run summary.
 
+The TRT-LLM mHC backend is experimental and disabled by default. Set
+`TOKENSPEED_V4_MHC_BACKEND=auto` to use it for decode and idle batches,
+including CUDA graph capture, while retaining the original DeepGEMM and Triton
+path for target-model eager extend and mixed batches. MTP drafter follow-up
+steps are intentionally represented as `DECODE` after the first catch-up step,
+even when that first step originated from an extend batch, so those draft
+substeps can select TRT-LLM mHC in `auto` mode. Set the value to `trtllm` to
+require the TRT-LLM path for every supported batch and fail fast during model
+construction when the package, device, or tensor shape is unsupported. Set it
+to `native`, the default, to retain the
+original path. The selective `auto` policy still requires larger repeated
+benchmarks before it should become the default.
+
 ## Tuning Order
 
 1. Set model ID, trust policy, tokenizer mode, and served model name.
