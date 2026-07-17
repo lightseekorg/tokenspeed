@@ -284,10 +284,13 @@ if platform.is_nvidia:
         )
 
         if routed:
-            # Weights apply verbatim at finalize (pre-fold route_scale); deferred never reads them.
+            # FlashInfer's UnpackedPrecomputed mode requires bf16 route weights
+            # regardless of whether it finalizes the expert outputs. Deferred
+            # callers retain their original fp32 weights for the later fused
+            # finalize step.
             topk = (
                 topk_ids.to(torch.int32),
-                topk_weights.to(torch.bfloat16) if do_finalize else topk_weights,
+                topk_weights.to(torch.bfloat16),
             )
             result = trtllm_fp4_block_scale_routed_moe(
                 topk_ids=topk,

@@ -90,3 +90,31 @@ def test_locs_multiquery(n):
         ref = (pages * p + (pos % p).to(torch.int32)).reshape(-1).to(torch.int32)
         assert torch.equal(out[i, : bs * n], ref), i
         assert (out[i, bs * n :] == -7).all(), i
+
+
+@pytest.mark.parametrize("n", [1, 4])
+def test_locs_negative_page_routes_to_dummy(n):
+    """A -1 table entry (column-tail pad / hole) must yield a slot in dummy
+    page 0, never a negative loc: a stale seq_lens can point the gather past
+    the bridge row's filled width (the 2026-07 DFLASH draft KV-scatter IMA)."""
+    dev = "cuda"
+    g_att, max_bs, wmax, bs = 2, 8, 16, 3
+    stack = torch.full((g_att, max_bs, wmax), -1, dtype=torch.int32, device=dev)
+    stack[:, :, :2] = 5  # only the first 2 columns are real pages
+    ps = torch.tensor([256, 128], dtype=torch.int32, device=dev)
+    # request 1's length reaches column 4 -> gathers the -1 tail pad
+    seq = torch.tensor([100, 1100, 30], dtype=torch.int32, device=dev)
+    out = torch.full((g_att, max_bs * n), -7, dtype=torch.int32, device=dev)
+    flat_decode_locs(stack, ps, seq, out, bs, tokens_per_req=n)
+    live = out[:, : bs * n]
+    assert (live >= 0).all(), live
+    for i in range(g_att):
+        p = int(ps[i])
+        pos = (
+            seq.to(torch.int64).unsqueeze(1) - n + torch.arange(n, device=dev)
+        ).clamp_min(0)
+        hit_pad = stack[i, :bs].gather(1, pos // p) < 0
+        # pad hits land inside dummy page 0 at the position's in-page offset
+        expect = (pos % p).to(torch.int32)
+        got = out[i, : bs * n].view(bs, n)
+        assert torch.equal(got[hit_pad], expect[hit_pad]), i

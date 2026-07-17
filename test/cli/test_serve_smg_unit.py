@@ -27,7 +27,7 @@ import json
 import os
 import signal
 import sys
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -57,7 +57,6 @@ from tokenspeed.cli.serve_smg import (
     _is_inkling_model,
     _prewarm_hf_tokenizer,
     _set_default_grpc_max_message_bytes,
-    _smg_supports_inkling_parsers,
     _user_host_port_from_gateway_args,
     _user_model_id,
     run_smg,
@@ -391,8 +390,7 @@ def test_local_inkling_config_is_detected(tmp_path):
     "tokenspeed.cli.serve_smg.current_platform",
     new=lambda: SimpleNamespace(is_nvidia=True),
 )
-@patch("tokenspeed.cli.serve_smg._smg_supports_inkling_parsers", return_value=True)
-def test_remote_inkling_model_ids_get_defaults(mock_supports_inkling_parsers):
+def test_remote_inkling_model_ids_get_defaults():
     for model in ("org/Inkling-Chat",):
         engine_args, gateway_args = _args_with_default_model_parsers(
             ["--model", model],
@@ -413,66 +411,14 @@ def test_remote_inkling_model_ids_get_defaults(mock_supports_inkling_parsers):
             == INKLING_TOOL_CALL_PARSER
         )
         assert "--chat-template" not in gateway_args
-    assert mock_supports_inkling_parsers.call_count == 1
-
-
-@pytest.mark.parametrize(
-    ("reasoning_parsers", "tool_call_parsers", "expected"),
-    [
-        (["inkling"], ["inkling"], True),
-        (["inkling"], [], False),
-        ([], ["inkling"], False),
-        ([], [], False),
-    ],
-)
-def test_smg_inkling_parser_capability_requires_complete_pair(
-    monkeypatch, reasoning_parsers, tool_call_parsers, expected
-):
-    smg_module = ModuleType("smg")
-    smg_rs_module = ModuleType("smg.smg_rs")
-    smg_rs_module.get_available_reasoning_parsers = lambda: reasoning_parsers
-    smg_rs_module.get_available_tool_call_parsers = lambda: tool_call_parsers
-    smg_module.smg_rs = smg_rs_module
-    monkeypatch.setitem(sys.modules, "smg", smg_module)
-    monkeypatch.setitem(sys.modules, "smg.smg_rs", smg_rs_module)
-
-    assert _smg_supports_inkling_parsers() is expected
 
 
 @patch(
     "tokenspeed.cli.serve_smg.current_platform",
     new=lambda: SimpleNamespace(is_nvidia=True),
 )
-@patch("tokenspeed.cli.serve_smg._smg_supports_inkling_parsers", return_value=False)
-def test_inkling_parser_defaults_fall_back_for_older_smg(
-    mock_supports_inkling_parsers, tmp_path, caplog
-):
-    model = _make_inkling_model_dir(tmp_path)
-
-    engine_args, gateway_args = _args_with_default_model_parsers(
-        ["--model", model],
-        ["--model", model],
-    )
-    gateway_args = _gateway_args_with_defaults(gateway_args)
-
-    assert "--reasoning-parser" not in engine_args
-    assert gateway_args[gateway_args.index("--reasoning-parser") + 1] == "passthrough"
-    assert "--tool-call-parser" not in gateway_args
-    assert engine_args[engine_args.index("--attention-backend") + 1] == (
-        INKLING_ATTENTION_BACKEND
-    )
-    assert "--chat-template" not in gateway_args
-    assert "automatic Inkling parser defaults are disabled" in caplog.text
-    mock_supports_inkling_parsers.assert_called_once_with()
-
-
-@patch(
-    "tokenspeed.cli.serve_smg.current_platform",
-    new=lambda: SimpleNamespace(is_nvidia=True),
-)
-@patch("tokenspeed.cli.serve_smg._smg_supports_inkling_parsers", return_value=True)
 def test_inkling_model_gets_default_parsers_without_overriding_checkpoint_template(
-    mock_supports_inkling_parsers, tmp_path
+    tmp_path,
 ):
     model = _make_inkling_model_dir(tmp_path)
 
@@ -495,7 +441,6 @@ def test_inkling_model_gets_default_parsers_without_overriding_checkpoint_templa
     assert gateway_args[reasoning_idx + 1] == INKLING_REASONING_PARSER
     tool_idx = gateway_args.index("--tool-call-parser")
     assert gateway_args[tool_idx + 1] == INKLING_TOOL_CALL_PARSER
-    mock_supports_inkling_parsers.assert_called_once_with()
 
 
 @patch(
@@ -505,31 +450,27 @@ def test_inkling_model_gets_default_parsers_without_overriding_checkpoint_templa
 def test_inkling_defaults_preserve_explicit_user_values(tmp_path):
     model = _make_inkling_model_dir(tmp_path)
 
-    with patch(
-        "tokenspeed.cli.serve_smg._smg_supports_inkling_parsers"
-    ) as mock_supports_inkling_parsers:
-        engine_args, gateway_args = _args_with_default_model_parsers(
-            [
-                "--model",
-                model,
-                "--reasoning-parser",
-                "custom_reasoning",
-                "--attention-backend",
-                INKLING_ATTENTION_BACKEND,
-                "--enable-prefix-caching",
-            ],
-            [
-                "--model",
-                model,
-                "--reasoning-parser",
-                "custom_reasoning",
-                "--tool-call-parser",
-                "custom_tools",
-                "--chat-template",
-                "/tmp/custom.jinja",
-            ],
-        )
-    mock_supports_inkling_parsers.assert_not_called()
+    engine_args, gateway_args = _args_with_default_model_parsers(
+        [
+            "--model",
+            model,
+            "--reasoning-parser",
+            "custom_reasoning",
+            "--attention-backend",
+            INKLING_ATTENTION_BACKEND,
+            "--enable-prefix-caching",
+        ],
+        [
+            "--model",
+            model,
+            "--reasoning-parser",
+            "custom_reasoning",
+            "--tool-call-parser",
+            "custom_tools",
+            "--chat-template",
+            "/tmp/custom.jinja",
+        ],
+    )
 
     assert engine_args == [
         "--model",
@@ -566,10 +507,7 @@ def test_inkling_rejects_incompatible_attention_backend(tmp_path):
         )
 
 
-@patch("tokenspeed.cli.serve_smg._smg_supports_inkling_parsers", return_value=True)
-def test_inkling_preserves_enabled_prefix_caching(
-    mock_supports_inkling_parsers, tmp_path
-):
+def test_inkling_preserves_enabled_prefix_caching(tmp_path):
     model = _make_inkling_model_dir(tmp_path)
 
     engine_args, _ = _args_with_default_model_parsers(
@@ -579,7 +517,6 @@ def test_inkling_preserves_enabled_prefix_caching(
 
     assert "--enable-prefix-caching" in engine_args
     assert "--no-enable-prefix-caching" not in engine_args
-    mock_supports_inkling_parsers.assert_called_once_with()
 
 
 def test_prewarm_skips_local_path(tmp_path):
