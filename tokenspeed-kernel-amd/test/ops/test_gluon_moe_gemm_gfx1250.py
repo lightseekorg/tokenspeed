@@ -303,13 +303,7 @@ def test_gluon_fp8_mxfp4_dispatch_and_combine_match_torch_gfx1250() -> None:
         swiglu_alpha=SWIGLU_ALPHA,
         swiglu_limit=SWIGLU_LIMIT,
         swiglu_beta=SWIGLU_BETA,
-        scale_preshuffle=True,
-        block_m=128,
-        block_n=128,
-        block_k=256,
-        num_buffers=2,
-        schedule="baseline",
-        num_warps=4,
+        scale_load_mode="swizzle",
     )
     intermediate_fp8 = dispatch.to(torch.float8_e4m3fn)
     flat = gluon_moe.gluon_mxfp_combine(
@@ -321,13 +315,7 @@ def test_gluon_fp8_mxfp4_dispatch_and_combine_match_torch_gfx1250() -> None:
         a_ragged_metadata=ragged,
         scatter_indx=scatter_indx,
         out_dtype=torch.bfloat16,
-        scale_preshuffle=True,
-        block_m=128,
-        block_n=128,
-        block_k=256,
-        num_buffers=2,
-        schedule="baseline",
-        num_warps=4,
+        scale_load_mode="swizzle",
     )
     actual = (
         (flat.float() * topk_weights.reshape(-1, 1))
@@ -342,8 +330,6 @@ def test_gluon_fp8_mxfp4_dispatch_and_combine_match_torch_gfx1250() -> None:
         module.w2_weight_triton_tensor,
         w13_mx_scale=module.w13_precision_config.b_mx_scale,
         w2_mx_scale=module.w2_precision_config.b_mx_scale,
-        w13_act_scale=module.w13_act_scale,
-        w2_act_scale=module.w2_act_scale,
         w13_bias=module.w13_weight_bias,
         w2_bias=module.w2_weight_bias,
         out_dtype=torch.bfloat16,

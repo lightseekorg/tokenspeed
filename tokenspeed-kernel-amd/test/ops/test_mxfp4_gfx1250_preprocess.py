@@ -154,6 +154,8 @@ def test_preprocess_gluon_mxfp4_gfx1250_mutates_module_state(monkeypatch):
     assert module.w2_weight_bias.dtype == torch.float32
     assert module.w13_act_scale.item() == pytest.approx(0.75)
     assert module.w2_act_scale.item() == pytest.approx(0.625)
+    assert module.w13_weight_triton_tensor.act_scale is module.w13_act_scale
+    assert module.w2_weight_triton_tensor.act_scale is module.w2_act_scale
 
     assert module.w13_weight_triton_tensor.shape == (2, 80, 256)
     assert module.w2_weight_triton_tensor.shape == (2, 64, 160)
@@ -164,8 +166,6 @@ def test_preprocess_gluon_mxfp4_gfx1250_mutates_module_state(monkeypatch):
     w2_config = module.w2_precision_config
     assert isinstance(w13_config, mxfp4_preprocess.PrecisionConfig)
     assert isinstance(w2_config, mxfp4_preprocess.PrecisionConfig)
-    assert w13_config.flex_ctx.lhs_data.dtype == torch.float8_e4m3fn
-    assert w2_config.flex_ctx.lhs_data.dtype == torch.float8_e4m3fn
     assert w13_config.b_microblock_size == 32
     assert w2_config.b_microblock_size == 32
     assert w13_config.out_dtype == torch.bfloat16
@@ -196,7 +196,7 @@ def test_preprocess_gluon_mxfp4_gfx1250_skips_static_scales_for_dynamic_activati
 
     assert not hasattr(module, "w13_act_scale")
     assert not hasattr(module, "w2_act_scale")
-    assert module.w13_precision_config.flex_ctx.lhs_data.dtype is None
-    assert module.w13_precision_config.flex_ctx.lhs_data.scale is None
-    assert module.w2_precision_config.flex_ctx.lhs_data.dtype is None
-    assert module.w2_precision_config.flex_ctx.lhs_data.scale is None
+    assert module.w13_weight_triton_tensor.act_scale is None
+    assert module.w2_weight_triton_tensor.act_scale is None
+    assert module.w13_precision_config.b_mx_scale is not None
+    assert module.w2_precision_config.b_mx_scale is not None

@@ -136,8 +136,6 @@ if platform.is_amd:
             ),
             w13_mx_scale=w13_pc.b_mx_scale,
             w2_mx_scale=w2_pc.b_mx_scale,
-            w13_act_scale=getattr(w, "w13_act_scale", None),
-            w2_act_scale=getattr(w, "w2_act_scale", None),
             out_dtype=w2_pc.out_dtype or torch.bfloat16,
             swiglu_alpha=swiglu_alpha,
             swiglu_limit=swiglu_limit,

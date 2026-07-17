@@ -1,9 +1,30 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+
 from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Optional
 
 import torch
 from tokenspeed_kernel_amd._triton import (
@@ -25,48 +46,18 @@ from tokenspeed_kernel_amd.ops.moe.utils import (
     RaggedTensorMetadata,
     Storage,
     Tensor,
-    make_ragged_tensor_metadata,
     swiglu_fn,
-    topk,
     wrap_torch_tensor,
 )
-
-
-@dataclass(frozen=True)
-class InFlexData:
-    dtype: torch.dtype | None = None
-    scale: torch.Tensor | None = None
-
-    def reinterpret(self, data: torch.Tensor) -> torch.Tensor:
-        if self.dtype is None or data.dtype == self.dtype:
-            return data
-        return data.view(self.dtype)
-
-
-@dataclass(frozen=True)
-class OutFlexData(InFlexData):
-    pass
-
-
-@dataclass(frozen=True)
-class FlexCtx:
-    lhs_data: Any | None = None
-    rhs_data: Any | None = None
-    out_data: Any | None = None
 
 
 @dataclass
 class PrecisionConfig:
     """Minimal precision config accepted by the gfx1250 MoE wrapper."""
 
-    flex_ctx: FlexCtx | None = field(default_factory=FlexCtx)
-    acc_scale: float = 1.0
     a_mx_scale: torch.Tensor | Tensor | None = None
     b_mx_scale: torch.Tensor | Tensor | None = None
-    c_mx_scale: torch.Tensor | Tensor | None = None
-    c_value_pack_factor: int = 1
     out_dtype: torch.dtype | None = None
-    intermediate_out_dtype: torch.dtype | None = None
 
 
 @dataclass
@@ -2045,13 +2036,11 @@ def should_upcast_indices(*args: Any) -> bool:
     return any(_can_overflow_int32(arg) for arg in args if arg is not None)
 
 
-def _canonicalize_storage(storage: Storage, out_ndim: int, flex_data: Any | None):
+def _canonicalize_storage(storage: Storage, out_ndim: int):
     assert out_ndim >= storage.data.ndim
     new_shape = [1] * (out_ndim - storage.data.ndim) + list(storage.data.shape)
     new_stride = [0] * (out_ndim - storage.data.ndim) + list(storage.data.stride())
     data = storage.data.as_strided(new_shape, new_stride)
-    if flex_data is not None and hasattr(flex_data, "reinterpret"):
-        data = flex_data.reinterpret(data)
     return Storage(data, storage.layout)
 
 
@@ -2141,12 +2130,11 @@ def matmul(
     block_k: int = 256,
     group_m: int = 8,
     xcd_swizzle: int = 1,
+    w_transpose: bool = True,
     scale_preshuffle: bool | None = None,
     schedule: str = "baseline",
     pingpong: bool = False,
     num_warps: int = 4,
-    benchmark_mode: str | None = None,
-    benchmark_num_iters: int = 32,
 ):
     """Run the gfx1250 Gluon MoE matmul kernel.
 
@@ -2181,7 +2169,6 @@ def matmul(
 
     if precision_config is None:
         precision_config = PrecisionConfig()
-    flex = precision_config.flex_ctx or FlexCtx()
     fused_activation = fused_activation or FusedActivation(FnSpecs.default(), tuple())
     do_swiglu, swiglu_alpha, swiglu_limit, swiglu_beta, activation_reduction_n = (
         _activation_config(fused_activation)
@@ -2272,9 +2259,9 @@ def matmul(
         a_ragged_metadata.n_slices if ragged_dimension == "M" else batch_size
     )
 
-    a_storage = _canonicalize_storage(a.storage, 3, getattr(flex, "lhs_data", None))
-    b_storage = _canonicalize_storage(b.storage, 3, getattr(flex, "rhs_data", None))
-    c_storage = _canonicalize_storage(c.storage, 3, getattr(flex, "out_data", None))
+    a_storage = _canonicalize_storage(a.storage, 3)
+    b_storage = _canonicalize_storage(b.storage, 3)
+    c_storage = _canonicalize_storage(c.storage, 3)
 
     a_strides = [0] * (3 - a_storage.data.ndim) + list(a_storage.data.stride())
     a_scale_strides = a_scale.stride() if a_scale is not None else (None, None, None)
@@ -2284,72 +2271,55 @@ def matmul(
     bias_stride = None if bias is None else bias.stride(0)
 
     swizzle_mx_scale = None if b_scale is None else b_scale.storage.layout.name
-    w_transpose = True
 
-    def _launch():
-        return _matmul[(grid,)](
-            c_storage.data,
-            *out_matmul.stride(),
-            a_storage.data,
-            *a_strides,
-            a_scale,
-            *a_scale_strides,
-            b_storage.data,
-            *b_storage.data.stride(),
-            w_transpose,
-            b_scale,
-            *b_scale_strides,
-            bias,
-            bias_stride,
-            M,
-            N,
-            K,
-            K_W,
-            gather_indx,
-            scatter_indx,
-            None if scatter_indx is None else scatter_indx.shape[0],
-            ragged_dimension,
-            *expt_data_x,
-            *expt_data_w,
-            batch_size,
-            grid_m,
-            grid_n,
-            do_swiglu,
-            swiglu_alpha,
-            swiglu_limit,
-            swiglu_beta,
-            activation_reduction_n,
-            n_valid_slices,
-            opt_flags.block_m,
-            opt_flags.block_n,
-            opt_flags.block_k,
-            opt_flags.group_m,
-            opt_flags.xcd_swizzle,
-            SWIZZLE_MX_SCALE=swizzle_mx_scale,
-            EVEN_K=(K % opt_flags.block_k == 0),
-            UPCAST_INDICES=should_upcast_indices(a, b, out_matmul),
-            NUM_BUFFERS=num_buffers,
-            SCALE_BLOCK=scale_block,
-            SCHEDULE=schedule,
-            PINGPONG=pingpong,
-            NUM_WARPS=num_warps,
-            num_warps=num_warps,
-        )
-
-    if benchmark_mode == "graph":
-        time_ms = triton.testing.do_bench_cudagraph(_launch, rep=benchmark_num_iters)
-        tflops = 2 * M * N * K / (time_ms * 1e-3) / 1e12
-        print(
-            f"[moe matmul M={M} N={N} K={K}] execution time: {time_ms} ms, {tflops:.2f} TFLOPS"
-        )
-    elif benchmark_mode == "eager":
-        time_ms = triton.testing.do_bench(_launch, warmup=30, rep=benchmark_num_iters)
-        tflops = 2 * M * N * K / (time_ms * 1e-3) / 1e12
-        print(
-            f"[moe matmul M={M} N={N} K={K}] execution time: {time_ms} ms, {tflops:.2f} TFLOPS"
-        )
-
-    kernel = _launch()
+    kernel = _matmul[(grid,)](
+        c_storage.data,
+        *out_matmul.stride(),
+        a_storage.data,
+        *a_strides,
+        a_scale,
+        *a_scale_strides,
+        b_storage.data,
+        *b_storage.data.stride(),
+        w_transpose,
+        b_scale,
+        *b_scale_strides,
+        bias,
+        bias_stride,
+        M,
+        N,
+        K,
+        K_W,
+        gather_indx,
+        scatter_indx,
+        None if scatter_indx is None else scatter_indx.shape[0],
+        ragged_dimension,
+        *expt_data_x,
+        *expt_data_w,
+        batch_size,
+        grid_m,
+        grid_n,
+        do_swiglu,
+        swiglu_alpha,
+        swiglu_limit,
+        swiglu_beta,
+        activation_reduction_n,
+        n_valid_slices,
+        opt_flags.block_m,
+        opt_flags.block_n,
+        opt_flags.block_k,
+        opt_flags.group_m,
+        opt_flags.xcd_swizzle,
+        SWIZZLE_MX_SCALE=swizzle_mx_scale,
+        EVEN_K=(K % opt_flags.block_k == 0),
+        UPCAST_INDICES=should_upcast_indices(a, b, out_matmul),
+        NUM_BUFFERS=num_buffers,
+        SCALE_BLOCK=scale_block,
+        SCHEDULE=schedule,
+        PINGPONG=pingpong,
+        NUM_WARPS=num_warps,
+        num_warps=num_warps,
+    )
     out_final = c_storage.data
     if not is_input_batched:
         out_final = out_final.squeeze(0)
@@ -2376,7 +2346,7 @@ def gluon_mxfp_dispatch_swiglu(
     w_scale: torch.Tensor,
     *,
     x_scale: torch.Tensor | None = None,
-    x_format: str = "e4m3",
+    x_format: str = "e2m1",
     x_global_scale: torch.Tensor | float = 1.0,
     bias: torch.Tensor | None,
     a_ragged_metadata,
@@ -2385,11 +2355,30 @@ def gluon_mxfp_dispatch_swiglu(
     swiglu_alpha: float = 1.0,
     swiglu_limit: float = 0.0,
     swiglu_beta: float = 1.0,
-    scale_preshuffle: bool = False,
-    **kwargs,
-) -> torch.Tensor:
+    block_m: int = 128,
+    block_n: int = 256,
+    block_k: int = 256,
+    num_warps: int = 4,
+    num_buffers: int = 3,
+    use_warp_pipeline: bool | None = None,
+    use_slice_mn: bool | None = None,
+    use_slice_n: bool | None = None,
+    scale_load_mode: str = "transpose",
+    w_transpose: bool = True,
+    persistent: bool | None = None,
+    num_ctas: int | None = None,
+    out_quant_scale: torch.Tensor | float | None = None,
+    out_quant_format: str | None = None,
+    w_preshuffle: bool = False,
+    x_scale_ragged_padded: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Dispatch GEMM + fused SwiGLU using the gfx1250 Gluon MoE kernel."""
-    del x_global_scale
+    del x_global_scale, use_warp_pipeline, use_slice_mn, use_slice_n
+    del persistent, num_ctas, w_preshuffle, x_scale_ragged_padded
+    if out_quant_scale is not None or out_quant_format is not None:
+        raise NotImplementedError(
+            "gfx1250 dispatch wrapper does not support output quantization"
+        )
     if x_format == "e2m1" and x_scale is None:
         raise ValueError("x_scale is required for e2m1/MXFP4 activation input")
     if x_format != "e2m1" and x_scale is not None:
@@ -2412,8 +2401,13 @@ def gluon_mxfp_dispatch_swiglu(
         gather_indx=gather_tensor,
         precision_config=precision,
         fused_activation=activation,
-        scale_preshuffle=scale_preshuffle,
-        **kwargs,
+        scale_preshuffle=(scale_load_mode == "swizzle"),
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        num_warps=num_warps,
+        num_buffers=num_buffers,
+        w_transpose=w_transpose,
     )
     return out
 
@@ -2424,7 +2418,7 @@ def gluon_mxfp_combine(
     w_scale: torch.Tensor,
     *,
     x_scale: torch.Tensor | None = None,
-    x_format: str = "e4m3",
+    x_format: str = "e2m1",
     x_global_scale: torch.Tensor | float = 1.0,
     bias: torch.Tensor | None,
     a_ragged_metadata,
@@ -2433,11 +2427,24 @@ def gluon_mxfp_combine(
     n_tokens: int | None = None,
     n_expts_act: int | None = None,
     out_dtype: torch.dtype = torch.bfloat16,
-    scale_preshuffle: bool = False,
-    **kwargs,
+    block_m: int = 256,
+    block_n: int = 256,
+    block_k: int = 256,
+    num_warps: int = 4,
+    num_buffers: int = 3,
+    use_warp_pipeline: bool | None = None,
+    use_slice_mn: bool | None = None,
+    use_slice_n: bool | None = None,
+    scale_load_mode: str = "transpose",
+    w_transpose: bool = True,
+    persistent: bool | None = None,
+    num_ctas: int | None = None,
+    w_preshuffle: bool = False,
+    x_scale_ragged_padded: bool = False,
 ) -> torch.Tensor:
     """Combine GEMM using the gfx1250 Gluon MoE kernel."""
-    del x_global_scale
+    del x_global_scale, use_warp_pipeline, use_slice_mn, use_slice_n
+    del persistent, num_ctas, w_preshuffle, x_scale_ragged_padded
     if gate_scal is not None:
         raise NotImplementedError(
             "gfx1250 source kernel does not apply route gate scaling"
@@ -2459,8 +2466,13 @@ def gluon_mxfp_combine(
         a_ragged_metadata=a_ragged_metadata,
         scatter_indx=scatter_tensor,
         precision_config=precision,
-        scale_preshuffle=scale_preshuffle,
-        **kwargs,
+        scale_preshuffle=(scale_load_mode == "swizzle"),
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        num_warps=num_warps,
+        num_buffers=num_buffers,
+        w_transpose=w_transpose,
     )
     if n_expts_act is not None and int(n_expts_act) > 1:
         if n_tokens is None:
@@ -2506,15 +2518,12 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
     *,
     w13_mx_scale: torch.Tensor,
     w2_mx_scale: torch.Tensor,
-    w13_act_scale: torch.Tensor | None = None,
-    w2_act_scale: torch.Tensor | None = None,
-    w13_bias: torch.Tensor | None = None,
-    w2_bias: torch.Tensor | None = None,
+    w13_bias: Optional[torch.Tensor] = None,
+    w2_bias: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
     swiglu_alpha: float = 1.702,
     swiglu_limit: float = 7.0,
     swiglu_beta: float = 1.0,
-    **launch_kwargs,
 ) -> torch.Tensor:
     """Dispatch + combine for gfx1250 MXFP4-weight MoE with precomputed top-k.
 
@@ -2527,8 +2536,6 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         w2_weight: gfx1250-preprocessed down-projection expert weight.
         w13_mx_scale: gfx1250-swizzled MXFP4 scale for ``w13_weight``.
         w2_mx_scale: gfx1250-swizzled MXFP4 scale for ``w2_weight``.
-        w13_act_scale: Optional static FP8 scale for the input activation.
-        w2_act_scale: Optional static FP8 scale for the intermediate activation.
         w13_bias: Optional expert bias for the gate/up projection.
         w2_bias: Optional expert bias for the down projection.
         out_dtype: Final output dtype.
@@ -2569,18 +2576,10 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         num_experts,
     )
 
-    scale_preshuffle = bool(launch_kwargs.pop("scale_preshuffle", True))
-    launch_defaults = {
-        "block_m": 128,
-        "block_n": 128,
-        "block_k": 256,
-        "num_buffers": 2,
-        "schedule": "baseline",
-        "num_warps": 4,
-    }
-    launch_defaults.update(launch_kwargs)
-
-    x_fp8 = _quantize_fp8_activation(hidden_states, w13_act_scale)
+    x_fp8 = _quantize_fp8_activation(
+        hidden_states,
+        w13_weight.act_scale,
+    )
     intermediate = gluon_mxfp_dispatch_swiglu(
         x_fp8,
         w13_weight,
@@ -2593,10 +2592,17 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         swiglu_alpha=swiglu_alpha,
         swiglu_limit=swiglu_limit,
         swiglu_beta=swiglu_beta,
-        scale_preshuffle=scale_preshuffle,
-        **launch_defaults,
+        block_m=128,
+        block_n=256,
+        block_k=256,
+        num_warps=4,
+        num_buffers=3,
+        scale_load_mode="swizzle",
     )
-    intermediate_fp8 = _quantize_fp8_activation(intermediate, w2_act_scale)
+    intermediate_fp8 = _quantize_fp8_activation(
+        intermediate,
+        w2_weight.act_scale,
+    )
     flat = gluon_mxfp_combine(
         intermediate_fp8,
         w2_weight,
@@ -2606,8 +2612,12 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         a_ragged_metadata=ragged_metadata,
         scatter_indx=scatter_indx,
         out_dtype=out_dtype,
-        scale_preshuffle=scale_preshuffle,
-        **launch_defaults,
+        block_m=256,
+        block_n=256,
+        block_k=256,
+        num_warps=4,
+        num_buffers=3,
+        scale_load_mode="swizzle",
     )
     weighted = flat.float() * topk_weights.reshape(-1, 1)
     return (
@@ -2642,8 +2652,9 @@ def gluon_mxfp_ragged_matmul(
     gather_indx = _adapt_index(gather_indx, "src_indx")
     scatter_indx = _adapt_index(scatter_indx, "dst_indx")
     scale_preshuffle = bool(extra_kwargs.pop("scale_preshuffle", False))
+    scale_load_mode = "swizzle" if scale_preshuffle else "transpose"
     extra_kwargs.pop("scale_load_mode", None)
-    extra_kwargs.pop("w_transpose", None)
+    w_transpose = bool(extra_kwargs.pop("w_transpose", True))
     extra_kwargs.pop("w_preshuffle", None)
     gate_scal = extra_kwargs.pop("gammas", None)
     gate_scal = extra_kwargs.pop("gate_scal", gate_scal)
@@ -2658,10 +2669,13 @@ def gluon_mxfp_ragged_matmul(
         "schedule",
         "pingpong",
         "num_warps",
-        "benchmark_mode",
-        "benchmark_num_iters",
     }
     launch_kwargs = {k: extra_kwargs.pop(k) for k in list(extra_kwargs) if k in allowed}
+    wrapper_launch_kwargs = {
+        k: v
+        for k, v in launch_kwargs.items()
+        if k in {"block_m", "block_n", "block_k", "num_buffers", "num_warps"}
+    }
     unsupported = sorted(extra_kwargs)
     if unsupported:
         raise TypeError(f"unsupported gfx1250 MoE keyword(s): {unsupported}")
@@ -2680,8 +2694,9 @@ def gluon_mxfp_ragged_matmul(
             n_tokens=n_tokens,
             n_expts_act=n_expts_act,
             out_dtype=out_dtype,
-            scale_preshuffle=scale_preshuffle,
-            **launch_kwargs,
+            scale_load_mode=scale_load_mode,
+            w_transpose=w_transpose,
+            **wrapper_launch_kwargs,
         )
     if fused_activation is not None:
         swiglu_args = _activation_config(fused_activation)
@@ -2700,8 +2715,9 @@ def gluon_mxfp_ragged_matmul(
             swiglu_alpha=swiglu_args[1],
             swiglu_limit=swiglu_args[2],
             swiglu_beta=swiglu_args[3],
-            scale_preshuffle=scale_preshuffle,
-            **launch_kwargs,
+            scale_load_mode=scale_load_mode,
+            w_transpose=w_transpose,
+            **wrapper_launch_kwargs,
         )
     precision = PrecisionConfig(
         out_dtype=out_dtype, a_mx_scale=x_mx_scale, b_mx_scale=w_mx_scale
@@ -2715,33 +2731,15 @@ def gluon_mxfp_ragged_matmul(
         scatter_indx=_index_tensor(scatter_indx, "dst_indx"),
         precision_config=precision,
         scale_preshuffle=scale_preshuffle,
+        w_transpose=w_transpose,
         **launch_kwargs,
     )
     return out
 
 
-def routing(x, logits, n_expts_act, apply_softmax: bool = True):
-    logits = topk(logits, n_expts_act, apply_softmax=apply_softmax)
-    dispatch_indx = logits.mask_metadata.row_sorted_indx
-    combine_indx = logits.mask_metadata.col_sorted_indx
-    ragged_metadata = make_ragged_tensor_metadata(
-        logits.mask_metadata.col_sum, dispatch_indx.shape[0]
-    )
-    gather_indx = combine_indx // n_expts_act
-    scatter_indx = combine_indx
-    return x, ragged_metadata, gather_indx, scatter_indx, None
-
-
 __all__ = [
-    "FlexCtx",
-    "InFlexData",
-    "OutFlexData",
     "PrecisionConfig",
     "gluon_mxfp_combine",
     "gluon_mxfp_dispatch_swiglu",
     "gluon_mxfp_precomputed_mxfp4_fused_moe",
-    "gluon_mxfp_ragged_matmul",
-    "matmul",
-    "routing",
-    "static_profile",
 ]

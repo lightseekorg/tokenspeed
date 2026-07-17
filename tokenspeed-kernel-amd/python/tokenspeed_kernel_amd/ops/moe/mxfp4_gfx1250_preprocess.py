@@ -24,8 +24,6 @@ import math
 
 import torch
 from tokenspeed_kernel_amd.ops.moe.fused_mxfp_gfx1250 import (
-    FlexCtx,
-    InFlexData,
     PrecisionConfig,
 )
 
@@ -107,7 +105,7 @@ def _swizzle_gfx1250_mxfp4_scale(scale: torch.Tensor) -> torch.Tensor:
 def _swizzle_mxfp4(quant_tensor: torch.Tensor, scale: torch.Tensor):
     quant_tensor = _make_k_packed_mxfp4_weight(quant_tensor)
     scale = _swizzle_gfx1250_mxfp4_scale(scale)
-    return quant_tensor, InFlexData(), scale
+    return quant_tensor, scale
 
 
 def preprocess_gluon_mxfp4_gfx1250_moe_weights(
@@ -155,11 +153,11 @@ def preprocess_gluon_mxfp4_gfx1250_moe_weights(
         w._gluon_w2_bias_is_zero = not bool(torch.count_nonzero(w2_weight_bias).item())
         w.w2_weight_bias = torch.nn.Parameter(w2_weight_bias, requires_grad=False)
 
-    w13_weight, w13_flex, w13_scale = _swizzle_mxfp4(
+    w13_weight, w13_scale = _swizzle_mxfp4(
         w13_weight.data,
         w13_weight_scale.data,
     )
-    w2_weight, w2_flex, w2_scale = _swizzle_mxfp4(
+    w2_weight, w2_scale = _swizzle_mxfp4(
         w.w2_weight.data,
         w.w2_weight_scale.data,
     )
@@ -173,6 +171,8 @@ def preprocess_gluon_mxfp4_gfx1250_moe_weights(
         and hasattr(w, "w2_input_scale")
         and not use_dynamic_mxfp4_activations
     )
+    w13_act_scale = None
+    w2_act_scale = None
     if has_static_fp8_scales:
         w13_in_scale = (
             w.w13_input_scale.data.to(torch.float32)
@@ -190,21 +190,17 @@ def preprocess_gluon_mxfp4_gfx1250_moe_weights(
         )
         w.w13_act_scale = w13_in_scale
         w.w2_act_scale = w2_in_scale
-        fp8_dtype = torch.float8_e4m3fn
-        w13_lhs = InFlexData(dtype=fp8_dtype, scale=w13_in_scale)
-        w2_lhs = InFlexData(dtype=fp8_dtype, scale=w2_in_scale)
-    else:
-        w13_lhs = InFlexData()
-        w2_lhs = InFlexData()
+        w13_act_scale = w13_in_scale
+        w2_act_scale = w2_in_scale
+    w13_weight.act_scale = w13_act_scale
+    w2_weight.act_scale = w2_act_scale
 
     out_dtype = torch.bfloat16
     w.w13_precision_config = PrecisionConfig(
-        flex_ctx=FlexCtx(lhs_data=w13_lhs, rhs_data=w13_flex),
         b_mx_scale=w13_scale,
         out_dtype=out_dtype,
     )
     w.w2_precision_config = PrecisionConfig(
-        flex_ctx=FlexCtx(lhs_data=w2_lhs, rhs_data=w2_flex),
         b_mx_scale=w2_scale,
         out_dtype=out_dtype,
     )
@@ -223,5 +219,4 @@ def preprocess_gluon_mxfp4_gfx1250_moe_weights(
 __all__ = [
     "preprocess_gluon_mxfp4_gfx1250_moe_weights",
     "_make_k_packed_mxfp4_weight",
-    "_swizzle_gfx1250_mxfp4_scale",
 ]
