@@ -15,6 +15,8 @@ import math
 import os
 import sys
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -36,6 +38,7 @@ from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
     deepseek_v4_swa_scale_dim,
     deepseek_v4_swa_token_stride,
 )
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
     deepseek_v4_combine_dense_swa_indices,
     deepseek_v4_combine_topk_swa_indices,
@@ -56,11 +59,18 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
     write_deepseek_v4_indexer_mxfp4_cache,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
+    _group_slot_mapping_from_raw,
     _mask_invalid_graph_tokens,
 )
+from tokenspeed.runtime.models import deepseek_v4 as deepseek_v4_model
 from tokenspeed.runtime.models.deepseek_v4 import (
+    DeepseekV4Attention,
+    DeepseekV4Compressor,
+    DeepseekV4Indexer,
     _deepseek_v4_sanitize_swa_slot_mapping,
+    _DeepseekV4PregraphBuffers,
 )
+from tokenspeed.runtime.utils.cuda_stream import StreamFork
 
 HEAD_DIM = 512
 NOPE_DIM = 448
@@ -188,6 +198,29 @@ def _mxfp4_bytes_and_scales(
     return torch.cat(packed_blocks), torch.stack(scales), torch.cat(dequant_blocks)
 
 
+def _dequantize_packed_indexer_q(
+    values: torch.Tensor,
+    scales: torch.Tensor,
+) -> torch.Tensor:
+    """Decode the four MXFP4 blocks used by the indexer Q tests."""
+    scale_bytes = scales.contiguous().view(torch.uint8).reshape(*scales.shape, 4)
+    out = torch.empty(
+        (*values.shape[:-1], values.shape[-1] * 2),
+        device=values.device,
+        dtype=torch.float32,
+    )
+    for block_id in range(4):
+        packed = values[..., block_id * 16 : (block_id + 1) * 16]
+        scale = torch.pow(
+            2.0,
+            scale_bytes[..., block_id].to(torch.float32) - 127.0,
+        ).unsqueeze(-1)
+        target = out[..., block_id * 32 : (block_id + 1) * 32]
+        target[..., 0::2] = _e2m1_values(packed & 0x0F) * scale
+        target[..., 1::2] = _e2m1_values(packed >> 4) * scale
+    return out
+
+
 def _hadamard_rotate(row: torch.Tensor) -> torch.Tensor:
     shape = row.shape
     return hadamard_transform(
@@ -296,6 +329,1107 @@ def _expected_overlap_normed(
 
 
 class DeepseekV4AttentionOpsCpuValidationTest(unittest.TestCase):
+    def test_attention_phase1_uses_bucket_then_core_slices_every_tensor(self):
+        bucket_tokens = 5
+        real_tokens = 3
+
+        for ambient, expected_rows in ((True, real_tokens), (False, bucket_tokens)):
+            with self.subTest(ambient=ambient):
+                attention = object.__new__(DeepseekV4Attention)
+                torch.nn.Module.__init__(attention)
+                attention.attention_kind = "csa"
+                attention.rotary_emb = SimpleNamespace(
+                    cos_sin_cache=torch.zeros(1, ROPE_DIM, dtype=torch.float32)
+                )
+                attention.stream_fork = StreamFork(None)
+                attention.padded_heads = 16
+                attention.cache_layer_index = 0
+                attention.compress_ratio = 4
+                attention.pregraph_buffers = None
+                attention.num_local_heads = 16
+                attention.head_dim = HEAD_DIM
+                attention.swa_window = 64
+                attention.scale = 1.0
+                attention.attn_sink = torch.zeros(1)
+
+                q = torch.randn(bucket_tokens, 16, HEAD_DIM, dtype=torch.bfloat16)
+                kv = torch.randn(bucket_tokens, HEAD_DIM, dtype=torch.bfloat16)
+                qr = torch.randn(bucket_tokens, 32, dtype=torch.bfloat16)
+                compressor_score = torch.randn(bucket_tokens, 17)
+                indexer_compressor_score = torch.randn(bucket_tokens, 19)
+                attention._project_q_kv = mock.Mock(return_value=(q, kv, qr))
+
+                compressor = mock.Mock()
+                compressor.compute_kv_score.return_value = compressor_score
+                attention.compressor = compressor
+                indexer = mock.Mock()
+                indexer.compressor.compute_kv_score.return_value = (
+                    indexer_compressor_score
+                )
+                packed_q_values = torch.full(
+                    (bucket_tokens, 2, 64), 0x11, dtype=torch.uint8
+                )
+                packed_q_scales = torch.full(
+                    (bucket_tokens, 2), 0x01010101, dtype=torch.int32
+                )
+                packed_weights = torch.ones(bucket_tokens, 2)
+                packed_q_values[real_tokens:].fill_(0xFF)
+                packed_q_scales[real_tokens:].fill_(torch.iinfo(torch.int32).max)
+                packed_weights[real_tokens:].fill_(float("nan"))
+                indexer._prepare_packed_inputs.return_value = (
+                    packed_q_values,
+                    packed_q_scales,
+                    packed_weights,
+                )
+                indexer.side_effect = lambda **kw: torch.zeros(
+                    (kw["positions"].shape[0], 4), dtype=torch.int32
+                )
+                attention.indexer = indexer
+                attention._insert_swa_cache = mock.Mock()
+                attention._project_attention_output = mock.Mock(
+                    side_effect=lambda output, *_: output
+                )
+
+                metadata = SimpleNamespace(
+                    is_valid_token=None,
+                    token_to_req_indices=torch.arange(real_tokens),
+                )
+                backend = SimpleNamespace(
+                    forward_metadata=metadata,
+                    forward_deepseek_v4_prefill=mock.Mock(
+                        side_effect=lambda **kw: kw["q"]
+                    ),
+                )
+                pool = SimpleNamespace(
+                    swa_block_size=4,
+                    get_swa_kv_buffer=mock.Mock(
+                        return_value=torch.empty(1, 4 * 584, dtype=torch.uint8)
+                    ),
+                    get_indexer_block_size=mock.Mock(return_value=64),
+                )
+                ctx = SimpleNamespace(
+                    dsa_compressor_slot_cache=None,
+                    dsa_swa_slot_mapping=None,
+                    token_to_kv_pool=pool,
+                    attn_backend=backend,
+                    forward_mode=ForwardMode.EXTEND,
+                    dsa_pregraph_writes=False,
+                )
+                positions = torch.arange(bucket_tokens, dtype=torch.int64)
+                hidden_states = torch.randn(bucket_tokens, 8)
+                out_cache_loc = torch.arange(bucket_tokens, dtype=torch.int64) + 10
+                swa_slot_mapping = torch.arange(bucket_tokens, dtype=torch.int64) + 20
+
+                with mock.patch(
+                    "tokenspeed.runtime.models.deepseek_v4.current_forward_ctx",
+                    return_value=ctx if ambient else None,
+                ):
+                    attention(
+                        positions,
+                        hidden_states,
+                        ctx,
+                        out_cache_loc,
+                        swa_slot_mapping=swa_slot_mapping,
+                    )
+
+                self.assertEqual(
+                    attention._project_q_kv.call_args.args[0].shape[0], bucket_tokens
+                )
+                self.assertEqual(
+                    compressor.compute_kv_score.call_args.args[0].shape[0],
+                    bucket_tokens,
+                )
+                self.assertEqual(
+                    indexer.compressor.compute_kv_score.call_args.args[0].shape[0],
+                    bucket_tokens,
+                )
+
+                compressor_args = compressor.call_args.kwargs
+                self.assertEqual(
+                    compressor_args["hidden_states"].shape[0], expected_rows
+                )
+                self.assertEqual(compressor_args["positions"].shape[0], expected_rows)
+                self.assertEqual(
+                    compressor_args["out_cache_loc"].shape[0], expected_rows
+                )
+                self.assertEqual(compressor_args["kv_score"].shape[0], expected_rows)
+
+                indexer_args = indexer.call_args.kwargs
+                self.assertEqual(indexer_args["hidden_states"].shape[0], expected_rows)
+                self.assertEqual(indexer_args["qr"].shape[0], expected_rows)
+                self.assertEqual(indexer_args["positions"].shape[0], expected_rows)
+                self.assertEqual(indexer_args["out_cache_loc"].shape[0], expected_rows)
+                self.assertEqual(
+                    indexer_args["indexer_compressor_kv_score"].shape[0],
+                    expected_rows,
+                )
+                prepared_sources = {
+                    "packed_q_values": packed_q_values,
+                    "packed_q_scales": packed_q_scales,
+                    "packed_weights": packed_weights,
+                }
+                if ambient:
+                    indexer._prepare_packed_inputs.assert_called_once_with(
+                        hidden_states=hidden_states,
+                        qr=qr,
+                        positions=positions,
+                        cos_sin_cache=attention.rotary_emb.cos_sin_cache,
+                    )
+                    for name, source in prepared_sources.items():
+                        actual = indexer_args[name]
+                        self.assertEqual(actual.shape[0], real_tokens)
+                        self.assertEqual(actual.data_ptr(), source.data_ptr())
+                        self.assertIs(actual._base, source)
+                    self.assertTrue(
+                        bool((indexer_args["packed_q_values"] == 0x11).all())
+                    )
+                    self.assertTrue(
+                        bool((indexer_args["packed_q_scales"] == 0x01010101).all())
+                    )
+                    self.assertTrue(
+                        bool(torch.isfinite(indexer_args["packed_weights"]).all())
+                    )
+                else:
+                    indexer._prepare_packed_inputs.assert_not_called()
+                    for name in prepared_sources:
+                        self.assertIsNone(indexer_args[name])
+
+                insert_args = attention._insert_swa_cache.call_args.kwargs
+                self.assertEqual(insert_args["q"].shape[0], expected_rows)
+                self.assertEqual(insert_args["kv"].shape[0], expected_rows)
+                self.assertEqual(insert_args["positions"].shape[0], expected_rows)
+                self.assertEqual(insert_args["slot_mapping"].shape[0], expected_rows)
+                backend_args = backend.forward_deepseek_v4_prefill.call_args.kwargs
+                self.assertEqual(backend_args["q"].shape[0], expected_rows)
+                attention._project_attention_output.assert_called_once()
+                output_args = attention._project_attention_output.call_args.args
+                self.assertEqual(output_args[0].shape[0], expected_rows)
+                # The real-token slice is local to the eager core. The output
+                # projection sits after the break and therefore retains the
+                # outer bucket-shaped positions tensor; during CUDA-graph
+                # replay the raw attention output lands in a bucket-shaped
+                # handoff buffer before this call as well.
+                self.assertIs(output_args[1], positions)
+                self.assertEqual(output_args[1].shape[0], bucket_tokens)
+                self.assertIs(output_args[2], attention.rotary_emb.cos_sin_cache)
+                if ambient:
+                    leading_views = (
+                        (insert_args["q"], q),
+                        (insert_args["kv"], kv),
+                        (indexer_args["qr"], qr),
+                        (compressor_args["kv_score"], compressor_score),
+                        (
+                            indexer_args["indexer_compressor_kv_score"],
+                            indexer_compressor_score,
+                        ),
+                        (indexer_args["packed_q_values"], packed_q_values),
+                        (indexer_args["packed_q_scales"], packed_q_scales),
+                        (indexer_args["packed_weights"], packed_weights),
+                    )
+                    for actual, source in leading_views:
+                        self.assertEqual(actual.data_ptr(), source.data_ptr())
+                        self.assertIs(actual._base, source)
+
+    def test_indexer_forward_threads_prepared_triplet_to_custom_op(self):
+        num_tokens = 2
+        indexer = object.__new__(DeepseekV4Indexer)
+        torch.nn.Module.__init__(indexer)
+        indexer.compress_ratio = 4
+        indexer.use_fp4_cache = True
+        compressor = mock.Mock()
+        compressor.norm = SimpleNamespace(
+            weight=torch.ones(1),
+            variance_epsilon=1.0e-6,
+        )
+        indexer.compressor = compressor
+        expected_topk = torch.full((num_tokens, 2), 7, dtype=torch.int32)
+        indexer._forward_sparse_indexer_custom_op = mock.Mock(
+            return_value=expected_topk
+        )
+
+        state_cache = torch.empty(1, 1)
+        indexer_cache = torch.empty(1, 1, dtype=torch.uint8)
+        state_slots = torch.arange(num_tokens, dtype=torch.int64)
+        state_table = torch.zeros(1, 1, dtype=torch.int32)
+        compressed_slots = torch.arange(num_tokens, dtype=torch.int64)
+        cache_metadata = SimpleNamespace(
+            compressed_slot_mapping=mock.Mock(return_value=compressed_slots)
+        )
+        metadata = SimpleNamespace(
+            cache=cache_metadata,
+            token_to_req_indices=torch.zeros(num_tokens, dtype=torch.int32),
+            is_valid_token=None,
+            query_start_loc=torch.tensor([0, num_tokens], dtype=torch.int32),
+            seq_lens=torch.tensor([num_tokens], dtype=torch.int32),
+        )
+        pool = SimpleNamespace(
+            get_indexer_state_buffer=mock.Mock(return_value=state_cache),
+            get_indexer_block_size=mock.Mock(return_value=4),
+            get_indexer_kv_buffer_2d=mock.Mock(return_value=indexer_cache),
+        )
+        ctx = SimpleNamespace(
+            token_to_kv_pool=pool,
+            attn_backend=SimpleNamespace(
+                forward_metadata=metadata,
+                forward_prefill_metadata=metadata,
+            ),
+            forward_mode=ForwardMode.MIXED,
+            dsa_pregraph_writes=False,
+        )
+        packed_q_values = torch.full((num_tokens, 2, 2), 1, dtype=torch.uint8)
+        packed_q_scales = torch.full((num_tokens, 2), 2, dtype=torch.int32)
+        packed_weights = torch.full((num_tokens, 2), 3.0)
+
+        with mock.patch.object(
+            deepseek_v4_model,
+            "deepseek_v4_csa_indexer_cache_insert",
+        ):
+            actual = indexer(
+                hidden_states=torch.zeros(num_tokens, 4),
+                qr=torch.zeros(num_tokens, 4),
+                positions=torch.arange(num_tokens, dtype=torch.int64),
+                ctx=ctx,
+                out_cache_loc=torch.arange(num_tokens, dtype=torch.int64),
+                layer_index=0,
+                cos_sin_cache=torch.empty(1, ROPE_DIM),
+                compressor_slot_cache={
+                    "indexer_state": (state_slots, state_table, 4, None)
+                },
+                packed_q_values=packed_q_values,
+                packed_q_scales=packed_q_scales,
+                packed_weights=packed_weights,
+            )
+
+        self.assertIs(actual, expected_topk)
+        custom_args = indexer._forward_sparse_indexer_custom_op.call_args.kwargs
+        self.assertIs(custom_args["packed_q_values"], packed_q_values)
+        self.assertIs(custom_args["packed_q_scales"], packed_q_scales)
+        self.assertIs(custom_args["packed_weights"], packed_weights)
+
+    def test_compressed_slot_mapping_memo_is_shared_by_block_size(self):
+        num_tokens = 2
+        positions = torch.arange(num_tokens, dtype=torch.int64)
+        state_slots = torch.arange(num_tokens, dtype=torch.int64)
+        state_table = torch.zeros(1, 1, dtype=torch.int32)
+        compressed_slots_64 = torch.tensor([11, 12], dtype=torch.int64)
+        compressed_slots_32 = torch.tensor([21, 22], dtype=torch.int64)
+        slots_by_block_size = {
+            64: compressed_slots_64,
+            32: compressed_slots_32,
+        }
+
+        def compressed_slot_mapping(*args, kv_cache_block_size, **kwargs):
+            del args, kwargs
+            return slots_by_block_size[kv_cache_block_size]
+
+        cache_metadata = SimpleNamespace(
+            compressed_slot_mapping=mock.Mock(side_effect=compressed_slot_mapping),
+            compressor_state_block_tables={4: state_table},
+            compressor_state_base_logical_pages={4: None},
+        )
+        metadata = SimpleNamespace(
+            cache=cache_metadata,
+            token_to_req_indices=torch.zeros(num_tokens, dtype=torch.int32),
+            is_valid_token=None,
+            query_start_loc=torch.tensor([0, num_tokens], dtype=torch.int32),
+            seq_lens=torch.tensor([num_tokens], dtype=torch.int32),
+        )
+        compressed_block_size = mock.Mock(return_value=64)
+        pool = SimpleNamespace(
+            get_indexer_state_buffer=mock.Mock(return_value=torch.empty(1, 1)),
+            get_indexer_block_size=mock.Mock(return_value=64),
+            get_indexer_kv_buffer_2d=mock.Mock(
+                return_value=torch.empty(1, 1, dtype=torch.uint8)
+            ),
+            get_compressed_block_size=compressed_block_size,
+            get_compressed_kv_buffer_2d=mock.Mock(
+                return_value=torch.empty(1, 1, dtype=torch.uint8)
+            ),
+        )
+        ctx = SimpleNamespace(
+            token_to_kv_pool=pool,
+            attn_backend=SimpleNamespace(forward_metadata=metadata),
+            forward_mode=ForwardMode.MIXED,
+            dsa_pregraph_writes=False,
+        )
+        slot_cache = {
+            "indexer_state": (state_slots, state_table, 4, None),
+        }
+
+        indexer = object.__new__(DeepseekV4Indexer)
+        torch.nn.Module.__init__(indexer)
+        indexer.compress_ratio = 4
+        indexer.use_fp4_cache = True
+        indexer.compressor = mock.Mock()
+        indexer.compressor.norm = SimpleNamespace(
+            weight=torch.ones(1),
+            variance_epsilon=1.0e-6,
+        )
+        indexer._forward_sparse_indexer_custom_op = mock.Mock(
+            return_value=torch.zeros(num_tokens, 1, dtype=torch.int32)
+        )
+        packed_q_values = torch.zeros(num_tokens, 1, 1, dtype=torch.uint8)
+        packed_q_scales = torch.zeros(num_tokens, 1, dtype=torch.int32)
+        packed_weights = torch.zeros(num_tokens, 1)
+
+        compressor = SimpleNamespace(
+            compress_ratio=4,
+            coff=1,
+            head_dim=2,
+            ape=torch.empty((4, 2), dtype=torch.float32),
+            norm=SimpleNamespace(
+                weight=torch.ones(2),
+                variance_epsilon=1.0e-6,
+            ),
+        )
+        kv_score = torch.empty((num_tokens, 4), dtype=torch.float32)
+
+        with (
+            mock.patch.object(
+                deepseek_v4_model,
+                "deepseek_v4_csa_indexer_cache_insert",
+            ) as indexer_insert,
+            mock.patch.object(
+                deepseek_v4_model,
+                "save_deepseek_v4_compressor_state",
+            ),
+            mock.patch.object(
+                deepseek_v4_model,
+                "deepseek_v4_csa_compress_kv_cache_insert",
+            ) as compressor_insert,
+        ):
+            indexer(
+                hidden_states=torch.zeros(num_tokens, 4),
+                qr=torch.zeros(num_tokens, 4),
+                positions=positions,
+                ctx=ctx,
+                out_cache_loc=state_slots,
+                layer_index=0,
+                cos_sin_cache=torch.empty(1, ROPE_DIM),
+                compressor_slot_cache=slot_cache,
+                packed_q_values=packed_q_values,
+                packed_q_scales=packed_q_scales,
+                packed_weights=packed_weights,
+            )
+            DeepseekV4Compressor.forward(
+                compressor,
+                hidden_states=torch.empty(num_tokens, 1),
+                positions=positions,
+                ctx=ctx,
+                out_cache_loc=state_slots,
+                layer_index=0,
+                cos_sin_cache=torch.empty(1, ROPE_DIM),
+                state_cache=torch.empty(1, 1),
+                state_block_size=4,
+                state_slot_mapping=state_slots,
+                compressor_slot_cache=slot_cache,
+                kv_score=kv_score,
+            )
+
+            key_64 = ("compressed_slot_mapping", 4, 64)
+            self.assertIs(slot_cache[key_64], compressed_slots_64)
+            self.assertIs(
+                indexer_insert.call_args.kwargs["kv_slot_mapping"],
+                compressed_slots_64,
+            )
+            self.assertIs(
+                compressor_insert.call_args.kwargs["kv_slot_mapping"],
+                compressed_slots_64,
+            )
+            cache_metadata.compressed_slot_mapping.assert_called_once()
+
+            compressed_block_size.return_value = 32
+            DeepseekV4Compressor.forward(
+                compressor,
+                hidden_states=torch.empty(num_tokens, 1),
+                positions=positions,
+                ctx=ctx,
+                out_cache_loc=state_slots,
+                layer_index=0,
+                cos_sin_cache=torch.empty(1, ROPE_DIM),
+                state_cache=torch.empty(1, 1),
+                state_block_size=4,
+                state_slot_mapping=state_slots,
+                compressor_slot_cache=slot_cache,
+                kv_score=kv_score,
+            )
+
+        key_32 = ("compressed_slot_mapping", 4, 32)
+        self.assertIs(slot_cache[key_32], compressed_slots_32)
+        self.assertEqual(cache_metadata.compressed_slot_mapping.call_count, 2)
+        self.assertIs(
+            compressor_insert.call_args.kwargs["kv_slot_mapping"],
+            compressed_slots_32,
+        )
+
+    def test_pregraph_buffers_allocate_disarmed_and_reuse(self):
+        buffers = _DeepseekV4PregraphBuffers()
+        self.assertFalse(buffers.allocated)
+        buffers.allocate(4, 2, 3, 2, torch.device("cpu"))
+        self.assertTrue(buffers.allocated)
+        self.assertEqual(buffers.token_to_req.tolist(), [-1] * 4)
+        self.assertEqual(buffers.indexer.state_slot_mapping.tolist(), [-1] * 4)
+        self.assertEqual(buffers.indexer.kv_slot_mapping.tolist(), [-1] * 4)
+        self.assertEqual(buffers.indexer.state_block_table.tolist(), [[-1] * 3] * 2)
+        self.assertEqual(buffers.indexer.state_base_pages.tolist(), [0, 0])
+        self.assertEqual(buffers.c4.state_slot_mapping.tolist(), [-1] * 4)
+        self.assertEqual(buffers.c4.kv_slot_mapping.tolist(), [-1] * 4)
+        self.assertEqual(buffers.c4.state_block_table.tolist(), [[-1] * 2] * 2)
+        self.assertEqual(buffers.c4.state_base_pages.tolist(), [0, 0])
+
+        # A smaller re-allocation keeps the captured storage and re-disarms it.
+        buffers.token_to_req.fill_(5)
+        buffers.c4.state_slot_mapping.fill_(5)
+        table = buffers.indexer.state_block_table
+        buffers.allocate(2, 1, 3, 2, torch.device("cpu"))
+        self.assertIs(buffers.indexer.state_block_table, table)
+        self.assertEqual(buffers.token_to_req.tolist(), [-1] * 4)
+        self.assertEqual(buffers.c4.state_slot_mapping.tolist(), [-1] * 4)
+
+    def test_model_pregraph_hook_arms_pure_extend_and_disarms_unsafe(self):
+        model = object.__new__(deepseek_v4_model.DeepseekV4Model)
+        torch.nn.Module.__init__(model)
+        model.pregraph_buffers = _DeepseekV4PregraphBuffers()
+        model._pregraph_indexer_cache_layer_index = 0
+        model._pregraph_indexer_compress_ratio = 4
+
+        num_tokens = 4
+        positions = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
+        token_to_req = torch.tensor([0, 0, 1, 1], dtype=torch.int32)
+        state_table = torch.tensor([[3, 4], [5, 6]], dtype=torch.int32)
+        c4_state_table = torch.tensor([[7], [9]], dtype=torch.int32)
+        compressed_slots = torch.tensor([9, -1, 13, 15], dtype=torch.int64)
+        cache_metadata = SimpleNamespace(
+            indexer_state_block_table=state_table,
+            indexer_state_base_logical_page=None,
+            compressor_state_block_tables={4: c4_state_table},
+            compressor_state_base_logical_pages={4: None},
+            compressed_slot_mapping=mock.Mock(return_value=compressed_slots),
+        )
+        metadata = SimpleNamespace(
+            cache=cache_metadata,
+            token_to_req_indices=token_to_req,
+            is_valid_token=None,
+            num_prefill_tokens=num_tokens,
+            decode_token_count=mock.Mock(return_value=0),
+            query_start_loc=torch.tensor([0, 2, 4], dtype=torch.int32),
+            seq_lens=torch.tensor([2, 4], dtype=torch.int32),
+        )
+        pool = SimpleNamespace(
+            get_indexer_state_block_size=mock.Mock(return_value=2),
+            get_indexer_block_size=mock.Mock(return_value=64),
+            get_compressor_state_block_size=mock.Mock(return_value=4),
+            get_compressed_block_size=mock.Mock(return_value=64),
+        )
+        ctx = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            token_to_kv_pool=pool,
+            req_to_page=torch.zeros(8, 2, dtype=torch.int32),
+            attn_backend=SimpleNamespace(
+                forward_metadata=metadata,
+                forward_prefill_metadata=metadata,
+            ),
+            dsa_compressor_slot_cache=None,
+        )
+
+        # The capture call sizes and disarms the buffers from dummy metadata.
+        model.prepare_prefill_graph_replay(
+            ctx, torch.zeros(6, dtype=torch.int64), capture=True
+        )
+        buffers = model.pregraph_buffers
+        self.assertTrue(buffers.allocated)
+        self.assertFalse(ctx.dsa_pregraph_writes)
+        self.assertEqual(buffers.token_to_req.shape[0], 6)
+        self.assertEqual(list(buffers.indexer.state_block_table.shape), [6, 2])
+        self.assertEqual(list(buffers.c4.state_block_table.shape), [6, 1])
+
+        # A safe pure-extend replay stages live metadata and arms the flag.
+        model.prepare_prefill_graph_replay(ctx, positions, capture=False)
+        self.assertTrue(ctx.dsa_pregraph_writes)
+        self.assertEqual(
+            buffers.token_to_req[:num_tokens].tolist(), token_to_req.tolist()
+        )
+        self.assertEqual(buffers.token_to_req[num_tokens:].tolist(), [-1, -1])
+        expected_state = _group_slot_mapping_from_raw(
+            positions, token_to_req, state_table, 2
+        )
+        self.assertEqual(
+            buffers.indexer.state_slot_mapping[:num_tokens].tolist(),
+            expected_state.tolist(),
+        )
+        self.assertEqual(
+            buffers.indexer.state_slot_mapping[num_tokens:].tolist(), [-1, -1]
+        )
+        self.assertEqual(
+            buffers.indexer.kv_slot_mapping[:num_tokens].tolist(),
+            compressed_slots.tolist(),
+        )
+        self.assertEqual(
+            buffers.indexer.state_block_table[:2].tolist(), state_table.tolist()
+        )
+        self.assertEqual(buffers.indexer.state_block_table[2:].tolist(), [[-1, -1]] * 4)
+        expected_c4_state = _group_slot_mapping_from_raw(
+            positions, token_to_req, c4_state_table, 4
+        )
+        self.assertEqual(
+            buffers.c4.state_slot_mapping[:num_tokens].tolist(),
+            expected_c4_state.tolist(),
+        )
+        self.assertEqual(buffers.c4.state_slot_mapping[num_tokens:].tolist(), [-1, -1])
+        # Equal compressed block sizes share one mapping computation.
+        self.assertEqual(
+            buffers.c4.kv_slot_mapping[:num_tokens].tolist(),
+            compressed_slots.tolist(),
+        )
+        self.assertEqual(
+            buffers.c4.state_block_table[:2].tolist(), c4_state_table.tolist()
+        )
+        self.assertEqual(buffers.c4.state_block_table[2:].tolist(), [[-1]] * 4)
+        cache_metadata.compressed_slot_mapping.assert_called_once()
+        mapping_kwargs = cache_metadata.compressed_slot_mapping.call_args.kwargs
+        self.assertEqual(mapping_kwargs["kv_cache_block_size"], 64)
+        self.assertFalse(mapping_kwargs["use_decode_cache"])
+        model.finish_prefill_graph_replay(ctx)
+        self.assertFalse(ctx.dsa_pregraph_writes)
+
+        # Mixed forwards disarm (isolates the is_mixed() guard: MIXED is also
+        # not a pure extend, so this alone would not distinguish the two, but
+        # the DECODE case below covers the not-is_extend() guard).
+        ctx.forward_mode = ForwardMode.MIXED
+        model.prepare_prefill_graph_replay(ctx, positions, capture=False)
+        self.assertFalse(ctx.dsa_pregraph_writes)
+        self.assertEqual(buffers.indexer.state_slot_mapping.tolist(), [-1] * 6)
+
+        # Pure decode disarms (isolates the not-is_extend() guard).
+        ctx.forward_mode = ForwardMode.DECODE
+        buffers.indexer.state_slot_mapping[:num_tokens].fill_(0)
+        model.prepare_prefill_graph_replay(ctx, positions, capture=False)
+        self.assertFalse(ctx.dsa_pregraph_writes)
+        self.assertEqual(buffers.indexer.state_slot_mapping.tolist(), [-1] * 6)
+        ctx.forward_mode = ForwardMode.EXTEND
+
+        # Base pages shorter than the live table's request count disarm (the
+        # kernel would otherwise index out of the base-page tensor).
+        cache_metadata.indexer_state_base_logical_page = torch.zeros(
+            1, dtype=torch.int32
+        )
+        buffers.indexer.state_slot_mapping[:num_tokens].fill_(0)
+        model.prepare_prefill_graph_replay(ctx, positions, capture=False)
+        self.assertFalse(ctx.dsa_pregraph_writes)
+        self.assertEqual(buffers.indexer.state_slot_mapping.tolist(), [-1] * 6)
+        cache_metadata.indexer_state_base_logical_page = None
+
+        # A live table wider than the captured buffers disarms too.
+        ctx.forward_mode = ForwardMode.EXTEND
+        cache_metadata.indexer_state_block_table = torch.zeros(2, 3, dtype=torch.int32)
+        buffers.indexer.state_slot_mapping[:num_tokens].fill_(0)
+        model.prepare_prefill_graph_replay(ctx, positions, capture=False)
+        self.assertFalse(ctx.dsa_pregraph_writes)
+        self.assertEqual(buffers.indexer.state_slot_mapping.tolist(), [-1] * 6)
+
+        # A missing compressor-state table disarms (arm-both-or-none).
+        cache_metadata.indexer_state_block_table = state_table
+        cache_metadata.compressor_state_block_tables = {}
+        buffers.c4.state_slot_mapping[:num_tokens].fill_(0)
+        model.prepare_prefill_graph_replay(ctx, positions, capture=False)
+        self.assertFalse(ctx.dsa_pregraph_writes)
+        self.assertEqual(buffers.c4.state_slot_mapping.tolist(), [-1] * 6)
+
+        # Unequal compressed block sizes compute and stage a second C4
+        # mapping.
+        cache_metadata.compressor_state_block_tables = {4: c4_state_table}
+        c4_compressed_slots = torch.tensor([21, 22, -1, 25], dtype=torch.int64)
+        slots_by_block_size = {64: compressed_slots, 32: c4_compressed_slots}
+
+        def compressed_by_size(*args, kv_cache_block_size, **kwargs):
+            del args, kwargs
+            return slots_by_block_size[kv_cache_block_size]
+
+        cache_metadata.compressed_slot_mapping = mock.Mock(
+            side_effect=compressed_by_size
+        )
+        pool.get_compressed_block_size.return_value = 32
+        model.prepare_prefill_graph_replay(ctx, positions, capture=False)
+        self.assertTrue(ctx.dsa_pregraph_writes)
+        self.assertEqual(cache_metadata.compressed_slot_mapping.call_count, 2)
+        self.assertEqual(
+            buffers.indexer.kv_slot_mapping[:num_tokens].tolist(),
+            compressed_slots.tolist(),
+        )
+        self.assertEqual(
+            buffers.c4.kv_slot_mapping[:num_tokens].tolist(),
+            c4_compressed_slots.tolist(),
+        )
+        model.finish_prefill_graph_replay(ctx)
+
+    def test_insert_cache_pregraph_binds_staged_buffers_to_kernels(self):
+        num_tokens = 2
+        buffers = _DeepseekV4PregraphBuffers()
+        buffers.allocate(num_tokens, 1, 1, 1, torch.device("cpu"))
+        pool = SimpleNamespace(
+            get_indexer_state_buffer=mock.Mock(return_value=torch.empty(1, 1)),
+            get_indexer_state_block_size=mock.Mock(return_value=2),
+            get_indexer_block_size=mock.Mock(return_value=64),
+            get_indexer_kv_buffer_2d=mock.Mock(
+                return_value=torch.empty(1, 1, dtype=torch.uint8)
+            ),
+            get_compressor_state_buffer=mock.Mock(return_value=torch.empty(1, 1)),
+            get_compressor_state_block_size=mock.Mock(return_value=4),
+            get_compressed_kv_buffer_2d=mock.Mock(
+                return_value=torch.empty(1, 1, dtype=torch.uint8)
+            ),
+            get_compressed_block_size=mock.Mock(return_value=64),
+        )
+        ctx = SimpleNamespace(token_to_kv_pool=pool)
+        positions = torch.arange(num_tokens, dtype=torch.int64)
+
+        indexer = object.__new__(DeepseekV4Indexer)
+        torch.nn.Module.__init__(indexer)
+        indexer.compress_ratio = 4
+        indexer.use_fp4_cache = True
+        indexer.compressor = SimpleNamespace(
+            coff=1,
+            head_dim=2,
+            ape=torch.empty(4, 2),
+            norm=SimpleNamespace(weight=torch.ones(2), variance_epsilon=1.0e-6),
+        )
+        with (
+            mock.patch.object(
+                deepseek_v4_model, "save_deepseek_v4_compressor_state"
+            ) as save_state,
+            mock.patch.object(
+                deepseek_v4_model, "deepseek_v4_csa_indexer_cache_insert"
+            ) as indexer_insert,
+        ):
+            indexer.insert_cache_pregraph(
+                positions=positions,
+                ctx=ctx,
+                layer_index=0,
+                cos_sin_cache=torch.empty(1, ROPE_DIM),
+                kv_score=torch.zeros(num_tokens, 4),
+                buffers=buffers,
+            )
+        self.assertIs(
+            save_state.call_args.kwargs["slot_mapping"]._base,
+            buffers.indexer.state_slot_mapping,
+        )
+        kwargs = indexer_insert.call_args.kwargs
+        self.assertIs(
+            kwargs["compressor_slot_mapping"]._base,
+            buffers.indexer.state_slot_mapping,
+        )
+        self.assertIs(kwargs["kv_slot_mapping"]._base, buffers.indexer.kv_slot_mapping)
+        self.assertIs(kwargs["block_table"], buffers.indexer.state_block_table)
+        self.assertIs(
+            kwargs["block_table_base_offsets"], buffers.indexer.state_base_pages
+        )
+        self.assertIs(kwargs["token_to_req_indices"]._base, buffers.token_to_req)
+        self.assertTrue(kwargs["use_fp4_cache"])
+
+        compressor = object.__new__(DeepseekV4Compressor)
+        torch.nn.Module.__init__(compressor)
+        compressor.compress_ratio = 4
+        compressor.coff = 1
+        compressor.head_dim = 2
+        compressor.ape = torch.empty(4, 2)
+        compressor.norm = SimpleNamespace(weight=torch.ones(2), variance_epsilon=1.0e-6)
+        with (
+            mock.patch.object(
+                deepseek_v4_model, "save_deepseek_v4_compressor_state"
+            ) as save_state,
+            mock.patch.object(
+                deepseek_v4_model, "deepseek_v4_csa_compress_kv_cache_insert"
+            ) as compressor_insert,
+        ):
+            compressor.insert_cache_pregraph(
+                positions=positions,
+                ctx=ctx,
+                layer_index=0,
+                cos_sin_cache=torch.empty(1, ROPE_DIM),
+                kv_score=torch.zeros(num_tokens, 4),
+                buffers=buffers,
+            )
+        self.assertIs(
+            save_state.call_args.kwargs["slot_mapping"]._base,
+            buffers.c4.state_slot_mapping,
+        )
+        kwargs = compressor_insert.call_args.kwargs
+        self.assertIs(
+            kwargs["compressor_slot_mapping"]._base,
+            buffers.c4.state_slot_mapping,
+        )
+        self.assertIs(kwargs["kv_slot_mapping"]._base, buffers.c4.kv_slot_mapping)
+        self.assertIs(kwargs["block_table"], buffers.c4.state_block_table)
+        self.assertIs(kwargs["block_table_base_offsets"], buffers.c4.state_base_pages)
+        self.assertIs(kwargs["token_to_req_indices"]._base, buffers.token_to_req)
+
+    def test_indexer_forward_skips_cache_writes_when_pregraph_armed(self):
+        num_tokens = 2
+        indexer = object.__new__(DeepseekV4Indexer)
+        torch.nn.Module.__init__(indexer)
+        indexer.compress_ratio = 4
+        indexer.use_fp4_cache = True
+        indexer.compressor = mock.Mock()
+        expected_topk = torch.full((num_tokens, 2), 7, dtype=torch.int32)
+        indexer._forward_sparse_indexer_custom_op = mock.Mock(
+            return_value=expected_topk
+        )
+        packed_q_values = torch.zeros(num_tokens, 1, 1, dtype=torch.uint8)
+        packed_q_scales = torch.zeros(num_tokens, 1, dtype=torch.int32)
+        packed_weights = torch.zeros(num_tokens, 1)
+
+        cache_metadata = SimpleNamespace(compressed_slot_mapping=mock.Mock())
+        metadata = SimpleNamespace(
+            cache=cache_metadata,
+            token_to_req_indices=torch.zeros(num_tokens, dtype=torch.int32),
+            is_valid_token=None,
+            query_start_loc=torch.tensor([0, num_tokens], dtype=torch.int32),
+            seq_lens=torch.tensor([num_tokens], dtype=torch.int32),
+        )
+        pool = SimpleNamespace(
+            get_indexer_state_buffer=mock.Mock(return_value=torch.empty(1, 1)),
+            get_indexer_block_size=mock.Mock(return_value=64),
+            get_indexer_kv_buffer_2d=mock.Mock(
+                return_value=torch.empty(1, 1, dtype=torch.uint8)
+            ),
+        )
+        ctx = SimpleNamespace(
+            token_to_kv_pool=pool,
+            attn_backend=SimpleNamespace(
+                forward_metadata=metadata,
+                forward_prefill_metadata=metadata,
+            ),
+            forward_mode=ForwardMode.EXTEND,
+            dsa_pregraph_writes=True,
+        )
+
+        with (
+            mock.patch.object(
+                deepseek_v4_model,
+                "deepseek_v4_csa_indexer_cache_insert",
+            ) as indexer_insert,
+            mock.patch.object(
+                deepseek_v4_model,
+                "save_deepseek_v4_compressor_state",
+            ) as save_state,
+        ):
+            actual = indexer(
+                hidden_states=torch.zeros(num_tokens, 4),
+                qr=torch.zeros(num_tokens, 4),
+                positions=torch.arange(num_tokens, dtype=torch.int64),
+                ctx=ctx,
+                out_cache_loc=torch.arange(num_tokens, dtype=torch.int64),
+                layer_index=0,
+                cos_sin_cache=torch.empty(1, ROPE_DIM),
+                compressor_slot_cache={},
+                packed_q_values=packed_q_values,
+                packed_q_scales=packed_q_scales,
+                packed_weights=packed_weights,
+            )
+
+        self.assertIs(actual, expected_topk)
+        indexer.compressor.assert_not_called()
+        indexer_insert.assert_not_called()
+        save_state.assert_not_called()
+        cache_metadata.compressed_slot_mapping.assert_not_called()
+        custom_kwargs = indexer._forward_sparse_indexer_custom_op.call_args.kwargs
+        self.assertEqual(custom_kwargs["indexer_block_size"], 64)
+        # The skip path must thread the caller's already-packed triplet through
+        # unchanged (not drop/recompute it inside the sparse indexer op).
+        self.assertIs(custom_kwargs["packed_q_values"], packed_q_values)
+        self.assertIs(custom_kwargs["packed_q_scales"], packed_q_scales)
+        self.assertIs(custom_kwargs["packed_weights"], packed_weights)
+
+    def test_attention_forward_pregraph_insert_gate(self):
+        # The gate is load-bearing: the staging buffers stay armed with the
+        # last replay's mappings after finish clears the ctx flag, so the
+        # captured-write kernels must fire ONLY under an ambient breakable
+        # capture/replay with allocated buffers -- never on eager forwards.
+        num_tokens = 4
+        positions = torch.arange(num_tokens, dtype=torch.int64)
+
+        def build_attention(pregraph_buffers, use_fp4_cache):
+            attention = object.__new__(DeepseekV4Attention)
+            torch.nn.Module.__init__(attention)
+            attention.attention_kind = "csa"
+            attention.rotary_emb = SimpleNamespace(
+                cos_sin_cache=torch.zeros(1, ROPE_DIM, dtype=torch.float32)
+            )
+            attention.stream_fork = StreamFork(None)
+            attention.cache_layer_index = 0
+            attention.compress_ratio = 4
+            attention.pregraph_buffers = pregraph_buffers
+            attention._project_q_kv = mock.Mock(
+                return_value=(
+                    torch.zeros(num_tokens, 1, 2),
+                    torch.zeros(num_tokens, 2),
+                    torch.zeros(num_tokens, 2),
+                )
+            )
+            compressor = mock.Mock()
+            compressor_score = torch.zeros(num_tokens, 2)
+            compressor.compute_kv_score.return_value = compressor_score
+            attention.compressor = compressor
+            indexer = mock.Mock()
+            indexer.use_fp4_cache = use_fp4_cache
+            indexer_score = torch.zeros(num_tokens, 3)
+            indexer.compressor.compute_kv_score.return_value = indexer_score
+            indexer._prepare_packed_inputs.return_value = (None, None, None)
+            attention.indexer = indexer
+            attention._forward_attention_core = mock.Mock(
+                return_value=torch.zeros(num_tokens, 2)
+            )
+            attention._project_attention_output = mock.Mock(
+                side_effect=lambda output, *_: output
+            )
+            return attention, indexer, indexer_score, compressor, compressor_score
+
+        allocated = _DeepseekV4PregraphBuffers()
+        allocated.allocate(num_tokens, 1, 1, 1, torch.device("cpu"))
+        unallocated = _DeepseekV4PregraphBuffers()
+        cases = (
+            # (name, ambient, buffers, use_fp4, expect_indexer, expect_c4)
+            ("armed", True, allocated, True, True, True),
+            ("eager", False, allocated, True, False, False),
+            ("unallocated", True, unallocated, True, False, False),
+            # Gate structure check: with fp4 off only the indexer part is
+            # suppressed. In production fp8 configs the buffers are never
+            # allocated (the model hook is inert without an fp4 indexer
+            # layer), so allocated+fp8 is defense-in-depth, not a reachable
+            # serving state.
+            ("fp8_cache", True, allocated, False, False, True),
+        )
+        for name, ambient, buffers, use_fp4, expect_indexer, expect_c4 in cases:
+            with self.subTest(case=name):
+                attention, indexer, indexer_score, compressor, compressor_score = (
+                    build_attention(buffers, use_fp4)
+                )
+                ctx = SimpleNamespace()
+                with mock.patch(
+                    "tokenspeed.runtime.models.deepseek_v4.current_forward_ctx",
+                    return_value=ctx if ambient else None,
+                ):
+                    attention(
+                        positions,
+                        torch.zeros(num_tokens, 8),
+                        ctx,
+                        torch.arange(num_tokens, dtype=torch.int64),
+                    )
+                if expect_indexer:
+                    indexer.insert_cache_pregraph.assert_called_once()
+                    kwargs = indexer.insert_cache_pregraph.call_args.kwargs
+                    self.assertIs(kwargs["buffers"], buffers)
+                    self.assertIs(kwargs["kv_score"], indexer_score)
+                    self.assertIs(kwargs["positions"], positions)
+                    self.assertEqual(kwargs["layer_index"], 0)
+                else:
+                    indexer.insert_cache_pregraph.assert_not_called()
+                if expect_c4:
+                    compressor.insert_cache_pregraph.assert_called_once()
+                    kwargs = compressor.insert_cache_pregraph.call_args.kwargs
+                    self.assertIs(kwargs["buffers"], buffers)
+                    self.assertIs(kwargs["kv_score"], compressor_score)
+                    self.assertIs(kwargs["positions"], positions)
+                    self.assertEqual(kwargs["layer_index"], 0)
+                else:
+                    compressor.insert_cache_pregraph.assert_not_called()
+
+    def test_attention_core_skips_csa_compressor_when_pregraph_armed(self):
+        num_tokens = 2
+        cases = (
+            # (kind, ratio, armed, expect_compressor_called)
+            ("csa", 4, True, False),
+            ("csa", 4, False, True),
+            # HCA (C128) layers keep the eager compressor even when armed.
+            ("hca", 128, True, True),
+        )
+        for kind, ratio, armed, expect_called in cases:
+            with self.subTest(kind=kind, armed=armed):
+                attention = object.__new__(DeepseekV4Attention)
+                torch.nn.Module.__init__(attention)
+                attention.attention_kind = kind
+                attention.stream_fork = StreamFork(None)
+                attention.cache_layer_index = 0
+                attention.compress_ratio = ratio
+                attention.padded_heads = 2
+                attention.num_local_heads = 2
+                attention.head_dim = HEAD_DIM
+                attention.swa_window = 64
+                attention.scale = 1.0
+                attention.attn_sink = torch.zeros(1)
+                attention.compressor = mock.Mock()
+                attention.indexer = None
+                attention._insert_swa_cache = mock.Mock()
+
+                metadata = SimpleNamespace(
+                    token_to_req_indices=torch.arange(num_tokens, dtype=torch.int32),
+                    is_valid_token=None,
+                )
+                backend = SimpleNamespace(
+                    forward_metadata=metadata,
+                    forward_deepseek_v4_prefill=mock.Mock(
+                        side_effect=lambda **kw: kw["q"]
+                    ),
+                )
+                pool = SimpleNamespace(
+                    swa_block_size=4,
+                    get_swa_kv_buffer=mock.Mock(
+                        return_value=torch.empty(1, 1, dtype=torch.uint8)
+                    ),
+                )
+                ctx = SimpleNamespace(
+                    dsa_compressor_slot_cache=None,
+                    dsa_swa_slot_mapping=None,
+                    token_to_kv_pool=pool,
+                    attn_backend=backend,
+                    forward_mode=ForwardMode.EXTEND,
+                    dsa_pregraph_writes=armed,
+                )
+                with mock.patch(
+                    "tokenspeed.runtime.models.deepseek_v4.current_forward_ctx",
+                    return_value=None,
+                ):
+                    attention._forward_attention_core(
+                        torch.arange(num_tokens, dtype=torch.int64),
+                        torch.zeros(num_tokens, 8),
+                        torch.zeros(num_tokens, 2, HEAD_DIM),
+                        torch.zeros(num_tokens, HEAD_DIM),
+                        torch.zeros(num_tokens, 4),
+                        torch.zeros(1, ROPE_DIM),
+                        ctx,
+                        torch.arange(num_tokens, dtype=torch.int64),
+                        None,
+                        None,
+                        swa_slot_mapping=torch.arange(num_tokens, dtype=torch.int64),
+                        compressor_slot_cache={},
+                    )
+                if expect_called:
+                    attention.compressor.assert_called_once()
+                else:
+                    attention.compressor.assert_not_called()
+                attention._insert_swa_cache.assert_called_once()
+
+    def test_attention_core_returns_raw_output_without_projection(self):
+        attention = object.__new__(DeepseekV4Attention)
+        torch.nn.Module.__init__(attention)
+        attention.attention_kind = "swa"
+        attention.stream_fork = StreamFork(None)
+        attention.compressor = None
+        attention.indexer = None
+        attention.padded_heads = 2
+        attention.cache_layer_index = 0
+        attention.compress_ratio = 1
+        attention.num_local_heads = 2
+        attention.head_dim = HEAD_DIM
+        attention.swa_window = 64
+        attention.scale = 1.0
+        attention.attn_sink = torch.zeros(1)
+        attention._insert_swa_cache = mock.Mock()
+        attention._project_attention_output = mock.Mock()
+
+        positions = torch.arange(2, dtype=torch.int64)
+        hidden_states = torch.randn(2, 8)
+        q = torch.randn(2, 2, HEAD_DIM, dtype=torch.bfloat16)
+        kv = torch.randn(2, HEAD_DIM, dtype=torch.bfloat16)
+        qr = torch.randn(2, 32, dtype=torch.bfloat16)
+        cos_sin_cache = torch.zeros(1, ROPE_DIM, dtype=torch.float32)
+        raw_output = torch.randn_like(q)
+        backend = SimpleNamespace(
+            forward_metadata=SimpleNamespace(token_to_req_indices=None),
+            forward_deepseek_v4_prefill=mock.Mock(return_value=raw_output),
+        )
+        pool = SimpleNamespace(
+            swa_block_size=4,
+            get_swa_kv_buffer=mock.Mock(
+                return_value=torch.empty(1, 4 * 584, dtype=torch.uint8)
+            ),
+        )
+        ctx = SimpleNamespace(
+            dsa_compressor_slot_cache={},
+            dsa_swa_slot_mapping=None,
+            token_to_kv_pool=pool,
+            attn_backend=backend,
+            forward_mode=ForwardMode.EXTEND,
+        )
+
+        output = attention._forward_attention_core(
+            positions,
+            hidden_states,
+            q,
+            kv,
+            qr,
+            cos_sin_cache,
+            ctx,
+            torch.arange(2, dtype=torch.int64),
+            None,
+            None,
+            torch.arange(2, dtype=torch.int64),
+            {},
+        )
+
+        self.assertIs(output, raw_output)
+        attention._project_attention_output.assert_not_called()
+
+    def test_attention_forward_projects_core_output_once(self):
+        attention = object.__new__(DeepseekV4Attention)
+        torch.nn.Module.__init__(attention)
+        attention.attention_kind = "swa"
+        attention.stream_fork = StreamFork(None)
+        attention.compressor = None
+        attention.indexer = None
+        attention.rotary_emb = SimpleNamespace(
+            cos_sin_cache=torch.zeros(1, ROPE_DIM, dtype=torch.float64)
+        )
+
+        positions = torch.arange(3, dtype=torch.int64)
+        hidden_states = torch.randn(3, 8)
+        q = torch.randn(3, 2, HEAD_DIM, dtype=torch.bfloat16)
+        kv = torch.randn(3, HEAD_DIM, dtype=torch.bfloat16)
+        qr = torch.randn(3, 32, dtype=torch.bfloat16)
+        raw_output = torch.randn_like(q)
+        projected_output = torch.randn(3, 8)
+        attention._project_q_kv = mock.Mock(return_value=(q, kv, qr))
+        attention._forward_attention_core = mock.Mock(return_value=raw_output)
+        attention._project_attention_output = mock.Mock(return_value=projected_output)
+
+        output = attention(
+            positions,
+            hidden_states,
+            object(),
+            torch.arange(3, dtype=torch.int64),
+        )
+
+        self.assertIs(output, projected_output)
+        attention._forward_attention_core.assert_called_once()
+        attention._project_attention_output.assert_called_once()
+        core_args = attention._forward_attention_core.call_args.args
+        project_args = attention._project_attention_output.call_args.args
+        self.assertIs(core_args[0], positions)
+        self.assertIs(project_args[0], raw_output)
+        self.assertIs(project_args[1], positions)
+        self.assertIs(core_args[5], project_args[2])
+        self.assertEqual(project_args[2].dtype, torch.float32)
+
+    def test_attention_empty_input_skips_phase1(self):
+        attention = object.__new__(DeepseekV4Attention)
+        torch.nn.Module.__init__(attention)
+        attention._project_q_kv = mock.Mock()
+        attention._forward_attention_core = mock.Mock()
+        attention._project_attention_output = mock.Mock()
+        hidden_states = torch.empty(0, 8)
+
+        output = attention(
+            torch.empty(0, dtype=torch.int64),
+            hidden_states,
+            None,
+            torch.empty(0, dtype=torch.int64),
+        )
+
+        self.assertIs(output, hidden_states)
+        attention._project_q_kv.assert_not_called()
+        attention._forward_attention_core.assert_not_called()
+        attention._project_attention_output.assert_not_called()
+
     def test_swa_slot_mapping_guard_masks_out_of_range_slots(self):
         slots = torch.tensor([-3, -1, 0, 7, 8, 99], dtype=torch.int64)
 
@@ -457,6 +1591,121 @@ class DeepseekV4AttentionOpsCpuValidationTest(unittest.TestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class DeepseekV4AttentionOpsTest(unittest.TestCase):
+
+    def test_indexer_custom_op_routes_complete_triplet_or_legacy(self):
+        device = torch.device("cuda")
+        num_tokens = 3
+        indexer = object.__new__(DeepseekV4Indexer)
+        torch.nn.Module.__init__(indexer)
+        indexer.use_fp4_cache = True
+        indexer.compress_ratio = 4
+        indexer.topk_tokens = 2
+        indexer.topk_buffer = None
+        indexer._persistent_topk_workspace = torch.empty(
+            0, device=device, dtype=torch.uint8
+        )
+        empty_workspace = torch.empty((0, 0), device=device, dtype=torch.uint8)
+        indexer._prefill_gather_workspace = mock.Mock(
+            return_value=(empty_workspace, empty_workspace)
+        )
+
+        def triplet(seed):
+            return (
+                torch.full((num_tokens, 2, 2), seed, device=device, dtype=torch.uint8),
+                torch.full((num_tokens, 2), seed + 1, device=device, dtype=torch.int32),
+                torch.full((num_tokens, 2), float(seed + 2), device=device),
+            )
+
+        legacy = triplet(1)
+        supplied = triplet(11)
+        indexer._prepare_packed_inputs = mock.Mock(return_value=legacy)
+        block_table = torch.zeros((1, 1), device=device, dtype=torch.int32)
+        metadata = SimpleNamespace(
+            cache=SimpleNamespace(
+                compressed_block_table=mock.Mock(return_value=block_table)
+            ),
+            token_to_req_indices=torch.zeros(
+                num_tokens, device=device, dtype=torch.int32
+            ),
+            seq_lens_cpu=None,
+            query_lens_cpu=None,
+        )
+        prefill_metadata = SimpleNamespace(max_gather_rows=mock.Mock(return_value=0))
+        ctx = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
+        hidden_states = torch.zeros(num_tokens, 4, device=device)
+        qr = torch.zeros(num_tokens, 4, device=device)
+        positions = torch.arange(num_tokens, device=device, dtype=torch.int64)
+        cos_sin_cache = torch.empty(1, ROPE_DIM, device=device)
+        sparse_indexer = mock.Mock(
+            side_effect=lambda **kwargs: kwargs["topk_indices_buffer"]
+        )
+
+        def run(prepared=(None, None, None)):
+            return indexer._forward_sparse_indexer_custom_op(
+                hidden_states=hidden_states,
+                qr=qr,
+                positions=positions,
+                metadata=metadata,
+                ctx=ctx,
+                indexer_cache=torch.empty(1, 1, device=device, dtype=torch.uint8),
+                indexer_block_size=1,
+                cos_sin_cache=cos_sin_cache,
+                packed_q_values=prepared[0],
+                packed_q_scales=prepared[1],
+                packed_weights=prepared[2],
+            )
+
+        with (
+            mock.patch.object(
+                deepseek_v4_model,
+                "_deepseek_v4_deepgemm_fp4_indexer_available",
+                return_value=True,
+            ),
+            mock.patch.object(
+                deepseek_v4_model,
+                "_deepseek_v4_indexer_prefill_metadata",
+                return_value=prefill_metadata,
+            ),
+            mock.patch.object(
+                deepseek_v4_model,
+                "_deepseek_v4_sparse_attn_indexer",
+                sparse_indexer,
+            ),
+        ):
+            run()
+            indexer._prepare_packed_inputs.assert_called_once_with(
+                hidden_states=hidden_states,
+                qr=qr,
+                positions=positions,
+                cos_sin_cache=cos_sin_cache,
+            )
+            sparse_args = sparse_indexer.call_args.kwargs
+            self.assertIs(sparse_args["packed_q_values"], legacy[0])
+            self.assertIs(sparse_args["packed_q_scales"], legacy[1])
+            self.assertIs(sparse_args["packed_weights"], legacy[2])
+
+            indexer._prepare_packed_inputs.reset_mock()
+            sparse_indexer.reset_mock()
+            run(supplied)
+            indexer._prepare_packed_inputs.assert_not_called()
+            sparse_args = sparse_indexer.call_args.kwargs
+            self.assertIs(sparse_args["packed_q_values"], supplied[0])
+            self.assertIs(sparse_args["packed_q_scales"], supplied[1])
+            self.assertIs(sparse_args["packed_weights"], supplied[2])
+
+            partials = (
+                (supplied[0], supplied[1], None),
+                (supplied[0], None, supplied[2]),
+                (None, supplied[1], supplied[2]),
+            )
+            for partial in partials:
+                with self.subTest(partial=tuple(x is not None for x in partial)):
+                    indexer._prepare_packed_inputs.reset_mock()
+                    sparse_indexer.reset_mock()
+                    with self.assertRaisesRegex(ValueError, "provided together"):
+                        run(partial)
+                    indexer._prepare_packed_inputs.assert_not_called()
+                    sparse_indexer.assert_not_called()
 
     def test_sanitized_insert_write_safety_under_graph_replay(self):
         # Full producer -> sanitize -> CUDA graph replay -> cache write path.

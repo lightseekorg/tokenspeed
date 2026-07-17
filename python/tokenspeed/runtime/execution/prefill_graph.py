@@ -224,6 +224,20 @@ class PrefillGraph:
         # Embedding runs eagerly OUTSIDE the graphs (see capture); the graphs
         # read a static input-embeds buffer instead of gathering from input_ids.
         self._embed_tokens = getattr(self.inner_model, "embed_tokens", None)
+        # Optional model seam for captured cache writes fed by persistent
+        # metadata buffers (DeepSeek-V4 DSA): resolved once here like the
+        # other model seams; the hooks ship as a pair.
+        self._prepare_replay_hook = getattr(
+            self.inner_model, "prepare_prefill_graph_replay", None
+        )
+        self._finish_replay_hook = getattr(
+            self.inner_model, "finish_prefill_graph_replay", None
+        )
+        if (self._prepare_replay_hook is None) != (self._finish_replay_hook is None):
+            raise ValueError(
+                "prepare_prefill_graph_replay and finish_prefill_graph_replay "
+                "must be implemented together"
+            )
         self._input_embeds_buf: torch.Tensor | None = None
         self.attn_backend = attn_backend
         self.token_to_kv_pool = token_to_kv_pool
@@ -452,7 +466,7 @@ class PrefillGraph:
         )
         ib.req_pool_indices_buf[:1].zero_()
         ib.seq_lens_buf[:1].fill_(num_tokens)
-        ib.extend_seq_lens_buf[:1].fill_(num_tokens)
+        ib.input_lengths_buf[:1].fill_(num_tokens)
         ib.extend_seq_lens_cpu[:1].fill_(num_tokens)
         ib.extend_prefix_lens_buf[:1].zero_()
         ib.extend_prefix_lens_cpu[:1].zero_()
@@ -497,12 +511,16 @@ class PrefillGraph:
             seq_lens=ib.seq_lens_buf[:1],
             req_to_page=self.req_to_page,
             forward_mode=ForwardMode.EXTEND,
-            extend_seq_lens=ib.extend_seq_lens_buf[:1],
+            extend_seq_lens=ib.input_lengths_buf[:1],
             extend_seq_lens_cpu=ib.extend_seq_lens_cpu[:1],
             extend_prefix_lens=ib.extend_prefix_lens_buf[:1],
             extend_prefix_lens_cpu=ib.extend_prefix_lens_cpu[:1],
             **extra_metadata_kwargs,
         )
+        # The capture call is the one place the pregraph staging buffers may
+        # allocate, sized from the dummy metadata built above.
+        if self._prepare_replay_hook is not None:
+            self._prepare_replay_hook(ctx, ib.positions_buf[:num_tokens], capture=True)
         return ctx
 
     def _capture_unanimous(self, captured_ok: bool) -> bool:
@@ -579,8 +597,22 @@ class PrefillGraph:
                 ib.mrope_positions_buf[:, num_tokens:bucket].zero_()
             else:
                 ib.positions_buf[num_tokens:bucket].zero_()
-        with self._padded_to(ctx, bucket):
-            self._captures[bucket].replay()
+        # Same model seam as capture: stage (or disarm) the persistent
+        # metadata feeding captured cache writes from THIS forward's live
+        # metadata. The finish call runs in a finally as exception-path
+        # hygiene, keeping the armed flag scoped strictly to this replay.
+        try:
+            if self._prepare_replay_hook is not None:
+                self._prepare_replay_hook(
+                    ctx,
+                    self.input_buffers.positions_buf[:num_tokens],
+                    capture=False,
+                )
+            with self._padded_to(ctx, bucket):
+                self._captures[bucket].replay()
+        finally:
+            if self._finish_replay_hook is not None:
+                self._finish_replay_hook(ctx)
         hidden_states, aux_hidden_states = self._outputs[bucket].sliced(num_tokens)
         # The eager logits tail of BaseCausalLM.forward, on the replayed hidden states.
         logits_metadata = LogitsMetadata.from_forward_context(ctx)
