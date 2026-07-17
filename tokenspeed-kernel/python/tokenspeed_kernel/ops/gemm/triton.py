@@ -25,7 +25,7 @@ import json
 import logging
 import math
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
@@ -72,7 +72,8 @@ def prepare_block_fp8_matmul_inputs(
     Bs: torch.Tensor,
     block_size: List[int],
     output_dtype: torch.dtype = torch.float16,
-) -> Tuple[int, int, int]:
+    out: torch.Tensor | None = None,
+) -> tuple[int, int, int, torch.Tensor]:
     assert len(block_size) == 2
     block_n, block_k = block_size[0], block_size[1]
 
@@ -108,7 +109,7 @@ def prepare_block_fp8_matmul_inputs(
         raise NotImplementedError
 
     C_shape = A.shape[:-1] + (N,)
-    C = A.new_empty(C_shape, dtype=output_dtype)
+    C = out if out is not None else A.new_empty(C_shape, dtype=output_dtype)
 
     return M, N, K, C
 
@@ -415,6 +416,7 @@ def w8a8_block_fp8_matmul_triton(
     Bs: torch.Tensor,
     block_size: List[int],
     output_dtype: torch.dtype = torch.float16,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """This function performs matrix multiplication with block-wise quantization.
 
@@ -432,7 +434,9 @@ def w8a8_block_fp8_matmul_triton(
     Returns:
         torch.Tensor: The result of matmul.
     """
-    M, N, K, C = prepare_block_fp8_matmul_inputs(A, B, As, Bs, block_size, output_dtype)
+    M, N, K, C = prepare_block_fp8_matmul_inputs(
+        A, B, As, Bs, block_size, output_dtype, out=out
+    )
 
     block_n, block_k = block_size
 
@@ -648,6 +652,7 @@ def triton_scaled_mm(
     block_size_n: int = 32,
     block_size_k: int = 32,
     use_heuristic=True,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     M, K = input.shape
     N = weight.shape[1]
@@ -671,7 +676,15 @@ def triton_scaled_mm(
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
 
-    result = torch.empty((M, N), dtype=out_dtype, device=input.device)
+    result = (
+        out
+        if out is not None
+        else torch.empty((M, N), dtype=out_dtype, device=input.device)
+    )
+    if result.dtype != out_dtype:
+        raise ValueError(
+            f"triton_scaled_mm out expects dtype {out_dtype}, got {result.dtype}"
+        )
 
     has_scalar = lambda x: x.shape[0] == 1 and x.shape[1] == 1
 
@@ -720,7 +733,7 @@ def triton_scaled_mm(
         BLOCK_SIZE_SCALE_B=block_size_sb,
     )
 
-    return result.to(out_dtype)
+    return result
 
 
 # ---- Triton block-scaled FP8 ----------------------------------------------
@@ -748,6 +761,7 @@ def triton_mm_fp8_blockscale(
     *,
     alpha: torch.Tensor | None = None,
     block_size: list[int] | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert block_size is not None, "block_size is required for triton_mm_fp8_blockscale"
     assert (
@@ -760,6 +774,7 @@ def triton_mm_fp8_blockscale(
         B_scales,
         block_size=block_size,
         output_dtype=out_dtype,
+        out=out,
     )
 
 
@@ -855,6 +870,7 @@ def triton_mm_mxfp4(
     *,
     alpha: torch.Tensor | None = None,
     block_size: list[int] | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     del alpha, block_size
     if A.dtype != torch.uint8 or B.dtype != torch.uint8:
@@ -868,7 +884,7 @@ def triton_mm_mxfp4(
     N = B.shape[0]
     if K % 32 != 0:
         raise ValueError("MXFP4 GEMM requires K divisible by 32")
-    C = torch.empty(M, N, device=A.device, dtype=out_dtype)
+    C = out if out is not None else torch.empty(M, N, device=A.device, dtype=out_dtype)
     grid = (triton.cdiv(M, 16), triton.cdiv(N, 32))
     _mxfp4_mm_kernel[grid](
         A,
@@ -926,6 +942,7 @@ def triton_mm_fp8_scaled(
     alpha: torch.Tensor | None = None,
     block_size: list[int] | None = None,
     bias: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return triton_scaled_mm(
         A,
@@ -934,4 +951,5 @@ def triton_mm_fp8_scaled(
         B_scales,
         out_dtype=out_dtype,
         bias=bias,
+        out=out,
     )
