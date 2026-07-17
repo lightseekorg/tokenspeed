@@ -9,7 +9,7 @@ runner:
     - amd-mi35x-4gpu-test
 env:
   CI: "true"
-  TOKENSPEED_FLAT_KV: ON
+  TOKENSPEED_FLAT_KV: "ON"
 install:
   - bash test/ci_system/install_deps_rocm.sh
 server:
