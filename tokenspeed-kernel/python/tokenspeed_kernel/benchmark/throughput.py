@@ -55,6 +55,21 @@ class ThroughputCalculator:
         return (M * K + K * N + M * N) * element_size
 
     @staticmethod
+    def gemm_bmm_flops(batch: int, M: int, N: int, K: int) -> int:
+        return batch * ThroughputCalculator.gemm_mm_flops(M, N, K)
+
+    @staticmethod
+    def gemm_bmm_bytes(
+        batch: int,
+        M: int,
+        N: int,
+        K: int,
+        dtype: torch.dtype,
+    ) -> int:
+        element_size = _dtype_nbytes(dtype)
+        return (batch * M * K + batch * N * K + batch * M * N) * element_size
+
+    @staticmethod
     def attn_flops(
         batch: int,
         seq_len: int,
@@ -99,6 +114,28 @@ class ThroughputCalculator:
 
             flops = ThroughputCalculator.gemm_mm_flops(M, N, K)
             bytes_moved = ThroughputCalculator.gemm_mm_bytes(M, N, K, dtype)
+            seconds = latency_us * 1e-6
+
+            tflops = flops / seconds / 1e12
+            bandwidth = bytes_moved / seconds / 1e9
+            return tflops, bandwidth
+
+        if op_family == "gemm" and op_mode == "bmm":
+            batch = _shape_int(shape_params, "B", "batch")
+            M = _shape_int(shape_params, "M")
+            N = _shape_int(shape_params, "N")
+            K = _shape_int(shape_params, "K")
+            if any(value is None for value in (batch, M, N, K)):
+                return None, None
+
+            flops = ThroughputCalculator.gemm_bmm_flops(batch, M, N, K)
+            bytes_moved = ThroughputCalculator.gemm_bmm_bytes(
+                batch,
+                M,
+                N,
+                K,
+                dtype,
+            )
             seconds = latency_us * 1e-6
 
             tflops = flops / seconds / 1e12

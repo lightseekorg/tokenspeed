@@ -38,15 +38,58 @@ _FP8_TENSOR_SCALE = ScaleFormat(
     storage_dtype=torch.float32,
     granularity="tensor",
 )
+_FP8_CHANNEL_SCALE = ScaleFormat(
+    storage_dtype=torch.float32,
+    granularity="channel",
+)
 _MXFP8_FORMAT_SIGNATURES = format_signatures(
     ("a", "b"), "mxfp8", {fp8_dtype}, scale=_FP8_BLOCK_SCALE
 )
 _FP8_TENSOR_FORMAT_SIGNATURES = format_signatures(
     ("a", "b"), "scaled-fp8", {fp8_dtype}, scale=_FP8_TENSOR_SCALE
 )
+_FP8_SCALED_BMM_FORMAT_SIGNATURES = _FP8_TENSOR_FORMAT_SIGNATURES | format_signatures(
+    ("a", "b"), "scaled-fp8", {fp8_dtype}, scale=_FP8_CHANNEL_SCALE
+)
 _DENSE_GEMM_FORMAT_SIGNATURES = format_signatures(
     ("a", "b"), "dense", {torch.bfloat16, torch.float16, torch.float32}
 )
+
+
+def _as_baddbmm_alpha(alpha: torch.Tensor | float | int | None) -> float | int:
+    if alpha is None:
+        return 1
+    if isinstance(alpha, torch.Tensor):
+        if alpha.numel() != 1:
+            raise ValueError(
+                f"torch_bmm alpha expects a scalar tensor, got {alpha.shape}"
+            )
+        return alpha.item()
+    return alpha
+
+
+def _reference_mxfp8_quantize(
+    A: torch.Tensor,
+    *,
+    block_k: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    k_tiles = math.ceil(A.shape[-1] / block_k)
+    qA = torch.empty(A.shape, device=A.device, dtype=fp8_dtype)
+    A_scales = torch.empty(
+        (*A.shape[:-1], k_tiles),
+        device=A.device,
+        dtype=torch.float32,
+    )
+    fp8_max = float(torch.finfo(fp8_dtype).max)
+    min_scale = torch.finfo(torch.float32).tiny
+    for tile_idx in range(k_tiles):
+        start = tile_idx * block_k
+        end = min(start + block_k, A.shape[-1])
+        tile = A[..., start:end].float()
+        scale = (tile.abs().amax(dim=-1) / fp8_max).clamp_min(min_scale)
+        A_scales[..., tile_idx] = scale
+        qA[..., start:end] = (tile / scale.unsqueeze(-1)).to(fp8_dtype)
+    return qA, A_scales
 
 
 @register_kernel(
@@ -68,11 +111,12 @@ def torch_mm_fp8_blockscale(
     *,
     alpha: torch.Tensor | None = None,
     block_size: list[int] | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert block_size is not None, "block_size is required for mxfp8 reference"
-    assert (
-        A_scales is not None and B_scales is not None
-    ), "A_scales and B_scales are required for mxfp8 reference"
+    if A_scales is None:
+        A, A_scales = _reference_mxfp8_quantize(A, block_k=block_size[1])
+    assert B_scales is not None, "B_scales is required for mxfp8 reference"
     assert A.ndim == 2 and B.ndim == 2, f"Expected 2D inputs, got {A.ndim=} {B.ndim=}"
 
     M, K = A.shape
@@ -101,7 +145,13 @@ def torch_mm_fp8_blockscale(
 
     if alpha is not None:
         output = output * alpha.float()
-    return output.to(out_dtype)
+    output = output.to(out_dtype)
+    if out is not None:
+        # Reference expressions materialize through fp32 dequantization first,
+        # so support pre-allocated output by copying into caller storage.
+        out.copy_(output)
+        return out
+    return output
 
 
 @register_kernel(
@@ -125,6 +175,7 @@ def torch_mm_fp8_scaled_mnk(
     *,
     alpha: torch.Tensor | None = None,
     block_size: list[int] | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert block_size is None, "block_size is not supported for fp8 scaled reference"
     assert (
@@ -143,7 +194,13 @@ def torch_mm_fp8_scaled_mnk(
 
     if alpha is not None:
         output = output * alpha.float()
-    return output.to(out_dtype)
+    output = output.to(out_dtype)
+    if out is not None:
+        # Reference expressions materialize through fp32 dequantization first,
+        # so support pre-allocated output by copying into caller storage.
+        out.copy_(output)
+        return out
+    return output
 
 
 @register_kernel(
@@ -167,6 +224,7 @@ def torch_mm_fp8_scaled_nkm(
     *,
     alpha: torch.Tensor | None = None,
     block_size: list[int] | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert block_size is None, "block_size is not supported for fp8 scaled reference"
     assert (
@@ -183,7 +241,13 @@ def torch_mm_fp8_scaled_nkm(
 
     if alpha is not None:
         output = output * alpha.float()
-    return output.to(out_dtype)
+    output = output.to(out_dtype)
+    if out is not None:
+        # Reference expressions materialize through fp32 dequantization first,
+        # so support pre-allocated output by copying into caller storage.
+        out.copy_(output)
+        return out
+    return output
 
 
 @register_kernel(
@@ -206,7 +270,22 @@ def torch_mm(
     alpha: torch.Tensor | None = None,
     block_size: list[int] | None = None,
     bias: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    if out is not None:
+        if out_dtype != A.dtype:
+            raise ValueError(
+                f"torch_mm out= requires out_dtype {A.dtype}, got {out_dtype}"
+            )
+        # F.linear has no portable out= form, so write the GEMM natively and
+        # apply the epilogue in place.
+        output = torch.mm(A, B.T, out=out)
+        if alpha is not None:
+            output.mul_(alpha.to(dtype=output.dtype))
+        if bias is not None:
+            output.add_(bias.to(dtype=output.dtype))
+        return output
+
     if alpha is None:
         # F.linear fuses the bias add inside the GEMM epilogue.
         output = F.linear(A, B, bias)
@@ -216,3 +295,217 @@ def torch_mm(
         if bias is not None:
             output = output + bias.to(dtype=output.dtype)
     return output.to(out_dtype)
+
+
+@register_kernel(
+    "gemm",
+    "bmm",
+    name="torch_bmm_fp8_blockscale",
+    solution="reference",
+    signatures=_MXFP8_FORMAT_SIGNATURES,
+    traits={},
+    priority=Priority.PORTABLE + 2,
+    tags={"portability"},
+)
+def torch_bmm_fp8_blockscale(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scales: torch.Tensor | None,
+    B_scales: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    *,
+    alpha: torch.Tensor | None = None,
+    block_size: list[int] | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    assert block_size is not None, "block_size is required for mxfp8 reference"
+    if A_scales is None:
+        A, A_scales = _reference_mxfp8_quantize(A, block_k=block_size[1])
+    assert B_scales is not None, "B_scales is required for mxfp8 reference"
+    assert A.ndim == 3 and B.ndim == 3, f"Expected 3D inputs, got {A.ndim=} {B.ndim=}"
+
+    batch, M, K = A.shape
+    B_batch, N, K_b = B.shape
+    assert B_batch == batch, f"Expected matching batch dims, got {A.shape=} {B.shape=}"
+    assert K_b == K, f"Expected B in [B, N, K] layout, got shape={tuple(B.shape)}"
+
+    block_n, block_k = block_size
+    k_tiles = math.ceil(K / block_k)
+    n_tiles = math.ceil(N / block_n)
+    assert A_scales.shape == (batch, M, k_tiles), (
+        f"A_scales shape mismatch: expected {(batch, M, k_tiles)}, "
+        f"got {tuple(A_scales.shape)}"
+    )
+    assert B_scales.shape == (batch, n_tiles, k_tiles), (
+        f"B_scales shape mismatch: expected {(batch, n_tiles, k_tiles)}, "
+        f"got {tuple(B_scales.shape)}"
+    )
+
+    A_scaled = A_scales.float().repeat_interleave(block_k, dim=2)[:, :, :K]
+    B_scaled = (
+        B_scales.float()
+        .repeat_interleave(block_n, dim=1)
+        .repeat_interleave(block_k, dim=2)[:, :N, :K]
+    )
+    output = torch.bmm(A.float() * A_scaled, (B.float() * B_scaled).transpose(1, 2))
+
+    if alpha is not None:
+        output = output * alpha.float()
+    output = output.to(out_dtype)
+    if out is not None:
+        # Reference expressions materialize through fp32 dequantization first,
+        # so support pre-allocated output by copying into caller storage.
+        out.copy_(output)
+        return out
+    return output
+
+
+def _bmm_scaled_fp8_scale(
+    scale: torch.Tensor | None,
+    *,
+    batch: int,
+    rows: int,
+    name: str,
+) -> float | torch.Tensor:
+    assert scale is not None, f"{name} is required for fp8 scaled reference"
+    if scale.shape == (1,):
+        return float(scale.item())
+    if scale.shape == (batch, rows):
+        return scale.float().unsqueeze(-1)
+    raise AssertionError(
+        f"{name} shape mismatch: expected (1,) or {(batch, rows)}, "
+        f"got {tuple(scale.shape)}"
+    )
+
+
+@register_kernel(
+    "gemm",
+    "bmm",
+    name="torch_bmm_fp8_scaled",
+    solution="reference",
+    signatures=_FP8_SCALED_BMM_FORMAT_SIGNATURES,
+    traits={},
+    priority=Priority.PORTABLE,
+    tags={"portability"},
+)
+def torch_bmm_fp8_scaled(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scales: torch.Tensor | None,
+    B_scales: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    *,
+    alpha: torch.Tensor | None = None,
+    block_size: list[int] | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    assert block_size is None, "block_size is not supported for fp8 scaled reference"
+    assert A.ndim == 3 and B.ndim == 3, f"Expected 3D inputs, got {A.ndim=} {B.ndim=}"
+
+    batch, M, K = A.shape
+    B_batch, N, K_b = B.shape
+    assert B_batch == batch, f"Expected matching batch dims, got {A.shape=} {B.shape=}"
+    assert K_b == K, f"Expected B in [B, N, K] layout, got shape={tuple(B.shape)}"
+
+    A_scale = _bmm_scaled_fp8_scale(A_scales, batch=batch, rows=M, name="A_scales")
+    B_scale = _bmm_scaled_fp8_scale(B_scales, batch=batch, rows=N, name="B_scales")
+    output = torch.bmm(A.float() * A_scale, (B.float() * B_scale).transpose(1, 2))
+
+    if alpha is not None:
+        output = output * alpha.float()
+    output = output.to(out_dtype)
+    if out is not None:
+        # Reference expressions materialize through fp32 dequantization first,
+        # so support pre-allocated output by copying into caller storage.
+        out.copy_(output)
+        return out
+    return output
+
+
+@register_kernel(
+    "gemm",
+    "bmm",
+    name="torch_bmm",
+    solution="reference",
+    signatures=_DENSE_GEMM_FORMAT_SIGNATURES,
+    priority=Priority.PORTABLE + 3,
+    tags={"determinism", "portability"},
+)
+def torch_bmm(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scales: torch.Tensor | None,
+    B_scales: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    *,
+    alpha: torch.Tensor | None = None,
+    block_size: list[int] | None = None,
+    bias: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if A_scales is not None:
+        raise ValueError("A_scales are not supported for dense reference BMM")
+    if B_scales is not None:
+        raise ValueError("B_scales are not supported for dense reference BMM")
+    if block_size is not None:
+        raise ValueError("block_size is not supported for dense reference BMM")
+    if A.ndim != 3:
+        raise ValueError(f"torch_bmm expects A=[B, M, K], got {A.shape}")
+    if B.ndim != 3:
+        raise ValueError(f"torch_bmm expects B=[B, N, K], got {B.shape}")
+    if A.shape[0] != B.shape[0]:
+        raise ValueError(f"torch_bmm batch mismatch: {A.shape=} {B.shape=}")
+    if A.shape[2] != B.shape[2]:
+        raise ValueError(f"torch_bmm K mismatch: {A.shape=} {B.shape=}")
+    if out is not None and out_dtype != A.dtype:
+        raise ValueError(
+            f"torch_bmm out= requires out_dtype {A.dtype}, got {out_dtype}"
+        )
+    if bias is not None and out_dtype == A.dtype:
+        bias = bias.to(dtype=A.dtype)
+        # torch.baddbmm is the batched equivalent of the dense F.linear path:
+        # it combines bias, alpha, matmul, and out= for native output dtype.
+        if bias.ndim == 1:
+            bias_view = bias.view(1, 1, -1)
+        elif bias.ndim == 2:
+            bias_view = bias.view(bias.shape[0], 1, bias.shape[1])
+        else:
+            raise ValueError(
+                f"torch_bmm bias expects shape [N] or [B, N], got {bias.shape}"
+            )
+        if out is not None:
+            return torch.baddbmm(
+                bias_view,
+                A,
+                B.transpose(1, 2),
+                alpha=_as_baddbmm_alpha(alpha),
+                out=out,
+            )
+        return torch.baddbmm(
+            bias_view,
+            A,
+            B.transpose(1, 2),
+            alpha=_as_baddbmm_alpha(alpha),
+        )
+
+    output = torch.bmm(A, B.transpose(1, 2), out=out)
+    if alpha is not None:
+        output.mul_(alpha.to(dtype=output.dtype))
+    if bias is not None:
+        bias = bias.to(dtype=output.dtype)
+        # Match mm bias broadcasting for either a shared [N] vector or a
+        # per-batch [B, N] bias matrix.
+        if bias.ndim == 1:
+            bias_view = bias.view(1, 1, -1)
+        elif bias.ndim == 2:
+            bias_view = bias.view(bias.shape[0], 1, bias.shape[1])
+        else:
+            raise ValueError(
+                f"torch_bmm bias expects shape [N] or [B, N], got {bias.shape}"
+            )
+        output.add_(bias_view)
+    if output.dtype != out_dtype:
+        # torch.bmm only writes the input dtype; non-native output dtypes are
+        # represented as a reference cast after the native epilogue.
+        output = output.to(out_dtype)
+    return output
