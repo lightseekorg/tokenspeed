@@ -38,8 +38,12 @@ from tokenspeed_kernel.ops.attention import (
     mha_prefill,
     mla_decode_with_kvcache,
     mla_prefill,
+    rel_mha_decode_with_kvcache,
+    rel_mha_extend_with_kvcache,
+    rel_mha_plan,
+    rel_mha_prefill,
 )
-from tokenspeed_kernel.ops.gemm import mm
+from tokenspeed_kernel.ops.gemm import bmm, mm
 from tokenspeed_kernel.ops.moe import moe_apply, moe_plan, moe_process_weights
 from tokenspeed_kernel.ops.quantization import (
     quantize_fp8,
@@ -56,12 +60,17 @@ __all__ = [
     # exceptions
     "NoKernelFoundError",
     # gemm
+    "bmm",
     "mm",
     # attention
     "mha_plan",
     "mha_prefill",
     "mha_extend_with_kvcache",
     "mha_decode_with_kvcache",
+    "rel_mha_prefill",
+    "rel_mha_extend_with_kvcache",
+    "rel_mha_decode_with_kvcache",
+    "rel_mha_plan",
     "mla_prefill",
     "mla_decode_with_kvcache",
     "dsa_prefill",

@@ -273,3 +273,21 @@ def format_signatures(
         )
         for storage_dtype in storage_dtypes
     )
+
+
+def __getattr__(name: str):
+    # Canonical MXFP8 per-32-element block-scale format (UE8M0), shared by
+    # the attention dispatchers and kernel registrations. Materialized
+    # lazily (and cached in module globals) so this module stays free of
+    # runtime torch imports; the dtype constant is the only torch need.
+    if name == "MXFP8_BLOCK_SCALE":
+        import torch
+
+        value = ScaleFormat(
+            storage_dtype=torch.float8_e8m0fnu,
+            granularity="block",
+            block_shape=(1, 32),
+        )
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

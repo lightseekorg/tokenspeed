@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import dataclasses
 import uuid
+from collections.abc import Mapping
 from enum import Enum, auto
 from typing import Any
 
@@ -35,32 +36,113 @@ from tokenspeed.runtime.multimodal.shm_transport import ShmTensorHandle
 from tokenspeed.runtime.utils.env import envs
 
 # Multimodal pad-value substitute IDs: a placeholder mm token's id is rewritten
-# to ``_MM_PAD_BASE + (hash & _MM_PAD_HASH_MASK)`` so duplicate features share
-# the same substitute and prefix-match in the text-only prefix cache. The base
-# sits well above any text vocab; the 30-bit mask keeps cross-hash collisions
-# rare enough for long-running servers (~10^9 slots).
+# to a content-derived value so duplicate features share the same substitute and
+# prefix-match in the text-only prefix cache. The signed-int32 space above the
+# text vocabulary is split into one equally sized interval per modality;
+# speculative draft models use that interval tag to replace image/audio/video
+# positions with the corresponding in-vocab placeholder before embedding lookup.
+# Interval encoding preserves substantially more content-hash entropy than
+# packing a two-bit modality tag into the old 30-bit payload.
 _MM_PAD_BASE = 1_000_000
-_MM_PAD_HASH_MASK = (1 << 30) - 1
+_MM_PAD_INT32_MAX = (1 << 31) - 1
+_MM_PAD_MODALITY_COUNT = 3
+_MM_PAD_HASH_SLOTS = (_MM_PAD_INT32_MAX - _MM_PAD_BASE + 1) // _MM_PAD_MODALITY_COUNT
+_MM_PAD_MAX = _MM_PAD_BASE + _MM_PAD_HASH_SLOTS * _MM_PAD_MODALITY_COUNT - 1
 
 
 def is_mm_pad_value(token_ids: torch.Tensor) -> torch.Tensor:
     """Bool mask of positions rewritten to a hash-derived multimodal pad id."""
-    return (token_ids >= _MM_PAD_BASE) & (token_ids <= _MM_PAD_BASE + _MM_PAD_HASH_MASK)
+    return (token_ids >= _MM_PAD_BASE) & (token_ids <= _MM_PAD_MAX)
+
+
+def _modality_pad_tag(modality: "Modality") -> int:
+    return {
+        Modality.IMAGE: 0,
+        Modality.VIDEO: 1,
+        Modality.AUDIO: 2,
+    }[modality]
+
+
+def is_mm_pad_value_for(token_ids: torch.Tensor, modality: "Modality") -> torch.Tensor:
+    """Bool mask for hash-derived pad IDs belonging to ``modality``."""
+    relative = token_ids - _MM_PAD_BASE
+    return is_mm_pad_value(token_ids) & (
+        torch.div(relative, _MM_PAD_HASH_SLOTS, rounding_mode="floor")
+        == _modality_pad_tag(modality)
+    )
 
 
 def maybe_substitute_mm_pad(
-    input_ids: torch.Tensor, substitute_id: int | None
+    input_ids: torch.Tensor,
+    substitute_ids: int | Mapping["Modality", int] | None,
 ) -> torch.Tensor:
-    """Replace hash mm-pad positions with ``substitute_id``; no-op if None."""
-    if substitute_id is None:
+    """Replace hash MM-pad positions with in-vocab draft token IDs.
+
+    A scalar keeps the legacy behavior and substitutes every modality with one
+    token. A mapping preserves modality-specific semantics, which is required
+    by mixed image+audio prompts such as TML/Inkling.
+    """
+    if substitute_ids is None:
         return input_ids
-    return input_ids.masked_fill(is_mm_pad_value(input_ids), substitute_id)
+    if isinstance(substitute_ids, int):
+        return input_ids.masked_fill(is_mm_pad_value(input_ids), substitute_ids)
+
+    output = input_ids
+    for modality, substitute_id in substitute_ids.items():
+        if output is input_ids:
+            output = input_ids.clone()
+        output.masked_fill_(is_mm_pad_value_for(input_ids, modality), substitute_id)
+    return output
 
 
 class Modality(Enum):
     IMAGE = auto()
     VIDEO = auto()
     AUDIO = auto()
+
+
+def resolve_mm_pad_substitute_ids(config: Any) -> dict[Modality, int]:
+    """Resolve in-vocab speculative-draft tokens for each media modality.
+
+    Model families use different configuration names. Prefer a modality's
+    explicit token, then its transport placeholder, and finally a shared media
+    placeholder. Returning only configured modalities lets text-only and
+    partially multimodal models keep their existing behavior.
+    """
+
+    sources = [config]
+    # Composite multimodal configs do not consistently forward their media
+    # token IDs. Qwen3-Omni, for example, keeps all three on thinker_config.
+    for nested_name in ("thinker_config", "text_config"):
+        nested = getattr(config, nested_name, None)
+        if nested is not None and all(nested is not source for source in sources):
+            sources.append(nested)
+
+    def first_configured(*names: str) -> int | None:
+        for name in names:
+            for source in sources:
+                value = getattr(source, name, None)
+                if value is not None:
+                    return int(value)
+        return None
+
+    shared = first_configured("media_placeholder_token_id")
+    candidates = {
+        Modality.IMAGE: first_configured(
+            "image_token_id", "image_placeholder_token_id"
+        ),
+        Modality.VIDEO: first_configured(
+            "video_token_id", "video_placeholder_token_id"
+        ),
+        Modality.AUDIO: first_configured(
+            "audio_token_id", "audio_placeholder_token_id"
+        ),
+    }
+    return {
+        modality: token_id if token_id is not None else shared
+        for modality, token_id in candidates.items()
+        if token_id is not None or shared is not None
+    }
 
 
 # ``eq=False`` on every dataclass below: tensor-valued fields crash the
@@ -130,7 +212,10 @@ class MultimodalDataItem:
         if self.pad_value is not None:
             return
         self.ensure_hash()
-        self.pad_value = _MM_PAD_BASE + (self.hash & _MM_PAD_HASH_MASK)
+        modality_offset = _modality_pad_tag(self.modality) * _MM_PAD_HASH_SLOTS
+        self.pad_value = (
+            _MM_PAD_BASE + modality_offset + (self.hash % _MM_PAD_HASH_SLOTS)
+        )
 
     def is_modality(self, modality: Modality) -> bool:
         return self.modality == modality

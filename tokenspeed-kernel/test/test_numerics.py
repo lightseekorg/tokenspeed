@@ -24,6 +24,13 @@ import pytest
 import torch
 from tokenspeed_kernel.numerics.comparison import compare_outputs, format_comparison
 from tokenspeed_kernel.numerics.inputs import get_input_generator
+from tokenspeed_kernel.numerics.reference.gemm import (
+    torch_bmm_fp8_blockscale,
+    torch_bmm_fp8_scaled,
+    torch_mm_fp8_blockscale,
+    torch_mm_fp8_scaled_mnk,
+    torch_mm_fp8_scaled_nkm,
+)
 from tokenspeed_kernel.numerics.tolerance import Tolerance
 from tokenspeed_kernel.numerics.verify import (
     _verification_signature_and_reference,
@@ -113,6 +120,146 @@ def test_gemm_input_generator_requires_mxfp8_block_shape() -> None:
 
     with pytest.raises(ValueError, match="requires concrete block_shape"):
         generator.generate(M=4, N=256, K=128)
+
+
+def test_quantized_reference_gemm_supports_out() -> None:
+    A = torch.empty((2, 128), dtype=_fp8_dtype)
+    B = torch.empty((256, 128), dtype=_fp8_dtype)
+    tensor_scale = torch.ones((1,), dtype=torch.float32)
+    block_a_scale = torch.ones((2, 1), dtype=torch.float32)
+    block_b_scale = torch.ones((2, 1), dtype=torch.float32)
+    out = torch.empty((2, 256), dtype=torch.bfloat16)
+
+    blockscale = torch_mm_fp8_blockscale(
+        A,
+        B,
+        block_a_scale,
+        block_b_scale,
+        torch.bfloat16,
+        block_size=[128, 128],
+        out=out,
+    )
+    assert blockscale is out
+
+    scaled_mnk = torch_mm_fp8_scaled_mnk(
+        A,
+        B,
+        tensor_scale,
+        tensor_scale,
+        torch.bfloat16,
+        out=out,
+    )
+    assert scaled_mnk is out
+
+    scaled_nkm = torch_mm_fp8_scaled_nkm(
+        A,
+        B.T,
+        tensor_scale,
+        tensor_scale,
+        torch.bfloat16,
+        out=out,
+    )
+    assert scaled_nkm is out
+
+
+def test_quantized_reference_bmm_supports_out() -> None:
+    A = torch.empty((2, 4, 128), dtype=_fp8_dtype)
+    B = torch.empty((2, 256, 128), dtype=_fp8_dtype)
+    tensor_scale = torch.ones((1,), dtype=torch.float32)
+    channel_a_scale = torch.ones((2, 4), dtype=torch.float32)
+    channel_b_scale = torch.ones((2, 256), dtype=torch.float32)
+    block_a_scale = torch.ones((2, 4, 1), dtype=torch.float32)
+    block_b_scale = torch.ones((2, 2, 1), dtype=torch.float32)
+    out = torch.empty((2, 4, 256), dtype=torch.bfloat16)
+
+    blockscale = torch_bmm_fp8_blockscale(
+        A,
+        B,
+        block_a_scale,
+        block_b_scale,
+        torch.bfloat16,
+        block_size=[128, 128],
+        out=out,
+    )
+    assert blockscale is out
+
+    tensor_scaled = torch_bmm_fp8_scaled(
+        A,
+        B,
+        tensor_scale,
+        tensor_scale,
+        torch.bfloat16,
+        out=out,
+    )
+    assert tensor_scaled is out
+
+    channel_scaled = torch_bmm_fp8_scaled(
+        A,
+        B,
+        channel_a_scale,
+        channel_b_scale,
+        torch.bfloat16,
+        out=out,
+    )
+    assert channel_scaled is out
+
+
+def test_bmm_input_generator_uses_signature_scale_metadata() -> None:
+    scale = ScaleFormat(
+        storage_dtype=torch.float32,
+        granularity="block",
+        block_shape=(128, 128),
+    )
+    signature = next(
+        iter(format_signatures(("a", "b"), "mxfp8", {_fp8_dtype}, scale=scale))
+    )
+    generator = get_input_generator(
+        "gemm",
+        "bmm",
+        dtype=_fp8_dtype,
+        traits={},
+        format_signature=signature,
+        device="cpu",
+    )
+
+    inputs = generator.generate(batch=2, M=4, N=256, K=128)
+
+    assert inputs["A"].shape == (2, 4, 128)
+    assert inputs["B"].shape == (2, 256, 128)
+    assert inputs["A"].dtype == _fp8_dtype
+    assert inputs["B"].dtype == _fp8_dtype
+    assert inputs["A_scales"].shape == (2, 4, 1)
+    assert inputs["B_scales"].shape == (2, 2, 1)
+    assert inputs["A_scales"].dtype == torch.float32
+    assert inputs["B_scales"].dtype == torch.float32
+    assert inputs["block_size"] == [128, 128]
+
+
+def test_bmm_input_generator_supports_scaled_fp8_channel_scales() -> None:
+    scale = ScaleFormat(storage_dtype=torch.float32, granularity="channel")
+    signature = next(
+        iter(format_signatures(("a", "b"), "scaled-fp8", {_fp8_dtype}, scale=scale))
+    )
+    generator = get_input_generator(
+        "gemm",
+        "bmm",
+        dtype=_fp8_dtype,
+        traits={},
+        format_signature=signature,
+        device="cpu",
+    )
+
+    inputs = generator.generate(batch=2, M=4, N=256, K=128)
+
+    assert inputs["A"].shape == (2, 4, 128)
+    assert inputs["B"].shape == (2, 256, 128)
+    assert inputs["A"].dtype == _fp8_dtype
+    assert inputs["B"].dtype == _fp8_dtype
+    assert inputs["A_scales"].shape == (2, 4)
+    assert inputs["B_scales"].shape == (2, 256)
+    assert inputs["A_scales"].dtype == torch.float32
+    assert inputs["B_scales"].dtype == torch.float32
+    assert inputs["block_size"] is None
 
 
 def test_verification_uses_signature_with_compatible_reference(fresh_registry) -> None:

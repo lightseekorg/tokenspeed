@@ -32,6 +32,8 @@ import signal
 import sys
 from pathlib import Path
 
+from tokenspeed_kernel.platform import current_platform
+
 from tokenspeed.cli._argsplit import OrchestratorOpts, split_argv
 from tokenspeed.cli._logo import print_logo
 from tokenspeed.cli._logprefix import ENGINE_TAG, GATEWAY_TAG, tag_stream
@@ -54,7 +56,12 @@ DEEPSEEK_V4_REASONING_PARSER = "deepseek_v31"
 DEEPSEEK_V4_TOOL_CALL_PARSER = "deepseek_v4"
 GLM_REASONING_PARSER = "glm45"
 GLM_TOOL_CALL_PARSER = "glm47_moe"
+INKLING_REASONING_PARSER = "inkling"
+INKLING_TOOL_CALL_PARSER = "inkling"
+INKLING_ATTENTION_BACKEND = "fa4"
 DEFAULT_SMG_LOG_LEVEL = "warn"
+GRPC_MAX_MESSAGE_BYTES_ENV = "TOKENSPEED_GRPC_MAX_MESSAGE_BYTES"
+DEFAULT_GRPC_MAX_MESSAGE_BYTES = "536870912"
 # smg routing policy for ``ts serve``. Distinct from DEFAULT_REASONING_PARSER,
 # which happens to share the "passthrough" string but configures an unrelated
 # flag (--reasoning-parser).
@@ -66,6 +73,16 @@ _DEFAULT_SMG_DISABLE_FLAGS = (
     "--disable-circuit-breaker",
     "--disable-retries",
 )
+
+
+def _set_default_grpc_max_message_bytes() -> None:
+    """Raise the gRPC payload ceiling for ``ts serve`` child processes.
+
+    Multimodal tensors can exceed the smaller transport default. ``setdefault``
+    keeps this an orchestrator default: an operator-provided environment value
+    is inherited unchanged by both the engine and gateway subprocesses.
+    """
+    os.environ.setdefault(GRPC_MAX_MESSAGE_BYTES_ENV, DEFAULT_GRPC_MAX_MESSAGE_BYTES)
 
 
 def _check_serve_extra_installed() -> None:
@@ -222,25 +239,28 @@ def _user_model_id(gateway_args: list[str]) -> str | None:
     return gateway_args[idx + 1]
 
 
-def _is_deepseek_v4_model(model_id: str | None) -> bool:
+def _load_model_config(model_id: str | None) -> dict:
+    """Best-effort read of ``<model_id>/config.json`` (empty dict on any miss)."""
     if not model_id:
-        return False
-
-    normalized = model_id.lower().replace("_", "-")
-    compact = normalized.replace("-", "")
-    if "deepseek-v4" in normalized or "deepseekv4" in compact:
-        return True
-
+        return {}
     config_path = Path(model_id) / "config.json"
     if not config_path.is_file():
-        return False
+        return {}
     try:
         with config_path.open() as f:
             config = json.load(f)
     except (OSError, json.JSONDecodeError):
+        return {}
+    return config if isinstance(config, dict) else {}
+
+
+def _is_deepseek_v4_model(model_id: str | None) -> bool:
+    if not model_id:
         return False
-    if not isinstance(config, dict):
-        return False
+    normalized = model_id.lower().replace("_", "-")
+    if "deepseek-v4" in normalized or "deepseekv4" in normalized.replace("-", ""):
+        return True
+    config = _load_model_config(model_id)
     architectures = config.get("architectures") or []
     return (
         config.get("model_type") == "deepseek_v4"
@@ -251,26 +271,55 @@ def _is_deepseek_v4_model(model_id: str | None) -> bool:
 def _is_glm_dsa_model(model_id: str | None) -> bool:
     if not model_id:
         return False
-
     normalized = model_id.lower().replace("_", "-")
-    compact = normalized.replace("-", "")
-    if "glm-5" in normalized or "glm5" in compact:
+    if "glm-5" in normalized or "glm5" in normalized.replace("-", ""):
         return True
-
-    config_path = Path(model_id) / "config.json"
-    if not config_path.is_file():
-        return False
-    try:
-        with config_path.open() as f:
-            config = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return False
-    if not isinstance(config, dict):
-        return False
+    config = _load_model_config(model_id)
     architectures = config.get("architectures") or []
     return config.get("model_type") == "glm_moe_dsa" or any(
         arch in {"GlmMoeDsaForCausalLM", "GlmMoeDsaForCausalLMNextN"}
         for arch in architectures
+    )
+
+
+def _is_inkling_model(model_id: str | None) -> bool:
+    if not model_id:
+        return False
+
+    normalized = model_id.lower().replace("_", "-").rstrip("/")
+    if "inkling" in normalized:
+        return True
+
+    config = _load_model_config(model_id)
+    architectures = config.get("architectures") or []
+    return (
+        config.get("model_type") == "inkling_mm_model"
+        or "InklingForConditionalGeneration" in architectures
+    )
+
+
+def _smg_supports_inkling_parsers() -> bool:
+    """Whether the installed SMG advertises the complete Inkling parser pair.
+
+    Keep this import lazy so lightweight TokenSpeed tooling and unit tests do
+    not require the optional gateway extension at module-import time. Treat a
+    missing/older/broken capability API conservatively: automatic Inkling
+    parser defaults must never make an otherwise usable gateway fail to start.
+    """
+    try:
+        from smg.smg_rs import (
+            get_available_reasoning_parsers,
+            get_available_tool_call_parsers,
+        )
+
+        reasoning_parsers = get_available_reasoning_parsers()
+        tool_call_parsers = get_available_tool_call_parsers()
+    except Exception:  # noqa: BLE001 - capability probing must be fail-safe
+        return False
+
+    return (
+        INKLING_REASONING_PARSER in reasoning_parsers
+        and INKLING_TOOL_CALL_PARSER in tool_call_parsers
     )
 
 
@@ -307,11 +356,61 @@ def _args_with_default_model_parsers(
         if "--tool-call-parser" not in gateway_result:
             gateway_result.extend(["--tool-call-parser", GLM_TOOL_CALL_PARSER])
 
+    elif _is_inkling_model(model_id):
+        # Use the checkpoint-provided Inkling template instead of maintaining
+        # a second protocol copy in TokenSpeed. Newer SMG builds advertise
+        # Inkling reasoning and tool parsers; older pinned builds must keep
+        # their prior passthrough behavior rather than failing argparse
+        # validation on an unknown parser name.
+        needs_reasoning_default = (
+            "--reasoning-parser" not in engine_result
+            and "--reasoning-parser" not in gateway_result
+        )
+        needs_tool_default = "--tool-call-parser" not in gateway_result
+        if needs_reasoning_default or needs_tool_default:
+            if _smg_supports_inkling_parsers():
+                # The engine also needs the reasoning parser name to defer
+                # json_schema grammars until after the reasoning channel.
+                if needs_reasoning_default:
+                    engine_result.extend(
+                        ["--reasoning-parser", INKLING_REASONING_PARSER]
+                    )
+                    gateway_result.extend(
+                        ["--reasoning-parser", INKLING_REASONING_PARSER]
+                    )
+                if needs_tool_default:
+                    gateway_result.extend(
+                        ["--tool-call-parser", INKLING_TOOL_CALL_PARSER]
+                    )
+            else:
+                logger.warning(
+                    "Installed SMG does not advertise the complete Inkling "
+                    "reasoning/tool parser pair; automatic Inkling parser "
+                    "defaults are disabled and the gateway will fall back to "
+                    "passthrough. Explicit parser arguments are preserved."
+                )
+        if current_platform().is_nvidia:
+            # Inkling's NVIDIA rel-bias attention requires FA4; reject bad explicit backends before workers start.
+            if "--attention-backend" in engine_result:
+                backend_index = engine_result.index("--attention-backend")
+                backend = (
+                    engine_result[backend_index + 1]
+                    if backend_index + 1 < len(engine_result)
+                    else None
+                )
+                if backend != INKLING_ATTENTION_BACKEND:
+                    raise ValueError(
+                        "Inkling requires --attention-backend "
+                        f"{INKLING_ATTENTION_BACKEND}, got {backend!r}"
+                    )
+            else:
+                engine_result.extend(["--attention-backend", INKLING_ATTENTION_BACKEND])
+
     return engine_result, gateway_result
 
 
 def _prewarm_hf_tokenizer(model_id: str) -> None:
-    """Download tokenizer artifacts to the HF cache before the gateway boots.
+    """Download tokenizer and chat-template assets before the gateway boots.
 
     smg fires its ``AddTokenizer`` job asynchronously after the engine
     reports SERVING. On fast runners (e.g. b300) the first eval request
@@ -333,6 +432,7 @@ def _prewarm_hf_tokenizer(model_id: str) -> None:
                 "special_tokens_map*",
                 "vocab*",
                 "merges*",
+                "chat_template*",
                 "*.json",
             ],
         )
@@ -605,6 +705,8 @@ async def run_smg(
 
 def run_smg_from_args(args: argparse.Namespace, raw_argv: list[str]) -> None:
     """Entry point called from cli/__main__.py for ``ts serve``."""
+    _set_default_grpc_max_message_bytes()
+
     try:
         import setproctitle
 

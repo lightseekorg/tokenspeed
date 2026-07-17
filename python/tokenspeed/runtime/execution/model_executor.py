@@ -59,6 +59,7 @@ from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 from tokenspeed.runtime.layers.paged_attention import (
     validate_paged_cache_group_ids,
 )
+from tokenspeed.runtime.multimodal.inputs import resolve_mm_pad_substitute_ids
 from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 from tokenspeed.runtime.sampling.dp_sampling_config import (
     DpSamplingRuntimeLimits,
@@ -319,10 +320,20 @@ class ModelExecutor:
             device=self.device,
         )
         spec_num_tokens = config.spec_num_tokens if config.spec_algo is not None else 1
+        # Stride for indexing req_to_page when building drafter caller-side
+        # write locs. These locs are live on the radix arm only: on flat,
+        # every KV write (target and draft) takes the backend metadata's
+        # per-group out_cache_locs, and req_to_page is a verbatim mirror of
+        # the full-attention group's table kept for the non-flat fallbacks —
+        # the caller locs computed from it are never consumed there (the
+        # Inkling rel path asserts loc/row agreement).
+        self._draft_page_size = int(
+            getattr(draft_token_to_kv_pool, "page_size", 0) or config.block_size
+        )
         self.input_buffers = InputBuffers(
             max_bs=max_bs,
             max_num_tokens=config.chunked_prefill_size,
-            page_size=config.block_size,
+            page_size=self._draft_page_size,
             # token_to_kv_pool allocates size+page_size slots; index `size` is
             # the reserved dummy slot (see MHATokenToKVPool._create_buffers).
             dummy_kv_slot=0,
@@ -350,7 +361,7 @@ class ModelExecutor:
                 spec_num_tokens=config.spec_num_tokens,
                 spec_num_steps=config.spec_num_steps,
                 draft_model_runner=draft_model_runner,
-                page_size=config.block_size,
+                page_size=self._draft_page_size,
                 runtime_states=self.runtime_states,
                 input_buffers=self.input_buffers,
                 req_to_page=self.req_to_page,
@@ -366,13 +377,11 @@ class ModelExecutor:
                 embed, head = self.model_runner.model.get_embed_and_head()
                 draft_model_runner.model.set_embed_and_head(embed, head)
             target_hf = self.model_runner.model_config.hf_config
-            mm_pad_substitute_id = getattr(
-                target_hf, "image_token_id", None
-            ) or getattr(target_hf, "media_placeholder_token_id", None)
-            if mm_pad_substitute_id is not None and hasattr(
-                self.drafter, "set_mm_pad_substitute_id"
+            mm_pad_substitute_ids = resolve_mm_pad_substitute_ids(target_hf)
+            if mm_pad_substitute_ids and hasattr(
+                self.drafter, "set_mm_pad_substitute_ids"
             ):
-                self.drafter.set_mm_pad_substitute_id(mm_pad_substitute_id)
+                self.drafter.set_mm_pad_substitute_ids(mm_pad_substitute_ids)
             if config.spec_algo in ("EAGLE3",) and hasattr(
                 self.model_runner.model, "set_eagle3_layers_to_capture"
             ):

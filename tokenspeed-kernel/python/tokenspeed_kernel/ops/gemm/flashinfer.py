@@ -114,6 +114,7 @@ if gemm_fp8_nt_groupwise is not error_fn:
         *,
         alpha: torch.Tensor | None = None,
         block_size: list[int] | None = None,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert (
             A_scales is not None
@@ -140,7 +141,11 @@ if gemm_fp8_nt_groupwise is not error_fn:
             scale_major_mode="MN",
             out_dtype=out_dtype,
         )
-        return output[:orig_m] if output.shape[0] != orig_m else output
+        output = output[:orig_m] if output.shape[0] != orig_m else output
+        if out is not None:
+            out.copy_(output)
+            return out
+        return output
 
 
 # ---- FlashInfer FP4 -----------------------------------------------------
@@ -178,9 +183,10 @@ if mm_fp4 is not error_fn:
         alpha: torch.Tensor | None = None,
         block_size: list[int] | None = None,
         enable_pdl: bool = False,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # backend="cutlass" (not "auto") to skip flashinfer's cuDNN-graph plan compile.
-        return mm_fp4(
+        output = mm_fp4(
             A,
             B,
             A_scales,
@@ -190,3 +196,7 @@ if mm_fp4 is not error_fn:
             backend="cutlass",
             enable_pdl=enable_pdl,
         )
+        if out is not None:
+            out.copy_(output)
+            return out
+        return output

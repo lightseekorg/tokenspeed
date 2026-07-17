@@ -21,7 +21,10 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING
+
+import torch
 
 from tokenspeed.runtime.configs.flat_memory_plan import (
     components_from_layers,
@@ -115,6 +118,12 @@ _HYBRID_GDN_ARCHITECTURES = {
     "Qwen3_5MoeForConditionalGenerationNextN",
     "Qwen3_5ForConditionalGeneration",
     "Qwen3_5ForConditionalGenerationNextN",
+}
+
+# Inkling stays on the plain dense path (thin sconv wrapper); deliberately NOT hybrid-GDN
+_INKLING_ARCHITECTURES = {
+    "InklingForConditionalGeneration",
+    "InklingForConditionalGenerationNextN",
 }
 
 
@@ -363,6 +372,248 @@ def _create_hybrid_linear_attn(
         ),
     )
     return backend, pool, mamba_pool
+
+
+def _floor_tokens_to_layout_grid(max_num_tokens: int, config) -> int:
+    """Floor the memory-profiled token capacity onto the KV layout's grid.
+
+    The profile is memory-dependent (``--gpu-memory-utilization`` over the
+    free bytes at boot), so the raw value can land ANYWHERE on the 128-token
+    page grid — but the hetero slot layout is only viewable on a coarser
+    grid. With ``slot_tokens`` S and a largest group page P (Inkling: S=256,
+    P=256, base page 128), the pool row counts that must divide are:
+
+    - target hybrid slab: rows = size + S viewed at base-page granularity
+      after the per-layer head reinterpretation -> needs ``128 | size``
+      (any 128-grid value satisfies it);
+    - MTP draft pool: SAME page-id space and the SAME byte-uniform slot
+      layout (the draft is a depth-count miniature of the target pool, see
+      the Inkling draft branch below), so its full-attention view pages at
+      P likewise divide on the 128 grid. Flooring to ``size ≡ 0 (mod P)``
+      keeps the id count itself on the coarse grid.
+      (Historical: before the drafter consumed the table at P, the draft
+      pool held one 128-row slot per id and its P-row page view required
+      ``size ≡ 128 (mod 256)`` — an ODD id count. The 2026-07-14 cont. 9
+      boot lottery was literally the parity of the profiled id count.)
+
+    Flooring costs at most 255 tokens (~0.02%). No-op for layouts without
+    hetero head counts.
+    """
+    if not getattr(config, "layer_kv_head_counts", None):
+        return max_num_tokens
+    slot = int(getattr(config, "slot_tokens", 0) or config.page_size)
+    page_sizes = getattr(config, "group_page_sizes", None) or {}
+    largest_page = max([config.page_size, *page_sizes.values()])
+    # size ≡ 0 (mod largest_page). Degenerates to plain page flooring when
+    # every group shares the base page.
+    residue = 0
+    floored = max_num_tokens - ((max_num_tokens - residue) % largest_page)
+    if floored != max_num_tokens:
+        logger.info(
+            "KV capacity floored to the hetero layout grid: %d -> %d tokens "
+            "(slot %d, largest group page %d)",
+            max_num_tokens,
+            floored,
+            slot,
+            largest_page,
+        )
+    return floored
+
+
+def _apply_inkling_hetero_kv(config, model_config) -> None:
+    """Zero-padding slots: full=256 fills the slot, swa=128 leads (tail padded); ids sized by slot."""
+    from tokenspeed.runtime.configs.inkling_config import inkling_kv_heads_for_layer
+
+    config.slot_tokens = 256
+    config.group_page_sizes = {"full_attention": 256}
+    tc = model_config.hf_config.get_text_config()
+    config.layer_kv_head_counts = tuple(
+        inkling_kv_heads_for_layer(tc, i, True) for i in range(tc.num_hidden_layers)
+    )
+
+
+def _publish_inkling_conv_groups(config, model_config, server_args) -> tuple[int, int]:
+    """Publish per-label kvconv (+ optional hiddenconv) paged groups.
+
+    Conv blocks scale with the KV element size (an fp8 slot holds half the bf16 column tokens).
+
+    Returns ``(conv_block_tokens, hidden_block_tokens)``.
+    """
+    from tokenspeed.runtime.configs.paged_cache_spec import PagedCacheGroupSpec
+
+    tc = model_config.hf_config.get_text_config()
+    bt = server_args.block_size
+    kv_elem = config.kv_cache_dtype.itemsize
+    conv_bt = bt * kv_elem // 2
+    slot_bytes = (
+        bt
+        * max(config.num_kv_heads // config.attn_tp_size, 1)
+        * config.head_dim
+        * kv_elem
+    )
+    # fp8 doubles the hiddenconv block (halves ids/token); must agree with the pool's conv_col_dtype
+    hcol_elem = 2 if os.environ.get("INKLING_FP8_SCONV", "1") == "0" else 1
+    hbt = 1
+    while hbt * 2 * tc.hidden_size * hcol_elem <= slot_bytes:
+        hbt *= 2
+    assert conv_bt > 0 and hbt * tc.hidden_size * hcol_elem <= slot_bytes
+    config.extra_paged_groups = tuple(
+        PagedCacheGroupSpec(
+            group_id=f"kvconv_{label}",
+            retention="sliding_window",
+            rows_per_page=conv_bt,
+            entry_stride_tokens=1,
+            sliding_window_tokens=conv_bt + tc.sconv_kernel_size,
+            family="history",
+            block_size=conv_bt,
+        )
+        for label in dict.fromkeys(tc.paged_cache_layer_types)
+    )
+    if (
+        True
+    ):  # paged hiddenconv is unconditional (INKLING_PAGED_HIDDENCONV gate retired 2026-07-15)
+        # ATTN cols ride the K slot, MLP the V slot; each new base needs a FlatInklingShapeSuite pass
+        config.extra_paged_groups = config.extra_paged_groups + tuple(
+            PagedCacheGroupSpec(
+                group_id=f"hiddenconv_{label}",
+                retention="sliding_window",
+                rows_per_page=hbt,
+                entry_stride_tokens=1,
+                sliding_window_tokens=hbt + tc.sconv_kernel_size,
+                family="history",
+                block_size=hbt,
+            )
+            for label in dict.fromkeys(tc.paged_cache_layer_types)
+        )
+    return conv_bt, hbt
+
+
+def _wrap_inkling_backend(inner, text_config, attn_config, *, num_layers, is_draft):
+    """Wrap a dense backend with the engine-side Inkling sconv state pool.
+
+    The wrapper only adds conv metadata; all attention delegates to ``inner``.
+    Returns ``(backend, conv_pool)``.
+    """
+    from tokenspeed.runtime.configs.inkling_config import inkling_conv_total_dim
+    from tokenspeed.runtime.layers.attention.backends.inkling import (
+        InklingAttnBackend,
+        InklingConvStatePool,
+    )
+
+    conv_pool = InklingConvStatePool(
+        num_layers=num_layers,
+        # Row 0 is reserved (1-based indices); +2 covers it plus a padding slot
+        num_slots=attn_config.max_bs + 2,
+        conv_dim=inkling_conv_total_dim(text_config, attn_config.attn_tp_size),
+        kernel_size=text_config.sconv_kernel_size,
+        dtype=torch.bfloat16,
+        device=attn_config.device,
+    )
+    logger.info(
+        "Inkling %sconv state pool: %d layers x %d slots, %.1f MiB",
+        "draft " if is_draft else "",
+        num_layers,
+        attn_config.max_bs + 2,
+        conv_pool.mem_usage_bytes() / (1 << 20),
+    )
+    backend = InklingAttnBackend(
+        inner,
+        conv_pool,
+        spec_num_tokens=getattr(attn_config, "speculative_num_draft_tokens", 1),
+        is_draft=is_draft,
+    )
+    return backend, conv_pool
+
+
+def _inkling_conv_columns(pool, text_config, conv_bt, hbt):
+    """kvconv-as-swa geometry for the backend (None if no kvconv pages).
+
+    Columns live in the layers' own K/V slots; backend gets only geometry + layer->group map.
+    """
+    layer_labels = text_config.paged_cache_layer_types
+    labels = list(dict.fromkeys(layer_labels))
+    num_conv_blocks = sum(
+        pool.paged_cache_group_page_counts.get(f"kvconv_{label}", 0) for label in labels
+    )
+    if not num_conv_blocks:
+        logger.warning(
+            "paged sconv expected but no kvconv pages published;"
+            " rolling conv state only."
+        )
+        return None
+    paged_hidden = True  # unconditional (gate retired 2026-07-15)
+    conv_columns = {
+        "block_tokens": conv_bt,
+        "lcm_align": 256,
+        "conv_group_of_layer": tuple(f"kvconv_{label}" for label in layer_labels),
+        "hidden_block_tokens": hbt,
+        "hidden_group_of_layer": (
+            tuple(f"hiddenconv_{label}" for label in layer_labels)
+            if paged_hidden
+            else None
+        ),
+        # Per-group block sizes for the backend's table buffers.
+        "group_block_tokens": {
+            **{f"kvconv_{label}": conv_bt for label in labels},
+            **(
+                {f"hiddenconv_{label}": hbt for label in labels} if paged_hidden else {}
+            ),
+        },
+    }
+    logger.info(
+        "Inkling kvconv-as-swa: %d groups, block %d%s",
+        len(labels),
+        conv_bt,
+        f" + hiddenconv block {hbt}" if paged_hidden else "",
+    )
+    return conv_columns
+
+
+def _start_inkling_pool_probe(kv_pool, conv_pool, rank, probe_dir) -> None:
+    """Diagnostic (INKLING_POOL_PROBE_DIR=<dir>): background thread
+    checksumming pool regions that must stay INVARIANT under traffic — the
+    dummy page's tail rows and the top quarter of each layer buffer — to catch
+    wrong-location KV writes in the act. One JSONL line per interval per rank;
+    ~seconds of bandwidth per sweep, diagnosis only."""
+    import json
+    import threading
+    import time
+
+    path = f"{probe_dir}/pool_probe_rank{rank}.jsonl"
+
+    def _pool_probe():
+        while True:
+            try:
+                rec = {"t": time.time()}
+                d0 = top = tot = 0.0
+                d0_layers = []
+                for lid, bufs in enumerate(zip(kv_pool.k_buffer, kv_pool.v_buffer)):
+                    for tb in bufs:
+                        if tb is None:
+                            continue
+                        n = tb.shape[0]
+                        v = float(tb[4:128].float().abs().sum())
+                        d0 += v
+                        if v > 0.0:
+                            d0_layers.append((lid, round(v, 3)))
+                        top += float(tb[(3 * n) // 4 :].float().abs().sum())
+                        tot += float(tb.float().abs().sum())
+                rec["dummy_tail_abs"] = round(d0, 4)
+                rec["dummy_tail_layers"] = d0_layers[:8]
+                rec["top_quarter_abs"] = round(top, 4)
+                rec["total_abs"] = round(tot, 2)
+                rec["conv_abs"] = round(
+                    float(conv_pool.conv_state.float().abs().sum()), 2
+                )
+                with open(path, "a") as f:
+                    f.write(json.dumps(rec) + "\n")
+            except Exception as exc:  # diagnostics must not kill serving
+                with open(path, "a") as f:
+                    f.write(json.dumps({"error": repr(exc)}) + "\n")
+            time.sleep(10)
+
+    threading.Thread(target=_pool_probe, daemon=True).start()
+    logger.info("Inkling pool probe enabled -> %s", probe_dir)
 
 
 # ---------- public API ----------
@@ -737,10 +988,45 @@ def create_attn_components(
             mamba_pool_total_chunks=mamba_pool_total_chunks,
         )
     else:
+        is_inkling = any(a in _INKLING_ARCHITECTURES for a in architectures)
+        # Hetero KV + paged sconv are unconditional for Inkling (the
+        # INKLING_HETERO_KV / INKLING_PAGED_SCONV bisection gates were
+        # retired 2026-07-15 after the experiments settled).
+        paged_sconv = is_inkling
+        if is_inkling:
+            _apply_inkling_hetero_kv(config, model_config)
+            # Must run AFTER the hetero fields exist on the config.
+            max_num_tokens = _floor_tokens_to_layout_grid(max_num_tokens, config)
+        if paged_sconv:
+            _conv_bt, _hbt = _publish_inkling_conv_groups(
+                config, model_config, server_args
+            )
         backend = _create_attn_backend(arch, config)
         pool = _create_attn_pool(
             config, num_layers, max_num_tokens, rank, enable_memory_saver
         )
+        if is_inkling:
+            # Wrapper only adds sconv state keyed on req_pool_indices; attention stays on the dense backend
+            text_config = model_config.hf_config.get_text_config()
+            backend, conv_pool = _wrap_inkling_backend(
+                backend,
+                text_config,
+                config,
+                num_layers=text_config.num_hidden_layers,
+                is_draft=False,
+            )
+            _probe_dir = os.environ.get("INKLING_POOL_PROBE_DIR")
+            if _probe_dir:
+                _start_inkling_pool_probe(pool, conv_pool, rank, _probe_dir)
+            conv_columns = None
+            if paged_sconv:
+                conv_columns = _inkling_conv_columns(pool, text_config, _conv_bt, _hbt)
+            backend.conv_columns = conv_columns
+            if conv_columns is not None:
+                # Wrapper-owned conv groups: the attention mixin skips their write-loc math and capture fills
+                backend.inner.flat_engine_owned_group_ids = frozenset(
+                    conv_columns["group_block_tokens"]
+                )
     draft_attn_backend = None
     draft_pool = None
     if draft_attn_config:
@@ -788,6 +1074,55 @@ def create_attn_components(
                     else None
                 ),
                 mamba_pool_total_chunks=mamba_pool_total_chunks,
+            )
+        elif any(a in _INKLING_ARCHITECTURES for a in draft_archs):
+            draft_text_config = draft_model_config.hf_config.get_text_config()
+            num_depths = draft_model_config.num_attention_layers
+            if server_args.speculative_num_steps > num_depths:
+                raise ValueError(
+                    f"Inkling MTP has {num_depths} depth layers; "
+                    f"--speculative-num-steps {server_args.speculative_num_steps} "
+                    "would wrap depths with no trained meaning."
+                )
+            # Hetero KV, symmetric with the target pool: per-depth head
+            # counts come from the MTP text config's own local ids
+            # (ModelConfig swapped it in for the draft worker), giving the
+            # draft the same byte-uniform slot layout as the target — full
+            # depths at 256 tokens/id x ckpt heads, SWA depths at the base
+            # 128 x swa heads. The pool shares the TARGET's page-id space
+            # (the drafter consumes the target's per-group flat tables), so
+            # it is sized at the same max_num_tokens; per-layer views turn
+            # the max-head allocation into the group geometry, and the
+            # profile's max-head draft charge prices exactly that
+            # allocation. (The former num_kv_heads pin + explicit 2x row
+            # sizing described the all-full-attention special case of this
+            # same byte math.)
+            _apply_inkling_hetero_kv(draft_attn_config, draft_model_config)
+            logger.info(
+                "Inkling MTP draft pool: hetero KV layer head counts=%s, "
+                "layer types=%s, group page sizes=%s (%d depths, %d ids)",
+                draft_attn_config.layer_kv_head_counts,
+                draft_attn_config.layer_types,
+                draft_attn_config.group_page_sizes,
+                num_depths,
+                max_num_tokens // config.page_size,
+            )
+            draft_attn_backend = _create_attn_backend(
+                draft_model_config.attention_arch, draft_attn_config
+            )
+            draft_pool = _create_attn_pool(
+                draft_attn_config,
+                num_depths,
+                max_num_tokens,
+                rank,
+                enable_memory_saver,
+            )
+            draft_attn_backend, _ = _wrap_inkling_backend(
+                draft_attn_backend,
+                draft_text_config,
+                draft_attn_config,
+                num_layers=num_depths,
+                is_draft=True,
             )
         else:
             draft_attn_backend = _create_attn_backend(

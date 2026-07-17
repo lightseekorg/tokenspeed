@@ -53,6 +53,7 @@ def _torch_mm(
     *,
     alpha: torch.Tensor | None = None,
     block_size: list[int] | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     _ = A_scales, B_scales, alpha, block_size
     return (A @ B).to(out_dtype)
@@ -230,6 +231,36 @@ def test_export_import_roundtrip(tmp_path, setup_gemm_case):
     assert loaded[0].numerics_passed == results[0].numerics_passed
     assert loaded[0].max_abs_diff == results[0].max_abs_diff
     assert loaded[0].max_rel_diff == results[0].max_rel_diff
+
+
+def test_bmm_throughput_with_batched_weights():
+    shape = {"batch": 2, "M": 4, "N": 8, "K": 16}
+
+    tflops, bandwidth = ThroughputCalculator.compute(
+        "gemm",
+        "bmm",
+        shape,
+        latency_us=1000.0,
+        dtype=torch.float16,
+    )
+
+    assert tflops == pytest.approx(2.048e-6)
+    assert bandwidth == pytest.approx(0.000896)
+
+
+def test_bmm_throughput_missing_required_shape_returns_none():
+    shape = {"batch": 2, "M": 4, "N": 8}
+
+    tflops, bandwidth = ThroughputCalculator.compute(
+        "gemm",
+        "bmm",
+        shape,
+        latency_us=1000.0,
+        dtype=torch.float16,
+    )
+
+    assert tflops is None
+    assert bandwidth is None
 
 
 def test_attention_decode_throughput_with_explicit_kv_heads():

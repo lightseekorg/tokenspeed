@@ -120,8 +120,7 @@ struct LoopUnroller<kEnd, kEnd, kHiddenDim, ADtype, BDtype> {
   }
 };
 
-// Dispatch on hidden_dim only: the custom kernel launches one block per
-// expert row, so any expert count is supported at runtime.
+// Dispatch on hidden_dim only: one block per expert row, so any expert count works at runtime.
 template <typename BDtype>
 static bool dispatch_custom_kernel(
     int num_tokens, int hidden_dim, float* output, __nv_bfloat16 const* mat_a, BDtype const* mat_b,

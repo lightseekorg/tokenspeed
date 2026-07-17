@@ -36,6 +36,9 @@ def resolve_dtype(kv_cache_dtype_str: str) -> torch.dtype:
         return torch.bfloat16
     elif kv_cache_dtype_str in ("fp8", "fp8_e4m3"):
         return torch.float8_e4m3fn
+    elif kv_cache_dtype_str == "mxfp8":
+        # fp8-e4m3 data; the UE8M0 scale sidecar lives in the pool's scale buffers (kv_cache_mxfp8)
+        return torch.float8_e4m3fn
     else:
         raise ValueError(f"Unsupported kv_cache_dtype: {kv_cache_dtype_str!r}")
 
@@ -55,6 +58,8 @@ class BaseAttnConfig:
     max_bs: int
     max_graph_bs: int
     kv_cache_quant_method: str
+    # MXFP8 KV: UE8M0 vec-32 scale sidecar in pool buffers; kv_cache_dtype alone can't express it
+    kv_cache_mxfp8: bool = False
     speculative_num_steps: int = 0
     speculative_num_draft_tokens: int = 1
     is_draft: bool = False

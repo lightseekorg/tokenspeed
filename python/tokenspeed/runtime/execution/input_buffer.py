@@ -112,13 +112,11 @@ class InputBuffers:
                     (max_bs,), -1, dtype=torch.int32
                 )
 
-        self.extend_prefix_lens_cpu = torch.zeros(
-            max_bs, dtype=torch.int32, pin_memory=True
-        )
-        self.extend_seq_lens_cpu = torch.zeros(
-            max_bs, dtype=torch.int32, pin_memory=True
-        )
+        # NOT pinned: python readers only; the H2D uses the per-step bulk pinned staging (_bulk_pinned).
+        self.extend_prefix_lens_cpu = torch.zeros(max_bs, dtype=torch.int32)
+        self.extend_seq_lens_cpu = torch.zeros(max_bs, dtype=torch.int32)
         if has_mamba:
+            # TODO(overlap-safety): migrate to the per-step bulk (_bulk_pinned).
             self._mamba_pool_indices_cpu = torch.full(
                 (max_bs,), -1, dtype=torch.int32, pin_memory=True
             )
@@ -131,6 +129,24 @@ class InputBuffers:
             self._mamba_track_pool_indices_cpu = torch.full(
                 (max_bs,), -1, dtype=torch.int32, pin_memory=True
             )
+
+    def _bulk_pinned(self, *specs):
+        """One pinned allocation for this step, sliced per (numel, dtype).
+
+        NEVER persistent: a reused pinned buffer races with overlap
+        scheduling (the CPU preps step N+1 while step N's async H2D from
+        the same buffer may still be in flight). A fresh allocation per
+        step is event-fenced by the caching host allocator; bulking keeps
+        it to ONE allocation instead of one per field.
+        """
+        align = 8
+        offsets, off = [], 0
+        for numel, dtype in specs:
+            nbytes = numel * dtype.itemsize
+            offsets.append((off, numel, dtype))
+            off += (nbytes + align - 1) // align * align
+        bulk = torch.empty(off, dtype=torch.int8, pin_memory=True)
+        return [bulk[o : o + n * dt.itemsize].view(dt) for o, n, dt in offsets]
 
     @nvtx_range("input_prep_fill", color="cyan")
     def fill_input_buffers(
@@ -148,8 +164,16 @@ class InputBuffers:
         decode_input_ids = forward_op.decode_input_ids
         if decode_input_ids is not None and all(x == -1 for x in decode_input_ids):
             decode_input_ids = None
-        req_pool_indices_cpu = torch.tensor(
-            forward_op.request_pool_indices, device="cpu", pin_memory=True
+        n_req = len(forward_op.request_pool_indices)
+        n_len = len(forward_op.input_lengths)
+        req_pool_indices_cpu, input_lengths_cpu = self._bulk_pinned(
+            (n_req, torch.int64), (n_len, torch.int32)
+        )
+        req_pool_indices_cpu.copy_(
+            torch.as_tensor(forward_op.request_pool_indices, dtype=torch.int64)
+        )
+        input_lengths_cpu.copy_(
+            torch.as_tensor(forward_op.input_lengths, dtype=torch.int32)
         )
         self.req_pool_indices_buf[:batch_size].copy_(
             req_pool_indices_cpu,
@@ -159,12 +183,7 @@ class InputBuffers:
             req_pool_indices_cpu,
             non_blocking=True,
         )
-        input_lengths_cpu = torch.tensor(
-            forward_op.input_lengths,
-            dtype=torch.int32,
-            device="cpu",
-            pin_memory=True,
-        )
+
         self.input_lengths_buf[:batch_size].copy_(
             input_lengths_cpu,
             non_blocking=True,
@@ -181,18 +200,22 @@ class InputBuffers:
         )
 
         if num_extends > 0:
+            # Fresh bulk pinned per step (see _bulk_pinned: persistent staging races overlap scheduling).
             self.extend_prefix_lens_cpu[:num_extends] = torch.as_tensor(
                 forward_op.extend_prefix_lens, dtype=torch.int32
-            )
-            self.extend_prefix_lens_buf[:num_extends].copy_(
-                self.extend_prefix_lens_cpu[:num_extends], non_blocking=True
             )
             self.extend_seq_lens_cpu[:num_extends] = torch.as_tensor(
                 forward_op.input_lengths[:num_extends], dtype=torch.int32
             )
-            self.extend_seq_lens_buf[:num_extends].copy_(
-                self.extend_seq_lens_cpu[:num_extends], non_blocking=True
+            ext_prefix_cpu, ext_seq_cpu = self._bulk_pinned(
+                (num_extends, torch.int32), (num_extends, torch.int32)
             )
+            ext_prefix_cpu.copy_(self.extend_prefix_lens_cpu[:num_extends])
+            ext_seq_cpu.copy_(self.extend_seq_lens_cpu[:num_extends])
+            self.extend_prefix_lens_buf[:num_extends].copy_(
+                ext_prefix_cpu, non_blocking=True
+            )
+            self.extend_seq_lens_buf[:num_extends].copy_(ext_seq_cpu, non_blocking=True)
 
         # Get valid cache lengths for requests
         req_pool_indices_device = self.req_pool_indices_buf[:batch_size]
@@ -298,15 +321,19 @@ class InputBuffers:
         # Determine input_ids and forward_mode
         if num_extends > 0:
             prefill_token_count = sum(forward_op.input_lengths[:num_extends])
-            input_ids_cpu = torch.tensor(
-                forward_op.input_ids, device="cpu", pin_memory=True
+            n_ids = len(forward_op.input_ids)
+            (input_ids_cpu,) = self._bulk_pinned((n_ids, torch.int32))
+            input_ids_cpu.copy_(
+                torch.as_tensor(forward_op.input_ids, dtype=torch.int32)
             )
             self.input_ids_buf[:prefill_token_count].copy_(
                 input_ids_cpu,
                 non_blocking=True,
             )
-            shifted_ids_cpu = torch.tensor(
-                forward_op.shifted_input_ids, device="cpu", pin_memory=True
+            n_sh = len(forward_op.shifted_input_ids)
+            (shifted_ids_cpu,) = self._bulk_pinned((n_sh, torch.int32))
+            shifted_ids_cpu.copy_(
+                torch.as_tensor(forward_op.shifted_input_ids, dtype=torch.int32)
             )
             self.shifted_prefill_ids_buf[:prefill_token_count].copy_(
                 shifted_ids_cpu,
@@ -352,19 +379,18 @@ class InputBuffers:
                 non_blocking=True,
             )
 
-        # Defensive clamp into the valid vocab range. The decode input ids come
-        # from future_input_map, written by the previous iteration's
-        # sampler/drafter; the intermittent spec-decode decode-state race can
-        # surface a stale/corrupt out-of-range id there. Feeding an out-of-range
-        # id to the captured graph's embedding gather trips a device-side assert
-        # (`vectorized_gather_kernel index out of bounds`) that tears the whole
-        # server down. Clamp the active prefix before the graph reads these
-        # buffers (a no-op for legitimate ids). Mirrors the post-graph
-        # output_tokens clamp in the output_d2h step of
-        # ModelExecutor.execute_forward_op.
+        # Defensive clamp of the target-model IDs into the valid vocab range.
+        # Decode IDs come from future_input_map, written by the previous
+        # sampler/drafter; a stale/corrupt value must not reach the captured
+        # graph's embedding gather. The shifted draft buffer is deliberately
+        # handled separately below because valid content-derived MM pads are
+        # out-of-vocab until Eagle/MTP restores their modality token.
         vocab_size = runtime_states.vocab_size
         self.input_ids_buf[:total_tokens].clamp_(0, vocab_size - 1)
-        self.shifted_prefill_ids_buf[:total_tokens].clamp_(0, vocab_size - 1)
+        # Do not clamp shifted_prefill_ids_buf here. Content-derived MM pad IDs
+        # intentionally exceed the vocabulary and retain a modality tag until
+        # Eagle/MTP replaces them with model-specific in-vocab tokens. The draft
+        # path performs its own defensive clamp immediately after substitution.
 
         if valid_cache_lengths is not None:
             torch.add(

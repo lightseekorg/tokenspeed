@@ -1,4 +1,7 @@
 -r common.txt
+# The 4.6 libs wheels declare protobuf<7 solely for the (unused) iket
+# profiler gencode; serving needs protobuf>=7.35.1 for the smg grpc-health
+# gencode. Keep protobuf 7.x and ignore that resolver warning.
 nvidia-cutlass-dsl[cu13]==4.6.0
 nvidia-cutlass-dsl-libs-cu13==4.6.0
 torch==2.11.0

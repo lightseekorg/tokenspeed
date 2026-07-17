@@ -36,6 +36,7 @@ from tokenspeed_kernel.ops.kvcache.triton import (
     fused_fp8_set_kv_buffer,
     gather_page_table_with_padding,
 )
+from tokenspeed_kernel.ops.quantization import quantize_mxfp8
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.breakable_cuda_graph import scrub_padding_tail
@@ -139,13 +140,19 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         self.head_dim = config.head_dim
         self.qkv_dtype = config.dtype
         self.kv_cache_dtype = config.kv_cache_dtype
-        self.is_fp8 = self.kv_cache_dtype in (
-            torch.float8_e4m3fn,
-            torch.float8_e5m2,
+        self.is_mxfp8 = bool(getattr(config, "kv_cache_mxfp8", False))
+        # mxfp8 shares the fp8 storage dtype but uses block scales; keep it off the per-tensor casts
+        self.is_fp8 = (
+            self.kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+            and not self.is_mxfp8
         )
         self.plan = partial(
             mha_plan,
-            dtype=self.kv_cache_dtype if self.is_fp8 else self.qkv_dtype,
+            dtype=(
+                torch.float8_e4m3fn
+                if self.is_mxfp8
+                else (self.kv_cache_dtype if self.is_fp8 else self.qkv_dtype)
+            ),
             head_dim=self.head_dim,
             return_lse=False,
             solution=self.kernel_solution,
@@ -157,6 +164,11 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         # Forward metadata is initialized in the runner per forward call
         self.forward_decode_metadata: MHADecodeMetadata | None = None
         self.forward_extend_metadata: MHAExtendMetadata | None = None
+
+        # family="state" ids (GDN/mamba) learned in init_cuda_graph_state; this backend sheds them
+        self.flat_state_group_ids: frozenset[str] = frozenset()
+        # Per-group page sizes (heterogeneous block sizes), learned with them.
+        self.flat_group_page_sizes: dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Metadata initialization
@@ -204,11 +216,16 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                     self.page_size,
                 )
             else:
-                verify_tokens = (
-                    self.spec_num_tokens
-                    if self.spec_num_tokens > 1 and not self.is_draft
-                    else 1
-                )
+                # Spec rounds write multi-token windows on BOTH sides: the
+                # target's verify chunk, and a window-mode draft's catch-up
+                # plus per-depth window passes, which all cover the same
+                # verify-window rows (positions seq-N..seq-1) every step.
+                # Sizing the draft's locs at 1 token/request used to make
+                # _save_kv_cache trim the bs*N-row draft writes down to bs —
+                # silently corrupting every decode-round draft KV write on
+                # the flat arm. (A chaining draft ignores these locs via
+                # prefer_caller in the base forward_decode.)
+                verify_tokens = self.spec_num_tokens if self.spec_num_tokens > 1 else 1
                 flat_out_cache_locs = self._compute_flat_decode_out_cache_locs(
                     flat_page_tables,
                     seq_lens,
@@ -329,8 +346,8 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         )
 
         self.cuda_graph_decode_metadata = {}
-        # Flat per-group persistent buffers, lazily allocated at first
-        # capture. TODO(radix-removal): parallels cuda_graph_page_table.
+        # Flat per-group persistent buffers. TODO(radix-removal): parallels
+        # cuda_graph_page_table.
         # Initialized before the DFLASH early return: replay reads the dict
         # unconditionally for the stale-table guard.
         self._init_flat_graph_buffers(max_bs)
@@ -368,9 +385,9 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
     ):
         assert not forward_mode.is_extend_or_mixed()
 
-        # Real tables only arrive at replay: capture lazily allocates
-        # persistent per-group buffers and records metadata views into them,
-        # so replay can copy_ fresh data to the graph-recorded addresses.
+        # Real tables only arrive at replay; capture records metadata views
+        # into the persistent per-group buffers so replay can copy_ fresh data
+        # to the graph-recorded addresses.
         if flat_cache_group_ids:
             # Verify keeps [bs]-row tables + [bs*N] loc views. TODO(flat+dflash).
             assert not (
@@ -379,11 +396,9 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         page_tables, out_cache_locs = self._flat_capture_group_views(
             bs,
             flat_cache_group_ids,
-            tokens_per_req=(
-                self.spec_num_tokens
-                if self.spec_num_tokens > 1 and not self.is_draft
-                else 1
-            ),
+            # Multi-token window locs for target verify AND window-mode
+            # drafts alike; see the eager decode branch.
+            tokens_per_req=(self.spec_num_tokens if self.spec_num_tokens > 1 else 1),
         )
 
         if self.draft_block_decode and self.spec_num_tokens > 1:
@@ -448,7 +463,12 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                 dummy_slot=0,
             )
         if self.spec_num_tokens > 1 and not self.is_draft:
-            self.cuda_graph_seq_lens[:bs].copy_(seq_lens[:bs])
+            # Clamp padded rows (seq_len 1) to N: verify derives row lengths as seq - N + t + 1, which must stay positive.
+            torch.clamp_min(
+                seq_lens[:bs],
+                self.spec_num_tokens,
+                out=self.cuda_graph_seq_lens[:bs],
+            )
         elif self.draft_block_decode:
             # DFLASH draft: replicate each request's page table to its
             # spec_num_tokens block rows. The block-end seq_lens are filled by
@@ -466,9 +486,7 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                 flat_block_tables,
                 self.cuda_graph_seq_lens,
                 tokens_per_req=(
-                    self.spec_num_tokens
-                    if self.spec_num_tokens > 1 and not self.is_draft
-                    else 1
+                    self.spec_num_tokens if self.spec_num_tokens > 1 else 1
                 ),
             )
 
@@ -645,9 +663,16 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
     ) -> torch.Tensor:
         _scrub_extend_padding(metadata, q, k, v)
         if save_kv_cache:
+            # KV store (incl. the mxfp8 quantize-on-store path) lives solely
+            # in _save_kv_cache.
             self._save_kv_cache(layer, out_cache_loc, token_to_kv_pool, k, v)
 
-        if self.is_fp8:
+        scale_kwargs = {}
+        if self.is_mxfp8:
+            q, q_sf = self._quantize_mxfp8_tokens(q)
+            k_sf, v_sf = token_to_kv_pool.get_kv_scale_buffer(layer.layer_id)
+            scale_kwargs = dict(q_scale=q_sf, k_scale=k_sf, v_scale=v_sf)
+        elif self.is_fp8:
             q = q.to(self.kv_cache_dtype)
 
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
@@ -669,6 +694,7 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             logit_cap=layer.logit_cap,
             sinks=sinks,
             solution=self.kernel_solution,
+            **scale_kwargs,
         )
         return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 
@@ -685,9 +711,16 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         sinks: torch.Tensor | None,
     ) -> torch.Tensor:
         if save_kv_cache:
+            # KV store (incl. the mxfp8 quantize-on-store path) lives solely
+            # in _save_kv_cache.
             self._save_kv_cache(layer, out_cache_loc, token_to_kv_pool, k, v)
 
-        if self.is_fp8:
+        scale_kwargs = {}
+        if self.is_mxfp8:
+            q, q_sf = self._quantize_mxfp8_tokens(q)
+            k_sf, v_sf = token_to_kv_pool.get_kv_scale_buffer(layer.layer_id)
+            scale_kwargs = dict(q_scale=q_sf, k_scale=k_sf, v_scale=v_sf)
+        elif self.is_fp8:
             q = q.to(self.kv_cache_dtype)
 
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
@@ -704,12 +737,41 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             max_seqlen_k=self.max_context_len,
             max_seqlen_q=max_seqlen_q,
             solution=self.kernel_solution,
+            **scale_kwargs,
         )
         return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     # ------------------------------------------------------------------
     # Helper methods
     # ------------------------------------------------------------------
+
+    def _store_kv_mxfp8(self, layer, loc, token_to_kv_pool, k, v) -> None:
+        """MXFP8 quantize-on-store: one fused launch when the pool supports
+        it (bit-identical, PDL-chained), else the split 5-launch path.
+        The sole caller (_save_kv_cache) has already trimmed k/v to loc."""
+        fused = getattr(token_to_kv_pool, "quantize_and_set_kv_buffer", None)
+        if fused is not None and fused(layer, loc, k, v):
+            return
+        k_q, k_sf = self._quantize_mxfp8_tokens(k)
+        v_q, v_sf = self._quantize_mxfp8_tokens(v)
+        token_to_kv_pool.set_kv_buffer(layer, loc, k_q, v_q, k_scale=k_sf, v_scale=v_sf)
+
+    def _quantize_mxfp8_tokens(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-token MXFP8: (fp8-e4m3 [T, H, D], UE8M0 scales [T, H, D // 32]).
+
+        Accepts [T, H, D] or [T, H * D]; H is inferred so the same helper
+        serves q (tp_q_head_num) and k/v (tp_kv_head_num).
+        """
+        t, d = x.shape[0], self.head_dim
+        h = x.numel() // (t * d)
+        # (A PDL triton variant measured 0.07 ms slower e2e at decode Q shapes; flashinfer stays)
+        data, sf = quantize_mxfp8(x.reshape(t * h, d))
+        return (
+            data.view(t, h, d),
+            sf.view(torch.float8_e8m0fnu).view(t, h, d // 32),
+        )
 
     def _save_kv_cache(
         self,
@@ -723,10 +785,10 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             return
         k, v = self._trim_kv_to_locs(out_cache_loc, k, v)
 
-        if (
-            self.kv_cache_dtype == torch.float8_e4m3fn
-            and k.dtype != torch.float8_e4m3fn
-        ):
+        if self.is_mxfp8:
+            # Quantize-on-store: fp8 data + per-token e8m0 scales into the paged interleaved layout
+            self._store_kv_mxfp8(layer, out_cache_loc, token_to_kv_pool, k, v)
+        elif self.is_fp8:
             k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
             fused_fp8_set_kv_buffer(
                 k=k,
@@ -749,15 +811,17 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             )
 
     def _get_kv_cache(self, layer: PagedAttention, token_to_kv_pool):
+        # Hetero block sizes: page ids are in the LAYER'S group page-size units, so view at that size
+        page_size = self._layer_page_size(layer)
         k_cache = token_to_kv_pool.get_key_buffer(layer.layer_id).view(
             -1,
-            self.page_size,
+            page_size,
             layer.tp_k_head_num,
             layer.qk_head_dim,
         )
         v_cache = token_to_kv_pool.get_value_buffer(layer.layer_id).view(
             -1,
-            self.page_size,
+            page_size,
             layer.tp_v_head_num,
             layer.v_head_dim,
         )

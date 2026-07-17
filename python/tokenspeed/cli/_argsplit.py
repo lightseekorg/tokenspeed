@@ -73,6 +73,7 @@ _MODEL_FLAG_TOKENS = ("--model", "--model-path")
 
 _ENGINE_MULTI_VALUE_FLAGS = {
     "--cudagraph-capture-sizes",
+    "--prefill-graph-capture-sizes",
 }
 
 
