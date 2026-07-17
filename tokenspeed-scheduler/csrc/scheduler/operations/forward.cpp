@@ -996,7 +996,11 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
             // PrefetchDone: host cache populated; treat same as Submitted for forward scheduling.
             std::int32_t decode_input_tokens = config_.role == Role::kP ? 0 : config_.decode_input_tokens;
 
-            if (auto ev = schedulePrefillFirstChunk(request, token_budget, decode_input_tokens,
+            // Role D only reserves the remote-prefill destination. A partial
+            // first chunk cannot be completed locally, so admit the whole
+            // prompt atomically without applying the prefill compute budget.
+            const std::int32_t prefill_budget = config_.role == Role::kD ? request->PrefillSize() : token_budget;
+            if (auto ev = schedulePrefillFirstChunk(request, prefill_budget, decode_input_tokens,
                                                     config_.disable_l2_cache, simulated_free)) {
                 std::vector<TreeNode*> loadback_diff = ev->GetLoadbackDiff();
                 std::vector<TreeNode*> mamba_loadback_nodes = ev->GetMambaLoadbackNodes();
