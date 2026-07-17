@@ -1,7 +1,7 @@
 # Build with buildx for linux/amd64 and linux/arm64. The base image is a
 # multi-architecture manifest; prefer a native arm64 builder because QEMU
 # emulation can make native extension builds substantially slower.
-FROM lightseekorg/tokenspeed-runner:cu130-torch-2.11.0-flashinfer-0.6.13
+FROM lightseekorg/tokenspeed-runner:cu130-torch-2.11.0-flashinfer-0.6.15
 
 USER root
 
