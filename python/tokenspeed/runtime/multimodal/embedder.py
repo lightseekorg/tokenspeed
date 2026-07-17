@@ -492,8 +492,8 @@ class MultimodalEmbedder:
         Inputs that originate from the SHM transport are pinned, so the
         H2D copy can actually run async with respect to the LM kernels
         already queued on the current stream. We synchronise the current
-        stream with the H2D stream before returning so the encode call
-        sees the moved tensors.
+        stream with the H2D stream so the encoder sees the moved tensors,
+        then record that consumer stream for allocator-safe reuse.
         """
         pending = [
             it
@@ -521,6 +521,9 @@ class MultimodalEmbedder:
                 if isinstance(it.feature, torch.Tensor):
                     it.feature = it.feature.to(device, non_blocking=True)
         current.wait_stream(h2d)
+        for it in pending:
+            if isinstance(it.feature, torch.Tensor):
+                it.feature.record_stream(current)
 
     @staticmethod
     def _drop_raw_feature(item: MultimodalDataItem) -> bool:
