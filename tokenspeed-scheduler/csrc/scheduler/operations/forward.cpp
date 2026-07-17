@@ -22,6 +22,7 @@
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
@@ -669,11 +670,62 @@ std::optional<WriteBackOperation> Scheduler::newRetractOperation(Request* retrac
     return std::nullopt;
 }
 
+#if !TOKENSPEED_FLAT_KVCACHE
+void Scheduler::finalizeRadixPageTableEmission(Request* request, ForwardOperationBase& op, bool force_full) {
+    // Without a hybrid cache, local pages are never published into the radix tree
+    // during an active forward lease, so the builder's append-only delta is exact.
+    if (!hybrid_prefix_cache_) return;
+
+    if (op.request_pool_index <= 0 ||
+        static_cast<std::size_t>(op.request_pool_index) >= radix_page_table_emissions_.size()) {
+        throw std::logic_error("Scheduler::finalizeRadixPageTableEmission: invalid request-pool index=" +
+                               std::to_string(op.request_pool_index));
+    }
+
+    RadixPageTableEmission& previous = radix_page_table_emissions_[op.request_pool_index];
+    const std::int32_t current_size = static_cast<std::int32_t>(op.occupied_pages.size());
+    const std::int32_t current_prefix = request->GetDeviceNode()->DepthInPage(config_.block_size);
+    if (current_prefix < 0 || current_prefix > current_size) {
+        throw std::logic_error("Scheduler::finalizeRadixPageTableEmission: invalid radix prefix size=" +
+                               std::to_string(current_prefix) + "; page-table size=" + std::to_string(current_size));
+    }
+
+    std::int32_t begin = 0;
+    if (!force_full && previous.prefix_pages >= 0) {
+        const std::int32_t previous_size =
+            previous.prefix_pages + static_cast<std::int32_t>(previous.local_pages.size());
+
+        // The emitted table is an immutable, pinned radix prefix followed by an
+        // append-only local tail. Publication can replace ids only in that old
+        // tail. If a lifecycle or ordering invariant changes, refresh safely.
+        const bool valid_incremental =
+            current_prefix >= previous.prefix_pages && op.begin == previous_size && current_size >= previous_size;
+        if (valid_incremental) {
+            auto mismatch = std::mismatch(previous.local_pages.begin(), previous.local_pages.end(),
+                                          op.occupied_pages.begin() + previous.prefix_pages,
+                                          op.occupied_pages.begin() + previous_size);
+            begin = op.begin;
+            if (mismatch.first != previous.local_pages.end()) {
+                begin = previous.prefix_pages +
+                        static_cast<std::int32_t>(std::distance(previous.local_pages.begin(), mismatch.first));
+            }
+        }
+    }
+
+    op.begin = begin;
+    op.size = current_size - begin;
+    previous.prefix_pages = current_prefix;
+    previous.local_pages.assign(op.occupied_pages.begin() + current_prefix, op.occupied_pages.end());
+}
+#endif
+
 // By-reference so the first-chunk caller can harvest the transition's flat load pairs afterwards.
 template <typename Event>
     requires(std::same_as<Event, fsm::SchedulePrefillFirstChunkEvent> || std::same_as<Event, fsm::SchedulePrefillEvent>)
 static PrefillOperation applyPrefillEvent(Request* request, Event& event, std::span<const std::string> flat_group_ids) {
-    // begin/size are PAGE-space: the occupied_pages slice new this round (Python copies it into req_to_page).
+    // begin/size are PAGE-space: the req_to_page refresh slice for this operation.
+    // The builder starts with appended pages; radix finalization may move begin
+    // backward when publication canonicalizes an already-emitted physical page.
     // A first-chunk prefix hit enters during the event, so begin stays 0 and size counts the hit rows too;
     // the op's token-space INPUT window intentionally starts past the hit.
     std::int32_t begin = static_cast<std::int32_t>(request->GetOccupiedPages().size());
@@ -751,6 +803,7 @@ PrefillOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Sched
                                                 op.extend_prefix_len + op.input_length, match.paged_cache);
         hybrid_prefix_cache_->PopulateOp(op);
     }
+    finalizeRadixPageTableEmission(request, op, /*force_full=*/true);
 #endif
     return op;
 }
@@ -764,6 +817,7 @@ PrefillOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Sched
                                                 op.extend_prefix_len + op.input_length);
         hybrid_prefix_cache_->PopulateOp(op);
     }
+    finalizeRadixPageTableEmission(request, op, /*force_full=*/false);
 #endif
     return op;
 }
@@ -829,6 +883,7 @@ DecodeOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Schedu
         hybrid_prefix_cache_->AcquireForRequest(op.request_id, first_pos, target);
         hybrid_prefix_cache_->PopulateOp(op);
     }
+    finalizeRadixPageTableEmission(request, op, /*force_full=*/false);
 #endif
     return op;
 }
@@ -877,6 +932,7 @@ DecodeOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Schedu
         hybrid_prefix_cache_->AcquireForRequest(op.request_id, op.hist_token_len, target, paged_cache_hit);
         hybrid_prefix_cache_->PopulateOp(op);
     }
+    finalizeRadixPageTableEmission(request, op, /*force_full=*/true);
 #endif
 
     MaybeFillFlatBlockTables(op, request, FlatGroupIds());
