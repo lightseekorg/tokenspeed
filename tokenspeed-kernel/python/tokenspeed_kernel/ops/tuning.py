@@ -28,16 +28,11 @@ it blocks the launch thread for the whole profiling run, and under tensor
 parallelism ranks that tune at different times miss their next collective and
 deadlock. Shapes first seen after the freeze run on each library's fallback
 tactics instead -- slower, never stalled.
-
-Set ``TOKENSPEED_DISABLE_FLASHINFER_AUTOTUNE=1`` to start with autotuning
-frozen. This is useful for temporarily bypassing tuning in targeted CI jobs.
 """
-
-import os
 
 __all__ = ["autotune_frozen", "freeze_autotuning"]
 
-_frozen = os.environ.get("TOKENSPEED_DISABLE_FLASHINFER_AUTOTUNE") == "1"
+_frozen = False
 
 
 def autotune_frozen() -> bool:
