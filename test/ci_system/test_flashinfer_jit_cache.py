@@ -15,7 +15,7 @@ def test_read_exact_pin_ignores_other_requirements(tmp_path: Path):
         "-r common.txt\n"
         "torch==2.11.0\n"
         "flashinfer-python==0.6.15\n"
-        "flashinfer-cubin @ https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.15/flashinfer_cubin-0.6.15-py3-none-any.whl\n"
+        "flashinfer-extra==0.0.1\n"
     )
 
     assert read_exact_pin(requirements, "flashinfer-python") == "0.6.15"
