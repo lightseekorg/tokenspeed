@@ -10,12 +10,15 @@ from typing import Any
 import torch
 from tokenspeed_kernel_amd._triton import (
     aggregate,
-)
-from tokenspeed_kernel_amd._triton import gfx1250_tdm as tdm
-from tokenspeed_kernel_amd._triton import (
     gl,
     gluon,
     triton,
+)
+from tokenspeed_kernel_amd.ops.moe.fused_mxfp_gfx950 import (
+    _route_from_topk as _gfx950_route_from_topk,
+)
+from tokenspeed_kernel_amd.ops.moe.fused_mxfp_gfx950 import (
+    fp8_quantize,
 )
 from tokenspeed_kernel_amd.ops.moe.utils import (
     FP4,
@@ -295,7 +298,10 @@ def get_blocked_layout(shape, dtype, num_warps, ndim=2):
     vector_size = max(inner_dim // (8 * (bitwidth // 8)), 4)
 
     return gl.BlockedLayout(
-        [1, vector_size], [4, 8], [num_warps // 2, 2], [1, 0]  #  #  #
+        [1, vector_size],
+        [4, 8],
+        [num_warps // 2, 2],
+        [1, 0],  #  #  #
     )
 
 
@@ -574,7 +580,7 @@ def create_descriptor(
         offs_m_gather = off_m + gl.arange(0, NUM_INDICES, IDX_LAYOUT)
         gathered_m = gl.load(GatherIndx_ptr + offs_m_gather).to(gl.int32)
 
-        x_desc = tdm.make_tensor_descriptor(
+        x_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=x_ptr,
             shape=(M, K // cfg.DIV_FACTOR_X),
             strides=(stride_xm, stride_xk),
@@ -584,7 +590,7 @@ def create_descriptor(
 
         if cfg.WITH_X_MX_SCALE:
             BLOCK_K_SCALE: gl.constexpr = cfg.BLOCK_K // SCALE_BLOCK
-            x_scale_desc = tdm.make_tensor_descriptor(
+            x_scale_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
                 base=x_scale_ptr,
                 shape=(M, K // SCALE_BLOCK),
                 strides=(stride_x_scale_m, stride_x_scale_k),
@@ -596,7 +602,7 @@ def create_descriptor(
     else:
         gathered_m = gl.constexpr(0)
         x_offs = off_m * stride_xm
-        x_desc = tdm.make_tensor_descriptor(
+        x_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=x_ptr + x_offs,
             shape=(M, K // cfg.DIV_FACTOR_X),
             strides=(stride_xm, stride_xk),
@@ -606,7 +612,7 @@ def create_descriptor(
 
         if cfg.WITH_X_MX_SCALE:
             x_scale_offs = off_m * stride_x_scale_m // PRESHUFFLE_FACTOR
-            x_scale_desc = tdm.make_tensor_descriptor(
+            x_scale_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
                 base=x_scale_ptr + x_scale_offs,
                 shape=(M // PRESHUFFLE_FACTOR, K // SCALE_BLOCK * PRESHUFFLE_FACTOR),
                 strides=(stride_x_scale_m, stride_x_scale_k),
@@ -617,7 +623,7 @@ def create_descriptor(
             x_scale_desc = gl.constexpr(0)
 
     if cfg.W_TRANSPOSE:
-        w_desc = tdm.make_tensor_descriptor(
+        w_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=w_ptr + w_offs,
             shape=(N, K // cfg.DIV_FACTOR_W),
             strides=(stride_wn, stride_wk),
@@ -625,7 +631,7 @@ def create_descriptor(
             layout=cfg.shared_layout_w,
         )
     else:
-        w_desc = tdm.make_tensor_descriptor(
+        w_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=w_ptr + w_offs,
             shape=(K // cfg.DIV_FACTOR_W, N),
             strides=(stride_wk, stride_wn),
@@ -638,7 +644,7 @@ def create_descriptor(
         N_PADDED = (N + PRESHUFFLE_FACTOR - 1) // PRESHUFFLE_FACTOR * PRESHUFFLE_FACTOR
         K_SCALE = (K + SCALE_BLOCK - 1) // SCALE_BLOCK
         K_SCALE_PADDED = (K_SCALE + SCALE_KWIDTH - 1) // SCALE_KWIDTH * SCALE_KWIDTH
-        w_scale_desc = tdm.make_tensor_descriptor(
+        w_scale_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=w_scale_ptr + w_scale_offs,
             shape=(N_PADDED // PRESHUFFLE_FACTOR, K_SCALE_PADDED * PRESHUFFLE_FACTOR),
             strides=(stride_w_scale_n, stride_w_scale_k),
@@ -653,7 +659,6 @@ def create_descriptor(
 
 @aggregate
 class MoEProgramBase:
-
     @gluon.constexpr_function
     def __init__(self):
         pass
@@ -677,16 +682,16 @@ class MoEProgramBase:
 
         if cfg.USE_GATHER:
             col_offset_x = self.off_k_x + load_idx * BLOCK_K_PACKED_X
-            x_desc_k = tdm.update_tensor_descriptor(
+            x_desc_k = gl.amd.gfx1250.tdm.update_tensor_descriptor(
                 self.x_desc, add_offsets=[0, col_offset_x], pred=pred, clamp_bounds=True
             )
-            tdm.async_gather(
+            gl.amd.gfx1250.tdm.async_gather(
                 x_desc_k,
                 self.gathered_m,
                 self.x_buffer.index(load_idx % cfg.NUM_BUFFERS),
             )
         else:
-            tdm.async_load(
+            gl.amd.gfx1250.tdm.async_load(
                 self.x_desc,
                 [0, load_idx * BLOCK_K_PACKED_X],
                 self.x_buffer.index(load_idx % cfg.NUM_BUFFERS),
@@ -694,14 +699,14 @@ class MoEProgramBase:
             )
 
         if cfg.W_TRANSPOSE:
-            tdm.async_load(
+            gl.amd.gfx1250.tdm.async_load(
                 self.w_desc,
                 [0, load_idx * BLOCK_K_PACKED_W],
                 self.w_buffer.index(load_idx % cfg.NUM_BUFFERS),
                 pred=pred,
             )
         else:
-            tdm.async_load(
+            gl.amd.gfx1250.tdm.async_load(
                 self.w_desc,
                 [load_idx * BLOCK_K_PACKED_W, 0],
                 self.w_buffer.index(load_idx % cfg.NUM_BUFFERS),
@@ -714,19 +719,19 @@ class MoEProgramBase:
                     self.off_k_x * cfg.DIV_FACTOR_X // cfg.SCALE_BLOCK
                     + load_idx * BLOCK_K_SCALE
                 )
-                x_scale_desc_k = tdm.update_tensor_descriptor(
+                x_scale_desc_k = gl.amd.gfx1250.tdm.update_tensor_descriptor(
                     self.x_scale_desc,
                     add_offsets=[0, col_offset_x_scale],
                     pred=pred,
                     clamp_bounds=True,
                 )
-                tdm.async_gather(
+                gl.amd.gfx1250.tdm.async_gather(
                     x_scale_desc_k,
                     self.gathered_m,
                     self.x_scale_buffer.index(load_idx % cfg.NUM_BUFFERS),
                 )
             else:
-                tdm.async_load(
+                gl.amd.gfx1250.tdm.async_load(
                     self.x_scale_desc,
                     [0, load_idx * cfg.BLOCK_K_SCALE_PRESHUFFLED],
                     self.x_scale_buffer.index(load_idx % cfg.NUM_BUFFERS),
@@ -734,7 +739,7 @@ class MoEProgramBase:
                 )
 
         if cfg.WITH_W_MX_SCALE:
-            tdm.async_load(
+            gl.amd.gfx1250.tdm.async_load(
                 self.w_scale_desc,
                 [0, load_idx * cfg.BLOCK_K_SCALE_PRESHUFFLED],
                 self.w_scale_buffer.index(load_idx % cfg.NUM_BUFFERS),
@@ -745,7 +750,7 @@ class MoEProgramBase:
 
     @gluon.jit
     def async_wait(self, waitcnt):
-        tdm.async_wait(waitcnt * self.cfg.NUM_LOADS_IN_BATCH)
+        gl.amd.gfx1250.tdm.async_wait(waitcnt * self.cfg.NUM_LOADS_IN_BATCH)
 
 
 @composition
@@ -759,10 +764,10 @@ class MoEPipelinedProgram:
     x_scale_buffer: gl.shared_memory_descriptor | gl.constexpr
     w_scale_buffer: gl.shared_memory_descriptor | gl.constexpr
 
-    x_desc: tdm.tensor_descriptor
-    w_desc: tdm.tensor_descriptor
-    x_scale_desc: tdm.tensor_descriptor | gl.constexpr
-    w_scale_desc: tdm.tensor_descriptor | gl.constexpr
+    x_desc: gl.amd.gfx1250.tdm.tensor_descriptor
+    w_desc: gl.amd.gfx1250.tdm.tensor_descriptor
+    x_scale_desc: gl.amd.gfx1250.tdm.tensor_descriptor | gl.constexpr
+    w_scale_desc: gl.amd.gfx1250.tdm.tensor_descriptor | gl.constexpr
 
     gathered_m: gl.tensor | gl.constexpr
     off_k_x: gl.tensor
@@ -1014,10 +1019,10 @@ class MoESliceKProgram:
     x_scale_buffer: gl.shared_memory_descriptor | gl.constexpr
     w_scale_buffer: gl.shared_memory_descriptor | gl.constexpr
 
-    x_desc: tdm.tensor_descriptor
-    w_desc: tdm.tensor_descriptor
-    x_scale_desc: tdm.tensor_descriptor | gl.constexpr
-    w_scale_desc: tdm.tensor_descriptor | gl.constexpr
+    x_desc: gl.amd.gfx1250.tdm.tensor_descriptor
+    w_desc: gl.amd.gfx1250.tdm.tensor_descriptor
+    x_scale_desc: gl.amd.gfx1250.tdm.tensor_descriptor | gl.constexpr
+    w_scale_desc: gl.amd.gfx1250.tdm.tensor_descriptor | gl.constexpr
 
     gathered_m: gl.tensor | gl.constexpr
     off_k_x: gl.tensor
@@ -1305,10 +1310,10 @@ class MoESliceNKProgram:
     x_scale_buffer: gl.shared_memory_descriptor | gl.constexpr
     w_scale_buffer: gl.shared_memory_descriptor | gl.constexpr
 
-    x_desc: tdm.tensor_descriptor
-    w_desc: tdm.tensor_descriptor
-    x_scale_desc: tdm.tensor_descriptor | gl.constexpr
-    w_scale_desc: tdm.tensor_descriptor | gl.constexpr
+    x_desc: gl.amd.gfx1250.tdm.tensor_descriptor
+    w_desc: gl.amd.gfx1250.tdm.tensor_descriptor
+    x_scale_desc: gl.amd.gfx1250.tdm.tensor_descriptor | gl.constexpr
+    w_scale_desc: gl.amd.gfx1250.tdm.tensor_descriptor | gl.constexpr
 
     gathered_m: gl.tensor | gl.constexpr
     off_k_x: gl.tensor
@@ -1413,16 +1418,16 @@ class MoESliceNKProgram:
 
         if cfg.USE_GATHER:
             col_offset_x = self.off_k_x + load_idx * BLOCK_K_PACKED_X
-            x_desc_k = tdm.update_tensor_descriptor(
+            x_desc_k = gl.amd.gfx1250.tdm.update_tensor_descriptor(
                 self.x_desc, add_offsets=[0, col_offset_x], pred=pred, clamp_bounds=True
             )
-            tdm.async_gather(
+            gl.amd.gfx1250.tdm.async_gather(
                 x_desc_k,
                 self.gathered_m,
                 self.x_buffer.index(load_idx % cfg.NUM_BUFFERS),
             )
         else:
-            tdm.async_load(
+            gl.amd.gfx1250.tdm.async_load(
                 self.x_desc,
                 [0, load_idx * BLOCK_K_PACKED_X],
                 self.x_buffer.index(load_idx % cfg.NUM_BUFFERS),
@@ -1435,19 +1440,19 @@ class MoESliceNKProgram:
                     self.off_k_x * cfg.DIV_FACTOR_X // cfg.SCALE_BLOCK
                     + load_idx * BLOCK_K_SCALE
                 )
-                x_scale_desc_k = tdm.update_tensor_descriptor(
+                x_scale_desc_k = gl.amd.gfx1250.tdm.update_tensor_descriptor(
                     self.x_scale_desc,
                     add_offsets=[0, col_offset_x_scale],
                     pred=pred,
                     clamp_bounds=True,
                 )
-                tdm.async_gather(
+                gl.amd.gfx1250.tdm.async_gather(
                     x_scale_desc_k,
                     self.gathered_m,
                     self.x_scale_buffer.index(load_idx % cfg.NUM_BUFFERS),
                 )
             else:
-                tdm.async_load(
+                gl.amd.gfx1250.tdm.async_load(
                     self.x_scale_desc,
                     [0, load_idx * cfg.BLOCK_K_SCALE_PRESHUFFLED],
                     self.x_scale_buffer.index(load_idx % cfg.NUM_BUFFERS),
@@ -1461,14 +1466,14 @@ class MoESliceNKProgram:
         BLOCK_K_PACKED_W: gl.constexpr = cfg.BLOCK_K // cfg.DIV_FACTOR_W
 
         if cfg.W_TRANSPOSE:
-            tdm.async_load(
+            gl.amd.gfx1250.tdm.async_load(
                 self.w_desc,
                 [0, load_idx * BLOCK_K_PACKED_W],
                 self.w_buffer.index(load_idx % cfg.NUM_BUFFERS),
                 pred=pred,
             )
         else:
-            tdm.async_load(
+            gl.amd.gfx1250.tdm.async_load(
                 self.w_desc,
                 [load_idx * BLOCK_K_PACKED_W, 0],
                 self.w_buffer.index(load_idx % cfg.NUM_BUFFERS),
@@ -1476,7 +1481,7 @@ class MoESliceNKProgram:
             )
 
         if cfg.WITH_W_MX_SCALE:
-            tdm.async_load(
+            gl.amd.gfx1250.tdm.async_load(
                 self.w_scale_desc,
                 [0, load_idx * cfg.BLOCK_K_SCALE_PRESHUFFLED],
                 self.w_scale_buffer.index(load_idx % cfg.NUM_BUFFERS),
@@ -1994,7 +1999,7 @@ def _matmul(
         )
         out_smem.store(out)
 
-        y_desc = tdm.make_tensor_descriptor(
+        y_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=Y_ptr,
             shape=(writeback_size, yN),
             strides=(stride_y_m, stride_y_n),
@@ -2003,11 +2008,11 @@ def _matmul(
         )
 
         col_offset = (OUT_BLOCK_N * pid_n).to(cfg.index_type)
-        y_desc = tdm.update_tensor_descriptor(
+        y_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
             y_desc, add_offsets=[0, col_offset], clamp_bounds=True
         )
-        tdm.async_scatter(y_desc, dst_row_indices, out_smem)
-        tdm.async_wait(0)
+        gl.amd.gfx1250.tdm.async_scatter(y_desc, dst_row_indices, out_smem)
+        gl.amd.gfx1250.tdm.async_wait(0)
     else:
         offs_y_m = off_m + gl.arange(0, BLOCK_M, gl.SliceLayout(1, BLOCKED_LAYOUT_Y))
         offs_y_n = OUT_BLOCK_N * pid_n + gl.arange(
@@ -2062,7 +2067,7 @@ def _as_tensor(
 
 def _mark_scale_preshuffled(scale: Tensor | None, enabled: bool) -> Tensor | None:
     if scale is not None and enabled:
-        scale.storage.layout = _NamedScaleLayout("CDNA4MXScaleLayout")
+        scale.storage.layout = _NamedScaleLayout("GFX1250_SCALE")
     return scale
 
 
@@ -2470,6 +2475,150 @@ def gluon_mxfp_combine(
     return out
 
 
+def _quantize_fp8_activation(
+    x: torch.Tensor,
+    scale: torch.Tensor | None,
+) -> torch.Tensor:
+    if x.dtype is torch.float8_e4m3fn:
+        return x.contiguous()
+    if x.dtype not in (torch.bfloat16, torch.float16):
+        raise TypeError(f"gfx1250 FP8 path expects bf16/fp16/fp8 input, got {x.dtype}")
+    return fp8_quantize(x.contiguous(), scale, fp8_dtype=torch.float8_e4m3fn)
+
+
+def _precomputed_topk_route(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_experts: int,
+):
+    return _gfx950_route_from_topk(
+        topk_weights,
+        topk_ids,
+        num_experts,
+        dtype=topk_weights.dtype,
+    )
+
+
+def gluon_mxfp_precomputed_mxfp4_fused_moe(
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    w13_weight: torch.Tensor,
+    w2_weight: torch.Tensor,
+    *,
+    w13_mx_scale: torch.Tensor,
+    w2_mx_scale: torch.Tensor,
+    w13_act_scale: torch.Tensor | None = None,
+    w2_act_scale: torch.Tensor | None = None,
+    w13_bias: torch.Tensor | None = None,
+    w2_bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    swiglu_alpha: float = 1.702,
+    swiglu_limit: float = 7.0,
+    swiglu_beta: float = 1.0,
+    **launch_kwargs,
+) -> torch.Tensor:
+    """Dispatch + combine for gfx1250 MXFP4-weight MoE with precomputed top-k.
+
+    Args:
+        hidden_states: Token activations in bf16/fp16/fp8, shaped
+            ``(n_tokens, hidden_size)``.
+        topk_weights: Route weights, shaped ``(n_tokens, top_k)``.
+        topk_ids: Expert ids, shaped ``(n_tokens, top_k)``.
+        w13_weight: gfx1250-preprocessed interleaved gate/up expert weight.
+        w2_weight: gfx1250-preprocessed down-projection expert weight.
+        w13_mx_scale: gfx1250-swizzled MXFP4 scale for ``w13_weight``.
+        w2_mx_scale: gfx1250-swizzled MXFP4 scale for ``w2_weight``.
+        w13_act_scale: Optional static FP8 scale for the input activation.
+        w2_act_scale: Optional static FP8 scale for the intermediate activation.
+        w13_bias: Optional expert bias for the gate/up projection.
+        w2_bias: Optional expert bias for the down projection.
+        out_dtype: Final output dtype.
+        swiglu_alpha: SwiGLU gate scale.
+        swiglu_limit: Optional SwiGLU clamp limit; ``0`` disables clamping.
+        swiglu_beta: SwiGLU linear branch offset.
+
+    Returns:
+        Tensor shaped ``(n_tokens, hidden_size)``.
+    """
+    if topk_ids.ndim != 2:
+        raise ValueError(f"topk_ids must be rank-2, got {tuple(topk_ids.shape)}")
+    if topk_weights.shape != topk_ids.shape:
+        raise ValueError(
+            "topk_weights and topk_ids must have the same shape, got "
+            f"{tuple(topk_weights.shape)} and {tuple(topk_ids.shape)}"
+        )
+
+    w13_raw = w13_weight.storage.data if isinstance(w13_weight, Tensor) else w13_weight
+    if not isinstance(w13_raw, torch.Tensor) or w13_raw.ndim != 3:
+        raise ValueError("w13_weight must expose a rank-3 expert weight tensor")
+    num_experts = int(w13_raw.shape[0])
+    if num_experts <= 0:
+        raise ValueError(f"num_experts must be positive, got {num_experts}")
+
+    topk_ids = topk_ids.to(device=hidden_states.device, dtype=torch.int32).contiguous()
+    topk_weights = topk_weights.to(
+        device=hidden_states.device, dtype=torch.float32
+    ).contiguous()
+    if bool(((topk_ids < 0) | (topk_ids >= num_experts)).any().item()):
+        raise NotImplementedError(
+            "gfx1250 Gluon MXFP4 combine does not support masked or EP-local top-k ids"
+        )
+
+    ragged_metadata, gather_indx, scatter_indx, _gate_scal = _precomputed_topk_route(
+        topk_weights,
+        topk_ids,
+        num_experts,
+    )
+
+    scale_preshuffle = bool(launch_kwargs.pop("scale_preshuffle", True))
+    launch_defaults = {
+        "block_m": 128,
+        "block_n": 128,
+        "block_k": 256,
+        "num_buffers": 2,
+        "schedule": "baseline",
+        "num_warps": 4,
+    }
+    launch_defaults.update(launch_kwargs)
+
+    x_fp8 = _quantize_fp8_activation(hidden_states, w13_act_scale)
+    intermediate = gluon_mxfp_dispatch_swiglu(
+        x_fp8,
+        w13_weight,
+        w13_mx_scale,
+        x_format="e4m3",
+        bias=w13_bias,
+        a_ragged_metadata=ragged_metadata,
+        gather_indx=gather_indx,
+        out_dtype=out_dtype,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_limit=swiglu_limit,
+        swiglu_beta=swiglu_beta,
+        scale_preshuffle=scale_preshuffle,
+        **launch_defaults,
+    )
+    intermediate_fp8 = _quantize_fp8_activation(intermediate, w2_act_scale)
+    flat = gluon_mxfp_combine(
+        intermediate_fp8,
+        w2_weight,
+        w2_mx_scale,
+        x_format="e4m3",
+        bias=w2_bias,
+        a_ragged_metadata=ragged_metadata,
+        scatter_indx=scatter_indx,
+        out_dtype=out_dtype,
+        scale_preshuffle=scale_preshuffle,
+        **launch_defaults,
+    )
+    weighted = flat.float() * topk_weights.reshape(-1, 1)
+    return (
+        weighted.view(hidden_states.shape[0], topk_ids.shape[1], flat.shape[-1])
+        .sum(dim=1)
+        .to(out_dtype)
+    )
+
+
 def gluon_mxfp_ragged_matmul(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -2592,6 +2741,7 @@ __all__ = [
     "PrecisionConfig",
     "gluon_mxfp_combine",
     "gluon_mxfp_dispatch_swiglu",
+    "gluon_mxfp_precomputed_mxfp4_fused_moe",
     "gluon_mxfp_ragged_matmul",
     "matmul",
     "routing",
