@@ -20,14 +20,27 @@
 
 """The kernel autotune-lifecycle switch the executor flips at end of startup."""
 
+import importlib
+import os
 import unittest
+from unittest import mock
 
 from tokenspeed_kernel.ops import tuning
 
 
 class TestAutotuneFreeze(unittest.TestCase):
+    def setUp(self):
+        tuning._frozen = False
+
     def tearDown(self):
         tuning._frozen = False  # global switch; restore for other tests
+
+    def test_environment_disables_autotuning(self):
+        with mock.patch.dict(
+            os.environ, {"TOKENSPEED_DISABLE_FLASHINFER_AUTOTUNE": "1"}
+        ):
+            importlib.reload(tuning)
+            self.assertTrue(tuning.autotune_frozen())
 
     def test_freeze_is_one_way_and_idempotent(self):
         self.assertFalse(tuning.autotune_frozen())

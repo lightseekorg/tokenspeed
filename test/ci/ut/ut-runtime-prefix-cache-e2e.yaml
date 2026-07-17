@@ -9,6 +9,7 @@ runner:
     - b200-1gpu
 env:
   CI: "true"
+  TOKENSPEED_DISABLE_FLASHINFER_AUTOTUNE: "1"
 install:
   - bash test/ci_system/install_deps.sh
 ut:
