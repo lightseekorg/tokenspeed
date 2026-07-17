@@ -1,5 +1,3 @@
-# Adapted from triton-mi450/third_party/amd/python/examples/gluon/moe_gfx1250.py.
-
 from __future__ import annotations
 
 import math
