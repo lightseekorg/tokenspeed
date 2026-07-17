@@ -9,6 +9,17 @@ from pathlib import Path
 JIT_CACHE_DIST = "flashinfer-jit-cache"
 FLASHINFER_PYTHON_DIST = "flashinfer-python"
 _QUERY_INSTALLED = object()
+RUNNER_PLATFORM_TAGS = (
+    ("gb200", "manylinux_2_28_aarch64"),
+    ("b200", "manylinux_2_28_x86_64"),
+)
+
+
+def platform_tag_for_runner(runner: str) -> str | None:
+    for prefix, platform_tag in RUNNER_PLATFORM_TAGS:
+        if runner.startswith(prefix):
+            return platform_tag
+    return None
 
 
 def read_exact_pin(requirements_path: Path, package: str) -> str:
@@ -51,6 +62,8 @@ def install_url_if_needed(
     requirements_path: Path,
     cuda_index: str,
     installed_version: str | None | object = _QUERY_INSTALLED,
+    *,
+    platform_tag: str,
 ) -> tuple[str | None, str, str | None]:
     flashinfer_version = read_exact_pin(requirements_path, FLASHINFER_PYTHON_DIST)
     expected_version = expected_jit_cache_version(flashinfer_version, cuda_index)
@@ -62,7 +75,11 @@ def install_url_if_needed(
     if current_version == expected_version:
         return None, expected_version, current_version
     return (
-        jit_cache_wheel_url(flashinfer_version, cuda_index),
+        jit_cache_wheel_url(
+            flashinfer_version,
+            cuda_index,
+            platform_tag=platform_tag,
+        ),
         expected_version,
         current_version,
     )
@@ -72,11 +89,17 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--requirements", type=Path, required=True)
     parser.add_argument("--cuda-index", required=True)
+    parser.add_argument("--runner", required=True)
     args = parser.parse_args(argv)
+
+    platform_tag = platform_tag_for_runner(args.runner)
+    if platform_tag is None:
+        return 0
 
     url, expected_version, installed_version = install_url_if_needed(
         args.requirements,
         args.cuda_index,
+        platform_tag=platform_tag,
     )
     if url is None:
         print(
