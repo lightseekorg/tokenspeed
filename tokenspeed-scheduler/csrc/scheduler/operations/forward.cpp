@@ -715,6 +715,8 @@ PrefillOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Sched
     auto match = event.GetMatchResult();
 #endif
     auto op = applyPrefillEvent(request, event, FlatGroupIds());
+    // First chunk adopts/rebuilds the prefix, so refresh the whole mirror row.
+    op.full_refresh = true;
 #if TOKENSPEED_FLAT_KVCACHE
     // Host-loaded pages ride the same LoadBackOperation channel as radix loadbacks.
     std::vector<std::pair<CacheBlock*, CacheBlock*>> load_pairs = event.TakeFlatLoadPairs();
@@ -757,6 +759,9 @@ PrefillOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Sched
 
 PrefillOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::SchedulePrefillEvent event) {
     auto op = applyPrefillEvent(request, event, FlatGroupIds());
+    // Continuation prefill may publish/adopt completed prior-chunk pages before
+    // scheduling the next tail chunk, so earlier logical pages can be repointed.
+    op.full_refresh = true;
 #if !TOKENSPEED_FLAT_KVCACHE
     if (hybrid_prefix_cache_) {
         hybrid_prefix_cache_->CommitChunk(op.request_id, const_cast<TreeNode*>(request->GetDeviceNode()));
@@ -810,6 +815,11 @@ DecodeOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Schedu
 #endif
 
     auto op = applyDecodeEvent(request, std::move(event), config_.decode_input_tokens, FlatGroupIds());
+    if (came_from_prefill_done) {
+        // PrefillDone -> Decode may publish/adopt completed prefill pages before
+        // reserving the decode tail, so earlier logical pages can be repointed.
+        op.full_refresh = true;
+    }
     if (need_bootstrap_token) {
         op.decode_input_id = bootstrap_token;
     }
@@ -853,6 +863,7 @@ DecodeOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Schedu
         .occupied_pages = std::move(all_pages),
         .begin = 0,
         .size = sz,
+        .full_refresh = true,
     }};
     op.decode_input_id = request->GetLastToken();
     op.hist_token_len = request->TokenSize() - 1;

@@ -42,6 +42,8 @@ struct ForwardOperationBase {
     std::int32_t begin;
     // Number of newly allocated pages (starting at occupied_pages[begin]).
     std::int32_t size;
+    // True when this op rebuilt the prefix: refresh the whole mirror row, not just the tail delta.
+    bool full_refresh{false};
 
     std::int32_t prefill_length;
 
@@ -92,6 +94,8 @@ struct FlatForwardOperation {
     std::vector<std::vector<std::int32_t>> occupied_pages;
     std::vector<std::int32_t> begins;
     std::vector<std::int32_t> sizes;
+    // Per-request 0/1 flag mirroring ForwardOperationBase::full_refresh (1 = whole-row copy, 0 = tail delta).
+    std::vector<std::int32_t> full_refresh;
 
     std::vector<std::int32_t> input_ids;
     std::vector<std::int32_t> shifted_input_ids;
@@ -139,6 +143,7 @@ struct FlatForwardOperation {
                     occupied_pages.push_back(std::move(inner.occupied_pages));
                     begins.push_back(inner.begin);
                     sizes.push_back(inner.size);
+                    full_refresh.push_back(static_cast<std::int32_t>(inner.full_refresh));
                     mamba_working_indices.push_back(inner.mamba_working_idx);
                     mamba_checkpoint_dst_indices.push_back(inner.mamba_checkpoint_dst_idx);
                     mamba_cow_src_indices.push_back(inner.mamba_cow_src_idx);
