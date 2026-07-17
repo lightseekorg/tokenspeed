@@ -6,6 +6,6 @@ nvidia-cutlass-dsl[cu13]==4.6.0
 nvidia-cutlass-dsl-libs-cu13==4.6.0
 torch==2.11.0
 flashinfer-python==0.6.15
-flashinfer-cubin==0.6.15
+flashinfer-cubin @ https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.15/flashinfer_cubin-0.6.15-py3-none-any.whl
 nvidia-ml-py==13.580.82
 nvtx
