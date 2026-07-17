@@ -61,7 +61,12 @@ pip_install_with_retry pip3 install tokenspeed-kernel/python/ \
 
 echo "=== Step 4: Install TokenSpeed Scheduler ==="
 pip_install_with_retry pip3 install cmake ninja
-pip_install_with_retry pip3 install tokenspeed-scheduler/
+# Set TOKENSPEED_FLAT_KV=ON in a CI task env to build the scheduler with Flat KV.
+SCHEDULER_PIP_ARGS=()
+if [ "${TOKENSPEED_FLAT_KV:-OFF}" = "ON" ]; then
+    SCHEDULER_PIP_ARGS+=(--config-settings=cmake.define.TOKENSPEED_FLAT_KVCACHE=ON)
+fi
+pip_install_with_retry pip3 install tokenspeed-scheduler/ "${SCHEDULER_PIP_ARGS[@]}"
 
 echo "=== Step 5: Install TokenSpeed ==="
 # tokenspeed-smg / -grpc-servicer / -grpc-proto are pinned in
