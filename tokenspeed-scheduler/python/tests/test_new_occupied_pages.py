@@ -22,7 +22,7 @@
 
 Covers:
   - Prefill allocates pages; occupied_pages contains all held page indices,
-    begins/sizes describe the newly allocated slice
+    begins/sizes describe the page-table slice that must be refreshed
   - begins is 0 on first schedule (no pages were occupied before)
   - Chunked prefill: begins grows across chunks as more pages are allocated
   - Decode step: no new pages allocated when tail page still has capacity

@@ -161,6 +161,10 @@ class PlatformInfo:
         return self.is_amd and self.arch_version == ArchVersion(9, 5)
 
     @property
+    def is_cdna5(self) -> bool:
+        return self.is_amd and self.arch_version == ArchVersion(12, 5)
+
+    @property
     def is_ampere_plus(self) -> bool:
         return self.is_nvidia and self.arch_version >= ArchVersion(8, 0)
 
@@ -179,6 +183,10 @@ class PlatformInfo:
     @property
     def is_cdna4_plus(self) -> bool:
         return self.is_amd and self.arch_version >= ArchVersion(9, 5)
+
+    @property
+    def is_cdna5_plus(self) -> bool:
+        return self.is_amd and self.arch_version >= ArchVersion(12, 5)
 
     @property
     def arch(self) -> str:
@@ -237,6 +245,7 @@ class PlatformInfo:
             names = {
                 (9, 4): "CDNA3",  # MI300
                 (9, 5): "CDNA4",  # MI350
+                (12, 5): "CDNA5",
             }
             return names.get(arch_version, f"GFX{arch_version[0]}.{arch_version[1]}")
         return f"{self.vendor}:{arch_version[0]}.{arch_version[1]}"
@@ -417,6 +426,7 @@ def _detect_rocm_platform() -> PlatformInfo:
     arch_map = {
         "gfx942": ArchVersion(9, 4),  # MI300
         "gfx950": ArchVersion(9, 5),  # MI350
+        "gfx1250": ArchVersion(12, 5),
     }
     arch_version = arch_map.get(arch, ArchVersion(9, 0))
     sm_features = _get_rocm_sm_features(arch)
@@ -431,9 +441,10 @@ def _detect_rocm_platform() -> PlatformInfo:
         memory_bandwidth=_estimate_amd_bandwidth(props),
         sm_count=props.multi_processor_count,
         max_threads_per_sm=getattr(props, "max_threads_per_multi_processor", 0),
-        max_shared_memory_per_sm={"gfx942": 64 * 1024, "gfx950": 160 * 1024}.get(
-            arch, getattr(props, "max_shared_memory_per_block", 0)
-        ),
+        max_shared_memory_per_sm={
+            "gfx942": 64 * 1024,
+            "gfx950": 160 * 1024,
+        }.get(arch, getattr(props, "max_shared_memory_per_block", 0)),
         sm_features=sm_features,
         runtime_features=runtime_features,
         interconnect=_detect_rocm_interconnect(),
@@ -444,10 +455,10 @@ def _get_rocm_sm_features(arch: str) -> frozenset[str]:
     """Determine ROCm SM features from architecture."""
     features: set[str] = set()
 
-    if arch in ("gfx942", "gfx950"):
+    if arch in ("gfx942", "gfx950", "gfx1250"):
         features |= {"tensor_core:f16", "tensor_core:f8"}
 
-    if arch == "gfx950":
+    if arch in ("gfx950", "gfx1250"):
         features |= {"tensor_core:f4", "memory:async_copy"}
 
     return frozenset(features)

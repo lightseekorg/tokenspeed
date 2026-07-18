@@ -86,6 +86,9 @@ Scheduler::Scheduler(SchedulerConfig config)
     if (config_.overlap_schedule_depth > 0 && config_.decode_input_tokens == 0) {
         throw std::invalid_argument("Scheduler: overlapped decode requires decode_input_tokens > 0");
     }
+#if !TOKENSPEED_FLAT_KVCACHE
+    radix_page_table_emissions_.resize(static_cast<std::size_t>(config_.max_batch_size) + 1);
+#endif
     if (auto* env = std::getenv("SPDLOG_LEVEL")) {
         std::string level_str{env};
         spdlog::level::level_enum level = spdlog::level::from_str(level_str);

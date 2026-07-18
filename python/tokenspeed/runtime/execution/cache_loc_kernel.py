@@ -35,10 +35,10 @@ logger = get_colorful_logger(__name__)
 def update_req_to_page_kernel(
     # Input pointers
     req_pool_indices_ptr,  # [batch_size]
-    new_occupied_pages_ptr,  # [total_pages] - flattened
-    new_occupied_pages_num_ptr,  # [batch_size]
+    new_occupied_pages_ptr,  # [total_entries] - flattened refresh page IDs
+    new_occupied_pages_num_ptr,  # [batch_size] - refresh entries per request
     pages_copy_starts_ptr,  # [batch_size]
-    cumsum_pages_ptr,  # [batch_size] - cumulative sum of new_occupied_pages_num
+    cumsum_pages_ptr,  # [batch_size] - cumulative refresh-entry counts
     # Output pointer
     req_to_page_ptr,  # [req_pool_size+1, context_len]
     # Scalars
@@ -46,7 +46,7 @@ def update_req_to_page_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     """
-    Update req_to_page table with new occupied pages.
+    Apply emitted page-table refresh slices to req_to_page.
     Each program handles one request in the batch.
     """
     req_idx = tl.program_id(0)
@@ -56,7 +56,7 @@ def update_req_to_page_kernel(
     num_pages = tl.load(new_occupied_pages_num_ptr + req_idx)
     copy_start = tl.load(pages_copy_starts_ptr + req_idx)
 
-    # Get offset into flattened new_occupied_pages
+    # Get the request's offset into the flattened refresh entries.
     offset_idx = tl.where(req_idx > 0, req_idx - 1, 0)
     pages_offset = tl.load(cumsum_pages_ptr + offset_idx)
     pages_offset = tl.where(req_idx > 0, pages_offset, 0)
@@ -70,7 +70,7 @@ def update_req_to_page_kernel(
         page_offsets = block_start + tl.arange(0, BLOCK_SIZE)
         mask = page_offsets < num_pages
 
-        # Load new page IDs
+        # Load the page IDs to refresh.
         page_ptrs = new_occupied_pages_ptr + pages_offset + page_offsets
         new_page_ids = tl.load(page_ptrs, mask=mask, other=0)
 
@@ -90,13 +90,13 @@ def update_req_to_page(
     pages_copy_starts: torch.Tensor,
 ) -> None:
     """
-    Update req_to_page table with new occupied pages using Triton kernel.
+    Apply emitted page-table refresh slices to req_to_page using Triton.
 
     Args:
         req_to_page: Request to page table [req_pool_size+1, context_len]
         req_pool_indices: Request pool indices [batch_size]
-        new_occupied_pages: New page IDs [total_pages] - flattened
-        new_occupied_pages_num: Number of new pages per request [batch_size]
+        new_occupied_pages: Refresh page IDs [total_entries] - flattened
+        new_occupied_pages_num: Number of refresh entries per request [batch_size]
         pages_copy_starts: Start position in req_to_page for each request [batch_size]
     """
     batch_size = req_pool_indices.shape[0]
@@ -484,7 +484,9 @@ def update_block_table(forward_op, device, req_to_page):
         tensor = torch.tensor(flat, dtype=dtype, device="cpu", pin_memory=True)
         return tensor.to(device, non_blocking=True)
 
-    # sizes[i] is the number of newly allocated pages for request i.
+    # sizes[i] is the number of page-table entries to refresh. Besides newly
+    # allocated pages, this can include an existing radix prefix whose physical
+    # IDs changed when duplicate request-local pages were canonicalized.
     if all(n == 0 for n in forward_op.sizes):
         return
 

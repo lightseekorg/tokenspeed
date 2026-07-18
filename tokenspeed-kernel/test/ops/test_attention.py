@@ -108,6 +108,7 @@ def test_mha_prefill(
     ],
 )
 @pytest.mark.parametrize("solution", ["triton", "gluon"])
+@pytest.mark.parametrize("window_left", [-1, 127], ids=["full", "sliding"])
 def test_mha_prefill_lse(
     device: str,
     solution: str,
@@ -115,6 +116,7 @@ def test_mha_prefill_lse(
     head_dim: int,
     num_q_heads: int,
     num_kv_heads: int,
+    window_left: int,
     require,
 ) -> None:
     require("attention", "mha_prefill", solution, dtype, "q")
@@ -140,6 +142,7 @@ def test_mha_prefill_lse(
         cu_seqlens=cu_seqlens,
         cu_seqlens_cpu=cu_seqlens_cpu,
         max_seqlen=max_seqlen,
+        window_left=window_left,
         return_lse=True,
         solution=solution,
     )
@@ -148,19 +151,27 @@ def test_mha_prefill_lse(
     assert lse.shape == (total_tokens, num_q_heads)
 
     # Reference: natural-log log-sum-exp over a causal MHA prefill.
+    ref_outs = []
     ref_lses = []
     for start, end in zip(cu_seqlens_cpu[:-1], cu_seqlens_cpu[1:]):
         q_i = q[start:end].float()
         k_i = k[start:end].float()
         k_exp = k_i.repeat_interleave(group, dim=1)
+        v_exp = v[start:end].float().repeat_interleave(group, dim=1)
         seq_len = end - start
         scores = torch.einsum("qhd,khd->hqk", q_i, k_exp) * sm_scale
         pos = torch.arange(seq_len, device=device)
-        causal = pos[:, None] >= pos[None, :]
-        scores = scores.masked_fill(~causal[None, :, :], float("-inf"))
+        mask = pos[:, None] >= pos[None, :]
+        if window_left >= 0:
+            mask &= (pos[:, None] - pos[None, :]) <= window_left
+        scores = scores.masked_fill(~mask[None, :, :], float("-inf"))
+        probs = torch.softmax(scores, dim=-1)
+        ref_outs.append(torch.einsum("hqk,khd->qhd", probs, v_exp))
         ref_lses.append(torch.logsumexp(scores, dim=-1).transpose(0, 1))
+    out_ref = torch.cat(ref_outs, dim=0)
     lse_ref = torch.cat(ref_lses, dim=0)
 
+    torch.testing.assert_close(out.float(), out_ref, rtol=8e-2, atol=8e-2)
     torch.testing.assert_close(lse, lse_ref, rtol=8e-2, atol=8e-2)
 
 
