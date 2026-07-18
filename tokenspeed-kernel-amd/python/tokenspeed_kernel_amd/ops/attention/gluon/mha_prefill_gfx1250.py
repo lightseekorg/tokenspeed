@@ -558,7 +558,7 @@ def process_attention_tile(program: AttentionProgram, kv_start, num_tiles):
 
         # SM0, LR_K for t+1
         p, alpha, m_i = program.softmax_part0(qk, m_i)
-        k = program.tdm_shared_load_k(next_buffer_index, wait_count=2)
+        k = program.tdm_shared_load_k(next_buffer_index, wait_count=1)
 
     """
     Epilogue:
@@ -680,6 +680,7 @@ def get_config(
     cu_seqlens_q: torch.Tensor,
     max_seqlen: int,
     window_left: int,
+    softmax_scale: float | None,
 ) -> LaunchConfig:
     n_heads = q.shape[1]
     n_kv_heads = k.shape[1]
@@ -687,7 +688,9 @@ def get_config(
     batch_size = cu_seqlens_q.numel() - 1
     block_m = 128
     block_n = 64
-    sm_scale = (1.0 / math.sqrt(head_dim)) * _INV_LN2_VALUE
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(head_dim)
+    sm_scale = softmax_scale * _INV_LN2_VALUE
     return LaunchConfig(
         n_heads=n_heads,
         n_kv_heads=n_kv_heads,
@@ -717,6 +720,7 @@ def gluon_mha_prefill_gfx1250(
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
     return_lse: bool = False,
+    softmax_scale: float | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     if logit_cap != 0.0:
         raise NotImplementedError("GFX1250 Gluon prefill does not support logit_cap")
@@ -732,6 +736,7 @@ def gluon_mha_prefill_gfx1250(
         cu_seqlens_q=cu_seqlens,
         max_seqlen=max_seqlen,
         window_left=window_left,
+        softmax_scale=softmax_scale,
     )
     output = torch.empty_like(q)
     lse = (
