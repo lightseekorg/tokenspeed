@@ -113,6 +113,53 @@ def _proton_trace() -> dict:
     }
 
 
+def _roctracer_proton_trace() -> dict:
+    """Return a ROCm activity trace with separate GPU and CPU clock forms."""
+    monotonic_anchor_ns = 4_000_000_000_000
+    return {
+        "displayTimeUnit": "us",
+        "baseTimeNanoseconds": monotonic_anchor_ns,
+        "traceEvents": [
+            {
+                "ph": "X",
+                "ts": 10.0,
+                "dur": 5.0,
+                "pid": 0,
+                "tid": 100,
+                "name": "kernel",
+                "cat": "kernel",
+            },
+            {
+                "ph": "X",
+                "ts": VIZTRACER_BASE_NS / 1000.0 + 30.0,
+                "dur": 5.0,
+                "pid": 0,
+                "tid": 1,
+                "name": "scope",
+                "cat": "metric",
+            },
+            {
+                "ph": "s",
+                "ts": VIZTRACER_BASE_NS / 1000.0 + 20.0,
+                "pid": 0,
+                "tid": 1,
+                "id": 1,
+                "cat": "flow",
+                "name": "launch->kernel",
+            },
+            {
+                "ph": "f",
+                "ts": 10.0,
+                "pid": 0,
+                "tid": 100,
+                "id": 1,
+                "cat": "flow",
+                "name": "launch->kernel",
+            },
+        ],
+    }
+
+
 def _write(tmp_path, name: str, payload: dict) -> str:
     path = tmp_path / name
     path.write_text(json.dumps(payload))
@@ -147,6 +194,22 @@ def test_merge_shifts_proton_events_onto_viztracer_axis(tmp_path):
     assert by_name["gemm.mm[triton_mm]"]["dur"] == 5.0
     flow_ts = sorted(e["ts"] for e in events if e.get("cat") == "flow")
     assert flow_ts == [8.0 + EXPECTED_OFFSET_US, 10.0 + EXPECTED_OFFSET_US]
+
+
+def test_merge_aligns_roctracer_cpu_and_gpu_clock_forms(tmp_path):
+    viztracer_path = _write(tmp_path, "run.viztracer.json", _viztracer_report())
+    proton_path = _write(tmp_path, "run.proton.chrome_trace", _roctracer_proton_trace())
+    output_path = tmp_path / "merged.json"
+
+    merge_proton_viztracer(viztracer_path, proton_path, output_path)
+
+    events = json.loads(output_path.read_text())["traceEvents"]
+    by_name = {event["name"]: event for event in events if event["ph"] == "X"}
+    monotonic_anchor_us = 4_000_000_000.0
+    assert by_name["kernel"]["ts"] == monotonic_anchor_us + 10.0
+    assert by_name["scope"]["ts"] == monotonic_anchor_us + 30.0
+    flow_ts = sorted(event["ts"] for event in events if event.get("cat") == "flow")
+    assert flow_ts == [monotonic_anchor_us + 10.0, monotonic_anchor_us + 20.0]
 
 
 def test_merge_rejects_viztracer_report_without_anchor(tmp_path):
