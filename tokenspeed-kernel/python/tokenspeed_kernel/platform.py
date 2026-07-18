@@ -178,27 +178,15 @@ class PlatformInfo:
 
     @property
     def is_cdna3_plus(self) -> bool:
-        return (
-            self.is_amd
-            and self.arch_version.major == 9
-            and self.arch_version >= ArchVersion(9, 4)
-        )
+        return self.is_amd and self.arch_version >= ArchVersion(9, 4)
 
     @property
     def is_cdna4_plus(self) -> bool:
-        return (
-            self.is_amd
-            and self.arch_version.major == 9
-            and self.arch_version >= ArchVersion(9, 5)
-        )
+        return self.is_amd and self.arch_version >= ArchVersion(9, 5)
 
     @property
     def is_cdna5_plus(self) -> bool:
-        return (
-            self.is_amd
-            and self.arch_version.major == 12
-            and self.arch_version >= ArchVersion(12, 5)
-        )
+        return self.is_amd and self.arch_version >= ArchVersion(12, 5)
 
     @property
     def arch(self) -> str:
