@@ -38,9 +38,11 @@ struct ForwardOperationBase {
     std::int32_t input_length;
     // All pages currently occupied by this request (existing + newly allocated).
     std::vector<int32_t> occupied_pages;
-    // Index into occupied_pages where newly allocated pages begin.
+    // Index into occupied_pages where the emitted page-table refresh begins.
+    // On the radix path this may precede newly allocated pages when publishing
+    // canonicalizes a duplicate physical page.
     std::int32_t begin;
-    // Number of newly allocated pages (starting at occupied_pages[begin]).
+    // Number of page-table entries to refresh from occupied_pages[begin].
     std::int32_t size;
 
     std::int32_t prefill_length;
