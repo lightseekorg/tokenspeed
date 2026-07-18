@@ -28,6 +28,7 @@ from dataclasses import dataclass
 import torch
 
 from tokenspeed.runtime.distributed.comm_ops import token_all_gather
+from tokenspeed.runtime.utils import get_bool_env_var
 
 
 def get_layer_id(weight_name: str) -> int | None:
@@ -71,6 +72,7 @@ class CPMetadataContainer:
 
 
 CP_METADATA = CPMetadataContainer()
+ENABLE_CP = get_bool_env_var("ENABLE_CP", "false")
 
 
 def cp_split_and_rebuild_data(x: torch.Tensor, split_list, zigzag_index):

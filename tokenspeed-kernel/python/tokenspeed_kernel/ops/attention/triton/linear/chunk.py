@@ -32,6 +32,7 @@ from tokenspeed_kernel.ops.attention.triton.linear.cumsum import chunk_local_cum
 from tokenspeed_kernel.ops.attention.triton.linear.l2norm import l2norm_fwd
 from tokenspeed_kernel.ops.attention.triton.linear.solve_tril import solve_tril
 from tokenspeed_kernel.ops.attention.triton.linear.utils import (
+    SUPPRESS_LEVEL,
     autocast_custom_fwd,
     input_guard,
 )
@@ -82,9 +83,12 @@ def chunk_gated_delta_rule_fwd(
         scale=scale,
         cu_seqlens=cu_seqlens,
     )
-    if return_h:
+    if SUPPRESS_LEVEL < 3 and not return_h:
+        return g, o, A, final_state, None, None, None
+    elif SUPPRESS_LEVEL >= 3:
+        return g, o, A, final_state, w, h, v_new
+    else:
         return g, o, A, final_state, None, h, None
-    return g, o, A, final_state, None, None, None
 
 
 class ChunkGatedDeltaRuleFunction(torch.autograd.Function):

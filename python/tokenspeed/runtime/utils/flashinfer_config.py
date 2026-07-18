@@ -18,9 +18,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import os
+
 DEFAULT_FLASHINFER_WORKSPACE_SIZE = 384 * 1024 * 1024
 
 
 def get_flashinfer_workspace_size() -> int:
-    """Return TokenSpeed's fixed FlashInfer workspace reservation in bytes."""
-    return DEFAULT_FLASHINFER_WORKSPACE_SIZE
+    return int(
+        os.environ.get("FLASHINFER_WORKSPACE_SIZE", DEFAULT_FLASHINFER_WORKSPACE_SIZE)
+    )

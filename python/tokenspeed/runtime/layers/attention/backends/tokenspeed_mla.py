@@ -37,7 +37,6 @@ import torch
 import triton
 from tokenspeed_kernel.ops.attention.tokenspeed_mla import (
     get_num_sm,
-    has_binary_prefill,
     tokenspeed_mla_decode,
     tokenspeed_mla_prefill,
     warmup_compile_prefill,
@@ -109,10 +108,10 @@ class CuteDSLMLADecodeMetadata:
 
 
 class CuteDSLMLABackend(AttentionBackend):
-    """TokenSpeed MLA attention backend for Blackwell SM100 GPUs.
+    """CuteDSL MLA attention backend for Blackwell SM100 GPUs.
 
     Decode uses CuTe DSL JIT-compiled kernels via tokenspeed_mla_decode().
-    Prefill uses the explicitly selected CuTe DSL JIT or AOT binary kernel.
+    Prefill uses CuTe DSL FMHA kernel via tokenspeed_mla_prefill().
     """
 
     _logged_decode = False
@@ -133,28 +132,6 @@ class CuteDSLMLABackend(AttentionBackend):
         self.scaling = config.scaling
         self.data_type = config.kv_cache_dtype
         self.q_data_type = config.dtype
-        self.prefill_backend = config.tokenspeed_mla_prefill_backend
-        self.prefill_binary_so_path = config.tokenspeed_mla_prefill_binary_so_path
-
-        if self.prefill_backend not in {"cutedsl", "binary"}:
-            raise ValueError(
-                "TokenSpeed MLA prefill backend must be 'cutedsl' or 'binary'"
-            )
-        if self.prefill_binary_so_path is not None and self.prefill_backend != "binary":
-            raise ValueError("TokenSpeed MLA binary_so_path requires backend='binary'")
-
-        # Validate static backend constraints before allocating a workspace or
-        # compiling/loading a prefill implementation.
-        if self.page_size not in (32, 64):
-            raise ValueError(
-                f"tokenspeed_mla backend requires page_size 32 or 64, got {self.page_size}"
-            )
-        kv_cache_dtype = global_server_args_dict.get("kv_cache_dtype", "auto")
-        if kv_cache_dtype != "fp8_e4m3":
-            raise NotImplementedError(
-                f"tokenspeed_mla backend requires --kv-cache-dtype fp8_e4m3, "
-                f"got {kv_cache_dtype!r}."
-            )
 
         # Workspace buffers — sized from config's num_heads / kv_lora_rank.
         num_heads_per_tp = config.num_attention_heads // config.attn_tp_size
@@ -170,19 +147,27 @@ class CuteDSLMLABackend(AttentionBackend):
         # FP8 prefill path (deepseek_v3.py:946 `use_fp8_prefill`) is always
         # on and feeds fp8_e4m3fn q/k/v to the kernel — bf16 is unreachable
         # for this backend.
-        if self.prefill_backend == "binary":
-            if not has_binary_prefill(self.prefill_binary_so_path):
-                raise RuntimeError(
-                    "TokenSpeed MLA binary prefill was requested, but no "
-                    "loadable packaged or explicit AOT module was found"
-                )
-        else:
-            d_qk = self.qk_nope_head_dim + self.qk_rope_head_dim
-            warmup_compile_prefill(
-                q_dtype=torch.float8_e4m3fn,
-                d_qk=d_qk,
-                d_v=self.v_head_dim,
-                enable_pdl=pdl_enabled(),
+        d_qk = self.qk_nope_head_dim + self.qk_rope_head_dim
+        warmup_compile_prefill(
+            q_dtype=torch.float8_e4m3fn,
+            d_qk=d_qk,
+            d_v=self.v_head_dim,
+            enable_pdl=pdl_enabled(),
+        )
+
+        # Validate page_size
+        if self.page_size not in (32, 64):
+            raise ValueError(
+                f"tokenspeed_mla backend requires page_size 32 or 64, got {self.page_size}"
+            )
+
+        # tokenspeed_mla's CuTe DSL kernel only supports fp8_e4m3 KV cache; check
+        # at startup so misconfiguration surfaces here, not in the first forward.
+        kv_cache_dtype = global_server_args_dict.get("kv_cache_dtype", "auto")
+        if kv_cache_dtype != "fp8_e4m3":
+            raise NotImplementedError(
+                f"tokenspeed_mla backend requires --kv-cache-dtype fp8_e4m3, "
+                f"got {kv_cache_dtype!r}."
             )
 
         self.num_local_heads = num_heads_per_tp
@@ -544,10 +529,7 @@ class CuteDSLMLABackend(AttentionBackend):
             v = v.to(torch.float8_e4m3fn)
 
         if not CuteDSLMLABackend._logged_prefill:
-            logger.info(
-                "TokenSpeed MLA prefill kernel invoked (backend=%s)",
-                self.prefill_backend,
-            )
+            logger.info("CuteDSL MLA prefill kernel invoked (tokenspeed_mla_prefill)")
             CuteDSLMLABackend._logged_prefill = True
 
         result = tokenspeed_mla_prefill(
@@ -565,8 +547,6 @@ class CuteDSLMLABackend(AttentionBackend):
             max_seq_len_q=max_q_len,
             enable_pdl=pdl_enabled(),
             out=out,
-            backend=self.prefill_backend,
-            binary_so_path=self.prefill_binary_so_path,
         )
 
         if isinstance(result, tuple):

@@ -82,7 +82,6 @@ class FlashInferSamplingBackend(SamplingBackend):
 
     _HAS_POOL_STATE = True
     _SUPPORTS_DP_VERIFY = True
-    _SUPPORTS_GREEDY_GRAPH_VARIANT = True
 
     def __init__(self, config: SamplingBackendConfig) -> None:
 

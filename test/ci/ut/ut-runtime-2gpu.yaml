@@ -16,10 +16,6 @@ install:
   - bash test/ci_system/install_deps.sh
 ut:
   commands:
-    - >-
-      python3 test/runtime/run_ci_suite.py
-      --device cuda
-      --suite runtime-2gpu
-      --cuda-coredump-dir .ci-artifacts/cuda-coredumps
+    - python3 test/runtime/run_ci_suite.py --device cuda --suite runtime-2gpu
 report:
   github_step_summary: true

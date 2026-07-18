@@ -20,6 +20,9 @@
 
 from __future__ import annotations
 
+import os
+from unittest import mock
+
 import pytest
 import tokenspeed_kernel.ops.gemm as gemm
 import torch
@@ -747,37 +750,21 @@ class TestSelectKernel:
                 override="nonexistent_kernel",
             )
 
-    def test_explicit_override(self, sample_specs, h100_platform):
+    def test_env_override(self, sample_specs, h100_platform):
         reg = KernelRegistry.get()
         register_all_samples(reg, sample_specs)
 
-        impl = select_kernel(
-            "attention",
-            "decode",
-            ATTN_DECODE_BF16,
-            platform=h100_platform,
-            override="reference_decode",
-        )
-        assert impl() == "reference_decode"
-
-    def test_environment_does_not_override_selection(
-        self, sample_specs, h100_platform, monkeypatch
-    ):
-        reg = KernelRegistry.get()
-        register_all_samples(reg, sample_specs)
-        monkeypatch.setenv(
-            "TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_DECODE",
-            "reference_decode",
-        )
-
-        impl = select_kernel(
-            "attention",
-            "decode",
-            ATTN_DECODE_BF16,
-            platform=h100_platform,
-        )
-
-        assert impl.name != "reference_decode"
+        with mock.patch.dict(
+            os.environ,
+            {"TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_DECODE": "reference_decode"},
+        ):
+            impl = select_kernel(
+                "attention",
+                "decode",
+                ATTN_DECODE_BF16,
+                platform=h100_platform,
+            )
+            assert impl() == "reference_decode"
 
     def test_portability_objective_prefers_triton(self, sample_specs, h100_platform):
         reg = KernelRegistry.get()
@@ -1093,10 +1080,6 @@ class TestParseOverrides:
 class TestLoadConfigOverrides:
     """Tests for load_config_overrides / clear_config_overrides."""
 
-    def test_config_path_is_required(self):
-        with pytest.raises(TypeError, match="required positional argument"):
-            load_config_overrides()  # type: ignore[call-arg]
-
     def test_load_from_file(self, tmp_path):
         yaml_content = (
             "overrides:\n"
@@ -1154,6 +1137,21 @@ class TestLoadConfigOverrides:
 
         clear_config_overrides()
         assert _get_config_override("attention", "decode") is None
+
+    def test_env_var_overrides_file_path(self, tmp_path):
+        yaml_content = "overrides:\n" "  gemm.mm:\n" "    name: custom_gemm\n"
+        config_file = tmp_path / "custom_overrides.yaml"
+        config_file.write_text(yaml_content)
+
+        with mock.patch.dict(
+            os.environ,
+            {"TOKENSPEED_KERNEL_OVERRIDES_FILE": str(config_file)},
+        ):
+            load_config_overrides()
+
+        entry = _get_config_override("gemm", "mm")
+        assert entry is not None
+        assert entry.name == "custom_gemm"
 
 
 class TestConfigOverrideIntegration:
@@ -1228,6 +1226,27 @@ class TestConfigOverrideIntegration:
             override="triton_decode",
         )
         assert impl() == "triton_decode"
+
+    def test_env_var_override_takes_priority_over_config(
+        self, sample_specs, h100_platform, tmp_path
+    ):
+        """Env var override has higher priority than config file."""
+        reg = KernelRegistry.get()
+        register_all_samples(reg, sample_specs)
+
+        self._write_overrides(
+            tmp_path,
+            "overrides:\n" "  attention.decode:\n" "    name: reference_decode\n",
+        )
+
+        with mock.patch.dict(
+            os.environ,
+            {"TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_DECODE": "triton_decode"},
+        ):
+            impl = select_kernel(
+                "attention", "decode", ATTN_DECODE_BF16, platform=h100_platform
+            )
+            assert impl() == "triton_decode"
 
     def test_context_manager_override_takes_priority_over_config(
         self, sample_specs, h100_platform, tmp_path

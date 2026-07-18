@@ -26,10 +26,11 @@ Wraps BlackwellFusedMultiHeadAttentionForward for ragged MLA prefill on Blackwel
 No padding required — kernel handles ragged varlen directly.
 """
 
+import functools
 import logging
 import math
-from pathlib import Path
-from typing import Literal, Optional, Tuple
+import os
+from typing import Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
@@ -48,25 +49,25 @@ from tokenspeed_mla.utils import torch_to_cutlass_dtype
 logger = logging.getLogger(__name__)
 LOG2_E = math.log2(math.exp(1.0))  # ≈ 1.4426950408889634
 
+# Backend selection via env var. Values: "cutedsl" (default) or "binary" (AOT SO).
+_PREFILL_BACKEND_ENV = os.environ.get(
+    "TOKENSPEED_MLA_PREFILL_BACKEND", "cutedsl"
+).lower()
 
-def _resolve_backend(
-    backend: Literal["cutedsl", "binary"],
-    binary_so_path: str | Path | None = None,
-) -> Literal["cutedsl", "binary"]:
-    """Validate one explicit prefill backend selection."""
-    if backend not in ("cutedsl", "binary"):
-        raise ValueError("backend must be 'cutedsl' or 'binary'")
-    if backend == "cutedsl":
-        if binary_so_path is not None:
-            raise ValueError("binary_so_path requires backend='binary'")
-        return "cutedsl"
-    if not _fmha_binary.has_binary_prefill(binary_so_path):
-        raise RuntimeError(
-            "MLA binary prefill requested but no loadable binary SO was "
-            "found. Check tokenspeed_mla/objs/ or pass binary_so_path."
-        )
-    logger.info("MLA prefill: using binary backend")
-    return "binary"
+
+@functools.lru_cache(maxsize=None)
+def _resolve_backend() -> str:
+    """Resolve the effective prefill backend, called once on first inference."""
+    if _PREFILL_BACKEND_ENV == "binary":
+        if not _fmha_binary.has_binary_prefill():
+            raise RuntimeError(
+                "TOKENSPEED_MLA_PREFILL_BACKEND=binary requested but no binary SO "
+                "found for this GPU. Check tokenspeed_mla/objs/ or set "
+                "TOKENSPEED_MLA_FMHA_BINARY_SO to the .so path."
+            )
+        logger.info("MLA prefill: using binary backend")
+        return "binary"
+    return "cutedsl"
 
 
 def _to_cute(src: torch.Tensor, dtype):
@@ -296,9 +297,6 @@ def tokenspeed_mla_prefill(
     max_seq_len_q: Optional[int] = None,
     enable_pdl: bool = False,
     out: Optional[torch.Tensor] = None,
-    *,
-    backend: Literal["cutedsl", "binary"] = "cutedsl",
-    binary_so_path: str | Path | None = None,
 ) -> "torch.Tensor | Tuple[torch.Tensor, torch.Tensor]":
     """CuTe DSL FMHA prefill kernel for MLA on Blackwell SM100.
 
@@ -307,19 +305,7 @@ def tokenspeed_mla_prefill(
       K shape: [sum(kv_lens), h_k, d_qk]
       V shape: [sum(kv_lens), h_k, d_v]
     If provided, out must be contiguous BF16 with shape [sum(q_lens), h_q, d_v].
-
-    Args:
-        backend: Explicit implementation selection. ``"cutedsl"`` is the
-            stable default; ``"binary"`` selects the packaged or custom AOT
-            module.
-        binary_so_path: Optional custom AOT module path. Valid only when
-            ``backend="binary"``.
-
-    Returns:
-        The BF16 attention output, or ``(output, lse)`` when
-        ``return_lse=True``.
     """
-    resolved_backend = _resolve_backend(backend, binary_so_path)
     total_q_tokens, h_q, d_qk = query.shape
     total_kv_tokens, h_k, _ = key.shape
     d_v = value.shape[2]
@@ -385,7 +371,7 @@ def tokenspeed_mla_prefill(
     cum_q_ct, _cum_q_backing = _to_cute_1d(cum_seq_lens_q)
     cum_k_ct, _cum_k_backing = _to_cute_1d(cum_seq_lens_kv)
 
-    if resolved_backend == "binary":
+    if _resolve_backend() == "binary":
         # Binary backend: LSE layout is (1, h_k, h_r, total_q) — differs from CuteDSL's
         # (total_q, h_q). The binary SO was AOT-compiled with that layout.
         if return_lse:
@@ -419,7 +405,6 @@ def tokenspeed_mla_prefill(
             softmax_scale,
             is_causal,
             return_lse,
-            so_path=binary_so_path,
         )
 
         if return_lse:

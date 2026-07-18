@@ -76,38 +76,27 @@ logger = logging.getLogger(__name__)
 
 time_infos = {}
 
-DEFAULT_IMAGE_REQUEST_TIMEOUT_SECONDS = 3.0
-DEFAULT_AUDIO_REQUEST_TIMEOUT_SECONDS = 5.0
-
 
 _warned_bool_env_var_keys = set()
 
 
 def get_bool_env_var(name: str, default: str = "false") -> bool:
-    """Read the two standard CI boolean contracts used by test tooling.
-
-    Product behavior must use typed configuration, so this deliberately is
-    not a general environment-variable reader.
-    """
-    if name == "CI":
-        value = os.getenv("CI", default)
-    elif name == "GITHUB_ACTIONS":
-        value = os.getenv("GITHUB_ACTIONS", default)
-    else:
-        raise ValueError(f"Unsupported environment boolean: {name}")
+    # Runtime env helpers still read a few legacy keys directly until the
+    # central env module owns all boolean parsing.
+    value = os.getenv(name, default)
     value = value.lower()
 
     truthy_values = ("true", "1")
     falsy_values = ("false", "0")
 
     if (value not in truthy_values) and (value not in falsy_values):
-        if name not in _warned_bool_env_var_keys:
+        if value not in _warned_bool_env_var_keys:
             logger.warning(
                 "get_bool_env_var(%s) see non-understandable value=%s and treat as false",
                 name,
                 value,
             )
-        _warned_bool_env_var_keys.add(name)
+        _warned_bool_env_var_keys.add(value)
 
     return value in truthy_values
 
@@ -119,22 +108,23 @@ def get_device_module():
 
 
 def maybe_inference_mode():
-    """Return the production inference context.
+    from tokenspeed.runtime.utils.env import envs
 
-    TokenSpeed model execution always runs in inference mode. Keeping this as
-    a function preserves the decorator/context-manager call sites without a
-    hidden process-environment switch.
-    """
-    return torch.inference_mode()
+    if envs.TOKENSPEED_ENABLE_TORCH_INFERENCE_MODE.get():
+        return torch.inference_mode()
+    else:
+        return torch.no_grad()
 
 
-def maybe_set_numa_aware_cpu_affinity(device_id: int, *, enabled: bool = True) -> None:
+def maybe_set_numa_aware_cpu_affinity(device_id: int) -> None:
     """Pin the current process to ``device_id``'s NUMA-local CPU set.
 
-    NVIDIA-only optimization. No-op when explicitly disabled, the platform is
-    not NVIDIA, or the process already has a constrained affinity (e.g., taskset).
+    NVIDIA-only optimization. No-op if the env var is False, the platform is not
+    NVIDIA, or the process already has a constrained affinity (e.g., taskset).
     """
-    if not enabled:
+    from tokenspeed.runtime.utils.env import envs
+
+    if not envs.TOKENSPEED_NUMA_AWARE_WORKER_AFFINITY.get():
         return
     platform = current_platform()
     if not platform.is_nvidia:
@@ -255,14 +245,13 @@ def _load_image(
     image_bytes: bytes = b"",
     image_file: str = "",
     gpu_image_decode: bool = True,
-    request_timeout: float = DEFAULT_IMAGE_REQUEST_TIMEOUT_SECONDS,
 ) -> torch.Tensor | Image.Image:
     """
     Try to decode JPEG with nvJPEG on GPU and return a torch device tensor,
     otherwise fallback to decode with PIL on CPU and return a PIL Image.
     """
     if image_file != "":
-        image_bytes = get_image_bytes(image_file, request_timeout=request_timeout)
+        image_bytes = get_image_bytes(image_file)
     if is_jpeg_with_cuda(image_bytes, gpu_image_decode):
         try:
             from torchvision.io import decode_jpeg
@@ -280,8 +269,6 @@ def _load_image(
 def load_image(
     image_file: Image.Image | str | ImageData | bytes,
     gpu_image_decode: bool = True,
-    *,
-    request_timeout: float = DEFAULT_IMAGE_REQUEST_TIMEOUT_SECONDS,
 ) -> tuple[torch.Tensor | Image.Image, tuple[int, int] | None]:
     """
     Load image from multiple input formats, including:
@@ -296,59 +283,35 @@ def load_image(
         image = image_file
         image_size = (image.width, image.height)
     elif isinstance(image_file, bytes):
-        image = _load_image(
-            image_bytes=image_file,
-            gpu_image_decode=gpu_image_decode,
-            request_timeout=request_timeout,
-        )
+        image = _load_image(image_bytes=image_file, gpu_image_decode=gpu_image_decode)
     elif isinstance(image_file, str) and image_file.startswith(("http://", "https://")):
-        image = _load_image(
-            image_file=image_file,
-            gpu_image_decode=gpu_image_decode,
-            request_timeout=request_timeout,
-        )
+        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
     elif isinstance(image_file, str) and image_file.startswith("file://"):
         image = _load_image(
             image_file=unquote(urlparse(image_file).path),
             gpu_image_decode=gpu_image_decode,
-            request_timeout=request_timeout,
         )
     elif isinstance(image_file, str) and image_file.lower().endswith(
         image_extension_names
     ):
-        image = _load_image(
-            image_file=image_file,
-            gpu_image_decode=gpu_image_decode,
-            request_timeout=request_timeout,
-        )
+        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
     elif isinstance(image_file, str) and image_file.startswith("data:"):
-        image = _load_image(
-            image_file=image_file,
-            gpu_image_decode=gpu_image_decode,
-            request_timeout=request_timeout,
-        )
+        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
     elif isinstance(image_file, str):
-        image = _load_image(
-            image_file=image_file,
-            gpu_image_decode=gpu_image_decode,
-            request_timeout=request_timeout,
-        )
+        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
     else:
         raise ValueError(f"Invalid image: {image_file}")
 
     return image, image_size
 
 
-def get_image_bytes(
-    image_file: str | bytes,
-    *,
-    request_timeout: float = DEFAULT_IMAGE_REQUEST_TIMEOUT_SECONDS,
-) -> bytes:
+def get_image_bytes(image_file: str | bytes) -> bytes:
     """Normalize various image inputs into raw bytes."""
     if isinstance(image_file, bytes):
         return image_file
     if image_file.startswith(("http://", "https://")):
-        response = requests.get(image_file, timeout=request_timeout)
+        timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
+        response = requests.get(image_file, timeout=timeout)
         try:
             response.raise_for_status()
             result = response.content
@@ -376,8 +339,6 @@ def load_audio(
     audio_file: str | bytes,
     sr: int | None = None,
     mono: bool = True,
-    *,
-    request_timeout: float = DEFAULT_AUDIO_REQUEST_TIMEOUT_SECONDS,
 ) -> np.ndarray:
     # Use soundfile directly; librosa delegates to it and is moving away from
     # audio loading support.
@@ -395,7 +356,8 @@ def load_audio(
             BytesIO(pybase64.b64decode(encoded, validate=True))
         )
     elif audio_file.startswith(("http://", "https://")):
-        response = requests.get(audio_file, stream=True, timeout=request_timeout)
+        timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
+        response = requests.get(audio_file, stream=True, timeout=timeout)
         try:
             response.raise_for_status()
             audio, original_sr = sf.read(BytesIO(response.content))
@@ -454,13 +416,10 @@ def add_api_key_middleware(app, api_key: str):
         return await call_next(request)
 
 
-def prepare_model_and_tokenizer(
-    model_path: str,
-    tokenizer_path: str,
-    *,
-    use_modelscope: bool = False,
-):
-    if use_modelscope:
+def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):
+    from tokenspeed.runtime.utils.env import envs
+
+    if envs.TOKENSPEED_USE_MODELSCOPE.get():
         if not os.path.exists(model_path):
             from modelscope import snapshot_download
 
@@ -479,15 +438,17 @@ def configure_logger(server_args, prefix: str = ""):
     LOG_LEVEL = server_args.log_level.upper()
 
     from tokenspeed._logging import suppress_noisy_third_party_logs
+    from tokenspeed.runtime.utils.env import envs
 
     suppress_noisy_third_party_logs()
 
-    if logging_config_path := server_args.logging_config_path:
-        if not os.path.exists(logging_config_path):
+    if TOKENSPEED_LOGGING_CONFIG_PATH := envs.TOKENSPEED_LOGGING_CONFIG_PATH.get():
+        if not os.path.exists(TOKENSPEED_LOGGING_CONFIG_PATH):
             raise FileNotFoundError(
-                f"--logging-config-path does not exist: {logging_config_path}"
+                "Setting TOKENSPEED_LOGGING_CONFIG_PATH from env with "
+                f"{TOKENSPEED_LOGGING_CONFIG_PATH} but it does not exist!"
             )
-        with open(logging_config_path, encoding="utf-8") as file:
+        with open(TOKENSPEED_LOGGING_CONFIG_PATH, encoding="utf-8") as file:
             custom_config = json.loads(file.read())
         logging.config.dictConfig(custom_config)
         suppress_noisy_third_party_logs()
@@ -1183,13 +1144,17 @@ def _maybe_space_split_dict(path: str | os.PathLike) -> dict[str, str]:
     return parsed_dict
 
 
-def maybe_model_redirect(model: str, model_redirect_path: str | None = None) -> str:
+def maybe_model_redirect(model: str) -> str:
     """
     Use model_redirect to redirect the model name to a local folder.
 
     :param model: hf model name
     :return: maybe redirect to a local folder
     """
+
+    from tokenspeed.runtime.utils.env import envs
+
+    model_redirect_path = envs.TOKENSPEED_MODEL_REDIRECT_PATH.get()
 
     if not model_redirect_path:
         return model

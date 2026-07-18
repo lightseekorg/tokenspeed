@@ -215,10 +215,10 @@ class RequestState:
             mm.mrope_positions, target_len - current_len
         )
 
-    def release_pending_multimodal_features(self, *, log_timing: bool = False) -> None:
+    def release_pending_multimodal_features(self) -> None:
         mm = self.multimodal_inputs
         if mm is not None and hasattr(mm, "release_shm_features"):
-            mm.release_shm_features(log_timing=log_timing)
+            mm.release_shm_features()
 
     def init_incremental_detokenize(self):
         """Return (all_ids_from_surr_offset, read_offset_relative_to_surr)."""
@@ -320,7 +320,6 @@ class OutputProcesser:
         spec_num_tokens: int | None = None,
         stream_interval: int = 1,
         enable_log_request_stats: bool = False,
-        enable_log_mm_timing: bool = False,
         *,
         metrics: EngineMetrics,
     ) -> None:
@@ -338,7 +337,6 @@ class OutputProcesser:
         self.stream_interval = stream_interval
         self.metrics = metrics
         self.enable_log_request_stats = enable_log_request_stats
-        self.enable_log_mm_timing = enable_log_mm_timing
         # previous forward step ts, for host-side preempt timing
         self._last_step_ts: float = 0.0
         self.log_cnt = 0
@@ -435,9 +433,7 @@ class OutputProcesser:
             state.finished_output = False
             self.stream_output([rid], [state])
         finally:
-            state.release_pending_multimodal_features(
-                log_timing=self.enable_log_mm_timing
-            )
+            state.release_pending_multimodal_features()
             self.rid_to_state.pop(rid, None)
             # This path replaces register() for grammar-aborted rids —
             # drop any queued abort marker so pending_aborts doesn't leak
@@ -695,12 +691,6 @@ class OutputProcesser:
                         int(x)
                         for x in model_execution_results.next_input_ids[i].tolist()
                     ]
-                    if spec_candidate_ids and spec_candidate_ids[0] != bootstrap_token:
-                        raise RuntimeError(
-                            "Prefill bootstrap token mismatch: output token "
-                            f"{bootstrap_token}, first speculative candidate "
-                            f"{spec_candidate_ids[0]}"
-                        )
 
                 on_first_token(
                     rid,
@@ -773,9 +763,7 @@ class OutputProcesser:
                     stream_out_rids.append(rid)
                     stream_out_states.append(request_state)
                 self._log_request_stats(rid, request_state, stats_now)
-                request_state.release_pending_multimodal_features(
-                    log_timing=self.enable_log_mm_timing
-                )
+                request_state.release_pending_multimodal_features()
                 self.rid_to_state.pop(rid)
                 continue
 
@@ -795,9 +783,7 @@ class OutputProcesser:
                     make_abort_event(rid) if nan_detected else make_finish_event(rid)
                 )
                 self._log_request_stats(rid, request_state, stats_now)
-                request_state.release_pending_multimodal_features(
-                    log_timing=self.enable_log_mm_timing
-                )
+                request_state.release_pending_multimodal_features()
                 self.rid_to_state.pop(rid)
             else:
                 stream_out_rids.append(rid)
@@ -849,7 +835,7 @@ class OutputProcesser:
         if req_id not in self.rid_to_state:
             return []
         rs = self.rid_to_state.pop(req_id)
-        rs.release_pending_multimodal_features(log_timing=self.enable_log_mm_timing)
+        rs.release_pending_multimodal_features()
 
         # Ensure a finish reason is set so TokenizerManager marks the request done.
         if not rs.finished:

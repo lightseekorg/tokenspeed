@@ -132,11 +132,14 @@ def my_experimental_gemm(a, b, **kwargs):
 
 Plugins can be skipped without uninstalling them:
 
+```bash
+TOKENSPEED_KERNEL_DISABLE_PLUGINS="my_plugin,other_plugin" python ...
+```
+
 ```python
 from tokenspeed_kernel.plugins import disable_plugin, discover_plugins
 
 disable_plugin("my_plugin")
-disable_plugin("other_plugin")
 discover_plugins()
 ```
 

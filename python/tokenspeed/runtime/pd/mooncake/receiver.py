@@ -688,9 +688,7 @@ class MooncakeKVReceiver:
                     if elapsed >= self.kv_mgr.waiting_timeout:
                         logger.warning_once(
                             "Some requests fail to receive KV Cache transfer done signal after bootstrapping. "
-                            "If a greater mean TTFT is acceptable, increase "
-                            "--disaggregation-waiting-timeout (for example, "
-                            "600 seconds) to relax the timeout condition. "
+                            "If a greater mean TTFT is acceptable, you can 'export TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT=600' (10 minutes) to relax the timeout condition. "
                         )
                         self.kv_mgr.record_failure(
                             self.bootstrap_room,

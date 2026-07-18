@@ -567,29 +567,6 @@ class TestMapping:
         assert m.nprocs_per_node == 8
         assert m.nnodes == 1
 
-    def test_gpu_id_honors_base_and_step_per_node(self):
-        assert (
-            Mapping(
-                rank=2,
-                world_size=4,
-                nprocs_per_node=4,
-                base_gpu_id=1,
-                gpu_id_step=2,
-            ).gpu_id
-            == 5
-        )
-        assert (
-            Mapping(
-                rank=6,
-                world_size=8,
-                nprocs_per_node=4,
-                nnodes=2,
-                base_gpu_id=1,
-                gpu_id_step=2,
-            ).gpu_id
-            == 5
-        )
-
     def test_nprocs_nnodes_mismatch_raises(self):
         with pytest.raises(AssertionError):
             Mapping(rank=0, world_size=16, nprocs_per_node=3, nnodes=2)

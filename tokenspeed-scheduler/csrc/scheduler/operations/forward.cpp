@@ -397,13 +397,6 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     std::int32_t tokens_this_round = std::min(remaining, unscheduled);
 
     std::int32_t pages_needed = (tokens_this_round + config_.block_size - 1) / config_.block_size;
-#if !TOKENSPEED_FLAT_KVCACHE
-    // The first prefill chunk reserves decode tokens in the radix allocator.
-    // Reuse that partial tail before charging later chunks for fresh pages.
-    const std::int32_t tail_available = request->TailPageAvailableTokens();
-    const std::int32_t extra_tokens = std::max(0, tokens_this_round - tail_available);
-    pages_needed = (extra_tokens + config_.block_size - 1) / config_.block_size;
-#endif
 
     if (!kv_prefix_cache_.EnsureCapacityByEvict<ResourceType::Device>(pages_needed)) {
         return {};

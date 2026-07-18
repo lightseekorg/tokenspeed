@@ -69,7 +69,6 @@ class LoadConfig:
     decryption_key_file: str | None = None
     weight_loader_prefetch_checkpoints: bool = False
     weight_loader_prefetch_num_threads: int = 4
-    use_modelscope: bool = False
 
     ext_yaml: str | None = None
 

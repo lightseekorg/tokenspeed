@@ -69,10 +69,12 @@ from tokenspeed.runtime.multimodal.inputs import (
     MultimodalInputs,
 )
 from tokenspeed.runtime.multimodal.shm_transport import ShmTensorHandle
+from tokenspeed.runtime.utils.env import envs
 
 EncoderFn = Callable[[list[MultimodalDataItem]], torch.Tensor]
 
 logger = logging.getLogger(__name__)
+LOG_MM_TIMING = envs.TOKENSPEED_LOG_MM_TIMING.get()
 
 
 @dataclass
@@ -193,7 +195,6 @@ class MultimodalEmbedder:
         encoders: dict[Modality, EncoderSpec],
         multimodal_model: nn.Module,
         is_decode_or_idle: bool = False,
-        log_timing: bool = False,
     ) -> tuple[torch.Tensor | None, dict[str, Any]]:
         """Compose LM input embeddings with encoder tokens scattered in.
 
@@ -204,8 +205,8 @@ class MultimodalEmbedder:
         if is_decode_or_idle or ctx is None or not ctx.has_extend_inputs():
             return None, {}
 
-        total_started = time.perf_counter() if log_timing else None
-        plan_started = time.perf_counter() if log_timing else None
+        total_started = time.perf_counter() if LOG_MM_TIMING else None
+        plan_started = time.perf_counter() if LOG_MM_TIMING else None
         plan = self._plan(ctx)
         plan_elapsed_ms = (
             (time.perf_counter() - plan_started) * 1000
@@ -215,31 +216,23 @@ class MultimodalEmbedder:
         if not plan:
             return None, {}
 
-        encode_started = time.perf_counter() if log_timing else None
-        self._encode(
-            plan,
-            encoders,
-            multimodal_model,
-            input_ids.device,
-            log_timing=log_timing,
-        )
+        encode_started = time.perf_counter() if LOG_MM_TIMING else None
+        self._encode(plan, encoders, multimodal_model, input_ids.device)
         encode_elapsed_ms = (
             (time.perf_counter() - encode_started) * 1000
             if encode_started is not None
             else None
         )
 
-        alias_started = time.perf_counter() if log_timing else None
-        released_alias_features = self._share_encoded_aliases(
-            plan, log_timing=log_timing
-        )
+        alias_started = time.perf_counter() if LOG_MM_TIMING else None
+        released_alias_features = self._share_encoded_aliases(plan)
         alias_elapsed_ms = (
             (time.perf_counter() - alias_started) * 1000
             if alias_started is not None
             else None
         )
 
-        assemble_started = time.perf_counter() if log_timing else None
+        assemble_started = time.perf_counter() if LOG_MM_TIMING else None
         input_embeds, kwargs = self._assemble(
             input_ids, text_embedding, plan, encoders, multimodal_model
         )
@@ -249,16 +242,14 @@ class MultimodalEmbedder:
             else None
         )
 
-        cleanup_started = time.perf_counter() if log_timing else None
-        released_encoded_features = self._drop_encoded_features(
-            ctx, log_timing=log_timing
-        )
+        cleanup_started = time.perf_counter() if LOG_MM_TIMING else None
+        released_encoded_features = self._drop_encoded_features(ctx)
         cleanup_elapsed_ms = (
             (time.perf_counter() - cleanup_started) * 1000
             if cleanup_started is not None
             else None
         )
-        if log_timing and total_started is not None:
+        if LOG_MM_TIMING and total_started is not None:
             misses = {
                 modality.name: len(items)
                 for modality, items in plan.misses_by_modality.items()
@@ -370,8 +361,6 @@ class MultimodalEmbedder:
         encoders: dict[Modality, EncoderSpec],
         multimodal_model: nn.Module,
         device: torch.device,
-        *,
-        log_timing: bool = False,
     ) -> None:
         for modality, items in plan.misses_by_modality.items():
             if not items:
@@ -382,16 +371,16 @@ class MultimodalEmbedder:
                     f"MultimodalEmbedder: no encoder registered for {modality}"
                 )
 
-            move_started = time.perf_counter() if log_timing else None
-            self._move_features_to_device(items, device, log_timing=log_timing)
+            move_started = time.perf_counter() if LOG_MM_TIMING else None
+            self._move_features_to_device(items, device)
             move_elapsed_ms = (
                 (time.perf_counter() - move_started) * 1000
                 if move_started is not None
                 else None
             )
-            encoder_started = time.perf_counter() if log_timing else None
+            encoder_started = time.perf_counter() if LOG_MM_TIMING else None
             output = spec.fn(items)
-            if log_timing and device.type == "cuda":
+            if LOG_MM_TIMING and device.type == "cuda":
                 torch.cuda.synchronize(device)
             encoder_elapsed_ms = (
                 (time.perf_counter() - encoder_started) * 1000
@@ -411,7 +400,7 @@ class MultimodalEmbedder:
             else:
                 for item, emb in zip(items, per_item_embs):
                     item.encoded = emb
-            if log_timing:
+            if LOG_MM_TIMING:
                 logger.info(
                     "mm_timing encoder_ms modality=%s items=%d "
                     "encoder_output_tokens=%d move_h2d=%.3f encode=%.3f "
@@ -424,9 +413,7 @@ class MultimodalEmbedder:
                     per_item_lens,
                 )
 
-    def _share_encoded_aliases(
-        self, plan: EncodePlan, *, log_timing: bool = False
-    ) -> int:
+    def _share_encoded_aliases(self, plan: EncodePlan) -> int:
         released = 0
         for canonical, aliases in plan.aliases_by_canonical.items():
             if canonical.encoded is None:
@@ -434,7 +421,7 @@ class MultimodalEmbedder:
             for alias in aliases:
                 alias.encoded = canonical.encoded
                 alias.encoded_deepstack = canonical.encoded_deepstack
-                if self._drop_raw_feature(alias, log_timing=log_timing):
+                if self._drop_raw_feature(alias):
                     released += 1
         return released
 
@@ -498,11 +485,7 @@ class MultimodalEmbedder:
         return self._h2d_stream
 
     def _move_features_to_device(
-        self,
-        items: list[MultimodalDataItem],
-        device: torch.device,
-        *,
-        log_timing: bool = False,
+        self, items: list[MultimodalDataItem], device: torch.device
     ) -> None:
         """Stage encoder features onto ``device`` on a dedicated H2D stream.
 
@@ -523,7 +506,7 @@ class MultimodalEmbedder:
 
         for it in pending:
             if isinstance(it.feature, ShmTensorHandle):
-                it.feature = it.feature.consume(log_timing=log_timing)
+                it.feature = it.feature.consume()
 
         if device.type != "cuda":
             for it in pending:
@@ -543,28 +526,22 @@ class MultimodalEmbedder:
                 it.feature.record_stream(current)
 
     @staticmethod
-    def _drop_raw_feature(
-        item: MultimodalDataItem, *, log_timing: bool = False
-    ) -> bool:
+    def _drop_raw_feature(item: MultimodalDataItem) -> bool:
         if item.feature is None:
             return False
         if isinstance(item.feature, ShmTensorHandle):
-            item.feature.release(log_timing=log_timing)
+            item.feature.release()
         item.feature = None
         return True
 
     @staticmethod
-    def _drop_encoded_features(
-        ctx: MultimodalForwardContext, *, log_timing: bool = False
-    ) -> int:
+    def _drop_encoded_features(ctx: MultimodalForwardContext) -> int:
         released = 0
         for mm in ctx.mm_inputs:
             if mm is None:
                 continue
             for it in mm.mm_items:
-                if it.encoded is not None and MultimodalEmbedder._drop_raw_feature(
-                    it, log_timing=log_timing
-                ):
+                if it.encoded is not None and MultimodalEmbedder._drop_raw_feature(it):
                     released += 1
         return released
 

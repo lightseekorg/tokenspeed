@@ -33,6 +33,7 @@ from tokenspeed.runtime.pd.utils import DisaggregationMode
 from tokenspeed.runtime.utils import (
     get_colorful_logger,
 )
+from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.network import get_free_port, get_local_ip_by_remote
 
 logger = get_colorful_logger(__name__)
@@ -85,9 +86,15 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
         self.session_pool_lock = threading.Lock()
         self.addr_to_rooms_tracker = defaultdict(set)
         self.connection_lock = threading.Lock()
-        runtime_config = args.runtime_config
-        self.heartbeat_interval = runtime_config.heartbeat_interval_s
-        self.max_failures = runtime_config.heartbeat_max_failures
+        # Heartbeat interval should be at least 2 seconds
+        self.heartbeat_interval = max(
+            envs.TOKENSPEED_DISAGGREGATION_HEARTBEAT_INTERVAL.get(),
+            2.0,
+        )
+        # Heartbeat failure should be at least 1
+        self.max_failures = max(
+            envs.TOKENSPEED_DISAGGREGATION_HEARTBEAT_MAX_FAILURE.get(), 1
+        )
         self.start_decode_thread()
         self.connection_pool: dict[str, dict[str, str | int]] = {}
         self.required_prefill_response_num_table: dict[int, int] = {}
@@ -98,7 +105,7 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
         # If a timeout happens on the decode side, it means decode instances
         # fail to receive the KV Cache transfer done signal after bootstrapping.
         # These timeout requests should be aborted to release the tree cache.
-        self.waiting_timeout = runtime_config.waiting_timeout_s
+        self.waiting_timeout = envs.TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT.get()
 
     def start_decode_thread(self):
         self.rank_port = get_free_port()

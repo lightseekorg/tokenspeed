@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -535,11 +536,11 @@ class MambaAttnBackend(AttentionBackend):
         state-group block table. seq_lens counts the tokens computed AFTER
         this forward (decode: q_len 1; extend: prefix + chunk).
 
-        validate: explicit True/False wins; None (the hot-path default) keeps
-        host-synchronizing validation disabled.
+        validate: explicit True/False wins; None (the hot-path default)
+        validates only under TOKENSPEED_FLAT_DEBUG=1 (the checks host-sync).
         """
         if validate is None:
-            validate = False
+            validate = os.environ.get("TOKENSPEED_FLAT_DEBUG") == "1"
         flat_tables = kwargs.get("flat_block_tables")
         if not flat_tables or _STATE_GROUP_ID not in flat_tables:
             raise RuntimeError(

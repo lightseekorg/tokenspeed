@@ -32,27 +32,11 @@ tokenspeed serve <model> \
 | `--world-size` | Total worker processes across all nodes. |
 | `--nprocs-per-node` | Worker processes launched on each node. |
 | `--attn-tp-size` | Attention tensor parallel size. |
-| `--attn-cp-size` | Attention context-parallel size. |
 | `--dense-tp-size` | Dense layer tensor parallel size. |
 | `--moe-tp-size` | MoE layer tensor parallel size. |
 | `--data-parallel-size` | Replicated data-parallel groups. |
 | `--enable-expert-parallel` | Expert parallelism across the selected world size. |
 | `--expert-parallel-size` | Explicit expert parallel size. |
-
-Context parallelism is configured explicitly. For example, the former
-`ENABLE_CP=1` plus attention-size-4 setup is now:
-
-```bash
-tokenspeed serve <model> \
-  --attn-cp-size 4
-```
-
-When `--world-size` is omitted, TokenSpeed infers it from the configured
-parallel sizes. Context parallelism defaults to size 1.
-
-This option configures the process topology only. A model and attention
-backend must implement the corresponding context-parallel data path before the
-topology can be used for inference.
 
 ## MoE Deployments
 

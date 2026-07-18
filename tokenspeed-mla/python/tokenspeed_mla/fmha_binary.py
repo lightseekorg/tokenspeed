@@ -22,11 +22,10 @@
 
 Loads a pre-compiled AOT TVM-FFI .so calls the exported function.
 
-By default, SO files are looked up in:
+SO files are looked up in:
   <package>/objs/cute_dsl_fmha_fp8_e4m3_to_bf16_hd192_{arch}.so
 
-Callers can pass an explicit path through :func:`has_binary_prefill` or
-:func:`call_binary_prefill`.
+Set TOKENSPEED_MLA_FMHA_BINARY_SO to override with a custom .so path.
 
 Note on LSE layout: the binary kernel writes LSE in (1, h_k, h_r, total_q)
 layout (row-major), which differs from the CuteDSL backend's (total_q, h_q).
@@ -38,6 +37,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
 import platform
 from pathlib import Path
 
@@ -73,12 +73,11 @@ def _objs_dir() -> Path:
     return Path(__file__).resolve().parent / "objs"
 
 
-def _resolve_so_path(so_path: str | Path | None = None) -> Path:
-    """Return an explicit SO path or the packaged arch-specific default."""
-    if so_path is not None:
-        if not isinstance(so_path, (str, Path)) or not str(so_path).strip():
-            raise ValueError("so_path must be a non-empty path")
-        return Path(so_path)
+def _resolve_so_path() -> Path:
+    """Return the SO path: env override first, then arch-specific default."""
+    env = os.environ.get("TOKENSPEED_MLA_FMHA_BINARY_SO")
+    if env:
+        return Path(env)
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
     machine = platform.machine().lower()
     if machine == "amd64":
@@ -99,21 +98,16 @@ def _load_module(so_path_str: str):
     if not so_path.exists():
         raise RuntimeError(
             f"tokenspeed_mla binary FMHA SO not found: {so_path}. "
-            "Place the compiled .so in the package or pass its path explicitly."
+            "Place the compiled .so there or set TOKENSPEED_MLA_FMHA_BINARY_SO."
         )
     logger.info("Loading binary FMHA module from %s", so_path)
     return cute.runtime.load_module(str(so_path), enable_tvm_ffi=True)
 
 
-def has_binary_prefill(so_path: str | Path | None = None) -> bool:
-    """Return whether an explicit or packaged binary FMHA SO can be loaded.
-
-    Args:
-        so_path: Optional path to a custom AOT module. When omitted, use the
-            packaged binary selected for the current GPU architecture.
-    """
+def has_binary_prefill() -> bool:
+    """Return True if a binary FMHA SO is present and loadable for the current GPU."""
     try:
-        _load_module(str(_resolve_so_path(so_path)))
+        _load_module(str(_resolve_so_path()))
         return True
     except Exception:
         return False
@@ -132,8 +126,6 @@ def call_binary_prefill(
     scale_softmax: float,
     is_causal: bool,
     return_lse: bool,
-    *,
-    so_path: str | Path | None = None,
 ) -> None:
     """Invoke the pre-compiled binary FMHA prefill kernel via TVM-FFI.
 
@@ -147,7 +139,7 @@ def call_binary_prefill(
     """
     import tvm_ffi
 
-    module = _load_module(str(_resolve_so_path(so_path)))
+    module = _load_module(str(_resolve_so_path()))
     func = getattr(module, _FUNC_NAMES[(is_causal, return_lse)])
     window_size_right = 0 if is_causal else None
 

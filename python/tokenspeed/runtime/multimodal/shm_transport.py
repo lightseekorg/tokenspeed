@@ -37,7 +37,10 @@ from multiprocessing import shared_memory
 
 import torch
 
+from tokenspeed.runtime.utils.env import envs
+
 logger = logging.getLogger(__name__)
+LOG_MM_TIMING = envs.TOKENSPEED_LOG_MM_TIMING.get()
 
 
 @dataclass
@@ -73,7 +76,7 @@ class ShmTensorHandle:
         if self._segment is None:
             self._segment = shared_memory.SharedMemory(name=self.shm_name)
 
-    def consume(self, *, log_timing: bool = False) -> torch.Tensor:
+    def consume(self) -> torch.Tensor:
         """Copy into a pinned tensor (so downstream non_blocking H2D is real),
         close this rank's FD, and unlink. ``attach()`` must have run.
         """
@@ -83,7 +86,7 @@ class ShmTensorHandle:
                 "before consume() (or has already been consumed on this rank)"
             )
         segment = self._segment
-        started = time.perf_counter() if log_timing else None
+        started = time.perf_counter() if LOG_MM_TIMING else None
         try:
             dst = torch.empty(self.shape, dtype=self.dtype, pin_memory=True)
             src = torch.frombuffer(segment.buf, dtype=self.dtype).reshape(self.shape)
@@ -96,7 +99,7 @@ class ShmTensorHandle:
             except FileNotFoundError:
                 # Another rank already won the unlink race; benign.
                 pass
-        if log_timing and started is not None:
+        if LOG_MM_TIMING and started is not None:
             logger.info(
                 "mm_timing shm_consume_ms name=%s elapsed=%.3f shape=%s dtype=%s",
                 self.shm_name,
@@ -106,9 +109,9 @@ class ShmTensorHandle:
             )
         return dst
 
-    def release(self, *, log_timing: bool = False) -> None:
+    def release(self) -> None:
         """Close and unlink a SHM segment without materializing the tensor."""
-        started = time.perf_counter() if log_timing else None
+        started = time.perf_counter() if LOG_MM_TIMING else None
         segment = self._segment
         self._segment = None
         try:
@@ -121,7 +124,7 @@ class ShmTensorHandle:
                 pass
         except FileNotFoundError:
             pass
-        if log_timing and started is not None:
+        if LOG_MM_TIMING and started is not None:
             logger.info(
                 "mm_timing shm_release_ms name=%s elapsed=%.3f shape=%s dtype=%s",
                 self.shm_name,
@@ -131,9 +134,7 @@ class ShmTensorHandle:
             )
 
 
-def sync_shm_features(
-    reqs, group, group_size: int, *, log_timing: bool = False
-) -> None:
+def sync_shm_features(reqs, group, group_size: int) -> None:
     """Attach SHM-backed features in ``reqs`` on every rank.
 
     The barrier makes later consume/release unlink race-free in multi-rank
@@ -148,12 +149,12 @@ def sync_shm_features(
     ]
     if not pending:
         return
-    started = time.perf_counter() if log_timing else None
+    started = time.perf_counter() if LOG_MM_TIMING else None
     for mm in pending:
         mm.attach_shm_features()
     if group_size > 1:
         torch.distributed.barrier(group)
-    if log_timing and started is not None:
+    if LOG_MM_TIMING and started is not None:
         item_count = sum(len(mm.mm_items) for mm in pending)
         logger.info(
             "mm_timing shm_attach_ms requests=%d items=%d elapsed=%.3f",

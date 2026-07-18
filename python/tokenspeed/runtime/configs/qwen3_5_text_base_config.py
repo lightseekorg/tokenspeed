@@ -35,6 +35,7 @@ from transformers.utils import logging
 
 from tokenspeed.runtime.configs.paged_cache_spec import FULL_ATTENTION
 from tokenspeed.runtime.distributed.utils import divide
+from tokenspeed.runtime.utils.env import envs
 
 logger = logging.get_logger(__name__)
 
@@ -335,7 +336,7 @@ class Qwen3_5BaseTextConfig(PretrainedConfig):
             "float32": torch.float32,
             "bfloat16": torch.bfloat16,
         }
-        ssm_dtype = dtype_map[global_server_args_dict["mamba_ssm_dtype"]]
+        ssm_dtype = dtype_map[envs.TOKENSPEED_MAMBA_SSM_DTYPE.get()]
         mamba_layers = self.linear_layer_ids
         return (
             conv_state_shape,

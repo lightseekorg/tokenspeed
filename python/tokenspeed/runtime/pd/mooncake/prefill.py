@@ -19,6 +19,7 @@
 # SOFTWARE.
 
 import concurrent.futures
+import os
 import socket
 import threading
 import time
@@ -52,6 +53,7 @@ from tokenspeed.runtime.pd.utils import (
 from tokenspeed.runtime.utils import (
     get_colorful_logger,
 )
+from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.network import (
     get_free_port,
     get_ip,
@@ -75,8 +77,9 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         self._register_to_bootstrap()
         self.session_failures = defaultdict(int)
         self.failed_sessions: dict[str, float] = {}
-        runtime_config = args.runtime_config
-        self.failed_session_ttl = runtime_config.failed_session_ttl_s
+        self.failed_session_ttl = max(
+            envs.TOKENSPEED_DISAGGREGATION_FAILED_SESSION_TTL.get(), 0
+        )
         self.session_lock = threading.Lock()
         self.kv_layer_ids = list(
             getattr(self.kv_args, "kv_layer_ids", None)
@@ -92,10 +95,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             for i, layer_id in enumerate(self.kv_layer_ids[: len(self.kv_args.offsets)])
         }
         self.layerwise_interval = 1
-        self.layerwise_debug = runtime_config.layerwise_debug
-        self.prefill_metadata_wait_log_interval = (
-            runtime_config.prefill_metadata_wait_log_interval_s
-        )
+        self.layerwise_debug = envs.TOKENSPEED_PD_LAYERWISE_DEBUG.get()
         self.step_counter = None
         # room -> (bootstrap_token, spec_candidate_ids). Published after the prefill
         # forward; the transfer thread reads it on the wait_for_bootstrap_token path.
@@ -103,10 +103,21 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         self.expired_prefill_metadata_rooms: set[int] = set()
         self.bootstrap_token_cond = threading.Condition()
         # Determine the number of threads to use for kv sender
-        transfer_thread_pool_size = runtime_config.resolved_thread_pool_size()
-        transfer_queue_size = runtime_config.queue_size
+        cpu_count = os.cpu_count()
+        transfer_thread_pool_size = (
+            envs.TOKENSPEED_DISAGGREGATION_THREAD_POOL_SIZE.get_set_value_or(
+                min(max(4, int(0.75 * cpu_count) // 8), 12)
+            )
+        )
+        transfer_queue_size = envs.TOKENSPEED_DISAGGREGATION_QUEUE_SIZE.get()
+        if transfer_thread_pool_size < transfer_queue_size:
+            raise ValueError(
+                "TOKENSPEED_DISAGGREGATION_THREAD_POOL_SIZE="
+                f"{transfer_thread_pool_size} must be greater than or equal to "
+                f"TOKENSPEED_DISAGGREGATION_QUEUE_SIZE={transfer_queue_size}."
+            )
         self.start_transfer_thread(transfer_thread_pool_size, transfer_queue_size)
-        self.bootstrap_time_out = runtime_config.bootstrap_timeout_s
+        self.bootstrap_time_out = envs.TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
 
     def register_layerwise_step_counter(
         self, step_counter: StepCounter, interval: int
@@ -158,7 +169,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
     ) -> tuple[int, list[int] | None]:
         if room is None or fallback_token != -1:
             return fallback_token, fallback_candidate_ids
-        wait_log_interval = self.prefill_metadata_wait_log_interval
+        wait_log_interval = max(envs.TOKENSPEED_PD_PREFILL_METADATA_TIMEOUT.get(), 0.01)
         start_time = time.monotonic()
         next_log_time = start_time + wait_log_interval
         with self.bootstrap_token_cond:
@@ -1047,15 +1058,8 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
 
     def _register_to_bootstrap(self):
         """Register KVSender to bootstrap server via HTTP POST."""
-        advertised_ip = (
-            get_ip(self.args.advertised_host)
-            if self.args.advertised_host is not None
-            else get_local_ip_by_remote()
-        )
         if self.dist_init_addr:
             ip_address = socket.gethostbyname(self.dist_init_addr.split(":")[0])
-        elif self.args.advertised_host is not None:
-            ip_address = advertised_ip
         else:
             ip_address = get_ip()
 
@@ -1065,7 +1069,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             "role": "Prefill",
             "world_size": self.world_size,
             "dp_size": self.dp_size,
-            "rank_ip": advertised_ip,
+            "rank_ip": get_local_ip_by_remote(),
             "rank_port": self.rank_port,
             "engine_rank": self.kv_args.engine_rank,
             "enable_mla_l1_5_cache": self.args.enable_mla_l1_5_cache,

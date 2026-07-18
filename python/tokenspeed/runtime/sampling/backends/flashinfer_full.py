@@ -94,8 +94,6 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
     mask. Both remain silently-ignored no-ops.
     """
 
-    _SUPPORTS_GREEDY_GRAPH_VARIANT = False
-
     _SUPPORTS_DP_VERIFY = False
 
     def __init__(self, config: SamplingBackendConfig) -> None:

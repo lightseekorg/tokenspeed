@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import importlib
 from dataclasses import dataclass
-from types import SimpleNamespace
 from typing import Callable
 
 import pytest
@@ -349,33 +348,6 @@ def test_bmm_mxfp8_online_activation_signature_uses_quantized_storage() -> None:
     assert b_format.scale is not None
     assert a_format.scale.block_shape == (128, 128)
     assert b_format.scale.block_shape == (128, 128)
-
-
-def test_gemm_mxfp8_online_activation_uses_mixed_scale_formats() -> None:
-    a = torch.empty((4, 128), dtype=torch.bfloat16)
-    b = torch.empty((128, 128), dtype=_fp8_dtype())
-    b_scales = torch.empty((128, 4), dtype=torch.uint8)
-
-    signature = _gemm_pkg._gemm_format_signature(
-        a,
-        b,
-        None,
-        b_scales,
-        torch.bfloat16,
-        "mxfp8",
-        [1, 32],
-    )
-
-    a_format = signature.format_for("a")
-    b_format = signature.format_for("b")
-    assert a_format is not None and a_format.scale is not None
-    assert b_format is not None and b_format.scale is not None
-    assert a_format.storage_dtype == _fp8_dtype()
-    assert b_format.storage_dtype == _fp8_dtype()
-    assert a_format.scale.storage_dtype == torch.float32
-    assert b_format.scale.storage_dtype == torch.uint8
-    assert a_format.scale.block_shape == (1, 32)
-    assert b_format.scale.block_shape == (1, 32)
 
 
 def test_gemm_mxfp8_online_activation_preserves_repeated_rows() -> None:
@@ -1100,43 +1072,6 @@ def _assert_moe_plan(plan: dict, *, apply: str, preprocessor: str | None) -> Non
         else getattr(actual_preprocessor, "__name__", repr(actual_preprocessor))
     )
     assert actual_name == preprocessor
-
-
-def test_triton_mxfp8_native_weights_do_not_fall_back_to_requantization(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    weights = torch.nn.Module()
-    weights.quant_config = SimpleNamespace(weight_block_size=[1, 32])
-    weights.w13_input_layout = "interleaved"
-    weights.w13_weight = torch.empty((2, 16, 64), dtype=_fp8_dtype())
-    weights.w2_weight = torch.empty((2, 64, 32), dtype=_fp8_dtype())
-    w13_scale = torch.empty((2, 16, 2), dtype=torch.uint8)
-    w2_scale = torch.empty((2, 64, 1), dtype=torch.uint8)
-    weights.w13_weight_scale_inv = w13_scale
-    weights.w2_weight_scale_inv = w2_scale
-
-    monkeypatch.setattr(
-        _moe_triton_fp8,
-        "_downcast_block_fp8_weight_to_mxfp8",
-        lambda *_args, **_kwargs: pytest.fail(
-            "native 1x32 MXFP8 weights must not be requantized"
-        ),
-    )
-
-    _moe_triton_fp8.triton_fp8_moe_weights({}, weights)
-
-    assert weights.w13_weight_triton_tensor.shape == (2, 64, 16)
-    assert weights.w2_weight_triton_tensor.shape == (2, 32, 64)
-    assert torch.equal(
-        weights.w13_precision_config.b_mx_scale,
-        w13_scale.transpose(-2, -1),
-    )
-    assert torch.equal(
-        weights.w2_precision_config.b_mx_scale,
-        w2_scale.transpose(-2, -1),
-    )
-    assert not hasattr(weights, "w13_weight")
-    assert not hasattr(weights, "w2_weight")
 
 
 def test_gluon_mxfp4_swiglu_args_default_missing_values_to_standard_swiglu() -> None:

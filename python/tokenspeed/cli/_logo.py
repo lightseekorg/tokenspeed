@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from typing import IO
 
@@ -48,8 +49,14 @@ _SPEED_STYLE = "\033[94m"  # bright blue.
 _RESET = "\033[0m"
 
 _TAGLINE = "Tokens at the speed of light"
+_DISABLE_ENV = "TOKENSPEED_DISABLE_LOGO"
 # Visible width of one banner row: len(token) + " " + len(speed).
 _BANNER_WIDTH = len(_TOKEN_LINES[0]) + 1 + len(_SPEED_LINES[0])
+
+
+def _is_disabled() -> bool:
+    value = os.environ.get(_DISABLE_ENV, "").strip().lower()
+    return value not in ("", "0", "false", "no")
 
 
 def _stream_supports_color(stream: IO[str]) -> bool:
@@ -79,22 +86,13 @@ def render_logo(version: str = __version__, *, color: bool = True) -> str:
     return "\n".join(rows) + "\n"
 
 
-def print_logo(
-    version: str = __version__,
-    *,
-    stream: IO[str] | None = None,
-    disabled: bool = False,
-) -> None:
+def print_logo(version: str = __version__, *, stream: IO[str] | None = None) -> None:
     """Write the banner to ``stream`` (default stderr).
 
-    Args:
-        version: Version string shown in the footer.
-        stream: Output stream. Defaults to stderr.
-        disabled: Skip the banner. ``ts serve --disable-logo`` owns this setting.
-
-    ANSI colors are emitted only when the target stream is a TTY.
+    No-op when ``TOKENSPEED_DISABLE_LOGO`` is truthy. ANSI colors are emitted
+    only when the target stream is a TTY.
     """
-    if disabled:
+    if _is_disabled():
         return
     if stream is None:
         stream = sys.stderr

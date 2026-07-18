@@ -20,16 +20,7 @@
 
 """Tests for CacheEvent Python bindings."""
 
-from tokenspeed_scheduler import Cache, ExecutionEvent, SchedulerConfig
-
-
-def test_memory_debug_checks_are_explicit_and_off_by_default(monkeypatch):
-    monkeypatch.setenv("DEBUG_MEM", "1")
-    config = SchedulerConfig()
-
-    assert config.enable_memory_debug_checks is False
-    config.enable_memory_debug_checks = True
-    assert config.enable_memory_debug_checks is True
+from tokenspeed_scheduler import Cache, ExecutionEvent
 
 
 def test_cache_event_fields_are_bound():

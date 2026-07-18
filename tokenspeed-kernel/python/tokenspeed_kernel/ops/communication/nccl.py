@@ -36,12 +36,14 @@
 # A C/C++ binding is not flexible enough to handle this. It requires
 # recompilation of the code every time we want to switch between different
 # versions. This current implementation, with a **pure** Python wrapper, is
-# more flexible. Callers can switch between different versions of NCCL by
-# passing the desired shared-library path to ``NCCLLibrary(so_file=...)``.
+# more flexible. We can easily switch between different versions of NCCL by
+# changing the environment variable `TOKENSPEED_NCCL_SO_PATH`, or the `so_file`
+# variable in the code.
 
 
 import ctypes
 import logging
+import os
 import platform
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -54,27 +56,30 @@ logger = logging.getLogger(__name__)
 
 
 def find_nccl_library() -> str:
-    """Return the platform's default NCCL-compatible library name.
-
-    After importing PyTorch, ``libnccl.so.2`` or ``librccl.so.1`` can usually
-    be resolved by ``ctypes`` through the process's existing loader paths.
-    Callers that need another library must pass its path explicitly to
-    :class:`NCCLLibrary`.
-
-    Returns:
-        ``"libnccl.so.2"`` on NVIDIA or ``"librccl.so.1"`` on AMD.
-
-    Raises:
-        ValueError: If the current platform has neither CUDA nor ROCm.
     """
-    runtime_platform = current_platform()
-    if runtime_platform.is_nvidia:
-        so_file = "libnccl.so.2"
-    elif runtime_platform.is_amd:
-        so_file = "librccl.so.1"
+    We either use the library file specified by the `TOKENSPEED_NCCL_SO_PATH`
+    environment variable, or we find the library file brought by PyTorch.
+    After importing `torch`, `libnccl.so.2` or `librccl.so.1` can be
+    found by `ctypes` automatically.
+    """
+
+    # so_file can be set to None in tokenspeed
+    so_file = os.environ.get("TOKENSPEED_NCCL_SO_PATH", None)
+
+    # manually load the nccl library
+    if so_file:
+        logger.info(
+            "Found nccl from environment variable TOKENSPEED_NCCL_SO_PATH=%s", so_file
+        )
     else:
-        raise ValueError("NCCL only supports CUDA and ROCm backends.")
-    logger.debug("Using default collective library %s", so_file)
+        platform = current_platform()
+        if platform.is_nvidia:
+            so_file = "libnccl.so.2"
+        elif platform.is_amd:
+            so_file = "librccl.so.1"
+        else:
+            raise ValueError("NCCL only supports CUDA and ROCm backends.")
+        logger.debug("Found nccl from library %s", so_file)
     return so_file
 
 
@@ -169,13 +174,6 @@ class Function:
 
 
 class NCCLLibrary:
-    """Thin ``ctypes`` wrapper for an explicitly selected NCCL/RCCL library.
-
-    Args:
-        so_file: Shared-library name or path. If omitted, use the platform
-            default returned by :func:`find_nccl_library`.
-    """
-
     exported_functions = [
         # const char* ncclGetErrorString(ncclResult_t result)
         Function("ncclGetErrorString", ctypes.c_char_p, [ncclResult_t]),
@@ -326,8 +324,9 @@ class NCCLLibrary:
                 "It is expected if you are not running on NVIDIA/AMD GPUs."
                 "Otherwise, the nccl library might not exist, be corrupted "
                 "or it does not support the current platform %s."
-                "If you already have the library, pass its path explicitly "
-                "as NCCLLibrary(so_file=...).",
+                "If you already have the library, please set the "
+                "environment variable TOKENSPEED_NCCL_SO_PATH"
+                " to point to the correct nccl library path.",
                 so_file,
                 platform.platform(),
             )

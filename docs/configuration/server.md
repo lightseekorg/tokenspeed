@@ -4,13 +4,6 @@ This page documents the parameters operators usually set directly. TokenSpeed
 uses familiar serving parameter names where the semantics match and keeps
 TokenSpeed-specific knobs for runtime features with different meaning.
 
-First-party runtime behavior is configured through typed CLI, config, or Python
-API values. TokenSpeed does not use product environment variables as a second
-configuration channel. A small reviewed boundary remains for external
-protocols such as authentication, distributed-launch ranks, Prometheus, and
-vendor libraries; CI enforces that boundary by exact source path, variable
-name, and read/write direction.
-
 For a compact compatibility table, see
 [Compatible Parameters](./compatible-parameters.md).
 
@@ -28,11 +21,6 @@ For a compact compatibility table, see
 | `--revision` | Model branch, tag, or commit. |
 | `--download-dir` | Hugging Face download/cache directory. |
 | `--hf-overrides` | JSON overrides for model configuration values. |
-| `--use-modelscope` / `--no-use-modelscope` | Select ModelScope instead of Hugging Face for remote model and tokenizer downloads. Disabled by default. |
-| `--model-redirect-path` | Explicit JSON or whitespace-delimited mapping from model IDs to local paths. |
-
-Hub selection and model redirection are request-independent server arguments;
-TokenSpeed does not infer either setting from the process environment.
 
 ## Precision And Quantization
 
@@ -43,18 +31,6 @@ TokenSpeed does not infer either setting from the process environment.
 | `--kv-cache-quant-method` | KV cache quantization method. |
 | `--quantization` | Weight quantization mode such as `fp8`, `nvfp4`, `w8a8_fp8`, or `compressed-tensors`. |
 | `--quantization-param-path` | JSON file for KV cache scaling factors, commonly needed with FP8 KV cache. |
-| `--mamba-ssm-dtype` | Recurrent Mamba SSM-state dtype: `float32` (default) or `bfloat16`. |
-
-Mamba state precision is an explicit CLI setting and has no environment-variable
-alias.
-
-For MiniMax-M3 release runs, cache dtype, quantization, GPU placement, and
-workspace behavior are CLI/code configuration. Do not use
-`FLASHINFER_WORKSPACE_SIZE`, visible-device masks, TF32 override variables, or
-TokenSpeed feature environment variables. The mixed BF16-Q/E4M3-KV path owns a
-stable 512 MiB planning workspace internally. CI preflight fails when those
-inherited configuration channels or a persistent TokenSpeed-kernel override
-file are present.
 
 ## API Surface
 
@@ -67,14 +43,12 @@ file are present.
 | `--chat-template` | Built-in chat template name or template file path (handled by the smg gateway). |
 | `--stream-interval` | Streaming buffer interval in generated tokens. Smaller values stream more frequently. |
 | `--stream-output` | Return generated text as disjoint streaming segments. |
-| `--disable-logo` | Suppress the `ts serve` startup banner in non-interactive launchers. |
 
 ## Scheduler And Memory
 
 | Parameter | Purpose |
 | --- | --- |
 | `--max-model-len` | Maximum sequence length. If omitted, TokenSpeed uses the model config. |
-| `--allow-overwrite-longer-context-len` | Allow `--max-model-len` to exceed the model-derived context length, with a warning. Disabled by default. |
 | `--gpu-memory-utilization` | Fraction of GPU memory used for model weights and KV cache. Lower it to leave headroom. |
 | `--max-num-seqs` | Maximum number of active sequences the scheduler may process concurrently. |
 | `--chunked-prefill-size` | Token budget the scheduler may issue in one iteration. Defaults to `8192`. Set `-1` to disable chunked prefill. |
@@ -82,53 +56,13 @@ file are present.
 | `--max-total-tokens` | Override the automatically calculated token pool size. |
 | `--block-size` | KV cache block size. |
 | `--enable-prefix-caching` / `--no-enable-prefix-caching` | Enable or disable prefix cache reuse. |
-| `--scheduler-memory-debug-checks` | Run expensive scheduler device-memory consistency checks. Disabled by default; use only for diagnosis. |
-| `--enforce-eager` | Disable language-model CUDA Graph execution. An explicitly enabled multimodal encoder graph remains independent. |
+| `--enforce-eager` | Disable CUDA graph execution. |
 | `--max-cudagraph-capture-size` | Largest batch size to capture with CUDA graphs. |
 | `--cudagraph-capture-sizes` | Explicit CUDA graph capture sizes. |
 
 `--chunked-prefill-size` is intentionally separate from
 `--max-num-batched-tokens`: in TokenSpeed it is the scheduler's per-iteration
 issue budget, while `--max-total-tokens` controls the global token pool.
-Use `--max-total-tokens` when a small deterministic token pool is needed for a
-test; there is no separate CI-only KV-size environment override.
-
-Longer-context override is an explicit CLI setting with no environment-variable
-alias. Enable it only when the checkpoint is known to support the requested
-length; an invalid override can produce incorrect output or CUDA errors.
-
-### Mooncake KV Storage
-
-Mooncake storage is configured through
-`--kvstore-storage-backend-extra-config`; TokenSpeed does not read Mooncake or
-host-name environment variables. The smallest inline configuration names the
-Mooncake master explicitly:
-
-```bash
---kvstore-storage-backend mooncake \
---kvstore-storage-backend-extra-config \
-'{"master_server_address":"10.0.0.1:50051"}'
-```
-
-Inline fields are `local_hostname` (default `localhost`), `metadata_server`
-(default `P2PHANDSHAKE`), `global_segment_size` (default 4 GiB), `protocol`
-(default `tcp`), `device_name` (default empty), `master_metrics_port` (default
-`9003`), `check_server` (default `false`), and the optional key-prefix
-`extra_backend_tag`. `master_server_address` has no default and is always
-required.
-
-For a checked-in or mounted JSON document, pass an explicit path inside the
-same argument:
-
-```bash
---kvstore-storage-backend-extra-config \
-'{"config_path":"/etc/tokenspeed/mooncake.json"}'
-```
-
-`config_path` and inline Mooncake fields are mutually exclusive. Missing,
-unknown, or ill-typed settings fail startup instead of falling back to process
-environment state. `global_segment_size=0` remains a supported registered-host-
-buffer-only mode; negative sizes are rejected.
 
 ## Parallelism
 
@@ -136,7 +70,6 @@ buffer-only mode; negative sizes are rejected.
 | --- | --- |
 | `--tensor-parallel-size`, `--tp` | Familiar alias for setting attention tensor parallel size. |
 | `--attn-tp-size` | Tensor parallel size for attention. |
-| `--attn-cp-size` | Context parallel size for attention. Defaults to 1 after parallelism resolution. |
 | `--dense-tp-size` | Tensor parallel size for dense layers. |
 | `--moe-tp-size` | Tensor parallel size for MoE layers. |
 | `--data-parallel-size` | Number of data-parallel replicas. |
@@ -147,17 +80,10 @@ buffer-only mode; negative sizes are rejected.
 | `--nnodes` | Number of nodes. |
 | `--node-rank` | Rank of the current node. |
 | `--dist-init-addr` | Distributed initialization address. |
-| `--block-nonzero-rank-children` / `--no-block-nonzero-rank-children` | Keep non-zero-rank launcher processes alive after workers become ready. Enabled by default; disable only when an embedding API owns those workers' lifecycle. |
-| `--base-gpu-id` | First local GPU index assigned to the server. |
-| `--gpu-id-step` | Distance between assigned local GPU indices. For example, base `0` and step `2` selects `0,2,4,...`. |
-| `--enable-numa-aware-worker-affinity` / `--no-enable-numa-aware-worker-affinity` | Enable or disable NVIDIA worker pinning to the GPU-local CPU set. Enabled by default. |
 
 Use `--tensor-parallel-size` for simple launches. Use the
 TokenSpeed-specific split knobs when attention, dense, and MoE layers need
 different process groups.
-
-Parallel topology is configured through CLI arguments; TokenSpeed does not
-read `ENABLE_CP` from the process environment.
 
 ## Backend Selection
 
@@ -168,8 +94,6 @@ read `ENABLE_CP` from the process environment.
 | `--moe-backend` | MoE backend. |
 | `--draft-moe-backend` | MoE backend for the speculative decoding draft model. |
 | `--all2all-backend` | MoE all-to-all backend. |
-| `--tokenspeed-mla-prefill-backend` | TokenSpeed MLA prefill implementation: `cutedsl` (default) or `binary`. |
-| `--tokenspeed-mla-prefill-binary-so-path` | Optional custom AOT module path for the TokenSpeed MLA binary prefill backend. |
 | `--deepep-mode` | DeepEP mode: `auto`, `normal`, or `low_latency`. |
 | `--sampling-backend` | Sampling backend: `greedy`, `flashinfer`, `flashinfer_full`, `triton`, or `triton_full`. |
 
@@ -177,125 +101,9 @@ Set backend choices explicitly in production. `auto` is useful for bring-up, but
 explicit values make benchmark comparisons and regressions easier to reason
 about.
 
-The TokenSpeed MLA binary prefill backend is fail-closed: select it explicitly,
-and optionally provide a custom `.so` path. Each worker verifies that the
-packaged or custom module is loadable during backend initialization; CuTe DSL
-prefill warmup is skipped in that mode. A custom path is rejected with the
-default `cutedsl` selection.
-
-FlashInfer's generic workspace reservation is a stable runtime constant.
-Kernel-selection experiments use the explicit `override=` argument,
-`kernel_override(...)` context manager, or
-`load_config_overrides("/path/to/overrides.yaml")`. TokenSpeed-kernel does not
-read per-op override environment variables or automatically load a per-user
-override file.
-
-## Multimodal Execution
-
-| Parameter | Purpose |
-| --- | --- |
-| `--mm-attention-backend` | Attention backend used inside supported multimodal encoders, such as `fa3`, `fa4`, or `triton_attn`. |
-| `--mm-skip-compute-hash` | Replace multimodal content hashes with random per-item IDs, disabling content deduplication and content-aware prefix reuse. Disabled by default. |
-| `--enable-mm-encoder-cuda-graph` / `--no-enable-mm-encoder-cuda-graph` | Capture supported multimodal encoders during startup and replay matching input budgets. Disabled by default. |
-| `--mm-encoder-cudagraph-max-metadata-sequences-per-batch` | Explicit maximum number of attention-metadata sequences captured per encoder batch. Supported models derive it from the token budget when omitted. |
-| `--language-model-only` | Disable the active multimodal model path and reject multimodal requests. |
-
-Encoder CUDA Graph enablement is fail-closed: startup fails if the active model
-does not provide an encoder graph adapter or the selected multimodal attention
-backend cannot be captured. A supported model may still execute inputs outside
-its captured budget range eagerly. This graph is separate from the
-language-model graph controlled by `--enforce-eager` and the language-model
-capture-size options.
-
-Encoder-graph enablement and metadata sizing are CLI settings. They do not
-have environment-variable aliases.
-
-MiniMax-M3 captures image budgets `[16, 32, 64, 128, 256, 512, 1024, 2048,
-2304]` at startup. A fixed-candidate TP4 validation captured all nine budgets
-on every rank and replayed differently sized single- and multi-image requests
-without request-time recapture. This is real encoder execution capture; it is
-not merely a graph wrapper around an eager tower.
-
-Multimodal hash policy is also an explicit CLI setting with no
-environment-variable alias. Leave content hashing enabled unless intentionally
-diagnosing deduplication or prefix-reuse behavior.
-
-Multimodal modalities remain model-specific. MiniMax-M3 currently supports
-image items only; video items are rejected.
-
 When `--dp-sampling` is enabled, the logits processor owns the per-forward
 logits layout decision and carries the resulting plan to the sampling backend
-with the logits output. Its communication backend follows a stable automatic
-policy; there is no environment override.
-
-Remote image and audio helpers use explicit Python API timeouts, defaulting to
-3 and 5 seconds respectively. Callers that need different limits pass
-`request_timeout=` directly; process environment state is not consulted.
-
-## PD and EPD Transport
-
-PD/EPD transport tuning is part of the server argument snapshot. None of these
-settings has an environment-variable alias.
-
-| Parameter | Purpose |
-| --- | --- |
-| `--disaggregation-advertised-host` | Host or address that a prefill node advertises to decode peers. When omitted, TokenSpeed discovers the local address. |
-| `--disaggregation-queue-size` | Number of room-affine transfer queues. Defaults to `4`. |
-| `--disaggregation-thread-pool-size` | Total transfer worker threads. When omitted, TokenSpeed derives a bounded value from the available CPUs. |
-| `--disaggregation-bootstrap-timeout` | Bootstrap registration timeout in seconds. Defaults to `120`. |
-| `--disaggregation-waiting-timeout` | Completed-transfer wait timeout in seconds. Defaults to `300`. |
-| `--disaggregation-failed-session-ttl` | Failed-session quarantine in seconds. Defaults to `30`; `0` disables quarantine. |
-| `--disaggregation-heartbeat-interval` | Decode-side prefill heartbeat interval in seconds. Defaults to `5`. |
-| `--disaggregation-heartbeat-max-failures` | Consecutive heartbeat failures before affected requests fail. Defaults to `2`. |
-| `--pd-layerwise-debug` / `--no-pd-layerwise-debug` | Enable additional layerwise transfer consistency checks. Disabled by default. |
-| `--pd-prefill-metadata-wait-log-interval` | Debug-log interval while waiting for prefill metadata. Defaults to `5` seconds. |
-| `--epd-encode-ring-slots` | Pre-registered encode bounce-buffer slots. Defaults to `64`. |
-| `--epd-encode-ring-slot-mb` | Capacity of each encode bounce-buffer slot in MiB. Defaults to `256`. |
-| `--epd-encode-embedding-cache-mb` | Per-encode-process VRAM embedding-cache budget in MiB. Defaults to `4096`. |
-| `--epd-encode-embedding-cache-dram-mb` | Per-encode-process host embedding-cache budget in MiB. Defaults to `0` (disabled). |
-| `--epd-recv-pool-slots` | Lifetime-registered prefill receive slots. Defaults to `16`; `0` selects per-request buffers. |
-| `--epd-recv-pool-slot-mb` | Capacity of each prefill receive slot in MiB. Defaults to `256`; `0` also disables the pool. |
-| `--epd-embedding-shard` / `--no-epd-embedding-shard` | Shard image-embedding rows across prefill attention-TP ranks. Enabled by default. |
-
-The encode ring and receive pool reserve their configured capacities per
-process. Size them for the largest post-merge image embedding and multiply the
-memory budget by the number of co-located TP ranks. At the defaults, each
-encode rank reserves a 16 GiB main ring and a 4 GiB L1 embedding cache; each
-prefill rank reserves a 4 GiB receive pool. A model with a deepstack embedding
-path may allocate a second encode ring.
-
-## SMG Process Integration
-
-SMG launch behavior is also explicit server configuration: use
-`--grpc-max-message-bytes`, `--skip-grpc-warmup`,
-`--health-check-timeout`, `--log-mm-tensor-data`, `--enable-log-mm-timing`,
-`--unlink-mm-shm-after-read`, `--epd-pixel-shm`, and
-`--epd-ingest-offloop` (including each Boolean option's `--no-...` form).
-These settings are propagated to the SMG TokenSpeed gRPC adapter without
-feature environment variables.
-
-Image preprocessing and tensor transport at the SMG gateway are configured by
-gateway-owned flags. `tokenspeed serve` forwards these flags to SMG:
-
-| Parameter | Purpose |
-| --- | --- |
-| `--multimodal-tensor-transport` | Select `inline`, `shm`, `auto`, or `rdma`. |
-| `--multimodal-shm-min-bytes` | Minimum encoded tensor size before the `shm` path is used. |
-| `--multimodal-pixel-cache-mb` | Host pixel-cache budget in MiB; `0` disables the cache. |
-| `--multimodal-log-timing` | Enable gateway preprocessing/transport timing. Disabled by default. |
-| `--multimodal-image-max-input-bytes` | Reject an encoded image larger than this byte limit before decode. |
-| `--multimodal-image-encoder-input-dtype` | Explicit TokenSpeed encoder wire dtype: `float32`, `bfloat16`, or `float16`. |
-
-These TokenSpeed image/transport settings use RouterConfig and CLI state, not
-product environment variables. Video/audio paths are outside the MiniMax-M3
-basic image-support contract.
-
-Shared multimodal RDMA is configured with `--mm-pixel-rdma`,
-`--mm-rdma-slot-bytes`, `--mm-rdma-landing-slots`,
-`--mm-rdma-landing-wait-seconds`, and
-`--mm-rdma-read-timeout-seconds`. Metadata sending is tri-state:
-omit `--mm-rdma-send-metadata` for automatic behavior, or use its positive or
-`--no-mm-rdma-send-metadata` form to force the choice.
+with the logits output.
 
 ## Reasoning And Tool Calling
 
@@ -333,52 +141,14 @@ draft model, and token count together.
 | --- | --- |
 | `--log-level` | Runtime log level. |
 | `--log-level-http` | HTTP server log level. Defaults to `--log-level` when unset. |
-| `--logging-config-path` | Explicit path to a JSON `logging.dictConfig` document. |
 | `--enable-log-requests` | Log request metadata and optionally payloads. |
 | `--log-requests-level` | Request logging verbosity. |
 | `--enable-log-request-stats` | Log a one-line per-request performance summary on finish/abort (see below). |
-| `--enable-log-mm-timing` | Log detailed multimodal SHM, encoder, embedding, and forward timings. |
-| `--expert-distribution-recorder-output-dir` | Directory for expert-distribution recorder dumps. Defaults to `/tmp`. |
 | `--enable-metrics` | Enable metrics reporting. |
 | `--metrics-reporters` | Metrics reporter, such as `prometheus`. |
 | `--decode-log-interval` | Decode batch log interval. |
 | `--enable-cache-report` | Include cached-token counts in OpenAI-compatible usage details. |
 | `--kv-events-config` | JSON config for KV cache mutation events. Set `enable_kv_cache_events` and a publisher such as `zmq` to publish device prefix-cache stores and removals. |
-
-`--enable-log-mm-timing` is disabled by default and is intended for diagnostics.
-It is an explicit per-server setting; environment variables do not enable it.
-The encoder timing path may synchronize CUDA, so leave it disabled for normal
-throughput measurements.
-
-### On-Demand Profiling
-
-`/start_profile` accepts profiling configuration in its request body. Defaults
-are explicit and stable: `output_dir` is `/tmp`, `with_stack` is `true`,
-and `record_shapes` is `false`. Existing request fields are `output_dir`,
-`start_step`, `num_steps`, `activities`, `with_stack`, `record_shapes`, and
-`profile_by_stage`; internal clients may also provide a `profile_id` for output
-names. TokenSpeed does not merge profiler environment variables into the request.
-`profile_by_stage=true` requires `num_steps` and cannot be combined with
-`start_step`, because stage-based counting starts at the next eligible batch.
-
-For example:
-
-```json
-{
-  "activities": ["PROTON"],
-  "output_dir": "/var/log/tokenspeed/profiles",
-  "with_stack": true
-}
-```
-
-Proton cannot share CUPTI/roctracer with the torch GPU or CUDA profilers in one
-request. Invalid profiler values are rejected before any profiling state is
-started. Proton uses `ProfilingConfig` defaults, and VizTracer's minimum event
-duration is a stable 100 microseconds; neither is an additional request field.
-
-Model execution always enters `torch.inference_mode`; this is a stable runtime
-policy rather than an operator-controlled environment switch. The detokenizer
-also uses a stable 65,536-request state capacity.
 
 ### Per-Request Stats
 
@@ -445,10 +215,8 @@ features directly:
 - `--moe-tp-size`
 - `--kvstore-*`
 - `--enable-mla-l1-5-cache`
-- `--enable-mm-encoder-cuda-graph`
 - `--kv-events-config`
 - `--mla-chunk-multiplier`
 - `--disaggregation-*`
-- `--epd-*`
 - `--comm-fusion-max-num-tokens`
 - `--enable-allreduce-fusion`

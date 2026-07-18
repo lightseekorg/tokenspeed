@@ -51,26 +51,29 @@ from tokenspeed.runtime.cache.embedding_cache import (
     EmbeddingCache,
     TieredEmbeddingCache,
 )
-from tokenspeed.runtime.multimodal.encoder_cudagraph import (
-    install_encoder_cudagraph_wrappers,
-)
 from tokenspeed.runtime.pd.epd.encode_scheduler import EncodeScheduler
 from tokenspeed.runtime.pd.epd.encode_worker import EncodeWorker
 from tokenspeed.runtime.utils import get_colorful_logger, get_zmq_socket
+from tokenspeed.runtime.utils.env import envs
 
 logger = get_colorful_logger(__name__)
 
 
 # Vision-embedding cache capacity. L1 lives in GPU VRAM; the optional L2 lives in
 # host DRAM and catches L1 evictions so duplicate images skip the tower even past
-# the VRAM working set. L2 defaults to 0 (disabled): the host tier is opt-in.
-# Both knobs are PER ENCODE PROCESS (per TP rank): at encode TP>1, every
-# co-located rank allocates its own L1+L2.
-def _embedding_cache_bytes(mb: int, option_name: str) -> int:
-    """Convert a nonnegative whole-MiB cache setting to bytes."""
+# the VRAM working set. Both are whole-MiB env overrides. L2 defaults to 0
+# (disabled): the host tier is opt-in. NOTE both knobs are PER ENCODE PROCESS (per
+# TP rank): at encode TP>1, every co-located rank allocates its own L1+L2, so
+# budget host DRAM as tp_size * EMBED_CACHE_DRAM_MB.
+def _embedding_cache_bytes(env_field) -> int:
+    """Whole-MiB env field -> bytes.
 
+    EnvField handles parsing and defaults; negative capacities are rejected here
+    with an env-named error.
+    """
+    mb = env_field.get()
     if mb < 0:
-        raise ValueError(f"{option_name} must be >= 0 MiB, got {mb}")
+        raise ValueError(f"{env_field.name} must be >= 0 MiB, got {mb}")
     return mb * 1024 * 1024
 
 
@@ -113,28 +116,32 @@ def _build_manager_args(server_args, mapping):
         bootstrap_port=server_args.disaggregation_bootstrap_port,
         tp_size=mapping.attn.tp_size,
         bootstrap_host=bootstrap_host,
-        runtime_config=server_args.disaggregation_config,
     )
 
 
 def _maybe_install_encoder_cudagraph(model, server_args) -> bool:
-    """Install the image CUDA-graph wrapper exposed by the model.
+    """Install the vision-encoder CUDA-graph wrapper as ``model.image_encoder``,
+    mirroring the aggregated path's hook in ``execution/model_executor.py``.
 
     The encode loop never builds a ModelExecutor, so this is where the encode
-    worker opts into capture/replay of the tower instead of running it eager.
-    The gate and plural wrapper-builder contract match the aggregated executor.
-    The executor's IMAGE path dispatches through ``model.image_encoder`` and
-    retains the eager model method when this function returns ``False``.
+    worker opts into capture/replay of the tower instead of running it eager. Same
+    gate as the aggregated install: the model exposes the builder, multimodal is
+    active, the env flag is on, and the attention backend is graph-capturable. The
+    wrapper IS the model's ``image_encoder`` seam (lazy capture on first encode);
+    the executor's IMAGE path dispatches through ``model.image_encoder`` and falls
+    back to eager ``get_image_feature`` (the default) when this returns False.
+    Returns whether the wrapper was installed.
     """
-    wrappers = install_encoder_cudagraph_wrappers(
-        model,
-        enabled=server_args.enable_mm_encoder_cuda_graph,
-        mm_attention_backend=server_args.mm_attention_backend,
-        max_metadata_sequences_per_batch=(
-            server_args.mm_encoder_cudagraph_max_metadata_sequences_per_batch
-        ),
-    )
-    return "image_encoder" in wrappers
+    if not (
+        hasattr(model, "make_encoder_cudagraph_wrapper")
+        and getattr(model, "is_multimodal_active", True)
+        and envs.TOKENSPEED_MM_ENABLE_ENCODER_CUDA_GRAPH.get()
+        and server_args.mm_attention_backend != "flashinfer_cudnn"
+    ):
+        return False
+    model.image_encoder = model.make_encoder_cudagraph_wrapper(model.mapping)
+    logger.info("EPD encode worker: vision-encoder CUDA graph installed")
+    return True
 
 
 def _build_encode_worker(server_args, port_args, gpu_id, global_rank):
@@ -191,8 +198,6 @@ def _build_encode_worker(server_args, port_args, gpu_id, global_rank):
     # which the encode worker bypasses by never building a ModelExecutor).
     _maybe_install_encoder_cudagraph(model, server_args)
 
-    runtime_config = server_args.disaggregation_config
-    epd_config = runtime_config.epd
     manager_args = _build_manager_args(server_args, mapping)
     embedding_args = EmbeddingArgs(
         engine_rank=global_rank,
@@ -210,36 +215,16 @@ def _build_encode_worker(server_args, port_args, gpu_id, global_rank):
     if attn_tp_rank == 0:
         MooncakeEmbeddingBootstrapServer(server_args.disaggregation_bootstrap_port)
     manager = MooncakeEmbeddingManagerEncode(manager_args, embedding_args)
-    executor = DisaggEncodeExecutor(
-        manager,
-        model,
-        device=device,
-        ring_slots=epd_config.encode_ring_slots,
-        ring_bytes=epd_config.encode_ring_slot_mb << 20,
-    )
+    executor = DisaggEncodeExecutor(manager, model, device=device)
 
-    l1_bytes = _embedding_cache_bytes(
-        epd_config.encode_embedding_cache_mb,
-        "--epd-encode-embedding-cache-mb",
-    )
-    l2_bytes = _embedding_cache_bytes(
-        epd_config.encode_embedding_cache_dram_mb,
-        "--epd-encode-embedding-cache-dram-mb",
-    )
+    l1_bytes = _embedding_cache_bytes(envs.TOKENSPEED_EPD_ENCODE_EMBED_CACHE_MB)
+    l2_bytes = _embedding_cache_bytes(envs.TOKENSPEED_EPD_ENCODE_EMBED_CACHE_DRAM_MB)
     cache = _make_embedding_cache(l1_bytes, l2_bytes, device)
     scheduler = EncodeScheduler(
         max_tokens_per_batch=server_args.chunked_prefill_size or 8192,
         max_items_per_batch=server_args.max_num_seqs,
     )
-    return (
-        EncodeWorker(
-            executor,
-            scheduler,
-            cache,
-            log_mm_timing=server_args.enable_log_mm_timing,
-        ),
-        model_config,
-    )
+    return EncodeWorker(executor, scheduler, cache), model_config
 
 
 def run_encode_loop(server_args, port_args, pipe_writer, gpu_id, global_rank):

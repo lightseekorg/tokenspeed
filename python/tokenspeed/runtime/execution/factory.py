@@ -80,7 +80,8 @@ def create_model_executor(
     mamba_pool: object | None = None,
 ) -> ModelExecutor:
     """Create the model executor with its sampler configuration."""
-    set_nvtx_enabled(server_args.enable_nvtx)
+    if server_args.enable_nvtx:
+        set_nvtx_enabled(True)
 
     max_bs = config.max_num_seqs // max(config.data_parallel_size, 1)
 

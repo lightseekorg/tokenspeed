@@ -326,7 +326,7 @@ def test_minimax_m3_rejects_nonpositive_or_nonfinite_kv_cache_scale(
     assert all(attention.v_scale is None for attention in attentions)
 
 
-def test_minimax_m3_forwards_explicit_mm_timing_to_embedder() -> None:
+def test_minimax_m3_multimodal_embedder_uses_default_timing() -> None:
     expected = torch.zeros((1, 2))
     apply = Mock(return_value=(expected, {}))
     model = SimpleNamespace(
@@ -336,7 +336,6 @@ def test_minimax_m3_forwards_explicit_mm_timing_to_embedder() -> None:
     )
     ctx = SimpleNamespace(
         forward_mode=SimpleNamespace(is_decode_or_idle=lambda: False),
-        enable_log_mm_timing=True,
     )
     multimodal_context = SimpleNamespace(has_extend_inputs=lambda: True)
 
@@ -348,7 +347,7 @@ def test_minimax_m3_forwards_explicit_mm_timing_to_embedder() -> None:
     )
 
     assert actual is expected
-    assert apply.call_args.kwargs["log_timing"] is True
+    assert apply.call_args.kwargs["log_timing"] is False
 
 
 def test_minimax_m3_builds_active_multimodal_runtime(

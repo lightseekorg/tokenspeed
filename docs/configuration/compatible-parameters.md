@@ -61,6 +61,4 @@ TokenSpeed-specific behavior explicitly.
 - Pass the model path positionally, then keep `--trust-remote-code`, `--max-model-len`, `--kv-cache-dtype`, `--gpu-memory-utilization`, `--max-num-seqs`, `--tensor-parallel-size`, `--reasoning-parser`, and `--tool-call-parser` when the model needs them.
 - Review `--max-num-batched-tokens` before copying it. TokenSpeed usually wants `--chunked-prefill-size` for per-iteration scheduling.
 - Review backend names. TokenSpeed backends are optimized for its runtime and kernel packages.
-- Keep TokenSpeed-specific `--attn-tp-size`, `--moe-tp-size`,
-  `--disaggregation-*`, `--epd-*`, and `--kvstore-*` only when the deployment
-  needs those features.
+- Keep TokenSpeed-specific `--attn-tp-size`, `--moe-tp-size`, `--disaggregation-*`, and `--kvstore-*` only when the deployment needs those features.

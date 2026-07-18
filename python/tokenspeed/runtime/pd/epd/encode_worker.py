@@ -85,13 +85,10 @@ class EncodeWorker:
         executor,
         scheduler: EncodeScheduler,
         cache: EmbeddingCache | TieredEmbeddingCache,
-        *,
-        log_mm_timing: bool = False,
     ):
         self.executor = executor
         self.scheduler = scheduler
         self.cache = cache
-        self.log_mm_timing = log_mm_timing
         # (request_id, item_index) -> item awaiting the tower
         self._pending: dict = {}
 
@@ -113,9 +110,9 @@ class EncodeWorker:
                 handle, item.feature = item.feature, None
                 handle.attach()
                 if cached is None:
-                    item.feature = handle.consume(log_timing=self.log_mm_timing)
+                    item.feature = handle.consume()
                 else:
-                    handle.consume(log_timing=self.log_mm_timing)
+                    handle.consume()
             if cached is not None:
                 # Cache hit: tower skipped, but the embedding still must reach
                 # the prefill peer, so ship it directly. Entries are

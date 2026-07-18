@@ -21,25 +21,13 @@
 import contextlib
 import io
 import logging
-import os
 import unittest
 from importlib import import_module
-from unittest.mock import patch
 
 from tokenspeed._logging import suppress_noisy_third_party_logs
 
 
 class TestThirdPartyLogging(unittest.TestCase):
-    def test_suppression_does_not_configure_third_parties_via_environment(self):
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("HF_HUB_DISABLE_PROGRESS_BARS", None)
-            os.environ.pop("TLLM_LOG_LEVEL", None)
-
-            suppress_noisy_third_party_logs()
-
-            self.assertNotIn("HF_HUB_DISABLE_PROGRESS_BARS", os.environ)
-            self.assertNotIn("TLLM_LOG_LEVEL", os.environ)
-
     def test_flash_attn_jit_cache_debug_log_is_suppressed(self):
         try:
             cache_utils = import_module("flash_attn.cute.cache_utils")

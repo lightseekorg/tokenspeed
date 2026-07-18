@@ -21,6 +21,18 @@
 from dataclasses import dataclass
 from enum import Enum
 
+from tokenspeed.runtime.utils.env import envs
+
+TOKENSPEED_TEST_REQUEST_TIME_STATS = envs.TOKENSPEED_TEST_REQUEST_TIME_STATS.get()
+
+
+def _raise_for_negative_durations(**durations: float) -> None:
+    negative_durations = [
+        f"{name}={duration} < 0" for name, duration in durations.items() if duration < 0
+    ]
+    if negative_durations:
+        raise ValueError(" or ".join(negative_durations))
+
 
 @dataclass
 class TimeStats:
@@ -58,6 +70,12 @@ class TimeStats:
             queue_duration = self.forward_entry_time - self.wait_queue_entry_time
             forward_duration = self.completion_time - self.forward_entry_time
 
+            if TOKENSPEED_TEST_REQUEST_TIME_STATS:
+                _raise_for_negative_durations(
+                    queue_duration=queue_duration,
+                    forward_duration=forward_duration,
+                )
+
             return f"queue_duration={self.format_duration(queue_duration)}, forward_duration={self.format_duration(forward_duration)}, start_time={self.wait_queue_entry_time}"
         if _type == self.RequestType.PREFILL:
             bootstrap_duration = (
@@ -68,6 +86,12 @@ class TimeStats:
 
             forward_duration = self.completion_time - self.forward_entry_time
 
+            if TOKENSPEED_TEST_REQUEST_TIME_STATS:
+                _raise_for_negative_durations(
+                    bootstrap_duration=bootstrap_duration,
+                    queue_duration=queue_duration,
+                    forward_duration=forward_duration,
+                )
             return f"bootstrap_duration={self.format_duration(bootstrap_duration)}, queue_duration={self.format_duration(queue_duration)}, forward_duration={self.format_duration(forward_duration)}, start_time={self.prefill_bootstrap_queue_entry_time}"
         # if decode
         if _type == self.RequestType.DECODE:
@@ -81,6 +105,14 @@ class TimeStats:
             )
             queue_duration = self.forward_entry_time - self.wait_queue_entry_time
             forward_duration = self.completion_time - self.forward_entry_time
+
+            if TOKENSPEED_TEST_REQUEST_TIME_STATS:
+                _raise_for_negative_durations(
+                    prealloc_duration=prealloc_duration,
+                    transfer_duration=transfer_duration,
+                    queue_duration=queue_duration,
+                    forward_duration=forward_duration,
+                )
 
             return f"prealloc_duration={self.format_duration(prealloc_duration)}, transfer_duration={self.format_duration(transfer_duration)}, queue_duration={self.format_duration(queue_duration)}, forward_duration={self.format_duration(forward_duration)}, start_time={self.decode_prealloc_queue_entry_time}"
         return "Invalid Time Stats"

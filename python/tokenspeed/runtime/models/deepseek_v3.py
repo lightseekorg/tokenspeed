@@ -53,6 +53,7 @@ from tokenspeed.runtime.layers.moe import (
 )
 from tokenspeed.runtime.layers.utils import (
     CP_METADATA,
+    ENABLE_CP,
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_data,
     get_layer_id,
@@ -113,7 +114,7 @@ from tokenspeed.runtime.moe.distribution_recorder import (
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.utils import LazyValue, add_prefix, get_colorful_logger
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
-from tokenspeed.runtime.utils.env import global_server_args_dict
+from tokenspeed.runtime.utils.env import envs, global_server_args_dict
 from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 logger = get_colorful_logger(__name__)
@@ -187,7 +188,8 @@ class DeepseekV3MLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
         self._use_nvfp4_gemm_swiglu_nvfp4_quant = (
-            _is_blackwell
+            envs.TOKENSPEED_NVFP4_GEMM_SWIGLU_NVFP4_QUANT.get()
+            and _is_blackwell
             and isinstance(self.gate_up_proj.quant_method, Nvfp4LinearMethod)
             and isinstance(self.down_proj.quant_method, Nvfp4LinearMethod)
         )
@@ -1463,7 +1465,7 @@ class DeepseekV3Model(nn.Module):
                     residual,
                 )
         if not ctx.forward_mode.is_idle():
-            if not self.mapping.attn.has_cp:
+            if not ENABLE_CP:
                 hidden_states, _ = layer.comm_manager.final_norm(
                     hidden_states, residual, ctx, self.norm
                 )

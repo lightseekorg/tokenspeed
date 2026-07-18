@@ -80,7 +80,6 @@ class WeightLoader:
             ext_yaml=server_args.ext_yaml,
             weight_loader_prefetch_checkpoints=server_args.weight_loader_prefetch_checkpoints,
             weight_loader_prefetch_num_threads=server_args.weight_loader_prefetch_num_threads,
-            use_modelscope=server_args.use_modelscope,
         )
 
         # Load model with memory saver context. Tag as "weights" with CPU backup

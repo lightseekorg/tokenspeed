@@ -44,7 +44,6 @@ from tokenspeed_kernel.ops.sampling.triton import (
 
 from tokenspeed.runtime.sampling.backends.base import (
     CUDA_GRAPH_VARIANT_DEFAULT,
-    CUDA_GRAPH_VARIANT_GREEDY,
     SamplingBackend,
     SamplingBackendConfig,
 )
@@ -98,7 +97,6 @@ class TritonSamplingBackend(SamplingBackend):
     """TokenSpeed pool-state backend using Triton Gumbel-Max kernels."""
 
     _HAS_POOL_STATE = True
-    _SUPPORTS_GREEDY_GRAPH_VARIANT = True
 
     def __init__(self, config: SamplingBackendConfig) -> None:
         super().__init__(config)
@@ -380,7 +378,7 @@ class TritonSamplingBackend(SamplingBackend):
 
     def cuda_graph_capture_variants(self, num_tokens_per_req: int) -> tuple[str, ...]:
         variants = (
-            *super().cuda_graph_capture_variants(num_tokens_per_req),
+            CUDA_GRAPH_VARIANT_DEFAULT,
             CUDA_GRAPH_VARIANT_TRITON_NO_FILTER,
             CUDA_GRAPH_VARIANT_TRITON_TOP_P,
             CUDA_GRAPH_VARIANT_TRITON_TOP_K,
@@ -410,23 +408,12 @@ class TritonSamplingBackend(SamplingBackend):
                 num_tokens_per_req=num_tokens_per_req,
             )
             return
-        if variant == CUDA_GRAPH_VARIANT_GREEDY:
-            SamplingBackend.prepare_capture_variant(
-                self,
-                bs=bs,
-                num_tokens_per_req=num_tokens_per_req,
-                variant=variant,
-            )
-            return
         if variant == CUDA_GRAPH_VARIANT_DEFAULT:
             self.prepare_capture(bs=bs, num_tokens_per_req=num_tokens_per_req)
             return
         raise ValueError(f"Unsupported CUDA graph variant: {variant}")
 
     def cuda_graph_replay_variant(self, num_tokens_per_req: int) -> str:
-        base_variant = super().cuda_graph_replay_variant(num_tokens_per_req)
-        if base_variant == CUDA_GRAPH_VARIANT_GREEDY:
-            return base_variant
         if self._sample_route == _SAMPLE_ROUTE_GUMBEL_NO_FILTER:
             if num_tokens_per_req > 1:
                 return CUDA_GRAPH_VARIANT_TRITON_VERIFY_NO_FILTER

@@ -21,10 +21,10 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
-from os import PathLike
 from pathlib import Path
 from typing import Any, Callable, Generator
 
@@ -173,7 +173,7 @@ class _ConfigOverrideEntry:
 _policy = SelectionPolicy()
 _oracles: dict[str, SelectionOracle] = {}
 _global_overrides: dict[tuple[str, str], str] = {}
-_config_overrides: dict[tuple[str, str], _ConfigOverrideEntry] = {}
+_config_overrides: dict[tuple[str, str], _ConfigOverrideEntry] | None = None
 
 
 def set_selection_policy(policy: SelectionPolicy) -> None:
@@ -236,16 +236,24 @@ def _parse_overrides(
     return result
 
 
-def load_config_overrides(path: str | PathLike[str]) -> None:
+def load_config_overrides(path: str | os.PathLike[str] | None = None) -> None:
     """Load kernel overrides from a YAML config file.
 
     Args:
-        path: Explicit path to the YAML file. TokenSpeed-kernel never loads a
-            process environment variable or a per-user default file.
+        path: Path to the YAML file.  If *None*, uses the
+            ``TOKENSPEED_KERNEL_OVERRIDES_FILE`` env var or falls back to
+            ``~/.config/tokenspeed-kernel/overrides.yaml``.
     """
     global _config_overrides
 
-    path = Path(path)
+    if path is None:
+        env_path = os.environ.get("TOKENSPEED_KERNEL_OVERRIDES_FILE")
+        if env_path:
+            path = Path(env_path)
+        else:
+            path = Path("~/.config/tokenspeed-kernel/overrides.yaml").expanduser()
+    else:
+        path = Path(path)
 
     _config_overrides = {}
 
@@ -294,8 +302,12 @@ def clear_config_overrides() -> None:
 
 
 def _get_config_override(family: str, mode: str) -> _ConfigOverrideEntry | None:
-    """Return the explicitly loaded config-file override for *(family, mode)*."""
-    return _config_overrides.get((family, mode))
+    """Return the config-file override for *(family, mode)*, lazily loading
+    from the default path on first access."""
+    global _config_overrides
+    if _config_overrides is None:
+        load_config_overrides()
+    return _config_overrides.get((family, mode))  # type: ignore[union-attr]
 
 
 def _make_cache_key(
@@ -528,11 +540,13 @@ def _log_selection(
     platform: PlatformInfo,
     objective: SelectionObjective,
 ) -> None:
-    """Log selection details when debug logging is enabled."""
+    """Log selection result if verbose mode is enabled."""
+    if not os.environ.get("TOKENSPEED_KERNEL_VERBOSE"):
+        return
 
     breakdown = next((s for spec, s in scored if spec.name == winner.name), None)
     if breakdown:
-        logger.debug(
+        logger.info(
             "[tokenspeed_kernel] %s.%s(%s) -> %s (%s, %s)",
             family,
             mode,
@@ -542,7 +556,7 @@ def _log_selection(
             platform.arch,
         )
     else:
-        logger.debug(
+        logger.info(
             "[tokenspeed_kernel] %s.%s(%s) -> %s (%s)",
             family,
             mode,
@@ -619,6 +633,11 @@ def select_kernel(
     if global_override:
         override = global_override
 
+    # 3. Environment variable
+    env_key = f"TOKENSPEED_KERNEL_OVERRIDE_{family.upper()}_{mode.upper()}"
+    env_override = os.environ.get(env_key)
+    if env_override:
+        override = env_override
     registry = KernelRegistry.get()
 
     # Fast path: check cache (skipped when override is active)

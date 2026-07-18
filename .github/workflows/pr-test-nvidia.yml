@@ -40,10 +40,6 @@ on:
         options:
           - manual
           - debug
-      task_names:
-        description: "Comma-separated exact CI task names (required; no wildcards)"
-        required: true
-        type: string
 
 env:
   PIP_BREAK_SYSTEM_PACKAGES: 1
@@ -97,20 +93,12 @@ jobs:
       - name: Build task matrix
         id: scan
         env:
-          CI_SELECTED_TASK_NAMES: ${{ github.event.inputs.task_names }}
           TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS: ${{ vars.TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS }}
         run: |
-          set -euo pipefail
-          python3 test/ci_system/product_env_guard.py
-          TASK_FILTER_ARGS=()
-          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
-            TASK_FILTER_ARGS=(--task-names "$CI_SELECTED_TASK_NAMES")
-          fi
           MATRIX=$(python3 test/ci_system/pipeline.py scan \
             --root test/ci \
             --trigger "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.trigger || 'per-commit' }}" \
-            --runner-group "nvidia-x86" \
-            "${TASK_FILTER_ARGS[@]}")
+            --runner-group "nvidia-x86")
           echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
           printf '%s' "$MATRIX" | python3 -c "import json, sys; print('has_tasks=' + ('true' if json.load(sys.stdin).get('include') else 'false'))" >> "$GITHUB_OUTPUT"
 
@@ -136,11 +124,6 @@ jobs:
               files=$(gh api \
                 "/repos/${{ github.repository }}/compare/${{ github.event.before }}...${{ github.event.after }}" \
                 -q '.files[].filename')
-              ;;
-            workflow_dispatch)
-              # A targeted manual run validates the checked-out branch. It has
-              # no PR/push diff payload, so always install the in-tree MLA.
-              files="tokenspeed-mla/"
               ;;
             *)
               files=""
@@ -173,7 +156,7 @@ jobs:
       matrix: ${{ fromJson(needs.scan.outputs.matrix) }}
     name: ${{ matrix.name }} (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: ${{ matrix.timeout_minutes }}
+    timeout-minutes: 60
     continue-on-error: ${{ matrix.optional }}
     env:
       # When the scan job determined that this run touched `tokenspeed-mla/`,
@@ -225,7 +208,7 @@ jobs:
             --print-plan \
             --only-stage install \
             --keep-runner-state \
-            --result-json .ci-artifacts/install-result.json
+            --result-json .ci-artifacts/result.json
 
       - name: Execute CI task
         run: |
@@ -240,13 +223,12 @@ jobs:
             --reuse-runner-state \
             --result-json .ci-artifacts/result.json
 
-      - name: Upload task artifacts
+      - name: Upload task result
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: pr-test-${{ matrix.name }}-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ env.WORK_DIR }}/.ci-artifacts/
-          include-hidden-files: true
+          path: ${{ env.WORK_DIR }}/.ci-artifacts/result.json
 
       - name: Cleanup work directory
         if: always()

@@ -24,7 +24,6 @@ import struct
 import numpy as np
 import numpy.typing as npt
 
-from tokenspeed.runtime.pd.config import DisaggregationRuntimeConfig
 from tokenspeed.runtime.pd.transfer_plan import (
     TransferFragment,
     decode_transfer_fragments,
@@ -236,7 +235,3 @@ class KVManagerArgs:
     served_model_name: str
     app_key: str
     metrics_reporters: str
-    runtime_config: DisaggregationRuntimeConfig = dataclasses.field(
-        default_factory=DisaggregationRuntimeConfig
-    )
-    advertised_host: str | None = None

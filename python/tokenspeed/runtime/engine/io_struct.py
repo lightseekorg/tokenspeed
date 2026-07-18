@@ -896,13 +896,13 @@ class ProfileReqType(Enum):
 @dataclass
 class ProfileReq:
     type: ProfileReqType
-    output_dir: str | None = "/tmp"
+    output_dir: str | None = None
     start_step: int | None = None
     num_steps: int | None = None
     activities: list[str] | None = None
     profile_by_stage: bool = False
-    with_stack: bool | None = True
-    record_shapes: bool | None = False
+    with_stack: bool | None = None
+    record_shapes: bool | None = None
     profile_id: str | None = None
 
 

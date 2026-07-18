@@ -120,7 +120,6 @@ struct SchedulerConfig {
     std::int32_t prefetch_threshold{4};  // num pages
     bool enable_kv_cache_events{false};
     bool enable_mixed_prefill_decode{false};
-    bool enable_memory_debug_checks{false};
 
     std::int32_t num_pages_reserved_for_retracted_or_running{};
     Role role{Role::kFused};

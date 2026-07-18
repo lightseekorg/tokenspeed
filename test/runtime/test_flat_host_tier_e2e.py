@@ -172,6 +172,11 @@ class TestFlatHostTierE2E(unittest.TestCase):
                 "tokenspeed_scheduler ext; radix builds use the radix "
                 "MemoryExecutor host tier"
             )
+        if os.environ.get("TOKENSPEED_CI_SMALL_KV_SIZE"):
+            self.skipTest(
+                "TOKENSPEED_CI_SMALL_KV_SIZE pins the token pool, breaking "
+                "the oversubscription sizing under test"
+            )
 
     def test_host_tier_restores_prefix_hits_after_eviction(self):
         # --- Arm 1: host tier ON ---

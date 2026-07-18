@@ -21,6 +21,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 
 #include <spdlog/spdlog.h>
@@ -140,7 +141,7 @@ std::vector<TreeNode*> ResourceManager<RType>::Evict(std::int32_t num_pages) {
         }
 
         if constexpr (RType == ResourceType::Device) {
-            if (spdlog::should_log(spdlog::level::debug)) {
+            if (std::getenv("DEBUG_MEM")) {
                 spdlog::debug("  evict node pages: [{}]", fmt::join(GetResource<RType>(leaf).Pages(), ", "));
             }
         }

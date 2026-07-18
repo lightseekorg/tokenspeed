@@ -22,6 +22,7 @@
 
 import copy
 import multiprocessing as mp
+import os
 import signal
 import threading
 from collections import deque
@@ -136,10 +137,16 @@ class DataParallelController:
             self.recv_from_tokenizer = get_zmq_socket(
                 self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
             )
+        # dp_worker for fixed data dispatch can be set by SINGLE_WORKER_ID environment variable
+        robin_scheduler = (
+            self.round_robin_scheduler
+            if os.environ.get("SINGLE_WORKER_ID", "-1") == "-1"
+            else self.single_robin_scheduler
+        )
         # Dispatch method
         self.round_robin_counter = 0
         dispatch_lookup = {
-            LoadBalanceMethod.ROUND_ROBIN: self.round_robin_scheduler,
+            LoadBalanceMethod.ROUND_ROBIN: robin_scheduler,
             LoadBalanceMethod.SHORTEST_QUEUE: self.budget_scheduler,
             LoadBalanceMethod.MINIMUM_CACHE_USAGE: self.budget_scheduler,
         }
@@ -313,6 +320,12 @@ class DataParallelController:
             )
         else:
             self.workers[req.bootstrap_room % len(self.workers)].send_pyobj(req)
+
+    def single_robin_scheduler(self, req):
+        worker_id = int(os.environ.get("SINGLE_WORKER_ID", "-1"))
+        if not 0 <= worker_id < self.server_args.mapping.attn.dp_size - 1:
+            raise ValueError(f"Invalid SINGLE_WORKER_ID:{worker_id}")
+        self.workers[worker_id].send_pyobj(req)
 
     def budget_scheduler(self, req):
         target_worker = self.dp_budget.dispatch()

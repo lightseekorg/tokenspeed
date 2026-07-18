@@ -121,7 +121,6 @@ def run_unittest_files(
     enable_retry: bool = False,
     max_attempts: int = 2,
     retry_wait_seconds: int = 60,
-    cuda_coredump_dir: str | None = None,
 ):
     """
     Run a list of test files.
@@ -135,17 +134,10 @@ def run_unittest_files(
                      assertion failures (not code errors).
         max_attempts: Maximum number of attempts per file including initial run (default: 2).
         retry_wait_seconds: Seconds to wait between retries (default: 60).
-        cuda_coredump_dir: Explicit directory for NVIDIA CUDA exception dumps.
-            ``None`` leaves coredump generation disabled.
     """
-    subprocess_env = os.environ.copy()
-    if cuda_coredump_dir is not None:
-        cuda_coredump.configure(cuda_coredump_dir, env=subprocess_env)
-        cuda_coredump.cleanup_dump_dir(cuda_coredump_dir)
-    else:
-        # Runtime CI is deterministic: inherited driver coredump state is not
-        # another configuration channel for test subprocesses.
-        cuda_coredump.disable(subprocess_env)
+    coredump_enabled = cuda_coredump.is_enabled()
+    if coredump_enabled:
+        cuda_coredump.cleanup_dump_dir()
 
     tic = time.perf_counter()
     success = True
@@ -181,7 +173,6 @@ def run_unittest_files(
                     stderr=subprocess.STDOUT,
                     text=True,
                     errors="ignore",  # Ignore non-UTF-8 bytes to prevent UnicodeDecodeError
-                    env=subprocess_env,
                 )
                 output_lines = []
                 for line in process.stdout:
@@ -190,10 +181,7 @@ def run_unittest_files(
                 process.wait()
             else:
                 process = subprocess.Popen(
-                    ["python3", full_path],
-                    stdout=None,
-                    stderr=None,
-                    env=subprocess_env,
+                    ["python3", full_path], stdout=None, stderr=None
                 )
                 process.wait()
 
@@ -279,8 +267,8 @@ def run_unittest_files(
 
     elapsed_total = time.perf_counter() - tic
 
-    if cuda_coredump_dir is not None and not success:
-        cuda_coredump.report(cuda_coredump_dir)
+    if coredump_enabled and not success:
+        cuda_coredump.report()
 
     if success:
         logger.info(f"Success. Time elapsed: {elapsed_total:.2f}s")

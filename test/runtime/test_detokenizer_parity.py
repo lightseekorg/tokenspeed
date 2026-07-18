@@ -1147,7 +1147,8 @@ class TestDetokenizerLifecycle(unittest.TestCase):
         # forces the first rid to be evicted while the third is being
         # assigned in the first loop. The second loop's direct dict
         # lookup then KeyErrors and handle_batch_token_id_out must
-        # surface a RuntimeError pointing callers at the explicit capacity.
+        # surface a RuntimeError pointing operators at
+        # TOKENSPEED_DETOKENIZER_MAX_STATES.
         manager = _StubDetokenizerManager(self.tokenizer, capacity=2)
         ids_1 = self.tokenizer.encode("alpha", add_special_tokens=False)
         ids_2 = self.tokenizer.encode("beta", add_special_tokens=False)
@@ -1162,8 +1163,7 @@ class TestDetokenizerLifecycle(unittest.TestCase):
             )
 
         message = str(cm.exception)
-        self.assertIn("LimitedCapacityDict capacity", message)
-        self.assertIn("current value is 2", message)
+        self.assertIn("TOKENSPEED_DETOKENIZER_MAX_STATES", message)
         self.assertIn("req-1", message)
 
     def test_is_dummy_flag_does_not_alter_decoding_output(self):

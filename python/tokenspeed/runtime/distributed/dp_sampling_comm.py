@@ -54,6 +54,7 @@ from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
 from tokenspeed.runtime.utils import get_colorful_logger
+from tokenspeed.runtime.utils.env import envs
 
 try:
     from tokenspeed_kernel.ops.communication.triton import (
@@ -74,6 +75,17 @@ logger = get_colorful_logger(__name__)
 
 DpSamplingBackend = Literal["auto", "nccl", "onesided"]
 _ResolvedBackend = Literal["nccl", "onesided"]
+
+ENV_VAR = "TOKENSPEED_DP_SAMPLING_BACKEND"
+
+
+def _env_override() -> DpSamplingBackend | None:
+    val = envs.TOKENSPEED_DP_SAMPLING_BACKEND.get()
+    if val in ("auto", "nccl", "onesided"):
+        return val  # type: ignore[return-value]
+    if val is not None:
+        raise ValueError(f"{ENV_VAR}={val!r} must be one of 'auto'|'nccl'|'onesided'")
+    return None
 
 
 def _onesided_available(group: Group) -> bool:
@@ -99,19 +111,28 @@ def _onesided_available(group: Group) -> bool:
 
 
 def _resolve_backend(requested: DpSamplingBackend, group: Group) -> _ResolvedBackend:
+    env = _env_override()
+    requested_via_env = env is not None
+    if env is not None:
+        requested = env
+
     if requested == "nccl":
         return "nccl"
     if requested == "onesided":
         if not _onesided_available(group):
+            fallback_msg = (
+                f"Set {ENV_VAR}=nccl or unset {ENV_VAR} to use auto fallback."
+                if requested_via_env
+                else f"Set {ENV_VAR}=nccl or use backend='auto' to fall back."
+            )
             raise RuntimeError(
                 f"Batch-DP sampling backend='onesided' requested but the one-sided "
                 f"NVLink kernel is not available for group {group}. "
-                "Use backend='auto' to fall back."
+                f"{fallback_msg}"
             )
         return "onesided"
-    if requested == "auto":
-        return "onesided" if _onesided_available(group) else "nccl"
-    raise ValueError(f"backend={requested!r} must be one of 'auto'|'nccl'|'onesided'")
+
+    return "onesided" if _onesided_available(group) else "nccl"
 
 
 class DpSamplingComm:

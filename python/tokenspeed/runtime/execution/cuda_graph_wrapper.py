@@ -42,10 +42,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 from tokenspeed.runtime.layers.attention.backends.base import (
     init_backend_cuda_graph_state,
 )
-from tokenspeed.runtime.sampling.backends.base import (
-    CUDA_GRAPH_VARIANT_DEFAULT,
-    CUDA_GRAPH_VARIANT_GREEDY,
-)
+from tokenspeed.runtime.sampling.backends.base import CUDA_GRAPH_VARIANT_DEFAULT
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 from tokenspeed.runtime.utils import (
     get_available_gpu_memory,
@@ -418,8 +415,11 @@ class CudaGraphWrapper:
             # uniform dummy.
             ctx.global_bs = [bs] * self.world_size
 
-        # Greedy sampling is a separate graph variant. top_k=1 is not a strict
-        # substitute for argmax because sampler tie-breaking can differ.
+        # Capture with is_all_greedy=False so the graph records the full
+        # top_k_top_p_sampling path (greedy-only requests are served by the
+        # same path with top_k=1 in the buffer, which effectively argmaxes).
+        # is_all_greedy=True at capture would freeze the graph into
+        # argmax and bypass per-request seeding at replay.
         ibd = self.input_buffers
         sampling_info = SamplingBatchInfo(
             req_pool_indices=ibd.req_pool_indices_buf[:bs],
@@ -428,7 +428,7 @@ class CudaGraphWrapper:
                 if self.runtime_states is not None
                 else None
             ),
-            is_all_greedy=variant == CUDA_GRAPH_VARIANT_GREEDY,
+            is_all_greedy=False,
             vocab_size=self.vocab_size,
             device=self.device,
         )

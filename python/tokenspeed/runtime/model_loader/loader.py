@@ -209,11 +209,13 @@ class DefaultModelLoader(BaseModelLoader):
     def _maybe_download_from_modelscope(
         self, model: str, revision: str | None
     ) -> str | None:
-        """Download a model from ModelScope when explicitly configured.
+        """Download model from ModelScope hub if TOKENSPEED_USE_MODELSCOPE is True.
 
         Returns the path to the downloaded model, or None if the model is not
         downloaded from ModelScope."""
-        if self.load_config.use_modelscope:
+        from tokenspeed.runtime.utils.env import envs
+
+        if envs.TOKENSPEED_USE_MODELSCOPE.is_set():
             # download model from ModelScope hub,
             # lazy import so that modelscope is not required for normal use.
             from modelscope.hub.snapshot_download import snapshot_download

@@ -136,11 +136,10 @@ Input/output dtype behavior:
 
 Backend selection:
 
-- Default: CuTe DSL JIT (`backend="cutedsl"`).
-- Optional binary AOT: pass `backend="binary"` explicitly.
-- To use a particular binary, pass `binary_so_path="/path/to/fmha.so"`;
-  the path is only valid with the binary backend.
-- Availability probe API: `has_binary_prefill(path=None)`.
+- Default: CuTe DSL JIT (`TOKENSPEED_MLA_PREFILL_BACKEND=cutedsl`)
+- Optional: binary AOT (`TOKENSPEED_MLA_PREFILL_BACKEND=binary`)
+- Binary `.so` path override: `TOKENSPEED_MLA_FMHA_BINARY_SO`
+- Availability probe API: `has_binary_prefill()`
 
 
 
@@ -209,7 +208,5 @@ out, lse = tokenspeed_mla_prefill(
     cum_seq_lens_q=cum_seq_lens_q,  # optional, when Q/KV lengths differ
     max_seq_len_q=max_q_len,        # optional
     enable_pdl=False,
-    backend="cutedsl",              # default; use "binary" explicitly for AOT
-    # binary_so_path="/path/to/fmha.so",  # binary backend only
 )
 ```

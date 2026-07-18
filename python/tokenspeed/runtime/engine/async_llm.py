@@ -175,11 +175,7 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         # Store states
         self.no_create_loop = False
         self.rid_to_state: dict[str, ReqState] = {}
-        self._rl_control_server = None
-        self._rl_control_task: asyncio.Task | None = None
-        self._close_task: asyncio.Task[None] | None = None
-        self._closed = False
-        self._gracefully_exit = False
+        self.gracefully_exit = False
         self.last_receive_tstamp = 0
         self.dump_requests_folder = ""  # By default do not dump
         self.dump_requests_threshold = 1000
@@ -203,6 +199,7 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         # control plane is enabled. The in-engine HTTP app is launched lazily on
         # this object's event loop (see auto_create_handle_loop).
         self.weight_transfer_manager = None
+        self._rl_control_task = None
 
         # For session info
         self.session_futures = {}  # session_id -> asyncio event
@@ -701,26 +698,7 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         """
         self.rid_to_state.pop(rid, None)
 
-    @property
-    def gracefully_exit(self) -> bool:
-        return self._gracefully_exit
-
-    @gracefully_exit.setter
-    def gracefully_exit(self, value: bool) -> None:
-        self._gracefully_exit = value
-        if value and self._rl_control_server is not None:
-            # Keep older gRPC servicers safe as well: they set this public flag
-            # before unwinding their event loop.  Requesting Uvicorn shutdown
-            # synchronously prevents asyncio.run() from cancelling its lifespan.
-            self._rl_control_server.should_exit = True
-
-    def auto_create_handle_loop(self, manage_signals: bool = True):
-        """Start AsyncLLM background tasks on the current event loop.
-
-        ``manage_signals`` is disabled when an outer server owns process
-        signals and shutdown.  This avoids racing AsyncLLM's self-killing
-        watchdog against the gRPC server's drain/close sequence.
-        """
+    def auto_create_handle_loop(self):
         if self.no_create_loop:
             return
 
@@ -733,19 +711,18 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
 
         # We cannot add signal handler when the tokenizer manager is not in
         # the main thread due to the CPython limitation.
-        if manage_signals:
-            if threading.current_thread() is threading.main_thread():
-                signal_handler = SignalHandler(self)
-                loop.add_signal_handler(signal.SIGTERM, signal_handler.signal_handler)
-            else:
-                logger.warning(
-                    "Signal handler is not added because the tokenizer manager is "
-                    "not in the main thread. This disables graceful shutdown of the "
-                    "tokenizer manager when SIGTERM is received."
-                )
-            self.asyncio_tasks.add(
-                loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
+        if threading.current_thread() is threading.main_thread():
+            signal_handler = SignalHandler(self)
+            loop.add_signal_handler(signal.SIGTERM, signal_handler.signal_handler)
+        else:
+            logger.warning(
+                "Signal handler is not added because the tokenizer manager is "
+                "not in the main thread. This disables graceful shutdown of the "
+                "tokenizer manager when SIGTERM is received."
             )
+        self.asyncio_tasks.add(
+            loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
+        )
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.watch_load_thread))
         )
@@ -795,82 +772,9 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
                     app, host=self.server_args.host, port=port, log_level="warning"
                 )
             )
-            self._rl_control_server = server
-            if self.gracefully_exit:
-                server.should_exit = True
-            try:
-                await server.serve()
-            finally:
-                if self._rl_control_server is server:
-                    self._rl_control_server = None
+            await server.serve()
         except Exception as e:  # noqa: BLE001
             logger.error("RL control plane stopped: %s", e)
-
-    async def close(
-        self, timeout: float = 10.0, *, terminate_processes: bool = True
-    ) -> None:
-        """Stop background tasks, the RL HTTP server, and scheduler children.
-
-        The outer serving frontend calls this after it has stopped admitting
-        requests and drained in-flight work. The method is idempotent.
-
-        Args:
-            timeout: Seconds to wait for the RL HTTP server before cancellation.
-            terminate_processes: Kill and reap this engine process's owned
-                scheduler descendants. Tests that construct an AsyncLLM without
-                launching schedulers set this to ``False``.
-        """
-        if self._closed:
-            if terminate_processes:
-                kill_process_tree(os.getpid(), include_parent=False)
-            return
-
-        close_task = self._close_task
-        if close_task is None:
-            close_task = asyncio.create_task(
-                self._close_impl(timeout, terminate_processes=terminate_processes)
-            )
-            self._close_task = close_task
-
-        try:
-            await asyncio.shield(close_task)
-        except asyncio.CancelledError:
-            if close_task.cancelled():
-                raise
-            # Preserve caller cancellation semantics, but never strand the
-            # schedulers or background tasks because the outer server cancelled
-            # its shutdown coroutine.
-            await asyncio.shield(close_task)
-            raise
-
-    async def _close_impl(self, timeout: float, *, terminate_processes: bool) -> None:
-        self.gracefully_exit = True
-        try:
-            rl_task = self._rl_control_task
-            if rl_task is not None and rl_task is not asyncio.current_task():
-                done, _ = await asyncio.wait({rl_task}, timeout=timeout)
-                if not done:
-                    logger.warning(
-                        "RL control plane did not stop within %.1fs; cancelling",
-                        timeout,
-                    )
-                    rl_task.cancel()
-                await asyncio.gather(rl_task, return_exceptions=True)
-        finally:
-            self._rl_control_task = None
-
-            current_task = asyncio.current_task()
-            tasks = [task for task in self.asyncio_tasks if task is not current_task]
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
-            self.asyncio_tasks.clear()
-
-            if terminate_processes:
-                kill_process_tree(os.getpid(), include_parent=False)
-            self._closed = True
 
     async def sigterm_watchdog(self):
         while not self.gracefully_exit:

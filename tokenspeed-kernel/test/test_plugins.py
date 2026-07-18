@@ -29,6 +29,7 @@ import torch
 from tokenspeed_kernel import plugins as plugins_mod
 from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.plugins import (
+    DISABLE_ENV_VAR,
     PluginInfo,
     disable_plugin,
     discover_plugins,
@@ -346,7 +347,8 @@ class TestDisable:
         assert KernelRegistry.get().get_by_name("a_kernel") is None
         assert KernelRegistry.get().get_by_name("b_kernel") is not None
 
-    def test_disable_multiple_via_api(self, fresh_plugins, patch_entry_points):
+    def test_disable_via_env(self, fresh_plugins, patch_entry_points, monkeypatch):
+        monkeypatch.setenv(DISABLE_ENV_VAR, "a, c")  # whitespace, multi
         patch_entry_points(
             [
                 _FakeEntryPoint("a", _make_register("a_kernel")),
@@ -354,8 +356,6 @@ class TestDisable:
                 _FakeEntryPoint("c", _make_register("c_kernel")),
             ]
         )
-        disable_plugin("a")
-        disable_plugin("c")
         loaded = discover_plugins()
         assert {info.name for info in loaded} == {"b"}
 

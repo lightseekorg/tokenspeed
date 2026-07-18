@@ -24,6 +24,7 @@
 #include <cassert>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -284,7 +285,7 @@ InsertResult KVPrefixCache::Insert(const token_vec_t& token_ids, const std::vect
         }
 
         if constexpr (RType == ResourceType::Device) {
-            if (spdlog::should_log(spdlog::level::debug)) {
+            if (std::getenv("DEBUG_MEM")) {
                 auto inserted_pages = SliceInts(page_ids, remaining_pages, node_num_pages);
                 spdlog::debug("[InsertDevice] node inserted pages: [{}]", fmt::join(inserted_pages, ", "));
             }

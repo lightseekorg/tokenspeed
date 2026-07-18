@@ -40,11 +40,12 @@ from collections import OrderedDict, defaultdict
 from typing import Any
 
 from tokenspeed.runtime.engine.io_struct import BatchTokenIDOut
+from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.text import find_printable_text
 
 # Maximum number of request states that the detokenizer can hold.
 # When exceeded, the oldest entries are evicted. Default: 65536 (1<<16).
-DETOKENIZER_MAX_STATES = 1 << 16
+DETOKENIZER_MAX_STATES = envs.TOKENSPEED_DETOKENIZER_MAX_STATES.get()
 
 
 @dataclasses.dataclass
@@ -218,12 +219,12 @@ def incremental_decode_batch(
         try:
             s = decode_status[recv_obj.rids[i]]
         except KeyError:
-            capacity = getattr(decode_status, "capacity", DETOKENIZER_MAX_STATES)
             raise RuntimeError(
                 f"Decode status not found for request {recv_obj.rids[i]}. "
                 "It may be due to the request being evicted from the decode status due to memory pressure. "
-                "Please increase the explicit LimitedCapacityDict capacity in the caller. "
-                f"The current value is {capacity}."
+                "Please increase the maximum number of requests by setting "
+                "the TOKENSPEED_DETOKENIZER_MAX_STATES environment variable to a bigger value than the default value. "
+                f"The current value is {DETOKENIZER_MAX_STATES}."
             )
         new_text = read_texts[i][len(surr_texts[i]) :]
         if recv_obj.finished_reasons[i] is None:

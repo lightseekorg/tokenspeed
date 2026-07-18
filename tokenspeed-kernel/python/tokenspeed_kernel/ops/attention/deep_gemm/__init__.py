@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import torch
 from tokenspeed_kernel.ops.attention.cuda.dsa_topk import (
     has_ragged_decode_topk,
@@ -27,10 +29,14 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 platform = current_platform()
 _PERSISTENT_TOPK_WORKSPACE_BYTES = 1024 * 1024
 
+# Default the DSA decode top-k to the CuTe DSL cluster kernel; set
+# ``TS_DSA_DECODE_TOPK_CUTEDSL=0`` to fall back to the ragged/persistent path.
+_CUTE_DSL_DECODE_TOPK_ENABLED = os.environ.get("TS_DSA_DECODE_TOPK_CUTEDSL", "1") == "1"
+
 
 def _use_cute_dsl_decode_topk() -> bool:
-    """Prefer the CuTe DSL cluster kernel whenever it is available."""
-    return has_cute_dsl_decode_topk()
+    """Whether the DSA decode top-k should use the CuTe DSL cluster kernel."""
+    return _CUTE_DSL_DECODE_TOPK_ENABLED and has_cute_dsl_decode_topk()
 
 
 def _check_out(

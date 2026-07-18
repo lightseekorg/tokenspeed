@@ -23,10 +23,8 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 register_cuda_ci(est_time=20, suite="runtime-1gpu")
 
 import asyncio  # noqa: E402
-import socket  # noqa: E402
 import types  # noqa: E402
 from typing import Any, Dict  # noqa: E402
-from unittest.mock import patch  # noqa: E402
 
 from tokenspeed.runtime.engine.async_llm import AsyncLLM  # noqa: E402
 from tokenspeed.runtime.engine.collector import RequestOutputCollector  # noqa: E402
@@ -172,137 +170,6 @@ class TestWaitOneResponseCancellation(unittest.IsolatedAsyncioTestCase):
             0,
             "normal finish should not schedule an AbortReq",
         )
-
-
-class TestAsyncLLMClose(unittest.IsolatedAsyncioTestCase):
-    async def test_close_terminates_owned_scheduler_processes(self) -> None:
-        mgr = AsyncLLM.__new__(AsyncLLM)
-        mgr._closed = False
-        mgr._gracefully_exit = False
-        mgr._rl_control_server = None
-        mgr._rl_control_task = None
-        mgr._close_task = None
-        mgr.asyncio_tasks = set()
-
-        with patch(
-            "tokenspeed.runtime.engine.async_llm.kill_process_tree"
-        ) as kill_tree:
-            await mgr.close(timeout=1.0)
-
-        kill_tree.assert_called_once_with(os.getpid(), include_parent=False)
-
-    async def test_close_stops_rl_server_and_cancels_owned_tasks(self) -> None:
-        mgr = AsyncLLM.__new__(AsyncLLM)
-        mgr._closed = False
-        mgr._gracefully_exit = False
-        server = types.SimpleNamespace(should_exit=False)
-        mgr._rl_control_server = server
-        mgr._close_task = None
-
-        async def run_rl_server() -> None:
-            while not server.should_exit:
-                await asyncio.sleep(0)
-
-        async def run_background() -> None:
-            await asyncio.Event().wait()
-
-        rl_task = asyncio.create_task(run_rl_server())
-        background_task = asyncio.create_task(run_background())
-        mgr._rl_control_task = rl_task
-        mgr.asyncio_tasks = {background_task}
-
-        await mgr.close(timeout=1.0, terminate_processes=False)
-
-        self.assertTrue(server.should_exit)
-        self.assertTrue(rl_task.done())
-        self.assertTrue(background_task.cancelled())
-        self.assertEqual(mgr.asyncio_tasks, set())
-        self.assertIsNone(mgr._rl_control_task)
-
-        # Idempotent: a second close is a no-op rather than re-cancelling tasks.
-        await mgr.close(timeout=1.0, terminate_processes=False)
-
-    async def test_close_absorbs_already_cancelled_rl_task(self) -> None:
-        mgr = AsyncLLM.__new__(AsyncLLM)
-        mgr._closed = False
-        mgr._gracefully_exit = False
-        mgr._rl_control_server = None
-        mgr._close_task = None
-
-        async def wait_forever() -> None:
-            await asyncio.Event().wait()
-
-        rl_task = asyncio.create_task(wait_forever())
-        rl_task.cancel()
-        await asyncio.gather(rl_task, return_exceptions=True)
-        background_task = asyncio.create_task(wait_forever())
-        mgr._rl_control_task = rl_task
-        mgr.asyncio_tasks = {background_task}
-
-        await mgr.close(timeout=1.0, terminate_processes=False)
-
-        self.assertTrue(mgr._closed)
-        self.assertIsNone(mgr._rl_control_task)
-        self.assertTrue(background_task.cancelled())
-        self.assertEqual(mgr.asyncio_tasks, set())
-
-    async def test_close_finishes_cleanup_before_propagating_caller_cancel(
-        self,
-    ) -> None:
-        mgr = AsyncLLM.__new__(AsyncLLM)
-        mgr._closed = False
-        mgr._gracefully_exit = False
-        mgr._rl_control_server = None
-        mgr._close_task = None
-
-        async def wait_forever() -> None:
-            await asyncio.Event().wait()
-
-        rl_task = asyncio.create_task(wait_forever())
-        background_task = asyncio.create_task(wait_forever())
-        mgr._rl_control_task = rl_task
-        mgr.asyncio_tasks = {background_task}
-
-        close_task = asyncio.create_task(
-            mgr.close(timeout=0.01, terminate_processes=False)
-        )
-        await asyncio.sleep(0)
-        close_task.cancel()
-        with self.assertRaises(asyncio.CancelledError):
-            await close_task
-
-        self.assertTrue(mgr._closed)
-        self.assertTrue(rl_task.cancelled())
-        self.assertTrue(background_task.cancelled())
-        self.assertIsNone(mgr._rl_control_task)
-        self.assertEqual(mgr.asyncio_tasks, set())
-
-    async def test_close_gracefully_stops_real_rl_uvicorn(self) -> None:
-        with socket.socket() as sock:
-            sock.bind(("127.0.0.1", 0))
-            port = sock.getsockname()[1]
-
-        mgr = AsyncLLM.__new__(AsyncLLM)
-        mgr._closed = False
-        mgr._gracefully_exit = False
-        mgr._rl_control_server = None
-        mgr._close_task = None
-        mgr.asyncio_tasks = set()
-        mgr.server_args = types.SimpleNamespace(host="127.0.0.1")
-
-        task = asyncio.create_task(mgr._serve_rl_control_plane(object(), port))
-        mgr._rl_control_task = task
-        deadline = asyncio.get_running_loop().time() + 5.0
-        while mgr._rl_control_server is None or not mgr._rl_control_server.started:
-            self.assertLess(asyncio.get_running_loop().time(), deadline)
-            await asyncio.sleep(0.01)
-
-        await mgr.close(timeout=5.0, terminate_processes=False)
-
-        self.assertTrue(task.done())
-        self.assertIsNone(mgr._rl_control_server)
-        with socket.socket() as probe:
-            self.assertNotEqual(probe.connect_ex(("127.0.0.1", port)), 0)
 
 
 if __name__ == "__main__":

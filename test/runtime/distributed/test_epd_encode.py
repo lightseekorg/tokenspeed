@@ -29,6 +29,7 @@ import threading
 import pytest
 import torch
 
+import tokenspeed.runtime.pd.epd.encode_loop as encode_loop
 from tokenspeed.runtime.cache.embedding_cache import (
     EmbeddingCache,
     TieredEmbeddingCache,
@@ -79,9 +80,6 @@ class _FakeExecutor:
 
     def has_deferred(self):
         return False
-
-    def reap_concluded_senders(self, active_request_ids):
-        del active_request_ids
 
 
 def _item(h, tokens=2):
@@ -176,9 +174,6 @@ class _RaisingExecutor:
 
     def has_deferred(self):
         return False
-
-    def reap_concluded_senders(self, active_request_ids):
-        del active_request_ids
 
     def fail_rooms(self, request_ids, exc):
         rooms = set()
@@ -481,16 +476,18 @@ def test_scheduler_rejects_bad_budgets():
 # --------------------------------------------------------------------------- #
 # _embedding_cache_bytes
 # --------------------------------------------------------------------------- #
-def test_cache_mebibytes_convert_to_bytes():
-    assert _embedding_cache_bytes(8, "--epd-encode-embedding-cache-mb") == (
-        8 * 1024 * 1024
-    )
+def test_bytes_override(monkeypatch):
+    env_field = encode_loop.envs.TOKENSPEED_EPD_ENCODE_EMBED_CACHE_MB
+    monkeypatch.setenv(env_field.name, "8")
+    assert _embedding_cache_bytes(env_field) == 8 * 1024 * 1024
 
 
-def test_negative_cache_mebibytes_raise_with_option_name():
+def test_bytes_negative_raises_with_env_name(monkeypatch):
+    env_field = encode_loop.envs.TOKENSPEED_EPD_ENCODE_EMBED_CACHE_MB
+    monkeypatch.setenv(env_field.name, "-5")
     with pytest.raises(ValueError) as exc:
-        _embedding_cache_bytes(-5, "--epd-encode-embedding-cache-mb")
-    assert "--epd-encode-embedding-cache-mb" in str(exc.value)
+        _embedding_cache_bytes(env_field)
+    assert env_field.name in str(exc.value)
 
 
 # --------------------------------------------------------------------------- #
@@ -508,12 +505,7 @@ def test_make_cache_l2_enabled_is_tiered_with_caps_and_device():
 # _maybe_install_encoder_cudagraph (gate parity with the aggregated ModelExecutor
 # install; the actual capture is GPU-only and validated at e2e)
 # --------------------------------------------------------------------------- #
-class _FakeWrapper:
-    def __init__(self):
-        self.capture_count = 0
-
-    def capture(self):
-        self.capture_count += 1
+_WRAPPER = object()  # stands in for the EncoderCudaGraphWrapper
 
 
 class _FakeModel:
@@ -526,48 +518,31 @@ class _FakeModel:
         # wrapper install overrides it.
         self.image_encoder = self.get_image_feature
         self.built_with = None
-        self.wrapper = _FakeWrapper()
 
     def get_image_feature(self, items):
         return "eager"
 
-    def make_encoder_cudagraph_wrappers(
-        self, mapping, *, max_metadata_sequences_per_batch=None
-    ):
-        self.built_with = (mapping, max_metadata_sequences_per_batch)
-        return {"image_encoder": self.wrapper}
+    def make_encoder_cudagraph_wrapper(self, mapping):
+        self.built_with = mapping
+        return _WRAPPER
 
 
 class _FakeServerArgs:
-    def __init__(self, *, enabled=True, backend="trtllm_ragged", max_sequences=7):
-        self.enable_mm_encoder_cuda_graph = enabled
+    def __init__(self, backend="trtllm_ragged"):
         self.mm_attention_backend = backend
-        self.mm_encoder_cudagraph_max_metadata_sequences_per_batch = max_sequences
 
 
-def test_encoder_cudagraph_installed_when_enabled():
+def _set_graph_flag(monkeypatch, value):
+    monkeypatch.setattr(
+        encode_loop.envs.TOKENSPEED_MM_ENABLE_ENCODER_CUDA_GRAPH,
+        "get",
+        lambda: value,
+    )
+
+
+def test_encoder_cudagraph_installed_when_enabled(monkeypatch):
+    _set_graph_flag(monkeypatch, True)
     m = _FakeModel()
     assert _maybe_install_encoder_cudagraph(m, _FakeServerArgs()) is True
-    assert m.image_encoder is m.wrapper
-    assert m.built_with == (m.mapping, 7)
-    assert m.wrapper.capture_count == 1
-
-
-def test_encoder_cudagraph_disabled_keeps_eager_encoder():
-    m = _FakeModel()
-    eager = m.image_encoder
-    assert _maybe_install_encoder_cudagraph(m, _FakeServerArgs(enabled=False)) is False
-    assert m.image_encoder == eager
-    assert m.built_with is None
-
-
-def test_encoder_cudagraph_rejects_incompatible_backend():
-    with pytest.raises(ValueError, match="flashinfer_cudnn"):
-        _maybe_install_encoder_cudagraph(
-            _FakeModel(), _FakeServerArgs(backend="flashinfer_cudnn")
-        )
-
-
-def test_encoder_cudagraph_rejects_nonpositive_metadata_sequence_limit():
-    with pytest.raises(ValueError, match="must be positive"):
-        _maybe_install_encoder_cudagraph(_FakeModel(), _FakeServerArgs(max_sequences=0))
+    assert m.image_encoder is _WRAPPER
+    assert m.built_with is m.mapping

@@ -33,6 +33,7 @@ import torch
 
 from tokenspeed.runtime.multimodal.hash import hash_feature
 from tokenspeed.runtime.multimodal.shm_transport import ShmTensorHandle
+from tokenspeed.runtime.utils.env import envs
 
 # Multimodal pad-value substitute IDs: a placeholder mm token's id is rewritten
 # to a content-derived value so duplicate features share the same substitute and
@@ -178,7 +179,7 @@ class MultimodalDataItem:
             return self.__dict__["model_specific_data"][name]
         raise AttributeError(f"'{self.__class__.__name__}' has no attribute '{name}'")
 
-    def ensure_hash(self, *, skip_compute_hash: bool = False) -> None:
+    def ensure_hash(self):
         """Resolve ``self.hash`` to a concrete content id, lazily.
 
         The hash is resolved on demand rather than at construction because it
@@ -187,7 +188,7 @@ class MultimodalDataItem:
         only worth doing once the value is actually needed.
 
         Resolution order:
-          * ``skip_compute_hash=True`` -> a random id (dedup disabled);
+          * ``TOKENSPEED_MM_SKIP_COMPUTE_HASH`` -> a random id (dedup disabled);
           * an already-set hash (e.g. the gateway-provided ``content_hash`` for
             image/video) is kept as-is, no recompute;
           * inline features the gateway does not hash (e.g. audio) are hashed
@@ -195,7 +196,7 @@ class MultimodalDataItem:
           * SHM-backed features must carry a caller-provided hash, else raise --
             we cannot hash a handle without reading shared memory.
         """
-        if skip_compute_hash:
+        if envs.TOKENSPEED_MM_SKIP_COMPUTE_HASH.get():
             self.hash = uuid.uuid4().int
         elif self.hash is None:
             if isinstance(self.feature, ShmTensorHandle):
@@ -207,10 +208,10 @@ class MultimodalDataItem:
         if self.hash is None:
             raise RuntimeError("Failed to resolve multimodal item hash.")
 
-    def set_pad_value(self, *, skip_compute_hash: bool = False) -> None:
+    def set_pad_value(self):
         if self.pad_value is not None:
             return
-        self.ensure_hash(skip_compute_hash=skip_compute_hash)
+        self.ensure_hash()
         modality_offset = _modality_pad_tag(self.modality) * _MM_PAD_HASH_SLOTS
         self.pad_value = (
             _MM_PAD_BASE + modality_offset + (self.hash % _MM_PAD_HASH_SLOTS)
@@ -230,9 +231,9 @@ class MultimodalInputs:
     mrope_position_delta_scalar: int | None = None
     mrope_position_delta_repeated_cache: torch.Tensor | None = None
 
-    def ensure_pad_values(self, *, skip_compute_hash: bool = False) -> None:
+    def ensure_pad_values(self) -> None:
         for item in self.mm_items:
-            item.set_pad_value(skip_compute_hash=skip_compute_hash)
+            item.set_pad_value()
 
     def publish_shm_features(self) -> None:
         for item in self.mm_items:
@@ -247,10 +248,10 @@ class MultimodalInputs:
             if isinstance(item.feature, ShmTensorHandle):
                 item.feature.attach()
 
-    def release_shm_features(self, *, log_timing: bool = False) -> None:
+    def release_shm_features(self) -> None:
         for item in self.mm_items:
             if isinstance(item.feature, ShmTensorHandle):
-                item.feature.release(log_timing=log_timing)
+                item.feature.release()
                 item.feature = None
 
     def has_pending_shm_features(self) -> bool:

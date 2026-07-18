@@ -836,12 +836,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
         proj_out = mm_projection_auto(self.mm_projector, merged)
         return torch.cat(proj_out, dim=0)
 
-    def make_encoder_cudagraph_wrappers(
-        self,
-        mapping,
-        *,
-        max_metadata_sequences_per_batch: int | None = None,
-    ):
+    def make_encoder_cudagraph_wrappers(self, mapping):
         # Captured region is ``MoonViT3dEncoder.forward_blocks`` (token-preserving
         # block loop); spatial/temporal merge lives in ``post_encode``, so
         # budgets are encoder-input patch counts (``out_div=1``). ``forward_blocks``
@@ -862,7 +857,6 @@ class KimiK25ForConditionalGeneration(nn.Module):
                     capture_tp_group=mapping.vision.tp_group,
                 ),
                 budget_range=(256, 16384),
-                max_metadata_sequences_per_batch=max_metadata_sequences_per_batch,
             )
         }
 

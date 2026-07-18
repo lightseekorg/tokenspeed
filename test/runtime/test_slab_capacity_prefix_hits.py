@@ -230,6 +230,11 @@ class TestSlabCapacityPrefixHits(unittest.TestCase):
                 "requires a flat-built (TOKENSPEED_FLAT_KVCACHE) "
                 "tokenspeed_scheduler ext; radix builds have no slab layout"
             )
+        if os.environ.get("TOKENSPEED_CI_SMALL_KV_SIZE"):
+            self.skipTest(
+                "TOKENSPEED_CI_SMALL_KV_SIZE pins the token pool for both "
+                "layouts, erasing the capacity contrast under test"
+            )
 
     def test_slab_layout_doubles_capacity_and_prefix_hits(self):
         # --- Arm 1: natural slab layout ---

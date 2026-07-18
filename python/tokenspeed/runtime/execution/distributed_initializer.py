@@ -21,6 +21,7 @@
 from dataclasses import dataclass
 
 import torch
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -82,7 +83,6 @@ class DistributedConfig:
     # Feature flags
     disable_custom_all_reduce: bool = False
     force_deterministic_rsag: bool = False
-    enable_numa_aware_worker_affinity: bool = True
 
     # The full Mapping object for pg_manager initialization
     mapping: object = None
@@ -123,9 +123,6 @@ class DistributedConfig:
             max_num_tokens=max_num_tokens,
             disable_custom_all_reduce=server_args.disable_custom_all_reduce,
             force_deterministic_rsag=server_args.force_deterministic_rsag,
-            enable_numa_aware_worker_affinity=(
-                server_args.enable_numa_aware_worker_affinity
-            ),
             mapping=mapping,
         )
 
@@ -139,10 +136,7 @@ class DistributedInitializer:
             get_available_gpu_memory(config.device, config.gpu_id),
         )
         if config.device == "cuda":
-            maybe_set_numa_aware_cpu_affinity(
-                config.gpu_id,
-                enabled=config.enable_numa_aware_worker_affinity,
-            )
+            maybe_set_numa_aware_cpu_affinity(config.gpu_id)
 
         # Determine backend
         if config.device == "cuda":
@@ -156,10 +150,12 @@ class DistributedInitializer:
         else:
             dist_init_method = f"tcp://127.0.0.1:{config.nccl_port}"
 
-        # Bind NCCL's root and child process groups to this rank's physical GPU.
-        # Without this, NCCL may infer a device from the global rank and create
-        # contexts on unrelated GPUs when base_gpu_id is non-zero.
-        device_id = torch.device(config.device, config.gpu_id)
+        # Device-scoped NCCL init is only required and tested on AMD.
+        device_id = (
+            torch.device(config.device, config.gpu_id)
+            if current_platform().is_amd
+            else None
+        )
 
         # Initialize distributed via the mapping-based process group manager
         pg_manager.init_distributed(

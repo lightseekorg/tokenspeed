@@ -22,14 +22,6 @@
 
 namespace tokenspeed::test {
 
-TEST(SchedulerConfigTest, MemoryDebugChecksAreExplicitAndOffByDefault) {
-    SchedulerConfig config;
-    EXPECT_FALSE(config.enable_memory_debug_checks);
-
-    config.enable_memory_debug_checks = true;
-    EXPECT_TRUE(config.enable_memory_debug_checks);
-}
-
 class BasicLifecycleTestSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
