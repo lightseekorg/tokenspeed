@@ -22,12 +22,11 @@
 
 Both profilers can run in the same scheduler process (``/start_profile``
 with ``{"activities": ["VIZTRACER", "PROTON"]}``) but write separate files
-with timestamps relative to their own start. Each file records enough clock
-metadata to place its events on the VizTracer monotonic time axis —
-``viztracer_metadata.baseTimeNanoseconds`` in VizTracer reports and
-top-level ``baseTimeNanoseconds`` in Proton chrome traces. Proton ROCm
-activity traces use a monotonic GPU-clock anchor while their CPU scope events
-retain an absolute clock; the merger handles both timestamp forms.
+with timestamps relative to their own start. Each file also records the
+absolute wall-clock time its ``ts=0`` refers to — ``viztracer_metadata.
+baseTimeNanoseconds`` in VizTracer reports, top-level
+``baseTimeNanoseconds`` in Proton chrome traces — so the two timelines can
+be shifted onto a shared axis after the fact.
 
 On AMD, launch the server with ``ROCR_VISIBLE_DEVICES`` rather than
 ``HIP_VISIBLE_DEVICES`` when using Proton. If the host cannot attach a ROCm
@@ -68,32 +67,6 @@ def _load_json(path: str | Path, kind: str) -> dict[str, Any]:
         raise ValueError(f"{kind} file {path} is not valid JSON: {exc}") from exc
 
 
-def _proton_timestamp_offset_us(
-    proton_base_ns: int | float,
-    viztracer_base_ns: int | float,
-    timestamp_us: int | float,
-) -> float:
-    """Return the shift that puts one Proton event on the VizTracer axis.
-
-    Most Proton writers use an absolute clock anchor and relative event
-    timestamps. ROCm activity traces instead use a monotonic GPU-clock anchor
-    for kernel/flow timestamps while CPU scope timestamps retain the absolute
-    clock. The latter anchor is far smaller than the VizTracer wall-to-monotonic
-    conversion offset, which lets us distinguish the formats without relying
-    on a backend-specific marker in the JSON.
-    """
-    if proton_base_ns >= viztracer_base_ns / 2:
-        return (proton_base_ns - viztracer_base_ns) / 1000.0
-
-    proton_base_us = proton_base_ns / 1000.0
-    viztracer_base_us = viztracer_base_ns / 1000.0
-    if timestamp_us >= viztracer_base_us / 2:
-        # CPU scope timestamp on the absolute clock.
-        return proton_base_us - viztracer_base_us
-    # GPU activity or flow timestamp relative to the monotonic anchor.
-    return proton_base_us
-
-
 def merge_proton_viztracer(
     viztracer_path: str | Path,
     proton_path: str | Path,
@@ -101,9 +74,10 @@ def merge_proton_viztracer(
 ) -> int:
     """Merge a Proton chrome trace into a VizTracer report.
 
-    Converts Proton relative and absolute timestamp forms onto the VizTracer
-    monotonic axis and appends them to the report ``traceEvents``, producing
-    one chrome-trace JSON on a shared time axis.
+    Shifts every Proton event by the difference between the two files'
+    ``baseTimeNanoseconds`` anchors and appends them to the VizTracer
+    report's ``traceEvents``, producing one chrome-trace JSON on a shared
+    time axis.
 
     Args:
         viztracer_path: VizTracer report (``.json``) saved with a viztracer
@@ -140,6 +114,8 @@ def merge_proton_viztracer(
             "tokenspeed-triton and re-record."
         )
 
+    offset_us = (proton_base_ns - viztracer_base_ns) / 1000.0
+
     proton_events = proton_json.get("traceEvents", [])
     for event in proton_events:
         if event.get("ph") == "M":
@@ -152,9 +128,7 @@ def merge_proton_viztracer(
             ):
                 event["args"]["name"] = _PROTON_PROCESS_NAME
         elif "ts" in event:
-            event["ts"] += _proton_timestamp_offset_us(
-                proton_base_ns, viztracer_base_ns, event["ts"]
-            )
+            event["ts"] += offset_us
 
     viztracer_json.setdefault("traceEvents", []).extend(proton_events)
 
