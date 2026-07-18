@@ -25,7 +25,6 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 import torch
-from torch import nn
 
 from tokenspeed.runtime.configs.qwen3_moe_config import Qwen3MoeConfig
 from tokenspeed.runtime.distributed.comm_manager import CommManager

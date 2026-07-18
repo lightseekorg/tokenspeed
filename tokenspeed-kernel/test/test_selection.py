@@ -402,6 +402,17 @@ class TestSpecMatchesShapeTraits:
 
         assert spec_matches_shape_traits(spec, {})
 
+    def test_required_k64_alignment_trait_matches(self):
+        spec = KernelSpec(
+            name="k",
+            family="f",
+            mode="m",
+            traits={"k_align_64": frozenset({True})},
+        )
+
+        assert spec_matches_shape_traits(spec, {"K": 128})
+        assert not spec_matches_shape_traits(spec, {"K": 96})
+
     def test_non_alignment_traits_do_not_affect_shape_matching(self):
         spec = KernelSpec(
             name="k",
@@ -1343,6 +1354,7 @@ class TestGemmDispatchProfiling:
             *,
             alpha: torch.Tensor | None = None,
             block_size: list[int] | None = None,
+            out: torch.Tensor | None = None,
         ) -> torch.Tensor:
             _ = A_scales, B_scales, alpha, block_size
             call_log.append(name)
@@ -1417,6 +1429,7 @@ class TestGemmDispatchProfiling:
                     "M": 4,
                     "N": 6,
                     "K": 8,
+                    "has_out": False,
                 },
             )
         ]
@@ -1454,6 +1467,7 @@ class TestGemmDispatchProfiling:
                     "M": 4,
                     "N": 6,
                     "K": 8,
+                    "has_out": False,
                 },
             )
         ]

@@ -22,7 +22,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Optional
 
 from tokenspeed.runtime.models.base.placement import Placement
 
@@ -49,8 +48,8 @@ class FusionCapability(Enum):
 
 @dataclass(frozen=True, slots=True)
 class ModuleSpec:
-    input_placement: Optional[Placement] = None
-    output_placement: Optional[Placement] = None
+    input_placement: Placement | None = None
+    output_placement: Placement | None = None
     kind: ModuleKind = ModuleKind.GENERIC
     call: CallConvention = CallConvention.HIDDEN_STATES_ONLY
     fusion: FusionCapability = FusionCapability.NONE
@@ -61,8 +60,8 @@ class ModuleSpec:
     def from_kind(
         cls,
         *,
-        input_placement: Optional[Placement] = None,
-        output_placement: Optional[Placement] = None,
+        input_placement: Placement | None = None,
+        output_placement: Placement | None = None,
         kind: ModuleKind = ModuleKind.GENERIC,
         supports_fused_reduce_norm: bool = False,
         captures_aux: bool = False,

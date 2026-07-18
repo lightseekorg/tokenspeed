@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT AND Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 LightSeek Foundation
+# SPDX-FileCopyrightText: Copyright 2023-2024 SGLang Team
+#
 # Copyright (c) 2026 LightSeek Foundation
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -24,8 +28,8 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Iterable, Sequence
 from copy import deepcopy
-from typing import Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -105,11 +109,12 @@ class MLP2(nn.Module):
         dims: list[int],
         activation,
         bias: bool = True,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ):
         super().__init__()
-        assert len(dims) == 3
+        if len(dims) != 3:
+            raise ValueError(f"dims must have length 3, got {len(dims)}.")
 
         self.quant_config = quant_config
         if isinstance(self.quant_config, ModelSlimConfig):
@@ -211,7 +216,7 @@ class MoonViTEncoderLayer(nn.Module):
         *,
         activation=F.gelu,
         attn_bias: bool = False,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         mm_attention_backend: str | None = None,
     ):
@@ -249,10 +254,10 @@ class MoonViTEncoderLayer(nn.Module):
         max_seqlen: int,
         rope_freqs_cis: torch.Tensor | None = None,
     ):
-        assert isinstance(max_seqlen, int), (
-            f"max_seqlen must be a Python int for capture-safety, "
-            f"got {type(max_seqlen)}"
-        )
+        if not isinstance(max_seqlen, int):
+            raise TypeError(
+                f"max_seqlen must be a Python int for capture-safety, got {type(max_seqlen)}"
+            )
         residual = hidden_states
         hidden_states = self.norm0(hidden_states)
 
@@ -294,7 +299,8 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     pos: a list of positions to be encoded: size (M,)
     out: (M, D)
     """
-    assert embed_dim % 2 == 0
+    if embed_dim % 2 != 0:
+        raise ValueError(f"embed_dim must be even, got {embed_dim}.")
     omega = np.arange(embed_dim // 2, dtype=np.float32)
     omega /= embed_dim / 2.0
     omega = 1.0 / 10000**omega  # (D/2,)
@@ -370,7 +376,8 @@ class Learnable2DInterpPosEmbDivided_fixed(nn.Module):
     def forward(self, x: torch.Tensor, grid_thws: torch.Tensor) -> torch.Tensor:
         pos_embs = []
         for t, h, w in grid_thws.tolist():
-            assert t <= self.num_frames, f"t:{t} > self.num_frames:{self.num_frames}"
+            if t > self.num_frames:
+                raise ValueError(f"t:{t} > self.num_frames:{self.num_frames}")
             if (h, w) == self.weight.shape[:-1]:
                 pos_emb_2d = self.weight.flatten(end_dim=1)
             else:
@@ -419,7 +426,8 @@ class Rope2DPosEmbRepeated(nn.Module):
     def __init__(self, dim: int, max_height: int, max_width: int, theta_base=10000):
         super().__init__()
         self.dim = dim
-        assert self.dim % 4 == 0, "dim must be divisible by 4"
+        if self.dim % 4 != 0:
+            raise ValueError("dim must be divisible by 4")
         self.max_height = max_height
         self.max_width = max_width
         self.theta_base = theta_base
@@ -469,13 +477,13 @@ class Rope2DPosEmbRepeated(nn.Module):
             )
 
         shapes = grid_thws.tolist()
-        assert all(
+        if not all(
             1 <= h <= self.max_height and 1 <= w <= self.max_width for t, h, w in shapes
-        ), (
-            shapes,
-            self.max_height,
-            self.max_width,
-        )
+        ):
+            raise ValueError(
+                f"grid shape out of range: {shapes}, max_height={self.max_height}, "
+                f"max_width={self.max_width}"
+            )
         freqs_cis = torch.cat(
             [
                 self.freqs_cis[:h, :w].reshape(-1, self.dim // 2).repeat(t, 1)
@@ -499,14 +507,14 @@ class MoonVision3dPatchEmbed(nn.Module):
         pos_emb_type: str = "divided_fixed",
     ):
         super().__init__()
-        assert isinstance(
-            patch_size, int | Sequence
-        ), f"Invalid patch_size type: {type(patch_size)}"
+        if not isinstance(patch_size, int | Sequence):
+            raise TypeError(f"Invalid patch_size type: {type(patch_size)}")
         if isinstance(patch_size, int):
             patch_size = (patch_size, patch_size)
-        assert (
-            len(patch_size) == 2
-        ), f"Expected patch_size to be a tuple of 2, got {patch_size}"
+        if len(patch_size) != 2:
+            raise ValueError(
+                f"Expected patch_size to be a tuple of 2, got {patch_size}"
+            )
         self.patch_size = patch_size
 
         self.proj = Conv2dLayer(
@@ -545,14 +553,15 @@ class MoonViT3dEncoder(nn.Module):
         num_layers: int,
         block_cfg: dict,
         video_attn_type: str = "spatial_temporal",
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
 
-        assert (
-            video_attn_type == "spatial_temporal"
-        ), f'video_attn_type must be "spatial_temporal", got {video_attn_type}'
+        if video_attn_type != "spatial_temporal":
+            raise ValueError(
+                f'video_attn_type must be "spatial_temporal", got {video_attn_type}'
+            )
         self.video_attn_type = video_attn_type
         self.rope_2d = Rope2DPosEmbRepeated(
             block_cfg["hidden_dim"] // block_cfg["num_heads"], 512, 512
@@ -627,7 +636,7 @@ class MoonViT3dPretrainedModel(nn.Module):
         config,
         mapping: Mapping,
         *inputs,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         mm_attention_backend: str | None = None,
         **kwargs,
@@ -730,7 +739,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
         self,
         config: KimiK25Config,
         mapping: Mapping,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         is_multimodal_active: bool = True,
         mm_attention_backend: str | None = None,
@@ -786,7 +795,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
             self.vision_embedder = None
             self.image_encoder = None
 
-    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+    def get_image_feature(self, items: list[MultimodalDataItem]) -> torch.Tensor:
         """Eager image encode via the same ``pre_encode`` / ``forward_blocks``
         / ``post_encode`` decomposition the cudagraph wrapper uses, so the
         eager and captured paths share a single source of truth."""
@@ -799,7 +808,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
         return self.post_encode([encoded.squeeze(0)], grid_thws)
 
     def pre_encode(
-        self, items: List[MultimodalDataItem]
+        self, items: list[MultimodalDataItem]
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Eager patch-embed before the captured region; returns (tokens, grid).
 
@@ -808,9 +817,9 @@ class KimiK25ForConditionalGeneration(nn.Module):
         """
         device = self.vision_tower.device
         target_dtype = self.vision_tower.patch_embed.proj.weight.dtype
-        pixel_values = torch.cat([item.feature for item in items], dim=0).to(
-            device=device, dtype=target_dtype
-        )
+        pixel_values = torch.cat(
+            [item.feature.to(device, non_blocking=True) for item in items], dim=0
+        ).to(dtype=target_dtype)
         grid_thws = torch.concat([item.grid_thws for item in items], dim=0).to(device)
         hidden_states = self.vision_tower.patch_embed(pixel_values, grid_thws)
         return hidden_states, grid_thws
@@ -851,7 +860,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
             )
         }
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: list[int], mm_inputs: MultimodalInputs):
         return pad_input_tokens(input_ids, mm_inputs)
 
     @property
@@ -874,6 +883,38 @@ class KimiK25ForConditionalGeneration(nn.Module):
         )
 
     @torch.no_grad()
+    def multimodal_input_embeds(
+        self,
+        input_ids: torch.Tensor,
+        ctx,
+        multimodal_context,
+    ) -> torch.Tensor | None:
+        """Merged text+vision input embeddings, or ``None`` for a plain text step.
+
+        Kimi-K2.5's multimodal path is embeds-only -- the vision features are
+        scattered into the input embeddings and nothing else reaches the
+        language model (no per-layer extras like deepstack) -- so both the
+        eager ``forward`` below and a prefill-graph replay take the exact same
+        tensor from here.
+        """
+        if (
+            multimodal_context is None
+            or self.vision_embedder is None
+            or not multimodal_context.has_extend_inputs()
+            or ctx.forward_mode.is_decode_or_idle()
+        ):
+            return None
+        input_embeds, model_kwargs = self.vision_embedder.apply(
+            input_ids=input_ids,
+            text_embedding=self.get_input_embeddings(),
+            ctx=multimodal_context,
+            encoders={Modality.IMAGE: EncoderSpec(self.image_encoder)},
+            multimodal_model=self,
+            is_decode_or_idle=ctx.forward_mode.is_decode_or_idle(),
+        )
+        assert not model_kwargs, "Kimi-K2.5 multimodal path must stay embeds-only"
+        return input_embeds
+
     def forward(
         self,
         ctx,
@@ -885,22 +926,9 @@ class KimiK25ForConditionalGeneration(nn.Module):
         if self.language_model is None:
             raise RuntimeError("KimiK25 language_model is not initialized.")
         multimodal_context = kwargs.pop("multimodal_context", None)
-        if (
-            multimodal_context is not None
-            and multimodal_context.has_extend_inputs()
-            and not ctx.forward_mode.is_decode_or_idle()
-        ):
-            input_embeds, model_kwargs = self.vision_embedder.apply(
-                input_ids=input_ids,
-                text_embedding=self.get_input_embeddings(),
-                ctx=multimodal_context,
-                encoders={Modality.IMAGE: EncoderSpec(self.image_encoder)},
-                multimodal_model=self,
-                is_decode_or_idle=ctx.forward_mode.is_decode_or_idle(),
-            )
-            kwargs.update(model_kwargs)
-            if input_embeds is not None:
-                kwargs["input_embeds"] = input_embeds
+        input_embeds = self.multimodal_input_embeds(input_ids, ctx, multimodal_context)
+        if input_embeds is not None:
+            kwargs["input_embeds"] = input_embeds
         return self.language_model.forward(
             ctx,
             input_ids,
@@ -909,7 +937,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
             **kwargs,
         )
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         """Load weights for the model, separating vision and language weights"""
         vision_weights = []
         language_weights = []
@@ -957,9 +985,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
             num_groups=text_config.n_group,
         )
 
-    def set_eagle3_layers_to_capture(
-        self, layer_ids: Optional[List[int]] = None
-    ) -> None:
+    def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None) -> None:
         """Set the layers to capture for EAGLE3 speculative decoding."""
         if self.language_model is None or not hasattr(
             self.language_model, "set_eagle3_layers_to_capture"
@@ -970,7 +996,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
 
         self.language_model.set_eagle3_layers_to_capture(layer_ids)
 
-    def set_dflash_layers_to_capture(self, layer_ids: List[int]) -> None:
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
         """Set the layers to capture for DFLASH draft model training."""
         if not hasattr(self.language_model, "set_dflash_layers_to_capture"):
             raise AttributeError(
@@ -1004,7 +1030,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
 
         return self.language_model.logits_processor
 
-    def get_embed_and_head(self) -> Tuple[torch.Tensor, torch.Tensor]:
+    def get_embed_and_head(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Get embedding and LM head weights for speculative decoding."""
         if self.language_model is None or not hasattr(
             self.language_model, "get_embed_and_head"

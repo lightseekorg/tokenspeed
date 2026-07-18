@@ -70,7 +70,7 @@ class LoadConfig:
     weight_loader_prefetch_checkpoints: bool = False
     weight_loader_prefetch_num_threads: int = 4
 
-    ext_yaml: str = None
+    ext_yaml: str | None = None
 
     def __post_init__(self) -> None:
         model_loader_extra_config = self.model_loader_extra_config or {}

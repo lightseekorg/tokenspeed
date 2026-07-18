@@ -17,6 +17,8 @@
 
 """CUDA sampling kernels."""
 
+import os as _os
+
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import error_fn
 
@@ -29,6 +31,12 @@ fused_topk_topp_prepare = lambda *_args, **_kwargs: None  # noqa: E731
 fused_topk_topp_renorm = error_fn
 fused_topk_topp_workspace_size = error_fn
 verify_chain_greedy = error_fn
+
+# One availability decision for every sampler backend. The 2026-07-14
+# misaligned-address quarantine was lifted after
+# upstream #683 fixed the kernel's graph-capture addressing without losing
+# float4 throughput.
+fused_topk_topp_available = False
 
 if current_platform().is_nvidia:
     try:
@@ -47,11 +55,16 @@ if current_platform().is_nvidia:
         from tokenspeed_kernel.thirdparty.cuda.fused_topk_topp import (
             prepare_for_device as fused_topk_topp_prepare,
         )
+
+        fused_topk_topp_available = (
+            _os.environ.get("TS_DISABLE_FUSED_TOPK_TOPP", "0") != "1"
+        )
     except ImportError:
         pass
 
 __all__ = [
     "chain_speculative_sampling_target_only",
+    "fused_topk_topp_available",
     "fused_topk_topp_prepare",
     "fused_topk_topp_renorm",
     "fused_topk_topp_workspace_size",

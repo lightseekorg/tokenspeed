@@ -151,17 +151,22 @@ class DpSamplingComm:
         fallback_comm_backend: CommBackend | None = None,
         device: torch.device | str | None = None,
     ):
-        assert tp_size >= 1, f"tp_size={tp_size}"
-        assert (
-            len(group) == tp_size
-        ), f"group {group} has {len(group)} ranks but tp_size={tp_size}"
-        assert (
-            max_pad_bs % tp_size == 0
-        ), f"max_pad_bs={max_pad_bs} must be divisible by tp_size={tp_size}"
-        assert (
-            vocab_size % tp_size == 0
-        ), f"vocab_size={vocab_size} must be divisible by tp_size={tp_size}"
-        assert num_tokens_per_req >= 1
+        if tp_size < 1:
+            raise ValueError(f"tp_size={tp_size}")
+        if len(group) != tp_size:
+            raise ValueError(
+                f"group {group} has {len(group)} ranks but tp_size={tp_size}"
+            )
+        if max_pad_bs % tp_size != 0:
+            raise ValueError(
+                f"max_pad_bs={max_pad_bs} must be divisible by tp_size={tp_size}"
+            )
+        if vocab_size % tp_size != 0:
+            raise ValueError(
+                f"vocab_size={vocab_size} must be divisible by tp_size={tp_size}"
+            )
+        if num_tokens_per_req < 1:
+            raise ValueError(f"num_tokens_per_req={num_tokens_per_req}")
 
         self._tp_size = tp_size
         self._rank = rank
@@ -242,6 +247,29 @@ class DpSamplingComm:
     def is_initialized(self) -> bool:
         return self._state is not None
 
+    @staticmethod
+    def _check_shape(
+        name: str, tensor: torch.Tensor, expected: tuple[int, ...]
+    ) -> None:
+        if tuple(tensor.shape) != expected:
+            raise ValueError(f"{name} shape {tuple(tensor.shape)} != {expected}")
+
+    @staticmethod
+    def _check_dtype(name: str, tensor: torch.Tensor, expected: torch.dtype) -> None:
+        if tensor.dtype != expected:
+            raise TypeError(f"{name} dtype {tensor.dtype} != {expected}")
+
+    def _check_pad_bs(self, pad_bs: int) -> None:
+        if pad_bs > self._max_pad_bs:
+            raise ValueError(
+                f"pad_bs={pad_bs} exceeds max_pad_bs={self._max_pad_bs} "
+                "(set at construction time)"
+            )
+        if pad_bs % self._tp_size != 0:
+            raise ValueError(
+                f"pad_bs={pad_bs} must be divisible by tp_size={self._tp_size}"
+            )
+
     def prepare_verify_outputs(self, logits_dtype: torch.dtype) -> None:
         """Initialize one-sided state for verify-only DP sampling routes."""
         if self._backend == "onesided":
@@ -264,10 +292,7 @@ class DpSamplingComm:
         Returned row local_req * N + d is global request
         rank * reqs_per_rank + local_req at draft position d.
         """
-        assert pad_bs <= self._max_pad_bs, (
-            f"pad_bs={pad_bs} exceeds max_pad_bs={self._max_pad_bs} "
-            "(set at construction time)"
-        )
+        self._check_pad_bs(pad_bs)
 
         if self._backend == "onesided":
             self._ensure_onesided_state(local_logits.dtype)
@@ -301,25 +326,16 @@ class DpSamplingComm:
         Row r from source rank src lands at src * reqs_per_rank + r.
         Callers slice the real [0:bs] prefix and ignore phantom rows.
         """
-        assert pad_bs <= self._max_pad_bs
+        self._check_pad_bs(pad_bs)
         reqs_per_rank = pad_bs // self._tp_size
         n = self._num_tokens_per_req
 
-        assert tuple(predict_local.shape) == (
-            reqs_per_rank,
-            n,
-        ), f"predict_local shape {tuple(predict_local.shape)} != ({reqs_per_rank}, {n})"
-        assert tuple(accept_index_local.shape) == (reqs_per_rank, n), (
-            f"accept_index_local shape {tuple(accept_index_local.shape)} "
-            f"!= ({reqs_per_rank}, {n})"
-        )
-        assert tuple(accept_length_local.shape) == (reqs_per_rank,), (
-            f"accept_length_local shape {tuple(accept_length_local.shape)} "
-            f"!= ({reqs_per_rank},)"
-        )
-        assert predict_local.dtype == torch.int32
-        assert accept_index_local.dtype == torch.int32
-        assert accept_length_local.dtype == torch.int32
+        self._check_shape("predict_local", predict_local, (reqs_per_rank, n))
+        self._check_shape("accept_index_local", accept_index_local, (reqs_per_rank, n))
+        self._check_shape("accept_length_local", accept_length_local, (reqs_per_rank,))
+        self._check_dtype("predict_local", predict_local, torch.int32)
+        self._check_dtype("accept_index_local", accept_index_local, torch.int32)
+        self._check_dtype("accept_length_local", accept_length_local, torch.int32)
 
         if self._backend == "onesided":
             return self._gather_verify_outputs_onesided(
@@ -329,8 +345,8 @@ class DpSamplingComm:
                 pad_bs=pad_bs,
             )
 
-        assert self._combined_local_nccl is not None
-        assert self._combined_full_nccl is not None
+        if self._combined_local_nccl is None or self._combined_full_nccl is None:
+            raise RuntimeError("NCCL DP sampling buffers are not initialized")
         combined_local = self._combined_local_nccl[:reqs_per_rank]
         combined_local[:, :n].copy_(predict_local)
         combined_local[:, n : 2 * n].copy_(accept_index_local)
@@ -359,13 +375,10 @@ class DpSamplingComm:
         pad_bs: int,
     ) -> torch.Tensor:
         """Gather per-token scalar logprobs into full padded-batch order."""
-        assert pad_bs <= self._max_pad_bs
+        self._check_pad_bs(pad_bs)
         reqs_per_rank = pad_bs // self._tp_size
         n = self._num_tokens_per_req
-        assert tuple(logprobs_local.shape) == (reqs_per_rank, n), (
-            f"logprobs_local shape {tuple(logprobs_local.shape)} "
-            f"!= ({reqs_per_rank}, {n})"
-        )
+        self._check_shape("logprobs_local", logprobs_local, (reqs_per_rank, n))
         logprobs_full = self._logprobs_full[:pad_bs]
         all_gather_into_tensor(
             logprobs_full,
@@ -376,8 +389,10 @@ class DpSamplingComm:
         return logprobs_full
 
     def _init_onesided(self) -> None:
-        assert self._logits_dtype is not None
-        assert create_dp_sampling_state is not None
+        if self._logits_dtype is None:
+            raise RuntimeError("DP sampling logits dtype is not initialized")
+        if create_dp_sampling_state is None:
+            raise RuntimeError("one-sided DP sampling state creation is unavailable")
 
         self._state = create_dp_sampling_state(
             group=pg_manager.get_process_group("nccl", self._group),
@@ -392,10 +407,11 @@ class DpSamplingComm:
 
     def _ensure_onesided_state(self, logits_dtype: torch.dtype) -> None:
         if self._state is not None:
-            assert self._logits_dtype == logits_dtype, (
-                f"DP sampling logits dtype changed from {self._logits_dtype} "
-                f"to {logits_dtype}"
-            )
+            if self._logits_dtype != logits_dtype:
+                raise RuntimeError(
+                    f"DP sampling logits dtype changed from {self._logits_dtype} "
+                    f"to {logits_dtype}"
+                )
             return
         self._logits_dtype = logits_dtype
         self._init_onesided()
@@ -403,8 +419,10 @@ class DpSamplingComm:
     def _swap_batch_vocab_onesided(
         self, local_logits: torch.Tensor, *, pad_bs: int
     ) -> torch.Tensor:
-        assert self._state is not None
-        assert dp_sampling_swap is not None
+        if self._state is None:
+            raise RuntimeError("one-sided DP sampling state is not initialized")
+        if dp_sampling_swap is None:
+            raise RuntimeError("one-sided DP sampling swap is unavailable")
         return dp_sampling_swap(self._state, local_logits, pad_bs=pad_bs)
 
     def _gather_verify_outputs_onesided(
@@ -415,8 +433,10 @@ class DpSamplingComm:
         *,
         pad_bs: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        assert self._state is not None
-        assert dp_sampling_gather is not None
+        if self._state is None:
+            raise RuntimeError("one-sided DP sampling state is not initialized")
+        if dp_sampling_gather is None:
+            raise RuntimeError("one-sided DP sampling gather is unavailable")
         return dp_sampling_gather(
             self._state,
             predict_local,

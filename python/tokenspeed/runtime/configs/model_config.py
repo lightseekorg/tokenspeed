@@ -90,7 +90,7 @@ class _AttentionFamilySpec:
 
 
 def override_model_config(model_config, ext_yaml):
-    with open(ext_yaml) as f:
+    with open(ext_yaml, encoding="utf-8") as f:
         ext_config = yaml.safe_load(f)
 
     override_model_config: dict = ext_config.get("override_model_config", {})
@@ -326,6 +326,26 @@ class ModelConfig:
         )
 
         self.hf_text_config = get_hf_text_config(self.hf_config)
+        if (
+            is_draft_worker
+            and resolve_architecture(self.hf_config)
+            == "InklingForConditionalGenerationNextN"
+        ):
+            # The MTP head's depth blocks have their own local/full attention
+            # pattern (mtp_config.local_layer_ids) and only depths
+            # 0..steps-1 ever run; swap in the depth-specialized (and
+            # steps-pruned) text config so layer construction, attention
+            # metadata, and paged-cache layout all derive from it.
+            from tokenspeed.runtime.configs.inkling_config import (
+                inkling_mtp_text_config,
+            )
+
+            self.hf_text_config = inkling_mtp_text_config(
+                self.hf_text_config,
+                num_steps=getattr(server_args, "speculative_num_steps", None),
+            )
+            if hasattr(self.hf_config, "text_config"):
+                self.hf_config.text_config = self.hf_text_config
 
         # Check model type
         self.is_generation = is_generation_model(self.hf_config.architectures)
@@ -348,6 +368,35 @@ class ModelConfig:
             )
         # ``is_multimodal`` is the architectural fact; this is the runtime gate.
         self.is_multimodal_active = self.is_multimodal and not apply_language_model_only
+        # Vision-only role (EPD encode): the inverse axis of language_model_only.
+        # Build the vision tower (is_multimodal_active stays True) but SKIP LM
+        # construction + LM weight load so a full ViT fits at encode TP=1.
+        encoder_only = (
+            getattr(server_args, "disaggregation_mode", None) == "encode"
+            and not is_draft_worker
+        )
+        if encoder_only and not self.is_multimodal:
+            raise ValueError(
+                "disaggregation_mode=encode requires a multimodal checkpoint."
+            )
+        if encoder_only and apply_language_model_only:
+            raise ValueError(
+                "disaggregation_mode=encode (encoder-only) and language_model_only "
+                "are mutually exclusive."
+            )
+        if encoder_only and self.is_audio_model:
+            raise ValueError(
+                "disaggregation_mode=encode does not support audio models; "
+                "only image/video encoders are currently supported."
+            )
+        if encoder_only:
+            # Single model-facing gate: Kimi reads hf_config.encoder_only directly;
+            # Qwen3_5ForConditionalGeneration reads it to skip LM construction.
+            self.hf_config.encoder_only = True
+            logger.info(
+                "Running in encoder-only mode: the language model will not "
+                "be constructed or loaded (encode role)."
+            )
         # Cap gpu_memory_utilization for VLMs in mm mode — the vision encoder
         # needs headroom that the global default doesn't account for.
         if (
@@ -482,12 +531,17 @@ class ModelConfig:
                         allow_patterns=["*.json"],
                         local_files_only=True,
                     )
-                except Exception:
+                except Exception as exc:
+                    logger.debug(
+                        "Unable to resolve local quantization config for %s: %s",
+                        self.model_path,
+                        exc,
+                    )
                     model_dir = None
             if model_dir is not None:
                 hf_quant_path = os.path.join(model_dir, "hf_quant_config.json")
                 if os.path.isfile(hf_quant_path):
-                    with open(hf_quant_path) as f:
+                    with open(hf_quant_path, encoding="utf-8") as f:
                         hf_quant = json.load(f)
                     quant_algo = hf_quant.get("quantization", {}).get("quant_algo", "")
                     if quant_algo:
@@ -596,14 +650,16 @@ def get_hf_text_config(config: PretrainedConfig):
         config.dtype = torch.float16
         return config
 
+    if hasattr(config, "thinker_config"):
+        thinker_config = config.thinker_config
+        if hasattr(thinker_config, "text_config"):
+            return thinker_config.text_config
+        return thinker_config
     if hasattr(config, "text_config"):
-        # The code operates under the assumption that text_config should have
-        # `num_attention_heads` (among others). Assert here to fail early
-        # if transformers config doesn't align with this assumption.
-        assert hasattr(config.text_config, "num_attention_heads")
+        if not hasattr(config.text_config, "num_attention_heads"):
+            raise ValueError("text_config must define num_attention_heads")
         return config.text_config
-    else:
-        return config
+    return config
 
 
 _STR_DTYPE_TO_TORCH_DTYPE = {
@@ -673,7 +729,10 @@ def is_multimodal_model(model_architectures: list[str] | None):
     multimodal_architectures = {
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
+        "Qwen3OmniMoeForConditionalGeneration",
+        "Qwen3ASRForConditionalGeneration",
         "KimiK25ForConditionalGeneration",
+        "InklingForConditionalGeneration",
     }
     return any(arch in multimodal_architectures for arch in model_architectures or [])
 
@@ -686,8 +745,13 @@ def is_image_gen_model(model_architectures: list[str]):
     return False
 
 
-def is_audio_model(model_architectures: list[str]):
-    return False
+def is_audio_model(model_architectures: list[str] | None):
+    audio_architectures = {
+        "InklingForConditionalGeneration",
+        "Qwen3OmniMoeForConditionalGeneration",
+        "Qwen3ASRForConditionalGeneration",
+    }
+    return any(arch in audio_architectures for arch in model_architectures or [])
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:

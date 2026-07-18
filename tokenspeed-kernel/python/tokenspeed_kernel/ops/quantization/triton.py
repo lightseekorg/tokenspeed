@@ -18,9 +18,11 @@ from typing import Optional
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
+
+platform = current_platform()
 
 
 @triton.jit
@@ -205,6 +207,71 @@ def fp8_quantize(
     return out
 
 
+@triton.jit
+def _fp8_token_group_quantize_kernel(
+    x_ptr,
+    out_ptr,
+    scale_ptr,
+    group_size,
+    eps,
+    bit8_min,
+    bit8_max,
+    BLOCK: tl.constexpr,
+):
+    group_id = tl.program_id(0)
+    cols = tl.arange(0, BLOCK)
+    mask = cols < group_size
+    offsets = group_id.to(tl.int64) * group_size + cols
+
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    scale = tl.maximum(tl.max(tl.abs(x), axis=0), eps) / bit8_max
+    out = tl.clamp(x / scale, bit8_min, bit8_max).to(out_ptr.dtype.element_ty)
+
+    tl.store(out_ptr + offsets, out, mask=mask)
+    tl.store(scale_ptr + group_id, scale)
+
+
+def _fp8_token_group_quantize(
+    x: torch.Tensor,
+    group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if x.shape[-1] % group_size != 0:
+        raise ValueError(
+            f"the last dimension of x must be divisible by group_size, got "
+            f"shape={tuple(x.shape)}, group_size={group_size}"
+        )
+    if not x.is_contiguous():
+        raise ValueError("x must be contiguous")
+
+    out_dtype = platform.fp8e4m3fn.dtype
+    out = torch.empty_like(x, device=x.device, dtype=out_dtype)
+    scales = torch.empty(
+        x.shape[:-1] + (x.shape[-1] // group_size,),
+        device=x.device,
+        dtype=torch.float32,
+    )
+
+    groups = x.numel() // group_size
+    block = triton.next_power_of_2(group_size)
+    num_warps = min(max(block // 256, 1), 8)
+    bit8_max = platform.fp8e4m3fn.max
+    bit8_min = -bit8_max
+
+    _fp8_token_group_quantize_kernel[(groups,)](
+        x,
+        out,
+        scales,
+        group_size,
+        1e-10,
+        bit8_min=bit8_min,
+        bit8_max=bit8_max,
+        BLOCK=block,
+        num_warps=num_warps,
+        num_stages=1,
+    )
+    return out, scales
+
+
 @register_kernel(
     "quantization",
     "fp8",
@@ -220,6 +287,114 @@ def triton_quantize_fp8(
     enable_pdl: bool = False,
 ) -> torch.Tensor:
     return fp8_quantize(x, scale=scale, enable_pdl=enable_pdl)
+
+
+@register_kernel(
+    "quantization",
+    "fp8_with_scale",
+    name="triton_quantize_fp8_with_scale",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
+    signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
+    traits={
+        "granularity": frozenset({"token_group_128"}),
+        "scale_encoding": frozenset({"float32"}),
+    },
+    priority=Priority.PORTABLE,
+)
+def triton_quantize_fp8_with_scale(
+    x: torch.Tensor,
+    granularity: str = "tensor",
+    group_size: int | None = None,
+    scale_encoding: str = "float32",
+    enable_pdl: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if granularity != "token_group" or group_size != 128:
+        raise ValueError(
+            "triton FP8 dynamic quantization currently supports only "
+            f"granularity='token_group' with group_size=128, got "
+            f"granularity={granularity!r}, group_size={group_size}."
+        )
+    if scale_encoding != "float32":
+        raise ValueError(
+            "triton FP8 dynamic quantization currently requires "
+            f"scale_encoding='float32', got {scale_encoding!r}."
+        )
+    return _fp8_token_group_quantize(x.contiguous(), 128)
+
+
+@triton.jit
+def _mxfp8_quantize_kernel(
+    x_ptr,
+    out_ptr,
+    scale_ptr,
+    x_row_stride,
+    out_row_stride,
+    scale_row_stride,
+):
+    row = tl.program_id(0)
+    group = tl.program_id(1)
+    offs = group * 32 + tl.arange(0, 32)
+
+    x = tl.load(x_ptr + row * x_row_stride + offs).to(tl.float32)
+    amax = tl.max(tl.abs(x), axis=0)
+    exp = tl.ceil(tl.log2(amax / 448.0))
+    exp = tl.clamp(exp, -127.0, 127.0)
+    exp = tl.where(amax > 0, exp, -127.0)
+    q = x * tl.exp2(-exp)
+    q8 = q.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
+
+    tl.store(out_ptr + row * out_row_stride + offs, q8)
+    tl.store(scale_ptr + row * scale_row_stride + group, (exp + 127.0).to(tl.uint8))
+
+
+@register_kernel(
+    "quantization",
+    "mxfp8",
+    name="triton_quantize_mxfp8",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
+    signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
+    traits={},
+    priority=Priority.PORTABLE,
+)
+def mxfp8_quantize(
+    x: torch.Tensor,
+    enable_pdl: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a BF16/FP16 tensor to MXFP8.
+
+    The last dimension is quantized in groups of 32 values. The returned data
+    has the same shape as ``x`` and FP8-E4M3 storage; the returned scales have
+    shape ``x.shape[:-1] + (x.shape[-1] // 32,)`` and E8M0 byte encoding.
+    """
+    assert x.dtype in (
+        torch.bfloat16,
+        torch.float16,
+    ), f"mxfp8_quantize input must be bf16/fp16, got {x.dtype}"
+    M, N, x_row_stride = _flatten_to_2d(x)
+    if N % 32 != 0:
+        raise ValueError("mxfp8_quantize requires the last dimension divisible by 32")
+
+    out = torch.empty(x.shape, dtype=torch.float8_e4m3fn, device=x.device)
+    scale_dtype = getattr(torch, "float8_e8m0fnu", torch.uint8)
+    scales = torch.empty((*x.shape[:-1], N // 32), dtype=scale_dtype, device=x.device)
+
+    out_M, _, out_row_stride = _flatten_to_2d(out)
+    scales_M, _, scale_row_stride = _flatten_to_2d(scales)
+    assert out_M == M and scales_M == M
+    # enable_pdl is accepted for launch-site parity with other backends and unused here.
+
+    _mxfp8_quantize_kernel[(M, N // 32)](
+        x,
+        out.view(torch.uint8),
+        scales.view(torch.uint8),
+        x_row_stride,
+        out_row_stride,
+        scale_row_stride,
+        num_warps=1,
+    )
+    return out, scales
 
 
 @triton.jit
@@ -361,7 +536,6 @@ def triton_quantize_mxfp4(
     scale_layout: str = "linear",
     enable_pdl: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    del enable_pdl
     if global_scale is not None:
         raise ValueError("triton MXFP4 quantization does not support global_scale")
     if scale_size != 32:
@@ -380,4 +554,5 @@ __all__ = [
     "fp8_quantize",
     "mxfp4_quantize",
     "triton_quantize_mxfp4",
+    "triton_quantize_fp8_with_scale",
 ]

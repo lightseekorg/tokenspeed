@@ -22,7 +22,7 @@
 
 Covers:
   - Prefill allocates pages; occupied_pages contains all held page indices,
-    begins/sizes describe the newly allocated slice
+    begins/sizes describe the page-table slice that must be refreshed
   - begins is 0 on first schedule (no pages were occupied before)
   - Chunked prefill: begins grows across chunks as more pages are allocated
   - Decode step: no new pages allocated when tail page still has capacity
@@ -49,7 +49,7 @@ def make_config(
     num_device_pages: int = 1024,
 ) -> SchedulerConfig:
     cfg = SchedulerConfig()
-    cfg.page_size = page_size
+    cfg.block_size = page_size
     cfg.max_scheduled_tokens = max_scheduled_tokens
     cfg.max_batch_size = max_batch_size
     cfg.num_device_pages = num_device_pages

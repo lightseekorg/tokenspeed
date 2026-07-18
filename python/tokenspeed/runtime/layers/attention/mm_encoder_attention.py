@@ -18,10 +18,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Cache-less multi-headed attention used by VLM vision encoders.
+"""Cache-less multi-headed attention used by multimodal encoders.
 
-Encode-only attention layer used by Qwen3.5-VL / Kimi-K2.5-VL vision towers,
-plus its backend dispatch table. Backends are free functions (not
+Encode-only attention layer used by vision and audio towers, plus its backend
+dispatch table. Backends are free functions (not
 ``AttentionBackend`` subclasses) because the vision encoder is single-shot
 with no KV cache, no decode/extend split, and no graph capture protocol --
 the ``AttentionBackend`` ABC's prefill/decode/extend lifecycle does not
@@ -34,7 +34,8 @@ from __future__ import annotations
 
 import functools
 import logging
-from typing import Any, Callable, Optional, Tuple
+from collections.abc import Callable
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -72,7 +73,7 @@ from tokenspeed_kernel.ops.attention.triton.qkv_rotary import (
 # CUDA-graph bucketing for the cuDNN vision prefill backend: batch and max
 # seqlen are quantized so a small set of captured graphs covers the request
 # distribution. The consts are consumed by VLM tower models, not by
-# ``VisionAttention`` itself.
+# ``MultimodalEncoderAttention`` itself.
 VIT_CUDNN_WORKSPACE_BYTES = 128 * 1024 * 1024
 VIT_CUDNN_BATCH_BUCKETS: tuple[int, ...] = (8, 16, 32, 64)
 VIT_CUDNN_SEQLEN_BUCKETS: tuple[int, ...] = (4096, 8192, 16384, 32768, 65536, 131072)
@@ -103,8 +104,8 @@ def _varlen_metadata(
     seq_len: int,
     *,
     device: torch.device,
-    max_seqlen: Optional[int],
-) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    max_seqlen: int | None,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
     """Resolve cu_seqlens / seq_lens / max_seqlen shared by the varlen backends.
 
     ``max_seqlen`` is honored when the caller supplies it (the capture-safe
@@ -133,8 +134,8 @@ def vision_attn_triton(
     cu_seqlens: torch.Tensor | None,
     bsz: int,
     seq_len: int,
-    softmax_scale: Optional[float] = None,
-    max_seqlen: Optional[int] = None,
+    softmax_scale: float | None = None,
+    max_seqlen: int | None = None,
     **_: Any,
 ) -> torch.Tensor:
     """Triton context attention without a causal mask."""
@@ -164,8 +165,8 @@ def vision_attn_fa3(
     cu_seqlens: torch.Tensor | None,
     bsz: int,
     seq_len: int,
-    softmax_scale: Optional[float] = None,
-    max_seqlen: Optional[int] = None,
+    softmax_scale: float | None = None,
+    max_seqlen: int | None = None,
     **_: Any,
 ) -> torch.Tensor:
     cu_seqlens, _, max_seqlen = _varlen_metadata(
@@ -191,8 +192,8 @@ def vision_attn_fa4(
     cu_seqlens: torch.Tensor | None,
     bsz: int,
     seq_len: int,
-    softmax_scale: Optional[float] = None,
-    max_seqlen: Optional[int] = None,
+    softmax_scale: float | None = None,
+    max_seqlen: int | None = None,
     **_: Any,
 ) -> torch.Tensor:
     cu_seqlens, _, max_seqlen = _varlen_metadata(
@@ -219,10 +220,10 @@ def vision_attn_flashinfer_cudnn(
     v: torch.Tensor,
     *,
     cu_seqlens: torch.Tensor | None,
-    softmax_scale: Optional[float] = None,
+    softmax_scale: float | None = None,
     max_seqlen: Any = None,
-    sequence_lengths: Optional[torch.Tensor] = None,
-    workspace_buffer: Optional[torch.Tensor] = None,
+    sequence_lengths: torch.Tensor | None = None,
+    workspace_buffer: torch.Tensor | None = None,
     **_: Any,
 ) -> torch.Tensor:
     """cuDNN prefill backend. The caller (vision tower with cuDNN graph capture)
@@ -230,11 +231,14 @@ def vision_attn_flashinfer_cudnn(
     ``[qk | v | o]`` of length ``batch+1`` each, plus ``sequence_lengths`` per
     real (un-padded) sequence and ``max_seqlen`` as the bucketed budget.
     """
-    assert (
-        sequence_lengths is not None
-        and max_seqlen is not None
-        and isinstance(cu_seqlens, torch.Tensor)
-    ), "flashinfer_cudnn needs sequence_lengths, max_seqlen, and packed indptrs"
+    if (
+        sequence_lengths is None
+        or max_seqlen is None
+        or not isinstance(cu_seqlens, torch.Tensor)
+    ):
+        raise ValueError(
+            "flashinfer_cudnn needs sequence_lengths, max_seqlen, and packed indptrs"
+        )
 
     # cuDNN wants a python int for the seq budget.
     max_seqlen = int(
@@ -250,7 +254,11 @@ def vision_attn_flashinfer_cudnn(
     seq_lens = sequence_lengths.view(-1).to(device=q.device, dtype=torch.int32)
     batch = seq_lens.numel()
     packed = cu_seqlens.view(-1).to(device=q.device, dtype=torch.int32)
-    assert packed.numel() == 3 * (batch + 1)
+    expected_packed = 3 * (batch + 1)
+    if packed.numel() != expected_packed:
+        raise ValueError(
+            f"Expected packed indptr length {expected_packed}, got {packed.numel()}."
+        )
     chunk = batch + 1
     qk_off = packed[:chunk].view(chunk, 1, 1, 1)
     v_off = packed[chunk : 2 * chunk].view(chunk, 1, 1, 1)
@@ -291,7 +299,7 @@ _BACKENDS: dict[str, Callable[..., torch.Tensor]] = {
 }
 
 
-def _default_vision_attn_backend() -> str:
+def _default_multimodal_encoder_attn_backend() -> str:
     """Platform default backend name."""
     if _is_nvidia:
         if _platform.arch_version.major == 9:  # Hopper SM90
@@ -302,13 +310,13 @@ def _default_vision_attn_backend() -> str:
     if _is_amd:
         return "triton_attn"
     raise RuntimeError(
-        f"No default vision attention backend for platform {_platform}; "
+        f"No default multimodal encoder attention backend for platform {_platform}; "
         "set --mm-attention-backend explicitly."
     )
 
 
 @functools.lru_cache(maxsize=None)
-def _resolve_backend(name: Optional[str]) -> Callable[..., torch.Tensor]:
+def _resolve_backend(name: str | None) -> Callable[..., torch.Tensor]:
     """Resolve a backend name to its dispatch function.
 
     ``None`` falls back to the platform default; an unknown or platform-
@@ -317,43 +325,45 @@ def _resolve_backend(name: Optional[str]) -> Callable[..., torch.Tensor]:
     """
     explicit = name is not None
     if name is None:
-        name = _default_vision_attn_backend()
+        name = _default_multimodal_encoder_attn_backend()
     fn = _BACKENDS.get(name)
     if fn is None:
         raise ValueError(
-            f"Unknown vision attention backend {name!r} "
+            f"Unknown multimodal encoder attention backend {name!r} "
             f"(check --mm-attention-backend); available: {sorted(_BACKENDS)}"
         )
     if name in ("fa3", "fa4", "flashinfer_cudnn") and not _is_nvidia:
         raise ValueError(
-            f"vision attention backend {name!r} is only available on NVIDIA CUDA"
+            f"multimodal encoder attention backend {name!r} is only available "
+            "on NVIDIA CUDA"
         )
     if name == "fa3" and _platform.is_blackwell:
         raise ValueError("The 'fa3' backend is not supported on Blackwell GPUs")
     logger.info(
-        f"vision attention backend: {name} ({'override' if explicit else 'auto'})"
+        f"multimodal encoder attention backend: {name} "
+        f"({'override' if explicit else 'auto'})"
     )
     return fn
 
 
-class VisionAttention(nn.Module):
-    r"""Multi-headed attention without any cache, mostly used for multimodal transformers."""
+class MultimodalEncoderAttention(nn.Module):
+    r"""Multi-headed attention without a KV cache for multimodal encoders."""
 
     def __init__(
         self,
         embed_dim: int,
         num_heads: int,
         mapping: Mapping,
-        head_size: Optional[int] = None,
-        quant_config: Optional[QuantizationConfig] = None,
+        head_size: int | None = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         proj_bias: bool = True,
         qkv_bias: bool = True,
         customized_position_embedding_applier: Callable[
-            [torch.Tensor, torch.Tensor, Any, Any], Tuple[torch.Tensor, torch.Tensor]
+            [torch.Tensor, torch.Tensor, Any, Any], tuple[torch.Tensor, torch.Tensor]
         ] = None,
         position_embedding_mode: str | None = None,
-        workspace_buffer: Optional[torch.Tensor] = None,
+        workspace_buffer: torch.Tensor | None = None,
         mm_attention_backend: str | None = None,
     ):
         super().__init__()
@@ -419,10 +429,10 @@ class VisionAttention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        cu_seqlens: Optional[torch.Tensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        rotary_pos_emb_cos: Optional[torch.Tensor] = None,
-        rotary_pos_emb_sin: Optional[torch.Tensor] = None,
+        cu_seqlens: torch.Tensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        rotary_pos_emb_cos: torch.Tensor | None = None,
+        rotary_pos_emb_sin: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         r"""
@@ -544,3 +554,7 @@ class VisionAttention(nn.Module):
         output, _ = self.proj(output)
 
         return output
+
+
+# Compatibility alias for existing vision tower implementations.
+VisionAttention = MultimodalEncoderAttention

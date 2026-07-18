@@ -18,4 +18,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import tokenspeed_kernel.ops.moe.triton.fp8  # noqa: F401
+import tokenspeed_kernel.ops.moe.triton.inkling_topk  # noqa: F401
 import tokenspeed_kernel.ops.moe.triton.mxfp4  # noqa: F401

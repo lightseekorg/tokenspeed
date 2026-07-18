@@ -21,7 +21,8 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Callable, NamedTuple
+from collections.abc import Callable
+from typing import Any, NamedTuple
 
 import torch
 
@@ -41,7 +42,7 @@ class MatchResult(NamedTuple):
                             Note: node.host_value stores token indices.
     """
 
-    device_indices: torch.Tensor = None
+    device_indices: torch.Tensor | None = None
     last_device_node: Any = None
     device_prefix_length: int = 0
     last_host_node: Any = None
@@ -52,11 +53,11 @@ class BasePrefixCache(ABC):
     """Cache can be indexed by either rid or key."""
 
     @abstractmethod
-    def reset(self):
+    def reset(self) -> None:
         raise NotImplementedError
 
     @abstractmethod
-    def match_prefix(self, **kwargs) -> tuple[list[int], int]:
+    def match_prefix(self, **kwargs) -> MatchResult:
         """Match a request prefix and optionally prepare req-local state.
 
         Unified contract:
@@ -80,7 +81,7 @@ class BasePrefixCache(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def evict(self, num_tokens: int, evict_callback: Callable):
+    def evict(self, num_tokens: int, evict_callback: Callable[..., None]):
         raise NotImplementedError
 
     @abstractmethod

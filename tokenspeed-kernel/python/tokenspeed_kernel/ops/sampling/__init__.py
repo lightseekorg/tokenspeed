@@ -85,7 +85,12 @@ def argmax(
     Returns:
         A tensor containing argmax indices for each row of ``logits``.
     """
-    if logits.dim() != 2 or not logits.is_cuda or logits.dtype not in _SUPPORTED_DTYPES:
+    if (
+        logits.dim() != 2
+        or logits.shape[0] == 0
+        or not logits.is_cuda
+        or logits.dtype not in _SUPPORTED_DTYPES
+    ):
         return _argmax_torch_fallback(logits, out=out)
 
     signature = format_signature(logits=dense_tensor_format(logits.dtype))

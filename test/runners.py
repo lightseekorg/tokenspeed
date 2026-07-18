@@ -1,9 +1,7 @@
-# Adapted from meituan-longcat/SGLang-FluentLLM.
-# This file has been modified for this repository.
-# This file may incorporate material from ModelTC/lightllm,
-# vllm-project/vllm, and sgl-project/sglang, as identified in
-# python/THIRDPARTYNOTICES.
-
+# SPDX-License-Identifier: MIT AND Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 LightSeek Foundation
+# SPDX-FileCopyrightText: Copyright 2023-2024 SGLang Team
+#
 # Copyright (c) 2026 LightSeek Foundation
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -272,7 +270,7 @@ class HFRunner:
     ) -> ModelOutput:
         output_strs = []
         # Per-prompt list of (logprob, token_id) for each greedily generated
-        # token — the reference for the engine's vLLM-style output logprobs.
+        # token; this is the sampled-token logprob reference.
         output_token_logprobs_lst = []
 
         for i, p in enumerate(prompts):
@@ -511,10 +509,10 @@ class RTRunner:
         top_k: Optional[int] = None,
         token_ids_logprob: Optional[List[int]] = None,
     ):
-        # vLLM-style output logprobs only: request the sampled token's logprob
-        # at each output position via SamplingParams.logprobs=0. Prompt/top-k/
-        # token-id logprobs are not supported, so their ModelOutput fields stay
-        # None. (logprob_start_len / token_ids_logprob are accepted for call-site
+        # Output logprobs only: request the sampled token's logprob at each
+        # output position via SamplingParams.logprobs=0. Prompt/top-k/token-id
+        # logprobs are not supported, so their ModelOutput fields stay None.
+        # (logprob_start_len / token_ids_logprob are accepted for call-site
         # compatibility but ignored.)
         output_strs = []
         output_ids = []
@@ -627,8 +625,8 @@ def check_close_model_outputs(
 
     if check_logprobs:
         for i in range(len(hf_outputs.output_strs)):
-            # Compare the vLLM-style output (sampled-token) logprobs against the
-            # HF reference. Both runners decode greedily; compare the prefix of
+            # Compare sampled-token output logprobs against the HF reference.
+            # Both runners decode greedily; compare the prefix of
             # positions where the generated token ids agree (greedy can diverge
             # late due to numerics, which the ROUGE-L check above already bounds).
             hf_lp = hf_outputs.output_token_logprobs_lst[i]

@@ -72,7 +72,8 @@ def tolerance(
     - fp32: error grows as sqrt(K) under fp32 accumulation noise.
     - fp16/bf16: K-independent — fp32 accumulation is well below the output
       dtype's rounding floor, so error is dominated by the final cast.
-    - fp8: error grows linearly with K for blockwise kernels.
+    - fp8: error grows linearly with K for blockwise kernels, with a floor for
+      the output dtype rounding error on small K.
     """
     if dtype not in _ATOL:
         raise KeyError(f"No GEMM tolerance baseline for dtype={dtype}")
@@ -84,7 +85,8 @@ def tolerance(
 
     base = _ATOL[dtype]
     if dtype in _FP8_DTYPES:
-        scale = max(K, 1) / 128.0
+        output_rounding_floor = max(_ATOL[d] for d in _BF16_FP16_DTYPES)
+        scale = max(base * max(K, 1) / 128.0, output_rounding_floor) / base
     elif dtype in _BF16_FP16_DTYPES:
         scale = 1.0
     else:
@@ -102,6 +104,14 @@ set_family_tolerance("gemm", tolerance)
 
 
 class GemmInputGenerator(InputGenerator):
+    def _trait_value(self, name: str, default: str) -> str:
+        value = self.traits.get(name)
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (frozenset, set)) and len(value) == 1:
+            return str(next(iter(value)))
+        return default
+
     def _generate_value(self, shape: tuple[int, ...], dtype) -> torch.Tensor:
         values = torch.randn(
             *shape,
@@ -140,6 +150,7 @@ class GemmInputGenerator(InputGenerator):
         tensor_format: TensorFormat | None,
         role: str,
         *,
+        batch_shape: tuple[int, ...],
         M: int,
         N: int,
         K: int,
@@ -157,47 +168,76 @@ class GemmInputGenerator(InputGenerator):
             block_n, block_k = block_size
             k_tiles = math.ceil(K / block_k)
             if role == "a":
-                return self._generate_scales((M, k_tiles), scale.storage_dtype)
+                return self._generate_scales(
+                    (*batch_shape, M, k_tiles), scale.storage_dtype
+                )
             if role == "b":
                 n_tiles = math.ceil(N / block_n)
-                return self._generate_scales((n_tiles, k_tiles), scale.storage_dtype)
+                return self._generate_scales(
+                    (*batch_shape, n_tiles, k_tiles), scale.storage_dtype
+                )
 
         if scale.granularity == "channel":
             return self._generate_scales(
-                (M,) if role == "a" else (N,),
+                (*batch_shape, M) if role == "a" else (*batch_shape, N),
                 scale.storage_dtype,
             )
 
         return self._generate_scales((1,), scale.storage_dtype)
 
-    def generate(
+    def _a_shape(
         self,
+        *,
+        batch_shape: tuple[int, ...],
+        M: int,
+        K: int,
+        layout: str,
+    ) -> tuple[int, ...]:
+        if layout in {"KM", "BKM"}:
+            return (*batch_shape, K, M)
+        return (*batch_shape, M, K)
+
+    def _b_shape(
+        self,
+        *,
+        batch_shape: tuple[int, ...],
+        N: int,
+        K: int,
+        layout: str,
+    ) -> tuple[int, ...]:
+        if layout in {"KN", "BKN"}:
+            return (*batch_shape, K, N)
+        return (*batch_shape, N, K)
+
+    def _generate_for_shape(
+        self,
+        *,
+        batch_shape: tuple[int, ...],
         M: int,
         N: int,
         K: int,
+        a_layout: str,
+        b_layout: str,
     ) -> dict[str, Any]:
-        a_layout = self.traits.get("a_layout")
-        b_layout = self.traits.get("b_layout")
         a_format = self._format("a")
         b_format = self._format("b")
+
         a_dtype = a_format.storage_dtype if a_format is not None else self.dtype
         b_dtype = b_format.storage_dtype if b_format is not None else self.dtype
-
-        A = (
-            self._generate_value((K, M), a_dtype)
-            if a_layout == {"KM"}
-            else self._generate_value((M, K), a_dtype)
+        A = self._generate_value(
+            self._a_shape(batch_shape=batch_shape, M=M, K=K, layout=a_layout),
+            a_dtype,
         )
-        B = (
-            self._generate_value((K, N), b_dtype)
-            if b_layout == {"KN"}
-            else self._generate_value((N, K), b_dtype)
+        B = self._generate_value(
+            self._b_shape(batch_shape=batch_shape, N=N, K=K, layout=b_layout),
+            b_dtype,
         )
 
         block_size = self._block_size(a_format, b_format)
         A_scales = self._scale_for_format(
             a_format,
             "a",
+            batch_shape=batch_shape,
             M=M,
             N=N,
             K=K,
@@ -206,27 +246,62 @@ class GemmInputGenerator(InputGenerator):
         B_scales = self._scale_for_format(
             b_format,
             "b",
+            batch_shape=batch_shape,
             M=M,
             N=N,
             K=K,
             block_size=block_size,
         )
 
-        out_dtype = torch.bfloat16
-        alpha = None
-
         return {
             "A": A,
             "B": B,
             "A_scales": A_scales,
             "B_scales": B_scales,
-            "out_dtype": out_dtype,
-            "alpha": alpha,
+            "out_dtype": torch.bfloat16,
+            "alpha": None,
             "block_size": block_size,
         }
 
+    def generate(
+        self,
+        M: int,
+        N: int,
+        K: int,
+    ) -> dict[str, Any]:
+        return self._generate_for_shape(
+            batch_shape=(),
+            M=M,
+            N=N,
+            K=K,
+            a_layout=self._trait_value("a_layout", "MK"),
+            b_layout=self._trait_value("b_layout", "NK"),
+        )
+
+
+class BmmInputGenerator(GemmInputGenerator):
+    def generate(
+        self,
+        M: int,
+        N: int,
+        K: int,
+        B: int | None = None,
+        batch: int | None = None,
+        **_: Any,
+    ) -> dict[str, Any]:
+        batch_size = B if B is not None else batch if batch is not None else 1
+        return self._generate_for_shape(
+            batch_shape=(batch_size,),
+            M=M,
+            N=N,
+            K=K,
+            a_layout="BMK",
+            b_layout="BNK",
+        )
+
 
 set_input_generator("gemm", "mm", GemmInputGenerator)
+set_input_generator("gemm", "bmm", BmmInputGenerator)
 
 # ---------------------------------------------------------------------------
 # Shape Presets
@@ -261,5 +336,24 @@ GEMM_MM_BENCHMARK_SHAPES: list[dict[str, int]] = [
 ]
 
 
+GEMM_BMM_STANDARD_SHAPES: list[dict[str, Any]] = [
+    {"batch": 1, "M": 4, "N": 32, "K": 64},
+    {"batch": 4, "M": 8, "N": 128, "K": 64},
+    {"batch": 8, "M": 2, "N": 128, "K": 128},
+    {"batch": 4, "M": 16, "N": 256, "K": 256},
+]
+
+
+GEMM_BMM_BENCHMARK_SHAPES: list[dict[str, Any]] = [
+    {"batch": 32, "M": 1, "N": 4096, "K": 4096},
+    {"batch": 8, "M": 16, "N": 4096, "K": 4096},
+    {"batch": 4, "M": 64, "N": 4096, "K": 4096},
+    {"batch": 32, "M": 1, "N": 512, "K": 512},
+    {"batch": 8, "M": 16, "N": 512, "K": 512},
+]
+
+
 set_standard_shapes("gemm", "mm", GEMM_MM_STANDARD_SHAPES)
 set_benchmark_shapes("gemm", "mm", GEMM_MM_BENCHMARK_SHAPES)
+set_standard_shapes("gemm", "bmm", GEMM_BMM_STANDARD_SHAPES)
+set_benchmark_shapes("gemm", "bmm", GEMM_BMM_BENCHMARK_SHAPES)

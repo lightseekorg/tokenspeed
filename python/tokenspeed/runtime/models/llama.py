@@ -52,7 +52,10 @@ from tokenspeed.runtime.models.base import (
     BaseDecoderLayer,
     BaseTransformerModel,
 )
-from tokenspeed.runtime.models.utils import create_fused_set_kv_buffer_arg
+from tokenspeed.runtime.models.utils import (
+    create_fused_set_kv_buffer_arg,
+    validate_attention_partition,
+)
 from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.pdl import pdl_enabled
 
@@ -131,13 +134,13 @@ class LlamaAttention(nn.Module):
         attn_tp_group = mapping.attn.tp_group
 
         self.total_num_heads = num_heads
-        assert self.total_num_heads % self.attn_tp_size == 0
-        self.num_heads = self.total_num_heads // self.attn_tp_size
         self.total_num_kv_heads = num_kv_heads
-        if self.total_num_kv_heads >= self.attn_tp_size:
-            assert self.total_num_kv_heads % self.attn_tp_size == 0
-        else:
-            assert self.attn_tp_size % self.total_num_kv_heads == 0
+        validate_attention_partition(
+            self.total_num_heads,
+            self.total_num_kv_heads,
+            self.attn_tp_size,
+        )
+        self.num_heads = self.total_num_heads // self.attn_tp_size
         self.num_kv_heads = max(1, self.total_num_kv_heads // self.attn_tp_size)
         self.head_dim = getattr(
             config, "head_dim", self.hidden_size // self.total_num_heads

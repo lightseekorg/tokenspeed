@@ -1,4 +1,5 @@
 /python/tokenspeed/runtime @lightseekorg/code-owner
-/tokenspeed-kernel @lightseekorg/code-owner
+/tokenspeed-kernel @lightseekorg/code-owner @lightseekorg/kernel-team
+/tokenspeed-kernel-amd @lightseekorg/code-owner @lightseekorg/kernel-team
 /tokenspeed-mla @lightseekorg/code-owner
 /tokenspeed-scheduler @lightseekorg/code-owner

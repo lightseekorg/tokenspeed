@@ -36,6 +36,7 @@ from tokenspeed_kernel.ops.layernorm.triton import (
 )
 
 # Configs
+from tokenspeed.runtime.configs.paged_cache_spec import FULL_ATTENTION
 from tokenspeed.runtime.configs.qwen3_5_config import (
     Qwen3_5Config,
     Qwen3_5TextConfig,
@@ -86,6 +87,7 @@ from tokenspeed.runtime.models.qwen3_5_moe import (
     Qwen3_5MoeSparseMoeBlock,
 )
 from tokenspeed.runtime.models.qwen3_vision import Qwen3VLMoeVisionModel
+from tokenspeed.runtime.models.utils import validate_attention_partition
 from tokenspeed.runtime.moe.distribution_recorder import (
     get_global_expert_distribution_recorder,
 )
@@ -109,7 +111,6 @@ from tokenspeed.runtime.utils import (
     make_layers,
     set_weight_attrs,
 )
-from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import envs
 
 logger = logging.getLogger(__name__)
@@ -261,8 +262,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         if hasattr(param, "weight_loader"):
             # Regular parameter/tensor that already has a mutable attr.
-            # Do NOT call set_weight_attrs here, because it asserts when
-            # overwriting an existing attribute.
+            # Do NOT call set_weight_attrs here; overwriting an existing
+            # attribute is rejected.
             param.weight_loader = loader
             return
 
@@ -317,19 +318,21 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
                 if len(loaded_weight.shape) == 0:
                     # Scalar only makes sense for a single logical shard.
-                    assert len(split_sizes) == 1 and split_sizes[0] == 1, (
-                        f"Unexpected scalar for tuple shard load: "
-                        f"{loaded_shard_id=}, {split_sizes=}"
-                    )
+                    if len(split_sizes) != 1 or split_sizes[0] != 1:
+                        raise ValueError(
+                            f"Unexpected scalar for tuple shard load: "
+                            f"{loaded_shard_id=}, {split_sizes=}"
+                        )
                     chunks = [loaded_weight.reshape(1)]
                 else:
                     split_dim = getattr(param, "output_dim", 0)
                     chunks = loaded_weight.split(split_sizes, dim=split_dim)
 
-                assert len(chunks) == len(loaded_shard_id), (
-                    f"Chunk/shard mismatch: {len(chunks)=}, "
-                    f"{len(loaded_shard_id)=}, {split_sizes=}"
-                )
+                if len(chunks) != len(loaded_shard_id):
+                    raise ValueError(
+                        f"Chunk/shard mismatch: {len(chunks)=}, "
+                        f"{len(loaded_shard_id)=}, {split_sizes=}"
+                    )
 
                 for idx, chunk in zip(loaded_shard_id, chunks):
                     # Delegate each chunk to the param's original int-shard loader.
@@ -583,13 +586,13 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self.attn_tp_size = mapping.attn.tp_size
         self.attn_tp_group = mapping.attn.tp_group
         self.total_num_heads = config.num_attention_heads
-        assert self.total_num_heads % self.attn_tp_size == 0
-        self.num_heads = self.total_num_heads // self.attn_tp_size
         self.total_num_kv_heads = config.num_key_value_heads
-        if self.total_num_kv_heads >= self.attn_tp_size:
-            assert self.total_num_kv_heads % self.attn_tp_size == 0
-        else:
-            assert self.attn_tp_size % self.total_num_kv_heads == 0
+        validate_attention_partition(
+            self.total_num_heads,
+            self.total_num_kv_heads,
+            self.attn_tp_size,
+        )
+        self.num_heads = self.total_num_heads // self.attn_tp_size
         self.num_kv_heads = max(1, self.total_num_kv_heads // self.attn_tp_size)
         self.head_dim = config.head_dim or (self.hidden_size // self.num_heads)
         self.q_size = self.num_heads * self.head_dim
@@ -655,6 +658,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            group_id=FULL_ATTENTION,
         )
 
         # Dense MLP for non-MoE variant
@@ -898,6 +902,15 @@ class Qwen3_5ForCausalLM(nn.Module):
         # Final normalization
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        # For DFLASH speculative decoding: set of layer indices whose
+        # *input* hidden states are captured. Populated by
+        # set_eagle3_layers_to_capture() / set_dflash_layers_to_capture().
+        self.layers_to_capture: set = set()
+        self._dflash_incremental_callback = None
+        self._dflash_slot_bufs = None
+        self._dflash_capture_idx_map = {}
+        self._dflash_incr_active = False
+
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
 
@@ -926,9 +939,32 @@ class Qwen3_5ForCausalLM(nn.Module):
             hidden_states = input_embeds
             residual = None
 
+        aux_hidden_states = [] if self.layers_to_capture else None
+
         # Pass through decoder layers
         for layer_idx in range(len(self.layers)):
             layer = self.layers[layer_idx]
+            if aux_hidden_states is not None and layer_idx in self.layers_to_capture:
+                # Under RSAG the inter-layer hidden/residual are reduce-scattered
+                # across the attn TP group; aux consumers (e.g. the DFLASH
+                # drafter) expect full rows, so gather before capturing.
+                aux = (
+                    hidden_states + residual if residual is not None else hidden_states
+                )
+                gathered = layer.comm_manager.gather_residual(aux, ctx)
+                capture_idx = self._dflash_capture_idx_map.get(layer_idx)
+                if (
+                    self._dflash_incr_active
+                    and self._dflash_incremental_callback is not None
+                    and self._dflash_slot_bufs is not None
+                    and capture_idx is not None
+                ):
+                    num_tokens = gathered.shape[0]
+                    self._dflash_slot_bufs[capture_idx][:num_tokens].copy_(gathered)
+                    self._dflash_incremental_callback(capture_idx, num_tokens)
+                aux_hidden_states.append(
+                    gathered if gathered is aux else gathered.clone()
+                )
             with get_global_expert_distribution_recorder().with_current_layer(
                 layer_idx
             ):
@@ -956,7 +992,7 @@ class Qwen3_5ForCausalLM(nn.Module):
             hidden_states, residual, ctx, self.norm
         )
 
-        return hidden_states, None
+        return hidden_states, aux_hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -1126,6 +1162,8 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                     mapped_name = moe_loader.load(name, loaded_weight)
                     loaded_params.add(mapped_name)
                     continue
+                if moe_loader.is_expert_checkpoint_weight(name):
+                    continue
 
                 # Skip loading extra parameters for GPTQ/nvfp4 models.
                 if name.endswith(ignore_suffixes) and name not in params_dict:
@@ -1161,6 +1199,7 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             mapping=mapping,
             quant_config=quant_config,
             prefix=prefix,
+            encoder_only=getattr(config, "encoder_only", False),
         )
 
         rope_config = get_rope_parameters(self.config)
@@ -1191,10 +1230,11 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             self.video_encoder = self.get_video_feature
 
     def separate_deepstack_embeds(self, embedding: torch.Tensor):
-        assert embedding.shape[-1] % (1 + self.num_deepstack_embeddings) == 0, (
-            f"hidden_state of {embedding.shape} should be divisible by "
-            f"{1 + self.num_deepstack_embeddings}"
-        )
+        divisor = 1 + self.num_deepstack_embeddings
+        if embedding.shape[-1] % divisor != 0:
+            raise ValueError(
+                f"hidden_state of {embedding.shape} should be divisible by {divisor}"
+            )
         separate_index = self.config.hidden_size
         input_embeds = embedding[:, :separate_index]
         input_deepstack_embeds = embedding[:, separate_index:]
@@ -1229,9 +1269,10 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
         video, ``image_grid_thw`` otherwise) so a single shared encoder cudagraph
         wrapper can serve both image and video batches.
         """
-        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
-            self.visual.dtype
-        )
+        device = self.visual.device
+        pixel_values = torch.cat(
+            [item.feature.to(device, non_blocking=True) for item in items], dim=0
+        ).type(self.visual.dtype)
         grid = torch.concat(
             [
                 getattr(
@@ -1246,8 +1287,10 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             ],
             dim=0,
         )
-        assert pixel_values.dim() == 2, pixel_values.dim()
-        assert grid.dim() == 2, grid.dim()
+        if pixel_values.dim() != 2:
+            raise ValueError(f"pixel_values must be 2D, got {pixel_values.dim()}D.")
+        if grid.dim() != 2:
+            raise ValueError(f"grid must be 2D, got {grid.dim()}D.")
         x = self.visual.prepare_patch_embed(pixel_values, grid)
         return x, grid
 
@@ -1314,6 +1357,32 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
+
+    def set_dflash_layers_to_capture(
+        self,
+        layer_ids: list[int],
+        incremental_callback=None,
+        slot_bufs: list | None = None,
+    ) -> None:
+        # DFLASH checkpoints name 0-indexed target layer outputs. The capture
+        # check runs before layer i, so capture at i + 1 for layer i's output.
+        num_layers = len(self.model.layers)
+        if len(set(layer_ids)) != len(layer_ids):
+            raise ValueError("DFLASH target_layer_ids must be unique.")
+        invalid = [val for val in layer_ids if val < 0 or val + 1 >= num_layers]
+        if invalid:
+            raise ValueError(
+                "DFLASH target_layer_ids must map to capturable target layer "
+                f"outputs. Got invalid ids {invalid}; valid range is "
+                f"[0, {num_layers - 2}] for {num_layers} target layers."
+            )
+        self.model.layers_to_capture = {val + 1 for val in layer_ids}
+        sorted_capture_layers = sorted(self.model.layers_to_capture)
+        self.model._dflash_capture_idx_map = {
+            layer_idx: i for i, layer_idx in enumerate(sorted_capture_layers)
+        }
+        self.model._dflash_incremental_callback = incremental_callback
+        self.model._dflash_slot_bufs = slot_bufs
 
     @torch.no_grad()
     def forward(
@@ -1406,6 +1475,12 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             if "mtp" in name:
                 continue
             if not self.is_multimodal_active and "visual" in name:
+                continue
+            # Vision-only role: drop every non-visual (LM / lm_head / norm /
+            # embed) weight up front, before any rename or params_dict lookup,
+            # so none is routed into a None module. self.model is None here, so
+            # named_parameters() exposes only visual params.
+            if getattr(self, "encoder_only", False) and "visual" not in name:
                 continue
             if "language_model" in name:
                 name = name.replace(r"model.language_model.", r"model.")
@@ -1527,6 +1602,13 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
                 continue
             if not self.is_multimodal_active and "visual" in name:
                 continue
+            # Vision-only role: drop every non-visual (LM / lm_head / norm /
+            # embed / expert) weight up front, before any rename, params_dict
+            # lookup, or moe_loader.load (which would KeyError on a missing
+            # expert param). self.model is None here, so named_parameters()
+            # exposes only visual params.
+            if getattr(self, "encoder_only", False) and "visual" not in name:
+                continue
             if "language_model" in name:
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
@@ -1559,6 +1641,8 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration):
                 if moe_loader.matches(name):
                     mapped_name = moe_loader.load(name, loaded_weight)
                     loaded_params.add(mapped_name)
+                    continue
+                if moe_loader.is_expert_checkpoint_weight(name):
                     continue
 
                 # Skip loading extra parameters for GPTQ/nvfp4 models.

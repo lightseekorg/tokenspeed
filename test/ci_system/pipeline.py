@@ -37,9 +37,10 @@ SUPPORTED_TRIGGERS = {"per-commit", "manual", "nightly", "debug"}
 # 1gpu unit-test for the same b300 box).
 SUPPORTED_PRIORITIES = ("high", "normal", "low")
 DEFAULT_PRIORITY = "normal"
-SUPPORTED_RUNNER_GROUPS = ("all", "amd", "nvidia")
+SUPPORTED_RUNNER_GROUPS = ("all", "amd", "nvidia", "nvidia-arm", "nvidia-x86")
 _PRIORITY_ORDER = {value: index for index, value in enumerate(SUPPORTED_PRIORITIES)}
 B200_RUNNER_LABEL_ENV = "TOKENSPEED_B200_RUNNER_LABEL"
+EXCLUDED_RUNNER_LABELS_ENV = "TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS"
 STALE_PROCESS_PATTERNS = [
     r"ts serve",
     r"python.*-m\s+smg(\s|\.launch|$)",
@@ -57,6 +58,7 @@ RUNNER_SM_PREFIXES = (
 )
 
 AMD_RUNNER_PREFIXES = ("amd-mi35x-", "amd-mi355-", "amd-mi350-")
+NVIDIA_ARM_RUNNER_PREFIXES = ("gb200",)
 GB200_RUNNER_PREFIXES = ("gb200",)
 NVIDIA_GPU_CLEANUP_RUNNER_PREFIXES = ("gb200", "b300")
 PERF_DIAGNOSTIC_RUNNERS = ("b300-4gpu",)
@@ -66,6 +68,10 @@ def is_amd_runner(runner: str) -> bool:
     return runner.startswith(AMD_RUNNER_PREFIXES)
 
 
+def is_nvidia_arm_runner(runner: str) -> bool:
+    return runner.startswith(NVIDIA_ARM_RUNNER_PREFIXES)
+
+
 def runner_matches_group(runner: str, runner_group: str) -> bool:
     if runner_group == "all":
         return True
@@ -73,6 +79,10 @@ def runner_matches_group(runner: str, runner_group: str) -> bool:
         return is_amd_runner(runner)
     if runner_group == "nvidia":
         return not is_amd_runner(runner)
+    if runner_group == "nvidia-arm":
+        return is_nvidia_arm_runner(runner)
+    if runner_group == "nvidia-x86":
+        return not is_amd_runner(runner) and not is_nvidia_arm_runner(runner)
     raise ValueError(f"unsupported runner group: {runner_group!r}")
 
 
@@ -171,6 +181,31 @@ def validate_task(data: Dict[str, Any], path: Path) -> None:
                 f"{path}: priority must be a string or a per-label mapping; "
                 f"got {type(priority).__name__}"
             )
+    if "optional" in data:
+        optional = data["optional"]
+        if isinstance(optional, bool):
+            pass
+        elif isinstance(optional, dict):
+            unknown_labels = sorted(set(optional) - set(labels))
+            if unknown_labels:
+                raise ValueError(
+                    f"{path}: optional contains unknown labels: {unknown_labels}"
+                )
+            bad_values = sorted(
+                label
+                for label, value in optional.items()
+                if not isinstance(value, bool)
+            )
+            if bad_values:
+                raise ValueError(
+                    f"{path}: optional values must be booleans for labels: "
+                    f"{bad_values}"
+                )
+        else:
+            raise ValueError(
+                f"{path}: optional must be a boolean or a per-label mapping; "
+                f"got {type(optional).__name__}"
+            )
 
 
 def normalize_task(path: Path, repo_root: Path) -> Dict[str, Any]:
@@ -182,6 +217,19 @@ def normalize_task(path: Path, repo_root: Path) -> Dict[str, Any]:
 
 def get_b200_runner_label_override() -> str:
     return os.environ.get(B200_RUNNER_LABEL_ENV, "").strip()
+
+
+def get_excluded_runner_labels() -> List[str]:
+    return [
+        term.strip().lower()
+        for term in os.environ.get(EXCLUDED_RUNNER_LABELS_ENV, "").split(",")
+        if term.strip()
+    ]
+
+
+def runner_is_excluded(runner: str, excluded_labels: Iterable[str]) -> bool:
+    normalized_runner = runner.lower()
+    return any(label in normalized_runner for label in excluded_labels)
 
 
 def resolve_runner_label(label: str) -> str:
@@ -221,6 +269,17 @@ def resolve_priority_for_label(priority: Any, label: str) -> str:
     return DEFAULT_PRIORITY
 
 
+def resolve_optional_for_label(optional: Any, label: str) -> bool:
+    """Pick whether ``label`` is allowed to fail from task ``optional`` data."""
+    if optional is None:
+        return False
+    if isinstance(optional, bool):
+        return optional
+    if isinstance(optional, dict):
+        return optional.get(label, False)
+    return False
+
+
 def build_matrix(
     root: Path,
     repo_root: Path,
@@ -228,16 +287,22 @@ def build_matrix(
     runner_group: str = "all",
 ) -> Dict[str, Any]:
     include = []
+    excluded_runner_labels = get_excluded_runner_labels()
     for path in find_task_files(root):
         task = normalize_task(path, repo_root)
         if trigger and trigger not in task["triggers"]:
             continue
         priority = task.get("priority")
+        optional = task.get("optional")
         for label in task["runner"]["labels"]:
             # `priority` keys are the labels as written in YAML, so look
-            # up before `resolve_runner_label` rewrites b200 to b200v2.
+            # up per-label metadata before `resolve_runner_label` rewrites
+            # b200 to b200v2.
             effective = resolve_priority_for_label(priority, label)
+            is_optional = resolve_optional_for_label(optional, label)
             runner = resolve_runner_label(label)
+            if runner_is_excluded(runner, excluded_runner_labels):
+                continue
             if not runner_matches_group(runner, runner_group):
                 continue
             include.append(
@@ -247,6 +312,7 @@ def build_matrix(
                     "config": task["_source_path"],
                     "runner": runner,
                     "priority": effective,
+                    "optional": is_optional,
                 }
             )
     # Stable sort: tasks at the same priority keep their file-path / label
@@ -471,14 +537,6 @@ def setup_runner(
     shell_run("sudo apt-get update -q", env=local_env, cwd=cwd, dry_run=dry_run)
     shell_run(
         "sudo apt-get install -y ninja-build",
-        env=local_env,
-        cwd=cwd,
-        dry_run=dry_run,
-    )
-    shell_run(
-        "sudo apt-get install -y libspdlog-dev || "
-        "(git clone --depth 1 https://github.com/gabime/spdlog.git /tmp/spdlog && "
-        "sudo cp -r /tmp/spdlog/include/spdlog /usr/local/include/)",
         env=local_env,
         cwd=cwd,
         dry_run=dry_run,

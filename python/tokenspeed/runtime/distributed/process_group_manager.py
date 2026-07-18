@@ -22,6 +22,7 @@
 
 from datetime import timedelta
 
+import torch
 import torch.distributed as dist
 
 from tokenspeed.runtime.distributed.mapping import Group, Mapping
@@ -52,14 +53,18 @@ class ProcessGroupManager:
         distributed_init_method: str = "env://",
         backend: str = "nccl",
         timeout: int | None = None,
+        device_id: "torch.device | None" = None,
     ) -> None:
         if not dist.is_initialized():
-            assert (
-                distributed_init_method is not None
-            ), "distributed_init_method must be provided when initializing distributed environment"
+            if distributed_init_method is None:
+                raise ValueError(
+                    "distributed_init_method must be provided when initializing distributed environment"
+                )
             if timeout is not None:
-                assert isinstance(timeout, int), "timeout must be a number"
-                assert timeout > 0, "timeout must be positive"
+                if not isinstance(timeout, int):
+                    raise TypeError("timeout must be a number")
+                if timeout <= 0:
+                    raise ValueError("timeout must be positive")
                 timeout = timedelta(seconds=timeout)
 
             dist.init_process_group(
@@ -68,6 +73,7 @@ class ProcessGroupManager:
                 world_size=mapping.world_size,
                 rank=mapping.rank,
                 timeout=timeout,
+                device_id=device_id,
             )
 
     def register_process_group(

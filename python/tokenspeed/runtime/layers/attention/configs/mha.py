@@ -25,6 +25,11 @@ from dataclasses import dataclass
 import torch
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
+from tokenspeed.runtime.configs.paged_cache_spec import (
+    STATE_LAYER_TYPES,
+    PagedCacheGroupSpec,
+    scheduler_ext_flat_kvcache,
+)
 from tokenspeed.runtime.layers.attention.configs.base import (
     BaseAttnConfig,
     resolve_dtype,
@@ -35,6 +40,31 @@ from tokenspeed.runtime.utils.server_args import ServerArgs
 
 @dataclass
 class MHAConfig(BaseAttnConfig):
+    # Per-layer attention-type labels + window, forwarded to the KV pool for
+    # paged_cache_group_specs publication (empty -> single full-history group).
+    layer_types: tuple[str, ...] = ()
+    sliding_window_tokens: int | tuple[int | None, ...] | None = None
+    max_scheduled_tokens: int = 0
+    # True iff server_args.disaggregation_mode != "null"; the pool's slab
+    # guards consume it.
+    pd_disaggregation_enabled: bool = False
+    # Mamba2/GDN per-state-layer shapes and dtypes (the configs'
+    # mamba2_cache_params), forwarded to the pool's state slabs. Populated
+    # only on a flat-built scheduler ext — the radix path keeps its
+    # SimpleMambaPool state ownership byte-identical (None here means the
+    # pool neither allocates state slabs nor runs the page-geometry check).
+    conv_state_shape: tuple[int, ...] | None = None
+    # Extra model-declared paged-cache groups (e.g. Inkling paged sconv); forwarded to publication
+    extra_paged_groups: tuple[PagedCacheGroupSpec, ...] = ()
+    # Slot span in tokens (largest group's block)
+    slot_tokens: int | None = None
+    # Per-group page sizes (hetero zero-padding slots)
+    group_page_sizes: dict[str, int] | None = None
+    layer_kv_head_counts: tuple[int, ...] | None = None
+    temporal_state_shape: tuple[int, ...] | None = None
+    conv_dtype: torch.dtype | None = None
+    ssm_dtype: torch.dtype | None = None
+
     @classmethod
     def generate(
         cls, server_args: ServerArgs, model_config: ModelConfig, is_draft: bool = False
@@ -49,9 +79,41 @@ class MHAConfig(BaseAttnConfig):
         draft_block_decode = bool(
             is_draft and server_args.speculative_algorithm == "DFLASH"
         )
-        if draft_block_decode:
+        if draft_block_decode and server_args.drafter_attention_backend != "trtllm":
             kv_cache_dtype = "bfloat16"
 
+        hf_config = getattr(model_config, "hf_config", None)
+        # paged_cache_layer_types wins: it can carry labels outside transformers' ALLOWED_LAYER_TYPES
+        layer_types = tuple(
+            getattr(hf_config, "paged_cache_layer_types", None)
+            or getattr(hf_config, "layer_types", None)
+            or ()
+        )
+        if (
+            is_draft
+            and layer_types
+            and len(layer_types) != model_config.num_attention_layers
+        ):
+            # Target-stack labels don't fit the draft depth; drop so the pool falls back to full attn
+            layer_types = ()
+        sliding_window_tokens = getattr(hf_config, "sliding_window", None)
+        conv_state_shape = temporal_state_shape = None
+        conv_dtype = ssm_dtype = None
+        if (
+            any(label in STATE_LAYER_TYPES for label in layer_types)
+            and scheduler_ext_flat_kvcache()
+        ):
+            # GDN hybrid on the flat ext: the KV pool owns the recurrent
+            # state (state slabs), so it needs the mamba2 shapes/dtypes.
+            # Radix branch untouched: SimpleMambaPool owns the state there.
+            text_config = getattr(hf_config, "text_config", hf_config)
+            (
+                conv_state_shape,
+                temporal_state_shape,
+                conv_dtype,
+                ssm_dtype,
+                _,
+            ) = text_config.mamba2_cache_params
         return cls(
             device=server_args.device,
             context_len=model_config.context_len,
@@ -66,6 +128,7 @@ class MHAConfig(BaseAttnConfig):
             attn_tp_size=server_args.attn_tp_size or server_args.mapping.attn.tp_size,
             dtype=model_config.dtype,
             kv_cache_dtype=resolve_dtype(kv_cache_dtype),
+            kv_cache_mxfp8=kv_cache_dtype == "mxfp8",
             page_size=server_args.block_size,
             max_bs=server_args.max_num_seqs
             // (server_args.data_parallel_size or server_args.mapping.attn.dp_size),
@@ -73,16 +136,31 @@ class MHAConfig(BaseAttnConfig):
             kv_cache_quant_method=server_args.kv_cache_quant_method,
             is_draft=is_draft,
             draft_block_decode=draft_block_decode,
+            layer_types=layer_types,
+            sliding_window_tokens=sliding_window_tokens,
+            max_scheduled_tokens=getattr(server_args, "chunked_prefill_size", 8192),
+            pd_disaggregation_enabled=getattr(
+                server_args, "disaggregation_mode", "null"
+            )
+            != "null",
+            conv_state_shape=conv_state_shape,
+            temporal_state_shape=temporal_state_shape,
+            conv_dtype=conv_dtype,
+            ssm_dtype=ssm_dtype,
             **kwargs,
         )
 
     def cache_cell_size(self) -> int:
-        return (
+        cell = (
             max(self.num_kv_heads // self.attn_tp_size, 1)
             * self.head_dim
             * 2
             * torch._utils._element_size(self.kv_cache_dtype)
         )
+        if self.kv_cache_mxfp8:
+            # One UE8M0 byte per 32 fp8 data bytes.
+            cell += cell // 32
+        return cell
 
     def create_pool(
         self,
@@ -91,9 +169,20 @@ class MHAConfig(BaseAttnConfig):
         rank: int,
         enable_memory_saver: bool,
     ) -> BaseTokenToKVPool:
-        from tokenspeed.runtime.layers.attention.kv_cache.mha import MHATokenToKVPool
+        from tokenspeed.runtime.layers.attention.kv_cache.mha import (
+            MHATokenToKVPool,
+            MHATokenToKVPoolMXFP8,
+        )
 
-        return MHATokenToKVPool(
+        pool_cls = MHATokenToKVPool
+        if self.kv_cache_mxfp8:
+            assert self.page_size == 128, (
+                "mxfp8 KV cache requires --block-size 128 (the attention "
+                "kernel consumes the interleaved paged scale layout)"
+            )
+            pool_cls = MHATokenToKVPoolMXFP8
+
+        return pool_cls(
             size=max_total_num_tokens,
             dtype=self.kv_cache_dtype,
             head_num=max(self.num_kv_heads // self.attn_tp_size, 1),
@@ -105,4 +194,19 @@ class MHAConfig(BaseAttnConfig):
             max_context_len=self.context_len,
             page_size=self.page_size,
             rank=rank,
+            layer_types=self.layer_types,
+            sliding_window_tokens=self.sliding_window_tokens,
+            max_scheduled_tokens=self.max_scheduled_tokens,
+            pd_disaggregation_enabled=self.pd_disaggregation_enabled,
+            conv_state_shape=self.conv_state_shape,
+            extra_paged_groups=self.extra_paged_groups,
+            slot_tokens=self.slot_tokens,
+            group_page_sizes=self.group_page_sizes,
+            layer_kv_head_counts=self.layer_kv_head_counts,
+            # Pre-TP width the slab rows are allocated at (head_num is its
+            # per-rank shard) — the per-layer view normalization base.
+            kv_alloc_head_count=self.num_kv_heads,
+            temporal_state_shape=self.temporal_state_shape,
+            conv_dtype=self.conv_dtype,
+            ssm_dtype=self.ssm_dtype,
         )

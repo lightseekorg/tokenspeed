@@ -26,11 +26,13 @@ import logging
 import tokenspeed_kernel.numerics.reference.gemm  # noqa: F401
 import tokenspeed_kernel.ops.gemm.deep_gemm  # noqa: F401
 import tokenspeed_kernel.ops.gemm.flashinfer  # noqa: F401
+import tokenspeed_kernel.ops.gemm.gluon  # noqa: F401
 import tokenspeed_kernel.ops.gemm.triton  # noqa: F401
 import tokenspeed_kernel.ops.gemm.trtllm  # noqa: F401
 import torch
-from tokenspeed_kernel.platform import Platform
+from tokenspeed_kernel.platform import ArchVersion, Platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
+from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import (
     ScaleFormat,
@@ -41,16 +43,17 @@ from tokenspeed_kernel.signature import (
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["mm"]
+__all__ = ["bmm", "mm"]
 
 _platform = Platform.get()
 _fp8_dtype = _platform.fp8e4m3fn.dtype
 
-# Kernels that natively fuse a bias-vector add inside their GEMM kernel.
-# For any kernel not listed here, ``mm`` applies the bias with a post-GEMM
+# Kernels that accept and own bias application inside their GEMM wrapper.
+# For any kernel not listed here, dispatch applies the bias with a post-GEMM
 # add instead of passing it to the kernel.
 _KERNELS_WITH_FUSED_BIAS: frozenset[str] = frozenset(
     {
+        "torch_bmm",
         "torch_mm",
         "triton_mm_fp8_scaled",
     }
@@ -162,6 +165,21 @@ def _online_quantize_mxfp8(
     """
     block_k = block_size[1]
 
+    if (
+        kernel_name in {"flashinfer_mm_fp8_blockscale", "triton_mm_fp8_blockscale"}
+        and _platform.is_nvidia
+        and _platform.arch_version == ArchVersion(12, 0)
+    ):
+        from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
+
+        return quantize_fp8_with_scale(
+            A,
+            granularity="token_group",
+            group_size=block_k,
+            scale_encoding="float32",
+            solution="triton",
+        )
+
     def ensure_row_major_scales(
         qA: torch.Tensor,
         A_scales: torch.Tensor,
@@ -224,9 +242,32 @@ def _online_quantize_mxfp8(
         raise ValueError(f"No online quantization defined for kernel {kernel_name!r}")
 
 
+def _kernel_handles_online_mxfp8(kernel_name: str) -> bool:
+    spec = KernelRegistry.get().get_by_name(kernel_name)
+    return spec is not None and spec.solution == "reference"
+
+
 # ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
+
+
+def _validate_gemm_out(
+    out: torch.Tensor,
+    *,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device,
+    op: str,
+) -> None:
+    if tuple(out.shape) != shape:
+        raise ValueError(f"{op} out expects shape {shape}, got {tuple(out.shape)}")
+    if out.dtype != dtype:
+        raise ValueError(f"{op} out expects dtype {dtype}, got {out.dtype}")
+    if out.device != device:
+        raise ValueError(f"{op} out expects device {device}, got {out.device}")
+    if out.stride(-1) != 1:
+        raise ValueError(f"{op} out must have stride(-1) == 1")
 
 
 def mm(
@@ -236,6 +277,7 @@ def mm(
     A_scales: torch.Tensor | None = None,
     B_scales: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
     out_dtype: torch.dtype | None = None,
     alpha: torch.Tensor | None = None,
     block_size: list[int] | None = None,
@@ -260,6 +302,8 @@ def mm(
             output.  When the selected kernel supports a fused bias
             epilogue (see ``_KERNELS_WITH_FUSED_BIAS``) it is passed
             into the kernel; otherwise it is added after the GEMM.
+        out: Optional output buffer. The output may be a strided view
+            but must have contiguous rows (``stride(-1) == 1``).
         out_dtype: Output dtype (defaults to ``A.dtype``).
         alpha: Global scaling factor (nvfp4 only).
         block_size: Block size for block-wise quantization, e.g.
@@ -267,11 +311,13 @@ def mm(
         quant: Explicit quant type override.  One of ``"mxfp8"``,
             ``"fp8"``, ``"nvfp4"``, ``"mxfp4"``, ``"none"``.
             If ``None``, inferred from input dtypes and scales.
+        enable_pdl: Whether to request Programmatic Dependent Launch support
+            from kernels that accept it.
         override: Force selection of a specific kernel by name (e.g.
             ``"cublaslt_mm_nvfp4"``). Bypasses heuristic scoring.
         expected_kernel_name: Debug hint for expected kernel selection.
     """
-    out_dtype = out_dtype or A.dtype
+    out_dtype = out_dtype or (out.dtype if out is not None else A.dtype)
 
     M = A.shape[0]
     if quant == "mxfp4":
@@ -281,11 +327,21 @@ def mm(
         K = A.shape[-1]
         N = B.shape[-1] if B.shape[0] == K else B.shape[0]
 
+    if out is not None:
+        _validate_gemm_out(
+            out,
+            shape=(M, N),
+            dtype=out_dtype,
+            device=A.device,
+            op="mm",
+        )
+
     traits: dict[str, object] = {
         "n_align_16": N % 16 == 0,
         "k_align_16": K % 16 == 0,
         "n_align_64": N % 64 == 0,
         "n_align_128": N % 128 == 0,
+        "k_align_64": K % 64 == 0,
         "k_align_128": K % 128 == 0,
     }
 
@@ -304,14 +360,23 @@ def mm(
     )
 
     # Online activation quantization
-    if quant == "mxfp8" and A_scales is None:
+    if (
+        quant == "mxfp8"
+        and A_scales is None
+        and not _kernel_handles_online_mxfp8(kernel.name)
+    ):
         assert (
             block_size is not None
         ), "block_size is required for online activation quantization"
         A, A_scales = _online_quantize_mxfp8(A, block_size, kernel.name)
 
     kernel_args = (A, B, A_scales, B_scales, out_dtype)
-    kernel_kwargs: dict[str, object] = {"alpha": alpha, "block_size": block_size}
+    kernel_kwargs: dict[str, object] = {
+        "alpha": alpha,
+        "block_size": block_size,
+    }
+    if out is not None:
+        kernel_kwargs["out"] = out
 
     fused_bias = bias is not None and kernel.name in _KERNELS_WITH_FUSED_BIAS
     if fused_bias:
@@ -334,9 +399,167 @@ def mm(
         select_dtype,
         kernel_name=kernel.name,
         **shape_params,
+        has_out=out is not None,
     ):
         output = kernel(*kernel_args, **kernel_kwargs)
 
     if bias is not None and not fused_bias:
-        output = output + bias.to(dtype=output.dtype)
+        if out is not None:
+            output.add_(bias.to(dtype=output.dtype))
+        else:
+            output = output + bias.to(dtype=output.dtype)
+    return output
+
+
+def bmm(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    *,
+    A_scales: torch.Tensor | None = None,
+    B_scales: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+    alpha: torch.Tensor | None = None,
+    block_size: list[int] | None = None,
+    quant: str | None = None,
+    enable_pdl: bool = False,
+    override: str | None = None,
+    expected_kernel_name: str | None = None,
+) -> torch.Tensor:
+    """Batched matrix multiply with automatic kernel selection.
+
+    Mirrors :func:`mm` for batched inputs with an outer batch dimension.
+    ``A`` must use ``[B, M, K]`` layout and ``B`` must use ``[B, N, K]``
+    layout. The result shape is ``[B, M, N]``.
+    If ``out`` is provided, kernels that support direct output write into that
+    buffer. The output may be a strided view but must have contiguous rows
+    (``stride(-1) == 1``).
+
+    Args:
+        A: Activation batch ``[batch, M, K]``.
+        B: Weight batch ``[batch, N, K]``.
+        A_scales: Activation scales.
+        B_scales: Weight scales (layout depends on quant type).
+        bias: Optional bias vector of shape ``[N]`` or per-batch bias matrix
+            of shape ``[batch, N]`` added to the output. When the selected
+            kernel supports a fused bias epilogue (see
+            ``_KERNELS_WITH_FUSED_BIAS``) it is passed into the kernel;
+            otherwise it is added after the BMM.
+        out: Optional output buffer. The output may be a strided view
+            but must have contiguous rows (``stride(-1) == 1``).
+        out_dtype: Output dtype (defaults to ``A.dtype``).
+        alpha: Global scaling factor (nvfp4 only).
+        block_size: Block size for block-wise quantization, e.g.
+            ``[128, 128]``.
+        quant: Explicit quant type override. One of ``"mxfp8"``,
+            ``"fp8"``, ``"nvfp4"``, ``"mxfp4"``, ``"none"``.
+            If ``None``, inferred from input dtypes and scales.
+        enable_pdl: Whether to request Programmatic Dependent Launch support
+            from kernels that accept it.
+        override: Force selection of a specific kernel by name. Bypasses
+            heuristic scoring.
+        expected_kernel_name: Debug hint for expected kernel selection.
+    """
+    out_dtype = out_dtype or (out.dtype if out is not None else A.dtype)
+    if A.ndim != 3:
+        raise ValueError(f"bmm expects A with shape [B, M, K], got {tuple(A.shape)}")
+    if B.ndim != 3:
+        raise ValueError(f"bmm expects B with shape [B, N, K], got {tuple(B.shape)}")
+
+    batch, M, A_storage_K = A.shape
+    B_batch, N, B_storage_K = B.shape
+    if B_batch != batch:
+        raise ValueError(f"bmm batch mismatch: A batch={batch}, B batch={B_batch}")
+    if B_storage_K != A_storage_K:
+        raise ValueError(f"bmm K mismatch: A K={A_storage_K}, B K={B_storage_K}")
+    K = A_storage_K * 2 if quant == "mxfp4" else A_storage_K
+
+    if out is not None:
+        _validate_gemm_out(
+            out,
+            shape=(batch, M, N),
+            dtype=out_dtype,
+            device=A.device,
+            op="bmm",
+        )
+
+    traits: dict[str, object] = {
+        "n_align_16": N % 16 == 0,
+        "k_align_16": K % 16 == 0,
+        "n_align_64": N % 64 == 0,
+        "n_align_128": N % 128 == 0,
+        "k_align_64": K % 64 == 0,
+        "k_align_128": K % 128 == 0,
+    }
+
+    signature = _gemm_format_signature(
+        A, B, A_scales, B_scales, out_dtype, quant, block_size
+    )
+    select_dtype = signature.storage_dtype_for("a") or A.dtype
+
+    kernel = select_kernel(
+        "gemm",
+        "bmm",
+        signature,
+        traits=traits,
+        override=override,
+        expected_kernel_name=expected_kernel_name,
+    )
+
+    if (
+        quant == "mxfp8"
+        and A_scales is None
+        and not _kernel_handles_online_mxfp8(kernel.name)
+    ):
+        assert (
+            block_size is not None
+        ), "block_size is required for online activation quantization"
+        A, A_scales = _online_quantize_mxfp8(A, block_size, kernel.name)
+
+    kernel_args = (A, B, A_scales, B_scales, out_dtype)
+    kernel_kwargs: dict[str, object] = {
+        "alpha": alpha,
+        "block_size": block_size,
+    }
+    if out is not None:
+        kernel_kwargs["out"] = out
+
+    fused_bias = bias is not None and kernel.name in _KERNELS_WITH_FUSED_BIAS
+    if fused_bias:
+        kernel_kwargs["bias"] = bias
+
+    if kernel.name in _KERNELS_WITH_PDL:
+        kernel_kwargs["enable_pdl"] = enable_pdl
+
+    shape_params = {"B": batch, "M": M, "N": N, "K": K}
+    ShapeCapture.get().record(
+        "gemm",
+        "bmm",
+        kernel.name,
+        select_dtype,
+        shape_params,
+    )
+    with kernel_scope(
+        "gemm",
+        "bmm",
+        select_dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+        has_out=out is not None,
+    ):
+        output = kernel(*kernel_args, **kernel_kwargs)
+
+    if bias is not None and not fused_bias:
+        bias = bias.to(dtype=output.dtype)
+        if bias.ndim == 1:
+            bias_view = bias.view(1, 1, -1)
+        elif bias.ndim == 2:
+            bias_view = bias.view(bias.shape[0], 1, bias.shape[1])
+        else:
+            raise ValueError(f"bmm bias expects shape [N] or [B, N], got {bias.shape}")
+        if out is not None:
+            output.add_(bias_view)
+        else:
+            output = output + bias_view
     return output

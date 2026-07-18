@@ -29,8 +29,8 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any, Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -78,9 +78,13 @@ from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
 )
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_manager import CommManager
-from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
+)
+from tokenspeed.runtime.execution.breakable_cuda_graph import (
+    break_point,
+    current_forward_ctx,
+    slice_to_real_tokens,
 )
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
@@ -159,7 +163,7 @@ def _deepseek_v4_metadata_matches_tokens(metadata, num_tokens: int) -> bool:
 
 
 def _deepseek_v4_indexer_token_split(
-    forward_mode: Optional[ForwardMode],
+    forward_mode: ForwardMode | None,
     metadata,
     total_tokens: int,
 ) -> tuple[int, int]:
@@ -173,7 +177,7 @@ def _deepseek_v4_indexer_token_split(
 def _deepseek_v4_forward_metadata(ctx: ForwardContext):
     metadata = getattr(ctx.attn_backend, "forward_metadata", None)
     forward_mode = getattr(ctx, "forward_mode", None)
-    if forward_mode == ForwardMode.EXTEND:
+    if forward_mode is not None and forward_mode.is_extend_or_mixed():
         return getattr(ctx.attn_backend, "forward_prefill_metadata", None) or metadata
     if forward_mode is not None and forward_mode.is_decode_or_idle():
         input_num_tokens = getattr(ctx, "input_num_tokens", None)
@@ -544,7 +548,7 @@ def _deepseek_v4_gather_paged_indexer_mxfp4_cache(
     block_table: torch.Tensor,
     cu_seq_lens: torch.Tensor,
     block_size: int,
-    out: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     _, value_bytes, scale_bytes = deepseek_v4_indexer_mxfp4_layout_from_row_bytes(
         cache_2d.shape[1] // block_size
@@ -600,10 +604,10 @@ def _deepseek_v4_indexer_topk_from_logits(
     *,
     next_n: int = 1,
     use_prefill_topk_op: bool = False,
-    row_starts: Optional[torch.Tensor] = None,
-    row_ends: Optional[torch.Tensor] = None,
-    out: Optional[torch.Tensor] = None,
-    persistent_topk_workspace: Optional[torch.Tensor] = None,
+    row_starts: torch.Tensor | None = None,
+    row_ends: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    persistent_topk_workspace: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if not logits.is_cuda or logits.dtype != torch.float32:
         raise RuntimeError("DeepSeek V4 indexer top-k requires CUDA float32 logits")
@@ -643,8 +647,8 @@ def _deepseek_v4_indexer_topk_from_logits(
     if max_len <= 0:
         return topk
 
-    row_starts_for_kernel: Optional[torch.Tensor] = None
-    row_ends_for_kernel: Optional[torch.Tensor] = None
+    row_starts_for_kernel: torch.Tensor | None = None
+    row_ends_for_kernel: torch.Tensor | None = None
     if row_starts is not None or row_ends is not None:
         if row_starts is None:
             row_starts_for_kernel = torch.zeros_like(length_rows)
@@ -713,8 +717,8 @@ def _deepseek_v4_indexer_topk_from_logits_prefill_op(
     length_rows: torch.Tensor,
     topk_tokens: int,
     *,
-    row_starts: Optional[torch.Tensor] = None,
-    row_ends: Optional[torch.Tensor] = None,
+    row_starts: torch.Tensor | None = None,
+    row_ends: torch.Tensor | None = None,
     out: torch.Tensor,
 ) -> torch.Tensor:
     """Use the local TRT-LLM CUDA prefill selector."""
@@ -785,7 +789,7 @@ class _DeepseekV4IndexerPrefillChunk:
 
 
 def _deepseek_v4_indexer_prefill_max_logits_bytes(
-    max_logits_bytes: Optional[int] = None,
+    max_logits_bytes: int | None = None,
 ) -> int:
     if max_logits_bytes is not None:
         return max(1, int(max_logits_bytes))
@@ -795,7 +799,7 @@ def _deepseek_v4_indexer_prefill_max_logits_bytes(
 
 def _deepseek_v4_indexer_prefill_workspace_size(
     seq_lens_cpu: torch.Tensor,
-    workspace_size: Optional[int] = None,
+    workspace_size: int | None = None,
 ) -> int:
     if workspace_size is not None:
         return max(1, int(workspace_size))
@@ -812,8 +816,8 @@ def _deepseek_v4_indexer_prefill_request_chunks(
     query_lens_cpu: torch.Tensor,
     compress_ratio: int,
     num_tokens: int,
-    max_logits_bytes: Optional[int] = None,
-    workspace_size: Optional[int] = None,
+    max_logits_bytes: int | None = None,
+    workspace_size: int | None = None,
     request_offset: int = 0,
 ) -> list[_DeepseekV4IndexerPrefillChunk]:
     """Build request/query-slice sparse-indexer prefill chunks."""
@@ -1195,8 +1199,8 @@ def _deepseek_v4_indexer_decode_plan(
     block_table: torch.Tensor,
     cache_block_size: int,
     compress_ratio: int,
-    metadata: Optional[DeepseekV4ForwardMetadata] = None,
-    is_valid_token: Optional[torch.Tensor] = None,
+    metadata: DeepseekV4ForwardMetadata | None = None,
+    is_valid_token: torch.Tensor | None = None,
     block_table_base_offsets: torch.Tensor | None = None,
 ) -> DeepseekV4IndexerDecodePlan:
     num_tokens = positions.numel()
@@ -1308,9 +1312,9 @@ def _deepseek_v4_indexer_decode_schedule_metadata(
     positions: torch.Tensor,
     cache_block_size: int,
     compress_ratio: int,
-    metadata: Optional[DeepseekV4ForwardMetadata],
-    context_lens: Optional[torch.Tensor] = None,
-) -> Optional[torch.Tensor]:
+    metadata: DeepseekV4ForwardMetadata | None,
+    context_lens: torch.Tensor | None = None,
+) -> torch.Tensor | None:
     if positions.numel() == 0:
         return None
     if deep_gemm is None:
@@ -1373,9 +1377,9 @@ def _deepseek_v4_indexer_topk_prefill_deepgemm(
     cache_block_size: int,
     topk_tokens: int,
     use_prefill_topk_op: bool,
-    gathered_k: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-    gather_workspace: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-) -> tuple[torch.Tensor, Optional[tuple[torch.Tensor, torch.Tensor]]]:
+    gathered_k: tuple[torch.Tensor, torch.Tensor] | None = None,
+    gather_workspace: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
     q_values, q_scales = index_q
     if not _deepseek_v4_deepgemm_fp4_indexer_available(q_values):
         raise RuntimeError("DeepSeek V4 sparse indexer requires DeepGEMM FP4 support")
@@ -1447,14 +1451,14 @@ def _deepseek_v4_indexer_topk_from_cache_deepgemm_decode(
     weights: torch.Tensor,
     compress_ratio: int,
     topk_tokens: int,
-    metadata: Optional[DeepseekV4ForwardMetadata] = None,
-    schedule_metadata: Optional[torch.Tensor] = None,
-    decode_context_lens: Optional[torch.Tensor] = None,
-    decode_block_table: Optional[torch.Tensor] = None,
-    decode_max_context_len: Optional[int] = None,
-    is_valid_token: Optional[torch.Tensor] = None,
-    out: Optional[torch.Tensor] = None,
-    persistent_topk_workspace: Optional[torch.Tensor] = None,
+    metadata: DeepseekV4ForwardMetadata | None = None,
+    schedule_metadata: torch.Tensor | None = None,
+    decode_context_lens: torch.Tensor | None = None,
+    decode_block_table: torch.Tensor | None = None,
+    decode_max_context_len: int | None = None,
+    is_valid_token: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    persistent_topk_workspace: torch.Tensor | None = None,
 ) -> torch.Tensor:
     q_values, q_scales = index_q
     if not _deepseek_v4_deepgemm_fp4_indexer_available(q_values):
@@ -1565,9 +1569,9 @@ def _deepseek_v4_sparse_attn_indexer_native(
     packed_q_values: torch.Tensor,
     packed_q_scales: torch.Tensor,
     packed_weights: torch.Tensor,
-    decode_schedule_metadata: Optional[torch.Tensor],
-    decode_context_lens: Optional[torch.Tensor],
-    decode_block_table: Optional[torch.Tensor],
+    decode_schedule_metadata: torch.Tensor | None,
+    decode_context_lens: torch.Tensor | None,
+    decode_block_table: torch.Tensor | None,
     decode_max_context_len: int,
     topk_indices_buffer: torch.Tensor,
     prefill_gather_values_workspace: torch.Tensor,
@@ -1977,12 +1981,14 @@ def _deepseek_v4_padded_heads(num_local_heads: int) -> int:
 
 def _deepseek_v4_sanitize_swa_slot_mapping(
     slot_mapping: torch.Tensor,
-    swa_kv_cache: torch.Tensor,
-    block_size: int,
+    capacity: int,
     is_valid_token: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    # Fail closed: with no writable SWA capacity every slot is masked, so an
+    # unchecked mapping can never reach the fused cache-insert kernels.
+    if capacity <= 0:
+        return torch.full_like(slot_mapping, -1)
     slot_mapping = _mask_invalid_graph_tokens(slot_mapping, is_valid_token)
-    capacity = int(swa_kv_cache.shape[0]) * int(block_size)
     valid = (slot_mapping >= 0) & (slot_mapping < capacity)
     return torch.where(
         valid,
@@ -1996,26 +2002,46 @@ def _deepseek_v4_swa_slot_mapping(
     positions: torch.Tensor,
     out_cache_loc: torch.Tensor,
 ) -> torch.Tensor:
+    """Build the SWA write-slot mapping, already sanitized for cache inserts.
+
+    The returned mapping has invalid CUDA-graph tokens and out-of-capacity
+    slots masked to -1, so per-layer SWA inserts can consume it directly.
+    Sanitizing here keeps the mask/clamp elementwise chain at once per step;
+    doing it per layer previously baked ~7 tiny kernels x 61 layers into the
+    captured decode graph.
+    """
     if positions.numel() == 0:
         return out_cache_loc
     metadata = _deepseek_v4_forward_metadata(ctx)
     if metadata is None:
         raise RuntimeError("DeepSeek V4 attention requires forward metadata")
     cache_metadata = metadata.cache
-    if cache_metadata.swa_block_table is None:
-        return out_cache_loc
     token_to_req_indices = metadata.token_to_req_indices[: positions.numel()]
-    if token_to_req_indices.numel() != positions.numel() and (
+    if cache_metadata.swa_block_table is None:
+        slot_mapping = out_cache_loc
+    elif token_to_req_indices.numel() != positions.numel() and (
         token_to_req_indices.numel() <= 0
         or positions.numel() % token_to_req_indices.numel() != 0
     ):
-        return out_cache_loc
-    return _group_slot_mapping_from_raw(
-        positions,
-        token_to_req_indices,
-        cache_metadata.swa_block_table,
-        ctx.token_to_kv_pool.swa_block_size,
-        base_offsets=cache_metadata.swa_base_logical_page,
+        slot_mapping = out_cache_loc
+    else:
+        slot_mapping = _group_slot_mapping_from_raw(
+            positions,
+            token_to_req_indices,
+            cache_metadata.swa_block_table,
+            ctx.token_to_kv_pool.swa_block_size,
+            base_offsets=cache_metadata.swa_base_logical_page,
+        )
+    is_valid_token = getattr(metadata, "is_valid_token", None)
+    if is_valid_token is not None:
+        is_valid_token = is_valid_token[: positions.numel()]
+    # Attribute access is deliberately unguarded: a pool without
+    # swa_capacity_slots must fail fast here rather than skip the bounds
+    # check that protects the fused cache-insert kernels.
+    return _deepseek_v4_sanitize_swa_slot_mapping(
+        slot_mapping,
+        ctx.token_to_kv_pool.swa_capacity_slots,
+        is_valid_token,
     )
 
 
@@ -2393,14 +2419,13 @@ class DeepseekV4MegaMoEExperts(nn.Module):
             symm_buffer.topk_weights[:num_tokens],
         )
 
-        assert (
-            self._transformed_l1_weights is not None
-            and self._transformed_l2_weights is not None
-        ), (
-            "DeepseekV4MegaMoEExperts.finalize_weights() must run via "
-            "post_load_weights() before forward()"
-        )
-        assert deep_gemm is not None
+        if self._transformed_l1_weights is None or self._transformed_l2_weights is None:
+            raise RuntimeError(
+                "DeepseekV4MegaMoEExperts.finalize_weights() must run via "
+                "post_load_weights() before forward()"
+            )
+        if deep_gemm is None:
+            raise RuntimeError("deep_gemm is required for fp8_fp4_mega_moe.")
         deep_gemm.fp8_fp4_mega_moe(
             y,
             self._transformed_l1_weights,
@@ -2511,6 +2536,7 @@ class DeepseekV4MoE(nn.Module):
                 with_bias=True,
                 routing_config={
                     "routed_scaling_factor": self.routed_scaling_factor,
+                    "normalize_topk_weights": config.norm_topk_prob,
                     "correction_bias": self.gate.e_score_correction_bias,
                     "routing_method_type": RoutingMethodType.Renormalize,
                 },
@@ -3267,10 +3293,6 @@ class DeepseekV4Indexer(nn.Module):
             )
         with nvtx_range("indexer_compressed_slot_mapping"):
             indexer_block_size = pool.get_indexer_block_size(layer_index)
-            indexer_block_table = cache_metadata.compressed_block_table(
-                self.compress_ratio,
-                indexer_block_size,
-            )
             compressed_slots = cache_metadata.compressed_slot_mapping(
                 positions,
                 self.compress_ratio,
@@ -3391,8 +3413,6 @@ class DeepseekV4Attention(nn.Module):
             rope_scaling=rope_scaling,
             is_neox_style=False,
         )
-        if not rope_scaling and hasattr(self.rotary_emb, "forward_cuda"):
-            self.rotary_emb.forward = self.rotary_emb.forward_cuda
         self.indexer_rotary_emb = self.rotary_emb
         self.fused_wqa_wkv = MergedColumnParallelLinear(
             config.hidden_size,
@@ -3504,16 +3524,12 @@ class DeepseekV4Attention(nn.Module):
         positions: torch.Tensor,
         cos_sin_cache: torch.Tensor,
         block_size: int,
-        is_valid_token: torch.Tensor | None = None,
     ) -> None:
+        # slot_mapping arrives pre-sanitized from _deepseek_v4_swa_slot_mapping
+        # (invalid tokens and out-of-capacity slots masked to -1); sanitizing
+        # here again would re-run the mask chain once per layer.
         if q.shape[0] == 0:
             return
-        slot_mapping = _deepseek_v4_sanitize_swa_slot_mapping(
-            slot_mapping,
-            swa_kv_cache,
-            block_size,
-            is_valid_token=is_valid_token,
-        )
         fused_qnorm_rope_kv_insert(
             q=q,
             kv=kv,
@@ -3565,6 +3581,7 @@ class DeepseekV4Attention(nn.Module):
         out, _ = self.wo_b(z.flatten(1))
         return out
 
+    @break_point
     def forward(
         self,
         positions: torch.Tensor,
@@ -3574,10 +3591,27 @@ class DeepseekV4Attention(nn.Module):
         swa_slot_mapping: torch.Tensor | None = None,
         compressor_slot_cache: dict | None = None,
     ) -> torch.Tensor:
+        """DSA attention, one COARSE breakable-graph break point.
+
+        Per layer it does multiple paged-cache writes (SWA / compressor /
+        indexer), a data/length-dependent indexer -> top-k stage, the FlashMLA
+        sparse kernel, AND aux-stream forks -- none capturable into a CUDA
+        graph. Under a prefill-graph capture the whole attention runs eager
+        (reading the live ``ctx``) while the layer's norms + MoE stay graphed;
+        direct call otherwise (see ``break_point``). Padding rows are handled
+        by the existing ``metadata.is_valid_token`` masking, and the
+        token-shaped inputs are sliced to the real count DSA kernels assert
+        (see ``slice_to_real_tokens`` below). The cross-layer SWA slot mapping
+        and compressor memo are shared via ctx -- replay-safe because ctx is
+        rebound to the live forward (see ``DeepseekV4Model.forward``).
+        """
         if hidden_states.shape[0] == 0:
             return hidden_states
+        # Cross-layer compressor memo, created once per forward by the first layer.
         if compressor_slot_cache is None:
-            compressor_slot_cache = {}
+            compressor_slot_cache = ctx.dsa_compressor_slot_cache
+            if compressor_slot_cache is None:
+                compressor_slot_cache = ctx.dsa_compressor_slot_cache = {}
         profile_prefix = f"attn_{self.attention_kind}"
         cos_sin_cache = self.rotary_emb.cos_sin_cache
         if cos_sin_cache.dtype != torch.float32:
@@ -3586,6 +3620,22 @@ class DeepseekV4Attention(nn.Module):
         metadata = ctx.attn_backend.forward_metadata
         if metadata is None:
             raise RuntimeError("DeepSeek V4 attention requires forward metadata")
+
+        # Slice padded inputs to the real count the DSA kernels assert (see
+        # docstring). Only under a breakable capture/replay (ambient ctx set):
+        # eager forwards are never padded, and the MTP draft path reaches here
+        # with metadata whose token_to_req_indices does NOT describe q's rows.
+        token_to_req = getattr(metadata, "token_to_req_indices", None)
+        if current_forward_ctx() is not None and token_to_req is not None:
+            positions, hidden_states, out_cache_loc, swa_slot_mapping = (
+                slice_to_real_tokens(
+                    token_to_req.numel(),
+                    positions,
+                    hidden_states,
+                    out_cache_loc,
+                    swa_slot_mapping,
+                )
+            )
 
         # --- Phase 1: pre-compute input GEMMs in parallel ---
         # Q/KV projection on main stream; compressor GEMM(s) on aux stream.
@@ -3612,19 +3662,18 @@ class DeepseekV4Attention(nn.Module):
                         )
 
         if swa_slot_mapping is None:
-            swa_slot_mapping = _deepseek_v4_swa_slot_mapping(
-                ctx,
-                positions,
-                out_cache_loc,
-            )
+            # Cross-layer SWA slot mapping (per-token, layer-invariant), first layer computes.
+            swa_slot_mapping = ctx.dsa_swa_slot_mapping
+            if swa_slot_mapping is None:
+                swa_slot_mapping = _deepseek_v4_swa_slot_mapping(
+                    ctx,
+                    positions,
+                    out_cache_loc,
+                )
+                ctx.dsa_swa_slot_mapping = swa_slot_mapping
 
         def insert_swa_cache() -> None:
             with nvtx_range(f"{profile_prefix}_insert_swa_cache"):
-                is_valid_token = (
-                    metadata.is_valid_token[: positions.numel()]
-                    if metadata.is_valid_token is not None
-                    else None
-                )
                 self._insert_swa_cache(
                     q=q,
                     kv=kv,
@@ -3633,7 +3682,6 @@ class DeepseekV4Attention(nn.Module):
                     positions=positions,
                     cos_sin_cache=cos_sin_cache,
                     block_size=pool.swa_block_size,
-                    is_valid_token=is_valid_token,
                 )
 
         def run_compressor() -> None:
@@ -3656,7 +3704,8 @@ class DeepseekV4Attention(nn.Module):
         # state updates and paged cache writes — safe to overlap.
         topk_indices = None
         if self.indexer is not None:
-            assert self.compressor is not None
+            if self.compressor is None:
+                raise RuntimeError("compressor is required when indexer is enabled.")
             with nvtx_range(f"{profile_prefix}_indexer_prepare_decode_metadata"):
                 self.indexer.prepare_decode_metadata(
                     positions=positions,
@@ -4019,18 +4068,10 @@ class DeepseekV4Model(nn.Module):
                 hidden_states = self.embed_tokens(input_ids)
         with nvtx_range("hc_repeat"):
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
-        # The SWA write-slot mapping is identical across all layers, so compute
-        # it once per step here instead of recomputing it in every attention
-        # layer (DeepSeek-V3 likewise derives its slot mapping once per step).
-        swa_slot_mapping = _deepseek_v4_swa_slot_mapping(
-            ctx,
-            positions,
-            out_cache_loc,
-        )
-        # Per-(step, ratio) compressor slot mappings are identical across layers of the
-        # same ratio; memoize within the step (filled lazily by the first compressor of
-        # each ratio, reused by the rest).
-        compressor_slot_cache: dict = {}
+        # Layer-invariant DSA memos: computing them HERE (graphed scope) would bake
+        # dummy addresses; the first attention break computes them LIVE onto ctx.
+        ctx.dsa_swa_slot_mapping = None
+        ctx.dsa_compressor_slot_cache = None
         hc_x_prev = None
         hc_post_prev = None
         hc_comb_prev = None
@@ -4041,8 +4082,8 @@ class DeepseekV4Model(nn.Module):
                 ctx,
                 out_cache_loc,
                 input_ids,
-                swa_slot_mapping,
-                compressor_slot_cache,
+                None,  # swa_slot_mapping: first break computes + caches on ctx
+                None,  # compressor_slot_cache: shared dict created on ctx
                 hc_x_prev,
                 hc_post_prev,
                 hc_comb_prev,
@@ -4107,7 +4148,7 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
             name = name[:-6] + ".weight_scale_inv"
         return name
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         stacked_params_mapping = self.get_stacked_params_mapping()
         params_dict = dict(self.named_parameters())
         moe_loader = build_moe_checkpoint_loader(

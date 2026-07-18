@@ -27,12 +27,12 @@ import os
 import random
 from typing import Literal
 
+from tokenspeed_kernel.ops.attention.triton.linear.chunk_delta_h import (
+    CHUNK_SIZE as FLA_CHUNK_SIZE,
+)
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.mapping import Mapping, _resolve_parallelism_sizes
-from tokenspeed.runtime.layers.attention.linear.chunk_delta_h import (
-    CHUNK_SIZE as FLA_CHUNK_SIZE,
-)
 from tokenspeed.runtime.utils import (
     get_amdgpu_memory_capacity,
     get_colorful_logger,
@@ -132,6 +132,17 @@ class ServerArgs:
     api_key: str | None = None
     enable_cache_report: bool = False
     kv_events_config: str | None = None
+
+    # RL online weight sync (always on / ungated). NOTE: these endpoints can
+    # overwrite model weights, reload checkpoints from disk, and pause/abort
+    # serving, and are exposed on the public control port. See
+    # runtime/engine/weight_transfer/ and runtime/entrypoints/vllm_compat_http.py.
+    weight_transfer_config: str | None = None
+    # Port for the in-engine RL control-plane HTTP app (weight sync + pause/resume
+    # + memory occupation, both the native and SGLang-compatible dialects). Set by
+    # the ``ts serve`` orchestrator (allocated + proxied by the sidecar); None
+    # disables the in-engine app.
+    rl_control_port: int | None = None
 
     # Data parallelism
     data_parallel_size: int | None = None
@@ -245,7 +256,10 @@ class ServerArgs:
     low_latency_max_num_tokens_per_gpu: int = 256
     max_cudagraph_capture_size: int | None = None
     disable_prefill_graph: bool | None = False
-    prefill_graph_max_tokens: int | None = 128
+    # Breakable prefill graph bucket cap: None = auto min(2048, chunk); 0 disables.
+    prefill_graph_max_tokens: int | None = None
+    # Explicit prefill bucket list; unset = the relative-stride ladder (see get_prefill_token_buckets).
+    prefill_graph_capture_sizes: list[int] | None = None
     cudagraph_capture_sizes: list[int] | None = None
     enable_nan_detection: bool = False
     enable_nvtx: bool = False
@@ -270,7 +284,7 @@ class ServerArgs:
     mla_chunk_multiplier: int = 4
     mm_attention_backend: str | None = None
 
-    # For PD disaggregation: can be "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only)
+    # For PD/EPD disaggregation: "null", "prefill", "decode", or "encode" (vision-tower-only).
     disaggregation_mode: str = "null"
     disaggregation_bootstrap_port: int = 8998
     disaggregation_transfer_backend: str = "mooncake"
@@ -545,7 +559,7 @@ class ServerArgs:
                 int(x) for x in self.eagle3_layers_to_capture.split(",")
             ]
 
-        # Hoist the PD-decode runtime assert (topk == 1) to startup.
+        # Hoist the PD-decode topk == 1 check to startup.
         if self.speculative_algorithm is not None and self.speculative_eagle_topk != 1:
             raise ValueError(
                 "speculative_eagle_topk > 1 (tree spec) is not currently "
@@ -586,6 +600,16 @@ class ServerArgs:
                 "enable_prefix_caching=%r for decode server",
                 self.enable_prefix_caching,
             )
+        elif self.disaggregation_mode == "encode":
+            # Encode server: vision tower only, no LM / KV pool / prefix cache.
+            # enforce_eager left as-is (the vision tower keeps its own CUDA graph).
+            if self.mapping.has_attn_dp:
+                raise ValueError(
+                    "disaggregation_mode=encode currently supports "
+                    "data_parallel_size == 1 inside one encode server; run "
+                    "multiple independent encode servers for horizontal scale."
+                )
+            self.enable_prefix_caching = False
 
         # Prefill graph disable logic is handled by AttnInitializer.modify_args
         # after the attention backend is resolved.
@@ -594,14 +618,20 @@ class ServerArgs:
             self.disaggregation_mode == "prefill"
             and self.load_balance_method != "round_robin"
         ):
-            assert (
-                not self.mapping.has_attn_dp
-            ), f"Not Supported when {self.disaggregation_mode=} {self.load_balance_method=} {self.mapping.attn.dp_size=}"
+            if self.mapping.has_attn_dp:
+                raise ValueError(
+                    "Not supported when "
+                    f"{self.disaggregation_mode=} {self.load_balance_method=} "
+                    f"{self.mapping.attn.dp_size=}"
+                )
 
     def _handle_kvstore(self):
-        if self.disaggregation_mode == "decode":
+        if self.disaggregation_mode in ("decode", "encode"):
             self.enable_kvstore = False
-            logger.info("Decode instance has set enable_kvstore to False!")
+            logger.info(
+                "%s instance has set enable_kvstore to False!",
+                self.disaggregation_mode,
+            )
         elif not self.disable_kvstore:
             self.enable_kvstore = True
 
@@ -773,8 +803,11 @@ class ServerArgs:
             "--kv-cache-dtype",
             type=str,
             default=ServerArgs.kv_cache_dtype,
-            choices=["auto", "fp8", "fp8_e4m3"],
-            help='Data type for kv cache storage. "auto" will use model data type. "fp8" is an alias for "fp8_e4m3".',
+            choices=["auto", "fp8", "fp8_e4m3", "mxfp8"],
+            help='Data type for kv cache storage. "auto" will use model data type. '
+            '"fp8" is an alias for "fp8_e4m3" (per-tensor scales). "mxfp8" stores '
+            "block-scaled fp8-e4m3 (one UE8M0 scale per 32 head_dim elements) and "
+            "requires --block-size 128 with an MHA attention backend.",
         )
         parser.add_argument(
             "--kv-cache-quant-method",
@@ -1311,17 +1344,26 @@ class ServerArgs:
         parser.add_argument(
             "--sampling-backend",
             type=str,
-            choices=["greedy", "flashinfer", "flashinfer_full"],
+            choices=[
+                "greedy",
+                "flashinfer",
+                "flashinfer_full",
+                "triton",
+                "triton_full",
+            ],
             default=ServerArgs.sampling_backend,
             help="Sampling backend. "
-            "When unspecified, defaults to 'flashinfer' on NVIDIA and 'greedy' elsewhere. "
             "'greedy': argmax + verify_chain_greedy, zero sampling-param plumbing. "
             "'flashinfer': temperature/top_k/top_p via fused softmax + top_k_top_p_sampling_from_probs; "
             "min_p and penalties silently ignored. "
+            "'triton': temperature/top_k/top_p via MRV2-style logits-to-Gumbel-Max; "
+            "min_p and penalties silently ignored. "
             "'flashinfer_full': adds min_p plus frequency/presence/repetition penalties and logit_bias "
             "via the softmax+renorm+min_p kernel sequence. "
+            "'triton_full': adds min_p plus frequency/presence/repetition penalties and logit_bias "
+            "with Triton Gumbel-Max for single-step sampling. "
             "Allocates a counts[max_req_pool_size, vocab_size] int32 buffer (substantial memory). "
-            "Both 'flashinfer' and 'flashinfer_full' require top_k < 128 (fused kernel limit) or -1.",
+            "Finite top_k values must be < 128 or -1.",
         )
         parser.add_argument(
             "--dp-sampling",
@@ -1582,7 +1624,19 @@ class ServerArgs:
             "--prefill-graph-max-tokens",
             type=int,
             default=ServerArgs.prefill_graph_max_tokens,
-            help="Max query tokens to capture when enable prefill graph",
+            help="Largest token bucket captured by the breakable prefill CUDA "
+            "graph. Default (unset) = min(2048, chunked-prefill size); "
+            "0 disables.",
+        )
+        parser.add_argument(
+            "--prefill-graph-capture-sizes",
+            metavar="PREFILL_GRAPH_CAPTURE_SIZE",
+            type=int,
+            nargs="+",
+            help="Explicit list of token-bucket sizes to capture for the "
+            "breakable prefill graph (like --cudagraph-capture-sizes for "
+            "decode). Unset: a relative-stride ladder bounding padded compute "
+            "at ~12.5%% of any size.",
         )
         parser.add_argument(
             "--enable-nan-detection",
@@ -1748,8 +1802,8 @@ class ServerArgs:
             "--disaggregation-mode",
             type=str,
             default="null",
-            choices=["null", "prefill", "decode"],
-            help='Only used for PD disaggregation. "prefill" for prefill-only server, and "decode" for decode-only server. If not specified, it is not PD disaggregated',
+            choices=["null", "prefill", "decode", "encode"],
+            help='Used for PD/EPD disaggregation. "prefill" for prefill-only server, "decode" for decode-only server, and "encode" for a vision-tower-only server that ships image embeddings to a prefill server. If not specified, it is not disaggregated',
         )
         parser.add_argument(
             "--comm-fusion-max-num-tokens",
@@ -1796,6 +1850,23 @@ class ServerArgs:
             help="The URL of the PD disaggregation load balancer. If set, the prefill/decode server will register with the load balancer.",
         )
 
+        # RL online weight sync (always on / ungated).
+        parser.add_argument(
+            "--weight-transfer-config",
+            type=str,
+            default=ServerArgs.weight_transfer_config,
+            help='JSON config for weight transfer, e.g. \'{"backend":"nccl"}\'. '
+            "Backend is one of 'nccl' (disaggregated) or 'ipc' (colocated).",
+        )
+        parser.add_argument(
+            "--rl-control-port",
+            type=int,
+            default=ServerArgs.rl_control_port,
+            help="Port for the in-engine RL control-plane HTTP app (weight sync, "
+            "pause/resume, memory occupation). Normally allocated automatically "
+            "by the `ts serve` orchestrator.",
+        )
+
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
         args.ep_size = args.expert_parallel_size
@@ -1837,6 +1908,14 @@ class ServerArgs:
         if is_valid_ipv6_address(self.host):
             return f"http://[{self.host}]:{self.port}"
         return f"http://{self.host}:{self.port}"
+
+    def get_weight_transfer_config(self):
+        """Parse ``--weight-transfer-config`` JSON into a ``WeightTransferConfig``."""
+        from tokenspeed.runtime.engine.weight_transfer.config import (
+            WeightTransferConfig,
+        )
+
+        return WeightTransferConfig.from_json(self.weight_transfer_config)
 
 
 def prepare_server_args(argv: list[str]) -> ServerArgs:
@@ -1902,9 +1981,10 @@ class PortArgs:
             dist_init_addr = ("127.0.0.1", server_args.port + ZMQ_TCP_PORT_DELTA)
         else:
             dist_init_addr = server_args.dist_init_addr.split(":")
-        assert (
-            len(dist_init_addr) == 2
-        ), "please provide --dist-init-addr as host:port of head node"
+        if len(dist_init_addr) != 2:
+            raise ValueError(
+                "please provide --dist-init-addr as host:port of head node"
+            )
 
         dist_init_host, dist_init_port = dist_init_addr
         dist_init_port = int(dist_init_port)

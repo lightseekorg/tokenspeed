@@ -21,11 +21,36 @@
 """Helpers shared across runtime model implementations."""
 
 import torch
-from tokenspeed_kernel.ops.embedding import FusedSetKVBufferArg
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.ops.embedding import FusedMLASetKVBufferArg, FusedSetKVBufferArg
 
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.utils import print_warning_once
+
+
+def validate_attention_partition(
+    total_num_heads: int,
+    total_num_kv_heads: int,
+    tp_size: int,
+) -> None:
+    if tp_size <= 0:
+        raise ValueError(f"tp_size must be positive, got {tp_size}.")
+    if total_num_heads % tp_size != 0:
+        raise ValueError(
+            f"num_attention_heads={total_num_heads} must be divisible by tp_size={tp_size}."
+        )
+    if total_num_kv_heads <= 0:
+        raise ValueError(
+            f"num_key_value_heads must be positive, got {total_num_kv_heads}."
+        )
+    if total_num_kv_heads >= tp_size:
+        if total_num_kv_heads % tp_size != 0:
+            raise ValueError(
+                f"num_key_value_heads={total_num_kv_heads} must be divisible by tp_size={tp_size}."
+            )
+    elif tp_size % total_num_kv_heads != 0:
+        raise ValueError(
+            f"tp_size={tp_size} must be divisible by num_key_value_heads={total_num_kv_heads}."
+        )
 
 
 def create_fused_set_kv_buffer_arg(
@@ -71,5 +96,36 @@ def create_fused_set_kv_buffer_arg(
         v_buffer=v_buffer,
         k_scale=None,
         v_scale=None,
+        cache_loc=out_cache_loc,
+    )
+
+
+def create_fused_mla_set_kv_buffer_arg(
+    k_nope: torch.Tensor,
+    rope_dim: int,
+    out_cache_loc: torch.Tensor,
+    token_to_kv_pool,
+    layer_id: int,
+):
+    """Build fused MLA RoPE+KV write arguments when the cache layout matches."""
+
+    from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
+
+    if not isinstance(token_to_kv_pool, MLATokenToKVPool):
+        return None
+
+    kv_buffer = token_to_kv_pool.get_key_buffer(layer_id)
+    if not isinstance(kv_buffer, torch.Tensor):
+        return None
+    if kv_buffer.dtype != k_nope.dtype:
+        return None
+    if kv_buffer.ndim != 3 or kv_buffer.shape[1] != 1:
+        return None
+    if kv_buffer.shape[2] != k_nope.shape[-1] + rope_dim:
+        return None
+
+    return FusedMLASetKVBufferArg(
+        k_nope=k_nope,
+        kv_buffer=kv_buffer.view(kv_buffer.shape[0], -1),
         cache_loc=out_cache_loc,
     )

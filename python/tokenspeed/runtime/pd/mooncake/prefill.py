@@ -24,25 +24,25 @@ import socket
 import threading
 import time
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
 import requests
 
-from tokenspeed.runtime.pd.base.conn import (
-    KVArgs,
-    KVPoll,
-)
+from tokenspeed.runtime.pd.base.status import TransferPoll
 from tokenspeed.runtime.pd.mooncake.conn import MooncakeKVManagerBase
 from tokenspeed.runtime.pd.mooncake.entities import (
+    KVArgs,
     KVArgsRegisterInfo,
-    ManagerArgs,
+    KVManagerArgs,
     TransferIndexResolution,
     TransferInfo,
     TransferKVChunk,
 )
-from tokenspeed.runtime.pd.transfer_plan import BufferKind, TransferFragment
+from tokenspeed.runtime.pd.transfer_plan import (
+    BufferKind,
+    TransferFragment,
+)
 from tokenspeed.runtime.pd.utils import (
     DisaggregationMode,
     FastQueue,
@@ -66,17 +66,17 @@ logger = get_colorful_logger(__name__)
 class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
     def __init__(
         self,
-        args: ManagerArgs,
+        args: KVManagerArgs,
         kv_args: KVArgs,
     ):
         super().__init__(args, kv_args, DisaggregationMode.PREFILL)
 
-        self.transfer_infos: Dict[int, Dict[str, TransferInfo]] = {}
-        self.decode_kv_args_table: Dict[str, KVArgsRegisterInfo] = {}
+        self.transfer_infos: dict[int, dict[str, TransferInfo]] = {}
+        self.decode_kv_args_table: dict[str, KVArgsRegisterInfo] = {}
         self.start_prefill_thread()
         self._register_to_bootstrap()
         self.session_failures = defaultdict(int)
-        self.failed_sessions: Dict[str, float] = {}
+        self.failed_sessions: dict[str, float] = {}
         self.failed_session_ttl = max(
             envs.TOKENSPEED_DISAGGREGATION_FAILED_SESSION_TTL.get(), 0
         )
@@ -97,7 +97,9 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         self.layerwise_interval = 1
         self.layerwise_debug = envs.TOKENSPEED_PD_LAYERWISE_DEBUG.get()
         self.step_counter = None
-        self.prefill_metadata: Dict[int, Tuple[int, Optional[list[int]]]] = {}
+        # room -> (bootstrap_token, spec_candidate_ids). Published after the prefill
+        # forward; the transfer thread reads it on the wait_for_bootstrap_token path.
+        self.prefill_metadata: dict[int, tuple[int, list[int] | None]] = {}
         self.expired_prefill_metadata_rooms: set[int] = set()
         self.bootstrap_token_cond = threading.Condition()
         # Determine the number of threads to use for kv sender
@@ -108,10 +110,12 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             )
         )
         transfer_queue_size = envs.TOKENSPEED_DISAGGREGATION_QUEUE_SIZE.get()
-        assert transfer_thread_pool_size >= transfer_queue_size, (
-            f"The environment variable TOKENSPEED_DISAGGREGATION_THREAD_POOL_SIZE={transfer_thread_pool_size} must be "
-            f"greater than or equal to TOKENSPEED_DISAGGREGATION_QUEUE_SIZE={transfer_queue_size}."
-        )
+        if transfer_thread_pool_size < transfer_queue_size:
+            raise ValueError(
+                "TOKENSPEED_DISAGGREGATION_THREAD_POOL_SIZE="
+                f"{transfer_thread_pool_size} must be greater than or equal to "
+                f"TOKENSPEED_DISAGGREGATION_QUEUE_SIZE={transfer_queue_size}."
+            )
         self.start_transfer_thread(transfer_thread_pool_size, transfer_queue_size)
         self.bootstrap_time_out = envs.TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
 
@@ -132,7 +136,10 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         return cache_step
 
     def set_prefill_metadata(
-        self, room: int, token: int, spec_candidate_ids: list[int] | None = None
+        self,
+        room: int,
+        token: int,
+        spec_candidate_ids: list[int] | None = None,
     ) -> None:
         with self.bootstrap_token_cond:
             if room in self.expired_prefill_metadata_rooms:
@@ -142,7 +149,10 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                     room,
                 )
                 return
-            self.prefill_metadata[room] = (token, spec_candidate_ids)
+            self.prefill_metadata[room] = (
+                token,
+                spec_candidate_ids,
+            )
             self.bootstrap_token_cond.notify_all()
 
     def discard_expired_metadata_room(self, room: int) -> None:
@@ -153,10 +163,10 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
 
     def _wait_prefill_metadata(
         self,
-        room: Optional[int],
+        room: int | None,
         fallback_token: int,
-        fallback_candidate_ids: Optional[list[int]],
-    ) -> tuple[int, Optional[list[int]]]:
+        fallback_candidate_ids: list[int] | None,
+    ) -> tuple[int, list[int] | None]:
         if room is None or fallback_token != -1:
             return fallback_token, fallback_candidate_ids
         wait_log_interval = max(envs.TOKENSPEED_PD_PREFILL_METADATA_TIMEOUT.get(), 0.01)
@@ -164,14 +174,17 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         next_log_time = start_time + wait_log_interval
         with self.bootstrap_token_cond:
             while room not in self.prefill_metadata:
-                if self.request_status.get(room) == KVPoll.Failed:
+                if self.request_status.get(room) == TransferPoll.Failed:
                     self.expired_prefill_metadata_rooms.add(room)
                     logger.warning(
                         "Prefill metadata unavailable for failed bootstrap_room=%s; using fallback=%s",
                         room,
                         fallback_token,
                     )
-                    return fallback_token, fallback_candidate_ids
+                    return (
+                        fallback_token,
+                        fallback_candidate_ids,
+                    )
                 now = time.monotonic()
                 if now >= next_log_time:
                     logger.debug(
@@ -264,9 +277,11 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
 
         # Prefill ON/Decode OFF: prefill-side only has partial kv cache, only send local part.
         if src_mode == "ON" and dst_mode == "OFF":
-            assert (
-                src_args is not None
-            ), "Prefill MLA L1.5 cache is enabled but no transfer metadata provided"
+            if src_args is None:
+                raise RuntimeError(
+                    "Prefill MLA L1.5 cache is enabled but no transfer "
+                    "metadata provided"
+                )
             src_mask = src_args.page_transfer_mask
             src_local = src_args.page_local_indices
             return TransferIndexResolution(
@@ -276,9 +291,11 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
 
         # Prefill OFF/Decode ON: decode-side only has partial kv cache, only send requested part.
         if src_mode == "OFF" and dst_mode == "ON":
-            assert (
-                req.dst_page_transfer_mask is not None
-            ), "OFF/ON expects decode ownership mask when destination reports local indices."
+            if req.dst_page_transfer_mask is None:
+                raise RuntimeError(
+                    "OFF/ON expects decode ownership mask when destination "
+                    "reports local indices."
+                )
             dst_mapping = req.dst_page_indices_mapping[kv_chunk.index_slice]
             dst_mask = req.dst_page_transfer_mask[kv_chunk.index_slice]
             dst_mapping = dst_mapping[dst_mask]
@@ -289,12 +306,16 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             )
 
         # Prefill ON/Decode ON: both sides hold partial kv cache, find the intersection part.
-        assert (
-            src_args is not None
-        ), "ON/ON expects prefill metadata (page_transfer_mask/page_local_indices)."
-        assert (
-            req.dst_page_transfer_mask is not None
-        ), "ON/ON expects decode ownership mask when destination uses local index space."
+        if src_args is None:
+            raise RuntimeError(
+                "ON/ON expects prefill metadata "
+                "(page_transfer_mask/page_local_indices)."
+            )
+        if req.dst_page_transfer_mask is None:
+            raise RuntimeError(
+                "ON/ON expects decode ownership mask when destination uses local "
+                "index space."
+            )
 
         # src_args.page_transfer_mask is generated from current chunk page_indices,
         # so it is already in chunk-local coordinates.
@@ -344,12 +365,20 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             prefill_kv_indices, dst_kv_indices
         )
 
+        # ``_layer_transfer_blocks`` indexes ``kv_args.offsets`` by its loop var,
+        # and ``offsets`` is keyed by KV-LAYER INDEX (one entry per attention/KV
+        # layer), not by global layer id. For hybrid models (e.g. Qwen3.5 GDN +
+        # attention) only the attention layers carry KV, so len(offsets) is the
+        # KV-layer count while ``self.layer_num`` is the (larger) global layer
+        # count -- using ``layer_num`` here over-runs ``offsets`` and IndexErrors.
+        # Iterate the full KV-index space instead (the layerwise path already
+        # maps global->KV index via ``_kv_layer_to_index`` before calling this).
         transfer_blocks = self._layer_transfer_blocks(
             dst_ptrs=dst_kv_ptrs,
             src_blocks=prefill_kv_blocks,
             dst_blocks=dst_kv_blocks,
             begin_layer_id=0,
-            end_layer_id=self.layer_num,
+            end_layer_id=len(self.kv_args.offsets),
             transfer_fragments=transfer_fragments,
         )
         return self._transfer_data(mooncake_session_id, transfer_blocks)
@@ -362,7 +391,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         begin_layer_id: int,
         end_layer_id: int,
         transfer_fragments: tuple[TransferFragment, ...] = (),
-    ) -> List[Tuple[int, int, int]]:
+    ) -> list[tuple[int, int, int]]:
         transfer_blocks = []
         fragments_by_buffer: dict[int, list[TransferFragment]] = defaultdict(list)
         for fragment in transfer_fragments:
@@ -419,11 +448,11 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
     def send_mamba_cache(
         self,
         mooncake_session_id: str,
-        prefill_mamba_indices: Optional[npt.NDArray[np.int64]],
+        prefill_mamba_indices: npt.NDArray[np.int64] | None,
         dst_state_data_ptrs: list[int],
-        dst_mamba_indices: Optional[npt.NDArray[np.int64]],
-        begin_layer_id: Optional[int] = None,
-        end_layer_id: Optional[int] = None,
+        dst_mamba_indices: npt.NDArray[np.int64] | None,
+        begin_layer_id: int | None = None,
+        end_layer_id: int | None = None,
         transfer_fragments: tuple[TransferFragment, ...] = (),
     ) -> int:
         if self.kv_args.state_type != "mamba":
@@ -558,9 +587,9 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         dst_kv_indices: npt.NDArray[np.int64],
         begin_cache_step: int,
         interval: int,
-        dst_state_data_ptrs: Optional[list[int]] = None,
-        prefill_mamba_indices: Optional[npt.NDArray[np.int64]] = None,
-        dst_mamba_indices: Optional[npt.NDArray[np.int64]] = None,
+        dst_state_data_ptrs: list[int] | None = None,
+        prefill_mamba_indices: npt.NDArray[np.int64] | None = None,
+        dst_mamba_indices: npt.NDArray[np.int64] | None = None,
         transfer_fragments: tuple[TransferFragment, ...] = (),
     ) -> int:
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
@@ -642,7 +671,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         status: int,
         prefill_rank: int,
         bootstrap_token: int = -1,
-        spec_candidate_ids: Optional[list[int]] = None,
+        spec_candidate_ids: list[int] | None = None,
     ):
         if ":" in remote:
             remote = remote.split(":")[0]
@@ -661,12 +690,37 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             ]
         )
 
+    def abort_room(self, room: int, reason: str) -> None:
+        """Notify the decode that a room failed before any KV transfer.
+
+        EPD: when the prefill aborts a request on embedding-receive timeout it never
+        sends KV, so the decode's dual-dispatched KV receiver would wait
+        indefinitely -- its heartbeat only trips if the prefill /health dies, and the
+        receiver waiting_timeout only covers the WaitingForInput state (a receiver
+        whose prefill never registered a sender is stuck earlier). Push a Failed
+        status to every decode endpoint that already pre-allocated for this room
+        (mirrors the in-transfer failure path), so the decode raises a FailedEvent and
+        the client gets an error instead of hanging. A room whose decode has not
+        pre-allocated yet is only marked Failed locally (no endpoint to notify).
+        """
+        self.record_failure(room, reason)
+        self.update_status(room, TransferPoll.Failed)
+        for req in list(self.transfer_infos.get(room, {}).values()):
+            if not req.is_dummy:
+                self.sync_status_to_decode_endpoint(
+                    req.endpoint,
+                    req.dst_port,
+                    req.room,
+                    TransferPoll.Failed,
+                    self.attn_tp_rank,
+                )
+
     def transfer_worker(
         self, queue: FastQueue, executor: concurrent.futures.ThreadPoolExecutor
     ):
         while True:
             try:
-                kv_chunk: TransferKVChunk = queue.get()
+                kv_chunk = queue.get()
                 logger.debug(
                     "[TRANSFER_WORKER] Got transfer request for room %s, is_last=%s, kv_indices_len=%s",
                     kv_chunk.room,
@@ -694,12 +748,12 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                                     kv_chunk.room,
                                     f"Decode instance could be dead, remote mooncake session {req.mooncake_session_id} is not alive",
                                 )
-                                self.update_status(kv_chunk.room, KVPoll.Failed)
+                                self.update_status(kv_chunk.room, TransferPoll.Failed)
                                 self.sync_status_to_decode_endpoint(
                                     req.endpoint,
                                     req.dst_port,
                                     req.room,
-                                    KVPoll.Failed,
+                                    TransferPoll.Failed,
                                     self.attn_tp_rank,
                                 )
                                 break
@@ -778,12 +832,12 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                                 kv_chunk.room,
                                 f"Failed to send kv chunk of {kv_chunk.room} to {req.endpoint}:{req.dst_port}",
                             )
-                            self.update_status(kv_chunk.room, KVPoll.Failed)
+                            self.update_status(kv_chunk.room, TransferPoll.Failed)
                             self.sync_status_to_decode_endpoint(
                                 req.endpoint,
                                 req.dst_port,
                                 req.room,
-                                KVPoll.Failed,
+                                TransferPoll.Failed,
                                 self.attn_tp_rank,
                             )
                             break
@@ -796,7 +850,11 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
 
                             # Only sync status when all the dst ranks have received the kvcache
                             if len(polls) == req.required_dst_info_num:
-                                status = KVPoll.Success if all(polls) else KVPoll.Failed
+                                status = (
+                                    TransferPoll.Success
+                                    if all(polls)
+                                    else TransferPoll.Failed
+                                )
                                 self.update_status(req.room, status)
                                 # bootstrap_token is carried directly in the chunk (set by
                                 # DisaggPrefillExecutor._decode after prefill forward).
@@ -815,8 +873,8 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                                         kv_chunk.bootstrap_token,
                                         kv_chunk.spec_candidate_ids,
                                     )
-                                if self.check_status(req.room) == KVPoll.Failed:
-                                    status = KVPoll.Failed
+                                if self.check_status(req.room) == TransferPoll.Failed:
+                                    status = TransferPoll.Failed
                                 for endpoint, dst_port, room in dst_ranks_infos:
                                     self.sync_status_to_decode_endpoint(
                                         endpoint,
@@ -836,19 +894,20 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                         # Dummy request means the decode instance is not used, so its status can be marked as success directly
                         # Dummy request does not need to sync status to decode endpoint
                         if kv_chunk.is_last and req.room in self.request_status:
-                            self.update_status(req.room, KVPoll.Success)
+                            self.update_status(req.room, TransferPoll.Success)
 
                 if (
                     kv_chunk.room not in self.request_status
-                    or self.check_status(kv_chunk.room) == KVPoll.Success
+                    or self.check_status(kv_chunk.room) == TransferPoll.Success
                 ):
                     if kv_chunk.room in self.transfer_infos:
                         self.transfer_infos.pop(kv_chunk.room)
 
-            except Exception as e:
+            except Exception as exc:
                 raise RuntimeError(
-                    f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
-                )
+                    f"Transfer thread failed because of {exc}. Prefill instance "
+                    f"with bootstrap_port={self.bootstrap_port} is dead."
+                ) from exc
 
     def start_prefill_thread(self):
         self.rank_port = get_free_port()
@@ -856,7 +915,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
 
         def bootstrap_thread():
             """This thread recvs pre-alloc notification from the decode engine"""
-            # KVPoll.Bootstrapping -> KVPoll.WaitingForInput
+            # TransferPoll.Bootstrapping -> TransferPoll.WaitingForInput
             while True:
                 waiting_req_bytes = self.server_socket.recv_multipart()
                 room = waiting_req_bytes[0].decode("ascii")
@@ -899,14 +958,14 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                         ),
                     )
                     if len(self.transfer_infos[room]) == required_dst_info_num:
-                        self.update_status(room, KVPoll.Bootstrapped)
+                        self.update_status(room, TransferPoll.Bootstrapped)
 
         threading.Thread(target=bootstrap_thread).start()
 
     def start_transfer_thread(
         self, transfer_thread_pool_size: int, transfer_queue_size: int
     ):
-        self.transfer_queues: List[FastQueue] = [
+        self.transfer_queues: list[FastQueue] = [
             FastQueue() for _ in range(transfer_queue_size)
         ]
         self.executors = [
@@ -926,20 +985,22 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         kv_indices: npt.NDArray[np.int64],
         index_slice: slice,
         is_last: bool,
-        aux_index: Optional[int] = None,
-        mla_l1_5_args: Optional[PageTransferMetadata] = None,
+        aux_index: int | None = None,
+        mla_l1_5_args: PageTransferMetadata | None = None,
         bootstrap_token: int = -1,
-        begin_cache_step: Optional[int] = None,
+        begin_cache_step: int | None = None,
         layerwise_interval: int = 1,
         wait_for_bootstrap_token: bool = False,
-        mamba_indices: Optional[npt.NDArray[np.int64]] = None,
-        spec_candidate_ids: Optional[list[int]] = None,
+        mamba_indices: npt.NDArray[np.int64] | None = None,
+        spec_candidate_ids: list[int] | None = None,
     ):
-        assert self.disaggregation_mode == DisaggregationMode.PREFILL
-        assert not is_last or (is_last and aux_index is not None)
+        if self.disaggregation_mode != DisaggregationMode.PREFILL:
+            raise RuntimeError("Transfer requests can only be added in prefill mode.")
+        if is_last and aux_index is None:
+            raise ValueError("aux_index must be set for the last transfer chunk.")
         if (
             bootstrap_room not in self.request_status
-            or self.check_status(bootstrap_room) == KVPoll.Failed
+            or self.check_status(bootstrap_room) == TransferPoll.Failed
         ):
             logger.debug(
                 "Request with bootstrap_room=%s already failed", bootstrap_room
@@ -1028,9 +1089,9 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                     response.status_code,
                     response.text,
                 )
-        except Exception as e:
+        except Exception as exc:
             logger.error(
-                "Prefill instance failed to register with bootstrap server: %s", e
+                "Prefill instance failed to register with bootstrap server: %s", exc
             )
 
 

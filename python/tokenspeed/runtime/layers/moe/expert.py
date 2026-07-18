@@ -65,6 +65,7 @@ class MoELayer(torch.nn.Module):
         w13_input_layout: str = "concatenated",
         with_bias=False,
         routing_config: dict = {},
+        routing_mode: str | None = None,
     ):
         super().__init__()
         self.layer_index = layer_index
@@ -142,6 +143,9 @@ class MoELayer(torch.nn.Module):
         self._n_group = routing_config.get("n_group", 0)
         self._topk_group = routing_config.get("topk_group", 0)
         self._routed_scaling_factor = routing_config.get("routed_scaling_factor", 1.0)
+        self._normalize_topk_weights = routing_config.get(
+            "normalize_topk_weights", True
+        )
 
         # Quantization config. ignored_layers (compressed-tensors) keys the MoE
         # block; exclude_modules (ModelOpt) keys the fused experts.
@@ -184,6 +188,8 @@ class MoELayer(torch.nn.Module):
             self._quant_kind,
             input_dtype=input_dtype,
             activation=self.activation,
+            # e.g. "precomputed_topk" when fused kernels cannot reproduce the routing; None = unconstrained.
+            routing_mode=routing_mode,
             a2a_backend=self._spec.a2a_backend,
             ep_size=self.ep_size,
             ispp=self.intermediate_size // self.tp_size,

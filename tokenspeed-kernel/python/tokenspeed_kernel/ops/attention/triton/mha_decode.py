@@ -18,8 +18,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import math
+
+import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
+from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 _MIN_BLOCK_KV = 32
 
@@ -79,8 +84,10 @@ def _fwd_kernel_stage1(
     cache_len = tl.load(cache_seqlens + cur_batch)
     cache_len = cache_len - (MAX_SEQLEN_Q - 1 - q_pos)
     cache_len = tl.maximum(cache_len, 0)
+    # WINDOW_LEFT is exclusive of the current token, so keep WINDOW_LEFT + 1
+    # keys (window_left left keys plus the current one).
     cur_batch_seq_len = (
-        tl.minimum(cache_len, WINDOW_LEFT) if WINDOW_LEFT >= 0 else cache_len
+        tl.minimum(cache_len, WINDOW_LEFT + 1) if WINDOW_LEFT >= 0 else cache_len
     )
     kv_start_offset = cache_len - cur_batch_seq_len
     kv_splits = tl.load(num_kv_splits + cur_batch)
@@ -311,8 +318,10 @@ def _fwd_grouped_kernel_stage1(
     cache_len = tl.load(cache_seqlens + cur_batch)
     cache_len = cache_len - (MAX_SEQLEN_Q - 1 - q_pos)
     cache_len = tl.maximum(cache_len, 0)
+    # WINDOW_LEFT is exclusive of the current token, so keep WINDOW_LEFT + 1
+    # keys (window_left left keys plus the current one).
     cur_batch_seq_len = (
-        tl.minimum(cache_len, WINDOW_LEFT) if WINDOW_LEFT >= 0 else cache_len
+        tl.minimum(cache_len, WINDOW_LEFT + 1) if WINDOW_LEFT >= 0 else cache_len
     )
     kv_start_offset = cache_len - cur_batch_seq_len
     kv_splits = tl.load(num_kv_splits + cur_batch)
@@ -554,8 +563,10 @@ def _fwd_kernel_stage2(
     cache_len = tl.load(cache_seqlens + cur_batch)
     cache_len = cache_len - (MAX_SEQLEN_Q - 1 - q_pos)
     cache_len = tl.maximum(cache_len, 0)
+    # WINDOW_LEFT is exclusive of the current token, so keep WINDOW_LEFT + 1
+    # keys (window_left left keys plus the current one).
     cur_batch_seq_len = (
-        tl.minimum(cache_len, WINDOW_LEFT) if WINDOW_LEFT >= 0 else cache_len
+        tl.minimum(cache_len, WINDOW_LEFT + 1) if WINDOW_LEFT >= 0 else cache_len
     )
     kv_splits = tl.load(num_kv_splits + cur_batch)
 
@@ -822,3 +833,82 @@ def decode_attention_fwd(
             logit_cap=logit_cap,
             sinks=sinks,
         )
+
+
+@register_kernel(
+    "attention",
+    "mha_decode_with_kvcache",
+    name="triton_mha_decode_with_kvcache_cached",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=format_signatures(
+        ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
+    ),
+    priority=Priority.PORTABLE,
+    traits={
+        "sliding_window": frozenset({False, True}),
+        "support_sinks": frozenset({False, True}),
+        "support_logit_cap": frozenset({False, True}),
+        "return_lse": frozenset({False}),
+    },
+    tags={"portability"},
+)
+def triton_mha_decode_with_kvcache(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    max_seqlen_k: int,
+    max_seqlen_q: int = 1,
+    window_left: int = -1,
+    logit_cap: float = 0.0,
+    sinks: torch.Tensor | None = None,
+    return_lse: bool = False,
+    softmax_scale: float | None = None,
+    q_scale: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(q.shape[-1])
+    out = torch.empty_like(q)
+    max_kv_splits = 4
+    attn_logits = torch.empty(
+        q.shape[0],
+        q.shape[1],
+        max_kv_splits,
+        q.shape[2],
+        dtype=torch.float32,
+        device=q.device,
+    )
+    attn_lse = torch.empty(
+        q.shape[0],
+        q.shape[1],
+        max_kv_splits,
+        dtype=torch.float32,
+        device=q.device,
+    )
+    num_kv_splits = torch.ones(
+        (cache_seqlens.shape[0],), dtype=torch.int32, device=q.device
+    )
+    decode_attention_fwd(
+        q,
+        k_cache.view(-1, k_cache.shape[2], k_cache.shape[3]),
+        v_cache.view(-1, v_cache.shape[2], v_cache.shape[3]),
+        out,
+        page_table,
+        cache_seqlens,
+        attn_logits,
+        attn_lse,
+        num_kv_splits,
+        max_kv_splits,
+        max_seqlen_q,
+        page_table.stride(0),
+        k_cache.shape[1],
+        window_left,
+        sm_scale=softmax_scale,
+        logit_cap=logit_cap,
+        sinks=sinks,
+    )
+    return out

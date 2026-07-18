@@ -99,6 +99,10 @@ def _iter_ignored_layer_pattern_aliases(raw: str):
         yield raw.removeprefix("language_model.")
         return
 
+    if "model.language_model." in raw:
+        yield raw.replace("model.language_model.", "model.")
+        return
+
     if raw.startswith("re:"):
         regex = raw[3:]
         for prefix in ("language_model.", re.escape("language_model.")):
@@ -147,11 +151,13 @@ class Mxfp4Config(QuantizationConfig):
         is_checkpoint_mxfp4_serialized: bool = False,
         is_w4a8_fp8: bool = False,
         use_dynamic_mxfp4_activations: bool = False,
+        quant_method: str | None = None,
     ):
         super().__init__(ignored_layers=ignored_layers)
         self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized
         self.is_w4a8_fp8 = is_w4a8_fp8
         self.use_dynamic_mxfp4_activations = use_dynamic_mxfp4_activations
+        self.quant_method = quant_method
         self.group_size = 32
 
     @classmethod
@@ -171,6 +177,7 @@ class Mxfp4Config(QuantizationConfig):
             is_checkpoint_mxfp4_serialized=is_checkpoint_mxfp4_serialized,
             is_w4a8_fp8=is_w4a8_fp8,
             use_dynamic_mxfp4_activations=use_dynamic_mxfp4_activations,
+            quant_method=quant_method,
         )
 
     @classmethod

@@ -25,12 +25,14 @@ from typing import Any, Literal, NamedTuple, Protocol, runtime_checkable
 
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.ops.moe.triton.inkling_topk import inkling_topk
 from tokenspeed_kernel.thirdparty.cuda import routing_flash as cuda_routing_flash
 from tokenspeed_kernel.thirdparty.triton import minimax_biased_grouped_topk
 
 from tokenspeed.runtime.moe.distribution_recorder import (
     get_global_expert_distribution_recorder,
 )
+from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 
 class TopKOutputFormat(Enum):
@@ -291,6 +293,9 @@ class TopKConfig:
     output_format: TopKOutputFormat | None = None
     zero_expert_num: int | None = 0
     topk_indices_dtype: torch.dtype | None = torch.int32
+    # Shared-expert sink (Inkling)
+    num_sink_experts: int = 0
+    sink_global_scale: torch.Tensor | None = None
 
 
 class StandardTopKOutput(NamedTuple):
@@ -346,11 +351,17 @@ class TopK(torch.nn.Module):
         output_format: TopKOutputFormat | None = None,
         zero_expert_num: int | None = 0,
         topk_indices_dtype=torch.int32,
+        num_sink_experts: int = 0,
+        sink_global_scale: torch.Tensor | None = None,
     ):
         super().__init__()
 
         if use_grouped_topk:
             assert num_expert_group is not None and topk_group is not None
+        if num_sink_experts > 0:
+            assert correction_bias is not None
+            assert sink_global_scale is not None
+            assert routed_scaling_factor is not None
 
         self.topk_config = TopKConfig(
             top_k=top_k,
@@ -365,6 +376,8 @@ class TopK(torch.nn.Module):
             output_format=output_format,
             zero_expert_num=zero_expert_num,
             topk_indices_dtype=topk_indices_dtype,
+            num_sink_experts=num_sink_experts,
+            sink_global_scale=sink_global_scale,
         )
 
     def forward(
@@ -456,8 +469,21 @@ def select_experts(
         info=expert_location_dispatch_info,
     )
 
+    # Shared-expert-sink routing (Inkling)
+    if topk_config.num_sink_experts > 0:
+        assert num_token_non_padded is None
+        assert expert_location_dispatch_info is None
+        topk_weights, topk_ids = inkling_topk(
+            router_logits,
+            correction_bias,
+            topk_config.sink_global_scale,
+            top_k=top_k,
+            n_routed=router_logits.shape[1] - topk_config.num_sink_experts,
+            route_scale=routed_scaling_factor,
+            enable_pdl=pdl_enabled(),
+        )
     # DeepSeek V2/V3/R1 series models use grouped_top_k
-    if use_grouped_topk:
+    elif use_grouped_topk:
         assert topk_group is not None
         assert num_expert_group is not None
         if correction_bias is None:
@@ -537,7 +563,7 @@ def select_experts(
             topk_weights,
             num_real_experts,
             routed_scaling_factor,
-            True,
+            renormalize,
         )
     elif custom_routing_function is None:
         topk_weights, topk_ids = torch_native_fused_topk(

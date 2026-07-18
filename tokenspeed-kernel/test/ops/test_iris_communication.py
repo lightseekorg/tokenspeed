@@ -27,6 +27,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from tokenspeed_kernel.platform import current_platform
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -44,7 +45,7 @@ def _skip_if_unsupported(world_size: int, reason_prefix: str) -> None:
         pytest.skip(f"CUDA/ROCm is required for {reason_prefix}")
     if world_size > torch.cuda.device_count():
         pytest.skip(f"Need {world_size} GPUs, have {torch.cuda.device_count()}")
-    if not torch.version.hip:
+    if not current_platform().is_amd:
         pytest.skip(f"{reason_prefix} only targets AMD ROCm")
     try:
         import iris  # noqa: F401

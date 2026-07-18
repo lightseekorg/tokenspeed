@@ -211,11 +211,15 @@ class LogitsProcessor(nn.Module):
         self._logits_layout_executor: LogitsLayoutExecutor | None = None
 
         if tp_rank is None:
-            assert tp_size is None
-            assert tp_group is None
+            if tp_size is not None or tp_group is not None:
+                raise ValueError("tp_size and tp_group require tp_rank.")
             tp_rank, tp_size = 0, 1
-        assert 0 <= tp_rank < tp_size
-        assert tp_size == 1 or tp_group is not None
+        elif tp_size is None:
+            raise ValueError("tp_size is required when tp_rank is provided.")
+        if not 0 <= tp_rank < tp_size:
+            raise ValueError(f"Invalid tensor-parallel rank: {tp_rank}/{tp_size}.")
+        if tp_size != 1 and tp_group is None:
+            raise ValueError("tp_group is required when tp_size > 1.")
         self.tp_rank, self.tp_size, self.tp_group = tp_rank, tp_size, tp_group
 
         self._all_gather_state = self._LOGITS_AG_STATE_UNINITIALIZED
@@ -268,7 +272,8 @@ class LogitsProcessor(nn.Module):
             return None
         n = self.dp_num_tokens_per_req
         rows = hidden_states.shape[0]
-        assert rows % n == 0, f"hidden_states have {rows} rows, not divisible by N={n}"
+        if rows % n != 0:
+            raise ValueError(f"hidden_states have {rows} rows, not divisible by N={n}")
         effective_bs = rows // n
         bucket_bs = ((effective_bs + self.tp_size - 1) // self.tp_size) * self.tp_size
         if effective_bs < self.dp_sampling_min_bs:
@@ -350,9 +355,10 @@ class LogitsProcessor(nn.Module):
                     if aux_hidden_states is not None:
                         aux_pruned_states = [h[gather_ids] for h in aux_hidden_states]
             else:
-                assert (
-                    not logits_metadata.forward_mode.is_extend_or_mixed()
-                ), "EXTEND/MIXED forward must set gather_ids on ForwardContext"
+                if logits_metadata.forward_mode.is_extend_or_mixed():
+                    raise RuntimeError(
+                        "EXTEND/MIXED forward must set gather_ids on ForwardContext"
+                    )
                 pruned_states = hidden_states
                 if aux_hidden_states is not None:
                     aux_pruned_states = list(aux_hidden_states)
@@ -383,7 +389,8 @@ class LogitsProcessor(nn.Module):
 
                 # We always need at least 1 token to sample because that's required
                 # by a caller.
-                assert extend_len > start_len
+                if extend_len <= start_len:
+                    raise RuntimeError("extend_len must be greater than start_len.")
                 pruned_states.append(hidden_states[pt + start_len : pt + extend_len])
                 pt += extend_len
                 sample_index_pt += extend_len - start_len
@@ -448,7 +455,7 @@ class LogitsProcessor(nn.Module):
                         else pruned_states
                     )
             else:
-                assert False, "Should never reach"
+                raise RuntimeError("Should never reach")
 
         if not logits_metadata.extend_return_logprob:
             # Decode mode or extend mode without return_logprob.
@@ -532,10 +539,11 @@ class LogitsProcessor(nn.Module):
         guarantee the given hidden_states follow this constraint.
         """
         dp_sampling = plan is not None
-        assert (not dp_sampling) or self.dp_sampling_enabled, (
-            "DP logits layout plan was provided but LogitsProcessor was not "
-            "configured with dp_sampling"
-        )
+        if dp_sampling and not self.dp_sampling_enabled:
+            raise RuntimeError(
+                "DP logits layout plan was provided but LogitsProcessor was not "
+                "configured with dp_sampling"
+            )
 
         if dp_sampling and self.skip_all_gather:
             if self._logits_layout_executor is None:

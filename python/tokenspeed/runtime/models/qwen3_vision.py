@@ -22,8 +22,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from functools import lru_cache, partial
-from typing import Callable, Optional
 
 import numpy as np
 import torch
@@ -77,7 +77,7 @@ class Qwen3VLVisionMLP(nn.Module):
         mapping: Mapping,
         bias: bool = True,
         hidden_act="silu",
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ):
         super().__init__()
@@ -152,10 +152,10 @@ class Qwen3VLVisionBlock(nn.Module):
         num_heads: int,
         intermediate_dim: int,
         mapping: Mapping,
-        head_size: Optional[int] = None,
+        head_size: int | None = None,
         hidden_act="silu",
-        norm_layer: Optional[Callable[[int], nn.Module]] = None,
-        quant_config: Optional[QuantizationConfig] = None,
+        norm_layer: Callable[[int], nn.Module] | None = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         workspace_buffer: torch.Tensor | None = None,
         mm_attention_backend: str | None = None,
@@ -193,8 +193,8 @@ class Qwen3VLVisionBlock(nn.Module):
         cu_seqlens: torch.Tensor,
         rotary_pos_emb_cos: torch.Tensor,
         rotary_pos_emb_sin: torch.Tensor,
-        max_seqlen: Optional[int] = None,
-        sequence_lengths: Optional[torch.Tensor] = None,
+        max_seqlen: int | None = None,
+        sequence_lengths: torch.Tensor | None = None,
     ) -> torch.Tensor:
         hidden_states = self.norm1(x)
         hidden_states = rearrange(hidden_states, "s b ... -> b s ...")
@@ -222,10 +222,10 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
         context_dim: int,
         padded_context_dim: int,
         mapping: Mapping,
-        norm_layer: Optional[Callable[[int], nn.Module]] = None,
+        norm_layer: Callable[[int], nn.Module] | None = None,
         spatial_merge_size: int = 2,
         use_postshuffle_norm: bool = False,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -282,7 +282,7 @@ class Qwen3VLMoeVisionModel(nn.Module):
         vision_config: Qwen3VLVisionConfig,
         mapping: Mapping,
         norm_eps: float = 1e-6,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         mm_attention_backend: str | None = None,
     ) -> None:
@@ -486,7 +486,10 @@ class Qwen3VLMoeVisionModel(nn.Module):
             [qk_indptr, v_indptr, o_indptr] concatenated,
             each indptr is (B_padded + 1,) in element units.
         """
-        assert token_cu_seqlens.ndim == 1 and token_cu_seqlens.size >= 2
+        if token_cu_seqlens.ndim != 1 or token_cu_seqlens.size < 2:
+            raise ValueError(
+                "token_cu_seqlens must be a 1D array with at least 2 entries."
+            )
         B = int(token_cu_seqlens.size - 1)
         B_padded = round_up_to_bucket(B, VIT_CUDNN_BATCH_BUCKETS)
 
@@ -512,7 +515,10 @@ class Qwen3VLMoeVisionModel(nn.Module):
         token_cu_seqlens: (B+1,) token indptr
         return: (B_padded,) token lengths (padded with 0)
         """
-        assert token_cu_seqlens.ndim == 1 and token_cu_seqlens.size >= 2
+        if token_cu_seqlens.ndim != 1 or token_cu_seqlens.size < 2:
+            raise ValueError(
+                "token_cu_seqlens must be a 1D array with at least 2 entries."
+            )
         B = int(token_cu_seqlens.size - 1)
 
         seq_lens = (token_cu_seqlens[1:] - token_cu_seqlens[:-1]).astype(

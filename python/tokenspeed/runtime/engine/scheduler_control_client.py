@@ -35,6 +35,8 @@ from typing import (
 import zmq
 
 from tokenspeed.runtime.engine.io_struct import (
+    DestroyWeightsUpdateGroupReqInput,
+    DestroyWeightsUpdateGroupReqOutput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     FlushCacheReqInput,
@@ -93,15 +95,16 @@ class _Communicator(Generic[T]):
         self._result_values: list[T] | None = None
         self._ready_queue: deque[asyncio.Future] = deque()
 
-        assert mode in ["queueing", "watching"]
+        if mode not in ("queueing", "watching"):
+            raise ValueError(f"Invalid communicator mode: {mode}")
 
     async def queueing_call(self, obj: T):
         ready_event = asyncio.Event()
         if self._result_event is not None or len(self._ready_queue) > 0:
             self._ready_queue.append(ready_event)
             await ready_event.wait()
-            assert self._result_event is None
-            assert self._result_values is None
+            if self._result_event is not None or self._result_values is not None:
+                raise RuntimeError("Communicator result state was not reset.")
 
         if obj:
             self._sender.send_pyobj(obj)
@@ -119,7 +122,8 @@ class _Communicator(Generic[T]):
 
     async def watching_call(self, obj):
         if self._result_event is None:
-            assert self._result_values is None
+            if self._result_values is not None:
+                raise RuntimeError("Communicator result values were not reset.")
             self._result_values = []
             self._result_event = asyncio.Event()
 
@@ -149,6 +153,9 @@ class SchedulerControlClient:
     def init_communicators(self: AsyncLLM, server_args: ServerArgs):
         # Communicators
         self.init_weights_update_group_communicator = _Communicator(
+            self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
+        )
+        self.destroy_weights_update_group_communicator = _Communicator(
             self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
         )
         self.update_weights_from_distributed_communicator = _Communicator(
@@ -208,6 +215,10 @@ class SchedulerControlClient:
                 (
                     InitWeightsUpdateGroupReqOutput,
                     self.init_weights_update_group_communicator.handle_recv,
+                ),
+                (
+                    DestroyWeightsUpdateGroupReqOutput,
+                    self.destroy_weights_update_group_communicator.handle_recv,
                 ),
                 (
                     UpdateWeightsFromDistributedReqOutput,
@@ -365,10 +376,20 @@ class SchedulerControlClient:
         obj: InitWeightsUpdateGroupReqInput,
     ) -> tuple[bool, str]:
         self.auto_create_handle_loop()
+        if self.server_args.mapping.attn.has_dp:
+            raise RuntimeError("dp_size must be 1 for init parameter update group")
+        result = (await self.init_weights_update_group_communicator(obj))[0]
+        return result.success, result.message
+
+    async def destroy_weights_update_group(
+        self: AsyncLLM,
+        obj: DestroyWeightsUpdateGroupReqInput,
+    ) -> tuple[bool, str]:
+        self.auto_create_handle_loop()
         assert (
             not self.server_args.mapping.attn.has_dp
-        ), "dp_size must be 1 for init parameter update group"
-        result = (await self.init_weights_update_group_communicator(obj))[0]
+        ), "dp_size must be 1 for destroy parameter update group"
+        result = (await self.destroy_weights_update_group_communicator(obj))[0]
         return result.success, result.message
 
     async def update_weights_from_distributed(
@@ -376,9 +397,8 @@ class SchedulerControlClient:
         obj: UpdateWeightsFromDistributedReqInput,
     ) -> tuple[bool, str]:
         self.auto_create_handle_loop()
-        assert (
-            not self.server_args.mapping.attn.has_dp
-        ), "dp_size must be for update weights from distributed"
+        if self.server_args.mapping.attn.has_dp:
+            raise RuntimeError("dp_size must be 1 for update weights from distributed")
 
         # This means that weight sync
         # cannot run while requests are in progress.
@@ -391,9 +411,8 @@ class SchedulerControlClient:
         obj: UpdateWeightsFromTensorReqInput,
     ) -> tuple[bool, str]:
         self.auto_create_handle_loop()
-        assert (
-            not self.server_args.mapping.attn.has_dp
-        ), "dp_size must be for update weights from distributed"
+        if self.server_args.mapping.attn.has_dp:
+            raise RuntimeError("dp_size must be 1 for update weights from tensor")
 
         # This means that weight sync
         # cannot run while requests are in progress.

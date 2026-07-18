@@ -48,7 +48,7 @@ if platform.is_nvidia:
 
 
 def has_deterministic_decode_topk() -> bool:
-    """Whether the flashinfer deterministic top-k path is importable."""
+    """Whether the flashinfer deterministic top-k fallback is importable."""
     return top_k is not None and TopKTieBreak is not None
 
 
@@ -57,15 +57,14 @@ def deterministic_decode_topk(
     out: torch.Tensor,
     topk: int,
 ) -> None:
-    """Select per-row top-``topk`` local offsets deterministically.
+    """Select per-row top-``topk`` local offsets deterministically via flashinfer.
 
-    ``logits`` rows are pre-masked with ``-inf`` beyond each request's valid
-    length (so a global per-row top-``topk`` yields the in-sequence candidates).
-    Writes int32 local offsets into ``out`` in-place. Uses a stable
-    ``tie_break=SMALL`` (smallest index wins ties) and ``deterministic`` +
-    ``dsa_graph_safe`` so eager and CUDA-graph replay agree.
+    ``logits`` rows must already be pre-masked with ``-inf`` beyond each request's
+    valid length; the fallback uses a stable ``tie_break=SMALL`` plus
+    ``deterministic`` + ``dsa_graph_safe``. For the length-aware (ragged) path see
+    :func:`tokenspeed_kernel.ops.attention.cuda.dsa_topk.ragged_decode_topk`.
     """
-    if not has_deterministic_decode_topk():
+    if top_k is None or TopKTieBreak is None:
         raise RuntimeError("flashinfer deterministic top_k is unavailable.")
     _values, indices = top_k(
         logits.contiguous(),

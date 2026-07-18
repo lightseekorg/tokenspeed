@@ -20,14 +20,32 @@ on:
           - all
           - cu130
           - cu129
+      pypi_cuda_variant:
+        description: "CUDA variant to publish to PyPI."
+        required: false
+        default: cu130
+        type: choice
+        options:
+          - cu130
+          - cu129
       prerelease:
         description: "Mark the GitHub release as a prerelease."
         required: false
         default: false
         type: boolean
+      publish_github:
+        description: "Publish distributions to lightseekorg/whl."
+        required: false
+        default: false
+        type: boolean
+      publish_pypi:
+        description: "Publish the selected PyPI CUDA variant."
+        required: false
+        default: false
+        type: boolean
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}
@@ -42,6 +60,12 @@ jobs:
       version_date: ${{ steps.metadata.outputs.version_date }}
       tag_name: ${{ steps.metadata.outputs.tag_name }}
     steps:
+      - name: Validate publish inputs
+        if: inputs.publish_pypi && inputs.cuda_variant != 'all' && inputs.cuda_variant != inputs.pypi_cuda_variant
+        run: |
+          echo "pypi_cuda_variant must be included by cuda_variant." >&2
+          exit 1
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -55,6 +79,8 @@ jobs:
 
       - name: Resolve release metadata
         id: metadata
+        env:
+          PUBLISH_PYPI: ${{ inputs.publish_pypi }}
         run: |
           version_date="${{ inputs.version_date }}"
           if [ -z "$version_date" ]; then
@@ -69,6 +95,11 @@ jobs:
             TOKENSPEED_KERNEL_GIT_BRANCH="$GITHUB_REF_NAME" \
               python setup.py --version
           )
+
+          if [ "$PUBLISH_PYPI" = "true" ] && [[ "$version" == *+* ]]; then
+            echo "Version ${version} contains a local segment and cannot be published to PyPI; dispatch from a release/* branch." >&2
+            exit 1
+          fi
 
           tag_name="${{ inputs.tag_name }}"
           if [ -z "$tag_name" ]; then
@@ -243,7 +274,8 @@ jobs:
           path: dist/*.tar.gz
 
   release:
-    name: Create GitHub release
+    name: Create wheelhouse release
+    if: inputs.publish_github
     needs: [metadata, build-wheel, build-sdist]
     runs-on: ubuntu-24.04-32core-x64
     steps:
@@ -259,11 +291,13 @@ jobs:
 
       - name: Create or update GitHub release
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+          RELEASE_REPOSITORY: lightseekorg/whl
           TAG_NAME: ${{ needs.metadata.outputs.tag_name }}
           VERSION: ${{ needs.metadata.outputs.version }}
           CUDA_VARIANT: ${{ inputs.cuda_variant }}
           PRERELEASE: ${{ inputs.prerelease }}
+          SOURCE_SHA: ${{ github.sha }}
         run: |
           prerelease_args=()
           if [ "$PRERELEASE" = "true" ]; then
@@ -287,13 +321,15 @@ jobs:
               exit 1
             fi
 
-            if gh release view "$release_tag" >/dev/null 2>&1; then
-              gh release upload "$release_tag" "${assets[@]}" --clobber
+            if gh release view "$release_tag" --repo "$RELEASE_REPOSITORY" >/dev/null 2>&1; then
+              gh release upload "$release_tag" "${assets[@]}" \
+                --repo "$RELEASE_REPOSITORY" \
+                --clobber
             else
               gh release create "$release_tag" "${assets[@]}" \
-                --target "$GITHUB_SHA" \
+                --repo "$RELEASE_REPOSITORY" \
                 --title "$release_title" \
-                --notes "$release_title" \
+                --notes "$release_title built from lightseekorg/tokenspeed@$SOURCE_SHA" \
                 "${prerelease_args[@]}"
             fi
           }
@@ -311,3 +347,30 @@ jobs:
               exit 1
               ;;
           esac
+
+  publish-pypi:
+    name: Publish ${{ inputs.pypi_cuda_variant }} to PyPI
+    if: inputs.publish_pypi
+    needs: [metadata, build-wheel, build-sdist]
+    runs-on: ubuntu-24.04-32core-x64
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - name: Download wheels
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: tokenspeed-kernel-wheel-${{ inputs.pypi_cuda_variant }}-*
+          merge-multiple: true
+
+      - name: Download source distribution
+        uses: actions/download-artifact@v4
+        with:
+          name: tokenspeed-kernel-sdist
+          path: dist
+
+      - name: Publish distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist

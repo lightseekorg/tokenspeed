@@ -212,7 +212,8 @@ class BaseTransformerModel(nn.Module):
 
         if not ctx.forward_mode.is_idle():
 
-            assert residual is not None
+            if residual is None:
+                raise RuntimeError("residual is required for non-idle forward mode.")
 
             if isinstance(layer, BaseDecoderLayer):
                 hidden_states, final_residual = layer.comm_manager.final_norm(

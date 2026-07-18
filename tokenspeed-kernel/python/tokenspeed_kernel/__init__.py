@@ -23,15 +23,27 @@ from tokenspeed_kernel.profiling import bootstrap_profiling_from_env
 bootstrap_profiling_from_env()
 
 from tokenspeed_kernel.ops.attention import (
+    GdnCheckpointLayout,
+    GdnChunkPrefillResult,
     attn_merge_state,
-    attn_plan,
+    dsa_decode,
+    dsa_decode_topk,
+    dsa_plan,
+    dsa_prefill,
+    dsa_prefill_topk,
+    gdn_chunk_prefill,
     mha_decode_with_kvcache,
     mha_extend_with_kvcache,
+    mha_plan,
     mha_prefill,
     mla_decode_with_kvcache,
     mla_prefill,
+    rel_mha_decode_with_kvcache,
+    rel_mha_extend_with_kvcache,
+    rel_mha_plan,
+    rel_mha_prefill,
 )
-from tokenspeed_kernel.ops.gemm import mm
+from tokenspeed_kernel.ops.gemm import bmm, mm
 from tokenspeed_kernel.ops.moe import moe_apply, moe_plan, moe_process_weights
 from tokenspeed_kernel.ops.quantization import (
     quantize_fp8,
@@ -41,21 +53,35 @@ from tokenspeed_kernel.ops.quantization import (
     quantize_nvfp4,
 )
 from tokenspeed_kernel.ops.sampling import argmax
+from tokenspeed_kernel.ops.transform import hadamard_transform
 from tokenspeed_kernel.selection import NoKernelFoundError
 
 __all__ = [
     # exceptions
     "NoKernelFoundError",
     # gemm
+    "bmm",
     "mm",
     # attention
-    "attn_plan",
+    "mha_plan",
     "mha_prefill",
     "mha_extend_with_kvcache",
     "mha_decode_with_kvcache",
+    "rel_mha_prefill",
+    "rel_mha_extend_with_kvcache",
+    "rel_mha_decode_with_kvcache",
+    "rel_mha_plan",
     "mla_prefill",
     "mla_decode_with_kvcache",
+    "dsa_prefill",
+    "dsa_decode",
+    "dsa_prefill_topk",
+    "dsa_decode_topk",
+    "dsa_plan",
     "attn_merge_state",
+    "gdn_chunk_prefill",
+    "GdnCheckpointLayout",
+    "GdnChunkPrefillResult",
     # moe
     "moe_apply",
     "moe_plan",
@@ -68,4 +94,6 @@ __all__ = [
     "quantize_mxfp4",
     # sampling
     "argmax",
+    # transform
+    "hadamard_transform",
 ]

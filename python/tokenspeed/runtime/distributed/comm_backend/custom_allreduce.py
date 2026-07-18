@@ -99,10 +99,10 @@ class CustomAllReduceBackend(CommBackend):
             and ca_comm.should_custom_ar(tensor)
         ):
             out = ca_comm.custom_all_reduce(tensor)
-            assert out is not None
+            if out is None:
+                raise RuntimeError("custom all-reduce returned no output")
             return out
-        else:
-            return self._fallback.all_reduce(tensor, group, op=op)
+        return self._fallback.all_reduce(tensor, group, op=op)
 
     def all_gather(
         self, tensor: torch.Tensor, group: Group, dim: int = 0

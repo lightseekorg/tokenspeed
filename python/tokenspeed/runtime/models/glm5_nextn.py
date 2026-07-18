@@ -31,7 +31,10 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from tokenspeed.runtime.distributed.mapping import Mapping
-from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.context import (
+    ForwardContext,
+    report_collective_sizing,
+)
 from tokenspeed.runtime.layers.attention.dsa.utils import workspace_indices_to_kv_slots
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
@@ -177,7 +180,6 @@ class GlmMoeDsaModelNextN(nn.Module):
 
 class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
     compute_dsa_topk_first_step = True
-    draft_first_step_reduce_for_catchup = True
 
     def __init__(
         self,
@@ -226,11 +228,7 @@ class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
     def _apply_first_step_correction(ctx: ForwardContext) -> None:
         seq_lens_buf = ctx.draft_seq_lens_buf
         accept_lengths = ctx.accept_lengths
-        if (
-            not ctx.draft_first_step_reduce
-            or seq_lens_buf is None
-            or accept_lengths is None
-        ):
+        if seq_lens_buf is None or accept_lengths is None:
             return
         num_extends = ctx.num_extends
         if num_extends >= ctx.bs:
@@ -307,13 +305,14 @@ class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
         out_cache_loc: torch.Tensor,
         captured_hidden_states: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        hidden_states, _ = self.model(
-            input_ids,
-            positions,
-            ctx,
-            out_cache_loc,
-            captured_hidden_states=captured_hidden_states,
-        )
+        with report_collective_sizing(ctx, ctx.bs, ctx.global_bs):
+            hidden_states, _ = self.model(
+                input_ids,
+                positions,
+                ctx,
+                out_cache_loc,
+                captured_hidden_states=captured_hidden_states,
+            )
         self._apply_first_step_correction(ctx)
         logits_metadata = LogitsMetadata.from_forward_context(ctx)
         return self.logits_processor(

@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Iterable, Optional, Tuple
+from collections.abc import Iterable
 
 import torch
 from torch import nn
@@ -62,7 +62,7 @@ logger = logging.getLogger(__name__)
 _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
 
 
-def _spec_layer_idx(config: PretrainedConfig, weight_name: str) -> Optional[int]:
+def _spec_layer_idx(config: PretrainedConfig, weight_name: str) -> int | None:
     if getattr(config, "num_nextn_predict_layers", 0) <= 0:
         return None
     start = config.num_hidden_layers
@@ -99,9 +99,9 @@ class DeepseekV4MultiTokenPredictorLayer(nn.Module):
         config: PretrainedConfig,
         mapping: Mapping,
         layer_id: int,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
-        cache_layer_index: Optional[int] = None,
+        cache_layer_index: int | None = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -162,7 +162,7 @@ class DeepseekV4MultiTokenPredictorLayer(nn.Module):
         previous_hidden_states: torch.Tensor,
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
-        input_embeds: Optional[torch.Tensor] = None,
+        input_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if input_embeds is None:
             raise ValueError("DeepSeek V4 MTP requires input_embeds.")
@@ -209,7 +209,7 @@ class DeepseekV4MultiTokenPredictor(nn.Module):
         self,
         config: PretrainedConfig,
         mapping: Mapping,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -246,7 +246,7 @@ class DeepseekV4MultiTokenPredictor(nn.Module):
         previous_hidden_states: torch.Tensor,
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
-        input_embeds: Optional[torch.Tensor] = None,
+        input_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
         if input_embeds is None:
@@ -277,7 +277,7 @@ class DeepseekV4ForCausalLMNextN(nn.Module):
         self,
         config: PretrainedConfig,
         mapping: Mapping,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         nn.Module.__init__(self)
@@ -319,7 +319,7 @@ class DeepseekV4ForCausalLMNextN(nn.Module):
     def get_hot_token_id(self):
         return None
 
-    def get_embed_and_head(self) -> Tuple[torch.Tensor, torch.Tensor]:
+    def get_embed_and_head(self) -> tuple[torch.Tensor, torch.Tensor]:
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_embed_and_head(self, embed: torch.Tensor, head: torch.Tensor) -> None:
@@ -337,8 +337,8 @@ class DeepseekV4ForCausalLMNextN(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         out_cache_loc: torch.Tensor,
-        input_embeds: Optional[torch.Tensor] = None,
-        captured_hidden_states: Optional[torch.Tensor] = None,
+        input_embeds: torch.Tensor | None = None,
+        captured_hidden_states: torch.Tensor | None = None,
         spec_step_idx: int = 0,
         **kwargs,
     ):
@@ -415,7 +415,7 @@ class DeepseekV4ForCausalLMNextN(nn.Module):
             name = name.replace(f"model.layers.{spec_layer}.", "model.")
         return name
 
-    def _map_checkpoint_name(self, raw_name: str) -> Optional[str]:
+    def _map_checkpoint_name(self, raw_name: str) -> str | None:
         if raw_name.startswith("mtp."):
             mtp_layer_idx = _find_mtp_layer_idx(raw_name)
             raw_name = raw_name.replace(
@@ -453,7 +453,7 @@ class DeepseekV4ForCausalLMNextN(nn.Module):
             ("compressor.fused_wkv_wgate", "compressor.wgate", 1),
         ]
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         stacked_params_mapping = self.get_stacked_params_mapping()
         params_dict = dict(self.named_parameters())
         moe_loader = build_moe_checkpoint_loader(

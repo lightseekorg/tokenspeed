@@ -1038,7 +1038,7 @@ class RaggedTensorMetadata:
 
     @staticmethod
     def block_sizes_log2():
-        return range(4, 9) if torch.version.hip is not None else range(4, 8)
+        return range(4, 9)
 
     @staticmethod
     def block_sizes():

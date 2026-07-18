@@ -26,7 +26,7 @@ namespace tokenspeed::test {
 //  Retract: Decoding → Retracting → Retracted → Decoding
 // ============================================================
 
-// device_total=2 (page_size=2) means one request fills the device during Decoding;
+// device_total=2 (block_size=2) means one request fills the device during Decoding;
 // requesting an extra page then forces a Retract.
 class RetractTestSuite : public SchedulerTestSuite {
 protected:
@@ -168,7 +168,7 @@ TEST_F(RetractTestSuite, Retract_RetractedRequestRecoversToDecoding) {
 // ============================================================
 
 // device_total=4 → 3 usable pages (page 0 is reserved).
-// page_size=2, decode_input_tokens=2.
+// block_size=2, decode_input_tokens=2.
 // A 2-page request (4 tokens) uses 2 token pages + 1 decode reserve = 3 device pages.
 // This fills the device. scheduleDecode needs 1 more page → fails → retract from PrefillDone.
 //
@@ -264,7 +264,7 @@ TEST_F(RetractFromPrefillDoneTestSuite, Retract_FromPrefillDone_FullCycle) {
 //  Retract with tail_page_available==0: verify boundary page preserved
 // ============================================================
 
-// page_size=2, decode_input_tokens=1.
+// block_size=2, decode_input_tokens=1.
 // device_total=7 (6 usable).
 // r1 (2-page, 4 tokens): prefill 2 + Acquire(1) = 3 pages, tail_available=1.
 // r2 (1-page, 2 tokens): prefill 1 + Acquire(1) = 2 pages, tail_available=1.
@@ -315,7 +315,7 @@ protected:
 };
 
 // Retract when tail_page_available==0, then recover.
-// device_total=3 → 2 usable pages. page_size=2, decode_input_tokens=0.
+// device_total=3 → 2 usable pages. block_size=2, decode_input_tokens=0.
 // r1: 1-page request (2 tokens). Prefill: 1 page, tail_available=0.
 // After PrefillDone → Decoding: Acquire(0), still 1 page, tail_available=0.
 // SendForwardDone to add output token → 3 tokens. Then Acquire(1) → 1 more page, tail=1.
@@ -337,7 +337,7 @@ protected:
 // At retract: GetFullPagedTokens(true) on 3 tokens except_last → 2 tokens → 1 full page.
 // prefix=0. alloc_count=1. TakeFirstPages(1) from 2 pages → 1 inserted, 1 remains.
 // This tests the fix! The remaining page holds token 2's KV (position 2, partially fills page).
-// device_total=3 (2 usable). decode_input_tokens=0, page_size=2.
+// device_total=3 (2 usable). decode_input_tokens=0, block_size=2.
 // r1: 1-page (2 tokens). Prefill: 1 page, tail=0.
 // After decode: Acquire(0) → still 1 page, tail=0.
 // SendForwardDone → token count grows. SendReserveNumTokens(3) →

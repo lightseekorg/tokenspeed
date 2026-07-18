@@ -97,22 +97,24 @@ def import_model_classes():
 
         try:
             module = importlib.import_module(name)
-        except Exception as e:
-            raise e
+        except Exception as exc:
+            raise RuntimeError(f"Failed to import model module {name}.") from exc
         if hasattr(module, "EntryClass"):
             entry = module.EntryClass
             if isinstance(
                 entry, list
             ):  # To support multiple model classes in one module
                 for tmp in entry:
-                    assert (
-                        tmp.__name__ not in model_arch_name_to_cls
-                    ), f"Duplicated model implementation for {tmp.__name__}"
+                    if tmp.__name__ in model_arch_name_to_cls:
+                        raise ValueError(
+                            f"Duplicated model implementation for {tmp.__name__}"
+                        )
                     model_arch_name_to_cls[tmp.__name__] = tmp
             else:
-                assert (
-                    entry.__name__ not in model_arch_name_to_cls
-                ), f"Duplicated model implementation for {entry.__name__}"
+                if entry.__name__ in model_arch_name_to_cls:
+                    raise ValueError(
+                        f"Duplicated model implementation for {entry.__name__}"
+                    )
                 model_arch_name_to_cls[entry.__name__] = entry
 
     return model_arch_name_to_cls
