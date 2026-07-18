@@ -959,7 +959,7 @@ class MiniMaxM3SparseForConditionalGeneration(MiniMaxM3SparseForCausalLM):
 
     @staticmethod
     def _image_grid(item: MultimodalDataItem) -> torch.Tensor:
-        """Read and validate the explicit SMG grid contract for one image."""
+        """Read SMG ``image_grid_thw`` for one image item."""
 
         try:
             grid = item.model_specific_data["image_grid_thw"]
@@ -969,18 +969,17 @@ class MiniMaxM3SparseForConditionalGeneration(MiniMaxM3SparseForCausalLM):
             ) from error
         if not isinstance(grid, torch.Tensor):
             raise TypeError(
-                "MiniMax-M3 image_grid_thw must be a torch.Tensor, got "
+                f"MiniMax-M3 image_grid_thw must be a torch.Tensor, got "
                 f"{type(grid).__name__}."
             )
         if grid.dtype == torch.bool or grid.is_floating_point() or grid.is_complex():
             raise TypeError(
-                "MiniMax-M3 image_grid_thw must use an integer dtype, got "
-                f"{grid.dtype}."
+                f"MiniMax-M3 image_grid_thw must use an integer dtype, got {grid.dtype}."
             )
         if grid.ndim != 2 or grid.shape[1] != 3:
             raise ValueError(
-                "MiniMax-M3 image_grid_thw must have shape [num_images, 3], "
-                f"got {tuple(grid.shape)}."
+                f"MiniMax-M3 image_grid_thw must have shape [num_images, 3], got "
+                f"{tuple(grid.shape)}."
             )
         if bool((grid <= 0).any()):
             raise ValueError("MiniMax-M3 image_grid_thw values must be positive.")
@@ -989,23 +988,23 @@ class MiniMaxM3SparseForConditionalGeneration(MiniMaxM3SparseForCausalLM):
     def _validate_image_item(
         self, item: MultimodalDataItem, grid: torch.Tensor
     ) -> None:
-        if not isinstance(item.feature, torch.Tensor):
+        feature = item.feature
+        if not isinstance(feature, torch.Tensor):
             raise TypeError(
                 "MiniMax-M3 image features must be materialized torch tensors "
-                f"before encoding, got {type(item.feature).__name__}."
+                f"before encoding, got {type(feature).__name__}."
             )
-        if item.feature.ndim != 2:
+        if feature.ndim != 2:
             raise ValueError(
-                "MiniMax-M3 pixel_values must be 2D, got shape "
-                f"{tuple(item.feature.shape)}."
+                f"MiniMax-M3 pixel_values must be 2D, got shape {tuple(feature.shape)}."
             )
 
         patch_counts = grid.to(dtype=torch.int64).prod(dim=1)
         expected_patches = int(patch_counts.sum().item())
-        if item.feature.shape[0] != expected_patches:
+        if feature.shape[0] != expected_patches:
             raise ValueError(
                 "MiniMax-M3 pixel row count must equal image_grid_thw product, "
-                f"got {item.feature.shape[0]} and {expected_patches}."
+                f"got {feature.shape[0]} and {expected_patches}."
             )
 
         merge = self.vl_config.vision_config.spatial_merge_size

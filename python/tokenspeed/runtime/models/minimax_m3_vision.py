@@ -63,20 +63,16 @@ def _normalize_grid_thw(
 
     if raw_grid.ndim != 2 or raw_grid.shape[1] != 3:
         raise ValueError(
-            "grid_thw must have shape [num_grids, 3], " f"got {tuple(raw_grid.shape)}."
+            f"grid_thw must have shape [num_grids, 3], got {tuple(raw_grid.shape)}."
         )
     if raw_grid.shape[0] == 0:
         raise ValueError("grid_thw must contain at least one image or video grid.")
-    if not np.issubdtype(raw_grid.dtype, np.number):
+    if not np.issubdtype(raw_grid.dtype, np.number) or not np.isfinite(raw_grid).all():
         raise TypeError("grid_thw entries must be integers.")
-    if not np.isfinite(raw_grid).all():
-        raise ValueError("grid_thw entries must be finite integers.")
 
     normalized = raw_grid.astype(np.int64, copy=False)
-    if not np.equal(raw_grid, normalized).all():
-        raise ValueError("grid_thw entries must be integers.")
-    if (normalized <= 0).any():
-        raise ValueError("grid_thw entries must all be positive.")
+    if not np.equal(raw_grid, normalized).all() or (normalized <= 0).any():
+        raise ValueError("grid_thw entries must all be positive integers.")
     if (normalized[:, 1] % spatial_merge_size != 0).any() or (
         normalized[:, 2] % spatial_merge_size != 0
     ).any():
@@ -98,29 +94,12 @@ def apply_minimax_m3_vision_rotary(
     position_embeddings: tuple[torch.Tensor, torch.Tensor],
     x_shape: torch.Size | tuple[int, ...] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply MiniMax-M3's partial 3D RoPE to flattened vision Q/K tensors.
-
-    Args:
-        q: Query tensor shaped ``[tokens, heads, head_dim]``.
-        k: Key tensor shaped ``[tokens, heads, head_dim]``.
-        position_embeddings: Cosine and sine tensors shaped
-            ``[tokens, rotary_dim]``.
-        x_shape: Original attention input shape. It is accepted for the custom
-            :class:`VisionAttention` callback interface and is not otherwise used.
-
-    Returns:
-        The rotated query and key. Dimensions after ``rotary_dim`` pass through
-        unchanged (two dimensions for MiniMax-M3's 80-dimensional heads).
-    """
+    """Apply MiniMax-M3 partial 3D RoPE to flattened vision Q/K."""
     del x_shape
-    if q.ndim != 3 or k.ndim != 3:
+    if q.ndim != 3 or k.ndim != 3 or q.shape != k.shape:
         raise ValueError(
-            "MiniMax-M3 vision rotary expects Q/K shaped "
+            "MiniMax-M3 vision rotary expects matching Q/K shaped "
             f"[tokens, heads, head_dim], got {tuple(q.shape)} and {tuple(k.shape)}."
-        )
-    if q.shape != k.shape:
-        raise ValueError(
-            f"MiniMax-M3 vision Q/K shapes must match, got {q.shape} and {k.shape}."
         )
     if q.device != k.device or q.dtype != k.dtype:
         raise ValueError("MiniMax-M3 vision Q/K must share a device and dtype.")
@@ -128,25 +107,17 @@ def apply_minimax_m3_vision_rotary(
         raise TypeError("position_embeddings must be a (cos, sin) tuple.")
 
     cos, sin = position_embeddings
-    if cos.ndim != 2 or sin.shape != cos.shape:
+    if cos.ndim != 2 or sin.shape != cos.shape or cos.shape[0] != q.shape[0]:
         raise ValueError(
-            "Vision rotary cos/sin must share shape [tokens, rotary_dim], got "
-            f"{tuple(cos.shape)} and {tuple(sin.shape)}."
-        )
-    if cos.shape[0] != q.shape[0]:
-        raise ValueError(
-            "Vision rotary token count does not match Q/K: "
-            f"{cos.shape[0]} versus {q.shape[0]}."
+            "Vision rotary cos/sin must share shape [tokens, rotary_dim] with Q/K, "
+            f"got {tuple(cos.shape)} and {tuple(sin.shape)} for {q.shape[0]} tokens."
         )
 
     rotary_dim = cos.shape[-1]
-    if rotary_dim == 0 or rotary_dim % 2 != 0:
+    if rotary_dim == 0 or rotary_dim % 2 != 0 or rotary_dim > q.shape[-1]:
         raise ValueError(
-            f"Vision rotary_dim must be a positive even value, got {rotary_dim}."
-        )
-    if rotary_dim > q.shape[-1]:
-        raise ValueError(
-            f"Vision rotary_dim ({rotary_dim}) exceeds head_dim ({q.shape[-1]})."
+            f"Vision rotary_dim must be a positive even value <= head_dim, got "
+            f"{rotary_dim} for head_dim={q.shape[-1]}."
         )
 
     cos = cos.to(device=q.device, dtype=q.dtype).unsqueeze(1)
