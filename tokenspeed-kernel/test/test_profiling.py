@@ -168,6 +168,36 @@ def test_kernel_scope_uses_proton_scope_when_active(monkeypatch):
     assert fake.scope_log == ["enter", "exit"]
 
 
+def test_kernel_scope_filters_unsupported_proton_metrics(monkeypatch):
+    fake = _FakeProton()
+    monkeypatch.setattr(profiling, "_HAS_PROTON", True)
+    monkeypatch.setattr(profiling, "proton", fake)
+    profiling.start_profiling()
+
+    with profiling.kernel_scope(
+        "quantization",
+        "mxfp4",
+        torch.float16,
+        kernel_name="triton",
+        shape=(2, 3),
+        scale_size=32,
+        scale_layout="ue8m0",
+        has_global_scale=False,
+    ):
+        pass
+
+    assert fake.scope_calls == [
+        (
+            "quantization.mxfp4[triton]",
+            {
+                "shape": [2, 3],
+                "scale_size": 32,
+                "has_global_scale": False,
+            },
+        )
+    ]
+
+
 def test_bootstrap_reads_env_and_only_runs_once(monkeypatch):
     fake = _FakeProton()
     registrations: list[object] = []

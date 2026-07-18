@@ -28,6 +28,7 @@ import time
 import warnings
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
+from numbers import Real
 from pathlib import Path
 from typing import Any
 
@@ -189,6 +190,19 @@ _NOOP_SCOPE = _NoopScope()
 _BOOTSTRAPPED = False
 
 
+def _proton_metrics(metrics: dict[str, object]) -> dict[str, object]:
+    """Keep only the metric types accepted by Proton's Python API."""
+    supported: dict[str, object] = {}
+    for name, value in metrics.items():
+        if hasattr(value, "data_ptr") or isinstance(value, Real):
+            supported[name] = value
+        elif isinstance(value, (list, tuple)) and all(
+            isinstance(element, Real) for element in value
+        ):
+            supported[name] = list(value)
+    return supported
+
+
 def _is_truthy(value: str | None) -> bool:
     if value is None:
         return False
@@ -326,7 +340,7 @@ def kernel_scope(
         return _NOOP_SCOPE
 
     name = f"{family}.{mode}[{kernel_name}]" if kernel_name else f"{family}.{mode}"
-    scope_metrics = dict(metrics)
+    scope_metrics = _proton_metrics(metrics)
     return proton.scope(name, metrics=scope_metrics)
 
 
