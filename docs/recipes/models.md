@@ -164,6 +164,20 @@ tokenspeed serve Qwen/Qwen3-30B-A3B \
   --port 8000
 ```
 
+## Multimodal Encoder Warmup
+
+Kimi K2.5 and Qwen3.5 VLM servers prewarm their native vision encoder inputs
+before KV-cache memory is sized. Kimi warms image encoding; Qwen3.5 warms both
+image and video encoding. The same warmup runs in aggregated and EPD encode
+workers. Set `TOKENSPEED_MM_ENABLE_VISION_PREWARM=0` or pass
+`--skip-server-warmup` to disable it. The default synthetic spatial grid is 74
+patches per side; override it with
+`TOKENSPEED_MM_VISION_PREWARM_PATCHES_PER_SIDE`, keeping the value divisible by
+the model's spatial merge size. Prewarm materializes persistent encoder
+allocations before KV-cache sizing, so multimodal servers can have less KV-cache
+capacity than text-only servers. Disable it for text-only deployments that do
+not need the encoder initialized before the first multimodal request.
+
 ## GPT-OSS 20B / 120B
 
 Small GPT-OSS launches can start simple. Large GPT-OSS launches usually tune

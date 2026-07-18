@@ -1223,8 +1223,8 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             )
             self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
             self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
-            # Encoder callables may be swapped to cudagraph wrappers by
-            # ModelExecutor.
+            # Encoder callables may be swapped to cudagraph wrappers during
+            # runtime startup.
             self.vision_embedder = VisionEmbedder()
             self.image_encoder = self.get_image_feature
             self.video_encoder = self.get_video_feature
@@ -1258,6 +1258,52 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
         metadata = self.visual.prepare_metadata(grid)
         encoded = self.visual.forward_blocks(tokens, metadata)
         return self.post_encode([encoded], grid)
+
+    def make_encoder_warmup_items(
+        self, patches_per_side: int
+    ) -> dict[Modality, list[MultimodalDataItem]]:
+        """Build synthetic image and video batches for startup encoder warmup.
+
+        Args:
+            patches_per_side: Number of vision patches along each spatial axis.
+
+        Returns:
+            Image and video batches accepted by their corresponding encoders.
+        """
+        merge = int(self.visual.spatial_merge_size)
+        if patches_per_side % merge:
+            raise ValueError(
+                f"Qwen encoder warmup patches_per_side={patches_per_side} must be "
+                f"divisible by spatial_merge_size={merge}"
+            )
+        patch_embed = self.visual.patch_embed
+        flattened_patch_size = (
+            patch_embed.in_channels
+            * patch_embed.temporal_patch_size
+            * patch_embed.patch_size
+            * patch_embed.patch_size
+        )
+
+        def make_item(modality: Modality, temporal_patches: int, grid_key: str):
+            grid = torch.tensor(
+                [[temporal_patches, patches_per_side, patches_per_side]],
+                dtype=torch.long,
+            )
+            feature = torch.zeros(
+                temporal_patches * patches_per_side * patches_per_side,
+                flattened_patch_size,
+                dtype=self.visual.dtype,
+            )
+            return MultimodalDataItem(
+                modality=modality,
+                feature=feature,
+                model_specific_data={grid_key: grid},
+            )
+
+        return {
+            Modality.IMAGE: [make_item(Modality.IMAGE, 1, "image_grid_thw")],
+            Modality.VIDEO: [make_item(Modality.VIDEO, 2, "video_grid_thw")],
+        }
 
     def pre_encode(
         self,

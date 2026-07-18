@@ -554,34 +554,6 @@ class ModelExecutor:
             decode_wrapper=self.forward_step,
         )
 
-        # Encoder CUDA graph: install model-built wrappers by overriding
-        # modality encoder callables (e.g. ``image_encoder``, ``video_encoder``).
-        # Multimodal-encoder analogue of ``forward_step``'s ``CudaGraphWrapper``.
-        self.encoder_graph_wrappers = {}
-        _mm_model = self.model_runner.model
-        if (
-            hasattr(_mm_model, "make_encoder_cudagraph_wrappers")
-            and getattr(_mm_model, "is_multimodal_active", True)
-            and envs.TOKENSPEED_MM_ENABLE_ENCODER_CUDA_GRAPH.get()
-            and self.model_runner.server_args.mm_attention_backend != "flashinfer_cudnn"
-        ):
-            self.encoder_graph_wrappers = _mm_model.make_encoder_cudagraph_wrappers(
-                _mm_model.mapping
-            )
-
-            active_encoder_graph_wrappers = {}
-            for encoder_attr, wrapper in self.encoder_graph_wrappers.items():
-                if not hasattr(_mm_model, encoder_attr):
-                    logger.warning(
-                        "Skipping encoder CUDA graph wrapper for missing attribute %s",
-                        encoder_attr,
-                    )
-                    continue
-                setattr(_mm_model, encoder_attr, wrapper)
-                active_encoder_graph_wrappers[encoder_attr] = wrapper
-
-            self.encoder_graph_wrappers = active_encoder_graph_wrappers
-
         self.execution_stream = torch.cuda.Stream()
         self.log_step = 0
         self._seen_prefill_ids: set[str] = set()
