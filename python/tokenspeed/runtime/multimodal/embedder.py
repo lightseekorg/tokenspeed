@@ -53,6 +53,7 @@ request's scatter ranges read from the first item's ``encoded`` tensor.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from collections import defaultdict
 from collections.abc import Callable
@@ -75,6 +76,14 @@ EncoderFn = Callable[[list[MultimodalDataItem]], torch.Tensor]
 
 logger = logging.getLogger(__name__)
 LOG_MM_TIMING = envs.TOKENSPEED_LOG_MM_TIMING.get()
+# Small transfers are faster after staging the whole batch; larger transfers
+# benefit from overlapping each H2D enqueue with the next SHM-to-pinned copy.
+_INTERLEAVED_H2D_MIN_AVERAGE_BYTES = 1024 * 1024
+# One rank can stage the input and distribute it faster than every TP rank
+# repeating the host copy once the payload reaches this TP-scaled threshold.
+# Local B200 measurements put the break-even points near 128 MiB for TP2 and
+# 64 MiB for TP4.
+_TP_BROADCAST_BASE_MIN_BYTES = 256 * 1024 * 1024
 
 
 @dataclass
@@ -182,8 +191,20 @@ def _item_token_count(item: MultimodalDataItem) -> int:
 class MultimodalEmbedder:
     """Multimodal input embedding pipeline for one model executor."""
 
-    def __init__(self) -> None:
+    def __init__(self, vision_tp_group: tuple[int, ...] | None = None) -> None:
         self._h2d_stream: torch.cuda.Stream | None = None
+        self._vision_tp_group = vision_tp_group
+        self._vision_tp_process_group = None
+        self._vision_tp_src_rank: int | None = None
+        if vision_tp_group is not None and len(vision_tp_group) > 1:
+            from tokenspeed.runtime.distributed.process_group_manager import (
+                process_group_manager as pg_manager,
+            )
+
+            self._vision_tp_process_group = pg_manager.get_process_group(
+                "nccl", vision_tp_group
+            )
+            self._vision_tp_src_rank = vision_tp_group[0]
 
     # --- public entry point ------------------------------------------------
 
@@ -504,23 +525,108 @@ class MultimodalEmbedder:
         if not pending:
             return
 
-        for it in pending:
-            if isinstance(it.feature, ShmTensorHandle):
-                it.feature = it.feature.consume()
-
         if device.type != "cuda":
             for it in pending:
+                if isinstance(it.feature, ShmTensorHandle):
+                    it.feature = it.feature.consume()
                 if isinstance(it.feature, torch.Tensor):
                     it.feature = it.feature.to(device, non_blocking=True)
+            return
+
+        shm_count = 0
+        shm_nbytes = 0
+        for item in pending:
+            if isinstance(item.feature, ShmTensorHandle):
+                shm_count += 1
+                shm_nbytes += item.feature.nbytes
+        use_tp_broadcast = self._should_move_shm_via_tp_broadcast(pending)
+        interleave_h2d = shm_nbytes > shm_count * _INTERLEAVED_H2D_MIN_AVERAGE_BYTES
+        defer_shm_cleanup = shm_count == 1 and interleave_h2d
+        if not use_tp_broadcast and not interleave_h2d:
+            for item in pending:
+                if isinstance(item.feature, ShmTensorHandle):
+                    item.feature = item.feature.consume()
+
+        # Keep collectives on the model stream so their ordering matches other
+        # TP collectives queued by the forward pass on every rank.
+        if use_tp_broadcast:
+            self._move_shm_via_tp_broadcast(pending, device)
             return
 
         h2d = self._h2d_stream_on(device)
         current = torch.cuda.current_stream(device)
         with torch.cuda.stream(h2d):
             for it in pending:
+                if isinstance(it.feature, ShmTensorHandle):
+                    if defer_shm_cleanup:
+                        handle = it.feature
+                        try:
+                            it.feature = handle.copy_to_pinned()
+                            it.feature = it.feature.to(device, non_blocking=True)
+                        finally:
+                            handle.release()
+                        continue
+                    it.feature = it.feature.consume()
                 if isinstance(it.feature, torch.Tensor):
                     it.feature = it.feature.to(device, non_blocking=True)
         current.wait_stream(h2d)
+
+    def _should_move_shm_via_tp_broadcast(
+        self, items: list[MultimodalDataItem]
+    ) -> bool:
+        tp_group = self._vision_tp_group
+        if (
+            tp_group is None
+            or self._vision_tp_process_group is None
+            or self._vision_tp_src_rank is None
+            or not items
+            or not all(isinstance(item.feature, ShmTensorHandle) for item in items)
+        ):
+            return False
+
+        handles = [item.feature for item in items]
+        dtype = handles[0].dtype
+        if any(handle.dtype != dtype for handle in handles):
+            return False
+        total_nbytes = sum(handle.nbytes for handle in handles)
+        return total_nbytes >= _TP_BROADCAST_BASE_MIN_BYTES // len(tp_group)
+
+    def _move_shm_via_tp_broadcast(
+        self,
+        items: list[MultimodalDataItem],
+        device: torch.device,
+    ) -> None:
+        tp_group = self._vision_tp_group
+        process_group = self._vision_tp_process_group
+        src_rank = self._vision_tp_src_rank
+        assert tp_group is not None
+        assert process_group is not None
+        assert src_rank is not None
+
+        handles = [item.feature for item in items]
+        dtype = handles[0].dtype
+
+        element_lengths = [math.prod(handle.shape) for handle in handles]
+        base = torch.empty(sum(element_lengths), dtype=dtype, device=device)
+        is_source = torch.distributed.get_rank() == src_rank
+        offset = 0
+        if is_source:
+            for handle, length in zip(handles, element_lengths, strict=True):
+                if len(handles) == 1:
+                    handle.copy_into(base.narrow(0, offset, length))
+                else:
+                    source = handle.consume().reshape(-1)
+                    base.narrow(0, offset, length).copy_(source, non_blocking=True)
+                offset += length
+        else:
+            for handle in handles:
+                handle.release()
+
+        torch.distributed.broadcast(base, src=src_rank, group=process_group)
+        offset = 0
+        for item, handle, length in zip(items, handles, element_lengths, strict=True):
+            item.feature = base.narrow(0, offset, length).view(handle.shape)
+            offset += length
 
     @staticmethod
     def _drop_raw_feature(item: MultimodalDataItem) -> bool:

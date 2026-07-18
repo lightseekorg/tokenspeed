@@ -181,6 +181,7 @@ class EventLoop:
         target, draft = create_model_runner(
             server_args, self.model_config, draft_model_config, gpu_id, global_rank
         )
+        self.multimodal_encoder_dtype = target.multimodal_encoder_dtype
         self.use_overlap_schedule = should_use_overlap_schedule(
             disable_overlap_schedule=server_args.disable_overlap_schedule,
             disaggregation_mode=server_args.disaggregation_mode,
@@ -1894,6 +1895,7 @@ def run_event_loop(
                 "max_num_seqs": server_args.max_num_seqs,
                 "chunked_prefill_size": server_args.chunked_prefill_size,
                 "max_model_len": event_loop.model_config.context_len,
+                "multimodal_encoder_dtype": event_loop.multimodal_encoder_dtype,
             }
         )
 

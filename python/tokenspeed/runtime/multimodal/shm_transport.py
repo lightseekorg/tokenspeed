@@ -31,6 +31,7 @@ large payload copy happens:
 from __future__ import annotations
 
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from multiprocessing import shared_memory
@@ -53,6 +54,12 @@ class ShmTensorHandle:
     _segment: shared_memory.SharedMemory | None = field(
         default=None, init=False, repr=False, compare=False
     )
+
+    @property
+    def nbytes(self) -> int:
+        if self._segment is not None:
+            return self._segment.size
+        return math.prod(self.shape) * self.dtype.itemsize
 
     @classmethod
     def publish(cls, tensor: torch.Tensor) -> ShmTensorHandle:
@@ -80,25 +87,11 @@ class ShmTensorHandle:
         """Copy into a pinned tensor (so downstream non_blocking H2D is real),
         close this rank's FD, and unlink. ``attach()`` must have run.
         """
-        if self._segment is None:
-            raise RuntimeError(
-                f"ShmTensorHandle({self.shm_name!r}) must be attach()'d "
-                "before consume() (or has already been consumed on this rank)"
-            )
-        segment = self._segment
         started = time.perf_counter() if LOG_MM_TIMING else None
         try:
-            dst = torch.empty(self.shape, dtype=self.dtype, pin_memory=True)
-            src = torch.frombuffer(segment.buf, dtype=self.dtype).reshape(self.shape)
-            dst.copy_(src)
+            dst = self._copy_to_pinned()
         finally:
-            self._segment = None
-            segment.close()
-            try:
-                segment.unlink()
-            except FileNotFoundError:
-                # Another rank already won the unlink race; benign.
-                pass
+            self._close_and_unlink()
         if LOG_MM_TIMING and started is not None:
             logger.info(
                 "mm_timing shm_consume_ms name=%s elapsed=%.3f shape=%s dtype=%s",
@@ -109,9 +102,73 @@ class ShmTensorHandle:
             )
         return dst
 
-    def release(self) -> None:
-        """Close and unlink a SHM segment without materializing the tensor."""
+    def copy_to_pinned(self) -> torch.Tensor:
+        """Copy into pinned memory while retaining this rank's SHM ownership.
+
+        The caller must subsequently call :meth:`release`. This allows an
+        asynchronous H2D copy to be enqueued before close/unlink cleanup.
+        """
         started = time.perf_counter() if LOG_MM_TIMING else None
+        dst = self._copy_to_pinned()
+        if LOG_MM_TIMING and started is not None:
+            logger.info(
+                "mm_timing shm_copy_to_pinned_ms name=%s elapsed=%.3f shape=%s dtype=%s",
+                self.shm_name,
+                (time.perf_counter() - started) * 1000,
+                list(self.shape),
+                self.dtype,
+            )
+        return dst
+
+    def copy_into(self, destination: torch.Tensor) -> None:
+        """Synchronously copy into an existing tensor and release the SHM segment."""
+        if self._segment is None:
+            raise RuntimeError(
+                f"ShmTensorHandle({self.shm_name!r}) must be attach()'d "
+                "before copying (or has already been released on this rank)"
+            )
+        started = time.perf_counter() if LOG_MM_TIMING else None
+        source = torch.frombuffer(self._segment.buf, dtype=self.dtype).reshape(
+            self.shape
+        )
+        try:
+            if source.dtype != destination.dtype:
+                raise ValueError(
+                    "SHM source and destination dtypes differ: "
+                    f"{source.dtype} != {destination.dtype}"
+                )
+            if source.shape != destination.shape:
+                if source.numel() != destination.numel():
+                    raise ValueError(
+                        "SHM source and destination element counts differ: "
+                        f"{source.numel()} != {destination.numel()}"
+                    )
+                source = source.reshape(destination.shape)
+            destination.copy_(source)
+        finally:
+            del source
+            self._close_and_unlink()
+        if LOG_MM_TIMING and started is not None:
+            logger.info(
+                "mm_timing shm_copy_into_ms name=%s elapsed=%.3f shape=%s dtype=%s",
+                self.shm_name,
+                (time.perf_counter() - started) * 1000,
+                list(self.shape),
+                self.dtype,
+            )
+
+    def _copy_to_pinned(self) -> torch.Tensor:
+        if self._segment is None:
+            raise RuntimeError(
+                f"ShmTensorHandle({self.shm_name!r}) must be attach()'d "
+                "before copying (or has already been released on this rank)"
+            )
+        dst = torch.empty(self.shape, dtype=self.dtype, pin_memory=True)
+        src = torch.frombuffer(self._segment.buf, dtype=self.dtype).reshape(self.shape)
+        dst.copy_(src)
+        return dst
+
+    def _close_and_unlink(self) -> None:
         segment = self._segment
         self._segment = None
         try:
@@ -121,9 +178,15 @@ class ShmTensorHandle:
             try:
                 segment.unlink()
             except FileNotFoundError:
+                # Another rank already won the unlink race; benign.
                 pass
         except FileNotFoundError:
             pass
+
+    def release(self) -> None:
+        """Close and unlink a SHM segment without materializing the tensor."""
+        started = time.perf_counter() if LOG_MM_TIMING else None
+        self._close_and_unlink()
         if LOG_MM_TIMING and started is not None:
             logger.info(
                 "mm_timing shm_release_ms name=%s elapsed=%.3f shape=%s dtype=%s",
