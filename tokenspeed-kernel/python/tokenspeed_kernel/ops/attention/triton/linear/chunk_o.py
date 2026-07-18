@@ -88,21 +88,18 @@ def chunk_fwd_kernel_o(
     b_A = tl.zeros([BT, BT], dtype=tl.float32)
 
     for i_k in range(tl.cdiv(K, BK)):
-        p_q = tl.make_block_ptr(
-            q, (T, K), (Hg * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
-        )
-        p_k = tl.make_block_ptr(
-            k, (K, T), (1, Hg * K), (i_k * BK, i_t * BT), (BK, BT), (0, 1)
-        )
-        p_h = tl.make_block_ptr(
-            h, (K, V), (V, 1), (i_k * BK, i_v * BV), (BK, BV), (1, 0)
-        )
+        p_q = tl.make_tensor_descriptor(q, (T, K), (Hg * K, 1), (BT, BK))
+        # ``k`` is consumed transposed ([BK, BT]); descriptors require a
+        # contiguous innermost dim, so load it in its natural [BT, BK] layout
+        # and transpose in-register.
+        p_k = tl.make_tensor_descriptor(k, (T, K), (Hg * K, 1), (BT, BK))
+        p_h = tl.make_tensor_descriptor(h, (K, V), (V, 1), (BK, BV))
         # [BT, BK]
-        b_q = tl.load(p_q, boundary_check=(0, 1))
+        b_q = p_q.load([i_t * BT, i_k * BK])
         # [BK, BT]
-        b_k = tl.load(p_k, boundary_check=(0, 1))
+        b_k = tl.trans(p_k.load([i_t * BT, i_k * BK]))
         # [BK, BV]
-        b_h = tl.load(p_h, boundary_check=(0, 1))
+        b_h = p_h.load([i_k * BK, i_v * BV])
 
         # [BT, BK] @ [BK, BV] -> [BT, BV]
         b_o += tl.dot(b_q, b_h)
@@ -111,8 +108,10 @@ def chunk_fwd_kernel_o(
 
     if USE_G:
         g += bos * H + i_h
-        p_g = tl.make_block_ptr(g, (T,), (H,), (i_t * BT,), (BT,), (0,))
-        b_g = tl.load(p_g, boundary_check=(0,))
+        # ``g`` is one scalar per token (stride H), not contiguous; use a
+        # masked pointer load rather than a descriptor.
+        o_g = i_t * BT + tl.arange(0, BT)
+        b_g = tl.load(g + o_g * H, mask=o_g < T, other=0.0)
         b_o = b_o * exp(b_g)[:, None]
         b_A = b_A * safe_exp(b_g[:, None] - b_g[None, :])
 
@@ -120,18 +119,14 @@ def chunk_fwd_kernel_o(
     m_A = o_i[:, None] >= o_i[None, :]
     b_A = tl.where(m_A, b_A, 0)
 
-    p_v = tl.make_block_ptr(
-        v, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
-    )
-    p_o = tl.make_block_ptr(
-        o, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
-    )
-    b_v = tl.load(p_v, boundary_check=(0, 1))
+    p_v = tl.make_tensor_descriptor(v, (T, V), (H * V, 1), (BT, BV))
+    p_o = tl.make_tensor_descriptor(o, (T, V), (H * V, 1), (BT, BV))
+    b_v = p_v.load([i_t * BT, i_v * BV])
 
     # to fix mma -> mma layout conversion
     # already solved by triton v3.2 or higher
     b_o = b_o * scale + tl.dot(b_A.to(b_v.dtype), b_v) * scale
-    tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+    p_o.store([i_t * BT, i_v * BV], b_o.to(p_o.dtype))
 
 
 def chunk_fwd_o(
