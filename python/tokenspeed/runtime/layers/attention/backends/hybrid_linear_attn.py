@@ -43,7 +43,7 @@ from tokenspeed.runtime.configs.paged_cache_spec import LINEAR_ATTENTION
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     break_point,
     current_forward_ctx,
-    scrub_padding_tail,
+    slice_to_real_tokens,
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import (
@@ -1308,10 +1308,14 @@ class MambaAttnBackend(AttentionBackend):
                 and self.forward_metadata.track_ssm_h_src.numel() > 0
             )
 
-            # Zero padded rows so garbage can't reach recurrent state (see scrub_padding_tail).
-            if extend_seq_lens_cpu is not None:
+            # Recurrent kernels require the tensor row count to match the live
+            # cumulative sequence lengths. A prefill graph may hand this eager
+            # break a larger bucket, so drop its padded rows before launching.
+            # Mixed metadata does not describe its trailing decode rows.
+            if forward_mode.is_extend() and extend_seq_lens_cpu is not None:
                 ntok = int(sum(int(x) for x in extend_seq_lens_cpu))
-                scrub_padding_tail(ntok, mixed_qkv, a, b)
+                mixed_qkv, a, b = slice_to_real_tokens(ntok, mixed_qkv, a, b)
+                seq_len = ntok
 
             mixed_qkv_t = mixed_qkv.transpose(0, 1)
             if need_h_track:

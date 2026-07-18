@@ -24,6 +24,7 @@ import torch  # noqa: E402
 
 from tokenspeed.runtime.execution.breakable_cuda_graph import (  # noqa: E402
     BreakableCapture,
+    _land_in,
     active_forward,
     break_here,
     break_point,
@@ -32,6 +33,17 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (  # noqa: E402
     scrub_padding_tail,
     slice_to_real_tokens,
 )
+
+
+class TestPaddedBreakHandoff(unittest.TestCase):
+    def test_short_result_copies_prefix_and_clears_padded_tail(self):
+        dst = torch.full((6, 3), 99.0)
+        result = torch.arange(12, dtype=torch.float32).view(4, 3)
+
+        _land_in(dst, result)
+
+        torch.testing.assert_close(dst[:4], result)
+        torch.testing.assert_close(dst[4:], torch.zeros_like(dst[4:]))
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")

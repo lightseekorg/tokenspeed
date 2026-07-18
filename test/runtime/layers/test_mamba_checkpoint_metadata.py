@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.layers.attention.backends import hybrid_linear_attn
 from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
     MambaAttnBackend,
+    MambaForwardMetadata,
     SimpleMambaPool,
 )
 from tokenspeed.runtime.layers.attention.linear.mamba_state_scatter_triton import (
@@ -159,6 +163,110 @@ def test_extend_skips_unaligned_inserted_page_boundary():
 
     assert metadata.track_ssm_h_dst is None
     assert metadata.track_ssm_final_dst is None
+
+
+def test_gdn_extend_trims_prefill_graph_bucket_to_live_rows(monkeypatch):
+    bucket_tokens = 1536
+    live_tokens = 1478
+    num_heads = 2
+    head_dim = 2
+    mixed_width = num_heads * head_dim * 3
+
+    backend = object.__new__(MambaAttnBackend)
+    backend.is_draft = False
+    backend.speculative_num_draft_tokens = 4
+    backend.flat_state_active = False
+
+    conv_states = torch.zeros(2, mixed_width)
+    ssm_states = torch.zeros(2, num_heads, head_dim, head_dim)
+    backend.pool = SimpleNamespace(
+        get_mamba_params=lambda _layer_id: (conv_states, ssm_states)
+    )
+    backend.forward_metadata = MambaForwardMetadata(
+        query_start_loc=torch.tensor([0, live_tokens], dtype=torch.int32),
+        mamba_cache_indices=torch.tensor([0], dtype=torch.int64),
+        extend_prefix_lens=torch.tensor([60_222], dtype=torch.int32),
+        extend_seq_lens_cpu=torch.tensor([live_tokens], dtype=torch.int32),
+        track_ssm_h_src=torch.tensor([0], dtype=torch.int64),
+        track_ssm_h_dst=torch.tensor([1], dtype=torch.int64),
+        track_conv_indices=torch.tensor([live_tokens - 1], dtype=torch.int64),
+    )
+
+    seen = {}
+
+    def fake_causal_conv(x, _weights, _bias, **kwargs):
+        seen["conv_rows"] = x.shape[1]
+        seen["conv_seq_lens_cpu"] = kwargs["seq_lens_cpu"]
+        return x
+
+    def fake_qkv_split(x, **_kwargs):
+        seen["split_rows"] = x.shape[0]
+        shape = (1, x.shape[0], num_heads, head_dim)
+        return torch.zeros(shape), torch.zeros(shape), torch.zeros(shape)
+
+    def fake_gating(_a_log, a, _dt_bias):
+        seen["gating_rows"] = a.shape[0]
+        return torch.zeros_like(a)
+
+    def fake_gdn_prefill(query, key, value, g, beta, **kwargs):
+        seen["gdn_shapes"] = tuple(
+            tensor.shape for tensor in (query, key, value, g, beta)
+        )
+        seen["gdn_cu_seqlens"] = kwargs["cu_seqlens"]
+        seen["gdn_output_h"] = kwargs["output_h"]
+        return SimpleNamespace(
+            out=query,
+            final_state=kwargs["initial_state"].clone(),
+            h=torch.zeros(1, num_heads, head_dim, head_dim),
+            h_layout=hybrid_linear_attn.GdnCheckpointLayout.FLASHINFER,
+        )
+
+    monkeypatch.setattr(hybrid_linear_attn, "causal_conv1d_fn", fake_causal_conv)
+    monkeypatch.setattr(
+        hybrid_linear_attn, "fused_qkv_split_gdn_prefill", fake_qkv_split
+    )
+    monkeypatch.setattr(hybrid_linear_attn, "fused_gdn_gating", fake_gating)
+    monkeypatch.setattr(hybrid_linear_attn, "gdn_chunk_prefill", fake_gdn_prefill)
+
+    mixed_qkv = torch.arange(bucket_tokens * mixed_width, dtype=torch.float32).view(
+        bucket_tokens, mixed_width
+    )
+    a = torch.zeros(bucket_tokens, num_heads)
+    b = torch.zeros(bucket_tokens, num_heads)
+    output = backend.forward_extend(
+        q=None,
+        k=None,
+        v=None,
+        layer=SimpleNamespace(),
+        out_cache_loc=None,
+        token_to_kv_pool=None,
+        bs=1,
+        forward_mode=ForwardMode.EXTEND,
+        mixed_qkv=mixed_qkv,
+        conv_weights=torch.empty(0),
+        bias=None,
+        activation="silu",
+        key_dim=num_heads * head_dim,
+        value_dim=num_heads * head_dim,
+        attention_tp_size=1,
+        head_k_dim=head_dim,
+        head_v_dim=head_dim,
+        a=a,
+        b=b,
+        A_log=torch.zeros(num_heads),
+        dt_bias=torch.zeros(num_heads),
+        layer_id=0,
+        seq_len=bucket_tokens,
+    )
+
+    assert seen["conv_rows"] == live_tokens
+    assert seen["split_rows"] == live_tokens
+    assert seen["gating_rows"] == live_tokens
+    assert [shape[1] for shape in seen["gdn_shapes"]] == [live_tokens] * 5
+    assert seen["conv_seq_lens_cpu"] is backend.forward_metadata.extend_seq_lens_cpu
+    assert seen["gdn_cu_seqlens"] is backend.forward_metadata.query_start_loc
+    assert seen["gdn_output_h"] is True
+    assert output.shape[1] == live_tokens
 
 
 @pytest.mark.skipif(

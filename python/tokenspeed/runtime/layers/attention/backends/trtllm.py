@@ -43,6 +43,7 @@ from tokenspeed_kernel.ops.kvcache.triton import (
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     is_breakable_capture_active,
+    slice_to_real_tokens,
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
@@ -95,6 +96,8 @@ class TRTLLMMHAMetadata:
     cache_seqlens_int32: torch.Tensor = None
     max_seq_len_q: int = 1
     max_seq_len_k: int = 0
+    # Exact only for pure EXTEND; mixed metadata omits trailing decode rows.
+    num_query_tokens: int | None = None
     cu_seqlens_q: torch.Tensor = None
     cu_seqlens_k: torch.Tensor = None
     # page_table is None on the flat path (per-group page_tables route reads).
@@ -363,6 +366,10 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
     ) -> torch.Tensor:
         metadata = self.forward_prefill_metadata
         out_cache_loc = self._select_out_cache_loc(layer, metadata, out_cache_loc)
+        if metadata.num_query_tokens is not None:
+            q, k, v, out_cache_loc = slice_to_real_tokens(
+                metadata.num_query_tokens, q, k, v, out_cache_loc
+            )
         q = self._save_kv_and_prepare_q(
             q, k, v, layer, out_cache_loc, token_to_kv_pool, save_kv_cache
         )
@@ -445,6 +452,7 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                 req_pool_indices,
                 seq_lens,
                 req_to_page,
+                forward_mode=forward_mode,
                 extend_with_prefix=extend_with_prefix,
                 extend_prefix_lens=extend_prefix_lens,
                 extend_prefix_lens_cpu=extend_prefix_lens_cpu,
@@ -668,8 +676,9 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         extend_seq_lens_cpu=None,
         flat_page_tables: dict[str, torch.Tensor] | None = None,
         flat_out_cache_locs: dict[str, torch.Tensor] | None = None,
+        forward_mode: ForwardMode = ForwardMode.EXTEND,
     ):
-        """Populate prefill slot for regular EXTEND (ragged query)."""
+        """Populate the ragged-query prefill slot for EXTEND or MIXED."""
         assert (
             seq_lens.dtype == torch.int32
         ), f"seq_lens must be int32, got {seq_lens.dtype}"
@@ -696,6 +705,11 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         # seq_lens, for a prefix-cached extend it's seq_lens-prefix_lens —
         # extend_seq_lens_cpu holds those new-token counts in either case.
         max_seq_len_q = int(extend_seq_lens_cpu[:bs].max().item())
+        num_query_tokens = (
+            sum(int(length) for length in extend_seq_lens_cpu[:bs])
+            if forward_mode.is_extend()
+            else None
+        )
 
         if extend_with_prefix and (
             (extend_prefix_lens_cpu is not None and any(extend_prefix_lens_cpu))
@@ -717,6 +731,7 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             cache_seqlens_int32=cache_seqlens_int32,
             max_seq_len_q=max_seq_len_q,
             max_seq_len_k=self.max_context_len,
+            num_query_tokens=num_query_tokens,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
             page_table=page_table,

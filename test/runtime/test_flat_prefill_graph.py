@@ -144,7 +144,8 @@ class DummyFlatTablesTest(unittest.TestCase):
 class TrtllmPrefillGraphSeamsTest(unittest.TestCase):
     """trtllm under the prefill graph: the extend prewrite must not bake
     capture-time write locs into the graph, and the break's KV write must
-    trim padded tails like mha."""
+    trim padded tails like mha. The context kernel must likewise receive only
+    live query rows, never the larger capture-bucket tensor."""
 
     def setUp(self):
         try:
@@ -170,6 +171,130 @@ class TrtllmPrefillGraphSeamsTest(unittest.TestCase):
             self.mod, "is_breakable_capture_active", return_value=True
         ):
             self.assertFalse(b.support_kv_cache_prewrite(None))
+
+    def test_context_inputs_trimmed_to_cpu_metadata_token_count(self):
+        from unittest import mock
+
+        bucket_tokens = 1536
+        live_tokens = 1478
+        prefix_tokens = 60_222
+        b = self._bare_backend()
+        b.max_context_len = 100_000
+        b.workspace_buffer = self.torch.empty(0, dtype=self.torch.uint8)
+        b.dtype = self.torch.bfloat16
+
+        block_tables = self.torch.zeros((1, 1), dtype=self.torch.int32)
+        b._init_extend_metadata(
+            bs=1,
+            req_pool_indices=self.torch.tensor([0], dtype=self.torch.int32),
+            seq_lens=self.torch.tensor(
+                [prefix_tokens + live_tokens], dtype=self.torch.int32
+            ),
+            req_to_page=None,
+            extend_with_prefix=True,
+            extend_prefix_lens=self.torch.tensor(
+                [prefix_tokens], dtype=self.torch.int32
+            ),
+            extend_prefix_lens_cpu=self.torch.tensor(
+                [prefix_tokens], dtype=self.torch.int32
+            ),
+            extend_seq_lens_cpu=self.torch.tensor(
+                [live_tokens], dtype=self.torch.int32
+            ),
+            flat_page_tables={"full_attention": block_tables},
+        )
+        metadata = b.forward_prefill_metadata
+        self.assertEqual(metadata.num_query_tokens, live_tokens)
+
+        layer = SimpleNamespace(
+            group_id="full_attention",
+            tp_q_head_num=1,
+            tp_k_head_num=1,
+            head_dim=4,
+            sliding_window_size=-1,
+        )
+        q = (
+            self.torch.arange(bucket_tokens * layer.head_dim, dtype=self.torch.float32)
+            .to(self.torch.bfloat16)
+            .view(bucket_tokens, layer.head_dim)
+        )
+        k = q + 10_000
+        v = q + 20_000
+        out_cache_loc = (
+            self.torch.arange(bucket_tokens, dtype=self.torch.int32) + 30_000
+        )
+        k_cache = self.torch.empty(0)
+        v_cache = self.torch.empty(0)
+        b._get_kv_cache_permuted = mock.Mock(return_value=(k_cache, v_cache))
+        b._compute_scales = mock.Mock(return_value=(0.125, 1.0))
+
+        def fake_context_kernel(**kwargs):
+            return kwargs["query"].clone()
+
+        with (
+            mock.patch.object(
+                b,
+                "_save_kv_and_prepare_q",
+                wraps=b._save_kv_and_prepare_q,
+            ) as save_kv,
+            mock.patch.object(
+                self.mod,
+                "trtllm_batch_context_with_kv_cache",
+                side_effect=fake_context_kernel,
+            ) as context_kernel,
+        ):
+            out = b.forward_extend(
+                q,
+                k,
+                v,
+                layer,
+                out_cache_loc,
+                token_to_kv_pool=object(),
+                bs=1,
+                save_kv_cache=False,
+            )
+
+        save_args = save_kv.call_args.args
+        self.assertEqual([arg.shape[0] for arg in save_args[:3]], [live_tokens] * 3)
+        self.assertEqual(save_args[4].shape[0], live_tokens)
+        for actual, expected in zip(
+            (*save_args[:3], save_args[4]),
+            (q, k, v, out_cache_loc),
+            strict=True,
+        ):
+            self.assertTrue(self.torch.equal(actual, expected[:live_tokens]))
+        call = context_kernel.call_args.kwargs
+        self.assertEqual(call["query"].shape[0], live_tokens)
+        self.assertTrue(
+            self.torch.equal(
+                call["query"], q[:live_tokens].view(live_tokens, 1, layer.head_dim)
+            )
+        )
+        self.assertIs(call["cum_seq_lens_q"], metadata.cu_seqlens_q)
+        self.assertIs(call["cum_seq_lens_kv"], metadata.cu_seqlens_k)
+        self.assertIs(call["seq_lens"], metadata.cache_seqlens_int32)
+        self.assertIs(call["block_tables"], block_tables)
+        self.assertEqual(call["max_q_len"], live_tokens)
+        self.assertEqual(call["batch_size"], 1)
+        self.assertEqual(call["window_left"], -1)
+        self.assertEqual(out.shape[0], live_tokens)
+
+    def test_mixed_metadata_does_not_trim_using_extend_only_token_count(self):
+        b = self._bare_backend()
+        b.max_context_len = 100_000
+        block_tables = self.torch.zeros((2, 1), dtype=self.torch.int32)
+
+        b._init_extend_metadata(
+            bs=2,
+            req_pool_indices=self.torch.tensor([0, 1], dtype=self.torch.int32),
+            seq_lens=self.torch.tensor([1478, 1], dtype=self.torch.int32),
+            req_to_page=None,
+            forward_mode=self.mod.ForwardMode.MIXED,
+            extend_seq_lens_cpu=self.torch.tensor([1478], dtype=self.torch.int32),
+            flat_page_tables={"full_attention": block_tables},
+        )
+
+        self.assertIsNone(b.forward_prefill_metadata.num_query_tokens)
 
 
 if __name__ == "__main__":

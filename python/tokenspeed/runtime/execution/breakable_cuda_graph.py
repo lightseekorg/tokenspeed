@@ -441,12 +441,14 @@ def _land_in(dst: torch.Tensor, result: torch.Tensor) -> None:
     ``dst`` is the (possibly token-padded) handoff buffer the next graph segment
     reads. ``result`` may cover only the real (unpadded) leading rows -- e.g. a
     varlen attention kernel writes only ``sum(cu_seqlens_q)`` rows -- so we copy
-    into the matching leading slice. Padded rows are left as-is (discarded by the
-    final output slice). No-op when the op already wrote ``dst`` in place.
+    into the matching leading slice and clear the padded tail before the next
+    segment consumes it. No-op when the op already wrote ``dst`` in place.
     """
     if result is dst:
         return
     if result.shape == dst.shape:
         dst.copy_(result)
     else:
-        dst.narrow(0, 0, result.shape[0]).copy_(result)
+        num_real_tokens = result.shape[0]
+        dst.narrow(0, 0, num_real_tokens).copy_(result)
+        dst.narrow(0, num_real_tokens, dst.shape[0] - num_real_tokens).zero_()
