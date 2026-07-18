@@ -28,6 +28,11 @@ baseTimeNanoseconds`` in VizTracer reports, top-level
 ``baseTimeNanoseconds`` in Proton chrome traces — so the two timelines can
 be shifted onto a shared axis after the fact.
 
+On AMD, launch the server with ``ROCR_VISIBLE_DEVICES`` rather than
+``HIP_VISIBLE_DEVICES`` when using Proton. If the host cannot attach a ROCm
+activity backend, set ``TOKENSPEED_KERNEL_PROFILE_BACKEND=instrumentation`` to
+collect mergeable Proton kernel scopes without acquiring the ROCm profiler.
+
 Usage (one file pair per scheduler rank):
 
     tokenspeed merge-traces <run>-TP0.viztracer.json \

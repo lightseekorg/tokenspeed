@@ -126,6 +126,36 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
         self.assertIn("already active", result.message)
         self.assertFalse(self.handler.profile_in_progress)
 
+    def test_init_rejects_hip_visible_devices_for_amd_proton(self):
+        with (
+            mock.patch.object(
+                request_handler_mod, "proton_available", return_value=True
+            ),
+            mock.patch.object(request_handler_mod.torch.version, "hip", "7.2"),
+            mock.patch.dict(
+                request_handler_mod.os.environ, {"HIP_VISIBLE_DEVICES": "0"}
+            ),
+        ):
+            result = self.handler.profile(_start_req(self.output_dir))
+
+        self.assertFalse(result.success)
+        self.assertIn("ROCR_VISIBLE_DEVICES", result.message)
+        self.assertFalse(self.handler.profile_in_progress)
+
+    def test_start_returns_failure_when_proton_cannot_initialize(self):
+        with mock.patch.object(
+            request_handler_mod, "proton_available", return_value=True
+        ), mock.patch.object(
+            request_handler_mod,
+            "start_profiling",
+            side_effect=RuntimeError("rocprofiler unavailable"),
+        ):
+            result = self.handler.profile(_start_req(self.output_dir))
+
+        self.assertFalse(result.success)
+        self.assertIn("Failed to start Proton profiling", result.message)
+        self.assertFalse(self.handler.profile_in_progress)
+
     def test_start_and_stop_drive_proton_session_per_rank(self):
         self.handler = _make_handler(_attn_mapping(tp_rank=3))
         with mock.patch.object(
@@ -187,7 +217,7 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
 
     def test_stop_profile_barriers_tp_peers_after_proton_finalize(self):
         # Only attn-TP rank 0 replies to /stop_profile; the reply must wait
-        # until every TP peer has finalized its proton file.
+        # until every TP peer has finalized its Proton file.
         self.handler.attn_tp_cpu_group = object()
 
         with mock.patch.object(
@@ -202,6 +232,24 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
             result = self.handler.profile(ProfileReq(type=ProfileReqType.STOP_PROFILE))
 
         self.assertTrue(result.success)
+        self.barrier.assert_called_once_with(self.handler.attn_tp_cpu_group)
+
+    def test_stop_profile_reports_proton_finalize_failure(self):
+        self.handler.attn_tp_cpu_group = object()
+
+        with mock.patch.object(
+            request_handler_mod, "proton_available", return_value=True
+        ), mock.patch.object(request_handler_mod, "start_profiling"), mock.patch.object(
+            request_handler_mod,
+            "stop_profiling",
+            side_effect=RuntimeError("finalize failed"),
+        ):
+            self.handler.profile(_start_req(self.output_dir))
+            result = self.handler.profile(ProfileReq(type=ProfileReqType.STOP_PROFILE))
+
+        self.assertFalse(result.success)
+        self.assertIn("Failed to finalize Proton profiling", result.message)
+        self.assertFalse(self.handler.profile_in_progress)
         self.barrier.assert_called_once_with(self.handler.attn_tp_cpu_group)
 
     def test_num_steps_window_finalizes_proton(self):

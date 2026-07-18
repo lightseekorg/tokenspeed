@@ -306,13 +306,27 @@ def kernel_scope(
     kernel_name: str = "",
     **metrics: object,
 ):
+    """Return a Proton scope for one kernel launch.
+
+    Proton accepts numeric or tensor metrics only, so ``dtype`` is retained by
+    :class:`ShapeCapture` but is not emitted as a Proton scope metric.
+
+    Args:
+        family: Kernel family name.
+        mode: Kernel operation name.
+        dtype: Kernel data type recorded by shape capture.
+        kernel_name: Selected kernel implementation name.
+        **metrics: Numeric kernel-shape metrics for Proton.
+
+    Returns:
+        A Proton scope when profiling is active, otherwise a no-op scope.
+    """
     state = ProfilingState.get()
     if not state.active:
         return _NOOP_SCOPE
 
     name = f"{family}.{mode}[{kernel_name}]" if kernel_name else f"{family}.{mode}"
-    scope_metrics = {"dtype": str(dtype)}
-    scope_metrics.update(metrics)
+    scope_metrics = dict(metrics)
     return proton.scope(name, metrics=scope_metrics)
 
 

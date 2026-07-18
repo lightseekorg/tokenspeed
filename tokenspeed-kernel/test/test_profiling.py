@@ -159,7 +159,6 @@ def test_kernel_scope_uses_proton_scope_when_active(monkeypatch):
         (
             "gemm.mm[triton_mm_fp8_scaled]",
             {
-                "dtype": "torch.float16",
                 "M": 32,
                 "N": 64,
                 "K": 128,

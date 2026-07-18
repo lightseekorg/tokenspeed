@@ -375,6 +375,12 @@ class RequestHandler:
                     message="Proton is not available: the installed "
                     "tokenspeed-triton does not provide a profiler.",
                 )
+            if torch.version.hip and "HIP_VISIBLE_DEVICES" in os.environ:
+                return ProfileReqOutput(
+                    success=False,
+                    message="Proton on AMD requires ROCR_VISIBLE_DEVICES; "
+                    "unset HIP_VISIBLE_DEVICES before calling /start_profile.",
+                )
             if ProfilingState.get().active:
                 return ProfileReqOutput(
                     success=False,
@@ -450,7 +456,19 @@ class RequestHandler:
                 self.profiler_output_dir,
                 f"{self.profile_id}-{self.profile_rank_tag}{stage_suffix}.proton",
             )
-            start_profiling(profile_config_from_env(output=proton_output))
+            try:
+                start_profiling(profile_config_from_env(output=proton_output))
+            except Exception as exc:
+                logger.exception("Failed to start Proton profiling")
+                if self.torch_profiler is not None:
+                    self.torch_profiler.stop()
+                    self.torch_profiler = None
+                if "MEM" in activities:
+                    torch.cuda.memory._record_memory_history(enabled=None)
+                return ProfileReqOutput(
+                    success=False,
+                    message=f"Failed to start Proton profiling: {exc}",
+                )
 
         if "VIZTRACER" in activities:
             Path(self.profiler_output_dir).mkdir(parents=True, exist_ok=True)
@@ -511,11 +529,18 @@ class RequestHandler:
         if "CUDA_PROFILER" in self.profiler_activities:
             torch.cuda.cudart().cudaProfilerStop()
 
+        proton_error: Exception | None = None
         if "PROTON" in self.profiler_activities:
             # Finalizes the session and writes the profile now, while this
             # process is still alive (shutdown is SIGKILL; no atexit).
-            stop_profiling()
-            torch.distributed.barrier(self.attn_tp_cpu_group)
+            try:
+                stop_profiling()
+            except Exception as exc:
+                logger.exception("Failed to finalize Proton profiling")
+                proton_error = exc
+            finally:
+                # Do not reply until every TP peer has finished writing.
+                torch.distributed.barrier(self.attn_tp_cpu_group)
 
         if "VIZTRACER" in self.profiler_activities and self.viztracer is not None:
             self.viztracer.stop()
@@ -531,6 +556,11 @@ class RequestHandler:
         self.profile_in_progress = False
         self.profiler_start_forward_ct = None
 
+        if proton_error is not None:
+            return ProfileReqOutput(
+                success=False,
+                message=f"Failed to finalize Proton profiling: {proton_error}",
+            )
         return ProfileReqOutput(success=True, message="Succeeded.")
 
     def _profile_batch_predicate(self, forward_mode=None):
