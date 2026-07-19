@@ -20,13 +20,10 @@
 
 from __future__ import annotations
 
-import logging
-import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
-from tokenspeed_kernel.ops.conv import seq_idx_from_cu_seqlens
 from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
 from typing_extensions import override
 
@@ -44,18 +41,6 @@ from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 DsaTopKState = tuple[Any | None, Any | None]
 
-logger = logging.getLogger(__name__)
-
-# Multi-depth window dataflow A/B knobs (the 53a50800 MTP head ships no
-# reference implementation; these resolve its training dataflow empirically):
-# - CHAIN_TARGET_HIDDEN: every depth consumes the TARGET model's hidden
-#   (DeepSeek-MTP style) instead of the previous depth's chain-normed rows.
-# - POS_SHIFT: depth d's window rows carry positions p_j + d instead of p_j.
-_WINDOW_CHAIN_TARGET_HIDDEN = (
-    os.environ.get("INKLING_MTP_CHAIN_TARGET_HIDDEN", "0") == "1"
-)
-_WINDOW_POS_SHIFT = os.environ.get("INKLING_MTP_WINDOW_POS_SHIFT", "0") == "1"
-
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
     from tokenspeed.runtime.execution.model_runner import ModelRunner
@@ -69,245 +54,6 @@ def _advance_draft_forward_metadata_if_supported(attn_backend, seq_lens) -> None
     advance = getattr(attn_backend, "advance_draft_forward_metadata", None)
     if advance is not None:
         advance(seq_lens)
-
-
-def _window_shifted_ids(
-    v: torch.Tensor,
-    accept: torch.Tensor,
-    next_tokens: torch.Tensor,
-    depth: int,
-    src: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Depth-``depth`` input ids over a decode verify window.
-
-    Row ``j`` consumes the token at source position ``p_j + depth``; in
-    verify-output coordinates that is ``src[j]``: ``src < accept`` reads
-    this round's verify output ``v[:, src]``, else the round's own draft
-    ``d_m`` (m = src - accept + 1 <= depth) from ``next_tokens`` columns
-    1..depth. Negative ``src`` rows (lookback) come out as ``drafts[:, 0]``;
-    the caller overlays them (see ``_window_lookback_shifted_ids``).
-
-    Args:
-        v: [bs, k] int64 verify outputs.
-        accept: [bs, 1] int64 accepted lengths clamped to [1, k].
-        next_tokens: [bs, >= depth+1] col 0 = last verified id, cols 1.. =
-            this round's drafts.
-        depth: draft depth d >= 1.
-        src: optional [1, n] (or [bs, n]) int64 source coordinates; defaults
-            to ``arange(k) + depth`` (the plain forward window).
-
-    Returns:
-        [bs, n] int64 input ids.
-    """
-    bs, k = v.shape
-    if src is None:
-        src = torch.arange(k, dtype=torch.int64, device=v.device).view(1, k) + depth
-    n = src.shape[-1]
-    from_verify = torch.gather(v, 1, src.clamp(0, k - 1).expand(bs, n))
-    drafts = next_tokens[:, 1 : depth + 1].to(torch.int64)
-    m = (src - accept).clamp(0, depth - 1)  # draft index - 1
-    from_draft = torch.gather(drafts, 1, m.expand(bs, n))
-    return torch.where(src < accept, from_verify, from_draft)
-
-
-def _extend_depth_precompute(
-    shift1_ids: torch.Tensor,
-    input_lengths: torch.Tensor,
-    last_row: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Depth-invariant pieces of :func:`_extend_depth_shifted_ids`.
-
-    Hoisted out of the catch-up depth loop; ``last_row`` (per-request cumsum
-    of ``input_lengths`` minus one) may be passed in when the caller already
-    computed it.
-
-    Returns:
-        ``(shift1_i64, base, req_of_row, row_last)``: the int64 shift-1 ids,
-        ``arange(num_rows)``, each row's request index, and the global index
-        of each row's request-final row.
-    """
-    device = shift1_ids.device
-    lengths = input_lengths.to(torch.int64)
-    num_rows = shift1_ids.shape[0]
-    if last_row is None:
-        last_row = lengths.cumsum(0) - 1
-    cu_seqlens = torch.nn.functional.pad(last_row + 1, (1, 0))
-    # Sync-free repeat_interleave(arange(ne), lengths) equivalent.
-    req_of_row = seq_idx_from_cu_seqlens(cu_seqlens, num_rows).to(torch.int64)
-    base = torch.arange(num_rows, dtype=torch.int64, device=device)
-    return shift1_ids.to(torch.int64), base, req_of_row, last_row[req_of_row]
-
-
-def _extend_depth_shifted_ids_from(
-    pre: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-    next_tokens: torch.Tensor,
-    depth: int,
-) -> torch.Tensor:
-    """Per-depth gather of :func:`_extend_depth_shifted_ids` over ``pre``
-    (= :func:`_extend_depth_precompute` output)."""
-    shift1_i64, base, req_of_row, row_last = pre
-    num_rows = shift1_i64.shape[0]
-    src = base + depth
-    from_prompt = shift1_i64[src.clamp(max=num_rows - 1)]
-    overshoot = (src - row_last).clamp(1, depth)
-    from_draft = next_tokens.to(torch.int64)[req_of_row, overshoot]
-    return torch.where(src <= row_last, from_prompt, from_draft)
-
-
-def _extend_depth_shifted_ids(
-    shift1_ids: torch.Tensor,
-    input_lengths: torch.Tensor,
-    next_tokens: torch.Tensor,
-    depth: int,
-) -> torch.Tensor:
-    """Depth-``depth`` input ids for the ragged prefill rows of an EXTEND round.
-
-    ``shift1_ids`` are the first draft step's prefill inputs (prompt tokens
-    shifted by one within each request, last row already holding the round's
-    sampled token on final chunks). Depth ``d`` at local row ``i`` consumes the
-    token ``d`` further along: ``shift1_ids[row + d]`` while that stays inside
-    the request, else the request's own draft ``d_m`` (``m = overshoot``) from
-    ``next_tokens`` — columns ``1..d`` are already filled when depth ``d``
-    runs. On mid-chunk rows the overshoot tokens are not staged; those
-    trailing ``d`` rows per chunk consume the placeholder ``next_tokens``
-    columns (known §14 Step 1 approximation, <= steps-1 rows per chunk).
-
-    Args:
-        shift1_ids: [num_prefill_rows] first-step prefill input ids.
-        input_lengths: [num_extends] per-request prefill row counts.
-        next_tokens: [>=num_extends, >=depth+1] col 0 = last verified token,
-            cols 1.. = this round's drafts, per request.
-        depth: draft depth d >= 1.
-
-    Returns:
-        [num_prefill_rows] int64 input ids for the depth-``depth`` pass.
-    """
-    return _extend_depth_shifted_ids_from(
-        _extend_depth_precompute(shift1_ids, input_lengths), next_tokens, depth
-    )
-
-
-def _window_lookback_shifted_ids(
-    v: torch.Tensor,
-    accept: torch.Tensor,
-    next_tokens: torch.Tensor,
-    stash_tokens: torch.Tensor,
-    depth: int,
-    lookback: int,
-    src: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Depth-``depth`` input ids for a lookback decode window (§12 Hole 2).
-
-    Row ``r`` of the ``lookback + k`` window sits at source position
-    ``vc - lookback + r`` and consumes the token at source + depth + 1;
-    in verify-output coordinates that is ``src = r - lookback + depth``:
-    ``src < 0`` reads the stash of the last ``lookback`` committed tokens
-    (entry ``lookback + src``), ``src < accept`` this round's verify output
-    ``v[src]``, else this round's own draft ``d_m`` (m = src - accept + 1
-    <= depth) — identical to the plain window for the trailing k rows.
-
-    Args:
-        v: [bs, k] int64 verify outputs (token at position vc+j+1 = v[:, j]).
-        accept: [bs, 1] int64 accepted lengths clamped to [1, k].
-        next_tokens: [bs, >= depth+1] col 0 = last verified id, cols 1.. =
-            this round's drafts.
-        stash_tokens: [bs, lookback] int64 committed tokens at positions
-            vc-lookback+1 .. vc (the pre-window tail).
-        depth: draft depth d >= 1.
-        lookback: D >= 1 lookback rows.
-        src: optional [1, lookback + k] precomputed source coordinates
-            (``arange(total) - lookback + depth``), hoistable per depth.
-
-    Returns:
-        [bs * (lookback + k)] int64 input ids.
-    """
-    bs, k = v.shape
-    total = lookback + k
-    if src is None:
-        src = (
-            torch.arange(total, dtype=torch.int64, device=v.device).view(1, total)
-            - lookback
-            + depth
-        )
-    ids = _window_shifted_ids(v, accept, next_tokens, depth, src=src)
-    from_stash = stash_tokens.gather(
-        1, (src + lookback).clamp(0, lookback - 1).expand(bs, total)
-    )
-    ids = torch.where(src < 0, from_stash, ids)
-    return ids.reshape(-1)
-
-
-def _committed_tail_update(
-    stash: torch.Tensor,
-    fresh: torch.Tensor,
-    valid: torch.Tensor,
-    lookback: int,
-) -> torch.Tensor:
-    """Roll a committed-tail stash: last ``lookback`` of [stash || fresh[:valid]].
-
-    ``stash``: [bs, lookback, ...] previous tail; ``fresh``: [bs, k, ...]
-    this round's per-row values whose committed prefix is the first
-    ``valid`` rows (``fresh`` row 0 must directly follow the stash's last
-    entry); ``valid``: [bs] int64 in [1, k].
-
-    Returns:
-        The updated [bs, lookback, ...] tail.
-    """
-    bs = fresh.shape[0]
-    rows = (
-        valid.view(bs, 1)
-        - lookback
-        + torch.arange(lookback, dtype=torch.int64, device=fresh.device).view(
-            1, lookback
-        )
-    )
-    idx_shape = (bs, lookback) + (1,) * (fresh.dim() - 2)
-    expand = (bs, lookback) + fresh.shape[2:]
-    new_rows = fresh.gather(1, rows.clamp_min(0).view(idx_shape).expand(expand))
-    old_rows = stash.gather(
-        1, (rows + lookback).clamp(0, lookback - 1).view(idx_shape).expand(expand)
-    )
-    return torch.where((rows >= 0).view(idx_shape), new_rows, old_rows)
-
-
-def _ragged_tail_rows(
-    flat: torch.Tensor,
-    lengths: torch.Tensor,
-    old_tail: torch.Tensor,
-    lookback: int,
-) -> torch.Tensor:
-    """Per-request last ``lookback`` rows of ragged ``flat`` chunks.
-
-    Requests whose chunk is shorter than ``lookback`` borrow leading entries
-    from ``old_tail`` (the previous chunk's tail, contiguous with this
-    chunk's first row).
-
-    Args:
-        flat: [total, ...] ragged per-request rows.
-        lengths: [n] per-request row counts.
-        old_tail: [n, lookback, ...] previous tail.
-
-    Returns:
-        The updated [n, lookback, ...] tail.
-    """
-    n = lengths.shape[0]
-    lens = lengths.to(torch.int64)
-    starts = lens.cumsum(0) - lens
-    offs = (
-        lens.view(n, 1)
-        - lookback
-        + torch.arange(lookback, dtype=torch.int64, device=flat.device).view(
-            1, lookback
-        )
-    )
-    rows = (starts.view(n, 1) + offs.clamp_min(0)).clamp(max=max(flat.shape[0] - 1, 0))
-    new_rows = flat[rows.reshape(-1)].reshape((n, lookback) + flat.shape[1:])
-    idx_shape = (n, lookback) + (1,) * (old_tail.dim() - 2)
-    expand = (n, lookback) + old_tail.shape[2:]
-    old_rows = old_tail.gather(
-        1, (offs + lookback).clamp(0, lookback - 1).view(idx_shape).expand(expand)
-    )
-    return torch.where((offs >= 0).view(idx_shape), new_rows, old_rows)
 
 
 @dataclass
@@ -389,56 +135,12 @@ class Eagle(BaseDrafter):
             - 1
         )
 
-        # In-vocab media tokens plumbed by ModelExecutor. The content-derived
-        # prefix-cache pad IDs retain a modality tag and are restored here before
-        # the text-only speculative draft performs its embedding lookup.
+        # VLM placeholder ids plumbed by ModelExecutor; empty for text-only targets.
         self.mm_pad_substitute_ids: dict[Modality, int] = {}
         hf_config = getattr(draft_model_runner.model_config, "hf_config", None)
         self._dsa_reuse_mtp_topk = bool(
             getattr(hf_config, "index_share_for_mtp_iteration", False)
         )
-
-        # Log-once flags for the window/lookback/catch-up engagement banners.
-        self._window_mode_logged = False
-        self._lookback_mode_logged = False
-        self._extend_catchup_logged = False
-
-        # Decode-window lookback: the model's
-        # draft_decode_lookback already folds in window mode AND extend
-        # catch-up (the lookback's prompt boundary and per-depth conv lag are
-        # built by those passes); armed only when the backend supports the
-        # lagged-conv recurrence. DP is excluded: the lookback rows change
-        # per-rank token counts.
-        model = draft_model_runner.model
-        lookback = 0
-        if (
-            spec_num_steps > 1
-            and self.dp_size == 1
-            and not _WINDOW_CHAIN_TARGET_HIDDEN
-            and getattr(model, "draft_decode_lookback", False)
-        ):
-            lookback = spec_num_steps - 1
-            configure = getattr(self.attn_backend, "configure_draft_lookback", None)
-            if configure is None or not configure(lookback):
-                lookback = 0
-        self.draft_lookback = lookback
-        # Cross-round stashes keyed by req_pool_indices (PAD rows clamp to the
-        # reserved slot 0): the last D committed tokens and depth-0 chain rows
-        # per request. Allocated eagerly — the decode rounds that fill them
-        # run inside CUDA graph capture, where allocation is off-limits.
-        self._lookback_hidden_buf: torch.Tensor | None = None
-        if lookback:
-            model_config = draft_model_runner.model_config
-            self._lookback_tokens_buf = torch.zeros(
-                (req_to_page.shape[0], lookback),
-                dtype=torch.int64,
-                device=self.device,
-            )
-            self._lookback_hidden_buf = torch.zeros(
-                (req_to_page.shape[0], lookback, model_config.hidden_size),
-                dtype=model_config.dtype,
-                device=self.device,
-            )
 
     def _accepted_output_indices(
         self,
@@ -488,64 +190,6 @@ class Eagle(BaseDrafter):
         input_ids = maybe_substitute_mm_pad(input_ids, self.mm_pad_substitute_ids)
         return input_ids.clamp(0, self.vocab_size - 1)
 
-    def _use_multi_depth_windows(self, draft_input: EagleDraftInput) -> bool:
-        """Teacher-forced multi-depth catch-up (draft-model opt-in).
-
-        Multi-depth MTP heads are trained as full-sequence layers: depth d's
-        attention at source position p runs over depth-d activations of ALL
-        positions <= p. The classic multi-step loop gives depth d>0 exactly
-        one new row per round, so its decode queries attend over a KV window
-        it mostly never wrote (stale garbage). In window mode every step
-        re-runs its depth over the whole verify window — dense per-depth KV
-        and sconv state over the accepted prefix — with per-depth
-        token-shifted inputs and the previous depth's full-row chain-normed
-        hidden. Pure-decode rounds only; MIXED rounds keep the classic loop.
-        """
-        return (
-            self.spec_num_steps > 1
-            and draft_input.num_extends == 0
-            and not draft_input.forward_mode.is_idle()
-            and bool(
-                getattr(
-                    self.draft_model_runner.model, "draft_multi_depth_windows", False
-                )
-            )
-        )
-
-    def _use_extend_depth_catchup(self, draft_input: EagleDraftInput) -> bool:
-        """Per-depth prompt coverage at EXTEND rounds (draft-model opt-in).
-
-        Window mode (above) only repairs pure-decode rounds, so depths >= 1
-        never write KV or sconv state over the prompt region — their decode
-        queries then attend over never-written prompt keys
-        forever. When the draft model opts in, EXTEND and
-        MIXED rounds re-run depths 1..steps-1 over the same ragged rows as the
-        first step (per-depth token-shifted inputs, chained full-row hidden),
-        which builds every used depth's dense prompt KV and sconv prompt
-        state chunk by chunk and replaces the classic loop's one-token steps.
-        """
-        return (
-            self.spec_num_steps > 1
-            and draft_input.num_extends > 0
-            and not draft_input.forward_mode.is_idle()
-            and bool(
-                getattr(
-                    self.draft_model_runner.model, "draft_extend_depth_catchup", False
-                )
-            )
-        )
-
-    def _use_decode_lookback(self, draft_input: EagleDraftInput) -> bool:
-        """Lookback rows for the window pass (§12 Hole 2, armed at init).
-
-        At depth d, the last d committed rows of each round's window embed
-        the round's own unverified drafts; once a draft is rejected those
-        KV/conv entries are permanently wrong under the forward-only window.
-        The lookback variant prepends D = steps-1 rows so the previous
-        round's provisional entries are recomputed from committed tokens.
-        """
-        return self.draft_lookback > 0 and self._use_multi_depth_windows(draft_input)
-
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -571,13 +215,6 @@ class Eagle(BaseDrafter):
     def _map_hot(self, ids: torch.Tensor) -> torch.Tensor:
         """Map token ids through hot_token_ids if available, otherwise return as-is."""
         return self.hot_token_ids[ids] if self.hot_token_ids is not None else ids
-
-    def _sample_step_tokens(self, logits_output: LogitsProcessorOutput) -> torch.Tensor:
-        """One draft step's raw sampled ids: the logits processor's
-        pre-sampled ids when present, greedy argmax otherwise."""
-        if logits_output.next_token_ids is not None:
-            return logits_output.next_token_ids
-        return sampling_argmax(logits_output.next_token_logits)
 
     def _get_first_step_input(
         self,
@@ -653,16 +290,6 @@ class Eagle(BaseDrafter):
         draft_model = self.draft_model_runner.model
         input_num_tokens = draft_input.input_num_tokens
 
-        # Multi-depth window mode and extend catch-up chain FULL per-row
-        # hidden states between depths (see _run_multi_step_windows /
-        # _run_extend_depth_catchup); logits stay gathered.
-        capture_mode = (
-            CaptureHiddenMode.FULL
-            if self._use_multi_depth_windows(draft_input)
-            or self._use_extend_depth_catchup(draft_input)
-            else CaptureHiddenMode.LAST
-        )
-
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
             token_to_kv_pool=self.token_to_kv_pool,
@@ -671,7 +298,7 @@ class Eagle(BaseDrafter):
             num_extends=draft_input.num_extends,
             input_num_tokens=input_num_tokens,
             forward_mode=forward_mode,
-            capture_hidden_mode=capture_mode,
+            capture_hidden_mode=CaptureHiddenMode.LAST,
             gather_ids=gather_ids,
             global_num_tokens=draft_input.global_num_tokens,
             global_bs=draft_input.global_bs,
@@ -711,424 +338,6 @@ class Eagle(BaseDrafter):
                 num_prefill_rows=draft_input.num_extends,
             )
         return logits_output, dsa_topk
-
-    @nvtx_range("draft_multi_step_windows", color="purple")
-    def _run_multi_step_windows(
-        self,
-        bs: int,
-        next_tokens: torch.Tensor,
-        logits_output: LogitsProcessorOutput,
-        draft_input: EagleDraftInput,
-    ) -> None:
-        """Teacher-forced multi-depth catch-up (see _use_multi_depth_windows).
-
-        Every step d re-runs depth layer d over the SAME verify window the
-        first step processed (same positions and KV slot locations — the KV
-        pool write is layer-indexed), consuming:
-
-        - the previous depth's FULL chain-normed window rows as
-          captured_hidden_states (row j = source position p_j), and
-        - per-depth shifted input ids: row j of depth d needs the token at
-          source p_j + d, which is the verify output ``v[j + d]`` while it
-          lands inside the accepted prefix and the drafter's own token
-          ``d_m`` (m = j + d - accept + 1 <= d) at the accepted tail. Rows
-          past the accepted prefix are rejected-tail garbage; their KV is
-          rewritten by the next round's window, which starts at the first
-          uncommitted position.
-
-        The drafted token for step d is sampled at the accept-position row
-        (same gather as the first step). Nothing advances between steps: the
-        attention metadata, conv metadata (valid-length catch-up mode),
-        positions, and out_cache_loc of the first step are all reused.
-        """
-        if not self._window_mode_logged:
-            self._window_mode_logged = True
-            logger.info(
-                "MTP multi-depth window mode engaged (bs=%d, k=%d, steps=%d)",
-                bs,
-                self.spec_num_tokens,
-                self.spec_num_steps,
-            )
-        k = self.spec_num_tokens
-        buffers = self.input_buffers
-        v = draft_input.base_model_output.view(bs, k).to(torch.int64)
-        accept = draft_input.accept_lengths[:bs].to(torch.int64).clamp(1, k).view(bs, 1)
-        gather_ids = self._accepted_output_indices(draft_input.accept_lengths, bs)
-        positions = buffers.positions_buf[: bs * k]
-        out_cache_loc = buffers.out_cache_loc_buf[: bs * k]
-        col = torch.arange(k, dtype=torch.int64, device=v.device).view(1, k)
-
-        prev_hidden = logits_output.hidden_states  # [bs*k, H], depth d-1 rows
-        for d in range(1, self.spec_num_steps):
-            input_ids = _window_shifted_ids(
-                v, accept, next_tokens, d, src=col + d
-            ).reshape(-1)
-
-            if _WINDOW_CHAIN_TARGET_HIDDEN:
-                prev_hidden = draft_input.base_out_hidden_states
-            step_positions = positions + d if _WINDOW_POS_SHIFT else positions
-
-            ctx = ForwardContext(
-                bs=bs,
-                num_extends=0,
-                attn_backend=self.attn_backend,
-                token_to_kv_pool=self.token_to_kv_pool,
-                req_to_page=self.req_to_page,
-                input_num_tokens=bs * k,
-                forward_mode=ForwardMode.DECODE,
-                capture_hidden_mode=CaptureHiddenMode.FULL,
-                gather_ids=gather_ids,
-                global_num_tokens=draft_input.global_num_tokens,
-                global_bs=draft_input.global_bs,
-                all_decode_or_idle=draft_input.all_decode_or_idle,
-                draft_seq_lens_buf=self.draft_seq_lens_buf,
-                accept_lengths=draft_input.accept_lengths,
-            )
-
-            with nvtx_range("draft_window_forward", color="red"):
-                logits_output = self.draft_model_runner.forward(
-                    ctx=ctx,
-                    input_ids=self._map_hot(input_ids),
-                    positions=step_positions,
-                    out_cache_loc=out_cache_loc,
-                    captured_hidden_states=prev_hidden,
-                    spec_step_idx=d,
-                )
-            prev_hidden = logits_output.hidden_states
-
-            with nvtx_range("draft_sample", color="yellow"):
-                next_tokens[:, d + 1] = self._map_hot(
-                    self._sample_step_tokens(logits_output)
-                )
-
-    @nvtx_range("draft_multi_step_windows_lookback", color="purple")
-    def _run_multi_step_windows_lookback(
-        self,
-        bs: int,
-        next_tokens: torch.Tensor,
-        logits_output: LogitsProcessorOutput,
-        draft_input: EagleDraftInput,
-        slot: torch.Tensor,
-        v: torch.Tensor,
-        accept: torch.Tensor,
-    ) -> bool:
-        """Lookback variant of ``_run_multi_step_windows`` (§12 Hole 2).
-
-        Every depth d >= 1 re-runs over ``D + k`` rows per request
-        (D = steps-1): the D leading rows re-cover the last D committed
-        positions — whose entries were first written while their input
-        tokens were still unverified drafts — from now-committed tokens,
-        overwriting the stale KV and conv contributions in place. Depth 1's
-        lookback rows chain the stashed depth-0 hidden (depth 0 has no
-        residue of its own, so it never re-runs); deeper depths chain the
-        previous pass's corrected full rows directly.
-
-        Attention rides the first step's decode metadata unchanged: the rel
-        decode kernel derives ``max_seqlen_q`` from the row count, and with
-        the round's ``seq_lens`` the D+k queries land at positions
-        ``vc-D .. vc+k-1`` — exactly the extended window. Conv metadata is
-        rebuilt by the backend hook (lagged-window recurrence).
-
-        ``slot``/``v``/``accept`` come pre-sliced from the caller (see
-        ``_decode_window_slices``), which also feeds them to the stash roll.
-
-        Returns False when the backend refuses the lookback metadata; the
-        caller then falls back to the plain window pass. This runs inside
-        CUDA graph capture (MTP decode rounds are graph-captured), so there
-        are no host syncs: sub-D prompts, whose lookback would cross
-        position 0, are clamped GPU-side instead — their first positions
-        get wrong-shift rewrites, bounded to prompts shorter than steps-1
-        tokens (below any real chat traffic).
-        """
-        k = self.spec_num_tokens
-        lb = self.draft_lookback
-        buffers = self.input_buffers
-        positions = buffers.positions_buf[: bs * k]
-        first_pos = positions.view(bs, k)[:, 0]
-        enter = getattr(self.attn_backend, "enter_draft_lookback_window", None)
-        if enter is None or not enter(bs):
-            return False
-        if not self._lookback_mode_logged:
-            self._lookback_mode_logged = True
-            logger.info(
-                "MTP lookback window mode engaged (bs=%d, k=%d, D=%d, steps=%d)",
-                bs,
-                k,
-                lb,
-                self.spec_num_steps,
-            )
-        total = lb + k
-        gather_ids = (
-            torch.arange(bs, dtype=torch.int64, device=v.device) * total
-            + (lb - 1)
-            + accept.view(-1)
-        )
-        # The D lookback rows prepend the committed slots just before the
-        # verify window; their cache locs go through the paged mapping.
-        lb_positions = (
-            first_pos.view(bs, 1)
-            - lb
-            + torch.arange(lb, dtype=positions.dtype, device=v.device).view(1, lb)
-        ).clamp_min(0)
-        step_positions = torch.cat([lb_positions, positions.view(bs, k)], 1).reshape(-1)
-        lb_cache_loc = self.draft_out_cache_loc_buf[: bs * lb]
-        compute_out_cache_loc_uniform(
-            out_cache_loc_ptr=lb_cache_loc,
-            req_pool_indices=buffers.req_pool_indices_buf[:bs],
-            uniform_input_length=lb,
-            cache_start=(first_pos - lb).clamp_min(0).to(torch.int32),
-            req_to_pages=self.req_to_page,
-            page_size=self.page_size,
-        )
-        out_cache_loc = torch.cat(
-            [
-                lb_cache_loc.view(bs, lb),
-                buffers.out_cache_loc_buf[: bs * k].view(bs, k),
-            ],
-            1,
-        ).reshape(-1)
-        stash_tokens = self._lookback_tokens_buf[slot]
-        hidden_stash = self._lookback_hidden_buf
-        h0 = logits_output.hidden_states  # [bs*k, H], depth-0 rows
-        prev_hidden = torch.cat([hidden_stash[slot], h0.view(bs, k, -1)], 1).reshape(
-            bs * total, -1
-        )
-        # Depth-invariant base of the per-depth source coordinates.
-        base_src = (
-            torch.arange(total, dtype=torch.int64, device=v.device).view(1, total) - lb
-        )
-        for d in range(1, self.spec_num_steps):
-            input_ids = _window_lookback_shifted_ids(
-                v, accept, next_tokens, stash_tokens, d, lb, src=base_src + d
-            )
-            input_ids = self._prepare_draft_input_ids(input_ids)
-            pass_positions = step_positions + d if _WINDOW_POS_SHIFT else step_positions
-
-            ctx = ForwardContext(
-                bs=bs,
-                num_extends=0,
-                attn_backend=self.attn_backend,
-                token_to_kv_pool=self.token_to_kv_pool,
-                req_to_page=self.req_to_page,
-                input_num_tokens=bs * total,
-                forward_mode=ForwardMode.DECODE,
-                capture_hidden_mode=CaptureHiddenMode.FULL,
-                gather_ids=gather_ids,
-                global_num_tokens=draft_input.global_num_tokens,
-                global_bs=draft_input.global_bs,
-                all_decode_or_idle=draft_input.all_decode_or_idle,
-                draft_seq_lens_buf=self.draft_seq_lens_buf,
-                accept_lengths=draft_input.accept_lengths,
-            )
-
-            with nvtx_range("draft_window_lookback_forward", color="red"):
-                logits_output = self.draft_model_runner.forward(
-                    ctx=ctx,
-                    input_ids=self._map_hot(input_ids),
-                    positions=pass_positions,
-                    out_cache_loc=out_cache_loc,
-                    captured_hidden_states=prev_hidden,
-                    spec_step_idx=d,
-                )
-            prev_hidden = logits_output.hidden_states
-
-            with nvtx_range("draft_sample", color="yellow"):
-                next_tokens[:, d + 1] = self._map_hot(
-                    self._sample_step_tokens(logits_output)
-                )
-        return True
-
-    def _decode_window_slices(
-        self, bs: int, draft_input: EagleDraftInput
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """``(slot, v, accept)`` shared by the lookback window pass and the
-        decode stash roll: [bs] int64 stash slots, [bs, k] int64 verify
-        outputs, [bs, 1] int64 accepted lengths clamped to [1, k]."""
-        k = self.spec_num_tokens
-        slot = self.input_buffers.req_pool_indices_buf[:bs].to(torch.int64).clamp_min(0)
-        v = draft_input.base_model_output.view(bs, k).to(torch.int64)
-        accept = draft_input.accept_lengths[:bs].to(torch.int64).clamp(1, k).view(bs, 1)
-        return slot, v, accept
-
-    def _update_lookback_stash_decode(
-        self,
-        slot: torch.Tensor,
-        accept: torch.Tensor,
-        v: torch.Tensor,
-        h0: torch.Tensor,
-    ) -> None:
-        """Roll the cross-round stashes past a round's decode-row commits.
-
-        Args come pre-sliced per decode row: ``slot`` [n] int64 stash slots,
-        ``accept`` [n]-viewable int64 accepts clamped to [1, k], ``v`` [n, k]
-        int64 verify outputs, ``h0`` [n, k, H] depth-0 hidden rows.
-        """
-        lb = self.draft_lookback
-        tokens = self._lookback_tokens_buf
-        tokens[slot] = _committed_tail_update(tokens[slot], v, accept, lb)
-        hidden = self._lookback_hidden_buf
-        hidden[slot] = _committed_tail_update(hidden[slot], h0, accept, lb)
-
-    def _update_lookback_stash_extend(
-        self,
-        draft_input: EagleDraftInput,
-        h0_full: torch.Tensor,
-    ) -> None:
-        """Roll the stashes across an EXTEND/MIXED round's chunk rows.
-
-        Prefill requests stash the last D shift-1 ids and depth-0 rows of
-        their chunk (blending across chunk boundaries when a chunk is
-        shorter than D); MIXED decode rows roll the same committed-tail
-        update as pure decode, offset past the prefill rows.
-        """
-        lb = self.draft_lookback
-        k = self.spec_num_tokens
-        buffers = self.input_buffers
-        ne = draft_input.num_extends
-        bs = draft_input.accept_lengths.shape[0]
-        nd = bs - ne
-        num_prefill_tokens = draft_input.input_num_tokens - nd * k
-        slot = buffers.req_pool_indices_buf[:bs].to(torch.int64).clamp_min(0)
-        lengths = buffers.input_lengths_buf[:ne]
-        tokens = self._lookback_tokens_buf
-        hidden = self._lookback_hidden_buf
-        shift1 = buffers.shifted_prefill_ids_buf[:num_prefill_tokens].to(torch.int64)
-        extend_slot = slot[:ne]
-        tokens[extend_slot] = _ragged_tail_rows(
-            shift1, lengths, tokens[extend_slot], lb
-        )
-        hidden[extend_slot] = _ragged_tail_rows(
-            h0_full[:num_prefill_tokens], lengths, hidden[extend_slot], lb
-        )
-        if nd > 0:
-            self._update_lookback_stash_decode(
-                slot[ne:],
-                draft_input.accept_lengths[ne:bs].to(torch.int64).clamp(1, k),
-                draft_input.base_model_output[ne:].view(nd, k).to(torch.int64),
-                h0_full[num_prefill_tokens:].view(nd, k, -1),
-            )
-
-    @nvtx_range("draft_extend_catchup", color="purple")
-    def _run_extend_depth_catchup(
-        self,
-        bs: int,
-        next_tokens: torch.Tensor,
-        logits_output: LogitsProcessorOutput,
-        draft_input: EagleDraftInput,
-    ) -> None:
-        """Per-depth prompt coverage at EXTEND rounds (see the gate above).
-
-        Each step d re-runs depth layer d over the SAME ragged rows the first
-        step processed — identical positions, out_cache_loc, and attention /
-        conv metadata (the KV and conv pools are layer-indexed, so depth d's
-        writes land in its own layer) — consuming the previous depth's FULL
-        rows as captured_hidden_states and inputs shifted d further:
-
-        - prefill rows: the request's own prompt tokens (all known), with the
-          trailing d rows taking the round's fresh drafts (final chunk) or
-          placeholder columns (mid-chunk; backfilled never — known §14
-          approximation, <= steps-1 rows per chunk boundary);
-        - decode rows (MIXED batches): the window-mode gather over verify
-          outputs and drafts, offset past the prefill rows.
-
-        Step d's draft token is sampled at the same rows as the first step
-        (request-last prefill row / accept-position decode row), so this also
-        replaces the classic loop's one-token steps for EXTEND rounds.
-        """
-        if not self._extend_catchup_logged:
-            self._extend_catchup_logged = True
-            logger.info(
-                "MTP extend-time per-depth catch-up engaged "
-                "(bs=%d, num_extends=%d, steps=%d)",
-                bs,
-                draft_input.num_extends,
-                self.spec_num_steps,
-            )
-        k = self.spec_num_tokens
-        buffers = self.input_buffers
-        ne = draft_input.num_extends
-        nd = bs - ne
-        input_num_tokens = draft_input.input_num_tokens
-        num_prefill_tokens = input_num_tokens - nd * k
-
-        if self.draft_lookback:
-            # Before the loop rebinds logits_output: this round's chunk tail
-            # (tokens + depth-0 rows) feeds the next decode round's lookback.
-            self._update_lookback_stash_extend(draft_input, logits_output.hidden_states)
-
-        shift1_ids = buffers.shifted_prefill_ids_buf[:num_prefill_tokens]
-        input_lengths = buffers.input_lengths_buf[:ne]
-        gather_ids = input_lengths.to(torch.int64).cumsum(0) - 1
-        # Depth-invariant pieces of the per-depth shifted-id gathers
-        # (gather_ids doubles as the precompute's per-request last row).
-        extend_pre = _extend_depth_precompute(
-            shift1_ids, input_lengths, last_row=gather_ids
-        )
-        if nd > 0:
-            v = draft_input.base_model_output[ne:].view(nd, k).to(torch.int64)
-            accept = (
-                draft_input.accept_lengths[ne:].to(torch.int64).clamp(1, k).view(nd, 1)
-            )
-            col = torch.arange(k, dtype=torch.int64, device=v.device).view(1, k)
-            gather_ids = torch.cat(
-                [
-                    gather_ids,
-                    self._accepted_output_indices(
-                        draft_input.accept_lengths[ne:],
-                        nd,
-                        base_offset=num_prefill_tokens,
-                    ),
-                ]
-            )
-        positions = buffers.positions_buf[:input_num_tokens]
-        out_cache_loc = buffers.out_cache_loc_buf[:input_num_tokens]
-
-        prev_hidden = logits_output.hidden_states  # [input_num_tokens, H]
-        for d in range(1, self.spec_num_steps):
-            input_ids = _extend_depth_shifted_ids_from(extend_pre, next_tokens[:ne], d)
-            if nd > 0:
-                decode_ids = _window_shifted_ids(
-                    v, accept, next_tokens[ne:], d, src=col + d
-                )
-                input_ids = torch.cat([input_ids, decode_ids.reshape(-1)])
-            input_ids = self._prepare_draft_input_ids(input_ids)
-
-            if _WINDOW_CHAIN_TARGET_HIDDEN:
-                prev_hidden = draft_input.base_out_hidden_states
-            step_positions = positions + d if _WINDOW_POS_SHIFT else positions
-
-            ctx = ForwardContext(
-                bs=bs,
-                num_extends=ne,
-                attn_backend=self.attn_backend,
-                token_to_kv_pool=self.token_to_kv_pool,
-                req_to_page=self.req_to_page,
-                input_num_tokens=input_num_tokens,
-                forward_mode=draft_input.forward_mode,
-                capture_hidden_mode=CaptureHiddenMode.FULL,
-                gather_ids=gather_ids,
-                global_num_tokens=draft_input.global_num_tokens,
-                global_bs=draft_input.global_bs,
-                all_decode_or_idle=draft_input.all_decode_or_idle,
-                draft_seq_lens_buf=self.draft_seq_lens_buf,
-                accept_lengths=draft_input.accept_lengths,
-            )
-
-            with nvtx_range("draft_extend_catchup_forward", color="red"):
-                logits_output = self.draft_model_runner.forward(
-                    ctx=ctx,
-                    input_ids=self._map_hot(input_ids),
-                    positions=step_positions,
-                    out_cache_loc=out_cache_loc,
-                    captured_hidden_states=prev_hidden,
-                    spec_step_idx=d,
-                )
-            prev_hidden = logits_output.hidden_states
-
-            with nvtx_range("draft_sample", color="yellow"):
-                next_tokens[:, d + 1] = self._map_hot(
-                    self._sample_step_tokens(logits_output)
-                )
 
     @nvtx_range("draft_multi_step", color="purple")
     def _run_multi_step_decode(
@@ -1220,7 +429,10 @@ class Eagle(BaseDrafter):
                 dsa_topk = self._extract_dsa_topk(ctx, dsa_topk)
 
             with nvtx_range("draft_sample", color="yellow"):
-                draft_ids = self._sample_step_tokens(logits_output)
+                if logits_output.next_token_ids is not None:
+                    draft_ids = logits_output.next_token_ids
+                else:
+                    draft_ids = sampling_argmax(logits_output.next_token_logits)
                 # Column 0 holds last_verified_ids; drafter writes step `i` into column `i + 1`.
                 next_tokens[:, i + 1] = self._map_hot(draft_ids)
                 if i + 1 < self.spec_num_steps:
@@ -1291,7 +503,10 @@ class Eagle(BaseDrafter):
         # down to `[bs, ...]`, so logits/hidden_states arrive here already aligned to one row per request.
         logits_output, dsa_topk = self._run_first_step(bs, draft_input)
 
-        draft_ids = self._sample_step_tokens(logits_output)
+        if logits_output.next_token_ids is not None:
+            draft_ids = logits_output.next_token_ids
+        else:
+            draft_ids = sampling_argmax(logits_output.next_token_logits)
         next_tokens[:, 1] = self._map_hot(draft_ids)
 
         if self.spec_num_steps <= 1:
@@ -1305,22 +520,6 @@ class Eagle(BaseDrafter):
             # In DP we still run, because peer ranks may have completing
             # extends or decodes; diverging here would desync the drafter's
             # dense-TP / MoE-EP collectives (NCCL hang or RSAG mismatch).
-            #
-            # Extend catch-up still runs: its point is per-depth KV/sconv
-            # coverage of THIS chunk's rows, not the (discarded) drafts —
-            # skipping mid-chunks would leave every chunk but the last
-            # uncovered for depths >= 1 on long prompts.
-            if self._use_extend_depth_catchup(draft_input):
-                self._run_extend_depth_catchup(
-                    bs, next_tokens, logits_output, draft_input
-                )
-            return next_tokens
-
-        if self._use_extend_depth_catchup(draft_input):
-            # EXTEND/MIXED with per-depth prompt coverage: reuses the first
-            # step's extend metadata as-is, so it must run OUTSIDE the
-            # override_num_extends(0) below.
-            self._run_extend_depth_catchup(bs, next_tokens, logits_output, draft_input)
             return next_tokens
 
         # Draft step 2+ (multi-step decode).
@@ -1329,46 +528,14 @@ class Eagle(BaseDrafter):
         # backends that fill separate prefill/decode metadata at init
         # time.
         with self.attn_backend.override_num_extends(0):
-            if self._use_multi_depth_windows(draft_input):
-                use_lookback = self._use_decode_lookback(draft_input)
-                ran_lookback = False
-                if use_lookback:
-                    slot, v, accept = self._decode_window_slices(bs, draft_input)
-                    ran_lookback = self._run_multi_step_windows_lookback(
-                        bs,
-                        next_tokens,
-                        logits_output,
-                        draft_input,
-                        slot,
-                        v,
-                        accept,
-                    )
-                if not ran_lookback:
-                    self._run_multi_step_windows(
-                        bs,
-                        next_tokens,
-                        logits_output,
-                        draft_input,
-                    )
-                if use_lookback:
-                    # Keep the stashes fresh even on fallback rounds; the
-                    # next round may look back. logits_output here is still
-                    # the first step's FULL depth-0 capture.
-                    self._update_lookback_stash_decode(
-                        slot,
-                        accept,
-                        v,
-                        logits_output.hidden_states.view(bs, self.spec_num_tokens, -1),
-                    )
-            else:
-                self._run_multi_step_decode(
-                    bs,
-                    draft_ids,
-                    next_tokens,
-                    logits_output,
-                    draft_input,
-                    dsa_topk,
-                )
+            self._run_multi_step_decode(
+                bs,
+                draft_ids,
+                next_tokens,
+                logits_output,
+                draft_input,
+                dsa_topk,
+            )
         return next_tokens
 
     @override

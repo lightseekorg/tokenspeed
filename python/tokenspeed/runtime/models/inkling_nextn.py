@@ -26,9 +26,11 @@ The checkpoint ships an 8-depth MTP chain (``mtp_config``) under
 embed_norm(token_embed)]`` (hidden FIRST — the reverse of DeepSeek's
 ``eh_proj``), and one full Inkling transformer block (full attention +
 dense MLP, both with sconv), plus ONE ``chain_norm`` shared by all depths.
-``chain_hidden_post_norm=true``: the chain-normalized block output is both
-the logits input and the hidden chained to the next depth. Embedding and
-LM head are shared with the target model (``set_embed_and_head``).
+The (possibly chain-normalized) block output is both the logits input and
+the hidden chained to the next depth; ``chain_hidden_post_norm`` in the
+model config decides whether the post-norm applies when the checkpoint
+ships no ``chain_norm`` weight. Embedding and LM head are shared with the
+target model (``set_embed_and_head``).
 
 Depth blocks reuse ``InklingDecoderLayer`` unmodified: a copied text config
 with ``local_layer_ids`` from ``mtp_config`` (checkpoints since 4d71c3ea mix
@@ -73,25 +75,6 @@ from tokenspeed.runtime.models.inkling import (
 from tokenspeed.runtime.utils import add_prefix
 
 logger = logging.getLogger(__name__)
-
-# Checkpoints since 53a50800 ship no ``model.mtp.chain_norm.weight``; the
-# model provider confirmed (2026-07-14) the head is trained WITHOUT a chain
-# post-norm and the checkpoint's ``chain_hidden_post_norm=true`` is stale —
-# the intended value is false. Default "none" skips the norm (keeping the
-# residual add). The alternatives produce identical draft tokens under
-# greedy drafting (a weightless RMSNorm is a per-token scalar rescale —
-# absorbed by the next depth's hidden_norm and by the bias-free lm_head
-# argmax) and remain as A/B probes:
-# - "unit": post-depth RMSNorm with its init weight of 1.
-# - "base": the target model's llm.norm.weight as the chain scale.
-_CHAIN_NORM_FALLBACK = os.environ.get("INKLING_MTP_CHAIN_NORM", "none")
-
-# Draft embedding: apply the BASE model's embed_norm to the token embedding
-# before each depth's own embed_norm. Resolved empirically on BOTH heads
-# (pre-53a50800: accept 1.36-1.77 -> 1.61-1.96; 53a50800: counting probe
-# 1.32 -> 2.32) — the head is trained on the normalized embeddings the base
-# decoder consumes. INKLING_MTP_RAW_EMBED=1 reverts to the raw lookup.
-_USE_BASE_EMBED_NORM = os.environ.get("INKLING_MTP_RAW_EMBED", "0") != "1"
 
 
 def _draft_text_config(text_config: InklingModelConfig) -> InklingModelConfig:
@@ -179,16 +162,20 @@ class InklingMultiTokenPredictor(nn.Module):
             )
             for idx in range(self.num_mtp_layers)
         )
-        # Shared post-depth norm slot: applied when the checkpoint ships a
-        # learned ``chain_norm`` weight, otherwise resolved by
-        # _CHAIN_NORM_FALLBACK (see the module-level history there).
-        self.chain_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.chain_norm_identity = False
-        # A/B knob: base-model embed_norm before the depth's own embed_norm
-        # (weight loaded from the base checkpoint's llm.embed_norm).
+        # Post-depth chain norm, per the ``chain_hidden_post_norm`` model
+        # config (weight from the checkpoint's ``chain_norm`` if shipped,
+        # else its init weight of 1).
+        self.chain_norm = (
+            RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            if config.chain_hidden_post_norm
+            else None
+        )
+        # Base-model embed_norm before the depth's own embed_norm (weight
+        # loaded from the base checkpoint's llm.embed_norm): the head is
+        # trained on the normalized embeddings the base decoder consumes.
         self.base_embed_norm = (
             RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-            if _USE_BASE_EMBED_NORM and config.use_embed_norm
+            if config.use_embed_norm
             else None
         )
 
@@ -214,10 +201,10 @@ class InklingMultiTokenPredictor(nn.Module):
         if ctx.forward_mode.is_idle():
             return hidden
         if residual is None:
-            if self.chain_norm_identity:
+            if self.chain_norm is None:
                 return hidden
             return self.chain_norm(hidden)
-        if self.chain_norm_identity:
+        if self.chain_norm is None:
             return hidden + residual
         hidden, _ = self.chain_norm(hidden, residual)
         return hidden
@@ -227,28 +214,20 @@ class InklingForConditionalGenerationNextN(nn.Module):
     # Catch-up runs the full padded window; ctx.gather_ids narrows to one row per request.
     draft_first_step_reduce_for_catchup = True
     # Full-sequence depths: re-run each depth over the whole verify window
-    # (eagle.py window mode); INKLING_MTP_CLASSIC_LOOP=1 reverts for A/B.
-    draft_multi_depth_windows = os.environ.get("INKLING_MTP_CLASSIC_LOOP", "0") != "1"
+    # (mtp.py window mode); the trained dataflow, not optional.
+    draft_multi_depth_windows = True
     # Prompt catch-up: at EXTEND rounds run depths
     # 1..steps-1 over the prompt rows too (inputs shifted d+1, chaining the
     # previous depth's full-row hidden), so every used depth gets dense
-    # prompt KV and sconv prompt state. INKLING_MTP_EXTEND_CATCHUP=0 reverts
-    # for A/B (depths >= 1 then never cover the prompt region).
-    draft_extend_depth_catchup = (
-        os.environ.get("INKLING_MTP_EXTEND_CATCHUP", "1") != "0"
-    )
+    # prompt KV and sconv prompt state.
+    draft_extend_depth_catchup = True
     # Provisional-tail recompute: decode windows carry D=steps-1
     # lookback rows so the previous round's provisional tail entries (written
     # from then-unverified drafts) are recomputed from committed tokens.
-    # Requires window mode + extend catch-up (the lookback's prompt boundary
-    # and per-depth conv lag are built by those passes) — folded in here so
-    # the drafter need not re-derive the invariant. INKLING_MTP_DECODE_LOOKBACK=0
-    # reverts for A/B (depth-d KV/conv keeps ~d/<a>*(1-p) stale slots).
-    draft_decode_lookback = (
-        os.environ.get("INKLING_MTP_DECODE_LOOKBACK", "1") != "0"
-        and draft_multi_depth_windows
-        and draft_extend_depth_catchup
-    )
+    # Kept as an A/B knob for further experiments:
+    # INKLING_MTP_DECODE_LOOKBACK=0 reverts (depth-d KV/conv then keeps
+    # ~d/<a>*(1-p) stale slots).
+    draft_decode_lookback = os.environ.get("INKLING_MTP_DECODE_LOOKBACK", "1") != "0"
 
     def __init__(
         self,
@@ -370,14 +349,10 @@ class InklingForConditionalGenerationNextN(nn.Module):
 
         for name, w in weights:
             name = name.removeprefix("model.")
-            if name == "llm.embed_norm.weight" and _USE_BASE_EMBED_NORM:
+            if name == "llm.embed_norm.weight":
                 # The base embedding norm, applied before each depth's own
-                # embed_norm (absent only under INKLING_MTP_RAW_EMBED=1).
+                # embed_norm.
                 load_param("model.base_embed_norm.weight", w)
-                continue
-            if name == "llm.norm.weight" and _CHAIN_NORM_FALLBACK == "base":
-                # A/B probe: target final-norm weight as the chain scale.
-                load_param("model.chain_norm.weight", w)
                 continue
             if not name.startswith("mtp."):
                 continue  # base-model tensor; the target worker owns it
@@ -407,30 +382,9 @@ class InklingForConditionalGenerationNextN(nn.Module):
                 "Use a checkpoint that ships `model.mtp.*` weights or disable "
                 "MTP speculative decoding."
             )
-        if "model.chain_norm.weight" not in loaded:
-            if _CHAIN_NORM_FALLBACK == "none":
-                self.model.chain_norm_identity = True
-            elif _CHAIN_NORM_FALLBACK == "base":
-                raise ValueError(
-                    "INKLING_MTP_CHAIN_NORM=base but llm.norm.weight never "
-                    "appeared in the weight stream"
-                )
-            elif _CHAIN_NORM_FALLBACK != "unit":
-                raise ValueError(
-                    "INKLING_MTP_CHAIN_NORM must be 'unit', 'none' or 'base', "
-                    f"got {_CHAIN_NORM_FALLBACK!r}"
-                )
-            logger.info(
-                "Inkling MTP checkpoint ships no chain_norm weight; running "
-                "the chain post-norm as %r (INKLING_MTP_CHAIN_NORM)",
-                _CHAIN_NORM_FALLBACK,
-            )
-
         if dropped:
             logger.warning(
-                "Inkling NextN load_weights dropped %d tensors (first: %s)",
-                len(dropped),
-                dropped[:8],
+                f"Inkling NextN load_weights dropped {len(dropped)} tensors (first: {dropped[:8]})"
             )
         return loaded
 
