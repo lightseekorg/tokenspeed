@@ -6,8 +6,6 @@ tokenspeed-mla==0.2.0
 tokenspeed-fast-hadamard-transform==1.1.0.post20251110
 tokenspeed-fa3==3.0.0.post20260408
 tokenspeed-fa4==4.0.0.post20260710
-# tokenspeed-mha and cutlass-dsl 4.6 need quack >= 0.6.1 (fa4 only floors it at 0.5.3).
-quack-kernels>=0.6.1
 nvidia-cutlass-dsl[cu13]==4.6.0
 quack-kernels>=0.6.1
 tokenspeed-triton-kernels==1.0.0.post20260510
