@@ -159,7 +159,7 @@ class Fp8LinearMethod(LinearMethodBase):
                         )
                 scale_dtype = (
                     torch.uint8
-                    if self.quant_config.quant_method == "mxfp8"
+                    if self.quant_config.scale_fmt == "ue8m0"
                     else torch.float32
                 )
                 scale = BlockQuantScaleParameter(

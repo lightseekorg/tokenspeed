@@ -117,8 +117,10 @@ __all__ = [
     "dsa_prefill_topk",
     "dsa_decode_topk",
     "dsa_plan",
-    "minimax_m3_msa_indexer",
-    "minimax_m3_msa_sparse_attention",
+    "msa_decode_with_kvcache",
+    "msa_extend_with_kvcache",
+    "msa_indexer",
+    "msa_sparse_attention",
     "attn_merge_state",
     "mha_plan",
 ]
@@ -126,7 +128,7 @@ __all__ = [
 LSE_LN = math.log2(math.e)
 
 
-def minimax_m3_msa_indexer(
+def msa_indexer(
     index_q: torch.Tensor,
     index_k: torch.Tensor,
     index_k_cache: torch.Tensor,
@@ -135,6 +137,7 @@ def minimax_m3_msa_indexer(
     seq_lens: torch.Tensor,
     *,
     topk: int,
+    page_size: int,
     scale: float,
     init_blocks: int,
     local_blocks: int,
@@ -146,16 +149,17 @@ def minimax_m3_msa_indexer(
     override: str | None = None,
     solution: str | None = None,
 ) -> torch.Tensor:
-    """Select MiniMax-M3 MSA blocks and update the index-key side cache.
+    """Select MSA blocks and update the index-key side cache.
 
     Args:
-        index_q: Gathered index queries shaped ``[tokens, all_groups, 128]``.
-        index_k: Shared index keys shaped ``[tokens, 128]``.
-        index_k_cache: Per-layer side cache shaped ``[slots, 128]``.
+        index_q: Index queries shaped ``[tokens, local_groups, index_dim]``.
+        index_k: Shared index keys shaped ``[tokens, index_dim]``.
+        index_k_cache: Per-layer side cache shaped ``[slots, index_dim]``.
         slot_mapping: Cache slot for each input token.
         block_table: Logical-to-physical 128-token page table.
         seq_lens: Total sequence lengths after the current step.
-        topk: Selected block count. MiniMax-M3 uses 16.
+        topk: Selected block count.
+        page_size: Number of cache tokens in each indexed block.
         scale: Index score scale.
         init_blocks: Leading blocks forced into the selected set.
         local_blocks: Recent blocks forced into the selected set.
@@ -168,12 +172,12 @@ def minimax_m3_msa_indexer(
         solution: Optional registered solution selector.
 
     Returns:
-        Shared logical block ids shaped ``[tokens, 1, topk]``.
+        Logical block ids shaped ``[tokens, local_groups, topk]``.
     """
     decode = int(decode_query_len) > 0
     traits = {
         "head_dim": int(index_q.shape[-1]),
-        "page_size": 128,
+        "page_size": int(page_size),
         "topk": int(topk),
         "decode": decode,
     }
@@ -184,7 +188,7 @@ def minimax_m3_msa_indexer(
     )
     kernel = select_kernel(
         "attention",
-        "minimax_m3_msa_indexer",
+        "msa_indexer",
         signature,
         traits=traits,
         solution=solution,
@@ -194,19 +198,20 @@ def minimax_m3_msa_indexer(
         "tokens": index_q.shape[0],
         "num_heads": index_q.shape[1],
         "head_dim": index_q.shape[2],
+        "page_size": int(page_size),
         "topk": int(topk),
         "decode": decode,
     }
     ShapeCapture.get().record(
         "attention",
-        "minimax_m3_msa_indexer",
+        "msa_indexer",
         kernel.name,
         index_q.dtype,
         shape_params,
     )
     with kernel_scope(
         "attention",
-        "minimax_m3_msa_indexer",
+        "msa_indexer",
         index_q.dtype,
         kernel_name=kernel.name,
         **shape_params,
@@ -230,7 +235,7 @@ def minimax_m3_msa_indexer(
         )
 
 
-def minimax_m3_msa_sparse_attention(
+def msa_sparse_attention(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -246,13 +251,14 @@ def minimax_m3_msa_sparse_attention(
     override: str | None = None,
     solution: str | None = None,
 ) -> torch.Tensor:
-    """Run MiniMax-M3 exact block-sparse GQA over selected logical blocks.
+    """Run exact block-sparse GQA over selected logical blocks.
 
     Args:
-        q: Main queries shaped ``[tokens, local_heads, 128]``.
-        k_cache: Key cache shaped ``[pages, local_kv_heads, 128, 128]``.
+        q: Main queries shaped ``[tokens, local_heads, head_dim]``.
+        k_cache: Key cache shaped
+            ``[pages, local_kv_heads, page_size, head_dim]``.
         v_cache: Value cache with the same shape as ``k_cache``.
-        selected_blocks: Logical block ids from :func:`minimax_m3_msa_indexer`.
+        selected_blocks: Logical block ids from :func:`msa_indexer`.
         block_table: Logical-to-physical 128-token page table.
         seq_lens: Total sequence lengths after the current step.
         scale: Main attention softmax scale.
@@ -276,7 +282,7 @@ def minimax_m3_msa_sparse_attention(
     signature = _attention_format_signature(q=q, k_cache=k_cache, v_cache=v_cache)
     kernel = select_kernel(
         "attention",
-        "minimax_m3_msa_sparse_attention",
+        "msa_sparse_attention",
         signature,
         traits=traits,
         solution=solution,
@@ -292,14 +298,14 @@ def minimax_m3_msa_sparse_attention(
     }
     ShapeCapture.get().record(
         "attention",
-        "minimax_m3_msa_sparse_attention",
+        "msa_sparse_attention",
         kernel.name,
         q.dtype,
         shape_params,
     )
     with kernel_scope(
         "attention",
-        "minimax_m3_msa_sparse_attention",
+        "msa_sparse_attention",
         q.dtype,
         kernel_name=kernel.name,
         **shape_params,
@@ -317,6 +323,183 @@ def minimax_m3_msa_sparse_attention(
             prefix_lens=prefix_lens,
             max_query_len=max_query_len,
         )
+
+
+def msa_decode_with_kvcache(
+    q: torch.Tensor,
+    index_q: torch.Tensor,
+    index_k: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    *,
+    topk: int,
+    page_size: int,
+    index_scale: float,
+    attention_scale: float,
+    init_blocks: int,
+    local_blocks: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    solution: str | None = None,
+) -> torch.Tensor:
+    """Run MSA decode against paged K/V and index-key caches.
+
+    Args:
+        q: Main queries shaped ``[tokens, local_heads, head_dim]``.
+        index_q: Index queries shaped ``[tokens, local_groups, index_dim]``.
+        index_k: Index keys for the current tokens shaped
+            ``[tokens, index_dim]``.
+        k_cache: Paged key cache shaped
+            ``[pages, local_kv_heads, page_size, head_dim]``.
+        v_cache: Paged value cache with the same shape as ``k_cache``.
+        index_k_cache: Per-layer index-key cache shaped
+            ``[slots, index_dim]``.
+        slot_mapping: Cache slot for each current token.
+        page_table: Logical-to-physical page table.
+        cache_seqlens: Visible sequence lengths after the current tokens.
+        topk: Number of sparse blocks selected for each index query.
+        page_size: Number of cache tokens in each indexed block.
+        index_scale: Scale applied to index scores.
+        attention_scale: Scale applied to main attention scores.
+        init_blocks: Leading blocks forced into the selected set.
+        local_blocks: Recent blocks forced into the selected set.
+        max_seqlen_q: Uniform query-token count per request.
+        max_seqlen_k: Maximum KV length addressable through ``page_table``.
+        solution: Optional solution selector applied to both kernel stages.
+
+    Returns:
+        Attention output with the same shape and dtype as ``q``. The indexer
+        stage also writes ``index_k`` into ``index_k_cache`` at
+        ``slot_mapping``.
+    """
+    max_blocks = min(
+        page_table.shape[1],
+        (max_seqlen_k + page_size - 1) // page_size,
+    )
+    selected_blocks = msa_indexer(
+        index_q,
+        index_k,
+        index_k_cache,
+        slot_mapping,
+        page_table,
+        cache_seqlens,
+        topk=topk,
+        page_size=page_size,
+        scale=index_scale,
+        init_blocks=init_blocks,
+        local_blocks=local_blocks,
+        decode_query_len=max_seqlen_q,
+        max_blocks=max_blocks,
+        solution=solution,
+    )
+    return msa_sparse_attention(
+        q,
+        k_cache,
+        v_cache,
+        selected_blocks,
+        page_table,
+        cache_seqlens,
+        scale=attention_scale,
+        decode_query_len=max_seqlen_q,
+        solution=solution,
+    )
+
+
+def msa_extend_with_kvcache(
+    q: torch.Tensor,
+    index_q: torch.Tensor,
+    index_k: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    *,
+    topk: int,
+    page_size: int,
+    index_scale: float,
+    attention_scale: float,
+    init_blocks: int,
+    local_blocks: int,
+    solution: str | None = None,
+) -> torch.Tensor:
+    """Run MSA extend against paged K/V and index-key caches.
+
+    Args:
+        q: Main queries shaped ``[total_q, local_heads, head_dim]``.
+        index_q: Index queries shaped
+            ``[total_q, local_groups, index_dim]``.
+        index_k: Index keys for the current tokens shaped
+            ``[total_q, index_dim]``.
+        k_cache: Paged key cache shaped
+            ``[pages, local_kv_heads, page_size, head_dim]``.
+        v_cache: Paged value cache with the same shape as ``k_cache``.
+        index_k_cache: Per-layer index-key cache shaped
+            ``[slots, index_dim]``.
+        slot_mapping: Cache slot for each current token.
+        page_table: Logical-to-physical page table.
+        cache_seqlens: Visible sequence lengths after the current tokens.
+        cu_seqlens_q: Cumulative query lengths shaped ``[batch + 1]``.
+        prefix_lens: Cached prefix length for each request.
+        max_seqlen_q: Maximum query length in the batch.
+        max_seqlen_k: Maximum visible KV length in the batch.
+        topk: Number of sparse blocks selected for each index query.
+        page_size: Number of cache tokens in each indexed block.
+        index_scale: Scale applied to index scores.
+        attention_scale: Scale applied to main attention scores.
+        init_blocks: Leading blocks forced into the selected set.
+        local_blocks: Recent blocks forced into the selected set.
+        solution: Optional solution selector applied to both kernel stages.
+
+    Returns:
+        Attention output with the same shape and dtype as ``q``. The indexer
+        stage also writes ``index_k`` into ``index_k_cache`` at
+        ``slot_mapping``.
+    """
+    max_blocks = min(
+        page_table.shape[1],
+        (max_seqlen_k + page_size - 1) // page_size,
+    )
+    selected_blocks = msa_indexer(
+        index_q,
+        index_k,
+        index_k_cache,
+        slot_mapping,
+        page_table,
+        cache_seqlens,
+        topk=topk,
+        page_size=page_size,
+        scale=index_scale,
+        init_blocks=init_blocks,
+        local_blocks=local_blocks,
+        cu_seqlens_q=cu_seqlens_q,
+        prefix_lens=prefix_lens,
+        max_query_len=max_seqlen_q,
+        max_blocks=max_blocks,
+        solution=solution,
+    )
+    return msa_sparse_attention(
+        q,
+        k_cache,
+        v_cache,
+        selected_blocks,
+        page_table,
+        cache_seqlens,
+        scale=attention_scale,
+        cu_seqlens_q=cu_seqlens_q,
+        prefix_lens=prefix_lens,
+        max_query_len=max_seqlen_q,
+        solution=solution,
+    )
 
 
 # ===-----------------------------------------------------------------------===#

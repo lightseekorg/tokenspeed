@@ -18,124 +18,45 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""MiniMax-M3 multimodal and text configuration definitions."""
+"""
+Minimax M3 Model Configuration.
+"""
 
 from transformers.configuration_utils import PretrainedConfig
-
-
-class MiniMaxM3TextConfig(PretrainedConfig):
-    """Configuration for the MiniMax-M3 language model."""
-
-    model_type = "minimax_m3_text"
-    base_config_key = "text_config"
-    keys_to_ignore_at_inference = ["past_key_values"]
-
-    def __init__(
-        self,
-        vocab_size: int = 200064,
-        hidden_size: int = 6144,
-        intermediate_size: int = 3072,
-        dense_intermediate_size: int = 12288,
-        shared_intermediate_size: int = 3072,
-        num_hidden_layers: int = 60,
-        num_attention_heads: int = 64,
-        num_key_value_heads: int = 4,
-        head_dim: int = 128,
-        max_position_embeddings: int = 1048576,
-        rms_norm_eps: float = 1e-6,
-        use_gemma_norm: bool = True,
-        attention_output_gate: bool = False,
-        rope_theta: float = 5_000_000,
-        rotary_dim: int = 64,
-        partial_rotary_factor: float = 0.5,
-        hidden_act: str = "swigluoai",
-        use_qk_norm: bool = True,
-        qk_norm_type: str = "per_head",
-        attention_bias: bool = False,
-        attention_dropout: float = 0.0,
-        initializer_range: float = 0.02,
-        use_cache: bool = True,
-        tie_word_embeddings: bool = False,
-        num_local_experts: int = 128,
-        num_experts_per_tok: int = 4,
-        n_shared_experts: int = 1,
-        scoring_func: str = "sigmoid",
-        use_routing_bias: bool = True,
-        routed_scaling_factor: float = 2.0,
-        moe_layer_freq: list[int] | None = None,
-        swiglu_alpha: float = 1.702,
-        swiglu_limit: float = 7.0,
-        sparse_attention_config: dict | None = None,
-        num_mtp_modules: int = 1,
-        **kwargs,
-    ) -> None:
-        if moe_layer_freq is None:
-            moe_layer_freq = [0, 0, 0] + [1] * (num_hidden_layers - 3)
-        if len(moe_layer_freq) != num_hidden_layers:
-            raise ValueError(
-                "moe_layer_freq must have one entry per decoder layer: "
-                f"got {len(moe_layer_freq)} entries for {num_hidden_layers} layers."
-            )
-
-        if sparse_attention_config is None:
-            sparse_attention_config = {
-                "use_sparse_attention": True,
-                "sparse_index_dim": 128,
-                "sparse_num_index_heads": 4,
-                "sparse_topk_blocks": 16,
-                "sparse_block_size": 128,
-                "sparse_disable_index_value": list(moe_layer_freq),
-                "sparse_score_type": "max",
-                "sparse_init_block": 0,
-                "sparse_local_block": 1,
-                "sparse_attention_freq": list(moe_layer_freq),
-            }
-
-        self.vocab_size = vocab_size
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        self.dense_intermediate_size = dense_intermediate_size
-        self.shared_intermediate_size = shared_intermediate_size
-        self.num_hidden_layers = num_hidden_layers
-        self.num_attention_heads = num_attention_heads
-        self.num_key_value_heads = num_key_value_heads
-        self.head_dim = head_dim
-        self.max_position_embeddings = max_position_embeddings
-        self.rms_norm_eps = rms_norm_eps
-        self.use_gemma_norm = use_gemma_norm
-        self.attention_output_gate = attention_output_gate
-        self.rope_theta = rope_theta
-        self.rotary_dim = rotary_dim
-        self.partial_rotary_factor = partial_rotary_factor
-        self.hidden_act = hidden_act
-        self.use_qk_norm = use_qk_norm
-        self.qk_norm_type = qk_norm_type
-        self.attention_bias = attention_bias
-        self.attention_dropout = attention_dropout
-        self.initializer_range = initializer_range
-        self.use_cache = use_cache
-        self.num_local_experts = num_local_experts
-        self.num_experts_per_tok = num_experts_per_tok
-        self.n_shared_experts = n_shared_experts
-        self.scoring_func = scoring_func
-        self.use_routing_bias = use_routing_bias
-        self.routed_scaling_factor = routed_scaling_factor
-        self.moe_layer_freq = moe_layer_freq
-        self.swiglu_alpha = swiglu_alpha
-        self.swiglu_limit = swiglu_limit
-        self.sparse_attention_config = sparse_attention_config
-        self.num_mtp_modules = num_mtp_modules
-
-        super().__init__(
-            tie_word_embeddings=tie_word_embeddings,
-            **kwargs,
-        )
+from transformers.models.minimax_m3_vl.configuration_minimax_m3_vl import (
+    MiniMaxM3VLTextConfig,
+)
 
 
 class MiniMaxM3VisionConfig(PretrainedConfig):
-    """Configuration container for the MiniMax-M3 vision tower."""
+    """Configuration for the MiniMax-M3 vision tower.
 
-    model_type = "clip_vision_model"
+    Args:
+        hidden_size: Vision transformer hidden size.
+        intermediate_size: Vision feed-forward intermediate size.
+        num_hidden_layers: Number of vision transformer layers.
+        num_attention_heads: Number of vision attention heads.
+        image_size: Maximum input image size.
+        patch_size: Spatial patch size.
+        num_channels: Number of image channels.
+        temporal_patch_size: Number of frames in each temporal patch.
+        spatial_merge_size: Spatial patch-merging factor.
+        hidden_act: Vision feed-forward activation.
+        layer_norm_eps: Layer normalization epsilon.
+        attention_dropout: Vision attention dropout probability.
+        rope_parameters: Standard Transformers RoPE parameters.
+        initializer_range: Weight initialization standard deviation.
+        projection_dim: Legacy checkpoint projection dimension.
+        position_embedding_type: Legacy position-embedding selector.
+        rope_mode: Legacy rotary position mode.
+        rope_theta: Legacy RoPE base, converted into ``rope_parameters``.
+        initializer_factor: Legacy initialization multiplier.
+        img_token_compression_config: Legacy image-token compression settings.
+        vision_segment_max_frames: Maximum frames in one packed vision segment.
+        **kwargs: Additional vision checkpoint configuration fields.
+    """
+
+    model_type = "minimax_m3"
     base_config_key = "vision_config"
 
     def __init__(
@@ -147,71 +68,103 @@ class MiniMaxM3VisionConfig(PretrainedConfig):
         image_size: int = 2016,
         patch_size: int = 14,
         num_channels: int = 3,
+        temporal_patch_size: int | None = None,
+        spatial_merge_size: int | None = None,
+        hidden_act: str = "gelu",
+        layer_norm_eps: float = 1e-5,
+        attention_dropout: float = 0.0,
+        rope_parameters: dict | None = None,
+        initializer_range: float = 0.02,
         projection_dim: int = 6144,
         position_embedding_type: str = "rope",
         rope_mode: str = "3d",
         rope_theta: float = 10000.0,
-        attention_dropout: float = 0.0,
-        hidden_act: str = "gelu",
         initializer_factor: float = 1.0,
-        initializer_range: float = 0.02,
-        layer_norm_eps: float = 1e-5,
         img_token_compression_config: dict | None = None,
-        vision_segment_max_frames: int = 4,
+        vision_segment_max_frames: int | None = 4,
         **kwargs,
     ) -> None:
-        compression_config = img_token_compression_config or {
-            "image_token_compression_method": "patch_merge",
-            "spatial_merge_size": 2,
-            "temporal_patch_size": 2,
-        }
-        spatial_merge_size = int(compression_config["spatial_merge_size"])
-        temporal_patch_size = int(compression_config["temporal_patch_size"])
-        if hidden_size % num_attention_heads != 0:
-            raise ValueError(
-                "MiniMax-M3 vision hidden_size must be divisible by "
-                f"num_attention_heads, got {hidden_size} and {num_attention_heads}."
-            )
-        if spatial_merge_size <= 0 or temporal_patch_size <= 0:
-            raise ValueError("MiniMax-M3 patch merge sizes must be positive.")
+        compression_config = dict(img_token_compression_config or {})
+        if temporal_patch_size is None:
+            temporal_patch_size = int(compression_config.get("temporal_patch_size", 2))
+        if spatial_merge_size is None:
+            spatial_merge_size = int(compression_config.get("spatial_merge_size", 2))
+        compression_config.setdefault("image_token_compression_method", "patch_merge")
+        compression_config["temporal_patch_size"] = temporal_patch_size
+        compression_config["spatial_merge_size"] = spatial_merge_size
+
+        if rope_parameters is None:
+            rope_parameters = {
+                "rope_type": "default",
+                "rope_theta": rope_theta,
+            }
+        else:
+            rope_parameters = dict(rope_parameters)
+            rope_parameters.setdefault("rope_type", "default")
+            rope_parameters.setdefault("rope_theta", rope_theta)
 
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
-        self.head_dim = hidden_size // num_attention_heads
         self.image_size = image_size
         self.patch_size = patch_size
+        self.num_channels = num_channels
         self.temporal_patch_size = temporal_patch_size
         self.spatial_merge_size = spatial_merge_size
-        self.num_channels = num_channels
+        self.hidden_act = hidden_act
+        self.layer_norm_eps = layer_norm_eps
+        self.attention_dropout = attention_dropout
+        self.rope_parameters = rope_parameters
+        self.rope_theta = rope_theta
+        self.initializer_range = initializer_range
         self.projection_dim = projection_dim
         self.position_embedding_type = position_embedding_type
         self.rope_mode = rope_mode
-        self.rope_theta = rope_theta
-        self.attention_dropout = attention_dropout
-        self.hidden_act = hidden_act
         self.initializer_factor = initializer_factor
-        self.initializer_range = initializer_range
-        self.layer_norm_eps = layer_norm_eps
         self.img_token_compression_config = compression_config
         self.vision_segment_max_frames = vision_segment_max_frames
         super().__init__(**kwargs)
 
 
-class MiniMaxM3VLConfig(PretrainedConfig):
-    """Configuration for MiniMax-M3's vision-language wrapper."""
+class MiniMaxM3Config(PretrainedConfig):
+    """Combined MiniMax-M3 text and vision configuration.
+
+    Args:
+        text_config: Official MiniMax-M3 text config or its dictionary form.
+        vision_config: TokenSpeed MiniMax-M3 vision config or its dictionary form.
+        image_token_index: Image placeholder token ID.
+        video_token_index: Video placeholder token ID.
+        image_seq_length: Default number of image tokens.
+        process_image_mode: Image preprocessing mode.
+        projector_hidden_act: Multimodal projector activation.
+        projector_hidden_size: Multimodal projector intermediate size.
+        multimodal_projector_bias: Whether projector linear layers use bias.
+        vision_feature_layer: Vision layer selected for projection.
+        vision_feature_select_strategy: Vision feature selection strategy.
+        img_token_compression_config: Outer image-token compression settings.
+        image_grid_pinpoints: Dynamic-resolution image grid candidates.
+        num_reward_heads: Number of checkpoint reward heads.
+        tie_word_embeddings: Whether input and output embeddings are tied.
+        **kwargs: Additional outer checkpoint configuration fields.
+    """
 
     model_type = "minimax_m3_vl"
+    runtime_attention_arch = "MSA"
+    runtime_attention_layer_type = "minimax_m3_sparse"
     sub_configs = {
+        "text_config": MiniMaxM3VLTextConfig,
         "vision_config": MiniMaxM3VisionConfig,
-        "text_config": MiniMaxM3TextConfig,
+    }
+    attribute_map = {
+        "image_token_id": "image_token_index",
+        "video_token_id": "video_token_index",
     }
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
         self,
-        text_config: MiniMaxM3TextConfig | dict | None = None,
+        text_config: MiniMaxM3VLTextConfig | dict | None = None,
         vision_config: MiniMaxM3VisionConfig | dict | None = None,
         image_token_index: int = 200025,
         video_token_index: int = 200026,
@@ -219,79 +172,58 @@ class MiniMaxM3VLConfig(PretrainedConfig):
         process_image_mode: str = "dynamic_res",
         projector_hidden_act: str = "gelu",
         projector_hidden_size: int = 6144,
-        merged_hidden_size: int | None = None,
         multimodal_projector_bias: bool = True,
         vision_feature_layer: int = -1,
         vision_feature_select_strategy: str = "full",
         img_token_compression_config: dict | None = None,
-        image_grid_pinpoints: str | None = None,
+        image_grid_pinpoints: str | list[tuple[int, int]] | None = None,
         num_reward_heads: int = 0,
-        encoder_only: bool = False,
+        tie_word_embeddings: bool = False,
         **kwargs,
     ) -> None:
-        self.text_config = self._make_text_config(text_config)
-        self.vision_config = self._make_vision_config(vision_config)
-        compression_config = (
-            img_token_compression_config
-            or self.vision_config.img_token_compression_config
+        if text_config is None:
+            text_config = MiniMaxM3VLTextConfig()
+        elif isinstance(text_config, dict):
+            text_values = dict(text_config)
+            text_values.pop("model_type", None)
+            text_config = MiniMaxM3VLTextConfig(**text_values)
+
+        if vision_config is None:
+            vision_config = MiniMaxM3VisionConfig()
+        elif isinstance(vision_config, dict):
+            vision_values = dict(vision_config)
+            vision_values.pop("model_type", None)
+            vision_config = MiniMaxM3VisionConfig(**vision_values)
+
+        self.text_config = text_config
+        self.text_config.runtime_attention_layer_type = (
+            self.runtime_attention_layer_type
         )
-        spatial_merge_size = int(compression_config["spatial_merge_size"])
-        if spatial_merge_size != self.vision_config.spatial_merge_size:
-            raise ValueError(
-                "MiniMax-M3 top-level and vision spatial_merge_size must match."
-            )
+        self.vision_config = vision_config
         self.image_token_index = image_token_index
         self.video_token_index = video_token_index
-        self.image_token_id = image_token_index
-        self.video_token_id = video_token_index
         self.image_seq_length = image_seq_length
         self.process_image_mode = process_image_mode
         self.projector_hidden_act = projector_hidden_act
         self.projector_hidden_size = projector_hidden_size
-        expected_merged_hidden_size = (
-            self.text_config.hidden_size * spatial_merge_size**2
-        )
-        if (
-            merged_hidden_size is not None
-            and merged_hidden_size != expected_merged_hidden_size
-        ):
-            raise ValueError(
-                "MiniMax-M3 merged_hidden_size must equal text hidden_size times "
-                f"spatial_merge_size squared ({expected_merged_hidden_size}), got "
-                f"{merged_hidden_size}."
-            )
-        self.merged_hidden_size = expected_merged_hidden_size
         self.multimodal_projector_bias = multimodal_projector_bias
         self.vision_feature_layer = vision_feature_layer
         self.vision_feature_select_strategy = vision_feature_select_strategy
-        self.img_token_compression_config = compression_config
+        self.img_token_compression_config = dict(
+            img_token_compression_config or vision_config.img_token_compression_config
+        )
         self.image_grid_pinpoints = image_grid_pinpoints
         self.num_reward_heads = num_reward_heads
-        self.encoder_only = encoder_only
-        super().__init__(**kwargs)
+        self.merged_hidden_size = text_config.hidden_size * (
+            vision_config.spatial_merge_size**2
+        )
 
-    @staticmethod
-    def _make_text_config(
-        config: MiniMaxM3TextConfig | dict | None,
-    ) -> MiniMaxM3TextConfig:
-        if isinstance(config, MiniMaxM3TextConfig):
-            return config
-        return MiniMaxM3TextConfig(**(config or {}))
-
-    @staticmethod
-    def _make_vision_config(
-        config: MiniMaxM3VisionConfig | dict | None,
-    ) -> MiniMaxM3VisionConfig:
-        if isinstance(config, MiniMaxM3VisionConfig):
-            return config
-        return MiniMaxM3VisionConfig(**(config or {}))
-
-    def __setattr__(self, name, value):
-        if name == "text_config" and isinstance(value, dict):
-            value = self._make_text_config(value)
-        elif name == "vision_config" and isinstance(value, dict):
-            value = self._make_vision_config(value)
-        super().__setattr__(name, value)
+        if not tie_word_embeddings and text_config.tie_word_embeddings:
+            tie_word_embeddings = True
+        super().__init__(
+            tie_word_embeddings=tie_word_embeddings,
+            **kwargs,
+        )
 
 
-__all__ = ["MiniMaxM3TextConfig", "MiniMaxM3VisionConfig", "MiniMaxM3VLConfig"]
+__all__ = ["MiniMaxM3Config"]

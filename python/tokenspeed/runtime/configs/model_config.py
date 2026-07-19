@@ -34,6 +34,7 @@ from transformers import PretrainedConfig
 
 from tokenspeed.runtime.layers.quantization import QUANTIZATION_METHODS
 from tokenspeed.runtime.utils import get_colorful_logger
+from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.hf_transformers_utils import (
     get_config,
     get_context_length,
@@ -76,6 +77,7 @@ class AttentionArch(IntEnum):
     MLA = auto()
     MHA = auto()
     DSA = auto()
+    MSA = auto()
 
 
 @dataclass(frozen=True)
@@ -416,7 +418,7 @@ class ModelConfig:
         derived_context_len = get_context_length(self.hf_text_config)
         if context_length is not None:
             if context_length > derived_context_len:
-                if server_args.allow_overwrite_longer_context_len:
+                if envs.TOKENSPEED_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.get():
                     logger.warning(
                         "User-specified context_length (%s) is greater than the derived "
                         "context_length (%s). This may lead to incorrect model outputs or "
@@ -429,8 +431,7 @@ class ModelConfig:
                     raise ValueError(
                         f"User-specified context_length ({context_length}) is greater than the derived context_length ({derived_context_len}). "
                         f"This may lead to incorrect model outputs or CUDA errors. Note that the derived context_length may differ from max_position_embeddings in the model's config. "
-                        "To allow overriding this maximum, pass "
-                        "--allow-overwrite-longer-context-len."
+                        f"To allow overriding this maximum, set the env var TOKENSPEED_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"
                     )
             else:
                 self.context_len = context_length
@@ -443,7 +444,6 @@ class ModelConfig:
             "head_dim",
             self.hf_text_config.hidden_size // self.hf_text_config.num_attention_heads,
         )
-
         # MLA/DSA families carry per-head dimension metadata that does not
         # follow the standard hidden_size / num_attention_heads derivation above.
         attention_family = _resolve_attention_family(

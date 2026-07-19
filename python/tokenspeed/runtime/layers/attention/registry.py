@@ -40,6 +40,9 @@ from tokenspeed.runtime.configs.paged_cache_spec import (
 from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
 from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
+from tokenspeed.runtime.layers.attention.configs.minimax_sparse import (
+    MinimaxSparseConfig,
+)
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
 from tokenspeed.runtime.layers.attention.utils import (
@@ -138,6 +141,8 @@ def _get_default_backend_name(arch: AttentionArch) -> str:
         return "mla"
     if arch == AttentionArch.DSA:
         return "dsa"
+    if arch == AttentionArch.MSA:
+        return "minimax_sparse"
     else:
         return "mha"
 
@@ -173,6 +178,7 @@ _CONFIG_CLS: dict[AttentionArch, type[BaseAttnConfig]] = {
     AttentionArch.MHA: MHAConfig,
     AttentionArch.MLA: MLAConfig,
     AttentionArch.DSA: DSAConfig,
+    AttentionArch.MSA: MinimaxSparseConfig,
 }
 
 

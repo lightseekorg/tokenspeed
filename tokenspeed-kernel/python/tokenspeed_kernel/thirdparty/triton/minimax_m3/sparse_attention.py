@@ -38,8 +38,6 @@ def _sparse_prefill_kernel(
     head_dim,
     topk: tl.constexpr,
     scale,
-    k_scale,
-    v_scale,
     stride_q_n,
     stride_q_h,
     stride_q_d,
@@ -97,7 +95,7 @@ def _sparse_prefill_kernel(
     selected_ptr = selected_blocks + token * stride_t_n + kv_head * stride_t_h
     visible_blocks = (query_position + BLOCK_K) // BLOCK_K
     selected_count = tl.minimum(topk, visible_blocks)
-    scale_log2e = scale * k_scale * 1.4426950408889634
+    scale_log2e = scale * 1.4426950408889634
 
     for selected_offset in tl.range(0, selected_count):
         block = tl.load(selected_ptr + selected_offset * stride_t_k).to(tl.int32)
@@ -112,7 +110,7 @@ def _sparse_prefill_kernel(
             + dims[:, None] * stride_k_d,
             mask=dim_mask[:, None] & key_mask[None, :],
             other=0.0,
-        ).to(tl.bfloat16)
+        )
         logits = tl.dot(q, key, out_dtype=tl.float32) * scale_log2e
         logits = tl.where(
             head_mask[:, None] & key_mask[None, :],
@@ -133,10 +131,8 @@ def _sparse_prefill_kernel(
             + dims[None, :] * stride_v_d,
             mask=key_mask[:, None] & dim_mask[None, :],
             other=0.0,
-        ).to(tl.bfloat16)
-        accumulator += (
-            tl.dot(probabilities.to(tl.bfloat16), value, out_dtype=tl.float32) * v_scale
         )
+        accumulator += tl.dot(probabilities.to(value.dtype), value)
         max_score = new_max
 
     accumulator /= normalizer[:, None]
@@ -171,8 +167,6 @@ def _sparse_decode_kernel(
     head_dim,
     topk: tl.constexpr,
     scale,
-    k_scale,
-    v_scale,
     decode_query_len,
     stride_q_n,
     stride_q_h,
@@ -235,7 +229,7 @@ def _sparse_decode_kernel(
     key_offsets = tl.arange(0, BLOCK_K)
     block_table_row = block_table + request * stride_bt_b
     selected_ptr = selected_blocks + token * stride_t_n + kv_head * stride_t_h
-    scale_log2e = scale * k_scale * 1.4426950408889634
+    scale_log2e = scale * 1.4426950408889634
 
     for selected_offset in tl.range(selected_start, selected_end):
         block = tl.load(selected_ptr + selected_offset * stride_t_k).to(tl.int32)
@@ -250,7 +244,7 @@ def _sparse_decode_kernel(
             + dims[:, None] * stride_k_d,
             mask=dim_mask[:, None] & key_mask[None, :],
             other=0.0,
-        ).to(tl.bfloat16)
+        )
         logits = tl.dot(q, key, out_dtype=tl.float32) * scale_log2e
         logits = tl.where(
             head_mask[:, None] & key_mask[None, :],
@@ -270,10 +264,8 @@ def _sparse_decode_kernel(
             + dims[None, :] * stride_v_d,
             mask=key_mask[:, None] & dim_mask[None, :],
             other=0.0,
-        ).to(tl.bfloat16)
-        accumulator += (
-            tl.dot(probabilities.to(tl.bfloat16), value, out_dtype=tl.float32) * v_scale
         )
+        accumulator += tl.dot(probabilities.to(value.dtype), value)
         lse = new_max + tl.log2(tl.exp2(lse - new_max) + block_sum)
         max_score = new_max
 
@@ -364,15 +356,15 @@ def _validate_inputs(
     if key_cache.shape[2] != SPARSE_BLOCK_SIZE:
         raise ValueError("MiniMax-M3 sparse attention requires 128-token pages")
     if selected_blocks.dim() != 3 or selected_blocks.shape[0] != query.shape[0]:
-        raise ValueError("selected_blocks must be [tokens, selected_heads, topk]")
+        raise ValueError("selected_blocks must be [tokens, local_kv_heads, topk]")
     if block_table.dim() != 2 or seq_lens.dim() != 1:
         raise ValueError("block_table must be 2-D and seq_lens must be 1-D")
     tokens, num_heads, head_dim = query.shape
     num_kv_heads = key_cache.shape[1]
     if head_dim != 128 or key_cache.shape[3] != head_dim:
         raise ValueError("MiniMax-M3 sparse attention requires head dim 128")
-    if selected_blocks.shape[1] not in (1, num_kv_heads):
-        raise ValueError("selected block heads must be shared or match local KV heads")
+    if selected_blocks.shape[1] != num_kv_heads:
+        raise ValueError("selected block heads must match local KV heads")
     if num_heads % num_kv_heads:
         raise ValueError("query heads must be divisible by KV heads")
     return tokens, num_heads, num_kv_heads, head_dim
@@ -388,8 +380,6 @@ def minimax_m3_msa_sparse_attention(
     seq_lens: torch.Tensor,
     *,
     scale: float,
-    k_scale: float | None = None,
-    v_scale: float | None = None,
     decode_query_len: int = 0,
     cu_seqlens_q: torch.Tensor | None = None,
     prefix_lens: torch.Tensor | None = None,
@@ -402,15 +392,10 @@ def minimax_m3_msa_sparse_attention(
         key_cache: Paged key cache shaped ``[pages, local_kv_heads, 128, 128]``.
         value_cache: Paged value cache with the same shape as ``key_cache``.
         selected_blocks: Logical block ids shaped
-            ``[tokens, 1, topk]`` for MiniMax-M3's shared block set. A
-            per-local-KV-head tensor is also accepted by the primitive.
+            ``[tokens, local_kv_heads, topk]``.
         block_table: Logical-to-physical page table.
         seq_lens: Total sequence lengths after this step.
         scale: Main attention softmax scale.
-        k_scale: Static dequantization scale for an FP8 key cache. ``None``
-            means the cache values use unit scale.
-        v_scale: Static dequantization scale for an FP8 value cache. ``None``
-            means the cache values use unit scale.
         decode_query_len: Uniform queries per request for decode; zero selects
             sparse prefill.
         cu_seqlens_q: Prefill cumulative query lengths.
@@ -430,13 +415,8 @@ def minimax_m3_msa_sparse_attention(
     )
     if query.dtype != torch.bfloat16:
         raise TypeError("MiniMax-M3 Triton sparse attention requires BF16 query")
-    supported_cache_dtypes = (torch.bfloat16, torch.float8_e4m3fn)
-    if key_cache.dtype != value_cache.dtype:
-        raise TypeError("MiniMax-M3 key and value caches must use the same dtype")
-    if key_cache.dtype not in supported_cache_dtypes:
-        raise TypeError(
-            "MiniMax-M3 Triton sparse attention requires a BF16 or FP8 E4M3 " "KV cache"
-        )
+    if key_cache.dtype != torch.bfloat16 or value_cache.dtype != torch.bfloat16:
+        raise TypeError("MiniMax-M3 Triton sparse attention requires BF16 KV cache")
     if selected_blocks.dtype != torch.int32:
         raise TypeError("selected_blocks must be int32")
     if tokens == 0:
@@ -444,14 +424,9 @@ def minimax_m3_msa_sparse_attention(
 
     query = query.contiguous()
     selected_blocks = selected_blocks.contiguous()
-    selected_head_stride = (
-        0 if selected_blocks.shape[1] == 1 else selected_blocks.stride(1)
-    )
     block_table = block_table.to(device=query.device, dtype=torch.int32).contiguous()
     seq_lens = seq_lens.to(device=query.device, dtype=torch.int32).contiguous()
     output = torch.empty_like(query)
-    k_scale = 1.0 if k_scale is None else float(k_scale)
-    v_scale = 1.0 if v_scale is None else float(v_scale)
     gqa_group_size = num_heads // num_kv_heads
     topk = selected_blocks.shape[2]
 
@@ -489,8 +464,6 @@ def minimax_m3_msa_sparse_attention(
             head_dim,
             topk=topk,
             scale=float(scale),
-            k_scale=k_scale,
-            v_scale=v_scale,
             decode_query_len=decode_query_len,
             stride_q_n=query.stride(0),
             stride_q_h=query.stride(1),
@@ -504,7 +477,7 @@ def minimax_m3_msa_sparse_attention(
             stride_v_pos=value_cache.stride(2),
             stride_v_d=value_cache.stride(3),
             stride_t_n=selected_blocks.stride(0),
-            stride_t_h=selected_head_stride,
+            stride_t_h=selected_blocks.stride(1),
             stride_t_k=selected_blocks.stride(2),
             stride_o_c=partial_output.stride(0),
             stride_o_n=partial_output.stride(1),
@@ -562,8 +535,6 @@ def minimax_m3_msa_sparse_attention(
         head_dim,
         topk=topk,
         scale=float(scale),
-        k_scale=k_scale,
-        v_scale=v_scale,
         stride_q_n=query.stride(0),
         stride_q_h=query.stride(1),
         stride_q_d=query.stride(2),
@@ -576,7 +547,7 @@ def minimax_m3_msa_sparse_attention(
         stride_v_pos=value_cache.stride(2),
         stride_v_d=value_cache.stride(3),
         stride_t_n=selected_blocks.stride(0),
-        stride_t_h=selected_head_stride,
+        stride_t_h=selected_blocks.stride(1),
         stride_t_k=selected_blocks.stride(2),
         stride_o_n=output.stride(0),
         stride_o_h=output.stride(1),
