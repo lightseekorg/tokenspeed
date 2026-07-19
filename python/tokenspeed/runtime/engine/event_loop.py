@@ -401,6 +401,7 @@ class EventLoop:
             paged_cache_groups=paged_cache_groups,
             enable_mixed_prefill_decode=server_args.enable_mixed_batch,
             prefix_cache_adjunct=prefix_cache_adjunct,
+            max_loras=0,
         )
         logger.info(
             "Scheduler config: block_size=%s num_device_pages=%s "

@@ -114,16 +114,16 @@ HybridPrefixCache::~HybridPrefixCache() {
     }
 }
 
-MatchResult HybridPrefixCache::Match(const token_vec_t& token_ids, MatchIntent intent) {
-    auto match = kv_prefix_cache_.Match(token_ids, intent);
+MatchResult HybridPrefixCache::Match(const token_vec_t& token_ids, std::int32_t lora_id, MatchIntent intent) {
+    auto match = kv_prefix_cache_.Match(token_ids, lora_id, intent);
     augmentMatch(match);
     augmentMatchPagedCache(match);
     return match;
 }
 
 MatchResult HybridPrefixCache::Match(const std::vector<std::span<const std::int32_t>>& token_pages,
-                                     MatchIntent intent) {
-    auto match = kv_prefix_cache_.Match(token_pages, intent);
+                                     std::int32_t lora_id, MatchIntent intent) {
+    auto match = kv_prefix_cache_.Match(token_pages, lora_id, intent);
     augmentMatch(match);
     augmentMatchPagedCache(match);
     return match;
@@ -171,8 +171,14 @@ void HybridPrefixCache::augmentMatch(MatchResult& match) const {
             if (aligned_seqlen > 0) {
                 match.mamba_branching_seqlen = aligned_seqlen;
             }
+            // Truncating to the real root drops out of the LoRA namespace, so the
+            // sentinel-page depth offset no longer applies. Without this reset
+            // DepthInPage() would return -1 (real_root depth 0 minus offset 1) for
+            // a no-hit LoRA match and inflate ``unscheduled``/break window math.
             match.device.last_node = root;
+            match.device.namespace_depth_offset = 0;
             match.host.last_node = root;
+            match.host.namespace_depth_offset = 0;
             return;
         }
 
@@ -207,7 +213,10 @@ void HybridPrefixCache::augmentMatch(MatchResult& match) const {
         }
         mamba_depth = std::max(mamba_depth, device_mamba_depth);
     } else {
+        // Truncating to the real root leaves the LoRA namespace; clear the
+        // sentinel-page offset so DepthInPage() returns 0, not -1.
         match.device.last_node = root;
+        match.device.namespace_depth_offset = 0;
     }
 
     if (host_mamba_node != nullptr) {
@@ -218,7 +227,9 @@ void HybridPrefixCache::augmentMatch(MatchResult& match) const {
         }
         mamba_depth = std::max(mamba_depth, host_mamba_depth);
     } else {
+        // Same as the device branch: clear the LoRA offset when truncating to root.
         match.host.last_node = root;
+        match.host.namespace_depth_offset = 0;
     }
 
     if (kv_depth > mamba_depth) {
@@ -318,15 +329,11 @@ std::vector<TransferPair> HybridPrefixCache::PrepareMambaDeviceLoadBack(const st
 }
 
 bool HybridPrefixCache::EnsureMambaCapacityByEvict(std::int32_t num_slots, TreeNode* protected_node) {
-    if (mamba_allocator_ == nullptr) return num_slots <= 0;
     return mamba_eviction_manager_.EnsureCapacity(num_slots, protected_node);
 }
 
 void HybridPrefixCache::InsertMamba(TreeNode* terminal_node, std::unique_ptr<MambaSlot> slot) {
     if (terminal_node == nullptr || slot == nullptr) return;
-    if (mamba_allocator_ == nullptr) {
-        throw std::logic_error("HybridPrefixCache::InsertMamba: mamba adjunct not enabled");
-    }
     const std::int32_t page_size = kv_prefix_cache_.PageSize();
     if (page_size <= 0 || terminal_node->DepthInTokens() % static_cast<std::size_t>(page_size) != 0) {
         throw std::logic_error("HybridPrefixCache::InsertMamba: terminal node is not block-aligned");
@@ -651,7 +658,6 @@ void HybridPrefixCache::OnKVDeviceDemote(TreeNode* node) {
 }
 
 std::int32_t HybridPrefixCache::AvailableSlots() const {
-    if (mamba_allocator_ == nullptr) return 0;
     return mamba_allocator_->AvailableSlots();
 }
 

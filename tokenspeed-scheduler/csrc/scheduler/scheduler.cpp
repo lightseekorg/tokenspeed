@@ -166,6 +166,10 @@ Scheduler::Scheduler(SchedulerConfig config)
     }
 }
 
+void Scheduler::EvictLoraNamespace(std::int32_t lora_id) {
+    kv_prefix_cache_.EvictLoraNamespace(lora_id);
+}
+
 std::vector<KvCacheEvent> Scheduler::DrainKvEvents() {
     std::vector<KvCacheEvent> events;
     events.swap(kv_events_);

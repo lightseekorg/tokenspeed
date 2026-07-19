@@ -270,8 +270,9 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     Request* request, std::int32_t remaining, std::int32_t decode_input_tokens, bool disable_l2_cache,
     std::map<std::string, std::int32_t>& simulated_free) {
     if (req_pool_allocator_.AvailableSlots() == 0) return {};
-    MatchResult match_result = hybrid_prefix_cache_ ? hybrid_prefix_cache_->Match(request->GetFullPagedTokens(true))
-                                                    : kv_prefix_cache_.Match(request->GetFullPagedTokens(true));
+    MatchResult match_result = hybrid_prefix_cache_
+                                   ? hybrid_prefix_cache_->Match(request->GetFullPagedTokens(true), request->LoraId())
+                                   : kv_prefix_cache_.Match(request->GetFullPagedTokens(true), request->LoraId());
     std::int32_t loadback_tokens = 0;
     std::int32_t unscheduled = 0;
     std::vector<TreeNode*> loadback_diff;
@@ -437,12 +438,11 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
 #endif
 
     return fsm::SchedulePrefillEvent{tokens_this_round, reserve_num_tokens_in_next_schedule_event,
-                                     hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr
+                                     hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr,
 #if TOKENSPEED_FLAT_KVCACHE
-                                     ,
-                                     &coordinator_
+                                     &coordinator_,
 #endif
-    };
+                                     request->LoraId()};
 }
 
 std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* request,
@@ -483,12 +483,12 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* reque
         }
     }
 
-    return fsm::ScheduleDecodeEvent{config_.decode_input_tokens, hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr
+    return fsm::ScheduleDecodeEvent{config_.decode_input_tokens,
+                                    hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr,
 #if TOKENSPEED_FLAT_KVCACHE
-                                    ,
-                                    &coordinator_
+                                    &coordinator_,
 #endif
-    };
+                                    request->LoraId()};
 }
 
 std::optional<fsm::ScheduleDecodeFromRetractedEvent> Scheduler::scheduleDecodeFromRetracted(
@@ -497,8 +497,9 @@ std::optional<fsm::ScheduleDecodeFromRetractedEvent> Scheduler::scheduleDecodeFr
 
     MatchResult match_result =
         hybrid_prefix_cache_
-            ? hybrid_prefix_cache_->Match(request->GetFullPagedTokens(true), MatchIntent::StateRecovery)
-            : kv_prefix_cache_.Match(request->GetFullPagedTokens(true), MatchIntent::StateRecovery);
+            ? hybrid_prefix_cache_->Match(request->GetFullPagedTokens(true), request->LoraId(),
+                                          MatchIntent::StateRecovery)
+            : kv_prefix_cache_.Match(request->GetFullPagedTokens(true), request->LoraId(), MatchIntent::StateRecovery);
     std::vector<TreeNode*> loadback_diff = match_result.NodesWithout<ResourceType::Device>();
     std::vector<TreeNode*> mamba_loadback_nodes;
     TreeNode* mamba_recovery_node = nullptr;
@@ -595,10 +596,11 @@ std::optional<fsm::ScheduleRetractEvent> Scheduler::scheduleRetract(Request* req
     // Skip when alloc_count <= 0: a prefix deeper than total_available would make TakeFirstPages negative.
     if (alloc_count > 0) {
         OwnedPages alloc_pages = request->TakeFirstPages(alloc_count);
-        kv_prefix_cache_.Insert<ResourceType::Device>(full_paged_tokens, prefix_pages, std::move(alloc_pages));
+        kv_prefix_cache_.Insert<ResourceType::Device>(full_paged_tokens, prefix_pages, std::move(alloc_pages),
+                                                      /*page_hashs=*/{}, /*start_node=*/nullptr, request->LoraId());
     }
 
-    MatchResult match_result = kv_prefix_cache_.Match(full_paged_tokens, MatchIntent::StateRecovery);
+    MatchResult match_result = kv_prefix_cache_.Match(full_paged_tokens, request->LoraId(), MatchIntent::StateRecovery);
 
     std::unique_ptr<HostNodeRef> temp_lock = std::make_unique<HostNodeRef>(match_result.host.last_node);
     const std::int32_t device_matched3 = match_result.device.DepthInPage();
@@ -983,8 +985,30 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
     std::vector<LoadBackOperation> loadback_ops;
     auto simulated_free =
         hybrid_prefix_cache_ ? hybrid_prefix_cache_->InitialSimulatedFree() : std::map<std::string, std::int32_t>{};
+
+    // Track unique LoRA adapter ids in this batch.  When max_loras > 0 we skip
+    // any request whose lora_id would push the count over the cap, deferring it
+    // to the next scheduling round.  This guarantees prepare_loras() never
+    // receives a batch that requires more GPU adapter slots than are available.
+    std::unordered_set<std::int32_t> batch_lora_ids;
+
     for (Request* request : candidates) {
         if (token_budget <= 0 || config_.max_batch_size == ops.size()) break;
+
+        // LoRA adapter cap: skip requests that would exceed max_loras unique ids.
+        // The cap is enforced up-front, but the lora_id is only counted after a
+        // schedule call actually pushes an op — failed schedules (e.g. capacity
+        // pressure) must not consume a slot, or other adapters get starved.
+        const std::int32_t request_lora_id = request->LoraId();
+        const bool lora_cap_active = config_.max_loras > 0 && request_lora_id != kLoraNone;
+        if (lora_cap_active) {
+            bool is_new = batch_lora_ids.find(request_lora_id) == batch_lora_ids.end();
+            if (is_new && static_cast<std::int32_t>(batch_lora_ids.size()) >= config_.max_loras) {
+                continue;  // defer to next step
+            }
+        }
+
+        const std::size_t ops_before = ops.size();
 
         if (request->Is<fsm::Prefilling>() && config_.role != Role::kD) {
             std::int32_t reserver_num_tokens = config_.role == Role::kP ? 0 : config_.decode_input_tokens;
@@ -1033,6 +1057,10 @@ Scheduler::newForwardOperation(std::vector<Request*> candidates) {
                     loadback_ops.push_back(GenerateLoadBackOp(loadback_diff, mamba_loadback_nodes, op_id));
                 }
             }
+        }
+
+        if (lora_cap_active && ops.size() > ops_before) {
+            batch_lora_ids.insert(request_lora_id);
         }
     }
 
