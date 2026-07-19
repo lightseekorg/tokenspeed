@@ -130,8 +130,7 @@ iteration.
   Perfetto timeline, profile with `VIZTRACER` + `PROTON`
   (`TOKENSPEED_KERNEL_PROFILE_DATA=trace`,
   `TOKENSPEED_KERNEL_PROFILE_OUTPUT_FORMAT=chrome_trace`), then merge the
-  per-rank file pair: `tokenspeed merge-traces <id>-TP0.viztracer.json
-  <id>-TP0.proton.chrome_trace`.
+  traces with `tokenspeed merge-traces`.
 
 ### Plugins
 
