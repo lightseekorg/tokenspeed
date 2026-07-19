@@ -86,8 +86,8 @@ def main() -> None:
     merge_traces_parser = subparsers.add_parser(
         "merge-traces",
         add_help=False,
-        help="Merge a Proton chrome trace into a VizTracer report on a "
-        "shared timeline.",
+        help="Merge one or more Proton/VizTracer trace pairs onto a shared "
+        "timeline.",
     )
     merge_traces_parser.set_defaults(func=_merge_traces, merge_args=[])
 

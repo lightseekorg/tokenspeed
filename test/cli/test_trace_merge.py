@@ -34,7 +34,11 @@ import json
 
 import pytest
 
-from tokenspeed.cli.trace_merge import main, merge_proton_viztracer
+from tokenspeed.cli.trace_merge import (
+    main,
+    merge_all_ranks,
+    merge_proton_viztracer,
+)
 
 VIZTRACER_BASE_NS = 1_000_000_000_000_000
 # Proton session started 2.5 ms after the viztracer clock origin.
@@ -147,6 +151,7 @@ def test_merge_shifts_proton_events_onto_viztracer_axis(tmp_path):
     assert by_name["gemm.mm[triton_mm]"]["dur"] == 5.0
     flow_ts = sorted(e["ts"] for e in events if e.get("cat") == "flow")
     assert flow_ts == [8.0 + EXPECTED_OFFSET_US, 10.0 + EXPECTED_OFFSET_US]
+    assert {e["id"] for e in events if e.get("cat") == "flow"} == {1}
 
 
 def test_merge_rejects_viztracer_report_without_anchor(tmp_path):
@@ -178,3 +183,130 @@ def test_cli_defaults_output_next_to_viztracer_report(tmp_path, capsys):
     default_output = tmp_path / "run.viztracer-merged.json"
     assert default_output.exists()
     assert "Merged 5 Proton events" in capsys.readouterr().out
+
+
+def _rank_viztracer_report(*, base_time_ns: int, pid: int) -> dict:
+    report = _viztracer_report()
+    event = report["traceEvents"][0]
+    event["pid"] = pid
+    event["tid"] = pid
+    report["viztracer_metadata"]["baseTimeNanoseconds"] = base_time_ns
+    return report
+
+
+def _rank_proton_trace(*, base_time_ns: int) -> dict:
+    trace = _proton_trace()
+    trace["baseTimeNanoseconds"] = base_time_ns
+    return trace
+
+
+def test_merge_all_ranks_aligns_timelines_and_namespaces_flow_ids(tmp_path):
+    rank0_viz = _write(
+        tmp_path,
+        "run-TP0.viztracer.json",
+        _rank_viztracer_report(base_time_ns=VIZTRACER_BASE_NS, pid=4242),
+    )
+    rank0_proton = _write(
+        tmp_path,
+        "run-TP0.proton.chrome_trace",
+        _rank_proton_trace(base_time_ns=PROTON_BASE_NS),
+    )
+
+    rank1_base = VIZTRACER_BASE_NS + 10_000
+    rank1_viz = _write(
+        tmp_path,
+        "run-TP1.viztracer.json",
+        _rank_viztracer_report(base_time_ns=rank1_base, pid=4243),
+    )
+    rank1_proton = _write(
+        tmp_path,
+        "run-TP1.proton.chrome_trace",
+        _rank_proton_trace(base_time_ns=rank1_base + 2_500_000),
+    )
+    output_path = tmp_path / "all-ranks.json"
+
+    merged_count = merge_all_ranks(
+        [(1, rank1_viz, rank1_proton), (0, rank0_viz, rank0_proton)],
+        output_path,
+    )
+    assert merged_count == 10
+
+    merged = json.loads(output_path.read_text())
+    assert merged["viztracer_metadata"]["baseTimeNanoseconds"] == VIZTRACER_BASE_NS
+    assert len(merged["traceEvents"]) == 12
+
+    forwards = sorted(
+        (event["pid"], event["ts"])
+        for event in merged["traceEvents"]
+        if event["name"] == "forward"
+    )
+    assert forwards == [(4242, 100.0), (4243, 110.0)]
+
+    proton_processes = {
+        event["pid"]: event["args"]["name"]
+        for event in merged["traceEvents"]
+        if event["ph"] == "M" and event["name"] == "process_name"
+    }
+    assert proton_processes == {10000: "Proton TP0", 10001: "Proton TP1"}
+
+    flow_events = [
+        event
+        for event in merged["traceEvents"]
+        if event.get("name") == "launch->kernel"
+    ]
+    assert {(event["pid"], event["id"]) for event in flow_events} == {
+        (10000, 1),
+        (10001, (1 << 32) | 1),
+    }
+    assert {event["id"] for event in flow_events if event["ph"] == "s"} == {
+        1,
+        (1 << 32) | 1,
+    }
+    assert {event["id"] for event in flow_events if event["ph"] == "f"} == {
+        1,
+        (1 << 32) | 1,
+    }
+    assert all(isinstance(event["id"], int) for event in flow_events)
+
+
+def test_all_ranks_cli_merges_explicit_rank_triples(tmp_path, capsys):
+    rank0_viz = _write(
+        tmp_path,
+        "run-TP0.viztracer.json",
+        _rank_viztracer_report(base_time_ns=VIZTRACER_BASE_NS, pid=4242),
+    )
+    rank0_proton = _write(
+        tmp_path,
+        "run-TP0.proton.chrome_trace",
+        _rank_proton_trace(base_time_ns=PROTON_BASE_NS),
+    )
+    rank1_viz = _write(
+        tmp_path,
+        "run-TP1.viztracer.json",
+        _rank_viztracer_report(base_time_ns=VIZTRACER_BASE_NS, pid=4243),
+    )
+    rank1_proton = _write(
+        tmp_path,
+        "run-TP1.proton.chrome_trace",
+        _rank_proton_trace(base_time_ns=PROTON_BASE_NS),
+    )
+    output_path = tmp_path / "all-ranks.json"
+
+    main(
+        [
+            "--all-ranks",
+            "--rank",
+            "0",
+            rank0_viz,
+            rank0_proton,
+            "--rank",
+            "1",
+            rank1_viz,
+            rank1_proton,
+            "--output",
+            str(output_path),
+        ]
+    )
+
+    assert output_path.exists()
+    assert "Merged 10 Proton events across 2 ranks" in capsys.readouterr().out
