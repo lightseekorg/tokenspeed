@@ -145,8 +145,6 @@ class MinimaxSparseAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         # (whole block in one decode forward), with uniform non-causal seq_lens.
         self.draft_block_decode = bool(getattr(config, "draft_block_decode", False))
 
-        self.kernel_solution = None
-
         # Forward metadata is initialized in the runner per forward call
         self.forward_decode_metadata: MSADecodeMetadata | None = None
         self.forward_extend_metadata: MSAExtendMetadata | None = None
@@ -555,7 +553,6 @@ class MinimaxSparseAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             local_blocks=self.index_local_blocks,
             max_seqlen_q=decode_query_len,
             max_seqlen_k=self.max_context_len,
-            solution=self.kernel_solution,
         )
         return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 
@@ -630,7 +627,6 @@ class MinimaxSparseAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             attention_scale=layer.scaling,
             init_blocks=self.index_init_blocks,
             local_blocks=self.index_local_blocks,
-            solution=self.kernel_solution,
         )
         return self._reshape_and_pad_output(output, total_tokens, layer)
 

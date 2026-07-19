@@ -39,9 +39,7 @@ def create_fp8_block_scale_inverses(
     block_shape: tuple[int, int],
 ) -> None:
     block_n, block_k = block_shape
-    scale_dtype = (
-        torch.uint8 if layer.quant_config.quant_method == "mxfp8" else torch.float32
-    )
+    scale_dtype = layer.quant_config.weight_scale_dtype
     w13_weight_scale = torch.nn.Parameter(
         torch.ones(
             spec.num_local_experts,

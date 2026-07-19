@@ -157,11 +157,7 @@ class Fp8LinearMethod(LinearMethodBase):
                         raise ValueError(
                             "Block FP8 requires dynamic linear activation quantization."
                         )
-                scale_dtype = (
-                    torch.uint8
-                    if self.quant_config.scale_fmt == "ue8m0"
-                    else torch.float32
-                )
+                scale_dtype = self.quant_config.weight_scale_dtype
                 scale = BlockQuantScaleParameter(
                     data=torch.empty(
                         (output_size_per_partition + block_n - 1) // block_n,

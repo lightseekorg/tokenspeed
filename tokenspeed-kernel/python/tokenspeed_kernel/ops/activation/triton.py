@@ -335,15 +335,11 @@ def swiglu_oai(
     alpha: float = 1.702,
     limit: float = 7.0,
 ) -> torch.Tensor:
-    """Apply MiniMax-M3's SwiGLU-OAI activation with a Triton kernel.
+    """Fused ``gate * sigmoid(alpha * gate) * (up + 1)``.
 
-    Args:
-        gate_up: Tensor with gate values followed by up values on its last axis.
-        alpha: Sigmoid multiplier applied to the gate.
-        limit: Upper gate clamp and symmetric up clamp.
-
-    Returns:
-        A tensor with half the last-axis width and the same dtype as ``gate_up``.
+    ``gate_up`` is interpreted as ``[..., 2 * D]`` with gate values in the first
+    half and up values in the second half. The gate is upper-clamped to ``limit``
+    and up is clamped to ``[-limit, limit]``. The output has shape ``[..., D]``.
     """
     if gate_up.shape[-1] % 2 != 0:
         raise ValueError(f"last dimension must be even, got {gate_up.shape[-1]}")

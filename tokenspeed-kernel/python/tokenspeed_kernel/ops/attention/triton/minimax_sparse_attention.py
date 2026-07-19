@@ -1,7 +1,8 @@
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: MIT AND Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 LightSeek Foundation
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Triton block-sparse GQA attention for MiniMax-M3.
+"""Triton block-sparse GQA attention for MiniMax.
 
 The prefill kernel uses one program per query position and local KV head.  The
 decode path splits the selected blocks across programs and merges their online
@@ -12,8 +13,13 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-
-from .indexer import SPARSE_BLOCK_SIZE
+from tokenspeed_kernel.ops.attention.triton.minimax_indexer import (
+    SPARSE_BLOCK_SIZE,
+    minimax_indexer,
+)
+from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 
 @triton.heuristics(
@@ -354,7 +360,7 @@ def _validate_inputs(
     if key_cache.shape != value_cache.shape or key_cache.dim() != 4:
         raise ValueError("key/value caches must have matching [pages, heads, 128, dim]")
     if key_cache.shape[2] != SPARSE_BLOCK_SIZE:
-        raise ValueError("MiniMax-M3 sparse attention requires 128-token pages")
+        raise ValueError("MiniMax sparse attention requires 128-token pages")
     if selected_blocks.dim() != 3 or selected_blocks.shape[0] != query.shape[0]:
         raise ValueError("selected_blocks must be [tokens, local_kv_heads, topk]")
     if block_table.dim() != 2 or seq_lens.dim() != 1:
@@ -362,7 +368,7 @@ def _validate_inputs(
     tokens, num_heads, head_dim = query.shape
     num_kv_heads = key_cache.shape[1]
     if head_dim != 128 or key_cache.shape[3] != head_dim:
-        raise ValueError("MiniMax-M3 sparse attention requires head dim 128")
+        raise ValueError("MiniMax sparse attention requires head dim 128")
     if selected_blocks.shape[1] != num_kv_heads:
         raise ValueError("selected block heads must match local KV heads")
     if num_heads % num_kv_heads:
@@ -371,7 +377,7 @@ def _validate_inputs(
 
 
 @torch.no_grad()
-def minimax_m3_msa_sparse_attention(
+def minimax_sparse_attention(
     query: torch.Tensor,
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
@@ -385,7 +391,7 @@ def minimax_m3_msa_sparse_attention(
     prefix_lens: torch.Tensor | None = None,
     max_query_len: int = 0,
 ) -> torch.Tensor:
-    """Run exact GQA attention over MiniMax-M3's selected KV blocks.
+    """Run exact GQA attention over MiniMax's selected KV blocks.
 
     Args:
         query: Main attention queries shaped ``[tokens, local_heads, 128]``.
@@ -414,9 +420,9 @@ def minimax_m3_msa_sparse_attention(
         seq_lens,
     )
     if query.dtype != torch.bfloat16:
-        raise TypeError("MiniMax-M3 Triton sparse attention requires BF16 query")
+        raise TypeError("MiniMax Triton sparse attention requires BF16 query")
     if key_cache.dtype != torch.bfloat16 or value_cache.dtype != torch.bfloat16:
-        raise TypeError("MiniMax-M3 Triton sparse attention requires BF16 KV cache")
+        raise TypeError("MiniMax Triton sparse attention requires BF16 KV cache")
     if selected_blocks.dtype != torch.int32:
         raise TypeError("selected_blocks must be int32")
     if tokens == 0:
@@ -560,4 +566,146 @@ def minimax_m3_msa_sparse_attention(
     return output
 
 
-__all__ = ["minimax_m3_msa_sparse_attention"]
+_MINIMAX_MSA_TRAITS = {
+    "head_dim": frozenset({128}),
+    "index_head_dim": frozenset({128}),
+    "page_size": frozenset({128}),
+    "topk": frozenset({16}),
+}
+_MINIMAX_MSA_SIGNATURES = format_signatures(
+    ("q", "index_q", "index_k", "k_cache", "v_cache", "index_k_cache"),
+    "dense",
+    {torch.bfloat16},
+)
+
+
+@register_kernel(
+    "attention",
+    "msa_decode_with_kvcache",
+    name="triton_minimax_msa_decode_with_kvcache",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=_MINIMAX_MSA_SIGNATURES,
+    traits=_MINIMAX_MSA_TRAITS,
+    priority=Priority.PERFORMANT,
+    tags={"portability"},
+)
+def triton_minimax_msa_decode_with_kvcache(
+    q: torch.Tensor,
+    index_q: torch.Tensor,
+    index_k: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    *,
+    topk: int,
+    page_size: int,
+    index_scale: float,
+    attention_scale: float,
+    init_blocks: int,
+    local_blocks: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+) -> torch.Tensor:
+    """Run MiniMax sparse-attention decode over paged caches."""
+
+    max_blocks = min(
+        page_table.shape[1],
+        (max_seqlen_k + page_size - 1) // page_size,
+    )
+    selected_blocks = minimax_indexer(
+        index_q,
+        index_k,
+        index_k_cache,
+        slot_mapping,
+        page_table,
+        cache_seqlens,
+        topk=topk,
+        scale=index_scale,
+        init_blocks=init_blocks,
+        local_blocks=local_blocks,
+        decode_query_len=max_seqlen_q,
+        max_blocks=max_blocks,
+    )
+    return minimax_sparse_attention(
+        q,
+        k_cache,
+        v_cache,
+        selected_blocks,
+        page_table,
+        cache_seqlens,
+        scale=attention_scale,
+        decode_query_len=max_seqlen_q,
+    )
+
+
+@register_kernel(
+    "attention",
+    "msa_extend_with_kvcache",
+    name="triton_minimax_msa_extend_with_kvcache",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=_MINIMAX_MSA_SIGNATURES,
+    traits=_MINIMAX_MSA_TRAITS,
+    priority=Priority.PERFORMANT,
+    tags={"portability"},
+)
+def triton_minimax_msa_extend_with_kvcache(
+    q: torch.Tensor,
+    index_q: torch.Tensor,
+    index_k: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    *,
+    topk: int,
+    page_size: int,
+    index_scale: float,
+    attention_scale: float,
+    init_blocks: int,
+    local_blocks: int,
+) -> torch.Tensor:
+    """Run MiniMax sparse-attention extend over paged caches."""
+
+    max_blocks = min(
+        page_table.shape[1],
+        (max_seqlen_k + page_size - 1) // page_size,
+    )
+    selected_blocks = minimax_indexer(
+        index_q,
+        index_k,
+        index_k_cache,
+        slot_mapping,
+        page_table,
+        cache_seqlens,
+        topk=topk,
+        scale=index_scale,
+        init_blocks=init_blocks,
+        local_blocks=local_blocks,
+        cu_seqlens_q=cu_seqlens_q,
+        prefix_lens=prefix_lens,
+        max_query_len=max_seqlen_q,
+        max_blocks=max_blocks,
+    )
+    return minimax_sparse_attention(
+        q,
+        k_cache,
+        v_cache,
+        selected_blocks,
+        page_table,
+        cache_seqlens,
+        scale=attention_scale,
+        cu_seqlens_q=cu_seqlens_q,
+        prefix_lens=prefix_lens,
+        max_query_len=max_seqlen_q,
+    )

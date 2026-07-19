@@ -69,7 +69,7 @@ class BaseTransformerModel(nn.Module):
 
         self.embed_tokens = self.resolve_embed(config, prefix)
         self.layers = self.resolve_layers(config, quant_config, prefix)
-        self.norm = self.resolve_norm(config)
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layers_to_capture: list[int] = []
 
         self._compile_decoder_stack()
@@ -135,11 +135,6 @@ class BaseTransformerModel(nn.Module):
             tp_group=self.mapping.attn.tp_group,
             prefix=add_prefix("embed_tokens", prefix),
         )
-
-    def resolve_norm(self, config: PretrainedConfig) -> nn.Module:
-        """Build the final decoder norm."""
-
-        return RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def resolve_layers(
         self,
