@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: Copyright (c) 2026 LightSeek Foundation
+# SPDX-FileCopyrightText: Copyright contributors to the Triton project
+
 """Local copies of small triton-kernels utilities used by AMD MoE kernels."""
 
 # fmt: off
