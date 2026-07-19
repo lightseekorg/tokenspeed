@@ -62,6 +62,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         )
 
         # (loc, loc._version, page, slot_in_page) memo for the index-K write;
+        # only version-tracked loc is cached (inference-mode loc recomputes),
         # see _index_k_page_slot.
         self._index_k_loc_cache: (
             tuple[torch.Tensor, int, torch.Tensor, torch.Tensor] | None
@@ -187,6 +188,21 @@ class DSATokenToKVPool(MLATokenToKVPool):
         k_scale = scale_view[page, slot_in_page]
         return k_fp8, k_scale
 
+    @staticmethod
+    def _loc_version(loc: torch.Tensor) -> int | None:
+        """Version counter of ``loc``, or ``None`` when it isn't tracked.
+
+        The speculative draft path runs under ``torch.inference_mode()`` (see
+        the DFLASH drafter), whose tensors do not maintain a version counter, so
+        reading ``loc._version`` raises ``RuntimeError``. Returning ``None`` lets
+        the memo fall back to recomputation instead of crashing. That costs the
+        draft nothing: its ``GLM5 NextN`` model has a single DSA layer, so the
+        per-forward memo could never hit there anyway.
+        """
+        if loc.is_inference():
+            return None
+        return loc._version
+
     def _index_k_page_slot(
         self, loc: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -199,14 +215,25 @@ class DSATokenToKVPool(MLATokenToKVPool):
         storage in a fresh object also misses (identity differs), and under
         CUDA-graph replay this Python does not run. Numerically identical to the
         inline computation.
+
+        Inference-mode ``loc`` (no version counter) can't be validated across
+        calls, so it is never memoized and always recomputes -- correct, and
+        the only path that hits it (the draft) has nothing to gain from the memo.
         """
+        version = self._loc_version(loc)
         cached = self._index_k_loc_cache
-        if cached is not None and cached[0] is loc and cached[1] == loc._version:
+        if (
+            version is not None
+            and cached is not None
+            and cached[0] is loc
+            and cached[1] == version
+        ):
             return cached[2], cached[3]
         loc_long = loc.to(torch.long)
         page = loc_long // self.page_size
         slot_in_page = loc_long % self.page_size
-        self._index_k_loc_cache = (loc, loc._version, page, slot_in_page)
+        if version is not None:
+            self._index_k_loc_cache = (loc, version, page, slot_in_page)
         return page, slot_in_page
 
     def _set_index_k_buffer(
