@@ -168,9 +168,6 @@ _KV_REPLICATED_SUFFIXES = (
 # ModelOpt NVFP4: input_scale = amax/(448*6) (E4M3 max * E2M1 max); ckpt stores raw amax.
 _NVFP4_AMAX_TO_SCALE = 448.0 * 6.0
 
-# MTP capture A/B: draft consumes the pre-final-norm residual (not post-norm hidden).
-_MTP_PRENORM_CAPTURE = os.environ.get("INKLING_MTP_PRENORM_CAPTURE", "0") == "1"
-
 
 def _translate_inkling_quant_pattern(pattern: str) -> str:
     is_regex = pattern.startswith("re:")
@@ -1552,13 +1549,9 @@ class InklingTextModel(nn.Module):
                 log_scaling_tau=log_scaling_tau,
             )
         if residual is None:
-            prenorm = hidden_states
             hidden_states = self.norm(hidden_states)
         else:
-            hidden_states, prenorm = self.norm(hidden_states, residual)
-        # aux = prenorm residual under INKLING_MTP_PRENORM_CAPTURE, else None.
-        if _MTP_PRENORM_CAPTURE and ctx.capture_hidden_mode.need_capture():
-            return hidden_states, [prenorm]
+            hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states, None
 
 
