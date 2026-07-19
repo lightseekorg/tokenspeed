@@ -375,7 +375,7 @@ class RequestHandler:
                     message="Proton is not available: the installed "
                     "tokenspeed-triton does not provide a profiler.",
                 )
-            if "HIP_VISIBLE_DEVICES" in os.environ:
+            if torch.version.hip and "HIP_VISIBLE_DEVICES" in os.environ:
                 return ProfileReqOutput(
                     success=False,
                     message="Proton on AMD requires ROCR_VISIBLE_DEVICES; "
