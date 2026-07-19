@@ -1516,6 +1516,8 @@ class InklingTextModel(nn.Module):
             return embed_norm(embeds) if embed_norm is not None else embeds
 
         embed.num_embeddings = embed_tokens.num_embeddings
+        embed.embedding_dim = embed_tokens.embedding_dim
+        embed.weight = embed_tokens.weight
         return embed
 
     def forward(
@@ -1628,7 +1630,7 @@ class InklingForConditionalGeneration(nn.Module):
             else None
         )
         self.vision_embedder = (
-            VisionEmbedder()
+            VisionEmbedder(encoder_mapping=mapping.vision)
             if (self.audio is not None or self.visual is not None)
             else None
         )
@@ -1710,20 +1712,15 @@ class InklingForConditionalGeneration(nn.Module):
             )
         encoders = {}
         if self.visual is not None:
-            encoders[Modality.IMAGE] = EncoderSpec(
-                self.get_image_feature, deepstack=False
-            )
+            encoders[Modality.IMAGE] = EncoderSpec(self.get_image_feature)
         if self.audio is not None:
-            encoders[Modality.AUDIO] = EncoderSpec(
-                self.get_audio_feature, deepstack=False
-            )
+            encoders[Modality.AUDIO] = EncoderSpec(self.get_audio_feature)
         input_embeds, _ = self.vision_embedder.apply(
             input_ids=input_ids,
             text_embedding=self.model.mm_text_embedding(),
             ctx=multimodal_context,
             encoders=encoders,
             multimodal_model=self,
-            is_decode_or_idle=ctx.forward_mode.is_decode_or_idle(),
         )
         return input_embeds
 

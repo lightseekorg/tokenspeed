@@ -166,7 +166,9 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3MoeForCausalLM):
 
         self.is_multimodal_active = is_multimodal_active
         self.multimodal_embedder = (
-            MultimodalEmbedder() if is_multimodal_active else None
+            MultimodalEmbedder(encoder_mapping=mapping.vision)
+            if is_multimodal_active
+            else None
         )
         if not is_multimodal_active:
             self.visual = None
@@ -340,7 +342,6 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3MoeForCausalLM):
                 Modality.AUDIO: EncoderSpec(self.audio_encoder),
             },
             multimodal_model=self,
-            is_decode_or_idle=ctx.forward_mode.is_decode_or_idle(),
         )
         hidden_states, aux_hidden_states = self.model(
             input_ids,

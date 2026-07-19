@@ -283,6 +283,7 @@ class ServerArgs:
 
     mla_chunk_multiplier: int = 4
     mm_attention_backend: str | None = None
+    mm_encoder_tp_mode: Literal["weights", "data"] = "weights"
 
     # For PD/EPD disaggregation: "null", "prefill", "decode", or "encode" (vision-tower-only).
     disaggregation_mode: str = "null"
@@ -492,6 +493,22 @@ class ServerArgs:
         )
         moe_dp_size = None
 
+        # The colocated multimodal encoder lives inside each attention TP
+        # group. ``weights`` preserves the legacy weight-TP layout; ``data``
+        # replicates the encoder weights and assigns whole multimodal items to
+        # the ranks in that group.
+        if self.mm_encoder_tp_mode not in ("weights", "data"):
+            raise ValueError(
+                "mm_encoder_tp_mode must be one of {'weights', 'data'}, got "
+                f"{self.mm_encoder_tp_mode!r}"
+            )
+        if self.mm_encoder_tp_mode == "data":
+            vision_tp_size = 1
+            vision_dp_size = attn_tp_size
+        else:
+            vision_tp_size = attn_tp_size
+            vision_dp_size = 1
+
         self.mapping = Mapping(
             world_size=world_size,
             attn_tp_size=attn_tp_size,
@@ -502,6 +519,8 @@ class ServerArgs:
             moe_tp_size=moe_tp_size,
             moe_ep_size=moe_ep_size,
             moe_dp_size=moe_dp_size,
+            vision_tp_size=vision_tp_size,
+            vision_dp_size=vision_dp_size,
             nprocs_per_node=nprocs_per_node,
             nnodes=nnodes,
             base_gpu_id=self.base_gpu_id,
@@ -511,6 +530,22 @@ class ServerArgs:
         # Impl constraints:
         if self.mapping.moe.has_tp and self.mapping.moe.has_ep:
             raise ValueError("MoE TP and EP cannot be both > 1")
+
+        if self.mm_encoder_tp_mode == "data":
+            if self.disaggregation_mode != "null":
+                raise ValueError(
+                    "--mm-encoder-tp-mode data currently requires "
+                    "--disaggregation-mode null (aggregate serving)"
+                )
+            if self.mapping.nnodes != 1:
+                raise ValueError(
+                    "--mm-encoder-tp-mode data currently supports a single node only"
+                )
+            if self.mapping.has_attn_cp:
+                raise ValueError(
+                    "--mm-encoder-tp-mode data does not currently support "
+                    "attention context parallelism"
+                )
 
         logger.info("Parallelism configuration:\n%s", self.mapping)
 
@@ -1796,6 +1831,18 @@ class ServerArgs:
             choices=mm_attention_backend_choices,
             default=ServerArgs.mm_attention_backend,
             help="Set multimodal attention backend.",
+        )
+        parser.add_argument(
+            "--mm-encoder-tp-mode",
+            type=str,
+            choices=["weights", "data"],
+            default=ServerArgs.mm_encoder_tp_mode,
+            help=(
+                "Multimodal encoder parallelism within each attention TP "
+                "group. 'weights' shards encoder weights with TP (default); "
+                "'data' replicates encoder weights and distributes whole "
+                "multimodal items across the TP ranks."
+            ),
         )
         # Disaggregation
         parser.add_argument(
