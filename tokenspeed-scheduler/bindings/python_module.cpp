@@ -227,6 +227,12 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("reserved_blocks", &tokenspeed::BlockPoolSnapshot::reserved_blocks)
         .def_ro("bytes_per_block", &tokenspeed::BlockPoolSnapshot::bytes_per_block);
 
+    nb::class_<tokenspeed::FlatPoolAggregate>(m, "FlatPoolAggregate")
+        .def_ro("active_bytes", &tokenspeed::FlatPoolAggregate::active_bytes)
+        .def_ro("capacity_bytes", &tokenspeed::FlatPoolAggregate::capacity_bytes)
+        .def_ro("pressure_numerator", &tokenspeed::FlatPoolAggregate::pressure_numerator)
+        .def_ro("pressure_denominator", &tokenspeed::FlatPoolAggregate::pressure_denominator);
+
     nb::class_<tokenspeed::PagedCacheGroupConfig>(m, "PagedCacheGroupConfig")
         .def(nb::init<>())
         .def(
@@ -236,21 +242,17 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                tokenspeed::PagedCacheGroupConfig::Retention retention,
                std::optional<std::int32_t> sliding_window_tokens, tokenspeed::PagedCacheGroupFamily family,
                std::int32_t block_size, std::string pool_id, tokenspeed::PrefixRole prefix_role,
-               tokenspeed::TableLayout table_layout, std::uint32_t required_producer_domain_mask,
-               std::uint32_t owner_mask) {
+               tokenspeed::TableLayout table_layout, std::uint32_t owner_mask) {
                 new (self) tokenspeed::PagedCacheGroupConfig{
-                    std::move(group_id), rows_per_page, entry_stride_tokens,   total_pages,
-                    block_size,          retention,     sliding_window_tokens, family,
-                    std::move(pool_id),  prefix_role,   table_layout,          required_producer_domain_mask,
-                    owner_mask};
+                    std::move(group_id),   rows_per_page, entry_stride_tokens, total_pages, block_size,   retention,
+                    sliding_window_tokens, family,        std::move(pool_id),  prefix_role, table_layout, owner_mask};
             },
             nb::arg("group_id"), nb::arg("rows_per_page"), nb::arg("entry_stride_tokens"), nb::arg("total_pages"),
             nb::arg("retention") = tokenspeed::PagedCacheGroupConfig::Retention::FullHistory,
             nb::arg("sliding_window_tokens") = std::nullopt,
             nb::arg("family") = tokenspeed::PagedCacheGroupFamily::History, nb::arg("block_size") = 0,
             nb::arg("pool_id") = "", nb::arg("prefix_role") = tokenspeed::PrefixRole::HistoryAnchor,
-            nb::arg("table_layout") = tokenspeed::TableLayout::Absolute, nb::arg("required_producer_domain_mask") = 0,
-            nb::arg("owner_mask") = 0)
+            nb::arg("table_layout") = tokenspeed::TableLayout::Absolute, nb::arg("owner_mask") = 0)
         .def_rw("group_id", &tokenspeed::PagedCacheGroupConfig::group_id)
         .def_rw("rows_per_page", &tokenspeed::PagedCacheGroupConfig::rows_per_page)
         .def_rw("entry_stride_tokens", &tokenspeed::PagedCacheGroupConfig::entry_stride_tokens)
@@ -262,7 +264,6 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("pool_id", &tokenspeed::PagedCacheGroupConfig::pool_id)
         .def_rw("prefix_role", &tokenspeed::PagedCacheGroupConfig::prefix_role)
         .def_rw("table_layout", &tokenspeed::PagedCacheGroupConfig::table_layout)
-        .def_rw("required_producer_domain_mask", &tokenspeed::PagedCacheGroupConfig::required_producer_domain_mask)
         .def_rw("owner_mask", &tokenspeed::PagedCacheGroupConfig::owner_mask)
         .def("raw_tokens_per_page", &tokenspeed::PagedCacheGroupConfig::RawTokensPerPage)
         .def("validate", &tokenspeed::PagedCacheGroupConfig::Validate)
@@ -325,9 +326,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("prefetch_threshold", &tokenspeed::SchedulerConfig::prefetch_threshold)
         .def_rw("enable_kv_cache_events", &tokenspeed::SchedulerConfig::enable_kv_cache_events)
         .def_rw("enable_mixed_prefill_decode", &tokenspeed::SchedulerConfig::enable_mixed_prefill_decode)
-        .def_rw("enable_structured_flat_kv_completion",
-                &tokenspeed::SchedulerConfig::enable_structured_flat_kv_completion)
-        .def_prop_ro("uses_structured_flat_admission", &tokenspeed::SchedulerConfig::UsesStructuredFlatAdmission)
+        .def_prop_ro("uses_explicit_flat_pools", &tokenspeed::SchedulerConfig::UsesExplicitFlatPools)
         .def_rw("disable_prefix_cache", &tokenspeed::SchedulerConfig::disable_prefix_cache)
         .def_rw("enable_mamba", &tokenspeed::SchedulerConfig::enable_mamba)
         .def_rw("mamba_cache_chunk_size", &tokenspeed::SchedulerConfig::mamba_cache_chunk_size)
@@ -343,20 +342,11 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("storage_hit_pages", &tokenspeed::RequestSpec::storage_hit_pages);
 
     nb::module_ forward_event = m.def_submodule("ForwardEvent");
-    nb::class_<tokenspeed::forward::FlatKVGroupCompletion>(forward_event, "FlatKVGroupCompletion")
-        .def(nb::init<>())
-        .def_rw("group_id", &tokenspeed::forward::FlatKVGroupCompletion::group_id)
-        .def_rw("completed_domain_mask", &tokenspeed::forward::FlatKVGroupCompletion::completed_domain_mask)
-        .def_rw("domain_valid_ends", &tokenspeed::forward::FlatKVGroupCompletion::domain_valid_ends);
-
     nb::class_<tokenspeed::forward::FlatKVCompletion>(forward_event, "FlatKVCompletion")
         .def(nb::init<>())
-        .def_rw("request_id", &tokenspeed::forward::FlatKVCompletion::request_id)
         .def_rw("table_generation", &tokenspeed::forward::FlatKVCompletion::table_generation)
         .def_rw("dispatch_seq", &tokenspeed::forward::FlatKVCompletion::dispatch_seq)
-        .def_rw("accepted_raw_end", &tokenspeed::forward::FlatKVCompletion::accepted_raw_end)
-        .def_rw("protected_raw_end", &tokenspeed::forward::FlatKVCompletion::protected_raw_end)
-        .def_rw("groups", &tokenspeed::forward::FlatKVCompletion::groups);
+        .def_rw("accepted_raw_end", &tokenspeed::forward::FlatKVCompletion::accepted_raw_end);
 
     nb::class_<tokenspeed::forward::ExtendResult>(forward_event, "ExtendResult")
         .def(nb::init<>())
@@ -429,7 +419,6 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     nb::module_ forward = m.def_submodule("Forward");
 
     nb::class_<tokenspeed::FlatKVCompletionInput>(forward, "FlatKVCompletionInput")
-        .def_ro("request_id", &tokenspeed::FlatKVCompletionInput::request_id)
         .def_ro("table_generation", &tokenspeed::FlatKVCompletionInput::table_generation)
         .def_ro("dispatch_seq", &tokenspeed::FlatKVCompletionInput::dispatch_seq)
         .def_ro("dispatch_raw_start", &tokenspeed::FlatKVCompletionInput::dispatch_raw_start)
@@ -438,7 +427,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
 
     auto flat_fwd_op = nb::class_<tokenspeed::FlatForwardOperation>(forward, "FlatForwardOp");
     BindForwardCommonFields<tokenspeed::FlatForwardOperation>(flat_fwd_op);
-    flat_fwd_op.def_ro("input_ids", &tokenspeed::FlatForwardOperation::input_ids)
+    flat_fwd_op.def_ro("cache_generation", &tokenspeed::FlatForwardOperation::cache_generation)
+        .def_ro("input_ids", &tokenspeed::FlatForwardOperation::input_ids)
         .def_ro("shifted_input_ids", &tokenspeed::FlatForwardOperation::shifted_input_ids)
         .def_ro("extend_prefix_lens", &tokenspeed::FlatForwardOperation::extend_prefix_lens)
         .def_prop_ro(
@@ -596,7 +586,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("get_request_paged_cache_base_logical_page", &tokenspeed::Scheduler::GetRequestPagedCacheBaseLogicalPage,
              nb::arg("request_id"), nb::arg("group_id"));
 #if TOKENSPEED_FLAT_KVCACHE
-    scheduler.def("flat_pool_snapshots", &tokenspeed::Scheduler::FlatPoolSnapshots)
+    scheduler.def("flat_pool_aggregate", &tokenspeed::Scheduler::FlatPoolAggregateStats)
+        .def("flat_pool_snapshots", &tokenspeed::Scheduler::FlatPoolSnapshots)
         .def("flat_kv_generation", &tokenspeed::Scheduler::FlatKVGeneration)
         .def("flat_kv_cache_quiescent", &tokenspeed::Scheduler::FlatKVQuiescent)
         .def("reset_flat_kv_cache", &tokenspeed::Scheduler::ResetFlatKVCache);

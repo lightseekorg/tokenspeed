@@ -28,16 +28,12 @@ import torch
 from tokenspeed_kernel.ops.tuning import freeze_autotuning
 from tokenspeed_kernel.platform import current_platform
 
+from tokenspeed.runtime.configs.flat_kv_contract import CACHE_OWNER_DRAFT
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.configs.paged_cache_spec import (
     scheduler_ext_flat_kvcache,
-    validate_flat_scheduler_config,
 )
 from tokenspeed.runtime.configs.utils import get_rope_parameters
-from tokenspeed.runtime.deepseek_v4_cache_tables import (
-    legacy_flat_loc_group_id,
-    resolve_deepseek_v4_flat_loc_policy,
-)
 from tokenspeed.runtime.engine.scheduler_utils import (
     flat_block_table_base_offsets_from_forward_op,
     flat_block_tables_from_forward_op,
@@ -50,10 +46,6 @@ from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
 from tokenspeed.runtime.execution.drafter.dflash import DFlash
 from tokenspeed.runtime.execution.drafter.eagle import Eagle
 from tokenspeed.runtime.execution.drafter.mtp import Mtp
-from tokenspeed.runtime.execution.flat_kv_progress import (
-    FlatKVExecutionTracker,
-    FlatKVProgressSchema,
-)
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
@@ -64,6 +56,15 @@ from tokenspeed.runtime.execution.nan_guard import NanGuard
 from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 from tokenspeed.runtime.execution.types import ModelExecutionResult
+from tokenspeed.runtime.flat_cache_tables import (
+    CacheTableSource,
+    legacy_flat_loc_group_id,
+    resolve_cache_table_binding,
+    resolve_cache_table_source,
+    validate_flat_cache_generation,
+    validate_flat_cache_table_source,
+    validate_speculative_flat_bindings,
+)
 from tokenspeed.runtime.grammar.capturable_grammar import setup_grammar_step
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 from tokenspeed.runtime.layers.paged_attention import (
@@ -101,9 +102,8 @@ def _get_drafter_impl(spec_algo: str, model: torch.nn.Module):
 
     DRAFTER_MAPPING = {"EAGLE3": Eagle, "MTP": Eagle, "DFLASH": DFlash}
 
-    # "MTP" covers two algorithms:
-    # (1) Eagle-like MTP (e.g. DeepSeek) stays on Eagle in eagle.py;
-    # (2) Vanilla MTP (e.g. Inkling) with multi-layer weights stays on Mtp in mtp.py.
+    # "MTP" covers both an Eagle-compatible single-layer form and a native
+    # multi-layer form. Only the latter uses the dedicated Mtp implementation.
     if spec_algo == "MTP" and isinstance(model, InklingForConditionalGenerationNextN):
         return Mtp
     else:
@@ -190,8 +190,6 @@ class ModelExecutorConfig:
     overlap_schedule_depth: int = 0
     dp_sampling: bool = False
     dp_sampling_min_bs: int | None = None
-    use_v4_mtp_paged_metadata: bool = False
-
     # ====== GRAMMAR =========
     # "none" disables all grammar handling; otherwise the backend name
     # (currently only "xgrammar" is implemented).
@@ -256,7 +254,6 @@ class ModelExecutorConfig:
             dp_sampling=server_args.dp_sampling,
             dp_sampling_min_bs=server_args.dp_sampling_min_bs,
             enable_nan_detection=server_args.enable_nan_detection,
-            use_v4_mtp_paged_metadata=model_config.use_v4_mtp_paged_metadata,
             grammar_backend=server_args.grammar_backend,
             disable_capturable_grammar=server_args.disable_capturable_grammar,
         )
@@ -286,29 +283,58 @@ class ModelExecutor:
         self.attn_backend = attn_backend
         self.token_to_kv_pool = token_to_kv_pool
         _group_specs = getattr(token_to_kv_pool, "paged_cache_group_specs", ()) or ()
+        _completion_group_specs = (
+            getattr(token_to_kv_pool, "scheduler_group_specs", None) or _group_specs
+        )
         self.draft_attn_backend = draft_attn_backend
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self._layerwise_mamba_cow_done = None
 
-        # Must precede CUDA-graph capture: unsupported flat combinations
-        # (e.g. spec on a backend without flat_spec_capable) would otherwise
-        # die on a capture-path assert instead of this actionable error.
-        validate_flat_scheduler_config(
-            flat_kvcache_ext=scheduler_ext_flat_kvcache(),
-            paged_cache_groups=_group_specs,
-            attn_backend=attn_backend,
-            kv_pool=token_to_kv_pool,
-            speculative_algorithm=config.spec_algo,
+        flat_scheduler_active = scheduler_ext_flat_kvcache()
+        self._target_cache_table_binding = resolve_cache_table_binding(
+            backend=attn_backend,
+            pool=token_to_kv_pool,
+            flat_scheduler_active=flat_scheduler_active,
+        )
+        self._draft_cache_table_binding = (
+            resolve_cache_table_binding(
+                backend=draft_attn_backend,
+                pool=draft_token_to_kv_pool,
+                flat_scheduler_active=flat_scheduler_active,
+            )
+            if draft_attn_backend is not None and draft_token_to_kv_pool is not None
+            else None
+        )
+        self._flat_generation_pool = next(
+            (
+                pool
+                for pool, binding in (
+                    (token_to_kv_pool, self._target_cache_table_binding),
+                    (draft_token_to_kv_pool, self._draft_cache_table_binding),
+                )
+                if pool is not None
+                and binding is not None
+                and binding.kind == "flat"
+                and getattr(pool, "flat_memory_plan", None) is not None
+            ),
+            None,
         )
 
-        self._flat_v4_loc_policy = resolve_deepseek_v4_flat_loc_policy(
-            target_backend=attn_backend,
+        validate_speculative_flat_bindings(
             target_pool=token_to_kv_pool,
-            draft_backend=draft_attn_backend,
+            target_binding=self._target_cache_table_binding,
             draft_pool=draft_token_to_kv_pool,
+            draft_binding=self._draft_cache_table_binding,
             speculative_algorithm=config.spec_algo,
         )
-        self._uses_group_keyed_cache_locs = self._flat_v4_loc_policy is not None
+        self._uses_group_keyed_cache_locs = (
+            self._target_cache_table_binding.group_keyed_cache_locs
+        )
+        self._extract_scheduler_cache_tables = (
+            self._extract_flat_scheduler_cache_tables
+            if self._target_cache_table_binding.kind == "flat"
+            else self._extract_radix_scheduler_cache_tables
+        )
         self._legacy_flat_loc_group_id = (
             None
             if self._uses_group_keyed_cache_locs
@@ -321,14 +347,7 @@ class ModelExecutor:
         self._mirror_idx_dev: torch.Tensor | None = None
         self._mirror_row_buf: torch.Tensor | None = None
 
-        flat_source_active = bool(
-            scheduler_ext_flat_kvcache()
-            and getattr(attn_backend, "uses_flat_cache_groups", False)
-            and (
-                not getattr(attn_backend, "uses_paged_cache_groups", False)
-                or getattr(token_to_kv_pool, "flat_memory_plan", None) is not None
-            )
-        )
+        flat_source_active = self._target_cache_table_binding.kind == "flat"
         if (
             config.spec_algo is not None
             and flat_source_active
@@ -343,7 +362,7 @@ class ModelExecutor:
             )
 
         if self._uses_group_keyed_cache_locs:
-            # V4 flat has no canonical scalar page domain. Keep a one-column
+            # Group-keyed flat caches have no canonical scalar page domain. Keep a one-column
             # page-0 sentinel solely for source-neutral call signatures; all
             # real target/draft tables and write locations are group-keyed.
             max_num_pages_per_req = 1
@@ -371,22 +390,6 @@ class ModelExecutor:
             ) // config.block_size
 
         max_bs = config.max_num_seqs // max(config.data_parallel_size, 1)
-
-        self.flat_kv_execution_tracker: FlatKVExecutionTracker | None = None
-        if flat_source_active:
-            schema = FlatKVProgressSchema.from_runtime_pool(token_to_kv_pool)
-            self.flat_kv_execution_tracker = FlatKVExecutionTracker(schema)
-            if draft_token_to_kv_pool is not None:
-                target_plan = getattr(token_to_kv_pool, "flat_memory_plan", None)
-                draft_plan = getattr(draft_token_to_kv_pool, "flat_memory_plan", None)
-                if (
-                    target_plan is not None
-                    and draft_plan is not None
-                    and target_plan.plan_fingerprint != draft_plan.plan_fingerprint
-                ):
-                    raise ValueError(
-                        "target and draft flat KV progress plans must match"
-                    )
 
         self.req_to_page = torch.zeros(
             (config.max_req_pool_size + 1, max_num_pages_per_req),
@@ -417,6 +420,13 @@ class ModelExecutor:
             uses_group_keyed_cache_locs=self._uses_group_keyed_cache_locs,
             flat_memory_plan=getattr(token_to_kv_pool, "flat_memory_plan", None),
         )
+        if (
+            self._flat_generation_pool is not None
+            and self.input_buffers.flat_block_table_staging is None
+        ):
+            raise RuntimeError(
+                "planned flat cache execution requires table staging buffers"
+            )
         self.runtime_states = RuntimeStates(
             req_pool_size=config.max_req_pool_size,
             context_len=config.context_len,
@@ -485,10 +495,10 @@ class ModelExecutor:
         else:
             self.drafter = None
 
-        # Static host-only capability: a successful first draft step may retire
-        # producer debt only when it covers every planned draft KV layer. Cache
-        # it once so the forward hot path neither probes Python attributes nor
-        # risks coercing a device-backed value.
+        # Validate the static draft-write contract once at the initialization
+        # seam. A successful forward and the copy_event recorded later on the
+        # same execution stream are then sufficient completion evidence; the
+        # forward hot path does not need a second progress tracker.
         draft_prefix_capability = getattr(
             self.drafter,
             "first_step_covers_all_draft_kv_layers",
@@ -498,7 +508,21 @@ class ModelExecutor:
             raise TypeError(
                 "first_step_covers_all_draft_kv_layers must be a host Python bool"
             )
-        self._draft_first_step_covers_all_kv_layers = draft_prefix_capability
+        if flat_source_active and not _completion_group_specs:
+            raise RuntimeError("flat KV completion requires scheduler group specs")
+        requires_draft_forward = any(
+            int(getattr(spec, "owner_mask", 0)) & CACHE_OWNER_DRAFT
+            for spec in _completion_group_specs
+        )
+        if (
+            flat_source_active
+            and requires_draft_forward
+            and not draft_prefix_capability
+        ):
+            raise RuntimeError(
+                "flat KV draft groups require the first draft step to cover "
+                "every planned draft KV layer"
+            )
 
         # Single grammar handle: CapturableGrammarExecutor on CUDA (uses
         # cudaLaunchHostFunc on a side stream so the xgrammar fill +
@@ -629,6 +653,9 @@ class ModelExecutor:
             eager_grammar_buffers=self.eager_grammar_buffers,
             sampling_backend=self.sampling_backend,
             runtime_states=self.runtime_states,
+            target_cache_table_binding=self._target_cache_table_binding,
+            draft_cache_table_binding=self._draft_cache_table_binding,
+            flat_generation_pool=self._flat_generation_pool,
         )
 
         # Breakable prefill (extend) CUDA graphs, the extend-mode analogue of
@@ -749,6 +776,77 @@ class ModelExecutor:
             else None
         )
 
+    def _extract_flat_scheduler_cache_tables(
+        self,
+        forward_op,
+        bs: int,
+        cache_generation: int | None,
+    ) -> tuple[None, None, CacheTableSource | None, dict]:
+        """Stage exactly the Flat table ABI selected during initialization."""
+
+        flat_staging = self.input_buffers.flat_block_table_staging
+        if flat_staging is not None and bs > 0:
+            source = flat_staging.stage(
+                forward_op,
+                num_reqs=bs,
+                cache_generation=cache_generation,
+            )
+            return None, None, source, source.tables
+        if flat_staging is not None:
+            # Idle graph replay rotates a slot after its padded size is known.
+            return None, None, None, {}
+
+        tables = flat_block_tables_from_forward_op(
+            forward_op,
+            device=self.device,
+            num_reqs=bs,
+        )
+        base_offsets, _ = flat_block_table_base_offsets_from_forward_op(
+            forward_op,
+            device=self.device,
+            num_reqs=bs,
+        )
+        if not tables and not base_offsets:
+            return None, None, None, tables
+        source = resolve_cache_table_source(
+            paged_tables=None,
+            paged_base_offsets=None,
+            flat_tables=tables,
+            flat_base_offsets=base_offsets,
+            flat_generation=(
+                cache_generation
+                if cache_generation is not None
+                else getattr(forward_op, "cache_generation", None)
+            ),
+        )
+        validate_flat_cache_table_source(
+            source,
+            where="model executor flat table conversion",
+            min_rows=bs,
+        )
+        return None, None, source, tables
+
+    def _extract_radix_scheduler_cache_tables(
+        self,
+        forward_op,
+        bs: int,
+        cache_generation: int | None,
+    ) -> tuple[dict, dict, None, dict]:
+        """Convert exactly the radix table ABI selected during initialization."""
+
+        del cache_generation
+        tables = paged_cache_block_tables_from_forward_op(
+            forward_op,
+            device=self.device,
+            num_reqs=bs,
+        )
+        base_offsets, _ = paged_cache_block_table_base_offsets_from_forward_op(
+            forward_op,
+            device=self.device,
+            num_reqs=bs,
+        )
+        return tables, base_offsets, None, {}
+
     def _mirror_legacy_flat_table_into_req_to_page(
         self, forward_op, flat_block_tables
     ) -> None:
@@ -756,7 +854,7 @@ class ModelExecutor:
 
         The selected group is proven to be the only owner group, stride 1,
         absolute full-history, and byte-for-byte aligned with the configured
-        scalar page size. V4 flat never enters this path: its local page ids
+        scalar page size. Group-keyed flat caches never enter this path: their local page ids
         require a group identity and are delivered directly to owner-local
         backend metadata.
         """
@@ -1557,7 +1655,7 @@ class ModelExecutor:
             if self._uses_group_keyed_cache_locs:
                 # Never feed FlatForwardOperation.occupied_pages into the
                 # radix mirror: it is only a first-group compatibility sample
-                # and its local ids are meaningless in every other V4 pool.
+                # and its local ids are meaningless in every other pool.
                 # The single schema guard lives in staging.stage(), immediately
                 # before the atomic table/base copy on the execution path.
                 return
@@ -1802,6 +1900,15 @@ class ModelExecutor:
         multimodal_context=None,
         capture_next_input_ids: bool = False,
     ) -> ModelExecutionResult:
+        cache_generation = None
+        if self._flat_generation_pool is not None:
+            cache_generation = validate_flat_cache_generation(
+                getattr(forward_op, "cache_generation", None),
+                expected_generation=getattr(
+                    self._flat_generation_pool, "arena_generation", None
+                ),
+                where="model executor forward entry",
+            )
         num_extends = forward_op.num_extends()
         total_tokens = sum(forward_op.input_lengths)
         self._active_multimodal_context = multimodal_context
@@ -1815,10 +1922,6 @@ class ModelExecutor:
         output_d2h_ms = 0.0
         graph_capable = False
         graph_padded_bs = 0
-        flat_kv_execution_evidence = None
-        target_forward_enqueued = False
-        draft_continuous_prefix_enqueued = False
-
         with nvtx_range("pre_fill_setup", color="orange"):
             has_retract = self._contains_retracted_decode(forward_op)
 
@@ -1829,45 +1932,20 @@ class ModelExecutor:
             self.execution_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.execution_stream):
             bs = len(forward_op.request_ids)
-            if self.flat_kv_execution_tracker is not None:
-                self.flat_kv_execution_tracker.begin_dispatch(
-                    getattr(forward_op, "flat_kv_completion_inputs", None),
-                    request_ids=forward_op.request_ids,
-                )
             # Outside the graph: in-graph sites only OR into the flag buffer.
             self.nan_guard.reset(bs)
-            # Export the scheduler union once. V4 target/draft consumers take
-            # owner-local subsets in CudaGraphWrapper; only the explicitly
-            # validated one-group legacy ABI is mirrored into req_to_page.
-            flat_staging = self.input_buffers.flat_block_table_staging
-            if flat_staging is not None:
-                flat_block_tables, flat_block_table_base_offsets = flat_staging.stage(
-                    forward_op, num_reqs=bs
-                )
-            else:
-                flat_block_tables = flat_block_tables_from_forward_op(
-                    forward_op,
-                    device=self.device,
-                    num_reqs=bs,
-                    max_cols_by_group=getattr(
-                        self.token_to_kv_pool,
-                        "flat_max_export_cols_by_group",
-                        None,
-                    ),
-                )
-                flat_block_table_base_offsets, _ = (
-                    flat_block_table_base_offsets_from_forward_op(
-                        forward_op,
-                        device=self.device,
-                        num_reqs=bs,
-                    )
-                )
-            if set(flat_block_tables) != set(flat_block_table_base_offsets):
-                raise ValueError(
-                    "flat block table/base group mismatch: "
-                    f"tables={sorted(flat_block_tables)}, "
-                    f"bases={sorted(flat_block_table_base_offsets)}"
-                )
+            # The startup binding selects one extractor. Flat execution never
+            # touches the radix native properties/converters, and vice versa.
+            (
+                paged_cache_block_tables,
+                paged_cache_block_table_base_offsets,
+                flat_cache_table_source,
+                flat_block_tables,
+            ) = self._extract_scheduler_cache_tables(
+                forward_op,
+                bs,
+                cache_generation,
+            )
             self._mirror_legacy_flat_table_into_req_to_page(
                 forward_op, flat_block_tables
             )
@@ -2045,20 +2123,6 @@ class ModelExecutor:
                         if self.input_buffers.has_mamba
                         else {}
                     )
-                    paged_cache_block_tables = paged_cache_block_tables_from_forward_op(
-                        forward_op,
-                        device=self.device,
-                        num_reqs=bs,
-                    )
-                    # flat_block_tables computed once in pre_fill above.
-                    (
-                        paged_cache_block_table_base_offsets,
-                        _paged_cache_block_table_base_offset_max,
-                    ) = paged_cache_block_table_base_offsets_from_forward_op(
-                        forward_op,
-                        device=self.device,
-                        num_reqs=bs,
-                    )
                     self._log_dp_sampling_route(bs, ctx)
                     forward_step_start = 0.0
                     if timing_enabled:
@@ -2091,18 +2155,8 @@ class ModelExecutor:
                         paged_cache_block_table_base_offsets=(
                             paged_cache_block_table_base_offsets
                         ),
-                        flat_block_tables=flat_block_tables,
-                        flat_block_table_base_offsets=(flat_block_table_base_offsets),
+                        flat_cache_table_source=flat_cache_table_source,
                         **mamba_kwargs,
-                    )
-                    # Successful return proves the eager/breakable path ran, or
-                    # the full decode graph enqueued, its complete captured
-                    # target forward and the complete captured draft first step.
-                    # The cached capability is true only when that draft step
-                    # includes all-layer dense KV catch-up.
-                    target_forward_enqueued = True
-                    draft_continuous_prefix_enqueued = (
-                        self._draft_first_step_covers_all_kv_layers
                     )
                     if timing_enabled:
                         forward_step_ms = (
@@ -2130,16 +2184,6 @@ class ModelExecutor:
                     output_lengths,
                     bs,
                     num_extends,
-                )
-
-            if self.flat_kv_execution_tracker is not None:
-                flat_kv_execution_evidence = (
-                    self.flat_kv_execution_tracker.finish_dispatch(
-                        target_forward_enqueued=target_forward_enqueued,
-                        draft_continuous_prefix_enqueued=(
-                            draft_continuous_prefix_enqueued
-                        ),
-                    )
                 )
 
             with nvtx_range("output_d2h", color="green"):
@@ -2235,7 +2279,6 @@ class ModelExecutor:
             grammar_completion=grammar_completion,
             next_input_ids=next_input_ids,
             output_nan_flags=output_nan_flags,
-            _flat_kv_execution_evidence=flat_kv_execution_evidence,
         )
 
     def write_remote_spec_candidate_ids(

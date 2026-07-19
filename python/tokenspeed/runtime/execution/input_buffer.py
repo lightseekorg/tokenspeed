@@ -20,7 +20,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -34,7 +34,6 @@ from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
-    from tokenspeed.runtime.configs.flat_memory_plan import V4FlatMemoryPlan
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 
 
@@ -59,7 +58,7 @@ class InputBuffers:
         device: str = "cuda",
         has_mamba: bool = False,
         uses_group_keyed_cache_locs: bool = False,
-        flat_memory_plan: V4FlatMemoryPlan | None = None,
+        flat_memory_plan: Any | None = None,
     ):
         self.device = device
         self.page_size = page_size
@@ -298,10 +297,10 @@ class InputBuffers:
             # Decode path's seq_lens / positions / out_cache_loc are done.
             valid_cache_lengths = None
         else:
-            # Mixed / pure-prefill keep the per-kernel position pipeline. V4
-            # flat has no scalar page domain: its persistent out_cache_loc is
-            # already the page-0 sentinel, while every real KV writer consumes
-            # group-keyed table/base metadata from the attention backend.
+            # Mixed / pure-prefill keep the per-kernel position pipeline. A
+            # group-keyed cache has no scalar page domain: its persistent
+            # out_cache_loc is already the page-0 sentinel, while every real KV
+            # writer consumes table/base metadata from the attention backend.
             valid_cache_lengths = runtime_states.valid_cache_lengths.index_select(
                 0, req_pool_indices_device
             )

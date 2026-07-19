@@ -16,8 +16,6 @@ On the default (radix) build it stays empty, so the whole module is
 
 from __future__ import annotations
 
-import array
-
 import pytest
 
 ts = pytest.importorskip("tokenspeed_scheduler")
@@ -116,25 +114,6 @@ def test_prefill_produces_per_group_block_tables():
     full_row = list(tables["full"][0])
     assert full_row, "full-history row should be non-empty after prefill"
     assert all(page_id > 0 for page_id in full_row)
-
-
-def test_copy_flat_block_table_to_returns_shape_and_writes_buffers():
-    scheduler = ts.Scheduler(_make_config())
-    scheduler.submit_requests([_make_spec("r1", num_pages=2)])
-
-    op = _find_flat_op(scheduler.next_execution_plan())
-    assert op is not None
-
-    expected_table = list(op.flat_block_tables["full"][0])
-    expected_base = op.flat_block_table_base_offsets["full"][0]
-    table = array.array("i", [-1] * 32)
-    bases = array.array("i", [-1] * 8)
-
-    rows, cols = op.copy_flat_block_table_to("full", table, bases, 32)
-
-    assert (rows, cols) == (1, len(expected_table))
-    assert list(table[:cols]) == expected_table
-    assert bases[0] == expected_base
 
 
 def test_decode_slides_swa_window_to_null_hole():

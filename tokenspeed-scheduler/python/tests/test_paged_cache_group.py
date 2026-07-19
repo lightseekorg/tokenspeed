@@ -1,7 +1,7 @@
+from types import SimpleNamespace
+
 import pytest
 from tokenspeed_scheduler import (
-    FLAT_KVCACHE,
-    FlatBlockPoolConfig,
     PagedCacheGroupAllocator,
     PagedCacheGroupConfig,
     PagedCacheGroupFamily,
@@ -9,8 +9,10 @@ from tokenspeed_scheduler import (
     PagedCachePrefixRole,
     PagedCacheRetention,
     PagedCacheTableLayout,
-    SchedulerConfig,
 )
+
+from tokenspeed.runtime.configs.deepseek_v4_cache_spec import build_v4_cache_specs
+from tokenspeed.runtime.engine.scheduler_utils import pool_to_paged_cache_groups
 
 
 def _full_history_config(rows_per_page=64, entry_stride_tokens=4, total_pages=10):
@@ -34,57 +36,58 @@ def _sliding_config(rows_per_page=2, entry_stride_tokens=1, total_pages=8, windo
     )
 
 
-def _flat_pool(
-    pool_id: str, total_blocks: int, bytes_per_block: int
-) -> FlatBlockPoolConfig:
-    pool = FlatBlockPoolConfig()
-    pool.pool_id = pool_id
-    pool.total_blocks = total_blocks
-    pool.bytes_per_block = bytes_per_block
-    return pool
-
-
-def _v4_state_group() -> PagedCacheGroupConfig:
-    return PagedCacheGroupConfig(
-        group_id="v4.c4.state",
-        rows_per_page=1,
-        entry_stride_tokens=4,
-        total_pages=32,
-        retention=PagedCacheRetention.SlidingWindow,
-        sliding_window_tokens=128,
-        family=PagedCacheGroupFamily.State,
-        block_size=4,
-        pool_id="v4.c4.state",
-        prefix_role=PagedCachePrefixRole.ContinuationState,
-        table_layout=PagedCacheTableLayout.BoundedWindow,
-        required_producer_domain_mask=0b0011,
-        owner_mask=0b0011,
+_V4_SPECS = tuple(
+    build_v4_cache_specs(
+        SimpleNamespace(sliding_window=128),
+        layer_ratio=(1, 4, 128),
     )
+)
 
 
-def test_v4_explicit_flat_pool_and_group_binding_round_trip():
-    config = SchedulerConfig()
-    config.enable_structured_flat_kv_completion = True
-    config.flat_block_pools = [
-        _flat_pool("v4.swa", total_blocks=32, bytes_per_block=64),
-        _flat_pool("v4.c4.state", total_blocks=16, bytes_per_block=128),
-    ]
-    config.paged_cache_groups = [_v4_state_group()]
+def _v4_native_groups() -> dict[str, PagedCacheGroupConfig]:
+    pool = SimpleNamespace(
+        paged_cache_group_specs=_V4_SPECS,
+        paged_cache_group_page_counts={spec.group_id: 32 for spec in _V4_SPECS},
+    )
+    return {group.group_id: group for group in pool_to_paged_cache_groups(pool)}
 
-    assert [
-        (pool.pool_id, pool.total_blocks, pool.bytes_per_block)
-        for pool in config.flat_block_pools
-    ] == [("v4.swa", 32, 64), ("v4.c4.state", 16, 128)]
-    assert config.uses_structured_flat_admission is FLAT_KVCACHE
 
-    group = config.paged_cache_groups[0]
+@pytest.mark.parametrize("spec", _V4_SPECS, ids=lambda spec: spec.group_id)
+def test_v4_production_spec_round_trips_native_geometry(spec) -> None:
+    group = _v4_native_groups()[spec.group_id]
+
     group.validate_flat_block_geometry()
-    assert (group.block_size, group.pool_id) == (4, "v4.c4.state")
-    assert (group.prefix_role, group.table_layout) == (
-        PagedCachePrefixRole.ContinuationState,
-        PagedCacheTableLayout.BoundedWindow,
+    assert (group.rows_per_page, group.entry_stride_tokens, group.block_size) == (
+        spec.rows_per_page,
+        spec.entry_stride_tokens,
+        spec.block_size,
     )
-    assert (group.required_producer_domain_mask, group.owner_mask) == (0b0011, 0b0011)
+    assert (group.total_pages, group.pool_id, group.owner_mask) == (
+        32,
+        spec.pool_id,
+        spec.owner_mask,
+    )
+    assert (
+        group.family
+        == {
+            "history": PagedCacheGroupFamily.History,
+            "state": PagedCacheGroupFamily.State,
+        }[spec.family]
+    )
+    assert (
+        group.prefix_role
+        == {
+            "history_anchor": PagedCachePrefixRole.HistoryAnchor,
+            "continuation_state": PagedCachePrefixRole.ContinuationState,
+        }[spec.prefix_role]
+    )
+    assert (
+        group.table_layout
+        == {
+            "absolute": PagedCacheTableLayout.Absolute,
+            "bounded_window": PagedCacheTableLayout.BoundedWindow,
+        }[spec.table_layout]
+    )
 
 
 @pytest.mark.parametrize(
@@ -92,13 +95,13 @@ def test_v4_explicit_flat_pool_and_group_binding_round_trip():
     [
         ("block_size", 8, "block_size must equal"),
         ("sliding_window_tokens", 126, "window must be page-aligned"),
-        ("owner_mask", 0, "producer-domain and owner masks"),
+        ("owner_mask", 0, "requires an owner mask"),
     ],
 )
 def test_v4_flat_group_rejects_invalid_geometry(
     field: str, value: int, error: str
 ) -> None:
-    config = _v4_state_group()
+    config = _v4_native_groups()["v4.c4a.compressor_state"]
     setattr(config, field, value)
 
     with pytest.raises(ValueError, match=error):

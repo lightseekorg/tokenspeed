@@ -82,12 +82,15 @@ struct PagedCacheGroupConfig {
     std::string pool_id{};
     PrefixRole prefix_role{PrefixRole::HistoryAnchor};
     TableLayout table_layout{TableLayout::Absolute};
-    // Bounded producer domains, not per-layer tensor-plane bits.
-    std::uint32_t required_producer_domain_mask{0};
     // Planner-defined target/draft owner bits; zero means legacy/unspecified.
     std::uint32_t owner_mask{0};
 
-    std::int32_t RawTokensPerPage() const { return rows_per_page * entry_stride_tokens; }
+    std::int32_t RawTokensPerPage() const {
+        // Explicit Flat configs use the canonical block_size validated by
+        // ValidateFlatBlockGeometry(). Legacy/radix configs leave it unset and
+        // retain their historical geometry-derived span.
+        return block_size > 0 ? block_size : rows_per_page * entry_stride_tokens;
+    }
 
     void Validate() const;
 

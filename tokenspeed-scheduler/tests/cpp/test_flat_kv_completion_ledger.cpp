@@ -20,12 +20,10 @@
 
 #include <gtest/gtest.h>
 
-#include <bit>
 #include <cstdint>
-#include <new>
 #include <stdexcept>
 #include <string>
-#include <utility>
+#include <type_traits>
 #include <vector>
 
 #include "scheduler/flat_kv_completion_ledger.h"
@@ -33,420 +31,163 @@
 namespace tokenspeed::test {
 namespace {
 
-void NoopCommit(void*) noexcept {}
-
-template <typename Observer>
-class ObserverCallbacks {
-public:
-    explicit ObserverCallbacks(Observer observer) : observer_{std::move(observer)} {}
-
-    operator FlatKVCompletionCallbacks() {
-        return FlatKVCompletionCallbacks{
-            .context = this,
-            .prepare =
-                [](void* opaque, const FlatKVReadyCompletion& ready) {
-                    static_cast<ObserverCallbacks*>(opaque)->observer_(ready);
-                },
-            .commit = &NoopCommit,
-        };
-    }
-
-private:
-    Observer observer_;
-};
-
-template <typename Observer>
-ObserverCallbacks<Observer> PrepareWith(Observer observer) {
-    return ObserverCallbacks<Observer>{std::move(observer)};
-}
-
-void ThrowBadAlloc(void*, const FlatKVReadyCompletion&) {
-    throw std::bad_alloc{};
-}
-
-FlatKVCompletionCallbacks FailingPrepare() {
-    return FlatKVCompletionCallbacks{.prepare = &ThrowBadAlloc, .commit = &NoopCommit};
-}
-
-std::vector<FlatKVCompletionGroupSchema> Schemas() {
-    return {
-        FlatKVCompletionGroupSchema{
-            .group_id = "history",
-            .required_domain_mask = 0b0011,
-            .entry_stride_tokens = 1,
-        },
-        FlatKVCompletionGroupSchema{
-            .group_id = "state",
-            .required_domain_mask = 0b0101,
-            .entry_stride_tokens = 1,
-        },
-    };
-}
+static_assert(std::is_same_v<decltype(FlatKVReadyCompletion::request_id), const std::string&>);
+static_assert(std::is_same_v<decltype(FlatKVReadyCompletion::tokens), std::span<const std::int32_t>>);
 
 forward::FlatKVCompletion Complete(const FlatKVCompletionInput& input, std::int32_t accepted_raw_end) {
-    std::vector<forward::FlatKVGroupCompletion> groups;
-    groups.reserve(Schemas().size());
-    for (const FlatKVCompletionGroupSchema& group : Schemas()) {
-        groups.push_back(forward::FlatKVGroupCompletion{
-            .group_id = group.group_id,
-            .completed_domain_mask = group.required_domain_mask,
-            .domain_valid_ends =
-                std::vector<std::int32_t>(std::popcount(group.required_domain_mask), input.dispatch_raw_end),
-        });
-    }
     return forward::FlatKVCompletion{
-        .request_id = input.request_id,
         .table_generation = input.table_generation,
         .dispatch_seq = input.dispatch_seq,
         .accepted_raw_end = accepted_raw_end,
-        .protected_raw_end = input.protected_raw_end,
-        .groups = std::move(groups),
     };
 }
 
-forward::FlatKVCompletion CompleteOneGroup(const FlatKVCompletionInput& input, std::int32_t accepted_raw_end,
-                                           std::uint32_t completed_domain_mask,
-                                           std::vector<std::int32_t> domain_valid_ends) {
-    return forward::FlatKVCompletion{
-        .request_id = input.request_id,
-        .table_generation = input.table_generation,
-        .dispatch_seq = input.dispatch_seq,
-        .accepted_raw_end = accepted_raw_end,
-        .protected_raw_end = input.protected_raw_end,
-        .groups = {forward::FlatKVGroupCompletion{
-            .group_id = "compressed",
-            .completed_domain_mask = completed_domain_mask,
-            .domain_valid_ends = std::move(domain_valid_ends),
-        }},
+FlatKVCompletionInput Dispatch(FlatKVCompletionLedger& ledger, FlatKVCompletionState& state, std::int32_t raw_start,
+                               std::int32_t raw_end, bool apply_fsm_result = true) {
+    return ledger.RecordDispatch(state, FlatKVDispatchSpec{
+                                            .dispatch_raw_start = raw_start,
+                                            .dispatch_raw_end = raw_end,
+                                            .protected_raw_end = raw_end + 8,
+                                            .apply_fsm_result = apply_fsm_result,
+                                        });
+}
+
+std::size_t CommitPrepared(FlatKVCompletionLedger& ledger, FlatKVCompletionState& state,
+                           const FlatKVCompletionPrepareResult& prepared) {
+    EXPECT_NE(prepared.disposition, FlatKVCompletionDisposition::kStale);
+    EXPECT_TRUE(prepared.ticket.has_value());
+    return ledger.Commit(state, *prepared.ticket);
+}
+
+TEST(FlatKVCompletionLedgerTest, ValidatesFixedDepthAndGroupStrides) {
+    EXPECT_THROW((FlatKVCompletionLedger{0, {1}}), std::invalid_argument);
+    EXPECT_THROW((FlatKVCompletionLedger{3, {1}}), std::invalid_argument);
+    EXPECT_THROW((FlatKVCompletionLedger{1, {}}), std::invalid_argument);
+    EXPECT_THROW((FlatKVCompletionLedger{1, {0}}), std::invalid_argument);
+}
+
+TEST(FlatKVCompletionLedgerTest, PrepareDerivesStaticGroupBoundariesWithoutRetiringFront) {
+    struct Case {
+        std::int32_t accepted;
+        std::vector<std::int32_t> expected;
     };
-}
+    for (const Case& test :
+         std::vector<Case>{{0, {0, 0, 0}}, {7, {7, 4, 0}}, {128, {128, 128, 128}}, {585, {585, 584, 512}}}) {
+        FlatKVCompletionLedger ledger(/*max_outstanding_per_request=*/1, {1, 4, 128});
+        FlatKVCompletionState state;
+        const FlatKVCompletionInput input = Dispatch(ledger, state, 0, 585);
 
-FlatKVCompletionInput Dispatch(FlatKVCompletionLedger& ledger, std::int32_t raw_start, std::int32_t raw_end,
-                               bool legacy_result_expected = true) {
-    return ledger.RecordDispatch(FlatKVDispatchSpec{
-        .request_id = "r",
-        .dispatch_raw_start = raw_start,
-        .dispatch_raw_end = raw_end,
-        .protected_raw_end = raw_end + 4,
-        .legacy_result_expected = legacy_result_expected,
-    });
-}
+        const FlatKVCompletionPrepareResult prepared = ledger.Prepare(state, "r", Complete(input, test.accepted), {});
 
-TEST(FlatKVCompletionLedgerTest, UnpublishedPlanBatchRollsBackEveryDispatch) {
-    FlatKVCompletionLedger ledger(/*max_buffered_results=*/2, Schemas());
-
-    try {
-        FlatKVDispatchBatch batch(ledger, /*max_dispatches=*/2);
-        const FlatKVCompletionInput first = batch.Record(FlatKVDispatchSpec{
-            .request_id = "r",
-            .dispatch_raw_start = 8,
-            .dispatch_raw_end = 12,
-            .protected_raw_end = 16,
-            .legacy_result_expected = true,
-        });
-        const FlatKVCompletionInput second = batch.Record(FlatKVDispatchSpec{
-            .request_id = "r",
-            .dispatch_raw_start = 12,
-            .dispatch_raw_end = 16,
-            .protected_raw_end = 20,
-            .legacy_result_expected = true,
-        });
-        EXPECT_EQ(first.dispatch_seq, 0u);
-        EXPECT_EQ(second.dispatch_seq, 1u);
-        EXPECT_EQ(ledger.OutstandingCount("r"), 2u);
-        throw std::bad_alloc{};  // stand-in for a later plan/export allocation
-    } catch (const std::bad_alloc&) {
+        ASSERT_EQ(prepared.disposition, FlatKVCompletionDisposition::kApplied);
+        ASSERT_TRUE(prepared.ready.has_value());
+        EXPECT_EQ(
+            (std::vector<std::int32_t>{prepared.ready->ready_raw_ends.begin(), prepared.ready->ready_raw_ends.end()}),
+            test.expected);
+        EXPECT_EQ(prepared.ready->accepted_raw_end, test.accepted);
+        EXPECT_EQ(state.Snapshot().outstanding_count, 1u) << "Prepare must not cross the FIFO progress boundary";
+        EXPECT_EQ(CommitPrepared(ledger, state, prepared), 0u);
     }
-
-    EXPECT_EQ(ledger.OutstandingCount("r"), 0u);
-    EXPECT_FALSE(ledger.HasOutstanding("r"));
-    const FlatKVCompletionInput recovered = Dispatch(ledger, /*raw_start=*/20, /*raw_end=*/24);
-    EXPECT_EQ(recovered.dispatch_seq, 0u);
-    EXPECT_EQ(recovered.dispatch_raw_start, 20);
 }
 
-TEST(FlatKVCompletionLedgerTest, AppliesInOrderAndClampsRequiredDomainMinimumToAcceptedEnd) {
-    FlatKVCompletionLedger ledger(/*max_buffered_results=*/2, Schemas());
-    const FlatKVCompletionInput input = Dispatch(ledger, /*raw_start=*/4, /*raw_end=*/8);
-    std::vector<FlatKVReadyCompletion> applied;
+TEST(FlatKVCompletionLedgerTest, RejectsOutOfOrderAndRetiresStrictFifo) {
+    FlatKVCompletionLedger ledger(/*max_outstanding_per_request=*/2, {1});
+    FlatKVCompletionState state;
+    const FlatKVCompletionInput first = Dispatch(ledger, state, 0, 4);
+    const FlatKVCompletionInput second = Dispatch(ledger, state, 4, 8);
 
-    auto completion = Complete(input, /*accepted_raw_end=*/6);
-    completion.groups.at(1).domain_valid_ends = {7, 5};
-    const FlatKVCompletionSubmitResult result =
-        ledger.Submit(std::move(completion), /*tokens=*/{10, 11},
-                      PrepareWith([&](const FlatKVReadyCompletion& ready) { applied.push_back(ready); }));
-
-    EXPECT_EQ(result.disposition, FlatKVCompletionDisposition::kApplied);
-    EXPECT_EQ(result.applied_count, 1u);
-    ASSERT_EQ(applied.size(), 1u);
-    EXPECT_EQ(applied.front().tokens, (std::vector<std::int32_t>{10, 11}));
-    EXPECT_EQ(applied.front().ready_raw_ends, (std::vector<std::int32_t>{6, 5}));
-    EXPECT_FALSE(ledger.HasOutstanding("r"));
+    EXPECT_THROW(ledger.Prepare(state, "r", Complete(second, 8), {}), std::invalid_argument);
+    EXPECT_EQ(state.Snapshot().outstanding_count, 2u);
+    const auto first_prepared = ledger.Prepare(state, "r", Complete(first, 4), {10});
+    ASSERT_TRUE(first_prepared.ready.has_value());
+    EXPECT_EQ(first_prepared.ready->dispatch_seq, first.dispatch_seq);
+    EXPECT_EQ(CommitPrepared(ledger, state, first_prepared), 1u);
+    const auto second_prepared = ledger.Prepare(state, "r", Complete(second, 8), {11});
+    ASSERT_TRUE(second_prepared.ready.has_value());
+    EXPECT_EQ(second_prepared.ready->dispatch_seq, second.dispatch_seq);
+    EXPECT_EQ(CommitPrepared(ledger, state, second_prepared), 0u);
 }
 
-TEST(FlatKVCompletionLedgerTest, AcceptsCompressedEndBeforeDispatchAndDraftEndBeyondDispatchWithinProtection) {
-    FlatKVCompletionLedger ledger(
-        /*max_buffered_results=*/2,
-        {FlatKVCompletionGroupSchema{"compressed", /*required_domain_mask=*/0b0011, /*entry_stride_tokens=*/4}});
-    const FlatKVCompletionInput input = ledger.RecordDispatch(FlatKVDispatchSpec{
-        .request_id = "r",
-        .dispatch_raw_start = 8,
-        .dispatch_raw_end = 12,
-        .protected_raw_end = 16,
-        .legacy_result_expected = true,
-    });
-    std::vector<FlatKVReadyCompletion> applied;
+TEST(FlatKVCompletionLedgerTest, RejectsStaleGenerationAndRetiredSequenceWithoutMutation) {
+    FlatKVCompletionLedger ledger(/*max_outstanding_per_request=*/1, {1});
+    FlatKVCompletionState retired_state;
+    const FlatKVCompletionInput stale_generation = Dispatch(ledger, retired_state, 0, 4);
+    FlatKVCompletionState current_state;
+    const FlatKVCompletionInput current = Dispatch(ledger, current_state, 0, 4);
+    ASSERT_NE(stale_generation.table_generation, current.table_generation);
 
-    const auto result =
-        ledger.Submit(CompleteOneGroup(input, /*accepted_raw_end=*/12, 0b0011, {4, 16}), {},
-                      PrepareWith([&](const FlatKVReadyCompletion& ready) { applied.push_back(ready); }));
-
-    EXPECT_EQ(result.disposition, FlatKVCompletionDisposition::kApplied);
-    ASSERT_EQ(applied.size(), 1u);
-    EXPECT_EQ(applied.front().ready_raw_ends, (std::vector<std::int32_t>{8}));
+    EXPECT_EQ(ledger.Prepare(current_state, "r", Complete(stale_generation, 4), {}).disposition,
+              FlatKVCompletionDisposition::kStale);
+    EXPECT_EQ(current_state.Snapshot().outstanding_count, 1u);
+    const auto prepared = ledger.Prepare(current_state, "r", Complete(current, 4), {});
+    CommitPrepared(ledger, current_state, prepared);
+    EXPECT_EQ(ledger.Prepare(current_state, "r", Complete(current, 4), {}).disposition,
+              FlatKVCompletionDisposition::kStale);
 }
 
-TEST(FlatKVCompletionLedgerTest, MergesProducerDomainsAcrossOrderedCompletionsBeforeTakingRequiredMinimum) {
-    FlatKVCompletionLedger ledger(
-        /*max_buffered_results=*/2,
-        {FlatKVCompletionGroupSchema{"compressed", /*required_domain_mask=*/0b0011, /*entry_stride_tokens=*/1}});
-    const FlatKVCompletionInput first = ledger.RecordDispatch(FlatKVDispatchSpec{
-        .request_id = "r",
-        .dispatch_raw_start = 0,
-        .dispatch_raw_end = 8,
-        .protected_raw_end = 16,
-        .legacy_result_expected = true,
-    });
-    const FlatKVCompletionInput second = ledger.RecordDispatch(FlatKVDispatchSpec{
-        .request_id = "r",
-        .dispatch_raw_start = 8,
-        .dispatch_raw_end = 12,
-        .protected_raw_end = 16,
-        .legacy_result_expected = true,
-    });
-    std::vector<std::int32_t> ready_ends;
-    auto collect = [&](const FlatKVReadyCompletion& ready) { ready_ends.push_back(ready.ready_raw_ends.front()); };
+TEST(FlatKVCompletionLedgerTest, ShortAcceptanceQuarantinesSuccessorUntilItsFence) {
+    FlatKVCompletionLedger ledger(/*max_outstanding_per_request=*/2, {1, 4});
+    FlatKVCompletionState state;
+    const FlatKVCompletionInput first = Dispatch(ledger, state, 0, 4);
+    const FlatKVCompletionInput successor = Dispatch(ledger, state, 4, 8);
 
-    ledger.Submit(CompleteOneGroup(first, /*accepted_raw_end=*/8, 0b0011, {8, 4}), {}, PrepareWith(collect));
-    ledger.Submit(CompleteOneGroup(second, /*accepted_raw_end=*/12, 0b0011, {6, 12}), {}, PrepareWith(collect));
+    const auto short_prepared = ledger.Prepare(state, "r", Complete(first, 2), {10, 11});
+    EXPECT_FALSE(state.Snapshot().has_canceled_outstanding);
+    EXPECT_EQ(short_prepared.disposition, FlatKVCompletionDisposition::kApplied);
+    EXPECT_EQ(CommitPrepared(ledger, state, short_prepared), 1u);
+    const FlatKVCompletionRequestSnapshot quarantined = state.Snapshot();
+    EXPECT_TRUE(quarantined.has_canceled_outstanding);
+    ASSERT_TRUE(quarantined.last_dispatch_raw_end.has_value());
+    EXPECT_EQ(*quarantined.last_dispatch_raw_end, successor.dispatch_raw_end);
+    EXPECT_THROW(Dispatch(ledger, state, 2, 6), std::logic_error);
 
-    EXPECT_EQ(ready_ends, (std::vector<std::int32_t>{4, 8}));
+    const auto canceled = ledger.Prepare(state, "r", Complete(successor, 8), {20, 21, 22, 23});
+    EXPECT_EQ(canceled.disposition, FlatKVCompletionDisposition::kCanceled);
+    EXPECT_FALSE(canceled.ready.has_value());
+    EXPECT_EQ(CommitPrepared(ledger, state, canceled), 0u);
+    EXPECT_EQ(Dispatch(ledger, state, 2, 6).dispatch_seq, successor.dispatch_seq + 1);
 }
 
-TEST(FlatKVCompletionLedgerTest, ShortAcceptanceClampsStrideProgressAndKeepsReadyBoundaryMonotonic) {
-    FlatKVCompletionLedger ledger(
-        /*max_buffered_results=*/2,
-        {FlatKVCompletionGroupSchema{"compressed", /*required_domain_mask=*/0b0001, /*entry_stride_tokens=*/4}});
-    const FlatKVCompletionInput first = ledger.RecordDispatch(FlatKVDispatchSpec{
-        .request_id = "r",
-        .dispatch_raw_start = 0,
-        .dispatch_raw_end = 12,
-        .protected_raw_end = 16,
-        .legacy_result_expected = true,
-    });
-    std::vector<std::int32_t> ready_ends;
-    auto collect = [&](const FlatKVReadyCompletion& ready) { ready_ends.push_back(ready.ready_raw_ends.front()); };
-    ledger.Submit(CompleteOneGroup(first, /*accepted_raw_end=*/10, 0b0001, {16}), {}, PrepareWith(collect));
+TEST(FlatKVCompletionLedgerTest, TerminalCancellationRetainsEveryExecutionFence) {
+    FlatKVCompletionLedger ledger(/*max_outstanding_per_request=*/2, {1});
+    FlatKVCompletionState state;
+    const FlatKVCompletionInput first = Dispatch(ledger, state, 0, 4);
+    const FlatKVCompletionInput second = Dispatch(ledger, state, 4, 8);
 
-    const FlatKVCompletionInput recovered = ledger.RecordDispatch(FlatKVDispatchSpec{
-        .request_id = "r",
-        .dispatch_raw_start = 10,
-        .dispatch_raw_end = 14,
-        .protected_raw_end = 18,
-        .legacy_result_expected = true,
-    });
-    ledger.Submit(CompleteOneGroup(recovered, /*accepted_raw_end=*/14, 0b0001, {8}), {}, PrepareWith(collect));
-
-    EXPECT_EQ(ready_ends, (std::vector<std::int32_t>{8, 8}));
+    EXPECT_EQ(state.CancelOutstanding(), 2u);
+    EXPECT_EQ(state.CancelOutstanding(), 0u);
+    EXPECT_EQ(state.Snapshot().outstanding_count, 2u);
+    const auto first_canceled = ledger.Prepare(state, "r", Complete(first, 4), {10});
+    EXPECT_EQ(first_canceled.disposition, FlatKVCompletionDisposition::kCanceled);
+    EXPECT_EQ(CommitPrepared(ledger, state, first_canceled), 1u);
+    const auto second_canceled = ledger.Prepare(state, "r", Complete(second, 8), {11});
+    EXPECT_EQ(second_canceled.disposition, FlatKVCompletionDisposition::kCanceled);
+    EXPECT_EQ(CommitPrepared(ledger, state, second_canceled), 0u);
 }
 
-TEST(FlatKVCompletionLedgerTest, BuffersOutOfOrderAndAppliesContiguousSequence) {
-    FlatKVCompletionLedger ledger(/*max_buffered_results=*/2, Schemas());
-    const FlatKVCompletionInput first = Dispatch(ledger, 0, 4);
-    const FlatKVCompletionInput second = Dispatch(ledger, 4, 8);
-    std::vector<std::uint64_t> order;
-    auto apply = [&](const FlatKVReadyCompletion& ready) { order.push_back(ready.input.dispatch_seq); };
-
-    const auto buffered = ledger.Submit(Complete(second, 8), {}, PrepareWith(apply));
-    EXPECT_EQ(buffered.disposition, FlatKVCompletionDisposition::kBuffered);
-    EXPECT_TRUE(order.empty());
-    EXPECT_EQ(ledger.BufferedResultCount("r"), 1u);
-
-    const auto drained = ledger.Submit(Complete(first, 4), {}, PrepareWith(apply));
-    EXPECT_EQ(drained.disposition, FlatKVCompletionDisposition::kApplied);
-    EXPECT_EQ(drained.applied_count, 2u);
-    EXPECT_EQ(order, (std::vector<std::uint64_t>{first.dispatch_seq, second.dispatch_seq}));
-    EXPECT_EQ(ledger.BufferedResultCount("r"), 0u);
-}
-
-TEST(FlatKVCompletionLedgerTest, IgnoresAndCountsCrossGenerationLateResult) {
-    FlatKVCompletionLedger ledger(/*max_buffered_results=*/2, Schemas());
-    const FlatKVCompletionInput stale = Dispatch(ledger, 0, 4);
-    EXPECT_EQ(ledger.Invalidate("r"), 1u);
-    const FlatKVCompletionInput current = Dispatch(ledger, 0, 4);
-    ASSERT_NE(stale.table_generation, current.table_generation);
-    std::size_t applies = 0;
-
-    const auto result =
-        ledger.Submit(Complete(stale, 4), {}, PrepareWith([&](const FlatKVReadyCompletion&) { ++applies; }));
-
-    EXPECT_EQ(result.disposition, FlatKVCompletionDisposition::kStaleGeneration);
-    EXPECT_EQ(applies, 0u);
-    EXPECT_EQ(ledger.Stats().stale_generation_results, 1u);
-    EXPECT_TRUE(ledger.HasOutstanding("r"));
-}
-
-TEST(FlatKVCompletionLedgerTest, ShortAcceptanceInvalidatesEveryDispatchedSuccessor) {
-    FlatKVCompletionLedger ledger(/*max_buffered_results=*/2, Schemas());
-    const FlatKVCompletionInput first = Dispatch(ledger, 0, 4);
-    const FlatKVCompletionInput second = Dispatch(ledger, 4, 8);
-    std::vector<std::uint64_t> order;
-    std::vector<std::int32_t> history_ready_ends;
-    auto apply = [&](const FlatKVReadyCompletion& ready) {
-        order.push_back(ready.input.dispatch_seq);
-        history_ready_ends.push_back(ready.ready_raw_ends.front());
+TEST(FlatKVCompletionLedgerTest, RejectsInvalidCompletionPayloadBeforeCommit) {
+    struct Case {
+        const char* name;
+        std::int32_t accepted;
+        std::vector<std::int32_t> tokens;
+        bool canceled;
     };
-    EXPECT_EQ(ledger.Submit(Complete(second, 8), {}, PrepareWith(apply)).disposition,
-              FlatKVCompletionDisposition::kBuffered);
-
-    const auto rejected = ledger.Submit(Complete(first, 2), {}, PrepareWith(apply));
-
-    EXPECT_EQ(rejected.applied_count, 1u);
-    EXPECT_EQ(rejected.invalidated_dispatches, 1u);
-    EXPECT_EQ(order, (std::vector<std::uint64_t>{first.dispatch_seq}));
-    EXPECT_FALSE(ledger.HasOutstanding("r"));
-    const FlatKVCompletionInput recovered = Dispatch(ledger, 2, 6);
-    EXPECT_GT(recovered.dispatch_seq, second.dispatch_seq);
-    auto recovered_completion = Complete(recovered, /*accepted_raw_end=*/3);
-    recovered_completion.groups.at(0).domain_valid_ends = {3, 3};
-    recovered_completion.groups.at(1).domain_valid_ends = {3, 3};
-    ledger.Submit(std::move(recovered_completion), {}, PrepareWith(apply));
-    EXPECT_EQ(history_ready_ends, (std::vector<std::int32_t>{2, 3}));
-}
-
-TEST(FlatKVCompletionLedgerTest, UnfencedCanceledSuccessorBlocksRedispatchUntilItsCompletionRetires) {
-    FlatKVCompletionLedger ledger(/*max_buffered_results=*/2, Schemas());
-    const FlatKVCompletionInput first = Dispatch(ledger, 0, 4);
-    const FlatKVCompletionInput successor = Dispatch(ledger, 4, 8);
-    std::vector<std::uint64_t> applied;
-    auto apply = [&](const FlatKVReadyCompletion& ready) { applied.push_back(ready.input.dispatch_seq); };
-
-    const auto rejected = ledger.Submit(Complete(first, 2), {}, PrepareWith(apply));
-    EXPECT_EQ(rejected.invalidated_dispatches, 1u);
-    EXPECT_EQ(rejected.retired_canceled_dispatches, 0u);
-    EXPECT_TRUE(ledger.HasCanceledOutstanding("r"));
-    EXPECT_EQ(ledger.OutstandingCount("r"), 1u);
-    EXPECT_THROW(Dispatch(ledger, 2, 6), std::logic_error);
-
-    const auto retired = ledger.Submit(Complete(successor, 8), {99}, PrepareWith(apply));
-    EXPECT_EQ(retired.disposition, FlatKVCompletionDisposition::kCanceled);
-    EXPECT_EQ(retired.retired_canceled_dispatches, 1u);
-    EXPECT_EQ(applied, (std::vector<std::uint64_t>{first.dispatch_seq}));
-    EXPECT_FALSE(ledger.HasCanceledOutstanding("r"));
-    EXPECT_FALSE(ledger.HasOutstanding("r"));
-    const FlatKVCompletionInput recovered = Dispatch(ledger, 2, 6);
-    EXPECT_EQ(recovered.dispatch_seq, successor.dispatch_seq + 1);
-}
-
-TEST(FlatKVCompletionLedgerTest, TerminalCancellationRetainsEveryDispatchUntilItsFenceArrives) {
-    FlatKVCompletionLedger ledger(/*max_buffered_results=*/2, Schemas());
-    const FlatKVCompletionInput first = Dispatch(ledger, 0, 4);
-    const FlatKVCompletionInput second = Dispatch(ledger, 4, 8);
-    std::size_t applies = 0;
-    auto apply = [&](const FlatKVReadyCompletion&) { ++applies; };
-
-    EXPECT_EQ(ledger.CancelOutstanding("r"), 2u);
-    EXPECT_EQ(ledger.CancelOutstanding("r"), 0u);
-    EXPECT_TRUE(ledger.HasCanceledOutstanding("r"));
-    EXPECT_EQ(ledger.OutstandingCount("r"), 2u);
-    EXPECT_THROW(Dispatch(ledger, 0, 4), std::logic_error);
-
-    const auto buffered = ledger.Submit(Complete(second, 8), {99}, PrepareWith(apply));
-    EXPECT_EQ(buffered.disposition, FlatKVCompletionDisposition::kBuffered);
-    EXPECT_EQ(ledger.OutstandingCount("r"), 2u);
-    EXPECT_EQ(applies, 0u);
-
-    const auto retired = ledger.Submit(Complete(first, 4), {98}, PrepareWith(apply));
-    EXPECT_EQ(retired.disposition, FlatKVCompletionDisposition::kCanceled);
-    EXPECT_EQ(retired.retired_canceled_dispatches, 2u);
-    EXPECT_EQ(applies, 0u);
-    EXPECT_FALSE(ledger.HasOutstanding("r"));
-    EXPECT_EQ(ledger.Stats().invalidated_dispatches, 2u);
-    EXPECT_EQ(ledger.Stats().canceled_results, 2u);
-}
-
-enum class InvalidGroupCompletion { kMissingDomain, kExtraDomain, kCardinality, kRange, kStride };
-
-TEST(FlatKVCompletionLedgerTest, RejectsInvalidGroupCompletionMatrix) {
-    for (const InvalidGroupCompletion invalid :
-         {InvalidGroupCompletion::kMissingDomain, InvalidGroupCompletion::kExtraDomain,
-          InvalidGroupCompletion::kCardinality, InvalidGroupCompletion::kRange, InvalidGroupCompletion::kStride}) {
-        SCOPED_TRACE(static_cast<int>(invalid));
-        const bool checks_stride = invalid == InvalidGroupCompletion::kStride;
-        auto schemas = checks_stride ? std::vector<FlatKVCompletionGroupSchema>{FlatKVCompletionGroupSchema{
-                                           "compressed", /*required_domain_mask=*/1, /*entry_stride_tokens=*/4}}
-                                     : Schemas();
-        FlatKVCompletionLedger ledger(/*max_buffered_results=*/2, std::move(schemas));
-        const FlatKVCompletionInput input = Dispatch(ledger, 0, 4);
-        auto completion = checks_stride ? CompleteOneGroup(input, 4, 1, {3}) : Complete(input, 4);
-        switch (invalid) {
-            case InvalidGroupCompletion::kMissingDomain:
-                completion.groups.at(0).completed_domain_mask = 0b0001;
-                completion.groups.at(0).domain_valid_ends = {4};
-                break;
-            case InvalidGroupCompletion::kExtraDomain:
-                completion.groups.at(0).completed_domain_mask = 0b0111;
-                completion.groups.at(0).domain_valid_ends = {4, 4, 4};
-                break;
-            case InvalidGroupCompletion::kCardinality:
-                completion.groups.at(0).domain_valid_ends.pop_back();
-                break;
-            case InvalidGroupCompletion::kRange:
-                completion.groups.at(1).domain_valid_ends.at(1) = 9;
-                break;
-            case InvalidGroupCompletion::kStride:
-                break;
+    const Case cases[] = {
+        {"active before dispatch", 7, {}, false},       {"active after dispatch", 13, {}, false},
+        {"canceled before dispatch", 7, {}, true},      {"canceled after dispatch", 13, {}, true},
+        {"mid-prefill result tokens", 12, {99}, false},
+    };
+    for (const Case& test : cases) {
+        SCOPED_TRACE(test.name);
+        FlatKVCompletionLedger ledger(/*max_outstanding_per_request=*/1, {1});
+        FlatKVCompletionState state;
+        const FlatKVCompletionInput input = Dispatch(ledger, state, 8, 12, /*apply_fsm_result=*/false);
+        if (test.canceled) {
+            ASSERT_EQ(state.CancelOutstanding(), 1u);
         }
-        EXPECT_THROW(ledger.Submit(std::move(completion), {}, PrepareWith([](const FlatKVReadyCompletion&) {})),
-                     std::invalid_argument);
-        EXPECT_TRUE(ledger.HasOutstanding("r"));
+        EXPECT_THROW(ledger.Prepare(state, "r", Complete(input, test.accepted), test.tokens), std::invalid_argument);
+        EXPECT_EQ(state.Snapshot().outstanding_count, 1u);
     }
-}
-
-TEST(FlatKVCompletionLedgerTest, ThrowingPrepareKeepsCurrentAndBufferedSuccessorRetryable) {
-    FlatKVCompletionLedger ledger(
-        /*max_buffered_results=*/2,
-        {FlatKVCompletionGroupSchema{"compressed", /*required_domain_mask=*/0b0011, /*entry_stride_tokens=*/1}});
-    const FlatKVCompletionInput first = ledger.RecordDispatch(FlatKVDispatchSpec{
-        .request_id = "r",
-        .dispatch_raw_start = 0,
-        .dispatch_raw_end = 8,
-        .protected_raw_end = 16,
-        .legacy_result_expected = true,
-    });
-    const FlatKVCompletionInput second = ledger.RecordDispatch(FlatKVDispatchSpec{
-        .request_id = "r",
-        .dispatch_raw_start = 8,
-        .dispatch_raw_end = 12,
-        .protected_raw_end = 16,
-        .legacy_result_expected = true,
-    });
-    const forward::FlatKVCompletion first_completion = CompleteOneGroup(first, /*accepted_raw_end=*/8, 0b0011, {8, 4});
-    ledger.Submit(CompleteOneGroup(second, /*accepted_raw_end=*/12, 0b0011, {6, 12}), {},
-                  PrepareWith([](const FlatKVReadyCompletion&) {}));
-
-    EXPECT_THROW(ledger.Submit(first_completion, {}, FailingPrepare()), std::bad_alloc);
-    EXPECT_EQ(ledger.OutstandingCount("r"), 2u);
-    EXPECT_EQ(ledger.BufferedResultCount("r"), 1u);
-    EXPECT_EQ(ledger.Stats().applied_results, 0u);
-
-    std::vector<std::int32_t> ready_ends;
-    const auto retried = ledger.Submit(first_completion, {}, PrepareWith([&](const FlatKVReadyCompletion& ready) {
-                                           ready_ends.push_back(ready.ready_raw_ends.front());
-                                       }));
-    EXPECT_EQ(retried.applied_count, 2u);
-    EXPECT_EQ(ready_ends, (std::vector<std::int32_t>{4, 8}));
-    EXPECT_FALSE(ledger.HasOutstanding("r"));
 }
 
 }  // namespace

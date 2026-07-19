@@ -23,12 +23,9 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
-#include <exception>
 #include <optional>
+#include <span>
 #include <string>
-#include <unordered_map>
-#include <utility>
 #include <vector>
 
 #include "scheduler/operations/forward.h"
@@ -36,194 +33,142 @@
 
 namespace tokenspeed {
 
-struct FlatKVCompletionGroupSchema {
-    std::string group_id;
-    std::uint32_t required_domain_mask{};
-    std::int32_t entry_stride_tokens{1};
-};
-
 struct FlatKVDispatchSpec {
-    std::string request_id;
     std::int32_t dispatch_raw_start{};
     std::int32_t dispatch_raw_end{};
     std::int32_t protected_raw_end{};
-    bool legacy_result_expected{};
+    bool apply_fsm_result{};
 };
 
-// Validated, ordered result passed to the scheduler's ready-only publisher
-// callback before its token/FSM mutation is applied.
+// One fence-ready dispatch. Every reference/view is borrowed until the next
+// Prepare call and must be consumed synchronously by the scheduler.
 struct FlatKVReadyCompletion {
-    FlatKVCompletionInput input;
-    forward::FlatKVCompletion completion;
-    std::vector<std::int32_t> tokens;
-    // Monotonic group publication boundaries: persistent required-domain
-    // minima, clamped to the stride-aligned accepted end.
-    std::vector<std::int32_t> ready_raw_ends;
+    const std::string& request_id;
+    std::uint64_t table_generation{};
+    std::uint64_t dispatch_seq{};
+    std::int32_t dispatch_raw_start{};
+    std::int32_t dispatch_raw_end{};
+    std::int32_t accepted_raw_end{};
+    std::span<const std::int32_t> tokens;
+    std::span<const std::int32_t> ready_raw_ends;
     bool apply_fsm_result{};
 };
 
 enum class FlatKVCompletionDisposition : std::uint8_t {
     kApplied,
-    kBuffered,
     kCanceled,
-    kStaleGeneration,
+    kStale,
 };
 
-struct FlatKVCompletionSubmitResult {
-    FlatKVCompletionDisposition disposition{FlatKVCompletionDisposition::kBuffered};
-    std::size_t applied_count{};
-    std::size_t invalidated_dispatches{};
-    // Canceled successors whose execution fences have now arrived. Their
-    // result tokens/progress were deliberately not applied.
-    std::size_t retired_canceled_dispatches{};
+struct FlatKVCompletionRequestSnapshot {
+    std::size_t outstanding_count{};
+    bool has_canceled_outstanding{};
+    std::optional<std::int32_t> last_dispatch_raw_end;
 };
 
-// Allocation-free callbacks into one caller-owned prepared transaction slot.
-// `prepare` is the last fallible step and populates that slot; `commit` crosses
-// the ledger progress boundary and is therefore an explicitly noexcept
-// function pointer. Keeping both in one value prevents returning a dangling
-// action to stack-local preparation state.
-struct FlatKVCompletionCallbacks {
-    void* context{};
-    void (*prepare)(void*, const FlatKVReadyCompletion&){};
-    void (*commit)(void*) noexcept{};
-
-    explicit operator bool() const noexcept { return prepare != nullptr && commit != nullptr; }
-};
-
-class FlatKVCompletionLedger;
-
-// A scheduler-plan transaction for newly recorded dispatches.  The caller
-// reserves the maximum batch size before the first ledger mutation, records
-// each row through this object, and commits only after the complete execution
-// plan has been materialized.  Stack unwinding rolls the rows back in reverse
-// order without allocating, so a failed table export or plan publication
-// cannot leave completion debt for device work that was never dispatched.
-class FlatKVDispatchBatch {
+// The FIFO itself belongs to Request. The ledger owns only immutable schema
+// and reusable completion-boundary scratch.
+class FlatKVCompletionState {
 public:
-    FlatKVDispatchBatch(FlatKVCompletionLedger& ledger, std::size_t max_dispatches);
-    ~FlatKVDispatchBatch() noexcept;
+    static constexpr std::size_t kMaxDispatches = 2;
 
-    FlatKVDispatchBatch(const FlatKVDispatchBatch&) = delete;
-    FlatKVDispatchBatch& operator=(const FlatKVDispatchBatch&) = delete;
-    FlatKVDispatchBatch(FlatKVDispatchBatch&&) = delete;
-    FlatKVDispatchBatch& operator=(FlatKVDispatchBatch&&) = delete;
+    FlatKVCompletionState();
+    FlatKVCompletionState(const FlatKVCompletionState&) = delete;
+    FlatKVCompletionState& operator=(const FlatKVCompletionState&) = delete;
+    FlatKVCompletionState(FlatKVCompletionState&&) = delete;
+    FlatKVCompletionState& operator=(FlatKVCompletionState&&) = delete;
 
-    FlatKVCompletionInput Record(FlatKVDispatchSpec spec);
-    void Commit() noexcept { committed_ = true; }
+    bool HasOutstanding() const noexcept { return size_ != 0; }
+    FlatKVCompletionRequestSnapshot Snapshot() const noexcept;
+
+    // Logical cancellation does not retire physical work. Every row stays in
+    // the FIFO until its executor fence arrives.
+    std::size_t CancelOutstanding() noexcept;
 
 private:
-    struct RollbackHandle {
-        const std::string* request_id{};
-        std::uint64_t table_generation{};
+    struct DispatchRecord {
         std::uint64_t dispatch_seq{};
+        std::int32_t dispatch_raw_start{};
+        std::int32_t dispatch_raw_end{};
+        bool apply_fsm_result{};
+        bool canceled{};
     };
 
-    FlatKVCompletionLedger* ledger_{};
-    std::vector<RollbackHandle> handles_;
-    std::size_t handle_count_{};
-    bool committed_{};
+    static std::uint64_t AllocateGeneration();
+    DispatchRecord& Front() noexcept { return *dispatches_[head_]; }
+    const DispatchRecord& Front() const noexcept { return *dispatches_[head_]; }
+    DispatchRecord& Back() noexcept { return *dispatches_[(head_ + size_ - 1) % kMaxDispatches]; }
+    const DispatchRecord& Back() const noexcept { return *dispatches_[(head_ + size_ - 1) % kMaxDispatches]; }
+    DispatchRecord& At(std::size_t offset) noexcept { return *dispatches_[(head_ + offset) % kMaxDispatches]; }
+    const DispatchRecord& At(std::size_t offset) const noexcept {
+        return *dispatches_[(head_ + offset) % kMaxDispatches];
+    }
+    void PushBack(DispatchRecord record) noexcept;
+    void PopFront() noexcept;
+
+    std::uint64_t table_generation_{};
+    std::uint64_t next_dispatch_seq_{};
+    std::uint64_t next_retire_seq_{};
+    std::array<std::optional<DispatchRecord>, kMaxDispatches> dispatches_;
+    std::size_t head_{};
+    std::size_t size_{};
 
     friend class FlatKVCompletionLedger;
 };
 
-struct FlatKVCompletionLedgerStats {
-    std::uint64_t applied_results{};
-    std::uint64_t buffered_results{};
-    std::uint64_t stale_generation_results{};
-    std::uint64_t duplicate_results{};
-    std::uint64_t invalid_results{};
-    std::uint64_t buffer_overflows{};
-    std::uint64_t invalidated_dispatches{};
-    std::uint64_t canceled_results{};
-    std::uint64_t legacy_results{};
+// An opaque proof that Prepare validated the current FIFO front. Scheduler
+// publication is prepared fallibly between Prepare and Commit; Commit then
+// retires exactly this sequence without throwing.
+struct FlatKVCompletionTicket {
+public:
+    FlatKVCompletionTicket(const FlatKVCompletionTicket&) = default;
+    FlatKVCompletionTicket& operator=(const FlatKVCompletionTicket&) = default;
+    FlatKVCompletionTicket(FlatKVCompletionTicket&&) noexcept = default;
+    FlatKVCompletionTicket& operator=(FlatKVCompletionTicket&&) noexcept = default;
+
+private:
+    FlatKVCompletionTicket(std::uint64_t generation, std::uint64_t sequence, std::int32_t accepted_end,
+                           FlatKVCompletionDisposition completion_disposition) noexcept
+        : table_generation{generation},
+          dispatch_seq{sequence},
+          accepted_raw_end{accepted_end},
+          disposition{completion_disposition} {}
+
+    std::uint64_t table_generation{};
+    std::uint64_t dispatch_seq{};
+    std::int32_t accepted_raw_end{};
+    FlatKVCompletionDisposition disposition{FlatKVCompletionDisposition::kStale};
+
+    friend class FlatKVCompletionLedger;
+};
+
+struct FlatKVCompletionPrepareResult {
+    FlatKVCompletionDisposition disposition{FlatKVCompletionDisposition::kStale};
+    std::optional<FlatKVReadyCompletion> ready;
+    std::optional<FlatKVCompletionTicket> ticket;
 };
 
 class FlatKVCompletionLedger {
 public:
-    // The prepare callback may validate and allocate, but must not mutate
-    // irreversible scheduler/FSM/cache state. A failed preparation leaves the
-    // ordered result buffered and retryable; its paired callback is the
-    // no-throw commit seam.
-    FlatKVCompletionLedger(std::size_t max_buffered_results, std::vector<FlatKVCompletionGroupSchema> group_schema);
+    FlatKVCompletionLedger(std::size_t max_outstanding_per_request, std::vector<std::int32_t> group_strides);
 
-    FlatKVCompletionInput RecordDispatch(FlatKVDispatchSpec spec);
-    FlatKVCompletionSubmitResult Submit(forward::FlatKVCompletion completion, std::vector<std::int32_t> tokens,
-                                        FlatKVCompletionCallbacks callbacks);
+    FlatKVCompletionInput RecordDispatch(FlatKVCompletionState& state, FlatKVDispatchSpec spec);
 
-    // Legacy ExtendResult has no completion metadata. Retire it and every
-    // preceding mid-prefill dispatch, which historically emitted no event.
-    std::size_t RetireLegacyResult(const std::string& request_id);
-    // Stop applying every outstanding dispatch while preserving each dispatch
-    // until its execution fence arrives. This is the terminal/retract path:
-    // callers must not free or reuse exported block-table pages before the
-    // canceled completions retire.
-    std::size_t CancelOutstanding(const std::string& request_id);
-    std::size_t Invalidate(const std::string& request_id);
-
-    bool HasOutstanding(const std::string& request_id) const;
-    bool HasCanceledOutstanding(const std::string& request_id) const;
-    std::size_t OutstandingCount(const std::string& request_id) const;
-    // Exclusive raw end of the newest still-outstanding dispatch. Overlap
-    // scheduling projects the next logical interval from this boundary while
-    // the request FSM still reflects only completed results.
-    std::optional<std::int32_t> LastOutstandingDispatchRawEnd(const std::string& request_id) const;
-    std::size_t BufferedResultCount(const std::string& request_id) const;
-    std::size_t TotalOutstandingCount() const;
-    // Structured producers owe every dispatch, including first/mid-prefill
-    // work before the first result establishes its response shape.
-    bool HasBlockingOutstanding() const;
-    const FlatKVCompletionLedgerStats& Stats() const { return stats_; }
-    std::size_t MaxBufferedResults() const { return max_buffered_results_; }
+    // Prepare validates but never mutates the request FIFO. Applied results
+    // borrow tokens and the ledger's aligned-boundary scratch until Commit.
+    FlatKVCompletionPrepareResult Prepare(const FlatKVCompletionState& state, const std::string& request_id,
+                                          forward::FlatKVCompletion completion,
+                                          const std::vector<std::int32_t>& tokens);
+    std::size_t Commit(FlatKVCompletionState& state, const FlatKVCompletionTicket& ticket) noexcept;
 
 private:
-    using RollbackHandle = FlatKVDispatchBatch::RollbackHandle;
+    FlatKVReadyCompletion MakeReady(const std::string& request_id, std::uint64_t table_generation,
+                                    const FlatKVCompletionState::DispatchRecord& record,
+                                    const forward::FlatKVCompletion& completion, std::span<const std::int32_t> tokens);
 
-    struct PendingResult {
-        FlatKVReadyCompletion ready;
-        bool counted_as_buffered{};
-        bool preparation_failed{};
-    };
-
-    struct DispatchRecord {
-        FlatKVCompletionInput input;
-        bool legacy_result_expected{};
-        bool canceled{};
-        std::optional<PendingResult> pending;
-    };
-
-    struct GenerationState {
-        std::uint64_t table_generation{};
-        std::uint64_t next_dispatch_seq{};
-        std::uint64_t next_apply_seq{};
-        // Group-aligned absolute producer watermarks. This ledger is their
-        // single owner so out-of-order/canceled results cannot leak progress.
-        std::vector<std::array<std::int32_t, 32>> domain_valid_ends;
-        std::vector<std::int32_t> last_ready_raw_ends;
-        std::deque<DispatchRecord> dispatches;
-        std::size_t buffered_results{};
-        bool saw_structured_completion{};
-    };
-
-    static std::uint64_t AllocateGeneration();
-    std::pair<FlatKVCompletionInput, RollbackHandle> RecordDispatchTracked(FlatKVDispatchSpec spec);
-    void RollbackDispatch(const RollbackHandle& handle) noexcept;
-    FlatKVReadyCompletion ValidateAndMakeReady(const DispatchRecord& record, forward::FlatKVCompletion completion,
-                                               std::vector<std::int32_t> tokens) const;
-    FlatKVCompletionSubmitResult DrainReady(GenerationState& state, FlatKVCompletionCallbacks callbacks);
-    std::size_t RetireCanceledReady(GenerationState& state) noexcept;
-    void ComputeReady(const GenerationState& state, FlatKVReadyCompletion& ready) const noexcept;
-    void CommitProgress(GenerationState& state, const FlatKVReadyCompletion& ready) const noexcept;
-    void ClampProgressToAccepted(GenerationState& state, std::int32_t accepted_raw_end) const noexcept;
-    [[noreturn]] void RejectDuplicate(const std::string& message);
-    [[noreturn]] void RejectInvalid(const std::string& message);
-
-    std::size_t max_buffered_results_;
-    std::vector<FlatKVCompletionGroupSchema> group_schema_;
-    std::unordered_map<std::string, GenerationState> active_;
-    FlatKVCompletionLedgerStats stats_;
-
-    friend class FlatKVDispatchBatch;
+    const std::size_t max_outstanding_per_request_;
+    const std::vector<std::int32_t> group_strides_;
+    std::vector<std::int32_t> ready_raw_ends_scratch_;
 };
 
 }  // namespace tokenspeed

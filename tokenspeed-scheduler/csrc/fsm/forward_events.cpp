@@ -205,7 +205,7 @@ void InsertHybridCache(HybridPrefixCache* hybrid_cache,
 }
 
 #if TOKENSPEED_FLAT_KVCACHE
-// Submitted -> PrefillDone / Prefilling for coordinator-owned structured flat
+// Submitted -> PrefillDone / Prefilling for coordinator-owned explicit flat
 // admission. No fallible cache operation or legacy observer crosses this seam.
 std::variant<PrefillDone, Prefilling> ScheduleFlatPrefillFirstChunkEvent::operator()(Submitted&& state) {
     TokenContainer* token_container = state.GetTokenContainer();
@@ -346,7 +346,7 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillEvent::operator()(Prefillin
     bool acquired = false;
     if (coordinator_->CompletionFencedPublication()) {
         // The previous chunk is not prefix-visible and cannot fund a slide
-        // until its execution-result fence produces a structured completion.
+        // until its execution-result fence reports the accepted end.
         acquired = coordinator_->Acquire(tables, tokens_this_round_);
     } else {
         const std::vector<std::string> hashes = FlatWindowPageHashes(

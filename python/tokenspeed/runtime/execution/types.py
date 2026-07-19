@@ -22,14 +22,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 import torch
 
 if TYPE_CHECKING:
-    from tokenspeed.runtime.execution.flat_kv_progress import FlatKVExecutionEvidence
     from tokenspeed.runtime.grammar.capturable_grammar import (
         GrammarStepCompletion,
     )
@@ -74,12 +73,10 @@ class FlatKVCompletionInput:
     """Schema-free per-request dispatch metadata awaiting the result fence.
 
     This is not a completion: it contains no accepted end and must never be
-    sent to the scheduler.  In particular it contains no producer domain mask
-    and no group watermark to echo.  The active runtime cache plan plus
-    sync-gated execution evidence are the producer-progress authority.
+    sent to the scheduler. The active runtime cache plan plus the execution
+    stream fence remain the cache-write authority.
     """
 
-    request_id: str
     table_generation: int
     dispatch_seq: int
     dispatch_raw_start: int
@@ -87,8 +84,6 @@ class FlatKVCompletionInput:
     protected_raw_end: int
 
     def __post_init__(self) -> None:
-        if type(self.request_id) is not str or not self.request_id:
-            raise ValueError("flat KV completion request_id must be a non-empty str")
         _require_pod_int(
             self.table_generation,
             field_name="table_generation",
@@ -136,7 +131,6 @@ class FlatKVCompletionInput:
                 "flat KV completion dispatch input must not contain group schema"
             )
         return cls(
-            request_id=_pod_field(raw, "request_id"),
             table_generation=_pod_field(raw, "table_generation"),
             dispatch_seq=_pod_field(raw, "dispatch_seq"),
             dispatch_raw_start=_pod_field(raw, "dispatch_raw_start"),
@@ -146,60 +140,20 @@ class FlatKVCompletionInput:
 
 
 @dataclass(frozen=True, slots=True)
-class FlatKVGroupCompletion:
-    """Ready-only packed producer-domain progress for one cache group."""
-
-    group_id: str
-    completed_domain_mask: int
-    domain_valid_ends: tuple[int, ...]
-
-    def __post_init__(self) -> None:
-        if type(self.group_id) is not str or not self.group_id:
-            raise ValueError("flat KV completion group_id must be a non-empty str")
-        mask = _require_pod_int(
-            self.completed_domain_mask,
-            field_name=f"{self.group_id}.completed_domain_mask",
-            maximum=0xFFFFFFFF,
-        )
-        if mask == 0:
-            raise ValueError("flat KV completed_domain_mask must be non-zero")
-        if type(self.domain_valid_ends) is not tuple:
-            raise TypeError("flat KV domain_valid_ends must be a tuple")
-        expected_size = mask.bit_count()
-        if len(self.domain_valid_ends) != expected_size:
-            raise ValueError(
-                f"{self.group_id}.domain_valid_ends must contain one value per "
-                f"set domain bit: {len(self.domain_valid_ends)} != {expected_size}"
-            )
-        for index, valid_end in enumerate(self.domain_valid_ends):
-            _require_pod_int(
-                valid_end,
-                field_name=f"{self.group_id}.domain_valid_ends[{index}]",
-                maximum=0x7FFFFFFF,
-            )
-
-    def to_pod(self) -> dict[str, Any]:
-        return {
-            "group_id": self.group_id,
-            "completed_domain_mask": self.completed_domain_mask,
-            "domain_valid_ends": list(self.domain_valid_ends),
-        }
-
-
-@dataclass(frozen=True, slots=True)
 class FlatKVCompletion:
-    """Fence-ready scheduler payload containing host primitives only."""
+    """Fence-ready scheduler payload containing host primitives only.
 
-    request_id: str
+    Request identity belongs to the enclosing ``ExtendResult``. Per-group ready
+    ends are derived by the scheduler from this accepted end and its immutable
+    cache-group geometry, so echoing either across the Python/C++ boundary would
+    create a second source of truth.
+    """
+
     table_generation: int
     dispatch_seq: int
     accepted_raw_end: int
-    protected_raw_end: int
-    groups: tuple[FlatKVGroupCompletion, ...]
 
     def __post_init__(self) -> None:
-        if type(self.request_id) is not str or not self.request_id:
-            raise ValueError("flat KV completion request_id must be a non-empty str")
         _require_pod_int(
             self.table_generation,
             field_name="table_generation",
@@ -215,36 +169,6 @@ class FlatKVCompletion:
             field_name="accepted_raw_end",
             maximum=0x7FFFFFFF,
         )
-        _require_pod_int(
-            self.protected_raw_end,
-            field_name="protected_raw_end",
-            maximum=0x7FFFFFFF,
-        )
-        if self.accepted_raw_end > self.protected_raw_end:
-            raise ValueError(
-                "accepted_raw_end must not exceed protected_raw_end: "
-                f"{self.accepted_raw_end} > {self.protected_raw_end}"
-            )
-        if not self.groups:
-            raise ValueError("flat KV completion must contain at least one group")
-        if type(self.groups) is not tuple:
-            raise TypeError("flat KV completion groups must be a tuple")
-        if any(type(group) is not FlatKVGroupCompletion for group in self.groups):
-            raise TypeError("flat KV completion groups must be POD group completions")
-        group_ids = [group.group_id for group in self.groups]
-        if len(group_ids) != len(set(group_ids)):
-            raise ValueError(f"flat KV completion has duplicate groups: {group_ids}")
-
-    def to_pod(self) -> dict[str, Any]:
-        """Return the exact primitive container expected by the event bridge."""
-        return {
-            "request_id": self.request_id,
-            "table_generation": self.table_generation,
-            "dispatch_seq": self.dispatch_seq,
-            "accepted_raw_end": self.accepted_raw_end,
-            "protected_raw_end": self.protected_raw_end,
-            "groups": [group.to_pod() for group in self.groups],
-        }
 
     def rewind_to_host_accepted_tokens(
         self, *, device_accepted_tokens: int, host_accepted_tokens: int
@@ -253,9 +177,8 @@ class FlatKVCompletion:
 
         Decode completion materialization advances ``accepted_raw_end`` by the
         device-reported accepted count. Host EOS, stop, max-length, or grammar
-        handling can later retain a shorter prefix. Group watermarks continue
-        to describe the producer's true writes; C++ clamps them to this revised
-        accepted end before publication.
+        handling can later retain a shorter prefix. The scheduler derives every
+        group boundary from this revised accepted end before publication.
 
         Args:
             device_accepted_tokens: Accepted token count used when this
@@ -316,13 +239,8 @@ class ModelExecutionResult:
     next_input_ids: torch.Tensor | None = None
     # Per-request NaN-guard flags (int32, [bs]); None when the guard is disabled.
     output_nan_flags: torch.Tensor | None = None
-    # Host orchestration proof for the enqueued producer forwards.  It is
-    # deliberately private: only sync-gated materialization may expose PODs.
-    _flat_kv_execution_evidence: FlatKVExecutionEvidence | None = field(
-        default=None, repr=False
-    )
     # Ready-only host-POD payloads. init=False prevents executor code from
-    # constructing a completion before copy_event and auxiliary KV producers
+    # constructing a completion before copy_event and auxiliary cache writes
     # have crossed the execution-result fence.
     flat_kv_completions: tuple[FlatKVCompletion, ...] | None = field(
         default=None, init=False
@@ -347,12 +265,12 @@ class ModelExecutionResult:
     ) -> tuple[FlatKVCompletion, ...]:
         """Build ready-only flat KV completions from dispatch metadata.
 
-        The execution evidence owns the already-parsed schema-free dispatch
-        identity/ranges captured before the forward. Group/domain ends come
-        from the active plan plus that evidence after the complete target/draft
-        orchestration returned. Extend rows accept every input/KV-writing token,
-        while decode rows add the synchronized accepted count to
-        ``dispatch_raw_start``.
+        The matching forward operation owns the schema-free dispatch identity
+        and ranges. The result fence was recorded on the same execution stream
+        after all target/draft cache writers, so parsing those host inputs after
+        ``sync`` is sufficient evidence that their device writes are complete.
+        Extend rows accept every input/KV-writing token, while decode rows add
+        the synchronized accepted count to ``dispatch_raw_start``.
         """
         if not self._is_synchronized:
             raise RuntimeError(
@@ -361,14 +279,15 @@ class ModelExecutionResult:
         if self.flat_kv_completions is not None:
             return self.flat_kv_completions
 
-        evidence = self._flat_kv_execution_evidence
-        if evidence is None:
+        raw_inputs = getattr(forward_op, "flat_kv_completion_inputs", None)
+        if raw_inputs is None or len(raw_inputs) == 0:
             self.flat_kv_completions = ()
             return self.flat_kv_completions
-        completion_inputs = evidence.inputs
-        if not completion_inputs:
-            self.flat_kv_completions = ()
-            return self.flat_kv_completions
+        if isinstance(raw_inputs, (str, bytes)) or not isinstance(raw_inputs, Sequence):
+            raise TypeError("flat_kv_completion_inputs must be a host sequence")
+        completion_inputs = tuple(
+            FlatKVCompletionInput.from_raw(item) for item in raw_inputs
+        )
 
         request_ids = forward_op.request_ids
         if len(completion_inputs) != len(request_ids):
@@ -402,16 +321,10 @@ class ModelExecutionResult:
                 f"num_extends={num_extends} exceeds batch size {len(request_ids)}"
             )
 
-        accepted_raw_ends: list[int] = []
+        completions: list[FlatKVCompletion] = []
         for row, (request_id, completion_input) in enumerate(
             zip(request_ids, completion_inputs)
         ):
-            if completion_input.request_id != request_id:
-                raise ValueError(
-                    "flat KV completion input row/request mismatch: "
-                    f"row {row} is {request_id!r}, payload is "
-                    f"{completion_input.request_id!r}"
-                )
             input_length = _require_pod_int(
                 input_lengths[row], field_name=f"input_length[{request_id}]"
             )
@@ -443,27 +356,11 @@ class ModelExecutionResult:
                     f"[{completion_input.dispatch_raw_start}, "
                     f"{completion_input.dispatch_raw_end}]"
                 )
-            accepted_raw_ends.append(accepted_raw_end)
-
-        groups_by_row = evidence.materialize_group_completions(accepted_raw_ends)
-        if len(groups_by_row) != len(completion_inputs):
-            raise ValueError("flat KV execution evidence returned the wrong row count")
-
-        completions: list[FlatKVCompletion] = []
-        for request_id, completion_input, accepted_raw_end, groups in zip(
-            request_ids,
-            completion_inputs,
-            accepted_raw_ends,
-            groups_by_row,
-        ):
             completions.append(
                 FlatKVCompletion(
-                    request_id=request_id,
                     table_generation=completion_input.table_generation,
                     dispatch_seq=completion_input.dispatch_seq,
                     accepted_raw_end=accepted_raw_end,
-                    protected_raw_end=completion_input.protected_raw_end,
-                    groups=groups,
                 )
             )
 

@@ -15,6 +15,7 @@ import importlib.util
 import os
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 # CI Registration (parsed via AST, runtime no-op)
@@ -73,6 +74,29 @@ def _load_paged_cache_spec():
 
 
 _pcs = _load_paged_cache_spec()
+
+
+def _load_cache_capabilities():
+    repo_root = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
+    path = os.path.join(
+        repo_root,
+        "python",
+        "tokenspeed",
+        "runtime",
+        "cache_capabilities.py",
+    )
+    spec = importlib.util.spec_from_file_location(
+        "_flat_cache_capabilities_guard", path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_capabilities = _load_cache_capabilities()
 
 
 class FakeV4StyleBackend:
@@ -325,6 +349,34 @@ class ValidateFlatSchedulerConfigTest(unittest.TestCase):
                 kv_pool=FakeMHAPool(),
                 speculative_algorithm=None,
             )
+
+
+class ValidateCacheRuntimeCapabilitiesTest(unittest.TestCase):
+    def test_unsupported_flat_runtime_features_fail_by_capability(self):
+        cases = (
+            (
+                "active PD transfer",
+                "decode",
+                False,
+                {"supports_pd_transfer": False},
+            ),
+            (
+                "host/L2 cache tier",
+                "none",
+                True,
+                {"supports_hierarchical_kv_cache": False},
+            ),
+        )
+        for message, mode, kvstore, attributes in cases:
+            with self.subTest(message=message), self.assertRaisesRegex(
+                RuntimeError, message
+            ):
+                _capabilities.validate_cache_runtime_capabilities(
+                    target_pool=SimpleNamespace(**attributes),
+                    draft_pool=None,
+                    disaggregation_mode=mode,
+                    enable_kvstore=kvstore,
+                )
 
 
 if __name__ == "__main__":

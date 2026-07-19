@@ -27,7 +27,6 @@ import torch
 from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
 from typing_extensions import override
 
-from tokenspeed.runtime.configs.model_config import is_deepseek_v4_nextn
 from tokenspeed.runtime.execution.cache_loc_kernel import (
     compute_out_cache_loc_uniform,
 )
@@ -55,17 +54,6 @@ def _advance_draft_forward_metadata_if_supported(attn_backend, seq_lens) -> None
     advance = getattr(attn_backend, "advance_draft_forward_metadata", None)
     if advance is not None:
         advance(seq_lens)
-
-
-def _first_step_covers_all_draft_kv_layers(model_config: Any) -> bool:
-    """Whether one Eagle invocation writes a continuous prefix for every draft layer."""
-
-    hf_config = getattr(model_config, "hf_config", None)
-    return bool(
-        hf_config is not None
-        and is_deepseek_v4_nextn(hf_config)
-        and getattr(model_config, "num_attention_layers", 0) == 1
-    )
 
 
 @dataclass
@@ -148,16 +136,18 @@ class Eagle(BaseDrafter):
             - 1
         )
 
-        # VLM placeholder ids plumbed by ModelExecutor; empty for text-only targets.
+        # In-vocab media tokens plumbed by ModelExecutor. The content-derived
+        # prefix-cache pad IDs retain a modality tag and are restored here before
+        # the text-only speculative draft performs its embedding lookup.
         self.mm_pad_substitute_ids: dict[Modality, int] = {}
         hf_config = getattr(draft_model_runner.model_config, "hf_config", None)
-        # V4 NextN selects layer `spec_step_idx % num_mtp_layers`. With one
-        # layer every speculative iteration extends the same draft KV plane,
-        # so the completed Eagle invocation covers a continuous prefix. With
-        # multiple layers the round-robin writes are sparse per layer and must
-        # remain fail-closed until a dense catch-up path exists.
-        self.first_step_covers_all_draft_kv_layers = (
-            _first_step_covers_all_draft_kv_layers(draft_model_runner.model_config)
+        # The model owns whether its first speculative step writes every draft
+        # KV plane. Eagle consumes only that source-neutral capability; absent
+        # capability remains fail-closed.
+        self.first_step_covers_all_draft_kv_layers = getattr(
+            draft_model_runner.model,
+            "draft_first_step_covers_all_kv_layers",
+            False,
         )
         self._dsa_reuse_mtp_topk = bool(
             getattr(hf_config, "index_share_for_mtp_iteration", False)

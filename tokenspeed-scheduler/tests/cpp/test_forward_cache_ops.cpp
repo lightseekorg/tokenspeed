@@ -367,7 +367,6 @@ TEST(ForwardCacheOpsSpecs, CanonicalFlatConfigMapsPrefixRolesByCacheMode) {
         state.pool_id = "v4.indexer.state";
         state.prefix_role = PrefixRole::ContinuationState;
         state.table_layout = TableLayout::BoundedWindow;
-        state.required_producer_domain_mask = 0b010;
         state.owner_mask = 0b001;
         config.paged_cache_groups = {state};
 
@@ -382,7 +381,6 @@ TEST(ForwardCacheOpsSpecs, CanonicalFlatConfigMapsPrefixRolesByCacheMode) {
             EXPECT_EQ(specs[0].sliding_window, 8);
             EXPECT_EQ(specs[0].pool_index, pools.IndexOf("v4.indexer.state"));
             EXPECT_EQ(specs[0].table_layout, KvTableLayout::kBoundedWindow);
-            EXPECT_EQ(specs[0].required_producer_domain_mask, 0b010u);
             EXPECT_EQ(specs[0].owner_mask, 0b001u);
         }
         if (test_case.coordinator_is_valid) {

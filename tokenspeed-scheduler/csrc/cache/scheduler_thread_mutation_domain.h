@@ -27,8 +27,8 @@
 namespace tokenspeed {
 
 // Immutable owner-thread token shared by every mutable object in one flat KV
-// scheduler domain. The scheduler is single-threaded by contract; this object
-// makes that contract executable without adding synchronization to its hot path.
+// scheduler domain. The scheduler is single-threaded by contract; transaction
+// boundaries validate that contract without synchronizing the hot path.
 class SchedulerThreadMutationDomain {
 public:
     SchedulerThreadMutationDomain() noexcept : owner_thread_id_{std::this_thread::get_id()} {}
@@ -52,6 +52,15 @@ public:
         if (!IsOwnerThread()) {
             std::terminate();
         }
+    }
+
+    // RAII cleanup may run once per page inside an already-validated
+    // transaction. Keep the local misuse check in debug builds without paying
+    // for std::this_thread::get_id() once per page in release builds.
+    void DebugAssertOwnerThreadNoexcept() const noexcept {
+#ifndef NDEBUG
+        AssertOwnerThreadNoexcept();
+#endif
     }
 
 private:

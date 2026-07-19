@@ -2018,7 +2018,7 @@ def _deepseek_v4_swa_slot_mapping(
     cache_metadata = metadata.cache
     token_to_req_indices = metadata.token_to_req_indices[: positions.numel()]
     if cache_metadata.swa_block_table is None:
-        if cache_metadata.table_source_kind == "flat":
+        if not cache_metadata.has_legacy_block_table:
             raise RuntimeError(
                 "DeepSeek V4 flat cache metadata is missing the SWA group table"
             )
@@ -2027,7 +2027,7 @@ def _deepseek_v4_swa_slot_mapping(
         token_to_req_indices.numel() <= 0
         or positions.numel() % token_to_req_indices.numel() != 0
     ):
-        if cache_metadata.table_source_kind == "flat":
+        if not cache_metadata.has_legacy_block_table:
             raise RuntimeError(
                 "DeepSeek V4 flat SWA slot mapping has incompatible token/request "
                 "metadata; generic out_cache_loc fallback is forbidden"

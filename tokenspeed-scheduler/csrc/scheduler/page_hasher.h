@@ -105,8 +105,7 @@ inline std::vector<uint8_t> HexToBytes(std::string_view hex) {
 // bleeding into extra_keys, and per-key length prefixes prevent re-splitting.
 // Feed order is prior_hash -> tokens -> extra_keys.
 inline std::string HashPageSegments(std::span<const std::int32_t> first_tokens,
-                                    std::span<const std::int32_t> second_tokens,
-                                    const std::string& prior_hash,
+                                    std::span<const std::int32_t> second_tokens, const std::string& prior_hash,
                                     std::span<const std::string> extra_keys = {}) {
     SHA256_CTX ctx;
     SHA256_Init(&ctx);

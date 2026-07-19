@@ -11,6 +11,21 @@ from ci_system.ci_register import register_cuda_ci
 register_cuda_ci(est_time=15, suite="runtime-1gpu")
 
 
+def _flat_specs(group_sizes):
+    from tokenspeed.runtime.configs.paged_cache_spec import PagedCacheGroupSpec
+
+    return tuple(
+        PagedCacheGroupSpec(
+            group_id=group_id,
+            retention="full_history",
+            rows_per_page=block_size,
+            entry_stride_tokens=1,
+            sliding_window_tokens=None,
+        )
+        for group_id, block_size in group_sizes.items()
+    )
+
+
 def _import_backend():
     from tokenspeed.runtime.layers.attention.backends.trtllm import (
         TRTLLMMHAAttnBackend,
@@ -52,8 +67,16 @@ class TRTLLMFlatGroupsTest(unittest.TestCase):
         b.max_num_pages = max_num_pages
         b.max_context_len = page_size * max_num_pages
         b.device = device
-        if groups is not None:
-            b.flat_group_page_sizes = groups
+        b._learn_flat_state_groups(
+            _flat_specs(
+                groups
+                if groups is not None
+                else {
+                    "full_attention": page_size,
+                    "sliding_attention": page_size,
+                }
+            )
+        )
         b.spec_num_tokens = spec_num_tokens
         b.is_draft = False
         b.draft_block_decode = False

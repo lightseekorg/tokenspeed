@@ -73,8 +73,6 @@ with mock.patch.dict(sys.modules):
     _load("tokenspeed.runtime.configs.flat_kv_contract", "flat_kv_contract.py")
     _pcs = _load("paged_cache_spec_for_page_counts", "paged_cache_spec.py")
 compute_paged_cache_group_page_counts = _pcs.compute_paged_cache_group_page_counts
-compute_flat_capture_cols = _pcs.compute_flat_capture_cols
-compute_flat_export_cols = _pcs.compute_flat_export_cols
 group_specs_from_layer_types = _pcs.group_specs_from_layer_types
 PagedCacheGroupSpec = _pcs.PagedCacheGroupSpec
 DUMMY = _pcs._PAGED_CACHE_GROUP_DUMMY_PAGES
@@ -185,50 +183,6 @@ class SuffixedGroupIdFlowTest(unittest.TestCase):
         self.assertGreater(
             counts["sliding_attention_128"], counts["sliding_attention_4"]
         )
-
-
-class OverlapTableWidthTest(unittest.TestCase):
-    def test_sliding_table_width_formulae(self):
-        cases = (
-            (
-                "export covers current and overlapped prefill chunks",
-                compute_flat_export_cols,
-                {
-                    "max_context_len": 16_384,
-                    "max_new_tokens_per_req": 8_192,
-                    "max_tokens_per_req": 1,
-                    "overlap_schedule_depth": 1,
-                },
-                math.ceil((8 + 2 * 8_192 + 2) / 4) + 1,
-            ),
-            (
-                "overlapped capture covers the final prefill predecessor",
-                compute_flat_capture_cols,
-                {
-                    "max_context_len": 16_384,
-                    "max_tokens_per_req": 1,
-                    "max_prefill_tokens_per_req": 8_192,
-                    "overlap_schedule_depth": 1,
-                },
-                math.ceil((8 + 8_192 + 2) / 4) + 1,
-            ),
-            (
-                "non-overlap capture excludes committed prefill",
-                compute_flat_capture_cols,
-                {
-                    "max_context_len": 16_384,
-                    "max_tokens_per_req": 1,
-                    "max_prefill_tokens_per_req": 8_192,
-                    "overlap_schedule_depth": 0,
-                },
-                math.ceil((8 + 1) / 4) + 1,
-            ),
-        )
-
-        for name, compute_cols, kwargs, expected in cases:
-            with self.subTest(name=name):
-                spec = _spec("state", "sliding_window", window=8, rows_per_page=4)
-                self.assertEqual(compute_cols(spec, **kwargs), expected)
 
 
 if __name__ == "__main__":

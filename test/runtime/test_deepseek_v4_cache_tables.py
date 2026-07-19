@@ -11,7 +11,7 @@ from unittest import mock
 def _load_module():
     path = (
         pathlib.Path(__file__).parents[2]
-        / "python/tokenspeed/runtime/deepseek_v4_cache_tables.py"
+        / "python/tokenspeed/runtime/flat_cache_tables.py"
     )
     with mock.patch.dict(sys.modules):
         spec = importlib.util.spec_from_file_location("_v4_cache_tables", path)
@@ -23,130 +23,189 @@ def _load_module():
 
 
 _tables = _load_module()
+_SPECS = tuple(SimpleNamespace(group_id=group_id) for group_id in ("a", "b"))
+
+
+def _backend(*, flat=True, paged=True, group_keyed=True):
+    return SimpleNamespace(
+        uses_flat_cache_groups=flat,
+        uses_paged_cache_groups=paged,
+        requires_group_keyed_cache_locs=group_keyed,
+    )
+
+
+def _pool(*, plan=None, owner_specs=_SPECS, scheduler_specs=_SPECS):
+    return SimpleNamespace(
+        flat_memory_plan=plan,
+        paged_cache_group_specs=owner_specs,
+        scheduler_group_specs=scheduler_specs,
+    )
 
 
 class DeepseekV4CacheTableSourceTest(unittest.TestCase):
-    def test_flat_requires_explicit_base_for_every_group(self):
-        source = _tables.resolve_deepseek_v4_cache_table_source(
+    def test_binding_is_selected_once_from_scheduler_and_pool(self):
+        cases = (
+            ("radix build", False, _backend(), object(), "radix", (), False),
+            ("dual flat", True, _backend(), object(), "flat", ("a", "b"), True),
+            (
+                "flat only",
+                True,
+                _backend(paged=False, group_keyed=False),
+                None,
+                "flat",
+                ("a", "b"),
+                False,
+            ),
+        )
+        for name, active, backend, plan, kind, groups, group_keyed in cases:
+            with self.subTest(name=name):
+                binding = _tables.resolve_cache_table_binding(
+                    backend=backend,
+                    pool=_pool(plan=plan),
+                    flat_scheduler_active=active,
+                )
+                self.assertEqual(
+                    (binding.kind, binding.group_ids, binding.group_keyed_cache_locs),
+                    (kind, groups, group_keyed),
+                )
+
+    def test_owner_view_reuses_only_the_same_planned_union(self):
+        view = _tables.FlatCacheTableOwnerView(("target",))
+        tables = {"target": object(), "draft": object()}
+        bases = {"target": object(), "draft": object()}
+
+        def source(generation, source_tables=tables):
+            return _tables.CacheTableSource(
+                kind="flat",
+                tables=source_tables,
+                base_offsets=bases,
+                planned=True,
+                generation=generation,
+            )
+
+        union = source(3)
+        first = view.bind(union, owner="target")
+        self.assertIs(view.bind(union, owner="target"), first)
+        self.assertIsNot(view.bind(source(4), owner="target"), first)
+        self.assertIsNot(
+            view.bind(
+                source(4, {"target": object(), "draft": object()}), owner="target"
+            ),
+            first,
+        )
+        self.assertEqual(tuple(first.tables), ("target",))
+        self.assertIs(first.tables["target"], tables["target"])
+        self.assertIs(first.base_offsets["target"], bases["target"])
+
+    def test_flat_source_schema_is_atomic_and_group_complete(self):
+        tables = {"history": object(), "state": object()}
+        bases = {"history": [0], "state": [7]}
+        source = _tables.resolve_cache_table_source(
             paged_tables=None,
             paged_base_offsets=None,
-            flat_tables={"history": object(), "state": object()},
-            flat_base_offsets={"history": [0], "state": [7]},
+            flat_tables=tables,
+            flat_base_offsets=bases,
         )
         self.assertEqual(source.kind, "flat")
-        self.assertEqual(set(source.tables), {"history", "state"})
-        self.assertEqual(source.base_offsets["state"], [7])
+        self.assertIs(source.tables, tables)
+        self.assertIs(source.base_offsets, bases)
 
-    def test_invalid_flat_source_shapes_fail_closed(self):
         cases = (
-            (
-                "table/base group mismatch",
-                None,
-                {"history": object(), "state": object()},
-                {"history": [0]},
-                False,
-            ),
+            ("table/base group mismatch", None, tables, {"history": [0]}, False),
             ("requires both", None, {"history": object()}, None, False),
-            (
-                "exactly one",
-                {"history": object()},
-                {"history": object()},
-                {"history": [0]},
-                False,
-            ),
+            ("exactly one", {"history": object()}, tables, bases, False),
             ("missing", None, None, None, True),
             ("at least one", None, {}, {}, False),
         )
-        for message, paged, flat, bases, required in cases:
-            with self.subTest(message=message):
-                with self.assertRaisesRegex(RuntimeError, message):
-                    _tables.resolve_deepseek_v4_cache_table_source(
-                        paged_tables=paged,
-                        paged_base_offsets=None,
-                        flat_tables=flat,
-                        flat_base_offsets=bases,
-                        require_source=required,
-                    )
+        for message, paged, flat, offsets, required in cases:
+            with self.subTest(message=message), self.assertRaisesRegex(
+                RuntimeError, message
+            ):
+                _tables.resolve_cache_table_source(
+                    paged_tables=paged,
+                    paged_base_offsets=None,
+                    flat_tables=flat,
+                    flat_base_offsets=offsets,
+                    require_source=required,
+                )
 
-    def test_v4_flat_loc_policy_preserves_owner_local_group_sets(self):
+    def test_speculative_bindings_preserve_owner_local_domains(self):
         shared = SimpleNamespace(group_id="shared.history")
-        target_state = SimpleNamespace(group_id="target.state")
-        draft_only = SimpleNamespace(group_id="draft.state")
+        target = SimpleNamespace(group_id="target.state")
+        draft = SimpleNamespace(group_id="draft.state")
         plan = SimpleNamespace(plan_fingerprint="same-plan")
-        target_pool = SimpleNamespace(
-            flat_memory_plan=plan,
-            scheduler_group_specs=(shared, target_state, draft_only),
-            paged_cache_group_specs=(shared, target_state),
+        union = (shared, target, draft)
+        target_pool = _pool(
+            plan=plan, owner_specs=(shared, target), scheduler_specs=union
         )
-        draft_pool = SimpleNamespace(
-            flat_memory_plan=plan,
-            paged_cache_group_specs=(shared, draft_only),
+        draft_pool = _pool(
+            plan=plan, owner_specs=(shared, draft), scheduler_specs=union
         )
-        backend = SimpleNamespace(requires_group_keyed_cache_locs=True)
-
-        policy = _tables.resolve_deepseek_v4_flat_loc_policy(
-            target_backend=backend,
+        backend = _backend()
+        target_binding = _tables.resolve_cache_table_binding(
+            backend=backend,
+            pool=target_pool,
+            flat_scheduler_active=True,
+        )
+        draft_binding = _tables.resolve_cache_table_binding(
+            backend=backend,
+            pool=draft_pool,
+            flat_scheduler_active=True,
+        )
+        _tables.validate_speculative_flat_bindings(
             target_pool=target_pool,
-            draft_backend=backend,
+            target_binding=target_binding,
             draft_pool=draft_pool,
+            draft_binding=draft_binding,
             speculative_algorithm="MTP",
         )
+        self.assertEqual(target_binding.group_ids, ("shared.history", "target.state"))
+        self.assertEqual(draft_binding.group_ids, ("shared.history", "draft.state"))
 
-        self.assertIsNotNone(policy)
-        self.assertEqual(policy.target_group_ids, ("shared.history", "target.state"))
-        self.assertEqual(policy.draft_group_ids, ("shared.history", "draft.state"))
-
-    def test_v4_flat_spec_cannot_borrow_target_page_domain(self):
+    def test_speculative_bindings_reject_ambiguous_page_domains(self):
         cases = (
-            ("target backend", False, None, None, None, "group-keyed cache locations"),
-            ("missing draft backend", True, "MTP", None, None, "draft backend"),
-            ("draft backend", True, "MTP", False, "same-plan", "group-keyed draft"),
-            ("plan mismatch", True, "MTP", True, "different-plan", "shared plan"),
+            ("target backend", False, None, None, "group-keyed cache locations"),
+            ("missing draft backend", True, None, None, "draft backend"),
+            ("draft backend", True, False, "same-plan", "group-keyed cache"),
+            ("plan mismatch", True, True, "different-plan", "canonical plan object"),
         )
-
-        for (
-            name,
-            target_group_keyed,
-            algorithm,
-            draft_group_keyed,
-            draft_fingerprint,
-            message,
-        ) in cases:
-            with self.subTest(name=name):
-                shared = SimpleNamespace(group_id="shared.history")
-                target_plan = SimpleNamespace(plan_fingerprint="same-plan")
-                target_pool = SimpleNamespace(
-                    flat_memory_plan=target_plan,
-                    scheduler_group_specs=(shared,),
-                    paged_cache_group_specs=(shared,),
-                )
-                target_backend = SimpleNamespace(
-                    requires_group_keyed_cache_locs=target_group_keyed
-                )
-                draft_backend = (
-                    SimpleNamespace(requires_group_keyed_cache_locs=draft_group_keyed)
-                    if draft_group_keyed is not None
-                    else None
+        shared = SimpleNamespace(group_id="shared.history")
+        target_plan = SimpleNamespace(plan_fingerprint="same-plan")
+        target_pool = _pool(
+            plan=target_plan, owner_specs=(shared,), scheduler_specs=(shared,)
+        )
+        for name, target_keyed, draft_keyed, draft_fingerprint, message in cases:
+            with self.subTest(name=name), self.assertRaisesRegex(RuntimeError, message):
+                target_binding = _tables.resolve_cache_table_binding(
+                    backend=_backend(group_keyed=target_keyed),
+                    pool=target_pool,
+                    flat_scheduler_active=True,
                 )
                 draft_pool = (
-                    SimpleNamespace(
-                        flat_memory_plan=SimpleNamespace(
-                            plan_fingerprint=draft_fingerprint
-                        ),
-                        paged_cache_group_specs=(shared,),
+                    _pool(
+                        plan=SimpleNamespace(plan_fingerprint=draft_fingerprint),
+                        owner_specs=(shared,),
+                        scheduler_specs=(shared,),
                     )
-                    if draft_group_keyed is not None
+                    if draft_keyed is not None
                     else None
                 )
-
-                with self.assertRaisesRegex(RuntimeError, message):
-                    _tables.resolve_deepseek_v4_flat_loc_policy(
-                        target_backend=target_backend,
-                        target_pool=target_pool,
-                        draft_backend=draft_backend,
-                        draft_pool=draft_pool,
-                        speculative_algorithm=algorithm,
+                draft_binding = (
+                    _tables.resolve_cache_table_binding(
+                        backend=_backend(group_keyed=draft_keyed),
+                        pool=draft_pool,
+                        flat_scheduler_active=True,
                     )
+                    if draft_pool is not None
+                    else None
+                )
+                _tables.validate_speculative_flat_bindings(
+                    target_pool=target_pool,
+                    target_binding=target_binding,
+                    draft_pool=draft_pool,
+                    draft_binding=draft_binding,
+                    speculative_algorithm="MTP",
+                )
 
 
 if __name__ == "__main__":

@@ -25,6 +25,21 @@ MAX_NUM_PAGES = 4
 MAX_BS = 4
 
 
+def _flat_specs(group_sizes):
+    from tokenspeed.runtime.configs.paged_cache_spec import PagedCacheGroupSpec
+
+    return tuple(
+        PagedCacheGroupSpec(
+            group_id=group_id,
+            retention="full_history",
+            rows_per_page=block_size,
+            entry_stride_tokens=1,
+            sliding_window_tokens=None,
+        )
+        for group_id, block_size in group_sizes.items()
+    )
+
+
 def _decode_forward_mode():
     return SimpleNamespace(
         is_mixed=lambda: False,
@@ -62,7 +77,15 @@ class _MHACase(_TorchCase):
         self.MHAAttnBackend = MHAAttnBackend
         self.backend = MHAAttnBackend.__new__(MHAAttnBackend)
         self.backend.page_size = PAGE
-        self.backend.flat_group_page_sizes = {}
+        self.backend._learn_flat_state_groups(
+            _flat_specs(
+                {
+                    "sliding_attention": PAGE,
+                    "full_attention": PAGE,
+                    "bounded": PAGE,
+                }
+            )
+        )
 
 
 class ComputeFlatOutCacheLocsTest(_MHACase):
@@ -91,6 +114,35 @@ class ComputeFlatOutCacheLocsTest(_MHACase):
         assert locs["full_attention"].dtype == torch.int32
         assert locs["sliding_attention"].dtype == torch.int32
 
+    def test_decode_locs_bounded_negative_pages_route_to_dummy(self):
+        torch = self.torch
+        tables = {
+            # Logical pages 3 and 4 are present in the bounded table, but both
+            # map to the negative padding/hole sentinel.
+            "bounded": torch.tensor([[-1, -1]], dtype=torch.int32)
+        }
+        bases = {"bounded": torch.tensor([3], dtype=torch.int32)}
+        cases = (
+            # pos 7 -> logical page 3, local col 0, offset 1.
+            (1, 8, [1]),
+            # pos 6..9 -> logical pages 3,3,4,4, local cols 0,0,1,1.
+            (4, 10, [0, 1, 0, 1]),
+        )
+
+        for num_tokens_per_req, seq_len, expected in cases:
+            with self.subTest(num_tokens_per_req=num_tokens_per_req):
+                locs = self.backend._compute_flat_decode_out_cache_locs(
+                    tables,
+                    bases,
+                    torch.tensor([seq_len], dtype=torch.int32),
+                    PAGE,
+                    num_tokens_per_req=num_tokens_per_req,
+                )
+                # The non-zero logical base selects an in-range local column;
+                # clamping physical page -1 to dummy page 0 leaves only the
+                # original offset within that page.
+                self.assertEqual(locs["bounded"].tolist(), expected)
+
     def test_extend_locs_formula(self):
         torch = self.torch
         # r0: prefix 2, extend 3 -> positions 2,3,4; r1: prefix 0, extend 2
@@ -113,7 +165,7 @@ class ComputeFlatOutCacheLocsTest(_MHACase):
 
     def test_decode_locs_honor_group_page_sizes(self):
         torch = self.torch
-        self.backend.flat_group_page_sizes = {"small": 2, "large": 4}
+        self.backend._learn_flat_state_groups(_flat_specs({"small": 2, "large": 4}))
         tables = {
             "small": torch.tensor([[1, 2, 3]], dtype=torch.int32),
             "large": torch.tensor([[6, 7]], dtype=torch.int32),
@@ -127,7 +179,7 @@ class ComputeFlatOutCacheLocsTest(_MHACase):
 
     def test_extend_locs_honor_group_page_sizes(self):
         torch = self.torch
-        self.backend.flat_group_page_sizes = {"small": 2, "large": 4}
+        self.backend._learn_flat_state_groups(_flat_specs({"small": 2, "large": 4}))
         tables = {
             "small": torch.tensor([[10, 11, 12]], dtype=torch.int32),
             "large": torch.tensor([[20, 21]], dtype=torch.int32),
@@ -142,6 +194,46 @@ class ComputeFlatOutCacheLocsTest(_MHACase):
         )
         self.assertEqual(locs["small"].tolist(), [23, 24, 25])
         self.assertEqual(locs["large"].tolist(), [83, 84, 85])
+
+    def test_logical_base_bounds_asserts_are_debug_only(self):
+        torch = self.torch
+        tables = {"full_attention": torch.tensor([[1, 2]], dtype=torch.int32)}
+        bases = {"full_attention": torch.zeros(1, dtype=torch.int32)}
+        seq_lens = torch.tensor([2], dtype=torch.int32)
+        prefix_lens = torch.tensor([0], dtype=torch.int32)
+        extend_lens = torch.tensor([2], dtype=torch.int32)
+
+        with mock.patch.dict(os.environ):
+            os.environ.pop("TOKENSPEED_FLAT_DEBUG", None)
+            with mock.patch.object(
+                torch,
+                "_assert_async",
+                side_effect=AssertionError("production path ran a bounds reduction"),
+            ) as assert_async:
+                self.backend._compute_flat_decode_out_cache_locs(
+                    tables, bases, seq_lens, PAGE
+                )
+                self.backend._compute_flat_decode_out_cache_locs(
+                    tables, bases, seq_lens, PAGE, num_tokens_per_req=2
+                )
+                self.backend._compute_flat_extend_out_cache_locs(
+                    tables, bases, prefix_lens, extend_lens, PAGE
+                )
+            assert_async.assert_not_called()
+
+        with mock.patch.dict(
+            os.environ, {"TOKENSPEED_FLAT_DEBUG": "1"}
+        ), mock.patch.object(torch, "_assert_async") as assert_async:
+            self.backend._compute_flat_decode_out_cache_locs(
+                tables, bases, seq_lens, PAGE
+            )
+            self.backend._compute_flat_decode_out_cache_locs(
+                tables, bases, seq_lens, PAGE, num_tokens_per_req=2
+            )
+            self.backend._compute_flat_extend_out_cache_locs(
+                tables, bases, prefix_lens, extend_lens, PAGE
+            )
+        self.assertEqual(assert_async.call_count, 3)
 
 
 class MaybeCheckFlatWriteLocsTest(_MHACase):
@@ -197,7 +289,7 @@ class MaybeCheckFlatWriteLocsTest(_MHACase):
 
     def test_debug_honors_group_page_size(self):
         torch = self.torch
-        self.backend.flat_group_page_sizes = {"wide": 4}
+        self.backend._learn_flat_state_groups(_flat_specs({"wide": 4}))
         tables = {"wide": torch.tensor([[2, 3]], dtype=torch.int32)}
         locs = {"wide": torch.tensor([11, 15], dtype=torch.int32)}
         with mock.patch.dict(os.environ, {"TOKENSPEED_FLAT_DEBUG": "1"}):
@@ -218,7 +310,14 @@ class InitForwardMetadataAssemblyTest(_MHACase):
         backend.spec_num_tokens = 1
         backend.is_draft = False
         backend.draft_block_decode = False
-        backend.flat_state_group_ids = frozenset()
+        backend._learn_flat_state_groups(
+            _flat_specs(
+                {
+                    "sliding_attention": PAGE,
+                    "full_attention": PAGE,
+                }
+            )
+        )
         backend.forward_decode_metadata = None
         backend.forward_extend_metadata = None
         self.backend = backend
@@ -423,7 +522,7 @@ class GraphLocBuffersTest(_MHACase):
         backend.draft_block_decode = False
         backend.flat_state_group_ids = frozenset()
         backend.flat_engine_owned_group_ids = frozenset()
-        backend.flat_group_page_sizes = {gid: PAGE for gid in _GROUP_IDS}
+        backend._learn_flat_state_groups(_flat_specs({gid: PAGE for gid in _GROUP_IDS}))
         backend.max_num_pages = MAX_NUM_PAGES
         backend.page_size = PAGE
         backend.device = "cuda"

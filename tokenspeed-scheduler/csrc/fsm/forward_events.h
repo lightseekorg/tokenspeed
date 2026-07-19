@@ -68,7 +68,7 @@ void InsertHybridCache(HybridPrefixCache* hybrid_prefix_cache,
                        std::int32_t page_size, const std::vector<std::int32_t>* prefix_pages_override = nullptr);
 
 #if TOKENSPEED_FLAT_KVCACHE
-// Move-only RAII owner crossing the scheduler -> FSM seam after a structured
+// Move-only RAII owner crossing the scheduler -> FSM seam after an explicit
 // device-only flat admission has already committed. It contains no raw prefix
 // observers and exposes only ownership moves. If an event is abandoned or an
 // invalid transition throws, destruction returns both the request slot and all
@@ -162,7 +162,7 @@ private:
     std::string reservation_id_{};
 };
 
-// Structured explicit-pool first admission. Its type cannot carry a radix
+// Explicit-pool Flat first admission. Its type cannot carry a radix
 // match, tree node, legacy allocator, or host-transfer observer; the scheduler
 // has already committed the coordinator transaction before creating it.
 struct ScheduleFlatPrefillFirstChunkEvent : InvalidTransitionHandler<ScheduleFlatPrefillFirstChunkEvent> {

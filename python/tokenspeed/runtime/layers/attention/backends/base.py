@@ -28,9 +28,9 @@ from typing import TYPE_CHECKING
 import torch
 
 from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 
 if TYPE_CHECKING:
-    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
     from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
     from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
@@ -57,6 +57,59 @@ def init_backend_cuda_graph_state(
     if not any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
         extras = {k: v for k, v in extras.items() if k in params}
     backend.init_cuda_graph_state(max_bs, seq_lens_buf, **extras)
+
+
+def init_target_verify_draft_metadata(
+    backend: "AttentionBackend",
+    *,
+    bs: int,
+    num_extends: int,
+    req_pool_indices: torch.Tensor,
+    target_seq_lens: torch.Tensor,
+    draft_seq_lens: torch.Tensor,
+    req_to_page: torch.Tensor,
+    forward_mode: "ForwardMode",
+    extend_kwargs: dict,
+    decode_kwargs: dict,
+) -> None:
+    """Initialize draft metadata that distinguishes verify and draft lengths.
+
+    Attention families exposing this function as
+    ``init_speculative_draft_metadata`` use the target's accepted-prefix
+    lengths for their first draft step. EXTEND/MIXED additionally seeds the
+    mutable draft-length view used by later speculative steps.
+    """
+
+    decode_mode = ForwardMode.DECODE
+    if forward_mode.is_extend_or_mixed():
+        backend.init_forward_metadata(
+            bs=bs,
+            num_extends=num_extends,
+            req_pool_indices=req_pool_indices,
+            seq_lens=target_seq_lens,
+            req_to_page=req_to_page,
+            forward_mode=forward_mode,
+            **extend_kwargs,
+        )
+        backend.init_forward_metadata(
+            bs=bs,
+            num_extends=0,
+            req_pool_indices=req_pool_indices,
+            seq_lens=draft_seq_lens,
+            req_to_page=req_to_page,
+            forward_mode=decode_mode,
+            **decode_kwargs,
+        )
+        return
+    backend.init_forward_metadata(
+        bs=bs,
+        num_extends=0,
+        req_pool_indices=req_pool_indices,
+        seq_lens=target_seq_lens,
+        req_to_page=req_to_page,
+        forward_mode=decode_mode,
+        **decode_kwargs,
+    )
 
 
 class AttentionBackend(ABC):

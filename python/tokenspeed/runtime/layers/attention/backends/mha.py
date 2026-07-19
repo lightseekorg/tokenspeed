@@ -170,8 +170,6 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
 
         # family="state" ids (GDN/mamba) learned in init_cuda_graph_state; this backend sheds them
         self.flat_state_group_ids: frozenset[str] = frozenset()
-        # Per-group page sizes (heterogeneous block sizes), learned with them.
-        self.flat_group_page_sizes: dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Metadata initialization
@@ -466,7 +464,7 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         assert not forward_mode.is_extend_or_mixed()
 
         # Fail loudly instead of replaying over stale/zero page tables.
-        self._flat_replay_stale_guard(
+        validated_flat_group_ids = self._flat_replay_stale_guard(
             bs, flat_block_tables, flat_block_table_base_offsets
         )
 
@@ -510,6 +508,7 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                 tokens_per_req=(
                     self.spec_num_tokens if self.spec_num_tokens > 1 else 1
                 ),
+                validated_group_ids=validated_flat_group_ids,
             )
 
         if bs in self.cuda_graph_decode_metadata:

@@ -33,7 +33,10 @@ from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
+from tokenspeed.runtime.layers.attention.backends.base import (
+    AttentionBackend,
+    init_target_verify_draft_metadata,
+)
 from tokenspeed.runtime.layers.attention.backends.mla import MLAAttnBackend
 from tokenspeed.runtime.layers.attention.backends.trtllm_mla import TRTLLMMLABackend
 from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
@@ -53,6 +56,10 @@ class DSABackend(AttentionBackend):
 
     Dense MLA metadata and dense attention calls are delegated to a platform backend.
     """
+
+    # GLM target-verify uses the same accepted-prefix/draft-length distinction
+    # as V4. Keep the capability on the backend, outside the model-agnostic loop.
+    init_speculative_draft_metadata = init_target_verify_draft_metadata
 
     def __init__(self, config: DSAConfig):
         super().__init__(config)

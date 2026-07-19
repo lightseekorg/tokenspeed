@@ -86,7 +86,7 @@ def scheduler_drained(scheduler) -> bool:
     """True when the scheduler holds no requests that need a forward pass.
 
     Covers every active lifecycle state (waiting/submitted, prefilling,
-    decoding, retracted). A structured flat-KV scheduler also owns completion
+    decoding, retracted). An executor-fenced Flat KV scheduler also owns completion
     fences and page references after the last forward pass, so its optional
     quiescence predicate joins the drain boundary. Legacy schedulers have no
     such predicate and retain the original forward-work-only behavior.

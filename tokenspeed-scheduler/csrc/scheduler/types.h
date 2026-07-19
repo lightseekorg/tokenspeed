@@ -115,19 +115,13 @@ struct SchedulerConfig {
     std::int32_t prefetch_threshold{4};  // num pages
     bool enable_kv_cache_events{false};
     bool enable_mixed_prefill_decode{false};
-    // Executor-fenced flat KV publication is a new ABI. Keep legacy flat
-    // scheduling as the default until the runtime explicitly supplies one
-    // completion record for every dispatched operation.
-    bool enable_structured_flat_kv_completion{false};
-
-    // Explicit pools plus the structured completion ABI form the device-side
-    // ownership boundary. The completion flag alone is also used by legacy
-    // single-pool tests/configurations and therefore is not sufficient. This
-    // only selects lanes inside a Flat build; the compile option remains the
-    // sole Flat-versus-radix backend selector.
-    bool UsesStructuredFlatAdmission() const noexcept {
+    // Explicit pools are the device-side flat ownership boundary and always
+    // use executor-fenced completion. Empty preserves the legacy single-pool
+    // compatibility path. The compile option remains the sole Flat-versus-
+    // radix backend selector.
+    bool UsesExplicitFlatPools() const noexcept {
 #if TOKENSPEED_FLAT_KVCACHE
-        return enable_structured_flat_kv_completion && !flat_block_pools.empty();
+        return !flat_block_pools.empty();
 #else
         return false;
 #endif

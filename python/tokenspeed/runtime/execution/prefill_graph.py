@@ -439,11 +439,10 @@ class PrefillGraph:
         The prefill analogue of decode's ``_init_capture_metadata``. KV writes
         go to the reserved dummy slot and the page table points at page 0, so
         the forward runs (producing discarded garbage) without touching real
-        cache state. Backends with extra paged caches (DeepSeek-V4 DSA: SWA +
-        compressor + indexer state) also need per-cache block tables, or their
-        extend metadata comes up incomplete and the eager attention break
-        aborts the capture -- reuse the decode wrapper's dummy-table builder
-        (all zeros, the safe page 0) for those.
+        cache state. Backends with extra grouped caches also need one table per
+        cache group, or their extend metadata comes up incomplete and the eager
+        attention break aborts the capture -- reuse the decode wrapper's
+        dummy-table builder (all zeros, the safe page 0) for those.
         """
         ib = self.input_buffers
         ib.input_ids_buf[:num_tokens].fill_(1)
@@ -478,10 +477,7 @@ class PrefillGraph:
             ctx.global_bs = [1] * self.config.world_size
         extra_metadata_kwargs: dict = {}
         uses_flat_groups = bool(
-            decode_wrapper is not None
-            and decode_wrapper._uses_flat_table_source(
-                self.token_to_kv_pool, self.attn_backend
-            )
+            decode_wrapper is not None and decode_wrapper.uses_flat_table_source
         )
         uses_paged_groups = bool(
             getattr(self.attn_backend, "uses_paged_cache_groups", False)
@@ -506,9 +502,17 @@ class PrefillGraph:
                     extra_metadata_kwargs["paged_cache_block_tables"] = tables
             extra_metadata_kwargs["num_tokens"] = num_tokens
             extra_metadata_kwargs["positions"] = ib.positions_buf[:num_tokens]
-        flat_tables = self._dummy_flat_tables(num_tokens)
+        flat_tables = (
+            self._dummy_flat_tables(num_tokens)
+            if uses_flat_groups and "flat_block_tables" not in extra_metadata_kwargs
+            else {}
+        )
         if flat_tables:
             extra_metadata_kwargs["flat_block_tables"] = flat_tables
+            extra_metadata_kwargs["flat_block_table_base_offsets"] = {
+                gid: torch.zeros((1,), dtype=torch.int32, device=table.device)
+                for gid, table in flat_tables.items()
+            }
         self.attn_backend.init_forward_metadata(
             bs=1,
             num_extends=1,

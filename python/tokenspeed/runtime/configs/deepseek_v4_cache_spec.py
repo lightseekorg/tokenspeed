@@ -19,12 +19,6 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
-from tokenspeed.runtime.configs.flat_kv_contract import (
-    V4_PRODUCER_DRAFT_INDEXER,
-    V4_PRODUCER_DRAFT_MAIN,
-    V4_PRODUCER_TARGET_INDEXER,
-    V4_PRODUCER_TARGET_MAIN,
-)
 from tokenspeed.runtime.configs.paged_cache_spec import (
     CACHE_OWNER_DRAFT,
     CACHE_OWNER_TARGET,
@@ -204,37 +198,6 @@ def _v4_pool_id_for_ratio(ratio: int, *, history: bool) -> str:
         raise ValueError(f"unsupported DeepSeek V4 compress_ratio={ratio}") from exc
 
 
-def _producer_domain_mask(
-    owner_mask: int,
-    *,
-    main: bool = False,
-    indexer: bool = False,
-) -> int:
-    supported_owners = CACHE_OWNER_TARGET | CACHE_OWNER_DRAFT
-    if (
-        isinstance(owner_mask, bool)
-        or not isinstance(owner_mask, int)
-        or owner_mask <= 0
-        or owner_mask & ~supported_owners
-    ):
-        raise ValueError(
-            "DeepSeek V4 owner_mask must contain only CACHE_OWNER_TARGET "
-            f"and/or CACHE_OWNER_DRAFT, got {owner_mask!r}"
-        )
-    mask = 0
-    if owner_mask & CACHE_OWNER_TARGET:
-        if main:
-            mask |= V4_PRODUCER_TARGET_MAIN
-        if indexer:
-            mask |= V4_PRODUCER_TARGET_INDEXER
-    if owner_mask & CACHE_OWNER_DRAFT:
-        if main:
-            mask |= V4_PRODUCER_DRAFT_MAIN
-        if indexer:
-            mask |= V4_PRODUCER_DRAFT_INDEXER
-    return mask
-
-
 def _resolve_sliding_window(hf_config: Any) -> int:
     for source in (hf_config, getattr(hf_config, "text_config", None)):
         if source is None:
@@ -261,15 +224,21 @@ def build_v4_cache_specs(
     Args:
         hf_config: Model config containing a positive ``sliding_window``.
         layer_ratio: Per-layer compression ratios present in this owner.
-        owner_mask: Target and/or draft ownership bits used to derive bounded
-            producer-domain completion masks.
+        owner_mask: Exactly one owner bit: target or draft.
 
     Returns:
         Six explicitly bound storage classes for the typical ``1/4/128``
         topology, reduced to only the compression ratios actually present.
     """
-    main_producer_mask = _producer_domain_mask(owner_mask, main=True)
-    indexer_producer_mask = _producer_domain_mask(owner_mask, indexer=True)
+    if (
+        isinstance(owner_mask, bool)
+        or not isinstance(owner_mask, int)
+        or owner_mask not in (CACHE_OWNER_TARGET, CACHE_OWNER_DRAFT)
+    ):
+        raise ValueError(
+            "DeepSeek V4 owner_mask must be exactly CACHE_OWNER_TARGET or "
+            f"CACHE_OWNER_DRAFT, got {owner_mask!r}"
+        )
     swa_window = _resolve_sliding_window(hf_config)
     unique_compress_ratios = sorted({int(r) for r in layer_ratio if int(r) > 1})
 
@@ -282,11 +251,10 @@ def build_v4_cache_specs(
             entry_stride_tokens=1,
             sliding_window_tokens=swa_window,
             family="state",
-            block_size_tokens=V4_KERNEL_BLOCK_ROWS,
+            block_size=V4_KERNEL_BLOCK_ROWS,
             pool_id=V4_SWA_POOL_ID,
             prefix_role="continuation_state",
             table_layout="bounded_window",
-            required_producer_domain_mask=main_producer_mask,
             owner_mask=owner_mask,
         ),
     ]
@@ -302,11 +270,10 @@ def build_v4_cache_specs(
                 entry_stride_tokens=1,
                 sliding_window_tokens=_COMPRESSOR_STATE_WINDOW_TOKENS[ratio],
                 family="state",
-                block_size_tokens=_COMPRESSOR_STATE_ROWS_PER_PAGE[ratio],
+                block_size=_COMPRESSOR_STATE_ROWS_PER_PAGE[ratio],
                 pool_id=_v4_pool_id_for_ratio(ratio, history=False),
                 prefix_role="continuation_state",
                 table_layout="bounded_window",
-                required_producer_domain_mask=main_producer_mask,
                 owner_mask=owner_mask,
             )
         )
@@ -319,15 +286,10 @@ def build_v4_cache_specs(
                 entry_stride_tokens=ratio,
                 sliding_window_tokens=None,
                 family="history",
-                block_size_tokens=(_compressed_kernel_block_size(ratio) * ratio),
+                block_size=(_compressed_kernel_block_size(ratio) * ratio),
                 pool_id=_v4_pool_id_for_ratio(ratio, history=True),
                 prefix_role="history_anchor",
                 table_layout="absolute",
-                required_producer_domain_mask=_producer_domain_mask(
-                    owner_mask,
-                    main=True,
-                    indexer=ratio == 4,
-                ),
                 owner_mask=owner_mask,
             )
         )
@@ -341,11 +303,10 @@ def build_v4_cache_specs(
                 entry_stride_tokens=1,
                 sliding_window_tokens=_COMPRESSOR_STATE_WINDOW_TOKENS[4],
                 family="state",
-                block_size_tokens=_COMPRESSOR_STATE_ROWS_PER_PAGE[4],
+                block_size=_COMPRESSOR_STATE_ROWS_PER_PAGE[4],
                 pool_id=V4_INDEX_STATE_POOL_ID,
                 prefix_role="continuation_state",
                 table_layout="bounded_window",
-                required_producer_domain_mask=indexer_producer_mask,
                 owner_mask=owner_mask,
             )
         )
@@ -371,10 +332,6 @@ __all__ = [
     "V4_C4_STATE_POOL_ID",
     "V4_INDEX_STATE_POOL_ID",
     "V4_KERNEL_BLOCK_ROWS",
-    "V4_PRODUCER_DRAFT_INDEXER",
-    "V4_PRODUCER_DRAFT_MAIN",
-    "V4_PRODUCER_TARGET_INDEXER",
-    "V4_PRODUCER_TARGET_MAIN",
     "V4_SWA_KV_GROUP_ID",
     "V4_SWA_POOL_ID",
     "build_v4_cache_specs",

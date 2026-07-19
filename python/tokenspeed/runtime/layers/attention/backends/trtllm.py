@@ -950,7 +950,7 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             )
 
         # Fail loudly instead of replaying over stale/zero page tables.
-        self._flat_replay_stale_guard(
+        validated_flat_group_ids = self._flat_replay_stale_guard(
             bs, flat_block_tables, flat_block_table_base_offsets
         )
 
@@ -989,6 +989,7 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                 flat_block_table_base_offsets,
                 self.cuda_graph_cache_seqlens,
                 tokens_per_req=self._flat_verify_tokens(),
+                validated_group_ids=validated_flat_group_ids,
             )
 
         # Refresh for both verify and draft: draft step 1 is multi-token

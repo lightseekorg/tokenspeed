@@ -22,6 +22,7 @@
 
 #include <concepts>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -38,6 +39,10 @@
 #include "scheduler/request_spec.h"
 #include "utils.h"
 
+#if TOKENSPEED_FLAT_KVCACHE
+#include "scheduler/flat_kv_completion_ledger.h"
+#endif
+
 namespace tokenspeed {
 
 class TreeNode;
@@ -47,6 +52,20 @@ struct Bootstrapping;
 struct PrefetchDone;
 struct Prefetching;
 }  // namespace fsm
+
+#if TOKENSPEED_FLAT_KVCACHE
+struct FlatKVWriteProgress {
+    std::uint64_t table_generation{};
+    // Scheduler-union group order, matching the request's BlockTable vector.
+    std::vector<std::int32_t> published_raw_ends;
+    // Incremental content-hash chain at coordinator base-page granularity. It
+    // never includes a rejected partial page.
+    std::vector<std::string> base_hashes;
+    std::int32_t accepted_raw_end{};
+};
+
+enum class FlatPendingTerminal : std::uint8_t { kFinish, kAbort };
+#endif
 
 class Request {
 public:
@@ -101,7 +120,7 @@ public:
         return token_container_.GetTokenSlice(window);
     }
 
-    // Structured flat completion uses a two-step token append so allocation
+    // Fenced flat completion uses a two-step token append so allocation
     // and FSM-state validation happen before the ledger progress commit. The
     // returned flag preserves ExtendResult's Finished-state no-op behavior.
     bool PrepareFlatResultAppend(std::size_t additional_tokens) {
@@ -127,6 +146,25 @@ public:
             token_container_.ExtendPrepared(tokens);
         }
     }
+
+#if TOKENSPEED_FLAT_KVCACHE
+    FlatKVCompletionState& FlatCompletionState() noexcept { return flat_completion_state_; }
+    const FlatKVCompletionState& FlatCompletionState() const noexcept { return flat_completion_state_; }
+
+    std::optional<FlatKVWriteProgress>& FlatWriteProgress() noexcept { return flat_write_progress_; }
+    const std::optional<FlatKVWriteProgress>& FlatWriteProgress() const noexcept { return flat_write_progress_; }
+    void ResetFlatWriteProgress() noexcept { flat_write_progress_.reset(); }
+
+    bool HasPendingFlatTerminal() const noexcept { return flat_pending_terminal_.has_value(); }
+    void DeferFlatTerminal(FlatPendingTerminal terminal) noexcept {
+        if (!flat_pending_terminal_.has_value() || terminal == FlatPendingTerminal::kAbort) {
+            flat_pending_terminal_ = terminal;
+        }
+    }
+    std::optional<FlatPendingTerminal> TakePendingFlatTerminal() noexcept {
+        return std::exchange(flat_pending_terminal_, std::nullopt);
+    }
+#endif
 
     PrefillInfo GetPrefillInfo() const;
 
@@ -367,6 +405,11 @@ private:
     std::int32_t page_size_;
     fsm::State state_;
     StorageInfo storage_info_;
+#if TOKENSPEED_FLAT_KVCACHE
+    FlatKVCompletionState flat_completion_state_;
+    std::optional<FlatKVWriteProgress> flat_write_progress_;
+    std::optional<FlatPendingTerminal> flat_pending_terminal_;
+#endif
 };
 
 using ConstRequestVector = std::vector<const Request*>;

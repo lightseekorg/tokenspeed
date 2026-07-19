@@ -38,19 +38,17 @@ from tokenspeed.runtime.configs.deepseek_v4_cache_spec import (
     v4_compressed_kv_group_id,
     v4_compressor_state_group_id,
 )
+from tokenspeed.runtime.configs.deepseek_v4_flat_memory_plan import (
+    V4FlatMemoryPlan,
+)
+from tokenspeed.runtime.configs.deepseek_v4_flat_memory_plan import (
+    build_v4_flat_memory_plan as _build_v4_flat_memory_plan,
+)
 from tokenspeed.runtime.configs.flat_memory_plan import (
-    V4_CPU_BLOCK_REF_BYTES_ESTIMATE,
-    V4_CPU_EXPORT_GROUP_HEADER_BYTES_ESTIMATE,
-    V4_CPU_POOL_FIXED_BYTES_ESTIMATE,
-    V4_CPU_POOL_METADATA_BYTES_PER_BLOCK_ESTIMATE,
     FlatCacheOwner,
     FlatComponentTensorPlan,
     FlatGroupTablePlan,
-    V4FlatMemoryPlan,
-    V4FlatMetadataAccounting,
-)
-from tokenspeed.runtime.configs.flat_memory_plan import (
-    build_v4_flat_memory_plan as _build_v4_flat_memory_plan,
+    FlatRuntimeMetadataPlan,
 )
 from tokenspeed.runtime.configs.paged_cache_spec import (
     PagedCacheGroupSpec,
@@ -90,10 +88,10 @@ class DeepseekV4CacheLayout:
     def swa_row_bytes(self) -> int:
         return self.swa_token_stride + self.swa_scale_dim
 
-    def swa_block_bytes(self, page_size: int | None = None) -> int:
-        if page_size is None:
-            page_size = self.page_size
-        block_bytes = page_size * self.swa_row_bytes
+    def swa_block_bytes(self, rows_per_page: int | None = None) -> int:
+        if rows_per_page is None:
+            rows_per_page = self.page_size
+        block_bytes = rows_per_page * self.swa_row_bytes
         alignment = self.swa_token_stride
         return ((block_bytes + alignment - 1) // alignment) * alignment
 
@@ -104,13 +102,6 @@ class DeepseekV4CacheLayout:
     def storage_block_size(self, compress_ratio: int) -> int:
         if compress_ratio > 1:
             return max(1, DEEPSEEK_V4_COMPRESSED_LOGICAL_BLOCK_SIZE // compress_ratio)
-        return self.page_size
-
-    def compressor_state_block_size(self, compress_ratio: int) -> int:
-        if compress_ratio == 4:
-            return 4
-        if compress_ratio == 128:
-            return 8
         return self.page_size
 
     def compressed_cell_bytes(self, compress_ratio: int) -> int:
@@ -213,8 +204,9 @@ def deepseek_v4_flat_component_plans(
     """Describe every independently allocated V4 component plane.
 
     Args:
-        layout: Owner-local layer ratios and physical row geometry.
-        specs: Owner-local group specs whose pool bindings namespace planes.
+        layout: Owner-local ratios and packed per-row storage schema.
+        specs: Owner-local groups; their ``rows_per_page`` is the sole page-row
+            geometry used for every component shape.
         layer_num: Number of owner-local attention layers.
         owner: Target or draft tensor namespace.
 
@@ -228,14 +220,23 @@ def deepseek_v4_flat_component_plans(
             f"layer_num={layer_num}, ratios={len(layout.layer_ratio)}"
         )
     specs_by_id = {spec.group_id: spec for spec in specs}
+    if len(specs_by_id) != len(specs):
+        raise ValueError("DeepSeek V4 flat component specs contain duplicate groups")
 
-    def _require_group(group_id: str) -> None:
-        if group_id not in specs_by_id:
+    def _group_rows(group_id: str) -> int:
+        spec = specs_by_id.get(group_id)
+        if spec is None:
             raise ValueError(
                 f"DeepSeek V4 flat component is missing group spec {group_id!r}"
             )
+        rows_per_page = int(spec.rows_per_page)
+        if rows_per_page <= 0:
+            raise ValueError(
+                f"DeepSeek V4 flat group {group_id!r} rows_per_page must be positive"
+            )
+        return rows_per_page
 
-    _require_group(V4_SWA_KV_GROUP_ID)
+    swa_rows_per_page = _group_rows(V4_SWA_KV_GROUP_ID)
     components: list[FlatComponentTensorPlan] = []
     for layer_id, ratio in enumerate(layout.layer_ratio):
         components.append(
@@ -245,7 +246,7 @@ def deepseek_v4_flat_component_plans(
                 layer=layer_id,
                 component=_V4_SWA_COMPONENT,
                 dtype="uint8",
-                shape_per_block=(layout.swa_block_bytes(V4_KERNEL_BLOCK_ROWS),),
+                shape_per_block=(layout.swa_block_bytes(swa_rows_per_page),),
             )
         )
         if ratio <= 1:
@@ -253,10 +254,8 @@ def deepseek_v4_flat_component_plans(
 
         compressed_group_id = v4_compressed_kv_group_id(ratio)
         compressor_state_group_id = v4_compressor_state_group_id(ratio)
-        _require_group(compressed_group_id)
-        _require_group(compressor_state_group_id)
-        compressed_block_size = layout.storage_block_size(ratio)
-        compressor_state_block_size = layout.compressor_state_block_size(ratio)
+        compressed_rows_per_page = _group_rows(compressed_group_id)
+        compressor_state_rows_per_page = _group_rows(compressor_state_group_id)
         components.extend(
             (
                 _flat_component_plan(
@@ -265,7 +264,7 @@ def deepseek_v4_flat_component_plans(
                     layer=layer_id,
                     component=_V4_COMPRESSED_COMPONENT,
                     dtype="uint8",
-                    shape_per_block=(layout.swa_block_bytes(compressed_block_size),),
+                    shape_per_block=(layout.swa_block_bytes(compressed_rows_per_page),),
                 ),
                 _flat_component_plan(
                     owner=owner,
@@ -274,7 +273,7 @@ def deepseek_v4_flat_component_plans(
                     component=_V4_COMPRESSOR_STATE_COMPONENT,
                     dtype="float32",
                     shape_per_block=(
-                        compressor_state_block_size,
+                        compressor_state_rows_per_page,
                         layout.state_width(layer_id) * 2,
                     ),
                 ),
@@ -283,9 +282,7 @@ def deepseek_v4_flat_component_plans(
         if ratio != 4:
             continue
 
-        _require_group(V4_INDEXER_COMPRESSOR_STATE_GROUP_ID)
-        indexer_block_size = max(V4_KERNEL_BLOCK_ROWS, compressed_block_size)
-        indexer_state_block_size = layout.compressor_state_block_size(ratio)
+        indexer_state_rows_per_page = _group_rows(V4_INDEXER_COMPRESSOR_STATE_GROUP_ID)
         components.extend(
             (
                 _flat_component_plan(
@@ -294,7 +291,9 @@ def deepseek_v4_flat_component_plans(
                     layer=layer_id,
                     component=_V4_INDEXER_COMPONENT,
                     dtype="uint8",
-                    shape_per_block=(indexer_block_size * layout.indexer_row_bytes,),
+                    shape_per_block=(
+                        compressed_rows_per_page * layout.indexer_row_bytes,
+                    ),
                 ),
                 _flat_component_plan(
                     owner=owner,
@@ -303,7 +302,7 @@ def deepseek_v4_flat_component_plans(
                     component=_V4_INDEXER_STATE_COMPONENT,
                     dtype="float32",
                     shape_per_block=(
-                        indexer_state_block_size,
+                        indexer_state_rows_per_page,
                         layout.state_width(layer_id, indexer=True) * 2,
                     ),
                 ),
@@ -312,55 +311,70 @@ def deepseek_v4_flat_component_plans(
     return tuple(components)
 
 
+def _validate_v4_flat_plan_components(
+    plan: V4FlatMemoryPlan,
+    *,
+    specs: Sequence[PagedCacheGroupSpec],
+    expected_components: Sequence[FlatComponentTensorPlan],
+    owner: FlatCacheOwner,
+) -> None:
+    """Fail closed if a plan drifts from the spec-derived storage schema."""
+    pool_by_group = {spec.group_id: spec.pool_id for spec in specs}
+    expected = {
+        (
+            pool_by_group[component.group_id],
+            component.group_id,
+            component.layer,
+            component.component,
+        ): component
+        for component in expected_components
+    }
+    actual = {
+        (
+            pool.pool_id,
+            component.group_id,
+            component.layer,
+            component.component,
+        ): component
+        for pool in plan.pools
+        for component in pool.tensors
+        if component.owner == owner
+    }
+    if actual == expected:
+        return
+
+    missing = sorted(expected.keys() - actual.keys())
+    extra = sorted(actual.keys() - expected.keys())
+    if missing or extra:
+        raise ValueError(
+            f"DeepSeek V4 flat {owner} component geometry disagrees with specs: "
+            f"missing={missing}, extra={extra}"
+        )
+    for identity in sorted(expected):
+        if actual[identity] != expected[identity]:
+            raise ValueError(
+                f"DeepSeek V4 flat {owner} component geometry disagrees with "
+                f"specs for {identity}: expected={expected[identity]!r}, "
+                f"actual={actual[identity]!r}"
+            )
+    raise AssertionError("unreachable component geometry comparison")
+
+
 def _deepseek_v4_cache_group_page_bytes(
     layout: DeepseekV4CacheLayout,
     specs: Sequence[PagedCacheGroupSpec],
     layer_num: int,
 ) -> dict[str, int]:
-    if layer_num > len(layout.layer_ratio):
-        raise ValueError(
-            "DeepSeek V4 cache layout has fewer layer ratios "
-            f"({len(layout.layer_ratio)}) than requested layers ({layer_num})"
-        )
-
-    group_rows = {spec.group_id: int(spec.rows_per_page) for spec in specs}
+    """Sum canonical component-plane bytes for each physical group page."""
     page_bytes = {spec.group_id: 0 for spec in specs}
-    fp32_size = torch._utils._element_size(torch.float32)
-
-    swa_block_bytes = layout.swa_block_bytes(
-        group_rows.get(V4_SWA_KV_GROUP_ID, V4_KERNEL_BLOCK_ROWS)
+    components = deepseek_v4_flat_component_plans(
+        layout=layout,
+        specs=specs,
+        layer_num=layer_num,
+        owner="target",
     )
-    for layer_id, ratio in enumerate(layout.layer_ratio[:layer_num]):
-        page_bytes[V4_SWA_KV_GROUP_ID] += swa_block_bytes
-        if ratio <= 1:
-            continue
-
-        compressed_group_id = v4_compressed_kv_group_id(ratio)
-        compressed_block_size = layout.storage_block_size(ratio)
-        page_bytes[compressed_group_id] += layout.swa_block_bytes(compressed_block_size)
-
-        state_group_id = v4_compressor_state_group_id(ratio)
-        state_block_size = group_rows.get(state_group_id, layout.page_size)
-        page_bytes[state_group_id] += (
-            state_block_size * layout.state_width(layer_id) * 2 * fp32_size
-        )
-
-        if ratio == 4:
-            indexer_block_size = max(V4_KERNEL_BLOCK_ROWS, compressed_block_size)
-            page_bytes[compressed_group_id] += (
-                indexer_block_size * layout.indexer_row_bytes
-            )
-
-            indexer_state_block_size = group_rows.get(
-                V4_INDEXER_COMPRESSOR_STATE_GROUP_ID,
-                layout.compressor_state_block_size(ratio),
-            )
-            page_bytes[V4_INDEXER_COMPRESSOR_STATE_GROUP_ID] += (
-                indexer_state_block_size
-                * layout.state_width(layer_id, indexer=True)
-                * 2
-                * fp32_size
-            )
+    for component in components:
+        page_bytes[component.group_id] += component.bytes_per_block
 
     return page_bytes
 
@@ -416,7 +430,7 @@ def _resolve_flat_graph_batch_rows(
     return resolved
 
 
-def _build_v4_flat_metadata_accounting(
+def _build_v4_flat_runtime_metadata(
     *,
     target_specs: Sequence[PagedCacheGroupSpec],
     target_max_context_len: int,
@@ -429,7 +443,7 @@ def _build_v4_flat_metadata_accounting(
     draft_max_context_len: int | None = None,
     draft_max_live_requests: int | None = None,
     draft_max_graph_bs: int = 0,
-) -> V4FlatMetadataAccounting:
+) -> FlatRuntimeMetadataPlan:
     """Build the exact non-payload accounting for one owner-union plan."""
     target_by_id = {spec.group_id: spec for spec in target_specs}
     draft_by_id = {spec.group_id: spec for spec in draft_specs}
@@ -446,6 +460,11 @@ def _build_v4_flat_metadata_accounting(
         raise ValueError(
             "DeepSeek V4 draft graph rows exceed live request rows: "
             f"graph={draft_max_graph_bs}, live={draft_max_live_requests}"
+        )
+    if draft_specs and draft_max_graph_bs != target_max_graph_bs:
+        raise ValueError(
+            "DeepSeek V4 target/draft graph rows must match the shared executor "
+            f"graph: target={target_max_graph_bs}, draft={draft_max_graph_bs}"
         )
 
     max_new_tokens_per_req = max(0, int(max_scheduled_tokens))
@@ -475,6 +494,10 @@ def _build_v4_flat_metadata_accounting(
             if draft_spec is not None
             else 0
         )
+        if target_spec is not None and draft_spec is not None:
+            shared_capture_cols = max(target_capture_cols, draft_capture_cols)
+            target_capture_cols = shared_capture_cols
+            draft_capture_cols = shared_capture_cols
         export_cols = []
         if target_spec is not None:
             export_cols.append(
@@ -503,51 +526,19 @@ def _build_v4_flat_metadata_accounting(
                 target_capture_cols=target_capture_cols,
                 draft_capture_cols=draft_capture_cols,
                 max_export_cols=max_export_cols,
-                max_live_descriptor_cols=max_export_cols,
             )
         )
 
-    table_plan_by_id = {plan.group_id: plan for plan in group_table_plans}
-    graph_metadata_int32s = target_max_graph_bs * sum(
-        table_plan_by_id[spec.group_id].target_capture_cols + 1 for spec in target_specs
-    ) + draft_max_graph_bs * sum(
-        table_plan_by_id[spec.group_id].draft_capture_cols + 1 for spec in draft_specs
-    )
     forward_buffer_depth = overlap_schedule_depth + 1
     max_scheduled_batch_rows = max(
         target_max_live_requests,
         int(draft_max_live_requests or 0),
     )
-    forward_int32s_per_row = sum(
-        plan.max_export_cols for plan in group_table_plans
-    ) + len(group_table_plans)
-    forward_tensor_bytes = (
-        4 * forward_buffer_depth * max_scheduled_batch_rows * forward_int32s_per_row
-    )
-    return V4FlatMetadataAccounting(
+    return FlatRuntimeMetadataPlan(
         group_table_plans=tuple(group_table_plans),
-        graph_metadata_bytes=4 * graph_metadata_int32s,
-        forward_input_bytes=forward_tensor_bytes,
-        cpu_forward_export_bytes=(
-            forward_tensor_bytes
-            + forward_buffer_depth
-            * len(group_table_plans)
-            * V4_CPU_EXPORT_GROUP_HEADER_BYTES_ESTIMATE
-        ),
-        cpu_forward_staging_bytes=forward_tensor_bytes,
-        cpu_request_metadata_bytes_estimate=(
-            V4_CPU_BLOCK_REF_BYTES_ESTIMATE
-            * max_scheduled_batch_rows
-            * sum(plan.max_live_descriptor_cols for plan in group_table_plans)
-        ),
         forward_buffer_depth=forward_buffer_depth,
-        target_graph_batch_rows=target_max_graph_bs,
-        draft_graph_batch_rows=draft_max_graph_bs,
+        graph_batch_rows=target_max_graph_bs,
         max_scheduled_batch_rows=max_scheduled_batch_rows,
-        cpu_pool_metadata_bytes_per_block_estimate=(
-            V4_CPU_POOL_METADATA_BYTES_PER_BLOCK_ESTIMATE
-        ),
-        cpu_pool_fixed_bytes_estimate=V4_CPU_POOL_FIXED_BYTES_ESTIMATE,
     )
 
 
@@ -687,7 +678,7 @@ def build_deepseek_v4_flat_memory_plan(
     ):
         raise ValueError("DeepSeek V4 flat draft arguments require a draft_layout")
 
-    metadata_accounting = _build_v4_flat_metadata_accounting(
+    runtime_metadata = _build_v4_flat_runtime_metadata(
         target_specs=target_specs,
         target_max_context_len=target_max_context_len,
         target_max_live_requests=target_max_live_requests,
@@ -701,7 +692,7 @@ def build_deepseek_v4_flat_memory_plan(
         draft_max_graph_bs=resolved_draft_max_graph_bs,
     )
 
-    return _build_v4_flat_memory_plan(
+    plan = _build_v4_flat_memory_plan(
         max_total_tokens=max_total_tokens,
         target_group_specs=target_specs,
         target_group_page_counts=target_counts,
@@ -709,8 +700,22 @@ def build_deepseek_v4_flat_memory_plan(
         draft_group_specs=draft_specs,
         draft_group_page_counts=draft_counts,
         draft_components=draft_components,
-        metadata_accounting=metadata_accounting,
+        runtime_metadata=runtime_metadata,
     )
+    _validate_v4_flat_plan_components(
+        plan,
+        specs=target_specs,
+        expected_components=target_components,
+        owner="target",
+    )
+    if draft_specs:
+        _validate_v4_flat_plan_components(
+            plan,
+            specs=draft_specs,
+            expected_components=draft_components,
+            owner="draft",
+        )
+    return plan
 
 
 def profile_deepseek_v4_flat_memory_plan(
@@ -1032,7 +1037,7 @@ def profile_deepseek_v4_max_num_pages(
         bytes_per_page = page_bytes[spec.group_id]
         if bytes_per_page == 0:
             continue
-        raw_per_page = int(spec.rows_per_page) * int(spec.entry_stride_tokens)
+        raw_per_page = int(spec.block_size)
         if spec.retention == "full_history":
             full_history_slope += Fraction(page_size * bytes_per_page, raw_per_page)
         elif spec.retention == "sliding_window":
@@ -1230,9 +1235,6 @@ def _compressed_boundary_mask(
 class DeepseekV4CacheMetadata:
     page_size: int
     block_table: torch.Tensor
-    # ``flat`` forbids every legacy single-table fallback. ``radix`` keeps
-    # today's compatibility for direct metadata construction and old callers.
-    table_source_kind: str = "radix"
     paged_cache_block_tables: dict[str, torch.Tensor] = field(default_factory=dict)
     # Per-sliding-group [num_reqs] int32 base logical-page offset that
     # accompanies each compact block table. Consumers index sliding tables as
@@ -1255,6 +1257,11 @@ class DeepseekV4CacheMetadata:
         default_factory=dict
     )
 
+    @property
+    def has_legacy_block_table(self) -> bool:
+        """Whether the radix-compatible single-table fallback is available."""
+        return self.block_table.ndim == 2 and self.block_table.shape[1] > 0
+
     def compressed_block_table(
         self,
         compress_ratio: int,
@@ -1262,7 +1269,7 @@ class DeepseekV4CacheMetadata:
     ) -> torch.Tensor:
         del kv_cache_block_size
         if compress_ratio <= 1:
-            if self.table_source_kind == "flat":
+            if not self.has_legacy_block_table:
                 raise RuntimeError(
                     "DeepSeek V4 flat cache metadata cannot use the legacy "
                     "single block_table fallback for an uncompressed group"
@@ -1418,7 +1425,7 @@ class DeepseekV4CacheMetadata:
             kv_cache_block_size = self.page_size
         if capacity_pages is not None and capacity_pages < 0:
             raise ValueError(f"capacity_pages must be >= 0, got {capacity_pages}")
-        if self.table_source_kind == "flat" and capacity_pages is None:
+        if not self.has_legacy_block_table and capacity_pages is None:
             raise RuntimeError(
                 "DeepSeek V4 flat compressed slot mapping requires the owner "
                 "component page capacity"
@@ -1552,6 +1559,13 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
 
     supports_hierarchical_kv_cache = False
     supports_pd_transfer = False
+    device_cache_buffer_names = (
+        "swa_kv_buffer",
+        "compressed_kv_buffer",
+        "compressor_state_buffer",
+        "indexer_kv_buffer",
+        "indexer_state_buffer",
+    )
 
     def __init__(
         self,
@@ -1598,9 +1612,6 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
         self.flat_memory_plan = (
             flat_arena_set.plan if flat_arena_set is not None else None
         )
-        self.flat_group_table_plans = ()
-        self.flat_capture_cols_by_group: dict[str, int] | None = None
-        self.flat_max_export_cols_by_group: dict[str, int] | None = None
         # The arena creates the one allocation region for flat target+draft.
         # Radix keeps the existing per-pool region and allocation behavior.
         self.memory_saver_adapter = (
@@ -1639,15 +1650,6 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
             self.num_pages = (size + page_size - 1) // page_size + 1
         else:
             plan = flat_arena_set.plan
-            self.flat_group_table_plans = plan.group_table_plans
-            self.flat_capture_cols_by_group = {
-                item.group_id: item.capture_cols(cache_owner)
-                for item in plan.group_table_plans
-                if item.capture_cols(cache_owner) > 0
-            }
-            self.flat_max_export_cols_by_group = {
-                item.group_id: item.max_export_cols for item in plan.group_table_plans
-            }
             if size != plan.max_total_tokens:
                 raise ValueError(
                     "DeepSeek V4 flat pool size must match shared plan: "
@@ -1699,48 +1701,57 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
             if spec.family == "state"
         )
 
-        def _group_rows(group_id: str, default: int) -> int:
+        def _group_rows(group_id: str) -> int:
             spec = self._paged_cache_group_specs_by_id.get(group_id)
-            return int(spec.rows_per_page) if spec is not None else int(default)
+            if spec is None:
+                raise ValueError(
+                    f"DeepSeek V4 cache layout is missing group spec {group_id!r}"
+                )
+            return int(spec.rows_per_page)
 
-        self.swa_block_size = _group_rows(V4_SWA_KV_GROUP_ID, V4_KERNEL_BLOCK_ROWS)
-        self.state_block_size = page_size
+        self.swa_block_size = _group_rows(V4_SWA_KV_GROUP_ID)
+        self._legacy_state_block_size = page_size
         self.swa_block_bytes = layout.swa_block_bytes(self.swa_block_size)
-        self.compressed_block_sizes = tuple(
-            layout.storage_block_size(ratio) if ratio > 1 else page_size
-            for ratio in layout.layer_ratio
-        )
-        self.indexer_block_sizes = tuple(
-            (
-                max(V4_KERNEL_BLOCK_ROWS, self.compressed_block_sizes[layer_id])
-                if ratio == 4
-                else 0
+        if flat_arena_set is not None:
+            self.compressed_block_sizes = tuple(
+                (
+                    _group_rows(v4_compressed_kv_group_id(ratio))
+                    if ratio > 1
+                    else page_size
+                )
+                for ratio in layout.layer_ratio
             )
-            for layer_id, ratio in enumerate(layout.layer_ratio)
-        )
+            self.indexer_block_sizes = tuple(
+                (_group_rows(v4_compressed_kv_group_id(ratio)) if ratio == 4 else 0)
+                for ratio in layout.layer_ratio
+            )
+        else:
+            # The legacy/radix allocation keeps its existing layout-derived
+            # kernel geometry. Flat allocation is spec-derived above.
+            self.compressed_block_sizes = tuple(
+                layout.storage_block_size(ratio) if ratio > 1 else page_size
+                for ratio in layout.layer_ratio
+            )
+            self.indexer_block_sizes = tuple(
+                (
+                    max(V4_KERNEL_BLOCK_ROWS, self.compressed_block_sizes[layer_id])
+                    if ratio == 4
+                    else 0
+                )
+                for layer_id, ratio in enumerate(layout.layer_ratio)
+            )
         self.compressor_state_block_sizes = tuple(
             (
-                _group_rows(v4_compressor_state_group_id(ratio), page_size)
+                _group_rows(v4_compressor_state_group_id(ratio))
                 if ratio > 1
                 else page_size
             )
             for ratio in layout.layer_ratio
         )
         self.indexer_state_block_sizes = tuple(
-            (
-                _group_rows(
-                    V4_INDEXER_COMPRESSOR_STATE_GROUP_ID,
-                    layout.compressor_state_block_size(ratio),
-                )
-                if ratio == 4
-                else 0
-            )
+            (_group_rows(V4_INDEXER_COMPRESSOR_STATE_GROUP_ID) if ratio == 4 else 0)
             for ratio in layout.layer_ratio
         )
-        self.compressed_block_size = (
-            self.compressed_block_sizes[0] if self.compressed_block_sizes else page_size
-        )
-
         if flat_arena_set is not None:
             self.swa_kv_buffer = tuple(
                 flat_arena_set.tensor(
@@ -1925,6 +1936,11 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
             return None
         return self.flat_arena_set.arena_generation
 
+    @property
+    def device_cache_arena(self) -> V4FlatArenaSet | None:
+        """Return the shared flat arena that owns this pool's device tensors."""
+        return self.flat_arena_set
+
     def bind_paged_cache_scheduler(self, scheduler: object) -> None:
         self._paged_cache_scheduler = scheduler
 
@@ -1987,6 +2003,16 @@ class DeepseekV4TokenToKVPool(BaseTokenToKVPool):
 
     def get_swa_kv_buffer(self, layer_id: int) -> torch.Tensor:
         return self.swa_kv_buffer[layer_id]
+
+    @property
+    def state_block_size(self) -> int:
+        """Legacy/radix state-block fallback; Flat requires a group table."""
+        if self.flat_memory_plan is not None:
+            raise RuntimeError(
+                "DeepSeek V4 Flat KV state geometry requires its group-specific "
+                "block table"
+            )
+        return self._legacy_state_block_size
 
     @property
     def swa_capacity_pages(self) -> int:

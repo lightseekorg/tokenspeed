@@ -83,10 +83,9 @@ void PagedCacheGroupConfig::ValidateFlatBlockGeometry() const {
             throw std::invalid_argument("PagedCacheGroupConfig: continuation window must be page-aligned; group=" +
                                         group_id);
         }
-        if (required_producer_domain_mask == 0 || owner_mask == 0) {
-            throw std::invalid_argument(
-                "PagedCacheGroupConfig: continuation state requires producer-domain and owner masks; group=" +
-                group_id);
+        if (owner_mask == 0) {
+            throw std::invalid_argument("PagedCacheGroupConfig: continuation state requires an owner mask; group=" +
+                                        group_id);
         }
     }
 }

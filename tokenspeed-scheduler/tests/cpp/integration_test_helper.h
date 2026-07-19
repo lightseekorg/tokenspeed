@@ -31,6 +31,18 @@
 
 namespace tokenspeed::test {
 
+#if TOKENSPEED_FLAT_KVCACHE
+inline std::vector<std::int32_t> SnapshotFreeBlocks(const Scheduler& scheduler) {
+    const std::vector<BlockPoolSnapshot> snapshots = scheduler.FlatPoolSnapshots();
+    std::vector<std::int32_t> free_blocks;
+    free_blocks.reserve(snapshots.size());
+    for (const BlockPoolSnapshot& snapshot : snapshots) {
+        free_blocks.push_back(snapshot.free_blocks);
+    }
+    return free_blocks;
+}
+#endif
+
 class SchedulerTestSuite : public ::testing::Test {
 protected:
     // Subclasses can override this to customize the config.

@@ -30,18 +30,14 @@
 namespace tokenspeed::test {
 namespace {
 
-TEST(PoolDemandTest, ArithmeticIsComponentWise) {
-    PoolDemand demand{1, 2, 3};
-    demand.AddInPlace(PoolDemand{4, 0, 1});
-    EXPECT_EQ(demand, (PoolDemand{5, 2, 4}));
-
-    demand.SubtractInPlace(PoolDemand{2, 2, 1});
-    EXPECT_EQ(demand, (PoolDemand{3, 0, 3}));
-}
-
 enum class InvalidPoolDemandArithmetic { kShapeMismatch, kUnderflow };
 
 TEST(PoolDemandTest, InvalidArithmeticDoesNotPartiallyMutate) {
+    PoolDemand valid{1, 2, 3};
+    valid.AddInPlace(PoolDemand{4, 0, 1});
+    valid.SubtractInPlace(PoolDemand{2, 2, 1});
+    EXPECT_EQ(valid, (PoolDemand{3, 0, 3}));
+
     struct Case {
         const char* name;
         InvalidPoolDemandArithmetic operation;
@@ -82,36 +78,37 @@ TEST(BlockPoolSetTest, CanonicalizesIdsAndKeepsPoolAddressesStable) {
     EXPECT_NE(first, second);
     EXPECT_EQ(&pools.Pool(0), first);
     EXPECT_EQ(&pools.Pool(1), second);
+
+    auto first_page = first->AllocateBlocks(1);
+    auto second_page = second->AllocateBlocks(1);
+    ASSERT_EQ(first_page.size(), 1u);
+    ASSERT_EQ(second_page.size(), 1u);
+    EXPECT_EQ(first_page.front()->BlockId(), 1);
+    EXPECT_EQ(second_page.front()->BlockId(), 1);
+    EXPECT_NE(first_page.front(), second_page.front());
 }
 
-TEST(BlockPoolSetTest, LocalPageIdsAreIndependentAcrossPools) {
-    BlockPoolSet pools({
-        FlatBlockPoolConfig{.pool_id = "history", .total_blocks = 3, .bytes_per_block = 128},
-        FlatBlockPoolConfig{.pool_id = "state", .total_blocks = 3, .bytes_per_block = 32},
-    });
-
-    auto history = pools.Pool(pools.IndexOf("history")).AllocateBlocks(1);
-    auto state = pools.Pool(pools.IndexOf("state")).AllocateBlocks(1);
-    ASSERT_EQ(history.size(), 1u);
-    ASSERT_EQ(state.size(), 1u);
-    EXPECT_EQ(history.front()->BlockId(), 1);
-    EXPECT_EQ(state.front()->BlockId(), 1);
-    EXPECT_NE(history.front(), state.front());
-}
-
-TEST(BlockPoolSetTest, AdmissionChecksEveryPoolWithoutCrossPoolBorrowing) {
+TEST(BlockPoolSetTest, SnapshotReportsIndependentPerPoolCapacityAndUsage) {
     BlockPoolSet pools({
         FlatBlockPoolConfig{.pool_id = "history", .total_blocks = 5, .bytes_per_block = 128},
         FlatBlockPoolConfig{.pool_id = "state", .total_blocks = 2, .bytes_per_block = 32},
     });
 
-    EXPECT_TRUE(pools.CanSatisfy(PoolDemand{4, 1}));
-    EXPECT_FALSE(pools.CanSatisfy(PoolDemand{1, 2}));
+    const std::vector<BlockPoolSnapshot> initial = pools.Snapshot();
+    ASSERT_EQ(initial.size(), 2u);
+    EXPECT_EQ(initial[0].pool_id, "history");
+    EXPECT_EQ(initial[0].usable_blocks, 4);
+    EXPECT_EQ(initial[0].free_blocks, 4);
+    EXPECT_EQ(initial[1].pool_id, "state");
+    EXPECT_EQ(initial[1].usable_blocks, 1);
+    EXPECT_EQ(initial[1].free_blocks, 1);
 
     auto state = pools.Pool(pools.IndexOf("state")).AllocateBlocks(1);
     ASSERT_EQ(state.size(), 1u);
-    EXPECT_TRUE(pools.CanSatisfy(PoolDemand{4, 0}));
-    EXPECT_FALSE(pools.CanSatisfy(PoolDemand{0, 1}));
+    const std::vector<BlockPoolSnapshot> allocated = pools.Snapshot();
+    ASSERT_EQ(allocated.size(), initial.size());
+    EXPECT_EQ(allocated[0].free_blocks, initial[0].free_blocks);
+    EXPECT_EQ(allocated[1].free_blocks, initial[1].free_blocks - 1);
 }
 
 TEST(BlockPoolSetTest, RejectsInvalidOrDuplicateConfiguration) {

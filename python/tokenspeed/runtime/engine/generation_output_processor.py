@@ -659,7 +659,7 @@ class OutputProcesser:
 
             # Mid-chunk extend slot by the op's own prefill_lengths (rebased after
             # flat retract). The sampled token is garbage, but a flat KV row
-            # still owes its producer completion. Fresh requests:
+            # still owes its execution completion. Fresh requests:
             # prefill_length == prompt length, same as the gate below.
             if (
                 not is_decode_slot
@@ -816,13 +816,13 @@ class OutputProcesser:
                 self.rid_to_state.pop(rid)
                 continue
 
-            structured_nan_abort = (
+            flat_kv_nan_abort = (
                 flat_kv_completion is not None
                 and nan_detected
                 and request_state.finished
                 and not is_prefill_instance
             )
-            if structured_nan_abort:
+            if flat_kv_nan_abort:
                 # Cancel every outstanding dispatch before this execution
                 # fence reaches the scheduler. The completion still retires
                 # debt, but canceled records cannot mutate tokens or publish
@@ -846,7 +846,7 @@ class OutputProcesser:
                 stream_out_rids.append(rid)
                 stream_out_states.append(request_state)
                 # Abort (vs Finish) keeps corrupted KV out of the prefix caches.
-                if not structured_nan_abort:
+                if not flat_kv_nan_abort:
                     request_changes.append(
                         make_abort_event(rid)
                         if nan_detected

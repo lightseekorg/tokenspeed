@@ -32,8 +32,6 @@ Family = Literal["history", "state"]
 PrefixRole = Literal["history_anchor", "continuation_state", "none"]
 TableLayout = Literal["absolute", "bounded_window"]
 
-_UINT32_MAX = (1 << 32) - 1
-
 
 @dataclass(frozen=True)
 class PagedCacheGroupSpec:
@@ -46,15 +44,14 @@ class PagedCacheGroupSpec:
     sliding_window_tokens: int | None
     # History groups form a chain; State groups only need the trailing window.
     family: Family = "history"
-    # Per-group page tokens; None -> scheduler global block_size, else a multiple of it.
+    # The only per-group raw-token page span. ``None`` is accepted as a
+    # construction convenience and is immediately canonicalized from geometry.
     block_size: int | None = None
     # Flat-cache metadata is additive: existing positional construction keeps
     # the legacy single-pool, all-groups-prefix, absolute-table behavior.
-    block_size_tokens: int | None = None
     pool_id: str = "default"
     prefix_role: PrefixRole = "history_anchor"
     table_layout: TableLayout = "absolute"
-    required_producer_domain_mask: int = 0
     owner_mask: int = 0
 
     def __post_init__(self) -> None:
@@ -62,11 +59,13 @@ class PagedCacheGroupSpec:
 
         Existing geometry/retention validation intentionally remains in the
         sizing helpers: several legacy callers construct specs first and only
-        validate them when selecting a scheduler path.  The new explicit block
-        span, when supplied, must nevertheless agree with that geometry.
+        validate them when selecting a scheduler path. The canonical block span
+        must nevertheless agree with that geometry.
         """
         derived_block_size = self.rows_per_page * self.entry_stride_tokens
-        if self.block_size is not None and (
+        if self.block_size is None:
+            object.__setattr__(self, "block_size", derived_block_size)
+        elif (
             isinstance(self.block_size, bool)
             or not isinstance(self.block_size, int)
             or self.block_size != derived_block_size
@@ -75,18 +74,6 @@ class PagedCacheGroupSpec:
                 f"PagedCacheGroupSpec {self.group_id}: block_size must equal "
                 f"rows_per_page * entry_stride_tokens ({derived_block_size}), "
                 f"got {self.block_size!r}"
-            )
-        if self.block_size_tokens is None:
-            object.__setattr__(self, "block_size_tokens", derived_block_size)
-        elif (
-            isinstance(self.block_size_tokens, bool)
-            or not isinstance(self.block_size_tokens, int)
-            or self.block_size_tokens != derived_block_size
-        ):
-            raise ValueError(
-                f"PagedCacheGroupSpec {self.group_id}: block_size_tokens "
-                f"must equal rows_per_page * entry_stride_tokens "
-                f"({derived_block_size}), got {self.block_size_tokens!r}"
             )
 
         if not isinstance(self.pool_id, str) or not self.pool_id:
@@ -107,21 +94,17 @@ class PagedCacheGroupSpec:
                 f"PagedCacheGroupSpec {self.group_id}: unsupported table_layout "
                 f"{self.table_layout!r}"
             )
-        self._validate_mask(
-            "required_producer_domain_mask", self.required_producer_domain_mask
-        )
-        self._validate_mask("owner_mask", self.owner_mask)
-
-    def _validate_mask(self, name: str, value: int) -> None:
+        supported_owners = CACHE_OWNER_TARGET | CACHE_OWNER_DRAFT
         if (
-            isinstance(value, bool)
-            or not isinstance(value, int)
-            or value < 0
-            or value > _UINT32_MAX
+            isinstance(self.owner_mask, bool)
+            or not isinstance(self.owner_mask, int)
+            or self.owner_mask < 0
+            or self.owner_mask & ~supported_owners
         ):
             raise ValueError(
-                f"PagedCacheGroupSpec {self.group_id}: {name} must be uint32, "
-                f"got {value!r}"
+                f"PagedCacheGroupSpec {self.group_id}: owner_mask must contain "
+                "only CACHE_OWNER_TARGET and/or CACHE_OWNER_DRAFT, got "
+                f"{self.owner_mask!r}"
             )
 
 
@@ -357,7 +340,8 @@ def compute_paged_cache_group_page_counts(
 
     counts: dict[str, int] = {}
     for spec in specs:
-        raw_per_page = spec.block_size_tokens
+        raw_per_page = spec.block_size
+        assert raw_per_page is not None
         if raw_per_page <= 0:
             raise ValueError(
                 f"PagedCacheGroupSpec {spec.group_id}: rows_per_page * "
@@ -367,7 +351,7 @@ def compute_paged_cache_group_page_counts(
             overlap_schedule_depth * decode_input_tokens, raw_per_page
         )
         # Mamba-state kind = family "state" AND retention != sliding_window
-        # (the C++ side keys it the same way); V4's sliding-window state tail
+        # (the C++ side keys it the same way); sliding-window state-tail
         # buffers keep the sliding-window formula below.
         if spec.family == "state" and spec.retention == "full_history":
             # State group: 2 live pages/request (the W=2 write window) +
@@ -681,7 +665,8 @@ def compute_flat_capture_cols(
         raise ValueError(
             f"overlap_schedule_depth must be 0 or 1, got {overlap_schedule_depth}"
         )
-    raw_per_page = spec.block_size_tokens
+    raw_per_page = spec.block_size
+    assert raw_per_page is not None
     if raw_per_page <= 0:
         raise ValueError(
             f"PagedCacheGroupSpec {spec.group_id}: rows_per_page * "
@@ -758,7 +743,8 @@ def compute_flat_export_cols(
         raise ValueError(
             f"overlap_schedule_depth must be 0 or 1, got {overlap_schedule_depth}"
         )
-    raw_per_page = spec.block_size_tokens
+    raw_per_page = spec.block_size
+    assert raw_per_page is not None
     if raw_per_page <= 0:
         raise ValueError(
             f"PagedCacheGroupSpec {spec.group_id}: rows_per_page * "

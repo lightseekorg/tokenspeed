@@ -20,7 +20,7 @@
 
 """Factories for PD KV transfer helpers."""
 
-from tokenspeed.runtime.deepseek_v4_cache_capabilities import (
+from tokenspeed.runtime.cache_capabilities import (
     validate_pd_transfer_pools,
 )
 from tokenspeed.runtime.pd.decode_executor import DisaggDecodeExecutor

@@ -42,6 +42,8 @@ namespace tokenspeed {
 
 using PoolIndex = std::size_t;
 
+class Scheduler;
+
 // Canonical scheduler-side description of one homogeneous flat block pool.
 // Device tensor ownership remains in Python; this config only sizes metadata
 // and provides byte weights for admission/observability.
@@ -56,8 +58,8 @@ struct FlatBlockPoolConfig {
 // mutation so failed admission bookkeeping cannot leave a partial demand.
 class PoolDemand {
 public:
-    // The current V4 layout has six storage classes. Eight int32 entries fit
-    // in one 32-byte inline array and leave room for two optional classes.
+    // Eight int32 entries fit in one 32-byte inline array. Larger heterogeneous
+    // layouts retain the same contract through the heap fallback.
     static constexpr std::size_t kInlineCapacity = 8;
 
     PoolDemand() = default;
@@ -261,22 +263,9 @@ public:
         mutation_domain_->AssertOwnerThread();
         PoolDemand out(Size(), 0);
         for (PoolIndex i = 0; i < Size(); ++i) {
-            out[i] = Pool(i).NumFreeBlocks();
+            out[i] = Pool(i).numFreeBlocksInDomain();
         }
         return out;
-    }
-
-    PoolDemand TotalUsableBlocks() const {
-        PoolDemand out(Size(), 0);
-        for (PoolIndex i = 0; i < Size(); ++i) {
-            out[i] = Config(i).total_blocks - 1;
-        }
-        return out;
-    }
-
-    bool CanSatisfy(const PoolDemand& demand) const {
-        mutation_domain_->AssertOwnerThread();
-        return demand.FitsWithin(FreeBlocks());
     }
 
     std::int64_t BytesFor(const PoolDemand& demand) const {
@@ -342,6 +331,13 @@ public:
     }
 
 private:
+    // Scheduler APIs validate the shared mutation domain once before scanning
+    // the immutable pool registry. Keep the unchecked counter read private so
+    // no other caller can accidentally bypass that transaction boundary.
+    std::int32_t numFreeBlocksInValidatedDomain(PoolIndex index) const noexcept {
+        return pools_[index]->numFreeBlocksInDomain();
+    }
+
     void Initialize(std::vector<FlatBlockPoolConfig> configs) {
         mutation_domain_->AssertOwnerThread();
         if (configs.empty()) {
@@ -382,6 +378,8 @@ private:
     std::vector<std::unique_ptr<BlockPool>> pools_;
     std::unordered_map<std::string, PoolIndex> pool_index_;
     std::uint64_t generation_{0};
+
+    friend class Scheduler;
 };
 
 }  // namespace tokenspeed

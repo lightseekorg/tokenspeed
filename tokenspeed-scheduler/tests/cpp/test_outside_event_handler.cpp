@@ -195,7 +195,7 @@ TEST_F(DisaggDecodeAdmissionTestSuite, ReservesWholeDestinationAndSurvivesRemote
     EXPECT_EQ(decode->occupied_pages[static_cast<std::size_t>(r0)].size(), 3u);
 #if TOKENSPEED_FLAT_KVCACHE
     ASSERT_EQ(decode->flat_block_tables.count("full"), 1u);
-    EXPECT_EQ(decode->flat_block_tables.at("full")[static_cast<std::size_t>(r0)].size(), 3u);
+    EXPECT_EQ(decode->flat_block_tables.at("full").Row(static_cast<std::size_t>(r0)).size(), 3u);
 #endif
 }
 

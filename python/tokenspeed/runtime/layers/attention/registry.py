@@ -26,13 +26,16 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from tokenspeed.runtime.configs.flat_memory_plan import (
+from tokenspeed.runtime.configs.deepseek_v4_flat_memory_plan import (
     V4FlatMemoryPlan,
     V4FlatPlanAgreementRecord,
     assert_v4_flat_plan_agreement,
+    canonical_v4_flat_memory_plan,
+    make_v4_flat_plan_agreement_record,
+)
+from tokenspeed.runtime.configs.flat_memory_plan import (
     components_from_layers,
     equalized_block_size,
-    make_v4_flat_plan_agreement_record,
     plan_component_tensors,
     state_const_bytes,
 )
@@ -163,9 +166,27 @@ def _assert_v4_flat_plan_tp_agreement(
             "DeepSeek V4 flat plan agreement received an incomplete "
             f"attention-TP gather for group {attn_tp_group}"
         )
-    assert_v4_flat_plan_agreement(
-        [record for record in gathered_records if record is not None]
-    )
+    records = [record for record in gathered_records if record is not None]
+    canonical_plans = None
+    if len({record.plan_fingerprint for record in records}) != 1:
+        local_diagnostic = (rank, canonical_v4_flat_memory_plan(plan))
+        gathered_diagnostics: list[tuple[int, dict[str, object]] | None] = [None] * len(
+            attn_tp_group
+        )
+        dist.all_gather_object(
+            gathered_diagnostics,
+            local_diagnostic,
+            group=cpu_group,
+        )
+        if any(item is None for item in gathered_diagnostics):
+            raise RuntimeError(
+                "DeepSeek V4 flat plan mismatch diagnostic received an "
+                f"incomplete attention-TP gather for group {attn_tp_group}"
+            )
+        canonical_plans = dict(
+            diagnostic for diagnostic in gathered_diagnostics if diagnostic is not None
+        )
+    assert_v4_flat_plan_agreement(records, canonical_plans=canonical_plans)
 
 
 # ---------- backend registry ----------
@@ -904,11 +925,7 @@ def create_attn_components(
                     else None
                 ),
                 draft_max_graph_bs=(
-                    # CudaGraphWrapper currently initializes both owner
-                    # backends with the target wrapper's shared max_bs.
-                    flat_graph_batch_rows
-                    if is_deepseek_v4_draft_model
-                    else None
+                    flat_graph_batch_rows if is_deepseek_v4_draft_model else None
                 ),
                 decode_input_tokens=decode_input_tokens,
                 overlap_schedule_depth=overlap_schedule_depth,
@@ -920,24 +937,23 @@ def create_attn_components(
             )
             max_num_tokens = deepseek_v4_flat_plan.max_total_tokens
             max_total_num_pages = max_num_tokens // server_args.block_size
+            runtime_metadata = deepseek_v4_flat_plan.runtime_metadata
             logger.info(
                 "DeepSeek V4 flat KV profile: max_total_num_pages=%s, "
                 "device_cache_total_bytes=%s, payload_bytes=%s, "
                 "graph_metadata_bytes=%s, forward_input_bytes=%s, "
-                "cpu_cache_metadata_total_bytes=%s, forward_buffer_depth=%s, "
-                "graph_batch_rows=(target=%s,draft=%s), "
+                "forward_buffer_depth=%s, "
+                "graph_batch_rows=%s, "
                 "max_scheduled_batch_rows=%s, "
                 "pools=%s, fingerprint=%s",
                 max_total_num_pages,
                 deepseek_v4_flat_plan.device_cache_total_bytes,
                 deepseek_v4_flat_plan.payload_bytes,
-                deepseek_v4_flat_plan.graph_metadata_bytes,
-                deepseek_v4_flat_plan.forward_input_bytes,
-                deepseek_v4_flat_plan.cpu_cache_metadata_total_bytes,
-                deepseek_v4_flat_plan.forward_buffer_depth,
-                deepseek_v4_flat_plan.target_graph_batch_rows,
-                deepseek_v4_flat_plan.draft_graph_batch_rows,
-                deepseek_v4_flat_plan.max_scheduled_batch_rows,
+                runtime_metadata.graph_metadata_bytes,
+                runtime_metadata.forward_input_bytes,
+                runtime_metadata.forward_buffer_depth,
+                runtime_metadata.graph_batch_rows,
+                runtime_metadata.max_scheduled_batch_rows,
                 [
                     (pool.pool_id, pool.total_blocks, pool.bytes_per_block)
                     for pool in deepseek_v4_flat_plan.pools

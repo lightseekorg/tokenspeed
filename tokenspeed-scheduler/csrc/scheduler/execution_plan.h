@@ -52,9 +52,7 @@ public:
     // with no Decoding/PrefillDone victim to retract. Always empty on the radix path.
     std::vector<std::string> flat_oom_request_ids;
 
-    void TakeFlatOomRequestIds(std::vector<std::string>& outbox) noexcept {
-        flat_oom_request_ids.swap(outbox);
-    }
+    void TakeFlatOomRequestIds(std::vector<std::string>& outbox) noexcept { flat_oom_request_ids.swap(outbox); }
 
 private:
     std::vector<Operation> operations_;

@@ -22,62 +22,13 @@
 
 from __future__ import annotations
 
-import ast
-import pathlib
 from types import SimpleNamespace
 
 import pytest
 
-_ROOT = pathlib.Path(__file__).resolve().parents[2]
-_EVENT_LOOP = _ROOT / "python" / "tokenspeed" / "runtime" / "engine" / "event_loop.py"
-_METHOD_NAMES = {
-    "_kv_pools",
-    "_v4_flat_arenas",
-    "_reset_caches_for_release",
-    "_kv_repair_after_wake",
-}
-
-
-def _load_event_loop_seam():
-    """Compile only the dependency-free lifecycle methods from EventLoop."""
-    tree = ast.parse(_EVENT_LOOP.read_text())
-    source_class = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "EventLoop"
-    )
-    methods = [
-        node
-        for node in source_class.body
-        if isinstance(node, ast.FunctionDef) and node.name in _METHOD_NAMES
-    ]
-    assert {node.name for node in methods} == _METHOD_NAMES
-    seam_class = ast.ClassDef(
-        name="EventLoopSeam",
-        bases=[],
-        keywords=[],
-        body=methods,
-        decorator_list=[],
-    )
-    module = ast.fix_missing_locations(
-        ast.Module(
-            body=[
-                ast.ImportFrom(
-                    module="__future__",
-                    names=[ast.alias(name="annotations")],
-                    level=0,
-                ),
-                seam_class,
-            ],
-            type_ignores=[],
-        )
-    )
-    namespace = {}
-    exec(compile(module, str(_EVENT_LOOP), "exec"), namespace)
-    return namespace["EventLoopSeam"]
-
-
-EventLoopSeam = _load_event_loop_seam()
+pytest.importorskip("torch")
+pytest.importorskip("tokenspeed_scheduler")
+EventLoop = pytest.importorskip("tokenspeed.runtime.engine.event_loop").EventLoop
 
 
 class _Arena:
@@ -94,7 +45,7 @@ class _Arena:
 
 class _Pool:
     def __init__(self, arena=None):
-        self.flat_arena_set = arena
+        self.device_cache_arena = arena
         self.clear_calls = 0
 
     def clear_kv_buffers(self):
@@ -116,7 +67,7 @@ class _Scheduler:
 
 
 def _event_loop(*, target, draft=None, scheduler=None):
-    event_loop = EventLoopSeam()
+    event_loop = object.__new__(EventLoop)
     event_loop.model_executor = SimpleNamespace(
         token_to_kv_pool=target,
         draft_token_to_kv_pool=draft,
@@ -177,7 +128,7 @@ def test_distinct_target_and_draft_arenas_are_rejected_before_reset():
         scheduler=scheduler,
     )
 
-    with pytest.raises(RuntimeError, match="must share one canonical arena"):
+    with pytest.raises(RuntimeError, match="must share one device-cache arena"):
         event_loop._reset_caches_for_release()
 
     assert scheduler.flat_reset_calls == 0

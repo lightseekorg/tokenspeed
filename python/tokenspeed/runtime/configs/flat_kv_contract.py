@@ -20,21 +20,16 @@
 
 """Import-light constants shared by flat-KV planning and execution.
 
-This module deliberately depends only on Python builtins.  Config planners and
-execution progress tracking can therefore share one ABI authority without
-pulling model, torch, or compiled-extension dependencies into standalone tests.
+This module deliberately depends only on Python builtins so configuration
+planners share one owner/layer vocabulary without importing model, torch, or
+compiled-extension dependencies into standalone tests.
 """
 
 from __future__ import annotations
 
-# Model-side owners and executor producer domains are separate bit namespaces.
+# Model-side owners in the shared target/draft plan.
 CACHE_OWNER_TARGET = 1 << 0
 CACHE_OWNER_DRAFT = 1 << 1
-
-V4_PRODUCER_TARGET_MAIN = 1 << 0
-V4_PRODUCER_TARGET_INDEXER = 1 << 1
-V4_PRODUCER_DRAFT_MAIN = 1 << 2
-V4_PRODUCER_DRAFT_INDEXER = 1 << 3
 
 # Paged-cache label vocabulary, not the checkpoint's serialized layer enum.
 LINEAR_ATTENTION = "linear_attention"
@@ -45,8 +40,4 @@ __all__ = [
     "CACHE_OWNER_TARGET",
     "LINEAR_ATTENTION",
     "STATE_LAYER_TYPES",
-    "V4_PRODUCER_DRAFT_INDEXER",
-    "V4_PRODUCER_DRAFT_MAIN",
-    "V4_PRODUCER_TARGET_INDEXER",
-    "V4_PRODUCER_TARGET_MAIN",
 ]
