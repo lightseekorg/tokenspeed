@@ -62,7 +62,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 
 
-def _window_shifted_ids(
+def _decode_shifted_ids(
     v: torch.Tensor,
     accept: torch.Tensor,
     next_tokens: torch.Tensor,
@@ -76,7 +76,7 @@ def _window_shifted_ids(
     this round's verify output ``v[:, src]``, else the round's own draft
     ``d_m`` (m = src - accept + 1 <= depth) from ``next_tokens`` columns
     1..depth. Negative ``src`` rows (lookback) come out as ``drafts[:, 0]``;
-    the caller overlays them (see ``_window_lookback_shifted_ids``).
+    the caller overlays them (see ``_lookback_shifted_ids``).
 
     Args:
         v: [bs, k] int64 verify outputs.
@@ -178,7 +178,7 @@ def _extend_depth_shifted_ids(
     )
 
 
-def _window_lookback_shifted_ids(
+def _lookback_shifted_ids(
     v: torch.Tensor,
     accept: torch.Tensor,
     next_tokens: torch.Tensor,
@@ -220,7 +220,7 @@ def _window_lookback_shifted_ids(
             - lookback
             + depth
         )
-    ids = _window_shifted_ids(v, accept, next_tokens, depth, src=src)
+    ids = _decode_shifted_ids(v, accept, next_tokens, depth, src=src)
     from_stash = stash_tokens.gather(
         1, (src + lookback).clamp(0, lookback - 1).expand(bs, total)
     )
@@ -460,64 +460,6 @@ class Mtp(BaseDrafter):
         input_ids = maybe_substitute_mm_pad(input_ids, self.mm_pad_substitute_ids)
         return input_ids.clamp(0, self.vocab_size - 1)
 
-    def _use_multi_depth_windows(self, draft_input: MtpDraftInput) -> bool:
-        """Teacher-forced multi-depth catch-up (draft-model opt-in).
-
-        Multi-depth MTP heads are trained as full-sequence layers: depth d's
-        attention at source position p runs over depth-d activations of ALL
-        positions <= p. The classic multi-step loop gives depth d>0 exactly
-        one new row per round, so its decode queries attend over a KV window
-        it mostly never wrote (stale garbage). In window mode every step
-        re-runs its depth over the whole verify window — dense per-depth KV
-        and sconv state over the accepted prefix — with per-depth
-        token-shifted inputs and the previous depth's full-row chain-normed
-        hidden. Pure-decode rounds only; EXTEND/MIXED rounds run catch-up.
-        """
-        return (
-            self.spec_num_steps > 1
-            and draft_input.num_extends == 0
-            and not draft_input.forward_mode.is_idle()
-            and bool(
-                getattr(
-                    self.draft_model_runner.model, "draft_multi_depth_windows", False
-                )
-            )
-        )
-
-    def _use_extend_depth_catchup(self, draft_input: MtpDraftInput) -> bool:
-        """Per-depth prompt coverage at EXTEND rounds (draft-model opt-in).
-
-        Window mode (above) only repairs pure-decode rounds, so depths >= 1
-        never write KV or sconv state over the prompt region — their decode
-        queries then attend over never-written prompt keys
-        forever. When the draft model opts in, EXTEND and
-        MIXED rounds re-run depths 1..steps-1 over the same ragged rows as the
-        first step (per-depth token-shifted inputs, chained full-row hidden),
-        which builds every used depth's dense prompt KV and sconv prompt
-        state chunk by chunk and replaces the classic loop's one-token steps.
-        """
-        return (
-            self.spec_num_steps > 1
-            and draft_input.num_extends > 0
-            and not draft_input.forward_mode.is_idle()
-            and bool(
-                getattr(
-                    self.draft_model_runner.model, "draft_extend_depth_catchup", False
-                )
-            )
-        )
-
-    def _use_decode_lookback(self, draft_input: MtpDraftInput) -> bool:
-        """Lookback rows for the window pass (§12 Hole 2, armed at init).
-
-        At depth d, the last d committed rows of each round's window embed
-        the round's own unverified drafts; once a draft is rejected those
-        KV/conv entries are permanently wrong under the forward-only window.
-        The lookback variant prepends D = steps-1 rows so the previous
-        round's provisional entries are recomputed from committed tokens.
-        """
-        return self.draft_lookback > 0 and self._use_multi_depth_windows(draft_input)
-
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -603,12 +545,11 @@ class Mtp(BaseDrafter):
         input_num_tokens = draft_input.input_num_tokens
 
         # Multi-depth window mode and extend catch-up chain FULL per-row
-        # hidden states between depths (see _run_multi_step_windows /
+        # hidden states between depths (see _run_multi_step /
         # _run_extend_depth_catchup); logits stay gathered.
         capture_mode = (
             CaptureHiddenMode.FULL
-            if self._use_multi_depth_windows(draft_input)
-            or self._use_extend_depth_catchup(draft_input)
+            if self.spec_num_steps > 1
             else CaptureHiddenMode.LAST
         )
 
@@ -639,15 +580,20 @@ class Mtp(BaseDrafter):
         )
         return logits_output
 
-    @nvtx_range("draft_multi_step_windows", color="purple")
-    def _run_multi_step_windows(
+    @nvtx_range("draft_multi_step", color="purple")
+    def _run_multi_step(
         self,
         bs: int,
         next_tokens: torch.Tensor,
         logits_output: LogitsProcessorOutput,
         draft_input: MtpDraftInput,
     ) -> None:
-        """Teacher-forced multi-depth catch-up (see _use_multi_depth_windows).
+        """Multi-depth decode window passes.
+
+        Multi-depth MTP heads are trained as full-sequence layers: depth d's
+        attention at source position p runs over depth-d activations of ALL
+        positions <= p, so a one-row-per-step chain loop would leave its
+        queries attending over KV it mostly never wrote.
 
         Every step d re-runs depth layer d over the SAME verify window the
         first step processed (same positions and KV slot locations — the KV
@@ -679,7 +625,7 @@ class Mtp(BaseDrafter):
 
         prev_hidden = logits_output.hidden_states  # [bs*k, H], depth d-1 rows
         for d in range(1, self.spec_num_steps):
-            input_ids = _window_shifted_ids(
+            input_ids = _decode_shifted_ids(
                 v, accept, next_tokens, d, src=col + d
             ).reshape(-1)
 
@@ -700,7 +646,7 @@ class Mtp(BaseDrafter):
                 accept_lengths=draft_input.accept_lengths,
             )
 
-            with nvtx_range("draft_window_forward", color="red"):
+            with nvtx_range("draft_step_forward", color="red"):
                 logits_output = self.draft_model_runner.forward(
                     ctx=ctx,
                     input_ids=input_ids,
@@ -714,8 +660,8 @@ class Mtp(BaseDrafter):
             with nvtx_range("draft_sample", color="yellow"):
                 next_tokens[:, d + 1] = self._sample_step_tokens(logits_output)
 
-    @nvtx_range("draft_multi_step_windows_lookback", color="purple")
-    def _run_multi_step_windows_lookback(
+    @nvtx_range("draft_multi_step_lookback", color="purple")
+    def _run_multi_step_lookback(
         self,
         bs: int,
         next_tokens: torch.Tensor,
@@ -725,7 +671,7 @@ class Mtp(BaseDrafter):
         v: torch.Tensor,
         accept: torch.Tensor,
     ) -> bool:
-        """Lookback variant of ``_run_multi_step_windows`` (§12 Hole 2).
+        """Lookback variant of ``_run_multi_step`` (§12 Hole 2).
 
         Every depth d >= 1 re-runs over ``D + k`` rows per request
         (D = steps-1): the D leading rows re-cover the last D committed
@@ -743,7 +689,7 @@ class Mtp(BaseDrafter):
         rebuilt by the backend hook (lagged-window recurrence).
 
         ``slot``/``v``/``accept`` come pre-sliced from the caller (see
-        ``_decode_window_slices``), which also feeds them to the stash roll.
+        ``_decode_slices``), which also feeds them to the stash roll.
 
         Returns False when the backend refuses the lookback metadata; the
         caller then falls back to the plain window pass. This runs inside
@@ -802,7 +748,7 @@ class Mtp(BaseDrafter):
             torch.arange(total, dtype=torch.int64, device=v.device).view(1, total) - lb
         )
         for d in range(1, self.spec_num_steps):
-            input_ids = _window_lookback_shifted_ids(
+            input_ids = _lookback_shifted_ids(
                 v, accept, next_tokens, stash_tokens, d, lb, src=base_src + d
             )
             input_ids = self._prepare_draft_input_ids(input_ids)
@@ -824,7 +770,7 @@ class Mtp(BaseDrafter):
                 accept_lengths=draft_input.accept_lengths,
             )
 
-            with nvtx_range("draft_window_lookback_forward", color="red"):
+            with nvtx_range("draft_lookback_forward", color="red"):
                 logits_output = self.draft_model_runner.forward(
                     ctx=ctx,
                     input_ids=input_ids,
@@ -839,7 +785,7 @@ class Mtp(BaseDrafter):
                 next_tokens[:, d + 1] = self._sample_step_tokens(logits_output)
         return True
 
-    def _decode_window_slices(
+    def _decode_slices(
         self, bs: int, draft_input: MtpDraftInput
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """``(slot, v, accept)`` shared by the lookback window pass and the
@@ -917,7 +863,12 @@ class Mtp(BaseDrafter):
         logits_output: LogitsProcessorOutput,
         draft_input: MtpDraftInput,
     ) -> None:
-        """Per-depth prompt coverage at EXTEND rounds (see the gate above).
+        """Per-depth prompt coverage at EXTEND rounds.
+
+        The decode windows only repair pure-decode rounds, so without this
+        pass depths >= 1 would never write KV or sconv state over the prompt
+        region and their decode queries would attend over never-written
+        prompt keys forever.
 
         Each step d re-runs depth layer d over the SAME ragged rows the first
         step processed — identical positions, out_cache_loc, and attention /
@@ -979,7 +930,7 @@ class Mtp(BaseDrafter):
         for d in range(1, self.spec_num_steps):
             input_ids = _extend_depth_shifted_ids_from(extend_pre, next_tokens[:ne], d)
             if nd > 0:
-                decode_ids = _window_shifted_ids(
+                decode_ids = _decode_shifted_ids(
                     v, accept, next_tokens[ne:], d, src=col + d
                 )
                 input_ids = torch.cat([input_ids, decode_ids.reshape(-1)])
@@ -1095,13 +1046,10 @@ class Mtp(BaseDrafter):
             # coverage of THIS chunk's rows, not the (discarded) drafts —
             # skipping mid-chunks would leave every chunk but the last
             # uncovered for depths >= 1 on long prompts.
-            if self._use_extend_depth_catchup(draft_input):
-                self._run_extend_depth_catchup(
-                    bs, next_tokens, logits_output, draft_input
-                )
+            self._run_extend_depth_catchup(bs, next_tokens, logits_output, draft_input)
             return next_tokens
 
-        if self._use_extend_depth_catchup(draft_input):
+        if draft_input.num_extends > 0:
             # EXTEND/MIXED with per-depth prompt coverage: reuses the first
             # step's extend metadata as-is, so it must run OUTSIDE the
             # override_num_extends(0) below.
@@ -1113,11 +1061,11 @@ class Mtp(BaseDrafter):
         # MIXED target. No-op on backends that fill separate prefill/decode
         # metadata at init time.
         with self.attn_backend.override_num_extends(0):
-            use_lookback = self._use_decode_lookback(draft_input)
+            use_lookback = self.draft_lookback > 0
             ran_lookback = False
             if use_lookback:
-                slot, v, accept = self._decode_window_slices(bs, draft_input)
-                ran_lookback = self._run_multi_step_windows_lookback(
+                slot, v, accept = self._decode_slices(bs, draft_input)
+                ran_lookback = self._run_multi_step_lookback(
                     bs,
                     next_tokens,
                     logits_output,
@@ -1127,7 +1075,7 @@ class Mtp(BaseDrafter):
                     accept,
                 )
             if not ran_lookback:
-                self._run_multi_step_windows(
+                self._run_multi_step(
                     bs,
                     next_tokens,
                     logits_output,
