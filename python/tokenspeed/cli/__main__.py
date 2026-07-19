@@ -43,7 +43,7 @@ def _env(args: argparse.Namespace) -> None:
 
 
 def _merge_traces(args: argparse.Namespace) -> None:
-    from tokenspeed.trace_merge import main as merge_traces_main
+    from tokenspeed.cli.trace_merge import main as merge_traces_main
 
     merge_traces_main(args.merge_args)
 

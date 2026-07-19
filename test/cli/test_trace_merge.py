@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Tests for :mod:`tokenspeed.trace_merge` using synthetic trace files.
+"""Tests for :mod:`tokenspeed.cli.trace_merge` using synthetic trace files.
 
 The synthetic files encode the on-disk contracts this tool depends on:
 VizTracer reports store their absolute time base in
@@ -34,7 +34,7 @@ import json
 
 import pytest
 
-from tokenspeed.trace_merge import main, merge_proton_viztracer
+from tokenspeed.cli.trace_merge import main, merge_proton_viztracer
 
 VIZTRACER_BASE_NS = 1_000_000_000_000_000
 # Proton session started 2.5 ms after the viztracer clock origin.
