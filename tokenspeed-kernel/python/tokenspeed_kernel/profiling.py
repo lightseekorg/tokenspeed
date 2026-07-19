@@ -275,10 +275,13 @@ def stop_profiling() -> None:
         return
 
     output_format = state._config.output_format if state._config is not None else ""
-    proton.finalize(state._session, output_format)
-    state._session = None
-    state._config = None
-    state.enabled = False
+    try:
+        proton.finalize(state._session, output_format)
+    finally:
+        # Keep wrapper state recoverable even when report serialization fails.
+        state._session = None
+        state._config = None
+        state.enabled = False
 
 
 def start_shape_capture() -> None:

@@ -112,6 +112,29 @@ def test_start_and_stop_calls_proton(monkeypatch):
     assert fake.finalize_calls == [((123, "chrome_trace"), {})]
 
 
+def test_stop_clears_state_when_proton_finalize_fails(monkeypatch):
+    fake = _FakeProton()
+    original_finalize = fake.finalize
+
+    def fail_finalize(*args, **kwargs):
+        _ = args, kwargs
+        raise RuntimeError("write failed")
+
+    monkeypatch.setattr(profiling, "_HAS_PROTON", True)
+    monkeypatch.setattr(profiling, "proton", fake)
+    monkeypatch.setattr(fake, "finalize", fail_finalize)
+
+    profiling.start_profiling()
+    with pytest.raises(RuntimeError, match="write failed"):
+        profiling.stop_profiling()
+
+    assert not profiling.ProfilingState.get().active
+
+    monkeypatch.setattr(fake, "finalize", original_finalize)
+    assert profiling.start_profiling() == 123
+    profiling.stop_profiling()
+
+
 def test_start_warns_when_proton_missing(monkeypatch):
     monkeypatch.setattr(profiling, "_HAS_PROTON", False)
     monkeypatch.setattr(profiling, "proton", None)
