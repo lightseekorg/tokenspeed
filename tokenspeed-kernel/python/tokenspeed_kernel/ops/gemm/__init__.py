@@ -422,7 +422,6 @@ def bmm(
     quant: str | None = None,
     enable_pdl: bool = False,
     override: str | None = None,
-    expected_kernel_name: str | None = None,
 ) -> torch.Tensor:
     """Batched matrix multiply with automatic kernel selection.
 
@@ -456,7 +455,6 @@ def bmm(
             from kernels that accept it.
         override: Force selection of a specific kernel by name. Bypasses
             heuristic scoring.
-        expected_kernel_name: Debug hint for expected kernel selection.
     """
     out_dtype = out_dtype or (out.dtype if out is not None else A.dtype)
     if A.ndim != 3:
@@ -501,7 +499,6 @@ def bmm(
         signature,
         traits=traits,
         override=override,
-        expected_kernel_name=expected_kernel_name,
     )
 
     if (
