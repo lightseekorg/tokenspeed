@@ -227,7 +227,7 @@ class InklingForConditionalGenerationNextN(nn.Module):
     # Catch-up runs the full padded window; ctx.gather_ids narrows to one row per request.
     draft_first_step_reduce_for_catchup = True
     # Full-sequence depths: re-run each depth over the whole verify window
-    # (eagle.py window mode); INKLING_MTP_CLASSIC_LOOP=1 reverts for A/B.
+    # (mtp.py window mode); INKLING_MTP_CLASSIC_LOOP=1 reverts for A/B.
     draft_multi_depth_windows = os.environ.get("INKLING_MTP_CLASSIC_LOOP", "0") != "1"
     # Prompt catch-up: at EXTEND rounds run depths
     # 1..steps-1 over the prompt rows too (inputs shifted d+1, chaining the

@@ -4,9 +4,8 @@ from types import SimpleNamespace
 import torch
 
 from tokenspeed.runtime.execution.drafter.dflash import DFlash
-from tokenspeed.runtime.execution.drafter.eagle import (
-    Eagle,
-    EagleDraftInput,
+from tokenspeed.runtime.execution.drafter.eagle import Eagle, EagleDraftInput
+from tokenspeed.runtime.execution.drafter.mtp import (
     _committed_tail_update,
     _extend_depth_shifted_ids,
     _ragged_tail_rows,
