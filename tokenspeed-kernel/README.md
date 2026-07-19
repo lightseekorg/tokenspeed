@@ -143,7 +143,7 @@ backends. See `tokenspeed_kernel/plugins/README.md`.
 
 ```python
 from tokenspeed_kernel import (
-    mha_prefill, mha_extend_with_kvcache, mha_decode_with_kvcache,
+    mha_prefill, mha_prefill_with_kvcache, mha_decode_with_kvcache,
     msa_extend_with_kvcache, msa_decode_with_kvcache,
     gdn_chunk_prefill,
     mm,

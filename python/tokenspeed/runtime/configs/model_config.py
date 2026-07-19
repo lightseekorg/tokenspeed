@@ -444,6 +444,7 @@ class ModelConfig:
             "head_dim",
             self.hf_text_config.hidden_size // self.hf_text_config.num_attention_heads,
         )
+
         # MLA/DSA families carry per-head dimension metadata that does not
         # follow the standard hidden_size / num_attention_heads derivation above.
         attention_family = _resolve_attention_family(

@@ -40,7 +40,6 @@ class RoutingMethodType(IntEnum):
     SigmoidRenorm = 6
     MiniMax2 = 7
     Unspecified = 8
-    FP32SigmoidBias = 9
 
 
 class All2AllBackend(Enum):

@@ -18,6 +18,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+from tokenspeed_kernel.profiling import bootstrap_profiling_from_env
+
+bootstrap_profiling_from_env()
+
 from tokenspeed_kernel.ops.attention import (
     GdnCheckpointLayout,
     GdnChunkPrefillResult,
@@ -42,12 +46,7 @@ from tokenspeed_kernel.ops.attention import (
     rel_mha_prefill,
 )
 from tokenspeed_kernel.ops.gemm import bmm, mm
-from tokenspeed_kernel.ops.moe import (
-    minimax_m3_topk,
-    moe_apply,
-    moe_plan,
-    moe_process_weights,
-)
+from tokenspeed_kernel.ops.moe import moe_apply, moe_plan, moe_process_weights
 from tokenspeed_kernel.ops.quantization import (
     quantize_fp8,
     quantize_fp8_with_scale,
@@ -88,7 +87,6 @@ __all__ = [
     "GdnCheckpointLayout",
     "GdnChunkPrefillResult",
     # moe
-    "minimax_m3_topk",
     "moe_apply",
     "moe_plan",
     "moe_process_weights",

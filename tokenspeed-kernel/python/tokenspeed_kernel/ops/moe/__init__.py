@@ -29,7 +29,6 @@ from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
-    "minimax_m3_topk",
     "moe_apply",
     "moe_plan",
     "moe_process_weights",
@@ -58,59 +57,6 @@ def _validate_routing_mode(routing_mode: str | None) -> None:
     raise ValueError(
         f"routing_mode must be 'kernel_routing' or 'precomputed_topk', "
         f"got {routing_mode!r}"
-    )
-
-
-def minimax_m3_topk(
-    hidden_states: torch.Tensor,
-    gating_output: torch.Tensor,
-    correction_bias: torch.Tensor,
-    *,
-    topk: int = 4,
-    renormalize: bool = True,
-    routed_scaling_factor: float = 2.0,
-    override: str | None = None,
-    solution: str | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Select MiniMax-M3's four routed experts with a registered kernel.
-
-    Args:
-        hidden_states: BF16 token states shaped ``[tokens, hidden_size]``.
-        gating_output: FP32 router logits shaped ``[tokens, experts]``.
-        correction_bias: FP32 correction bias shaped ``[experts]``.
-        topk: Selected expert count. MiniMax-M3 supports exactly four.
-        renormalize: Whether selected sigmoid scores are normalized. Must be true.
-        routed_scaling_factor: Positive multiplier applied after normalization.
-        override: Optional exact registered kernel name.
-        solution: Optional registered solution selector.
-
-    Returns:
-        FP32 routing weights and INT32 expert ids, each shaped ``[tokens, 4]``.
-    """
-    if topk != 4:
-        raise ValueError(f"MiniMax-M3 routing requires topk=4, got {topk}.")
-    if renormalize is not True:
-        raise ValueError("MiniMax-M3 routing requires renormalize=True.")
-
-    kernel = select_kernel(
-        "moe",
-        "minimax_m3_topk",
-        format_signature(
-            hidden_states=dense_tensor_format(hidden_states.dtype),
-            gating_output=dense_tensor_format(gating_output.dtype),
-            correction_bias=dense_tensor_format(correction_bias.dtype),
-        ),
-        traits={"topk": topk, "renormalize": renormalize},
-        solution=solution,
-        override=override,
-    )
-    return kernel(
-        hidden_states,
-        gating_output,
-        correction_bias,
-        topk=topk,
-        renormalize=renormalize,
-        routed_scaling_factor=routed_scaling_factor,
     )
 
 

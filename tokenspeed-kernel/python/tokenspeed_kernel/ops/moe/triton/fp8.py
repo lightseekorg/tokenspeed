@@ -45,11 +45,6 @@ from tokenspeed_kernel.ops.moe.triton.mxfp4 import (
     _routing_from_topk,
     _silu_gate_up,
 )
-from tokenspeed_kernel.thirdparty.triton.minimax_m3 import (
-    minimax_m3_reduce_topk,
-    minimax_m3_route_counts,
-    minimax_m3_route_order,
-)
 from triton_kernels.matmul import (
     FlexCtx,
     FnSpecs,
@@ -60,7 +55,6 @@ from triton_kernels.matmul import (
 from triton_kernels.numerics import InFlexData
 from triton_kernels.numerics_details.mxfp import downcast_to_mxfp
 from triton_kernels.swiglu import swiglu_fn
-from triton_kernels.tensor import make_ragged_tensor_metadata
 
 
 def _scale_attr(w: torch.nn.Module, base: str) -> torch.Tensor:
@@ -305,30 +299,12 @@ def triton_fp8_moe_apply(
         topk_ids,
         w,
     )
-    block_shape = tuple(w.quant_config.weight_block_size)
-    if block_shape == (1, 32):
-        if top_k != 4 or router_logits.dtype != torch.float32:
-            raise RuntimeError(
-                "MiniMax-M3 MXFP8 MoE requires Top-4 routing with FP32 weights"
-            )
-        col_sum = minimax_m3_route_counts(topk_weights, topk_ids, num_experts)
-        ragged_metadata = make_ragged_tensor_metadata(
-            col_sum,
-            topk_ids.numel(),
-        )
-        gather_indx, scatter_indx, gate_scal = minimax_m3_route_order(
-            topk_weights,
-            topk_ids,
-            ragged_metadata.slice_offs,
-            num_experts,
-        )
-    else:
-        ragged_metadata, gather_indx, scatter_indx, gate_scal = _routing_from_topk(
-            topk_weights,
-            topk_ids,
-            num_experts=num_experts,
-            dtype=router_logits.dtype,
-        )
+    ragged_metadata, gather_indx, scatter_indx, gate_scal = _routing_from_topk(
+        topk_weights,
+        topk_ids,
+        num_experts=num_experts,
+        dtype=router_logits.dtype,
+    )
 
     w13_bias = getattr(w, "w13_weight_bias", None)
     w2_bias = getattr(w, "w2_weight_bias", None)
@@ -368,8 +344,5 @@ def triton_fp8_moe_apply(
         gammas=gate_scal,
     )
     if top_k > 1:
-        output = output.view(n_tokens, top_k, output.shape[-1])
-        if block_shape == (1, 32):
-            return minimax_m3_reduce_topk(output)
-        return output.sum(dim=1)
+        return output.view(n_tokens, top_k, output.shape[-1]).sum(dim=1)
     return output
