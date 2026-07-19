@@ -27,8 +27,8 @@ catch-up, decode windows, lookback stashes).
 
 Eagle-like MTP (MTP-Eagle: a single MTP layer chained on its own hidden,
 e.g. DeepSeek) stays in ``eagle.py``. Both register under
-``--speculative-algorithm MTP``; ``ModelExecutor`` routes to this drafter
-when the draft model declares ``draft_multi_depth_windows``.
+``--speculative-algorithm MTP``; ``ModelExecutor`` routes multi-depth
+draft model classes to this drafter (see ``_get_drafter_impl``).
 """
 
 from __future__ import annotations
@@ -106,7 +106,7 @@ def _extend_depth_precompute(
     input_lengths: torch.Tensor,
     last_row: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Depth-invariant pieces of :func:`_extend_depth_shifted_ids`.
+    """Depth-invariant pieces of :func:`_extend_depth_shifted_ids_from`.
 
     Hoisted out of the catch-up depth loop; ``last_row`` (per-request cumsum
     of ``input_lengths`` minus one) may be passed in when the caller already
@@ -134,38 +134,21 @@ def _extend_depth_shifted_ids_from(
     next_tokens: torch.Tensor,
     depth: int,
 ) -> torch.Tensor:
-    """Per-depth gather of :func:`_extend_depth_shifted_ids` over ``pre``
-    (= :func:`_extend_depth_precompute` output)."""
-    shift1_i64, base, req_of_row, row_last = pre
-    num_rows = shift1_i64.shape[0]
-    src = base + depth
-    from_prompt = shift1_i64[src.clamp(max=num_rows - 1)]
-    overshoot = (src - row_last).clamp(1, depth)
-    from_draft = next_tokens.to(torch.int64)[req_of_row, overshoot]
-    return torch.where(src <= row_last, from_prompt, from_draft)
-
-
-def _extend_depth_shifted_ids(
-    shift1_ids: torch.Tensor,
-    input_lengths: torch.Tensor,
-    next_tokens: torch.Tensor,
-    depth: int,
-) -> torch.Tensor:
     """Depth-``depth`` input ids for the ragged prefill rows of an EXTEND round.
 
-    ``shift1_ids`` are the first draft step's prefill inputs (prompt tokens
-    shifted by one within each request, last row already holding the round's
-    sampled token on final chunks). Depth ``d`` at local row ``i`` consumes the
-    token ``d`` further along: ``shift1_ids[row + d]`` while that stays inside
-    the request, else the request's own draft ``d_m`` (``m = overshoot``) from
-    ``next_tokens`` — columns ``1..d`` are already filled when depth ``d``
-    runs. On mid-chunk rows the overshoot tokens are not staged; those
-    trailing ``d`` rows per chunk consume the placeholder ``next_tokens``
-    columns (known §14 Step 1 approximation, <= steps-1 rows per chunk).
+    ``pre`` is :func:`_extend_depth_precompute` output over the first draft
+    step's prefill inputs ``shift1_ids`` (prompt tokens shifted by one within
+    each request, last row already holding the round's sampled token on final
+    chunks). Depth ``d`` at local row ``i`` consumes the token ``d`` further
+    along: ``shift1_ids[row + d]`` while that stays inside the request, else
+    the request's own draft ``d_m`` (``m = overshoot``) from ``next_tokens``
+    — columns ``1..d`` are already filled when depth ``d`` runs. On mid-chunk
+    rows the overshoot tokens are not staged; those trailing ``d`` rows per
+    chunk consume the placeholder ``next_tokens`` columns (known
+    approximation, <= steps-1 rows per chunk).
 
     Args:
-        shift1_ids: [num_prefill_rows] first-step prefill input ids.
-        input_lengths: [num_extends] per-request prefill row counts.
+        pre: :func:`_extend_depth_precompute` output.
         next_tokens: [>=num_extends, >=depth+1] col 0 = last verified token,
             cols 1.. = this round's drafts, per request.
         depth: draft depth d >= 1.
@@ -173,9 +156,13 @@ def _extend_depth_shifted_ids(
     Returns:
         [num_prefill_rows] int64 input ids for the depth-``depth`` pass.
     """
-    return _extend_depth_shifted_ids_from(
-        _extend_depth_precompute(shift1_ids, input_lengths), next_tokens, depth
-    )
+    shift1_i64, base, req_of_row, row_last = pre
+    num_rows = shift1_i64.shape[0]
+    src = base + depth
+    from_prompt = shift1_i64[src.clamp(max=num_rows - 1)]
+    overshoot = (src - row_last).clamp(1, depth)
+    from_draft = next_tokens.to(torch.int64)[req_of_row, overshoot]
+    return torch.where(src <= row_last, from_prompt, from_draft)
 
 
 def _lookback_shifted_ids(
@@ -187,7 +174,7 @@ def _lookback_shifted_ids(
     lookback: int,
     src: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Depth-``depth`` input ids for a lookback decode window (§12 Hole 2).
+    """Depth-``depth`` input ids for a lookback decode window.
 
     Row ``r`` of the ``lookback + k`` window sits at source position
     ``vc - lookback + r`` and consumes the token at source + depth + 1;
@@ -348,9 +335,7 @@ class Mtp(BaseDrafter):
 
         self.device = draft_model_runner.device
 
-        # For constructing fallback global_num_tokens during CUDA graph capture.
         self.dp_size = draft_model_runner.mapping.attn.dp_size
-        self.world_size = draft_model_runner.mapping.world_size
 
         # Drafter-owned alias source for the draft attn backend; advanced in
         # place during multi-step decode.
@@ -671,7 +656,7 @@ class Mtp(BaseDrafter):
         v: torch.Tensor,
         accept: torch.Tensor,
     ) -> bool:
-        """Lookback variant of ``_run_multi_step`` (§12 Hole 2).
+        """Lookback variant of ``_run_multi_step``.
 
         Every depth d >= 1 re-runs over ``D + k`` rows per request
         (D = steps-1): the D leading rows re-cover the last D committed
@@ -878,7 +863,7 @@ class Mtp(BaseDrafter):
 
         - prefill rows: the request's own prompt tokens (all known), with the
           trailing d rows taking the round's fresh drafts (final chunk) or
-          placeholder columns (mid-chunk; backfilled never — known §14
+          placeholder columns (mid-chunk; backfilled never — known
           approximation, <= steps-1 rows per chunk boundary);
         - decode rows (MIXED batches): the window-mode gather over verify
           outputs and drafts, offset past the prefill rows.
@@ -1021,8 +1006,7 @@ class Mtp(BaseDrafter):
                 indices,
                 out=next_tokens[num_extends:, 0],
             )
-        if self.spec_num_steps > 0:
-            next_tokens[:, 1:] = next_tokens[:, :1]
+        next_tokens[:, 1:] = next_tokens[:, :1]
 
         # Seed the draft attn backend's aliased seq_lens for the first step.
         self.draft_seq_lens_buf[:bs].copy_(self.input_buffers.seq_lens_buf[:bs])
@@ -1037,22 +1021,15 @@ class Mtp(BaseDrafter):
         if self.spec_num_steps <= 1:
             return next_tokens
 
-        if self.input_buffers.all_extends_mid_chunk:
-            # Skip multi-step when the whole batch is mid-chunk EXTEND:
-            # no request completes a target-side speculative verification
-            # after this forward, so any speculative tokens would be discarded.
-            #
-            # Extend catch-up still runs: its point is per-depth KV/sconv
-            # coverage of THIS chunk's rows, not the (discarded) drafts —
-            # skipping mid-chunks would leave every chunk but the last
-            # uncovered for depths >= 1 on long prompts.
-            self._run_extend_depth_catchup(bs, next_tokens, logits_output, draft_input)
-            return next_tokens
-
         if draft_input.num_extends > 0:
             # EXTEND/MIXED with per-depth prompt coverage: reuses the first
             # step's extend metadata as-is, so it must run OUTSIDE the
-            # override_num_extends(0) below.
+            # override_num_extends(0) below. This covers mid-chunk EXTEND
+            # rounds too — their drafts get discarded (no verification
+            # completes after this forward), but catch-up's point is
+            # per-depth KV/sconv coverage of THIS chunk's rows; skipping
+            # mid-chunks would leave every chunk but the last uncovered for
+            # depths >= 1 on long prompts.
             self._run_extend_depth_catchup(bs, next_tokens, logits_output, draft_input)
             return next_tokens
 
