@@ -52,13 +52,18 @@ choices (still evolving; subject to change):
   gluon          (...)            cute_dsl         (...)              ← in-tree perf JIT
   flash_mla      flashinfer       (...)            (...)              ← vendor library wrappers
                                 ...
-       │              │                │                │
-       └──────────────┴────────────────┴────────────────┴── reference (PyTorch ground truth)
 ```
 
 - **Registration** — backends register with `@register_kernel(family, mode, ...)`,
   declaring supported `format_signatures`, arch capability requirements,
   non-format traits (head dim, GQA factor, ...), and a priority band.
+- **Operation schemas** — migrated family/mode pairs publish one
+  `OperationSchema` before their backends load. The schema attaches an
+  executable semantic reference and validates the existing signature, trait,
+  and callable declarations without changing the registration API. Operations
+  without a schema continue to use the legacy behavior during migration. A
+  schema reference defines semantics but is not registered or selectable as a
+  kernel.
 - **Auto-selection** — `select_kernel` filters by capability and traits,
   ranks the survivors with an optional per-family `SelectionOracle` and
   priority, and returns a callable. Selection accepts an objective (latency,
@@ -72,6 +77,7 @@ tokenspeed_kernel/
   __init__.py            # Public API re-exports
   platform.py            # PlatformInfo, capability detection
   signature.py           # TensorFormat, ScaleFormat, FormatSignature
+  operation.py           # OperationSchema definitions and catalog
   registry.py            # KernelRegistry, register_kernel, Priority bands
   selection.py           # select_kernel, oracles, overrides
   profiling.py           # ShapeCapture, kernel_scope, Proton bootstrap

@@ -27,6 +27,7 @@ from typing import Callable
 import pytest
 import torch
 from tokenspeed_kernel import plugins as plugins_mod
+from tokenspeed_kernel.operation import OperationSchema
 from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.plugins import (
     DISABLE_ENV_VAR,
@@ -38,7 +39,12 @@ from tokenspeed_kernel.plugins import (
 )
 from tokenspeed_kernel.plugins.cli import main as cli_main
 from tokenspeed_kernel.registry import KernelRegistry, register_kernel
-from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.signature import (
+    dense_tensor_format,
+    format_signature,
+    format_signatures,
+)
 
 # ---------------------------------------------------------------------------
 # Fixtures and helpers
@@ -199,6 +205,61 @@ class TestDiscovery:
         assert info.num_kernels == 1
         assert info.kernel_names == ("alpha_kernel",)
         assert KernelRegistry.get().get_by_name("alpha_kernel") is not None
+
+    def test_schema_backed_plugin_can_override_selection(
+        self, fresh_plugins, patch_entry_points
+    ):
+        signature = format_signature(x=dense_tensor_format(torch.float32))
+        validated = []
+
+        def reference(*, x, scale=1.0):
+            return x * scale
+
+        schema = OperationSchema(
+            family="plugin_test",
+            mode="scale",
+            reference=reference,
+            validate_signatures=lambda signatures: validated.append(signatures),
+            validate_traits=lambda traits: None,
+        ).publish()
+
+        @register_kernel(
+            *schema.id,
+            name="builtin_scale",
+            solution="builtin",
+            signatures={signature},
+            priority=10,
+        )
+        def builtin(*, x, scale=1.0):
+            return x * scale
+
+        class OpaquePluginKernel:
+            __signature__ = object()
+
+            def __call__(self, *, x, scale=1.0):
+                return x * scale + 1
+
+        plugin_kernel = OpaquePluginKernel()
+
+        def register_plugin():
+            register_kernel(
+                *schema.id,
+                name="external_scale",
+                solution="external",
+                signatures={signature},
+                priority=19,
+            )(plugin_kernel)
+
+        patch_entry_points([_FakeEntryPoint("external", register_plugin)])
+        loaded = discover_plugins()
+
+        assert loaded[0].kernel_names == ("external_scale",)
+        assert validated == [frozenset({signature}), frozenset({signature})]
+        selected = select_kernel(*schema.id, signature)
+        assert selected.name == "external_scale"
+        assert torch.equal(
+            selected(x=torch.tensor([2.0]), scale=3.0), torch.tensor([7.0])
+        )
 
     def test_discover_alphabetical_order(self, fresh_plugins, patch_entry_points):
         order: list[str] = []
