@@ -20,9 +20,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
@@ -34,6 +36,24 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
+    from tokenspeed.runtime.lora.lora_manager import LoraManager
+
+_CURRENT_LORA_MANAGER: ContextVar[Optional["LoraManager"]] = ContextVar(
+    "tokenspeed_current_lora_manager", default=None
+)
+
+
+def get_current_lora_manager() -> Optional["LoraManager"]:
+    return _CURRENT_LORA_MANAGER.get()
+
+
+@contextmanager
+def bind_forward_context(ctx: "ForwardContext") -> Iterator[None]:
+    token = _CURRENT_LORA_MANAGER.set(ctx.lora_manager)
+    try:
+        yield
+    finally:
+        _CURRENT_LORA_MANAGER.reset(token)
 
 
 @dataclass
@@ -82,6 +102,14 @@ class ForwardContext:
     # DSA SWA slot mapping + compressor memo, computed once per forward, shared across layers.
     dsa_swa_slot_mapping: torch.Tensor | None = None
     dsa_compressor_slot_cache: Any | None = None
+
+    # --- LoRA ---
+    # Reference to the LoraManager.  When set, forward layers call
+    # ``lora_manager.apply_qkv_lora`` / ``apply_o_lora`` which read from
+    # the manager's persistent batch_info.  Set at capture time when
+    # ``--enable-lora`` is on so the LoRA path is recorded into the graph
+    # (NO_LORA_SLOT = no adapter), otherwise None.
+    lora_manager: Optional["LoraManager"] = None
 
 
 @contextmanager

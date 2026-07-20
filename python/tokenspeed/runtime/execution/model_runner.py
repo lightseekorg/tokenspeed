@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from tokenspeed.runtime.execution.context import bind_forward_context
 from tokenspeed.runtime.execution.weight_loader import WeightLoader
 from tokenspeed.runtime.layers.moe.utils import initialize_moe_config
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -161,13 +162,14 @@ class ModelRunner:
         if kv_sync_event is not None:
             kwargs["kv_sync_event"] = kv_sync_event
 
-        return self.model.forward(
-            ctx,
-            input_ids,
-            positions,
-            out_cache_loc,
-            **kwargs,
-        )
+        with bind_forward_context(ctx):
+            return self.model.forward(
+                ctx,
+                input_ids,
+                positions,
+                out_cache_loc,
+                **kwargs,
+            )
 
     # ------------------------------------------------------------------ #
     # RL online weight sync: receive NCCL-broadcast weights from a trainer.

@@ -123,6 +123,12 @@ class GenerateReqInput:
     bootstrap_port: list[int] | int | None = None
     bootstrap_room: list[int] | int | None = None
 
+    # LoRA adapter to use for this request. Supply the name under which the
+    # adapter was registered via Engine.load_lora_adapter(). None means use the
+    # base model. Requests do not load adapters from disk; adapter filesystem
+    # paths belong to load_lora_adapter().
+    lora_name: list[str | None] | str | None = None
+
     def normalize_batch_and_arguments(self):
         if (
             self.text is None and self.input_ids is None and self.input_embeds is None
@@ -225,6 +231,11 @@ class GenerateReqInput:
                 self.token_ids_logprob = None
             if isinstance(self.input_extra_infos, dict):
                 self.input_extra_infos = [self.input_extra_infos]
+            if isinstance(self.lora_name, list):
+                assert (
+                    len(self.lora_name) == 1
+                ), "lora_name list should have length 1 for single request."
+                self.lora_name = self.lora_name[0]
         else:
             if self.parallel_sample_num == 1:
                 num = self.batch_size
@@ -338,6 +349,15 @@ class GenerateReqInput:
                     "bootstrap_room cannot be a list when n > 1.",
                 )
 
+            if self.lora_name is None:
+                self.lora_name = [None] * num
+            elif not isinstance(self.lora_name, list):
+                self.lora_name = [self.lora_name] * num
+            else:
+                assert (
+                    len(self.lora_name) == num
+                ), "lora_name should be a str or a list of matching length."
+
         # Other checks
         if self.session_params is not None:
             _require(
@@ -396,6 +416,11 @@ class GenerateReqInput:
             bootstrap_room=(
                 self.bootstrap_room[i] if self.bootstrap_room is not None else None
             ),
+            lora_name=(
+                self.lora_name[i]
+                if isinstance(self.lora_name, list)
+                else self.lora_name
+            ),
         )
         sub.rid = self.rid[i]
         return sub
@@ -452,6 +477,8 @@ class TokenizedGenerateReqInput:
     # uses input_ids, while detokenization must use these tokenizer-valid ids.
     input_ids_unpadded: list[int] | None = None
     multimodal_inputs: Any | None = None
+    # Integer lora_id resolved from lora_name (0 = base model)
+    lora_id: int = 0
 
 
 @dataclass
@@ -952,6 +979,30 @@ class RpcReqInput:
 class RpcReqOutput:
     success: bool
     message: str
+
+
+@dataclass
+class LoadLoraReqInput:
+    lora_name: str
+    adapter_path: str
+
+
+@dataclass
+class LoadLoraReqOutput:
+    success: bool
+    lora_id: int = 0
+    message: str = ""
+
+
+@dataclass
+class UnloadLoraReqInput:
+    lora_name: str
+
+
+@dataclass
+class UnloadLoraReqOutput:
+    success: bool
+    message: str = ""
 
 
 @dataclass

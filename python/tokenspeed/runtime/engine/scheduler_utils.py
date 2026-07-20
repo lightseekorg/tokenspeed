@@ -71,10 +71,11 @@ def resolve_scheduler_block_size(page_size: int, paged_cache_groups) -> int:
     return base
 
 
-def make_spec(rid: str, tokens: list[int]) -> RequestSpec:
+def make_spec(rid: str, tokens: list[int], lora_id: int = 0) -> RequestSpec:
     spec = RequestSpec()
     spec.request_id = rid
     spec.tokens = tokens
+    spec.lora_id = lora_id
     return spec
 
 
@@ -100,6 +101,7 @@ def make_config(
     paged_cache_groups: Sequence["PagedCacheGroupConfig"] | None = None,
     enable_mixed_prefill_decode: bool = False,
     prefix_cache_adjunct: "PrefixCacheAdjunctSpec | None" = None,
+    max_loras: int = 0,
 ) -> SchedulerConfig:
     cfg = SchedulerConfig()
     cfg.num_device_pages = num_device_pages
@@ -134,6 +136,7 @@ def make_config(
     # Opt-in; unset means paged-cache groups are transport-only.
     if prefix_cache_adjunct is not None:
         cfg.prefix_cache_adjunct = prefix_cache_adjunct
+    cfg.max_loras = max_loras
     return cfg
 
 

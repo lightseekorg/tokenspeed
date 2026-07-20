@@ -57,6 +57,7 @@ class EngineBase(ABC):
         bootstrap_port: list[int] | int | None = None,
         bootstrap_room: list[int] | int | None = None,
         data_parallel_rank: int | None = None,
+        lora_name: list[str | None] | str | None = None,
     ) -> dict | Iterator[dict]:
         """Generate outputs based on given inputs."""
 
@@ -88,3 +89,32 @@ class EngineBase(ABC):
     @abstractmethod
     def shutdown(self) -> None:
         """Shutdown the engine and clean up resources."""
+
+    # ------------------------------------------------------------------
+    # LoRA adapter management
+    # ------------------------------------------------------------------
+
+    def load_lora_adapter(
+        self,
+        lora_name: str,
+        adapter_path: str,
+    ) -> int:
+        """Load a PEFT LoRA adapter and make it available for serving.
+
+        Args:
+            lora_name: Short identifier used by request-time lora_name.
+            adapter_path: Filesystem path to the PEFT adapter directory.
+
+        Returns:
+            Integer lora_id assigned to this adapter.
+        """
+        raise NotImplementedError(
+            "load_lora_adapter() is not implemented on this engine type. "
+            "Use the tokenspeed serve engine."
+        )
+
+    def unload_lora_adapter(self, lora_name: str) -> None:
+        """Unload a previously loaded LoRA adapter and free its GPU slot."""
+        raise NotImplementedError(
+            "unload_lora_adapter() is not implemented on this engine type."
+        )

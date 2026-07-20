@@ -776,7 +776,7 @@ class BenchmarkDataset:
         self,
         index: int,
         max_loras: int | None = None,
-        lora_path: str | None = None,
+        lora_name: str | None = None,
         lora_assignment: str = "random",
     ) -> None:
         return None
@@ -821,7 +821,7 @@ class RandomDataset(BenchmarkDataset):
         output_len: int = DEFAULT_OUTPUT_LEN,
         batchsize: int = 1,
         max_loras: int | None = None,
-        lora_path: str | None = None,
+        lora_name: str | None = None,
         lora_assignment: str = "random",
         **kwargs,
     ) -> list[SampleRequest]:
@@ -879,7 +879,7 @@ class RandomDataset(BenchmarkDataset):
             lora_req = self.get_lora_request(
                 index=i,
                 max_loras=max_loras,
-                lora_path=lora_path,
+                lora_name=lora_name,
                 lora_assignment=lora_assignment,
             )
             requests.append(

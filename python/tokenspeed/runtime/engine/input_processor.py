@@ -273,6 +273,7 @@ class InputProcessor:
                 input_extra_infos=obj.input_extra_infos,
                 input_ids_unpadded=input_ids_unpadded,
                 multimodal_inputs=multimodal_inputs,
+                lora_id=self._resolve_lora_id(obj),
             )
 
         return TokenizedEmbeddingReqInput(
@@ -282,3 +283,17 @@ class InputProcessor:
             sampling_params,
             created_time=time.time(),
         )
+
+    def _resolve_lora_id(self, obj: "GenerateReqInput") -> int:
+        """Map request LoRA adapter name to an integer lora_id."""
+        lora_name = getattr(obj, "lora_name", None)
+        if lora_name is None:
+            return 0
+        lora_registry: dict = getattr(self.engine, "_lora_name_to_id", {})
+        lora_id = lora_registry.get(lora_name, 0)
+        if lora_id == 0:
+            raise ValueError(
+                f"lora_name={lora_name!r} is not a registered adapter. "
+                "Call load_lora_adapter(name, adapter_path) before using it in a request."
+            )
+        return lora_id

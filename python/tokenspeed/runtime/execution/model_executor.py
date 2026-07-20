@@ -198,6 +198,18 @@ class ModelExecutorConfig:
     # Explicit bucket list overriding the ladder (see get_prefill_token_buckets).
     prefill_graph_capture_sizes: list[int] | None = None
 
+    # ====== LORA =========
+    enable_lora: bool = False
+    max_loras: int = 4
+    max_lora_rank: int = 64
+    # Tiered residence: at most ``max_loras`` adapters in GPU buffers,
+    # at most ``max_loras_cpu`` cached in pinned host memory; beyond
+    # that adapters fall back to their disk_path on next use.
+    max_loras_cpu: int = 16
+    lora_buffer_groups: str = "attn,mlp,moe"
+    lora_moe_compressed_shared_outer: bool = False
+    lora_scheduling_policy: str = "lru"
+
     @staticmethod
     def from_server_args(
         server_args: ServerArgs,
@@ -250,6 +262,16 @@ class ModelExecutorConfig:
             use_v4_mtp_paged_metadata=model_config.use_v4_mtp_paged_metadata,
             grammar_backend=server_args.grammar_backend,
             disable_capturable_grammar=server_args.disable_capturable_grammar,
+            enable_lora=server_args.enable_lora,
+            max_loras=server_args.max_loras,
+            max_lora_rank=server_args.max_lora_rank,
+            max_loras_cpu=server_args.max_loras_cpu or 4 * server_args.max_loras,
+            lora_buffer_groups=server_args.lora_buffer_groups,
+            lora_moe_compressed_shared_outer=(
+                server_args.lora_moe_compressed_shared_outer
+            ),
+            lora_scheduling_policy=server_args.lora_scheduling_policy,
+            mamba_cache_chunk_size=server_args.mamba_cache_chunk_size,
         )
 
 
@@ -304,6 +326,11 @@ class ModelExecutor:
             kv_pool=token_to_kv_pool,
             speculative_algorithm=config.spec_algo,
         )
+
+        # LoRA — created below before CudaGraphWrapper so that the captured
+        # graphs include the LoRA delta path (NO_LORA_SLOT = no adapter).
+        self.lora_manager = None
+        self.request_lora_ids: dict[str, int] = {}
 
         if config.spec_algo is not None:
             # The DFLASH overlap scheduler reserves a fresh draft block per
@@ -541,6 +568,39 @@ class ModelExecutor:
         self._active_multimodal_context = None
         self._active_positions_override = None
 
+        if config.enable_lora:
+            from tokenspeed.runtime.lora.lora_manager import LoraManager
+
+            model = self.model_runner.model
+            lora_dtype = next(model.parameters()).dtype
+            lora_device = next(model.parameters()).device
+            attn_mapping = model_runner.mapping.attn
+            tp_size = attn_mapping.tp_size
+            tp_rank = attn_mapping.tp_rank
+            # ``tp_group`` is the rank-tuple expected by comm_ops.all_reduce
+            # (it routes through the codebase's graph-capturable backend).
+            tp_group = attn_mapping.tp_group if tp_size > 1 else None
+            self.lora_manager = LoraManager(
+                model_config=model_runner.model_config.hf_config,
+                max_loras=config.max_loras,
+                max_lora_rank=config.max_lora_rank,
+                max_num_tokens=config.chunked_prefill_size,
+                max_loras_cpu=config.max_loras_cpu,
+                dtype=lora_dtype,
+                device=lora_device,
+                tp_rank=tp_rank,
+                tp_size=tp_size,
+                tp_group=tp_group,
+                lora_buffer_groups={
+                    group.strip()
+                    for group in config.lora_buffer_groups.split(",")
+                    if group.strip()
+                },
+                lora_moe_compressed_shared_outer=(
+                    config.lora_moe_compressed_shared_outer
+                ),
+            )
+
         self.forward_step = CudaGraphWrapper(
             forward_func=self._forward_step,
             attn_backend=attn_backend,
@@ -554,6 +614,7 @@ class ModelExecutor:
             eager_grammar_buffers=self.eager_grammar_buffers,
             sampling_backend=self.sampling_backend,
             runtime_states=self.runtime_states,
+            lora_manager=self.lora_manager,
         )
 
         # Breakable prefill (extend) CUDA graphs, the extend-mode analogue of
@@ -1848,6 +1909,21 @@ class ModelExecutor:
                     gather_ids=gather_ids,
                     decode_input_ids=decode_input_ids,
                 )
+                # Bind LoRA when adapters are active.  ``prepare_loras``
+                # writes per-segment metadata into the manager's persistent
+                # ``batch_info`` (the captured graph already references
+                # those tensors); we set ``ctx.lora_manager`` so the
+                # forward layers call into the LoRA delta path.
+                if self.lora_manager is not None and bs > 0:
+                    lora_ids = [
+                        self.request_lora_ids.get(rid, 0)
+                        for rid in forward_op.request_ids
+                    ]
+                    self.lora_manager.prepare_loras(
+                        lora_ids, list(forward_op.input_lengths)
+                    )
+                    if any(lid != 0 for lid in lora_ids):
+                        ctx.lora_manager = self.lora_manager
                 if self.config.data_parallel_size > 1:
                     if dp_global_num_tokens is None:
                         raise RuntimeError(

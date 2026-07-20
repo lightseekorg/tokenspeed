@@ -57,6 +57,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
+    from tokenspeed.runtime.lora.lora_manager import LoraManager
     from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 
 logger = get_colorful_logger(__name__)
@@ -201,6 +202,7 @@ class CudaGraphWrapper:
         eager_grammar_buffers=None,
         sampling_backend: SamplingBackend | None = None,
         runtime_states: RuntimeStates | None = None,
+        lora_manager: LoraManager | None = None,
     ):
         self.config = config
         self.attn_backend = attn_backend
@@ -213,6 +215,7 @@ class CudaGraphWrapper:
         self.capturable_grammar = capturable_grammar
         self.eager_grammar_buffers = eager_grammar_buffers
         self.runtime_states = runtime_states
+        self.lora_manager = lora_manager
         self.enable_torch_compile = getattr(config, "enable_torch_compile", False)
         self.disable_padding = config.disable_cuda_graph_padding
         self.enable_cudagraph_gc = getattr(config, "enable_cudagraph_gc", True)
@@ -303,6 +306,11 @@ class CudaGraphWrapper:
     def capture(self):
         """
         Capture CUDA graphs for all configured batch sizes.
+
+        When a ``lora_manager`` is attached, the captured graph records the
+        per-layer LoRA Triton kernels and feeds them from the manager's
+        persistent batch_info.  Base-model requests reuse the same graph via
+        NO_LORA_SLOT, so no separate no-LoRA graph is captured.
 
         Args:
             forward_func: ModelExecutor.forward_step(bs, ctx, sampling_info).
@@ -415,6 +423,43 @@ class CudaGraphWrapper:
             # uniform dummy.
             ctx.global_bs = [bs] * self.world_size
 
+        # Bind the LoRA manager into the captured graph so the per-layer
+        # Triton LoRA kernels are recorded.  Base-model requests are served
+        # from the same graph via NO_LORA_SLOT (weight_indices resolve to the
+        # all-zero slot at replay), so a single graph covers both cases.
+        if self.lora_manager is not None:
+            ctx.lora_manager = self.lora_manager
+            # Pre-fill batch_info so the captured kernels see a stable
+            # set of pointers; runtime updates the same tensors before
+            # each ``graph.replay()`` and the kernels re-read seg_lens /
+            # weight_indices / lora_ranks.
+            #
+            # Use lora_id=0 (base model) which resolves to NO_LORA_SLOT, BUT
+            # force has_active_lora=True so LoRA kernels ARE captured in the
+            # graph.  With dynamic GPU-tensor weight indexing (w13_A_buffers
+            # etc.) the captured kernels read weight_indices at replay time,
+            # so the correct adapter slot is used regardless of what was set
+            # during capture.  Slot 0 weights are all-zero at capture time
+            # (no adapter loaded yet), so the model output is unaffected.
+            self.lora_manager.prepare_loras(
+                [0] * bs, per_request_token_counts=self.max_tokens_per_req
+            )
+            # Force has_active_lora and single_lora_slot so ALL LoRA kernels
+            # (MoE, attention, MLP) are included in the captured graph.
+            # This applies to any enabled LoRA type — without this, kernels that
+            # check has_active_lora (e.g. apply_qkv_lora) return early during
+            # capture, recording a no-op that is then replayed at every decode step.
+            if (
+                self.lora_manager.enable_moe_lora
+                or self.lora_manager.enable_attn_lora
+                or self.lora_manager.enable_mlp_lora
+            ):
+                self.lora_manager.has_active_lora = True
+                bi = self.lora_manager._batch_info
+                bi.single_lora_slot = 0
+                bi.single_lora_rank = self.lora_manager.max_lora_rank
+                bi.weight_indices[:bs].fill_(0)
+
         # Capture with is_all_greedy=False so the graph records the full
         # top_k_top_p_sampling path (greedy-only requests are served by the
         # same path with top_k=1 in the buffer, which effectively argmaxes).
@@ -433,6 +478,7 @@ class CudaGraphWrapper:
             device=self.device,
         )
 
+        from tokenspeed.runtime.execution.context import bind_forward_context
         from tokenspeed.runtime.grammar.capturable_grammar import (
             bind_grammar_mask_buf,
         )
@@ -458,7 +504,8 @@ class CudaGraphWrapper:
                 self.capturable_grammar.add_batch(
                     grammars=[None] * bs, bs=bs, has_candidates=False
                 )
-            return self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
+            with bind_forward_context(ctx):
+                return self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
 
         global _is_cuda_graph_phase
         _is_cuda_graph_phase = True
@@ -1196,7 +1243,10 @@ class CudaGraphWrapper:
                 **mamba_kwargs,
             )
 
-            result = self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
+            from tokenspeed.runtime.execution.context import bind_forward_context
+
+            with bind_forward_context(ctx):
+                result = self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
 
         if use_graph and padded_bs != bs:
             ctx.bs = bs
