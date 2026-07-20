@@ -31,6 +31,7 @@ export C_INCLUDE_PATH="/usr/local/cuda/include/cccl"
 
 WORKSPACE=${WORKSPACE:-$(pwd)}
 CUDA_REQ="${WORKSPACE}/tokenspeed-kernel/python/requirements/cuda.txt"
+TOKENSPEED_TESTPYPI_INDEX=${TOKENSPEED_TESTPYPI_INDEX:-https://test.pypi.org/simple}
 
 # Wrap pip install in a retry loop. PyPI's CDN occasionally returns a
 # bad Content-Type for /simple/<pkg>/ pages (most recently observed for
@@ -71,6 +72,18 @@ ensure_flashinfer_jit_cache_for_gb200() {
 
     pip_install_with_retry pip3 install --break-system-packages \
         --force-reinstall --no-deps "${wheel_url}"
+}
+preinstall_tokenspeed_testpypi_packages() {
+    local requirements_file="${WORKSPACE}/tokenspeed-kernel/python/requirements/common.txt"
+    local vendor_requirements=()
+    mapfile -t vendor_requirements < <(grep -E '^tokenspeed-(triton|proton)==' "${requirements_file}")
+    if [ "${#vendor_requirements[@]}" -eq 0 ]; then
+        echo "No tokenspeed vendor requirements found in ${requirements_file}" >&2
+        return 1
+    fi
+    pip_install_with_retry pip3 install --no-deps \
+        --index-url "${TOKENSPEED_TESTPYPI_INDEX}" \
+        "${vendor_requirements[@]}"
 }
 
 echo "=========================================="
@@ -115,6 +128,8 @@ ensure_flashinfer_jit_cache_for_gb200
 # ============================================================
 echo "=== Step 4: Install tokenspeed-kernel ==="
 cd ${WORKSPACE}
+echo "Preinstalling staged TokenSpeed vendor packages from ${TOKENSPEED_TESTPYPI_INDEX}"
+preinstall_tokenspeed_testpypi_packages
 export PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cu${CUINDEX}"
 TOKENSPEED_KERNEL_BACKEND=cuda FLASHINFER_CUDA_ARCH_LIST="${FI_ARCH}" \
 pip_install_with_retry pip3 install tokenspeed-kernel/python/ --no-build-isolation -v
