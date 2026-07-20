@@ -1614,19 +1614,21 @@ def _index_k_scatter_kernel(
     scale_buf_ptr,  # float32 flat view of buf (aliases fp8_buf_ptr)
     k_fp8_ptr,  # uint8 [tokens, HD]
     k_scale_ptr,  # float32 [tokens, NG]
-    page_ptr,
-    slot_ptr,
+    loc_ptr,  # int [tokens] global slot index (non-negative)
     page_bytes,  # fp8 elements per page
     scale_page_off,  # float32 elements per page (page_bytes // 4)
     scale_base_off,  # float32 offset of the scale region ((ps*hd)//4)
+    PAGE_SIZE: tl.constexpr,
     HD: tl.constexpr,
     NG: tl.constexpr,
     BLOCK_HD: tl.constexpr,  # next_pow2(HD); masked so HD need not be pow2
     BLOCK_NG: tl.constexpr,  # next_pow2(NG)
 ):
     t = tl.program_id(0)
-    page = tl.load(page_ptr + t)
-    slot = tl.load(slot_ptr + t)
+    # loc >= 0 makes // and % exact.
+    loc = tl.load(loc_ptr + t).to(tl.int64)
+    page = loc // PAGE_SIZE
+    slot = loc % PAGE_SIZE
 
     d = tl.arange(0, BLOCK_HD)
     hd_mask = d < HD
@@ -1651,8 +1653,7 @@ def index_k_block_split_scatter(
     buf: torch.Tensor,
     index_k_fp8: torch.Tensor,
     index_k_scale: torch.Tensor,
-    page: torch.Tensor,
-    slot_in_page: torch.Tensor,
+    loc: torch.Tensor,
     *,
     page_size: int,
     head_dim: int,
@@ -1660,16 +1661,18 @@ def index_k_block_split_scatter(
 ) -> None:
     """Scatter FP8 index-K rows + scales into the block-split paged buffer.
 
-    Byte-exact single-launch equivalent of the two ``index_put`` writes through
+    Byte-exact single-launch equivalent of two ``index_put`` writes through
     the block-split ``as_strided`` views (see
-    ``DSATokenToKVPool._index_k_block_views``); sibling of
-    ``fused_fp8_set_kv_buffer`` for the non-block-split cache.
+    ``DSATokenToKVPool._index_k_block_views``). The ``(page, slot_in_page) =
+    (loc // page_size, loc % page_size)`` mapping is derived per token inside
+    the kernel, so callers pass raw cache locations.
 
     Args:
         buf: uint8 ``[num_slots, head_dim + num_groups*4]`` packed buffer.
         index_k_fp8: ``[tokens, head_dim]`` FP8 values.
         index_k_scale: ``[tokens, num_groups]`` float32 scales.
-        page, slot_in_page: ``[tokens]`` int write location (page / slot in page).
+        loc: ``[tokens]`` non-negative int global slot indices (any integer
+            dtype).
         page_size, head_dim, group_size: layout; ``num_groups = head_dim //
             group_size``.
 
@@ -1693,11 +1696,11 @@ def index_k_block_split_scatter(
         scale_buf,
         k_fp8,
         k_scale,
-        page.to(torch.int64),
-        slot_in_page.to(torch.int64),
+        loc.reshape(-1),
         page_bytes,
         page_bytes // 4,
         (page_size * head_dim) // 4,
+        PAGE_SIZE=page_size,
         HD=head_dim,
         NG=ng,
         BLOCK_HD=_next_power_of_two(head_dim),

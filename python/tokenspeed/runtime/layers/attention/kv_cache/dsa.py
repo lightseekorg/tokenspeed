@@ -61,13 +61,6 @@ class DSATokenToKVPool(MLATokenToKVPool):
             device=self.device,
         )
 
-        # (loc, loc._version, page, slot_in_page) memo for the index-K write;
-        # only version-tracked loc is cached (inference-mode loc recomputes),
-        # see _index_k_page_slot.
-        self._index_k_loc_cache: (
-            tuple[torch.Tensor, int, torch.Tensor, torch.Tensor] | None
-        ) = None
-
     def _get_page_size_bytes(self):
         index_size_bytes = self.index_k_row_bytes
         return (
@@ -188,54 +181,6 @@ class DSATokenToKVPool(MLATokenToKVPool):
         k_scale = scale_view[page, slot_in_page]
         return k_fp8, k_scale
 
-    @staticmethod
-    def _loc_version(loc: torch.Tensor) -> int | None:
-        """Version counter of ``loc``, or ``None`` when it isn't tracked.
-
-        The speculative draft path runs under ``torch.inference_mode()`` (see
-        the DFLASH drafter), whose tensors do not maintain a version counter, so
-        reading ``loc._version`` raises ``RuntimeError``. Returning ``None`` lets
-        the memo fall back to recomputation instead of crashing. That costs the
-        draft nothing: its ``GLM5 NextN`` model has a single DSA layer, so the
-        per-forward memo could never hit there anyway.
-        """
-        if loc.is_inference():
-            return None
-        return loc._version
-
-    def _index_k_page_slot(
-        self, loc: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Map ``loc`` to ``(page, slot_in_page)``, memoized on ``loc``.
-
-        ``loc`` is the step's ``out_cache_loc``, shared by every indexer layer,
-        so the cast/floor-div/remainder fire once per forward instead of per
-        layer. Keyed on object identity *and* ``_version`` so an in-place
-        ``loc.copy_()`` (same object, new content) correctly misses; recycled
-        storage in a fresh object also misses (identity differs), and under
-        CUDA-graph replay this Python does not run. Numerically identical to the
-        inline computation.
-
-        Inference-mode ``loc`` (no version counter) can't be validated across
-        calls, so it is never memoized and always recomputes -- correct, and
-        the only path that hits it (the draft) has nothing to gain from the memo.
-        """
-        version = self._loc_version(loc)
-        cached = self._index_k_loc_cache
-        if (
-            version is not None
-            and cached is not None
-            and cached[0] is loc
-            and cached[1] == version
-        ):
-            return cached[2], cached[3]
-        loc_long = loc.to(torch.long)
-        page = loc_long // self.page_size
-        slot_in_page = loc_long % self.page_size
-        if version is not None:
-            self._index_k_loc_cache = (loc, version, page, slot_in_page)
-        return page, slot_in_page
-
     def _set_index_k_buffer(
         self,
         layer_id: int,
@@ -250,14 +195,12 @@ class DSATokenToKVPool(MLATokenToKVPool):
             scale_encoding="float32",
         )
 
-        # One fused scatter, byte-exact with the two index_put writes it replaces.
-        page, slot_in_page = self._index_k_page_slot(loc)
+        # Fused scatter; (page, slot_in_page) is derived from loc in-kernel.
         index_k_block_split_scatter(
             buf,
             index_k_fp8,
             index_k_scale,
-            page,
-            slot_in_page,
+            loc,
             page_size=self.page_size,
             head_dim=self.index_head_dim,
             group_size=_INDEX_K_FP8_GROUP_SIZE,

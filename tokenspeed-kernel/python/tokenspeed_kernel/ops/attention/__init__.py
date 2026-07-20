@@ -1416,7 +1416,8 @@ def dsa_prefill_topk(
 
     Args:
         q: BF16 indexer query with shape [tokens, index_heads, head_dim].
-        weights: FP32 per-token/head weights with shape [tokens, index_heads].
+        weights: Per-token/head weights with shape [tokens, index_heads],
+            FP32 or raw BF16 (implementations upcast on the fly).
         kv_workspace_slots: Global KV slot for each workspace row, shape
             [workspace_rows].
         row_starts: Inclusive workspace-row start per query token, shape [tokens].
@@ -1522,7 +1523,8 @@ def dsa_decode_topk(
 
     Args:
         q: BF16 indexer query with shape [tokens, index_heads, head_dim].
-        weights: FP32 per-token/head weights with shape [tokens, index_heads].
+        weights: Per-token/head weights with shape [tokens, index_heads],
+            FP32 or raw BF16 (implementations upcast on the fly).
         seq_lens: Per-request full KV length, shape [num_reqs] (= tokens /
             q_len_per_req). Each query token's causal bound
             seq_lens[req] - (q_len_per_req - 1) + j is derived in-kernel.

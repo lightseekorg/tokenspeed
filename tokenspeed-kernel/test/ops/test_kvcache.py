@@ -232,7 +232,7 @@ def test_transfer_kv_all_layer_mla(device: str) -> None:
         assert torch.equal(layers_dst[layer_idx], expected[layer_idx])
 
 
-# index_k_block_split_scatter (GLM-5 DSA index-K cache write, 组C)
+# index_k_block_split_scatter (GLM-5 DSA index-K cache write)
 
 
 def _index_k_block_views(buf, num_pages, page_size, head_dim, num_groups):
@@ -264,8 +264,9 @@ def _index_k_block_views(buf, num_pages, page_size, head_dim, num_groups):
     ],
 )
 @pytest.mark.parametrize("tokens", [1, 7, 16, 64])
+@pytest.mark.parametrize("loc_dtype", [torch.int32, torch.int64])
 def test_index_k_block_split_scatter_matches_index_put(
-    device: str, head_dim: int, group_size: int, tokens: int
+    device: str, head_dim: int, group_size: int, tokens: int, loc_dtype: torch.dtype
 ) -> None:
     torch.manual_seed(head_dim + group_size + tokens)
     page_size, num_pages = 64, 32
@@ -275,8 +276,8 @@ def test_index_k_block_split_scatter_matches_index_put(
 
     k_fp8 = torch.randn(tokens, head_dim, device=device).to(torch.float8_e4m3fn)
     k_scale = torch.rand(tokens, ng, device=device, dtype=torch.float32) + 0.1
-    loc = torch.randperm(num_slots, device=device)[:tokens].to(torch.int64)
-    page, slot = loc // page_size, loc % page_size
+    loc = torch.randperm(num_slots, device=device)[:tokens].to(loc_dtype)
+    page, slot = loc.long() // page_size, loc.long() % page_size
 
     buf_ref = torch.zeros(num_slots, row, dtype=torch.uint8, device=device)
     buf_k = torch.zeros(num_slots, row, dtype=torch.uint8, device=device)
@@ -291,8 +292,7 @@ def test_index_k_block_split_scatter_matches_index_put(
         buf_k,
         k_fp8,
         k_scale,
-        page,
-        slot,
+        loc,
         page_size=page_size,
         head_dim=head_dim,
         group_size=group_size,
@@ -305,13 +305,12 @@ def test_index_k_block_split_scatter_empty_is_noop(device: str) -> None:
     buf = torch.zeros(64, 132, dtype=torch.uint8, device=device)
     empty_fp8 = torch.empty(0, 128, device=device, dtype=torch.float8_e4m3fn)
     empty_scale = torch.empty(0, 1, device=device, dtype=torch.float32)
-    empty_idx = torch.empty(0, dtype=torch.int64, device=device)
+    empty_loc = torch.empty(0, dtype=torch.int64, device=device)
     index_k_block_split_scatter(
         buf,
         empty_fp8,
         empty_scale,
-        empty_idx,
-        empty_idx,
+        empty_loc,
         page_size=64,
         head_dim=128,
         group_size=128,

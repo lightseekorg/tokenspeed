@@ -185,8 +185,8 @@ class GlmDsaIndexer(nn.Module):
         self.index_head_dim = config.index_head_dim
         self.rope_head_dim = int(qk_rope_head_dim)
         self.softmax_scale = self.index_head_dim**-0.5
-        # Head norm folded into the top-k kernel's weights scale, so forward
-        # skips a separate weights-scale kernel (组A).
+        # Top-k scale with the per-head normalization folded in, so forward
+        # needs no separate weights-scale kernel.
         self.weights_softmax_scale = self.softmax_scale * (self.index_n_heads**-0.5)
 
         if self.rope_head_dim <= 0 or self.rope_head_dim > self.index_head_dim:
@@ -271,8 +271,10 @@ class GlmDsaIndexer(nn.Module):
         return GlmDsaIndexerOutput(
             query=index_q,
             key=index_k,
-            # Head norm folded into weights_softmax_scale (组A); only the cast here.
-            weights=weights.float(),
+            # Raw bf16 weights: the head-norm constant is folded into
+            # weights_softmax_scale and the fp32 upcast into the top-k
+            # kernels' fused combine.
+            weights=weights,
         )
 
 
@@ -579,8 +581,8 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             raise RuntimeError("GLM DSA top-k requires an index-K cache.")
 
         # The top-k kernels overwrite the whole workspace when they cover all
-        # rows, making the sentinel pre-fills dead; keep the fills only when
-        # leading prefill rows stay unwritten but readable (mixed prefill) (组D).
+        # rows; the sentinel pre-fills are only needed for mixed prefill,
+        # where leading rows stay unwritten but readable.
         writes_full_workspace = decode_start == 0 and num_decode_tokens == num_tokens
         topk_indices = self._get_decode_topk_workspace(
             "_decode_topk_indices_buffer",
@@ -685,7 +687,9 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         topk: int,
     ) -> GlmDsaPrefillTopK:
         q = indexer_output.query[:num_prefill_tokens].contiguous()
-        weights = indexer_output.weights[:num_prefill_tokens].float().contiguous()
+        # Raw bf16 weights view (may be column-split, non-compact); the top-k
+        # kernel's fused combine upcasts and compacts in one launch.
+        weights = indexer_output.weights[:num_prefill_tokens]
 
         req_ids = torch.arange(
             seq_lens.numel(),
