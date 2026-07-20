@@ -386,19 +386,7 @@ def mm(
         assert (
             block_size is not None
         ), "block_size is required for online activation quantization"
-        a_format = signature.format_for("a")
-        assert a_format is not None and a_format.scale is not None
-        A, A_scales = _online_quantize_mxfp8(
-            A,
-            block_size,
-            kernel.name,
-        )
-        if A_scales.dtype != a_format.scale.storage_dtype:
-            raise RuntimeError(
-                f"{kernel.name} online MXFP8 quantization returned "
-                f"{A_scales.dtype} scales, expected "
-                f"{a_format.scale.storage_dtype} from its selected format"
-            )
+        A, A_scales = _online_quantize_mxfp8(A, block_size, kernel.name)
 
     kernel_args = (A, B, A_scales, B_scales, out_dtype)
     kernel_kwargs: dict[str, object] = {
