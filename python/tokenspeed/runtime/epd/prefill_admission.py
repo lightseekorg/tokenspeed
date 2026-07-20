@@ -56,12 +56,12 @@ import torch.distributed as dist
 
 logger = logging.getLogger(__name__)
 
+from tokenspeed.runtime.epd.mooncake.receiver import (
+    MooncakeEmbeddingReceiver,
+)
 from tokenspeed.runtime.multimodal.embedder import _item_token_count
 from tokenspeed.runtime.multimodal.inputs import MultimodalDataItem
 from tokenspeed.runtime.pd.base.status import TransferPoll
-from tokenspeed.runtime.pd.epd.embedding_transfer import (
-    MooncakeEmbeddingReceiver,
-)
 from tokenspeed.runtime.utils.env import envs
 
 # (manager, bootstrap_addr, bootstrap_room) -> receiver. Defaults to the real
@@ -859,10 +859,10 @@ def build_prefill_embedding_manager(server_args, global_rank, is_multimodal_acti
     if server_args.disaggregation_mode != "prefill" or not is_multimodal_active:
         return None
 
-    from tokenspeed.runtime.pd.epd.embedding_transfer import (
+    from tokenspeed.runtime.epd.entities import EmbeddingArgs, EmbeddingManagerArgs
+    from tokenspeed.runtime.epd.mooncake.prefill import (
         MooncakeEmbeddingManagerPrefill,
     )
-    from tokenspeed.runtime.pd.epd.entities import EmbeddingArgs, EmbeddingManagerArgs
 
     emb_mgr_args = EmbeddingManagerArgs(
         bootstrap_port=server_args.disaggregation_bootstrap_port,

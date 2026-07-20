@@ -40,13 +40,13 @@ from tokenspeed.runtime.cache.embedding_cache import (
     EmbeddingCache,
     TieredEmbeddingCache,
 )
-from tokenspeed.runtime.multimodal.embedder import _item_token_count
-from tokenspeed.runtime.multimodal.inputs import MultimodalDataItem
-from tokenspeed.runtime.multimodal.shm_transport import ShmTensorHandle
-from tokenspeed.runtime.pd.epd.encode_scheduler import (
+from tokenspeed.runtime.epd.encode_scheduler import (
     EncodeScheduler,
     PendingEncodeItem,
 )
+from tokenspeed.runtime.multimodal.embedder import _item_token_count
+from tokenspeed.runtime.multimodal.inputs import MultimodalDataItem
+from tokenspeed.runtime.multimodal.shm_transport import ShmTensorHandle
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)

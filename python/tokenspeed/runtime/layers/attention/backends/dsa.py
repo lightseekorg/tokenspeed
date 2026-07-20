@@ -199,7 +199,6 @@ class DSABackend(AttentionBackend):
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
         req_to_page: torch.Tensor,
-        spec_info=None,
         **kwargs,
     ):
         self._dense_backend.init_forward_metadata(
@@ -209,7 +208,6 @@ class DSABackend(AttentionBackend):
             seq_lens=seq_lens,
             forward_mode=forward_mode,
             req_to_page=req_to_page,
-            spec_info=spec_info,
             **kwargs,
         )
         if (

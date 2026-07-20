@@ -545,7 +545,7 @@ class EventLoop:
             # prefill skips the vision tower. The admission controller owns the
             # receive jobs, the rank-synced admission drain, and the optional NCCL
             # row-shard reassembly; None for decode/encode/text-only nodes.
-            from tokenspeed.runtime.pd.epd.prefill_receiver import (
+            from tokenspeed.runtime.epd.prefill_admission import (
                 make_epd_prefill_admission,
             )
 
@@ -1871,7 +1871,7 @@ def run_event_loop(
         if server_args.disaggregation_mode == "encode":
             # The encode role is LM-free; run the lightweight vision-tower loop
             # instead of building the full EventLoop (KV/LM scheduler).
-            from tokenspeed.runtime.pd.epd.encode_loop import (
+            from tokenspeed.runtime.epd.encode_loop import (
                 run_encode_loop,
             )
 

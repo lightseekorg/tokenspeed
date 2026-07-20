@@ -18,17 +18,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Mooncake transport for EPD encode->prefill image-embedding transfer.
+"""Encode-side (data source) manager for the Mooncake embedding transfer.
 
-The encode (vision-tower-only) server is the data source: it calls
-``batch_transfer_sync`` to ship a contiguous ``[num_tokens, hidden]`` tensor
-per item over the same Mooncake RDMA engine the KV path uses. The prefill side
-is the receiver that pre-registers buffers and registers with the bootstrap
-server (direction reversed relative to prefill->decode).
-
-Wire-frame dataclasses live in :mod:`tokenspeed.runtime.pd.epd.entities`: they
-are pure data plus codecs and import no torch, so the protocol contract stays
-importable and unit-testable on CPU.
+Split out of :mod:`tokenspeed.runtime.epd.mooncake.embedding_transfer`; the
+per-request sender it drives lives in
+:mod:`tokenspeed.runtime.epd.mooncake.sender`.
 """
 
 from __future__ import annotations
@@ -37,54 +31,27 @@ import concurrent.futures
 import os
 import threading
 import time
-from typing import TYPE_CHECKING
 
 import requests
 import zmq
 
-from tokenspeed.runtime.pd.base.status import TransferPoll
-from tokenspeed.runtime.pd.epd.conn import (
-    MooncakeEmbeddingManagerBase,
-)
-from tokenspeed.runtime.pd.epd.entities import (
+from tokenspeed.runtime.epd.entities import (
     REGISTER_ROOM_SENTINEL,
     EmbeddingArgs,
-    EmbeddingArgsRegisterInfo,
     EmbeddingChunk,
     EmbeddingManagerArgs,
-    EmbeddingTransferError,
     EmbeddingTransferInfo,
 )
+from tokenspeed.runtime.epd.mooncake.conn import (
+    MooncakeEmbeddingManagerBase,
+)
+from tokenspeed.runtime.pd.base.status import TransferPoll
 from tokenspeed.runtime.pd.utils import DisaggregationMode, FastQueue
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.network import get_free_port, get_local_ip_by_remote
 
 logger = get_colorful_logger(__name__)
-
-if TYPE_CHECKING:
-    import torch
-
-
-def _route_get(bootstrap_addr: str, engine_rank: int, target_dp_group: int):
-    """GET the bootstrap server's /route endpoint; ``None`` on any failure.
-
-    Must never raise: callers in the receiver ``__init__`` treat ``None`` as a
-    per-room failure, but an uncaught exception would escape the prefill
-    scheduler thread and take the whole engine down via SIGUSR1.
-    """
-    url = (
-        f"http://{bootstrap_addr}/route?"
-        f"engine_rank={engine_rank}&target_dp_group={target_dp_group}"
-    )
-    try:
-        resp = requests.get(url, timeout=5)
-    except Exception as e:  # noqa: BLE001 -- any transport failure -> per-room fail
-        logger.error("EPD bootstrap /route fetch failed (%s): %s", url, e)
-        return None
-    if resp.status_code == 200:
-        return resp.json()
-    return None
 
 
 def _b(value: object) -> bytes:
@@ -163,77 +130,6 @@ def shard_payload(
         deep_src = chunk.src_deepstack_ptr + info.row_start * deep_row_bytes
         deep_nbytes = info.n_tokens * deep_row_bytes
     return src, nbytes, deep_src, deep_nbytes
-
-
-class MooncakeEmbeddingSender:
-    """Encode-side per-request sender for one bootstrap room.
-
-    ``poll`` / ``clear`` / ``failure_exception`` are status-only (they touch
-    only the manager's status maps). ``send`` queues one contiguous embedding
-    tensor described by scalar fields, keeping this class free of any torch
-    dependency.
-    """
-
-    def __init__(self, mgr, bootstrap_addr: str, bootstrap_room: int):
-        self.mgr = mgr  # MooncakeEmbeddingManagerEncode
-        self.bootstrap_server_url = bootstrap_addr
-        self.bootstrap_room = bootstrap_room
-        self.mgr.update_status(bootstrap_room, TransferPoll.Bootstrapping)
-        self.conclude_state = None
-
-    def send(
-        self,
-        *,
-        src_embedding_ptr: int,
-        n_tokens: int,
-        hidden: int,
-        dtype: str,
-        nbytes: int,
-        src_deepstack_ptr: int = 0,
-        deepstack_width: int = 0,
-        deepstack_nbytes: int = 0,
-        copy_event: torch.cuda.Event | None = None,
-    ) -> None:
-        chunk = EmbeddingChunk(
-            room=self.bootstrap_room,
-            src_embedding_ptr=src_embedding_ptr,
-            n_tokens=n_tokens,
-            hidden=hidden,
-            dtype=dtype,
-            nbytes=nbytes,
-            src_deepstack_ptr=src_deepstack_ptr,
-            deepstack_width=deepstack_width,
-            deepstack_nbytes=deepstack_nbytes,
-            copy_event=copy_event,
-        )
-        self.mgr.add_transfer_request(self.bootstrap_room, chunk)
-
-    def poll(self) -> int:
-        # No Bootstrapping timeout here: the never-registered-receiver case is
-        # handled by the manager's _park_reaper (it fails rooms whose parked chunk
-        # outlives bootstrap_time_out), so this only reports terminal status.
-        if self.conclude_state is None:
-            status = self.mgr.check_status(self.bootstrap_room)
-            if status in (TransferPoll.Success, TransferPoll.Failed):
-                self.conclude_state = status
-            return status
-        return self.conclude_state
-
-    def clear(self) -> None:
-        if self.bootstrap_room in self.mgr.request_status:
-            self.mgr.request_status.pop(self.bootstrap_room)
-
-    def failure_exception(self):
-        if self.conclude_state is None:
-            self.conclude_state = TransferPoll.Failed
-        self.clear()
-        with self.mgr.failure_lock:
-            failure_reason = self.mgr.failure_records.pop(
-                self.bootstrap_room, "Failed due to an unknown reason from another rank"
-            )
-        raise EmbeddingTransferError(
-            self.bootstrap_room, failure_reason, self.bootstrap_server_url
-        )
 
 
 class MooncakeEmbeddingManagerEncode(MooncakeEmbeddingManagerBase):
@@ -532,191 +428,3 @@ class MooncakeEmbeddingManagerEncode(MooncakeEmbeddingManagerBase):
         sock.send_multipart(
             [_b(info.room), _b(int(status)), _b(self.embedding_args.engine_rank)]
         )
-
-
-class MooncakeEmbeddingManagerPrefill(MooncakeEmbeddingManagerBase):
-    """Prefill-side (data sink) manager: holds the discovery caches and a thread
-    that consumes the encode side's per-request completion-status frames, marking
-    the room Success once all expected responses arrive.
-    """
-
-    def __init__(self, args: EmbeddingManagerArgs, embedding_args: EmbeddingArgs):
-        super().__init__(args, embedding_args, DisaggregationMode.PREFILL)
-        self.required_response_num: dict[int, int] = {}
-        self.response_tracker: dict[int, set] = {}
-        self.connection_pool: dict[str, list] = {}
-        self.prefill_parallel_info: dict[str, dict] = {}
-        self._start_status_thread()
-
-    def _start_status_thread(self):
-        self.rank_port = get_free_port()
-        self.server_socket.bind(f"tcp://{get_local_ip_by_remote()}:{self.rank_port}")
-
-        def loop():
-            while True:
-                parts = self.server_socket.recv_multipart()
-                room = int(parts[0].decode("ascii"))
-                status = int(parts[1].decode("ascii"))
-                rank = int(parts[2].decode("ascii"))
-                if status == TransferPoll.Success and room in self.request_status:
-                    self.response_tracker.setdefault(room, set()).add(rank)
-                    if len(
-                        self.response_tracker[room]
-                    ) >= self.required_response_num.get(room, 1):
-                        self.update_status(room, TransferPoll.Success)
-                elif status == TransferPoll.Failed:
-                    self.record_failure(room, "encode failed to send embedding")
-                    self.update_status(room, TransferPoll.Failed)
-
-        threading.Thread(target=loop, daemon=True).start()
-
-
-class MooncakeEmbeddingReceiver:
-    """Prefill-side per-request receiver: discovers the encode endpoint via the
-    bootstrap server, registers its receive buffer, and on ``pre_alloc`` tells
-    the encode side where/how big to write this request's embedding. 1->N
-    broadcast (prefill_tp a multiple of encode_tp): contiguous blocks of prefill
-    ranks pair one encode rank; encode_tp=1 -> all prefill ranks pair encode
-    rank 0 and receive the same TP-gathered embedding.
-    """
-
-    def __init__(
-        self,
-        mgr: MooncakeEmbeddingManagerPrefill,
-        bootstrap_addr: str,
-        bootstrap_room: int,
-    ):
-        self.mgr = mgr
-        self.bootstrap_addr = bootstrap_addr
-        self.bootstrap_room = bootstrap_room
-        self.session_id = mgr.get_session_id()
-        mgr.update_status(bootstrap_room, TransferPoll.Bootstrapping)
-
-        pinfo = mgr.prefill_parallel_info.get(bootstrap_addr)
-        if pinfo is None or pinfo.get("prefill_tp_size") is None:
-            # SINGLE-attempt fail-fast: this runs in the prefill scheduler thread,
-            # so a retry-loop would stall the whole TP group on a slow/unreachable
-            # encode bootstrap. /route can answer 200 with un-populated
-            # parallel-info while the encode worker is still registering (startup
-            # race); fail this room fast and let the client retry once the encode
-            # has registered. A partial dict is never cached (it would crash later
-            # requests on int(None)). _route_get bounds its own GET at timeout=5,
-            # so this attempt cannot block beyond that.
-            cand = _route_get(bootstrap_addr, -1, -1)
-            if cand is None or cand.get("prefill_tp_size") is None:
-                mgr.record_failure(
-                    bootstrap_room, "no (complete) parallel info from bootstrap"
-                )
-                mgr.update_status(bootstrap_room, TransferPoll.Failed)
-                return
-            pinfo = cand
-            mgr.prefill_parallel_info[bootstrap_addr] = pinfo
-
-        encode_tp = int(pinfo["prefill_tp_size"])
-        encode_dp = int(pinfo["prefill_dp_size"])
-        local_tp = mgr.world_size // mgr.dp_size
-        # prefill_tp must be a whole multiple of encode_tp. The vision tower
-        # output is TP-gathered (identical on every encode rank) and every prefill
-        # rank needs the full embedding, so encode_tp=1 -> prefill_tp=N is a 1->N
-        # broadcast. Contiguous blocks of `fanout` prefill ranks share one encode
-        # rank.
-        assert local_tp % encode_tp == 0, (
-            f"EPD requires prefill_tp to be a multiple of encode_tp "
-            f"(encode_tp={encode_tp}, prefill_tp={local_tp})"
-        )
-        fanout = local_tp // encode_tp  # prefill ranks served by one encode rank
-        # Drives the ENCODE-side gate: how many prefill ranks register with this
-        # request's encode rank before it may send + conclude (1->N broadcast).
-        self.required_dst_info_num = fanout
-        # This prefill rank still pulls from exactly ONE encode rank, so it expects
-        # a single completion sync. The N-way fan-out is purely the encode side's
-        # concern; bumping this to N would hang every prefill rank.
-        mgr.required_response_num[bootstrap_room] = 1
-
-        # Which encode rank this prefill rank pulls from: contiguous grouping.
-        # encode_tp=1 -> fanout=local_tp -> my_encode_rank == 0 for all prefill
-        # ranks. Use `// fanout`, NOT `% encode_tp`: both are 0 for encode_tp=1,
-        # but only `// fanout` groups ranks correctly for encode_tp>1.
-        my_tp_rank = mgr.embedding_args.engine_rank % local_tp
-        my_encode_rank = my_tp_rank // fanout
-        target_dp_group = bootstrap_room % encode_dp
-        key = f"{bootstrap_addr}_{target_dp_group}_{my_encode_rank}"
-        if key not in mgr.connection_pool:
-            info = _route_get(bootstrap_addr, my_encode_rank, target_dp_group)
-            if info is None:
-                mgr.record_failure(bootstrap_room, "no encode rank info from bootstrap")
-                mgr.update_status(bootstrap_room, TransferPoll.Failed)
-                return
-            self.encode_infos = [info]
-            mgr.connection_pool[key] = self.encode_infos
-            self._register_args()
-        else:
-            self.encode_infos = mgr.connection_pool[key]
-        mgr.update_status(bootstrap_room, TransferPoll.Bootstrapped)
-
-    def _register_args(self):
-        ea = self.mgr.embedding_args
-        reg = EmbeddingArgsRegisterInfo(
-            room=REGISTER_ROOM_SENTINEL,
-            endpoint=get_local_ip_by_remote(),
-            dst_port=self.mgr.rank_port,
-            mooncake_session_id=self.session_id,
-            dst_embedding_ptr=ea.embedding_data_ptr,
-            dst_deepstack_ptr=ea.deepstack_data_ptr,
-        )
-        for info in self.encode_infos:
-            sock = self.mgr._connect(f"tcp://{info['rank_ip']}:{info['rank_port']}")
-            sock.send_multipart(reg.to_zmq())
-
-    def pre_alloc(
-        self,
-        *,
-        dst_embedding_ptr: int,
-        n_tokens: int,
-        hidden: int,
-        dtype: str,
-        dst_deepstack_ptr: int = 0,
-        has_deepstack: bool = False,
-        row_start: int = 0,
-        span: int = 0,
-    ) -> None:
-        """Tell the encode side where/how big to write. In shard mode the caller
-        passes this rank's row sub-range: ``row_start`` within the image and
-        ``n_tokens`` = the SHARD's row count, both dst pointers already offset to
-        the shard's first row. ``span`` is the image's FULL row count (pass it in
-        identity mode too: it is the encode side's token-count tripwire). A
-        ``n_tokens == 0`` frame is still sent: it doubles as this receiver's
-        registration heartbeat (the encode-side fanout gate counts frames, not
-        bytes)."""
-        for info in self.encode_infos:
-            ti = EmbeddingTransferInfo(
-                room=self.bootstrap_room,
-                endpoint=get_local_ip_by_remote(),
-                dst_port=self.mgr.rank_port,
-                mooncake_session_id=self.session_id,
-                dst_embedding_ptr=dst_embedding_ptr,
-                dst_deepstack_ptr=dst_deepstack_ptr,
-                n_tokens=n_tokens,
-                hidden=hidden,
-                dtype=dtype,
-                has_deepstack=has_deepstack,
-                required_dst_info_num=self.required_dst_info_num,
-                row_start=row_start,
-                span=span,
-            )
-            sock = self.mgr._connect(f"tcp://{info['rank_ip']}:{info['rank_port']}")
-            sock.send_multipart(ti.to_zmq())
-
-    def poll(self) -> int:
-        return self.mgr.check_status(self.bootstrap_room)
-
-    def clear(self) -> None:
-        """Drop this room's bookkeeping from the (singleton) prefill manager on a
-        terminal receive, else every request leaks its status/tracker entries.
-        Mirrors the KV receiver; called post-terminal so it can't race check_status."""
-        room = self.bootstrap_room
-        self.mgr.request_status.pop(room, None)
-        self.mgr.required_response_num.pop(room, None)
-        self.mgr.response_tracker.pop(room, None)
-        with self.mgr.failure_lock:
-            self.mgr.failure_records.pop(room, None)

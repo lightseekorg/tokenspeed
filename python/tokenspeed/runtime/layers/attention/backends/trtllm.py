@@ -407,7 +407,6 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         extend_prefix_lens: torch.Tensor | None = None,
         extend_prefix_lens_cpu: torch.Tensor | None = None,
         extend_seq_lens_cpu: torch.Tensor | None = None,
-        spec_info=None,
         use_cuda_graph: bool = False,
         flat_block_tables: dict[str, torch.Tensor] | None = None,
         **kwargs,
