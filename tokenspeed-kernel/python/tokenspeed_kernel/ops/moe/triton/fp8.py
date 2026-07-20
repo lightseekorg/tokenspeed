@@ -169,6 +169,7 @@ def triton_fp8_moe_weights(plan: dict, w: torch.nn.Module):
         "internal_activation_dtype": frozenset({"input"}),
         "fp8_scale_block_shape": frozenset({(128, 128)}),
         "supports_bias": frozenset({False}),
+        "supports_moe_lora": frozenset({True}),
     },
     priority=Priority.PORTABLE,
 )
@@ -195,6 +196,7 @@ def triton_fp8_moe_weights(plan: dict, w: torch.nn.Module):
         "internal_activation_dtype": frozenset({"input"}),
         "fp8_scale_block_shape": frozenset({(128, 128)}),
         "supports_bias": frozenset({False}),
+        "supports_moe_lora": frozenset({True}),
     },
     priority=Priority.PORTABLE,
 )
@@ -237,9 +239,15 @@ def triton_fp8_moe_apply(
     if w13_bias is not None or w2_bias is not None:
         raise RuntimeError("triton FP8 MoE does not support bias")
 
+    # MoE LoRA (per-expert adapters) is applied around the two GEMMs via the
+    # gathered-layout adapters on the attached context. It needs the
+    # pre-activation gate/up buffer, so the swiglu activation cannot be fused
+    # into the gate/up GEMM while a LoRA context is attached (the un-fused
+    # _silu_gate_up path is used instead, matching the LoRA activation contract).
+    moe_lora_ctx = getattr(w, "_moe_lora_ctx", None)
     swiglu_arg = getattr(w, "swiglu_arg", None)
     act = None
-    if swiglu_arg is not None:
+    if swiglu_arg is not None and moe_lora_ctx is None:
         act = FusedActivation(
             FnSpecs("swiglu", swiglu_fn, ("alpha", "limit"), reduction_n=2),
             (swiglu_arg.alpha, swiglu_arg.limit),
@@ -254,6 +262,10 @@ def triton_fp8_moe_apply(
         precision_config=w.w13_precision_config,
         fused_activation=act,
     )
+    if moe_lora_ctx is not None:
+        moe_lora_ctx.apply_gate_up_lora_ragged(
+            w.layer_index, x, topk_ids, intermediate_cache, scatter_indx
+        )
     if act is None:
         intermediate_cache = _silu_gate_up(
             intermediate_cache,
@@ -269,6 +281,15 @@ def triton_fp8_moe_apply(
         scatter_indx=scatter_indx,
         gammas=gate_scal,
     )
+    if moe_lora_ctx is not None:
+        moe_lora_ctx.apply_down_lora_ragged(
+            w.layer_index,
+            intermediate_cache,
+            topk_ids,
+            topk_weights,
+            output,
+            scatter_indx,
+        )
     if top_k > 1:
         return output.view(n_tokens, top_k, output.shape[-1]).sum(dim=1)
     return output
