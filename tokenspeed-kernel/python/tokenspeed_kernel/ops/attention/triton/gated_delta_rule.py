@@ -137,6 +137,7 @@ def _fused_gdn_decode_update_kernel(
     h0_indices,
     output_state_indices,
     intermediate_states_buffer,
+    per_token_output_state_indices,
     scale,
     T,
     H: tl.constexpr,
@@ -149,6 +150,7 @@ def _fused_gdn_decode_update_kernel(
     DISABLE_STATE_UPDATE: tl.constexpr,
     CACHE_INTERMEDIATE_STATES: tl.constexpr,
     HAS_OUTPUT_STATE_INDICES: tl.constexpr,
+    HAS_PER_TOKEN_OUTPUT_STATE_INDICES: tl.constexpr,
 ):
     """Dense-batch (no varlen) sigmoid-gating delta-rule decode/MTP update.
 
@@ -160,15 +162,17 @@ def _fused_gdn_decode_update_kernel(
     skipped (state contribution treated as zero -- mirrors flashinfer's
     float32 legacy decode path; output for that batch entry is undefined).
 
-    T=1 is a plain decode step; T>1 is an MTP verify step. Two independent,
+    T=1 is a plain decode step; T>1 is an MTP verify step. Three independent,
     mutually-exclusive-by-convention state-output mechanisms:
     - HAS_OUTPUT_STATE_INDICES: after the LAST processed step, write to the
       single row ``output_state_indices[i_n]`` (``[B]``-shaped; T=1 decode's
       dual-index paging remap).
     - CACHE_INTERMEDIATE_STATES: after EVERY step, write to the batch-scoped
       ``intermediate_states_buffer[i_n, step]`` (``[B, T, HV, V, K]``,
-      K-last -- matches flashinfer's MTP intermediate-state-buffer
-      convention so the runtime's post-call scatter is solution-agnostic).
+      K-last -- matches flashinfer's MTP intermediate-state-buffer convention).
+    - HAS_PER_TOKEN_OUTPUT_STATE_INDICES: after EVERY step, write directly to
+      the pool row ``per_token_output_state_indices[i_n, step]`` (``[B, T]``),
+      matching FlashInfer 0.6.15's ``ssm_state_indices`` contract.
     DISABLE_STATE_UPDATE additionally gates a final write-back to
     ``h0_indices[i_n]`` (the read row) when neither of the above applies.
     """
@@ -251,6 +255,24 @@ def _fused_gdn_decode_update_kernel(
             )
             tl.store(cache_ptr, b_h.to(cache_ptr.dtype.element_ty), mask=mask_h)
 
+        if HAS_PER_TOKEN_OUTPUT_STATE_INDICES:
+            out_idx = tl.load(per_token_output_state_indices + i_n * T + step_idx).to(
+                tl.int64
+            )
+            if out_idx >= 0:
+                p_step_out = (
+                    h0_source
+                    + out_idx * HV * V * K
+                    + i_hv * V * K
+                    + o_v[None, :] * K
+                    + o_k[:, None]
+                )
+                tl.store(
+                    p_step_out,
+                    b_h.to(p_step_out.dtype.element_ty),
+                    mask=mask_h,
+                )
+
         p_q += H * K
         p_k += H * K
         p_v += HV * V
@@ -269,7 +291,7 @@ def _fused_gdn_decode_update_kernel(
                 + o_k[:, None]
             )
             tl.store(p_out, b_h.to(p_out.dtype.element_ty), mask=mask_h)
-    elif not DISABLE_STATE_UPDATE:
+    elif not DISABLE_STATE_UPDATE and not HAS_PER_TOKEN_OUTPUT_STATE_INDICES:
         if idx >= 0:
             p_out = (
                 h0_source
@@ -297,6 +319,7 @@ def _launch_fused_gdn_decode_update(
     disable_state_update: bool,
     output_state_indices: torch.Tensor | None,
     intermediate_states_buffer: torch.Tensor | None,
+    per_token_output_state_indices: torch.Tensor | None,
 ) -> torch.Tensor:
     """Shared launcher for the ``gdn_decode_step`` (T=1) / ``gdn_decode_mtp``
     (T>1) Triton fallback kernels. q/k: [B, T, H, K]; v: [B, T, HV, V]; a/b:
@@ -337,6 +360,7 @@ def _launch_fused_gdn_decode_update(
         h0_indices=initial_state_indices,
         output_state_indices=output_state_indices,
         intermediate_states_buffer=intermediate_states_buffer,
+        per_token_output_state_indices=per_token_output_state_indices,
         scale=scale,
         T=T,
         H=H,
@@ -349,6 +373,7 @@ def _launch_fused_gdn_decode_update(
         DISABLE_STATE_UPDATE=disable_state_update,
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
         HAS_OUTPUT_STATE_INDICES=output_state_indices is not None,
+        HAS_PER_TOKEN_OUTPUT_STATE_INDICES=(per_token_output_state_indices is not None),
         num_warps=1,
         num_stages=3,
     )
@@ -402,6 +427,7 @@ def triton_gdn_decode_step(
         disable_state_update=False,
         output_state_indices=output_state_indices,
         intermediate_states_buffer=None,
+        per_token_output_state_indices=None,
     )
 
 
@@ -432,12 +458,12 @@ def triton_gdn_decode_mtp(
     disable_state_update: bool = True,
     use_qk_l2norm: bool = True,
     intermediate_states_buffer: torch.Tensor | None = None,
+    output_state_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Portable Triton fallback for ``gdn_decode_mtp`` (see
-    ``flashinfer/gated_delta_rule.py`` for the shared contract). Unlike the
-    flashinfer backend (which needs a dtype/pool-layout dispatch to reach its
-    intermediate-state-caching kernel), this kernel writes per-step snapshots
-    directly whenever ``intermediate_states_buffer`` is given.
+    ``flashinfer/gated_delta_rule.py`` for the shared contract). Supports both
+    batch-scoped intermediate-state caching and direct per-token pool scatter
+    through ``output_state_indices``.
     """
     return _launch_fused_gdn_decode_update(
         q,
@@ -454,4 +480,5 @@ def triton_gdn_decode_mtp(
         disable_state_update=disable_state_update,
         output_state_indices=None,
         intermediate_states_buffer=intermediate_states_buffer,
+        per_token_output_state_indices=output_state_indices,
     )
