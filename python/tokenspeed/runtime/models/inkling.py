@@ -168,9 +168,6 @@ _KV_REPLICATED_SUFFIXES = (
 # ModelOpt NVFP4: input_scale = amax/(448*6) (E4M3 max * E2M1 max); ckpt stores raw amax.
 _NVFP4_AMAX_TO_SCALE = 448.0 * 6.0
 
-# MTP capture A/B: draft consumes the pre-final-norm residual (not post-norm hidden).
-_MTP_PRENORM_CAPTURE = os.environ.get("INKLING_MTP_PRENORM_CAPTURE", "0") == "1"
-
 
 def _translate_inkling_quant_pattern(pattern: str) -> str:
     is_regex = pattern.startswith("re:")
@@ -1516,6 +1513,8 @@ class InklingTextModel(nn.Module):
             return embed_norm(embeds) if embed_norm is not None else embeds
 
         embed.num_embeddings = embed_tokens.num_embeddings
+        embed.embedding_dim = embed_tokens.embedding_dim
+        embed.weight = embed_tokens.weight
         return embed
 
     def forward(
@@ -1552,13 +1551,9 @@ class InklingTextModel(nn.Module):
                 log_scaling_tau=log_scaling_tau,
             )
         if residual is None:
-            prenorm = hidden_states
             hidden_states = self.norm(hidden_states)
         else:
-            hidden_states, prenorm = self.norm(hidden_states, residual)
-        # aux = prenorm residual under INKLING_MTP_PRENORM_CAPTURE, else None.
-        if _MTP_PRENORM_CAPTURE and ctx.capture_hidden_mode.need_capture():
-            return hidden_states, [prenorm]
+            hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states, None
 
 
@@ -1628,7 +1623,7 @@ class InklingForConditionalGeneration(nn.Module):
             else None
         )
         self.vision_embedder = (
-            VisionEmbedder()
+            VisionEmbedder(encoder_mapping=mapping.vision)
             if (self.audio is not None or self.visual is not None)
             else None
         )
@@ -1710,20 +1705,15 @@ class InklingForConditionalGeneration(nn.Module):
             )
         encoders = {}
         if self.visual is not None:
-            encoders[Modality.IMAGE] = EncoderSpec(
-                self.get_image_feature, deepstack=False
-            )
+            encoders[Modality.IMAGE] = EncoderSpec(self.get_image_feature)
         if self.audio is not None:
-            encoders[Modality.AUDIO] = EncoderSpec(
-                self.get_audio_feature, deepstack=False
-            )
+            encoders[Modality.AUDIO] = EncoderSpec(self.get_audio_feature)
         input_embeds, _ = self.vision_embedder.apply(
             input_ids=input_ids,
             text_embedding=self.model.mm_text_embedding(),
             ctx=multimodal_context,
             encoders=encoders,
             multimodal_model=self,
-            is_decode_or_idle=ctx.forward_mode.is_decode_or_idle(),
         )
         return input_embeds
 

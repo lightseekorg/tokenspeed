@@ -1225,7 +1225,7 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
             # Encoder callables may be swapped to cudagraph wrappers by
             # ModelExecutor.
-            self.vision_embedder = VisionEmbedder()
+            self.vision_embedder = VisionEmbedder(encoder_mapping=mapping.vision)
             self.image_encoder = self.get_image_feature
             self.video_encoder = self.get_video_feature
 
@@ -1416,7 +1416,6 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
                 Modality.VIDEO: EncoderSpec(self.video_encoder, deepstack=True),
             },
             multimodal_model=self,
-            is_decode_or_idle=ctx.forward_mode.is_decode_or_idle(),
         )
         hidden_states, aux_hidden_states = self.model(
             input_ids,

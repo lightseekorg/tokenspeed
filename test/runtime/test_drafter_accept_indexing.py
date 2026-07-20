@@ -4,13 +4,13 @@ from types import SimpleNamespace
 import torch
 
 from tokenspeed.runtime.execution.drafter.dflash import DFlash
-from tokenspeed.runtime.execution.drafter.eagle import (
-    Eagle,
-    EagleDraftInput,
+from tokenspeed.runtime.execution.drafter.eagle import Eagle, EagleDraftInput
+from tokenspeed.runtime.execution.drafter.mtp import (
     _committed_tail_update,
-    _extend_depth_shifted_ids,
+    _extend_depth_precompute,
+    _extend_depth_shifted_ids_from,
+    _lookback_shifted_ids,
     _ragged_tail_rows,
-    _window_lookback_shifted_ids,
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.multimodal.inputs import Modality, MultimodalDataItem
@@ -124,8 +124,9 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
             [[500, 501, 502, 502], [600, 601, 602, 602]], dtype=torch.int32
         )
 
-        depth1 = _extend_depth_shifted_ids(shift1_ids, input_lengths, next_tokens, 1)
-        depth2 = _extend_depth_shifted_ids(shift1_ids, input_lengths, next_tokens, 2)
+        pre = _extend_depth_precompute(shift1_ids, input_lengths)
+        depth1 = _extend_depth_shifted_ids_from(pre, next_tokens, 1)
+        depth2 = _extend_depth_shifted_ids_from(pre, next_tokens, 2)
 
         self.assertEqual(depth1.tolist(), [12, 13, 14, 500, 501, 22, 600, 601])
         self.assertEqual(depth2.tolist(), [13, 14, 500, 501, 502, 600, 601, 602])
@@ -135,13 +136,14 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
         input_lengths = torch.tensor([3], dtype=torch.int32)
         next_tokens = torch.tensor([[700, 701, 702, 703]], dtype=torch.int32)
 
-        depth3 = _extend_depth_shifted_ids(shift1_ids, input_lengths, next_tokens, 3)
+        pre = _extend_depth_precompute(shift1_ids, input_lengths)
+        depth3 = _extend_depth_shifted_ids_from(pre, next_tokens, 3)
 
         # With P=3 and depth 3 every row overshoots the shift-1 ids: local
         # row i consumes t_{i+4}, i.e. drafts d_1..d_3.
         self.assertEqual(depth3.tolist(), [701, 702, 703])
 
-    def test_window_lookback_shifted_ids_reads_stash_verify_and_drafts(self):
+    def test_lookback_shifted_ids_reads_stash_verify_and_drafts(self):
         # k=4, D=2. Request A accepts 2 of [v0..v3]; request B accepts all 4.
         # Stash entry i holds the committed token at position vc-D+1+i, so
         # entry 1 (= token at vc) is the only one any depth >= 1 consumes.
@@ -152,8 +154,8 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
         )
         stash = torch.tensor([[41, 42], [71, 72]])
 
-        depth1 = _window_lookback_shifted_ids(v, accept, next_tokens, stash, 1, 2)
-        depth2 = _window_lookback_shifted_ids(v, accept, next_tokens, stash, 2, 2)
+        depth1 = _lookback_shifted_ids(v, accept, next_tokens, stash, 1, 2)
+        depth2 = _lookback_shifted_ids(v, accept, next_tokens, stash, 2, 2)
 
         # depth 1: src = [-1, 0, 1, 2, 3, 4] per request.
         self.assertEqual(

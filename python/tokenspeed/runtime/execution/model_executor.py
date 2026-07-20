@@ -44,6 +44,7 @@ from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
 from tokenspeed.runtime.execution.drafter.dflash import DFlash
 from tokenspeed.runtime.execution.drafter.eagle import Eagle
+from tokenspeed.runtime.execution.drafter.mtp import Mtp
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
@@ -81,8 +82,23 @@ if TYPE_CHECKING:
 
 logger = get_colorful_logger(__name__)
 
-_DRAFTER_MAPPING = {"EAGLE3": Eagle, "MTP": Eagle, "DFLASH": DFlash}
 LOG_MM_TIMING = envs.TOKENSPEED_LOG_MM_TIMING.get()
+
+
+def _get_drafter_impl(spec_algo: str, model: torch.nn.Module):
+    from tokenspeed.runtime.models.inkling_nextn import (
+        InklingForConditionalGenerationNextN,
+    )
+
+    DRAFTER_MAPPING = {"EAGLE3": Eagle, "MTP": Eagle, "DFLASH": DFlash}
+
+    # "MTP" covers two algorithms:
+    # (1) Eagle-like MTP (e.g. DeepSeek) stays on Eagle in eagle.py;
+    # (2) Vanilla MTP (e.g. Inkling) with multi-layer weights stays on Mtp in mtp.py.
+    if spec_algo == "MTP" and isinstance(model, InklingForConditionalGenerationNextN):
+        return Mtp
+    else:
+        return DRAFTER_MAPPING[spec_algo]
 
 
 def _eagle_aux_layer_ids(hf_config) -> list[int] | None:
@@ -356,7 +372,7 @@ class ModelExecutor:
             self.device,
         )
         if self.config.spec_algo is not None:
-            DrafterImpl = _DRAFTER_MAPPING[config.spec_algo]
+            DrafterImpl = _get_drafter_impl(config.spec_algo, draft_model_runner.model)
             self.drafter = DrafterImpl(
                 spec_num_tokens=config.spec_num_tokens,
                 spec_num_steps=config.spec_num_steps,

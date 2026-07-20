@@ -39,6 +39,7 @@ Finished SucceededEvent::operator()(Decoding&& /*state*/) {
 
 PrefillDone RemotePrefillDoneEvent::operator()(Prefilling&& state) {
     TokenContainer::Window w = state.window;
+    auto block_tables = std::move(state).TakeBlockTables();
     auto prefill_done = PrefillDone{
         state.GetTokenContainer(),
         state.GetPageSize(),
@@ -51,6 +52,7 @@ PrefillDone RemotePrefillDoneEvent::operator()(Prefilling&& state) {
         std::move(state).TakeLocalMambaAllocator(),
     };
 
+    prefill_done.SetBlockTables(std::move(block_tables));
     prefill_done.ExtendResultTokens({bootstrap_token});
     return prefill_done;
 }

@@ -23,7 +23,7 @@ _FP8_DTYPES = frozenset({torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4
         pytest.param(platform.fp8e4m3fn.dtype, 128, 192, 128, id="fp8"),
     ],
 )
-@pytest.mark.parametrize("solution", ["triton"])
+@pytest.mark.parametrize("solution", ["triton", "gluon"])
 @pytest.mark.parametrize("is_causal", [False, True], ids=["noncausal", "causal"])
 def test_mla_prefill(
     device: str,
@@ -101,13 +101,16 @@ def test_mla_prefill(
 
 
 @pytest.mark.parametrize(
-    "dtype,num_heads,kv_lora_rank,qk_rope_head_dim",
+    "solution,dtype,num_heads,kv_lora_rank,qk_rope_head_dim,batch_size,page_size",
     [
-        pytest.param(torch.bfloat16, 128, 512, 64, id="bf16"),
-        pytest.param(platform.fp8e4m3fn.dtype, 128, 512, 64, id="fp8"),
+        pytest.param("triton", torch.bfloat16, 128, 512, 64, 2, 4, id="triton-bf16"),
+        pytest.param(
+            "triton", platform.fp8e4m3fn.dtype, 128, 512, 64, 2, 4, id="triton-fp8"
+        ),
+        pytest.param("gluon", torch.bfloat16, 16, 512, 64, 4, 64, id="gluon-bh16bn64"),
+        pytest.param("gluon", torch.bfloat16, 128, 512, 64, 64, 64, id="gluon-bh64"),
     ],
 )
-@pytest.mark.parametrize("solution", ["triton"])
 def test_mla_decode_with_kvcache(
     device: str,
     solution: str,
@@ -115,17 +118,26 @@ def test_mla_decode_with_kvcache(
     num_heads: int,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
+    batch_size: int,
+    page_size: int,
     require,
 ) -> None:
     require("attention", "mla_decode_with_kvcache", solution, dtype, "q")
 
-    batch_size = 2
     q_len = 1
-    page_size = 4
-    max_seqlen_k = 7
-    num_pages = 4
     qk_nope_head_dim = 128
     qk_head_dim = kv_lora_rank + qk_rope_head_dim
+
+    # Runtime seqlens cycled across the batch, spanning sub-page to multi-page
+    # relative to page_size (this also leaves some trailing split-K tiles empty).
+    seqlen_cycle = [page_size + 1, page_size, 2 * page_size + 1, 1]
+    cache_seqlens_list = [
+        seqlen_cycle[i % len(seqlen_cycle)] for i in range(batch_size)
+    ]
+    max_seqlen_k = max(cache_seqlens_list)
+    max_pages = (max_seqlen_k + page_size - 1) // page_size
+    num_pages = batch_size * max_pages
+
     init_dtype = torch.bfloat16 if dtype in _FP8_DTYPES else dtype
     q = torch.randn(
         batch_size,
@@ -146,8 +158,11 @@ def test_mla_decode_with_kvcache(
     if dtype != init_dtype:
         q = q.to(dtype)
         kv_cache = kv_cache.to(dtype)
-    page_table = torch.tensor([[0, 1], [2, 3]], device=device, dtype=torch.int32)
-    cache_seqlens = torch.tensor([5, 7], device=device, dtype=torch.int32)
+
+    cache_seqlens = torch.tensor(cache_seqlens_list, device=device, dtype=torch.int32)
+    page_table = torch.arange(num_pages, device=device, dtype=torch.int32).reshape(
+        batch_size, max_pages
+    )
     softmax_scale = 1.0 / math.sqrt(qk_nope_head_dim + qk_rope_head_dim)
 
     out, lse = mla_decode_with_kvcache(

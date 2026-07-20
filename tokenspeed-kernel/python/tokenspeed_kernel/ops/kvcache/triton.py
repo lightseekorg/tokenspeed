@@ -1480,7 +1480,8 @@ def _flat_decode_locs_kernel(
     page = tl.load(tab_ptr + g * stride_g + b * stride_b + col, mask=mask, other=0).to(
         tl.int64
     )
-    loc = page * ps + pos % ps
+    # Negative pages (-1 column-tail pad / holes) route to dummy page 0, never a negative slot.
+    loc = tl.maximum(page, 0) * ps + pos % ps
     tl.store(out_ptr + g * out_stride_g + i, loc.to(tl.int32), mask=mask)
 
 

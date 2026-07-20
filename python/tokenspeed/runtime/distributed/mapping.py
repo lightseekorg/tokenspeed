@@ -267,9 +267,12 @@ class MoeLayerMapping(MappingBase):
 
 
 class VisionTowerMapping(MappingBase):
-    """Parallel mapping for vision encoders. Vision layers run colocated and
-    share the attention TP group; non-colocated deployments should run the
-    encoder out-of-engine (EPD-style workers + gateway dispatch).
+    """Parallel mapping for colocated multimodal encoders.
+
+    ``tp_size`` controls weight tensor parallelism inside the encoder, while
+    ``dp_size`` controls item data parallelism. The mapping's world is one
+    attention TP group, so item-DP composes independently with outer request
+    data parallelism.
     """
 
     def __init__(
@@ -277,9 +280,12 @@ class VisionTowerMapping(MappingBase):
         rank: int | None = None,
         world_size: int = 1,
         tp_size: int | None = None,
+        dp_size: int | None = None,
     ):
         super().__init__(rank, world_size)
-        (self.tp_size,) = _resolve_parallelism_sizes(self.world_size, tp_size)
+        self.tp_size, self.dp_size = _resolve_parallelism_sizes(
+            self.world_size, tp_size, dp_size
+        )
 
     @cached_property
     def has_tp(self) -> bool:
@@ -292,6 +298,18 @@ class VisionTowerMapping(MappingBase):
     @cached_property
     def tp_group(self) -> Group:
         return _make_parallelism_group(self.rank, self.tp_size, stride=1)
+
+    @cached_property
+    def has_dp(self) -> bool:
+        return self.dp_size > 1
+
+    @cached_property
+    def dp_rank(self) -> int:
+        return _make_parallelism_rank(self.rank, self.dp_size, stride=self.tp_size)
+
+    @cached_property
+    def dp_group(self) -> Group:
+        return _make_parallelism_group(self.rank, self.dp_size, stride=self.tp_size)
 
 
 class Mapping(MappingBase):
@@ -309,6 +327,8 @@ class Mapping(MappingBase):
         moe_tp_size: int | None = None,
         moe_ep_size: int | None = None,
         moe_dp_size: int | None = None,
+        vision_tp_size: int | None = None,
+        vision_dp_size: int | None = None,
         nprocs_per_node: int | None = None,
         nnodes: int | None = None,
         base_gpu_id: int = 0,
@@ -335,11 +355,13 @@ class Mapping(MappingBase):
             ep_size=moe_ep_size,
             dp_size=moe_dp_size,
         )
-        # Vision tower runs colocated on the attention TP group.
+        # The vision mapping is local to each attention TP group. With both
+        # sizes omitted it resolves to weight TP, preserving the legacy mode.
         self.vision = VisionTowerMapping(
             rank=rank,
             world_size=self.attn.tp_size,
-            tp_size=self.attn.tp_size,
+            tp_size=vision_tp_size,
+            dp_size=vision_dp_size,
         )
         self.nprocs_per_node, self.nnodes = _resolve_parallelism_sizes(
             self.world_size, nprocs_per_node, nnodes
@@ -385,7 +407,7 @@ class Mapping(MappingBase):
             f"Mapping(rank={rank_str}, world_size={self.world_size})",
             f"  Cluster : {self.nnodes} node(s) x {self.nprocs_per_node} proc(s)",
             f"  Attention: tp={self.attn.tp_size}  cp={self.attn.cp_size}  dp={self.attn.dp_size}",
-            f"    Vision: tp={self.vision.tp_size}",
+            f"    Vision: tp={self.vision.tp_size}  item_dp={self.vision.dp_size}",
             f"  Dense   : tp={self.dense.tp_size}  dp={self.dense.dp_size}",
             f"  MoE     : tp={self.moe.tp_size}  ep={self.moe.ep_size}  dp={self.moe.dp_size}",
         ]

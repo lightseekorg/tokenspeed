@@ -226,7 +226,10 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()
     coordinator_->CacheFullBlocks(tables, flat_ext_hashes_,
                                   /*first_slot=*/flat_hit_.num_common_tokens / state.GetPageSize(),
                                   /*end_tokens=*/hit_tokens);
-    if (!coordinator_->Acquire(tables, tokens_this_round_)) {
+    // Role kD cannot defer its decode reserve until RemotePrefillDone: the
+    // remote transfer may complete after other requests consume the pool.
+    const std::int32_t tokens_to_acquire = tokens_this_round_ + (role_ == Role::kD ? decode_input_tokens_ : 0);
+    if (!coordinator_->Acquire(tables, tokens_to_acquire)) {
         _assert(false, "flat path: allocation failure unsupported in C slice");
     }
 

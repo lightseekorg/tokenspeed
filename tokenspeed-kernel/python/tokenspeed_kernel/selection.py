@@ -577,7 +577,6 @@ def select_kernel(
     traits: dict[str, Any] | None = None,
     solution: str | None = None,
     override: str | None = None,
-    expected_kernel_name: str | None = None,
 ) -> SelectedKernel:
     """Select the best kernel for an operation.
 
@@ -597,9 +596,6 @@ def select_kernel(
         solution: Restrict selection to a registered solution while preserving
             normal platform, format signature, and trait filtering.
         override: Force a specific kernel name or solution string
-        expected_kernel_name: Debug-only hint. When set, a warning is
-            logged if the selected kernel differs from this name. The
-            selected kernel is still used regardless of the mismatch.
 
     Returns:
         A :class:`SelectedKernel` that is directly callable and also
@@ -705,18 +701,6 @@ def select_kernel(
         winner = scored[0][0]
 
     _log_selection(family, mode, format_signature, winner, scored, platform, objective)
-
-    if expected_kernel_name and winner.name != expected_kernel_name:
-        logger.warning(
-            "[tokenspeed_kernel] select_kernel(%s.%s, %s) chose '%s' but "
-            "expected '%s'. Score breakdown — selected: %s",
-            family,
-            mode,
-            format_signature,
-            winner.name,
-            expected_kernel_name,
-            next((s for sp, s in scored if sp.name == winner.name), "N/A"),
-        )
 
     impl = registry.get_impl(winner.name)
     result = SelectedKernel(name=winner.name, impl=impl)

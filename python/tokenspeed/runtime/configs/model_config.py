@@ -368,6 +368,12 @@ class ModelConfig:
             )
         # ``is_multimodal`` is the architectural fact; this is the runtime gate.
         self.is_multimodal_active = self.is_multimodal and not apply_language_model_only
+        if (
+            not is_draft_worker
+            and getattr(server_args, "mm_encoder_tp_mode", "weights") == "data"
+        ):
+            if not self.is_multimodal_active:
+                raise ValueError("item-DP requires an active multimodal encoder")
         # Vision-only role (EPD encode): the inverse axis of language_model_only.
         # Build the vision tower (is_multimodal_active stays True) but SKIP LM
         # construction + LM weight load so a full ViT fits at encode TP=1.

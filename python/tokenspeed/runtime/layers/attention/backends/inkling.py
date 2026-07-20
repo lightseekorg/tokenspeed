@@ -699,11 +699,10 @@ class InklingAttnBackend(AttentionBackend):
         activations. Name matches the generic executor hook.
 
         Runs outside the captured graph once per MTP round, so it is batched
-        over all layers in one shot: the per-layer ``_write_window_at`` loop
-        costs ~500 eager launches/round (~14 ms host-bound at bs=1, the bulk
-        of MTP round time), the batched blend ~10. The blend is cat-free —
-        two gathers selected by ``where`` — to avoid materializing a
-        ``[L, n, W-1+k, D]`` extension buffer at full batch.
+        over all layers in one shot (the per-layer ``_write_window_at`` loop
+        is host-launch-bound). The blend is cat-free — two gathers selected
+        by ``where`` — to avoid materializing a ``[L, n, W-1+k, D]`` extension
+        buffer at full batch.
         """
         del model
         md = self.conv_metadata
@@ -839,8 +838,7 @@ class InklingAttnBackend(AttentionBackend):
                 f"Inkling decode KV write: {k.shape[0]} rows vs "
                 f"{out_cache_loc.shape[0]} write locs (layer "
                 f"{layer.layer_id}, group {layer.group_id!r}); a chaining "
-                "draft loop (INKLING_MTP_CLASSIC_LOOP=1) is unsupported on "
-                "the flat arm."
+                "one-row-per-step draft loop is unsupported on the flat arm."
             )
             inner._save_kv_cache(layer, out_cache_loc, token_to_kv_pool, k, v)
         scale_kwargs = {}

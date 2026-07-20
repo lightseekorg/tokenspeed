@@ -285,41 +285,14 @@ def _is_glm_dsa_model(model_id: str | None) -> bool:
 def _is_inkling_model(model_id: str | None) -> bool:
     if not model_id:
         return False
-
     normalized = model_id.lower().replace("_", "-").rstrip("/")
     if "inkling" in normalized:
         return True
-
     config = _load_model_config(model_id)
     architectures = config.get("architectures") or []
     return (
         config.get("model_type") == "inkling_mm_model"
         or "InklingForConditionalGeneration" in architectures
-    )
-
-
-def _smg_supports_inkling_parsers() -> bool:
-    """Whether the installed SMG advertises the complete Inkling parser pair.
-
-    Keep this import lazy so lightweight TokenSpeed tooling and unit tests do
-    not require the optional gateway extension at module-import time. Treat a
-    missing/older/broken capability API conservatively: automatic Inkling
-    parser defaults must never make an otherwise usable gateway fail to start.
-    """
-    try:
-        from smg.smg_rs import (
-            get_available_reasoning_parsers,
-            get_available_tool_call_parsers,
-        )
-
-        reasoning_parsers = get_available_reasoning_parsers()
-        tool_call_parsers = get_available_tool_call_parsers()
-    except Exception:  # noqa: BLE001 - capability probing must be fail-safe
-        return False
-
-    return (
-        INKLING_REASONING_PARSER in reasoning_parsers
-        and INKLING_TOOL_CALL_PARSER in tool_call_parsers
     )
 
 
@@ -357,38 +330,14 @@ def _args_with_default_model_parsers(
             gateway_result.extend(["--tool-call-parser", GLM_TOOL_CALL_PARSER])
 
     elif _is_inkling_model(model_id):
-        # Use the checkpoint-provided Inkling template instead of maintaining
-        # a second protocol copy in TokenSpeed. Newer SMG builds advertise
-        # Inkling reasoning and tool parsers; older pinned builds must keep
-        # their prior passthrough behavior rather than failing argparse
-        # validation on an unknown parser name.
-        needs_reasoning_default = (
+        if (
             "--reasoning-parser" not in engine_result
             and "--reasoning-parser" not in gateway_result
-        )
-        needs_tool_default = "--tool-call-parser" not in gateway_result
-        if needs_reasoning_default or needs_tool_default:
-            if _smg_supports_inkling_parsers():
-                # The engine also needs the reasoning parser name to defer
-                # json_schema grammars until after the reasoning channel.
-                if needs_reasoning_default:
-                    engine_result.extend(
-                        ["--reasoning-parser", INKLING_REASONING_PARSER]
-                    )
-                    gateway_result.extend(
-                        ["--reasoning-parser", INKLING_REASONING_PARSER]
-                    )
-                if needs_tool_default:
-                    gateway_result.extend(
-                        ["--tool-call-parser", INKLING_TOOL_CALL_PARSER]
-                    )
-            else:
-                logger.warning(
-                    "Installed SMG does not advertise the complete Inkling "
-                    "reasoning/tool parser pair; automatic Inkling parser "
-                    "defaults are disabled and the gateway will fall back to "
-                    "passthrough. Explicit parser arguments are preserved."
-                )
+        ):
+            engine_result.extend(["--reasoning-parser", INKLING_REASONING_PARSER])
+            gateway_result.extend(["--reasoning-parser", INKLING_REASONING_PARSER])
+        if "--tool-call-parser" not in gateway_result:
+            gateway_result.extend(["--tool-call-parser", INKLING_TOOL_CALL_PARSER])
         if current_platform().is_nvidia:
             # Inkling's NVIDIA rel-bias attention requires FA4; reject bad explicit backends before workers start.
             if "--attention-backend" in engine_result:

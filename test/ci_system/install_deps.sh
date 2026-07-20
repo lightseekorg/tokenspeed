@@ -180,19 +180,18 @@ if [ -n "${CUTLASS_DSL_SPEC}" ]; then
         --force-reinstall --no-deps "${CUTLASS_DSL_DEPS[@]}"
 fi
 
-PINNED_KERNEL_DEPS=()
-for pkg in flashinfer-python flashinfer-cubin; do
-    spec="$(pin_version "${pkg}")"
-    if [ -n "${spec}" ]; then
-        PINNED_KERNEL_DEPS+=("${spec}")
-    fi
-done
-if [ "${#PINNED_KERNEL_DEPS[@]}" -gt 0 ]; then
-    echo "Force-reinstalling pinned kernel deps: ${PINNED_KERNEL_DEPS[*]}"
+FLASHINFER_PYTHON_SPEC="$(pin_version flashinfer-python)"
+if [ -n "${FLASHINFER_PYTHON_SPEC}" ]; then
+    FLASHINFER_VERSION="${FLASHINFER_PYTHON_SPEC##*==}"
+    FLASHINFER_CUBIN_WHEEL_URL="https://github.com/flashinfer-ai/flashinfer/releases/download/v${FLASHINFER_VERSION}/flashinfer_cubin-${FLASHINFER_VERSION}-py3-none-any.whl"
+    echo "Force-reinstalling pinned FlashInfer Python: ${FLASHINFER_PYTHON_SPEC}"
     pip_install_with_retry pip3 install --break-system-packages \
-        --force-reinstall --no-deps "${PINNED_KERNEL_DEPS[@]}"
+        --force-reinstall --no-deps "${FLASHINFER_PYTHON_SPEC}"
+    echo "Installing FlashInfer cubin from GitHub Release: ${FLASHINFER_CUBIN_WHEEL_URL}"
+    pip_install_with_retry pip3 install --break-system-packages \
+        --force-reinstall --no-deps "${FLASHINFER_CUBIN_WHEEL_URL}"
 else
-    echo "No pinned kernel deps found in ${CUDA_REQ}; skipping."
+    echo "No FlashInfer Python pin found in ${CUDA_REQ}; skipping FlashInfer installs."
 fi
 
 # ============================================================

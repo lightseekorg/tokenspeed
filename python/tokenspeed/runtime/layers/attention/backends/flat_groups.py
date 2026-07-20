@@ -222,7 +222,8 @@ class FlatCacheGroupsMixin:
                 pages = table.gather(1, page_idx.unsqueeze(1)).squeeze(1)
             else:
                 pages = table.gather(1, page_idx.view(-1, n)).reshape(-1)
-            out[gid] = pages * ps + off
+            # Mirror the graph-path kernel's clamp: -1 pads/holes route to dummy page 0.
+            out[gid] = pages.clamp_min(0) * ps + off
         return out
 
     def _compute_flat_extend_out_cache_locs(

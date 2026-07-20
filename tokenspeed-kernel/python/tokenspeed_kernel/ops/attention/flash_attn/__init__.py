@@ -975,6 +975,7 @@ elif platform.is_nvidia and platform.is_hopper:
         solution="fa3",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
+            max_arch_version=ArchVersion(9, 0),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=format_signatures(
@@ -1028,6 +1029,7 @@ elif platform.is_nvidia and platform.is_hopper:
         solution="fa3",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
+            max_arch_version=ArchVersion(9, 0),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=format_signatures(
@@ -1087,6 +1089,7 @@ elif platform.is_nvidia and platform.is_hopper:
         solution="fa3",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
+            max_arch_version=ArchVersion(9, 0),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=format_signatures(

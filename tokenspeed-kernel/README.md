@@ -126,7 +126,11 @@ iteration.
   `/stop_profile`, writing
   `<output_dir>/<profile_id>[-DP<rank>][-CP<rank>]-TP<rank>.proton.<fmt>`
   per rank. `PROTON` composes only with host-side activities (`CPU`, `MEM`,
-  `VIZTRACER`).
+  `VIZTRACER`). To see Python activity and Proton's kernel lanes on one
+  Perfetto timeline, profile with `VIZTRACER` + `PROTON`
+  (`TOKENSPEED_KERNEL_PROFILE_DATA=trace`,
+  `TOKENSPEED_KERNEL_PROFILE_OUTPUT_FORMAT=chrome_trace`), then merge the
+  traces with `tokenspeed merge-traces`.
 
 ### Plugins
 

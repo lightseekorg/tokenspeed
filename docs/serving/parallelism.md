@@ -35,6 +35,7 @@ tokenspeed serve <model> \
 | `--dense-tp-size` | Dense layer tensor parallel size. |
 | `--moe-tp-size` | MoE layer tensor parallel size. |
 | `--data-parallel-size` | Replicated data-parallel groups. |
+| `--mm-encoder-tp-mode` | `weights` (default), or TP1 whole-item DP within each attention TP group (`data`). |
 | `--enable-expert-parallel` | Expert parallelism across the selected world size. |
 | `--expert-parallel-size` | Explicit expert parallel size. |
 

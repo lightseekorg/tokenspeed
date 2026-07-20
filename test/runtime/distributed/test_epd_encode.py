@@ -75,6 +75,9 @@ class _FakeExecutor:
     def send_item(self, rid, item):
         self.sent_direct.append(item.hash)
 
+    def reap_concluded_senders(self, _pending_request_ids):
+        pass
+
     def drain_deferred(self):
         pass
 
@@ -167,6 +170,9 @@ class _RaisingExecutor:
         raise self._exc
 
     def send_item(self, rid, item):
+        pass
+
+    def reap_concluded_senders(self, _pending_request_ids):
         pass
 
     def drain_deferred(self):

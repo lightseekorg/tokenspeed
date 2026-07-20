@@ -172,10 +172,9 @@ class DisaggPrefillExecutor:
         is_last = chunk_end >= op.prefill_lengths[index]
 
         decode_prefix_pages = decode_prefix_len // self.page_size
-        start_page = max(
-            decode_prefix_pages + sender.curr_idx,
-            chunk_begin // self.page_size,
-        )
+        # Transfer progress is relative to D's missing-page window. P's local
+        # prefix may be deeper and must not hide pages that D still needs.
+        start_page = decode_prefix_pages + sender.curr_idx
         if is_last:
             end_page = (chunk_end + self.page_size - 1) // self.page_size
         else:
