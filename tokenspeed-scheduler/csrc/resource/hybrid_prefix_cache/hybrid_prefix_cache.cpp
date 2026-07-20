@@ -114,16 +114,16 @@ HybridPrefixCache::~HybridPrefixCache() {
     }
 }
 
-MatchResult HybridPrefixCache::Match(const token_vec_t& token_ids, MatchIntent intent) {
-    auto match = kv_prefix_cache_.Match(token_ids, intent);
+MatchResult HybridPrefixCache::Match(const token_vec_t& token_ids, std::int32_t lora_id, MatchIntent intent) {
+    auto match = kv_prefix_cache_.Match(token_ids, lora_id, intent);
     augmentMatch(match);
     augmentMatchPagedCache(match);
     return match;
 }
 
 MatchResult HybridPrefixCache::Match(const std::vector<std::span<const std::int32_t>>& token_pages,
-                                     MatchIntent intent) {
-    auto match = kv_prefix_cache_.Match(token_pages, intent);
+                                     std::int32_t lora_id, MatchIntent intent) {
+    auto match = kv_prefix_cache_.Match(token_pages, lora_id, intent);
     augmentMatch(match);
     augmentMatchPagedCache(match);
     return match;
@@ -318,15 +318,11 @@ std::vector<TransferPair> HybridPrefixCache::PrepareMambaDeviceLoadBack(const st
 }
 
 bool HybridPrefixCache::EnsureMambaCapacityByEvict(std::int32_t num_slots, TreeNode* protected_node) {
-    if (mamba_allocator_ == nullptr) return num_slots <= 0;
     return mamba_eviction_manager_.EnsureCapacity(num_slots, protected_node);
 }
 
 void HybridPrefixCache::InsertMamba(TreeNode* terminal_node, std::unique_ptr<MambaSlot> slot) {
     if (terminal_node == nullptr || slot == nullptr) return;
-    if (mamba_allocator_ == nullptr) {
-        throw std::logic_error("HybridPrefixCache::InsertMamba: mamba adjunct not enabled");
-    }
     const std::int32_t page_size = kv_prefix_cache_.PageSize();
     if (page_size <= 0 || terminal_node->DepthInTokens() % static_cast<std::size_t>(page_size) != 0) {
         throw std::logic_error("HybridPrefixCache::InsertMamba: terminal node is not block-aligned");
@@ -651,7 +647,6 @@ void HybridPrefixCache::OnKVDeviceDemote(TreeNode* node) {
 }
 
 std::int32_t HybridPrefixCache::AvailableSlots() const {
-    if (mamba_allocator_ == nullptr) return 0;
     return mamba_allocator_->AvailableSlots();
 }
 

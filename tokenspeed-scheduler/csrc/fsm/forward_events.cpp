@@ -159,7 +159,8 @@ void InsertHybridCache(HybridPrefixCache* hybrid_cache,
                        const std::vector<std::span<const std::int32_t>>& full_paged_tokens,
                        std::unique_ptr<DeviceNodeRef>& device_node_ref, LocalKVAllocator* local_kv_allocator,
                        LocalMambaAllocator* local_mamba_allocator, std::int32_t chunk_begin, std::int32_t chunk_size,
-                       std::int32_t page_size, const std::vector<std::int32_t>* prefix_pages_override) {
+                       std::int32_t page_size, const std::vector<std::int32_t>* prefix_pages_override,
+                       std::int32_t lora_id) {
     if (hybrid_cache == nullptr) return;
 
     std::vector<std::int32_t> computed_prefix_pages;
@@ -191,7 +192,8 @@ void InsertHybridCache(HybridPrefixCache* hybrid_cache,
 
     OwnedPages pages_to_insert = local_kv_allocator->TakeFirst(new_page_count);
     auto insert_result = hybrid_cache->GetKVPrefixCache().Insert<ResourceType::Device>(
-        *tokens_for_insert, *prefix_pages, std::move(pages_to_insert));
+        *tokens_for_insert, *prefix_pages, std::move(pages_to_insert),
+        /*page_hashs=*/{}, /*start_node=*/nullptr, lora_id);
 
     if (local_mamba_allocator != nullptr && local_mamba_allocator->HasCheckpoint()) {
         const bool publish = ShouldPublishMambaCheckpoint(hybrid_cache, chunk_begin, chunk_size, page_size);
@@ -359,7 +361,9 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillEvent::operator()(Prefillin
         paged_tokens.resize(end_of_window_pages);
     }
     InsertHybridCache(hybrid_prefix_cache_, paged_tokens, device_node_ref, local_kv_allocator.get(),
-                      local_mamba_allocator.get(), state.window.begin, state.window.size, state.GetPageSize());
+                      local_mamba_allocator.get(), state.window.begin, state.window.size, state.GetPageSize(),
+                      /*prefix_pages_override=*/nullptr, lora_id_);
+    // Allocate KV pages for the new chunk
     local_kv_allocator->Acquire(tokens_this_round_);
 
     if (hybrid_prefix_cache_ != nullptr && local_mamba_allocator != nullptr) {
@@ -427,7 +431,9 @@ Decoding ScheduleDecodeEvent::operator()(PrefillDone&& state) {
         paged_tokens.resize(end_of_window_pages);
     }
     InsertHybridCache(hybrid_prefix_cache_, paged_tokens, device_node_ref, local_kv_allocator.get(),
-                      local_mamba_allocator.get(), state.window.begin, state.window.size, state.GetPageSize());
+                      local_mamba_allocator.get(), state.window.begin, state.window.size, state.GetPageSize(),
+                      /*prefix_pages_override=*/nullptr, lora_id_);
+    // Allocate fresh checkpoint for decode-phase mamba state tracking
     if (hybrid_prefix_cache_ != nullptr && local_mamba_allocator != nullptr) {
         if (!local_mamba_allocator->AllocateCheckpoint()) {
             throw std::logic_error("ScheduleDecodeEvent: failed to allocate Mamba checkpoint slot");
@@ -571,11 +577,11 @@ std::variant<Draining, Finished> FinishEvent::apply(ForwardStateT&& state) {
         OwnedPages alloc_pages = local_allocator->TakeFirst(alloc_count);
 
         kv_prefix_cache_->Insert<ResourceType::Device>(full_paged_tokens, prefix_pages, std::move(alloc_pages),
-                                                       page_hashes_);
+                                                       page_hashes_, /*start_node=*/nullptr, lora_id_);
 
         if (hybrid_prefix_cache_ != nullptr && local_mamba_allocator != nullptr &&
             (local_mamba_allocator->HasCheckpoint() || local_mamba_allocator->HasWorking())) {
-            MatchResult post_match = kv_prefix_cache_->Match(full_paged_tokens);
+            MatchResult post_match = kv_prefix_cache_->Match(full_paged_tokens, lora_id_);
             TreeNode* terminal = post_match.device.last_node;
             if (terminal != nullptr && !terminal->HasMamba()) {
                 if (local_mamba_allocator->HasCheckpoint()) {
@@ -588,7 +594,7 @@ std::variant<Draining, Finished> FinishEvent::apply(ForwardStateT&& state) {
     }
     // local_mamba_allocator dropped here — destructor frees remaining slots
 
-    MatchResult match = kv_prefix_cache_->Match(full_paged_tokens);
+    MatchResult match = kv_prefix_cache_->Match(full_paged_tokens, lora_id_);
     if (!disable_l2_cache_ && (match.device.DepthInPage() > match.host.DepthInPage())) {
         std::vector<TreeNode*> write_diff = match.NodesWithout<ResourceType::Host>();
         std::int32_t host_pages_num = 0;

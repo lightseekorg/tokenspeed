@@ -112,14 +112,13 @@ void Scheduler::handleEvent(const pd::SucceededEvent& event) {
     flat_reserved_pages_.erase(event.request_id);
 #endif
     std::vector<std::string> page_hashes;
-    requests_.at(event.request_id)
-        ->Apply(fsm::FinishEvent{&kv_prefix_cache_, &host_allocator_, std::move(page_hashes), config_.disable_l2_cache,
-                                 hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr
+    auto& req = requests_.at(event.request_id);
+    req->Apply(fsm::FinishEvent{&kv_prefix_cache_, &host_allocator_, std::move(page_hashes), config_.disable_l2_cache,
+                                hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr,
 #if TOKENSPEED_FLAT_KVCACHE
-                                 ,
-                                 &coordinator_
+                                &coordinator_,
 #endif
-        });
+                                req->LoraId()});
 }
 
 void Scheduler::handleEvent(const pd::RemotePrefillDoneEvent& event) {
@@ -145,12 +144,11 @@ void Scheduler::handleEvent(const forward::Finish& event) {
             }
         }
         req->Apply(fsm::FinishEvent{&kv_prefix_cache_, &host_allocator_, std::move(page_hashes),
-                                    config_.disable_l2_cache, hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr
+                                    config_.disable_l2_cache, hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr,
 #if TOKENSPEED_FLAT_KVCACHE
-                                    ,
-                                    &coordinator_
+                                    &coordinator_,
 #endif
-        });
+                                    req->LoraId()});
     }
 }
 
@@ -172,7 +170,7 @@ void Scheduler::handleEvent(const forward::ExtendResult& event) {
         const std::int32_t protected_tail_tokens = config_.overlap_schedule_depth * config_.decode_input_tokens;
         req->Apply(fsm::ExtendResultEvent{event.request_id, event.tokens,
                                           hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr,
-                                          protected_tail_tokens});
+                                          protected_tail_tokens, req->LoraId()});
     }
 }
 
