@@ -108,6 +108,13 @@ runner pod recreation and avoids downloading the same large wheels again on
 that node. Other runner families keep their existing cache behavior because
 their cluster storage layouts may differ.
 
+The CUDA and ROCm kernel requirement files exact-pin the staged
+`tokenspeed-triton` and `tokenspeed-proton` builds. The corresponding
+`install_deps*.sh` entry point preinstalls those wheels from TestPyPI before
+building `tokenspeed-kernel`, so both packages must be published there before
+updating the pins. Set `TOKENSPEED_TESTPYPI_INDEX` to use a compatible package
+mirror instead of `https://test.pypi.org/simple`.
+
 To enable `push` and `workflow_dispatch` runs of the three PR test workflows
 outside the official repository, set the `TOKENSPEED_CI_REPOSITORY` repository
 variable at the same settings path to the configured repository's exact
