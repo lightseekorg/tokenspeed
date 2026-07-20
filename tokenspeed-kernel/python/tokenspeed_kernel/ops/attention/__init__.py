@@ -350,9 +350,11 @@ def gdn_decode_mtp(
         initial_state_indices: Per-batch read row, shaped ``[B]``. When
             ``output_state_indices`` is not provided and
             ``disable_state_update=False``, the final state is written back to
-            that same row. Entries must be ``>= 0``: unlike
-            ``gdn_decode_step``, negative indices are not skipped or redirected
-            -- the caller must clamp CUDA-graph padding rows before calling.
+            that same row. Padding handling is solution and state-dtype
+            specific: the portable Triton and FlashInfer FP32 paths suppress
+            state reads and writes for negative rows, while FlashInfer's BF16
+            fast path redirects them to row 0 and requires the caller to
+            reserve that row.
         scale: Attention scale. ``None`` lets the implementation use its default.
         disable_state_update: When True (default), never write back to
             ``initial_state_indices``.
@@ -364,7 +366,9 @@ def gdn_decode_mtp(
         output_state_indices: Optional per-token state-pool destinations shaped
             ``[B, T]`` with dtype ``torch.int32``. When provided, each
             post-update state ``h_{t+1}`` is written directly to
-            ``initial_state[output_state_indices[i, t]]``. Entries must be
+            ``initial_state[output_state_indices[i, t]]``. Negative entries
+            are safe only when the selected solution skips the corresponding
+            negative initial-state row; otherwise entries must be
             non-negative. This is mutually exclusive with
             ``intermediate_states_buffer`` and requires
             ``disable_state_update=False``.

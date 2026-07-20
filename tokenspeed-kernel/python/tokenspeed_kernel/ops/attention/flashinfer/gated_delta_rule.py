@@ -420,11 +420,13 @@ if is_decode_available():
         ``output_state_indices`` is None and ``disable_state_update=False``,
         the final state is written back to that same row.
 
-        Unlike gdn_decode_step, ``initial_state_indices`` entries must be
-        ``>= 0``: this kernel does not skip or redirect negative indices, so
-        the caller must clamp CUDA-graph padding rows (e.g. ``.clamp(min=0)``)
-        before calling; the corresponding output rows are simply unused
-        downstream.
+        Padding behavior depends on the state dtype. The standalone FP32 MTP
+        kernel skips a batch row when ``initial_state_indices`` is negative;
+        its per-token state indices may remain negative for that skipped row.
+        The BF16 fast path redirects negative read indices to row 0 and does
+        not mask negative per-token scatter indices, so callers must provide
+        non-negative destinations (typically by clamping padding to a reserved
+        sacrificial row 0).
 
         intermediate_states_buffer: Optional batch-scoped ``[B, T, HV, V, K]``
         (K-last, same dtype as ``initial_state``) buffer that receives every

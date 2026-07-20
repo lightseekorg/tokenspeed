@@ -7,6 +7,7 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
     MambaAttnBackend,
     SimpleMambaPool,
+    _prepare_gdn_mtp_state_indices,
 )
 from tokenspeed.runtime.layers.attention.linear.mamba_state_scatter_triton import (
     fused_mamba_state_copy,
@@ -34,6 +35,47 @@ def _new_backend(page_size: int = 64) -> MambaAttnBackend:
     backend.speculative_num_draft_tokens = 0
     backend.flat_state_active = False
     return backend
+
+
+def test_fp32_mtp_padding_indices_are_forwarded_without_clamp():
+    states = torch.empty(1, dtype=torch.float32)
+    initial = torch.tensor([3, -1], dtype=torch.int32)
+    output = torch.tensor([[4, 5], [-1, -1]], dtype=torch.int32)
+
+    prepared_initial, prepared_output = _prepare_gdn_mtp_state_indices(
+        states, initial, output
+    )
+
+    assert prepared_initial is initial
+    assert prepared_output is output
+
+
+def test_bf16_mtp_padding_indices_still_route_to_row_zero():
+    states = torch.empty(1, dtype=torch.bfloat16)
+    initial = torch.tensor([3, -1], dtype=torch.int32)
+    output = torch.tensor([[4, 5], [-1, -1]], dtype=torch.int32)
+
+    prepared_initial, prepared_output = _prepare_gdn_mtp_state_indices(
+        states, initial, output
+    )
+
+    assert prepared_initial.tolist() == [3, 0]
+    assert prepared_output.tolist() == [[4, 5], [0, 0]]
+
+
+def test_simple_mamba_pool_preserves_k_last_temporal_shape():
+    pool = SimpleMambaPool(
+        size=8,
+        num_mamba_layers=1,
+        conv_state_shape=(4,),
+        temporal_state_shape=(2, 3, 5),
+        conv_dtype=torch.float32,
+        ssm_dtype=torch.float32,
+        mamba_layer_ids=[0],
+        device="cpu",
+    )
+
+    assert pool.ssm_state.shape == (1, 8, 2, 3, 5)
 
 
 def test_simple_mamba_pool_current_input_map_uses_rank_local_req_pool_range():

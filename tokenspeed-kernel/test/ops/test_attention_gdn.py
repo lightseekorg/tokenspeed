@@ -783,6 +783,81 @@ def test_gdn_decode_mtp_output_state_indices_scatter_matches_reference(
 
 
 @pytest.mark.parametrize("solution", ["triton", "flashinfer"])
+def test_gdn_decode_mtp_fp32_padding_indices_skip_state_writes(
+    device: str, solution: str, require
+):
+    require("attention", "gdn_decode_mtp", solution, torch.bfloat16, "q")
+
+    T = 3
+    q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
+        device=device,
+        dtype=torch.bfloat16,
+        T=T,
+        pool_size=24,
+        state_dtype=torch.float32,
+    )
+    read_idx = torch.tensor([1, -1, 5, 7], device=device, dtype=torch.int32)
+    output_idx = torch.tensor(
+        [[8, 9, 10], [-1, -1, -1], [11, 12, 13], [14, 15, 16]],
+        device=device,
+        dtype=torch.int32,
+    )
+    scale = q.shape[-1] ** -0.5
+
+    pool_copy = pool.clone()
+    out = gdn_decode_mtp(
+        q,
+        k,
+        v,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b=b,
+        initial_state=pool_copy,
+        initial_state_indices=read_idx,
+        output_state_indices=output_idx,
+        scale=scale,
+        disable_state_update=False,
+        use_qk_l2norm=True,
+        solution=solution,
+    )
+
+    valid_batch = torch.tensor([0, 2, 3], device=device)
+    valid_read = read_idx[valid_batch]
+    ref_out, ref_states = _torch_gdn_decode_reference(
+        q[valid_batch],
+        k[valid_batch],
+        v[valid_batch],
+        a[valid_batch],
+        b[valid_batch],
+        A_log,
+        dt_bias,
+        pool[valid_read],
+        scale,
+    )
+    torch.testing.assert_close(
+        out[valid_batch].float(),
+        ref_out.to(out.dtype).float(),
+        rtol=2e-2,
+        atol=2e-2,
+    )
+    valid_output = output_idx[valid_batch]
+    for t in range(T):
+        torch.testing.assert_close(
+            pool_copy[valid_output[:, t].long()].float(),
+            ref_states[t].to(pool.dtype).float(),
+            rtol=2e-2,
+            atol=3e-2,
+        )
+
+    written = set(valid_output.flatten().tolist())
+    untouched = torch.tensor(
+        [i for i in range(pool.shape[0]) if i not in written], device=device
+    )
+    torch.testing.assert_close(pool_copy[untouched], pool[untouched])
+
+
+@pytest.mark.parametrize("solution", ["triton", "flashinfer"])
 def test_gdn_decode_mtp_disable_state_update_false_writes_back(
     device: str, solution: str, require
 ):

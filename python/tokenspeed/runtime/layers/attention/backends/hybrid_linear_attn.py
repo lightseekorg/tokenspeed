@@ -130,6 +130,25 @@ def compute_state_page_indices(
     return state_in.to(torch.int32), state_out.to(torch.int32)
 
 
+def _prepare_gdn_mtp_state_indices(
+    ssm_states: torch.Tensor,
+    initial_state_indices: torch.Tensor,
+    output_state_indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Prepare CUDA-graph padding indices for the selected MTP state path.
+
+    FlashInfer's FP32 MTP kernel skips a whole batch row when its initial-state
+    index is negative. Runtime padding keeps every corresponding per-token
+    output index negative as well, so forwarding both tables unchanged avoids
+    launching two clamp kernels per GDN layer. The BF16 fast path instead
+    redirects negative reads and requires valid per-token scatter addresses;
+    keep routing those entries to its sacrificial row 0.
+    """
+    if ssm_states.dtype == torch.float32:
+        return initial_state_indices, output_state_indices
+    return initial_state_indices.clamp(min=0), output_state_indices.clamp(min=0)
+
+
 @dataclass
 class MambaForwardMetadata:
     query_start_loc: torch.Tensor | None
@@ -246,22 +265,12 @@ class SimpleMambaPool:
             dtype=conv_dtype,
             device=device,
         )
-        # Allocate temporal/SSM state: (num_mamba_layers, total_size, heads, val_dim, key_dim).
-        # K-last (last two dims of temporal_state_shape swapped vs the
-        # [Hv, K, V] shape configs report): matches flashinfer's native GDN
-        # decode/MTP state layout, so no transpose is needed at those kernel
-        # boundaries (see MambaAttnBackend.forward_decode/forward_extend).
-        if len(temporal_state_shape) >= 2:
-            ssm_alloc_shape = tuple(temporal_state_shape[:-2]) + (
-                temporal_state_shape[-1],
-                temporal_state_shape[-2],
-            )
-        else:
-            ssm_alloc_shape = tuple(temporal_state_shape)
+        # temporal_state_shape is already K-last [Hv, V, K], matching the
+        # native GDN decode/MTP/chunk-prefill state layout.
         self.ssm_state = torch.zeros(
             num_mamba_layers,
             total_size,
-            *ssm_alloc_shape,
+            *temporal_state_shape,
             dtype=ssm_dtype,
             device=device,
         )
@@ -1381,6 +1390,11 @@ class MambaAttnBackend(AttentionBackend):
             b_b = b.view(batch_size, draft_token_num, -1)
 
             output_indices = self.forward_metadata.mamba_output_indices
+            mtp_initial_indices, mtp_output_indices = _prepare_gdn_mtp_state_indices(
+                ssm_states,
+                cache_indices,
+                output_indices,
+            )
             core_attn_out = gdn_decode_mtp(
                 query_b,
                 key_b,
@@ -1390,14 +1404,9 @@ class MambaAttnBackend(AttentionBackend):
                 dt_bias=dt_bias,
                 b=b_b,
                 initial_state=ssm_states,
-                # gdn_decode_mtp (unlike gdn_decode_step) does not skip/redirect
-                # negative indices itself -- clamp CUDA-graph padding rows here.
-                initial_state_indices=cache_indices.clamp(min=0),
+                initial_state_indices=mtp_initial_indices,
                 use_qk_l2norm=True,
-                # FlashInfer 0.6.15 scatters every post-token state directly
-                # into the scheduler-assigned pool row. Redirect graph-padding
-                # -1 entries to the pool's reserved sacrificial row 0.
-                output_state_indices=output_indices.clamp(min=0),
+                output_state_indices=mtp_output_indices,
                 disable_state_update=False,
             ).reshape(1, seq_len, num_value_heads, head_v_dim)
         else:
