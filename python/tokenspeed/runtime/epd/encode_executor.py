@@ -28,12 +28,12 @@ import logging
 
 import torch
 
+from tokenspeed.runtime.epd.mooncake.sender import (
+    MooncakeEmbeddingSender,
+)
 from tokenspeed.runtime.multimodal.embedder import _item_token_count
 from tokenspeed.runtime.multimodal.inputs import Modality, MultimodalDataItem
 from tokenspeed.runtime.pd.base.status import TransferPoll
-from tokenspeed.runtime.pd.epd.embedding_transfer import (
-    MooncakeEmbeddingSender,
-)
 from tokenspeed.runtime.utils.env import envs
 
 logger = logging.getLogger(__name__)

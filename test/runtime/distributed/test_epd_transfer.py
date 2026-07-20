@@ -29,29 +29,31 @@ import threading
 import pytest
 import torch
 
-from tokenspeed.runtime.multimodal.inputs import (
-    Modality,
-    MultimodalDataItem,
-)
-from tokenspeed.runtime.pd.base.status import TransferPoll
-from tokenspeed.runtime.pd.epd.embedding_transfer import (
-    MooncakeEmbeddingSender,
-    shard_payload,
-    validate_fanout_frames,
-)
-from tokenspeed.runtime.pd.epd.entities import (
+from tokenspeed.runtime.epd.entities import (
     REGISTER_ROOM_SENTINEL,
     EmbeddingArgsRegisterInfo,
     EmbeddingChunk,
     EmbeddingTransferError,
     EmbeddingTransferInfo,
 )
-from tokenspeed.runtime.pd.epd.prefill_receiver import (
+from tokenspeed.runtime.epd.mooncake.encode import (
+    shard_payload,
+    validate_fanout_frames,
+)
+from tokenspeed.runtime.epd.mooncake.sender import (
+    MooncakeEmbeddingSender,
+)
+from tokenspeed.runtime.epd.prefill_admission import (
     DONE,
     receive_encoded_embeddings,
     shard_rows,
     start_embedding_receive,
 )
+from tokenspeed.runtime.multimodal.inputs import (
+    Modality,
+    MultimodalDataItem,
+)
+from tokenspeed.runtime.pd.base.status import TransferPoll
 
 # Each merged concern keeps its own per-test setup (the shard
 # pointer-math tests need the TOKENSPEED_EPD_RECV_POOL_SLOTS=0 path, the
@@ -362,7 +364,7 @@ class _ShardReceiver:
 
 
 def _shard_setup(monkeypatch):
-    import tokenspeed.runtime.pd.epd.prefill_receiver as er
+    import tokenspeed.runtime.epd.prefill_admission as er
 
     _ShardReceiver.created.clear()
     # Pin the LEGACY per-request buffer path: the pointer-math assertions below
@@ -506,7 +508,7 @@ def _epd(item: MultimodalDataItem, *, room: int, host: str, port: int):
 
 
 def _recv_setup(monkeypatch):
-    import tokenspeed.runtime.pd.epd.prefill_receiver as er
+    import tokenspeed.runtime.epd.prefill_admission as er
 
     _FakeReceiver.created.clear()
     # Small pool defaults so each test's fresh fake engine doesn't allocate
@@ -519,7 +521,7 @@ def _recv_setup(monkeypatch):
 
 
 def test_recv_pool_release_waits_for_clone_event(monkeypatch):
-    import tokenspeed.runtime.pd.epd.prefill_receiver as er
+    import tokenspeed.runtime.epd.prefill_admission as er
 
     class _FakeEvent:
         def __init__(self):
