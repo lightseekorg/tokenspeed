@@ -86,6 +86,11 @@ class ReqState:
     output_ids: list[int] = dataclasses.field(default_factory=list)
     logprobs_info: dict = dataclasses.field(default_factory=dict)
 
+    # Tokenizer-valid (unpadded) prompt token ids, captured at send time when
+    # ``obj.return_token_ids`` is set. Surfaced in ``meta_info.prompt_token_ids``
+    # so RL trainers reuse the rollout's exact prompt tokens. Empty otherwise.
+    prompt_token_ids: list[int] = dataclasses.field(default_factory=list)
+
     # Inline detokenizer: lazily constructed on the first
     # BatchTokenIDOut frame for this request. Stays None for
     # raw-token mode (skip_tokenizer_init or tokenizer absent).
@@ -298,6 +303,16 @@ class OutputProcessor:
                     "embedding": recv_obj.embeddings[i],
                     "meta_info": meta_info,
                 }
+
+            # Echo raw token ids for RL trainers (return_token_ids). meta_info is
+            # the same object referenced by out_dict["meta_info"], so mutating it
+            # here reaches the caller. We expose the full cumulative generated
+            # sequence (not the per-frame stream delta in out_dict["output_ids"])
+            # so trainers get the exact rollout tokens on the finished response.
+            if getattr(obj, "return_token_ids", False):
+                meta_info["prompt_token_ids"] = list(state.prompt_token_ids)
+                if "output_ids" in out_dict:
+                    meta_info["output_token_ids"] = list(state.output_ids)
 
             state.finished = recv_obj.finished_reasons[i] is not None
             if state.finished:

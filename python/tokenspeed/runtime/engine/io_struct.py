@@ -118,6 +118,14 @@ class GenerateReqInput:
     # Whether to return hidden states
     return_hidden_states: bool = False
 
+    # Whether to echo the raw prompt/output token ids back to the caller so RL
+    # trainers reuse the rollout's exact token sequence instead of re-tokenizing
+    # the returned text (avoids retokenization drift). When set, the engine adds
+    # ``meta_info.prompt_token_ids`` (the tokenizer-valid, unpadded prompt ids)
+    # and ``meta_info.output_token_ids`` (the full generated sequence).
+    # See docs/guides/return-token-ids.md.
+    return_token_ids: bool = False
+
     # For disaggregated inference
     bootstrap_host: list[str] | str | None = None
     bootstrap_port: list[int] | int | None = None
@@ -386,6 +394,7 @@ class GenerateReqInput:
                 else None
             ),
             return_hidden_states=self.return_hidden_states,
+            return_token_ids=self.return_token_ids,
             # if `__getitem__` is called, the bootstrap_host, bootstrap_port, bootstrap_room must be a list
             bootstrap_host=(
                 self.bootstrap_host[i] if self.bootstrap_host is not None else None
