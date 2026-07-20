@@ -333,6 +333,15 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
             created_time=created_time,
             tokenized_time=tokenized_obj.created_time,
         )
+        # When the caller asked to echo raw token ids, stash the tokenizer-valid
+        # (unpadded) prompt ids so the output processor can surface them in
+        # meta_info without re-deriving them from the original request.
+        if getattr(obj, "return_token_ids", False):
+            state.prompt_token_ids = (
+                getattr(tokenized_obj, "input_ids_unpadded", None)
+                or getattr(tokenized_obj, "input_ids", None)
+                or []
+            )
         self.rid_to_state[obj.rid] = state
         mm_inputs = getattr(tokenized_obj, "multimodal_inputs", None)
         if mm_inputs is not None:
