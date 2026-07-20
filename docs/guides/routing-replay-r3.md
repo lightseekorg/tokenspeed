@@ -38,10 +38,13 @@ about 1-5% of the KV footprint.
   `MHATokenToKVPool.set_kv_buffer`; `gather(loc)` returns `[n, num_moe_layers,
   top_k]` — the prefix-hit retrieval.
 - **`RoutedExpertsCapturer`** — per-forward controller:
-  `begin_forward(out_cache_loc)` → `capture(layer_id, topk_ids)` per MoE layer →
+  `begin_forward(out_cache_loc)` → `capture_in_order(topk_ids)` per MoE layer →
   `commit()` scatters into the pool. No-op when inactive, so the hook is free on
   requests that didn't ask for replay. Rows that don't match the forward's slot
   count (TP/EP all-gather) are skipped and counted, never written.
+- `build_routed_experts_capturer(server_args, model_config, size)` sizes the
+  pool from the model config (`num_hidden_layers`, `num_experts_per_tok`);
+  returns `None` for dense models.
 - A process-global accessor (`get/set_global_routed_experts_capturer`) mirroring
   `moe/distribution_recorder.py`'s global recorder.
 - Request flag **`GenerateReqInput.return_routed_experts`** (opt-in, off by
@@ -49,44 +52,56 @@ about 1-5% of the KV footprint.
 
 The repo already captures per-token per-layer `topk_ids` for *offline*
 distribution analysis (`moe/distribution_recorder.py`'s
-`_DetailSinglePassGatherer._topk_ids_of_layer`) and tracks the current layer via
-`with_current_layer`. R3 reuses that shape but adds slot-indexed **persistence**
-and a **return path**.
+`_DetailSinglePassGatherer._topk_ids_of_layer`). R3 reuses that shape but adds
+slot-indexed **persistence** and a **return path**.
 
-## Remaining wiring (model forward + serving) — follow-ups
+## Forward wiring (landed, guarded by `--enable-routing-replay`)
 
-These need a running model, so they are tracked separately from the tested core:
+All hooks are no-ops unless the flag is set, so default behavior is unchanged:
 
-1. **Allocate the pool.** Add a `ServerArgs` flag (e.g.
-   `--enable-routing-replay`) that constructs a `RoutedExpertsPool` sized to the
-   KV pool's `size`, with `num_moe_layers`/`top_k` from the model config, and
-   installs a `RoutedExpertsCapturer` via `set_global_routed_experts_capturer`.
-2. **Capture hook.** In `runtime/layers/moe/topk.py::select_experts` (next to
-   the existing `get_global_expert_distribution_recorder().on_select_experts`
-   call), call `capturer.capture(layer_id, topk_ids)`. The layer index is
-   available through the same `with_current_layer` mechanism the distribution
-   recorder uses.
-3. **Slot mapping into the MoE layer.** `out_cache_loc` currently reaches
-   attention but not the MoE block (`ForwardContext` holds no tensors by
-   design). Thread it into `forward_mlp`/the sparse block, or stash it on the
-   capturer via `begin_forward(out_cache_loc)` at forward start (in
-   `model_runner`) and `commit()` at forward end.
-4. **TP/EP alignment.** In the TP path `topk_ids` rows are the global
-   all-gathered token set, not the rank-local tokens `out_cache_loc` indexes.
-   Either capture before `pre_mlp_comm`, or slice the gathered rows back to
-   local using the comm manager's bookkeeping. The DeepEP path routes locally
-   and is easier. Until this lands, the capturer skips misaligned layers.
-5. **Bypassed/fused routing.** When routing is fused into the kernel
-   (`TopK` `BYPASSED` output), `topk_ids` never materializes in Python; R3 runs
-   need a kernel-level capture or a forced standard-topk path.
-6. **Prefix-hit retrieval + return.** On a prefix hit, `gather` the reused
+1. **Allocate + install** — `engine/event_loop.py` builds the pool (sized to the
+   KV pool's `max_total_num_tokens`) and installs the capturer right after the
+   KV pool is created.
+2. **Forward lifecycle** — `execution/model_runner.py::forward` calls
+   `begin_forward(out_cache_loc)` before `model.forward` and `commit()` after
+   (in a `finally`). `out_cache_loc` is the exact per-token KV-slot vector.
+3. **Capture hook** — `layers/moe/topk.py::select_experts` calls
+   `capture_in_order(topk_ids)` next to the existing `on_select_experts`. Layer
+   index is assigned by per-forward invocation order (MoE layers fire in order),
+   avoiding edits to every model file. The standard (non-`BYPASSED`) path is the
+   only one that materializes `topk_ids` in Python, so fused-routing models are
+   naturally skipped.
+
+## Remaining wiring — follow-ups (need GPU validation)
+
+1. **CUDA-graph decode.** The decode forward is CUDA-graph captured;
+   `capture_in_order` currently **skips under
+   `torch.cuda.is_current_stream_capturing()`** (correct — it never corrupts the
+   graph), so only eager forwards are captured today. To cover graphed decode,
+   record the scatter into the graph using only stable-address buffers (mirror
+   `distribution_recorder._on_hook`, which deliberately fires during capture).
+2. **TP/EP alignment.** In the TP path `topk_ids` rows are the global
+   all-gathered token set, not the rank-local tokens `out_cache_loc` indexes, so
+   the capturer safe-skips (counted in `skipped_misaligned`). Capture before
+   `pre_mlp_comm`, or slice the gathered rows back to local. TP=1 works today;
+   the DeepEP path routes locally and is easier.
+3. **Bypassed/fused routing.** When routing is fused into the kernel
+   (`TopK` `BYPASSED`), `topk_ids` never materializes in Python; R3 runs need a
+   kernel-level capture or a forced standard-topk path.
+4. **Layer-index precision.** Invocation-order indexing assumes one
+   `select_experts` per MoE layer per forward; multi-pass (spec/MTP) or
+   multi-router layers would need the global layer index from
+   `with_current_layer` instead (which also requires installing a non-noop layer
+   tracker — the recorder is a noop in this fork).
+5. **Prefix-hit retrieval + return.** On a prefix hit, `gather` the reused
    slots' routing and merge with the freshly captured tail; surface it to the
    caller (`meta_info.routed_experts`, shape `[seq_len, num_moe_layers,
-   top_k]`). Crossing the gRPC/gateway boundary needs a proto field +
-   servicer + Rust gateway rendering, same as the `return_token_ids` follow-up.
+   top_k]`). Crossing the gRPC/gateway boundary needs a proto field + servicer +
+   Rust gateway rendering, same as the `return_token_ids` follow-up.
 
 ## Status
 
-This PR is a **design-review scaffold**: the storage + capture/commit + retrieval
-core is implemented and unit-tested (CPU); the model-forward and serving wiring
-above are the follow-ups it is built to support.
+The storage/capture core is unit-tested (CPU, 25 tests) and the forward wiring
+is landed but **guarded and not yet GPU-validated end to end** (this venv can't
+run a model). The follow-ups above — chiefly CUDA-graph decode capture, TP/EP
+alignment, and the retrieval/return path — are the remaining work.

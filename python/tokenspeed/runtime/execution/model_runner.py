@@ -25,6 +25,9 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from tokenspeed.runtime.cache.routed_experts_pool import (
+    get_global_routed_experts_capturer,
+)
 from tokenspeed.runtime.execution.weight_loader import WeightLoader
 from tokenspeed.runtime.layers.moe.utils import initialize_moe_config
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -161,13 +164,22 @@ class ModelRunner:
         if kv_sync_event is not None:
             kwargs["kv_sync_event"] = kv_sync_event
 
-        return self.model.forward(
-            ctx,
-            input_ids,
-            positions,
-            out_cache_loc,
-            **kwargs,
-        )
+        # Rollout Routing Replay (R3): capture MoE routing keyed by this forward's
+        # KV slots. No-op unless a capturer is installed (--enable-routing-replay).
+        capturer = get_global_routed_experts_capturer()
+        if capturer is not None:
+            capturer.begin_forward(out_cache_loc)
+        try:
+            return self.model.forward(
+                ctx,
+                input_ids,
+                positions,
+                out_cache_loc,
+                **kwargs,
+            )
+        finally:
+            if capturer is not None:
+                capturer.commit()
 
     # ------------------------------------------------------------------ #
     # RL online weight sync: receive NCCL-broadcast weights from a trainer.

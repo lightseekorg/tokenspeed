@@ -212,6 +212,21 @@ class EventLoop:
             overlap_schedule_depth=self.overlap_schedule_depth,
         )
 
+        # Rollout Routing Replay (R3): allocate the slot-indexed routing pool and
+        # install a process-global capturer, sized to the KV pool. Off by default;
+        # a dense model yields None (no-op). See docs/guides/routing-replay-r3.md.
+        if getattr(server_args, "enable_routing_replay", False):
+            from tokenspeed.runtime.cache.routed_experts_pool import (
+                build_routed_experts_capturer,
+                set_global_routed_experts_capturer,
+            )
+
+            set_global_routed_experts_capturer(
+                build_routed_experts_capturer(
+                    server_args, self.model_config, self.max_total_num_tokens
+                )
+            )
+
         num_total_pages = self.max_total_num_tokens // server_args.block_size
         hf_config = getattr(self.model_config, "hf_config", None)
         text_config = getattr(hf_config, "text_config", None) if hf_config else None

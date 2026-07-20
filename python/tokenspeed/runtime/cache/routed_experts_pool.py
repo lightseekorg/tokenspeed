@@ -115,7 +115,9 @@ class RoutedExpertsPool:
             device=device,
         )
 
-    def store_layer(self, layer_id: int, loc: torch.Tensor, topk_ids: torch.Tensor) -> None:
+    def store_layer(
+        self, layer_id: int, loc: torch.Tensor, topk_ids: torch.Tensor
+    ) -> None:
         """Scatter one layer's routing into the pool at the given KV slots.
 
         Args:
@@ -201,7 +203,12 @@ class RoutedExpertsCapturer:
         self.pool = pool
         self._loc: torch.Tensor | None = None
         self._captured: dict[int, torch.Tensor] = {}
+        # Per-forward MoE-layer counter. MoE layers invoke select_experts in
+        # layer order within a forward, so the n-th capture_in_order() call is
+        # MoE layer n. Reset by begin_forward().
+        self._layer_counter: int = 0
         self.skipped_misaligned: int = 0
+        self.skipped_overflow: int = 0
 
     @property
     def active(self) -> bool:
@@ -215,6 +222,7 @@ class RoutedExpertsCapturer:
         """
         self._loc = out_cache_loc
         self._captured.clear()
+        self._layer_counter = 0
 
     def capture(self, layer_id: int, topk_ids: torch.Tensor) -> None:
         """Record one MoE layer's ``topk_ids`` for the active forward.
@@ -230,6 +238,28 @@ class RoutedExpertsCapturer:
         # Detach + clone: topk_ids is transient inside the MoE forward and may be
         # freed/overwritten before commit.
         self._captured[layer_id] = topk_ids.detach().clone()
+
+    def capture_in_order(self, topk_ids: torch.Tensor) -> None:
+        """Capture ``topk_ids`` for the next MoE layer in invocation order.
+
+        The MoE forward hook calls this without a layer index; layers fire in
+        order, so the k-th call in a forward is MoE layer k. No-op when capture
+        is inactive. Skipped (and counted) under CUDA-graph capture — the Python
+        counter runs only once at capture time, so baking the scatter into the
+        graph is deferred to a later increment (see docs).
+        """
+        if self._loc is None:
+            return
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            return
+        layer_id = self._layer_counter
+        self._layer_counter += 1
+        if layer_id >= self.pool.num_moe_layers:
+            # More MoE invocations this forward than the pool was sized for
+            # (e.g. speculative/MTP multi-pass). Skip rather than overflow.
+            self.skipped_overflow += 1
+            return
+        self.capture(layer_id, topk_ids)
 
     def commit(self) -> None:
         """Scatter all captured layers into the pool, then end the forward."""
@@ -260,3 +290,66 @@ def set_global_routed_experts_capturer(
     """Install (or clear with ``None``) the process-global capturer."""
     global _global_routed_experts_capturer
     _global_routed_experts_capturer = capturer
+
+
+def _config_value(model_config, name: str):
+    """Read ``name`` from the model's text config, falling back to hf_config."""
+    hf = getattr(model_config, "hf_config", None)
+    text = getattr(hf, "text_config", None) if hf is not None else None
+    for cfg in (text, hf):
+        if cfg is not None and hasattr(cfg, name):
+            return getattr(cfg, name)
+    return None
+
+
+def build_routed_experts_capturer(
+    server_args,
+    model_config,
+    size: int,
+) -> RoutedExpertsCapturer | None:
+    """Construct a :class:`RoutedExpertsCapturer` sized from the model config.
+
+    Args:
+        server_args: The server args (for ``device``).
+        model_config: The loaded model config (exposes ``hf_config`` /
+            ``hf_config.text_config`` with ``num_hidden_layers`` and
+            ``num_experts_per_tok``).
+        size: Number of KV slots (the KV pool's ``max_total_num_tokens``).
+
+    Returns:
+        A capturer wrapping a pool of shape
+        ``[size + 1, num_hidden_layers, num_experts_per_tok]``, or ``None`` for a
+        dense (non-MoE) model where ``num_experts_per_tok`` is absent — routing
+        replay does not apply there. The layer axis is sized to
+        ``num_hidden_layers`` (the total transformer-layer count, matching
+        ``ExpertLocationMetadata.num_layers``); dense layers simply never write.
+
+    Does not install the capturer; call
+    :func:`set_global_routed_experts_capturer` with the result.
+    """
+    top_k = _config_value(model_config, "num_experts_per_tok")
+    num_layers = _config_value(model_config, "num_hidden_layers")
+    if top_k is None or num_layers is None:
+        logger.warning(
+            "routing replay requested but the model config exposes no "
+            "num_experts_per_tok/num_hidden_layers (dense model?); "
+            "routing replay disabled."
+        )
+        return None
+    device = getattr(server_args, "device", "cuda")
+    pool = RoutedExpertsPool(
+        size=size,
+        num_moe_layers=int(num_layers),
+        top_k=int(top_k),
+        device=device,
+    )
+    logger.info(
+        "routing replay enabled: RoutedExpertsPool size=%d layers=%d top_k=%d "
+        "(%.1f MiB) on %s",
+        size,
+        int(num_layers),
+        int(top_k),
+        pool.num_bytes / (1024 * 1024),
+        device,
+    )
+    return RoutedExpertsCapturer(pool)
