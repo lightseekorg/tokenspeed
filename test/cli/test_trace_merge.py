@@ -142,7 +142,7 @@ def _add_proton_cpu_scope(trace: dict, scope_id: int) -> None:
             "tid": 1,
             "name": "gemm.mm",
             "cat": "scope",
-            "args": {"proton_scope_id": scope_id},
+            "args": {"scope_id": scope_id},
         }
     )
 
