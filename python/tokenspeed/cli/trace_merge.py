@@ -72,7 +72,7 @@ _FLOW_ID_RANK_SHIFT = 32
 _FLOW_ID_LOCAL_MASK = (1 << _FLOW_ID_RANK_SHIFT) - 1
 _VIZTRACER_PROTON_FLOW_NAME = "viztracer->proton"
 _VIZTRACER_PROTON_FLOW_CATEGORY = "tokenspeed.proton"
-_PROTON_SCOPE_ID_ARG = "proton_scope_id"
+_SCOPE_ID_ARG = "scope_id"
 _VIZTRACER_PROTON_FLOW_TAG = 1 << 52
 _MAX_FLOW_RANK = (_VIZTRACER_PROTON_FLOW_TAG - 1) >> _FLOW_ID_RANK_SHIFT
 
@@ -163,7 +163,7 @@ def _link_viztracer_to_proton_cpu(
         args = event.get("args")
         if not isinstance(args, dict):
             continue
-        scope_id = args.get(_PROTON_SCOPE_ID_ARG)
+        scope_id = args.get(_SCOPE_ID_ARG)
         if isinstance(scope_id, int) and not isinstance(scope_id, bool):
             proton_cpu_scopes[scope_id] = event
 
