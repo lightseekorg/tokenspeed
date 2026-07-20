@@ -91,11 +91,9 @@ if platform.is_hopper_plus:
     except ImportError:
         pass
 
-# BF16-state MTP kernel: a separate, optional entry point (not reachable
-# through gated_delta_rule_decode_pretranspose's T>1 dispatch, which does not
-# forward intermediate_states_buffer/disable_state_update). Needed so
-# gdn_decode_mtp can support a bf16 state pool the same way gdn_decode_step
-# already does via gated_delta_rule_decode_pretranspose's own dispatch.
+# BF16-state MTP kernel: a separate, optional entry point. Needed so
+# gdn_decode_mtp can forward the intermediate-state and per-token state-pool
+# scatter arguments that are not exposed by gated_delta_rule_decode_pretranspose.
 _gated_delta_rule_bf16_mtp = None
 
 if platform.is_hopper_plus:
@@ -147,9 +145,9 @@ def is_decode_available() -> bool:
 def is_decode_supported(head_dim: int, dtype: torch.dtype) -> bool:
     """Whether ``gdn_decode_step``/``gdn_decode_mtp`` support this shape/dtype.
 
-    Both kernels require K == V == 128 (bf16 fast path / MTP kernel constraint)
-    and a float16/bfloat16 q/k/v dtype; the recurrent state itself must stay
-    float32 (asserted inside the kernels).
+    Both kernels require K == V == 128 and a float16/bfloat16 q/k/v dtype. The
+    recurrent state pool may be float32 or bfloat16; FlashInfer dispatches the
+    latter to its dedicated BF16-state kernel.
     """
     return (
         is_decode_available()
@@ -411,16 +409,16 @@ if is_decode_available():
         disable_state_update: bool = True,
         use_qk_l2norm: bool = True,
         intermediate_states_buffer: torch.Tensor | None = None,
+        output_state_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run one multi-token (T>1) GDN MTP verify step, K-last pool+indices.
 
         q, k are [B, T, H, K]; v is [B, T, HV, V]; a, b are [B, T, HV].
         initial_state is the K-last [pool_size, HV, V, K] SSM state pool (same
         layout as gdn_chunk_prefill/gdn_decode_step); initial_state_indices
-        ([B]) selects each batch entry's row for both the read and, when
-        ``disable_state_update=False``, the post-verify write-back to that
-        SAME row (unlike gdn_decode_step, this kernel has no arbitrary
-        per-step output_state_indices scatter).
+        ([B]) selects each batch entry's read row. When
+        ``output_state_indices`` is None and ``disable_state_update=False``,
+        the final state is written back to that same row.
 
         Unlike gdn_decode_step, ``initial_state_indices`` entries must be
         ``>= 0``: this kernel does not skip or redirect negative indices, so
@@ -430,11 +428,13 @@ if is_decode_available():
 
         intermediate_states_buffer: Optional batch-scoped ``[B, T, HV, V, K]``
         (K-last, same dtype as ``initial_state``) buffer that receives every
-        step's post-update state at ``buffer[i_n, step]``. Callers that need
-        per-draft-step snapshots at arbitrary pool rows (e.g. the runtime's
-        speculative-decode ``mamba_output_indices``) provide this buffer and
-        scatter it into the real pool themselves after the call -- this
-        kernel has no arbitrary per-step output-index scatter of its own.
+        step's post-update state at ``buffer[i_n, step]``.
+
+        output_state_indices: Optional int32 ``[B, T]`` table. Each step's
+        post-update state is scattered directly to the corresponding pool row.
+        FlashInfer names this argument ``ssm_state_indices``. It is mutually
+        exclusive with ``intermediate_states_buffer`` and requires
+        ``disable_state_update=False``.
 
         Dispatches to the bf16-state MTP kernel when ``initial_state`` is
         bfloat16 with K == V == 128 (mirrors gdn_decode_step's own bf16/fp32
@@ -466,6 +466,7 @@ if is_decode_available():
                 initial_state_source=initial_state,
                 initial_state_indices=initial_state_indices,
                 intermediate_states_buffer=intermediate_states_buffer,
+                ssm_state_indices=output_state_indices,
                 disable_state_update=disable_state_update,
                 use_qk_l2norm_in_kernel=use_qk_l2norm,
                 scale=scale,
@@ -483,6 +484,7 @@ if is_decode_available():
             b=b.to(q.dtype),
             scale=scale,
             intermediate_states_buffer=intermediate_states_buffer,
+            ssm_state_indices=output_state_indices,
             disable_state_update=disable_state_update,
             use_qk_l2norm=use_qk_l2norm,
         )

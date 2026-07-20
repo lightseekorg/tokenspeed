@@ -723,6 +723,66 @@ def test_gdn_decode_mtp_intermediate_states_buffer_matches_reference(
 
 
 @pytest.mark.parametrize("solution", ["triton", "flashinfer"])
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+def test_gdn_decode_mtp_output_state_indices_scatter_matches_reference(
+    device: str,
+    solution: str,
+    state_dtype: torch.dtype,
+    require,
+):
+    # FlashInfer 0.6.15 and the Triton fallback scatter every post-token state
+    # directly into the scheduler-provided pool row, avoiding a dense B*T state
+    # scratch buffer plus a follow-up PyTorch scatter.
+    require("attention", "gdn_decode_mtp", solution, torch.bfloat16, "q")
+
+    T = 3
+    q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
+        device=device,
+        dtype=torch.bfloat16,
+        T=T,
+        pool_size=24,
+        state_dtype=state_dtype,
+    )
+    read_idx = torch.tensor([1, 3, 5, 7], device=device, dtype=torch.int32)
+    output_idx = torch.arange(8, 20, device=device, dtype=torch.int32).view(4, T)
+    scale = q.shape[-1] ** -0.5
+
+    pool_copy = pool.clone()
+    out = gdn_decode_mtp(
+        q,
+        k,
+        v,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b=b,
+        initial_state=pool_copy,
+        initial_state_indices=read_idx,
+        output_state_indices=output_idx,
+        scale=scale,
+        disable_state_update=False,
+        use_qk_l2norm=True,
+        solution=solution,
+    )
+
+    ref_out, ref_states = _torch_gdn_decode_reference(
+        q, k, v, a, b, A_log, dt_bias, pool[read_idx], scale
+    )
+    torch.testing.assert_close(
+        out.float(), ref_out.to(out.dtype).float(), rtol=2e-2, atol=2e-2
+    )
+    # Per-token scatter must not overwrite the read rows.
+    torch.testing.assert_close(pool_copy[read_idx], pool[read_idx])
+    for t in range(T):
+        torch.testing.assert_close(
+            pool_copy[output_idx[:, t].long()].float(),
+            ref_states[t].to(pool.dtype).float(),
+            rtol=2e-2,
+            atol=3e-2,
+        )
+
+
+@pytest.mark.parametrize("solution", ["triton", "flashinfer"])
 def test_gdn_decode_mtp_disable_state_update_false_writes_back(
     device: str, solution: str, require
 ):

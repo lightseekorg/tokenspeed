@@ -138,12 +138,6 @@ class MambaForwardMetadata:
     mamba_req_pool_indices: torch.Tensor | None = None
     extend_prefix_lens: torch.Tensor | None = None
     extend_seq_lens_cpu: torch.Tensor | None = None
-    # Batch-scoped [B, T, HV, V, K] (K-last) scratch buffer for gdn_decode_mtp's
-    # per-step state snapshots (target_verify); scattered into the state pool
-    # at mamba_output_indices after the kernel call (see MambaAttnBackend.
-    # forward_extend). None outside target_verify / when speculative decoding
-    # is disabled.
-    mamba_mtp_state_scratch: torch.Tensor | None = None
     # Pre-computed src/dst indices for extracting Mamba prefix-cache snapshots.
     track_ssm_h_src: torch.Tensor | None = None
     track_ssm_h_src_fla: torch.Tensor | None = None
@@ -515,11 +509,6 @@ class MambaAttnBackend(AttentionBackend):
         self.cached_cuda_graph_decode_query_start_loc: torch.Tensor = None
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
         self.output_indices_list = []
-        # Batch-scoped [bs, draft_token_num, HV, V, K] (K-last) scratch buffers
-        # for gdn_decode_mtp's per-step state snapshots under CUDA-graph
-        # capture/replay -- mirrors output_indices_list's per-bs persistence
-        # (see init_cuda_graph_state).
-        self.intermediate_state_scratch_list: list[torch.Tensor] = []
         self.speculative_num_draft_tokens = getattr(
             config, "speculative_num_draft_tokens", 0
         )
@@ -630,7 +619,6 @@ class MambaAttnBackend(AttentionBackend):
 
         mamba_output_indices = None
         extend_seq_lens_cpu = None
-        mamba_mtp_state_scratch = None
         if is_target_verify:
             draft_token_num = int(
                 kwargs.get("tokens_per_req", self.speculative_num_draft_tokens)
@@ -645,19 +633,6 @@ class MambaAttnBackend(AttentionBackend):
                 draft_token_num,
             )
             mamba_cache_indices = mamba_input_indices
-            # Batch-scoped scratch for gdn_decode_mtp's per-step state
-            # snapshots; not CUDA-graph-persistent here (eager path), so a
-            # fresh allocation per call is fine.
-            hv, v_dim, k_dim = self.pool.ssm_state.shape[-3:]
-            mamba_mtp_state_scratch = torch.empty(
-                bs,
-                draft_token_num,
-                hv,
-                v_dim,
-                k_dim,
-                dtype=self.pool.ssm_state.dtype,
-                device=self.device,
-            )
 
         if forward_mode.is_decode_or_idle() and self.spec_num_tokens == 1:
             query_start_loc = torch.arange(
@@ -794,7 +769,6 @@ class MambaAttnBackend(AttentionBackend):
             mamba_req_pool_indices=req_pool_indices[:bs],
             extend_prefix_lens=kwargs.get("extend_prefix_lens"),
             extend_seq_lens_cpu=extend_seq_lens_cpu,
-            mamba_mtp_state_scratch=mamba_mtp_state_scratch,
             track_ssm_h_src=track_ssm_h_src,
             track_ssm_h_src_fla=track_ssm_h_src_fla,
             track_ssm_h_dst=track_ssm_h_dst,
@@ -899,19 +873,6 @@ class MambaAttnBackend(AttentionBackend):
                         device=self.device,
                     )
                 )
-                if self.pool is not None:
-                    hv, v_dim, k_dim = self.pool.ssm_state.shape[-3:]
-                    self.intermediate_state_scratch_list.append(
-                        torch.empty(
-                            i + 1,
-                            self.speculative_num_draft_tokens,
-                            hv,
-                            v_dim,
-                            k_dim,
-                            dtype=self.pool.ssm_state.dtype,
-                            device=self.device,
-                        )
-                    )
         self.cached_cuda_graph_decode_query_start_loc = torch.arange(
             0, max_num_tokens + 1, dtype=torch.int32, device=self.device
         )
@@ -1017,11 +978,6 @@ class MambaAttnBackend(AttentionBackend):
             mamba_cache_indices=self.state_indices_list[bs - 1],
             mamba_output_indices=mamba_output_indices,
             mamba_req_pool_indices=req_pool_indices[:bs],
-            mamba_mtp_state_scratch=(
-                self.intermediate_state_scratch_list[bs - 1]
-                if is_target_verify
-                else None
-            ),
             state_in_pages=state_in_pages,
             state_out_pages=state_out_pages,
         )
@@ -1151,11 +1107,6 @@ class MambaAttnBackend(AttentionBackend):
             mamba_cache_indices=self.state_indices_list[bs - 1],
             mamba_output_indices=mamba_output_indices,
             mamba_req_pool_indices=req_pool_indices,
-            mamba_mtp_state_scratch=(
-                self.intermediate_state_scratch_list[bs - 1]
-                if is_target_verify
-                else None
-            ),
             state_in_pages=state_in_pages,
             state_out_pages=state_out_pages,
         )
@@ -1429,7 +1380,7 @@ class MambaAttnBackend(AttentionBackend):
             a_b = a.view(batch_size, draft_token_num, -1)
             b_b = b.view(batch_size, draft_token_num, -1)
 
-            mtp_scratch = self.forward_metadata.mamba_mtp_state_scratch
+            output_indices = self.forward_metadata.mamba_output_indices
             core_attn_out = gdn_decode_mtp(
                 query_b,
                 key_b,
@@ -1443,27 +1394,12 @@ class MambaAttnBackend(AttentionBackend):
                 # negative indices itself -- clamp CUDA-graph padding rows here.
                 initial_state_indices=cache_indices.clamp(min=0),
                 use_qk_l2norm=True,
-                # Never write back to the read row directly: the scheduler
-                # doesn't yet know how many draft tokens will be accepted, so
-                # every step's state is captured into mtp_scratch below and
-                # scattered to the scheduler-chosen per-step output row instead.
-                disable_state_update=True,
-                intermediate_states_buffer=mtp_scratch,
+                # FlashInfer 0.6.15 scatters every post-token state directly
+                # into the scheduler-assigned pool row. Redirect graph-padding
+                # -1 entries to the pool's reserved sacrificial row 0.
+                output_state_indices=output_indices.clamp(min=0),
+                disable_state_update=False,
             ).reshape(1, seq_len, num_value_heads, head_v_dim)
-
-            # Scatter every draft step's post-update snapshot to its
-            # scheduler-assigned row (mamba_output_indices[req, step] --
-            # column 0 is the "working" row, columns 1.. are scratch "draft"
-            # rows; see SimpleMambaPool.get_mtp_output_indices). -1 marks an
-            # inactive/padding batch row and is redirected to the pool's
-            # reserved sacrificial row 0 (never assigned to a real request --
-            # req_pool_indices are 1-based), matching gdn_decode_step's own
-            # padding convention; the resulting junk at row 0 is never read.
-            output_indices = self.forward_metadata.mamba_output_indices
-            flat_out_idx = output_indices.reshape(-1).to(torch.int64).clamp(min=0)
-            ssm_states[flat_out_idx] = mtp_scratch.reshape(
-                -1, *mtp_scratch.shape[-3:]
-            ).to(ssm_states.dtype)
         else:
             beta = b.sigmoid()
             g = fused_gdn_gating(A_log, a, dt_bias)

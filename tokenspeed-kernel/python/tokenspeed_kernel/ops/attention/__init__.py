@@ -329,6 +329,7 @@ def gdn_decode_mtp(
     disable_state_update: bool = True,
     use_qk_l2norm: bool = True,
     intermediate_states_buffer: torch.Tensor | None = None,
+    output_state_indices: torch.Tensor | None = None,
     override: str | None = None,
     solution: str | None = None,
 ) -> torch.Tensor:
@@ -346,12 +347,12 @@ def gdn_decode_mtp(
         b: Update-gate (beta) input shaped ``[B, T, num_v_heads]``.
         initial_state: SSM state pool, K-last ``[pool_size, num_v_heads,
             head_v_dim, head_dim]`` (matches the runtime's SSM state pool).
-        initial_state_indices: Per-batch row, shaped ``[B]``, used for both
-            the read and (when ``disable_state_update=False``) the
-            post-verify write-back to that SAME row. Entries must be
-            ``>= 0``: unlike ``gdn_decode_step``, negative indices are not
-            skipped or redirected -- the caller must clamp CUDA-graph padding
-            rows before calling.
+        initial_state_indices: Per-batch read row, shaped ``[B]``. When
+            ``output_state_indices`` is not provided and
+            ``disable_state_update=False``, the final state is written back to
+            that same row. Entries must be ``>= 0``: unlike
+            ``gdn_decode_step``, negative indices are not skipped or redirected
+            -- the caller must clamp CUDA-graph padding rows before calling.
         scale: Attention scale. ``None`` lets the implementation use its default.
         disable_state_update: When True (default), never write back to
             ``initial_state_indices``.
@@ -359,17 +360,39 @@ def gdn_decode_mtp(
         intermediate_states_buffer: Optional batch-scoped ``[B, T,
             num_v_heads, head_v_dim, head_dim]`` (K-last, same dtype as
             ``initial_state``) buffer that receives every step's post-update
-            state at ``buffer[i_n, step]``. Use this when per-draft-step
-            snapshots at arbitrary pool rows are needed (e.g. speculative
-            decoding's per-request output-index table): every registered
-            kernel for this op fills it the same way, so the caller's
-            post-call scatter into the real pool is solution-agnostic.
+            state at ``buffer[i_n, step]``.
+        output_state_indices: Optional per-token state-pool destinations shaped
+            ``[B, T]`` with dtype ``torch.int32``. When provided, each
+            post-update state ``h_{t+1}`` is written directly to
+            ``initial_state[output_state_indices[i, t]]``. Entries must be
+            non-negative. This is mutually exclusive with
+            ``intermediate_states_buffer`` and requires
+            ``disable_state_update=False``.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
     Returns:
         Decode output shaped ``[B, T, num_v_heads, head_v_dim]`` (q.dtype).
     """
+    if output_state_indices is not None:
+        if output_state_indices.shape != q.shape[:2]:
+            raise ValueError(
+                "output_state_indices must have shape "
+                f"{tuple(q.shape[:2])}, got {tuple(output_state_indices.shape)}"
+            )
+        if output_state_indices.dtype != torch.int32:
+            raise ValueError(
+                "output_state_indices must have dtype torch.int32, got "
+                f"{output_state_indices.dtype}"
+            )
+        if intermediate_states_buffer is not None:
+            raise ValueError(
+                "output_state_indices and intermediate_states_buffer are "
+                "mutually exclusive"
+            )
+        if disable_state_update:
+            raise ValueError("output_state_indices requires disable_state_update=False")
+
     head_dim = q.shape[-1]
     signature = _attention_format_signature(q=q, k=k, v=v)
     kernel = select_kernel(
@@ -405,6 +428,7 @@ def gdn_decode_mtp(
             disable_state_update=disable_state_update,
             use_qk_l2norm=use_qk_l2norm,
             intermediate_states_buffer=intermediate_states_buffer,
+            output_state_indices=output_state_indices,
         )
 
 
