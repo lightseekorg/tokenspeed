@@ -221,7 +221,6 @@ class CuteDSLMLABackend(AttentionBackend):
         forward_mode: ForwardMode,
         req_to_page: torch.Tensor,
         seq_lens_cpu: torch.Tensor | None = None,
-        spec_info=None,
         **kwargs,
     ):
         if forward_mode.is_extend_or_mixed():
