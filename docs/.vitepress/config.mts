@@ -37,7 +37,8 @@ export default defineConfig({
         text: "Guides",
         items: [
           { text: "Getting Started", link: "/guides/getting-started" },
-          { text: "Launching a Server", link: "/guides/launching" }
+          { text: "Launching a Server", link: "/guides/launching" },
+          { text: "Rollout Routing Replay (R3)", link: "/guides/routing-replay-r3" }
         ]
       },
       {
