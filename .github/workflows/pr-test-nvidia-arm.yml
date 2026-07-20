@@ -92,8 +92,6 @@ jobs:
 
       - name: Build task matrix
         id: scan
-        env:
-          TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS: ${{ vars.TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS }}
         run: |
           MATRIX=$(python3 test/ci_system/pipeline.py scan \
             --root test/ci \
