@@ -580,7 +580,7 @@ class PrefillGraph:
             else:
                 ib.positions_buf[num_tokens:bucket].zero_()
         with self._padded_to(ctx, bucket):
-            self._captures[bucket].replay()
+            self._captures[bucket].replay(valid_rows=num_tokens)
         hidden_states, aux_hidden_states = self._outputs[bucket].sliced(num_tokens)
         # The eager logits tail of BaseCausalLM.forward, on the replayed hidden states.
         logits_metadata = LogitsMetadata.from_forward_context(ctx)
@@ -663,7 +663,8 @@ class PrefillGraph:
 
         The graph replays over ``bucket`` (padded) tokens; attention metadata stays
         at the real count (set upstream), so the eager attention break only touches
-        real tokens and the padded rows produce discarded garbage. Pin
+        real tokens; eager-break handoffs clear the padded rows before the
+        following graph segment consumes them. Pin
         ``input_num_tokens`` to the bucket and, under DP, ``global_num_tokens`` /
         ``global_bs`` to the captured uniform layout so any live read during the
         break matches the baked EP shapes. The break reads ``forward_mode`` / ``bs``
