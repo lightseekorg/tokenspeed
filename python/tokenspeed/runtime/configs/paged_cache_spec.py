@@ -205,7 +205,7 @@ def validate_flat_scheduler_config(
             "speculative decoding yet. Use the MHA backend or a radix-built "
             "tokenspeed_scheduler extension."
         )
-    if speculative_algorithm == "DFLASH":
+    if speculative_algorithm in ("DFLASH", "DSPARK"):
         raise RuntimeError(
             "flat scheduler build (TOKENSPEED_FLAT_KVCACHE): DFLASH block "
             "decode is unsupported on the flat path. Use a radix-built "

@@ -77,7 +77,7 @@ class MHAConfig(BaseAttnConfig):
             )
         kv_cache_dtype = server_args.kv_cache_dtype
         draft_block_decode = bool(
-            is_draft and server_args.speculative_algorithm == "DFLASH"
+            is_draft and server_args.speculative_algorithm in ("DFLASH", "DSPARK")
         )
         if draft_block_decode and server_args.drafter_attention_backend != "trtllm":
             kv_cache_dtype = "bfloat16"

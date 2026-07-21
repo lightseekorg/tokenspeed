@@ -706,7 +706,7 @@ class EventLoop:
         local_has_work = bool(
             self._num_inflight_cache_ops != 0 or self._pending_cache_event_payloads
         )
-        if self.server_args.speculative_algorithm == "DFLASH":
+        if self.server_args.speculative_algorithm in ("DFLASH", "DSPARK"):
             if not self._cache_group_has_work(local_has_work):
                 return
         else:

@@ -967,7 +967,7 @@ class CudaGraphWrapper:
         pad = padded_bs - active_req_pool_indices.shape[0]
         if pad <= 0:
             return active_req_pool_indices
-        if self.config.spec_algo == "DFLASH":
+        if self.config.spec_algo in ("DFLASH", "DSPARK"):
             # Route padding rows to the sentinel req-pool slot
             # (max_req_pool_size), not slot 0. The DFLASH draft derives each
             # row's block seq_len from valid_cache_lengths[req_pool], so
