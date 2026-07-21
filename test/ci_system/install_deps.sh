@@ -194,6 +194,16 @@ else
     echo "No FlashInfer Python pin found in ${CUDA_REQ}; skipping FlashInfer installs."
 fi
 
+THIRDPARTY_REQ="${WORKSPACE}/tokenspeed-kernel/python/requirements/cuda-thirdparty.txt"
+FA4_SPEC="$(grep -E '^tokenspeed-fa4(\[[^]]+\])?==' "${THIRDPARTY_REQ}" | head -n1 | tr -d '[:space:]')"
+if [ -n "${FA4_SPEC}" ]; then
+    echo "Force-reinstalling pinned FA4: ${FA4_SPEC}"
+    pip_install_with_retry pip3 install --break-system-packages \
+        --force-reinstall --no-deps "${FA4_SPEC}"
+else
+    echo "No tokenspeed-fa4 pin found in ${THIRDPARTY_REQ}; skipping FA4 reinstall."
+fi
+
 # ============================================================
 # Step 9: Fix Triton ptxas (CUDA 13+ only)
 # ============================================================
