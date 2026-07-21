@@ -635,11 +635,10 @@ def test_gdn_decode_step_padding_index_is_isolated(device: str, solution: str, r
         rtol=2e-2,
         atol=3e-2,
     )
-    # Rows unrelated to any (valid or padding) index stay untouched.  Row 0 is
-    # excluded: flashinfer's bf16 fast path treats it as the caller-reserved
-    # sacrificial null slot for -1 padding (see gdn_decode_step's docstring);
-    # the runtime's own state pool never allocates row 0 to a real request for
-    # exactly this reason, but this test's pool fills every row with data.
+    # Rows unrelated to any (valid or padding) index stay untouched. Row 0 is
+    # excluded because FlashInfer's bf16 path redirects -1 padding there. The
+    # radix runtime cannot use that convention because its row 0 may be live;
+    # it routes bf16 state to the Triton solution instead.
     referenced = {int(x) for x in valid_rows.tolist()} | {0}
     untouched = torch.tensor(
         [i for i in range(pool.shape[0]) if i not in referenced], device=device
@@ -782,9 +781,16 @@ def test_gdn_decode_mtp_output_state_indices_scatter_matches_reference(
         )
 
 
-@pytest.mark.parametrize("solution", ["triton", "flashinfer"])
-def test_gdn_decode_mtp_fp32_padding_indices_skip_state_writes(
-    device: str, solution: str, require
+@pytest.mark.parametrize(
+    ("solution", "state_dtype"),
+    [
+        ("triton", torch.bfloat16),
+        ("triton", torch.float32),
+        ("flashinfer", torch.float32),
+    ],
+)
+def test_gdn_decode_mtp_padding_indices_skip_state_writes(
+    device: str, solution: str, state_dtype: torch.dtype, require
 ):
     require("attention", "gdn_decode_mtp", solution, torch.bfloat16, "q")
 
@@ -794,7 +800,7 @@ def test_gdn_decode_mtp_fp32_padding_indices_skip_state_writes(
         dtype=torch.bfloat16,
         T=T,
         pool_size=24,
-        state_dtype=torch.float32,
+        state_dtype=state_dtype,
     )
     read_idx = torch.tensor([1, -1, 5, 7], device=device, dtype=torch.int32)
     output_idx = torch.tensor(

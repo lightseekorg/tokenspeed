@@ -130,23 +130,21 @@ def compute_state_page_indices(
     return state_in.to(torch.int32), state_out.to(torch.int32)
 
 
-def _prepare_gdn_mtp_state_indices(
+def _prepare_gdn_decode_state_path(
     ssm_states: torch.Tensor,
     initial_state_indices: torch.Tensor,
-    output_state_indices: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Prepare CUDA-graph padding indices for the selected MTP state path.
+    output_state_indices: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor | None, str | None]:
+    """Select a safe decode solution while preserving graph padding indices.
 
-    FlashInfer's FP32 MTP kernel skips a whole batch row when its initial-state
-    index is negative. Runtime padding keeps every corresponding per-token
-    output index negative as well, so forwarding both tables unchanged avoids
-    launching two clamp kernels per GDN layer. The BF16 fast path instead
-    redirects negative reads and requires valid per-token scatter addresses;
-    keep routing those entries to its sacrificial row 0.
+    FlashInfer's FP32 kernels skip negative state rows, and the portable Triton
+    kernels guard negative reads and writes for both FP32 and BF16 state. The
+    FlashInfer BF16 path instead redirects padding to row 0, which is a live,
+    scheduler-owned row in the radix Mamba pool. Until that kernel supports a
+    padding mask, route BF16 state through Triton and keep ``-1`` unchanged.
     """
-    if ssm_states.dtype == torch.float32:
-        return initial_state_indices, output_state_indices
-    return initial_state_indices.clamp(min=0), output_state_indices.clamp(min=0)
+    solution = "triton" if ssm_states.dtype == torch.bfloat16 else None
+    return initial_state_indices, output_state_indices, solution
 
 
 @dataclass
@@ -1214,6 +1212,15 @@ class MambaAttnBackend(AttentionBackend):
         key = key.view(seq_len, 1, num_heads, head_k_dim)
         value = value.view(seq_len, 1, value.shape[1] // head_v_dim, head_v_dim)
 
+        (
+            decode_initial_indices,
+            decode_output_indices,
+            decode_solution,
+        ) = _prepare_gdn_decode_state_path(
+            ssm_states,
+            read_indices,
+            state_out_pages if use_flat else None,
+        )
         core_attn_out = gdn_decode_step(
             q=query,
             k=key,
@@ -1223,11 +1230,12 @@ class MambaAttnBackend(AttentionBackend):
             dt_bias=dt_bias,
             b=b.unsqueeze(1),
             initial_state=ssm_states,
-            initial_state_indices=read_indices,
+            initial_state_indices=decode_initial_indices,
             # Flat: write to the out page, not the (possibly shared) in page;
             # pool: None writes back in place to initial_state_indices.
-            output_state_indices=state_out_pages if use_flat else None,
+            output_state_indices=decode_output_indices,
             use_qk_l2norm=True,
+            solution=decode_solution,
         )
         # [B, 1, Hv, V] (pool/indices-major) -> [1, B, Hv, V], this backend's
         # decode-output convention (matches gdn_chunk_prefill's B=1-leading out).
@@ -1390,7 +1398,11 @@ class MambaAttnBackend(AttentionBackend):
             b_b = b.view(batch_size, draft_token_num, -1)
 
             output_indices = self.forward_metadata.mamba_output_indices
-            mtp_initial_indices, mtp_output_indices = _prepare_gdn_mtp_state_indices(
+            (
+                mtp_initial_indices,
+                mtp_output_indices,
+                mtp_solution,
+            ) = _prepare_gdn_decode_state_path(
                 ssm_states,
                 cache_indices,
                 output_indices,
@@ -1408,6 +1420,7 @@ class MambaAttnBackend(AttentionBackend):
                 use_qk_l2norm=True,
                 output_state_indices=mtp_output_indices,
                 disable_state_update=False,
+                solution=mtp_solution,
             ).reshape(1, seq_len, num_value_heads, head_v_dim)
         else:
             beta = b.sigmoid()
