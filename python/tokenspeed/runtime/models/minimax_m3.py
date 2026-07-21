@@ -295,6 +295,9 @@ class MiniMaxM3Indexer(nn.Module):
         )
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+
+        rope_type = (config.rope_parameters or {}).get("rope_type", "default")
+        assert rope_type == "default", f"RoPE type {rope_type} is not supported."
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=config.rotary_dim,
@@ -372,6 +375,9 @@ class MiniMaxM3Attention(nn.Module):
         )
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+
+        rope_type = (config.rope_parameters or {}).get("rope_type", "default")
+        assert rope_type == "default", f"RoPE type {rope_type} is not supported."
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=config.rotary_dim,

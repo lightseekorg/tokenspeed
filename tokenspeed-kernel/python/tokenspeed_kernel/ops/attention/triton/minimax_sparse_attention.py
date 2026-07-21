@@ -587,7 +587,7 @@ _MINIMAX_MSA_SIGNATURES = format_signatures(
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
     signatures=_MINIMAX_MSA_SIGNATURES,
     traits=_MINIMAX_MSA_TRAITS,
-    priority=Priority.PERFORMANT,
+    priority=Priority.PORTABLE,
     tags={"portability"},
 )
 def triton_minimax_msa_decode_with_kvcache(
@@ -650,7 +650,7 @@ def triton_minimax_msa_decode_with_kvcache(
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
     signatures=_MINIMAX_MSA_SIGNATURES,
     traits=_MINIMAX_MSA_TRAITS,
-    priority=Priority.PERFORMANT,
+    priority=Priority.PORTABLE,
     tags={"portability"},
 )
 def triton_minimax_msa_extend_with_kvcache(
