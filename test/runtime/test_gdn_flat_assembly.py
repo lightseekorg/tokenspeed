@@ -103,6 +103,7 @@ class Qwen3_5LayerTypesTest(unittest.TestCase):
         mapping = mock.Mock()
         mapping.attn.tp_size = 2
         cfg = self.config_cls(
+            full_attention_interval=4,
             linear_num_value_heads=8,
             linear_key_head_dim=3,
             linear_value_head_dim=5,
