@@ -28,14 +28,14 @@
 #include <unordered_map>
 #include <vector>
 
+#include "cache/block_ref.h"
 #include "utils.h"
 
 namespace tokenspeed {
 
-class BlockPool;
-
-// Per-block metadata. ref_cnt_==0 does NOT destroy the block: it re-enters the free list hash-intact,
-// so it is both prefix-reusable and an eviction candidate.
+// Per-block metadata. A zero BlockControl::strong_count does NOT destroy the
+// block: it re-enters the free list hash-intact, so it is both prefix-reusable
+// and an eviction candidate.
 class CacheBlock {
 public:
     explicit CacheBlock(std::int32_t block_id) : block_id_{block_id} {}
@@ -48,7 +48,6 @@ public:
     CacheBlock& operator=(CacheBlock&&) = default;
 
     std::int32_t BlockId() const { return block_id_; }
-    std::int32_t RefCount() const { return ref_cnt_; }
     bool IsNull() const { return is_null_; }
     bool IsCached() const { return !block_hash_.empty(); }
 
@@ -58,12 +57,6 @@ public:
 private:
     friend class BlockPool;
 
-    void IncrRef() { ++ref_cnt_; }
-    void DecrRef() {
-        _assert(ref_cnt_ >= 1, "ref_cnt must >= 1 on DecrRef");
-        --ref_cnt_;
-    }
-
     void SetHash(std::string hash) {
         _assert(block_hash_.empty(), "block already has a hash");
         block_hash_ = std::move(hash);
@@ -71,8 +64,7 @@ private:
     void ResetHash() { block_hash_.clear(); }
 
     std::int32_t block_id_{0};
-    std::int32_t ref_cnt_{0};
-    const BlockPool* owner_{nullptr};
+    BlockControl* control_{nullptr};
     std::string block_hash_{};
     bool is_null_{false};
     // Valid only while in_free_: this block's node in BlockPool::free_, for O(1) removal on a prefix hit.
@@ -80,7 +72,7 @@ private:
     std::list<CacheBlock*>::iterator free_pos_{};
 };
 
-inline auto AllCachedBlocks(const std::unordered_map<std::string, std::vector<CacheBlock*>>& cached) {
+inline auto AllCachedControls(const std::unordered_map<std::string, std::vector<BlockControl*>>& cached) {
     return cached | std::views::values | std::views::join;
 }
 
@@ -91,9 +83,11 @@ public:
         : total_num_blocks_{total_num_blocks}, enable_caching_{enable_caching} {
         _assert(total_num_blocks > 0, "total_num_blocks must be > 0");
         blocks_.reserve(total_num_blocks);
+        controls_.reserve(total_num_blocks);
         for (std::int32_t i = 0; i < total_num_blocks; ++i) {
             blocks_.emplace_back(i);
-            blocks_.back().owner_ = this;
+            controls_.push_back(BlockControl{this, &blocks_.back(), 0});
+            blocks_.back().control_ = &controls_.back();
         }
         // Block 0 is the null placeholder: never cached, ref not tracked; all others start free.
         null_block_ = &blocks_[0];
@@ -109,106 +103,112 @@ public:
     std::int32_t TotalBlocks() const { return total_num_blocks_; }
     std::int32_t NumFreeBlocks() const { return static_cast<std::int32_t>(free_.size()); }
     CacheBlock* NullBlock() const { return null_block_; }
+    BlockRef NullBlockRef() { return BlockRef{ControlFor(null_block_)}; }
 
-    // nullptr on miss; does NOT change ref counts -- callers TouchBlock() the result to claim it.
-    CacheBlock* GetCachedBlock(const std::string& block_hash_with_group) const {
-        if (!enable_caching_) {
-            return nullptr;
-        }
-        auto it = cached_hash_to_blocks_.find(block_hash_with_group);
-        if (it == cached_hash_to_blocks_.end() || it->second.empty()) {
-            return nullptr;
-        }
-        return it->second.front();
-    }
-
-    // Claim a new reference, pulling a ref-0 eviction candidate out of the free list first.
-    void TouchBlock(CacheBlock* block) {
-        _assert(block->owner_ == this, "block belongs to another pool");
-        if (block->is_null_) {
-            return;
-        }
-        if (block->ref_cnt_ == 0) {
-            removeFromFree(block);
-        }
-        block->IncrRef();
-    }
-
-    // All-or-nothing (empty on shortfall): fresh ref-1 blocks from the LRU head, evicting popped cached content.
-    std::vector<CacheBlock*> AllocateBlocks(std::int32_t num) {
-        std::vector<CacheBlock*> out;
+    // All-or-nothing (empty on shortfall). Returned handles own the blocks.
+    std::vector<BlockRef> AcquireBlocks(std::int32_t num) {
+        std::vector<BlockRef> out;
         if (num <= 0 || static_cast<std::int32_t>(free_.size()) < num) {
             return out;
         }
         out.reserve(num);
         for (std::int32_t i = 0; i < num; ++i) {
-            out.push_back(AllocateBlock());
+            out.push_back(AcquireBlock());
         }
         return out;
     }
 
-    // Single-block twin (nullptr on shortfall).
-    CacheBlock* AllocateBlock() {
+    // Empty handle on shortfall.
+    BlockRef AcquireBlock() {
         if (free_.empty()) {
-            return nullptr;
+            return {};
         }
         CacheBlock* block = popFromFree();
         if (block->IsCached()) {
             evictCachedBlock(block);
         }
-        block->IncrRef();
-        return block;
+        return BlockRef{ControlFor(block)};
     }
 
-    // Blocks reaching ref 0 return hash-intact, in reverse so a chain's tail (more prefix tokens) evicts first.
-    void FreeBlocks(const std::vector<CacheBlock*>& blocks) {
-        for (CacheBlock* block : blocks | std::views::reverse) {
-            FreeBlock(block);
+    // Owning prefix lookup: a hit is pinned before it leaves the pool.
+    BlockRef FindCachedBlock(const std::string& block_hash_with_group) {
+        BlockControl* control = lookupCachedControl(block_hash_with_group);
+        if (control == nullptr) {
+            return {};
         }
+        if (control->strong_count == 0) {
+            removeFromFree(control->object);
+        }
+        return BlockRef{control};
     }
 
-    void FreeBlock(CacheBlock* block) {
-        _assert(block->owner_ == this, "block belongs to another pool");
-        if (block->is_null_) {
-            return;
-        }
-        block->DecrRef();
-        if (block->ref_cnt_ == 0) {
-            pushToFree(block);
-        }
+    bool ContainsCachedBlock(const std::string& block_hash_with_group) const {
+        return lookupCachedControl(block_hash_with_group) != nullptr;
     }
 
     void CacheFullBlock(CacheBlock* block, const std::string& block_hash_with_group) {
-        _assert(block->owner_ == this, "block belongs to another pool");
+        BlockControl* control = ControlFor(block);
         if (!enable_caching_ || block->is_null_) {
             return;
         }
         block->SetHash(block_hash_with_group);
-        cached_hash_to_blocks_[block_hash_with_group].push_back(block);
+        cached_hash_to_controls_[block_hash_with_group].push_back(control);
     }
 
     // Test probes (off the hot path).
     std::int32_t NumCachedBlocks() const {
-        return static_cast<std::int32_t>(std::ranges::distance(AllCachedBlocks(cached_hash_to_blocks_)));
+        return static_cast<std::int32_t>(std::ranges::distance(AllCachedControls(cached_hash_to_controls_)));
     }
     std::int32_t NumCachedFreeBlocks() const {
-        return static_cast<std::int32_t>(std::ranges::count_if(AllCachedBlocks(cached_hash_to_blocks_),
-                                                               [](const CacheBlock* b) { return b->ref_cnt_ == 0; }));
+        return static_cast<std::int32_t>(
+            std::ranges::count_if(AllCachedControls(cached_hash_to_controls_),
+                                  [](const BlockControl* control) { return control->strong_count == 0; }));
     }
     std::int32_t NumPinnedCachedBlocks() const {
-        return static_cast<std::int32_t>(std::ranges::count_if(AllCachedBlocks(cached_hash_to_blocks_),
-                                                               [](const CacheBlock* b) { return b->ref_cnt_ > 0; }));
+        return static_cast<std::int32_t>(
+            std::ranges::count_if(AllCachedControls(cached_hash_to_controls_),
+                                  [](const BlockControl* control) { return control->strong_count > 0; }));
     }
 
 private:
+    friend class BlockRef;
+
+    BlockControl* ControlFor(CacheBlock* block) {
+        _assert(block != nullptr, "block must not be null");
+        _assert(block->control_ != nullptr && block->control_->owner == this && block->control_->object == block,
+                "block belongs to another pool");
+        return block->control_;
+    }
+
+    void OnLastRef(BlockControl* control) {
+        _assert(control != nullptr && control->owner == this, "control belongs to another pool");
+        _assert(control->strong_count == 0, "OnLastRef requires zero strong_count");
+        pushToFree(control->object);
+    }
+
+    BlockControl* lookupCachedControl(const std::string& block_hash_with_group) const {
+        if (!enable_caching_) {
+            return nullptr;
+        }
+        auto it = cached_hash_to_controls_.find(block_hash_with_group);
+        if (it == cached_hash_to_controls_.end() || it->second.empty()) {
+            return nullptr;
+        }
+        return it->second.front();
+    }
+
     // std::list gives the O(1) stored-iterator erase a prefix cache needs; a vector/deque stack cannot.
     void pushToFree(CacheBlock* block) {
+        _assert(block != nullptr && !block->is_null_, "only real blocks enter the free list");
+        _assert(block->control_->strong_count == 0, "only unowned blocks enter the free list");
+        _assert(!block->in_free_, "block is already in the free list");
         block->free_pos_ = free_.insert(free_.end(), block);
         block->in_free_ = true;
     }
 
     CacheBlock* popFromFree() {
         CacheBlock* block = free_.front();
+        _assert(block->in_free_ && block->control_->strong_count == 0, "free-list block invariant violated");
         free_.pop_front();
         block->in_free_ = false;
         return block;
@@ -221,11 +221,11 @@ private:
     }
 
     void evictCachedBlock(CacheBlock* block) {
-        auto it = cached_hash_to_blocks_.find(block->block_hash_);
-        if (it != cached_hash_to_blocks_.end()) {
-            std::erase(it->second, block);
+        auto it = cached_hash_to_controls_.find(block->block_hash_);
+        if (it != cached_hash_to_controls_.end()) {
+            std::erase(it->second, ControlFor(block));
             if (it->second.empty()) {
-                cached_hash_to_blocks_.erase(it);
+                cached_hash_to_controls_.erase(it);
             }
         }
         block->ResetHash();
@@ -234,11 +234,12 @@ private:
     std::int32_t total_num_blocks_{0};
     bool enable_caching_{true};
     std::vector<CacheBlock> blocks_{};
+    std::vector<BlockControl> controls_{};
     // LRU-ordered: front = next to evict.
     std::list<CacheBlock*> free_{};
 
     // One key may map to several physical duplicates: never de-duplicated so handed-out block ids stay stable.
-    std::unordered_map<std::string, std::vector<CacheBlock*>> cached_hash_to_blocks_{};
+    std::unordered_map<std::string, std::vector<BlockControl*>> cached_hash_to_controls_{};
     CacheBlock* null_block_{nullptr};
 };
 

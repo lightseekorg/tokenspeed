@@ -119,9 +119,9 @@ TEST(ForwardCacheOpsPrefill, FirstChunkClaimsHitThenAcquiresOnlyRemainder) {
         EXPECT_EQ(r2[1].Blocks()[i]->BlockId(), r1_swa_ids[i]) << "swa slot " << i;
     }
 
-    // Claiming pulls cached ref==0 blocks off the free list, so
-    // delta = (4 claimed + 2 acquired) * 2 groups = 12.
-    EXPECT_EQ(free_before - pool.NumFreeBlocks(), 12);
+    // Match already pinned the 4 prefix pages/group before free_before; claim
+    // only transfers those refs. This operation allocates 2 new pages/group.
+    EXPECT_EQ(free_before - pool.NumFreeBlocks(), 4);
 }
 
 TEST(ForwardCacheOpsPrefill, ChunkAcquiresAndCachesFullBlocks) {
@@ -175,7 +175,7 @@ TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowAndKeepsPunchedPageHashes) {
     EXPECT_EQ(pool.NumFreeBlocks(), free_before_chunk + 2 - 4);
 
     for (const std::string& h : {hashes[0], hashes[1]}) {
-        EXPECT_NE(pool.GetCachedBlock(MakeKeyWithGroupId(h, /*group_id=*/1)), nullptr)
+        EXPECT_TRUE(pool.ContainsCachedBlock(MakeKeyWithGroupId(h, /*group_id=*/1)))
             << "slid-out page must keep its registered hash";
     }
 }

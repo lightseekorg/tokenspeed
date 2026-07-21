@@ -39,6 +39,15 @@
 namespace tokenspeed::test {
 namespace {
 
+std::vector<CacheBlock*> RawBlocks(const std::vector<BlockRef>& refs) {
+    std::vector<CacheBlock*> blocks;
+    blocks.reserve(refs.size());
+    for (const BlockRef& ref : refs) {
+        blocks.push_back(ref.get());
+    }
+    return blocks;
+}
+
 using token_span = std::span<const std::int32_t>;
 
 std::vector<std::string> ContentHashes(const std::vector<std::vector<std::int32_t>>& pages) {
@@ -53,10 +62,11 @@ std::vector<std::string> ContentHashes(const std::vector<std::vector<std::int32_
 // Cache then free, so the block is prefix-hittable via MatchPrefix.
 CacheBlock* CacheForGroup(BlockPool& pool, const std::string& content_hash, std::uint32_t group_id) {
     std::string key = MakeKeyWithGroupId(content_hash, group_id);
-    std::vector<CacheBlock*> got = pool.AllocateBlocks(1);
-    pool.CacheFullBlock(got.front(), key);
-    pool.FreeBlocks(got);
-    return got.front();
+    BlockRef got = pool.AcquireBlock();
+    CacheBlock* raw = got.get();
+    pool.CacheFullBlock(raw, key);
+    got.reset();
+    return raw;
 }
 
 // Asserts no null hole inside the last min(len, pages_needed) blocks.
@@ -311,11 +321,11 @@ TEST(CoordinatorStepTest, CacheFullBlocksAtSlotOffsetExtendsPrefix) {
     ASSERT_EQ(m.per_group.size(), 2u);
     ASSERT_EQ(m.per_group[0].blocks.size(), 6u);
     for (std::size_t s = 0; s < 6; ++s) {
-        EXPECT_EQ(m.per_group[0].blocks[s], tables[0].Blocks()[s]) << "slot " << s;
+        EXPECT_EQ(m.per_group[0].blocks[s].get(), tables[0].Blocks()[s]) << "slot " << s;
     }
     // swa window 4 -> pages_needed 1: tail run maps to the offset-registered slot-5 block.
     ASSERT_EQ(m.per_group[1].blocks.size(), 6u);
-    EXPECT_EQ(m.per_group[1].blocks[5], tables[1].Blocks()[5]);
+    EXPECT_EQ(m.per_group[1].blocks[5].get(), tables[1].Blocks()[5]);
 }
 
 TEST(CoordinatorStepTest, CacheFullBlocksAtOffsetSkipsSwaHoles) {
@@ -337,12 +347,12 @@ TEST(CoordinatorStepTest, CacheFullBlocksAtOffsetSkipsSwaHoles) {
 
     coord.CacheFullBlocks(tables, std::span(ch).subspan(2), /*first_slot=*/2);
     for (std::size_t s = 2; s < 6; ++s) {
-        EXPECT_NE(pool.GetCachedBlock(MakeKeyWithGroupId(ch[s], 0)), nullptr) << "full slot " << s;
+        EXPECT_TRUE(pool.ContainsCachedBlock(MakeKeyWithGroupId(ch[s], 0))) << "full slot " << s;
     }
-    EXPECT_EQ(pool.GetCachedBlock(MakeKeyWithGroupId(ch[2], 1)), nullptr);
-    EXPECT_EQ(pool.GetCachedBlock(MakeKeyWithGroupId(ch[3], 1)), nullptr);
-    EXPECT_NE(pool.GetCachedBlock(MakeKeyWithGroupId(ch[4], 1)), nullptr);
-    EXPECT_NE(pool.GetCachedBlock(MakeKeyWithGroupId(ch[5], 1)), nullptr);
+    EXPECT_FALSE(pool.ContainsCachedBlock(MakeKeyWithGroupId(ch[2], 1)));
+    EXPECT_FALSE(pool.ContainsCachedBlock(MakeKeyWithGroupId(ch[3], 1)));
+    EXPECT_TRUE(pool.ContainsCachedBlock(MakeKeyWithGroupId(ch[4], 1)));
+    EXPECT_TRUE(pool.ContainsCachedBlock(MakeKeyWithGroupId(ch[5], 1)));
 }
 
 TEST(CoordinatorStepTest, CacheFullBlocksRejectsOutOfRangeFirstSlot) {
@@ -718,7 +728,7 @@ TEST(CoordinatorAllocTest, AcquireShortfallLeavesClaimedPrefixForCallerToFree) {
     ASSERT_EQ(hit.num_common_tokens, 4);
 
     std::vector<BlockTable> tables(2);
-    coord.ClaimCommonPrefix(tables, hit);  // claim 1 cached page each (2 blocks)
+    coord.ClaimCommonPrefix(tables, std::move(hit));  // transfer 1 cached page per group
     EXPECT_EQ(tables[0].NumBlocks(), 1);
     EXPECT_EQ(tables[1].NumBlocks(), 1);
 
@@ -837,7 +847,7 @@ TEST(KvCacheCoordinatorStoreCandidates, CollectsPinnedNewRegistrations) {
     ASSERT_EQ(pending.size(), 4u);  // 2 pages x 2 groups, group-wrapped keys
     EXPECT_EQ(pool.NumFreeBlocks(), free_before) << "pinning ref'd blocks must not touch the free list";
     for (const auto& c : pending) {
-        EXPECT_GE(c.block->RefCount(), 2) << "pinned on top of the table ref";
+        EXPECT_GE(c.block.use_count(), 2) << "pinned on top of the table ref";
     }
     // Keys are group-wrapped and distinct across groups for the same content hash.
     std::set<std::string> keys;
@@ -888,7 +898,7 @@ std::int32_t SlideCredit(const KvCacheCoordinator& coord, std::span<const BlockT
 
 // The exact slide-credit rule: collection-on credits a slide-out block only when it is CACHED
 // (an uncached one is this op's own registration and gets pinned before the slide); collection-off
-// keeps the RefCount()==1 rule so uncached same-round registrations still free.
+// keeps the unique-owner rule so uncached same-round registrations still free.
 TEST(KvCacheCoordinatorStoreCandidates, SlideCreditExcludesUncachedOnlyWhenCollecting) {
     BlockPool pool(16, true);
     std::vector<KvCacheSpec> specs{
@@ -918,10 +928,11 @@ TEST(KvCacheCoordinatorStoreCandidates, SlideCreditExcludesUncachedOnlyWhenColle
 // D2H write): allocate -> hash -> free leaves it cached-and-evictable, like a committed store.
 CacheBlock* HostPut(BlockPool& host_pool, const std::string& content_hash, std::uint32_t gid) {
     std::string key = MakeKeyWithGroupId(content_hash, gid);
-    CacheBlock* block = host_pool.AllocateBlocks(1).front();
-    host_pool.CacheFullBlock(block, key);
-    host_pool.FreeBlocks({block});
-    return block;
+    BlockRef block = host_pool.AcquireBlock();
+    CacheBlock* raw = block.get();
+    host_pool.CacheFullBlock(raw, key);
+    block.reset();
+    return raw;
 }
 
 // Cache slots [0, blocks) in the DEVICE pool for every group, so the merged MatchPrefix's
@@ -955,11 +966,11 @@ TEST(KvCacheCoordinatorHostExtension, BothGroupsFullyPresent) {
     CoordinatorMatch m = coord.MatchPrefix(ch).host;
     EXPECT_EQ(m.num_common_tokens, 8);  // boundary 4 blocks * P=2 (floor 1 + extension 3)
     ASSERT_EQ(m.per_group.size(), 2u);
-    EXPECT_EQ(m.per_group[0].blocks, (std::vector<CacheBlock*>{fp[0], fp[1], fp[2]}));
+    EXPECT_EQ(RawBlocks(m.per_group[0].blocks), (std::vector<CacheBlock*>{fp[0], fp[1], fp[2]}));
     // SWA tail at boundary 4 needs blocks [2, 4); extension slot for block 1 is a hole.
-    EXPECT_EQ(m.per_group[1].blocks, (std::vector<CacheBlock*>{host_pool.NullBlock(), sp[0], sp[1]}));
+    EXPECT_EQ(RawBlocks(m.per_group[1].blocks), (std::vector<CacheBlock*>{host_pool.NullBlock(), sp[0], sp[1]}));
     EXPECT_EQ(m.per_group[0].num_hit_blocks + m.per_group[1].num_hit_blocks, 5);
-    EXPECT_EQ(host_pool.NumPinnedCachedBlocks(), 0) << "matching is read-only; pins come with the load ticket";
+    EXPECT_EQ(host_pool.NumPinnedCachedBlocks(), 5);
 }
 
 TEST(KvCacheCoordinatorHostExtension, SwaTailMissShrinksBoundary) {
@@ -979,9 +990,9 @@ TEST(KvCacheCoordinatorHostExtension, SwaTailMissShrinksBoundary) {
     CoordinatorMatch m = coord.MatchPrefix(ch).host;
     EXPECT_EQ(m.num_common_tokens, 6);  // boundary 3 blocks * P=2 (floor 1 + extension 2)
     ASSERT_EQ(m.per_group.size(), 2u);
-    EXPECT_EQ(m.per_group[0].blocks, (std::vector<CacheBlock*>{fp[0], fp[1]}));
-    EXPECT_EQ(m.per_group[1].blocks, (std::vector<CacheBlock*>{sp[0], sp[1]}));
-    EXPECT_EQ(host_pool.NumPinnedCachedBlocks(), 0);
+    EXPECT_EQ(RawBlocks(m.per_group[0].blocks), (std::vector<CacheBlock*>{fp[0], fp[1]}));
+    EXPECT_EQ(RawBlocks(m.per_group[1].blocks), (std::vector<CacheBlock*>{sp[0], sp[1]}));
+    EXPECT_EQ(host_pool.NumPinnedCachedBlocks(), 4);
 }
 
 TEST(KvCacheCoordinatorHostExtension, FullGapCapsExtension) {
@@ -1002,8 +1013,8 @@ TEST(KvCacheCoordinatorHostExtension, FullGapCapsExtension) {
     CoordinatorMatch m = coord.MatchPrefix(ch).host;
     EXPECT_EQ(m.num_common_tokens, 4);  // boundary 2 blocks * P=2 (floor 1 + extension 1)
     ASSERT_EQ(m.per_group.size(), 2u);
-    EXPECT_EQ(m.per_group[0].blocks, (std::vector<CacheBlock*>{fp1}));
-    EXPECT_EQ(m.per_group[1].blocks, (std::vector<CacheBlock*>{sp[0]}));
+    EXPECT_EQ(RawBlocks(m.per_group[0].blocks), (std::vector<CacheBlock*>{fp1}));
+    EXPECT_EQ(RawBlocks(m.per_group[1].blocks), (std::vector<CacheBlock*>{sp[0]}));
 }
 
 TEST(KvCacheCoordinatorHostExtension, EmptyStoreZeroExtension) {
@@ -1039,10 +1050,10 @@ TEST(KvCacheCoordinatorHostExtension, DeviceBoundaryRespected) {
     EXPECT_EQ(m.num_common_tokens, 4) << "below-floor host pages extend nothing";
     // The below-dev entries were never probed: all four stay evictable.
     EXPECT_EQ(host_pool.NumPinnedCachedBlocks(), 0);
-    EXPECT_FALSE(host_pool.AllocateBlocks(1).empty());
+    EXPECT_TRUE(host_pool.AcquireBlock());
 }
 
-TEST(KvCacheCoordinatorHostExtension, MatchTakesNoRefsAndLeavesPagesEvictable) {
+TEST(KvCacheCoordinatorHostExtension, MatchPinsPagesUntilResultDies) {
     BlockPool pool(16, true);
     std::vector<KvCacheSpec> specs = HostExtSpecs();
     BlockPool host_pool(6);
@@ -1055,11 +1066,12 @@ TEST(KvCacheCoordinatorHostExtension, MatchTakesNoRefsAndLeavesPagesEvictable) {
     SeedDeviceFloor(pool, coord, ch, 1);
     CoordinatorMatch m = coord.MatchPrefix(ch).host;
     EXPECT_EQ(m.num_common_tokens, 8);
-    // Matching is read-only on both tiers: pins are taken only when the load ticket is built
-    // (safe because the sink drain -- the only host evictor -- runs after op building).
+    EXPECT_EQ(host_pool.NumPinnedCachedBlocks(), 5);
+    EXPECT_EQ(host_pool.NumFreeBlocks(), 0);
+    EXPECT_FALSE(host_pool.AcquireBlock()) << "matched pages must not be evicted before claim";
+    m = {};
     EXPECT_EQ(host_pool.NumPinnedCachedBlocks(), 0);
     EXPECT_EQ(host_pool.NumFreeBlocks(), 5);
-    EXPECT_FALSE(host_pool.AllocateBlocks(1).empty()) << "everything stays evictable";
 }
 
 TEST(KvCacheCoordinatorHostExtension, DeepCascadeConverges) {
@@ -1094,8 +1106,8 @@ TEST(KvCacheCoordinatorHostExtension, DeepCascadeConverges) {
         EXPECT_FALSE(m.per_group[i].blocks[0]->IsNull()) << "group " << i;
         EXPECT_FALSE(m.per_group[i].blocks[1]->IsNull()) << "group " << i;
     }
-    // The cascade's abandoned intermediate matches leave no refs behind.
-    EXPECT_EQ(host_pool.NumPinnedCachedBlocks(), 0);
+    // Abandoned intermediate matches release; only the final 2 pages/group stay pinned.
+    EXPECT_EQ(host_pool.NumPinnedCachedBlocks(), 6);
 }
 
 TEST(KvCacheCoordinatorHostExtension, MultiWindowGroupsExtendTogether) {
@@ -1120,10 +1132,10 @@ TEST(KvCacheCoordinatorHostExtension, MultiWindowGroupsExtendTogether) {
     CoordinatorMatch m = coord.MatchPrefix(ch).host;
     EXPECT_EQ(m.num_common_tokens, 10);  // boundary 5 blocks * P=2 (floor 1 + extension 4)
     ASSERT_EQ(m.per_group.size(), 3u);
-    EXPECT_EQ(m.per_group[0].blocks, (std::vector<CacheBlock*>{fp[0], fp[1], fp[2], fp[3]}));
+    EXPECT_EQ(RawBlocks(m.per_group[0].blocks), (std::vector<CacheBlock*>{fp[0], fp[1], fp[2], fp[3]}));
     CacheBlock* hole = host_pool.NullBlock();
-    EXPECT_EQ(m.per_group[1].blocks, (std::vector<CacheBlock*>{hole, ap[0], ap[1], ap[2]}));
-    EXPECT_EQ(m.per_group[2].blocks, (std::vector<CacheBlock*>{hole, hole, hole, bp4}));
+    EXPECT_EQ(RawBlocks(m.per_group[1].blocks), (std::vector<CacheBlock*>{hole, ap[0], ap[1], ap[2]}));
+    EXPECT_EQ(RawBlocks(m.per_group[2].blocks), (std::vector<CacheBlock*>{hole, hole, hole, bp4}));
     EXPECT_EQ(m.per_group[0].num_hit_blocks + m.per_group[1].num_hit_blocks + m.per_group[2].num_hit_blocks,
               8);  // 4 full + 3 W=6 + 1 W=2
 }
@@ -1257,8 +1269,8 @@ TEST(MambaAnalogTest, HostTierStoresAndMatchesTheSnapshotOnly) {
     SeedDeviceFloor(pool, coord, ch, 1);
     CoordinatorMatch m = coord.MatchPrefix(ch).host;
     EXPECT_EQ(m.num_common_tokens, 16);  // boundary 4 blocks * P=4 (floor 1 + extension 3)
-    EXPECT_EQ(m.per_group[0].blocks, (std::vector<CacheBlock*>{fp[0], fp[1], fp[2]}));
-    EXPECT_EQ(m.per_group[1].blocks,
+    EXPECT_EQ(RawBlocks(m.per_group[0].blocks), (std::vector<CacheBlock*>{fp[0], fp[1], fp[2]}));
+    EXPECT_EQ(RawBlocks(m.per_group[1].blocks),
               (std::vector<CacheBlock*>{host_pool.NullBlock(), host_pool.NullBlock(), snapshot}));
     EXPECT_EQ(m.per_group[0].num_hit_blocks + m.per_group[1].num_hit_blocks, 4);
 }
@@ -1311,11 +1323,11 @@ TEST(MambaStateRegistrationTest, AlignedEndRegistersOnlyFinalPage) {
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}});
     coord.CacheFullBlocks(tables, ch, /*first_slot=*/0, /*end_tokens=*/12);
     // full group: all 3 registered; state group: only page 2 (the aligned chunk end)
-    EXPECT_NE(pool.GetCachedBlock(MakeKeyWithGroupId(ch[0], 0)), nullptr);
-    EXPECT_NE(pool.GetCachedBlock(MakeKeyWithGroupId(ch[2], 0)), nullptr);
-    EXPECT_EQ(pool.GetCachedBlock(MakeKeyWithGroupId(ch[0], 1)), nullptr);
-    EXPECT_EQ(pool.GetCachedBlock(MakeKeyWithGroupId(ch[1], 1)), nullptr);
-    EXPECT_NE(pool.GetCachedBlock(MakeKeyWithGroupId(ch[2], 1)), nullptr);
+    EXPECT_TRUE(pool.ContainsCachedBlock(MakeKeyWithGroupId(ch[0], 0)));
+    EXPECT_TRUE(pool.ContainsCachedBlock(MakeKeyWithGroupId(ch[2], 0)));
+    EXPECT_FALSE(pool.ContainsCachedBlock(MakeKeyWithGroupId(ch[0], 1)));
+    EXPECT_FALSE(pool.ContainsCachedBlock(MakeKeyWithGroupId(ch[1], 1)));
+    EXPECT_TRUE(pool.ContainsCachedBlock(MakeKeyWithGroupId(ch[2], 1)));
     coord.Free(tables);
 }
 
@@ -1327,8 +1339,8 @@ TEST(MambaStateRegistrationTest, UnalignedEndRegistersNoStatePages) {
     ASSERT_TRUE(coord.Acquire(tables, /*num_tokens=*/14));  // 3 full pages + partial tail
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}});
     coord.CacheFullBlocks(tables, ch, /*first_slot=*/0, /*end_tokens=*/14);  // 14 % 4 != 0
-    EXPECT_NE(pool.GetCachedBlock(MakeKeyWithGroupId(ch[2], 0)), nullptr);   // full group unaffected
-    EXPECT_EQ(pool.GetCachedBlock(MakeKeyWithGroupId(ch[2], 1)), nullptr);   // state group skipped
+    EXPECT_TRUE(pool.ContainsCachedBlock(MakeKeyWithGroupId(ch[2], 0)));     // full group unaffected
+    EXPECT_FALSE(pool.ContainsCachedBlock(MakeKeyWithGroupId(ch[2], 1)));    // state group skipped
     coord.Free(tables);
 }
 
@@ -1458,8 +1470,8 @@ TEST(HeteroFoldedRegistrationTest, EachGroupRegistersAtOwnGranularityThenHits) {
 
     // group0: 4 base coarse blocks; group1: 2 folded coarse blocks.
     std::vector<std::string> folded_g1 = FoldBaseHashes(ch, 0, 2);
-    for (const std::string& h : ch) EXPECT_NE(pool.GetCachedBlock(MakeKeyWithGroupId(h, 0)), nullptr);
-    for (const std::string& h : folded_g1) EXPECT_NE(pool.GetCachedBlock(MakeKeyWithGroupId(h, 1)), nullptr);
+    for (const std::string& h : ch) EXPECT_TRUE(pool.ContainsCachedBlock(MakeKeyWithGroupId(h, 0)));
+    for (const std::string& h : folded_g1) EXPECT_TRUE(pool.ContainsCachedBlock(MakeKeyWithGroupId(h, 1)));
 
     CoordinatorMatch m = coord.MatchPrefix(ch).device;
     EXPECT_EQ(m.num_common_tokens, 16);
@@ -1485,10 +1497,10 @@ TEST(HeteroFoldedRegistrationTest, MambaGroupRegistersOnlyFinalFoldedBlock) {
 
     std::vector<std::string> folded_g1 = FoldBaseHashes(ch, 0, 2);
     ASSERT_EQ(folded_g1.size(), 2u);
-    EXPECT_EQ(pool.GetCachedBlock(MakeKeyWithGroupId(folded_g1[0], 1)), nullptr);  // interior: skipped
-    EXPECT_NE(pool.GetCachedBlock(MakeKeyWithGroupId(folded_g1[1], 1)), nullptr);  // aligned end: registered
+    EXPECT_FALSE(pool.ContainsCachedBlock(MakeKeyWithGroupId(folded_g1[0], 1)));  // interior: skipped
+    EXPECT_TRUE(pool.ContainsCachedBlock(MakeKeyWithGroupId(folded_g1[1], 1)));   // aligned end: registered
     // full group unaffected: all 4 base blocks registered.
-    for (const std::string& h : ch) EXPECT_NE(pool.GetCachedBlock(MakeKeyWithGroupId(h, 0)), nullptr);
+    for (const std::string& h : ch) EXPECT_TRUE(pool.ContainsCachedBlock(MakeKeyWithGroupId(h, 0)));
     coord.Free(tables);
 }
 

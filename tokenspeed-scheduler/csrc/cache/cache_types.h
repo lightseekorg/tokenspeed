@@ -45,28 +45,26 @@ struct KvCacheSpec {
 class BlockTable {
 public:
     // Read-only view of the pages as CacheBlock*; refcounts stay sealed inside BlockRef.
-    using BlockView = std::ranges::transform_view<std::span<const BlockRef>, decltype(&BlockRef::Get)>;
+    using BlockView = std::ranges::transform_view<std::span<const BlockRef>, decltype(&BlockRef::get)>;
 
-    BlockView Blocks() const { return BlockView{std::span{blocks_}, &BlockRef::Get}; }
+    BlockView Blocks() const { return BlockView{std::span{blocks_}, &BlockRef::get}; }
+    const BlockRef& RefAt(std::int32_t index) const { return blocks_[static_cast<std::size_t>(index)]; }
     std::int32_t NumBlocks() const { return static_cast<std::int32_t>(blocks_.size()); }
     std::int32_t TailAvailableTokens() const { return tail_avail_; }
 
     // Replace slot `index` with a null hole (slot alignment kept) and return the
-    // displaced block for the caller to free; nullptr if already a hole.
-    CacheBlock* EvictToNull(std::int32_t index, CacheBlock* null_block) {
+    // displaced ownership; empty if already a hole.
+    BlockRef EvictToNull(std::int32_t index, BlockRef null_ref) {
         _assert(0 <= index && index < static_cast<std::int32_t>(blocks_.size()), "EvictToNull index out of range");
         BlockRef& slot = blocks_[static_cast<std::size_t>(index)];
-        CacheBlock* old = slot.Get();
+        CacheBlock* old = slot.get();
         _assert(old != nullptr, "EvictToNull on a moved-out slot");
-        if (old == null_block) {
-            return nullptr;
+        if (old->IsNull()) {
+            return {};
         }
-        // Order is load-bearing: surrender the displaced ref BEFORE the move-assign,
-        // or the assignment would double-decrement it.
-        BlockRef hole = BlockRef::Share(*slot.pool_, null_block);
-        slot.Release();
-        slot = std::move(hole);
-        return old;
+        BlockRef displaced = std::move(slot);
+        slot = std::move(null_ref);
+        return displaced;
     }
 
 private:
@@ -89,8 +87,14 @@ inline std::vector<std::int32_t> BlockTablePageIds(const BlockTable& table) {
 // blocks maps logical page -> physical page, unmatched / out-of-window slots as null_block
 // holes; num_hit_blocks counts only the real cached pages (holes excluded).
 struct PrefixMatch {
-    std::vector<CacheBlock*> blocks{};
+    std::vector<BlockRef> blocks{};
     std::int32_t num_hit_blocks{0};
+};
+
+// Pinned source/destination pages for one asynchronous cache transfer.
+struct BlockTransfer {
+    BlockRef source;
+    BlockRef destination;
 };
 
 }  // namespace tokenspeed

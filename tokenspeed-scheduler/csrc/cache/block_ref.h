@@ -20,66 +20,51 @@
 
 #pragma once
 
-#include <utility>
-
-#include "cache/block_pool.h"
+#include <cstdint>
 
 namespace tokenspeed {
 
-// Move-only RAII reference to one CacheBlock. Adopt takes over an already-counted ref (Acquire's);
-// Share claims a new one (TouchBlock; null blocks are held but never counted). The destructor
-// releases; Release() surrenders the block so batch sites keep one ordered pool FreeBlocks call.
+class BlockPool;
+class CacheBlock;
+class BlockTable;
+
+// Stable control block owned by BlockPool. The scheduler is the sole writer, so
+// the count deliberately stays non-atomic.
+struct BlockControl {
+    BlockPool* owner{nullptr};
+    CacheBlock* object{nullptr};
+    std::uint32_t strong_count{0};
+};
+
+// Shared owning handle to one pool-owned CacheBlock. Like std::shared_ptr,
+// copying shares ownership, moving transfers it, and the last reset/destructor
+// returns the block to its pool. The CacheBlock object itself is never deleted,
+// and every handle must be destroyed before its owning BlockPool.
 class BlockRef {
 public:
     BlockRef() = default;
+    BlockRef(const BlockRef& other);
+    BlockRef& operator=(const BlockRef& other);
+    BlockRef(BlockRef&& other) noexcept;
+    BlockRef& operator=(BlockRef&& other) noexcept;
+    ~BlockRef();
 
-    static BlockRef Adopt(BlockPool& pool, CacheBlock* block) { return BlockRef{&pool, block}; }
+    CacheBlock* get() const;
+    CacheBlock* operator->() const { return get(); }
+    explicit operator bool() const { return control_ != nullptr; }
 
-    static BlockRef Share(BlockPool& pool, CacheBlock* block) {
-        pool.TouchBlock(block);
-        return BlockRef{&pool, block};
-    }
-
-    BlockRef(BlockRef&& other) noexcept
-        : pool_{std::exchange(other.pool_, nullptr)}, block_{std::exchange(other.block_, nullptr)} {}
-
-    BlockRef& operator=(BlockRef&& other) noexcept {
-        if (this != &other) {
-            reset();
-            pool_ = std::exchange(other.pool_, nullptr);
-            block_ = std::exchange(other.block_, nullptr);
-        }
-        return *this;
-    }
-
-    BlockRef(const BlockRef&) = delete;
-    BlockRef& operator=(const BlockRef&) = delete;
-
-    ~BlockRef() { reset(); }
-
-    CacheBlock* Get() const { return block_; }
-    CacheBlock* operator->() const { return block_; }
-
-    CacheBlock* Release() {
-        pool_ = nullptr;
-        return std::exchange(block_, nullptr);
-    }
+    std::uint32_t use_count() const;
+    bool unique() const { return use_count() == 1; }
+    void reset();
 
 private:
+    friend class BlockPool;
     friend class BlockTable;
 
-    BlockRef(BlockPool* pool, CacheBlock* block) : pool_{pool}, block_{block} {}
+    explicit BlockRef(BlockControl* control);
+    void Retain();
 
-    void reset() {
-        if (block_ != nullptr) {
-            pool_->FreeBlock(block_);
-        }
-        pool_ = nullptr;
-        block_ = nullptr;
-    }
-
-    BlockPool* pool_{nullptr};
-    CacheBlock* block_{nullptr};
+    BlockControl* control_{nullptr};
 };
 
 }  // namespace tokenspeed

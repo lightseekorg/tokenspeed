@@ -45,7 +45,7 @@ struct CoordinatorMatch {
 class KvCacheCoordinator {
 public:
     // The host tier is fixed at construction: bound, CacheFullBlocks feeds the sink mailbox.
-    KvCacheCoordinator(std::vector<CacheGroup> groups, BlockPool& pool, const BlockPool* host_pool = nullptr,
+    KvCacheCoordinator(std::vector<CacheGroup> groups, BlockPool& pool, BlockPool* host_pool = nullptr,
                        std::int32_t base_block_size = 0, std::int32_t lcm_block_size = 0);
 
     std::int32_t NumGroups() const { return static_cast<std::int32_t>(groups_.size()); }
@@ -58,22 +58,18 @@ public:
     const KvCacheManager& GroupManager(std::int32_t i) const { return groups_[static_cast<std::size_t>(i)].Manager(); }
 
     // The admission entry: the device match, plus the host-tier match above the device boundary when a
-    // host tier is bound. Read-only -- pinning happens at load-ticket build, before the sink drain evicts.
+    // host tier is bound. Every real hit is already pinned in the returned match.
     struct AdmissionMatch {
         CoordinatorMatch device;
         CoordinatorMatch host;
     };
-    AdmissionMatch MatchPrefix(std::span<const std::string> content_hashes) const;
+    AdmissionMatch MatchPrefix(std::span<const std::string> content_hashes);
 
     // Pure claim into fresh tables, never fails; a non-empty per_group must be sized to the group count.
-    void ClaimCommonPrefix(std::span<BlockTable> tables, const CoordinatorMatch& hit);
+    void ClaimCommonPrefix(std::span<BlockTable> tables, CoordinatorMatch hit);
 
     // Contract on the forward_cache_ops facade.
-    std::vector<std::pair<CacheBlock*, CacheBlock*>> LoadHostExtension(std::span<BlockTable> tables,
-                                                                       const CoordinatorMatch& host);
-
-    // Free-list blocks the claim will consume (TouchBlock pulls ref-0 cached hits); gates charge these too.
-    std::int32_t BlocksConsumedByClaim(const CoordinatorMatch& hit) const;
+    std::vector<BlockTransfer> LoadHostExtension(std::span<BlockTable> tables, CoordinatorMatch host);
 
     // All-or-nothing across all groups: on shortfall allocates NOTHING and returns false (no rollback needed).
     bool Acquire(std::span<BlockTable> tables, std::int32_t num_tokens);
@@ -94,7 +90,7 @@ public:
 
     struct StoreCandidate {
         std::string key;  // group-wrapped (MakeKeyWithGroupId), the host-tier index key
-        BlockRef block;   // pinned (Share) until WriteBackDone or a drain-time drop releases the ref
+        BlockRef block;   // pinned until WriteBackDone or a drain-time drop releases the ref
     };
     std::vector<StoreCandidate> TakePendingStores() { return std::exchange(pending_stores_, {}); }
     // Collection/pinning follows host-tier presence, so the slide credit flips count_uncached on this.
@@ -108,20 +104,19 @@ private:
     std::vector<std::string> keysForGroup(std::span<const std::string> content_hashes, std::uint32_t group_id,
                                           std::int32_t group_block_size, std::int32_t first_base = 0) const;
     std::vector<std::vector<std::string>> buildGroupKeys(std::span<const std::string> content_hashes) const;
-    CoordinatorMatch matchTierWithKeys(const BlockPool& pool, std::span<const std::vector<std::string>> group_keys,
+    CoordinatorMatch matchTierWithKeys(BlockPool& pool, std::span<const std::vector<std::string>> group_keys,
                                        std::int32_t num_base_pages, std::int32_t floor_tokens) const;
     std::vector<CacheGroup> groups_;
     // Closed groups first, so non-closed groups match against a settled bound.
     std::vector<std::size_t> match_order_;
     BlockPool& pool_;
-    const BlockPool* host_pool_{nullptr};
+    BlockPool* host_pool_{nullptr};
     std::int32_t base_block_size_{0};
     std::int32_t lcm_block_size_{0};
     std::vector<StoreCandidate> pending_stores_;
 };
 
 // One CacheGroup per spec (group_id = index); carries GCD/LCM of the per-group block_sizes.
-KvCacheCoordinator MakeCoordinator(std::span<const KvCacheSpec> specs, BlockPool& pool,
-                                   const BlockPool* host_pool = nullptr);
+KvCacheCoordinator MakeCoordinator(std::span<const KvCacheSpec> specs, BlockPool& pool, BlockPool* host_pool = nullptr);
 
 }  // namespace tokenspeed

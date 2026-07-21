@@ -125,16 +125,16 @@ private:
     std::optional<fsm::ScheduleRetractEvent> scheduleRetract(Request* request);
 
 #if TOKENSPEED_FLAT_KVCACHE
-    // One hash pass at admission: the device match, the read-only host-tier match above its
-    // boundary, and the extension's hash slice (registration form).
+    // One hash pass at admission: owning device/host matches plus the extension's
+    // hash slice (registration form).
     struct FlatAdmissionMatch {
         CoordinatorMatch device;
         CoordinatorMatch host;
         std::vector<std::string> ext_hashes;
     };
     FlatAdmissionMatch matchFlatPrefixAtAdmission(Request* request);
-    std::optional<std::int32_t> flatAdmitFirstChunk(Request* request, const CoordinatorMatch& hit,
-                                                    std::int32_t ext_real_pages, std::int32_t chunk_tokens,
+    std::optional<std::int32_t> flatAdmitFirstChunk(Request* request, std::int32_t ext_real_pages,
+                                                    std::int32_t chunk_tokens,
                                                     std::int32_t decode_reserve_tokens) const;
     std::optional<std::int32_t> flatAdmitPrefillChunk(Request* request, std::int32_t chunk_tokens,
                                                       std::int32_t decode_reserve_tokens,

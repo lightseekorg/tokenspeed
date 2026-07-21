@@ -41,17 +41,17 @@ public:
 
     bool MatchIsPrefixClosed() const override { return true; }
 
-    PrefixMatch Match(const BlockPool& pool, std::span<const std::string> keys, std::int32_t begin_blocks,
+    PrefixMatch Match(BlockPool& pool, std::span<const std::string> keys, std::int32_t begin_blocks,
                       std::int32_t max_blocks) const override {
         const std::int32_t end_blocks =
             static_cast<std::int32_t>(std::min(keys.size(), static_cast<std::size_t>(std::max(max_blocks, 0))));
         PrefixMatch match;
         for (std::int32_t j = begin_blocks; j < end_blocks; ++j) {
-            CacheBlock* block = pool.GetCachedBlock(keys[static_cast<std::size_t>(j)]);
-            if (block == nullptr) {
+            BlockRef block = pool.FindCachedBlock(keys[static_cast<std::size_t>(j)]);
+            if (!block) {
                 break;
             }
-            match.blocks.push_back(block);
+            match.blocks.push_back(std::move(block));
         }
         match.num_hit_blocks = static_cast<std::int32_t>(match.blocks.size());
         return match;

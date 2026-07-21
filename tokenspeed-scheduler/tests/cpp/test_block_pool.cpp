@@ -53,46 +53,43 @@ TEST(BlockPoolTest, ReservesNullBlockAndCountsFree) {
 
 // ---- allocate / free lifecycle -----------------------------------------
 
-TEST(BlockPoolTest, AllocateClaimsBlocksWithRefOne) {
+TEST(BlockPoolTest, AcquireReturnsOwningRefs) {
     BlockPool pool(8);
-    auto blocks = pool.AllocateBlocks(3);
+    auto blocks = pool.AcquireBlocks(3);
     ASSERT_EQ(blocks.size(), 3u);
-    for (CacheBlock* b : blocks) {
-        EXPECT_EQ(b->RefCount(), 1);
-        EXPECT_FALSE(b->IsNull());
+    for (const BlockRef& block : blocks) {
+        EXPECT_EQ(block.use_count(), 1);
+        EXPECT_FALSE(block->IsNull());
     }
     EXPECT_EQ(pool.NumFreeBlocks(), 4);  // 7 free - 3 claimed
 }
 
-TEST(BlockPoolTest, AllocateFailsWhenCapacityShort) {
+TEST(BlockPoolTest, AcquireFailsWhenCapacityShort) {
     BlockPool pool(4);  // 3 free after null reservation
-    auto blocks = pool.AllocateBlocks(4);
+    auto blocks = pool.AcquireBlocks(4);
     EXPECT_TRUE(blocks.empty());  // all-or-nothing
     EXPECT_EQ(pool.NumFreeBlocks(), 3);
 }
 
-TEST(BlockPoolTest, FreeReturnsBlocksToPool) {
+TEST(BlockPoolTest, ResetReturnsBlocksToPool) {
     BlockPool pool(8);
-    auto blocks = pool.AllocateBlocks(3);
+    auto blocks = pool.AcquireBlocks(3);
     EXPECT_EQ(pool.NumFreeBlocks(), 4);
-    pool.FreeBlocks(blocks);
-    EXPECT_EQ(pool.NumFreeBlocks(), 7);
-    for (CacheBlock* b : blocks) {
-        EXPECT_EQ(b->RefCount(), 0);
+    for (auto it = blocks.rbegin(); it != blocks.rend(); ++it) {
+        it->reset();
     }
+    EXPECT_EQ(pool.NumFreeBlocks(), 7);
 }
 
-TEST(BlockPoolTest, RefCountReachesZeroOnlyAfterAllRefsReleased) {
+TEST(BlockPoolTest, BlockReturnsOnlyAfterLastRefResets) {
     BlockPool pool(8);
-    auto blocks = pool.AllocateBlocks(1);
-    CacheBlock* b = blocks.front();
-    pool.TouchBlock(b);  // second reference
-    EXPECT_EQ(b->RefCount(), 2);
-    pool.FreeBlocks({b});
-    EXPECT_EQ(b->RefCount(), 1);  // still referenced -> not back in free queue
+    BlockRef first = pool.AcquireBlock();
+    BlockRef second = first;
+    EXPECT_EQ(first.use_count(), 2);
+    first.reset();
+    EXPECT_EQ(second.use_count(), 1);
     EXPECT_EQ(pool.NumFreeBlocks(), 6);
-    pool.FreeBlocks({b});
-    EXPECT_EQ(b->RefCount(), 0);
+    second.reset();
     EXPECT_EQ(pool.NumFreeBlocks(), 7);
 }
 
@@ -102,39 +99,37 @@ TEST(BlockPoolTest, CachedFreeBlockSurvivesAndIsReusable) {
     BlockPool pool(8);
     const std::string key = RealKey({1, 2, 3, 4}, 0);
 
-    auto blocks = pool.AllocateBlocks(1);
-    CacheBlock* b = blocks.front();
+    BlockRef block = pool.AcquireBlock();
+    CacheBlock* b = block.get();
     pool.CacheFullBlock(b, key);
     EXPECT_TRUE(b->IsCached());
 
-    pool.FreeBlocks({b});
-    EXPECT_EQ(b->RefCount(), 0);
+    block.reset();
     EXPECT_TRUE(b->IsCached());
     EXPECT_EQ(pool.NumCachedFreeBlocks(), 1);
 
-    CacheBlock* hit = pool.GetCachedBlock(key);
-    ASSERT_EQ(hit, b);
-
-    // TouchBlock revives it out of the free queue.
-    pool.TouchBlock(hit);
-    EXPECT_EQ(hit->RefCount(), 1);
+    BlockRef hit = pool.FindCachedBlock(key);
+    ASSERT_EQ(hit.get(), b);
+    EXPECT_EQ(hit.use_count(), 1);
     EXPECT_EQ(pool.NumFreeBlocks(), 6);
 }
 
 TEST(BlockPoolTest, MissReturnsNull) {
     BlockPool pool(8);
-    EXPECT_EQ(pool.GetCachedBlock(RealKey({9, 9}, 0)), nullptr);
+    EXPECT_FALSE(pool.FindCachedBlock(RealKey({9, 9}, 0)));
+    EXPECT_FALSE(pool.ContainsCachedBlock(RealKey({9, 9}, 0)));
 }
 
 TEST(BlockPoolTest, CachingDisabledNeverHits) {
     BlockPool pool(8, /*enable_caching=*/false);
     const std::string key = RealKey({1, 2, 3, 4}, 0);
 
-    auto blocks = pool.AllocateBlocks(1);
-    CacheBlock* b = blocks.front();
+    BlockRef block = pool.AcquireBlock();
+    CacheBlock* b = block.get();
     pool.CacheFullBlock(b, key);  // no-op when caching is disabled
     EXPECT_FALSE(b->IsCached());
-    EXPECT_EQ(pool.GetCachedBlock(key), nullptr);  // lookups always miss
+    EXPECT_FALSE(pool.FindCachedBlock(key));  // lookups always miss
+    EXPECT_FALSE(pool.ContainsCachedBlock(key));
 }
 
 TEST(BlockPoolTest, GroupIdDistinguishesSameContent) {
@@ -143,10 +138,10 @@ TEST(BlockPoolTest, GroupIdDistinguishesSameContent) {
     const std::string k1 = RealKey({1, 2, 3, 4}, 1);
     ASSERT_NE(k0, k1);  // same content, different group -> different key
 
-    auto a = pool.AllocateBlocks(1);
-    pool.CacheFullBlock(a.front(), k0);
-    EXPECT_EQ(pool.GetCachedBlock(k0), a.front());
-    EXPECT_EQ(pool.GetCachedBlock(k1), nullptr);  // group 1 not cached
+    BlockRef a = pool.AcquireBlock();
+    pool.CacheFullBlock(a.get(), k0);
+    EXPECT_TRUE(pool.ContainsCachedBlock(k0));
+    EXPECT_FALSE(pool.ContainsCachedBlock(k1));  // group 1 not cached
 }
 
 TEST(BlockPoolTest, EvictionDropsCachedContentWhenReused) {
@@ -154,38 +149,38 @@ TEST(BlockPoolTest, EvictionDropsCachedContentWhenReused) {
     BlockPool pool(2);
     const std::string key = RealKey({1, 2, 3, 4}, 0);
 
-    auto first = pool.AllocateBlocks(1);
-    CacheBlock* b = first.front();
+    BlockRef first = pool.AcquireBlock();
+    CacheBlock* b = first.get();
     pool.CacheFullBlock(b, key);
-    pool.FreeBlocks({b});  // cached + free
-    EXPECT_EQ(pool.GetCachedBlock(key), b);
+    first.reset();  // cached + free
+    EXPECT_TRUE(pool.ContainsCachedBlock(key));
 
-    auto second = pool.AllocateBlocks(1);
-    EXPECT_EQ(second.front(), b);  // same physical block reused
+    BlockRef second = pool.AcquireBlock();
+    EXPECT_EQ(second.get(), b);  // same physical block reused
     EXPECT_FALSE(b->IsCached());
-    EXPECT_EQ(pool.GetCachedBlock(key), nullptr);  // content gone from the map
+    EXPECT_FALSE(pool.ContainsCachedBlock(key));  // content gone from the map
 }
 
 // ---- LRU ordering -------------------------------------------------------
 
 TEST(BlockPoolTest, EvictionPrefersLeastRecentlyFreed) {
     BlockPool pool(4);  // 3 usable blocks
-    auto blocks = pool.AllocateBlocks(3);
-    CacheBlock* b0 = blocks[0];
-    CacheBlock* b1 = blocks[1];
-    CacheBlock* b2 = blocks[2];
+    auto blocks = pool.AcquireBlocks(3);
+    CacheBlock* b0 = blocks[0].get();
+    CacheBlock* b1 = blocks[1].get();
+    CacheBlock* b2 = blocks[2].get();
 
-    pool.FreeBlocks({b0});
-    pool.FreeBlocks({b1});
-    pool.FreeBlocks({b2});
+    blocks[0].reset();
+    blocks[1].reset();
+    blocks[2].reset();
 
-    auto next = pool.AllocateBlocks(1);
-    EXPECT_EQ(next.front(), b0);
+    BlockRef next = pool.AcquireBlock();
+    EXPECT_EQ(next.get(), b0);
 }
 
-TEST(BlockPoolTest, AllocateZeroBlocksReturnsEmpty) {
+TEST(BlockPoolTest, AcquireZeroBlocksReturnsEmpty) {
     BlockPool pool(4);
-    EXPECT_TRUE(pool.AllocateBlocks(0).empty());
+    EXPECT_TRUE(pool.AcquireBlocks(0).empty());
     EXPECT_EQ(pool.NumFreeBlocks(), 3);
 }
 
