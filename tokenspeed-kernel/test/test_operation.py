@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import importlib
 import inspect
 
 import pytest
@@ -339,3 +340,27 @@ def test_registered_traits_are_copied(operation_catalog) -> None:
     spec = KernelRegistry.get().get_by_name("immutable_traits")
     assert spec is not None
     assert "typo" not in spec.traits
+
+
+def test_contract_package_publishes_complete_catalog() -> None:
+    import tokenspeed_kernel.contracts as contracts
+    import tokenspeed_kernel.contracts.ops as ops_contracts
+
+    exports = {("attention", "mha_prefill"): "MHA_PREFILL"}
+    catalog = {schema.id: schema for schema in contracts.list_operation_schemas()}
+
+    assert catalog.keys() == exports.keys()
+    for (family, mode), export in exports.items():
+        family_contracts = importlib.import_module(
+            f"tokenspeed_kernel.contracts.ops.{family}"
+        )
+        mode_contract = importlib.import_module(
+            f"tokenspeed_kernel.contracts.ops.{family}.{mode}"
+        )
+        schema = getattr(contracts, export)
+
+        assert getattr(ops_contracts, export) is schema
+        assert getattr(family_contracts, export) is schema
+        assert getattr(mode_contract, export) is schema
+        assert catalog[(family, mode)] is schema
+        assert contracts.get_operation_schema(family, mode) is schema

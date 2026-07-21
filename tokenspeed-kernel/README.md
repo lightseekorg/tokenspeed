@@ -75,6 +75,7 @@ choices (still evolving; subject to change):
 ```
 tokenspeed_kernel/
   __init__.py            # Public API re-exports
+  contracts/ops/         # Family/mode schemas and semantic references
   platform.py            # PlatformInfo, capability detection
   signature.py           # TensorFormat, ScaleFormat, FormatSignature
   operation.py           # OperationSchema definitions and catalog

@@ -101,6 +101,20 @@ discover_plugins()
 print(list_plugins())  # -> [PluginInfo(name='my_plugin', ...)]
 ```
 
+Schema-backed operations expose their canonical callable signature through the
+contract catalog:
+
+```python
+from tokenspeed_kernel.contracts import get_operation_schema
+
+schema = get_operation_schema("attention", "mha_prefill")
+print(schema.signature)
+```
+
+Omitting an allowed trait from a registration means the kernel claims support
+for every requested value of that trait. Specialized kernels should declare
+their actual constraints.
+
 ## Host-application integration
 
 Engines and other long-running hosts should call `discover_plugins()`

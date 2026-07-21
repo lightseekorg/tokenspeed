@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import math
 
-# Backend registration (side-effect imports)
+import tokenspeed_kernel.contracts.ops.attention  # noqa: F401
+
+# Backend registration (side-effect imports, after contract publication)
 import tokenspeed_kernel.ops.attention.cuda  # noqa: F401
 import tokenspeed_kernel.ops.attention.deep_gemm  # noqa: F401
 import tokenspeed_kernel.ops.attention.flash_attn  # noqa: F401
