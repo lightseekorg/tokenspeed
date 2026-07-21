@@ -556,10 +556,12 @@ def attn_decode_fwd_paged_pipeline_peeled_kernel(
         logical_t_2 = start_k + t_2
         logical_t_3 = start_k + t_3
         page_idx_k_next = start_page + iter_id + 3
+        page_is_valid = (logical_t_3 < end_k) & (page_idx_k_next < PAGES_PER_BATCH)
         physical_page_k_next = gl.load(
-            block_table_ptr + off_z * PAGES_PER_BATCH + page_idx_k_next
+            block_table_ptr + off_z * PAGES_PER_BATCH + page_idx_k_next,
+            mask=page_is_valid,
+            other=0,
         )
-        physical_page_k_next = gl.where(logical_t_3 < end_k, physical_page_k_next, 0)
 
         qk = gl.zeros([BLOCK_M, BLOCK_N], dtype=gl.float32, layout=cfg.qk_layout)
         qk = gl.amd.gfx1250.wmma(q, k, qk)
