@@ -45,6 +45,7 @@ from tokenspeed.runtime.layers.parameter import (
 )
 from tokenspeed.runtime.layers.quantization import (
     Fp8Config,
+    ModelOptMixedConfig,
     Mxfp4Config,
     Nvfp4Config,
     W8A8Fp8Config,
@@ -188,6 +189,8 @@ class LinearBase(torch.nn.Module):
                 # remain unquantized unless the checkpoint stores dense MXFP4.
                 self.quant_method = UnquantizedLinearMethod()
         elif isinstance(quant_config, CompressedTensorsConfig):
+            self.quant_method = quant_config.get_quant_method(self, prefix)
+        elif isinstance(quant_config, ModelOptMixedConfig):
             self.quant_method = quant_config.get_quant_method(self, prefix)
         else:
             if isinstance(quant_config, Fp8Config):

@@ -72,17 +72,22 @@ attention layers automatically; select the dense backend with
 `--attention-backend` and run with `--disable-kvstore`.
 
 ```bash
-tokenspeed serve MiniMaxAI/MiniMax-M3-MXFP8 \
-  --trust-remote-code \
-  --tensor-parallel-size 4 \
-  --max-model-len 1048576 \
-  --max-total-tokens 1048576 \
-  --block-size 128 \
-  --attention-backend trtllm \
-  --moe-backend triton \
-  --disable-kvstore \
-  --host 0.0.0.0 \
-  --port 8000
+tokenspeed serve nvidia/MiniMax-M3-NVFP4 \
+    --tensor-parallel-size 4 \
+    --max-model-len 81920 \
+    --max-num-seqs 16 \
+    --max-prefill-tokens 8192 \
+    --chunked-prefill-size 8192 \
+    --gpu-memory-utilization 0.95 \
+    --disable-cuda-graph-padding \
+    --attention-backend trtllm \
+    --moe-backend flashinfer_trtllm \
+    --disable-prefill-graph \
+    --disable-kvstore \
+    --block-size 128 \
+    --trust-remote-code \
+    --host 0.0.0.0 \
+    --port 8000
 ```
 
 ## Kimi K2.5 / K2.6

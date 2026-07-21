@@ -581,6 +581,7 @@ class ModelConfig:
             "fp8",
             "nvfp4",
             "mxfp4",
+            "modelopt_mixed",
             "compressed_tensors",
             "compressed-tensors",
             "w8a8_fp8",

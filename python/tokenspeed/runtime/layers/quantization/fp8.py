@@ -122,5 +122,5 @@ class Mxfp8Config(Fp8Config):
             config["scale_fmt"] = "ue8m0"
         return super().from_config(config)
 
-    def moe_weight_dtype(self) -> str:
+    def moe_weight_dtype(self, prefix: str = "") -> str:
         return "fp8"
