@@ -27,7 +27,7 @@ def test_triton_mxfp8_1x32_raw_ue8m0_weight(device: str) -> None:
         out_dtype=torch.bfloat16,
         quant="mxfp8",
         block_size=[1, 32],
-        expected_kernel_name="triton_mm_fp8_blockscale",
+        override="triton_mm_fp8_blockscale",
     )
 
     scales = torch.exp2(b_scales.float() - 127.0).repeat_interleave(32, dim=1)
