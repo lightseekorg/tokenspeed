@@ -496,13 +496,16 @@ def attn_decode_fwd_paged_pipeline_peeled_kernel(
     qk_mask = (
         logical_k_0 + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, cfg.qk_layout))
     )[None, :] < end_k
+    tile_is_active = logical_k_0 < end_k
     qk = gl.where(qk_mask, qk, float("-inf"))
-    qk = gl.where(logical_k_0 < end_k, qk, 0.0)
+    qk = gl.where(tile_is_active, qk, 0.0)
     m_ij = gl.maximum(m_i, gl.max(qk, 1))
-    m_ij_scaled = m_ij * sm_scale_dot_rcp_ln2
+    m_ij = gl.where(tile_is_active, m_ij, m_i)
+    m_ij_scaled = gl.where(tile_is_active, m_ij, 0.0) * sm_scale_dot_rcp_ln2
     p = gl.exp2(sm_scale_dot_rcp_ln2 * qk - m_ij_scaled[:, None])
     p = gl.where(qk_mask, p, 0.0)
-    alpha = gl.exp2(sm_scale_dot_rcp_ln2 * m_i - m_ij_scaled)
+    m_i_for_alpha = gl.where(tile_is_active, m_i, 0.0)
+    alpha = gl.exp2(sm_scale_dot_rcp_ln2 * m_i_for_alpha - m_ij_scaled)
     m_i = m_ij
 
     tile_2: gl.constexpr = 2 * BLOCK_N
@@ -568,8 +571,9 @@ def attn_decode_fwd_paged_pipeline_peeled_kernel(
         qk_mask_loop = (
             qk_tile + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, cfg.qk_layout))
         )[None, :] < end_k
+        tile_is_active = qk_tile < end_k
         qk = gl.where(qk_mask_loop, qk, float("-inf"))
-        qk = gl.where(qk_tile < end_k, qk, 0.0)
+        qk = gl.where(tile_is_active, qk, 0.0)
 
         l_ij = gl.sum(p, 1)
         acc = acc * alpha[:, None]
@@ -597,10 +601,12 @@ def attn_decode_fwd_paged_pipeline_peeled_kernel(
         acc = gl.amd.gfx1250.wmma(p_dot, v, acc)
 
         m_ij = gl.maximum(m_i, gl.max(qk, 1))
-        m_ij_scaled = m_ij * sm_scale_dot_rcp_ln2
+        m_ij = gl.where(tile_is_active, m_ij, m_i)
+        m_ij_scaled = gl.where(tile_is_active, m_ij, 0.0) * sm_scale_dot_rcp_ln2
         p = gl.exp2(sm_scale_dot_rcp_ln2 * qk - m_ij_scaled[:, None])
         p = gl.where(qk_mask_loop, p, 0.0)
-        alpha = gl.exp2(sm_scale_dot_rcp_ln2 * m_i - m_ij_scaled)
+        m_i_for_alpha = gl.where(tile_is_active, m_i, 0.0)
+        alpha = gl.exp2(sm_scale_dot_rcp_ln2 * m_i_for_alpha - m_ij_scaled)
         m_i = m_ij
 
         gl.amd.gfx1250.tdm.async_wait(PEELED_HOT_WAIT_COUNT)
@@ -646,13 +652,16 @@ def attn_decode_fwd_paged_pipeline_peeled_kernel(
     qk_mask2 = (
         logical_t_2 + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, cfg.qk_layout))
     )[None, :] < end_k
+    tile_is_active2 = logical_t_2 < end_k
     qk = gl.where(qk_mask2, qk, float("-inf"))
-    qk = gl.where(logical_t_2 < end_k, qk, 0.0)
+    qk = gl.where(tile_is_active2, qk, 0.0)
     m_ij = gl.maximum(m_i, gl.max(qk, 1))
-    m_ij_scaled = m_ij * sm_scale_dot_rcp_ln2
+    m_ij = gl.where(tile_is_active2, m_ij, m_i)
+    m_ij_scaled = gl.where(tile_is_active2, m_ij, 0.0) * sm_scale_dot_rcp_ln2
     p = gl.exp2(sm_scale_dot_rcp_ln2 * qk - m_ij_scaled[:, None])
     p = gl.where(qk_mask2, p, 0.0)
-    alpha = gl.exp2(sm_scale_dot_rcp_ln2 * m_i - m_ij_scaled)
+    m_i_for_alpha = gl.where(tile_is_active2, m_i, 0.0)
+    alpha = gl.exp2(sm_scale_dot_rcp_ln2 * m_i_for_alpha - m_ij_scaled)
     m_i = m_ij
 
     gl.amd.gfx1250.tdm.async_wait(1)
@@ -677,8 +686,9 @@ def attn_decode_fwd_paged_pipeline_peeled_kernel(
     qk_mask3 = (
         logical_t_3 + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, cfg.qk_layout))
     )[None, :] < end_k
+    tile_is_active3 = logical_t_3 < end_k
     qk = gl.where(qk_mask3, qk, float("-inf"))
-    qk = gl.where(logical_t_3 < end_k, qk, 0.0)
+    qk = gl.where(tile_is_active3, qk, 0.0)
 
     l_ij = gl.sum(p, 1)
     acc = acc * alpha[:, None]
@@ -690,10 +700,12 @@ def attn_decode_fwd_paged_pipeline_peeled_kernel(
     acc = gl.amd.gfx1250.wmma(p_dot, v, acc)
 
     m_ij = gl.maximum(m_i, gl.max(qk, 1))
-    m_ij_scaled = m_ij * sm_scale_dot_rcp_ln2
+    m_ij = gl.where(tile_is_active3, m_ij, m_i)
+    m_ij_scaled = gl.where(tile_is_active3, m_ij, 0.0) * sm_scale_dot_rcp_ln2
     p = gl.exp2(sm_scale_dot_rcp_ln2 * qk - m_ij_scaled[:, None])
     p = gl.where(qk_mask3, p, 0.0)
-    alpha = gl.exp2(sm_scale_dot_rcp_ln2 * m_i - m_ij_scaled)
+    m_i_for_alpha = gl.where(tile_is_active3, m_i, 0.0)
+    alpha = gl.exp2(sm_scale_dot_rcp_ln2 * m_i_for_alpha - m_ij_scaled)
     m_i = m_ij
 
     l_ij = gl.sum(p, 1)

@@ -516,6 +516,66 @@ def test_mha_decode_with_kvcache_gluon_uneven_peeled_split(
     torch.testing.assert_close(out.cpu(), expected, rtol=3e-2, atol=3e-2)
 
 
+def test_mha_decode_with_kvcache_gluon_inactive_peeled_tiles(
+    device: str,
+    require,
+) -> None:
+    require(
+        "attention",
+        "mha_decode_with_kvcache",
+        "gluon",
+        torch.bfloat16,
+        "q",
+    )
+
+    batch_size = 1
+    num_q_heads = 8
+    num_kv_heads = 2
+    head_dim = 64
+    page_size = 64
+    num_pages = 9
+    max_seqlen_k = num_pages * page_size
+    cache_seqlen = page_size
+
+    q = torch.full(
+        (batch_size, num_q_heads, head_dim),
+        16.0,
+        dtype=torch.bfloat16,
+    )
+    k_cache = torch.full(
+        (num_pages, page_size, num_kv_heads, head_dim),
+        -16.0,
+        dtype=torch.bfloat16,
+    )
+    v_cache = torch.randn_like(k_cache)
+    page_table = torch.arange(num_pages, dtype=torch.int32).reshape(1, num_pages)
+    cache_seqlens = torch.tensor([cache_seqlen], dtype=torch.int32)
+
+    group_size = num_q_heads // num_kv_heads
+    k_ref = k_cache[0].repeat_interleave(group_size, dim=1)
+    v_ref = v_cache[0].repeat_interleave(group_size, dim=1)
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        q.unsqueeze(2),
+        k_ref.permute(1, 0, 2).unsqueeze(0),
+        v_ref.permute(1, 0, 2).unsqueeze(0),
+    ).squeeze(2)
+
+    out = mha_decode_with_kvcache(
+        q=q.to(device),
+        k_cache=k_cache.to(device),
+        v_cache=v_cache.to(device),
+        page_table=page_table.to(device),
+        cache_seqlens=cache_seqlens.to(device),
+        max_seqlen_k=max_seqlen_k,
+        max_seqlen_q=1,
+        solution="gluon",
+    )
+
+    assert out.shape == q.shape
+    assert not torch.isnan(out).any()
+    torch.testing.assert_close(out.cpu(), expected, rtol=3e-2, atol=3e-2)
+
+
 @pytest.mark.parametrize(
     "dtype,head_dim,num_heads",
     [(torch.bfloat16, 64, 8)],
