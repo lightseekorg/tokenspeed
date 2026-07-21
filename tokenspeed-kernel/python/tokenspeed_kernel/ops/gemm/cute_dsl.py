@@ -34,16 +34,15 @@ if platform.is_nvidia:
     import cutlass
     import cutlass.cute as cute
     import torch
-    from tokenspeed_kernel.thirdparty.cute_dsl.nvfp4_gemm_swiglu_nvfp4_quant import (
-        Sm100BlockScaledPersistentDenseGemmKernel,
-    )
-
     from flashinfer.cute_dsl.utils import (
         get_cutlass_dtype,
         get_max_active_clusters,
         make_ptr,
     )
     from flashinfer.utils import get_compute_capability
+    from tokenspeed_kernel.thirdparty.cute_dsl.nvfp4_gemm_swiglu_nvfp4_quant import (
+        Sm100BlockScaledPersistentDenseGemmKernel,
+    )
 
     _nvfp4_gemm_swiglu_nvfp4_quant_kernel_cache: dict[tuple, object] = {}
 
