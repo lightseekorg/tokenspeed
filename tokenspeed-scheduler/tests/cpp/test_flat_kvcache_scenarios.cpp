@@ -1842,7 +1842,7 @@ TEST(FlatSwaWindowBoundary, DecodeStepKeepsOldestInWindowPageAtPageBoundary) {
         /*hybrid_prefix_cache=*/nullptr, /*mamba_allocator=*/nullptr, /*mamba_loadback_nodes=*/{}, &coordinator});
     ASSERT_TRUE(request.Is<fsm::PrefillDone>());
 
-    const auto swa_slot_null = [&](std::int32_t i) { return request.FlatBlockTablesRef()[1].Blocks()[i]->IsNull(); };
+    const auto swa_slot_null = [&](std::int32_t i) { return !request.FlatBlockTablesRef()[1].Blocks()[i]; };
 
     // Size 5, decode transition (no slide): 3 pages.
     request.Apply(fsm::ExtendResultEvent{"r1", {100}});
@@ -1873,8 +1873,8 @@ TEST(FlatSwaWindowBoundary, DecodeStepKeepsOldestInWindowPageAtPageBoundary) {
     EXPECT_TRUE(swa_slot_null(1));
     EXPECT_FALSE(swa_slot_null(2));
 
-    for (CacheBlock* b : request.FlatBlockTablesRef()[0].Blocks()) {
-        EXPECT_FALSE(b->IsNull());
+    for (const BlockRef& block : request.FlatBlockTablesRef()[0].Blocks()) {
+        EXPECT_TRUE(block);
     }
 
     request.Apply(fsm::AbortEvent{&coordinator});

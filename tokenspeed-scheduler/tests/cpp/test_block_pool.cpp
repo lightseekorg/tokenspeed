@@ -30,6 +30,15 @@
 namespace tokenspeed::test {
 namespace {
 
+template <class T>
+concept HasNullBlock = requires(T& value) { value.NullBlock(); };
+
+template <class T>
+concept HasNullBlockRef = requires(T& value) { value.NullBlockRef(); };
+
+static_assert(!HasNullBlock<BlockPool>);
+static_assert(!HasNullBlockRef<BlockPool>);
+
 using token_span = std::span<const std::int32_t>;
 
 // A real key from page_hasher.h, not a synthetic placeholder.
@@ -39,19 +48,11 @@ std::string RealKey(const std::vector<std::int32_t>& tokens, uint32_t group_id) 
     return keys.front();
 }
 
-// ---- construction / null block -----------------------------------------
-
-TEST(BlockPoolTest, ReservesNullBlockAndCountsFree) {
+TEST(BlockPoolTest, ReservesPageIdZeroAndCountsFree) {
     BlockPool pool(8);
     EXPECT_EQ(pool.TotalBlocks(), 8);
-    // block 0 is reserved as the null placeholder, so 7 are free.
     EXPECT_EQ(pool.NumFreeBlocks(), 7);
-    ASSERT_NE(pool.NullBlock(), nullptr);
-    EXPECT_TRUE(pool.NullBlock()->IsNull());
-    EXPECT_EQ(pool.NullBlock()->BlockId(), 0);
 }
-
-// ---- allocate / free lifecycle -----------------------------------------
 
 TEST(BlockPoolTest, AcquireReturnsOwningRefs) {
     BlockPool pool(8);
@@ -59,7 +60,7 @@ TEST(BlockPoolTest, AcquireReturnsOwningRefs) {
     ASSERT_EQ(blocks.size(), 3u);
     for (const BlockRef& block : blocks) {
         EXPECT_EQ(block.use_count(), 1);
-        EXPECT_FALSE(block->IsNull());
+        EXPECT_TRUE(block);
     }
     EXPECT_EQ(pool.NumFreeBlocks(), 4);  // 7 free - 3 claimed
 }
@@ -81,7 +82,7 @@ TEST(BlockPoolTest, ResetReturnsBlocksToPool) {
     EXPECT_EQ(pool.NumFreeBlocks(), 7);
 }
 
-TEST(BlockPoolTest, BlockReturnsOnlyAfterLastRefResets) {
+TEST(BlockPoolTest, BlockReturnsWhenOwnerCountReachesZero) {
     BlockPool pool(8);
     BlockRef first = pool.AcquireBlock();
     BlockRef second = first;
@@ -93,25 +94,53 @@ TEST(BlockPoolTest, BlockReturnsOnlyAfterLastRefResets) {
     EXPECT_EQ(pool.NumFreeBlocks(), 7);
 }
 
-// ---- prefix caching: the three-state lifecycle -------------------------
-
 TEST(BlockPoolTest, CachedFreeBlockSurvivesAndIsReusable) {
     BlockPool pool(8);
     const std::string key = RealKey({1, 2, 3, 4}, 0);
 
     BlockRef block = pool.AcquireBlock();
-    CacheBlock* b = block.get();
+    const std::int32_t block_id = block->BlockId();
     pool.CacheFullBlock(block, key);
-    EXPECT_TRUE(b->IsCached());
+    EXPECT_TRUE(block->IsCached());
 
     block.reset();
-    EXPECT_TRUE(b->IsCached());
     EXPECT_EQ(pool.NumCachedFreeBlocks(), 1);
 
     BlockRef hit = pool.FindCachedBlock(key);
-    ASSERT_EQ(hit.get(), b);
+    ASSERT_EQ(hit->BlockId(), block_id);
+    EXPECT_TRUE(hit->IsCached());
     EXPECT_EQ(hit.use_count(), 1);
     EXPECT_EQ(pool.NumFreeBlocks(), 6);
+}
+
+TEST(BlockPoolTest, ActiveCachedBlockCanBeShared) {
+    BlockPool pool(4);
+    const std::string key = RealKey({1, 2, 3, 4}, 0);
+    BlockRef first = pool.AcquireBlock();
+    pool.CacheFullBlock(first, key);
+
+    BlockRef second = pool.FindCachedBlock(key);
+
+    EXPECT_EQ(second, first);
+    EXPECT_EQ(first.use_count(), 2);
+    EXPECT_EQ(pool.NumFreeBlocks(), 2);
+}
+
+TEST(BlockPoolTest, DuplicateHashesKeepDistinctBlocksIndexed) {
+    BlockPool pool(3);
+    const std::string key = RealKey({1, 2, 3, 4}, 0);
+    BlockRef first = pool.AcquireBlock();
+    BlockRef second = pool.AcquireBlock();
+    const std::int32_t first_id = first->BlockId();
+    pool.CacheFullBlock(first, key);
+    pool.CacheFullBlock(second, key);
+    first.reset();
+    second.reset();
+
+    EXPECT_EQ(pool.NumCachedBlocks(), 2);
+    BlockRef hit = pool.FindCachedBlock(key);
+    EXPECT_EQ(hit->BlockId(), first_id);
+    EXPECT_EQ(pool.NumCachedBlocks(), 2);
 }
 
 TEST(BlockPoolTest, MissReturnsNull) {
@@ -125,9 +154,8 @@ TEST(BlockPoolTest, CachingDisabledNeverHits) {
     const std::string key = RealKey({1, 2, 3, 4}, 0);
 
     BlockRef block = pool.AcquireBlock();
-    CacheBlock* b = block.get();
     pool.CacheFullBlock(block, key);  // no-op when caching is disabled
-    EXPECT_FALSE(b->IsCached());
+    EXPECT_FALSE(block->IsCached());
     EXPECT_FALSE(pool.FindCachedBlock(key));  // lookups always miss
     EXPECT_FALSE(pool.ContainsCachedBlock(key));
 }
@@ -150,15 +178,30 @@ TEST(BlockPoolTest, EvictionDropsCachedContentWhenReused) {
     const std::string key = RealKey({1, 2, 3, 4}, 0);
 
     BlockRef first = pool.AcquireBlock();
-    CacheBlock* b = first.get();
+    const std::int32_t block_id = first->BlockId();
     pool.CacheFullBlock(first, key);
     first.reset();  // cached + free
     EXPECT_TRUE(pool.ContainsCachedBlock(key));
 
     BlockRef second = pool.AcquireBlock();
-    EXPECT_EQ(second.get(), b);  // same physical block reused
-    EXPECT_FALSE(b->IsCached());
+    EXPECT_EQ(second->BlockId(), block_id);  // same physical block reused
+    EXPECT_FALSE(second->IsCached());
     EXPECT_FALSE(pool.ContainsCachedBlock(key));  // content gone from the map
+}
+
+TEST(BlockPoolTest, BatchAcquireDropsCachedContentWhenReused) {
+    BlockPool pool(3);
+    const std::string key = RealKey({1, 2, 3, 4}, 0);
+
+    BlockRef cached = pool.AcquireBlock();
+    pool.CacheFullBlock(cached, key);
+    cached.reset();
+    ASSERT_TRUE(pool.ContainsCachedBlock(key));
+
+    std::vector<BlockRef> blocks = pool.AcquireBlocks(2);
+
+    ASSERT_EQ(blocks.size(), 2u);
+    EXPECT_FALSE(pool.ContainsCachedBlock(key));
 }
 
 TEST(BlockPoolTest, CacheFullBlockRejectsEmptyOrForeignReference) {
@@ -166,26 +209,25 @@ TEST(BlockPoolTest, CacheFullBlockRejectsEmptyOrForeignReference) {
     BlockPool other_pool(8);
     const std::string key = RealKey({1, 2, 3, 4}, 0);
     BlockRef foreign = other_pool.AcquireBlock();
+    BlockRef local = pool.AcquireBlock();
 
     EXPECT_THROW(pool.CacheFullBlock(BlockRef{}, key), std::runtime_error);
     EXPECT_THROW(pool.CacheFullBlock(foreign, key), std::runtime_error);
+    EXPECT_THROW(pool.CacheFullBlock(local, ""), std::runtime_error);
+    EXPECT_FALSE(local->IsCached());
 }
-
-// ---- LRU ordering -------------------------------------------------------
 
 TEST(BlockPoolTest, EvictionPrefersLeastRecentlyFreed) {
     BlockPool pool(4);  // 3 usable blocks
     auto blocks = pool.AcquireBlocks(3);
-    CacheBlock* b0 = blocks[0].get();
-    CacheBlock* b1 = blocks[1].get();
-    CacheBlock* b2 = blocks[2].get();
+    const std::int32_t first_id = blocks[0]->BlockId();
 
     blocks[0].reset();
     blocks[1].reset();
     blocks[2].reset();
 
     BlockRef next = pool.AcquireBlock();
-    EXPECT_EQ(next.get(), b0);
+    EXPECT_EQ(next->BlockId(), first_id);
 }
 
 TEST(BlockPoolTest, AcquireZeroBlocksReturnsEmpty) {

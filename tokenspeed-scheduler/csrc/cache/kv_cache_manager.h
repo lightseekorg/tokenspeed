@@ -50,8 +50,7 @@ public:
     virtual bool MatchIsPrefixClosed() const = 0;
 
     // One matcher for every tier: scan `pool` over slots [begin_blocks, max_blocks) of the FULL
-    // key sequence. Hits are pinned before return; blocks are relative to
-    // begin_blocks, holes = pool.NullBlockRef().
+    // key sequence. Hits are pinned before return; blocks are relative to begin_blocks.
     virtual PrefixMatch Match(BlockPool& pool, std::span<const std::string> keys, std::int32_t begin_blocks,
                               std::int32_t max_blocks) const = 0;
 
@@ -59,7 +58,7 @@ public:
     void ClaimHitBlocks(BlockTable& table, PrefixMatch&& hit) {
         _assert(table.blocks_.empty(), "ClaimHitBlocks requires a fresh (empty) table");
         for (const BlockRef& block : hit.blocks) {
-            _assert(block->IsNull() || block->IsCached(), "matched block lost its hash before the claim");
+            _assert(!block || block->IsCached(), "matched block lost its hash before the claim");
         }
         table.blocks_ = std::move(hit.blocks);
     }
@@ -92,8 +91,8 @@ public:
                              std::vector<BlockTransfer>& load_pairs) {
         _assert(table.tail_avail_ == 0, "host extension must append on a full-page boundary");
         for (BlockRef& host_block : host_blocks) {
-            if (host_block->IsNull()) {
-                table.blocks_.push_back(pool.NullBlockRef());
+            if (!host_block) {
+                table.blocks_.emplace_back();
                 continue;
             }
             const bool acquired = Acquire(pool, table, block_size_);
@@ -125,11 +124,10 @@ public:
             "hash range exceeds table size");
         for (std::size_t j = 0; j < block_hashes.size(); ++j) {
             const BlockRef& block_ref = table.blocks_[static_cast<std::size_t>(first_slot) + j];
-            CacheBlock* block = block_ref.get();
-            if (block->IsNull()) {
+            if (!block_ref) {
                 continue;
             }
-            if (block->IsCached()) {
+            if (block_ref->IsCached()) {
                 continue;
             }
             pool.CacheFullBlock(block_ref, block_hashes[j]);

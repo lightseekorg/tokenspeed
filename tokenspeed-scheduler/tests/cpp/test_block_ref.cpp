@@ -30,9 +30,15 @@
 namespace tokenspeed::test {
 namespace {
 
+template <class T>
+concept HasGet = requires(const T& value) { value.get(); };
+
+static_assert(!HasGet<BlockRef>);
 static_assert(sizeof(BlockRef) == sizeof(void*));
 static_assert(std::is_copy_constructible_v<BlockRef>);
 static_assert(std::is_copy_assignable_v<BlockRef>);
+static_assert(std::is_nothrow_move_constructible_v<BlockRef>);
+static_assert(std::is_same_v<decltype(std::declval<const BlockRef&>().operator->()), const CacheBlock*>);
 
 TEST(BlockRefTest, AcquireReturnsUniqueOwningHandle) {
     BlockPool pool(/*total_num_blocks=*/4);
@@ -40,8 +46,8 @@ TEST(BlockRefTest, AcquireReturnsUniqueOwningHandle) {
 
     BlockRef ref = pool.AcquireBlock();
 
-    ASSERT_NE(ref.get(), nullptr);
-    EXPECT_FALSE(ref->IsNull());
+    ASSERT_TRUE(ref);
+    EXPECT_TRUE(ref);
     EXPECT_EQ(ref.use_count(), 1);
     EXPECT_TRUE(ref.unique());
     EXPECT_EQ(pool.NumFreeBlocks(), free_before - 1);
@@ -51,17 +57,18 @@ TEST(BlockRefTest, CopySharesControlAndLastOwnerReturnsBlock) {
     BlockPool pool(4);
     const std::int32_t free_before = pool.NumFreeBlocks();
     BlockRef first = pool.AcquireBlock();
-    CacheBlock* raw = first.get();
+    const std::int32_t block_id = first->BlockId();
 
     {
         BlockRef second = first;
-        EXPECT_EQ(second.get(), raw);
+        EXPECT_EQ(second, first);
+        EXPECT_EQ(second->BlockId(), block_id);
         EXPECT_EQ(first.use_count(), 2);
         EXPECT_EQ(second.use_count(), 2);
         EXPECT_FALSE(first.unique());
 
         first.reset();
-        EXPECT_EQ(first.get(), nullptr);
+        EXPECT_FALSE(first);
         EXPECT_EQ(second.use_count(), 1);
         EXPECT_EQ(pool.NumFreeBlocks(), free_before - 1);
     }
@@ -74,11 +81,12 @@ TEST(BlockRefTest, CopyAssignmentReleasesPreviousBlock) {
     const std::int32_t free_before = pool.NumFreeBlocks();
     BlockRef first = pool.AcquireBlock();
     BlockRef second = pool.AcquireBlock();
-    CacheBlock* first_raw = first.get();
+    const std::int32_t first_id = first->BlockId();
 
     second = first;
 
-    EXPECT_EQ(second.get(), first_raw);
+    EXPECT_EQ(second, first);
+    EXPECT_EQ(second->BlockId(), first_id);
     EXPECT_EQ(first.use_count(), 2);
     EXPECT_EQ(pool.NumFreeBlocks(), free_before - 1);
 }
@@ -86,12 +94,12 @@ TEST(BlockRefTest, CopyAssignmentReleasesPreviousBlock) {
 TEST(BlockRefTest, MoveTransfersWithoutChangingCount) {
     BlockPool pool(4);
     BlockRef source = pool.AcquireBlock();
-    CacheBlock* raw = source.get();
+    const std::int32_t block_id = source->BlockId();
 
     BlockRef target = std::move(source);
 
-    EXPECT_EQ(source.get(), nullptr);
-    EXPECT_EQ(target.get(), raw);
+    EXPECT_FALSE(source);
+    EXPECT_EQ(target->BlockId(), block_id);
     EXPECT_EQ(target.use_count(), 1);
 }
 
@@ -100,31 +108,57 @@ TEST(BlockRefTest, MoveAssignmentReleasesPreviousBlock) {
     const std::int32_t free_before = pool.NumFreeBlocks();
     BlockRef holder = pool.AcquireBlock();
     BlockRef incoming = pool.AcquireBlock();
-    CacheBlock* incoming_raw = incoming.get();
+    const std::int32_t incoming_id = incoming->BlockId();
 
     holder = std::move(incoming);
 
-    EXPECT_EQ(holder.get(), incoming_raw);
-    EXPECT_EQ(incoming.get(), nullptr);
+    EXPECT_EQ(holder->BlockId(), incoming_id);
+    EXPECT_FALSE(incoming);
     EXPECT_EQ(holder.use_count(), 1);
     EXPECT_EQ(pool.NumFreeBlocks(), free_before - 1);
 }
 
-TEST(BlockRefTest, NullBlockRefIsTruthyButUncounted) {
+TEST(BlockRefTest, EmptyRefHasSharedPtrNullSemantics) {
     BlockPool pool(4);
     const std::int32_t free_before = pool.NumFreeBlocks();
 
-    BlockRef first = pool.NullBlockRef();
+    BlockRef first;
     BlockRef second = first;
 
-    ASSERT_TRUE(first);
-    ASSERT_TRUE(second);
-    EXPECT_TRUE(first->IsNull());
+    EXPECT_FALSE(first);
+    EXPECT_FALSE(second);
     EXPECT_EQ(first.use_count(), 0);
     EXPECT_FALSE(first.unique());
     first.reset();
     second.reset();
     EXPECT_EQ(pool.NumFreeBlocks(), free_before);
+}
+
+TEST(BlockRefTest, SwapExchangesOwnershipWithoutChangingCounts) {
+    BlockPool pool(4);
+    BlockRef first = pool.AcquireBlock();
+    BlockRef second = pool.AcquireBlock();
+    const std::int32_t first_id = first->BlockId();
+    const std::int32_t second_id = second->BlockId();
+
+    swap(first, second);
+
+    EXPECT_EQ(first->BlockId(), second_id);
+    EXPECT_EQ(second->BlockId(), first_id);
+    EXPECT_EQ(first.use_count(), 1);
+    EXPECT_EQ(second.use_count(), 1);
+}
+
+TEST(BlockRefTest, SelfAssignmentKeepsOwnership) {
+    BlockPool pool(4);
+    BlockRef ref = pool.AcquireBlock();
+    const std::int32_t block_id = ref->BlockId();
+
+    ref = ref;
+    ref = std::move(ref);
+
+    EXPECT_EQ(ref->BlockId(), block_id);
+    EXPECT_EQ(ref.use_count(), 1);
 }
 
 TEST(BlockRefTest, VectorCopiesKeepBlockPinnedUntilLastCopyDies) {

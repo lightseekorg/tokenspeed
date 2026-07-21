@@ -20,25 +20,74 @@
 
 #include "cache/block_ref.h"
 
+#include <exception>
 #include <utility>
 
-#include "cache/block_pool.h"
 #include "utils.h"
 
 namespace tokenspeed {
 
-BlockRef::BlockRef(BlockControl* control) : control_{control} {
-    Retain();
+void CacheBlock::SetHash(std::string hash) {
+    _assert(block_hash_.empty(), "block already has a hash");
+    block_hash_ = std::move(hash);
 }
 
-BlockRef::BlockRef(const BlockRef& other) : control_{other.control_} {
-    Retain();
+namespace detail {
+
+BlockControl::BlockControl(std::int32_t block_id, BlockPool& owner_pool, ReturnToPoolHandler return_to_pool) noexcept
+    : object_{block_id}, owner_pool_{&owner_pool}, return_to_pool_{return_to_pool} {
+    if (return_to_pool_ == nullptr) {
+        std::terminate();
+    }
 }
 
-BlockRef& BlockRef::operator=(const BlockRef& other) {
+void BlockControl::Retain() noexcept {
+    if (owner_pool_ == nullptr || (strong_count_ == 0 && in_free_list_)) {
+        std::terminate();
+    }
+    ++strong_count_;
+}
+
+void BlockControl::Release() noexcept {
+    if (strong_count_ == 0 || in_free_list_) {
+        std::terminate();
+    }
+    --strong_count_;
+    if (strong_count_ == 0) {
+        return_to_pool_(*owner_pool_, *this);
+    }
+}
+
+void BlockControl::MarkFree() noexcept {
+    if (in_free_list_ || strong_count_ != 0) {
+        std::terminate();
+    }
+    in_free_list_ = true;
+}
+
+void BlockControl::MarkInUse() noexcept {
+    if (!in_free_list_ || strong_count_ != 0) {
+        std::terminate();
+    }
+    in_free_list_ = false;
+}
+
+}  // namespace detail
+
+BlockRef::BlockRef(detail::BlockControl& control) noexcept : control_{&control} {
+    control_->Retain();
+}
+
+BlockRef::BlockRef(const BlockRef& other) noexcept : control_{other.control_} {
+    if (control_ != nullptr) {
+        control_->Retain();
+    }
+}
+
+BlockRef& BlockRef::operator=(const BlockRef& other) noexcept {
     if (this != &other) {
         BlockRef copy{other};
-        std::swap(control_, copy.control_);
+        swap(copy);
     }
     return *this;
 }
@@ -53,42 +102,35 @@ BlockRef& BlockRef::operator=(BlockRef&& other) noexcept {
     return *this;
 }
 
-BlockRef::~BlockRef() {
+BlockRef::~BlockRef() noexcept {
     reset();
 }
 
-CacheBlock* BlockRef::get() const {
-    return control_ == nullptr ? nullptr : control_->object_;
+const CacheBlock* BlockRef::operator->() const noexcept {
+    return control_ == nullptr ? nullptr : &control_->Object();
 }
 
-std::uint32_t BlockRef::use_count() const {
-    return control_ == nullptr ? 0 : control_->strong_count_;
+const CacheBlock& BlockRef::operator*() const noexcept {
+    return control_->Object();
 }
 
-void BlockRef::reset() {
-    BlockControl* control = std::exchange(control_, nullptr);
-    if (control == nullptr || control->object_->IsNull()) {
-        return;
-    }
-    _assert(control->strong_count_ > 0, "BlockRef strong_count underflow");
-    --control->strong_count_;
-    if (control->strong_count_ == 0) {
-        control->owner_->OnLastRef(control);
+std::uint32_t BlockRef::use_count() const noexcept {
+    return control_ == nullptr ? 0 : control_->UseCount();
+}
+
+bool BlockRef::IsOwnedBy(const BlockPool& pool) const noexcept {
+    return control_ != nullptr && control_->IsOwnedBy(pool);
+}
+
+void BlockRef::reset() noexcept {
+    detail::BlockControl* control = std::exchange(control_, nullptr);
+    if (control != nullptr) {
+        control->Release();
     }
 }
 
-bool BlockRef::SharesPoolWith(const BlockRef& other) const {
-    return control_ != nullptr && other.control_ != nullptr && control_->owner_ == other.control_->owner_;
-}
-
-void BlockRef::Retain() {
-    if (control_ == nullptr) {
-        return;
-    }
-    _assert(control_->owner_ != nullptr && control_->object_ != nullptr, "BlockRef requires a valid control");
-    if (!control_->object_->IsNull()) {
-        ++control_->strong_count_;
-    }
+void BlockRef::swap(BlockRef& other) noexcept {
+    std::swap(control_, other.control_);
 }
 
 }  // namespace tokenspeed

@@ -55,18 +55,17 @@ public:
         }
         // W == 1: no lookback, so every boundary is resumable with no cached page at all.
         if (pagesNeededToResume() == 0) {
-            match.blocks.assign(static_cast<std::size_t>(end_blocks - begin_blocks), pool.NullBlockRef());
+            match.blocks.resize(static_cast<std::size_t>(end_blocks - begin_blocks));
             return match;
         }
-        std::vector<BlockRef> probed(static_cast<std::size_t>(end_blocks), pool.NullBlockRef());
+        std::vector<BlockRef> probed(static_cast<std::size_t>(end_blocks));
         const auto [boundary, hits_begin] = findResumableBoundary(
             [&](std::int32_t i) {
                 BlockRef block = pool.FindCachedBlock(keys[static_cast<std::size_t>(i)]);
                 if (block) {
                     probed[static_cast<std::size_t>(i)] = std::move(block);
                 }
-                return static_cast<bool>(probed[static_cast<std::size_t>(i)]) &&
-                       !probed[static_cast<std::size_t>(i)]->IsNull();
+                return static_cast<bool>(probed[static_cast<std::size_t>(i)]);
             },
             begin_blocks, end_blocks);
         if (boundary == begin_blocks) {
@@ -78,11 +77,11 @@ public:
     }
 
     // Punches null holes so the table never shrinks (keeps slot alignment); reverse-collect evicts FIFO.
-    void ReclaimExpired(BlockPool& pool, BlockTable& table, std::int32_t num_computed_tokens) override {
+    void ReclaimExpired(BlockPool& /*pool*/, BlockTable& table, std::int32_t num_computed_tokens) override {
         std::int32_t skipped_blocks = fullySlidOutBlocks(table, num_computed_tokens);
         std::vector<BlockRef> freed;
         for (std::int32_t i = skipped_blocks - 1; i >= 0; --i) {
-            BlockRef old = table.EvictToNull(i, pool.NullBlockRef());
+            BlockRef old = table.EvictToNull(i);
             if (!old) {
                 break;  // already null -> earlier slots are null too
             }
@@ -99,11 +98,11 @@ public:
         std::int32_t skipped_blocks = fullySlidOutBlocks(table, num_computed_tokens);
         std::int32_t freed = 0;
         for (std::int32_t i = skipped_blocks - 1; i >= 0; --i) {
-            CacheBlock* block = table.Blocks()[i];
-            if (block->IsNull()) {
+            const BlockRef& block = table.Blocks()[static_cast<std::size_t>(i)];
+            if (!block) {
                 break;  // already null -> earlier slots are null too
             }
-            if (table.RefAt(i).unique() && (count_uncached || block->IsCached())) {
+            if (block.unique() && (count_uncached || block->IsCached())) {
                 ++freed;
             }
         }

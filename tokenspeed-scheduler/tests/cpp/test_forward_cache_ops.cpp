@@ -138,8 +138,8 @@ TEST(ForwardCacheOpsPrefill, ChunkAcquiresAndCachesFullBlocks) {
     ASSERT_TRUE(PrefillChunk(coordinator, tables, hashes2, /*num_tokens=*/4, /*num_computed_tokens=*/4));
     EXPECT_EQ(tables[0].NumBlocks(), 4);
     EXPECT_EQ(tables[1].NumBlocks(), 4);
-    for (CacheBlock* b : tables[1].Blocks()) {
-        EXPECT_FALSE(b->IsNull()) << "num_computed=4, W=4: no page is fully out of window yet";
+    for (const BlockRef& block : tables[1].Blocks()) {
+        EXPECT_TRUE(block) << "num_computed=4, W=4: no page is fully out of window yet";
     }
 }
 
@@ -162,14 +162,14 @@ TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowAndKeepsPunchedPageHashes) {
     ASSERT_TRUE(PrefillChunk(coordinator, tables, hashes, /*num_tokens=*/4, /*num_computed_tokens=*/8));
 
     EXPECT_EQ(tables[0].NumBlocks(), 6);
-    for (CacheBlock* b : tables[0].Blocks()) {
-        EXPECT_FALSE(b->IsNull());
+    for (const BlockRef& block : tables[0].Blocks()) {
+        EXPECT_TRUE(block);
     }
     ASSERT_EQ(tables[1].NumBlocks(), 6);
-    EXPECT_TRUE(tables[1].Blocks()[0]->IsNull());
-    EXPECT_TRUE(tables[1].Blocks()[1]->IsNull());
+    EXPECT_FALSE(tables[1].Blocks()[0]);
+    EXPECT_FALSE(tables[1].Blocks()[1]);
     for (std::int32_t i = 2; i < 6; ++i) {
-        EXPECT_FALSE(tables[1].Blocks()[i]->IsNull()) << "slot " << i;
+        EXPECT_TRUE(tables[1].Blocks()[i]) << "slot " << i;
     }
 
     // Pool: the slide freed 2 SWA pages, the acquire took 2/group = 4 -> net -2.
@@ -202,10 +202,10 @@ TEST(ForwardCacheOpsPrefill, FinalizeSlidesSwaWindowBeforeReserveAcquire) {
 
     ASSERT_EQ(tables[1].NumBlocks(), 7);
     for (std::int32_t i = 0; i < 4; ++i) {
-        EXPECT_TRUE(tables[1].Blocks()[i]->IsNull()) << "slot " << i;
+        EXPECT_FALSE(tables[1].Blocks()[i]) << "slot " << i;
     }
     for (std::int32_t i = 4; i < 7; ++i) {
-        EXPECT_FALSE(tables[1].Blocks()[i]->IsNull()) << "slot " << i;
+        EXPECT_TRUE(tables[1].Blocks()[i]) << "slot " << i;
     }
     EXPECT_EQ(tables[0].NumBlocks(), 7);
     // Pool: slide freed 4, reserve acquire took 1/group = 2 -> net +2.
@@ -226,13 +226,13 @@ TEST(ForwardCacheOpsDecode, StepAcquiresAndSlidesSwaWindow) {
     // 13 tokens -> ceil(13/2) = 7 pages.
     EXPECT_EQ(tables[0].NumBlocks(), 7);
     std::int32_t full_nulls = 0;
-    for (auto* b : tables[0].Blocks()) {
-        if (b == pool.NullBlock()) ++full_nulls;
+    for (const BlockRef& block : tables[0].Blocks()) {
+        if (!block) ++full_nulls;
     }
     EXPECT_EQ(full_nulls, 0);
     std::int32_t swa_active = 0;
-    for (auto* b : tables[1].Blocks()) {
-        if (b != pool.NullBlock()) ++swa_active;
+    for (const BlockRef& block : tables[1].Blocks()) {
+        if (block) ++swa_active;
     }
     EXPECT_LE(swa_active, 3);
 }
@@ -352,14 +352,8 @@ TEST(ForwardCacheOpsBuildFlatBlockTables, TwoGroupsRowsAndIds) {
         EXPECT_GT(id, 0);
     }
     // Rows match the source span verbatim: no compaction, null hole = 0 in its slot.
-    std::vector<std::int32_t> expected_full;
-    for (auto* b : tables[0].Blocks()) {
-        expected_full.push_back(b->IsNull() ? 0 : b->BlockId());
-    }
-    std::vector<std::int32_t> expected_swa;
-    for (auto* b : tables[1].Blocks()) {
-        expected_swa.push_back(b->IsNull() ? 0 : b->BlockId());
-    }
+    const std::vector<std::int32_t> expected_full = BlockTablePageIds(tables[0]);
+    const std::vector<std::int32_t> expected_swa = BlockTablePageIds(tables[1]);
     EXPECT_EQ(built.at("full"), expected_full);
     EXPECT_EQ(built.at("swa"), expected_swa);
 }
@@ -382,10 +376,7 @@ TEST(ForwardCacheOpsBuildFlatBlockTables, SwaRowGetsNullHoleAfterAdvance) {
     }
     const auto& swa = built.at("swa");
     EXPECT_NE(std::find(swa.begin(), swa.end(), 0), swa.end());
-    std::vector<std::int32_t> expected_swa;
-    for (auto* b : tables[1].Blocks()) {
-        expected_swa.push_back(b->IsNull() ? 0 : b->BlockId());
-    }
+    const std::vector<std::int32_t> expected_swa = BlockTablePageIds(tables[1]);
     EXPECT_EQ(swa, expected_swa);
 }
 
@@ -415,10 +406,7 @@ TEST(ForwardCacheOpsBuildFlatBlockTables, SingleGroupRowMatchesSource) {
     auto built = BuildFlatBlockTables(tables, group_ids);
 
     ASSERT_EQ(built.size(), 1u);
-    std::vector<std::int32_t> expected;
-    for (auto* b : tables[0].Blocks()) {
-        expected.push_back(b->IsNull() ? 0 : b->BlockId());
-    }
+    const std::vector<std::int32_t> expected = BlockTablePageIds(tables[0]);
     EXPECT_EQ(built.at("only"), expected);
     // Sanity: keyed by the supplied group_id, not a bare index.
     EXPECT_EQ(built.count("0"), 0u);
@@ -436,10 +424,7 @@ TEST(ForwardCacheOpsBuildFlatBlockTables, KeyMatchesSuppliedGroupIdStrings) {
     ASSERT_EQ(built.size(), 2u);
     EXPECT_TRUE(built.count("alpha"));
     EXPECT_TRUE(built.count("beta"));
-    std::vector<std::int32_t> expected_alpha;
-    for (auto* b : tables[0].Blocks()) {
-        expected_alpha.push_back(b->IsNull() ? 0 : b->BlockId());
-    }
+    const std::vector<std::int32_t> expected_alpha = BlockTablePageIds(tables[0]);
     EXPECT_EQ(built.at("alpha"), expected_alpha);
 }
 

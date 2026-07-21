@@ -21,60 +21,97 @@
 #pragma once
 
 #include <cstdint>
+#include <list>
+#include <string>
 
 namespace tokenspeed {
 
 class BlockPool;
-class CacheBlock;
-class BlockTable;
 
-// Stable control block owned by BlockPool. The scheduler is the sole writer, so
-// the count deliberately stays non-atomic. Only BlockPool and BlockRef may
-// mutate its ownership state.
+class CacheBlock {
+public:
+    explicit CacheBlock(std::int32_t block_id) : block_id_{block_id} {}
+
+    std::int32_t BlockId() const noexcept { return block_id_; }
+    bool IsCached() const noexcept { return !block_hash_.empty(); }
+    const std::string& BlockHash() const noexcept { return block_hash_; }
+
+    void SetHash(std::string hash);
+    void ResetHash() noexcept { block_hash_.clear(); }
+
+private:
+    std::int32_t block_id_{0};
+    std::string block_hash_{};
+};
+
+namespace detail {
+
 class BlockControl {
 public:
-    BlockControl() = default;
+    using ControlList = std::list<BlockControl*>;
+    using ListPosition = ControlList::iterator;
+    using ReturnToPoolHandler = void (*)(BlockPool&, BlockControl&) noexcept;
+
+    BlockControl(std::int32_t block_id, BlockPool& owner_pool, ReturnToPoolHandler return_to_pool) noexcept;
+    BlockControl(const BlockControl&) = delete;
+    BlockControl& operator=(const BlockControl&) = delete;
+    BlockControl(BlockControl&&) noexcept = default;
+    BlockControl& operator=(BlockControl&&) noexcept = default;
+
+    void Retain() noexcept;
+    void Release() noexcept;
+    std::uint32_t UseCount() const noexcept { return strong_count_; }
+
+    CacheBlock& Object() noexcept { return object_; }
+    const CacheBlock& Object() const noexcept { return object_; }
+    bool IsOwnedBy(const BlockPool& pool) const noexcept { return owner_pool_ == &pool; }
+
+    bool InFreeList() const noexcept { return in_free_list_; }
+    ListPosition Position() const noexcept { return position_; }
+    void SetPosition(ListPosition position) noexcept { position_ = position; }
+    void MarkFree() noexcept;
+    void MarkInUse() noexcept;
 
 private:
-    friend class BlockPool;
-    friend class BlockRef;
-
-    BlockPool* owner_{nullptr};
-    CacheBlock* object_{nullptr};
+    CacheBlock object_;
+    BlockPool* owner_pool_{nullptr};
+    ReturnToPoolHandler return_to_pool_{nullptr};
     std::uint32_t strong_count_{0};
+    bool in_free_list_{false};
+    ListPosition position_{};
 };
 
-// Pool-scoped shared owning handle to one CacheBlock. Copying shares ownership,
-// moving transfers it, and the last real-block reset/destructor returns the
-// block to its pool. CacheBlock and BlockControl remain pool-owned, so every
-// BlockRef must be destroyed before its BlockPool. A null-block reference is
-// truthy but uncounted; use_count()/unique() are meaningful only for real blocks.
+}  // namespace detail
+
+// Pool-scoped shared owner. Its BlockPool must outlive every non-empty copy.
 class BlockRef {
 public:
-    BlockRef() = default;
-    BlockRef(const BlockRef& other);
-    BlockRef& operator=(const BlockRef& other);
+    BlockRef() noexcept = default;
+    explicit BlockRef(detail::BlockControl& control) noexcept;
+    BlockRef(const BlockRef& other) noexcept;
+    BlockRef& operator=(const BlockRef& other) noexcept;
     BlockRef(BlockRef&& other) noexcept;
     BlockRef& operator=(BlockRef&& other) noexcept;
-    ~BlockRef();
+    ~BlockRef() noexcept;
 
-    CacheBlock* get() const;
-    CacheBlock* operator->() const { return get(); }
-    explicit operator bool() const { return control_ != nullptr; }
+    const CacheBlock* operator->() const noexcept;
+    const CacheBlock& operator*() const noexcept;
+    explicit operator bool() const noexcept { return control_ != nullptr; }
 
-    std::uint32_t use_count() const;
-    bool unique() const { return use_count() == 1; }
-    void reset();
+    std::uint32_t use_count() const noexcept;
+    bool unique() const noexcept { return use_count() == 1; }
+    bool IsOwnedBy(const BlockPool& pool) const noexcept;
+    void reset() noexcept;
+    void swap(BlockRef& other) noexcept;
+
+    bool operator==(const BlockRef&) const noexcept = default;
 
 private:
-    friend class BlockPool;
-    friend class BlockTable;
-
-    explicit BlockRef(BlockControl* control);
-    bool SharesPoolWith(const BlockRef& other) const;
-    void Retain();
-
-    BlockControl* control_{nullptr};
+    detail::BlockControl* control_{nullptr};
 };
+
+inline void swap(BlockRef& lhs, BlockRef& rhs) noexcept {
+    lhs.swap(rhs);
+}
 
 }  // namespace tokenspeed

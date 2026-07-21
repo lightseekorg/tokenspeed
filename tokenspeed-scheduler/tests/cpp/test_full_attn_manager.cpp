@@ -75,10 +75,10 @@ TEST(FullAttnManagerTest, MatchStopsAtFirstMiss) {
     const std::string k2 = RealKey({9, 9, 9, 9}, 0);
 
     BlockRef a = pool.AcquireBlock();
-    CacheBlock* a_raw = a.get();
+    const std::int32_t a_id = a->BlockId();
     pool.CacheFullBlock(a, k0);
     BlockRef b = pool.AcquireBlock();
-    CacheBlock* b_raw = b.get();
+    const std::int32_t b_id = b->BlockId();
     pool.CacheFullBlock(b, k1);
     a.reset();
     b.reset();
@@ -87,8 +87,8 @@ TEST(FullAttnManagerTest, MatchStopsAtFirstMiss) {
     PrefixMatch m = mgr.Match(pool, keys, 0, 3);
     EXPECT_EQ(m.num_hit_blocks, 2);
     ASSERT_EQ(m.blocks.size(), 2u);
-    EXPECT_EQ(m.blocks[0]->BlockId(), a_raw->BlockId());
-    EXPECT_EQ(m.blocks[1]->BlockId(), b_raw->BlockId());
+    EXPECT_EQ(m.blocks[0]->BlockId(), a_id);
+    EXPECT_EQ(m.blocks[1]->BlockId(), b_id);
 }
 
 TEST(FullAttnManagerTest, MatchPinsUntilResultDies) {
@@ -96,7 +96,6 @@ TEST(FullAttnManagerTest, MatchPinsUntilResultDies) {
     FullAttnManager mgr(4);
     const std::string k0 = RealKey({1, 2, 3, 4}, 0);
     BlockRef a = pool.AcquireBlock();
-    CacheBlock* raw = a.get();
     pool.CacheFullBlock(a, k0);
     a.reset();
     EXPECT_EQ(pool.NumFreeBlocks(), 7);
@@ -115,7 +114,7 @@ TEST(FullAttnManagerTest, ClaimHitBlocksClaimsAndAppends) {
     FullAttnManager mgr(4);
     const std::string k0 = RealKey({1, 2, 3, 4}, 0);
     BlockRef a = pool.AcquireBlock();
-    CacheBlock* raw = a.get();
+    const std::int32_t id = a->BlockId();
     pool.CacheFullBlock(a, k0);
     a.reset();
     EXPECT_EQ(pool.NumFreeBlocks(), 7);
@@ -126,10 +125,10 @@ TEST(FullAttnManagerTest, ClaimHitBlocksClaimsAndAppends) {
     mgr.ClaimHitBlocks(table, std::move(m));
 
     EXPECT_EQ(table.NumBlocks(), 1);
-    EXPECT_EQ(table.Blocks()[0]->BlockId(), raw->BlockId());
-    EXPECT_EQ(table.RefAt(0).use_count(), 1);   // match ownership transferred
-    EXPECT_EQ(pool.NumFreeBlocks(), 6);         // pulled out of free list
-    EXPECT_EQ(table.TailAvailableTokens(), 0);  // hit pages are full
+    EXPECT_EQ(table.Blocks()[0]->BlockId(), id);
+    EXPECT_EQ(table.Blocks()[0].use_count(), 1);  // match ownership transferred
+    EXPECT_EQ(pool.NumFreeBlocks(), 6);           // pulled out of free list
+    EXPECT_EQ(table.TailAvailableTokens(), 0);    // hit pages are full
 }
 
 TEST(FullAttnManagerTest, ClaimNoHitsIsNoOp) {

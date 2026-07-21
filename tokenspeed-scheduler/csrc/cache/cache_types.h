@@ -22,7 +22,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <ranges>
 #include <span>
 #include <utility>
 #include <vector>
@@ -44,29 +43,13 @@ struct KvCacheSpec {
 // Per-request logical-page -> physical-page mapping.
 class BlockTable {
 public:
-    // Read-only view of the pages as CacheBlock*; refcounts stay sealed inside BlockRef.
-    using BlockView = std::ranges::transform_view<std::span<const BlockRef>, decltype(&BlockRef::get)>;
-
-    BlockView Blocks() const { return BlockView{std::span{blocks_}, &BlockRef::get}; }
-    const BlockRef& RefAt(std::int32_t index) const { return blocks_[static_cast<std::size_t>(index)]; }
+    std::span<const BlockRef> Blocks() const noexcept { return blocks_; }
     std::int32_t NumBlocks() const { return static_cast<std::int32_t>(blocks_.size()); }
     std::int32_t TailAvailableTokens() const { return tail_avail_; }
 
-    // Replace slot `index` with a null hole (slot alignment kept) and return the
-    // displaced ownership; empty if already a hole.
-    BlockRef EvictToNull(std::int32_t index, BlockRef null_ref) {
+    BlockRef EvictToNull(std::int32_t index) {
         _assert(0 <= index && index < static_cast<std::int32_t>(blocks_.size()), "EvictToNull index out of range");
-        BlockRef& slot = blocks_[static_cast<std::size_t>(index)];
-        CacheBlock* old = slot.get();
-        _assert(old != nullptr, "EvictToNull on a moved-out slot");
-        _assert(null_ref && null_ref->IsNull(), "EvictToNull replacement must be a null block");
-        _assert(slot.SharesPoolWith(null_ref), "EvictToNull replacement belongs to another pool");
-        if (old->IsNull()) {
-            return {};
-        }
-        BlockRef displaced = std::move(slot);
-        slot = std::move(null_ref);
-        return displaced;
+        return std::exchange(blocks_[static_cast<std::size_t>(index)], {});
     }
 
 private:
@@ -76,18 +59,15 @@ private:
     std::int32_t tail_avail_{0};
 };
 
-// The single flattening authority: BlockId() per logical slot, null holes written as 0, no compaction.
 inline std::vector<std::int32_t> BlockTablePageIds(const BlockTable& table) {
     std::vector<std::int32_t> ids;
     ids.reserve(static_cast<std::size_t>(table.NumBlocks()));
-    for (CacheBlock* b : table.Blocks()) {
-        ids.push_back(b->IsNull() ? 0 : b->BlockId());
+    for (const BlockRef& block : table.Blocks()) {
+        ids.push_back(block ? block->BlockId() : 0);
     }
     return ids;
 }
 
-// blocks maps logical page -> physical page, unmatched / out-of-window slots as null_block
-// holes; num_hit_blocks counts only the real cached pages (holes excluded).
 struct PrefixMatch {
     std::vector<BlockRef> blocks{};
     std::int32_t num_hit_blocks{0};
