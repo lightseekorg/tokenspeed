@@ -1,0 +1,201 @@
+name: Update tokenspeed-kernel AMD dependency
+
+on:
+  workflow_dispatch:
+    inputs:
+      amd_version:
+        description: "Published tokenspeed-kernel-amd version to pin, for example 0.1.3 or v0.1.3."
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require lightseek-bot token
+        env:
+          LIGHTSEEK_BOT_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+        run: |
+          if [ -z "$LIGHTSEEK_BOT_TOKEN" ]; then
+            echo "LIGHTSEEK_BOT_TOKEN is required to push the branch and create the pull request." >&2
+            exit 1
+          fi
+
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Prepare update branch
+        id: prepare
+        env:
+          REQUESTED_VERSION: ${{ inputs.amd_version }}
+        run: |
+          version="${REQUESTED_VERSION#v}"
+          if ! [[ "$version" =~ ^[0-9]+(\.[0-9]+)*((a|b|rc)[0-9]+)?(\.post[0-9]+)?$ ]]; then
+            echo "Invalid public release version: $REQUESTED_VERSION" >&2
+            exit 1
+          fi
+
+          branch="bot/update-tokenspeed-kernel-amd-${version}"
+          git switch -c "$branch"
+          git config user.name "lightseek-bot"
+          git config user.email "243258330+lightseek-bot@users.noreply.github.com"
+
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Verify published version
+        env:
+          VERSION: ${{ steps.prepare.outputs.version }}
+        run: |
+          if ! http_code=$(curl --silent --show-error \
+            --output /tmp/pypi-version.json \
+            --write-out '%{http_code}' \
+            "https://pypi.org/pypi/tokenspeed-kernel-amd/${VERSION}/json"); then
+            echo "Could not verify tokenspeed-kernel-amd ${VERSION} on PyPI." >&2
+            exit 1
+          fi
+
+          case "$http_code" in
+            200) ;;
+            404)
+              echo "tokenspeed-kernel-amd ${VERSION} is not published on PyPI yet." >&2
+              exit 1
+              ;;
+            *)
+              echo "Could not verify tokenspeed-kernel-amd ${VERSION} on PyPI: HTTP ${http_code}." >&2
+              exit 1
+              ;;
+          esac
+
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          release = json.loads(Path("/tmp/pypi-version.json").read_text())
+          files = release.get("urls")
+          if not isinstance(files, list) or not any(
+              not file.get("yanked", False) for file in files
+          ):
+              raise SystemExit(
+                  "The PyPI release has no non-yanked distribution files to install."
+              )
+          PY
+
+      - name: Update AMD dependency
+        id: update
+        env:
+          VERSION: ${{ steps.prepare.outputs.version }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          version = os.environ["VERSION"]
+          path = Path("tokenspeed-kernel/python/requirements/rocm.txt")
+          text, count = re.subn(
+              r"(?m)^tokenspeed-kernel-amd==[^\n]+$",
+              f"tokenspeed-kernel-amd=={version}",
+              path.read_text(),
+          )
+          if count != 1:
+              raise SystemExit(f"expected one tokenspeed-kernel-amd pin in {path}")
+          path.write_text(text)
+          PY
+
+          if git diff --quiet -- tokenspeed-kernel/python/requirements/rocm.txt; then
+            echo "tokenspeed-kernel already uses tokenspeed-kernel-amd $VERSION."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run pre-commit
+        if: steps.update.outputs.changed == 'true'
+        run: |
+          python -m pip install pre-commit
+
+          set +e
+          pre-commit run --all-files
+          precommit_status=$?
+          set -e
+
+          list_unexpected_files() {
+            {
+              git diff --name-only
+              git ls-files --others --exclude-standard
+            } | sort -u | while IFS= read -r path; do
+              if [ "$path" != "tokenspeed-kernel/python/requirements/rocm.txt" ]; then
+                echo "$path"
+              fi
+            done
+          }
+
+          unexpected_files=$(list_unexpected_files)
+          if [ -n "$unexpected_files" ]; then
+            echo "pre-commit changed files outside the AMD dependency update:" >&2
+            echo "$unexpected_files" >&2
+            exit 1
+          fi
+          if [ "$precommit_status" -ne 0 ]; then
+            pre-commit run --all-files
+          fi
+
+          unexpected_files=$(list_unexpected_files)
+          if [ -n "$unexpected_files" ]; then
+            echo "pre-commit changed files outside the AMD dependency update:" >&2
+            echo "$unexpected_files" >&2
+            exit 1
+          fi
+
+      - name: Commit, push, and create pull request
+        if: steps.update.outputs.changed == 'true'
+        env:
+          BRANCH: ${{ steps.prepare.outputs.branch }}
+          GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+          VERSION: ${{ steps.prepare.outputs.version }}
+        run: |
+          git add tokenspeed-kernel/python/requirements/rocm.txt
+          git commit -s -m "build: pin tokenspeed-kernel-amd ${VERSION}"
+
+          remote_line=$(git ls-remote --heads origin "refs/heads/${BRANCH}")
+          remote_sha=${remote_line%%$'\t'*}
+          if [ -n "$remote_sha" ]; then
+            lease="refs/heads/${BRANCH}:${remote_sha}"
+          else
+            lease="refs/heads/${BRANCH}:"
+          fi
+          git push \
+            --force-with-lease="$lease" \
+            origin "HEAD:refs/heads/${BRANCH}"
+
+          title="build: pin tokenspeed-kernel-amd ${VERSION}"
+          body="Pin tokenspeed-kernel's ROCm dependency to the published tokenspeed-kernel-amd ${VERSION} release."
+          if gh pr view "$BRANCH" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh pr edit "$BRANCH" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$title" \
+              --body "$body"
+          else
+            gh pr create \
+              --repo "$GITHUB_REPOSITORY" \
+              --base main \
+              --head "$BRANCH" \
+              --title "$title" \
+              --body "$body"
+          fi
