@@ -17,7 +17,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import torch
 
@@ -235,6 +235,16 @@ class DFlash(BaseDrafter):
         hidden_states: torch.Tensor,
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        return self._greedy_argmax_vocab_parallel(hidden_states, out=out)
+
+    def _greedy_argmax_vocab_parallel(
+        self,
+        hidden_states: torch.Tensor,
+        out: torch.Tensor | None = None,
+        bias_fn: "Callable[[int, int], torch.Tensor] | None" = None,
+    ) -> torch.Tensor:
+        """Shared vocab-parallel greedy argmax primitive.
+        """
         if not hasattr(self.lm_head, "weight") or not hasattr(
             self.lm_head, "shard_indices"
         ):
@@ -242,6 +252,8 @@ class DFlash(BaseDrafter):
             logits = self.logits_processor._get_logits(
                 hidden_states, self.lm_head, metadata
             )
+            if bias_fn is not None:
+                logits = logits + bias_fn(0, int(logits.shape[-1])).to(logits.dtype)
             argmax = torch.argmax(logits, dim=-1)
             if out is not None:
                 out.copy_(argmax.view_as(out))
@@ -261,6 +273,10 @@ class DFlash(BaseDrafter):
         chunk_len = int(hidden_states.shape[0])
         if num_org > 0:
             base_logits = torch.matmul(hidden_states, weight[:num_org].T)
+            if bias_fn is not None:
+                base_logits = base_logits + bias_fn(
+                    org_vocab_start, num_org
+                ).to(base_logits.dtype)
             local_max, local_arg = torch.max(base_logits, dim=-1)
         else:
             local_max = torch.full(
@@ -278,6 +294,10 @@ class DFlash(BaseDrafter):
             added_end = num_org_padded + num_added
             added_weight = weight[added_start:added_end]
             added_logits = torch.matmul(hidden_states, added_weight.T)
+            if bias_fn is not None:
+                added_logits = added_logits + bias_fn(
+                    added_vocab_start, num_added
+                ).to(added_logits.dtype)
             added_max, added_arg = torch.max(added_logits, dim=-1)
             use_added = added_max > local_max
             local_max = torch.where(use_added, added_max, local_max)
@@ -895,6 +915,15 @@ class DFlash(BaseDrafter):
         draft_hidden = draft_hidden.view(bs, self.spec_num_tokens, self.hidden_size)
 
         next_tokens = self.next_tokens_buf[:bs]
+        return self._sample_block(draft_hidden, block_ids, next_tokens)
+
+    def _sample_block(
+        self,
+        draft_hidden: torch.Tensor,
+        block_ids: torch.Tensor,
+        next_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Sample the block draft tokens from the draft hidden states."""
         next_tokens[:, 0] = block_ids[:, 0]
         self._greedy_sample_from_vocab_parallel_head(
             draft_hidden[:, 1:, :].reshape(-1, self.hidden_size),
