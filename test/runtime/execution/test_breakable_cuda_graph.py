@@ -32,6 +32,7 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (  # noqa: E402
     scrub_padding_tail,
     slice_to_real_tokens,
 )
+from tokenspeed.runtime.utils.cuda_stream import StreamFork  # noqa: E402
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
@@ -328,6 +329,215 @@ class TestBreakPointAndAmbientCtx(unittest.TestCase):
         expected = torch.relu((new_x @ self.w0) @ self.w1) * 5.0
         torch.testing.assert_close(captured, expected, rtol=1e-4, atol=1e-4)
 
+    def test_multistream_segment_then_eager_break_reuses_events(self):
+        """A joined graph fork may feed a break that reuses the same events.
+
+        DeepSeek-V4 projects Q/KV on the capture stream and compressor inputs on
+        an auxiliary stream, then its eager attention core reuses that
+        ``StreamFork`` for cache writes. Exercise that exact ordering while also
+        proving that both graph-produced break arguments refresh on replay.
+        """
+        stream_fork = StreamFork(torch.cuda.Stream())
+        w2 = torch.randn(self.d, self.d, device=self.dev, dtype=self.dtype)
+        w3 = torch.randn(self.d, self.d, device=self.dev, dtype=self.dtype)
+        calls = {"outer": 0, "core": 0}
+        observed_rows = []
+
+        class M:
+            def forward(inner_self, x, ctx):
+                calls["outer"] += 1
+                with stream_fork.scope(enable=True) as fork:
+                    q = x @ self.w0
+                    with fork.branch():
+                        score1 = x @ self.w1
+                        score2 = score1 * 2.0
+                return inner_self.core(q, score1, score2, ctx) @ w3
+
+            @break_point
+            def core(inner_self, q, score1, score2, ctx):
+                calls["core"] += 1
+                q, score1, score2 = slice_to_real_tokens(
+                    ctx.real_tokens, q, score1, score2
+                )
+                observed_rows.append((q.shape[0], score1.shape[0], score2.shape[0]))
+                with stream_fork.scope(enable=True) as fork:
+                    main = torch.relu(q + score1) * ctx.scale
+                    with fork.branch():
+                        aux = (q - score2) @ w2
+                return main + aux
+
+        model = M()
+        dummy = SimpleNamespace(scale=2.0, real_tokens=self.x_static.shape[0])
+
+        for _ in range(3):
+            with active_forward(dummy):
+                model.forward(self.x_static, dummy)
+        torch.cuda.synchronize()
+        observed_rows.clear()
+
+        cap = BreakableCapture()
+        with active_forward(dummy):
+            with cap:
+                captured = model.forward(self.x_static, dummy)
+        self.assertEqual(cap.num_segments, 3)
+        outer_calls_after_capture = calls["outer"]
+        core_calls_after_capture = calls["core"]
+
+        for trial, (real_tokens, scale) in enumerate(((5, 3.0), (3, 5.0))):
+            new_x = torch.randn(8, self.d, device=self.dev, dtype=self.dtype)
+            self.x_static.copy_(new_x)
+            live = SimpleNamespace(scale=scale, real_tokens=real_tokens)
+            with active_forward(live):
+                cap.replay()
+            torch.cuda.synchronize()
+
+            q = new_x @ self.w0
+            score1 = new_x @ self.w1
+            score2 = score1 * 2.0
+            expected = (
+                torch.relu(q[:real_tokens] + score1[:real_tokens]) * scale
+                + (q[:real_tokens] - score2[:real_tokens]) @ w2
+            ) @ w3
+            self.assertEqual(captured.shape[0], self.x_static.shape[0])
+            torch.testing.assert_close(
+                captured[:real_tokens],
+                expected,
+                rtol=1e-4,
+                atol=1e-4,
+                msg=f"trial {trial}",
+            )
+
+        self.assertEqual(calls["outer"], outer_calls_after_capture)
+        self.assertEqual(calls["core"], core_calls_after_capture + 2)
+        self.assertEqual(
+            observed_rows,
+            [(8, 8, 8), (5, 5, 5), (3, 3, 3)],
+        )
+
+    def test_short_handoff_with_live_positions_and_same_shape_reuse(self):
+        """Short breaks may share one handoff before row-local graph work.
+
+        Mirrors DeepSeek-V4's eager attention-core -> graphed output-
+        projection boundary.  Two same-shaped breaks reuse one handoff, each
+        following graph segment consumes it before the next break overwrites it,
+        and only the real prefix is refreshed on replay.  Poisoning the untouched
+        tail proves that row-local work cannot contaminate real-token rows.
+        """
+        positions_static = torch.zeros(
+            self.x_static.shape[0], device=self.dev, dtype=self.dtype
+        )
+        projection_weights = [
+            torch.randn(self.d, self.d, device=self.dev, dtype=self.dtype)
+            for _ in range(2)
+        ]
+        position_scales = (0.03125, -0.015625)
+        observed_rows = []
+
+        class M:
+            def forward(inner_self, x, positions, ctx):
+                h = x @ self.w0
+                for layer, weight in enumerate(projection_weights):
+                    h = inner_self.core(h, ctx, layer)
+                    # The output projection remains in the following graph
+                    # segment and reads the persistent, replay-refreshed positions.
+                    h = (
+                        torch.tanh(h + positions[:, None] * position_scales[layer])
+                        @ weight
+                    )
+                return h
+
+            @break_point
+            def core(inner_self, h, ctx, layer):
+                (h,) = slice_to_real_tokens(ctx.real_tokens, h)
+                observed_rows.append((layer, h.shape[0]))
+                return torch.sin(h + ctx.core_offsets[layer])
+
+        def eager(x, positions, core_offsets):
+            h = x @ self.w0
+            for layer, weight in enumerate(projection_weights):
+                h = torch.sin(h + core_offsets[layer])
+                h = torch.tanh(h + positions[:, None] * position_scales[layer]) @ weight
+            return h
+
+        model = M()
+        dummy = SimpleNamespace(
+            real_tokens=self.x_static.shape[0], core_offsets=(0.125, -0.25)
+        )
+        positions_static.copy_(
+            torch.arange(self.x_static.shape[0], device=self.dev, dtype=self.dtype)
+        )
+
+        for _ in range(3):
+            with active_forward(dummy):
+                model.forward(self.x_static, positions_static, dummy)
+        torch.cuda.synchronize()
+        observed_rows.clear()
+
+        cap = BreakableCapture()
+        with active_forward(dummy):
+            with cap:
+                captured = model.forward(self.x_static, positions_static, dummy)
+
+        # graph -> break -> graph -> break -> graph, with both breaks sharing
+        # the same shape-keyed destination.
+        self.assertEqual(cap.num_segments, 5)
+        self.assertEqual(len(cap._handoff), 1)
+        handoff = next(iter(cap._handoff.values()))
+        self.assertEqual(tuple(handoff.shape), tuple(self.x_static.shape))
+
+        trials = (
+            (5, (0.5, -0.75), "nan"),
+            (3, (-0.375, 0.625), "inf"),
+        )
+        for trial, (real_tokens, core_offsets, poison_kind) in enumerate(trials):
+            new_x = torch.randn_like(self.x_static)
+            self.x_static.copy_(new_x)
+            live_positions = (
+                torch.arange(real_tokens, device=self.dev, dtype=self.dtype)
+                * (trial + 2)
+                + 17
+            )
+            positions_static.zero_()
+            positions_static[:real_tokens].copy_(live_positions)
+
+            tail = handoff[real_tokens:]
+            if poison_kind == "nan":
+                tail.fill_(float("nan"))
+            else:
+                row_poison = torch.where(
+                    torch.arange(tail.shape[0], device=self.dev) % 2 == 0,
+                    torch.tensor(float("inf"), device=self.dev),
+                    torch.tensor(-float("inf"), device=self.dev),
+                ).to(self.dtype)
+                tail.copy_(row_poison[:, None].expand_as(tail))
+            torch.cuda.synchronize()
+
+            live = SimpleNamespace(real_tokens=real_tokens, core_offsets=core_offsets)
+            with active_forward(live):
+                cap.replay()
+            torch.cuda.synchronize()
+
+            expected = eager(new_x[:real_tokens], live_positions, core_offsets)
+            self.assertEqual(captured.shape[0], self.x_static.shape[0])
+            self.assertTrue(bool(torch.isfinite(captured[:real_tokens]).all()))
+            torch.testing.assert_close(
+                captured[:real_tokens],
+                expected,
+                rtol=1e-4,
+                atol=1e-4,
+                msg=f"trial {trial}",
+            )
+            self.assertTrue(bool((positions_static[real_tokens:] == 0).all()))
+            if poison_kind == "nan":
+                self.assertTrue(bool(torch.isnan(tail).all()))
+            else:
+                self.assertTrue(bool(torch.isinf(tail).all()))
+
+        self.assertEqual(
+            observed_rows,
+            [(0, 8), (1, 8), (0, 5), (1, 5), (0, 3), (1, 3)],
+        )
+
     def test_break_reads_live_scalar_off_ambient_not_frozen_arg(self):
         """Scalar args freeze at capture; live values must come off the ambient ctx.
 
@@ -517,6 +727,317 @@ class TestPrefillTokenBuckets(unittest.TestCase):
             self._cfg(prefill_graph_capture_sizes=[256, 1024, 4096])
         )
         self.assertEqual(buckets, [256, 1024, 2048])
+
+
+class TestPrefillDummyBatch(unittest.TestCase):
+    """CPU-only checks for the prefill capture metadata wiring."""
+
+    def test_dummy_batch_uses_input_lengths_for_paged_extend_metadata(self):
+        from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+        from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
+
+        class RecordingBackend:
+            uses_paged_cache_groups = True
+
+            def init_forward_metadata(self, **kwargs):
+                self.metadata = kwargs
+
+        class RecordingDecodeWrapper:
+            def _capture_paged_cache_block_tables(self, bs, token_to_kv_pool):
+                self.call = (bs, token_to_kv_pool)
+                return paged_cache_block_tables
+
+        num_tokens = 4
+        input_buffers = SimpleNamespace(
+            input_ids_buf=torch.empty(num_tokens, dtype=torch.int32),
+            out_cache_loc_buf=torch.empty(num_tokens, dtype=torch.int64),
+            positions_buf=torch.empty(num_tokens, dtype=torch.int64),
+            req_pool_indices_buf=torch.empty(1, dtype=torch.int32),
+            seq_lens_buf=torch.empty(1, dtype=torch.int32),
+            input_lengths_buf=torch.empty(1, dtype=torch.int32),
+            extend_seq_lens_cpu=torch.empty(1, dtype=torch.int32),
+            extend_prefix_lens_buf=torch.empty(1, dtype=torch.int32),
+            extend_prefix_lens_cpu=torch.empty(1, dtype=torch.int32),
+            dummy_kv_slot=7,
+        )
+        self.assertFalse(hasattr(input_buffers, "extend_seq_lens_buf"))
+
+        backend = RecordingBackend()
+        decode_wrapper = RecordingDecodeWrapper()
+        token_to_kv_pool = object()
+        paged_cache_block_tables = {"v4.swa_kv": torch.zeros(1, 1)}
+
+        graph = PrefillGraph.__new__(PrefillGraph)
+        graph.input_buffers = input_buffers
+        graph.config = SimpleNamespace(device="cpu", world_size=1)
+        graph.req_to_page = torch.ones(1, 2, dtype=torch.int32)
+        graph.attn_backend = backend
+        graph.token_to_kv_pool = token_to_kv_pool
+        graph.drafter = None
+        graph.dp_size = 1
+        graph._prepare_replay_hook = None
+
+        ctx = graph._make_dummy_batch(num_tokens, decode_wrapper)
+
+        extend_seq_lens = backend.metadata["extend_seq_lens"]
+        self.assertEqual(input_buffers.input_lengths_buf.tolist(), [num_tokens])
+        self.assertEqual(extend_seq_lens.tolist(), [num_tokens])
+        self.assertEqual(
+            extend_seq_lens.data_ptr(), input_buffers.input_lengths_buf.data_ptr()
+        )
+        self.assertIs(extend_seq_lens._base, input_buffers.input_lengths_buf)
+        self.assertEqual(input_buffers.extend_seq_lens_cpu.tolist(), [num_tokens])
+        self.assertEqual(input_buffers.extend_prefix_lens_buf.tolist(), [0])
+        self.assertEqual(input_buffers.extend_prefix_lens_cpu.tolist(), [0])
+        self.assertEqual(backend.metadata["seq_lens"].tolist(), [num_tokens])
+
+        self.assertEqual(ctx.bs, 1)
+        self.assertEqual(ctx.num_extends, 1)
+        self.assertEqual(ctx.input_num_tokens, num_tokens)
+        self.assertEqual(ctx.forward_mode, ForwardMode.EXTEND)
+        self.assertEqual(decode_wrapper.call, (1, token_to_kv_pool))
+        self.assertIs(
+            backend.metadata["paged_cache_block_tables"], paged_cache_block_tables
+        )
+        self.assertEqual(backend.metadata["num_tokens"], num_tokens)
+        self.assertEqual(
+            backend.metadata["positions"].tolist(), list(range(num_tokens))
+        )
+        # Capture-safety: the throwaway forward's KV writes must target the
+        # reserved dummy slot and the dummy request's pages must point at
+        # page 0, so capturing never touches real cache state.
+        self.assertEqual(
+            input_buffers.out_cache_loc_buf.tolist(),
+            [input_buffers.dummy_kv_slot] * num_tokens,
+        )
+        self.assertEqual(input_buffers.input_ids_buf.tolist(), [1] * num_tokens)
+        self.assertEqual(graph.req_to_page[0].tolist(), [0, 0])
+
+    def test_replay_bucket_eligibility_gate(self):
+        from tokenspeed.runtime.execution.forward_batch_info import (
+            CaptureHiddenMode,
+            ForwardMode,
+        )
+        from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
+
+        graph = PrefillGraph.__new__(PrefillGraph)
+        graph.disable = False
+        graph.dp_size = 1
+        graph._captured_hidden_mode = CaptureHiddenMode.NULL
+        graph.capture_buckets = [4]
+        graph._captures = {4: object()}
+        graph.config = SimpleNamespace(disable_cuda_graph_padding=False)
+
+        def ctx(**over):
+            base = dict(
+                forward_mode=ForwardMode.EXTEND,
+                num_extends=1,
+                accept_lengths=None,
+                capture_hidden_mode=CaptureHiddenMode.NULL,
+                input_num_tokens=4,
+                global_num_tokens=None,
+            )
+            base.update(over)
+            return SimpleNamespace(**base)
+
+        # Eligible: pure extend, matching hidden mode, bucket captured.
+        self.assertEqual(graph._replay_bucket(ctx()), 4)
+        self.assertEqual(graph._replay_bucket(ctx(forward_mode=ForwardMode.MIXED)), 4)
+        # Each ineligibility condition must force eager (None):
+        self.assertIsNone(graph._replay_bucket(ctx(forward_mode=ForwardMode.DECODE)))
+        self.assertIsNone(graph._replay_bucket(ctx(num_extends=0)))
+        self.assertIsNone(graph._replay_bucket(ctx(accept_lengths=torch.tensor([1]))))
+        self.assertIsNone(
+            graph._replay_bucket(ctx(capture_hidden_mode=CaptureHiddenMode.FULL))
+        )
+        self.assertIsNone(graph._replay_bucket(ctx(input_num_tokens=9)))  # > bucket
+        graph.disable = True
+        self.assertIsNone(graph._replay_bucket(ctx()))
+
+    def test_capture_unanimous_min_reduce_disables_on_any_rank_failure(self):
+        from unittest import mock
+
+        from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
+
+        graph = PrefillGraph.__new__(PrefillGraph)
+        graph.config = SimpleNamespace(world_group="w", world_size=2)
+
+        # Single-rank / no group short-circuits to the local flag.
+        solo = PrefillGraph.__new__(PrefillGraph)
+        solo.config = SimpleNamespace(world_group=None, world_size=1)
+        self.assertTrue(solo._capture_unanimous(True))
+        self.assertFalse(solo._capture_unanimous(False))
+
+        # Multi-rank: MIN all-reduce means any rank's False makes all False.
+        for local_ok, peer_result, expected in ((True, 0, False), (True, 1, True)):
+            with mock.patch(
+                "tokenspeed.runtime.distributed.process_group_manager."
+                "process_group_manager.get_process_group",
+                return_value=object(),
+            ), mock.patch("torch.distributed.all_reduce") as all_reduce:
+
+                def fill(flag, op=None, group=None, _r=peer_result):
+                    flag.fill_(_r)
+
+                all_reduce.side_effect = fill
+                self.assertEqual(graph._capture_unanimous(local_ok), expected)
+                op = all_reduce.call_args.kwargs.get("op")
+                self.assertIs(op, torch.distributed.ReduceOp.MIN)
+
+    def test_prepare_finish_hooks_must_be_implemented_together(self):
+        from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
+
+        def resolve(model):
+            g = PrefillGraph.__new__(PrefillGraph)
+            g.inner_model = model
+            g._prepare_replay_hook = getattr(
+                model, "prepare_prefill_graph_replay", None
+            )
+            g._finish_replay_hook = getattr(model, "finish_prefill_graph_replay", None)
+            if (g._prepare_replay_hook is None) != (g._finish_replay_hook is None):
+                raise ValueError("both-or-neither")
+            return g
+
+        # Neither hook: fine (non-V4 models).
+        self.assertIsNone(resolve(SimpleNamespace())._prepare_replay_hook)
+        # Both hooks: fine.
+        both = resolve(
+            SimpleNamespace(
+                prepare_prefill_graph_replay=lambda *a, **k: None,
+                finish_prefill_graph_replay=lambda *a, **k: None,
+            )
+        )
+        self.assertIsNotNone(both._prepare_replay_hook)
+        # Exactly one: rejected.
+        with self.assertRaises(ValueError):
+            resolve(SimpleNamespace(prepare_prefill_graph_replay=lambda *a, **k: None))
+        with self.assertRaises(ValueError):
+            resolve(SimpleNamespace(finish_prefill_graph_replay=lambda *a, **k: None))
+
+    def test_dummy_batch_calls_model_pregraph_hook_with_capture(self):
+        from unittest import mock
+
+        from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
+
+        num_tokens = 4
+        input_buffers = SimpleNamespace(
+            input_ids_buf=torch.empty(num_tokens, dtype=torch.int32),
+            out_cache_loc_buf=torch.empty(num_tokens, dtype=torch.int64),
+            positions_buf=torch.empty(num_tokens, dtype=torch.int64),
+            req_pool_indices_buf=torch.empty(1, dtype=torch.int32),
+            seq_lens_buf=torch.empty(1, dtype=torch.int32),
+            input_lengths_buf=torch.empty(1, dtype=torch.int32),
+            extend_seq_lens_cpu=torch.empty(1, dtype=torch.int32),
+            extend_prefix_lens_buf=torch.empty(1, dtype=torch.int32),
+            extend_prefix_lens_cpu=torch.empty(1, dtype=torch.int32),
+            dummy_kv_slot=7,
+        )
+        backend = SimpleNamespace(
+            uses_paged_cache_groups=False,
+            init_forward_metadata=mock.Mock(),
+        )
+
+        graph = PrefillGraph.__new__(PrefillGraph)
+        graph.input_buffers = input_buffers
+        graph.config = SimpleNamespace(device="cpu", world_size=1)
+        graph.req_to_page = torch.ones(1, 2, dtype=torch.int32)
+        graph.attn_backend = backend
+        graph.token_to_kv_pool = object()
+        graph.drafter = None
+        graph.dp_size = 1
+        graph._prepare_replay_hook = mock.Mock()
+
+        ctx = graph._make_dummy_batch(num_tokens, None)
+
+        hook = graph._prepare_replay_hook
+        hook.assert_called_once()
+        hook_ctx, hook_positions = hook.call_args.args
+        self.assertIs(hook_ctx, ctx)
+        self.assertEqual(hook_positions.shape[0], num_tokens)
+        self.assertIs(hook_positions._base, input_buffers.positions_buf)
+        self.assertEqual(hook.call_args.kwargs, {"capture": True})
+
+    def test_replay_runs_pregraph_hooks_around_graph_and_clears_on_error(self):
+        from unittest import mock
+
+        from tokenspeed.runtime.execution import prefill_graph as prefill_graph_mod
+        from tokenspeed.runtime.execution.context import ForwardContext
+        from tokenspeed.runtime.execution.forward_batch_info import (
+            CaptureHiddenMode,
+            ForwardMode,
+        )
+        from tokenspeed.runtime.execution.prefill_graph import (
+            CapturedForward,
+            PrefillGraph,
+        )
+
+        bucket = 4
+        calls: list[str] = []
+        input_buffers = SimpleNamespace(
+            positions_buf=torch.arange(bucket, dtype=torch.int64),
+        )
+
+        graph = PrefillGraph.__new__(PrefillGraph)
+        graph.disable = False
+        graph.dp_size = 1
+        graph.config = SimpleNamespace(
+            device="cpu", world_size=1, disable_cuda_graph_padding=False
+        )
+        graph.capture_buckets = [bucket]
+        graph.input_buffers = input_buffers
+        graph._multimodal_input_embeds = None
+        graph._embed_tokens = lambda ids: torch.zeros(ids.shape[0], 2)
+        graph._input_embeds_buf = torch.zeros(bucket, 2)
+        graph._captured_hidden_mode = CaptureHiddenMode.NULL
+        graph._engaged_logged = {"text", "multimodal"}
+        graph._captures = {
+            bucket: SimpleNamespace(replay=lambda: calls.append("graph"))
+        }
+        graph._outputs = {
+            bucket: CapturedForward(
+                hidden_states=torch.zeros(bucket, 2), aux_hidden_states=None
+            )
+        }
+        graph.text_model = SimpleNamespace(
+            logits_processor=mock.Mock(return_value="logits"),
+            lm_head=object(),
+        )
+        graph._prepare_replay_hook = mock.Mock(
+            side_effect=lambda *a, **k: calls.append("prepare")
+        )
+        graph._finish_replay_hook = mock.Mock(
+            side_effect=lambda ctx: calls.append("finish")
+        )
+
+        ctx = ForwardContext(
+            attn_backend=None,
+            token_to_kv_pool=None,
+            bs=1,
+            num_extends=1,
+            input_num_tokens=bucket,
+            forward_mode=ForwardMode.EXTEND,
+        )
+        with mock.patch.object(prefill_graph_mod, "LogitsMetadata"):
+            result = graph.replay(ctx, torch.zeros(bucket, dtype=torch.int64))
+
+        self.assertEqual(result, "logits")
+        self.assertEqual(calls, ["prepare", "graph", "finish"])
+        prepare = graph._prepare_replay_hook
+        prepare_ctx, prepare_positions = prepare.call_args.args
+        self.assertIs(prepare_ctx, ctx)
+        self.assertIs(prepare_positions._base, input_buffers.positions_buf)
+        self.assertEqual(prepare.call_args.kwargs, {"capture": False})
+        graph._finish_replay_hook.assert_called_once_with(ctx)
+
+        # A replay failure must still clear the armed flag via the finish hook.
+        calls.clear()
+        graph._captures[bucket] = SimpleNamespace(
+            replay=mock.Mock(side_effect=RuntimeError("boom"))
+        )
+        with mock.patch.object(prefill_graph_mod, "LogitsMetadata"):
+            with self.assertRaises(RuntimeError):
+                graph.replay(ctx, torch.zeros(bucket, dtype=torch.int64))
+        self.assertEqual(calls, ["prepare", "finish"])
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")

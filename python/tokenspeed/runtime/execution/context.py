@@ -82,6 +82,9 @@ class ForwardContext:
     # DSA SWA slot mapping + compressor memo, computed once per forward, shared across layers.
     dsa_swa_slot_mapping: torch.Tensor | None = None
     dsa_compressor_slot_cache: Any | None = None
+    # Armed by the prefill-graph replay hook: the captured segment wrote the
+    # DSA caches, so the attention break skips its eager cache writes.
+    dsa_pregraph_writes: bool = False
 
 
 @contextmanager

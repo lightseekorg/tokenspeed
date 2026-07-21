@@ -1969,6 +1969,142 @@ class _DeepseekV4TopKBuffer:
         return self.buffer[:num_tokens]
 
 
+class _DeepseekV4PregraphStateGroup:
+    """One compressor-family staging group for the captured cache writes.
+
+    Holds the per-token state/compressed slot mappings plus the compact state
+    block table and its sliding base pages at stable addresses the captured
+    kernels bake. ``-1`` slot mappings make every captured write a per-token
+    no-op (the kernels check them before reading the table or base pages).
+    """
+
+    def __init__(self) -> None:
+        self.state_slot_mapping: torch.Tensor | None = None
+        self.kv_slot_mapping: torch.Tensor | None = None
+        self.state_block_table: torch.Tensor | None = None
+        self.state_base_pages: torch.Tensor | None = None
+
+    def allocate(
+        self,
+        num_tokens: int,
+        max_reqs: int,
+        table_width: int,
+        device: torch.device,
+    ) -> None:
+        self.state_slot_mapping = torch.empty(
+            num_tokens, dtype=torch.int64, device=device
+        )
+        self.kv_slot_mapping = torch.empty(num_tokens, dtype=torch.int64, device=device)
+        self.state_block_table = torch.empty(
+            (max_reqs, table_width), dtype=torch.int32, device=device
+        )
+        self.state_base_pages = torch.empty(max_reqs, dtype=torch.int32, device=device)
+
+    def fits(self, num_tokens: int, max_reqs: int, table_width: int) -> bool:
+        return (
+            self.state_block_table is not None
+            and self.state_slot_mapping.shape[0] >= num_tokens
+            and self.state_block_table.shape[0] >= max_reqs
+            and self.state_block_table.shape[1] >= table_width
+        )
+
+    def disarm(self) -> None:
+        self.state_slot_mapping.fill_(-1)
+        self.kv_slot_mapping.fill_(-1)
+        self.state_block_table.fill_(-1)
+        self.state_base_pages.fill_(0)
+
+    def stage(
+        self,
+        num_tokens: int,
+        state_slot_mapping: torch.Tensor,
+        kv_slot_mapping: torch.Tensor,
+        block_table: torch.Tensor,
+        base_pages: torch.Tensor | None,
+    ) -> None:
+        """Refresh this group in place from live per-replay values.
+
+        Rows beyond ``num_tokens`` / the live table extent keep their
+        disarmed fill, unreachable behind the -1 slots.
+        """
+        self.state_slot_mapping[:num_tokens].copy_(state_slot_mapping)
+        self.kv_slot_mapping[:num_tokens].copy_(kv_slot_mapping)
+        num_reqs = int(block_table.shape[0])
+        self.state_block_table[:num_reqs, : block_table.shape[1]].copy_(
+            block_table.to(torch.int32)
+        )
+        if base_pages is not None:
+            self.state_base_pages[:num_reqs].copy_(
+                base_pages[:num_reqs].to(torch.int32)
+            )
+
+
+class _DeepseekV4PregraphBuffers:
+    """Persistent DSA metadata staging for the captured pre-break cache writes.
+
+    The prefill breakable graph captures the CSA indexer's AND the main C4
+    compressor's state save + cache insert in the pre-break segment, which
+    bakes their metadata addresses. Per-replay values (a shared
+    token->request map plus one staging group per write set) live here at
+    stable addresses: the pre-replay hook refreshes them in place from live
+    metadata when the forward is safe, and otherwise disarms them, making
+    every captured write a per-token no-op (fail-open).
+    """
+
+    def __init__(self) -> None:
+        self.token_to_req: torch.Tensor | None = None
+        self.indexer = _DeepseekV4PregraphStateGroup()
+        self.c4 = _DeepseekV4PregraphStateGroup()
+
+    @property
+    def allocated(self) -> bool:
+        return self.token_to_req is not None
+
+    def allocate(
+        self,
+        num_tokens: int,
+        max_reqs: int,
+        table_width: int,
+        c4_table_width: int,
+        device: torch.device,
+    ) -> None:
+        """Allocate (or grow) the staging buffers, disarmed.
+
+        Only legal outside stream capture: the capture loop visits buckets
+        largest-first, so the first dummy batch sizes every buffer and later
+        buckets reuse the same addresses the captured kernels baked.
+        """
+        needs_alloc = (
+            self.token_to_req is None
+            or self.token_to_req.device != device
+            or self.token_to_req.shape[0] < num_tokens
+            or not self.indexer.fits(num_tokens, max_reqs, table_width)
+            or not self.c4.fits(num_tokens, max_reqs, c4_table_width)
+        )
+        if not needs_alloc:
+            self.disarm()
+            return
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "DeepSeek V4 pregraph buffers must be allocated before "
+                "CUDA graph capture"
+            )
+        with torch.inference_mode(False):
+            self.token_to_req = torch.empty(
+                num_tokens, dtype=torch.int32, device=device
+            )
+            self.indexer.allocate(num_tokens, max_reqs, table_width, device)
+            self.c4.allocate(num_tokens, max_reqs, c4_table_width, device)
+        self.disarm()
+
+    def disarm(self) -> None:
+        """Make every captured write a no-op: -1 slots gate the kernels before
+        they read the request map, block table, or base pages."""
+        self.token_to_req.fill_(-1)
+        self.indexer.disarm()
+        self.c4.disarm()
+
+
 def _deepseek_v4_padded_heads(num_local_heads: int) -> int:
     if num_local_heads <= 64:
         return 64
@@ -2753,6 +2889,68 @@ class DeepseekV4Compressor(nn.Module):
             kv_score = torch.matmul(hidden_states.float(), weight.float().T)
         return kv_score
 
+    def insert_cache_pregraph(
+        self,
+        *,
+        positions: torch.Tensor,
+        ctx: ForwardContext,
+        layer_index: int,
+        cos_sin_cache: torch.Tensor,
+        kv_score: torch.Tensor,
+        buffers: "_DeepseekV4PregraphBuffers",
+    ) -> None:
+        """Run the main C4 compressor state save + compressed cache insert in
+        the captured pre-break prefill-graph segment.
+
+        The C4 sibling of :meth:`DeepseekV4Indexer.insert_cache_pregraph`,
+        against the ``buffers.c4`` staging group: armed replays perform this
+        layer's compressor writes here and the break skips its eager
+        ``run_compressor`` call; behind disarmed (-1) slots every token is a
+        kernel-side no-op.
+
+        Args:
+            positions: Padded bucket positions (the static input buffer slice).
+            ctx: Forward context supplying the KV pool.
+            layer_index: This layer's compact cache slot.
+            cos_sin_cache: fp32 rope cache shared with the eager insert path.
+            kv_score: This compressor's fused ``[kv | score]`` GEMM output
+                from the current segment.
+            buffers: The model-owned pregraph staging buffers.
+        """
+        pool = ctx.token_to_kv_pool
+        num_tokens = positions.numel()
+        kv, score = kv_score.split([self.coff * self.head_dim] * 2, dim=-1)
+        state_cache = pool.get_compressor_state_buffer(layer_index)
+        state_block_size = pool.get_compressor_state_block_size(layer_index)
+        with nvtx_range("compressor_pregraph_save_state"):
+            save_deepseek_v4_compressor_state(
+                kv=kv,
+                score=score,
+                ape=self.ape,
+                state_cache=state_cache,
+                slot_mapping=buffers.c4.state_slot_mapping[:num_tokens],
+                positions=positions,
+                block_size=state_block_size,
+                compress_ratio=self.compress_ratio,
+            )
+        with nvtx_range("compressor_pregraph_cache_insert"):
+            deepseek_v4_csa_compress_kv_cache_insert(
+                state_cache=state_cache,
+                token_to_req_indices=buffers.token_to_req[:num_tokens],
+                positions=positions,
+                compressor_slot_mapping=buffers.c4.state_slot_mapping[:num_tokens],
+                block_table=buffers.c4.state_block_table,
+                block_table_base_offsets=buffers.c4.state_base_pages,
+                compressor_block_size=state_block_size,
+                rms_norm_weight=self.norm.weight,
+                rms_norm_eps=self.norm.variance_epsilon,
+                cos_sin_cache=cos_sin_cache,
+                kv_cache_2d=pool.get_compressed_kv_buffer_2d(layer_index),
+                kv_slot_mapping=buffers.c4.kv_slot_mapping[:num_tokens],
+                kv_cache_block_size=pool.get_compressed_block_size(layer_index),
+                compress_ratio=self.compress_ratio,
+            )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -2797,9 +2995,10 @@ class DeepseekV4Compressor(nn.Module):
         if state_cache is None:
             state_cache = pool.get_compressor_state_buffer(layer_index)
         cache_metadata = metadata.cache
-        # state/compressed slot mappings depend only on (per-step state, ratio), so reuse
-        # them across layers of the same ratio within a step. Attn-compressor path only:
-        # the indexer-compressor passes an explicit state_block_table and is excluded.
+        # State mappings depend on per-step state and ratio; compressed mappings also
+        # depend on the actual cache block size. Reuse each exact mapping across layers
+        # within a step. Attn-compressor path only: the indexer-compressor passes an
+        # explicit state_block_table and is excluded.
         memo = compressor_slot_cache if state_block_table is None else None
         if state_block_table is None:
             state_block_table = cache_metadata.compressor_state_block_tables.get(
@@ -2864,9 +3063,12 @@ class DeepseekV4Compressor(nn.Module):
             return kv, score
 
         kv_cache_block_size = pool.get_compressed_block_size(layer_index)
-        compressed_hit = (
-            memo.get(("compressed", self.compress_ratio)) if memo is not None else None
+        compressed_slot_key = (
+            "compressed_slot_mapping",
+            self.compress_ratio,
+            kv_cache_block_size,
         )
+        compressed_hit = memo.get(compressed_slot_key) if memo is not None else None
         if compressed_hit is not None:
             compressed_slots = compressed_hit
         else:
@@ -2886,7 +3088,7 @@ class DeepseekV4Compressor(nn.Module):
                     is_valid_token=valid_token,
                 )
             if memo is not None:
-                memo[("compressed", self.compress_ratio)] = compressed_slots
+                memo[compressed_slot_key] = compressed_slots
         with nvtx_range(f"{profile_prefix}_cache_insert"):
             insert = (
                 deepseek_v4_csa_compress_kv_cache_insert
@@ -3071,6 +3273,9 @@ class DeepseekV4Indexer(nn.Module):
         indexer_cache: torch.Tensor,
         indexer_block_size: int,
         cos_sin_cache: torch.Tensor,
+        packed_q_values: torch.Tensor | None = None,
+        packed_q_scales: torch.Tensor | None = None,
+        packed_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if not self.use_fp4_cache:
             raise RuntimeError(
@@ -3093,23 +3298,32 @@ class DeepseekV4Indexer(nn.Module):
             total_tokens,
         )
 
-        with nvtx_range("indexer_wq_b"):
-            index_q, _ = self.wq_b(qr)
-            index_q = index_q.view(-1, self.n_head, self.head_dim)
-        with nvtx_range("indexer_weights_proj"):
-            weights, _ = self.weights_proj(hidden_states)
-        with nvtx_range("indexer_prepare_mxfp4"):
-            packed_index_q, packed_weights = deepseek_v4_prepare_indexer_q_mxfp4(
-                index_q=index_q,
-                positions=positions,
-                cos_sin_cache=cos_sin_cache,
-                weights=weights,
-                softmax_scale=self.softmax_scale,
-                head_scale=self.n_head**-0.5,
+        packed_inputs_supplied = (
+            packed_q_values is not None,
+            packed_q_scales is not None,
+            packed_weights is not None,
+        )
+        if any(packed_inputs_supplied) and not all(packed_inputs_supplied):
+            raise ValueError(
+                "packed_q_values, packed_q_scales, and packed_weights must be "
+                "provided together"
+            )
+        if not any(packed_inputs_supplied):
+            packed_q_values, packed_q_scales, packed_weights = (
+                self._prepare_packed_inputs(
+                    hidden_states=hidden_states,
+                    qr=qr,
+                    positions=positions,
+                    cos_sin_cache=cos_sin_cache,
+                )
             )
 
+        assert packed_q_values is not None
+        assert packed_q_scales is not None
+        assert packed_weights is not None
+
         packed_indexer_available = _deepseek_v4_deepgemm_fp4_indexer_available(
-            packed_index_q[0]
+            packed_q_values
         )
         if not packed_indexer_available:
             raise RuntimeError(
@@ -3201,8 +3415,8 @@ class DeepseekV4Indexer(nn.Module):
             indexer_block_table=indexer_block_table,
             indexer_block_size=indexer_block_size,
             compress_ratio=self.compress_ratio,
-            packed_q_values=packed_index_q[0],
-            packed_q_scales=packed_index_q[1],
+            packed_q_values=packed_q_values,
+            packed_q_scales=packed_q_scales,
             packed_weights=packed_weights,
             topk_indices_buffer=topk_out,
             prefill_gather_values_workspace=prefill_gather_values,
@@ -3210,6 +3424,98 @@ class DeepseekV4Indexer(nn.Module):
             persistent_topk_workspace=self._persistent_topk_workspace,
             topk_tokens=self.topk_tokens,
         )
+
+    def _prepare_packed_inputs(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        qr: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        with nvtx_range("indexer_wq_b"):
+            index_q, _ = self.wq_b(qr)
+            index_q = index_q.view(-1, self.n_head, self.head_dim)
+        with nvtx_range("indexer_weights_proj"):
+            weights, _ = self.weights_proj(hidden_states)
+        with nvtx_range("indexer_prepare_mxfp4"):
+            # This call consumes the disposable projection output. The
+            # large-token TRT-LLM kernel path applies RoPE to index_q in place.
+            packed_index_q, packed_weights = deepseek_v4_prepare_indexer_q_mxfp4(
+                index_q=index_q,
+                positions=positions,
+                cos_sin_cache=cos_sin_cache,
+                weights=weights,
+                softmax_scale=self.softmax_scale,
+                head_scale=self.n_head**-0.5,
+            )
+        return packed_index_q[0], packed_index_q[1], packed_weights
+
+    def insert_cache_pregraph(
+        self,
+        *,
+        positions: torch.Tensor,
+        ctx: ForwardContext,
+        layer_index: int,
+        cos_sin_cache: torch.Tensor,
+        kv_score: torch.Tensor,
+        buffers: _DeepseekV4PregraphBuffers,
+    ) -> None:
+        """Run the CSA indexer state save + fused cache insert in the captured
+        pre-break prefill-graph segment.
+
+        Captured over the padded bucket against the pregraph staging
+        ``buffers``: when the pre-replay hook armed them with live metadata,
+        these kernels perform this layer's indexer cache writes and the break
+        skips its eager duplicates; behind disarmed (-1) slots -- including the
+        padded tail, whose positions are washed to 0 upstream -- every token is
+        a kernel-side no-op.
+
+        Args:
+            positions: Padded bucket positions (the static input buffer slice).
+            ctx: Forward context supplying the KV pool.
+            layer_index: This layer's compact cache slot.
+            cos_sin_cache: fp32 rope cache shared with the eager insert path.
+            kv_score: The indexer compressor's fused ``[kv | score]`` GEMM
+                output from the current segment.
+            buffers: The model-owned pregraph staging buffers.
+        """
+        pool = ctx.token_to_kv_pool
+        num_tokens = positions.numel()
+        kv, score = kv_score.split(
+            [self.compressor.coff * self.compressor.head_dim] * 2, dim=-1
+        )
+        state_cache = pool.get_indexer_state_buffer(layer_index)
+        state_block_size = pool.get_indexer_state_block_size(layer_index)
+        with nvtx_range("indexer_pregraph_save_state"):
+            save_deepseek_v4_compressor_state(
+                kv=kv,
+                score=score,
+                ape=self.compressor.ape,
+                state_cache=state_cache,
+                slot_mapping=buffers.indexer.state_slot_mapping[:num_tokens],
+                positions=positions,
+                block_size=state_block_size,
+                compress_ratio=self.compress_ratio,
+            )
+        with nvtx_range("indexer_pregraph_cache_insert"):
+            deepseek_v4_csa_indexer_cache_insert(
+                state_cache=state_cache,
+                token_to_req_indices=buffers.token_to_req[:num_tokens],
+                positions=positions,
+                compressor_slot_mapping=buffers.indexer.state_slot_mapping[:num_tokens],
+                block_table=buffers.indexer.state_block_table,
+                block_table_base_offsets=buffers.indexer.state_base_pages,
+                compressor_block_size=state_block_size,
+                rms_norm_weight=self.compressor.norm.weight,
+                rms_norm_eps=self.compressor.norm.variance_epsilon,
+                cos_sin_cache=cos_sin_cache,
+                kv_cache_2d=pool.get_indexer_kv_buffer_2d(layer_index),
+                kv_slot_mapping=buffers.indexer.kv_slot_mapping[:num_tokens],
+                kv_cache_block_size=pool.get_indexer_block_size(layer_index),
+                use_fp4_cache=self.use_fp4_cache,
+                compress_ratio=self.compress_ratio,
+            )
 
     def forward(
         self,
@@ -3222,6 +3528,9 @@ class DeepseekV4Indexer(nn.Module):
         cos_sin_cache: torch.Tensor,
         compressor_slot_cache: dict,
         indexer_compressor_kv_score: torch.Tensor | None = None,
+        packed_q_values: torch.Tensor | None = None,
+        packed_q_scales: torch.Tensor | None = None,
+        packed_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         pool = ctx.token_to_kv_pool
         metadata = _deepseek_v4_forward_metadata(ctx)
@@ -3234,6 +3543,23 @@ class DeepseekV4Indexer(nn.Module):
             if getattr(metadata, "is_valid_token", None) is not None
             else None
         )
+        indexer_block_size = pool.get_indexer_block_size(layer_index)
+        if self.use_fp4_cache and ctx.dsa_pregraph_writes:
+            # Captured segment already wrote this layer; skip to the sparse
+            # indexer. Disarmed/eager forwards keep the path below.
+            return self._forward_sparse_indexer_custom_op(
+                hidden_states=hidden_states,
+                qr=qr,
+                positions=positions,
+                metadata=metadata,
+                ctx=ctx,
+                indexer_cache=pool.get_indexer_kv_buffer_2d(layer_index),
+                indexer_block_size=indexer_block_size,
+                cos_sin_cache=cos_sin_cache,
+                packed_q_values=packed_q_values,
+                packed_q_scales=packed_q_scales,
+                packed_weights=packed_weights,
+            )
         idx_hit = (
             compressor_slot_cache.get("indexer_state")
             if compressor_slot_cache is not None
@@ -3292,19 +3618,33 @@ class DeepseekV4Indexer(nn.Module):
                 kv_score=indexer_compressor_kv_score,
             )
         with nvtx_range("indexer_compressed_slot_mapping"):
-            indexer_block_size = pool.get_indexer_block_size(layer_index)
-            compressed_slots = cache_metadata.compressed_slot_mapping(
-                positions,
+            compressed_slot_key = (
+                "compressed_slot_mapping",
                 self.compress_ratio,
-                token_to_req_indices=metadata.token_to_req_indices[: positions.numel()],
-                query_start_loc=metadata.query_start_loc,
-                seq_lens=metadata.seq_lens,
-                kv_cache_block_size=indexer_block_size,
-                use_decode_cache=(
-                    ctx.forward_mode is not None and ctx.forward_mode.is_decode()
-                ),
-                is_valid_token=valid_token,
+                indexer_block_size,
             )
+            compressed_slots = (
+                compressor_slot_cache.get(compressed_slot_key)
+                if compressor_slot_cache is not None
+                else None
+            )
+            if compressed_slots is None:
+                compressed_slots = cache_metadata.compressed_slot_mapping(
+                    positions,
+                    self.compress_ratio,
+                    token_to_req_indices=metadata.token_to_req_indices[
+                        : positions.numel()
+                    ],
+                    query_start_loc=metadata.query_start_loc,
+                    seq_lens=metadata.seq_lens,
+                    kv_cache_block_size=indexer_block_size,
+                    use_decode_cache=(
+                        ctx.forward_mode is not None and ctx.forward_mode.is_decode()
+                    ),
+                    is_valid_token=valid_token,
+                )
+                if compressor_slot_cache is not None:
+                    compressor_slot_cache[compressed_slot_key] = compressed_slots
         with nvtx_range("indexer_cache_insert"):
             deepseek_v4_csa_indexer_cache_insert(
                 state_cache=indexer_state,
@@ -3332,6 +3672,9 @@ class DeepseekV4Indexer(nn.Module):
             indexer_cache=pool.get_indexer_kv_buffer_2d(layer_index),
             indexer_block_size=indexer_block_size,
             cos_sin_cache=cos_sin_cache,
+            packed_q_values=packed_q_values,
+            packed_q_scales=packed_q_scales,
+            packed_weights=packed_weights,
         )
 
 
@@ -3346,11 +3689,13 @@ class DeepseekV4Attention(nn.Module):
         aux_stream: torch.cuda.Stream | None = None,
         topk_buffer: _DeepseekV4TopKBuffer | None = None,
         cache_layer_index: int | None = None,
+        pregraph_buffers: _DeepseekV4PregraphBuffers | None = None,
     ) -> None:
         super().__init__()
         # `layer_index` addresses checkpoint/config metadata; `cache_layer_index`
         # addresses this model's compact KV cache slot.
         self.layer_index = layer_index
+        self.pregraph_buffers = pregraph_buffers
         self.cache_layer_index = (
             layer_index if cache_layer_index is None else cache_layer_index
         )
@@ -3581,7 +3926,6 @@ class DeepseekV4Attention(nn.Module):
         out, _ = self.wo_b(z.flatten(1))
         return out
 
-    @break_point
     def forward(
         self,
         positions: torch.Tensor,
@@ -3591,51 +3935,13 @@ class DeepseekV4Attention(nn.Module):
         swa_slot_mapping: torch.Tensor | None = None,
         compressor_slot_cache: dict | None = None,
     ) -> torch.Tensor:
-        """DSA attention, one COARSE breakable-graph break point.
-
-        Per layer it does multiple paged-cache writes (SWA / compressor /
-        indexer), a data/length-dependent indexer -> top-k stage, the FlashMLA
-        sparse kernel, AND aux-stream forks -- none capturable into a CUDA
-        graph. Under a prefill-graph capture the whole attention runs eager
-        (reading the live ``ctx``) while the layer's norms + MoE stay graphed;
-        direct call otherwise (see ``break_point``). Padding rows are handled
-        by the existing ``metadata.is_valid_token`` masking, and the
-        token-shaped inputs are sliced to the real count DSA kernels assert
-        (see ``slice_to_real_tokens`` below). The cross-layer SWA slot mapping
-        and compressor memo are shared via ctx -- replay-safe because ctx is
-        rebound to the live forward (see ``DeepseekV4Model.forward``).
-        """
+        """Run token-local projections around the live DSA core break."""
         if hidden_states.shape[0] == 0:
             return hidden_states
-        # Cross-layer compressor memo, created once per forward by the first layer.
-        if compressor_slot_cache is None:
-            compressor_slot_cache = ctx.dsa_compressor_slot_cache
-            if compressor_slot_cache is None:
-                compressor_slot_cache = ctx.dsa_compressor_slot_cache = {}
         profile_prefix = f"attn_{self.attention_kind}"
         cos_sin_cache = self.rotary_emb.cos_sin_cache
         if cos_sin_cache.dtype != torch.float32:
             cos_sin_cache = cos_sin_cache.float()
-        pool = ctx.token_to_kv_pool
-        metadata = ctx.attn_backend.forward_metadata
-        if metadata is None:
-            raise RuntimeError("DeepSeek V4 attention requires forward metadata")
-
-        # Slice padded inputs to the real count the DSA kernels assert (see
-        # docstring). Only under a breakable capture/replay (ambient ctx set):
-        # eager forwards are never padded, and the MTP draft path reaches here
-        # with metadata whose token_to_req_indices does NOT describe q's rows.
-        token_to_req = getattr(metadata, "token_to_req_indices", None)
-        if current_forward_ctx() is not None and token_to_req is not None:
-            positions, hidden_states, out_cache_loc, swa_slot_mapping = (
-                slice_to_real_tokens(
-                    token_to_req.numel(),
-                    positions,
-                    hidden_states,
-                    out_cache_loc,
-                    swa_slot_mapping,
-                )
-            )
 
         # --- Phase 1: pre-compute input GEMMs in parallel ---
         # Q/KV projection on main stream; compressor GEMM(s) on aux stream.
@@ -3644,6 +3950,9 @@ class DeepseekV4Attention(nn.Module):
         # shared-weight dependency that prevents safe multi-stream overlap.
         compressor_kv_score: torch.Tensor | None = None
         indexer_compressor_kv_score: torch.Tensor | None = None
+        packed_q_values: torch.Tensor | None = None
+        packed_q_scales: torch.Tensor | None = None
+        packed_weights: torch.Tensor | None = None
         with self.stream_fork.scope(
             enable=self.stream_fork.aux_stream is not None
         ) as fork:
@@ -3660,6 +3969,156 @@ class DeepseekV4Attention(nn.Module):
                         indexer_compressor_kv_score = (
                             self.indexer.compressor.compute_kv_score(hidden_states)
                         )
+            # Prefill-graph query packing stays on the main stream after qr is
+            # ready and overlaps the compressor GEMMs already queued on aux.
+            if self.indexer is not None and current_forward_ctx() is not None:
+                packed_q_values, packed_q_scales, packed_weights = (
+                    self.indexer._prepare_packed_inputs(
+                        hidden_states=hidden_states,
+                        qr=qr,
+                        positions=positions,
+                        cos_sin_cache=cos_sin_cache,
+                    )
+                )
+
+        # Captured CSA cache writes (indexer + main C4 compressor): only under
+        # an ambient breakable capture/replay, and only once the pregraph
+        # buffers exist (they are allocated by the model's capture hook, so
+        # eligibility here exactly matches what the pre-replay hook may arm).
+        # Eager forwards skip this block entirely and keep their writes inside
+        # the break.
+        # Indexer exists only on CSA (ratio 4) layers -> the layer-kind gate.
+        # Must stay equivalent to run_compressor's compress_ratio == 4 skip, or
+        # an armed replay double-writes; see run_compressor.
+        if (
+            self.indexer is not None
+            and self.pregraph_buffers is not None
+            and self.pregraph_buffers.allocated
+            and current_forward_ctx() is not None
+        ):
+            if self.indexer.use_fp4_cache:
+                with nvtx_range(f"{profile_prefix}_indexer_pregraph_insert"):
+                    self.indexer.insert_cache_pregraph(
+                        positions=positions,
+                        ctx=ctx,
+                        layer_index=self.cache_layer_index,
+                        cos_sin_cache=cos_sin_cache,
+                        kv_score=indexer_compressor_kv_score,
+                        buffers=self.pregraph_buffers,
+                    )
+            if self.compressor is not None:
+                with nvtx_range(f"{profile_prefix}_compressor_pregraph_insert"):
+                    self.compressor.insert_cache_pregraph(
+                        positions=positions,
+                        ctx=ctx,
+                        layer_index=self.cache_layer_index,
+                        cos_sin_cache=cos_sin_cache,
+                        kv_score=compressor_kv_score,
+                        buffers=self.pregraph_buffers,
+                    )
+
+        # Keep these as three top-level tensor args: break-point capture weakly
+        # aliases tensor args, but intentionally does not recurse into tuples.
+        attn_output = self._forward_attention_core(
+            positions,
+            hidden_states,
+            q,
+            kv,
+            qr,
+            cos_sin_cache,
+            ctx,
+            out_cache_loc,
+            compressor_kv_score,
+            indexer_compressor_kv_score,
+            swa_slot_mapping,
+            compressor_slot_cache,
+            packed_q_values,
+            packed_q_scales,
+            packed_weights,
+        )
+        with nvtx_range(f"{profile_prefix}_output_proj"):
+            return self._project_attention_output(
+                attn_output,
+                positions,
+                cos_sin_cache,
+            )
+
+    @break_point
+    def _forward_attention_core(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        qr: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        ctx: ForwardContext,
+        out_cache_loc: torch.Tensor,
+        compressor_kv_score: torch.Tensor | None,
+        indexer_compressor_kv_score: torch.Tensor | None,
+        swa_slot_mapping: torch.Tensor | None = None,
+        compressor_slot_cache: dict | None = None,
+        packed_q_values: torch.Tensor | None = None,
+        packed_q_scales: torch.Tensor | None = None,
+        packed_weights: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run the request-dependent DSA work as one breakable-graph break.
+
+        The token-local projections are produced by the preceding graph segment
+        at the padded bucket size. This eager core rebinds ``ctx`` to the live
+        forward, slices every token-shaped input to the real metadata count, and
+        keeps all cache writes, sparse-indexer planning, and attention outside
+        the graph. Its raw attention output lands in the stable handoff buffer so
+        the caller's token-local output projection joins the following segment.
+        """
+        # Cross-layer compressor memo, created once per forward by the first layer.
+        if compressor_slot_cache is None:
+            compressor_slot_cache = ctx.dsa_compressor_slot_cache
+            if compressor_slot_cache is None:
+                compressor_slot_cache = ctx.dsa_compressor_slot_cache = {}
+        profile_prefix = f"attn_{self.attention_kind}"
+        pool = ctx.token_to_kv_pool
+        metadata = ctx.attn_backend.forward_metadata
+        if metadata is None:
+            raise RuntimeError("DeepSeek V4 attention requires forward metadata")
+        forward_mode = ctx.forward_mode
+        if forward_mode is None:
+            raise RuntimeError("DeepSeek V4 attention requires forward mode")
+
+        # Slice padded inputs to the real count the DSA kernels assert (see
+        # docstring). Only under a breakable capture/replay (ambient ctx set):
+        # eager forwards are never padded, and the MTP draft path reaches here
+        # with metadata whose token_to_req_indices does NOT describe q's rows.
+        token_to_req = getattr(metadata, "token_to_req_indices", None)
+        if current_forward_ctx() is not None and token_to_req is not None:
+            (
+                positions,
+                hidden_states,
+                q,
+                kv,
+                qr,
+                out_cache_loc,
+                compressor_kv_score,
+                indexer_compressor_kv_score,
+                swa_slot_mapping,
+                packed_q_values,
+                packed_q_scales,
+                packed_weights,
+            ) = slice_to_real_tokens(
+                token_to_req.numel(),
+                positions,
+                hidden_states,
+                q,
+                kv,
+                qr,
+                out_cache_loc,
+                compressor_kv_score,
+                indexer_compressor_kv_score,
+                swa_slot_mapping,
+                packed_q_values,
+                packed_q_scales,
+                packed_weights,
+            )
 
         if swa_slot_mapping is None:
             # Cross-layer SWA slot mapping (per-token, layer-invariant), first layer computes.
@@ -3686,6 +4145,11 @@ class DeepseekV4Attention(nn.Module):
 
         def run_compressor() -> None:
             if self.compressor is None:
+                return
+            if self.compress_ratio == 4 and ctx.dsa_pregraph_writes:
+                # Captured pre-break segment already wrote this CSA layer;
+                # HCA (C128) keeps the eager path. Gate must match the
+                # captured-write gate (see insert_cache_pregraph call site).
                 return
             with nvtx_range(f"{profile_prefix}_compressor"):
                 self.compressor(
@@ -3730,6 +4194,9 @@ class DeepseekV4Attention(nn.Module):
                         cos_sin_cache=cos_sin_cache,
                         compressor_slot_cache=compressor_slot_cache,
                         indexer_compressor_kv_score=indexer_compressor_kv_score,
+                        packed_q_values=packed_q_values,
+                        packed_q_scales=packed_q_scales,
+                        packed_weights=packed_weights,
                     )
                 with fork.branch():
                     insert_swa_cache()
@@ -3799,12 +4266,7 @@ class DeepseekV4Attention(nn.Module):
                 )
         else:
             raise RuntimeError(f"Unsupported DeepSeek V4 forward mode: {forward_mode}")
-        with nvtx_range(f"{profile_prefix}_output_proj"):
-            return self._project_attention_output(
-                attn_output,
-                positions,
-                cos_sin_cache,
-            )
+        return attn_output
 
 
 class DeepseekV4DecoderLayer(nn.Module):
@@ -3818,6 +4280,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         aux_stream: torch.cuda.Stream | None = None,
         topk_buffer: _DeepseekV4TopKBuffer | None = None,
         cache_layer_index: int | None = None,
+        pregraph_buffers: _DeepseekV4PregraphBuffers | None = None,
     ) -> None:
         super().__init__()
         self.mapping = mapping
@@ -3838,6 +4301,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             aux_stream=aux_stream,
             topk_buffer=topk_buffer,
             cache_layer_index=cache_layer_index,
+            pregraph_buffers=pregraph_buffers,
         )
         self.ffn = DeepseekV4MoE(
             config,
@@ -4019,6 +4483,7 @@ class DeepseekV4Model(nn.Module):
         self.rms_norm_eps = config.rms_norm_eps
         self.aux_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
         self.topk_indices_buffer = _DeepseekV4TopKBuffer(int(config.index_topk))
+        self.pregraph_buffers = _DeepseekV4PregraphBuffers()
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
@@ -4037,9 +4502,27 @@ class DeepseekV4Model(nn.Module):
                     add_prefix(f"layers.{layer_id}", prefix),
                     aux_stream=self.aux_stream,
                     topk_buffer=self.topk_indices_buffer,
+                    pregraph_buffers=self.pregraph_buffers,
                 )
                 for layer_id in range(config.num_hidden_layers)
             ]
+        )
+        # First CSA layer eligible for captured indexer cache writes (the
+        # indexer state mapping and block sizes are layer-invariant, like the
+        # cross-layer memo); the prefill-graph hooks stay inert when None.
+        pregraph_attn = next(
+            (
+                layer.attn
+                for layer in self.layers
+                if layer.attn.indexer is not None and layer.attn.indexer.use_fp4_cache
+            ),
+            None,
+        )
+        self._pregraph_indexer_cache_layer_index = (
+            pregraph_attn.cache_layer_index if pregraph_attn is not None else None
+        )
+        self._pregraph_indexer_compress_ratio = (
+            pregraph_attn.indexer.compress_ratio if pregraph_attn is not None else 0
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         hc_dim = config.hc_mult * config.hidden_size
@@ -4111,6 +4594,183 @@ class DeepseekV4Model(nn.Module):
         with nvtx_range("final_norm"):
             hidden_states = self.norm(hidden_states)
         return hidden_states, aux_hidden_states
+
+    def prepare_prefill_graph_replay(
+        self,
+        ctx: ForwardContext,
+        positions: torch.Tensor,
+        *,
+        capture: bool = False,
+    ) -> None:
+        """Stage the pregraph DSA cache-write metadata for a prefill-graph run.
+
+        The :class:`PrefillGraph` optional model hook. On the dummy capture
+        batch (``capture=True``, the only call allowed to allocate) this sizes
+        the staging buffers from the dummy metadata and leaves them disarmed.
+        Before each replay it re-checks safety -- pure extend, FP4 indexer,
+        complete metadata whose shapes fit the captured buffers -- and either
+        refreshes the buffers in place from live metadata (indexer AND main
+        C4 compressor staging, armed together or not at all) and sets
+        ``ctx.dsa_pregraph_writes`` so the attention break skips its eager
+        indexer and CSA-compressor cache writes; anything unsafe disarms the
+        buffers, so the captured writes replay as per-token no-ops while the
+        break keeps the eager path unchanged.
+
+        Args:
+            ctx: The forward context about to capture or replay.
+            positions: The static positions-buffer slice -- the padded bucket
+                at capture, the real token count at replay (tail rows beyond
+                it are washed to 0 upstream and stay behind -1 slots).
+            capture: True only for the dummy capture batch.
+        """
+        ctx.dsa_pregraph_writes = False
+        cache_layer_index = self._pregraph_indexer_cache_layer_index
+        if cache_layer_index is None:
+            return
+        compress_ratio = self._pregraph_indexer_compress_ratio
+        buffers = self.pregraph_buffers
+        metadata = _deepseek_v4_forward_metadata(ctx)
+        cache_metadata = metadata.cache if metadata is not None else None
+        state_table = (
+            cache_metadata.indexer_state_block_table
+            if cache_metadata is not None
+            else None
+        )
+        c4_state_table = (
+            cache_metadata.compressor_state_block_tables.get(compress_ratio)
+            if cache_metadata is not None
+            else None
+        )
+        if capture:
+            # No indexer/compressor-state group in the dummy metadata -> stay
+            # unallocated so replays are permanently disarmed, matching that
+            # the captured segments skip these writes too.
+            if state_table is None or c4_state_table is None or ctx.req_to_page is None:
+                return
+            max_reqs = max(1, min(int(ctx.req_to_page.shape[0]), positions.numel()))
+            buffers.allocate(
+                positions.numel(),
+                max_reqs,
+                int(state_table.shape[1]),
+                int(c4_state_table.shape[1]),
+                positions.device,
+            )
+            return
+        if not buffers.allocated:
+            return
+        num_tokens = positions.numel()
+        forward_mode = ctx.forward_mode
+        if (
+            forward_mode is None
+            or not forward_mode.is_extend()
+            or forward_mode.is_mixed()
+            or state_table is None
+            or c4_state_table is None
+            or not _deepseek_v4_metadata_matches_tokens(metadata, num_tokens)
+            or int(metadata.num_prefill_tokens) != num_tokens
+            or metadata.decode_token_count() != 0
+            or metadata.query_start_loc is None
+            or metadata.seq_lens is None
+            or num_tokens > buffers.token_to_req.shape[0]
+            or int(state_table.shape[0]) > buffers.indexer.state_block_table.shape[0]
+            or int(state_table.shape[1]) > buffers.indexer.state_block_table.shape[1]
+            or int(c4_state_table.shape[0]) > buffers.c4.state_block_table.shape[0]
+            or int(c4_state_table.shape[1]) > buffers.c4.state_block_table.shape[1]
+        ):
+            buffers.disarm()
+            return
+        num_reqs = int(state_table.shape[0])
+        base_pages = cache_metadata.indexer_state_base_logical_page
+        c4_num_reqs = int(c4_state_table.shape[0])
+        c4_base_pages = cache_metadata.compressor_state_base_logical_pages.get(
+            compress_ratio
+        )
+        if (base_pages is not None and int(base_pages.shape[0]) < num_reqs) or (
+            c4_base_pages is not None and int(c4_base_pages.shape[0]) < c4_num_reqs
+        ):
+            buffers.disarm()
+            return
+        pool = ctx.token_to_kv_pool
+        token_to_req = metadata.token_to_req_indices[:num_tokens]
+        valid_token = (
+            metadata.is_valid_token[:num_tokens]
+            if getattr(metadata, "is_valid_token", None) is not None
+            else None
+        )
+        state_slot_mapping = _group_slot_mapping_from_raw(
+            positions,
+            token_to_req,
+            state_table,
+            pool.get_indexer_state_block_size(cache_layer_index),
+            base_offsets=base_pages,
+        )
+        state_slot_mapping = _mask_invalid_graph_tokens(
+            state_slot_mapping,
+            valid_token,
+        )
+        indexer_block_size = pool.get_indexer_block_size(cache_layer_index)
+        compressed_slots = cache_metadata.compressed_slot_mapping(
+            positions,
+            compress_ratio,
+            token_to_req_indices=token_to_req,
+            query_start_loc=metadata.query_start_loc,
+            seq_lens=metadata.seq_lens,
+            kv_cache_block_size=indexer_block_size,
+            use_decode_cache=False,
+            is_valid_token=valid_token,
+        )
+        c4_state_slot_mapping = _group_slot_mapping_from_raw(
+            positions,
+            token_to_req,
+            c4_state_table,
+            pool.get_compressor_state_block_size(cache_layer_index),
+            base_offsets=c4_base_pages,
+        )
+        c4_state_slot_mapping = _mask_invalid_graph_tokens(
+            c4_state_slot_mapping,
+            valid_token,
+        )
+        c4_kv_block_size = pool.get_compressed_block_size(cache_layer_index)
+        if c4_kv_block_size == indexer_block_size:
+            c4_compressed_slots = compressed_slots
+        else:
+            c4_compressed_slots = cache_metadata.compressed_slot_mapping(
+                positions,
+                compress_ratio,
+                token_to_req_indices=token_to_req,
+                query_start_loc=metadata.query_start_loc,
+                seq_lens=metadata.seq_lens,
+                kv_cache_block_size=c4_kv_block_size,
+                use_decode_cache=False,
+                is_valid_token=valid_token,
+            )
+        buffers.disarm()
+        buffers.token_to_req[:num_tokens].copy_(token_to_req)
+        buffers.indexer.stage(
+            num_tokens,
+            state_slot_mapping,
+            compressed_slots,
+            state_table,
+            base_pages,
+        )
+        buffers.c4.stage(
+            num_tokens,
+            c4_state_slot_mapping,
+            c4_compressed_slots,
+            c4_state_table,
+            c4_base_pages,
+        )
+        ctx.dsa_pregraph_writes = True
+
+    def finish_prefill_graph_replay(self, ctx: ForwardContext) -> None:
+        """Clear the pregraph arm flag; called in the replay ``finally``.
+
+        Buffers are left armed: the capture block only runs under an ambient
+        context, entered solely by capture or by replay right after prepare
+        armed/disarmed them. A new ambient entry that skips prepare would
+        break exactly-once.
+        """
+        ctx.dsa_pregraph_writes = False
 
 
 class DeepseekV4ForCausalLM(BaseCausalLM):
