@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.kvcache.triton import index_k_block_split_scatter
 from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
 
 from tokenspeed.runtime.layers.attention.configs.dsa import dsa_index_k_row_bytes
@@ -194,13 +195,15 @@ class DSATokenToKVPool(MLATokenToKVPool):
             scale_encoding="float32",
         )
 
-        fp8_view, scale_view = self._index_k_block_views(buf)
-        loc = loc.to(torch.long)
-        page = loc // self.page_size
-        slot_in_page = loc % self.page_size
-        fp8_view[page, slot_in_page] = index_k_fp8.view(-1, self.index_head_dim)
-        scale_view[page, slot_in_page] = index_k_scale.view(
-            -1, self.index_head_dim // _INDEX_K_FP8_GROUP_SIZE
+        # Fused scatter; (page, slot_in_page) is derived from loc in-kernel.
+        index_k_block_split_scatter(
+            buf,
+            index_k_fp8,
+            index_k_scale,
+            loc,
+            page_size=self.page_size,
+            head_dim=self.index_head_dim,
+            group_size=_INDEX_K_FP8_GROUP_SIZE,
         )
 
     def get_contiguous_buf_infos(self):

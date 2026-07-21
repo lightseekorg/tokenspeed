@@ -32,6 +32,8 @@ from tokenspeed_kernel.ops.attention import (
     dsa_prefill,
     dsa_prefill_topk,
     gdn_chunk_prefill,
+    gdn_decode_mtp,
+    gdn_decode_step,
     mha_decode_with_kvcache,
     mha_extend_with_kvcache,
     mha_plan,
@@ -80,6 +82,8 @@ __all__ = [
     "dsa_plan",
     "attn_merge_state",
     "gdn_chunk_prefill",
+    "gdn_decode_step",
+    "gdn_decode_mtp",
     "GdnCheckpointLayout",
     "GdnChunkPrefillResult",
     # moe

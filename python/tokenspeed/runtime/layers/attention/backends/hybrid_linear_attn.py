@@ -27,7 +27,12 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel.ops.attention import GdnCheckpointLayout, gdn_chunk_prefill
+from tokenspeed_kernel.ops.attention import (
+    GdnCheckpointLayout,
+    gdn_chunk_prefill,
+    gdn_decode_mtp,
+    gdn_decode_step,
+)
 from tokenspeed_kernel.ops.attention.triton.gdn_qkv_split import (
     fused_qkv_split_gdn_prefill,
 )
@@ -53,9 +58,6 @@ from tokenspeed.runtime.layers.attention.backends.base import (
 from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
-)
-from tokenspeed.runtime.layers.attention.linear.fused_sigmoid_gating_recurrent import (
-    fused_sigmoid_gating_delta_rule_update,
 )
 from tokenspeed.runtime.layers.attention.linear.gdn import fused_gdn_gating
 from tokenspeed.runtime.layers.attention.linear.mamba_state_scatter_triton import (
@@ -126,6 +128,23 @@ def compute_state_page_indices(
         if torch.unique(state_out).numel() != state_out.numel():
             raise ValueError("state out pages must be unique per batch")
     return state_in.to(torch.int32), state_out.to(torch.int32)
+
+
+def _prepare_gdn_decode_state_path(
+    ssm_states: torch.Tensor,
+    initial_state_indices: torch.Tensor,
+    output_state_indices: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor | None, str | None]:
+    """Select a safe decode solution while preserving graph padding indices.
+
+    FlashInfer's FP32 kernels skip negative state rows, and the portable Triton
+    kernels guard negative reads and writes for both FP32 and BF16 state. The
+    FlashInfer BF16 path instead redirects padding to row 0, which is a live,
+    scheduler-owned row in the radix Mamba pool. Until that kernel supports a
+    padding mask, route BF16 state through Triton and keep ``-1`` unchanged.
+    """
+    solution = "triton" if ssm_states.dtype == torch.bfloat16 else None
+    return initial_state_indices, output_state_indices, solution
 
 
 @dataclass
@@ -244,7 +263,8 @@ class SimpleMambaPool:
             dtype=conv_dtype,
             device=device,
         )
-        # Allocate temporal/SSM state: (num_mamba_layers, total_size, heads, key_dim, val_dim)
+        # temporal_state_shape is already K-last [Hv, V, K], matching the
+        # native GDN decode/MTP/chunk-prefill state layout.
         self.ssm_state = torch.zeros(
             num_mamba_layers,
             total_size,
@@ -1148,7 +1168,6 @@ class MambaAttnBackend(AttentionBackend):
         dt_bias = kwargs["dt_bias"]
         layer_id = kwargs["layer_id"]
 
-        query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
         state_in_pages = self.forward_metadata.state_in_pages
         state_out_pages = self.forward_metadata.state_out_pages
@@ -1186,30 +1205,41 @@ class MambaAttnBackend(AttentionBackend):
         )
         seq_len = query.shape[0]
         num_heads = query.shape[1] // head_k_dim
-        query = query.view(1, seq_len, num_heads, head_k_dim)
-        key = key.view(1, seq_len, num_heads, head_k_dim)
-        value = value.view(1, seq_len, value.shape[1] // head_v_dim, head_v_dim)
+        # [B, 1, H, K] / [B, 1, HV, V]: B=this decode step's request count,
+        # T=1. gdn_decode_step's K-last state pool means no transpose is
+        # needed between this call and the pool/state-slab storage.
+        query = query.view(seq_len, 1, num_heads, head_k_dim)
+        key = key.view(seq_len, 1, num_heads, head_k_dim)
+        value = value.view(seq_len, 1, value.shape[1] // head_v_dim, head_v_dim)
 
-        core_attn_out = fused_sigmoid_gating_delta_rule_update(
-            A_log=A_log,
-            dt_bias=dt_bias,
+        (
+            decode_initial_indices,
+            decode_output_indices,
+            decode_solution,
+        ) = _prepare_gdn_decode_state_path(
+            ssm_states,
+            read_indices,
+            state_out_pages if use_flat else None,
+        )
+        core_attn_out = gdn_decode_step(
             q=query,
             k=key,
             v=value,
-            a=a,
-            b=b,
-            initial_state_source=ssm_states,
-            initial_state_indices=read_indices,
-            cu_seqlens=query_start_loc,
-            use_qk_l2norm_in_kernel=True,
-            softplus_beta=1.0,
-            softplus_threshold=20.0,
-            # Flat: don't write back to the (possibly shared) in page; the
-            # post-step state lands on the out page instead.
-            disable_state_update=use_flat,
-            output_state_indices=state_out_pages if use_flat else None,
+            A_log=A_log,
+            a=a.unsqueeze(1),
+            dt_bias=dt_bias,
+            b=b.unsqueeze(1),
+            initial_state=ssm_states,
+            initial_state_indices=decode_initial_indices,
+            # Flat: write to the out page, not the (possibly shared) in page;
+            # pool: None writes back in place to initial_state_indices.
+            output_state_indices=decode_output_indices,
+            use_qk_l2norm=True,
+            solution=decode_solution,
         )
-        return core_attn_out
+        # [B, 1, Hv, V] (pool/indices-major) -> [1, B, Hv, V], this backend's
+        # decode-output convention (matches gdn_chunk_prefill's B=1-leading out).
+        return core_attn_out.transpose(0, 1)
 
     def forward_extend(
         self,
@@ -1354,24 +1384,44 @@ class MambaAttnBackend(AttentionBackend):
             draft_token_num = kwargs.get(
                 "draft_token_num", self.speculative_num_draft_tokens
             )
-            core_attn_out = fused_sigmoid_gating_delta_rule_update(
-                A_log=A_log,
-                dt_bias=dt_bias,
-                q=query,
-                k=key,
-                v=value,
-                a=a,
-                b=b,
-                initial_state_source=ssm_states,
-                initial_state_indices=cache_indices,
-                cu_seqlens=query_start_loc,
-                use_qk_l2norm_in_kernel=True,
-                softplus_beta=1.0,
-                softplus_threshold=20.0,
-                # target_verify specific parameters
-                disable_state_update=True,
-                output_state_indices=self.forward_metadata.mamba_output_indices,
+            batch_size = seq_len // draft_token_num
+            # fused_qkv_split_gdn_prefill's [1, seq_len, H, D] varlen-style
+            # layout is request-major (token = req * draft_token_num + step),
+            # so reshaping the leading two dims into [B, T, H, D] is a plain
+            # view -- gdn_decode_mtp's dense-batch contract, no data movement.
+            query_b = query.view(batch_size, draft_token_num, num_heads, head_k_dim)
+            key_b = key.view(batch_size, draft_token_num, num_heads, head_k_dim)
+            value_b = value.view(
+                batch_size, draft_token_num, num_value_heads, head_v_dim
             )
+            a_b = a.view(batch_size, draft_token_num, -1)
+            b_b = b.view(batch_size, draft_token_num, -1)
+
+            output_indices = self.forward_metadata.mamba_output_indices
+            (
+                mtp_initial_indices,
+                mtp_output_indices,
+                mtp_solution,
+            ) = _prepare_gdn_decode_state_path(
+                ssm_states,
+                cache_indices,
+                output_indices,
+            )
+            core_attn_out = gdn_decode_mtp(
+                query_b,
+                key_b,
+                value_b,
+                A_log=A_log,
+                a=a_b,
+                dt_bias=dt_bias,
+                b=b_b,
+                initial_state=ssm_states,
+                initial_state_indices=mtp_initial_indices,
+                use_qk_l2norm=True,
+                output_state_indices=mtp_output_indices,
+                disable_state_update=False,
+                solution=mtp_solution,
+            ).reshape(1, seq_len, num_value_heads, head_v_dim)
         else:
             beta = b.sigmoid()
             g = fused_gdn_gating(A_log, a, dt_bias)

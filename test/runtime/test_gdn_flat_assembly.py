@@ -97,6 +97,22 @@ class Qwen3_5LayerTypesTest(unittest.TestCase):
         cfg.full_attention_interval = 1
         self.assertEqual(cfg.layer_types, ["full_attention"] * 2)
 
+    def test_temporal_state_shape_is_native_k_last(self):
+        from tokenspeed.runtime.utils.env import global_server_args_dict
+
+        mapping = mock.Mock()
+        mapping.attn.tp_size = 2
+        cfg = self.config_cls(
+            full_attention_interval=4,
+            linear_num_value_heads=8,
+            linear_key_head_dim=3,
+            linear_value_head_dim=5,
+        )
+        with mock.patch.dict(global_server_args_dict, {"mapping": mapping}):
+            temporal_state_shape = cfg.mamba2_cache_params[1]
+
+        self.assertEqual(temporal_state_shape, (4, 5, 3))
+
 
 class EqualizedPageSizeTest(unittest.TestCase):
     """Pure equalization decision (no torch)."""

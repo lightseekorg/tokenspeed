@@ -7,6 +7,7 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.hybrid_linear_attn import (
     MambaAttnBackend,
     SimpleMambaPool,
+    _prepare_gdn_decode_state_path,
 )
 from tokenspeed.runtime.layers.attention.linear.mamba_state_scatter_triton import (
     fused_mamba_state_copy,
@@ -34,6 +35,57 @@ def _new_backend(page_size: int = 64) -> MambaAttnBackend:
     backend.speculative_num_draft_tokens = 0
     backend.flat_state_active = False
     return backend
+
+
+@pytest.mark.parametrize(
+    ("state_dtype", "expected_solution"),
+    [
+        (torch.float32, None),
+        (torch.bfloat16, "triton"),
+    ],
+)
+def test_gdn_decode_state_path_preserves_padding_indices(
+    state_dtype: torch.dtype, expected_solution: str | None
+):
+    states = torch.empty(1, dtype=state_dtype)
+    initial = torch.tensor([3, -1], dtype=torch.int32)
+    output = torch.tensor([[4, 5], [-1, -1]], dtype=torch.int32)
+
+    prepared_initial, prepared_output, solution = _prepare_gdn_decode_state_path(
+        states, initial, output
+    )
+
+    assert prepared_initial is initial
+    assert prepared_output is output
+    assert solution == expected_solution
+
+
+def test_bf16_decode_without_output_indices_falls_back_to_triton():
+    states = torch.empty(1, dtype=torch.bfloat16)
+    initial = torch.tensor([3, -1], dtype=torch.int32)
+
+    prepared_initial, prepared_output, solution = _prepare_gdn_decode_state_path(
+        states, initial, None
+    )
+
+    assert prepared_initial is initial
+    assert prepared_output is None
+    assert solution == "triton"
+
+
+def test_simple_mamba_pool_preserves_k_last_temporal_shape():
+    pool = SimpleMambaPool(
+        size=8,
+        num_mamba_layers=1,
+        conv_state_shape=(4,),
+        temporal_state_shape=(2, 3, 5),
+        conv_dtype=torch.float32,
+        ssm_dtype=torch.float32,
+        mamba_layer_ids=[0],
+        device="cpu",
+    )
+
+    assert pool.ssm_state.shape == (1, 8, 2, 3, 5)
 
 
 def test_simple_mamba_pool_current_input_map_uses_rank_local_req_pool_range():
