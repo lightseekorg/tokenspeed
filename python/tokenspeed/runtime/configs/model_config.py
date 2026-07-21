@@ -66,6 +66,11 @@ _DSA_ARCHITECTURES = frozenset(
         "GlmMoeDsaForCausalLMNextN",
     }
 )
+_MSA_ARCHITECTURES = frozenset(
+    {
+        "MiniMaxM3SparseForConditionalGeneration",
+    }
+)
 _DOUBLE_ATTENTION_LAYER_ARCHITECTURES = frozenset(
     {
         "LongcatFlashForCausalLM",
@@ -209,6 +214,10 @@ def configure_mla_attention(model_config) -> None:
         model_config.scaling = model_config.scaling * mscale * mscale
 
 
+def configure_minimax_m3_attention(model_config) -> None:
+    model_config.attention_arch = AttentionArch.MSA
+
+
 _ATTENTION_FAMILY_SPECS = (
     _AttentionFamilySpec(
         name="DeepSeek V4",
@@ -228,6 +237,12 @@ _ATTENTION_FAMILY_SPECS = (
         name="MLA",
         architectures=_MLA_ARCHITECTURES,
         configure=configure_mla_attention,
+    ),
+    _AttentionFamilySpec(
+        name="MiniMax MSA",
+        architectures=_MSA_ARCHITECTURES,
+        configure=configure_minimax_m3_attention,
+        default_block_size=128,
     ),
 )
 

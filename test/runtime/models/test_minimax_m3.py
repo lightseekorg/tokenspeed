@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from transformers import MiniMaxM3VLTextConfig
 
 from tokenspeed.runtime.configs import MiniMaxM3Config
 from tokenspeed.runtime.configs.minimax_m3_config import MiniMaxM3VisionConfig
-from tokenspeed.runtime.configs.model_config import is_multimodal_model
+from tokenspeed.runtime.configs.model_config import (
+    AttentionArch,
+    _resolve_attention_family,
+    is_multimodal_model,
+)
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.layers.quantization.fp8 import Mxfp8Config
 from tokenspeed.runtime.models.minimax_m3 import (
@@ -138,6 +144,23 @@ def test_minimax_m3_config() -> None:
     assert config.text_config.index_block_size == 128
     assert isinstance(config.vision_config, MiniMaxM3VisionConfig)
     assert is_multimodal_model(["MiniMaxM3SparseForConditionalGeneration"])
+
+
+def test_minimax_m3_attention_family_selects_msa() -> None:
+    config = _tiny_config()
+    config.architectures = ["MiniMaxM3SparseForConditionalGeneration"]
+
+    spec = _resolve_attention_family(config, config.text_config)
+    assert spec is not None
+    assert spec.name == "MiniMax MSA"
+    assert spec.default_block_size == 128
+    # --attention-backend must keep selecting the dense sub-backend; the
+    # top-level backend is pinned by MinimaxSparseConfig itself.
+    assert spec.default_backend is None
+
+    model_config = SimpleNamespace(attention_arch=None)
+    spec.configure(model_config)
+    assert model_config.attention_arch is AttentionArch.MSA
 
 
 def test_minimax_m3_tp4_meta_layout_and_loader(monkeypatch: pytest.MonkeyPatch) -> None:
