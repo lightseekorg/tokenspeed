@@ -143,6 +143,10 @@ def _initialize_model(
     """Initialize a model with the given configurations."""
     model_class, _ = get_model_architecture(model_config)
     quant_config = _get_quantization_config(model_config, load_config)
+    if quant_config is not None:
+        replacements = getattr(model_class, "quant_module_name_replacements", None)
+        if replacements:
+            quant_config.apply_checkpoint_name_replacements(replacements)
     mapping = model_config.mapping
     # Only VLM wrappers accept these kwargs.
     extra_kwargs: dict = {}

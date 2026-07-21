@@ -203,12 +203,18 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             },
         )
 
-        # State parameters
+        # FlashInfer GDN decay inputs must stay in FP32.
         self.dt_bias = nn.Parameter(
-            torch.ones(self.num_v_heads // self.attn_tp_size),
+            torch.ones(
+                self.num_v_heads // self.attn_tp_size,
+                dtype=torch.float32,
+            ),
         )
         self.A_log = nn.Parameter(
-            torch.empty(self.num_v_heads // self.attn_tp_size),
+            torch.empty(
+                self.num_v_heads // self.attn_tp_size,
+                dtype=torch.float32,
+            ),
         )
 
         set_weight_attrs(

@@ -65,6 +65,29 @@ if platform.is_nvidia:
             requires_grad=False,
         )
 
+        swiglu_arg = getattr(w, "swiglu_arg", None)
+        if swiglu_arg is not None:
+            # The cutlass gated activation runs post-dequant, so alpha/beta/
+            # limit are passed in the actual-value domain (SwigluBias adaptor).
+            num_experts = w.w13_weight.shape[0]
+            device = w.w13_weight.device
+
+            def _per_expert(value: float) -> torch.nn.Parameter:
+                return torch.nn.Parameter(
+                    torch.full(
+                        (num_experts,), float(value), dtype=torch.float32, device=device
+                    ),
+                    requires_grad=False,
+                )
+
+            alpha = swiglu_arg.alpha if swiglu_arg.alpha is not None else 1.0
+            beta = getattr(w, "swiglu_beta", None)
+            w.swiglu_alpha_t = _per_expert(alpha)
+            if beta is not None:
+                w.swiglu_beta_t = _per_expert(beta)
+            if swiglu_arg.limit is not None:
+                w.swiglu_limit_t = _per_expert(swiglu_arg.limit)
+
         scales = w.w13_weight_scale
         scale_ndim = scales.ndim
         if scale_ndim == 2:
@@ -158,6 +181,10 @@ if platform.is_nvidia:
         output = torch.empty(
             x.shape[0], x.shape[1], dtype=torch.bfloat16, device=x.device
         )
+        swiglu_alpha = getattr(w, "swiglu_alpha_t", None)
+        activation_type = (
+            ActivationType.Swiglu if swiglu_alpha is None else ActivationType.SwigluBias
+        )
         return cutlass_fused_moe(
             output=output,
             input=x,
@@ -180,5 +207,8 @@ if platform.is_nvidia:
             tp_size=getattr(w, "tp_size", 1),
             tp_rank=getattr(w, "tp_rank", 0),
             tune_max_num_tokens=next_power_of_2(x.shape[0]),
-            activation_type=ActivationType.Swiglu,
+            activation_type=activation_type,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=getattr(w, "swiglu_beta_t", None),
+            swiglu_limit=getattr(w, "swiglu_limit_t", None),
         )[0]

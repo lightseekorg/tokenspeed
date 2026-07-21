@@ -273,6 +273,76 @@ def workspace_topk_to_global_slots(
 
 
 @triton.jit
+def _combine_topk_weights_kernel(
+    weights_ptr,
+    q_scale_ptr,
+    out_ptr,
+    softmax_scale,
+    weights_row_stride,
+    heads,
+    numel,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < numel
+    t = offs // heads
+    h = offs % heads
+    w = tl.load(weights_ptr + t * weights_row_stride + h, mask=mask).to(tl.float32)
+    q_scale = tl.load(q_scale_ptr + offs, mask=mask)
+    tl.store(out_ptr + offs, w * q_scale * softmax_scale, mask=mask)
+
+
+def combine_topk_weights(
+    weights: torch.Tensor,
+    q_scale: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """Build the combined per-(token, head) weights for DSA logits scoring.
+
+    Single-launch, bit-exact equivalent of
+    ``(weights.float().unsqueeze(-1) * q_scale * float(softmax_scale)).squeeze(-1)``
+    (same fp32 operation order).
+
+    Args:
+        weights: ``[tokens, heads]`` bf16/fp16/fp32 indexer weights. The
+            leading axis may have any stride (e.g. a column-``split`` view of
+            the fused ``wk_weights_proj`` output); only ``stride(-1) == 1``
+            is required.
+        q_scale: fp32 per-``(token, head)`` dequant scales with
+            ``tokens * heads`` elements in row-major order (any unit-trailing
+            shape such as ``[tokens * heads, 1]`` or ``[tokens, heads, 1]``).
+        softmax_scale: Constant score scale folded into the weights.
+
+    Returns:
+        ``[tokens, heads]`` contiguous fp32 combined weights.
+    """
+    tokens, heads = weights.shape
+    if weights.stride(-1) != 1:
+        raise ValueError("combine_topk_weights expects unit-stride weights rows")
+    if q_scale.dtype != torch.float32:
+        raise TypeError(f"q_scale must be fp32, got {q_scale.dtype}")
+    q_scale = q_scale.reshape(tokens * heads)
+    out = torch.empty(tokens, heads, dtype=torch.float32, device=weights.device)
+    numel = tokens * heads
+    if numel == 0:
+        return out
+    block = 1024
+    _combine_topk_weights_kernel[(triton.cdiv(numel, block),)](
+        weights,
+        q_scale,
+        out,
+        float(softmax_scale),
+        weights.stride(0),
+        heads,
+        numel,
+        BLOCK=block,
+        num_warps=4,
+        num_stages=1,
+    )
+    return out
+
+
+@triton.jit
 def _dsa_decode_logits_fp8_kernel(
     q,
     index_k_fp8,
@@ -1046,7 +1116,12 @@ def triton_dsa_plan(
             format_signature(
                 q=dense_tensor_format(torch.bfloat16),
                 weights=dense_tensor_format(torch.float32),
-            )
+            ),
+            # Raw indexer weights: the wrapper upcasts before scoring.
+            format_signature(
+                q=dense_tensor_format(torch.bfloat16),
+                weights=dense_tensor_format(torch.bfloat16),
+            ),
         }
     ),
     traits={
@@ -1076,6 +1151,8 @@ def triton_dsa_decode_topk_fp8(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if index_k_cache is None:
         raise RuntimeError("Triton DSA paged top-k requires packed FP8 index_k_cache")
+    if weights.dtype != torch.float32:
+        weights = weights.float()
     return dsa_decode_topk_fp8(
         q,
         index_k_cache,
@@ -1102,7 +1179,12 @@ def triton_dsa_decode_topk_fp8(
             format_signature(
                 q=dense_tensor_format(torch.bfloat16),
                 weights=dense_tensor_format(torch.float32),
-            )
+            ),
+            # Raw indexer weights: the wrapper upcasts before scoring.
+            format_signature(
+                q=dense_tensor_format(torch.bfloat16),
+                weights=dense_tensor_format(torch.bfloat16),
+            ),
         }
     ),
     traits={
@@ -1134,6 +1216,8 @@ def triton_dsa_prefill_topk_fp8(
         raise RuntimeError(
             "Triton DSA top-k requires packed FP8 index_k_cache and page_size"
         )
+    if weights.dtype != torch.float32:
+        weights = weights.float()
     return dsa_prefill_topk_fp8(
         q,
         index_k_cache,
@@ -1151,6 +1235,7 @@ def triton_dsa_prefill_topk_fp8(
 
 
 __all__ = [
+    "combine_topk_weights",
     "dsa_decode_topk_fp8",
     "dsa_prefill_topk_fp8",
     "local_topk_to_global_slots",

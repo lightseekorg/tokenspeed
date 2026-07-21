@@ -393,6 +393,69 @@ def test_rope_fused_set_kv_buffer(
     )
 
 
+def test_rope_fused_set_kv_buffer_large_strides_use_i64_offsets(
+    device: str,
+    require,
+) -> None:
+    dtype = torch.bfloat16
+    require("embedding", "rope", "triton", dtype, "q")
+
+    from tokenspeed_kernel.ops.embedding.triton import _rope_apply_kernel
+
+    head_size = 16
+    positions = torch.zeros(1, device=device, dtype=torch.int64)
+    query = torch.zeros(1, head_size, device=device, dtype=dtype)
+    key = torch.zeros_like(query)
+    value = torch.zeros(1, 1, head_size, device=device, dtype=dtype)
+    cos_sin_cache = torch.cat(
+        (
+            torch.ones(1, head_size // 2, device=device),
+            torch.zeros(1, head_size // 2, device=device),
+        ),
+        dim=-1,
+    )
+    cache_loc = torch.ones(1, device=device, dtype=torch.int32)
+    k_buffer = torch.zeros(2, head_size, device=device, dtype=dtype)
+    v_buffer = torch.zeros_like(k_buffer)
+
+    apply_rope(
+        positions=positions,
+        q=query,
+        k=key,
+        head_size=head_size,
+        cos_sin_cache=cos_sin_cache,
+        is_neox=True,
+        fused_set_kv_buffer_arg=FusedSetKVBufferArg(
+            value=value,
+            k_buffer=k_buffer,
+            v_buffer=v_buffer,
+            k_scale=None,
+            v_scale=None,
+            cache_loc=cache_loc,
+        ),
+        solution="triton",
+    )
+
+    # A cache slot fits in int32, but multiplying it by a large KV row stride
+    # can produce an offset outside the int32 range. Inspect TTIR because a
+    # runtime reproduction would require multi-GB cache buffers.
+    device_cache = _rope_apply_kernel.device_caches[torch.cuda.current_device()][0]
+    int32_fused_ttirs = [
+        compiled.asm["ttir"]
+        for compiled in device_cache.values()
+        if "%cache_loc_ptr: !tt.ptr<i32>" in compiled.asm["ttir"]
+        and "arith.muli %cache_loc" in compiled.asm["ttir"]
+    ]
+    assert int32_fused_ttirs
+    for ttir in int32_fused_ttirs:
+        cache_loc_muls = [
+            line for line in ttir.splitlines() if "arith.muli %cache_loc" in line
+        ]
+        assert "arith.extsi %cache_loc" in ttir
+        assert len(cache_loc_muls) == 2
+        assert all(": i64" in line for line in cache_loc_muls)
+
+
 @pytest.mark.parametrize("solution", [None, "triton", "flashinfer"])
 @pytest.mark.parametrize("is_neox", [True, False])
 def test_rope_mla_quantize(

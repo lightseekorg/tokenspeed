@@ -488,6 +488,48 @@ class CudaKernelBuilder:
                 seen.add(path_str)
                 yield path
 
+    def _read_cuda_header_version(self, include_dir: Path):
+        header = include_dir / "cuda_runtime_api.h"
+        if not header.exists():
+            return None
+
+        try:
+            for line in header.read_text(
+                encoding="utf-8", errors="ignore"
+            ).splitlines():
+                if line.startswith("#define CUDART_VERSION"):
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        version = int(parts[2])
+                        return version // 1000, (version % 1000) // 10
+        except (OSError, ValueError):
+            return None
+
+        return None
+
+    def _nvcc_toolkit_version(self):
+        try:
+            output = subprocess.check_output(
+                [NVCC, "--version"],
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        except (OSError, subprocess.CalledProcessError):
+            return None
+
+        marker = "release "
+        for line in output.splitlines():
+            if marker not in line:
+                continue
+            version_text = line.split(marker, 1)[1].split(",", 1)[0].strip()
+            parts = version_text.split(".")
+            if len(parts) >= 2:
+                try:
+                    return int(parts[0]), int(parts[1])
+                except ValueError:
+                    return None
+        return None
+
     def _cuda_toolkit_roots(self):
         roots = [Path(CUDA_HOME)]
 
@@ -526,12 +568,30 @@ class CudaKernelBuilder:
 
         # Do not mix wheel CUDA headers with an available toolkit.
         if not found_toolkit_headers:
+            nvcc_version = self._nvcc_toolkit_version()
             found_wheel_headers = False
             for base_path in self._site_paths():
                 for candidate in sorted(
                     base_path.glob("nvidia/cu*/include"), reverse=True
                 ):
                     if not _is_complete_cuda_include(candidate):
+                        continue
+                    # The nvidia-cuda-runtime wheels may lag the nvcc minor
+                    # version. Mixing them trips CCCL's toolkit compatibility
+                    # check, so only use matching fallback headers.
+                    header_version = self._read_cuda_header_version(candidate)
+                    if (
+                        nvcc_version
+                        and header_version
+                        and header_version != nvcc_version
+                    ):
+                        if self.verbose:
+                            print(
+                                "Skipping CUDA include with mismatched toolkit "
+                                f"version: {candidate} "
+                                f"({header_version[0]}.{header_version[1]} != nvcc "
+                                f"{nvcc_version[0]}.{nvcc_version[1]})"
+                            )
                         continue
                     _add_dir(candidate)
                     if (candidate / "cccl").exists():

@@ -311,6 +311,11 @@ class Qwen3_5BaseTextConfig(PretrainedConfig):
 
     @property
     def mamba2_cache_params(self):
+        """Return per-layer cache shapes using the kernels' native layouts.
+
+        The temporal/SSM state shape is K-last ``[Hv, V, K]``, matching the
+        GDN decode, MTP, and chunk-prefill kernel boundary directly.
+        """
         # Imported lazily to avoid config/env import cycles during module initialization.
         from tokenspeed.runtime.utils.env import global_server_args_dict
 
@@ -328,8 +333,8 @@ class Qwen3_5BaseTextConfig(PretrainedConfig):
 
         temporal_state_shape = (
             divide(self.linear_num_value_heads, attn_tp_size),
-            self.linear_key_head_dim,
             self.linear_value_head_dim,
+            self.linear_key_head_dim,
         )
         conv_dtype = torch.bfloat16
         dtype_map = {

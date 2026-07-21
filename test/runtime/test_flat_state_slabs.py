@@ -41,7 +41,8 @@ class FlatStateSlabsTest(unittest.TestCase):
             "linear_attention",
         )
         self.conv_shape = (3, 2)
-        self.ssm_shape = (4,)
+        # Non-square K-last [Hv, V, K] shape catches accidental V/K swaps.
+        self.ssm_shape = (4, 3, 2)
 
     def _make(self, *, layer_types=None, conv=None, ssm=None, page_size=1, size=8):
         return self.cls(
