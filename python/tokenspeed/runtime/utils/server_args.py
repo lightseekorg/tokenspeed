@@ -145,8 +145,8 @@ class ServerArgs:
     rl_control_port: int | None = None
     # Version identifier for the model weights. Stamped into every generation
     # response's meta_info so RL trainers know which policy version produced each
-    # sample. Updated atomically on successful weight pushes (the trainer may pass
-    # a new version string with each update, or it auto-increments).
+    # sample. Updated atomically after a successful weight push when the trainer
+    # supplies a new version string.
     weight_version: str = "default"
 
     # Data parallelism
