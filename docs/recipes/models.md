@@ -78,7 +78,7 @@ tokenspeed serve MiniMaxAI/MiniMax-M3-MXFP8 \
   --max-model-len 1048576 \
   --max-total-tokens 1048576 \
   --block-size 128 \
-  --attention-backend triton \
+  --attention-backend trtllm \
   --moe-backend triton \
   --disable-kvstore \
   --host 0.0.0.0 \

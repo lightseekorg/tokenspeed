@@ -202,7 +202,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
             cum_seq_lens_kv=cu_seqlens_kv,
             window_left=window_left,
             sinks=sinks,
-            out_dtype=q.dtype,
+            out_dtype=(torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype),
             causal=is_causal,
         )
 
@@ -273,7 +273,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
             bmm2_scale=1.0,
             window_left=window_left,
             sinks=sinks,
-            out_dtype=q.dtype,
+            out_dtype=(torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype),
             q_len_per_req=max_seqlen_q,
         )
 
