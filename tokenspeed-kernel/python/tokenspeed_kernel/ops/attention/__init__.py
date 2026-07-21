@@ -522,6 +522,7 @@ def mha_decode_with_kvcache(
 
     # Select kernel
     traits = {
+        "q_len": max_seqlen_q,
         "head_dim": q.shape[-1],
         "page_size": k_cache.shape[1],
         "sliding_window": window_left >= 0,

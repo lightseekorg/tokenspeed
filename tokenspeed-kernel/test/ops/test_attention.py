@@ -30,6 +30,7 @@ from tokenspeed_kernel import (
     mha_extend_with_kvcache,
     mha_prefill,
 )
+from tokenspeed_kernel.platform import current_platform
 
 torch.manual_seed(42)
 
@@ -334,6 +335,8 @@ def test_mha_decode_with_kvcache(
     require,
 ) -> None:
     require("attention", "mha_decode_with_kvcache", solution, dtype, "q")
+    if solution == "gluon" and current_platform().is_cdna5 and seqlen_q != 1:
+        pytest.skip("GFX1250 Gluon decode currently supports one query token")
 
     batch_size = 4
     page_size = 64
@@ -417,6 +420,25 @@ def test_mha_decode_with_kvcache(
 
     assert out.shape == q.shape
     assert not torch.isnan(out).any()
+    if seqlen_q == 1 and dtype not in _FP8_DTYPES:
+        group_size = num_q_heads // num_kv_heads
+        expected = []
+        for batch_idx, cache_len in enumerate(cache_seqlens.tolist()):
+            num_blocks = int(num_blocks_per_seq[batch_idx].item())
+            physical_blocks = page_table[batch_idx, :num_blocks].long()
+            k_i = k_cache[physical_blocks].reshape(-1, num_kv_heads, head_dim)
+            v_i = v_cache[physical_blocks].reshape(-1, num_kv_heads, head_dim)
+            k_i = k_i[:cache_len].repeat_interleave(group_size, dim=1)
+            v_i = v_i[:cache_len].repeat_interleave(group_size, dim=1)
+            expected.append(
+                torch.nn.functional.scaled_dot_product_attention(
+                    q[batch_idx : batch_idx + 1].unsqueeze(2),
+                    k_i.permute(1, 0, 2).unsqueeze(0),
+                    v_i.permute(1, 0, 2).unsqueeze(0),
+                ).squeeze(2)
+            )
+        expected_out = torch.cat(expected, dim=0)
+        torch.testing.assert_close(out, expected_out, rtol=3e-2, atol=3e-2)
 
 
 @pytest.mark.parametrize(
