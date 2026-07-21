@@ -341,22 +341,25 @@ def test_mha_decode_with_kvcache(
     batch_size = 4
     page_size = 64
     max_cache_seqlen = 256
-    prefix_seqlens = torch.tensor([63, 129, 17, 191], device=device, dtype=torch.int32)
-    cache_seqlens = prefix_seqlens + seqlen_q
-    num_blocks_per_seq = (cache_seqlens + page_size - 1) // page_size
+    prefix_seqlens_list = [63, 129, 17, 191]
+    cache_seqlens_list = [seqlen + seqlen_q for seqlen in prefix_seqlens_list]
+    cache_seqlens = torch.tensor(cache_seqlens_list, dtype=torch.int32)
+    num_blocks_per_seq = torch.tensor(
+        [(seqlen + page_size - 1) // page_size for seqlen in cache_seqlens_list],
+        dtype=torch.int32,
+    )
     max_num_blocks_per_seq = (max_cache_seqlen + page_size - 1) // page_size
     total_num_blocks = int(num_blocks_per_seq.sum().item())
 
     q = _randn(
         (batch_size * seqlen_q, num_q_heads, head_dim),
-        device=device,
+        device="cpu",
         dtype=dtype,
     )
 
     page_table = torch.zeros(
         batch_size,
         max_num_blocks_per_seq,
-        device=device,
         dtype=torch.int32,
     )
     next_block = 0
@@ -364,7 +367,6 @@ def test_mha_decode_with_kvcache(
         page_table[batch_idx, :num_blocks] = torch.arange(
             next_block,
             next_block + num_blocks,
-            device=device,
             dtype=torch.int32,
         )
         next_block += num_blocks
@@ -374,7 +376,6 @@ def test_mha_decode_with_kvcache(
         page_size,
         num_kv_heads,
         head_dim,
-        device=device,
         dtype=dtype,
     )
     v_cache = torch.zeros(
@@ -382,7 +383,6 @@ def test_mha_decode_with_kvcache(
         page_size,
         num_kv_heads,
         head_dim,
-        device=device,
         dtype=dtype,
     )
     for batch_idx, total_kv_len in enumerate(cache_seqlens.tolist()):
@@ -396,34 +396,20 @@ def test_mha_decode_with_kvcache(
                     tokens_in_block,
                     num_kv_heads,
                     head_dim,
-                    device=device,
                     dtype=torch.bfloat16 if dtype in _FP8_DTYPES else dtype,
                 ).to(dtype)
                 v_cache[physical_block, :tokens_in_block] = torch.randn(
                     tokens_in_block,
                     num_kv_heads,
                     head_dim,
-                    device=device,
                     dtype=torch.bfloat16 if dtype in _FP8_DTYPES else dtype,
                 ).to(dtype)
 
-    out = mha_decode_with_kvcache(
-        q=q,
-        k_cache=k_cache,
-        v_cache=v_cache,
-        page_table=page_table,
-        cache_seqlens=cache_seqlens,
-        max_seqlen_k=max_cache_seqlen,
-        max_seqlen_q=seqlen_q,
-        solution=solution,
-    )
-
-    assert out.shape == q.shape
-    assert not torch.isnan(out).any()
+    expected_out = None
     if seqlen_q == 1 and dtype not in _FP8_DTYPES:
         group_size = num_q_heads // num_kv_heads
         expected = []
-        for batch_idx, cache_len in enumerate(cache_seqlens.tolist()):
+        for batch_idx, cache_len in enumerate(cache_seqlens_list):
             num_blocks = int(num_blocks_per_seq[batch_idx].item())
             physical_blocks = page_table[batch_idx, :num_blocks].long()
             k_i = k_cache[physical_blocks].reshape(-1, num_kv_heads, head_dim)
@@ -438,7 +424,28 @@ def test_mha_decode_with_kvcache(
                 ).squeeze(2)
             )
         expected_out = torch.cat(expected, dim=0)
-        torch.testing.assert_close(out, expected_out, rtol=3e-2, atol=3e-2)
+
+    q = q.to(device)
+    k_cache = k_cache.to(device)
+    v_cache = v_cache.to(device)
+    page_table = page_table.to(device)
+    cache_seqlens = cache_seqlens.to(device)
+
+    out = mha_decode_with_kvcache(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        max_seqlen_k=max_cache_seqlen,
+        max_seqlen_q=seqlen_q,
+        solution=solution,
+    )
+
+    assert out.shape == q.shape
+    assert not torch.isnan(out).any()
+    if expected_out is not None:
+        torch.testing.assert_close(out.cpu(), expected_out, rtol=3e-2, atol=3e-2)
 
 
 @pytest.mark.parametrize(
