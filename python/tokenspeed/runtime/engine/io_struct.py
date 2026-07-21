@@ -118,6 +118,13 @@ class GenerateReqInput:
     # Whether to return hidden states
     return_hidden_states: bool = False
 
+    # Rollout Routing Replay (R3): whether to return the per-token, per-MoE-layer
+    # top-k expert ids the rollout selected, so an RL trainer can replay the exact
+    # expert selection and cut the train/inference routing mismatch. Backed by the
+    # slot-indexed pool in runtime/cache/routed_experts_pool.py.
+    # See docs/guides/routing-replay-r3.md.
+    return_routed_experts: bool = False
+
     # For disaggregated inference
     bootstrap_host: list[str] | str | None = None
     bootstrap_port: list[int] | int | None = None
@@ -386,6 +393,7 @@ class GenerateReqInput:
                 else None
             ),
             return_hidden_states=self.return_hidden_states,
+            return_routed_experts=self.return_routed_experts,
             # if `__getitem__` is called, the bootstrap_host, bootstrap_port, bootstrap_room must be a list
             bootstrap_host=(
                 self.bootstrap_host[i] if self.bootstrap_host is not None else None

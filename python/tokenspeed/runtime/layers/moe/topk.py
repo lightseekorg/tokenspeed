@@ -29,6 +29,9 @@ from tokenspeed_kernel.ops.moe.triton.inkling_topk import inkling_topk
 from tokenspeed_kernel.thirdparty.cuda import routing_flash as cuda_routing_flash
 from tokenspeed_kernel.thirdparty.triton import minimax_biased_grouped_topk
 
+from tokenspeed.runtime.cache.routed_experts_pool import (
+    get_global_routed_experts_capturer,
+)
 from tokenspeed.runtime.moe.distribution_recorder import (
     get_global_expert_distribution_recorder,
 )
@@ -596,5 +599,13 @@ def select_experts(
             topk_weights *= routed_scaling_factor
 
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
+
+    # Rollout Routing Replay (R3): persist this layer's routing into the
+    # slot-indexed pool. No-op unless --enable-routing-replay installed a
+    # capturer. Only the standard (non-BYPASSED) path materializes topk_ids in
+    # Python, so fused-routing models are naturally skipped (see docs).
+    _r3_capturer = get_global_routed_experts_capturer()
+    if _r3_capturer is not None:
+        _r3_capturer.capture_in_order(topk_ids)
 
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)

@@ -171,6 +171,12 @@ class ServerArgs:
     enable_expert_distribution_metrics: bool = False
     enable_eplb: bool = False
 
+    # Rollout Routing Replay (R3): capture per-token, per-MoE-layer top-k expert
+    # ids into a KV-slot-indexed pool so RL trainers can replay the rollout's
+    # exact expert selection. Off by default.
+    # See docs/guides/routing-replay-r3.md.
+    enable_routing_replay: bool = False
+
     # MoE backend
     moe_backend: str = "auto"
     draft_moe_backend: str | None = None
@@ -1282,6 +1288,13 @@ class ServerArgs:
             "--enable-expert-distribution-metrics",
             action="store_true",
             help="Enable logging metrics for expert balancedness",
+        )
+        parser.add_argument(
+            "--enable-routing-replay",
+            action="store_true",
+            help="Enable Rollout Routing Replay (R3): capture per-token, "
+            "per-MoE-layer top-k expert ids into a KV-slot-indexed pool so RL "
+            "trainers can replay the rollout's exact expert selection.",
         )
         parser.add_argument(
             "--enable-eplb",
