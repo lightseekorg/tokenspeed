@@ -578,13 +578,28 @@ class MiniMaxM3SparseForCausalLM(BaseCausalLM):
     model_cls = MiniMaxM3Model
     fall_back_to_pt_during_load = False
 
+    # Ordered checkpoint->parameter-dict renames applied by load_weights.
+    checkpoint_name_replacements = (
+        ("language_model.", ""),
+        (".block_sparse_moe", ".mlp"),
+        (".e_score_correction_bias", ".routing_bias"),
+        (".self_attn.index_q_proj", ".self_attn.indexer.index_q_proj"),
+        (".self_attn.index_k_proj", ".self_attn.indexer.index_k_proj"),
+        (".self_attn.index_q_norm", ".self_attn.indexer.q_norm"),
+        (".self_attn.index_k_norm", ".self_attn.indexer.k_norm"),
+    )
+    # Checkpoint->module-prefix renames for per-layer quantization lookups
+    # (mixed-precision checkpoints). Construction prefixes keep the
+    # checkpoint module tree (block_sparse_moe, flat indexer projections);
+    # only the language_model wrapper is stripped.
+    quant_module_name_replacements = (("language_model.", ""),)
+
     def _load_non_language_weight(
         self,
         checkpoint_name: str,
         loaded_weight: torch.Tensor,
         params_dict: dict[str, nn.Parameter],
     ) -> str | None:
-        del checkpoint_name, loaded_weight, params_dict
         return None
 
     def load_weights(
@@ -592,7 +607,6 @@ class MiniMaxM3SparseForCausalLM(BaseCausalLM):
         weights: Iterable[tuple[str, torch.Tensor]],
         **kwargs,
     ) -> set[str]:
-        del kwargs
         stacked_params_mapping = [
             (".qkv_proj", ".q_proj", "q"),
             (".qkv_proj", ".k_proj", "k"),
@@ -615,9 +629,7 @@ class MiniMaxM3SparseForCausalLM(BaseCausalLM):
 
         loaded_params: set[str] = set()
         for checkpoint_name, loaded_weight in weights:
-            if checkpoint_name.startswith("language_model."):
-                name = checkpoint_name.removeprefix("language_model.")
-            elif checkpoint_name.startswith(
+            if checkpoint_name.startswith(
                 ("vision_tower.", "multi_modal_projector.", "patch_merge_mlp.")
             ):
                 loaded_name = self._load_non_language_weight(
@@ -628,24 +640,15 @@ class MiniMaxM3SparseForCausalLM(BaseCausalLM):
                 if loaded_name is not None:
                     loaded_params.add(loaded_name)
                 continue
-            else:
-                name = checkpoint_name
+
+            name = checkpoint_name
+            for old, new in self.checkpoint_name_replacements:
+                name = name.replace(old, new)
 
             if name.startswith("model.mtp."):
                 continue
             if "rotary_emb.inv_freq" in name:
                 continue
-
-            name = name.replace(".block_sparse_moe", ".mlp")
-            name = name.replace(".e_score_correction_bias", ".routing_bias")
-            name = name.replace(
-                ".self_attn.index_q_proj", ".self_attn.indexer.index_q_proj"
-            )
-            name = name.replace(
-                ".self_attn.index_k_proj", ".self_attn.indexer.index_k_proj"
-            )
-            name = name.replace(".self_attn.index_q_norm", ".self_attn.indexer.q_norm")
-            name = name.replace(".self_attn.index_k_norm", ".self_attn.indexer.k_norm")
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name or ".mlp.experts." in name:

@@ -123,7 +123,7 @@ class CompressedTensorsConfig(QuantizationConfig):
     def get_name(self) -> str:
         return "compressed_tensors"
 
-    def moe_weight_dtype(self) -> str:
+    def moe_weight_dtype(self, prefix: str = "") -> str:
         # Container format: resolve the routed-expert scheme to a concrete MoE
         # kernel dtype. Only INT4 group-32 symmetric pack-quantized weights
         # (Kimi-K2.5 / K2.6 / K2.7, weight-only + bf16 group scales) are wired.

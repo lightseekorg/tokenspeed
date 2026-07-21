@@ -191,6 +191,81 @@ def test_minimax_m3_tp4_meta_layout_and_loader(monkeypatch: pytest.MonkeyPatch) 
     }
 
 
+def _mixed_precision_config() -> "ModelOptMixedConfig":
+    from tokenspeed.runtime.layers.quantization.modelopt_mixed import (
+        ModelOptMixedConfig,
+    )
+
+    layers: dict = {}
+    for i in range(4):
+        for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
+            layers[f"language_model.model.layers.{i}.self_attn.{proj}"] = {
+                "quant_algo": "MXFP8"
+            }
+    for i in range(3):
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            layers[f"language_model.model.layers.{i}.mlp.{proj}"] = {
+                "quant_algo": "MXFP8"
+            }
+    for proj in ("index_q_proj", "index_k_proj"):
+        layers[f"language_model.model.layers.3.self_attn.{proj}"] = {
+            "quant_algo": "MXFP8"
+        }
+    for proj in ("gate_proj", "up_proj", "down_proj"):
+        layers[
+            "language_model.model.layers.3.block_sparse_moe." f"shared_experts.{proj}"
+        ] = {"quant_algo": "MXFP8"}
+    for expert in range(8):
+        for proj in ("w1", "w2", "w3"):
+            layers[
+                "language_model.model.layers.3.block_sparse_moe."
+                f"experts.{expert}.{proj}"
+            ] = {"quant_algo": "NVFP4", "group_size": 16}
+
+    config = ModelOptMixedConfig.from_config(
+        {
+            "quant_algo": "MIXED_PRECISION",
+            "quant_method": "modelopt",
+            "exclude_modules": [
+                "lm_head",
+                "model.embed_tokens",
+                "language_model.model.layers.3.block_sparse_moe.gate",
+            ],
+            "quantized_layers": layers,
+        }
+    )
+    config.apply_checkpoint_name_replacements(
+        MiniMaxM3SparseForConditionalGeneration.quant_module_name_replacements
+    )
+    return config
+
+
+def test_minimax_m3_mixed_precision_quant_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tokenspeed.runtime.layers.dense import Fp8LinearMethod
+
+    model = _build_model(monkeypatch, quant_config=_mixed_precision_config())
+
+    attn = model.model.layers[3].self_attn
+    assert isinstance(attn.qkv_proj.quant_method, Fp8LinearMethod)
+    assert isinstance(attn.o_proj.quant_method, Fp8LinearMethod)
+    assert isinstance(attn.indexer.index_q_proj.quant_method, Fp8LinearMethod)
+    assert isinstance(attn.indexer.index_k_proj.quant_method, Fp8LinearMethod)
+
+    assert isinstance(
+        model.model.layers[0].mlp.gate_up_proj.quant_method, Fp8LinearMethod
+    )
+
+    moe = model.model.layers[3].mlp
+    assert isinstance(moe.shared_experts.gate_up_proj.quant_method, Fp8LinearMethod)
+    experts = moe.experts
+    assert experts._quant_kind == "nvfp4"
+    assert experts.w13_weight.dtype == torch.uint8
+    assert experts.w13_weight_scale.dtype == torch.float8_e4m3fn
+    assert experts.w13_weight_scale_2.shape == (8, 2)
+
+
 def test_minimax_m3_active_multimodal_layout_and_loader(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
