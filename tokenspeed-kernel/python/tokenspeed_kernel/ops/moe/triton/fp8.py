@@ -208,7 +208,7 @@ def triton_fp8_moe_weights(plan: dict, w: torch.nn.Module):
     ),
     traits={
         "weight_dtype": frozenset({"fp8"}),
-        "activation": frozenset({"silu", "swiglu"}),
+        "activation": frozenset({"swiglu"}),
         "routing_mode": frozenset({"precomputed_topk"}),
         "supports_deferred_finalize": frozenset({False}),
         "supports_ep": frozenset({False}),
