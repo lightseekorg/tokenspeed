@@ -36,7 +36,7 @@ from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
 @dataclass(kw_only=True)
-class MinimaxSparseConfig(BaseAttnConfig):
+class MSAConfig(BaseAttnConfig):
     """Runtime and cache contract for MiniMax sparse attention."""
 
     full_attn_backend_name: str | None = None
@@ -65,7 +65,7 @@ class MinimaxSparseConfig(BaseAttnConfig):
         server_args: ServerArgs,
         model_config: ModelConfig,
         is_draft: bool = False,
-    ) -> "MinimaxSparseConfig":
+    ) -> "MSAConfig":
         text_config = model_config.hf_text_config
         sparse_layer_type = model_config.hf_config.runtime_attention_layer_type
 
@@ -102,7 +102,7 @@ class MinimaxSparseConfig(BaseAttnConfig):
         return cls(
             device=server_args.device,
             context_len=model_config.context_len,
-            backend_name="minimax_sparse",
+            backend_name="msa",
             full_attn_backend_name=full_attn_backend_name,
             num_attention_heads=model_config.num_attention_heads,
             num_kv_heads=model_config.num_key_value_heads,
@@ -158,11 +158,11 @@ class MinimaxSparseConfig(BaseAttnConfig):
         rank: int,
         enable_memory_saver: bool,
     ) -> BaseTokenToKVPool:
-        from tokenspeed.runtime.layers.attention.kv_cache.minimax_sparse import (
-            MinimaxSparseKVPool,
+        from tokenspeed.runtime.layers.attention.kv_cache.msa import (
+            MSATokenToKVPool,
         )
 
-        return MinimaxSparseKVPool(
+        return MSATokenToKVPool(
             size=max_total_num_tokens,
             dtype=self.kv_cache_dtype,
             head_num=max(self.num_kv_heads // self.attn_tp_size, 1),

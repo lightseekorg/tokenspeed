@@ -50,8 +50,8 @@ from tokenspeed.runtime.layers.attention.backends.base import (
 from tokenspeed.runtime.layers.attention.backends.flat_groups import (
     FlatCacheGroupsMixin,
 )
-from tokenspeed.runtime.layers.attention.configs.minimax_sparse import (
-    MinimaxSparseConfig,
+from tokenspeed.runtime.layers.attention.configs.msa import (
+    MSAConfig,
 )
 from tokenspeed.runtime.layers.attention.registry import (
     register_backend,
@@ -104,7 +104,7 @@ class MSADecodeMetadata:
     out_cache_locs: dict[str, torch.Tensor] | None = None
 
 
-class MinimaxSparseAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
+class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
     """MiniMax sparse attention backend that routes through tokenspeed_kernel attention APIs."""
 
     # Unconditional: safety comes from the publication rule
@@ -117,7 +117,7 @@ class MinimaxSparseAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
     ) -> bool:
         return False
 
-    def __init__(self, config: MinimaxSparseConfig) -> None:
+    def __init__(self, config: MSAConfig) -> None:
         super().__init__(config)
 
         # Static information needed for metadata construction and kernel dispatch
@@ -757,12 +757,12 @@ class MinimaxSparseAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         return padded
 
 
-class MinimaxHybridAttnBackend(AttentionBackend):
+class MSAHybridAttnBackend(AttentionBackend):
     """Minimax hybrid attention backend that dispatches to either a dense or sparse backend per layer."""
 
     uses_flat_cache_groups: bool = True
 
-    def __init__(self, config: MinimaxSparseConfig) -> None:
+    def __init__(self, config: MSAConfig) -> None:
         from tokenspeed.runtime.layers.attention.registry import (
             _create_attn_backend_with_name,
         )
@@ -773,7 +773,7 @@ class MinimaxHybridAttnBackend(AttentionBackend):
             AttentionArch.MHA,
             config,
         )
-        sparse_attn_backend = MinimaxSparseAttnBackend(config)
+        sparse_attn_backend = MSAAttnBackend(config)
         self.full_attn_backend = full_attn_backend
         self.sparse_attn_backend = sparse_attn_backend
         self.sparse_layer_ids = sparse_attn_backend.sparse_layer_ids
@@ -906,7 +906,7 @@ class MinimaxHybridAttnBackend(AttentionBackend):
 
 
 register_backend(
-    "minimax_sparse",
+    "msa",
     {AttentionArch.MSA},
-    MinimaxHybridAttnBackend,
+    MSAHybridAttnBackend,
 )

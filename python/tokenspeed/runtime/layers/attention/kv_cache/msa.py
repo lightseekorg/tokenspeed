@@ -10,7 +10,7 @@ import torch
 from tokenspeed.runtime.layers.attention.kv_cache.mha import MHATokenToKVPool
 
 
-class MinimaxSparseKVPool(MHATokenToKVPool):
+class MSATokenToKVPool(MHATokenToKVPool):
     """MHA K/V cache plus a key-only sparse-index side cache."""
 
     supports_hierarchical_kv_cache = False

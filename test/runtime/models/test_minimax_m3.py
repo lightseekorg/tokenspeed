@@ -155,7 +155,7 @@ def test_minimax_m3_attention_family_selects_msa() -> None:
     assert spec.name == "MiniMax MSA"
     assert spec.default_block_size == 128
     # --attention-backend must keep selecting the dense sub-backend; the
-    # top-level backend is pinned by MinimaxSparseConfig itself.
+    # top-level backend is pinned by MSAConfig itself.
     assert spec.default_backend is None
 
     model_config = SimpleNamespace(attention_arch=None)
