@@ -92,17 +92,28 @@ class MiniMaxM3MLP(nn.Module):
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        is_shared_expert: bool = False,
     ) -> None:
         super().__init__()
-        dense = mapping.dense
+        if is_shared_expert:
+            # The MoE block's combined routed+shared output is reduced once
+            # over the MoE tp_ep group, so shard the shared expert over that
+            # same group (mapping.dense may differ under DP/EP layouts).
+            tp_rank = mapping.moe.tp_ep_rank
+            tp_size = mapping.moe.tp_ep_size
+            tp_group = mapping.moe.tp_ep_group
+        else:
+            tp_rank = mapping.dense.tp_rank
+            tp_size = mapping.dense.tp_size
+            tp_group = mapping.dense.tp_group
         self.gate_up_proj = MergedColumnParallelLinear(
             config.hidden_size,
             [intermediate_size, intermediate_size],
             bias=False,
             quant_config=quant_config,
-            tp_rank=dense.tp_rank,
-            tp_size=dense.tp_size,
-            tp_group=dense.tp_group,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            tp_group=tp_group,
             prefix=add_prefix("gate_up_proj", prefix),
         )
         self.down_proj = RowParallelLinear(
@@ -111,9 +122,9 @@ class MiniMaxM3MLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             reduce_results=False,
-            tp_rank=dense.tp_rank,
-            tp_size=dense.tp_size,
-            tp_group=dense.tp_group,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            tp_group=tp_group,
             prefix=add_prefix("down_proj", prefix),
         )
         self.swiglu_alpha = config.swiglu_alpha
@@ -208,6 +219,7 @@ class MiniMaxM3SparseMoeBlock(nn.Module):
             mapping=mapping,
             quant_config=quant_config,
             prefix=add_prefix("shared_experts", prefix),
+            is_shared_expert=True,
         )
 
     def forward(
