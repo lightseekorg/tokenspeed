@@ -56,13 +56,12 @@ public:
                               std::int32_t max_blocks) const = 0;
 
     // Move the already-pinned match into the request table.
-    void ClaimHitBlocks(BlockTable& table, PrefixMatch hit) {
+    void ClaimHitBlocks(BlockTable& table, PrefixMatch&& hit) {
         _assert(table.blocks_.empty(), "ClaimHitBlocks requires a fresh (empty) table");
-        for (BlockRef& block : hit.blocks) {
+        for (const BlockRef& block : hit.blocks) {
             _assert(block->IsNull() || block->IsCached(), "matched block lost its hash before the claim");
-            table.blocks_.push_back(std::move(block));
         }
-        hit.blocks.clear();
+        table.blocks_ = std::move(hit.blocks);
     }
 
     // All-or-nothing (tail-page room first, then fresh pages): on shortfall the table is unchanged, returns false.
@@ -89,7 +88,7 @@ public:
     }
 
     // Contract on the forward_cache_ops facade; admission pre-charged the real slots via ext_real_pages.
-    void AppendHostExtension(BlockPool& pool, BlockTable& table, std::vector<BlockRef>& host_blocks,
+    void AppendHostExtension(BlockPool& pool, BlockTable& table, std::vector<BlockRef>&& host_blocks,
                              std::vector<BlockTransfer>& load_pairs) {
         _assert(table.tail_avail_ == 0, "host extension must append on a full-page boundary");
         for (BlockRef& host_block : host_blocks) {
@@ -125,14 +124,15 @@ public:
             static_cast<std::int64_t>(first_slot) + static_cast<std::int64_t>(block_hashes.size()) <= table.NumBlocks(),
             "hash range exceeds table size");
         for (std::size_t j = 0; j < block_hashes.size(); ++j) {
-            CacheBlock* block = table.blocks_[static_cast<std::size_t>(first_slot) + j].get();
+            const BlockRef& block_ref = table.blocks_[static_cast<std::size_t>(first_slot) + j];
+            CacheBlock* block = block_ref.get();
             if (block->IsNull()) {
                 continue;
             }
             if (block->IsCached()) {
                 continue;
             }
-            pool.CacheFullBlock(block, block_hashes[j]);
+            pool.CacheFullBlock(block_ref, block_hashes[j]);
             if (newly_cached != nullptr) {
                 newly_cached->emplace_back(block_hashes[j], table.blocks_[static_cast<std::size_t>(first_slot) + j]);
             }
@@ -149,7 +149,7 @@ public:
     }
 
     // Cached pages keep their hash on free, so they stay prefix-reusable until evicted.
-    void Free(BlockPool& /*pool*/, BlockTable& table) {
+    void Free(BlockTable& table) {
         // Release in reverse explicitly; vector destruction order is not the
         // free-list policy and must not choose the eviction order for us.
         for (auto it = table.blocks_.rbegin(); it != table.blocks_.rend(); ++it) {

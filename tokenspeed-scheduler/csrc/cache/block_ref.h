@@ -29,17 +29,26 @@ class CacheBlock;
 class BlockTable;
 
 // Stable control block owned by BlockPool. The scheduler is the sole writer, so
-// the count deliberately stays non-atomic.
-struct BlockControl {
-    BlockPool* owner{nullptr};
-    CacheBlock* object{nullptr};
-    std::uint32_t strong_count{0};
+// the count deliberately stays non-atomic. Only BlockPool and BlockRef may
+// mutate its ownership state.
+class BlockControl {
+public:
+    BlockControl() = default;
+
+private:
+    friend class BlockPool;
+    friend class BlockRef;
+
+    BlockPool* owner_{nullptr};
+    CacheBlock* object_{nullptr};
+    std::uint32_t strong_count_{0};
 };
 
-// Shared owning handle to one pool-owned CacheBlock. Like std::shared_ptr,
-// copying shares ownership, moving transfers it, and the last reset/destructor
-// returns the block to its pool. The CacheBlock object itself is never deleted,
-// and every handle must be destroyed before its owning BlockPool.
+// Pool-scoped shared owning handle to one CacheBlock. Copying shares ownership,
+// moving transfers it, and the last real-block reset/destructor returns the
+// block to its pool. CacheBlock and BlockControl remain pool-owned, so every
+// BlockRef must be destroyed before its BlockPool. A null-block reference is
+// truthy but uncounted; use_count()/unique() are meaningful only for real blocks.
 class BlockRef {
 public:
     BlockRef() = default;
@@ -62,6 +71,7 @@ private:
     friend class BlockTable;
 
     explicit BlockRef(BlockControl* control);
+    bool SharesPoolWith(const BlockRef& other) const;
     void Retain();
 
     BlockControl* control_{nullptr};

@@ -159,7 +159,7 @@ KvCacheCoordinator::AdmissionMatch KvCacheCoordinator::MatchPrefix(std::span<con
     return out;
 }
 
-void KvCacheCoordinator::ClaimCommonPrefix(std::span<BlockTable> tables, CoordinatorMatch hit) {
+void KvCacheCoordinator::ClaimCommonPrefix(std::span<BlockTable> tables, CoordinatorMatch&& hit) {
     _assert(tables.size() == groups_.size(), "tables/groups size mismatch");
     if (hit.per_group.empty()) {
         _assert(hit.num_common_tokens == 0, "empty per_group with nonzero num_common_tokens");
@@ -171,7 +171,8 @@ void KvCacheCoordinator::ClaimCommonPrefix(std::span<BlockTable> tables, Coordin
     }
 }
 
-std::vector<BlockTransfer> KvCacheCoordinator::LoadHostExtension(std::span<BlockTable> tables, CoordinatorMatch host) {
+std::vector<BlockTransfer> KvCacheCoordinator::LoadHostExtension(std::span<BlockTable> tables,
+                                                                 CoordinatorMatch&& host) {
     _assert(tables.size() == groups_.size(), "tables/groups size mismatch");
     std::vector<BlockTransfer> pairs;
     if (host.per_group.empty()) {
@@ -179,7 +180,7 @@ std::vector<BlockTransfer> KvCacheCoordinator::LoadHostExtension(std::span<Block
     }
     _assert(host.per_group.size() == groups_.size(), "host match/groups size mismatch");
     for (std::size_t i = 0; i < groups_.size(); ++i) {
-        groups_[i].Manager().AppendHostExtension(pool_, tables[i], host.per_group[i].blocks, pairs);
+        groups_[i].Manager().AppendHostExtension(pool_, tables[i], std::move(host.per_group[i].blocks), pairs);
     }
     return pairs;
 }
@@ -260,7 +261,7 @@ void KvCacheCoordinator::ReclaimExpired(std::span<BlockTable> tables, std::int32
 void KvCacheCoordinator::Free(std::span<BlockTable> tables) {
     _assert(tables.size() == groups_.size(), "tables/groups size mismatch");
     for (std::size_t i = 0; i < groups_.size(); ++i) {
-        groups_[i].Manager().Free(pool_, tables[i]);
+        groups_[i].Manager().Free(tables[i]);
     }
 }
 

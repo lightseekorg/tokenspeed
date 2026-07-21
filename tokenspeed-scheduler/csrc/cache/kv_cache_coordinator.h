@@ -66,10 +66,10 @@ public:
     AdmissionMatch MatchPrefix(std::span<const std::string> content_hashes);
 
     // Pure claim into fresh tables, never fails; a non-empty per_group must be sized to the group count.
-    void ClaimCommonPrefix(std::span<BlockTable> tables, CoordinatorMatch hit);
+    void ClaimCommonPrefix(std::span<BlockTable> tables, CoordinatorMatch&& hit);
 
     // Contract on the forward_cache_ops facade.
-    std::vector<BlockTransfer> LoadHostExtension(std::span<BlockTable> tables, CoordinatorMatch host);
+    std::vector<BlockTransfer> LoadHostExtension(std::span<BlockTable> tables, CoordinatorMatch&& host);
 
     // All-or-nothing across all groups: on shortfall allocates NOTHING and returns false (no rollback needed).
     bool Acquire(std::span<BlockTable> tables, std::int32_t num_tokens);

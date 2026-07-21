@@ -27,9 +27,13 @@
 
 namespace tokenspeed {
 
-BlockRef::BlockRef(BlockControl* control) : control_{control} { Retain(); }
+BlockRef::BlockRef(BlockControl* control) : control_{control} {
+    Retain();
+}
 
-BlockRef::BlockRef(const BlockRef& other) : control_{other.control_} { Retain(); }
+BlockRef::BlockRef(const BlockRef& other) : control_{other.control_} {
+    Retain();
+}
 
 BlockRef& BlockRef::operator=(const BlockRef& other) {
     if (this != &other) {
@@ -49,31 +53,41 @@ BlockRef& BlockRef::operator=(BlockRef&& other) noexcept {
     return *this;
 }
 
-BlockRef::~BlockRef() { reset(); }
+BlockRef::~BlockRef() {
+    reset();
+}
 
-CacheBlock* BlockRef::get() const { return control_ == nullptr ? nullptr : control_->object; }
+CacheBlock* BlockRef::get() const {
+    return control_ == nullptr ? nullptr : control_->object_;
+}
 
-std::uint32_t BlockRef::use_count() const { return control_ == nullptr ? 0 : control_->strong_count; }
+std::uint32_t BlockRef::use_count() const {
+    return control_ == nullptr ? 0 : control_->strong_count_;
+}
 
 void BlockRef::reset() {
     BlockControl* control = std::exchange(control_, nullptr);
-    if (control == nullptr || control->object->IsNull()) {
+    if (control == nullptr || control->object_->IsNull()) {
         return;
     }
-    _assert(control->strong_count > 0, "BlockRef strong_count underflow");
-    --control->strong_count;
-    if (control->strong_count == 0) {
-        control->owner->OnLastRef(control);
+    _assert(control->strong_count_ > 0, "BlockRef strong_count underflow");
+    --control->strong_count_;
+    if (control->strong_count_ == 0) {
+        control->owner_->OnLastRef(control);
     }
+}
+
+bool BlockRef::SharesPoolWith(const BlockRef& other) const {
+    return control_ != nullptr && other.control_ != nullptr && control_->owner_ == other.control_->owner_;
 }
 
 void BlockRef::Retain() {
     if (control_ == nullptr) {
         return;
     }
-    _assert(control_->owner != nullptr && control_->object != nullptr, "BlockRef requires a valid control");
-    if (!control_->object->IsNull()) {
-        ++control_->strong_count;
+    _assert(control_->owner_ != nullptr && control_->object_ != nullptr, "BlockRef requires a valid control");
+    if (!control_->object_->IsNull()) {
+        ++control_->strong_count_;
     }
 }
 

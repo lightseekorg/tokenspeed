@@ -64,7 +64,7 @@ CacheBlock* CacheForGroup(BlockPool& pool, const std::string& content_hash, std:
     std::string key = MakeKeyWithGroupId(content_hash, group_id);
     BlockRef got = pool.AcquireBlock();
     CacheBlock* raw = got.get();
-    pool.CacheFullBlock(raw, key);
+    pool.CacheFullBlock(got, key);
     got.reset();
     return raw;
 }
@@ -171,7 +171,7 @@ TEST(CoordinatorAllocTest, ColdStartAllocatesAlignedPages) {
     EXPECT_EQ(hit.num_common_tokens, 0);
 
     std::vector<BlockTable> tables(2);
-    coord.ClaimCommonPrefix(tables, hit);  // no hits -> no-op
+    coord.ClaimCommonPrefix(tables, std::move(hit));  // no hits -> no-op
     ASSERT_TRUE(coord.Acquire(tables, /*num_tokens=*/8));
     // 8 tokens / page 4 = 2 pages in EACH group; tables aligned.
     EXPECT_EQ(tables[0].NumBlocks(), 2);
@@ -193,8 +193,9 @@ TEST(CoordinatorAllocTest, ClaimsCommonPrefixThenAllocatesRemainder) {
 
     std::vector<BlockTable> tables(2);
     // 8 tokens total, 1 page (4 tokens) common -> 4 uncached tokens -> +1 page each.
-    coord.ClaimCommonPrefix(tables, hit);  // claim the 1 cached page each
-    ASSERT_TRUE(coord.Acquire(tables, 8 - hit.num_common_tokens));
+    const std::int32_t num_common_tokens = hit.num_common_tokens;
+    coord.ClaimCommonPrefix(tables, std::move(hit));  // claim the 1 cached page each
+    ASSERT_TRUE(coord.Acquire(tables, 8 - num_common_tokens));
     EXPECT_EQ(tables[0].NumBlocks(), 2);  // 1 claimed + 1 allocated
     EXPECT_EQ(tables[1].NumBlocks(), 2);
 }
@@ -210,7 +211,7 @@ TEST(CoordinatorAllocTest, CrossGroupShortfallAllocatesNothing) {
 
     std::vector<BlockTable> tables(2);
     std::int32_t free_before = pool.NumFreeBlocks();
-    coord.ClaimCommonPrefix(tables, hit);  // no hits -> no-op
+    coord.ClaimCommonPrefix(tables, std::move(hit));  // no hits -> no-op
     // 12 tokens -> 3 pages per group = 6 needed, only 4 free -> fail, nothing taken.
     EXPECT_FALSE(coord.Acquire(tables, 12));
     EXPECT_EQ(tables[0].NumBlocks(), 0);
@@ -286,7 +287,7 @@ TEST(CoordinatorStepTest, EndToEndTwoRequestsSharePrefix) {
         CoordinatorMatch m = coord.MatchPrefix(ch).device;
         EXPECT_EQ(m.num_common_tokens, 0);
         std::vector<BlockTable> a(2);
-        coord.ClaimCommonPrefix(a, m);
+        coord.ClaimCommonPrefix(a, std::move(m));
         ASSERT_TRUE(coord.Acquire(a, 8));
         coord.CacheFullBlocks(a, ch);
         coord.Free(a);
@@ -296,8 +297,9 @@ TEST(CoordinatorStepTest, EndToEndTwoRequestsSharePrefix) {
         CoordinatorMatch m = coord.MatchPrefix(ch).device;
         EXPECT_EQ(m.num_common_tokens, 8);
         std::vector<BlockTable> b(2);
-        coord.ClaimCommonPrefix(b, m);
-        ASSERT_TRUE(coord.Acquire(b, 8 - m.num_common_tokens));
+        const std::int32_t num_common_tokens = m.num_common_tokens;
+        coord.ClaimCommonPrefix(b, std::move(m));
+        ASSERT_TRUE(coord.Acquire(b, 8 - num_common_tokens));
         EXPECT_EQ(b[0].NumBlocks(), 2);
         EXPECT_EQ(b[1].NumBlocks(), 2);
         coord.Free(b);
@@ -930,7 +932,7 @@ CacheBlock* HostPut(BlockPool& host_pool, const std::string& content_hash, std::
     std::string key = MakeKeyWithGroupId(content_hash, gid);
     BlockRef block = host_pool.AcquireBlock();
     CacheBlock* raw = block.get();
-    host_pool.CacheFullBlock(raw, key);
+    host_pool.CacheFullBlock(block, key);
     block.reset();
     return raw;
 }
@@ -1217,7 +1219,7 @@ TEST(MambaAnalogTest, RetentionKeepsOnlyTheLastStateBlock) {
     EXPECT_TRUE(table.Blocks()[1]->IsNull());
     EXPECT_TRUE(table.Blocks()[2]->IsNull());
     EXPECT_FALSE(table.Blocks()[3]->IsNull()) << "the live state block";
-    mgr.Free(pool, table);
+    mgr.Free(table);
 }
 
 TEST(MambaAnalogTest, HybridFullSwaMambaComposesUnderOnePool) {
@@ -1245,7 +1247,7 @@ TEST(MambaAnalogTest, HybridFullSwaMambaComposesUnderOnePool) {
 
     // Claim + acquire keeps the pool unified and balanced across all three.
     std::vector<BlockTable> tables(coord.NumGroups());
-    coord.ClaimCommonPrefix(tables, m);
+    coord.ClaimCommonPrefix(tables, std::move(m));
     ASSERT_TRUE(coord.Acquire(tables, /*num_tokens=*/4));
     coord.Free(tables);
 }

@@ -91,7 +91,7 @@ TEST(ForwardCacheOpsPrefill, FirstChunkClaimsHitThenAcquiresOnlyRemainder) {
     FreeRequest(coordinator, r1);
 
     // r2: same 8-token prefix, 12-token prefill target -> 4 NEW tokens.
-    const CoordinatorMatch hit = coordinator.MatchPrefix(hashes8).device;
+    CoordinatorMatch hit = coordinator.MatchPrefix(hashes8).device;
     ASSERT_EQ(hit.num_common_tokens, 8);
     ASSERT_EQ(hit.per_group[1].num_hit_blocks, 4) << "W=16 must keep every SWA prefix page real";
 
@@ -99,7 +99,8 @@ TEST(ForwardCacheOpsPrefill, FirstChunkClaimsHitThenAcquiresOnlyRemainder) {
     // BlocksNeededFor(4 new tokens) = ceil(4/2) = 2 pages/group = 4 total.
     {
         std::vector<BlockTable> probe(coordinator.NumGroups());
-        coordinator.ClaimCommonPrefix(probe, hit);
+        CoordinatorMatch probe_hit = hit;
+        coordinator.ClaimCommonPrefix(probe, std::move(probe_hit));
         EXPECT_EQ(probe[0].TailAvailableTokens(), 0);
         EXPECT_EQ(probe[1].TailAvailableTokens(), 0);
         EXPECT_EQ(coordinator.BlocksNeededFor(probe, /*num_tokens=*/4), 4);
@@ -108,7 +109,7 @@ TEST(ForwardCacheOpsPrefill, FirstChunkClaimsHitThenAcquiresOnlyRemainder) {
 
     const std::int32_t free_before = pool.NumFreeBlocks();
     std::vector<BlockTable> r2(coordinator.NumGroups());
-    ASSERT_TRUE(PrefillFirstChunk(coordinator, r2, hit, /*num_new_tokens=*/4));
+    ASSERT_TRUE(PrefillFirstChunk(coordinator, r2, std::move(hit), /*num_new_tokens=*/4));
 
     // Per-group table: 4 claimed prefix pages + ceil(4 new / 2) = 2 fresh = 6.
     ASSERT_EQ(r2[0].NumBlocks(), 6);

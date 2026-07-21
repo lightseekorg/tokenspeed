@@ -202,7 +202,7 @@ void Scheduler::handleEvent(const cache::WriteBackDone& event) {
         // ticket order keep both pools' recycling order deterministic.
         for (FlatStoreTicket& t : tickets) {
             if (event.success) {
-                flat_host_pool_.CacheFullBlock(t.host_block.get(), t.key);
+                flat_host_pool_.CacheFullBlock(t.host_block, t.key);
             }
         }
         for (auto it = tickets.rbegin(); it != tickets.rend(); ++it) {

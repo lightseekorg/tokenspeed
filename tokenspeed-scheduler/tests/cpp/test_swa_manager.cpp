@@ -53,7 +53,7 @@ std::string RealKey(const std::vector<std::int32_t>& tokens, uint32_t group_id) 
 CacheBlock* CacheOnePage(BlockPool& pool, const std::string& key) {
     BlockRef got = pool.AcquireBlock();
     CacheBlock* raw = got.get();
-    pool.CacheFullBlock(raw, key);
+    pool.CacheFullBlock(got, key);
     got.reset();
     return raw;
 }
@@ -256,7 +256,7 @@ TEST(SwaManagerTest, InheritedAcquireAndFreeWork) {
     EXPECT_EQ(table.NumBlocks(), 2);
     EXPECT_EQ(pool.NumFreeBlocks(), 5);
 
-    mgr.Free(pool, table);
+    mgr.Free(table);
     EXPECT_EQ(table.NumBlocks(), 0);
     EXPECT_EQ(pool.NumFreeBlocks(), 7);
 }
@@ -300,6 +300,35 @@ TEST(BlockTableTest, EvictToNullIsIdempotentOnNullSlot) {
     BlockRef again = table.EvictToNull(0, pool.NullBlockRef());
     EXPECT_FALSE(again);  // empty on already-null
     EXPECT_TRUE(table.Blocks()[0]->IsNull());
+}
+
+TEST(BlockTableTest, EvictToNullRejectsEmptyReplacement) {
+    BlockPool pool(8);
+    SwaManager mgr(4, 4);
+    BlockTable table;
+    ASSERT_TRUE(mgr.Acquire(pool, table, 4));
+
+    EXPECT_THROW(table.EvictToNull(0, BlockRef{}), std::runtime_error);
+}
+
+TEST(BlockTableTest, EvictToNullRejectsRealBlockReplacement) {
+    BlockPool pool(8);
+    SwaManager mgr(4, 4);
+    BlockTable table;
+    ASSERT_TRUE(mgr.Acquire(pool, table, 4));
+    BlockRef real_block = pool.AcquireBlock();
+
+    EXPECT_THROW(table.EvictToNull(0, real_block), std::runtime_error);
+}
+
+TEST(BlockTableTest, EvictToNullRejectsNullFromAnotherPool) {
+    BlockPool pool(8);
+    BlockPool other_pool(8);
+    SwaManager mgr(4, 4);
+    BlockTable table;
+    ASSERT_TRUE(mgr.Acquire(pool, table, 4));
+
+    EXPECT_THROW(table.EvictToNull(0, other_pool.NullBlockRef()), std::runtime_error);
 }
 
 TEST(SwaManagerTest, ReclaimExpiredMirrorsVllmBoundarySequence) {

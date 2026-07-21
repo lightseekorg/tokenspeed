@@ -101,7 +101,7 @@ TEST(BlockPoolTest, CachedFreeBlockSurvivesAndIsReusable) {
 
     BlockRef block = pool.AcquireBlock();
     CacheBlock* b = block.get();
-    pool.CacheFullBlock(b, key);
+    pool.CacheFullBlock(block, key);
     EXPECT_TRUE(b->IsCached());
 
     block.reset();
@@ -126,7 +126,7 @@ TEST(BlockPoolTest, CachingDisabledNeverHits) {
 
     BlockRef block = pool.AcquireBlock();
     CacheBlock* b = block.get();
-    pool.CacheFullBlock(b, key);  // no-op when caching is disabled
+    pool.CacheFullBlock(block, key);  // no-op when caching is disabled
     EXPECT_FALSE(b->IsCached());
     EXPECT_FALSE(pool.FindCachedBlock(key));  // lookups always miss
     EXPECT_FALSE(pool.ContainsCachedBlock(key));
@@ -139,7 +139,7 @@ TEST(BlockPoolTest, GroupIdDistinguishesSameContent) {
     ASSERT_NE(k0, k1);  // same content, different group -> different key
 
     BlockRef a = pool.AcquireBlock();
-    pool.CacheFullBlock(a.get(), k0);
+    pool.CacheFullBlock(a, k0);
     EXPECT_TRUE(pool.ContainsCachedBlock(k0));
     EXPECT_FALSE(pool.ContainsCachedBlock(k1));  // group 1 not cached
 }
@@ -151,7 +151,7 @@ TEST(BlockPoolTest, EvictionDropsCachedContentWhenReused) {
 
     BlockRef first = pool.AcquireBlock();
     CacheBlock* b = first.get();
-    pool.CacheFullBlock(b, key);
+    pool.CacheFullBlock(first, key);
     first.reset();  // cached + free
     EXPECT_TRUE(pool.ContainsCachedBlock(key));
 
@@ -159,6 +159,16 @@ TEST(BlockPoolTest, EvictionDropsCachedContentWhenReused) {
     EXPECT_EQ(second.get(), b);  // same physical block reused
     EXPECT_FALSE(b->IsCached());
     EXPECT_FALSE(pool.ContainsCachedBlock(key));  // content gone from the map
+}
+
+TEST(BlockPoolTest, CacheFullBlockRejectsEmptyOrForeignReference) {
+    BlockPool pool(8);
+    BlockPool other_pool(8);
+    const std::string key = RealKey({1, 2, 3, 4}, 0);
+    BlockRef foreign = other_pool.AcquireBlock();
+
+    EXPECT_THROW(pool.CacheFullBlock(BlockRef{}, key), std::runtime_error);
+    EXPECT_THROW(pool.CacheFullBlock(foreign, key), std::runtime_error);
 }
 
 // ---- LRU ordering -------------------------------------------------------

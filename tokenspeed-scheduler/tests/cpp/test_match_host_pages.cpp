@@ -49,7 +49,7 @@ std::vector<CacheBlock*> RawBlocks(const std::vector<BlockRef>& refs) {
 CacheBlock* Put(BlockPool& host_pool, const std::string& key) {
     BlockRef block = host_pool.AcquireBlock();
     CacheBlock* raw = block.get();
-    host_pool.CacheFullBlock(raw, key);
+    host_pool.CacheFullBlock(block, key);
     block.reset();
     return raw;
 }

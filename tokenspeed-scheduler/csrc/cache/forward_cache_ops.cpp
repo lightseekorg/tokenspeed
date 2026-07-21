@@ -25,14 +25,14 @@
 
 namespace tokenspeed {
 
-bool PrefillFirstChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables, CoordinatorMatch hit,
+bool PrefillFirstChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables, CoordinatorMatch&& hit,
                        std::int32_t num_new_tokens) {
     coordinator.ClaimCommonPrefix(tables, std::move(hit));
     return coordinator.Acquire(tables, num_new_tokens);
 }
 
 std::vector<BlockTransfer> LoadHostExtension(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
-                                             CoordinatorMatch host) {
+                                             CoordinatorMatch&& host) {
     return coordinator.LoadHostExtension(tables, std::move(host));
 }
 

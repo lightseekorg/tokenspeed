@@ -187,6 +187,8 @@ private:
     std::optional<HybridPrefixCache> hybrid_prefix_cache_{};
 
 #if TOKENSPEED_FLAT_KVCACHE
+    // Lifetime anchor: these pools are declared before every member that may
+    // hold BlockRef, so reverse member destruction releases all handles first.
     BlockPool block_pool_;
     // Host tier = a second BlockPool, isomorphic to the device pool (block 0 is the null
     // placeholder there too); the two differ only in which memory the ids index.

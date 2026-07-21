@@ -76,10 +76,10 @@ TEST(FullAttnManagerTest, MatchStopsAtFirstMiss) {
 
     BlockRef a = pool.AcquireBlock();
     CacheBlock* a_raw = a.get();
-    pool.CacheFullBlock(a.get(), k0);
+    pool.CacheFullBlock(a, k0);
     BlockRef b = pool.AcquireBlock();
     CacheBlock* b_raw = b.get();
-    pool.CacheFullBlock(b.get(), k1);
+    pool.CacheFullBlock(b, k1);
     a.reset();
     b.reset();
 
@@ -97,7 +97,7 @@ TEST(FullAttnManagerTest, MatchPinsUntilResultDies) {
     const std::string k0 = RealKey({1, 2, 3, 4}, 0);
     BlockRef a = pool.AcquireBlock();
     CacheBlock* raw = a.get();
-    pool.CacheFullBlock(raw, k0);
+    pool.CacheFullBlock(a, k0);
     a.reset();
     EXPECT_EQ(pool.NumFreeBlocks(), 7);
 
@@ -116,7 +116,7 @@ TEST(FullAttnManagerTest, ClaimHitBlocksClaimsAndAppends) {
     const std::string k0 = RealKey({1, 2, 3, 4}, 0);
     BlockRef a = pool.AcquireBlock();
     CacheBlock* raw = a.get();
-    pool.CacheFullBlock(raw, k0);
+    pool.CacheFullBlock(a, k0);
     a.reset();
     EXPECT_EQ(pool.NumFreeBlocks(), 7);
 
@@ -271,7 +271,7 @@ TEST(FullAttnManagerTest, FreeReturnsPagesAndClearsTable) {
     ASSERT_TRUE(mgr.Acquire(pool, table, 8));  // 2 pages
     EXPECT_EQ(pool.NumFreeBlocks(), 5);
 
-    mgr.Free(pool, table);
+    mgr.Free(table);
     EXPECT_EQ(table.NumBlocks(), 0);
     EXPECT_EQ(table.TailAvailableTokens(), 0);
     EXPECT_TRUE(table.Blocks().empty());
@@ -286,7 +286,7 @@ TEST(FullAttnManagerTest, FreedCachedPageStaysPrefixReusable) {
     BlockTable a;
     ASSERT_TRUE(mgr.Acquire(pool, a, 4));
     mgr.CacheFullBlocks(pool, a, std::vector<std::string>{k0});
-    mgr.Free(pool, a);
+    mgr.Free(a);
 
     std::vector<std::string> keys{k0};
     PrefixMatch m = mgr.Match(pool, keys, 0, 1);
@@ -308,7 +308,7 @@ TEST(FullAttnManagerTest, EndToEndTwoRequestsSharePrefix) {
         mgr.ClaimHitBlocks(a, std::move(m));
         ASSERT_TRUE(mgr.Acquire(pool, a, 8));
         mgr.CacheFullBlocks(pool, a, std::vector<std::string>{k0, k1});
-        mgr.Free(pool, a);
+        mgr.Free(a);
     }
 
     // Request B: shares the prefix.
@@ -322,7 +322,7 @@ TEST(FullAttnManagerTest, EndToEndTwoRequestsSharePrefix) {
         std::int32_t free_before = pool.NumFreeBlocks();
         ASSERT_TRUE(mgr.Acquire(pool, b, 0));  // no new tokens beyond the hit prefix
         EXPECT_EQ(pool.NumFreeBlocks(), free_before);
-        mgr.Free(pool, b);
+        mgr.Free(b);
     }
 }
 
@@ -350,7 +350,7 @@ TEST(FullAttnManagerTest, ClaimThenAcquireStartsFreshPage) {
     FullAttnManager mgr(4);
     const std::string k0 = RealKey({1, 2, 3, 4}, 0);
     BlockRef a = pool.AcquireBlock();
-    pool.CacheFullBlock(a.get(), k0);
+    pool.CacheFullBlock(a, k0);
     a.reset();
 
     std::vector<std::string> keys{k0};

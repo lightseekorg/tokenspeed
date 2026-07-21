@@ -59,6 +59,8 @@ public:
         BlockRef& slot = blocks_[static_cast<std::size_t>(index)];
         CacheBlock* old = slot.get();
         _assert(old != nullptr, "EvictToNull on a moved-out slot");
+        _assert(null_ref && null_ref->IsNull(), "EvictToNull replacement must be a null block");
+        _assert(slot.SharesPoolWith(null_ref), "EvictToNull replacement belongs to another pool");
         if (old->IsNull()) {
             return {};
         }
