@@ -37,6 +37,8 @@ logger = logging.getLogger(__name__)
 class Fp8Config(QuantizationConfig):
     """Config class for FP8."""
 
+    weight_scale_dtype = torch.float32
+
     def __init__(
         self,
         is_checkpoint_fp8_serialized: bool = False,
@@ -102,3 +104,23 @@ class Fp8Config(QuantizationConfig):
 
     def get_scaled_act_names(self) -> list[str]:
         return []
+
+
+class Mxfp8Config(Fp8Config):
+    """Config class for MXFP8."""
+
+    weight_scale_dtype = torch.uint8
+
+    @classmethod
+    def get_name(cls) -> str:
+        return "mxfp8"
+
+    @classmethod
+    def from_config(cls, config: dict[str, Any]) -> Mxfp8Config:
+        config = dict(config)
+        if config.get("scale_fmt") is None:
+            config["scale_fmt"] = "ue8m0"
+        return super().from_config(config)
+
+    def moe_weight_dtype(self) -> str:
+        return "fp8"

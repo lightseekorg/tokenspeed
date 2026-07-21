@@ -297,7 +297,7 @@ def triton_quantize_fp8(
     capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
     signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
     traits={
-        "granularity": frozenset({"token_group_128"}),
+        "granularity": frozenset({"token_group_32", "token_group_128"}),
         "scale_encoding": frozenset({"float32"}),
     },
     priority=Priority.PORTABLE,
@@ -309,10 +309,10 @@ def triton_quantize_fp8_with_scale(
     scale_encoding: str = "float32",
     enable_pdl: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if granularity != "token_group" or group_size != 128:
+    if granularity != "token_group" or group_size not in {32, 128}:
         raise ValueError(
-            "triton FP8 dynamic quantization currently supports only "
-            f"granularity='token_group' with group_size=128, got "
+            "triton FP8 dynamic quantization supports only "
+            f"granularity='token_group' with group_size 32 or 128, got "
             f"granularity={granularity!r}, group_size={group_size}."
         )
     if scale_encoding != "float32":
@@ -320,7 +320,7 @@ def triton_quantize_fp8_with_scale(
             "triton FP8 dynamic quantization currently requires "
             f"scale_encoding='float32', got {scale_encoding!r}."
         )
-    return _fp8_token_group_quantize(x.contiguous(), 128)
+    return _fp8_token_group_quantize(x.contiguous(), group_size)
 
 
 @triton.jit

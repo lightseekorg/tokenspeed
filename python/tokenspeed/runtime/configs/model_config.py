@@ -66,6 +66,11 @@ _DSA_ARCHITECTURES = frozenset(
         "GlmMoeDsaForCausalLMNextN",
     }
 )
+_MSA_ARCHITECTURES = frozenset(
+    {
+        "MiniMaxM3SparseForConditionalGeneration",
+    }
+)
 _DOUBLE_ATTENTION_LAYER_ARCHITECTURES = frozenset(
     {
         "LongcatFlashForCausalLM",
@@ -77,6 +82,7 @@ class AttentionArch(IntEnum):
     MLA = auto()
     MHA = auto()
     DSA = auto()
+    MSA = auto()
 
 
 @dataclass(frozen=True)
@@ -208,6 +214,10 @@ def configure_mla_attention(model_config) -> None:
         model_config.scaling = model_config.scaling * mscale * mscale
 
 
+def configure_minimax_m3_attention(model_config) -> None:
+    model_config.attention_arch = AttentionArch.MSA
+
+
 _ATTENTION_FAMILY_SPECS = (
     _AttentionFamilySpec(
         name="DeepSeek V4",
@@ -227,6 +237,12 @@ _ATTENTION_FAMILY_SPECS = (
         name="MLA",
         architectures=_MLA_ARCHITECTURES,
         configure=configure_mla_attention,
+    ),
+    _AttentionFamilySpec(
+        name="MiniMax MSA",
+        architectures=_MSA_ARCHITECTURES,
+        configure=configure_minimax_m3_attention,
+        default_block_size=128,
     ),
 )
 
@@ -739,6 +755,7 @@ def is_multimodal_model(model_architectures: list[str] | None):
         "Qwen3ASRForConditionalGeneration",
         "KimiK25ForConditionalGeneration",
         "InklingForConditionalGeneration",
+        "MiniMaxM3SparseForConditionalGeneration",
     }
     return any(arch in multimodal_architectures for arch in model_architectures or [])
 

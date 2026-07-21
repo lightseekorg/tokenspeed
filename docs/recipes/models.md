@@ -65,6 +65,26 @@ ts serve \
     --speculative-num-draft-tokens 4
 ```
 
+## MiniMax M3
+
+MiniMax M3 uses 128-token MSA blocks. TokenSpeed configures its dense and sparse
+attention layers automatically; select the dense backend with
+`--attention-backend` and run with `--disable-kvstore`.
+
+```bash
+tokenspeed serve MiniMaxAI/MiniMax-M3-MXFP8 \
+  --trust-remote-code \
+  --tensor-parallel-size 4 \
+  --max-model-len 1048576 \
+  --max-total-tokens 1048576 \
+  --block-size 128 \
+  --attention-backend trtllm \
+  --moe-backend triton \
+  --disable-kvstore \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
 ## Kimi K2.5 / K2.6
 
 Kimi-style MoE launches usually need remote code, long context, reasoning and

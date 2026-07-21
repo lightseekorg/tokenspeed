@@ -42,6 +42,7 @@ __all__ = [
     "flat_decode_locs",
     "flat_tables_unpack",
     "gather_page_table_with_padding",
+    "index_k_block_split_scatter",
     "quantize_mxfp8_rows",
     "quantize_store_kv_mxfp8",
     "store_kv_cache",
@@ -1601,4 +1602,107 @@ def flat_tables_unpack(
         actual_bs,
         TAIL_PAD=tail_pad,
         BLOCK_W=BLOCK_W,
+    )
+
+
+# GLM-5 DSA block-split index-K scatter
+
+
+@triton.jit
+def _index_k_scatter_kernel(
+    fp8_buf_ptr,  # uint8 flat view of buf
+    scale_buf_ptr,  # float32 flat view of buf (aliases fp8_buf_ptr)
+    k_fp8_ptr,  # uint8 [tokens, HD]
+    k_scale_ptr,  # float32 [tokens, NG]
+    loc_ptr,  # int [tokens] global slot index (non-negative)
+    page_bytes,  # fp8 elements per page
+    scale_page_off,  # float32 elements per page (page_bytes // 4)
+    scale_base_off,  # float32 offset of the scale region ((ps*hd)//4)
+    PAGE_SIZE: tl.constexpr,
+    HD: tl.constexpr,
+    NG: tl.constexpr,
+    BLOCK_HD: tl.constexpr,  # next_pow2(HD); masked so HD need not be pow2
+    BLOCK_NG: tl.constexpr,  # next_pow2(NG)
+):
+    t = tl.program_id(0)
+    # loc >= 0 makes // and % exact.
+    loc = tl.load(loc_ptr + t).to(tl.int64)
+    page = loc // PAGE_SIZE
+    slot = loc % PAGE_SIZE
+
+    d = tl.arange(0, BLOCK_HD)
+    hd_mask = d < HD
+    fp8_dst = page * page_bytes + slot * HD + d
+    tl.store(
+        fp8_buf_ptr + fp8_dst,
+        tl.load(k_fp8_ptr + t * HD + d, mask=hd_mask),
+        mask=hd_mask,
+    )
+
+    g = tl.arange(0, BLOCK_NG)
+    ng_mask = g < NG
+    sc_dst = scale_base_off + page * scale_page_off + slot * NG + g
+    tl.store(
+        scale_buf_ptr + sc_dst,
+        tl.load(k_scale_ptr + t * NG + g, mask=ng_mask),
+        mask=ng_mask,
+    )
+
+
+def index_k_block_split_scatter(
+    buf: torch.Tensor,
+    index_k_fp8: torch.Tensor,
+    index_k_scale: torch.Tensor,
+    loc: torch.Tensor,
+    *,
+    page_size: int,
+    head_dim: int,
+    group_size: int,
+) -> None:
+    """Scatter FP8 index-K rows + scales into the block-split paged buffer.
+
+    Byte-exact single-launch equivalent of two ``index_put`` writes through
+    the block-split ``as_strided`` views (see
+    ``DSATokenToKVPool._index_k_block_views``). The ``(page, slot_in_page) =
+    (loc // page_size, loc % page_size)`` mapping is derived per token inside
+    the kernel, so callers pass raw cache locations.
+
+    Args:
+        buf: uint8 ``[num_slots, head_dim + num_groups*4]`` packed buffer.
+        index_k_fp8: ``[tokens, head_dim]`` FP8 values.
+        index_k_scale: ``[tokens, num_groups]`` float32 scales.
+        loc: ``[tokens]`` non-negative int global slot indices (any integer
+            dtype).
+        page_size, head_dim, group_size: layout; ``num_groups = head_dim //
+            group_size``.
+
+    Returns:
+        None; ``buf`` is written in place.
+    """
+    tokens = index_k_fp8.shape[0]
+    if tokens == 0:
+        return
+    ng = head_dim // group_size
+    row_bytes = head_dim + ng * 4
+    page_bytes = page_size * row_bytes
+
+    fp8_buf = buf.reshape(-1)  # uint8
+    scale_buf = fp8_buf.view(torch.float32)  # aliases the same storage
+    k_fp8 = index_k_fp8.reshape(-1, head_dim).contiguous().view(torch.uint8)
+    k_scale = index_k_scale.reshape(-1, ng).contiguous()
+
+    _index_k_scatter_kernel[(tokens,)](
+        fp8_buf,
+        scale_buf,
+        k_fp8,
+        k_scale,
+        loc.reshape(-1),
+        page_bytes,
+        page_bytes // 4,
+        (page_size * head_dim) // 4,
+        PAGE_SIZE=page_size,
+        HD=head_dim,
+        NG=ng,
+        BLOCK_HD=_next_power_of_two(head_dim),
+        BLOCK_NG=_next_power_of_two(ng),
     )

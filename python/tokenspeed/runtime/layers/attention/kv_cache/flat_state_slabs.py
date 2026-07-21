@@ -54,8 +54,8 @@ class FlatStateSlabs:
         layer_types: Per-layer type labels; state layers carry the
             ``STATE_LAYER_TYPES`` labels. Drives the slab pairing.
         conv_state_shape / temporal_state_shape: Per-state-layer mamba2
-            state tensor shapes (configs' mamba2_cache_params); ``None`` on
-            pure-attention models.
+            state tensor shapes (configs' mamba2_cache_params). The temporal
+            shape is K-last ``[Hv, V, K]``; ``None`` on pure-attention models.
         conv_dtype / ssm_dtype: State dtypes; default to ``default_dtype``.
         default_dtype: Pool store dtype used when a state dtype is ``None``.
         page_size: The (already-equalized) page size P.
@@ -185,6 +185,8 @@ class FlatStateSlabs:
         # dummy-page convention.
         assert self.size % self.page_size == 0, "flat pool size must be whole pages"
         self.num_pages_with_null = self.size // self.page_size + 1
+        # The config publishes SSM rows directly in the kernels' native K-last
+        # [Hv, V, K] layout, so the slab preserves the declared shape.
         self.state_slabs = [
             (
                 torch.zeros(
