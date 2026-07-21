@@ -81,9 +81,6 @@ class WeightTransferManager:
         # Lifecycle state.
         self._engine_inited = False
         self._update_active = False
-        # Tracks whether an explicit weight_version was set during the current
-        # update cycle (via chunk metadata or finish_update arg).
-        self._version_set_this_update = False
         self._pending_weight_version: str | None = None
 
     # ------------------------------------------------------------------ #
@@ -148,8 +145,7 @@ class WeightTransferManager:
                 "/finish_weight_update before starting another."
             )
         self._update_active = True
-        self._version_set_this_update = False
-        self._pending_weight_version: str | None = None
+        self._pending_weight_version = None
         logger.info("Weight update started")
 
     async def update(self, update_info: dict[str, Any]) -> None:
@@ -174,7 +170,6 @@ class WeightTransferManager:
             version = update_info.get("weight_version")
             if version is not None:
                 self._pending_weight_version = version
-                self._version_set_this_update = True
         else:  # ipc
             self._parse_ipc_update(update_info)
             # The CUDA-IPC receive path (rebuild_cuda_tensor + load_weights on the
@@ -207,10 +202,10 @@ class WeightTransferManager:
             )
         self._update_active = False
 
-        # Apply the weight version: explicit finish arg > pending from chunks > unchanged.
+        # Apply the explicit finish version first, then any version from a chunk.
         if weight_version is not None:
             self._apply_weight_version(weight_version)
-        elif self._version_set_this_update and self._pending_weight_version is not None:
+        elif self._pending_weight_version is not None:
             self._apply_weight_version(self._pending_weight_version)
         # else: trainer chose not to supply a version (leave as-is).
 
@@ -272,12 +267,6 @@ class WeightTransferManager:
     def _apply_weight_version(self, version: str) -> None:
         """Set the weight version on server_args (stamps future responses)."""
         self._async_llm.server_args.weight_version = version
-
-    def _apply_weight_version_if_provided(self, version: str | None) -> None:
-        """Set the weight version if the caller supplied one."""
-        if version is not None:
-            self._apply_weight_version(version)
-            self._version_set_this_update = True
 
     # ------------------------------------------------------------------ #
     # Backend-specific parsing
