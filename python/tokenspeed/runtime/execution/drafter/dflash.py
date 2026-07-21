@@ -88,16 +88,22 @@ class DFlash(BaseDrafter):
 
         cfg = self.model.config
         dflash_cfg = getattr(cfg, "dflash_config", {}) or {}
-        self.target_layer_ids = [int(x) for x in dflash_cfg.get("target_layer_ids", [])]
+        target_layer_ids = dflash_cfg.get("target_layer_ids") or getattr(
+            cfg, "target_layer_ids", None
+        )
+        self.target_layer_ids = [int(x) for x in (target_layer_ids or [])]
         if not self.target_layer_ids:
             raise ValueError(
                 "DFLASH draft config must define dflash_config.target_layer_ids."
             )
-        if "mask_token_id" not in dflash_cfg:
+        mask_token_id = dflash_cfg.get("mask_token_id")
+        if mask_token_id is None:
+            mask_token_id = getattr(cfg, "mask_token_id", None)
+        if mask_token_id is None:
             raise ValueError(
                 "DFLASH draft config must define dflash_config.mask_token_id."
             )
-        self.mask_token_id = int(dflash_cfg["mask_token_id"])
+        self.mask_token_id = int(mask_token_id)
         self.block_size = int(getattr(cfg, "block_size", spec_num_tokens))
         if self.block_size != int(spec_num_tokens):
             logger.warning(
