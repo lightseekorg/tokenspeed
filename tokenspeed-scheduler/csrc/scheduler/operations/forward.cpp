@@ -137,7 +137,9 @@ bool isFlatDeferred(const Request* req) {
 // (forward_cache_ops.h).
 Scheduler::FlatAdmissionMatch Scheduler::matchFlatPrefixAtAdmission(Request* request) {
     if (config_.disable_prefix_cache) {
-        return {};
+        FlatAdmissionMatch match;
+        match.probe = coordinator_.ProbePrefix({});
+        return match;
     }
     // Hash input must be byte-identical to the REGISTRATION form (GetFullPagedTokens(false)); radix's
     // except_last rule (last prompt token recomputed for logits) becomes the page cap, also bounding SWA.
