@@ -77,7 +77,8 @@ private:
 
     std::vector<BlockRef> blocks_{};
     std::int32_t tail_avail_{0};
-    // Slots below this are known-null (already reclaimed); lets ReclaimExpired skip re-scanning punched history.
+    // Reclaim scans never revisit slots below this. NOT a null guarantee: claimed/extension holes can strand
+    // real pages under an alignment==0 early break (same pages the pre-floor scan stranded); Free releases them.
     std::int32_t reclaim_floor_{0};
 };
 

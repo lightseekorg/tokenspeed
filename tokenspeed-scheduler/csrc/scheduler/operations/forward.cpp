@@ -168,6 +168,8 @@ std::optional<std::int32_t> Scheduler::flatAdmitFirstChunk(Request* request, con
     // Charge chunk-then-reserve sequentially: unreserved, an exactly-filling prompt's own decode
     // defers forever, and the combined query under-charges live-tail groups (non-monotonic).
     // ext_real_pages composes exactly: extension pages are FULL, so they leave tail_avail 0.
+    // Fresh-table charge is exact only because SweepThenConverge pins claim extents to the same
+    // lcm MakeCoordinator wires as the live alignment (slotIsLive is not shift-invariant otherwise).
     const std::int32_t blocks_needed = coordinator_.BlocksNeededForSequential(chunk_tokens, decode_reserve_tokens);
     // Exact since gate and apply run back to back.
     const std::int32_t claim_blocks = coordinator_.BlocksConsumedByClaim(hit);
