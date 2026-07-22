@@ -170,7 +170,12 @@ class OperationSchema:
 
 
 class OperationRegistry:
-    """Process-wide catalog of operation schemas, keyed by string identity."""
+    """Process-wide catalog of operation schemas, keyed by string identity.
+
+    Schemas are normally published as their modules are imported. The catalog
+    then supplies contracts to future kernel registrations and validates any
+    kernels that were registered before their schema became available.
+    """
 
     _instance: OperationRegistry | None = None
 
@@ -179,11 +184,13 @@ class OperationRegistry:
 
     @classmethod
     def get(cls) -> OperationRegistry:
+        """Return the shared operation catalog, creating it on first use."""
         if cls._instance is None:
             cls._instance = cls()
         return cls._instance
 
     def register(self, schema: OperationSchema) -> None:
+        """Publish a schema after validating kernels already using its identity."""
         if not isinstance(schema, OperationSchema):
             raise TypeError("operation registry accepts OperationSchema instances")
         existing_schema = self._schemas.get(schema.id)
@@ -196,6 +203,9 @@ class OperationRegistry:
 
         from tokenspeed_kernel.registry import KernelRegistry
 
+        # Plugins may register kernels before the corresponding contract module
+        # is imported. Validate that backlog before making the schema visible so
+        # registration order does not weaken the contract.
         existing = KernelRegistry.get().get_for_operator(*schema.id)
         for spec in existing:
             implementation = KernelRegistry.get().get_impl(spec.name)
@@ -205,13 +215,16 @@ class OperationRegistry:
         self._schemas[schema.id] = schema
 
     def find(self, family: str, mode: str) -> OperationSchema | None:
+        """Return a schema when present, for callers where it is optional."""
         return self._schemas.get((family, mode))
 
     def lookup(self, family: str, mode: str) -> OperationSchema:
+        """Return a required schema, raising when the operation is unknown."""
         schema = self.find(family, mode)
         if schema is None:
             raise UnknownOperationError(f"unknown operation {family}.{mode}")
         return schema
 
     def schemas(self) -> tuple[OperationSchema, ...]:
+        """Return all schemas in deterministic family-and-mode order."""
         return tuple(self._schemas[key] for key in sorted(self._schemas))
