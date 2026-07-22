@@ -27,7 +27,7 @@ from typing import Callable
 import pytest
 import torch
 from tokenspeed_kernel import plugins as plugins_mod
-from tokenspeed_kernel.operation import OperationSchema
+from tokenspeed_kernel.operation import OperationRegistry, OperationSchema
 from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.plugins import (
     DISABLE_ENV_VAR,
@@ -53,10 +53,11 @@ from tokenspeed_kernel.signature import (
 
 @pytest.fixture
 def fresh_plugins(monkeypatch: pytest.MonkeyPatch):
-    """Reset registry and plugin state before/after each test."""
-    # Preserve the process-wide built-in registry for tests collected after
-    # this module; monkeypatch restores it after this fixture tears down.
+    """Reset registries and plugin state before/after each test."""
+    # Preserve the process-wide built-in catalogs for tests collected after
+    # this module; monkeypatch restores them after this fixture tears down.
     monkeypatch.setattr(KernelRegistry, "_instance", None)
+    monkeypatch.setattr(OperationRegistry, "_instance", None)
     reset_plugins()
     yield
     KernelRegistry.reset()
