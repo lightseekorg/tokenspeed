@@ -881,6 +881,15 @@ setup(
     packages=find_packages(),
     package_data={
         "tokenspeed_kernel.thirdparty.cuda": ["objs/**/*.so"],
+        # Vendored MiniMax MSA CuTe sources: cute/ has no __init__.py (it is
+        # loaded via the upstream sys.path bootstrap), so ship it as data.
+        "tokenspeed_kernel.thirdparty.msa": [
+            "README.md",
+            "cute/**/*.py",
+            "cute/**/*.cu",
+            "cute/README.md",
+            "cute/requirements.txt",
+        ],
     },
     cmdclass={
         "build_native": BuildNative,

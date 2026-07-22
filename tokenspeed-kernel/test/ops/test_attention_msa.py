@@ -555,3 +555,163 @@ def test_msa_fp8_kv_descale_matches_dequant_reference(phase: str) -> None:
             )
     finally:
         torch.backends.cuda.matmul.allow_tf32 = old_tf32
+
+
+def _msa_cute_registered() -> bool:
+    import tokenspeed_kernel.ops.attention.msa as msa_mod
+
+    return hasattr(msa_mod, "msa_minimax_extend_with_kvcache")
+
+
+requires_msa_cute = pytest.mark.skipif(
+    not torch.cuda.is_available() or not _msa_cute_registered(),
+    reason="the msa CuTe attend requires SM100 with cutlass-dsl and quack",
+)
+
+
+def _two_request_extend_case(kv_cache_dtype: torch.dtype):
+    """Two ragged chunked-prefill requests sharing one paged cache."""
+    prefix_lens = [2305, 517]
+    new_tokens = [7, 129]
+    total_lens = [p + n for p, n in zip(prefix_lens, new_tokens)]
+    num_blocks = [math.ceil(total / _BLOCK_SIZE) for total in total_lens]
+    max_blocks = max(num_blocks)
+    num_pages = 1 + sum(num_blocks)  # Physical page zero is the dummy page.
+
+    block_table = torch.zeros((2, max_blocks), dtype=torch.int32, device="cuda")
+    next_page = 1
+    for request, blocks in enumerate(num_blocks):
+        block_table[request, :blocks] = torch.arange(
+            next_page, next_page + blocks, dtype=torch.int32, device="cuda"
+        )
+        next_page += blocks
+
+    def slots_for(request: int, positions: torch.Tensor) -> torch.Tensor:
+        pages = block_table[request, positions // _BLOCK_SIZE].to(torch.int64)
+        return (pages * _BLOCK_SIZE + positions % _BLOCK_SIZE).to(torch.int32)
+
+    key_cache = torch.randn(
+        num_pages, 1, _BLOCK_SIZE, _HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+    )
+    value_cache = torch.randn_like(key_cache)
+    if kv_cache_dtype is torch.float8_e4m3fn:
+        key_cache = key_cache.to(kv_cache_dtype)
+        value_cache = value_cache.to(kv_cache_dtype)
+
+    index_key_cache = torch.zeros(
+        num_pages * _BLOCK_SIZE, _HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+    )
+    for request, prefix in enumerate(prefix_lens):
+        prefix_positions = torch.arange(prefix, device="cuda")
+        index_key_cache[slots_for(request, prefix_positions).long()] = torch.randn(
+            prefix, _HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+        )
+
+    total_q = sum(new_tokens)
+    query = torch.randn(total_q, 16, _HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    index_query = torch.randn(
+        total_q, 1, _HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+    )
+    index_key = torch.randn(total_q, _HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    slot_mapping = torch.cat(
+        [
+            slots_for(request, torch.arange(prefix, total, device="cuda"))
+            for request, (prefix, total) in enumerate(zip(prefix_lens, total_lens))
+        ]
+    )
+    kwargs = dict(
+        q=query,
+        index_q=index_query,
+        index_k=index_key,
+        k_cache=key_cache,
+        v_cache=value_cache,
+        index_k_cache=index_key_cache,
+        slot_mapping=slot_mapping,
+        page_table=block_table,
+        cache_seqlens=torch.tensor(total_lens, dtype=torch.int32, device="cuda"),
+        cu_seqlens_q=torch.tensor(
+            [0, new_tokens[0], total_q], dtype=torch.int32, device="cuda"
+        ),
+        prefix_lens=torch.tensor(prefix_lens, dtype=torch.int32, device="cuda"),
+        max_seqlen_q=max(new_tokens),
+        max_seqlen_k=max(total_lens),
+        topk=_TOPK,
+        page_size=_BLOCK_SIZE,
+        index_scale=_HEAD_DIM**-0.5,
+        attention_scale=_HEAD_DIM**-0.5,
+        init_blocks=0,
+        local_blocks=1,
+    )
+    return kwargs
+
+
+@requires_msa_cute
+@pytest.mark.parametrize(
+    "kv_cache_dtype",
+    [torch.bfloat16, torch.float8_e4m3fn],
+    ids=["bf16", "fp8_e4m3"],
+)
+def test_msa_cute_extend_matches_triton(kv_cache_dtype: torch.dtype) -> None:
+    """The CuTe attend must match the Triton attend on ragged extend batches.
+
+    Both solutions run through the public dispatch op with a solution pin, on
+    the same caches and the same (deterministic) indexer selection; only the
+    attend kernel differs. The FP8 case exercises the CuTe kernel's BF16-Q +
+    E4M3-KV staging mode at identity scale.
+    """
+    torch.manual_seed(20260722)
+    old_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        kwargs = _two_request_extend_case(kv_cache_dtype)
+        # Each solution's indexer pass rewrites the same index_k_cache slots
+        # with identical values, so back-to-back calls stay comparable.
+        out_cute = msa_extend_with_kvcache(solution="msa", **kwargs)
+        out_triton = msa_extend_with_kvcache(solution="triton", **kwargs)
+        assert out_cute.dtype == torch.bfloat16
+        torch.testing.assert_close(out_cute, out_triton, atol=2e-2, rtol=2e-2)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = old_tf32
+
+
+@requires_msa_cute
+def test_msa_cute_extend_wins_selection_and_decode_stays_triton() -> None:
+    """On SM100 the SPECIALIZED CuTe solution must win extend dispatch, decode
+    must keep resolving to Triton (no fmha_sm100 decode registration), and the
+    descale fallback must keep non-identity FP8 scales on the Triton attend."""
+    from tokenspeed_kernel.selection import select_kernel
+    from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+
+    traits = {
+        "head_dim": _HEAD_DIM,
+        "index_head_dim": _HEAD_DIM,
+        "page_size": _BLOCK_SIZE,
+        "topk": _TOPK,
+    }
+    for kv_dtype in (torch.bfloat16, torch.float8_e4m3fn):
+        signature = format_signature(
+            q=dense_tensor_format(torch.bfloat16),
+            index_q=dense_tensor_format(torch.bfloat16),
+            index_k=dense_tensor_format(torch.bfloat16),
+            k_cache=dense_tensor_format(kv_dtype),
+            v_cache=dense_tensor_format(kv_dtype),
+            index_k_cache=dense_tensor_format(torch.bfloat16),
+        )
+        extend = select_kernel(
+            "attention", "msa_extend_with_kvcache", signature, traits=traits
+        )
+        assert extend.name == "msa_minimax_extend_with_kvcache"
+        decode = select_kernel(
+            "attention", "msa_decode_with_kvcache", signature, traits=traits
+        )
+        assert decode.name == "triton_minimax_msa_decode_with_kvcache"
+
+    # Descaled FP8 extend goes through the dispatcher-selected CuTe wrapper
+    # but must produce the Triton-descaled result (internal fallback).
+    torch.manual_seed(20260722)
+    kwargs = _two_request_extend_case(torch.float8_e4m3fn)
+    out_default = msa_extend_with_kvcache(k_scale=0.25, v_scale=0.5, **kwargs)
+    out_triton = msa_extend_with_kvcache(
+        solution="triton", k_scale=0.25, v_scale=0.5, **kwargs
+    )
+    torch.testing.assert_close(out_default, out_triton, atol=0.0, rtol=0.0)
