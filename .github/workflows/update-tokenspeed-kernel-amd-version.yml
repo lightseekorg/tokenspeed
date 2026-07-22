@@ -1,10 +1,10 @@
-name: Update tokenspeed-kernel AMD dependency
+name: Update tokenspeed-kernel-amd version
 
 on:
   workflow_dispatch:
     inputs:
-      amd_version:
-        description: "Published tokenspeed-kernel-amd version to pin, for example 0.1.3 or v0.1.3."
+      version:
+        description: "tokenspeed-kernel-amd version to write to pyproject.toml, for example 0.1.3."
         required: true
         type: string
 
@@ -12,7 +12,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}
+  group: ${{ github.workflow }}-${{ inputs.version }}
   cancel-in-progress: false
 
 jobs:
@@ -22,9 +22,14 @@ jobs:
       - name: Require lightseek-bot token
         env:
           LIGHTSEEK_BOT_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+          SOURCE_REF: ${{ github.ref }}
         run: |
+          if [ "$SOURCE_REF" != "refs/heads/main" ]; then
+            echo "Dispatch this workflow from main." >&2
+            exit 1
+          fi
           if [ -z "$LIGHTSEEK_BOT_TOKEN" ]; then
-            echo "LIGHTSEEK_BOT_TOKEN is required to push the branch and create the pull request." >&2
+            echo "LIGHTSEEK_BOT_TOKEN is required to push the version update and create its pull request." >&2
             exit 1
           fi
 
@@ -42,61 +47,22 @@ jobs:
       - name: Prepare update branch
         id: prepare
         env:
-          REQUESTED_VERSION: ${{ inputs.amd_version }}
+          VERSION: ${{ inputs.version }}
         run: |
-          version="${REQUESTED_VERSION#v}"
-          if ! [[ "$version" =~ ^[0-9]+(\.[0-9]+)*((a|b|rc)[0-9]+)?(\.post[0-9]+)?$ ]]; then
-            echo "Invalid public release version: $REQUESTED_VERSION" >&2
+          if ! [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+)*((a|b|rc)[0-9]+)?(\.post[0-9]+)?$ ]]; then
+            echo "Invalid public release version: $VERSION" >&2
             exit 1
           fi
 
-          branch="bot/update-tokenspeed-kernel-amd-${version}"
+          branch="bot/update-tokenspeed-kernel-amd-version-${VERSION}"
           git switch -c "$branch"
           git config user.name "lightseek-bot"
           git config user.email "243258330+lightseek-bot@users.noreply.github.com"
 
           echo "branch=$branch" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Verify published version
-        env:
-          VERSION: ${{ steps.prepare.outputs.version }}
-        run: |
-          if ! http_code=$(curl --silent --show-error \
-            --output /tmp/pypi-version.json \
-            --write-out '%{http_code}' \
-            "https://pypi.org/pypi/tokenspeed-kernel-amd/${VERSION}/json"); then
-            echo "Could not verify tokenspeed-kernel-amd ${VERSION} on PyPI." >&2
-            exit 1
-          fi
-
-          case "$http_code" in
-            200) ;;
-            404)
-              echo "tokenspeed-kernel-amd ${VERSION} is not published on PyPI yet." >&2
-              exit 1
-              ;;
-            *)
-              echo "Could not verify tokenspeed-kernel-amd ${VERSION} on PyPI: HTTP ${http_code}." >&2
-              exit 1
-              ;;
-          esac
-
-          python - <<'PY'
-          import json
-          from pathlib import Path
-
-          release = json.loads(Path("/tmp/pypi-version.json").read_text())
-          files = release.get("urls")
-          if not isinstance(files, list) or not any(
-              not file.get("yanked", False) for file in files
-          ):
-              raise SystemExit(
-                  "The PyPI release has no non-yanked distribution files to install."
-              )
-          PY
-
-      - name: Update AMD dependency
+      - name: Update package version
         id: update
         env:
           VERSION: ${{ steps.prepare.outputs.version }}
@@ -104,22 +70,40 @@ jobs:
           python - <<'PY'
           import os
           import re
+          import tomllib
           from pathlib import Path
 
           version = os.environ["VERSION"]
-          path = Path("tokenspeed-kernel/python/requirements/rocm.txt")
-          text, count = re.subn(
-              r"(?m)^tokenspeed-kernel-amd==[^\n]+$",
-              f"tokenspeed-kernel-amd=={version}",
-              path.read_text(),
+          path = Path("tokenspeed-kernel-amd/pyproject.toml")
+          text = path.read_text()
+          data = tomllib.loads(text)
+          if data["project"]["name"] != "tokenspeed-kernel-amd":
+              raise SystemExit(f"{path} does not describe tokenspeed-kernel-amd")
+
+          project_match = re.search(r"(?ms)^\[project\]\n(?P<body>.*?)(?=^\[|\Z)", text)
+          if project_match is None:
+              raise SystemExit(f"missing [project] table in {path}")
+
+          body = project_match.group("body")
+          version_lines = re.findall(r'(?m)^version = "[^"]+"$', body)
+          if len(version_lines) != 1:
+              raise SystemExit(f"expected one project.version in {path}")
+          updated_body = re.sub(
+              r'(?m)^version = "[^"]+"$',
+              f'version = "{version}"',
+              body,
+              count=1,
           )
-          if count != 1:
-              raise SystemExit(f"expected one tokenspeed-kernel-amd pin in {path}")
+          text = (
+              text[: project_match.start("body")]
+              + updated_body
+              + text[project_match.end("body") :]
+          )
           path.write_text(text)
           PY
 
-          if git diff --quiet -- tokenspeed-kernel/python/requirements/rocm.txt; then
-            echo "tokenspeed-kernel already uses tokenspeed-kernel-amd $VERSION."
+          if git diff --quiet -- tokenspeed-kernel-amd/pyproject.toml; then
+            echo "tokenspeed-kernel-amd is already at $VERSION."
             echo "changed=false" >> "$GITHUB_OUTPUT"
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
@@ -140,7 +124,7 @@ jobs:
               git diff --name-only
               git ls-files --others --exclude-standard
             } | sort -u | while IFS= read -r path; do
-              if [ "$path" != "tokenspeed-kernel/python/requirements/rocm.txt" ]; then
+              if [ "$path" != "tokenspeed-kernel-amd/pyproject.toml" ]; then
                 echo "$path"
               fi
             done
@@ -148,7 +132,7 @@ jobs:
 
           unexpected_files=$(list_unexpected_files)
           if [ -n "$unexpected_files" ]; then
-            echo "pre-commit changed files outside the AMD dependency update:" >&2
+            echo "pre-commit changed files outside the AMD package version update:" >&2
             echo "$unexpected_files" >&2
             exit 1
           fi
@@ -158,7 +142,7 @@ jobs:
 
           unexpected_files=$(list_unexpected_files)
           if [ -n "$unexpected_files" ]; then
-            echo "pre-commit changed files outside the AMD dependency update:" >&2
+            echo "pre-commit changed files outside the AMD package version update:" >&2
             echo "$unexpected_files" >&2
             exit 1
           fi
@@ -170,8 +154,13 @@ jobs:
           GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
           VERSION: ${{ steps.prepare.outputs.version }}
         run: |
-          git add tokenspeed-kernel/python/requirements/rocm.txt
-          git commit -s -m "build: pin tokenspeed-kernel-amd ${VERSION}"
+          if git diff --quiet -- tokenspeed-kernel-amd/pyproject.toml; then
+            echo "The package version is unchanged after pre-commit; nothing to publish."
+            exit 0
+          fi
+
+          git add tokenspeed-kernel-amd/pyproject.toml
+          git commit -s -m "build: update tokenspeed-kernel-amd to ${VERSION}"
 
           remote_line=$(git ls-remote --heads origin "refs/heads/${BRANCH}")
           remote_sha=${remote_line%%$'\t'*}
@@ -184,10 +173,17 @@ jobs:
             --force-with-lease="$lease" \
             origin "HEAD:refs/heads/${BRANCH}"
 
-          title="build: pin tokenspeed-kernel-amd ${VERSION}"
-          body="Pin tokenspeed-kernel's ROCm dependency to the published tokenspeed-kernel-amd ${VERSION} release."
-          if gh pr view "$BRANCH" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh pr edit "$BRANCH" \
+          title="build: update tokenspeed-kernel-amd to ${VERSION}"
+          body="Prepare the tokenspeed-kernel-amd ${VERSION} release from a reviewed main-branch change."
+          pr_number=$(gh pr list \
+            --repo "$GITHUB_REPOSITORY" \
+            --base main \
+            --head "$BRANCH" \
+            --state open \
+            --json number \
+            --jq '.[0].number // empty')
+          if [ -n "$pr_number" ]; then
+            gh pr edit "$pr_number" \
               --repo "$GITHUB_REPOSITORY" \
               --title "$title" \
               --body "$body"
