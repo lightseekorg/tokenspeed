@@ -176,6 +176,90 @@ TEST(SwaLiveAllocTest, CheckpointPagesLandExactlyBeforeAlignedBoundaries) {
     }
 }
 
+TEST(SwaLiveAllocTest, SequentialChargeCoversPeakAcquireDemand) {
+    // BlocksNeededFor is non-monotonic (frontier 19 holes slot 0): the combined query
+    // under-charges the chunk-then-reserve sequence that admission actually performs.
+    BlockPool pool(64);
+    SwaManager mgr(8, 12, 256);
+    const BlockTable fresh;
+    EXPECT_EQ(mgr.BlocksNeededFor(fresh, 17), 3);
+    EXPECT_EQ(mgr.BlocksNeededFor(fresh, 19), 2);  // the drop the combined gate would trust
+    EXPECT_EQ(mgr.BlocksNeededForSequential(fresh, 17, 2), 3);
+
+    // The sequential charge equals what the two real acquires pin at their peak.
+    BlockTable table;
+    std::int32_t before = pool.NumFreeBlocks();
+    ASSERT_TRUE(mgr.Acquire(pool, table, 17));
+    EXPECT_EQ(before - pool.NumFreeBlocks(), 3);
+    before = pool.NumFreeBlocks();
+    ASSERT_TRUE(mgr.Acquire(pool, table, 2));
+    EXPECT_EQ(before - pool.NumFreeBlocks(), 0);
+
+    // A reserve crossing into new pages charges both batches (A=3 at frontier 17, B=1 at 27).
+    EXPECT_EQ(mgr.BlocksNeededForSequential(fresh, 17, 10), 4);
+    BlockTable table2;
+    before = pool.NumFreeBlocks();
+    ASSERT_TRUE(mgr.Acquire(pool, table2, 17));
+    ASSERT_TRUE(mgr.Acquire(pool, table2, 10));
+    EXPECT_EQ(before - pool.NumFreeBlocks(), 4);
+}
+
+TEST(SwaLiveAllocTest, SequentialReserveMatchesSecondAcquireAndIsNonNegative) {
+    // reserve = Sequential(chunk, extra) - BlocksNeededFor(chunk) must equal the second
+    // acquire's real demand (the old combined form went negative, e.g. chunk=17/extra=2).
+    for (const auto [chunk, extra] : {std::pair{17, 2}, {18, 2}, {16, 3}, {17, 10}, {24, 2}, {8192, 16}, {3, 4}}) {
+        BlockPool pool(2048);
+        SwaManager mgr(8, 12, 256);
+        const BlockTable fresh;
+        const std::int32_t reserve =
+            mgr.BlocksNeededForSequential(fresh, chunk, extra) - mgr.BlocksNeededFor(fresh, chunk);
+        ASSERT_GE(reserve, 0) << "chunk " << chunk << " extra " << extra;
+        BlockTable table;
+        ASSERT_TRUE(mgr.Acquire(pool, table, chunk));
+        const std::int32_t before = pool.NumFreeBlocks();
+        ASSERT_TRUE(mgr.Acquire(pool, table, extra));
+        EXPECT_EQ(before - pool.NumFreeBlocks(), reserve) << "chunk " << chunk << " extra " << extra;
+    }
+}
+
+TEST(SwaLiveAllocTest, ReclaimFloorFreesNewBandOnlyAndStaysExact) {
+    // Repeated slides must free exactly the newly-expired real pages; the floor never
+    // hides a real page and a same-bound re-reclaim frees nothing.
+    BlockPool pool(2048);
+    SwaManager mgr(8, 12, 256);
+    BlockTable table;
+    ASSERT_TRUE(mgr.Acquire(pool, table, 8192));
+    mgr.ReclaimExpired(pool, table, 8192);  // bound 1022, floor advances
+    ASSERT_EQ(CountReal(table), 2);
+
+    // Decode 16 more tokens -> bound moves to 1024; slots 1022/1023 expire, 1024/1025 are the new tail.
+    ASSERT_TRUE(mgr.Acquire(pool, table, 16));
+    EXPECT_EQ(mgr.BlocksReclaimableAt(table, 8208, /*count_uncached=*/true), 2);
+    std::int32_t free_before = pool.NumFreeBlocks();
+    mgr.ReclaimExpired(pool, table, 8208);
+    EXPECT_EQ(pool.NumFreeBlocks(), free_before + 2);
+    EXPECT_EQ(HighestRealBelow(table, 1024), -1);
+    EXPECT_EQ(CountReal(table), 2);
+
+    // Same bound again: nothing left in the band.
+    free_before = pool.NumFreeBlocks();
+    mgr.ReclaimExpired(pool, table, 8208);
+    EXPECT_EQ(pool.NumFreeBlocks(), free_before);
+    EXPECT_EQ(mgr.BlocksReclaimableAt(table, 8208, /*count_uncached=*/true), 0);
+}
+
+TEST(SwaLiveAllocTest, CoordinatorSequentialSumsPerGroupPeaks) {
+    const std::vector<KvCacheSpec> specs = {
+        {.kind = AttnKind::kFull, .block_size = 256, .sliding_window = 0},
+        {.kind = AttnKind::kSlidingWindow, .block_size = 8, .sliding_window = 12, .live_tail_alloc = true},
+    };
+    BlockPool pool(4096);
+    KvCacheCoordinator coord = MakeCoordinator(specs, pool);
+    // full: 1 page either way; conv live: sequential 3 vs combined 2.
+    EXPECT_EQ(coord.BlocksNeededFor(19), 1 + 2);
+    EXPECT_EQ(coord.BlocksNeededForSequential(17, 2), 1 + 3);
+}
+
 TEST(SwaLiveAllocTest, CoordinatorWiresGroupLcmAsAlignment) {
     // Inkling-shaped hybrid: full 256 + SWA 128 (no live) + conv 8 (live), lcm=256.
     const std::vector<KvCacheSpec> specs = {

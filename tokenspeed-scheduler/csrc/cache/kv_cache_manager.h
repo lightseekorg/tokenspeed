@@ -113,6 +113,13 @@ public:
         return (over + block_size_ - 1) / block_size_;
     }
 
+    // Peak demand of Acquire(first) then Acquire(extra): live-tail holing makes the combined
+    // query non-monotonic, so gating on BlocksNeededFor(first + extra) can under-charge.
+    virtual std::int32_t BlocksNeededForSequential(const BlockTable& table, std::int32_t first_tokens,
+                                                   std::int32_t extra_tokens) const {
+        return BlocksNeededFor(table, first_tokens + extra_tokens);  // exact when pages never turn into holes
+    }
+
     // State snapshots are only boundary-correct where a forward call ended page-aligned:
     // such groups register just the final full page of an aligned range.
     virtual bool RegistersAlignedFinalPageOnly() const { return false; }
@@ -161,6 +168,7 @@ public:
         pool.FreeBlocks(batch);
         table.blocks_.clear();
         table.tail_avail_ = 0;
+        table.reclaim_floor_ = 0;
     }
 
 protected:
@@ -170,6 +178,8 @@ protected:
     }
     static std::int32_t TableTailAvail(const BlockTable& table) { return table.tail_avail_; }
     static void SetTableTailAvail(BlockTable& table, std::int32_t tail_avail) { table.tail_avail_ = tail_avail; }
+    static std::int32_t TableReclaimFloor(const BlockTable& table) { return table.reclaim_floor_; }
+    static void SetTableReclaimFloor(BlockTable& table, std::int32_t floor) { table.reclaim_floor_ = floor; }
     static void AppendRealBlock(BlockPool& pool, BlockTable& table, CacheBlock* block) {
         table.blocks_.push_back(BlockRef::Adopt(pool, block));
     }

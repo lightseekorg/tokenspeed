@@ -215,6 +215,25 @@ std::int32_t KvCacheCoordinator::BlocksNeededFor(std::int32_t num_tokens) const 
     return total_needed;
 }
 
+std::int32_t KvCacheCoordinator::BlocksNeededForSequential(std::span<const BlockTable> tables,
+                                                           std::int32_t first_tokens, std::int32_t extra_tokens) const {
+    _assert(tables.size() == groups_.size(), "tables/groups size mismatch");
+    std::int32_t total_needed = 0;
+    for (std::size_t i = 0; i < groups_.size(); ++i) {
+        total_needed += groups_[i].Manager().BlocksNeededForSequential(tables[i], first_tokens, extra_tokens);
+    }
+    return total_needed;
+}
+
+std::int32_t KvCacheCoordinator::BlocksNeededForSequential(std::int32_t first_tokens, std::int32_t extra_tokens) const {
+    const BlockTable fresh;
+    std::int32_t total_needed = 0;
+    for (const CacheGroup& group : groups_) {
+        total_needed += group.Manager().BlocksNeededForSequential(fresh, first_tokens, extra_tokens);
+    }
+    return total_needed;
+}
+
 bool KvCacheCoordinator::Acquire(std::span<BlockTable> tables, std::int32_t num_tokens) {
     // Check-then-act: no group is ever left in a partial/unaligned state.
     if (BlocksNeededFor(tables, num_tokens) > pool_.NumFreeBlocks()) {

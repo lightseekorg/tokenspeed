@@ -139,11 +139,48 @@ public:
         return real;
     }
 
+    // Sequential Acquire(first) then Acquire(extra) can peak above the combined query: the later
+    // frontier holes early slots, so BlocksNeededFor(first + extra) may undercount what the first
+    // acquire really pins. Charge A (first batch at its own frontier) + B (extra batch, final frontier).
+    std::int32_t BlocksNeededForSequential(const BlockTable& table, std::int32_t first_tokens,
+                                           std::int32_t extra_tokens) const override {
+        if (live_alloc_alignment_ == 0) {
+            return KvCacheManager::BlocksNeededForSequential(table, first_tokens, extra_tokens);
+        }
+        if (first_tokens <= 0 || extra_tokens <= 0) {
+            return BlocksNeededFor(table, std::max(first_tokens, 0) + std::max(extra_tokens, 0));
+        }
+        const std::int32_t needed_first = BlocksNeededFor(table, first_tokens);
+        // Post-first geometry (extent grows by exactly first_tokens).
+        const std::int32_t tail_avail = TableTailAvail(table);
+        std::int32_t num_blocks_after = table.NumBlocks();
+        std::int32_t tail_after = tail_avail - first_tokens;
+        if (first_tokens > tail_avail) {
+            const std::int32_t over = first_tokens - tail_avail;
+            const std::int32_t num_new = (over + block_size_ - 1) / block_size_;
+            num_blocks_after += num_new;
+            tail_after = num_new * block_size_ - over;
+        }
+        if (extra_tokens <= tail_after) {
+            return needed_first;
+        }
+        const std::int32_t over_extra = extra_tokens - tail_after;
+        const std::int32_t num_new_extra = (over_extra + block_size_ - 1) / block_size_;
+        const std::int32_t end = TableExtentTokens(table, block_size_) + first_tokens + extra_tokens;
+        std::int32_t needed_extra = 0;
+        for (std::int32_t s = num_blocks_after; s < num_blocks_after + num_new_extra; ++s) {
+            needed_extra += slotIsLive(s, end) ? 1 : 0;
+        }
+        return needed_first + needed_extra;
+    }
+
     // Punches null holes so the table never shrinks (keeps slot alignment); reverse-collect evicts FIFO.
+    // The reclaim floor bounds the scan to the newly-expired band; punched history is never re-walked.
     void ReclaimExpired(BlockPool& pool, BlockTable& table, std::int32_t num_computed_tokens) override {
-        std::int32_t skipped_blocks = fullySlidOutBlocks(table, num_computed_tokens);
+        const std::int32_t skipped_blocks = fullySlidOutBlocks(table, num_computed_tokens);
+        const std::int32_t floor = TableReclaimFloor(table);
         std::vector<CacheBlock*> freed;
-        for (std::int32_t i = skipped_blocks - 1; i >= 0; --i) {
+        for (std::int32_t i = skipped_blocks - 1; i >= floor; --i) {
             CacheBlock* old = table.EvictToNull(i, pool.NullBlock());
             if (old == nullptr) {
                 // Live-tail interleaves holes with real checkpoint pages, so don't early-break.
@@ -154,15 +191,19 @@ public:
             }
             freed.push_back(old);
         }
+        if (skipped_blocks > floor) {
+            SetTableReclaimFloor(table, skipped_blocks);
+        }
         pool.FreeBlocks(freed);
     }
 
     // Only blocks whose last reference is this table (RefCount()==1) reach the free list, so shared ones don't count.
     std::int32_t BlocksReclaimableAt(const BlockTable& table, std::int32_t num_computed_tokens,
                                      bool count_uncached) const override {
-        std::int32_t skipped_blocks = fullySlidOutBlocks(table, num_computed_tokens);
+        const std::int32_t skipped_blocks = fullySlidOutBlocks(table, num_computed_tokens);
+        const std::int32_t floor = TableReclaimFloor(table);
         std::int32_t freed = 0;
-        for (std::int32_t i = skipped_blocks - 1; i >= 0; --i) {
+        for (std::int32_t i = skipped_blocks - 1; i >= floor; --i) {
             CacheBlock* block = table.Blocks()[i];
             if (block->IsNull()) {
                 if (live_alloc_alignment_ == 0) {

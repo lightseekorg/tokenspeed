@@ -77,6 +77,8 @@ private:
 
     std::vector<BlockRef> blocks_{};
     std::int32_t tail_avail_{0};
+    // Slots below this are known-null (already reclaimed); lets ReclaimExpired skip re-scanning punched history.
+    std::int32_t reclaim_floor_{0};
 };
 
 // The single flattening authority: BlockId() per logical slot, null holes written as 0, no compaction.
