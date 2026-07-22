@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: "Git tag prefix to create or update. Defaults to tokenspeed-kernel-v<version>."
+        description: "Git tag prefix to create or update. Defaults to tokenspeed-kernel-v<version>; non-release refs include the date and source SHA."
         required: false
         type: string
       version_date:
@@ -29,12 +29,12 @@ on:
           - cu130
           - cu129
       prerelease:
-        description: "Mark the GitHub release as a prerelease."
+        description: "Mark a stable GitHub release as a prerelease. Development versions are always prereleases."
         required: false
         default: false
         type: boolean
       publish_github:
-        description: "Publish distributions to lightseekorg/whl."
+        description: "Publish stable or dated development distributions to lightseekorg/whl."
         required: false
         default: false
         type: boolean
@@ -48,8 +48,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   metadata:
@@ -300,7 +300,7 @@ jobs:
           SOURCE_SHA: ${{ github.sha }}
         run: |
           prerelease_args=()
-          if [ "$PRERELEASE" = "true" ]; then
+          if [ "$PRERELEASE" = "true" ] || [[ "$VERSION" == *.dev* ]] || [[ "$VERSION" == *+* ]]; then
             prerelease_args+=(--prerelease)
           fi
 
@@ -322,6 +322,11 @@ jobs:
             fi
 
             if gh release view "$release_tag" --repo "$RELEASE_REPOSITORY" >/dev/null 2>&1; then
+              if [ "${#prerelease_args[@]}" -gt 0 ]; then
+                gh release edit "$release_tag" \
+                  --repo "$RELEASE_REPOSITORY" \
+                  --prerelease
+              fi
               gh release upload "$release_tag" "${assets[@]}" \
                 --repo "$RELEASE_REPOSITORY" \
                 --clobber
