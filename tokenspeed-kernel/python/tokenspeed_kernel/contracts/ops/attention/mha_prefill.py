@@ -118,8 +118,53 @@ def mha_prefill_reference(
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Evaluate packed causal grouped-query MHA prefill in PyTorch.
 
-    Sink logits contribute to the softmax denominator but have zero values.
-    LSE results use natural logarithms.
+    The batch is packed along the first tensor dimension. Query, key, and value
+    tensors use identical sequence boundaries, and attention is computed
+    independently within each sequence. Inputs are not modified.
+
+    Args:
+        q: Query tensor shaped
+            ``[total_tokens, num_query_heads, head_dim]``.
+        k: Key tensor shaped ``[total_tokens, num_kv_heads, head_dim]``.
+        v: Value tensor with the same shape as ``k``. The tensors must be on
+            the same device, and ``num_query_heads`` must be a positive integer
+            multiple of ``num_kv_heads`` for grouped-query attention.
+        cu_seqlens: One-dimensional cumulative sequence offsets shaped
+            ``[batch_size + 1]``. Offsets must begin at zero, be
+            nondecreasing, and end at ``total_tokens``.
+        cu_seqlens_cpu: Host-side ``list[int]`` containing exactly the same
+            offsets as ``cu_seqlens`` and at least two entries. This duplicate
+            representation is part of the kernel ABI for backends that need
+            host launch metadata.
+        max_seqlen: Upper bound on every packed sequence length. It must be at
+            least the largest difference between adjacent cumulative offsets.
+        window_left: Number of preceding key positions visible to each query.
+            A negative value enables full causal attention; otherwise query
+            position ``i`` attends positions
+            ``[max(0, i - window_left), i]`` within its sequence.
+        logit_cap: Nonnegative soft cap for scaled query-key logits. A positive
+            value ``c`` transforms each logit ``x`` to
+            ``c * tanh(x / c)``; zero disables the cap.
+        sinks: Optional uncapped, per-query-head sink logits shaped
+            ``[num_query_heads]`` on the same device as ``q``. Each sink
+            contributes to the softmax denominator but has a zero value, so it
+            can absorb attention weight without contributing to the output.
+        return_lse: Whether to return per-token, per-query-head log-sum-exp
+            values in addition to the attention output.
+        softmax_scale: Scale applied to query-key logits before the optional
+            cap and softmax. ``None`` uses ``1 / sqrt(head_dim)``.
+
+    Returns:
+        The attention output has the same shape and dtype as ``q``, except
+        ``torch.float8_e4m3fn`` and ``torch.float8_e5m2`` inputs produce BF16
+        output. If ``return_lse`` is false, the output tensor is returned
+        directly. Otherwise, returns ``(output, lse)``, where ``lse`` is a
+        float32 tensor shaped ``[total_tokens, num_query_heads]`` using natural
+        logarithms.
+
+    Raises:
+        ValueError: If Q/K/V shapes are incompatible or the packed sequence
+            metadata is inconsistent.
     """
     if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
         raise ValueError("MHA prefill q, k, and v must have rank 3")
