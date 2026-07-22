@@ -47,38 +47,48 @@ def _state_slabs(device_kv_pool) -> list[tuple[torch.Tensor, torch.Tensor]]:
     return list(getattr(device_kv_pool, "state_slabs", None) or ())
 
 
+def _auxiliary_page_buffers(device_kv_pool) -> list[torch.Tensor | None]:
+    """Per-layer auxiliary page tensors, [] on ordinary KV pools."""
+    return list(getattr(device_kv_pool, "flat_auxiliary_page_buffers", None) or ())
+
+
 def flat_bytes_per_host_page(device_kv_pool) -> int:
     """Bytes one host page occupies across all mirrors, computed from the
     device pool alone (no mirror allocation) -- the sizing side of
     ``FlatHostMirror.bytes_per_host_page`` for host-budget arithmetic.
     """
-    tensors = _identity_dedup(device_kv_pool.k_buffer) + _identity_dedup(
-        device_kv_pool.v_buffer
+    page_tensors = (
+        _identity_dedup(device_kv_pool.k_buffer)
+        + _identity_dedup(device_kv_pool.v_buffer)
+        + _identity_dedup(_auxiliary_page_buffers(device_kv_pool))
     )
     page_size = int(device_kv_pool.page_size)
-    kv_bytes = sum(t.element_size() * t[0].numel() * page_size for t in tensors)
+    page_bytes = sum(t.element_size() * t[0].numel() * page_size for t in page_tensors)
     # State slabs are page-indexed: one constant row per page id.
     state_bytes = sum(
         t.element_size() * t[0].numel()
         for pair in _state_slabs(device_kv_pool)
         for t in pair
     )
-    return kv_bytes + state_bytes
+    return page_bytes + state_bytes
 
 
 class FlatHostMirror:
-    """One pinned CPU mirror per DISTINCT device KV tensor plus one per
-    state slab tensor; a (device_page, host_page) pair copies that page's
-    row range on every mirror pair.
+    """One pinned CPU mirror per distinct device page or state tensor.
+
+    A ``(device_page, host_page)`` pair copies that page's row range on
+    every mirror pair. Auxiliary page tensors are optional, aligned to
+    ``k_buffer`` / ``v_buffer`` by layer, and share the physical page ids.
 
     Slab tensors are enumerated once each -- a page's rows are exactly its
     owner group's layers, so byte copies are group-safe by id-exclusivity.
 
     ``tensor_pairs`` order (PINNED, D2 fencing indexes into it): K*, V*,
-    then state tensors flattened in slab order (conv0, ssm0, conv1, ...).
-    KV mirrors span ``page_size`` token rows per page; state slabs are
-    page-indexed (one snapshot row per page id), so their mirrors span 1
-    row per page -- ``row_spans[i]`` carries each pair's span.
+    auxiliary*, then state tensors flattened in slab order (conv0, ssm0,
+    conv1, ...). KV and auxiliary mirrors span ``page_size`` token rows
+    per page; state slabs are page-indexed (one snapshot row per page id),
+    so their mirrors span 1 row per page -- ``row_spans[i]`` carries each
+    pair's span.
     """
 
     def __init__(self, device_kv_pool, num_host_pages: int):
@@ -92,6 +102,16 @@ class FlatHostMirror:
         v_tensors = _identity_dedup(device_kv_pool.v_buffer)
         self.num_k_tensors = len(k_tensors)
 
+        auxiliary_by_layer = _auxiliary_page_buffers(device_kv_pool)
+        if auxiliary_by_layer:
+            assert len(auxiliary_by_layer) == len(
+                device_kv_pool.k_buffer
+            ), "flat host mirror: auxiliary page buffers must align with layers"
+        else:
+            auxiliary_by_layer = [None] * len(device_kv_pool.k_buffer)
+        auxiliary_tensors = _identity_dedup(auxiliary_by_layer)
+        self.num_auxiliary_tensors = len(auxiliary_tensors)
+
         k_index = {id(t): i for i, t in enumerate(k_tensors)}
         v_index = {id(t): i for i, t in enumerate(v_tensors)}
         # None entries (flat GDN state layers, no KV) map to None: those
@@ -104,6 +124,13 @@ class FlatHostMirror:
         assert self._layer_to_k_index == [
             None if t is None else v_index[id(t)] for t in device_kv_pool.v_buffer
         ], "flat host mirror: K/V dedup orders diverge"
+
+        auxiliary_base = 2 * self.num_k_tensors
+        auxiliary_index = {id(t): i for i, t in enumerate(auxiliary_tensors)}
+        self._layer_to_auxiliary_index = [
+            None if tensor is None else auxiliary_base + auxiliary_index[id(tensor)]
+            for tensor in auxiliary_by_layer
+        ]
 
         state_slabs = _state_slabs(device_kv_pool)
         state_tensors = [t for pair in state_slabs for t in pair]
@@ -121,7 +148,7 @@ class FlatHostMirror:
                 self._layer_to_state_pair[layer_id] = pair_of_conv[id(conv)]
 
         pin = torch.cuda.is_available()
-        kv_pairs = [
+        page_pairs = [
             (
                 dev,
                 torch.zeros(
@@ -130,7 +157,7 @@ class FlatHostMirror:
                     pin_memory=pin,
                 ),
             )
-            for dev in k_tensors + v_tensors
+            for dev in k_tensors + v_tensors + auxiliary_tensors
         ]
         state_pairs = [
             (
@@ -144,11 +171,11 @@ class FlatHostMirror:
             for dev in state_tensors
         ]
         self.tensor_pairs: tuple[tuple[torch.Tensor, torch.Tensor], ...] = tuple(
-            kv_pairs + state_pairs
+            page_pairs + state_pairs
         )
-        # Rows one page spans on each pair: page_size token rows for KV,
-        # one page-indexed snapshot row for state slabs.
-        self.row_spans: tuple[int, ...] = (self.page_size,) * len(kv_pairs) + (
+        # Rows one page spans on each pair: page_size token rows for KV and
+        # auxiliary tensors, one page-indexed snapshot row for state slabs.
+        self.row_spans: tuple[int, ...] = (self.page_size,) * len(page_pairs) + (
             1,
         ) * len(state_pairs)
 
@@ -169,8 +196,22 @@ class FlatHostMirror:
         pair = self._layer_to_state_pair.get(layer_id)
         if pair is None:
             return None
-        base = 2 * self.num_k_tensors + 2 * pair
+        base = 2 * self.num_k_tensors + self.num_auxiliary_tensors + 2 * pair
         return base, base + 1
+
+    def auxiliary_tensor_index_of_layer(self, layer_id: int) -> int | None:
+        """Auxiliary tensor index for ``layer_id``, if the layer has one."""
+        return self._layer_to_auxiliary_index[layer_id]
+
+    def completion_tensor_index_of_layer(self, layer_id: int) -> int:
+        """Last tensor event required before ``layer_id`` can run."""
+        state_indices = self.state_tensor_indices_of_layer(layer_id)
+        if state_indices is not None:
+            return state_indices[1]
+        auxiliary_index = self.auxiliary_tensor_index_of_layer(layer_id)
+        if auxiliary_index is not None:
+            return auxiliary_index
+        return self.num_k_tensors + self.tensor_index_of_layer(layer_id)
 
     def bytes_per_host_page(self) -> int:
         return sum(

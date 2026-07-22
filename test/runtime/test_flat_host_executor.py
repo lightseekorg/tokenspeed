@@ -164,7 +164,7 @@ class LoadBackDonePayloadTest(unittest.TestCase):
 
 
 class FlatMemoryExecutorTest(unittest.TestCase):
-    """Real (tiny) MHATokenToKVPool on GPU driving the flat executor."""
+    """Real tiny MHA/MSA pools on GPU driving the flat executor."""
 
     def setUp(self):
         try:
@@ -178,6 +178,9 @@ class FlatMemoryExecutorTest(unittest.TestCase):
             from tokenspeed.runtime.layers.attention.kv_cache.mha import (
                 MHATokenToKVPool,
             )
+            from tokenspeed.runtime.layers.attention.kv_cache.msa import (
+                MSATokenToKVPool,
+            )
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs torch + tokenspeed_kernel + scheduler ext: {exc}")
         if not hasattr(Cache, "LoadBackDoneEvent"):
@@ -189,6 +192,7 @@ class FlatMemoryExecutorTest(unittest.TestCase):
         self.CacheKind = CacheKind
         self.FlatMemoryExecutor = FlatMemoryExecutor
         self.MHATokenToKVPool = MHATokenToKVPool
+        self.MSATokenToKVPool = MSATokenToKVPool
 
     def _pool(self):
         kwargs = dict(
@@ -209,6 +213,25 @@ class FlatMemoryExecutorTest(unittest.TestCase):
         )
         with mock.patch(_PKG_FLAT_PROBE, return_value=True):
             return self.MHATokenToKVPool(**kwargs)
+
+    def _msa_pool(self):
+        with mock.patch(_PKG_FLAT_PROBE, return_value=True):
+            return self.MSATokenToKVPool(
+                size=32,
+                dtype=self.torch.bfloat16,
+                head_num=1,
+                head_dim=8,
+                layer_num=4,
+                device="cuda",
+                enable_memory_saver=False,
+                max_batch_size=2,
+                max_context_len=64,
+                page_size=4,
+                rank=0,
+                index_head_dim=6,
+                index_dtype=self.torch.bfloat16,
+                indexed_layer_ids=frozenset({1, 3}),
+            )
 
     def _executor(self, pool):
         return self.FlatMemoryExecutor(device_pool=pool, host_ratio=2.0, host_size_gb=0)
@@ -321,6 +344,36 @@ class FlatMemoryExecutorTest(unittest.TestCase):
         self.assertIsNot(producer_event.load_events[0], producer_event.load_events[2])
         self.torch.cuda.synchronize()
         self.assertTrue(producer_event.finish_event.query())
+        self._drain(executor, 1)
+
+    def test_auxiliary_page_event_mapping(self):
+        pool = self._msa_pool()
+        executor = self._executor(pool)
+        mirror = executor.mirror
+
+        captured = {}
+        original_load = mirror.load_pages_with_events
+
+        def capture_events(pairs, stream):
+            events = original_load(pairs, stream)
+            captured["events"] = events
+            return events
+
+        mirror.load_pages_with_events = capture_events
+        executor.submit_loadback([33], [[0]], [[3]])
+        executor.flush()
+
+        events = captured["events"]
+        producer_idx = executor.get_producer_index(self.CacheKind.KV, 33)
+        producer_event = executor._counter.events[producer_idx]
+        for layer_id in (0, 2):
+            v_index = mirror.num_k_tensors + mirror.tensor_index_of_layer(layer_id)
+            self.assertIs(producer_event.load_events[layer_id], events[v_index])
+        for layer_id in (1, 3):
+            auxiliary_index = mirror.auxiliary_tensor_index_of_layer(layer_id)
+            self.assertIs(producer_event.load_events[layer_id], events[auxiliary_index])
+
+        self.torch.cuda.synchronize()
         self._drain(executor, 1)
 
     def _state_pool(self):
