@@ -65,6 +65,27 @@ optional:
 non-empty runner family such as `b200v2` to temporarily route them to
 `b200v2-<Ngpu>` without editing task YAML. Leave the variable unset or empty to
 use the default `b200-<Ngpu>` labels.
+
+To enable `push` and `workflow_dispatch` runs of the three PR test workflows
+outside the official repository, set the `TOKENSPEED_CI_REPOSITORY` repository
+variable at the same settings path to the configured repository's exact
+`owner/repo` name. The official
+`lightseekorg/tokenspeed` repository remains enabled without this variable.
+Leave it unset or empty to keep push/manual GPU CI disabled in other
+repositories. `pull_request` runs keep their existing behavior. The configured
+repository must also provide the matching self-hosted runner labels and any
+required secrets; this variable only controls the repository gate.
+
+To temporarily remove unavailable GPU runners from PR test matrices, set the
+`TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS` repository variable to comma-separated,
+case-insensitive substrings such as `b300, mi355`. Matching uses the resolved
+runner label after applying `TOKENSPEED_B200_RUNNER_LABEL`; `b300` therefore
+matches both `b300-*` and `gb300-*`, while `mi355` matches
+`amd-mi355-*`. Empty entries are ignored. If every runner in a workflow group
+is excluded, its matrix job is skipped while the workflow still finishes.
+This variable applies only to the three PR test workflows. Clear or unset it to
+restore all runner labels.
+
 The CI system derives `SM` from common runner label prefixes by default:
 `h100`/`h200` use `sm90`, `b200`/`gb200` use `sm100`, and `b300`/`gb300` use
 `sm103`. Use `runner.env.<label>` only for environment variables that should

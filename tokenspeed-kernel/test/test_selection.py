@@ -1354,6 +1354,7 @@ class TestGemmDispatchProfiling:
             *,
             alpha: torch.Tensor | None = None,
             block_size: list[int] | None = None,
+            out: torch.Tensor | None = None,
         ) -> torch.Tensor:
             _ = A_scales, B_scales, alpha, block_size
             call_log.append(name)
@@ -1428,6 +1429,7 @@ class TestGemmDispatchProfiling:
                     "M": 4,
                     "N": 6,
                     "K": 8,
+                    "has_out": False,
                 },
             )
         ]
@@ -1465,6 +1467,7 @@ class TestGemmDispatchProfiling:
                     "M": 4,
                     "N": 6,
                     "K": 8,
+                    "has_out": False,
                 },
             )
         ]

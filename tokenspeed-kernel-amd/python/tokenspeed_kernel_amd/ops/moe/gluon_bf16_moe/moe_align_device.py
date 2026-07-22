@@ -42,9 +42,11 @@ Kernels:
                            and writes its packed id + weight to that row.
 
 Order within an expert is arbitrary (atomics), unlike the stable reference, but
-MoE is order-independent. One host sync reads EM/num_blocks to slice tight
-outputs. CDNA3/4 ``buffer_atomic_add`` is float-only, so counts / rank counters
-are fp32 (values are small ints, exact in fp32).
+MoE is order-independent. Outputs stay padded to their compile-time upper bound
+so this path is safe under CUDA/HIP graph capture; downstream stages read the
+device-side valid-count tensor and early-out on padding. CDNA3/4
+``buffer_atomic_add`` is float-only, so counts / rank counters are fp32 (values
+are small ints, exact in fp32).
 """
 
 from __future__ import annotations
@@ -265,6 +267,5 @@ def moe_align_block_size_device(
         num_warps=4,
     )
 
-    em, num_blocks = (int(x) for x in meta.tolist())  # single host sync
     num_valid_ids = meta[0:1]
-    return sti[:em], sei[:num_blocks], sw[:em], num_valid_ids
+    return sti, sei, sw, num_valid_ids

@@ -12,6 +12,11 @@ on:
         required: false
         default: false
         type: boolean
+      flat_kvcache:
+        description: "Build with TOKENSPEED_FLAT_KVCACHE enabled."
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -40,6 +45,7 @@ jobs:
         env:
           CIBW_BEFORE_ALL: dnf install -y openssl-devel
           CIBW_BUILD: ${{ matrix.build-selector }}
+          CIBW_CONFIG_SETTINGS: "cmake.define.TOKENSPEED_FLAT_KVCACHE=${{ inputs.flat_kvcache && 'ON' || 'OFF' }}"
           CIBW_MANYLINUX_AARCH64_IMAGE: manylinux_2_28
           CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
         with:

@@ -394,12 +394,41 @@ def _supports_largem_shape(M: int, N: int, K: int) -> bool:
     )
 
 
+def _resolve_largem_output(
+    A: torch.Tensor,
+    M: int,
+    N: int,
+    out_dtype: torch.dtype,
+    out: torch.Tensor | None,
+) -> torch.Tensor:
+    if out is None:
+        return torch.empty((M, N), device=A.device, dtype=out_dtype)
+    if out.shape != (M, N):
+        raise ValueError(
+            f"large-M dense16 output must have shape {(M, N)}, got {tuple(out.shape)}"
+        )
+    if out.dtype != out_dtype:
+        raise TypeError(
+            f"large-M dense16 output dtype must be {out_dtype}, got {out.dtype}"
+        )
+    if out.device != A.device:
+        raise ValueError(
+            f"large-M dense16 output must be on {A.device}, got {out.device}"
+        )
+    if out.stride(-1) != 1:
+        raise ValueError(
+            "large-M dense16 output must be contiguous in the last dimension"
+        )
+    return out
+
+
 def gluon_mm_a16w16_largem_gfx950(
     A: torch.Tensor,
     B: torch.Tensor,
     out_dtype: torch.dtype,
     *,
     alpha: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """Compute large, aligned dense16 ``A @ B.T`` with an 8-wave MFMA/LDS tile."""
     if A.ndim != 2 or B.ndim != 2:
@@ -416,7 +445,7 @@ def gluon_mm_a16w16_largem_gfx950(
     if K_b != K or not _supports_largem_shape(M, N, K):
         return None
 
-    C = torch.empty((M, N), device=A.device, dtype=out_dtype)
+    C = _resolve_largem_output(A, M, N, out_dtype, out)
     grid_m = triton.cdiv(M, LARGEM_BLOCK_M)
     grid_n = triton.cdiv(N, LARGEM_BLOCK_N)
     grid_mn = grid_m * grid_n
@@ -446,5 +475,5 @@ def gluon_mm_a16w16_largem_gfx950(
     )
 
     if alpha is not None:
-        C = C * alpha.to(dtype=C.dtype)
+        C.mul_(alpha.to(device=C.device, dtype=C.dtype))
     return C

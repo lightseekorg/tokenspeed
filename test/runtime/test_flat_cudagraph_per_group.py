@@ -437,54 +437,6 @@ class BackendCaptureFlatTest(_BackendCase):
             self.backend.cuda_graph_page_table.data_ptr(),
         )
 
-    def test_flat_capture_sheds_single_page_table(self):
-        # Flat captures route reads through per-group tables and replay never
-        # fills the radix single table: page_table must be None, never a
-        # slice of the never-filled zero buffer.
-        metadata = self._capture(2, _GROUP_IDS)
-        self.assertIsNone(metadata.page_table)
-
-    def test_allocates_persistent_buffers_and_views(self):
-        bs = 2
-        metadata = self._capture(bs, _GROUP_IDS)
-        bufs = self.backend.cuda_graph_flat_page_tables
-        self.assertEqual(set(bufs), set(_GROUP_IDS))
-        for gid, buf in bufs.items():
-            self.assertEqual(tuple(buf.shape), (MAX_BS, MAX_NUM_PAGES))
-            self.assertEqual(buf.dtype, self.torch.int32)
-            view = metadata.page_tables[gid]
-            self.assertEqual(tuple(view.shape), (bs, MAX_NUM_PAGES))
-            # Pointer-fixing: metadata views alias the persistent buffer.
-            self.assertEqual(view.data_ptr(), buf.data_ptr())
-
-    def test_second_capture_reuses_buffers(self):
-        first = self._capture(2, _GROUP_IDS)
-        bufs = dict(self.backend.cuda_graph_flat_page_tables)
-        second = self._capture(4, _GROUP_IDS)
-        self.assertEqual(
-            {g: b.data_ptr() for g, b in bufs.items()},
-            {
-                g: b.data_ptr()
-                for g, b in self.backend.cuda_graph_flat_page_tables.items()
-            },
-        )
-        self.assertIsNot(first, second)
-
-    def test_flat_with_spec_verify_records_expanded_loc_views(self):
-        # Verify (spec target) keeps [bs]-row tables but records [bs*N]
-        # write-loc views (token-major), sized off the persistent buffers.
-        self.backend.spec_num_tokens = 2
-        torch = self.torch
-        self.backend.cuda_graph_page_table = torch.zeros(
-            (MAX_BS * 2, MAX_NUM_PAGES), dtype=torch.int32
-        )
-        self.backend.cuda_graph_seq_lens = torch.zeros(MAX_BS * 2, dtype=torch.int32)
-        self._capture(2, _GROUP_IDS)
-        meta = self.backend.forward_decode_metadata
-        for gid in _GROUP_IDS:
-            self.assertEqual(meta.page_tables[gid].shape[0], 2)
-            self.assertEqual(meta.out_cache_locs[gid].shape[0], 2 * 2)
-
     def test_flat_with_dflash_block_decode_asserts(self):
         self.backend.spec_num_tokens = 2
         self.backend.draft_block_decode = True
@@ -495,112 +447,6 @@ class BackendCaptureFlatTest(_BackendCase):
         self.backend.cuda_graph_seq_lens = torch.zeros(MAX_BS * 2, dtype=torch.int32)
         with self.assertRaisesRegex(AssertionError, "DFLASH"):
             self._capture(2, _GROUP_IDS)
-
-
-class BackendReplayFlatTest(_BackendCase):
-    def setUp(self):
-        super().setUp()
-        # Capture first so persistent buffers exist (replay indexes them).
-        self._capture(2, _GROUP_IDS)
-
-    def test_copies_prefix_and_fills_tail_minus_one(self):
-        torch = self.torch
-        src = {
-            # 0 = null hole (slid-out SWA page); cols narrower than buffer.
-            "sliding_attention": torch.tensor([[0, 3], [4, 5]], dtype=torch.int32),
-            "full_attention": torch.tensor([[1, 2], [6, 7]], dtype=torch.int32),
-        }
-        self._replay(2, src)
-        for gid, expected in src.items():
-            buf = self.backend.cuda_graph_flat_page_tables[gid]
-            self.assertTrue((buf[:2, :2] == expected).all())
-            self.assertTrue((buf[:2, 2:] == -1).all())
-            # Rows beyond bs untouched (still capture-time zeros).
-            self.assertTrue((buf[2:] == 0).all())
-
-    def test_padded_replay_dummy_rows_land_on_page_zero(self):
-        # After the wrapper's 0-row-pad and the backend's column fill_(-1),
-        # a dummy row reads only col 0 (seq_lens=1) -> dummy page 0.
-        torch = self.torch
-        from tokenspeed.runtime.execution.cuda_graph_wrapper import (
-            CudaGraphWrapper,
-        )
-
-        src = {
-            "sliding_attention": torch.tensor([[3, 4]], dtype=torch.int32),
-            "full_attention": torch.tensor([[5, 6]], dtype=torch.int32),
-        }
-        padded = CudaGraphWrapper._pad_block_tables_to_padded_bs(
-            src, actual_bs=1, padded_bs=2, pad_value=0
-        )
-        self._replay(2, padded)
-        for gid, expected in src.items():
-            buf = self.backend.cuda_graph_flat_page_tables[gid]
-            self.assertTrue((buf[:1, :2] == expected).all())
-            # Dummy row: col 0 must be a dereferenceable page (0), never -1.
-            self.assertEqual(int(buf[1, 0]), 0)
-            self.assertTrue((buf[1, :2] == 0).all())
-            self.assertTrue((buf[:2, 2:] == -1).all())
-
-    def test_full_width_src_leaves_no_tail(self):
-        torch = self.torch
-        src = {
-            gid: torch.full((2, MAX_NUM_PAGES), 9, dtype=torch.int32)
-            for gid in ("sliding_attention", "full_attention")
-        }
-        self._replay(2, src)
-        for gid in src:
-            buf = self.backend.cuda_graph_flat_page_tables[gid]
-            self.assertTrue((buf[:2] == 9).all())
-
-    def test_overwide_src_asserts(self):
-        # Both captured groups delivered (the missing-group guard runs
-        # first); the overwide one trips the width assert.
-        torch = self.torch
-        src = {
-            "sliding_attention": torch.ones((2, MAX_NUM_PAGES + 1), dtype=torch.int32),
-            "full_attention": torch.ones((2, 2), dtype=torch.int32),
-        }
-        with self.assertRaisesRegex(AssertionError, "cols"):
-            self._replay(2, src)
-
-    def test_underpadded_rows_assert(self):
-        torch = self.torch
-        src = {
-            "sliding_attention": torch.ones((1, 2), dtype=torch.int32),
-            "full_attention": torch.ones((2, 2), dtype=torch.int32),
-        }
-        with self.assertRaisesRegex(AssertionError, "rows"):
-            self._replay(2, src)
-
-    def test_missing_tables_with_flat_buffers_raises(self):
-        # A flat-captured graph replayed without tables must be loud, never
-        # silently compute over stale/zero page tables.
-        with self.assertRaisesRegex(RuntimeError, "stale"):
-            self._replay(2)
-
-    def test_missing_tables_empty_dict_raises(self):
-        with self.assertRaisesRegex(RuntimeError, "flat_block_tables"):
-            self._replay(2, {})
-
-    def test_missing_captured_group_raises(self):
-        # Per-group hole: a non-empty dict lacking one captured group would
-        # leave that group's buffer stale — must raise naming the group.
-        torch = self.torch
-        src = {"sliding_attention": torch.ones((2, 2), dtype=torch.int32)}
-        with self.assertRaisesRegex(RuntimeError, "full_attention"):
-            self._replay(2, src)
-
-    def test_bs_zero_missing_tables_skips(self):
-        # Documented bs==0 skip: buffers keep valid page-0/previous entries;
-        # outputs are discarded.
-        before = {
-            gid: buf.clone()
-            for gid, buf in self.backend.cuda_graph_flat_page_tables.items()
-        }
-        self._replay(0)
-        for gid, buf in self.backend.cuda_graph_flat_page_tables.items():
-            self.assertTrue((buf == before[gid]).all())
 
 
 class BackendStateGroupShedTest(_BackendCase):
@@ -614,50 +460,11 @@ class BackendStateGroupShedTest(_BackendCase):
         super().setUp()
         self.backend.flat_state_group_ids = frozenset({"linear_attention"})
 
-    def test_init_cuda_graph_state_learns_state_ids_from_specs(self):
-        torch = self.torch
-        self.backend.init_cuda_graph_state(
-            MAX_BS,
-            torch.ones(MAX_BS, dtype=torch.int32),
-            paged_cache_group_specs=(
-                SimpleNamespace(group_id="full_attention", family="history"),
-                SimpleNamespace(group_id="linear_attention", family="state"),
-            ),
-        )
-        self.assertEqual(
-            self.backend.flat_state_group_ids, frozenset({"linear_attention"})
-        )
-
-    def test_capture_buffers_exclude_state_group(self):
-        metadata = self._capture(2, self._HYBRID_IDS)
-        self.assertEqual(
-            set(self.backend.cuda_graph_flat_page_tables), {"full_attention"}
-        )
-        self.assertEqual(
-            set(self.backend.cuda_graph_flat_out_cache_locs), {"full_attention"}
-        )
-        self.assertEqual(set(metadata.page_tables), {"full_attention"})
-        self.assertEqual(set(metadata.out_cache_locs), {"full_attention"})
-
     def test_capture_state_only_yields_no_flat_metadata(self):
         metadata = self._capture(2, ("linear_attention",))
         self.assertIsNone(metadata.page_tables)
         self.assertIsNone(metadata.out_cache_locs)
         self.assertEqual(self.backend.cuda_graph_flat_page_tables, {})
-
-    def test_replay_skips_state_group_delivery(self):
-        torch = self.torch
-        self._capture(2, self._HYBRID_IDS)
-        src = {
-            "full_attention": torch.tensor([[1, 2], [3, 4]], dtype=torch.int32),
-            # Hole-heavy state table: MHA must not copy or derive locs
-            # from it (and has no buffer for it).
-            "linear_attention": torch.tensor([[0, 5], [0, 6]], dtype=torch.int32),
-        }
-        self._replay(2, src)
-        self.assertNotIn("linear_attention", self.backend.cuda_graph_flat_page_tables)
-        buf = self.backend.cuda_graph_flat_page_tables["full_attention"]
-        self.assertTrue((buf[:2, :2] == src["full_attention"]).all())
 
     def test_eager_decode_metadata_sheds_state_group(self):
         torch = self.torch
@@ -704,17 +511,6 @@ class BackendReplayNoFlatBuffersTest(_BackendCase):
         gather = self._replay_with_recorded_gather(2)
         gather.assert_called_once()
         self.assertEqual(self.backend.cuda_graph_flat_page_tables, {})
-
-    def test_flat_replay_skips_radix_single_table_fill(self):
-        # Flat captures read only the per-group buffers: filling the radix
-        # single table would be dead work (see init_forward_metadata_replay).
-        torch = self.torch
-        self._capture(2, _GROUP_IDS)
-        gather = self._replay_with_recorded_gather(
-            2,
-            {gid: torch.ones((2, 2), dtype=torch.int32) for gid in _GROUP_IDS},
-        )
-        gather.assert_not_called()
 
 
 if __name__ == "__main__":

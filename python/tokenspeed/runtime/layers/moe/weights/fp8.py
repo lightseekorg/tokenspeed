@@ -39,12 +39,13 @@ def create_fp8_block_scale_inverses(
     block_shape: tuple[int, int],
 ) -> None:
     block_n, block_k = block_shape
+    scale_dtype = layer.quant_config.weight_scale_dtype
     w13_weight_scale = torch.nn.Parameter(
         torch.ones(
             spec.num_local_experts,
             2 * round_up(intermediate_size_per_partition, block_n) // block_n,
             round_up(spec.hidden_size, block_k) // block_k,
-            dtype=torch.float32,
+            dtype=scale_dtype,
         ),
         requires_grad=False,
     )
@@ -53,7 +54,7 @@ def create_fp8_block_scale_inverses(
             spec.num_local_experts,
             round_up(spec.hidden_size, block_n) // block_n,
             round_up(intermediate_size_per_partition, block_k) // block_k,
-            dtype=torch.float32,
+            dtype=scale_dtype,
         ),
         requires_grad=False,
     )

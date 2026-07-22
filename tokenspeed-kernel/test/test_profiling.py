@@ -112,6 +112,29 @@ def test_start_and_stop_calls_proton(monkeypatch):
     assert fake.finalize_calls == [((123, "chrome_trace"), {})]
 
 
+def test_stop_clears_state_when_proton_finalize_fails(monkeypatch):
+    fake = _FakeProton()
+    original_finalize = fake.finalize
+
+    def fail_finalize(*args, **kwargs):
+        _ = args, kwargs
+        raise RuntimeError("write failed")
+
+    monkeypatch.setattr(profiling, "_HAS_PROTON", True)
+    monkeypatch.setattr(profiling, "proton", fake)
+    monkeypatch.setattr(fake, "finalize", fail_finalize)
+
+    profiling.start_profiling()
+    with pytest.raises(RuntimeError, match="write failed"):
+        profiling.stop_profiling()
+
+    assert not profiling.ProfilingState.get().active
+
+    monkeypatch.setattr(fake, "finalize", original_finalize)
+    assert profiling.start_profiling() == 123
+    profiling.stop_profiling()
+
+
 def test_start_warns_when_proton_missing(monkeypatch):
     monkeypatch.setattr(profiling, "_HAS_PROTON", False)
     monkeypatch.setattr(profiling, "proton", None)
@@ -159,7 +182,6 @@ def test_kernel_scope_uses_proton_scope_when_active(monkeypatch):
         (
             "gemm.mm[triton_mm_fp8_scaled]",
             {
-                "dtype": "torch.float16",
                 "M": 32,
                 "N": 64,
                 "K": 128,
@@ -167,6 +189,36 @@ def test_kernel_scope_uses_proton_scope_when_active(monkeypatch):
         )
     ]
     assert fake.scope_log == ["enter", "exit"]
+
+
+def test_kernel_scope_filters_unsupported_proton_metrics(monkeypatch):
+    fake = _FakeProton()
+    monkeypatch.setattr(profiling, "_HAS_PROTON", True)
+    monkeypatch.setattr(profiling, "proton", fake)
+    profiling.start_profiling()
+
+    with profiling.kernel_scope(
+        "quantization",
+        "mxfp4",
+        torch.float16,
+        kernel_name="triton",
+        shape=(2, 3),
+        scale_size=32,
+        scale_layout="ue8m0",
+        has_global_scale=False,
+    ):
+        pass
+
+    assert fake.scope_calls == [
+        (
+            "quantization.mxfp4[triton]",
+            {
+                "shape": [2, 3],
+                "scale_size": 32,
+                "has_global_scale": False,
+            },
+        )
+    ]
 
 
 def test_bootstrap_reads_env_and_only_runs_once(monkeypatch):
@@ -197,6 +249,46 @@ def test_bootstrap_reads_env_and_only_runs_once(monkeypatch):
         },
     )
     assert len(registrations) == 2
+
+
+def test_proton_available_reflects_import(monkeypatch):
+    monkeypatch.setattr(profiling, "_HAS_PROTON", True)
+    assert profiling.proton_available()
+
+    monkeypatch.setattr(profiling, "_HAS_PROTON", False)
+    assert not profiling.proton_available()
+
+
+def test_profile_config_from_env_defaults(monkeypatch):
+    for env in (
+        "TOKENSPEED_KERNEL_PROFILE_OUTPUT",
+        "TOKENSPEED_KERNEL_PROFILE_DATA",
+        "TOKENSPEED_KERNEL_PROFILE_BACKEND",
+        "TOKENSPEED_KERNEL_PROFILE_MODE",
+        "TOKENSPEED_KERNEL_PROFILE_HOOK",
+        "TOKENSPEED_KERNEL_PROFILE_OUTPUT_FORMAT",
+    ):
+        monkeypatch.delenv(env, raising=False)
+
+    cfg = profiling.profile_config_from_env()
+    assert cfg == profiling.ProfilingConfig()
+
+
+def test_profile_config_from_env_output_override_wins(monkeypatch):
+    monkeypatch.setenv("TOKENSPEED_KERNEL_PROFILE_OUTPUT", "env_profile")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_PROFILE_DATA", "trace")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_PROFILE_BACKEND", "roctracer")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_PROFILE_MODE", "periodic_flushing")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_PROFILE_OUTPUT_FORMAT", "chrome_trace")
+
+    cfg = profiling.profile_config_from_env(output="rank0/step5.proton")
+
+    assert cfg.output == "rank0/step5.proton"
+    assert cfg.data == "trace"
+    assert cfg.backend == "roctracer"
+    assert cfg.mode == "periodic_flushing"
+    assert cfg.hook == "triton"
+    assert cfg.output_format == "chrome_trace"
 
 
 def test_shape_capture_records_dump_and_clear(tmp_path):

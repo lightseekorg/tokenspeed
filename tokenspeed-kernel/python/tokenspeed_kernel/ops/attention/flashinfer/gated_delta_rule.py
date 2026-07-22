@@ -15,21 +15,28 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""FlashInfer Blackwell (sm100) gated delta net chunked prefill.
+"""FlashInfer gated delta net (GDN) prefill + decode/MTP kernels.
 
-Fast-path for GDN prefill on Blackwell (sm100/sm103) + CUDA 13 + bf16 +
-head_dim==128. The caller gates on ``is_supported`` and must fail fast when the
-fast-path is unavailable;
-this module has no Triton fallback.
+Prefill: fast-path for GDN chunked prefill on Blackwell (sm100/sm103) + CUDA 13
++ bf16 + head_dim==128. The caller gates on ``is_supported`` and must fail fast
+when the fast-path is unavailable; this module has no Triton fallback for it.
 
-Convention vs the Triton FLA path (verified equal to bf16 on B200):
+Decode / MTP: single-token decode (``gdn_decode_step``) and multi-token
+speculative-verify decode (``gdn_decode_mtp``) on Hopper+ (SM90+).
+
+State layout convention (all three kernels): the recurrent state is K-last
+(``[N, H, V, K]``, v-major), matching flashinfer's native GDN decode/MTP
+layout -- this is also the layout the runtime's SSM state pool allocates, so
+no transpose is needed at any of these kernels' boundaries. This differs from
+the Triton FLA convention (``[N, H, K, V]``); the Triton ``gdn_chunk_prefill``
+wrapper is the one that adapts (transposes) to/from FLA internally.
+
+Other prefill conventions (verified equal to bf16 on B200):
 - q, k must be L2-normalized by the caller (the sm100 kernel ignores its own
   use_qk_l2norm flag).
 - g is the FLA log-space forget gate; the sm100 kernel takes log internally, so
   we pass alpha = exp(g).
 - beta is cast to float32 (flashinfer passes it through without casting).
-- the recurrent state is stored transposed (K<->V) vs FLA, so we transpose the
-  initial state in and the final state out.
 - scale defaults to head_dim**-0.5 (FLA default).
 """
 
@@ -66,6 +73,39 @@ if platform.is_blackwell:
     except ImportError:
         pass
 
+# Decode / MTP (K-last, SM90+): independent of the sm100 prefill import above.
+_gated_delta_rule_decode_pretranspose = error_fn
+_gated_delta_rule_mtp = error_fn
+_has_gdn_decode = False
+
+if platform.is_hopper_plus:
+    try:
+        from flashinfer.gdn_decode import (
+            gated_delta_rule_decode_pretranspose as _fi_decode_pretranspose,
+        )
+        from flashinfer.gdn_decode import gated_delta_rule_mtp as _fi_mtp
+
+        _gated_delta_rule_decode_pretranspose = _fi_decode_pretranspose
+        _gated_delta_rule_mtp = _fi_mtp
+        _has_gdn_decode = True
+    except ImportError:
+        pass
+
+# BF16-state MTP kernel: a separate, optional entry point. Needed so
+# gdn_decode_mtp can forward the intermediate-state and per-token state-pool
+# scatter arguments that are not exposed by gated_delta_rule_decode_pretranspose.
+_gated_delta_rule_bf16_mtp = None
+
+if platform.is_hopper_plus:
+    try:
+        from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
+            gated_delta_rule_mtp as _fi_bf16_mtp,
+        )
+
+        _gated_delta_rule_bf16_mtp = _fi_bf16_mtp
+    except ImportError:
+        pass
+
 
 def is_available() -> bool:
     """Whether the sm100 GDN kernel can run on this platform."""
@@ -94,6 +134,25 @@ def is_supported(
         and head_dim == SUPPORTED_HEAD_DIM
         and dtype == torch.bfloat16
         and num_v_heads >= num_q_heads
+    )
+
+
+def is_decode_available() -> bool:
+    """Whether the SM90+ GDN decode/MTP kernels can run on this platform."""
+    return _has_gdn_decode and platform.is_hopper_plus
+
+
+def is_decode_supported(head_dim: int, dtype: torch.dtype) -> bool:
+    """Whether ``gdn_decode_step``/``gdn_decode_mtp`` support this shape/dtype.
+
+    Both kernels require K == V == 128 and a float16/bfloat16 q/k/v dtype. The
+    recurrent state pool may be float32 or bfloat16; FlashInfer dispatches the
+    latter to its dedicated BF16-state kernel.
+    """
+    return (
+        is_decode_available()
+        and head_dim == SUPPORTED_HEAD_DIM
+        and dtype in (torch.float16, torch.bfloat16)
     )
 
 
@@ -142,16 +201,17 @@ if is_available():
         """Run one chunked GDN prefill on the sm100 kernel.
 
         q, k, v are [B, T, H, D] (B==1) or [T, H, D]; q/k already L2-normalized.
-        g, beta are [B, T, H] or [T, H]; g in log space. initial_state is the FLA
-        [N, H, K, V] recurrent state.
+        g, beta are [B, T, H] or [T, H]; g in log space. initial_state is the
+        K-last [N, H, V, K] recurrent state (flashinfer-native; matches the
+        runtime's SSM state pool layout, so no transpose is needed here).
 
-        Default returns ``(out, final_state)`` matching the FLA layout:
-        out [B, T, Hv, D] in q.dtype, final_state [N, H, K, V].
+        Default returns ``(out, final_state)``: out [B, T, Hv, D] in q.dtype,
+        final_state [N, H, V, K] (K-last, same layout as initial_state).
 
         When ``output_h=True`` returns
         ``(out, final_state, fi_checkpoints, checkpoint_cu_starts)`` where:
-        - ``fi_checkpoints``: raw flashinfer checkpoint buffer in FLA state layout
-          ``[total_fi_ckpts, H, K, V]`` (float32). Checkpoint ``k`` within a
+        - ``fi_checkpoints``: raw flashinfer checkpoint buffer, K-last
+          ``[total_fi_ckpts, H, V, K]`` (float32). Checkpoint ``k`` within a
           sequence is the state *after* processing chunk ``k`` (= FLA ``h[k+1]``).
           Per-sequence count is ``L_i // CHUNK_SIZE``.
         - ``checkpoint_cu_starts``: int64 tensor of length ``N+1`` giving the
@@ -176,8 +236,9 @@ if is_available():
         if scale is None:
             scale = head_dim**-0.5
 
-        # flashinfer's recurrent-state layout is [N, H, V, K]; FLA uses [N, H, K, V].
-        fi_initial_state = initial_state.float().transpose(-1, -2).contiguous()
+        # initial_state is already K-last [N, H, V, K] (flashinfer-native);
+        # only a dtype cast + contiguity are needed, no transpose.
+        fi_initial_state = initial_state.float().contiguous()
 
         state_checkpoints = None
         checkpoint_cu_starts = None
@@ -187,12 +248,13 @@ if is_available():
             per_seq_h_ckpts = per_seq_lens // CHUNK_SIZE
             total_h_ckpts = int(per_seq_h_ckpts.sum().item())
             H_state = fi_initial_state.shape[1]
-            D_state = fi_initial_state.shape[-1]
+            V_state = fi_initial_state.shape[-2]
+            K_state = fi_initial_state.shape[-1]
             state_checkpoints = torch.empty(
                 total_h_ckpts,
                 H_state,
-                D_state,
-                D_state,
+                V_state,
+                K_state,
                 device=fi_initial_state.device,
                 dtype=torch.float32,
             )
@@ -221,20 +283,211 @@ if is_available():
         out = out.to(q.dtype)
         if batched:
             out = out.unsqueeze(0)
-        final_state_fla = (
-            final_state.transpose(-1, -2) if final_state is not None else None
-        )
+        # final_state is already K-last [N, H, V, K]; no transpose needed.
 
         if not output_h:
-            return GdnChunkPrefillResult(out=out, final_state=final_state_fla)
+            return GdnChunkPrefillResult(out=out, final_state=final_state)
 
-        # Return raw flashinfer checkpoints in FLA state layout [total_fi, H, K, V].
-        # The caller indexes directly using flashinfer-native offsets
-        h_ckpts_fla = state_checkpoints.transpose(-1, -2)
+        # Return raw flashinfer checkpoints, K-last [total_fi, H, V, K]. The
+        # caller indexes directly using flashinfer-native offsets.
         return GdnChunkPrefillResult(
             out=out,
-            final_state=final_state_fla,
-            h=h_ckpts_fla,
+            final_state=final_state,
+            h=state_checkpoints,
             h_cu_starts=checkpoint_cu_starts,
             h_layout=GdnCheckpointLayout.FLASHINFER,
         )
+
+
+# ===-----------------------------------------------------------------------===#
+# GDN decode / MTP (K-last, SM90+)
+# ===-----------------------------------------------------------------------===#
+
+gdn_decode_step = error_fn
+gdn_decode_mtp = error_fn
+
+if is_decode_available():
+
+    @register_kernel(
+        "attention",
+        "gdn_decode_step",
+        name="flashinfer_gdn_decode_step",
+        solution="flashinfer",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 0),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=format_signatures(
+            ("q", "k", "v"), "dense", {torch.bfloat16, torch.float16}
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "head_dim": frozenset({SUPPORTED_HEAD_DIM}),
+        },
+        tags={"hopper", "latency"},
+    )
+    def gdn_decode_step(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        A_log: torch.Tensor,
+        a: torch.Tensor,
+        dt_bias: torch.Tensor,
+        b: torch.Tensor,
+        initial_state: torch.Tensor,
+        initial_state_indices: torch.Tensor,
+        scale: float | None = None,
+        output_state_indices: torch.Tensor | None = None,
+        use_qk_l2norm: bool = True,
+    ) -> torch.Tensor:
+        """Run one single-token (T=1) GDN decode step, K-last pool+indices.
+
+        q, k are [B, 1, H, K]; v is [B, 1, HV, V]; a, b are [B, 1, HV].
+        initial_state is the K-last [pool_size, HV, V, K] SSM state pool (same
+        layout as gdn_chunk_prefill/gdn_decode_mtp -- no transpose needed at
+        this boundary); initial_state_indices ([B]) selects each batch entry's
+        read row. ``-1`` marks CUDA-graph padding rows and is handled
+        internally by flashinfer (skipped on the float32 path, redirected to a
+        sacrificial pool row 0 on the bf16 fast path) -- no caller-side clamp
+        needed. The post-step state is written to output_state_indices
+        (defaults to initial_state_indices when None, e.g. the non-flat pool
+        path; pass the flat path's distinct out-page ids to write elsewhere).
+
+        Returns the [B, 1, HV, V] decode output (q.dtype).
+        """
+        # Normalize decay inputs for FlashInfer's FP32 CuteDSL/DLPack boundary.
+        A_log = A_log.detach().float()
+        dt_bias = dt_bias.detach().float()
+        out, _ = _gated_delta_rule_decode_pretranspose(
+            q=q,
+            k=k,
+            v=v,
+            state=None,
+            A_log=A_log,
+            a=a.to(q.dtype),
+            dt_bias=dt_bias,
+            b=b.to(q.dtype),
+            scale=scale,
+            use_qk_l2norm=use_qk_l2norm,
+            initial_state=initial_state,
+            initial_state_indices=initial_state_indices,
+            output_state_indices=output_state_indices,
+        )
+        return out
+
+    @register_kernel(
+        "attention",
+        "gdn_decode_mtp",
+        name="flashinfer_gdn_decode_mtp",
+        solution="flashinfer",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 0),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=format_signatures(
+            ("q", "k", "v"), "dense", {torch.bfloat16, torch.float16}
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "head_dim": frozenset({SUPPORTED_HEAD_DIM}),
+        },
+        tags={"hopper", "latency", "speculative-decoding"},
+    )
+    def gdn_decode_mtp(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        A_log: torch.Tensor,
+        a: torch.Tensor,
+        dt_bias: torch.Tensor,
+        b: torch.Tensor,
+        initial_state: torch.Tensor,
+        initial_state_indices: torch.Tensor,
+        scale: float | None = None,
+        disable_state_update: bool = True,
+        use_qk_l2norm: bool = True,
+        intermediate_states_buffer: torch.Tensor | None = None,
+        output_state_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run one multi-token (T>1) GDN MTP verify step, K-last pool+indices.
+
+        q, k are [B, T, H, K]; v is [B, T, HV, V]; a, b are [B, T, HV].
+        initial_state is the K-last [pool_size, HV, V, K] SSM state pool (same
+        layout as gdn_chunk_prefill/gdn_decode_step); initial_state_indices
+        ([B]) selects each batch entry's read row. When
+        ``output_state_indices`` is None and ``disable_state_update=False``,
+        the final state is written back to that same row.
+
+        Padding behavior depends on the state dtype. The standalone FP32 MTP
+        kernel skips a batch row when ``initial_state_indices`` is negative;
+        its per-token state indices may remain negative for that skipped row.
+        The BF16 fast path redirects negative read indices to row 0 and does
+        not mask negative per-token scatter indices, so callers must provide
+        non-negative destinations (typically by clamping padding to a reserved
+        sacrificial row 0).
+
+        intermediate_states_buffer: Optional batch-scoped ``[B, T, HV, V, K]``
+        (K-last, same dtype as ``initial_state``) buffer that receives every
+        step's post-update state at ``buffer[i_n, step]``.
+
+        output_state_indices: Optional int32 ``[B, T]`` table. Each step's
+        post-update state is scattered directly to the corresponding pool row.
+        FlashInfer names this argument ``ssm_state_indices``. It is mutually
+        exclusive with ``intermediate_states_buffer`` and requires
+        ``disable_state_update=False``.
+
+        Dispatches to the bf16-state MTP kernel when ``initial_state`` is
+        bfloat16 with K == V == 128 (mirrors gdn_decode_step's own bf16/fp32
+        dispatch via gated_delta_rule_decode_pretranspose); otherwise uses the
+        float32-only standalone MTP entry point.
+
+        Returns the [B, T, HV, V] decode output (q.dtype).
+        """
+        # Normalize decay inputs for FlashInfer's FP32 CuteDSL/DLPack boundary.
+        A_log = A_log.detach().float()
+        dt_bias = dt_bias.detach().float()
+        K_dim = q.shape[-1]
+        V_dim = v.shape[-1]
+        use_bf16_state = (
+            _gated_delta_rule_bf16_mtp is not None
+            and initial_state.dtype == torch.bfloat16
+            and K_dim == SUPPORTED_HEAD_DIM
+            and V_dim == SUPPORTED_HEAD_DIM
+        )
+        if use_bf16_state:
+            out = _gated_delta_rule_bf16_mtp(
+                A_log=A_log,
+                a=a.to(q.dtype),
+                dt_bias=dt_bias,
+                q=q,
+                k=k,
+                v=v,
+                b=b.to(q.dtype),
+                initial_state_source=initial_state,
+                initial_state_indices=initial_state_indices,
+                intermediate_states_buffer=intermediate_states_buffer,
+                ssm_state_indices=output_state_indices,
+                disable_state_update=disable_state_update,
+                use_qk_l2norm_in_kernel=use_qk_l2norm,
+                scale=scale,
+            )
+            return out
+        out, _ = _gated_delta_rule_mtp(
+            q=q,
+            k=k,
+            v=v,
+            initial_state=initial_state,
+            initial_state_indices=initial_state_indices,
+            A_log=A_log,
+            a=a.to(q.dtype),
+            dt_bias=dt_bias,
+            b=b.to(q.dtype),
+            scale=scale,
+            intermediate_states_buffer=intermediate_states_buffer,
+            ssm_state_indices=output_state_indices,
+            disable_state_update=disable_state_update,
+            use_qk_l2norm=use_qk_l2norm,
+        )
+        return out

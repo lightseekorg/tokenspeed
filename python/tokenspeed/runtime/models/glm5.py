@@ -185,6 +185,9 @@ class GlmDsaIndexer(nn.Module):
         self.index_head_dim = config.index_head_dim
         self.rope_head_dim = int(qk_rope_head_dim)
         self.softmax_scale = self.index_head_dim**-0.5
+        # Top-k scale with the per-head normalization folded in, so forward
+        # needs no separate weights-scale kernel.
+        self.weights_softmax_scale = self.softmax_scale * (self.index_n_heads**-0.5)
 
         if self.rope_head_dim <= 0 or self.rope_head_dim > self.index_head_dim:
             raise ValueError(
@@ -268,7 +271,10 @@ class GlmDsaIndexer(nn.Module):
         return GlmDsaIndexerOutput(
             query=index_q,
             key=index_k,
-            weights=weights.float() * (self.index_n_heads**-0.5),
+            # Raw bf16 weights: the head-norm constant is folded into
+            # weights_softmax_scale and the fp32 upcast into the top-k
+            # kernels' fused combine.
+            weights=weights,
         )
 
 
@@ -389,6 +395,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         self,
         rows: int,
         device: torch.device,
+        fill: bool = True,
     ) -> torch.Tensor:
         buffer = getattr(self, "_decode_topk_lens_buffer", None)
         if buffer is None or buffer.device != device or buffer.numel() < rows:
@@ -401,7 +408,8 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             )
             self._decode_topk_lens_buffer = buffer
         workspace = buffer[:rows]
-        workspace.fill_(0)
+        if fill:
+            workspace.fill_(0)
         return workspace
 
     @staticmethod
@@ -572,15 +580,21 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         if index_k_cache is None:
             raise RuntimeError("GLM DSA top-k requires an index-K cache.")
 
+        # The top-k kernels overwrite the whole workspace when they cover all
+        # rows; the sentinel pre-fills are only needed for mixed prefill,
+        # where leading rows stay unwritten but readable.
+        writes_full_workspace = decode_start == 0 and num_decode_tokens == num_tokens
         topk_indices = self._get_decode_topk_workspace(
             "_decode_topk_indices_buffer",
             num_tokens,
             topk,
             q.device,
-            fill_value=-1,
+            fill_value=None if writes_full_workspace else -1,
         )
         topk_slice = topk_indices[decode_start : decode_start + num_decode_tokens]
-        topk_lens = self._get_decode_topk_lens_workspace(num_tokens, q.device)
+        topk_lens = self._get_decode_topk_lens_workspace(
+            num_tokens, q.device, fill=not writes_full_workspace
+        )
         topk_lens_slice = topk_lens[decode_start : decode_start + num_decode_tokens]
 
         metadata = ctx.attn_backend.forward_decode_metadata
@@ -596,7 +610,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             block_tables,
             page_size=ctx.token_to_kv_pool.page_size,
             topk=topk,
-            softmax_scale=self.indexer.softmax_scale,
+            softmax_scale=self.indexer.weights_softmax_scale,
             q_len_per_req=q_len_per_req,
             index_k_cache=index_k_cache,
             seq_lens_2d=seq_lens_2d,
@@ -673,7 +687,9 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         topk: int,
     ) -> GlmDsaPrefillTopK:
         q = indexer_output.query[:num_prefill_tokens].contiguous()
-        weights = indexer_output.weights[:num_prefill_tokens].float().contiguous()
+        # Raw bf16 weights view (may be column-split, non-compact); the top-k
+        # kernel's fused combine upcasts and compacts in one launch.
+        weights = indexer_output.weights[:num_prefill_tokens]
 
         req_ids = torch.arange(
             seq_lens.numel(),
@@ -714,7 +730,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             row_starts.to(torch.int32).contiguous(),
             row_ends.to(torch.int32).contiguous(),
             topk=topk,
-            softmax_scale=self.indexer.softmax_scale,
+            softmax_scale=self.indexer.weights_softmax_scale,
             index_k_cache=index_k_cache,
             page_size=ctx.token_to_kv_pool.page_size,
             max_logits_bytes=max(1, max_logits_mb) * 1024 * 1024,

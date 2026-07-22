@@ -26,6 +26,11 @@ import torch
 from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
 from tokenspeed_kernel.ops.sampling.cuda import (
     chain_speculative_sampling_target_only,
+)
+from tokenspeed_kernel.ops.sampling.cuda import (
+    fused_topk_topp_available as _FUSED_TOPK_TOPP_AVAILABLE,
+)
+from tokenspeed_kernel.ops.sampling.cuda import (
     fused_topk_topp_prepare,
     fused_topk_topp_renorm,
     verify_chain_greedy,
@@ -37,14 +42,7 @@ from tokenspeed_kernel.ops.sampling.flashinfer import (
     top_p_renorm_prob,
 )
 from tokenspeed_kernel.ops.sampling.triton import gather_and_expand_scalars
-from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.torch_compile import get_compiler_backend
-
-# Resolved once at import: the fused top-k + top-p kernel is NVIDIA-only.
-# On non-NVIDIA platforms (e.g. ROCm) we fall back to the back-to-back
-# flashinfer renorm calls. Defining this at module scope keeps the hot path
-# branch-free in the captured graph.
-_FUSED_TOPK_TOPP_AVAILABLE = current_platform().is_nvidia
 
 from tokenspeed.runtime.distributed.dp_sampling_comm import DpSamplingComm
 from tokenspeed.runtime.sampling.backends.base import (
@@ -91,10 +89,10 @@ class FlashInferSamplingBackend(SamplingBackend):
         self._init_dp_sampling(config)
         self._init_shared_buffers(config)
         self._init_pool_scalars(config)
-        # Pre-create the side stream used by fused_topk_topp_renorm. Must
-        # happen before any CUDA graph capture — cudaStreamCreate is illegal
-        # inside capture, and verify() runs from the captured graph.
-        fused_topk_topp_prepare(config.device)
+        if _FUSED_TOPK_TOPP_AVAILABLE:
+            # Pre-create the fused renorm side stream: cudaStreamCreate is
+            # illegal inside capture, and verify() runs from the captured graph.
+            fused_topk_topp_prepare(config.device)
 
     def _init_dp_sampling(self, config: SamplingBackendConfig) -> None:
         self._dp_tp_group = config.tp_group
@@ -504,7 +502,8 @@ class FlashInferSamplingBackend(SamplingBackend):
                 # Fused replacement for the back-to-back top_k_renorm_prob +
                 # top_p_renorm_prob(is_deterministic=True) pair. Sentinel
                 # K = 1<<30 in top_ks routes per-row through the radix top-p
-                # only path.
+                # only path. Availability decided once in
+                # tokenspeed_kernel.ops.sampling.cuda.
                 target_probs = fused_topk_topp_renorm(
                     target_probs,
                     top_ks,

@@ -132,4 +132,71 @@ TEST_F(LoadBackDoneTestSuite, LoadBack_SubsequentPlanProceeds) {
     EXPECT_TRUE(true);
 }
 
+class DisaggDecodeAdmissionTestSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg{};
+        cfg.block_size = 2;
+        // Flat block 0 is the null page, leaving three usable pages.
+        cfg.device_allocator.total_pages = 4;
+        cfg.host_allocator.total_pages = 4;
+        cfg.max_scheduled_tokens = 2;
+        cfg.max_batch_size = 1;
+        cfg.decode_input_tokens = 1;
+        cfg.role = Role::kD;
+        cfg.enable_l3_storage = false;
+        cfg.disable_l2_cache = true;
+        cfg.disable_prefix_cache = true;
+
+        PagedCacheGroupConfig full;
+        full.group_id = "full";
+        full.rows_per_page = cfg.block_size;
+        full.entry_stride_tokens = 1;
+        full.total_pages = cfg.device_allocator.total_pages;
+        full.retention = PagedCacheGroupConfig::Retention::FullHistory;
+        full.family = PagedCacheGroupFamily::History;
+        cfg.paged_cache_groups = {full};
+        return cfg;
+    }
+
+    void SendBootstrapped(const std::string& request_id) {
+        ExecutionEvent event;
+        event.With(PDEvent{pd::BootstrappedEvent{request_id}});
+        scheduler_->Advance(std::move(event));
+    }
+
+    void SendRemotePrefillDone(const std::string& request_id, std::int32_t bootstrap_token) {
+        ExecutionEvent event;
+        event.With(PDEvent{pd::RemotePrefillDoneEvent{request_id, bootstrap_token}});
+        scheduler_->Advance(std::move(event));
+    }
+};
+
+TEST_F(DisaggDecodeAdmissionTestSuite, ReservesWholeDestinationAndSurvivesRemoteCompletion) {
+    Submit({MakeRequestSpec("r0", /*num_pages=*/2, /*start=*/1)});
+    SendBootstrapped("r0");
+
+    const ExecutionPlan admission = PlanOnce();
+    const FlatForwardOperation* prefill = GetForwardOp(admission.Operations());
+    ASSERT_NE(prefill, nullptr);
+    EXPECT_EQ(prefill->request_ids, (std::vector<std::string>{"r0"}));
+    EXPECT_EQ(prefill->input_lengths, (std::vector<std::int32_t>{4}));
+    ASSERT_EQ(prefill->occupied_pages.size(), 1u);
+    EXPECT_EQ(prefill->occupied_pages[0].size(), 3u);
+    EXPECT_EQ(scheduler_->ActiveKvPages(), 3u);
+
+    SendRemotePrefillDone("r0", /*bootstrap_token=*/42);
+    const ExecutionPlan decode_plan = PlanOnce();
+    const FlatForwardOperation* decode = GetForwardOp(decode_plan.Operations());
+    ASSERT_NE(decode, nullptr);
+    const std::int32_t r0 = FindRequestIndex(decode, "r0");
+    ASSERT_GE(r0, 0);
+    EXPECT_EQ(decode->decode_input_ids[static_cast<std::size_t>(r0)], 42);
+    EXPECT_EQ(decode->occupied_pages[static_cast<std::size_t>(r0)].size(), 3u);
+#if TOKENSPEED_FLAT_KVCACHE
+    ASSERT_EQ(decode->flat_block_tables.count("full"), 1u);
+    EXPECT_EQ(decode->flat_block_tables.at("full")[static_cast<std::size_t>(r0)].size(), 3u);
+#endif
+}
+
 }  // namespace tokenspeed::test

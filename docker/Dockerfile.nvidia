@@ -1,0 +1,38 @@
+# Build with buildx for linux/amd64 and linux/arm64. The base image is a
+# multi-architecture manifest; prefer a native arm64 builder because QEMU
+# emulation can make native extension builds substantially slower.
+FROM lightseekorg/tokenspeed-runner:cu130-torch-2.11.0-flashinfer-0.6.15.post1
+
+USER root
+
+ARG MAX_JOBS=16
+ARG CUDA_ARCH_LIST="9.0a 10.0a"
+
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
+
+WORKDIR /workspace
+
+# libnuma1 is required at runtime by torch_memory_saver, a TokenSpeed
+# dependency. Install system dependencies before copying sources to preserve
+# this cache layer across source-only changes.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libssl-dev \
+        libopenmpi-dev \
+        libnuma1 \
+        pkg-config && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY . /workspace
+
+# Install every TokenSpeed package from this checkout so the image always
+# contains the source being built, rather than published package wheels.
+RUN python3 -m pip install cmake ninja && \
+    MAX_JOBS=${MAX_JOBS} \
+    FLASHINFER_CUDA_ARCH_LIST="${CUDA_ARCH_LIST}" \
+    TOKENSPEED_KERNEL_BACKEND=cuda \
+    python3 -m pip install tokenspeed-kernel/python/ --no-build-isolation && \
+    python3 -m pip install tokenspeed-scheduler/ \
+        --config-settings=cmake.define.TOKENSPEED_FLAT_KVCACHE=ON && \
+    python3 -m pip install ./python --no-build-isolation
+
+CMD ["/bin/bash"]

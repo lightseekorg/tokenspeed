@@ -44,9 +44,12 @@ from transformers.utils import cached_file
 
 from tokenspeed.runtime.configs import (
     DeepseekV4Config,
+    InklingMMConfig,
+    InklingModelConfig,
     KimiK2Config,
     KimiK25Config,
     MiniMaxM2Config,
+    MiniMaxM3Config,
     Qwen2Config,
     Qwen3_5Config,
     Qwen3_5MoeConfig,
@@ -65,8 +68,11 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     Qwen3_5Config.model_type: Qwen3_5Config,
     Qwen3_5MoeConfig.model_type: Qwen3_5MoeConfig,
     MiniMaxM2Config.model_type: MiniMaxM2Config,
+    MiniMaxM3Config.model_type: MiniMaxM3Config,
     KimiK2Config.model_type: KimiK2Config,
     KimiK25Config.model_type: KimiK25Config,
+    InklingModelConfig.model_type: InklingModelConfig,
+    InklingMMConfig.model_type: InklingMMConfig,
 }
 
 _DEEPSEEK_V4_ENCODING_MODULE_NAME = "_tokenspeed_deepseek_v4_encoding"
@@ -284,10 +290,14 @@ def get_config(
         "Qwen3_5MoeConfig",
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5ForConditionalGenerationNextN",
+        "InklingForConditionalGeneration",
+        "InklingForConditionalGenerationNextN",
+        "InklingMMConfig",
         "Qwen3OmniMoeForConditionalGeneration",
         "Qwen3OmniMoeConfig",
         "Qwen3ASRForConditionalGeneration",
         "Qwen3ASRConfig",
+        "MiniMaxM3SparseForConditionalGeneration",
     ]:
         config.text_config = text_config
         return config

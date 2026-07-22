@@ -33,16 +33,24 @@ platform = current_platform()
 
 
 if platform.is_amd:
+    from tokenspeed_kernel_amd.ops.moe import fused_mxfp_gfx1250
     from tokenspeed_kernel_amd.ops.moe.fused_mxfp_gfx950 import (
         gluon_mxfp_dynamic_mxfp4_fused_moe,
         gluon_mxfp_fused_moe,
+        gluon_mxfp_precomputed_mxfp4_fused_moe,
     )
     from tokenspeed_kernel_amd.ops.moe.mxfp4_gfx950_preprocess import (
         preprocess_gluon_mxfp4_gfx950_moe_weights,
     )
+    from tokenspeed_kernel_amd.ops.moe.mxfp4_gfx1250_preprocess import (
+        preprocess_gluon_mxfp4_gfx1250_moe_weights,
+    )
 
     def gluon_mxfp4_gfx950_moe_weights(plan: dict, w: torch.nn.Module):
         return preprocess_gluon_mxfp4_gfx950_moe_weights(plan, w, preshuffle=True)
+
+    def gluon_mxfp4_gfx1250_moe_weights(plan: dict, w: torch.nn.Module):
+        return preprocess_gluon_mxfp4_gfx1250_moe_weights(plan, w)
 
     def _swiglu_args(w: torch.nn.Module) -> tuple[float, float, float]:
         swiglu_arg = getattr(w, "swiglu_arg", None)
@@ -55,6 +63,83 @@ if platform.is_amd:
             1.0 if swiglu_arg.alpha is None else swiglu_arg.alpha,
             0.0 if swiglu_arg.limit is None else swiglu_arg.limit,
             0.0 if swiglu_beta is None else swiglu_beta,
+        )
+
+    @register_kernel(
+        "moe",
+        "apply",
+        name="gluon_mxfp4_gfx1250_precomputed_moe_apply",
+        solution="gluon",
+        weight_preprocessor=gluon_mxfp4_gfx1250_moe_weights,
+        capability=CapabilityRequirement(
+            vendors=frozenset({"amd"}),
+            min_arch_version=ArchVersion(12, 5),
+            max_arch_version=ArchVersion(12, 5),
+        ),
+        signatures=format_signatures(
+            "x",
+            "dense",
+            {torch.float16, torch.bfloat16},
+        ),
+        traits={
+            "weight_dtype": frozenset({"mxfp4"}),
+            "activation": frozenset({"silu", "swiglu"}),
+            "routing_mode": frozenset({"precomputed_topk"}),
+            "supports_deferred_finalize": frozenset({False}),
+            "supports_ep": frozenset({False}),
+            "supports_all_to_all_ep": frozenset({False}),
+            "ispp_alignment": frozenset({1}),
+            "internal_activation_dtype": frozenset({"fp8"}),
+            "supports_bias": frozenset({True}),
+        },
+        priority=Priority.SPECIALIZED + 4,
+    )
+    def gluon_mxfp4_gfx1250_precomputed_moe_apply(
+        plan: dict,
+        x: torch.Tensor,
+        w: torch.nn.Module,
+        router_logits: torch.Tensor,
+        topk_weights: torch.Tensor | None = None,
+        topk_ids: torch.Tensor | None = None,
+        num_tokens_global: int | None = None,
+        max_num_tokens_per_gpu: int | None = None,
+        do_finalize: bool = True,
+        enable_pdl: bool = False,
+    ):
+        del plan, router_logits, num_tokens_global, max_num_tokens_per_gpu
+        del do_finalize, enable_pdl
+        if topk_weights is None or topk_ids is None:
+            raise ValueError(
+                "gluon_mxfp4_gfx1250_precomputed_moe_apply requires "
+                "topk_weights and topk_ids"
+            )
+
+        swiglu_alpha, swiglu_limit, swiglu_beta = _swiglu_args(w)
+        w13_pc = w.w13_precision_config
+        w2_pc = w.w2_precision_config
+
+        return fused_mxfp_gfx1250.gluon_mxfp_precomputed_mxfp4_fused_moe(
+            x,
+            topk_weights,
+            topk_ids,
+            w.w13_weight_triton_tensor,
+            w.w2_weight_triton_tensor,
+            w13_bias=(
+                None
+                if getattr(w, "_gluon_w13_bias_is_zero", False)
+                else getattr(w, "w13_weight_bias", None)
+            ),
+            w2_bias=(
+                None
+                if getattr(w, "_gluon_w2_bias_is_zero", False)
+                else getattr(w, "w2_weight_bias", None)
+            ),
+            w13_mx_scale=w13_pc.b_mx_scale,
+            w2_mx_scale=w2_pc.b_mx_scale,
+            out_dtype=w2_pc.out_dtype or torch.bfloat16,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_limit=swiglu_limit,
+            swiglu_beta=swiglu_beta,
         )
 
     @register_kernel(
@@ -98,20 +183,36 @@ if platform.is_amd:
         do_finalize: bool = True,
         enable_pdl: bool = False,
     ):
-        del topk_weights, topk_ids, num_tokens_global, max_num_tokens_per_gpu
+        del num_tokens_global, max_num_tokens_per_gpu
         del do_finalize, enable_pdl
         top_k = getattr(w, "top_k")
         swiglu_alpha, swiglu_limit, swiglu_beta = _swiglu_args(w)
         w13_precision_config = w.w13_precision_config
         w2_precision_config = w.w2_precision_config
+        # Forward the caller's precomputed top-k whenever it is supplied. The
+        # downstream dispatch picks the tuned kernel by batch size (direct
+        # decode owns M <= _DIRECT_DECODE_MAX_M, precomputed-MFMA decode owns
+        # M >= _PRECOMPUTED_MFMA_MIN_M) and otherwise builds ragged metadata
+        # directly from the forwarded top-k. Dropping it for any M in between
+        # (e.g. M == 3) would silently recompute routing from router_logits,
+        # so we always forward and let the dispatch choose.
+        forward_precomputed_topk = topk_weights is not None and topk_ids is not None
 
         return gluon_mxfp_dynamic_mxfp4_fused_moe(
             x,
             router_logits,
             w.w13_weight_triton_tensor,
             w.w2_weight_triton_tensor,
-            w13_bias=getattr(w, "w13_weight_bias", None),
-            w2_bias=getattr(w, "w2_weight_bias", None),
+            w13_bias=(
+                None
+                if getattr(w, "_gluon_w13_bias_is_zero", False)
+                else getattr(w, "w13_weight_bias", None)
+            ),
+            w2_bias=(
+                None
+                if getattr(w, "_gluon_w2_bias_is_zero", False)
+                else getattr(w, "w2_weight_bias", None)
+            ),
             w13_mx_scale=w13_precision_config.b_mx_scale,
             w2_mx_scale=w2_precision_config.b_mx_scale,
             out_dtype=w2_precision_config.out_dtype or torch.bfloat16,
@@ -124,6 +225,75 @@ if platform.is_amd:
             ),
             normalize_topk_weights=bool(getattr(w, "_normalize_topk_weights", True)),
             routing_method_type=int(getattr(w, "_routing_method_type", 0)),
+            swiglu_alpha=swiglu_alpha,
+            swiglu_limit=swiglu_limit,
+            swiglu_beta=swiglu_beta,
+            precomputed_topk_weights=topk_weights if forward_precomputed_topk else None,
+            precomputed_topk_ids=topk_ids if forward_precomputed_topk else None,
+        )
+
+    @register_kernel(
+        "moe",
+        "apply",
+        name="gluon_mxfp4_precomputed_moe_apply",
+        solution="gluon",
+        weight_preprocessor=gluon_mxfp4_gfx950_moe_weights,
+        capability=CapabilityRequirement(
+            vendors=frozenset({"amd"}),
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+        ),
+        signatures=format_signatures(
+            "x",
+            "dense",
+            {torch.float16, torch.bfloat16},
+        ),
+        traits={
+            "weight_dtype": frozenset({"mxfp4"}),
+            "activation": frozenset({"silu", "swiglu"}),
+            "routing_mode": frozenset({"precomputed_topk"}),
+            "supports_deferred_finalize": frozenset({False}),
+            "supports_ep": frozenset({False}),
+            "supports_all_to_all_ep": frozenset({False}),
+            "ispp_alignment": frozenset({1}),
+            "internal_activation_dtype": frozenset({"input"}),
+            "supports_bias": frozenset({True}),
+        },
+        priority=Priority.SPECIALIZED + 2,
+    )
+    def gluon_mxfp4_precomputed_moe_apply(
+        plan: dict,
+        x: torch.Tensor,
+        w: torch.nn.Module,
+        router_logits: torch.Tensor,
+        topk_weights: torch.Tensor | None = None,
+        topk_ids: torch.Tensor | None = None,
+        num_tokens_global: int | None = None,
+        max_num_tokens_per_gpu: int | None = None,
+        do_finalize: bool = True,
+        enable_pdl: bool = False,
+    ):
+        del plan, router_logits, num_tokens_global, max_num_tokens_per_gpu
+        del do_finalize, enable_pdl
+        if topk_weights is None or topk_ids is None:
+            raise ValueError(
+                "gluon_mxfp4_precomputed_moe_apply requires topk_weights and topk_ids"
+            )
+        swiglu_alpha, swiglu_limit, swiglu_beta = _swiglu_args(w)
+        w13_precision_config = w.w13_precision_config
+        w2_precision_config = w.w2_precision_config
+
+        return gluon_mxfp_precomputed_mxfp4_fused_moe(
+            x,
+            topk_weights,
+            topk_ids,
+            w.w13_weight_triton_tensor,
+            w.w2_weight_triton_tensor,
+            w13_bias=getattr(w, "w13_weight_bias", None),
+            w2_bias=getattr(w, "w2_weight_bias", None),
+            w13_mx_scale=w13_precision_config.b_mx_scale,
+            w2_mx_scale=w2_precision_config.b_mx_scale,
+            out_dtype=w2_precision_config.out_dtype or torch.bfloat16,
             swiglu_alpha=swiglu_alpha,
             swiglu_limit=swiglu_limit,
             swiglu_beta=swiglu_beta,
@@ -183,8 +353,16 @@ if platform.is_amd:
             router_logits,
             w.w13_weight_triton_tensor,
             w.w2_weight_triton_tensor,
-            w13_bias=getattr(w, "w13_weight_bias", None),
-            w2_bias=getattr(w, "w2_weight_bias", None),
+            w13_bias=(
+                None
+                if getattr(w, "_gluon_w13_bias_is_zero", False)
+                else getattr(w, "w13_weight_bias", None)
+            ),
+            w2_bias=(
+                None
+                if getattr(w, "_gluon_w2_bias_is_zero", False)
+                else getattr(w, "w2_weight_bias", None)
+            ),
             w13_mx_scale=w13_precision_config.b_mx_scale,
             w2_mx_scale=w2_precision_config.b_mx_scale,
             w13_act_scale=w.w13_act_scale,

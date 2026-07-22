@@ -112,7 +112,9 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
                 prefix=add_prefix("audio_tower", prefix),
                 mm_attention_backend=mm_attention_backend,
             )
-            self.multimodal_embedder = MultimodalEmbedder()
+            self.multimodal_embedder = MultimodalEmbedder(
+                encoder_mapping=mapping.vision
+            )
             # ModelExecutor may replace this callable with an encoder graph.
             self.audio_encoder = self.get_audio_feature
         else:
@@ -188,14 +190,8 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
                 input_ids=input_ids,
                 text_embedding=self.get_input_embeddings(),
                 ctx=multimodal_context,
-                encoders={
-                    Modality.AUDIO: EncoderSpec(
-                        self.audio_encoder,
-                        deepstack=False,
-                    )
-                },
+                encoders={Modality.AUDIO: EncoderSpec(self.audio_encoder)},
                 multimodal_model=self,
-                is_decode_or_idle=ctx.forward_mode.is_decode_or_idle(),
             )
             kwargs.update(model_kwargs)
             if input_embeds is not None:

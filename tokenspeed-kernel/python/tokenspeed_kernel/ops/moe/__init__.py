@@ -51,11 +51,21 @@ def _validate_a2a_backend(a2a_backend: str | None) -> None:
     raise NotImplementedError(f"MoE all-to-all backend is unsupported: {a2a_backend}")
 
 
+def _validate_routing_mode(routing_mode: str | None) -> None:
+    if routing_mode in {None, "kernel_routing", "precomputed_topk"}:
+        return
+    raise ValueError(
+        f"routing_mode must be 'kernel_routing' or 'precomputed_topk', "
+        f"got {routing_mode!r}"
+    )
+
+
 def _build_traits(
     *,
     weight_dtype: str,
     activation: str | None,
     requires_deferred_finalize: bool,
+    routing_mode: str | None,
     a2a_backend: str | None,
     ep_size: int | None,
     ispp: int | None,
@@ -71,6 +81,8 @@ def _build_traits(
         traits["activation"] = activation
     if requires_deferred_finalize:
         traits["supports_deferred_finalize"] = True
+    if routing_mode is not None:
+        traits["routing_mode"] = routing_mode
 
     all_to_all_ep = _uses_all_to_all_ep(a2a_backend)
     traits["supports_all_to_all_ep"] = all_to_all_ep
@@ -92,6 +104,7 @@ def moe_plan(
     input_dtype: torch.dtype = torch.bfloat16,
     activation: str | None = None,
     requires_deferred_finalize: bool = False,
+    routing_mode: str | None = None,
     a2a_backend: str | None = None,
     ep_size: int | None = None,
     ispp: int | None = None,
@@ -109,6 +122,11 @@ def moe_plan(
         input_dtype: Hidden-state dtype used for the apply-kernel signature.
         activation: Optional activation name required by the layer.
         requires_deferred_finalize: Require a kernel that can defer finalize.
+        routing_mode: Optional routing-mode requirement. "precomputed_topk"
+            requires a kernel that consumes externally computed top-k ids and
+            weights (for models whose routing function the fused kernels
+            cannot reproduce); "kernel_routing" requires in-kernel routing
+            from logits. None (default) leaves routing mode unconstrained.
         a2a_backend: Optional all-to-all backend. deepep selects the DeepEP
             solution when solution is not set.
         ep_size: Optional expert-parallel size. Values > 1 require EP support.
@@ -130,6 +148,7 @@ def moe_plan(
     """
     weight_dtype = _normalize_weight_dtype(weight_dtype)
     _validate_a2a_backend(a2a_backend)
+    _validate_routing_mode(routing_mode)
     if solution is None and a2a_backend == "deepep":
         solution = "flashinfer_cutedsl_deepep"
 
@@ -137,6 +156,7 @@ def moe_plan(
         weight_dtype=weight_dtype,
         activation=activation,
         requires_deferred_finalize=requires_deferred_finalize,
+        routing_mode=routing_mode,
         a2a_backend=a2a_backend,
         ep_size=ep_size,
         ispp=ispp,

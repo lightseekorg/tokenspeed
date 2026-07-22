@@ -46,10 +46,6 @@ from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.layers.attention.utils import (
     create_flashinfer_kv_indices_triton,
 )
-from tokenspeed.runtime.spec_decode.eagle import (
-    EagleDraftInput,
-    generate_attn_arg_prefill,
-)
 from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.flashinfer_config import get_flashinfer_workspace_size
 
@@ -184,7 +180,6 @@ class FlashMLABackend(AttentionBackend):
         req_to_page: torch.Tensor = None,
         extend_with_prefix: bool = False,
         extend_prefix_lens: torch.Tensor | None = None,
-        spec_info=None,
         **kwargs,
     ):
         if forward_mode.is_extend_or_mixed():
@@ -747,7 +742,6 @@ class _PrefillIndicesUpdater:
         req_to_page: torch.Tensor = None,
         prefill_wrapper_paged: BatchMLAPagedAttentionWrapper = None,
         use_ragged: bool = False,
-        spec_info: EagleDraftInput | None = None,
     ):
         if use_ragged:
             paged_kernel_lens = prefix_lens
@@ -768,7 +762,6 @@ class _PrefillIndicesUpdater:
             self.qo_indptr,
             use_ragged,
             req_to_page=req_to_page,
-            spec_info=spec_info,
         )
 
     def _call_begin_forward(
@@ -784,42 +777,33 @@ class _PrefillIndicesUpdater:
         qo_indptr: torch.Tensor,
         use_ragged: bool,
         req_to_page: torch.Tensor = None,
-        spec_info: EagleDraftInput | None = None,
     ):
         bs = len(seq_lens)
         sm_scale = self.scaling
 
-        if spec_info is None:
-            assert len(seq_lens) == len(req_pool_indices)
-            torch.cumsum(paged_kernel_lens, dim=0, out=kv_indptr[1 : bs + 1])
-            kv_indptr = kv_indptr[: bs + 1]
-            if wrapper_paged._use_cuda_graph:
-                kv_indices = wrapper_paged._kv_indices_buf
-            else:
-                kv_indices = torch.empty(
-                    paged_kernel_lens_sum,
-                    dtype=torch.int32,
-                    device=req_pool_indices.device,
-                )
-            if req_to_page is not None:
-                create_flashinfer_kv_indices_triton[(bs,)](
-                    req_to_page,
-                    req_pool_indices,
-                    paged_kernel_lens,
-                    kv_indptr,
-                    None,
-                    kv_indices,
-                    req_to_page.shape[1],
-                )
-            torch.cumsum(seq_lens - prefix_lens, dim=0, out=qo_indptr[1 : bs + 1])
-            qo_indptr = qo_indptr[: bs + 1]
+        assert len(seq_lens) == len(req_pool_indices)
+        torch.cumsum(paged_kernel_lens, dim=0, out=kv_indptr[1 : bs + 1])
+        kv_indptr = kv_indptr[: bs + 1]
+        if wrapper_paged._use_cuda_graph:
+            kv_indices = wrapper_paged._kv_indices_buf
         else:
-            kv_indices, kv_indptr, qo_indptr, _ = generate_attn_arg_prefill(
-                spec_info.draft_token_num,
+            kv_indices = torch.empty(
+                paged_kernel_lens_sum,
+                dtype=torch.int32,
+                device=req_pool_indices.device,
+            )
+        if req_to_page is not None:
+            create_flashinfer_kv_indices_triton[(bs,)](
+                req_to_page,
                 req_pool_indices,
                 paged_kernel_lens,
-                req_to_page,
+                kv_indptr,
+                None,
+                kv_indices,
+                req_to_page.shape[1],
             )
+        torch.cumsum(seq_lens - prefix_lens, dim=0, out=qo_indptr[1 : bs + 1])
+        qo_indptr = qo_indptr[: bs + 1]
 
         if use_ragged:
             wrapper_ragged.begin_forward(

@@ -24,8 +24,50 @@ from tokenspeed_kernel.ops.attention.cute_dsl.dsa_topk import (
     cute_dsl_decode_topk,
     has_cute_dsl_decode_topk,
 )
+from tokenspeed_kernel.registry import error_fn
+
+try:
+    from tokenspeed_kernel.ops.attention.cute_dsl import rel_mha
+    from tokenspeed_kernel.ops.attention.cute_dsl.rel_mha import (
+        CuBlocksToBatchKernel,
+        CuSeqlensToBlocksKernel,
+        FlashAttentionDecodeSm100Bias,
+        FlashAttentionForwardCombine,
+        FlashAttentionForwardSm100,
+        ShearingBias,
+        create_mxfp8_scale_factor_tensor,
+        rel_decode,
+        rel_decode_v2,
+        rel_extend,
+    )
+
+    HAS_REL_MHA = True
+except ImportError:
+    # rel_mha needs tokenspeed-fa4 + cutlass-dsl; degrade instead of failing the import.
+    rel_mha = None
+    rel_decode = rel_decode_v2 = rel_extend = None
+    CuBlocksToBatchKernel = error_fn
+    CuSeqlensToBlocksKernel = error_fn
+    FlashAttentionDecodeSm100Bias = error_fn
+    FlashAttentionForwardCombine = error_fn
+    FlashAttentionForwardSm100 = error_fn
+    ShearingBias = error_fn
+    create_mxfp8_scale_factor_tensor = error_fn
+    HAS_REL_MHA = False
 
 __all__ = [
+    "CuBlocksToBatchKernel",
+    "CuSeqlensToBlocksKernel",
+    "FlashAttentionDecodeSm100Bias",
+    "FlashAttentionForwardCombine",
+    "FlashAttentionForwardSm100",
+    "HAS_REL_MHA",
+    "ShearingBias",
+    "create_mxfp8_scale_factor_tensor",
     "cute_dsl_decode_topk",
     "has_cute_dsl_decode_topk",
+    "rel_decode",
+    "rel_decode_v2",
+    "rel_extend",
+    "rel_mha",
 ]

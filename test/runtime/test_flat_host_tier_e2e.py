@@ -110,7 +110,7 @@ def _make_engine(*, host_tier: bool) -> Engine:
         # Small device budget: the profiled pool also depends on free GPU
         # memory at boot, hence K is sized from the measured capacity.
         gpu_memory_utilization=0.165,
-        moe_backend="flashinfer_mxfp4",
+        moe_backend="auto",  # our tree lacks upstream flashinfer_mxfp4
         disable_prefill_graph=True,
     )
 

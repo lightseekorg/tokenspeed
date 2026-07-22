@@ -354,7 +354,7 @@ def minimax_biased_grouped_topk(
         or hidden_states.shape[0] != gating_output.shape[0]
         or gating_output.shape[1] != correction_bias.shape[0]
         or gating_output.shape[1] > 256
-        or topk != 8
+        or not (1 <= topk <= 8)
         or num_expert_group != 1
         or topk_group != 1
         or num_fused_shared_experts != 0

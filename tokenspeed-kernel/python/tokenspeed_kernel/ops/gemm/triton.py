@@ -25,13 +25,18 @@ import json
 import logging
 import math
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, Platform
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import ScaleFormat, format_signatures
+from tokenspeed_kernel.signature import (
+    ScaleFormat,
+    format_signature,
+    format_signatures,
+    tensor_format,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +46,16 @@ _MXFP8_BLOCK_SCALE = ScaleFormat(
     granularity="block",
     block_shape=(128, 128),
 )
+_MXFP8_UE8M0_SCALE = ScaleFormat(
+    storage_dtype=torch.uint8,
+    granularity="block",
+    block_shape=(1, 32),
+)
+_MXFP8_FLOAT_1X32_SCALE = ScaleFormat(
+    storage_dtype=torch.float32,
+    granularity="block",
+    block_shape=(1, 32),
+)
 _FP8_TENSOR_SCALE = ScaleFormat(
     storage_dtype=torch.float32,
     granularity="tensor",
@@ -49,8 +64,17 @@ _FP8_CHANNEL_SCALE = ScaleFormat(
     storage_dtype=torch.float32,
     granularity="channel",
 )
-_MXFP8_FORMAT_SIGNATURES = format_signatures(
-    ("a", "b"), "mxfp8", {_fp8_dtype}, scale=_MXFP8_BLOCK_SCALE
+_MXFP8_FORMAT_SIGNATURES = (
+    format_signatures(("a", "b"), "mxfp8", {_fp8_dtype}, scale=_MXFP8_BLOCK_SCALE)
+    | format_signatures(("a", "b"), "mxfp8", {_fp8_dtype}, scale=_MXFP8_UE8M0_SCALE)
+    | frozenset(
+        {
+            format_signature(
+                a=tensor_format("mxfp8", _fp8_dtype, scale=_MXFP8_FLOAT_1X32_SCALE),
+                b=tensor_format("mxfp8", _fp8_dtype, scale=_MXFP8_UE8M0_SCALE),
+            )
+        }
+    )
 )
 _FP8_SCALED_FORMAT_SIGNATURES = format_signatures(
     ("a", "b"), "scaled-fp8", {_fp8_dtype}, scale=_FP8_TENSOR_SCALE
@@ -72,7 +96,8 @@ def prepare_block_fp8_matmul_inputs(
     Bs: torch.Tensor,
     block_size: List[int],
     output_dtype: torch.dtype = torch.float16,
-) -> Tuple[int, int, int]:
+    out: torch.Tensor | None = None,
+) -> tuple[int, int, int, torch.Tensor]:
     assert len(block_size) == 2
     block_n, block_k = block_size[0], block_size[1]
 
@@ -86,6 +111,8 @@ def prepare_block_fp8_matmul_inputs(
         assert (
             triton.cdiv(triton.cdiv(A.shape[-1], block_k), 4) == As.shape[-1]
         ), f"{A.shape=} {As.shape=} {block_size=}"
+    elif As.dtype == torch.uint8:
+        assert triton.cdiv(A.shape[-1], block_k) == As.shape[-1]
     else:
         raise NotImplementedError
 
@@ -104,11 +131,14 @@ def prepare_block_fp8_matmul_inputs(
         assert (
             triton.cdiv(triton.cdiv(K, block_k), 4) == Bs.shape[1]
         ), f"{B.shape=} {Bs.shape=} {block_size=}"
+    elif Bs.dtype == torch.uint8:
+        assert triton.cdiv(N, block_n) == Bs.shape[0]
+        assert triton.cdiv(K, block_k) == Bs.shape[1]
     else:
         raise NotImplementedError
 
     C_shape = A.shape[:-1] + (N,)
-    C = A.new_empty(C_shape, dtype=output_dtype)
+    C = out if out is not None else A.new_empty(C_shape, dtype=output_dtype)
 
     return M, N, K, C
 
@@ -224,6 +254,10 @@ def _w8a8_block_fp8_matmul(
         offs_ks = k_start // group_k
         a_s = tl.load(As_ptrs + offs_ks * stride_As_k)
         b_s = tl.load(Bs_ptrs + offs_ks * stride_Bs_k)
+        if As.dtype.element_ty == tl.uint8:
+            a_s = tl.exp2(a_s.to(tl.float32) - 127.0)
+        if Bs.dtype.element_ty == tl.uint8:
+            b_s = tl.exp2(b_s.to(tl.float32) - 127.0)
 
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
@@ -415,6 +449,7 @@ def w8a8_block_fp8_matmul_triton(
     Bs: torch.Tensor,
     block_size: List[int],
     output_dtype: torch.dtype = torch.float16,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """This function performs matrix multiplication with block-wise quantization.
 
@@ -432,7 +467,9 @@ def w8a8_block_fp8_matmul_triton(
     Returns:
         torch.Tensor: The result of matmul.
     """
-    M, N, K, C = prepare_block_fp8_matmul_inputs(A, B, As, Bs, block_size, output_dtype)
+    M, N, K, C = prepare_block_fp8_matmul_inputs(
+        A, B, As, Bs, block_size, output_dtype, out=out
+    )
 
     block_n, block_k = block_size
 
@@ -443,7 +480,7 @@ def w8a8_block_fp8_matmul_triton(
         config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
     else:
         # Default config
-        # Block-wise quant: BLOCK_SIZE_K must be divisible by block_size[1]
+        # Each K tile consumes one scale, so its width must equal the scale group.
         if Platform.get().is_amd:
             config = {
                 "BLOCK_SIZE_M": 32,
@@ -456,12 +493,19 @@ def w8a8_block_fp8_matmul_triton(
         else:
             config = {
                 "BLOCK_SIZE_M": 64,
-                "BLOCK_SIZE_N": block_size[0],
+                "BLOCK_SIZE_N": max(64, block_size[0]),
                 "BLOCK_SIZE_K": block_size[1],
                 "GROUP_SIZE_M": 32,
                 "num_warps": 4,
                 "num_stages": 3,
             }
+
+    if config["BLOCK_SIZE_K"] != block_k:
+        raise ValueError(
+            "block-scaled FP8 GEMM requires BLOCK_SIZE_K to match the scale "
+            f"group exactly, got BLOCK_SIZE_K={config['BLOCK_SIZE_K']} and "
+            f"group_k={block_k}"
+        )
 
     kernel = _w8a8_block_fp8_matmul
     if Platform.get().is_amd and config["BLOCK_SIZE_N"] == block_size[0]:
@@ -648,6 +692,7 @@ def triton_scaled_mm(
     block_size_n: int = 32,
     block_size_k: int = 32,
     use_heuristic=True,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     M, K = input.shape
     N = weight.shape[1]
@@ -671,7 +716,15 @@ def triton_scaled_mm(
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
 
-    result = torch.empty((M, N), dtype=out_dtype, device=input.device)
+    result = (
+        out
+        if out is not None
+        else torch.empty((M, N), dtype=out_dtype, device=input.device)
+    )
+    if result.dtype != out_dtype:
+        raise ValueError(
+            f"triton_scaled_mm out expects dtype {out_dtype}, got {result.dtype}"
+        )
 
     has_scalar = lambda x: x.shape[0] == 1 and x.shape[1] == 1
 
@@ -720,7 +773,7 @@ def triton_scaled_mm(
         BLOCK_SIZE_SCALE_B=block_size_sb,
     )
 
-    return result.to(out_dtype)
+    return result
 
 
 # ---- Triton block-scaled FP8 ----------------------------------------------
@@ -748,11 +801,14 @@ def triton_mm_fp8_blockscale(
     *,
     alpha: torch.Tensor | None = None,
     block_size: list[int] | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert block_size is not None, "block_size is required for triton_mm_fp8_blockscale"
     assert (
         A_scales is not None
     ), "A_scales is required; online quantization should be done by the caller"
+    if B_scales is None:
+        raise ValueError("B_scales is required for triton MXFP8 GEMM")
     return w8a8_block_fp8_matmul_triton(
         A,
         B,
@@ -760,6 +816,7 @@ def triton_mm_fp8_blockscale(
         B_scales,
         block_size=block_size,
         output_dtype=out_dtype,
+        out=out,
     )
 
 
@@ -855,6 +912,7 @@ def triton_mm_mxfp4(
     *,
     alpha: torch.Tensor | None = None,
     block_size: list[int] | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     del alpha, block_size
     if A.dtype != torch.uint8 or B.dtype != torch.uint8:
@@ -868,7 +926,7 @@ def triton_mm_mxfp4(
     N = B.shape[0]
     if K % 32 != 0:
         raise ValueError("MXFP4 GEMM requires K divisible by 32")
-    C = torch.empty(M, N, device=A.device, dtype=out_dtype)
+    C = out if out is not None else torch.empty(M, N, device=A.device, dtype=out_dtype)
     grid = (triton.cdiv(M, 16), triton.cdiv(N, 32))
     _mxfp4_mm_kernel[grid](
         A,
@@ -926,6 +984,7 @@ def triton_mm_fp8_scaled(
     alpha: torch.Tensor | None = None,
     block_size: list[int] | None = None,
     bias: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return triton_scaled_mm(
         A,
@@ -934,4 +993,5 @@ def triton_mm_fp8_scaled(
         B_scales,
         out_dtype=out_dtype,
         bias=bias,
+        out=out,
     )

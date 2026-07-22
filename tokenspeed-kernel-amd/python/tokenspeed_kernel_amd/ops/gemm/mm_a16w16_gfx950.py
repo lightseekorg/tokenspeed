@@ -1041,7 +1041,7 @@ def _get_partial_scratch(
 def _check_supported_dense16_shape(M: int, N: int, K: int) -> None:
     if M <= 0 or N <= 0 or K <= 0:
         raise ValueError(
-            "dense16 Gluon GEMM requires positive M/N/K, got " f"M={M}, N={N}, K={K}"
+            f"dense16 Gluon GEMM requires positive M/N/K, got M={M}, N={N}, K={K}"
         )
     if M > MAX_M:
         raise ValueError(f"dense16 Gluon GEMM requires M <= {MAX_M}; got M={M}")
@@ -1055,6 +1055,29 @@ def _check_supported_dense16_shape(M: int, N: int, K: int) -> None:
             f"dense16 Gluon GEMM requires K to be a multiple of {DENSE16_BLOCK_K}; "
             f"got K={K}"
         )
+
+
+def _resolve_output(
+    A: torch.Tensor,
+    M: int,
+    N: int,
+    out_dtype: torch.dtype,
+    out: torch.Tensor | None,
+    op_name: str,
+) -> torch.Tensor:
+    if out is None:
+        return torch.empty((M, N), device=A.device, dtype=out_dtype)
+    if out.shape != (M, N):
+        raise ValueError(
+            f"{op_name} output must have shape {(M, N)}, got {tuple(out.shape)}"
+        )
+    if out.dtype != out_dtype:
+        raise TypeError(f"{op_name} output dtype must be {out_dtype}, got {out.dtype}")
+    if out.device != A.device:
+        raise ValueError(f"{op_name} output must be on {A.device}, got {out.device}")
+    if out.stride(-1) != 1:
+        raise ValueError(f"{op_name} output must be contiguous in the last dimension")
+    return out
 
 
 def _use_warp_reduce_smallm(M: int, _N: int, K: int) -> bool:
@@ -1142,6 +1165,7 @@ def gluon_mm_a16w16_warp_reduce_smallm_gfx950(
     out_dtype: torch.dtype,
     *,
     alpha: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute small-M dense ``A @ B.T`` with one warp per output.
 
@@ -1180,7 +1204,7 @@ def gluon_mm_a16w16_warp_reduce_smallm_gfx950(
         )
     _check_supported_dense16_shape(M, N, K)
 
-    C = torch.empty((M, N), device=A.device, dtype=out_dtype)
+    C = _resolve_output(A, M, N, out_dtype, out, "small-M dense16 warp-reduce GEMM")
     total_outputs = M * N
     grid = (triton.cdiv(total_outputs, WARP_REDUCE_OUTPUTS),)
     _warp_reduce_smallm_kernel[grid](
@@ -1202,7 +1226,7 @@ def gluon_mm_a16w16_warp_reduce_smallm_gfx950(
     )
 
     if alpha is not None:
-        C = C * alpha.to(dtype=C.dtype)
+        C.mul_(alpha.to(device=C.device, dtype=C.dtype))
     return C
 
 
@@ -1212,6 +1236,7 @@ def gluon_mm_a16w16_mfma_lds_smallm_gfx950(
     out_dtype: torch.dtype,
     *,
     alpha: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute high-K small-M dense ``A @ B.T`` with MFMA and partial-sum reduction.
 
@@ -1224,8 +1249,7 @@ def gluon_mm_a16w16_mfma_lds_smallm_gfx950(
     """
     if A.ndim != 2 or B.ndim != 2:
         raise ValueError(
-            "small-M dense16 MFMA LDS GEMM expects 2D inputs, got "
-            f"{A.ndim=} {B.ndim=}"
+            f"small-M dense16 MFMA LDS GEMM expects 2D inputs, got {A.ndim=} {B.ndim=}"
         )
     if A.dtype not in _SUPPORTED_DTYPES or B.dtype not in _SUPPORTED_DTYPES:
         raise TypeError(
@@ -1261,8 +1285,13 @@ def gluon_mm_a16w16_mfma_lds_smallm_gfx950(
             f"got M={M}, N={N}, K={K}"
         )
 
-    C_full = torch.empty((MFMA_LDS_REDUCE_M, N), device=A.device, dtype=out_dtype)
-    C = C_full[:M, :]
+    if out is not None:
+        _resolve_output(A, M, N, out_dtype, out, "small-M dense16 MFMA LDS GEMM")
+    if out is not None and M == MFMA_LDS_REDUCE_M:
+        C = out
+    else:
+        C_full = torch.empty((MFMA_LDS_REDUCE_M, N), device=A.device, dtype=out_dtype)
+        C = C_full[:M, :]
     split_k = _choose_mfma_lds_split_k(K)
     num_n_tiles = triton.cdiv(N, MFMA_LDS_BLOCK_N)
     total_work = num_n_tiles * split_k
@@ -1310,7 +1339,10 @@ def gluon_mm_a16w16_mfma_lds_smallm_gfx950(
     )
 
     if alpha is not None:
-        C = C * alpha.to(dtype=C.dtype)
+        C.mul_(alpha.to(device=C.device, dtype=C.dtype))
+    if out is not None and C is not out:
+        out.copy_(C)
+        return out
     return C
 
 
@@ -1320,6 +1352,7 @@ def gluon_mm_a16w16_mfma_lds_mediumm_gfx950(
     out_dtype: torch.dtype,
     *,
     alpha: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute tuned medium-M dense ``A @ B.T`` with MFMA/LDS tiling.
 
@@ -1364,7 +1397,7 @@ def gluon_mm_a16w16_mfma_lds_mediumm_gfx950(
         )
 
     block_m, block_n, block_k, warps_m, warps_n, num_buffers = config
-    C = torch.empty((M, N), device=A.device, dtype=out_dtype)
+    C = _resolve_output(A, M, N, out_dtype, out, "medium-M dense16 MFMA LDS GEMM")
     grid = (triton.cdiv(M, block_m) * triton.cdiv(N, block_n),)
     _mfma_lds_mediumm_kernel[grid](
         A,
@@ -1391,7 +1424,7 @@ def gluon_mm_a16w16_mfma_lds_mediumm_gfx950(
     )
 
     if alpha is not None:
-        C = C * alpha.to(dtype=C.dtype)
+        C.mul_(alpha.to(device=C.device, dtype=C.dtype))
     return C
 
 
@@ -1401,6 +1434,7 @@ def gluon_mm_a16w16_gfx950(
     out_dtype: torch.dtype,
     *,
     alpha: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """Compute dense16 GEMM ``A @ B.T`` on gfx950 when supported.
 
@@ -1444,6 +1478,7 @@ def gluon_mm_a16w16_gfx950(
             B,
             out_dtype,
             alpha=alpha,
+            out=out,
         )
     if M > MAX_M:
         return None
@@ -1454,6 +1489,7 @@ def gluon_mm_a16w16_gfx950(
             B,
             out_dtype,
             alpha=alpha,
+            out=out,
         )
     if _use_mfma_lds_smallm(M, N, K):
         return gluon_mm_a16w16_mfma_lds_smallm_gfx950(
@@ -1461,6 +1497,7 @@ def gluon_mm_a16w16_gfx950(
             B,
             out_dtype,
             alpha=alpha,
+            out=out,
         )
     if _use_mfma_lds_mediumm(M, N, K):
         return gluon_mm_a16w16_mfma_lds_mediumm_gfx950(
@@ -1468,5 +1505,6 @@ def gluon_mm_a16w16_gfx950(
             B,
             out_dtype,
             alpha=alpha,
+            out=out,
         )
     return None

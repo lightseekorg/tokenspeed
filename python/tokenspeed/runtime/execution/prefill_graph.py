@@ -303,6 +303,15 @@ class PrefillGraph:
         )
         captured_ok = True
         try:
+            # Seam: backends alloc static buffers or refuse capture; kept outside inference mode (in-place refresh).
+            init_pfg_state = getattr(
+                self.attn_backend, "init_prefill_graph_state", None
+            )
+            if init_pfg_state is not None:
+                init_pfg_state(
+                    max_num_tokens=max(self.capture_buckets),
+                    max_bs=int(self.req_to_page.shape[0]),
+                )
             with maybe_inference_mode():
                 self._capture_all_buckets(decode_wrapper)
         except torch.cuda.OutOfMemoryError:
@@ -397,6 +406,29 @@ class PrefillGraph:
         if num_tokens < bucket:
             self._input_embeds_buf[num_tokens:bucket].zero_()
 
+    def _dummy_flat_tables(self, num_tokens: int) -> dict[str, "torch.Tensor"]:
+        """Dummy batch must carry flat tables (else the non-flat path gets captured); zeros = null block 0."""
+        backend = self.attn_backend
+        if not getattr(backend, "uses_flat_cache_groups", False):
+            return {}
+        # Composite wrappers (hybrid) hold the flat KV consumer as a child.
+        if not hasattr(backend, "page_size") and hasattr(backend, "full_attn_backend"):
+            backend = backend.full_attn_backend
+        # Full width: backends that derive the row stride from max_kv_len
+        # (trtllm) index the whole row even when the bucket is small.
+        width = getattr(backend, "max_num_pages", 0) or -(
+            -num_tokens // backend.page_size
+        )
+        # ALL groups, state included: hybrid wrappers forward the dict to the
+        # mamba child, which requires its state group; KV children shed state
+        # groups themselves (_shed_state_groups).
+        return {
+            str(spec.group_id): torch.zeros(
+                (1, width), dtype=torch.int32, device=self.config.device
+            )
+            for spec in getattr(self.token_to_kv_pool, "paged_cache_group_specs", ())
+        }
+
     def _make_dummy_batch(
         self, num_tokens: int, decode_wrapper: CudaGraphWrapper | None
     ) -> ForwardContext:
@@ -455,6 +487,9 @@ class PrefillGraph:
                 extra_metadata_kwargs["paged_cache_block_tables"] = tables
             extra_metadata_kwargs["num_tokens"] = num_tokens
             extra_metadata_kwargs["positions"] = ib.positions_buf[:num_tokens]
+        flat_tables = self._dummy_flat_tables(num_tokens)
+        if flat_tables:
+            extra_metadata_kwargs["flat_block_tables"] = flat_tables
         self.attn_backend.init_forward_metadata(
             bs=1,
             num_extends=1,
@@ -535,8 +570,17 @@ class PrefillGraph:
             input_embeds if input_embeds is not None else self._embed_tokens(input_ids),
             bucket,
         )
+        # Re-pad tail rows: they hold the previous forward's residue, which captured kernels consume.
+        if num_tokens < bucket:
+            ib = self.input_buffers
+            ib.input_ids_buf[num_tokens:bucket].fill_(1)
+            ib.out_cache_loc_buf[num_tokens:bucket].fill_(ib.dummy_kv_slot)
+            if self.config.model_is_mrope:
+                ib.mrope_positions_buf[:, num_tokens:bucket].zero_()
+            else:
+                ib.positions_buf[num_tokens:bucket].zero_()
         with self._padded_to(ctx, bucket):
-            self._captures[bucket].replay()
+            self._captures[bucket].replay(valid_rows=num_tokens)
         hidden_states, aux_hidden_states = self._outputs[bucket].sliced(num_tokens)
         # The eager logits tail of BaseCausalLM.forward, on the replayed hidden states.
         logits_metadata = LogitsMetadata.from_forward_context(ctx)
@@ -619,7 +663,8 @@ class PrefillGraph:
 
         The graph replays over ``bucket`` (padded) tokens; attention metadata stays
         at the real count (set upstream), so the eager attention break only touches
-        real tokens and the padded rows produce discarded garbage. Pin
+        real tokens; eager-break handoffs clear the padded rows before the
+        following graph segment consumes them. Pin
         ``input_num_tokens`` to the bucket and, under DP, ``global_num_tokens`` /
         ``global_bs`` to the captured uniform layout so any live read during the
         break matches the baked EP shapes. The break reads ``forward_mode`` / ``bs``

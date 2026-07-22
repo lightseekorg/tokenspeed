@@ -86,6 +86,9 @@ Scheduler::Scheduler(SchedulerConfig config)
     if (config_.overlap_schedule_depth > 0 && config_.decode_input_tokens == 0) {
         throw std::invalid_argument("Scheduler: overlapped decode requires decode_input_tokens > 0");
     }
+#if !TOKENSPEED_FLAT_KVCACHE
+    radix_page_table_emissions_.resize(static_cast<std::size_t>(config_.max_batch_size) + 1);
+#endif
     if (auto* env = std::getenv("SPDLOG_LEVEL")) {
         std::string level_str{env};
         spdlog::level::level_enum level = spdlog::level::from_str(level_str);
@@ -260,10 +263,14 @@ std::size_t Scheduler::AvailableKvPages() const {
 }
 
 std::size_t Scheduler::ActiveKvPages() const {
+    // Distinct pages pinned by running requests, in the same units as AvailableKvPages():
+    // flat pool ids across ALL groups (a group-0 sample here understated the ratio that
+    // Python monitoring derives against the whole pool), radix device pages otherwise.
+    // The set dedups pages shared between requests via prefix hits.
     std::unordered_set<std::int32_t> active_pages;
     for (const auto& [_, req] : requests_) {
         if (req->Is<fsm::Prefilling>() || req->Is<fsm::PrefillDone>() || req->Is<fsm::Decoding>()) {
-            for (std::int32_t page : req->GetOccupiedPages()) {
+            for (std::int32_t page : req->GetOccupiedPagesAllGroups()) {
                 active_pages.insert(page);
             }
         }

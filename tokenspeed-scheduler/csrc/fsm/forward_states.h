@@ -175,12 +175,32 @@ struct ForwardState : public BaseState {
     std::int32_t GetReqPoolIndex() const { return req_pool_index_ ? req_pool_index_->slot_ : -1; }
 
     // Flat: group-0 SAMPLE (ids -- and with per-group block sizes, counts -- differ per group);
-    // feeds one-group stats and the radix-era req_to_page fallback, never cross-group accounting.
+    // feeds one-group stats and the radix-era req_to_page fallback, never cross-group accounting
+    // (that is GetOccupiedPagesAllGroups).
     std::vector<std::int32_t> GetOccupiedPages() const {
         if (!block_tables_.empty()) {
             return BlockTablePageIds(block_tables_[0]);  // flat: first-group sample (see above)
         }
         return GetPageContainer().Pages();  // radix
+    }
+
+    // Flat: real pages of EVERY group's block table (null holes excluded — block 0 is the
+    // never-allocated punch placeholder, not occupancy). Block ids are pool-wide and each id
+    // is owned by one group, so concatenation has no cross-group duplicates. This is the
+    // pool-wide occupancy counterpart of the group-0 sample above.
+    std::vector<std::int32_t> GetOccupiedPagesAllGroups() const {
+        if (block_tables_.empty()) {
+            return GetPageContainer().Pages();  // radix
+        }
+        std::vector<std::int32_t> ids;
+        for (const BlockTable& table : block_tables_) {
+            for (CacheBlock* b : table.Blocks()) {
+                if (!b->IsNull()) {
+                    ids.push_back(b->BlockId());
+                }
+            }
+        }
+        return ids;
     }
 
     std::vector<std::int32_t> GetLocalAllocatorPages() const {

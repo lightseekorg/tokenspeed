@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <array>
 #include <map>
 #include <string>
 #include <utility>
@@ -37,9 +38,11 @@ struct ForwardOperationBase {
     std::int32_t input_length;
     // All pages currently occupied by this request (existing + newly allocated).
     std::vector<int32_t> occupied_pages;
-    // Index into occupied_pages where newly allocated pages begin.
+    // Index into occupied_pages where the emitted page-table refresh begins.
+    // On the radix path this may precede newly allocated pages when publishing
+    // canonicalizes a duplicate physical page.
     std::int32_t begin;
-    // Number of newly allocated pages (starting at occupied_pages[begin]).
+    // Number of page-table entries to refresh from occupied_pages[begin].
     std::int32_t size;
 
     std::int32_t prefill_length;
@@ -119,6 +122,11 @@ struct FlatForwardOperation {
     // [num_reqs, max_pages_in_batch] padded with -1. Each row is absolute
     // (null hole = 0, no compaction); there is no base-offset companion.
     std::map<std::string, std::vector<std::vector<std::int32_t>>> flat_block_tables;
+    // Contiguous row-major copy of flat_block_tables ([rows * cols], -1
+    // padded), exposed zero-copy to Python as a 2-D ndarray -- the nested
+    // vectors above cost one PyLong per page id at every attribute access.
+    std::map<std::string, std::vector<std::int32_t>> flat_block_tables_contig;
+    std::map<std::string, std::array<std::size_t, 2>> flat_block_tables_dims;
 
     explicit FlatForwardOperation(std::vector<ForwardOperation> ops) {
         std::stable_partition(ops.begin(), ops.end(),
@@ -187,6 +195,16 @@ struct FlatForwardOperation {
         }
         padRectangularMinusOne(paged_cache_block_tables);
         padRectangularMinusOne(flat_block_tables);
+        for (auto& [gid, table] : flat_block_tables) {
+            const std::size_t rows = table.size();
+            const std::size_t cols = rows ? table.front().size() : 0;
+            auto& buf = flat_block_tables_contig[gid];
+            buf.reserve(rows * cols);
+            for (const auto& row : table) {
+                buf.insert(buf.end(), row.begin(), row.end());
+            }
+            flat_block_tables_dims[gid] = {rows, cols};
+        }
     }
 
     bool empty() const { return request_ids.empty(); }

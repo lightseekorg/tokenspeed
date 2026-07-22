@@ -34,6 +34,7 @@ from tokenspeed_kernel_amd.ops.attention.gluon.utils import (
     attention_layouts,
     max,
     maximum,
+    select_kv_splits,
 )
 
 cdna4 = gl.amd.cdna4
@@ -720,44 +721,6 @@ def _mha_decode_reduce(
     cdna4.buffer_store(output, out_ptr, out_base + offs_d)
 
 
-def _select_num_kv_splits(
-    *,
-    batch: int,
-    num_kv_heads: int,
-    num_groups: int,
-    num_pages: int,
-    sm_count: int,
-) -> int:
-    """Pick num_kv_splits to balance occupancy against reduce overhead.
-
-    The launch grid is (batch * num_kv_heads * num_groups) * num_kv_splits
-    work-groups. Too few splits under-fill the machine at low batch; too many
-    leave each split with a handful of pages, so the reduce kernel dominates.
-
-    Return the smaller of two candidate counts: splits_for_occupancy (enough to
-    fill ~wave_target waves of CUs) and splits_for_pages (~min_pages_per_split
-    pages per split), with the pages candidate clamped to [min_page_splits,
-    max_page_splits] so a short context still splits without launching empty work
-    and a long one does not over-split where reduce cost outgrows the decode win.
-    """
-    wave_target = 2
-    min_pages_per_split = 2
-    min_page_splits = 8
-    max_page_splits = 32
-
-    base_ctas = batch * num_kv_heads * num_groups
-    target_ctas = sm_count * wave_target
-    splits_for_occupancy = (target_ctas + base_ctas - 1) // base_ctas
-
-    splits_for_pages = num_pages // min_pages_per_split
-    min_page_splits = min(min_page_splits, num_pages)
-    if splits_for_pages < min_page_splits:
-        splits_for_pages = min_page_splits
-    if splits_for_pages > max_page_splits:
-        splits_for_pages = max_page_splits
-    return min(splits_for_occupancy, splits_for_pages)
-
-
 class LaunchConfig(NamedTuple):
     num_q_heads: int
     num_kv_heads: int
@@ -778,6 +741,7 @@ def get_config(
     k_cache: torch.Tensor,
     max_seqlen_k: int,
     window_left: int,
+    softmax_scale: float | None,
 ) -> LaunchConfig:
     head_dim = q.shape[2]
     page_size = k_cache.shape[1]
@@ -787,13 +751,12 @@ def get_config(
     num_groups = math.ceil(group_size / block_m)
     is_sliding = window_left >= 0
     window_left = window_left if is_sliding else -1
-    sm_scale = 1.0 / math.sqrt(head_dim)
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(head_dim)
     effective_seqlen_k = min(max_seqlen_k, window_left) if is_sliding else max_seqlen_k
     num_pages = (effective_seqlen_k + page_size - 1) // page_size
-    num_kv_splits = _select_num_kv_splits(
-        batch=q.shape[0],
-        num_kv_heads=k_cache.shape[2],
-        num_groups=num_groups,
+    num_kv_splits = select_kv_splits(
+        base_ctas=q.shape[0] * k_cache.shape[2] * num_groups,
         num_pages=num_pages,
         sm_count=_GFX950_SM_COUNT,
     )
@@ -806,7 +769,7 @@ def get_config(
         num_kv_splits=num_kv_splits,
         block_m=block_m,
         block_n=block_n,
-        sm_scale=sm_scale * _INV_LN2_VALUE,
+        sm_scale=softmax_scale * _INV_LN2_VALUE,
         is_sliding=is_sliding,
         window_left=window_left,
     )
@@ -824,6 +787,10 @@ def gluon_mha_decode_gfx950(
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
     return_lse: bool = False,
+    softmax_scale: float | None = None,
+    q_scale: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     total_q = q.shape[0]
 
@@ -834,6 +801,7 @@ def gluon_mha_decode_gfx950(
         k_cache=k_cache,
         max_seqlen_k=max_seqlen_k,
         window_left=window_left,
+        softmax_scale=softmax_scale,
     )
 
     is_fp8 = q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)

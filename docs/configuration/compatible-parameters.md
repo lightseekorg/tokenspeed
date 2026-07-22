@@ -38,6 +38,7 @@ TokenSpeed-specific behavior explicitly.
 | `--max-cudagraph-capture-size` | Largest CUDA graph capture size. |
 | `--tensor-parallel-size`, `--tp` | Set attention tensor parallel size. |
 | `--data-parallel-size` | Data parallel size. |
+| `--mm-encoder-tp-mode` | Select multimodal encoder weight TP (`weights`) or item data parallelism (`data`). |
 | `--enable-expert-parallel` | Enable expert parallelism. |
 | `--speculative-config` | JSON speculative decoding config. |
 | `--kv-events-config` | JSON KV cache event publisher config; the vLLM-style `enable_kv_cache_events` field is accepted and defaults to ZMQ when enabled. |

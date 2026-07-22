@@ -63,10 +63,15 @@ logger = get_colorful_logger(__name__)
 
 
 _is_capture_mode = False
+_is_cuda_graph_phase = False
 
 
 def get_is_capture_mode() -> bool:
     return _is_capture_mode
+
+
+def get_is_cuda_graph_phase() -> bool:
+    return _is_cuda_graph_phase
 
 
 def _should_update_mamba_state_after_mtp_verify(
@@ -247,6 +252,14 @@ class CudaGraphWrapper:
                 max_tokens_per_req=self.max_tokens_per_req,
                 overlap_schedule_depth=self.overlap_schedule_depth,
             )
+            # Drafter reads the TARGET's flat tables (_draft_flat_tables):
+            # its page-size view must match the target's hetero geometry.
+            target_ps = getattr(attn_backend, "flat_group_page_sizes", None)
+            draft_ps = getattr(draft_attn_backend, "flat_group_page_sizes", None)
+            if target_ps and draft_ps is not None:
+                for gid in self._draft_flat_group_ids():
+                    if gid in target_ps:
+                        draft_ps[gid] = target_ps[gid]
 
             # Drafter (Eagle) is constructed with the target's req_to_page
             # (ModelExecutor passes the same self.req_to_page to both), and the
@@ -447,6 +460,9 @@ class CudaGraphWrapper:
                 )
             return self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
 
+        global _is_cuda_graph_phase
+        _is_cuda_graph_phase = True
+
         # Warm up before capture.
         for _ in range(4):
             torch.cuda.synchronize()
@@ -488,6 +504,7 @@ class CudaGraphWrapper:
         torch.cuda.synchronize()
         dist.barrier()
         _is_capture_mode = False
+        _is_cuda_graph_phase = False
 
         # Graph capture records the hostfunc launches without invoking
         # them, so the dummy run_once pushed stays queued — drain it, and
@@ -502,6 +519,7 @@ class CudaGraphWrapper:
             self.capturable_grammar.reset_state()
 
         global_graph_memory_pool = graph.pool()
+
         return graph, out
 
     def _capture_paged_cache_block_tables(self, bs: int, pool) -> dict | None:
@@ -536,13 +554,28 @@ class CudaGraphWrapper:
         return tuple(str(spec.group_id) for spec in pool.paged_cache_group_specs)
 
     def _draft_flat_group_ids(self) -> tuple[str, ...]:
-        """The draft head shares the target full-attention group's page ids
-        (EAGLE writes its own pool tensors at the same indices), so the
-        drafter consumes exactly that group's table on the flat path."""
+        """Per-group flat page tables the drafter consumes.
+
+        The draft head shares the TARGET's page-id space (EAGLE writes its
+        own pool tensors at the same indices), so each draft group consumes
+        the target table of the SAME group id. A draft pool that publishes
+        its own specs (Inkling MTP: mixed full/SWA depths) names exactly the
+        groups its layers carry — all of which exist in the target's table
+        set by construction (same label vocabulary, same window). Older
+        draft paths without a separate pool keep the full-history fallback.
+        """
         if self.draft_attn_backend is None or not getattr(
             self.draft_attn_backend, "uses_flat_cache_groups", False
         ):
             return ()
+        if self.draft_token_to_kv_pool is not None and getattr(
+            self.draft_token_to_kv_pool, "paged_cache_group_specs", ()
+        ):
+            return tuple(
+                str(spec.group_id)
+                for spec in self.draft_token_to_kv_pool.paged_cache_group_specs
+                if spec.family != "state"
+            )
         return tuple(
             str(spec.group_id)
             for spec in self.token_to_kv_pool.paged_cache_group_specs
@@ -741,12 +774,16 @@ class CudaGraphWrapper:
                 ),
                 int(req_pool_indices.shape[0]),
             )
-            kwargs["flat_block_tables"] = self._pad_block_tables_to_padded_bs(
-                flat_block_tables,
-                actual_bs=flat_table_bs,
-                padded_bs=padded_bs,
-                pad_value=0,
-            )
+            if getattr(self.attn_backend, "flat_tables_self_padding", False):
+                # Backend pads dummy rows itself; F.pad would reallocate tables and break storage sharing.
+                kwargs["flat_block_tables"] = flat_block_tables
+            else:
+                kwargs["flat_block_tables"] = self._pad_block_tables_to_padded_bs(
+                    flat_block_tables,
+                    actual_bs=flat_table_bs,
+                    padded_bs=padded_bs,
+                    pad_value=0,
+                )
         if self.attn_backend.uses_padded_decode_token_mask:
             kwargs["actual_bs"] = actual_bs
         if target_uses_paged_groups and getattr(self, "drafter", None) is not None:
@@ -842,7 +879,7 @@ class CudaGraphWrapper:
                 draft_prefill_seq_lens = (
                     seq_lens if self.use_v4_mtp_paged_metadata else draft_seq_lens
                 )
-                # Drafter consumes only the full group's table (see _draft_flat_tables).
+                # Drafter consumes its own groups' tables (see _draft_flat_tables).
                 draft_extend_kwargs = (
                     {**kwargs, "flat_block_tables": draft_flat}
                     if kwargs.get("flat_block_tables") is not None
@@ -868,6 +905,10 @@ class CudaGraphWrapper:
                         **draft_kwargs,
                     )
             else:
+                from tokenspeed.runtime.execution.drafter.dflash import DFlash
+
+                if isinstance(self.drafter, DFlash):
+                    return
                 draft_metadata_seq_lens = (
                     seq_lens if self.use_v4_mtp_paged_metadata else draft_seq_lens
                 )
@@ -971,7 +1012,6 @@ class CudaGraphWrapper:
         mamba_cow_src_indices: torch.Tensor | None = None,
         mamba_branching_seqlens: torch.Tensor | None = None,
         mamba_track_pool_indices: torch.Tensor | None = None,
-        spec_info=None,
         paged_cache_block_tables: dict | None = None,
         paged_cache_block_table_base_offsets: dict | None = None,
         flat_block_tables: dict | None = None,
@@ -1135,7 +1175,6 @@ class CudaGraphWrapper:
                 global_num_tokens=ctx.global_num_tokens,
                 all_decode_or_idle=ctx.all_decode_or_idle,
                 capture_hidden_mode=ctx.capture_hidden_mode,
-                spec_info=spec_info,
                 **metadata_num_tokens,
                 paged_cache_block_tables=(
                     paged_cache_block_tables

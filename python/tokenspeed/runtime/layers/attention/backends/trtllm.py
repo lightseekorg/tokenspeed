@@ -41,6 +41,9 @@ from tokenspeed_kernel.ops.kvcache.triton import (
 )
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
+from tokenspeed.runtime.execution.breakable_cuda_graph import (
+    is_breakable_capture_active,
+)
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.backends.flat_groups import (
@@ -114,6 +117,12 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
     def support_kv_cache_prewrite(
         self, forward_mode: ForwardMode | None = None
     ) -> bool:
+        # Under a breakable prefill-graph capture the prewrite would bake this
+        # forward's write locations into the graph (stale on every replay;
+        # dummy-page locs on the flat path) -- bake the non-prewrite branch
+        # instead: the eager attention break writes KV from fresh metadata.
+        if is_breakable_capture_active():
+            return False
         return True
 
     def _prewrite_metadata(self, forward_mode):
@@ -258,6 +267,7 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
     def _save_kv_and_prepare_q(
         self, q, k, v, layer, out_cache_loc, token_to_kv_pool, save_kv_cache
     ):
+        k, v = self._trim_kv_to_locs(out_cache_loc, k, v)
         if self._should_use_fused_fp8_path(save_kv_cache, k):
             k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
             fused_fp8_set_kv_buffer(
@@ -397,7 +407,6 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         extend_prefix_lens: torch.Tensor | None = None,
         extend_prefix_lens_cpu: torch.Tensor | None = None,
         extend_seq_lens_cpu: torch.Tensor | None = None,
-        spec_info=None,
         use_cuda_graph: bool = False,
         flat_block_tables: dict[str, torch.Tensor] | None = None,
         **kwargs,
@@ -775,8 +784,8 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                 f"trtllm CUDA graph capture not supported for {forward_mode}"
             )
 
-        # Real tables only arrive at replay: capture lazily allocates
-        # persistent per-group buffers and records metadata views into them.
+        # Real tables only arrive at replay; capture records metadata views
+        # into the persistent per-group buffers.
         if flat_cache_group_ids:
             # Verify keeps [bs]-row tables + [bs*N] loc views. TODO(flat+dflash).
             assert not (

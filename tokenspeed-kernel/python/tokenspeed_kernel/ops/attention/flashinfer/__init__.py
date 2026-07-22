@@ -166,7 +166,13 @@ if platform.is_nvidia and platform.is_hopper_plus:
         logit_cap: float = 0.0,
         sinks: torch.Tensor | None = None,
         return_lse: bool = False,
+        softmax_scale: float | None = None,
+        q_scale: torch.Tensor | None = None,
+        k_scale: torch.Tensor | None = None,
+        v_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if softmax_scale is None:
+            softmax_scale = 1.0 / math.sqrt(q.shape[-1])
         global _workspace_buffer
         if _workspace_buffer is None:
             _workspace_buffer = torch.zeros(
@@ -189,14 +195,14 @@ if platform.is_nvidia and platform.is_hopper_plus:
             seq_lens=cache_seqlens,
             max_q_len=max_seqlen_q,
             max_kv_len=max_seqlen_k,
-            bmm1_scale=1.0 / math.sqrt(q.shape[-1]),
+            bmm1_scale=softmax_scale,
             bmm2_scale=1.0,
             batch_size=cache_seqlens.shape[0],
             cum_seq_lens_q=cu_seqlens_q,
             cum_seq_lens_kv=cu_seqlens_kv,
             window_left=window_left,
             sinks=sinks,
-            out_dtype=q.dtype,
+            out_dtype=(torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype),
             causal=is_causal,
         )
 
@@ -234,7 +240,13 @@ if platform.is_nvidia and platform.is_hopper_plus:
         logit_cap: float = 0.0,
         sinks: torch.Tensor | None = None,
         return_lse: bool = False,
+        softmax_scale: float | None = None,
+        q_scale: torch.Tensor | None = None,
+        k_scale: torch.Tensor | None = None,
+        v_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if softmax_scale is None:
+            softmax_scale = 1.0 / math.sqrt(q.shape[-1])
         global _workspace_buffer
         if _workspace_buffer is None:
             _workspace_buffer = torch.zeros(
@@ -257,11 +269,11 @@ if platform.is_nvidia and platform.is_hopper_plus:
             block_tables=page_table,
             seq_lens=cache_seqlens,
             max_seq_len=max_seqlen_k,
-            bmm1_scale=1.0 / math.sqrt(q.shape[-1]),
+            bmm1_scale=softmax_scale,
             bmm2_scale=1.0,
             window_left=window_left,
             sinks=sinks,
-            out_dtype=q.dtype,
+            out_dtype=(torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype),
             q_len_per_req=max_seqlen_q,
         )
 

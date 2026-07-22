@@ -40,6 +40,7 @@ DEFAULT_PRIORITY = "normal"
 SUPPORTED_RUNNER_GROUPS = ("all", "amd", "nvidia", "nvidia-arm", "nvidia-x86")
 _PRIORITY_ORDER = {value: index for index, value in enumerate(SUPPORTED_PRIORITIES)}
 B200_RUNNER_LABEL_ENV = "TOKENSPEED_B200_RUNNER_LABEL"
+EXCLUDED_RUNNER_LABELS_ENV = "TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS"
 STALE_PROCESS_PATTERNS = [
     r"ts serve",
     r"python.*-m\s+smg(\s|\.launch|$)",
@@ -218,6 +219,19 @@ def get_b200_runner_label_override() -> str:
     return os.environ.get(B200_RUNNER_LABEL_ENV, "").strip()
 
 
+def get_excluded_runner_labels() -> List[str]:
+    return [
+        term.strip().lower()
+        for term in os.environ.get(EXCLUDED_RUNNER_LABELS_ENV, "").split(",")
+        if term.strip()
+    ]
+
+
+def runner_is_excluded(runner: str, excluded_labels: Iterable[str]) -> bool:
+    normalized_runner = runner.lower()
+    return any(label in normalized_runner for label in excluded_labels)
+
+
 def resolve_runner_label(label: str) -> str:
     override = get_b200_runner_label_override()
     if not override:
@@ -273,6 +287,7 @@ def build_matrix(
     runner_group: str = "all",
 ) -> Dict[str, Any]:
     include = []
+    excluded_runner_labels = get_excluded_runner_labels()
     for path in find_task_files(root):
         task = normalize_task(path, repo_root)
         if trigger and trigger not in task["triggers"]:
@@ -286,6 +301,8 @@ def build_matrix(
             effective = resolve_priority_for_label(priority, label)
             is_optional = resolve_optional_for_label(optional, label)
             runner = resolve_runner_label(label)
+            if runner_is_excluded(runner, excluded_runner_labels):
+                continue
             if not runner_matches_group(runner, runner_group):
                 continue
             include.append(

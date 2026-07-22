@@ -113,6 +113,54 @@ def triton_fp8_moe_weights(plan: dict, w: torch.nn.Module):
     w13_scale = _scale_attr(w, "w13_weight")
     w2_scale = _scale_attr(w, "w2_weight")
 
+    if tuple(w.quant_config.weight_block_size) == (1, 32):
+        if w13_scale.dtype != torch.uint8 or w2_scale.dtype != torch.uint8:
+            raise RuntimeError("MXFP8 (1, 32) MoE scales must use UE8M0 uint8")
+
+        if w.w13_input_layout == "concatenated":
+            num_experts, two_intermediate, hidden_size = w.w13_weight.shape
+            intermediate = two_intermediate // 2
+            w13_weight = (
+                w.w13_weight.view(num_experts, 2, intermediate, hidden_size)
+                .transpose(1, 2)
+                .reshape(num_experts, two_intermediate, hidden_size)
+            )
+            num_scale_groups = w13_scale.shape[-1]
+            w13_scale = (
+                w13_scale.view(num_experts, 2, intermediate, num_scale_groups)
+                .transpose(1, 2)
+                .reshape(num_experts, two_intermediate, num_scale_groups)
+            )
+        elif w.w13_input_layout == "interleaved":
+            w13_weight = w.w13_weight
+        else:
+            raise RuntimeError(f"Unsupported w13 layout: {w.w13_input_layout!r}")
+
+        w.w13_weight_triton_tensor = w13_weight.transpose(-2, -1)
+        w.w2_weight_triton_tensor = w.w2_weight.transpose(-2, -1)
+        w.w13_precision_config = PrecisionConfig(
+            flex_ctx=FlexCtx(
+                rhs_data=InFlexData(dtype=current_platform().fp8e4m3fn.dtype)
+            ),
+            b_mx_scale=w13_scale.transpose(-2, -1),
+            b_microblock_size=32,
+            out_dtype=torch.bfloat16,
+        )
+        w.w2_precision_config = PrecisionConfig(
+            flex_ctx=FlexCtx(
+                rhs_data=InFlexData(dtype=current_platform().fp8e4m3fn.dtype)
+            ),
+            b_mx_scale=w2_scale.transpose(-2, -1),
+            b_microblock_size=32,
+            out_dtype=torch.bfloat16,
+        )
+
+        _release_parameter(w, "w13_weight")
+        _release_parameter(w, "w2_weight")
+        _release_parameter(w, "w13_weight_scale_inv")
+        _release_parameter(w, "w2_weight_scale_inv")
+        return
+
     w13_weight, w13_mx_scale = _downcast_block_fp8_weight_to_mxfp8(
         w.w13_weight,
         w13_scale,
@@ -146,6 +194,32 @@ def triton_fp8_moe_weights(plan: dict, w: torch.nn.Module):
     torch.cuda.empty_cache()
 
 
+@register_kernel(
+    "moe",
+    "apply",
+    name="triton_mxfp8_precomputed_moe_apply",
+    solution="triton",
+    weight_preprocessor=triton_fp8_moe_weights,
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+    signatures=format_signatures(
+        "x",
+        "dense",
+        {torch.float16, torch.bfloat16},
+    ),
+    traits={
+        "weight_dtype": frozenset({"fp8"}),
+        "activation": frozenset({"swiglu"}),
+        "routing_mode": frozenset({"precomputed_topk"}),
+        "supports_deferred_finalize": frozenset({False}),
+        "supports_ep": frozenset({False}),
+        "supports_all_to_all_ep": frozenset({False}),
+        "ispp_alignment": frozenset({1}),
+        "internal_activation_dtype": frozenset({"input"}),
+        "fp8_scale_block_shape": frozenset({(1, 32)}),
+        "supports_bias": frozenset({False}),
+    },
+    priority=Priority.PORTABLE,
+)
 @register_kernel(
     "moe",
     "apply",

@@ -1,3 +1,23 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
 from __future__ import annotations
 
 import pytest
@@ -73,6 +93,39 @@ def test_dense16_kernel_variant_correctness(
     out = kernel(a, b, dtype)
     assert out is not None
 
+    torch.testing.assert_close(out, torch.mm(a, b.T), atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("kernel,shape", _CORRECTNESS_CASES)
+def test_dense16_kernel_variant_writes_strided_out(
+    kernel, shape: tuple[int, int, int]
+) -> None:
+    torch.manual_seed(0)
+    dtype = torch.bfloat16
+    m, n, k = shape
+    a = torch.randn((m, k), device="cuda", dtype=dtype) * 0.25
+    b = torch.randn((n, k), device="cuda", dtype=dtype) * 0.25
+    backing = torch.empty((m, n + 17), device="cuda", dtype=dtype)
+    out = backing[:, :n]
+
+    actual = kernel(a, b, dtype, out=out)
+
+    assert actual is out
+    torch.testing.assert_close(out, torch.mm(a, b.T), atol=1e-2, rtol=1e-2)
+
+
+def test_splitk_smallm_out_handles_padded_reducer_rows() -> None:
+    torch.manual_seed(0)
+    dtype = torch.bfloat16
+    m, n, k = 2, 256, 2048
+    a = torch.randn((m, k), device="cuda", dtype=dtype) * 0.25
+    b = torch.randn((n, k), device="cuda", dtype=dtype) * 0.25
+    backing = torch.empty((m, n + 17), device="cuda", dtype=dtype)
+    out = backing[:, :n]
+
+    actual = gluon_mm_a16w16_mfma_lds_smallm_gfx950(a, b, dtype, out=out)
+
+    assert actual is out
     torch.testing.assert_close(out, torch.mm(a, b.T), atol=1e-2, rtol=1e-2)
 
 

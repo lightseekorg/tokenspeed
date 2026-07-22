@@ -44,6 +44,7 @@ from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cuda_graph_wrapper import CudaGraphWrapper
 from tokenspeed.runtime.execution.drafter.dflash import DFlash
 from tokenspeed.runtime.execution.drafter.eagle import Eagle
+from tokenspeed.runtime.execution.drafter.mtp import Mtp
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
@@ -59,6 +60,7 @@ from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 from tokenspeed.runtime.layers.paged_attention import (
     validate_paged_cache_group_ids,
 )
+from tokenspeed.runtime.multimodal.inputs import resolve_mm_pad_substitute_ids
 from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 from tokenspeed.runtime.sampling.dp_sampling_config import (
     DpSamplingRuntimeLimits,
@@ -80,8 +82,23 @@ if TYPE_CHECKING:
 
 logger = get_colorful_logger(__name__)
 
-_DRAFTER_MAPPING = {"EAGLE3": Eagle, "MTP": Eagle, "DFLASH": DFlash}
 LOG_MM_TIMING = envs.TOKENSPEED_LOG_MM_TIMING.get()
+
+
+def _get_drafter_impl(spec_algo: str, model: torch.nn.Module):
+    from tokenspeed.runtime.models.inkling_nextn import (
+        InklingForConditionalGenerationNextN,
+    )
+
+    DRAFTER_MAPPING = {"EAGLE3": Eagle, "MTP": Eagle, "DFLASH": DFlash}
+
+    # "MTP" covers two algorithms:
+    # (1) Eagle-like MTP (e.g. DeepSeek) stays on Eagle in eagle.py;
+    # (2) Vanilla MTP (e.g. Inkling) with multi-layer weights stays on Mtp in mtp.py.
+    if spec_algo == "MTP" and isinstance(model, InklingForConditionalGenerationNextN):
+        return Mtp
+    else:
+        return DRAFTER_MAPPING[spec_algo]
 
 
 def _eagle_aux_layer_ids(hf_config) -> list[int] | None:
@@ -319,10 +336,20 @@ class ModelExecutor:
             device=self.device,
         )
         spec_num_tokens = config.spec_num_tokens if config.spec_algo is not None else 1
+        # Stride for indexing req_to_page when building drafter caller-side
+        # write locs. These locs are live on the radix arm only: on flat,
+        # every KV write (target and draft) takes the backend metadata's
+        # per-group out_cache_locs, and req_to_page is a verbatim mirror of
+        # the full-attention group's table kept for the non-flat fallbacks —
+        # the caller locs computed from it are never consumed there (the
+        # Inkling rel path asserts loc/row agreement).
+        self._draft_page_size = int(
+            getattr(draft_token_to_kv_pool, "page_size", 0) or config.block_size
+        )
         self.input_buffers = InputBuffers(
             max_bs=max_bs,
             max_num_tokens=config.chunked_prefill_size,
-            page_size=config.block_size,
+            page_size=self._draft_page_size,
             # token_to_kv_pool allocates size+page_size slots; index `size` is
             # the reserved dummy slot (see MHATokenToKVPool._create_buffers).
             dummy_kv_slot=0,
@@ -345,12 +372,12 @@ class ModelExecutor:
             self.device,
         )
         if self.config.spec_algo is not None:
-            DrafterImpl = _DRAFTER_MAPPING[config.spec_algo]
+            DrafterImpl = _get_drafter_impl(config.spec_algo, draft_model_runner.model)
             self.drafter = DrafterImpl(
                 spec_num_tokens=config.spec_num_tokens,
                 spec_num_steps=config.spec_num_steps,
                 draft_model_runner=draft_model_runner,
-                page_size=config.block_size,
+                page_size=self._draft_page_size,
                 runtime_states=self.runtime_states,
                 input_buffers=self.input_buffers,
                 req_to_page=self.req_to_page,
@@ -366,13 +393,11 @@ class ModelExecutor:
                 embed, head = self.model_runner.model.get_embed_and_head()
                 draft_model_runner.model.set_embed_and_head(embed, head)
             target_hf = self.model_runner.model_config.hf_config
-            mm_pad_substitute_id = getattr(
-                target_hf, "image_token_id", None
-            ) or getattr(target_hf, "media_placeholder_token_id", None)
-            if mm_pad_substitute_id is not None and hasattr(
-                self.drafter, "set_mm_pad_substitute_id"
+            mm_pad_substitute_ids = resolve_mm_pad_substitute_ids(target_hf)
+            if mm_pad_substitute_ids and hasattr(
+                self.drafter, "set_mm_pad_substitute_ids"
             ):
-                self.drafter.set_mm_pad_substitute_id(mm_pad_substitute_id)
+                self.drafter.set_mm_pad_substitute_ids(mm_pad_substitute_ids)
             if config.spec_algo in ("EAGLE3",) and hasattr(
                 self.model_runner.model, "set_eagle3_layers_to_capture"
             ):
@@ -387,8 +412,15 @@ class ModelExecutor:
                         "DFLASH requires the target model to support "
                         "set_dflash_layers_to_capture."
                     )
+                incr_callback = None
+                incr_slot_bufs = None
+                if getattr(self.drafter, "_incremental_proj_enabled", False):
+                    incr_callback = self.drafter._on_capture_slot_ready
+                    incr_slot_bufs = self.drafter._incr_slot_bufs
                 self.model_runner.model.set_dflash_layers_to_capture(
-                    self.drafter.target_layer_ids
+                    self.drafter.target_layer_ids,
+                    incremental_callback=incr_callback,
+                    slot_bufs=incr_slot_bufs,
                 )
         else:
             self.drafter = None
@@ -922,7 +954,23 @@ class ModelExecutor:
             )
             self.capturable_grammar.schedule_fill(input_ids_buf_slice=slice_)
 
+        if (
+            self.drafter is not None
+            and getattr(self.drafter, "_incremental_proj_enabled", False)
+            and ctx.num_extends == 0
+        ):
+            self.drafter._prepare_incremental_proj(
+                ctx.input_num_tokens,
+                self.input_buffers.positions_buf[: ctx.input_num_tokens],
+                self.input_buffers.out_cache_loc_buf[: ctx.input_num_tokens],
+            )
+
         logits_output = self._run_target_forward(bs, ctx, req_pool_indices)
+
+        if self.drafter is not None and getattr(
+            self.drafter, "_incremental_proj_enabled", False
+        ):
+            self.drafter.target_language_model.model._dflash_incr_active = False
 
         # Flag NaN per request and sanitize in place, before any sampling kernel.
         self.nan_guard.audit_logits(logits_output, ctx)

@@ -133,6 +133,17 @@ class ServerArgs:
     enable_cache_report: bool = False
     kv_events_config: str | None = None
 
+    # RL online weight sync (always on / ungated). NOTE: these endpoints can
+    # overwrite model weights, reload checkpoints from disk, and pause/abort
+    # serving, and are exposed on the public control port. See
+    # runtime/engine/weight_transfer/ and runtime/entrypoints/vllm_compat_http.py.
+    weight_transfer_config: str | None = None
+    # Port for the in-engine RL control-plane HTTP app (weight sync + pause/resume
+    # + memory occupation, both the native and SGLang-compatible dialects). Set by
+    # the ``ts serve`` orchestrator (allocated + proxied by the sidecar); None
+    # disables the in-engine app.
+    rl_control_port: int | None = None
+
     # Data parallelism
     data_parallel_size: int | None = None
     load_balance_method: str = "shortest_queue"
@@ -272,6 +283,7 @@ class ServerArgs:
 
     mla_chunk_multiplier: int = 4
     mm_attention_backend: str | None = None
+    mm_encoder_tp_mode: Literal["weights", "data"] = "weights"
 
     # For PD/EPD disaggregation: "null", "prefill", "decode", or "encode" (vision-tower-only).
     disaggregation_mode: str = "null"
@@ -481,6 +493,22 @@ class ServerArgs:
         )
         moe_dp_size = None
 
+        # The colocated multimodal encoder lives inside each attention TP
+        # group. ``weights`` preserves the legacy weight-TP layout; ``data``
+        # replicates the encoder weights and assigns whole multimodal items to
+        # the ranks in that group.
+        if self.mm_encoder_tp_mode not in ("weights", "data"):
+            raise ValueError(
+                "mm_encoder_tp_mode must be one of {'weights', 'data'}, got "
+                f"{self.mm_encoder_tp_mode!r}"
+            )
+        if self.mm_encoder_tp_mode == "data":
+            vision_tp_size = 1
+            vision_dp_size = attn_tp_size
+        else:
+            vision_tp_size = attn_tp_size
+            vision_dp_size = 1
+
         self.mapping = Mapping(
             world_size=world_size,
             attn_tp_size=attn_tp_size,
@@ -491,6 +519,8 @@ class ServerArgs:
             moe_tp_size=moe_tp_size,
             moe_ep_size=moe_ep_size,
             moe_dp_size=moe_dp_size,
+            vision_tp_size=vision_tp_size,
+            vision_dp_size=vision_dp_size,
             nprocs_per_node=nprocs_per_node,
             nnodes=nnodes,
             base_gpu_id=self.base_gpu_id,
@@ -500,6 +530,22 @@ class ServerArgs:
         # Impl constraints:
         if self.mapping.moe.has_tp and self.mapping.moe.has_ep:
             raise ValueError("MoE TP and EP cannot be both > 1")
+
+        if self.mm_encoder_tp_mode == "data":
+            if self.disaggregation_mode != "null":
+                raise ValueError(
+                    "--mm-encoder-tp-mode data currently requires "
+                    "--disaggregation-mode null (aggregate serving)"
+                )
+            if self.mapping.nnodes != 1:
+                raise ValueError(
+                    "--mm-encoder-tp-mode data currently supports a single node only"
+                )
+            if self.mapping.has_attn_cp:
+                raise ValueError(
+                    "--mm-encoder-tp-mode data does not currently support "
+                    "attention context parallelism"
+                )
 
         logger.info("Parallelism configuration:\n%s", self.mapping)
 
@@ -792,8 +838,11 @@ class ServerArgs:
             "--kv-cache-dtype",
             type=str,
             default=ServerArgs.kv_cache_dtype,
-            choices=["auto", "fp8", "fp8_e4m3"],
-            help='Data type for kv cache storage. "auto" will use model data type. "fp8" is an alias for "fp8_e4m3".',
+            choices=["auto", "fp8", "fp8_e4m3", "mxfp8"],
+            help='Data type for kv cache storage. "auto" will use model data type. '
+            '"fp8" is an alias for "fp8_e4m3" (per-tensor scales). "mxfp8" stores '
+            "block-scaled fp8-e4m3 (one UE8M0 scale per 32 head_dim elements) and "
+            "requires --block-size 128 with an MHA attention backend.",
         )
         parser.add_argument(
             "--kv-cache-quant-method",
@@ -1783,6 +1832,18 @@ class ServerArgs:
             default=ServerArgs.mm_attention_backend,
             help="Set multimodal attention backend.",
         )
+        parser.add_argument(
+            "--mm-encoder-tp-mode",
+            type=str,
+            choices=["weights", "data"],
+            default=ServerArgs.mm_encoder_tp_mode,
+            help=(
+                "Multimodal encoder parallelism within each attention TP "
+                "group. 'weights' shards encoder weights with TP (default); "
+                "'data' replicates encoder weights and distributes whole "
+                "multimodal items across the TP ranks."
+            ),
+        )
         # Disaggregation
         parser.add_argument(
             "--disaggregation-mode",
@@ -1836,6 +1897,23 @@ class ServerArgs:
             help="The URL of the PD disaggregation load balancer. If set, the prefill/decode server will register with the load balancer.",
         )
 
+        # RL online weight sync (always on / ungated).
+        parser.add_argument(
+            "--weight-transfer-config",
+            type=str,
+            default=ServerArgs.weight_transfer_config,
+            help='JSON config for weight transfer, e.g. \'{"backend":"nccl"}\'. '
+            "Backend is one of 'nccl' (disaggregated) or 'ipc' (colocated).",
+        )
+        parser.add_argument(
+            "--rl-control-port",
+            type=int,
+            default=ServerArgs.rl_control_port,
+            help="Port for the in-engine RL control-plane HTTP app (weight sync, "
+            "pause/resume, memory occupation). Normally allocated automatically "
+            "by the `ts serve` orchestrator.",
+        )
+
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
         args.ep_size = args.expert_parallel_size
@@ -1877,6 +1955,14 @@ class ServerArgs:
         if is_valid_ipv6_address(self.host):
             return f"http://[{self.host}]:{self.port}"
         return f"http://{self.host}:{self.port}"
+
+    def get_weight_transfer_config(self):
+        """Parse ``--weight-transfer-config`` JSON into a ``WeightTransferConfig``."""
+        from tokenspeed.runtime.engine.weight_transfer.config import (
+            WeightTransferConfig,
+        )
+
+        return WeightTransferConfig.from_json(self.weight_transfer_config)
 
 
 def prepare_server_args(argv: list[str]) -> ServerArgs:
