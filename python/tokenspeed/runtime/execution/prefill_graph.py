@@ -600,22 +600,20 @@ class PrefillGraph:
         split itself, while the captured token-shaped compute is uniform over
         all rows (pure decode is the decode graph's job). Two ctx fields are
         baked into the captured segments rather than rebound at replay -- the
-        draft first-step row narrowing (keyed on ``accept_lengths``) and the
-        ``capture_hidden_mode`` aux-hidden capture -- so a live forward carrying
-        different values falls back to eager rather than silently dropping the
-        reduce / mismatching aux. Prefix caching (cache hits and chunked-prefill
-        chunks 2+) IS eligible: the prefix affects only the ragged attention,
-        which runs entirely inside the eager break, and it adds zero new tokens,
-        so the padded bucket -- hence the baked EP all-to-all shape under DP --
-        is identical on prefix and non-prefix ranks.
+        ``capture_hidden_mode`` aux-hidden capture is baked into the captured
+        segments rather than rebound at replay, so a live forward carrying a
+        different value falls back to eager rather than mismatching aux.
+        Prefix caching (cache hits and chunked-prefill chunks 2+) IS eligible:
+        the prefix affects only the ragged attention, which runs entirely
+        inside the eager break, and it adds zero new tokens, so the padded
+        bucket -- hence the baked EP all-to-all shape under DP -- is identical
+        on prefix and non-prefix ranks.
         """
         if self.disable or ctx.forward_mode is None:
             return None
         if ctx.num_extends <= 0:
             return None
         if not (ctx.forward_mode.is_extend() or ctx.forward_mode.is_mixed()):
-            return None
-        if ctx.accept_lengths is not None:
             return None
         if ctx.capture_hidden_mode != self._captured_hidden_mode:
             return None

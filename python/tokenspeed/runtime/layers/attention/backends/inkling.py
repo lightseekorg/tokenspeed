@@ -90,7 +90,7 @@ class InklingConvMetadata:
             stash the pre-conv chunk activations and defer the window write
             to ``update_mamba_state_after_mtp_verify`` (post-verify hook).
             ``valid_len``: draft catch-up — the chunk's valid prefix length
-            is already known (``ctx.accept_lengths``); write the window
+            is already known (the model forward's ``accept_lengths``); write the window
             ending at the accepted position inline.
         tokens_per_req: Uniform tokens per request for the multi-token
             decode modes (``stash``/``valid_len``).
@@ -538,7 +538,7 @@ class InklingAttnBackend(AttentionBackend):
         assert md.update_mode == "valid_len"
         if accept_lengths is None:
             raise RuntimeError(
-                "Inkling draft catch-up conv update needs ctx.accept_lengths"
+                "Inkling draft catch-up conv update needs accept_lengths"
             )
         if md.lookback > 0:
             # Lookback window pass: ``state`` is the LAG slice, whose old

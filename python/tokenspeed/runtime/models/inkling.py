@@ -350,7 +350,12 @@ class InklingShortConvolution(nn.Module):
         if self._on_load is not None:
             self._on_load()
 
-    def forward(self, x: torch.Tensor, ctx: ForwardContext) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        ctx: ForwardContext,
+        accept_lengths: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         weight = self.weight.squeeze(1)  # [dim, W]
         # K/V stream instances never run forward (InklingAttention fuses them
         # into one _sconv_apply call); a KeyError here means that broke.
@@ -366,6 +371,7 @@ class InklingShortConvolution(nn.Module):
             self.channel_offset,
             self.dim,
             conv_group=conv_group,
+            accept_lengths=accept_lengths,
         )
 
 
@@ -377,6 +383,7 @@ def _sconv_apply(
     channel_offset: int,
     dim: int,
     conv_group: str | None = None,
+    accept_lengths: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run one sconv stream (or several adjacent ones fused) over ``x``.
 
@@ -508,7 +515,7 @@ def _sconv_apply(
         layer_id,
         channel_offset,
         dim,
-        accept_lengths=getattr(ctx, "accept_lengths", None),
+        accept_lengths=accept_lengths,
     )
     return y
 
@@ -667,6 +674,7 @@ class InklingAttention(nn.Module):
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
         log_scaling_tau: torch.Tensor | None = None,
+        accept_lengths: torch.Tensor | None = None,
     ) -> torch.Tensor:
         num_tokens = hidden_states.shape[0]
         qkvr, _ = self.qkvr(hidden_states)
@@ -696,6 +704,7 @@ class InklingAttention(nn.Module):
                     self._kv_channel_offset,
                     2 * self.kv_size,
                     conv_group="kvconv",
+                    accept_lengths=accept_lengths,
                 )
             k = kv[:, : self.kv_size]
             v = kv[:, self.kv_size :]
@@ -1150,6 +1159,7 @@ class InklingDecoderLayer(nn.Module):
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
         log_scaling_tau: torch.Tensor | None = None,
+        accept_lengths: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if ctx.forward_mode.is_idle():
             return hidden_states, residual
@@ -1165,9 +1175,10 @@ class InklingDecoderLayer(nn.Module):
             ctx,
             out_cache_loc,
             log_scaling_tau=log_scaling_tau,
+            accept_lengths=accept_lengths,
         )
         if self.attn_sconv is not None:
-            attn_out = self.attn_sconv(attn_out, ctx)
+            attn_out = self.attn_sconv(attn_out, ctx, accept_lengths=accept_lengths)
         mlp_input, residual = self.mlp_norm(attn_out, residual)
 
         if self.is_moe:
@@ -1175,7 +1186,7 @@ class InklingDecoderLayer(nn.Module):
         else:
             mlp_out = self.mlp(mlp_input)
         if self.mlp_sconv is not None:
-            mlp_out = self.mlp_sconv(mlp_out, ctx)
+            mlp_out = self.mlp_sconv(mlp_out, ctx, accept_lengths=accept_lengths)
         return mlp_out, residual
 
 
@@ -1524,6 +1535,7 @@ class InklingTextModel(nn.Module):
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
+        accept_lengths: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
@@ -1549,6 +1561,7 @@ class InklingTextModel(nn.Module):
                 ctx,
                 out_cache_loc,
                 log_scaling_tau=log_scaling_tau,
+                accept_lengths=accept_lengths,
             )
         if residual is None:
             hidden_states = self.norm(hidden_states)

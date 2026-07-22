@@ -73,11 +73,22 @@ class Qwen3_5DraftAttentionDecoderLayer(Qwen3_5AttentionDecoderLayer):
         gate: torch.Tensor | None,
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
+        accept_lengths: torch.Tensor | None = None,
+        draft_seq_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if ctx.accept_lengths is None:
-            return super()._attn(q, k, v, gate, ctx, out_cache_loc)
+        if accept_lengths is None:
+            return super()._attn(
+                q,
+                k,
+                v,
+                gate,
+                ctx,
+                out_cache_loc,
+                accept_lengths=accept_lengths,
+                draft_seq_lens=draft_seq_lens,
+            )
 
-        self._apply_correction(ctx)
+        self._apply_correction(ctx, accept_lengths, draft_seq_lens)
         q = q.index_select(0, ctx.gather_ids)
         if gate is not None:
             gate = gate.index_select(0, ctx.gather_ids)
@@ -99,25 +110,30 @@ class Qwen3_5DraftAttentionDecoderLayer(Qwen3_5AttentionDecoderLayer):
             sigmoid_mul(attn_output, gate)
         return attn_output
 
-    def _apply_correction(self, ctx: ForwardContext) -> None:
+    def _apply_correction(
+        self,
+        ctx: ForwardContext,
+        accept_lengths: torch.Tensor,
+        draft_seq_lens: torch.Tensor | None,
+    ) -> None:
         """Trim decode rows' cache_seqlens by ``spec_num_tokens - accept_lengths``."""
-        seq_lens_buf = ctx.draft_seq_lens_buf
-        if seq_lens_buf is None or ctx.accept_lengths is None:
+        if draft_seq_lens is None:
             return
         num_extends = ctx.num_extends
         if num_extends >= ctx.bs:
             return
         correction = (
-            ctx.attn_backend.spec_num_tokens - ctx.accept_lengths[num_extends:]
-        ).to(seq_lens_buf.dtype)
-        seq_lens_buf[num_extends : ctx.bs].sub_(correction).clamp_(min=1)
+            ctx.attn_backend.spec_num_tokens - accept_lengths[num_extends:]
+        ).to(draft_seq_lens.dtype)
+        draft_seq_lens[num_extends : ctx.bs].sub_(correction).clamp_(min=1)
 
     def _maybe_narrow_residual(
         self,
         residual: torch.Tensor,
         ctx: ForwardContext,
+        accept_lengths: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if ctx.accept_lengths is None or ctx.forward_mode.is_idle():
+        if accept_lengths is None or ctx.forward_mode.is_idle():
             return residual
         return residual.index_select(0, ctx.gather_ids)
 
@@ -125,8 +141,9 @@ class Qwen3_5DraftAttentionDecoderLayer(Qwen3_5AttentionDecoderLayer):
 class Qwen3_5DraftForCausalLM(Qwen3_5ForCausalLM):
     """Causal LM with the draft-variant attention layer injected.
 
-    Restricted to single-layer drafts: ``_apply_correction`` mutates
-    ``ctx.draft_seq_lens_buf`` in place and is not idempotent across layers.
+    Restricted to single-layer drafts: ``_apply_correction`` mutates the
+    explicit ``draft_seq_lens`` input in place and is not idempotent across
+    layers.
     A multi-layer draft would double-trim cache_seqlens. Lift the correction
     out of the per-layer hook (e.g. into the drafter) before relaxing this.
     """
@@ -240,6 +257,8 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
         out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
         captured_hidden_states: torch.Tensor | None = None,
+        accept_lengths: torch.Tensor | None = None,
+        draft_seq_lens: torch.Tensor | None = None,
         **kwargs,
     ):
         if captured_hidden_states is None and not ctx.forward_mode.is_idle():
@@ -272,6 +291,8 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
                 ctx,
                 out_cache_loc,
                 input_embeds=hidden_states,
+                accept_lengths=accept_lengths,
+                draft_seq_lens=draft_seq_lens,
             )
 
         logits_metadata = LogitsMetadata.from_forward_context(ctx)
