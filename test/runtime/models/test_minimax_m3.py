@@ -163,6 +163,57 @@ def test_minimax_m3_attention_family_selects_msa() -> None:
     assert model_config.attention_arch is AttentionArch.MSA
 
 
+def _msa_model_config() -> SimpleNamespace:
+    config = _tiny_config()
+    return SimpleNamespace(
+        hf_config=config,
+        hf_text_config=config.text_config,
+        context_len=4096,
+        num_attention_heads=8,
+        num_key_value_heads=4,
+        head_dim=16,
+        dtype=torch.bfloat16,
+    )
+
+
+def _msa_server_args(**overrides) -> SimpleNamespace:
+    args = dict(
+        device="cuda",
+        kv_cache_dtype="fp8_e4m3",
+        kv_cache_quant_method="none",
+        speculative_algorithm=None,
+        attention_backend="trtllm",
+        drafter_attention_backend=None,
+        block_size=128,
+        max_num_seqs=16,
+        data_parallel_size=1,
+        attn_tp_size=4,
+        max_cudagraph_capture_size=16,
+        chunked_prefill_size=8192,
+        disaggregation_mode="null",
+    )
+    args.update(overrides)
+    return SimpleNamespace(**args)
+
+
+def test_msa_config_kv_cache_dtype_guards() -> None:
+    from tokenspeed.runtime.layers.attention.configs.msa import MSAConfig
+
+    model_config = _msa_model_config()
+
+    config = MSAConfig.generate(_msa_server_args(), model_config)
+    assert config.kv_cache_dtype is torch.float8_e4m3fn
+    # The index side cache stays in model dtype regardless of kv_cache_dtype.
+    assert config.dtype is torch.bfloat16
+
+    with pytest.raises(ValueError, match="mxfp8"):
+        MSAConfig.generate(_msa_server_args(kv_cache_dtype="mxfp8"), model_config)
+    with pytest.raises(ValueError, match="kv_cache_quant_method"):
+        MSAConfig.generate(
+            _msa_server_args(kv_cache_quant_method="per_token_head"), model_config
+        )
+
+
 def test_minimax_m3_tp4_meta_layout_and_loader(monkeypatch: pytest.MonkeyPatch) -> None:
     model = _build_model(monkeypatch, quant_config=_mxfp8_config())
 
