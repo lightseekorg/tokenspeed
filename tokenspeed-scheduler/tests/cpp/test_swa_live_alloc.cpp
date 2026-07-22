@@ -18,7 +18,8 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-// Live-tail allocation reference geometry: Inkling hiddenconv (block 8, window 12, alignment 256) -> 2 of every 32 slots stay real once slid out.
+// Live-tail allocation reference geometry: Inkling hiddenconv (block 8, window 12, alignment 256) -> 2 of every 32
+// slots stay real once slid out.
 
 #include <gtest/gtest.h>
 
@@ -133,7 +134,8 @@ TEST(SwaLiveAllocTest, AcquireShortfallLeavesTableUntouched) {
 }
 
 TEST(SwaLiveAllocTest, ReclaimPunchesRealPagesBelowInterleavedHoles) {
-    // Chunk-1 checkpoint pages sit below interleaved holes: ReclaimExpired must not early-break and must free every real page under the bound.
+    // Chunk-1 checkpoint pages sit below interleaved holes: ReclaimExpired must not early-break and must free every
+    // real page under the bound.
     BlockPool pool(2048);
     SwaManager mgr(8, 12, 256);
     BlockTable table;

@@ -36,7 +36,8 @@ namespace tokenspeed {
 
 class SwaManager : public KvCacheManager {
 public:
-    // live_alloc_alignment > 0 = live-tail allocation: real blocks only for the live tail + resume pages behind each alignment boundary; 0 = full allocation.
+    // live_alloc_alignment > 0 = live-tail allocation: real blocks only for the live tail + resume pages behind each
+    // alignment boundary; 0 = full allocation.
     SwaManager(std::int32_t block_size, std::int32_t sliding_window, std::int32_t live_alloc_alignment = 0)
         : KvCacheManager(block_size), sliding_window_{sliding_window}, live_alloc_alignment_{live_alloc_alignment} {
         _assert(sliding_window > 0, "sliding_window must be > 0");
@@ -219,7 +220,8 @@ private:
         return std::min(skipped_blocks, table.NumBlocks());
     }
 
-    // Live-tail predicate: NEW slot s is real iff not fully slid out at frontier_tokens, or a resume page behind an alignment boundary.
+    // Live-tail predicate: NEW slot s is real iff not fully slid out at frontier_tokens, or a resume page behind an
+    // alignment boundary.
     bool slotIsLive(std::int32_t s, std::int32_t frontier_tokens) const {
         const std::int32_t skipped = frontier_tokens - sliding_window_ + 1;
         if (skipped <= 0 || s >= skipped / block_size_) {

@@ -64,7 +64,8 @@ public:
     }
 
     // All-or-nothing (tail-page room first, then fresh pages): on shortfall the table is unchanged, returns false.
-    // Virtual so live-tail overrides can hole dead slots; overrides keep the all-or-nothing contract + BlocksNeededFor mirror.
+    // Virtual so live-tail overrides can hole dead slots; overrides keep the all-or-nothing contract + BlocksNeededFor
+    // mirror.
     virtual bool Acquire(BlockPool& pool, BlockTable& table, std::int32_t num_tokens) {
         if (num_tokens <= 0) {
             return true;

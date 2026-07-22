@@ -178,14 +178,12 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                bool live_tail_alloc) {
                 new (self) tokenspeed::PagedCacheGroupConfig{
                     std::move(group_id), rows_per_page, entry_stride_tokens,   total_pages,
-                    /*block_size=*/0,    retention,     sliding_window_tokens, family,
-                    live_tail_alloc};
+                    /*block_size=*/0,    retention,     sliding_window_tokens, family,      live_tail_alloc};
             },
             nb::arg("group_id"), nb::arg("rows_per_page"), nb::arg("entry_stride_tokens"), nb::arg("total_pages"),
             nb::arg("retention") = tokenspeed::PagedCacheGroupConfig::Retention::FullHistory,
             nb::arg("sliding_window_tokens") = std::nullopt,
-            nb::arg("family") = tokenspeed::PagedCacheGroupFamily::History,
-            nb::arg("live_tail_alloc") = false)
+            nb::arg("family") = tokenspeed::PagedCacheGroupFamily::History, nb::arg("live_tail_alloc") = false)
         .def_rw("group_id", &tokenspeed::PagedCacheGroupConfig::group_id)
         .def_rw("rows_per_page", &tokenspeed::PagedCacheGroupConfig::rows_per_page)
         .def_rw("entry_stride_tokens", &tokenspeed::PagedCacheGroupConfig::entry_stride_tokens)

@@ -39,7 +39,8 @@ struct KvCacheSpec {
     AttnKind kind;
     std::int32_t block_size;
     std::int32_t sliding_window;  // 0 for full attention
-    // Sliding-only: real pages for the live tail + LCM-boundary resume pages, holes elsewhere; MakeCoordinator sets the alignment.
+    // Sliding-only: real pages for the live tail + LCM-boundary resume pages, holes elsewhere; MakeCoordinator sets the
+    // alignment.
     bool live_tail_alloc{false};
 };
 
