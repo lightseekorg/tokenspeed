@@ -59,6 +59,19 @@ class _FakeProton:
         return _FakeScope(self.scope_log)
 
 
+class _FakeVizTracer:
+    enable = True
+
+    def __init__(self) -> None:
+        self.raw_events: list[dict[str, object]] = []
+
+    def getts(self) -> float:
+        return 1234.5
+
+    def add_raw(self, event: dict[str, object]) -> None:
+        self.raw_events.append(event)
+
+
 @pytest.fixture(autouse=True)
 def _reset_state():
     profiling.stop_profiling()
@@ -189,6 +202,38 @@ def test_kernel_scope_uses_proton_scope_when_active(monkeypatch):
         )
     ]
     assert fake.scope_log == ["enter", "exit"]
+
+
+def test_kernel_scope_links_active_viztracer_to_proton_scope(monkeypatch):
+    fake = _FakeProton()
+    scope = _FakeScope(fake.scope_log)
+    scope.id = 42
+    tracer = _FakeVizTracer()
+
+    def proton_scope(name: str, metrics: dict[str, object] | None = None):
+        fake.scope_calls.append((name, {} if metrics is None else dict(metrics)))
+        return scope
+
+    monkeypatch.setattr(profiling, "_HAS_PROTON", True)
+    monkeypatch.setattr(profiling, "proton", fake)
+    monkeypatch.setattr(fake, "scope", proton_scope)
+    monkeypatch.setattr(profiling, "_active_viztracer", lambda: tracer)
+    profiling.start_profiling()
+
+    with profiling.kernel_scope("gemm", "mm", torch.float16, M=32):
+        pass
+
+    assert fake.scope_log == ["enter", "exit"]
+    assert tracer.raw_events == [
+        {
+            "name": "viztracer->proton",
+            "cat": "tokenspeed.proton",
+            "ph": "s",
+            "ts": 1234.5,
+            "id": 42,
+            "bp": "e",
+        }
+    ]
 
 
 def test_kernel_scope_filters_unsupported_proton_metrics(monkeypatch):
