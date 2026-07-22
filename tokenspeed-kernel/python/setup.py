@@ -46,7 +46,7 @@ from setuptools.command.editable_wheel import editable_wheel
 ROOT = Path(__file__).resolve().parent
 REQUIREMENTS_DIR = ROOT / "requirements"
 THIRDPARTY_DIR = ROOT / "tokenspeed_kernel" / "thirdparty"
-BASE_VERSION = "0.1.2"
+BASE_VERSION = "0.1.3"
 BACKEND_ENV = "TOKENSPEED_KERNEL_BACKEND"
 VALID_BACKENDS = {"cuda", "rocm"}
 DEFAULT_CUDA_ARCHS = ("100a", "103a")

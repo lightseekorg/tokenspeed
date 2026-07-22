@@ -1,0 +1,294 @@
+name: Update tokenspeed-kernel for tokenspeed-kernel-amd
+
+on:
+  workflow_dispatch:
+    inputs:
+      amd_version:
+        description: "Published tokenspeed-kernel-amd version, for example 0.1.3 or v0.1.3."
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.amd_version }}
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require main and lightseek-bot token
+        env:
+          LIGHTSEEK_BOT_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+          SOURCE_REF: ${{ github.ref }}
+        run: |
+          if [ "$SOURCE_REF" != "refs/heads/main" ]; then
+            echo "Dispatch this workflow from main." >&2
+            exit 1
+          fi
+          if [ -z "$LIGHTSEEK_BOT_TOKEN" ]; then
+            echo "LIGHTSEEK_BOT_TOKEN is required to push the update and create its pull request." >&2
+            exit 1
+          fi
+
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Prepare update branch
+        id: prepare
+        env:
+          REQUESTED_VERSION: ${{ inputs.amd_version }}
+        run: |
+          version="${REQUESTED_VERSION#v}"
+          if ! [[ "$version" =~ ^[0-9]+(\.[0-9]+)*((a|b|rc)[0-9]+)?(\.post[0-9]+)?$ ]]; then
+            echo "Invalid public release version: $REQUESTED_VERSION" >&2
+            exit 1
+          fi
+
+          branch="bot/update-tokenspeed-kernel-amd-dependency-${version}"
+          git switch -c "$branch"
+          git config user.name "lightseek-bot"
+          git config user.email "243258330+lightseek-bot@users.noreply.github.com"
+
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Verify AMD version on main
+        env:
+          VERSION: ${{ steps.prepare.outputs.version }}
+        run: |
+          python - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          version = os.environ["VERSION"]
+          path = Path("tokenspeed-kernel-amd/pyproject.toml")
+          project = tomllib.loads(path.read_text())["project"]
+          if project["name"] != "tokenspeed-kernel-amd":
+              raise SystemExit(f"{path} does not describe tokenspeed-kernel-amd")
+          if project["version"] != version:
+              raise SystemExit(
+                  f"requested tokenspeed-kernel-amd {version}, but {path} contains "
+                  f'{project["version"]}'
+              )
+          PY
+
+      - name: Wait for the published version
+        env:
+          VERSION: ${{ steps.prepare.outputs.version }}
+        run: |
+          for attempt in {1..12}; do
+            if ! http_code=$(curl --silent --show-error \
+              --output /tmp/pypi-version.json \
+              --write-out '%{http_code}' \
+              "https://pypi.org/pypi/tokenspeed-kernel-amd/${VERSION}/json"); then
+              http_code=000
+            fi
+
+            if [ "$http_code" = "200" ] && python - <<'PY'
+          import json
+          from pathlib import Path
+
+          release = json.loads(Path("/tmp/pypi-version.json").read_text())
+          files = release.get("urls")
+          if not isinstance(files, list) or not any(
+              not file.get("yanked", False) for file in files
+          ):
+              raise SystemExit(1)
+          PY
+            then
+              echo "tokenspeed-kernel-amd ${VERSION} is available on PyPI."
+              exit 0
+            fi
+
+            if [ "$attempt" -eq 12 ]; then
+              echo "tokenspeed-kernel-amd ${VERSION} is not available with a non-yanked distribution after publication (last HTTP status: ${http_code})." >&2
+              exit 1
+            fi
+
+            echo "Waiting for tokenspeed-kernel-amd ${VERSION} to become available on PyPI (attempt ${attempt}/12, HTTP ${http_code})."
+            sleep 30
+          done
+
+      - name: Update tokenspeed-kernel
+        id: update
+        env:
+          VERSION: ${{ steps.prepare.outputs.version }}
+        run: |
+          python -m pip install packaging
+          python - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          from packaging.version import Version
+
+          version = os.environ["VERSION"]
+          target_version = Version(version)
+
+          rocm_path = Path("tokenspeed-kernel/python/requirements/rocm.txt")
+          rocm_text = rocm_path.read_text()
+          amd_versions = re.findall(
+              r"(?m)^tokenspeed-kernel-amd==([^\s]+)$",
+              rocm_text,
+          )
+          if len(amd_versions) != 1:
+              raise SystemExit(
+                  f"expected one tokenspeed-kernel-amd pin in {rocm_path}"
+              )
+
+          setup_path = Path("tokenspeed-kernel/python/setup.py")
+          setup_text = setup_path.read_text()
+          kernel_versions = re.findall(
+              r'(?m)^BASE_VERSION = "([^"]+)"$',
+              setup_text,
+          )
+          if len(kernel_versions) != 1:
+              raise SystemExit(f"expected one BASE_VERSION in {setup_path}")
+
+          current_versions = (
+              (rocm_path, amd_versions[0]),
+              (setup_path, kernel_versions[0]),
+          )
+          for path, current in current_versions:
+              parsed_current = Version(current)
+              if parsed_current > target_version:
+                  raise SystemExit(
+                      f"refusing to downgrade {path} from {current} to {version}"
+                  )
+
+          if amd_versions[0] != version:
+              rocm_text, count = re.subn(
+                  r"(?m)^tokenspeed-kernel-amd==[^\n]+$",
+                  f"tokenspeed-kernel-amd=={version}",
+                  rocm_text,
+              )
+              if count != 1:
+                  raise SystemExit(
+                      f"expected one tokenspeed-kernel-amd pin in {rocm_path}"
+                  )
+              rocm_path.write_text(rocm_text)
+
+          if kernel_versions[0] != version:
+              setup_text, count = re.subn(
+                  r'(?m)^BASE_VERSION = "[^"]+"$',
+                  f'BASE_VERSION = "{version}"',
+                  setup_text,
+              )
+              if count != 1:
+                  raise SystemExit(f"expected one BASE_VERSION in {setup_path}")
+              setup_path.write_text(setup_text)
+          PY
+
+          if git diff --quiet -- \
+            tokenspeed-kernel/python/requirements/rocm.txt \
+            tokenspeed-kernel/python/setup.py; then
+            echo "tokenspeed-kernel already matches tokenspeed-kernel-amd $VERSION."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run pre-commit
+        if: steps.update.outputs.changed == 'true'
+        run: |
+          python -m pip install pre-commit
+
+          set +e
+          pre-commit run --all-files
+          precommit_status=$?
+          set -e
+
+          list_unexpected_files() {
+            {
+              git diff --name-only
+              git ls-files --others --exclude-standard
+            } | sort -u | while IFS= read -r path; do
+              case "$path" in
+                tokenspeed-kernel/python/requirements/rocm.txt | \
+                  tokenspeed-kernel/python/setup.py) ;;
+                *) echo "$path" ;;
+              esac
+            done
+          }
+
+          unexpected_files=$(list_unexpected_files)
+          if [ -n "$unexpected_files" ]; then
+            echo "pre-commit changed files outside the tokenspeed-kernel AMD update:" >&2
+            echo "$unexpected_files" >&2
+            exit 1
+          fi
+          if [ "$precommit_status" -ne 0 ]; then
+            pre-commit run --all-files
+          fi
+
+          unexpected_files=$(list_unexpected_files)
+          if [ -n "$unexpected_files" ]; then
+            echo "pre-commit changed files outside the tokenspeed-kernel AMD update:" >&2
+            echo "$unexpected_files" >&2
+            exit 1
+          fi
+
+      - name: Commit, push, and create pull request
+        if: steps.update.outputs.changed == 'true'
+        env:
+          BRANCH: ${{ steps.prepare.outputs.branch }}
+          GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+          VERSION: ${{ steps.prepare.outputs.version }}
+        run: |
+          if git diff --quiet -- \
+            tokenspeed-kernel/python/requirements/rocm.txt \
+            tokenspeed-kernel/python/setup.py; then
+            echo "tokenspeed-kernel is unchanged after pre-commit; nothing to publish."
+            exit 0
+          fi
+
+          git add \
+            tokenspeed-kernel/python/requirements/rocm.txt \
+            tokenspeed-kernel/python/setup.py
+          git commit -s -m "build: sync tokenspeed-kernel with AMD ${VERSION}"
+
+          remote_line=$(git ls-remote --heads origin "refs/heads/${BRANCH}")
+          remote_sha=${remote_line%%$'\t'*}
+          if [ -n "$remote_sha" ]; then
+            lease="refs/heads/${BRANCH}:${remote_sha}"
+          else
+            lease="refs/heads/${BRANCH}:"
+          fi
+          git push \
+            --force-with-lease="$lease" \
+            origin "HEAD:refs/heads/${BRANCH}"
+
+          title="build: sync tokenspeed-kernel with AMD ${VERSION}"
+          body="Keep tokenspeed-kernel's package version and ROCm dependency aligned with the published tokenspeed-kernel-amd ${VERSION} release."
+          pr_number=$(gh pr list \
+            --repo "$GITHUB_REPOSITORY" \
+            --base main \
+            --head "$BRANCH" \
+            --state open \
+            --json number \
+            --jq '.[0].number // empty')
+          if [ -n "$pr_number" ]; then
+            gh pr edit "$pr_number" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$title" \
+              --body "$body"
+          else
+            gh pr create \
+              --repo "$GITHUB_REPOSITORY" \
+              --base main \
+              --head "$BRANCH" \
+              --title "$title" \
+              --body "$body"
+          fi
