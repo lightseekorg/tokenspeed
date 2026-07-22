@@ -63,6 +63,18 @@ public:
         CoordinatorMatch device;
         CoordinatorMatch host;
     };
+    struct CoordinatorProbe {
+        std::int32_t num_common_tokens{0};
+        std::vector<PrefixProbe> per_group;
+    };
+    struct AdmissionProbe {
+        CoordinatorProbe device;
+        CoordinatorProbe host;
+    };
+    // Split probing from ownership acquisition so admission checks can defer
+    // without refreshing free cached blocks in the eviction order.
+    AdmissionProbe ProbePrefix(std::span<const std::string> content_hashes) const;
+    AdmissionMatch AcquirePrefix(std::span<const std::string> content_hashes, AdmissionProbe&& probe);
     AdmissionMatch MatchPrefix(std::span<const std::string> content_hashes);
 
     // Pure claim into fresh tables, never fails; a non-empty per_group must be sized to the group count.
@@ -104,8 +116,10 @@ private:
     std::vector<std::string> keysForGroup(std::span<const std::string> content_hashes, std::uint32_t group_id,
                                           std::int32_t group_block_size, std::int32_t first_base = 0) const;
     std::vector<std::vector<std::string>> buildGroupKeys(std::span<const std::string> content_hashes) const;
-    CoordinatorMatch matchTierWithKeys(BlockPool& pool, std::span<const std::vector<std::string>> group_keys,
+    CoordinatorProbe probeTierWithKeys(const BlockPool& pool, std::span<const std::vector<std::string>> group_keys,
                                        std::int32_t num_base_pages, std::int32_t floor_tokens) const;
+    CoordinatorMatch acquireTierWithKeys(BlockPool& pool, std::span<const std::vector<std::string>> group_keys,
+                                         std::int32_t floor_tokens, CoordinatorProbe&& probe) const;
     std::vector<CacheGroup> groups_;
     // Closed groups first, so non-closed groups match against a settled bound.
     std::vector<std::size_t> match_order_;

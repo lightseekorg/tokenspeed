@@ -108,54 +108,81 @@ std::vector<std::vector<std::string>> KvCacheCoordinator::buildGroupKeys(
 // The one tier matcher: slots below floor_tokens are assumed valid in a lower tier; per_group
 // blocks are relative to the floor, num_common_tokens is the absolute converged boundary (in
 // TOKENS). num_base_pages = content_hashes.size(); group_keys[i] is folded to group i's blocks.
-CoordinatorMatch KvCacheCoordinator::matchTierWithKeys(BlockPool& pool,
-                                                       std::span<const std::vector<std::string>> group_keys,
-                                                       std::int32_t num_base_pages, std::int32_t floor_tokens) const {
-    CoordinatorMatch out;
+KvCacheCoordinator::CoordinatorProbe KvCacheCoordinator::probeTierWithKeys(
+    const BlockPool& pool, std::span<const std::vector<std::string>> group_keys, std::int32_t num_base_pages,
+    std::int32_t floor_tokens) const {
+    CoordinatorProbe out;
     out.per_group.resize(groups_.size());
     if (groups_.empty()) {
         return out;
     }
-    std::vector<PrefixProbe> probes(groups_.size());
     const std::int32_t boundary_tokens = SweepThenConverge(
         match_order_, groups_, num_base_pages * base_block_size_, lcm_block_size_,
         [&](std::size_t i, std::int32_t bound_tokens) {
             const std::int32_t group_block_size = groups_[i].Spec().block_size;
-            probes[i] = groups_[i].Manager().Probe(pool, group_keys[i], floor_tokens / group_block_size,
-                                                   bound_tokens / group_block_size);
+            out.per_group[i] = groups_[i].Manager().Probe(pool, group_keys[i], floor_tokens / group_block_size,
+                                                          bound_tokens / group_block_size);
         },
         [&](std::size_t i) {
             const std::int32_t group_block_size = groups_[i].Spec().block_size;
-            return (floor_tokens / group_block_size + static_cast<std::int32_t>(probes[i].hits.size())) *
+            return (floor_tokens / group_block_size + static_cast<std::int32_t>(out.per_group[i].hits.size())) *
                    group_block_size;
         });
 
-    // Truncate closed probes to the converged boundary, then acquire only the final hits.
+    // Truncate closed probes to the converged boundary.
     // Non-closed groups were re-probed against the settled bound and are already at or below it.
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         const std::int32_t group_block_size = groups_[i].Spec().block_size;
-        PrefixProbe& probe = probes[i];
+        PrefixProbe& probe = out.per_group[i];
         const std::int32_t floor_blocks = floor_tokens / group_block_size;
         if ((floor_blocks + static_cast<std::int32_t>(probe.hits.size())) * group_block_size > boundary_tokens) {
             _assert(groups_[i].Manager().MatchIsPrefixClosed(), "window group left above the converged boundary");
             probe.hits.resize(static_cast<std::size_t>(boundary_tokens / group_block_size - floor_blocks));
         }
-        out.per_group[i] = groups_[i].Manager().AcquireMatchedBlocks(pool, group_keys[i], floor_blocks, probe);
     }
     out.num_common_tokens = boundary_tokens;
     return out;
 }
 
-KvCacheCoordinator::AdmissionMatch KvCacheCoordinator::MatchPrefix(std::span<const std::string> content_hashes) {
+CoordinatorMatch KvCacheCoordinator::acquireTierWithKeys(BlockPool& pool,
+                                                         std::span<const std::vector<std::string>> group_keys,
+                                                         std::int32_t floor_tokens, CoordinatorProbe&& probe) const {
+    CoordinatorMatch out;
+    out.num_common_tokens = probe.num_common_tokens;
+    out.per_group.resize(groups_.size());
+    for (std::size_t i = 0; i < groups_.size(); ++i) {
+        const std::int32_t floor_blocks = floor_tokens / groups_[i].Spec().block_size;
+        out.per_group[i] =
+            groups_[i].Manager().AcquireMatchedBlocks(pool, group_keys[i], floor_blocks, probe.per_group[i]);
+    }
+    return out;
+}
+
+KvCacheCoordinator::AdmissionProbe KvCacheCoordinator::ProbePrefix(std::span<const std::string> content_hashes) const {
     const std::vector<std::vector<std::string>> group_keys = buildGroupKeys(content_hashes);
     const std::int32_t num_base_pages = static_cast<std::int32_t>(content_hashes.size());
-    AdmissionMatch out;
-    out.device = matchTierWithKeys(pool_, group_keys, num_base_pages, /*floor_tokens=*/0);
+    AdmissionProbe out;
+    out.device = probeTierWithKeys(pool_, group_keys, num_base_pages, /*floor_tokens=*/0);
     if (host_pool_ != nullptr) {
-        out.host = matchTierWithKeys(*host_pool_, group_keys, num_base_pages,
+        out.host = probeTierWithKeys(*host_pool_, group_keys, num_base_pages,
                                      /*floor_tokens=*/out.device.num_common_tokens);
     }
     return out;
+}
+
+KvCacheCoordinator::AdmissionMatch KvCacheCoordinator::AcquirePrefix(std::span<const std::string> content_hashes,
+                                                                     AdmissionProbe&& probe) {
+    const std::vector<std::vector<std::string>> group_keys = buildGroupKeys(content_hashes);
+    AdmissionMatch out;
+    out.device = acquireTierWithKeys(pool_, group_keys, /*floor_tokens=*/0, std::move(probe.device));
+    if (host_pool_ != nullptr) {
+        out.host = acquireTierWithKeys(*host_pool_, group_keys, out.device.num_common_tokens, std::move(probe.host));
+    }
+    return out;
+}
+
+KvCacheCoordinator::AdmissionMatch KvCacheCoordinator::MatchPrefix(std::span<const std::string> content_hashes) {
+    return AcquirePrefix(content_hashes, ProbePrefix(content_hashes));
 }
 
 void KvCacheCoordinator::ClaimCommonPrefix(std::span<BlockTable> tables, CoordinatorMatch&& hit) {

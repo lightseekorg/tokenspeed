@@ -169,6 +169,23 @@ TEST(CoordinatorMatchTest, TrimmedFullHitsDoNotRefreshEvictionOrder) {
     EXPECT_EQ(acquired.back()->BlockId(), trimmed);
 }
 
+TEST(CoordinatorMatchTest, AdmissionProbeDoesNotRefreshEvictionOrder) {
+    BlockPool pool(3);  // 2 usable blocks, both cached below.
+    const std::vector<KvCacheSpec> specs = {{AttnKind::kFull, 4, 0}};
+    KvCacheCoordinator coord = MakeCoordinator(specs, pool);
+    std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}});
+    const std::int32_t oldest = CacheForGroup(pool, ch[0], 0);
+    CacheForGroup(pool, ch[1], 0);
+
+    KvCacheCoordinator::AdmissionProbe probe = coord.ProbePrefix(std::span<const std::string>{ch}.first(1));
+    EXPECT_EQ(probe.device.num_common_tokens, 4);
+    EXPECT_EQ(pool.NumFreeBlocks(), 2);
+
+    BlockRef acquired = pool.AcquireBlock();
+    ASSERT_TRUE(acquired);
+    EXPECT_EQ(acquired->BlockId(), oldest);
+}
+
 TEST(CoordinatorMatchTest, SwaMissForcesZeroCommon) {
     // full caches 2 pages, swa caches nothing -> common = min(2, 0) = 0.
     BlockPool pool(16);

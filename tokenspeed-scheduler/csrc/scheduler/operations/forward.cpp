@@ -27,6 +27,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -149,15 +150,14 @@ Scheduler::FlatAdmissionMatch Scheduler::matchFlatPrefixAtAdmission(Request* req
     }
     const std::vector<std::string> flat_hashes = ComputePagedHashes(paged_tokens, "");
     FlatAdmissionMatch match;
-    auto [device, host] = coordinator_.MatchPrefix(flat_hashes);
-    match.device = std::move(device);
-    match.host = std::move(host);
+    match.probe = coordinator_.ProbePrefix(flat_hashes);
     // Boundaries are in tokens; the extension hash offsets are in base pages (the granularity the
     // hashes were computed at). No host pool -> host boundary 0 -> empty slice.
     const std::int32_t ext_pages =
-        std::max(match.host.num_common_tokens - match.device.num_common_tokens, 0) / base_block_size;
-    const auto ext_begin = flat_hashes.begin() + match.device.num_common_tokens / base_block_size;
+        std::max(match.probe.host.num_common_tokens - match.probe.device.num_common_tokens, 0) / base_block_size;
+    const auto ext_begin = flat_hashes.begin() + match.probe.device.num_common_tokens / base_block_size;
     match.ext_hashes.assign(ext_begin, ext_begin + ext_pages);
+    match.hashes = flat_hashes;
     return match;
 }
 
@@ -311,7 +311,7 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     FlatAdmissionMatch flat_match = matchFlatPrefixAtAdmission(request);
     // Overwrite the radix-sourced locals: the radix tree is never written on flat builds.
     const std::int32_t flat_hit_tokens =
-        std::max(flat_match.device.num_common_tokens, flat_match.host.num_common_tokens);
+        std::max(flat_match.probe.device.num_common_tokens, flat_match.probe.host.num_common_tokens);
     unscheduled = request->PrefillSize() - flat_hit_tokens;
     tokens_this_round = std::min(remaining, unscheduled);
 
@@ -319,8 +319,8 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     const std::int32_t flat_decode_reserve = completes_prefill ? decode_input_tokens : 0;
     // One pin per real (non-hole) extension slot across all groups = the new device pages the load needs.
     std::int32_t flat_ext_real_pages = 0;
-    for (const PrefixMatch& g : flat_match.host.per_group) {
-        flat_ext_real_pages += g.num_hit_blocks;
+    for (const PrefixProbe& g : flat_match.probe.host.per_group) {
+        flat_ext_real_pages += static_cast<std::int32_t>(std::ranges::count(g.hits, std::uint8_t{1}));
     }
     const std::optional<std::int32_t> flat_reserve_pages =
         flatAdmitFirstChunk(request, flat_ext_real_pages, tokens_this_round, flat_decode_reserve);
@@ -363,6 +363,8 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     }
 
 #if TOKENSPEED_FLAT_KVCACHE
+    KvCacheCoordinator::AdmissionMatch acquired_flat_match =
+        coordinator_.AcquirePrefix(flat_match.hashes, std::move(flat_match.probe));
     // Role kD reaches PrefillDone via RemotePrefillDoneEvent with reserve 0: recording would leave a phantom entry.
     if (*flat_reserve_pages > 0 && config_.role != Role::kD) {
         flat_reserved_pages_[request->Id()] = *flat_reserve_pages;
@@ -383,8 +385,8 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         std::move(mamba_loadback_nodes),
 #if TOKENSPEED_FLAT_KVCACHE
         &coordinator_,
-        std::move(flat_match.device),
-        std::move(flat_match.host),
+        std::move(acquired_flat_match.device),
+        std::move(acquired_flat_match.host),
         std::move(flat_match.ext_hashes),
 #endif
     };

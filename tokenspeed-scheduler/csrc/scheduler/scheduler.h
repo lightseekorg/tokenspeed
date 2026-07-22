@@ -129,11 +129,11 @@ private:
     std::optional<fsm::ScheduleRetractEvent> scheduleRetract(Request* request);
 
 #if TOKENSPEED_FLAT_KVCACHE
-    // One hash pass at admission: owning device/host matches plus the extension's
-    // hash slice (registration form).
+    // One hash pass at admission: non-owning device/host probes plus the hashes
+    // retained for acquisition after every admission check succeeds.
     struct FlatAdmissionMatch {
-        CoordinatorMatch device;
-        CoordinatorMatch host;
+        KvCacheCoordinator::AdmissionProbe probe;
+        std::vector<std::string> hashes;
         std::vector<std::string> ext_hashes;
     };
     FlatAdmissionMatch matchFlatPrefixAtAdmission(Request* request);
