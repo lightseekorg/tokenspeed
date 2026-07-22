@@ -165,9 +165,12 @@ Scheduler::FlatAdmissionMatch Scheduler::matchFlatPrefixAtAdmission(Request* req
 std::optional<std::int32_t> Scheduler::flatAdmitFirstChunk(Request* request, const CoordinatorMatch& hit,
                                                            std::int32_t ext_real_pages, std::int32_t chunk_tokens,
                                                            std::int32_t decode_reserve_tokens) const {
-    // Charge chunk + reserve in one query: unreserved, an exactly-filling prompt's own decode defers forever.
+    // Charge chunk-then-reserve sequentially: unreserved, an exactly-filling prompt's own decode
+    // defers forever, and the combined query under-charges live-tail groups (non-monotonic).
     // ext_real_pages composes exactly: extension pages are FULL, so they leave tail_avail 0.
-    const std::int32_t blocks_needed = coordinator_.BlocksNeededFor(chunk_tokens + decode_reserve_tokens);
+    // Fresh-table charge is exact only because SweepThenConverge pins claim extents to the same
+    // lcm MakeCoordinator wires as the live alignment (slotIsLive is not shift-invariant otherwise).
+    const std::int32_t blocks_needed = coordinator_.BlocksNeededForSequential(chunk_tokens, decode_reserve_tokens);
     // Exact since gate and apply run back to back.
     const std::int32_t claim_blocks = coordinator_.BlocksConsumedByClaim(hit);
     if (blocks_needed + claim_blocks + ext_real_pages > flatFreeBudget(request->Id())) {
@@ -183,7 +186,7 @@ std::optional<std::int32_t> Scheduler::flatAdmitPrefillChunk(Request* request, s
                                                              std::int32_t num_computed_tokens) const {
     const std::int32_t slide_credit = FlatSlideCredit(coordinator_, request->FlatBlockTablesRef(), num_computed_tokens);
     const std::int32_t blocks_needed =
-        coordinator_.BlocksNeededFor(request->FlatBlockTablesRef(), chunk_tokens + decode_reserve_tokens);
+        coordinator_.BlocksNeededForSequential(request->FlatBlockTablesRef(), chunk_tokens, decode_reserve_tokens);
     if (blocks_needed > flatFreeBudget(request->Id()) + slide_credit) {
         return std::nullopt;
     }

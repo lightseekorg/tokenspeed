@@ -472,6 +472,8 @@ def _publish_inkling_conv_groups(config, model_config, server_args) -> tuple[int
             sliding_window_tokens=conv_bt + tc.sconv_kernel_size,
             family="history",
             block_size=conv_bt,
+            # Conv reads the chunk from packed activations, so slid-out pages can be holes (degenerates to full at this block size).
+            live_tail_alloc=True,
         )
         for label in dict.fromkeys(tc.paged_cache_layer_types)
     )
@@ -488,6 +490,8 @@ def _publish_inkling_conv_groups(config, model_config, server_args) -> tuple[int
                 sliding_window_tokens=hbt + tc.sconv_kernel_size,
                 family="history",
                 block_size=hbt,
+                # Drops the ~17 GB/GPU 8k-chunk hiddenconv admission transient ~16x.
+                live_tail_alloc=True,
             )
             for label in dict.fromkeys(tc.paged_cache_layer_types)
         )

@@ -84,6 +84,7 @@ std::vector<KvCacheSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
             .kind = is_swa ? AttnKind::kSlidingWindow : AttnKind::kFull,
             .block_size = block_size,
             .sliding_window = is_swa ? group.sliding_window_tokens.value_or(0) : 0,
+            .live_tail_alloc = is_swa && group.live_tail_alloc,
         });
     }
     return specs;

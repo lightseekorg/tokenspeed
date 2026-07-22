@@ -83,6 +83,12 @@ public:
     // Fresh-table overload for a not-yet-allocated request (no tail credit).
     std::int32_t BlocksNeededFor(std::int32_t num_tokens) const;
 
+    // Peak demand of Acquire(first) then Acquire(extra) -- the chunk + decode-reserve admission
+    // charge (live-tail groups are non-monotonic, so the combined query can under-charge).
+    std::int32_t BlocksNeededForSequential(std::span<const BlockTable> tables, std::int32_t first_tokens,
+                                           std::int32_t extra_tokens) const;
+    std::int32_t BlocksNeededForSequential(std::int32_t first_tokens, std::int32_t extra_tokens) const;
+
     // end_tokens = the chunk's end position (-1 = unknown/legacy): aligned-final-page-only
     // groups register nothing without it, since only an aligned chunk end holds a real snapshot.
     // first_slot may reach back to the fold grid (decode re-covers so coarse groups can fold);

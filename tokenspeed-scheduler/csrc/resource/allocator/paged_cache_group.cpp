@@ -44,6 +44,9 @@ void PagedCacheGroupConfig::Validate() const {
     if (retention == Retention::SlidingWindow && (!sliding_window_tokens.has_value() || *sliding_window_tokens <= 0)) {
         throw std::invalid_argument("PagedCacheGroupConfig: sliding_window_tokens must be > 0 for sliding groups");
     }
+    if (live_tail_alloc && retention != Retention::SlidingWindow) {
+        throw std::invalid_argument("PagedCacheGroupConfig: live_tail_alloc requires SlidingWindow retention");
+    }
 }
 
 PagedCacheGroupAllocator::PagedCacheGroupAllocator(PagedCacheGroupConfig config)

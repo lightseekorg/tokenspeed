@@ -171,6 +171,9 @@ def pool_to_paged_cache_groups(pool: Any) -> list:
         # Ctor default 0 = global base; a spec block_size sets the per-group granularity.
         if getattr(spec, "block_size", None):
             cfg.block_size = int(spec.block_size)
+        # Attribute-set (not ctor kwarg) so an older compiled ext fails loudly here.
+        if getattr(spec, "live_tail_alloc", False):
+            cfg.live_tail_alloc = True
         out.append(cfg)
     return out
 

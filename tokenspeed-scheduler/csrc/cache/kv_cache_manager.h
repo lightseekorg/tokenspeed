@@ -64,7 +64,9 @@ public:
     }
 
     // All-or-nothing (tail-page room first, then fresh pages): on shortfall the table is unchanged, returns false.
-    bool Acquire(BlockPool& pool, BlockTable& table, std::int32_t num_tokens) {
+    // Virtual so live-tail overrides can hole dead slots; overrides keep the all-or-nothing contract + BlocksNeededFor
+    // mirror.
+    virtual bool Acquire(BlockPool& pool, BlockTable& table, std::int32_t num_tokens) {
         if (num_tokens <= 0) {
             return true;
         }
@@ -95,19 +97,27 @@ public:
                 table.blocks_.push_back(BlockRef::Share(pool, pool.NullBlock()));
                 continue;
             }
-            const bool acquired = Acquire(pool, table, block_size_);
+            // Base Acquire on purpose: a loaded host page must land in a REAL slot, not a live-tail hole.
+            const bool acquired = KvCacheManager::Acquire(pool, table, block_size_);
             _assert(acquired, "pre-checked Acquire must succeed");
             load_pairs.emplace_back(host_block, table.blocks_.back().Get());
         }
     }
 
-    // Pure query mirroring Acquire's page math exactly.
-    std::int32_t BlocksNeededFor(const BlockTable& table, std::int32_t num_tokens) const {
+    // Pure query mirroring Acquire's page math exactly (virtual in lockstep with Acquire).
+    virtual std::int32_t BlocksNeededFor(const BlockTable& table, std::int32_t num_tokens) const {
         if (num_tokens <= table.tail_avail_) {
             return 0;
         }
         std::int32_t over = num_tokens - table.tail_avail_;
         return (over + block_size_ - 1) / block_size_;
+    }
+
+    // Peak demand of Acquire(first) then Acquire(extra): live-tail holing makes the combined
+    // query non-monotonic, so gating on BlocksNeededFor(first + extra) can under-charge.
+    virtual std::int32_t BlocksNeededForSequential(const BlockTable& table, std::int32_t first_tokens,
+                                                   std::int32_t extra_tokens) const {
+        return BlocksNeededFor(table, first_tokens + extra_tokens);  // exact when pages never turn into holes
     }
 
     // State snapshots are only boundary-correct where a forward call ended page-aligned:
@@ -158,9 +168,25 @@ public:
         pool.FreeBlocks(batch);
         table.blocks_.clear();
         table.tail_avail_ = 0;
+        table.reclaim_floor_ = 0;
     }
 
 protected:
+    // Table-mutation helpers for derived Acquire overrides (BlockTable befriends only this base).
+    static std::int32_t TableExtentTokens(const BlockTable& table, std::int32_t block_size) {
+        return table.NumBlocks() * block_size - table.tail_avail_;
+    }
+    static std::int32_t TableTailAvail(const BlockTable& table) { return table.tail_avail_; }
+    static void SetTableTailAvail(BlockTable& table, std::int32_t tail_avail) { table.tail_avail_ = tail_avail; }
+    static std::int32_t TableReclaimFloor(const BlockTable& table) { return table.reclaim_floor_; }
+    static void SetTableReclaimFloor(BlockTable& table, std::int32_t floor) { table.reclaim_floor_ = floor; }
+    static void AppendRealBlock(BlockPool& pool, BlockTable& table, CacheBlock* block) {
+        table.blocks_.push_back(BlockRef::Adopt(pool, block));
+    }
+    static void AppendHole(BlockPool& pool, BlockTable& table) {
+        table.blocks_.push_back(BlockRef::Share(pool, pool.NullBlock()));
+    }
+
     std::int32_t block_size_;
 };
 
