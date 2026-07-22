@@ -81,6 +81,7 @@ tokenspeed serve nvidia/MiniMax-M3-NVFP4 \
     --gpu-memory-utilization 0.95 \
     --disable-cuda-graph-padding \
     --attention-backend trtllm \
+    --kv-cache-dtype fp8 \
     --moe-backend flashinfer_trtllm \
     --speculative-algorithm EAGLE3 \
     --speculative-draft-model-path Inferact/MiniMax-M3-EAGLE3 \
