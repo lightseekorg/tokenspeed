@@ -140,8 +140,7 @@ CoordinatorMatch KvCacheCoordinator::matchTierWithKeys(BlockPool& pool,
             _assert(groups_[i].Manager().MatchIsPrefixClosed(), "window group left above the converged boundary");
             probe.hits.resize(static_cast<std::size_t>(boundary_tokens / group_block_size - floor_blocks));
         }
-        out.per_group[i] =
-            groups_[i].Manager().AcquireMatchedBlocks(pool, group_keys[i], floor_blocks, probe);
+        out.per_group[i] = groups_[i].Manager().AcquireMatchedBlocks(pool, group_keys[i], floor_blocks, probe);
     }
     out.num_common_tokens = boundary_tokens;
     return out;

@@ -51,11 +51,11 @@ public:
 
     // Probe slots [begin_blocks, max_blocks) without changing pool ownership.
     // Hit slots are relative to begin_blocks.
-    virtual PrefixProbe Probe(const BlockPool& pool, std::span<const std::string> keys,
-                              std::int32_t begin_blocks, std::int32_t max_blocks) const = 0;
+    virtual PrefixProbe Probe(const BlockPool& pool, std::span<const std::string> keys, std::int32_t begin_blocks,
+                              std::int32_t max_blocks) const = 0;
 
-    PrefixMatch AcquireMatchedBlocks(BlockPool& pool, std::span<const std::string> keys,
-                                     std::int32_t begin_blocks, const PrefixProbe& probe) const {
+    PrefixMatch AcquireMatchedBlocks(BlockPool& pool, std::span<const std::string> keys, std::int32_t begin_blocks,
+                                     const PrefixProbe& probe) const {
         _assert(begin_blocks >= 0 && static_cast<std::size_t>(begin_blocks) + probe.hits.size() <= keys.size(),
                 "matched block range is out of bounds");
         PrefixMatch match;

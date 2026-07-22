@@ -59,8 +59,8 @@ public:
             return probe;
         }
         const auto [boundary, hits_begin] = findResumableBoundary(
-            [&](std::int32_t i) { return pool.ContainsCachedBlock(keys[static_cast<std::size_t>(i)]); },
-            begin_blocks, end_blocks);
+            [&](std::int32_t i) { return pool.ContainsCachedBlock(keys[static_cast<std::size_t>(i)]); }, begin_blocks,
+            end_blocks);
         if (boundary == begin_blocks) {
             return probe;
         }
