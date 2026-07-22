@@ -42,9 +42,17 @@ _FP8_CHANNEL_SCALE = ScaleFormat(
     storage_dtype=torch.float32,
     granularity="channel",
 )
+_MXFP8_UE8M0_1X32_SCALE = ScaleFormat(
+    storage_dtype=torch.uint8,
+    granularity="block",
+    block_shape=(1, 32),
+)
+# No reference is registered for the mixed float-A/ue8m0-B (1,32) signature:
+# it exists only so kernels win dispatch before the gemm dispatcher requants
+# activations to ue8m0; kernel impls never execute with float (1,32) A scales.
 _MXFP8_FORMAT_SIGNATURES = format_signatures(
     ("a", "b"), "mxfp8", {fp8_dtype}, scale=_FP8_BLOCK_SCALE
-)
+) | format_signatures(("a", "b"), "mxfp8", {fp8_dtype}, scale=_MXFP8_UE8M0_1X32_SCALE)
 _FP8_TENSOR_FORMAT_SIGNATURES = format_signatures(
     ("a", "b"), "scaled-fp8", {fp8_dtype}, scale=_FP8_TENSOR_SCALE
 )
@@ -54,6 +62,13 @@ _FP8_SCALED_BMM_FORMAT_SIGNATURES = _FP8_TENSOR_FORMAT_SIGNATURES | format_signa
 _DENSE_GEMM_FORMAT_SIGNATURES = format_signatures(
     ("a", "b"), "dense", {torch.bfloat16, torch.float16, torch.float32}
 )
+
+
+def _dequant_scales(scales: torch.Tensor) -> torch.Tensor:
+    if scales.dtype == torch.uint8:
+        # ue8m0: biased power-of-two exponent bytes.
+        return torch.exp2(scales.float() - 127.0)
+    return scales.float()
 
 
 def _as_baddbmm_alpha(alpha: torch.Tensor | float | int | None) -> float | int:
@@ -135,9 +150,9 @@ def torch_mm_fp8_blockscale(
         f"got {tuple(B_scales.shape)}"
     )
 
-    A_scaled = A_scales.float().repeat_interleave(block_k, dim=1)[:, :K]
+    A_scaled = _dequant_scales(A_scales).repeat_interleave(block_k, dim=1)[:, :K]
     B_scaled = (
-        B_scales.float()
+        _dequant_scales(B_scales)
         .repeat_interleave(block_n, dim=0)
         .repeat_interleave(block_k, dim=1)[:N, :K]
     )
