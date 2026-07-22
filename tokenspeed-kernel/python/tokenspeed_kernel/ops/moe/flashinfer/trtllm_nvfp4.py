@@ -200,6 +200,35 @@ if platform.is_nvidia:
             w2_input_scale_quant * (w13_input_scale * up_ws2).to(torch.float32),
             requires_grad=False,
         )
+
+        swiglu_arg = getattr(w, "swiglu_arg", None)
+        if swiglu_arg is not None:
+            # The fused gated activation runs on pre-dequant accumulators
+            # (actual = raw * g1_alphas), so beta and the clamp limit must be
+            # expressed in the raw domain; alpha passes through unchanged.
+            # Folding the gate dequant scale is only exact when the gate and
+            # up halves share one global scale.
+            if not torch.equal(gate_ws2, up_ws2):
+                raise RuntimeError(
+                    "NVFP4 swiglu alpha/limit requires equal gate/up "
+                    "weight_scale_2 per expert."
+                )
+            alpha = swiglu_arg.alpha if swiglu_arg.alpha is not None else 1.0
+            beta = getattr(w, "swiglu_beta", None)
+            w.gemm1_alpha = torch.nn.Parameter(
+                torch.full_like(w.g1_alphas.data, float(alpha)),
+                requires_grad=False,
+            )
+            if beta is not None:
+                w.gemm1_beta = torch.nn.Parameter(
+                    float(beta) / w.g1_alphas.data, requires_grad=False
+                )
+            if swiglu_arg.limit is not None:
+                w.gemm1_clamp_limit = torch.nn.Parameter(
+                    float(swiglu_arg.limit) / w.g1_alphas.data,
+                    requires_grad=False,
+                )
+
         # Store intermediate_size_per_partition for the executor
         w.intermediate_size_per_partition = intermediate_size
 
@@ -263,9 +292,9 @@ if platform.is_nvidia:
                 torch.float8_e4m3fn
             ),
             gemm1_bias=None,
-            gemm1_alpha=None,
-            gemm1_beta=None,
-            gemm1_clamp_limit=None,
+            gemm1_alpha=getattr(w, "gemm1_alpha", None),
+            gemm1_beta=getattr(w, "gemm1_beta", None),
+            gemm1_clamp_limit=getattr(w, "gemm1_clamp_limit", None),
             gemm2_weights=w.gemm2_weights_fp4_shuffled.data,
             gemm2_weights_scale=w.gemm2_scales_fp4_shuffled.data.view(
                 torch.float8_e4m3fn

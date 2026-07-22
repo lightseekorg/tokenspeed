@@ -1495,7 +1495,7 @@ def _moe_apply_nvfp4_deepep_cutedsl() -> object:
     plan = tokenspeed_kernel.moe_plan(
         "nvfp4",
         input_dtype=torch.bfloat16,
-        activation="swiglu",
+        activation="silu",
         a2a_backend="deepep",
         ep_size=2,
         ispp=128,

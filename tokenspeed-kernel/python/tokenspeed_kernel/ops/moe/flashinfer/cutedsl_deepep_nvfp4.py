@@ -121,7 +121,7 @@ if platform.is_nvidia:
         ),
         traits={
             "weight_dtype": frozenset({"nvfp4"}),
-            "activation": frozenset({"silu", "swiglu"}),
+            "activation": frozenset({"silu"}),
             "routing_mode": frozenset({"precomputed_topk"}),
             "supports_deferred_finalize": frozenset({False}),
             "supports_ep": frozenset({True}),

@@ -168,6 +168,7 @@ class BreakableCapture:
         self._stream_ctx: Any | None = None
         # Break-output handoff buffers keyed by (shape, dtype, device); see break_point.
         self._handoff: dict[Any, torch.Tensor] = {}
+        self._valid_rows: int | None = None
 
     @classmethod
     def current(cls) -> BreakableCapture | None:
@@ -245,13 +246,24 @@ class BreakableCapture:
 
     # -- replay ------------------------------------------------------------
 
-    def replay(self) -> None:
+    def replay(self, valid_rows: int | None = None) -> None:
         """Replay all segments in order.
 
         Breaks read the live forward context from the ambient :func:`active_forward`
-        scope (the runner wraps replay in it), so this stays a pure graph primitive.
+        scope (the runner wraps replay in it).
+
+        Args:
+            valid_rows: Number of valid leading rows in a padded replay. After
+                each eager break, handoff rows beyond this prefix are cleared
+                before the following graph segment consumes them. ``None``
+                leaves handoff buffers unchanged.
         """
-        deque((run() for run in self.segments), maxlen=0)
+        previous_valid_rows = self._valid_rows
+        self._valid_rows = valid_rows
+        try:
+            deque((run() for run in self.segments), maxlen=0)
+        finally:
+            self._valid_rows = previous_valid_rows
 
     @property
     def num_segments(self) -> int:
@@ -309,6 +321,8 @@ def _record_break(
         if dst is None:
             dst = state["dst"] = resolve_dst(result)
         _land_in(dst, result)
+        if cap._valid_rows is not None:
+            scrub_padding_tail(cap._valid_rows, dst)
         return dst
 
     return cap.add_eager(replay_fn)
@@ -441,8 +455,10 @@ def _land_in(dst: torch.Tensor, result: torch.Tensor) -> None:
     ``dst`` is the (possibly token-padded) handoff buffer the next graph segment
     reads. ``result`` may cover only the real (unpadded) leading rows -- e.g. a
     varlen attention kernel writes only ``sum(cu_seqlens_q)`` rows -- so we copy
-    into the matching leading slice. Padded rows are left as-is (discarded by the
-    final output slice). No-op when the op already wrote ``dst`` in place.
+    into the matching leading slice. Padded rows are otherwise left as-is;
+    :meth:`BreakableCapture.replay` clears them before the following graph segment
+    when it is given the valid prefix length. No-op when the op already wrote
+    ``dst`` in place.
     """
     if result is dst:
         return

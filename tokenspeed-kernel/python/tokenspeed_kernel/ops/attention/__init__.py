@@ -119,11 +119,272 @@ __all__ = [
     "dsa_prefill_topk",
     "dsa_decode_topk",
     "dsa_plan",
+    "msa_decode_with_kvcache",
+    "msa_extend_with_kvcache",
     "attn_merge_state",
     "mha_plan",
 ]
 
 LSE_LN = math.log2(math.e)
+
+
+def msa_decode_with_kvcache(
+    q: torch.Tensor,
+    index_q: torch.Tensor,
+    index_k: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    *,
+    topk: int,
+    page_size: int,
+    index_scale: float,
+    attention_scale: float,
+    init_blocks: int,
+    local_blocks: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    override: str | None = None,
+    solution: str | None = None,
+) -> torch.Tensor:
+    """Run MSA decode against paged K/V and index-key caches.
+
+    Args:
+        q: Main queries shaped ``[tokens, local_heads, head_dim]``.
+        index_q: Index queries shaped ``[tokens, local_groups, index_dim]``.
+        index_k: Index keys for the current tokens shaped
+            ``[tokens, index_dim]``.
+        k_cache: Paged key cache shaped
+            ``[pages, local_kv_heads, page_size, head_dim]``.
+        v_cache: Paged value cache with the same shape as ``k_cache``.
+        index_k_cache: Per-layer index-key cache shaped
+            ``[slots, index_dim]``.
+        slot_mapping: Cache slot for each current token.
+        page_table: Logical-to-physical page table.
+        cache_seqlens: Visible sequence lengths after the current tokens.
+        topk: Number of sparse blocks selected for each index query.
+        page_size: Number of cache tokens in each indexed block.
+        index_scale: Scale applied to index scores.
+        attention_scale: Scale applied to main attention scores.
+        init_blocks: Leading blocks forced into the selected set.
+        local_blocks: Recent blocks forced into the selected set.
+        max_seqlen_q: Uniform query-token count per request.
+        max_seqlen_k: Maximum KV length addressable through ``page_table``.
+        override: Optional kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+
+    Returns:
+        Attention output with the same shape and dtype as ``q``. The indexer
+        stage also writes ``index_k`` into ``index_k_cache`` at
+        ``slot_mapping``.
+    """
+    traits = {
+        "head_dim": q.shape[-1],
+        "index_head_dim": index_q.shape[-1],
+        "page_size": page_size,
+        "topk": topk,
+    }
+    signature = _attention_format_signature(
+        q=q,
+        index_q=index_q,
+        index_k=index_k,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        index_k_cache=index_k_cache,
+    )
+    kernel = select_kernel(
+        "attention",
+        "msa_decode_with_kvcache",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+
+    shape_params = {
+        "batch_size": cache_seqlens.shape[0],
+        "total_q": q.shape[0],
+        "num_pages": k_cache.shape[0],
+        "page_size": page_size,
+        "max_pages_per_seq": page_table.shape[1],
+        "num_q_heads": q.shape[1],
+        "num_kv_heads": k_cache.shape[1],
+        "head_dim": q.shape[-1],
+        "index_head_dim": index_q.shape[-1],
+        "topk": topk,
+        "max_seqlen_q": max_seqlen_q,
+        "max_seqlen_k": max_seqlen_k,
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "msa_decode_with_kvcache",
+        kernel.name,
+        q.dtype,
+        shape_params,
+    )
+
+    with kernel_scope(
+        "attention",
+        "msa_decode_with_kvcache",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            q=q,
+            index_q=index_q,
+            index_k=index_k,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            index_k_cache=index_k_cache,
+            slot_mapping=slot_mapping,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            topk=topk,
+            page_size=page_size,
+            index_scale=index_scale,
+            attention_scale=attention_scale,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+        )
+
+
+def msa_extend_with_kvcache(
+    q: torch.Tensor,
+    index_q: torch.Tensor,
+    index_k: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    *,
+    topk: int,
+    page_size: int,
+    index_scale: float,
+    attention_scale: float,
+    init_blocks: int,
+    local_blocks: int,
+    override: str | None = None,
+    solution: str | None = None,
+) -> torch.Tensor:
+    """Run MSA extend against paged K/V and index-key caches.
+
+    Args:
+        q: Main queries shaped ``[total_q, local_heads, head_dim]``.
+        index_q: Index queries shaped
+            ``[total_q, local_groups, index_dim]``.
+        index_k: Index keys for the current tokens shaped
+            ``[total_q, index_dim]``.
+        k_cache: Paged key cache shaped
+            ``[pages, local_kv_heads, page_size, head_dim]``.
+        v_cache: Paged value cache with the same shape as ``k_cache``.
+        index_k_cache: Per-layer index-key cache shaped
+            ``[slots, index_dim]``.
+        slot_mapping: Cache slot for each current token.
+        page_table: Logical-to-physical page table.
+        cache_seqlens: Visible sequence lengths after the current tokens.
+        cu_seqlens_q: Cumulative query lengths shaped ``[batch + 1]``.
+        prefix_lens: Cached prefix length for each request.
+        max_seqlen_q: Maximum query length in the batch.
+        max_seqlen_k: Maximum visible KV length in the batch.
+        topk: Number of sparse blocks selected for each index query.
+        page_size: Number of cache tokens in each indexed block.
+        index_scale: Scale applied to index scores.
+        attention_scale: Scale applied to main attention scores.
+        init_blocks: Leading blocks forced into the selected set.
+        local_blocks: Recent blocks forced into the selected set.
+        override: Optional kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+
+    Returns:
+        Attention output with the same shape and dtype as ``q``. The indexer
+        stage also writes ``index_k`` into ``index_k_cache`` at
+        ``slot_mapping``.
+    """
+    traits = {
+        "head_dim": q.shape[-1],
+        "index_head_dim": index_q.shape[-1],
+        "page_size": page_size,
+        "topk": topk,
+    }
+    signature = _attention_format_signature(
+        q=q,
+        index_q=index_q,
+        index_k=index_k,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        index_k_cache=index_k_cache,
+    )
+    kernel = select_kernel(
+        "attention",
+        "msa_extend_with_kvcache",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+
+    shape_params = {
+        "batch_size": cache_seqlens.shape[0],
+        "total_q": q.shape[0],
+        "num_pages": k_cache.shape[0],
+        "page_size": page_size,
+        "max_pages_per_seq": page_table.shape[1],
+        "num_q_heads": q.shape[1],
+        "num_kv_heads": k_cache.shape[1],
+        "head_dim": q.shape[-1],
+        "index_head_dim": index_q.shape[-1],
+        "topk": topk,
+        "max_seqlen_q": max_seqlen_q,
+        "max_seqlen_k": max_seqlen_k,
+    }
+    ShapeCapture.get().record(
+        "attention",
+        "msa_extend_with_kvcache",
+        kernel.name,
+        q.dtype,
+        shape_params,
+    )
+
+    with kernel_scope(
+        "attention",
+        "msa_extend_with_kvcache",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            q=q,
+            index_q=index_q,
+            index_k=index_k,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            index_k_cache=index_k_cache,
+            slot_mapping=slot_mapping,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            prefix_lens=prefix_lens,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            topk=topk,
+            page_size=page_size,
+            index_scale=index_scale,
+            attention_scale=attention_scale,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+        )
 
 
 # ===-----------------------------------------------------------------------===#
