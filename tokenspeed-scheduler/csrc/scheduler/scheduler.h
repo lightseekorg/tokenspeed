@@ -110,6 +110,10 @@ private:
     std::optional<WriteBackOperation> applyEventAndGenerateOp(Request* request, fsm::ScheduleRetractEvent event);
     PrefetchOperation applyEventAndGenerateOp(Request* request, fsm::SchedulePrefetchEvent event);
 
+#if !TOKENSPEED_FLAT_KVCACHE
+    void finalizeRadixPageTableEmission(Request* request, ForwardOperationBase& op, bool force_full);
+#endif
+
     std::optional<fsm::SchedulePrefetchEvent> schedulePrefetch(Request* request, const MatchResult& match);
 
     std::optional<fsm::SchedulePrefillFirstChunkEvent> schedulePrefillFirstChunk(
@@ -185,6 +189,16 @@ private:
     KVPrefixCache kv_prefix_cache_;
     ReqPoolAllocator req_pool_allocator_;
     std::optional<HybridPrefixCache> hybrid_prefix_cache_{};
+
+#if !TOKENSPEED_FLAT_KVCACHE
+    struct RadixPageTableEmission {
+        std::int32_t prefix_pages{-1};
+        std::vector<std::int32_t> local_pages;
+    };
+    // Baseline of the page table last emitted for each Python req_to_page row.
+    // Slot 0 is reserved, matching ReqPoolAllocator and the Python request pool.
+    std::vector<RadixPageTableEmission> radix_page_table_emissions_;
+#endif
 
 #if TOKENSPEED_FLAT_KVCACHE
     BlockPool block_pool_;

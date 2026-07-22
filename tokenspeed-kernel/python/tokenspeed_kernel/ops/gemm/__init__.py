@@ -99,15 +99,22 @@ def _gemm_format_signature(
     if quant == "mxfp8":
         if block_size is None:
             raise ValueError("mxfp8 format selection requires block_size")
-        scale = ScaleFormat(
-            storage_dtype=_scale_storage_dtype(A_scales, B_scales),
+        if B_scales is None:
+            raise ValueError("mxfp8 format selection requires B_scales")
+        a_scale = ScaleFormat(
+            storage_dtype=(A_scales.dtype if A_scales is not None else torch.float32),
+            granularity="block",
+            block_shape=tuple(block_size),
+        )
+        b_scale = ScaleFormat(
+            storage_dtype=B_scales.dtype,
             granularity="block",
             block_shape=tuple(block_size),
         )
         a_storage_dtype = _fp8_dtype if A_scales is None else A.dtype
         return format_signature(
-            a=tensor_format("mxfp8", a_storage_dtype, scale=scale),
-            b=tensor_format("mxfp8", B.dtype, scale=scale),
+            a=tensor_format("mxfp8", a_storage_dtype, scale=a_scale),
+            b=tensor_format("mxfp8", B.dtype, scale=b_scale),
         )
     if quant == "fp8":
         scale = ScaleFormat(
@@ -164,6 +171,17 @@ def _online_quantize_mxfp8(
     name because different backends require different scale layouts.
     """
     block_k = block_size[1]
+
+    if kernel_name == "triton_mm_fp8_blockscale" and block_k == 32:
+        from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
+
+        return quantize_fp8_with_scale(
+            A,
+            granularity="token_group",
+            group_size=block_k,
+            scale_encoding="float32",
+            solution="triton",
+        )
 
     if (
         kernel_name in {"flashinfer_mm_fp8_blockscale", "triton_mm_fp8_blockscale"}
@@ -284,7 +302,6 @@ def mm(
     quant: str | None = None,
     enable_pdl: bool = False,
     override: str | None = None,
-    expected_kernel_name: str | None = None,
 ) -> torch.Tensor:
     """Dense matrix multiply with automatic kernel selection.
 
@@ -315,7 +332,6 @@ def mm(
             from kernels that accept it.
         override: Force selection of a specific kernel by name (e.g.
             ``"cublaslt_mm_nvfp4"``). Bypasses heuristic scoring.
-        expected_kernel_name: Debug hint for expected kernel selection.
     """
     out_dtype = out_dtype or (out.dtype if out is not None else A.dtype)
 
@@ -356,7 +372,6 @@ def mm(
         signature,
         traits=traits,
         override=override,
-        expected_kernel_name=expected_kernel_name,
     )
 
     # Online activation quantization
@@ -425,7 +440,6 @@ def bmm(
     quant: str | None = None,
     enable_pdl: bool = False,
     override: str | None = None,
-    expected_kernel_name: str | None = None,
 ) -> torch.Tensor:
     """Batched matrix multiply with automatic kernel selection.
 
@@ -459,7 +473,6 @@ def bmm(
             from kernels that accept it.
         override: Force selection of a specific kernel by name. Bypasses
             heuristic scoring.
-        expected_kernel_name: Debug hint for expected kernel selection.
     """
     out_dtype = out_dtype or (out.dtype if out is not None else A.dtype)
     if A.ndim != 3:
@@ -504,7 +517,6 @@ def bmm(
         signature,
         traits=traits,
         override=override,
-        expected_kernel_name=expected_kernel_name,
     )
 
     if (

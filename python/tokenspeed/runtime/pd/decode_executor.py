@@ -117,8 +117,15 @@ class DisaggDecodeExecutor:
                 # the scheduler may still dispatch its forward op one last time.
                 continue
             extend_prefix_len = op.extend_prefix_lens[i]
+            # Exclude pages held only for reserved decode input token(s); P has
+            # source KV only through the logical end of the prompt.
+            prompt_end_page = (
+                op.prefill_lengths[i] + self.page_size - 1
+            ) // self.page_size
             kv_indices = np.array(
-                op.occupied_pages[i][extend_prefix_len // self.page_size :],
+                op.occupied_pages[i][
+                    extend_prefix_len // self.page_size : prompt_end_page
+                ],
                 dtype=np.int64,
             )
             aux_index = op.request_pool_indices[i]

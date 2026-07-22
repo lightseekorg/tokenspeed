@@ -157,17 +157,21 @@ class Fp8LinearMethod(LinearMethodBase):
                         raise ValueError(
                             "Block FP8 requires dynamic linear activation quantization."
                         )
+                scale_dtype = self.quant_config.weight_scale_dtype
                 scale = BlockQuantScaleParameter(
                     data=torch.empty(
                         (output_size_per_partition + block_n - 1) // block_n,
                         (input_size_per_partition + block_k - 1) // block_k,
-                        dtype=torch.float32,
+                        dtype=scale_dtype,
                     ),
                     input_dim=1,
                     output_dim=0,
                     weight_loader=weight_loader,
                 )
-                scale[:] = torch.finfo(torch.float32).min
+                if scale_dtype == torch.uint8:
+                    scale.zero_()
+                else:
+                    scale[:] = torch.finfo(torch.float32).min
                 layer.register_parameter("weight_scale_inv", scale)
             else:
                 scale = PerTensorScaleParameter(
@@ -213,7 +217,14 @@ class Fp8LinearMethod(LinearMethodBase):
             layer._use_deep_gemm_fp8 = False
             is_bmm = getattr(layer, "is_bmm", False)
             is_ue8m0 = getattr(self.quant_config, "scale_fmt", None) == "ue8m0"
-            if _transform_sf is not None and _ceil_to_ue8m0 is not None and is_ue8m0:
+            scale_requires_transform = (
+                is_ue8m0 and layer.weight_scale_inv.dtype.is_floating_point
+            )
+            if (
+                _transform_sf is not None
+                and _ceil_to_ue8m0 is not None
+                and scale_requires_transform
+            ):
                 N, K = layer.weight.shape
                 block_n, block_k = self.quant_config.weight_block_size
                 if is_bmm:

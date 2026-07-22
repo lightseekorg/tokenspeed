@@ -18,7 +18,16 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Golden selection tests for top-level tokenspeed-kernel public APIs."""
+"""Golden selection tests for top-level tokenspeed-kernel public APIs.
+
+Each case invokes a real public API (``mm``, ``moe_plan``/``moe_apply``,
+attention, sampling) with :class:`SelectedKernel` calls intercepted by a spy,
+and asserts the auto-selected kernel name.  Cases run on every host: the
+platform each case targets is injected via ``Platform.override`` with the
+fixture platforms from ``conftest.py``, so an NVIDIA CI machine also checks
+the AMD golden selections and vice versa.  Only kernels whose registration is
+import-guarded on missing optional backend packages are skipped.
+"""
 
 from __future__ import annotations
 
@@ -209,6 +218,9 @@ class KernelApiSelectionCase:
     mode: str
     arch: str
     expected: str
+    # Whether a platform would run this case natively.  Evaluated against the
+    # host platform to decide if a missing kernel registration is a failure
+    # (the host should have the backend) or a skip (optional backend absent).
     matches: Callable[[PlatformInfo], bool]
     invoke: Callable[[], object]
 
@@ -704,6 +716,21 @@ def test_bmm_nvfp4_signature_uses_fixed_block_shape() -> None:
         assert tensor_format.scale.block_shape == (16,)
 
 
+def _mm_mxfp4() -> torch.Tensor:
+    a = torch.empty((4, 32), dtype=torch.uint8)
+    b = torch.empty((128, 32), dtype=torch.uint8)
+    a_scales = torch.empty((4, 2), dtype=torch.uint8)
+    b_scales = torch.empty((128, 2), dtype=torch.uint8)
+    return tokenspeed_kernel.mm(
+        a,
+        b,
+        A_scales=a_scales,
+        B_scales=b_scales,
+        out_dtype=torch.bfloat16,
+        quant="mxfp4",
+    )
+
+
 def _attention_prefill() -> object:
     q = torch.empty((4, 16, 64), dtype=torch.bfloat16)
     k = torch.empty((4, 8, 64), dtype=torch.bfloat16)
@@ -1059,6 +1086,8 @@ def _attention_gdn_chunk_prefill() -> object:
 
 
 def _sampling_argmax() -> object:
+    if not torch.cuda.is_available():
+        pytest.skip("argmax dispatches through kernel selection only for CUDA tensors")
     logits = torch.empty((4, 4096), dtype=torch.float32, device="cuda")
     return tokenspeed_kernel.argmax(logits)
 
@@ -1466,7 +1495,7 @@ def _moe_apply_nvfp4_deepep_cutedsl() -> object:
     plan = tokenspeed_kernel.moe_plan(
         "nvfp4",
         input_dtype=torch.bfloat16,
-        activation="swiglu",
+        activation="silu",
         a2a_backend="deepep",
         ep_size=2,
         ispp=128,
@@ -1773,24 +1802,24 @@ _CASES = [
         _attention_merge_state,
     ),
     _case(
-        _is_blackwell_non_sm100,
-        "blackwell-non-sm100",
+        _is_blackwell_sm103,
+        "blackwell-sm103",
         "attention",
         "mha_extend_with_kvcache",
         "flashinfer_trtllm_mha_extend_with_kvcache",
         _attention_extend,
     ),
     _case(
-        _is_blackwell_non_sm100,
-        "blackwell-non-sm100",
+        _is_blackwell_sm103,
+        "blackwell-sm103",
         "attention",
         "mha_decode_with_kvcache",
         "flashinfer_trtllm_mha_decode_with_kvcache",
         _attention_decode,
     ),
     _case(
-        _is_blackwell_non_sm100,
-        "blackwell-non-sm100",
+        _is_blackwell_sm103,
+        "blackwell-sm103",
         "attention",
         "attn_merge_state",
         "cuda_attn_merge_state",
@@ -2006,6 +2035,14 @@ _CASES = [
         "mxfp8",
         "flashinfer_quantize_mxfp8",
         _quantize_mxfp8,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "gemm",
+        "mm",
+        "triton_mm_mxfp4",
+        _mm_mxfp4,
     ),
     # Sampling API x architecture golden cases.
     _case(
@@ -2235,6 +2272,23 @@ def _find_case(*, arch: str, family: str, mode: str) -> KernelApiSelectionCase:
     raise AssertionError(f"missing golden case for {arch}/{family}.{mode}")
 
 
+# Fixture platforms (see conftest.py) each case's arch tag runs under.
+_ARCH_FIXTURES: dict[str, tuple[str, ...]] = {
+    "hopper": ("h100_platform",),
+    "blackwell-sm100": ("b200_platform",),
+    "blackwell-sm103": ("b300_platform",),
+    "blackwell-plus": ("b200_platform", "b300_platform"),
+    "cdna4": ("mi350_platform",),
+    "supported-gpu": (
+        "h100_platform",
+        "b200_platform",
+        "b300_platform",
+        "mi350_platform",
+    ),
+    "nvidia-cutedsl": ("h100_platform", "b200_platform", "b300_platform"),
+}
+
+
 def test_mxfp8_quantizer_capabilities_match_architecture(
     h100_platform: PlatformInfo,
     b200_platform: PlatformInfo,
@@ -2330,21 +2384,38 @@ def test_attn_merge_state_routes_to_triton_on_cdna4(
         registry.clear_cache()
 
 
-@pytest.mark.parametrize("case", _CASES, ids=lambda case: case.id)
-def test_kernel_api_selection(case: KernelApiSelectionCase, selected_kernel_spy):
-    platform = Platform.get()
-    if not case.matches(platform):
-        pytest.skip(
-            f"{case.id} only applies to its {case.arch} architecture case; "
-            f"current platform is {platform.device_name} ({platform.arch_version})"
-        )
+_CASE_PLATFORM_PARAMS = [
+    pytest.param(
+        case,
+        fixture_name,
+        id=f"{case.id}@{fixture_name.removesuffix('_platform')}",
+    )
+    for case in _CASES
+    for fixture_name in _ARCH_FIXTURES[case.arch]
+]
+
+
+@pytest.mark.parametrize(("case", "platform_fixture"), _CASE_PLATFORM_PARAMS)
+def test_kernel_api_selection(
+    case: KernelApiSelectionCase,
+    platform_fixture: str,
+    selected_kernel_spy,
+    request: pytest.FixtureRequest,
+):
+    platform = request.getfixturevalue(platform_fixture)
+    host_platform = Platform.get()
 
     registry = KernelRegistry.get()
     expected_spec = registry.get_by_name(case.expected)
-    assert expected_spec is not None, (
-        f"{case.expected!r} is not registered on "
-        f"{platform.device_name} ({platform.arch_version})"
-    )
+    if expected_spec is None:
+        # Registrations are import-guarded on optional backend packages, so a
+        # missing spec is only a failure when this host should run the case
+        # natively.
+        assert not case.matches(host_platform), (
+            f"{case.expected!r} is not registered on "
+            f"{host_platform.device_name} ({host_platform.arch_version})"
+        )
+        pytest.skip(f"{case.expected!r} is not registered (optional backend missing)")
     assert expected_spec.capability.satisfied_by(platform), (
         f"{case.expected!r} is registered but not compatible with "
         f"{platform.device_name} ({platform.arch_version})"
@@ -2352,8 +2423,13 @@ def test_kernel_api_selection(case: KernelApiSelectionCase, selected_kernel_spy)
 
     active_case, calls = selected_kernel_spy
     active_case["case"] = case
-    registry.clear_cache()
+    try:
+        Platform.override(platform)
+        registry.clear_cache()
 
-    case.invoke()
+        case.invoke()
+    finally:
+        Platform.override(host_platform)
+        registry.clear_cache()
 
     assert calls == [case.expected]

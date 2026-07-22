@@ -33,6 +33,7 @@ __all__ = [
     "fused_swiglu_fp8_ue8m0",
     "sigmoid_mul",
     "silu_and_mul",
+    "swiglu_oai",
 ]
 
 
@@ -301,6 +302,79 @@ def silu_and_mul(
     return out
 
 
+@triton.jit
+def _swiglu_oai_kernel(
+    gate_up_ptr,
+    out_ptr,
+    n_elements,
+    hidden_dim: tl.constexpr,
+    input_stride_row: tl.constexpr,
+    out_stride_row: tl.constexpr,
+    alpha: tl.constexpr,
+    limit: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offset = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offset < n_elements
+    row = offset // hidden_dim
+    col = offset % hidden_dim
+    gate_ptr = gate_up_ptr + row * input_stride_row + col
+    up_ptr = gate_ptr + hidden_dim
+
+    gate = tl.load(gate_ptr, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(up_ptr, mask=mask, other=0.0).to(tl.float32)
+    gate = tl.minimum(gate, limit)
+    up = tl.clamp(up, -limit, limit)
+    out = gate * tl.sigmoid(alpha * gate) * (up + 1.0)
+    tl.store(out_ptr + row * out_stride_row + col, out, mask=mask)
+
+
+def swiglu_oai(
+    gate_up: torch.Tensor,
+    *,
+    alpha: float = 1.702,
+    limit: float = 7.0,
+) -> torch.Tensor:
+    """Fused ``gate * sigmoid(alpha * gate) * (up + 1)``.
+
+    ``gate_up`` is interpreted as ``[..., 2 * D]`` with gate values in the first
+    half and up values in the second half. The gate is upper-clamped to ``limit``
+    and up is clamped to ``[-limit, limit]``. The output has shape ``[..., D]``.
+    """
+    if gate_up.shape[-1] % 2 != 0:
+        raise ValueError(f"last dimension must be even, got {gate_up.shape[-1]}")
+    if limit <= 0:
+        raise ValueError(f"limit must be positive, got {limit}")
+    if gate_up.stride(-1) != 1:
+        gate_up = gate_up.contiguous()
+
+    hidden_dim = gate_up.shape[-1] // 2
+    out = torch.empty(
+        (*gate_up.shape[:-1], hidden_dim),
+        dtype=gate_up.dtype,
+        device=gate_up.device,
+    )
+    flat_input = gate_up.reshape(-1, gate_up.shape[-1])
+    flat_out = out.reshape(-1, hidden_dim)
+    n_elements = flat_out.numel()
+    if n_elements == 0:
+        return out
+
+    block_size = 1024
+    _swiglu_oai_kernel[((n_elements + block_size - 1) // block_size,)](
+        flat_input,
+        flat_out,
+        n_elements,
+        hidden_dim=hidden_dim,
+        input_stride_row=flat_input.stride(0),
+        out_stride_row=flat_out.stride(0),
+        alpha=alpha,
+        limit=limit,
+        BLOCK_SIZE=block_size,
+    )
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Fused SwiGLU + FP8 UE8M0 quantization
 # ---------------------------------------------------------------------------
@@ -317,6 +391,8 @@ def _fused_swiglu_fp8_ue8m0_kernel(
     out_stride_row,
     scale_col_stride,
     swiglu_limit,
+    swiglu_alpha,
+    swiglu_beta,
     eps,
     bit8_min,
     bit8_max,
@@ -342,8 +418,8 @@ def _fused_swiglu_fp8_ue8m0_kernel(
         gate = tl.minimum(gate, swiglu_limit)
         up = tl.clamp(up, -swiglu_limit, swiglu_limit)
 
-    silu_gate = gate * tl.sigmoid(gate)
-    y = silu_gate * up
+    silu_gate = gate * tl.sigmoid(swiglu_alpha * gate)
+    y = silu_gate * (up + swiglu_beta)
 
     _absmax = tl.max(tl.abs(y))
     scale_raw = tl.maximum(_absmax / bit8_max, eps)
@@ -364,6 +440,8 @@ def _fused_swiglu_fp8_ue8m0_kernel(
 def fused_swiglu_fp8_ue8m0(
     gate_up: torch.Tensor,
     swiglu_limit: float = 0.0,
+    swiglu_alpha: float = 1.0,
+    swiglu_beta: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused SwiGLU activation + FP8 UE8M0 block-scale quantization.
 
@@ -374,6 +452,8 @@ def fused_swiglu_fp8_ue8m0(
     Args:
         gate_up: ``[M, 2*N]`` tensor (BF16 or FP8; cast to float32 internally).
         swiglu_limit: Clamp bound. 0 or negative disables clamping.
+        swiglu_alpha: Sigmoid multiplier applied to the gate.
+        swiglu_beta: Value added to the up projection before multiplication.
 
     Returns:
         ``(fp8_out, scale)``: ``fp8_out`` is ``[M, N]`` float8_e4m3fn,
@@ -410,6 +490,8 @@ def fused_swiglu_fp8_ue8m0(
         out.stride(0),
         scale.stride(-1),
         swiglu_limit if swiglu_limit is not None and swiglu_limit > 0 else 0.0,
+        swiglu_alpha,
+        swiglu_beta,
         1e-10,
         bit8_min=info.min,
         bit8_max=info.max,

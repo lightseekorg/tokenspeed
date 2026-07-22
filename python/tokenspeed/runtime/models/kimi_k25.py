@@ -789,7 +789,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
                 self.mm_projector = self.mm_projector.to(dtype=target_dtype)
 
             # image_encoder may be swapped to a cudagraph wrapper by ModelExecutor.
-            self.vision_embedder = VisionEmbedder()
+            self.vision_embedder = VisionEmbedder(encoder_mapping=mapping.vision)
             self.image_encoder = self.get_image_feature
         else:
             self.vision_embedder = None
@@ -910,7 +910,6 @@ class KimiK25ForConditionalGeneration(nn.Module):
             ctx=multimodal_context,
             encoders={Modality.IMAGE: EncoderSpec(self.image_encoder)},
             multimodal_model=self,
-            is_decode_or_idle=ctx.forward_mode.is_decode_or_idle(),
         )
         assert not model_kwargs, "Kimi-K2.5 multimodal path must stay embeds-only"
         return input_embeds

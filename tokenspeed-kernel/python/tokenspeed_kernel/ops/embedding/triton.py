@@ -78,7 +78,6 @@ def _rope_apply_kernel(
     HAS_FUSED_KV: tl.constexpr,
     IS_NEOX: tl.constexpr,
     POSITION_INT64: tl.constexpr,
-    CACHE_LOC_INT64: tl.constexpr,
 ):
     """Apply rotary embedding to one (token, head) pair in-place.
 
@@ -167,10 +166,8 @@ def _rope_apply_kernel(
         tl.store(out_ptr + head_offs, tail, mask=tail_mask)
 
     if HAS_FUSED_KV and not is_query:
-        if CACHE_LOC_INT64:
-            cache_loc = tl.load(cache_loc_ptr + token_idx).to(tl.int64)
-        else:
-            cache_loc = tl.load(cache_loc_ptr + token_idx).to(tl.int32)
+        # Slot IDs fit in int32, but slot * row stride may not.
+        cache_loc = tl.load(cache_loc_ptr + token_idx).to(tl.int64)
         head_mask = head_offs < head_size
         k_value = tl.load(out_ptr + head_offs, mask=head_mask, other=0.0)
         v_value = tl.load(
@@ -540,7 +537,6 @@ def apply_rope_triton(
         HAS_FUSED_KV=fused_set_kv_buffer_arg is not None,
         IS_NEOX=bool(is_neox),
         POSITION_INT64=positions.dtype == torch.int64,
-        CACHE_LOC_INT64=cache_loc.dtype == torch.int64,
     )
 
 

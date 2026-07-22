@@ -6990,10 +6990,21 @@ def _mxfp4_quantize_cdna4_scale_kernel(
 ):
     out_m = tl.program_id(0)
     k_group = tl.program_id(1)
-    valid = (out_m < M) & (k_group < K_SCALE)
+    row_in_range = out_m < M
+    if HAS_PADDED_SCALE_ROWS:
+        # Under HIP/CUDA-graph replay the grid is captured for the padded row
+        # count M, but the route kernel only writes gather indices + ragged
+        # metadata for gates that map to a valid expert (mask=valid). The final
+        # slice_offs entry is that valid row count; rows at/after it are padding
+        # whose gather index and scale are never consumed downstream. Their
+        # metadata is uninitialised, so the expert binary search overshoots and
+        # produces an out-of-bounds scale store. Skip them.
+        n_valid_rows = tl.load(slice_offs_ptr + N_EXPERTS)
+        row_in_range = row_in_range & (out_m < n_valid_rows)
+    valid = row_in_range & (k_group < K_SCALE)
     src_m = out_m
     if HAS_GATHER:
-        src_m = tl.load(gather_ptr + out_m, mask=out_m < M, other=0)
+        src_m = tl.load(gather_ptr + out_m, mask=row_in_range, other=0)
 
     offs_k = k_group * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     x = tl.load(
@@ -7022,7 +7033,10 @@ def _mxfp4_quantize_cdna4_scale_kernel(
             go_left = search_m < end
             hi = tl.where(go_left, mid, hi)
             lo = tl.where(go_left, lo, mid + 1)
-        expert = lo
+        # Clamp to a valid expert index. For in-range rows the search never
+        # exceeds N_EXPERTS-1; the clamp only guards padding rows (masked off
+        # above) against an out-of-bounds slice_offs/scale_block_offs read.
+        expert = tl.minimum(lo, N_EXPERTS - 1)
         compact_base = tl.load(slice_offs_ptr + expert)
         scale_block_base = tl.load(scale_block_offs_ptr + expert)
         scale_m = scale_block_base * M_SWIZZLE + (out_m - compact_base)
@@ -7073,6 +7087,12 @@ def _mxfp4_quantize_cdna4_scale_tiled_kernel(
     offs_ks = pid_ks * BLOCK_K_SCALE + tl.arange(0, BLOCK_K_SCALE)
     offs_block = tl.arange(0, BLOCK_SIZE)
     valid_m = offs_m < M
+    if HAS_PADDED_SCALE_ROWS:
+        # See scalar kernel: skip padded rows beyond the valid routed-row count
+        # (slice_offs[N_EXPERTS]); their gather index / metadata are
+        # uninitialised under graph-replay and drive out-of-bounds stores.
+        n_valid_rows = tl.load(slice_offs_ptr + N_EXPERTS)
+        valid_m = valid_m & (offs_m < n_valid_rows)
     valid_ks = offs_ks < K_SCALE
 
     src_m = offs_m
@@ -7116,7 +7136,8 @@ def _mxfp4_quantize_cdna4_scale_tiled_kernel(
             go_left = search_m < end
             hi = tl.where(go_left, mid, hi)
             lo = tl.where(go_left, lo, mid + 1)
-        expert = lo
+        # Clamp to a valid expert index (guards padding rows masked off above).
+        expert = tl.minimum(lo, N_EXPERTS - 1)
         compact_base = tl.load(slice_offs_ptr + expert)
         scale_block_base = tl.load(scale_block_offs_ptr + expert)
         scale_m = scale_block_base * M_SWIZZLE + (offs_m - compact_base)

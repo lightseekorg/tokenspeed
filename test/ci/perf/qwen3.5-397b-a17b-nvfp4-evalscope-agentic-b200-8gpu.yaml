@@ -21,9 +21,11 @@ server:
     --max-num-seqs 128
     --mamba-ssm-dtype float32
     --moe-backend flashinfer_trtllm
+    --draft-moe-backend flashinfer_cutlass
     --trust-remote-code
     --attention-backend trtllm
     --chunked-prefill-size 2048
+    --disable-cuda-graph-padding
     --quantization nvfp4
     --kv-cache-dtype fp8
     --kvstore-ratio 0.5

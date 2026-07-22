@@ -25,7 +25,11 @@ Covers the per-solution wrappers behind ``deep_gemm_dsa_decode_topk``:
   * ``deterministic_decode_topk`` (flashinfer) pre-masked fallback path.
   * ``cute_dsl_decode_topk`` (CuTe DSL cluster radix): per-row causal-window
     ``torch.topk`` accuracy across batch / next_n / top-k / context length /
-    compression ratio.
+    compression ratio, plus row-aligned (widened) logits equivalence.
+  * ``combine_topk_weights`` (Triton): bit-exactness against the unfused
+    ``weights.float() * q_scale * softmax_scale`` reference chain.
+  * ``_prepare_logits_for_topk``: widening of DeepGEMM's narrowed logits
+    slices plus the in-place NaN/inf -> -inf scrub.
 
 The wrapper-dispatch tests are CPU-only (monkeypatched kernels); the CuTe DSL
 kernel test needs NVIDIA Blackwell (sm_100+) and skips elsewhere.
@@ -42,11 +46,17 @@ from tokenspeed_kernel.ops.attention.cute_dsl.dsa_topk import (
     cute_dsl_decode_topk,
     has_cute_dsl_decode_topk,
 )
+from tokenspeed_kernel.ops.attention.deep_gemm import _prepare_logits_for_topk
 from tokenspeed_kernel.ops.attention.flashinfer import dsa_topk as fi_dsa_topk
+from tokenspeed_kernel.ops.attention.triton.dsa_topk import combine_topk_weights
 
 requires_kernel = pytest.mark.skipif(
     not (torch.cuda.is_available() and has_cute_dsl_decode_topk()),
     reason="CuTe DSL DSA decode top-k requires NVIDIA Blackwell (sm_100+)",
+)
+
+requires_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="requires CUDA"
 )
 
 
@@ -225,3 +235,135 @@ def test_cute_dsl_decode_topk(
     got = _gathered_topk_values(logits, ret, seq_lens, index_topk, next_n)
     ref = _reference_topk_values(logits, seq_lens, index_topk, next_n)
     assert torch.equal(got, ref), "selected top-k values differ from reference"
+
+
+@requires_kernel
+@pytest.mark.parametrize("next_n", [1, 2])
+def test_cute_dsl_decode_topk_widened_rows_match_narrow(next_n):
+    """Row-aligned (widened) logits select identically to the narrow slice.
+
+    DeepGEMM row-aligns the logits allocation; ``deep_gemm_dsa_decode_topk``
+    hands the widened compact view straight to the kernel instead of paying a
+    ``.contiguous()`` copy of the narrow slice. The kernel is length-aware, so
+    the padding columns -- poisoned with NaN here -- must never influence the
+    selection.
+    """
+    batch_size, num_cols, aligned_cols, index_topk = 4, 4992, 5120, 2048
+    num_rows = batch_size * next_n
+    torch.manual_seed(1)
+    buf = torch.full(
+        (num_rows, aligned_cols), float("nan"), device="cuda", dtype=torch.float32
+    )
+    buf[:, :num_cols].normal_()
+    narrow = buf[:, :num_cols]
+    assert not narrow.is_contiguous()
+    seq_lens = torch.randint(
+        index_topk // 4, num_cols + 1, (batch_size,), device="cuda", dtype=torch.int32
+    )
+
+    out_narrow = torch.empty(num_rows, index_topk, device="cuda", dtype=torch.int32)
+    cute_dsl_decode_topk(
+        narrow.contiguous(), seq_lens, index_topk, next_n=next_n, out=out_narrow
+    )
+    out_wide = torch.empty(num_rows, index_topk, device="cuda", dtype=torch.int32)
+    cute_dsl_decode_topk(buf, seq_lens, index_topk, next_n=next_n, out=out_wide)
+
+    got = _gathered_topk_values(narrow, out_wide, seq_lens, index_topk, next_n)
+    ref = _gathered_topk_values(narrow, out_narrow, seq_lens, index_topk, next_n)
+    assert torch.equal(got, ref), "widened-view selection differs from narrow slice"
+
+
+# ---------------------------------------------------------------------------
+# combine_topk_weights (Triton fused weights * q_scale * softmax_scale)
+# ---------------------------------------------------------------------------
+@requires_cuda
+@pytest.mark.parametrize("weights_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("split_view", [False, True])
+@pytest.mark.parametrize("tokens,heads", [(1, 64), (16, 64), (37, 64), (128, 32)])
+def test_combine_topk_weights_bitexact(weights_dtype, split_view, tokens, heads):
+    """Fused combine is bit-exact with the unfused fp32 reference chain.
+
+    ``split_view=True`` mirrors production: ``weights`` is the trailing
+    column-``split`` view of the fused ``wk_weights_proj`` output, so its rows
+    are unit-stride but not compact.
+    """
+    torch.manual_seed(tokens * heads)
+    softmax_scale = 0.08838834764831845 * (64**-0.5)
+    if split_view:
+        fused = torch.randn(tokens, 128 + heads, device="cuda", dtype=weights_dtype)
+        weights = fused.split([128, heads], dim=-1)[1]
+        # (a [1, heads] slice is trivially "contiguous"; multi-row ones are not)
+        assert weights.stride(-1) == 1
+        assert tokens == 1 or not weights.is_contiguous()
+    else:
+        weights = torch.randn(tokens, heads, device="cuda", dtype=weights_dtype)
+    q_scale = torch.rand(tokens * heads, 1, device="cuda", dtype=torch.float32) + 0.01
+
+    ref = (
+        weights.float().unsqueeze(-1)
+        * q_scale.view(tokens, heads, 1)
+        * float(softmax_scale)
+    ).squeeze(-1)
+    got = combine_topk_weights(weights, q_scale, softmax_scale)
+
+    assert got.dtype == torch.float32 and got.shape == (tokens, heads)
+    assert got.is_contiguous()
+    assert torch.equal(got, ref)
+
+
+@requires_cuda
+def test_combine_topk_weights_empty():
+    out = combine_topk_weights(
+        torch.empty(0, 64, device="cuda", dtype=torch.bfloat16),
+        torch.empty(0, 1, device="cuda", dtype=torch.float32),
+        0.5,
+    )
+    assert out.shape == (0, 64) and out.dtype == torch.float32
+
+
+# ---------------------------------------------------------------------------
+# _prepare_logits_for_topk (DeepGEMM narrowed-logits widening + NaN/inf scrub)
+# ---------------------------------------------------------------------------
+def test_prepare_logits_for_topk_widens_and_scrubs():
+    base = torch.arange(4 * 256, dtype=torch.float32).view(4, 256)
+    expected = base.clone()
+    # Non-finite values inside the window and in the padding columns alike.
+    base[0, 10] = float("nan")
+    base[1, 20] = float("inf")
+    base[2, 200] = float("-inf")  # padding column (>= 192)
+    expected[0, 10] = expected[1, 20] = expected[2, 200] = float("-inf")
+    narrow = base[:, :192]
+    assert not narrow.is_contiguous()
+
+    full = _prepare_logits_for_topk(narrow)
+
+    assert full.shape == (4, 256) and full.is_contiguous()
+    assert torch.equal(full, expected)
+    # The scrub is in place: the narrow slice aliases the cleaned storage.
+    assert narrow[0, 10] == float("-inf") and narrow[1, 20] == float("-inf")
+    # In-place edits through the widened view alias the narrow slice.
+    full[1, 0] = -1.0
+    assert narrow[1, 0] == -1.0
+
+
+def test_prepare_logits_for_topk_passthrough_still_scrubs():
+    # Already-compact logits: same object back, values scrubbed in place.
+    compact = torch.zeros(4, 256)
+    compact[3, 5] = float("nan")
+    assert _prepare_logits_for_topk(compact) is compact
+    assert compact[3, 5] == float("-inf")
+    # Column slices don't own their full rows: no widening, scrub only the
+    # slice (the storage outside the view must stay untouched).
+    owner = torch.full((4, 256), float("nan"))
+    col_slice = owner[:, 64:192]
+    assert _prepare_logits_for_topk(col_slice) is col_slice
+    assert (col_slice == float("-inf")).all()
+    assert owner[:, :64].isnan().all() and owner[:, 192:].isnan().all()
+    # Non-unit column stride: no widening, scrubbed in place.
+    strided = torch.full((4, 256), float("inf"))[:, ::2]
+    assert _prepare_logits_for_topk(strided) is strided
+    assert (strided == float("-inf")).all()
+    # 3-D tensors: no widening, scrubbed in place.
+    cube = torch.full((2, 3, 4), float("nan"))
+    assert _prepare_logits_for_topk(cube) is cube
+    assert (cube == float("-inf")).all()

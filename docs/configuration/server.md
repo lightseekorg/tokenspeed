@@ -73,6 +73,7 @@ issue budget, while `--max-total-tokens` controls the global token pool.
 | `--dense-tp-size` | Tensor parallel size for dense layers. |
 | `--moe-tp-size` | Tensor parallel size for MoE layers. |
 | `--data-parallel-size` | Number of data-parallel replicas. |
+| `--mm-encoder-tp-mode` | Multimodal encoder parallelism: `weights` shards encoder weights with attention TP; `data` uses TP1 whole-item DP and currently requires aggregate serving, one node, and no attention context parallelism. |
 | `--enable-expert-parallel` | Set expert parallelism across the selected world size. |
 | `--expert-parallel-size`, `--ep-size` | Explicit expert parallel size. |
 | `--world-size` | Total worker process count across all nodes. |

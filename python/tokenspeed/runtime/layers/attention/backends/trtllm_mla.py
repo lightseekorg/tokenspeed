@@ -190,7 +190,6 @@ class TRTLLMMLABackend(AttentionBackend):
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
         req_to_page: torch.Tensor,
-        spec_info=None,
         **kwargs,
     ):
         if forward_mode.is_extend_or_mixed():
