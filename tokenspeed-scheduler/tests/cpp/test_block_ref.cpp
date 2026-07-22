@@ -35,6 +35,7 @@ concept HasGet = requires(const T& value) { value.get(); };
 
 static_assert(!HasGet<BlockRef>);
 static_assert(sizeof(BlockRef) == sizeof(void*));
+static_assert(std::is_constructible_v<BlockRef, internal_block_ref::BlockControl&>);
 static_assert(std::is_copy_constructible_v<BlockRef>);
 static_assert(std::is_copy_assignable_v<BlockRef>);
 static_assert(std::is_nothrow_move_constructible_v<BlockRef>);

@@ -22,7 +22,6 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <exception>
 #include <iterator>
 #include <string>
 #include <unordered_map>
@@ -39,13 +38,13 @@ public:
         : total_num_blocks_{total_num_blocks}, enable_caching_{enable_caching} {
         _assert(total_num_blocks > 0, "total_num_blocks must be > 0");
         controls_.reserve(static_cast<std::size_t>(total_num_blocks - 1));
-        auto return_to_pool = [](BlockPool& pool, detail::BlockControl& control) noexcept {
-            pool.ReturnToPool(control);
+        auto return_to_pool = [](BlockPool& pool, internal_block_ref::BlockControl& control) noexcept {
+            pool.returnToPool(control);
         };
         for (std::int32_t block_id = 1; block_id < total_num_blocks; ++block_id) {
             controls_.emplace_back(block_id, *this, return_to_pool);
         }
-        for (detail::BlockControl& control : controls_) {
+        for (internal_block_ref::BlockControl& control : controls_) {
             free_list_.push_back(&control);
             control.SetPosition(std::prev(free_list_.end()));
             control.MarkFree();
@@ -54,11 +53,7 @@ public:
 
     BlockPool(const BlockPool&) = delete;
     BlockPool& operator=(const BlockPool&) = delete;
-    ~BlockPool() noexcept {
-        if (!in_use_.empty()) {
-            std::terminate();
-        }
-    }
+    ~BlockPool() noexcept { FatalCheck(in_use_.empty(), "BlockPool destroyed with live block references"); }
 
     std::int32_t TotalBlocks() const noexcept { return total_num_blocks_; }
     std::int32_t NumFreeBlocks() const noexcept { return static_cast<std::int32_t>(free_list_.size()); }
@@ -79,31 +74,31 @@ public:
         if (free_list_.empty()) {
             return {};
         }
-        detail::BlockControl& control = PopFree();
+        internal_block_ref::BlockControl& control = popFree();
         if (control.Object().IsCached()) {
-            EvictCached(control);
+            evictCached(control);
         }
         return BlockRef{control};
     }
 
     BlockRef FindCachedBlock(const std::string& block_hash_with_group) {
-        detail::BlockControl* control = LookupCachedControl(block_hash_with_group);
+        internal_block_ref::BlockControl* control = lookupCachedControl(block_hash_with_group);
         if (control == nullptr) {
             return {};
         }
         if (control->UseCount() == 0) {
-            RemoveFree(*control);
+            removeFree(*control);
         }
         return BlockRef{*control};
     }
 
     bool ContainsCachedBlock(const std::string& block_hash_with_group) const {
-        return LookupCachedControl(block_hash_with_group) != nullptr;
+        return lookupCachedControl(block_hash_with_group) != nullptr;
     }
 
     void CacheFullBlock(const BlockRef& block_ref, const std::string& block_hash_with_group) {
         _assert(block_ref && block_ref.IsOwnedBy(*this), "block reference belongs to another pool");
-        detail::BlockControl& control = ControlAt(block_ref->BlockId());
+        internal_block_ref::BlockControl& control = controlAt(block_ref->BlockId());
         CacheBlock& block = control.Object();
         if (!enable_caching_) {
             return;
@@ -127,46 +122,41 @@ public:
     }
 
     std::int32_t NumCachedFreeBlocks() const {
-        return CountCached([](const detail::BlockControl& control) { return control.UseCount() == 0; });
+        return countCached([](const internal_block_ref::BlockControl& control) { return control.UseCount() == 0; });
     }
 
     std::int32_t NumPinnedCachedBlocks() const {
-        return CountCached([](const detail::BlockControl& control) { return control.UseCount() > 0; });
+        return countCached([](const internal_block_ref::BlockControl& control) { return control.UseCount() > 0; });
     }
 
 private:
-    detail::BlockControl& ControlAt(std::int32_t block_id) {
+    internal_block_ref::BlockControl& controlAt(std::int32_t block_id) {
         _assert(0 < block_id && block_id < total_num_blocks_, "block id out of range");
         return controls_[static_cast<std::size_t>(block_id - 1)];
     }
 
-    void ReturnToPool(detail::BlockControl& control) noexcept {
-        if (!control.IsOwnedBy(*this) || control.InFreeList() || control.UseCount() != 0) {
-            std::terminate();
-        }
+    void returnToPool(internal_block_ref::BlockControl& control) noexcept {
+        FatalCheck(control.IsOwnedBy(*this) && !control.InFreeList() && control.UseCount() == 0,
+                   "BlockPool can only reclaim its own unowned in-use block");
         free_list_.splice(free_list_.end(), in_use_, control.Position());
         control.MarkFree();
     }
 
-    detail::BlockControl& PopFree() noexcept {
-        if (free_list_.empty()) {
-            std::terminate();
-        }
-        detail::BlockControl& control = *free_list_.front();
+    internal_block_ref::BlockControl& popFree() noexcept {
+        FatalCheck(!free_list_.empty(), "BlockPool cannot pop an empty free list");
+        internal_block_ref::BlockControl& control = *free_list_.front();
         in_use_.splice(in_use_.end(), free_list_, free_list_.begin());
         control.MarkInUse();
         return control;
     }
 
-    void RemoveFree(detail::BlockControl& control) noexcept {
-        if (!control.InFreeList() || control.UseCount() != 0) {
-            std::terminate();
-        }
+    void removeFree(internal_block_ref::BlockControl& control) noexcept {
+        FatalCheck(control.InFreeList() && control.UseCount() == 0, "BlockPool can only remove an unowned free block");
         in_use_.splice(in_use_.end(), free_list_, control.Position());
         control.MarkInUse();
     }
 
-    void EvictCached(detail::BlockControl& control) {
+    void evictCached(internal_block_ref::BlockControl& control) {
         CacheBlock& block = control.Object();
         auto it = cache_index_.find(block.BlockHash());
         if (it != cache_index_.end()) {
@@ -178,7 +168,7 @@ private:
         block.ResetHash();
     }
 
-    detail::BlockControl* LookupCachedControl(const std::string& block_hash_with_group) const {
+    internal_block_ref::BlockControl* lookupCachedControl(const std::string& block_hash_with_group) const {
         if (!enable_caching_) {
             return nullptr;
         }
@@ -190,21 +180,21 @@ private:
     }
 
     template <class Predicate>
-    std::int32_t CountCached(Predicate predicate) const {
+    std::int32_t countCached(Predicate predicate) const {
         std::int32_t count = 0;
         for (const auto& [_, controls] : cache_index_) {
             count += static_cast<std::int32_t>(std::ranges::count_if(
-                controls, [&](const detail::BlockControl* control) { return predicate(*control); }));
+                controls, [&](const internal_block_ref::BlockControl* control) { return predicate(*control); }));
         }
         return count;
     }
 
     std::int32_t total_num_blocks_{0};
     bool enable_caching_{true};
-    std::vector<detail::BlockControl> controls_{};
-    detail::BlockControl::ControlList free_list_{};
-    detail::BlockControl::ControlList in_use_{};
-    std::unordered_map<std::string, std::vector<detail::BlockControl*>> cache_index_{};
+    std::vector<internal_block_ref::BlockControl> controls_{};
+    internal_block_ref::BlockControl::ControlList free_list_{};
+    internal_block_ref::BlockControl::ControlList in_use_{};
+    std::unordered_map<std::string, std::vector<internal_block_ref::BlockControl*>> cache_index_{};
 };
 
 }  // namespace tokenspeed

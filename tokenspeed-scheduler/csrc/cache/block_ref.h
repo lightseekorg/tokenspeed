@@ -44,8 +44,10 @@ private:
     std::string block_hash_{};
 };
 
-namespace detail {
+namespace internal_block_ref {
 
+// A lightweight std::shared_ptr-like control block that also embeds the CacheBlock.
+// BlockPool owns and recycles the control after the last BlockRef releases it.
 class BlockControl {
 public:
     using ControlList = std::list<BlockControl*>;
@@ -81,13 +83,13 @@ private:
     ListPosition position_{};
 };
 
-}  // namespace detail
+}  // namespace internal_block_ref
 
 // Pool-scoped shared owner. Its BlockPool must outlive every non-empty copy.
 class BlockRef {
 public:
     BlockRef() noexcept = default;
-    explicit BlockRef(detail::BlockControl& control) noexcept;
+    explicit BlockRef(internal_block_ref::BlockControl& control) noexcept;
     BlockRef(const BlockRef& other) noexcept;
     BlockRef& operator=(const BlockRef& other) noexcept;
     BlockRef(BlockRef&& other) noexcept;
@@ -107,7 +109,7 @@ public:
     bool operator==(const BlockRef&) const noexcept = default;
 
 private:
-    detail::BlockControl* control_{nullptr};
+    internal_block_ref::BlockControl* control_{nullptr};
 };
 
 inline void swap(BlockRef& lhs, BlockRef& rhs) noexcept {

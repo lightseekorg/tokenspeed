@@ -20,9 +20,12 @@
 
 #include <gtest/gtest.h>
 
+#include <memory>
 #include <span>
 #include <string>
 #include <vector>
+
+#include <spdlog/sinks/stdout_color_sinks.h>
 
 #include "cache/block_pool.h"
 #include "scheduler/page_hasher.h"
@@ -52,6 +55,17 @@ TEST(BlockPoolTest, ReservesPageIdZeroAndCountsFree) {
     BlockPool pool(8);
     EXPECT_EQ(pool.TotalBlocks(), 8);
     EXPECT_EQ(pool.NumFreeBlocks(), 7);
+}
+
+TEST(BlockPoolTest, DestroyWithLiveReferenceReportsFatalInvariant) {
+    EXPECT_DEATH(
+        {
+            spdlog::set_default_logger(spdlog::stderr_color_mt("fatal-check-test"));
+            auto pool = std::make_unique<BlockPool>(2);
+            BlockRef ref = pool->AcquireBlock();
+            pool.reset();
+        },
+        "BlockPool destroyed with live block references");
 }
 
 TEST(BlockPoolTest, AcquireReturnsOwningRefs) {

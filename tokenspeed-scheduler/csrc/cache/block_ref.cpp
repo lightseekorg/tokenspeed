@@ -20,7 +20,6 @@
 
 #include "cache/block_ref.h"
 
-#include <exception>
 #include <utility>
 
 #include "utils.h"
@@ -32,26 +31,21 @@ void CacheBlock::SetHash(std::string hash) {
     block_hash_ = std::move(hash);
 }
 
-namespace detail {
+namespace internal_block_ref {
 
 BlockControl::BlockControl(std::int32_t block_id, BlockPool& owner_pool, ReturnToPoolHandler return_to_pool) noexcept
     : object_{block_id}, owner_pool_{&owner_pool}, return_to_pool_{return_to_pool} {
-    if (return_to_pool_ == nullptr) {
-        std::terminate();
-    }
+    FatalCheck(return_to_pool_ != nullptr, "BlockControl requires a return-to-pool handler");
 }
 
 void BlockControl::Retain() noexcept {
-    if (owner_pool_ == nullptr || (strong_count_ == 0 && in_free_list_)) {
-        std::terminate();
-    }
+    FatalCheck(owner_pool_ != nullptr && (strong_count_ != 0 || !in_free_list_),
+               "BlockControl cannot retain a free or detached block");
     ++strong_count_;
 }
 
 void BlockControl::Release() noexcept {
-    if (strong_count_ == 0 || in_free_list_) {
-        std::terminate();
-    }
+    FatalCheck(strong_count_ != 0 && !in_free_list_, "BlockControl release requires a live in-use reference");
     --strong_count_;
     if (strong_count_ == 0) {
         return_to_pool_(*owner_pool_, *this);
@@ -59,22 +53,18 @@ void BlockControl::Release() noexcept {
 }
 
 void BlockControl::MarkFree() noexcept {
-    if (in_free_list_ || strong_count_ != 0) {
-        std::terminate();
-    }
+    FatalCheck(!in_free_list_ && strong_count_ == 0, "BlockControl can only mark an unowned in-use block free");
     in_free_list_ = true;
 }
 
 void BlockControl::MarkInUse() noexcept {
-    if (!in_free_list_ || strong_count_ != 0) {
-        std::terminate();
-    }
+    FatalCheck(in_free_list_ && strong_count_ == 0, "BlockControl can only claim an unowned free block");
     in_free_list_ = false;
 }
 
-}  // namespace detail
+}  // namespace internal_block_ref
 
-BlockRef::BlockRef(detail::BlockControl& control) noexcept : control_{&control} {
+BlockRef::BlockRef(internal_block_ref::BlockControl& control) noexcept : control_{&control} {
     control_->Retain();
 }
 
@@ -123,7 +113,7 @@ bool BlockRef::IsOwnedBy(const BlockPool& pool) const noexcept {
 }
 
 void BlockRef::reset() noexcept {
-    detail::BlockControl* control = std::exchange(control_, nullptr);
+    internal_block_ref::BlockControl* control = std::exchange(control_, nullptr);
     if (control != nullptr) {
         control->Release();
     }
