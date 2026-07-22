@@ -147,6 +147,8 @@ def msa_decode_with_kvcache(
     local_blocks: int,
     max_seqlen_q: int,
     max_seqlen_k: int,
+    k_scale: float | torch.Tensor | None = None,
+    v_scale: float | torch.Tensor | None = None,
     override: str | None = None,
     solution: str | None = None,
 ) -> torch.Tensor:
@@ -173,6 +175,10 @@ def msa_decode_with_kvcache(
         local_blocks: Recent blocks forced into the selected set.
         max_seqlen_q: Uniform query-token count per request.
         max_seqlen_k: Maximum KV length addressable through ``page_table``.
+        k_scale: Optional scalar descale for an FP8 ``k_cache``; keys were
+            divided by this scale before quantization. None means 1.0.
+        v_scale: Optional scalar descale for an FP8 ``v_cache``, with the
+            same convention as ``k_scale``.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
@@ -251,6 +257,8 @@ def msa_decode_with_kvcache(
             local_blocks=local_blocks,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
+            k_scale=k_scale,
+            v_scale=v_scale,
         )
 
 
@@ -275,6 +283,8 @@ def msa_extend_with_kvcache(
     attention_scale: float,
     init_blocks: int,
     local_blocks: int,
+    k_scale: float | torch.Tensor | None = None,
+    v_scale: float | torch.Tensor | None = None,
     override: str | None = None,
     solution: str | None = None,
 ) -> torch.Tensor:
@@ -304,6 +314,10 @@ def msa_extend_with_kvcache(
         attention_scale: Scale applied to main attention scores.
         init_blocks: Leading blocks forced into the selected set.
         local_blocks: Recent blocks forced into the selected set.
+        k_scale: Optional scalar descale for an FP8 ``k_cache``; keys were
+            divided by this scale before quantization. None means 1.0.
+        v_scale: Optional scalar descale for an FP8 ``v_cache``, with the
+            same convention as ``k_scale``.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
@@ -384,6 +398,8 @@ def msa_extend_with_kvcache(
             attention_scale=attention_scale,
             init_blocks=init_blocks,
             local_blocks=local_blocks,
+            k_scale=k_scale,
+            v_scale=v_scale,
         )
 
 

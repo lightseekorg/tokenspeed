@@ -419,6 +419,87 @@ def test_mha_decode_with_kvcache(
     assert not torch.isnan(out).any()
 
 
+@pytest.mark.parametrize("op", ["decode", "extend"])
+@pytest.mark.parametrize("seqlen_q", [1, 4], ids=["q1", "q4"])
+def test_fa4_mha_fp8_kvcache_matches_bf16_on_dequant_inputs(
+    device: str,
+    op: str,
+    seqlen_q: int,
+    require,
+) -> None:
+    """Dense-FP8 fa4 path vs the BF16 kernel on the same representable values.
+
+    q/k/v are quantized to e4m3 and the BF16 reference runs on the exact
+    dequantized values (e4m3 -> bf16 is lossless), so the comparison isolates
+    the kernel's in-fp8 compute error from input quantization error.
+    """
+    mode = f"mha_{op}_with_kvcache"
+    require("attention", mode, "fa4", torch.float8_e4m3fn, "q")
+
+    torch.manual_seed(20260722)
+    batch_size = 2
+    page_size = 128
+    num_q_heads, num_kv_heads, head_dim = 16, 16, 128  # MHA draft shape
+    prefix_seqlens = torch.tensor([2305, 2205], device=device, dtype=torch.int32)
+    cache_seqlens = prefix_seqlens + seqlen_q
+    max_seqlen_k = int(cache_seqlens.max().item())
+    blocks_per_seq = (max_seqlen_k + page_size - 1) // page_size
+    page_table = torch.arange(
+        batch_size * blocks_per_seq, device=device, dtype=torch.int32
+    ).view(batch_size, blocks_per_seq)
+
+    q8 = _randn(
+        (batch_size * seqlen_q, num_q_heads, head_dim),
+        device=device,
+        dtype=torch.float8_e4m3fn,
+    )
+    k8 = _randn(
+        (batch_size * blocks_per_seq, page_size, num_kv_heads, head_dim),
+        device=device,
+        dtype=torch.float8_e4m3fn,
+    )
+    v8 = _randn(
+        (batch_size * blocks_per_seq, page_size, num_kv_heads, head_dim),
+        device=device,
+        dtype=torch.float8_e4m3fn,
+    )
+
+    kwargs = dict(
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        max_seqlen_q=seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        solution="fa4",
+    )
+    if op == "extend":
+        query_seqlens = torch.full(
+            (batch_size,), seqlen_q, device=device, dtype=torch.int32
+        )
+        cu_seqlens_q = torch.nn.functional.pad(
+            torch.cumsum(query_seqlens, dim=0, dtype=torch.int32), (1, 0)
+        )
+        cu_seqlens_kv = torch.nn.functional.pad(
+            torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32), (1, 0)
+        )
+        kwargs.update(
+            cu_seqlens_q=cu_seqlens_q, cu_seqlens_kv=cu_seqlens_kv, is_causal=True
+        )
+        run = mha_extend_with_kvcache
+    else:
+        run = mha_decode_with_kvcache
+
+    out_fp8 = run(q=q8, k_cache=k8, v_cache=v8, **kwargs)
+    out_ref = run(
+        q=q8.to(torch.bfloat16),
+        k_cache=k8.to(torch.bfloat16),
+        v_cache=v8.to(torch.bfloat16),
+        **kwargs,
+    )
+
+    assert out_fp8.dtype == torch.bfloat16
+    torch.testing.assert_close(out_fp8.float(), out_ref.float(), atol=1e-1, rtol=1e-1)
+
+
 @pytest.mark.parametrize(
     "dtype,head_dim,num_heads",
     [(torch.bfloat16, 64, 8)],

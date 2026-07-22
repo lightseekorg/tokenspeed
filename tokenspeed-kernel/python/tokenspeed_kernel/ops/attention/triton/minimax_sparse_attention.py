@@ -19,7 +19,11 @@ from tokenspeed_kernel.ops.attention.triton.minimax_indexer import (
 )
 from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.signature import (
+    dense_tensor_format,
+    format_signature,
+    format_signatures,
+)
 
 
 @triton.heuristics(
@@ -44,6 +48,8 @@ def _sparse_prefill_kernel(
     head_dim,
     topk: tl.constexpr,
     scale,
+    k_descale,
+    v_descale,
     stride_q_n,
     stride_q_h,
     stride_q_d,
@@ -65,6 +71,7 @@ def _sparse_prefill_kernel(
     BLOCK_K: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    USE_FP8: tl.constexpr,
 ):
     query_offset = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -117,6 +124,8 @@ def _sparse_prefill_kernel(
             mask=dim_mask[:, None] & key_mask[None, :],
             other=0.0,
         )
+        if USE_FP8:
+            key = (key.to(tl.float32) * k_descale).to(q.dtype)
         logits = tl.dot(q, key, out_dtype=tl.float32) * scale_log2e
         logits = tl.where(
             head_mask[:, None] & key_mask[None, :],
@@ -138,6 +147,8 @@ def _sparse_prefill_kernel(
             mask=key_mask[:, None] & dim_mask[None, :],
             other=0.0,
         )
+        if USE_FP8:
+            value = (value.to(tl.float32) * v_descale).to(q.dtype)
         accumulator += tl.dot(probabilities.to(value.dtype), value)
         max_score = new_max
 
@@ -173,6 +184,8 @@ def _sparse_decode_kernel(
     head_dim,
     topk: tl.constexpr,
     scale,
+    k_descale,
+    v_descale,
     decode_query_len,
     stride_q_n,
     stride_q_h,
@@ -200,6 +213,7 @@ def _sparse_decode_kernel(
     BLOCK_K: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    USE_FP8: tl.constexpr,
 ):
     query_chunk = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -251,6 +265,8 @@ def _sparse_decode_kernel(
             mask=dim_mask[:, None] & key_mask[None, :],
             other=0.0,
         )
+        if USE_FP8:
+            key = (key.to(tl.float32) * k_descale).to(q.dtype)
         logits = tl.dot(q, key, out_dtype=tl.float32) * scale_log2e
         logits = tl.where(
             head_mask[:, None] & key_mask[None, :],
@@ -271,6 +287,8 @@ def _sparse_decode_kernel(
             mask=key_mask[:, None] & dim_mask[None, :],
             other=0.0,
         )
+        if USE_FP8:
+            value = (value.to(tl.float32) * v_descale).to(q.dtype)
         accumulator += tl.dot(probabilities.to(value.dtype), value)
         lse = new_max + tl.log2(tl.exp2(lse - new_max) + block_sum)
         max_score = new_max
@@ -390,13 +408,17 @@ def minimax_sparse_attention(
     cu_seqlens_q: torch.Tensor | None = None,
     prefix_lens: torch.Tensor | None = None,
     max_query_len: int = 0,
+    k_scale: float | torch.Tensor | None = None,
+    v_scale: float | torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run exact GQA attention over MiniMax's selected KV blocks.
 
     Args:
         query: Main attention queries shaped ``[tokens, local_heads, 128]``.
-        key_cache: Paged key cache shaped ``[pages, local_kv_heads, 128, 128]``.
-        value_cache: Paged value cache with the same shape as ``key_cache``.
+        key_cache: Paged key cache shaped ``[pages, local_kv_heads, 128, 128]``,
+            BF16 or FP8-E4M3 (dequantized to the query dtype on load).
+        value_cache: Paged value cache with the same shape and dtype as
+            ``key_cache``.
         selected_blocks: Logical block ids shaped
             ``[tokens, local_kv_heads, topk]``.
         block_table: Logical-to-physical page table.
@@ -407,6 +429,10 @@ def minimax_sparse_attention(
         cu_seqlens_q: Prefill cumulative query lengths.
         prefix_lens: Prefill prefix lengths.
         max_query_len: Maximum query length in the prefill batch.
+        k_scale: Optional scalar descale applied to FP8 keys on load; keys
+            were divided by this scale before quantization. None means 1.0.
+        v_scale: Optional scalar descale applied to FP8 values on load, with
+            the same convention as ``k_scale``.
 
     Returns:
         Attention output with the same shape and dtype as ``query``.
@@ -421,8 +447,17 @@ def minimax_sparse_attention(
     )
     if query.dtype != torch.bfloat16:
         raise TypeError("MiniMax Triton sparse attention requires BF16 query")
-    if key_cache.dtype != torch.bfloat16 or value_cache.dtype != torch.bfloat16:
-        raise TypeError("MiniMax Triton sparse attention requires BF16 KV cache")
+    if key_cache.dtype != value_cache.dtype:
+        raise TypeError("key and value caches must share one dtype")
+    if key_cache.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+        raise TypeError(
+            "MiniMax Triton sparse attention requires a BF16 or FP8-E4M3 KV cache"
+        )
+    use_fp8 = key_cache.dtype == torch.float8_e4m3fn
+    if not use_fp8 and (k_scale is not None or v_scale is not None):
+        raise ValueError("k_scale/v_scale are only valid with an FP8 KV cache")
+    k_descale = 1.0 if k_scale is None else float(k_scale)
+    v_descale = 1.0 if v_scale is None else float(v_scale)
     if selected_blocks.dtype != torch.int32:
         raise TypeError("selected_blocks must be int32")
     if tokens == 0:
@@ -470,6 +505,8 @@ def minimax_sparse_attention(
             head_dim,
             topk=topk,
             scale=float(scale),
+            k_descale=k_descale,
+            v_descale=v_descale,
             decode_query_len=decode_query_len,
             stride_q_n=query.stride(0),
             stride_q_h=query.stride(1),
@@ -495,6 +532,7 @@ def minimax_sparse_attention(
             stride_bt_b=block_table.stride(0),
             NUM_CHUNKS=num_chunks,
             BLOCK_K=SPARSE_BLOCK_SIZE,
+            USE_FP8=use_fp8,
             num_warps=4,
             num_stages=2,
         )
@@ -541,6 +579,8 @@ def minimax_sparse_attention(
         head_dim,
         topk=topk,
         scale=float(scale),
+        k_descale=k_descale,
+        v_descale=v_descale,
         stride_q_n=query.stride(0),
         stride_q_h=query.stride(1),
         stride_q_d=query.stride(2),
@@ -560,6 +600,7 @@ def minimax_sparse_attention(
         stride_o_d=output.stride(2),
         stride_bt_b=block_table.stride(0),
         BLOCK_K=SPARSE_BLOCK_SIZE,
+        USE_FP8=use_fp8,
         num_warps=4,
         num_stages=2,
     )
@@ -576,6 +617,18 @@ _MINIMAX_MSA_SIGNATURES = format_signatures(
     ("q", "index_q", "index_k", "k_cache", "v_cache", "index_k_cache"),
     "dense",
     {torch.bfloat16},
+) | frozenset(
+    {
+        # FP8-E4M3 main K/V cache; queries and the index side cache stay BF16.
+        format_signature(
+            q=dense_tensor_format(torch.bfloat16),
+            index_q=dense_tensor_format(torch.bfloat16),
+            index_k=dense_tensor_format(torch.bfloat16),
+            k_cache=dense_tensor_format(torch.float8_e4m3fn),
+            v_cache=dense_tensor_format(torch.float8_e4m3fn),
+            index_k_cache=dense_tensor_format(torch.bfloat16),
+        )
+    }
 )
 
 
@@ -609,6 +662,8 @@ def triton_minimax_msa_decode_with_kvcache(
     local_blocks: int,
     max_seqlen_q: int,
     max_seqlen_k: int,
+    k_scale: float | torch.Tensor | None = None,
+    v_scale: float | torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run MiniMax sparse-attention decode over paged caches."""
 
@@ -639,6 +694,8 @@ def triton_minimax_msa_decode_with_kvcache(
         cache_seqlens,
         scale=attention_scale,
         decode_query_len=max_seqlen_q,
+        k_scale=k_scale,
+        v_scale=v_scale,
     )
 
 
@@ -674,6 +731,8 @@ def triton_minimax_msa_extend_with_kvcache(
     attention_scale: float,
     init_blocks: int,
     local_blocks: int,
+    k_scale: float | torch.Tensor | None = None,
+    v_scale: float | torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run MiniMax sparse-attention extend over paged caches."""
 
@@ -708,4 +767,6 @@ def triton_minimax_msa_extend_with_kvcache(
         cu_seqlens_q=cu_seqlens_q,
         prefix_lens=prefix_lens,
         max_query_len=max_seqlen_q,
+        k_scale=k_scale,
+        v_scale=v_scale,
     )

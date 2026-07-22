@@ -3,34 +3,63 @@ name: Build and Release tokenspeed-kernel-amd
 on:
   workflow_dispatch:
     inputs:
-      tag_name:
-        description: "Git tag to create or update. Defaults to tokenspeed-kernel-amd-v<version>."
-        required: false
-        type: string
-      prerelease:
-        description: "Mark the GitHub release as a prerelease."
+      create_release_branch:
+        description: "Create release/<version> from main, then run this workflow on it."
         required: false
         default: false
+        type: boolean
+      prerelease:
+        description: "Mark the wheelhouse release as a prerelease."
+        required: false
+        default: false
+        type: boolean
+      publish_github:
+        description: "Publish distributions to the lightseekorg/whl release."
+        required: false
+        default: false
+        type: boolean
+      publish_pypi:
+        description: "Publish distributions to PyPI."
+        required: false
+        default: true
         type: boolean
 
 permissions:
   contents: read
-  id-token: write
 
 concurrency:
-  group: ${{ github.workflow }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  metadata:
-    name: Resolve release metadata
+  cut-release-branch:
+    name: Create release branch
+    if: ${{ inputs.create_release_branch }}
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.metadata.outputs.version }}
+      branch: ${{ steps.metadata.outputs.branch }}
       tag_name: ${{ steps.metadata.outputs.tag_name }}
+      version: ${{ steps.metadata.outputs.version }}
     steps:
-      - name: Checkout repository
+      - name: Require main and lightseek-bot token
+        env:
+          LIGHTSEEK_BOT_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+          SOURCE_REF: ${{ github.ref }}
+        run: |
+          if [ "$SOURCE_REF" != "refs/heads/main" ]; then
+            echo "Release branches can only be created from main. Dispatch on main, or dispatch an existing release/<version> branch to build or publish." >&2
+            exit 1
+          fi
+          if [ -z "$LIGHTSEEK_BOT_TOKEN" ]; then
+            echo "LIGHTSEEK_BOT_TOKEN is required to create and dispatch the release branch." >&2
+            exit 1
+          fi
+
+      - name: Checkout main
         uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -40,22 +69,217 @@ jobs:
       - name: Resolve release metadata
         id: metadata
         run: |
-          VERSION=$(python - <<'PY'
-          import pathlib
+          python - <<'PY'
+          import os
+          import re
           import tomllib
+          from pathlib import Path
 
-          data = tomllib.loads(pathlib.Path("tokenspeed-kernel-amd/pyproject.toml").read_text())
-          print(data["project"]["version"])
+          pyproject_path = Path("tokenspeed-kernel-amd/pyproject.toml")
+          data = tomllib.loads(pyproject_path.read_text())
+          if data["project"]["name"] != "tokenspeed-kernel-amd":
+              raise SystemExit(f"{pyproject_path} does not describe tokenspeed-kernel-amd")
+          version = data["project"]["version"]
+          if not re.fullmatch(
+              r"[0-9]+(?:\.[0-9]+)*(?:(?:a|b|rc)[0-9]+)?(?:\.post[0-9]+)?",
+              version,
+          ):
+              raise SystemExit(f"invalid public release version: {version}")
+
+          output_path = Path(os.environ["GITHUB_OUTPUT"])
+          with output_path.open("a") as output:
+              print(f"branch=release/{version}", file=output)
+              print(f"tag_name=tokenspeed-kernel-amd-v{version}", file=output)
+              print(f"version={version}", file=output)
           PY
-          )
-          TAG_NAME="${{ inputs.tag_name }}"
-          if [ -z "$TAG_NAME" ]; then
-            TAG_NAME="tokenspeed-kernel-amd-v${VERSION}"
+
+      - name: Refuse an already-published version
+        env:
+          VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          if ! http_code=$(curl --silent --show-error \
+            --output /tmp/pypi-version.json \
+            --write-out '%{http_code}' \
+            "https://pypi.org/pypi/tokenspeed-kernel-amd/${VERSION}/json"); then
+            echo "Could not verify whether tokenspeed-kernel-amd ${VERSION} is already on PyPI." >&2
+            exit 1
           fi
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
-          echo "Release version: ${VERSION}"
-          echo "Release tag: ${TAG_NAME}"
+
+          case "$http_code" in
+            200)
+              echo "tokenspeed-kernel-amd ${VERSION} is already on PyPI. Bump tokenspeed-kernel-amd/pyproject.toml on main before creating another release branch." >&2
+              exit 1
+              ;;
+            404) ;;
+            *)
+              echo "Could not verify PyPI state for tokenspeed-kernel-amd ${VERSION}: HTTP ${http_code}." >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Refuse an existing wheelhouse release
+        env:
+          GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+          RELEASE_REPOSITORY: lightseekorg/whl
+          TAG_NAME: ${{ steps.metadata.outputs.tag_name }}
+          VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          if ! http_code=$(curl --silent --show-error \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            --output /tmp/wheelhouse-release.json \
+            --write-out '%{http_code}' \
+            "https://api.github.com/repos/${RELEASE_REPOSITORY}/releases/tags/${TAG_NAME}"); then
+            echo "Could not verify the wheelhouse release for tokenspeed-kernel-amd ${VERSION}." >&2
+            exit 1
+          fi
+
+          case "$http_code" in
+            200)
+              asset_count=$(python -c 'import json; from pathlib import Path; print(len(json.loads(Path("/tmp/wheelhouse-release.json").read_text())["assets"]))')
+              if [ "$asset_count" -gt 0 ]; then
+                echo "The wheelhouse release already has assets. Dispatch its existing release branch to verify it; this workflow will not recreate the branch." >&2
+                exit 1
+              fi
+              ;;
+            404) ;;
+            *)
+              echo "Could not verify the wheelhouse release for tokenspeed-kernel-amd ${VERSION}: HTTP ${http_code}." >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Create immutable release branch
+        env:
+          BRANCH: ${{ steps.metadata.outputs.branch }}
+        run: |
+          source_sha=$(git rev-parse HEAD)
+          if git push \
+            --force-with-lease="refs/heads/${BRANCH}:" \
+            origin "HEAD:refs/heads/${BRANCH}"; then
+            echo "Created ${BRANCH} at ${source_sha}."
+            exit 0
+          fi
+
+          remote_line=$(git ls-remote --heads origin "refs/heads/${BRANCH}")
+          remote_sha=${remote_line%%$'\t'*}
+          if [ "$remote_sha" = "$source_sha" ]; then
+            echo "${BRANCH} already points to ${source_sha}; leaving it unchanged."
+            exit 0
+          fi
+
+          if [ -n "$remote_sha" ]; then
+            echo "${BRANCH} already exists at ${remote_sha}; this workflow never moves an existing release branch." >&2
+          else
+            echo "Failed to create ${BRANCH}; the remote branch does not exist after the rejected push." >&2
+          fi
+          exit 1
+
+      - name: Dispatch release branch
+        env:
+          BRANCH: ${{ steps.metadata.outputs.branch }}
+          GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+          PRERELEASE: ${{ inputs.prerelease }}
+          PUBLISH_GITHUB: ${{ inputs.publish_github }}
+          PUBLISH_PYPI: ${{ inputs.publish_pypi }}
+        run: |
+          # The child run must publish instead of trying to create the branch again.
+          gh workflow run release-tokenspeed-kernel-amd.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref "$BRANCH" \
+            --field create_release_branch=false \
+            --field prerelease="$PRERELEASE" \
+            --field publish_github="$PUBLISH_GITHUB" \
+            --field publish_pypi="$PUBLISH_PYPI"
+          echo "Dispatched the build and publish run on ${BRANCH}."
+
+  metadata:
+    name: Validate release branch
+    if: ${{ !inputs.create_release_branch }}
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+      tag_name: ${{ steps.metadata.outputs.tag_name }}
+    steps:
+      - name: Checkout release branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate branch and version
+        id: metadata
+        env:
+          RELEASE_REF: ${{ github.ref }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          import tomllib
+          from pathlib import Path
+
+          pyproject_path = Path("tokenspeed-kernel-amd/pyproject.toml")
+          data = tomllib.loads(pyproject_path.read_text())
+          if data["project"]["name"] != "tokenspeed-kernel-amd":
+              raise SystemExit(f"{pyproject_path} does not describe tokenspeed-kernel-amd")
+          version = data["project"]["version"]
+          if not re.fullmatch(
+              r"[0-9]+(?:\.[0-9]+)*(?:(?:a|b|rc)[0-9]+)?(?:\.post[0-9]+)?",
+              version,
+          ):
+              raise SystemExit(f"invalid public release version: {version}")
+
+          expected_branch = f"release/{version}"
+          expected_ref = f"refs/heads/{expected_branch}"
+          if os.environ["RELEASE_REF"] != expected_ref:
+              raise SystemExit(
+                  f"release ref must be {expected_ref}, not "
+                  f'{os.environ["RELEASE_REF"]}. Dispatch on main with '
+                  "create_release_branch=true, or create "
+                  f"{expected_branch} from main and dispatch on it."
+              )
+
+          output_path = Path(os.environ["GITHUB_OUTPUT"])
+          with output_path.open("a") as output:
+              print(f"version={version}", file=output)
+              print(f"tag_name=tokenspeed-kernel-amd-v{version}", file=output)
+          PY
+
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
+            echo "Release commit ${GITHUB_SHA} is not part of main history." >&2
+            exit 1
+          fi
+
+      - name: Refuse an already-published PyPI version
+        if: inputs.publish_pypi
+        env:
+          VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          if ! http_code=$(curl --silent --show-error \
+            --output /tmp/pypi-version.json \
+            --write-out '%{http_code}' \
+            "https://pypi.org/pypi/tokenspeed-kernel-amd/${VERSION}/json"); then
+            echo "Could not verify whether tokenspeed-kernel-amd ${VERSION} is already on PyPI." >&2
+            exit 1
+          fi
+
+          case "$http_code" in
+            200)
+              echo "tokenspeed-kernel-amd ${VERSION} is already on PyPI; refusing a duplicate upload." >&2
+              exit 1
+              ;;
+            404) ;;
+            *)
+              echo "Could not verify PyPI state for tokenspeed-kernel-amd ${VERSION}: HTTP ${http_code}." >&2
+              exit 1
+              ;;
+          esac
 
   build:
     name: Build distributions
@@ -84,12 +308,10 @@ jobs:
 
   release:
     name: Create wheelhouse release
+    if: ${{ inputs.publish_github }}
     needs: [metadata, build]
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
       - name: Download distributions
         uses: actions/download-artifact@v4
         with:
@@ -106,26 +328,79 @@ jobs:
           PRERELEASE: ${{ inputs.prerelease }}
           SOURCE_SHA: ${{ github.sha }}
         run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "LIGHTSEEK_BOT_TOKEN is required to publish the wheelhouse release." >&2
+            exit 1
+          fi
+
+          source_note="tokenspeed-kernel-amd ${VERSION} built from ${GITHUB_REPOSITORY}@${SOURCE_SHA}"
           prerelease_args=()
           if [ "$PRERELEASE" = "true" ]; then
             prerelease_args+=(--prerelease)
           fi
 
           if gh release view "$TAG_NAME" --repo "$RELEASE_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$TAG_NAME" dist/* --repo "$RELEASE_REPOSITORY" --clobber
+            release_prerelease=$(gh release view "$TAG_NAME" \
+              --repo "$RELEASE_REPOSITORY" \
+              --json isPrerelease \
+              --jq '.isPrerelease')
+            if [ "$release_prerelease" != "$PRERELEASE" ]; then
+              echo "Existing wheelhouse release has a different prerelease setting; refusing to modify it." >&2
+              exit 1
+            fi
+
+            release_note=$(gh release view "$TAG_NAME" \
+              --repo "$RELEASE_REPOSITORY" \
+              --json body \
+              --jq '.body')
+            if [ "$release_note" != "$source_note" ]; then
+              echo "Existing wheelhouse release was built from a different source; refusing to replace its assets." >&2
+              exit 1
+            fi
+
+            asset_names=$(gh release view "$TAG_NAME" \
+              --repo "$RELEASE_REPOSITORY" \
+              --json assets \
+              --jq '.assets[].name')
+            upload_files=()
+
+            for artifact in dist/*; do
+              artifact_name=${artifact##*/}
+              asset_exists=false
+              while IFS= read -r asset_name; do
+                if [ "$asset_name" = "$artifact_name" ]; then
+                  asset_exists=true
+                  break
+                fi
+              done <<< "$asset_names"
+
+              if [ "$asset_exists" = "true" ]; then
+                echo "Existing wheelhouse asset ${artifact_name} is already present under the verified source release; keeping it."
+              else
+                upload_files+=("$artifact")
+              fi
+            done
+
+            if [ "${#upload_files[@]}" -gt 0 ]; then
+              gh release upload "$TAG_NAME" "${upload_files[@]}" \
+                --repo "$RELEASE_REPOSITORY"
+            fi
           else
             gh release create "$TAG_NAME" dist/* \
               --repo "$RELEASE_REPOSITORY" \
               --title "tokenspeed-kernel-amd ${VERSION}" \
-              --notes "tokenspeed-kernel-amd ${VERSION} built from lightseekorg/tokenspeed@${SOURCE_SHA}" \
+              --notes "$source_note" \
               "${prerelease_args[@]}"
           fi
 
   publish-pypi:
     name: Publish to PyPI
-    needs: [metadata, build]
+    if: ${{ !cancelled() && inputs.publish_pypi && needs.metadata.result == 'success' && needs.build.result == 'success' && (needs.release.result == 'success' || needs.release.result == 'skipped') }}
+    needs: [metadata, build, release]
     runs-on: ubuntu-latest
     environment: pypi
+    permissions:
+      id-token: write
     steps:
       - name: Download distributions
         uses: actions/download-artifact@v4

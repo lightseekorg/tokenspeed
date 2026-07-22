@@ -553,6 +553,8 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             local_blocks=self.index_local_blocks,
             max_seqlen_q=decode_query_len,
             max_seqlen_k=self.max_context_len,
+            k_scale=layer.k_scale if self.is_fp8 else None,
+            v_scale=layer.v_scale if self.is_fp8 else None,
         )
         return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 
@@ -627,6 +629,8 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             attention_scale=layer.scaling,
             init_blocks=self.index_init_blocks,
             local_blocks=self.index_local_blocks,
+            k_scale=layer.k_scale if self.is_fp8 else None,
+            v_scale=layer.v_scale if self.is_fp8 else None,
         )
         return self._reshape_and_pad_output(output, total_tokens, layer)
 

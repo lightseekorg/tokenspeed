@@ -318,6 +318,130 @@ if platform.is_nvidia and platform.is_blackwell:
         return out.view_as(q)
 
     # --------------------------------------------------------------------------
+    # Dense (unscaled) FP8-E4M3 MHA: fp8 q + paged fp8 K/V at implicit scale
+    # 1.0, bf16 output. e5m2 is excluded, matching vLLM's FLASH_ATTN gate.
+    # --------------------------------------------------------------------------
+
+    _FA4_FP8_DENSE_SIGNATURES = format_signatures(
+        ("q", "k_cache", "v_cache"), "dense", {torch.float8_e4m3fn}
+    )
+
+    @register_kernel(
+        "attention",
+        "mha_extend_with_kvcache",
+        name="fa4_mha_extend_with_kvcache_fp8",
+        solution="fa4",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 0),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=_FA4_FP8_DENSE_SIGNATURES,
+        priority=Priority.SPECIALIZED,
+        traits={
+            "head_dim": _FA4_BLACKWELL_DECODE_HEAD_DIMS,
+            "is_causal": frozenset({False, True}),
+            "sliding_window": frozenset({False, True}),
+            "support_sinks": frozenset({False}),
+            "return_lse": frozenset({False}),
+            "support_logit_cap": frozenset({False}),
+        },
+    )
+    def fa4_mha_extend_with_kvcache_fp8(
+        q: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_kv: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        is_causal: bool = False,
+        window_left: int = -1,
+        logit_cap: float = 0.0,
+        sinks: torch.Tensor | None = None,
+        return_lse: bool = False,
+        softmax_scale: float | None = None,
+        q_scale: torch.Tensor | None = None,
+        k_scale: torch.Tensor | None = None,
+        v_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if softmax_scale is None:
+            softmax_scale = 1.0 / math.sqrt(q.shape[-1])
+        window_size = (window_left, 0) if window_left >= 0 else (-1, -1)
+        out, _ = flash_attn_varlen_func(
+            q=q,
+            k=k_cache,
+            v=v_cache,
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_k=cache_seqlens,
+            page_table=page_table,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=is_causal,
+            window_size=window_size,
+        )
+        return out
+
+    @register_kernel(
+        "attention",
+        "mha_decode_with_kvcache",
+        name="fa4_mha_decode_with_kvcache_fp8",
+        solution="fa4",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 0),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=_FA4_FP8_DENSE_SIGNATURES,
+        priority=Priority.SPECIALIZED,
+        traits={
+            "head_dim": _FA4_BLACKWELL_DECODE_HEAD_DIMS,
+            "sliding_window": frozenset({False, True}),
+            "support_sinks": frozenset({False}),
+            "return_lse": frozenset({False}),
+            "support_logit_cap": frozenset({False}),
+        },
+    )
+    def fa4_mha_decode_with_kvcache_fp8(
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        max_seqlen_k: int,
+        max_seqlen_q: int = 1,
+        window_left: int = -1,
+        logit_cap: float = 0.0,
+        sinks: torch.Tensor | None = None,
+        return_lse: bool = False,
+        softmax_scale: float | None = None,
+        q_scale: torch.Tensor | None = None,
+        k_scale: torch.Tensor | None = None,
+        v_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if softmax_scale is None:
+            softmax_scale = 1.0 / math.sqrt(q.shape[-1])
+        batch_size = cache_seqlens.shape[0]
+        q_reshaped = q.view(batch_size, max_seqlen_q, q.shape[1], q.shape[2])
+        window_size = (window_left, 0) if window_left >= 0 else (-1, -1)
+        out, _ = flash_attn_varlen_func(
+            q=q_reshaped,
+            k=k_cache,
+            v=v_cache,
+            seqused_k=cache_seqlens,
+            page_table=page_table,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=max_seqlen_q > 1,
+            window_size=window_size,
+        )
+        return out.view_as(q)
+
+    # --------------------------------------------------------------------------
     # MXFP8 block-scaled MHA: fp8-e4m3 q + paged KV with UE8M0 vector-32 scale
     # factors. The KV scale layout is the interleaved BlockScaledBasicChunk
     # atom ([num_pages, num_kv_heads, 32, 4, 4]) that the fork requires at
