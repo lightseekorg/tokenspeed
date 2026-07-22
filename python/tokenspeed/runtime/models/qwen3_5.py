@@ -198,9 +198,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         ba_unquant = _gdn_group_unquantized(
             prefix, ("in_proj_b", "in_proj_a"), ignored_layers
         )
-        self._split_in_proj = quant_config is not None and (
-            qkvz_unquant != ba_unquant
-        )
+        self._split_in_proj = quant_config is not None and (qkvz_unquant != ba_unquant)
         if self._split_in_proj:
             self.in_proj_qkvz = MergedColumnParallelLinear(
                 input_size=self.hidden_size,
@@ -486,7 +484,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 lambda x: x.reshape(x.shape[0], -1), (query, key, value)
             )
             mixed_qkv = torch.cat((query, key, value), dim=-1)
-
 
         kwargs = {
             "mixed_qkv": mixed_qkv,
