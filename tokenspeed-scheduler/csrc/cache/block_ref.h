@@ -27,6 +27,7 @@
 namespace tokenspeed {
 
 class BlockPool;
+class BlockRef;
 
 class CacheBlock {
 public:
@@ -50,15 +51,21 @@ namespace internal_block_ref {
 // BlockPool owns and recycles the control after the last BlockRef releases it.
 class BlockControl {
 public:
-    using ControlList = std::list<BlockControl*>;
-    using ListPosition = ControlList::iterator;
     using ReturnToPoolHandler = void (*)(BlockPool&, BlockControl&) noexcept;
 
     BlockControl(std::int32_t block_id, BlockPool& owner_pool, ReturnToPoolHandler return_to_pool) noexcept;
     BlockControl(const BlockControl&) = delete;
     BlockControl& operator=(const BlockControl&) = delete;
-    BlockControl(BlockControl&&) noexcept = default;
-    BlockControl& operator=(BlockControl&&) noexcept = default;
+    BlockControl(BlockControl&&) = delete;
+    BlockControl& operator=(BlockControl&&) = delete;
+    ~BlockControl() = default;
+
+private:
+    friend class ::tokenspeed::BlockPool;
+    friend class ::tokenspeed::BlockRef;
+
+    using ControlList = std::list<BlockControl*>;
+    using ListPosition = ControlList::iterator;
 
     void Retain() noexcept;
     void Release() noexcept;
@@ -89,7 +96,6 @@ private:
 class BlockRef {
 public:
     BlockRef() noexcept = default;
-    explicit BlockRef(internal_block_ref::BlockControl& control) noexcept;
     BlockRef(const BlockRef& other) noexcept;
     BlockRef& operator=(const BlockRef& other) noexcept;
     BlockRef(BlockRef&& other) noexcept;
@@ -109,6 +115,10 @@ public:
     bool operator==(const BlockRef&) const noexcept = default;
 
 private:
+    friend class BlockPool;
+
+    explicit BlockRef(internal_block_ref::BlockControl& control) noexcept;
+
     internal_block_ref::BlockControl* control_{nullptr};
 };
 

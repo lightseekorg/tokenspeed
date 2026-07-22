@@ -116,32 +116,32 @@ CoordinatorMatch KvCacheCoordinator::matchTierWithKeys(BlockPool& pool,
     if (groups_.empty()) {
         return out;
     }
+    std::vector<PrefixProbe> probes(groups_.size());
     const std::int32_t boundary_tokens = SweepThenConverge(
         match_order_, groups_, num_base_pages * base_block_size_, lcm_block_size_,
         [&](std::size_t i, std::int32_t bound_tokens) {
             const std::int32_t group_block_size = groups_[i].Spec().block_size;
-            out.per_group[i] = groups_[i].Manager().Match(pool, group_keys[i], floor_tokens / group_block_size,
-                                                          bound_tokens / group_block_size);
+            probes[i] = groups_[i].Manager().Probe(pool, group_keys[i], floor_tokens / group_block_size,
+                                                   bound_tokens / group_block_size);
         },
         [&](std::size_t i) {
             const std::int32_t group_block_size = groups_[i].Spec().block_size;
-            return (floor_tokens / group_block_size + static_cast<std::int32_t>(out.per_group[i].blocks.size())) *
+            return (floor_tokens / group_block_size + static_cast<std::int32_t>(probes[i].hits.size())) *
                    group_block_size;
         });
 
-    // Linear cleanup: closed groups truncate to the converged boundary (any prefix stays valid;
-    // the lcm-aligned boundary cuts on whole blocks); non-closed groups are at or under it.
+    // Truncate closed probes to the converged boundary, then acquire only the final hits.
+    // Non-closed groups were re-probed against the settled bound and are already at or below it.
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         const std::int32_t group_block_size = groups_[i].Spec().block_size;
-        PrefixMatch& m = out.per_group[i];
+        PrefixProbe& probe = probes[i];
         const std::int32_t floor_blocks = floor_tokens / group_block_size;
-        if ((floor_blocks + static_cast<std::int32_t>(m.blocks.size())) * group_block_size <= boundary_tokens) {
-            continue;
+        if ((floor_blocks + static_cast<std::int32_t>(probe.hits.size())) * group_block_size > boundary_tokens) {
+            _assert(groups_[i].Manager().MatchIsPrefixClosed(), "window group left above the converged boundary");
+            probe.hits.resize(static_cast<std::size_t>(boundary_tokens / group_block_size - floor_blocks));
         }
-        _assert(groups_[i].Manager().MatchIsPrefixClosed(), "window group left above the converged boundary");
-        m.blocks.resize(static_cast<std::size_t>(boundary_tokens / group_block_size - floor_blocks));
-        m.num_hit_blocks = static_cast<std::int32_t>(
-            std::ranges::count_if(m.blocks, [](const BlockRef& block) { return static_cast<bool>(block); }));
+        out.per_group[i] =
+            groups_[i].Manager().AcquireMatchedBlocks(pool, group_keys[i], floor_blocks, probe);
     }
     out.num_common_tokens = boundary_tokens;
     return out;

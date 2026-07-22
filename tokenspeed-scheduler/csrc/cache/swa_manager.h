@@ -45,35 +45,30 @@ public:
     bool MatchIsPrefixClosed() const override { return false; }
 
     // Right->left scan for a run backing a resumable boundary; slots left of it stay holes.
-    PrefixMatch Match(BlockPool& pool, std::span<const std::string> keys, std::int32_t begin_blocks,
+    PrefixProbe Probe(const BlockPool& pool, std::span<const std::string> keys, std::int32_t begin_blocks,
                       std::int32_t max_blocks) const override {
         const std::int32_t end_blocks =
             static_cast<std::int32_t>(std::min(keys.size(), static_cast<std::size_t>(std::max(max_blocks, 0))));
-        PrefixMatch match;
+        PrefixProbe probe;
         if (begin_blocks >= end_blocks) {
-            return match;
+            return probe;
         }
         // W == 1: no lookback, so every boundary is resumable with no cached page at all.
         if (pagesNeededToResume() == 0) {
-            match.blocks.resize(static_cast<std::size_t>(end_blocks - begin_blocks));
-            return match;
+            probe.hits.resize(static_cast<std::size_t>(end_blocks - begin_blocks));
+            return probe;
         }
-        std::vector<BlockRef> probed(static_cast<std::size_t>(end_blocks));
         const auto [boundary, hits_begin] = findResumableBoundary(
-            [&](std::int32_t i) {
-                BlockRef block = pool.FindCachedBlock(keys[static_cast<std::size_t>(i)]);
-                if (block) {
-                    probed[static_cast<std::size_t>(i)] = std::move(block);
-                }
-                return static_cast<bool>(probed[static_cast<std::size_t>(i)]);
-            },
+            [&](std::int32_t i) { return pool.ContainsCachedBlock(keys[static_cast<std::size_t>(i)]); },
             begin_blocks, end_blocks);
         if (boundary == begin_blocks) {
-            return match;
+            return probe;
         }
-        match.blocks.assign(probed.begin() + begin_blocks, probed.begin() + boundary);
-        match.num_hit_blocks = boundary - hits_begin;
-        return match;
+        probe.hits.resize(static_cast<std::size_t>(boundary - begin_blocks));
+        for (std::int32_t i = hits_begin; i < boundary; ++i) {
+            probe.hits[static_cast<std::size_t>(i - begin_blocks)] = 1;
+        }
+        return probe;
     }
 
     // Punches null holes so the table never shrinks (keeps slot alignment); reverse-collect evicts FIFO.

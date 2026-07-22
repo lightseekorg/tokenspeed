@@ -145,6 +145,30 @@ TEST(CoordinatorMatchTest, CommonIsMinCoverageFullDeeperThanSwa) {
     EXPECT_EQ(m.per_group[0].num_hit_blocks, 3);
 }
 
+TEST(CoordinatorMatchTest, TrimmedFullHitsDoNotRefreshEvictionOrder) {
+    BlockPool pool(11);
+    std::vector<KvCacheSpec> specs = {{AttnKind::kFull, 4, 0}, {AttnKind::kSlidingWindow, 4, 10}};
+    KvCacheCoordinator coord = MakeCoordinator(specs, pool);
+
+    std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}});
+    CacheForGroup(pool, ch[0], 0);
+    CacheForGroup(pool, ch[1], 0);
+    CacheForGroup(pool, ch[2], 0);
+    const std::int32_t trimmed = CacheForGroup(pool, ch[3], 0);
+    CacheForGroup(pool, ch[0], 1);
+    CacheForGroup(pool, ch[1], 1);
+    CacheForGroup(pool, ch[2], 1);
+    const std::string unrelated = ContentHashes({{9, 9, 9, 9}}).front();
+    CacheForGroup(pool, unrelated, 99);
+
+    CoordinatorMatch match = coord.MatchPrefix(ch).device;
+    ASSERT_EQ(match.num_common_tokens, 12);
+
+    std::vector<BlockRef> acquired = pool.AcquireBlocks(3);
+    ASSERT_EQ(acquired.size(), 3u);
+    EXPECT_EQ(acquired.back()->BlockId(), trimmed);
+}
+
 TEST(CoordinatorMatchTest, SwaMissForcesZeroCommon) {
     // full caches 2 pages, swa caches nothing -> common = min(2, 0) = 0.
     BlockPool pool(16);

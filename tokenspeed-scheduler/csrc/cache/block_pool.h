@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <deque>
 #include <iterator>
 #include <string>
 #include <unordered_map>
@@ -37,7 +38,6 @@ public:
     explicit BlockPool(std::int32_t total_num_blocks, bool enable_caching = true)
         : total_num_blocks_{total_num_blocks}, enable_caching_{enable_caching} {
         _assert(total_num_blocks > 0, "total_num_blocks must be > 0");
-        controls_.reserve(static_cast<std::size_t>(total_num_blocks - 1));
         auto return_to_pool = [](BlockPool& pool, internal_block_ref::BlockControl& control) noexcept {
             pool.returnToPool(control);
         };
@@ -81,7 +81,7 @@ public:
         return BlockRef{control};
     }
 
-    BlockRef FindCachedBlock(const std::string& block_hash_with_group) {
+    BlockRef AcquireCachedBlock(const std::string& block_hash_with_group) {
         internal_block_ref::BlockControl* control = lookupCachedControl(block_hash_with_group);
         if (control == nullptr) {
             return {};
@@ -191,7 +191,8 @@ private:
 
     std::int32_t total_num_blocks_{0};
     bool enable_caching_{true};
-    std::vector<internal_block_ref::BlockControl> controls_{};
+    std::deque<internal_block_ref::BlockControl> controls_{};
+    // Keep every control in an allocated list node so acquire/release can use allocation-free splice().
     internal_block_ref::BlockControl::ControlList free_list_{};
     internal_block_ref::BlockControl::ControlList in_use_{};
     std::unordered_map<std::string, std::vector<internal_block_ref::BlockControl*>> cache_index_{};

@@ -49,10 +49,33 @@ public:
     // coordinator may match once and trim late; non-closed managers re-match bound-first.
     virtual bool MatchIsPrefixClosed() const = 0;
 
-    // One matcher for every tier: scan `pool` over slots [begin_blocks, max_blocks) of the FULL
-    // key sequence. Hits are pinned before return; blocks are relative to begin_blocks.
-    virtual PrefixMatch Match(BlockPool& pool, std::span<const std::string> keys, std::int32_t begin_blocks,
-                              std::int32_t max_blocks) const = 0;
+    // Probe slots [begin_blocks, max_blocks) without changing pool ownership.
+    // Hit slots are relative to begin_blocks.
+    virtual PrefixProbe Probe(const BlockPool& pool, std::span<const std::string> keys,
+                              std::int32_t begin_blocks, std::int32_t max_blocks) const = 0;
+
+    PrefixMatch AcquireMatchedBlocks(BlockPool& pool, std::span<const std::string> keys,
+                                     std::int32_t begin_blocks, const PrefixProbe& probe) const {
+        _assert(begin_blocks >= 0 && static_cast<std::size_t>(begin_blocks) + probe.hits.size() <= keys.size(),
+                "matched block range is out of bounds");
+        PrefixMatch match;
+        match.blocks.resize(probe.hits.size());
+        for (std::size_t i = 0; i < probe.hits.size(); ++i) {
+            if (probe.hits[i] == 0) {
+                continue;
+            }
+            BlockRef block = pool.AcquireCachedBlock(keys[static_cast<std::size_t>(begin_blocks) + i]);
+            _assert(static_cast<bool>(block), "cached block disappeared between match probe and acquisition");
+            match.blocks[i] = std::move(block);
+            ++match.num_hit_blocks;
+        }
+        return match;
+    }
+
+    PrefixMatch Match(BlockPool& pool, std::span<const std::string> keys, std::int32_t begin_blocks,
+                      std::int32_t max_blocks) const {
+        return AcquireMatchedBlocks(pool, keys, begin_blocks, Probe(pool, keys, begin_blocks, max_blocks));
+    }
 
     // Move the already-pinned match into the request table.
     void ClaimHitBlocks(BlockTable& table, PrefixMatch&& hit) {

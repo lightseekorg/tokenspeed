@@ -73,6 +73,12 @@ struct PrefixMatch {
     std::int32_t num_hit_blocks{0};
 };
 
+// Non-owning match shape. A nonzero slot is acquired only after the coordinator
+// converges every group to the final common boundary.
+struct PrefixProbe {
+    std::vector<std::uint8_t> hits{};
+};
+
 // Pinned source/destination pages for one asynchronous cache transfer.
 struct BlockTransfer {
     BlockRef source;

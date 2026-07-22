@@ -186,6 +186,28 @@ TEST(SwaManagerTest, MatchRequiresContiguityNotAnyHit) {
     EXPECT_EQ(m.num_hit_blocks, 2);
 }
 
+TEST(SwaManagerTest, SpeculativeHitsDoNotRefreshEvictionOrder) {
+    BlockPool pool(7);
+    SwaManager mgr(4, 10);  // pages_needed = 3
+    std::string h0 = RealKey({0, 0, 0, 0}, 0);
+    std::string h1 = RealKey({1, 1, 1, 1}, 0);
+    std::string h2 = RealKey({2, 2, 2, 2}, 0);
+    std::string h3 = RealKey({3, 3, 3, 3}, 0);
+    std::string h4 = RealKey({4, 4, 4, 4}, 0);
+    const std::int32_t b0 = CacheOnePage(pool, h0);
+    const std::int32_t b1 = CacheOnePage(pool, h1);
+    const std::int32_t b3 = CacheOnePage(pool, h3);
+    CacheOnePage(pool, h4);
+
+    std::vector<std::string> keys{h0, h1, h2, h3, h4};
+    PrefixMatch match = mgr.Match(pool, keys, 0, 5);
+    ASSERT_EQ(BlockIds(match.blocks), (std::vector<std::int32_t>{b0, b1}));
+
+    std::vector<BlockRef> acquired = pool.AcquireBlocks(3);
+    ASSERT_EQ(acquired.size(), 3u);
+    EXPECT_EQ(acquired.back()->BlockId(), b3);
+}
+
 // Pins the device-tier W=1 semantic: no lookback means every boundary is resumable,
 // so the match covers the full bounded range with holes and claims no real page.
 TEST(SwaManagerTest, MatchWindowOneCoversAllAsHoles) {
@@ -411,7 +433,7 @@ TEST(SwaManagerTest, ReclaimExpiredFreedCachedPageStaysPrefixReusable) {
 
     mgr.ReclaimExpired(pool, table, 8);  // frees pages 0,1; p0 returns with hash intact
     EXPECT_FALSE(table.Blocks()[0]);
-    BlockRef hit = pool.FindCachedBlock(h0);
+    BlockRef hit = pool.AcquireCachedBlock(h0);
     EXPECT_EQ(hit->BlockId(), p0);
 }
 

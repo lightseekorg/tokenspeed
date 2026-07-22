@@ -120,7 +120,7 @@ TEST(BlockPoolTest, CachedFreeBlockSurvivesAndIsReusable) {
     block.reset();
     EXPECT_EQ(pool.NumCachedFreeBlocks(), 1);
 
-    BlockRef hit = pool.FindCachedBlock(key);
+    BlockRef hit = pool.AcquireCachedBlock(key);
     ASSERT_EQ(hit->BlockId(), block_id);
     EXPECT_TRUE(hit->IsCached());
     EXPECT_EQ(hit.use_count(), 1);
@@ -133,7 +133,7 @@ TEST(BlockPoolTest, ActiveCachedBlockCanBeShared) {
     BlockRef first = pool.AcquireBlock();
     pool.CacheFullBlock(first, key);
 
-    BlockRef second = pool.FindCachedBlock(key);
+    BlockRef second = pool.AcquireCachedBlock(key);
 
     EXPECT_EQ(second, first);
     EXPECT_EQ(first.use_count(), 2);
@@ -152,14 +152,14 @@ TEST(BlockPoolTest, DuplicateHashesKeepDistinctBlocksIndexed) {
     second.reset();
 
     EXPECT_EQ(pool.NumCachedBlocks(), 2);
-    BlockRef hit = pool.FindCachedBlock(key);
+    BlockRef hit = pool.AcquireCachedBlock(key);
     EXPECT_EQ(hit->BlockId(), first_id);
     EXPECT_EQ(pool.NumCachedBlocks(), 2);
 }
 
 TEST(BlockPoolTest, MissReturnsNull) {
     BlockPool pool(8);
-    EXPECT_FALSE(pool.FindCachedBlock(RealKey({9, 9}, 0)));
+    EXPECT_FALSE(pool.AcquireCachedBlock(RealKey({9, 9}, 0)));
     EXPECT_FALSE(pool.ContainsCachedBlock(RealKey({9, 9}, 0)));
 }
 
@@ -170,7 +170,7 @@ TEST(BlockPoolTest, CachingDisabledNeverHits) {
     BlockRef block = pool.AcquireBlock();
     pool.CacheFullBlock(block, key);  // no-op when caching is disabled
     EXPECT_FALSE(block->IsCached());
-    EXPECT_FALSE(pool.FindCachedBlock(key));  // lookups always miss
+    EXPECT_FALSE(pool.AcquireCachedBlock(key));  // lookups always miss
     EXPECT_FALSE(pool.ContainsCachedBlock(key));
 }
 
