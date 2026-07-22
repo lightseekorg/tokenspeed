@@ -21,7 +21,7 @@ server:
     --max-num-seqs 128
     --mamba-ssm-dtype float32
     --moe-backend flashinfer_trtllm
-    --draft-moe-backend flashinfer_cutlass
+    --draft-moe-backend flashinfer_trtllm
     --trust-remote-code
     --attention-backend trtllm
     --chunked-prefill-size 2048

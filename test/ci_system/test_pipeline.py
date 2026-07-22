@@ -14,6 +14,7 @@ from pipeline import (
     format_perf_reference_markdown_table,
     format_perf_reference_table,
     get_excluded_runner_labels,
+    get_included_tasks,
     get_runner_specific_env,
     is_amd_runner,
     is_gb200_runner,
@@ -21,6 +22,7 @@ from pipeline import (
     resolve_score_threshold_for_runner,
     runner_matches_group,
     should_run_nvidia_gpu_cleanup,
+    task_is_included,
     validate_task,
 )
 
@@ -133,6 +135,23 @@ def test_excluded_runner_labels_parse_comma_separated_terms(monkeypatch):
 
     monkeypatch.delenv("TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS")
     assert get_excluded_runner_labels() == []
+
+
+def test_included_tasks_parse_comma_separated_terms(monkeypatch):
+    monkeypatch.setenv("TOKENSPEED_CI_INCLUDED_TASKS", " perf-a, perf-b, ,")
+    assert get_included_tasks() == ["perf-a", "perf-b"]
+
+    monkeypatch.setenv("TOKENSPEED_CI_INCLUDED_TASKS", " , , ")
+    assert get_included_tasks() == []
+
+    monkeypatch.delenv("TOKENSPEED_CI_INCLUDED_TASKS")
+    assert get_included_tasks() == []
+
+
+def test_task_is_included_defaults_to_all_tasks():
+    assert task_is_included("ut-a", []) is True
+    assert task_is_included("ut-a", ["ut-a"]) is True
+    assert task_is_included("ut-a", ["ut-b"]) is False
 
 
 def test_extract_evalscope_score_from_pipe_table():
@@ -483,6 +502,26 @@ def test_build_matrix_default_priority_preserves_existing_order(tmp_path):
     ]
     assert all(e["priority"] == "normal" for e in matrix["include"])
     assert all(e["optional"] is False for e in matrix["include"])
+
+
+def test_build_matrix_filters_included_tasks(monkeypatch, tmp_path):
+    monkeypatch.setenv("TOKENSPEED_CI_INCLUDED_TASKS", "ut-b")
+    _write_task_yaml(
+        tmp_path,
+        "a-first.yaml",
+        _default_body("ut-a", ["b300-1gpu"]),
+    )
+    _write_task_yaml(
+        tmp_path,
+        "b-second.yaml",
+        _default_body("ut-b", ["b200-1gpu"]),
+    )
+
+    matrix = build_matrix(tmp_path, tmp_path, trigger="per-commit")
+
+    assert [(e["name"], e["runner"]) for e in matrix["include"]] == [
+        ("ut-b", "b200-1gpu"),
+    ]
 
 
 def test_build_matrix_excludes_runner_label_substrings_case_insensitively(

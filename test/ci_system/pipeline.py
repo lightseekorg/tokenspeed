@@ -41,6 +41,7 @@ SUPPORTED_RUNNER_GROUPS = ("all", "amd", "nvidia", "nvidia-arm", "nvidia-x86")
 _PRIORITY_ORDER = {value: index for index, value in enumerate(SUPPORTED_PRIORITIES)}
 B200_RUNNER_LABEL_ENV = "TOKENSPEED_B200_RUNNER_LABEL"
 EXCLUDED_RUNNER_LABELS_ENV = "TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS"
+INCLUDED_TASKS_ENV = "TOKENSPEED_CI_INCLUDED_TASKS"
 STALE_PROCESS_PATTERNS = [
     r"ts serve",
     r"python.*-m\s+smg(\s|\.launch|$)",
@@ -227,6 +228,19 @@ def get_excluded_runner_labels() -> List[str]:
     ]
 
 
+def get_included_tasks() -> List[str]:
+    return [
+        term.strip()
+        for term in os.environ.get(INCLUDED_TASKS_ENV, "").split(",")
+        if term.strip()
+    ]
+
+
+def task_is_included(task_name: str, included_tasks: Iterable[str]) -> bool:
+    included = set(included_tasks)
+    return not included or task_name in included
+
+
 def runner_is_excluded(runner: str, excluded_labels: Iterable[str]) -> bool:
     normalized_runner = runner.lower()
     return any(label in normalized_runner for label in excluded_labels)
@@ -288,8 +302,11 @@ def build_matrix(
 ) -> Dict[str, Any]:
     include = []
     excluded_runner_labels = get_excluded_runner_labels()
+    included_tasks = get_included_tasks()
     for path in find_task_files(root):
         task = normalize_task(path, repo_root)
+        if not task_is_included(task["name"], included_tasks):
+            continue
         if trigger and trigger not in task["triggers"]:
             continue
         priority = task.get("priority")

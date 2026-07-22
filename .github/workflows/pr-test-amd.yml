@@ -94,6 +94,7 @@ jobs:
         id: scan
         env:
           TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS: ${{ vars.TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS }}
+          TOKENSPEED_CI_INCLUDED_TASKS: perf-qwen3.5-397b-a17b-nvfp4-agentic-b200-8gpu
         run: |
           MATRIX=$(python3 test/ci_system/pipeline.py scan \
             --root test/ci \
