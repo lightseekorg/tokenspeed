@@ -96,6 +96,11 @@ public:
         return lookupCachedControl(block_hash_with_group) != nullptr;
     }
 
+    bool IsCachedBlockFree(const std::string& block_hash_with_group) const {
+        const internal_block_ref::BlockControl* control = lookupCachedControl(block_hash_with_group);
+        return control != nullptr && control->UseCount() == 0;
+    }
+
     void CacheFullBlock(const BlockRef& block_ref, const std::string& block_hash_with_group) {
         _assert(block_ref && block_ref.IsOwnedBy(*this), "block reference belongs to another pool");
         internal_block_ref::BlockControl& control = controlAt(block_ref->BlockId());

@@ -162,15 +162,15 @@ Scheduler::FlatAdmissionMatch Scheduler::matchFlatPrefixAtAdmission(Request* req
 }
 
 // Returns the decode-reserve pages to record when admitted (0 unless this chunk completes prefill); nullopt = defer.
-std::optional<std::int32_t> Scheduler::flatAdmitFirstChunk(Request* request, std::int32_t ext_real_pages,
-                                                           std::int32_t chunk_tokens,
+std::optional<std::int32_t> Scheduler::flatAdmitFirstChunk(Request* request, std::int32_t device_free_hit_blocks,
+                                                           std::int32_t ext_real_pages, std::int32_t chunk_tokens,
                                                            std::int32_t decode_reserve_tokens) const {
     // Charge chunk + reserve in one query: unreserved, an exactly-filling prompt's own decode defers forever.
     // ext_real_pages composes exactly: extension pages are FULL, so they leave tail_avail 0.
     const std::int32_t blocks_needed = coordinator_.BlocksNeededFor(chunk_tokens + decode_reserve_tokens);
-    // Prefix matches already own their real pages, so those pages have left the
-    // free list and must not be charged a second time here.
-    if (blocks_needed + ext_real_pages > flatFreeBudget(request->Id())) {
+    // Device probe hits remain in the free list until admission commits; charge
+    // the entries AcquirePrefix will remove. Host hits need fresh device pages.
+    if (blocks_needed + device_free_hit_blocks + ext_real_pages > flatFreeBudget(request->Id())) {
         return std::nullopt;
     }
     // Reserve need is computed on the post-prefill table shape now, never recomputed against drifted state.
@@ -323,7 +323,8 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         flat_ext_real_pages += static_cast<std::int32_t>(std::ranges::count(g.hits, std::uint8_t{1}));
     }
     const std::optional<std::int32_t> flat_reserve_pages =
-        flatAdmitFirstChunk(request, flat_ext_real_pages, tokens_this_round, flat_decode_reserve);
+        flatAdmitFirstChunk(request, flat_match.probe.device.num_free_hit_blocks, flat_ext_real_pages,
+                            tokens_this_round, flat_decode_reserve);
     if (!flat_reserve_pages) {
         return {};
     }

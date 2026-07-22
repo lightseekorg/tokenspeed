@@ -137,8 +137,8 @@ private:
         std::vector<std::string> ext_hashes;
     };
     FlatAdmissionMatch matchFlatPrefixAtAdmission(Request* request);
-    std::optional<std::int32_t> flatAdmitFirstChunk(Request* request, std::int32_t ext_real_pages,
-                                                    std::int32_t chunk_tokens,
+    std::optional<std::int32_t> flatAdmitFirstChunk(Request* request, std::int32_t device_free_hit_blocks,
+                                                    std::int32_t ext_real_pages, std::int32_t chunk_tokens,
                                                     std::int32_t decode_reserve_tokens) const;
     std::optional<std::int32_t> flatAdmitPrefillChunk(Request* request, std::int32_t chunk_tokens,
                                                       std::int32_t decode_reserve_tokens,

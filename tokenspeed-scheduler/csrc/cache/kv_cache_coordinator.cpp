@@ -139,6 +139,12 @@ KvCacheCoordinator::CoordinatorProbe KvCacheCoordinator::probeTierWithKeys(
             _assert(groups_[i].Manager().MatchIsPrefixClosed(), "window group left above the converged boundary");
             probe.hits.resize(static_cast<std::size_t>(boundary_tokens / group_block_size - floor_blocks));
         }
+        for (std::size_t j = 0; j < probe.hits.size(); ++j) {
+            if (probe.hits[j] != 0 &&
+                pool.IsCachedBlockFree(group_keys[i][static_cast<std::size_t>(floor_blocks) + j])) {
+                ++out.num_free_hit_blocks;
+            }
+        }
     }
     out.num_common_tokens = boundary_tokens;
     return out;

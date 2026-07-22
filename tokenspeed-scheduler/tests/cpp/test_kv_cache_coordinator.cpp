@@ -179,6 +179,7 @@ TEST(CoordinatorMatchTest, AdmissionProbeDoesNotRefreshEvictionOrder) {
 
     KvCacheCoordinator::AdmissionProbe probe = coord.ProbePrefix(std::span<const std::string>{ch}.first(1));
     EXPECT_EQ(probe.device.num_common_tokens, 4);
+    EXPECT_EQ(probe.device.num_free_hit_blocks, 1);
     EXPECT_EQ(pool.NumFreeBlocks(), 2);
 
     BlockRef acquired = pool.AcquireBlock();

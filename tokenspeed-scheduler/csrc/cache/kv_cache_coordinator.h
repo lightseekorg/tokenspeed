@@ -65,6 +65,7 @@ public:
     };
     struct CoordinatorProbe {
         std::int32_t num_common_tokens{0};
+        std::int32_t num_free_hit_blocks{0};
         std::vector<PrefixProbe> per_group;
     };
     struct AdmissionProbe {
