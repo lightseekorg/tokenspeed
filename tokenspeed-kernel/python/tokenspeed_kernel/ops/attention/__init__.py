@@ -29,6 +29,7 @@ import tokenspeed_kernel.ops.attention.flash_attn  # noqa: F401
 import tokenspeed_kernel.ops.attention.flash_mla  # noqa: F401
 import tokenspeed_kernel.ops.attention.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.attention.gluon  # noqa: F401
+import tokenspeed_kernel.ops.attention.msa  # noqa: F401
 import tokenspeed_kernel.ops.attention.triton  # noqa: F401
 import torch
 from tokenspeed_kernel.ops.attention.gdn_utils import (

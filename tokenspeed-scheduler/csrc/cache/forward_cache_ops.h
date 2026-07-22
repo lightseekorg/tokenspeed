@@ -42,15 +42,13 @@ struct SchedulerConfig;
 // On false (pool short) nothing is acquired but the claimed prefix blocks REMAIN -- caller must FreeRequest.
 // SWA peak = ceil((chunk+W-1)/P) pages (chunk fully resident during its forward; pinned by
 // FlatPrefillPlateauSuite -- shrinking it needs a kernel-level ring buffer).
-bool PrefillFirstChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables, const CoordinatorMatch& hit,
+bool PrefillFirstChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables, CoordinatorMatch&& hit,
                        std::int32_t num_new_tokens);
 
 // Appends the host extension to each group's table (null-block slots -> device null, real slots
-// Acquire one page); returns (host_block, device_block) pairs group-major -- the load emission
-// pins BOTH sides when it builds the ticket, before the sink drain can evict.
-std::vector<std::pair<CacheBlock*, CacheBlock*>> LoadHostExtension(KvCacheCoordinator& coordinator,
-                                                                   std::vector<BlockTable>& tables,
-                                                                   const CoordinatorMatch& host);
+// Acquire one page); returns already-pinned pairs group-major.
+std::vector<BlockTransfer> LoadHostExtension(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
+                                             CoordinatorMatch&& host);
 
 // Register prior chunks' pages, slide to num_computed_tokens, then acquire; false = pool
 // short (registration and slide already ran, nothing allocated) -- same for the two ops below.
