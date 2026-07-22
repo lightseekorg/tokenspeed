@@ -177,7 +177,12 @@ class BaseCausalLM(nn.Module):
     ) -> dict:
         """Hook for subclasses to pass model-specific tensors."""
         model_kwargs = {}
-        for key in ("input_embeds", "inputs_embeds"):
+        for key in (
+            "input_embeds",
+            "inputs_embeds",
+            "accept_lengths",
+            "draft_seq_lens",
+        ):
             if kwargs.get(key) is not None:
                 model_kwargs[key] = kwargs[key]
         return model_kwargs
