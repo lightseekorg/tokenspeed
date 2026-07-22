@@ -31,6 +31,7 @@ from tokenspeed_kernel.ops.gemm.fp8_utils import (
     per_token_group_quant_fp8,
     per_token_quant_fp8,
     static_quant_fp8,
+    swizzle_mxfp8_scale,
 )
 from tokenspeed_kernel.platform import Platform
 from torch.nn.parameter import Parameter
@@ -45,6 +46,11 @@ try:
 except ImportError:
     _ceil_to_ue8m0 = None
     _transform_sf = None
+
+try:
+    from tokenspeed_kernel.ops.gemm.flashinfer import has_flashinfer_mxfp8
+except ImportError:
+    has_flashinfer_mxfp8 = None
 
 from tokenspeed.runtime.layers.dense.utils import normalize_e4m3fn_to_e4m3fnuz
 from tokenspeed.runtime.layers.parameter import (
@@ -272,6 +278,25 @@ class Fp8LinearMethod(LinearMethodBase):
                     f"weight={tuple(layer.weight.shape)}); ensure FP8 block-quant "
                     "ue8m0 weights with block-aligned dims and deep_gemm installed."
                 )
+            layer._use_flashinfer_mxfp8 = False
+            if (
+                not layer._use_deep_gemm_fp8
+                and not is_bmm
+                and has_flashinfer_mxfp8 is not None
+                and has_flashinfer_mxfp8()
+                and tuple(self.quant_config.weight_block_size) == (1, 32)
+                and layer.weight_scale_inv.dtype == torch.uint8
+                and layer.weight_scale_inv.dim() == 2
+            ):
+                N, K = layer.weight.shape
+                if N >= 128 and K >= 128 and K % 32 == 0:
+                    # Swizzle the e8m0 scales once into the F8_128x4 layout the
+                    # flashinfer cute-dsl GEMM consumes; the Triton fallback
+                    # cannot read this layout, so apply() pins the kernel.
+                    layer.weight_scale_inv.data = swizzle_mxfp8_scale(
+                        layer.weight_scale_inv.data, N, K
+                    )
+                    layer._use_flashinfer_mxfp8 = True
         else:
             layer.weight = Parameter(layer.weight.data, requires_grad=False)
 
@@ -338,11 +363,12 @@ class Fp8LinearMethod(LinearMethodBase):
             output_shape = [*x.shape[:-1], layer.weight.shape[0]]
             output_dtype = output_dtype or x.dtype
 
-            override = (
-                "deep_gemm_mm_fp8_blockscale"
-                if getattr(layer, "_use_deep_gemm_fp8", False)
-                else None
-            )
+            if getattr(layer, "_use_deep_gemm_fp8", False):
+                override = "deep_gemm_mm_fp8_blockscale"
+            elif getattr(layer, "_use_flashinfer_mxfp8", False):
+                override = "flashinfer_mm_mxfp8"
+            else:
+                override = None
             output = tokenspeed_kernel.mm(
                 input_2d,
                 layer.weight,
