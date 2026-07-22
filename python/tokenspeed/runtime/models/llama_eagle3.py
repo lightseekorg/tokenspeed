@@ -458,21 +458,6 @@ class Eagle3LlamaModel(BaseTransformerModel):
         )
         self.norm_output = getattr(config, "norm_output", False)
 
-        # fc_norm: separate RMSNorm per aux hidden state, applied to each
-        # hidden_size chunk before fc (replicated)
-        self.fc_norm = (
-            nn.ModuleList(
-                RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-                for _ in range(self.num_fc_input_dim)
-            )
-            if getattr(config, "fc_norm", False)
-            else None
-        )
-
-        # norm_output: chained draft steps consume the post-final-norm hidden
-        # states instead of the pre-norm residual stream.
-        self.norm_output = getattr(config, "norm_output", False)
-
     def forward(
         self,
         input_ids: torch.Tensor,
