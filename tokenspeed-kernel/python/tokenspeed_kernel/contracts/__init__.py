@@ -31,10 +31,27 @@ __all__ = [
 
 
 def get_operation_schema(family: str, mode: str) -> OperationSchema:
-    """Return the published contract for one family and mode."""
+    """Return the published contract for one kernel operation.
+
+    Args:
+        family: Kernel family that owns the operation, such as ``"attention"``.
+        mode: Operation mode within the family, such as ``"mha_prefill"``.
+
+    Returns:
+        The published :class:`OperationSchema` that defines the operation's
+        canonical call and validates kernel registrations.
+
+    Raises:
+        tokenspeed_kernel.operation.UnknownOperationError: If no schema is
+            published for ``family`` and ``mode``.
+    """
     return OperationRegistry.get().lookup(family, mode)
 
 
 def list_operation_schemas() -> tuple[OperationSchema, ...]:
-    """Return every contract published by this package."""
+    """Return every contract published by this package.
+
+    Returns:
+        Published operation schemas sorted by family and mode.
+    """
     return OperationRegistry.get().schemas()
