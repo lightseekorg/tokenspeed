@@ -3746,59 +3746,66 @@ class DeepseekV4Attention(nn.Module):
         forward_mode = ctx.forward_mode
         if forward_mode is None:
             raise RuntimeError("DeepSeek V4 attention requires forward mode")
-        if forward_mode.is_mixed():
-            with nvtx_range(f"{profile_prefix}_mixed_backend"):
-                attn_output = ctx.attn_backend.forward_deepseek_v4_mixed(
-                    q=q,
-                    positions=positions,
-                    token_to_kv_pool=pool,
-                    layer_id=self.cache_layer_index,
-                    kind=self.attention_kind,
-                    compress_ratio=self.compress_ratio,
-                    num_local_heads=self.num_local_heads,
-                    padded_heads=self.padded_heads,
-                    head_dim=self.head_dim,
-                    window_size=self.swa_window,
-                    softmax_scale=self.scale,
-                    attn_sink=self.attn_sink,
-                    topk_indices=topk_indices,
+        with ctx.attn_backend.record_pd_cache_step(
+            forward_mode,
+            save_kv_cache=False,
+            record_kv_cache=None,
+        ):
+            if forward_mode.is_mixed():
+                with nvtx_range(f"{profile_prefix}_mixed_backend"):
+                    attn_output = ctx.attn_backend.forward_deepseek_v4_mixed(
+                        q=q,
+                        positions=positions,
+                        token_to_kv_pool=pool,
+                        layer_id=self.cache_layer_index,
+                        kind=self.attention_kind,
+                        compress_ratio=self.compress_ratio,
+                        num_local_heads=self.num_local_heads,
+                        padded_heads=self.padded_heads,
+                        head_dim=self.head_dim,
+                        window_size=self.swa_window,
+                        softmax_scale=self.scale,
+                        attn_sink=self.attn_sink,
+                        topk_indices=topk_indices,
+                    )
+            elif forward_mode.is_decode():
+                with nvtx_range(f"{profile_prefix}_decode_backend"):
+                    attn_output = ctx.attn_backend.forward_deepseek_v4_decode(
+                        q=q,
+                        positions=positions,
+                        token_to_kv_pool=pool,
+                        layer_id=self.cache_layer_index,
+                        kind=self.attention_kind,
+                        compress_ratio=self.compress_ratio,
+                        num_local_heads=self.num_local_heads,
+                        padded_heads=self.padded_heads,
+                        head_dim=self.head_dim,
+                        window_size=self.swa_window,
+                        softmax_scale=self.scale,
+                        attn_sink=self.attn_sink,
+                        topk_indices=topk_indices,
+                    )
+            elif forward_mode.is_extend_or_mixed():
+                with nvtx_range(f"{profile_prefix}_prefill_backend"):
+                    attn_output = ctx.attn_backend.forward_deepseek_v4_prefill(
+                        q=q,
+                        positions=positions,
+                        token_to_kv_pool=pool,
+                        layer_id=self.cache_layer_index,
+                        kind=self.attention_kind,
+                        compress_ratio=self.compress_ratio,
+                        num_local_heads=self.num_local_heads,
+                        padded_heads=self.padded_heads,
+                        head_dim=self.head_dim,
+                        window_size=self.swa_window,
+                        softmax_scale=self.scale,
+                        attn_sink=self.attn_sink,
+                        topk_indices=topk_indices,
+                    )
+            else:
+                raise RuntimeError(
+                    f"Unsupported DeepSeek V4 forward mode: {forward_mode}"
                 )
-        elif forward_mode.is_decode():
-            with nvtx_range(f"{profile_prefix}_decode_backend"):
-                attn_output = ctx.attn_backend.forward_deepseek_v4_decode(
-                    q=q,
-                    positions=positions,
-                    token_to_kv_pool=pool,
-                    layer_id=self.cache_layer_index,
-                    kind=self.attention_kind,
-                    compress_ratio=self.compress_ratio,
-                    num_local_heads=self.num_local_heads,
-                    padded_heads=self.padded_heads,
-                    head_dim=self.head_dim,
-                    window_size=self.swa_window,
-                    softmax_scale=self.scale,
-                    attn_sink=self.attn_sink,
-                    topk_indices=topk_indices,
-                )
-        elif forward_mode.is_extend_or_mixed():
-            with nvtx_range(f"{profile_prefix}_prefill_backend"):
-                attn_output = ctx.attn_backend.forward_deepseek_v4_prefill(
-                    q=q,
-                    positions=positions,
-                    token_to_kv_pool=pool,
-                    layer_id=self.cache_layer_index,
-                    kind=self.attention_kind,
-                    compress_ratio=self.compress_ratio,
-                    num_local_heads=self.num_local_heads,
-                    padded_heads=self.padded_heads,
-                    head_dim=self.head_dim,
-                    window_size=self.swa_window,
-                    softmax_scale=self.scale,
-                    attn_sink=self.attn_sink,
-                    topk_indices=topk_indices,
-                )
-        else:
-            raise RuntimeError(f"Unsupported DeepSeek V4 forward mode: {forward_mode}")
         with nvtx_range(f"{profile_prefix}_output_proj"):
             return self._project_attention_output(
                 attn_output,

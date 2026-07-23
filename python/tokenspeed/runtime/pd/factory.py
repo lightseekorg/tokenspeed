@@ -38,6 +38,25 @@ def _get_contiguous_buf_unit_lens(pool, item_lens):
     return unit_lens
 
 
+def _get_contiguous_buf_group_ids(pool, item_lens):
+    getter = getattr(pool, "get_contiguous_buf_group_ids", None)
+    if getter is None:
+        return [None] * len(item_lens)
+    group_ids = list(getter())
+    if len(group_ids) != len(item_lens):
+        raise ValueError(
+            f"contiguous buffer group count mismatch: groups={len(group_ids)}, items={len(item_lens)}"
+        )
+    return group_ids
+
+
+def _get_paged_cache_group_tokens_per_page(pool):
+    return {
+        str(spec.group_id): int(spec.rows_per_page) * int(spec.entry_stride_tokens)
+        for spec in getattr(pool, "paged_cache_group_specs", ())
+    }
+
+
 def get_kv_args(
     engine_rank: int,
     gpu_id,
@@ -50,6 +69,10 @@ def get_kv_args(
         token_to_kv_pool.get_contiguous_buf_infos()
     )
     kv_unit_lens = _get_contiguous_buf_unit_lens(token_to_kv_pool, kv_item_lens)
+    kv_group_ids = _get_contiguous_buf_group_ids(token_to_kv_pool, kv_item_lens)
+    paged_cache_group_tokens_per_page = _get_paged_cache_group_tokens_per_page(
+        token_to_kv_pool
+    )
     # [[layer0buf0, layer0buf1...], [layer1buf0, layer1buf1...], ...]
     offsets = token_to_kv_pool.get_layerwise_buf_info_offsets()
     target_layer_num = token_to_kv_pool.layer_num
@@ -73,6 +96,12 @@ def get_kv_args(
         kv_data_lens += draft_kv_data_lens
         kv_item_lens += draft_kv_item_lens
         kv_unit_lens += draft_kv_unit_lens
+        kv_group_ids += _get_contiguous_buf_group_ids(
+            draft_token_to_kv_pool, draft_kv_item_lens
+        )
+        paged_cache_group_tokens_per_page.update(
+            _get_paged_cache_group_tokens_per_page(draft_token_to_kv_pool)
+        )
         offsets += draft_offsets
         draft_base_layer_id = (
             max(kv_layer_ids) + 1 if kv_layer_ids else target_layer_num
@@ -106,6 +135,8 @@ def get_kv_args(
         draft_layer_num=draft_layer_num,
         kv_layer_ids=kv_layer_ids,
         kv_unit_lens=kv_unit_lens,
+        kv_group_ids=kv_group_ids,
+        paged_cache_group_tokens_per_page=paged_cache_group_tokens_per_page,
         state_data_ptrs=state_data_ptrs,
         state_data_lens=state_data_lens,
         state_item_lens=state_item_lens,
