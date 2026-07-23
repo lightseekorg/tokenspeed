@@ -598,7 +598,7 @@ class ModelExecutor:
 
             self.encoder_graph_wrappers = active_encoder_graph_wrappers
 
-        self.execution_stream = torch.cuda.Stream()
+        self.execution_stream = torch.get_device_module(self.device).Stream()
         self.log_step = 0
         self._seen_prefill_ids: set[str] = set()
         self._prev_decode_bs: int = 0

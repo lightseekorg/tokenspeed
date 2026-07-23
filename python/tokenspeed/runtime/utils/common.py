@@ -157,22 +157,24 @@ def get_available_gpu_memory(
     Get available memory for cuda:gpu_id device.
     When distributed is True, the available memory is the minimum available memory of all GPUs.
     """
-    if device == "cuda":
-        num_gpus = torch.cuda.device_count()
+    if device in ("cuda", "xpu"):
+        dev_module = torch.get_device_module(device)
+        num_gpus = dev_module.device_count()
         if gpu_id >= num_gpus:
             raise ValueError(f"gpu_id={gpu_id} must be less than num_gpus={num_gpus}.")
 
-        if torch.cuda.current_device() != gpu_id:
+        if dev_module.current_device() != gpu_id:
             logger.debug(
                 "Current device is not %s, but %s, which may cause useless "
-                "memory allocation for torch CUDA context.",
+                "memory allocation for torch %s context.",
                 gpu_id,
-                torch.cuda.current_device(),
+                dev_module.current_device(),
+                device,
             )
 
         if empty_cache:
-            torch.cuda.empty_cache()
-        free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
+            dev_module.empty_cache()
+        free_gpu_memory, _ = dev_module.mem_get_info(gpu_id)
 
     if distributed:
         tensor = torch.tensor(free_gpu_memory, dtype=torch.float32)
@@ -185,6 +187,9 @@ def get_available_gpu_memory(
 
 
 def is_pin_memory_available() -> bool:
+    # Minimal Intel bring-up: keep pinned host memory disabled on XPU-only
+    # systems (torch.cuda.is_available() is False there) to avoid pinning
+    # failures on the "just run it" path. Revisit for perf.
     return torch.cuda.is_available()
 
 

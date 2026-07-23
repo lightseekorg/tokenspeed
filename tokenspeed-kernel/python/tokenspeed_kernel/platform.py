@@ -102,7 +102,7 @@ _fp8e4m3_dtype = None
 class PlatformInfo:
     """Complete description of a compute platform."""
 
-    vendor: str  # "nvidia", "amd"
+    vendor: str  # "nvidia", "amd", "intel"
     arch_version: ArchVersion
     device_name: str
     device_count: int
@@ -151,6 +151,10 @@ class PlatformInfo:
     @property
     def is_amd(self) -> bool:
         return self.vendor == "amd"
+
+    @property
+    def is_intel(self) -> bool:
+        return self.vendor == "intel"
 
     @property
     def is_cdna3(self) -> bool:
@@ -215,6 +219,10 @@ class PlatformInfo:
         """Register host memory that GPU kernels will directly dereference."""
         if tensor.device.type != "cpu" or tensor.numel() == 0:
             return
+        if self.is_intel:
+            # XPU: skip CUDA host pinning. Not required for correctness on the
+            # minimal Intel bring-up path.
+            return
         status = torch.cuda.cudart().cudaHostRegister(
             tensor.data_ptr(), tensor.numel() * tensor.element_size(), 0
         )
@@ -263,7 +271,12 @@ class CapabilityRequirement:
     def satisfied_by(self, platform: PlatformInfo) -> bool:
         """Check if platform satisfies these requirements."""
         if self.vendors and platform.vendor not in self.vendors:
-            return False
+            # Intel XPU rides the portable Triton path: accept any kernel that
+            # advertises portability across both established GPU vendors.
+            if not (
+                platform.vendor == "intel" and {"nvidia", "amd"} <= self.vendors
+            ):
+                return False
 
         if self.min_arch_version:
             if not platform.arch_version >= self.min_arch_version:
@@ -348,7 +361,60 @@ def _detect_platform() -> PlatformInfo:
             return _detect_rocm_platform()
         return _detect_cuda_platform()
 
-    raise RuntimeError("tokenspeed-kernel requires an NVIDIA CUDA or AMD ROCm GPU.")
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return _detect_xpu_platform()
+
+    raise RuntimeError(
+        "tokenspeed-kernel requires an NVIDIA CUDA, AMD ROCm, or Intel XPU GPU."
+    )
+
+
+def _detect_xpu_platform() -> PlatformInfo:
+    """Detect Intel XPU platform (minimal bring-up path).
+
+    Intel GPUs run through the portable Triton backend. Architecture-specific
+    tuning is not wired up yet, so we report a neutral arch version and let the
+    portable kernels take the generic code paths.
+    """
+    import torch
+
+    props = torch.xpu.get_device_properties(torch.xpu.current_device())
+
+    total_memory = int(getattr(props, "total_memory", 0))
+    # XPU exposes execution units / slices rather than SMs; fall back gracefully.
+    sm_count = int(
+        getattr(props, "gpu_subslice_count", 0)
+        or getattr(props, "max_compute_units", 0)
+        or 0
+    )
+    max_shared_memory = int(getattr(props, "local_mem_size", 0))
+
+    return PlatformInfo(
+        vendor="intel",
+        arch_version=ArchVersion(0, 0),
+        device_name=getattr(props, "name", "Intel XPU"),
+        device_count=torch.xpu.device_count(),
+        total_memory=total_memory,
+        memory_bandwidth=0.0,
+        sm_count=sm_count,
+        max_threads_per_sm=0,
+        max_shared_memory_per_sm=max_shared_memory,
+        sm_features=_get_xpu_sm_features(),
+        runtime_features=_get_xpu_runtime_features(),
+        interconnect=InterconnectInfo(topology="single_gpu"),
+    )
+
+
+def _get_xpu_sm_features() -> frozenset[str]:
+    """Determine Intel XPU compute features (conservative minimal set)."""
+    # Intel Xe Matrix Extensions (XMX) provide f16/int8 matrix engines. Keep the
+    # advertised feature set conservative for the initial bring-up.
+    return frozenset({"tensor_core:f16"})
+
+
+def _get_xpu_runtime_features() -> frozenset[str]:
+    """Detect Intel XPU runtime features."""
+    return frozenset()
 
 
 def _detect_cuda_platform() -> PlatformInfo:

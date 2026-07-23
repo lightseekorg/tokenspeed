@@ -48,7 +48,7 @@ REQUIREMENTS_DIR = ROOT / "requirements"
 THIRDPARTY_DIR = ROOT / "tokenspeed_kernel" / "thirdparty"
 BASE_VERSION = "0.1.3"
 BACKEND_ENV = "TOKENSPEED_KERNEL_BACKEND"
-VALID_BACKENDS = {"cuda", "rocm"}
+VALID_BACKENDS = {"cuda", "rocm", "xpu"}
 DEFAULT_CUDA_ARCHS = ("100a", "103a")
 
 # CUDA kernels source and output directories
@@ -177,6 +177,27 @@ def _is_rocm_platform() -> bool:
     return Path("/opt/rocm").exists()
 
 
+def _is_xpu_platform() -> bool:
+    # Intel XPU: no native CUDA/HIP compilation is required for the minimal
+    # bring-up (kernels run through the portable Triton path), so detection is
+    # best-effort based on the oneAPI runtime environment or a present device.
+    xpu_env_names = (
+        "ONEAPI_ROOT",
+        "SYCL_DEVICE_FILTER",
+        "ONEAPI_DEVICE_SELECTOR",
+    )
+    if any(os.environ.get(name) for name in xpu_env_names):
+        return True
+    try:
+        import torch
+
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            return True
+    except Exception:
+        pass
+    return Path("/dev/dri").exists()
+
+
 def _selected_backend() -> str:
     override = os.environ.get(BACKEND_ENV, "").strip().lower()
     if override:
@@ -189,6 +210,8 @@ def _selected_backend() -> str:
         return "cuda"
     if _is_rocm_platform():
         return "rocm"
+    if _is_xpu_platform():
+        return "xpu"
 
     raise RuntimeError(
         "Unable to detect CUDA or ROCm for tokenspeed_kernel dependencies. "

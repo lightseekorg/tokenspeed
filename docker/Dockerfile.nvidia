@@ -10,6 +10,12 @@ ARG CUDA_ARCH_LIST="9.0a 10.0a"
 
 ENV PIP_BREAK_SYSTEM_PACKAGES=1
 
+# Use a domestic mirror to speed up package downloads, keeping the official
+# PyPI index as a fallback for packages the mirror does not host (e.g.
+# tokenspeed-trtllm-kernel).
+ENV PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+ENV PIP_EXTRA_INDEX_URL=https://pypi.org/simple/
+
 WORKDIR /workspace
 
 # libnuma1 is required at runtime by torch_memory_saver, a TokenSpeed
