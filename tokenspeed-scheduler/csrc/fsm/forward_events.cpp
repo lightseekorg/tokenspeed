@@ -119,21 +119,13 @@ struct HashesToRegister {
     std::vector<std::string> hashes;
 };
 
-// Seed from a full-prefix hash list; the tail keeps the suffix from the last fold-grid boundary.
-HashChain MakeHashChain(const std::vector<std::string>& hashes, std::int32_t fold_align_pages) {
+HashChain MakeHashChain(const std::vector<std::string>& hashes) {
     const std::int32_t n = static_cast<std::int32_t>(hashes.size());
-    const std::int32_t tail_begin = n / fold_align_pages * fold_align_pages;
-    return HashChain{.num_hashed_pages = n,
-                     .last_hash = n > 0 ? hashes.back() : std::string{},
-                     .tail_begin_page = tail_begin,
-                     .tail = {hashes.begin() + tail_begin, hashes.end()}};
+    return HashChain{.num_hashed_pages = n, .last_hash = n > 0 ? hashes.back() : std::string{}};
 }
 
-// Hash the newly filled pages onto the chain; the returned batch reaches back to the fold grid
-// (fold_align_pages = lcm/base) so coarse groups fold the blocks completed this step. The
-// re-covered overlap is idempotent (m == 1 degenerates to exactly the fresh pages).
 HashesToRegister AdvanceHashChain(HashChain& chain, const std::vector<std::span<const std::int32_t>>& paged,
-                                  std::int32_t filled_pages, std::int32_t fold_align_pages) {
+                                  std::int32_t filled_pages) {
     _assert(filled_pages > chain.num_hashed_pages, "caller must pre-check hash-chain progress");
     _assert(filled_pages <= static_cast<std::int32_t>(paged.size()),
             "flat decode hashing: filled pages exceed the container's full pages");
@@ -141,14 +133,9 @@ HashesToRegister AdvanceHashChain(HashChain& chain, const std::vector<std::span<
                                                            paged.begin() + filled_pages);
     std::vector<std::string> new_hashes = ComputePagedHashes(fresh, chain.last_hash);
 
-    HashesToRegister batch{.begin_page = chain.tail_begin_page, .hashes = std::move(chain.tail)};
-    batch.hashes.insert(batch.hashes.end(), new_hashes.begin(), new_hashes.end());
-
-    const std::int32_t tail_begin = filled_pages / fold_align_pages * fold_align_pages;
+    HashesToRegister batch{.begin_page = chain.num_hashed_pages, .hashes = std::move(new_hashes)};
     chain.num_hashed_pages = filled_pages;
     chain.last_hash = batch.hashes.back();
-    chain.tail_begin_page = tail_begin;
-    chain.tail.assign(batch.hashes.begin() + (tail_begin - batch.begin_page), batch.hashes.end());
     return batch;
 }
 
@@ -413,7 +400,7 @@ Decoding ScheduleDecodeEvent::operator()(PrefillDone&& state) {
     Decoding decoding{state.GetTokenContainer(),           state.GetPageSize(),  nullptr, nullptr, nullptr,
                       std::move(state).TakeReqPoolIndex(), decode_input_tokens_, nullptr};
     decoding.SetBlockTables(std::move(tables));
-    decoding.SetHashChain(MakeHashChain(hashes, coordinator_->LcmBlockSize() / coordinator_->BaseBlockSize()));
+    decoding.SetHashChain(MakeHashChain(hashes));
     return decoding;
 #else
     auto local_kv_allocator = std::move(state).TakeLocalKVAllocator();
@@ -459,8 +446,7 @@ Decoding ScheduleDecodeEvent::operator()(Decoding&& state) {
     // A page fills only once every page_size steps; skip the span walk on the other steps.
     HashesToRegister to_register{.begin_page = chain.num_hashed_pages};
     if (filled_pages > chain.num_hashed_pages) {
-        to_register = AdvanceHashChain(chain, state.GetFullPagedTokens(false), filled_pages,
-                                       coordinator_->LcmBlockSize() / coordinator_->BaseBlockSize());
+        to_register = AdvanceHashChain(chain, state.GetFullPagedTokens(false), filled_pages);
     }
 
     auto tables = std::move(state).TakeBlockTables();

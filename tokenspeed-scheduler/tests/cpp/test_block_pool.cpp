@@ -21,233 +21,157 @@
 #include <gtest/gtest.h>
 
 #include <memory>
-#include <span>
-#include <string>
-#include <vector>
+#include <new>
+#include <optional>
 
 #include <spdlog/sinks/stdout_color_sinks.h>
 
 #include "cache/block_pool.h"
-#include "scheduler/page_hasher.h"
 
 namespace tokenspeed::test {
 namespace {
 
 template <class T>
-concept HasNullBlock = requires(T& value) { value.NullBlock(); };
+concept HasCacheIndex = requires(T& value) { value.ContainsCachedBlock("key"); };
 
-template <class T>
-concept HasNullBlockRef = requires(T& value) { value.NullBlockRef(); };
+static_assert(!HasCacheIndex<BlockPool>);
 
-static_assert(!HasNullBlock<BlockPool>);
-static_assert(!HasNullBlockRef<BlockPool>);
-
-using token_span = std::span<const std::int32_t>;
-
-// A real key from page_hasher.h, not a synthetic placeholder.
-std::string RealKey(const std::vector<std::int32_t>& tokens, uint32_t group_id) {
-    std::vector<token_span> pages = {token_span(tokens.data(), tokens.size())};
-    std::vector<std::string> keys = ComputePagedHashesWithGroup(pages, "", group_id);
-    return keys.front();
-}
-
-TEST(BlockPoolTest, ReservesPageIdZeroAndCountsFree) {
+TEST(BlockPoolTest, ConstructsExactlyRequestedLcmBlocks) {
     BlockPool pool(8);
     EXPECT_EQ(pool.TotalBlocks(), 8);
-    EXPECT_EQ(pool.NumFreeBlocks(), 7);
+    EXPECT_EQ(pool.NumFreeBlocks(), 8);
 }
 
 TEST(BlockPoolTest, DestroyWithLiveReferenceReportsFatalInvariant) {
     EXPECT_DEATH(
         {
             spdlog::set_default_logger(spdlog::stderr_color_mt("fatal-check-test"));
-            auto pool = std::make_unique<BlockPool>(2);
-            BlockRef ref = pool->AcquireBlock();
+            auto pool = std::make_unique<BlockPool>(1);
+            CacheBlockRef ref = pool->AcquireBlock();
             pool.reset();
         },
         "BlockPool destroyed with live block references");
 }
 
-TEST(BlockPoolTest, AcquireReturnsOwningRefs) {
-    BlockPool pool(8);
-    auto blocks = pool.AcquireBlocks(3);
-    ASSERT_EQ(blocks.size(), 3u);
-    for (const BlockRef& block : blocks) {
-        EXPECT_EQ(block.use_count(), 1);
-        EXPECT_TRUE(block);
-    }
-    EXPECT_EQ(pool.NumFreeBlocks(), 4);  // 7 free - 3 claimed
-}
-
-TEST(BlockPoolTest, AcquireFailsWhenCapacityShort) {
-    BlockPool pool(4);  // 3 free after null reservation
+TEST(BlockPoolTest, KOneBatchAcquireIsAllOrNothing) {
+    BlockPool pool(3);
     auto blocks = pool.AcquireBlocks(4);
-    EXPECT_TRUE(blocks.empty());  // all-or-nothing
-    EXPECT_EQ(pool.NumFreeBlocks(), 3);
+    EXPECT_TRUE(blocks.empty());
+    EXPECT_EQ(pool.NumOccupiedSlots(), 0);
+
+    blocks = pool.AcquireBlocks(3);
+    EXPECT_EQ(blocks.size(), 3u);
+    EXPECT_EQ(pool.NumFreeBlocks(), 0);
 }
 
-TEST(BlockPoolTest, ResetReturnsBlocksToPool) {
-    BlockPool pool(8);
-    auto blocks = pool.AcquireBlocks(3);
-    EXPECT_EQ(pool.NumFreeBlocks(), 4);
-    for (auto it = blocks.rbegin(); it != blocks.rend(); ++it) {
-        it->reset();
-    }
-    EXPECT_EQ(pool.NumFreeBlocks(), 7);
-}
-
-TEST(BlockPoolTest, BlockReturnsWhenOwnerCountReachesZero) {
-    BlockPool pool(8);
-    BlockRef first = pool.AcquireBlock();
-    BlockRef second = first;
-    EXPECT_EQ(first.use_count(), 2);
-    first.reset();
-    EXPECT_EQ(second.use_count(), 1);
-    EXPECT_EQ(pool.NumFreeBlocks(), 6);
-    second.reset();
-    EXPECT_EQ(pool.NumFreeBlocks(), 7);
-}
-
-TEST(BlockPoolTest, CachedFreeBlockSurvivesAndIsReusable) {
-    BlockPool pool(8);
-    const std::string key = RealKey({1, 2, 3, 4}, 0);
-
-    BlockRef block = pool.AcquireBlock();
-    const std::int32_t block_id = block->BlockId();
-    pool.CacheFullBlock(block, key);
-    EXPECT_TRUE(block->IsCached());
-
-    block.reset();
-    EXPECT_EQ(pool.NumCachedFreeBlocks(), 1);
-
-    BlockRef hit = pool.AcquireCachedBlock(key);
-    ASSERT_EQ(hit->BlockId(), block_id);
-    EXPECT_TRUE(hit->IsCached());
-    EXPECT_EQ(hit.use_count(), 1);
-    EXPECT_EQ(pool.NumFreeBlocks(), 6);
-}
-
-TEST(BlockPoolTest, ActiveCachedBlockCanBeShared) {
-    BlockPool pool(4);
-    const std::string key = RealKey({1, 2, 3, 4}, 0);
-    BlockRef first = pool.AcquireBlock();
-    pool.CacheFullBlock(first, key);
-
-    BlockRef second = pool.AcquireCachedBlock(key);
-
-    EXPECT_EQ(second, first);
-    EXPECT_EQ(first.use_count(), 2);
-    EXPECT_EQ(pool.NumFreeBlocks(), 2);
-}
-
-TEST(BlockPoolTest, DuplicateHashesKeepDistinctBlocksIndexed) {
+TEST(BlockPoolLcmPlacementTest, EmptyParentBindsToGroupOnFirstChild) {
     BlockPool pool(3);
-    const std::string key = RealKey({1, 2, 3, 4}, 0);
-    BlockRef first = pool.AcquireBlock();
-    BlockRef second = pool.AcquireBlock();
-    const std::int32_t first_id = first->BlockId();
-    pool.CacheFullBlock(first, key);
-    pool.CacheFullBlock(second, key);
-    first.reset();
-    second.reset();
+    CacheBlockRef first = pool.AcquireBlock(/*group_id=*/7, /*cache_blocks_per_lcm_block=*/2);
 
-    EXPECT_EQ(pool.NumCachedBlocks(), 2);
-    BlockRef hit = pool.AcquireCachedBlock(key);
-    EXPECT_EQ(hit->BlockId(), first_id);
-    EXPECT_EQ(pool.NumCachedBlocks(), 2);
+    ASSERT_TRUE(first);
+    EXPECT_EQ(first->Location(), (CacheBlockLocation{.lcm_block_id = 1, .slot_index = 0}));
+    EXPECT_EQ(pool.BoundGroup(1), std::optional<GroupId>{7});
+    EXPECT_EQ(pool.OccupiedCount(1), 1);
 }
 
-TEST(BlockPoolTest, MissReturnsNull) {
-    BlockPool pool(8);
-    EXPECT_FALSE(pool.AcquireCachedBlock(RealKey({9, 9}, 0)));
-    EXPECT_FALSE(pool.ContainsCachedBlock(RealKey({9, 9}, 0)));
+TEST(BlockPoolLcmPlacementTest, NormalCapacityShortfallDoesNotMutatePartialParent) {
+    BlockPool pool(1);
+    CacheBlockRef existing = pool.AcquireBlock(/*group_id=*/7, /*cache_blocks_per_lcm_block=*/2);
+    ASSERT_TRUE(existing);
+    const CacheBlockLocation location = existing->Location();
+
+    std::vector<CacheBlockRef> blocks = pool.AcquireBlocks(/*group_id=*/7, /*cache_blocks_per_lcm_block=*/2, /*num=*/2);
+
+    EXPECT_TRUE(blocks.empty());
+    EXPECT_EQ(pool.BoundGroup(1), std::optional<GroupId>{7});
+    EXPECT_EQ(pool.OccupiedCount(1), 1);
+    EXPECT_TRUE(pool.IsOccupied(location));
 }
 
-TEST(BlockPoolTest, CachingDisabledNeverHits) {
-    BlockPool pool(8, /*enable_caching=*/false);
-    const std::string key = RealKey({1, 2, 3, 4}, 0);
+TEST(BlockPoolLcmPlacementTest, ParentRebindsOnlyAfterLastChildReleases) {
+    BlockPool pool(1);
+    CacheBlockRef child = pool.AcquireBlock(/*group_id=*/1, /*cache_blocks_per_lcm_block=*/2);
 
-    BlockRef block = pool.AcquireBlock();
-    pool.CacheFullBlock(block, key);  // no-op when caching is disabled
-    EXPECT_FALSE(block->IsCached());
-    EXPECT_FALSE(pool.AcquireCachedBlock(key));  // lookups always miss
-    EXPECT_FALSE(pool.ContainsCachedBlock(key));
+    EXPECT_FALSE(pool.AcquireBlock(/*group_id=*/2, /*cache_blocks_per_lcm_block=*/8));
+    child.reset();
+    EXPECT_EQ(pool.BoundGroup(1), std::nullopt);
+
+    CacheBlockRef rebound = pool.AcquireBlock(/*group_id=*/2, /*cache_blocks_per_lcm_block=*/8);
+    ASSERT_TRUE(rebound);
+    EXPECT_EQ(rebound->Location().slot_index, 0);
+    EXPECT_EQ(pool.BoundGroup(1), std::optional<GroupId>{2});
 }
 
-TEST(BlockPoolTest, GroupIdDistinguishesSameContent) {
-    BlockPool pool(8);
-    const std::string k0 = RealKey({1, 2, 3, 4}, 0);
-    const std::string k1 = RealKey({1, 2, 3, 4}, 1);
-    ASSERT_NE(k0, k1);  // same content, different group -> different key
-
-    BlockRef a = pool.AcquireBlock();
-    pool.CacheFullBlock(a, k0);
-    EXPECT_TRUE(pool.ContainsCachedBlock(k0));
-    EXPECT_FALSE(pool.ContainsCachedBlock(k1));  // group 1 not cached
-}
-
-TEST(BlockPoolTest, EvictionDropsCachedContentWhenReused) {
-    // 1 usable block: reusing it must evict its old cached content from the map.
+TEST(BlockPoolLcmPlacementTest, ReleasedParentsRestoreBatchCapacity) {
     BlockPool pool(2);
-    const std::string key = RealKey({1, 2, 3, 4}, 0);
-
-    BlockRef first = pool.AcquireBlock();
-    const std::int32_t block_id = first->BlockId();
-    pool.CacheFullBlock(first, key);
-    first.reset();  // cached + free
-    EXPECT_TRUE(pool.ContainsCachedBlock(key));
-
-    BlockRef second = pool.AcquireBlock();
-    EXPECT_EQ(second->BlockId(), block_id);  // same physical block reused
-    EXPECT_FALSE(second->IsCached());
-    EXPECT_FALSE(pool.ContainsCachedBlock(key));  // content gone from the map
-}
-
-TEST(BlockPoolTest, BatchAcquireDropsCachedContentWhenReused) {
-    BlockPool pool(3);
-    const std::string key = RealKey({1, 2, 3, 4}, 0);
-
-    BlockRef cached = pool.AcquireBlock();
-    pool.CacheFullBlock(cached, key);
-    cached.reset();
-    ASSERT_TRUE(pool.ContainsCachedBlock(key));
-
-    std::vector<BlockRef> blocks = pool.AcquireBlocks(2);
-
+    std::vector<CacheBlockRef> blocks = pool.AcquireBlocks(/*group_id=*/1, /*cache_blocks_per_lcm_block=*/1, /*num=*/2);
     ASSERT_EQ(blocks.size(), 2u);
-    EXPECT_FALSE(pool.ContainsCachedBlock(key));
-}
-
-TEST(BlockPoolTest, CacheFullBlockRejectsEmptyOrForeignReference) {
-    BlockPool pool(8);
-    BlockPool other_pool(8);
-    const std::string key = RealKey({1, 2, 3, 4}, 0);
-    BlockRef foreign = other_pool.AcquireBlock();
-    BlockRef local = pool.AcquireBlock();
-
-    EXPECT_THROW(pool.CacheFullBlock(BlockRef{}, key), std::runtime_error);
-    EXPECT_THROW(pool.CacheFullBlock(foreign, key), std::runtime_error);
-    EXPECT_THROW(pool.CacheFullBlock(local, ""), std::runtime_error);
-    EXPECT_FALSE(local->IsCached());
-}
-
-TEST(BlockPoolTest, EvictionPrefersLeastRecentlyFreed) {
-    BlockPool pool(4);  // 3 usable blocks
-    auto blocks = pool.AcquireBlocks(3);
-    const std::int32_t first_id = blocks[0]->BlockId();
-
     blocks[0].reset();
     blocks[1].reset();
-    blocks[2].reset();
 
-    BlockRef next = pool.AcquireBlock();
-    EXPECT_EQ(next->BlockId(), first_id);
+    std::vector<CacheBlockRef> reused = pool.AcquireBlocks(/*group_id=*/2, /*cache_blocks_per_lcm_block=*/1, /*num=*/2);
+
+    EXPECT_EQ(reused.size(), 2u);
+    EXPECT_EQ(pool.NumFreeBlocks(), 0);
 }
 
-TEST(BlockPoolTest, AcquireZeroBlocksReturnsEmpty) {
-    BlockPool pool(4);
-    EXPECT_TRUE(pool.AcquireBlocks(0).empty());
-    EXPECT_EQ(pool.NumFreeBlocks(), 3);
+TEST(BlockPoolLcmPlacementTest, IndependentChildrenShareOneParent) {
+    BlockPool pool(1);
+    CacheBlockRef first = pool.AcquireBlock(/*group_id=*/3, /*cache_blocks_per_lcm_block=*/2);
+    CacheBlockRef second = pool.AcquireBlock(/*group_id=*/3, /*cache_blocks_per_lcm_block=*/2);
+
+    ASSERT_TRUE(first);
+    ASSERT_TRUE(second);
+    EXPECT_EQ(first->Location().lcm_block_id, second->Location().lcm_block_id);
+    EXPECT_NE(first->Location().slot_index, second->Location().slot_index);
+    EXPECT_EQ(pool.OccupiedCount(1), 2);
+}
+
+TEST(BlockPoolLcmPlacementTest, ReleasingOneChildKeepsSiblingAndReusesOnlyItsSlot) {
+    BlockPool pool(1);
+    CacheBlockRef first = pool.AcquireBlock(/*group_id=*/3, /*cache_blocks_per_lcm_block=*/2);
+    CacheBlockRef sibling = pool.AcquireBlock(/*group_id=*/3, /*cache_blocks_per_lcm_block=*/2);
+    const CacheBlockLocation released = first->Location();
+    const CacheBlockLocation retained = sibling->Location();
+
+    first.reset();
+    EXPECT_FALSE(pool.IsOccupied(released));
+    EXPECT_TRUE(pool.IsOccupied(retained));
+
+    CacheBlockRef replacement = pool.AcquireBlock(/*group_id=*/3, /*cache_blocks_per_lcm_block=*/2);
+    ASSERT_TRUE(replacement);
+    EXPECT_EQ(replacement->Location(), released);
+    EXPECT_TRUE(pool.IsOccupied(retained));
+}
+
+TEST(BlockPoolLcmPlacementTest, FillsMostOccupiedPartialParentBeforeFreeParent) {
+    BlockPool pool(3);
+    auto first_parent = pool.AcquireBlocks(/*group_id=*/5, /*cache_blocks_per_lcm_block=*/3, /*num=*/3);
+    ASSERT_EQ(first_parent.size(), 3u);
+    CacheBlockRef second_parent = pool.AcquireBlock(/*group_id=*/5, /*cache_blocks_per_lcm_block=*/3);
+    ASSERT_TRUE(second_parent);
+    first_parent.back().reset();
+
+    CacheBlockRef fills_more_occupied_parent = pool.AcquireBlock(/*group_id=*/5, /*cache_blocks_per_lcm_block=*/3);
+    ASSERT_TRUE(fills_more_occupied_parent);
+    EXPECT_EQ(fills_more_occupied_parent->Location().lcm_block_id, first_parent.front()->Location().lcm_block_id);
+
+    CacheBlockRef fills_second_parent = pool.AcquireBlock(/*group_id=*/5, /*cache_blocks_per_lcm_block=*/3);
+    ASSERT_TRUE(fills_second_parent);
+    CacheBlockRef fills_second_parent_again = pool.AcquireBlock(/*group_id=*/5, /*cache_blocks_per_lcm_block=*/3);
+    ASSERT_TRUE(fills_second_parent_again);
+    CacheBlockRef uses_free_parent = pool.AcquireBlock(/*group_id=*/5, /*cache_blocks_per_lcm_block=*/3);
+    ASSERT_TRUE(uses_free_parent);
+    EXPECT_EQ(uses_free_parent->Location().lcm_block_id, 3);
+}
+
+TEST(BlockPoolLcmPlacementTest, LastReleaseImmediatelyClearsParentBinding) {
+    BlockPool pool(1);
+    CacheBlockRef child = pool.AcquireBlock(/*group_id=*/4, /*cache_blocks_per_lcm_block=*/8);
+    child.reset();
+
+    EXPECT_EQ(pool.BoundGroup(1), std::nullopt);
+    EXPECT_EQ(pool.NumFreeBlocks(), 1);
 }
 
 }  // namespace

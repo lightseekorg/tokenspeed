@@ -68,7 +68,7 @@ add_library(tokenspeed_scheduler_core STATIC
     csrc/scheduler/scheduler.cpp
 
     csrc/cache/kv_cache_coordinator.cpp
-    csrc/cache/block_ref.cpp
+    csrc/cache/cache_block_ref.cpp
     csrc/cache/forward_cache_ops.cpp
 )
 
@@ -125,7 +125,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
     add_executable(tokenspeed_scheduler_tests
         tests/cpp/test_page_hasher.cpp
         tests/cpp/test_block_pool.cpp
-        tests/cpp/test_block_ref.cpp
+        tests/cpp/test_cache_block_ref.cpp
         tests/cpp/test_full_attn_manager.cpp
         tests/cpp/test_swa_manager.cpp
         tests/cpp/test_match_host_pages.cpp

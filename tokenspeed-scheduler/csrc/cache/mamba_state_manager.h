@@ -27,11 +27,13 @@
 namespace tokenspeed {
 
 // GDN/mamba align semantics: hit = the nearest aligned snapshot, retention = last page only
-// (= SwaManager(P, 2) matching), plus final-page-only registration -- interior chunk
+// (= SwaManager(P, K_g, 2) matching), plus final-page-only registration -- interior chunk
 // boundaries never received a state write, so only the aligned chunk end is publishable.
 class MambaStateManager : public SwaManager {
 public:
-    explicit MambaStateManager(std::int32_t block_size) : SwaManager(block_size, /*sliding_window=*/2) {}
+    explicit MambaStateManager(std::int32_t cache_block_tokens, std::int32_t cache_blocks_per_lcm_block = 1,
+                               GroupId group_id = 0)
+        : SwaManager(cache_block_tokens, cache_blocks_per_lcm_block, /*sliding_window=*/2, group_id) {}
 
     bool RegistersAlignedFinalPageOnly() const override { return true; }
 };

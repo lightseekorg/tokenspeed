@@ -35,7 +35,7 @@ namespace tokenspeed {
 namespace {
 
 // Release explicitly in reverse; vector destruction order is not our eviction policy.
-void FreeAll(std::vector<BlockRef>&& refs) {
+void FreeAll(std::vector<CacheBlockRef>&& refs) {
     for (auto it = refs.rbegin(); it != refs.rend(); ++it) {
         it->reset();
     }
@@ -202,7 +202,7 @@ void Scheduler::handleEvent(const cache::WriteBackDone& event) {
         // ticket order keep both pools' recycling order deterministic.
         for (FlatStoreTicket& t : tickets) {
             if (event.success) {
-                flat_host_pool_.CacheFullBlock(t.host_block, t.key);
+                coordinator_.CacheHostBlock(t.group_id, t.host_block, t.key);
             }
         }
         for (auto it = tickets.rbegin(); it != tickets.rend(); ++it) {

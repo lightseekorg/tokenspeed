@@ -96,9 +96,10 @@ void AddUniqueNode(std::vector<TreeNode*>& nodes, TreeNode* node) {
 }
 
 template <typename Op>
-static void MaybeFillFlatBlockTables(Op& op, Request* request, std::span<const std::string> flat_group_ids) {
+static void MaybeFillFlatBlockTables(Op& op, Request* request, const KvCacheCoordinator& coordinator,
+                                     std::span<const std::string> flat_group_ids) {
     if (!request->FlatBlockTablesEmpty()) {
-        op.flat_block_tables = BuildFlatBlockTables(request->FlatBlockTablesRef(), flat_group_ids);
+        op.flat_block_tables = BuildFlatBlockTables(coordinator, request->FlatBlockTablesRef(), flat_group_ids);
     }
 }
 
@@ -143,9 +144,8 @@ Scheduler::FlatAdmissionMatch Scheduler::matchFlatPrefixAtAdmission(Request* req
     }
     // Hash input must be byte-identical to the REGISTRATION form (GetFullPagedTokens(false)); radix's
     // except_last rule (last prompt token recomputed for logits) becomes the page cap, also bounding SWA.
-    // These offsets index the base-granular hash array (GetFullPagedTokens is cut at base).
-    const std::int32_t base_block_size = coordinator_.BaseBlockSize();
-    const std::int32_t cap_pages = std::max((request->PrefillSize() - 1) / base_block_size, 0);
+    const std::int32_t cache_block_tokens = coordinator_.CacheBlockTokens();
+    const std::int32_t cap_pages = std::max((request->PrefillSize() - 1) / cache_block_tokens, 0);
     std::vector<std::span<const std::int32_t>> paged_tokens = request->GetFullPagedTokens(/*except_last=*/false);
     if (static_cast<std::size_t>(cap_pages) < paged_tokens.size()) {
         paged_tokens.resize(cap_pages);
@@ -153,11 +153,10 @@ Scheduler::FlatAdmissionMatch Scheduler::matchFlatPrefixAtAdmission(Request* req
     const std::vector<std::string> flat_hashes = ComputePagedHashes(paged_tokens, "");
     FlatAdmissionMatch match;
     match.probe = coordinator_.ProbePrefix(flat_hashes);
-    // Boundaries are in tokens; the extension hash offsets are in base pages (the granularity the
-    // hashes were computed at). No host pool -> host boundary 0 -> empty slice.
+    // Boundaries are in tokens; extension offsets are in logical CacheBlocks.
     const std::int32_t ext_pages =
-        std::max(match.probe.host.num_common_tokens - match.probe.device.num_common_tokens, 0) / base_block_size;
-    const auto ext_begin = flat_hashes.begin() + match.probe.device.num_common_tokens / base_block_size;
+        std::max(match.probe.host.num_common_tokens - match.probe.device.num_common_tokens, 0) / cache_block_tokens;
+    const auto ext_begin = flat_hashes.begin() + match.probe.device.num_common_tokens / cache_block_tokens;
     match.ext_hashes.assign(ext_begin, ext_begin + ext_pages);
     match.hashes = flat_hashes;
     return match;
@@ -209,8 +208,8 @@ bool Scheduler::flatAdmitDecode(Request* request) const {
 // True when this round can never unwedge itself; fused-only (PD requests hold pages outside both ledgers).
 bool Scheduler::flatPoolWedged(const std::vector<Request*>& candidates) const {
     const bool any_deferred = std::any_of(candidates.begin(), candidates.end(), isFlatDeferred);
-    // Block 0 is the null placeholder, never allocated.
-    const bool pool_pages_held = block_pool_.NumFreeBlocks() < block_pool_.TotalBlocks() - 1;
+    // BlockPool's count excludes the separately reserved null page.
+    const bool pool_pages_held = block_pool_.NumFreeBlocks() < block_pool_.TotalBlocks();
     // An in-flight D2H store OR H2D load still holds pool pages its Done event will free; both
     // ledgers must be empty. Dispatched mid-prefill chunk ops are invisible here and safe (they
     // free no pool pages, emit no event, and page reuse under them is stream-ordering safe).
@@ -727,7 +726,8 @@ void Scheduler::finalizeRadixPageTableEmission(Request* request, ForwardOperatio
 // By-reference so the first-chunk caller can harvest the transition's flat load pairs afterwards.
 template <typename Event>
     requires(std::same_as<Event, fsm::SchedulePrefillFirstChunkEvent> || std::same_as<Event, fsm::SchedulePrefillEvent>)
-static PrefillOperation applyPrefillEvent(Request* request, Event& event, std::span<const std::string> flat_group_ids) {
+static PrefillOperation applyPrefillEvent(Request* request, Event& event, const KvCacheCoordinator* coordinator,
+                                          std::span<const std::string> flat_group_ids) {
     // begin/size are PAGE-space: the req_to_page refresh slice for this operation.
     // The builder starts with appended pages; radix finalization may move begin
     // backward when publication canonicalizes an already-emitted physical page.
@@ -760,7 +760,13 @@ static PrefillOperation applyPrefillEvent(Request* request, Event& event, std::s
         }
     }
 
-    MaybeFillFlatBlockTables(op, request, flat_group_ids);
+#if TOKENSPEED_FLAT_KVCACHE
+    _assert(coordinator != nullptr, "flat operation requires a cache coordinator");
+    MaybeFillFlatBlockTables(op, request, *coordinator, flat_group_ids);
+#else
+    (void)coordinator;
+    (void)flat_group_ids;
+#endif
 
     return op;
 }
@@ -771,7 +777,11 @@ PrefillOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Sched
 #if !TOKENSPEED_FLAT_KVCACHE
     auto match = event.GetMatchResult();
 #endif
-    auto op = applyPrefillEvent(request, event, FlatGroupIds());
+#if TOKENSPEED_FLAT_KVCACHE
+    auto op = applyPrefillEvent(request, event, &coordinator_, FlatGroupIds());
+#else
+    auto op = applyPrefillEvent(request, event, nullptr, FlatGroupIds());
+#endif
 #if TOKENSPEED_FLAT_KVCACHE
     // Host-loaded pages ride the same LoadBackOperation channel as radix loadbacks.
     std::vector<BlockTransfer> load_pairs = event.TakeFlatLoadPairs();
@@ -782,8 +792,11 @@ PrefillOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Sched
         ticket.host_pins.reserve(load_pairs.size());
         ticket.device_blocks.reserve(load_pairs.size());
         for (BlockTransfer& pair : load_pairs) {
-            _assert(pair.source->IsCached(), "pinned host page lost its hash before load emission");
-            transfers.push_back(TransferPair{CacheKind::kKV, pair.source->BlockId(), pair.destination->BlockId()});
+            _assert(coordinator_.IsHostCachedBlock(pair.source->Location()),
+                    "pinned host page lost its cache entry before load emission");
+            const KvCacheManager& manager = coordinator_.GroupManager(static_cast<std::int32_t>(pair.group_id));
+            transfers.push_back(TransferPair{CacheKind::kKV, manager.ResolveKernelPageId(pair.source->Location()),
+                                             manager.ResolveKernelPageId(pair.destination->Location())});
             ticket.host_pins.push_back(std::move(pair.source));
             ticket.device_blocks.push_back(std::move(pair.destination));
         }
@@ -812,7 +825,11 @@ PrefillOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Sched
 }
 
 PrefillOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::SchedulePrefillEvent event) {
-    auto op = applyPrefillEvent(request, event, FlatGroupIds());
+#if TOKENSPEED_FLAT_KVCACHE
+    auto op = applyPrefillEvent(request, event, &coordinator_, FlatGroupIds());
+#else
+    auto op = applyPrefillEvent(request, event, nullptr, FlatGroupIds());
+#endif
 #if !TOKENSPEED_FLAT_KVCACHE
     if (hybrid_prefix_cache_) {
         hybrid_prefix_cache_->CommitChunk(op.request_id, const_cast<TreeNode*>(request->GetDeviceNode()));
@@ -829,6 +846,7 @@ template <typename Event>
     requires(std::same_as<Event, fsm::ScheduleDecodeEvent> ||
              std::same_as<Event, fsm::ScheduleDecodeFromRetractedEvent>)
 static DecodeOperation applyDecodeEvent(Request* request, Event event, std::int32_t decode_input_tokens,
+                                        const KvCacheCoordinator* coordinator,
                                         std::span<const std::string> flat_group_ids) {
     std::int32_t begin = static_cast<std::int32_t>(request->GetOccupiedPages().size());
     request->Apply(std::move(event));
@@ -853,7 +871,13 @@ static DecodeOperation applyDecodeEvent(Request* request, Event event, std::int3
         }
     }
 
-    MaybeFillFlatBlockTables(op, request, flat_group_ids);
+#if TOKENSPEED_FLAT_KVCACHE
+    _assert(coordinator != nullptr, "flat operation requires a cache coordinator");
+    MaybeFillFlatBlockTables(op, request, *coordinator, flat_group_ids);
+#else
+    (void)coordinator;
+    (void)flat_group_ids;
+#endif
 
     return op;
 }
@@ -866,7 +890,11 @@ DecodeOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Schedu
     const std::int32_t first_pos = request->TokenSize();
 #endif
 
-    auto op = applyDecodeEvent(request, std::move(event), config_.decode_input_tokens, FlatGroupIds());
+#if TOKENSPEED_FLAT_KVCACHE
+    auto op = applyDecodeEvent(request, std::move(event), config_.decode_input_tokens, &coordinator_, FlatGroupIds());
+#else
+    auto op = applyDecodeEvent(request, std::move(event), config_.decode_input_tokens, nullptr, FlatGroupIds());
+#endif
     if (need_bootstrap_token) {
         op.decode_input_id = bootstrap_token;
     }
@@ -938,7 +966,9 @@ DecodeOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Schedu
     finalizeRadixPageTableEmission(request, op, /*force_full=*/true);
 #endif
 
-    MaybeFillFlatBlockTables(op, request, FlatGroupIds());
+#if TOKENSPEED_FLAT_KVCACHE
+    MaybeFillFlatBlockTables(op, request, coordinator_, FlatGroupIds());
+#endif
 
     return op;
 }

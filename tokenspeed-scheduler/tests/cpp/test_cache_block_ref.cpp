@@ -25,7 +25,7 @@
 #include <vector>
 
 #include "cache/block_pool.h"
-#include "cache/block_ref.h"
+#include "cache/cache_block_ref.h"
 
 namespace tokenspeed::test {
 namespace {
@@ -33,21 +33,21 @@ namespace {
 template <class T>
 concept HasGet = requires(const T& value) { value.get(); };
 
-static_assert(!HasGet<BlockRef>);
-static_assert(sizeof(BlockRef) == sizeof(void*));
-static_assert(!std::is_constructible_v<BlockRef, internal_block_ref::BlockControl&>);
-static_assert(!std::is_copy_constructible_v<internal_block_ref::BlockControl>);
-static_assert(!std::is_move_constructible_v<internal_block_ref::BlockControl>);
-static_assert(std::is_copy_constructible_v<BlockRef>);
-static_assert(std::is_copy_assignable_v<BlockRef>);
-static_assert(std::is_nothrow_move_constructible_v<BlockRef>);
-static_assert(std::is_same_v<decltype(std::declval<const BlockRef&>().operator->()), const CacheBlock*>);
+static_assert(!HasGet<CacheBlockRef>);
+static_assert(sizeof(CacheBlockRef) == sizeof(void*));
+static_assert(!std::is_constructible_v<CacheBlockRef, internal_cache_block_ref::CacheBlockControl&>);
+static_assert(!std::is_copy_constructible_v<internal_cache_block_ref::CacheBlockControl>);
+static_assert(!std::is_move_constructible_v<internal_cache_block_ref::CacheBlockControl>);
+static_assert(std::is_copy_constructible_v<CacheBlockRef>);
+static_assert(std::is_copy_assignable_v<CacheBlockRef>);
+static_assert(std::is_nothrow_move_constructible_v<CacheBlockRef>);
+static_assert(std::is_same_v<decltype(std::declval<const CacheBlockRef&>().operator->()), const CacheBlock*>);
 
-TEST(BlockRefTest, AcquireReturnsUniqueOwningHandle) {
-    BlockPool pool(/*total_num_blocks=*/4);
+TEST(CacheBlockRefTest, AcquireReturnsUniqueOwningHandle) {
+    BlockPool pool(/*num_lcm_blocks=*/4);
     const std::int32_t free_before = pool.NumFreeBlocks();
 
-    BlockRef ref = pool.AcquireBlock();
+    CacheBlockRef ref = pool.AcquireBlock();
 
     ASSERT_TRUE(ref);
     EXPECT_TRUE(ref);
@@ -56,16 +56,16 @@ TEST(BlockRefTest, AcquireReturnsUniqueOwningHandle) {
     EXPECT_EQ(pool.NumFreeBlocks(), free_before - 1);
 }
 
-TEST(BlockRefTest, CopySharesControlAndLastOwnerReturnsBlock) {
+TEST(CacheBlockRefTest, CopySharesControlAndLastOwnerReturnsBlock) {
     BlockPool pool(4);
     const std::int32_t free_before = pool.NumFreeBlocks();
-    BlockRef first = pool.AcquireBlock();
-    const std::int32_t block_id = first->BlockId();
+    CacheBlockRef first = pool.AcquireBlock();
+    const std::int32_t block_id = first->Location().lcm_block_id;
 
     {
-        BlockRef second = first;
+        CacheBlockRef second = first;
         EXPECT_EQ(second, first);
-        EXPECT_EQ(second->BlockId(), block_id);
+        EXPECT_EQ(second->Location().lcm_block_id, block_id);
         EXPECT_EQ(first.use_count(), 2);
         EXPECT_EQ(second.use_count(), 2);
         EXPECT_FALSE(first.unique());
@@ -79,54 +79,54 @@ TEST(BlockRefTest, CopySharesControlAndLastOwnerReturnsBlock) {
     EXPECT_EQ(pool.NumFreeBlocks(), free_before);
 }
 
-TEST(BlockRefTest, CopyAssignmentReleasesPreviousBlock) {
+TEST(CacheBlockRefTest, CopyAssignmentReleasesPreviousBlock) {
     BlockPool pool(4);
     const std::int32_t free_before = pool.NumFreeBlocks();
-    BlockRef first = pool.AcquireBlock();
-    BlockRef second = pool.AcquireBlock();
-    const std::int32_t first_id = first->BlockId();
+    CacheBlockRef first = pool.AcquireBlock();
+    CacheBlockRef second = pool.AcquireBlock();
+    const std::int32_t first_id = first->Location().lcm_block_id;
 
     second = first;
 
     EXPECT_EQ(second, first);
-    EXPECT_EQ(second->BlockId(), first_id);
+    EXPECT_EQ(second->Location().lcm_block_id, first_id);
     EXPECT_EQ(first.use_count(), 2);
     EXPECT_EQ(pool.NumFreeBlocks(), free_before - 1);
 }
 
-TEST(BlockRefTest, MoveTransfersWithoutChangingCount) {
+TEST(CacheBlockRefTest, MoveTransfersWithoutChangingCount) {
     BlockPool pool(4);
-    BlockRef source = pool.AcquireBlock();
-    const std::int32_t block_id = source->BlockId();
+    CacheBlockRef source = pool.AcquireBlock();
+    const std::int32_t block_id = source->Location().lcm_block_id;
 
-    BlockRef target = std::move(source);
+    CacheBlockRef target = std::move(source);
 
     EXPECT_FALSE(source);
-    EXPECT_EQ(target->BlockId(), block_id);
+    EXPECT_EQ(target->Location().lcm_block_id, block_id);
     EXPECT_EQ(target.use_count(), 1);
 }
 
-TEST(BlockRefTest, MoveAssignmentReleasesPreviousBlock) {
+TEST(CacheBlockRefTest, MoveAssignmentReleasesPreviousBlock) {
     BlockPool pool(4);
     const std::int32_t free_before = pool.NumFreeBlocks();
-    BlockRef holder = pool.AcquireBlock();
-    BlockRef incoming = pool.AcquireBlock();
-    const std::int32_t incoming_id = incoming->BlockId();
+    CacheBlockRef holder = pool.AcquireBlock();
+    CacheBlockRef incoming = pool.AcquireBlock();
+    const std::int32_t incoming_id = incoming->Location().lcm_block_id;
 
     holder = std::move(incoming);
 
-    EXPECT_EQ(holder->BlockId(), incoming_id);
+    EXPECT_EQ(holder->Location().lcm_block_id, incoming_id);
     EXPECT_FALSE(incoming);
     EXPECT_EQ(holder.use_count(), 1);
     EXPECT_EQ(pool.NumFreeBlocks(), free_before - 1);
 }
 
-TEST(BlockRefTest, EmptyRefHasSharedPtrNullSemantics) {
+TEST(CacheBlockRefTest, EmptyRefHasSharedPtrNullSemantics) {
     BlockPool pool(4);
     const std::int32_t free_before = pool.NumFreeBlocks();
 
-    BlockRef first;
-    BlockRef second = first;
+    CacheBlockRef first;
+    CacheBlockRef second = first;
 
     EXPECT_FALSE(first);
     EXPECT_FALSE(second);
@@ -137,38 +137,38 @@ TEST(BlockRefTest, EmptyRefHasSharedPtrNullSemantics) {
     EXPECT_EQ(pool.NumFreeBlocks(), free_before);
 }
 
-TEST(BlockRefTest, SwapExchangesOwnershipWithoutChangingCounts) {
+TEST(CacheBlockRefTest, SwapExchangesOwnershipWithoutChangingCounts) {
     BlockPool pool(4);
-    BlockRef first = pool.AcquireBlock();
-    BlockRef second = pool.AcquireBlock();
-    const std::int32_t first_id = first->BlockId();
-    const std::int32_t second_id = second->BlockId();
+    CacheBlockRef first = pool.AcquireBlock();
+    CacheBlockRef second = pool.AcquireBlock();
+    const std::int32_t first_id = first->Location().lcm_block_id;
+    const std::int32_t second_id = second->Location().lcm_block_id;
 
     swap(first, second);
 
-    EXPECT_EQ(first->BlockId(), second_id);
-    EXPECT_EQ(second->BlockId(), first_id);
+    EXPECT_EQ(first->Location().lcm_block_id, second_id);
+    EXPECT_EQ(second->Location().lcm_block_id, first_id);
     EXPECT_EQ(first.use_count(), 1);
     EXPECT_EQ(second.use_count(), 1);
 }
 
-TEST(BlockRefTest, SelfAssignmentKeepsOwnership) {
+TEST(CacheBlockRefTest, SelfAssignmentKeepsOwnership) {
     BlockPool pool(4);
-    BlockRef ref = pool.AcquireBlock();
-    const std::int32_t block_id = ref->BlockId();
+    CacheBlockRef ref = pool.AcquireBlock();
+    const std::int32_t block_id = ref->Location().lcm_block_id;
 
     ref = ref;
     ref = std::move(ref);
 
-    EXPECT_EQ(ref->BlockId(), block_id);
+    EXPECT_EQ(ref->Location().lcm_block_id, block_id);
     EXPECT_EQ(ref.use_count(), 1);
 }
 
-TEST(BlockRefTest, VectorCopiesKeepBlockPinnedUntilLastCopyDies) {
+TEST(CacheBlockRefTest, VectorCopiesKeepBlockPinnedUntilLastCopyDies) {
     BlockPool pool(4);
     const std::int32_t free_before = pool.NumFreeBlocks();
-    BlockRef original = pool.AcquireBlock();
-    std::vector<BlockRef> refs(8, original);
+    CacheBlockRef original = pool.AcquireBlock();
+    std::vector<CacheBlockRef> refs(8, original);
     EXPECT_EQ(original.use_count(), 9);
 
     original.reset();
@@ -177,6 +177,19 @@ TEST(BlockRefTest, VectorCopiesKeepBlockPinnedUntilLastCopyDies) {
 
     refs.clear();
     EXPECT_EQ(pool.NumFreeBlocks(), free_before);
+}
+
+TEST(CacheBlockRefTest, LastOwnerDestroysDynamicBlockAndReleasesExactSlot) {
+    BlockPool pool(1);
+    CacheBlockRef first = pool.AcquireBlock(/*group_id=*/4, /*cache_blocks_per_lcm_block=*/2);
+    CacheBlockRef last = first;
+    const CacheBlockLocation location = first->Location();
+
+    first.reset();
+    EXPECT_TRUE(pool.IsOccupied(location));
+    last.reset();
+    EXPECT_FALSE(pool.IsOccupied(location));
+    EXPECT_EQ(pool.BoundGroup(location.lcm_block_id), std::nullopt);
 }
 
 }  // namespace

@@ -28,11 +28,10 @@
 
 namespace tokenspeed {
 
-// One attention group: spec + index-derived group_id + the manager that runs it.
+// One attention group: spec plus the manager that owns its group identity.
 class CacheGroup {
 public:
-    CacheGroup(KvCacheSpec spec, std::uint32_t group_id, std::unique_ptr<KvCacheManager> manager)
-        : spec_{spec}, group_id_{group_id}, manager_{std::move(manager)} {}
+    CacheGroup(KvCacheSpec spec, std::unique_ptr<KvCacheManager> manager) : spec_{spec}, manager_{std::move(manager)} {}
 
     CacheGroup(const CacheGroup&) = delete;
     CacheGroup& operator=(const CacheGroup&) = delete;
@@ -42,11 +41,10 @@ public:
     KvCacheManager& Manager() { return *manager_; }
     const KvCacheManager& Manager() const { return *manager_; }
     const KvCacheSpec& Spec() const { return spec_; }
-    std::uint32_t GroupId() const { return group_id_; }
+    GroupId GroupId() const { return manager_->GroupIdValue(); }
 
 private:
     KvCacheSpec spec_;
-    std::uint32_t group_id_;
     std::unique_ptr<KvCacheManager> manager_;
 };
 

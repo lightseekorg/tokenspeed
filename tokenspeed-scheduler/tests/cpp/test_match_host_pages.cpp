@@ -21,6 +21,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -31,14 +32,34 @@
 namespace tokenspeed::test {
 namespace {
 
-std::vector<std::int32_t> BlockIds(const std::vector<BlockRef>& refs) {
+std::vector<std::int32_t> BlockIds(const std::vector<CacheBlockRef>& refs) {
     std::vector<std::int32_t> ids;
     ids.reserve(refs.size());
-    for (const BlockRef& ref : refs) {
-        ids.push_back(ref ? ref->BlockId() : 0);
+    for (const CacheBlockRef& ref : refs) {
+        ids.push_back(ref ? ref->Location().lcm_block_id : 0);
     }
     return ids;
 }
+
+template <typename Base>
+class TestManager : public Base {
+public:
+    using Base::Base;
+
+    PrefixMatch Match(BlockPool& pool, std::span<const std::string> keys, std::int32_t begin_blocks,
+                      std::int32_t max_blocks) {
+        return Base::Match(pool, keys, begin_blocks, max_blocks, recency_);
+    }
+    void CacheBlock(BlockPool& pool, CacheBlockRef& block, const std::string& key) {
+        Base::CacheBlock(pool, block, key, recency_);
+    }
+
+private:
+    std::uint64_t recency_{0};
+};
+
+using FullAttnManager = TestManager<::tokenspeed::FullAttnManager>;
+using SwaManager = TestManager<::tokenspeed::SwaManager>;
 
 // The unified Match with a raised floor (begin_blocks > 0 over a non-device pool) is the
 // host-tier lookup: slots below the floor are device-valid, holes come back as the queried
@@ -46,23 +67,23 @@ std::vector<std::int32_t> BlockIds(const std::vector<BlockRef>& refs) {
 
 // Publish a host page for `key` (the scheduler's store path minus the D2H write):
 // allocate -> hash -> free leaves it cached-and-evictable, exactly like a committed store.
-std::int32_t Put(BlockPool& host_pool, const std::string& key) {
-    BlockRef block = host_pool.AcquireBlock();
-    const std::int32_t id = block->BlockId();
-    host_pool.CacheFullBlock(block, key);
+template <typename Manager>
+std::int32_t Put(Manager& manager, BlockPool& host_pool, const std::string& key) {
+    CacheBlockRef block = host_pool.AcquireBlock(manager.GroupIdValue(), manager.CacheBlocksPerLcmBlock());
+    const std::int32_t id = block->Location().lcm_block_id;
+    manager.CacheBlock(host_pool, block, key);
     block.reset();
     return id;
 }
 
 TEST(HostTierMatchTest, FullWalksContiguousRunFromBegin) {
-    BlockPool pool(4);
+    BlockPool host_pool(9);
     FullAttnManager mgr(/*block_size=*/4);
     EXPECT_TRUE(mgr.MatchIsPrefixClosed());
-    BlockPool host_pool(9);
     std::vector<std::string> keys{"k0", "k1", "k2", "k3", "k4"};
     std::vector<std::int32_t> put;
     for (std::size_t j = 1; j <= 4; ++j) {
-        put.push_back(Put(host_pool, keys[j]));
+        put.push_back(Put(mgr, host_pool, keys[j]));
     }
     // Slots below begin=1 are device-valid; the run covers all extension slots, no holes.
     PrefixMatch m = mgr.Match(host_pool, keys, /*begin_blocks=*/1, /*max_blocks=*/5);
@@ -71,36 +92,33 @@ TEST(HostTierMatchTest, FullWalksContiguousRunFromBegin) {
 }
 
 TEST(HostTierMatchTest, FullStopsAtFirstMiss) {
-    BlockPool pool(4);
-    FullAttnManager mgr(4);
     BlockPool host_pool(9);
+    FullAttnManager mgr(4);
     std::vector<std::string> keys{"k0", "k1", "k2", "k3"};
-    const std::int32_t p0 = Put(host_pool, keys[0]);
-    const std::int32_t p1 = Put(host_pool, keys[1]);
-    (void)Put(host_pool, keys[3]);  // beyond the gap at k2: unreachable
+    const std::int32_t p0 = Put(mgr, host_pool, keys[0]);
+    const std::int32_t p1 = Put(mgr, host_pool, keys[1]);
+    (void)Put(mgr, host_pool, keys[3]);  // beyond the gap at k2: unreachable
     EXPECT_EQ(BlockIds(mgr.Match(host_pool, keys, 0, 4).blocks), (std::vector<std::int32_t>{p0, p1}));
 }
 
 TEST(HostTierMatchTest, FullEmptyOnBeginMissOrEmptyRange) {
-    BlockPool pool(4);
-    FullAttnManager mgr(4);
     BlockPool host_pool(9);
+    FullAttnManager mgr(4);
     std::vector<std::string> keys{"k0", "k1"};
-    (void)Put(host_pool, keys[1]);
+    (void)Put(mgr, host_pool, keys[1]);
     EXPECT_TRUE(mgr.Match(host_pool, keys, 0, 2).blocks.empty());  // miss right at begin
     EXPECT_TRUE(mgr.Match(host_pool, keys, 2, 2).blocks.empty());  // empty extension range
 }
 
 TEST(HostTierMatchTest, SwaTrailingRunAtEnd) {
-    BlockPool pool(4);
+    BlockPool host_pool(9);
     // block_size 4, window 10 -> pages_needed = ceil(9/4) = 3.
     SwaManager mgr(4, /*sliding_window=*/10);
     EXPECT_FALSE(mgr.MatchIsPrefixClosed());
-    BlockPool host_pool(9);
     std::vector<std::string> keys{"k0", "k1", "k2", "k3", "k4"};
-    const std::int32_t p2 = Put(host_pool, keys[2]);
-    const std::int32_t p3 = Put(host_pool, keys[3]);
-    const std::int32_t p4 = Put(host_pool, keys[4]);
+    const std::int32_t p2 = Put(mgr, host_pool, keys[2]);
+    const std::int32_t p3 = Put(mgr, host_pool, keys[3]);
+    const std::int32_t p4 = Put(mgr, host_pool, keys[4]);
     // Trailing run [2, 5) covers the window at boundary 5; slots below stay holes.
     PrefixMatch m = mgr.Match(host_pool, keys, 0, 5);
     EXPECT_EQ(BlockIds(m.blocks), (std::vector<std::int32_t>{0, 0, p2, p3, p4}));
@@ -108,36 +126,33 @@ TEST(HostTierMatchTest, SwaTrailingRunAtEnd) {
 }
 
 TEST(HostTierMatchTest, SwaInteriorBoundaryShrink) {
-    BlockPool pool(4);
-    SwaManager mgr(4, 10);  // pages_needed = 3
     BlockPool host_pool(9);
+    SwaManager mgr(4, 10);  // pages_needed = 3
     std::vector<std::string> keys{"k0", "k1", "k2", "k3", "k4"};
-    const std::int32_t p1 = Put(host_pool, keys[1]);
-    const std::int32_t p2 = Put(host_pool, keys[2]);
-    const std::int32_t p3 = Put(host_pool, keys[3]);
+    const std::int32_t p1 = Put(mgr, host_pool, keys[1]);
+    const std::int32_t p2 = Put(mgr, host_pool, keys[2]);
+    const std::int32_t p3 = Put(mgr, host_pool, keys[3]);
     // Miss at 4 invalidates boundary 5; boundary 4 needs [1, 4), which hits.
     EXPECT_EQ(BlockIds(mgr.Match(host_pool, keys, 0, 5).blocks), (std::vector<std::int32_t>{0, p1, p2, p3}));
 }
 
 TEST(HostTierMatchTest, SwaShortRunAtBottomSuffices) {
-    BlockPool pool(4);
-    SwaManager mgr(4, 10);  // pages_needed = 3, but only 2 extension slots exist
     BlockPool host_pool(9);
+    SwaManager mgr(4, 10);  // pages_needed = 3, but only 2 extension slots exist
     std::vector<std::string> keys{"k0", "k1"};
-    const std::int32_t p0 = Put(host_pool, keys[0]);
-    const std::int32_t p1 = Put(host_pool, keys[1]);
+    const std::int32_t p0 = Put(mgr, host_pool, keys[0]);
+    const std::int32_t p1 = Put(mgr, host_pool, keys[1]);
     // The window clamps to begin: a full 2-run from the bottom is a valid boundary 2.
     EXPECT_EQ(BlockIds(mgr.Match(host_pool, keys, 0, 2).blocks), (std::vector<std::int32_t>{p0, p1}));
 }
 
 TEST(HostTierMatchTest, SwaBeginAboveZeroInteriorBoundary) {
-    BlockPool pool(4);
-    SwaManager mgr(4, /*sliding_window=*/9);  // pages_needed = ceil(8/4) = 2
     BlockPool host_pool(9);
+    SwaManager mgr(4, /*sliding_window=*/9);  // pages_needed = ceil(8/4) = 2
     std::vector<std::string> keys{"k0", "k1", "k2", "k3", "k4", "k5", "k6"};
-    const std::int32_t p3 = Put(host_pool, keys[3]);
-    const std::int32_t p4 = Put(host_pool, keys[4]);
-    const std::int32_t p5 = Put(host_pool, keys[5]);
+    const std::int32_t p3 = Put(mgr, host_pool, keys[3]);
+    const std::int32_t p4 = Put(mgr, host_pool, keys[4]);
+    const std::int32_t p5 = Put(mgr, host_pool, keys[5]);
     (void)p3;  // hit at slot 3 sits below the winning run's window and stays a hole
     // Miss at 6 invalidates boundary 7; boundary 6 needs [4, 6), which hits -> vector
     // covers [3, 6): hole at slot 3, pages for 4 and 5.
@@ -147,17 +162,15 @@ TEST(HostTierMatchTest, SwaBeginAboveZeroInteriorBoundary) {
 }
 
 TEST(HostTierMatchTest, SwaAllMissReturnsEmpty) {
-    BlockPool pool(4);
-    SwaManager mgr(4, 10);
     BlockPool host_pool(9);
+    SwaManager mgr(4, 10);
     std::vector<std::string> keys{"k0", "k1", "k2", "k3", "k4"};
     EXPECT_TRUE(mgr.Match(host_pool, keys, 1, 5).blocks.empty());
 }
 
 TEST(HostTierMatchTest, SwaZeroNeededWindowAcceptsAllAsHoles) {
-    BlockPool pool(4);
-    SwaManager mgr(4, /*sliding_window=*/1);  // pages_needed = 0
     BlockPool host_pool(9);
+    SwaManager mgr(4, /*sliding_window=*/1);  // pages_needed = 0
     std::vector<std::string> keys{"k0", "k1", "k2"};
     // Zero needed pages: every boundary is resumable with no host page at all.
     PrefixMatch m = mgr.Match(host_pool, keys, 1, 3);

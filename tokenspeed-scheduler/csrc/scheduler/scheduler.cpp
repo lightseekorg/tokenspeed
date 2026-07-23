@@ -63,9 +63,9 @@ Scheduler::Scheduler(SchedulerConfig config)
       req_pool_allocator_{config_.max_batch_size}
 #if TOKENSPEED_FLAT_KVCACHE
       ,
-      block_pool_{config_.device_allocator.total_pages},
-      flat_host_pool_{config_.FlatStreamingSinkEnabled() ? config_.host_allocator.total_pages : 1},
-      coordinator_{MakeCoordinator(MakeSpecsFromConfig(config_), block_pool_,
+      block_pool_{config_.device_allocator.total_pages - 1},
+      flat_host_pool_{config_.FlatStreamingSinkEnabled() ? config_.host_allocator.total_pages - 1 : 0},
+      coordinator_{MakeCoordinator(MakeSpecsFromConfig(config_), config_.block_size, block_pool_,
                                    config_.FlatStreamingSinkEnabled() ? &flat_host_pool_ : nullptr)},
       flat_group_ids_{[&] {
           std::vector<std::string> ids;
@@ -196,14 +196,7 @@ std::vector<std::string> Scheduler::CalcRollingHash(const std::vector<std::int32
 }
 
 void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
-#if TOKENSPEED_FLAT_KVCACHE
-    // The content-hash chain and base-slot indexing run at base (GCD) granularity; the
-    // coordinator folds base pages up to each group's block_size. Uniform block_size =>
-    // base == block_size.
-    const std::int32_t page_size = config_.BaseBlockSize();
-#else
     const std::int32_t page_size = config_.block_size;
-#endif
     for (const auto& spec : request_specs) {
         auto req = std::make_unique<Request>(spec, page_size, config_.role);
         requests_.emplace(spec.request_id, std::move(req));
@@ -403,18 +396,21 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
         // corrupts the ledger's key set).
         std::unordered_set<std::string> batch_keys;
         for (auto& cand : coordinator_.TakePendingStores()) {
-            if (flat_host_pool_.ContainsCachedBlock(cand.key) || flat_store_ops_.InFlight(cand.key) ||
+            if (coordinator_.ContainsHostCachedBlock(cand.key) || flat_store_ops_.InFlight(cand.key) ||
                 !batch_keys.insert(cand.key).second) {
                 cand.block.reset();  // duplicate: drop + unpin
                 continue;
             }
-            BlockRef host_block = flat_host_pool_.AcquireBlock();
+            const KvCacheManager& manager = coordinator_.GroupManager(static_cast<std::int32_t>(cand.group_id));
+            CacheBlockRef host_block = flat_host_pool_.AcquireBlock(cand.group_id, manager.CacheBlocksPerLcmBlock());
             if (!host_block) {
                 cand.block.reset();  // host full: drop + unpin
                 continue;
             }
-            pairs.push_back(TransferPair{CacheKind::kKV, cand.block->BlockId(), host_block->BlockId()});
-            tickets.push_back(FlatStoreTicket{std::move(cand.key), std::move(cand.block), std::move(host_block)});
+            pairs.push_back(TransferPair{CacheKind::kKV, manager.ResolveKernelPageId(cand.block->Location()),
+                                         manager.ResolveKernelPageId(host_block->Location())});
+            tickets.push_back(
+                FlatStoreTicket{std::move(cand.key), cand.group_id, std::move(cand.block), std::move(host_block)});
         }
         if (!pairs.empty()) {
             const cache_op_id id = kv_prefix_cache_.AllocateCacheOpId();

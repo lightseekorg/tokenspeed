@@ -82,7 +82,7 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
                                    // default {} is the zero hit for call sites that never match.
                                    CoordinatorMatch flat_hit = {},
                                    // Host-tier match above flat_hit's boundary; real pages are
-                                   // already pinned by its BlockRefs.
+                                   // already pinned by its CacheBlockRefs.
                                    CoordinatorMatch flat_host = {}, std::vector<std::string> flat_ext_hashes = {}
 #endif
                                    )

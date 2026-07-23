@@ -174,20 +174,28 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
             [](tokenspeed::PagedCacheGroupConfig* self, std::string group_id, std::int32_t rows_per_page,
                std::int32_t entry_stride_tokens, std::int32_t total_pages,
                tokenspeed::PagedCacheGroupConfig::Retention retention,
-               std::optional<std::int32_t> sliding_window_tokens, tokenspeed::PagedCacheGroupFamily family) {
-                new (self) tokenspeed::PagedCacheGroupConfig{
-                    std::move(group_id), rows_per_page, entry_stride_tokens,   total_pages,
-                    /*block_size=*/0,    retention,     sliding_window_tokens, family};
+               std::optional<std::int32_t> sliding_window_tokens, tokenspeed::PagedCacheGroupFamily family,
+               std::int32_t cache_blocks_per_lcm_block) {
+                new (self) tokenspeed::PagedCacheGroupConfig{std::move(group_id),
+                                                             rows_per_page,
+                                                             entry_stride_tokens,
+                                                             total_pages,
+                                                             /*block_size=*/0,
+                                                             cache_blocks_per_lcm_block,
+                                                             retention,
+                                                             sliding_window_tokens,
+                                                             family};
             },
             nb::arg("group_id"), nb::arg("rows_per_page"), nb::arg("entry_stride_tokens"), nb::arg("total_pages"),
             nb::arg("retention") = tokenspeed::PagedCacheGroupConfig::Retention::FullHistory,
             nb::arg("sliding_window_tokens") = std::nullopt,
-            nb::arg("family") = tokenspeed::PagedCacheGroupFamily::History)
+            nb::arg("family") = tokenspeed::PagedCacheGroupFamily::History, nb::arg("cache_blocks_per_lcm_block") = 1)
         .def_rw("group_id", &tokenspeed::PagedCacheGroupConfig::group_id)
         .def_rw("rows_per_page", &tokenspeed::PagedCacheGroupConfig::rows_per_page)
         .def_rw("entry_stride_tokens", &tokenspeed::PagedCacheGroupConfig::entry_stride_tokens)
         .def_rw("total_pages", &tokenspeed::PagedCacheGroupConfig::total_pages)
         .def_rw("block_size", &tokenspeed::PagedCacheGroupConfig::block_size)
+        .def_rw("cache_blocks_per_lcm_block", &tokenspeed::PagedCacheGroupConfig::cache_blocks_per_lcm_block)
         .def_rw("retention", &tokenspeed::PagedCacheGroupConfig::retention)
         .def_rw("sliding_window_tokens", &tokenspeed::PagedCacheGroupConfig::sliding_window_tokens)
         .def_rw("family", &tokenspeed::PagedCacheGroupConfig::family)

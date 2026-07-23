@@ -69,8 +69,10 @@ std::vector<KvCacheSpec> MakeSpecsFromConfig(const SchedulerConfig& config);
 
 void FreeRequest(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables);
 
-// One row per config group_id (page encoding: BlockTablePageIds).
-std::map<std::string, std::vector<std::int32_t>> BuildFlatBlockTables(const std::vector<BlockTable>& tables,
+// One row per config group_id. Each manager resolves the group's LCM placement
+// to the kernel-visible page id.
+std::map<std::string, std::vector<std::int32_t>> BuildFlatBlockTables(const KvCacheCoordinator& coordinator,
+                                                                      const std::vector<BlockTable>& tables,
                                                                       std::span<const std::string> group_ids);
 
 }  // namespace tokenspeed

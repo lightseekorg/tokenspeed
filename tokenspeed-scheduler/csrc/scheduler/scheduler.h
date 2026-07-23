@@ -88,9 +88,9 @@ public:
 #if TOKENSPEED_FLAT_KVCACHE
     // Free pages in the flat shared BlockPool; int32 twin of AvailableKvPages() for C++ tests.
     std::int32_t FlatPoolFreeBlocks() const { return block_pool_.NumFreeBlocks(); }
-    std::int32_t FlatHostPoolCachedBlocks() const { return flat_host_pool_.NumCachedBlocks(); }
+    std::int32_t FlatHostPoolCachedBlocks() const { return coordinator_.NumHostCachedBlocks(); }
     std::int32_t FlatHostPoolFreeBlocks() const { return flat_host_pool_.NumFreeBlocks(); }
-    std::int32_t FlatHostPoolPinnedBlocks() const { return flat_host_pool_.NumPinnedCachedBlocks(); }
+    std::int32_t FlatHostPoolPinnedBlocks() const { return coordinator_.NumPinnedHostCachedBlocks(); }
 #endif
 
 private:
@@ -202,7 +202,7 @@ private:
 
 #if TOKENSPEED_FLAT_KVCACHE
     // Lifetime anchor: these pools are declared before every member that may
-    // hold BlockRef, so reverse member destruction releases all handles first.
+    // hold CacheBlockRef, so reverse member destruction releases all handles first.
     BlockPool block_pool_;
     // Host tier = a second BlockPool, isomorphic to the device pool (block 0 is the null
     // placeholder there too); the two differ only in which memory the ids index.
@@ -224,8 +224,9 @@ private:
 
     struct FlatStoreTicket {
         std::string key;
-        BlockRef device_block;  // source page, pinned under the D2H copy
-        BlockRef host_block;    // destination page, unhashed until WriteBackDone publishes it
+        GroupId group_id;
+        CacheBlockRef device_block;  // source page, pinned under the D2H copy
+        CacheBlockRef host_block;    // destination page, unhashed until WriteBackDone publishes it
     };
     // In-flight D2H stores. The host pool is transaction-blind like the device pool, so the
     // key-dedupe index lives here, paired with the op ledger: Add/Retire are the only mutation
@@ -262,8 +263,8 @@ private:
     FlatStoreLedger flat_store_ops_;
 
     struct FlatLoadTicket {
-        std::vector<BlockRef> host_pins;
-        std::vector<BlockRef> device_blocks;
+        std::vector<CacheBlockRef> host_pins;
+        std::vector<CacheBlockRef> device_blocks;
     };
     // In-flight H2D loads: op_id -> the pinned source host pages plus the pinned destination
     // device pages (a freed destination must not be recycled under the copy); LoadBackDone drops both.

@@ -62,10 +62,13 @@ bool FinalizePrefillAndReserveDecode(KvCacheCoordinator& coordinator, std::vecto
 }
 
 std::vector<KvCacheSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
+    _assert(config.block_size > 0, "cache_block_tokens must be > 0");
     std::vector<KvCacheSpec> specs;
     specs.reserve(config.paged_cache_groups.size());
     for (const PagedCacheGroupConfig& group : config.paged_cache_groups) {
-        const std::int32_t block_size = group.block_size > 0 ? group.block_size : config.block_size;
+        _assert(group.cache_blocks_per_lcm_block > 0, "cache_blocks_per_lcm_block must be > 0");
+        _assert(group.block_size == 0 || group.block_size == config.block_size,
+                "per-group block_size cannot override the shared cache_block_tokens");
         // family=State marks trailing-window prefix reuse and covers both SWA and
         // linear-attention groups; only a State group WITHOUT SlidingWindow
         // retention is a mamba-style state group.
@@ -73,16 +76,16 @@ std::vector<KvCacheSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
             group.retention != PagedCacheGroupConfig::Retention::SlidingWindow) {
             specs.push_back(KvCacheSpec{
                 .kind = AttnKind::kMambaState,
-                .block_size = block_size,
                 .sliding_window = 0,
+                .cache_blocks_per_lcm_block = group.cache_blocks_per_lcm_block,
             });
             continue;
         }
         const bool is_swa = group.retention == PagedCacheGroupConfig::Retention::SlidingWindow;
         specs.push_back(KvCacheSpec{
             .kind = is_swa ? AttnKind::kSlidingWindow : AttnKind::kFull,
-            .block_size = block_size,
             .sliding_window = is_swa ? group.sliding_window_tokens.value_or(0) : 0,
+            .cache_blocks_per_lcm_block = group.cache_blocks_per_lcm_block,
         });
     }
     return specs;
@@ -95,12 +98,15 @@ void FreeRequest(KvCacheCoordinator& coordinator, std::vector<BlockTable>& table
     coordinator.Free(tables);
 }
 
-std::map<std::string, std::vector<std::int32_t>> BuildFlatBlockTables(const std::vector<BlockTable>& tables,
+std::map<std::string, std::vector<std::int32_t>> BuildFlatBlockTables(const KvCacheCoordinator& coordinator,
+                                                                      const std::vector<BlockTable>& tables,
                                                                       std::span<const std::string> group_ids) {
     _assert(tables.size() == group_ids.size(), "BuildFlatBlockTables: tables/group_ids size mismatch");
+    _assert(tables.size() == static_cast<std::size_t>(coordinator.NumGroups()),
+            "BuildFlatBlockTables: tables/coordinator size mismatch");
     std::map<std::string, std::vector<std::int32_t>> out;
     for (std::size_t i = 0; i < tables.size(); ++i) {
-        out.emplace(group_ids[i], BlockTablePageIds(tables[i]));
+        out.emplace(group_ids[i], coordinator.GroupManager(static_cast<std::int32_t>(i)).BlockTablePageIds(tables[i]));
     }
     return out;
 }

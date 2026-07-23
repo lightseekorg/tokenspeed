@@ -23,31 +23,47 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <string>
 #include <utility>
 #include <vector>
 
 #include "cache/block_pool.h"
-#include "cache/block_ref.h"
+#include "cache/cache_block_ref.h"
 #include "utils.h"
 
 namespace tokenspeed {
 
 enum class AttnKind { kFull, kSlidingWindow, kMambaState };
 
+using CacheNamespaceId = std::uint32_t;
+using ContentHash = std::string;
+
+inline constexpr CacheNamespaceId kDefaultCacheNamespaceId = 0;
+
+struct CacheKey {
+    CacheNamespaceId namespace_id{kDefaultCacheNamespaceId};
+    GroupId group_id{0};
+    ContentHash content_hash{};
+
+    bool operator==(const CacheKey&) const noexcept = default;
+};
+
 struct KvCacheSpec {
     AttnKind kind;
-    std::int32_t block_size;
     std::int32_t sliding_window;  // 0 for full attention
+    // Number of this group's logical cache blocks packed into one physical
+    // LCM block. It affects placement only, never prefix-match granularity.
+    std::int32_t cache_blocks_per_lcm_block{1};
 };
 
 // Per-request logical-page -> physical-page mapping.
 class BlockTable {
 public:
-    std::span<const BlockRef> Blocks() const noexcept { return blocks_; }
+    std::span<const CacheBlockRef> Blocks() const noexcept { return blocks_; }
     std::int32_t NumBlocks() const { return static_cast<std::int32_t>(blocks_.size()); }
     std::int32_t TailAvailableTokens() const { return tail_avail_; }
 
-    BlockRef EvictToNull(std::int32_t index) {
+    CacheBlockRef EvictToNull(std::int32_t index) {
         _assert(0 <= index && index < static_cast<std::int32_t>(blocks_.size()), "EvictToNull index out of range");
         return std::exchange(blocks_[static_cast<std::size_t>(index)], {});
     }
@@ -55,21 +71,23 @@ public:
 private:
     friend class KvCacheManager;
 
-    std::vector<BlockRef> blocks_{};
+    std::vector<CacheBlockRef> blocks_{};
     std::int32_t tail_avail_{0};
 };
 
-inline std::vector<std::int32_t> BlockTablePageIds(const BlockTable& table) {
+// LCM ownership ids for scheduler accounting/debugging. Kernel-facing page
+// tables must instead go through KvCacheManager::BlockTablePageIds().
+inline std::vector<std::int32_t> BlockTableLcmBlockIds(const BlockTable& table) {
     std::vector<std::int32_t> ids;
     ids.reserve(static_cast<std::size_t>(table.NumBlocks()));
-    for (const BlockRef& block : table.Blocks()) {
-        ids.push_back(block ? block->BlockId() : 0);
+    for (const CacheBlockRef& block : table.Blocks()) {
+        ids.push_back(block ? block->Location().lcm_block_id : 0);
     }
     return ids;
 }
 
 struct PrefixMatch {
-    std::vector<BlockRef> blocks{};
+    std::vector<CacheBlockRef> blocks{};
     std::int32_t num_hit_blocks{0};
 };
 
@@ -81,8 +99,9 @@ struct PrefixProbe {
 
 // Pinned source/destination pages for one asynchronous cache transfer.
 struct BlockTransfer {
-    BlockRef source;
-    BlockRef destination;
+    GroupId group_id{0};
+    CacheBlockRef source;
+    CacheBlockRef destination;
 };
 
 }  // namespace tokenspeed

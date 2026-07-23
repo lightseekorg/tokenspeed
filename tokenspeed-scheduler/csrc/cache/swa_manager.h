@@ -24,7 +24,6 @@
 #include <cstdint>
 #include <span>
 #include <string>
-#include <utility>
 #include <vector>
 
 #include "cache/block_pool.h"
@@ -36,8 +35,12 @@ namespace tokenspeed {
 
 class SwaManager : public KvCacheManager {
 public:
-    SwaManager(std::int32_t block_size, std::int32_t sliding_window)
-        : KvCacheManager(block_size), sliding_window_{sliding_window} {
+    SwaManager(std::int32_t cache_block_tokens, std::int32_t sliding_window)
+        : SwaManager(cache_block_tokens, /*cache_blocks_per_lcm_block=*/1, sliding_window, /*group_id=*/0) {}
+
+    SwaManager(std::int32_t cache_block_tokens, std::int32_t cache_blocks_per_lcm_block, std::int32_t sliding_window,
+               GroupId group_id = 0)
+        : KvCacheManager(cache_block_tokens, cache_blocks_per_lcm_block, group_id), sliding_window_{sliding_window} {
         _assert(sliding_window > 0, "sliding_window must be > 0");
     }
 
@@ -59,7 +62,7 @@ public:
             return probe;
         }
         const auto [boundary, hits_begin] = findResumableBoundary(
-            [&](std::int32_t i) { return pool.ContainsCachedBlock(keys[static_cast<std::size_t>(i)]); }, begin_blocks,
+            [&](std::int32_t i) { return ContainsCachedBlock(pool, keys[static_cast<std::size_t>(i)]); }, begin_blocks,
             end_blocks);
         if (boundary == begin_blocks) {
             return probe;
@@ -71,19 +74,14 @@ public:
         return probe;
     }
 
-    // Punches null holes so the table never shrinks (keeps slot alignment); reverse-collect evicts FIFO.
+    // Punches null holes so the table never shrinks and slot alignment stays stable.
     void ReclaimExpired(BlockPool& /*pool*/, BlockTable& table, std::int32_t num_computed_tokens) override {
         std::int32_t skipped_blocks = fullySlidOutBlocks(table, num_computed_tokens);
-        std::vector<BlockRef> freed;
         for (std::int32_t i = skipped_blocks - 1; i >= 0; --i) {
-            BlockRef old = table.EvictToNull(i);
+            CacheBlockRef old = table.EvictToNull(i);
             if (!old) {
                 break;  // already null -> earlier slots are null too
             }
-            freed.push_back(std::move(old));
-        }
-        for (auto it = freed.rbegin(); it != freed.rend(); ++it) {
-            it->reset();
         }
     }
 
@@ -93,11 +91,13 @@ public:
         std::int32_t skipped_blocks = fullySlidOutBlocks(table, num_computed_tokens);
         std::int32_t freed = 0;
         for (std::int32_t i = skipped_blocks - 1; i >= 0; --i) {
-            const BlockRef& block = table.Blocks()[static_cast<std::size_t>(i)];
+            const CacheBlockRef& block = table.Blocks()[static_cast<std::size_t>(i)];
             if (!block) {
                 break;  // already null -> earlier slots are null too
             }
-            if (block.unique() && (count_uncached || block->IsCached())) {
+            const bool cached = ContainsCachedBlock(block);
+            const bool only_table_and_cache_owners = cached && block.use_count() == 2;
+            if (only_table_and_cache_owners || (count_uncached && !cached && block.unique())) {
                 ++freed;
             }
         }
@@ -106,7 +106,9 @@ public:
 
 private:
     // Cached pages a boundary needs behind it: they cover the window's last (window - 1) tokens.
-    std::int32_t pagesNeededToResume() const { return (sliding_window_ - 1 + block_size_ - 1) / block_size_; }
+    std::int32_t pagesNeededToResume() const {
+        return (sliding_window_ - 1 + cache_block_tokens_ - 1) / cache_block_tokens_;
+    }
 
     struct ResumableBoundary {
         std::int32_t boundary;    // == begin_blocks when no boundary qualifies
@@ -142,7 +144,7 @@ private:
         if (skipped <= 0) {
             return 0;  // all tokens still inside the window
         }
-        std::int32_t skipped_blocks = skipped / block_size_;  // only fully-slid-out pages
+        std::int32_t skipped_blocks = skipped / cache_block_tokens_;  // only fully-slid-out pages
         // Safety cap: FSM-consistent input never engages it.
         return std::min(skipped_blocks, table.NumBlocks());
     }

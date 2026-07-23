@@ -47,7 +47,7 @@ public:
             static_cast<std::int32_t>(std::min(keys.size(), static_cast<std::size_t>(std::max(max_blocks, 0))));
         PrefixProbe probe;
         for (std::int32_t j = begin_blocks; j < end_blocks; ++j) {
-            if (!pool.ContainsCachedBlock(keys[static_cast<std::size_t>(j)])) {
+            if (!ContainsCachedBlock(pool, keys[static_cast<std::size_t>(j)])) {
                 break;
             }
             probe.hits.push_back(1);
