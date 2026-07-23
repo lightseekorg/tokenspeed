@@ -303,8 +303,6 @@ class Eagle(BaseDrafter):
             global_num_tokens=draft_input.global_num_tokens,
             global_bs=draft_input.global_bs,
             all_decode_or_idle=draft_input.all_decode_or_idle,
-            draft_seq_lens_buf=self.draft_seq_lens_buf,
-            accept_lengths=draft_input.accept_lengths,
         )
 
         dsa_topk = draft_input.dsa_topk
@@ -329,6 +327,8 @@ class Eagle(BaseDrafter):
             out_cache_loc=buffers.out_cache_loc_buf[:input_num_tokens],
             captured_hidden_states=draft_input.base_out_hidden_states,
             spec_step_idx=0,
+            accept_lengths=draft_input.accept_lengths,
+            seq_lens=self.draft_seq_lens_buf,
         )
         dsa_topk = self._extract_dsa_topk(ctx, dsa_topk)
         if compute_dsa_topk_first_step and prepare_dsa_topk is not None:

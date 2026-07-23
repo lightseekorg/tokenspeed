@@ -177,9 +177,19 @@ class BaseCausalLM(nn.Module):
     ) -> dict:
         """Hook for subclasses to pass model-specific tensors."""
         model_kwargs = {}
-        for key in ("input_embeds", "inputs_embeds"):
+        for key in (
+            "input_embeds",
+            "inputs_embeds",
+            "accept_lengths",
+        ):
             if kwargs.get(key) is not None:
                 model_kwargs[key] = kwargs[key]
+        # seq_lens reaches the model only on the spec-decode first step
+        # (accept_lengths present), where it is the drafter's mutable
+        # cache-seqlens view. Target models don't take seq_lens in forward.
+        if model_kwargs.get("accept_lengths") is not None:
+            if kwargs.get("seq_lens") is not None:
+                model_kwargs["seq_lens"] = kwargs["seq_lens"]
         return model_kwargs
 
     # Weight loading.

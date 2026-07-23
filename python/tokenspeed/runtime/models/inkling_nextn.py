@@ -123,6 +123,7 @@ class InklingMultiTokenPredictorLayer(nn.Module):
         previous_hidden: torch.Tensor,
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
+        accept_lengths: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # Checkpoint order: [hidden, embed] (mtp_model.py reference).
         fused, _ = self.input_proj(
@@ -131,7 +132,13 @@ class InklingMultiTokenPredictorLayer(nn.Module):
                 dim=-1,
             )
         )
-        return self.transformer_block(fused, None, ctx, out_cache_loc)
+        return self.transformer_block(
+            fused,
+            None,
+            ctx,
+            out_cache_loc,
+            accept_lengths=accept_lengths,
+        )
 
 
 class InklingMultiTokenPredictor(nn.Module):
@@ -187,6 +194,7 @@ class InklingMultiTokenPredictor(nn.Module):
         captured_hidden_states: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
+        accept_lengths: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if input_embeds is None:
             # Lookup + base embed_norm (matching what the base decoder
@@ -196,7 +204,11 @@ class InklingMultiTokenPredictor(nn.Module):
                 input_embeds = self.base_embed_norm(input_embeds)
         layer = self.layers[spec_step_idx % self.num_mtp_layers]
         hidden, residual = layer(
-            input_embeds, captured_hidden_states, ctx, out_cache_loc
+            input_embeds,
+            captured_hidden_states,
+            ctx,
+            out_cache_loc,
+            accept_lengths=accept_lengths,
         )
         if ctx.forward_mode.is_idle():
             return hidden
@@ -302,6 +314,7 @@ class InklingForConditionalGenerationNextN(nn.Module):
         input_embeds: torch.Tensor | None = None,
         captured_hidden_states: torch.Tensor | None = None,
         spec_step_idx: int = 0,
+        accept_lengths: torch.Tensor | None = None,
         **kwargs,
     ):
         del positions, kwargs  # rel attention needs no positions; tau is off
@@ -321,6 +334,7 @@ class InklingForConditionalGenerationNextN(nn.Module):
             captured_hidden_states,
             input_embeds=input_embeds,
             spec_step_idx=spec_step_idx,
+            accept_lengths=accept_lengths,
         )
         # Base-model muP convention: lm_head consumes hidden/mup; next depth's RMSNorm is invariant to it.
         return self._compute_logits(input_ids, hidden_states, ctx)
