@@ -459,6 +459,7 @@ def minimax_indexer(
                 init_blocks=int(init_blocks),
                 local_blocks=int(local_blocks),
                 decode_query_len=decode_query_len,
+                enable_pdl=enable_pdl,
             )
         else:
             num_chunks = 64
