@@ -1937,10 +1937,16 @@ def dsa_prefill_topk(
         index_k_fp8: FP8 index-K rows in workspace-row order. Used by DeepGEMM.
         index_k_scale: FP8 index-K scales in workspace-row order. Used by DeepGEMM.
         max_logits_bytes: Optional temporary logits memory cap.
-        out: Optional int32 output buffer with shape [tokens, topk].
-        lens_out: Optional int32 output buffer with shape [tokens].
+        out: Optional contiguous int32 output buffer on q's device with shape
+            [tokens, topk].
+        lens_out: Optional contiguous int32 output buffer on q's device with
+            shape [tokens].
         override: Optional exact kernel override name.
         solution: Optional kernel solution to force through normal selection.
+
+    Gluon requires q, weights, index_k_cache, kv_workspace_slots, row_starts,
+    and row_ends to be contiguous on q's device. kv_workspace_slots must be
+    int64; row_starts and row_ends must be int32.
 
     Returns:
         Tuple of workspace row ids and valid counts. Returned indices are
@@ -1957,6 +1963,7 @@ def dsa_prefill_topk(
     traits = {
         "head_dim": q.shape[-1],
         "topk": int(topk),
+        "page_size": None if page_size is None else int(page_size),
     }
     has_fp8 = index_k_cache is not None or (
         index_k_fp8 is not None and index_k_scale is not None
@@ -2044,10 +2051,15 @@ def dsa_decode_topk(
         index_k_cache: Packed FP8 index-K cache with scales (uint8). Used by
             both Triton and DeepGEMM.
         plan: Optional opaque backend-specific plan.
-        out: Optional int32 output buffer with shape [tokens, topk].
-        lens_out: Optional int32 output buffer with shape [tokens].
+        out: Optional contiguous int32 output buffer on q's device with shape
+            [tokens, topk].
+        lens_out: Optional contiguous int32 output buffer on q's device with
+            shape [tokens].
         override: Optional exact kernel override name.
         solution: Optional kernel solution to force through normal selection.
+
+    Gluon requires q, weights, index_k_cache, seq_lens, and block_table to be
+    contiguous on q's device. seq_lens and block_table must be int32.
 
     Returns:
         Tuple of global KV slots and valid counts; invalid entries are -1.

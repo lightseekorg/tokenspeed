@@ -346,6 +346,7 @@ if current_platform().is_amd:
         traits={
             "head_dim": frozenset({128}),
             "topk": frozenset({512, 1024, 2048}),
+            "page_size": frozenset({64}),
             "index_k_format": frozenset({"fp8_scaled"}),
         },
     )

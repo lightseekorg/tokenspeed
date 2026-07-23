@@ -1030,7 +1030,12 @@ def _attention_dsa_decode_topk() -> object:
     )
 
 
-def _attention_dsa_prefill_topk() -> object:
+def _attention_dsa_prefill_topk(
+    *,
+    page_size: int = 64,
+    solution: str | None = None,
+    override: str | None = None,
+) -> object:
     q = torch.empty((2, 2, 128), dtype=torch.bfloat16)
     weights = torch.empty((2, 2), dtype=torch.float32)
     index_k = torch.zeros((128, 132), dtype=torch.uint8)
@@ -1046,7 +1051,9 @@ def _attention_dsa_prefill_topk() -> object:
         topk=512,
         softmax_scale=1.0,
         index_k_cache=index_k,
-        page_size=64,
+        page_size=page_size,
+        solution=solution,
+        override=override,
     )
 
 
@@ -1116,6 +1123,25 @@ def test_gluon_mxfp4_swiglu_args_default_missing_values_to_standard_swiglu() -> 
     w.swiglu_beta = 1.0
 
     assert _moe_gluon_mxfp4._swiglu_args(w) == (1.702, 7.0, 1.0)
+
+
+def test_gluon_dsa_prefill_topk_rejects_unsupported_page_size() -> None:
+    registry = KernelRegistry.get()
+    if registry.get_by_name("gluon_dsa_prefill_topk_fp8_gfx950") is None:
+        pytest.skip("Gluon DSA top-k is AMD-only")
+
+    with pytest.raises(tokenspeed_kernel.NoKernelFoundError, match="traits"):
+        _attention_dsa_prefill_topk(page_size=32, solution="gluon")
+
+
+def test_gluon_dsa_prefill_topk_exact_override_checks_page_size() -> None:
+    registry = KernelRegistry.get()
+    kernel_name = "gluon_dsa_prefill_topk_fp8_gfx950"
+    if registry.get_by_name(kernel_name) is None:
+        pytest.skip("Gluon DSA top-k is AMD-only")
+
+    with pytest.raises(ValueError, match="page_size=64"):
+        _attention_dsa_prefill_topk(page_size=32, override=kernel_name)
 
 
 def test_gluon_mxfp4_apply_priority_prefers_dynamic_over_precomputed() -> None:
