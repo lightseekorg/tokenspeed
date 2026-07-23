@@ -328,7 +328,7 @@ class Eagle(BaseDrafter):
             captured_hidden_states=draft_input.base_out_hidden_states,
             spec_step_idx=0,
             accept_lengths=draft_input.accept_lengths,
-            draft_seq_lens=self.draft_seq_lens_buf,
+            seq_lens=self.draft_seq_lens_buf,
         )
         dsa_topk = self._extract_dsa_topk(ctx, dsa_topk)
         if compute_dsa_topk_first_step and prepare_dsa_topk is not None:

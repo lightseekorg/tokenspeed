@@ -228,18 +228,18 @@ class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
     def _apply_first_step_correction(
         ctx: ForwardContext,
         accept_lengths: torch.Tensor | None,
-        draft_seq_lens: torch.Tensor | None,
+        seq_lens: torch.Tensor | None,
     ) -> None:
-        if draft_seq_lens is None or accept_lengths is None:
+        if seq_lens is None or accept_lengths is None:
             return
         num_extends = ctx.num_extends
         if num_extends >= ctx.bs:
             return
         correction = (
             ctx.attn_backend.spec_num_tokens - accept_lengths[num_extends:]
-        ).to(draft_seq_lens.dtype)
-        draft_seq_lens[num_extends : ctx.bs].sub_(correction).clamp_(min=1)
-        ctx.attn_backend.advance_draft_forward_metadata(draft_seq_lens[: ctx.bs])
+        ).to(seq_lens.dtype)
+        seq_lens[num_extends : ctx.bs].sub_(correction).clamp_(min=1)
+        ctx.attn_backend.advance_draft_forward_metadata(seq_lens[: ctx.bs])
 
     @staticmethod
     def prepare_dsa_topk_for_mtp_decode(
@@ -307,7 +307,7 @@ class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
         out_cache_loc: torch.Tensor,
         captured_hidden_states: torch.Tensor | None = None,
         accept_lengths: torch.Tensor | None = None,
-        draft_seq_lens: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         with report_collective_sizing(ctx, ctx.bs, ctx.global_bs):
             hidden_states, _ = self.model(
@@ -317,9 +317,9 @@ class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
                 out_cache_loc,
                 captured_hidden_states=captured_hidden_states,
                 accept_lengths=accept_lengths,
-                draft_seq_lens=draft_seq_lens,
+                seq_lens=seq_lens,
             )
-        self._apply_first_step_correction(ctx, accept_lengths, draft_seq_lens)
+        self._apply_first_step_correction(ctx, accept_lengths, seq_lens)
         logits_metadata = LogitsMetadata.from_forward_context(ctx)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, logits_metadata
