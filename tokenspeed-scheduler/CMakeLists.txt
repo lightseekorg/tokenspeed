@@ -63,6 +63,7 @@ add_library(tokenspeed_scheduler_core STATIC
     csrc/scheduler/operations/forward.cpp
 
     csrc/scheduler/kv_cache_events.cpp
+    csrc/scheduler/xxhash3.cpp
     csrc/scheduler/request.cpp
     csrc/scheduler/outside_event_handler.cpp
     csrc/scheduler/scheduler.cpp

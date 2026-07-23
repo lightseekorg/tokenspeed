@@ -19,6 +19,8 @@
 # SOFTWARE.
 
 import faulthandler
+import json
+import queue
 import signal
 import time
 from collections import OrderedDict
@@ -83,13 +85,24 @@ from tokenspeed.runtime.pd.factory import (
     get_kv_args,
 )
 from tokenspeed.runtime.pd.kv_events import (
+    AllBlocksCleared,
+    EventIdAllocator,
     EventPublisherFactory,
     KVEventBatch,
+    KVEventsConfig,
     NullEventPublisher,
+    apply_envelope,
+    assign_event_ids,
     drain_scheduler_kv_events,
+    l3_storage_keys_to_disk_events,
     scheduler_kv_events_to_wire_events,
 )
 from tokenspeed.runtime.pd.mooncake.entities import KVManagerArgs
+from tokenspeed.runtime.pd.mooncake_kv_events import (
+    MooncakeMasterEventSubscriber,
+    engine_publishes_l3_disk,
+    parse_mooncake_kv_events_config,
+)
 from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 from tokenspeed.runtime.utils import (
@@ -104,6 +117,10 @@ from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = get_colorful_logger(__name__)
+
+# Sentinel queued on ``_pending_l3_kv_events`` for Mooncake ``clear()`` /
+# ``remove_all`` → ``AllBlocksCleared(medium=disk)``.
+_L3_ALL_BLOCKS_CLEARED = object()
 
 
 def calc_l3_query_hashes(scheduler, tokens: list[int]) -> list[str]:
@@ -316,6 +333,65 @@ class EventLoop:
             mamba_l2_layout=server_args.mamba_l2_layout,
             mamba_l2_io_backend=server_args.mamba_l2_io_backend,
         )
+        # Parse KV events config before MemoryExecutor so L3 disk callbacks can
+        # be wired at construction time. Publishing stays on attn_tp_rank == 0.
+        self._kv_events_enabled = (
+            EventPublisherFactory.is_enabled(server_args.kv_events_config)
+            and attn_tp_rank == 0
+        )
+        # Retain full config: EventPublisherFactory.create pops wire_format /
+        # hash_mode / envelope fields that the publish path still needs.
+        self._kv_events_config: KVEventsConfig | None = (
+            KVEventsConfig.from_cli(server_args.kv_events_config)
+            if server_args.kv_events_config
+            else None
+        )
+        # Per-stream RFC #1527 event_id counters (model, block_size, backend,
+        # medium, dp_rank). Unused under wire_format=legacy. Mutated only from
+        # the event-loop thread (L3 backups enqueue on a worker thread).
+        self._kv_event_id_allocator = EventIdAllocator()
+        # Thread-safe queue of L3 KV event payloads from StorageExecutor /
+        # MooncakeStore callbacks. Items are either ``list[str]`` rolling
+        # hashes (BlockStored) or the ``_L3_ALL_BLOCKS_CLEARED`` sentinel
+        # (AllBlocksCleared). Drained on the event-loop thread in
+        # ``_publish_scheduler_kv_events`` so EventIdAllocator stays
+        # single-threaded.
+        self._pending_l3_kv_events: queue.Queue = queue.Queue()
+        # Mooncake L3 source: engine (default), master, or both. When
+        # source=master, skip engine L3 callbacks to avoid duplicate disk
+        # events once the master publisher (PR #2214) is the authority.
+        mooncake_extra: dict = {}
+        raw_extra = server_args.kvstore_storage_backend_extra_config
+        if raw_extra:
+            try:
+                parsed = json.loads(raw_extra)
+                if isinstance(parsed, dict):
+                    mooncake_extra = parsed
+            except json.JSONDecodeError:
+                logger.warning(
+                    "Invalid kvstore_storage_backend_extra_config JSON; "
+                    "mooncake kv_events defaults to source=engine."
+                )
+        self._mooncake_kv_events_config = parse_mooncake_kv_events_config(
+            mooncake_extra
+        )
+        self._mooncake_master_kv_subscriber = MooncakeMasterEventSubscriber(
+            self._mooncake_kv_events_config
+        )
+        if self._kv_events_enabled:
+            self._mooncake_master_kv_subscriber.start()
+
+        on_l3_blocks_stored = None
+        on_l3_all_cleared = None
+        if (
+            self._kv_events_enabled
+            and self._kv_events_config is not None
+            and "disk" in self._kv_events_config.publish_tiers
+            and engine_publishes_l3_disk(self._mooncake_kv_events_config)
+        ):
+            on_l3_blocks_stored = self._enqueue_l3_blocks_stored
+            on_l3_all_cleared = self._enqueue_l3_all_cleared
+
         if scheduler_ext_flat_kvcache() and server_args.enable_kvstore:
             if server_args.kvstore_storage_backend is not None:
                 raise NotImplementedError(
@@ -344,6 +420,8 @@ class EventLoop:
                 tp_group=self.attn_tp_cpu_group,
                 draft_device_pool=draft_token_to_kv_pool,
                 mamba_pool=mamba_pool,
+                on_l3_blocks_stored=on_l3_blocks_stored,
+                on_l3_all_cleared=on_l3_all_cleared,
             )
             num_host_pages = self.memory_executor.host_pool.page_num
 
@@ -351,11 +429,6 @@ class EventLoop:
         # inflight accounting in _submit_cache_ops; radix loadbacks never ack.
         self._loadback_acks_expected = getattr(
             self.memory_executor, "emits_loadback_acks", False
-        )
-
-        self._kv_events_enabled = (
-            EventPublisherFactory.is_enabled(server_args.kv_events_config)
-            and attn_tp_rank == 0
         )
 
         if has_mamba and server_args.max_mamba_cache_size is None:
@@ -735,17 +808,78 @@ class EventLoop:
         logger.debug("[cache_poll] scheduler.advance() done")
         self._publish_scheduler_kv_events()
 
+    def _enqueue_l3_blocks_stored(self, rolling_page_hashes: list[str]) -> None:
+        """Thread-safe enqueue from StorageExecutor backup-done callback."""
+        if rolling_page_hashes:
+            self._pending_l3_kv_events.put(list(rolling_page_hashes))
+
+    def _enqueue_l3_all_cleared(self) -> None:
+        """Thread-safe enqueue from MooncakeStore.clear() via StorageExecutor."""
+        self._pending_l3_kv_events.put(_L3_ALL_BLOCKS_CLEARED)
+
+    def _drain_pending_l3_disk_events(self) -> list:
+        """Convert queued L3 payloads to disk-tier wire events.
+
+        Runs on the event-loop thread only. Always drains the queue so failed
+        or disabled publishes do not retain payloads indefinitely. Events are
+        produced only when KV events are enabled and ``"disk"`` is in
+        ``publish_tiers``.
+        """
+        config = self._kv_events_config
+        publish_disk = (
+            self._kv_events_enabled
+            and config is not None
+            and "disk" in config.publish_tiers
+            and engine_publishes_l3_disk(self._mooncake_kv_events_config)
+        )
+        block_size = self.server_args.block_size
+        events = []
+        while True:
+            try:
+                item = self._pending_l3_kv_events.get_nowait()
+            except queue.Empty:
+                break
+            if not publish_disk:
+                continue
+            if item is _L3_ALL_BLOCKS_CLEARED:
+                cleared = AllBlocksCleared()
+                apply_envelope(cleared, config, medium="disk", dp_rank=self.dp_rank)
+                events.append(cleared)
+                continue
+            hashes = item
+            if not hashes:
+                continue
+            disk_events = l3_storage_keys_to_disk_events(hashes, block_size=block_size)
+            for event in disk_events:
+                apply_envelope(event, config, medium="disk", dp_rank=self.dp_rank)
+            events.extend(disk_events)
+        return events
+
     def _publish_scheduler_kv_events(self) -> None:
         raw_events = drain_scheduler_kv_events(
             self.scheduler,
             enabled=self._kv_events_enabled,
         )
-        if not raw_events:
-            return
-
-        events = scheduler_kv_events_to_wire_events(raw_events)
+        config = self._kv_events_config
+        hash_mode = config.hash_mode if config is not None else "fnv"
+        # medium="gpu" is the fallback for events without tier (older bindings);
+        # host-tiered events override to medium="cpu" via _tier_to_medium.
+        events = []
+        if raw_events:
+            events.extend(
+                scheduler_kv_events_to_wire_events(
+                    raw_events,
+                    hash_mode=hash_mode,
+                    config=config,
+                    medium="gpu",
+                    dp_rank=self.dp_rank,
+                )
+            )
+        events.extend(self._drain_pending_l3_disk_events())
         if not events:
             return
+        if config is not None:
+            assign_event_ids(events, config, self._kv_event_id_allocator)
 
         self.kv_event_publisher.publish(
             KVEventBatch(ts=time.time(), events=events, attn_dp_rank=self.dp_rank)

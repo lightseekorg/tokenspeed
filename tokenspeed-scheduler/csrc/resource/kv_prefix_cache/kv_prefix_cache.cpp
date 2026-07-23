@@ -66,7 +66,7 @@ std::vector<std::uint64_t> BuildBlockHashesForTokens(const token_vec_t& tokens, 
     for (std::int32_t page = 0; page < page_count; ++page) {
         const auto begin = tokens.begin() + page * page_size;
         token_slice token_page{&*begin, static_cast<std::size_t>(page_size)};
-        parent_hash = HashKvBlock(token_page, parent_hash);
+        parent_hash = HashKvBlockForEvents(token_page, parent_hash);
         block_hashes.push_back(*parent_hash);
     }
     return block_hashes;
@@ -129,6 +129,7 @@ void KVPrefixCache::SetKvEventSink(KvEventSink sink) {
     kv_event_sink_ = std::move(sink);
     if (!kv_event_sink_) {
         published_device_blocks_.clear();
+        published_host_blocks_.clear();
     }
 }
 
@@ -157,6 +158,36 @@ void KVPrefixCache::recordDeviceBlockRemoved(TreeNode* node) {
     }
     if (!removed_hashes.empty()) {
         kv_event_sink_(KvCacheEvent{KvBlockRemovedEvent{.block_hashes = std::move(removed_hashes)}});
+    }
+}
+
+void KVPrefixCache::recordHostBlockStored(TreeNode* node) {
+    if (!kv_event_sink_) {
+        return;
+    }
+    for (auto& event : BuildBlockEventsForNode(node, tree_.PageSize())) {
+        const std::uint64_t block_hash = event.block_hashes.front();
+        if (published_host_blocks_.insert(block_hash).second) {
+            event.tier = KvEventTier::kHost;
+            kv_event_sink_(KvCacheEvent{std::move(event)});
+        }
+    }
+}
+
+void KVPrefixCache::recordHostBlockRemoved(TreeNode* node) {
+    if (!kv_event_sink_) {
+        return;
+    }
+    std::vector<std::uint64_t> removed_hashes;
+    for (const auto& event : BuildBlockEventsForNode(node, tree_.PageSize())) {
+        const std::uint64_t block_hash = event.block_hashes.front();
+        if (published_host_blocks_.erase(block_hash) > 0) {
+            removed_hashes.push_back(block_hash);
+        }
+    }
+    if (!removed_hashes.empty()) {
+        kv_event_sink_(
+            KvCacheEvent{KvBlockRemovedEvent{.block_hashes = std::move(removed_hashes), .tier = KvEventTier::kHost}});
     }
 }
 
@@ -235,7 +266,7 @@ InsertResult KVPrefixCache::Insert(const token_vec_t& token_ids, const std::vect
     }
 
     insert_result.last_node = current;
-    if constexpr (RType == ResourceType::Device) {
+    if constexpr (RType == ResourceType::Device || RType == ResourceType::Host) {
         if (kv_event_sink_) {
             EnsureBlockHashesTo(current, page_size);
         }
@@ -256,6 +287,7 @@ InsertResult KVPrefixCache::Insert(const token_vec_t& token_ids, const std::vect
     const std::int32_t alloc_start = static_cast<std::int32_t>(prefix_pages.size());
     OwnedPages unconsumed;
     std::vector<TreeNode*> newly_stored_device_nodes;
+    std::vector<TreeNode*> newly_stored_host_nodes;
 
     std::int32_t remaining_pages = total_pages;
     for (TreeNode* node : LeafToRoot(current)) {
@@ -301,6 +333,10 @@ InsertResult KVPrefixCache::Insert(const token_vec_t& token_ids, const std::vect
             if (kv_event_sink_) {
                 newly_stored_device_nodes.push_back(node);
             }
+        } else if constexpr (RType == ResourceType::Host) {
+            if (kv_event_sink_) {
+                newly_stored_host_nodes.push_back(node);
+            }
         }
     }
 
@@ -308,6 +344,11 @@ InsertResult KVPrefixCache::Insert(const token_vec_t& token_ids, const std::vect
         std::reverse(newly_stored_device_nodes.begin(), newly_stored_device_nodes.end());
         for (TreeNode* node : newly_stored_device_nodes) {
             recordDeviceBlockStored(node);
+        }
+    } else if constexpr (RType == ResourceType::Host) {
+        std::reverse(newly_stored_host_nodes.begin(), newly_stored_host_nodes.end());
+        for (TreeNode* node : newly_stored_host_nodes) {
+            recordHostBlockStored(node);
         }
     }
 
@@ -347,6 +388,10 @@ bool KVPrefixCache::EnsureCapacityByEvict(std::int32_t required_num_pages) {
     if constexpr (RType == ResourceType::Device) {
         for (TreeNode* node : evicted) {
             recordDeviceBlockRemoved(node);
+        }
+    } else if constexpr (RType == ResourceType::Host) {
+        for (TreeNode* node : evicted) {
+            recordHostBlockRemoved(node);
         }
     }
     pruneEvicted<RType>(evicted);

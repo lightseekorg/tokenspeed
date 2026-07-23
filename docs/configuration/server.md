@@ -149,7 +149,7 @@ draft model, and token count together.
 | `--metrics-reporters` | Metrics reporter, such as `prometheus`. |
 | `--decode-log-interval` | Decode batch log interval. |
 | `--enable-cache-report` | Include cached-token counts in OpenAI-compatible usage details. |
-| `--kv-events-config` | JSON config for KV cache mutation events. Set `enable_kv_cache_events` and a publisher such as `zmq` to publish device prefix-cache stores and removals. |
+| `--kv-events-config` | JSON config for KV cache mutation events (`KVEventsConfig`). Keys: `enable_kv_cache_events`, `publisher`, `endpoint`, `replay_endpoint`, `buffer_steps`, `hwm`, `max_queue_size`, `topic`, `wire_format`, `backend_id`, `tenant_id`, `model_name`, `publish_medium`, `publish_tiers`, `hash_mode`. See [KV Cache Events](#kv-cache-events). |
 
 ### Per-Request Stats
 
@@ -180,25 +180,224 @@ Req: chatcmpl-019ef6b7 Finish! RequestStats(status='finished', reason='stop', pr
 
 ### KV Cache Events
 
-KV cache events publish reusable device prefix-cache mutations from the live
-C++ scheduler path. Host/L2 loadback events are not published by this initial
-stream. Block hash lineage is cached on prefix-cache nodes, so publishing a
-stored block uses the parent node's cached hash instead of rebuilding the full
-ancestor prefix.
+KV cache events publish reusable prefix-cache mutations from the live C++
+scheduler path (device/GPU and host/CPU tiers) and, when enabled, Mooncake L3
+(disk) backup/clear paths. Block hash lineage is cached on prefix-cache nodes,
+so publishing a stored block uses the parent node's cached hash instead of
+rebuilding the full ancestor prefix.
 
-Example:
+`--kv-events-config` accepts a JSON object with these `KVEventsConfig` keys:
+
+| Key | Default | Purpose |
+| --- | --- | --- |
+| `enable_kv_cache_events` | `false` | Publish scheduler KV cache mutation events. |
+| `publisher` | `zmq` when enabled, else `null` | Event publisher (`zmq` or `null`). |
+| `endpoint` | `tcp://*:5557` | ZMQ PUB bind address. |
+| `replay_endpoint` | unset | Optional ZMQ endpoint for event replay. |
+| `buffer_steps` | `10000` | Steps retained for the replay endpoint. |
+| `hwm` | `100000` | ZMQ high water mark (events drop if consumers lag). |
+| `max_queue_size` | `100000` | Max queued events waiting to publish. |
+| `topic` | `""` | ZMQ topic subscribers filter on. |
+| `wire_format` | `legacy` | `legacy` (Dynamo-compat) or `rfc1527` envelopes. |
+| `backend_id` | env / hostname | Worker id shared across all tier publishes. |
+| `tenant_id` | `default` | Multi-tenant indexer isolation. |
+| `model_name` | unset | Model name in RFC #1527 envelopes when set. |
+| `publish_medium` | `true` | Include `medium` in RFC #1527 envelopes. |
+| `publish_tiers` | `["gpu"]` | Tiers to publish: `gpu`, `cpu`, `disk`. |
+| `hash_mode` | `fnv` | Block hash mode (`fnv` or `xxh3`). |
+
+Minimal example:
 
 ```bash
 --kv-events-config '{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://*:5557","topic":"kv-events"}'
 ```
 
+Recommended Mooncake multi-tier deployment:
+
+```bash
+--kv-events-config '{
+  "enable_kv_cache_events": true,
+  "publisher": "zmq",
+  "endpoint": "tcp://*:5557",
+  "replay_endpoint": "tcp://*:5558",
+  "buffer_steps": 10000,
+  "hwm": 100000,
+  "max_queue_size": 100000,
+  "topic": "kv-events",
+  "wire_format": "rfc1527",
+  "backend_id": "ts-worker-0",
+  "tenant_id": "default",
+  "model_name": "Qwen3-8B",
+  "publish_medium": true,
+  "publish_tiers": ["gpu", "cpu", "disk"],
+  "hash_mode": "xxh3"
+}'
+```
+
 The ZMQ publisher sends three frames: topic bytes, an 8-byte big-endian sequence
-number, and a msgpack payload. The payload is an array-like `KVEventBatch`:
+number, and a msgpack payload. The payload is an array-like `KVEventBatch`
+(`[ts, events, attn_dp_rank]`). Individual events are tagged **maps** (not
+positional arrays), which Dynamo's ZMQ relay accepts:
 
 ```python
-[timestamp, [["BlockStored", [block_hash], parent_hash, token_ids, block_size]], attn_dp_rank]
-[timestamp, [["BlockRemoved", [block_hash]]], attn_dp_rank]
+[timestamp, [{"type": "BlockStored", "block_hashes": [...], "parent_block_hash": ..., "token_ids": [...], "block_size": N}], attn_dp_rank]
+[timestamp, [{"type": "BlockRemoved", "block_hashes": [...]}], attn_dp_rank]
 ```
+
+Unset optional fields are omitted via msgspec `omit_defaults`. With
+`wire_format=rfc1527`, RFC #1527 envelope fields (`backend_id`, `medium`,
+`dp_rank`, `model_name`, `tenant_id`, `event_id`) may also appear on events.
+`medium` is derived from the scheduler event `tier` when present
+(`device`/`0` → `gpu`, `host`/`1` → `cpu`); older events without `tier` keep
+the publisher fallback (`gpu` for device-path publishes). Disk-path publishes
+set `medium="disk"` explicitly. `event_id` is assigned monotonically per stream
+keyed by `(model_name, block_size, backend_id, medium, dp_rank)`, starting at
+`0`. The default `wire_format=legacy` leaves those fields unset so payloads
+stay Dynamo-compatible.
+
+#### Multi-tier deduplication (gpu / cpu / disk)
+
+Each tier publish is **independent**: when the same logical block is present on
+GPU, host, and Mooncake at once, TokenSpeed emits a separate event per tier
+(distinct `medium`). Indexers that follow [Dynamo PR
+#8912](https://github.com/ai-dynamo/dynamo/pull/8912) **aggregate those events
+cumulatively** as per-instance tier counts — they must not open duplicate
+radix entries for the same worker. That contract requires a single shared
+`backend_id` across all tier publish paths for one worker (set once on
+`KVEventsConfig` / `TOKENSPEED_KV_EVENTS_BACKEND_ID` and applied by
+`apply_envelope` for every medium). Do not configure different `backend_id`
+values for GPU, host, and disk on the same worker.
+
+`publish_tiers` (default `["gpu"]`) selects which storage tiers to publish.
+Include `"disk"` (e.g. `["gpu","cpu","disk"]`) to emit `medium="disk"`
+`BlockStored` events when Mooncake L3 backup succeeds, and
+`AllBlocksCleared` when the Mooncake store is cleared (`remove_all`).
+GPU and host events for the same token page share scheduler `block_hashes`.
+Disk hashes are an interim mapping from Mooncake SHA256 hex storage keys via
+XXH3-64 seed 1337 (empty `token_ids`) until `BackUpOp` carries token page
+spans, so disk hashes may intentionally differ from GPU/CPU hashes until that
+plumbing lands; identity for multi-tier aggregation still relies on the shared
+`backend_id`.
+
+#### Dynamo standalone indexer (end-to-end)
+
+To validate multi-tier KV events against NVIDIA Dynamo's standalone indexer
+(`python -m dynamo.indexer`), run TokenSpeed with RFC #1527 envelopes and all
+three publish tiers, then point the indexer at the worker's ZMQ PUB endpoint.
+Dynamo is an external dependency and is **not** required in TokenSpeed CI —
+see `test/integration/test_kv_events_dynamo_indexer.py` for the manual
+checklist.
+
+```bash
+# TokenSpeed worker
+--kv-events-config '{
+  "enable_kv_cache_events":true,
+  "publisher":"zmq",
+  "endpoint":"tcp://*:5557",
+  "replay_endpoint":"tcp://*:5558",
+  "topic":"kv-events",
+  "wire_format":"rfc1527",
+  "backend_id":"ts-worker-0",
+  "tenant_id":"default",
+  "model_name":"YOUR_MODEL",
+  "publish_medium":true,
+  "publish_tiers":["gpu","cpu","disk"],
+  "hash_mode":"xxh3"
+}'
+--kvstore-storage-backend mooncake
+--kvstore-storage-backend-extra-config '{"master_server_address":"HOST:PORT"}'
+
+# Dynamo indexer (separate process)
+python -m dynamo.indexer --zmq-endpoint tcp://ts-worker-0:5557
+```
+
+Register the worker (or pass `--workers` / `--zmq-endpoint` at indexer startup
+per your Dynamo version), drive traffic that stores prefixes on GPU, host, and
+Mooncake, then query overlap:
+
+```bash
+curl -X POST http://localhost:8090/query \
+  -H 'Content-Type: application/json' \
+  -d '{"token_ids": [/* prompt tokens */], "model_name": "YOUR_MODEL"}'
+```
+
+##### Expected `/query` per-instance tier breakdown
+
+[Dynamo PR #8912](https://github.com/ai-dynamo/dynamo/pull/8912) aligns the
+standalone indexer's HTTP API with [Mooncake RFC
+#1403](https://github.com/kvcache-ai/Mooncake/issues/1403). Successful
+multi-tier publish yields an `instances` map keyed by instance id. Example
+shape (counts are **matched tokens** = block overlap × block size):
+
+```json
+{
+  "scores": {"1": {"0": 32}},
+  "frequencies": [1],
+  "instances": {
+    "1": {
+      "longest_matched": 48,
+      "gpu": 32,
+      "dp": {"0": 32},
+      "cpu": 48,
+      "disk": 48
+    }
+  }
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `gpu` | Tokens matched on the device tier (longest device-tier prefix across DP ranks). |
+| `dp` | Per-`dp_rank` device-tier match counts. |
+| `cpu` | Cumulative through device → host-pinned (includes everything in `gpu` plus host extension). |
+| `disk` | Cumulative through device → host → disk/external. |
+| `longest_matched` | `max(gpu, cpu, disk)` — best prefix length for gateway ranking. |
+
+Under a natural offload pipeline (device → host → disk), tier counts are
+**cumulative**: `gpu ≤ cpu ≤ disk` for every instance. Legacy `scores` remain
+equal to each instance's per-`dp_rank` `gpu` count. Because TokenSpeed emits
+one event per tier with a shared `backend_id`, the indexer aggregates those
+events into a single instance entry rather than duplicate radix workers.
+
+##### Follow-up: `/v1/tokenize` with chat `messages`
+
+TokenSpeed does **not** yet expose `/v1/tokenize` that accepts ChatCompletion-style
+`messages` (HTTP `/v1/*` is proxied to the SMG gateway today). Routers that need
+template-identical token IDs for indexer `/query` should track adding that API
+following the [SGLang PR #23981](https://github.com/sgl-project/sglang/pull/23981)
+pattern; it requires SMG/gateway changes outside the KV-events Mooncake Store
+scope. Until then, pass pre-tokenized `input_ids` / `token_ids`, or apply the
+engine's chat template offline before querying the indexer.
+
+#### Mooncake master publisher relay (scaffold)
+
+For DaemonSet / decoupled cache topologies, Mooncake master can publish RFC
+#1527 KV events (PR
+[#2214](https://github.com/kvcache-ai/Mooncake/pull/2214)). TokenSpeed accepts
+an optional nested `kv_events` object inside
+`--kvstore-storage-backend-extra-config`:
+
+```json
+{
+  "master_server_address": "mooncake-master:50051",
+  "kv_events": {
+    "source": "engine|master|both",
+    "master_subscribe_endpoint": "tcp://mooncake-master:6000",
+    "backend_id": "node-3-cache-daemon"
+  }
+}
+```
+
+- `source=engine` (default): engine publishes L3/disk events (current
+  behavior). Master subscribe is not attempted.
+- `source=master`: skip engine L3 disk publish; attempt master SUB relay.
+- `source=both`: keep engine L3 publish and also attempt master SUB.
+
+Master relay is a **safe scaffold** pending Mooncake master publisher
+availability in the installed SDK: if the subscribe endpoint is missing or the
+event API is unavailable, TokenSpeed logs a warning and stays idle
+(fail-open) without crashing the engine. A production ZMQ poll loop will land
+once the master publisher is ready.
 
 With attention data parallelism, each attention DP rank publishes on an offset
 port from the configured endpoint.
