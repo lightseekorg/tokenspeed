@@ -19,6 +19,7 @@ from tokenspeed_kernel.ops.attention.triton.dsa_topk import _topk_with_padding
 from tokenspeed_kernel.platform import current_platform
 
 SPARSE_BLOCK_SIZE = 128
+_is_nvidia = current_platform().is_nvidia
 
 if current_platform().is_blackwell:
     try:
@@ -59,8 +60,11 @@ def _store_index_k_kernel(
     stride_cache_d,
     head_dim: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     token = tl.program_id(0)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     dims = tl.arange(0, BLOCK_D)
     slot = tl.load(slot_mapping + token).to(tl.int64)
     values = tl.load(
@@ -73,6 +77,8 @@ def _store_index_k_kernel(
         values,
         mask=dims < head_dim,
     )
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit(do_not_specialize_on_alignment=["seq_lens", "prefix_lens"])
@@ -320,6 +326,7 @@ def minimax_indexer(
     query_lens_cpu: Sequence[int] | None = None,
     seq_lens_cpu: Sequence[int] | None = None,
     score_out: torch.Tensor | None = None,
+    enable_pdl: bool = False,
 ) -> torch.Tensor:
     """Write index keys, score visible 128-token blocks, and select Top-K.
 
@@ -392,6 +399,8 @@ def minimax_indexer(
     assert seq_lens.is_contiguous()
 
     block_d = triton.next_power_of_2(head_dim)
+    use_pdl = bool(enable_pdl and _is_nvidia)
+    pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
     _store_index_k_kernel[(tokens,)](
         index_k,
         index_k_cache,
@@ -402,7 +411,9 @@ def minimax_indexer(
         index_k_cache.stride(1),
         head_dim=head_dim,
         BLOCK_D=block_d,
+        ENABLE_PDL=use_pdl,
         num_warps=4,
+        **pdl_kwargs,
     )
 
     max_blocks = block_table.shape[1] if max_blocks is None else int(max_blocks)

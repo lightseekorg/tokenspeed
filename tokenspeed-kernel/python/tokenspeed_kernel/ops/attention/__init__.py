@@ -152,6 +152,7 @@ def msa_decode_with_kvcache(
     k_scale: float | torch.Tensor | None = None,
     v_scale: float | torch.Tensor | None = None,
     score_out: torch.Tensor | None = None,
+    enable_pdl: bool = False,
     override: str | None = None,
     solution: str | None = None,
 ) -> torch.Tensor:
@@ -186,6 +187,8 @@ def msa_decode_with_kvcache(
             ``-inf`` and reused across layers; forwarded to the kernel to avoid
             a per-layer allocation + fill. Ignored by kernels that do not
             accept it or when its shape does not match.
+        enable_pdl: Request Programmatic Dependent Launch (SM90+) for the
+            indexer's index-key store; forwarded to the kernel.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
@@ -267,6 +270,7 @@ def msa_decode_with_kvcache(
             k_scale=k_scale,
             v_scale=v_scale,
             score_out=score_out,
+            enable_pdl=enable_pdl,
         )
 
 
