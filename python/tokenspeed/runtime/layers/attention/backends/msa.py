@@ -105,6 +105,10 @@ class MSADecodeMetadata:
     # Flat per-group tables/write-locs; see MSAExtendMetadata.
     page_tables: dict[str, torch.Tensor] | None = None
     out_cache_locs: dict[str, torch.Tensor] | None = None
+    # Per-forward view of the backend's shared decode score buffer, pre-filled
+    # with -inf and reused by every sparse layer. None on paths that keep the
+    # per-layer allocation (draft/DFLASH, or before the buffer is allocated).
+    score_out: torch.Tensor | None = None
 
 
 class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
@@ -152,6 +156,24 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         self.forward_decode_metadata: MSADecodeMetadata | None = None
         self.forward_extend_metadata: MSAExtendMetadata | None = None
 
+        # Persistent decode index-score buffer, shared across sparse layers so
+        # the indexer's -inf tail is reset once per forward instead of a
+        # per-layer torch.full. Full page width == max_blocks for decode
+        # (max_seqlen_k == context_len).
+        self.decode_score_buffer = torch.empty(
+            (
+                config.max_bs * self.tokens_per_req,
+                self.tp_kv_head_num,
+                self.max_num_pages,
+            ),
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+    @property
+    def tokens_per_req(self) -> int:
+        return 1 if self.is_draft else self.spec_num_tokens
+
     # ------------------------------------------------------------------
     # Metadata initialization
     # ------------------------------------------------------------------
@@ -198,16 +220,11 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                     self.page_size,
                 )
             else:
-                verify_tokens = (
-                    self.spec_num_tokens
-                    if self.spec_num_tokens > 1 and not self.is_draft
-                    else 1
-                )
                 flat_out_cache_locs = self._compute_flat_decode_out_cache_locs(
                     flat_page_tables,
                     seq_lens,
                     self.page_size,
-                    verify_tokens,
+                    self.tokens_per_req,
                 )
             self._maybe_check_flat_write_locs(
                 flat_page_tables, flat_out_cache_locs, self.page_size
@@ -298,11 +315,14 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                     out_cache_locs=flat_out_cache_locs,
                 )
             else:
+                score_out = self.decode_score_buffer[: bs * self.tokens_per_req]
+                score_out.fill_(-float("inf"))
                 self.forward_decode_metadata = MSADecodeMetadata(
                     page_table=page_table,
                     seq_lens=seq_lens,
                     page_tables=flat_page_tables,
                     out_cache_locs=flat_out_cache_locs,
+                    score_out=score_out,
                 )
 
     def init_cuda_graph_state(
@@ -376,11 +396,7 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         page_tables, out_cache_locs = self._flat_capture_group_views(
             bs,
             flat_cache_group_ids,
-            tokens_per_req=(
-                self.spec_num_tokens
-                if self.spec_num_tokens > 1 and not self.is_draft
-                else 1
-            ),
+            tokens_per_req=self.tokens_per_req,
         )
 
         if self.draft_block_decode and self.spec_num_tokens > 1:
@@ -397,6 +413,8 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             # baseline for the capture run before that op records.
             metadata.seq_lens.fill_(self.spec_num_tokens)
         else:
+            score_out = self.decode_score_buffer[: bs * self.tokens_per_req]
+            score_out.fill_(-float("inf"))
             metadata = MSADecodeMetadata(
                 # Flat captures route reads through the per-group tables and
                 # replay never fills the radix single table, so mirror the
@@ -410,6 +428,7 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                 seq_lens=self.cuda_graph_seq_lens[:bs],
                 page_tables=page_tables,
                 out_cache_locs=out_cache_locs,
+                score_out=score_out,
             )
             if self.spec_num_tokens > 1 and not self.is_draft:
                 metadata.seq_lens.copy_(seq_lens[:bs].clamp_min(self.spec_num_tokens))
@@ -462,15 +481,14 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                 bs,
                 flat_block_tables,
                 self.cuda_graph_seq_lens,
-                tokens_per_req=(
-                    self.spec_num_tokens
-                    if self.spec_num_tokens > 1 and not self.is_draft
-                    else 1
-                ),
+                tokens_per_req=self.tokens_per_req,
             )
 
         if bs in self.cuda_graph_decode_metadata:
             self.forward_decode_metadata = self.cuda_graph_decode_metadata[bs]
+            # Reset the shared score buffer to -inf before replay; the captured
+            # score kernels overwrite only visible blocks, leaving the tail.
+            self.forward_decode_metadata.score_out.fill_(-float("inf"))
 
     def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
         """DFLASH: broadcast each request's block-end length to its
@@ -561,6 +579,7 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             max_seqlen_k=self.max_context_len,
             k_scale=layer.k_scale if self.is_fp8 else None,
             v_scale=layer.v_scale if self.is_fp8 else None,
+            score_out=metadata.score_out,
         )
         return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 

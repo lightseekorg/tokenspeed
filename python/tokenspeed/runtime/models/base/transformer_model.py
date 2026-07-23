@@ -142,16 +142,12 @@ class BaseTransformerModel(nn.Module):
         quant_config: QuantizationConfig | None,
         prefix: str,
     ) -> nn.ModuleList:
-
-        layer_cls = self.layer_cls
-        mapping = self.mapping
-
         return make_layers(
             config.num_hidden_layers,
-            lambda idx, prefix: layer_cls(
+            lambda idx, prefix: self.layer_cls(
                 config=config,
                 layer_id=idx,
-                mapping=mapping,
+                mapping=self.mapping,
                 quant_config=quant_config,
                 prefix=prefix,
             ),
