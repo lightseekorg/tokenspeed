@@ -634,7 +634,7 @@ class DeepseekV3AttentionMLA(nn.Module):
         comm_manager: CommManager,
         block_scale: torch.Tensor | None = None,
         accept_lengths: torch.Tensor | None = None,
-        draft_seq_lens: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """MLA attention with a NARROW prefill-graph break.
 
@@ -662,7 +662,7 @@ class DeepseekV3AttentionMLA(nn.Module):
                 ctx,
                 out_cache_loc,
                 accept_lengths=accept_lengths,
-                draft_seq_lens=draft_seq_lens,
+                seq_lens=seq_lens,
             )
         output, _ = self.o_proj(attn_output)
         return output
@@ -708,7 +708,7 @@ class DeepseekV3AttentionMLA(nn.Module):
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
         accept_lengths: torch.Tensor | None = None,
-        draft_seq_lens: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """The eager break: KV write + varlen prefill / absorb decode attention.
 
@@ -1173,7 +1173,7 @@ class DeepseekV3DraftAttentionMLA(DeepseekV3AttentionMLA):
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
         accept_lengths: torch.Tensor | None = None,
-        draft_seq_lens: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if accept_lengths is None:
             return super()._attn(
@@ -1183,10 +1183,10 @@ class DeepseekV3DraftAttentionMLA(DeepseekV3AttentionMLA):
                 ctx,
                 out_cache_loc,
                 accept_lengths=accept_lengths,
-                draft_seq_lens=draft_seq_lens,
+                seq_lens=seq_lens,
             )
 
-        self._apply_correction(ctx, accept_lengths, draft_seq_lens)
+        self._apply_correction(ctx, accept_lengths, seq_lens)
 
         # Full q/latent_cache write all KV cache rows; only the live rows
         # (ctx.gather_ids) run the absorbed decode attention, so the output is
@@ -1221,18 +1221,18 @@ class DeepseekV3DraftAttentionMLA(DeepseekV3AttentionMLA):
         self,
         ctx: ForwardContext,
         accept_lengths: torch.Tensor,
-        draft_seq_lens: torch.Tensor | None,
+        seq_lens: torch.Tensor | None,
     ) -> None:
         """Trim decode rows' cache_seqlens by ``spec_num_tokens - accept_lengths``."""
-        if draft_seq_lens is None:
+        if seq_lens is None:
             return
         num_extends = ctx.num_extends
         if num_extends >= ctx.bs:
             return
         correction = (
             ctx.attn_backend.spec_num_tokens - accept_lengths[num_extends:]
-        ).to(draft_seq_lens.dtype)
-        draft_seq_lens[num_extends : ctx.bs].sub_(correction).clamp_(min=1)
+        ).to(seq_lens.dtype)
+        seq_lens[num_extends : ctx.bs].sub_(correction).clamp_(min=1)
 
 
 class DeepseekV3DecoderLayer(nn.Module):
@@ -1345,7 +1345,7 @@ class DeepseekV3DecoderLayer(nn.Module):
         out_cache_loc: torch.Tensor,
         residual: torch.Tensor | None,
         accept_lengths: torch.Tensor | None = None,
-        draft_seq_lens: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
 
         num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
@@ -1363,7 +1363,7 @@ class DeepseekV3DecoderLayer(nn.Module):
                 out_cache_loc=out_cache_loc,
                 comm_manager=self.comm_manager,
                 accept_lengths=accept_lengths,
-                draft_seq_lens=draft_seq_lens,
+                seq_lens=seq_lens,
             )
             hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
                 hidden_states, residual, ctx
@@ -1461,7 +1461,7 @@ class DeepseekV3Model(nn.Module):
         out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
         accept_lengths: torch.Tensor | None = None,
-        draft_seq_lens: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
         if input_embeds is not None:
             hidden_states = input_embeds
@@ -1495,7 +1495,7 @@ class DeepseekV3Model(nn.Module):
                 layer_kwargs = (
                     {
                         "accept_lengths": accept_lengths,
-                        "draft_seq_lens": draft_seq_lens,
+                        "seq_lens": seq_lens,
                     }
                     if accept_lengths is not None
                     else {}
@@ -1920,7 +1920,7 @@ class Eagle3MlaDecoderLayer(nn.Module):
         out_cache_loc: torch.Tensor,
         residual: torch.Tensor | None,
         accept_lengths: torch.Tensor | None = None,
-        draft_seq_lens: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         residual = hidden_states
 
@@ -1947,7 +1947,7 @@ class Eagle3MlaDecoderLayer(nn.Module):
                 out_cache_loc=out_cache_loc,
                 comm_manager=self.comm_manager,
                 accept_lengths=accept_lengths,
-                draft_seq_lens=draft_seq_lens,
+                seq_lens=seq_lens,
             )
 
             # Active first draft step narrows attn output to [bs, H]; align the
@@ -2033,7 +2033,7 @@ class Eagle3MlaModel(nn.Module):
         input_embeds: torch.Tensor | None = None,
         captured_hidden_states: torch.Tensor | None = None,
         accept_lengths: torch.Tensor | None = None,
-        draft_seq_lens: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         if captured_hidden_states is None:
             raise ValueError("Eagle3 MLA forward requires captured_hidden_states.")
@@ -2055,7 +2055,7 @@ class Eagle3MlaModel(nn.Module):
             out_cache_loc,
             residual,
             accept_lengths=accept_lengths,
-            draft_seq_lens=draft_seq_lens,
+            seq_lens=seq_lens,
         )
 
         comm_manager = self.midlayer.comm_manager

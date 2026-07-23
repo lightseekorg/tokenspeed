@@ -755,7 +755,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
         accept_lengths: torch.Tensor | None = None,
-        draft_seq_lens: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Backend attention call + optional gate apply. Subclasses override."""
         attn_output = self.attn(q, k, v, ctx, out_cache_loc)
@@ -770,7 +770,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
         accept_lengths: torch.Tensor | None = None,
-        draft_seq_lens: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Full attention forward pass."""
         q, k, v, gate = self._project_qkv_rope(positions, hidden_states)
@@ -782,7 +782,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             ctx,
             out_cache_loc,
             accept_lengths=accept_lengths,
-            draft_seq_lens=draft_seq_lens,
+            seq_lens=seq_lens,
         )
         output, _ = self.o_proj(attn_output)
         return output
@@ -806,7 +806,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         **kwargs,
     ):
         accept_lengths = kwargs.get("accept_lengths")
-        draft_seq_lens = kwargs.get("draft_seq_lens")
+        seq_lens = kwargs.get("seq_lens")
         num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
             ctx
         )
@@ -822,7 +822,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 ctx=ctx,
                 out_cache_loc=out_cache_loc,
                 accept_lengths=accept_lengths,
-                draft_seq_lens=draft_seq_lens,
+                seq_lens=seq_lens,
             )
             residual = self._maybe_narrow_residual(
                 residual, ctx, accept_lengths=accept_lengths
@@ -945,7 +945,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         pp_proxy_tensors=None,
         input_deepstack_embeds: torch.Tensor | None = None,
         accept_lengths: torch.Tensor | None = None,
-        draft_seq_lens: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, None]:
         # Initialize hidden states
         if input_embeds is None:
@@ -993,7 +993,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 layer_kwargs = (
                     {
                         "accept_lengths": accept_lengths,
-                        "draft_seq_lens": draft_seq_lens,
+                        "seq_lens": seq_lens,
                     }
                     if accept_lengths is not None
                     else {}

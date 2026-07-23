@@ -201,7 +201,7 @@ class LlamaAttention(nn.Module):
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
         accept_lengths: torch.Tensor | None = None,
-        draft_seq_lens: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Skip the QKV projection, RoPE, attention, and o_proj kernels when
         # the batch row is empty (e.g. idle ranks under DP attention). Matches
@@ -223,7 +223,7 @@ class LlamaAttention(nn.Module):
                 ctx,
                 out_cache_loc,
                 accept_lengths=accept_lengths,
-                draft_seq_lens=draft_seq_lens,
+                seq_lens=seq_lens,
             )
         output, _ = self.o_proj(attn_output)
         return output
@@ -237,7 +237,7 @@ class LlamaAttention(nn.Module):
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
         accept_lengths: torch.Tensor | None = None,
-        draft_seq_lens: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """RoPE + attention (pre-o_proj), with optional fused KV pre-write.
 

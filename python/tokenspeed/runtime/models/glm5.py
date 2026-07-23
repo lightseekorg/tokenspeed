@@ -738,7 +738,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         comm_manager: CommManager,
         block_scale: torch.Tensor | None = None,
         accept_lengths: torch.Tensor | None = None,
-        draft_seq_lens: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """GLM-5 DSA attention, one COARSE breakable-graph break point.
 
@@ -1086,7 +1086,7 @@ class GlmMoeDsaDecoderLayer(DeepseekV3DecoderLayer):
         out_cache_loc: torch.Tensor,
         residual: torch.Tensor | None,
         accept_lengths: torch.Tensor | None = None,
-        draft_seq_lens: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
             ctx
@@ -1103,7 +1103,7 @@ class GlmMoeDsaDecoderLayer(DeepseekV3DecoderLayer):
                 out_cache_loc=out_cache_loc,
                 comm_manager=self.comm_manager,
                 accept_lengths=accept_lengths,
-                draft_seq_lens=draft_seq_lens,
+                seq_lens=seq_lens,
             )
             if accept_lengths is not None:
                 residual = residual.index_select(0, ctx.gather_ids)

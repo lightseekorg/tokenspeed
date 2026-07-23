@@ -67,7 +67,7 @@ class DeepseekV3DraftDecoderLayer(DeepseekV3DecoderLayer):
     """Decoder layer that injects the draft attention and narrows residuals.
 
     Restricted to single-layer drafts: ``_apply_correction`` mutates the
-    explicit ``draft_seq_lens`` input in place and is not idempotent across
+    explicit ``seq_lens`` input in place and is not idempotent across
     layers.
     """
 
@@ -94,7 +94,7 @@ class DeepseekV3DraftDecoderLayer(DeepseekV3DecoderLayer):
         out_cache_loc: torch.Tensor,
         residual: torch.Tensor | None,
         accept_lengths: torch.Tensor | None = None,
-        draft_seq_lens: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
             ctx
@@ -111,7 +111,7 @@ class DeepseekV3DraftDecoderLayer(DeepseekV3DecoderLayer):
                 out_cache_loc=out_cache_loc,
                 comm_manager=self.comm_manager,
                 accept_lengths=accept_lengths,
-                draft_seq_lens=draft_seq_lens,
+                seq_lens=seq_lens,
             )
             residual = self._maybe_narrow_residual(
                 residual, ctx, accept_lengths=accept_lengths
@@ -183,7 +183,7 @@ class DeepseekModelNextN(nn.Module):
         input_embeds: torch.Tensor | None = None,
         captured_hidden_states: torch.Tensor | None = None,
         accept_lengths: torch.Tensor | None = None,
-        draft_seq_lens: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, None]:
         if captured_hidden_states is None:
             raise ValueError("DeepSeek NextN requires captured_hidden_states.")
@@ -219,7 +219,7 @@ class DeepseekModelNextN(nn.Module):
             out_cache_loc,
             residual,
             accept_lengths=accept_lengths,
-            draft_seq_lens=draft_seq_lens,
+            seq_lens=seq_lens,
         )
 
         if not ctx.forward_mode.is_idle():

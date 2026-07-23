@@ -561,7 +561,7 @@ class Mtp(BaseDrafter):
             captured_hidden_states=draft_input.base_out_hidden_states,
             spec_step_idx=0,
             accept_lengths=draft_input.accept_lengths,
-            draft_seq_lens=self.draft_seq_lens_buf,
+            seq_lens=self.draft_seq_lens_buf,
         )
         return logits_output
 
@@ -638,7 +638,7 @@ class Mtp(BaseDrafter):
                     captured_hidden_states=prev_hidden,
                     spec_step_idx=d,
                     accept_lengths=draft_input.accept_lengths,
-                    draft_seq_lens=self.draft_seq_lens_buf,
+                    seq_lens=self.draft_seq_lens_buf,
                 )
             prev_hidden = logits_output.hidden_states
 
@@ -762,7 +762,7 @@ class Mtp(BaseDrafter):
                     captured_hidden_states=prev_hidden,
                     spec_step_idx=d,
                     accept_lengths=draft_input.accept_lengths,
-                    draft_seq_lens=self.draft_seq_lens_buf,
+                    seq_lens=self.draft_seq_lens_buf,
                 )
             prev_hidden = logits_output.hidden_states
 
@@ -945,7 +945,7 @@ class Mtp(BaseDrafter):
                     captured_hidden_states=prev_hidden,
                     spec_step_idx=d,
                     accept_lengths=draft_input.accept_lengths,
-                    draft_seq_lens=self.draft_seq_lens_buf,
+                    seq_lens=self.draft_seq_lens_buf,
                 )
             prev_hidden = logits_output.hidden_states
 
