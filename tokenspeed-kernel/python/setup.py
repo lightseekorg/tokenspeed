@@ -316,15 +316,6 @@ KERNEL_GROUPS = [
         ["-lcublas", "-lcublasLt"],
     ),
     (
-        "fp32_router_gemm",
-        [
-            CUDA_CSRC_DIR / "fp32_router_gemm.cu",
-            CUDA_CSRC_DIR / "fp32_router_gemm_entry.cu",
-            CUDA_CSRC_DIR / "fp32_router_gemm_binding.cu",
-        ],
-        ["-lcublas", "-lcublasLt"],
-    ),
-    (
         "marlin",
         [
             CUDA_CSRC_DIR / "gptq_marlin_repack.cu",
