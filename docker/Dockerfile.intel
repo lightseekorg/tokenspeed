@@ -1,0 +1,45 @@
+# Minimal Intel GPU (XPU) image for bringing up TokenSpeed on Intel Data Center
+# GPUs. Intel kernels run through the portable Triton path, so no native
+# CUDA/HIP kernels are compiled (TOKENSPEED_KERNEL_BACKEND=xpu skips the
+# CUDA build step in tokenspeed-kernel/python/setup.py).
+#
+# The base image must provide a torch build with XPU support (Intel Extension
+# for PyTorch / upstream torch-xpu) plus a Triton distribution that targets the
+# Intel GPU backend. Override with --build-arg BASE_IMAGE=... as needed.
+ARG BASE_IMAGE=intel/intel-extension-for-pytorch:2.11.0-xpu
+FROM ${BASE_IMAGE}
+
+USER root
+
+ARG MAX_JOBS=16
+
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
+
+WORKDIR /workspace
+
+# libnuma1 is required at runtime by torch_memory_saver, a TokenSpeed
+# dependency. Install system dependencies before copying sources to preserve
+# this cache layer across source-only changes.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libssl-dev \
+        libopenmpi-dev \
+        libnuma1 \
+        pkg-config && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m pip install --upgrade pip setuptools wheel && \
+    python3 -m pip install cmake ninja
+
+COPY . /workspace
+
+# Install every TokenSpeed package from this checkout. The xpu backend skips
+# native CUDA kernel compilation; kernels are dispatched to the portable Triton
+# implementations at runtime via the platform selector.
+RUN MAX_JOBS=${MAX_JOBS} \
+    TOKENSPEED_KERNEL_BACKEND=xpu \
+    python3 -m pip install tokenspeed-kernel/python/ --no-build-isolation && \
+    python3 -m pip install tokenspeed-scheduler/ \
+        --config-settings=cmake.define.TOKENSPEED_FLAT_KVCACHE=ON && \
+    python3 -m pip install ./python --no-build-isolation
+
+CMD ["/bin/bash"]

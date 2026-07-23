@@ -1724,9 +1724,13 @@ class EventLoop:
             # update_block_table, prefix_cache writes to req_to_page)
             # after the prev iter's forward on execution_stream that
             # reads the same tensor. Non-blocking on host.
-            torch.cuda.default_stream().wait_stream(
-                self.model_executor.execution_stream
+            _dev_module = torch.get_device_module(self.model_executor.device)
+            # torch.xpu has no default_stream(); in the main loop (no active
+            # stream scope) current_stream() is the default stream.
+            _default_stream = getattr(
+                _dev_module, "default_stream", _dev_module.current_stream
             )
+            _default_stream().wait_stream(self.model_executor.execution_stream)
             self._process_new_requests()
             self._commit_cache_results()
             if self._pause.forward_blocked:

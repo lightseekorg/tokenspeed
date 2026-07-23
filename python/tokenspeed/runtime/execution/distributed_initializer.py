@@ -141,6 +141,9 @@ class DistributedInitializer:
         # Determine backend
         if config.device == "cuda":
             backend = "nccl"
+        elif config.device == "xpu":
+            # Intel XPU uses the XCCL (oneCCL) collective backend.
+            backend = "xccl"
         else:
             raise ValueError(f"Unsupported device: {config.device}")
 
@@ -150,7 +153,11 @@ class DistributedInitializer:
         else:
             dist_init_method = f"tcp://127.0.0.1:{config.nccl_port}"
 
-        # Device-scoped NCCL init is only required and tested on AMD.
+        # Device-scoped init is only required and tested on AMD. Intel XPU must
+        # NOT pass a device id: torch's new_group() would then call
+        # pg._get_backend(xpu_device).supports_splitting, which fails on the XCCL
+        # backend. Leaving it None short-circuits that check while still using
+        # xccl for real collectives.
         device_id = (
             torch.device(config.device, config.gpu_id)
             if current_platform().is_amd

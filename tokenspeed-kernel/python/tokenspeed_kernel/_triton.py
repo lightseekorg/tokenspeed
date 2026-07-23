@@ -26,16 +26,77 @@ import contextlib
 import importlib
 import importlib.abc
 import importlib.util
+import os
 import sys
 
-import tokenspeed_triton as triton
-import tokenspeed_triton.experimental.gluon.language as gl
-import tokenspeed_triton.profiler as proton
-from tokenspeed_triton import language as tl
-from tokenspeed_triton.experimental import gluon
-from tokenspeed_triton.language.core import _aggregate as aggregate
-from tokenspeed_triton.language.extra import libdevice
-from tokenspeed_triton.tools.tensor_descriptor import TensorDescriptor
+
+def _use_native_triton() -> bool:
+    """Return True when in-tree kernels should bind to the native ``triton``.
+
+    The default vendor Triton distribution is ``tokenspeed_triton`` (an
+    NVIDIA/AMD-focused fork with gluon/proton extensions). Intel XPU has no
+    ``tokenspeed_triton`` build, so on XPU we bind to the platform's native
+    ``triton`` (e.g. ``triton-xpu``) instead. Override with
+    ``TOKENSPEED_KERNEL_TRITON=triton|tokenspeed_triton``.
+    """
+    override = os.environ.get("TOKENSPEED_KERNEL_TRITON", "").strip().lower()
+    if override == "triton":
+        return True
+    if override == "tokenspeed_triton":
+        return False
+    try:
+        import torch
+
+        if (
+            hasattr(torch, "xpu")
+            and torch.xpu.is_available()
+            and not torch.cuda.is_available()
+        ):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+if _use_native_triton():
+    # Intel XPU path: use the native Triton (triton-xpu). Extensions that only
+    # exist in tokenspeed_triton (gluon, proton) are optional here because the
+    # kernels that use them are gated to other vendors and are not imported on
+    # XPU.
+    import triton
+    from triton import language as tl
+
+    try:
+        import triton.experimental.gluon.language as gl
+        from triton.experimental import gluon
+    except Exception:  # pragma: no cover - gluon is NVIDIA/AMD-only
+        gl = None
+        gluon = None
+    try:
+        import triton.profiler as proton
+    except Exception:  # pragma: no cover - proton not present on triton-xpu
+        proton = None
+    try:
+        from triton.language.core import _aggregate as aggregate
+    except Exception:  # pragma: no cover
+        aggregate = None
+    try:
+        from triton.language.extra import libdevice
+    except Exception:  # pragma: no cover
+        libdevice = None
+    try:
+        from triton.tools.tensor_descriptor import TensorDescriptor
+    except Exception:  # pragma: no cover
+        TensorDescriptor = None
+else:
+    import tokenspeed_triton as triton
+    import tokenspeed_triton.experimental.gluon.language as gl
+    import tokenspeed_triton.profiler as proton
+    from tokenspeed_triton import language as tl
+    from tokenspeed_triton.experimental import gluon
+    from tokenspeed_triton.language.core import _aggregate as aggregate
+    from tokenspeed_triton.language.extra import libdevice
+    from tokenspeed_triton.tools.tensor_descriptor import TensorDescriptor
 
 __all__ = [
     "aggregate",

@@ -83,10 +83,26 @@ class ProcessGroupManager:
             self._process_groups[backend] = {}
         self._process_groups[backend][group] = process_group
 
+    def _normalize_backend(self, backend: str) -> str:
+        # Many call sites hard-code the "nccl" backend. On Intel XPU the
+        # accelerator collective backend is "xccl", so alias "nccl" lookups to
+        # it when no "nccl" groups were registered.
+        if (
+            backend == "nccl"
+            and "nccl" not in self._process_groups
+            and hasattr(torch, "xpu")
+            and torch.xpu.is_available()
+            and not torch.cuda.is_available()
+        ):
+            return "xccl"
+        return backend
+
     def get_process_group(self, backend: str, group: Group):
+        backend = self._normalize_backend(backend)
         return self._process_groups[backend][group]
 
     def has_process_group(self, backend: str, group: Group) -> bool:
+        backend = self._normalize_backend(backend)
         if backend not in self._process_groups:
             return False
         return group in self._process_groups[backend]
@@ -95,7 +111,16 @@ class ProcessGroupManager:
         self, group: Group, backend: str | list[str] | None = None
     ) -> None:
         if backend is None:
-            backends = ["nccl", "gloo"]
+            if (
+                hasattr(torch, "xpu")
+                and torch.xpu.is_available()
+                and not torch.cuda.is_available()
+            ):
+                # Intel XPU: XCCL is the accelerator collective backend; gloo
+                # covers CPU-side groups.
+                backends = ["xccl", "gloo"]
+            else:
+                backends = ["nccl", "gloo"]
         elif isinstance(backend, str):
             backends = [backend]
         else:

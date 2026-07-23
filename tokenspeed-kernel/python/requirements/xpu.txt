@@ -1,0 +1,17 @@
+# Intel XPU minimal bring-up build requirements.
+#
+# NOTE: intentionally does NOT `-r common.txt`. common.txt pins
+# tokenspeed-triton / tokenspeed-proton (the NVIDIA/AMD Triton fork), which
+# clobbers the platform's Intel `triton-xpu` install. On XPU the kernels run
+# through the native Triton (triton-xpu) via tokenspeed_kernel/_triton.py's
+# XPU fallback, so only the vendor-neutral build deps are listed here.
+#
+# torch (XPU build) is expected to come from the base environment / image
+# (e.g. intel-extension-for-pytorch) and is intentionally not pinned to avoid
+# clobbering the platform torch-xpu wheel.
+apache-tvm-ffi==0.1.12
+numpy
+packaging
+PyYAML>=6.0
+wheel
+psutil

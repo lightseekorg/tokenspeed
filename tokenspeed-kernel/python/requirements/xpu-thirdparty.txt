@@ -1,0 +1,5 @@
+# Intel XPU third-party kernel dependencies.
+#
+# Minimal bring-up: Intel GPUs run through the portable Triton path, so no
+# NVIDIA/AMD vendor kernel packages are pulled in here. torch (XPU build) and
+# tokenspeed-triton are expected to come from the base environment / image.
