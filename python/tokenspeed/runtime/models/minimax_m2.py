@@ -33,6 +33,7 @@ from tokenspeed_kernel.ops.communication.trtllm import (
     minimax_allreduce_rms_qk,
     trtllm_create_ipc_workspace_for_minimax,
 )
+from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.torch_compile import get_compiler_backend
 from torch import nn
@@ -81,17 +82,14 @@ from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 logger = logging.getLogger(__name__)
 
-_is_nvidia = current_platform().is_nvidia
-
-if _is_nvidia:
-    from tokenspeed_kernel.thirdparty.cuda import fp32_router_gemm
-
 from tokenspeed.runtime.layers.moe.expert import MoELayer as _MoELayer
 
 MoELayer = _MoELayer
 
 
 class MiniMaxM2SparseMoeBlock(nn.Module):
+    _DSV3_ROUTER_GEMM_HIDDEN = (3072, 6144, 7168)
+
     def __init__(
         self,
         config: MiniMaxM2Config,
@@ -128,10 +126,10 @@ class MiniMaxM2SparseMoeBlock(nn.Module):
         else:
             self.routing_bias = None
 
-        self.use_fp32_router_gemm = (
+        self.use_dsv3_router_gemm = (
             current_platform().is_hopper_plus
-            and config.hidden_size == 3072
-            and config.num_local_experts == 256
+            and self.gate.weight.dtype in (torch.bfloat16, torch.float32)
+            and config.hidden_size in self._DSV3_ROUTER_GEMM_HIDDEN
         )
 
         routing_config = {
@@ -187,9 +185,13 @@ class MiniMaxM2SparseMoeBlock(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        # FP32 Router GEMM.
-        if self.use_fp32_router_gemm and hidden_states.shape[0] > 0:
-            router_logits = fp32_router_gemm(hidden_states, self.gate.weight)
+        if self.use_dsv3_router_gemm and hidden_states.shape[0] > 0:
+            router_logits = dsv3_router_gemm(
+                hidden_states,
+                self.gate.weight,
+                out_dtype=torch.float32,
+                enable_pdl=pdl_enabled(),
+            )
         else:
             router_logits, _ = self.gate(hidden_states.to(torch.float32))
 

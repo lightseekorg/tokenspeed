@@ -20,7 +20,7 @@
 
 """DeepSeek-V3 router GEMM kernel wrapper.
 
-Provides dsv3_router_gemm with cuBLAS fallback for num_tokens > 16.
+Provides dsv3_router_gemm with cuBLAS fallback for num_tokens > 32.
 """
 
 import functools

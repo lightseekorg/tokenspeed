@@ -319,6 +319,7 @@ def minimax_indexer(
     max_blocks: int | None = None,
     query_lens_cpu: Sequence[int] | None = None,
     seq_lens_cpu: Sequence[int] | None = None,
+    score_out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Write index keys, score visible 128-token blocks, and select Top-K.
 
@@ -348,6 +349,10 @@ def minimax_indexer(
             with the fmha_sm100 OnlyScore kernel instead of Triton.
         seq_lens_cpu: Optional host-side per-request total sequence lengths;
             see ``query_lens_cpu``.
+        score_out: Optional caller-owned ``[tokens, num_heads, max_blocks]``
+            fp32 buffer, pre-filled with ``-inf`` and reused across layers in
+            place of a fresh per-call allocation. Honored only on the decode
+            path when its shape/dtype match; otherwise a buffer is allocated.
 
     Returns:
         Selected logical block ids shaped ``[tokens, local_index_heads, topk]``.
@@ -413,12 +418,22 @@ def minimax_indexer(
                 f"tokens={tokens}, requests={seq_lens.numel()}, "
                 f"decode_query_len={decode_query_len}"
             )
-        scores = torch.full(
-            (tokens, num_heads, max_blocks),
-            -float("inf"),
-            dtype=torch.float32,
-            device=index_q.device,
-        )
+        if score_out is None:
+            scores = torch.full(
+                (tokens, num_heads, max_blocks),
+                -float("inf"),
+                dtype=torch.float32,
+                device=index_q.device,
+            )
+        else:
+            # Caller owns a persistent -inf-filled buffer shared across layers:
+            # the score kernel writes only visible blocks, so the -inf tail
+            # survives for top-k. Skips the per-layer alloc + fill.
+            assert score_out.dtype == torch.float32
+            assert score_out.is_contiguous()
+            assert score_out.size() == (tokens, num_heads, max_blocks)
+            scores = score_out
+
         if _cutedsl_decode_score is not None and _cutedsl_decode_score_supported(
             index_q, cache_pages, decode_query_len, max_blocks
         ):

@@ -27,7 +27,10 @@ from collections.abc import Iterable, Sequence
 
 import torch
 from tokenspeed_kernel.ops.activation.triton import swiglu_oai
+from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
 from tokenspeed_kernel.ops.layernorm.triton import qk_rmsnorm
+from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
+from tokenspeed_kernel.platform import current_platform
 from torch import nn
 from transformers import MiniMaxM3VLTextConfig
 
@@ -39,6 +42,7 @@ from tokenspeed.runtime.configs.paged_cache_spec import FULL_ATTENTION
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
 from tokenspeed.runtime.layers.attention.mm_encoder_attention import VisionAttention
 from tokenspeed.runtime.layers.conv import Conv3dLayer
 from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
@@ -76,8 +80,10 @@ from tokenspeed.runtime.multimodal.inputs import (
     MultimodalDataItem,
     MultimodalInputs,
 )
-from tokenspeed.runtime.utils import add_prefix
+from tokenspeed.runtime.utils import add_prefix, make_layers
+from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import global_server_args_dict
+from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +152,8 @@ class MiniMaxM3MLP(nn.Module):
 class MiniMaxM3SparseMoeBlock(nn.Module):
     """MiniMax-M3 routed experts plus one unconditional shared expert."""
 
+    _DSV3_ROUTER_GEMM_HIDDEN = (3072, 6144, 7168)
+
     def __init__(
         self,
         config: MiniMaxM3VLTextConfig,
@@ -153,12 +161,13 @@ class MiniMaxM3SparseMoeBlock(nn.Module):
         quant_config: QuantizationConfig | None = None,
         layer_index: int = -1,
         prefix: str = "",
+        alt_stream: torch.cuda.Stream | None = None,
     ) -> None:
         super().__init__()
+        self.stream_fork = StreamFork(alt_stream)
         if mapping.moe.tp_ep_size > config.num_local_experts:
             raise ValueError(
-                f"MoE parallel size {mapping.moe.tp_ep_size} exceeds "
-                f"{config.num_local_experts} experts."
+                f"MoE parallel size {mapping.moe.tp_ep_size} exceeds {config.num_local_experts} experts."
             )
 
         self.gate = ReplicatedLinear(
@@ -168,6 +177,11 @@ class MiniMaxM3SparseMoeBlock(nn.Module):
             quant_config=None,
             params_dtype=torch.float32,
             prefix=add_prefix("gate", prefix),
+        )
+        self.use_dsv3_router_gemm = (
+            current_platform().is_hopper_plus
+            and self.gate.weight.dtype in (torch.bfloat16, torch.float32)
+            and config.hidden_size in self._DSV3_ROUTER_GEMM_HIDDEN
         )
         self.routing_bias = nn.Parameter(
             torch.zeros(config.num_local_experts, dtype=torch.float32)
@@ -228,27 +242,59 @@ class MiniMaxM3SparseMoeBlock(nn.Module):
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
     ) -> torch.Tensor:
-        num_tokens, hidden_size = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_size)
-        router_logits, _ = self.gate(hidden_states.to(torch.float32))
+        num_tokens = hidden_states.size(0)
 
-        if hidden_states.shape[0] == 0:
-            topk_output = self.topk.empty_topk_output(
-                hidden_states.device,
+        with self.stream_fork.scope(enable=get_is_capture_mode()) as fork:
+            if self.use_dsv3_router_gemm and num_tokens > 0:
+                router_logits = dsv3_router_gemm(
+                    hidden_states,
+                    self.gate.weight,
+                    out_dtype=torch.float32,
+                    enable_pdl=pdl_enabled(),
+                )
+            else:
+                router_logits, _ = self.gate(hidden_states.to(torch.float32))
+
+            if num_tokens > 0:
+                topk_output = self.topk(hidden_states, router_logits)
+            else:
+                topk_output = self.topk.empty_topk_output(
+                    hidden_states.device,
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                )
+
+            deferred_finalize = self.experts.supports_deferred_finalize
+            routed_output = self.experts(
                 hidden_states=hidden_states,
-                router_logits=router_logits,
+                topk_output=topk_output,
+                num_global_tokens=num_global_tokens,
+                max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+                do_finalize=not deferred_finalize,
+            )
+
+            shared_output = None
+            with fork.branch():
+                if num_tokens > 0:
+                    shared_output = self.shared_experts(hidden_states)
+
+        if deferred_finalize:
+            gemm2_out, expert_weights, expanded_idx = routed_output
+            output = moe_finalize_fuse_shared(
+                gemm2_out,
+                expanded_idx,
+                expert_weights,
+                shared_output,
+                top_k=self.topk.topk_config.top_k,
+                enable_pdl=pdl_enabled(),
             )
         else:
-            topk_output = self.topk(hidden_states, router_logits)
-
-        routed_output = self.experts(
-            hidden_states=hidden_states,
-            topk_output=topk_output,
-            num_global_tokens=num_global_tokens,
-            max_num_tokens_per_gpu=max_num_tokens_per_gpu,
-        )
-        shared_output = self.shared_experts(hidden_states)
-        return (routed_output + shared_output).view(num_tokens, hidden_size)
+            output = (
+                routed_output
+                if shared_output is None
+                else routed_output + shared_output
+            )
+        return output
 
 
 class MiniMaxM3Indexer(nn.Module):
@@ -451,6 +497,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        alt_stream: torch.cuda.Stream | None = None,
     ) -> None:
         super().__init__()
         self.mapping = mapping
@@ -478,6 +525,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 quant_config=quant_config,
                 layer_index=layer_id,
                 prefix=add_prefix("block_sparse_moe", prefix),
+                alt_stream=alt_stream,
             )
         else:
             self.mlp = MiniMaxM3MLP(
@@ -545,6 +593,26 @@ class MiniMaxM3Model(BaseTransformerModel):
     """MiniMax-M3 decoder-only text backbone."""
 
     layer_cls = MiniMaxM3DecoderLayer
+
+    def resolve_layers(
+        self,
+        config: MiniMaxM3VLTextConfig,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> nn.ModuleList:
+        self.alt_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+        return make_layers(
+            config.num_hidden_layers,
+            lambda idx, prefix: self.layer_cls(
+                config=config,
+                layer_id=idx,
+                mapping=self.mapping,
+                quant_config=quant_config,
+                prefix=prefix,
+                alt_stream=self.alt_stream,
+            ),
+            prefix=add_prefix("layers", prefix),
+        )
 
     def __init__(
         self,

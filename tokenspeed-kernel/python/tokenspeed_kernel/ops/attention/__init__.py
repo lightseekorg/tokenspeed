@@ -151,6 +151,7 @@ def msa_decode_with_kvcache(
     max_seqlen_k: int,
     k_scale: float | torch.Tensor | None = None,
     v_scale: float | torch.Tensor | None = None,
+    score_out: torch.Tensor | None = None,
     override: str | None = None,
     solution: str | None = None,
 ) -> torch.Tensor:
@@ -181,6 +182,10 @@ def msa_decode_with_kvcache(
             divided by this scale before quantization. None means 1.0.
         v_scale: Optional scalar descale for an FP8 ``v_cache``, with the
             same convention as ``k_scale``.
+        score_out: Optional caller-owned index-score buffer, pre-filled with
+            ``-inf`` and reused across layers; forwarded to the kernel to avoid
+            a per-layer allocation + fill. Ignored by kernels that do not
+            accept it or when its shape does not match.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
@@ -261,6 +266,7 @@ def msa_decode_with_kvcache(
             max_seqlen_k=max_seqlen_k,
             k_scale=k_scale,
             v_scale=v_scale,
+            score_out=score_out,
         )
 
 
