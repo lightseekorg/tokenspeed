@@ -866,7 +866,7 @@ def _topk_with_padding(logits: torch.Tensor, topk: int) -> torch.Tensor:
     logits = logits.contiguous()
     if cols >= _RADIX_TOPK_MIN_COLS:
         return _radix_topk(logits, topk)
-    out = torch.full((rows, topk), -1, dtype=torch.int32, device=logits.device)
+    out = torch.empty((rows, topk), dtype=torch.int32, device=logits.device)
     n_cols_padded = _next_power_of_2(max(cols, topk))
     block_n = min(n_cols_padded, 2048)
     block_n = max(block_n, topk)
