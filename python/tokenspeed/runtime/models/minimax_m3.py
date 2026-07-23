@@ -28,6 +28,7 @@ from collections.abc import Iterable, Sequence
 import torch
 from tokenspeed_kernel.ops.activation.triton import swiglu_oai
 from tokenspeed_kernel.ops.layernorm.triton import qk_rmsnorm
+from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
 from torch import nn
 from transformers import MiniMaxM3VLTextConfig
 
@@ -80,6 +81,7 @@ from tokenspeed.runtime.multimodal.inputs import (
 from tokenspeed.runtime.utils import add_prefix, make_layers
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import global_server_args_dict
+from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -231,36 +233,51 @@ class MiniMaxM3SparseMoeBlock(nn.Module):
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
     ) -> torch.Tensor:
-        num_tokens, hidden_size = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_size)
-        router_logits, _ = self.gate(hidden_states.to(torch.float32))
+        num_tokens = hidden_states.size(0)
 
-        if hidden_states.shape[0] == 0:
-            topk_output = self.topk.empty_topk_output(
-                hidden_states.device,
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-            )
-        else:
-            topk_output = self.topk(hidden_states, router_logits)
-
-        shared_output = None
         with self.stream_fork.scope(enable=get_is_capture_mode()) as fork:
-            # Routed path (critical, comm-bubbled) on the main stream; the
-            # dense shared expert fills its bubbles on the aux stream.
+            router_logits, _ = self.gate(hidden_states.to(torch.float32))
+
+            if num_tokens > 0:
+                topk_output = self.topk(hidden_states, router_logits)
+            else:
+                topk_output = self.topk.empty_topk_output(
+                    hidden_states.device,
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                )
+
+            deferred_finalize = self.experts.supports_deferred_finalize
             routed_output = self.experts(
                 hidden_states=hidden_states,
                 topk_output=topk_output,
                 num_global_tokens=num_global_tokens,
                 max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+                do_finalize=not deferred_finalize,
             )
+
+            shared_output = None
             with fork.branch():
-                if hidden_states.shape[0] > 0:
+                if num_tokens > 0:
                     shared_output = self.shared_experts(hidden_states)
-        output = (
-            routed_output if shared_output is None else routed_output + shared_output
-        )
-        return output.view(num_tokens, hidden_size)
+
+        if deferred_finalize:
+            gemm2_out, expert_weights, expanded_idx = routed_output
+            output = moe_finalize_fuse_shared(
+                gemm2_out,
+                expanded_idx,
+                expert_weights,
+                shared_output,
+                top_k=self.topk.topk_config.top_k,
+                enable_pdl=pdl_enabled(),
+            )
+        else:
+            output = (
+                routed_output
+                if shared_output is None
+                else routed_output + shared_output
+            )
+        return output
 
 
 class MiniMaxM3Indexer(nn.Module):
