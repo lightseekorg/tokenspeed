@@ -25,6 +25,12 @@ itself.
 Loading is **fully explicit** — importing `tokenspeed_kernel` or
 `tokenspeed_kernel.plugins` does **not** trigger discovery on its own.
 
+Plugins use the same string-based registration API whether or not an operation
+has migrated to an `OperationSchema`. For a schema-backed family/mode pair,
+registration also validates the claimed format signatures, trait dictionary,
+and implementation callable against that operation's contract. Validation
+errors are reported while the plugin loads, before the registry is modified.
+
 ## Example plugin
 
 A minimal out-of-tree package that contributes a custom decode-attention
@@ -95,6 +101,20 @@ discover_plugins()
 print(list_plugins())  # -> [PluginInfo(name='my_plugin', ...)]
 ```
 
+Schema-backed operations expose their canonical callable signature through the
+contract catalog:
+
+```python
+from tokenspeed_kernel.contracts import get_operation_schema
+
+schema = get_operation_schema("attention", "mha_prefill")
+print(schema.signature)
+```
+
+Omitting an allowed trait from a registration means the kernel claims support
+for every requested value of that trait. Specialized kernels should declare
+their actual constraints.
+
 ## Host-application integration
 
 Engines and other long-running hosts should call `discover_plugins()`
@@ -163,10 +183,11 @@ for info in list_plugins():
 
 ## Selection contract
 
-- Priority is an integer in `[0, 20)`. Higher wins. The reference
-  implementation lives at `0`. Built-in optimized kernels typically sit at
-  `10`–`18`. Plugin authors who want to override a built-in should choose
-  a value strictly higher than the built-in they replace.
+- Priority is an integer in `[0, 20)`. Higher wins. Legacy selectable reference
+  kernels live at `0`, while an `OperationSchema` semantic reference is not a
+  registry entry and has no priority. Built-in optimized kernels typically sit
+  at `10`–`18`. Plugin authors who want to override a built-in should choose a
+  value strictly higher than the built-in they replace.
 - `discover_plugins()` walks entry points in alphabetical order by
   entry-point name. When two registrations land at the same priority for
   the same `(family, mode)`, the warning is emitted and selection becomes

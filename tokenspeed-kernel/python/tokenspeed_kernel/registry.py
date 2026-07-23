@@ -183,6 +183,7 @@ class KernelSpec:
     weight_preprocessor: Callable | None = None
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "traits", dict(self.traits))
         object.__setattr__(
             self,
             "weight_preprocessor",
@@ -273,6 +274,12 @@ class KernelRegistry:
 
     def register(self, spec: KernelSpec, impl: Callable) -> None:
         """Register a kernel specification and its implementation."""
+        from tokenspeed_kernel.operation import OperationRegistry
+
+        schema = OperationRegistry.get().find(spec.family, spec.mode)
+        if schema is not None:
+            schema.validate_registration(spec, impl)
+
         if spec.name in self._by_name:
             # Allow re-registration (plugin override)
             self._unregister(spec.name)
