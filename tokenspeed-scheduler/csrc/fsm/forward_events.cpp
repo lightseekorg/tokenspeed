@@ -214,17 +214,18 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()
     auto req_pool_index = std::make_unique<ReqPoolIndex>(req_pool_allocator_->Allocate());
 
     std::vector<BlockTable> tables(coordinator_->NumGroups());
-    coordinator_->ClaimCommonPrefix(tables, flat_hit_);
+    const std::int32_t device_hit_tokens = flat_hit_.num_common_tokens;
+    const std::int32_t hit_tokens = std::max(device_hit_tokens, flat_host_.num_common_tokens);
+    coordinator_->ClaimCommonPrefix(tables, std::move(flat_hit_));
     // Extension appends between claim and fresh acquire so slots stay
     // [device hit | host ext | new pages]; ext pages are FULL, composing with the gate.
-    flat_load_pairs_ = LoadHostExtension(*coordinator_, tables, flat_host_);
+    flat_load_pairs_ = LoadHostExtension(*coordinator_, tables, std::move(flat_host_));
     // Host boundary is absolute (floor included); default-constructed (no host pool) it is 0.
-    const std::int32_t hit_tokens = std::max(flat_hit_.num_common_tokens, flat_host_.num_common_tokens);
     // Loaded pages become device-cached now (SWA holes skipped by the IsNull guard); the sink
     // re-collects them and the drain dedupes against the host index. The extension ends at the
     // page-aligned hit boundary, so the state group's final page is exactly the loaded snapshot.
     coordinator_->CacheFullBlocks(tables, flat_ext_hashes_,
-                                  /*first_slot=*/flat_hit_.num_common_tokens / state.GetPageSize(),
+                                  /*first_slot=*/device_hit_tokens / state.GetPageSize(),
                                   /*end_tokens=*/hit_tokens);
     // Role kD cannot defer its decode reserve until RemotePrefillDone: the
     // remote transfer may complete after other requests consume the pool.

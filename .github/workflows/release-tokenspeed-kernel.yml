@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: "Git tag prefix to create or update. Defaults to tokenspeed-kernel-v<version>."
+        description: "Git tag prefix to create or update. Defaults to tokenspeed-kernel-v<version>; non-release refs include the date and source SHA."
         required: false
         type: string
       version_date:
@@ -29,12 +29,12 @@ on:
           - cu130
           - cu129
       prerelease:
-        description: "Mark the GitHub release as a prerelease."
+        description: "Mark a stable GitHub release as a prerelease. Development versions are always prereleases."
         required: false
         default: false
         type: boolean
       publish_github:
-        description: "Publish distributions to lightseekorg/whl."
+        description: "Publish stable or dated development distributions to lightseekorg/whl."
         required: false
         default: false
         type: boolean
@@ -48,8 +48,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   metadata:
@@ -59,6 +59,7 @@ jobs:
       version: ${{ steps.metadata.outputs.version }}
       version_date: ${{ steps.metadata.outputs.version_date }}
       tag_name: ${{ steps.metadata.outputs.tag_name }}
+      cuda_matrix: ${{ steps.metadata.outputs.cuda_matrix }}
     steps:
       - name: Validate publish inputs
         if: inputs.publish_pypi && inputs.cuda_variant != 'all' && inputs.cuda_variant != inputs.pypi_cuda_variant
@@ -80,6 +81,7 @@ jobs:
       - name: Resolve release metadata
         id: metadata
         env:
+          CUDA_VARIANT: ${{ inputs.cuda_variant }}
           PUBLISH_PYPI: ${{ inputs.publish_pypi }}
         run: |
           version_date="${{ inputs.version_date }}"
@@ -106,9 +108,29 @@ jobs:
             tag_name="tokenspeed-kernel-v${version}"
           fi
 
+          cuda_cu130='{"variant":"cu130","package_version":"13-0","torch_index_url":"https://download.pytorch.org/whl/cu130"}'
+          cuda_cu129='{"variant":"cu129","package_version":"12-9","torch_index_url":"https://download.pytorch.org/whl/cu129"}'
+
+          case "$CUDA_VARIANT" in
+            all)
+              cuda_matrix="[${cuda_cu130},${cuda_cu129}]"
+              ;;
+            cu130)
+              cuda_matrix="[${cuda_cu130}]"
+              ;;
+            cu129)
+              cuda_matrix="[${cuda_cu129}]"
+              ;;
+            *)
+              echo "Unsupported CUDA variant: ${CUDA_VARIANT}" >&2
+              exit 1
+              ;;
+          esac
+
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "version_date=${version_date}" >> "$GITHUB_OUTPUT"
           echo "tag_name=${tag_name}" >> "$GITHUB_OUTPUT"
+          echo "cuda_matrix=${cuda_matrix}" >> "$GITHUB_OUTPUT"
           echo "Release version: ${version}"
           echo "Release tag: ${tag_name}"
 
@@ -137,20 +159,12 @@ jobs:
             tag: cp312-cp312
           - version: "3.13"
             tag: cp313-cp313
-        cuda:
-          - variant: cu130
-            package_version: "13-0"
-            torch_index_url: https://download.pytorch.org/whl/cu130
-          - variant: cu129
-            package_version: "12-9"
-            torch_index_url: https://download.pytorch.org/whl/cu129
+        cuda: ${{ fromJSON(needs.metadata.outputs.cuda_matrix) }}
     steps:
       - name: Checkout repository
-        if: inputs.cuda_variant == 'all' || inputs.cuda_variant == matrix.cuda.variant
         uses: actions/checkout@v4
 
       - name: Build manylinux CUDA image
-        if: inputs.cuda_variant == 'all' || inputs.cuda_variant == matrix.cuda.variant
         run: |
           cat > Dockerfile.tokenspeed-kernel-release <<'DOCKERFILE'
           ARG MANYLINUX_ARCH=x86_64
@@ -195,7 +209,6 @@ jobs:
             -t tokenspeed-kernel-release:${{ matrix.cuda.variant }}-${{ matrix.arch.name }} .
 
       - name: Build wheel
-        if: inputs.cuda_variant == 'all' || inputs.cuda_variant == matrix.cuda.variant
         run: |
           mkdir -p dist
           docker run --rm \
@@ -216,7 +229,7 @@ jobs:
               cd /workspace/tokenspeed-kernel/python
 
               "${PYBIN}/python" -m pip install --upgrade \
-                pip "setuptools<82" wheel build twine packaging "apache-tvm-ffi>=0.1.5,<=0.1.11"
+                pip "setuptools<82" wheel build twine packaging "apache-tvm-ffi==0.1.12"
               "${PYBIN}/python" -m pip install --no-cache-dir "torch==2.11.0" --index-url "${TORCH_INDEX_URL}"
 
               rm -rf build *.egg-info
@@ -236,7 +249,6 @@ jobs:
             '
 
       - name: Upload wheel
-        if: inputs.cuda_variant == 'all' || inputs.cuda_variant == matrix.cuda.variant
         uses: actions/upload-artifact@v4
         with:
           name: tokenspeed-kernel-wheel-${{ matrix.cuda.variant }}-${{ matrix.arch.name }}-py${{ matrix.python.version }}
@@ -258,7 +270,7 @@ jobs:
       - name: Build source distribution
         run: |
           python -m pip install --upgrade \
-            build twine "setuptools<82" wheel packaging "apache-tvm-ffi>=0.1.5,<=0.1.11"
+            build twine "setuptools<82" wheel packaging "apache-tvm-ffi==0.1.12"
           cd tokenspeed-kernel/python
           TOKENSPEED_KERNEL_BACKEND=cuda \
           TOKENSPEED_KERNEL_VERSION_DATE=${{ needs.metadata.outputs.version_date }} \
@@ -300,7 +312,7 @@ jobs:
           SOURCE_SHA: ${{ github.sha }}
         run: |
           prerelease_args=()
-          if [ "$PRERELEASE" = "true" ]; then
+          if [ "$PRERELEASE" = "true" ] || [[ "$VERSION" == *.dev* ]] || [[ "$VERSION" == *+* ]]; then
             prerelease_args+=(--prerelease)
           fi
 
@@ -322,6 +334,11 @@ jobs:
             fi
 
             if gh release view "$release_tag" --repo "$RELEASE_REPOSITORY" >/dev/null 2>&1; then
+              if [ "${#prerelease_args[@]}" -gt 0 ]; then
+                gh release edit "$release_tag" \
+                  --repo "$RELEASE_REPOSITORY" \
+                  --prerelease
+              fi
               gh release upload "$release_tag" "${assets[@]}" \
                 --repo "$RELEASE_REPOSITORY" \
                 --clobber

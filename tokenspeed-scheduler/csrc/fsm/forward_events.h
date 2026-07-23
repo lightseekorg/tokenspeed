@@ -81,8 +81,8 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
                                    // Admission-layer prefix match, threaded from the scheduler;
                                    // default {} is the zero hit for call sites that never match.
                                    CoordinatorMatch flat_hit = {},
-                                   // Host-tier match above flat_hit's boundary (read-only; the
-                                   // load emission pins both sides when it builds the ticket).
+                                   // Host-tier match above flat_hit's boundary; real pages are
+                                   // already pinned by its BlockRefs.
                                    CoordinatorMatch flat_host = {}, std::vector<std::string> flat_ext_hashes = {}
 #endif
                                    )
@@ -118,7 +118,7 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
 
 #if TOKENSPEED_FLAT_KVCACHE
     // Post-apply channel for the scheduler's LoadBack emission (transition fills the pairs).
-    std::vector<std::pair<CacheBlock*, CacheBlock*>> TakeFlatLoadPairs() { return std::exchange(flat_load_pairs_, {}); }
+    std::vector<BlockTransfer> TakeFlatLoadPairs() { return std::exchange(flat_load_pairs_, {}); }
 #endif
 
 private:
@@ -139,7 +139,7 @@ private:
     CoordinatorMatch flat_hit_{};
     CoordinatorMatch flat_host_{};
     std::vector<std::string> flat_ext_hashes_{};
-    std::vector<std::pair<CacheBlock*, CacheBlock*>> flat_load_pairs_{};
+    std::vector<BlockTransfer> flat_load_pairs_{};
 #endif
 };
 

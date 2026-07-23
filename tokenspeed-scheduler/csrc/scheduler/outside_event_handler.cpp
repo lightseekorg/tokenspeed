@@ -34,15 +34,11 @@ namespace tokenspeed {
 #if TOKENSPEED_FLAT_KVCACHE
 namespace {
 
-// Batched ref surrender in ticket order: after an abort these pins are the LAST refs, and
-// FreeBlocks recycles the batch tail-first (vector dtor order is impl-defined, so no per-ref dtors).
-void FreeAll(BlockPool& pool, std::vector<BlockRef>&& refs) {
-    std::vector<CacheBlock*> batch;
-    batch.reserve(refs.size());
-    for (BlockRef& ref : refs) {
-        batch.push_back(ref.Release());
+// Release explicitly in reverse; vector destruction order is not our eviction policy.
+void FreeAll(std::vector<BlockRef>&& refs) {
+    for (auto it = refs.rbegin(); it != refs.rend(); ++it) {
+        it->reset();
     }
-    pool.FreeBlocks(batch);
 }
 
 }  // namespace
@@ -204,17 +200,15 @@ void Scheduler::handleEvent(const cache::WriteBackDone& event) {
         // Publish-at-ack: hashing the host block makes it hittable; either way it returns to the
         // host free list (hash-intact = reusable, unhashed = plain recycling). Batched frees in
         // ticket order keep both pools' recycling order deterministic.
-        std::vector<CacheBlock*> device_batch;
-        std::vector<CacheBlock*> host_batch;
         for (FlatStoreTicket& t : tickets) {
             if (event.success) {
-                flat_host_pool_.CacheFullBlock(t.host_block.Get(), t.key);
+                flat_host_pool_.CacheFullBlock(t.host_block, t.key);
             }
-            device_batch.push_back(t.device_block.Release());
-            host_batch.push_back(t.host_block.Release());
         }
-        block_pool_.FreeBlocks(device_batch);
-        flat_host_pool_.FreeBlocks(host_batch);
+        for (auto it = tickets.rbegin(); it != tickets.rend(); ++it) {
+            it->device_block.reset();
+            it->host_block.reset();
+        }
         return;
     }
 #endif
@@ -243,8 +237,8 @@ void Scheduler::handleEvent(const cache::LoadBackDone& event) {
         // The loaded device pages are already claimed as computed KV: a failed copy
         // means the request would decode over garbage bytes -- fail loud.
         _assert(event.success, "flat host loadback failed: host bytes integrity");
-        FreeAll(flat_host_pool_, std::move(flat_it->second.host_pins));
-        FreeAll(block_pool_, std::move(flat_it->second.device_blocks));
+        FreeAll(std::move(flat_it->second.host_pins));
+        FreeAll(std::move(flat_it->second.device_blocks));
         flat_load_ops_.erase(flat_it);
         return;
     }

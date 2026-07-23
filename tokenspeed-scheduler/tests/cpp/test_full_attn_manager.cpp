@@ -74,56 +74,61 @@ TEST(FullAttnManagerTest, MatchStopsAtFirstMiss) {
     const std::string k1 = RealKey({5, 6, 7, 8}, 0);
     const std::string k2 = RealKey({9, 9, 9, 9}, 0);
 
-    auto a = pool.AllocateBlocks(1);
-    pool.CacheFullBlock(a.front(), k0);
-    auto b = pool.AllocateBlocks(1);
-    pool.CacheFullBlock(b.front(), k1);
-    pool.FreeBlocks(a);
-    pool.FreeBlocks(b);
+    BlockRef a = pool.AcquireBlock();
+    const std::int32_t a_id = a->BlockId();
+    pool.CacheFullBlock(a, k0);
+    BlockRef b = pool.AcquireBlock();
+    const std::int32_t b_id = b->BlockId();
+    pool.CacheFullBlock(b, k1);
+    a.reset();
+    b.reset();
 
     std::vector<std::string> keys{k0, k1, k2};
     PrefixMatch m = mgr.Match(pool, keys, 0, 3);
     EXPECT_EQ(m.num_hit_blocks, 2);
     ASSERT_EQ(m.blocks.size(), 2u);
-    EXPECT_EQ(m.blocks[0]->BlockId(), a.front()->BlockId());
-    EXPECT_EQ(m.blocks[1]->BlockId(), b.front()->BlockId());
+    EXPECT_EQ(m.blocks[0]->BlockId(), a_id);
+    EXPECT_EQ(m.blocks[1]->BlockId(), b_id);
 }
 
-TEST(FullAttnManagerTest, MatchDoesNotChangeRefCount) {
+TEST(FullAttnManagerTest, MatchPinsUntilResultDies) {
     BlockPool pool(8);
     FullAttnManager mgr(4);
     const std::string k0 = RealKey({1, 2, 3, 4}, 0);
-    auto a = pool.AllocateBlocks(1);
-    pool.CacheFullBlock(a.front(), k0);
-    pool.FreeBlocks(a);
-    EXPECT_EQ(a.front()->RefCount(), 0);
+    BlockRef a = pool.AcquireBlock();
+    pool.CacheFullBlock(a, k0);
+    a.reset();
+    EXPECT_EQ(pool.NumFreeBlocks(), 7);
 
     std::vector<std::string> keys{k0};
     PrefixMatch m = mgr.Match(pool, keys, 0, 1);
     EXPECT_EQ(m.num_hit_blocks, 1);
-    EXPECT_EQ(a.front()->RefCount(), 0);  // read-only: still zero
-    EXPECT_EQ(pool.NumFreeBlocks(), 7);   // still free
+    EXPECT_EQ(m.blocks.front().use_count(), 1);
+    EXPECT_EQ(pool.NumFreeBlocks(), 6);
+    m = {};
+    EXPECT_EQ(pool.NumFreeBlocks(), 7);
 }
 
 TEST(FullAttnManagerTest, ClaimHitBlocksClaimsAndAppends) {
     BlockPool pool(8);
     FullAttnManager mgr(4);
     const std::string k0 = RealKey({1, 2, 3, 4}, 0);
-    auto a = pool.AllocateBlocks(1);
-    pool.CacheFullBlock(a.front(), k0);
-    pool.FreeBlocks(a);
+    BlockRef a = pool.AcquireBlock();
+    const std::int32_t id = a->BlockId();
+    pool.CacheFullBlock(a, k0);
+    a.reset();
     EXPECT_EQ(pool.NumFreeBlocks(), 7);
 
     std::vector<std::string> keys{k0};
     PrefixMatch m = mgr.Match(pool, keys, 0, 1);
     BlockTable table;
-    mgr.ClaimHitBlocks(pool, table, m);
+    mgr.ClaimHitBlocks(table, std::move(m));
 
     EXPECT_EQ(table.NumBlocks(), 1);
-    EXPECT_EQ(table.Blocks()[0]->BlockId(), a.front()->BlockId());
-    EXPECT_EQ(a.front()->RefCount(), 1);        // claimed
-    EXPECT_EQ(pool.NumFreeBlocks(), 6);         // pulled out of free list
-    EXPECT_EQ(table.TailAvailableTokens(), 0);  // hit pages are full
+    EXPECT_EQ(table.Blocks()[0]->BlockId(), id);
+    EXPECT_EQ(table.Blocks()[0].use_count(), 1);  // match ownership transferred
+    EXPECT_EQ(pool.NumFreeBlocks(), 6);           // pulled out of free list
+    EXPECT_EQ(table.TailAvailableTokens(), 0);    // hit pages are full
 }
 
 TEST(FullAttnManagerTest, ClaimNoHitsIsNoOp) {
@@ -131,7 +136,7 @@ TEST(FullAttnManagerTest, ClaimNoHitsIsNoOp) {
     FullAttnManager mgr(4);
     BlockTable table;
     PrefixMatch empty;
-    mgr.ClaimHitBlocks(pool, table, empty);
+    mgr.ClaimHitBlocks(table, std::move(empty));
     EXPECT_EQ(table.NumBlocks(), 0);
     EXPECT_EQ(pool.NumFreeBlocks(), 7);
 }
@@ -265,7 +270,7 @@ TEST(FullAttnManagerTest, FreeReturnsPagesAndClearsTable) {
     ASSERT_TRUE(mgr.Acquire(pool, table, 8));  // 2 pages
     EXPECT_EQ(pool.NumFreeBlocks(), 5);
 
-    mgr.Free(pool, table);
+    mgr.Free(table);
     EXPECT_EQ(table.NumBlocks(), 0);
     EXPECT_EQ(table.TailAvailableTokens(), 0);
     EXPECT_TRUE(table.Blocks().empty());
@@ -280,7 +285,7 @@ TEST(FullAttnManagerTest, FreedCachedPageStaysPrefixReusable) {
     BlockTable a;
     ASSERT_TRUE(mgr.Acquire(pool, a, 4));
     mgr.CacheFullBlocks(pool, a, std::vector<std::string>{k0});
-    mgr.Free(pool, a);
+    mgr.Free(a);
 
     std::vector<std::string> keys{k0};
     PrefixMatch m = mgr.Match(pool, keys, 0, 1);
@@ -299,10 +304,10 @@ TEST(FullAttnManagerTest, EndToEndTwoRequestsSharePrefix) {
         PrefixMatch m = mgr.Match(pool, keys, 0, 2);
         EXPECT_EQ(m.num_hit_blocks, 0);
         BlockTable a;
-        mgr.ClaimHitBlocks(pool, a, m);
+        mgr.ClaimHitBlocks(a, std::move(m));
         ASSERT_TRUE(mgr.Acquire(pool, a, 8));
         mgr.CacheFullBlocks(pool, a, std::vector<std::string>{k0, k1});
-        mgr.Free(pool, a);
+        mgr.Free(a);
     }
 
     // Request B: shares the prefix.
@@ -311,12 +316,12 @@ TEST(FullAttnManagerTest, EndToEndTwoRequestsSharePrefix) {
         PrefixMatch m = mgr.Match(pool, keys, 0, 2);
         EXPECT_EQ(m.num_hit_blocks, 2);
         BlockTable b;
-        mgr.ClaimHitBlocks(pool, b, m);
+        mgr.ClaimHitBlocks(b, std::move(m));
         EXPECT_EQ(b.NumBlocks(), 2);
         std::int32_t free_before = pool.NumFreeBlocks();
         ASSERT_TRUE(mgr.Acquire(pool, b, 0));  // no new tokens beyond the hit prefix
         EXPECT_EQ(pool.NumFreeBlocks(), free_before);
-        mgr.Free(pool, b);
+        mgr.Free(b);
     }
 }
 
@@ -343,14 +348,14 @@ TEST(FullAttnManagerTest, ClaimThenAcquireStartsFreshPage) {
     BlockPool pool(8);
     FullAttnManager mgr(4);
     const std::string k0 = RealKey({1, 2, 3, 4}, 0);
-    auto a = pool.AllocateBlocks(1);
-    pool.CacheFullBlock(a.front(), k0);
-    pool.FreeBlocks(a);
+    BlockRef a = pool.AcquireBlock();
+    pool.CacheFullBlock(a, k0);
+    a.reset();
 
     std::vector<std::string> keys{k0};
     PrefixMatch m = mgr.Match(pool, keys, 0, 1);
     BlockTable table;
-    mgr.ClaimHitBlocks(pool, table, m);
+    mgr.ClaimHitBlocks(table, std::move(m));
     ASSERT_EQ(table.NumBlocks(), 1);
     ASSERT_EQ(table.TailAvailableTokens(), 0);
 
@@ -375,7 +380,7 @@ TEST(FullAttnManagerTest, ClaimHitBlocksOnNonEmptyTableAsserts) {
     BlockTable table;
     ASSERT_TRUE(mgr.Acquire(pool, table, 4));  // table now non-empty
     PrefixMatch empty;
-    EXPECT_THROW(mgr.ClaimHitBlocks(pool, table, empty), std::runtime_error);
+    EXPECT_THROW(mgr.ClaimHitBlocks(table, std::move(empty)), std::runtime_error);
 }
 
 // The chain links each page's key to the prior page's hash: an identical second
