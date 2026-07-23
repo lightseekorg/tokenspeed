@@ -36,6 +36,7 @@
 #include "fsm/forward_states.h"
 #include "resource/types.h"
 #include "resource/radix_tree/node_range.h"
+#include "resource/kv_prefix_cache/kv_prefix_cache.h"
 #include "resource/hybrid_prefix_cache/hybrid_prefix_cache.h"
 #include "resource/allocator/mamba_chunk_allocator.h"
 #include "resource/allocator/local_mamba_allocator.h"
@@ -61,7 +62,8 @@ void InsertHybridCache(HybridPrefixCache* hybrid_prefix_cache,
                        const std::vector<std::span<const std::int32_t>>& full_paged_tokens,
                        std::unique_ptr<DeviceNodeRef>& device_node_ref, LocalKVAllocator* local_kv_allocator,
                        LocalMambaAllocator* local_mamba_allocator, std::int32_t chunk_begin, std::int32_t chunk_size,
-                       std::int32_t page_size, const std::vector<std::int32_t>* prefix_pages_override = nullptr);
+                       std::int32_t page_size, const std::vector<std::int32_t>* prefix_pages_override = nullptr,
+                       std::int32_t lora_id = kLoraNone);
 
 struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefillFirstChunkEvent> {
     using InvalidTransitionHandler<SchedulePrefillFirstChunkEvent>::operator();
@@ -146,20 +148,18 @@ private:
 struct SchedulePrefillEvent : InvalidTransitionHandler<SchedulePrefillEvent> {
     using InvalidTransitionHandler<SchedulePrefillEvent>::operator();
     SchedulePrefillEvent(std::int32_t tokens_this_round, std::int32_t reserve_num_tokens_in_next_schedule_event,
-                         HybridPrefixCache* hybrid_prefix_cache = nullptr
+                         HybridPrefixCache* hybrid_prefix_cache = nullptr,
 #if TOKENSPEED_FLAT_KVCACHE
-                         ,
-                         KvCacheCoordinator* coordinator = nullptr
+                         KvCacheCoordinator* coordinator = nullptr,
 #endif
-                         )
+                         std::int32_t lora_id = kLoraNone)
         : tokens_this_round_(tokens_this_round),
           reserve_num_tokens_in_next_schedule_event_(reserve_num_tokens_in_next_schedule_event),
-          hybrid_prefix_cache_(hybrid_prefix_cache)
+          hybrid_prefix_cache_(hybrid_prefix_cache),
 #if TOKENSPEED_FLAT_KVCACHE
-          ,
-          coordinator_(coordinator)
+          coordinator_(coordinator),
 #endif
-    {
+          lora_id_(lora_id) {
     }
 
     // Returns PrefillDone (last chunk) or Prefilling (more chunks remain).
@@ -172,24 +172,23 @@ private:
 #if TOKENSPEED_FLAT_KVCACHE
     KvCacheCoordinator* coordinator_{};
 #endif
+    std::int32_t lora_id_{kLoraNone};
 };
 
 struct ScheduleDecodeEvent : InvalidTransitionHandler<ScheduleDecodeEvent> {
     using InvalidTransitionHandler<ScheduleDecodeEvent>::operator();
 
-    ScheduleDecodeEvent(std::int32_t decode_input_tokens, HybridPrefixCache* hybrid_prefix_cache = nullptr
+    ScheduleDecodeEvent(std::int32_t decode_input_tokens, HybridPrefixCache* hybrid_prefix_cache = nullptr,
 #if TOKENSPEED_FLAT_KVCACHE
-                        ,
-                        KvCacheCoordinator* coordinator = nullptr
+                        KvCacheCoordinator* coordinator = nullptr,
 #endif
-                        )
+                        std::int32_t lora_id = kLoraNone)
         : decode_input_tokens_(decode_input_tokens),
-          hybrid_prefix_cache_(hybrid_prefix_cache)
+          hybrid_prefix_cache_(hybrid_prefix_cache),
 #if TOKENSPEED_FLAT_KVCACHE
-          ,
-          coordinator_(coordinator)
+          coordinator_(coordinator),
 #endif
-    {
+          lora_id_(lora_id) {
     }
 
     Decoding operator()(PrefillDone&& state);
@@ -201,6 +200,7 @@ private:
 #if TOKENSPEED_FLAT_KVCACHE
     KvCacheCoordinator* coordinator_{};
 #endif
+    std::int32_t lora_id_{kLoraNone};
 };
 
 struct ScheduleDecodeFromRetractedEvent : InvalidTransitionHandler<ScheduleDecodeFromRetractedEvent> {
@@ -243,22 +243,20 @@ struct FinishEvent : InvalidTransitionHandler<FinishEvent> {
     using InvalidTransitionHandler<FinishEvent>::operator();
     explicit FinishEvent(KVPrefixCache* kv_prefix_cache, PageAllocator* host_allocator,
                          std::vector<std::string> page_hashes = {}, bool disable_l2_cache = false,
-                         HybridPrefixCache* hybrid_prefix_cache = nullptr
+                         HybridPrefixCache* hybrid_prefix_cache = nullptr,
 #if TOKENSPEED_FLAT_KVCACHE
-                         ,
-                         KvCacheCoordinator* coordinator = nullptr
+                         KvCacheCoordinator* coordinator = nullptr,
 #endif
-                         )
+                         std::int32_t lora_id = kLoraNone)
         : kv_prefix_cache_(kv_prefix_cache),
           page_hashes_(std::move(page_hashes)),
           host_allocator_(host_allocator),
           disable_l2_cache_(disable_l2_cache),
-          hybrid_prefix_cache_(hybrid_prefix_cache)
+          hybrid_prefix_cache_(hybrid_prefix_cache),
 #if TOKENSPEED_FLAT_KVCACHE
-          ,
-          coordinator_(coordinator)
+          coordinator_(coordinator),
 #endif
-    {
+          lora_id_(lora_id) {
     }
 
     // Returns Draining (needs device→host writeback) or Finished.
@@ -280,6 +278,7 @@ private:
 #if TOKENSPEED_FLAT_KVCACHE
     KvCacheCoordinator* coordinator_{};
 #endif
+    std::int32_t lora_id_{kLoraNone};
 
     template <typename ForwardStateT>
     std::variant<Draining, Finished> apply(ForwardStateT&& state);
@@ -405,11 +404,13 @@ struct ExtendResultEvent : InvalidTransitionHandler<ExtendResultEvent> {
     ExtendResultEvent() = delete;
 
     ExtendResultEvent(std::string request_id, std::vector<std::int32_t> result_tokens,
-                      HybridPrefixCache* hybrid_prefix_cache = nullptr, std::int32_t protected_tail_tokens = 0)
+                      HybridPrefixCache* hybrid_prefix_cache = nullptr, std::int32_t protected_tail_tokens = 0,
+                      std::int32_t lora_id = kLoraNone)
         : request_id_(std::move(request_id)),
           result_tokens_(std::move(result_tokens)),
           hybrid_prefix_cache_(hybrid_prefix_cache),
-          protected_tail_tokens_(protected_tail_tokens) {}
+          protected_tail_tokens_(protected_tail_tokens),
+          lora_id_(lora_id) {}
 
 public:
     template <typename S>
@@ -473,7 +474,7 @@ public:
         if (new_page_count > 0 && local_kv_allocator->PageCount() >= new_page_count) {
             InsertHybridCache(hybrid_prefix_cache_, full_paged_tokens, device_node_ref, local_kv_allocator.get(),
                               local_mamba_allocator.get(), chunk_begin,
-                              static_cast<std::int32_t>(result_tokens_.size()), page_size, &prefix_pages);
+                              static_cast<std::int32_t>(result_tokens_.size()), page_size, &prefix_pages, lora_id_);
             hybrid_prefix_cache_->CommitChunk(request_id_, device_node_ref->Node());
         }
         hybrid_prefix_cache_->RewindRequest(request_id_, accepted_token_size, protected_tail_tokens_);
@@ -497,6 +498,7 @@ private:
     std::vector<std::int32_t> result_tokens_;
     HybridPrefixCache* hybrid_prefix_cache_{};
     std::int32_t protected_tail_tokens_{};
+    std::int32_t lora_id_{kLoraNone};
 };
 
 }  // namespace tokenspeed::fsm

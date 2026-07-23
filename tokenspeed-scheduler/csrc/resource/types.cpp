@@ -25,11 +25,11 @@
 namespace tokenspeed {
 
 std::int32_t MatchResult::Device::DepthInPage() const {
-    return last_node->DepthInPage(page_size);
+    return last_node->DepthInPage(page_size) - namespace_depth_offset;
 }
 
 std::int32_t MatchResult::Host::DepthInPage() const {
-    return last_node->DepthInPage(page_size);
+    return last_node->DepthInPage(page_size) - namespace_depth_offset;
 }
 
 template <ResourceType RType>

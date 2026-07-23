@@ -69,6 +69,9 @@ public:
 
     void Advance(const ExecutionEvent& event);
     std::vector<KvCacheEvent> DrainKvEvents();
+    // Evict all KV pages cached under the given LoRA adapter's namespace and
+    // remove its virtual root from the prefix tree. Call on adapter unload.
+    void EvictLoraNamespace(std::int32_t lora_id);
 
     std::size_t WaitingSize() const;
     std::size_t DecodingSize() const;
