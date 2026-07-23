@@ -121,6 +121,25 @@ class TestFSMTransitions:
         assert s.prefilling_size() == 0
         assert s.decoding_size() == 0
 
+    def test_pending_prefill_tracks_only_prefill_candidates(self):
+        s = Scheduler(make_config(max_scheduled_tokens=8))
+        assert not s.has_pending_prefill()
+
+        submit(s, "r0", list(range(16)))
+        assert s.has_pending_prefill()
+
+        s.next_execution_plan()  # Submitted -> Prefilling.
+        assert s.has_pending_prefill()
+
+        s.next_execution_plan()  # Prefilling -> PrefillDone.
+        assert not s.has_pending_prefill()
+
+        s.next_execution_plan()  # PrefillDone -> Decoding.
+        assert not s.has_pending_prefill()
+
+        submit(s, "r1", list(range(8)))
+        assert s.has_pending_prefill()
+
     def test_first_plan_moves_submitted_to_prefilling(self):
         """After first next_execution_plan, request leaves Submitted (waiting → 0)."""
         s = Scheduler(make_config())
@@ -277,6 +296,7 @@ class TestPrefillFirst:
 
         plan = s.next_execution_plan()  # Should schedule r1 prefill, not decode r0
         assert s.waiting_size() == 0  # r1 moved out of Submitted
+        assert len(plan.forward) == 1
         assert plan.forward[0].num_extends() > 0
         assert plan.forward[0].request_ids == ["r1"]
 
@@ -292,13 +312,21 @@ class TestPrefillFirst:
 
         submit(s, "r1", list(range(8)))
         plan = s.next_execution_plan()
-        op = plan.forward[0]
+        assert len(plan.forward) == 2
+        decode_op, prefill_op = plan.forward
 
-        assert op.request_ids == ["r1", "r0"]
-        assert op.num_extends() == 1
-        assert len(op.input_ids) == sum(op.input_lengths[: op.num_extends()])
-        assert len(op.input_ids) + len(op.decode_input_ids) == sum(op.input_lengths)
-        assert op.sizes == [1, 0]
+        assert decode_op.request_ids == ["r0"]
+        assert decode_op.num_extends() == 0
+        assert decode_op.input_lengths == [1]
+        assert decode_op.decode_input_ids == [-1]
+        assert decode_op.sizes == [0]
+
+        assert prefill_op.request_ids == ["r1"]
+        assert prefill_op.num_extends() == 1
+        assert prefill_op.input_lengths == [8]
+        assert prefill_op.input_ids == list(range(8))
+        assert prefill_op.decode_input_ids == []
+        assert prefill_op.sizes == [1]
 
     def test_mixed_prefill_decode_decode_not_starved_by_long_prefill(self):
         """Decode-first priority: active decode is scheduled even when a long prefill would consume the full budget."""
@@ -313,13 +341,16 @@ class TestPrefillFirst:
 
         submit(s, "r1", list(range(32)))  # 32 > budget=16
         plan = s.next_execution_plan()
-        op = plan.forward[0]
+        assert len(plan.forward) == 2
+        decode_op, prefill_op = plan.forward
 
-        # Layout is prefill-first/decode-second (FlatForwardOperation::stable_partition).
-        assert op.request_ids == ["r1", "r0"]
-        assert op.num_extends() == 1
-        # r0 decode = 1 token; r1 prefill chunk takes the remaining 15.
-        assert op.input_lengths == [15, 1]
+        assert decode_op.request_ids == ["r0"]
+        assert decode_op.num_extends() == 0
+        assert decode_op.input_lengths == [1]
+
+        assert prefill_op.request_ids == ["r1"]
+        assert prefill_op.num_extends() == 1
+        assert prefill_op.input_lengths == [15]
 
     def test_max_batch_size_limits_scheduled_requests(self):
         """max_batch_size caps the number of requests per plan."""
@@ -781,7 +812,13 @@ class TestDecodeInputIds:
         # Submit r1 so that next plan has one prefill + one decode.
         submit(s, "r1", list(range(8)))
         mixed_plan = s.next_execution_plan()
-        op = mixed_plan.forward[0]
-        num_decodes = len(op.request_ids) - op.num_extends()
-        assert len(op.decode_input_ids) == num_decodes
-        assert all(did == -1 for did in op.decode_input_ids)
+        assert len(mixed_plan.forward) == 2
+        decode_op, prefill_op = mixed_plan.forward
+
+        assert decode_op.request_ids == ["r0"]
+        assert decode_op.num_extends() == 0
+        assert decode_op.decode_input_ids == [-1]
+
+        assert prefill_op.request_ids == ["r1"]
+        assert prefill_op.num_extends() == 1
+        assert prefill_op.decode_input_ids == []

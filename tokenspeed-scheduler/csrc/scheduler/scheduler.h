@@ -76,6 +76,7 @@ public:
     std::size_t AvailableKvPages() const;
     std::size_t ActiveKvPages() const;
     std::size_t PrefillSize() const;
+    bool HasPendingPrefill() const;
     std::int32_t GetRequestTokenSize(const std::string& id) const;
     std::vector<std::string> PagedCacheGroupIds() const;
     std::int32_t PagedCacheGroupTotalPages(const std::string& group_id) const;

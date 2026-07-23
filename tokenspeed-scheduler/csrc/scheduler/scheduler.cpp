@@ -240,6 +240,15 @@ std::size_t Scheduler::PrefillSize() const {
     return count;
 }
 
+bool Scheduler::HasPendingPrefill() const {
+    for (const auto& [id, req] : requests_) {
+        if (req->Is<fsm::Submitted>() || req->Is<fsm::PrefetchDone>() || req->Is<fsm::Prefilling>()) {
+            return true;
+        }
+    }
+    return false;
+}
+
 std::size_t Scheduler::RetractedSize() const {
     std::size_t count = 0;
     for (const auto& [id, req] : requests_) {
@@ -381,7 +390,21 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     }
 
     auto [fwd_ops, cache_ops] = newForwardOperation(candidates);
-    plan.With(FlatForwardOperation{std::move(fwd_ops)});
+    if (config_.enable_mixed_prefill_decode) {
+        std::vector<ForwardOperation> decode_ops;
+        std::vector<ForwardOperation> prefill_ops;
+        for (auto& op : fwd_ops) {
+            if (std::holds_alternative<DecodeOperation>(op)) {
+                decode_ops.push_back(std::move(op));
+            } else {
+                prefill_ops.push_back(std::move(op));
+            }
+        }
+        plan.With(FlatForwardOperation{std::move(decode_ops), FlatForwardOperation::Order::kPreserve});
+        plan.With(FlatForwardOperation{std::move(prefill_ops), FlatForwardOperation::Order::kPreserve});
+    } else {
+        plan.With(FlatForwardOperation{std::move(fwd_ops)});
+    }
 #if TOKENSPEED_FLAT_KVCACHE
     plan.flat_oom_request_ids = std::exchange(flat_oom_request_ids_, {});
 #endif
