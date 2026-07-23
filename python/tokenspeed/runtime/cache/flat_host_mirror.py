@@ -28,6 +28,10 @@ from collections.abc import Iterable, Sequence
 
 import torch
 
+from tokenspeed.runtime.utils import get_device_module
+
+device_module = get_device_module()
+
 
 def _identity_dedup(
     tensors: Sequence[torch.Tensor | None],
@@ -120,7 +124,7 @@ class FlatHostMirror:
                     continue  # not a state layer
                 self._layer_to_state_pair[layer_id] = pair_of_conv[id(conv)]
 
-        pin = torch.cuda.is_available()
+        pin = device_module.is_available()
         kv_pairs = [
             (
                 dev,
@@ -187,7 +191,7 @@ class FlatHostMirror:
     ) -> list[torch.cuda.Event]:
         pairs = list(pairs)
         events: list[torch.cuda.Event] = []
-        with torch.cuda.stream(stream):
+        with device_module.stream(stream):
             for (dev, mirror), p in zip(self.tensor_pairs, self.row_spans):
                 for device_page, host_page in pairs:
                     dev_rows = dev[device_page * p : (device_page + 1) * p]

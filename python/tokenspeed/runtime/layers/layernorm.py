@@ -46,8 +46,11 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 _is_amd = current_platform().is_amd
+_is_intel = current_platform().is_intel
+# Intel XPU has no flashinfer/CUDA rmsnorm; use the portable Triton path (as AMD).
+_use_triton_rmsnorm = _is_amd or _is_intel
 
-if _is_amd:
+if _use_triton_rmsnorm:
     from tokenspeed_kernel.ops.layernorm.triton import rmsnorm as triton_rmsnorm
     from tokenspeed_kernel.ops.layernorm.triton import (
         rmsnorm_fused_parallel as triton_rmsnorm_fused_parallel,
@@ -115,7 +118,7 @@ class RMSNorm(torch.nn.Module):
             else:
                 return x
 
-        if _is_amd:
+        if _use_triton_rmsnorm:
             if residual is not None:
                 if inplace:
                     raise ValueError(
@@ -274,7 +277,7 @@ class GemmaRMSNorm(torch.nn.Module):
             else:
                 return x
 
-        if _is_amd:
+        if _use_triton_rmsnorm:
             if x.shape[0] == 0:
                 if residual is not None:
                     return x, residual
@@ -443,7 +446,7 @@ class FusedRMSNorm(nn.Module):
         Returns:
             Tuple of (normalized_q_a, normalized_kv_a)
         """
-        if _is_amd:
+        if _use_triton_rmsnorm:
             triton_rmsnorm_fused_parallel(
                 input1=input_q_a,
                 weight1=self.weight_q_a,

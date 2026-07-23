@@ -48,9 +48,11 @@ from tokenspeed.runtime.cache.flat_host_mirror import (
 from tokenspeed.runtime.cache.kvstore_controller import LayerDoneCounter
 from tokenspeed.runtime.cache.transfer.types import CacheKind
 from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
-from tokenspeed.runtime.utils import get_colorful_logger
+from tokenspeed.runtime.utils import get_colorful_logger, get_device_module
 
 logger = get_colorful_logger(__name__)
+
+device_module = get_device_module()
 
 _HOST_MEM_HEADROOM_BYTES = 10 * (1024**3)
 
@@ -279,11 +281,11 @@ class FlatMemoryExecutor:
             return
         # Order the D2H copies after already-enqueued default-stream work
         # (same fence the radix _start_writing places).
-        start_event = torch.cuda.Event()
+        start_event = device_module.Event()
         start_event.record()
         start_event.wait(self.write_stream)
         self.mirror.store_pages(pairs, self.write_stream)
-        finish_event = torch.cuda.Event()
+        finish_event = device_module.Event()
         finish_event.record(self.write_stream)
         self.ack_write_queue.append(_Ack(finish_event, op_ids))
 

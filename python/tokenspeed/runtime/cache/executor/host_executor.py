@@ -41,6 +41,11 @@ CONCURRENT_WRITEBACK_BLOCK_QUOTA = 2
 
 
 def _cache_stream_priorities() -> tuple[int | None, int | None]:
+    # Intel XPU: prioritized streams produce a StreamId that Event.wait() does
+    # not recognize ("Unrecognized stream ... LOW"), so skip priorities and use
+    # plain streams there.
+    if not torch.cuda.is_available():
+        return None, None
     priority_range = getattr(device_module.Stream, "priority_range", None)
     if priority_range is None:
         return None, None
