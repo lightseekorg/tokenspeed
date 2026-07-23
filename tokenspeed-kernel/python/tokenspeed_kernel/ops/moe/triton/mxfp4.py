@@ -376,6 +376,7 @@ def triton_mxfp4_moe_weights(plan: dict, w: torch.nn.Module):
         "ispp_alignment": frozenset({1}),
         "internal_activation_dtype": frozenset({"fp8", "input"}),
         "supports_bias": frozenset({True}),
+        "supports_moe_lora": frozenset({True}),
     },
     priority=Priority.SPECIALIZED + 2,
 )
@@ -401,6 +402,7 @@ def triton_mxfp4_moe_weights(plan: dict, w: torch.nn.Module):
         "ispp_alignment": frozenset({1}),
         "internal_activation_dtype": frozenset({"fp8", "input"}),
         "supports_bias": frozenset({True}),
+        "supports_moe_lora": frozenset({True}),
     },
     priority=Priority.SPECIALIZED + 1,
 )
@@ -475,8 +477,19 @@ def triton_mxfp4_moe_apply(
     w13_pc = getattr(w, "w13_precision_config", None)
     w2_pc = getattr(w, "w2_precision_config", None)
 
+    # MoE LoRA is applied around the two GEMMs in gathered layout. It needs the
+    # per-(token, slot) routing table and the pre-activation gate/up buffer, so
+    # it is only available on the precomputed-topk path with the swiglu fusion
+    # disabled (the un-fused _silu_gate_up path is used instead).
+    moe_lora_ctx = getattr(w, "_moe_lora_ctx", None)
+    if moe_lora_ctx is not None and topk_ids is None:
+        raise NotImplementedError(
+            "MoE LoRA requires the precomputed-topk MoE routing path; the "
+            "kernel-routing mxfp4 kernel does not expose per-token expert ids."
+        )
+
     act = None
-    if swiglu_arg is not None:
+    if swiglu_arg is not None and moe_lora_ctx is None:
         act = FusedActivation(
             FnSpecs("swiglu", swiglu_fn, ("alpha", "limit"), reduction_n=2),
             (swiglu_arg.alpha, swiglu_arg.limit),
@@ -504,6 +517,10 @@ def triton_mxfp4_moe_apply(
             precision_config=w13_pc,
             fused_activation=act,
         )
+    if moe_lora_ctx is not None:
+        moe_lora_ctx.apply_gate_up_lora_ragged(
+            w.layer_index, x, topk_ids, intermediate_cache, scatter_indx
+        )
     if act is None:
         intermediate_cache = _silu_gate_up(
             intermediate_cache,
@@ -530,6 +547,16 @@ def triton_mxfp4_moe_apply(
             precision_config=w2_pc,
             scatter_indx=scatter_indx,
             gammas=gate_scal,
+        )
+    if moe_lora_ctx is not None:
+        # Use the un-quantized post-activation intermediate for the down shrink.
+        moe_lora_ctx.apply_down_lora_ragged(
+            w.layer_index,
+            intermediate_cache,
+            topk_ids,
+            topk_weights,
+            output,
+            scatter_indx,
         )
     if top_k > 1:
         return output.view(n_tokens, top_k, output.shape[-1]).sum(dim=1)

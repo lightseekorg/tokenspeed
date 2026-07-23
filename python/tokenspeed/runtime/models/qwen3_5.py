@@ -799,9 +799,16 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        ctx: ForwardContext,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """qkv_proj + split + rope (+ optional gate). ``gate`` is ``None`` when ``attn_output_gate=False``."""
         qkv, _ = self.qkv_proj(hidden_states)
+
+        # Apply QKV LoRA delta (same as qwen3.py; qkv layout matches the buffer
+        # offsets because q_size_per_tp already accounts for attn_output_gate).
+        if ctx.lora_manager is not None:
+            qkv = ctx.lora_manager.apply_qkv_lora(hidden_states, qkv, self.layer_id)
+
         if self.attn_output_gate:
             q_gate, k, v = qkv.split(
                 [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
@@ -848,9 +855,14 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         out_cache_loc: torch.Tensor,
     ) -> torch.Tensor:
         """Full attention forward pass."""
-        q, k, v, gate = self._project_qkv_rope(positions, hidden_states)
+        q, k, v, gate = self._project_qkv_rope(positions, hidden_states, ctx)
         attn_output = self._attn(q, k, v, gate, ctx, out_cache_loc)
         output, _ = self.o_proj(attn_output)
+
+        # Apply O-projection LoRA delta.
+        if ctx.lora_manager is not None:
+            output = ctx.lora_manager.apply_o_lora(attn_output, output, self.layer_id)
+
         return output
 
     def _maybe_narrow_residual(

@@ -54,6 +54,8 @@ from tokenspeed.runtime.engine.io_struct import (
     InitWeightsUpdateGroupReqOutput,
     IsSchedulerPausedReqInput,
     IsSleepingReqInput,
+    LoadLoraReqInput,
+    LoadLoraReqOutput,
     PauseSchedulerReqInput,
     ProfileReq,
     ProfileReqOutput,
@@ -64,6 +66,8 @@ from tokenspeed.runtime.engine.io_struct import (
     SetInternalStateReq,
     SetInternalStateReqOutput,
     TokenizedGenerateReqInput,
+    UnloadLoraReqInput,
+    UnloadLoraReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
 )
@@ -114,6 +118,8 @@ class RequestHandler:
         pause_controller=None,
         memory_controller=None,
         model_runner=None,
+        load_lora_fn=None,
+        unload_lora_fn=None,
     ) -> None:
 
         self.forward_ct = 0
@@ -140,6 +146,8 @@ class RequestHandler:
         self.max_req_len = max_req_len
         self.vocab_size = vocab_size
         self.get_load_fn = get_load_fn
+        self.load_lora_fn = load_lora_fn
+        self.unload_lora_fn = unload_lora_fn
 
         self.tokenizer = get_tokenizer(
             server_args.tokenizer,
@@ -256,6 +264,34 @@ class RequestHandler:
                 self.send_func.send_pyobj(
                     DestroyWeightsUpdateGroupReqOutput(success=ok, message=msg)
                 )
+            elif isinstance(recv_req, LoadLoraReqInput):
+                try:
+                    if self.load_lora_fn is not None:
+                        lora_id = self.load_lora_fn(
+                            recv_req.lora_name, recv_req.adapter_path
+                        )
+                        self.send_func.send_pyobj(
+                            LoadLoraReqOutput(success=True, lora_id=lora_id)
+                        )
+                    else:
+                        self.send_func.send_pyobj(
+                            LoadLoraReqOutput(
+                                success=False, message="LoRA not enabled on this server"
+                            )
+                        )
+                except Exception as e:
+                    self.send_func.send_pyobj(
+                        LoadLoraReqOutput(success=False, message=str(e))
+                    )
+            elif isinstance(recv_req, UnloadLoraReqInput):
+                try:
+                    if self.unload_lora_fn is not None:
+                        self.unload_lora_fn(recv_req.lora_name)
+                    self.send_func.send_pyobj(UnloadLoraReqOutput(success=True))
+                except Exception as e:
+                    self.send_func.send_pyobj(
+                        UnloadLoraReqOutput(success=False, message=str(e))
+                    )
             else:
                 raise NotImplementedError(f"Unsupported request type: {type(recv_req)}")
         return new_req_specs, req_states, bootstrap_infos, abort_rids
@@ -270,6 +306,7 @@ class RequestHandler:
         req_spec = make_spec(
             rid=recv_req.rid,
             tokens=recv_req.input_ids,
+            lora_id=getattr(recv_req, "lora_id", 0),
         )
         req_state = RequestState.from_recv_req(
             recv_req,

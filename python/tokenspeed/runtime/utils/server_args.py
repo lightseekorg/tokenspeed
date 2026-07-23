@@ -239,6 +239,30 @@ class ServerArgs:
     # server started without the matching flag will receive empty logprobs.
     enable_output_logprobs: bool = False
 
+    # LoRA adapter serving
+    enable_lora: bool = False
+    # Maximum number of LoRA adapters resident in GPU memory at once.
+    # Adapters beyond this cap are LRU-evicted to the CPU pool.
+    max_loras: int = 4
+    # Maximum LoRA rank supported (caps adapter loading; larger = more GPU memory).
+    max_lora_rank: int = 64
+    # Maximum number of LoRA adapters cached in CPU pinned memory.  When
+    # an adapter is evicted from this pool it falls back to its disk path
+    # (assumed durable) and is reloaded on next use.  ``None`` ⇒ default
+    # to ``4 * max_loras``.
+    max_loras_cpu: int | None = None
+    # Comma-separated coarse GPU buffer families to allocate for LoRA.
+    # Valid groups: attn, mlp, moe, lm_head.
+    lora_buffer_groups: str = "attn,mlp,moe"
+    # Store 3D MoE shared-outer adapters in compressed shared/per-expert
+    # buffers instead of fully expanding all sides to num_experts.
+    lora_moe_compressed_shared_outer: bool = False
+    # Scheduler-side LoRA scheduling policy.  ``"lru"`` (default) just
+    # relies on the manager's LRU; ``"admission"`` (future) gates batches
+    # that don't fit in GPU; ``"pack"`` (future) sorts the queue to reuse
+    # resident adapters.
+    lora_scheduling_policy: str = "lru"
+
     # Runtime options
     disable_pdl: bool = False
     enable_prefix_caching: bool = True
@@ -625,6 +649,43 @@ class ServerArgs:
             )
 
     def resolve_disaggregation(self):
+        if self.enable_lora:
+            # LoRA delta path is baked into the captured graph: the per-token
+            # slot index buffer (LoraManager.weight_indices_buf) is bound at
+            # capture and updated in place at replay. Base/no-LoRA requests
+            # use NO_LORA_SLOT in metadata and do not consume a GPU slot.
+            #
+            # Default the CPU pool to 4× the GPU pool so adapter swap-out
+            # to disk is rare in steady state.
+            if self.max_loras_cpu is None:
+                self.max_loras_cpu = 4 * self.max_loras
+            if self.max_loras_cpu < self.max_loras:
+                raise ValueError(
+                    f"max_loras_cpu ({self.max_loras_cpu}) must be ≥ "
+                    f"max_loras ({self.max_loras}) — every GPU-resident "
+                    "adapter must also fit in the CPU pool."
+                )
+            groups = {
+                group.strip()
+                for group in self.lora_buffer_groups.split(",")
+                if group.strip()
+            }
+            valid_groups = {"attn", "mlp", "moe", "lm_head"}
+            unknown_groups = groups - valid_groups
+            if not groups:
+                raise ValueError("lora_buffer_groups must include at least one group.")
+            if unknown_groups:
+                raise ValueError(
+                    "lora_buffer_groups contains unknown groups: "
+                    f"{sorted(unknown_groups)}. Valid groups: {sorted(valid_groups)}."
+                )
+            self.lora_buffer_groups = ",".join(sorted(groups))
+            if self.lora_moe_compressed_shared_outer and "moe" not in groups:
+                raise ValueError(
+                    "--lora-moe-compressed-shared-outer requires "
+                    "--lora-buffer-groups to include 'moe'."
+                )
+
         # PD disaggregation
         if self.disaggregation_mode == "prefill":
             self.enforce_eager = True
@@ -1582,6 +1643,70 @@ class ServerArgs:
             action="store_true",
             help="Disable PDL launch.",
         )
+        # LoRA adapter serving
+        parser.add_argument(
+            "--enable-lora",
+            action="store_true",
+            default=ServerArgs.enable_lora,
+            help="Enable LoRA adapter serving.",
+        )
+        parser.add_argument(
+            "--max-loras",
+            type=int,
+            default=ServerArgs.max_loras,
+            help="Maximum number of LoRA adapters in GPU memory at once.",
+        )
+        parser.add_argument(
+            "--max-lora-rank",
+            type=int,
+            default=ServerArgs.max_lora_rank,
+            help="Maximum LoRA rank supported across all loaded adapters.",
+        )
+        parser.add_argument(
+            "--max-loras-cpu",
+            type=int,
+            default=ServerArgs.max_loras_cpu,
+            help=(
+                "Maximum number of LoRA adapters cached in CPU pinned "
+                "memory.  Defaults to 4 × --max-loras.  Adapters evicted "
+                "from this pool are reloaded from disk on next use."
+            ),
+        )
+        parser.add_argument(
+            "--lora-buffer-groups",
+            type=str,
+            default=ServerArgs.lora_buffer_groups,
+            help=(
+                "Comma-separated LoRA GPU buffer groups to allocate. "
+                "Valid groups: attn, mlp, moe, lm_head. Loading an adapter that "
+                "targets a disabled group raises an error."
+            ),
+        )
+        parser.add_argument(
+            "--lora-moe-compressed-shared-outer",
+            action="store_true",
+            default=ServerArgs.lora_moe_compressed_shared_outer,
+            help=(
+                "Use compressed MoE storage for 3D shared-outer adapters "
+                "(w1/w3 A shared, w1/w3 B per-expert, w2 A per-expert, "
+                "w2 B shared)."
+            ),
+        )
+        parser.add_argument(
+            "--lora-scheduling-policy",
+            type=str,
+            default=ServerArgs.lora_scheduling_policy,
+            choices=["lru", "pack"],
+            help=(
+                "Scheduler-side LoRA scheduling policy. ``lru`` (default) "
+                "submits requests in arrival order and relies on the "
+                "manager's LRU pool. ``pack`` sorts the admission queue "
+                "by lora_id so adapter-shared requests cluster, reducing "
+                "eviction churn when working_set > max_loras_cpu and "
+                "traffic is bursty."
+            ),
+        )
+
         prefix_cache_group = parser.add_mutually_exclusive_group()
         prefix_cache_group.add_argument(
             "--enable-prefix-caching",
