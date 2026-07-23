@@ -27,8 +27,10 @@ from collections.abc import Iterable, Sequence
 
 import torch
 from tokenspeed_kernel.ops.activation.triton import swiglu_oai
+from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
 from tokenspeed_kernel.ops.layernorm.triton import qk_rmsnorm
 from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
+from tokenspeed_kernel.platform import current_platform
 from torch import nn
 from transformers import MiniMaxM3VLTextConfig
 
@@ -150,6 +152,8 @@ class MiniMaxM3MLP(nn.Module):
 class MiniMaxM3SparseMoeBlock(nn.Module):
     """MiniMax-M3 routed experts plus one unconditional shared expert."""
 
+    _DSV3_ROUTER_GEMM_HIDDEN = (3072, 6144, 7168)
+
     def __init__(
         self,
         config: MiniMaxM3VLTextConfig,
@@ -173,6 +177,11 @@ class MiniMaxM3SparseMoeBlock(nn.Module):
             quant_config=None,
             params_dtype=torch.float32,
             prefix=add_prefix("gate", prefix),
+        )
+        self.use_dsv3_router_gemm = (
+            current_platform().is_hopper_plus
+            and self.gate.weight.dtype in (torch.bfloat16, torch.float32)
+            and config.hidden_size in self._DSV3_ROUTER_GEMM_HIDDEN
         )
         self.routing_bias = nn.Parameter(
             torch.zeros(config.num_local_experts, dtype=torch.float32)
@@ -236,7 +245,15 @@ class MiniMaxM3SparseMoeBlock(nn.Module):
         num_tokens = hidden_states.size(0)
 
         with self.stream_fork.scope(enable=get_is_capture_mode()) as fork:
-            router_logits, _ = self.gate(hidden_states.to(torch.float32))
+            if self.use_dsv3_router_gemm and num_tokens > 0:
+                router_logits = dsv3_router_gemm(
+                    hidden_states,
+                    self.gate.weight,
+                    out_dtype=torch.float32,
+                    enable_pdl=pdl_enabled(),
+                )
+            else:
+                router_logits, _ = self.gate(hidden_states.to(torch.float32))
 
             if num_tokens > 0:
                 topk_output = self.topk(hidden_states, router_logits)
