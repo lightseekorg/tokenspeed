@@ -8,7 +8,9 @@ Usage:
 """
 
 import socket
+from types import SimpleNamespace
 from typing import List
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -16,6 +18,84 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from tokenspeed.runtime.distributed.comm_ops import all_to_all_single
+
+
+class TestAutoBackendTopology:
+    @pytest.fixture
+    def backend(self, monkeypatch):
+        from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
+        from tokenspeed.runtime.utils.env import global_server_args_dict
+
+        monkeypatch.setitem(
+            global_server_args_dict,
+            "mapping",
+            SimpleNamespace(nprocs_per_node=4),
+        )
+        backend = AutoBackend.__new__(AutoBackend)
+        backend._nccl = Mock()
+        backend._rsag = Mock()
+        backend._triton_ar = Mock()
+        backend._custom_ar = Mock()
+        backend._trtllm_ar = Mock()
+        return backend
+
+    def test_group_spans_nodes(self, backend):
+        assert not backend._group_spans_nodes((0, 1, 2, 3))
+        assert not backend._group_spans_nodes((4, 5, 6, 7))
+        assert backend._group_spans_nodes((0, 1, 4, 5))
+
+    @pytest.mark.parametrize("method", ["token_all_gather", "token_reduce_scatter"])
+    def test_cross_node_token_ops_fall_back_to_nccl(self, backend, method):
+        tensor = Mock()
+        scattered = [1] * 8
+        getattr(backend._nccl, method).return_value = "nccl-result"
+
+        result = getattr(backend, method)(tensor, tuple(range(8)), scattered)
+
+        assert result == "nccl-result"
+        getattr(backend._nccl, method).assert_called_once_with(
+            tensor, tuple(range(8)), scattered
+        )
+        getattr(backend._rsag, method).assert_not_called()
+
+    @pytest.mark.parametrize("method", ["token_all_gather", "token_reduce_scatter"])
+    def test_node_local_token_ops_use_rsag(self, backend, method):
+        tensor = Mock()
+        scattered = [1] * 4
+        getattr(backend._rsag, method).return_value = "rsag-result"
+
+        result = getattr(backend, method)(tensor, (0, 1, 2, 3), scattered)
+
+        assert result == "rsag-result"
+        getattr(backend._rsag, method).assert_called_once_with(
+            tensor, (0, 1, 2, 3), scattered
+        )
+        getattr(backend._nccl, method).assert_not_called()
+
+    def test_cross_node_all_reduce_falls_back_to_nccl(self, backend):
+        tensor = Mock()
+        backend._nccl.all_reduce.return_value = "nccl-result"
+
+        result = backend.all_reduce(tensor, tuple(range(8)))
+
+        assert result == "nccl-result"
+        backend._nccl.all_reduce.assert_called_once_with(
+            tensor, tuple(range(8)), op=None
+        )
+        backend._custom_ar.has_custom_ar.assert_not_called()
+        backend._trtllm_ar.has_trtllm_ar.assert_not_called()
+        backend._triton_ar.can_run.assert_not_called()
+
+    def test_cross_node_last_dim_all_gather_falls_back_to_nccl(self, backend):
+        tensor = Mock()
+        tensor.dim.return_value = 2
+        backend._nccl.all_gather.return_value = "nccl-result"
+
+        result = backend.all_gather(tensor, tuple(range(8)), dim=-1)
+
+        assert result == "nccl-result"
+        backend._nccl.all_gather.assert_called_once_with(tensor, tuple(range(8)), -1)
+        backend._rsag.all_gather.assert_not_called()
 
 
 def get_open_port() -> int:

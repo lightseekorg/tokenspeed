@@ -46,12 +46,21 @@ if platform.is_nvidia:
         w13_ws2 = w.w13_weight_scale_2[:, 0]
         w13_input_scale = w.w13_input_scale.max().to(torch.float32)
         w2_input_scale = w.w2_input_scale.max().to(torch.float32)
+        num_local_experts = getattr(w, "num_local_experts", w.w13_weight.shape[0])
         w.w13_weight_scale_2 = torch.nn.Parameter(w13_ws2, requires_grad=False)
         w.w13_input_scale_quant = torch.nn.Parameter(
-            (1.0 / w13_input_scale).to(torch.float32), requires_grad=False
+            (1.0 / w13_input_scale)
+            .to(torch.float32)
+            .expand(num_local_experts)
+            .contiguous(),
+            requires_grad=False,
         )
         w.w2_input_scale_quant = torch.nn.Parameter(
-            (1.0 / w2_input_scale).to(torch.float32), requires_grad=False
+            (1.0 / w2_input_scale)
+            .to(torch.float32)
+            .expand(num_local_experts)
+            .contiguous(),
+            requires_grad=False,
         )
         w.g1_alphas = torch.nn.Parameter(
             (w13_input_scale * w13_ws2).to(torch.float32), requires_grad=False
@@ -156,10 +165,15 @@ if platform.is_nvidia:
             group = plan.get("deepep_group")
             if group is None:
                 raise ValueError("DeepEP MoE plan is missing deepep_group")
+            dispatch_capacity = max(
+                plan.get("low_latency_max_num_tokens_per_gpu") or 0,
+                max_num_tokens_per_gpu or 0,
+                x.shape[0],
+            )
             config = SimpleNamespace(
                 top_k=getattr(w, "top_k"),
                 num_experts=getattr(w, "num_experts"),
-                low_latency_max_num_tokens_per_gpu=max_num_tokens_per_gpu or x.shape[0],
+                low_latency_max_num_tokens_per_gpu=dispatch_capacity,
                 hidden_size=x.shape[1],
                 world_size=getattr(w, "ep_size", group.size()),
                 group=group,
@@ -181,7 +195,7 @@ if platform.is_nvidia:
         a_q, a_q_sf = scaled_fp4_grouped_quantize(
             recv_hidden,
             masked_m,
-            w.w13_input_scale_quant.expand(num_local_experts),
+            w.w13_input_scale_quant,
         )
         sf_vec_size = 16
         gateup_output = torch.empty(
@@ -205,7 +219,7 @@ if platform.is_nvidia:
         diq, diq_sf = silu_and_mul_scaled_nvfp4_experts_quantize(
             gateup_output.permute(2, 0, 1),
             masked_m,
-            w.w2_input_scale_quant.expand(num_local_experts),
+            w.w2_input_scale_quant,
         )
         output = torch.empty(
             (num_local_experts, recv_hidden.shape[1], x.shape[1]),

@@ -47,6 +47,7 @@ from tokenspeed.runtime.layers.linear import (
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.topk import TopK
 from tokenspeed.runtime.layers.moe.utils import (
+    All2AllBackend,
     RoutingMethodType,
     get_all2all_backend,
     get_moe_backend,
@@ -68,6 +69,13 @@ def _is_moe_layer(layer_id: int, config) -> bool:
     if layer_id in mlp_only_layers:
         return False
     return config.num_experts > 0 and (layer_id + 1) % config.decoder_sparse_step == 0
+
+
+def _qwen35_moe_a2a_backend() -> str:
+    """Select DeepEP only for the Qwen3.5 CuTeDSL target path."""
+    if get_all2all_backend().is_deepep() and get_moe_backend().is_flashinfer_cutedsl():
+        return All2AllBackend.DEEPEP.value
+    return All2AllBackend.NONE.value
 
 
 class Qwen3_5MoeMLP(nn.Module):
@@ -182,13 +190,10 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         self.layer_index = layer_index
         self.tp_size = mapping.world_size
         self.stream_fork = StreamFork(alt_stream)
-        # DeepEP is only supported with the nvfp4 cutedsl MoE backend.
-        # Draft models (non-quantized) must fall back to the TP path even
-        # when the target model has deep_ep configured globally.
-        self.use_deepep = (
-            get_all2all_backend().is_deepep()
-            and get_moe_backend().is_flashinfer_cutedsl()
-        )
+        # Draft models use a different MoE backend and must not inherit the
+        # target model's global DeepEP setting.
+        a2a_backend = _qwen35_moe_a2a_backend()
+        self.use_deepep = a2a_backend == All2AllBackend.DEEPEP.value
         self.comm_manager = CommManager(
             mapping=mapping,
             layer_id=layer_index,
@@ -226,6 +231,7 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
                 "routing_method_type": RoutingMethodType.RenormalizeNaive,
                 "normalize_topk_weights": config.norm_topk_prob,
             },
+            a2a_backend=a2a_backend,
         )
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
@@ -348,17 +354,16 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         # Gate on local tokens (no all-gather needed)
         router_logits, _ = self.gate(hidden_states)
 
-        # Shared expert on local tokens (TP-parallel, needs explicit reduce)
+        # The shared expert is sharded over dense TP. Attention-DP ranks can
+        # hold different token counts, so gather those rows before the TP MLP
+        # and reduce-scatter its partial outputs back to the owning ranks.
         shared_output = None
         if self.shared_expert is not None:
-            shared_output = self.shared_expert(hidden_states)
-            if self.mapping.dense.has_tp:
-                from tokenspeed.runtime.distributed.comm_ops import all_reduce
-
-                shared_output = all_reduce(
-                    shared_output,
-                    self.mapping.dense.tp_group,
-                )
+            shared_input = self.comm_manager.pre_dense_comm(hidden_states, ctx)
+            shared_output = self.shared_expert(shared_input)
+            shared_output, _ = self.comm_manager.post_dense_comm(
+                shared_output, None, ctx
+            )
 
         # TopK on local tokens
         if hidden_states.shape[0] > 0:

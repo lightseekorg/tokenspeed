@@ -112,6 +112,7 @@ def moe_plan(
     internal_activation_dtype: str | None = None,
     with_bias: bool = False,
     deepep_group: object | None = None,
+    low_latency_max_num_tokens_per_gpu: int | None = None,
     solution: str | None = None,
 ) -> dict:
     """Create a MoE execution plan.
@@ -137,6 +138,9 @@ def moe_plan(
             activations have. Defaults to "input" if not set.
         with_bias: Whether the selected kernel must support expert bias tensors.
         deepep_group: Runtime-created process group used by DeepEP plans.
+        low_latency_max_num_tokens_per_gpu: Static per-rank token capacity for
+            low-latency DeepEP buffers. It must cover every batch that reuses
+            the plan, including CUDA graph capture sizes.
         solution: Optional kernel solution to force through normal selection.
             None leaves the concrete kernel choice to the registry.
 
@@ -188,6 +192,7 @@ def moe_plan(
         "weight_preprocessor": apply_spec.weight_preprocessor,
         "a2a_backend": a2a_backend,
         "deepep_group": deepep_group,
+        "low_latency_max_num_tokens_per_gpu": low_latency_max_num_tokens_per_gpu,
         "support_routing": support_routing,
         "supports_deferred_finalize": supports_deferred_finalize,
         "solution": apply_spec.solution,
