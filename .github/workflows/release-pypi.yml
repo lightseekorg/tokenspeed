@@ -7,25 +7,52 @@ on:
       - "python/tokenspeed/version.py"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
-  publish:
+  build:
     if: github.repository == 'lightseekorg/tokenspeed'
     runs-on: ubuntu-latest
-    environment: 'prod'
     steps:
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.10'
-
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
-      - name: Upload to pypi
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build distributions
         run: |
           cd python
           cp ../README.md ../LICENSE .
-          pip install build
-          python3 -m build
-          pip install twine
-          python3 -m twine upload dist/* -u __token__ -p ${{ secrets.PYPI_TOKEN }}
+          python -m pip install --upgrade build twine
+          python -m build
+          python -m twine check dist/*
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: tokenspeed-dist
+          path: python/dist/*
+          if-no-files-found: error
+
+  publish:
+    if: github.repository == 'lightseekorg/tokenspeed'
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: tokenspeed-dist
+          path: dist
+
+      - name: Publish distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
