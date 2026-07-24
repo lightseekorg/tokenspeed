@@ -245,6 +245,39 @@ def test_mla_prefill(
             64,
             id="gluon-bh64",
         ),
+        pytest.param(
+            "gluon",
+            torch.bfloat16,
+            torch.bfloat16,
+            64,
+            512,
+            64,
+            1,
+            64,
+            id="gluon-h64-small-b1",
+        ),
+        pytest.param(
+            "gluon",
+            torch.bfloat16,
+            torch.bfloat16,
+            64,
+            512,
+            64,
+            2,
+            64,
+            id="gluon-h64-small-b2",
+        ),
+        pytest.param(
+            "gluon",
+            torch.bfloat16,
+            torch.bfloat16,
+            64,
+            512,
+            64,
+            4,
+            64,
+            id="gluon-h64-small-b4",
+        ),
     ],
 )
 def test_mla_decode_with_kvcache(
@@ -278,6 +311,14 @@ def test_mla_decode_with_kvcache(
         # selects 256 split-K workgroups and exercises the empty-split
         # sanitization used by production long-context decode.
         max_seqlen_k = 300_000
+    elif (
+        solution == "gluon"
+        and q_dtype == torch.bfloat16
+        and kv_dtype == torch.bfloat16
+        and num_heads == 64
+        and batch_size in (1, 2, 4)
+    ):
+        max_seqlen_k = 80_000
     max_pages = (visible_max_seqlen_k + page_size - 1) // page_size
     num_pages = batch_size * max_pages
 

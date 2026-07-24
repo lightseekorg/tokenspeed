@@ -319,6 +319,37 @@ if current_platform().is_amd:
     @register_kernel(
         "attention",
         "mla_decode_with_kvcache",
+        name="gluon_mla_decode_bf16xbf16_gfx950_h64_small_batch",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=format_signatures(
+            ("q", "kv_cache"),
+            "dense",
+            {torch.bfloat16},
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "batch_size": frozenset({1, 2, 4}),
+            "q_len": frozenset({1}),
+            "num_q_heads": frozenset({64}),
+            "batch_size_div_64": frozenset({False}),
+            "page_size": frozenset({64}),
+            "kv_lora_rank": frozenset({512}),
+            "qk_rope_head_dim": frozenset({64}),
+            "support_logit_cap": frozenset({False}),
+            "return_lse": frozenset({False, True}),
+        },
+    )
+    def gluon_mla_decode_bf16xbf16_gfx950_h64_small_batch(*args, **kwargs):
+        return _mla_decode_bf16xbf16_impl(*args, **kwargs)
+
+    @register_kernel(
+        "attention",
+        "mla_decode_with_kvcache",
         name="gluon_mla_decode_bf16xfp8_gfx950_bh16bn128",
         solution="gluon",
         capability=CapabilityRequirement(
