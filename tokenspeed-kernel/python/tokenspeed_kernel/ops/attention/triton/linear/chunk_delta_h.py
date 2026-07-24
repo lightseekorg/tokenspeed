@@ -114,87 +114,63 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
 
     # load initial state
     if USE_INITIAL_STATE:
-        p_h0_1 = tl.make_block_ptr(h0, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0))
-        b_h1 += tl.load(p_h0_1, boundary_check=(0, 1)).to(tl.float32)
+        p_h0_1 = tl.make_tensor_descriptor(h0, (K, V), (V, 1), (64, BV))
+        b_h1 += p_h0_1.load([0, i_v * BV]).to(tl.float32)
         if K > 64:
-            p_h0_2 = tl.make_block_ptr(
-                h0, (K, V), (V, 1), (64, i_v * BV), (64, BV), (1, 0)
-            )
-            b_h2 += tl.load(p_h0_2, boundary_check=(0, 1)).to(tl.float32)
+            p_h0_2 = tl.make_tensor_descriptor(h0, (K, V), (V, 1), (64, BV))
+            b_h2 += p_h0_2.load([64, i_v * BV]).to(tl.float32)
         if K > 128:
-            p_h0_3 = tl.make_block_ptr(
-                h0, (K, V), (V, 1), (128, i_v * BV), (64, BV), (1, 0)
-            )
-            b_h3 += tl.load(p_h0_3, boundary_check=(0, 1)).to(tl.float32)
+            p_h0_3 = tl.make_tensor_descriptor(h0, (K, V), (V, 1), (64, BV))
+            b_h3 += p_h0_3.load([128, i_v * BV]).to(tl.float32)
         if K > 192:
-            p_h0_4 = tl.make_block_ptr(
-                h0, (K, V), (V, 1), (192, i_v * BV), (64, BV), (1, 0)
-            )
-            b_h4 += tl.load(p_h0_4, boundary_check=(0, 1)).to(tl.float32)
+            p_h0_4 = tl.make_tensor_descriptor(h0, (K, V), (V, 1), (64, BV))
+            b_h4 += p_h0_4.load([192, i_v * BV]).to(tl.float32)
 
     # main recurrence
     for i_t in range(NT):
-        p_h1 = tl.make_block_ptr(
-            h + i_t * stride_h, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0)
-        )
-        tl.store(p_h1, b_h1.to(p_h1.dtype.element_ty), boundary_check=(0, 1))
+        p_h1 = tl.make_tensor_descriptor(h + i_t * stride_h, (K, V), (V, 1), (64, BV))
+        p_h1.store([0, i_v * BV], b_h1.to(p_h1.dtype))
         if K > 64:
-            p_h2 = tl.make_block_ptr(
-                h + i_t * stride_h, (K, V), (V, 1), (64, i_v * BV), (64, BV), (1, 0)
+            p_h2 = tl.make_tensor_descriptor(
+                h + i_t * stride_h, (K, V), (V, 1), (64, BV)
             )
-            tl.store(p_h2, b_h2.to(p_h2.dtype.element_ty), boundary_check=(0, 1))
+            p_h2.store([64, i_v * BV], b_h2.to(p_h2.dtype))
         if K > 128:
-            p_h3 = tl.make_block_ptr(
-                h + i_t * stride_h, (K, V), (V, 1), (128, i_v * BV), (64, BV), (1, 0)
+            p_h3 = tl.make_tensor_descriptor(
+                h + i_t * stride_h, (K, V), (V, 1), (64, BV)
             )
-            tl.store(p_h3, b_h3.to(p_h3.dtype.element_ty), boundary_check=(0, 1))
+            p_h3.store([128, i_v * BV], b_h3.to(p_h3.dtype))
         if K > 192:
-            p_h4 = tl.make_block_ptr(
-                h + i_t * stride_h, (K, V), (V, 1), (192, i_v * BV), (64, BV), (1, 0)
+            p_h4 = tl.make_tensor_descriptor(
+                h + i_t * stride_h, (K, V), (V, 1), (64, BV)
             )
-            tl.store(p_h4, b_h4.to(p_h4.dtype.element_ty), boundary_check=(0, 1))
+            p_h4.store([192, i_v * BV], b_h4.to(p_h4.dtype))
 
-        p_w = tl.make_block_ptr(
-            w, (T, K), (stride_w, 1), (i_t * BT, 0), (BT, 64), (1, 0)
-        )
-        b_w = tl.load(p_w, boundary_check=(0, 1))
+        p_w = tl.make_tensor_descriptor(w, (T, K), (stride_w, 1), (BT, 64))
+        b_w = p_w.load([i_t * BT, 0])
         b_v = tl.dot(b_w, b_h1.to(b_w.dtype))
         if K > 64:
-            p_w = tl.make_block_ptr(
-                w, (T, K), (stride_w, 1), (i_t * BT, 64), (BT, 64), (1, 0)
-            )
-            b_w = tl.load(p_w, boundary_check=(0, 1))
+            b_w = p_w.load([i_t * BT, 64])
             b_v += tl.dot(b_w, b_h2.to(b_w.dtype))
         if K > 128:
-            p_w = tl.make_block_ptr(
-                w, (T, K), (stride_w, 1), (i_t * BT, 128), (BT, 64), (1, 0)
-            )
-            b_w = tl.load(p_w, boundary_check=(0, 1))
+            b_w = p_w.load([i_t * BT, 128])
             b_v += tl.dot(b_w, b_h3.to(b_w.dtype))
         if K > 192:
-            p_w = tl.make_block_ptr(
-                w, (T, K), (stride_w, 1), (i_t * BT, 192), (BT, 64), (1, 0)
-            )
-            b_w = tl.load(p_w, boundary_check=(0, 1))
+            b_w = p_w.load([i_t * BT, 192])
             b_v += tl.dot(b_w, b_h4.to(b_w.dtype))
-        p_v = tl.make_block_ptr(
-            v, (T, V), (stride_v, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
-        )
-        b_v = tl.load(p_v, boundary_check=(0, 1)) - b_v
+        p_v = tl.make_tensor_descriptor(v, (T, V), (stride_v, 1), (BT, BV))
+        b_v = p_v.load([i_t * BT, i_v * BV]) - b_v
 
         if SAVE_NEW_VALUE:
-            p_v = tl.make_block_ptr(
-                v_new, (T, V), (stride_v, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
-            )
-            tl.store(p_v, b_v.to(p_v.dtype.element_ty), boundary_check=(0, 1))
+            p_vn = tl.make_tensor_descriptor(v_new, (T, V), (stride_v, 1), (BT, BV))
+            p_vn.store([i_t * BT, i_v * BV], b_v.to(p_vn.dtype))
 
         last_idx = min((i_t + 1) * BT, T) - 1
         if USE_G:
             b_g_last = tl.load(g + bos * H + last_idx * H + i_h)
-            p_g = tl.make_block_ptr(
-                g + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,)
-            )
-            b_g = tl.load(p_g, boundary_check=(0,))
+            # ``g`` is one scalar per token (stride H); use a masked load.
+            o_g = i_t * BT + tl.arange(0, BT)
+            b_g = tl.load(g + bos * H + i_h + o_g * H, mask=o_g < T, other=0.0)
             b_v = b_v * safe_exp(b_g_last - b_g)[:, None]
             b_g_last = exp(b_g_last)
             b_h1 = b_h1 * b_g_last
@@ -239,49 +215,34 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                 b_h4 *= exp(b_gk_last4)[:, None]
         b_v = b_v.to(k.dtype.element_ty)
 
-        p_k = tl.make_block_ptr(
-            k, (K, T), (1, stride_k), (0, i_t * BT), (64, BT), (0, 1)
-        )
-        b_k = tl.load(p_k, boundary_check=(0, 1))
+        # ``k`` is consumed transposed ([64, BT]); descriptors need a contiguous
+        # innermost dim, so load the natural [BT, 64] layout and transpose.
+        p_k = tl.make_tensor_descriptor(k, (T, K), (stride_k, 1), (BT, 64))
+        b_k = tl.trans(p_k.load([i_t * BT, 0]))
         b_h1 += tl.dot(b_k, b_v)
         if K > 64:
-            p_k = tl.make_block_ptr(
-                k, (K, T), (1, stride_k), (64, i_t * BT), (64, BT), (0, 1)
-            )
-            b_k = tl.load(p_k, boundary_check=(0, 1))
+            b_k = tl.trans(p_k.load([i_t * BT, 64]))
             b_h2 += tl.dot(b_k, b_v)
         if K > 128:
-            p_k = tl.make_block_ptr(
-                k, (K, T), (1, stride_k), (128, i_t * BT), (64, BT), (0, 1)
-            )
-            b_k = tl.load(p_k, boundary_check=(0, 1))
+            b_k = tl.trans(p_k.load([i_t * BT, 128]))
             b_h3 += tl.dot(b_k, b_v)
         if K > 192:
-            p_k = tl.make_block_ptr(
-                k, (K, T), (1, stride_k), (192, i_t * BT), (64, BT), (0, 1)
-            )
-            b_k = tl.load(p_k, boundary_check=(0, 1))
+            b_k = tl.trans(p_k.load([i_t * BT, 192]))
             b_h4 += tl.dot(b_k, b_v)
 
     # epilogue
     if STORE_FINAL_STATE:
-        p_ht = tl.make_block_ptr(ht, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0))
-        tl.store(p_ht, b_h1.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
+        p_ht = tl.make_tensor_descriptor(ht, (K, V), (V, 1), (64, BV))
+        p_ht.store([0, i_v * BV], b_h1.to(p_ht.dtype))
         if K > 64:
-            p_ht = tl.make_block_ptr(
-                ht, (K, V), (V, 1), (64, i_v * BV), (64, BV), (1, 0)
-            )
-            tl.store(p_ht, b_h2.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
+            p_ht = tl.make_tensor_descriptor(ht, (K, V), (V, 1), (64, BV))
+            p_ht.store([64, i_v * BV], b_h2.to(p_ht.dtype))
         if K > 128:
-            p_ht = tl.make_block_ptr(
-                ht, (K, V), (V, 1), (128, i_v * BV), (64, BV), (1, 0)
-            )
-            tl.store(p_ht, b_h3.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
+            p_ht = tl.make_tensor_descriptor(ht, (K, V), (V, 1), (64, BV))
+            p_ht.store([128, i_v * BV], b_h3.to(p_ht.dtype))
         if K > 192:
-            p_ht = tl.make_block_ptr(
-                ht, (K, V), (V, 1), (192, i_v * BV), (64, BV), (1, 0)
-            )
-            tl.store(p_ht, b_h4.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
+            p_ht = tl.make_tensor_descriptor(ht, (K, V), (V, 1), (64, BV))
+            p_ht.store([192, i_v * BV], b_h4.to(p_ht.dtype))
 
 
 def chunk_gated_delta_rule_fwd_h(

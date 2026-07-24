@@ -67,39 +67,36 @@ def chunk_scaled_dot_kkt_fwd_kernel(
     else:
         bos, eos = i_b * T, i_b * T + T
     o_t = tl.arange(0, BT)
+    # ``beta``/``g`` are gathered with stride ``H`` (one scalar per token), which
+    # is not a contiguous innermost dimension, so tensor descriptors do not
+    # apply; use masked pointer loads for these 1D strided vectors.
+    o_row = i_t * BT + o_t
+    m_row = o_row < T
 
-    p_beta = tl.make_block_ptr(
-        beta + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,)
-    )
-    b_beta = tl.load(p_beta, boundary_check=(0,))
+    b_beta = tl.load(beta + bos * H + i_h + o_row * H, mask=m_row, other=0.0)
 
     b_A = tl.zeros([BT, BT], dtype=tl.float32)
     for i_k in range(tl.cdiv(K, BK)):
-        p_k = tl.make_block_ptr(
+        p_k = tl.make_tensor_descriptor(
             k + (bos * Hg + i_h // (H // Hg)) * K,
             (T, K),
             (Hg * K, 1),
-            (i_t * BT, i_k * BK),
             (BT, BK),
-            (1, 0),
         )
-        b_k = tl.load(p_k, boundary_check=(0, 1))
+        b_k = p_k.load([i_t * BT, i_k * BK])
         b_kb = b_k * b_beta[:, None]
         b_A += tl.dot(b_kb.to(b_k.dtype), tl.trans(b_k))
 
     if USE_G:
-        p_g = tl.make_block_ptr(
-            g_cumsum + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,)
-        )
-        b_g = tl.load(p_g, boundary_check=(0,))
+        b_g = tl.load(g_cumsum + bos * H + i_h + o_row * H, mask=m_row, other=0.0)
         b_g_diff = b_g[:, None] - b_g[None, :]
         b_A = b_A * safe_exp(b_g_diff)
 
     b_A = tl.where(o_t[:, None] > o_t[None, :], b_A, 0)
-    p_A = tl.make_block_ptr(
-        A + (bos * H + i_h) * BT, (T, BT), (BT * H, 1), (i_t * BT, 0), (BT, BT), (1, 0)
+    p_A = tl.make_tensor_descriptor(
+        A + (bos * H + i_h) * BT, (T, BT), (BT * H, 1), (BT, BT)
     )
-    tl.store(p_A, b_A.to(p_A.dtype.element_ty), boundary_check=(0, 1))
+    p_A.store([i_t * BT, 0], b_A.to(p_A.dtype))
 
 
 def chunk_scaled_dot_kkt_fwd(

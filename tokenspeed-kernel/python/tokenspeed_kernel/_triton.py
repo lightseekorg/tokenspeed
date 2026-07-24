@@ -40,6 +40,7 @@ from tokenspeed_triton.tools.tensor_descriptor import TensorDescriptor
 __all__ = [
     "aggregate",
     "TensorDescriptor",
+    "ensure_descriptor_allocator",
     "gl",
     "gluon",
     "libdevice",
@@ -48,6 +49,32 @@ __all__ = [
     "tl",
     "triton",
 ]
+
+
+_DESCRIPTOR_ALLOCATOR_SET = False
+
+
+def _descriptor_scratch_allocator(size: int, alignment: int, stream):
+    """Torch-backed scratch allocator for on-device tensor descriptors."""
+    import torch
+
+    return torch.empty(size, device="cuda", dtype=torch.int8)
+
+
+def ensure_descriptor_allocator() -> None:
+    """Register a global scratch allocator for on-device tensor descriptors.
+
+    ``tl.make_tensor_descriptor`` needs a global-memory scratch buffer for the
+    descriptor object, which Triton requests through a process-global allocator
+    callback. Kernels that build descriptors in-kernel must call this once
+    before launch. The registration is idempotent so repeated calls (and
+    multiple kernel families) share a single torch-backed allocator.
+    """
+    global _DESCRIPTOR_ALLOCATOR_SET
+    if _DESCRIPTOR_ALLOCATOR_SET:
+        return
+    triton.set_allocator(_descriptor_scratch_allocator)
+    _DESCRIPTOR_ALLOCATOR_SET = True
 
 
 _TRITON_SRC = "triton"

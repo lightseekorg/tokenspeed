@@ -16,3 +16,10 @@
 # SOFTWARE.
 
 """FLA-derived Triton helpers vendored for GDN chunk prefill."""
+
+from tokenspeed_kernel._triton import ensure_descriptor_allocator
+
+# These kernels build tensor descriptors in-kernel via tl.make_tensor_descriptor,
+# which needs a process-global scratch allocator. Register it when the package is
+# imported so any kernel here can launch without a per-call setup step.
+ensure_descriptor_allocator()
