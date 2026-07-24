@@ -1,11 +1,19 @@
 """Regression tests for DeepEP NVFP4 weight preprocessing."""
 
+import pytest
 import torch
+from tokenspeed_kernel.platform import current_platform
 
+if not current_platform().is_nvidia:
+    pytest.skip(
+        "flashinfer cutedsl DeepEP NVFP4 kernels are NVIDIA-only",
+        allow_module_level=True,
+    )
+
+from tokenspeed_kernel.ops.moe import moe_plan
 from tokenspeed_kernel.ops.moe.flashinfer.cutedsl_deepep_nvfp4 import (
     flashinfer_cutedsl_deepep_nvfp4_moe_weights,
 )
-from tokenspeed_kernel.ops.moe import moe_plan
 
 
 def test_deepep_nvfp4_quant_scales_are_contiguous_per_expert() -> None:
@@ -35,11 +43,12 @@ def test_deepep_nvfp4_quant_scales_are_contiguous_per_expert() -> None:
     )
 
 
-def test_deepep_plan_preserves_static_low_latency_token_capacity() -> None:
+def test_deepep_plan_preserves_static_low_latency_token_capacity(require) -> None:
+    require("moe", "apply", "flashinfer_cutedsl", torch.bfloat16, "x")
     plan = moe_plan(
         "nvfp4",
         input_dtype=torch.bfloat16,
-        activation="swiglu",
+        activation="silu",
         a2a_backend="deepep",
         ep_size=2,
         ispp=128,
