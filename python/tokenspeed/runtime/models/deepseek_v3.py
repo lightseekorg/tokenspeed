@@ -224,7 +224,6 @@ class DeepseekV3MLP(nn.Module):
 
 
 class MoEGate(nn.Module):
-    _DSV3_ROUTER_GEMM_EXPERTS = (256, 384, 768)
     _DSV3_ROUTER_GEMM_HIDDEN = (3072, 6144, 7168)
 
     def __init__(self, config, prefix: str = ""):
@@ -242,11 +241,10 @@ class MoEGate(nn.Module):
         self.use_dsv3_router_gemm = (
             _is_hopper_plus
             and self.weight.dtype in (torch.bfloat16, torch.float32)
-            and config.n_routed_experts in self._DSV3_ROUTER_GEMM_EXPERTS
             and config.hidden_size in self._DSV3_ROUTER_GEMM_HIDDEN
         )
 
-    def forward(self, hidden_states, comm_manager=None):
+    def forward(self, hidden_states):
         if self.use_dsv3_router_gemm and hidden_states.size(0) > 0:
             logits = dsv3_router_gemm(
                 hidden_states,

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import functools
 import importlib.util
+from collections.abc import Sequence
 
 import torch
 from tokenspeed_kernel.ops.attention.triton.minimax_indexer import (
@@ -123,6 +124,8 @@ if platform.is_nvidia and platform.is_blackwell and _fmha_sm100_importable():
         local_blocks: int,
         k_scale: float | torch.Tensor | None = None,
         v_scale: float | torch.Tensor | None = None,
+        query_lens_cpu: Sequence[int] | None = None,
+        seq_lens_cpu: Sequence[int] | None = None,
     ) -> torch.Tensor:
         """Run MiniMax sparse-attention extend with the CuTe attend kernel."""
 
@@ -155,6 +158,8 @@ if platform.is_nvidia and platform.is_blackwell and _fmha_sm100_importable():
                 local_blocks=local_blocks,
                 k_scale=k_scale,
                 v_scale=v_scale,
+                query_lens_cpu=query_lens_cpu,
+                seq_lens_cpu=seq_lens_cpu,
             )
         if q.shape[0] == 0:
             return torch.empty_like(q)
@@ -180,6 +185,8 @@ if platform.is_nvidia and platform.is_blackwell and _fmha_sm100_importable():
             prefix_lens=prefix_lens,
             max_query_len=max_seqlen_q,
             max_blocks=max_blocks,
+            query_lens_cpu=query_lens_cpu,
+            seq_lens_cpu=seq_lens_cpu,
         )
 
         q = q.contiguous()

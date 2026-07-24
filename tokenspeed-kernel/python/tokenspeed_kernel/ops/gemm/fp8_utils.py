@@ -52,6 +52,32 @@ def ceil_div(x: int, y: int) -> int:
     return (x + y - 1) // y
 
 
+def swizzle_mxfp8_scale(sf: torch.Tensor, M: int, K: int) -> torch.Tensor:
+    """Re-layout row-major MXFP8 (1,32) block scales into the F8_128x4
+    swizzled layout consumed by flashinfer's block-scaled GEMMs.
+
+    Args:
+        sf: ``[M, K // 32]`` uint8 e8m0 scales, row-major.
+        M: Number of rows of the scaled tensor.
+        K: Number of columns of the scaled tensor (multiple of 32).
+
+    Returns:
+        1D uint8 tensor of ``round_up(M, 128) * round_up(K // 32, 4)``
+        elements in the 128x4 tile layout (rows padded with zeros).
+    """
+    num_m_tiles = ceil_div(M, 128)
+    num_k_tiles = ceil_div(K, 128)
+
+    scale_cols = K // 32
+    sf_padded = torch.zeros(
+        (num_m_tiles * 128, num_k_tiles * 4), dtype=sf.dtype, device=sf.device
+    )
+    sf_padded[:M, :scale_cols] = sf
+
+    sf_tiled = sf_padded.view(num_m_tiles, 4, 32, num_k_tiles, 4)
+    return sf_tiled.transpose(1, 3).contiguous().view(-1)
+
+
 @triton.jit
 def _per_token_group_quant_8bit(
     # Pointers to inputs and output

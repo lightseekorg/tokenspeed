@@ -148,6 +148,138 @@ if gemm_fp8_nt_groupwise is not error_fn:
         return output
 
 
+# ---- FlashInfer MXFP8 (1,32) ue8m0, cute-dsl backend ---------------------
+
+mm_mxfp8 = error_fn
+
+if platform.is_nvidia and platform.is_blackwell:
+    try:
+        from flashinfer.gemm import mm_mxfp8
+    except ImportError:
+        pass
+
+_MXFP8_UE8M0_1X32_SCALE = ScaleFormat(
+    storage_dtype=torch.uint8,
+    granularity="block",
+    block_shape=(1, 32),
+)
+_MXFP8_FLOAT_1X32_SCALE = ScaleFormat(
+    storage_dtype=torch.float32,
+    granularity="block",
+    block_shape=(1, 32),
+)
+_MXFP8_1X32_FORMAT_SIGNATURES = frozenset(
+    format_signature(
+        a=tensor_format("mxfp8", _fp8_dtype, scale=a_scale),
+        b=tensor_format("mxfp8", _fp8_dtype, scale=_MXFP8_UE8M0_1X32_SCALE),
+    )
+    for a_scale in (_MXFP8_FLOAT_1X32_SCALE, _MXFP8_UE8M0_1X32_SCALE)
+)
+
+
+def has_flashinfer_mxfp8() -> bool:
+    """Whether the flashinfer cute-dsl MXFP8 (1,32) GEMM is usable here.
+
+    Returns:
+        True when running on an NVIDIA Blackwell (SM10x) GPU with a
+        flashinfer build that provides ``mm_mxfp8``.
+    """
+    return mm_mxfp8 is not error_fn
+
+
+if mm_mxfp8 is not error_fn:
+    from tokenspeed_kernel.ops.gemm.fp8_utils import swizzle_mxfp8_scale
+
+    @register_kernel(
+        "gemm",
+        "mm",
+        name="flashinfer_mm_mxfp8",
+        solution="flashinfer",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 3),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=_MXFP8_1X32_FORMAT_SIGNATURES,
+        traits={
+            "k_align_32": frozenset({True}),
+            "n_min_128": frozenset({True}),
+            "k_min_128": frozenset({True}),
+        },
+        priority=Priority.SPECIALIZED + 2,
+    )
+    def flashinfer_mm_mxfp8(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scales: torch.Tensor | None,
+        B_scales: torch.Tensor | None,
+        out_dtype: torch.dtype,
+        *,
+        alpha: torch.Tensor | None = None,
+        block_size: list[int] | None = None,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """MXFP8 (1,32)-block ue8m0 GEMM via flashinfer's cute-dsl backend.
+
+        Args:
+            A: ``[M, K]`` float8_e4m3fn activations.
+            B: ``[N, K]`` (or ``[K, N]`` column-major) float8_e4m3fn weight.
+            A_scales: uint8 e8m0 activation scales, either 1D in the
+                F8_128x4 swizzled layout or ``[M, K // 32]`` row-major
+                (re-swizzled per call; prefer pre-swizzled).
+            B_scales: uint8 e8m0 weight scales, same layout options with
+                ``[N, K // 32]`` row-major.
+            out_dtype: Output dtype (bf16/fp16).
+            alpha: Unused.
+            block_size: Must be ``[1, 32]``.
+            out: Optional output buffer.
+
+        Returns:
+            ``[M, N]`` tensor of ``out_dtype``.
+        """
+        assert (
+            A_scales is not None
+        ), "A_scales is required; online quantization should be done by the caller"
+        assert B_scales is not None, "B_scales is required for MXFP8 GEMM"
+        assert block_size == [1, 32], f"expected block_size [1, 32], got {block_size}"
+        k = A.shape[1]
+        # B follows the dispatch convention of a [N, K] weight (row-major,
+        # like the Triton kernel assumes); mm_mxfp8 wants the [K, N]
+        # column-major view. Shape alone cannot disambiguate square weights,
+        # so decide by memory layout.
+        if B.shape[0] == k and B.stride(0) == 1:
+            b = B
+        else:
+            b = B.t()
+        n = b.shape[1]
+        if k < 128 or k % 32 != 0 or n < 128:
+            raise ValueError(
+                f"flashinfer_mm_mxfp8 requires K >= 128, K % 32 == 0 and "
+                f"N >= 128, got K={k}, N={n}"
+            )
+        if A_scales.dtype != torch.uint8 or B_scales.dtype != torch.uint8:
+            raise ValueError(
+                "flashinfer_mm_mxfp8 requires uint8 e8m0 scales, got "
+                f"A_scales={A_scales.dtype}, B_scales={B_scales.dtype}"
+            )
+        if A_scales.dim() != 1:
+            A_scales = swizzle_mxfp8_scale(A_scales.contiguous(), A.shape[0], k)
+        if B_scales.dim() != 1:
+            B_scales = swizzle_mxfp8_scale(B_scales.contiguous(), n, k)
+        output = mm_mxfp8(
+            A,
+            b,
+            A_scales,
+            B_scales,
+            out_dtype=out_dtype,
+            backend="cute-dsl",
+        )
+        if out is not None:
+            out.copy_(output)
+            return out
+        return output
+
+
 # ---- FlashInfer FP4 -----------------------------------------------------
 
 mm_fp4 = error_fn

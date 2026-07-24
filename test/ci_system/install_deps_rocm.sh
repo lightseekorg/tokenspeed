@@ -48,8 +48,8 @@ echo "=== Step 3: Install tokenspeed-kernel packages ==="
 
 cd "${WORKSPACE}"
 # `tokenspeed-kernel` installs requirements/rocm.txt during its native build.
-# Keep the matching in-tree AMD package installed first so that exact pin is
-# satisfied even before the public wheel exists.
+# Keep the matching in-tree AMD package installed first so that the minimum
+# requirement is satisfied even before the public wheel exists.
 pip3 install --force-reinstall --no-deps \
     "${WORKSPACE}/tokenspeed-kernel-amd" --no-build-isolation
 

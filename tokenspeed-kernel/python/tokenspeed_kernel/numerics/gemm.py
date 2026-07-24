@@ -130,6 +130,20 @@ class GemmInputGenerator(InputGenerator):
         )
         return scales.to(dtype)
 
+    def _generate_block_scales(self, shape: tuple[int, ...], dtype) -> torch.Tensor:
+        if dtype == torch.uint8:
+            # ue8m0: biased power-of-two exponent bytes; span 2^-3..2^3 so
+            # dequantized magnitudes stay in a numerically sane range.
+            return torch.randint(
+                124,
+                131,
+                shape,
+                dtype=torch.uint8,
+                device=self.device,
+                generator=self.rng,
+            )
+        return self._generate_scales(shape, dtype)
+
     def _format(self, role: str) -> TensorFormat | None:
         if self.format_signature is None:
             return None
@@ -168,12 +182,12 @@ class GemmInputGenerator(InputGenerator):
             block_n, block_k = block_size
             k_tiles = math.ceil(K / block_k)
             if role == "a":
-                return self._generate_scales(
+                return self._generate_block_scales(
                     (*batch_shape, M, k_tiles), scale.storage_dtype
                 )
             if role == "b":
                 n_tiles = math.ceil(N / block_n)
-                return self._generate_scales(
+                return self._generate_block_scales(
                     (*batch_shape, n_tiles, k_tiles), scale.storage_dtype
                 )
 

@@ -295,14 +295,17 @@ def test_minimax_m3_mixed_precision_quant_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from tokenspeed.runtime.layers.dense import Fp8LinearMethod
+    from tokenspeed.runtime.models.minimax_m3 import (
+        MinimaxM3QKVParallelLinearWithIndexer,
+    )
 
     model = _build_model(monkeypatch, quant_config=_mixed_precision_config())
-
     attn = model.model.layers[3].self_attn
+    # Sparse layers fuse q/k/v/index_q/index_k into one projection; its MXFP8
+    # dispatch confirms the index members resolved to MXFP8 via the qkv unfuse.
+    assert isinstance(attn.qkv_proj, MinimaxM3QKVParallelLinearWithIndexer)
     assert isinstance(attn.qkv_proj.quant_method, Fp8LinearMethod)
     assert isinstance(attn.o_proj.quant_method, Fp8LinearMethod)
-    assert isinstance(attn.indexer.index_q_proj.quant_method, Fp8LinearMethod)
-    assert isinstance(attn.indexer.index_k_proj.quant_method, Fp8LinearMethod)
 
     assert isinstance(
         model.model.layers[0].mlp.gate_up_proj.quant_method, Fp8LinearMethod

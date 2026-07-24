@@ -10,6 +10,7 @@ runner:
     - b300-4gpu
 env:
   CI: "true"
+  TOKENSPEED_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN: "1"
 install:
   - bash test/ci_system/install_deps.sh
 server:
