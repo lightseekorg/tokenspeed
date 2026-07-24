@@ -20,37 +20,48 @@
 
 """CUDA KV cache transfer kernels."""
 
+from typing import Any
+
 from tokenspeed_kernel.registry import error_fn
 
 try:
     from tokenspeed_kernel.thirdparty.cuda.kvcacheio import (
+        DirectH2DScatterPlan,
+        prepare_kv_direct_h2d_scatter_plan,
         transfer_kv_all_layer_lf_pf,
         transfer_kv_all_layer_lf_ph,
         transfer_kv_all_layer_mla,
         transfer_kv_all_layer_mla_lf_pf,
         transfer_kv_direct,
+        transfer_kv_direct_h2d_scatter_prepared,
         transfer_kv_per_layer_mla,
         transfer_kv_per_layer_mla_pf_lf,
         transfer_kv_per_layer_pf_lf,
         transfer_kv_per_layer_ph_lf,
     )
 except ImportError:
+    DirectH2DScatterPlan = Any
+    prepare_kv_direct_h2d_scatter_plan = error_fn
     transfer_kv_all_layer_lf_pf = error_fn
     transfer_kv_all_layer_lf_ph = error_fn
     transfer_kv_all_layer_mla = error_fn
     transfer_kv_all_layer_mla_lf_pf = error_fn
     transfer_kv_direct = error_fn
+    transfer_kv_direct_h2d_scatter_prepared = error_fn
     transfer_kv_per_layer_mla = error_fn
     transfer_kv_per_layer_mla_pf_lf = error_fn
     transfer_kv_per_layer_pf_lf = error_fn
     transfer_kv_per_layer_ph_lf = error_fn
 
 __all__ = [
+    "DirectH2DScatterPlan",
+    "prepare_kv_direct_h2d_scatter_plan",
     "transfer_kv_all_layer_lf_pf",
     "transfer_kv_all_layer_lf_ph",
     "transfer_kv_all_layer_mla",
     "transfer_kv_all_layer_mla_lf_pf",
     "transfer_kv_direct",
+    "transfer_kv_direct_h2d_scatter_prepared",
     "transfer_kv_per_layer_mla",
     "transfer_kv_per_layer_mla_pf_lf",
     "transfer_kv_per_layer_pf_lf",

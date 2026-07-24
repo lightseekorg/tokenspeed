@@ -21,6 +21,7 @@
 #pragma once
 
 #include <optional>
+#include <map>
 #include <unordered_map>
 #include <variant>
 #include <cstdint>
@@ -86,6 +87,7 @@ struct SchedulerConfig {
     } device_allocator;
 
     std::vector<PagedCacheGroupConfig> paged_cache_groups{};
+    std::map<std::string, std::int32_t> paged_cache_host_group_pages{};
 
     // GCD of every group's effective block_size (per-group override, else the global
     // block_size): the base page granularity all group block sizes are multiples of.

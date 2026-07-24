@@ -294,6 +294,9 @@ speculative decoding and paged-cache groups are both active — and prefix cachi
 stays on by default. Add `--enable-metrics` to read `Decoded Tok/Iter` and the
 speculative accept rate from the run summary.
 
+DeepSeek V4 MTP currently requires `--disable-kvstore`; grouped paged-cache
+loadback does not yet restore the independent draft KV pool.
+
 ## Tuning Order
 
 1. Set model ID, trust policy, tokenizer mode, and served model name.

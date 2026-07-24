@@ -122,6 +122,9 @@ public:
     // snapshot itself (see `PagedCacheSnapshot::IsCompleteFor`).
     bool HasPagedCacheSnapshot() const { return paged_cache_snapshot_ != nullptr; }
     const PagedCacheSnapshot* GetPagedCacheSnapshot() const { return paged_cache_snapshot_.get(); }
+    bool HasPagedCacheHostSnapshot() const { return paged_cache_host_snapshot_ != nullptr; }
+    bool HasPagedCachePendingHostSnapshot() const { return paged_cache_pending_host_snapshot_ != nullptr; }
+    const PagedCacheSnapshot* GetPagedCacheHostSnapshot() const { return paged_cache_host_snapshot_.get(); }
 
     std::optional<cache_op_id> CacheOpId() const;
 
@@ -141,6 +144,12 @@ private:
     void AttachPagedCacheSnapshot(std::unique_ptr<PagedCacheSnapshot> snapshot);
     std::unique_ptr<PagedCacheSnapshot> DetachPagedCacheSnapshot();
     PagedCacheSnapshot* GetPagedCacheSnapshotMut() { return paged_cache_snapshot_.get(); }
+    void AttachPagedCacheHostSnapshot(std::unique_ptr<PagedCacheSnapshot> snapshot);
+    std::unique_ptr<PagedCacheSnapshot> DetachPagedCacheHostSnapshot();
+    void AttachPagedCachePendingHostSnapshot(std::unique_ptr<PagedCacheSnapshot> snapshot);
+    std::unique_ptr<PagedCacheSnapshot> DetachPagedCachePendingHostSnapshot();
+    void PromotePagedCachePendingHostSnapshot();
+    PagedCacheSnapshot* GetPagedCacheHostSnapshotMut() { return paged_cache_host_snapshot_.get(); }
 
 private:
     TreeNode* parent_{};
@@ -157,6 +166,8 @@ private:
     std::unique_ptr<MambaSlot> mamba_slot_{};
     std::unique_ptr<MambaSlot> mamba_host_slot_{};
     std::unique_ptr<PagedCacheSnapshot> paged_cache_snapshot_{};
+    std::unique_ptr<PagedCacheSnapshot> paged_cache_host_snapshot_{};
+    std::unique_ptr<PagedCacheSnapshot> paged_cache_pending_host_snapshot_{};
 
     static std::atomic<seq_id_t> next_seq_id_;
 };

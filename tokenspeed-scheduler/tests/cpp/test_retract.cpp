@@ -46,25 +46,14 @@ protected:
         SendForwardDone(id, {42});
         PlanOnce();
     }
+};
 
-    void SendReserveNumTokens(const std::string& id, std::int32_t n) {
-        ExecutionEvent event;
-        event.With(ForwardEvent{forward::UpdateReserveNumTokens{
-            .request_id = id,
-            .reserve_num_tokens_in_next_schedule_event = n,
-        }});
-        scheduler_->Advance(std::move(event));
-    }
-
-    static const FlatWriteBackOperation* GetWriteBack(const ExecutionPlan& plan) {
-        for (const auto& op : plan.Operations()) {
-            if (auto* cop = std::get_if<CacheOperation>(&op)) {
-                if (auto* wb = std::get_if<FlatWriteBackOperation>(cop)) {
-                    return wb;
-                }
-            }
-        }
-        return nullptr;
+class DisableL2RetractTestSuite : public RetractTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = RetractTestSuite::MakeConfig();
+        cfg.disable_l2_cache = true;
+        return cfg;
     }
 };
 
@@ -86,6 +75,17 @@ TEST_F(RetractTestSuite, Retract_TriggeredWhenDeviceFull) {
         }
     }
     EXPECT_TRUE(any_pages);
+}
+
+TEST_F(DisableL2RetractTestSuite, RetractStillEmitsHostWriteBackWhenL2Disabled) {
+    BringToDecoding("r1");
+    SendReserveNumTokens("r1", 3);
+
+    auto plan = PlanOnce();
+    const auto* wb = GetWriteBack(plan);
+    ASSERT_NE(wb, nullptr);
+    EXPECT_FALSE(wb->op_ids.empty());
+    EXPECT_EQ(scheduler_->AvailableHostKvPages(), Config().host_allocator.total_pages - 2);
 }
 
 // Retracting request must not appear in the forward batch.
@@ -128,6 +128,28 @@ TEST_F(RetractTestSuite, Retract_WriteBackDoneTransitionsToRetracted) {
     EXPECT_EQ(scheduler_->RetractedSize(), 1u);
     EXPECT_EQ(scheduler_->DecodingSize(), 0u);
 }
+
+#if !TOKENSPEED_FLAT_KVCACHE
+TEST_F(RetractTestSuite, FailedWriteBackAbortsAfterOutstandingForwardResult) {
+    BringToDecoding("r1");
+    SendReserveNumTokens("r1", 3);
+
+    auto retract_plan = PlanOnce();
+    const auto* writeback = GetWriteBack(retract_plan);
+    ASSERT_NE(writeback, nullptr);
+    ASSERT_EQ(writeback->op_ids.size(), 1u);
+
+    SendWriteBackDone(writeback->op_ids[0], /*success=*/false);
+    EXPECT_EQ(scheduler_->RetractedSize(), 0u);
+    EXPECT_TRUE(PlanOnce().SchedulerAborts().empty());
+
+    SendForwardDone("r1", {});
+    auto abort_plan = PlanOnce();
+    ASSERT_EQ(abort_plan.SchedulerAborts().size(), 1u);
+    EXPECT_EQ(abort_plan.SchedulerAborts().front().request_id, "r1");
+    EXPECT_EQ(abort_plan.SchedulerAborts().front().message, "L2 retract write-back failed");
+}
+#endif
 
 // Retracted request recovers to Decoding on next PlanOnce.
 TEST_F(RetractTestSuite, Retract_RetractedRequestRecoversToDecoding) {
@@ -184,26 +206,6 @@ protected:
         cfg.host_allocator.total_pages = 16;
         cfg.enable_l3_storage = false;
         return cfg;
-    }
-
-    static const FlatWriteBackOperation* GetWriteBack(const ExecutionPlan& plan) {
-        for (const auto& op : plan.Operations()) {
-            if (auto* cop = std::get_if<CacheOperation>(&op)) {
-                if (auto* wb = std::get_if<FlatWriteBackOperation>(cop)) {
-                    return wb;
-                }
-            }
-        }
-        return nullptr;
-    }
-
-    static const FlatForwardOperation* GetForward(const ExecutionPlan& plan) {
-        for (const auto& op : plan.Operations()) {
-            if (auto* f = std::get_if<FlatForwardOperation>(&op)) {
-                return f;
-            }
-        }
-        return nullptr;
     }
 };
 
@@ -282,35 +284,6 @@ protected:
         cfg.host_allocator.total_pages = 16;
         cfg.enable_l3_storage = false;
         return cfg;
-    }
-
-    void SendReserveNumTokens(const std::string& id, std::int32_t n) {
-        ExecutionEvent event;
-        event.With(ForwardEvent{forward::UpdateReserveNumTokens{
-            .request_id = id,
-            .reserve_num_tokens_in_next_schedule_event = n,
-        }});
-        scheduler_->Advance(std::move(event));
-    }
-
-    static const FlatWriteBackOperation* GetWriteBack(const ExecutionPlan& plan) {
-        for (const auto& op : plan.Operations()) {
-            if (auto* cop = std::get_if<CacheOperation>(&op)) {
-                if (auto* wb = std::get_if<FlatWriteBackOperation>(cop)) {
-                    return wb;
-                }
-            }
-        }
-        return nullptr;
-    }
-
-    static const FlatForwardOperation* GetForward(const ExecutionPlan& plan) {
-        for (const auto& op : plan.Operations()) {
-            if (auto* f = std::get_if<FlatForwardOperation>(&op)) {
-                return f;
-            }
-        }
-        return nullptr;
     }
 };
 

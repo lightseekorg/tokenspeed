@@ -98,6 +98,7 @@ def make_config(
     enable_mamba_l2: bool = False,
     mamba_l2_host_slots: int = 0,
     paged_cache_groups: Sequence["PagedCacheGroupConfig"] | None = None,
+    paged_cache_host_group_pages: Mapping[str, int] | None = None,
     enable_mixed_prefill_decode: bool = False,
     prefix_cache_adjunct: "PrefixCacheAdjunctSpec | None" = None,
 ) -> SchedulerConfig:
@@ -131,6 +132,11 @@ def make_config(
     cfg.enable_mixed_prefill_decode = enable_mixed_prefill_decode
     if paged_cache_groups:
         cfg.paged_cache_groups = list(paged_cache_groups)
+    if paged_cache_host_group_pages:
+        cfg.paged_cache_host_group_pages = {
+            str(group_id): int(page_count)
+            for group_id, page_count in paged_cache_host_group_pages.items()
+        }
     # Opt-in; unset means paged-cache groups are transport-only.
     if prefix_cache_adjunct is not None:
         cfg.prefix_cache_adjunct = prefix_cache_adjunct

@@ -41,13 +41,6 @@ protected:
         }
         return nullptr;
     }
-
-    static const FlatForwardOperation* GetForwardOp(const ExecutionPlan& plan) {
-        for (const auto& op : plan.Operations()) {
-            if (auto* f = std::get_if<FlatForwardOperation>(&op)) return f;
-        }
-        return nullptr;
-    }
 };
 
 TEST_F(PrefetchTestSuite, Prefetch_GeneratedForL3StorageHit) {

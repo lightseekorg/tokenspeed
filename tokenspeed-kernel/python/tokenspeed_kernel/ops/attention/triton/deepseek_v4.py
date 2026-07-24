@@ -41,7 +41,7 @@ DEEPSEEK_V4_INDEXER_MXFP4_SCALE_DIM = (
     DEEPSEEK_V4_INDEXER_DIM // DEEPSEEK_V4_MXFP4_BLOCK_SIZE
 )
 DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT = 128
-
+_HCA_DIRECT_LAUNCH_BUCKET = 64
 __all__ = [
     "deepseek_v4_build_dense_prefill_local_compressed_indices",
     "deepseek_v4_combine_dense_swa_indices",
@@ -51,6 +51,7 @@ __all__ = [
     "deepseek_v4_decode_swa_indices_and_lens",
     "deepseek_v4_dequantize_and_gather_k_cache",
     "deepseek_v4_fused_csa_indexer_mxfp4_cache_insert",
+    "deepseek_v4_fused_hca_direct_compress_cache_insert",
     "deepseek_v4_fused_indexer_q_rope_hadamard_mxfp4",
     "deepseek_v4_fused_sparse_compress_cache_insert",
     "deepseek_v4_gather_indexer_mxfp4_cache",
@@ -58,6 +59,14 @@ __all__ = [
     "deepseek_v4_save_compressor_state",
     "write_deepseek_v4_indexer_mxfp4_cache_cuda",
 ]
+
+
+def _deepseek_v4_hca_direct_launch_rows(num_actual: int) -> int:
+    return (
+        (num_actual + _HCA_DIRECT_LAUNCH_BUCKET - 1)
+        // _HCA_DIRECT_LAUNCH_BUCKET
+        * _HCA_DIRECT_LAUNCH_BUCKET
+    )
 
 
 @triton.jit
@@ -254,7 +263,18 @@ def deepseek_v4_fused_indexer_q_rope_hadamard_mxfp4(
     ), weights_out
 
 
-@triton.jit
+# ``block_table_width`` varies per request with cache depth, so keeping it as a
+# ``tl.constexpr`` compiles a fresh kernel variant for every distinct width and
+# stalls the compute stream on first use of each width. It only bounds
+# ``table_idx``, so it is a runtime scalar excluded from alignment specialization
+# (see the HCA direct kernel below for the full rationale).
+@triton.jit(
+    do_not_specialize_on_alignment=[
+        "block_table_width",
+        "state_block_size",
+        "kv_cache_block_size",
+    ]
+)
 def _deepseek_v4_fused_sparse_compress_cache_kernel(
     state_cache_ptr,
     state_cache_stride0,
@@ -265,7 +285,7 @@ def _deepseek_v4_fused_sparse_compress_cache_kernel(
     block_table_ptr,
     block_table_base_offsets_ptr,
     block_table_stride,
-    block_table_width: tl.constexpr,
+    block_table_width,
     state_block_size,
     rms_norm_weight_ptr,
     rms_norm_eps,
@@ -424,6 +444,7 @@ def deepseek_v4_fused_sparse_compress_cache_insert(
         compressor_slot_mapping.numel(),
         positions.numel(),
         kv_slot_mapping.numel(),
+        token_to_req_indices.numel(),
     )
     if num_actual == 0:
         return
@@ -465,7 +486,345 @@ def deepseek_v4_fused_sparse_compress_cache_insert(
     )
 
 
-@triton.jit
+# ``block_table_width`` and ``num_source_tokens`` vary per request with cache
+# depth (e.g. 704 vs 691), so their 16-divisibility flips across cached-prefill
+# calls. Triton specializes non-constexpr ints on 16-alignment by default
+# (``kwargs["align"]`` is ``True`` for positional ints), which turns each new
+# alignment class into a fresh JIT compile that stalls the compute stream for
+# seconds and shows up as a single-point cache-insert outlier. These scalars
+# only drive control flow and masks, never a contiguous load base, so excluding
+# them from alignment specialization removes the hidden compile dimension
+# without losing any vectorization hint.
+@triton.jit(
+    do_not_specialize_on_alignment=[
+        "block_table_width",
+        "state_block_size",
+        "kv_cache_block_size",
+        "num_active_tokens",
+        "num_source_tokens",
+    ]
+)
+def _deepseek_v4_fused_hca_direct_compress_cache_kernel(
+    active_token_indices_ptr,
+    state_cache_ptr,
+    state_cache_stride0,
+    state_cache_stride1,
+    kv_ptr,
+    kv_stride,
+    score_ptr,
+    score_stride,
+    ape_ptr,
+    token_to_req_indices_ptr,
+    query_start_loc_ptr,
+    positions_ptr,
+    block_table_ptr,
+    block_table_base_offsets_ptr,
+    block_table_stride,
+    block_table_width,
+    state_block_size,
+    rms_norm_weight_ptr,
+    rms_norm_eps,
+    cos_sin_cache_ptr,
+    cos_sin_stride,
+    k_cache_ptr,
+    kv_slot_mapping_ptr,
+    kv_cache_block_size,
+    num_active_tokens,
+    num_source_tokens,
+    HEAD_SIZE: tl.constexpr,
+    TRITON_BLOCK_SIZE: tl.constexpr,
+    STATE_WIDTH: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    ROPE_HEAD_DIM: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    QUANT_BLOCK: tl.constexpr,
+    TOKEN_STRIDE: tl.constexpr,
+    SCALE_DIM: tl.constexpr,
+    KV_BLOCK_STRIDE: tl.constexpr,
+):
+    row_idx = tl.program_id(0)
+    if row_idx >= num_active_tokens:
+        return
+    token_idx = tl.load(active_token_indices_ptr + row_idx)
+    if token_idx < 0 or token_idx >= num_source_tokens:
+        return
+
+    position = tl.load(positions_ptr + token_idx)
+    if (position + 1) % COMPRESS_RATIO != 0:
+        return
+
+    kv_slot = tl.load(kv_slot_mapping_ptr + token_idx)
+    if kv_slot < 0:
+        return
+
+    tokens = tl.arange(0, COMPRESS_RATIO)
+    source_positions = position - COMPRESS_RATIO + 1 + tokens
+
+    req_idx = tl.load(token_to_req_indices_ptr + token_idx)
+    req_start = tl.load(query_start_loc_ptr + req_idx)
+    req_end = tl.load(query_start_loc_ptr + req_idx + 1)
+    start_pos = tl.load(positions_ptr + req_start)
+    source_idx = req_start + source_positions - start_pos
+    tail_bounds = (
+        (source_idx >= req_start)
+        & (source_idx < req_end)
+        & (source_idx >= 0)
+        & (source_idx < num_source_tokens)
+    )
+    safe_source_idx = tl.minimum(tl.maximum(source_idx, 0), num_source_tokens - 1)
+    source_req = tl.load(
+        token_to_req_indices_ptr + safe_source_idx,
+        mask=tail_bounds,
+        other=-1,
+    )
+    in_tail = tail_bounds & (source_req == req_idx)
+
+    if block_table_base_offsets_ptr is not None:
+        base_logical_page = tl.load(block_table_base_offsets_ptr + req_idx)
+    else:
+        base_logical_page = tl.full((), 0, tl.int32)
+    table_idx = source_positions // state_block_size - base_logical_page
+    valid_paged = (
+        (~in_tail)
+        & (source_positions >= 0)
+        & (table_idx >= 0)
+        & (table_idx < block_table_width)
+    )
+    block_numbers = tl.load(
+        block_table_ptr + req_idx * block_table_stride + table_idx,
+        mask=valid_paged,
+        other=-1,
+    ).to(tl.int64)
+    valid_paged = valid_paged & (block_numbers >= 0)
+    pos_in_block = source_positions % state_block_size
+    safe_pos_in_block = tl.maximum(pos_in_block, 0)
+
+    block = tl.arange(0, TRITON_BLOCK_SIZE)
+    mask = block < HEAD_SIZE
+    safe_block_numbers = tl.maximum(block_numbers, 0)
+    state_row_base = (
+        state_cache_ptr
+        + safe_block_numbers[:, None] * state_cache_stride0
+        + safe_pos_in_block[:, None] * state_cache_stride1
+    )
+    paged_score = tl.load(
+        state_row_base + STATE_WIDTH + block[None, :],
+        mask=valid_paged[:, None] & mask[None, :],
+        other=float("-inf"),
+    ).to(tl.float32)
+    ape_row = tl.maximum(source_positions % COMPRESS_RATIO, 0)
+    ape = tl.load(
+        ape_ptr + ape_row[:, None] * HEAD_SIZE + block[None, :],
+        mask=in_tail[:, None] & mask[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    tail_score = tl.load(
+        score_ptr + safe_source_idx[:, None] * score_stride + block[None, :],
+        mask=in_tail[:, None] & mask[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    score = tl.where(in_tail[:, None], tail_score + ape, paged_score)
+    valid_source = in_tail | valid_paged
+    score = tl.where(valid_source[:, None], score, float("-inf"))
+    score = tl.softmax(score, dim=0)
+
+    paged_kv = tl.load(
+        state_row_base + block[None, :],
+        mask=valid_paged[:, None] & mask[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    tail_kv = tl.load(
+        kv_ptr + safe_source_idx[:, None] * kv_stride + block[None, :],
+        mask=in_tail[:, None] & mask[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    kv = tl.where(in_tail[:, None], tail_kv, paged_kv)
+    kv = tl.where(valid_source[:, None], kv, 0.0)
+    compressed = tl.sum(kv * score, axis=0)
+
+    rms_w = tl.load(rms_norm_weight_ptr + block, mask=mask, other=0.0)
+    variance = tl.sum(compressed * compressed, axis=0) / HEAD_SIZE
+    normed = compressed * tl.rsqrt(variance + rms_norm_eps) * rms_w
+
+    kv_block = kv_slot // kv_cache_block_size
+    kv_pos = kv_slot % kv_cache_block_size
+    cache_block_ptr = k_cache_ptr + kv_block.to(tl.int64) * KV_BLOCK_STRIDE
+    fp8_ptr = cache_block_ptr + kv_pos * TOKEN_STRIDE
+    scale_ptr = (
+        cache_block_ptr + kv_cache_block_size * TOKEN_STRIDE + kv_pos * SCALE_DIM
+    )
+
+    NOPE_HEAD_DIM: tl.constexpr = HEAD_SIZE - ROPE_HEAD_DIM
+    HALF_ROPE: tl.constexpr = ROPE_HEAD_DIM // 2
+    N_QUANT_BLOCKS: tl.constexpr = TRITON_BLOCK_SIZE // QUANT_BLOCK
+    N_NOPE_BLOCKS: tl.constexpr = NOPE_HEAD_DIM // QUANT_BLOCK
+    INV_FP8_MAX: tl.constexpr = 1.0 / FP8_MAX
+
+    quant_input = normed.to(tl.bfloat16).to(tl.float32)
+    quant_2d = tl.reshape(quant_input, (N_QUANT_BLOCKS, QUANT_BLOCK))
+    block_absmax = tl.max(tl.abs(quant_2d), axis=1)
+    block_absmax = tl.maximum(block_absmax, 1.0e-4)
+    exponents = tl.ceil(tl.log2(block_absmax * INV_FP8_MAX))
+    inv_scales = tl.exp2(-exponents)
+    x_scaled = quant_2d * tl.reshape(inv_scales, (N_QUANT_BLOCKS, 1))
+    x_fp8 = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX).to(tl.float8e4nv)
+    x_uint8 = tl.reshape(x_fp8.to(tl.uint8, bitcast=True), (TRITON_BLOCK_SIZE,))
+
+    tl.store(fp8_ptr + block, x_uint8, mask=block < NOPE_HEAD_DIM)
+    scale_idx = tl.arange(0, N_QUANT_BLOCKS)
+    encoded = tl.maximum(tl.minimum(exponents + 127.0, 255.0), 0.0)
+    tl.store(
+        scale_ptr + scale_idx, encoded.to(tl.uint8), mask=scale_idx < N_NOPE_BLOCKS
+    )
+    tl.store(scale_ptr + N_NOPE_BLOCKS, tl.zeros((), dtype=tl.uint8))
+
+    NUM_PAIRS: tl.constexpr = TRITON_BLOCK_SIZE // 2
+    NOPE_PAIRS: tl.constexpr = NOPE_HEAD_DIM // 2
+    pair_2d = tl.reshape(normed, (NUM_PAIRS, 2))
+    even, odd = tl.split(pair_2d)
+    pair_idx = tl.arange(0, NUM_PAIRS)
+    rope_pair = pair_idx - NOPE_PAIRS
+    is_rope = rope_pair >= 0
+    cs_idx = tl.maximum(rope_pair, 0)
+
+    compressed_pos = (position // COMPRESS_RATIO) * COMPRESS_RATIO
+    cs_base = cos_sin_cache_ptr + compressed_pos * cos_sin_stride
+    cos_v = tl.load(cs_base + cs_idx, mask=is_rope, other=1.0)
+    sin_v = tl.load(cs_base + HALF_ROPE + cs_idx, mask=is_rope, other=0.0)
+    new_even = even * cos_v - odd * sin_v
+    new_odd = odd * cos_v + even * sin_v
+    rotated = tl.interleave(new_even, new_odd)
+
+    rope_ptr = (fp8_ptr + NOPE_HEAD_DIM).to(tl.pointer_type(tl.bfloat16))
+    rope_local = block - NOPE_HEAD_DIM
+    tl.store(
+        rope_ptr + rope_local,
+        rotated.to(tl.bfloat16),
+        mask=(block >= NOPE_HEAD_DIM) & mask,
+    )
+
+
+def deepseek_v4_fused_hca_direct_compress_cache_insert(
+    *,
+    state_cache: torch.Tensor,
+    kv: torch.Tensor,
+    score: torch.Tensor,
+    ape: torch.Tensor,
+    token_to_req_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    positions: torch.Tensor,
+    block_table: torch.Tensor,
+    compressor_block_size: int,
+    rms_norm_weight: torch.Tensor,
+    rms_norm_eps: float,
+    cos_sin_cache: torch.Tensor,
+    kv_cache_2d: torch.Tensor,
+    kv_slot_mapping: torch.Tensor,
+    kv_cache_block_size: int,
+    active_token_indices: torch.Tensor,
+    block_table_base_offsets: torch.Tensor | None = None,
+) -> None:
+    """Compress HCA active rows from current KV/score plus paged prefix state.
+
+    Args:
+        state_cache: Paged HCA compressor state for prefix tokens.
+        kv: Current forward HCA value states with shape ``[tokens, 512]``.
+        score: Current forward HCA score states with shape ``[tokens, 512]``.
+        ape: HCA APE table with shape ``[128, 512]``.
+        token_to_req_indices: Request id per current-step token.
+        query_start_loc: Prefix-sum token offsets for current-step requests.
+        positions: Absolute token positions for the current forward step.
+        block_table: Paged compressor-state block table.
+        compressor_block_size: Compressor-state page size.
+        rms_norm_weight: RMSNorm weight applied after weighted reduction.
+        rms_norm_eps: RMSNorm epsilon.
+        cos_sin_cache: RoPE cache indexed by compressed positions.
+        kv_cache_2d: Destination compressed KV cache byte storage.
+        kv_slot_mapping: Destination compressed KV slot per source token.
+        kv_cache_block_size: Destination compressed KV cache page size.
+        active_token_indices: Source token offsets for HCA compressed rows.
+        block_table_base_offsets: Optional logical-page offset per request.
+    """
+
+    num_source_tokens = min(
+        kv.shape[0],
+        score.shape[0],
+        positions.numel(),
+        kv_slot_mapping.numel(),
+        token_to_req_indices.numel(),
+    )
+    if active_token_indices.dim() != 1:
+        raise ValueError("active_token_indices must be a 1D tensor")
+    if active_token_indices.dtype != torch.int64:
+        active_token_indices = active_token_indices.to(torch.int64)
+    if active_token_indices.device != positions.device:
+        active_token_indices = active_token_indices.to(
+            positions.device,
+            non_blocking=True,
+        )
+    if not active_token_indices.is_contiguous():
+        active_token_indices = active_token_indices.contiguous()
+    num_actual = active_token_indices.numel()
+    if num_actual == 0 or num_source_tokens == 0:
+        return
+    if (
+        block_table_base_offsets is not None
+        and block_table_base_offsets.dtype != torch.int32
+    ):
+        block_table_base_offsets = block_table_base_offsets.to(torch.int32)
+    launch_rows = _deepseek_v4_hca_direct_launch_rows(num_actual)
+    _deepseek_v4_fused_hca_direct_compress_cache_kernel[(launch_rows,)](
+        active_token_indices[:num_actual],
+        state_cache,
+        state_cache.stride(0),
+        state_cache.stride(1),
+        kv[:num_source_tokens],
+        kv.stride(0),
+        score[:num_source_tokens],
+        score.stride(0),
+        ape,
+        token_to_req_indices[:num_source_tokens],
+        query_start_loc,
+        positions[:num_source_tokens],
+        block_table,
+        block_table_base_offsets,
+        block_table.stride(0),
+        block_table.shape[-1],
+        compressor_block_size,
+        rms_norm_weight,
+        rms_norm_eps,
+        cos_sin_cache,
+        cos_sin_cache.stride(0),
+        kv_cache_2d,
+        kv_slot_mapping[:num_source_tokens],
+        kv_cache_block_size,
+        num_actual,
+        num_source_tokens,
+        HEAD_SIZE=DEEPSEEK_V4_HEAD_DIM,
+        TRITON_BLOCK_SIZE=triton.next_power_of_2(DEEPSEEK_V4_HEAD_DIM),
+        STATE_WIDTH=state_cache.shape[-1] // 2,
+        COMPRESS_RATIO=128,
+        ROPE_HEAD_DIM=DEEPSEEK_V4_ROPE_DIM,
+        FP8_MAX=DEEPSEEK_V4_FP8_MAX,
+        QUANT_BLOCK=DEEPSEEK_V4_FP8_QUANT_BLOCK,
+        TOKEN_STRIDE=DEEPSEEK_V4_SWA_TOKEN_STRIDE,
+        SCALE_DIM=DEEPSEEK_V4_SWA_SCALE_DIM,
+        KV_BLOCK_STRIDE=kv_cache_2d.stride(0),
+        num_warps=4,
+    )
+
+
+# Same fix as the sparse/HCA compress kernels: ``block_table_width`` is a
+# per-request runtime bound on ``table_idx``, not a compile-time constant, so
+# keeping it ``tl.constexpr`` compiled a distinct CSA variant per width and
+# charged that JIT cost to the CSA cache-insert scope.
+@triton.jit(
+    do_not_specialize_on_alignment=[
+        "block_table_width",
+        "state_block_size",
+        "kv_cache_block_size",
+    ]
+)
 def _deepseek_v4_fused_csa_indexer_mxfp4_cache_kernel(
     state_cache_ptr,
     state_cache_stride0,
@@ -476,7 +835,7 @@ def _deepseek_v4_fused_csa_indexer_mxfp4_cache_kernel(
     block_table_ptr,
     block_table_base_offsets_ptr,
     block_table_stride,
-    block_table_width: tl.constexpr,
+    block_table_width,
     state_block_size,
     rms_norm_weight_ptr,
     rms_norm_eps,

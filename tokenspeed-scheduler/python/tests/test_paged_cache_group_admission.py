@@ -380,13 +380,17 @@ def test_existing_terminal_state_snapshot_credit_is_branch_specific():
     assert scheduler.paged_cache_group_failed_alloc_count("c4.test") == 0
 
 
-def test_transport_state_decode_checkpoint_credit_is_not_overcounted():
+# Cover both failed generic retract and available-host fallback paths.
+@pytest.mark.parametrize("num_host_pages", [0, 256])
+def test_transport_state_decode_checkpoint_credit_is_not_overcounted(
+    num_host_pages: int,
+):
     scheduler = _transport_state_checkpoint_scheduler(
         state_total_pages=20,
         max_scheduled_tokens=72,
         decode_input_tokens=64,
         enable_mixed_prefill_decode=True,
-        num_host_pages=256,
+        num_host_pages=num_host_pages,
         requests=[
             ("A", list(range(68))),
             ("B", list(range(1_000, 1_004))),
@@ -401,6 +405,7 @@ def test_transport_state_decode_checkpoint_credit_is_not_overcounted():
     # would otherwise return, so A cannot safely fit at this capacity.
     second_plan = scheduler.next_execution_plan()
     assert _request_input_lengths(second_plan) == {}
+    assert not second_plan.scheduler_aborts
     assert scheduler.paged_cache_group_available_pages("c4.test") == 1
     assert scheduler.paged_cache_group_failed_alloc_count("c4.test") == 0
 

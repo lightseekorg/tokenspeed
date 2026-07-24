@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <vector>
 
 #include "resource/allocator/owned_pages.h"
@@ -40,9 +41,12 @@ void TreeNode::AddChild(const token_vec_t& key, std::unique_ptr<TreeNode>&& chil
     if (child == nullptr) [[unlikely]] {
         return;
     }
-    child->parent_ = this;
-    child->depth_in_tokens_ = depth_in_tokens_ + child->tokens_.size();
-    children_[key] = std::move(child);
+    auto [it, inserted] = children_.try_emplace(key, std::move(child));
+    if (!inserted) {
+        throw std::logic_error("TreeNode::AddChild: duplicate child key");
+    }
+    it->second->parent_ = this;
+    it->second->depth_in_tokens_ = depth_in_tokens_ + it->second->tokens_.size();
 }
 
 std::unique_ptr<TreeNode> TreeNode::RemoveChild(const token_vec_t& key) {
@@ -96,12 +100,8 @@ void TreeNode::SplitSelfInto(TreeNode& prefix, std::size_t prefix_pages, std::in
         std::int32_t ref_count = host_resource_->RefCount();
         prefix.AttachResource(std::make_unique<HostResource>(host_resource_->SplitFirst(prefix_pages), ref_count));
     }
-    // Mamba stays in suffix.
-    // Invariant: snapshot-bearing nodes are never split (RadixTree refuses).
-    // A split here would dangle borrowed ids in active requests.
-    _assert(paged_cache_snapshot_ == nullptr,
-            "TreeNode::SplitSelfInto called on a node with an attached paged-cache snapshot; "
-            "splitting would invalidate borrowed page id references in active requests");
+    // Mamba and paged-cache snapshots stay on this suffix object. Its pointer and
+    // absolute depth are unchanged, so adjunct membership and borrowed ids remain valid.
 }
 
 void TreeNode::AttachPagedCacheSnapshot(std::unique_ptr<PagedCacheSnapshot> snapshot) {
@@ -110,6 +110,29 @@ void TreeNode::AttachPagedCacheSnapshot(std::unique_ptr<PagedCacheSnapshot> snap
 
 std::unique_ptr<PagedCacheSnapshot> TreeNode::DetachPagedCacheSnapshot() {
     return std::move(paged_cache_snapshot_);
+}
+
+void TreeNode::AttachPagedCacheHostSnapshot(std::unique_ptr<PagedCacheSnapshot> snapshot) {
+    paged_cache_host_snapshot_ = std::move(snapshot);
+}
+
+std::unique_ptr<PagedCacheSnapshot> TreeNode::DetachPagedCacheHostSnapshot() {
+    return std::move(paged_cache_host_snapshot_);
+}
+
+void TreeNode::AttachPagedCachePendingHostSnapshot(std::unique_ptr<PagedCacheSnapshot> snapshot) {
+    paged_cache_pending_host_snapshot_ = std::move(snapshot);
+}
+
+std::unique_ptr<PagedCacheSnapshot> TreeNode::DetachPagedCachePendingHostSnapshot() {
+    return std::move(paged_cache_pending_host_snapshot_);
+}
+
+void TreeNode::PromotePagedCachePendingHostSnapshot() {
+    if (paged_cache_pending_host_snapshot_ == nullptr) {
+        return;
+    }
+    paged_cache_host_snapshot_ = std::move(paged_cache_pending_host_snapshot_);
 }
 
 void TreeNode::SetPersisted(bool persisted) {

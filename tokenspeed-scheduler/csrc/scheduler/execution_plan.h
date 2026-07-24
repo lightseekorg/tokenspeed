@@ -20,6 +20,8 @@
 
 #pragma once
 
+#include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -27,11 +29,16 @@
 
 namespace tokenspeed {
 
+struct SchedulerAbort {
+    std::string request_id;
+    std::string message;
+};
+
 class ExecutionPlan {
 public:
     template <typename OperationType>
     ExecutionPlan& With(OperationType operation) {
-        operations_.emplace_back(operation);
+        operations_.emplace_back(std::move(operation));
         return *this;
     }
 
@@ -43,7 +50,13 @@ public:
         return *this;
     }
 
+    ExecutionPlan& WithSchedulerAborts(std::vector<SchedulerAbort> aborts) {
+        scheduler_aborts_ = std::move(aborts);
+        return *this;
+    }
+
     const std::vector<Operation>& Operations() const { return operations_; }
+    const std::vector<SchedulerAbort>& SchedulerAborts() const { return scheduler_aborts_; }
 
     // Flat KV-cache: requests terminalized this round as OOM -- the pool was wedged by
     // unretractable mid-prefill holders (possibly the request itself, or a mutual wedge)
@@ -52,6 +65,7 @@ public:
 
 private:
     std::vector<Operation> operations_;
+    std::vector<SchedulerAbort> scheduler_aborts_;
 };
 
 }  // namespace tokenspeed

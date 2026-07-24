@@ -87,15 +87,6 @@ protected:
         }
         PlanOnce();
     }
-
-    static const FlatLoadBackOperation* GetLoadBack(const ExecutionPlan& plan) {
-        for (const auto& op : plan.Operations()) {
-            if (auto* cop = std::get_if<CacheOperation>(&op)) {
-                if (auto* lb = std::get_if<FlatLoadBackOperation>(cop)) return lb;
-            }
-        }
-        return nullptr;
-    }
 };
 
 // After host cache is populated, a new request with same tokens should see

@@ -132,6 +132,25 @@ Scheduler::Scheduler(SchedulerConfig config)
             copy.Validate();
             hybrid_prefix_cache_->RegisterPagedCacheGroup(std::make_unique<PagedCacheGroupAllocator>(std::move(copy)));
         }
+        std::unordered_set<std::string> registered_paged_group_ids;
+        for (const auto& cfg : config_.paged_cache_groups) {
+            registered_paged_group_ids.insert(cfg.group_id);
+            auto host_it = config_.paged_cache_host_group_pages.find(cfg.group_id);
+            if (host_it == config_.paged_cache_host_group_pages.end() || host_it->second <= 0) {
+                continue;
+            }
+            PagedCacheGroupConfig host_copy = cfg;
+            host_copy.total_pages = host_it->second;
+            host_copy.Validate();
+            hybrid_prefix_cache_->RegisterPagedCacheHostGroup(
+                std::make_unique<PagedCacheGroupAllocator>(std::move(host_copy)));
+        }
+        for (const auto& [gid, _] : config_.paged_cache_host_group_pages) {
+            if (registered_paged_group_ids.find(gid) == registered_paged_group_ids.end()) {
+                throw std::invalid_argument("Scheduler: paged_cache_host_group_pages references unknown group_id '" +
+                                            gid + "'");
+            }
+        }
 
         if (has_prefix_cache_adjunct) {
             const auto& spec = *config_.prefix_cache_adjunct;
@@ -262,6 +281,10 @@ std::size_t Scheduler::AvailableKvPages() const {
 #endif
 }
 
+std::size_t Scheduler::AvailableHostKvPages() const {
+    return host_allocator_.AvailablePages();
+}
+
 std::size_t Scheduler::ActiveKvPages() const {
     // Distinct pages pinned by running requests, in the same units as AvailableKvPages():
     // flat pool ids across ALL groups (a group-0 sample here understated the ratio that
@@ -304,6 +327,27 @@ std::int64_t Scheduler::PagedCacheGroupFailedAllocCount(const std::string& group
     return hybrid_prefix_cache_->PagedCacheGroupFailedAllocCount(group_id);
 }
 
+std::int32_t Scheduler::PagedCacheHostGroupTotalPages(const std::string& group_id) const {
+    if (!hybrid_prefix_cache_) {
+        throw std::out_of_range("Scheduler::PagedCacheHostGroupTotalPages: group_id not configured");
+    }
+    return hybrid_prefix_cache_->PagedCacheHostGroupTotalPages(group_id);
+}
+
+std::int32_t Scheduler::PagedCacheHostGroupAvailablePages(const std::string& group_id) const {
+    if (!hybrid_prefix_cache_) {
+        throw std::out_of_range("Scheduler::PagedCacheHostGroupAvailablePages: group_id not configured");
+    }
+    return hybrid_prefix_cache_->PagedCacheHostGroupAvailablePages(group_id);
+}
+
+std::int64_t Scheduler::PagedCacheHostGroupFailedAllocCount(const std::string& group_id) const {
+    if (!hybrid_prefix_cache_) {
+        throw std::out_of_range("Scheduler::PagedCacheHostGroupFailedAllocCount: group_id not configured");
+    }
+    return hybrid_prefix_cache_->PagedCacheHostGroupFailedAllocCount(group_id);
+}
+
 std::vector<std::int32_t> Scheduler::GetRequestPagedCachePageIds(const std::string& request_id,
                                                                  const std::string& group_id) const {
     if (!hybrid_prefix_cache_) {
@@ -335,21 +379,25 @@ std::vector<WriteBackOperation> Scheduler::newWriteBackOperation(
         return ops;
     }
     for (auto& [id, req] : requests) {
-        if (!req->Is<fsm::Draining>()) continue;
+        if (!req->Is<fsm::Draining>() || (!deferred_aborts_.empty() && deferred_aborts_.contains(id))) continue;
         const auto& pages_to_transfer = req->GetPagesToTransfer<fsm::Draining>();
+        const auto& paged_cache_transfers = req->GetPagedCacheWriteBackTransfers<fsm::Draining>();
 
-        if (!pages_to_transfer.empty()) {
+        if (!pages_to_transfer.empty() || !paged_cache_transfers.empty()) {
             cache_op_id op_id = kv_prefix_cache_.AllocateCacheOpId();
             CacheOpSpec spec;
             spec.request_id = id;
+            spec.paged_cache_nodes = req->GetPagedCacheWriteBackNodes<fsm::Draining>();
             cache_op_tracker_[op_id] = std::move(spec);
             ops.push_back(WriteBackOperation{
-                op_id, std::vector<TransferPair>(pages_to_transfer.begin(), pages_to_transfer.end())});
+                op_id, std::vector<TransferPair>(pages_to_transfer.begin(), pages_to_transfer.end()),
+                std::vector<PagedCacheTransferPair>(paged_cache_transfers.begin(), paged_cache_transfers.end())});
             req->Apply(fsm::CommitDrainingEvent{});
         } else {
-            req->Apply(fsm::AbortEvent{
+            req->Apply(fsm::AbortEvent{&kv_prefix_cache_, hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr
 #if TOKENSPEED_FLAT_KVCACHE
-                &coordinator_
+                                       ,
+                                       &coordinator_
 #endif
             });
         }
@@ -363,19 +411,23 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     std::vector<WriteBackOperation> write_back_ops;
     write_back_ops = std::move(newWriteBackOperation(requests_));
 
+    const bool has_deferred_aborts = !deferred_aborts_.empty();
     if (hybrid_prefix_cache_) {
         for (const auto& [id, req] : requests_) {
-            if (req->Is<fsm::Finished>()) {
+            if (req->Is<fsm::Finished>() && (!has_deferred_aborts || !deferred_aborts_.contains(id))) {
                 hybrid_prefix_cache_->ReleaseRequest(id);
             }
         }
     }
-    std::erase_if(requests_, [](const auto& req) { return req.second->template Is<fsm::Finished>(); });
+    std::erase_if(requests_, [this, has_deferred_aborts](const auto& req) {
+        return req.second->template Is<fsm::Finished>() &&
+               (!has_deferred_aborts || !deferred_aborts_.contains(req.first));
+    });
 
     std::vector<Request*> candidates;
     for (auto& [id, req] : requests_) {
-        if (!req->Is<fsm::Draining>() && !req->Is<fsm::Prefetching>() && !req->Is<fsm::Retracting>() &&
-            !req->Is<fsm::WritingBack>()) {
+        if ((!has_deferred_aborts || !deferred_aborts_.contains(id)) && !req->Is<fsm::Draining>() &&
+            !req->Is<fsm::Prefetching>() && !req->Is<fsm::Retracting>() && !req->Is<fsm::WritingBack>()) {
             candidates.push_back(req.get());
         }
     }
@@ -424,16 +476,17 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     }
 #endif
     if (!write_back_ops.empty()) {
-        plan.With(CacheOperation{FlatWriteBackOperation{write_back_ops}});
+        plan.With(CacheOperation{FlatWriteBackOperation{std::move(write_back_ops)}});
     }
     if (auto* lb = std::get_if<std::vector<LoadBackOperation>>(&cache_ops)) {
         if (!lb->empty()) {
-            plan.With(CacheOperation{FlatLoadBackOperation{*lb}});
+            plan.With(CacheOperation{FlatLoadBackOperation{std::move(*lb)}});
         }
     }
     if (std::getenv("DEBUG_MEM")) {
         check_device_mem();
     }
+    plan.WithSchedulerAborts(std::exchange(scheduler_aborts_, {}));
     return plan;
 }
 

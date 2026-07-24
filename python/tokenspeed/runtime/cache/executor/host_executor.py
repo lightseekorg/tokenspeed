@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections import OrderedDict
 from collections.abc import Iterable
 from typing import NamedTuple
@@ -31,11 +32,18 @@ from tokenspeed_scheduler import Cache
 
 from tokenspeed.runtime.cache.transfer.kv_pool import KVCachePool
 from tokenspeed.runtime.cache.transfer.pool import CachePool
-from tokenspeed.runtime.cache.transfer.types import CacheKind, Location, TransferUnit
+from tokenspeed.runtime.cache.transfer.types import (
+    PAGED_CACHE_KIND,
+    CacheKind,
+    Location,
+    PagedCacheTransferUnit,
+    TransferUnit,
+)
 from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
 from tokenspeed.runtime.utils import get_colorful_logger, get_device_module
 
 logger = get_colorful_logger(__name__)
+_DEBUG = logging.DEBUG
 device_module = get_device_module()
 CONCURRENT_WRITEBACK_BLOCK_QUOTA = 2
 
@@ -101,6 +109,28 @@ def _ordered_unique(values: Iterable[int]) -> list[int]:
     return result
 
 
+def _paged_queue_debug_summary(units: list[PagedCacheTransferUnit]):
+    pages = 0
+    groups: dict[str, int] = {}
+    transfers = 0
+    for unit in units:
+        for transfer in unit.transfers:
+            transfers += 1
+            group_id = str(getattr(transfer, "group_id", "unknown"))
+            transfer_pages = len(
+                {
+                    (int(src), int(dst))
+                    for src, dst in zip(
+                        getattr(transfer, "src_pages", []),
+                        getattr(transfer, "dst_pages", []),
+                    )
+                }
+            )
+            pages += transfer_pages
+            groups[group_id] = groups.get(group_id, 0) + transfer_pages
+    return pages, transfers, groups
+
+
 class _Ack(NamedTuple):
     finish_event: object  # device_module.Event
     op_ids: list[int]
@@ -118,32 +148,46 @@ class HostExecutor:
         draft_host_pool=None,
         draft_layer_num: int = 0,
         pools: list[CachePool] | None = None,
+        paged_pool=None,
     ):
         self.io_backend = io_backend
         if pools is None:
-            if (
-                page_size is None
-                or device_pool is None
-                or host_pool is None
-                or layer_num is None
-            ):
-                raise ValueError("HostExecutor requires either pools or KV pool inputs")
-            pools = [
-                KVCachePool(
-                    device_pool=device_pool,
-                    host_pool=host_pool,
-                    io_backend=io_backend,
-                    layer_num=layer_num,
-                    draft_device_pool=draft_device_pool,
-                    draft_host_pool=draft_host_pool,
-                    draft_layer_num=draft_layer_num,
-                )
-            ]
-        if not pools:
+            has_kv_inputs = (
+                page_size is not None
+                and device_pool is not None
+                and host_pool is not None
+                and layer_num is not None
+            )
+            if not has_kv_inputs:
+                if paged_pool is None:
+                    raise ValueError(
+                        "HostExecutor requires either pools, KV pool inputs, "
+                        "or a paged_pool"
+                    )
+                pools = []
+            else:
+                pools = [
+                    KVCachePool(
+                        device_pool=device_pool,
+                        host_pool=host_pool,
+                        io_backend=io_backend,
+                        layer_num=layer_num,
+                        draft_device_pool=draft_device_pool,
+                        draft_host_pool=draft_host_pool,
+                        draft_layer_num=draft_layer_num,
+                    )
+                ]
+        if not pools and paged_pool is None:
             raise ValueError("HostExecutor requires at least one cache pool")
 
         self.pools = {CacheKind(pool.kind): pool for pool in pools}
-        self.device = next(iter(self.pools.values())).device
+        self.paged_pool = paged_pool
+        self.emits_loadback_acks = paged_pool is not None
+        self.device = (
+            next(iter(self.pools.values())).device
+            if self.pools
+            else self.paged_pool.device
+        )
 
         write_priority, load_priority = _cache_stream_priorities()
         self.write_stream = _new_cache_stream(write_priority)
@@ -156,6 +200,8 @@ class HostExecutor:
         self.load_queues: dict[CacheKind, list[TransferUnit]] = {
             kind: [] for kind in self.pools
         }
+        self.paged_write_queue: list[PagedCacheTransferUnit] = []
+        self.paged_load_queue: list[PagedCacheTransferUnit] = []
 
         self.ack_write_queue: list[_Ack] = []
         self.ack_load_queue: list[_Ack] = []
@@ -164,9 +210,13 @@ class HostExecutor:
         self._counters = {
             kind: pool.get_layer_done_counter() for kind, pool in self.pools.items()
         }
+        self._paged_counter = (
+            paged_pool.get_layer_done_counter() if paged_pool is not None else None
+        )
         self._producer_map: dict[CacheKind, OrderedDict[int, int]] = {
             kind: OrderedDict() for kind in self.pools
         }
+        self._paged_producer_map: OrderedDict[int, int] = OrderedDict()
         self._producer_map_limit = 1024
 
     def enqueue_writeback(
@@ -241,10 +291,45 @@ class HostExecutor:
             )
         )
 
-    def flush(self) -> None:
-        throttle_writeback = self._has_work(self.load_queues) and not any(
-            unit.is_retract for units in self.write_queues.values() for unit in units
+    def enqueue_paged_cache_writeback(
+        self,
+        op_id: int,
+        transfers: list,
+        is_retract: bool = False,
+    ) -> None:
+        if self.paged_pool is None:
+            if transfers:
+                raise ValueError("paged-cache writeback requires a paged_pool")
+            self.completed_writebacks.append(op_id)
+            return
+        if not transfers:
+            self.completed_writebacks.append(op_id)
+            return
+        self.paged_write_queue.append(
+            PagedCacheTransferUnit(
+                op_id=int(op_id),
+                transfers=list(transfers),
+                is_retract=is_retract,
+            )
         )
+
+    def enqueue_paged_cache_loadback(self, op_id: int, transfers: list) -> None:
+        if self.paged_pool is None:
+            if transfers:
+                raise ValueError("paged-cache loadback requires a paged_pool")
+            return
+        if not transfers:
+            return
+        self.paged_load_queue.append(
+            PagedCacheTransferUnit(op_id=int(op_id), transfers=list(transfers))
+        )
+
+    def flush(self) -> None:
+        has_load_work = self._has_work(self.load_queues) or bool(self.paged_load_queue)
+        has_retract_writeback = any(
+            unit.is_retract for units in self.write_queues.values() for unit in units
+        ) or any(unit.is_retract for unit in self.paged_write_queue)
+        throttle_writeback = has_load_work and not has_retract_writeback
         writeback_block_quota = (
             CONCURRENT_WRITEBACK_BLOCK_QUOTA if throttle_writeback else None
         )
@@ -257,7 +342,7 @@ class HostExecutor:
             self._writeback_block_quota = previous_writeback_block_quota
 
     def _start_writing(self) -> None:
-        if not self._has_work(self.write_queues):
+        if not self._has_work(self.write_queues) and not self.paged_write_queue:
             return
 
         start_event = device_module.Event()
@@ -279,13 +364,68 @@ class HostExecutor:
                 self._record_if_cuda(src_indices, self.write_stream)
                 self._record_if_cuda(dst_indices, self.write_stream)
                 op_ids.extend(unit.op_id for unit in units)
+            if self.paged_write_queue:
+                assert self.paged_pool is not None
+                transfers = [
+                    transfer
+                    for unit in self.paged_write_queue
+                    for transfer in unit.transfers
+                ]
+                prepare_transfers = getattr(
+                    self.paged_pool,
+                    "prepare_paged_transfers",
+                    None,
+                )
+                write_prepared = getattr(
+                    self.paged_pool,
+                    "writeback_prepared_paged",
+                    None,
+                )
+                prepared_transfers = (
+                    prepare_transfers(transfers)
+                    if prepare_transfers is not None and write_prepared is not None
+                    else None
+                )
+                if logger.isEnabledFor(_DEBUG):
+                    paged_pages, paged_transfers, paged_groups = (
+                        _paged_queue_debug_summary(self.paged_write_queue)
+                    )
+                    prepared_count = (
+                        len(prepared_transfers)
+                        if prepared_transfers is not None
+                        else "n/a"
+                    )
+                    prepared_spans = (
+                        sum(
+                            int(getattr(transfer, "span_count", 0))
+                            for transfer in prepared_transfers
+                        )
+                        if prepared_transfers is not None
+                        else "n/a"
+                    )
+                    logger.debug(
+                        "[cache_op][paged_l2] writeback submit units=%s "
+                        "transfers=%s coalesced=%s spans=%s pages=%s groups=%s",
+                        len(self.paged_write_queue),
+                        paged_transfers,
+                        prepared_count,
+                        prepared_spans,
+                        paged_pages,
+                        paged_groups,
+                    )
+                if prepared_transfers is not None and write_prepared is not None:
+                    write_prepared(prepared_transfers)
+                else:
+                    self.paged_pool.writeback_paged(transfers)
+                op_ids.extend(unit.op_id for unit in self.paged_write_queue)
             finish_event.record()
 
         self._clear_queues(self.write_queues)
+        self.paged_write_queue.clear()
         self.ack_write_queue.append(_Ack(finish_event, _ordered_unique(op_ids)))
 
     def _start_loading(self) -> None:
-        if not self._has_work(self.load_queues):
+        if not self._has_work(self.load_queues) and not self.paged_load_queue:
             return
         assert (
             not get_is_capture_mode()
@@ -339,7 +479,103 @@ class HostExecutor:
                 while len(producer_map) > self._producer_map_limit:
                     producer_map.popitem(last=False)
 
+            if self.paged_load_queue:
+                assert self.paged_pool is not None
+                assert self._paged_counter is not None
+                transfers = [
+                    transfer
+                    for unit in self.paged_load_queue
+                    for transfer in unit.transfers
+                ]
+                prepare_transfers = getattr(
+                    self.paged_pool,
+                    "prepare_paged_transfers",
+                    None,
+                )
+                load_prepared = getattr(
+                    self.paged_pool,
+                    "loadback_prepared_paged",
+                    None,
+                )
+                load_prepared_range = getattr(
+                    self.paged_pool,
+                    "loadback_prepared_paged_range",
+                    None,
+                )
+                prepared_transfers = (
+                    prepare_transfers(transfers)
+                    if prepare_transfers is not None and load_prepared is not None
+                    else None
+                )
+                num_layers = self.paged_pool.num_layers()
+                layer_chunk_size = 1
+                if prepared_transfers is not None and load_prepared_range is not None:
+                    layer_chunk_size = max(
+                        1,
+                        int(getattr(self.paged_pool, "loadback_layer_chunk_size", 1)),
+                    )
+                layer_chunks = (num_layers + layer_chunk_size - 1) // layer_chunk_size
+                if logger.isEnabledFor(_DEBUG):
+                    paged_pages, paged_transfers, paged_groups = (
+                        _paged_queue_debug_summary(self.paged_load_queue)
+                    )
+                    prepared_count = (
+                        len(prepared_transfers)
+                        if prepared_transfers is not None
+                        else "n/a"
+                    )
+                    prepared_spans = (
+                        sum(
+                            int(getattr(transfer, "span_count", 0))
+                            for transfer in prepared_transfers
+                        )
+                        if prepared_transfers is not None
+                        else "n/a"
+                    )
+                    logger.debug(
+                        "[cache_op][paged_l2] loadback submit units=%s "
+                        "transfers=%s coalesced=%s spans=%s pages=%s groups=%s "
+                        "layers=%s layer_chunk=%s layer_chunks=%s",
+                        len(self.paged_load_queue),
+                        paged_transfers,
+                        prepared_count,
+                        prepared_spans,
+                        paged_pages,
+                        paged_groups,
+                        num_layers,
+                        layer_chunk_size,
+                        layer_chunks,
+                    )
+                producer_id = self._paged_counter.update_producer()
+                producer_event = self._paged_counter.events[producer_id]
+                producer_event.start_event.record()
+                producer_event.start_event.wait(self.load_stream)
+                if prepared_transfers is not None and load_prepared_range is not None:
+                    for layer_start in range(0, num_layers, layer_chunk_size):
+                        layer_end = min(layer_start + layer_chunk_size, num_layers)
+                        load_prepared_range(
+                            prepared_transfers,
+                            layer_start,
+                            layer_end,
+                        )
+                        for layer_index in range(layer_start, layer_end):
+                            producer_event.complete(layer_index)
+                else:
+                    for layer_index in range(num_layers):
+                        if prepared_transfers is not None and load_prepared is not None:
+                            load_prepared(prepared_transfers, layer_index)
+                        else:
+                            self.paged_pool.loadback_paged(transfers, layer_index)
+                        producer_event.complete(layer_index)
+                op_ids = _ordered_unique(unit.op_id for unit in self.paged_load_queue)
+                self.ack_load_queue.append(_Ack(producer_event.finish_event, op_ids))
+                for op_id in op_ids:
+                    self._paged_producer_map[op_id] = producer_id
+                while len(self._paged_producer_map) > self._producer_map_limit:
+                    self._paged_producer_map.popitem(last=False)
+
         self._clear_queues(self.load_queues)
+        self.paged_load_queue.clear()
 
     @staticmethod
     def _has_work(queues: dict[CacheKind, list[TransferUnit]]) -> bool:
@@ -470,6 +706,12 @@ class HostExecutor:
         for ack in self.ack_load_queue:
             if not ack.finish_event.query():
                 remaining.append(ack)
+            elif self.emits_loadback_acks:
+                for op_id in ack.op_ids:
+                    evt = Cache.LoadBackDoneEvent()
+                    evt.op_id = op_id
+                    evt.success = True
+                    results.append(evt)
         self.ack_load_queue[:] = remaining
         return results
 
@@ -480,6 +722,8 @@ class HostExecutor:
             kind = CacheKind.KV
             op_id = int(kind_or_op_id)
         else:
+            if self._is_paged_kind(kind_or_op_id):
+                return self._paged_producer_map.pop(int(op_id), None)
             kind = CacheKind(kind_or_op_id)
         return self._producer_map[kind].pop(int(op_id), None)
 
@@ -492,8 +736,17 @@ class HostExecutor:
             kind = CacheKind.KV
             producer_index = kind_or_producer_index
         else:
+            if self._is_paged_kind(kind_or_producer_index):
+                assert self._paged_counter is not None
+                self._paged_counter.set_consumer(producer_index)
+                return
             kind = CacheKind(kind_or_producer_index)
         self._counters[kind].set_consumer(producer_index)
+
+    def _is_paged_kind(self, kind: CacheKind | str | int | Iterable[int]) -> bool:
+        if self.paged_pool is None:
+            return False
+        return str(kind) == PAGED_CACHE_KIND
 
     def shutdown(self) -> None:
         self.write_stream.synchronize()
@@ -502,15 +755,24 @@ class HostExecutor:
             shutdown = getattr(pool, "shutdown", None)
             if shutdown is not None:
                 shutdown()
+        if self.paged_pool is not None:
+            shutdown = getattr(self.paged_pool, "shutdown", None)
+            if shutdown is not None:
+                shutdown()
 
     def reset(self) -> None:
         self.write_stream.synchronize()
         self.load_stream.synchronize()
         self._clear_queues(self.write_queues)
         self._clear_queues(self.load_queues)
+        self.paged_write_queue.clear()
+        self.paged_load_queue.clear()
         self.ack_write_queue.clear()
         self.ack_load_queue.clear()
         for producer_map in self._producer_map.values():
             producer_map.clear()
+        self._paged_producer_map.clear()
         for counter in self._counters.values():
             counter.reset()
+        if self._paged_counter is not None:
+            self._paged_counter.reset()

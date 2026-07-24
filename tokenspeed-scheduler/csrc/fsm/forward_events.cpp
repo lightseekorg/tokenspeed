@@ -60,6 +60,54 @@ std::vector<tokenspeed::TransferPair> BuildWriteBackPairs(const std::vector<toke
     return pages_to_transfer;
 }
 
+template <tokenspeed::ResourceType RType>
+tokenspeed::TreeNode* LastNodeWithResourceOrRoot(tokenspeed::TreeNode* node) {
+    for (tokenspeed::TreeNode* candidate = node; candidate != nullptr; candidate = candidate->Parent()) {
+        if (candidate->IsRoot()) return candidate;
+        if constexpr (RType == tokenspeed::ResourceType::Device) {
+            if (candidate->OnDevice()) {
+                return candidate;
+            }
+        } else {
+            if (candidate->OnHost()) {
+                return candidate;
+            }
+        }
+    }
+    return nullptr;
+}
+
+struct KVResourceNodes {
+    tokenspeed::TreeNode* device_node{nullptr};
+    tokenspeed::TreeNode* host_node{nullptr};
+    std::int32_t device_page_size{0};
+    std::int32_t host_page_size{0};
+
+    std::int32_t DeviceDepthInPage() const {
+        return device_node == nullptr ? 0 : device_node->DepthInPage(device_page_size);
+    }
+
+    std::int32_t HostDepthInPage() const { return host_node == nullptr ? 0 : host_node->DepthInPage(host_page_size); }
+
+    std::vector<tokenspeed::TreeNode*> NodesWithoutDevice() const {
+        std::vector<tokenspeed::TreeNode*> result;
+        for (tokenspeed::TreeNode* node : tokenspeed::LeafToRoot(host_node)) {
+            if (node->OnDevice()) break;
+            result.push_back(node);
+        }
+        return result;
+    }
+};
+
+KVResourceNodes GetKVResourceNodes(const tokenspeed::MatchResult& match) {
+    return KVResourceNodes{
+        LastNodeWithResourceOrRoot<tokenspeed::ResourceType::Device>(match.device.last_node),
+        LastNodeWithResourceOrRoot<tokenspeed::ResourceType::Host>(match.host.last_node),
+        match.device.page_size,
+        match.host.page_size,
+    };
+}
+
 std::vector<tokenspeed::TreeNode*> MambaNodesForTransferPairs(const std::vector<tokenspeed::TreeNode*>& candidates,
                                                               const std::vector<tokenspeed::TransferPair>& transfers) {
     std::unordered_set<std::int32_t> src_slots;
@@ -78,6 +126,18 @@ std::vector<tokenspeed::TreeNode*> MambaNodesForTransferPairs(const std::vector<
     return nodes;
 }
 
+std::vector<tokenspeed::TreeNode*> PagedCacheSnapshotNodesForWriteBack(tokenspeed::TreeNode* last_node) {
+    std::vector<tokenspeed::TreeNode*> nodes;
+    for (tokenspeed::TreeNode* node : tokenspeed::LeafToRoot(last_node)) {
+        if (node == nullptr) continue;
+        if (node->HasPagedCacheSnapshot() && !node->HasPagedCacheHostSnapshot() &&
+            !node->HasPagedCachePendingHostSnapshot()) {
+            nodes.push_back(node);
+        }
+    }
+    return nodes;
+}
+
 void DemoteWrittenBackDevice(tokenspeed::KVPrefixCache* kv_prefix_cache,
                              tokenspeed::HybridPrefixCache* hybrid_prefix_cache, tokenspeed::TreeNode* device_node) {
     if (kv_prefix_cache == nullptr || device_node == nullptr) return;
@@ -86,6 +146,28 @@ void DemoteWrittenBackDevice(tokenspeed::KVPrefixCache* kv_prefix_cache,
             hybrid_prefix_cache->OnKVDeviceDemote(n);
         }
     });
+}
+
+void ReleaseFailedHostWriteBack(tokenspeed::KVPrefixCache* kv_prefix_cache,
+                                tokenspeed::HybridPrefixCache* hybrid_prefix_cache,
+                                const std::vector<tokenspeed::TreeNode*>& host_writeback_nodes) {
+    if (kv_prefix_cache == nullptr || host_writeback_nodes.empty()) return;
+    kv_prefix_cache->ReleaseHostResources(host_writeback_nodes, [hybrid_prefix_cache](tokenspeed::TreeNode* n) {
+        if (hybrid_prefix_cache != nullptr) {
+            hybrid_prefix_cache->OnKVHostEvict(n);
+        }
+    });
+}
+
+void RollbackHostWriteBack(tokenspeed::KVPrefixCache* kv_prefix_cache,
+                           tokenspeed::HybridPrefixCache* hybrid_prefix_cache, tokenspeed::fsm::WritingBack& state) {
+    if (hybrid_prefix_cache != nullptr) {
+        hybrid_prefix_cache->OnMambaHostWriteBackDone(state.MambaWriteBackNodes(), false);
+        hybrid_prefix_cache->OnPagedCacheHostWriteBackDone(state.PagedCacheWriteBackNodes(), false);
+    }
+    state.DropHostNodeRef();
+    ReleaseFailedHostWriteBack(kv_prefix_cache, hybrid_prefix_cache, state.HostWriteBackNodes());
+    state.DropDeviceNodeRef();
 }
 
 bool ShouldPublishMambaCheckpoint(tokenspeed::HybridPrefixCache* hybrid_cache, std::int32_t chunk_begin,
@@ -249,13 +331,13 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()
 #else
     std::unique_ptr<HostNodeRef> host_node_ref{nullptr};
     std::unique_ptr<DeviceNodeRef> device_node_ref{nullptr};
-    if (!disable_l2_cache_ && (match_result_.host.DepthInPage() > match_result_.device.DepthInPage())) {
-        host_node_ref = std::make_unique<HostNodeRef>(match_result_.host.last_node);
-        kv_prefix_cache_->AllocateResourceOfType<ResourceType::Device>(
-            match_result_.NodesWithout<ResourceType::Device>());
-        device_node_ref = std::make_unique<DeviceNodeRef>(match_result_.host.last_node);
+    const KVResourceNodes kv_nodes = GetKVResourceNodes(match_result_);
+    if (!disable_l2_cache_ && (kv_nodes.HostDepthInPage() > kv_nodes.DeviceDepthInPage())) {
+        host_node_ref = std::make_unique<HostNodeRef>(kv_nodes.host_node);
+        kv_prefix_cache_->AllocateResourceOfType<ResourceType::Device>(kv_nodes.NodesWithoutDevice());
+        device_node_ref = std::make_unique<DeviceNodeRef>(kv_nodes.host_node);
     } else {
-        device_node_ref = std::make_unique<DeviceNodeRef>(match_result_.device.last_node);
+        device_node_ref = std::make_unique<DeviceNodeRef>(kv_nodes.device_node);
     }
 
     auto local_kv_allocator = std::make_unique<LocalKVAllocator>(device_allocator_, tokens_this_round_);
@@ -277,10 +359,13 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()
 
     TokenContainer* token_container = state.GetTokenContainer();
 
-    std::int32_t max_matched_pages =
-        disable_l2_cache_ ? match_result_.device.DepthInPage()
-                          : std::max(match_result_.device.DepthInPage(), match_result_.host.DepthInPage());
-    std::int32_t window_begin = max_matched_pages * state.GetPageSize();
+    std::int32_t window_begin = matched_prefix_len_tokens_;
+    if (window_begin < 0) {
+        const std::int32_t max_matched_pages =
+            disable_l2_cache_ ? match_result_.device.DepthInPage()
+                              : std::max(match_result_.device.DepthInPage(), match_result_.host.DepthInPage());
+        window_begin = max_matched_pages * state.GetPageSize();
+    }
     TokenContainer::Window window{.begin = window_begin, .size = tokens_this_round_};
 
     bool is_last_chunk = (window.begin + window.size) == token_container->PrefillSize();
@@ -496,17 +581,18 @@ Decoding ScheduleDecodeFromRetractedEvent::operator()(Retracted&& state) {
 #else
     std::unique_ptr<HostNodeRef> host_node_ref{nullptr};
     std::unique_ptr<DeviceNodeRef> device_node_ref{nullptr};
-    if (match_result_.host.DepthInPage() > match_result_.device.DepthInPage()) {
-        host_node_ref = std::make_unique<HostNodeRef>(match_result_.host.last_node);
-        if (!kv_prefix_cache_->AllocateResourceOfType<ResourceType::Device>(
-                match_result_.NodesWithout<ResourceType::Device>())) {
+    const KVResourceNodes kv_nodes = GetKVResourceNodes(match_result_);
+    if (kv_nodes.HostDepthInPage() > kv_nodes.DeviceDepthInPage()) {
+        host_node_ref = std::make_unique<HostNodeRef>(kv_nodes.host_node);
+        if (!kv_prefix_cache_->AllocateResourceOfType<ResourceType::Device>(kv_nodes.NodesWithoutDevice())) {
+            // Device allocation failed (race between capacity check and actual alloc).
             throw std::logic_error(
                 "ScheduleDecodeFromRetractedEvent: failed to allocate device pages for host cache recovery");
         }
-        // Device pages were just attached along the host-matched chain: pinning the HOST last node is not a typo.
-        device_node_ref = std::make_unique<DeviceNodeRef>(match_result_.host.last_node);
+        // This is not a typo
+        device_node_ref = std::make_unique<DeviceNodeRef>(kv_nodes.host_node);
     } else {
-        device_node_ref = std::make_unique<DeviceNodeRef>(match_result_.device.last_node);
+        device_node_ref = std::make_unique<DeviceNodeRef>(kv_nodes.device_node);
     }
     TokenContainer* token_container = state.GetTokenContainer();
     std::int32_t page_size = state.GetPageSize();
@@ -606,14 +692,24 @@ std::variant<Draining, Finished> FinishEvent::apply(ForwardStateT&& state) {
 
         auto pages_to_transfer = BuildWriteBackPairs(write_diff);
         std::vector<TreeNode*> mamba_writeback_nodes;
+        std::vector<PagedCacheTransferPair> paged_cache_writeback_transfers;
+        std::vector<TreeNode*> paged_cache_writeback_nodes;
         if (hybrid_prefix_cache_ != nullptr) {
             auto mamba_pairs = hybrid_prefix_cache_->PrepareMambaHostWriteBack(write_diff);
             mamba_writeback_nodes = MambaNodesForTransferPairs(write_diff, mamba_pairs);
             pages_to_transfer.insert(pages_to_transfer.end(), std::make_move_iterator(mamba_pairs.begin()),
                                      std::make_move_iterator(mamba_pairs.end()));
+            paged_cache_writeback_nodes = PagedCacheSnapshotNodesForWriteBack(match.device.last_node);
+            paged_cache_writeback_transfers =
+                hybrid_prefix_cache_->PreparePagedCacheHostWriteBack(paged_cache_writeback_nodes);
         }
-        return Draining{std::move(pages_to_transfer), std::move(device_node_ref), std::move(host_node_ref),
-                        std::move(mamba_writeback_nodes)};
+        return Draining{std::move(pages_to_transfer),
+                        std::move(device_node_ref),
+                        std::move(host_node_ref),
+                        std::move(write_diff),
+                        std::move(mamba_writeback_nodes),
+                        std::move(paged_cache_writeback_transfers),
+                        std::move(paged_cache_writeback_nodes)};
     }
     return Finished{};
 #endif
@@ -636,15 +732,23 @@ WritingBack FinishEvent::operator()(Retracting&& state) {
 WritingBack CommitDrainingEvent::operator()(Draining&& state) {
     auto device_node_ref = std::move(state).TakeDeviceNodeRef();
     auto host_node_ref = std::move(state).TakeHostNodeRef();
+    auto host_writeback_nodes = std::move(state).TakeHostWriteBackNodes();
     auto mamba_writeback_nodes = std::move(state).TakeMambaWriteBackNodes();
-    return WritingBack{std::move(device_node_ref), std::move(host_node_ref), std::move(mamba_writeback_nodes)};
+    auto paged_cache_writeback_nodes = std::move(state).TakePagedCacheWriteBackNodes();
+    return WritingBack{std::move(device_node_ref), std::move(host_node_ref), std::move(host_writeback_nodes),
+                       std::move(mamba_writeback_nodes), std::move(paged_cache_writeback_nodes)};
 }
 
 // WritingBack -> Finished: written-back cache demotes to host-only, so the next hit must load back.
 Finished WriteBackDoneEvent::operator()(WritingBack&& state) {
     TreeNode* device_node = state.DeviceNode();
+    if (!success_) {
+        RollbackHostWriteBack(kv_prefix_cache_, hybrid_prefix_cache_, state);
+        return Finished{};
+    }
     if (hybrid_prefix_cache_ != nullptr) {
-        hybrid_prefix_cache_->OnMambaHostWriteBackDone(state.MambaWriteBackNodes());
+        hybrid_prefix_cache_->OnMambaHostWriteBackDone(state.MambaWriteBackNodes(), true);
+        hybrid_prefix_cache_->OnPagedCacheHostWriteBackDone(state.PagedCacheWriteBackNodes(), true);
     }
     state.DropDeviceNodeRef();
     DemoteWrittenBackDevice(kv_prefix_cache_, hybrid_prefix_cache_, device_node);
@@ -654,15 +758,20 @@ Finished WriteBackDoneEvent::operator()(WritingBack&& state) {
     return Finished{};
 }
 
-Retracted WriteBackDoneEvent::operator()(Retracting&& state) {
+std::variant<Retracted, Finished> WriteBackDoneEvent::operator()(Retracting&& state) {
 #if TOKENSPEED_FLAT_KVCACHE
     FlatRetractUnsupported();
 #else
+    if (!success_) {
+        RollbackHostWriteBack(kv_prefix_cache_, hybrid_prefix_cache_, state);
+        return Finished{};
+    }
     TokenContainer* token_container = state.GetTokenContainer();
     std::int32_t page_size = state.GetPageSize();
     TreeNode* device_node = state.DeviceNode();
     if (hybrid_prefix_cache_ != nullptr) {
-        hybrid_prefix_cache_->OnMambaHostWriteBackDone(state.MambaWriteBackNodes());
+        hybrid_prefix_cache_->OnMambaHostWriteBackDone(state.MambaWriteBackNodes(), true);
+        hybrid_prefix_cache_->OnPagedCacheHostWriteBackDone(state.PagedCacheWriteBackNodes(), true);
     }
     state.DropDeviceNodeRef();
     DemoteWrittenBackDevice(kv_prefix_cache_, hybrid_prefix_cache_, device_node);
@@ -686,7 +795,15 @@ Aborting AbortEvent::operator()(Prefetching&& state) {
     return Aborting{std::move(state).TakeHostPages()};
 }
 
-Finished AbortEvent::operator()(Draining&&) {
+Finished AbortEvent::operator()(Draining&& state) {
+    auto device_node_ref = std::move(state).TakeDeviceNodeRef();
+    auto host_node_ref = std::move(state).TakeHostNodeRef();
+    auto host_writeback_nodes = std::move(state).TakeHostWriteBackNodes();
+    auto mamba_writeback_nodes = std::move(state).TakeMambaWriteBackNodes();
+    auto paged_cache_writeback_nodes = std::move(state).TakePagedCacheWriteBackNodes();
+    auto writeback = WritingBack{std::move(device_node_ref), std::move(host_node_ref), std::move(host_writeback_nodes),
+                                 std::move(mamba_writeback_nodes), std::move(paged_cache_writeback_nodes)};
+    RollbackHostWriteBack(kv_prefix_cache_, hybrid_prefix_cache_, writeback);
     return Finished{};
 }
 
@@ -731,10 +848,6 @@ Finished AbortEvent::operator()(Decoding&& state) {
     return Finished{};
 }
 
-Finished AbortEvent::operator()(Retracting&&) {
-    return Finished{};
-}
-
 Finished AbortEvent::operator()(Retracted&&) {
     return Finished{};
 }
@@ -769,7 +882,10 @@ Retracting ScheduleRetractEvent::applyRetract(ForwardStateT&& state) {
     std::unique_ptr<DeviceNodeRef> device_node_ref = nullptr;
     std::unique_ptr<HostNodeRef> host_node_ref = nullptr;
     std::vector<Retracting::PagePair> pages_to_transfer;
+    std::vector<TreeNode*> host_writeback_nodes;
     std::vector<TreeNode*> mamba_writeback_nodes;
+    std::vector<PagedCacheTransferPair> paged_cache_writeback_transfers;
+    std::vector<TreeNode*> paged_cache_writeback_nodes;
 
     if (match_result_.device.DepthInPage() > match_result_.host.DepthInPage()) {
         std::vector<TreeNode*> write_diff = match_result_.NodesWithout<ResourceType::Host>();
@@ -777,12 +893,16 @@ Retracting ScheduleRetractEvent::applyRetract(ForwardStateT&& state) {
         if (!kv_prefix_cache_->AllocateResourceOfType<ResourceType::Host>(write_diff)) {
             throw std::logic_error("ScheduleRetractEvent: failed to allocate host pages for device cache writeback");
         }
+        host_writeback_nodes = write_diff;
         pages_to_transfer = BuildWriteBackPairs(write_diff);
         if (hybrid_prefix_cache_ != nullptr) {
             auto mamba_pairs = hybrid_prefix_cache_->PrepareMambaHostWriteBack(write_diff);
             mamba_writeback_nodes = MambaNodesForTransferPairs(write_diff, mamba_pairs);
             pages_to_transfer.insert(pages_to_transfer.end(), std::make_move_iterator(mamba_pairs.begin()),
                                      std::make_move_iterator(mamba_pairs.end()));
+            paged_cache_writeback_nodes = PagedCacheSnapshotNodesForWriteBack(match_result_.device.last_node);
+            paged_cache_writeback_transfers =
+                hybrid_prefix_cache_->PreparePagedCacheHostWriteBack(paged_cache_writeback_nodes);
         }
         host_node_ref = std::make_unique<HostNodeRef>(match_result_.device.last_node);
     } else {
@@ -816,7 +936,10 @@ Retracting ScheduleRetractEvent::applyRetract(ForwardStateT&& state) {
                       std::move(local_allocator),
                       std::move(pages_to_transfer),
                       std::move(mamba_writeback_nodes),
-                      std::move(local_mamba_allocator)};
+                      std::move(local_mamba_allocator),
+                      std::move(paged_cache_writeback_transfers),
+                      std::move(paged_cache_writeback_nodes),
+                      std::move(host_writeback_nodes)};
 #endif
 }
 

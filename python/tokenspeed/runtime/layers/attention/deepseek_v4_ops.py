@@ -44,6 +44,9 @@ from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_fused_csa_indexer_mxfp4_cache_insert as _triton_fused_csa_indexer_mxfp4_cache_insert,
 )
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
+    deepseek_v4_fused_hca_direct_compress_cache_insert as _triton_fused_hca_direct_compress_cache_insert,
+)
+from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
     deepseek_v4_fused_indexer_q_rope_hadamard_mxfp4 as _triton_fused_indexer_q_rope_hadamard_mxfp4,
 )
 from tokenspeed_kernel.ops.attention.triton.deepseek_v4 import (
@@ -87,6 +90,7 @@ __all__ = (
     "deepseek_v4_csa_compress_kv_cache_insert",
     "deepseek_v4_csa_indexer_cache_insert",
     "deepseek_v4_hca_compress_kv_cache_insert",
+    "deepseek_v4_hca_direct_compress_kv_cache_insert",
     "deepseek_v4_prepare_indexer_q_mxfp4",
     "dequantize_deepseek_v4_fp8_ds_mla_cache",
     "fused_qnorm_rope_kv_insert",
@@ -906,6 +910,118 @@ def deepseek_v4_hca_compress_kv_cache_insert(
         kv_cache_block_size=kv_cache_block_size,
         compress_ratio=compress_ratio,
         overlap=False,
+        block_table_base_offsets=block_table_base_offsets,
+    )
+
+
+def deepseek_v4_hca_direct_compress_kv_cache_insert(
+    state_cache: torch.Tensor,
+    kv: torch.Tensor,
+    score: torch.Tensor,
+    ape: torch.Tensor,
+    token_to_req_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    positions: torch.Tensor,
+    block_table: torch.Tensor,
+    compressor_block_size: int,
+    rms_norm_weight: torch.Tensor,
+    rms_norm_eps: float,
+    cos_sin_cache: torch.Tensor,
+    kv_cache_2d: torch.Tensor,
+    kv_slot_mapping: torch.Tensor,
+    kv_cache_block_size: int,
+    active_token_indices: torch.Tensor,
+    block_table_base_offsets: torch.Tensor | None = None,
+) -> None:
+    """Compress HCA active rows without falling back to paged row gathering.
+
+    The kernel reads current-step tokens directly from ``kv``/``score`` and
+    prefix-boundary tokens from the loaded paged ``state_cache``. This keeps HCA
+    cached-prefill rows on the direct path even when their 128-token window
+    crosses the prefix/tail boundary.
+
+    Args:
+        state_cache: Paged HCA compressor state with shape
+            ``[blocks, block_size, 2 * head_dim]``.
+        kv: Current forward HCA value states with shape ``[tokens, head_dim]``.
+        score: Current forward HCA score states with shape ``[tokens, head_dim]``.
+        ape: HCA APE table with shape ``[128, head_dim]``.
+        token_to_req_indices: Request index for each current-step token.
+        query_start_loc: Prefix-sum token offsets for current-step requests.
+        positions: Absolute token positions for the current forward step.
+        block_table: Paged compressor-state block table.
+        compressor_block_size: Compressor-state page size.
+        rms_norm_weight: RMSNorm weight applied after weighted reduction.
+        rms_norm_eps: RMSNorm epsilon.
+        cos_sin_cache: RoPE cache indexed by compressed positions.
+        kv_cache_2d: Destination compressed KV cache byte storage.
+        kv_slot_mapping: Destination compressed KV slot per source token.
+        kv_cache_block_size: Destination compressed KV cache page size.
+        active_token_indices: Source token offsets for HCA compressed rows.
+        block_table_base_offsets: Optional logical-page offset per request.
+    """
+
+    if kv.shape != score.shape:
+        raise ValueError(
+            f"kv and score shapes must match, got {kv.shape} vs {score.shape}"
+        )
+    if kv.dim() != 2:
+        raise ValueError(f"kv/score must be [tokens, head_dim], got {kv.shape}")
+    if state_cache.dim() != 3:
+        raise ValueError(f"state_cache must be 3D, got {tuple(state_cache.shape)}")
+    state_width = kv.shape[-1]
+    head_dim = int(rms_norm_weight.numel())
+    if state_width != head_dim:
+        raise ValueError(f"HCA state width must be {head_dim}, got {state_width}")
+    if compressor_block_size != state_cache.shape[1]:
+        raise ValueError(
+            "compressor_block_size must match state_cache page size, "
+            f"got {compressor_block_size} vs {state_cache.shape[1]}"
+        )
+    if state_cache.shape[-1] != state_width * 2:
+        raise ValueError(
+            f"state_cache last dim must be {state_width * 2}, "
+            f"got {state_cache.shape[-1]}"
+        )
+    rope_dim = int(cos_sin_cache.shape[-1])
+    min_block_stride = kv_cache_block_size * deepseek_v4_swa_row_bytes(
+        state_width, rope_dim
+    )
+    if kv_cache_2d.dim() != 2 or kv_cache_2d.shape[1] < min_block_stride:
+        raise ValueError(
+            f"kv_cache_2d must be [blocks, >= {min_block_stride}] uint8, "
+            f"got {tuple(kv_cache_2d.shape)}"
+        )
+    if kv_cache_2d.dtype != torch.uint8:
+        raise TypeError(f"kv_cache_2d must be uint8, got {kv_cache_2d.dtype}")
+    if not kv.is_cuda:
+        raise ValueError(
+            "deepseek_v4_hca_direct_compress_kv_cache_insert only supports CUDA tensors."
+        )
+    if token_to_req_indices.device != positions.device:
+        token_to_req_indices = token_to_req_indices.to(
+            positions.device, non_blocking=True
+        )
+    if query_start_loc.device != positions.device:
+        query_start_loc = query_start_loc.to(positions.device, non_blocking=True)
+
+    _triton_fused_hca_direct_compress_cache_insert(
+        state_cache=state_cache,
+        kv=kv,
+        score=score,
+        ape=ape,
+        token_to_req_indices=token_to_req_indices,
+        query_start_loc=query_start_loc,
+        positions=positions,
+        block_table=block_table,
+        compressor_block_size=compressor_block_size,
+        rms_norm_weight=rms_norm_weight,
+        rms_norm_eps=rms_norm_eps,
+        cos_sin_cache=cos_sin_cache,
+        kv_cache_2d=kv_cache_2d,
+        kv_slot_mapping=kv_slot_mapping,
+        kv_cache_block_size=kv_cache_block_size,
+        active_token_indices=active_token_indices,
         block_table_base_offsets=block_table_base_offsets,
     )
 

@@ -37,22 +37,6 @@ protected:
         SendForwardDone(id, {42});
         PlanOnce();
     }
-
-    void SendReserveNumTokens(const std::string& id, std::int32_t n) {
-        ExecutionEvent event;
-        event.With(ForwardEvent{forward::UpdateReserveNumTokens{
-            .request_id = id,
-            .reserve_num_tokens_in_next_schedule_event = n,
-        }});
-        scheduler_->Advance(std::move(event));
-    }
-
-    static const FlatForwardOperation* GetForwardOp(const ExecutionPlan& plan) {
-        for (const auto& op : plan.Operations()) {
-            if (auto* f = std::get_if<FlatForwardOperation>(&op)) return f;
-        }
-        return nullptr;
-    }
 };
 
 TEST_F(BatchSchedulingTestSuite, MaxBatchSize_LimitsScheduledRequests) {

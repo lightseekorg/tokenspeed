@@ -50,44 +50,33 @@ protected:
         SendForwardDone(id, {42});
         PlanOnce();
     }
+};
 
-    void SendReserveNumTokens(const std::string& id, std::int32_t n) {
-        ExecutionEvent event;
-        event.With(ForwardEvent{forward::UpdateReserveNumTokens{
-            .request_id = id,
-            .reserve_num_tokens_in_next_schedule_event = n,
-        }});
-        scheduler_->Advance(std::move(event));
-    }
-
-    void SendAbort(const std::string& id) {
-        ExecutionEvent event;
-        event.With(ForwardEvent{forward::Abort{.request_id = id}});
-        scheduler_->Advance(std::move(event));
-    }
-
-    static const FlatWriteBackOperation* GetWriteBack(const ExecutionPlan& plan) {
-        for (const auto& op : plan.Operations()) {
-            if (auto* cop = std::get_if<CacheOperation>(&op)) {
-                if (auto* wb = std::get_if<FlatWriteBackOperation>(cop)) {
-                    return wb;
-                }
-            }
-        }
-        return nullptr;
-    }
-
-    static bool RequestInFwd(const ExecutionPlan& plan, const std::string& id) {
-        for (const auto& op : plan.Operations()) {
-            if (auto* fwd = std::get_if<FlatForwardOperation>(&op)) {
-                for (const auto& rid : fwd->request_ids) {
-                    if (rid == id) return true;
-                }
-            }
-        }
-        return false;
+class RetractHostExhaustionSuite : public RetractAbortPagesSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = RetractAbortPagesSuite::MakeConfig();
+        cfg.host_allocator.total_pages = 1;
+        return cfg;
     }
 };
+
+TEST_F(RetractHostExhaustionSuite, InternalAbortIsPublishedInExecutionPlan) {
+    // BringToDecoding schedules zero-token decode ops; settle their result debt before testing terminal abort.
+    BringToDecoding("r1", /*num_pages=*/2, /*start=*/1);
+    SendForwardDone("r1", {});
+    BringToDecoding("r2", /*num_pages=*/1, /*start=*/5);
+    SendForwardDone("r1", {});
+    SendForwardDone("r2", {});
+    SendReserveNumTokens("r1", 2);
+    SendReserveNumTokens("r2", 1);
+
+    auto plan = PlanOnce();
+
+    ASSERT_EQ(plan.SchedulerAborts().size(), 1u);
+    EXPECT_EQ(plan.SchedulerAborts().front().request_id, "r1");
+    EXPECT_NE(plan.SchedulerAborts().front().message.find("host cache capacity"), std::string::npos);
+}
 
 // Core scenario: Decoding request gets retracted, then aborted.
 // Before OwnedPages: ~LocalKVAllocator would double-free pages already in the tree.
@@ -105,7 +94,7 @@ TEST_F(RetractAbortPagesSuite, Retract_ThenAbort_NoDoubleFree) {
     (void)GetWriteBack(plan);
 
     // Whether retract was triggered or not, aborting should be safe.
-    SendAbort("r1");
+    SendAbortEvent("r1");
 
     // No crash (no double-free). r2 is still in Decoding.
     EXPECT_EQ(scheduler_->DecodingSize(), 1u);
@@ -149,7 +138,7 @@ TEST_F(RetractAbortPagesSuite, AbortOne_OtherContinues_PagesIntact) {
     BringToDecoding("r1", 1, 1);
     BringToDecoding("r2", 1, 3);
 
-    SendAbort("r1");
+    SendAbortEvent("r1");
     EXPECT_EQ(scheduler_->DecodingSize(), 1u);
 
     // r2 can still decode
@@ -165,7 +154,7 @@ TEST_F(RetractAbortPagesSuite, Abort_FromDecoding_PagesFreed) {
     auto after_decoding = scheduler_->AvailableKvPages();
     EXPECT_LT(after_decoding, before);
 
-    SendAbort("r1");
+    SendAbortEvent("r1");
 
     // After abort + next plan (cleanup), pages should be freed
     PlanOnce();
@@ -197,7 +186,7 @@ TEST_F(RetractAbortPagesSuite, RetractAbort_NewRequestReusesPages) {
     BringToDecoding("r1", 1, 1);
 
     // Abort r1
-    SendAbort("r1");
+    SendAbortEvent("r1");
     PlanOnce();
 
     // New request can reuse the freed device pages

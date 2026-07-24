@@ -101,7 +101,7 @@ class FlatMemoryExecutor:
     """
 
     # EventLoop keys per-op inflight accounting off this: flat loadbacks are
-    # acked (LoadBackDoneEvent), radix loadbacks are not.
+    # acknowledged with one LoadBackDoneEvent per op.
     emits_loadback_acks = True
 
     def __init__(self, device_pool, *, host_ratio: float, host_size_gb: float):

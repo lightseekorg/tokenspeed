@@ -151,6 +151,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_paged_cache_attach_loop.cpp
         tests/cpp/test_paged_cache_eviction.cpp
         tests/cpp/test_paged_cache_family_split.cpp
+        tests/cpp/test_paged_cache_l2_offload.cpp
         tests/cpp/test_paged_cache_prefix_hit_commit.cpp
         tests/cpp/test_paged_cache_replay.cpp
         tests/cpp/test_retract_abort_pages.cpp

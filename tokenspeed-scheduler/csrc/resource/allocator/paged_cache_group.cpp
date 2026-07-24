@@ -383,6 +383,45 @@ void PagedCacheGroupTable::ImportPrefixBorrowed(std::vector<std::int32_t> ids, s
     RefreshPageIdsView();
 }
 
+void PagedCacheGroupTable::ImportPrefixOwned(OwnedPages pages, std::int32_t base_logical_page,
+                                             std::int32_t raw_tokens_covered) {
+    if (allocator_ == nullptr) {
+        throw std::logic_error("PagedCacheGroupTable::ImportPrefixOwned: no allocator bound");
+    }
+    if (!(borrowed_page_ids_.empty() && owned_pages_.Empty() && raw_token_cursor_ == 0 && base_logical_page_ == 0 &&
+          committed_prefix_len_tokens_ == 0)) {
+        throw std::logic_error("PagedCacheGroupTable::ImportPrefixOwned: only legal on a fresh-empty table");
+    }
+    if (base_logical_page < 0) {
+        throw std::invalid_argument("PagedCacheGroupTable::ImportPrefixOwned: base_logical_page must be >= 0");
+    }
+    if (raw_tokens_covered < 0) {
+        throw std::invalid_argument("PagedCacheGroupTable::ImportPrefixOwned: raw_tokens_covered must be >= 0");
+    }
+    const std::int32_t raw_per_page = allocator_->Config().RawTokensPerPage();
+    if (raw_per_page <= 0) {
+        throw std::logic_error("PagedCacheGroupTable::ImportPrefixOwned: invalid group config");
+    }
+    if (raw_tokens_covered % raw_per_page != 0) {
+        throw std::invalid_argument("PagedCacheGroupTable::ImportPrefixOwned: raw_tokens_covered must be page-aligned");
+    }
+    if (!pages.Empty()) {
+        const std::int32_t covered_pages = raw_tokens_covered / raw_per_page;
+        if (base_logical_page + pages.Size() != covered_pages) {
+            throw std::invalid_argument(
+                "PagedCacheGroupTable::ImportPrefixOwned: page ids do not end at covered raw "
+                "token cursor");
+        }
+    }
+    owned_pages_ = std::move(pages);
+    base_logical_page_ = base_logical_page;
+    raw_token_cursor_ = raw_tokens_covered;
+    committed_prefix_len_tokens_ = allocator_->Config().family == PagedCacheGroupFamily::History
+                                       ? base_logical_page_ * raw_per_page
+                                       : raw_tokens_covered;
+    RefreshPageIdsView();
+}
+
 std::vector<std::int32_t> PagedCacheGroupTable::ReleaseSkipped(std::int32_t window_lower_bound) {
     if (allocator_ == nullptr || window_lower_bound <= 0) {
         return {};

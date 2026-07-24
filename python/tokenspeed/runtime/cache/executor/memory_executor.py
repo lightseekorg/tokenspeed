@@ -22,11 +22,15 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable
 from dataclasses import dataclass
 
 from tokenspeed_scheduler import Cache
 
+from tokenspeed.runtime.cache.deepseek_v4_cache_host import (
+    DeepseekV4TokenToKVPoolHost,
+)
 from tokenspeed.runtime.cache.executor.host_executor import HostExecutor
 from tokenspeed.runtime.cache.executor.storage_executor import StorageExecutor
 from tokenspeed.runtime.cache.kv_cache_host import (
@@ -36,15 +40,49 @@ from tokenspeed.runtime.cache.kv_cache_host import (
     get_available_host_memory_bytes,
 )
 from tokenspeed.runtime.cache.mamba_cache_host import MambaPoolHost
+from tokenspeed.runtime.cache.transfer.deepseek_v4_pool import DeepseekV4CachePool
 from tokenspeed.runtime.cache.transfer.kv_pool import KVCachePool
 from tokenspeed.runtime.cache.transfer.mamba_pool import MambaCachePool
 from tokenspeed.runtime.cache.transfer.types import CacheKind
+from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
+    DeepseekV4TokenToKVPool,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.dsa import DSATokenToKVPool
 from tokenspeed.runtime.layers.attention.kv_cache.mha import MHATokenToKVPool
 from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
+_DEBUG = logging.DEBUG
+
+
+def _count_page_pair_spans(src_pages, dst_pages) -> tuple[int, int]:
+    pairs = sorted({(int(src), int(dst)) for src, dst in zip(src_pages, dst_pages)})
+    if not pairs:
+        return 0, 0
+    spans = 1
+    prev_src, prev_dst = pairs[0]
+    for src, dst in pairs[1:]:
+        if src != prev_src + 1 or dst != prev_dst + 1:
+            spans += 1
+        prev_src, prev_dst = src, dst
+    return len(pairs), spans
+
+
+def _paged_transfer_debug_summary(paged_transfers) -> tuple[int, int, dict[str, int]]:
+    pages = 0
+    spans = 0
+    groups: dict[str, int] = {}
+    for transfer in paged_transfers or []:
+        group_id = str(getattr(transfer, "group_id", "unknown"))
+        transfer_pages, transfer_spans = _count_page_pair_spans(
+            getattr(transfer, "src_pages", []),
+            getattr(transfer, "dst_pages", []),
+        )
+        pages += transfer_pages
+        spans += transfer_spans
+        groups[group_id] = groups.get(group_id, 0) + transfer_pages
+    return pages, spans, groups
 
 
 @dataclass(slots=True)
@@ -124,107 +162,140 @@ class MemoryExecutor:
         mamba_pool=None,
     ):
         self.page_size = config.page_size
-        kv_pool_types = (DSATokenToKVPool, MHATokenToKVPool, MLATokenToKVPool)
+        kv_pool_types = (
+            DSATokenToKVPool,
+            DeepseekV4TokenToKVPool,
+            MHATokenToKVPool,
+            MLATokenToKVPool,
+        )
 
         # Unwrap LayerMappedKVPool (hybrid GDN models) to get the inner MHA pool.
         actual_pool = device_pool
         if hasattr(device_pool, "inner") and not isinstance(device_pool, kv_pool_types):
             actual_pool = device_pool.inner
 
+        self.paged_cache_pool = None
         actual_draft_pool = None
-        if draft_device_pool is not None:
-            actual_draft_pool = draft_device_pool
-            if hasattr(draft_device_pool, "inner") and not isinstance(
-                draft_device_pool, kv_pool_types
-            ):
-                actual_draft_pool = draft_device_pool.inner
-            if not isinstance(actual_draft_pool, kv_pool_types):
-                raise ValueError(
-                    f"draft_device_pool only supports DSA, MHA and MLA, "
-                    f"got {type(actual_draft_pool)}"
+        if isinstance(actual_pool, DeepseekV4TokenToKVPool):
+            if config.storage_backend is not None:
+                raise NotImplementedError(
+                    "DeepSeek V4 KVStore currently supports L2 host memory only; "
+                    "L3 storage backends are out of scope."
                 )
-
-        host_size_tokens = 0
-        if config.host_size_gb == 0:
-            target_size_per_token = _pool_size_per_token(actual_pool)
-            draft_size_per_token = (
-                _pool_size_per_token(actual_draft_pool)
-                if actual_draft_pool is not None
-                else 0
-            )
-            combined_size_per_token = target_size_per_token + draft_size_per_token
             reserve_bytes = int(config.host_reserve_gb * (1024**3))
-            available_bytes, _, cgroup_available = get_available_host_memory_bytes(
-                reserve_bytes
-            )
-            requested_tokens = int(actual_pool.size * config.host_ratio)
-            host_size_tokens = _auto_capped_host_size_tokens(
-                requested_tokens=requested_tokens,
-                page_size=config.page_size,
-                size_per_token=combined_size_per_token,
-                available_host_memory_bytes=available_bytes,
-                host_parallel_count=config.host_parallel_count,
-            )
-            if host_size_tokens > 0:
-                capped_tokens = _aligned_token_count(host_size_tokens, config.page_size)
-                requested_tokens_aligned = _aligned_token_count(
-                    requested_tokens, config.page_size
-                )
-                logger.warning(
-                    "Capping KVStore host pool for cgroup budget: "
-                    "tokens %s -> %s, total bytes %.2f GB -> %.2f GB "
-                    "(parallel_count=%s, available=%.2f GB, cgroup_available=%s)",
-                    requested_tokens_aligned,
-                    capped_tokens,
-                    requested_tokens_aligned * combined_size_per_token / 1e9,
-                    capped_tokens * combined_size_per_token / 1e9,
-                    config.host_parallel_count,
-                    available_bytes / 1e9,
-                    (
-                        f"{cgroup_available / 1e9:.2f} GB"
-                        if cgroup_available is not None
-                        else "unlimited"
-                    ),
-                )
-
-        # DSA subclasses MLA, so it must be matched before the MLA branch.
-        if isinstance(actual_pool, DSATokenToKVPool):
-            self.host_pool = DSATokenToKVPoolHost(
+            available_bytes, _, _ = get_available_host_memory_bytes(reserve_bytes)
+            host_budget_bytes = available_bytes // max(config.host_parallel_count, 1)
+            self.host_pool = DeepseekV4TokenToKVPoolHost(
                 actual_pool,
                 config.host_ratio,
                 config.host_size_gb,
-                config.page_size,
                 config.host_layout,
-                host_size_tokens=host_size_tokens,
+                host_budget_bytes=host_budget_bytes,
             )
-        elif isinstance(actual_pool, MHATokenToKVPool):
-            self.host_pool = MHATokenToKVPoolHost(
-                actual_pool,
-                config.host_ratio,
-                config.host_size_gb,
-                config.page_size,
-                config.host_layout,
-                host_size_tokens=host_size_tokens,
-            )
-        elif isinstance(actual_pool, MLATokenToKVPool):
-            self.host_pool = MLATokenToKVPoolHost(
-                actual_pool,
-                config.host_ratio,
-                config.host_size_gb,
-                config.page_size,
-                config.host_layout,
-                host_size_tokens=host_size_tokens,
+            self.paged_cache_pool = DeepseekV4CachePool(
+                device_pool=actual_pool,
+                host_pool=self.host_pool,
+                io_backend=config.io_backend,
             )
         else:
-            raise ValueError(
-                f"host_pool only supports DSA, MHA and MLA, got {type(actual_pool)} "
-                f"from module {type(actual_pool).__module__}"
-            )
+            if draft_device_pool is not None:
+                actual_draft_pool = draft_device_pool
+                if hasattr(draft_device_pool, "inner") and not isinstance(
+                    draft_device_pool, kv_pool_types
+                ):
+                    actual_draft_pool = draft_device_pool.inner
+                if not isinstance(
+                    actual_draft_pool,
+                    (DSATokenToKVPool, MHATokenToKVPool, MLATokenToKVPool),
+                ):
+                    raise ValueError(
+                        f"draft_device_pool only supports DSA, MHA and MLA, "
+                        f"got {type(actual_draft_pool)}"
+                    )
+
+            host_size_tokens = 0
+            if config.host_size_gb == 0:
+                target_size_per_token = _pool_size_per_token(actual_pool)
+                draft_size_per_token = (
+                    _pool_size_per_token(actual_draft_pool)
+                    if actual_draft_pool is not None
+                    else 0
+                )
+                combined_size_per_token = target_size_per_token + draft_size_per_token
+                reserve_bytes = int(config.host_reserve_gb * (1024**3))
+                available_bytes, _, cgroup_available = get_available_host_memory_bytes(
+                    reserve_bytes
+                )
+                requested_tokens = int(actual_pool.size * config.host_ratio)
+                host_size_tokens = _auto_capped_host_size_tokens(
+                    requested_tokens=requested_tokens,
+                    page_size=config.page_size,
+                    size_per_token=combined_size_per_token,
+                    available_host_memory_bytes=available_bytes,
+                    host_parallel_count=config.host_parallel_count,
+                )
+                if host_size_tokens > 0:
+                    capped_tokens = _aligned_token_count(
+                        host_size_tokens, config.page_size
+                    )
+                    requested_tokens_aligned = _aligned_token_count(
+                        requested_tokens, config.page_size
+                    )
+                    logger.warning(
+                        "Capping KVStore host pool for cgroup budget: "
+                        "tokens %s -> %s, total bytes %.2f GB -> %.2f GB "
+                        "(parallel_count=%s, available=%.2f GB, cgroup_available=%s)",
+                        requested_tokens_aligned,
+                        capped_tokens,
+                        requested_tokens_aligned * combined_size_per_token / 1e9,
+                        capped_tokens * combined_size_per_token / 1e9,
+                        config.host_parallel_count,
+                        available_bytes / 1e9,
+                        (
+                            f"{cgroup_available / 1e9:.2f} GB"
+                            if cgroup_available is not None
+                            else "unlimited"
+                        ),
+                    )
+
+            # DSA subclasses MLA, so it must be matched before the MLA branch.
+            if isinstance(actual_pool, DSATokenToKVPool):
+                self.host_pool = DSATokenToKVPoolHost(
+                    actual_pool,
+                    config.host_ratio,
+                    config.host_size_gb,
+                    config.page_size,
+                    config.host_layout,
+                    host_size_tokens=host_size_tokens,
+                )
+            elif isinstance(actual_pool, MHATokenToKVPool):
+                self.host_pool = MHATokenToKVPoolHost(
+                    actual_pool,
+                    config.host_ratio,
+                    config.host_size_gb,
+                    config.page_size,
+                    config.host_layout,
+                    host_size_tokens=host_size_tokens,
+                )
+            elif isinstance(actual_pool, MLATokenToKVPool):
+                self.host_pool = MLATokenToKVPoolHost(
+                    actual_pool,
+                    config.host_ratio,
+                    config.host_size_gb,
+                    config.page_size,
+                    config.host_layout,
+                    host_size_tokens=host_size_tokens,
+                )
+            else:
+                raise ValueError(
+                    "host_pool only supports DSA, MHA, MLA, and DeepSeek V4, "
+                    f"got {type(actual_pool)} from module {type(actual_pool).__module__}"
+                )
 
         # Draft model L2 cache: draft shares the same page mapping as the base
         # model, so its host pool must hold exactly the same number of tokens.
         # Pass host_size_tokens directly to bypass ratio/GB recalculation.
-        if actual_draft_pool is not None:
+        if actual_draft_pool is not None and self.paged_cache_pool is None:
             if isinstance(actual_draft_pool, DSATokenToKVPool):
                 self.draft_host_pool = DSATokenToKVPoolHost(
                     actual_draft_pool,
@@ -276,7 +347,8 @@ class MemoryExecutor:
         pools = None
         self.mamba_host_pool = None
         if (
-            config.enable_mamba_l2
+            self.paged_cache_pool is None
+            and config.enable_mamba_l2
             and mamba_pool is not None
             and config.mamba_l2_host_slots > 0
         ):
@@ -313,7 +385,13 @@ class MemoryExecutor:
                 config.host_layout,
             )
 
-        if pools is not None:
+        if self.paged_cache_pool is not None:
+            self.host_exec = HostExecutor(
+                pools=pools or [],
+                paged_pool=self.paged_cache_pool,
+                io_backend=config.io_backend,
+            )
+        elif pools is not None:
             self.host_exec = HostExecutor(pools=pools, io_backend=config.io_backend)
         else:
             self.host_exec = HostExecutor(
@@ -328,6 +406,7 @@ class MemoryExecutor:
                 draft_host_pool=self.draft_host_pool,
                 draft_layer_num=draft_layer_num,
             )
+        self.emits_loadback_acks = self.host_exec.emits_loadback_acks
         self.storage_exec = StorageExecutor(
             page_size=config.page_size,
             device_pool=device_pool,
@@ -377,9 +456,14 @@ class MemoryExecutor:
                 len(op.dst_pages),
             )
             groups = self._page_groups_by_kind(op)
+            paged_transfers_by_op = getattr(op, "paged_cache_transfers", [])
+            is_retract_flags = getattr(op, "is_retract", [])
             for i in range(len(op.op_ids)):
                 op_id = op.op_ids[i]
-                is_retract = bool(getattr(op, "is_retract", [False])[i])
+                is_retract = (
+                    bool(is_retract_flags[i]) if i < len(is_retract_flags) else False
+                )
+                submitted = False
                 for kind, (src_groups, dst_groups) in groups.items():
                     if kind not in self.host_exec.pools:
                         continue
@@ -405,7 +489,32 @@ class MemoryExecutor:
                         is_retract=is_retract,
                         kind=kind,
                     )
-                if all(
+                    submitted = True
+                paged_transfers = (
+                    paged_transfers_by_op[i] if i < len(paged_transfers_by_op) else []
+                )
+                if paged_transfers:
+                    if logger.isEnabledFor(_DEBUG):
+                        pages, spans, debug_groups = _paged_transfer_debug_summary(
+                            paged_transfers
+                        )
+                        logger.debug(
+                            "[cache_op][paged_l2] writeback schedule op_id=%s "
+                            "pages=%s spans=%s groups=%s transfers=%s is_retract=%s",
+                            op_id,
+                            pages,
+                            spans,
+                            debug_groups,
+                            len(paged_transfers),
+                            is_retract,
+                        )
+                    self.host_exec.enqueue_paged_cache_writeback(
+                        op_id,
+                        paged_transfers,
+                        is_retract=is_retract,
+                    )
+                    submitted = True
+                if not submitted and all(
                     i >= len(src_groups) or not src_groups[i]
                     for kind, (src_groups, _) in groups.items()
                     if kind in self.host_exec.pools
@@ -419,6 +528,7 @@ class MemoryExecutor:
                 len(op.dst_pages),
             )
             groups = self._page_groups_by_kind(op)
+            paged_transfers_by_op = getattr(op, "paged_cache_transfers", [])
             for i in range(len(op.op_ids)):
                 op_id = op.op_ids[i]
                 for kind, (src_groups, dst_groups) in groups.items():
@@ -447,6 +557,27 @@ class MemoryExecutor:
                         )
                     self.host_exec.enqueue_loadback(
                         op_id, src_pages, dst_pages, kind=kind, **loadback_kwargs
+                    )
+                paged_transfers = (
+                    paged_transfers_by_op[i] if i < len(paged_transfers_by_op) else []
+                )
+                if paged_transfers:
+                    if logger.isEnabledFor(_DEBUG):
+                        pages, spans, debug_groups = _paged_transfer_debug_summary(
+                            paged_transfers
+                        )
+                        logger.debug(
+                            "[cache_op][paged_l2] loadback schedule op_id=%s "
+                            "pages=%s spans=%s groups=%s transfers=%s",
+                            op_id,
+                            pages,
+                            spans,
+                            debug_groups,
+                            len(paged_transfers),
+                        )
+                    self.host_exec.enqueue_paged_cache_loadback(
+                        op_id,
+                        paged_transfers,
                     )
 
         elif isinstance(op, Cache.PrefetchOp):

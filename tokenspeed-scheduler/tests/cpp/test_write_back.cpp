@@ -37,15 +37,6 @@ protected:
         return cfg;
     }
 
-    void SendReserveNumTokens(const std::string& id, std::int32_t n) {
-        ExecutionEvent event;
-        event.With(ForwardEvent{forward::UpdateReserveNumTokens{
-            .request_id = id,
-            .reserve_num_tokens_in_next_schedule_event = n,
-        }});
-        scheduler_->Advance(std::move(event));
-    }
-
     // Submitted → PrefillDone → Decoding.
     // decoding_peers: requests already in Decoding that need reserve set before the next PlanOnce.
     void BringToDecoding(const std::string& id, std::int32_t num_pages, token_t start = 1,
@@ -59,28 +50,6 @@ protected:
             SendReserveNumTokens(peer, 0);
         }
         PlanOnce();
-    }
-
-    static const FlatWriteBackOperation* GetWriteBack(const ExecutionPlan& plan) {
-        for (const auto& op : plan.Operations()) {
-            if (auto* cop = std::get_if<CacheOperation>(&op)) {
-                if (auto* wb = std::get_if<FlatWriteBackOperation>(cop)) {
-                    return wb;
-                }
-            }
-        }
-        return nullptr;
-    }
-
-    static bool RequestInFwd(const ExecutionPlan& plan, const std::string& id) {
-        for (const auto& op : plan.Operations()) {
-            if (auto* fwd = std::get_if<FlatForwardOperation>(&op)) {
-                for (const auto& rid : fwd->request_ids) {
-                    if (rid == id) return true;
-                }
-            }
-        }
-        return false;
     }
 };
 
@@ -128,6 +97,41 @@ TEST_F(WriteBackTestSuite, WriteBack_FinishedAfterWriteBackDone) {
     EXPECT_EQ(scheduler_->WaitingSize(), 0u);
     EXPECT_EQ(scheduler_->DecodingSize(), 0u);
 }
+
+#if !TOKENSPEED_FLAT_KVCACHE
+TEST_F(WriteBackTestSuite, AbortBeforeWriteBackRollsBackPreparedHostState) {
+    BringToDecoding("r1", /*num_pages=*/2);
+    const std::size_t host_pages_before_finish = scheduler_->AvailableHostKvPages();
+
+    SendFinish("r1");
+    ASSERT_LT(scheduler_->AvailableHostKvPages(), host_pages_before_finish);
+
+    SendAbortEvent("r1");
+    EXPECT_EQ(scheduler_->AvailableHostKvPages(), host_pages_before_finish);
+    EXPECT_EQ(GetWriteBack(PlanOnce()), nullptr);
+}
+
+TEST_F(WriteBackTestSuite, AbortDuringWriteBackWaitsForAckAndDiscardsHostState) {
+    BringToDecoding("r1", /*num_pages=*/2);
+    const std::size_t host_pages_before_finish = scheduler_->AvailableHostKvPages();
+    SendFinish("r1");
+
+    auto writeback_plan = PlanOnce();
+    const auto* writeback = GetWriteBack(writeback_plan);
+    ASSERT_NE(writeback, nullptr);
+    ASSERT_EQ(writeback->op_ids.size(), 1u);
+    const std::size_t host_pages_during_writeback = scheduler_->AvailableHostKvPages();
+    ASSERT_LT(host_pages_during_writeback, host_pages_before_finish);
+
+    SendAbortEvent("r1");
+    EXPECT_EQ(scheduler_->AvailableHostKvPages(), host_pages_during_writeback);
+    EXPECT_EQ(GetWriteBack(PlanOnce()), nullptr);
+
+    SendWriteBackDone(writeback->op_ids[0]);
+    EXPECT_EQ(scheduler_->AvailableHostKvPages(), host_pages_before_finish);
+    EXPECT_TRUE(PlanOnce().SchedulerAborts().empty());
+}
+#endif
 
 // Two requests finish in the same round → two separate WriteBack ops.
 TEST_F(WriteBackTestSuite, WriteBack_MultipleRequestsGetSeparateOps) {

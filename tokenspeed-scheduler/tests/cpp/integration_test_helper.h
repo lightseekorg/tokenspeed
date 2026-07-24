@@ -20,6 +20,8 @@
 
 #pragma once
 
+#include <algorithm>
+
 #include "scheduler/scheduler.h"
 #include "scheduler/execution_plan.h"
 #include "scheduler/execution_event.h"
@@ -77,6 +79,49 @@ protected:
     void Submit(const std::vector<RequestSpec>& specs) { scheduler_->SubmitRequests(specs); }
 
     ExecutionPlan PlanOnce() { return scheduler_->NextExecutionPlan(); }
+
+    static const FlatForwardOperation* GetForward(const std::vector<Operation>& operations) {
+        for (const auto& op : operations) {
+            if (auto* forward = std::get_if<FlatForwardOperation>(&op)) return forward;
+        }
+        return nullptr;
+    }
+
+    static const FlatForwardOperation* GetForward(const ExecutionPlan& plan) { return GetForward(plan.Operations()); }
+
+    template <typename PlanOrOperations>
+    static const FlatForwardOperation* GetForwardOp(const PlanOrOperations& value) {
+        return GetForward(value);
+    }
+
+    template <typename Kind>
+    static const Kind* GetCacheOperation(const ExecutionPlan& plan) {
+        for (const auto& op : plan.Operations()) {
+            if (auto* cache_op = std::get_if<CacheOperation>(&op)) {
+                if (auto* result = std::get_if<Kind>(cache_op)) return result;
+            }
+        }
+        return nullptr;
+    }
+
+    static const FlatWriteBackOperation* GetWriteBack(const ExecutionPlan& plan) {
+        return GetCacheOperation<FlatWriteBackOperation>(plan);
+    }
+
+    static const FlatLoadBackOperation* GetLoadBack(const ExecutionPlan& plan) {
+        return GetCacheOperation<FlatLoadBackOperation>(plan);
+    }
+
+    static bool RequestInFwd(const ExecutionPlan& plan, const std::string& id) {
+        for (const auto& op : plan.Operations()) {
+            if (auto* forward = std::get_if<FlatForwardOperation>(&op);
+                forward != nullptr &&
+                std::find(forward->request_ids.begin(), forward->request_ids.end(), id) != forward->request_ids.end()) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     static std::vector<CacheOperation> ExtractCacheOps(const ExecutionPlan& plan) {
         std::vector<CacheOperation> result;
@@ -138,6 +183,21 @@ protected:
         ExecutionEvent event;
         event.With(ForwardEvent{forward::Finish{
             .request_id = request_id,
+        }});
+        scheduler_->Advance(std::move(event));
+    }
+
+    void SendAbortEvent(const std::string& request_id) {
+        ExecutionEvent event;
+        event.With(ForwardEvent{forward::Abort{.request_id = request_id}});
+        scheduler_->Advance(std::move(event));
+    }
+
+    void SendReserveNumTokens(const std::string& request_id, std::int32_t value) {
+        ExecutionEvent event;
+        event.With(ForwardEvent{forward::UpdateReserveNumTokens{
+            .request_id = request_id,
+            .reserve_num_tokens_in_next_schedule_event = value,
         }});
         scheduler_->Advance(std::move(event));
     }
