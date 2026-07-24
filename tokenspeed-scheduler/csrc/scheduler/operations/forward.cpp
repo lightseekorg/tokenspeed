@@ -597,25 +597,47 @@ std::optional<fsm::ScheduleRetractEvent> Scheduler::scheduleRetract(Request* req
     std::int32_t alloc_count =
         static_cast<std::int32_t>(full_paged_tokens.size()) - static_cast<std::int32_t>(prefix_pages.size());
 
+    // Check host write-back capacity BEFORE mutating request-local/tree state.
+    // This used to call TakeFirstPages()/Insert<Device>() first and only
+    // afterwards check EnsureCapacityByEvict<Host>(), bailing out via
+    // `return {}` on failure. That left the request internally inconsistent:
+    // its local KV allocator had already lost `alloc_count` pages and the
+    // shared tree already owned them, but the ScheduleRetractEvent that
+    // would update the request's device_node_ref_ to match was never
+    // constructed. A later TakeFirst on the same (now-desynced) local
+    // allocator can then run "count out of range".
+    //
+    // Every other scheduleXxx() in this file (scheduleDecode,
+    // scheduleDecodeFromRetracted, ...) follows the same "check every
+    // capacity gate first, mutate only once all gates pass" rule; mirror it
+    // here. The host-side match is independent of whether the device alloc
+    // pages below have been inserted yet -- Insert<Device> only touches the
+    // device resource -- so matching against `full_paged_tokens` here gives
+    // the same `host.DepthInPage()` as matching after the insert.
+    MatchResult pre_match = kv_prefix_cache_.Match(full_paged_tokens, MatchIntent::StateRecovery);
+    std::unique_ptr<HostNodeRef> temp_lock = std::make_unique<HostNodeRef>(pre_match.host.last_node);
+    const std::int32_t host_matched_pre = pre_match.host.DepthInPage();
+    std::int32_t host_pages_needed = 0;
+    if (static_cast<std::int32_t>(full_paged_tokens.size()) > host_matched_pre) {
+        host_pages_needed = static_cast<std::int32_t>(full_paged_tokens.size()) - host_matched_pre;
+    }
+
+    if (!kv_prefix_cache_.EnsureCapacityByEvict<ResourceType::Host>(host_pages_needed)) {
+        return {};
+    }
+
     // Skip when alloc_count <= 0: a prefix deeper than total_available would make TakeFirstPages negative.
     if (alloc_count > 0) {
         OwnedPages alloc_pages = request->TakeFirstPages(alloc_count);
         kv_prefix_cache_.Insert<ResourceType::Device>(full_paged_tokens, prefix_pages, std::move(alloc_pages));
     }
 
+    // Insert<Device>() only touches the device resource, so the host side
+    // (and therefore the node `temp_lock` protects) is unchanged; re-Match
+    // just to pick up the fresh device depth for the returned event.
     MatchResult match_result = kv_prefix_cache_.Match(full_paged_tokens, MatchIntent::StateRecovery);
+    temp_lock = std::make_unique<HostNodeRef>(match_result.host.last_node);
 
-    std::unique_ptr<HostNodeRef> temp_lock = std::make_unique<HostNodeRef>(match_result.host.last_node);
-    const std::int32_t device_matched3 = match_result.device.DepthInPage();
-    const std::int32_t host_matched3 = match_result.host.DepthInPage();
-    std::int32_t host_pages_needed = 0;
-    if (device_matched3 > host_matched3) {
-        host_pages_needed = device_matched3 - host_matched3;
-    }
-
-    if (!kv_prefix_cache_.EnsureCapacityByEvict<ResourceType::Host>(host_pages_needed)) {
-        return {};
-    }
     return fsm::ScheduleRetractEvent{&kv_prefix_cache_, &host_allocator_, match_result,
                                      hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr};
 }
