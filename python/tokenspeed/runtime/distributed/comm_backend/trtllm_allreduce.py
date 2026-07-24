@@ -154,6 +154,8 @@ class TrtllmAllReduceBackend(CommBackend):
         token_num, hidden_dim = tensor_2d.shape
         if hidden_dim > res["hidden_dim"] or token_num > res["max_token_num"]:
             return None
+        if token_num == 0:
+            return tensor
 
         from tokenspeed.runtime.utils.pdl import pdl_enabled
 
