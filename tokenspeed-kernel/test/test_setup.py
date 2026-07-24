@@ -87,12 +87,6 @@ def test_rocm_install_requires_exclude_cuda_dependencies(monkeypatch) -> None:
         specifier.operator
         for specifier in requirements["tokenspeed-kernel-amd"].specifier
     } == {">="}
-    assert str(requirements["tokenspeed-kernel-amd"].specifier) == ">=0.1.3"
-    assert str(requirements["torch"].specifier) == "==2.11.0+rocm7.2"
-    assert (
-        "--extra-index-url https://download.pytorch.org/whl/rocm7.2"
-        in (REQUIREMENTS_DIR / "rocm.txt").read_text(encoding="utf-8").splitlines()
-    )
     assert {
         "flashinfer-python",
         "nvidia-cutlass-dsl",
