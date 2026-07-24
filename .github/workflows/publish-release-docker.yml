@@ -2,11 +2,6 @@ name: Publish NVIDIA Release Docker Image
 
 on:
   workflow_dispatch:
-    inputs:
-      tag:
-        description: Docker image tag.
-        required: true
-        type: string
 
 concurrency:
   group: publish-release-docker-${{ github.ref }}
@@ -19,8 +14,49 @@ env:
   IMAGE: lightseekorg/tokenspeed
 
 jobs:
+  metadata:
+    if: github.repository == 'lightseekorg/tokenspeed'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve release metadata
+        id: metadata
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import tomllib
+          from pathlib import Path
+
+          pyproject_path = Path("python/pyproject.toml")
+          data = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+          project = data.get("project")
+          if not isinstance(project, dict) or project.get("name") != "tokenspeed":
+              raise SystemExit(f"{pyproject_path} does not describe tokenspeed")
+
+          version = project.get("version")
+          if not isinstance(version, str):
+              raise SystemExit(f"{pyproject_path} project.version must be a string")
+          if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}", version):
+              raise SystemExit(
+                  f"invalid Docker image tag from {pyproject_path}: {version}"
+              )
+
+          with Path(os.environ["GITHUB_OUTPUT"]).open(
+              "a", encoding="utf-8"
+          ) as output:
+              print(f"version={version}", file=output)
+          print(f"::notice::Docker image tag: {version}")
+          PY
+
   build:
     if: github.repository == 'lightseekorg/tokenspeed'
+    needs: metadata
     name: Build ${{ matrix.platform }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 360
@@ -86,7 +122,7 @@ jobs:
 
   merge:
     if: github.repository == 'lightseekorg/tokenspeed'
-    needs: build
+    needs: [metadata, build]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -108,25 +144,9 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Validate image tag
-        id: tag
-        env:
-          INPUT_TAG: ${{ inputs.tag }}
-        run: |
-          tag="${INPUT_TAG}"
-          if [ -z "$tag" ]; then
-            echo "::error::Image tag is required." >&2
-            exit 1
-          fi
-          if [[ ! "$tag" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
-            echo "::error::Invalid image tag: ${tag}" >&2
-            exit 1
-          fi
-          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
-
       - name: Create multi-platform manifest
         env:
-          TAG: ${{ steps.tag.outputs.tag }}
+          TAG: ${{ needs.metadata.outputs.version }}
         run: |
           refs=()
           for digest in "${RUNNER_TEMP}"/digests/*; do
