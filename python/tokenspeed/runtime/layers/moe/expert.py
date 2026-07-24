@@ -66,6 +66,7 @@ class MoELayer(torch.nn.Module):
         with_bias=False,
         routing_config: dict = {},
         routing_mode: str | None = None,
+        a2a_backend: str | None = None,
     ):
         super().__init__()
         self.layer_index = layer_index
@@ -113,6 +114,9 @@ class MoELayer(torch.nn.Module):
         num_local_experts = num_experts // self.ep_size
 
         self.num_local_experts = num_local_experts
+        if a2a_backend is None:
+            a2a_backend = get_all2all_backend().value
+
         self._spec = MoELayerSpec(
             top_k=top_k,
             num_experts=num_experts,
@@ -125,7 +129,7 @@ class MoELayer(torch.nn.Module):
             ep_rank=self.ep_rank,
             ep_size=self.ep_size,
             prefix=prefix,
-            a2a_backend=get_all2all_backend().value,
+            a2a_backend=a2a_backend,
         )
 
         # Routing config
@@ -197,6 +201,9 @@ class MoELayer(torch.nn.Module):
             internal_activation_dtype=internal_activation_dtype,
             with_bias=with_bias,
             deepep_group=deepep_group,
+            low_latency_max_num_tokens_per_gpu=global_server_args_dict[
+                "low_latency_max_num_tokens_per_gpu"
+            ],
             solution=moe_backend,
         )
 

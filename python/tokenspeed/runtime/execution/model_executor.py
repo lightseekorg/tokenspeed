@@ -1627,13 +1627,10 @@ class ModelExecutor:
         if not changed:
             return None
 
-        self.input_buffers._mamba_cow_src_indices_cpu[:bs].copy_(
-            torch.as_tensor(cow_src_indices, dtype=torch.int32)
-        )
+        (cow_src_indices_cpu,) = self.input_buffers._bulk_pinned((bs, torch.int32))
+        cow_src_indices_cpu.copy_(torch.as_tensor(cow_src_indices, dtype=torch.int32))
         cow_src_buf = self.input_buffers.mamba_cow_src_indices_buf
-        cow_src_buf[:bs].copy_(
-            self.input_buffers._mamba_cow_src_indices_cpu[:bs], non_blocking=True
-        )
+        cow_src_buf[:bs].copy_(cow_src_indices_cpu, non_blocking=True)
         return torch.tensor(skipped_mask, dtype=torch.bool, device=cow_src_buf.device)
 
     @staticmethod
