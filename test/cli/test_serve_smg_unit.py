@@ -147,6 +147,7 @@ def test_gateway_args_defaults_include_port_and_reasoning_parser():
         "passthrough",
         "--disable-circuit-breaker",
         "--disable-retries",
+        "--disable-health-check",
         "--policy",
         "passthrough",
         "--tokenizer-cache-enable-l0",
@@ -219,6 +220,7 @@ def test_smg_disable_flags_appended_when_absent():
         "/tmp/x",
         "--disable-circuit-breaker",
         "--disable-retries",
+        "--disable-health-check",
     ]
 
 
@@ -231,6 +233,7 @@ def test_smg_disable_flags_not_duplicated():
     assert gateway_args == [
         "--disable-circuit-breaker",
         "--disable-retries",
+        "--disable-health-check",
     ]
 
 
@@ -238,6 +241,7 @@ def test_smg_disable_flag_set_covers_both():
     assert _DEFAULT_SMG_DISABLE_FLAGS == (
         "--disable-circuit-breaker",
         "--disable-retries",
+        "--disable-health-check",
     )
 
 

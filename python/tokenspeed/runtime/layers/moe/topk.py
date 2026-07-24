@@ -196,6 +196,14 @@ def _mask_topk_ids_padded_region(
     topk_ids[indices >= num_token_non_padded, :] = -1
 
 
+def _stable_descending_topk(
+    scores: torch.Tensor,
+    topk: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    values, indices = torch.sort(scores, dim=-1, descending=True, stable=True)
+    return values[:, :topk], indices[:, :topk]
+
+
 def torch_native_fused_topk(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -209,14 +217,14 @@ def torch_native_fused_topk(
         scores_for_choice = scores.view(
             -1, n_routed_experts
         ) + correction_bias.unsqueeze(0)
-        topk_ids = torch.topk(scores_for_choice, k=topk, dim=-1, sorted=False)[1]
+        _, topk_ids = _stable_descending_topk(scores_for_choice, topk)
         topk_weights = scores.gather(1, topk_ids)
     else:
         assert (
             hidden_states.shape[0] == gating_output.shape[0]
         ), f"Number of tokens mismatch, {hidden_states.shape=} vs {gating_output.shape=}"
-        topk_weights = F.softmax(gating_output.float(), dim=-1)
-        topk_weights, topk_ids = torch.topk(topk_weights, topk, dim=-1)
+        scores = F.softmax(gating_output.float(), dim=-1)
+        topk_weights, topk_ids = _stable_descending_topk(scores, topk)
 
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)

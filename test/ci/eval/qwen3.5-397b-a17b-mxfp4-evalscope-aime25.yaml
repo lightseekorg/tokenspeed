@@ -21,6 +21,10 @@ server:
     --trust-remote-code
     --quantization mxfp4
     --weight-loader-prefetch-checkpoints
+    --speculative-algorithm MTP
+    --speculative-num-steps 3
+    --speculative-num-draft-tokens 4
+    --speculative-draft-model-quantization unquant
     --sampling-backend greedy
     --disable-kvstore
     --kvstore-ratio 0.0
@@ -45,7 +49,7 @@ eval:
     --limit 8
     --eval-batch-size 8
     --stream
-    --generation-config '{"do_sample":false,"temperature":0.0,"max_tokens":16384}'
+    --generation-config '{"do_sample":false,"temperature":0.0,"max_tokens":32768}'
 report:
   github_step_summary: true
 score_threshold: 0.75
