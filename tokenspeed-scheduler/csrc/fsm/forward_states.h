@@ -121,7 +121,7 @@ public:
         if (!block_tables_.empty()) {
             // flat: group-0 sample, feeding only the radix-era capacity probe (a flat no-op);
             // real admission gates on the coordinator's per-group BlocksNeededFor.
-            return block_tables_[0].TailAvailableTokens();
+            return block_tables_[0].AvailableTokens();
         }
         return local_kv_allocator_->TailPageAvailableTokens();  // radix
     }
@@ -327,6 +327,7 @@ struct Decoding : public ForwardState {
 #if TOKENSPEED_FLAT_KVCACHE
     HashChain TakeHashChain() && { return std::move(hash_chain_); }
     void SetHashChain(HashChain chain) { hash_chain_ = std::move(chain); }
+    const HashChain& HashChainValue() const { return hash_chain_; }
 #endif
 
 private:

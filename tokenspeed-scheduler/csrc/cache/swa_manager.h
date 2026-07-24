@@ -104,6 +104,23 @@ public:
         return freed;
     }
 
+    std::vector<CacheBlockLocation> ReclaimableBlockLocationsAt(
+        const BlockTable& table, std::int32_t num_computed_tokens) const override {
+        const std::int32_t skipped_blocks = fullySlidOutBlocks(table, num_computed_tokens);
+        std::vector<CacheBlockLocation> locations;
+        for (std::int32_t i = skipped_blocks - 1; i >= 0; --i) {
+            const CacheBlockRef& block = table.Blocks()[static_cast<std::size_t>(i)];
+            if (!block) {
+                break;
+            }
+            const bool cached = ContainsCachedBlock(block);
+            if ((cached && block.use_count() == 2) || (!cached && block.unique())) {
+                locations.push_back(block->Location());
+            }
+        }
+        return locations;
+    }
+
 private:
     // Cached pages a boundary needs behind it: they cover the window's last (window - 1) tokens.
     std::int32_t pagesNeededToResume() const {

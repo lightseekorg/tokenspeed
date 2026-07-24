@@ -86,8 +86,8 @@ public:
     // Compact-view base logical-page offset; 0 for full-history / unseen.
     std::int32_t GetRequestPagedCacheBaseLogicalPage(const std::string& request_id, const std::string& group_id) const;
 #if TOKENSPEED_FLAT_KVCACHE
-    // Free pages in the flat shared BlockPool; int32 twin of AvailableKvPages() for C++ tests.
-    std::int32_t FlatPoolFreeBlocks() const { return block_pool_.NumFreeBlocks(); }
+    // Empty or fully evictable LCM parents; capacity metrics remain approximate for K_g > 1.
+    std::int32_t FlatPoolFreeBlocks() const { return coordinator_.NumAvailableLcmBlocks(); }
     std::int32_t FlatHostPoolCachedBlocks() const { return coordinator_.NumHostCachedBlocks(); }
     std::int32_t FlatHostPoolFreeBlocks() const { return flat_host_pool_.NumFreeBlocks(); }
     std::int32_t FlatHostPoolPinnedBlocks() const { return coordinator_.NumPinnedHostCachedBlocks(); }
@@ -132,18 +132,10 @@ private:
     // One hash pass at admission: non-owning device/host probes plus the hashes
     // retained for acquisition after every admission check succeeds.
     struct FlatAdmissionMatch {
-        KvCacheCoordinator::AdmissionProbe probe;
-        std::vector<std::string> hashes;
+        KvCacheCoordinator::PrefixProbe probe;
         std::vector<std::string> ext_hashes;
     };
     FlatAdmissionMatch matchFlatPrefixAtAdmission(Request* request);
-    std::optional<std::int32_t> flatAdmitFirstChunk(Request* request, std::int32_t device_free_hit_blocks,
-                                                    std::int32_t ext_real_pages, std::int32_t chunk_tokens,
-                                                    std::int32_t decode_reserve_tokens) const;
-    std::optional<std::int32_t> flatAdmitPrefillChunk(Request* request, std::int32_t chunk_tokens,
-                                                      std::int32_t decode_reserve_tokens,
-                                                      std::int32_t num_computed_tokens) const;
-    bool flatAdmitDecode(Request* request) const;
     bool flatPoolWedged(const std::vector<Request*>& candidates) const;
     void resolveFlatStarvation(const std::vector<Request*>& candidates, bool made_progress);
 #endif
@@ -212,9 +204,9 @@ private:
     // ExtendResults the executor still owes per request (erased on Finish/Abort/PD-success); non-empty means
     // an in-flight forward can still free pool pages, which flatPoolWedged keys off.
     std::unordered_map<std::string, std::int32_t> pending_forward_results_;
-    // Reserve ledger: decode pages promised at admission but Acquired only at PrefillDone->Decoding; until
-    // then they sit in the free count, so every flat gate subtracts OTHER requests' entries.
-    std::unordered_map<std::string, std::int32_t> flat_reserved_pages_;
+    // Set only when exact LCM placement rejects an otherwise schedulable request
+    // in the current round. Starvation recovery must not react to unrelated gates.
+    bool flat_no_lcm_placement_{false};
     // Flat retract requires TWO consecutive starved rounds (an in-flight Finish fakes one)
     // before releasing a victim; see resolveFlatStarvation.
     std::int32_t flat_starved_rounds_{0};
@@ -270,21 +262,6 @@ private:
     // device pages (a freed destination must not be recycled under the copy); LoadBackDone drops both.
     std::unordered_map<cache_op_id, FlatLoadTicket> flat_load_ops_;
 
-    // Sum excluding request_id: a request consuming its own reservation must not be gated by it.
-    std::int32_t flatReservedPagesExcept(const std::string& request_id) const {
-        std::int32_t total = 0;
-        for (const auto& [id, pages] : flat_reserved_pages_) {
-            if (id != request_id) {
-                total += pages;
-            }
-        }
-        return total;
-    }
-
-    // Pool budget the flat gates charge against: free blocks minus other requests' decode reservations.
-    std::int32_t flatFreeBudget(const std::string& request_id) const {
-        return block_pool_.NumFreeBlocks() - flatReservedPagesExcept(request_id);
-    }
 #endif
 
 private:

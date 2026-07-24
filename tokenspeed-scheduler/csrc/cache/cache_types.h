@@ -61,7 +61,7 @@ class BlockTable {
 public:
     std::span<const CacheBlockRef> Blocks() const noexcept { return blocks_; }
     std::int32_t NumBlocks() const { return static_cast<std::int32_t>(blocks_.size()); }
-    std::int32_t TailAvailableTokens() const { return tail_avail_; }
+    std::int32_t AvailableTokens() const { return available_tokens_; }
 
     CacheBlockRef EvictToNull(std::int32_t index) {
         _assert(0 <= index && index < static_cast<std::int32_t>(blocks_.size()), "EvictToNull index out of range");
@@ -72,7 +72,20 @@ private:
     friend class KvCacheManager;
 
     std::vector<CacheBlockRef> blocks_{};
-    std::int32_t tail_avail_{0};
+    // Unconsumed capacity at the logical tail. This may span multiple blocks
+    // when admission preallocates a later decode/MTP step.
+    std::int32_t available_tokens_{0};
+};
+
+// Per-group token demand for one admission. The table remains owned by the
+// request; ProbeAdmission only reads it and Acquire appends to it.
+struct GroupDemand {
+    BlockTable* table{nullptr};
+    std::int32_t num_tokens{0};
+    std::span<const std::string> content_hashes{};
+    std::int32_t first_page_slot{0};
+    std::int32_t num_computed_tokens{-1};
+    std::int32_t reserve_tokens{0};
 };
 
 // LCM ownership ids for scheduler accounting/debugging. Kernel-facing page

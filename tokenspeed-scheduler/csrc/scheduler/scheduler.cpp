@@ -249,7 +249,7 @@ std::size_t Scheduler::AvailableKvPages() const {
     // permanently-full pool to Python monitoring. Report the flat BlockPool instead: one flat
     // block is one pool row, interpreted at each group's own block_size. Block 0 is the
     // never-allocated null placeholder, so an idle pool reports total_pages - 1.
-    return static_cast<std::size_t>(block_pool_.NumFreeBlocks());
+    return static_cast<std::size_t>(coordinator_.NumAvailableLcmBlocks());
 #else
     return device_allocator_.AvailablePages();
 #endif

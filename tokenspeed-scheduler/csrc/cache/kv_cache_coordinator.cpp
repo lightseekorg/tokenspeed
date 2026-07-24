@@ -23,6 +23,10 @@
 #include <algorithm>
 #include <limits>
 #include <memory>
+#include <optional>
+#include <queue>
+#include <tuple>
+#include <unordered_set>
 
 #include "cache/full_attn_manager.h"
 #include "cache/mamba_state_manager.h"
@@ -95,6 +99,338 @@ std::int32_t SweepThenConverge(std::span<const std::size_t> order, const std::ve
     return bound_tokens;
 }
 
+class AdmissionPlanner {
+public:
+    AdmissionPlanner(
+        const std::vector<CacheGroup>& groups, const BlockPool& pool,
+        const std::unordered_set<CacheBlockLocation, CacheBlockLocationHash>& protected_locations,
+        const std::vector<std::unordered_set<CacheBlockLocation, CacheBlockLocationHash>>& reclaimable_locations,
+        KvCacheCoordinator::AdmissionPlan& admission, bool pack_existing_parents)
+        : groups_{groups},
+          pool_{pool},
+          protected_locations_{protected_locations},
+          reclaimable_locations_{reclaimable_locations},
+          admission_{admission},
+          pack_existing_parents_{pack_existing_parents},
+          parents_(static_cast<std::size_t>(pool.NumLcmBlocks()) + 1),
+          free_slot_parents_(groups.size()) {
+        initializeParents();
+    }
+
+    bool plan() {
+        for (KvCacheCoordinator::AdmissionPlan::Group& group : admission_.per_group) {
+            group.placements.clear();
+        }
+        admission_.victims.clear();
+
+        for (std::size_t i = 0; i < groups_.size(); ++i) {
+            if (!placeGroup(static_cast<GroupId>(i))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+private:
+    struct ParentState {
+        std::optional<GroupId> group_id;
+        std::vector<bool> occupied;
+        std::vector<bool> planned;
+    };
+    using FreeParent = std::pair<std::size_t, std::int32_t>;
+    using ParentCandidate = std::tuple<std::uint64_t, GroupId, std::int32_t>;
+
+    void initializeParents() {
+        for (std::int32_t parent_id = 1; parent_id <= pool_.NumLcmBlocks(); ++parent_id) {
+            ParentState& parent = parents_[static_cast<std::size_t>(parent_id)];
+            parent.group_id = pool_.BoundGroup(parent_id);
+            if (!parent.group_id) {
+                empty_parents_.push_back(parent_id);
+                continue;
+            }
+            _assert(*parent.group_id < groups_.size(), "LCM parent has invalid group binding");
+            const std::int32_t slots = groups_[*parent.group_id].Manager().CacheBlocksPerLcmBlock();
+            parent.occupied.resize(static_cast<std::size_t>(slots));
+            parent.planned.resize(static_cast<std::size_t>(slots));
+            for (CacheBlockLocation location : pool_.OccupiedLocations(parent_id)) {
+                parent.occupied[static_cast<std::size_t>(location.slot_index)] = true;
+            }
+            const std::size_t occupied = static_cast<std::size_t>(std::ranges::count(parent.occupied, true));
+            if (occupied < parent.occupied.size()) {
+                free_slot_parents_[*parent.group_id].emplace(occupied, parent_id);
+            }
+        }
+    }
+
+    bool isEvictable(GroupId group_id, CacheBlockLocation location) const {
+        return reclaimable_locations_[group_id].contains(location) ||
+               groups_[group_id].Manager().IsCachedBlockEvictable(pool_, location);
+    }
+
+    const std::vector<CacheBlockLocation>& groupEvictable(GroupId group_id) {
+        if (!group_evictable_) {
+            group_evictable_ = groups_[group_id].Manager().EvictableBlockLocations(pool_);
+            for (CacheBlockLocation location : reclaimable_locations_[group_id]) {
+                if (std::ranges::find(*group_evictable_, location) == group_evictable_->end()) {
+                    group_evictable_->push_back(location);
+                }
+            }
+        }
+        return *group_evictable_;
+    }
+
+    const std::vector<ParentCandidate>& parentCandidates() {
+        if (evictable_parents_) {
+            return *evictable_parents_;
+        }
+        evictable_parents_.emplace();
+        std::unordered_set<std::int32_t> candidate_ids;
+        for (std::size_t i = 0; i < groups_.size(); ++i) {
+            for (const ParentEvictionCandidate& candidate : groups_[i].Manager().CollectEvictableParents(pool_)) {
+                evictable_parents_->emplace_back(candidate.last_access, static_cast<GroupId>(i),
+                                                 candidate.lcm_block_id);
+                candidate_ids.insert(candidate.lcm_block_id);
+            }
+        }
+        for (std::int32_t parent_id = 1; parent_id <= pool_.NumLcmBlocks(); ++parent_id) {
+            const ParentState& parent = parents_[static_cast<std::size_t>(parent_id)];
+            if (!parent.group_id || candidate_ids.contains(parent_id)) {
+                continue;
+            }
+            const GroupId owner = *parent.group_id;
+            const bool all_evictable =
+                std::ranges::all_of(pool_.OccupiedLocations(parent_id),
+                                    [&](CacheBlockLocation location) { return isEvictable(owner, location); });
+            if (all_evictable) {
+                evictable_parents_->emplace_back(std::numeric_limits<std::uint64_t>::max(), owner, parent_id);
+            }
+        }
+        std::ranges::sort(*evictable_parents_);
+        return *evictable_parents_;
+    }
+
+    void place(GroupId group_id, CacheBlockLocation location) {
+        admission_.per_group[group_id].placements.push_back(location);
+        ParentState& parent = parents_[static_cast<std::size_t>(location.lcm_block_id)];
+        const std::size_t slot = static_cast<std::size_t>(location.slot_index);
+        if (!parent.group_id) {
+            const std::size_t slots =
+                static_cast<std::size_t>(groups_[group_id].Manager().CacheBlocksPerLcmBlock());
+            parent.group_id = group_id;
+            parent.occupied.assign(slots, false);
+            parent.planned.assign(slots, false);
+        }
+        _assert(parent.group_id == group_id && slot < parent.occupied.size() && !parent.occupied[slot],
+                "admission planned an invalid LCM slot");
+        parent.occupied[slot] = true;
+        parent.planned[slot] = true;
+        active_parent_ = location.lcm_block_id;
+        const std::size_t occupied = static_cast<std::size_t>(std::ranges::count(parent.occupied, true));
+        if (occupied < parent.occupied.size()) {
+            free_slot_parents_[group_id].emplace(occupied, location.lcm_block_id);
+        }
+    }
+
+    void replaceVictim(GroupId group_id, CacheBlockLocation location) {
+        admission_.victims.emplace_back(group_id, location);
+        parents_[static_cast<std::size_t>(location.lcm_block_id)]
+            .occupied[static_cast<std::size_t>(location.slot_index)] = false;
+        place(group_id, location);
+    }
+
+    std::optional<CacheBlockLocation> takeFreeSlot(GroupId group_id) {
+        auto& candidates = free_slot_parents_[group_id];
+        while (!candidates.empty()) {
+            const auto [expected_occupied, parent_id] = candidates.top();
+            ParentState& parent = parents_[static_cast<std::size_t>(parent_id)];
+            const std::size_t occupied = static_cast<std::size_t>(std::ranges::count(parent.occupied, true));
+            if (parent.group_id != group_id || occupied != expected_occupied || occupied == parent.occupied.size()) {
+                candidates.pop();
+                continue;
+            }
+            candidates.pop();
+            const auto slot = std::ranges::find(parent.occupied, false);
+            _assert(slot != parent.occupied.end(), "partially occupied parent has no free slot");
+            return CacheBlockLocation{
+                .lcm_block_id = parent_id,
+                .slot_index = static_cast<std::int32_t>(slot - parent.occupied.begin()),
+            };
+        }
+        return std::nullopt;
+    }
+
+    std::optional<CacheBlockLocation> takeActiveFreeSlot(GroupId group_id) {
+        if (!active_parent_) {
+            return std::nullopt;
+        }
+        const std::int32_t parent_id = *active_parent_;
+        ParentState& parent = parents_[static_cast<std::size_t>(parent_id)];
+        const auto slot = std::ranges::find(parent.occupied, false);
+        if (slot == parent.occupied.end()) {
+            return std::nullopt;
+        }
+        return CacheBlockLocation{
+            .lcm_block_id = parent_id,
+            .slot_index = static_cast<std::int32_t>(slot - parent.occupied.begin()),
+        };
+    }
+
+    std::optional<CacheBlockLocation> takePackingVictim(GroupId group_id) {
+        if (!active_parent_) {
+            return std::nullopt;
+        }
+        const std::int32_t parent_id = *active_parent_;
+        ParentState& parent = parents_[static_cast<std::size_t>(parent_id)];
+        for (std::size_t slot = 0; slot < parent.occupied.size(); ++slot) {
+            const CacheBlockLocation location{
+                .lcm_block_id = parent_id,
+                .slot_index = static_cast<std::int32_t>(slot),
+            };
+            if (parent.occupied[slot] && !parent.planned[slot] && isEvictable(group_id, location) &&
+                !protected_locations_.contains(location)) {
+                return location;
+            }
+        }
+        return std::nullopt;
+    }
+
+    std::optional<std::int32_t> takeEmptyParent() {
+        while (empty_parent_cursor_ < empty_parents_.size()) {
+            const std::int32_t parent_id = empty_parents_[empty_parent_cursor_++];
+            if (!parents_[static_cast<std::size_t>(parent_id)].group_id) {
+                return parent_id;
+            }
+        }
+        return std::nullopt;
+    }
+
+    std::optional<CacheBlockLocation> takeSameGroupVictim(GroupId group_id) {
+        const std::vector<CacheBlockLocation>& candidates = groupEvictable(group_id);
+        while (group_evictable_cursor_ < candidates.size()) {
+            const CacheBlockLocation location = candidates[group_evictable_cursor_++];
+            ParentState& parent = parents_[static_cast<std::size_t>(location.lcm_block_id)];
+            const std::size_t slot = static_cast<std::size_t>(location.slot_index);
+            if (parent.group_id == group_id && parent.occupied[slot] && !parent.planned[slot] &&
+                !protected_locations_.contains(location)) {
+                return location;
+            }
+        }
+        return std::nullopt;
+    }
+
+    std::optional<std::pair<GroupId, std::int32_t>> takeForeignParent(GroupId group_id) {
+        const std::vector<ParentCandidate>& candidates = parentCandidates();
+        while (foreign_parent_cursor_ < candidates.size()) {
+            const auto& [last_access, owner, parent_id] = candidates[foreign_parent_cursor_++];
+            (void)last_access;
+            const ParentState& parent = parents_[static_cast<std::size_t>(parent_id)];
+            if (!parent.group_id || *parent.group_id != owner || owner == group_id) {
+                continue;
+            }
+            bool fully_evictable = true;
+            for (std::size_t slot = 0; slot < parent.occupied.size(); ++slot) {
+                if (!parent.occupied[slot]) {
+                    continue;
+                }
+                const CacheBlockLocation location{
+                    .lcm_block_id = parent_id,
+                    .slot_index = static_cast<std::int32_t>(slot),
+                };
+                if (parent.planned[slot] || protected_locations_.contains(location) ||
+                    !isEvictable(owner, location)) {
+                    fully_evictable = false;
+                    break;
+                }
+            }
+            if (fully_evictable) {
+                return std::pair{owner, parent_id};
+            }
+        }
+        return std::nullopt;
+    }
+
+    bool placeGroup(GroupId group_id) {
+        active_parent_.reset();
+        group_evictable_.reset();
+        group_evictable_cursor_ = 0;
+        foreign_parent_cursor_ = 0;
+
+        const KvCacheCoordinator::AdmissionPlan::Group& group = admission_.per_group[group_id];
+        const GroupDemand& demand = group.demand;
+        const std::int32_t total_blocks =
+            groups_[group_id].Manager().BlocksNeededFor(*demand.table, demand.num_tokens + demand.reserve_tokens);
+        std::int32_t needed = group.host_placement_count + total_blocks;
+
+        while (needed-- > 0) {
+            if (pack_existing_parents_) {
+                if (std::optional<CacheBlockLocation> free = takeActiveFreeSlot(group_id)) {
+                    place(group_id, *free);
+                    continue;
+                }
+                if (std::optional<CacheBlockLocation> victim = takePackingVictim(group_id)) {
+                    replaceVictim(group_id, *victim);
+                    continue;
+                }
+            }
+            if (std::optional<CacheBlockLocation> free = takeFreeSlot(group_id)) {
+                place(group_id, *free);
+                continue;
+            }
+            if (!pack_existing_parents_) {
+                if (std::optional<CacheBlockLocation> victim = takePackingVictim(group_id)) {
+                    replaceVictim(group_id, *victim);
+                    continue;
+                }
+            }
+            active_parent_.reset();
+            if (std::optional<std::int32_t> empty = takeEmptyParent()) {
+                place(group_id, CacheBlockLocation{.lcm_block_id = *empty, .slot_index = 0});
+                continue;
+            }
+            if (std::optional<CacheBlockLocation> victim = takeSameGroupVictim(group_id)) {
+                replaceVictim(group_id, *victim);
+                continue;
+            }
+            const std::optional<std::pair<GroupId, std::int32_t>> foreign_parent = takeForeignParent(group_id);
+            if (!foreign_parent) {
+                return false;
+            }
+
+            const auto [owner, parent_id] = *foreign_parent;
+            ParentState& parent = parents_[static_cast<std::size_t>(parent_id)];
+            for (std::size_t slot = 0; slot < parent.occupied.size(); ++slot) {
+                if (parent.occupied[slot]) {
+                    admission_.victims.emplace_back(
+                        owner, CacheBlockLocation{
+                                   .lcm_block_id = parent_id,
+                                   .slot_index = static_cast<std::int32_t>(slot),
+                               });
+                }
+            }
+            parent = {};
+            place(group_id, CacheBlockLocation{.lcm_block_id = parent_id, .slot_index = 0});
+        }
+        return true;
+    }
+
+    const std::vector<CacheGroup>& groups_;
+    const BlockPool& pool_;
+    const std::unordered_set<CacheBlockLocation, CacheBlockLocationHash>& protected_locations_;
+    const std::vector<std::unordered_set<CacheBlockLocation, CacheBlockLocationHash>>& reclaimable_locations_;
+    KvCacheCoordinator::AdmissionPlan& admission_;
+    bool pack_existing_parents_;
+
+    std::vector<ParentState> parents_;
+    std::vector<std::priority_queue<FreeParent>> free_slot_parents_;
+    std::vector<std::int32_t> empty_parents_;
+    std::size_t empty_parent_cursor_{0};
+    std::optional<std::int32_t> active_parent_;
+    std::optional<std::vector<CacheBlockLocation>> group_evictable_;
+    std::size_t group_evictable_cursor_{0};
+    std::optional<std::vector<ParentCandidate>> evictable_parents_;
+    std::size_t foreign_parent_cursor_{0};
+};
+
 }  // namespace
 
 std::vector<std::vector<std::string>> KvCacheCoordinator::buildGroupKeys(
@@ -110,10 +446,10 @@ std::vector<std::vector<std::string>> KvCacheCoordinator::buildGroupKeys(
 // blocks are relative to the floor, num_common_tokens is the absolute converged boundary (in
 // TOKENS). num_cache_blocks = content_hashes.size(); every group has one key per
 // logical CacheBlock.
-KvCacheCoordinator::CoordinatorProbe KvCacheCoordinator::probeTierWithKeys(
+KvCacheCoordinator::PrefixProbe::Tier KvCacheCoordinator::probeTierWithKeys(
     const BlockPool& pool, std::span<const std::vector<std::string>> group_keys, std::int32_t num_cache_blocks,
     std::int32_t floor_tokens) const {
-    CoordinatorProbe out;
+    PrefixProbe::Tier out;
     out.per_group.resize(groups_.size());
     if (groups_.empty()) {
         return out;
@@ -132,17 +468,11 @@ KvCacheCoordinator::CoordinatorProbe KvCacheCoordinator::probeTierWithKeys(
     // Truncate closed probes to the converged boundary.
     // Non-closed groups were re-probed against the settled bound and are already at or below it.
     for (std::size_t i = 0; i < groups_.size(); ++i) {
-        PrefixProbe& probe = out.per_group[i];
+        tokenspeed::PrefixProbe& probe = out.per_group[i];
         const std::int32_t floor_blocks = floor_tokens / cache_block_tokens_;
         if ((floor_blocks + static_cast<std::int32_t>(probe.hits.size())) * cache_block_tokens_ > boundary_tokens) {
             _assert(groups_[i].Manager().MatchIsPrefixClosed(), "window group left above the converged boundary");
             probe.hits.resize(static_cast<std::size_t>(boundary_tokens / cache_block_tokens_ - floor_blocks));
-        }
-        for (std::size_t j = 0; j < probe.hits.size(); ++j) {
-            if (probe.hits[j] != 0 && groups_[i].Manager().IsCachedBlockFree(
-                                          pool, group_keys[i][static_cast<std::size_t>(floor_blocks) + j])) {
-                ++out.num_free_hit_blocks;
-            }
         }
     }
     out.num_common_tokens = boundary_tokens;
@@ -151,7 +481,7 @@ KvCacheCoordinator::CoordinatorProbe KvCacheCoordinator::probeTierWithKeys(
 
 CoordinatorMatch KvCacheCoordinator::acquireTierWithKeys(BlockPool& pool,
                                                          std::span<const std::vector<std::string>> group_keys,
-                                                         std::int32_t floor_tokens, CoordinatorProbe&& probe) {
+                                                         std::int32_t floor_tokens, PrefixProbe::Tier&& probe) {
     CoordinatorMatch out;
     out.num_common_tokens = probe.num_common_tokens;
     out.per_group.resize(groups_.size());
@@ -163,34 +493,138 @@ CoordinatorMatch KvCacheCoordinator::acquireTierWithKeys(BlockPool& pool,
     return out;
 }
 
-KvCacheCoordinator::AdmissionProbe KvCacheCoordinator::ProbePrefix(std::span<const std::string> content_hashes) const {
+KvCacheCoordinator::PrefixProbe KvCacheCoordinator::ProbePrefix(std::span<const std::string> content_hashes) const {
     _assert(content_hashes.size() <=
                 static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max() / cache_block_tokens_),
             "prefix length exceeds int32 token range");
-    const std::vector<std::vector<std::string>> group_keys = buildGroupKeys(content_hashes);
     const std::int32_t num_cache_blocks = static_cast<std::int32_t>(content_hashes.size());
-    AdmissionProbe out;
-    out.device = probeTierWithKeys(pool_, group_keys, num_cache_blocks, /*floor_tokens=*/0);
+    PrefixProbe out;
+    out.group_keys = buildGroupKeys(content_hashes);
+    out.device = probeTierWithKeys(pool_, out.group_keys, num_cache_blocks, /*floor_tokens=*/0);
     if (host_pool_ != nullptr) {
-        out.host = probeTierWithKeys(*host_pool_, group_keys, num_cache_blocks,
+        out.host = probeTierWithKeys(*host_pool_, out.group_keys, num_cache_blocks,
                                      /*floor_tokens=*/out.device.num_common_tokens);
     }
     return out;
 }
 
-KvCacheCoordinator::AdmissionMatch KvCacheCoordinator::AcquirePrefix(std::span<const std::string> content_hashes,
-                                                                     AdmissionProbe&& probe) {
-    const std::vector<std::vector<std::string>> group_keys = buildGroupKeys(content_hashes);
-    AdmissionMatch out;
-    out.device = acquireTierWithKeys(pool_, group_keys, /*floor_tokens=*/0, std::move(probe.device));
-    if (host_pool_ != nullptr) {
-        out.host = acquireTierWithKeys(*host_pool_, group_keys, out.device.num_common_tokens, std::move(probe.host));
+std::optional<KvCacheCoordinator::AdmissionPlan> KvCacheCoordinator::ProbeAdmission(
+    PrefixProbe&& prefix, std::span<const GroupDemand> demands) const {
+    _assert(demands.size() == groups_.size(), "demands/groups size mismatch");
+
+    AdmissionPlan admission;
+    admission.prefix = std::move(prefix);
+    admission.per_group.resize(groups_.size());
+
+    std::unordered_set<CacheBlockLocation, CacheBlockLocationHash> protected_locations;
+    for (std::size_t i = 0; i < groups_.size(); ++i) {
+        const std::vector<CacheBlockLocation> hits = groups_[i].Manager().MatchedBlockLocations(
+            pool_, admission.prefix.group_keys[i], /*begin_blocks=*/0, admission.prefix.device.per_group[i]);
+        protected_locations.insert(hits.begin(), hits.end());
     }
-    return out;
+
+    std::vector<std::unordered_set<CacheBlockLocation, CacheBlockLocationHash>> reclaimable_locations(groups_.size());
+    for (std::size_t i = 0; i < groups_.size(); ++i) {
+        AdmissionPlan::Group& group = admission.per_group[i];
+        group.demand = demands[i];
+        const GroupDemand& demand = group.demand;
+        _assert(demand.table != nullptr, "group demand requires a block table");
+        const KvCacheManager& manager = groups_[i].Manager();
+        if (demand.num_computed_tokens >= 0) {
+            const std::vector<CacheBlockLocation> reclaimable =
+                manager.ReclaimableBlockLocationsAt(*demand.table, demand.num_computed_tokens);
+            reclaimable_locations[i].insert(reclaimable.begin(), reclaimable.end());
+        }
+        const std::int32_t host_blocks =
+            admission.prefix.host.per_group.empty()
+                ? 0
+                : static_cast<std::int32_t>(
+                      std::ranges::count(admission.prefix.host.per_group[i].hits, std::uint8_t{1}));
+        group.host_placement_count = host_blocks;
+    }
+
+    // First preserve cached children. If that fragments free slots across too many
+    // parents, retry by packing each group's demand into its current parent.
+    AdmissionPlanner preserve_cache{groups_, pool_, protected_locations, reclaimable_locations, admission,
+                                    /*pack_existing_parents=*/false};
+    if (!preserve_cache.plan() &&
+        !AdmissionPlanner{groups_, pool_, protected_locations, reclaimable_locations, admission,
+                          /*pack_existing_parents=*/true}
+             .plan()) {
+        return std::nullopt;
+    }
+    return admission;
 }
 
-KvCacheCoordinator::AdmissionMatch KvCacheCoordinator::MatchPrefix(std::span<const std::string> content_hashes) {
-    return AcquirePrefix(content_hashes, ProbePrefix(content_hashes));
+KvCacheCoordinator::AdmissionResult KvCacheCoordinator::Acquire(AdmissionPlan&& plan) {
+    _assert(plan.per_group.size() == groups_.size(), "admission plan/groups size mismatch");
+
+    AcquiredPrefix prefix = acquirePrefix(std::move(plan.prefix));
+    AdmissionResult result{
+        .device_prefix_tokens = prefix.device.num_common_tokens,
+        .host_prefix_tokens = prefix.host.num_common_tokens,
+    };
+    std::size_t total_host_blocks = 0;
+    for (const AdmissionPlan::Group& group : plan.per_group) {
+        total_host_blocks += static_cast<std::size_t>(group.host_placement_count);
+    }
+    result.load_pairs.reserve(total_host_blocks);
+
+    if (prefix.device.num_common_tokens > 0) {
+        for (std::size_t i = 0; i < groups_.size(); ++i) {
+            groups_[i].Manager().ClaimHitBlocks(*plan.per_group[i].demand.table,
+                                                std::move(prefix.device.per_group[i]));
+        }
+    }
+    std::vector<std::pair<GroupId, CacheBlockLocation>> prospective_victims;
+    prospective_victims.reserve(plan.victims.size());
+    for (const auto& victim : plan.victims) {
+        const auto& [group_id, location] = victim;
+        if (!groups_[group_id].Manager().EvictCachedBlock(pool_, location)) {
+            prospective_victims.push_back(victim);
+        }
+    }
+    for (std::size_t i = 0; i < groups_.size(); ++i) {
+        const GroupDemand& demand = plan.per_group[i].demand;
+        if (!demand.content_hashes.empty()) {
+            cacheFullBlocksForGroup(i, *demand.table, demand.content_hashes, demand.first_page_slot,
+                                    demand.num_computed_tokens);
+        }
+        if (demand.num_computed_tokens >= 0) {
+            groups_[i].Manager().ReclaimExpired(pool_, *demand.table, demand.num_computed_tokens);
+        }
+    }
+    for (const auto& [group_id, location] : prospective_victims) {
+        if (!groups_[group_id].Manager().EvictCachedBlock(pool_, location)) {
+            _assert(!pool_.IsOccupied(location), "admission victim changed before acquisition");
+        }
+    }
+
+    for (std::size_t i = 0; i < groups_.size(); ++i) {
+        AdmissionPlan::Group& group = plan.per_group[i];
+        const GroupDemand& demand = group.demand;
+        std::vector<CacheBlockLocation>& placements = group.placements;
+        const std::size_t host_count = static_cast<std::size_t>(group.host_placement_count);
+        if (host_count > 0) {
+            groups_[i].Manager().AppendHostExtensionAt(
+                pool_, *demand.table, std::move(prefix.host.per_group[i].blocks),
+                std::span<const CacheBlockLocation>{placements}.first(host_count), result.load_pairs);
+        }
+        groups_[i].Manager().AcquireAt(
+            pool_, *demand.table, demand.num_tokens, demand.reserve_tokens,
+            std::span<const CacheBlockLocation>{placements}.subspan(host_count));
+    }
+    return result;
+}
+
+KvCacheCoordinator::AcquiredPrefix KvCacheCoordinator::acquirePrefix(PrefixProbe&& probe) {
+    AcquiredPrefix out;
+    out.device = acquireTierWithKeys(pool_, probe.group_keys, /*floor_tokens=*/0, std::move(probe.device));
+    if (host_pool_ != nullptr) {
+        out.host =
+            acquireTierWithKeys(*host_pool_, probe.group_keys, out.device.num_common_tokens, std::move(probe.host));
+    }
+    return out;
 }
 
 void KvCacheCoordinator::ClaimCommonPrefix(std::span<BlockTable> tables, CoordinatorMatch&& hit) {
@@ -237,6 +671,17 @@ std::int32_t KvCacheCoordinator::BlocksNeededFor(std::int32_t num_tokens) const 
     return total_needed;
 }
 
+std::int32_t KvCacheCoordinator::NumAvailableLcmBlocks() const {
+    std::int32_t available = 0;
+    for (std::int32_t parent_id = 1; parent_id <= pool_.NumLcmBlocks(); ++parent_id) {
+        const std::optional<GroupId> group_id = pool_.BoundGroup(parent_id);
+        if (!group_id || groups_[*group_id].Manager().ParentIsFullyEvictable(pool_, parent_id)) {
+            ++available;
+        }
+    }
+    return available;
+}
+
 bool KvCacheCoordinator::Acquire(std::span<BlockTable> tables, std::int32_t num_tokens) {
     // Check-then-act: no group is ever left in a partial/unaligned state.
     if (BlocksNeededFor(tables, num_tokens) > pool_.NumFreeBlocks()) {
@@ -256,31 +701,35 @@ void KvCacheCoordinator::CacheFullBlocks(std::span<BlockTable> tables, std::span
         return;  // hot decode rounds usually fill no page
     }
     for (std::size_t i = 0; i < groups_.size(); ++i) {
-        std::vector<std::string> keys = keysForGroup(content_hashes, groups_[i].GroupId());
-        std::int32_t group_first_slot = first_slot;
-        std::span<const std::string> group_keys = keys;
-        if (groups_[i].Manager().RegistersAlignedFinalPageOnly()) {
-            // Interior boundaries never received a state write; only an
-            // aligned chunk end holds a real snapshot in the final full block.
-            if (end_tokens < 0 || end_tokens % cache_block_tokens_ != 0 || keys.empty()) {
-                continue;
-            }
-            const std::int32_t past_end_slot = group_first_slot + static_cast<std::int32_t>(keys.size());
-            group_first_slot = past_end_slot - 1;
-            group_keys = group_keys.last(1);
-            const bool aligned_range = past_end_slot == end_tokens / cache_block_tokens_;
-            _assert(aligned_range, "state registration range must end at the aligned boundary");
+        cacheFullBlocksForGroup(i, tables[i], content_hashes, first_slot, end_tokens);
+    }
+}
+
+void KvCacheCoordinator::cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table,
+                                                 std::span<const std::string> content_hashes,
+                                                 std::int32_t first_slot, std::int32_t end_tokens) {
+    std::vector<std::string> keys = keysForGroup(content_hashes, groups_[group_index].GroupId());
+    std::int32_t group_first_slot = first_slot;
+    std::span<const std::string> group_keys = keys;
+    if (groups_[group_index].Manager().RegistersAlignedFinalPageOnly()) {
+        if (end_tokens < 0 || end_tokens % cache_block_tokens_ != 0 || keys.empty()) {
+            return;
         }
-        std::vector<std::pair<std::string, CacheBlockRef>> newly_cached;
-        groups_[i].Manager().CacheFullBlocks(pool_, tables[i], group_keys, next_recency_, group_first_slot,
-                                             host_pool_ != nullptr ? &newly_cached : nullptr);
-        for (auto& [key, block] : newly_cached) {
-            pending_stores_.push_back(StoreCandidate{
-                .key = std::move(key),
-                .group_id = groups_[i].GroupId(),
-                .block = std::move(block),
-            });
-        }
+        const std::int32_t past_end_slot = group_first_slot + static_cast<std::int32_t>(keys.size());
+        group_first_slot = past_end_slot - 1;
+        group_keys = group_keys.last(1);
+        _assert(past_end_slot == end_tokens / cache_block_tokens_,
+                "state registration range must end at the aligned boundary");
+    }
+    std::vector<std::pair<std::string, CacheBlockRef>> newly_cached;
+    groups_[group_index].Manager().CacheFullBlocks(pool_, table, group_keys, next_recency_, group_first_slot,
+                                                   host_pool_ != nullptr ? &newly_cached : nullptr);
+    for (auto& [key, block] : newly_cached) {
+        pending_stores_.push_back(StoreCandidate{
+            .key = std::move(key),
+            .group_id = groups_[group_index].GroupId(),
+            .block = std::move(block),
+        });
     }
 }
 
@@ -288,6 +737,13 @@ void KvCacheCoordinator::ReclaimExpired(std::span<BlockTable> tables, std::int32
     _assert(tables.size() == groups_.size(), "tables/groups size mismatch");
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         groups_[i].Manager().ReclaimExpired(pool_, tables[i], num_computed_tokens);
+    }
+}
+
+void KvCacheCoordinator::ConsumeAvailable(std::span<BlockTable> tables, std::int32_t num_tokens) {
+    _assert(tables.size() == groups_.size(), "tables/groups size mismatch");
+    for (std::size_t i = 0; i < groups_.size(); ++i) {
+        groups_[i].Manager().ConsumeAvailable(tables[i], num_tokens);
     }
 }
 

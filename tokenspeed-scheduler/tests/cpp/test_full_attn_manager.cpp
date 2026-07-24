@@ -68,7 +68,7 @@ TEST(FullAttnManagerTest, ConstructsWithPageSize) {
     FullAttnManager mgr(/*block_size=*/4);
     BlockTable table;
     EXPECT_EQ(table.NumBlocks(), 0);
-    EXPECT_EQ(table.TailAvailableTokens(), 0);
+    EXPECT_EQ(table.AvailableTokens(), 0);
     EXPECT_TRUE(table.Blocks().empty());
 }
 
@@ -151,7 +151,7 @@ TEST(FullAttnManagerTest, ClaimHitBlocksClaimsAndAppends) {
     EXPECT_EQ(table.Blocks()[0]->Location().lcm_block_id, id);
     EXPECT_EQ(table.Blocks()[0].use_count(), 2);  // Manager cache owner + request
     EXPECT_EQ(pool.NumFreeBlocks(), 7);
-    EXPECT_EQ(table.TailAvailableTokens(), 0);  // hit pages are full
+    EXPECT_EQ(table.AvailableTokens(), 0);  // hit pages are full
 }
 
 TEST(FullAttnManagerTest, ClaimNoHitsIsNoOp) {
@@ -171,7 +171,7 @@ TEST(FullAttnManagerTest, AcquireFillsTailBeforeAllocating) {
 
     ASSERT_TRUE(mgr.Acquire(pool, table, 4));
     EXPECT_EQ(table.NumBlocks(), 1);
-    EXPECT_EQ(table.TailAvailableTokens(), 0);
+    EXPECT_EQ(table.AvailableTokens(), 0);
     EXPECT_EQ(pool.NumFreeBlocks(), 7);
 }
 
@@ -182,7 +182,7 @@ TEST(FullAttnManagerTest, AcquirePartialPageLeavesTailRoom) {
 
     ASSERT_TRUE(mgr.Acquire(pool, table, 3));
     EXPECT_EQ(table.NumBlocks(), 1);
-    EXPECT_EQ(table.TailAvailableTokens(), 1);
+    EXPECT_EQ(table.AvailableTokens(), 1);
 }
 
 TEST(FullAttnManagerTest, AcquireUsesTailRoomWithoutNewPage) {
@@ -193,7 +193,7 @@ TEST(FullAttnManagerTest, AcquireUsesTailRoomWithoutNewPage) {
     ASSERT_TRUE(mgr.Acquire(pool, table, 3));  // 1 page, tail_avail 1
     ASSERT_TRUE(mgr.Acquire(pool, table, 1));  // fits in tail -> no new page
     EXPECT_EQ(table.NumBlocks(), 1);
-    EXPECT_EQ(table.TailAvailableTokens(), 0);
+    EXPECT_EQ(table.AvailableTokens(), 0);
     EXPECT_EQ(pool.NumFreeBlocks(), 7);
 }
 
@@ -207,7 +207,7 @@ TEST(FullAttnManagerTest, AcquireSpillsAcrossMultiplePages) {
     ASSERT_TRUE(mgr.Acquire(pool, table, 7));
     EXPECT_EQ(table.NumBlocks(), 3);
     // over = 7 - 2 = 5; used_in_tail = 5 % 4 = 1; tail_avail = 4 - 1 = 3.
-    EXPECT_EQ(table.TailAvailableTokens(), 3);
+    EXPECT_EQ(table.AvailableTokens(), 3);
 }
 
 TEST(FullAttnManagerTest, AcquireZeroTokensIsNoOp) {
@@ -227,7 +227,7 @@ TEST(FullAttnManagerTest, AcquireAllOrNothingOnShortage) {
     // Need ceil(12/4) = 3 pages but only 2 free -> must fail and roll back.
     EXPECT_FALSE(mgr.Acquire(pool, table, 12));
     EXPECT_EQ(table.NumBlocks(), 0);
-    EXPECT_EQ(table.TailAvailableTokens(), 0);
+    EXPECT_EQ(table.AvailableTokens(), 0);
     EXPECT_EQ(pool.NumFreeBlocks(), 2);  // nothing consumed
 }
 
@@ -295,7 +295,7 @@ TEST(FullAttnManagerTest, FreeReturnsPagesAndClearsTable) {
 
     mgr.Free(table);
     EXPECT_EQ(table.NumBlocks(), 0);
-    EXPECT_EQ(table.TailAvailableTokens(), 0);
+    EXPECT_EQ(table.AvailableTokens(), 0);
     EXPECT_TRUE(table.Blocks().empty());
     EXPECT_EQ(pool.NumFreeBlocks(), 8);  // all returned
 }
@@ -365,7 +365,7 @@ TEST(FullAttnManagerTest, GroupIdIsolatesContent) {
     EXPECT_EQ(mgr.Match(pool, keys_g1, 0, 1).num_hit_blocks, 0);  // group 1 not cached
 }
 
-// Claimed full pages carry tail_avail_ 0: the next Acquire must start a fresh
+// Claimed full pages carry no available capacity: the next Acquire must start a fresh
 // page, not consume phantom tail room.
 TEST(FullAttnManagerTest, ClaimThenAcquireStartsFreshPage) {
     BlockPool pool(8);
@@ -380,11 +380,11 @@ TEST(FullAttnManagerTest, ClaimThenAcquireStartsFreshPage) {
     BlockTable table;
     mgr.ClaimHitBlocks(table, std::move(m));
     ASSERT_EQ(table.NumBlocks(), 1);
-    ASSERT_EQ(table.TailAvailableTokens(), 0);
+    ASSERT_EQ(table.AvailableTokens(), 0);
 
     ASSERT_TRUE(mgr.Acquire(pool, table, 3));
     EXPECT_EQ(table.NumBlocks(), 2);
-    EXPECT_EQ(table.TailAvailableTokens(), 1);
+    EXPECT_EQ(table.AvailableTokens(), 1);
 }
 
 TEST(FullAttnManagerTest, CacheFullBlocksZeroIsNoOp) {
@@ -449,7 +449,7 @@ TEST(FullAttnManagerLcmTest, ManagerOnlyCacheOwnerRetainsChild) {
 
     EXPECT_TRUE(pool.IsOccupied(location));
     EXPECT_TRUE(mgr.ContainsCachedBlock(pool, key));
-    EXPECT_TRUE(mgr.IsCachedBlockFree(pool, key));
+    EXPECT_TRUE(mgr.IsCachedBlockEvictable(pool, key));
 }
 
 TEST(FullAttnManagerLcmTest, RequestOnlyUniqueChildIsNotCacheEvictable) {

@@ -455,15 +455,15 @@ TEST(SwaManagerTest, ReclaimExpiredFreedCachedPageStaysPrefixReusable) {
     EXPECT_EQ(hit->Location().lcm_block_id, p0);
 }
 
-TEST(SwaManagerTest, ReclaimExpiredLeavesTailAvailUnchanged) {
+TEST(SwaManagerTest, ReclaimExpiredLeavesAvailableCapacityUnchanged) {
     BlockPool pool(32);
     SwaManager mgr(4, 4);
     BlockTable table;
     ASSERT_TRUE(mgr.Acquire(pool, table, 10));  // 3 pages, last partial: tail_avail = 2
-    EXPECT_EQ(table.TailAvailableTokens(), 2);
+    EXPECT_EQ(table.AvailableTokens(), 2);
     mgr.ReclaimExpired(pool, table, 10);  // skipped 7, blocks 1 -> frees front full page
     EXPECT_FALSE(table.Blocks()[0]);
-    EXPECT_EQ(table.TailAvailableTokens(), 2);  // tail untouched
+    EXPECT_EQ(table.AvailableTokens(), 2);  // tail untouched
 }
 
 TEST(SwaManagerTest, AcquireAdvancePairingKeepsPhysicalPagesBounded) {

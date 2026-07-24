@@ -21,6 +21,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 
 namespace tokenspeed {
 
@@ -36,6 +37,14 @@ struct CacheBlockLocation {
     std::int32_t slot_index{0};
 
     bool operator==(const CacheBlockLocation&) const noexcept = default;
+};
+
+struct CacheBlockLocationHash {
+    std::size_t operator()(CacheBlockLocation location) const noexcept {
+        const std::size_t parent = std::hash<std::int32_t>{}(location.lcm_block_id);
+        const std::size_t slot = std::hash<std::int32_t>{}(location.slot_index);
+        return parent ^ (slot + 0x9e3779b9U + (parent << 6U) + (parent >> 2U));
+    }
 };
 
 class CacheBlock {

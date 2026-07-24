@@ -23,7 +23,6 @@
 #include <algorithm>
 #include <compare>
 #include <cstdint>
-#include <functional>
 #include <limits>
 #include <list>
 #include <span>
@@ -56,14 +55,6 @@ struct ParentEvictionCandidate {
 // placement remains entirely in BlockPool.
 class KvCacheManager {
 private:
-    struct CacheBlockLocationHash {
-        std::size_t operator()(CacheBlockLocation location) const noexcept {
-            const std::size_t parent = std::hash<std::int32_t>{}(location.lcm_block_id);
-            const std::size_t slot = std::hash<std::int32_t>{}(location.slot_index);
-            return parent ^ (slot + 0x9e3779b9U + (parent << 6U) + (parent >> 2U));
-        }
-    };
-
     struct CacheEntry {
         CacheKey key;
         CacheBlockRef block;
@@ -143,6 +134,28 @@ public:
         return match;
     }
 
+    std::vector<CacheBlockLocation> MatchedBlockLocations(const BlockPool& pool,
+                                                          std::span<const std::string> keys,
+                                                          std::int32_t begin_blocks,
+                                                          const PrefixProbe& probe) const {
+        _assert(begin_blocks >= 0 && static_cast<std::size_t>(begin_blocks) + probe.hits.size() <= keys.size(),
+                "matched block range is out of bounds");
+        std::vector<CacheBlockLocation> locations;
+        locations.reserve(static_cast<std::size_t>(std::ranges::count(probe.hits, std::uint8_t{1})));
+        const PoolCache* cache = findPoolCache(pool);
+        for (std::size_t i = 0; i < probe.hits.size(); ++i) {
+            if (probe.hits[i] == 0) {
+                continue;
+            }
+            _assert(cache != nullptr, "cached pool disappeared between match probes");
+            ConstCacheEntryIterator entry =
+                findEntry(*cache, keys[static_cast<std::size_t>(begin_blocks) + i]);
+            _assert(entry != cache->entries_by_recency.end(), "cached block disappeared between match probes");
+            locations.push_back(entry->block->Location());
+        }
+        return locations;
+    }
+
     PrefixMatch Match(BlockPool& pool, std::span<const std::string> keys, std::int32_t begin_blocks,
                       std::int32_t max_blocks, std::uint64_t& next_recency) {
         return AcquireMatchedBlocks(pool, keys, begin_blocks, Probe(pool, keys, begin_blocks, max_blocks),
@@ -158,28 +171,80 @@ public:
         if (num_tokens <= 0) {
             return true;
         }
-        if (num_tokens <= table.tail_avail_) {
-            table.tail_avail_ -= num_tokens;
+        if (num_tokens <= table.available_tokens_) {
+            table.available_tokens_ -= num_tokens;
             return true;
         }
-        const std::int32_t over = num_tokens - table.tail_avail_;
+        const std::int32_t over = num_tokens - table.available_tokens_;
         const std::int32_t num_pages = (over + cache_block_tokens_ - 1) / cache_block_tokens_;
+        table.blocks_.reserve(table.blocks_.size() + static_cast<std::size_t>(num_pages));
         std::vector<CacheBlockRef> new_blocks = pool.AcquireBlocks(group_id_, cache_blocks_per_lcm_block_, num_pages);
         if (static_cast<std::int32_t>(new_blocks.size()) < num_pages) {
             return false;
         }
-        table.blocks_.reserve(table.blocks_.size() + new_blocks.size());
-        for (CacheBlockRef& block : new_blocks) {
-            table.blocks_.push_back(std::move(block));
-        }
-        const std::int32_t used_in_tail = over % cache_block_tokens_;
-        table.tail_avail_ = (used_in_tail == 0) ? 0 : cache_block_tokens_ - used_in_tail;
+        appendBlocks(table, num_tokens, std::move(new_blocks));
         return true;
     }
 
+    void AcquireAt(BlockPool& pool, BlockTable& table, std::int32_t num_tokens, std::int32_t reserve_tokens,
+                   std::span<const CacheBlockLocation> locations) {
+        _assert(num_tokens >= 0 && reserve_tokens >= 0, "token demand and reserve must be non-negative");
+        const std::int32_t num_pages = BlocksNeededFor(table, num_tokens + reserve_tokens);
+        _assert(locations.size() == static_cast<std::size_t>(num_pages),
+                "exact placement count does not match token demand");
+        if (num_pages == 0) {
+            table.available_tokens_ -= num_tokens;
+            return;
+        }
+        table.blocks_.reserve(table.blocks_.size() + locations.size());
+        appendBlocks(table, num_tokens,
+                     pool.AcquireBlocksAt(group_id_, cache_blocks_per_lcm_block_, locations));
+    }
+
+    void AppendHostExtensionAt(BlockPool& pool, BlockTable& table, std::vector<CacheBlockRef>&& host_blocks,
+                               std::span<const CacheBlockLocation> locations,
+                               std::vector<BlockTransfer>& load_pairs) {
+        _assert(table.available_tokens_ == 0, "host extension must append on a full-page boundary");
+        _assert(static_cast<std::size_t>(std::ranges::count_if(host_blocks, [](const CacheBlockRef& block) {
+                    return static_cast<bool>(block);
+                })) == locations.size(),
+                "host extension placement count mismatch");
+        table.blocks_.reserve(table.blocks_.size() + host_blocks.size());
+        std::vector<CacheBlockRef> destinations =
+            pool.AcquireBlocksAt(group_id_, cache_blocks_per_lcm_block_, locations);
+        auto destination = destinations.begin();
+        for (CacheBlockRef& host_block : host_blocks) {
+            if (!host_block) {
+                table.blocks_.emplace_back();
+                continue;
+            }
+            _assert(destination != destinations.end(), "missing host extension destination");
+            table.blocks_.push_back(std::move(*destination));
+            ++destination;
+            load_pairs.push_back(BlockTransfer{
+                .group_id = group_id_,
+                .source = std::move(host_block),
+                .destination = table.blocks_.back(),
+            });
+        }
+        _assert(destination == destinations.end(), "unused host extension destination");
+    }
+
+private:
+    void appendBlocks(BlockTable& table, std::int32_t num_tokens, std::vector<CacheBlockRef> blocks) {
+        const std::int32_t added_tokens = static_cast<std::int32_t>(blocks.size()) * cache_block_tokens_;
+        _assert(num_tokens <= table.available_tokens_ + added_tokens,
+                "allocated blocks do not cover the immediate token demand");
+        for (CacheBlockRef& block : blocks) {
+            table.blocks_.push_back(std::move(block));
+        }
+        table.available_tokens_ += added_tokens - num_tokens;
+    }
+
+public:
     void AppendHostExtension(BlockPool& pool, BlockTable& table, std::vector<CacheBlockRef>&& host_blocks,
                              std::vector<BlockTransfer>& load_pairs) {
-        _assert(table.tail_avail_ == 0, "host extension must append on a full-page boundary");
+        _assert(table.available_tokens_ == 0, "host extension must append on a full-page boundary");
         for (CacheBlockRef& host_block : host_blocks) {
             if (!host_block) {
                 table.blocks_.emplace_back();
@@ -196,10 +261,10 @@ public:
     }
 
     std::int32_t BlocksNeededFor(const BlockTable& table, std::int32_t num_tokens) const {
-        if (num_tokens <= table.tail_avail_) {
+        if (num_tokens <= table.available_tokens_) {
             return 0;
         }
-        const std::int32_t over = num_tokens - table.tail_avail_;
+        const std::int32_t over = num_tokens - table.available_tokens_;
         return (over + cache_block_tokens_ - 1) / cache_block_tokens_;
     }
 
@@ -260,12 +325,20 @@ public:
         const PoolCache* cache = findPoolCache(pool);
         return cache != nullptr && findEntry(*cache, location) != cache->entries_by_recency.end();
     }
-    bool IsCachedBlockFree(const BlockPool& pool, const std::string& key) const {
+    bool IsCachedBlockEvictable(const BlockPool& pool, const std::string& key) const {
         const PoolCache* cache = findPoolCache(pool);
         if (cache == nullptr) {
             return false;
         }
         ConstCacheEntryIterator entry = findEntry(*cache, key);
+        return entry != cache->entries_by_recency.end() && entry->block.use_count() == 1;
+    }
+    bool IsCachedBlockEvictable(const BlockPool& pool, CacheBlockLocation location) const {
+        const PoolCache* cache = findPoolCache(pool);
+        if (cache == nullptr) {
+            return false;
+        }
+        ConstCacheEntryIterator entry = findEntry(*cache, location);
         return entry != cache->entries_by_recency.end() && entry->block.use_count() == 1;
     }
     std::int32_t NumCachedBlocks(const BlockPool& pool) const {
@@ -374,13 +447,23 @@ public:
                                              bool /*count_uncached*/) const {
         return 0;
     }
+    virtual std::vector<CacheBlockLocation> ReclaimableBlockLocationsAt(
+        const BlockTable& /*table*/, std::int32_t /*num_computed_tokens*/) const {
+        return {};
+    }
+
+    void ConsumeAvailable(BlockTable& table, std::int32_t num_tokens) {
+        _assert(num_tokens >= 0 && num_tokens <= table.available_tokens_,
+                "token demand exceeds the available capacity");
+        table.available_tokens_ -= num_tokens;
+    }
 
     void Free(BlockTable& table) {
         for (auto it = table.blocks_.rbegin(); it != table.blocks_.rend(); ++it) {
             it->reset();
         }
         table.blocks_.clear();
-        table.tail_avail_ = 0;
+        table.available_tokens_ = 0;
     }
 
 protected:

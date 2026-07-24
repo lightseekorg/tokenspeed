@@ -115,6 +115,28 @@ TEST(BlockPoolLcmPlacementTest, ReleasedParentsRestoreBatchCapacity) {
     EXPECT_EQ(pool.NumFreeBlocks(), 0);
 }
 
+TEST(BlockPoolLcmPlacementTest, ExactAllocationRemovesAnyFreeParentWithoutDisturbingTheRest) {
+    BlockPool pool(4);
+    std::vector<CacheBlockRef> blocks =
+        pool.AcquireBlocks(/*group_id=*/1, /*cache_blocks_per_lcm_block=*/1, /*num=*/4);
+    ASSERT_EQ(blocks.size(), 4u);
+    const CacheBlockLocation first_released = blocks[0]->Location();
+    const CacheBlockLocation second_released = blocks[2]->Location();
+    blocks[0].reset();
+    blocks[2].reset();
+
+    std::vector<CacheBlockRef> exact =
+        pool.AcquireBlocksAt(/*group_id=*/2, /*cache_blocks_per_lcm_block=*/1,
+                             std::span<const CacheBlockLocation>{&first_released, 1});
+    ASSERT_EQ(exact.size(), 1u);
+    EXPECT_EQ(exact[0]->Location(), first_released);
+
+    CacheBlockRef remaining = pool.AcquireBlock(/*group_id=*/2, /*cache_blocks_per_lcm_block=*/1);
+    ASSERT_TRUE(remaining);
+    EXPECT_EQ(remaining->Location(), second_released);
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 0);
+}
+
 TEST(BlockPoolLcmPlacementTest, IndependentChildrenShareOneParent) {
     BlockPool pool(1);
     CacheBlockRef first = pool.AcquireBlock(/*group_id=*/3, /*cache_blocks_per_lcm_block=*/2);

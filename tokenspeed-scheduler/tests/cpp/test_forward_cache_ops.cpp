@@ -29,6 +29,7 @@
 #include "cache/cache_types.h"
 #include "cache/forward_cache_ops.h"
 #include "cache/kv_cache_coordinator.h"
+#include "flat_cache_test_access.h"
 #include "resource/allocator/paged_cache_group.h"
 #include "scheduler/page_hasher.h"
 #include "scheduler/types.h"
@@ -96,18 +97,18 @@ TEST(ForwardCacheOpsPrefill, FirstChunkClaimsHitThenAcquiresOnlyRemainder) {
     FreeRequest(coordinator, r1);
 
     // r2: same 8-token prefix, 12-token prefill target -> 4 NEW tokens.
-    CoordinatorMatch hit = coordinator.MatchPrefix(hashes8).device;
+    CoordinatorMatch hit = MatchPrefixForTest(coordinator, hashes8).device;
     ASSERT_EQ(hit.num_common_tokens, 8);
     ASSERT_EQ(hit.per_group[1].num_hit_blocks, 4) << "W=16 must keep every SWA prefix page real";
 
-    // Claimed pages carry no tail credit (spec §4.3): tail_avail_ stays 0, so
+    // Claimed pages carry no available capacity: the next allocation starts a fresh block.
     // BlocksNeededFor(4 new tokens) = ceil(4/2) = 2 pages/group = 4 total.
     {
         std::vector<BlockTable> probe(coordinator.NumGroups());
         CoordinatorMatch probe_hit = hit;
         coordinator.ClaimCommonPrefix(probe, std::move(probe_hit));
-        EXPECT_EQ(probe[0].TailAvailableTokens(), 0);
-        EXPECT_EQ(probe[1].TailAvailableTokens(), 0);
+        EXPECT_EQ(probe[0].AvailableTokens(), 0);
+        EXPECT_EQ(probe[1].AvailableTokens(), 0);
         EXPECT_EQ(coordinator.BlocksNeededFor(probe, /*num_tokens=*/4), 4);
         FreeRequest(coordinator, probe);
     }
@@ -188,7 +189,7 @@ TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowAndKeepsPunchedPageHashes) {
 }
 
 // The first decode step (query at position P) only reads keys back to P - W + 1.
-TEST(ForwardCacheOpsPrefill, FinalizeSlidesSwaWindowBeforeReserveAcquire) {
+TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowBeforeAcquire) {
     BlockPool pool(/*num_lcm_blocks=*/32);
     KvCacheCoordinator coordinator = MakeTwoGroup(pool);  // page=2, W=4
     std::vector<BlockTable> tables(coordinator.NumGroups());
@@ -203,8 +204,7 @@ TEST(ForwardCacheOpsPrefill, FinalizeSlidesSwaWindowBeforeReserveAcquire) {
     for (std::size_t i = 0; i < hashes.size(); ++i) {
         hashes[i] = std::string(64, static_cast<char>('a' + i));
     }
-    ASSERT_TRUE(FinalizePrefillAndReserveDecode(coordinator, tables, hashes, /*reserve_tokens=*/1,
-                                                /*num_computed_tokens=*/12));
+    ASSERT_TRUE(PrefillChunk(coordinator, tables, hashes, /*num_tokens=*/1, /*num_computed_tokens=*/12));
 
     ASSERT_EQ(tables[1].NumBlocks(), 7);
     for (std::int32_t i = 0; i < 4; ++i) {
@@ -258,14 +258,14 @@ TEST(ForwardCacheOpsDecode, DecodeStepRegistersFilledPages) {
         hashes[i] = std::string(64, static_cast<char>('a' + i));
     }
     coordinator.CacheFullBlocks(tables, std::span<const std::string>(hashes).first(2));
-    ASSERT_EQ(coordinator.MatchPrefix(hashes).device.num_common_tokens, 4);
+    ASSERT_EQ(MatchPrefixForTest(coordinator, hashes).device.num_common_tokens, 4);
 
     const std::vector<std::string> fresh(hashes.begin() + 2, hashes.end());
     ASSERT_TRUE(DecodeStep(coordinator, tables, fresh, /*first_page_slot=*/2,
                            /*num_tokens=*/1, /*num_computed_tokens=*/8));
 
     // Registration maps slots to this request's physical pages, not copies.
-    const CoordinatorMatch hit = coordinator.MatchPrefix(hashes).device;
+    const CoordinatorMatch hit = MatchPrefixForTest(coordinator, hashes).device;
     EXPECT_EQ(hit.num_common_tokens, 8);
     for (std::int32_t i = 0; i < 4; ++i) {
         EXPECT_EQ(hit.per_group[0].blocks[i]->Location().lcm_block_id, tables[0].Blocks()[i]->Location().lcm_block_id)
@@ -295,7 +295,7 @@ TEST(ForwardCacheOpsDecode, DecodeStepWithEmptyHashesUnchanged) {
     ASSERT_EQ(tables_new.size(), tables_old.size());
     for (std::size_t g = 0; g < tables_new.size(); ++g) {
         EXPECT_EQ(BlockTableLcmBlockIds(tables_new[g]), BlockTableLcmBlockIds(tables_old[g])) << "group " << g;
-        EXPECT_EQ(tables_new[g].TailAvailableTokens(), tables_old[g].TailAvailableTokens()) << "group " << g;
+        EXPECT_EQ(tables_new[g].AvailableTokens(), tables_old[g].AvailableTokens()) << "group " << g;
     }
 }
 

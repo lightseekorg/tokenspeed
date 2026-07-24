@@ -75,15 +75,12 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
 #if TOKENSPEED_FLAT_KVCACHE
                                    // coordinator defaults to nullptr because radix-only call
                                    // sites (production and tests) compile in flat builds too;
-                                   // every flat transition body asserts coordinator_ != nullptr.
+                                   // this flat transition asserts coordinator_ != nullptr.
                                    ,
                                    KvCacheCoordinator* coordinator = nullptr,
-                                   // Admission-layer prefix match, threaded from the scheduler;
-                                   // default {} is the zero hit for call sites that never match.
-                                   CoordinatorMatch flat_hit = {},
-                                   // Host-tier match above flat_hit's boundary; real pages are
-                                   // already pinned by its CacheBlockRefs.
-                                   CoordinatorMatch flat_host = {}, std::vector<std::string> flat_ext_hashes = {}
+                                   std::vector<BlockTable> flat_tables = {},
+                                   std::int32_t flat_hit_tokens = 0,
+                                   std::vector<BlockTransfer> flat_load_pairs = {}
 #endif
                                    )
         : tokens_this_round_(tokens_this_round),
@@ -101,9 +98,9 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
 #if TOKENSPEED_FLAT_KVCACHE
           ,
           coordinator_(coordinator),
-          flat_hit_(std::move(flat_hit)),
-          flat_host_(std::move(flat_host)),
-          flat_ext_hashes_(std::move(flat_ext_hashes))
+          flat_tables_(std::move(flat_tables)),
+          flat_hit_tokens_(flat_hit_tokens),
+          flat_load_pairs_(std::move(flat_load_pairs))
 #endif
     {
     }
@@ -136,9 +133,8 @@ private:
     MambaChunkAllocator* mamba_allocator_{};
 #if TOKENSPEED_FLAT_KVCACHE
     KvCacheCoordinator* coordinator_{};
-    CoordinatorMatch flat_hit_{};
-    CoordinatorMatch flat_host_{};
-    std::vector<std::string> flat_ext_hashes_{};
+    std::vector<BlockTable> flat_tables_;
+    std::int32_t flat_hit_tokens_{0};
     std::vector<BlockTransfer> flat_load_pairs_{};
 #endif
 };
@@ -146,21 +142,10 @@ private:
 struct SchedulePrefillEvent : InvalidTransitionHandler<SchedulePrefillEvent> {
     using InvalidTransitionHandler<SchedulePrefillEvent>::operator();
     SchedulePrefillEvent(std::int32_t tokens_this_round, std::int32_t reserve_num_tokens_in_next_schedule_event,
-                         HybridPrefixCache* hybrid_prefix_cache = nullptr
-#if TOKENSPEED_FLAT_KVCACHE
-                         ,
-                         KvCacheCoordinator* coordinator = nullptr
-#endif
-                         )
+                         HybridPrefixCache* hybrid_prefix_cache = nullptr)
         : tokens_this_round_(tokens_this_round),
           reserve_num_tokens_in_next_schedule_event_(reserve_num_tokens_in_next_schedule_event),
-          hybrid_prefix_cache_(hybrid_prefix_cache)
-#if TOKENSPEED_FLAT_KVCACHE
-          ,
-          coordinator_(coordinator)
-#endif
-    {
-    }
+          hybrid_prefix_cache_(hybrid_prefix_cache) {}
 
     // Returns PrefillDone (last chunk) or Prefilling (more chunks remain).
     std::variant<PrefillDone, Prefilling> operator()(Prefilling&& state);
@@ -169,9 +154,6 @@ private:
     std::int32_t tokens_this_round_{};
     std::int32_t reserve_num_tokens_in_next_schedule_event_{};
     HybridPrefixCache* hybrid_prefix_cache_{};
-#if TOKENSPEED_FLAT_KVCACHE
-    KvCacheCoordinator* coordinator_{};
-#endif
 };
 
 struct ScheduleDecodeEvent : InvalidTransitionHandler<ScheduleDecodeEvent> {
@@ -180,14 +162,14 @@ struct ScheduleDecodeEvent : InvalidTransitionHandler<ScheduleDecodeEvent> {
     ScheduleDecodeEvent(std::int32_t decode_input_tokens, HybridPrefixCache* hybrid_prefix_cache = nullptr
 #if TOKENSPEED_FLAT_KVCACHE
                         ,
-                        KvCacheCoordinator* coordinator = nullptr
+                        HashChain flat_hash_chain = {}
 #endif
                         )
         : decode_input_tokens_(decode_input_tokens),
           hybrid_prefix_cache_(hybrid_prefix_cache)
 #if TOKENSPEED_FLAT_KVCACHE
           ,
-          coordinator_(coordinator)
+          flat_hash_chain_(std::move(flat_hash_chain))
 #endif
     {
     }
@@ -199,7 +181,7 @@ private:
     std::int32_t decode_input_tokens_;
     HybridPrefixCache* hybrid_prefix_cache_{};
 #if TOKENSPEED_FLAT_KVCACHE
-    KvCacheCoordinator* coordinator_{};
+    HashChain flat_hash_chain_;
 #endif
 };
 

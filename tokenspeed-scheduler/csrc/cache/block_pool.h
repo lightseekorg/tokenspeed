@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -37,10 +38,14 @@ namespace tokenspeed {
 // CacheBlock pointer, or ownership count.
 class BlockPool {
 public:
-    explicit BlockPool(std::int32_t num_lcm_blocks) : lcm_blocks_(checkedLcmBlockCount(num_lcm_blocks)) {
+    explicit BlockPool(std::int32_t num_lcm_blocks)
+        : lcm_blocks_(checkedLcmBlockCount(num_lcm_blocks)),
+          free_lcm_block_positions_(lcm_blocks_.size(), kNotFree) {
         // Release() is noexcept, so keep enough capacity for every LCM block.
         free_lcm_block_ids_.reserve(lcm_blocks_.size());
         for (std::int32_t id = num_lcm_blocks; id > 0; --id) {
+            free_lcm_block_positions_[static_cast<std::size_t>(id - 1)] =
+                static_cast<std::int32_t>(free_lcm_block_ids_.size());
             free_lcm_block_ids_.push_back(id);
         }
     }
@@ -99,9 +104,18 @@ public:
         std::vector<CacheBlockRef> out;
         out.reserve(locations.size());
         for (CacheBlockLocation location : locations) {
-            auto* control = new internal_cache_block_ref::CacheBlockControl(*this, location);
-            occupy(group_id, cache_blocks_per_lcm_block, location);
-            out.push_back(CacheBlockRef{*control});
+            out.push_back(createBlockRef(group_id, cache_blocks_per_lcm_block, location));
+        }
+        return out;
+    }
+
+    std::vector<CacheBlockRef> AcquireBlocksAt(GroupId group_id, std::int32_t cache_blocks_per_lcm_block,
+                                               std::span<const CacheBlockLocation> locations) {
+        _assert(cache_blocks_per_lcm_block > 0, "cache_blocks_per_lcm_block must be > 0");
+        std::vector<CacheBlockRef> out;
+        out.reserve(locations.size());
+        for (CacheBlockLocation location : locations) {
+            out.push_back(createBlockRef(group_id, cache_blocks_per_lcm_block, location));
         }
         return out;
     }
@@ -150,11 +164,17 @@ public:
             parent.occupancy.clear();
             FatalCheck(free_lcm_block_ids_.size() < lcm_blocks_.size(),
                        "free LCM block stack cannot exceed the pool size");
+            std::int32_t& free_position =
+                free_lcm_block_positions_[static_cast<std::size_t>(location.lcm_block_id - 1)];
+            FatalCheck(free_position == kNotFree, "released LCM block is already free");
+            free_position = static_cast<std::int32_t>(free_lcm_block_ids_.size());
             free_lcm_block_ids_.push_back(location.lcm_block_id);
         }
     }
 
 private:
+    static constexpr std::int32_t kNotFree = -1;
+
     struct LcmBlock {
         std::optional<GroupId> bound_group;
         std::vector<bool> occupancy;
@@ -172,20 +192,37 @@ private:
         return lcm_blocks_[static_cast<std::size_t>(lcm_block_id - 1)];
     }
 
+    CacheBlockRef createBlockRef(GroupId group_id, std::int32_t slots_per_parent, CacheBlockLocation location) {
+        auto* control = new internal_cache_block_ref::CacheBlockControl(*this, location);
+        // Allocate the control before mutating the pool, then commit the
+        // location before publishing its RAII owner: CacheBlock destruction
+        // releases this location and therefore requires it to be occupied.
+        occupy(group_id, slots_per_parent, location);
+        return CacheBlockRef{*control};
+    }
+
     void occupy(GroupId group_id, std::int32_t slots_per_parent, CacheBlockLocation location) noexcept {
         LcmBlock& parent = lcm_blocks_[static_cast<std::size_t>(location.lcm_block_id - 1)];
         if (parent.occupied_count == 0) {
-            FatalCheck(!free_lcm_block_ids_.empty() && free_lcm_block_ids_.back() == location.lcm_block_id,
-                       "LCM placement must consume the top free block");
+            std::int32_t& free_position =
+                free_lcm_block_positions_[static_cast<std::size_t>(location.lcm_block_id - 1)];
+            FatalCheck(free_position != kNotFree, "LCM placement requires an empty parent");
             FatalCheck(parent.occupancy.empty(), "empty LCM parent must not retain child slots");
             parent.occupancy.assign(static_cast<std::size_t>(slots_per_parent), false);
+            const std::size_t free_index = static_cast<std::size_t>(free_position);
+            const std::int32_t moved_id = free_lcm_block_ids_.back();
+            free_lcm_block_ids_[free_index] = moved_id;
+            free_lcm_block_positions_[static_cast<std::size_t>(moved_id - 1)] =
+                static_cast<std::int32_t>(free_index);
             free_lcm_block_ids_.pop_back();
+            free_position = kNotFree;
             parent.bound_group = group_id;
         }
         FatalCheck(
             parent.bound_group == group_id && parent.occupancy.size() == static_cast<std::size_t>(slots_per_parent),
             "LCM parent binding changed while occupied");
         const std::size_t slot = static_cast<std::size_t>(location.slot_index);
+        FatalCheck(slot < parent.occupancy.size(), "LCM child slot is out of range");
         FatalCheck(!parent.occupancy[slot], "LCM child slot already occupied");
         parent.occupancy[slot] = true;
         ++parent.occupied_count;
@@ -246,6 +283,7 @@ private:
 
     std::vector<LcmBlock> lcm_blocks_;
     std::vector<std::int32_t> free_lcm_block_ids_;
+    std::vector<std::int32_t> free_lcm_block_positions_;
 };
 
 }  // namespace tokenspeed

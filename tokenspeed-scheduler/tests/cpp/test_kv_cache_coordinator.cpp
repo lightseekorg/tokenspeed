@@ -21,9 +21,11 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <set>
 #include <span>
 #include <string>
@@ -35,6 +37,7 @@
 #include "cache/cache_types.h"
 #include "cache/full_attn_manager.h"
 #include "cache/swa_manager.h"
+#include "flat_cache_test_access.h"
 #include "scheduler/page_hasher.h"
 
 namespace tokenspeed::test {
@@ -132,7 +135,7 @@ TEST(MakeCoordinatorTest, Qwen35UsesUniformLogicalPWithDifferentPacking) {
     const std::vector<std::string> hashes = ContentHashes({std::vector<std::int32_t>(128, 7)});
     coord.CacheFullBlocks(tables, hashes, /*first_slot=*/0, /*end_tokens=*/128);
     coord.Free(tables);
-    CoordinatorMatch match = coord.MatchPrefix(hashes).device;
+    CoordinatorMatch match = MatchPrefixForTest(coord, hashes).device;
     EXPECT_EQ(match.num_common_tokens, 128);
     ASSERT_EQ(match.per_group.size(), specs.size());
     for (const PrefixMatch& group_match : match.per_group) {
@@ -219,7 +222,7 @@ TEST(CoordinatorMatchTest, BothGroupsAllMiss) {
     KvCacheCoordinator coord = MakeCoordinator(specs, 4, pool);
 
     std::vector<std::string> ch = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
-    CoordinatorMatch m = coord.MatchPrefix(ch).device;
+    CoordinatorMatch m = MatchPrefixForTest(coord, ch).device;
     EXPECT_EQ(m.num_common_tokens, 0);
     ASSERT_EQ(m.per_group.size(), 2u);
     EXPECT_TRUE(m.per_group[0].blocks.empty());
@@ -242,7 +245,7 @@ TEST(CoordinatorMatchTest, CommonIsMinCoverageFullDeeperThanSwa) {
     CacheForGroup(coord, pool, ch[1], 1);
     CacheForGroup(coord, pool, ch[2], 1);
 
-    CoordinatorMatch m = coord.MatchPrefix(ch).device;
+    CoordinatorMatch m = MatchPrefixForTest(coord, ch).device;
     EXPECT_EQ(m.num_common_tokens, 12);
     ASSERT_EQ(m.per_group.size(), 2u);
     EXPECT_EQ(m.per_group[0].blocks.size(), 3u);
@@ -266,7 +269,7 @@ TEST(CoordinatorMatchTest, TrimmedFullHitsDoNotRefreshEvictionOrder) {
     CacheForGroup(coord, pool, ch[0], 1);
     CacheForGroup(coord, pool, ch[1], 1);
     CacheForGroup(coord, pool, ch[2], 1);
-    CoordinatorMatch match = coord.MatchPrefix(ch).device;
+    CoordinatorMatch match = MatchPrefixForTest(coord, ch).device;
     ASSERT_EQ(match.num_common_tokens, 12);
 
     std::vector<CacheBlockLocation> candidates = coord.GroupManager(0).EvictableBlockLocations(pool);
@@ -274,7 +277,7 @@ TEST(CoordinatorMatchTest, TrimmedFullHitsDoNotRefreshEvictionOrder) {
     EXPECT_EQ(candidates.front().lcm_block_id, trimmed);
 }
 
-TEST(CoordinatorMatchTest, AdmissionProbeDoesNotRefreshEvictionOrder) {
+TEST(CoordinatorMatchTest, RejectedAdmissionDoesNotRefreshEvictionOrder) {
     BlockPool pool(3);
     const std::vector<KvCacheSpec> specs = {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1}};
@@ -283,13 +286,250 @@ TEST(CoordinatorMatchTest, AdmissionProbeDoesNotRefreshEvictionOrder) {
     const std::int32_t oldest = CacheForGroup(coord, pool, ch[0], 0);
     CacheForGroup(coord, pool, ch[1], 0);
 
-    KvCacheCoordinator::AdmissionProbe probe = coord.ProbePrefix(std::span<const std::string>{ch}.first(1));
+    KvCacheCoordinator::PrefixProbe probe = coord.ProbePrefix(std::span<const std::string>{ch}.first(1));
     EXPECT_EQ(probe.device.num_common_tokens, 4);
-    EXPECT_EQ(probe.device.num_free_hit_blocks, 1);
     EXPECT_EQ(pool.NumFreeBlocks(), 1);
     std::vector<CacheBlockLocation> candidates = coord.GroupManager(0).EvictableBlockLocations(pool);
     ASSERT_FALSE(candidates.empty());
     EXPECT_EQ(candidates.front().lcm_block_id, oldest);
+}
+
+std::vector<GroupDemand> FreshDemands(std::vector<BlockTable>& tables, std::span<const std::int32_t> tokens) {
+    EXPECT_EQ(tables.size(), tokens.size());
+    std::vector<GroupDemand> demands;
+    demands.reserve(tables.size());
+    for (std::size_t i = 0; i < tables.size(); ++i) {
+        demands.push_back(GroupDemand{.table = &tables[i], .num_tokens = tokens[i]});
+    }
+    return demands;
+}
+
+TEST(KvCacheCoordinatorAdmissionTest, RejectedCachedHitDoesNotRefreshLru) {
+    BlockPool pool(2);
+    const std::vector<KvCacheSpec> specs = {
+        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1}};
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, 4, pool);
+    const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
+    const std::int32_t cached_hit = CacheForGroup(coordinator, pool, hashes[0], 0);
+    CacheBlockRef pinned = pool.AcquireBlock();
+    ASSERT_TRUE(pinned);
+    ASSERT_EQ(pool.NumEmptyLcmBlocks(), 0);
+
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    const std::array<std::int32_t, 1> tokens{4};
+    std::vector<GroupDemand> demands = FreshDemands(tables, tokens);
+    for (int retry = 0; retry < 2; ++retry) {
+        KvCacheCoordinator::PrefixProbe prefix =
+            coordinator.ProbePrefix(std::span<const std::string>{hashes}.first(1));
+        EXPECT_FALSE(coordinator.ProbeAdmission(std::move(prefix), demands));
+        EXPECT_TRUE(tables[0].Blocks().empty());
+        EXPECT_EQ(coordinator.GroupManager(0).EvictableBlockLocations(pool),
+                  (std::vector<CacheBlockLocation>{{.lcm_block_id = cached_hit, .slot_index = 0}}));
+    }
+}
+
+TEST(KvCacheCoordinatorAdmissionTest, FreeCachedHitCostsNoAdditionalPlacement) {
+    BlockPool pool(2);
+    const std::vector<KvCacheSpec> specs = {
+        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1}};
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, 4, pool);
+    const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}});
+    const std::int32_t hit_parent = CacheForGroup(coordinator, pool, hashes[0], 0);
+    ASSERT_EQ(pool.NumEmptyLcmBlocks(), 1);
+
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    const std::array<std::int32_t, 1> tokens{4};
+    std::vector<GroupDemand> demands = FreshDemands(tables, tokens);
+    auto plan = coordinator.ProbeAdmission(coordinator.ProbePrefix(hashes), demands);
+    ASSERT_TRUE(plan);
+
+    coordinator.Acquire(std::move(*plan));
+
+    ASSERT_EQ(tables[0].NumBlocks(), 2);
+    EXPECT_EQ(tables[0].Blocks()[0]->Location().lcm_block_id, hit_parent);
+    EXPECT_NE(tables[0].Blocks()[1]->Location().lcm_block_id, hit_parent);
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 0);
+}
+
+TEST(KvCacheCoordinatorAdmissionTest, ReservedCapacityLivesInBlockTableUntilConsumed) {
+    BlockPool pool(3);
+    const std::vector<KvCacheSpec> specs = {
+        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1}};
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, /*cache_block_tokens=*/4, pool);
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    const std::array<std::int32_t, 1> tokens{1};
+    std::vector<GroupDemand> demands = FreshDemands(tables, tokens);
+    demands[0].reserve_tokens = 8;
+
+    auto plan = coordinator.ProbeAdmission(coordinator.ProbePrefix({}), demands);
+    ASSERT_TRUE(plan);
+    const KvCacheCoordinator::AdmissionResult result = coordinator.Acquire(std::move(*plan));
+
+    EXPECT_TRUE(result.load_pairs.empty());
+    EXPECT_EQ(tables[0].NumBlocks(), 3);
+    EXPECT_EQ(coordinator.BlocksNeededFor(tables, /*num_tokens=*/8), 0);
+    const std::int32_t free_before_consume = pool.NumFreeBlocks();
+    coordinator.ConsumeAvailable(tables, /*num_tokens=*/8);
+    EXPECT_EQ(tables[0].AvailableTokens(), 3);
+    EXPECT_EQ(pool.NumFreeBlocks(), free_before_consume);
+}
+
+TEST(KvCacheCoordinatorAdmissionTest, HeterogeneousGroupsSharePartialAndEmptyParents) {
+    BlockPool pool(2);
+    const std::vector<KvCacheSpec> specs = {
+        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2},
+        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+    };
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, 4, pool);
+    const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}});
+    const std::int32_t hit_parent = CacheForGroup(coordinator, pool, hashes[0], 0);
+    ASSERT_EQ(pool.NumEmptyLcmBlocks(), 1);
+
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    const std::array<std::int32_t, 2> tokens{4, 4};
+    std::vector<GroupDemand> demands = FreshDemands(tables, tokens);
+    auto plan = coordinator.ProbeAdmission(coordinator.ProbePrefix(hashes), demands);
+    ASSERT_TRUE(plan);
+
+    coordinator.Acquire(std::move(*plan));
+
+    ASSERT_EQ(tables[0].NumBlocks(), 1);
+    EXPECT_EQ(tables[0].Blocks()[0]->Location(),
+              (CacheBlockLocation{.lcm_block_id = hit_parent, .slot_index = 1}));
+    ASSERT_EQ(tables[1].NumBlocks(), 1);
+    EXPECT_NE(tables[1].Blocks()[0]->Location().lcm_block_id, hit_parent);
+}
+
+TEST(KvCacheCoordinatorAdmissionTest, PacksDemandBeforeConsumingAnotherGroupsOnlyParent) {
+    BlockPool pool(2);
+    const std::vector<KvCacheSpec> specs = {
+        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2},
+        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+    };
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, 4, pool);
+    const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}});
+    const std::int32_t packed_parent = CacheForGroup(coordinator, pool, hashes[0], 0);
+
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    const std::array<std::int32_t, 2> tokens{8, 4};
+    std::vector<GroupDemand> demands = FreshDemands(tables, tokens);
+    auto plan = coordinator.ProbeAdmission(coordinator.ProbePrefix({}), demands);
+    ASSERT_TRUE(plan);
+
+    coordinator.Acquire(std::move(*plan));
+
+    ASSERT_EQ(tables[0].NumBlocks(), 2);
+    EXPECT_EQ(tables[0].Blocks()[0]->Location().lcm_block_id, packed_parent);
+    EXPECT_EQ(tables[0].Blocks()[1]->Location().lcm_block_id, packed_parent);
+    ASSERT_EQ(tables[1].NumBlocks(), 1);
+    EXPECT_NE(tables[1].Blocks()[0]->Location().lcm_block_id, packed_parent);
+}
+
+TEST(KvCacheCoordinatorAdmissionTest, RetriesWithCompactPackingWhenGreedyFreeSlotsWouldReject) {
+    BlockPool pool(3);
+    const std::vector<KvCacheSpec> specs = {
+        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2},
+        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+    };
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, 4, pool);
+    const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
+    const std::int32_t first_partial_parent = CacheForGroup(coordinator, pool, hashes[0], 0);
+    CacheBlockRef fills_first_parent =
+        pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/2);
+    const std::int32_t second_partial_parent = CacheForGroup(coordinator, pool, hashes[1], 0);
+    fills_first_parent.reset();
+    ASSERT_NE(first_partial_parent, second_partial_parent);
+    ASSERT_EQ(pool.NumEmptyLcmBlocks(), 1);
+
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    const std::array<std::int32_t, 2> tokens{8, 8};
+    std::vector<GroupDemand> demands = FreshDemands(tables, tokens);
+    auto plan = coordinator.ProbeAdmission(coordinator.ProbePrefix({}), demands);
+    ASSERT_TRUE(plan);
+
+    coordinator.Acquire(std::move(*plan));
+
+    ASSERT_EQ(tables[0].NumBlocks(), 2);
+    EXPECT_EQ(tables[0].Blocks()[0]->Location().lcm_block_id,
+              tables[0].Blocks()[1]->Location().lcm_block_id);
+    ASSERT_EQ(tables[1].NumBlocks(), 2);
+    EXPECT_NE(tables[1].Blocks()[0]->Location().lcm_block_id,
+              tables[1].Blocks()[1]->Location().lcm_block_id);
+}
+
+TEST(KvCacheCoordinatorAdmissionTest, KeepsCachedChildrenWhenUnpackedPlacementFits) {
+    BlockPool pool(3);
+    const std::vector<KvCacheSpec> specs = {
+        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2},
+        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+    };
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, 4, pool);
+    const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
+    CacheForGroup(coordinator, pool, hashes[0], 0);
+    CacheBlockRef fills_first_parent =
+        pool.AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/2);
+    CacheForGroup(coordinator, pool, hashes[1], 0);
+    fills_first_parent.reset();
+
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    const std::array<std::int32_t, 2> tokens{8, 0};
+    std::vector<GroupDemand> demands = FreshDemands(tables, tokens);
+    auto plan = coordinator.ProbeAdmission(coordinator.ProbePrefix({}), demands);
+    ASSERT_TRUE(plan);
+
+    coordinator.Acquire(std::move(*plan));
+
+    EXPECT_EQ(coordinator.GroupManager(0).NumCachedBlocks(pool), 2);
+}
+
+TEST(KvCacheCoordinatorAdmissionTest, RebindsOnlyAfterEvictingWholeForeignParent) {
+    BlockPool pool(1);
+    const std::vector<KvCacheSpec> specs = {
+        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2},
+        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+    };
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, 4, pool);
+    const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
+    CacheForGroup(coordinator, pool, hashes[0], 0);
+    CacheForGroup(coordinator, pool, hashes[1], 0);
+    ASSERT_EQ(pool.BoundGroup(1), std::optional<GroupId>{0});
+
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    const std::array<std::int32_t, 2> tokens{0, 4};
+    std::vector<GroupDemand> demands = FreshDemands(tables, tokens);
+    auto plan = coordinator.ProbeAdmission(coordinator.ProbePrefix({}), demands);
+    ASSERT_TRUE(plan);
+
+    coordinator.Acquire(std::move(*plan));
+
+    EXPECT_EQ(pool.BoundGroup(1), std::optional<GroupId>{1});
+    EXPECT_EQ(tables[1].NumBlocks(), 1);
+    EXPECT_EQ(coordinator.GroupManager(0).NumCachedBlocks(pool), 0);
+}
+
+TEST(KvCacheCoordinatorAdmissionTest, ProspectiveHitParentCannotBecomeVictim) {
+    BlockPool pool(2);
+    const std::vector<KvCacheSpec> specs = {
+        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2},
+        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1},
+    };
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, 4, pool);
+    const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
+    const std::int32_t protected_parent = CacheForGroup(coordinator, pool, hashes[0], 0);
+    CacheForGroup(coordinator, pool, hashes[1], 0);
+    CacheForGroup(coordinator, pool, hashes[0], 1);
+
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    const std::array<std::int32_t, 2> tokens{0, 4};
+    std::vector<GroupDemand> demands = FreshDemands(tables, tokens);
+    KvCacheCoordinator::PrefixProbe prefix =
+        coordinator.ProbePrefix(std::span<const std::string>{hashes}.first(1));
+
+    EXPECT_FALSE(coordinator.ProbeAdmission(std::move(prefix), demands));
+    EXPECT_EQ(pool.BoundGroup(protected_parent), std::optional<GroupId>{0});
+    EXPECT_EQ(coordinator.GroupManager(0).NumCachedBlocks(pool), 2);
+    EXPECT_TRUE(tables[0].Blocks().empty());
+    EXPECT_TRUE(tables[1].Blocks().empty());
 }
 
 TEST(CoordinatorMatchTest, SwaMissForcesZeroCommon) {
@@ -304,7 +544,7 @@ TEST(CoordinatorMatchTest, SwaMissForcesZeroCommon) {
     CacheForGroup(coord, pool, ch[0], 0);
     CacheForGroup(coord, pool, ch[1], 0);
 
-    CoordinatorMatch m = coord.MatchPrefix(ch).device;
+    CoordinatorMatch m = MatchPrefixForTest(coord, ch).device;
     EXPECT_EQ(m.num_common_tokens, 0);
     EXPECT_EQ(m.per_group[0].blocks.size(), 0u);
     EXPECT_EQ(m.per_group[1].blocks.size(), 0u);
@@ -318,7 +558,7 @@ TEST(CoordinatorAllocTest, ColdStartAllocatesAlignedPages) {
     KvCacheCoordinator coord = MakeCoordinator(specs, 4, pool);
 
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}});
-    CoordinatorMatch hit = coord.MatchPrefix(ch).device;
+    CoordinatorMatch hit = MatchPrefixForTest(coord, ch).device;
     EXPECT_EQ(hit.num_common_tokens, 0);
 
     std::vector<BlockTable> tables(2);
@@ -341,7 +581,7 @@ TEST(CoordinatorAllocTest, ClaimsCommonPrefixThenAllocatesRemainder) {
     CacheForGroup(coord, pool, ch[0], 0);
     CacheForGroup(coord, pool, ch[0], 1);
 
-    CoordinatorMatch hit = coord.MatchPrefix(ch).device;
+    CoordinatorMatch hit = MatchPrefixForTest(coord, ch).device;
     ASSERT_EQ(hit.num_common_tokens, 4);
 
     std::vector<BlockTable> tables(2);
@@ -361,7 +601,7 @@ TEST(CoordinatorAllocTest, CrossGroupShortfallAllocatesNothing) {
     KvCacheCoordinator coord = MakeCoordinator(specs, 4, pool);
 
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}});
-    CoordinatorMatch hit = coord.MatchPrefix(ch).device;  // all miss, common 0
+    CoordinatorMatch hit = MatchPrefixForTest(coord, ch).device;  // all miss, common 0
     ASSERT_EQ(hit.num_common_tokens, 0);
 
     std::vector<BlockTable> tables(2);
@@ -418,7 +658,7 @@ TEST(CoordinatorStepTest, CacheFullBlocksThenMatchHits) {
     ASSERT_TRUE(coord.Acquire(tables, 4));  // 1 page each
     coord.CacheFullBlocks(tables, ch);
 
-    CoordinatorMatch m = coord.MatchPrefix(ch).device;
+    CoordinatorMatch m = MatchPrefixForTest(coord, ch).device;
     EXPECT_EQ(m.num_common_tokens, 4);
 }
 
@@ -449,7 +689,7 @@ TEST(CoordinatorStepTest, EndToEndTwoRequestsSharePrefix) {
 
     // Request A: cold, allocate 2 pages each, cache both, free.
     {
-        CoordinatorMatch m = coord.MatchPrefix(ch).device;
+        CoordinatorMatch m = MatchPrefixForTest(coord, ch).device;
         EXPECT_EQ(m.num_common_tokens, 0);
         std::vector<BlockTable> a(2);
         coord.ClaimCommonPrefix(a, std::move(m));
@@ -459,7 +699,7 @@ TEST(CoordinatorStepTest, EndToEndTwoRequestsSharePrefix) {
     }
     // Request B: shares the prefix -> common 2 pages in both groups.
     {
-        CoordinatorMatch m = coord.MatchPrefix(ch).device;
+        CoordinatorMatch m = MatchPrefixForTest(coord, ch).device;
         EXPECT_EQ(m.num_common_tokens, 8);
         std::vector<BlockTable> b(2);
         const std::int32_t num_common_tokens = m.num_common_tokens;
@@ -485,7 +725,7 @@ TEST(CoordinatorStepTest, CacheFullBlocksAtSlotOffsetExtendsPrefix) {
     coord.CacheFullBlocks(tables, std::span(ch).first(4));  // prefill path: slots 0..3
     coord.CacheFullBlocks(tables, std::span(ch).subspan(4), /*first_slot=*/4);
 
-    CoordinatorMatch m = coord.MatchPrefix(ch).device;
+    CoordinatorMatch m = MatchPrefixForTest(coord, ch).device;
     EXPECT_EQ(m.num_common_tokens, 24);
     ASSERT_EQ(m.per_group.size(), 2u);
     ASSERT_EQ(m.per_group[0].blocks.size(), 6u);
@@ -558,7 +798,7 @@ TEST(CoordinatorMatchTest, SwaRunCutByFullBoundDropsToNoValidMatch) {
     CacheForGroup(coord, pool, ch[3], 1);
     CacheForGroup(coord, pool, ch[4], 1);
 
-    CoordinatorMatch m = coord.MatchPrefix(ch).device;
+    CoordinatorMatch m = MatchPrefixForTest(coord, ch).device;
     EXPECT_EQ(m.num_common_tokens, 0);
     ASSERT_EQ(m.per_group.size(), 2u);
     EXPECT_TRUE(m.per_group[0].blocks.empty());
@@ -585,7 +825,7 @@ TEST(CoordinatorMatchTest, FullShorterThanSwaBoundsSwaWithRunIntact) {
     CacheForGroup(coord, pool, ch[3], 1);
     CacheForGroup(coord, pool, ch[4], 1);
 
-    CoordinatorMatch m = coord.MatchPrefix(ch).device;
+    CoordinatorMatch m = MatchPrefixForTest(coord, ch).device;
     EXPECT_EQ(m.num_common_tokens, 16);
     ASSERT_EQ(m.per_group.size(), 2u);
     EXPECT_EQ(m.per_group[0].blocks.size(), 4u);
@@ -613,7 +853,7 @@ TEST(CoordinatorMatchTest, SwaShorterThanFullTruncatesFull) {
     CacheForGroup(coord, pool, ch[2], 1);
     CacheForGroup(coord, pool, ch[3], 1);
 
-    CoordinatorMatch m = coord.MatchPrefix(ch).device;
+    CoordinatorMatch m = MatchPrefixForTest(coord, ch).device;
     EXPECT_EQ(m.num_common_tokens, 16);
     ASSERT_EQ(m.per_group.size(), 2u);
     EXPECT_EQ(m.per_group[0].blocks.size(), 4u);
@@ -643,7 +883,7 @@ TEST(CoordinatorMatchTest, TwoSwaGroupsSharedBoundaryMatches) {
         CacheForGroup(coord, pool, ch[3], g);
     }
 
-    CoordinatorMatch m = coord.MatchPrefix(ch).device;
+    CoordinatorMatch m = MatchPrefixForTest(coord, ch).device;
     EXPECT_EQ(m.num_common_tokens, 16);
     ASSERT_EQ(m.per_group.size(), 3u);
     EXPECT_EQ(m.per_group[0].blocks.size(), 4u);
@@ -680,7 +920,7 @@ TEST(CoordinatorMatchTest, TwoSwaGroupsCascadingShrinkConverges) {
     CacheForGroup(coord, pool, ch[2], 2);
     CacheForGroup(coord, pool, ch[3], 2);
 
-    CoordinatorMatch m = coord.MatchPrefix(ch).device;
+    CoordinatorMatch m = MatchPrefixForTest(coord, ch).device;
     EXPECT_EQ(m.num_common_tokens, 4);
     ASSERT_EQ(m.per_group.size(), 3u);
     for (std::size_t i = 0; i < 3; ++i) {
@@ -713,7 +953,7 @@ TEST(CoordinatorMatchTest, SwaGroupOrderDoesNotChangeConvergedCommon) {
     CacheForGroup(coord, pool, ch[3], 2);
     CacheForGroup(coord, pool, ch[4], 2);
 
-    CoordinatorMatch m = coord.MatchPrefix(ch).device;
+    CoordinatorMatch m = MatchPrefixForTest(coord, ch).device;
     EXPECT_EQ(m.num_common_tokens, 4);
 }
 
@@ -735,7 +975,7 @@ TEST(CoordinatorMatchTest, MultiWindowThreeGroupsSharedBoundary) {
     CacheForGroup(coord, pool, ch[4], 1);
     CacheForGroup(coord, pool, ch[4], 2);
 
-    CoordinatorMatch m = coord.MatchPrefix(ch).device;
+    CoordinatorMatch m = MatchPrefixForTest(coord, ch).device;
     EXPECT_EQ(m.num_common_tokens, 10);
     ASSERT_EQ(m.per_group.size(), 3u);
     EXPECT_EQ(m.per_group[0].num_hit_blocks, 5);
@@ -765,7 +1005,7 @@ TEST(CoordinatorMatchTest, MultiWindowCascadeToZero) {
     CacheForGroup(coord, pool, ch[4], 1);
     CacheForGroup(coord, pool, ch[3], 2);
 
-    CoordinatorMatch m = coord.MatchPrefix(ch).device;
+    CoordinatorMatch m = MatchPrefixForTest(coord, ch).device;
     EXPECT_EQ(m.num_common_tokens, 0);
     for (const PrefixMatch& g : m.per_group) {
         EXPECT_TRUE(g.blocks.empty());
@@ -799,7 +1039,7 @@ TEST(CoordinatorMatchTest, DeepCascadeRequiresSecondConvergeSweep) {
 
     // Sweep: A {4,5,6} -> 7; B {3,4,5} -> 6. Converge pass 1: A@6 -> run {0,1,2} -> 3;
     // B@3 -> bottoming run {0,1} -> 2. Pass 2: A@2 -> bottoming {0,1} -> 2. Stable.
-    CoordinatorMatch m = coord.MatchPrefix(ch).device;
+    CoordinatorMatch m = MatchPrefixForTest(coord, ch).device;
     EXPECT_EQ(m.num_common_tokens, 8);
     ASSERT_EQ(m.per_group.size(), 3u);
     for (std::size_t i = 0; i < 3; ++i) {
@@ -848,7 +1088,7 @@ TEST(CoordinatorMatchTest, AllFullGroupsMinTruncationUnchanged) {
     CacheForGroup(coord, pool, ch[0], 1);
     CacheForGroup(coord, pool, ch[1], 1);
 
-    CoordinatorMatch m = coord.MatchPrefix(ch).device;
+    CoordinatorMatch m = MatchPrefixForTest(coord, ch).device;
     EXPECT_EQ(m.num_common_tokens, 8);
     ASSERT_EQ(m.per_group.size(), 2u);
     EXPECT_EQ(m.per_group[0].blocks.size(), 2u);
@@ -866,7 +1106,7 @@ TEST(CoordinatorMatchTest, SingleFullGroupUnchanged) {
     CacheForGroup(coord, pool, ch[0], 0);
     CacheForGroup(coord, pool, ch[1], 0);
 
-    CoordinatorMatch m = coord.MatchPrefix(ch).device;
+    CoordinatorMatch m = MatchPrefixForTest(coord, ch).device;
     EXPECT_EQ(m.num_common_tokens, 8);
     ASSERT_EQ(m.per_group.size(), 1u);
     EXPECT_EQ(m.per_group[0].blocks.size(), 2u);
@@ -885,7 +1125,7 @@ TEST(CoordinatorMatchTest, SwaOnlyConfigKeepsTailRunWithLeadingHoles) {
     CacheForGroup(coord, pool, ch[3], 0);
     CacheForGroup(coord, pool, ch[4], 0);
 
-    CoordinatorMatch m = coord.MatchPrefix(ch).device;
+    CoordinatorMatch m = MatchPrefixForTest(coord, ch).device;
     EXPECT_EQ(m.num_common_tokens, 20);
     ASSERT_EQ(m.per_group.size(), 1u);
     ASSERT_EQ(m.per_group[0].blocks.size(), 5u);
@@ -907,7 +1147,7 @@ TEST(CoordinatorAllocTest, AcquireShortfallLeavesClaimedPrefixForCallerToFree) {
     CacheForGroup(coord, pool, ch[0], 1);
     std::int32_t free_before = pool.NumFreeBlocks();  // after caching, before claim
 
-    CoordinatorMatch hit = coord.MatchPrefix(ch).device;
+    CoordinatorMatch hit = MatchPrefixForTest(coord, ch).device;
     ASSERT_EQ(hit.num_common_tokens, 4);
 
     std::vector<BlockTable> tables(2);
@@ -980,7 +1220,7 @@ TEST(CoordinatorMatchTest, ThreeGroupsCommonIsMinCoverageAcrossAll) {
     CacheForGroup(coord, pool, ch[1], 2);
     CacheForGroup(coord, pool, ch[2], 2);
 
-    CoordinatorMatch m = coord.MatchPrefix(ch).device;
+    CoordinatorMatch m = MatchPrefixForTest(coord, ch).device;
     EXPECT_EQ(m.num_common_tokens, 8) << "common = min(4, 2, 3) pages, in tokens (P=4)";
     ASSERT_EQ(m.per_group.size(), 3u);
     EXPECT_EQ(m.per_group[0].blocks.size(), 2u);
@@ -1006,7 +1246,7 @@ TEST(CoordinatorMatchTest, ThreeGroupsOneAllMissForcesZeroCommon) {
     for (const std::string& h : ch) CacheForGroup(coord, pool, h, 0);
     for (const std::string& h : ch) CacheForGroup(coord, pool, h, 2);
 
-    CoordinatorMatch m = coord.MatchPrefix(ch).device;
+    CoordinatorMatch m = MatchPrefixForTest(coord, ch).device;
     EXPECT_EQ(m.num_common_tokens, 0) << "one group all-miss -> common 0";
 }
 
@@ -1147,7 +1387,7 @@ TEST(KvCacheCoordinatorHostExtension, BothGroupsFullyPresent) {
     for (int j = 2; j <= 3; ++j) sp.push_back(HostPut(coord, host_pool, ch[static_cast<std::size_t>(j)], 1));
 
     SeedDeviceFloor(pool, coord, ch, 1);
-    CoordinatorMatch m = coord.MatchPrefix(ch).host;
+    CoordinatorMatch m = MatchPrefixForTest(coord, ch).host;
     EXPECT_EQ(m.num_common_tokens, 8);  // boundary 4 blocks * P=2 (floor 1 + extension 3)
     ASSERT_EQ(m.per_group.size(), 2u);
     EXPECT_EQ(BlockIds(m.per_group[0].blocks), (std::vector<std::int32_t>{fp[0], fp[1], fp[2]}));
@@ -1171,7 +1411,7 @@ TEST(KvCacheCoordinatorHostExtension, SwaTailMissShrinksBoundary) {
     for (int j = 1; j <= 2; ++j) sp.push_back(HostPut(coord, host_pool, ch[static_cast<std::size_t>(j)], 1));
 
     SeedDeviceFloor(pool, coord, ch, 1);
-    CoordinatorMatch m = coord.MatchPrefix(ch).host;
+    CoordinatorMatch m = MatchPrefixForTest(coord, ch).host;
     EXPECT_EQ(m.num_common_tokens, 6);  // boundary 3 blocks * P=2 (floor 1 + extension 2)
     ASSERT_EQ(m.per_group.size(), 2u);
     EXPECT_EQ(BlockIds(m.per_group[0].blocks), (std::vector<std::int32_t>{fp[0], fp[1]}));
@@ -1194,7 +1434,7 @@ TEST(KvCacheCoordinatorHostExtension, FullGapCapsExtension) {
     for (int j = 1; j <= 3; ++j) sp.push_back(HostPut(coord, host_pool, ch[static_cast<std::size_t>(j)], 1));
 
     SeedDeviceFloor(pool, coord, ch, 1);
-    CoordinatorMatch m = coord.MatchPrefix(ch).host;
+    CoordinatorMatch m = MatchPrefixForTest(coord, ch).host;
     EXPECT_EQ(m.num_common_tokens, 4);  // boundary 2 blocks * P=2 (floor 1 + extension 1)
     ASSERT_EQ(m.per_group.size(), 2u);
     EXPECT_EQ(BlockIds(m.per_group[0].blocks), (std::vector<std::int32_t>{fp1}));
@@ -1209,7 +1449,7 @@ TEST(KvCacheCoordinatorHostExtension, EmptyStoreZeroExtension) {
     std::vector<std::string> ch = ContentHashes({{0, 0}, {1, 1}, {2, 2}, {3, 3}});
 
     SeedDeviceFloor(pool, coord, ch, 1);
-    CoordinatorMatch m = coord.MatchPrefix(ch).host;
+    CoordinatorMatch m = MatchPrefixForTest(coord, ch).host;
     EXPECT_EQ(m.num_common_tokens, 2) << "no extension: boundary stays at the device floor";
     ASSERT_EQ(m.per_group.size(), 2u);
     EXPECT_TRUE(m.per_group[0].blocks.empty());
@@ -1230,7 +1470,7 @@ TEST(KvCacheCoordinatorHostExtension, DeviceBoundaryRespected) {
     }
 
     SeedDeviceFloor(pool, coord, ch, 2);
-    CoordinatorMatch m = coord.MatchPrefix(ch).host;
+    CoordinatorMatch m = MatchPrefixForTest(coord, ch).host;
     EXPECT_EQ(m.num_common_tokens, 4) << "below-floor host pages extend nothing";
     // The below-dev entries were never probed: all four stay evictable.
     EXPECT_EQ(coord.NumPinnedHostCachedBlocks(), 0);
@@ -1248,7 +1488,7 @@ TEST(KvCacheCoordinatorHostExtension, MatchPinsPagesUntilResultDies) {
     for (int j = 2; j <= 3; ++j) (void)HostPut(coord, host_pool, ch[static_cast<std::size_t>(j)], 1);
 
     SeedDeviceFloor(pool, coord, ch, 1);
-    CoordinatorMatch m = coord.MatchPrefix(ch).host;
+    CoordinatorMatch m = MatchPrefixForTest(coord, ch).host;
     EXPECT_EQ(m.num_common_tokens, 8);
     EXPECT_EQ(coord.NumPinnedHostCachedBlocks(), 5);
     EXPECT_EQ(host_pool.NumFreeBlocks(), 1);
@@ -1285,7 +1525,7 @@ TEST(KvCacheCoordinatorHostExtension, DeepCascadeConverges) {
     for (int j : {0, 1, 2, 4, 5, 6}) (void)HostPut(coord, host_pool, ch[static_cast<std::size_t>(j)], 1);
     for (int j : {0, 1, 3, 4, 5}) (void)HostPut(coord, host_pool, ch[static_cast<std::size_t>(j)], 2);
 
-    CoordinatorMatch m = coord.MatchPrefix(ch).host;
+    CoordinatorMatch m = MatchPrefixForTest(coord, ch).host;
     EXPECT_EQ(m.num_common_tokens, 8);  // boundary 2 blocks * P=4 (floor 0)
     ASSERT_EQ(m.per_group.size(), 3u);
     for (std::size_t i = 0; i < 3; ++i) {
@@ -1316,7 +1556,7 @@ TEST(KvCacheCoordinatorHostExtension, MultiWindowGroupsExtendTogether) {
     const std::int32_t bp4 = HostPut(coord, host_pool, ch[4], 2);
 
     SeedDeviceFloor(pool, coord, ch, 1);
-    CoordinatorMatch m = coord.MatchPrefix(ch).host;
+    CoordinatorMatch m = MatchPrefixForTest(coord, ch).host;
     EXPECT_EQ(m.num_common_tokens, 10);  // boundary 5 blocks * P=2 (floor 1 + extension 4)
     ASSERT_EQ(m.per_group.size(), 3u);
     EXPECT_EQ(BlockIds(m.per_group[0].blocks), (std::vector<std::int32_t>{fp[0], fp[1], fp[2], fp[3]}));
@@ -1346,7 +1586,7 @@ TEST(KvCacheCoordinatorHostExtension, MultiWindowCascadeConvergesToZeroExtension
     (void)HostPut(coord, host_pool, ch[3], 2);
 
     SeedDeviceFloor(pool, coord, ch, 1);
-    CoordinatorMatch m = coord.MatchPrefix(ch).host;
+    CoordinatorMatch m = MatchPrefixForTest(coord, ch).host;
     EXPECT_EQ(m.num_common_tokens, 2) << "extension converges to zero: boundary = device floor";
     for (const PrefixMatch& g : m.per_group) {
         EXPECT_TRUE(g.blocks.empty());
@@ -1425,7 +1665,7 @@ TEST(MambaAnalogTest, HybridFullSwaMambaComposesUnderOnePool) {
     CacheForGroup(coord, pool, ch[3], 1);
     CacheForGroup(coord, pool, ch[3], 2);  // mamba-analog: one snapshot at the boundary
 
-    CoordinatorMatch m = coord.MatchPrefix(ch).device;
+    CoordinatorMatch m = MatchPrefixForTest(coord, ch).device;
     EXPECT_EQ(m.num_common_tokens, 16);
     ASSERT_EQ(m.per_group.size(), 3u);
     EXPECT_EQ(m.per_group[0].num_hit_blocks, 4);
@@ -1456,7 +1696,7 @@ TEST(MambaAnalogTest, HostTierStoresAndMatchesTheSnapshotOnly) {
     const std::int32_t snapshot = HostPut(coord, host_pool, ch[3], 1);  // ONLY the boundary snapshot
 
     SeedDeviceFloor(pool, coord, ch, 1);
-    CoordinatorMatch m = coord.MatchPrefix(ch).host;
+    CoordinatorMatch m = MatchPrefixForTest(coord, ch).host;
     EXPECT_EQ(m.num_common_tokens, 16);  // boundary 4 blocks * P=4 (floor 1 + extension 3)
     EXPECT_EQ(BlockIds(m.per_group[0].blocks), (std::vector<std::int32_t>{fp[0], fp[1], fp[2]}));
     EXPECT_EQ(BlockIds(m.per_group[1].blocks), (std::vector<std::int32_t>{0, 0, snapshot}));
@@ -1476,7 +1716,7 @@ TEST(MambaStateKindTest, FactoryMapsStateKindToAlignSemantics) {
     for (int j = 0; j <= 2; ++j) CacheForGroup(coord, pool, ch[static_cast<std::size_t>(j)], 0);
     CacheForGroup(coord, pool, ch[2], 1);  // ONLY the boundary snapshot for the state group
 
-    CoordinatorMatch m = coord.MatchPrefix(ch).device;
+    CoordinatorMatch m = MatchPrefixForTest(coord, ch).device;
     EXPECT_EQ(m.num_common_tokens, 12);  // full covers 3 pages; state resumes off snapshot @2
     ASSERT_EQ(m.per_group.size(), 2u);
     EXPECT_EQ(m.per_group[1].num_hit_blocks, 1);
