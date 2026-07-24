@@ -522,6 +522,77 @@ class CudaGraphWrapper:
 
         return graph, out
 
+    def prewarm_comm_states(self, batch_sizes: tuple[int, ...] = (1,)) -> None:
+        """Initialize lazy comm state with capture-style dummy forwards."""
+        if self._forward_func is None:
+            return
+
+        global _is_cuda_graph_phase
+        old_cuda_graph_phase = _is_cuda_graph_phase
+        _is_cuda_graph_phase = True
+        try:
+            for bs in batch_sizes:
+                ctx = ForwardContext(
+                    attn_backend=self.attn_backend,
+                    token_to_kv_pool=self.token_to_kv_pool,
+                    bs=bs,
+                    num_extends=0,
+                    input_num_tokens=bs * self.max_tokens_per_req,
+                    forward_mode=ForwardMode.DECODE,
+                    capture_hidden_mode=(
+                        CaptureHiddenMode.FULL
+                        if self.drafter is not None
+                        else CaptureHiddenMode.NULL
+                    ),
+                )
+                if self.dp_size > 1:
+                    ctx.global_num_tokens = [
+                        bs * self.max_tokens_per_req
+                    ] * self.world_size
+                    ctx.global_bs = [bs] * self.world_size
+
+                sampling_info = SamplingBatchInfo(
+                    req_pool_indices=self.input_buffers.req_pool_indices_buf[:bs],
+                    valid_cache_lengths=(
+                        self.runtime_states.valid_cache_lengths
+                        if self.runtime_states is not None
+                        else None
+                    ),
+                    is_all_greedy=False,
+                    vocab_size=self.vocab_size,
+                    device=self.device,
+                )
+
+                from tokenspeed.runtime.grammar.capturable_grammar import (
+                    bind_grammar_mask_buf,
+                )
+
+                bind_grammar_mask_buf(
+                    sampling_info,
+                    self.eager_grammar_buffers,
+                    bs,
+                    spec=self.drafter is not None,
+                    capturable=self.capturable_grammar,
+                    grammar_backend=self.grammar_backend,
+                )
+
+                torch.cuda.synchronize()
+                dist.barrier()
+                self._prepare_sampling_capture(
+                    bs=bs,
+                    variant=CUDA_GRAPH_VARIANT_DEFAULT,
+                )
+                self.input_buffers.seq_lens_buf[:bs].fill_(self.max_tokens_per_req)
+                self._init_capture_metadata(bs)
+                self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
+                torch.cuda.synchronize()
+                dist.barrier()
+
+                if self.sampling_backend is not None:
+                    self.sampling_backend.reset_capture_state()
+        finally:
+            _is_cuda_graph_phase = old_cuda_graph_phase
+
     def _capture_paged_cache_block_tables(self, bs: int, pool) -> dict | None:
         specs = tuple(pool.paged_cache_group_specs)
         if not specs:

@@ -84,6 +84,14 @@ class MSAConfig(BaseAttnConfig):
         )
         if draft_block_decode:
             kv_cache_dtype = "bfloat16"
+        if kv_cache_dtype == "mxfp8":
+            raise ValueError(
+                "MiniMax sparse attention does not support kv_cache_dtype='mxfp8'."
+            )
+        if server_args.kv_cache_quant_method != "none":
+            raise ValueError(
+                f"MiniMax sparse attention does not support kv_cache_quant_method={server_args.kv_cache_quant_method!r}."
+            )
         resolved_kv_cache_dtype = resolve_dtype(kv_cache_dtype)
 
         # The sparse label selects compute, not cache retention. Dense and MSA

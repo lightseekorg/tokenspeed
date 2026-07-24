@@ -11,11 +11,42 @@ the selected set.  The code is adapted to TokenSpeed's paged-cache layout.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.triton.dsa_topk import _topk_with_padding
+from tokenspeed_kernel.platform import current_platform
 
 SPARSE_BLOCK_SIZE = 128
+_is_nvidia = current_platform().is_nvidia
+
+if current_platform().is_blackwell:
+    try:
+        from tokenspeed_kernel.ops.attention.cute_dsl.minimax_index_decode_score import (
+            decode_score_supported as _cutedsl_decode_score_supported,
+        )
+        from tokenspeed_kernel.ops.attention.cute_dsl.minimax_index_decode_score import (
+            minimax_index_decode_score as _cutedsl_decode_score,
+        )
+    except ImportError:
+        _cutedsl_decode_score = None
+        _cutedsl_decode_score_supported = None
+    try:
+        from tokenspeed_kernel.ops.attention.msa_score import (
+            minimax_prefill_score_topk as _fmha_prefill_score_topk,
+        )
+        from tokenspeed_kernel.ops.attention.msa_score import (
+            prefill_score_supported as _fmha_prefill_score_supported,
+        )
+    except ImportError:
+        _fmha_prefill_score_topk = None
+        _fmha_prefill_score_supported = None
+else:
+    _cutedsl_decode_score = None
+    _cutedsl_decode_score_supported = None
+    _fmha_prefill_score_topk = None
+    _fmha_prefill_score_supported = None
 
 
 @triton.jit
@@ -29,9 +60,12 @@ def _store_index_k_kernel(
     stride_cache_d,
     head_dim: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     token = tl.program_id(0)
     dims = tl.arange(0, BLOCK_D)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     slot = tl.load(slot_mapping + token).to(tl.int64)
     values = tl.load(
         index_k + token * stride_k_n + dims * stride_k_d,
@@ -43,6 +77,8 @@ def _store_index_k_kernel(
         values,
         mask=dims < head_dim,
     )
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit(do_not_specialize_on_alignment=["seq_lens", "prefix_lens"])
@@ -287,6 +323,10 @@ def minimax_indexer(
     prefix_lens: torch.Tensor | None = None,
     max_query_len: int = 0,
     max_blocks: int | None = None,
+    query_lens_cpu: Sequence[int] | None = None,
+    seq_lens_cpu: Sequence[int] | None = None,
+    score_out: torch.Tensor | None = None,
+    enable_pdl: bool = False,
 ) -> torch.Tensor:
     """Write index keys, score visible 128-token blocks, and select Top-K.
 
@@ -311,6 +351,15 @@ def minimax_indexer(
         max_blocks: Number of logical block columns to score. Defaults to the
             page-table width; prefill callers should pass the current batch's
             upper bound to avoid allocating scores for the full 1M context.
+        query_lens_cpu: Optional host-side per-request new-token counts. When
+            provided together with ``seq_lens_cpu``, the prefill path may score
+            with the fmha_sm100 OnlyScore kernel instead of Triton.
+        seq_lens_cpu: Optional host-side per-request total sequence lengths;
+            see ``query_lens_cpu``.
+        score_out: Optional caller-owned ``[tokens, num_heads, max_blocks]``
+            fp32 buffer, pre-filled with ``-inf`` and reused across layers in
+            place of a fresh per-call allocation. Honored only on the decode
+            path when its shape/dtype match; otherwise a buffer is allocated.
 
     Returns:
         Selected logical block ids shaped ``[tokens, local_index_heads, topk]``.
@@ -341,14 +390,17 @@ def minimax_indexer(
     if index_k_cache.shape[0] % SPARSE_BLOCK_SIZE:
         raise ValueError("index_k_cache slot count must be divisible by 128")
 
-    index_q = index_q.contiguous()
-    index_k = index_k.contiguous()
-    slot_mapping = slot_mapping.to(
-        device=index_q.device, dtype=torch.int32
-    ).contiguous()
-    block_table = block_table.to(device=index_q.device, dtype=torch.int32).contiguous()
-    seq_lens = seq_lens.to(device=index_q.device, dtype=torch.int32).contiguous()
+    assert index_q.is_contiguous()
+    assert slot_mapping.dtype == torch.int32
+    assert slot_mapping.is_contiguous()
+    assert block_table.dtype == torch.int32
+    assert block_table.is_contiguous()
+    assert seq_lens.dtype == torch.int32
+    assert seq_lens.is_contiguous()
+
     block_d = triton.next_power_of_2(head_dim)
+    use_pdl = bool(enable_pdl and _is_nvidia)
+    pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
     _store_index_k_kernel[(tokens,)](
         index_k,
         index_k_cache,
@@ -359,7 +411,9 @@ def minimax_indexer(
         index_k_cache.stride(1),
         head_dim=head_dim,
         BLOCK_D=block_d,
+        ENABLE_PDL=use_pdl,
         num_warps=4,
+        **pdl_kwargs,
     )
 
     max_blocks = block_table.shape[1] if max_blocks is None else int(max_blocks)
@@ -367,12 +421,6 @@ def minimax_indexer(
         raise ValueError(
             f"max_blocks must be in [1, {block_table.shape[1]}], got {max_blocks}"
         )
-    scores = torch.full(
-        (tokens, num_heads, max_blocks),
-        -float("inf"),
-        dtype=torch.float32,
-        device=index_q.device,
-    )
     cache_pages = index_k_cache.view(-1, SPARSE_BLOCK_SIZE, head_dim)
     if decode_query_len:
         decode_query_len = int(decode_query_len)
@@ -382,50 +430,106 @@ def minimax_indexer(
                 f"tokens={tokens}, requests={seq_lens.numel()}, "
                 f"decode_query_len={decode_query_len}"
             )
-        num_chunks = 64
-        block_q = triton.next_power_of_2(decode_query_len)
-        _decode_block_score_kernel[(seq_lens.numel(), num_chunks)](
-            index_q,
-            cache_pages,
-            scores,
-            block_table,
-            seq_lens,
-            num_index_heads=num_heads,
-            scale=float(scale),
-            init_blocks=int(init_blocks),
-            local_blocks=int(local_blocks),
-            decode_query_len=decode_query_len,
-            max_blocks=max_blocks,
-            num_chunks=num_chunks,
-            stride_q_n=index_q.stride(0),
-            stride_q_h=index_q.stride(1),
-            stride_q_d=index_q.stride(2),
-            stride_k_page=cache_pages.stride(0),
-            stride_k_pos=cache_pages.stride(1),
-            stride_k_d=cache_pages.stride(2),
-            stride_s_n=scores.stride(0),
-            stride_s_h=scores.stride(1),
-            stride_s_b=scores.stride(2),
-            stride_bt_b=block_table.stride(0),
-            head_dim=head_dim,
-            BLOCK_Q=block_q,
-            BLOCK_K=SPARSE_BLOCK_SIZE,
-            num_warps=4,
-            num_stages=2,
-        )
+        if score_out is None:
+            scores = torch.full(
+                (tokens, num_heads, max_blocks),
+                -float("inf"),
+                dtype=torch.float32,
+                device=index_q.device,
+            )
+        else:
+            # Caller owns a persistent -inf-filled buffer shared across layers:
+            # the score kernel writes only visible blocks, so the -inf tail
+            # survives for top-k. Skips the per-layer alloc + fill.
+            assert score_out.dtype == torch.float32
+            assert score_out.is_contiguous()
+            assert score_out.size() == (tokens, num_heads, max_blocks)
+            scores = score_out
+
+        if _cutedsl_decode_score is not None and _cutedsl_decode_score_supported(
+            index_q, cache_pages, decode_query_len, max_blocks
+        ):
+            _cutedsl_decode_score(
+                index_q,
+                cache_pages,
+                scores,
+                block_table,
+                seq_lens,
+                scale=float(scale),
+                init_blocks=int(init_blocks),
+                local_blocks=int(local_blocks),
+                decode_query_len=decode_query_len,
+                enable_pdl=enable_pdl,
+            )
+        else:
+            num_chunks = 64
+            block_q = triton.next_power_of_2(decode_query_len)
+            _decode_block_score_kernel[(seq_lens.numel(), num_chunks)](
+                index_q,
+                cache_pages,
+                scores,
+                block_table,
+                seq_lens,
+                num_index_heads=num_heads,
+                scale=float(scale),
+                init_blocks=int(init_blocks),
+                local_blocks=int(local_blocks),
+                decode_query_len=decode_query_len,
+                max_blocks=max_blocks,
+                num_chunks=num_chunks,
+                stride_q_n=index_q.stride(0),
+                stride_q_h=index_q.stride(1),
+                stride_q_d=index_q.stride(2),
+                stride_k_page=cache_pages.stride(0),
+                stride_k_pos=cache_pages.stride(1),
+                stride_k_d=cache_pages.stride(2),
+                stride_s_n=scores.stride(0),
+                stride_s_h=scores.stride(1),
+                stride_s_b=scores.stride(2),
+                stride_bt_b=block_table.stride(0),
+                head_dim=head_dim,
+                BLOCK_Q=block_q,
+                BLOCK_K=SPARSE_BLOCK_SIZE,
+                num_warps=4,
+                num_stages=2,
+            )
     else:
         if cu_seqlens_q is None or prefix_lens is None or max_query_len <= 0:
             raise ValueError(
                 "prefill indexer requires cu_seqlens_q, prefix_lens, and "
                 "positive max_query_len"
             )
-        cu_seqlens_q = cu_seqlens_q.to(
-            device=index_q.device, dtype=torch.int32
-        ).contiguous()
-        prefix_lens = prefix_lens.to(
-            device=index_q.device, dtype=torch.int32
-        ).contiguous()
+        if _fmha_prefill_score_topk is not None and _fmha_prefill_score_supported(
+            index_q,
+            cache_pages,
+            int(topk),
+            max_blocks,
+            query_lens_cpu,
+            seq_lens_cpu,
+        ):
+            return _fmha_prefill_score_topk(
+                index_q,
+                cache_pages,
+                block_table,
+                scale=float(scale),
+                init_blocks=int(init_blocks),
+                local_blocks=int(local_blocks),
+                topk=int(topk),
+                query_lens_cpu=query_lens_cpu,
+                seq_lens_cpu=seq_lens_cpu,
+            )
+
+        assert cu_seqlens_q.dtype == torch.int32
+        assert cu_seqlens_q.is_contiguous()
+        assert prefix_lens.dtype == torch.int32
+        assert prefix_lens.is_contiguous()
         batch = cu_seqlens_q.numel() - 1
+        scores = torch.full(
+            (tokens, num_heads, max_blocks),
+            -float("inf"),
+            dtype=torch.float32,
+            device=index_q.device,
+        )
         block_q = 64
         _prefill_block_score_kernel[
             (triton.cdiv(int(max_query_len), block_q), batch * num_heads)
@@ -458,7 +562,9 @@ def minimax_indexer(
             num_stages=2,
         )
 
-    selected = _topk_with_padding(scores.view(tokens * num_heads, max_blocks), topk)
+    selected = _topk_with_padding(
+        scores.view(tokens * num_heads, max_blocks), topk, enable_pdl=enable_pdl
+    )
     return selected.view(tokens, num_heads, int(topk))
 
 

@@ -403,19 +403,18 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
         // corrupts the ledger's key set).
         std::unordered_set<std::string> batch_keys;
         for (auto& cand : coordinator_.TakePendingStores()) {
-            if (flat_host_pool_.GetCachedBlock(cand.key) != nullptr || flat_store_ops_.InFlight(cand.key) ||
+            if (flat_host_pool_.ContainsCachedBlock(cand.key) || flat_store_ops_.InFlight(cand.key) ||
                 !batch_keys.insert(cand.key).second) {
-                cand.block = BlockRef{};  // duplicate: drop + unpin
+                cand.block.reset();  // duplicate: drop + unpin
                 continue;
             }
-            CacheBlock* host_block = flat_host_pool_.AllocateBlock();
-            if (host_block == nullptr) {
-                cand.block = BlockRef{};  // host full: drop + unpin
+            BlockRef host_block = flat_host_pool_.AcquireBlock();
+            if (!host_block) {
+                cand.block.reset();  // host full: drop + unpin
                 continue;
             }
             pairs.push_back(TransferPair{CacheKind::kKV, cand.block->BlockId(), host_block->BlockId()});
-            tickets.push_back(FlatStoreTicket{std::move(cand.key), std::move(cand.block),
-                                              BlockRef::Adopt(flat_host_pool_, host_block)});
+            tickets.push_back(FlatStoreTicket{std::move(cand.key), std::move(cand.block), std::move(host_block)});
         }
         if (!pairs.empty()) {
             const cache_op_id id = kv_prefix_cache_.AllocateCacheOpId();

@@ -45,62 +45,59 @@ public:
     bool MatchIsPrefixClosed() const override { return false; }
 
     // Right->left scan for a run backing a resumable boundary; slots left of it stay holes.
-    PrefixMatch Match(const BlockPool& pool, std::span<const std::string> keys, std::int32_t begin_blocks,
+    PrefixProbe Probe(const BlockPool& pool, std::span<const std::string> keys, std::int32_t begin_blocks,
                       std::int32_t max_blocks) const override {
         const std::int32_t end_blocks =
             static_cast<std::int32_t>(std::min(keys.size(), static_cast<std::size_t>(std::max(max_blocks, 0))));
-        PrefixMatch match;
+        PrefixProbe probe;
         if (begin_blocks >= end_blocks) {
-            return match;
+            return probe;
         }
         // W == 1: no lookback, so every boundary is resumable with no cached page at all.
         if (pagesNeededToResume() == 0) {
-            match.blocks.assign(static_cast<std::size_t>(end_blocks - begin_blocks), pool.NullBlock());
-            return match;
+            probe.hits.resize(static_cast<std::size_t>(end_blocks - begin_blocks));
+            return probe;
         }
-        std::vector<CacheBlock*> probed(static_cast<std::size_t>(end_blocks), pool.NullBlock());
         const auto [boundary, hits_begin] = findResumableBoundary(
-            [&](std::int32_t i) {
-                CacheBlock* block = pool.GetCachedBlock(keys[static_cast<std::size_t>(i)]);
-                if (block != nullptr) {
-                    probed[static_cast<std::size_t>(i)] = block;
-                }
-                return block != nullptr;
-            },
-            begin_blocks, end_blocks);
+            [&](std::int32_t i) { return pool.ContainsCachedBlock(keys[static_cast<std::size_t>(i)]); }, begin_blocks,
+            end_blocks);
         if (boundary == begin_blocks) {
-            return match;
+            return probe;
         }
-        match.blocks.assign(probed.begin() + begin_blocks, probed.begin() + boundary);
-        match.num_hit_blocks = boundary - hits_begin;
-        return match;
+        probe.hits.resize(static_cast<std::size_t>(boundary - begin_blocks));
+        for (std::int32_t i = hits_begin; i < boundary; ++i) {
+            probe.hits[static_cast<std::size_t>(i - begin_blocks)] = 1;
+        }
+        return probe;
     }
 
     // Punches null holes so the table never shrinks (keeps slot alignment); reverse-collect evicts FIFO.
-    void ReclaimExpired(BlockPool& pool, BlockTable& table, std::int32_t num_computed_tokens) override {
+    void ReclaimExpired(BlockPool& /*pool*/, BlockTable& table, std::int32_t num_computed_tokens) override {
         std::int32_t skipped_blocks = fullySlidOutBlocks(table, num_computed_tokens);
-        std::vector<CacheBlock*> freed;
+        std::vector<BlockRef> freed;
         for (std::int32_t i = skipped_blocks - 1; i >= 0; --i) {
-            CacheBlock* old = table.EvictToNull(i, pool.NullBlock());
-            if (old == nullptr) {
+            BlockRef old = table.EvictToNull(i);
+            if (!old) {
                 break;  // already null -> earlier slots are null too
             }
-            freed.push_back(old);
+            freed.push_back(std::move(old));
         }
-        pool.FreeBlocks(freed);
+        for (auto it = freed.rbegin(); it != freed.rend(); ++it) {
+            it->reset();
+        }
     }
 
-    // Only blocks whose last reference is this table (RefCount()==1) reach the free list, so shared ones don't count.
+    // Only blocks uniquely owned by this table reach the free list, so shared ones don't count.
     std::int32_t BlocksReclaimableAt(const BlockTable& table, std::int32_t num_computed_tokens,
                                      bool count_uncached) const override {
         std::int32_t skipped_blocks = fullySlidOutBlocks(table, num_computed_tokens);
         std::int32_t freed = 0;
         for (std::int32_t i = skipped_blocks - 1; i >= 0; --i) {
-            CacheBlock* block = table.Blocks()[i];
-            if (block->IsNull()) {
+            const BlockRef& block = table.Blocks()[static_cast<std::size_t>(i)];
+            if (!block) {
                 break;  // already null -> earlier slots are null too
             }
-            if (block->RefCount() == 1 && (count_uncached || block->IsCached())) {
+            if (block.unique() && (count_uncached || block->IsCached())) {
                 ++freed;
             }
         }

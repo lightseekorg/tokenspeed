@@ -234,6 +234,52 @@ class TestInklingAudioTower(unittest.TestCase):
         )
         torch.testing.assert_close(tower(dmel), ref, atol=1e-5, rtol=1e-5)
 
+    def test_peak_memory_does_not_scale_with_n_mel_bins(self):
+        """dMel embedding must fuse lookup+sum.
+
+        The unfused ``encoder(idx).reshape(...).sum(1)`` form materializes an
+        intermediate ``n_mel_bins`` times the size of the output (~0.95 MB per
+        audio token at the released ``decoder_dmodel=6144``), which lets a
+        single long clip OOM the engine. Assert the peak stays within a small
+        multiple of the output instead.
+        """
+        from tokenspeed.runtime.configs.inkling_config import InklingAudioConfig
+        from tokenspeed.runtime.models.inkling import InklingAudioTower
+
+        torch.manual_seed(2)
+        cfg = InklingAudioConfig(
+            decoder_dmodel=512,
+            n_mel_bins=80,
+            mel_vocab_size=16,
+            use_audio_norm=True,
+            audio_mode="dmel",
+        )
+        tower = InklingAudioTower(cfg).cuda().eval()
+        n_tokens = 4096
+        dmel = torch.randint(
+            0, cfg.mel_vocab_size, (n_tokens, cfg.n_mel_bins), device="cuda"
+        )
+
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
+        with torch.no_grad():
+            out = tower(dmel)
+        torch.cuda.synchronize()
+        peak = torch.cuda.max_memory_allocated() - base
+
+        out_bytes = out.numel() * out.element_size()
+        unfused_bytes = out_bytes * cfg.n_mel_bins
+        # Generous ceiling: comfortably above the fused path, far below unfused.
+        self.assertLess(
+            peak,
+            out_bytes * 8,
+            f"peak {peak / 2**20:.1f} MB suggests the unfused lookup+sum is "
+            f"back (unfused would be ~{unfused_bytes / 2**20:.1f} MB, output is "
+            f"{out_bytes / 2**20:.1f} MB)",
+        )
+
 
 @unittest.skipUnless(torch.cuda.is_available(), "runtime RMSNorm kernels need CUDA")
 class TestInklingHMLPPatchEncoder(unittest.TestCase):

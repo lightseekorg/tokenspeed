@@ -148,6 +148,8 @@ if platform.is_nvidia:
         routed_scaling_factor = _routing_value(w, "routed_scaling_factor", None)
         routing_method_type = _routing_value(w, "routing_method_type", 1)
 
+        intermediate_size = w.w2_weight.shape[-1]
+
         result = trtllm_fp8_block_scale_moe(
             routing_logits=router_logits.to(torch.float32),
             routing_bias=routing_bias,
@@ -161,7 +163,7 @@ if platform.is_nvidia:
             top_k=getattr(w, "top_k"),
             n_group=n_group,
             topk_group=topk_group,
-            intermediate_size=getattr(w, "intermediate_size"),
+            intermediate_size=intermediate_size,
             local_expert_offset=getattr(w, "ep_rank", 0) * local_experts,
             local_num_experts=local_experts,
             routed_scaling_factor=routed_scaling_factor,

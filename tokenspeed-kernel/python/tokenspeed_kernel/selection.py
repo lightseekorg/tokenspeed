@@ -484,6 +484,7 @@ def spec_matches_shape_traits(spec: KernelSpec, shape: dict[str, Any]) -> bool:
         "n_align_64": ("N", 64),
         "n_align_128": ("N", 128),
         "k_align_16": ("K", 16),
+        "k_align_32": ("K", 32),
         "k_align_64": ("K", 64),
         "k_align_128": ("K", 128),
     }
@@ -494,6 +495,19 @@ def spec_matches_shape_traits(spec: KernelSpec, shape: dict[str, Any]) -> bool:
 
         dim = shape.get(dim_name)
         if isinstance(dim, int) and dim % alignment != 0:
+            return False
+
+    minimum_traits: dict[str, tuple[str, int]] = {
+        "n_min_128": ("N", 128),
+        "k_min_128": ("K", 128),
+    }
+    for trait_name, (dim_name, minimum) in minimum_traits.items():
+        values = spec.traits.get(trait_name)
+        if values is None or True not in values:
+            continue
+
+        dim = shape.get(dim_name)
+        if isinstance(dim, int) and dim < minimum:
             return False
 
     return True

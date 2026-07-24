@@ -62,6 +62,7 @@ def _messages_to_text(
                 messages,
                 tokenize=False,
                 add_generation_prompt=not continue_final_message,
+                enable_thinking=False,
             )
         except TypeError:
             try:

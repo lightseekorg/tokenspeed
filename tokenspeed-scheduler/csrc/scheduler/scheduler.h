@@ -129,15 +129,15 @@ private:
     std::optional<fsm::ScheduleRetractEvent> scheduleRetract(Request* request);
 
 #if TOKENSPEED_FLAT_KVCACHE
-    // One hash pass at admission: the device match, the read-only host-tier match above its
-    // boundary, and the extension's hash slice (registration form).
+    // One hash pass at admission: non-owning device/host probes plus the hashes
+    // retained for acquisition after every admission check succeeds.
     struct FlatAdmissionMatch {
-        CoordinatorMatch device;
-        CoordinatorMatch host;
+        KvCacheCoordinator::AdmissionProbe probe;
+        std::vector<std::string> hashes;
         std::vector<std::string> ext_hashes;
     };
     FlatAdmissionMatch matchFlatPrefixAtAdmission(Request* request);
-    std::optional<std::int32_t> flatAdmitFirstChunk(Request* request, const CoordinatorMatch& hit,
+    std::optional<std::int32_t> flatAdmitFirstChunk(Request* request, std::int32_t device_free_hit_blocks,
                                                     std::int32_t ext_real_pages, std::int32_t chunk_tokens,
                                                     std::int32_t decode_reserve_tokens) const;
     std::optional<std::int32_t> flatAdmitPrefillChunk(Request* request, std::int32_t chunk_tokens,
@@ -201,6 +201,8 @@ private:
 #endif
 
 #if TOKENSPEED_FLAT_KVCACHE
+    // Lifetime anchor: these pools are declared before every member that may
+    // hold BlockRef, so reverse member destruction releases all handles first.
     BlockPool block_pool_;
     // Host tier = a second BlockPool, isomorphic to the device pool (block 0 is the null
     // placeholder there too); the two differ only in which memory the ids index.
