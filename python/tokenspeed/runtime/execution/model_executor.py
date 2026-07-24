@@ -2188,6 +2188,13 @@ class ModelExecutor:
             if multimodal_context is not None and multimodal_context.has_inputs()
             else []
         )
+        if not mm_inputs:
+            mrope_positions = self.input_buffers.mrope_positions_buf[:, :total_tokens]
+            mrope_positions.copy_(
+                base_positions.unsqueeze(0).expand_as(mrope_positions)
+            )
+            return mrope_positions
+
         if not is_prefill:
             return self._build_decode_mrope_positions_override(
                 forward_op=forward_op,

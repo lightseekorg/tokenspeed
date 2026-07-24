@@ -158,13 +158,18 @@ class InputProcessor:
             # the un-padded input_ids (so get_rope_index can still locate the
             # image regions) BEFORE pad_input_tokens substitutes per-image
             # pad_value over the placeholders, then pad for the embed splice.
+            input_ids_list = None
+            if input_ids is not None:
+                input_ids_list = (
+                    input_ids if isinstance(input_ids, list) else list(input_ids)
+                )
             if (
-                input_ids is not None
+                input_ids_list is not None
                 and getattr(multimodal_inputs, "mrope_positions", None) is None
             ):
                 mrope_positions, mrope_position_delta = compute_mrope_positions(
                     self.engine.model_config.hf_config,
-                    list(input_ids),
+                    input_ids_list,
                     multimodal_inputs.mm_items,
                 )
                 multimodal_inputs.mrope_positions = mrope_positions
@@ -173,9 +178,9 @@ class InputProcessor:
                     multimodal_inputs.mrope_position_delta_scalar = int(
                         mrope_position_delta.flatten()[0].item()
                     )
-            if input_ids is not None:
-                input_ids_unpadded = list(input_ids)
-                input_ids = pad_input_tokens(list(input_ids), multimodal_inputs)
+            if input_ids_list is not None:
+                input_ids_unpadded = input_ids_list
+                input_ids = pad_input_tokens(input_ids_list, multimodal_inputs)
 
         if self.engine.is_generation:
             session_params = (
