@@ -41,7 +41,7 @@ public:
 
     bool MatchIsPrefixClosed() const override { return true; }
 
-    PrefixProbe Probe(const BlockPool& pool, std::span<const std::string> keys, std::int32_t begin_blocks,
+    PrefixProbe Probe(const BlockPool& pool, std::span<const CacheKey> keys, std::int32_t begin_blocks,
                       std::int32_t max_blocks) const override {
         const std::int32_t end_blocks =
             static_cast<std::int32_t>(std::min(keys.size(), static_cast<std::size_t>(std::max(max_blocks, 0))));

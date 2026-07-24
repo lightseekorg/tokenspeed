@@ -31,6 +31,7 @@
 #include <stdexcept>
 
 #include "cache/forward_cache_ops.h"
+#include "flat_cache_test_access.h"
 #include "integration_test_helper.h"
 
 namespace tokenspeed::test {
@@ -74,7 +75,7 @@ std::vector<std::int32_t> RealPages(const std::vector<std::vector<std::int32_t>>
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// Chunked prefill: PrefillFirstChunk then PrefillChunk per chunk.
+// Chunked prefill: first-chunk admission followed by one admission per chunk.
 // ---------------------------------------------------------------------------
 class FlatChunkedPrefillSuite : public SchedulerTestSuite {
 protected:
@@ -1606,7 +1607,7 @@ TEST(FlatRetractEvent, PrefillDoneVictimReleasesPagesAndRequeues) {
     RequestSpec spec{.request_id = "r1", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*page_size=*/2)};
     Request request{spec, /*page_size=*/2, Role::kFused};
     std::vector<BlockTable> tables(coordinator.NumGroups());
-    ASSERT_TRUE(coordinator.Acquire(tables, /*num_tokens=*/4));
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
 
     // Whole 4-token prompt in one chunk -> PrefillDone: holds pages, no decode yet.
     request.Apply(fsm::SchedulePrefillFirstChunkEvent{
@@ -1679,7 +1680,7 @@ TEST(FlatEventFailurePath, ReqPoolExhaustionAtFirstChunkLeavesPoolBalanced) {
     RequestSpec spec{.request_id = "r1", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*page_size=*/2)};
     Request request{spec, /*page_size=*/2, Role::kFused};
     std::vector<BlockTable> tables(coordinator.NumGroups());
-    ASSERT_TRUE(coordinator.Acquire(tables, /*num_tokens=*/4));
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
     ASSERT_EQ(pool.NumFreeBlocks(), 27);
 
     EXPECT_THROW(request.Apply(fsm::SchedulePrefillFirstChunkEvent{
@@ -1707,27 +1708,43 @@ TEST(FlatSwaWindowBoundary, DecodeStepKeepsOldestInWindowPageAtPageBoundary) {
     };
     KvCacheCoordinator coordinator = MakeCoordinator(specs, 2, pool);
     std::vector<BlockTable> tables(coordinator.NumGroups());
-    ASSERT_TRUE(PrefillFirstChunk(coordinator, tables, CoordinatorMatch{}, /*num_new_tokens=*/4));
-    ASSERT_TRUE(PrefillChunk(coordinator, tables, {}, /*num_tokens=*/1, /*num_computed_tokens=*/4));
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
+    ASSERT_TRUE(AdmitForTest(coordinator, tables,
+                             GroupDemand{
+                                 .num_tokens = 1,
+                                 .num_computed_tokens = 4,
+                             }));
 
     const auto swa_slot_null = [&](std::int32_t i) { return !tables[1].Blocks()[i]; };
     ASSERT_EQ(tables[1].NumBlocks(), 3);
     EXPECT_FALSE(swa_slot_null(0));
 
     // N=5; keys [2,5] -> page 0 out: slot 0 punched, slot 1 kept.
-    ASSERT_TRUE(DecodeStep(coordinator, tables, {}, 0, /*num_tokens=*/1, /*num_computed_tokens=*/5));
+    ASSERT_TRUE(AdmitForTest(coordinator, tables,
+                             GroupDemand{
+                                 .num_tokens = 1,
+                                 .num_computed_tokens = 5,
+                             }));
     EXPECT_TRUE(swa_slot_null(0));
     EXPECT_FALSE(swa_slot_null(1));
 
     // N=6; keys [3,6]: key 3 still lives in page 1, so slot 1 survives.
     const std::int32_t free_before = pool.NumFreeBlocks();
-    ASSERT_TRUE(DecodeStep(coordinator, tables, {}, 0, /*num_tokens=*/1, /*num_computed_tokens=*/6));
+    ASSERT_TRUE(AdmitForTest(coordinator, tables,
+                             GroupDemand{
+                                 .num_tokens = 1,
+                                 .num_computed_tokens = 6,
+                             }));
     EXPECT_FALSE(swa_slot_null(1)) << "key 3 of the pending query lives in page 1; freeing it is the off-by-one";
     EXPECT_TRUE(swa_slot_null(0));
     EXPECT_EQ(pool.NumFreeBlocks(), free_before - 2);
 
     // N=7; keys [4,7] -> page 1 fully out, punched exactly now.
-    ASSERT_TRUE(DecodeStep(coordinator, tables, {}, 0, /*num_tokens=*/1, /*num_computed_tokens=*/7));
+    ASSERT_TRUE(AdmitForTest(coordinator, tables,
+                             GroupDemand{
+                                 .num_tokens = 1,
+                                 .num_computed_tokens = 7,
+                             }));
     EXPECT_TRUE(swa_slot_null(1));
     EXPECT_FALSE(swa_slot_null(2));
 
@@ -2208,7 +2225,7 @@ TEST_F(FlatPrefixHitTightPoolSuite, ProtectedHitAndFreshDemandMustFitTogether) {
 
 // ---------------------------------------------------------------------------
 // M13 decode-block caching: pages filled DURING decode register via the hash
-// chain (DecodeStep: register -> slide -> acquire), so a later turn hits PAST
+// chain (admission: register -> slide -> acquire), so a later turn hits PAST
 // the previous prompt boundary. Fill timing: a round at container Size s has
 // N = s - 1 computed and registers pages up to N/block_size -- a tail page
 // registers one round late (finishing earlier frees its block hashless).
@@ -2366,7 +2383,7 @@ TEST_F(FlatDecodeCachingSuite, MultiTurnConversationReusesResponsePages) {
     EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start) << "pool back to baseline after all three turns";
 }
 
-// A decode page REGISTERS (DecodeStep registers before the slide) and a later
+// A decode page registers before the admission slide, and a later
 // ReclaimExpired punches it: the punch frees the block WITH its hash intact.
 class FlatDecodeCachingSmallWindowSuite : public FlatDecodeCachingSuite {
 protected:

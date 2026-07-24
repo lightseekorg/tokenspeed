@@ -22,6 +22,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <span>
 #include <string>
 #include <utility>
@@ -46,6 +47,16 @@ struct CacheKey {
     ContentHash content_hash{};
 
     bool operator==(const CacheKey&) const noexcept = default;
+};
+
+struct CacheKeyHash {
+    std::size_t operator()(const CacheKey& key) const noexcept {
+        std::size_t hash = std::hash<CacheNamespaceId>{}(key.namespace_id);
+        const std::size_t group_hash = std::hash<GroupId>{}(key.group_id);
+        hash ^= group_hash + 0x9e3779b9U + (hash << 6U) + (hash >> 2U);
+        const std::size_t content_hash = std::hash<ContentHash>{}(key.content_hash);
+        return hash ^ (content_hash + 0x9e3779b9U + (hash << 6U) + (hash >> 2U));
+    }
 };
 
 struct KvCacheSpec {

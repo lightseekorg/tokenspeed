@@ -136,6 +136,9 @@ private:
         std::vector<std::string> ext_hashes;
     };
     FlatAdmissionMatch matchFlatPrefixAtAdmission(Request* request);
+    std::optional<KvCacheCoordinator::AdmissionResult> flatAdmit(
+        KvCacheCoordinator::PrefixProbe&& prefix, std::span<const GroupDemand> demands);
+    std::optional<KvCacheCoordinator::AdmissionResult> flatAdmit(std::span<const GroupDemand> demands);
     bool flatPoolWedged(const std::vector<Request*>& candidates) const;
     void resolveFlatStarvation(const std::vector<Request*>& candidates, bool made_progress);
 #endif
@@ -215,8 +218,7 @@ private:
     std::vector<std::string> flat_oom_request_ids_;
 
     struct FlatStoreTicket {
-        std::string key;
-        GroupId group_id;
+        CacheKey key;
         CacheBlockRef device_block;  // source page, pinned under the D2H copy
         CacheBlockRef host_block;    // destination page, unhashed until WriteBackDone publishes it
     };
@@ -245,12 +247,12 @@ private:
             ops_.erase(it);
             return tickets;
         }
-        bool InFlight(const std::string& key) const { return keys_.contains(key); }
+        bool InFlight(const CacheKey& key) const { return keys_.contains(key); }
         bool Empty() const { return ops_.empty(); }
 
     private:
         std::unordered_map<cache_op_id, std::vector<FlatStoreTicket>> ops_;
-        std::unordered_set<std::string> keys_;
+        std::unordered_set<CacheKey, CacheKeyHash> keys_;
     };
     FlatStoreLedger flat_store_ops_;
 

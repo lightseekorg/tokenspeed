@@ -25,36 +25,6 @@
 
 namespace tokenspeed {
 
-bool PrefillFirstChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables, CoordinatorMatch&& hit,
-                       std::int32_t num_new_tokens) {
-    coordinator.ClaimCommonPrefix(tables, std::move(hit));
-    return coordinator.Acquire(tables, num_new_tokens);
-}
-
-std::vector<BlockTransfer> LoadHostExtension(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
-                                             CoordinatorMatch&& host) {
-    return coordinator.LoadHostExtension(tables, std::move(host));
-}
-
-bool PrefillChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
-                  std::span<const std::string> content_hashes, std::int32_t num_tokens,
-                  std::int32_t num_computed_tokens) {
-    return DecodeStep(coordinator, tables, content_hashes, /*first_page_slot=*/0, num_tokens, num_computed_tokens);
-}
-
-bool DecodeStep(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
-                std::span<const std::string> content_hashes, std::int32_t first_page_slot, std::int32_t num_tokens,
-                std::int32_t num_computed_tokens) {
-    // CacheFullBlocks before ReclaimExpired: registration skips null holes, so
-    // the reverse order would lose the punched pages' hashes forever.
-    // ReclaimExpired before Acquire: the slide's freed pages fund this chunk
-    // (admission gates credit them via BlocksReclaimableAt in lockstep).
-    // num_computed_tokens is the chunk end: state groups register only its aligned final page.
-    coordinator.CacheFullBlocks(tables, content_hashes, first_page_slot, num_computed_tokens);
-    coordinator.ReclaimExpired(tables, num_computed_tokens);
-    return coordinator.Acquire(tables, num_tokens);
-}
-
 std::vector<KvCacheSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
     _assert(config.block_size > 0, "cache_block_tokens must be > 0");
     std::vector<KvCacheSpec> specs;

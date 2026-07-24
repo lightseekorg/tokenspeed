@@ -43,24 +43,24 @@ std::vector<std::int32_t> BlockIds(const std::vector<CacheBlockRef>& refs) {
 
 using token_span = std::span<const std::int32_t>;
 
-std::string RealKey(const std::vector<std::int32_t>& tokens, uint32_t group_id) {
+CacheKey RealKey(const std::vector<std::int32_t>& tokens, GroupId group_id) {
     std::vector<token_span> pages = {token_span(tokens.data(), tokens.size())};
-    std::vector<std::string> keys = ComputePagedHashesWithGroup(pages, "", group_id);
-    return keys.front();
+    std::vector<std::string> hashes = ComputePagedHashes(pages, "");
+    return CacheKey{.group_id = group_id, .content_hash = std::move(hashes.front())};
 }
 
 class SwaManager : public ::tokenspeed::SwaManager {
 public:
     using ::tokenspeed::SwaManager::SwaManager;
 
-    PrefixMatch Match(BlockPool& pool, std::span<const std::string> keys, std::int32_t begin_blocks,
+    PrefixMatch Match(BlockPool& pool, std::span<const CacheKey> keys, std::int32_t begin_blocks,
                       std::int32_t max_blocks) {
         return ::tokenspeed::SwaManager::Match(pool, keys, begin_blocks, max_blocks, recency_);
     }
-    void CacheBlock(BlockPool& pool, CacheBlockRef& block, const std::string& key) {
+    void CacheBlock(BlockPool& pool, CacheBlockRef& block, const CacheKey& key) {
         ::tokenspeed::SwaManager::CacheBlock(pool, block, key, recency_);
     }
-    void CacheFullBlocks(BlockPool& pool, BlockTable& table, std::span<const std::string> keys,
+    void CacheFullBlocks(BlockPool& pool, BlockTable& table, std::span<const CacheKey> keys,
                          std::int32_t first_slot = 0) {
         ::tokenspeed::SwaManager::CacheFullBlocks(pool, table, keys, recency_, first_slot);
     }
@@ -70,7 +70,7 @@ private:
 };
 
 // Cache then free, so the page is prefix-hittable via MatchPrefix.
-std::int32_t CacheOnePage(SwaManager& manager, BlockPool& pool, const std::string& key) {
+std::int32_t CacheOnePage(SwaManager& manager, BlockPool& pool, const CacheKey& key) {
     CacheBlockRef got = pool.AcquireBlock(manager.GroupIdValue(), manager.CacheBlocksPerLcmBlock());
     const std::int32_t id = got->Location().lcm_block_id;
     manager.CacheBlock(pool, got, key);
@@ -88,7 +88,7 @@ TEST(SwaManagerTest, ConstructsWithWindow) {
 TEST(SwaManagerTest, MatchAllMissReturnsEmpty) {
     BlockPool pool(8);
     SwaManager mgr(4, 10);
-    std::vector<std::string> hashes = {RealKey({1, 2, 3, 4}, 0), RealKey({5, 6, 7, 8}, 0)};
+    std::vector<CacheKey> hashes = {RealKey({1, 2, 3, 4}, 0), RealKey({5, 6, 7, 8}, 0)};
     PrefixMatch m = mgr.Match(pool, hashes, 0, static_cast<std::int32_t>(hashes.size()));
     EXPECT_EQ(m.num_hit_blocks, 0);
     EXPECT_TRUE(m.blocks.empty());
@@ -99,16 +99,16 @@ TEST(SwaManagerTest, MatchStopsAfterContiguousNeededFromRight) {
     // block_size 4, window 10 -> pages_needed = ceil(9/4) = 3.
     BlockPool pool(16);
     SwaManager mgr(4, 10);
-    std::string h0 = RealKey({0, 0, 0, 0}, 0);
-    std::string h1 = RealKey({1, 1, 1, 1}, 0);
-    std::string h2 = RealKey({2, 2, 2, 2}, 0);
-    std::string h3 = RealKey({3, 3, 3, 3}, 0);
-    std::string h4 = RealKey({4, 4, 4, 4}, 0);
+    CacheKey h0 = RealKey({0, 0, 0, 0}, 0);
+    CacheKey h1 = RealKey({1, 1, 1, 1}, 0);
+    CacheKey h2 = RealKey({2, 2, 2, 2}, 0);
+    CacheKey h3 = RealKey({3, 3, 3, 3}, 0);
+    CacheKey h4 = RealKey({4, 4, 4, 4}, 0);
     const std::int32_t b1 = CacheOnePage(mgr, pool, h1);
     const std::int32_t b2 = CacheOnePage(mgr, pool, h2);
     const std::int32_t b3 = CacheOnePage(mgr, pool, h3);
 
-    std::vector<std::string> keys{h0, h1, h2, h3, h4};
+    std::vector<CacheKey> keys{h0, h1, h2, h3, h4};
     PrefixMatch m = mgr.Match(pool, keys, 0, 5);
     // Right->left: h4 miss; h3,h2,h1 hit -> run reaches 3, stop. run_end = 3.
     // keep [0..3] -> [NULL, b1, b2, b3]; num_hit_blocks = 3.
@@ -125,15 +125,15 @@ TEST(SwaManagerTest, BoundedMatchEnforcesRunAgainstBoundedEnd) {
     // holes at 0,1 -> the bounded overload re-scans and returns empty.
     BlockPool pool(16);
     SwaManager mgr(4, 10);
-    std::string h0 = RealKey({0, 0, 0, 0}, 0);
-    std::string h1 = RealKey({1, 1, 1, 1}, 0);
-    std::string h2 = RealKey({2, 2, 2, 2}, 0);
-    std::string h3 = RealKey({3, 3, 3, 3}, 0);
-    std::string h4 = RealKey({4, 4, 4, 4}, 0);
+    CacheKey h0 = RealKey({0, 0, 0, 0}, 0);
+    CacheKey h1 = RealKey({1, 1, 1, 1}, 0);
+    CacheKey h2 = RealKey({2, 2, 2, 2}, 0);
+    CacheKey h3 = RealKey({3, 3, 3, 3}, 0);
+    CacheKey h4 = RealKey({4, 4, 4, 4}, 0);
     CacheOnePage(mgr, pool, h2);
     CacheOnePage(mgr, pool, h3);
     CacheOnePage(mgr, pool, h4);
-    std::vector<std::string> hashes{h0, h1, h2, h3, h4};
+    std::vector<CacheKey> hashes{h0, h1, h2, h3, h4};
 
     PrefixMatch unbounded = mgr.Match(pool, hashes, 0, /*max_blocks=*/5);
     EXPECT_EQ(unbounded.blocks.size(), 5u);
@@ -148,14 +148,14 @@ TEST(SwaManagerTest, MatchTrimsTailAfterWindow) {
     // pages_needed = ceil((4-1)/4) = 1 -> any single hit (from the right) suffices.
     BlockPool pool(16);
     SwaManager mgr(4, 4);
-    std::string h0 = RealKey({0, 0, 0, 0}, 0);
-    std::string h1 = RealKey({1, 1, 1, 1}, 0);
-    std::string h2 = RealKey({2, 2, 2, 2}, 0);
+    CacheKey h0 = RealKey({0, 0, 0, 0}, 0);
+    CacheKey h1 = RealKey({1, 1, 1, 1}, 0);
+    CacheKey h2 = RealKey({2, 2, 2, 2}, 0);
     const std::int32_t b0 = CacheOnePage(mgr, pool, h0);
     const std::int32_t b2 = CacheOnePage(mgr, pool, h2);  // h1 left uncached
 
     // Right->left: h2 hits, run 1 >= pages_needed -> keep [0..2].
-    std::vector<std::string> keys{h0, h1, h2};
+    std::vector<CacheKey> keys{h0, h1, h2};
     PrefixMatch m = mgr.Match(pool, keys, 0, 3);
     ASSERT_EQ(m.blocks.size(), 3u);
     EXPECT_FALSE(m.blocks[0]);
@@ -169,13 +169,13 @@ TEST(SwaManagerTest, MatchAcceptsRunShorterThanContiguousNeeded) {
     // window 10 -> pages_needed 3, but prompt is only 2 pages, both cached.
     BlockPool pool(16);
     SwaManager mgr(4, 10);
-    std::string h0 = RealKey({0, 0, 0, 0}, 0);
-    std::string h1 = RealKey({1, 1, 1, 1}, 0);
+    CacheKey h0 = RealKey({0, 0, 0, 0}, 0);
+    CacheKey h1 = RealKey({1, 1, 1, 1}, 0);
     const std::int32_t b0 = CacheOnePage(mgr, pool, h0);
     const std::int32_t b1 = CacheOnePage(mgr, pool, h1);
 
     // Run reaches the left end at 2 < 3; run > 0 -> accept, keep [b0, b1].
-    std::vector<std::string> keys{h0, h1};
+    std::vector<CacheKey> keys{h0, h1};
     PrefixMatch m = mgr.Match(pool, keys, 0, 2);
     ASSERT_EQ(m.blocks.size(), 2u);
     EXPECT_EQ(m.blocks[0]->Location().lcm_block_id, b0);
@@ -188,17 +188,17 @@ TEST(SwaManagerTest, MatchRequiresContiguityNotAnyHit) {
     // surviving run is the LEFT one: keep [0..1] = [b0, b1].
     BlockPool pool(16);
     SwaManager mgr(4, 10);
-    std::string h0 = RealKey({0, 0, 0, 0}, 0);
-    std::string h1 = RealKey({1, 1, 1, 1}, 0);
-    std::string h2 = RealKey({2, 2, 2, 2}, 0);
-    std::string h3 = RealKey({3, 3, 3, 3}, 0);
-    std::string h4 = RealKey({4, 4, 4, 4}, 0);
+    CacheKey h0 = RealKey({0, 0, 0, 0}, 0);
+    CacheKey h1 = RealKey({1, 1, 1, 1}, 0);
+    CacheKey h2 = RealKey({2, 2, 2, 2}, 0);
+    CacheKey h3 = RealKey({3, 3, 3, 3}, 0);
+    CacheKey h4 = RealKey({4, 4, 4, 4}, 0);
     const std::int32_t b0 = CacheOnePage(mgr, pool, h0);
     const std::int32_t b1 = CacheOnePage(mgr, pool, h1);
     CacheOnePage(mgr, pool, h3);
     CacheOnePage(mgr, pool, h4);  // h2 left uncached
 
-    std::vector<std::string> keys{h0, h1, h2, h3, h4};
+    std::vector<CacheKey> keys{h0, h1, h2, h3, h4};
     PrefixMatch m = mgr.Match(pool, keys, 0, 5);
     ASSERT_EQ(m.blocks.size(), 2u);
     EXPECT_EQ(m.blocks[0]->Location().lcm_block_id, b0);
@@ -209,17 +209,17 @@ TEST(SwaManagerTest, MatchRequiresContiguityNotAnyHit) {
 TEST(SwaManagerTest, SpeculativeHitsDoNotRefreshEvictionOrder) {
     BlockPool pool(7);
     SwaManager mgr(4, 10);  // pages_needed = 3
-    std::string h0 = RealKey({0, 0, 0, 0}, 0);
-    std::string h1 = RealKey({1, 1, 1, 1}, 0);
-    std::string h2 = RealKey({2, 2, 2, 2}, 0);
-    std::string h3 = RealKey({3, 3, 3, 3}, 0);
-    std::string h4 = RealKey({4, 4, 4, 4}, 0);
+    CacheKey h0 = RealKey({0, 0, 0, 0}, 0);
+    CacheKey h1 = RealKey({1, 1, 1, 1}, 0);
+    CacheKey h2 = RealKey({2, 2, 2, 2}, 0);
+    CacheKey h3 = RealKey({3, 3, 3, 3}, 0);
+    CacheKey h4 = RealKey({4, 4, 4, 4}, 0);
     const std::int32_t b0 = CacheOnePage(mgr, pool, h0);
     const std::int32_t b1 = CacheOnePage(mgr, pool, h1);
     const std::int32_t b3 = CacheOnePage(mgr, pool, h3);
     CacheOnePage(mgr, pool, h4);
 
-    std::vector<std::string> keys{h0, h1, h2, h3, h4};
+    std::vector<CacheKey> keys{h0, h1, h2, h3, h4};
     PrefixMatch match = mgr.Match(pool, keys, 0, 5);
     ASSERT_EQ(BlockIds(match.blocks), (std::vector<std::int32_t>{b0, b1}));
 
@@ -233,10 +233,10 @@ TEST(SwaManagerTest, SpeculativeHitsDoNotRefreshEvictionOrder) {
 TEST(SwaManagerTest, MatchWindowOneCoversAllAsHoles) {
     BlockPool pool(8);
     SwaManager mgr(4, /*sliding_window=*/1);  // pages_needed = 0
-    std::string h0 = RealKey({0, 0, 0, 0}, 0);
+    CacheKey h0 = RealKey({0, 0, 0, 0}, 0);
     CacheOnePage(mgr, pool, h0);  // a real cached page must NOT shrink or anchor the match
 
-    std::vector<std::string> keys{h0, "k1", "k2"};
+    std::vector<CacheKey> keys{h0, CacheKey{.content_hash = "k1"}, CacheKey{.content_hash = "k2"}};
     PrefixMatch m = mgr.Match(pool, keys, 0, 3);
     EXPECT_EQ(BlockIds(m.blocks), (std::vector<std::int32_t>{0, 0, 0}));
     EXPECT_EQ(m.num_hit_blocks, 0);
@@ -245,11 +245,11 @@ TEST(SwaManagerTest, MatchWindowOneCoversAllAsHoles) {
 TEST(SwaManagerTest, MatchPinsUntilResultDies) {
     BlockPool pool(8);
     SwaManager mgr(4, 4);
-    std::string h0 = RealKey({0, 0, 0, 0}, 0);
+    CacheKey h0 = RealKey({0, 0, 0, 0}, 0);
     const std::int32_t b0 = CacheOnePage(mgr, pool, h0);
     EXPECT_EQ(pool.NumFreeBlocks(), 7);
 
-    std::vector<std::string> keys{h0};
+    std::vector<CacheKey> keys{h0};
     PrefixMatch m = mgr.Match(pool, keys, 0, 1);
     EXPECT_EQ(m.num_hit_blocks, 1);
     EXPECT_EQ(m.blocks.front().use_count(), 2);
@@ -261,16 +261,16 @@ TEST(SwaManagerTest, MatchPinsUntilResultDies) {
 TEST(SwaManagerTest, ClaimHitBlocksSkipsNullHoles) {
     BlockPool pool(16);
     SwaManager mgr(4, 10);  // pages_needed = 3
-    std::string h0 = RealKey({0, 0, 0, 0}, 0);
-    std::string h1 = RealKey({1, 1, 1, 1}, 0);
-    std::string h2 = RealKey({2, 2, 2, 2}, 0);
-    std::string h3 = RealKey({3, 3, 3, 3}, 0);
+    CacheKey h0 = RealKey({0, 0, 0, 0}, 0);
+    CacheKey h1 = RealKey({1, 1, 1, 1}, 0);
+    CacheKey h2 = RealKey({2, 2, 2, 2}, 0);
+    CacheKey h3 = RealKey({3, 3, 3, 3}, 0);
     const std::int32_t b1 = CacheOnePage(mgr, pool, h1);
     const std::int32_t b2 = CacheOnePage(mgr, pool, h2);
     const std::int32_t b3 = CacheOnePage(mgr, pool, h3);
     std::int32_t free_before = pool.NumFreeBlocks();
 
-    std::vector<std::string> keys{h0, h1, h2, h3};
+    std::vector<CacheKey> keys{h0, h1, h2, h3};
     PrefixMatch m = mgr.Match(pool, keys, 0, 4);
     ASSERT_EQ(m.blocks.size(), 4u);
     ASSERT_FALSE(m.blocks[0]);
@@ -305,13 +305,13 @@ TEST(SwaManagerTest, InheritedAcquireAndFreeWork) {
 TEST(SwaManagerTest, InheritedCacheFullBlocksMakesPagesHittable) {
     BlockPool pool(8);
     SwaManager mgr(4, 4);  // pages_needed = 1
-    std::string h0 = RealKey({0, 0, 0, 0}, 0);
+    CacheKey h0 = RealKey({0, 0, 0, 0}, 0);
 
     BlockTable a;
     ASSERT_TRUE(mgr.Acquire(pool, a, 4));
-    mgr.CacheFullBlocks(pool, a, std::vector<std::string>{h0});
+    mgr.CacheFullBlocks(pool, a, std::vector<CacheKey>{h0});
 
-    std::vector<std::string> keys{h0};
+    std::vector<CacheKey> keys{h0};
     PrefixMatch m = mgr.Match(pool, keys, 0, 1);
     EXPECT_EQ(m.num_hit_blocks, 1);
     EXPECT_EQ(m.blocks.back()->Location().lcm_block_id, a.Blocks()[0]->Location().lcm_block_id);
@@ -444,14 +444,14 @@ TEST(SwaManagerTest, ReclaimExpiredFreedCachedPageStaysPrefixReusable) {
     SwaManager mgr(2, 4);
     BlockTable table;
     ASSERT_TRUE(mgr.Acquire(pool, table, 8));  // 4 pages
-    const std::string h0 = RealKey({1, 1}, 0);
-    mgr.CacheFullBlocks(pool, table, std::vector<std::string>{h0});
+    const CacheKey h0 = RealKey({1, 1}, 0);
+    mgr.CacheFullBlocks(pool, table, std::vector<CacheKey>{h0});
     const std::int32_t p0 = table.Blocks()[0]->Location().lcm_block_id;
     EXPECT_TRUE(mgr.ContainsCachedBlock(pool, table.Blocks()[0]->Location()));
 
     mgr.ReclaimExpired(pool, table, 8);  // frees pages 0,1; p0 returns with hash intact
     EXPECT_FALSE(table.Blocks()[0]);
-    CacheBlockRef hit = mgr.Match(pool, std::vector<std::string>{h0}, 0, 1).blocks.front();
+    CacheBlockRef hit = mgr.Match(pool, std::vector<CacheKey>{h0}, 0, 1).blocks.front();
     EXPECT_EQ(hit->Location().lcm_block_id, p0);
 }
 

@@ -108,22 +108,12 @@ static void MaybeFillFlatBlockTables(Op& op, Request* request, const KvCacheCoor
 #if TOKENSPEED_FLAT_KVCACHE
 namespace {
 
-std::vector<GroupDemand> makeGroupDemands(std::vector<BlockTable>& tables, std::int32_t num_tokens,
-                                          std::span<const std::string> content_hashes = {},
-                                          std::int32_t first_page_slot = 0,
-                                          std::int32_t num_computed_tokens = -1,
-                                          std::int32_t reserve_tokens = 0) {
+std::vector<GroupDemand> makeGroupDemands(std::vector<BlockTable>& tables, GroupDemand prototype) {
     std::vector<GroupDemand> demands;
     demands.reserve(tables.size());
     for (BlockTable& table : tables) {
-        demands.push_back(GroupDemand{
-            .table = &table,
-            .num_tokens = num_tokens,
-            .content_hashes = content_hashes,
-            .first_page_slot = first_page_slot,
-            .num_computed_tokens = num_computed_tokens,
-            .reserve_tokens = reserve_tokens,
-        });
+        prototype.table = &table;
+        demands.push_back(prototype);
     }
     return demands;
 }
@@ -268,6 +258,21 @@ void Scheduler::resolveFlatStarvation(const std::vector<Request*>& candidates, b
     }
     _assert(false, "wedged with no holder and no deferred non-holder");
 }
+
+std::optional<KvCacheCoordinator::AdmissionResult> Scheduler::flatAdmit(
+    KvCacheCoordinator::PrefixProbe&& prefix, std::span<const GroupDemand> demands) {
+    auto plan = coordinator_.ProbeAdmission(std::move(prefix), demands);
+    if (!plan) {
+        flat_no_lcm_placement_ = true;
+        return std::nullopt;
+    }
+    return coordinator_.Acquire(std::move(*plan));
+}
+
+std::optional<KvCacheCoordinator::AdmissionResult> Scheduler::flatAdmit(
+    std::span<const GroupDemand> demands) {
+    return flatAdmit(coordinator_.ProbePrefix({}), demands);
+}
 #endif
 
 std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFirstChunk(
@@ -361,15 +366,18 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
 #if TOKENSPEED_FLAT_KVCACHE
     const std::int32_t immediate_tokens =
         tokens_this_round + (config_.role == Role::kD ? flat_decode_reserve : 0);
-    std::vector<GroupDemand> flat_demands =
-        makeGroupDemands(flat_tables, immediate_tokens, {}, 0, -1,
-                         config_.role == Role::kD ? 0 : flat_decode_reserve);
-    auto flat_plan = coordinator_.ProbeAdmission(std::move(flat_match.probe), flat_demands);
-    if (!flat_plan) {
-        flat_no_lcm_placement_ = true;
+    std::vector<GroupDemand> flat_demands = makeGroupDemands(
+        flat_tables,
+        GroupDemand{
+            .num_tokens = immediate_tokens,
+            .reserve_tokens = config_.role == Role::kD ? 0 : flat_decode_reserve,
+        });
+    std::optional<KvCacheCoordinator::AdmissionResult> admission =
+        flatAdmit(std::move(flat_match.probe), flat_demands);
+    if (!admission) {
         return {};
     }
-    flat_admission = coordinator_.Acquire(std::move(*flat_plan));
+    flat_admission = std::move(*admission);
     if (!flat_match.ext_hashes.empty()) {
         coordinator_.CacheFullBlocks(
             flat_tables, flat_match.ext_hashes,
@@ -439,15 +447,17 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
         FlatWindowPageHashes(request->GetFullPagedTokens(false), coordinator_.CacheBlockTokens(),
                              previous.already_scheduled_len, previous.extend_len);
     std::vector<BlockTable>& flat_tables = request->FlatBlockTablesRef();
-    std::vector<GroupDemand> flat_demands =
-        makeGroupDemands(flat_tables, tokens_this_round, flat_hashes, /*first_page_slot=*/0,
-                         flat_num_computed, flat_decode_reserve);
-    auto flat_plan = coordinator_.ProbeAdmission(coordinator_.ProbePrefix({}), flat_demands);
-    if (!flat_plan) {
-        flat_no_lcm_placement_ = true;
+    std::vector<GroupDemand> flat_demands = makeGroupDemands(
+        flat_tables,
+        GroupDemand{
+            .num_tokens = tokens_this_round,
+            .content_hashes = flat_hashes,
+            .num_computed_tokens = flat_num_computed,
+            .reserve_tokens = flat_decode_reserve,
+        });
+    if (!flatAdmit(flat_demands)) {
         return {};
     }
-    coordinator_.Acquire(std::move(*flat_plan));
 #endif
 
     return fsm::SchedulePrefillEvent{tokens_this_round, reserve_num_tokens_in_next_schedule_event,
@@ -497,15 +507,16 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* reque
             FlatWindowPageHashes(request->GetFullPagedTokens(false), coordinator_.CacheBlockTokens(),
                                  previous.already_scheduled_len, previous.extend_len);
         flat_hash_chain = makeHashChain(hashes);
-        std::vector<GroupDemand> demands =
-            makeGroupDemands(flat_tables, reserve_tokens, hashes, /*first_page_slot=*/0,
-                             num_computed_tokens);
-        auto plan = coordinator_.ProbeAdmission(coordinator_.ProbePrefix({}), demands);
-        if (!plan) {
-            flat_no_lcm_placement_ = true;
+        std::vector<GroupDemand> demands = makeGroupDemands(
+            flat_tables,
+            GroupDemand{
+                .num_tokens = reserve_tokens,
+                .content_hashes = hashes,
+                .num_computed_tokens = num_computed_tokens,
+            });
+        if (!flatAdmit(demands)) {
             return {};
         }
-        coordinator_.Acquire(std::move(*plan));
     } else {
         const std::int32_t num_computed_tokens = request->TokenSize() - config_.decode_input_tokens;
         flat_hash_chain = request->FlatHashChain();
@@ -518,15 +529,17 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* reque
             canConsumeAvailable(coordinator_, flat_tables, reserve_tokens, num_computed_tokens)) {
             coordinator_.ConsumeAvailable(flat_tables, reserve_tokens);
         } else {
-            std::vector<GroupDemand> demands =
-                makeGroupDemands(flat_tables, reserve_tokens, batch.hashes, batch.begin_page,
-                                 num_computed_tokens);
-            auto plan = coordinator_.ProbeAdmission(coordinator_.ProbePrefix({}), demands);
-            if (!plan) {
-                flat_no_lcm_placement_ = true;
+            std::vector<GroupDemand> demands = makeGroupDemands(
+                flat_tables,
+                GroupDemand{
+                    .num_tokens = reserve_tokens,
+                    .content_hashes = batch.hashes,
+                    .first_page_slot = batch.begin_page,
+                    .num_computed_tokens = num_computed_tokens,
+                });
+            if (!flatAdmit(demands)) {
                 return {};
             }
-            coordinator_.Acquire(std::move(*plan));
         }
     }
 #endif

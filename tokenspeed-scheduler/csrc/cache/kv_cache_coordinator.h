@@ -64,12 +64,14 @@ public:
             std::vector<tokenspeed::PrefixProbe> per_group;
         };
 
-        std::vector<std::vector<std::string>> group_keys;
+        std::vector<std::vector<CacheKey>> group_keys;
         Tier device;
         Tier host;
     };
     struct AdmissionPlan {
         struct Group {
+            // Borrows GroupDemand::table and content_hashes from the caller.
+            // The plan must be acquired before either backing object changes.
             GroupDemand demand;
             std::vector<CacheBlockLocation> placements;
             std::int32_t host_placement_count{0};
@@ -91,16 +93,7 @@ public:
     std::optional<AdmissionPlan> ProbeAdmission(PrefixProbe&& prefix, std::span<const GroupDemand> demands) const;
     AdmissionResult Acquire(AdmissionPlan&& plan);
 
-    // Pure claim into fresh tables, never fails; a non-empty per_group must be sized to the group count.
-    void ClaimCommonPrefix(std::span<BlockTable> tables, CoordinatorMatch&& hit);
-
-    // Contract on the forward_cache_ops facade.
-    std::vector<BlockTransfer> LoadHostExtension(std::span<BlockTable> tables, CoordinatorMatch&& host);
-
-    // All-or-nothing across all groups: on shortfall allocates NOTHING and returns false (no rollback needed).
-    bool Acquire(std::span<BlockTable> tables, std::int32_t num_tokens);
-
-    // Single home of the gate-side page math; Acquire's check and the flat admission gates both build on it.
+    // Single home of the gate-side page math.
     std::int32_t BlocksNeededFor(std::span<const BlockTable> tables, std::int32_t num_tokens) const;
     // Fresh-table overload for a not-yet-allocated request (no tail credit).
     std::int32_t BlocksNeededFor(std::int32_t num_tokens) const;
@@ -116,18 +109,17 @@ public:
     void Free(std::span<BlockTable> tables);
 
     struct StoreCandidate {
-        std::string key;  // group-wrapped (MakeKeyWithGroupId), the host-tier index key
-        GroupId group_id;
+        CacheKey key;
         CacheBlockRef block;  // pinned until WriteBackDone or a drain-time drop releases the ref
     };
     std::vector<StoreCandidate> TakePendingStores() { return std::exchange(pending_stores_, {}); }
     // Collection/pinning follows host-tier presence, so the slide credit flips count_uncached on this.
     bool HasHostTier() const { return host_pool_ != nullptr; }
-    bool ContainsHostCachedBlock(const std::string& key) const;
+    bool ContainsHostCachedBlock(const CacheKey& key) const;
     bool IsHostCachedBlock(CacheBlockLocation location) const;
     std::int32_t NumHostCachedBlocks() const;
     std::int32_t NumPinnedHostCachedBlocks() const;
-    void CacheHostBlock(GroupId group_id, CacheBlockRef& block, const std::string& key);
+    void CacheHostBlock(CacheBlockRef& block, const CacheKey& key);
 
 private:
     friend struct KvCacheCoordinatorTestAccess;
@@ -137,12 +129,11 @@ private:
         CoordinatorMatch host;
     };
 
-    std::vector<std::string> keysForGroup(std::span<const std::string> content_hashes, GroupId group_id) const;
-    std::vector<std::vector<std::string>> buildGroupKeys(std::span<const std::string> content_hashes) const;
-    PrefixProbe::Tier probeTierWithKeys(const BlockPool& pool,
-                                        std::span<const std::vector<std::string>> group_keys,
+    std::vector<CacheKey> keysForGroup(std::span<const std::string> content_hashes, GroupId group_id) const;
+    std::vector<std::vector<CacheKey>> buildGroupKeys(std::span<const std::string> content_hashes) const;
+    PrefixProbe::Tier probeTierWithKeys(const BlockPool& pool, std::span<const std::vector<CacheKey>> group_keys,
                                         std::int32_t num_cache_blocks, std::int32_t floor_tokens) const;
-    CoordinatorMatch acquireTierWithKeys(BlockPool& pool, std::span<const std::vector<std::string>> group_keys,
+    CoordinatorMatch acquireTierWithKeys(BlockPool& pool, std::span<const std::vector<CacheKey>> group_keys,
                                          std::int32_t floor_tokens, PrefixProbe::Tier&& probe);
     AcquiredPrefix acquirePrefix(PrefixProbe&& probe);
     void cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table,

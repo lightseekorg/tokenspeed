@@ -20,8 +20,12 @@
 
 #pragma once
 
+#include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "cache/kv_cache_coordinator.h"
 
@@ -35,6 +39,32 @@ struct KvCacheCoordinatorTestAccess {
 
 inline auto MatchPrefixForTest(KvCacheCoordinator& coordinator, std::span<const std::string> content_hashes) {
     return KvCacheCoordinatorTestAccess::MatchPrefix(coordinator, content_hashes);
+}
+
+inline std::optional<KvCacheCoordinator::AdmissionResult> AdmitForTest(
+    KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables, KvCacheCoordinator::PrefixProbe&& prefix,
+    GroupDemand prototype) {
+    std::vector<GroupDemand> demands;
+    demands.reserve(tables.size());
+    for (BlockTable& table : tables) {
+        prototype.table = &table;
+        demands.push_back(prototype);
+    }
+    auto plan = coordinator.ProbeAdmission(std::move(prefix), demands);
+    if (!plan) {
+        return std::nullopt;
+    }
+    return coordinator.Acquire(std::move(*plan));
+}
+
+inline std::optional<KvCacheCoordinator::AdmissionResult> AdmitForTest(
+    KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables, GroupDemand prototype) {
+    return AdmitForTest(coordinator, tables, coordinator.ProbePrefix({}), prototype);
+}
+
+inline std::optional<KvCacheCoordinator::AdmissionResult> AdmitForTest(
+    KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables, std::int32_t num_tokens) {
+    return AdmitForTest(coordinator, tables, GroupDemand{.num_tokens = num_tokens});
 }
 
 }  // namespace tokenspeed
