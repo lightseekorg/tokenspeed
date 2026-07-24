@@ -450,8 +450,8 @@ TEST(ForwardCacheOpsBuildFlatBlockTables, TwoGroupsRowsAndIds) {
         EXPECT_GT(id, 0);
     }
     // Rows match the source span verbatim: no compaction, null hole = 0 in its slot.
-    const std::vector<std::int32_t> expected_full = BlockTableLcmBlockIds(tables[0]);
-    const std::vector<std::int32_t> expected_swa = BlockTableLcmBlockIds(tables[1]);
+    const std::vector<std::int32_t> expected_full = coordinator.GroupManager(0).BlockTablePageIds(tables[0]);
+    const std::vector<std::int32_t> expected_swa = coordinator.GroupManager(1).BlockTablePageIds(tables[1]);
     EXPECT_EQ(built.at("full"), expected_full);
     EXPECT_EQ(built.at("swa"), expected_swa);
 }
@@ -474,7 +474,7 @@ TEST(ForwardCacheOpsBuildFlatBlockTables, SwaRowGetsNullHoleAfterAdvance) {
     }
     const auto& swa = built.at("swa");
     EXPECT_NE(std::find(swa.begin(), swa.end(), 0), swa.end());
-    const std::vector<std::int32_t> expected_swa = BlockTableLcmBlockIds(tables[1]);
+    const std::vector<std::int32_t> expected_swa = coordinator.GroupManager(1).BlockTablePageIds(tables[1]);
     EXPECT_EQ(swa, expected_swa);
 }
 
@@ -504,7 +504,7 @@ TEST(ForwardCacheOpsBuildFlatBlockTables, SingleGroupRowMatchesSource) {
     auto built = BuildFlatBlockTables(coordinator, tables, group_ids);
 
     ASSERT_EQ(built.size(), 1u);
-    const std::vector<std::int32_t> expected = BlockTableLcmBlockIds(tables[0]);
+    const std::vector<std::int32_t> expected = coordinator.GroupManager(0).BlockTablePageIds(tables[0]);
     EXPECT_EQ(built.at("only"), expected);
     // Sanity: keyed by the supplied group_id, not a bare index.
     EXPECT_EQ(built.count("0"), 0u);
@@ -522,8 +522,27 @@ TEST(ForwardCacheOpsBuildFlatBlockTables, KeyMatchesSuppliedGroupIdStrings) {
     ASSERT_EQ(built.size(), 2u);
     EXPECT_TRUE(built.count("alpha"));
     EXPECT_TRUE(built.count("beta"));
-    const std::vector<std::int32_t> expected_alpha = BlockTableLcmBlockIds(tables[0]);
+    const std::vector<std::int32_t> expected_alpha = coordinator.GroupManager(0).BlockTablePageIds(tables[0]);
     EXPECT_EQ(built.at("alpha"), expected_alpha);
+}
+
+TEST(ForwardCacheOpsBuildFlatBlockTables, ChildSlotsWithinOneParentHaveDistinctKernelPageIds) {
+    BlockPool pool(/*num_lcm_blocks=*/4);
+    const std::vector<KvCacheSpec> specs{
+        {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2},
+    };
+    KvCacheCoordinator coordinator = MakeCoordinator(specs, /*cache_block_tokens=*/2, pool);
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
+
+    const std::vector<std::int32_t> parent_ids = BlockTableLcmBlockIds(tables[0]);
+    ASSERT_EQ(parent_ids.size(), 2u);
+    EXPECT_EQ(parent_ids[0], parent_ids[1]);
+
+    const auto built = BuildFlatBlockTables(coordinator, tables, std::vector<std::string>{"full"});
+    ASSERT_EQ(built.at("full").size(), 2u);
+    EXPECT_EQ(built.at("full"), (std::vector<std::int32_t>{1, 2}));
+    EXPECT_NE(built.at("full"), parent_ids);
 }
 
 TEST(ForwardCacheOpsBuildFlatBlockTables, ResolvesEachGroupsPackingRecipe) {

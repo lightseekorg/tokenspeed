@@ -49,6 +49,7 @@ protected:
         full_grp.rows_per_page = cfg.block_size;
         full_grp.entry_stride_tokens = 1;
         full_grp.total_pages = cfg.device_allocator.total_pages;
+        full_grp.cache_blocks_per_lcm_block = 2;
         full_grp.retention = PagedCacheGroupConfig::Retention::FullHistory;
         full_grp.family = PagedCacheGroupFamily::History;
 
@@ -91,6 +92,13 @@ TEST_F(FlatKvCacheLifecycleTestSuite, SingleRequest_PrefillDecodeFinish) {
     ASSERT_EQ(prefill->flat_block_tables.count("swa"), 1u);
     EXPECT_EQ(prefill->flat_block_tables.at("full").size(), 1u);
     EXPECT_EQ(prefill->flat_block_tables.at("swa").size(), 1u);
+    ASSERT_EQ(prefill->occupied_pages.size(), 1u);
+    const auto& full_prefill_row = prefill->flat_block_tables.at("full").at(0);
+    ASSERT_GE(full_prefill_row.size(), 2u);
+    EXPECT_NE(full_prefill_row[0], full_prefill_row[1])
+        << "two child slots in one LCM block need distinct kernel page ids";
+    EXPECT_EQ(prefill->occupied_pages.at(0), full_prefill_row)
+        << "the legacy single-table output must carry resolved kernel page ids, not LCM parent ids";
 
     SendForwardDone("r1", {42});
     EXPECT_EQ(scheduler_->PrefillSize(), 1u);

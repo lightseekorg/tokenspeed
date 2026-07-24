@@ -174,12 +174,13 @@ struct ForwardState : public BaseState {
     std::unique_ptr<ReqPoolIndex> TakeReqPoolIndex() && { return std::move(req_pool_index_); }
     std::int32_t GetReqPoolIndex() const { return req_pool_index_ ? req_pool_index_->slot_ : -1; }
 
-    // Flat: group-0 SAMPLE of LCM ownership ids;
-    // feeds one-group stats and the radix-era req_to_page fallback, never cross-group accounting
-    // (that is GetOccupiedPagesAllGroups).
+    // Flat: group-0 sample of LCM parent ids. Operation construction uses this
+    // only for row length/delta calculation, then replaces it with the owning
+    // Manager's resolved kernel page ids. Cross-group accounting uses
+    // GetOccupiedPagesAllGroups().
     std::vector<std::int32_t> GetOccupiedPages() const {
         if (!block_tables_.empty()) {
-            return BlockTableLcmBlockIds(block_tables_[0]);  // flat: first-group sample (see above)
+            return BlockTableLcmBlockIds(block_tables_[0]);
         }
         return GetPageContainer().Pages();  // radix
     }
@@ -205,7 +206,7 @@ struct ForwardState : public BaseState {
 
     std::vector<std::int32_t> GetLocalAllocatorPages() const {
         if (!block_tables_.empty()) {
-            return BlockTableLcmBlockIds(block_tables_[0]);  // flat: first-group sample (see GetOccupiedPages)
+            return BlockTableLcmBlockIds(block_tables_[0]);
         }
         return local_kv_allocator_->Pages();  // radix: tail pages only, not tree-owned prefix pages
     }

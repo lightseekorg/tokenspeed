@@ -40,13 +40,13 @@ class BlockPool {
 public:
     explicit BlockPool(std::int32_t num_lcm_blocks)
         : lcm_blocks_(checkedLcmBlockCount(num_lcm_blocks)),
-          free_lcm_block_positions_(lcm_blocks_.size(), kNotFree) {
+          free_parent_index_by_id_(lcm_blocks_.size(), kNotInFreeParentSet) {
         // Release() is noexcept, so keep enough capacity for every LCM block.
-        free_lcm_block_ids_.reserve(lcm_blocks_.size());
+        free_parent_ids_.reserve(lcm_blocks_.size());
         for (std::int32_t id = num_lcm_blocks; id > 0; --id) {
-            free_lcm_block_positions_[static_cast<std::size_t>(id - 1)] =
-                static_cast<std::int32_t>(free_lcm_block_ids_.size());
-            free_lcm_block_ids_.push_back(id);
+            free_parent_index_by_id_[static_cast<std::size_t>(id - 1)] =
+                static_cast<std::int32_t>(free_parent_ids_.size());
+            free_parent_ids_.push_back(id);
         }
     }
 
@@ -57,7 +57,7 @@ public:
     // Number of physical LCM blocks. Kernel page 0 is reserved separately.
     std::int32_t TotalBlocks() const noexcept { return static_cast<std::int32_t>(lcm_blocks_.size()); }
     std::int32_t NumLcmBlocks() const noexcept { return TotalBlocks(); }
-    std::int32_t NumEmptyLcmBlocks() const noexcept { return static_cast<std::int32_t>(free_lcm_block_ids_.size()); }
+    std::int32_t NumEmptyLcmBlocks() const noexcept { return static_cast<std::int32_t>(free_parent_ids_.size()); }
 
     // Compatibility with the K=1 scheduler gate. Task 3 replaces this scalar
     // admission view with exact per-group placement demand.
@@ -90,9 +90,9 @@ public:
             }
             locations.reserve(static_cast<std::size_t>(num));
             for (std::int32_t i = 0; i < num; ++i) {
-                const std::size_t free_index = free_lcm_block_ids_.size() - 1 - static_cast<std::size_t>(i);
+                const std::size_t free_index = free_parent_ids_.size() - 1 - static_cast<std::size_t>(i);
                 locations.push_back(
-                    CacheBlockLocation{.lcm_block_id = free_lcm_block_ids_[free_index], .slot_index = 0});
+                    CacheBlockLocation{.lcm_block_id = free_parent_ids_[free_index], .slot_index = 0});
             }
         } else {
             locations = planLocations(group_id, cache_blocks_per_lcm_block, static_cast<std::size_t>(num));
@@ -162,18 +162,18 @@ public:
         if (parent.occupied_count == 0) {
             parent.bound_group.reset();
             parent.occupancy.clear();
-            FatalCheck(free_lcm_block_ids_.size() < lcm_blocks_.size(),
+            FatalCheck(free_parent_ids_.size() < lcm_blocks_.size(),
                        "free LCM block stack cannot exceed the pool size");
-            std::int32_t& free_position =
-                free_lcm_block_positions_[static_cast<std::size_t>(location.lcm_block_id - 1)];
-            FatalCheck(free_position == kNotFree, "released LCM block is already free");
-            free_position = static_cast<std::int32_t>(free_lcm_block_ids_.size());
-            free_lcm_block_ids_.push_back(location.lcm_block_id);
+            std::int32_t& free_index_entry =
+                free_parent_index_by_id_[static_cast<std::size_t>(location.lcm_block_id - 1)];
+            FatalCheck(free_index_entry == kNotInFreeParentSet, "released LCM block is already free");
+            free_index_entry = static_cast<std::int32_t>(free_parent_ids_.size());
+            free_parent_ids_.push_back(location.lcm_block_id);
         }
     }
 
 private:
-    static constexpr std::int32_t kNotFree = -1;
+    static constexpr std::int32_t kNotInFreeParentSet = -1;
 
     struct LcmBlock {
         std::optional<GroupId> bound_group;
@@ -204,18 +204,18 @@ private:
     void occupy(GroupId group_id, std::int32_t slots_per_parent, CacheBlockLocation location) noexcept {
         LcmBlock& parent = lcm_blocks_[static_cast<std::size_t>(location.lcm_block_id - 1)];
         if (parent.occupied_count == 0) {
-            std::int32_t& free_position =
-                free_lcm_block_positions_[static_cast<std::size_t>(location.lcm_block_id - 1)];
-            FatalCheck(free_position != kNotFree, "LCM placement requires an empty parent");
+            std::int32_t& free_index_entry =
+                free_parent_index_by_id_[static_cast<std::size_t>(location.lcm_block_id - 1)];
+            FatalCheck(free_index_entry != kNotInFreeParentSet, "LCM placement requires an empty parent");
             FatalCheck(parent.occupancy.empty(), "empty LCM parent must not retain child slots");
             parent.occupancy.assign(static_cast<std::size_t>(slots_per_parent), false);
-            const std::size_t free_index = static_cast<std::size_t>(free_position);
-            const std::int32_t moved_id = free_lcm_block_ids_.back();
-            free_lcm_block_ids_[free_index] = moved_id;
-            free_lcm_block_positions_[static_cast<std::size_t>(moved_id - 1)] =
+            const std::size_t free_index = static_cast<std::size_t>(free_index_entry);
+            const std::int32_t moved_id = free_parent_ids_.back();
+            free_parent_ids_[free_index] = moved_id;
+            free_parent_index_by_id_[static_cast<std::size_t>(moved_id - 1)] =
                 static_cast<std::int32_t>(free_index);
-            free_lcm_block_ids_.pop_back();
-            free_position = kNotFree;
+            free_parent_ids_.pop_back();
+            free_index_entry = kNotInFreeParentSet;
             parent.bound_group = group_id;
         }
         FatalCheck(
@@ -266,7 +266,7 @@ private:
             }
         }
 
-        for (auto free_it = free_lcm_block_ids_.rbegin(); free_it != free_lcm_block_ids_.rend(); ++free_it) {
+        for (auto free_it = free_parent_ids_.rbegin(); free_it != free_parent_ids_.rend(); ++free_it) {
             const std::int32_t lcm_block_id = *free_it;
             for (std::int32_t slot = 0; slot < slots_per_parent && locations.size() < count; ++slot) {
                 locations.push_back(CacheBlockLocation{
@@ -282,8 +282,10 @@ private:
     }
 
     std::vector<LcmBlock> lcm_blocks_;
-    std::vector<std::int32_t> free_lcm_block_ids_;
-    std::vector<std::int32_t> free_lcm_block_positions_;
+    // Dense/sparse pair: free_parent_index_by_id_ enables O(1) swap-remove
+    // of any parent from free_parent_ids_ during exact placement.
+    std::vector<std::int32_t> free_parent_ids_;
+    std::vector<std::int32_t> free_parent_index_by_id_;
 };
 
 }  // namespace tokenspeed

@@ -96,10 +96,13 @@ void AddUniqueNode(std::vector<TreeNode*>& nodes, TreeNode* node) {
 }
 
 template <typename Op>
-static void MaybeFillFlatBlockTables(Op& op, Request* request, const KvCacheCoordinator& coordinator,
+static void maybeFillFlatBlockTables(Op& op, Request* request, const KvCacheCoordinator& coordinator,
                                      std::span<const std::string> flat_group_ids) {
     if (!request->FlatBlockTablesEmpty()) {
         op.flat_block_tables = BuildFlatBlockTables(coordinator, request->FlatBlockTablesRef(), flat_group_ids);
+        // occupied_pages is the legacy single-table bridge. It must expose the
+        // same kernel page ids as the first Flat group, never LCM parent ids.
+        op.occupied_pages = op.flat_block_tables.at(flat_group_ids.front());
     }
 }
 
@@ -819,7 +822,7 @@ static PrefillOperation applyPrefillEvent(Request* request, Event& event, const 
 
 #if TOKENSPEED_FLAT_KVCACHE
     _assert(coordinator != nullptr, "flat operation requires a cache coordinator");
-    MaybeFillFlatBlockTables(op, request, *coordinator, flat_group_ids);
+    maybeFillFlatBlockTables(op, request, *coordinator, flat_group_ids);
 #else
     (void)coordinator;
     (void)flat_group_ids;
@@ -930,7 +933,7 @@ static DecodeOperation applyDecodeEvent(Request* request, Event event, std::int3
 
 #if TOKENSPEED_FLAT_KVCACHE
     _assert(coordinator != nullptr, "flat operation requires a cache coordinator");
-    MaybeFillFlatBlockTables(op, request, *coordinator, flat_group_ids);
+    maybeFillFlatBlockTables(op, request, *coordinator, flat_group_ids);
 #else
     (void)coordinator;
     (void)flat_group_ids;
@@ -1018,7 +1021,7 @@ DecodeOperation Scheduler::applyEventAndGenerateOp(Request* request, fsm::Schedu
 #endif
 
 #if TOKENSPEED_FLAT_KVCACHE
-    MaybeFillFlatBlockTables(op, request, coordinator_, FlatGroupIds());
+    maybeFillFlatBlockTables(op, request, coordinator_, FlatGroupIds());
 #endif
 
     return op;
