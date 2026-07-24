@@ -48,11 +48,11 @@ public:
     bool MatchIsPrefixClosed() const override { return false; }
 
     // Right->left scan for a run backing a resumable boundary; slots left of it stay holes.
-    PrefixProbe Probe(const BlockPool& pool, std::span<const CacheKey> keys, std::int32_t begin_blocks,
-                      std::int32_t max_blocks) const override {
+    GroupPrefixProbe Probe(const BlockPool& pool, std::span<const CacheKey> keys, std::int32_t begin_blocks,
+                           std::int32_t max_blocks) const override {
         const std::int32_t end_blocks =
             static_cast<std::int32_t>(std::min(keys.size(), static_cast<std::size_t>(std::max(max_blocks, 0))));
-        PrefixProbe probe;
+        GroupPrefixProbe probe;
         if (begin_blocks >= end_blocks) {
             return probe;
         }
@@ -104,8 +104,8 @@ public:
         return freed;
     }
 
-    std::vector<CacheBlockLocation> ReclaimableBlockLocationsAt(
-        const BlockTable& table, std::int32_t num_computed_tokens) const override {
+    std::vector<CacheBlockLocation> ReclaimableBlockLocationsAt(const BlockTable& table,
+                                                                std::int32_t num_computed_tokens) const override {
         const std::int32_t skipped_blocks = fullySlidOutBlocks(table, num_computed_tokens);
         std::vector<CacheBlockLocation> locations;
         for (std::int32_t i = skipped_blocks - 1; i >= 0; --i) {

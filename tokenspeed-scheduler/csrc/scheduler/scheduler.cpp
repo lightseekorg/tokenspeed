@@ -395,23 +395,25 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
         // in flight. InFlight() drops it (load-bearing: else a key sits in two ops and Retire
         // corrupts the ledger's key set).
         std::unordered_set<CacheKey, CacheKeyHash> batch_keys;
-        for (auto& cand : coordinator_.TakePendingStores()) {
-            if (coordinator_.ContainsHostCachedBlock(cand.key) || flat_store_ops_.InFlight(cand.key) ||
-                !batch_keys.insert(cand.key).second) {
-                cand.block.reset();  // duplicate: drop + unpin
+        for (auto& candidate : coordinator_.TakePendingStores()) {
+            if (coordinator_.ContainsHostCachedBlock(candidate.key) ||
+                flat_store_ops_.InFlight(candidate.key) || !batch_keys.insert(candidate.key).second) {
+                candidate.block_ref.reset();  // duplicate: drop + unpin
                 continue;
             }
             const KvCacheManager& manager =
-                coordinator_.GroupManager(static_cast<std::int32_t>(cand.key.group_id));
-            CacheBlockRef host_block =
-                flat_host_pool_.AcquireBlock(cand.key.group_id, manager.CacheBlocksPerLcmBlock());
-            if (!host_block) {
-                cand.block.reset();  // host full: drop + unpin
+                coordinator_.GroupManager(static_cast<std::int32_t>(candidate.key.group_id));
+            CacheBlockRef host_block_ref =
+                flat_host_pool_.AcquireBlock(candidate.key.group_id, manager.CacheBlocksPerLcmBlock());
+            if (!host_block_ref) {
+                candidate.block_ref.reset();  // host full: drop + unpin
                 continue;
             }
-            pairs.push_back(TransferPair{CacheKind::kKV, manager.ResolveKernelPageId(cand.block->Location()),
-                                         manager.ResolveKernelPageId(host_block->Location())});
-            tickets.push_back(FlatStoreTicket{std::move(cand.key), std::move(cand.block), std::move(host_block)});
+            pairs.push_back(TransferPair{CacheKind::kKV,
+                                         manager.ResolveKernelPageId(candidate.block_ref->Location()),
+                                         manager.ResolveKernelPageId(host_block_ref->Location())});
+            tickets.push_back(FlatStoreTicket{std::move(candidate.key), std::move(candidate.block_ref),
+                                              std::move(host_block_ref)});
         }
         if (!pairs.empty()) {
             const cache_op_id id = kv_prefix_cache_.AllocateCacheOpId();

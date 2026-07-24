@@ -48,7 +48,8 @@ public:
 
     PrefixMatch Match(BlockPool& pool, std::span<const CacheKey> keys, std::int32_t begin_blocks,
                       std::int32_t max_blocks) {
-        return Base::Match(pool, keys, begin_blocks, max_blocks, recency_);
+        return this->AcquireMatchedBlocks(pool, keys, begin_blocks, this->Probe(pool, keys, begin_blocks, max_blocks),
+                                          recency_);
     }
     void CacheBlock(BlockPool& pool, CacheBlockRef& block, const CacheKey& key) {
         Base::CacheBlock(pool, block, key, recency_);
@@ -73,7 +74,7 @@ CacheKey Key(std::string content_hash) {
 // allocate -> hash -> free leaves it cached-and-evictable, exactly like a committed store.
 template <typename Manager>
 std::int32_t Put(Manager& manager, BlockPool& host_pool, const CacheKey& key) {
-    CacheBlockRef block = host_pool.AcquireBlock(manager.GroupIdValue(), manager.CacheBlocksPerLcmBlock());
+    CacheBlockRef block = host_pool.AcquireBlock(manager.Id(), manager.CacheBlocksPerLcmBlock());
     const std::int32_t id = block->Location().lcm_block_id;
     manager.CacheBlock(host_pool, block, key);
     block.reset();

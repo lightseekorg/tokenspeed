@@ -234,5 +234,23 @@ TEST(ComputePagedHashesTest, IncrementalChainEqualsOneShot) {
     EXPECT_EQ(incremental, one_shot);
 }
 
+TEST(ComputePagedHashesTest, AdvancePagedHashesReturnsOnlyNewPages) {
+    std::vector<std::int32_t> tokens(12);
+    for (std::int32_t i = 0; i < 12; ++i) {
+        tokens[i] = 100 + i;
+    }
+    std::vector<token_span> pages;
+    for (std::size_t start = 0; start < tokens.size(); start += 2) {
+        pages.push_back(token_span(tokens.data() + start, 2));
+    }
+
+    const std::vector<std::string> one_shot = ComputePagedHashes(pages, "");
+    const std::vector<std::string> first = AdvancePagedHashes(pages, 0, "", 2);
+    const std::vector<std::string> second = AdvancePagedHashes(pages, 2, first.back(), 5);
+
+    EXPECT_EQ(first, std::vector<std::string>(one_shot.begin(), one_shot.begin() + 2));
+    EXPECT_EQ(second, std::vector<std::string>(one_shot.begin() + 2, one_shot.begin() + 5));
+}
+
 }  // namespace
 }  // namespace tokenspeed::test

@@ -1616,14 +1616,14 @@ TEST(FlatRetractEvent, PrefillDoneVictimReleasesPagesAndRequeues) {
         /*hybrid_prefix_cache=*/nullptr, /*mamba_allocator=*/nullptr, /*mamba_loadback_nodes=*/{}, &coordinator,
         std::move(tables)});
     ASSERT_TRUE(request.Is<fsm::PrefillDone>());
-    ASSERT_LT(pool.NumFreeBlocks(), 8);
+    ASSERT_LT(pool.NumEmptyLcmBlocks(), 8);
 
     // The last chunk's ExtendResult lands while still PrefillDone.
     request.Apply(fsm::ExtendResultEvent{"r1", {42}});
 
     request.Apply(fsm::FlatRetractEvent{&coordinator});
     EXPECT_TRUE(request.Is<fsm::Submitted>());
-    EXPECT_EQ(pool.NumFreeBlocks(), 8) << "the retract must release every page";
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 8) << "the retract must release every page";
     EXPECT_EQ(request.TokenSize(), 5);
     EXPECT_EQ(request.PrefillSize(), 5) << "prompt + generated rebase into the prefill window";
 }
@@ -1681,7 +1681,7 @@ TEST(FlatEventFailurePath, ReqPoolExhaustionAtFirstChunkLeavesPoolBalanced) {
     Request request{spec, /*page_size=*/2, Role::kFused};
     std::vector<BlockTable> tables(coordinator.NumGroups());
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
-    ASSERT_EQ(pool.NumFreeBlocks(), 27);
+    ASSERT_EQ(pool.NumEmptyLcmBlocks(), 27);
 
     EXPECT_THROW(request.Apply(fsm::SchedulePrefillFirstChunkEvent{
                      /*tokens_this_round=*/4, /*decode_input_tokens=*/1, /*device_allocator=*/nullptr, &req_pool,
@@ -1689,11 +1689,11 @@ TEST(FlatEventFailurePath, ReqPoolExhaustionAtFirstChunkLeavesPoolBalanced) {
                      /*loadback_diff=*/{}, /*hybrid_prefix_cache=*/nullptr, /*mamba_allocator=*/nullptr,
                      /*mamba_loadback_nodes=*/{}, &coordinator, std::move(tables)}),
                  std::runtime_error);
-    EXPECT_EQ(pool.NumFreeBlocks(), 31) << "a failed req-pool Allocate must not leak block-pool pages";
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 31) << "a failed req-pool Allocate must not leak block-pool pages";
 
     EXPECT_NO_THROW(request.Apply(fsm::AbortEvent{&coordinator}));
     EXPECT_TRUE(request.Is<fsm::Finished>());
-    EXPECT_EQ(pool.NumFreeBlocks(), 31);
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 31);
 }
 
 // ---------------------------------------------------------------------------
@@ -1729,7 +1729,7 @@ TEST(FlatSwaWindowBoundary, DecodeStepKeepsOldestInWindowPageAtPageBoundary) {
     EXPECT_FALSE(swa_slot_null(1));
 
     // N=6; keys [3,6]: key 3 still lives in page 1, so slot 1 survives.
-    const std::int32_t free_before = pool.NumFreeBlocks();
+    const std::int32_t free_before = pool.NumEmptyLcmBlocks();
     ASSERT_TRUE(AdmitForTest(coordinator, tables,
                              GroupDemand{
                                  .num_tokens = 1,
@@ -1737,7 +1737,7 @@ TEST(FlatSwaWindowBoundary, DecodeStepKeepsOldestInWindowPageAtPageBoundary) {
                              }));
     EXPECT_FALSE(swa_slot_null(1)) << "key 3 of the pending query lives in page 1; freeing it is the off-by-one";
     EXPECT_TRUE(swa_slot_null(0));
-    EXPECT_EQ(pool.NumFreeBlocks(), free_before - 2);
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), free_before - 2);
 
     // N=7; keys [4,7] -> page 1 fully out, punched exactly now.
     ASSERT_TRUE(AdmitForTest(coordinator, tables,

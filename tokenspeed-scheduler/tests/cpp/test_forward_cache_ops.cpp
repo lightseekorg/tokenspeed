@@ -53,14 +53,14 @@ KvCacheCoordinator MakeTwoGroup(BlockPool& pool) {
 TEST(ForwardCacheOpsFree, ReturnsAllPagesToPool) {
     BlockPool pool(/*num_lcm_blocks=*/32);
     KvCacheCoordinator coordinator = MakeTwoGroup(pool);
-    const std::int32_t free_before = pool.NumFreeBlocks();
+    const std::int32_t free_before = pool.NumEmptyLcmBlocks();
 
     std::vector<BlockTable> tables(coordinator.NumGroups());
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/6));
-    ASSERT_LT(pool.NumFreeBlocks(), free_before);
+    ASSERT_LT(pool.NumEmptyLcmBlocks(), free_before);
 
     FreeRequest(coordinator, tables);
-    EXPECT_EQ(pool.NumFreeBlocks(), free_before);
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), free_before);
 }
 
 TEST(ForwardCacheOpsPrefill, FirstChunkAcquiresPagesForTokens) {
@@ -114,7 +114,7 @@ TEST(ForwardCacheOpsPrefill, FirstChunkClaimsHitThenAcquiresOnlyRemainder) {
         FreeRequest(coordinator, probe);
     }
 
-    const std::int32_t free_before = pool.NumFreeBlocks();
+    const std::int32_t free_before = pool.NumEmptyLcmBlocks();
     std::vector<BlockTable> r2(coordinator.NumGroups());
     KvCacheCoordinator::PrefixProbe prefix = coordinator.ProbePrefix(hashes8);
     ASSERT_TRUE(AdmitForTest(coordinator, r2, std::move(prefix), GroupDemand{.num_tokens = 4}));
@@ -130,7 +130,7 @@ TEST(ForwardCacheOpsPrefill, FirstChunkClaimsHitThenAcquiresOnlyRemainder) {
 
     // Match already pinned the 4 prefix pages/group before free_before; claim
     // only transfers those refs. This operation allocates 2 new pages/group.
-    EXPECT_EQ(free_before - pool.NumFreeBlocks(), 4);
+    EXPECT_EQ(free_before - pool.NumEmptyLcmBlocks(), 4);
 }
 
 TEST(ForwardCacheOpsPrefill, ChunkAcquiresAndCachesFullBlocks) {
@@ -146,7 +146,7 @@ TEST(ForwardCacheOpsPrefill, ChunkAcquiresAndCachesFullBlocks) {
     ASSERT_TRUE(AdmitForTest(coordinator, tables,
                              GroupDemand{
                                  .num_tokens = 4,
-                                 .content_hashes = hashes2,
+                                 .completed_page_hashes = hashes2,
                                  .num_computed_tokens = 4,
                              }));
     EXPECT_EQ(tables[0].NumBlocks(), 4);
@@ -166,7 +166,7 @@ TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowAndKeepsPunchedPageHashes) {
     // Chunk 0: 8 tokens -> 4 pages/group (chunk >> window is fine: the slide
     // happens on the next admission.
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/8));
-    const std::int32_t free_before_chunk = pool.NumFreeBlocks();
+    const std::int32_t free_before_chunk = pool.NumEmptyLcmBlocks();
 
     // Chunk 1: num_computed = 8 -> skipped = 8-4+1 = 5 -> 5/2 = 2 pages fully
     // out of window: SWA slots 0,1 punched, then 2 fresh pages acquired.
@@ -175,7 +175,7 @@ TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowAndKeepsPunchedPageHashes) {
     ASSERT_TRUE(AdmitForTest(coordinator, tables,
                              GroupDemand{
                                  .num_tokens = 4,
-                                 .content_hashes = hashes,
+                                 .completed_page_hashes = hashes,
                                  .num_computed_tokens = 8,
                              }));
 
@@ -192,11 +192,10 @@ TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowAndKeepsPunchedPageHashes) {
 
     // The manager cache owner retains the two slid-out pages; Task 3 admission
     // may evict them before charging the four fresh pages.
-    EXPECT_EQ(pool.NumFreeBlocks(), free_before_chunk - 4);
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), free_before_chunk - 4);
 
     for (const std::string& h : {hashes[0], hashes[1]}) {
-        EXPECT_TRUE(coordinator.GroupManager(1).ContainsCachedBlock(
-            pool, CacheKey{.group_id = 1, .content_hash = h}))
+        EXPECT_TRUE(coordinator.GroupManager(1).ContainsCachedBlock(pool, CacheKey{.group_id = 1, .content_hash = h}))
             << "slid-out page must keep its registered hash";
     }
 }
@@ -209,7 +208,7 @@ TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowBeforeAcquire) {
 
     // 12-token prefill -> 6 pages/group, tails full.
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/12));
-    const std::int32_t free_before = pool.NumFreeBlocks();
+    const std::int32_t free_before = pool.NumEmptyLcmBlocks();
 
     // num_computed = 12 -> skipped = 12-4+1 = 9 -> 9/2 = 4 pages punched
     // (slots 0..3); reserve 1 token -> 1 fresh page/group.
@@ -220,7 +219,7 @@ TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowBeforeAcquire) {
     ASSERT_TRUE(AdmitForTest(coordinator, tables,
                              GroupDemand{
                                  .num_tokens = 1,
-                                 .content_hashes = hashes,
+                                 .completed_page_hashes = hashes,
                                  .num_computed_tokens = 12,
                              }));
 
@@ -233,7 +232,7 @@ TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowBeforeAcquire) {
     }
     EXPECT_EQ(tables[0].NumBlocks(), 7);
     // Pool: slide freed 4, reserve acquire took 1/group = 2 -> net +2.
-    EXPECT_EQ(pool.NumFreeBlocks(), free_before - 2);
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), free_before - 2);
 }
 
 TEST(ForwardCacheOpsDecode, StepAcquiresAndSlidesSwaWindow) {
@@ -285,8 +284,8 @@ TEST(ForwardCacheOpsDecode, DecodeStepRegistersFilledPages) {
     ASSERT_TRUE(AdmitForTest(coordinator, tables,
                              GroupDemand{
                                  .num_tokens = 1,
-                                 .content_hashes = fresh,
-                                 .first_page_slot = 2,
+                                 .completed_page_hashes = fresh,
+                                 .completed_first_page_slot = 2,
                                  .num_computed_tokens = 8,
                              }));
 
@@ -304,7 +303,7 @@ TEST(ForwardCacheOpsDecode, AdmissionWithEmptyHashesOnlySlidesAndAllocates) {
     KvCacheCoordinator coordinator = MakeTwoGroup(pool);  // page=2, W=4
     std::vector<BlockTable> tables(coordinator.NumGroups());
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/8));  // 4 pages/group
-    const std::int32_t free_before = pool.NumFreeBlocks();
+    const std::int32_t free_before = pool.NumEmptyLcmBlocks();
 
     ASSERT_TRUE(AdmitForTest(coordinator, tables,
                              GroupDemand{
@@ -312,7 +311,7 @@ TEST(ForwardCacheOpsDecode, AdmissionWithEmptyHashesOnlySlidesAndAllocates) {
                                  .num_computed_tokens = 8,
                              }));
 
-    EXPECT_EQ(pool.NumFreeBlocks(), free_before);
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), free_before);
     EXPECT_EQ(tables[0].NumBlocks(), 5);
     EXPECT_EQ(tables[1].NumBlocks(), 5);
     EXPECT_FALSE(tables[1].Blocks()[0]);

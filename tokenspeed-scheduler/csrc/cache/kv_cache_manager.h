@@ -21,13 +21,12 @@
 #pragma once
 
 #include <algorithm>
-#include <compare>
 #include <cstdint>
 #include <limits>
 #include <list>
+#include <optional>
 #include <span>
 #include <string>
-#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -39,25 +38,13 @@
 
 namespace tokenspeed {
 
-struct ParentEvictionCandidate {
-    std::int32_t lcm_block_id{0};
-    std::uint64_t last_access{0};
-    std::int32_t occupied_count{0};
-
-    auto operator<=>(const ParentEvictionCandidate& other) const noexcept {
-        return std::tie(last_access, occupied_count, lcm_block_id) <=>
-               std::tie(other.last_access, other.occupied_count, other.lcm_block_id);
-    }
-    bool operator==(const ParentEvictionCandidate&) const noexcept = default;
-};
-
 // Per-attention-type token policy plus cache metadata for one group. Physical
 // placement remains entirely in BlockPool.
 class KvCacheManager {
 private:
     struct CacheEntry {
         CacheKey key;
-        CacheBlockRef block;
+        CacheBlockRef block_ref;
         std::uint64_t last_access{0};
     };
 
@@ -65,10 +52,12 @@ private:
     using CacheEntryIterator = LruEntries::iterator;
     using ConstCacheEntryIterator = LruEntries::const_iterator;
 
-    struct CacheIndex {
-        LruEntries entries_by_recency;
-        std::unordered_map<CacheKey, CacheEntryIterator, CacheKeyHash> prefix_index;
-        std::unordered_map<CacheBlockLocation, CacheEntryIterator, CacheBlockLocationHash> reverse_index;
+    struct CacheEntries {
+        // Owns each CacheEntry once in LRU order. The maps are non-owning
+        // secondary indices into stable list nodes for key and location lookup.
+        LruEntries lru;
+        std::unordered_map<CacheKey, CacheEntryIterator, CacheKeyHash> by_key;
+        std::unordered_map<CacheBlockLocation, CacheEntryIterator, CacheBlockLocationHash> by_location;
     };
 
 public:
@@ -87,7 +76,7 @@ public:
 
     std::int32_t CacheBlockTokens() const noexcept { return cache_block_tokens_; }
     std::int32_t CacheBlocksPerLcmBlock() const noexcept { return cache_blocks_per_lcm_block_; }
-    GroupId GroupIdValue() const noexcept { return group_id_; }
+    GroupId Id() const noexcept { return group_id_; }
 
     std::int32_t ResolveKernelPageId(CacheBlockLocation location) const {
         _assert(location.lcm_block_id > 0, "LCM block id must be > 0");
@@ -102,64 +91,56 @@ public:
     std::vector<std::int32_t> BlockTablePageIds(const BlockTable& table) const {
         std::vector<std::int32_t> ids;
         ids.reserve(static_cast<std::size_t>(table.NumBlocks()));
-        for (const CacheBlockRef& block : table.Blocks()) {
-            ids.push_back(block ? ResolveKernelPageId(block->Location()) : 0);
+        for (const CacheBlockRef& block_ref : table.Blocks()) {
+            ids.push_back(block_ref ? ResolveKernelPageId(block_ref->Location()) : 0);
         }
         return ids;
     }
 
     virtual bool MatchIsPrefixClosed() const = 0;
-    virtual PrefixProbe Probe(const BlockPool& pool, std::span<const CacheKey> keys, std::int32_t begin_blocks,
-                              std::int32_t max_blocks) const = 0;
+    virtual GroupPrefixProbe Probe(const BlockPool& pool, std::span<const CacheKey> keys, std::int32_t begin_blocks,
+                                   std::int32_t max_blocks) const = 0;
 
     PrefixMatch AcquireMatchedBlocks(BlockPool& pool, std::span<const CacheKey> keys, std::int32_t begin_blocks,
-                                     const PrefixProbe& probe, std::uint64_t& next_recency) {
+                                     const GroupPrefixProbe& probe, std::uint64_t& next_recency) {
         _assert(begin_blocks >= 0 && static_cast<std::size_t>(begin_blocks) + probe.hits.size() <= keys.size(),
                 "matched block range is out of bounds");
         PrefixMatch match;
         match.blocks.resize(probe.hits.size());
-        CacheIndex* cache = findCacheIndex(pool);
+        CacheEntries* cache_index = findCacheEntries(pool);
         for (std::size_t i = 0; i < probe.hits.size(); ++i) {
             if (probe.hits[i] == 0) {
                 continue;
             }
-            _assert(cache != nullptr, "cached pool disappeared between match probe and acquisition");
-            CacheEntryIterator entry = findEntry(*cache, keys[static_cast<std::size_t>(begin_blocks) + i]);
-            _assert(entry != cache->entries_by_recency.end(),
-                    "cached block disappeared between match probe and acquisition");
-            touch(*cache, entry, next_recency);
-            match.blocks[i] = entry->block;
+            _assert(cache_index != nullptr, "cached pool disappeared between match probe and acquisition");
+            CacheEntryIterator entry_it = findEntry(*cache_index, keys[static_cast<std::size_t>(begin_blocks) + i]);
+            _assert(entry_it != cache_index->lru.end(), "cached block disappeared between match probe and acquisition");
+            touch(*cache_index, entry_it, next_recency);
+            match.blocks[i] = entry_it->block_ref;
             ++match.num_hit_blocks;
         }
         return match;
     }
 
-    std::vector<CacheBlockLocation> MatchedBlockLocations(const BlockPool& pool,
-                                                          std::span<const CacheKey> keys,
+    std::vector<CacheBlockLocation> MatchedBlockLocations(const BlockPool& pool, std::span<const CacheKey> keys,
                                                           std::int32_t begin_blocks,
-                                                          const PrefixProbe& probe) const {
+                                                          const GroupPrefixProbe& probe) const {
         _assert(begin_blocks >= 0 && static_cast<std::size_t>(begin_blocks) + probe.hits.size() <= keys.size(),
                 "matched block range is out of bounds");
         std::vector<CacheBlockLocation> locations;
         locations.reserve(static_cast<std::size_t>(std::ranges::count(probe.hits, std::uint8_t{1})));
-        const CacheIndex* cache = findCacheIndex(pool);
+        const CacheEntries* cache_index = findCacheEntries(pool);
         for (std::size_t i = 0; i < probe.hits.size(); ++i) {
             if (probe.hits[i] == 0) {
                 continue;
             }
-            _assert(cache != nullptr, "cached pool disappeared between match probes");
-            ConstCacheEntryIterator entry =
-                findEntry(*cache, keys[static_cast<std::size_t>(begin_blocks) + i]);
-            _assert(entry != cache->entries_by_recency.end(), "cached block disappeared between match probes");
-            locations.push_back(entry->block->Location());
+            _assert(cache_index != nullptr, "cached pool disappeared between match probes");
+            ConstCacheEntryIterator entry_it =
+                findEntry(*cache_index, keys[static_cast<std::size_t>(begin_blocks) + i]);
+            _assert(entry_it != cache_index->lru.end(), "cached block disappeared between match probes");
+            locations.push_back(entry_it->block_ref->Location());
         }
         return locations;
-    }
-
-    PrefixMatch Match(BlockPool& pool, std::span<const CacheKey> keys, std::int32_t begin_blocks,
-                      std::int32_t max_blocks, std::uint64_t& next_recency) {
-        return AcquireMatchedBlocks(pool, keys, begin_blocks, Probe(pool, keys, begin_blocks, max_blocks),
-                                    next_recency);
     }
 
     void ClaimHitBlocks(BlockTable& table, PrefixMatch&& hit) {
@@ -167,76 +148,58 @@ public:
         table.blocks_ = std::move(hit.blocks);
     }
 
-    bool Acquire(BlockPool& pool, BlockTable& table, std::int32_t num_tokens) {
-        if (num_tokens <= 0) {
-            return true;
-        }
-        if (num_tokens <= table.available_tokens_) {
+    bool Acquire(BlockPool& pool, BlockTable& table, std::int32_t num_tokens, std::int32_t reserve_tokens = 0) {
+        _assert(num_tokens >= 0 && reserve_tokens >= 0, "token demand and reserve must be non-negative");
+        const std::int32_t num_pages = BlocksNeededFor(table, num_tokens + reserve_tokens);
+        if (num_pages == 0) {
             table.available_tokens_ -= num_tokens;
             return true;
         }
-        const std::int32_t over = num_tokens - table.available_tokens_;
-        const std::int32_t num_pages = (over + cache_block_tokens_ - 1) / cache_block_tokens_;
         table.blocks_.reserve(table.blocks_.size() + static_cast<std::size_t>(num_pages));
-        std::vector<CacheBlockRef> new_blocks = pool.AcquireBlocks(group_id_, cache_blocks_per_lcm_block_, num_pages);
-        if (static_cast<std::int32_t>(new_blocks.size()) < num_pages) {
+        std::vector<CacheBlockRef> new_block_refs =
+            pool.AcquireBlocks(group_id_, cache_blocks_per_lcm_block_, num_pages);
+        if (static_cast<std::int32_t>(new_block_refs.size()) < num_pages) {
             return false;
         }
-        appendBlocks(table, num_tokens, std::move(new_blocks));
+        appendBlocks(table, num_tokens, std::move(new_block_refs));
         return true;
     }
 
-    void AcquireAt(BlockPool& pool, BlockTable& table, std::int32_t num_tokens, std::int32_t reserve_tokens,
-                   std::span<const CacheBlockLocation> locations) {
-        _assert(num_tokens >= 0 && reserve_tokens >= 0, "token demand and reserve must be non-negative");
-        const std::int32_t num_pages = BlocksNeededFor(table, num_tokens + reserve_tokens);
-        _assert(locations.size() == static_cast<std::size_t>(num_pages),
-                "exact placement count does not match token demand");
-        if (num_pages == 0) {
-            table.available_tokens_ -= num_tokens;
-            return;
-        }
-        table.blocks_.reserve(table.blocks_.size() + locations.size());
-        appendBlocks(table, num_tokens,
-                     pool.AcquireBlocksAt(group_id_, cache_blocks_per_lcm_block_, locations));
-    }
-
-    void AppendHostExtensionAt(BlockPool& pool, BlockTable& table, std::vector<CacheBlockRef>&& host_blocks,
-                               std::span<const CacheBlockLocation> locations,
-                               std::vector<BlockTransfer>& load_pairs) {
+    void AppendHostExtension(BlockPool& pool, BlockTable& table, std::vector<CacheBlockRef>&& host_block_refs,
+                             std::vector<BlockTransfer>& load_pairs) {
         _assert(table.available_tokens_ == 0, "host extension must append on a full-page boundary");
-        _assert(static_cast<std::size_t>(std::ranges::count_if(host_blocks, [](const CacheBlockRef& block) {
-                    return static_cast<bool>(block);
-                })) == locations.size(),
-                "host extension placement count mismatch");
-        table.blocks_.reserve(table.blocks_.size() + host_blocks.size());
-        std::vector<CacheBlockRef> destinations =
-            pool.AcquireBlocksAt(group_id_, cache_blocks_per_lcm_block_, locations);
-        auto destination = destinations.begin();
-        for (CacheBlockRef& host_block : host_blocks) {
-            if (!host_block) {
+        const std::int32_t num_pages = static_cast<std::int32_t>(std::ranges::count_if(
+            host_block_refs, [](const CacheBlockRef& block_ref) { return static_cast<bool>(block_ref); }));
+        table.blocks_.reserve(table.blocks_.size() + host_block_refs.size());
+        std::vector<CacheBlockRef> destination_refs =
+            pool.AcquireBlocks(group_id_, cache_blocks_per_lcm_block_, num_pages);
+        FatalCheck(static_cast<std::int32_t>(destination_refs.size()) == num_pages,
+                   "admission plan no longer fits the block pool");
+        auto destination_it = destination_refs.begin();
+        for (CacheBlockRef& host_block_ref : host_block_refs) {
+            if (!host_block_ref) {
                 table.blocks_.emplace_back();
                 continue;
             }
-            _assert(destination != destinations.end(), "missing host extension destination");
-            table.blocks_.push_back(std::move(*destination));
-            ++destination;
+            _assert(destination_it != destination_refs.end(), "missing host extension destination");
+            table.blocks_.push_back(std::move(*destination_it));
+            ++destination_it;
             load_pairs.push_back(BlockTransfer{
                 .group_id = group_id_,
-                .source = std::move(host_block),
+                .source = std::move(host_block_ref),
                 .destination = table.blocks_.back(),
             });
         }
-        _assert(destination == destinations.end(), "unused host extension destination");
+        _assert(destination_it == destination_refs.end(), "unused host extension destination");
     }
 
 private:
-    void appendBlocks(BlockTable& table, std::int32_t num_tokens, std::vector<CacheBlockRef> blocks) {
-        const std::int32_t added_tokens = static_cast<std::int32_t>(blocks.size()) * cache_block_tokens_;
+    void appendBlocks(BlockTable& table, std::int32_t num_tokens, std::vector<CacheBlockRef> block_refs) {
+        const std::int32_t added_tokens = static_cast<std::int32_t>(block_refs.size()) * cache_block_tokens_;
         _assert(num_tokens <= table.available_tokens_ + added_tokens,
                 "allocated blocks do not cover the immediate token demand");
-        for (CacheBlockRef& block : blocks) {
-            table.blocks_.push_back(std::move(block));
+        for (CacheBlockRef& block_ref : block_refs) {
+            table.blocks_.push_back(std::move(block_ref));
         }
         table.available_tokens_ += added_tokens - num_tokens;
     }
@@ -252,34 +215,34 @@ public:
 
     virtual bool RegistersAlignedFinalPageOnly() const { return false; }
 
-    void CacheBlock(BlockPool& pool, CacheBlockRef& block, const CacheKey& key, std::uint64_t& next_recency,
+    void CacheBlock(BlockPool& pool, CacheBlockRef& block_ref, const CacheKey& key, std::uint64_t& next_recency,
                     std::vector<std::pair<CacheKey, CacheBlockRef>>* newly_cached = nullptr) {
-        _assert(block && block.IsOwnedBy(pool), "cache block must belong to the target pool");
+        _assert(block_ref && block_ref.IsOwnedBy(pool), "cache block must belong to the target pool");
         validateKey(key);
-        CacheIndex& cache = cacheIndex(pool);
-        CacheEntryIterator existing = findEntry(cache, block->Location());
-        if (existing != cache.entries_by_recency.end()) {
-            _assert(existing->key == key, "one cache block location cannot change cache key");
-            touch(cache, existing, next_recency);
+        CacheEntries& cache_index = cacheEntries(pool);
+        CacheEntryIterator existing_it = findEntry(cache_index, block_ref->Location());
+        if (existing_it != cache_index.lru.end()) {
+            _assert(existing_it->key == key, "one cache block location cannot change cache key");
+            touch(cache_index, existing_it, next_recency);
             return;
         }
-        CacheEntryIterator canonical = findEntry(cache, key);
-        if (canonical != cache.entries_by_recency.end()) {
-            touch(cache, canonical, next_recency);
-            block = canonical->block;
+        CacheEntryIterator canonical_it = findEntry(cache_index, key);
+        if (canonical_it != cache_index.lru.end()) {
+            touch(cache_index, canonical_it, next_recency);
+            block_ref = canonical_it->block_ref;
             return;
         }
 
-        cache.entries_by_recency.push_back(CacheEntry{
+        cache_index.lru.push_back(CacheEntry{
             .key = key,
-            .block = block,
+            .block_ref = block_ref,
             .last_access = ++next_recency,
         });
-        CacheEntryIterator entry = std::prev(cache.entries_by_recency.end());
-        cache.prefix_index.emplace(entry->key, entry);
-        cache.reverse_index.emplace(entry->block->Location(), entry);
+        CacheEntryIterator entry_it = std::prev(cache_index.lru.end());
+        cache_index.by_key.emplace(entry_it->key, entry_it);
+        cache_index.by_location.emplace(entry_it->block_ref->Location(), entry_it);
         if (newly_cached != nullptr) {
-            newly_cached->emplace_back(key, block);
+            newly_cached->emplace_back(key, block_ref);
         }
     }
 
@@ -290,75 +253,70 @@ public:
         _assert(static_cast<std::int64_t>(first_slot) + static_cast<std::int64_t>(keys.size()) <= table.NumBlocks(),
                 "key range exceeds table size");
         for (std::size_t j = 0; j < keys.size(); ++j) {
-            CacheBlockRef& block = table.blocks_[static_cast<std::size_t>(first_slot) + j];
-            if (!block) {
+            CacheBlockRef& block_ref = table.blocks_[static_cast<std::size_t>(first_slot) + j];
+            if (!block_ref) {
                 continue;
             }
-            CacheBlock(pool, block, keys[j], next_recency, newly_cached);
+            CacheBlock(pool, block_ref, keys[j], next_recency, newly_cached);
         }
     }
 
     bool ContainsCachedBlock(const BlockPool& pool, const CacheKey& key) const {
-        const CacheIndex* cache = findCacheIndex(pool);
-        return cache != nullptr && findEntry(*cache, key) != cache->entries_by_recency.end();
+        const CacheEntries* cache_index = findCacheEntries(pool);
+        return cache_index != nullptr && findEntry(*cache_index, key) != cache_index->lru.end();
     }
     bool ContainsCachedBlock(const BlockPool& pool, CacheBlockLocation location) const {
-        const CacheIndex* cache = findCacheIndex(pool);
-        return cache != nullptr && findEntry(*cache, location) != cache->entries_by_recency.end();
+        const CacheEntries* cache_index = findCacheEntries(pool);
+        return cache_index != nullptr && findEntry(*cache_index, location) != cache_index->lru.end();
     }
-    bool IsCachedBlockEvictable(const BlockPool& pool, const CacheKey& key) const {
-        const CacheIndex* cache = findCacheIndex(pool);
-        if (cache == nullptr) {
-            return false;
+    std::optional<std::uint64_t> CachedBlockLastAccess(const BlockPool& pool, CacheBlockLocation location) const {
+        const CacheEntries* cache_index = findCacheEntries(pool);
+        if (cache_index == nullptr) {
+            return std::nullopt;
         }
-        ConstCacheEntryIterator entry = findEntry(*cache, key);
-        return entry != cache->entries_by_recency.end() && entry->block.use_count() == 1;
-    }
-    bool IsCachedBlockEvictable(const BlockPool& pool, CacheBlockLocation location) const {
-        const CacheIndex* cache = findCacheIndex(pool);
-        if (cache == nullptr) {
-            return false;
+        ConstCacheEntryIterator entry_it = findEntry(*cache_index, location);
+        if (entry_it == cache_index->lru.end()) {
+            return std::nullopt;
         }
-        ConstCacheEntryIterator entry = findEntry(*cache, location);
-        return entry != cache->entries_by_recency.end() && entry->block.use_count() == 1;
+        return entry_it->last_access;
     }
     std::int32_t NumCachedBlocks(const BlockPool& pool) const {
-        const CacheIndex* cache = findCacheIndex(pool);
-        return cache == nullptr ? 0 : static_cast<std::int32_t>(cache->entries_by_recency.size());
+        const CacheEntries* cache_index = findCacheEntries(pool);
+        return cache_index == nullptr ? 0 : static_cast<std::int32_t>(cache_index->lru.size());
     }
     std::int32_t NumPinnedCachedBlocks(const BlockPool& pool) const {
-        const CacheIndex* cache = findCacheIndex(pool);
-        if (cache == nullptr) {
+        const CacheEntries* cache_index = findCacheEntries(pool);
+        if (cache_index == nullptr) {
             return 0;
         }
         return static_cast<std::int32_t>(std::ranges::count_if(
-            cache->entries_by_recency, [](const CacheEntry& entry) { return entry.block.use_count() > 1; }));
+            cache_index->lru, [](const CacheEntry& cache_entry) { return cache_entry.block_ref.use_count() > 1; }));
     }
 
     std::vector<CacheBlockLocation> EvictableBlockLocations(const BlockPool& pool) const {
-        const CacheIndex* cache = findCacheIndex(pool);
-        if (cache == nullptr) {
+        const CacheEntries* cache_index = findCacheEntries(pool);
+        if (cache_index == nullptr) {
             return {};
         }
         std::vector<CacheBlockLocation> locations;
-        for (const CacheEntry& entry : cache->entries_by_recency) {
-            if (entry.block.use_count() == 1) {
-                locations.push_back(entry.block->Location());
+        for (const CacheEntry& cache_entry : cache_index->lru) {
+            if (cache_entry.block_ref.unique()) {
+                locations.push_back(cache_entry.block_ref->Location());
             }
         }
         return locations;
     }
 
     bool EvictCachedBlock(const BlockPool& pool, CacheBlockLocation location) {
-        CacheIndex* cache = findCacheIndex(pool);
-        if (cache == nullptr) {
+        CacheEntries* cache_index = findCacheEntries(pool);
+        if (cache_index == nullptr) {
             return false;
         }
-        CacheEntryIterator entry = findEntry(*cache, location);
-        if (entry == cache->entries_by_recency.end() || entry->block.use_count() != 1) {
+        CacheEntryIterator entry_it = findEntry(*cache_index, location);
+        if (entry_it == cache_index->lru.end() || !entry_it->block_ref.unique()) {
             return false;
         }
-        eraseEntry(*cache, entry);
+        eraseEntry(*cache_index, entry_it);
         return true;
     }
 
@@ -367,60 +325,14 @@ public:
         if (locations.empty()) {
             return false;
         }
-        const CacheIndex* cache = findCacheIndex(pool);
-        if (cache == nullptr) {
+        const CacheEntries* cache_index = findCacheEntries(pool);
+        if (cache_index == nullptr) {
             return false;
         }
         return std::ranges::all_of(locations, [&](CacheBlockLocation location) {
-            ConstCacheEntryIterator entry = findEntry(*cache, location);
-            return entry != cache->entries_by_recency.end() && entry->block.use_count() == 1;
+            ConstCacheEntryIterator entry_it = findEntry(*cache_index, location);
+            return entry_it != cache_index->lru.end() && entry_it->block_ref.unique();
         });
-    }
-
-    std::vector<ParentEvictionCandidate> CollectEvictableParents(const BlockPool& pool) const {
-        std::vector<ParentEvictionCandidate> candidates;
-        for (std::int32_t lcm_block_id = 1; lcm_block_id <= pool.NumLcmBlocks(); ++lcm_block_id) {
-            if (pool.BoundGroup(lcm_block_id) != group_id_ || !ParentIsFullyEvictable(pool, lcm_block_id)) {
-                continue;
-            }
-            const std::vector<CacheBlockLocation> locations = pool.OccupiedLocations(lcm_block_id);
-            const CacheIndex* cache = findCacheIndex(pool);
-            _assert(cache != nullptr, "fully evictable parent must have a pool cache");
-            std::uint64_t parent_recency = 0;
-            for (CacheBlockLocation location : locations) {
-                ConstCacheEntryIterator entry = findEntry(*cache, location);
-                _assert(entry != cache->entries_by_recency.end(),
-                        "fully evictable parent must have one entry per occupied child");
-                parent_recency = std::max(parent_recency, entry->last_access);
-            }
-            candidates.push_back(ParentEvictionCandidate{
-                .lcm_block_id = lcm_block_id,
-                .last_access = parent_recency,
-                .occupied_count = static_cast<std::int32_t>(locations.size()),
-            });
-        }
-        std::ranges::sort(candidates);
-        return candidates;
-    }
-
-    bool EvictParent(const BlockPool& pool, std::int32_t lcm_block_id) {
-        if (pool.BoundGroup(lcm_block_id) != group_id_ || !ParentIsFullyEvictable(pool, lcm_block_id)) {
-            return false;
-        }
-        CacheIndex* cache = findCacheIndex(pool);
-        _assert(cache != nullptr, "fully evictable parent must have a pool cache");
-        std::vector<CacheEntryIterator> entries;
-        for (CacheBlockLocation location : pool.OccupiedLocations(lcm_block_id)) {
-            CacheEntryIterator entry = findEntry(*cache, location);
-            _assert(entry != cache->entries_by_recency.end(),
-                    "fully evictable parent must have one entry per occupied child");
-            entries.push_back(entry);
-        }
-        for (CacheEntryIterator entry : entries) {
-            eraseEntry(*cache, entry);
-        }
-        _assert(pool.BoundGroup(lcm_block_id) == std::nullopt, "evicting every child must unbind the parent");
-        return true;
     }
 
     virtual void ReclaimExpired(BlockPool& /*pool*/, BlockTable& /*table*/, std::int32_t /*num_computed_tokens*/) {}
@@ -428,8 +340,8 @@ public:
                                              bool /*count_uncached*/) const {
         return 0;
     }
-    virtual std::vector<CacheBlockLocation> ReclaimableBlockLocationsAt(
-        const BlockTable& /*table*/, std::int32_t /*num_computed_tokens*/) const {
+    virtual std::vector<CacheBlockLocation> ReclaimableBlockLocationsAt(const BlockTable& /*table*/,
+                                                                        std::int32_t /*num_computed_tokens*/) const {
         return {};
     }
 
@@ -448,13 +360,13 @@ public:
     }
 
 protected:
-    bool ContainsCachedBlock(const CacheBlockRef& block) const {
-        if (!block) {
+    bool ContainsCachedBlock(const CacheBlockRef& block_ref) const {
+        if (!block_ref) {
             return false;
         }
-        return std::ranges::any_of(cache_indices_, [&](const auto& item) {
-            auto entry = item.second.reverse_index.find(block->Location());
-            return entry != item.second.reverse_index.end() && entry->second->block == block;
+        return std::ranges::any_of(cache_entries_by_pool_, [&](const auto& item) {
+            auto index_it = item.second.by_location.find(block_ref->Location());
+            return index_it != item.second.by_location.end() && index_it->second->block_ref == block_ref;
         });
     }
 
@@ -463,50 +375,52 @@ protected:
     GroupId group_id_;
 
 private:
-    CacheIndex& cacheIndex(const BlockPool& pool) { return cache_indices_.try_emplace(&pool).first->second; }
-    CacheIndex* findCacheIndex(const BlockPool& pool) {
-        auto it = cache_indices_.find(&pool);
-        return it == cache_indices_.end() ? nullptr : &it->second;
+    CacheEntries& cacheEntries(const BlockPool& pool) {
+        return cache_entries_by_pool_.try_emplace(&pool).first->second;
     }
-    const CacheIndex* findCacheIndex(const BlockPool& pool) const {
-        auto it = cache_indices_.find(&pool);
-        return it == cache_indices_.end() ? nullptr : &it->second;
+    CacheEntries* findCacheEntries(const BlockPool& pool) {
+        auto it = cache_entries_by_pool_.find(&pool);
+        return it == cache_entries_by_pool_.end() ? nullptr : &it->second;
+    }
+    const CacheEntries* findCacheEntries(const BlockPool& pool) const {
+        auto it = cache_entries_by_pool_.find(&pool);
+        return it == cache_entries_by_pool_.end() ? nullptr : &it->second;
     }
     void validateKey(const CacheKey& key) const {
         _assert(key.group_id == group_id_, "cache key group does not match manager");
         _assert(!key.content_hash.empty(), "cache key content hash must not be empty");
     }
-    CacheEntryIterator findEntry(CacheIndex& cache, const CacheKey& key) {
+    CacheEntryIterator findEntry(CacheEntries& cache_index, const CacheKey& key) {
         validateKey(key);
-        auto entry = cache.prefix_index.find(key);
-        return entry == cache.prefix_index.end() ? cache.entries_by_recency.end() : entry->second;
+        auto index_it = cache_index.by_key.find(key);
+        return index_it == cache_index.by_key.end() ? cache_index.lru.end() : index_it->second;
     }
-    CacheEntryIterator findEntry(CacheIndex& cache, CacheBlockLocation location) {
-        auto entry = cache.reverse_index.find(location);
-        return entry == cache.reverse_index.end() ? cache.entries_by_recency.end() : entry->second;
+    CacheEntryIterator findEntry(CacheEntries& cache_index, CacheBlockLocation location) {
+        auto index_it = cache_index.by_location.find(location);
+        return index_it == cache_index.by_location.end() ? cache_index.lru.end() : index_it->second;
     }
-    ConstCacheEntryIterator findEntry(const CacheIndex& cache, const CacheKey& key) const {
+    ConstCacheEntryIterator findEntry(const CacheEntries& cache_index, const CacheKey& key) const {
         validateKey(key);
-        auto entry = cache.prefix_index.find(key);
-        return entry == cache.prefix_index.end() ? cache.entries_by_recency.end() : entry->second;
+        auto index_it = cache_index.by_key.find(key);
+        return index_it == cache_index.by_key.end() ? cache_index.lru.end() : index_it->second;
     }
-    ConstCacheEntryIterator findEntry(const CacheIndex& cache, CacheBlockLocation location) const {
-        auto entry = cache.reverse_index.find(location);
-        return entry == cache.reverse_index.end() ? cache.entries_by_recency.end() : entry->second;
+    ConstCacheEntryIterator findEntry(const CacheEntries& cache_index, CacheBlockLocation location) const {
+        auto index_it = cache_index.by_location.find(location);
+        return index_it == cache_index.by_location.end() ? cache_index.lru.end() : index_it->second;
     }
-    void eraseEntry(CacheIndex& cache, CacheEntryIterator entry) {
-        cache.prefix_index.erase(entry->key);
-        cache.reverse_index.erase(entry->block->Location());
-        cache.entries_by_recency.erase(entry);
+    void eraseEntry(CacheEntries& cache_index, CacheEntryIterator entry_it) {
+        cache_index.by_key.erase(entry_it->key);
+        cache_index.by_location.erase(entry_it->block_ref->Location());
+        cache_index.lru.erase(entry_it);
     }
-    void touch(CacheIndex& cache, CacheEntryIterator entry, std::uint64_t& next_recency) {
-        entry->last_access = ++next_recency;
-        cache.entries_by_recency.splice(cache.entries_by_recency.end(), cache.entries_by_recency, entry);
+    void touch(CacheEntries& cache_index, CacheEntryIterator entry_it, std::uint64_t& next_recency) {
+        entry_it->last_access = ++next_recency;
+        cache_index.lru.splice(cache_index.lru.end(), cache_index.lru, entry_it);
     }
 
     // Indices are pool-scoped because the same Manager can serve device and
     // host tiers. Every referenced BlockPool must outlive this Manager.
-    std::unordered_map<const BlockPool*, CacheIndex> cache_indices_;
+    std::unordered_map<const BlockPool*, CacheEntries> cache_entries_by_pool_;
 };
 
 }  // namespace tokenspeed

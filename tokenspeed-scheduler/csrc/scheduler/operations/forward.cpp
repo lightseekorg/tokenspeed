@@ -121,33 +121,22 @@ std::vector<GroupDemand> makeGroupDemands(std::vector<BlockTable>& tables, Group
     return demands;
 }
 
-fsm::HashChain makeHashChain(const std::vector<std::string>& hashes) {
+fsm::HashChain makeHashChain(std::span<const std::string> hashes) {
     return fsm::HashChain{
         .num_hashed_pages = static_cast<std::int32_t>(hashes.size()),
         .last_hash = hashes.empty() ? std::string{} : hashes.back(),
     };
 }
 
-struct HashBatch {
-    std::int32_t begin_page{0};
-    std::vector<std::string> hashes;
-};
-
-HashBatch advanceHashChain(fsm::HashChain& chain,
-                           const std::vector<std::span<const std::int32_t>>& paged,
-                           std::int32_t filled_pages) {
+std::vector<std::string> advanceHashChain(fsm::HashChain& chain,
+                                          const std::vector<std::span<const std::int32_t>>& paged,
+                                          std::int32_t filled_pages) {
     _assert(filled_pages > chain.num_hashed_pages, "caller must pre-check hash-chain progress");
-    _assert(filled_pages <= static_cast<std::int32_t>(paged.size()),
-            "flat decode hashing exceeds the container's full pages");
-    const std::vector<std::span<const std::int32_t>> fresh(
-        paged.begin() + chain.num_hashed_pages, paged.begin() + filled_pages);
-    HashBatch batch{
-        .begin_page = chain.num_hashed_pages,
-        .hashes = ComputePagedHashes(fresh, chain.last_hash),
-    };
+    std::vector<std::string> hashes =
+        AdvancePagedHashes(paged, chain.num_hashed_pages, chain.last_hash, filled_pages);
     chain.num_hashed_pages = filled_pages;
-    chain.last_hash = batch.hashes.back();
-    return batch;
+    chain.last_hash = hashes.back();
+    return hashes;
 }
 
 bool canConsumeAvailable(const KvCacheCoordinator& coordinator, std::span<const BlockTable> tables,
@@ -195,6 +184,9 @@ Scheduler::FlatAdmissionMatch Scheduler::matchFlatPrefixAtAdmission(Request* req
     const std::vector<std::string> flat_hashes = ComputePagedHashes(paged_tokens, "");
     FlatAdmissionMatch match;
     match.probe = coordinator_.ProbePrefix(flat_hashes);
+    const std::int32_t hit_pages =
+        std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens) / cache_block_tokens;
+    match.hash_chain = makeHashChain(std::span(flat_hashes).first(static_cast<std::size_t>(hit_pages)));
     // Boundaries are in tokens; extension offsets are in logical CacheBlocks.
     const std::int32_t ext_pages =
         std::max(match.probe.host.num_common_tokens - match.probe.device.num_common_tokens, 0) / cache_block_tokens;
@@ -264,12 +256,12 @@ void Scheduler::resolveFlatStarvation(const std::vector<Request*>& candidates, b
 
 std::optional<KvCacheCoordinator::AdmissionResult> Scheduler::flatAdmit(
     KvCacheCoordinator::PrefixProbe&& prefix, std::span<const GroupDemand> demands) {
-    auto plan = coordinator_.ProbeAdmission(std::move(prefix), demands);
-    if (!plan) {
+    std::optional<KvCacheCoordinator::AdmissionResult> result =
+        coordinator_.Admit(std::move(prefix), demands);
+    if (!result) {
         flat_no_lcm_placement_ = true;
-        return std::nullopt;
     }
-    return coordinator_.Acquire(std::move(*plan));
+    return result;
 }
 
 std::optional<KvCacheCoordinator::AdmissionResult> Scheduler::flatAdmit(
@@ -405,6 +397,7 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         &coordinator_,
         std::move(flat_tables),
         flat_hit_tokens,
+        std::move(flat_match.hash_chain),
         std::move(flat_admission.load_pairs),
 #endif
     };
@@ -446,15 +439,21 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
 #if TOKENSPEED_FLAT_KVCACHE
     PrefillInfo previous = request->GetPrefillInfo();
     const std::int32_t flat_num_computed = previous.already_scheduled_len + previous.extend_len;
-    const std::vector<std::string> flat_hashes =
-        FlatWindowPageHashes(request->GetFullPagedTokens(false), coordinator_.CacheBlockTokens(),
-                             previous.already_scheduled_len, previous.extend_len);
+    fsm::HashChain flat_hash_chain = request->FlatHashChain();
+    const std::int32_t completed_first_page_slot = flat_hash_chain.num_hashed_pages;
+    std::vector<std::string> completed_page_hashes;
+    const std::int32_t filled_pages = flat_num_computed / coordinator_.CacheBlockTokens();
+    if (filled_pages > flat_hash_chain.num_hashed_pages) {
+        completed_page_hashes =
+            advanceHashChain(flat_hash_chain, request->GetFullPagedTokens(false), filled_pages);
+    }
     std::vector<BlockTable>& flat_tables = request->FlatBlockTablesRef();
     std::vector<GroupDemand> flat_demands = makeGroupDemands(
         flat_tables,
         GroupDemand{
             .num_tokens = tokens_this_round,
-            .content_hashes = flat_hashes,
+            .completed_page_hashes = completed_page_hashes,
+            .completed_first_page_slot = completed_first_page_slot,
             .num_computed_tokens = flat_num_computed,
             .reserve_tokens = flat_decode_reserve,
         });
@@ -464,7 +463,12 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
 #endif
 
     return fsm::SchedulePrefillEvent{tokens_this_round, reserve_num_tokens_in_next_schedule_event,
-                                     hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr};
+                                     hybrid_prefix_cache_ ? &*hybrid_prefix_cache_ : nullptr
+#if TOKENSPEED_FLAT_KVCACHE
+                                     ,
+                                     std::move(flat_hash_chain)
+#endif
+    };
 }
 
 std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* request,
@@ -502,47 +506,35 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(Request* reque
 #if TOKENSPEED_FLAT_KVCACHE
     std::vector<BlockTable>& flat_tables = request->FlatBlockTablesRef();
     const std::int32_t reserve_tokens = request->GetReserveNumTokensInNextScheduleEvent();
-    fsm::HashChain flat_hash_chain;
+    fsm::HashChain flat_hash_chain = request->FlatHashChain();
+    std::int32_t num_computed_tokens;
     if (request->Is<fsm::PrefillDone>()) {
         PrefillInfo previous = request->GetPrefillInfo();
-        const std::int32_t num_computed_tokens = previous.already_scheduled_len + previous.extend_len;
-        const std::vector<std::string> hashes =
-            FlatWindowPageHashes(request->GetFullPagedTokens(false), coordinator_.CacheBlockTokens(),
-                                 previous.already_scheduled_len, previous.extend_len);
-        flat_hash_chain = makeHashChain(hashes);
+        num_computed_tokens = previous.already_scheduled_len + previous.extend_len;
+    } else {
+        num_computed_tokens = request->TokenSize() - config_.decode_input_tokens;
+    }
+    const std::int32_t completed_first_page_slot = flat_hash_chain.num_hashed_pages;
+    std::vector<std::string> completed_page_hashes;
+    const std::int32_t filled_pages = num_computed_tokens / coordinator_.CacheBlockTokens();
+    if (filled_pages > flat_hash_chain.num_hashed_pages) {
+        completed_page_hashes =
+            advanceHashChain(flat_hash_chain, request->GetFullPagedTokens(false), filled_pages);
+    }
+    if (completed_page_hashes.empty() &&
+        canConsumeAvailable(coordinator_, flat_tables, reserve_tokens, num_computed_tokens)) {
+        coordinator_.ConsumeAvailable(flat_tables, reserve_tokens);
+    } else {
         std::vector<GroupDemand> demands = makeGroupDemands(
             flat_tables,
             GroupDemand{
                 .num_tokens = reserve_tokens,
-                .content_hashes = hashes,
+                .completed_page_hashes = completed_page_hashes,
+                .completed_first_page_slot = completed_first_page_slot,
                 .num_computed_tokens = num_computed_tokens,
             });
         if (!flatAdmit(demands)) {
             return {};
-        }
-    } else {
-        const std::int32_t num_computed_tokens = request->TokenSize() - config_.decode_input_tokens;
-        flat_hash_chain = request->FlatHashChain();
-        HashBatch batch{.begin_page = flat_hash_chain.num_hashed_pages};
-        const std::int32_t filled_pages = num_computed_tokens / coordinator_.CacheBlockTokens();
-        if (filled_pages > flat_hash_chain.num_hashed_pages) {
-            batch = advanceHashChain(flat_hash_chain, request->GetFullPagedTokens(false), filled_pages);
-        }
-        if (batch.hashes.empty() &&
-            canConsumeAvailable(coordinator_, flat_tables, reserve_tokens, num_computed_tokens)) {
-            coordinator_.ConsumeAvailable(flat_tables, reserve_tokens);
-        } else {
-            std::vector<GroupDemand> demands = makeGroupDemands(
-                flat_tables,
-                GroupDemand{
-                    .num_tokens = reserve_tokens,
-                    .content_hashes = batch.hashes,
-                    .first_page_slot = batch.begin_page,
-                    .num_computed_tokens = num_computed_tokens,
-                });
-            if (!flatAdmit(demands)) {
-                return {};
-            }
         }
     }
 #endif

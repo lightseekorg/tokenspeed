@@ -41,7 +41,7 @@ public:
     KvCacheManager& Manager() { return *manager_; }
     const KvCacheManager& Manager() const { return *manager_; }
     const KvCacheSpec& Spec() const { return spec_; }
-    GroupId GroupId() const { return manager_->GroupIdValue(); }
+    GroupId Id() const { return manager_->Id(); }
 
 private:
     KvCacheSpec spec_;

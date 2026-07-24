@@ -89,7 +89,7 @@ public:
     // Empty or fully evictable LCM parents; capacity metrics remain approximate for K_g > 1.
     std::int32_t FlatPoolFreeBlocks() const { return coordinator_.NumAvailableLcmBlocks(); }
     std::int32_t FlatHostPoolCachedBlocks() const { return coordinator_.NumHostCachedBlocks(); }
-    std::int32_t FlatHostPoolFreeBlocks() const { return flat_host_pool_.NumFreeBlocks(); }
+    std::int32_t FlatHostPoolFreeBlocks() const { return flat_host_pool_.NumEmptyLcmBlocks(); }
     std::int32_t FlatHostPoolPinnedBlocks() const { return coordinator_.NumPinnedHostCachedBlocks(); }
 #endif
 
@@ -129,15 +129,16 @@ private:
     std::optional<fsm::ScheduleRetractEvent> scheduleRetract(Request* request);
 
 #if TOKENSPEED_FLAT_KVCACHE
-    // One hash pass at admission: non-owning device/host probes plus the hashes
-    // retained for acquisition after every admission check succeeds.
+    // One hash pass before scheduling: non-owning device/host probes plus the
+    // hashes retained for Admit after every non-Flat gate succeeds.
     struct FlatAdmissionMatch {
         KvCacheCoordinator::PrefixProbe probe;
         std::vector<std::string> ext_hashes;
+        fsm::HashChain hash_chain;
     };
     FlatAdmissionMatch matchFlatPrefixAtAdmission(Request* request);
-    std::optional<KvCacheCoordinator::AdmissionResult> flatAdmit(
-        KvCacheCoordinator::PrefixProbe&& prefix, std::span<const GroupDemand> demands);
+    std::optional<KvCacheCoordinator::AdmissionResult> flatAdmit(KvCacheCoordinator::PrefixProbe&& prefix,
+                                                                 std::span<const GroupDemand> demands);
     std::optional<KvCacheCoordinator::AdmissionResult> flatAdmit(std::span<const GroupDemand> demands);
     bool flatPoolWedged(const std::vector<Request*>& candidates) const;
     void resolveFlatStarvation(const std::vector<Request*>& candidates, bool made_progress);
@@ -219,8 +220,8 @@ private:
 
     struct FlatStoreTicket {
         CacheKey key;
-        CacheBlockRef device_block;  // source page, pinned under the D2H copy
-        CacheBlockRef host_block;    // destination page, unhashed until WriteBackDone publishes it
+        CacheBlockRef device_block_ref;  // source page, pinned under the D2H copy
+        CacheBlockRef host_block_ref;    // destination page, unhashed until WriteBackDone publishes it
     };
     // In-flight D2H stores. The host pool is transaction-blind like the device pool, so the
     // key-dedupe index lives here, paired with the op ledger: Add/Retire are the only mutation
@@ -228,8 +229,8 @@ private:
     class FlatStoreLedger {
     public:
         void Add(cache_op_id id, std::vector<FlatStoreTicket> tickets) {
-            for (const FlatStoreTicket& t : tickets) {
-                keys_.insert(t.key);
+            for (const FlatStoreTicket& ticket : tickets) {
+                keys_.insert(ticket.key);
             }
             const bool inserted = ops_.emplace(id, std::move(tickets)).second;
             _assert(inserted, "duplicate flat store op id");
@@ -240,8 +241,8 @@ private:
             if (it == ops_.end()) {
                 return {};
             }
-            for (const FlatStoreTicket& t : it->second) {
-                keys_.erase(t.key);
+            for (const FlatStoreTicket& ticket : it->second) {
+                keys_.erase(ticket.key);
             }
             std::vector<FlatStoreTicket> tickets = std::move(it->second);
             ops_.erase(it);

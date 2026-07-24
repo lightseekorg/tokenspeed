@@ -61,25 +61,12 @@ public:
     struct PrefixProbe {
         struct Tier {
             std::int32_t num_common_tokens{0};
-            std::vector<tokenspeed::PrefixProbe> per_group;
+            std::vector<GroupPrefixProbe> per_group;
         };
 
         std::vector<std::vector<CacheKey>> group_keys;
         Tier device;
         Tier host;
-    };
-    struct AdmissionPlan {
-        struct Group {
-            // Borrows GroupDemand::table and content_hashes from the caller.
-            // The plan must be acquired before either backing object changes.
-            GroupDemand demand;
-            std::vector<CacheBlockLocation> placements;
-            std::int32_t host_placement_count{0};
-        };
-
-        PrefixProbe prefix;
-        std::vector<Group> per_group;
-        std::vector<std::pair<GroupId, CacheBlockLocation>> victims;
     };
     struct AdmissionResult {
         std::int32_t device_prefix_tokens{0};
@@ -87,11 +74,13 @@ public:
         std::vector<BlockTransfer> load_pairs;
     };
 
-    // ProbePrefix and ProbeAdmission are read-only. Cache ownership, LRU and
-    // placement change only in Acquire after every independent gate succeeds.
+    // ProbePrefix is read-only. Flat cache state must not change before its
+    // result is passed to Admit. Admit consumes the probe even when admission
+    // fails. It returns nullopt before committing when capacity is unavailable;
+    // once commit starts, an internal plan/pool mismatch is fatal because
+    // partial commit is not rolled back.
     PrefixProbe ProbePrefix(std::span<const std::string> content_hashes) const;
-    std::optional<AdmissionPlan> ProbeAdmission(PrefixProbe&& prefix, std::span<const GroupDemand> demands) const;
-    AdmissionResult Acquire(AdmissionPlan&& plan);
+    std::optional<AdmissionResult> Admit(PrefixProbe&& prefix, std::span<const GroupDemand> demands);
 
     // Single home of the gate-side page math.
     std::int32_t BlocksNeededFor(std::span<const BlockTable> tables, std::int32_t num_tokens) const;
@@ -110,7 +99,7 @@ public:
 
     struct StoreCandidate {
         CacheKey key;
-        CacheBlockRef block;  // pinned until WriteBackDone or a drain-time drop releases the ref
+        CacheBlockRef block_ref;  // pinned until WriteBackDone or a drain-time drop releases the ref
     };
     std::vector<StoreCandidate> TakePendingStores() { return std::exchange(pending_stores_, {}); }
     // Collection/pinning follows host-tier presence, so the slide credit flips count_uncached on this.
@@ -119,7 +108,7 @@ public:
     bool IsHostCachedBlock(CacheBlockLocation location) const;
     std::int32_t NumHostCachedBlocks() const;
     std::int32_t NumPinnedHostCachedBlocks() const;
-    void CacheHostBlock(CacheBlockRef& block, const CacheKey& key);
+    void CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& key);
 
 private:
     friend struct KvCacheCoordinatorTestAccess;

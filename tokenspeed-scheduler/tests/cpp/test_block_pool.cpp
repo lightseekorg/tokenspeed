@@ -23,6 +23,7 @@
 #include <memory>
 #include <new>
 #include <optional>
+#include <stdexcept>
 
 #include <spdlog/sinks/stdout_color_sinks.h>
 
@@ -38,8 +39,8 @@ static_assert(!HasCacheIndex<BlockPool>);
 
 TEST(BlockPoolTest, ConstructsExactlyRequestedLcmBlocks) {
     BlockPool pool(8);
-    EXPECT_EQ(pool.TotalBlocks(), 8);
-    EXPECT_EQ(pool.NumFreeBlocks(), 8);
+    EXPECT_EQ(pool.NumLcmBlocks(), 8);
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 8);
 }
 
 TEST(BlockPoolTest, DestroyWithLiveReferenceReportsFatalInvariant) {
@@ -47,7 +48,7 @@ TEST(BlockPoolTest, DestroyWithLiveReferenceReportsFatalInvariant) {
         {
             spdlog::set_default_logger(spdlog::stderr_color_mt("fatal-check-test"));
             auto pool = std::make_unique<BlockPool>(1);
-            CacheBlockRef ref = pool->AcquireBlock();
+            CacheBlockRef ref = pool->AcquireBlock(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1);
             pool.reset();
         },
         "BlockPool destroyed with live block references");
@@ -55,13 +56,13 @@ TEST(BlockPoolTest, DestroyWithLiveReferenceReportsFatalInvariant) {
 
 TEST(BlockPoolTest, KOneBatchAcquireIsAllOrNothing) {
     BlockPool pool(3);
-    auto blocks = pool.AcquireBlocks(4);
+    auto blocks = pool.AcquireBlocks(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1, /*num=*/4);
     EXPECT_TRUE(blocks.empty());
     EXPECT_EQ(pool.NumOccupiedSlots(), 0);
 
-    blocks = pool.AcquireBlocks(3);
+    blocks = pool.AcquireBlocks(/*group_id=*/0, /*cache_blocks_per_lcm_block=*/1, /*num=*/3);
     EXPECT_EQ(blocks.size(), 3u);
-    EXPECT_EQ(pool.NumFreeBlocks(), 0);
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 0);
 }
 
 TEST(BlockPoolLcmPlacementTest, EmptyParentBindsToGroupOnFirstChild) {
@@ -72,6 +73,13 @@ TEST(BlockPoolLcmPlacementTest, EmptyParentBindsToGroupOnFirstChild) {
     EXPECT_EQ(first->Location(), (CacheBlockLocation{.lcm_block_id = 1, .slot_index = 0}));
     EXPECT_EQ(pool.BoundGroup(1), std::optional<GroupId>{7});
     EXPECT_EQ(pool.OccupiedCount(1), 1);
+}
+
+TEST(BlockPoolLcmPlacementTest, RejectsPackingChangeWhileParentIsOccupied) {
+    BlockPool pool(1);
+    CacheBlockRef existing = pool.AcquireBlock(/*group_id=*/7, /*cache_blocks_per_lcm_block=*/2);
+
+    EXPECT_THROW((void)pool.AcquireBlock(/*group_id=*/7, /*cache_blocks_per_lcm_block=*/4), std::runtime_error);
 }
 
 TEST(BlockPoolLcmPlacementTest, NormalCapacityShortfallDoesNotMutatePartialParent) {
@@ -112,28 +120,25 @@ TEST(BlockPoolLcmPlacementTest, ReleasedParentsRestoreBatchCapacity) {
     std::vector<CacheBlockRef> reused = pool.AcquireBlocks(/*group_id=*/2, /*cache_blocks_per_lcm_block=*/1, /*num=*/2);
 
     EXPECT_EQ(reused.size(), 2u);
-    EXPECT_EQ(pool.NumFreeBlocks(), 0);
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 0);
 }
 
-TEST(BlockPoolLcmPlacementTest, ExactAllocationRemovesAnyFreeParentWithoutDisturbingTheRest) {
+TEST(BlockPoolLcmPlacementTest, ReleasedParentsAreReusedInReleaseOrder) {
     BlockPool pool(4);
-    std::vector<CacheBlockRef> blocks =
-        pool.AcquireBlocks(/*group_id=*/1, /*cache_blocks_per_lcm_block=*/1, /*num=*/4);
+    std::vector<CacheBlockRef> blocks = pool.AcquireBlocks(/*group_id=*/1, /*cache_blocks_per_lcm_block=*/1, /*num=*/4);
     ASSERT_EQ(blocks.size(), 4u);
     const CacheBlockLocation first_released = blocks[0]->Location();
     const CacheBlockLocation second_released = blocks[2]->Location();
     blocks[0].reset();
     blocks[2].reset();
 
-    std::vector<CacheBlockRef> exact =
-        pool.AcquireBlocksAt(/*group_id=*/2, /*cache_blocks_per_lcm_block=*/1,
-                             std::span<const CacheBlockLocation>{&first_released, 1});
-    ASSERT_EQ(exact.size(), 1u);
-    EXPECT_EQ(exact[0]->Location(), first_released);
+    CacheBlockRef first_reused = pool.AcquireBlock(/*group_id=*/2, /*cache_blocks_per_lcm_block=*/1);
+    CacheBlockRef second_reused = pool.AcquireBlock(/*group_id=*/2, /*cache_blocks_per_lcm_block=*/1);
 
-    CacheBlockRef remaining = pool.AcquireBlock(/*group_id=*/2, /*cache_blocks_per_lcm_block=*/1);
-    ASSERT_TRUE(remaining);
-    EXPECT_EQ(remaining->Location(), second_released);
+    ASSERT_TRUE(first_reused);
+    ASSERT_TRUE(second_reused);
+    EXPECT_EQ(first_reused->Location(), first_released);
+    EXPECT_EQ(second_reused->Location(), second_released);
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), 0);
 }
 
@@ -193,7 +198,7 @@ TEST(BlockPoolLcmPlacementTest, LastReleaseImmediatelyClearsParentBinding) {
     child.reset();
 
     EXPECT_EQ(pool.BoundGroup(1), std::nullopt);
-    EXPECT_EQ(pool.NumFreeBlocks(), 1);
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 1);
 }
 
 }  // namespace

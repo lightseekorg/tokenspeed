@@ -50,11 +50,7 @@ inline std::optional<KvCacheCoordinator::AdmissionResult> AdmitForTest(
         prototype.table = &table;
         demands.push_back(prototype);
     }
-    auto plan = coordinator.ProbeAdmission(std::move(prefix), demands);
-    if (!plan) {
-        return std::nullopt;
-    }
-    return coordinator.Acquire(std::move(*plan));
+    return coordinator.Admit(std::move(prefix), demands);
 }
 
 inline std::optional<KvCacheCoordinator::AdmissionResult> AdmitForTest(

@@ -41,6 +41,15 @@
 
 namespace tokenspeed::fsm {
 
+#if TOKENSPEED_FLAT_KVCACHE
+// Rolling logical-CacheBlock hash chain. Pages [0, num_hashed_pages) are
+// registered and last_hash seeds the next increment.
+struct HashChain {
+    std::int32_t num_hashed_pages{0};
+    std::string last_hash;
+};
+#endif
+
 inline std::vector<std::int32_t> ComputeShiftedInputIds(const TokenContainer* token_container,
                                                         TokenContainer::Window window) {
     const std::int32_t shifted_start = window.begin + 1;
@@ -174,6 +183,12 @@ struct ForwardState : public BaseState {
     std::unique_ptr<ReqPoolIndex> TakeReqPoolIndex() && { return std::move(req_pool_index_); }
     std::int32_t GetReqPoolIndex() const { return req_pool_index_ ? req_pool_index_->slot_ : -1; }
 
+#if TOKENSPEED_FLAT_KVCACHE
+    HashChain TakeHashChain() && { return std::move(hash_chain_); }
+    void SetHashChain(HashChain chain) { hash_chain_ = std::move(chain); }
+    const HashChain& HashChainValue() const { return hash_chain_; }
+#endif
+
     // Flat: group-0 sample of LCM parent ids. Operation construction uses this
     // only for row length/delta calculation, then replaces it with the owning
     // Manager's resolved kernel page ids. Cross-group accounting uses
@@ -213,6 +228,9 @@ struct ForwardState : public BaseState {
 
 private:
     std::unique_ptr<ReqPoolIndex> req_pool_index_;
+#if TOKENSPEED_FLAT_KVCACHE
+    HashChain hash_chain_{};
+#endif
 };
 
 struct Prefilling : public ForwardState {
@@ -291,15 +309,6 @@ private:
     std::int32_t reserve_num_tokens_in_next_schedule_event_{};
 };
 
-#if TOKENSPEED_FLAT_KVCACHE
-// Rolling logical-CacheBlock hash chain. Pages [0, num_hashed_pages) are
-// registered and last_hash seeds the next increment.
-struct HashChain {
-    std::int32_t num_hashed_pages{0};
-    std::string last_hash;
-};
-#endif
-
 struct Decoding : public ForwardState {
     Decoding(TokenContainer* token_container, std::int32_t page_size, std::unique_ptr<HostNodeRef>&& host_node_ref,
              std::unique_ptr<DeviceNodeRef>&& node_ref, std::unique_ptr<LocalKVAllocator>&& local_kv_allocator,
@@ -325,18 +334,9 @@ struct Decoding : public ForwardState {
 
     std::unique_ptr<HostNodeRef> TakeHostNodeRef() && { return std::move(host_node_ref_); }
 
-#if TOKENSPEED_FLAT_KVCACHE
-    HashChain TakeHashChain() && { return std::move(hash_chain_); }
-    void SetHashChain(HashChain chain) { hash_chain_ = std::move(chain); }
-    const HashChain& HashChainValue() const { return hash_chain_; }
-#endif
-
 private:
     std::unique_ptr<HostNodeRef> host_node_ref_{};  // pins host pages until the next state takes ownership
     std::int32_t reserve_num_tokens_in_next_schedule_event_{-1};
-#if TOKENSPEED_FLAT_KVCACHE
-    HashChain hash_chain_{};
-#endif
 };
 
 // Generation finished, host pages allocated, writeback op not yet generated.

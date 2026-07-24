@@ -210,9 +210,15 @@ public:
     }
 
     fsm::HashChain FlatHashChain() const {
-        const auto* state = std::get_if<fsm::Decoding>(&state_);
-        _assert(state != nullptr, "FlatHashChain requires Decoding state");
-        return state->HashChainValue();
+        return std::visit(Overloaded{
+            []<typename T>(const T& state) -> fsm::HashChain
+                requires(std::derived_from<T, fsm::ForwardState>)
+            { return state.HashChainValue(); },
+            [this](const auto&) -> fsm::HashChain {
+                throw std::logic_error("Request::FlatHashChain: expected a forward state; got state=" + StateName());
+            },
+            },
+            state_);
     }
 #endif
 

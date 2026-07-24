@@ -181,11 +181,13 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()
         PrefillDone done{token_container, state.GetPageSize(),  nullptr, nullptr, nullptr, std::move(req_pool_index),
                          window,          decode_input_tokens_, nullptr};
         done.SetBlockTables(std::move(flat_tables_));
+        done.SetHashChain(std::move(flat_hash_chain_));
         return done;
     }
     Prefilling prefilling{token_container, state.GetPageSize(),       nullptr, nullptr,
                           nullptr,         std::move(req_pool_index), window,  nullptr};
     prefilling.SetBlockTables(std::move(flat_tables_));
+    prefilling.SetHashChain(std::move(flat_hash_chain_));
     return prefilling;
 #else
     std::unique_ptr<HostNodeRef> host_node_ref{nullptr};
@@ -267,6 +269,7 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillEvent::operator()(Prefillin
                          reserve_num_tokens_in_next_schedule_event_,
                          nullptr};
         done.SetBlockTables(std::move(tables));
+        done.SetHashChain(std::move(flat_hash_chain_));
         return done;
     }
     Prefilling prefilling{state.GetTokenContainer(),
@@ -278,6 +281,7 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillEvent::operator()(Prefillin
                           window,
                           nullptr};
     prefilling.SetBlockTables(std::move(tables));
+    prefilling.SetHashChain(std::move(flat_hash_chain_));
     return prefilling;
 #else
     auto local_kv_allocator = std::move(state).TakeLocalKVAllocator();

@@ -28,7 +28,6 @@
 #include <utility>
 #include <vector>
 
-#include "cache/block_pool.h"
 #include "cache/cache_block_ref.h"
 #include "utils.h"
 
@@ -88,13 +87,14 @@ private:
     std::int32_t available_tokens_{0};
 };
 
-// Per-group token demand for one admission. The table remains owned by the
-// request; ProbeAdmission only reads it and Acquire appends to it.
+// Per-group input for one admission. completed_page_hashes publishes only the
+// full pages produced since the previous admission; num_tokens is the capacity
+// needed by the next step. The request retains ownership of table.
 struct GroupDemand {
     BlockTable* table{nullptr};
     std::int32_t num_tokens{0};
-    std::span<const std::string> content_hashes{};
-    std::int32_t first_page_slot{0};
+    std::span<const std::string> completed_page_hashes{};
+    std::int32_t completed_first_page_slot{0};
     std::int32_t num_computed_tokens{-1};
     std::int32_t reserve_tokens{0};
 };
@@ -104,8 +104,8 @@ struct GroupDemand {
 inline std::vector<std::int32_t> BlockTableLcmBlockIds(const BlockTable& table) {
     std::vector<std::int32_t> ids;
     ids.reserve(static_cast<std::size_t>(table.NumBlocks()));
-    for (const CacheBlockRef& block : table.Blocks()) {
-        ids.push_back(block ? block->Location().lcm_block_id : 0);
+    for (const CacheBlockRef& block_ref : table.Blocks()) {
+        ids.push_back(block_ref ? block_ref->Location().lcm_block_id : 0);
     }
     return ids;
 }
@@ -117,7 +117,7 @@ struct PrefixMatch {
 
 // Non-owning match shape. A nonzero slot is acquired only after the coordinator
 // converges every group to the final common boundary.
-struct PrefixProbe {
+struct GroupPrefixProbe {
     std::vector<std::uint8_t> hits{};
 };
 

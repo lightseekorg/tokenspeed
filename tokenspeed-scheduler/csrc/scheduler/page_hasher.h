@@ -118,8 +118,8 @@ inline std::string HashPage(std::span<const std::int32_t> tokens, const std::str
 }
 
 inline std::vector<std::string> ComputePagedHashes(
-    const std::vector<std::span<const std::int32_t>>& paged_tokens, const std::string& prior,
-    const std::vector<std::span<const std::string>>& extra_keys_per_page = {}) {
+    std::span<const std::span<const std::int32_t>> paged_tokens, const std::string& prior,
+    std::span<const std::span<const std::string>> extra_keys_per_page = {}) {
     std::vector<std::string> hashes;
     hashes.reserve(paged_tokens.size());
     std::string current_prior = prior;
@@ -133,17 +133,17 @@ inline std::vector<std::string> ComputePagedHashes(
     return hashes;
 }
 
-// Content hashes for the full pages covered by the processed window
-// [0, window_begin + window_size), truncating any tail page past the window.
-// paged_tokens holds the request's full pages (partial tail already excluded).
-inline std::vector<std::string> FlatWindowPageHashes(std::vector<std::span<const std::int32_t>> paged_tokens,
-                                                     std::int32_t page_size, std::int32_t window_begin,
-                                                     std::int32_t window_size) {
-    const std::int32_t end_of_window_pages = (window_begin + window_size) / page_size;
-    if (end_of_window_pages < static_cast<std::int32_t>(paged_tokens.size())) {
-        paged_tokens.resize(end_of_window_pages);
-    }
-    return ComputePagedHashes(paged_tokens, "");
+// Continues an existing hash chain and returns only [first_page, past_end_page).
+inline std::vector<std::string> AdvancePagedHashes(
+    std::span<const std::span<const std::int32_t>> paged_tokens, std::int32_t first_page, const std::string& prior,
+    std::int32_t past_end_page) {
+    _assert(first_page >= 0, "first_page must be >= 0");
+    _assert(past_end_page > first_page, "hash range must be non-empty");
+    _assert(past_end_page <= static_cast<std::int32_t>(paged_tokens.size()),
+            "hash range exceeds the available full pages");
+    return ComputePagedHashes(paged_tokens.subspan(static_cast<std::size_t>(first_page),
+                                                   static_cast<std::size_t>(past_end_page - first_page)),
+                              prior);
 }
 
 }  // namespace tokenspeed

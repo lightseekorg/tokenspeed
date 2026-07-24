@@ -197,14 +197,14 @@ void Scheduler::handleEvent(const cache::WriteBackDone& event) {
         // Publish-at-ack: hashing the host block makes it hittable; either way it returns to the
         // host free list (hash-intact = reusable, unhashed = plain recycling). Batched frees in
         // ticket order keep both pools' recycling order deterministic.
-        for (FlatStoreTicket& t : tickets) {
+        for (FlatStoreTicket& ticket : tickets) {
             if (event.success) {
-                coordinator_.CacheHostBlock(t.host_block, t.key);
+                coordinator_.CacheHostBlock(ticket.host_block_ref, ticket.key);
             }
         }
         for (auto it = tickets.rbegin(); it != tickets.rend(); ++it) {
-            it->device_block.reset();
-            it->host_block.reset();
+            it->device_block_ref.reset();
+            it->host_block_ref.reset();
         }
         return;
     }
