@@ -21,23 +21,28 @@
 """Shared flat KV-cache group machinery for attention backends.
 
 A flat-capable backend (``uses_flat_cache_groups = True``) receives one page
-table per cache group (``flat_block_tables: dict[group_id, [bs, max_pages]]``)
-instead of the radix single table, and must route every KV read AND write
-through the layer's own group (M-W1). This mixin holds the group-selection,
-write-location, and CUDA-graph per-group buffer machinery shared by the MHA
-and TRT-LLM backends; model/kernel-specific constraints (spec decode, DFLASH)
-stay in the backends.
+table plus one logical-page base vector per cache group
+(``flat_block_tables: dict[group_id, [bs, max_pages]]`` and
+``flat_block_table_base_offsets: dict[group_id, [bs]]``) instead of the radix
+single table, and must route every KV read AND write through the layer's own
+group (M-W1). This mixin holds the group-selection, write-location, and
+CUDA-graph per-group buffer machinery shared by the MHA and TRT-LLM backends;
+model/kernel-specific constraints (spec decode, DFLASH) stay in the backends.
 
-Table contract (canonical): rows are requests (padded rows carry the
-zero-init dummy page 0), column tails pad with -1 and are never read past
-``cache_seqlens``; SWA holes sit only at the window front and are written as
-the null page 0 by the scheduler export.
+Table contract (canonical): rows are requests; column ``j`` represents
+logical page ``base[row] + j``. Padded rows carry dummy page 0 and base 0,
+column tails pad with -1 and are never read past ``cache_seqlens``; SWA holes
+sit only at the window front and are written as the null page 0 by the
+scheduler export. Full-history tables remain backward-compatible by carrying
+an explicit all-zero base vector.
 """
 
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from dataclasses import replace
+from types import MappingProxyType
 
 import torch
 from tokenspeed_kernel.ops.kvcache.triton import (
@@ -45,6 +50,8 @@ from tokenspeed_kernel.ops.kvcache.triton import (
     flat_tables_unpack,
 )
 
+from tokenspeed.runtime.configs.paged_cache_spec import PagedCacheGroupSpec
+from tokenspeed.runtime.flat_cache_tables import validate_flat_table_base_offsets
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.common import ceil_div
 
@@ -56,7 +63,7 @@ class FlatCacheGroupsMixin:
 
     Host class requirements: ``self.device``, ``self.page_size``,
     ``self.max_num_pages``, ``self.forward_decode_metadata`` (with
-    ``page_tables``/``out_cache_locs`` fields), and calling
+    ``page_tables``/``block_table_base_offsets``/``out_cache_locs`` fields), and calling
     :meth:`_init_flat_graph_buffers` from ``init_cuda_graph_state``.
     """
 
@@ -67,8 +74,15 @@ class FlatCacheGroupsMixin:
     # Wrapper-owned (Inkling conv) groups: mixin skips their write-loc math and capture buffers
     flat_engine_owned_group_ids: frozenset[str] = frozenset()
 
-    # Per-group page size in tokens (hetero block sizes); groups absent here use self.page_size
-    flat_group_page_sizes: dict[str, int] = {}
+    # Frozen construction-time geometry. PagedCacheGroupSpec.block_size is the
+    # sole raw-token page-span authority; the backend never mirrors it into a
+    # second mutable page-size mapping.
+    flat_group_specs: Mapping[str, PagedCacheGroupSpec] = MappingProxyType({})
+
+    # Groups whose scheduler tables use absolute logical columns.  They retain
+    # main's one-launch stacked write-loc hot path.  Bounded/unknown layouts
+    # use the paired per-request base buffers below.
+    flat_absolute_group_ids: frozenset[str] = frozenset()
 
     # Draft decode-window lookback rows (Inkling MTP): armed by the conv
     # wrapper's configure_draft_lookback BEFORE graph init, so the lookback
@@ -166,6 +180,18 @@ class FlatCacheGroupsMixin:
             tables = {gid: table for gid, table in tables.items() if gid not in skip}
         return tables or None
 
+    def _shed_state_group_inputs(self, page_tables, block_table_base_offsets):
+        """Validate the paired ABI, then shed state-family entries together."""
+        validate_flat_table_base_offsets(
+            page_tables,
+            block_table_base_offsets,
+            where=f"{type(self).__name__} flat metadata",
+        )
+        return (
+            self._shed_state_groups(page_tables),
+            self._shed_state_groups(block_table_base_offsets),
+        )
+
     def _learn_flat_state_groups(self, paged_cache_group_specs) -> None:
         """Record the pool's family="state" group ids (see
         flat_state_group_ids) and per-group page sizes (heterogeneous block
@@ -176,14 +202,35 @@ class FlatCacheGroupsMixin:
             for spec in paged_cache_group_specs
             if spec.family == "state"
         )
-        self.flat_group_page_sizes = {
-            str(spec.group_id): int(spec.rows_per_page) * int(spec.entry_stride_tokens)
+        self.flat_group_specs = MappingProxyType(
+            {
+                str(spec.group_id): spec
+                for spec in paged_cache_group_specs
+                if spec.family != "state"
+            }
+        )
+        self.flat_absolute_group_ids = frozenset(
+            str(spec.group_id)
             for spec in paged_cache_group_specs
-            if spec.family != "state"
-        }
+            if spec.family != "state" and spec.table_layout == "absolute"
+        )
 
     def _group_page_size(self, gid: str) -> int:
-        return self.flat_group_page_sizes.get(gid, self.page_size)
+        if not self.flat_group_specs and not self.flat_state_group_ids:
+            # Radix never publishes flat group specs, even when model layers
+            # carry group labels. Once flat specs exist, however, every
+            # id must resolve through that immutable geometry view.
+            return self.page_size
+        spec = self.flat_group_specs.get(gid)
+        if spec is None:
+            raise RuntimeError(
+                f"flat group {gid!r} is absent from the backend cache specs: "
+                f"{sorted(self.flat_group_specs)}"
+            )
+        block_size = spec.block_size
+        if block_size is None:
+            raise RuntimeError(f"flat group {gid!r} has no canonical block_size")
+        return int(block_size)
 
     def _layer_page_size(self, layer) -> int:
         """Page size of the layer's cache group (uniform when unknown)."""
@@ -194,7 +241,12 @@ class FlatCacheGroupsMixin:
     # ------------------------------------------------------------------
 
     def _compute_flat_decode_out_cache_locs(
-        self, page_tables, seq_lens, page_size, num_tokens_per_req=1
+        self,
+        page_tables,
+        block_table_base_offsets,
+        seq_lens,
+        page_size,
+        num_tokens_per_req=1,
     ):
         """Per-group decode write locs, gathered from the group's own read
         table (M-W1). Plain decode writes one token per request at seq_len-1;
@@ -207,6 +259,7 @@ class FlatCacheGroupsMixin:
         granularity.
         """
         n = num_tokens_per_req
+        check_bounds = os.environ.get("TOKENSPEED_FLAT_DEBUG") == "1"
         if n == 1:
             pos = (seq_lens - 1).to(torch.int64)
         else:
@@ -218,16 +271,38 @@ class FlatCacheGroupsMixin:
             ps = self._group_page_size(gid) if gid else page_size
             page_idx = pos // ps
             off = (pos % ps).to(torch.int32)
+            bases = block_table_base_offsets[gid].to(torch.int64)
             if n == 1:
-                pages = table.gather(1, page_idx.unsqueeze(1)).squeeze(1)
+                local_page_idx = page_idx - bases
+                if check_bounds:
+                    torch._assert_async(
+                        (
+                            (local_page_idx >= 0) & (local_page_idx < table.shape[1])
+                        ).all(),
+                        f"flat decode logical page is outside group {gid!r}'s table",
+                    )
+                pages = table.gather(1, local_page_idx.unsqueeze(1)).squeeze(1)
             else:
-                pages = table.gather(1, page_idx.view(-1, n)).reshape(-1)
+                local_page_idx = page_idx.view(-1, n) - bases.unsqueeze(1)
+                if check_bounds:
+                    torch._assert_async(
+                        (
+                            (local_page_idx >= 0) & (local_page_idx < table.shape[1])
+                        ).all(),
+                        f"flat decode logical page is outside group {gid!r}'s table",
+                    )
+                pages = table.gather(1, local_page_idx).reshape(-1)
             # Mirror the graph-path kernel's clamp: -1 pads/holes route to dummy page 0.
             out[gid] = pages.clamp_min(0) * ps + off
         return out
 
     def _compute_flat_extend_out_cache_locs(
-        self, page_tables, extend_prefix_lens_cpu, extend_seq_lens_cpu, page_size
+        self,
+        page_tables,
+        block_table_base_offsets,
+        extend_prefix_lens_cpu,
+        extend_seq_lens_cpu,
+        page_size,
     ):
         """Per-group extend write locs: positions [prefix_len, seq_len) per
         request, flattened in q/k/v token order (cu_extend_seq_lens). Bounds
@@ -235,23 +310,28 @@ class FlatCacheGroupsMixin:
         TODO(flat-perf): batch the per-request loop via repeat_interleave.
         """
         device = next(iter(page_tables.values())).device
+        check_bounds = os.environ.get("TOKENSPEED_FLAT_DEBUG") == "1"
         prefix_lens = [int(x) for x in extend_prefix_lens_cpu.tolist()]
         extend_lens = [int(x) for x in extend_seq_lens_cpu.tolist()]
         out = {gid: [] for gid in page_tables}
         for i, (start, num_new) in enumerate(zip(prefix_lens, extend_lens)):
             pos = torch.arange(start, start + num_new, dtype=torch.int64, device=device)
             for gid, table in page_tables.items():
-                ps = self._group_page_size(gid)
-                max_col = (start + num_new - 1) // ps
-                if max_col >= table.shape[1]:
-                    raise RuntimeError(
-                        f"flat extend write locs out of table bounds: group "
-                        f"{gid!r} table {tuple(table.shape)} req={i} "
-                        f"prefix={start} new={num_new} page_size={ps} needs "
-                        f"col {max_col}"
+                ps = self._group_page_size(gid) if gid else page_size
+                page_idx = pos // ps
+                off = (pos % ps).to(torch.int32)
+                local_page_idx = page_idx - block_table_base_offsets[gid][i].to(
+                    torch.int64
+                )
+                if check_bounds:
+                    torch._assert_async(
+                        (
+                            (local_page_idx >= 0) & (local_page_idx < table.shape[1])
+                        ).all(),
+                        f"flat extend logical page is outside group {gid!r}'s table",
                     )
-                pages = table[i].gather(0, pos // ps)
-                out[gid].append(pages * ps + (pos % ps).to(torch.int32))
+                pages = table[i].gather(0, local_page_idx)
+                out[gid].append(pages * ps + off)
         return {
             gid: (
                 torch.cat(chunks)
@@ -268,36 +348,61 @@ class FlatCacheGroupsMixin:
         pass's KV writes cover its extra leading rows.
 
         Radix metadata (no flat locs) needs no swap: the drafter's caller
-        locs are live there. Returns False when the flat locs cannot be
-        provided (lookback disarmed, or a captured metadata without the
-        lookback loc stack), so the caller falls back to the plain window
-        pass. The next round's metadata init restores the plain locs.
+        locs are live there. Returns False when lookback is disarmed, so the
+        caller falls back to the plain window pass. Captured Flat metadata
+        without a complete static lookback stack is a contract error: it must
+        never fall through to the eager gather. The next round's metadata init
+        restores the plain locs.
         """
         md = self.forward_decode_metadata
-        if md is None or md.out_cache_locs is None:
+        if md is None:
+            return True
+        captured = getattr(self, "cuda_graph_decode_metadata", None) or {}
+        captured_md = captured.get(bs)
+        graph_backed = md is captured_md
+        if md.out_cache_locs is None:
+            if graph_backed:
+                raise RuntimeError(
+                    "flat CUDA graph metadata has no group-keyed write "
+                    "locations; refusing draft lookback capture"
+                )
             return True
         lookback = int(getattr(self, "flat_draft_lookback", 0) or 0)
         if lookback <= 0:
             return False
         spec_n = max(int(getattr(self, "spec_num_tokens", 1) or 1), 1)
         total = spec_n + lookback
-        captured = getattr(self, "cuda_graph_decode_metadata", None) or {}
-        if md is captured.get(bs):
-            if not self.cuda_graph_flat_lookback_locs:
-                return False
-            locs = {
-                gid: buf[: bs * total]
-                for gid, buf in self.cuda_graph_flat_lookback_locs.items()
-                if gid in md.out_cache_locs
+        if graph_backed:
+            buffers = getattr(self, "cuda_graph_flat_lookback_locs", None) or {}
+            need = bs * total
+            invalid = {
+                gid: None if gid not in buffers else int(buffers[gid].shape[0])
+                for gid in md.out_cache_locs
+                if gid not in buffers or buffers[gid].shape[0] < need
             }
+            if invalid:
+                raise RuntimeError(
+                    "flat CUDA graph metadata is missing its static lookback "
+                    f"locations for batch size {bs}: need_rows={need}, "
+                    f"available_rows={invalid}; refusing an eager page-table "
+                    "gather during graph capture"
+                )
+            locs = {gid: buffers[gid][:need] for gid in md.out_cache_locs}
         else:
             locs = self._compute_flat_decode_out_cache_locs(
                 md.page_tables,
+                md.block_table_base_offsets,
                 md.seq_lens,
                 self.page_size,
                 total,
             )
-        self.forward_decode_metadata = replace(md, out_cache_locs=locs)
+        if graph_backed:
+            # CUDA Graph replay keys provenance by the captured metadata
+            # object. Keep that object stable and only redirect its loc views
+            # to the persistent lookback buffers.
+            md.out_cache_locs = locs
+        else:
+            self.forward_decode_metadata = replace(md, out_cache_locs=locs)
         return True
 
     def _maybe_check_flat_write_locs(self, page_tables, out_cache_locs, page_size):
@@ -329,12 +434,12 @@ class FlatCacheGroupsMixin:
         the dict unconditionally for the stale-table guard.
 
         Attention-consumed groups get views into ONE stacked table/loc pair
-        ([G, max_bs, Wmax] / [G, max_bs * spec_num_tokens]) so the
-        replay-time write-loc math ALWAYS runs as a single fused triton
-        launch over all groups — the per-group python chains (~4 tiny
-        elementwise launches per group per step, the nsys inter-step band)
-        are gone, on the spec-verify path too."""
+        ([G, max_bs, Wmax] / [G, max_bs * spec_num_tokens]). Absolute-layout
+        groups share one fused replay-time loc launch. Bounded groups reuse
+        the same persistent stack but apply their per-request logical bases
+        through base-aware per-group launches."""
         self.cuda_graph_flat_page_tables: dict[str, torch.Tensor] = {}
+        self.cuda_graph_flat_block_table_base_offsets: dict[str, torch.Tensor] = {}
         self.cuda_graph_flat_out_cache_locs: dict[str, torch.Tensor] = {}
         self.cuda_graph_flat_lookback_locs: dict[str, torch.Tensor] = {}
         self._cuda_graph_max_bs = max_bs
@@ -344,15 +449,20 @@ class FlatCacheGroupsMixin:
         self._flat_group_widths = {}
         self._flat_stack_gids = []
         self._flat_att_group_count = 0
-        att_gids = sorted(
+        self._flat_fused_group_count = 0
+        self._flat_local_seq_lens = {}
+        raw_att_gids = {
             gid
-            for gid in self.flat_group_page_sizes
+            for gid in self.flat_group_specs
             if gid not in self.flat_state_group_ids
             and gid not in self.flat_engine_owned_group_ids
-        )
+        }
+        fused_gids = sorted(raw_att_gids & set(self.flat_absolute_group_ids))
+        base_aware_gids = sorted(raw_att_gids - set(fused_gids))
+        att_gids = fused_gids + base_aware_gids
         owned_gids = sorted(
             gid
-            for gid in self.flat_group_page_sizes
+            for gid in self.flat_group_specs
             if gid in self.flat_engine_owned_group_ids
         )
         gids = att_gids + owned_gids  # attention prefix, wrapper-owned tail
@@ -375,6 +485,7 @@ class FlatCacheGroupsMixin:
         g = len(gids)
         self._flat_stack_gids = gids
         self._flat_att_group_count = len(att_gids)
+        self._flat_fused_group_count = len(fused_gids)
         self._flat_tables_stack = torch.zeros(
             (g, max_bs, wmax), dtype=torch.int32, device=self.device
         )
@@ -411,22 +522,31 @@ class FlatCacheGroupsMixin:
                 i, :, : widths[gid]
             ]
             if i < len(att_gids):
+                self.cuda_graph_flat_block_table_base_offsets[gid] = torch.zeros(
+                    (max_bs,), dtype=torch.int32, device=self.device
+                )
                 self.cuda_graph_flat_out_cache_locs[gid] = self._flat_locs_stack[i]
+
+        self._flat_local_seq_lens = {
+            gid: torch.empty((max_bs,), dtype=torch.int32, device=self.device)
+            for gid in base_aware_gids
+        }
 
     def _flat_capture_group_views(
         self, bs: int, flat_cache_group_ids, tokens_per_req: int = 1
     ):
-        """Capture-time (page_tables, out_cache_locs) per-group views into the
+        """Capture-time (page_tables, bases, out_cache_locs) per-group views into the
         persistent buffers initialized by :meth:`_init_flat_graph_buffers`.
         Real tables only arrive at replay, which copies fresh data to these
         graph-recorded addresses.
         Verify (tokens_per_req = spec_num_tokens) keeps [bs]-row tables but
         records [bs*N] write-loc views (token-major, radix verify layout).
-        Returns (None, None) when only state groups (or none) are delivered.
+        Returns (None, None, None) when only state groups (or none) are delivered.
         """
         if not flat_cache_group_ids:
-            return None, None
+            return None, None, None
         page_tables = {}
+        block_table_base_offsets = {}
         out_cache_locs = {}
         for gid in flat_cache_group_ids:
             if gid in self.flat_state_group_ids:
@@ -440,11 +560,17 @@ class FlatCacheGroupsMixin:
                 # Replay write locs are ALWAYS the fused triton launch over
                 # the stacked buffers; a group outside the stack could never
                 # get its locs filled. Groups must be declared (via
-                # flat_group_page_sizes) before init_cuda_graph_state.
+                # flat_group_specs) before init_cuda_graph_state.
                 raise RuntimeError(
                     f"flat group {gid!r} is not in the stacked CUDA-graph "
                     f"buffers (stack: {self._flat_stack_gids}); declare every "
                     "capture-visible group's page size before graph init."
+                )
+            base_buf = self.cuda_graph_flat_block_table_base_offsets.get(gid)
+            if base_buf is None:
+                raise RuntimeError(
+                    f"flat group {gid!r} is missing its stacked CUDA-graph "
+                    "logical-base buffer"
                 )
             loc_buf = self.cuda_graph_flat_out_cache_locs.get(gid)
             need = self._cuda_graph_max_bs * tokens_per_req
@@ -458,11 +584,12 @@ class FlatCacheGroupsMixin:
                     f"spec_num_tokens={getattr(self, 'spec_num_tokens', 1)}."
                 )
             page_tables[gid] = buf[:bs, :]
+            block_table_base_offsets[gid] = base_buf[:bs]
             out_cache_locs[gid] = loc_buf[: bs * tokens_per_req]
         if not page_tables:
             # Only state groups delivered: nothing for this backend.
-            return None, None
-        return page_tables, out_cache_locs
+            return None, None, None
+        return page_tables, block_table_base_offsets, out_cache_locs
 
     def _flat_try_packed_unpack(self, bs: int, flat_block_tables) -> bool:
         """One-launch fill of the stacked graph tables from the bridge's
@@ -510,12 +637,19 @@ class FlatCacheGroupsMixin:
         )
         return True
 
-    def _flat_replay_stale_guard(self, bs: int, flat_block_tables) -> None:
+    def _flat_replay_stale_guard(
+        self, bs: int, flat_block_tables, flat_block_table_base_offsets
+    ) -> frozenset[str]:
         """Fail loudly instead of replaying over stale/zero page tables.
         bs == 0 may skip: col-0 buffer entries stay valid (never -1),
         outputs are discarded, and only unit tests reach it."""
+        validated_group_ids = validate_flat_table_base_offsets(
+            flat_block_tables,
+            flat_block_table_base_offsets,
+            where=f"{type(self).__name__} replay",
+        )
         if not self.cuda_graph_flat_page_tables or bs <= 0:
-            return
+            return validated_group_ids
         name = type(self).__name__
         if not flat_block_tables:
             raise RuntimeError(
@@ -525,17 +659,26 @@ class FlatCacheGroupsMixin:
                 f"but flat_block_tables is missing/empty at bs={bs}; the "
                 "captured graph would read stale page tables."
             )
-        missing = set(self.cuda_graph_flat_page_tables) - set(flat_block_tables)
-        if missing:
+        delivered = validated_group_ids - self.flat_state_group_ids
+        captured = self.cuda_graph_flat_page_tables.keys()
+        if delivered != captured:
             raise RuntimeError(
-                f"{name} replay: flat_block_tables at bs="
-                f"{bs} is missing captured groups {sorted(missing)} "
-                f"(delivered: {sorted(flat_block_tables)}); the captured "
-                "graph would read stale page tables for those groups."
+                f"{name} replay: captured/delivered history groups differ at "
+                f"bs={bs}: captured={sorted(captured)}, "
+                f"delivered={sorted(delivered)}; the captured graph would "
+                "read stale page tables."
             )
+        return validated_group_ids
 
     def _flat_replay_fill(
-        self, bs: int, flat_block_tables, seq_lens, tokens_per_req: int = 1
+        self,
+        bs: int,
+        flat_block_tables,
+        flat_block_table_base_offsets,
+        seq_lens,
+        tokens_per_req: int = 1,
+        *,
+        validated_group_ids: frozenset[str] | None = None,
     ) -> None:
         """Copy this replay's tables into the captured buffers and recompute
         the per-group write locs from the live seq_lens (tokens_per_req locs
@@ -556,6 +699,12 @@ class FlatCacheGroupsMixin:
                 f"{None if self._flat_locs_stack is None else tuple(self._flat_locs_stack.shape)}); "
                 "the stack is sized max_bs * spec_num_tokens at graph init "
                 "and there is no python fallback."
+            )
+        if validated_group_ids is None:
+            validate_flat_table_base_offsets(
+                flat_block_tables,
+                flat_block_table_base_offsets,
+                where=f"{type(self).__name__} replay fill",
             )
         self._flat_packed_unpack_ran = self._flat_try_packed_unpack(
             bs, flat_block_tables
@@ -581,23 +730,59 @@ class FlatCacheGroupsMixin:
                     # Dummy rows pad with 0 (the zero-init dummy page).
                     buf[rows:bs].fill_(0)
 
-        # One fused launch writes every group's locs into the stacked buffer the graphs read
-        flat_decode_locs(
-            self._flat_tables_stack[: self._flat_att_group_count],
-            self._flat_group_ps_tensor,
-            seq_lens[:bs],
-            self._flat_locs_stack,
-            bs,
-            tokens_per_req,
+        for gid in self.cuda_graph_flat_block_table_base_offsets:
+            src = flat_block_table_base_offsets[gid]
+            rows = min(src.shape[0], bs)
+            self.cuda_graph_flat_block_table_base_offsets[gid][:rows].copy_(src[:rows])
+            if rows < bs:
+                self.cuda_graph_flat_block_table_base_offsets[gid][rows:bs].zero_()
+
+        self._flat_replay_fill_locs(
+            seq_lens[:bs], self._flat_locs_stack, bs, tokens_per_req
         )
         if self._flat_lookback_locs_stack is not None:
             # Second variant for the draft's lookback window passes: N + D
             # rows per request ending at the same frontier.
-            flat_decode_locs(
-                self._flat_tables_stack[: self._flat_att_group_count],
-                self._flat_group_ps_tensor,
+            self._flat_replay_fill_locs(
                 seq_lens[:bs],
                 self._flat_lookback_locs_stack,
                 bs,
                 tokens_per_req + self.flat_draft_lookback,
+            )
+
+    def _flat_replay_fill_locs(
+        self,
+        seq_lens: torch.Tensor,
+        out: torch.Tensor,
+        bs: int,
+        tokens_per_req: int,
+    ) -> None:
+        """Fill stacked graph loc buffers while honoring logical table bases."""
+        fused = self._flat_fused_group_count
+        if fused:
+            flat_decode_locs(
+                self._flat_tables_stack[:fused],
+                self._flat_group_ps_tensor[:fused],
+                seq_lens,
+                out[:fused],
+                bs,
+                tokens_per_req,
+            )
+        for i in range(fused, self._flat_att_group_count):
+            gid = self._flat_stack_gids[i]
+            ps = self._group_page_size(gid)
+            local_seq_lens = self._flat_local_seq_lens[gid][:bs]
+            torch.add(
+                seq_lens,
+                self.cuda_graph_flat_block_table_base_offsets[gid][:bs],
+                alpha=-ps,
+                out=local_seq_lens,
+            )
+            flat_decode_locs(
+                self._flat_tables_stack[i : i + 1],
+                self._flat_group_ps_tensor[i : i + 1],
+                local_seq_lens,
+                out[i : i + 1],
+                bs,
+                tokens_per_req,
             )

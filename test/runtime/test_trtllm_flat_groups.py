@@ -11,6 +11,21 @@ from ci_system.ci_register import register_cuda_ci
 register_cuda_ci(est_time=15, suite="runtime-1gpu")
 
 
+def _flat_specs(group_sizes):
+    from tokenspeed.runtime.configs.paged_cache_spec import PagedCacheGroupSpec
+
+    return tuple(
+        PagedCacheGroupSpec(
+            group_id=group_id,
+            retention="full_history",
+            rows_per_page=block_size,
+            entry_stride_tokens=1,
+            sliding_window_tokens=None,
+        )
+        for group_id, block_size in group_sizes.items()
+    )
+
+
 def _import_backend():
     from tokenspeed.runtime.layers.attention.backends.trtllm import (
         TRTLLMMHAAttnBackend,
@@ -52,8 +67,16 @@ class TRTLLMFlatGroupsTest(unittest.TestCase):
         b.max_num_pages = max_num_pages
         b.max_context_len = page_size * max_num_pages
         b.device = device
-        if groups is not None:
-            b.flat_group_page_sizes = groups
+        b._learn_flat_state_groups(
+            _flat_specs(
+                groups
+                if groups is not None
+                else {
+                    "full_attention": page_size,
+                    "sliding_attention": page_size,
+                }
+            )
+        )
         b.spec_num_tokens = spec_num_tokens
         b.is_draft = False
         b.draft_block_decode = False
@@ -110,18 +133,23 @@ class TRTLLMFlatGroupsTest(unittest.TestCase):
                 [[21, 22], [23, -1]], dtype=self.torch.int32
             ),
         }
-        locs = b._compute_flat_decode_out_cache_locs(tables, seq_lens, b.page_size)
+        bases = {gid: self.torch.zeros(2, dtype=self.torch.int32) for gid in tables}
+        locs = b._compute_flat_decode_out_cache_locs(
+            tables, bases, seq_lens, b.page_size
+        )
         b._init_decode_metadata(
             bs,
             req_pool_indices=self.torch.tensor([0, 1], dtype=self.torch.int32),
             seq_lens=seq_lens,
             req_to_page=None,
             flat_page_tables=tables,
+            flat_base_offsets=bases,
             flat_out_cache_locs=locs,
         )
         meta = b.forward_decode_metadata
         self.assertIsNone(meta.page_table)
         self.assertIs(meta.page_tables, tables)
+        self.assertIs(meta.block_table_base_offsets, bases)
         # seq_len 65 -> page index 1, offset 0; seq_len 3 -> page 0, offset 2.
         self.assertEqual(
             meta.out_cache_locs["full_attention"].tolist(),
@@ -137,8 +165,10 @@ class TRTLLMFlatGroupsTest(unittest.TestCase):
         bs = 1
         seq_lens = self.torch.tensor([66], dtype=self.torch.int32)
         tables = {"full_attention": self.torch.tensor([[5, 6]], dtype=self.torch.int32)}
+        bases = {"full_attention": self.torch.zeros(1, dtype=self.torch.int32)}
         locs = b._compute_flat_extend_out_cache_locs(
             tables,
+            bases,
             self.torch.tensor([64], dtype=self.torch.int32),
             self.torch.tensor([2], dtype=self.torch.int32),
             b.page_size,
@@ -150,11 +180,13 @@ class TRTLLMFlatGroupsTest(unittest.TestCase):
             req_to_page=None,
             extend_seq_lens_cpu=self.torch.tensor([2], dtype=self.torch.int32),
             flat_page_tables=tables,
+            flat_base_offsets=bases,
             flat_out_cache_locs=locs,
         )
         meta = b.forward_prefill_metadata
         self.assertIsNone(meta.page_table)
         self.assertIs(meta.page_tables, tables)
+        self.assertIs(meta.block_table_base_offsets, bases)
         # New tokens at positions 64, 65 -> page 6, offsets 0 and 1.
         self.assertEqual(
             meta.out_cache_locs["full_attention"].tolist(), [6 * 64, 6 * 64 + 1]
@@ -167,16 +199,22 @@ class TRTLLMFlatGroupsTest(unittest.TestCase):
         b = self._bare_backend(device="cuda", groups={g: 64 for g in gids})
         max_bs, bs = 4, 2
         b._init_flat_graph_buffers(max_bs)
-        page_tables, out_cache_locs = b._flat_capture_group_views(bs, gids)
+        page_tables, base_offsets, out_cache_locs = b._flat_capture_group_views(
+            bs, gids
+        )
         self.assertEqual(set(page_tables), set(gids))
         self.assertEqual(page_tables["full_attention"].shape, (bs, b.max_num_pages))
+        self.assertEqual(set(base_offsets), set(gids))
+        self.assertEqual(base_offsets["full_attention"].shape, (bs,))
 
         # Replay without tables must fail loudly (stale-table guard).
         with self.assertRaisesRegex(RuntimeError, "stale page tables"):
-            b._flat_replay_stale_guard(bs, None)
-        with self.assertRaisesRegex(RuntimeError, "missing captured groups"):
+            b._flat_replay_stale_guard(bs, None, None)
+        with self.assertRaisesRegex(RuntimeError, "captured/delivered"):
             b._flat_replay_stale_guard(
-                bs, {"full_attention": self.torch.zeros((bs, 1))}
+                bs,
+                {"full_attention": self.torch.zeros((bs, 1), dtype=self.torch.int32)},
+                {"full_attention": self.torch.zeros(bs, dtype=self.torch.int32)},
             )
 
         # Replay fill copies rows, pads column tails with the trtllm dummy
@@ -190,7 +228,8 @@ class TRTLLMFlatGroupsTest(unittest.TestCase):
                 [[21, 22], [0, -1]], dtype=self.torch.int32
             ),
         }
-        b._flat_replay_fill(bs, src, seq_lens)
+        bases = {gid: self.torch.zeros(bs, dtype=self.torch.int32) for gid in src}
+        b._flat_replay_fill(bs, src, bases, seq_lens)
         buf = b.cuda_graph_flat_page_tables["full_attention"]
         self.assertEqual(buf[0, :2].tolist(), [11, 12])
         self.assertEqual(self.Backend.flat_table_tail_pad, 0)
@@ -199,6 +238,30 @@ class TRTLLMFlatGroupsTest(unittest.TestCase):
             b.cuda_graph_flat_out_cache_locs["full_attention"][:bs].tolist(),
             [12 * 64 + 0, 0 * 64 + 0],
         )
+
+    def test_repeated_capture_reuses_metadata_object(self):
+        b = self._bare_backend()
+        bs = 2
+        b.cuda_graph_cache_seqlens = self.torch.ones(4, dtype=self.torch.int32)
+        b.cuda_graph_page_table = self.torch.zeros(
+            (4, b.max_num_pages), dtype=self.torch.int32
+        )
+
+        b._init_decode_metadata_capture(bs, b.cuda_graph_cache_seqlens[:bs])
+        first = b.cuda_graph_decode_metadata[bs]
+        first_cu_seqlens = first.cu_seqlens_q
+        b._init_decode_metadata_capture(bs, b.cuda_graph_cache_seqlens[:bs])
+
+        self.assertIs(b.cuda_graph_decode_metadata[bs], first)
+        self.assertIs(first.cu_seqlens_q, first_cu_seqlens)
+
+        b._init_multi_token_metadata_capture(bs, 4)
+        first_prefill = b.cuda_graph_prefill_metadata[bs]
+        first_prefill_cu_seqlens = first_prefill.cu_seqlens_q
+        b._init_multi_token_metadata_capture(bs, 4)
+
+        self.assertIs(b.cuda_graph_prefill_metadata[bs], first_prefill)
+        self.assertIs(first_prefill.cu_seqlens_q, first_prefill_cu_seqlens)
 
     def test_verify_metadata_expanded_write_locs(self):
         # Target verify (spec N, not draft): [bs]-row per-group tables in the
@@ -213,6 +276,7 @@ class TRTLLMFlatGroupsTest(unittest.TestCase):
                 [[21, 22], [23, -1]], dtype=self.torch.int32
             ),
         }
+        bases = {gid: self.torch.zeros(2, dtype=self.torch.int32) for gid in tables}
         b.init_forward_metadata(
             bs=2,
             req_pool_indices=self.torch.tensor([0, 1], dtype=self.torch.int32),
@@ -220,10 +284,12 @@ class TRTLLMFlatGroupsTest(unittest.TestCase):
             forward_mode=_DecodeMode(),
             req_to_page=None,
             flat_block_tables=tables,
+            flat_block_table_base_offsets=bases,
         )
         meta = b.forward_prefill_metadata
         self.assertIsNone(meta.page_table)
         self.assertIs(meta.page_tables, tables)
+        self.assertIs(meta.block_table_base_offsets, bases)
         # req0 positions 61..64 (pages 11,11,11,12); req1 clamps 0,0,1,2 (page 13).
         self.assertEqual(
             meta.out_cache_locs["full_attention"].tolist(),
@@ -272,12 +338,21 @@ class TRTLLMFlatGroupsTest(unittest.TestCase):
                 [[11, 12], [0, -1]], dtype=self.torch.int32, device="cuda"
             )
         }
+        bases = {
+            "full_attention": self.torch.zeros(
+                bs,
+                dtype=self.torch.int32,
+                device=src["full_attention"].device,
+            )
+        }
+        self.assertEqual(bases["full_attention"].device, src["full_attention"].device)
         b.init_forward_metadata_replay_cuda_graph(
             bs,
             req_pool_indices=self.torch.tensor([0, 1], dtype=self.torch.int32),
             seq_lens=b.cuda_graph_cache_seqlens,
             forward_mode=_DecodeMode(),
             flat_block_tables=src,
+            flat_block_table_base_offsets=bases,
         )
         locs = b.cuda_graph_flat_out_cache_locs["full_attention"][: bs * 4]
         self.assertEqual(
@@ -299,6 +374,7 @@ class TRTLLMFlatGroupsTest(unittest.TestCase):
         b.is_draft = True
         b.draft_block_decode = True
         tables = {"full_attention": self.torch.zeros((1, 1), dtype=self.torch.int32)}
+        bases = {"full_attention": self.torch.zeros(1, dtype=self.torch.int32)}
         with self.assertRaisesRegex(AssertionError, "DFLASH"):
             b.init_forward_metadata(
                 bs=1,
@@ -307,6 +383,7 @@ class TRTLLMFlatGroupsTest(unittest.TestCase):
                 forward_mode=_DecodeMode(),
                 req_to_page=None,
                 flat_block_tables=tables,
+                flat_block_table_base_offsets=bases,
             )
 
 

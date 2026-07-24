@@ -28,9 +28,9 @@ from typing import TYPE_CHECKING
 import torch
 
 from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 
 if TYPE_CHECKING:
-    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
     from tokenspeed.runtime.layers.attention.configs.base import BaseAttnConfig
     from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
@@ -59,6 +59,59 @@ def init_backend_cuda_graph_state(
     backend.init_cuda_graph_state(max_bs, seq_lens_buf, **extras)
 
 
+def init_target_verify_draft_metadata(
+    backend: "AttentionBackend",
+    *,
+    bs: int,
+    num_extends: int,
+    req_pool_indices: torch.Tensor,
+    target_seq_lens: torch.Tensor,
+    draft_seq_lens: torch.Tensor,
+    req_to_page: torch.Tensor,
+    forward_mode: "ForwardMode",
+    extend_kwargs: dict,
+    decode_kwargs: dict,
+) -> None:
+    """Initialize draft metadata that distinguishes verify and draft lengths.
+
+    Attention families exposing this function as
+    ``init_speculative_draft_metadata`` use the target's accepted-prefix
+    lengths for their first draft step. EXTEND/MIXED additionally seeds the
+    mutable draft-length view used by later speculative steps.
+    """
+
+    decode_mode = ForwardMode.DECODE
+    if forward_mode.is_extend_or_mixed():
+        backend.init_forward_metadata(
+            bs=bs,
+            num_extends=num_extends,
+            req_pool_indices=req_pool_indices,
+            seq_lens=target_seq_lens,
+            req_to_page=req_to_page,
+            forward_mode=forward_mode,
+            **extend_kwargs,
+        )
+        backend.init_forward_metadata(
+            bs=bs,
+            num_extends=0,
+            req_pool_indices=req_pool_indices,
+            seq_lens=draft_seq_lens,
+            req_to_page=req_to_page,
+            forward_mode=decode_mode,
+            **decode_kwargs,
+        )
+        return
+    backend.init_forward_metadata(
+        bs=bs,
+        num_extends=0,
+        req_pool_indices=req_pool_indices,
+        seq_lens=target_seq_lens,
+        req_to_page=req_to_page,
+        forward_mode=decode_mode,
+        **decode_kwargs,
+    )
+
+
 class AttentionBackend(ABC):
     """The base class of attention backends"""
 
@@ -70,6 +123,11 @@ class AttentionBackend(ABC):
     uses_flat_cache_groups: bool = False
     # False for flat-capable backends whose spec-verify path is not wired yet.
     flat_spec_capable: bool = True
+    # True only when a flat page id is meaningful exclusively together with
+    # its cache group. Such backends must not consume the radix-era scalar
+    # req_to_page/out_cache_loc ABI; every write location comes from named
+    # group tables and their per-row logical bases.
+    requires_group_keyed_cache_locs: bool = False
     uses_padded_decode_token_mask: bool = False
 
     def __init__(self, config: BaseAttnConfig) -> None:
@@ -153,6 +211,7 @@ class AttentionBackend(ABC):
         forward_mode: ForwardMode = None,
         req_to_page: torch.Tensor = None,
         flat_block_tables: dict[str, torch.Tensor] | None = None,
+        flat_block_table_base_offsets: dict[str, torch.Tensor] | None = None,
         **kwargs,
     ):
         """Update pre-allocated CUDA-graph metadata buffers in-place before replay.
@@ -160,9 +219,11 @@ class AttentionBackend(ABC):
         Called instead of init_forward_metadata when use_cuda_graph=True, so
         that the captured kernels (which hold pointers into the pre-allocated
         buffers) see the current batch's data without any new allocations.
-        ``flat_block_tables`` carries the per-group flat page tables
-        (group_id -> [>=bs, cols]) for flat-capable backends; a backend that
-        captured flat buffers must be handed non-empty tables whenever bs > 0.
+        ``flat_block_tables`` and ``flat_block_table_base_offsets`` carry the
+        atomic per-group flat page-table ABI (group_id -> [>=bs, cols] and
+        group_id -> [>=bs]); their group keys and row counts must match. A
+        backend that captured flat buffers must be handed non-empty tables and
+        bases whenever bs > 0.
         Default: fall back to init_forward_metadata (correct but may not work
         for all backends that use separate cuda-graph buffer pools).
         """

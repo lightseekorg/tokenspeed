@@ -82,6 +82,11 @@ class _ExecutionResult:
     def sync(self):
         return None
 
+    @staticmethod
+    def materialize_flat_kv_completions(_forward_op, *, accepted_lengths=None):
+        del accepted_lengths
+        return ()
+
 
 def _state(input_ids: list[int], *, computed_length: int = 0) -> RequestState:
     state = RequestState(
@@ -510,6 +515,11 @@ class _PrefillExecutionResult:
 
     def sync(self):
         return None
+
+    @staticmethod
+    def materialize_flat_kv_completions(_forward_op, *, accepted_lengths=None):
+        del accepted_lengths
+        return ()
 
 
 class _EmptyPrefillExecutionResult(_PrefillExecutionResult):

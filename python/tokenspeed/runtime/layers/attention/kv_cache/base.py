@@ -37,9 +37,15 @@ logger = get_colorful_logger(__name__)
 class BaseTokenToKVPool:
     """A memory pool that maps a token location to its kv cache data."""
 
+    device_cache_buffer_names: tuple[str, ...] = (
+        "k_buffer",
+        "v_buffer",
+        "kv_buffer",
+    )
     paged_cache_group_specs: tuple[PagedCacheGroupSpec, ...] = ()
     paged_cache_group_page_counts: dict[str, int] = {}
     supports_hierarchical_kv_cache: bool = True
+    supports_pd_transfer: bool = True
 
     def __init__(
         self,
@@ -84,6 +90,11 @@ class BaseTokenToKVPool:
         """Optional hook for model-specific paged-cache diagnostics."""
         return None
 
+    @property
+    def device_cache_arena(self) -> object | None:
+        """Shared device-cache lifecycle owner, when the pool is a view."""
+        return None
+
     @torch.no_grad()
     def clear_kv_buffers(self) -> None:
         """Zero the KV buffers in place.
@@ -95,18 +106,7 @@ class BaseTokenToKVPool:
         covered without per-class overrides. For non-quantized KV this is
         belt-and-suspenders (paging overwrites); for FP8 KV it removes garbage.
         """
-        attrs = (
-            "k_buffer",
-            "v_buffer",
-            "kv_buffer",
-            # DeepSeek V4 pool buffer names.
-            "swa_kv_buffer",
-            "compressed_kv_buffer",
-            "compressor_state_buffer",
-            "indexer_kv_buffer",
-            "indexer_state_buffer",
-        )
-        for attr in attrs:
+        for attr in self.device_cache_buffer_names:
             for entry in getattr(self, attr, None) or []:
                 items = entry if isinstance(entry, (tuple, list)) else (entry,)
                 for t in items:

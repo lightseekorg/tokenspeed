@@ -33,7 +33,23 @@ namespace {
 template <class T>
 concept HasGet = requires(const T& value) { value.get(); };
 
+template <class T>
+concept HasLegacyGet = requires(const T& value) { value.Get(); };
+
+template <class T>
+concept HasRelease = requires(T& value) { value.Release(); };
+
+template <class T>
+concept HasAdopt = requires { T::Adopt; };
+
+template <class T>
+concept HasShare = requires { T::Share; };
+
 static_assert(!HasGet<BlockRef>);
+static_assert(!HasLegacyGet<BlockRef>);
+static_assert(!HasRelease<BlockRef>);
+static_assert(!HasAdopt<BlockRef>);
+static_assert(!HasShare<BlockRef>);
 static_assert(sizeof(BlockRef) == sizeof(void*));
 static_assert(!std::is_constructible_v<BlockRef, internal_block_ref::BlockControl&>);
 static_assert(!std::is_copy_constructible_v<internal_block_ref::BlockControl>);

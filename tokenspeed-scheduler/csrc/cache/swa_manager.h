@@ -22,9 +22,10 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <exception>
+#include <optional>
 #include <span>
 #include <string>
-#include <utility>
 #include <vector>
 
 #include "cache/block_pool.h"
@@ -36,66 +37,118 @@ namespace tokenspeed {
 
 class SwaManager : public KvCacheManager {
 public:
-    SwaManager(std::int32_t block_size, std::int32_t sliding_window)
-        : KvCacheManager(block_size), sliding_window_{sliding_window} {
+    SwaManager(std::int32_t block_size, std::int32_t sliding_window,
+               KvTableLayout table_layout = KvTableLayout::kAbsolute)
+        : KvCacheManager(block_size), sliding_window_{sliding_window}, table_layout_{table_layout} {
         _assert(sliding_window > 0, "sliding_window must be > 0");
     }
 
-    // Non-closed: shortening a match can cut its trailing run below the window, so match bound-first.
     bool MatchIsPrefixClosed() const override { return false; }
 
-    // Right->left scan for a run backing a resumable boundary; slots left of it stay holes.
+    // Search right-to-left for the highest resumable endpoint. Absolute tables
+    // retain zero-valued probe holes; bounded tables return only the trailing
+    // cached run and record its absolute base.
     PrefixProbe Probe(const BlockPool& pool, std::span<const std::string> keys, std::int32_t begin_blocks,
                       std::int32_t max_blocks) const override {
+        _assert(begin_blocks >= 0, "SWA probe begin must be >= 0");
         const std::int32_t end_blocks =
             static_cast<std::int32_t>(std::min(keys.size(), static_cast<std::size_t>(std::max(max_blocks, 0))));
         PrefixProbe probe;
+        probe.base_logical_page = begin_blocks;
         if (begin_blocks >= end_blocks) {
             return probe;
         }
-        // W == 1: no lookback, so every boundary is resumable with no cached page at all.
+
+        // W=1 needs no predecessor page. The empty bounded range still ends at
+        // the selected endpoint, which is why its base advances to end_blocks.
         if (pagesNeededToResume() == 0) {
-            probe.hits.resize(static_cast<std::size_t>(end_blocks - begin_blocks));
+            if (table_layout_ == KvTableLayout::kBoundedWindow) {
+                probe.base_logical_page = end_blocks;
+            } else {
+                probe.hits.resize(static_cast<std::size_t>(end_blocks - begin_blocks), CachedBlockState::kMiss);
+            }
             return probe;
         }
+
+        probe.hits.resize(static_cast<std::size_t>(end_blocks - begin_blocks), CachedBlockState::kMiss);
         const auto [boundary, hits_begin] = findResumableBoundary(
-            [&](std::int32_t i) { return pool.ContainsCachedBlock(keys[static_cast<std::size_t>(i)]); }, begin_blocks,
-            end_blocks);
+            [&](std::int32_t logical_page) {
+                const CachedBlockState state = pool.ProbeCachedBlock(keys[static_cast<std::size_t>(logical_page)]);
+                probe.hits[static_cast<std::size_t>(logical_page - begin_blocks)] = state;
+                return IsCachedBlockHit(state);
+            },
+            begin_blocks, end_blocks);
         if (boundary == begin_blocks) {
+            probe.hits.clear();
             return probe;
         }
-        probe.hits.resize(static_cast<std::size_t>(boundary - begin_blocks));
-        for (std::int32_t i = hits_begin; i < boundary; ++i) {
-            probe.hits[static_cast<std::size_t>(i - begin_blocks)] = 1;
+
+        if (table_layout_ == KvTableLayout::kBoundedWindow) {
+            probe.base_logical_page = hits_begin;
+            probe.hits.resize(static_cast<std::size_t>(boundary - begin_blocks));
+            probe.hits.erase(probe.hits.begin(), probe.hits.begin() + (hits_begin - begin_blocks));
+        } else {
+            probe.hits.resize(static_cast<std::size_t>(boundary - begin_blocks));
         }
         return probe;
     }
 
-    // Punches null holes so the table never shrinks (keeps slot alignment); reverse-collect evicts FIFO.
-    void ReclaimExpired(BlockPool& /*pool*/, BlockTable& table, std::int32_t num_computed_tokens) override {
-        std::int32_t skipped_blocks = fullySlidOutBlocks(table, num_computed_tokens);
-        std::vector<BlockRef> freed;
-        for (std::int32_t i = skipped_blocks - 1; i >= 0; --i) {
-            BlockRef old = table.EvictToNull(i);
-            if (!old) {
-                break;  // already null -> earlier slots are null too
-            }
-            freed.push_back(std::move(old));
+    std::optional<PrefixProbe> ProbeExactBoundary(const BlockPool& pool, std::span<const std::string> keys,
+                                                  std::int32_t begin_blocks,
+                                                  std::int32_t boundary_blocks) const override {
+        if (begin_blocks < 0 || boundary_blocks < begin_blocks ||
+            boundary_blocks > static_cast<std::int32_t>(keys.size())) {
+            return std::nullopt;
         }
-        for (auto it = freed.rbegin(); it != freed.rend(); ++it) {
-            it->reset();
+        const std::int32_t retained_begin = std::max(begin_blocks, boundary_blocks - pagesNeededToResume());
+        PrefixProbe probe;
+        probe.base_logical_page = retained_begin;
+        probe.hits.reserve(static_cast<std::size_t>(boundary_blocks - retained_begin));
+        for (std::int32_t logical_page = retained_begin; logical_page < boundary_blocks; ++logical_page) {
+            const CachedBlockState state = pool.ProbeCachedBlock(keys[static_cast<std::size_t>(logical_page)]);
+            if (!IsCachedBlockHit(state)) {
+                return std::nullopt;
+            }
+            probe.hits.push_back(state);
+        }
+        return probe;
+    }
+
+    void ReclaimExpired(BlockPool& /*pool*/, BlockTable& table, std::int32_t num_computed_tokens) noexcept override {
+        const std::int32_t skipped_blocks = fullySlidOutBlocks(table, num_computed_tokens);
+        if (table_layout_ == KvTableLayout::kBoundedWindow) {
+            if (skipped_blocks > 0) {
+                table.DropBeforeNoexcept(table.BaseLogicalPage() + skipped_blocks);
+            }
+            return;
+        }
+
+        std::int32_t first_live = skipped_blocks;
+        for (std::int32_t i = skipped_blocks - 1; i >= 0; --i) {
+            if (!table.Blocks()[static_cast<std::size_t>(i)]) {
+                break;
+            }
+            first_live = i;
+        }
+        // Release low->high, matching the old reverse-batch LRU order without
+        // allocating a temporary owner vector on the completion path.
+        for (std::int32_t i = first_live; i < skipped_blocks; ++i) {
+            BlockRef old = table.EvictToNullNoexcept(i);
+            if (!old) {
+                std::terminate();
+            }
+            old.reset();
         }
     }
 
-    // Only blocks uniquely owned by this table reach the free list, so shared ones don't count.
     std::int32_t BlocksReclaimableAt(const BlockTable& table, std::int32_t num_computed_tokens,
                                      bool count_uncached) const override {
-        std::int32_t skipped_blocks = fullySlidOutBlocks(table, num_computed_tokens);
+        const std::int32_t skipped_blocks = fullySlidOutBlocks(table, num_computed_tokens);
         std::int32_t freed = 0;
         for (std::int32_t i = skipped_blocks - 1; i >= 0; --i) {
             const BlockRef& block = table.Blocks()[static_cast<std::size_t>(i)];
             if (!block) {
-                break;  // already null -> earlier slots are null too
+                break;
             }
             if (block.unique() && (count_uncached || block->IsCached())) {
                 ++freed;
@@ -105,18 +158,15 @@ public:
     }
 
 private:
-    // Cached pages a boundary needs behind it: they cover the window's last (window - 1) tokens.
     std::int32_t pagesNeededToResume() const { return (sliding_window_ - 1 + block_size_ - 1) / block_size_; }
 
     struct ResumableBoundary {
-        std::int32_t boundary;    // == begin_blocks when no boundary qualifies
-        std::int32_t hits_begin;  // probe hits cover [hits_begin, boundary)
+        std::int32_t boundary;
+        std::int32_t hits_begin;
     };
 
-    // Core scan shared by device and host lookup: the highest boundary backed by enough
-    // consecutive probe hits -- pagesNeededToResume(), or fewer bottoming out at begin_blocks.
-    template <typename Probe>
-    ResumableBoundary findResumableBoundary(const Probe& probe, std::int32_t begin_blocks,
+    template <typename ProbeFn>
+    ResumableBoundary findResumableBoundary(const ProbeFn& probe, std::int32_t begin_blocks,
                                             std::int32_t end_blocks) const {
         const std::int32_t pages_needed = pagesNeededToResume();
         for (std::int32_t boundary = end_blocks; boundary > begin_blocks;) {
@@ -124,30 +174,32 @@ private:
             while (hits_begin > begin_blocks && probe(hits_begin - 1)) {
                 --hits_begin;
                 if (boundary - hits_begin >= pages_needed) {
-                    return {boundary, hits_begin};  // enough pages behind the boundary
+                    return {boundary, hits_begin};
                 }
             }
             if (hits_begin == begin_blocks && hits_begin < boundary) {
-                return {boundary, hits_begin};  // fewer, but nothing below begin_blocks is needed
+                return {boundary, hits_begin};
             }
-            // The miss at hits_begin-1 cuts every boundary in (hits_begin-1, boundary] short -- retry below it.
             boundary = hits_begin - 1;
         }
         return {begin_blocks, begin_blocks};
     }
 
-    // Pages [0, result) fully slid out: the next query reads keys [num_computed - window + 1, num_computed].
+    // Local live-page count that lies wholly before the next query's window.
     std::int32_t fullySlidOutBlocks(const BlockTable& table, std::int32_t num_computed_tokens) const {
-        std::int32_t skipped = num_computed_tokens - sliding_window_ + 1;
-        if (skipped <= 0) {
-            return 0;  // all tokens still inside the window
+        const std::int32_t skipped_tokens = num_computed_tokens - sliding_window_ + 1;
+        if (skipped_tokens <= 0) {
+            return 0;
         }
-        std::int32_t skipped_blocks = skipped / block_size_;  // only fully-slid-out pages
-        // Safety cap: FSM-consistent input never engages it.
-        return std::min(skipped_blocks, table.NumBlocks());
+        const std::int32_t drop_before = skipped_tokens / block_size_;
+        if (drop_before <= table.BaseLogicalPage()) {
+            return 0;
+        }
+        return std::min(drop_before - table.BaseLogicalPage(), table.LiveSize());
     }
 
     std::int32_t sliding_window_;
+    KvTableLayout table_layout_{KvTableLayout::kAbsolute};
 };
 
 }  // namespace tokenspeed

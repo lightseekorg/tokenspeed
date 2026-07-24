@@ -2,8 +2,11 @@ import pytest
 from tokenspeed_scheduler import (
     PagedCacheGroupAllocator,
     PagedCacheGroupConfig,
+    PagedCacheGroupFamily,
     PagedCacheGroupTable,
+    PagedCachePrefixRole,
     PagedCacheRetention,
+    PagedCacheTableLayout,
 )
 
 
@@ -26,6 +29,66 @@ def _sliding_config(rows_per_page=2, entry_stride_tokens=1, total_pages=8, windo
         retention=PagedCacheRetention.SlidingWindow,
         sliding_window_tokens=window,
     )
+
+
+def _v4_compressor_state_config() -> PagedCacheGroupConfig:
+    return PagedCacheGroupConfig(
+        group_id="v4.c4a.compressor_state",
+        rows_per_page=4,
+        entry_stride_tokens=1,
+        total_pages=32,
+        retention=PagedCacheRetention.SlidingWindow,
+        sliding_window_tokens=8,
+        family=PagedCacheGroupFamily.State,
+        block_size=4,
+        pool_id="v4.c4.state",
+        prefix_role=PagedCachePrefixRole.ContinuationState,
+        table_layout=PagedCacheTableLayout.BoundedWindow,
+        owner_mask=1,
+    )
+
+
+def test_v4_flat_group_accepts_native_geometry() -> None:
+    config = _v4_compressor_state_config()
+
+    config.validate_flat_block_geometry()
+    assert (
+        config.rows_per_page,
+        config.entry_stride_tokens,
+        config.block_size,
+        config.pool_id,
+        config.family,
+        config.prefix_role,
+        config.table_layout,
+        config.owner_mask,
+    ) == (
+        4,
+        1,
+        4,
+        "v4.c4.state",
+        PagedCacheGroupFamily.State,
+        PagedCachePrefixRole.ContinuationState,
+        PagedCacheTableLayout.BoundedWindow,
+        1,
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        ("block_size", 8, "block_size must equal"),
+        ("sliding_window_tokens", 126, "window must be page-aligned"),
+        ("owner_mask", 0, "requires an owner mask"),
+    ],
+)
+def test_v4_flat_group_rejects_invalid_geometry(
+    field: str, value: int, error: str
+) -> None:
+    config = _v4_compressor_state_config()
+    setattr(config, field, value)
+
+    with pytest.raises(ValueError, match=error):
+        config.validate_flat_block_geometry()
 
 
 def test_full_history_release_skipped_is_noop():

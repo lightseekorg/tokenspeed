@@ -91,7 +91,6 @@ class _AttentionFamilySpec:
     architectures: frozenset[str]
     configure: Callable[[object], None]
     default_backend: str | None = None
-    supports_target_verify_forward_mode: bool = False
     default_block_size: int | None = None
 
 
@@ -223,7 +222,6 @@ _ATTENTION_FAMILY_SPECS = (
         name="DeepSeek V4",
         architectures=_DEEPSEEK_V4_ARCHITECTURES,
         configure=configure_deepseek_v4_attention,
-        supports_target_verify_forward_mode=True,
         default_block_size=256,
     ),
     _AttentionFamilySpec(
@@ -231,7 +229,6 @@ _ATTENTION_FAMILY_SPECS = (
         architectures=_DSA_ARCHITECTURES,
         configure=configure_glm_attention,
         default_backend="dsa",
-        supports_target_verify_forward_mode=True,
     ),
     _AttentionFamilySpec(
         name="MLA",
@@ -482,13 +479,6 @@ class ModelConfig:
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
         else:
             self.attention_arch = AttentionArch.MHA
-
-        self.use_v4_mtp_paged_metadata = (
-            getattr(server_args, "speculative_algorithm", None) is not None
-            and not is_draft_worker
-            and attention_family is not None
-            and attention_family.supports_target_verify_forward_mode
-        )
 
         self.num_attention_heads = self.hf_text_config.num_attention_heads
         self.num_key_value_heads = getattr(

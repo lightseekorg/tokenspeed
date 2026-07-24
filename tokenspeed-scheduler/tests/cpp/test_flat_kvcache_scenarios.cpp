@@ -29,6 +29,7 @@
 #include <optional>
 #include <set>
 #include <stdexcept>
+#include <string>
 
 #include "cache/forward_cache_ops.h"
 #include "integration_test_helper.h"
@@ -52,6 +53,7 @@ PagedCacheGroupConfig MakeGroup(const std::string& id, std::int32_t block_size, 
     g.rows_per_page = block_size;
     g.entry_stride_tokens = 1;
     g.total_pages = total_pages;
+    g.block_size = block_size;
     g.retention = retention;
     g.family = family;
     if (sliding_window_tokens > 0) {
@@ -61,10 +63,10 @@ PagedCacheGroupConfig MakeGroup(const std::string& id, std::int32_t block_size, 
 }
 
 // Collect every real (>0) physical page id across all rows of a group.
-std::vector<std::int32_t> RealPages(const std::vector<std::vector<std::int32_t>>& group) {
+std::vector<std::int32_t> RealPages(const FlatBlockTableExport& group) {
     std::vector<std::int32_t> out;
-    for (const auto& row : group) {
-        for (std::int32_t id : row) {
+    for (std::size_t row = 0; row < group.rows; ++row) {
+        for (std::int32_t id : group.Row(row)) {
             if (id > 0) out.push_back(id);
         }
     }
@@ -74,7 +76,7 @@ std::vector<std::int32_t> RealPages(const std::vector<std::vector<std::int32_t>>
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// Chunked prefill: PrefillFirstChunk then PrefillChunk per chunk.
+// Chunked prefill: first admission followed by AdvanceRequest per chunk.
 // ---------------------------------------------------------------------------
 class FlatChunkedPrefillSuite : public SchedulerTestSuite {
 protected:
@@ -110,14 +112,18 @@ TEST_F(FlatChunkedPrefillSuite, MultiChunkPrefillGrowsFullTableThenDecodes) {
     const FlatForwardOperation* op1 = FindFlatOp(chunk1);
     ASSERT_NE(op1, nullptr);
     ASSERT_EQ(op1->flat_block_tables.count("full"), 1u);
-    const std::size_t full_after_c1 = op1->flat_block_tables.at("full").at(0).size();
+    ASSERT_EQ(op1->occupied_pages.size(), 1u);
+    EXPECT_TRUE(op1->occupied_pages[0].empty());
+    EXPECT_EQ(op1->begins, (std::vector<std::int32_t>{0}));
+    EXPECT_EQ(op1->sizes, (std::vector<std::int32_t>{0}));
+    const std::size_t full_after_c1 = op1->flat_block_tables.at("full").Row(0).size();
     EXPECT_GT(full_after_c1, 0u);
     EXPECT_EQ(scheduler_->DecodingSize(), 0u);
 
     ExecutionPlan chunk2 = PlanOnce();
     const FlatForwardOperation* op2 = FindFlatOp(chunk2);
     ASSERT_NE(op2, nullptr);
-    const auto& full_c2 = op2->flat_block_tables.at("full").at(0);
+    const auto full_c2 = op2->flat_block_tables.at("full").Row(0);
     EXPECT_GT(full_c2.size(), full_after_c1) << "second chunk should extend the full-history block table";
     for (std::int32_t id : full_c2) {
         EXPECT_GT(id, 0) << "full-history row must have no null hole";
@@ -137,8 +143,8 @@ TEST_F(FlatChunkedPrefillSuite, MultiChunkPrefillGrowsFullTableThenDecodes) {
 }
 
 // ---------------------------------------------------------------------------
-// Three cache groups: full + two sliding windows. Group 0 stays full-history
-// to honor the flat consumer's block_tables_[0] contract.
+// Three cache groups: full + two sliding windows. Execution consumes the
+// explicit group-keyed tables; no group-0 canonical mirror is exported.
 // ---------------------------------------------------------------------------
 class FlatThreeGroupSuite : public SchedulerTestSuite {
 protected:
@@ -322,7 +328,7 @@ TEST_F(FlatAllFullTwoGroupSuite, BothFullGroupsKeepHistoryNoHoles) {
     const FlatForwardOperation* op = FindFlatOp(*last);
     ASSERT_NE(op, nullptr);
     for (const char* key : {"full_a", "full_b"}) {
-        const auto& row = op->flat_block_tables.at(key).at(0);
+        const auto row = op->flat_block_tables.at(key).Row(0);
         for (std::int32_t id : row) {
             EXPECT_GT(id, 0) << key << " (full-history) must not develop a null hole";
         }
@@ -405,7 +411,7 @@ TEST_F(FlatChunkedPrefillSuite, ChunkedPrefillThenSwaSlidesToNullHole) {
     const FlatForwardOperation* c2op = FindFlatOp(chunk2);
     ASSERT_NE(c2op, nullptr);
     {
-        const auto& swa_c2 = c2op->flat_block_tables.at("swa").at(0);
+        const auto swa_c2 = c2op->flat_block_tables.at("swa").Row(0);
         ASSERT_EQ(swa_c2.size(), 4u);
         EXPECT_EQ(std::count(swa_c2.begin(), swa_c2.end(), 0), 0)
             << "N=4, W=4: no page fully below token 1, so chunk 2 punches nothing";
@@ -418,11 +424,11 @@ TEST_F(FlatChunkedPrefillSuite, ChunkedPrefillThenSwaSlidesToNullHole) {
     const FlatForwardOperation* c3op = FindFlatOp(chunk3);
     ASSERT_NE(c3op, nullptr);
     {
-        const auto& swa_c3 = c3op->flat_block_tables.at("swa").at(0);
+        const auto swa_c3 = c3op->flat_block_tables.at("swa").Row(0);
         ASSERT_EQ(swa_c3.size(), 6u);
         for (int s = 0; s <= 1; ++s) EXPECT_EQ(swa_c3[s], 0) << "slot " << s << " punched during prefill";
         for (int s = 2; s <= 5; ++s) EXPECT_GT(swa_c3[s], 0) << "slot " << s;
-        for (std::int32_t id : c3op->flat_block_tables.at("full").at(0)) {
+        for (std::int32_t id : c3op->flat_block_tables.at("full").Row(0)) {
             EXPECT_GT(id, 0) << "full group keeps every chunk-built page";
         }
     }
@@ -439,10 +445,11 @@ TEST_F(FlatChunkedPrefillSuite, ChunkedPrefillThenSwaSlidesToNullHole) {
         ExecutionPlan plan = PlanOnce();
         const FlatForwardOperation* op = FindFlatOp(plan);
         ASSERT_NE(op, nullptr);
-        for (std::int32_t id : op->flat_block_tables.at("full").at(0)) {
+        for (std::int32_t id : op->flat_block_tables.at("full").Row(0)) {
             EXPECT_GT(id, 0) << "full group must keep chunk-built history without holes (round " << i << ")";
         }
-        swa_rows.push_back(op->flat_block_tables.at("swa").at(0));
+        const auto swa_row = op->flat_block_tables.at("swa").Row(0);
+        swa_rows.emplace_back(swa_row.begin(), swa_row.end());
         SendForwardDone("r1", {tok++});
     }
 
@@ -555,6 +562,9 @@ TEST_F(FlatMixedBatchSuite, PrefillAndDecodeShareOnePlan) {
     ASSERT_EQ(op->request_ids.size(), 2u);
     EXPECT_EQ(op->num_extends(), 1u) << "exactly one prefill row (r2)";
     EXPECT_EQ(op->decode_input_ids.size(), 1u) << "exactly one decode row (r1)";
+    EXPECT_EQ(op->decode_input_ids.front(), -1) << "ordinary decode must not masquerade as retraction recovery";
+    ASSERT_EQ(op->hist_token_lens.size(), 1u);
+    EXPECT_EQ(op->hist_token_lens.front(), -1) << "ordinary decode keeps the public retraction sentinel";
 
     EXPECT_EQ(op->request_ids.at(0), "r2") << "prefill partitioned first";
     EXPECT_EQ(op->request_ids.at(1), "r1") << "decode after prefill";
@@ -615,9 +625,10 @@ TEST_F(FlatMixedBatchSuite, PerRequestSwaHoleAtDifferentDecodeDepths) {
     const auto& full = op->flat_block_tables.at("full");
     if (std::find(ids.begin(), ids.end(), "r1") != ids.end()) {
         std::size_t r1 = row_of("r1");
-        EXPECT_NE(std::find(swa.at(r1).begin(), swa.at(r1).end(), 0), swa.at(r1).end())
+        const auto swa_row = swa.Row(r1);
+        EXPECT_NE(std::ranges::find(swa_row, 0), swa_row.end())
             << "r1 drove past the window -> swa row must have a null hole";
-        for (std::int32_t id : full.at(r1)) {
+        for (std::int32_t id : full.Row(r1)) {
             EXPECT_GT(id, 0) << "r1 full-history row must stay hole-free";
         }
     }
@@ -661,7 +672,7 @@ TEST_F(FlatPageSizeOneSuite, TokenGranularPagesSlideAndReclaim) {
     ExecutionPlan prefill = PlanOnce();
     const FlatForwardOperation* pop = FindFlatOp(prefill);
     ASSERT_NE(pop, nullptr);
-    EXPECT_EQ(pop->flat_block_tables.at("full").at(0).size(), 3u) << "block_size=1 -> one page per prompt token";
+    EXPECT_EQ(pop->flat_block_tables.at("full").Row(0).size(), 3u) << "block_size=1 -> one page per prompt token";
 
     SendForwardDone("r1", {42});
 
@@ -674,10 +685,10 @@ TEST_F(FlatPageSizeOneSuite, TokenGranularPagesSlideAndReclaim) {
     }
     const FlatForwardOperation* op = FindFlatOp(*last);
     ASSERT_NE(op, nullptr);
-    for (std::int32_t id : op->flat_block_tables.at("full").at(0)) {
+    for (std::int32_t id : op->flat_block_tables.at("full").Row(0)) {
         EXPECT_GT(id, 0) << "full group hole-free at block_size=1";
     }
-    const auto& swa = op->flat_block_tables.at("swa").at(0);
+    const auto swa = op->flat_block_tables.at("swa").Row(0);
     EXPECT_NE(std::find(swa.begin(), swa.end(), 0), swa.end())
         << "swa group must develop a null hole at block_size=1 too";
 
@@ -1372,7 +1383,7 @@ TEST_F(FlatRetractExactFitSuite, ReserveRefundBalances) {
     ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), 8);
     ASSERT_EQ(scheduler_->WaitingSize(), 1u);
 
-    // "d" needs EXACTLY the freed budget: a stale reserve ledger entry for the
+    // "d" needs EXACTLY the freed budget: a stale request reservation for the
     // victim would shrink the gate below 8 and defer it.
     Submit(MakeRequestSpec("d", /*num_pages=*/3, /*start=*/201));
     ExecutionPlan admitted = PlanOnce();
@@ -1590,7 +1601,7 @@ TEST_F(FlatRetractStateGroupSuite, StateGroupVictimRetractsCleanly) {
     EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start);
 }
 
-// Event-level PrefillDone victim: the scheduler's reserve ledger keeps a
+// Event-level PrefillDone victim: the request-owned reservation keeps a
 // PrefillDone always able to transition, so drive the FSM event directly
 // (FlatEventFailurePath idiom) to pin the PrefillDone overload.
 TEST(FlatRetractEvent, PrefillDoneVictimReleasesPagesAndRequeues) {
@@ -1609,7 +1620,7 @@ TEST(FlatRetractEvent, PrefillDoneVictimReleasesPagesAndRequeues) {
     request.Apply(fsm::SchedulePrefillFirstChunkEvent{
         /*tokens_this_round=*/4, /*decode_input_tokens=*/1, /*device_allocator=*/nullptr, &req_pool, MatchResult{},
         Role::kFused, /*kv_prefix_cache=*/nullptr, /*disable_l2_cache=*/true, /*loadback_diff=*/{},
-        /*hybrid_prefix_cache=*/nullptr, /*mamba_allocator=*/nullptr, /*mamba_loadback_nodes=*/{}, &coordinator});
+        /*mamba_allocator=*/nullptr, /*mamba_loadback_nodes=*/{}, &coordinator});
     ASSERT_TRUE(request.Is<fsm::PrefillDone>());
     ASSERT_LT(pool.NumFreeBlocks(), 8);
 
@@ -1679,15 +1690,15 @@ TEST(FlatEventFailurePath, PrefillChunkFailureReleasesPagesAndAbortStaysClean) {
     request.Apply(fsm::SchedulePrefillFirstChunkEvent{
         /*tokens_this_round=*/4, /*decode_input_tokens=*/0, /*device_allocator=*/nullptr, &req_pool, MatchResult{},
         Role::kFused, /*kv_prefix_cache=*/nullptr, /*disable_l2_cache=*/true, /*loadback_diff=*/{},
-        /*hybrid_prefix_cache=*/nullptr, /*mamba_allocator=*/nullptr, /*mamba_loadback_nodes=*/{}, &coordinator});
+        /*mamba_allocator=*/nullptr, /*mamba_loadback_nodes=*/{}, &coordinator});
     ASSERT_TRUE(request.Is<fsm::Prefilling>());
     ASSERT_EQ(pool.NumFreeBlocks(), 1);
 
     // Second chunk: 8 tokens -> 8 blocks > 1 free: the Acquire throws.
-    EXPECT_THROW(request.Apply(fsm::SchedulePrefillEvent{/*tokens_this_round=*/8,
-                                                         /*reserve_num_tokens_in_next_schedule_event=*/0,
-                                                         /*hybrid_prefix_cache=*/nullptr, &coordinator}),
-                 std::runtime_error);
+    EXPECT_THROW(
+        request.Apply(fsm::SchedulePrefillEvent{/*tokens_this_round=*/8,
+                                                /*reserve_num_tokens_in_next_schedule_event=*/0, &coordinator}),
+        std::runtime_error);
     EXPECT_EQ(pool.NumFreeBlocks(), 5) << "failure path must return the request's pages to the pool";
 
     EXPECT_NO_THROW(request.Apply(fsm::AbortEvent{&coordinator}));
@@ -1711,14 +1722,12 @@ TEST(FlatEventFailurePath, DecodeStepFailureReleasesPagesAndAbortStaysClean) {
     request.Apply(fsm::SchedulePrefillFirstChunkEvent{
         /*tokens_this_round=*/4, /*decode_input_tokens=*/1, /*device_allocator=*/nullptr, &req_pool, MatchResult{},
         Role::kFused, /*kv_prefix_cache=*/nullptr, /*disable_l2_cache=*/true, /*loadback_diff=*/{},
-        /*hybrid_prefix_cache=*/nullptr, /*mamba_allocator=*/nullptr, /*mamba_loadback_nodes=*/{}, &coordinator});
+        /*mamba_allocator=*/nullptr, /*mamba_loadback_nodes=*/{}, &coordinator});
     ASSERT_TRUE(request.Is<fsm::PrefillDone>());
     ASSERT_EQ(pool.NumFreeBlocks(), 0);
 
     // Decode transition needs 1 fresh page per group (tails full) with 0 free.
-    EXPECT_THROW(request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1,
-                                                        /*hybrid_prefix_cache=*/nullptr, &coordinator}),
-                 std::runtime_error);
+    EXPECT_THROW(request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1, &coordinator}), std::runtime_error);
     EXPECT_EQ(pool.NumFreeBlocks(), 4) << "failure path must return the request's pages to the pool";
 
     EXPECT_NO_THROW(request.Apply(fsm::AbortEvent{&coordinator}));
@@ -1743,19 +1752,17 @@ TEST(FlatEventFailurePath, MidDecodeStepFailureReleasesPagesAndAbortStaysClean) 
     request.Apply(fsm::SchedulePrefillFirstChunkEvent{
         /*tokens_this_round=*/4, /*decode_input_tokens=*/1, /*device_allocator=*/nullptr, &req_pool, MatchResult{},
         Role::kFused, /*kv_prefix_cache=*/nullptr, /*disable_l2_cache=*/true, /*loadback_diff=*/{},
-        /*hybrid_prefix_cache=*/nullptr, /*mamba_allocator=*/nullptr, /*mamba_loadback_nodes=*/{}, &coordinator});
+        /*mamba_allocator=*/nullptr, /*mamba_loadback_nodes=*/{}, &coordinator});
     ASSERT_TRUE(request.Is<fsm::PrefillDone>());
-    request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1, /*hybrid_prefix_cache=*/nullptr, &coordinator});
+    request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1, &coordinator});
     ASSERT_TRUE(request.Is<fsm::Decoding>());
     ASSERT_EQ(pool.NumFreeBlocks(), 0);
-    request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1, /*hybrid_prefix_cache=*/nullptr, &coordinator});
+    request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1, &coordinator});
     ASSERT_TRUE(request.Is<fsm::Decoding>());
     ASSERT_EQ(pool.NumFreeBlocks(), 0);
 
     // Third step needs a fresh page per group with 0 free.
-    EXPECT_THROW(request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1,
-                                                        /*hybrid_prefix_cache=*/nullptr, &coordinator}),
-                 std::runtime_error);
+    EXPECT_THROW(request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1, &coordinator}), std::runtime_error);
     EXPECT_EQ(pool.NumFreeBlocks(), 6) << "mid-decode failure path must return the request's pages to the pool";
 
     EXPECT_NO_THROW(request.Apply(fsm::AbortEvent{&coordinator}));
@@ -1779,8 +1786,7 @@ TEST(FlatEventFailurePath, FirstChunkFailureLeavesPoolBalancedAndAbortStaysClean
     EXPECT_THROW(request.Apply(fsm::SchedulePrefillFirstChunkEvent{
                      /*tokens_this_round=*/4, /*decode_input_tokens=*/1, /*device_allocator=*/nullptr, &req_pool,
                      MatchResult{}, Role::kFused, /*kv_prefix_cache=*/nullptr, /*disable_l2_cache=*/true,
-                     /*loadback_diff=*/{}, /*hybrid_prefix_cache=*/nullptr, /*mamba_allocator=*/nullptr,
-                     /*mamba_loadback_nodes=*/{}, &coordinator}),
+                     /*loadback_diff=*/{}, /*mamba_allocator=*/nullptr, /*mamba_loadback_nodes=*/{}, &coordinator}),
                  std::runtime_error);
     EXPECT_EQ(pool.NumFreeBlocks(), 3) << "failed first chunk must leave the pool untouched";
     EXPECT_EQ(req_pool.AvailableSlots(), 4) << "no request-pool slot may leak on a failed first chunk";
@@ -1809,8 +1815,7 @@ TEST(FlatEventFailurePath, ReqPoolExhaustionAtFirstChunkLeavesPoolBalanced) {
     EXPECT_THROW(request.Apply(fsm::SchedulePrefillFirstChunkEvent{
                      /*tokens_this_round=*/4, /*decode_input_tokens=*/1, /*device_allocator=*/nullptr, &req_pool,
                      MatchResult{}, Role::kFused, /*kv_prefix_cache=*/nullptr, /*disable_l2_cache=*/true,
-                     /*loadback_diff=*/{}, /*hybrid_prefix_cache=*/nullptr, /*mamba_allocator=*/nullptr,
-                     /*mamba_loadback_nodes=*/{}, &coordinator}),
+                     /*loadback_diff=*/{}, /*mamba_allocator=*/nullptr, /*mamba_loadback_nodes=*/{}, &coordinator}),
                  std::runtime_error);
     EXPECT_EQ(pool.NumFreeBlocks(), 31) << "a failed req-pool Allocate must not leak block-pool pages";
 
@@ -1839,21 +1844,21 @@ TEST(FlatSwaWindowBoundary, DecodeStepKeepsOldestInWindowPageAtPageBoundary) {
     request.Apply(fsm::SchedulePrefillFirstChunkEvent{
         /*tokens_this_round=*/4, /*decode_input_tokens=*/1, /*device_allocator=*/nullptr, &req_pool, MatchResult{},
         Role::kFused, /*kv_prefix_cache=*/nullptr, /*disable_l2_cache=*/true, /*loadback_diff=*/{},
-        /*hybrid_prefix_cache=*/nullptr, /*mamba_allocator=*/nullptr, /*mamba_loadback_nodes=*/{}, &coordinator});
+        /*mamba_allocator=*/nullptr, /*mamba_loadback_nodes=*/{}, &coordinator});
     ASSERT_TRUE(request.Is<fsm::PrefillDone>());
 
     const auto swa_slot_null = [&](std::int32_t i) { return !request.FlatBlockTablesRef()[1].Blocks()[i]; };
 
     // Size 5, decode transition (no slide): 3 pages.
     request.Apply(fsm::ExtendResultEvent{"r1", {100}});
-    request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1, /*hybrid_prefix_cache=*/nullptr, &coordinator});
+    request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1, &coordinator});
     ASSERT_TRUE(request.Is<fsm::Decoding>());
     ASSERT_EQ(request.FlatBlockTablesRef()[1].NumBlocks(), 3);
     EXPECT_FALSE(swa_slot_null(0));
 
     // Size 6 -> N=5; keys [2,5] -> page 0 out: slot 0 punched, slot 1 kept.
     request.Apply(fsm::ExtendResultEvent{"r1", {101}});
-    request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1, /*hybrid_prefix_cache=*/nullptr, &coordinator});
+    request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1, &coordinator});
     EXPECT_TRUE(swa_slot_null(0));
     EXPECT_FALSE(swa_slot_null(1));
 
@@ -1861,7 +1866,7 @@ TEST(FlatSwaWindowBoundary, DecodeStepKeepsOldestInWindowPageAtPageBoundary) {
     // survive (sliding at the container size 7 would free it here).
     request.Apply(fsm::ExtendResultEvent{"r1", {102}});
     const std::int32_t free_before = pool.NumFreeBlocks();
-    request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1, /*hybrid_prefix_cache=*/nullptr, &coordinator});
+    request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1, &coordinator});
     EXPECT_FALSE(swa_slot_null(1)) << "key 3 of the pending query lives in page 1; freeing it is the off-by-one";
     EXPECT_TRUE(swa_slot_null(0));
     // This round slides nothing and acquires one fresh page per group.
@@ -1869,7 +1874,7 @@ TEST(FlatSwaWindowBoundary, DecodeStepKeepsOldestInWindowPageAtPageBoundary) {
 
     // Size 8 -> N=7; keys [4,7] -> page 1 fully out, punched exactly now.
     request.Apply(fsm::ExtendResultEvent{"r1", {103}});
-    request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1, /*hybrid_prefix_cache=*/nullptr, &coordinator});
+    request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1, &coordinator});
     EXPECT_TRUE(swa_slot_null(1));
     EXPECT_FALSE(swa_slot_null(2));
 
@@ -1882,10 +1887,10 @@ TEST(FlatSwaWindowBoundary, DecodeStepKeepsOldestInWindowPageAtPageBoundary) {
 }
 
 // ---------------------------------------------------------------------------
-// Decode-reserve ledger (flat_reserved_pages_): promised decode pages are only
+// Decode reservations (flat_reserved_pages_): promised decode pages are only
 // Acquired one round later; nobody may be admitted into them in between.
 // ---------------------------------------------------------------------------
-class FlatReserveLedgerSuite : public SchedulerTestSuite {
+class FlatReservationSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg{};
@@ -1908,7 +1913,7 @@ protected:
     }
 };
 
-TEST_F(FlatReserveLedgerSuite, LaterRequestCannotStealReservedDecodeHeadroom) {
+TEST_F(FlatReservationSuite, LaterRequestCannotStealReservedDecodeHeadroom) {
     const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
     ASSERT_EQ(free_at_start, 10);
 
@@ -1948,7 +1953,7 @@ TEST_F(FlatReserveLedgerSuite, LaterRequestCannotStealReservedDecodeHeadroom) {
     EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start);
 }
 
-TEST_F(FlatReserveLedgerSuite, AbortWithOutstandingReservationLeavesNoPhantom) {
+TEST_F(FlatReservationSuite, AbortWithOutstandingReservationLeavesNoPhantom) {
     const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
     ASSERT_EQ(free_at_start, 10);
 
@@ -1957,7 +1962,7 @@ TEST_F(FlatReserveLedgerSuite, AbortWithOutstandingReservationLeavesNoPhantom) {
     PlanOnce();
     EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), 4);
 
-    // Abort BEFORE the reserve is acquired: the ledger entry must drop too.
+    // Abort BEFORE the reserve is acquired: the request-owned reservation must drop too.
     SendAbort(*scheduler_, "a");
     PlanOnce();  // reap
     EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start);
@@ -2025,7 +2030,8 @@ protected:
         std::map<std::string, std::vector<std::int32_t>> rows;
         if (op != nullptr) {
             for (const auto& [gid, table] : op->flat_block_tables) {
-                rows[gid] = table.at(0);
+                const auto row = table.Row(0);
+                rows[gid].assign(row.begin(), row.end());
             }
         }
         SendForwardDone(spec.request_id, {9001});
@@ -2036,8 +2042,8 @@ protected:
         return rows;
     }
 
-    static void ExpectRowPrefixEq(const std::vector<std::int32_t>& row,
-                                  const std::vector<std::int32_t>& expected_prefix, const char* what) {
+    static void ExpectRowPrefixEq(std::span<const std::int32_t> row, const std::vector<std::int32_t>& expected_prefix,
+                                  const char* what) {
         ASSERT_GE(row.size(), expected_prefix.size()) << what;
         for (std::size_t i = 0; i < expected_prefix.size(); ++i) {
             EXPECT_EQ(row[i], expected_prefix[i]) << what << " slot " << i;
@@ -2070,17 +2076,17 @@ TEST_F(FlatPrefixHitSuite, TwoRequestsSharePrefixReusePages) {
     EXPECT_EQ(op->extend_prefix_lens.at(0), 8);
     EXPECT_EQ(op->prefill_lengths.at(0), 12);
     EXPECT_EQ(op->input_ids, tail);
-    // Page-space fields (radix-hit parity): sizes counts everything new to the
-    // request's table this round = 4 claimed + ceil(4/2) = 6.
+    // Multi-group flat uses only the explicit keyed tables. The radix-era
+    // group-0 canonical mirror is intentionally absent.
     EXPECT_EQ(op->begins.at(0), 0);
-    EXPECT_EQ(op->sizes.at(0), 6);
-    ASSERT_EQ(op->occupied_pages.at(0).size(), 6u);
+    EXPECT_EQ(op->sizes.at(0), 0);
+    EXPECT_TRUE(op->occupied_pages.at(0).empty());
 
-    ExpectRowPrefixEq(op->flat_block_tables.at("full").at(0), r1_rows.at("full"), "full row");
-    ExpectRowPrefixEq(op->flat_block_tables.at("swa").at(0), r1_rows.at("swa"), "swa row");
+    ExpectRowPrefixEq(op->flat_block_tables.at("full").Row(0), r1_rows.at("full"), "full row");
+    ExpectRowPrefixEq(op->flat_block_tables.at("swa").Row(0), r1_rows.at("swa"), "swa row");
 
     // Pool: claim 4/group (8) + acquire ceil(4/2) = 2/group (4) = 12. The
-    // decode reserve is only PROMISED here (ledger), not acquired.
+    // decode reserve is only PROMISED here (request-owned), not acquired.
     EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 12);
 
     // Finalize registers pages 4..5 and acquires the reserve: 1 fresh page/group.
@@ -2118,7 +2124,7 @@ TEST_F(FlatPrefixHitSuite, FullHitCapsAtLastToken) {
     EXPECT_EQ(op->input_ids, MakeTokens(/*count=*/2, /*start=*/7));
     // 3 claimed + ceil(2/2) = 1 fresh page per group.
     EXPECT_EQ(op->begins.at(0), 0);
-    EXPECT_EQ(op->sizes.at(0), 4);
+    EXPECT_EQ(op->sizes.at(0), 0);
     // Pool: 3 claimed + 1 fresh per group = 8 blocks off the free count.
     EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 8);
 
@@ -2159,7 +2165,7 @@ TEST_F(FlatPrefixHitDisabledSuite, DisablePrefixCacheSkipsMatch) {
     EXPECT_EQ(op->extend_prefix_lens.at(0), 0);
     EXPECT_EQ(op->input_ids, r2_tokens);
     EXPECT_EQ(op->begins.at(0), 0);
-    EXPECT_EQ(op->sizes.at(0), 6) << "all 6 pages freshly allocated, none claimed";
+    EXPECT_EQ(op->sizes.at(0), 0);
     // Pool: 6 fresh pages per group = 12.
     EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 12);
 
@@ -2194,12 +2200,12 @@ TEST_F(FlatPrefixHitSuite, PartialHit) {
     EXPECT_EQ(op->input_ids, tail);
     // 2 claimed + ceil(8/2) = 4 fresh pages per group.
     EXPECT_EQ(op->begins.at(0), 0);
-    EXPECT_EQ(op->sizes.at(0), 6);
+    EXPECT_EQ(op->sizes.at(0), 0);
 
     const std::vector<std::int32_t> full_prefix(r1_rows.at("full").begin(), r1_rows.at("full").begin() + 2);
     const std::vector<std::int32_t> swa_prefix(r1_rows.at("swa").begin(), r1_rows.at("swa").begin() + 2);
-    ExpectRowPrefixEq(op->flat_block_tables.at("full").at(0), full_prefix, "full row");
-    ExpectRowPrefixEq(op->flat_block_tables.at("swa").at(0), swa_prefix, "swa row");
+    ExpectRowPrefixEq(op->flat_block_tables.at("full").Row(0), full_prefix, "full row");
+    ExpectRowPrefixEq(op->flat_block_tables.at("swa").Row(0), swa_prefix, "swa row");
 
     // Pool: 2 claimed + 4 fresh per group = 12 blocks off the free count.
     EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 12);
@@ -2246,14 +2252,14 @@ TEST_F(FlatPrefixHitSmallWindowSuite, SwaGroupHitRespectsWindow) {
     EXPECT_EQ(op->input_ids, tail);
     // 4 claimed slots (real or hole) + 1 fresh page.
     EXPECT_EQ(op->begins.at(0), 0);
-    EXPECT_EQ(op->sizes.at(0), 5);
+    EXPECT_EQ(op->sizes.at(0), 0);
 
-    const auto& full_row = op->flat_block_tables.at("full").at(0);
+    const auto full_row = op->flat_block_tables.at("full").Row(0);
     ASSERT_EQ(full_row.size(), 5u);
     ExpectRowPrefixEq(full_row, r1_rows.at("full"), "full row");
     EXPECT_GT(full_row[4], 0);
 
-    const auto& swa_row = op->flat_block_tables.at("swa").at(0);
+    const auto swa_row = op->flat_block_tables.at("swa").Row(0);
     ASSERT_EQ(swa_row.size(), 5u);
     EXPECT_EQ(swa_row[0], 0) << "out-of-window slot claimed as a null hole";
     EXPECT_EQ(swa_row[1], 0) << "out-of-window slot claimed as a null hole";
@@ -2303,14 +2309,15 @@ TEST_F(FlatPrefixHitTightPoolSuite, GateChargesFreeHitBlocksClaimWillConsume) {
     ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), 8);
 
     // r3's finalize acquires its decode reserve (1 fresh page/group): 8 -> 6,
-    // erasing its ledger entry: r2's gate below reads raw free 6, no reserves.
+    // clearing its request-owned reservation: r2's gate below reads raw free 6, no reserves.
     SendForwardDone("r3", {599});
     PlanOnce();
     ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), 6);
 
     // r2: 8 tokens, first 4 == r1's. Hit: cap = (8-1)/2 = 3, r1 registered 2
-    // -> fixpoint 2 blocks = 4 tokens, all 4 hit blocks ref-0 free. Gate:
-    // new/reserve 2*ceil(5/2) = 6 + claim 4 = 10 > free 6 -> defers untouched.
+    // -> fixpoint 2 blocks = 4 tokens, all 4 hit blocks ref-0 free. Legacy
+    // completion debt does not fence r3; its next decode still fits the
+    // allocated tail. r2 needs new/reserve 6 + claim 4 and therefore defers.
     token_vec_t r2_tokens = MakeAlignedTokens(/*num_pages=*/2, PageSize());  // tokens 1..4 == r1's
     const token_vec_t tail = MakeTokens(/*count=*/4, /*start=*/901);
     r2_tokens.insert(r2_tokens.end(), tail.begin(), tail.end());
@@ -2318,14 +2325,14 @@ TEST_F(FlatPrefixHitTightPoolSuite, GateChargesFreeHitBlocksClaimWillConsume) {
     ExecutionPlan starved = PlanOnce();
     const FlatForwardOperation* starved_op = FindFlatOp(starved);
     ASSERT_NE(starved_op, nullptr);
-    ASSERT_EQ(starved_op->request_ids.size(), 1u) << "r2 must be deferred, not admitted into a short pool";
-    EXPECT_EQ(starved_op->request_ids.at(0), "r3");
+    EXPECT_EQ(starved_op->request_ids, (std::vector<std::string>{"r3"}));
     EXPECT_EQ(scheduler_->WaitingSize(), 1u) << "deferred r2 stays intact in the waiting set";
     EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), 6) << "a deferred first chunk must not touch the pool";
 
     // r3 finishes -> free 10; r2's charge 6 + 4 = 10 == 10: admitted exactly
     // at the boundary. Claim pulls 4, Acquire takes 2/group: free 10 -> 2.
     SendForwardDone("r3", {600});
+    SendForwardDone("r3", {601});
     SendFinish("r3");
     ExecutionPlan plan2 = PlanOnce();
     const FlatForwardOperation* op2 = FindFlatOp(plan2);
@@ -2352,7 +2359,7 @@ TEST_F(FlatPrefixHitTightPoolSuite, GateChargesFreeHitBlocksClaimWillConsume) {
 
 // ---------------------------------------------------------------------------
 // M13 decode-block caching: pages filled DURING decode register via the hash
-// chain (DecodeStep: register -> slide -> acquire), so a later turn hits PAST
+// chain (AdvanceRequest: register -> slide -> acquire), so a later turn hits PAST
 // the previous prompt boundary. Fill timing: a round at container Size s has
 // N = s - 1 computed and registers pages up to N/block_size -- a tail page
 // registers one round late (finishing earlier frees its block hashless).
@@ -2369,7 +2376,8 @@ protected:
         std::map<std::string, std::vector<std::int32_t>> rows;
         if (op != nullptr) {
             for (const auto& [gid, table] : op->flat_block_tables) {
-                rows[gid] = table.at(0);
+                const auto row = table.Row(0);
+                rows[gid].assign(row.begin(), row.end());
             }
         }
         return rows;
@@ -2436,13 +2444,13 @@ TEST_F(FlatDecodeCachingSuite, DecodeFilledPageBecomesHittable) {
     EXPECT_EQ(op->input_ids, MakeTokens(/*count=*/2, /*start=*/901));
     // 4 claimed + ceil(2/2) = 1 fresh page.
     EXPECT_EQ(op->begins.at(0), 0);
-    EXPECT_EQ(op->sizes.at(0), 5);
+    EXPECT_EQ(op->sizes.at(0), 0);
 
     // Slots 2,3 are the pages r1's decode filled, beyond its prompt boundary.
     const std::vector<std::int32_t> full_prefix(r1_rows.at("full").begin(), r1_rows.at("full").begin() + 4);
     const std::vector<std::int32_t> swa_prefix(r1_rows.at("swa").begin(), r1_rows.at("swa").begin() + 4);
-    ExpectRowPrefixEq(op->flat_block_tables.at("full").at(0), full_prefix, "full row");
-    ExpectRowPrefixEq(op->flat_block_tables.at("swa").at(0), swa_prefix, "swa row");
+    ExpectRowPrefixEq(op->flat_block_tables.at("full").Row(0), full_prefix, "full row");
+    ExpectRowPrefixEq(op->flat_block_tables.at("swa").Row(0), swa_prefix, "swa row");
 
     // Pool: claim 4/group (8) + 1 fresh/group (2) = 10 off the free count.
     EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 10);
@@ -2491,13 +2499,13 @@ TEST_F(FlatDecodeCachingSuite, MultiTurnConversationReusesResponsePages) {
     EXPECT_EQ(op3->input_ids, (token_vec_t{203, 951, 952, 953}));
     // 6 claimed + ceil(4/2) = 2 fresh pages.
     EXPECT_EQ(op3->begins.at(0), 0);
-    EXPECT_EQ(op3->sizes.at(0), 8);
+    EXPECT_EQ(op3->sizes.at(0), 0);
 
     // Slots 0..3 are r1's blocks (re-freed cached by r2), 4..5 r2's own pages.
     const std::vector<std::int32_t> full_prefix(r2_rows.at("full").begin(), r2_rows.at("full").begin() + 6);
     const std::vector<std::int32_t> swa_prefix(r2_rows.at("swa").begin(), r2_rows.at("swa").begin() + 6);
-    ExpectRowPrefixEq(op3->flat_block_tables.at("full").at(0), full_prefix, "full row");
-    ExpectRowPrefixEq(op3->flat_block_tables.at("swa").at(0), swa_prefix, "swa row");
+    ExpectRowPrefixEq(op3->flat_block_tables.at("full").Row(0), full_prefix, "full row");
+    ExpectRowPrefixEq(op3->flat_block_tables.at("swa").Row(0), swa_prefix, "swa row");
 
     // Pool: 6 claimed/group (12) + 2 fresh/group (4) = 16.
     EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 16);
@@ -2510,7 +2518,7 @@ TEST_F(FlatDecodeCachingSuite, MultiTurnConversationReusesResponsePages) {
     EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start) << "pool back to baseline after all three turns";
 }
 
-// A decode page REGISTERS (DecodeStep registers before the slide) and a later
+// A decode page REGISTERS (AdvanceRequest registers before the slide) and a later
 // ReclaimExpired punches it: the punch frees the block WITH its hash intact.
 class FlatDecodeCachingSmallWindowSuite : public FlatDecodeCachingSuite {
 protected:
@@ -2559,13 +2567,13 @@ TEST_F(FlatDecodeCachingSmallWindowSuite, SwaPunchedDecodePageStillHittable) {
     EXPECT_EQ(op->extend_prefix_lens.at(0), 8);
     EXPECT_EQ(op->input_ids, MakeTokens(/*count=*/2, /*start=*/901));
     EXPECT_EQ(op->begins.at(0), 0);
-    EXPECT_EQ(op->sizes.at(0), 5);  // 4 claimed slots (real or hole) + 1 fresh page
+    EXPECT_EQ(op->sizes.at(0), 0);
 
     const std::vector<std::int32_t> full_prefix(r1_rows.at("full").begin(), r1_rows.at("full").begin() + 4);
-    ExpectRowPrefixEq(op->flat_block_tables.at("full").at(0), full_prefix, "full row");
+    ExpectRowPrefixEq(op->flat_block_tables.at("full").Row(0), full_prefix, "full row");
 
     // Slot 2's expected id was captured at the +105 round, before the punch.
-    const auto& swa_row = op->flat_block_tables.at("swa").at(0);
+    const auto swa_row = op->flat_block_tables.at("swa").Row(0);
     ASSERT_EQ(swa_row.size(), 5u);
     EXPECT_EQ(swa_row[0], 0) << "out-of-window slot claimed as a null hole";
     EXPECT_EQ(swa_row[1], 0) << "out-of-window slot claimed as a null hole";
@@ -2654,8 +2662,8 @@ TEST_F(FlatHeteroDecodeCachingSuite, CoarseGroupDecodeBlockFoldsAndBecomesHittab
 
     const std::vector<std::int32_t> full_prefix(r1_rows.at("full").begin(), r1_rows.at("full").begin() + 2);
     const std::vector<std::int32_t> swa_prefix(r1_rows.at("swa").begin(), r1_rows.at("swa").begin() + 4);
-    ExpectRowPrefixEq(op->flat_block_tables.at("full").at(0), full_prefix, "full row");
-    ExpectRowPrefixEq(op->flat_block_tables.at("swa").at(0), swa_prefix, "swa row");
+    ExpectRowPrefixEq(op->flat_block_tables.at("full").Row(0), full_prefix, "full row");
+    ExpectRowPrefixEq(op->flat_block_tables.at("swa").Row(0), swa_prefix, "swa row");
 
     // Pool: full claims 2 coarse + swa claims 4 base, then 1 fresh page per group = 8.
     EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 8);
@@ -2710,8 +2718,8 @@ TEST_F(FlatHeteroMambaDecodeSuite, CoarseStateGroupRegistersAlignedSnapshotMidDe
     EXPECT_EQ(op->input_ids, MakeTokens(/*count=*/2, /*start=*/901));
 
     const std::vector<std::int32_t> full_prefix(r1_rows.at("full").begin(), r1_rows.at("full").begin() + 4);
-    ExpectRowPrefixEq(op->flat_block_tables.at("full").at(0), full_prefix, "full row");
-    const auto& state_row = op->flat_block_tables.at("state").at(0);
+    ExpectRowPrefixEq(op->flat_block_tables.at("full").Row(0), full_prefix, "full row");
+    const auto state_row = op->flat_block_tables.at("state").Row(0);
     ASSERT_GE(state_row.size(), 2u);
     EXPECT_EQ(state_row[0], 0) << "only the aligned snapshot resumes; earlier state slots are holes";
     EXPECT_EQ(state_row[1], r1_rows.at("state")[1]) << "the decode-registered snapshot block is claimed back";
@@ -2769,9 +2777,9 @@ TEST_F(FlatThreeGranularitySuite, PrefixHitConvergesAcrossThreeBlockSizes) {
     ExecutionPlan prefill = PlanOnce();
     const FlatForwardOperation* r1_op = FindFlatOp(prefill);
     ASSERT_NE(r1_op, nullptr);
-    const auto full_row = r1_op->flat_block_tables.at("full").at(0);
-    const auto swa_row = r1_op->flat_block_tables.at("swa").at(0);
-    const auto conv_row = r1_op->flat_block_tables.at("conv").at(0);
+    const auto full_row = r1_op->flat_block_tables.at("full").Row(0);
+    const auto swa_row = r1_op->flat_block_tables.at("swa").Row(0);
+    const auto conv_row = r1_op->flat_block_tables.at("conv").Row(0);
     ASSERT_EQ(full_row.size(), 2u);
     ASSERT_EQ(swa_row.size(), 4u);
     ASSERT_EQ(conv_row.size(), 8u);
@@ -2800,14 +2808,14 @@ TEST_F(FlatThreeGranularitySuite, PrefixHitConvergesAcrossThreeBlockSizes) {
     // full reuses both coarse blocks; swa (W=8) claims 2 holes + the trailing run;
     // conv (W=2 <= block) resumes off the final block alone: 7 holes + 1 real.
     const std::vector<std::int32_t> full_prefix(full_row.begin(), full_row.begin() + 2);
-    ExpectRowPrefixEq(op->flat_block_tables.at("full").at(0), full_prefix, "full row");
-    const auto& swa2 = op->flat_block_tables.at("swa").at(0);
+    ExpectRowPrefixEq(op->flat_block_tables.at("full").Row(0), full_prefix, "full row");
+    const auto swa2 = op->flat_block_tables.at("swa").Row(0);
     ASSERT_GE(swa2.size(), 4u);
     EXPECT_EQ(swa2[0], 0);
     EXPECT_EQ(swa2[1], 0);
     EXPECT_EQ(swa2[2], swa_row[2]);
     EXPECT_EQ(swa2[3], swa_row[3]);
-    const auto& conv2 = op->flat_block_tables.at("conv").at(0);
+    const auto conv2 = op->flat_block_tables.at("conv").Row(0);
     ASSERT_GE(conv2.size(), 8u);
     for (int i = 0; i < 7; ++i) {
         EXPECT_EQ(conv2[static_cast<std::size_t>(i)], 0) << "conv slot " << i;
@@ -3262,21 +3270,21 @@ TEST_F(FlatHostHitSuite, HostHitLoadsBackAfterDeviceEviction) {
     EXPECT_EQ(op->prefill_lengths.at(0), 8);
     EXPECT_EQ(op->input_ids, MakeTokens(/*count=*/2, /*start=*/7));
     EXPECT_EQ(op->begins.at(0), 0);
-    EXPECT_EQ(op->sizes.at(0), 4) << "3 extension + 1 fresh page, all new to the table";
+    EXPECT_EQ(op->sizes.at(0), 0);
 
     // Wire pairs are group-major: full ext slots 0..2, then swa slots 1..2 (slot 0
     // is a pre-window hole = the null page 0).
-    const auto& full_row = op->flat_block_tables.at("full").at(0);
-    const auto& swa_row = op->flat_block_tables.at("swa").at(0);
+    const auto full_row = op->flat_block_tables.at("full").Row(0);
+    const auto swa_row = op->flat_block_tables.at("swa").Row(0);
     ASSERT_EQ(full_row.size(), 4u);
     ASSERT_EQ(swa_row.size(), 4u);
     const auto& dst = lb->dst_pages.at(0);
-    EXPECT_EQ(dst.at(0), full_row.at(0));
-    EXPECT_EQ(dst.at(1), full_row.at(1));
-    EXPECT_EQ(dst.at(2), full_row.at(2));
-    EXPECT_EQ(swa_row.at(0), 0) << "swa slot 0 is the pre-window hole";
-    EXPECT_EQ(dst.at(3), swa_row.at(1));
-    EXPECT_EQ(dst.at(4), swa_row.at(2));
+    EXPECT_EQ(dst.at(0), full_row[0]);
+    EXPECT_EQ(dst.at(1), full_row[1]);
+    EXPECT_EQ(dst.at(2), full_row[2]);
+    EXPECT_EQ(swa_row[0], 0) << "swa slot 0 is the pre-window hole";
+    EXPECT_EQ(dst.at(3), swa_row[1]);
+    EXPECT_EQ(dst.at(4), swa_row[2]);
 
     // The 5 matched host entries stay load-pinned until LoadBackDone retires the op.
     EXPECT_EQ(scheduler_->FlatHostPoolPinnedBlocks(), 5);
@@ -3545,8 +3553,197 @@ TEST_F(FlatChunkedHostHitSuite, ChunkedPrefillAfterHostHit) {
 }
 
 // ---------------------------------------------------------------------------
-// Heterogeneous per-group block_size: specs carry each group's own block_size
-// and BaseBlockSize() folds them via GCD.
+// Heterogeneous flat pools: canonical config, per-pool admission, and decode
+// reservation accounting. Pool configs are deliberately unsorted; observable
+// PoolDemand order is canonical pool_id order.
+// ---------------------------------------------------------------------------
+SchedulerConfig MakeHeterogeneousPoolConfig(std::int32_t history_blocks, std::int32_t state_blocks,
+                                            std::int32_t max_scheduled_tokens = 64,
+                                            std::int32_t decode_input_tokens = 1) {
+    SchedulerConfig cfg{};
+    cfg.block_size = 2;
+    cfg.device_allocator.total_pages = 0;
+    cfg.host_allocator.total_pages = 1;
+    cfg.max_scheduled_tokens = max_scheduled_tokens;
+    cfg.max_batch_size = 8;
+    cfg.decode_input_tokens = decode_input_tokens;
+    cfg.enable_l3_storage = false;
+    cfg.disable_l2_cache = true;
+    cfg.disable_prefix_cache = true;
+    cfg.flat_block_pools = {
+        FlatBlockPoolConfig{.pool_id = "state", .total_blocks = state_blocks, .bytes_per_block = 32},
+        FlatBlockPoolConfig{.pool_id = "history", .total_blocks = history_blocks, .bytes_per_block = 128},
+    };
+
+    PagedCacheGroupConfig history =
+        MakeGroup("history_group", cfg.block_size, history_blocks, PagedCacheGroupConfig::Retention::FullHistory,
+                  PagedCacheGroupFamily::History);
+    history.pool_id = "history";
+    PagedCacheGroupConfig state =
+        MakeGroup("state_group", cfg.block_size, state_blocks, PagedCacheGroupConfig::Retention::FullHistory,
+                  PagedCacheGroupFamily::History);
+    state.pool_id = "state";
+    cfg.paged_cache_groups = {history, state};
+    return cfg;
+}
+
+TEST(HeterogeneousFlatSchedulerTest, AggregateReportsByteUsageAndBottleneckPressureWithoutPoolRows) {
+    Scheduler scheduler(MakeHeterogeneousPoolConfig(/*history_blocks=*/5, /*state_blocks=*/9));
+
+    FlatPoolAggregate initial = scheduler.FlatPoolAggregateStats();
+    EXPECT_EQ(initial.active_bytes, 0);
+    EXPECT_EQ(initial.capacity_bytes, 4 * 128 + 8 * 32);
+    EXPECT_EQ(initial.pressure_numerator, 0);
+    EXPECT_EQ(initial.pressure_denominator, 1);
+
+    scheduler.SubmitRequests({RequestSpec{.request_id = "r", .tokens = MakeAlignedTokens(2, 2)}});
+    ASSERT_NE(FindFlatOp(scheduler.NextExecutionPlan()), nullptr);
+
+    FlatPoolAggregate allocated = scheduler.FlatPoolAggregateStats();
+    EXPECT_EQ(allocated.active_bytes, 2 * 128 + 2 * 32);
+    EXPECT_EQ(allocated.capacity_bytes, initial.capacity_bytes);
+    EXPECT_EQ(allocated.pressure_numerator, 3);
+    EXPECT_EQ(allocated.pressure_denominator, 4);
+}
+
+void SendHeterogeneousFlatForwardDone(Scheduler& scheduler, const std::string& request_id,
+                                      const FlatKVCompletionInput& input, std::vector<std::int32_t> tokens) {
+    ExecutionEvent event;
+    event.With(ForwardEvent{forward::ExtendResult{
+        .request_id = request_id,
+        .tokens = std::move(tokens),
+        .flat_kv_completion =
+            forward::FlatKVCompletion{
+                .table_generation = input.table_generation,
+                .dispatch_seq = input.dispatch_seq,
+                .accepted_raw_end = input.dispatch_raw_end,
+            },
+    }});
+    scheduler.Advance(event);
+}
+
+TEST(HeterogeneousFlatSchedulerTest, FirstPrefillShortfallMutatesNoPool) {
+    Scheduler scheduler(MakeHeterogeneousPoolConfig(/*history_blocks=*/6, /*state_blocks=*/2));
+    const std::vector<std::int32_t> baseline = SnapshotFreeBlocks(scheduler);
+    scheduler.SubmitRequests({RequestSpec{.request_id = "r", .tokens = MakeAlignedTokens(2, 2)}});
+
+    ExecutionPlan plan = scheduler.NextExecutionPlan();
+
+    const FlatForwardOperation* op = FindFlatOp(plan);
+    ASSERT_NE(op, nullptr);
+    EXPECT_TRUE(op->request_ids.empty());
+    EXPECT_EQ(scheduler.WaitingSize(), 1u);
+    EXPECT_EQ(SnapshotFreeBlocks(scheduler), baseline);
+    EXPECT_EQ(scheduler.FlatReservedBlocksByPool(), (PoolDemand{0, 0}));
+}
+
+TEST(HeterogeneousFlatSchedulerTest, DecodeConsumesOwnVectorReservationWithoutCrossPoolBorrowing) {
+    SchedulerConfig cfg = MakeHeterogeneousPoolConfig(/*history_blocks=*/10, /*state_blocks=*/7,
+                                                      /*max_scheduled_tokens=*/64,
+                                                      /*decode_input_tokens=*/3);
+    cfg.paged_cache_groups[0].rows_per_page = 4;
+    cfg.paged_cache_groups[0].block_size = 4;
+    Scheduler scheduler(std::move(cfg));
+
+    scheduler.SubmitRequests({
+        RequestSpec{.request_id = "a", .tokens = MakeAlignedTokens(2, 2)},
+        RequestSpec{.request_id = "b", .tokens = MakeAlignedTokens(1, 2, 101)},
+    });
+    ExecutionPlan prefill = scheduler.NextExecutionPlan();
+    const FlatForwardOperation* prefill_op = FindFlatOp(prefill);
+    ASSERT_NE(prefill_op, nullptr);
+    ASSERT_EQ(prefill_op->request_ids, (std::vector<std::string>{"a"}));
+    EXPECT_EQ(scheduler.WaitingSize(), 1u);
+    EXPECT_EQ(SnapshotFreeBlocks(scheduler), (std::vector<std::int32_t>{8, 4}));
+    EXPECT_EQ(scheduler.FlatReservedBlocksByPool(), (PoolDemand{1, 2}));
+
+    ASSERT_EQ(prefill_op->flat_kv_completion_inputs.size(), 1u);
+    SendHeterogeneousFlatForwardDone(scheduler, prefill_op->request_ids.front(),
+                                     prefill_op->flat_kv_completion_inputs.front(), {99});
+    ExecutionPlan decode = scheduler.NextExecutionPlan();
+    const FlatForwardOperation* decode_op = FindFlatOp(decode);
+    ASSERT_NE(decode_op, nullptr);
+    EXPECT_EQ(decode_op->request_ids, (std::vector<std::string>{"a"}));
+    EXPECT_EQ(SnapshotFreeBlocks(scheduler), (std::vector<std::int32_t>{7, 2}));
+    EXPECT_EQ(scheduler.FlatReservedBlocksByPool(), (PoolDemand{0, 0}));
+    EXPECT_EQ(scheduler.WaitingSize(), 1u);
+}
+
+enum class V4ExplicitFlatConfigViolation {
+    kDuplicatePageAuthority,
+    kZeroBytesPerBlock,
+    kMissingPool,
+    kUnknownPool,
+    kPdRole,
+    kHostTier,
+    kRadixMamba,
+    kRadixL3,
+};
+
+TEST(HeterogeneousFlatSchedulerTest, ExplicitFlatV4RejectsUnsupportedConfigMatrix) {
+    struct Case {
+        const char* name;
+        V4ExplicitFlatConfigViolation violation;
+        const char* error;
+    };
+    const Case cases[] = {
+        {"duplicate page authority", V4ExplicitFlatConfigViolation::kDuplicatePageAuthority,
+         "only device page authority"},
+        {"zero bytes per block", V4ExplicitFlatConfigViolation::kZeroBytesPerBlock, "positive bytes_per_block"},
+        {"missing pool", V4ExplicitFlatConfigViolation::kMissingPool, "must bind a configured pool_id"},
+        {"unknown pool", V4ExplicitFlatConfigViolation::kUnknownPool, "must bind a configured pool_id"},
+        {"PD role", V4ExplicitFlatConfigViolation::kPdRole, "group-aware PD transfer"},
+        {"usable host tier", V4ExplicitFlatConfigViolation::kHostTier, "device-only"},
+        {"radix mamba adjunct", V4ExplicitFlatConfigViolation::kRadixMamba, "radix-owned Mamba"},
+        {"radix l3", V4ExplicitFlatConfigViolation::kRadixL3, "radix-owned L3"},
+    };
+
+    for (const Case& test_case : cases) {
+        SCOPED_TRACE(test_case.name);
+        SchedulerConfig config = MakeHeterogeneousPoolConfig(/*history_blocks=*/6, /*state_blocks=*/5);
+        switch (test_case.violation) {
+            case V4ExplicitFlatConfigViolation::kDuplicatePageAuthority:
+                config.device_allocator.total_pages = 8;
+                break;
+            case V4ExplicitFlatConfigViolation::kZeroBytesPerBlock:
+                config.flat_block_pools.front().bytes_per_block = 0;
+                break;
+            case V4ExplicitFlatConfigViolation::kMissingPool:
+                config.flat_block_pools.erase(config.flat_block_pools.begin());
+                break;
+            case V4ExplicitFlatConfigViolation::kUnknownPool:
+                config.paged_cache_groups.at(1).pool_id = "unknown";
+                break;
+            case V4ExplicitFlatConfigViolation::kPdRole:
+                config.role = Role::kD;
+                break;
+            case V4ExplicitFlatConfigViolation::kHostTier:
+                config.host_allocator.total_pages = 8;
+                config.disable_l2_cache = false;
+                break;
+            case V4ExplicitFlatConfigViolation::kRadixMamba:
+                config.enable_mamba = true;
+                config.mamba_pool_total_chunks = 4;
+                break;
+            case V4ExplicitFlatConfigViolation::kRadixL3:
+                config.enable_l3_storage = true;
+                break;
+        }
+
+        bool rejected = false;
+        try {
+            Scheduler scheduler(std::move(config));
+        } catch (const std::invalid_argument& error) {
+            rejected = true;
+            EXPECT_NE(std::string{error.what()}.find(test_case.error), std::string::npos) << error.what();
+        }
+        EXPECT_TRUE(rejected);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Heterogeneous per-group block_size: specs carry each group's own block_size.
+// KvCacheCoordinator is the only component that folds them into base geometry.
 // ---------------------------------------------------------------------------
 TEST(HeteroBlockSize, SpecsCarryPerGroupBlockSize) {
     SchedulerConfig cfg{};
@@ -3562,11 +3759,11 @@ TEST(HeteroBlockSize, SpecsCarryPerGroupBlockSize) {
     cfg.paged_cache_groups[0].block_size = 4;
     cfg.paged_cache_groups[1].block_size = 8;
 
-    std::vector<KvCacheSpec> specs = MakeSpecsFromConfig(cfg);
+    BlockPoolSet pools(MakeFlatBlockPoolConfigs(cfg));
+    std::vector<KvCacheSpec> specs = MakeSpecsFromConfig(cfg, pools);
     ASSERT_EQ(specs.size(), 2u);
     EXPECT_EQ(specs[0].block_size, 4);
     EXPECT_EQ(specs[1].block_size, 8);
-    EXPECT_EQ(cfg.BaseBlockSize(), 4);
 }
 
 // Build one full-attn CacheGroup per block_size and hand the specs to MakeCoordinator,
@@ -3583,14 +3780,14 @@ static std::unique_ptr<KvCacheCoordinator> MakeCoordinatorFrom(std::vector<std::
 
 TEST(HeteroBlockSize, MakeCoordinatorAcceptsDivisibleBlockSizes) {
     auto coord = MakeCoordinatorFrom({4, 8});
-    EXPECT_EQ(coord->BaseBlockSize(), 4);  // gcd(4,8)
-    EXPECT_EQ(coord->LcmBlockSize(), 8);   // lcm(4,8)
+    EXPECT_EQ(coord->BaseBlockSize(), 4);           // gcd(4,8)
+    EXPECT_EQ(coord->HistoryAlignmentTokens(), 8);  // history lcm(4,8)
 }
 
 TEST(HeteroBlockSize, BaseAndLcmForThreeGroups) {
     auto coord = MakeCoordinatorFrom({4, 6, 8});
-    EXPECT_EQ(coord->BaseBlockSize(), 2);  // gcd(4,6,8)
-    EXPECT_EQ(coord->LcmBlockSize(), 24);  // lcm(4,6,8)
+    EXPECT_EQ(coord->BaseBlockSize(), 2);            // gcd(4,6,8)
+    EXPECT_EQ(coord->HistoryAlignmentTokens(), 24);  // history lcm(4,6,8)
 }
 
 }  // namespace tokenspeed::test

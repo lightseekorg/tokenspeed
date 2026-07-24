@@ -20,10 +20,12 @@
 
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <openssl/sha.h>
@@ -61,10 +63,12 @@ inline std::string DigestToHex(const unsigned char* digest) {
     return out;
 }
 
-// Decode a hex string back into its raw bytes (inverse of DigestToHex).
-inline std::vector<uint8_t> HexToBytes(const std::string& hex) {
-    std::vector<uint8_t> bytes;
-    bytes.reserve(hex.size() / 2);
+// Decode a hex string into caller-owned storage. HashPageSegments uses this
+// overload for its fixed-size prior digest so chaining pages never allocates a
+// temporary byte vector.
+inline std::size_t HexToBytes(std::string_view hex, std::span<uint8_t> bytes) {
+    const std::size_t byte_count = hex.size() / 2;
+    _assert(byte_count <= bytes.size(), "hex output does not fit caller-owned storage");
     for (std::size_t i = 0; i + 1 < hex.size(); i += 2) {
         uint8_t hi = (hex[i] >= 'a')   ? static_cast<uint8_t>(hex[i] - 'a' + 10)
                      : (hex[i] >= 'A') ? static_cast<uint8_t>(hex[i] - 'A' + 10)
@@ -72,11 +76,25 @@ inline std::vector<uint8_t> HexToBytes(const std::string& hex) {
         uint8_t lo = (hex[i + 1] >= 'a')   ? static_cast<uint8_t>(hex[i + 1] - 'a' + 10)
                      : (hex[i + 1] >= 'A') ? static_cast<uint8_t>(hex[i + 1] - 'A' + 10)
                                            : static_cast<uint8_t>(hex[i + 1] - '0');
-        bytes.push_back(static_cast<uint8_t>((hi << 4) | lo));
+        bytes[i / 2] = static_cast<uint8_t>((hi << 4) | lo);
     }
+    return byte_count;
+}
+
+// Decode a hex string back into its raw bytes (inverse of DigestToHex).
+inline std::vector<uint8_t> HexToBytes(std::string_view hex) {
+    std::vector<uint8_t> bytes(hex.size() / 2);
+    HexToBytes(hex, bytes);
     return bytes;
 }
 
+// Hash one logical page whose tokens may straddle two stable backing spans.
+// The split is deliberately not represented in the byte stream: token_count is
+// the sum of both spans and tokens are absorbed first->second, exactly as if the
+// caller had copied them into one contiguous page. This lets completion hashing
+// join stable request tokens with newly returned tokens without an O(tokens)
+// staging copy.
+//
 // extra_keys: per-page list of distinguishing keys (e.g. LoRA name, cache salt);
 // the caller encodes each value, this function owns only the framing.
 //
@@ -86,19 +104,33 @@ inline std::vector<uint8_t> HexToBytes(const std::string& hex) {
 // prior_len separates page 0 from a chained page, token_count keeps tokens from
 // bleeding into extra_keys, and per-key length prefixes prevent re-splitting.
 // Feed order is prior_hash -> tokens -> extra_keys.
-inline std::string HashPage(std::span<const std::int32_t> tokens, const std::string& prior_hash,
-                            std::span<const std::string> extra_keys = {}) {
+inline std::string HashPageSegments(std::span<const std::int32_t> first_tokens,
+                                    std::span<const std::int32_t> second_tokens, const std::string& prior_hash,
+                                    std::span<const std::string> extra_keys = {}) {
     SHA256_CTX ctx;
     SHA256_Init(&ctx);
 
-    std::vector<uint8_t> prior_bytes = HexToBytes(prior_hash);
-    Sha256UpdateU32LE(ctx, static_cast<uint32_t>(prior_bytes.size()));
-    if (!prior_bytes.empty()) {
-        SHA256_Update(&ctx, prior_bytes.data(), prior_bytes.size());
+    std::array<uint8_t, SHA256_DIGEST_LENGTH> inline_prior_bytes{};
+    std::vector<uint8_t> overflow_prior_bytes;
+    const std::size_t prior_byte_count = prior_hash.size() / 2;
+    std::span<uint8_t> prior_bytes;
+    if (prior_byte_count <= inline_prior_bytes.size()) {
+        prior_bytes = std::span<uint8_t>{inline_prior_bytes}.first(prior_byte_count);
+    } else {
+        overflow_prior_bytes.resize(prior_byte_count);
+        prior_bytes = overflow_prior_bytes;
+    }
+    HexToBytes(prior_hash, prior_bytes);
+    Sha256UpdateU32LE(ctx, static_cast<uint32_t>(prior_byte_count));
+    if (prior_byte_count != 0) {
+        SHA256_Update(&ctx, prior_bytes.data(), prior_byte_count);
     }
 
-    Sha256UpdateU32LE(ctx, static_cast<uint32_t>(tokens.size()));
-    for (std::int32_t t : tokens) {
+    Sha256UpdateU32LE(ctx, static_cast<uint32_t>(first_tokens.size() + second_tokens.size()));
+    for (std::int32_t t : first_tokens) {
+        Sha256UpdateU32LE(ctx, static_cast<uint32_t>(t));
+    }
+    for (std::int32_t t : second_tokens) {
         Sha256UpdateU32LE(ctx, static_cast<uint32_t>(t));
     }
 
@@ -115,6 +147,11 @@ inline std::string HashPage(std::span<const std::int32_t> tokens, const std::str
     unsigned char digest[SHA256_DIGEST_LENGTH];
     SHA256_Final(digest, &ctx);
     return DigestToHex(digest);
+}
+
+inline std::string HashPage(std::span<const std::int32_t> tokens, const std::string& prior_hash,
+                            std::span<const std::string> extra_keys = {}) {
+    return HashPageSegments(tokens, {}, prior_hash, extra_keys);
 }
 
 inline std::vector<std::string> ComputePagedHashes(
@@ -168,8 +205,7 @@ inline std::vector<std::string> FoldBaseHashes(std::span<const std::string> base
     for (; idx + m <= static_cast<std::int32_t>(base_hashes.size()); idx += m) {
         std::string running;
         for (std::int32_t k = 0; k < m; ++k) {
-            running =
-                HashPage(std::span<const std::int32_t>{}, running, std::vector<std::string>{base_hashes[idx + k]});
+            running = HashPage(std::span<const std::int32_t>{}, running, base_hashes.subspan(idx + k, 1));
         }
         out.push_back(running);
     }
@@ -224,7 +260,8 @@ inline uint32_t GetGroupIdFromHashKey(const std::string& key) {
     if (key.size() < kGroupIdHexLen) {
         return 0;
     }
-    std::vector<uint8_t> b = HexToBytes(key.substr(key.size() - kGroupIdHexLen));
+    std::array<uint8_t, kGroupIdHexLen / 2> b{};
+    HexToBytes(std::string_view{key}.substr(key.size() - kGroupIdHexLen), b);
     return (static_cast<uint32_t>(b[0]) << 24) | (static_cast<uint32_t>(b[1]) << 16) |
            (static_cast<uint32_t>(b[2]) << 8) | static_cast<uint32_t>(b[3]);
 }

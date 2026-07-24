@@ -24,11 +24,11 @@
 #include <unordered_map>
 #include <variant>
 #include <cstdint>
-#include <numeric>
 #include <string>
 #include <vector>
 #include <memory>
 
+#include "cache/block_pool_set.h"
 #include "fsm/forward_events.h"
 #include "resource/allocator/paged_cache_group.h"
 #include "resource/types.h"
@@ -87,16 +87,11 @@ struct SchedulerConfig {
 
     std::vector<PagedCacheGroupConfig> paged_cache_groups{};
 
-    // GCD of every group's effective block_size (per-group override, else the global
-    // block_size): the base page granularity all group block sizes are multiples of.
-    std::int32_t BaseBlockSize() const {
-        std::int32_t base = 0;
-        for (const auto& g : paged_cache_groups) {
-            std::int32_t bs = g.block_size > 0 ? g.block_size : block_size;
-            base = base == 0 ? bs : std::gcd(base, bs);
-        }
-        return base == 0 ? block_size : base;
-    }
+    // Flat-only canonical device metadata pools. Empty preserves the legacy
+    // single-pool contract by synthesizing pool "default" from
+    // device_allocator.total_pages. Non-empty configs are canonicalized by
+    // BlockPoolSet and every group.pool_id must resolve into that frozen set.
+    std::vector<FlatBlockPoolConfig> flat_block_pools{};
 
     // Streaming-sink (flat L2) enablement: an L2 host tier exists (> 1: page 0 is the null
     // placeholder) and this role writes to it. Orthogonal to disable_prefix_cache by design:
@@ -120,6 +115,17 @@ struct SchedulerConfig {
     std::int32_t prefetch_threshold{4};  // num pages
     bool enable_kv_cache_events{false};
     bool enable_mixed_prefill_decode{false};
+    // Explicit pools are the device-side flat ownership boundary and always
+    // use executor-fenced completion. Empty preserves the legacy single-pool
+    // compatibility path. The compile option remains the sole Flat-versus-
+    // radix backend selector.
+    bool UsesExplicitFlatPools() const noexcept {
+#if TOKENSPEED_FLAT_KVCACHE
+        return !flat_block_pools.empty();
+#else
+        return false;
+#endif
+    }
 
     std::int32_t num_pages_reserved_for_retracted_or_running{};
     Role role{Role::kFused};

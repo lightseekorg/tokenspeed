@@ -167,13 +167,19 @@ class InklingAttnBackend(AttentionBackend):
     """Thin wrapper over the dense MHA backend adding conv metadata.
 
     All attention forwards and CUDA-graph hooks delegate to the wrapped
-    backend; this class only derives ``InklingConvMetadata`` from the same
-    arguments the dense path already receives, so the scheduler and executor
-    are unaware anything beyond dense attention exists.
+    backend. This class derives ``InklingConvMetadata`` from the same arguments
+    the dense path already receives and declares that Flat execution must keep
+    its heterogeneous cache locations group-keyed; the scheduler and executor
+    remain unaware of the model-specific reason for that capability.
     """
 
     # Ask the graph wrapper for actual_bs at replay so padded rows can be marked PAD_SLOT_ID.
     uses_padded_decode_token_mask = True
+    # Inkling's heterogeneous groups reinterpret pool-local page ids with
+    # different token spans. A scalar req_to_page/out_cache_loc drops the
+    # required group identity, so Flat execution must use the existing
+    # per-group table and write-location metadata for both target and draft.
+    requires_group_keyed_cache_locs = True
 
     def __init__(
         self,

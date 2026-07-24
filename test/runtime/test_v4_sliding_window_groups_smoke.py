@@ -41,11 +41,17 @@ def _load(mod_name: str, file_name: str):
     return mod
 
 
-_generic = _load("tokenspeed.runtime.configs.paged_cache_spec", "paged_cache_spec.py")
-_v4 = _load(
-    "tokenspeed_runtime_configs_deepseek_v4_cache_spec_smoke",
-    "deepseek_v4_cache_spec.py",
-)
+with patch.dict(sys.modules):
+    _contract = _load(
+        "tokenspeed.runtime.configs.flat_kv_contract", "flat_kv_contract.py"
+    )
+    _generic = _load(
+        "tokenspeed.runtime.configs.paged_cache_spec", "paged_cache_spec.py"
+    )
+    _v4 = _load(
+        "tokenspeed_runtime_configs_deepseek_v4_cache_spec_smoke",
+        "deepseek_v4_cache_spec.py",
+    )
 
 build_v4_cache_specs = _v4.build_v4_cache_specs
 compute_max_logical_pages_for_capture = _generic.compute_max_logical_pages_for_capture
@@ -129,6 +135,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
                 sliding_window_tokens=window,
             )
             context_len = 5 * raw_per_page + 1
+            max_prefill_tokens = 2 * raw_per_page + 1
             for verify_width in (1, 2, 4, 8):
                 for overlap_depth in (0, 1):
                     with self.subTest(
@@ -140,6 +147,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
                             full,
                             max_context_len=context_len,
                             max_tokens_per_req=verify_width,
+                            max_prefill_tokens_per_req=max_prefill_tokens,
                             overlap_schedule_depth=overlap_depth,
                         )
                         self.assertEqual(
@@ -154,12 +162,17 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
                             sliding,
                             max_context_len=context_len,
                             max_tokens_per_req=verify_width,
+                            max_prefill_tokens_per_req=max_prefill_tokens,
                             overlap_schedule_depth=overlap_depth,
                         )
                         self.assertEqual(
                             sliding_pages,
                             math.ceil(
-                                (window + (overlap_depth + 1) * verify_width)
+                                (
+                                    window
+                                    + overlap_depth * max_prefill_tokens
+                                    + (overlap_depth + 1) * verify_width
+                                )
                                 / raw_per_page
                             )
                             + 1,
@@ -239,6 +252,10 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
         for overrides, message in (
             ({"max_context_len": -1}, "max_context_len"),
             ({"max_tokens_per_req": 0}, "max_tokens_per_req"),
+            (
+                {"max_prefill_tokens_per_req": -1},
+                "max_prefill_tokens_per_req",
+            ),
             ({"overlap_schedule_depth": 2}, "overlap_schedule_depth"),
         ):
             with self.subTest(function="capture_width", overrides=overrides):

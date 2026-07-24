@@ -20,6 +20,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -42,6 +43,8 @@ public:
     TokenContainer& operator=(const TokenContainer&) = delete;
 
     void Extend(const std::vector<std::int32_t>& new_tokens);
+    void ReserveAdditional(std::size_t additional_tokens);
+    void ExtendPrepared(std::span<const std::int32_t> new_tokens) noexcept;
 
     // Flat retract: fold generated tokens into the prefill window so the
     // requeued request prefills prompt + generated as one fresh extend.

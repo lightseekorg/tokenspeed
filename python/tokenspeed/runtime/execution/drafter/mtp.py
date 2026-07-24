@@ -342,8 +342,9 @@ class Mtp(BaseDrafter):
         self.draft_seq_lens_buf = torch.zeros_like(self.input_buffers.seq_lens_buf)
 
         # Persistent output buffer for the draft step's compute_out_cache_loc.
-        self.draft_out_cache_loc_buf = torch.empty(
+        self.draft_out_cache_loc_buf = torch.full(
             (self.input_buffers.max_bs * (spec_num_steps - 1),),
+            self.input_buffers.dummy_kv_slot,
             dtype=torch.int32,
             device=self.device,
         )
@@ -707,14 +708,15 @@ class Mtp(BaseDrafter):
         ).clamp_min(0)
         step_positions = torch.cat([lb_positions, positions.view(bs, k)], 1).reshape(-1)
         lb_cache_loc = self.draft_out_cache_loc_buf[: bs * lb]
-        compute_out_cache_loc_uniform(
-            out_cache_loc_ptr=lb_cache_loc,
-            req_pool_indices=buffers.req_pool_indices_buf[:bs],
-            uniform_input_length=lb,
-            cache_start=(first_pos - lb).clamp_min(0).to(torch.int32),
-            req_to_pages=self.req_to_page,
-            page_size=self.page_size,
-        )
+        if not self.input_buffers.uses_group_keyed_cache_locs:
+            compute_out_cache_loc_uniform(
+                out_cache_loc_ptr=lb_cache_loc,
+                req_pool_indices=buffers.req_pool_indices_buf[:bs],
+                uniform_input_length=lb,
+                cache_start=(first_pos - lb).clamp_min(0).to(torch.int32),
+                req_to_pages=self.req_to_page,
+                page_size=self.page_size,
+            )
         out_cache_loc = torch.cat(
             [
                 lb_cache_loc.view(bs, lb),

@@ -37,10 +37,12 @@ public:
     bool IsCached() const noexcept { return !block_hash_.empty(); }
     const std::string& BlockHash() const noexcept { return block_hash_; }
 
+private:
+    friend class BlockPool;
+
     void SetHash(std::string hash);
     void ResetHash() noexcept { block_hash_.clear(); }
 
-private:
     std::int32_t block_id_{0};
     std::string block_hash_{};
 };

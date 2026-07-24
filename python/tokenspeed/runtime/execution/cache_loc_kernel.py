@@ -256,6 +256,8 @@ def fused_decode_input_prep_kernel(
     seq_lens_out_ptr,  # [batch_size]
     # Scalars
     uniform_input_length,
+    dummy_kv_slot,
+    USE_DUMMY_CACHE_LOC: tl.constexpr,
     page_size: tl.constexpr,
     max_pages: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -269,8 +271,8 @@ def fused_decode_input_prep_kernel(
       torch.add(input_lengths, valid_cache_lengths, out=seq_lens)
 
     Each program handles one request. We do one GMEM read of
-    `valid_cache_lengths[pool_idx]` and reuse it for the seq_lens write,
-    the position writes, and the out_cache_loc page-table lookup.
+    `valid_cache_lengths[pool_idx]` and reuse it for the seq_lens and position
+    writes plus, in legacy scalar-location mode, the page-table lookup.
     """
     req_idx = tl.program_id(0)
     pool_idx = tl.load(req_pool_indices_ptr + req_idx)
@@ -288,17 +290,23 @@ def fused_decode_input_prep_kernel(
         mask = token_offsets < uniform_input_length
 
         positions_local = cache_start + token_offsets
-        page_indices = positions_local // page_size
-        overflow = page_indices >= max_pages
-        # Clamp to last valid page to avoid OOB GMEM read.
-        page_indices = tl.minimum(page_indices, max_pages - 1)
-        offsets_in_page = positions_local % page_size
+        if USE_DUMMY_CACHE_LOC:
+            # Group-keyed flat KV writers resolve their real destinations from
+            # per-group table/base metadata. The scalar location is a fixed
+            # compatibility sentinel, so do not touch the legacy page table.
+            cache_locs = tl.full((BLOCK_SIZE,), dummy_kv_slot, tl.int32)
+        else:
+            page_indices = positions_local // page_size
+            overflow = page_indices >= max_pages
+            # Clamp to last valid page to avoid OOB GMEM read.
+            page_indices = tl.minimum(page_indices, max_pages - 1)
+            offsets_in_page = positions_local % page_size
 
-        page_ptrs = req_to_pages_ptr + pool_idx * max_pages + page_indices
-        page_ids = tl.load(page_ptrs, mask=mask, other=0)
-        cache_locs = page_ids * page_size + offsets_in_page
-        # Route overflow tokens to slot 0 (fixed safe dummy target).
-        cache_locs = tl.where(overflow, 0, cache_locs)
+            page_ptrs = req_to_pages_ptr + pool_idx * max_pages + page_indices
+            page_ids = tl.load(page_ptrs, mask=mask, other=0)
+            cache_locs = page_ids * page_size + offsets_in_page
+            # Route overflow tokens to slot 0 (fixed safe dummy target).
+            cache_locs = tl.where(overflow, 0, cache_locs)
 
         tl.store(
             out_cache_loc_ptr + output_offset + token_offsets,
@@ -321,6 +329,9 @@ def fused_decode_input_prep(
     uniform_input_length: int,
     req_to_pages: torch.Tensor,  # [req_pool_size+1, max_pages]
     page_size: int,
+    *,
+    use_dummy_cache_loc: bool = False,
+    dummy_kv_slot: int = 0,
 ) -> None:
     """Decode-only fast path: one Triton launch writes out_cache_loc,
     positions, and seq_lens, reading `valid_cache_lengths[pool_idx]`
@@ -338,6 +349,8 @@ def fused_decode_input_prep(
         positions_ptr,
         seq_lens_out_ptr,
         uniform_input_length,
+        dummy_kv_slot,
+        USE_DUMMY_CACHE_LOC=use_dummy_cache_loc,
         page_size=page_size,
         max_pages=max_pages,
         BLOCK_SIZE=BLOCK_SIZE,

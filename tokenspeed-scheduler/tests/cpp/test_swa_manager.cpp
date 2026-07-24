@@ -466,5 +466,78 @@ TEST(SwaManagerTest, AcquireAdvancePairingKeepsPhysicalPagesBounded) {
     EXPECT_GT(table.NumBlocks(), 3);
 }
 
+TEST(SwaManagerTest, BoundedMatchReturnsOnlyTrailingRunWithAbsoluteBase) {
+    BlockPool pool(16);
+    SwaManager mgr(/*block_size=*/4, /*sliding_window=*/10, KvTableLayout::kBoundedWindow);
+    std::vector<std::string> keys{
+        RealKey({0, 0, 0, 0}, 0), RealKey({1, 1, 1, 1}, 0), RealKey({2, 2, 2, 2}, 0),
+        RealKey({3, 3, 3, 3}, 0), RealKey({4, 4, 4, 4}, 0),
+    };
+    const std::int32_t b2 = CacheOnePage(pool, keys[2]);
+    const std::int32_t b3 = CacheOnePage(pool, keys[3]);
+    const std::int32_t b4 = CacheOnePage(pool, keys[4]);
+
+    PrefixMatch match = mgr.Match(pool, keys, /*begin_blocks=*/0, /*max_blocks=*/5);
+    EXPECT_EQ(match.base_logical_page, 2);
+    EXPECT_EQ(match.LogicalEnd(), 5);
+    EXPECT_EQ(BlockIds(match.blocks), (std::vector<std::int32_t>{b2, b3, b4}));
+    EXPECT_EQ(match.num_hit_blocks, 3);
+}
+
+TEST(SwaManagerTest, BoundedWindowOneRepresentsValidEmptyRangeAtBoundary) {
+    BlockPool pool(8);
+    SwaManager mgr(/*block_size=*/4, /*sliding_window=*/1, KvTableLayout::kBoundedWindow);
+    const std::vector<std::string> keys{"k0", "k1", "k2"};
+
+    PrefixProbe probe = mgr.Probe(pool, keys, /*begin_blocks=*/0, /*max_blocks=*/3);
+    EXPECT_TRUE(probe.hits.empty());
+    EXPECT_EQ(probe.base_logical_page, 3);
+    EXPECT_EQ(probe.LogicalEnd(), 3);
+
+    PrefixMatch match = mgr.AcquireMatchedBlocks(pool, keys, 0, probe);
+    EXPECT_TRUE(match.blocks.empty());
+    EXPECT_EQ(match.base_logical_page, 3);
+    EXPECT_EQ(match.LogicalEnd(), 3);
+}
+
+TEST(SwaManagerTest, ExactBoundaryDoesNotFallBackToEarlierResumableEndpoint) {
+    BlockPool pool(16);
+    SwaManager mgr(/*block_size=*/4, /*sliding_window=*/10, KvTableLayout::kBoundedWindow);
+    std::vector<std::string> keys{
+        RealKey({0, 0, 0, 0}, 0),
+        RealKey({1, 1, 1, 1}, 0),
+        RealKey({2, 2, 2, 2}, 0),
+        RealKey({3, 3, 3, 3}, 0),
+    };
+    CacheOnePage(pool, keys[0]);
+    CacheOnePage(pool, keys[1]);
+    CacheOnePage(pool, keys[2]);
+
+    PrefixProbe earlier = mgr.Probe(pool, keys, 0, 4);
+    EXPECT_EQ(earlier.LogicalEnd(), 3);
+    EXPECT_FALSE(mgr.ProbeExactBoundary(pool, keys, 0, 4).has_value());
+}
+
+TEST(SwaManagerTest, BoundedReclaimAdvancesLogicalBaseAndShrinksStorage) {
+    BlockPool pool(16);
+    SwaManager mgr(/*block_size=*/2, /*sliding_window=*/4, KvTableLayout::kBoundedWindow);
+    BlockTable table;
+    ASSERT_TRUE(mgr.Acquire(pool, table, 10));
+    ASSERT_EQ(table.BaseLogicalPage(), 0);
+    ASSERT_EQ(table.LogicalEnd(), 5);
+    const std::int32_t free_before = pool.NumFreeBlocks();
+
+    mgr.ReclaimExpired(pool, table, /*num_computed_tokens=*/5);
+    EXPECT_EQ(table.BaseLogicalPage(), 1);
+    EXPECT_EQ(table.LiveSize(), 4);
+    EXPECT_EQ(table.LogicalEnd(), 5);
+    EXPECT_EQ(pool.NumFreeBlocks(), free_before + 1);
+
+    mgr.ReclaimExpired(pool, table, /*num_computed_tokens=*/11);
+    EXPECT_EQ(table.BaseLogicalPage(), 4);
+    EXPECT_EQ(table.LiveSize(), 1);
+    EXPECT_EQ(table.LogicalEnd(), 5);
+}
+
 }  // namespace
 }  // namespace tokenspeed::test

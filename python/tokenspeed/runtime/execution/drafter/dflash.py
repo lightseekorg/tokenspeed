@@ -118,6 +118,12 @@ class DFlash(BaseDrafter):
     def _init_native_buffers(self) -> None:
         if self.input_buffers is None:
             raise ValueError("Native DFLASH requires input buffers.")
+        if self.input_buffers.uses_group_keyed_cache_locs:
+            raise RuntimeError(
+                "DFLASH does not support group-keyed flat cache locations; "
+                "a scalar req_to_page/out_cache_loc cannot represent the "
+                "draft owner's per-group page domains"
+            )
         if self.req_to_page is None:
             raise ValueError("Native DFLASH requires req_to_page.")
         if self.attn_backend is None or self.token_to_kv_pool is None:

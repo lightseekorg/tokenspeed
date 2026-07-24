@@ -110,6 +110,7 @@ class RequestHandler:
         recv_func,
         send_func,
         get_load_fn=None,
+        get_internal_state_fn=None,
         architectures: list[str] | None = None,
         pause_controller=None,
         memory_controller=None,
@@ -140,6 +141,7 @@ class RequestHandler:
         self.max_req_len = max_req_len
         self.vocab_size = vocab_size
         self.get_load_fn = get_load_fn
+        self.get_internal_state_fn = get_internal_state_fn
 
         self.tokenizer = get_tokenizer(
             server_args.tokenizer,
@@ -228,7 +230,14 @@ class RequestHandler:
             elif isinstance(recv_req, IsSleepingReqInput):
                 self.memory_controller.handle_is_sleeping(recv_req)
             elif isinstance(recv_req, GetInternalStateReq):
-                self.send_func.send_pyobj(GetInternalStateReqOutput(internal_state={}))
+                internal_state = (
+                    self.get_internal_state_fn()
+                    if self.get_internal_state_fn is not None
+                    else {}
+                )
+                self.send_func.send_pyobj(
+                    GetInternalStateReqOutput(internal_state=internal_state)
+                )
             elif isinstance(recv_req, SetInternalStateReq):
                 self.send_func.send_pyobj(
                     SetInternalStateReqOutput(updated=False, server_args={})

@@ -36,6 +36,7 @@ DEVICE_MAPPING = {
 # Per-commit test suites (run on every PR)
 PER_COMMIT_SUITES = {
     DeviceBackend.CUDA: [
+        "deepseek-v4-flat-synthetic",
         "runtime-1gpu",
         "runtime-2gpu",
         "runtime-prefix-cache-e2e",

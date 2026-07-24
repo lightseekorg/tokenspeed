@@ -28,13 +28,14 @@ import torch
 from tokenspeed_kernel.ops.tuning import freeze_autotuning
 from tokenspeed_kernel.platform import current_platform
 
+from tokenspeed.runtime.configs.flat_kv_contract import CACHE_OWNER_DRAFT
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.configs.paged_cache_spec import (
     scheduler_ext_flat_kvcache,
-    validate_flat_scheduler_config,
 )
 from tokenspeed.runtime.configs.utils import get_rope_parameters
 from tokenspeed.runtime.engine.scheduler_utils import (
+    flat_block_table_base_offsets_from_forward_op,
     flat_block_tables_from_forward_op,
     paged_cache_block_table_base_offsets_from_forward_op,
     paged_cache_block_tables_from_forward_op,
@@ -55,6 +56,15 @@ from tokenspeed.runtime.execution.nan_guard import NanGuard
 from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 from tokenspeed.runtime.execution.types import ModelExecutionResult
+from tokenspeed.runtime.flat_cache_tables import (
+    CacheTableSource,
+    legacy_flat_loc_group_id,
+    resolve_cache_table_binding,
+    resolve_cache_table_source,
+    validate_flat_cache_generation,
+    validate_flat_cache_table_source,
+    validate_speculative_flat_bindings,
+)
 from tokenspeed.runtime.grammar.capturable_grammar import setup_grammar_step
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 from tokenspeed.runtime.layers.paged_attention import (
@@ -92,9 +102,8 @@ def _get_drafter_impl(spec_algo: str, model: torch.nn.Module):
 
     DRAFTER_MAPPING = {"EAGLE3": Eagle, "MTP": Eagle, "DFLASH": DFlash}
 
-    # "MTP" covers two algorithms:
-    # (1) Eagle-like MTP (e.g. DeepSeek) stays on Eagle in eagle.py;
-    # (2) Vanilla MTP (e.g. Inkling) with multi-layer weights stays on Mtp in mtp.py.
+    # "MTP" covers both an Eagle-compatible single-layer form and a native
+    # multi-layer form. Only the latter uses the dedicated Mtp implementation.
     if spec_algo == "MTP" and isinstance(model, InklingForConditionalGenerationNextN):
         return Mtp
     else:
@@ -181,8 +190,6 @@ class ModelExecutorConfig:
     overlap_schedule_depth: int = 0
     dp_sampling: bool = False
     dp_sampling_min_bs: int | None = None
-    use_v4_mtp_paged_metadata: bool = False
-
     # ====== GRAMMAR =========
     # "none" disables all grammar handling; otherwise the backend name
     # (currently only "xgrammar" is implemented).
@@ -247,7 +254,6 @@ class ModelExecutorConfig:
             dp_sampling=server_args.dp_sampling,
             dp_sampling_min_bs=server_args.dp_sampling_min_bs,
             enable_nan_detection=server_args.enable_nan_detection,
-            use_v4_mtp_paged_metadata=model_config.use_v4_mtp_paged_metadata,
             grammar_backend=server_args.grammar_backend,
             disable_capturable_grammar=server_args.disable_capturable_grammar,
         )
@@ -276,36 +282,92 @@ class ModelExecutor:
         self.sampling_backend = sampling_backend
         self.attn_backend = attn_backend
         self.token_to_kv_pool = token_to_kv_pool
-        # Full-attention group mirrored into req_to_page each step (flat+spec).
         _group_specs = getattr(token_to_kv_pool, "paged_cache_group_specs", ()) or ()
-        self._flat_full_group_id = next(
-            (
-                str(spec.group_id)
-                for spec in _group_specs
-                if getattr(spec, "family", "history") != "state"
-                and getattr(spec, "retention", None) == "full_history"
-            ),
-            None,
+        _completion_group_specs = (
+            getattr(token_to_kv_pool, "scheduler_group_specs", None) or _group_specs
         )
-        self._mirror_idx_cpu: torch.Tensor | None = None
-        self._mirror_idx_dev: torch.Tensor | None = None
-        self._mirror_row_buf: torch.Tensor | None = None
         self.draft_attn_backend = draft_attn_backend
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self._layerwise_mamba_cow_done = None
 
-        # Must precede CUDA-graph capture: unsupported flat combinations
-        # (e.g. spec on a backend without flat_spec_capable) would otherwise
-        # die on a capture-path assert instead of this actionable error.
-        validate_flat_scheduler_config(
-            flat_kvcache_ext=scheduler_ext_flat_kvcache(),
-            paged_cache_groups=_group_specs,
-            attn_backend=attn_backend,
-            kv_pool=token_to_kv_pool,
-            speculative_algorithm=config.spec_algo,
+        flat_scheduler_active = scheduler_ext_flat_kvcache()
+        self._target_cache_table_binding = resolve_cache_table_binding(
+            backend=attn_backend,
+            pool=token_to_kv_pool,
+            flat_scheduler_active=flat_scheduler_active,
+        )
+        self._draft_cache_table_binding = (
+            resolve_cache_table_binding(
+                backend=draft_attn_backend,
+                pool=draft_token_to_kv_pool,
+                flat_scheduler_active=flat_scheduler_active,
+            )
+            if draft_attn_backend is not None and draft_token_to_kv_pool is not None
+            else None
+        )
+        self._flat_generation_pool = next(
+            (
+                pool
+                for pool, binding in (
+                    (token_to_kv_pool, self._target_cache_table_binding),
+                    (draft_token_to_kv_pool, self._draft_cache_table_binding),
+                )
+                if pool is not None
+                and binding is not None
+                and binding.kind == "flat"
+                and getattr(pool, "flat_memory_plan", None) is not None
+            ),
+            None,
         )
 
-        if config.spec_algo is not None:
+        validate_speculative_flat_bindings(
+            target_pool=token_to_kv_pool,
+            target_binding=self._target_cache_table_binding,
+            draft_pool=draft_token_to_kv_pool,
+            draft_binding=self._draft_cache_table_binding,
+            speculative_algorithm=config.spec_algo,
+        )
+        self._uses_group_keyed_cache_locs = (
+            self._target_cache_table_binding.group_keyed_cache_locs
+        )
+        self._extract_scheduler_cache_tables = (
+            self._extract_flat_scheduler_cache_tables
+            if self._target_cache_table_binding.kind == "flat"
+            else self._extract_radix_scheduler_cache_tables
+        )
+        self._legacy_flat_loc_group_id = (
+            None
+            if self._uses_group_keyed_cache_locs
+            else legacy_flat_loc_group_id(
+                _group_specs,
+                legacy_page_size=config.block_size,
+            )
+        )
+        self._mirror_idx_cpu: torch.Tensor | None = None
+        self._mirror_idx_dev: torch.Tensor | None = None
+        self._mirror_row_buf: torch.Tensor | None = None
+
+        flat_source_active = self._target_cache_table_binding.kind == "flat"
+        if (
+            config.spec_algo is not None
+            and flat_source_active
+            and not self._uses_group_keyed_cache_locs
+            and self._legacy_flat_loc_group_id is None
+        ):
+            raise RuntimeError(
+                "flat speculative cache locations require either a group-keyed "
+                "backend or exactly one mirror-compatible stride-1 full-history "
+                "cache group whose block span equals the legacy page size; "
+                "refusing to mirror an arbitrary group into "
+                "req_to_page"
+            )
+
+        if self._uses_group_keyed_cache_locs:
+            # Group-keyed flat caches have no canonical scalar page domain. Keep a one-column
+            # page-0 sentinel solely for source-neutral call signatures; all
+            # real target/draft tables and write locations are group-keyed.
+            max_num_pages_per_req = 1
+        elif config.spec_algo is not None:
             # The DFLASH overlap scheduler reserves a fresh draft block per
             # decode step a request stays scheduled, including the few steps it
             # lingers between finishing and eviction, so peak page count runs
@@ -337,12 +399,9 @@ class ModelExecutor:
         )
         spec_num_tokens = config.spec_num_tokens if config.spec_algo is not None else 1
         # Stride for indexing req_to_page when building drafter caller-side
-        # write locs. These locs are live on the radix arm only: on flat,
-        # every KV write (target and draft) takes the backend metadata's
-        # per-group out_cache_locs, and req_to_page is a verbatim mirror of
-        # the full-attention group's table kept for the non-flat fallbacks —
-        # the caller locs computed from it are never consumed there (the
-        # Inkling rel path asserts loc/row agreement).
+        # write locs. Radix and the exact-geometry legacy Flat fallback consume
+        # these scalar locations. Group-keyed Flat backends keep them on the
+        # page-0 sentinel and route every real write through per-group metadata.
         self._draft_page_size = int(
             getattr(draft_token_to_kv_pool, "page_size", 0) or config.block_size
         )
@@ -356,7 +415,16 @@ class ModelExecutor:
             state_write_padding_pool_index=config.max_req_pool_size,
             device=self.device,
             has_mamba=(mamba_pool is not None),
+            uses_group_keyed_cache_locs=self._uses_group_keyed_cache_locs,
+            flat_memory_plan=getattr(token_to_kv_pool, "flat_memory_plan", None),
         )
+        if (
+            self._flat_generation_pool is not None
+            and self.input_buffers.flat_block_table_staging is None
+        ):
+            raise RuntimeError(
+                "planned flat cache execution requires table staging buffers"
+            )
         self.runtime_states = RuntimeStates(
             req_pool_size=config.max_req_pool_size,
             context_len=config.context_len,
@@ -424,6 +492,35 @@ class ModelExecutor:
                 )
         else:
             self.drafter = None
+
+        # Validate the static draft-write contract once at the initialization
+        # seam. A successful forward and the copy_event recorded later on the
+        # same execution stream are then sufficient completion evidence; the
+        # forward hot path does not need a second progress tracker.
+        draft_prefix_capability = getattr(
+            self.drafter,
+            "first_step_covers_all_draft_kv_layers",
+            False,
+        )
+        if type(draft_prefix_capability) is not bool:
+            raise TypeError(
+                "first_step_covers_all_draft_kv_layers must be a host Python bool"
+            )
+        if flat_source_active and not _completion_group_specs:
+            raise RuntimeError("flat KV completion requires scheduler group specs")
+        requires_draft_forward = any(
+            int(getattr(spec, "owner_mask", 0)) & CACHE_OWNER_DRAFT
+            for spec in _completion_group_specs
+        )
+        if (
+            flat_source_active
+            and requires_draft_forward
+            and not draft_prefix_capability
+        ):
+            raise RuntimeError(
+                "flat KV draft groups require the first draft step to cover "
+                "every planned draft KV layer"
+            )
 
         # Single grammar handle: CapturableGrammarExecutor on CUDA (uses
         # cudaLaunchHostFunc on a side stream so the xgrammar fill +
@@ -554,6 +651,9 @@ class ModelExecutor:
             eager_grammar_buffers=self.eager_grammar_buffers,
             sampling_backend=self.sampling_backend,
             runtime_states=self.runtime_states,
+            target_cache_table_binding=self._target_cache_table_binding,
+            draft_cache_table_binding=self._draft_cache_table_binding,
+            flat_generation_pool=self._flat_generation_pool,
         )
 
         # Breakable prefill (extend) CUDA graphs, the extend-mode analogue of
@@ -674,24 +774,100 @@ class ModelExecutor:
             else None
         )
 
-    def _mirror_flat_full_table_into_req_to_page(
+    def _extract_flat_scheduler_cache_tables(
+        self,
+        forward_op,
+        bs: int,
+        cache_generation: int | None,
+    ) -> tuple[None, None, CacheTableSource | None, dict]:
+        """Stage exactly the Flat table ABI selected during initialization."""
+
+        flat_staging = self.input_buffers.flat_block_table_staging
+        if flat_staging is not None and bs > 0:
+            source = flat_staging.stage(
+                forward_op,
+                num_reqs=bs,
+                cache_generation=cache_generation,
+            )
+            return None, None, source, source.tables
+        if flat_staging is not None:
+            # Idle graph replay rotates a slot after its padded size is known.
+            return None, None, None, {}
+
+        tables = flat_block_tables_from_forward_op(
+            forward_op,
+            device=self.device,
+            num_reqs=bs,
+        )
+        base_offsets, _ = flat_block_table_base_offsets_from_forward_op(
+            forward_op,
+            device=self.device,
+            num_reqs=bs,
+        )
+        if not tables and not base_offsets:
+            return None, None, None, tables
+        source = resolve_cache_table_source(
+            paged_tables=None,
+            paged_base_offsets=None,
+            flat_tables=tables,
+            flat_base_offsets=base_offsets,
+            flat_generation=(
+                cache_generation
+                if cache_generation is not None
+                else getattr(forward_op, "cache_generation", None)
+            ),
+        )
+        validate_flat_cache_table_source(
+            source,
+            where="model executor flat table conversion",
+            min_rows=bs,
+        )
+        return None, None, source, tables
+
+    def _extract_radix_scheduler_cache_tables(
+        self,
+        forward_op,
+        bs: int,
+        cache_generation: int | None,
+    ) -> tuple[dict, dict, None, dict]:
+        """Convert exactly the radix table ABI selected during initialization."""
+
+        del cache_generation
+        tables = paged_cache_block_tables_from_forward_op(
+            forward_op,
+            device=self.device,
+            num_reqs=bs,
+        )
+        base_offsets, _ = paged_cache_block_table_base_offsets_from_forward_op(
+            forward_op,
+            device=self.device,
+            num_reqs=bs,
+        )
+        return tables, base_offsets, None, {}
+
+    def _mirror_legacy_flat_table_into_req_to_page(
         self, forward_op, flat_block_tables
     ) -> None:
-        """Flat + spec: scatter the full-attention group's per-batch table
-        into req_to_page rows, restoring the radix contract for every
-        legacy consumer (input prep's out_cache_loc kernels, the drafter's
-        per-step location chains). The flat scheduler never populates
-        req_to_page itself; column tails zero-fill to the dummy page so
-        stale longer rows can't leak."""
+        """Populate the legacy scalar scratch table from one safe Flat group.
+
+        The selected group is the unique stride-1, absolute full-history
+        candidate whose block span exactly equals the scalar page size. Other
+        groups continue through per-group metadata. Group-keyed caches never
+        enter this path because their local page ids require a group identity.
+        """
         if (
             self.drafter is None
             or not flat_block_tables
-            or self._flat_full_group_id is None
+            or self._legacy_flat_loc_group_id is None
         ):
             return
-        table = flat_block_tables.get(self._flat_full_group_id)
+        table = flat_block_tables.get(self._legacy_flat_loc_group_id)
         if table is None:
-            return
+            raise RuntimeError(
+                "legacy flat req_to_page mirror is missing its validated group "
+                f"{self._legacy_flat_loc_group_id!r}; delivered groups="
+                f"{sorted(flat_block_tables)}"
+            )
         bs = len(forward_op.request_pool_indices)
         if self._mirror_idx_cpu is None or self._mirror_idx_cpu.shape[0] < bs:
             cap = max(bs, self.input_buffers.max_bs)
@@ -1356,6 +1532,15 @@ class ModelExecutor:
 
         return result
 
+    def cuda_graph_runtime_evidence(self) -> dict[str, object]:
+        """Return cold capture/replay evidence for acceptance gates."""
+
+        return {
+            "decode": self.forward_step.runtime_evidence(),
+            "prefill": self.prefill_graph.runtime_evidence(),
+            "drafter_present": self.drafter is not None,
+        }
+
     def execute_idle_forward(
         self,
         global_num_tokens: list[int],
@@ -1464,6 +1649,13 @@ class ModelExecutor:
         # Update page tables on the default stream before switching to execution stream.
         # HostTodevice segment begins
         with nvtx_range("update_block_table", color="cyan"):
+            if self._uses_group_keyed_cache_locs:
+                # Never feed FlatForwardOperation.occupied_pages into the
+                # radix mirror: it is only a first-group compatibility sample
+                # and its local ids are meaningless in every other pool.
+                # The single schema guard lives in staging.stage(), immediately
+                # before the atomic table/base copy on the execution path.
+                return
             update_block_table(
                 forward_op=forward_op,
                 device=self.device,
@@ -1705,6 +1897,15 @@ class ModelExecutor:
         multimodal_context=None,
         capture_next_input_ids: bool = False,
     ) -> ModelExecutionResult:
+        cache_generation = None
+        if self._flat_generation_pool is not None:
+            cache_generation = validate_flat_cache_generation(
+                getattr(forward_op, "cache_generation", None),
+                expected_generation=getattr(
+                    self._flat_generation_pool, "arena_generation", None
+                ),
+                where="model executor forward entry",
+            )
         num_extends = forward_op.num_extends()
         total_tokens = sum(forward_op.input_lengths)
         self._active_multimodal_context = multimodal_context
@@ -1718,7 +1919,6 @@ class ModelExecutor:
         output_d2h_ms = 0.0
         graph_capable = False
         graph_padded_bs = 0
-
         with nvtx_range("pre_fill_setup", color="orange"):
             has_retract = self._contains_retracted_decode(forward_op)
 
@@ -1731,13 +1931,21 @@ class ModelExecutor:
             bs = len(forward_op.request_ids)
             # Outside the graph: in-graph sites only OR into the flag buffer.
             self.nan_guard.reset(bs)
-            # Mirror the full group's flat table into req_to_page (flat+spec).
-            flat_block_tables = flat_block_tables_from_forward_op(
+            # The startup binding selects one extractor. Flat execution never
+            # touches the radix native properties/converters, and vice versa.
+            (
+                paged_cache_block_tables,
+                paged_cache_block_table_base_offsets,
+                flat_cache_table_source,
+                flat_block_tables,
+            ) = self._extract_scheduler_cache_tables(
                 forward_op,
-                device=self.device,
-                num_reqs=bs,
+                bs,
+                cache_generation,
             )
-            self._mirror_flat_full_table_into_req_to_page(forward_op, flat_block_tables)
+            self._mirror_legacy_flat_table_into_req_to_page(
+                forward_op, flat_block_tables
+            )
             decode_input_ids = self.input_buffers.fill_input_buffers(
                 forward_op=forward_op,
                 runtime_states=self.runtime_states,
@@ -1912,20 +2120,6 @@ class ModelExecutor:
                         if self.input_buffers.has_mamba
                         else {}
                     )
-                    paged_cache_block_tables = paged_cache_block_tables_from_forward_op(
-                        forward_op,
-                        device=self.device,
-                        num_reqs=bs,
-                    )
-                    # flat_block_tables computed once in pre_fill above.
-                    (
-                        paged_cache_block_table_base_offsets,
-                        _paged_cache_block_table_base_offset_max,
-                    ) = paged_cache_block_table_base_offsets_from_forward_op(
-                        forward_op,
-                        device=self.device,
-                        num_reqs=bs,
-                    )
                     self._log_dp_sampling_route(bs, ctx)
                     forward_step_start = 0.0
                     if timing_enabled:
@@ -1958,7 +2152,7 @@ class ModelExecutor:
                         paged_cache_block_table_base_offsets=(
                             paged_cache_block_table_base_offsets
                         ),
-                        flat_block_tables=flat_block_tables,
+                        flat_cache_table_source=flat_cache_table_source,
                         **mamba_kwargs,
                     )
                     if timing_enabled:

@@ -63,6 +63,7 @@ add_library(tokenspeed_scheduler_core STATIC
     csrc/scheduler/operations/forward.cpp
 
     csrc/scheduler/kv_cache_events.cpp
+    csrc/scheduler/flat_kv_completion_ledger.cpp
     csrc/scheduler/request.cpp
     csrc/scheduler/outside_event_handler.cpp
     csrc/scheduler/scheduler.cpp
@@ -122,9 +123,14 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
     )
     FetchContent_MakeAvailable(googletest)
 
-    add_executable(tokenspeed_scheduler_tests
+    set(TOKENSPEED_SCHEDULER_COMMON_TEST_SOURCES
         tests/cpp/test_page_hasher.cpp
+        tests/cpp/test_req_pool_allocator.cpp
+    )
+
+    set(TOKENSPEED_SCHEDULER_FLAT_TEST_SOURCES
         tests/cpp/test_block_pool.cpp
+        tests/cpp/test_block_pool_set.cpp
         tests/cpp/test_block_ref.cpp
         tests/cpp/test_full_attn_manager.cpp
         tests/cpp/test_swa_manager.cpp
@@ -132,13 +138,18 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_kv_cache_coordinator.cpp
         tests/cpp/test_forward_cache_ops.cpp
         tests/cpp/test_flat_forward_operation.cpp
+        tests/cpp/test_flat_kv_completion_ledger.cpp
+        tests/cpp/test_flat_kv_completion_scheduler.cpp
         tests/cpp/test_flat_kvcache_lifecycle.cpp
         tests/cpp/test_flat_kvcache_scenarios.cpp
+        tests/cpp/test_cache_operation_kinds.cpp
+    )
+
+    set(TOKENSPEED_SCHEDULER_RADIX_TEST_SOURCES
         tests/cpp/test_scheduler_plan.cpp
         tests/cpp/test_outside_event_handler.cpp
         tests/cpp/test_write_back.cpp
         tests/cpp/test_load_back.cpp
-        tests/cpp/test_cache_operation_kinds.cpp
         tests/cpp/test_retract.cpp
         tests/cpp/test_prefix_cache_host_match.cpp
         tests/cpp/test_abort.cpp
@@ -154,7 +165,6 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_paged_cache_prefix_hit_commit.cpp
         tests/cpp/test_paged_cache_replay.cpp
         tests/cpp/test_retract_abort_pages.cpp
-        tests/cpp/test_req_pool_allocator.cpp
         tests/cpp/test_mamba_slot.cpp
         tests/cpp/test_mamba_eviction.cpp
         tests/cpp/test_mamba_cache.cpp
@@ -164,6 +174,15 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_host_node_ref_lifetime.cpp
         tests/cpp/test_hybrid_takefirst_overflow.cpp
     )
+
+    set(TOKENSPEED_SCHEDULER_TEST_SOURCES ${TOKENSPEED_SCHEDULER_COMMON_TEST_SOURCES})
+    if(TOKENSPEED_FLAT_KVCACHE)
+        list(APPEND TOKENSPEED_SCHEDULER_TEST_SOURCES ${TOKENSPEED_SCHEDULER_FLAT_TEST_SOURCES})
+    else()
+        list(APPEND TOKENSPEED_SCHEDULER_TEST_SOURCES ${TOKENSPEED_SCHEDULER_RADIX_TEST_SOURCES})
+    endif()
+
+    add_executable(tokenspeed_scheduler_tests ${TOKENSPEED_SCHEDULER_TEST_SOURCES})
 
     target_link_libraries(tokenspeed_scheduler_tests
         PRIVATE

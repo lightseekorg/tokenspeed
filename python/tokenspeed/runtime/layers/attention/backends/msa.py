@@ -93,6 +93,8 @@ class MSAExtendMetadata:
     # Flat per-group page tables (group_id -> [num_reqs, max_pages]); None on
     # the single-table path. TODO(radix-removal): drop the single page_table.
     page_tables: dict[str, torch.Tensor] | None = None
+    # Per-request logical page represented by page_tables[group][row, 0].
+    block_table_base_offsets: dict[str, torch.Tensor] | None = None
     # Flat per-group KV write locations (group_id -> [num_tokens] int32),
     # built with page_tables — same groups, same lifecycle.
     out_cache_locs: dict[str, torch.Tensor] | None = None
@@ -105,6 +107,7 @@ class MSADecodeMetadata:
     seq_lens: torch.Tensor
     # Flat per-group tables/write-locs; see MSAExtendMetadata.
     page_tables: dict[str, torch.Tensor] | None = None
+    block_table_base_offsets: dict[str, torch.Tensor] | None = None
     out_cache_locs: dict[str, torch.Tensor] | None = None
     # Per-forward view of the backend's shared decode score buffer, pre-filled
     # with -inf and reused by every sparse layer. None on paths that keep the
@@ -195,13 +198,17 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         extend_prefix_lens: torch.Tensor | None = None,
         extend_prefix_lens_cpu: torch.Tensor | None = None,
         flat_block_tables: dict[str, torch.Tensor] | None = None,
+        flat_block_table_base_offsets: dict[str, torch.Tensor] | None = None,
         **kwargs,
     ):
         assert not forward_mode.is_mixed(), "MSA backend does not support mixed batch"
 
         seq_lens = seq_lens[:bs]
 
-        flat_page_tables = self._shed_state_groups(flat_block_tables)
+        flat_page_tables, flat_base_offsets = self._shed_state_group_inputs(
+            flat_block_tables,
+            flat_block_table_base_offsets,
+        )
         flat_out_cache_locs = None
         if flat_page_tables:
             # Verify keeps [bs]-row tables; only DFLASH expands rows. TODO(flat+dflash).
@@ -216,6 +223,7 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                 assert extend_seq_lens_cpu is not None
                 flat_out_cache_locs = self._compute_flat_extend_out_cache_locs(
                     flat_page_tables,
+                    flat_base_offsets,
                     extend_prefix_lens_cpu[:bs],
                     extend_seq_lens_cpu[:bs],
                     self.page_size,
@@ -223,6 +231,7 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             else:
                 flat_out_cache_locs = self._compute_flat_decode_out_cache_locs(
                     flat_page_tables,
+                    flat_base_offsets,
                     seq_lens,
                     self.page_size,
                     self.tokens_per_req,
@@ -277,6 +286,7 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                 max_extend_seq_len=max_extend_seq_len,
                 max_extend_prefix_len=max_extend_prefix_len,
                 page_tables=flat_page_tables,
+                block_table_base_offsets=flat_base_offsets,
                 out_cache_locs=flat_out_cache_locs,
             )
 
@@ -287,6 +297,7 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                     page_table=page_table,
                     seq_lens=seq_lens,
                     page_tables=flat_page_tables,
+                    block_table_base_offsets=flat_base_offsets,
                     out_cache_locs=flat_out_cache_locs,
                 )
         else:
@@ -313,6 +324,7 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                     page_table=expanded_page_table,
                     seq_lens=expanded_seq_lens,
                     page_tables=flat_page_tables,
+                    block_table_base_offsets=flat_base_offsets,
                     out_cache_locs=flat_out_cache_locs,
                 )
             else:
@@ -322,6 +334,7 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                     page_table=page_table,
                     seq_lens=seq_lens,
                     page_tables=flat_page_tables,
+                    block_table_base_offsets=flat_base_offsets,
                     out_cache_locs=flat_out_cache_locs,
                     score_out=score_out,
                 )
@@ -394,45 +407,59 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             assert not (
                 self.draft_block_decode and self.spec_num_tokens > 1
             ), "flat_cache_group_ids is unsupported with DFLASH block decode"
-        page_tables, out_cache_locs = self._flat_capture_group_views(
-            bs,
-            flat_cache_group_ids,
-            tokens_per_req=self.tokens_per_req,
+        page_tables, block_table_base_offsets, out_cache_locs = (
+            self._flat_capture_group_views(
+                bs,
+                flat_cache_group_ids,
+                tokens_per_req=self.tokens_per_req,
+            )
         )
 
+        prior_metadata = self.cuda_graph_decode_metadata.get(bs)
+        score_out = None
         if self.draft_block_decode and self.spec_num_tokens > 1:
             # DFLASH draft block: spec_num_tokens decode rows per request.
             expanded_bs = bs * self.spec_num_tokens
-            metadata = MSADecodeMetadata(
-                page_table=self.cuda_graph_page_table[:expanded_bs, :],
-                seq_lens=self.cuda_graph_seq_lens[:expanded_bs],
-                page_tables=page_tables,
-                out_cache_locs=out_cache_locs,
-            )
+            page_table = self.cuda_graph_page_table[:expanded_bs, :]
+            graph_seq_lens = self.cuda_graph_seq_lens[:expanded_bs]
             # Uniform non-causal seq_lens are written by the drafter inside the
             # captured graph (see fill_block_decode_seq_lens); seed a safe
             # baseline for the capture run before that op records.
-            metadata.seq_lens.fill_(self.spec_num_tokens)
+            graph_seq_lens.fill_(self.spec_num_tokens)
         else:
+            page_table = (
+                None if page_tables is not None else self.cuda_graph_page_table[:bs, :]
+            )
+            graph_seq_lens = self.cuda_graph_seq_lens[:bs]
             score_out = self.decode_score_buffer[: bs * self.tokens_per_req]
             score_out.fill_(-float("inf"))
+        if prior_metadata is None:
             metadata = MSADecodeMetadata(
                 # Flat captures route reads through the per-group tables and
                 # replay never fills the radix single table, so mirror the
                 # eager flat path: page_table=None instead of a slice of the
                 # never-filled zero buffer.
-                page_table=(
-                    None
-                    if page_tables is not None
-                    else self.cuda_graph_page_table[:bs, :]
-                ),
-                seq_lens=self.cuda_graph_seq_lens[:bs],
+                page_table=page_table,
+                seq_lens=graph_seq_lens,
                 page_tables=page_tables,
+                block_table_base_offsets=block_table_base_offsets,
                 out_cache_locs=out_cache_locs,
                 score_out=score_out,
             )
-            if self.spec_num_tokens > 1 and not self.is_draft:
-                metadata.seq_lens.copy_(seq_lens[:bs].clamp_min(self.spec_num_tokens))
+        else:
+            metadata = prior_metadata
+            metadata.page_table = page_table
+            metadata.seq_lens = graph_seq_lens
+            metadata.page_tables = page_tables
+            metadata.block_table_base_offsets = block_table_base_offsets
+            metadata.out_cache_locs = out_cache_locs
+            metadata.score_out = score_out
+        if (
+            not self.draft_block_decode
+            and self.spec_num_tokens > 1
+            and not self.is_draft
+        ):
+            metadata.seq_lens.copy_(seq_lens[:bs].clamp_min(self.spec_num_tokens))
         self.cuda_graph_decode_metadata[bs] = metadata
         self.forward_decode_metadata = metadata
 
@@ -444,12 +471,17 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         req_to_page: torch.Tensor,
         forward_mode: ForwardMode,
         flat_block_tables: dict[str, torch.Tensor] | None = None,
+        flat_block_table_base_offsets: dict[str, torch.Tensor] | None = None,
         **kwargs,
     ):
         assert not forward_mode.is_extend_or_mixed()
 
         # Fail loudly instead of replaying over stale/zero page tables.
-        self._flat_replay_stale_guard(bs, flat_block_tables)
+        validated_flat_group_ids = self._flat_replay_stale_guard(
+            bs,
+            flat_block_tables,
+            flat_block_table_base_offsets,
+        )
 
         # Flat captures read only the per-group buffers; the radix single
         # table (cuda_graph_page_table) would be dead work there.
@@ -481,15 +513,18 @@ class MSAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             self._flat_replay_fill(
                 bs,
                 flat_block_tables,
+                flat_block_table_base_offsets,
                 self.cuda_graph_seq_lens,
                 tokens_per_req=self.tokens_per_req,
+                validated_group_ids=validated_flat_group_ids,
             )
 
         if bs in self.cuda_graph_decode_metadata:
             self.forward_decode_metadata = self.cuda_graph_decode_metadata[bs]
             # Reset the shared score buffer to -inf before replay; the captured
             # score kernels overwrite only visible blocks, leaving the tail.
-            self.forward_decode_metadata.score_out.fill_(-float("inf"))
+            if self.forward_decode_metadata.score_out is not None:
+                self.forward_decode_metadata.score_out.fill_(-float("inf"))
 
     def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
         """DFLASH: broadcast each request's block-end length to its

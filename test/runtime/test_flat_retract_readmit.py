@@ -96,6 +96,11 @@ class _Results:
     def sync(self):
         pass
 
+    @staticmethod
+    def materialize_flat_kv_completions(_forward_op, *, accepted_lengths=None):
+        del accepted_lengths
+        return ()
+
 
 class _ForwardOp:
     """Forward-op stub exposing the flat binding's per-slot prefill_lengths."""

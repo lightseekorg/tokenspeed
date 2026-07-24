@@ -119,8 +119,9 @@ class Eagle(BaseDrafter):
         self.draft_seq_lens_buf = torch.zeros_like(self.input_buffers.seq_lens_buf)
 
         # Persistent output buffer for the draft step's compute_out_cache_loc.
-        self.draft_out_cache_loc_buf = torch.empty(
+        self.draft_out_cache_loc_buf = torch.full(
             (self.input_buffers.max_bs * (spec_num_steps - 1),),
+            self.input_buffers.dummy_kv_slot,
             dtype=torch.int32,
             device=self.device,
         )
@@ -135,9 +136,19 @@ class Eagle(BaseDrafter):
             - 1
         )
 
-        # VLM placeholder ids plumbed by ModelExecutor; empty for text-only targets.
+        # In-vocab media tokens plumbed by ModelExecutor. The content-derived
+        # prefix-cache pad IDs retain a modality tag and are restored here before
+        # the text-only speculative draft performs its embedding lookup.
         self.mm_pad_substitute_ids: dict[Modality, int] = {}
         hf_config = getattr(draft_model_runner.model_config, "hf_config", None)
+        # The model owns whether its first speculative step writes every draft
+        # KV plane. Eagle consumes only that source-neutral capability; absent
+        # capability remains fail-closed.
+        self.first_step_covers_all_draft_kv_layers = getattr(
+            draft_model_runner.model,
+            "draft_first_step_covers_all_kv_layers",
+            False,
+        )
         self._dsa_reuse_mtp_topk = bool(
             getattr(hf_config, "index_share_for_mtp_iteration", False)
         )
@@ -365,14 +376,18 @@ class Eagle(BaseDrafter):
 
         # Write cache slots for steps 1..N-1.
         cache_locs = self.draft_out_cache_loc_buf[: bs * (self.spec_num_steps - 1)]
-        compute_out_cache_loc_uniform(
-            out_cache_loc_ptr=cache_locs,
-            req_pool_indices=req_pool_indices,
-            uniform_input_length=self.spec_num_steps - 1,
-            cache_start=cache_start,
-            req_to_pages=self.req_to_page,
-            page_size=self.page_size,
-        )
+        if not self.input_buffers.uses_group_keyed_cache_locs:
+            compute_out_cache_loc_uniform(
+                out_cache_loc_ptr=cache_locs,
+                req_pool_indices=req_pool_indices,
+                uniform_input_length=self.spec_num_steps - 1,
+                cache_start=cache_start,
+                req_to_pages=self.req_to_page,
+                page_size=self.page_size,
+            )
+        # Group-keyed flat draft writes are resolved by already-initialized
+        # owner-local metadata. Their persistent scalar buffer remains the
+        # page-0 sentinel installed at construction, avoiding a per-step fill.
         cache_locs = cache_locs.view(bs, self.spec_num_steps - 1)
         # +1 is the kernel's read-inclusive convention; advanced per iter.
         draft_seq_lens = self.draft_seq_lens_buf[:bs]

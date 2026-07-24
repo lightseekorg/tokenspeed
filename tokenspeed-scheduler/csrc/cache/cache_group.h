@@ -28,11 +28,13 @@
 
 namespace tokenspeed {
 
-// One attention group: spec + index-derived group_id + the manager that runs it.
+// Runtime state for one coordinator schema entry. The coordinator owns the
+// immutable schema and BlockPoolSet owns the pool; CacheGroup observes both by
+// index/pointer and owns only its policy manager.
 class CacheGroup {
 public:
-    CacheGroup(KvCacheSpec spec, std::uint32_t group_id, std::unique_ptr<KvCacheManager> manager)
-        : spec_{spec}, group_id_{group_id}, manager_{std::move(manager)} {}
+    CacheGroup(std::uint32_t schema_index, std::unique_ptr<KvCacheManager> manager, BlockPool& pool)
+        : schema_index_{schema_index}, pool_{&pool}, manager_{std::move(manager)} {}
 
     CacheGroup(const CacheGroup&) = delete;
     CacheGroup& operator=(const CacheGroup&) = delete;
@@ -41,12 +43,13 @@ public:
 
     KvCacheManager& Manager() { return *manager_; }
     const KvCacheManager& Manager() const { return *manager_; }
-    const KvCacheSpec& Spec() const { return spec_; }
-    std::uint32_t GroupId() const { return group_id_; }
+    std::uint32_t SchemaIndex() const { return schema_index_; }
+    BlockPool& Pool() { return *pool_; }
+    const BlockPool& Pool() const { return *pool_; }
 
 private:
-    KvCacheSpec spec_;
-    std::uint32_t group_id_;
+    std::uint32_t schema_index_;
+    BlockPool* pool_;
     std::unique_ptr<KvCacheManager> manager_;
 };
 

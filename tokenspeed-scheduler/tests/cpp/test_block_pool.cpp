@@ -39,8 +39,20 @@ concept HasNullBlock = requires(T& value) { value.NullBlock(); };
 template <class T>
 concept HasNullBlockRef = requires(T& value) { value.NullBlockRef(); };
 
+template <class T>
+concept HasRawAllocate = requires(T& value) { value.AllocateBlock(); };
+
+template <class T>
+concept HasRawLookup = requires(T& value) { value.GetCachedBlock("key"); };
+
+template <class T>
+concept HasRawTouch = requires(T& value, CacheBlock* block) { value.TouchBlock(block); };
+
 static_assert(!HasNullBlock<BlockPool>);
 static_assert(!HasNullBlockRef<BlockPool>);
+static_assert(!HasRawAllocate<BlockPool>);
+static_assert(!HasRawLookup<BlockPool>);
+static_assert(!HasRawTouch<BlockPool>);
 
 using token_span = std::span<const std::int32_t>;
 
@@ -84,6 +96,21 @@ TEST(BlockPoolTest, AcquireFailsWhenCapacityShort) {
     auto blocks = pool.AcquireBlocks(4);
     EXPECT_TRUE(blocks.empty());  // all-or-nothing
     EXPECT_EQ(pool.NumFreeBlocks(), 3);
+}
+
+TEST(BlockPoolTest, AcquireBlocksIntoIsAllOrNothingAndUsesCallerStorage) {
+    BlockPool pool(4);  // three usable pages
+    std::vector<BlockRef> first(2);
+    ASSERT_TRUE(pool.AcquireBlocksInto(first));
+    EXPECT_TRUE(first[0]);
+    EXPECT_TRUE(first[1]);
+    EXPECT_EQ(pool.NumFreeBlocks(), 1);
+
+    std::vector<BlockRef> shortfall(2);
+    EXPECT_FALSE(pool.AcquireBlocksInto(shortfall));
+    EXPECT_FALSE(shortfall[0]);
+    EXPECT_FALSE(shortfall[1]);
+    EXPECT_EQ(pool.NumFreeBlocks(), 1);
 }
 
 TEST(BlockPoolTest, ResetReturnsBlocksToPool) {
@@ -157,10 +184,72 @@ TEST(BlockPoolTest, DuplicateHashesKeepDistinctBlocksIndexed) {
     EXPECT_EQ(pool.NumCachedBlocks(), 2);
 }
 
+TEST(BlockPoolTest, CachedCountersTrackPhysicalBindingsAcrossSharedOwners) {
+    BlockPool pool(2);  // one usable page, so the next fresh acquire evicts it
+    const std::string key = RealKey({1, 2, 3, 4}, 0);
+    BlockRef first = pool.AcquireBlock();
+    pool.CacheFullBlock(first, key);
+    EXPECT_EQ(pool.NumCachedBlocks(), 1);
+    EXPECT_EQ(pool.NumPinnedCachedBlocks(), 1);
+    EXPECT_EQ(pool.NumCachedFreeBlocks(), 0);
+
+    BlockRef second = pool.AcquireCachedBlock(key);
+    EXPECT_EQ(first.use_count(), 2);
+    EXPECT_EQ(pool.NumPinnedCachedBlocks(), 1);
+    first.reset();
+    EXPECT_EQ(pool.NumPinnedCachedBlocks(), 1);
+    second.reset();
+    EXPECT_EQ(pool.NumPinnedCachedBlocks(), 0);
+    EXPECT_EQ(pool.NumCachedFreeBlocks(), 1);
+
+    BlockRef replacement = pool.AcquireBlock();
+    EXPECT_FALSE(replacement->IsCached());
+    EXPECT_EQ(pool.NumCachedBlocks(), 0);
+    EXPECT_EQ(pool.NumCachedFreeBlocks(), 0);
+    EXPECT_EQ(pool.NumPinnedCachedBlocks(), 0);
+}
+
 TEST(BlockPoolTest, MissReturnsNull) {
     BlockPool pool(8);
     EXPECT_FALSE(pool.AcquireCachedBlock(RealKey({9, 9}, 0)));
     EXPECT_FALSE(pool.ContainsCachedBlock(RealKey({9, 9}, 0)));
+}
+
+TEST(BlockPoolTest, ProbeCachedBlockReportsCapacityStateWithoutMutation) {
+    BlockPool pool(8);
+    const std::string cached_key = RealKey({1, 2, 3, 4}, 0);
+    const std::string missing_key = RealKey({9, 9, 9, 9}, 0);
+    BlockRef owner = pool.AcquireBlock();
+    pool.CacheFullBlock(owner, cached_key);
+
+    struct Case {
+        const std::string* key;
+        CachedBlockState expected;
+    };
+    const auto expect_states = [&](std::span<const Case> cases) {
+        const std::int32_t free_before = pool.NumFreeBlocks();
+        const std::int32_t cached_free_before = pool.NumCachedFreeBlocks();
+        const std::int32_t pinned_before = pool.NumPinnedCachedBlocks();
+        for (const Case& test_case : cases) {
+            EXPECT_EQ(pool.ProbeCachedBlock(*test_case.key), test_case.expected);
+        }
+        EXPECT_EQ(pool.NumFreeBlocks(), free_before);
+        EXPECT_EQ(pool.NumCachedFreeBlocks(), cached_free_before);
+        EXPECT_EQ(pool.NumPinnedCachedBlocks(), pinned_before);
+    };
+
+    const std::vector pinned_cases{
+        Case{&missing_key, CachedBlockState::kMiss},
+        Case{&cached_key, CachedBlockState::kPinnedHit},
+    };
+    expect_states(pinned_cases);
+
+    owner.reset();
+    const std::vector free_cases{
+        Case{&missing_key, CachedBlockState::kMiss},
+        Case{&cached_key, CachedBlockState::kFreeHit},
+    };
+    expect_states(free_cases);
 }
 
 TEST(BlockPoolTest, CachingDisabledNeverHits) {

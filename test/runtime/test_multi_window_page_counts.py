@@ -31,6 +31,7 @@ import pathlib
 import sys
 import types
 import unittest
+from unittest import mock
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -68,7 +69,9 @@ def _load(mod_name: str, file_name: str):
     return mod
 
 
-_pcs = _load("paged_cache_spec_for_page_counts", "paged_cache_spec.py")
+with mock.patch.dict(sys.modules):
+    _load("tokenspeed.runtime.configs.flat_kv_contract", "flat_kv_contract.py")
+    _pcs = _load("paged_cache_spec_for_page_counts", "paged_cache_spec.py")
 compute_paged_cache_group_page_counts = _pcs.compute_paged_cache_group_page_counts
 group_specs_from_layer_types = _pcs.group_specs_from_layer_types
 PagedCacheGroupSpec = _pcs.PagedCacheGroupSpec

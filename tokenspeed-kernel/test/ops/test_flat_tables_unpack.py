@@ -64,6 +64,81 @@ def test_unpack_matches_per_group(actual_bs, bs):
         assert (dst[i, bs:] == 7).all(), i
 
 
+@pytest.mark.parametrize("actual_bs,bs", [(5, 8), (1, 1)])
+def test_ragged_unpack_copies_tables_and_bases_into_exact_storage(actual_bs, bs):
+    torch.manual_seed(1)
+    dev = "cuda"
+    source_widths = [3, 9, 2]
+    destination_widths = [5, 9, 4]
+    max_bs = 8
+    source_parts = []
+    meta_rows = []
+    source_offset = 0
+    destination_offset = 0
+    references = []
+    for source_width, destination_width in zip(
+        source_widths, destination_widths, strict=True
+    ):
+        table = torch.randint(1, 5000, (actual_bs, source_width), dtype=torch.int32)
+        bases = torch.randint(0, 30, (actual_bs,), dtype=torch.int32)
+        table_source_offset = source_offset
+        source_parts.append(table.reshape(-1))
+        source_offset += table.numel()
+        base_source_offset = source_offset
+        source_parts.append(bases)
+        source_offset += bases.numel()
+
+        table_destination_offset = destination_offset
+        destination_offset += max_bs * destination_width
+        base_destination_offset = destination_offset
+        destination_offset += max_bs
+        meta_rows.append(
+            [
+                table_source_offset,
+                source_width,
+                table_destination_offset,
+                destination_width,
+                base_source_offset,
+                base_destination_offset,
+            ]
+        )
+        references.append(
+            (
+                table,
+                bases,
+                table_destination_offset,
+                base_destination_offset,
+                destination_width,
+            )
+        )
+
+    source = torch.cat(source_parts).to(dev)
+    meta = torch.tensor(meta_rows, dtype=torch.int32, device=dev)
+    destination = torch.full((destination_offset,), 7, dtype=torch.int32, device=dev)
+    flat_tables_unpack(
+        source,
+        meta,
+        destination,
+        bs,
+        actual_bs=actual_bs,
+        tail_pad=-1,
+        max_cols=max(destination_widths),
+    )
+
+    for table, bases, table_offset, base_offset, destination_width in references:
+        table_view = destination[
+            table_offset : table_offset + max_bs * destination_width
+        ].view(max_bs, destination_width)
+        base_view = destination[base_offset : base_offset + max_bs]
+        assert torch.equal(table_view[:actual_bs, : table.shape[1]], table.to(dev))
+        assert (table_view[:actual_bs, table.shape[1] :] == -1).all()
+        assert torch.equal(base_view[:actual_bs], bases.to(dev))
+        assert (table_view[actual_bs:bs] == 0).all()
+        assert (base_view[actual_bs:bs] == 0).all()
+        assert (table_view[bs:] == 7).all()
+        assert (base_view[bs:] == 7).all()
+
+
 @pytest.mark.parametrize("n", [1, 3, 4])
 def test_locs_multiquery(n):
     """tokens_per_req > 1 (spec verify): token t of request b lands at

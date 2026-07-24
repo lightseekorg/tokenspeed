@@ -22,6 +22,7 @@
 
 #include <concepts>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -38,6 +39,11 @@
 #include "scheduler/request_spec.h"
 #include "utils.h"
 
+#if TOKENSPEED_FLAT_KVCACHE
+#include "cache/flat_reservation_tracker.h"
+#include "scheduler/flat_kv_completion_ledger.h"
+#endif
+
 namespace tokenspeed {
 
 class TreeNode;
@@ -48,11 +54,25 @@ struct PrefetchDone;
 struct Prefetching;
 }  // namespace fsm
 
+#if TOKENSPEED_FLAT_KVCACHE
+struct FlatKVWriteProgress {
+    std::uint64_t table_generation{};
+    // Scheduler-union group order, matching the request's BlockTable vector.
+    std::vector<std::int32_t> published_raw_ends;
+    // Incremental content-hash chain at coordinator base-page granularity. It
+    // never includes a rejected partial page.
+    std::vector<std::string> base_hashes;
+    std::int32_t accepted_raw_end{};
+};
+
+enum class FlatPendingTerminal : std::uint8_t { kFinish, kAbort };
+#endif
+
 class Request {
 public:
     Request(const RequestSpec& spec, std::int32_t page_size, Role role);
 
-    std::string Id() const { return id_; }
+    const std::string& Id() const noexcept { return id_; }
 
     // Keep Apply the only non-const function in Request
     // The wrapper lambda converts any concrete state type returned by event's operator()
@@ -94,6 +114,79 @@ public:
 
     std::int32_t TokenSize() const { return token_container_.Size(); }
     std::int32_t GetLastToken() const { return token_container_.LastToken(); }
+    std::span<const std::int32_t> GetTokenSlice(TokenContainer::Window window) const {
+        if (window.begin < 0 || window.size < 0 || window.begin > TokenSize() - window.size) {
+            throw std::out_of_range("Request token slice is outside the stable token range");
+        }
+        return token_container_.GetTokenSlice(window);
+    }
+
+    // Fenced flat completion uses a two-step token append so allocation
+    // and FSM-state validation happen before the ledger progress commit. The
+    // returned flag preserves ExtendResult's Finished-state no-op behavior.
+    bool PrepareFlatResultAppend(std::size_t additional_tokens) {
+        const bool append = std::visit(Overloaded{
+            []<typename T>(const T&) -> bool
+                requires(std::same_as<T, fsm::PrefillDone> || std::same_as<T, fsm::Decoding> ||
+                         std::same_as<T, fsm::Retracting> || std::same_as<T, fsm::Retracted>)
+            { return true; },
+            [](const fsm::Finished&) -> bool { return false; },
+            [this](const auto&) -> bool {
+                throw std::logic_error("flat completion result is invalid for request state=" + StateName());
+            },
+            },
+            state_);
+        if (append) {
+            token_container_.ReserveAdditional(additional_tokens);
+        }
+        return append;
+    }
+
+    void CommitFlatResultAppend(std::span<const std::int32_t> tokens, bool append) noexcept {
+        if (append) {
+            token_container_.ExtendPrepared(tokens);
+        }
+    }
+
+#if TOKENSPEED_FLAT_KVCACHE
+    void AttachFlatReservation(FlatReservationTracker& tracker) {
+        if (flat_reservation_.has_value()) {
+            throw std::logic_error("Request already has a flat reservation account");
+        }
+        flat_reservation_.emplace(tracker.MakeAccount());
+    }
+
+    FlatReservationTracker::Account& FlatReservation() noexcept {
+        if (!flat_reservation_.has_value()) {
+            std::terminate();
+        }
+        return *flat_reservation_;
+    }
+
+    const FlatReservationTracker::Account& FlatReservation() const noexcept {
+        if (!flat_reservation_.has_value()) {
+            std::terminate();
+        }
+        return *flat_reservation_;
+    }
+
+    FlatKVCompletionState& FlatCompletionState() noexcept { return flat_completion_state_; }
+    const FlatKVCompletionState& FlatCompletionState() const noexcept { return flat_completion_state_; }
+
+    std::optional<FlatKVWriteProgress>& FlatWriteProgress() noexcept { return flat_write_progress_; }
+    const std::optional<FlatKVWriteProgress>& FlatWriteProgress() const noexcept { return flat_write_progress_; }
+    void ResetFlatWriteProgress() noexcept { flat_write_progress_.reset(); }
+
+    bool HasPendingFlatTerminal() const noexcept { return flat_pending_terminal_.has_value(); }
+    void DeferFlatTerminal(FlatPendingTerminal terminal) noexcept {
+        if (!flat_pending_terminal_.has_value() || terminal == FlatPendingTerminal::kAbort) {
+            flat_pending_terminal_ = terminal;
+        }
+    }
+    std::optional<FlatPendingTerminal> TakePendingFlatTerminal() noexcept {
+        return std::exchange(flat_pending_terminal_, std::nullopt);
+    }
+#endif
 
     PrefillInfo GetPrefillInfo() const;
 
@@ -189,6 +282,19 @@ public:
                 requires(std::derived_from<T, fsm::ForwardState>)
             { return s.BlockTables(); },
             [this](const auto&) -> const std::vector<BlockTable>& {
+                throw std::logic_error("Request::FlatBlockTablesRef: expected a forward state; got state=" +
+                                       StateName());
+            },
+            },
+            state_);
+    }
+
+    std::vector<BlockTable>& FlatBlockTablesRef() {
+        return std::visit(Overloaded{
+            []<typename T>(T& s) -> std::vector<BlockTable>&
+                requires(std::derived_from<T, fsm::ForwardState>)
+            { return s.BlockTables(); },
+            [this](auto&) -> std::vector<BlockTable>& {
                 throw std::logic_error("Request::FlatBlockTablesRef: expected a forward state; got state=" +
                                        StateName());
             },
@@ -321,6 +427,12 @@ private:
     std::int32_t page_size_;
     fsm::State state_;
     StorageInfo storage_info_;
+#if TOKENSPEED_FLAT_KVCACHE
+    std::optional<FlatReservationTracker::Account> flat_reservation_;
+    FlatKVCompletionState flat_completion_state_;
+    std::optional<FlatKVWriteProgress> flat_write_progress_;
+    std::optional<FlatPendingTerminal> flat_pending_terminal_;
+#endif
 };
 
 using ConstRequestVector = std::vector<const Request*>;

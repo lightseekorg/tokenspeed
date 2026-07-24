@@ -20,6 +20,9 @@
 
 """Factories for PD KV transfer helpers."""
 
+from tokenspeed.runtime.cache_capabilities import (
+    validate_pd_transfer_pools,
+)
 from tokenspeed.runtime.pd.decode_executor import DisaggDecodeExecutor
 from tokenspeed.runtime.pd.mooncake.entities import KVArgs, KVManagerArgs
 from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
@@ -46,6 +49,11 @@ def get_kv_args(
     draft_token_to_kv_pool,
     mamba_pool=None,
 ):
+    # Validate target and draft as one set before enumerating either pool's
+    # device pointers.  This keeps unsupported grouped page domains from
+    # partially constructing transport state through an alternate entry point.
+    validate_pd_transfer_pools(token_to_kv_pool, draft_token_to_kv_pool)
+
     kv_data_ptrs, kv_data_lens, kv_item_lens = (
         token_to_kv_pool.get_contiguous_buf_infos()
     )

@@ -9,17 +9,98 @@ checked against the exact position ranges each window must end at:
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import torch
 
+from tokenspeed.runtime.flat_cache_tables import resolve_cache_table_binding
+from tokenspeed.runtime.layers.attention.backends.flat_groups import (
+    FlatCacheGroupsMixin,
+)
 from tokenspeed.runtime.layers.attention.backends.inkling import InklingAttnBackend
+from tokenspeed.runtime.layers.attention.backends.mha import MHADecodeMetadata
 
 
 def _acts(start: int, count: int) -> torch.Tensor:
     return torch.arange(start, start + count, dtype=torch.float32).view(count, 1)
 
 
+class _FlatLookbackBackend(FlatCacheGroupsMixin):
+    page_size = 128
+    spec_num_tokens = 4
+    flat_draft_lookback = 2
+
+
 class TestInklingConvLookback(unittest.TestCase):
+    def _flat_lookback_backend(self, *, with_static_locs: bool):
+        bs = 2
+        backend = _FlatLookbackBackend()
+        page_tables = {"full_attention": torch.zeros((bs, 2), dtype=torch.int32)}
+        captured = MHADecodeMetadata(
+            page_table=None,
+            seq_lens=torch.full((bs,), 4, dtype=torch.int32),
+            page_tables=page_tables,
+            block_table_base_offsets={
+                "full_attention": torch.zeros(bs, dtype=torch.int32)
+            },
+            out_cache_locs={"full_attention": torch.zeros(bs * 4, dtype=torch.int32)},
+        )
+        backend.cuda_graph_decode_metadata = {bs: captured}
+        backend.cuda_graph_flat_lookback_locs = (
+            {"full_attention": torch.arange(bs * (4 + 2), dtype=torch.int32)}
+            if with_static_locs
+            else {}
+        )
+        backend.forward_decode_metadata = captured
+        backend._compute_flat_decode_out_cache_locs = Mock(
+            side_effect=AssertionError("captured metadata entered eager gather")
+        )
+        return backend, bs, captured
+
+    def test_graph_lookback_uses_captured_metadata_identity(self):
+        backend, bs, captured = self._flat_lookback_backend(with_static_locs=True)
+
+        self.assertIs(backend.forward_decode_metadata, captured)
+        self.assertTrue(backend.flat_enter_draft_lookback(bs))
+
+        expected = backend.cuda_graph_flat_lookback_locs["full_attention"]
+        self.assertIs(backend.forward_decode_metadata, captured)
+        actual = backend.forward_decode_metadata.out_cache_locs["full_attention"]
+        self.assertTrue(actual.is_set_to(expected))
+        backend._compute_flat_decode_out_cache_locs.assert_not_called()
+
+    def test_graph_lookback_missing_static_locs_fails_before_eager_gather(self):
+        backend, bs, _ = self._flat_lookback_backend(with_static_locs=False)
+
+        with self.assertRaisesRegex(RuntimeError, "static lookback"):
+            backend.flat_enter_draft_lookback(bs)
+
+        backend._compute_flat_decode_out_cache_locs.assert_not_called()
+
+    def test_flat_binding_preserves_group_identity(self):
+        backend = InklingAttnBackend.__new__(InklingAttnBackend)
+        backend.inner = SimpleNamespace(
+            uses_paged_cache_groups=False,
+            uses_flat_cache_groups=True,
+        )
+        group_ids = ("full_attention", "sliding_attention")
+        pool = SimpleNamespace(
+            flat_memory_plan=None,
+            paged_cache_group_specs=tuple(
+                SimpleNamespace(group_id=group_id) for group_id in group_ids
+            ),
+        )
+
+        binding = resolve_cache_table_binding(
+            backend=backend,
+            pool=pool,
+            flat_scheduler_active=True,
+        )
+
+        self.assertEqual(binding.kind, "flat")
+        self.assertEqual(binding.group_ids, group_ids)
+        self.assertTrue(binding.group_keyed_cache_locs)
+
     def test_decode_window_recurrence_tracks_both_windows(self):
         # w1=3, D=2, k=4: chunk rows cover positions [vc-D, vc+k) per round.
         w1, lookback, k = 3, 2, 4

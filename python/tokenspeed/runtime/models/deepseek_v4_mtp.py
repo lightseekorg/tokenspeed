@@ -316,6 +316,12 @@ class DeepseekV4ForCausalLMNextN(nn.Module):
             tp_group=self.mapping.attn.tp_group,
         )
 
+    @property
+    def draft_first_step_covers_all_kv_layers(self) -> bool:
+        """Whether Flat completion may retire all draft KV producer debt."""
+
+        return self.model.num_mtp_layers == 1
+
     def get_hot_token_id(self):
         return None
 

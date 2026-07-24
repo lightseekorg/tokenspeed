@@ -101,6 +101,7 @@ class TRTLLMMHAMetadata:
     page_table: torch.Tensor = None
     # Flat per-group tables/write-locs, keyed by group id (see flat_groups).
     page_tables: dict[str, torch.Tensor] | None = None
+    block_table_base_offsets: dict[str, torch.Tensor] | None = None
     out_cache_locs: dict[str, torch.Tensor] | None = None
 
 
@@ -409,9 +410,12 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         extend_seq_lens_cpu: torch.Tensor | None = None,
         use_cuda_graph: bool = False,
         flat_block_tables: dict[str, torch.Tensor] | None = None,
+        flat_block_table_base_offsets: dict[str, torch.Tensor] | None = None,
         **kwargs,
     ):
-        flat_page_tables = self._shed_state_groups(flat_block_tables)
+        flat_page_tables, flat_base_offsets = self._shed_state_group_inputs(
+            flat_block_tables, flat_block_table_base_offsets
+        )
         flat_out_cache_locs = None
         if flat_page_tables:
             # Verify keeps [bs]-row tables; only DFLASH expands rows. TODO(flat+dflash).
@@ -423,6 +427,7 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                 assert extend_seq_lens_cpu is not None
                 flat_out_cache_locs = self._compute_flat_extend_out_cache_locs(
                     flat_page_tables,
+                    flat_base_offsets,
                     extend_prefix_lens_cpu[:bs],
                     extend_seq_lens_cpu[:bs],
                     self.page_size,
@@ -430,6 +435,7 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             else:
                 flat_out_cache_locs = self._compute_flat_decode_out_cache_locs(
                     flat_page_tables,
+                    flat_base_offsets,
                     seq_lens[:bs],
                     self.page_size,
                     self._flat_verify_tokens(),
@@ -449,13 +455,22 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                 extend_prefix_lens_cpu=extend_prefix_lens_cpu,
                 extend_seq_lens_cpu=extend_seq_lens_cpu,
                 flat_page_tables=flat_page_tables,
+                flat_base_offsets=flat_base_offsets,
                 flat_out_cache_locs=flat_out_cache_locs,
             )
             # Drafter: also fill decode_metadata so step 1+ multi-step has
             # metadata under EXTEND/MIXED target. seq_lens is the drafter's
             # live alias buffer (wrapper pre-writes before this call).
             if self.is_draft:
-                self._init_decode_metadata(bs, req_pool_indices, seq_lens, req_to_page)
+                self._init_decode_metadata(
+                    bs,
+                    req_pool_indices,
+                    seq_lens,
+                    req_to_page,
+                    flat_page_tables=flat_page_tables,
+                    flat_base_offsets=flat_base_offsets,
+                    flat_out_cache_locs=flat_out_cache_locs,
+                )
             return
 
         if self.draft_block_decode and self.spec_num_tokens > 1:
@@ -475,6 +490,7 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                 seq_lens,
                 req_to_page,
                 flat_page_tables=flat_page_tables,
+                flat_base_offsets=flat_base_offsets,
                 flat_out_cache_locs=flat_out_cache_locs,
             )
             if self.is_draft:
@@ -485,6 +501,7 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                     seq_lens,
                     req_to_page,
                     flat_page_tables=flat_page_tables,
+                    flat_base_offsets=flat_base_offsets,
                     flat_out_cache_locs=flat_out_cache_locs,
                 )
         else:
@@ -494,6 +511,7 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                 seq_lens,
                 req_to_page,
                 flat_page_tables=flat_page_tables,
+                flat_base_offsets=flat_base_offsets,
                 flat_out_cache_locs=flat_out_cache_locs,
             )
 
@@ -504,6 +522,7 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         seq_lens: torch.Tensor,
         req_to_page: torch.Tensor,
         flat_page_tables: dict[str, torch.Tensor] | None = None,
+        flat_base_offsets: dict[str, torch.Tensor] | None = None,
         flat_out_cache_locs: dict[str, torch.Tensor] | None = None,
     ):
         assert (
@@ -526,6 +545,7 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                 )
             ),
             page_tables=flat_page_tables,
+            block_table_base_offsets=flat_base_offsets,
             out_cache_locs=flat_out_cache_locs,
         )
 
@@ -622,6 +642,7 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         seq_lens: torch.Tensor,
         req_to_page: torch.Tensor,
         flat_page_tables: dict[str, torch.Tensor] | None = None,
+        flat_base_offsets: dict[str, torch.Tensor] | None = None,
         flat_out_cache_locs: dict[str, torch.Tensor] | None = None,
     ):
         """Prefill-slot metadata for multi-token decode (uniform q_len per
@@ -652,6 +673,7 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                 )
             ),
             page_tables=flat_page_tables,
+            block_table_base_offsets=flat_base_offsets,
             out_cache_locs=flat_out_cache_locs,
         )
 
@@ -666,6 +688,7 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         extend_prefix_lens_cpu=None,
         extend_seq_lens_cpu=None,
         flat_page_tables: dict[str, torch.Tensor] | None = None,
+        flat_base_offsets: dict[str, torch.Tensor] | None = None,
         flat_out_cache_locs: dict[str, torch.Tensor] | None = None,
     ):
         """Populate prefill slot for regular EXTEND (ragged query)."""
@@ -720,6 +743,7 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             cu_seqlens_k=cu_seqlens_k,
             page_table=page_table,
             page_tables=flat_page_tables,
+            block_table_base_offsets=flat_base_offsets,
             out_cache_locs=flat_out_cache_locs,
         )
 
@@ -791,8 +815,12 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             assert not (
                 self.draft_block_decode and self.spec_num_tokens > 1
             ), "flat_cache_group_ids is unsupported with DFLASH block decode"
-        page_tables, out_cache_locs = self._flat_capture_group_views(
-            bs, flat_cache_group_ids, tokens_per_req=self._flat_verify_tokens()
+        page_tables, block_table_base_offsets, out_cache_locs = (
+            self._flat_capture_group_views(
+                bs,
+                flat_cache_group_ids,
+                tokens_per_req=self._flat_verify_tokens(),
+            )
         )
 
         if self.draft_block_decode and self.spec_num_tokens > 1:
@@ -801,15 +829,27 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
 
         if self.spec_num_tokens > 1:
             self._init_multi_token_metadata_capture(
-                bs, self.spec_num_tokens, page_tables, out_cache_locs
+                bs,
+                self.spec_num_tokens,
+                page_tables,
+                block_table_base_offsets,
+                out_cache_locs,
             )
             if self.is_draft:
                 self._init_decode_metadata_capture(
-                    bs, seq_lens, page_tables, out_cache_locs
+                    bs,
+                    seq_lens,
+                    page_tables,
+                    block_table_base_offsets,
+                    out_cache_locs,
                 )
         else:
             self._init_decode_metadata_capture(
-                bs, seq_lens, page_tables, out_cache_locs
+                bs,
+                seq_lens,
+                page_tables,
+                block_table_base_offsets,
+                out_cache_locs,
             )
 
     def _init_block_decode_metadata_capture(self, bs: int):
@@ -819,15 +859,17 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         so the capture run stays in range before that op records."""
         expanded_bs = bs * self.spec_num_tokens
         self.cuda_graph_cache_seqlens[:expanded_bs].fill_(self.spec_num_tokens)
-        metadata = TRTLLMMHAMetadata(
-            cache_seqlens_int32=self.cuda_graph_cache_seqlens[:expanded_bs],
-            max_seq_len_q=1,
-            max_seq_len_k=self.max_context_len,
-            cu_seqlens_q=torch.arange(
-                0, expanded_bs + 1, dtype=torch.int32, device=self.device
-            ),
-            page_table=self.cuda_graph_page_table[:expanded_bs, :],
-        )
+        metadata = self.cuda_graph_decode_metadata.get(bs)
+        if metadata is None:
+            metadata = TRTLLMMHAMetadata(
+                cache_seqlens_int32=self.cuda_graph_cache_seqlens[:expanded_bs],
+                max_seq_len_q=1,
+                max_seq_len_k=self.max_context_len,
+                cu_seqlens_q=torch.arange(
+                    0, expanded_bs + 1, dtype=torch.int32, device=self.device
+                ),
+                page_table=self.cuda_graph_page_table[:expanded_bs, :],
+            )
         self.cuda_graph_decode_metadata[bs] = metadata
         self.forward_decode_metadata = metadata
 
@@ -836,23 +878,37 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         bs: int,
         seq_lens: torch.Tensor,
         page_tables: dict[str, torch.Tensor] | None = None,
+        block_table_base_offsets: dict[str, torch.Tensor] | None = None,
         out_cache_locs: dict[str, torch.Tensor] | None = None,
     ):
         # cache_seqlens aliases seq_lens_buf (set in init_cuda_graph_state).
         # Flat captures route reads through the per-group buffer views and
         # replay never fills the radix single table, so record page_table=None
         # instead of a slice of the never-filled zero buffer.
-        metadata = TRTLLMMHAMetadata(
-            cache_seqlens_int32=self.cuda_graph_cache_seqlens[:bs],
-            max_seq_len_q=1,
-            max_seq_len_k=self.max_context_len,
-            cu_seqlens_q=torch.arange(0, bs + 1, dtype=torch.int32, device=self.device),
-            page_table=(
-                None if page_tables is not None else self.cuda_graph_page_table[:bs, :]
-            ),
-            page_tables=page_tables,
-            out_cache_locs=out_cache_locs,
+        cache_seqlens = self.cuda_graph_cache_seqlens[:bs]
+        page_table = (
+            None if page_tables is not None else self.cuda_graph_page_table[:bs, :]
         )
+        metadata = self.cuda_graph_decode_metadata.get(bs)
+        if metadata is None:
+            metadata = TRTLLMMHAMetadata(
+                cache_seqlens_int32=cache_seqlens,
+                max_seq_len_q=1,
+                max_seq_len_k=self.max_context_len,
+                cu_seqlens_q=torch.arange(
+                    0, bs + 1, dtype=torch.int32, device=self.device
+                ),
+                page_table=page_table,
+                page_tables=page_tables,
+                block_table_base_offsets=block_table_base_offsets,
+                out_cache_locs=out_cache_locs,
+            )
+        else:
+            metadata.cache_seqlens_int32 = cache_seqlens
+            metadata.page_table = page_table
+            metadata.page_tables = page_tables
+            metadata.block_table_base_offsets = block_table_base_offsets
+            metadata.out_cache_locs = out_cache_locs
         self.cuda_graph_decode_metadata[bs] = metadata
         self.forward_decode_metadata = metadata
 
@@ -861,6 +917,7 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         bs: int,
         spec_num_tokens: int,
         page_tables: dict[str, torch.Tensor] | None = None,
+        block_table_base_offsets: dict[str, torch.Tensor] | None = None,
         out_cache_locs: dict[str, torch.Tensor] | None = None,
     ):
         # Multi-token decode: seed spec_cache_seqlens_buf (clamped to >=
@@ -869,23 +926,33 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         cache_seqlens = self._clamped_spec_seqlens(
             self.cuda_graph_cache_seqlens, bs, spec_num_tokens
         )
-        metadata = TRTLLMMHAMetadata(
-            cache_seqlens_int32=cache_seqlens,
-            max_seq_len_q=spec_num_tokens,
-            max_seq_len_k=self.max_context_len,
-            cu_seqlens_q=torch.arange(
-                0,
-                bs * spec_num_tokens + 1,
-                spec_num_tokens,
-                dtype=torch.int32,
-                device=self.device,
-            ),
-            page_table=(
-                None if page_tables is not None else self.cuda_graph_page_table[:bs, :]
-            ),
-            page_tables=page_tables,
-            out_cache_locs=out_cache_locs,
+        page_table = (
+            None if page_tables is not None else self.cuda_graph_page_table[:bs, :]
         )
+        metadata = self.cuda_graph_prefill_metadata.get(bs)
+        if metadata is None:
+            metadata = TRTLLMMHAMetadata(
+                cache_seqlens_int32=cache_seqlens,
+                max_seq_len_q=spec_num_tokens,
+                max_seq_len_k=self.max_context_len,
+                cu_seqlens_q=torch.arange(
+                    0,
+                    bs * spec_num_tokens + 1,
+                    spec_num_tokens,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                page_table=page_table,
+                page_tables=page_tables,
+                block_table_base_offsets=block_table_base_offsets,
+                out_cache_locs=out_cache_locs,
+            )
+        else:
+            metadata.cache_seqlens_int32 = cache_seqlens
+            metadata.page_table = page_table
+            metadata.page_tables = page_tables
+            metadata.block_table_base_offsets = block_table_base_offsets
+            metadata.out_cache_locs = out_cache_locs
         self.cuda_graph_prefill_metadata[bs] = metadata
         self.forward_prefill_metadata = metadata
 
@@ -897,6 +964,7 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         forward_mode: ForwardMode,
         req_to_page: torch.Tensor = None,
         flat_block_tables: dict[str, torch.Tensor] | None = None,
+        flat_block_table_base_offsets: dict[str, torch.Tensor] | None = None,
         **kwargs,
     ):
         if forward_mode.is_extend_or_mixed():
@@ -905,7 +973,9 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             )
 
         # Fail loudly instead of replaying over stale/zero page tables.
-        self._flat_replay_stale_guard(bs, flat_block_tables)
+        validated_flat_group_ids = self._flat_replay_stale_guard(
+            bs, flat_block_tables, flat_block_table_base_offsets
+        )
 
         if self.draft_block_decode and self.spec_num_tokens > 1:
             # DFLASH draft block: replicate the page table to each request's
@@ -939,8 +1009,10 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             self._flat_replay_fill(
                 bs,
                 flat_block_tables,
+                flat_block_table_base_offsets,
                 self.cuda_graph_cache_seqlens,
                 tokens_per_req=self._flat_verify_tokens(),
+                validated_group_ids=validated_flat_group_ids,
             )
 
         # Refresh for both verify and draft: draft step 1 is multi-token

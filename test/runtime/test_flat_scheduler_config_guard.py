@@ -1,8 +1,8 @@
 """Flat-scheduler config guard (validate_flat_scheduler_config, called from
 engine/event_loop before the C++ Scheduler ctor).
 
-On a flat-built ext: a radix-populate-only backend (uses_paged_cache_groups
-without uses_flat_cache_groups, DeepSeek V4/MLA-style) is rejected loudly;
+On a flat-built ext: any radix-populate-only backend (uses_paged_cache_groups
+without uses_flat_cache_groups) is rejected loudly;
 zero published groups is rejected with the actual cause named; a
 flat-capable backend with >=1 group passes. On a radix-built ext the guard
 is a no-op. The validator is pure and torch-free, so this file runs on a
@@ -15,6 +15,8 @@ import importlib.util
 import os
 import sys
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -42,23 +44,74 @@ def _load_paged_cache_spec():
             "configs",
             "paged_cache_spec.py",
         )
-        spec = importlib.util.spec_from_file_location("_paged_cache_spec_guard", path)
-        module = importlib.util.module_from_spec(spec)
-        # dataclass processing resolves cls.__module__ through sys.modules, so
-        # the module must be registered before exec.
-        sys.modules[spec.name] = module
-        spec.loader.exec_module(module)
+        contract_path = os.path.join(
+            repo_root,
+            "python",
+            "tokenspeed",
+            "runtime",
+            "configs",
+            "flat_kv_contract.py",
+        )
+        with mock.patch.dict(sys.modules):
+            contract_name = "tokenspeed.runtime.configs.flat_kv_contract"
+            if contract_name not in sys.modules:
+                contract_spec = importlib.util.spec_from_file_location(
+                    contract_name, contract_path
+                )
+                assert contract_spec is not None and contract_spec.loader is not None
+                contract = importlib.util.module_from_spec(contract_spec)
+                sys.modules[contract_name] = contract
+                contract_spec.loader.exec_module(contract)
+            spec = importlib.util.spec_from_file_location(
+                "_paged_cache_spec_guard", path
+            )
+            module = importlib.util.module_from_spec(spec)
+            # dataclass processing resolves cls.__module__ through sys.modules, so
+            # the module must be registered before exec.
+            sys.modules[spec.name] = module
+            spec.loader.exec_module(module)
         return module
 
 
 _pcs = _load_paged_cache_spec()
 
 
+def _load_cache_capabilities():
+    repo_root = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
+    path = os.path.join(
+        repo_root,
+        "python",
+        "tokenspeed",
+        "runtime",
+        "cache_capabilities.py",
+    )
+    spec = importlib.util.spec_from_file_location(
+        "_flat_cache_capabilities_guard", path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_capabilities = _load_cache_capabilities()
+
+
 class FakeV4StyleBackend:
-    """DeepSeek V4/MLA shape: radix-populate consumer, not flat-capable."""
+    """Legacy V4-like shape: radix-populate consumer, not flat-capable."""
 
     uses_paged_cache_groups = True
     uses_flat_cache_groups = False
+
+
+class FakeV4FlatBackend:
+    """Migrated V4 shape: exactly-one radix/flat source selected by its pool."""
+
+    uses_paged_cache_groups = True
+    uses_flat_cache_groups = True
+    flat_spec_capable = True
 
 
 class FakeFlatMHABackend:
@@ -149,6 +202,15 @@ class ValidateFlatSchedulerConfigTest(unittest.TestCase):
             attn_backend=FakeFlatMHABackend(),
             kv_pool=FakeMHAPool(),
             speculative_algorithm=None,
+        )
+
+    def test_flat_ext_migrated_v4_groups_passes_with_spec(self):
+        _pcs.validate_flat_scheduler_config(
+            flat_kvcache_ext=True,
+            paged_cache_groups=[FakeGroup(), FakeGroup()],
+            attn_backend=FakeV4FlatBackend(),
+            kv_pool=FakeV4Pool(),
+            speculative_algorithm="EAGLE3",
         )
 
     def test_radix_ext_is_a_noop_regardless(self):
@@ -287,6 +349,34 @@ class ValidateFlatSchedulerConfigTest(unittest.TestCase):
                 kv_pool=FakeMHAPool(),
                 speculative_algorithm=None,
             )
+
+
+class ValidateCacheRuntimeCapabilitiesTest(unittest.TestCase):
+    def test_unsupported_flat_runtime_features_fail_by_capability(self):
+        cases = (
+            (
+                "active PD transfer",
+                "decode",
+                False,
+                {"supports_pd_transfer": False},
+            ),
+            (
+                "host/L2 cache tier",
+                "none",
+                True,
+                {"supports_hierarchical_kv_cache": False},
+            ),
+        )
+        for message, mode, kvstore, attributes in cases:
+            with self.subTest(message=message), self.assertRaisesRegex(
+                RuntimeError, message
+            ):
+                _capabilities.validate_cache_runtime_capabilities(
+                    target_pool=SimpleNamespace(**attributes),
+                    draft_pool=None,
+                    disaggregation_mode=mode,
+                    enable_kvstore=kvstore,
+                )
 
 
 if __name__ == "__main__":

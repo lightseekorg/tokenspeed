@@ -20,10 +20,11 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
+from tokenspeed.runtime.engine.scheduler_utils import FlatBlockTableStagingBuffers
 from tokenspeed.runtime.execution.cache_loc_kernel import (
     compute_out_cache_loc,
     fused_decode_input_prep,
@@ -56,6 +57,8 @@ class InputBuffers:
         state_write_padding_pool_index: int,
         device: str = "cuda",
         has_mamba: bool = False,
+        uses_group_keyed_cache_locs: bool = False,
+        flat_memory_plan: Any | None = None,
     ):
         self.device = device
         self.page_size = page_size
@@ -65,6 +68,12 @@ class InputBuffers:
         self.max_bs = max_bs
         self.all_extends_mid_chunk = False
         self.has_mamba = has_mamba
+        self.uses_group_keyed_cache_locs = uses_group_keyed_cache_locs
+        self.flat_block_table_staging = (
+            FlatBlockTableStagingBuffers(flat_memory_plan, device=device)
+            if flat_memory_plan is not None
+            else None
+        )
 
         with torch.device(device):
             # Initialise buffers to the *padding* values the captured graph
@@ -282,24 +291,28 @@ class InputBuffers:
                 uniform_input_length=total_tokens // batch_size,
                 req_to_pages=req_to_page,
                 page_size=self.page_size,
+                use_dummy_cache_loc=self.uses_group_keyed_cache_locs,
+                dummy_kv_slot=self.dummy_kv_slot,
             )
             # Decode path's seq_lens / positions / out_cache_loc are done.
             valid_cache_lengths = None
         else:
-            # Mixed / pure-prefill: keep the per-kernel pipeline. indexSelect
-            # for valid_cache_lengths is required because compute_position and
-            # the seq_lens add use it.
+            # Mixed / pure-prefill keep the per-kernel position pipeline. A
+            # group-keyed cache has no scalar page domain: its persistent
+            # out_cache_loc is already the page-0 sentinel, while every real KV
+            # writer consumes table/base metadata from the attention backend.
             valid_cache_lengths = runtime_states.valid_cache_lengths.index_select(
                 0, req_pool_indices_device
             )
-            compute_out_cache_loc(
-                out_cache_loc_ptr=self.out_cache_loc_buf[:total_tokens],
-                req_pool_indices=req_pool_indices_device,
-                input_lengths=input_lengths_device,
-                cache_start=valid_cache_lengths,
-                req_to_pages=req_to_page,
-                page_size=self.page_size,
-            )
+            if not self.uses_group_keyed_cache_locs:
+                compute_out_cache_loc(
+                    out_cache_loc_ptr=self.out_cache_loc_buf[:total_tokens],
+                    req_pool_indices=req_pool_indices_device,
+                    input_lengths=input_lengths_device,
+                    cache_start=valid_cache_lengths,
+                    req_to_pages=req_to_page,
+                    page_size=self.page_size,
+                )
 
             # Compute positions. In mixed batches, prefill rows use their extend
             # prefix lengths while decode rows use the current valid cache lengths.
@@ -413,7 +426,8 @@ class InputBuffers:
         # (cheap tail-only fills; the active prefix was written above).
         if total_tokens < self.max_num_tokens:
             self.input_ids_buf[total_tokens:].fill_(1)
-            self.out_cache_loc_buf[total_tokens:].fill_(self.dummy_kv_slot)
+            if not self.uses_group_keyed_cache_locs:
+                self.out_cache_loc_buf[total_tokens:].fill_(self.dummy_kv_slot)
             self.positions_buf[total_tokens:].fill_(0)
             self.mrope_positions_buf[:, total_tokens:].zero_()
         if batch_size < self.max_bs:
@@ -465,7 +479,8 @@ class InputBuffers:
         """Prepare padded decode graph inputs for a rank with no real tokens."""
         if total_tokens > 0:
             self.input_ids_buf[:total_tokens].fill_(1)
-            self.out_cache_loc_buf[:total_tokens].fill_(self.dummy_kv_slot)
+            if not self.uses_group_keyed_cache_locs:
+                self.out_cache_loc_buf[:total_tokens].fill_(self.dummy_kv_slot)
             self.positions_buf[:total_tokens].fill_(0)
             self.mrope_positions_buf[:, :total_tokens].zero_()
         if batch_size > 0:

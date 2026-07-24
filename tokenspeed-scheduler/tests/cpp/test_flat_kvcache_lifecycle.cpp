@@ -108,11 +108,11 @@ TEST_F(FlatKvCacheLifecycleTestSuite, SingleRequest_PrefillDecodeFinish) {
     const FlatForwardOperation* last_decode = FindFlatOp(*last_plan);
     ASSERT_NE(last_decode, nullptr);
 
-    const auto& full_row = last_decode->flat_block_tables.at("full").at(0);
+    const auto full_row = last_decode->flat_block_tables.at("full").Row(0);
     for (std::int32_t id : full_row) {
         EXPECT_GT(id, 0) << "full row should keep history with no null/padding hole";
     }
-    const auto& swa_row = last_decode->flat_block_tables.at("swa").at(0);
+    const auto swa_row = last_decode->flat_block_tables.at("swa").Row(0);
     EXPECT_NE(std::find(swa_row.begin(), swa_row.end(), 0), swa_row.end())
         << "swa row should contain a null hole after the sliding window slides";
 
@@ -161,16 +161,18 @@ TEST_F(FlatKvCacheLifecycleTestSuite, TwoRequests_BatchedFlatBlockTables) {
     ASSERT_EQ(full.size(), 2u);
     ASSERT_EQ(swa.size(), 2u);
 
-    EXPECT_EQ(full.at(0).size(), full.at(1).size());
-    EXPECT_EQ(swa.at(0).size(), swa.at(1).size());
-    const bool any_pad = std::any_of(full.at(0).begin(), full.at(0).end(), [](std::int32_t id) { return id == -1; }) ||
-                         std::any_of(full.at(1).begin(), full.at(1).end(), [](std::int32_t id) { return id == -1; });
+    EXPECT_EQ(full.Row(0).size(), full.Row(1).size());
+    EXPECT_EQ(swa.Row(0).size(), swa.Row(1).size());
+    const std::span<const std::int32_t> full_row0 = full.Row(0);
+    const std::span<const std::int32_t> full_row1 = full.Row(1);
+    const bool any_pad =
+        std::ranges::find(full_row0, -1) != full_row0.end() || std::ranges::find(full_row1, -1) != full_row1.end();
     EXPECT_TRUE(any_pad) << "unequal prompt lengths should force -1 padding in one full row";
 
-    auto assert_no_page_collision = [](const std::vector<std::vector<std::int32_t>>& group) {
+    auto assert_no_page_collision = [](const FlatBlockTableExport& group) {
         std::vector<std::int32_t> real;
-        for (const auto& row : group) {
-            for (std::int32_t id : row) {
+        for (std::size_t row = 0; row < group.rows; ++row) {
+            for (std::int32_t id : group.Row(row)) {
                 if (id > 0) real.push_back(id);
             }
         }

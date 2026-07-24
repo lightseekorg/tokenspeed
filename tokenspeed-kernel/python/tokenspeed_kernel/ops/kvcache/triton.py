@@ -1580,6 +1580,46 @@ def _flat_tables_unpack_kernel(
         )
 
 
+@triton.jit
+def _flat_tables_unpack_ragged_kernel(
+    src_ptr,  # packed int32 device buffer (header + active table/base payload)
+    meta_ptr,  # [G, 6]: src table off/cols, dst table off/cols, src/dst base off
+    dst_ptr,  # exact-width packed graph table/base destination
+    actual_bs,
+    TAIL_PAD: tl.constexpr,
+    MAX_COLS: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+):
+    """Unpack one group's table and base vector per program row."""
+    g = tl.program_id(0)
+    b = tl.program_id(1)
+    row = meta_ptr + g * 6
+    src_table_off = tl.load(row).to(tl.int64)
+    src_cols = tl.load(row + 1).to(tl.int64)
+    dst_table_off = tl.load(row + 2).to(tl.int64)
+    dst_cols = tl.load(row + 3).to(tl.int64)
+    src_base_off = tl.load(row + 4).to(tl.int64)
+    dst_base_off = tl.load(row + 5).to(tl.int64)
+    real = b < actual_bs
+    w_off = tl.arange(0, BLOCK_W)
+    for w0 in range(0, MAX_COLS, BLOCK_W):
+        w = w0 + w_off
+        in_row = real & (w < src_cols)
+        vals = tl.load(
+            src_ptr + src_table_off + b * src_cols + w,
+            mask=in_row & (w < dst_cols),
+            other=0,
+        )
+        vals = tl.where(in_row, vals, tl.where(real, TAIL_PAD, 0))
+        tl.store(
+            dst_ptr + dst_table_off + b * dst_cols + w,
+            vals,
+            mask=w < dst_cols,
+        )
+    base = tl.load(src_ptr + src_base_off + b, mask=real, other=0)
+    tl.store(dst_ptr + dst_base_off + b, base)
+
+
 def flat_tables_unpack(
     src: torch.Tensor,
     meta: torch.Tensor,
@@ -1587,26 +1627,75 @@ def flat_tables_unpack(
     bs: int,
     actual_bs: int | None = None,
     tail_pad: int = -1,
+    *,
+    max_cols: int | None = None,
 ) -> None:
-    """Unpack the bridge's packed table upload into the stacked graph
-    buffers (all groups, one launch).
+    """Unpack one packed table upload into graph buffers in one launch.
 
     Args:
         src: 1-D int32 device buffer holding every group's rows
             back-to-back (rows x cols per group).
-        meta: [G, 2] int32 device tensor of (element offset, cols).
-        dst: [G, max_bs, Wmax] int32 stacked destination.
+        meta: ``[G, 2]`` source offset/width rows for a stacked destination,
+            or ``[G, 6]`` source/destination table offsets/widths plus
+            source/destination base offsets for an exact-width packed
+            destination.
+        dst: ``[G, max_bs, Wmax]`` stacked destination, or one exact-width
+            packed 1-D table/base destination.
         bs: rows to fill per group (padded batch size).
         actual_bs: live batch size; rows [actual_bs, bs) are written all-0
             (the flat dummy-page row contract). Defaults to bs (no padded
             rows).
         tail_pad: value for columns past the group's width.
+        max_cols: Maximum destination table width. Required for a packed
+            1-D destination and ignored for a stacked destination.
     """
-    g, _, wmax = dst.shape
-    if bs == 0 or g == 0:
-        return
+    if isinstance(bs, bool) or not isinstance(bs, int) or bs < 0:
+        raise ValueError("flat unpack bs must be an integer >= 0")
     if actual_bs is None:
         actual_bs = bs
+    if (
+        isinstance(actual_bs, bool)
+        or not isinstance(actual_bs, int)
+        or actual_bs < 0
+        or actual_bs > bs
+    ):
+        raise ValueError("flat unpack actual_bs must be an integer in [0, bs]")
+    if dst.ndim == 1:
+        if meta.ndim != 2 or meta.shape[1] != 6:
+            raise ValueError("ragged flat unpack meta must have shape [G, 6]")
+        if isinstance(max_cols, bool) or not isinstance(max_cols, int) or max_cols <= 0:
+            raise ValueError("ragged flat unpack requires max_cols > 0")
+        g = int(meta.shape[0])
+        if bs == 0 or g == 0:
+            return
+        BLOCK_W = 128 if max_cols >= 128 else 64
+        _flat_tables_unpack_ragged_kernel[(g, bs)](
+            src,
+            meta,
+            dst,
+            actual_bs,
+            TAIL_PAD=tail_pad,
+            MAX_COLS=max_cols,
+            BLOCK_W=BLOCK_W,
+        )
+        return
+    if dst.ndim != 3:
+        raise ValueError("flat unpack destination must be rank 1 or rank 3")
+    if meta.ndim != 2 or meta.shape[1] != 2:
+        raise ValueError("stacked flat unpack meta must have shape [G, 2]")
+    g, _, wmax = dst.shape
+    if int(meta.shape[0]) != g:
+        raise ValueError(
+            "stacked flat unpack group count mismatch: "
+            f"meta={int(meta.shape[0])}, destination={g}"
+        )
+    if bs > int(dst.shape[1]):
+        raise ValueError(
+            "stacked flat unpack row count exceeds destination: "
+            f"bs={bs}, destination={int(dst.shape[1])}"
+        )
+    if bs == 0 or g == 0:
+        return
     BLOCK_W = 128 if wmax >= 128 else 64
     grid = (g, bs)
     _flat_tables_unpack_kernel[grid](

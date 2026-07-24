@@ -31,7 +31,8 @@ namespace tokenspeed {
 // boundaries never received a state write, so only the aligned chunk end is publishable.
 class MambaStateManager : public SwaManager {
 public:
-    explicit MambaStateManager(std::int32_t block_size) : SwaManager(block_size, /*sliding_window=*/2) {}
+    explicit MambaStateManager(std::int32_t block_size, KvTableLayout table_layout = KvTableLayout::kAbsolute)
+        : SwaManager(block_size, /*sliding_window=*/2, table_layout) {}
 
     bool RegistersAlignedFinalPageOnly() const override { return true; }
 };

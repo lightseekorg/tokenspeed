@@ -254,6 +254,7 @@ class PrefillGraph:
         self._ctx: ForwardContext | None = None
         self._pool = None
         self._engaged_logged: set[str] = set()
+        self._replayed_kinds: set[str] = set()
         # Aux-capture mode baked into the graphs; mismatched live forwards run eager.
         self._captured_hidden_mode = None
         # One captured graph + bucket-sized output per padded token bucket.
@@ -438,11 +439,10 @@ class PrefillGraph:
         The prefill analogue of decode's ``_init_capture_metadata``. KV writes
         go to the reserved dummy slot and the page table points at page 0, so
         the forward runs (producing discarded garbage) without touching real
-        cache state. Backends with extra paged caches (DeepSeek-V4 DSA: SWA +
-        compressor + indexer state) also need per-cache block tables, or their
-        extend metadata comes up incomplete and the eager attention break
-        aborts the capture -- reuse the decode wrapper's dummy-table builder
-        (all zeros, the safe page 0) for those.
+        cache state. Backends with extra grouped caches also need one table per
+        cache group, or their extend metadata comes up incomplete and the eager
+        attention break aborts the capture -- reuse the decode wrapper's
+        dummy-table builder (all zeros, the safe page 0) for those.
         """
         ib = self.input_buffers
         ib.input_ids_buf[:num_tokens].fill_(1)
@@ -476,20 +476,43 @@ class PrefillGraph:
             ctx.global_num_tokens = [num_tokens] * self.config.world_size
             ctx.global_bs = [1] * self.config.world_size
         extra_metadata_kwargs: dict = {}
-        if (
+        uses_flat_groups = bool(
+            decode_wrapper is not None and decode_wrapper.uses_flat_table_source
+        )
+        uses_paged_groups = bool(
             getattr(self.attn_backend, "uses_paged_cache_groups", False)
-            and decode_wrapper is not None
-        ):
+            and not uses_flat_groups
+        )
+        if (uses_paged_groups or uses_flat_groups) and decode_wrapper is not None:
             tables = decode_wrapper._capture_paged_cache_block_tables(
                 1, self.token_to_kv_pool
             )
             if tables is not None:
-                extra_metadata_kwargs["paged_cache_block_tables"] = tables
+                if uses_flat_groups:
+                    extra_metadata_kwargs["flat_block_tables"] = tables
+                    extra_metadata_kwargs["flat_block_table_base_offsets"] = {
+                        gid: torch.zeros(
+                            (1,),
+                            dtype=torch.int32,
+                            device=table.device,
+                        )
+                        for gid, table in tables.items()
+                    }
+                else:
+                    extra_metadata_kwargs["paged_cache_block_tables"] = tables
             extra_metadata_kwargs["num_tokens"] = num_tokens
             extra_metadata_kwargs["positions"] = ib.positions_buf[:num_tokens]
-        flat_tables = self._dummy_flat_tables(num_tokens)
+        flat_tables = (
+            self._dummy_flat_tables(num_tokens)
+            if uses_flat_groups and "flat_block_tables" not in extra_metadata_kwargs
+            else {}
+        )
         if flat_tables:
             extra_metadata_kwargs["flat_block_tables"] = flat_tables
+            extra_metadata_kwargs["flat_block_table_base_offsets"] = {
+                gid: torch.zeros((1,), dtype=torch.int32, device=table.device)
+                for gid, table in flat_tables.items()
+            }
         self.attn_backend.init_forward_metadata(
             bs=1,
             num_extends=1,
@@ -581,6 +604,11 @@ class PrefillGraph:
                 ib.positions_buf[num_tokens:bucket].zero_()
         with self._padded_to(ctx, bucket):
             self._captures[bucket].replay(valid_rows=num_tokens)
+        # Set acceptance evidence only after the live replay returned.  Capture
+        # smoke replays and failed live replays must not satisfy the gate.
+        kind = "multimodal" if multimodal_context is not None else "text"
+        if kind not in self._replayed_kinds:
+            self._replayed_kinds.add(kind)
         hidden_states, aux_hidden_states = self._outputs[bucket].sliced(num_tokens)
         # The eager logits tail of BaseCausalLM.forward, on the replayed hidden states.
         logits_metadata = LogitsMetadata.from_forward_context(ctx)
@@ -699,3 +727,11 @@ class PrefillGraph:
             self.dp_size > 1 and ctx.global_num_tokens is not None,
             ctx.forward_mode,
         )
+
+    def runtime_evidence(self) -> dict[str, object]:
+        """Return cold, JSON-safe proof of capture and successful replay."""
+
+        return {
+            "captured_buckets": sorted(int(bucket) for bucket in self._captures),
+            "replayed_kinds": sorted(self._replayed_kinds),
+        }

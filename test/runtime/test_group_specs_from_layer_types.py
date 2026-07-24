@@ -5,6 +5,7 @@ import os
 import pathlib
 import sys
 import unittest
+from unittest import mock
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -32,7 +33,11 @@ def _load(mod_name: str, file_name: str):
     return mod
 
 
-_pcs = _load("paged_cache_spec_under_test", "paged_cache_spec.py")
+with mock.patch.dict(sys.modules):
+    _contract = _load(
+        "tokenspeed.runtime.configs.flat_kv_contract", "flat_kv_contract.py"
+    )
+    _pcs = _load("paged_cache_spec_under_test", "paged_cache_spec.py")
 group_specs_from_layer_types = _pcs.group_specs_from_layer_types
 layer_group_ids = _pcs.layer_group_ids
 PagedCacheGroupSpec = _pcs.PagedCacheGroupSpec
@@ -356,22 +361,51 @@ class PoolToPagedCacheGroupsIntegrationTest(unittest.TestCase):
     scheduler config. Needs torch + the tokenspeed_scheduler ext; skips
     where those are absent."""
 
-    def _import_converter(self):
+    def _import_scheduler_utils(self):
         try:
-            from tokenspeed.runtime.engine.scheduler_utils import (
-                pool_to_paged_cache_groups,
-            )
+            from tokenspeed.runtime.engine import scheduler_utils
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(
-                f"pool_to_paged_cache_groups unavailable (needs torch + "
+                f"scheduler_utils unavailable (needs torch + "
                 f"tokenspeed_scheduler ext): {exc}"
             )
-        return pool_to_paged_cache_groups
+        return scheduler_utils
+
+    def _heterogeneous_groups(self):
+        from types import SimpleNamespace
+
+        scheduler_utils = self._import_scheduler_utils()
+        specs = (
+            PagedCacheGroupSpec(
+                group_id="full_attention",
+                retention="full_history",
+                rows_per_page=256,
+                entry_stride_tokens=1,
+                sliding_window_tokens=None,
+            ),
+            PagedCacheGroupSpec(
+                group_id="state_c4",
+                retention="sliding_window",
+                rows_per_page=4,
+                entry_stride_tokens=1,
+                sliding_window_tokens=8,
+                family="state",
+                prefix_role="continuation_state",
+                table_layout="bounded_window",
+            ),
+        )
+        pool = SimpleNamespace(
+            paged_cache_group_specs=specs,
+            paged_cache_group_page_counts={spec.group_id: 4096 for spec in specs},
+        )
+        return scheduler_utils, scheduler_utils.pool_to_paged_cache_groups(pool)
 
     def test_two_group_specs_convert_to_two_scheduler_groups(self):
         from types import SimpleNamespace
 
-        pool_to_paged_cache_groups = self._import_converter()
+        pool_to_paged_cache_groups = (
+            self._import_scheduler_utils().pool_to_paged_cache_groups
+        )
 
         specs = group_specs_from_layer_types(
             layer_types=["full_attention", "sliding_attention"],
@@ -391,7 +425,9 @@ class PoolToPagedCacheGroupsIntegrationTest(unittest.TestCase):
         self.assertEqual(group_ids, {"full_attention", "sliding_attention"})
 
     def test_empty_specs_convert_to_no_groups(self):
-        pool_to_paged_cache_groups = self._import_converter()
+        pool_to_paged_cache_groups = (
+            self._import_scheduler_utils().pool_to_paged_cache_groups
+        )
 
         from types import SimpleNamespace
 
@@ -400,6 +436,70 @@ class PoolToPagedCacheGroupsIntegrationTest(unittest.TestCase):
             paged_cache_group_page_counts={},
         )
         self.assertEqual(pool_to_paged_cache_groups(fake_pool), [])
+
+    def test_scheduler_block_size_is_selected_by_backend(self):
+        scheduler_utils, groups = self._heterogeneous_groups()
+
+        for backend, expected in (("radix", 256), ("flat", 4)):
+            with self.subTest(backend=backend):
+                self.assertEqual(
+                    scheduler_utils.resolve_scheduler_block_size(
+                        256,
+                        groups,
+                        scheduler_backend=backend,
+                    ),
+                    expected,
+                )
+
+    def test_radix_config_retains_metadata_and_admits_300_token_request(self):
+        scheduler_utils, groups = self._heterogeneous_groups()
+        try:
+            import tokenspeed_scheduler as ts
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"tokenspeed_scheduler unavailable: {exc}")
+        if ts.FLAT_KVCACHE:
+            self.skipTest("admission regression is specific to the radix scheduler")
+
+        config = scheduler_utils.make_config(
+            num_device_pages=64,
+            max_scheduled_tokens=8192,
+            max_batch_size=1,
+            page_size=256,
+            scheduler_backend="radix",
+            num_host_pages=0,
+            disable_l2_cache=True,
+            enable_l3_storage=False,
+            prefetch_threshold=0,
+            role="null",
+            disable_prefix_cache=False,
+            paged_cache_groups=groups,
+            prefix_cache_adjunct=scheduler_utils.pool_to_prefix_cache_adjunct_spec(
+                ["full_attention"]
+            ),
+        )
+        self.assertEqual(config.block_size, 256)
+        self.assertEqual(config.num_device_pages, 64)
+        self.assertEqual(
+            [group.group_id for group in config.paged_cache_groups],
+            ["full_attention", "state_c4"],
+        )
+        self.assertEqual(
+            config.prefix_cache_adjunct.required_groups,
+            ["full_attention"],
+        )
+
+        scheduler = ts.Scheduler(config)
+        scheduler.submit_requests(
+            [scheduler_utils.make_spec("request", list(range(300)))]
+        )
+
+        plan = scheduler.next_execution_plan()
+        scheduled = {
+            request_id: input_length
+            for op in plan.forward
+            for request_id, input_length in zip(op.request_ids, op.input_lengths)
+        }
+        self.assertEqual(scheduled, {"request": 300})
 
 
 if __name__ == "__main__":
