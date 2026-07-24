@@ -106,7 +106,7 @@ from tokenspeed_kernel.ops.moe.triton import fp8 as _moe_triton_fp8
 from tokenspeed_kernel.ops.moe.triton import mxfp4 as _moe_triton_mxfp4
 from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry
-from tokenspeed_kernel.selection import SelectedKernel
+from tokenspeed_kernel.selection import SelectedKernel, spec_matches_traits
 
 _RELOAD_MODULES = [
     # Attention registration modules.
@@ -2772,6 +2772,30 @@ def test_attn_merge_state_routes_to_triton_on_cdna4(
     finally:
         Platform.override(real_platform)
         registry.clear_cache()
+
+
+@pytest.mark.parametrize("batch", [1, 2, 3, 4, 64])
+def test_gluon_mla_h64_small_batch_registration_matches_supported_batches(
+    batch: int,
+) -> None:
+    spec = KernelRegistry.get().get_by_name(
+        "gluon_mla_decode_bf16xbf16_gfx950_h64_small_batch"
+    )
+    if spec is None:
+        pytest.skip("gfx950 Gluon MLA registrations are unavailable")
+
+    traits = {
+        "batch_size": batch,
+        "batch_size_div_64": batch % 64 == 0,
+        "q_len": 1,
+        "num_q_heads": 64,
+        "page_size": 64,
+        "kv_lora_rank": 512,
+        "qk_rope_head_dim": 64,
+        "support_logit_cap": False,
+        "return_lse": False,
+    }
+    assert spec_matches_traits(spec, traits) is (batch in {1, 2, 4})
 
 
 _CASE_PLATFORM_PARAMS = [

@@ -22,9 +22,6 @@
 from __future__ import annotations
 
 import pytest
-from tokenspeed_kernel.ops.attention import gluon as _gluon_registrations  # noqa: F401
-from tokenspeed_kernel.registry import KernelRegistry
-from tokenspeed_kernel.selection import spec_matches_traits
 
 mla_decode = pytest.importorskip(
     "tokenspeed_kernel_amd.ops.attention.gluon.mla_decode_gfx950",
@@ -93,37 +90,3 @@ def test_small_batch_split_selection_caps_at_available_kv_blocks() -> None:
         )
         == 2
     )
-
-
-@pytest.mark.parametrize(
-    "batch,expected",
-    [
-        pytest.param(1, True, id="b1"),
-        pytest.param(2, True, id="b2"),
-        pytest.param(3, False, id="b3"),
-        pytest.param(4, True, id="b4"),
-        pytest.param(64, False, id="b64"),
-    ],
-)
-def test_small_batch_registration_matches_only_supported_batches(
-    batch: int,
-    expected: bool,
-) -> None:
-    spec = KernelRegistry.get().get_by_name(
-        "gluon_mla_decode_bf16xbf16_gfx950_h64_small_batch"
-    )
-    if spec is None:
-        pytest.skip("gfx950 Gluon MLA registrations are unavailable")
-
-    traits = {
-        "batch_size": batch,
-        "batch_size_div_64": batch % 64 == 0,
-        "q_len": 1,
-        "num_q_heads": 64,
-        "page_size": 64,
-        "kv_lora_rank": 512,
-        "qk_rope_head_dim": 64,
-        "support_logit_cap": False,
-        "return_lse": False,
-    }
-    assert spec_matches_traits(spec, traits) is expected
