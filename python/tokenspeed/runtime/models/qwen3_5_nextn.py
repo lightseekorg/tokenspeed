@@ -163,10 +163,6 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
         if self.is_multimodal:
             config = config.text_config
 
-        # The MTP model is unquantized in the nvfp4 checkpoint.
-        if quant_config and quant_config.get_name() == "nvfp4":
-            quant_config = None
-
         self.config = config
         self.mapping = mapping
         self.quant_config = quant_config
