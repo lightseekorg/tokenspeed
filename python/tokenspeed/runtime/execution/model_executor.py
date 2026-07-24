@@ -555,6 +555,11 @@ class ModelExecutor:
             sampling_backend=self.sampling_backend,
             runtime_states=self.runtime_states,
         )
+        # Eager warmup can be DP-asymmetric; prewarm RSAG under uniform dummy inputs.
+        if config.enforce_eager:
+            logger.info("Prewarming Triton RSAG communication states")
+            self.forward_step.prewarm_comm_states(batch_sizes=(1,))
+            logger.info("Finished prewarming Triton RSAG communication states")
 
         # Breakable prefill (extend) CUDA graphs, the extend-mode analogue of
         # the decode wrapper above; captures in __init__, borrowing the decode
