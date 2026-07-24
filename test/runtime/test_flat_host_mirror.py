@@ -1,7 +1,7 @@
 """FlatHostMirror (M15 Phase D1): byte-blind pinned-CPU slab mirror.
 
 Pins the transport contract only (no engine wiring): one mirror per
-distinct device KV tensor, whole-page row-range copies both directions,
+distinct device page tensor, whole-page row-range copies both directions,
 per-tensor load events, and the layer -> tensor-index mapping D2 fences on.
 """
 
@@ -31,7 +31,7 @@ GDN_LAYER_TYPES = ("linear_attention", "full_attention") * 2
 
 
 class FlatHostMirrorTest(unittest.TestCase):
-    """Real (tiny) MHATokenToKVPool on GPU, slab and legacy layouts."""
+    """Real tiny MHA/MSA pools on GPU, slab and legacy layouts."""
 
     def setUp(self):
         try:
@@ -39,9 +39,13 @@ class FlatHostMirrorTest(unittest.TestCase):
 
             from tokenspeed.runtime.cache.flat_host_mirror import (
                 FlatHostMirror,
+                flat_bytes_per_host_page,
             )
             from tokenspeed.runtime.layers.attention.kv_cache.mha import (
                 MHATokenToKVPool,
+            )
+            from tokenspeed.runtime.layers.attention.kv_cache.msa import (
+                MSATokenToKVPool,
             )
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
@@ -49,7 +53,9 @@ class FlatHostMirrorTest(unittest.TestCase):
             self.skipTest("needs a CUDA device")
         self.torch = torch
         self.FlatHostMirror = FlatHostMirror
+        self.flat_bytes_per_host_page = flat_bytes_per_host_page
         self.MHATokenToKVPool = MHATokenToKVPool
+        self.MSATokenToKVPool = MSATokenToKVPool
 
     def _pool(self, *, flat_ext: bool = True):
         kwargs = dict(
@@ -70,6 +76,25 @@ class FlatHostMirrorTest(unittest.TestCase):
         )
         with mock.patch(_PKG_FLAT_PROBE, return_value=flat_ext):
             return self.MHATokenToKVPool(**kwargs)
+
+    def _msa_pool(self):
+        with mock.patch(_PKG_FLAT_PROBE, return_value=True):
+            return self.MSATokenToKVPool(
+                size=32,
+                dtype=self.torch.bfloat16,
+                head_num=1,
+                head_dim=8,
+                layer_num=4,
+                device="cuda",
+                enable_memory_saver=False,
+                max_batch_size=2,
+                max_context_len=64,
+                page_size=4,
+                rank=0,
+                index_head_dim=6,
+                index_dtype=self.torch.bfloat16,
+                indexed_layer_ids=frozenset({1, 3}),
+            )
 
     def _fill_device_pages(self, mirror, device_pages):
         # Sentinels distinct per (tensor, page); bf16-exact small ints.
@@ -137,6 +162,24 @@ class FlatHostMirrorTest(unittest.TestCase):
         mirror = self.FlatHostMirror(pool, num_host_pages=8)
         self.assertEqual(len(mirror.tensor_pairs), 8)
         self._roundtrip_assert(mirror, [(1, 3), (2, 4)])
+
+    def test_auxiliary_page_roundtrip(self):
+        pool = self._msa_pool()
+        mirror = self.FlatHostMirror(pool, num_host_pages=8)
+
+        # 4 K + 4 V mirrors use 512 B per host page. The two sparse layers
+        # add 2 x page_size 4 x index width 6 bf16 rows = 96 B.
+        self.assertEqual(mirror.num_auxiliary_tensors, 2)
+        self.assertEqual(len(mirror.tensor_pairs), 10)
+        self.assertEqual(self.flat_bytes_per_host_page(pool), 608)
+        self.assertEqual(mirror.bytes_per_host_page(), 608)
+        for layer_id in (0, 2):
+            self.assertIsNone(mirror.auxiliary_tensor_index_of_layer(layer_id))
+        for layer_id in (1, 3):
+            index = mirror.auxiliary_tensor_index_of_layer(layer_id)
+            self.assertIs(mirror.tensor_pairs[index][0], pool.index_k_buffer[layer_id])
+
+        self._roundtrip_assert(mirror, [(1, 5), (2, 6)])
 
     def test_events_and_layer_mapping(self):
         torch = self.torch

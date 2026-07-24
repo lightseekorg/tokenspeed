@@ -78,6 +78,13 @@ class MSATokenToKVPool(MHATokenToKVPool):
             raise RuntimeError(f"Layer {layer_id} has no index-key cache.")
         return self.index_k_buffer[layer_id]
 
+    @property
+    def flat_auxiliary_page_buffers(self) -> tuple[torch.Tensor | None, ...]:
+        """Index-key pages mirrored alongside K/V by the flat host tier."""
+        return tuple(
+            self.index_k_buffer.get(layer_id) for layer_id in range(self.layer_num)
+        )
+
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor) -> None:
         super().move_kv_cache(tgt_loc, src_loc)
         if tgt_loc.numel() == 0:
