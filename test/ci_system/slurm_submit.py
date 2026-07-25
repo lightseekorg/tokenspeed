@@ -134,6 +134,11 @@ def parse_pr_number(value: str) -> int:
 @contextlib.contextmanager
 def pr_worktree(repo: Path, value: str):
     number = parse_pr_number(value)
+    if git(repo, "rev-parse", "--is-shallow-repository") == "true":
+        raise ValueError(
+            "cannot merge a pull request from a shallow checkout; "
+            "use actions/checkout with fetch-depth: 0 or unshallow the repository"
+        )
     temporary = Path(tempfile.mkdtemp(prefix=f"tokenspeed-pr-{number}-"))
     reference = f"refs/tokenspeed-slurm/pr-{number}-{os.getpid()}"
     try:

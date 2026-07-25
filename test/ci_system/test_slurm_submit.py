@@ -10,6 +10,7 @@ from slurm_submit import (
     gpu_count,
     load_task,
     parse_pr_number,
+    pr_worktree,
     render_script,
     result_detail,
     select_tasks,
@@ -151,6 +152,28 @@ def test_parse_pr_number(value, expected):
 def test_parse_pr_number_rejects_other_urls():
     with pytest.raises(ValueError, match="pull request"):
         parse_pr_number("https://example.com/pull/795")
+
+
+def test_pr_worktree_rejects_shallow_checkout(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    subprocess.run(["git", "init", "-q", source], check=True)
+    subprocess.run(["git", "-C", source, "config", "user.name", "Test"], check=True)
+    subprocess.run(
+        ["git", "-C", source, "config", "user.email", "test@example.com"], check=True
+    )
+    (source / "README.md").write_text("test\n")
+    subprocess.run(["git", "-C", source, "add", "README.md"], check=True)
+    subprocess.run(["git", "-C", source, "commit", "-qm", "initial"], check=True)
+    shallow = tmp_path / "shallow"
+    subprocess.run(
+        ["git", "clone", "-q", "--depth=1", f"file://{source}", shallow],
+        check=True,
+    )
+
+    with pytest.raises(ValueError, match="fetch-depth: 0"):
+        with pr_worktree(shallow, "794"):
+            pass
 
 
 def test_render_script_contains_cluster_requirements():

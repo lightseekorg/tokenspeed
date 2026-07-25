@@ -52,6 +52,10 @@ jobs:
     steps:
       - name: Checkout trusted dispatcher
         uses: actions/checkout@v4
+        with:
+          # pr_worktree fetches and merges the requested private-repo PR below.
+          fetch-depth: 0
+          persist-credentials: true
 
       - name: Submit and wait for Slurm tasks
         env:
