@@ -207,7 +207,10 @@ class CommManager:
         if not self.mapping.dense.has_tp:
             return hidden_states
 
-        if self.use_all_reduce(is_moe=False):
+        # Row placement is decided by post_attn_comm for the enclosing layer.
+        # A dense shared expert inside a MoE layer therefore inherits the MoE
+        # row layout, even though its weights use the dense TP group.
+        if self.use_all_reduce(is_moe=self.is_moe):
             return hidden_states
 
         return token_all_gather(
@@ -243,7 +246,7 @@ class CommManager:
         if not self.mapping.dense.has_tp:
             return hidden_states, residual
 
-        if self.use_all_reduce(is_moe=False):
+        if self.use_all_reduce(is_moe=self.is_moe):
             hidden_states = all_reduce(hidden_states, self.mapping.dense.tp_group)
             return hidden_states, residual
         hidden_states = token_reduce_scatter(

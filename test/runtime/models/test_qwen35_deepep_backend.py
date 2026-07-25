@@ -5,6 +5,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import tokenspeed.runtime.distributed.comm_manager as comm_manager_module
+from tokenspeed.runtime.distributed.comm_manager import CommManager
+from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.layers.moe.utils import All2AllBackend, MoeBackend
 from tokenspeed.runtime.models import qwen3_5_moe
 
@@ -98,3 +101,66 @@ def test_qwen35_deepep_shared_expert_gathers_then_scatters_idle_rank() -> None:
 
     assert output.shape == (0, 4)
     assert events == ["gather", "shared_expert", "scatter", "routed_experts"]
+
+
+def test_qwen35_deepep_shared_expert_uses_enclosing_moe_row_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Equal attention/dense TP still needs RSAG when MoE rows are scattered."""
+    mapping = Mapping(
+        rank=0,
+        world_size=4,
+        attn_tp_size=2,
+        attn_cp_size=1,
+        attn_dp_size=2,
+        dense_tp_size=2,
+        dense_dp_size=2,
+        moe_tp_size=1,
+        moe_ep_size=4,
+        moe_dp_size=1,
+    )
+    manager = CommManager(
+        mapping=mapping,
+        layer_id=1,
+        is_moe=True,
+        prev_is_moe=True,
+    )
+    ctx = SimpleNamespace(
+        collective_global_num_tokens=None,
+        global_num_tokens=[3, 3, 5, 5],
+        collective_num_tokens=None,
+        input_num_tokens=3,
+    )
+    local_hidden = torch.ones((2, 4))
+    gathered_hidden = torch.ones((3, 4))
+    calls = []
+
+    def fake_all_gather(hidden_states, *, group, scattered_num_tokens):
+        assert hidden_states is local_hidden
+        assert group == (0, 1)
+        assert scattered_num_tokens == [2, 1]
+        calls.append("gather")
+        return gathered_hidden
+
+    def fake_reduce_scatter(hidden_states, *, group, scattered_num_tokens):
+        assert hidden_states is gathered_hidden
+        assert group == (0, 1)
+        assert scattered_num_tokens == [2, 1]
+        calls.append("scatter")
+        return local_hidden
+
+    def unexpected_all_reduce(*args, **kwargs):
+        pytest.fail("scattered MoE rows must not use dense-TP all-reduce")
+
+    monkeypatch.setattr(comm_manager_module, "token_all_gather", fake_all_gather)
+    monkeypatch.setattr(
+        comm_manager_module, "token_reduce_scatter", fake_reduce_scatter
+    )
+    monkeypatch.setattr(comm_manager_module, "all_reduce", unexpected_all_reduce)
+
+    shared_input = manager.pre_dense_comm(local_hidden, ctx)
+    shared_output, residual = manager.post_dense_comm(shared_input, None, ctx)
+
+    assert shared_output is local_hidden
+    assert residual is None
+    assert calls == ["gather", "scatter"]
