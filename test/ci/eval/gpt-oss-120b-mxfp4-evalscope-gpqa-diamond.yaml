@@ -4,6 +4,7 @@ type: eval
 triggers:
   - per-commit
   - manual
+  - debug
 runner:
   labels:
     - b200-2gpu
@@ -16,6 +17,7 @@ runner:
       GPT_OSS_EVAL_MODEL: amd/gpt-oss-120b-w-mxfp4-a-fp8
 env:
   CI: "true"
+  TOKENSPEED_FLAT_KV: "ON"
 install:
   - bash test/ci_system/install_deps.sh
 server:
