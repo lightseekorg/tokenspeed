@@ -10,6 +10,7 @@ from slurm_submit import (
     gpu_count,
     load_task,
     parse_pr_number,
+    pr_worktree,
     render_script,
     result_detail,
     select_tasks,
@@ -153,6 +154,28 @@ def test_parse_pr_number_rejects_other_urls():
         parse_pr_number("https://example.com/pull/795")
 
 
+def test_pr_worktree_rejects_shallow_checkout(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    subprocess.run(["git", "init", "-q", source], check=True)
+    subprocess.run(["git", "-C", source, "config", "user.name", "Test"], check=True)
+    subprocess.run(
+        ["git", "-C", source, "config", "user.email", "test@example.com"], check=True
+    )
+    (source / "README.md").write_text("test\n")
+    subprocess.run(["git", "-C", source, "add", "README.md"], check=True)
+    subprocess.run(["git", "-C", source, "commit", "-qm", "initial"], check=True)
+    shallow = tmp_path / "shallow"
+    subprocess.run(
+        ["git", "clone", "-q", "--depth=1", f"file://{source}", shallow],
+        check=True,
+    )
+
+    with pytest.raises(ValueError, match="fetch-depth: 0"):
+        with pr_worktree(shallow, "794"):
+            pass
+
+
 def test_render_script_contains_cluster_requirements():
     script = render_script(
         Task("test/ci/eval/example.yaml", "example", "eval", "gb200-1gpu", 1),
@@ -167,6 +190,12 @@ def test_render_script_contains_cluster_requirements():
     assert "libcudart.so.13" in script
     assert "/usr/bin/nvidia-smi" in script
     assert "/shared/cache:/home/runner/.cache" in script
+    unset = (
+        "unset GITHUB_STEP_SUMMARY GITHUB_OUTPUT GITHUB_ENV GITHUB_PATH "
+        "GITHUB_STATE   GITHUB_EVENT_PATH"
+    )
+    assert unset in script
+    assert script.index(unset) < script.index('srun "${srun_args[@]}"')
     subprocess.run(["bash", "-n"], input=script, text=True, check=True)
 
 

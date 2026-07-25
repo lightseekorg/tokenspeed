@@ -1263,8 +1263,14 @@ def write_detailed_step_summary(result: Dict[str, Any]) -> None:
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if not summary_path:
         return
-    with open(summary_path, "a") as handle:
-        handle.write("\n".join(build_step_summary_lines(result)))
+    try:
+        with open(summary_path, "a") as handle:
+            handle.write("\n".join(build_step_summary_lines(result)))
+    except OSError as exc:
+        print(
+            f"warning: could not write GitHub step summary: {exc}",
+            file=sys.stderr,
+        )
 
 
 def write_result(path: str | None, payload: Dict[str, Any]) -> None:
@@ -1659,9 +1665,9 @@ def execute_task(
         result["perf_reference_check"] = perf_reference_check
     if eval_accept_rate is not None:
         result["eval_accept_rate"] = eval_accept_rate
+    write_result(result_json, result)
     if task.get("report", {}).get("github_step_summary"):
         write_detailed_step_summary(result)
-    write_result(result_json, result)
     if error is not None:
         if not error_reported:
             print(f"error: {error}", file=sys.stderr)

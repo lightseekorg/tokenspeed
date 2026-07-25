@@ -134,6 +134,11 @@ def parse_pr_number(value: str) -> int:
 @contextlib.contextmanager
 def pr_worktree(repo: Path, value: str):
     number = parse_pr_number(value)
+    if git(repo, "rev-parse", "--is-shallow-repository") == "true":
+        raise ValueError(
+            "cannot merge a pull request from a shallow checkout; "
+            "use actions/checkout with fetch-depth: 0 or unshallow the repository"
+        )
     temporary = Path(tempfile.mkdtemp(prefix=f"tokenspeed-pr-{number}-"))
     reference = f"refs/tokenspeed-slurm/pr-{number}-{os.getpid()}"
     try:
@@ -254,6 +259,8 @@ set -euo pipefail
 export RUNNER_NAME="slurm-${{SLURM_JOB_ID}}"
 export HF_HOME=/home/runner/.cache/huggingface
 export XDG_CACHE_HOME=/home/runner/.cache
+unset GITHUB_STEP_SUMMARY GITHUB_OUTPUT GITHUB_ENV GITHUB_PATH GITHUB_STATE \
+  GITHUB_EVENT_PATH
 
 scratch="${{SLURM_TMPDIR:-/tmp}}/tokenspeed-${{SLURM_JOB_ID}}"
 src="$scratch/src"

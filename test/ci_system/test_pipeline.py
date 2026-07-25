@@ -256,7 +256,10 @@ def test_slurm_execution_only_cleans_its_process_group(monkeypatch, tmp_path):
         "type": "ut",
         "runner": {"labels": ["gb200-1gpu"]},
         "ut": {"commands": ["run test"]},
+        "report": {"github_step_summary": True},
     }
+    result_json = tmp_path / "result.json"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(tmp_path / "missing" / "summary.md"))
 
     class FakeProcessGroupManager:
         terminated = False
@@ -286,12 +289,13 @@ def test_slurm_execution_only_cleans_its_process_group(monkeypatch, tmp_path):
         work_dir=str(tmp_path),
         dry_run=False,
         print_plan=False,
-        result_json=None,
+        result_json=str(result_json),
         setup_mode="slurm",
     )
 
     assert return_code == 0
     assert manager.terminated is True
+    assert result_json.exists()
 
 
 def test_runner_specific_env_uses_original_label_after_b200_override(monkeypatch):
@@ -491,6 +495,15 @@ def test_step_summary_includes_perf_reference_failures():
 def test_step_summary_omits_perf_reference_when_unconfigured():
     summary = "\n".join(build_step_summary_lines(_base_result()))
     assert "Perf reference" not in summary
+
+
+def test_step_summary_write_failure_is_non_fatal(monkeypatch, tmp_path, capsys):
+    missing = tmp_path / "missing" / "summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(missing))
+
+    pipeline.write_detailed_step_summary(_base_result())
+
+    assert "warning: could not write GitHub step summary" in capsys.readouterr().err
 
 
 def test_resolve_score_threshold_passes_through_scalar():
