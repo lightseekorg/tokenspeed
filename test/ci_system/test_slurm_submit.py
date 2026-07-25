@@ -167,6 +167,12 @@ def test_render_script_contains_cluster_requirements():
     assert "libcudart.so.13" in script
     assert "/usr/bin/nvidia-smi" in script
     assert "/shared/cache:/home/runner/.cache" in script
+    unset = (
+        "unset GITHUB_STEP_SUMMARY GITHUB_OUTPUT GITHUB_ENV GITHUB_PATH "
+        "GITHUB_STATE   GITHUB_EVENT_PATH"
+    )
+    assert unset in script
+    assert script.index(unset) < script.index('srun "${srun_args[@]}"')
     subprocess.run(["bash", "-n"], input=script, text=True, check=True)
 
 

@@ -254,6 +254,8 @@ set -euo pipefail
 export RUNNER_NAME="slurm-${{SLURM_JOB_ID}}"
 export HF_HOME=/home/runner/.cache/huggingface
 export XDG_CACHE_HOME=/home/runner/.cache
+unset GITHUB_STEP_SUMMARY GITHUB_OUTPUT GITHUB_ENV GITHUB_PATH GITHUB_STATE \
+  GITHUB_EVENT_PATH
 
 scratch="${{SLURM_TMPDIR:-/tmp}}/tokenspeed-${{SLURM_JOB_ID}}"
 src="$scratch/src"
