@@ -25,7 +25,12 @@ from pipeline import build_matrix, normalize_task
 GPU_RE = re.compile(r"(?:^|-)([1-9]\d*)gpu(?:-|$)")
 TASK_TYPES = {"ut", "server_smoke", "eval", "perf"}
 DEFAULT_TASK_TYPES = {"eval", "perf"}
-PR_RE = re.compile(r"^(?:https://github\.com/[^/]+/[^/]+/pull/)?(\d+)(?:/)?$")
+PR_RE = re.compile(
+    r"^(?:https://github\.com/"
+    r"(?P<owner>[A-Za-z0-9._-]+)/(?P<repo>[A-Za-z0-9._-]+)/pull/)?"
+    r"(?P<number>\d+)/?$"
+)
+REPOSITORY_RE = re.compile(r"^(?P<owner>[A-Za-z0-9._-]+)/(?P<repo>[A-Za-z0-9._-]+)$")
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 
@@ -131,7 +136,29 @@ def parse_pr_number(value: str) -> int:
         raise ValueError(
             "--pr must be a pull request number or GitHub pull request URL"
         )
-    return int(match.group(1))
+    return int(match.group("number"))
+
+
+def source_pr_summary(value: str) -> str:
+    match = PR_RE.fullmatch(value)
+    if not match:
+        raise ValueError(
+            "--pr must be a pull request number or GitHub pull request URL"
+        )
+    number = int(match.group("number"))
+    owner = match.group("owner")
+    repo = match.group("repo")
+    if owner is None or repo is None:
+        repository_match = REPOSITORY_RE.fullmatch(
+            os.environ.get("GITHUB_REPOSITORY", "")
+        )
+        if repository_match:
+            owner = repository_match.group("owner")
+            repo = repository_match.group("repo")
+    if owner is not None and repo is not None:
+        url = f"https://github.com/{owner}/{repo}/pull/{number}"
+        return f"**Target PR:** [#{number}]({url})"
+    return f"**Target PR:** #{number}"
 
 
 @contextlib.contextmanager
@@ -469,15 +496,22 @@ def write_report(
     states: dict[str, dict[str, str]],
     run_root: Path,
     report_dir: Path,
+    source_pr: str | None = None,
 ) -> None:
     report_dir.mkdir(parents=True, exist_ok=True)
     rows = []
     summary = [
         "## Slurm validation",
         "",
-        "| Job | Type | Runner | Task | State | Elapsed | Result |",
-        "|---:|---|---|---|---|---:|---|",
     ]
+    if source_pr:
+        summary.extend([source_pr_summary(source_pr), ""])
+    summary.extend(
+        [
+            "| Job | Type | Runner | Task | State | Elapsed | Result |",
+            "|---:|---|---|---|---|---:|---|",
+        ]
+    )
     details = []
     for submission in submissions:
         state = states.get(
@@ -523,7 +557,12 @@ def write_report(
     (report_dir / "summary.md").write_text("\n".join(summary) + "\n")
 
 
-def wait_all(submissions: list[Submission], run_root: Path, report_dir: Path) -> bool:
+def wait_all(
+    submissions: list[Submission],
+    run_root: Path,
+    report_dir: Path,
+    source_pr: str | None = None,
+) -> bool:
     job_ids = [submission.job_id for submission in submissions]
     previous_handlers = {}
 
@@ -550,7 +589,7 @@ def wait_all(submissions: list[Submission], run_root: Path, report_dir: Path) ->
             if len(states) == len(job_ids):
                 break
             time.sleep(2)
-        write_report(submissions, states, run_root, report_dir)
+        write_report(submissions, states, run_root, report_dir, source_pr)
         return all(item.get("state") == "COMPLETED" for item in states.values()) and (
             len(states) == len(job_ids)
         )
@@ -646,7 +685,9 @@ def run(args: argparse.Namespace, repo: Path, artifact_root: Path, cache: Path) 
             if args.report_dir
             else artifact_root / "reports" / f"{commit[:12]}-{time.time_ns()}"
         )
-        completed = wait_all(submitted, artifact_root / "runs", report_dir)
+        completed = wait_all(
+            submitted, artifact_root / "runs", report_dir, source_pr=args.pr
+        )
         print(f"Report: {report_dir}")
         return 0 if completed else 1
     if args.follow:
