@@ -175,13 +175,71 @@ test/ci/run_slurm.sh \
 
 # Every existing YAML for one exact runner label:
 test/ci/run_slurm.sh --all --runner gb200-4gpu --trigger manual
+
+# List Kimi eval/perf tasks from PR 795 for two runner labels:
+test/ci/run_slurm.sh \
+  --pr 795 \
+  --all \
+  --runner b200-4gpu \
+  --runner gb200-4gpu \
+  --match kimi \
+  --list
+
+# Submit selected task types; repeat --type and --match as needed:
+test/ci/run_slurm.sh \
+  --pr https://github.com/lightseekorg/tokenspeed/pull/795 \
+  --all \
+  --runner b200-1gpu \
+  --runner b200-2gpu \
+  --type ut \
+  --type eval \
+  --type perf \
+  --match kimi \
+  --follow
 ```
 
 This is a manual launcher, not a GitHub Actions runner. Override its defaults
 with `TS_CI_ARTIFACT_ROOT`, `TS_CI_CACHE_DIR`, or
 `TS_CI_CONTAINER_IMAGE`.
 
-For a YAML with multiple runner labels, select one explicitly with `--runner`.
+`--pr` accepts a pull request number or GitHub URL. It fetches the PR head and
+merges it into the launcher's committed `HEAD` in an isolated temporary
+worktree. The original checkout is not modified, and submitted jobs use an
+immutable archive of that merged commit. A merge conflict stops before any job
+is submitted.
+
+Repeat `--runner` to select multiple exact labels. Repeat `--type` to select
+from `ut`, `server_smoke`, `eval`, and `perf`; without `--type`, the
+backward-compatible default is `eval` plus `perf`. Repeat `--match` to select
+tasks whose name, YAML path, server command, or selected task command contains
+any supplied substring (case-insensitive). `--list` prints the final matrix
+without creating snapshots or submitting jobs, while `--render` prints the
+generated Slurm commands and scripts.
+
+`--wait` keeps the dispatcher process alive until every submitted Slurm job
+reaches a terminal state. `--report-dir PATH` then collects a `manifest.json`,
+Markdown summary, per-job logs, and available `result.json` files under
+`PATH`. The command succeeds only when every job reaches `COMPLETED`. SIGINT or
+SIGTERM while waiting calls `scancel` for the jobs submitted by that command.
+
+The manual `Slurm Dispatch` GitHub workflow runs on a self-hosted runner with
+the `slurm-dispatch` label. That runner belongs on the Slurm coordinator and
+only needs GitHub runner prerequisites, this repository, Python/PyYAML, and
+Slurm client commands; it does not need GPUs. From the Actions UI, provide a PR,
+comma-separated runner labels and task types, and an optional comma-separated
+task/model filter. The workflow submits the selected matrix, waits for all
+jobs, writes the aggregate table to the GitHub step summary, and uploads the
+collected report directory as an artifact. It excludes long-running MMLU tasks
+by default; explicitly enable `include_mmlu` in the manual workflow inputs when
+that coverage is required.
+
+The dispatcher checkout is trusted control-plane code. The requested PR is
+merged only in the submitter's temporary worktree and runs from its immutable
+archive inside Pyxis; do not configure the coordinator runner to execute
+arbitrary PR scripts directly.
+
+For a YAML with multiple runner labels, select one or more explicitly with
+repeated `--runner`.
 Site-specific scheduler settings can be supplied with `--account`, `--qos`,
 `--constraint`, `--time`, and `--gpu-type`. Additional host paths can be
 mounted with repeated `--mount HOST:CONTAINER[:FLAGS]` options. Exported

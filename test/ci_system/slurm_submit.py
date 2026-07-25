@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""Submit existing TokenSpeed eval/perf YAML tasks to Slurm through Pyxis."""
+"""Select and submit existing TokenSpeed CI YAML tasks through Slurm/Pyxis."""
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import re
 import shlex
+import shutil
+import signal
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,15 +22,25 @@ from typing import Iterable
 from pipeline import build_matrix, normalize_task
 
 GPU_RE = re.compile(r"(?:^|-)([1-9]\d*)gpu(?:-|$)")
-TASK_TYPES = {"eval", "perf"}
+TASK_TYPES = {"ut", "server_smoke", "eval", "perf"}
+DEFAULT_TASK_TYPES = {"eval", "perf"}
+PR_RE = re.compile(r"^(?:https://github\.com/[^/]+/[^/]+/pull/)?(\d+)(?:/)?$")
 
 
 @dataclass(frozen=True)
 class Task:
     config: str
     name: str
+    task_type: str
     runner: str
     gpus: int
+
+
+@dataclass(frozen=True)
+class Submission:
+    task: Task
+    job_id: str
+    log: Path
 
 
 def gpu_count(runner: str) -> int:
@@ -44,7 +58,7 @@ def load_task(repo: Path, config: str, runner: str | None = None) -> Task:
         raise ValueError("--config must be inside the repository") from exc
     data = normalize_task(path, repo)
     if data["type"] not in TASK_TYPES:
-        raise ValueError("only eval and perf YAML tasks can run through Slurm")
+        raise ValueError(f"unsupported task type {data['type']!r}")
     labels = list(data["runner"]["labels"])
     if runner is None:
         if len(labels) != 1:
@@ -52,23 +66,118 @@ def load_task(repo: Path, config: str, runner: str | None = None) -> Task:
         runner = labels[0]
     if runner not in labels:
         raise ValueError(f"{runner!r} is not declared by {relative}")
-    return Task(relative, str(data["name"]), runner, gpu_count(runner))
+    return Task(
+        relative, str(data["name"]), str(data["type"]), runner, gpu_count(runner)
+    )
+
+
+def task_matches(repo: Path, task: Task, patterns: list[str]) -> bool:
+    if not patterns:
+        return True
+    data = normalize_task(repo / task.config, repo)
+    commands = [
+        str(data.get(stage, {}).get("command", ""))
+        for stage in ("server", "ut", "server_smoke", "eval", "perf")
+    ]
+    haystack = "\n".join([task.config, task.name, *commands]).lower()
+    return any(pattern.lower() in haystack for pattern in patterns)
 
 
 def select_tasks(args: argparse.Namespace, repo: Path) -> list[Task]:
+    runners = args.runner or []
+    task_types = set(args.task_types or DEFAULT_TASK_TYPES)
+    patterns = args.match or []
+    excluded_patterns = getattr(args, "exclude_match", None) or []
+
+    def matches_filters(task: Task) -> bool:
+        return task_matches(repo, task, patterns) and (
+            not excluded_patterns or not task_matches(repo, task, excluded_patterns)
+        )
+
     if args.config:
-        return [load_task(repo, args.config, args.runner)]
-    if not args.runner:
+        tasks = (
+            [load_task(repo, args.config, runner) for runner in runners]
+            if runners
+            else [load_task(repo, args.config)]
+        )
+        tasks = [
+            task
+            for task in tasks
+            if task.task_type in task_types and matches_filters(task)
+        ]
+        if not tasks:
+            raise ValueError("the selected config does not match the task filters")
+        return tasks
+    if not runners:
         raise ValueError("--all requires --runner")
     matrix = build_matrix(repo / "test/ci", repo, args.trigger)
     tasks = [
         load_task(repo, item["config"], item["runner"])
         for item in matrix["include"]
-        if item["type"] in TASK_TYPES and item["runner"] == args.runner
+        if item["type"] in task_types and item["runner"] in runners
     ]
+    tasks = [task for task in tasks if matches_filters(task)]
     if not tasks:
-        raise ValueError(f"no eval/perf tasks declare runner {args.runner!r}")
+        raise ValueError("no tasks match the requested runners and filters")
     return tasks
+
+
+def parse_pr_number(value: str) -> int:
+    match = PR_RE.fullmatch(value)
+    if not match:
+        raise ValueError(
+            "--pr must be a pull request number or GitHub pull request URL"
+        )
+    return int(match.group(1))
+
+
+@contextlib.contextmanager
+def pr_worktree(repo: Path, value: str):
+    number = parse_pr_number(value)
+    if git(repo, "rev-parse", "--is-shallow-repository") == "true":
+        raise ValueError(
+            "cannot merge a pull request from a shallow checkout; "
+            "use actions/checkout with fetch-depth: 0 or unshallow the repository"
+        )
+    temporary = Path(tempfile.mkdtemp(prefix=f"tokenspeed-pr-{number}-"))
+    reference = f"refs/tokenspeed-slurm/pr-{number}-{os.getpid()}"
+    try:
+        git(repo, "fetch", "origin", f"refs/pull/{number}/head:{reference}")
+        git(repo, "worktree", "add", "--detach", str(temporary), "HEAD")
+        environment = os.environ.copy()
+        environment.setdefault("GIT_AUTHOR_NAME", "TokenSpeed Slurm")
+        environment.setdefault("GIT_AUTHOR_EMAIL", "slurm@tokenspeed.local")
+        environment.setdefault("GIT_COMMITTER_NAME", environment["GIT_AUTHOR_NAME"])
+        environment.setdefault("GIT_COMMITTER_EMAIL", environment["GIT_AUTHOR_EMAIL"])
+        subprocess.run(
+            ["git", "-C", str(temporary), "merge", "--no-ff", "--no-edit", reference],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        yield temporary
+    finally:
+        subprocess.run(
+            ["git", "-C", str(repo), "worktree", "remove", "--force", str(temporary)],
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "update-ref", "-d", reference],
+            capture_output=True,
+            text=True,
+        )
+        shutil.rmtree(temporary, ignore_errors=True)
+
+
+def print_tasks(tasks: list[Task]) -> None:
+    print("TYPE\tRUNNER\tGPUS\tCONFIG\tNAME")
+    for task in tasks:
+        print(
+            f"{task.task_type}\t{task.runner}\t{task.gpus}\t"
+            f"{task.config}\t{task.name}"
+        )
 
 
 def git(repo: Path, *arguments: str) -> str:
@@ -150,6 +259,8 @@ set -euo pipefail
 export RUNNER_NAME="slurm-${{SLURM_JOB_ID}}"
 export HF_HOME=/home/runner/.cache/huggingface
 export XDG_CACHE_HOME=/home/runner/.cache
+unset GITHUB_STEP_SUMMARY GITHUB_OUTPUT GITHUB_ENV GITHUB_PATH GITHUB_STATE \
+  GITHUB_EVENT_PATH
 
 scratch="${{SLURM_TMPDIR:-/tmp}}/tokenspeed-${{SLURM_JOB_ID}}"
 src="$scratch/src"
@@ -200,7 +311,7 @@ def submit(
     artifact_root: Path,
     args: argparse.Namespace,
     commit: str,
-) -> tuple[str, Path]:
+) -> Submission:
     stem = re.sub(r"[^A-Za-z0-9_.-]+", "-", task.name).strip("-")
     unique = f"{commit[:12]}-{time.time_ns()}"
     script_path = artifact_root / "scripts" / f"{stem}-{unique}.sbatch"
@@ -233,13 +344,13 @@ def submit(
     if args.render:
         print(f"$ {shlex.join(command)}")
         print(script, end="")
-        return "", log_pattern
+        return Submission(task, "", log_pattern)
     result = subprocess.run(command, check=True, capture_output=True, text=True)
     job_id = result.stdout.strip().split(";", 1)[0]
     log = Path(str(log_pattern).replace("%j", job_id))
     print(f"Submitted {job_id}: {task.config}")
     print(f"Log: {log}")
-    return job_id, log
+    return Submission(task, job_id, log)
 
 
 def follow(job_id: str, log: Path) -> None:
@@ -259,12 +370,152 @@ def follow(job_id: str, log: Path) -> None:
             tail.terminate()
 
 
+def slurm_states(job_ids: list[str]) -> dict[str, dict[str, str]]:
+    result = subprocess.run(
+        [
+            "sacct",
+            "-X",
+            "-n",
+            "-P",
+            "-j",
+            ",".join(job_ids),
+            "--format=JobIDRaw,State,Elapsed,ExitCode",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    states = {}
+    for line in result.stdout.splitlines():
+        fields = line.split("|")
+        if len(fields) >= 4 and fields[0] in job_ids:
+            states[fields[0]] = {
+                "state": fields[1].split("+", 1)[0],
+                "elapsed": fields[2],
+                "exit_code": fields[3],
+            }
+    return states
+
+
+def result_detail(path: Path) -> str:
+    if not path.exists():
+        return ""
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return "invalid result.json"
+    if data.get("eval_score_check"):
+        check = data["eval_score_check"]
+        return f"score={check['score']:g}, threshold={check['threshold']}"
+    if data.get("perf_reference_check"):
+        check = data["perf_reference_check"]
+        return f"perf={'pass' if check['passed'] else 'fail'}"
+    command_results = data.get("command_results", [])
+    if command_results and command_results[-1].get("pytest_summary"):
+        return str(command_results[-1]["pytest_summary"])
+    return str(data.get("error", ""))
+
+
+def write_report(
+    submissions: list[Submission],
+    states: dict[str, dict[str, str]],
+    run_root: Path,
+    report_dir: Path,
+) -> None:
+    report_dir.mkdir(parents=True, exist_ok=True)
+    rows = []
+    summary = [
+        "## Slurm validation",
+        "",
+        "| Job | Type | Runner | Task | State | Elapsed | Result |",
+        "|---:|---|---|---|---|---:|---|",
+    ]
+    for submission in submissions:
+        state = states.get(
+            submission.job_id,
+            {"state": "UNKNOWN", "elapsed": "", "exit_code": ""},
+        )
+        result_path = run_root / submission.job_id / "result.json"
+        detail = result_detail(result_path)
+        row = {
+            "job_id": submission.job_id,
+            "task": submission.task.__dict__,
+            "log": str(submission.log),
+            "result": str(result_path),
+            **state,
+            "detail": detail,
+        }
+        rows.append(row)
+        summary.append(
+            f"| {submission.job_id} | {submission.task.task_type} | "
+            f"{submission.task.runner} | {submission.task.name} | "
+            f"{state['state']} | {state['elapsed']} | {detail} |"
+        )
+        if submission.log.exists():
+            shutil.copy2(submission.log, report_dir / f"{submission.job_id}.log")
+        if result_path.exists():
+            shutil.copy2(result_path, report_dir / f"{submission.job_id}-result.json")
+    (report_dir / "manifest.json").write_text(json.dumps(rows, indent=2) + "\n")
+    (report_dir / "summary.md").write_text("\n".join(summary) + "\n")
+
+
+def wait_all(submissions: list[Submission], run_root: Path, report_dir: Path) -> bool:
+    job_ids = [submission.job_id for submission in submissions]
+    previous_handlers = {}
+
+    def cancel_jobs(signum, _frame):
+        subprocess.run(["scancel", *job_ids], check=False)
+        raise SystemExit(128 + signum)
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        previous_handlers[signum] = signal.signal(signum, cancel_jobs)
+    try:
+        while True:
+            queued = subprocess.run(
+                ["squeue", "-h", "-j", ",".join(job_ids)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            if not queued.stdout.strip():
+                break
+            time.sleep(10)
+        states = {}
+        for _ in range(6):
+            states = slurm_states(job_ids)
+            if len(states) == len(job_ids):
+                break
+            time.sleep(2)
+        write_report(submissions, states, run_root, report_dir)
+        return all(item.get("state") == "COMPLETED" for item in states.values()) and (
+            len(states) == len(job_ids)
+        )
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+
+
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--config")
     source.add_argument("--all", action="store_true")
-    parser.add_argument("--runner")
+    parser.add_argument("--runner", action="append")
+    parser.add_argument(
+        "--type", dest="task_types", action="append", choices=sorted(TASK_TYPES)
+    )
+    parser.add_argument(
+        "--match",
+        action="append",
+        help="Case-insensitive task/config/model substring; repeat for OR matching.",
+    )
+    parser.add_argument(
+        "--exclude-match",
+        action="append",
+        help="Exclude a case-insensitive task/config/model substring; repeat for OR.",
+    )
+    parser.add_argument("--pr", help="PR number or GitHub pull request URL to merge.")
+    parser.add_argument("--list", action="store_true", help="List matching tasks only.")
     parser.add_argument(
         "--trigger", choices=("per-commit", "manual", "nightly", "debug")
     )
@@ -276,6 +527,12 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--time", default="12:00:00")
     parser.add_argument("--nodelist")
     parser.add_argument("--follow", action="store_true")
+    parser.add_argument(
+        "--wait", action="store_true", help="Wait for every submitted job."
+    )
+    parser.add_argument(
+        "--report-dir", help="Write aggregate manifest, summary, logs, and results."
+    )
     parser.add_argument("--render", action="store_true")
     return parser.parse_args(argv)
 
@@ -286,32 +543,53 @@ def main(argv: Iterable[str] | None = None) -> int:
         repo = Path(args.repo_root).resolve()
         artifact_root = Path(args.artifact_root).expanduser().resolve()
         cache = Path(args.cache_dir).expanduser().resolve()
-        tasks = select_tasks(args, repo)
-        commit = git(repo, "rev-parse", "HEAD")
-        source = artifact_root / "snapshots" / f"{commit}.tar"
-        if not args.render:
-            source = snapshot(repo, artifact_root, commit)
-            cache.mkdir(parents=True, exist_ok=True)
-        submitted = [
-            submit(
-                task,
-                render_script(
-                    task, source, artifact_root / "runs", cache, args.container_image
-                ),
-                artifact_root,
-                args,
-                commit,
-            )
-            for task in tasks
-        ]
-        if args.follow:
-            for job_id, log in submitted:
-                if job_id:
-                    follow(job_id, log)
-        return 0
+        if args.pr:
+            with pr_worktree(repo, args.pr) as checkout:
+                return run(args, checkout, artifact_root, cache)
+        return run(args, repo, artifact_root, cache)
     except (OSError, ValueError, subprocess.CalledProcessError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+
+
+def run(args: argparse.Namespace, repo: Path, artifact_root: Path, cache: Path) -> int:
+    tasks = select_tasks(args, repo)
+    if args.list:
+        print_tasks(tasks)
+        return 0
+    commit = git(repo, "rev-parse", "HEAD")
+    source = artifact_root / "snapshots" / f"{commit}.tar"
+    if not args.render:
+        source = snapshot(repo, artifact_root, commit)
+        cache.mkdir(parents=True, exist_ok=True)
+    submitted = [
+        submit(
+            task,
+            render_script(
+                task, source, artifact_root / "runs", cache, args.container_image
+            ),
+            artifact_root,
+            args,
+            commit,
+        )
+        for task in tasks
+    ]
+    if args.wait:
+        if args.render:
+            raise ValueError("--wait cannot be combined with --render")
+        report_dir = (
+            Path(args.report_dir).expanduser().resolve()
+            if args.report_dir
+            else artifact_root / "reports" / f"{commit[:12]}-{time.time_ns()}"
+        )
+        completed = wait_all(submitted, artifact_root / "runs", report_dir)
+        print(f"Report: {report_dir}")
+        return 0 if completed else 1
+    if args.follow:
+        for submission in submitted:
+            if submission.job_id:
+                follow(submission.job_id, submission.log)
+    return 0
 
 
 if __name__ == "__main__":
