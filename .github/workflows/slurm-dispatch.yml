@@ -1,0 +1,99 @@
+name: Slurm Dispatch
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "Pull request number or GitHub pull request URL"
+        required: true
+        type: string
+      runners:
+        description: "Comma-separated exact runner labels"
+        required: true
+        default: "b200-4gpu,gb200-4gpu"
+        type: string
+      task_types:
+        description: "Comma-separated task types (ut,server_smoke,eval,perf)"
+        required: true
+        default: "eval,perf"
+        type: string
+      match:
+        description: "Optional comma-separated task/model substrings"
+        required: false
+        type: string
+      trigger:
+        description: "Optional task trigger filter"
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - manual
+          - nightly
+          - debug
+
+concurrency:
+  group: slurm-dispatch-${{ inputs.pr }}-${{ inputs.runners }}-${{ inputs.match }}
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    runs-on: [self-hosted, slurm-dispatch]
+    timeout-minutes: 720
+    permissions:
+      contents: read
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+    steps:
+      - name: Checkout trusted dispatcher
+        uses: actions/checkout@v4
+
+      - name: Submit and wait for Slurm tasks
+        env:
+          PR: ${{ inputs.pr }}
+          RUNNERS: ${{ inputs.runners }}
+          TASK_TYPES: ${{ inputs.task_types }}
+          MATCH: ${{ inputs.match }}
+          TRIGGER: ${{ inputs.trigger }}
+        run: |
+          set -euo pipefail
+          args=(--pr "$PR" --all --wait --report-dir "$RUNNER_TEMP/slurm-report")
+
+          IFS=',' read -ra values <<< "$RUNNERS"
+          for value in "${values[@]}"; do
+            value="${value//[[:space:]]/}"
+            [ -z "$value" ] || args+=(--runner "$value")
+          done
+
+          IFS=',' read -ra values <<< "$TASK_TYPES"
+          for value in "${values[@]}"; do
+            value="${value//[[:space:]]/}"
+            [ -z "$value" ] || args+=(--type "$value")
+          done
+
+          IFS=',' read -ra values <<< "$MATCH"
+          for value in "${values[@]}"; do
+            value="${value#"${value%%[![:space:]]*}"}"
+            value="${value%"${value##*[![:space:]]}"}"
+            [ -z "$value" ] || args+=(--match "$value")
+          done
+
+          [ "$TRIGGER" = all ] || args+=(--trigger "$TRIGGER")
+          test/ci/run_slurm.sh "${args[@]}"
+
+      - name: Publish job summary
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/slurm-report/summary.md" ]; then
+            cat "$RUNNER_TEMP/slurm-report/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Slurm dispatcher exited before producing a report." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload Slurm results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: slurm-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/slurm-report
+          if-no-files-found: warn

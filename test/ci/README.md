@@ -216,6 +216,26 @@ any supplied substring (case-insensitive). `--list` prints the final matrix
 without creating snapshots or submitting jobs, while `--render` prints the
 generated Slurm commands and scripts.
 
+`--wait` keeps the dispatcher process alive until every submitted Slurm job
+reaches a terminal state. `--report-dir PATH` then collects a `manifest.json`,
+Markdown summary, per-job logs, and available `result.json` files under
+`PATH`. The command succeeds only when every job reaches `COMPLETED`. SIGINT or
+SIGTERM while waiting calls `scancel` for the jobs submitted by that command.
+
+The manual `Slurm Dispatch` GitHub workflow runs on a self-hosted runner with
+the exact labels `self-hosted` and `slurm-dispatch`. That runner belongs on the
+Slurm coordinator and only needs GitHub runner prerequisites, this repository,
+Python/PyYAML, and Slurm client commands; it does not need GPUs. From the
+Actions UI, provide a PR, comma-separated runner labels and task types, and an
+optional comma-separated task/model filter. The workflow submits the selected
+matrix, waits for all jobs, writes the aggregate table to the GitHub step
+summary, and uploads the collected report directory as an artifact.
+
+The dispatcher checkout is trusted control-plane code. The requested PR is
+merged only in the submitter's temporary worktree and runs from its immutable
+archive inside Pyxis; do not configure the coordinator runner to execute
+arbitrary PR scripts directly.
+
 For a YAML with multiple runner labels, select one or more explicitly with
 repeated `--runner`.
 Site-specific scheduler settings can be supplied with `--account`, `--qos`,

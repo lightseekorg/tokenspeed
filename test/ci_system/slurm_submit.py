@@ -10,6 +10,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -33,6 +34,13 @@ class Task:
     task_type: str
     runner: str
     gpus: int
+
+
+@dataclass(frozen=True)
+class Submission:
+    task: Task
+    job_id: str
+    log: Path
 
 
 def gpu_count(runner: str) -> int:
@@ -289,7 +297,7 @@ def submit(
     artifact_root: Path,
     args: argparse.Namespace,
     commit: str,
-) -> tuple[str, Path]:
+) -> Submission:
     stem = re.sub(r"[^A-Za-z0-9_.-]+", "-", task.name).strip("-")
     unique = f"{commit[:12]}-{time.time_ns()}"
     script_path = artifact_root / "scripts" / f"{stem}-{unique}.sbatch"
@@ -322,13 +330,13 @@ def submit(
     if args.render:
         print(f"$ {shlex.join(command)}")
         print(script, end="")
-        return "", log_pattern
+        return Submission(task, "", log_pattern)
     result = subprocess.run(command, check=True, capture_output=True, text=True)
     job_id = result.stdout.strip().split(";", 1)[0]
     log = Path(str(log_pattern).replace("%j", job_id))
     print(f"Submitted {job_id}: {task.config}")
     print(f"Log: {log}")
-    return job_id, log
+    return Submission(task, job_id, log)
 
 
 def follow(job_id: str, log: Path) -> None:
@@ -346,6 +354,131 @@ def follow(job_id: str, log: Path) -> None:
     finally:
         if tail is not None:
             tail.terminate()
+
+
+def slurm_states(job_ids: list[str]) -> dict[str, dict[str, str]]:
+    result = subprocess.run(
+        [
+            "sacct",
+            "-X",
+            "-n",
+            "-P",
+            "-j",
+            ",".join(job_ids),
+            "--format=JobIDRaw,State,Elapsed,ExitCode",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    states = {}
+    for line in result.stdout.splitlines():
+        fields = line.split("|")
+        if len(fields) >= 4 and fields[0] in job_ids:
+            states[fields[0]] = {
+                "state": fields[1].split("+", 1)[0],
+                "elapsed": fields[2],
+                "exit_code": fields[3],
+            }
+    return states
+
+
+def result_detail(path: Path) -> str:
+    if not path.exists():
+        return ""
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return "invalid result.json"
+    if data.get("eval_score_check"):
+        check = data["eval_score_check"]
+        return f"score={check['score']:g}, threshold={check['threshold']}"
+    if data.get("perf_reference_check"):
+        check = data["perf_reference_check"]
+        return f"perf={'pass' if check['passed'] else 'fail'}"
+    command_results = data.get("command_results", [])
+    if command_results and command_results[-1].get("pytest_summary"):
+        return str(command_results[-1]["pytest_summary"])
+    return str(data.get("error", ""))
+
+
+def write_report(
+    submissions: list[Submission],
+    states: dict[str, dict[str, str]],
+    run_root: Path,
+    report_dir: Path,
+) -> None:
+    report_dir.mkdir(parents=True, exist_ok=True)
+    rows = []
+    summary = [
+        "## Slurm validation",
+        "",
+        "| Job | Type | Runner | Task | State | Elapsed | Result |",
+        "|---:|---|---|---|---|---:|---|",
+    ]
+    for submission in submissions:
+        state = states.get(
+            submission.job_id,
+            {"state": "UNKNOWN", "elapsed": "", "exit_code": ""},
+        )
+        result_path = run_root / submission.job_id / "result.json"
+        detail = result_detail(result_path)
+        row = {
+            "job_id": submission.job_id,
+            "task": submission.task.__dict__,
+            "log": str(submission.log),
+            "result": str(result_path),
+            **state,
+            "detail": detail,
+        }
+        rows.append(row)
+        summary.append(
+            f"| {submission.job_id} | {submission.task.task_type} | "
+            f"{submission.task.runner} | {submission.task.name} | "
+            f"{state['state']} | {state['elapsed']} | {detail} |"
+        )
+        if submission.log.exists():
+            shutil.copy2(submission.log, report_dir / f"{submission.job_id}.log")
+        if result_path.exists():
+            shutil.copy2(result_path, report_dir / f"{submission.job_id}-result.json")
+    (report_dir / "manifest.json").write_text(json.dumps(rows, indent=2) + "\n")
+    (report_dir / "summary.md").write_text("\n".join(summary) + "\n")
+
+
+def wait_all(submissions: list[Submission], run_root: Path, report_dir: Path) -> bool:
+    job_ids = [submission.job_id for submission in submissions]
+    previous_handlers = {}
+
+    def cancel_jobs(signum, _frame):
+        subprocess.run(["scancel", *job_ids], check=False)
+        raise SystemExit(128 + signum)
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        previous_handlers[signum] = signal.signal(signum, cancel_jobs)
+    try:
+        while True:
+            queued = subprocess.run(
+                ["squeue", "-h", "-j", ",".join(job_ids)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            if not queued.stdout.strip():
+                break
+            time.sleep(10)
+        states = {}
+        for _ in range(6):
+            states = slurm_states(job_ids)
+            if len(states) == len(job_ids):
+                break
+            time.sleep(2)
+        write_report(submissions, states, run_root, report_dir)
+        return all(item.get("state") == "COMPLETED" for item in states.values()) and (
+            len(states) == len(job_ids)
+        )
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
@@ -375,6 +508,12 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--time", default="12:00:00")
     parser.add_argument("--nodelist")
     parser.add_argument("--follow", action="store_true")
+    parser.add_argument(
+        "--wait", action="store_true", help="Wait for every submitted job."
+    )
+    parser.add_argument(
+        "--report-dir", help="Write aggregate manifest, summary, logs, and results."
+    )
     parser.add_argument("--render", action="store_true")
     return parser.parse_args(argv)
 
@@ -416,10 +555,21 @@ def run(args: argparse.Namespace, repo: Path, artifact_root: Path, cache: Path) 
         )
         for task in tasks
     ]
+    if args.wait:
+        if args.render:
+            raise ValueError("--wait cannot be combined with --render")
+        report_dir = (
+            Path(args.report_dir).expanduser().resolve()
+            if args.report_dir
+            else artifact_root / "reports" / f"{commit[:12]}-{time.time_ns()}"
+        )
+        completed = wait_all(submitted, artifact_root / "runs", report_dir)
+        print(f"Report: {report_dir}")
+        return 0 if completed else 1
     if args.follow:
-        for job_id, log in submitted:
-            if job_id:
-                follow(job_id, log)
+        for submission in submitted:
+            if submission.job_id:
+                follow(submission.job_id, submission.log)
     return 0
 
 

@@ -5,12 +5,15 @@ from pathlib import Path
 
 import pytest
 from slurm_submit import (
+    Submission,
     Task,
     gpu_count,
     load_task,
     parse_pr_number,
     render_script,
+    result_detail,
     select_tasks,
+    write_report,
 )
 
 
@@ -143,3 +146,42 @@ def test_render_script_contains_cluster_requirements():
     assert "/usr/bin/nvidia-smi" in script
     assert "/shared/cache:/home/runner/.cache" in script
     subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+
+
+def test_result_detail_reports_eval_score(tmp_path):
+    result = tmp_path / "result.json"
+    result.write_text(
+        '{"eval_score_check": {"score": 0.95, "threshold": 0.9, "passed": true}}'
+    )
+    assert result_detail(result) == "score=0.95, threshold=0.9"
+
+
+def test_write_report_collects_logs_and_results(tmp_path):
+    log = tmp_path / "job.log"
+    log.write_text("task output\n")
+    run_root = tmp_path / "runs"
+    result = run_root / "123" / "result.json"
+    result.parent.mkdir(parents=True)
+    result.write_text('{"error": ""}')
+    task = Task("test/ci/eval/example.yaml", "example", "eval", "gb200-1gpu", 1)
+
+    report = tmp_path / "report"
+    write_report(
+        [Submission(task, "123", log)],
+        {
+            "123": {
+                "state": "COMPLETED",
+                "elapsed": "00:01:00",
+                "exit_code": "0:0",
+            }
+        },
+        run_root,
+        report,
+    )
+
+    assert (report / "123.log").read_text() == "task output\n"
+    assert (report / "123-result.json").exists()
+    assert (
+        "| 123 | eval | gb200-1gpu | example | COMPLETED |"
+        in (report / "summary.md").read_text()
+    )
