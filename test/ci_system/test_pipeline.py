@@ -2,6 +2,7 @@ import re
 import textwrap
 from pathlib import Path
 
+import pipeline
 import pytest
 from pipeline import (
     STALE_PROCESS_PATTERNS,
@@ -9,17 +10,22 @@ from pipeline import (
     build_step_summary_lines,
     check_eval_score_threshold,
     check_perf_reference,
+    ensure_ready_port_available,
     extract_evalscope_score,
     extract_perf_summary_rows,
+    filter_stage_commands,
     format_perf_reference_markdown_table,
     format_perf_reference_table,
     get_excluded_runner_labels,
     get_runner_specific_env,
+    get_stage_commands,
     is_amd_runner,
     is_gb200_runner,
     is_nvidia_arm_runner,
+    parse_args,
     resolve_score_threshold_for_runner,
     runner_matches_group,
+    setup_runner,
     should_run_nvidia_gpu_cleanup,
     validate_task,
 )
@@ -89,6 +95,169 @@ def test_nvidia_gpu_cleanup_runner_prefixes_cover_gb200_and_b300():
     assert not should_run_nvidia_gpu_cleanup("amd-mi35x-2gpu-test")
     assert not should_run_nvidia_gpu_cleanup("amd-mi355-1gpu-bench")
     assert not should_run_nvidia_gpu_cleanup("amd-mi350-1gpu-bench")
+
+
+def test_execute_cli_defaults_to_ci_setup_mode():
+    args = parse_args(
+        [
+            "execute",
+            "--config",
+            "test/ci/eval/task.yaml",
+            "--runner",
+            "gb200-4gpu",
+        ]
+    )
+
+    assert args.setup_mode == "ci"
+
+
+def test_execute_cli_accepts_slurm_setup_mode():
+    args = parse_args(
+        [
+            "execute",
+            "--config",
+            "test/ci/eval/task.yaml",
+            "--runner",
+            "gb200-4gpu",
+            "--setup-mode",
+            "slurm",
+        ]
+    )
+
+    assert args.setup_mode == "slurm"
+
+
+def test_slurm_setup_is_scoped_to_job_id(monkeypatch, tmp_path):
+    class FakeProcessGroupManager:
+        def __init__(self, runner_id):
+            self.runner_id = runner_id
+
+    monkeypatch.setattr(pipeline, "ProcessGroupManager", FakeProcessGroupManager)
+    original_env = {"SLURM_JOB_ID": "12345", "CI_VENV_PATH": "/shared/venv"}
+
+    local_env, manager = setup_runner(
+        "gb200-4gpu",
+        original_env,
+        tmp_path,
+        dry_run=False,
+        setup_mode="slurm",
+    )
+
+    assert manager.runner_id == "slurm-12345"
+    assert local_env["CI_RUNNER_ID"] == "slurm-12345"
+    assert local_env["CI_VENV_PATH"] == "/shared/venv"
+    assert "CI_RUNNER_ID" not in original_env
+
+
+def test_slurm_setup_requires_job_id(tmp_path):
+    with pytest.raises(RuntimeError, match="SLURM_JOB_ID"):
+        setup_runner(
+            "gb200-4gpu",
+            {},
+            tmp_path,
+            dry_run=False,
+            setup_mode="slurm",
+        )
+
+
+def test_slurm_ready_port_check_rejects_an_existing_listener(monkeypatch):
+    class ConnectedSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    calls = []
+
+    def connect(address, timeout):
+        calls.append((address, timeout))
+        return ConnectedSocket()
+
+    monkeypatch.setattr(pipeline.socket, "create_connection", connect)
+
+    with pytest.raises(RuntimeError, match="already in use"):
+        ensure_ready_port_available(
+            {"url": "http://127.0.0.1:8123/readiness"}, dry_run=False
+        )
+
+    assert calls == [(("127.0.0.1", 8123), 0.5)]
+
+
+def test_slurm_ready_port_check_accepts_an_unused_port(monkeypatch):
+    def refuse_connection(address, timeout):
+        raise ConnectionRefusedError
+
+    monkeypatch.setattr(pipeline.socket, "create_connection", refuse_connection)
+
+    ensure_ready_port_available(
+        {"url": "http://127.0.0.1:8123/readiness"}, dry_run=False
+    )
+
+
+def test_skipping_top_level_install_keeps_eval_install():
+    task = {
+        "type": "eval",
+        "install": ["install project"],
+        "server": {
+            "command": "serve",
+            "ready": {"url": "http://127.0.0.1:8000/readiness"},
+        },
+        "eval": {
+            "install": ["install eval dependencies"],
+            "command": "run eval",
+        },
+    }
+
+    stages = filter_stage_commands(
+        get_stage_commands(task), only_stages=None, skip_stages={"install"}
+    )
+
+    assert [name for name, _ in stages] == ["server", "eval.install", "eval"]
+
+
+def test_slurm_execution_only_cleans_its_process_group(monkeypatch, tmp_path):
+    task = {
+        "name": "slurm-unit-test",
+        "type": "ut",
+        "runner": {"labels": ["gb200-1gpu"]},
+        "ut": {"commands": ["run test"]},
+    }
+
+    class FakeProcessGroupManager:
+        terminated = False
+
+        def run(self, command, *, cwd, env, dry_run):
+            return {"returncode": 0, "output": ""}
+
+        def terminate_all(self, *, dry_run):
+            self.terminated = True
+
+    manager = FakeProcessGroupManager()
+    monkeypatch.setattr(pipeline, "normalize_task", lambda path, root: task)
+    monkeypatch.setattr(
+        pipeline,
+        "setup_runner",
+        lambda runner, env, cwd, dry_run, reuse_state, setup_mode: (env, manager),
+    )
+
+    def reject_global_cleanup(*args, **kwargs):
+        raise AssertionError("Slurm mode must not run global runner cleanup")
+
+    monkeypatch.setattr(pipeline, "cleanup_runner", reject_global_cleanup)
+
+    return_code = pipeline.execute_task(
+        config="task.yaml",
+        runner="gb200-1gpu",
+        work_dir=str(tmp_path),
+        dry_run=False,
+        print_plan=False,
+        result_json=None,
+        setup_mode="slurm",
+    )
+
+    assert return_code == 0
+    assert manager.terminated is True
 
 
 def test_runner_specific_env_uses_original_label_after_b200_override(monkeypatch):
