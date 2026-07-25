@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import html
 import json
 import os
 import re
@@ -25,6 +26,8 @@ GPU_RE = re.compile(r"(?:^|-)([1-9]\d*)gpu(?:-|$)")
 TASK_TYPES = {"ut", "server_smoke", "eval", "perf"}
 DEFAULT_TASK_TYPES = {"eval", "perf"}
 PR_RE = re.compile(r"^(?:https://github\.com/[^/]+/[^/]+/pull/)?(\d+)(?:/)?$")
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 
 
 @dataclass(frozen=True)
@@ -416,6 +419,42 @@ def result_detail(path: Path) -> str:
     return str(data.get("error", ""))
 
 
+def clean_report_text(value: object) -> str:
+    return CONTROL_RE.sub("", ANSI_ESCAPE_RE.sub("", str(value)))
+
+
+def table_cell(value: object, limit: int = 120) -> str:
+    text = clean_report_text(value)
+    line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    if len(line) > limit:
+        line = line[: limit - 3].rstrip() + "..."
+    return line.replace("\\", "\\\\").replace("|", "\\|")
+
+
+def detail_block(job_id: str, task_name: str, detail: str) -> list[str]:
+    text = clean_report_text(detail)
+    lines = text.splitlines()[:40]
+    body = "\n".join(lines)
+    truncated = len(text.splitlines()) > 40 or len(body) > 4000
+    if len(body) > 4000:
+        body = body[:4000].rstrip()
+    if truncated:
+        body += f"\n[truncated; see {job_id}.log in the artifact]"
+    longest_tilde_run = max((len(run) for run in re.findall(r"~+", body)), default=0)
+    fence = "~" * max(3, longest_tilde_run + 1)
+    title = html.escape(f"Job {job_id} — {task_name}")
+    return [
+        "<details>",
+        f"<summary>{title}</summary>",
+        "",
+        f"{fence}text",
+        body,
+        fence,
+        "</details>",
+        "",
+    ]
+
+
 def write_report(
     submissions: list[Submission],
     states: dict[str, dict[str, str]],
@@ -430,6 +469,7 @@ def write_report(
         "| Job | Type | Runner | Task | State | Elapsed | Result |",
         "|---:|---|---|---|---|---:|---|",
     ]
+    details = []
     for submission in submissions:
         state = states.get(
             submission.job_id,
@@ -446,16 +486,27 @@ def write_report(
             "detail": detail,
         }
         rows.append(row)
-        summary.append(
-            f"| {submission.job_id} | {submission.task.task_type} | "
-            f"{submission.task.runner} | {submission.task.name} | "
-            f"{state['state']} | {state['elapsed']} | {detail} |"
-        )
+        cells = [
+            submission.job_id,
+            submission.task.task_type,
+            submission.task.runner,
+            submission.task.name,
+            state["state"],
+            state["elapsed"],
+            detail,
+        ]
+        summary.append("| " + " | ".join(table_cell(cell) for cell in cells) + " |")
+        if table_cell(detail) != detail:
+            details.extend(
+                detail_block(submission.job_id, submission.task.name, detail)
+            )
         if submission.log.exists():
             shutil.copy2(submission.log, report_dir / f"{submission.job_id}.log")
         if result_path.exists():
             shutil.copy2(result_path, report_dir / f"{submission.job_id}-result.json")
     (report_dir / "manifest.json").write_text(json.dumps(rows, indent=2) + "\n")
+    if details:
+        summary.extend(["", "## Details", "", *details])
     (report_dir / "summary.md").write_text("\n".join(summary) + "\n")
 
 

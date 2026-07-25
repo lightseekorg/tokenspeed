@@ -1,4 +1,5 @@
 import argparse
+import json
 import subprocess
 import textwrap
 from pathlib import Path
@@ -7,6 +8,7 @@ import pytest
 from slurm_submit import (
     Submission,
     Task,
+    detail_block,
     gpu_count,
     load_task,
     parse_pr_number,
@@ -14,6 +16,7 @@ from slurm_submit import (
     render_script,
     result_detail,
     select_tasks,
+    table_cell,
     write_report,
 )
 
@@ -236,3 +239,59 @@ def test_write_report_collects_logs_and_results(tmp_path):
         "| 123 | eval | gb200-1gpu | example | COMPLETED |"
         in (report / "summary.md").read_text()
     )
+    assert "<details>" not in (report / "summary.md").read_text()
+
+
+def test_write_report_keeps_multiline_errors_out_of_table(tmp_path):
+    log = tmp_path / "job.log"
+    log.write_text("full log\n")
+    run_root = tmp_path / "runs"
+    result = run_root / "456" / "result.json"
+    result.parent.mkdir(parents=True)
+    error = "server failed | rc=1\ntraceback <bad> \\\nlast line"
+    result.write_text(json.dumps({"error": error}))
+    task = Task(
+        "test/ci/eval/example.yaml",
+        "example </summary> | task",
+        "eval",
+        "gb200-1gpu",
+        1,
+    )
+    report = tmp_path / "report"
+
+    write_report(
+        [Submission(task, "456", log)],
+        {
+            "456": {
+                "state": "FAILED",
+                "elapsed": "00:01:00",
+                "exit_code": "1:0",
+            }
+        },
+        run_root,
+        report,
+    )
+
+    summary = (report / "summary.md").read_text()
+    table = summary.split("\n\n## Details", 1)[0]
+    assert len(table.splitlines()) == 5
+    assert "server failed \\| rc=1" in table
+    assert "traceback" not in table
+    assert "<summary>Job 456 — example &lt;/summary&gt; | task</summary>" in summary
+    assert error in json.loads((report / "manifest.json").read_text())[0]["detail"]
+
+
+def test_report_markdown_guards():
+    assert table_cell("\nfailed\\") == "failed\\\\"
+    fenced = detail_block("456", "task", "~~~~ fence bait")
+    assert fenced[3] == "~~~~~text"
+    assert fenced[5] == "~~~~~"
+
+    truncated = detail_block(
+        "456", "task", "\n".join(f"line {index}" for index in range(50))
+    )
+    assert len(truncated[4].splitlines()) == 41
+    assert truncated[4].endswith("[truncated; see 456.log in the artifact]")
+    long_detail = detail_block("789", "task", "x" * 5000)
+    assert len(long_detail[4]) < 4100
+    assert long_detail[4].endswith("[truncated; see 789.log in the artifact]")
