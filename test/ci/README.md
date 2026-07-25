@@ -94,3 +94,106 @@ override or extend the defaults for a single runner label.
 PR workflows split runner labels by vendor and host architecture. `PR Test
 NVIDIA` uses the `nvidia-x86` runner group, while `PR Test NVIDIA ARM` uses
 the `nvidia-arm` runner group for `gb200` labels.
+
+## Slurm with Pyxis/Enroot
+
+`slurm_submit.py` submits an existing task YAML without copying its server,
+evaluation, performance, or threshold configuration into a second format. It
+targets a single node and a single task. The GPU count comes from the selected
+runner label, such as `gb200-4gpu`, and is limited to four GPUs per node by
+default. Tasks that request more GPUs are rejected before submission; only
+raise `--max-gpus-per-node` when the target partition really provides them.
+
+The submitter expects Pyxis/Enroot support in Slurm. Before submission it
+archives the clean, committed `HEAD` into the artifact root. The compute node
+extracts that immutable snapshot under `SLURM_TMPDIR` and mounts it at
+`/workspace`, so the checkout itself does not need to be shared. The artifact
+root, cache directory, and any additional host mounts do need to be visible at
+the same paths on the login and compute nodes. The default container is the
+NVIDIA release image
+`docker.io#lightseekorg/tokenspeed:<version>`, where `<version>` is read from
+`python/pyproject.toml`. Override it with `--container-image` when testing a
+different build. The container needs Python and pip. If PyYAML is absent, the
+job installs `PyYAML>=6,<7` into its job-local `/tmp` before starting the
+pipeline; images that already provide PyYAML do not perform this bootstrap.
+
+The generated `sbatch` command uses `/tmp` as its working directory because the
+login-node checkout may not be mounted on compute nodes. Override it with
+`--sbatch-workdir` only when the selected path is compute-node-visible.
+
+By default, the task's top-level `install` stage runs so a runner/base image
+tests the exact committed checkout. Task-specific `eval.install` and
+`perf.install` stages run afterward. Use `--skip-install` only with a release
+image that already contains the intended TokenSpeed build.
+
+The job gets the node exclusively by default so another job cannot contend for
+its GPU or fixed service ports. `--no-exclusive` opts out. Runtime cleanup is
+scoped to the Slurm job and never kills unrelated listeners on the node.
+
+Render the exact `sbatch` command and job script without submitting:
+
+```bash
+python3 test/ci_system/slurm_submit.py \
+  --config test/ci/eval/qwen3.5-397b-a17b-nvfp4-dp4ep4-evalscope-aime25.yaml \
+  --partition batch \
+  --render
+```
+
+Submit the same evaluation and follow its output:
+
+```bash
+python3 test/ci_system/slurm_submit.py \
+  --config test/ci/eval/qwen3.5-397b-a17b-nvfp4-dp4ep4-evalscope-aime25.yaml \
+  --partition batch \
+  --cache-dir /mnt/lustre01/$USER/tokenspeed-cache \
+  --pass-env HF_TOKEN \
+  --follow
+```
+
+Submit every eval/perf YAML that declares an exact runner label:
+
+```bash
+python3 test/ci_system/slurm_submit.py \
+  --all \
+  --runner gb200-4gpu \
+  --partition batch \
+  --cache-dir /mnt/lustre01/$USER/tokenspeed-cache
+```
+
+`--trigger manual` (or another trigger) optionally narrows `--all`. All
+matching tasks are submitted before `--follow` starts, so their Slurm jobs can
+run concurrently.
+
+On the GB200 Slurm coordinator, use the shell launcher for manual scheduling.
+It supplies the cluster's shared artifact/cache paths and pinned runner image:
+
+```bash
+# One existing YAML:
+test/ci/run_slurm.sh \
+  test/ci/eval/qwen3.5-122b-a10b-nvfp4-evalscope-ocr-bench.yaml \
+  --follow
+
+# Every existing YAML for one exact runner label:
+test/ci/run_slurm.sh --all --runner gb200-4gpu --trigger manual
+```
+
+This is a manual launcher, not a GitHub Actions runner. Override its defaults
+with `TS_CI_ARTIFACT_ROOT`, `TS_CI_CACHE_DIR`, or
+`TS_CI_CONTAINER_IMAGE`.
+
+For a YAML with multiple runner labels, select one explicitly with `--runner`.
+Site-specific scheduler settings can be supplied with `--account`, `--qos`,
+`--constraint`, `--time`, and `--gpu-type`. Additional host paths can be
+mounted with repeated `--mount HOST:CONTAINER[:FLAGS]` options. Exported
+`HF_TOKEN` and `HUGGING_FACE_HUB_TOKEN` values are passed automatically;
+`--pass-env NAME` passes other exported variables by name without writing their
+values into the job script.
+
+Submitted job snapshots, scripts, metadata, logs, and run results are written
+below `.ci-artifacts/slurm` by default. `--render` only prints the command and
+script; it does not create or submit them. The artifact root must be writable
+from the compute node and should be on shared storage. Use `--artifact-root`
+(or `TS_CI_ARTIFACT_ROOT`) to put artifacts elsewhere. `--cache-dir` mounts a
+persistent host cache at `/home/runner/.cache`, matching the NVIDIA release
+image, and points the Hugging Face and XDG caches there; the directory must
+likewise be visible on the compute node.
