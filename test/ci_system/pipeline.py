@@ -1275,7 +1275,26 @@ def write_result(path: str | None, payload: Dict[str, Any]) -> None:
     result_path.write_text(json.dumps(payload, indent=2) + "\n")
 
 
-def poll_readiness(ready: Dict[str, Any], dry_run: bool) -> None:
+def server_exit_error(
+    process: subprocess.Popen[str], log_path: Path | None
+) -> str | None:
+    returncode = process.poll()
+    if returncode is None:
+        return None
+    detail = ""
+    if log_path is not None and log_path.exists():
+        lines = log_path.read_text(errors="replace").splitlines()
+        if lines:
+            detail = "\nLast server log lines:\n" + "\n".join(lines[-20:])
+    return f"server exited before readiness with exit code {returncode}{detail}"
+
+
+def poll_readiness(
+    ready: Dict[str, Any],
+    dry_run: bool,
+    process: subprocess.Popen[str] | None = None,
+    log_path: Path | None = None,
+) -> None:
     url = str(ready["url"])
     timeout_seconds = int(ready.get("timeout", 600))
     interval_seconds = int(ready.get("interval", 10))
@@ -1287,13 +1306,23 @@ def poll_readiness(ready: Dict[str, Any], dry_run: bool) -> None:
 
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
+        if process is not None:
+            error = server_exit_error(process, log_path)
+            if error is not None:
+                raise RuntimeError(error)
         try:
             with urlopen(url, timeout=5) as response:
                 if response.status == expected_status:
                     return
         except URLError:
             pass
-        time.sleep(interval_seconds)
+        sleep_deadline = min(deadline, time.time() + interval_seconds)
+        while time.time() < sleep_deadline:
+            if process is not None:
+                error = server_exit_error(process, log_path)
+                if error is not None:
+                    raise RuntimeError(error)
+            time.sleep(min(0.5, sleep_deadline - time.time()))
 
     raise RuntimeError(f"server readiness probe timed out: {url}")
 
@@ -1313,7 +1342,10 @@ def wrap_command_with_log(
     command: str, log_path: Path, *, login_shell: bool = True
 ) -> str:
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    wrapped = f"{{ {command}; }} 2>&1 | tee -a {shlex.quote(str(log_path))}"
+    wrapped = (
+        "set -o pipefail; "
+        f"{{ {command}; }} 2>&1 | tee -a {shlex.quote(str(log_path))}"
+    )
     flag = "-lc" if login_shell else "-c"
     return f"bash {flag} {shlex.quote(wrapped)}"
 
@@ -1532,7 +1564,12 @@ def execute_task(
                         repo_root,
                         dry_run,
                     )
-                poll_readiness(ready, dry_run)
+                poll_readiness(
+                    ready,
+                    dry_run,
+                    process=server_process,
+                    log_path=server_log_path,
+                )
                 if enable_perf_diagnostics:
                     run_perf_diagnostics(
                         "after server ready", runner_env, repo_root, dry_run

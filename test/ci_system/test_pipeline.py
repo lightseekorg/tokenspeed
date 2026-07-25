@@ -1,4 +1,5 @@
 import re
+import subprocess
 import textwrap
 from pathlib import Path
 
@@ -23,11 +24,13 @@ from pipeline import (
     is_gb200_runner,
     is_nvidia_arm_runner,
     parse_args,
+    poll_readiness,
     resolve_score_threshold_for_runner,
     runner_matches_group,
     setup_runner,
     should_run_nvidia_gpu_cleanup,
     validate_task,
+    wrap_command_with_log,
 )
 
 
@@ -56,6 +59,37 @@ def test_stale_process_patterns_match_existing_targets():
         assert any(
             re.search(pat, cmdline) for pat in STALE_PROCESS_PATTERNS
         ), f"no STALE_PROCESS_PATTERNS entry matched cmdline: {cmdline!r}"
+
+
+def test_poll_readiness_fails_when_server_process_exits(monkeypatch, tmp_path):
+    class ServerProcess:
+        calls = 0
+
+        def poll(self):
+            self.calls += 1
+            return None if self.calls == 1 else 7
+
+    def unavailable(*_args, **_kwargs):
+        raise pipeline.URLError("not ready")
+
+    log = tmp_path / "server.log"
+    log.write_text("first line\nfatal startup error\n")
+    monkeypatch.setattr(pipeline, "urlopen", unavailable)
+
+    with pytest.raises(RuntimeError, match="exit code 7") as exc_info:
+        poll_readiness(
+            {"url": "http://127.0.0.1:8000/readiness", "interval": 10},
+            False,
+            process=ServerProcess(),
+            log_path=log,
+        )
+    assert "fatal startup error" in str(exc_info.value)
+
+
+def test_server_log_wrapper_preserves_server_exit_code(tmp_path):
+    command = wrap_command_with_log("exit 9", tmp_path / "server.log")
+    assert "set -o pipefail" in command
+    assert subprocess.run(command, shell=True).returncode == 9
 
 
 def test_amd_runner_prefixes_cover_legacy_and_arc_labels():
