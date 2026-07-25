@@ -22,9 +22,11 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+
+_is_nvidia = current_platform().is_nvidia
 
 _RADIX_TOPK_MIN_COLS = 65536
 _RADIX_TOPK_BLOCK_N = 4096
@@ -571,10 +573,13 @@ def _dsa_logits_topk_kernel(
     n_cols_padded: tl.constexpr,
     topk: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     row = tl.program_id(0)
     offsets = (n_cols_padded - BLOCK_N) + tl.arange(0, BLOCK_N)
     valid = offsets < n_cols
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     values = tl.load(
         logits + row * logits_stride + offsets,
         mask=valid,
@@ -612,6 +617,8 @@ def _dsa_logits_topk_kernel(
         tl.where(valid_top, indices, -1),
         mask=top_offsets < topk,
     )
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
@@ -849,7 +856,9 @@ def _radix_topk(logits: torch.Tensor, topk: int) -> torch.Tensor:
     return out
 
 
-def _topk_with_padding(logits: torch.Tensor, topk: int) -> torch.Tensor:
+def _topk_with_padding(
+    logits: torch.Tensor, topk: int, enable_pdl: bool = False
+) -> torch.Tensor:
     topk = int(topk)
     if topk <= 0:
         raise ValueError(f"topk must be positive, got {topk}")
@@ -875,6 +884,8 @@ def _topk_with_padding(logits: torch.Tensor, topk: int) -> torch.Tensor:
             "DSA Triton top-k requires padded cols divisible by block size, got "
             f"cols={cols}, padded={n_cols_padded}, block={block_n}"
         )
+    use_pdl = bool(enable_pdl and _is_nvidia)
+    pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
     _dsa_logits_topk_kernel[(rows,)](
         logits,
         out,
@@ -884,8 +895,10 @@ def _topk_with_padding(logits: torch.Tensor, topk: int) -> torch.Tensor:
         n_cols_padded=n_cols_padded,
         topk=topk,
         BLOCK_N=block_n,
+        ENABLE_PDL=use_pdl,
         num_warps=8,
         num_stages=1,
+        **pdl_kwargs,
     )
     return out
 

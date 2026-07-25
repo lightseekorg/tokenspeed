@@ -1973,6 +1973,17 @@ class Eagle3MlaModel(nn.Module):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.fc_norm = (
+            nn.ModuleList(
+                [
+                    RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+                    for _ in range(self.num_fc_input_dim)
+                ]
+            )
+            if getattr(config, "fc_norm", False)
+            else None
+        )
+        self.norm_output = getattr(config, "norm_output", False)
 
     def forward(
         self,
@@ -1992,6 +2003,15 @@ class Eagle3MlaModel(nn.Module):
 
         hidden_states = captured_hidden_states
         if hidden_states.size(-1) != embeds.size(-1):
+            if self.fc_norm is not None:
+                chunks = hidden_states.chunk(self.num_fc_input_dim, dim=-1)
+                hidden_states = torch.cat(
+                    [
+                        norm(chunk)
+                        for norm, chunk in zip(self.fc_norm, chunks, strict=True)
+                    ],
+                    dim=-1,
+                )
             hidden_states, _ = self.fc(hidden_states)
 
         residual = None
@@ -2024,6 +2044,10 @@ class Eagle3MlaModel(nn.Module):
             hidden_states_to_aux, _ = comm_manager.post_final_norm_comm(
                 hidden_states_to_aux, None, ctx
             )
+
+        if self.norm_output:
+            hidden_states_to_aux = hidden_states_to_logits
+
         return hidden_states_to_logits, [hidden_states_to_aux]
 
 

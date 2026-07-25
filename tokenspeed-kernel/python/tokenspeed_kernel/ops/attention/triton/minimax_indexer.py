@@ -19,6 +19,7 @@ from tokenspeed_kernel.ops.attention.triton.dsa_topk import _topk_with_padding
 from tokenspeed_kernel.platform import current_platform
 
 SPARSE_BLOCK_SIZE = 128
+_is_nvidia = current_platform().is_nvidia
 
 if current_platform().is_blackwell:
     try:
@@ -59,9 +60,12 @@ def _store_index_k_kernel(
     stride_cache_d,
     head_dim: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     token = tl.program_id(0)
     dims = tl.arange(0, BLOCK_D)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     slot = tl.load(slot_mapping + token).to(tl.int64)
     values = tl.load(
         index_k + token * stride_k_n + dims * stride_k_d,
@@ -73,6 +77,8 @@ def _store_index_k_kernel(
         values,
         mask=dims < head_dim,
     )
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit(do_not_specialize_on_alignment=["seq_lens", "prefix_lens"])
@@ -320,6 +326,7 @@ def minimax_indexer(
     query_lens_cpu: Sequence[int] | None = None,
     seq_lens_cpu: Sequence[int] | None = None,
     score_out: torch.Tensor | None = None,
+    enable_pdl: bool = False,
 ) -> torch.Tensor:
     """Write index keys, score visible 128-token blocks, and select Top-K.
 
@@ -383,14 +390,17 @@ def minimax_indexer(
     if index_k_cache.shape[0] % SPARSE_BLOCK_SIZE:
         raise ValueError("index_k_cache slot count must be divisible by 128")
 
-    index_q = index_q.contiguous()
-    index_k = index_k.contiguous()
-    slot_mapping = slot_mapping.to(
-        device=index_q.device, dtype=torch.int32
-    ).contiguous()
-    block_table = block_table.to(device=index_q.device, dtype=torch.int32).contiguous()
-    seq_lens = seq_lens.to(device=index_q.device, dtype=torch.int32).contiguous()
+    assert index_q.is_contiguous()
+    assert slot_mapping.dtype == torch.int32
+    assert slot_mapping.is_contiguous()
+    assert block_table.dtype == torch.int32
+    assert block_table.is_contiguous()
+    assert seq_lens.dtype == torch.int32
+    assert seq_lens.is_contiguous()
+
     block_d = triton.next_power_of_2(head_dim)
+    use_pdl = bool(enable_pdl and _is_nvidia)
+    pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
     _store_index_k_kernel[(tokens,)](
         index_k,
         index_k_cache,
@@ -401,7 +411,9 @@ def minimax_indexer(
         index_k_cache.stride(1),
         head_dim=head_dim,
         BLOCK_D=block_d,
+        ENABLE_PDL=use_pdl,
         num_warps=4,
+        **pdl_kwargs,
     )
 
     max_blocks = block_table.shape[1] if max_blocks is None else int(max_blocks)
@@ -447,6 +459,7 @@ def minimax_indexer(
                 init_blocks=int(init_blocks),
                 local_blocks=int(local_blocks),
                 decode_query_len=decode_query_len,
+                enable_pdl=enable_pdl,
             )
         else:
             num_chunks = 64
@@ -505,12 +518,11 @@ def minimax_indexer(
                 query_lens_cpu=query_lens_cpu,
                 seq_lens_cpu=seq_lens_cpu,
             )
-        cu_seqlens_q = cu_seqlens_q.to(
-            device=index_q.device, dtype=torch.int32
-        ).contiguous()
-        prefix_lens = prefix_lens.to(
-            device=index_q.device, dtype=torch.int32
-        ).contiguous()
+
+        assert cu_seqlens_q.dtype == torch.int32
+        assert cu_seqlens_q.is_contiguous()
+        assert prefix_lens.dtype == torch.int32
+        assert prefix_lens.is_contiguous()
         batch = cu_seqlens_q.numel() - 1
         scores = torch.full(
             (tokens, num_heads, max_blocks),
@@ -550,7 +562,9 @@ def minimax_indexer(
             num_stages=2,
         )
 
-    selected = _topk_with_padding(scores.view(tokens * num_heads, max_blocks), topk)
+    selected = _topk_with_padding(
+        scores.view(tokens * num_heads, max_blocks), topk, enable_pdl=enable_pdl
+    )
     return selected.view(tokens, num_heads, int(topk))
 
 

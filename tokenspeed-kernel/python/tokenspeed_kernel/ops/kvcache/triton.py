@@ -403,10 +403,14 @@ def _fused_fp8_set_kv_buffer_kernel(
     v_cache_stride_dim: tl.constexpr,
     BLOCK_HEAD: tl.constexpr,
     BLOCK_DIM: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     token_id = tl.program_id(0)
     head_block_id = tl.program_id(1)
     kv_idx = tl.program_id(2)
+
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
 
     cache_loc = tl.load(cache_loc_ptr + token_id).to(tl.int64)
     page_id = cache_loc // page_size
@@ -465,6 +469,9 @@ def _fused_fp8_set_kv_buffer_kernel(
             BLOCK_DIM,
         )
 
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
 
 def fused_fp8_set_kv_buffer(
     k: torch.Tensor,
@@ -475,6 +482,7 @@ def fused_fp8_set_kv_buffer(
     k_scale: float | torch.Tensor | None = None,
     v_scale: float | torch.Tensor | None = None,
     page_size: int = 16,
+    enable_pdl: bool = False,
 ) -> None:
     """Quantize K/V tensors to FP8 and scatter them into a paged KV cache.
 
@@ -493,6 +501,8 @@ def fused_fp8_set_kv_buffer(
         v_scale: Optional scalar V scale. When provided with ``k_scale``, V is
             divided by this scale before FP8 conversion.
         page_size: Number of tokens per cache page.
+        enable_pdl: Request Programmatic Dependent Launch (SM90+); no-op on
+            non-NVIDIA platforms.
     """
     num_tokens = k.shape[0]
     if num_tokens == 0:
@@ -576,6 +586,11 @@ def fused_fp8_set_kv_buffer(
         inv_k_scale_ptr = k_3d
         inv_v_scale_ptr = k_3d
 
+    use_pdl = bool(enable_pdl and _is_nvidia)
+    kwargs = {}
+    if use_pdl:
+        kwargs["launch_pdl"] = True
+
     _fused_fp8_set_kv_buffer_kernel[grid](
         k_3d,
         v_3d,
@@ -604,6 +619,8 @@ def fused_fp8_set_kv_buffer(
         v_cache_stride_dim,
         BLOCK_HEAD=block_head,
         BLOCK_DIM=block_dim,
+        ENABLE_PDL=use_pdl,
+        **kwargs,
     )
 
 

@@ -1,0 +1,14 @@
+# Build with buildx for linux/amd64 and linux/arm64. The base image is a
+# multi-architecture manifest.
+FROM lightseekorg/tokenspeed-runner:cu130-torch-2.11.0-flashinfer-0.6.15.post1
+
+WORKDIR /workspace
+
+# The base image provides libnuma1 and libibverbs for TokenSpeed's published
+# runtime dependencies.
+COPY --chown=runner:runner python/ ./python/
+
+# Install TokenSpeed from this checkout. Its kernel and scheduler dependencies
+# resolve from published PyPI wheels using the bounds in python/pyproject.toml,
+# so rebuilding the same checkout may select newer compatible component releases.
+RUN python3 -m pip install --user --no-cache-dir ./python

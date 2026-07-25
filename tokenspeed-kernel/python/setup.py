@@ -317,6 +317,13 @@ KERNEL_GROUPS = [
         [],
     ),
     (
+        "minimax_m3_fused",
+        [
+            CUDA_CSRC_DIR / "fused_minimax_m3_qknorm_rope_kv_insert.cu",
+        ],
+        [],
+    ),
+    (
         "dsv3_gemm",
         [
             CUDA_CSRC_DIR / "dsv3_router_gemm_float_out.cu",

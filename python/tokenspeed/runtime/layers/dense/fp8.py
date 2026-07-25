@@ -61,6 +61,7 @@ from tokenspeed.runtime.layers.parameter import (
 from tokenspeed.runtime.layers.quantization.base_config import LinearMethodBase
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
 from tokenspeed.runtime.layers.quantization.utils import convert_to_channelwise
+from tokenspeed.runtime.utils.pdl import pdl_enabled
 
 platform = Platform.get()
 
@@ -379,6 +380,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 quant="mxfp8",
                 block_size=self.quant_config.weight_block_size,
                 override=override,
+                enable_pdl=pdl_enabled(),
             )
             return output.to(dtype=output_dtype).view(*output_shape)
         else:

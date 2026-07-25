@@ -140,12 +140,12 @@ jobs:
           rocm_path = Path("tokenspeed-kernel/python/requirements/rocm.txt")
           rocm_text = rocm_path.read_text()
           amd_versions = re.findall(
-              r"(?m)^tokenspeed-kernel-amd==([^\s]+)$",
+              r"(?m)^tokenspeed-kernel-amd>=([^\s]+)$",
               rocm_text,
           )
           if len(amd_versions) != 1:
               raise SystemExit(
-                  f"expected one tokenspeed-kernel-amd pin in {rocm_path}"
+                  f"expected one tokenspeed-kernel-amd minimum in {rocm_path}"
               )
 
           setup_path = Path("tokenspeed-kernel/python/setup.py")
@@ -170,13 +170,13 @@ jobs:
 
           if amd_versions[0] != version:
               rocm_text, count = re.subn(
-                  r"(?m)^tokenspeed-kernel-amd==[^\n]+$",
-                  f"tokenspeed-kernel-amd=={version}",
+                  r"(?m)^tokenspeed-kernel-amd>=[^\n]+$",
+                  f"tokenspeed-kernel-amd>={version}",
                   rocm_text,
               )
               if count != 1:
                   raise SystemExit(
-                      f"expected one tokenspeed-kernel-amd pin in {rocm_path}"
+                      f"expected one tokenspeed-kernel-amd minimum in {rocm_path}"
                   )
               rocm_path.write_text(rocm_text)
 
@@ -271,7 +271,7 @@ jobs:
             origin "HEAD:refs/heads/${BRANCH}"
 
           title="build: sync tokenspeed-kernel with AMD ${VERSION}"
-          body="Keep tokenspeed-kernel's package version and ROCm dependency aligned with the published tokenspeed-kernel-amd ${VERSION} release."
+          body="Keep tokenspeed-kernel's package version and ROCm dependency floor aligned with the published tokenspeed-kernel-amd ${VERSION} release."
           pr_number=$(gh pr list \
             --repo "$GITHUB_REPOSITORY" \
             --base main \

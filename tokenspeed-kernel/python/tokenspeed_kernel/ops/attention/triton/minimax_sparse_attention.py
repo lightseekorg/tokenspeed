@@ -19,13 +19,15 @@ from tokenspeed_kernel.ops.attention.triton.minimax_indexer import (
     SPARSE_BLOCK_SIZE,
     minimax_indexer,
 )
-from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import (
     dense_tensor_format,
     format_signature,
     format_signatures,
 )
+
+_is_nvidia = current_platform().is_nvidia
 
 
 @triton.heuristics(
@@ -216,6 +218,7 @@ def _sparse_decode_kernel(
     BLOCK_D: tl.constexpr,
     BLOCK_H: tl.constexpr,
     USE_FP8: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     query_chunk = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -223,6 +226,8 @@ def _sparse_decode_kernel(
     chunk = query_chunk // total_queries
     request = token // decode_query_len
     query_offset = token - request * decode_query_len
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     seq_len = tl.load(seq_lens + request)
     query_position = seq_len - decode_query_len + query_offset
     visible_blocks = (query_position + BLOCK_K) // BLOCK_K
@@ -318,6 +323,8 @@ def _sparse_decode_kernel(
         lse,
         mask=head_mask,
     )
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.heuristics({"BLOCK_D": lambda args: triton.next_power_of_2(args["head_dim"])})
@@ -339,11 +346,14 @@ def _merge_decode_kernel(
     stride_out_d,
     NUM_CHUNKS: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     token = tl.program_id(0)
     head = tl.program_id(1)
     chunks = tl.arange(0, NUM_CHUNKS)
     dims = tl.arange(0, BLOCK_D)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     lse = tl.load(
         partial_lse + chunks * stride_l_c + token * stride_l_n + head * stride_l_h
     )
@@ -365,6 +375,8 @@ def _merge_decode_kernel(
         merged,
         mask=dims < head_dim,
     )
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def _validate_inputs(
@@ -412,6 +424,7 @@ def minimax_sparse_attention(
     max_query_len: int = 0,
     k_scale: float | torch.Tensor | None = None,
     v_scale: float | torch.Tensor | None = None,
+    enable_pdl: bool = False,
 ) -> torch.Tensor:
     """Run exact GQA attention over MiniMax's selected KV blocks.
 
@@ -493,6 +506,8 @@ def minimax_sparse_attention(
             dtype=torch.float32,
             device=query.device,
         )
+        use_pdl = bool(enable_pdl and _is_nvidia)
+        pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
         _sparse_decode_kernel[(tokens * num_chunks, num_kv_heads)](
             query,
             key_cache,
@@ -535,8 +550,10 @@ def minimax_sparse_attention(
             NUM_CHUNKS=num_chunks,
             BLOCK_K=SPARSE_BLOCK_SIZE,
             USE_FP8=use_fp8,
+            ENABLE_PDL=use_pdl,
             num_warps=4,
             num_stages=2,
+            **pdl_kwargs,
         )
         _merge_decode_kernel[(tokens, num_heads)](
             partial_output,
@@ -554,7 +571,9 @@ def minimax_sparse_attention(
             output.stride(1),
             output.stride(2),
             NUM_CHUNKS=num_chunks,
+            ENABLE_PDL=use_pdl,
             num_warps=4,
+            **pdl_kwargs,
         )
         return output
 
@@ -667,6 +686,7 @@ def triton_minimax_msa_decode_with_kvcache(
     k_scale: float | torch.Tensor | None = None,
     v_scale: float | torch.Tensor | None = None,
     score_out: torch.Tensor | None = None,
+    enable_pdl: bool = False,
 ) -> torch.Tensor:
     """Run MiniMax sparse-attention decode over paged caches."""
 
@@ -688,6 +708,7 @@ def triton_minimax_msa_decode_with_kvcache(
         decode_query_len=max_seqlen_q,
         max_blocks=max_blocks,
         score_out=score_out,
+        enable_pdl=enable_pdl,
     )
     return minimax_sparse_attention(
         q,
@@ -700,6 +721,7 @@ def triton_minimax_msa_decode_with_kvcache(
         decode_query_len=max_seqlen_q,
         k_scale=k_scale,
         v_scale=v_scale,
+        enable_pdl=enable_pdl,
     )
 
 
