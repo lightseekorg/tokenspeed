@@ -43,7 +43,7 @@ concurrency:
 
 jobs:
   dispatch:
-    runs-on: [self-hosted, slurm-dispatch]
+    runs-on: slurm-dispatch
     timeout-minutes: 720
     permissions:
       contents: read

@@ -223,15 +223,15 @@ Markdown summary, per-job logs, and available `result.json` files under
 SIGTERM while waiting calls `scancel` for the jobs submitted by that command.
 
 The manual `Slurm Dispatch` GitHub workflow runs on a self-hosted runner with
-the exact labels `self-hosted` and `slurm-dispatch`. That runner belongs on the
-Slurm coordinator and only needs GitHub runner prerequisites, this repository,
-Python/PyYAML, and Slurm client commands; it does not need GPUs. From the
-Actions UI, provide a PR, comma-separated runner labels and task types, and an
-optional comma-separated task/model filter. The workflow submits the selected
-matrix, waits for all jobs, writes the aggregate table to the GitHub step
-summary, and uploads the collected report directory as an artifact. It excludes
-long-running MMLU tasks by default; explicitly enable `include_mmlu` in the
-manual workflow inputs when that coverage is required.
+the `slurm-dispatch` label. That runner belongs on the Slurm coordinator and
+only needs GitHub runner prerequisites, this repository, Python/PyYAML, and
+Slurm client commands; it does not need GPUs. From the Actions UI, provide a PR,
+comma-separated runner labels and task types, and an optional comma-separated
+task/model filter. The workflow submits the selected matrix, waits for all
+jobs, writes the aggregate table to the GitHub step summary, and uploads the
+collected report directory as an artifact. It excludes long-running MMLU tasks
+by default; explicitly enable `include_mmlu` in the manual workflow inputs when
+that coverage is required.
 
 The dispatcher checkout is trusted control-plane code. The requested PR is
 merged only in the submitter's temporary worktree and runs from its immutable
