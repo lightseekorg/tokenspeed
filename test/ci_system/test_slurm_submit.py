@@ -114,6 +114,28 @@ def test_select_all_supports_multiple_runners_types_and_model_match(
     ]
 
 
+def test_select_all_supports_exclude_match(monkeypatch, tmp_path):
+    config = write_task(tmp_path, model="example/mmlu")
+    monkeypatch.setattr(
+        "slurm_submit.build_matrix",
+        lambda *_: {
+            "include": [
+                {"config": config, "type": "eval", "runner": "gb200-1gpu"},
+            ]
+        },
+    )
+    args = argparse.Namespace(
+        config=None,
+        runner=["gb200-1gpu"],
+        task_types=["eval"],
+        match=None,
+        exclude_match=["mmlu"],
+        trigger=None,
+    )
+    with pytest.raises(ValueError, match="no tasks match"):
+        select_tasks(args, tmp_path)
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
     [

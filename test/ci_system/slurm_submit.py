@@ -87,6 +87,13 @@ def select_tasks(args: argparse.Namespace, repo: Path) -> list[Task]:
     runners = args.runner or []
     task_types = set(args.task_types or DEFAULT_TASK_TYPES)
     patterns = args.match or []
+    excluded_patterns = getattr(args, "exclude_match", None) or []
+
+    def matches_filters(task: Task) -> bool:
+        return task_matches(repo, task, patterns) and (
+            not excluded_patterns or not task_matches(repo, task, excluded_patterns)
+        )
+
     if args.config:
         tasks = (
             [load_task(repo, args.config, runner) for runner in runners]
@@ -96,7 +103,7 @@ def select_tasks(args: argparse.Namespace, repo: Path) -> list[Task]:
         tasks = [
             task
             for task in tasks
-            if task.task_type in task_types and task_matches(repo, task, patterns)
+            if task.task_type in task_types and matches_filters(task)
         ]
         if not tasks:
             raise ValueError("the selected config does not match the task filters")
@@ -109,7 +116,7 @@ def select_tasks(args: argparse.Namespace, repo: Path) -> list[Task]:
         for item in matrix["include"]
         if item["type"] in task_types and item["runner"] in runners
     ]
-    tasks = [task for task in tasks if task_matches(repo, task, patterns)]
+    tasks = [task for task in tasks if matches_filters(task)]
     if not tasks:
         raise ValueError("no tasks match the requested runners and filters")
     return tasks
@@ -494,6 +501,11 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         "--match",
         action="append",
         help="Case-insensitive task/config/model substring; repeat for OR matching.",
+    )
+    parser.add_argument(
+        "--exclude-match",
+        action="append",
+        help="Exclude a case-insensitive task/config/model substring; repeat for OR.",
     )
     parser.add_argument("--pr", help="PR number or GitHub pull request URL to merge.")
     parser.add_argument("--list", action="store_true", help="List matching tasks only.")

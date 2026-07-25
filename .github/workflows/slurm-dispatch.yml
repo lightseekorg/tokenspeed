@@ -21,6 +21,11 @@ on:
         description: "Optional comma-separated task/model substrings"
         required: false
         type: string
+      include_mmlu:
+        description: "Include long-running MMLU tasks"
+        required: true
+        default: false
+        type: boolean
       trigger:
         description: "Optional task trigger filter"
         required: true
@@ -54,6 +59,7 @@ jobs:
           RUNNERS: ${{ inputs.runners }}
           TASK_TYPES: ${{ inputs.task_types }}
           MATCH: ${{ inputs.match }}
+          INCLUDE_MMLU: ${{ inputs.include_mmlu }}
           TRIGGER: ${{ inputs.trigger }}
         run: |
           set -euo pipefail
@@ -78,6 +84,7 @@ jobs:
             [ -z "$value" ] || args+=(--match "$value")
           done
 
+          [ "$INCLUDE_MMLU" = true ] || args+=(--exclude-match mmlu)
           [ "$TRIGGER" = all ] || args+=(--trigger "$TRIGGER")
           test/ci/run_slurm.sh "${args[@]}"
 

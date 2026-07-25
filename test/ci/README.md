@@ -229,7 +229,9 @@ Python/PyYAML, and Slurm client commands; it does not need GPUs. From the
 Actions UI, provide a PR, comma-separated runner labels and task types, and an
 optional comma-separated task/model filter. The workflow submits the selected
 matrix, waits for all jobs, writes the aggregate table to the GitHub step
-summary, and uploads the collected report directory as an artifact.
+summary, and uploads the collected report directory as an artifact. It excludes
+long-running MMLU tasks by default; explicitly enable `include_mmlu` in the
+manual workflow inputs when that coverage is required.
 
 The dispatcher checkout is trusted control-plane code. The requested PR is
 merged only in the submitter's temporary worktree and runs from its immutable
