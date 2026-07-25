@@ -414,6 +414,15 @@ def result_detail(path: Path) -> str:
         check = data["perf_reference_check"]
         return f"perf={'pass' if check['passed'] else 'fail'}"
     command_results = data.get("command_results", [])
+    for command_result in reversed(command_results):
+        if not isinstance(command_result, dict):
+            continue
+        score = command_result.get("evalscope_score")
+        if score is not None:
+            try:
+                return f"score={float(score):g}"
+            except (TypeError, ValueError):
+                continue
     if command_results and command_results[-1].get("pytest_summary"):
         return str(command_results[-1]["pytest_summary"])
     return str(data.get("error", ""))
@@ -486,12 +495,16 @@ def write_report(
             "detail": detail,
         }
         rows.append(row)
+        display_state = {
+            "COMPLETED": "✅",
+            "FAILED": "❌",
+        }.get(state["state"], state["state"])
         cells = [
             submission.job_id,
             submission.task.task_type,
             submission.task.runner,
             submission.task.name,
-            state["state"],
+            display_state,
             state["elapsed"],
             detail,
         ]

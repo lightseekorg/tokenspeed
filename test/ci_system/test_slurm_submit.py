@@ -233,6 +233,6 @@ def test_write_report_collects_logs_and_results(tmp_path):
     assert (report / "123.log").read_text() == "task output\n"
     assert (report / "123-result.json").exists()
     assert (
-        "| 123 | eval | gb200-1gpu | example | COMPLETED |"
+        "| 123 | eval | gb200-1gpu | example | ✅ |"
         in (report / "summary.md").read_text()
     )
