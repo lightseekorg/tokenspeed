@@ -279,6 +279,50 @@ class Qwen3DecoderLayer(nn.Module):
         residual: torch.Tensor | None,
         cos_sin: tuple[torch.Tensor, torch.Tensor] | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        hidden_states, residual, _ = self._forward(
+            positions,
+            hidden_states,
+            ctx,
+            out_cache_loc,
+            residual,
+            cos_sin,
+            capture_input_residual=False,
+        )
+        return hidden_states, residual
+
+    def forward_with_input_residual(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        ctx: ForwardContext,
+        out_cache_loc: torch.Tensor,
+        residual: torch.Tensor | None,
+        cos_sin: tuple[torch.Tensor, torch.Tensor] | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Forward the layer and return its complete TP-reduced input residual."""
+        hidden_states, residual, input_residual = self._forward(
+            positions,
+            hidden_states,
+            ctx,
+            out_cache_loc,
+            residual,
+            cos_sin,
+            capture_input_residual=True,
+        )
+        assert input_residual is not None
+        return hidden_states, residual, input_residual
+
+    def _forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        ctx: ForwardContext,
+        out_cache_loc: torch.Tensor,
+        residual: torch.Tensor | None,
+        cos_sin: tuple[torch.Tensor, torch.Tensor] | None,
+        *,
+        capture_input_residual: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         # Self Attention
         if residual is None:
             residual = hidden_states
@@ -297,6 +341,8 @@ class Qwen3DecoderLayer(nn.Module):
                     residual,
                 )
             )
+
+        input_residual = residual.clone() if capture_input_residual else None
 
         hidden_states = self.self_attn(
             positions=positions,
@@ -322,7 +368,7 @@ class Qwen3DecoderLayer(nn.Module):
                 )
             )
         hidden_states = self.mlp(hidden_states)
-        return hidden_states, residual
+        return hidden_states, residual, input_residual
 
 
 class Qwen3Model(nn.Module):
@@ -358,6 +404,7 @@ class Qwen3Model(nn.Module):
             ),
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.layers_to_capture: set[int] = set()
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         if hasattr(self.config, "scale_emb"):
@@ -371,23 +418,39 @@ class Qwen3Model(nn.Module):
         ctx: ForwardContext,
         out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, None]:
+    ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
         else:
             hidden_states = input_embeds
         residual = None
+        aux_hidden_states = [] if self.layers_to_capture else None
 
         for i in range(len(self.layers)):
             layer = self.layers[i]
-            hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                ctx,
-                out_cache_loc,
-                residual,
-                cos_sin=None,
-            )
+            if aux_hidden_states is not None and i in self.layers_to_capture:
+                (
+                    hidden_states,
+                    residual,
+                    input_residual,
+                ) = layer.forward_with_input_residual(
+                    positions,
+                    hidden_states,
+                    ctx,
+                    out_cache_loc,
+                    residual,
+                    cos_sin=None,
+                )
+                aux_hidden_states.append(input_residual)
+            else:
+                hidden_states, residual = layer(
+                    positions,
+                    hidden_states,
+                    ctx,
+                    out_cache_loc,
+                    residual,
+                    cos_sin=None,
+                )
         if ctx.input_num_tokens > global_server_args_dict["comm_fusion_max_num_tokens"]:
             hidden_states = all_reduce(hidden_states, self.mapping.dense.tp_group)
             hidden_states, _ = self.norm(hidden_states, residual)
@@ -398,7 +461,7 @@ class Qwen3Model(nn.Module):
                 hidden_states,
                 residual,
             )
-        return hidden_states, None
+        return hidden_states, aux_hidden_states
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         tp_size = self.mapping.attn.tp_size
@@ -417,7 +480,7 @@ class Qwen3Model(nn.Module):
                 layer_self_attn.attn.v_scale = scaling_factor
             else:
                 raise RuntimeError(
-                    "Self attention has no KV cache scaling " "factor attribute!"
+                    "Self attention has no KV cache scaling factor attribute!"
                 )
 
 
