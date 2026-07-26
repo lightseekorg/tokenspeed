@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import os
 import sys
+import types
 import unittest
+from contextlib import nullcontext
 from unittest import mock
 
 # CI Registration (parsed via AST, runtime no-op)
@@ -359,12 +361,304 @@ class FlatHostMirrorStateSlabTest(unittest.TestCase):
         # the 4 KV mirrors; conv immediately precedes its ssm.
         self.assertEqual(mirror.state_tensor_indices_of_layer(0), (4, 5))
         self.assertEqual(mirror.state_tensor_indices_of_layer(2), (6, 7))
+        self.assertEqual(mirror.ready_tensor_index_of_layer(0), 5)
+        self.assertEqual(mirror.ready_tensor_index_of_layer(2), 7)
         self.assertIsNone(mirror.state_tensor_indices_of_layer(1))
         self.assertIsNone(mirror.state_tensor_indices_of_layer(3))
+        self.assertEqual(mirror.ready_tensor_index_of_layer(1), 2)
+        self.assertEqual(mirror.ready_tensor_index_of_layer(3), 3)
         # Pools without state slabs expose no state indices for any layer.
         kv_only = self.FlatHostMirror(self._pool(with_state=False), num_host_pages=2)
         for layer_id in range(4):
             self.assertIsNone(kv_only.state_tensor_indices_of_layer(layer_id))
+
+
+class FlatHostMirrorMSAIndexKTest(unittest.TestCase):
+    """CPU stub for MiniMax MSA's optional index-K side cache.
+
+    Sparse layers are deliberately non-contiguous and share K/V slabs with
+    dense layers. This pins both the index-K layer mapping and the fact that a
+    sparse layer must fence after index-K rather than after its shared V slab.
+    """
+
+    INDEXED_LAYER_IDS = (0, 2)
+
+    def setUp(self):
+        try:
+            import torch
+
+            from tokenspeed.runtime.cache.flat_host_mirror import (
+                FlatHostMirror,
+                flat_bytes_per_host_page,
+            )
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs torch: {exc}")
+        self.torch = torch
+        self.FlatHostMirror = FlatHostMirror
+        self.flat_bytes_per_host_page = flat_bytes_per_host_page
+
+    def _stub_pool(
+        self,
+        *,
+        with_index_k: bool = True,
+        alias_index_k: bool = False,
+        alias_kv: bool = True,
+        with_state: bool = False,
+    ):
+        torch = self.torch
+        page_size = 4
+        size = 8
+        rows = size + page_size
+        kv_tensor_count = 2 if alias_kv else 4
+        k_slabs = [
+            torch.zeros((rows, 1, 8), dtype=torch.bfloat16)
+            for _ in range(kv_tensor_count)
+        ]
+        v_slabs = [
+            torch.zeros((rows, 1, 8), dtype=torch.bfloat16)
+            for _ in range(kv_tensor_count)
+        ]
+        if alias_kv:
+            k_buffer = [k_slabs[0], k_slabs[0], k_slabs[1], k_slabs[1]]
+            v_buffer = [v_slabs[0], v_slabs[0], v_slabs[1], v_slabs[1]]
+        else:
+            k_buffer = k_slabs
+            v_buffer = v_slabs
+        pool = types.SimpleNamespace(
+            page_size=page_size,
+            size=size,
+            k_buffer=k_buffer,
+            v_buffer=v_buffer,
+        )
+        if with_index_k:
+            pool.indexed_layer_ids = frozenset(self.INDEXED_LAYER_IDS)
+            # Match MSATokenToKVPool: dict insertion order is sorted layer id.
+            pool.index_k_buffer = {
+                layer_id: torch.zeros((rows, 8), dtype=torch.bfloat16)
+                for layer_id in sorted(pool.indexed_layer_ids)
+            }
+            if alias_index_k:
+                pool.index_k_buffer[2] = pool.index_k_buffer[0]
+        if with_state:
+            conv = torch.zeros((4, 2), dtype=torch.bfloat16)
+            ssm = torch.zeros((4, 4), dtype=torch.bfloat16)
+            pool.state_slabs = [(conv, ssm)]
+
+            def get_state_buffers(layer_id):
+                if layer_id == 0:
+                    return conv, ssm
+                raise ValueError(f"layer {layer_id} is not a state layer")
+
+            pool.get_state_buffers = get_state_buffers
+        return pool
+
+    def _mirror(self, pool, num_host_pages: int = 3):
+        # Keep this stub test CPU-only even when it runs on a CUDA worker.
+        with mock.patch(
+            "tokenspeed.runtime.cache.flat_host_mirror.torch.cuda.is_available",
+            return_value=False,
+        ):
+            return self.FlatHostMirror(pool, num_host_pages=num_host_pages)
+
+    def _fill_page_byte_pattern(self, tensor, rows: slice, *, seed: int) -> None:
+        page_bytes = (
+            tensor[rows].view(self.torch.uint8).reshape(rows.stop - rows.start, -1)
+        )
+        row_ids = self.torch.arange(
+            rows.start,
+            rows.stop,
+            dtype=self.torch.int64,
+            device=tensor.device,
+        ).unsqueeze(1)
+        column_ids = self.torch.arange(
+            page_bytes.shape[1],
+            dtype=self.torch.int64,
+            device=tensor.device,
+        ).unsqueeze(0)
+        pattern = (row_ids * 17 + column_ids * 29 + seed) % 256
+        page_bytes.copy_(pattern.to(self.torch.uint8))
+
+    def test_capacity_and_non_contiguous_sparse_layer_mapping(self):
+        pool = self._stub_pool()
+        # K/V: 4 mirrors * 4 rows * 16 B = 256 B.
+        # index-K: 2 sparse layers * 4 rows * 16 B = 128 B.
+        self.assertEqual(self.flat_bytes_per_host_page(pool), 384)
+
+        mirror = self._mirror(pool)
+        self.assertEqual(mirror.num_k_tensors, 2)
+        self.assertEqual(mirror.num_index_k_tensors, 2)
+        self.assertEqual(len(mirror.tensor_pairs), 6)
+        self.assertEqual(mirror.row_spans, (4,) * 6)
+        self.assertEqual(mirror.bytes_per_host_page(), 384)
+
+        # PINNED order: K*, V*, then index-K* sorted by sparse layer id.
+        self.assertIs(mirror.tensor_pairs[4][0], pool.index_k_buffer[0])
+        self.assertIs(mirror.tensor_pairs[5][0], pool.index_k_buffer[2])
+        self.assertEqual(mirror.index_k_tensor_index_of_layer(0), 4)
+        self.assertIsNone(mirror.index_k_tensor_index_of_layer(1))
+        self.assertEqual(mirror.index_k_tensor_index_of_layer(2), 5)
+        self.assertIsNone(mirror.index_k_tensor_index_of_layer(3))
+
+        # Dense layers fence on V; sparse layers fence on their later index-K.
+        self.assertEqual(
+            [mirror.ready_tensor_index_of_layer(i) for i in range(4)],
+            [4, 2, 5, 3],
+        )
+
+    def test_per_layer_kv_layout_matches_m3(self):
+        pool = self._stub_pool(alias_kv=False)
+        mirror = self._mirror(pool)
+
+        # M3 uses per-layer K/V tensors: 8 K/V mirrors plus two sparse index-K
+        # mirrors. Each mirror contributes 4 rows * 16 bytes per host page.
+        self.assertEqual(self.flat_bytes_per_host_page(pool), 640)
+        self.assertEqual(mirror.num_k_tensors, 4)
+        self.assertEqual(mirror.num_index_k_tensors, 2)
+        self.assertEqual(len(mirror.tensor_pairs), 10)
+        self.assertEqual(mirror.row_spans, (4,) * 10)
+        self.assertEqual(mirror.bytes_per_host_page(), 640)
+        self.assertEqual(
+            [mirror.ready_tensor_index_of_layer(i) for i in range(4)],
+            [8, 5, 9, 7],
+        )
+
+    def test_index_k_identity_alias_is_mirrored_once(self):
+        pool = self._stub_pool(alias_index_k=True)
+        mirror = self._mirror(pool)
+
+        self.assertEqual(mirror.num_index_k_tensors, 1)
+        self.assertEqual(len(mirror.tensor_pairs), 5)
+        self.assertEqual(mirror.bytes_per_host_page(), 320)
+        self.assertEqual(mirror.index_k_tensor_index_of_layer(0), 4)
+        self.assertEqual(mirror.index_k_tensor_index_of_layer(2), 4)
+        self.assertEqual(
+            [mirror.ready_tensor_index_of_layer(i) for i in range(4)],
+            [4, 2, 4, 3],
+        )
+
+    def test_state_offsets_include_index_k_and_state_ready_wins(self):
+        pool = self._stub_pool(with_state=True)
+        mirror = self._mirror(pool)
+
+        # K*/V* occupy [0, 4), index-K occupies [4, 6), so state starts at
+        # 6 rather than the old KV-only base 4. Layer 0 deliberately has both
+        # state and index-K: its SSM event is the final readiness fence.
+        self.assertEqual(mirror.state_tensor_indices_of_layer(0), (6, 7))
+        self.assertEqual(mirror.index_k_tensor_index_of_layer(0), 4)
+        self.assertEqual(mirror.ready_tensor_index_of_layer(0), 7)
+        self.assertEqual(mirror.ready_tensor_index_of_layer(2), 5)
+
+    def test_store_load_roundtrip_preserves_index_k(self):
+        # Exercise M3's real per-layer K/V topology here. The aliased-slab
+        # layout remains covered by the layout/dedup tests above.
+        pool = self._stub_pool(alias_kv=False)
+        mirror = self._mirror(pool)
+        store_pairs = [(1, 2), (2, 0)]
+        source_device_pages = [device_page for device_page, _ in store_pairs]
+
+        before = []
+        for tensor_idx, ((dev, _), span) in enumerate(
+            zip(mirror.tensor_pairs, mirror.row_spans)
+        ):
+            pages = {}
+            for device_page in source_device_pages:
+                rows = slice(device_page * span, (device_page + 1) * span)
+                self._fill_page_byte_pattern(
+                    dev,
+                    rows,
+                    seed=tensor_idx * 41 + device_page * 13 + 7,
+                )
+                pages[device_page] = dev[rows].clone()
+            before.append(pages)
+
+        for tensor_idx, ((_, host), span) in enumerate(
+            zip(mirror.tensor_pairs, mirror.row_spans)
+        ):
+            for _, host_page in store_pairs:
+                host_rows = host[host_page * span : (host_page + 1) * span]
+                host_rows.view(self.torch.uint8).fill_((0xA5 + tensor_idx) % 256)
+
+        # _copy_pages only needs a stream context; CPU copy_ exercises the
+        # same row-span/index ordering without requiring a CUDA worker.
+        with mock.patch(
+            "tokenspeed.runtime.cache.flat_host_mirror.torch.cuda.stream",
+            side_effect=lambda _stream: nullcontext(),
+        ):
+            mirror.store_pages(store_pairs, stream=None)
+
+            # Validate D2H independently. Otherwise matching addressing bugs in
+            # store_pages and load_pages could cancel in the final roundtrip.
+            for tensor_idx, ((_, host), span) in enumerate(
+                zip(mirror.tensor_pairs, mirror.row_spans)
+            ):
+                for device_page, host_page in store_pairs:
+                    self.assertTrue(
+                        self.torch.equal(
+                            host[host_page * span : (host_page + 1) * span].view(
+                                self.torch.uint8
+                            ),
+                            before[tensor_idx][device_page].view(self.torch.uint8),
+                        ),
+                        f"tensor {tensor_idx} host page {host_page} D2H mismatch",
+                    )
+
+            # Reload the two host pages into reversed device destinations so
+            # H2D addressing is tested independently from the D2H mapping.
+            load_pairs = [(2, 2), (1, 0)]
+            for (dev, _), span in zip(mirror.tensor_pairs, mirror.row_spans):
+                for device_page, _ in load_pairs:
+                    dev[device_page * span : (device_page + 1) * span].zero_()
+            mirror.load_pages(load_pairs, stream=None)
+
+        source_page_by_host_page = {
+            host_page: device_page for device_page, host_page in store_pairs
+        }
+        for tensor_idx, ((dev, _), span) in enumerate(
+            zip(mirror.tensor_pairs, mirror.row_spans)
+        ):
+            for destination_page, host_page in load_pairs:
+                source_page = source_page_by_host_page[host_page]
+                self.assertTrue(
+                    self.torch.equal(
+                        dev[
+                            destination_page * span : (destination_page + 1) * span
+                        ].view(self.torch.uint8),
+                        before[tensor_idx][source_page].view(self.torch.uint8),
+                    ),
+                    f"tensor {tensor_idx} device page {destination_page} "
+                    "not byte-exact",
+                )
+
+    def test_pool_without_index_k_keeps_original_layout_and_sizing(self):
+        pool = self._stub_pool(with_index_k=False)
+        mirror = self._mirror(pool)
+
+        self.assertEqual(self.flat_bytes_per_host_page(pool), 256)
+        self.assertEqual(mirror.bytes_per_host_page(), 256)
+        self.assertEqual(mirror.num_k_tensors, 2)
+        self.assertEqual(mirror.num_index_k_tensors, 0)
+        self.assertEqual(len(mirror.tensor_pairs), 4)
+        self.assertEqual(mirror.row_spans, (4,) * 4)
+        self.assertEqual(
+            [mirror.ready_tensor_index_of_layer(i) for i in range(4)],
+            [2, 2, 3, 3],
+        )
+        for layer_id in range(4):
+            self.assertIsNone(mirror.index_k_tensor_index_of_layer(layer_id))
+
+    def test_non_mapping_index_cache_keeps_original_layout(self):
+        pool = self._stub_pool(with_index_k=False)
+        pool.indexed_layer_ids = frozenset(range(4))
+        pool.index_k_buffer = [
+            self.torch.zeros((12, 8), dtype=self.torch.uint8) for _ in range(4)
+        ]
+        mirror = self._mirror(pool)
+
+        # DSA-style packed/list side caches are outside the MSA mapping
+        # contract and keep the pre-existing flat mirror behavior.
+        self.assertEqual(self.flat_bytes_per_host_page(pool), 256)
+        self.assertEqual(mirror.num_index_k_tensors, 0)
+        self.assertEqual(len(mirror.tensor_pairs), 4)
 
 
 class FlatHostMirrorNoneKVTest(unittest.TestCase):

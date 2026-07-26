@@ -47,6 +47,25 @@ class _StubPool:
         self.v_buffer = [v_slabs[0], v_slabs[0], v_slabs[1], v_slabs[1]]
 
 
+class _StubMSAPool(_StubPool):
+    """MiniMax MSA's per-layer K/V plus index-K on layers 0/2."""
+
+    def __init__(self, torch):
+        super().__init__(torch)
+        rows = self.size + self.page_size
+        self.k_buffer = [
+            torch.zeros((rows, 1, 8), dtype=torch.bfloat16) for _ in range(4)
+        ]
+        self.v_buffer = [
+            torch.zeros((rows, 1, 8), dtype=torch.bfloat16) for _ in range(4)
+        ]
+        self.indexed_layer_ids = frozenset({0, 2})
+        self.index_k_buffer = {
+            layer_id: torch.zeros((rows, 8), dtype=torch.bfloat16)
+            for layer_id in sorted(self.indexed_layer_ids)
+        }
+
+
 class FlatHostPageSizingTest(unittest.TestCase):
     """num_host_pages budget arithmetic; no CUDA, no scheduler ext."""
 
@@ -161,6 +180,75 @@ class LoadBackDonePayloadTest(unittest.TestCase):
         self.assertEqual(self.pop_common([[payload], []]), [])
         both = self.pop_common([[payload], [dict(payload)]])
         self.assertEqual(both, [payload])
+
+
+class FlatMemoryExecutorMSAEventMappingTest(unittest.TestCase):
+    """CPU-only pin of _start_loading's MSA layer -> tensor event mapping."""
+
+    def setUp(self):
+        try:
+            import torch
+
+            from tokenspeed.runtime.cache.executor.flat_memory_executor import (
+                FlatMemoryExecutor,
+            )
+            from tokenspeed.runtime.cache.flat_host_mirror import FlatHostMirror
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs torch + scheduler ext: {exc}")
+        self.torch = torch
+        self.FlatHostMirror = FlatHostMirror
+        self.FlatMemoryExecutor = FlatMemoryExecutor
+
+    def test_sparse_layers_fence_on_index_k_and_finish_covers_last_copy(self):
+        pool = _StubMSAPool(self.torch)
+        with mock.patch(
+            "tokenspeed.runtime.cache.flat_host_mirror.torch.cuda.is_available",
+            return_value=False,
+        ):
+            mirror = self.FlatHostMirror(pool, num_host_pages=2)
+
+        # Bypass __init__ so this unit test can pin orchestration without a
+        # CUDA stream. The mirror returns one sentinel per tensor in its fixed
+        # K*, V*, index-K* order.
+        executor = self.FlatMemoryExecutor.__new__(self.FlatMemoryExecutor)
+        executor.layer_num = 4
+        executor.mirror = mirror
+        executor.load_stream = object()
+        executor._pending_load_op_ids = [31]
+        executor._pending_load_pairs = [(1, 0)]
+        executor._immediate_load_op_ids = []
+        executor.ack_load_queue = []
+        executor._producer_map = {}
+        executor._producer_map_limit = 1024
+
+        events = [object() for _ in mirror.tensor_pairs]
+        mirror.load_pages_with_events = mock.Mock(return_value=events)
+        producer_event = mock.Mock()
+        producer_event.start_event = mock.Mock()
+        producer_event.load_events = [None] * executor.layer_num
+        executor._counter = mock.Mock()
+        executor._counter.update_producer.return_value = 0
+        executor._counter.events = [producer_event]
+
+        with mock.patch(
+            "tokenspeed.runtime.cache.executor.flat_memory_executor."
+            "get_is_capture_mode",
+            return_value=False,
+        ):
+            executor._start_loading()
+
+        # Mirror ready mapping before the final producer-slot fence:
+        # sparse 0 -> index-K[0] event 8; dense 1 -> V event 5;
+        # sparse 2 -> index-K[2] event 9; dense 3 -> V event 7.
+        # _start_loading then pins the final layer to events[-1], ensuring
+        # finish_event/slot reuse/ack cover the later index-K copies.
+        self.assertIs(producer_event.load_events[0], events[8])
+        self.assertIs(producer_event.load_events[1], events[5])
+        self.assertIs(producer_event.load_events[2], events[9])
+        self.assertIs(producer_event.load_events[3], events[-1])
+        self.assertIs(executor.ack_load_queue[0].finish_event, events[-1])
+        self.assertEqual(executor.ack_load_queue[0].op_ids, [31])
+        self.assertEqual(executor._producer_map, {31: 0})
 
 
 class FlatMemoryExecutorTest(unittest.TestCase):

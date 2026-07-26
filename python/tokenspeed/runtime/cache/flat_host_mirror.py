@@ -24,7 +24,7 @@ tier (M15 Phase D). Transport mechanism only; scheduler/engine wiring is D2.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 
 import torch
 
@@ -47,38 +47,89 @@ def _state_slabs(device_kv_pool) -> list[tuple[torch.Tensor, torch.Tensor]]:
     return list(getattr(device_kv_pool, "state_slabs", None) or ())
 
 
+def _index_k_tensors_by_layer(device_kv_pool) -> list[tuple[int, torch.Tensor]]:
+    """Optional key-only side-cache tensors keyed by logical layer id.
+
+    MSA pools expose ``index_k_buffer`` as a mapping because only sparse
+    layers own an index-K tensor. Other pools either omit the attribute or
+    use a different representation, in which case their flat mirror layout
+    stays unchanged.
+    """
+    buffers = getattr(device_kv_pool, "index_k_buffer", None)
+    indexed_layer_ids = getattr(device_kv_pool, "indexed_layer_ids", None)
+    if not isinstance(buffers, Mapping) or indexed_layer_ids is None:
+        return []
+
+    num_layers = len(device_kv_pool.k_buffer)
+    declared_layer_ids = {int(layer_id) for layer_id in indexed_layer_ids}
+    buffer_layer_ids = {int(layer_id) for layer_id in buffers}
+    if buffer_layer_ids != declared_layer_ids:
+        raise ValueError(
+            "flat host mirror: index-K buffer layers do not match "
+            f"indexed_layer_ids (buffers={sorted(buffer_layer_ids)}, "
+            f"declared={sorted(declared_layer_ids)})"
+        )
+
+    tensors: list[tuple[int, torch.Tensor]] = []
+    for raw_layer_id, tensor in buffers.items():
+        layer_id = int(raw_layer_id)
+        if not 0 <= layer_id < num_layers:
+            raise ValueError(
+                "flat host mirror: index-K layer id out of range: "
+                f"{layer_id} not in [0, {num_layers})"
+            )
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(
+                "flat host mirror: index-K buffer must contain tensors, "
+                f"got {type(tensor).__name__} for layer {layer_id}"
+            )
+        tensors.append((layer_id, tensor))
+    tensors.sort(key=lambda item: item[0])
+    return tensors
+
+
 def flat_bytes_per_host_page(device_kv_pool) -> int:
     """Bytes one host page occupies across all mirrors, computed from the
     device pool alone (no mirror allocation) -- the sizing side of
     ``FlatHostMirror.bytes_per_host_page`` for host-budget arithmetic.
     """
-    tensors = _identity_dedup(device_kv_pool.k_buffer) + _identity_dedup(
-        device_kv_pool.v_buffer
+    token_tensors = (
+        _identity_dedup(device_kv_pool.k_buffer)
+        + _identity_dedup(device_kv_pool.v_buffer)
+        + _identity_dedup(
+            [tensor for _, tensor in _index_k_tensors_by_layer(device_kv_pool)]
+        )
     )
     page_size = int(device_kv_pool.page_size)
-    kv_bytes = sum(t.element_size() * t[0].numel() * page_size for t in tensors)
+    token_bytes = sum(
+        tensor.element_size() * tensor[0].numel() * page_size
+        for tensor in token_tensors
+    )
     # State slabs are page-indexed: one constant row per page id.
     state_bytes = sum(
         t.element_size() * t[0].numel()
         for pair in _state_slabs(device_kv_pool)
         for t in pair
     )
-    return kv_bytes + state_bytes
+    return token_bytes + state_bytes
 
 
 class FlatHostMirror:
-    """One pinned CPU mirror per DISTINCT device KV tensor plus one per
-    state slab tensor; a (device_page, host_page) pair copies that page's
-    row range on every mirror pair.
+    """Pinned CPU mirrors for device K/V, optional index-K, and state tensors.
+
+    A ``(device_page, host_page)`` pair copies that page's row range on every
+    mirror pair. Optional index-K mirrors are discovered from a mapping-valued
+    ``index_k_buffer``; pools without one retain the original K/V/state layout.
 
     Slab tensors are enumerated once each -- a page's rows are exactly its
     owner group's layers, so byte copies are group-safe by id-exclusivity.
 
     ``tensor_pairs`` order (PINNED, D2 fencing indexes into it): K*, V*,
-    then state tensors flattened in slab order (conv0, ssm0, conv1, ...).
-    KV mirrors span ``page_size`` token rows per page; state slabs are
-    page-indexed (one snapshot row per page id), so their mirrors span 1
-    row per page -- ``row_spans[i]`` carries each pair's span.
+    index-K* in ascending layer-id order, then state tensors flattened in slab
+    order (conv0, ssm0, conv1, ...). K/V and index-K mirrors span
+    ``page_size`` token rows per page; state slabs are page-indexed (one
+    snapshot row per page id), so their mirrors span 1 row per page --
+    ``row_spans[i]`` carries each pair's span.
     """
 
     def __init__(self, device_kv_pool, num_host_pages: int):
@@ -105,6 +156,16 @@ class FlatHostMirror:
             None if t is None else v_index[id(t)] for t in device_kv_pool.v_buffer
         ], "flat host mirror: K/V dedup orders diverge"
 
+        index_k_by_layer = _index_k_tensors_by_layer(device_kv_pool)
+        index_k_tensors = _identity_dedup([tensor for _, tensor in index_k_by_layer])
+        self.num_index_k_tensors = len(index_k_tensors)
+        index_k_base = 2 * self.num_k_tensors
+        index_k_index = {id(tensor): i for i, tensor in enumerate(index_k_tensors)}
+        self._layer_to_index_k_index = {
+            layer_id: index_k_base + index_k_index[id(tensor)]
+            for layer_id, tensor in index_k_by_layer
+        }
+
         state_slabs = _state_slabs(device_kv_pool)
         state_tensors = [t for pair in state_slabs for t in pair]
 
@@ -121,7 +182,7 @@ class FlatHostMirror:
                 self._layer_to_state_pair[layer_id] = pair_of_conv[id(conv)]
 
         pin = torch.cuda.is_available()
-        kv_pairs = [
+        token_pairs = [
             (
                 dev,
                 torch.zeros(
@@ -130,7 +191,7 @@ class FlatHostMirror:
                     pin_memory=pin,
                 ),
             )
-            for dev in k_tensors + v_tensors
+            for dev in k_tensors + v_tensors + index_k_tensors
         ]
         state_pairs = [
             (
@@ -144,11 +205,11 @@ class FlatHostMirror:
             for dev in state_tensors
         ]
         self.tensor_pairs: tuple[tuple[torch.Tensor, torch.Tensor], ...] = tuple(
-            kv_pairs + state_pairs
+            token_pairs + state_pairs
         )
-        # Rows one page spans on each pair: page_size token rows for KV,
-        # one page-indexed snapshot row for state slabs.
-        self.row_spans: tuple[int, ...] = (self.page_size,) * len(kv_pairs) + (
+        # Rows one page spans on each pair: page_size token rows for K/V and
+        # index-K, one page-indexed snapshot row for state slabs.
+        self.row_spans: tuple[int, ...] = (self.page_size,) * len(token_pairs) + (
             1,
         ) * len(state_pairs)
 
@@ -162,6 +223,10 @@ class FlatHostMirror:
             raise ValueError(f"layer {layer_id} is a state layer; it has no KV mirror")
         return index
 
+    def index_k_tensor_index_of_layer(self, layer_id: int) -> int | None:
+        """Absolute index of ``layer_id``'s index-K mirror, when present."""
+        return self._layer_to_index_k_index.get(layer_id)
+
     def state_tensor_indices_of_layer(self, layer_id: int) -> tuple[int, int] | None:
         """(conv_idx, ssm_idx) of layer_id's state slab pair in tensor_pairs
         (conv immediately precedes its ssm), or None for layers without
@@ -169,8 +234,23 @@ class FlatHostMirror:
         pair = self._layer_to_state_pair.get(layer_id)
         if pair is None:
             return None
-        base = 2 * self.num_k_tensors + 2 * pair
+        base = 2 * self.num_k_tensors + self.num_index_k_tensors + 2 * pair
         return base, base + 1
+
+    def ready_tensor_index_of_layer(self, layer_id: int) -> int:
+        """Tensor event after which all mirrored data for a layer is readable.
+
+        The copy stream follows ``tensor_pairs`` order. A state layer fences on
+        SSM (after conv); an MSA sparse layer fences on index-K (after K/V);
+        every other attention layer fences on V (after K).
+        """
+        state_indices = self.state_tensor_indices_of_layer(layer_id)
+        if state_indices is not None:
+            return state_indices[1]
+        index_k_index = self.index_k_tensor_index_of_layer(layer_id)
+        if index_k_index is not None:
+            return index_k_index
+        return self.num_k_tensors + self.tensor_index_of_layer(layer_id)
 
     def bytes_per_host_page(self) -> int:
         return sum(
