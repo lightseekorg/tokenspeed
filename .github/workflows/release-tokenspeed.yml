@@ -1,0 +1,59 @@
+name: Release TokenSpeed
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    if: github.repository == 'lightseekorg/tokenspeed'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve release metadata
+        id: metadata
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import tomllib
+          from pathlib import Path
+
+          pyproject_path = Path("python/pyproject.toml")
+          project = tomllib.loads(
+              pyproject_path.read_text(encoding="utf-8")
+          ).get("project")
+          if not isinstance(project, dict) or project.get("name") != "tokenspeed":
+              raise SystemExit(f"{pyproject_path} does not describe tokenspeed")
+
+          version = project.get("version")
+          if not isinstance(version, str) or not re.fullmatch(
+              r"[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9._+-]*", version
+          ):
+              raise SystemExit(f"invalid TokenSpeed version: {version}")
+
+          with Path(os.environ["GITHUB_OUTPUT"]).open(
+              "a", encoding="utf-8"
+          ) as output:
+              print(f"version={version}", file=output)
+          PY
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          tag="v${VERSION}"
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/git/refs" \
+            -f ref="refs/tags/${tag}" \
+            -f sha="${GITHUB_SHA}"
+          gh release create "${tag}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "TokenSpeed ${VERSION}" \
+            --generate-notes \
+            --verify-tag

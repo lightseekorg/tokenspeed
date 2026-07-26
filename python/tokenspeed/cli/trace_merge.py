@@ -42,7 +42,9 @@ Usage (one final report for multiple scheduler ranks):
 
 In all-ranks mode, the TP rank is encoded into each numeric Proton flow ID.
 This keeps CPU-to-GPU flow arrows within a rank while preventing matching
-launch IDs on different ranks from cross-linking.
+launch IDs on different ranks from cross-linking. When TokenSpeed emits
+VizTracer scope-entry flows and Proton exports their scope IDs, the merger also
+links VizTracer Python slices to Proton CPU scopes.
 
 Open the merged report in vizviewer or https://ui.perfetto.dev — Python
 frames and Proton's kernel/scope lanes share one time axis. Alignment
@@ -68,7 +70,11 @@ _PROTON_PID_BASE = 10_000
 _FLOW_PHASES = frozenset({"s", "t", "f"})
 _FLOW_ID_RANK_SHIFT = 32
 _FLOW_ID_LOCAL_MASK = (1 << _FLOW_ID_RANK_SHIFT) - 1
-_MAX_SAFE_JSON_INTEGER = (1 << 53) - 1
+_VIZTRACER_PROTON_FLOW_NAME = "viztracer->proton"
+_VIZTRACER_PROTON_FLOW_CATEGORY = "tokenspeed.proton"
+_SCOPE_ID_ARG = "scope_id"
+_VIZTRACER_PROTON_FLOW_TAG = 1 << 52
+_MAX_FLOW_RANK = (_VIZTRACER_PROTON_FLOW_TAG - 1) >> _FLOW_ID_RANK_SHIFT
 
 TracePair = tuple[int, str | Path, str | Path]
 
@@ -125,12 +131,69 @@ def _namespace_proton_flow_id(event: dict[str, Any], rank: int) -> None:
             f"Proton flow ID must be an unsigned 32-bit integer: {flow_id!r}"
         )
 
+    if rank > _MAX_FLOW_RANK:
+        raise ValueError(f"TP rank {rank} is too large to encode in a flow ID")
     namespaced_id = (rank << _FLOW_ID_RANK_SHIFT) | flow_id
-    if namespaced_id > _MAX_SAFE_JSON_INTEGER:
-        raise ValueError(
-            f"TP rank {rank} is too large to encode in a JSON-safe flow ID"
-        )
     event["id"] = namespaced_id
+
+
+def _namespace_viztracer_proton_flow_id(scope_id: int, rank: int) -> int:
+    """Return a numeric rank-local ID reserved for VizTracer-to-Proton flows."""
+    if (
+        not isinstance(scope_id, int)
+        or isinstance(scope_id, bool)
+        or not 0 <= scope_id <= _FLOW_ID_LOCAL_MASK
+    ):
+        raise ValueError(
+            f"Proton scope ID must be an unsigned 32-bit integer: {scope_id!r}"
+        )
+    if rank > _MAX_FLOW_RANK:
+        raise ValueError(f"TP rank {rank} is too large to encode in a flow ID")
+    return _VIZTRACER_PROTON_FLOW_TAG | (rank << _FLOW_ID_RANK_SHIFT) | scope_id
+
+
+def _link_viztracer_to_proton_cpu(
+    viztracer_events: list[dict[str, Any]],
+    proton_events: list[dict[str, Any]],
+    rank: int,
+) -> list[dict[str, Any]]:
+    """Append endpoint flows from VizTracer scope starts to Proton CPU scopes."""
+    proton_cpu_scopes: dict[int, dict[str, Any]] = {}
+    for event in proton_events:
+        args = event.get("args")
+        if not isinstance(args, dict):
+            continue
+        scope_id = args.get(_SCOPE_ID_ARG)
+        if isinstance(scope_id, int) and not isinstance(scope_id, bool):
+            proton_cpu_scopes[scope_id] = event
+
+    finish_events: list[dict[str, Any]] = []
+    for event in viztracer_events:
+        if (
+            event.get("name") != _VIZTRACER_PROTON_FLOW_NAME
+            or event.get("cat") != _VIZTRACER_PROTON_FLOW_CATEGORY
+            or event.get("ph") != "s"
+        ):
+            continue
+        scope_id = event.get("id")
+        proton_cpu_event = proton_cpu_scopes.get(scope_id)
+        if proton_cpu_event is None:
+            continue
+        flow_id = _namespace_viztracer_proton_flow_id(scope_id, rank)
+        event["id"] = flow_id
+        finish_events.append(
+            {
+                "name": _VIZTRACER_PROTON_FLOW_NAME,
+                "cat": _VIZTRACER_PROTON_FLOW_CATEGORY,
+                "ph": "f",
+                "ts": proton_cpu_event["ts"],
+                "pid": proton_cpu_event["pid"],
+                "tid": proton_cpu_event["tid"],
+                "id": flow_id,
+                "bp": "e",
+            }
+        )
+    return finish_events
 
 
 def _prepare_proton_events(
@@ -207,7 +270,11 @@ def merge_proton_viztracer(
     viztracer_base_ns = _viztracer_base_time_ns(viztracer_json, viztracer_path)
     proton_events = _prepare_proton_events(proton_json, proton_path, viztracer_base_ns)
 
-    viztracer_json.setdefault("traceEvents", []).extend(proton_events)
+    viztracer_events = viztracer_json.setdefault("traceEvents", [])
+    viztracer_events.extend(
+        _link_viztracer_to_proton_cpu(viztracer_events, proton_events, 0)
+    )
+    viztracer_events.extend(proton_events)
     _write_json(output_path, viztracer_json)
     return len(proton_events)
 
@@ -276,7 +343,11 @@ def merge_all_ranks(rank_traces: Iterable[TracePair], output_path: str | Path) -
         proton_events = _prepare_proton_events(
             proton_json, proton_path, viztracer_base_ns, rank=rank
         )
-        rank_events = [*viztracer_json.get("traceEvents", []), *proton_events]
+        viztracer_events = viztracer_json.get("traceEvents", [])
+        linked_flow_events = _link_viztracer_to_proton_cpu(
+            viztracer_events, proton_events, rank
+        )
+        rank_events = [*viztracer_events, *proton_events, *linked_flow_events]
         for event in rank_events:
             if event.get("ph") != "M" and "ts" in event:
                 event["ts"] += rank_offset_us
