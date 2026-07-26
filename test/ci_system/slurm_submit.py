@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import html
 import json
 import os
 import re
@@ -24,7 +25,14 @@ from pipeline import build_matrix, normalize_task
 GPU_RE = re.compile(r"(?:^|-)([1-9]\d*)gpu(?:-|$)")
 TASK_TYPES = {"ut", "server_smoke", "eval", "perf"}
 DEFAULT_TASK_TYPES = {"eval", "perf"}
-PR_RE = re.compile(r"^(?:https://github\.com/[^/]+/[^/]+/pull/)?(\d+)(?:/)?$")
+PR_RE = re.compile(
+    r"^(?:https://github\.com/"
+    r"(?P<owner>[A-Za-z0-9._-]+)/(?P<repo>[A-Za-z0-9._-]+)/pull/)?"
+    r"(?P<number>\d+)/?$"
+)
+REPOSITORY_RE = re.compile(r"^(?P<owner>[A-Za-z0-9._-]+)/(?P<repo>[A-Za-z0-9._-]+)$")
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 
 
 @dataclass(frozen=True)
@@ -128,7 +136,29 @@ def parse_pr_number(value: str) -> int:
         raise ValueError(
             "--pr must be a pull request number or GitHub pull request URL"
         )
-    return int(match.group(1))
+    return int(match.group("number"))
+
+
+def source_pr_summary(value: str) -> str:
+    match = PR_RE.fullmatch(value)
+    if not match:
+        raise ValueError(
+            "--pr must be a pull request number or GitHub pull request URL"
+        )
+    number = int(match.group("number"))
+    owner = match.group("owner")
+    repo = match.group("repo")
+    if owner is None or repo is None:
+        repository_match = REPOSITORY_RE.fullmatch(
+            os.environ.get("GITHUB_REPOSITORY", "")
+        )
+        if repository_match:
+            owner = repository_match.group("owner")
+            repo = repository_match.group("repo")
+    if owner is not None and repo is not None:
+        url = f"https://github.com/{owner}/{repo}/pull/{number}"
+        return f"**Target PR:** [#{number}]({url})"
+    return f"**Target PR:** #{number}"
 
 
 @contextlib.contextmanager
@@ -411,9 +441,54 @@ def result_detail(path: Path) -> str:
         check = data["perf_reference_check"]
         return f"perf={'pass' if check['passed'] else 'fail'}"
     command_results = data.get("command_results", [])
+    for command_result in reversed(command_results):
+        if not isinstance(command_result, dict):
+            continue
+        score = command_result.get("evalscope_score")
+        if score is not None:
+            try:
+                return f"score={float(score):g}"
+            except (TypeError, ValueError):
+                continue
     if command_results and command_results[-1].get("pytest_summary"):
         return str(command_results[-1]["pytest_summary"])
     return str(data.get("error", ""))
+
+
+def clean_report_text(value: object) -> str:
+    return CONTROL_RE.sub("", ANSI_ESCAPE_RE.sub("", str(value)))
+
+
+def table_cell(value: object, limit: int = 120) -> str:
+    text = clean_report_text(value)
+    line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    if len(line) > limit:
+        line = line[: limit - 3].rstrip() + "..."
+    return line.replace("\\", "\\\\").replace("|", "\\|")
+
+
+def detail_block(job_id: str, task_name: str, detail: str) -> list[str]:
+    text = clean_report_text(detail)
+    lines = text.splitlines()[:40]
+    body = "\n".join(lines)
+    truncated = len(text.splitlines()) > 40 or len(body) > 4000
+    if len(body) > 4000:
+        body = body[:4000].rstrip()
+    if truncated:
+        body += f"\n[truncated; see {job_id}.log in the artifact]"
+    longest_tilde_run = max((len(run) for run in re.findall(r"~+", body)), default=0)
+    fence = "~" * max(3, longest_tilde_run + 1)
+    title = html.escape(f"Job {job_id} — {task_name}")
+    return [
+        "<details>",
+        f"<summary>{title}</summary>",
+        "",
+        f"{fence}text",
+        body,
+        fence,
+        "</details>",
+        "",
+    ]
 
 
 def write_report(
@@ -421,15 +496,23 @@ def write_report(
     states: dict[str, dict[str, str]],
     run_root: Path,
     report_dir: Path,
+    source_pr: str | None = None,
 ) -> None:
     report_dir.mkdir(parents=True, exist_ok=True)
     rows = []
     summary = [
         "## Slurm validation",
         "",
-        "| Job | Type | Runner | Task | State | Elapsed | Result |",
-        "|---:|---|---|---|---|---:|---|",
     ]
+    if source_pr:
+        summary.extend([source_pr_summary(source_pr), ""])
+    summary.extend(
+        [
+            "| Job | Type | Runner | Task | State | Elapsed | Result |",
+            "|---:|---|---|---|---|---:|---|",
+        ]
+    )
+    details = []
     for submission in submissions:
         state = states.get(
             submission.job_id,
@@ -446,20 +529,40 @@ def write_report(
             "detail": detail,
         }
         rows.append(row)
-        summary.append(
-            f"| {submission.job_id} | {submission.task.task_type} | "
-            f"{submission.task.runner} | {submission.task.name} | "
-            f"{state['state']} | {state['elapsed']} | {detail} |"
-        )
+        display_state = {
+            "COMPLETED": "✅",
+            "FAILED": "❌",
+        }.get(state["state"], state["state"])
+        cells = [
+            submission.job_id,
+            submission.task.task_type,
+            submission.task.runner,
+            submission.task.name,
+            display_state,
+            state["elapsed"],
+            detail,
+        ]
+        summary.append("| " + " | ".join(table_cell(cell) for cell in cells) + " |")
+        if table_cell(detail) != detail:
+            details.extend(
+                detail_block(submission.job_id, submission.task.name, detail)
+            )
         if submission.log.exists():
             shutil.copy2(submission.log, report_dir / f"{submission.job_id}.log")
         if result_path.exists():
             shutil.copy2(result_path, report_dir / f"{submission.job_id}-result.json")
     (report_dir / "manifest.json").write_text(json.dumps(rows, indent=2) + "\n")
+    if details:
+        summary.extend(["", "## Details", "", *details])
     (report_dir / "summary.md").write_text("\n".join(summary) + "\n")
 
 
-def wait_all(submissions: list[Submission], run_root: Path, report_dir: Path) -> bool:
+def wait_all(
+    submissions: list[Submission],
+    run_root: Path,
+    report_dir: Path,
+    source_pr: str | None = None,
+) -> bool:
     job_ids = [submission.job_id for submission in submissions]
     previous_handlers = {}
 
@@ -486,7 +589,7 @@ def wait_all(submissions: list[Submission], run_root: Path, report_dir: Path) ->
             if len(states) == len(job_ids):
                 break
             time.sleep(2)
-        write_report(submissions, states, run_root, report_dir)
+        write_report(submissions, states, run_root, report_dir, source_pr)
         return all(item.get("state") == "COMPLETED" for item in states.values()) and (
             len(states) == len(job_ids)
         )
@@ -582,7 +685,9 @@ def run(args: argparse.Namespace, repo: Path, artifact_root: Path, cache: Path) 
             if args.report_dir
             else artifact_root / "reports" / f"{commit[:12]}-{time.time_ns()}"
         )
-        completed = wait_all(submitted, artifact_root / "runs", report_dir)
+        completed = wait_all(
+            submitted, artifact_root / "runs", report_dir, source_pr=args.pr
+        )
         print(f"Report: {report_dir}")
         return 0 if completed else 1
     if args.follow:
