@@ -157,7 +157,7 @@ class HostKVCache(abc.ABC):
         self.page_num = self.size // self.page_size + 1
         self.size = self.page_num * self.page_size
 
-        if self.size > device_pool.size:
+        if self.size < device_pool.size:
             logger.warning(
                 "The host memory is less than the device memory with the current protocol"
             )
