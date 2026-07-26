@@ -433,6 +433,14 @@ def get_ready_port(ready: Dict[str, Any]) -> int | None:
     return parsed.port
 
 
+def configure_slurm_server_command(command: str, timeout: int) -> str:
+    """Keep the TokenSpeed engine deadline aligned with Slurm readiness."""
+    tokens = shlex.split(command)
+    if tokens[:2] != ["ts", "serve"] or "--engine-startup-timeout" in tokens:
+        return command
+    return f"{command} --engine-startup-timeout {timeout}"
+
+
 def kill_port_listeners(
     port: int,
     env: Dict[str, str],
@@ -1536,8 +1544,12 @@ def execute_task(
             stages_run.append(stage_name)
             if stage_name == "server":
                 ready = dict(stage_payload["ready"])
+                server_command = stage_payload["command"]
                 if setup_mode == "slurm":
                     ready["timeout"] = max(int(ready.get("timeout", 600)), 7200)
+                    server_command = configure_slurm_server_command(
+                        server_command, int(ready["timeout"])
+                    )
                 if enable_perf_diagnostics:
                     run_perf_diagnostics(
                         "before server", runner_env, repo_root, dry_run
@@ -1553,7 +1565,7 @@ def execute_task(
                 if pgm is not None:
                     server_process = pgm.start(
                         wrap_command_with_log(
-                            stage_payload["command"],
+                            server_command,
                             server_log_path,
                             login_shell=False,
                         ),
@@ -1563,9 +1575,7 @@ def execute_task(
                     )
                 else:
                     server_process = start_server(
-                        wrap_command_with_log(
-                            stage_payload["command"], server_log_path
-                        ),
+                        wrap_command_with_log(server_command, server_log_path),
                         runner_env,
                         repo_root,
                         dry_run,

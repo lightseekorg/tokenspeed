@@ -11,6 +11,7 @@ from pipeline import (
     build_step_summary_lines,
     check_eval_score_threshold,
     check_perf_reference,
+    configure_slurm_server_command,
     ensure_ready_port_available,
     extract_evalscope_score,
     extract_perf_summary_rows,
@@ -1044,3 +1045,12 @@ def test_perf_reference_table_rendered_for_passing_check(capsys):
     assert "[perf-ref]   Conc" in out
     assert "[perf-ref]   ---" in out
     assert "%" in out
+
+
+def test_slurm_server_command_inherits_readiness_timeout():
+    assert configure_slurm_server_command("ts serve --model example", 7200) == (
+        "ts serve --model example --engine-startup-timeout 7200"
+    )
+    explicit = "ts serve --model example --engine-startup-timeout 300"
+    assert configure_slurm_server_command(explicit, 7200) == explicit
+    assert configure_slurm_server_command("python serve.py", 7200) == "python serve.py"
