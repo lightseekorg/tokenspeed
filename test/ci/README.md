@@ -222,16 +222,23 @@ Markdown summary, per-job logs, and available `result.json` files under
 `PATH`. The command succeeds only when every job reaches `COMPLETED`. SIGINT or
 SIGTERM while waiting calls `scancel` for the jobs submitted by that command.
 
-The manual `Slurm Dispatch` GitHub workflow runs on a self-hosted runner with
-the `slurm-dispatch` label. That runner belongs on the Slurm coordinator and
+The manual `Slurm Dispatch` GitHub workflow runs on the organization runner
+with the `slurm-dispatch` label. That runner belongs on the Slurm coordinator and
 only needs GitHub runner prerequisites, this repository, Python/PyYAML, and
-Slurm client commands; it does not need GPUs. From the Actions UI, provide a PR,
+Slurm client commands; it does not need GPUs. Leaving the PR input blank checks
+out and runs the latest `main`; otherwise the requested PR is merged into that
+trusted `main` checkout. From the Actions UI, optionally provide a PR,
 comma-separated runner labels and task types, and an optional comma-separated
 task/model filter. The workflow submits the selected matrix, waits for all
 jobs, writes the aggregate table to the GitHub step summary, and uploads the
 collected report directory as an artifact. It excludes long-running MMLU tasks
 by default; explicitly enable `include_mmlu` in the manual workflow inputs when
 that coverage is required.
+
+The `yaml` input is `off` by default. Select one listed B200/GB200 CI YAML to
+run that YAML independently of the bulk runner, type, match, trigger, and MMLU
+filters. Every B200 or GB200 runner label declared by the selected YAML is
+submitted as its own Slurm job.
 
 The dispatcher checkout is trusted control-plane code. The requested PR is
 merged only in the submitter's temporary worktree and runs from its immutable
