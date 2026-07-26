@@ -12,6 +12,7 @@ env:
 install:
   - bash test/ci_system/install_deps.sh
 server:
+  # Temporary NFS cold-load headroom; revert after the startup bottleneck is fixed.
   command: >-
     ts serve
     --model nvidia/Kimi-K2.5-NVFP4
@@ -29,6 +30,7 @@ server:
     --speculative-num-steps 1
     --drafter-attention-backend tokenspeed_mla
     --enable-cache-report
+    --engine-startup-timeout 2400
     --host 127.0.0.1
     --port 8000
   ready:
