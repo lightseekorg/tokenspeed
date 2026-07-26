@@ -37,6 +37,7 @@ from tokenspeed.runtime.cache.kv_cache_host import (
     DSATokenToKVPoolHost,
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
+    MSATokenToKVPoolHost,
     get_available_host_memory_bytes,
 )
 from tokenspeed.runtime.cache.mamba_cache_host import MambaPoolHost
@@ -50,6 +51,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
 from tokenspeed.runtime.layers.attention.kv_cache.dsa import DSATokenToKVPool
 from tokenspeed.runtime.layers.attention.kv_cache.mha import MHATokenToKVPool
 from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
+from tokenspeed.runtime.layers.attention.kv_cache.msa import MSATokenToKVPool
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
@@ -115,6 +117,13 @@ def _pool_size_per_token(pool) -> int:
             (pool.kv_lora_rank + pool.qk_rope_head_dim) * dtype_size * pool.layer_num
         )
         return latent_size + pool.index_k_row_bytes * pool.layer_num
+    if isinstance(pool, MSATokenToKVPool):
+        return (
+            pool.head_dim * pool.head_num * pool.layer_num * dtype_size * 2
+            + pool.index_head_dim
+            * len(pool.indexed_layer_ids)
+            * pool.index_dtype.itemsize
+        )
     if isinstance(pool, MHATokenToKVPool):
         return pool.head_dim * pool.head_num * pool.layer_num * dtype_size * 2
     if isinstance(pool, MLATokenToKVPool):
@@ -268,6 +277,15 @@ class MemoryExecutor:
                     config.host_layout,
                     host_size_tokens=host_size_tokens,
                 )
+            elif isinstance(actual_pool, MSATokenToKVPool):
+                self.host_pool = MSATokenToKVPoolHost(
+                    actual_pool,
+                    config.host_ratio,
+                    config.host_size_gb,
+                    config.page_size,
+                    config.host_layout,
+                    host_size_tokens=host_size_tokens,
+                )
             elif isinstance(actual_pool, MHATokenToKVPool):
                 self.host_pool = MHATokenToKVPoolHost(
                     actual_pool,
@@ -288,7 +306,7 @@ class MemoryExecutor:
                 )
             else:
                 raise ValueError(
-                    "host_pool only supports DSA, MHA, MLA, and DeepSeek V4, "
+                    "host_pool only supports DSA, MSA, MHA, MLA, and DeepSeek V4, "
                     f"got {type(actual_pool)} from module {type(actual_pool).__module__}"
                 )
 
@@ -298,6 +316,15 @@ class MemoryExecutor:
         if actual_draft_pool is not None and self.paged_cache_pool is None:
             if isinstance(actual_draft_pool, DSATokenToKVPool):
                 self.draft_host_pool = DSATokenToKVPoolHost(
+                    actual_draft_pool,
+                    config.host_ratio,
+                    config.host_size_gb,
+                    config.page_size,
+                    config.host_layout,
+                    host_size_tokens=self.host_pool.size,
+                )
+            elif isinstance(actual_draft_pool, MSATokenToKVPool):
+                self.draft_host_pool = MSATokenToKVPoolHost(
                     actual_draft_pool,
                     config.host_ratio,
                     config.host_size_gb,

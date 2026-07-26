@@ -35,6 +35,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
 from tokenspeed.runtime.layers.attention.kv_cache.dsa import DSATokenToKVPool
 from tokenspeed.runtime.layers.attention.kv_cache.mha import MHATokenToKVPool
 from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
+from tokenspeed.runtime.layers.attention.kv_cache.msa import MSATokenToKVPool
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
@@ -968,6 +969,156 @@ class DSATokenToKVPoolHost(MLATokenToKVPoolHost):
             transfer_kv_direct(
                 src_layers=list(device_pool.index_k_buffer),
                 dst_layers=self.index_k_refs,
+                src_indices=device_indices,
+                dst_indices=host_indices,
+                page_size=self.page_size,
+            )
+        else:
+            raise ValueError(f"Unsupported IO backend: {io_backend}")
+
+
+class MSATokenToKVPoolHost(MHATokenToKVPoolHost):
+    """MHA host pool with index-K side cache for MiniMax sparse attention."""
+
+    device_pool: MSATokenToKVPool
+
+    def __init__(
+        self,
+        device_pool,
+        host_to_device_ratio,
+        host_size,
+        page_size,
+        layout,
+        device="cpu",
+        host_size_tokens=0,
+    ):
+        super().__init__(
+            device_pool,
+            host_to_device_ratio,
+            host_size,
+            page_size,
+            layout,
+            device,
+            host_size_tokens,
+        )
+
+        self.index_k_host_buffer: dict[int, torch.Tensor] = {}
+        for layer_id in sorted(device_pool.indexed_layer_ids):
+            buf = torch.empty(
+                (self.size, device_pool.index_head_dim),
+                dtype=device_pool.index_dtype,
+                device=self.device,
+            )
+            current_platform().register_host_tensor_for_gpu_access(buf)
+            self.index_k_host_buffer[layer_id] = buf
+
+        self.index_k_row_bytes = (
+            device_pool.index_head_dim * device_pool.index_dtype.itemsize
+        )
+
+        self.index_k_data_refs = [
+            self.index_k_host_buffer[layer_id]
+            for layer_id in sorted(device_pool.indexed_layer_ids)
+        ]
+        self.index_k_data_ptrs = torch.tensor(
+            [
+                current_platform().device_visible_data_ptr(x)
+                for x in self.index_k_data_refs
+            ],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
+
+    def get_size_per_token(self):
+        base = super().get_size_per_token()
+        index_k_bytes = (
+            self.device_pool.index_head_dim
+            * self.device_pool.index_dtype.itemsize
+            * len(self.device_pool.indexed_layer_ids)
+        )
+        return base + index_k_bytes
+
+    def get_ksize_per_token(self):
+        # K-only bytes: MHA K + index-K (index-K is key-side)
+        base = super().get_size_per_token() // 2
+        index_k_bytes = (
+            self.device_pool.index_head_dim
+            * self.device_pool.index_dtype.itemsize
+            * len(self.device_pool.indexed_layer_ids)
+        )
+        return base + index_k_bytes
+
+    def load_to_device_per_layer(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+    ):
+        # Parent handles K/V transfer.
+        super().load_to_device_per_layer(
+            device_pool, host_indices, device_indices, layer_id, io_backend
+        )
+        # Transfer index-K for sparse layers (CPU → GPU).
+        if layer_id not in self.index_k_host_buffer:
+            return
+        if io_backend == "kernel":
+            transfer_kv_per_layer_mla(
+                src=self.index_k_host_buffer[layer_id],
+                dst=device_pool.index_k_buffer[layer_id],
+                src_indices=host_indices,
+                dst_indices=device_indices,
+                item_size=self.index_k_row_bytes,
+                block_quota=MLA_KVSTORE_LOADBACK_BLOCK_QUOTA,
+            )
+        elif io_backend == "direct":
+            transfer_kv_direct(
+                src_layers=[self.index_k_host_buffer[layer_id]],
+                dst_layers=[device_pool.index_k_buffer[layer_id]],
+                src_indices=host_indices,
+                dst_indices=device_indices,
+                page_size=self.page_size,
+            )
+        else:
+            raise ValueError(f"Unsupported IO backend: {io_backend}")
+
+    def backup_from_device_all_layer(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        io_backend,
+        block_quota: int | None = None,
+    ):
+        super().backup_from_device_all_layer(
+            device_pool,
+            host_indices,
+            device_indices,
+            io_backend,
+            block_quota=block_quota,
+        )
+        if not self.index_k_host_buffer:
+            return
+        if io_backend == "kernel":
+            if block_quota is None:
+                block_quota = MLA_KVSTORE_WRITEBACK_BLOCK_QUOTA
+            transfer_kv_all_layer_mla(
+                src_layers=device_pool.index_k_data_ptrs,
+                dst_layers=self.index_k_data_ptrs,
+                src_indices=device_indices,
+                dst_indices=host_indices,
+                item_size=self.index_k_row_bytes,
+                num_layers=len(self.index_k_data_refs),
+                block_quota=block_quota,
+            )
+        elif io_backend == "direct":
+            transfer_kv_direct(
+                src_layers=[
+                    device_pool.index_k_buffer[layer_id]
+                    for layer_id in sorted(device_pool.indexed_layer_ids)
+                ],
+                dst_layers=self.index_k_data_refs,
                 src_indices=device_indices,
                 dst_indices=host_indices,
                 page_size=self.page_size,

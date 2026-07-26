@@ -13,8 +13,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.mha import MHATokenToKVPool
 class MSATokenToKVPool(MHATokenToKVPool):
     """MHA K/V cache plus a key-only sparse-index side cache."""
 
-    supports_hierarchical_kv_cache = False
-
     def __init__(
         self,
         *,
@@ -70,6 +68,15 @@ class MSATokenToKVPool(MHATokenToKVPool):
                 )
                 for layer_id in sorted(self.indexed_layer_ids)
             }
+        # Device-side pointer table for index-K host offload transfers.
+        self.index_k_data_ptrs = torch.tensor(
+            [
+                self.index_k_buffer[layer_id].data_ptr()
+                for layer_id in sorted(self.indexed_layer_ids)
+            ],
+            dtype=torch.uint64,
+            device=self.device,
+        )
 
     def get_index_k_buffer(self, layer_id: int) -> torch.Tensor:
         if self.layer_transfer_counter is not None:
