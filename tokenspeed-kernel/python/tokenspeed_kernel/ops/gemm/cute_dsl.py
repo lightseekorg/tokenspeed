@@ -20,6 +20,8 @@
 
 from __future__ import annotations
 
+import functools
+import itertools
 from typing import Optional, Tuple
 
 from tokenspeed_kernel.platform import current_platform
@@ -34,93 +36,271 @@ if platform.is_nvidia:
     import cutlass
     import cutlass.cute as cute
     import torch
+    from flashinfer.autotuner import (
+        AutoTuner,
+        ConstraintSpec,
+        DynamicTensorSpec,
+        TunableRunner,
+        TuningConfig,
+        autotuner_initializer_empty,
+    )
     from flashinfer.cute_dsl.utils import (
         get_cutlass_dtype,
         get_max_active_clusters,
         make_ptr,
+    )
+    from flashinfer.fused_moe.utils import (
+        get_hybrid_num_tokens_buckets,
+        map_to_hybrid_bucket_uncapped,
     )
     from flashinfer.utils import get_compute_capability
     from tokenspeed_kernel.thirdparty.cute_dsl.nvfp4_gemm_swiglu_nvfp4_quant import (
         Sm100BlockScaledPersistentDenseGemmKernel,
     )
 
-    _nvfp4_gemm_swiglu_nvfp4_quant_kernel_cache: dict[tuple, object] = {}
-
     def _round_up(value: int, multiple: int) -> int:
         return (value + multiple - 1) // multiple * multiple
 
-    def _get_compiled_nvfp4_gemm_swiglu_nvfp4_quant_kernel(
-        *,
-        a_ptr,
-        b_ptr,
-        a_sf_ptr,
-        b_sf_ptr,
-        c_ptr,
-        c_sf_ptr,
-        alpha_ptr,
-        norm_const_ptr,
-        m: int,
-        n: int,
-        k: int,
-        l: int,
-        max_active_clusters: int,
-        stream,
-        ab_dtype: str,
-        sf_dtype: str,
-        c_dtype: str,
-        sf_vec_size: int,
-        mma_tiler_mn: Tuple[int, int],
-        cluster_shape_mn: Tuple[int, int],
-        use_prefetch: bool,
-        prefetch_dist: int,
-        vectorized_f32: bool,
-        enable_pdl: bool,
-    ):
-        cache_key = (
-            n,
-            k,
-            ab_dtype,
-            sf_dtype,
-            c_dtype,
-            sf_vec_size,
-            mma_tiler_mn,
-            cluster_shape_mn,
-            use_prefetch,
-            prefetch_dist,
-            vectorized_f32,
-            enable_pdl,
+    def _init_packed_fp4(shapes, dtype, device):
+        """Autotuner initializer for FP4-packed operands."""
+        return torch.randint(0, 256, shapes, dtype=dtype, device=device)
+
+    class _Nvfp4GemmSwigluNvfp4QuantRunner(TunableRunner):
+        """Autotuner adapter over the fused NVFP4 FC1 kernel.
+
+        A tactic is a ``(mma_tiler_mn, cluster_shape_mn)`` pair drawn from
+        :attr:`TACTICS`; ``-1`` is the mandatory fallback and reproduces
+        :meth:`_heuristic_tactic`. Instances are
+        stateless with respect to the problem shape -- M, N and K are read back
+        from ``inputs`` -- so one instance per compile-option set is enough,
+        which is what keeps the autotuner's per-runner caches stable.
+        """
+
+        # tile_n=64 is excluded: can_implement() accepts it but the vendored
+        # kernel then writes a wrong result.
+        MMA_TILER_MN_CANDIDATES = ((128, 128), (256, 128), (128, 256), (256, 256))
+        CLUSTER_N_CANDIDATES = (1, 2, 4)
+
+        # cluster_m is derived rather than swept: can_implement() requires it to
+        # be 1 for a 1-CTA tile and even for a 2-CTA one, and cluster_m=4 never
+        # won a cell in the standalone sweep.
+        TACTICS: Tuple[Tuple[Tuple[int, int], Tuple[int, int]], ...] = tuple(
+            (mma_tiler_mn, (mma_tiler_mn[0] // 128, cluster_n))
+            for mma_tiler_mn, cluster_n in itertools.product(
+                MMA_TILER_MN_CANDIDATES, CLUSTER_N_CANDIDATES
+            )
         )
 
-        if cache_key not in _nvfp4_gemm_swiglu_nvfp4_quant_kernel_cache:
-            gemm = Sm100BlockScaledPersistentDenseGemmKernel(
-                sf_vec_size=sf_vec_size,
-                mma_tiler_mn=mma_tiler_mn,
-                cluster_shape_mn=cluster_shape_mn,
-                use_prefetch=use_prefetch,
-                prefetch_dist=prefetch_dist,
-                vectorized_f32=vectorized_f32,
+        _kernel_cache: dict[tuple, object] = {}
+
+        def __init__(
+            self,
+            ab_dtype: str,
+            sf_dtype: str,
+            c_dtype: str,
+            sf_vec_size: int,
+            use_prefetch: bool,
+            prefetch_dist: int,
+            vectorized_f32: bool,
+            enable_pdl: bool,
+        ):
+            self.ab_dtype = ab_dtype
+            self.sf_dtype = sf_dtype
+            self.c_dtype = c_dtype
+            self.sf_vec_size = sf_vec_size
+            self.use_prefetch = use_prefetch
+            self.prefetch_dist = prefetch_dist
+            self.vectorized_f32 = vectorized_f32
+            self.enable_pdl = enable_pdl
+
+        @classmethod
+        @functools.lru_cache(maxsize=None)
+        def get(
+            cls,
+            ab_dtype: str,
+            sf_dtype: str,
+            c_dtype: str,
+            sf_vec_size: int,
+            use_prefetch: bool,
+            prefetch_dist: int,
+            vectorized_f32: bool,
+            enable_pdl: bool,
+        ) -> "_Nvfp4GemmSwigluNvfp4QuantRunner":
+            """Memoized runner for one set of compile-time options."""
+            return cls(
+                ab_dtype,
+                sf_dtype,
+                c_dtype,
+                sf_vec_size,
+                use_prefetch,
+                prefetch_dist,
+                vectorized_f32,
+                enable_pdl,
             )
-            _nvfp4_gemm_swiglu_nvfp4_quant_kernel_cache[cache_key] = cute.compile(
-                gemm.wrapper,
-                a_ptr,
-                b_ptr,
-                a_sf_ptr,
-                b_sf_ptr,
-                c_ptr,
-                c_sf_ptr,
-                alpha_ptr,
-                norm_const_ptr,
+
+        def _key(self) -> tuple:
+            return (
+                self.ab_dtype,
+                self.sf_dtype,
+                self.c_dtype,
+                self.sf_vec_size,
+                self.use_prefetch,
+                self.prefetch_dist,
+                self.vectorized_f32,
+                self.enable_pdl,
+            )
+
+        def __hash__(self) -> int:
+            return hash(self._key())
+
+        def __eq__(self, other: object) -> bool:
+            return (
+                isinstance(other, _Nvfp4GemmSwigluNvfp4QuantRunner)
+                and self._key() == other._key()
+            )
+
+        def get_cache_key_extras(self, inputs) -> tuple:
+            return self._key()
+
+        @staticmethod
+        def _heuristic_tactic(m: int) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+            """Tile/cluster pick used when no tuned entry is available."""
+            if m <= 128:
+                return (128, 128), (1, 2)
+            return (256, 128), (2, 1)
+
+        @staticmethod
+        def _mnk(inputs) -> Tuple[int, int, int]:
+            a, b = inputs[0], inputs[2]
+            return a.shape[0], b.shape[0], a.shape[1] * 2
+
+        def _can_implement(
+            self,
+            mma_tiler_mn: Tuple[int, int],
+            cluster_shape_mn: Tuple[int, int],
+            m: int,
+            n: int,
+            k: int,
+        ) -> bool:
+            return Sm100BlockScaledPersistentDenseGemmKernel.can_implement(
+                get_cutlass_dtype(self.ab_dtype),
+                get_cutlass_dtype(self.sf_dtype),
+                self.sf_vec_size,
+                get_cutlass_dtype(self.c_dtype),
+                mma_tiler_mn,
+                cluster_shape_mn,
                 m,
                 n,
                 k,
-                l,
-                scaling_vector_size=sf_vec_size,
-                max_active_clusters=max_active_clusters,
-                stream=stream,
-                use_pdl=enable_pdl,
+                1,
+                a_major="k",
+                b_major="k",
+                c_major="n",
             )
 
-        return _nvfp4_gemm_swiglu_nvfp4_quant_kernel_cache[cache_key]
+        def get_valid_tactics(self, inputs, profile) -> list:
+            m, n, k = self._mnk(inputs)
+            return [t for t in self.TACTICS if self._can_implement(*t, m, n, k)]
+
+        def _compile(
+            self,
+            ptrs: dict,
+            m: int,
+            n: int,
+            k: int,
+            mma_tiler_mn: Tuple[int, int],
+            cluster_shape_mn: Tuple[int, int],
+            stream,
+        ):
+            """Compile-and-cache the kernel; M stays dynamic so it is not keyed."""
+            cache_key = (*self._key(), n, k, mma_tiler_mn, cluster_shape_mn)
+            if cache_key not in self._kernel_cache:
+                gemm = Sm100BlockScaledPersistentDenseGemmKernel(
+                    sf_vec_size=self.sf_vec_size,
+                    mma_tiler_mn=mma_tiler_mn,
+                    cluster_shape_mn=cluster_shape_mn,
+                    use_prefetch=self.use_prefetch,
+                    prefetch_dist=self.prefetch_dist,
+                    vectorized_f32=self.vectorized_f32,
+                )
+                self._kernel_cache[cache_key] = cute.compile(
+                    gemm.wrapper,
+                    *ptrs.values(),
+                    m,
+                    n,
+                    k,
+                    1,
+                    scaling_vector_size=self.sf_vec_size,
+                    max_active_clusters=get_max_active_clusters(
+                        cluster_shape_mn[0] * cluster_shape_mn[1]
+                    ),
+                    stream=stream,
+                    use_pdl=self.enable_pdl,
+                )
+            return self._kernel_cache[cache_key]
+
+        def _make_ptrs(self, inputs) -> dict:
+            a, a_scale, b, b_scale, alpha, output_global_scale, out, out_scale = inputs
+            ab = get_cutlass_dtype(self.ab_dtype)
+            sf = get_cutlass_dtype(self.sf_dtype)
+            c = get_cutlass_dtype(self.c_dtype)
+            gmem = cute.AddressSpace.gmem
+            # Order matches Sm100BlockScaledPersistentDenseGemmKernel.wrapper.
+            return {
+                "a": make_ptr(ab, a.data_ptr(), gmem, assumed_align=32),
+                "b": make_ptr(ab, b.data_ptr(), gmem, assumed_align=32),
+                "a_sf": make_ptr(sf, a_scale.data_ptr(), gmem, assumed_align=16),
+                "b_sf": make_ptr(sf, b_scale.data_ptr(), gmem, assumed_align=16),
+                "c": make_ptr(c, out.data_ptr(), gmem, assumed_align=32),
+                "c_sf": make_ptr(sf, out_scale.data_ptr(), gmem, assumed_align=16),
+                "alpha": make_ptr(cutlass.Float32, alpha.data_ptr(), gmem),
+                "norm_const": make_ptr(
+                    cutlass.Float32, output_global_scale.data_ptr(), gmem
+                ),
+            }
+
+        def forward(self, inputs, tactic=-1, do_preparation: bool = False):
+            m, n, k = self._mnk(inputs)
+
+            if tactic is not None and tactic != -1:
+                mma_tiler_mn, cluster_shape_mn = tactic
+            else:
+                mma_tiler_mn, cluster_shape_mn = self._heuristic_tactic(m)
+                if not self._can_implement(mma_tiler_mn, cluster_shape_mn, m, n, k):
+                    raise ValueError(
+                        "Unsupported nvfp4_gemm_swiglu_nvfp4_quant configuration: "
+                        f"shape=(M={m}, N={n}, K={k}), mma_tiler_mn={mma_tiler_mn}, "
+                        f"cluster_shape_mn={cluster_shape_mn}"
+                    )
+
+            ptrs = self._make_ptrs(inputs)
+            stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+            compiled_gemm = self._compile(
+                ptrs, m, n, k, mma_tiler_mn, cluster_shape_mn, stream
+            )
+            compiled_gemm(*ptrs.values(), m, n, k, 1, stream=stream)
+            return inputs[6], inputs[7]
+
+        # Scale tensors are padded derivations of M, so they are constrained
+        # rather than tuned; the autotuner's default initializer handles their
+        # dtype. Cold L2 matches the conditions this GEMM meets in a decode
+        # step, as in flashinfer's own CuteDSL tuning configs.
+        TUNING_CONFIG = TuningConfig(
+            dynamic_tensor_specs=(
+                DynamicTensorSpec(
+                    (0, 6),  # a, out
+                    (0, 0),
+                    get_hybrid_num_tokens_buckets,
+                    map_to_hybrid_bucket_uncapped,
+                    [_init_packed_fp4, autotuner_initializer_empty],
+                ),
+            ),
+            constraint_specs=(
+                ConstraintSpec(1, 0, lambda shapes: _round_up(shapes[0][0], 128)),
+                ConstraintSpec(7, 0, lambda shapes: _round_up(shapes[0][0], 128)),
+            ),
+            use_cold_l2_cache=True,
+        )
 
     def nvfp4_gemm_swiglu_nvfp4_quant(
         a: torch.Tensor,
@@ -177,7 +357,6 @@ if platform.is_nvidia:
         if n % 2 != 0:
             raise ValueError(f"Interleaved FC1 N must be even, got {n}")
 
-        l = 1
         n_out = n // 2
         if n_out % sf_vec_size != 0:
             raise ValueError(
@@ -186,37 +365,6 @@ if platform.is_nvidia:
         scale_n_out = n_out // sf_vec_size
         padded_m = _round_up(m, 128)
         padded_scale_n = _round_up(scale_n_out, 4)
-
-        ab_dtype_cutlass = get_cutlass_dtype(ab_dtype)
-        sf_dtype_cutlass = get_cutlass_dtype(sf_dtype)
-        c_dtype_cutlass = get_cutlass_dtype(c_dtype)
-
-        # Select the tile shape from the current M dimension.
-        if m <= 128:
-            mma_tiler_mn, cluster_shape_mn = (128, 128), (1, 2)
-        else:
-            mma_tiler_mn, cluster_shape_mn = (256, 128), (2, 1)
-
-        if not Sm100BlockScaledPersistentDenseGemmKernel.can_implement(
-            ab_dtype_cutlass,
-            sf_dtype_cutlass,
-            sf_vec_size,
-            c_dtype_cutlass,
-            mma_tiler_mn,
-            cluster_shape_mn,
-            m,
-            n,
-            k,
-            l,
-            a_major="k",
-            b_major="k",
-            c_major="n",
-        ):
-            raise ValueError(
-                "Unsupported nvfp4_gemm_swiglu_nvfp4_quant configuration: "
-                f"shape=(M={m}, N={n}, K={k}), mma_tiler_mn={mma_tiler_mn}, "
-                f"cluster_shape_mn={cluster_shape_mn}"
-            )
 
         if out is None:
             out = torch.empty((m, n_out // 2), dtype=torch.uint8, device=a.device)
@@ -234,96 +382,24 @@ if platform.is_nvidia:
         if output_global_scale.dim() == 0:
             output_global_scale = output_global_scale.view(1)
 
-        a_ptr = make_ptr(
-            ab_dtype_cutlass,
-            a.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=32,
+        runner = _Nvfp4GemmSwigluNvfp4QuantRunner.get(
+            ab_dtype,
+            sf_dtype,
+            c_dtype,
+            sf_vec_size,
+            use_prefetch,
+            prefetch_dist,
+            vectorized_f32,
+            bool(enable_pdl),
         )
-        b_ptr = make_ptr(
-            ab_dtype_cutlass,
-            b.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=32,
+        inputs = [a, a_scale, b, b_scale, alpha, output_global_scale, out, out_scale]
+        chosen, tactic = AutoTuner.get().choose_one(
+            custom_op="nvfp4_gemm_swiglu_nvfp4_quant",
+            runners=[runner],
+            tuning_config=_Nvfp4GemmSwigluNvfp4QuantRunner.TUNING_CONFIG,
+            inputs=inputs,
         )
-        a_sf_ptr = make_ptr(
-            sf_dtype_cutlass,
-            a_scale.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        )
-        b_sf_ptr = make_ptr(
-            sf_dtype_cutlass,
-            b_scale.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        )
-        c_ptr = make_ptr(
-            c_dtype_cutlass,
-            out.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=32,
-        )
-        c_sf_ptr = make_ptr(
-            sf_dtype_cutlass,
-            out_scale.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        )
-        alpha_ptr = make_ptr(cutlass.Float32, alpha.data_ptr(), cute.AddressSpace.gmem)
-        norm_const_ptr = make_ptr(
-            cutlass.Float32,
-            output_global_scale.data_ptr(),
-            cute.AddressSpace.gmem,
-        )
-
-        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-        max_active_clusters = get_max_active_clusters(
-            cluster_shape_mn[0] * cluster_shape_mn[1]
-        )
-
-        compiled_gemm = _get_compiled_nvfp4_gemm_swiglu_nvfp4_quant_kernel(
-            a_ptr=a_ptr,
-            b_ptr=b_ptr,
-            a_sf_ptr=a_sf_ptr,
-            b_sf_ptr=b_sf_ptr,
-            c_ptr=c_ptr,
-            c_sf_ptr=c_sf_ptr,
-            alpha_ptr=alpha_ptr,
-            norm_const_ptr=norm_const_ptr,
-            m=m,
-            n=n,
-            k=k,
-            l=l,
-            max_active_clusters=max_active_clusters,
-            stream=stream,
-            ab_dtype=ab_dtype,
-            sf_dtype=sf_dtype,
-            c_dtype=c_dtype,
-            sf_vec_size=sf_vec_size,
-            mma_tiler_mn=mma_tiler_mn,
-            cluster_shape_mn=cluster_shape_mn,
-            use_prefetch=use_prefetch,
-            prefetch_dist=prefetch_dist,
-            vectorized_f32=vectorized_f32,
-            enable_pdl=bool(enable_pdl),
-        )
-
-        compiled_gemm(
-            a_ptr,
-            b_ptr,
-            a_sf_ptr,
-            b_sf_ptr,
-            c_ptr,
-            c_sf_ptr,
-            alpha_ptr,
-            norm_const_ptr,
-            m,
-            n,
-            k,
-            l,
-            stream=stream,
-        )
+        chosen(inputs=inputs, tactic=tactic)
         return out, out_scale
 
 
