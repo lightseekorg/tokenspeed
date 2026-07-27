@@ -4,9 +4,43 @@ on:
   workflow_dispatch:
     inputs:
       pr:
-        description: "Pull request number or GitHub pull request URL"
-        required: true
+        description: "Optional pull request number or URL; blank runs latest main"
+        required: false
+        default: ""
         type: string
+      yaml:
+        description: "Optional single B200/GB200 CI YAML"
+        required: true
+        default: "off"
+        type: choice
+        options:
+          - "off"
+          - test/ci/eval/deepseek-v4-flash-evalscope-gsm8k.yaml
+          - test/ci/eval/deepseek-v4-flash-mtp-evalscope-gsm8k.yaml
+          - test/ci/eval/glm-5.2-nvfp4-mtp-evalscope-aime26.yaml
+          - test/ci/eval/gpt-oss-120b-mxfp4-evalscope-gpqa-diamond.yaml
+          - test/ci/eval/inkling-nvfp4-mtp-evalscope-gsm8k.yaml
+          - test/ci/eval/kimi-k2.5-nvfp4-dflash-evalscope-aime25.yaml
+          - test/ci/eval/kimi-k2.5-nvfp4-eagle3-evalscope-aime25.yaml
+          - test/ci/eval/kimi-k2.5-nvfp4-eagle3-evalscope-gpqa-diamond.yaml
+          - test/ci/eval/kimi-k2.5-nvfp4-eagle3-evalscope-gsm8k.yaml
+          - test/ci/eval/kimi-k2.5-nvfp4-eagle3-evalscope-mmlu.yaml
+          - test/ci/eval/kimi-k2.5-nvfp4-eagle3-evalscope-ocr-bench.yaml
+          - test/ci/eval/minimax-m3-nvfp4-evalscope-aime25.yaml
+          - test/ci/eval/qwen3.5-122b-a10b-nvfp4-epd-1e1p2d-evalscope-ocr-bench.yaml
+          - test/ci/eval/qwen3.5-122b-a10b-nvfp4-evalscope-ocr-bench.yaml
+          - test/ci/eval/qwen3.5-397b-a17b-nvfp4-dp4ep4-evalscope-aime25.yaml
+          - test/ci/eval/qwen3.5-397b-a17b-nvfp4-evalscope-aime25.yaml
+          - test/ci/eval/qwen3.5-397b-a17b-nvfp4-pd-1p1d-evalscope-aime25.yaml
+          - test/ci/perf/qwen3.5-397b-a17b-nvfp4-evalscope-agentic-b200-8gpu.yaml
+          - test/ci/perf/qwen3.5-397b-a17b-nvfp4-evalscope-agentic.yaml
+          - test/ci/perf/qwen3.5-397b-a17b-nvfp4-evalscope-longctx.yaml
+          - test/ci/ut/qwen3.5-122b-a10b-nvfp4-epd-1e1p2d.yaml
+          - test/ci/ut/qwen3.5-397b-a17b-nvfp4-pd-1p1d.yaml
+          - test/ci/ut/ut-runtime-1gpu.yaml
+          - test/ci/ut/ut-runtime-2gpu.yaml
+          - test/ci/ut/ut-runtime-prefix-cache-e2e.yaml
+          - test/ci/ut/ut-tokenspeed-kernel.yaml
       runners:
         description: "Comma-separated exact runner labels"
         required: true
@@ -38,7 +72,7 @@ on:
           - debug
 
 concurrency:
-  group: slurm-dispatch-${{ inputs.pr }}-${{ inputs.runners }}-${{ inputs.match }}
+  group: slurm-dispatch-${{ inputs.pr || 'main' }}-${{ inputs.yaml }}-${{ inputs.runners }}-${{ inputs.match }}
   cancel-in-progress: false
 
 jobs:
@@ -54,12 +88,14 @@ jobs:
         uses: actions/checkout@v4
         with:
           # pr_worktree fetches and merges the requested private-repo PR below.
+          ref: main
           fetch-depth: 0
           persist-credentials: true
 
       - name: Submit and wait for Slurm tasks
         env:
           PR: ${{ inputs.pr }}
+          YAML_SELECTION: ${{ inputs.yaml }}
           RUNNERS: ${{ inputs.runners }}
           TASK_TYPES: ${{ inputs.task_types }}
           MATCH: ${{ inputs.match }}
@@ -67,29 +103,61 @@ jobs:
           TRIGGER: ${{ inputs.trigger }}
         run: |
           set -euo pipefail
-          args=(--pr "$PR" --all --wait --report-dir "$RUNNER_TEMP/slurm-report")
+          args=(--wait --report-dir "$RUNNER_TEMP/slurm-report")
+          [ -z "$PR" ] || args+=(--pr "$PR")
 
-          IFS=',' read -ra values <<< "$RUNNERS"
-          for value in "${values[@]}"; do
-            value="${value//[[:space:]]/}"
-            [ -z "$value" ] || args+=(--runner "$value")
-          done
+          if [ "$YAML_SELECTION" != off ]; then
+            args+=(--config "$YAML_SELECTION")
+            mapfile -t yaml_metadata < <(
+              python3 - "$YAML_SELECTION" <<'PY'
+          import sys
+          from pathlib import Path
 
-          IFS=',' read -ra values <<< "$TASK_TYPES"
-          for value in "${values[@]}"; do
-            value="${value//[[:space:]]/}"
-            [ -z "$value" ] || args+=(--type "$value")
-          done
+          sys.path.insert(0, "test/ci_system")
+          from pipeline import normalize_task
 
-          IFS=',' read -ra values <<< "$MATCH"
-          for value in "${values[@]}"; do
-            value="${value#"${value%%[![:space:]]*}"}"
-            value="${value%"${value##*[![:space:]]}"}"
-            [ -z "$value" ] || args+=(--match "$value")
-          done
+          repo = Path.cwd()
+          task = normalize_task(repo / sys.argv[1], repo)
+          print(f"type:{task['type']}")
+          for label in task["runner"]["labels"]:
+              if label.startswith(("b200-", "gb200-")):
+                  print(label)
+          PY
+            )
+            yaml_task_type="${yaml_metadata[0]#type:}"
+            yaml_runners=("${yaml_metadata[@]:1}")
+            ((${#yaml_runners[@]})) || {
+              echo "No B200/GB200 runners declared by $YAML_SELECTION" >&2
+              exit 2
+            }
+            args+=(--type "$yaml_task_type")
+            for value in "${yaml_runners[@]}"; do
+              args+=(--runner "$value")
+            done
+          else
+            args+=(--all)
+            IFS=',' read -ra values <<< "$RUNNERS"
+            for value in "${values[@]}"; do
+              value="${value//[[:space:]]/}"
+              [ -z "$value" ] || args+=(--runner "$value")
+            done
 
-          [ "$INCLUDE_MMLU" = true ] || args+=(--exclude-match mmlu)
-          [ "$TRIGGER" = all ] || args+=(--trigger "$TRIGGER")
+            IFS=',' read -ra values <<< "$TASK_TYPES"
+            for value in "${values[@]}"; do
+              value="${value//[[:space:]]/}"
+              [ -z "$value" ] || args+=(--type "$value")
+            done
+
+            IFS=',' read -ra values <<< "$MATCH"
+            for value in "${values[@]}"; do
+              value="${value#"${value%%[![:space:]]*}"}"
+              value="${value%"${value##*[![:space:]]}"}"
+              [ -z "$value" ] || args+=(--match "$value")
+            done
+
+            [ "$INCLUDE_MMLU" = true ] || args+=(--exclude-match mmlu)
+            [ "$TRIGGER" = all ] || args+=(--trigger "$TRIGGER")
+          fi
           test/ci/run_slurm.sh "${args[@]}"
 
       - name: Publish job summary
