@@ -117,8 +117,13 @@ echo "FlashInfer architecture: ${FI_ARCH}"
 # ============================================================
 # Step 2: Upgrade base tools
 # ============================================================
-run_as_root apt-get update
-run_as_root apt-get install -y openmpi-bin libopenmpi-dev libssl-dev pkg-config
+if ! dpkg -s openmpi-bin libopenmpi-dev libssl-dev pkg-config > /dev/null 2>&1; then
+    run_as_root apt-get -o DPkg::Lock::Timeout=600 update
+    run_as_root apt-get -o DPkg::Lock::Timeout=600 install -y \
+        openmpi-bin libopenmpi-dev libssl-dev pkg-config
+else
+    echo "apt packages already installed, skipping apt"
+fi
 echo "=== Step 2: Upgrade pip/setuptools/wheel ==="
 python3 -m pip install --upgrade --ignore-installed --break-system-packages \
     pip setuptools wheel

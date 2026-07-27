@@ -257,6 +257,7 @@ tokenspeed serve moonshotai/Kimi-K3 \
   --max-model-len 8192 \
   --kv-cache-dtype fp8 \
   --tensor-parallel-size 8 \
+  --mm-encoder-tp-mode data \
   --enable-expert-parallel \
   --attention-backend mla \
   --moe-backend auto \

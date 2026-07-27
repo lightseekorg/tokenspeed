@@ -20,10 +20,9 @@
 
 """Auto backend: per-call strategy selection.
 
-Wraps NcclBackend and optionally CustomAllReduceBackend and
-the fused all-reduce backend. For all_reduce, selects the lowest-latency
-backend based on tensor size and hardware.  For other ops, always uses
-NCCL.
+Wraps NCCL and optional low-latency GPU backends. CUDA IPC and symmetric-memory
+backends are only selected for node-local groups; groups spanning nodes fall
+back to NCCL.
 """
 
 import torch
@@ -40,6 +39,7 @@ from tokenspeed.runtime.distributed.comm_backend.triton_rsag import TritonRSAGBa
 from tokenspeed.runtime.distributed.comm_backend.trtllm_allreduce import (
     TrtllmAllReduceBackend,
 )
+from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
 class AutoBackend(CommBackend):
@@ -72,9 +72,15 @@ class AutoBackend(CommBackend):
 
     @staticmethod
     def _force_deterministic_rsag() -> bool:
-        from tokenspeed.runtime.utils.env import global_server_args_dict
-
         return bool(global_server_args_dict.get("force_deterministic_rsag", False))
+
+    @staticmethod
+    def _group_spans_nodes(group: Group) -> bool:
+        mapping = global_server_args_dict.get("mapping")
+        nprocs_per_node = getattr(mapping, "nprocs_per_node", None)
+        if not nprocs_per_node:
+            return False
+        return len({rank // nprocs_per_node for rank in group}) > 1
 
     # ---- Token-aware ops ----
 
@@ -84,7 +90,7 @@ class AutoBackend(CommBackend):
         group: Group,
         scattered_num_tokens: list[int],
     ) -> torch.Tensor:
-        if self._force_deterministic_rsag():
+        if self._force_deterministic_rsag() or self._group_spans_nodes(group):
             return self._nccl.token_all_gather(tensor, group, scattered_num_tokens)
         return self._rsag.token_all_gather(tensor, group, scattered_num_tokens)
 
@@ -94,14 +100,14 @@ class AutoBackend(CommBackend):
         group: Group,
         scattered_num_tokens: list[int],
     ) -> torch.Tensor:
-        if self._force_deterministic_rsag():
+        if self._force_deterministic_rsag() or self._group_spans_nodes(group):
             return self._nccl.token_reduce_scatter(tensor, group, scattered_num_tokens)
         return self._rsag.token_reduce_scatter(tensor, group, scattered_num_tokens)
 
     # ---- Public CommBackend interface ----
 
     def all_reduce(self, tensor: torch.Tensor, group: Group, op=None) -> torch.Tensor:
-        if self._force_deterministic_rsag():
+        if self._force_deterministic_rsag() or self._group_spans_nodes(group):
             return self._nccl.all_reduce(tensor, group, op=op)
         if self._custom_ar.has_custom_ar(group):
             return self._custom_ar.all_reduce(tensor, group, op=op)
@@ -118,7 +124,7 @@ class AutoBackend(CommBackend):
         group: Group,
         op=None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self._force_deterministic_rsag():
+        if self._force_deterministic_rsag() or self._group_spans_nodes(group):
             return self._nccl.all_reduce_two(first, second, group, op=op)
         # The fused two-segment primitive currently exists only in Iris. Keep
         # all configured custom backends authoritative, and use the ordinary
@@ -141,7 +147,7 @@ class AutoBackend(CommBackend):
     def all_gather(
         self, tensor: torch.Tensor, group: Group, dim: int = 0
     ) -> torch.Tensor:
-        if self._force_deterministic_rsag():
+        if self._force_deterministic_rsag() or self._group_spans_nodes(group):
             return self._nccl.all_gather(tensor, group, dim)
         if tensor.dim() == 2 and dim in (-1, tensor.dim() - 1):
             return self._rsag.all_gather(tensor, group, dim)

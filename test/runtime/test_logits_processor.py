@@ -123,6 +123,37 @@ def test_force_deterministic_rsag_disables_logits_symm_mem(
     assert getattr(processor, initializer_name)(SimpleNamespace()) is None
 
 
+def test_tp_logits_custom_collectives_skip_cross_node_group(monkeypatch):
+    monkeypatch.setitem(
+        global_server_args_dict,
+        "mapping",
+        SimpleNamespace(nprocs_per_node=4),
+    )
+    processor = LogitsProcessor(
+        config=SimpleNamespace(model_type="test", vocab_size=64),
+        tp_rank=0,
+        tp_size=8,
+        tp_group=tuple(range(8)),
+    )
+    lm_head = SimpleNamespace(weight=torch.ones((8, 2), dtype=torch.float32))
+
+    monkeypatch.setattr(
+        logits_processor_module,
+        "create_state",
+        lambda **kwargs: pytest.fail("cross-node TP must not create RSAG state"),
+    )
+    monkeypatch.setattr(
+        logits_processor_module,
+        "create_dist_argmax_state",
+        lambda **kwargs: pytest.fail(
+            "cross-node TP must not create distributed-argmax state"
+        ),
+    )
+
+    assert processor._init_all_gather_state(lm_head) is None
+    assert processor._init_dist_argmax_state(lm_head) is None
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_fused_softcap_handles_large_logits_without_nan():
     cap = 30.0
