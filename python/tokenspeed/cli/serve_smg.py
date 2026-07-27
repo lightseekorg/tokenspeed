@@ -59,6 +59,8 @@ GLM_TOOL_CALL_PARSER = "glm47_moe"
 INKLING_REASONING_PARSER = "inkling"
 INKLING_TOOL_CALL_PARSER = "inkling"
 INKLING_ATTENTION_BACKEND = "fa4"
+KIMI_K3_REASONING_PARSER = "kimi_k3"
+KIMI_K3_TOOL_CALL_PARSER = "kimi_k3"
 DEFAULT_SMG_LOG_LEVEL = "warn"
 GRPC_MAX_MESSAGE_BYTES_ENV = "TOKENSPEED_GRPC_MAX_MESSAGE_BYTES"
 DEFAULT_GRPC_MAX_MESSAGE_BYTES = "536870912"
@@ -296,6 +298,24 @@ def _is_inkling_model(model_id: str | None) -> bool:
     )
 
 
+def _is_kimi_k3_model(model_id: str | None) -> bool:
+    if not model_id:
+        return False
+    normalized = model_id.lower().replace("_", "-").rstrip("/")
+    if "kimi-k3" in normalized or "kimik3" in normalized.replace("-", ""):
+        return True
+    config = _load_model_config(model_id)
+    architectures = config.get("architectures") or []
+    return config.get("model_type") == "kimi_k3" or any(
+        arch
+        in {
+            "KimiK3ForConditionalGeneration",
+            "KimiK3ForConditionalGenerationNextN",
+        }
+        for arch in architectures
+    )
+
+
 def _args_with_default_model_parsers(
     engine_args: list[str], gateway_args: list[str]
 ) -> tuple[list[str], list[str]]:
@@ -354,6 +374,16 @@ def _args_with_default_model_parsers(
                     )
             else:
                 engine_result.extend(["--attention-backend", INKLING_ATTENTION_BACKEND])
+
+    elif _is_kimi_k3_model(model_id):
+        if (
+            "--reasoning-parser" not in engine_result
+            and "--reasoning-parser" not in gateway_result
+        ):
+            engine_result.extend(["--reasoning-parser", KIMI_K3_REASONING_PARSER])
+            gateway_result.extend(["--reasoning-parser", KIMI_K3_REASONING_PARSER])
+        if "--tool-call-parser" not in gateway_result:
+            gateway_result.extend(["--tool-call-parser", KIMI_K3_TOOL_CALL_PARSER])
 
     return engine_result, gateway_result
 

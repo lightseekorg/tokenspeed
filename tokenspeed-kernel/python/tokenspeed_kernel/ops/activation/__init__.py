@@ -16,3 +16,7 @@
 # SOFTWARE.
 
 """Activation kernel entry points."""
+
+from tokenspeed_kernel.ops.activation.triton import add3, situ_and_mul
+
+__all__ = ["add3", "situ_and_mul"]

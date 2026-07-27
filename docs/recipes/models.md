@@ -156,6 +156,122 @@ attention. It does not yet expose an equivalent of SGLang's
 `--speculative-dflash-draft-window-size`; add such a flag before relying on
 bounded draft attention for long-context deployments.
 
+## Kimi K3
+
+Kimi-K3 combines a MoonViT vision encoder with a hybrid KDA
+(linear-attention) / NoPE-MLA (full-attention) decoder and a
+DeepSeek-V3-style latent MoE. The KDA layers currently use
+flash-linear-attention kernels on NVIDIA, so install it first:
+
+```bash
+pip install flash-linear-attention
+```
+
+Notes:
+
+- K3 is FlatKV-only. Build the `tokenspeed_scheduler` extension with
+  `-DTOKENSPEED_FLAT_KVCACHE=ON`
+  (`SKBUILD_CMAKE_DEFINE="TOKENSPEED_FLAT_KVCACHE=ON" pip install -e
+  tokenspeed-scheduler/`); startup preflight rejects radix builds with a
+  clear error.
+- KDA dispatch is vendor-neutral at the runtime boundary. The kernel registry
+  selects the existing FLA-derived NVIDIA implementation or the native AMD
+  implementation, including each backend's preferred recurrent-state layout.
+  The runtime does not transpose or reinterpret that state.
+- NVIDIA auto-selects `--attention-backend tokenspeed_mla` for K3 FlatKV
+  (fp8 KV required). AMD uses the `mla` backend.
+- `tokenspeed serve` auto-selects the `kimi_k3` reasoning and tool-call
+  parsers. Explicit parser flags override these defaults.
+- Point `--model` at a **flattened local copy** of the checkpoint: real files
+  for the configs/tokenizer/`*.py` (weights may stay symlinks). An HF hub
+  snapshot directory fails engine startup — `tokenization_kimi.py`'s relative
+  `encoding_k3` import breaks when transformers resolves the module file
+  through the snapshot's `blobs/` symlinks — and the bare repo id fails the
+  smg gateway, which needs an on-disk tokenizer directory.
+- On a shared `HF_HOME`, set `HF_MODULES_CACHE` to a user-writable directory;
+  transformers stages the checkpoint's remote code under
+  `$HF_HOME/modules/transformers_modules/<model>` and a new model name fails
+  with `PermissionError` when that tree belongs to another user.
+- The checkpoint carries no fp8 KV scaling factors; the loader defaults them
+  to 1.0 (a warning at load). Expect a small accuracy delta vs bf16 KV.
+- The vision encoder has 12 attention heads. For an 8-way text TP deployment,
+  use `--mm-encoder-tp-mode data` so each rank runs the vision encoder at TP1
+  on a different whole image.
+- Use the current `lightseekorg/smg-private` frontend, which registers Kimi-K3's
+  chat renderer and multimodal processor. Preserve the checkpoint's
+  `media_proc_cfg.in_patch_limit=65536`; silently falling back to K2.5's
+  16384-patch default reduces OCR resolution.
+
+### NVIDIA
+
+The standard NVIDIA path uses the fused TensorRT-LLM-Gen MXFP4 + SiTU MoE
+backend.
+On 8x B300 (`sm103a`, CUDA 13) the `tokenspeed-situ` sidecar is pulled in as a
+`tokenspeed-kernel` CUDA dependency; no separate private FlashInfer repository
+or `FLASHINFER_PRIVATE_CUBIN_DIR` is required. To install or verify it directly:
+
+```bash
+python -m pip install "tokenspeed-situ==0.1.0.post20260726"
+python -c \
+  'import tokenspeed_situ as s; print(s.verify_bundle())'
+```
+
+Then serve with expert parallelism (recommended):
+
+```bash
+tokenspeed serve moonshotai/Kimi-K3 \
+  --served-model-name kimi-k3 \
+  --trust-remote-code \
+  --max-model-len 32768 \
+  --kv-cache-dtype fp8 \
+  --tensor-parallel-size 8 \
+  --mm-encoder-tp-mode data \
+  --ep-size 8 \
+  --moe-backend flashinfer_trtllm \
+  --gpu-memory-utilization 0.94 \
+  --max-num-seqs 32 \
+  --disable-kvstore \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+Plain TP8 (drop `--ep-size 8`) uses the native-384 expert layout and requires
+sidecar (tokenspeed-situ) >= 0.1.0.post20260726. Memory is identical either way on 8x B300: ~73 GB free
+per rank after load, and `--gpu-memory-utilization 0.94` yields a KV capacity
+of 4,437,504 tokens.
+
+The checked-in sidecar AOT bundle is a Linux x86_64 development artifact for
+B300/CUDA 13 (`sm103a`) only. On other NVIDIA platforms, fall back to the
+unfused Triton grouped-GEMM MoE backend: skip the sidecar install and
+substitute `--moe-backend triton`.
+
+### AMD
+
+The standard AMD path on 8x gfx950 uses the `mla` backend. For TP8/EP8,
+automatic MoE selection uses the specialized Gluon SiTU kernels:
+
+```bash
+tokenspeed serve moonshotai/Kimi-K3 \
+  --served-model-name kimi-k3 \
+  --trust-remote-code \
+  --max-model-len 8192 \
+  --kv-cache-dtype fp8 \
+  --tensor-parallel-size 8 \
+  --enable-expert-parallel \
+  --attention-backend mla \
+  --moe-backend auto \
+  --gpu-memory-utilization 0.92 \
+  --max-num-seqs 32 \
+  --disable-kvstore \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+On gfx950, the replicated 7168↔3584 latent projections automatically select
+among a one-token Triton GEMV, tuned Gluon GEMMs, and the vendor GEMM according
+to the current token count. The fused sigmoid-bias top-k route supports the
+full scheduled token count.
+
 ## GLM5 / GLM5.2
 
 GLM5 launches usually need remote code, long context, expert parallelism, FP8 KV

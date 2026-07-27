@@ -47,6 +47,7 @@ from tokenspeed.runtime.configs import (
     InklingMMConfig,
     InklingModelConfig,
     KimiK2Config,
+    KimiK3Config,
     KimiK25Config,
     MiniMaxM2Config,
     MiniMaxM3Config,
@@ -71,6 +72,7 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     MiniMaxM3Config.model_type: MiniMaxM3Config,
     KimiK2Config.model_type: KimiK2Config,
     KimiK25Config.model_type: KimiK25Config,
+    KimiK3Config.model_type: KimiK3Config,
     InklingModelConfig.model_type: InklingModelConfig,
     InklingMMConfig.model_type: InklingMMConfig,
 }
@@ -285,6 +287,9 @@ def get_config(
     if resolve_architecture(config) in [
         "KimiK25ForConditionalGeneration",
         "KimiK25Config",
+        "KimiK3ForConditionalGeneration",
+        "KimiK3ForConditionalGenerationNextN",
+        "KimiK3Config",
         "Qwen3_5MoeForConditionalGeneration",
         "Qwen3_5MoeForConditionalGenerationNextN",
         "Qwen3_5MoeConfig",

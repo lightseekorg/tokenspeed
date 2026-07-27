@@ -25,6 +25,8 @@ import torch.distributed as dist
 from tokenspeed_kernel.ops.communication.triton import (
     all_reduce,
     all_reduce_can_run,
+    all_reduce_two,
+    all_reduce_two_can_run,
     create_state,
 )
 
@@ -79,6 +81,37 @@ class TritonAllReduceBackend(CommBackend):
         if all_reduce_can_run(state, tensor, op=op):
             return all_reduce(state, tensor, op=op)
         return self._fallback.all_reduce(tensor, group, op=op)
+
+    def can_run_two(
+        self,
+        first: torch.Tensor,
+        second: torch.Tensor,
+        group: Group,
+        op=None,
+    ) -> bool:
+        if len(group) <= 1:
+            return False
+        try:
+            return all_reduce_two_can_run(
+                self._get_or_create(group),
+                first,
+                second,
+                op=op,
+            )
+        except Exception:
+            return False
+
+    def all_reduce_two(
+        self,
+        first: torch.Tensor,
+        second: torch.Tensor,
+        group: Group,
+        op=None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        state = self._get_or_create(group)
+        if all_reduce_two_can_run(state, first, second, op=op):
+            return all_reduce_two(state, first, second, op=op)
+        return super().all_reduce_two(first, second, group, op=op)
 
     def all_gather(
         self, tensor: torch.Tensor, group: Group, dim: int = 0

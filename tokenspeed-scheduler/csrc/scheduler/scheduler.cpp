@@ -86,7 +86,25 @@ Scheduler::Scheduler(SchedulerConfig config)
     if (config_.overlap_schedule_depth > 0 && config_.decode_input_tokens == 0) {
         throw std::invalid_argument("Scheduler: overlapped decode requires decode_input_tokens > 0");
     }
-#if !TOKENSPEED_FLAT_KVCACHE
+#if TOKENSPEED_FLAT_KVCACHE
+    if (config_.enable_flatkv_pd) {
+        if (config_.role == Role::kFused) {
+            throw std::invalid_argument("Scheduler: enable_flatkv_pd requires Prefill or Decode role");
+        }
+        if (config_.paged_cache_groups.empty()) {
+            throw std::invalid_argument("Scheduler: enable_flatkv_pd requires paged_cache_groups");
+        }
+        if (config_.decode_input_tokens != 1) {
+            throw std::invalid_argument("Scheduler: FlatKV PD currently requires decode_input_tokens == 1");
+        }
+        if (config_.overlap_schedule_depth != 0 && config_.role != Role::kD) {
+            throw std::invalid_argument("Scheduler: FlatKV PD overlap requires the Decode role");
+        }
+    }
+#else
+    if (config_.enable_flatkv_pd) {
+        throw std::invalid_argument("Scheduler: enable_flatkv_pd requires a TOKENSPEED_FLAT_KVCACHE build");
+    }
     radix_page_table_emissions_.resize(static_cast<std::size_t>(config_.max_batch_size) + 1);
 #endif
     if (auto* env = std::getenv("SPDLOG_LEVEL")) {
@@ -204,6 +222,12 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
 #else
     const std::int32_t page_size = config_.block_size;
 #endif
+    std::unordered_set<std::string> batch_ids;
+    for (const auto& spec : request_specs) {
+        if (!batch_ids.insert(spec.request_id).second || requests_.contains(spec.request_id)) {
+            throw std::invalid_argument("Scheduler: duplicate active request_id '" + spec.request_id + "'");
+        }
+    }
     for (const auto& spec : request_specs) {
         auto req = std::make_unique<Request>(spec, page_size, config_.role);
         requests_.emplace(spec.request_id, std::move(req));
@@ -213,7 +237,7 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
 std::size_t Scheduler::WaitingSize() const {
     std::size_t count = 0;
     for (const auto& [id, req] : requests_) {
-        if (req->Is<fsm::Submitted>()) {
+        if (req->Is<fsm::Submitted>() || (config_.enable_flatkv_pd && req->Is<fsm::Bootstrapping>())) {
             count++;
         }
     }
@@ -320,6 +344,15 @@ std::int32_t Scheduler::GetRequestPagedCacheBaseLogicalPage(const std::string& r
     return hybrid_prefix_cache_->GetRequestPagedCacheBaseLogicalPage(request_id, group_id);
 }
 
+bool Scheduler::FlatPdTransferPinned(const std::string& request_id) const {
+#if TOKENSPEED_FLAT_KVCACHE
+    return flat_pd_transfer_pins_.contains(request_id);
+#else
+    (void)request_id;
+    return false;
+#endif
+}
+
 std::int32_t Scheduler::GetRequestTokenSize(const std::string& id) const {
     auto it = requests_.find(id);
     if (it == requests_.end()) {
@@ -370,6 +403,13 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
             }
         }
     }
+#if TOKENSPEED_FLAT_KVCACHE
+    for (const auto& [id, req] : requests_) {
+        if (req->Is<fsm::Finished>()) {
+            _assert(!flat_pd_transfer_pins_.contains(id), "Finished FlatKV PD request still owns transfer page pins");
+        }
+    }
+#endif
     std::erase_if(requests_, [](const auto& req) { return req.second->template Is<fsm::Finished>(); });
 
     std::vector<Request*> candidates;
@@ -384,6 +424,7 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     plan.With(FlatForwardOperation{std::move(fwd_ops)});
 #if TOKENSPEED_FLAT_KVCACHE
     plan.flat_oom_request_ids = std::exchange(flat_oom_request_ids_, {});
+    plan.flat_terminal_errors = std::exchange(flat_terminal_errors_, {});
 #endif
 
     // Merge retract write-backs (if any) into the Draining write-back list, then emit once.
@@ -431,6 +472,12 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
             plan.With(CacheOperation{FlatLoadBackOperation{*lb}});
         }
     }
+#if TOKENSPEED_FLAT_KVCACHE
+    // Drain only after every operation has been built: host-extension
+    // destinations are allocated while constructing loadback ops and need the
+    // same pre-transfer sanitization as model-written pages.
+    plan.flat_page_ids_to_zero = block_pool_.TakePageIdsToZero();
+#endif
     if (std::getenv("DEBUG_MEM")) {
         check_device_mem();
     }

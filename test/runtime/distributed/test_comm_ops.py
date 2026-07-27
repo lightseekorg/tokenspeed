@@ -114,7 +114,7 @@ DTYPES = [torch.float32, torch.float16, torch.bfloat16]
 
 
 def _test_all_reduce(rank, world_size, device, group, ref_group):
-    from tokenspeed.runtime.distributed.comm_ops import all_reduce
+    from tokenspeed.runtime.distributed.comm_ops import all_reduce, all_reduce_two
 
     for sz in TEST_SIZES:
         for dtype in DTYPES:
@@ -131,6 +131,22 @@ def _test_all_reduce(rank, world_size, device, group, ref_group):
         dist.all_reduce(expected, group=ref_group)
         result = all_reduce(inp.clone(), group)
         torch.testing.assert_close(result, expected)
+
+    # Independent production-sized Kimi shared and routed segments. AMD Iris
+    # handles this with one kernel; other backends use the two-call fallback.
+    first = torch.randint(1, 16, (1, 7168), dtype=torch.bfloat16, device=device)
+    second = torch.randint(1, 16, (1, 3584), dtype=torch.bfloat16, device=device)
+    expected_first = first.clone()
+    expected_second = second.clone()
+    dist.all_reduce(expected_first, group=ref_group)
+    dist.all_reduce(expected_second, group=ref_group)
+    result_first, result_second = all_reduce_two(
+        first.clone(),
+        second.clone(),
+        group,
+    )
+    torch.testing.assert_close(result_first, expected_first)
+    torch.testing.assert_close(result_second, expected_second)
 
 
 def _test_all_gather(rank, world_size, device, group, ref_group):
@@ -344,6 +360,46 @@ class TestFusionParams:
         )
         assert params.fusion_op == FusionOp.RESIDUAL_RMS_NORM
         assert params.norm_weight is weight
+
+    def test_prepare_all_reduce_lane_uses_backend_capability(self):
+        from tokenspeed.runtime.distributed.comm_ops import prepare_all_reduce_lane
+
+        calls = []
+
+        class Backend:
+            def prepare_all_reduce_lane(self, group, hidden_dim):
+                calls.append((group, hidden_dim))
+                return True
+
+        group = (0, 1)
+        assert prepare_all_reduce_lane(group, 10752, backend=Backend())
+        assert calls == [(group, 10752)]
+
+    def test_prepare_all_reduce_fusion_hides_kernel_backend(self, monkeypatch):
+        from tokenspeed.runtime.distributed import comm_ops
+
+        process_group = type("ProcessGroup", (), {"rank": lambda self: 3})()
+        calls = []
+        monkeypatch.setattr(
+            comm_ops,
+            "_get_process_group",
+            lambda group: process_group,
+        )
+        monkeypatch.setattr(
+            comm_ops,
+            "kernel_prepare_allreduce_fusion",
+            lambda **kwargs: calls.append(kwargs) or True,
+        )
+
+        assert comm_ops.prepare_all_reduce_fusion((0, 1), 10752, 8)
+        assert calls == [
+            {
+                "rank": 3,
+                "group": process_group,
+                "max_token_num": 8,
+                "hidden_dim": 10752,
+            }
+        ]
 
 
 # ---------------------------------------------------------------------------

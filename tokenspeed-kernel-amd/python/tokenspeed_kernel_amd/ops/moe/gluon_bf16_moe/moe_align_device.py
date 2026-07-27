@@ -80,6 +80,7 @@ def _count_kernel(
     counts_ptr,
     BLOCK_N: gl.constexpr,
     BLOCK_E: gl.constexpr,
+    EXPERT_START: gl.constexpr,
     NW: gl.constexpr,
 ):
     # Parallel per-CTA histogram of an N-chunk -> atomic-add into global counts.
@@ -88,8 +89,17 @@ def _count_kernel(
     pid = gl.program_id(0)
     offs = pid * BLOCK_N + gl.arange(0, BLOCK_N, layout=LN)
     nmask = offs < N
-    e = gl.load(exp_ptr + offs, mask=nmask, other=num_experts)  # pad -> dump bin
-    hist = gl.histogram(e, BLOCK_E, mask=nmask, layout=LE).to(gl.float32)
+    global_e = gl.load(
+        exp_ptr + offs,
+        mask=nmask,
+        other=EXPERT_START + num_experts,
+    )
+    e = global_e - EXPERT_START
+    # EP may pass global expert IDs directly. Exclude routes outside this
+    # rank's contiguous local expert range from the aligned prefix.
+    valid = nmask & (e >= 0) & (e < num_experts)
+    safe_e = gl.where(valid, e, num_experts)
+    hist = gl.histogram(safe_e, BLOCK_E, mask=valid, layout=LE).to(gl.float32)
     e_ids = gl.arange(0, BLOCK_E, layout=LE)
     gl.amd.cdna4.buffer_atomic_add(counts_ptr, e_ids, hist, mask=e_ids < num_experts)
 
@@ -167,21 +177,33 @@ def _scatter_kernel(
     sti_ptr,  # [EM_max]
     sw_ptr,  # [EM_max]
     BLOCK: gl.constexpr,
+    EXPERT_START: gl.constexpr,
     NW: gl.constexpr,
 ):
     L: gl.constexpr = gl.BlockedLayout([1], [64], [NW], [0])
     pid = gl.program_id(0)
     offs = pid * BLOCK + gl.arange(0, BLOCK, layout=L)
     mask = offs < N
-    e = gl.load(exp_ptr + offs, mask=mask, other=num_experts)
-    valid = mask & (e < num_experts)
+    global_e = gl.load(
+        exp_ptr + offs,
+        mask=mask,
+        other=EXPERT_START + num_experts,
+    )
+    e = global_e - EXPERT_START
+    valid = mask & (e >= 0) & (e < num_experts)
+    safe_e = gl.where(valid, e, 0)
     # Each slot atomically claims the next free rank within its expert; the
     # buffer_atomic_add returns the pre-add value (the rank). CDNA3/4 only
     # supports float atomic add, so the counter is fp32 (ranks exact in fp32).
     ones = gl.full([BLOCK], 1.0, gl.float32, layout=L)
-    rank_f = gl.amd.cdna4.buffer_atomic_add(fill_ctr_ptr, e, ones, mask=valid)
+    rank_f = gl.amd.cdna4.buffer_atomic_add(
+        fill_ctr_ptr,
+        safe_e,
+        ones,
+        mask=valid,
+    )
     rank = rank_f.to(gl.int32)
-    ro = gl.load(row_off_ptr + e, mask=valid, other=0)
+    ro = gl.load(row_off_ptr + safe_e, mask=valid, other=0)
     dest = ro + rank
     tok = offs // topk
     slot = offs % topk
@@ -196,10 +218,19 @@ def moe_align_block_size_device(
     topk_weights: torch.Tensor,  # [M, topk] float32
     num_experts: int,
     block_m: int,
+    *,
+    expert_start: int = 0,
 ):
     """Fully-device MoE block alignment (pure Gluon). Same return contract as
-    the torch ``moe_align_block_size``."""
+    the torch ``moe_align_block_size``.
+
+    ``topk_ids`` may use global expert IDs. ``expert_start`` identifies the
+    first expert owned by this rank; routes outside the contiguous local range
+    are discarded in the count and scatter kernels.
+    """
     assert topk_ids.shape == topk_weights.shape
+    if expert_start < 0:
+        raise ValueError("expert_start must be non-negative")
     device = topk_ids.device
     M, topk = topk_ids.shape
     N = M * topk
@@ -234,6 +265,7 @@ def moe_align_block_size_device(
         counts,
         BLOCK_N=BLOCK_N,
         BLOCK_E=BLOCK_E,
+        EXPERT_START=expert_start,
         NW=4,
         num_warps=4,
     )
@@ -263,6 +295,7 @@ def moe_align_block_size_device(
         sti,
         sw,
         BLOCK=256,
+        EXPERT_START=expert_start,
         NW=4,
         num_warps=4,
     )

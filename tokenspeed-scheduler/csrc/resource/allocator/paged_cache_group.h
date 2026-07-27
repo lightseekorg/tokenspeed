@@ -42,6 +42,15 @@ inline std::int32_t CeilDivPositive(std::int32_t numer, std::int32_t denom) {
 // State: only the trailing window at the hit depth required.
 enum class PagedCacheGroupFamily { History, State };
 
+// Peer-visible Flat-PD transfer semantics. Unspecified preserves legacy
+// standalone/non-flat construction, but Flat-PD startup requires an explicit
+// value and verifies it against the scheduler manager selected for this group.
+enum class PagedCacheTransferPolicy {
+    Unspecified,
+    FullSuffix,
+    LatestSnapshot,
+};
+
 // One model-defined paged cache group; scheduler treats group_id as opaque.
 struct PagedCacheGroupConfig {
     enum class Retention {
@@ -60,6 +69,7 @@ struct PagedCacheGroupConfig {
     std::optional<std::int32_t> sliding_window_tokens{};
     // History groups form a chain; State groups only need the trailing window.
     PagedCacheGroupFamily family{PagedCacheGroupFamily::History};
+    PagedCacheTransferPolicy transfer_policy{PagedCacheTransferPolicy::Unspecified};
 
     std::int32_t RawTokensPerPage() const { return rows_per_page * entry_stride_tokens; }
 

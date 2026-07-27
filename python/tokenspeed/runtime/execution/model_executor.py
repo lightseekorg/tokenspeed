@@ -56,6 +56,9 @@ from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 from tokenspeed.runtime.execution.types import ModelExecutionResult
 from tokenspeed.runtime.grammar.capturable_grammar import setup_grammar_step
+from tokenspeed.runtime.layers.attention.backends.flat_cache_metadata import (
+    FlatCacheBatchMetadata,
+)
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 from tokenspeed.runtime.layers.paged_attention import (
     validate_paged_cache_group_ids,
@@ -276,6 +279,13 @@ class ModelExecutor:
         self.sampling_backend = sampling_backend
         self.attn_backend = attn_backend
         self.token_to_kv_pool = token_to_kv_pool
+        # FlatKV contract pools (FlatHybridCachePool) publish a runtime
+        # contract; on that path per-step tables travel as
+        # FlatCacheBatchMetadata and the legacy req_to_page mirror is
+        # forbidden.
+        self._flat_runtime_contract = getattr(
+            token_to_kv_pool, "runtime_contract", None
+        )
         # Full-attention group mirrored into req_to_page each step (flat+spec).
         _group_specs = getattr(token_to_kv_pool, "paged_cache_group_specs", ()) or ()
         self._flat_full_group_id = next(
@@ -687,9 +697,14 @@ class ModelExecutor:
         legacy consumer (input prep's out_cache_loc kernels, the drafter's
         per-step location chains). The flat scheduler never populates
         req_to_page itself; column tails zero-fill to the dummy page so
-        stale longer rows can't leak."""
+        stale longer rows can't leak.
+
+        Never called on the FlatKV contract path: mirroring into
+        req_to_page would resurrect the forbidden legacy path.
+        """
         if (
-            self.drafter is None
+            self._flat_runtime_contract is not None
+            or self.drafter is None
             or not flat_block_tables
             or self._flat_full_group_id is None
         ):
@@ -1475,6 +1490,24 @@ class ModelExecutor:
                 req_to_page=self.req_to_page,
             )
 
+    def zero_flat_cache_pages(self, page_ids):
+        """Clear newly owned pages and return a CUDA completion event when needed."""
+        if not page_ids:
+            return None
+        zero_pages = getattr(self.token_to_kv_pool, "zero_pages", None)
+        if not callable(zero_pages):
+            raise RuntimeError(
+                "scheduler emitted flat_page_ids_to_zero but the active KV pool "
+                "does not implement physical-page sanitization"
+            )
+        with nvtx_range("zero_flat_cache_pages", color="purple"):
+            zero_pages(page_ids)
+        if torch.device(self.device).type != "cuda":
+            return None
+        done = torch.cuda.Event()
+        done.record(torch.cuda.current_stream(self.device))
+        return done
+
     def reset_remote_prefill_mamba_inputs(self, forward_op) -> None:
         if self.runtime_states.mamba_pool is None:
             return
@@ -1736,13 +1769,32 @@ class ModelExecutor:
             bs = len(forward_op.request_ids)
             # Outside the graph: in-graph sites only OR into the flag buffer.
             self.nan_guard.reset(bs)
-            # Mirror the full group's flat table into req_to_page (flat+spec).
-            flat_block_tables = flat_block_tables_from_forward_op(
-                forward_op,
-                device=self.device,
-                num_reqs=bs,
-            )
-            self._mirror_flat_full_table_into_req_to_page(forward_op, flat_block_tables)
+            flat_cache_metadata = None
+            if self._flat_runtime_contract is not None and bs > 0:
+                # FlatKV contract path: validate + pack the per-group tables
+                # once, bound to this forward operation. The MLA backend
+                # consumes the full-attention table through this bridge;
+                # req_to_page is never populated.
+                flat_cache_metadata = FlatCacheBatchMetadata.from_forward_op(
+                    forward_op,
+                    device=self.device,
+                    contract=self._flat_runtime_contract,
+                    num_requests=bs,
+                )
+                flat_block_tables = dict(
+                    flat_cache_metadata.tables(active_forward_op=forward_op)
+                )
+            else:
+                # Mirror the full group's flat table into req_to_page
+                # (flat+spec legacy consumers only).
+                flat_block_tables = flat_block_tables_from_forward_op(
+                    forward_op,
+                    device=self.device,
+                    num_reqs=bs,
+                )
+                self._mirror_flat_full_table_into_req_to_page(
+                    forward_op, flat_block_tables
+                )
             decode_input_ids = self.input_buffers.fill_input_buffers(
                 forward_op=forward_op,
                 runtime_states=self.runtime_states,
@@ -1964,6 +2016,10 @@ class ModelExecutor:
                             paged_cache_block_table_base_offsets
                         ),
                         flat_block_tables=flat_block_tables,
+                        flat_cache_metadata=flat_cache_metadata,
+                        flat_cache_forward_op=(
+                            forward_op if flat_cache_metadata is not None else None
+                        ),
                         **mamba_kwargs,
                     )
                     if timing_enabled:

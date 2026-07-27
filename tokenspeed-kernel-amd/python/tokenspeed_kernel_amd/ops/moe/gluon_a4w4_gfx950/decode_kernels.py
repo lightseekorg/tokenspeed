@@ -40,7 +40,9 @@ from tokenspeed_kernel_amd._triton import gl, gluon, triton
 _LANES = gl.constexpr(64)  # wavefront width (reduction lanes)
 _ROUTE_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _ROUTE_MAX_E = 1024
-_ROUTE_MAX_G = 64
+# Kimi K3's top-k16 decode reaches 128 routed slots at M=8. The single-CTA
+# route remains faster than the generic torch fallback at that shape.
+_ROUTE_MAX_G = 128
 _ROUTE_GL_DTYPE = {
     torch.float16: gl.float16,
     torch.bfloat16: gl.bfloat16,

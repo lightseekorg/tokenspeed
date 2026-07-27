@@ -39,6 +39,10 @@ tokenspeed serve <model> \
 | `--enable-expert-parallel` | Expert parallelism across the selected world size. |
 | `--expert-parallel-size` | Explicit expert parallel size. |
 
+Kimi-K3 TP8 deployments must combine `--tensor-parallel-size 8` with
+`--mm-encoder-tp-mode data`. This keeps the text model at TP8 while running the
+wide-QKV MoonViT encoder at TP1 with whole-item DP8.
+
 ## MoE Deployments
 
 Large MoE models usually choose one of these shapes:

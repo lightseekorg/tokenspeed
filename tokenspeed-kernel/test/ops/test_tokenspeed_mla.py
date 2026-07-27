@@ -278,6 +278,186 @@ def test_pure_cast_strided_inputs(device: str) -> None:
     assert _bitwise_equal(v_out, v_ref)
 
 
+@pytest.mark.parametrize(
+    "page_size,seq_len,batch_size,num_heads,return_lse,"
+    "expected_split,expected_k_tiles,expected_tail_tile",
+    [
+        (64, 5, 1, 16, True, None, None, None),
+        (64, 133, 1, 16, True, None, None, None),
+        (64, 1982, 5, 12, False, 14, 16, 2),
+        (64, 2246, 12, 12, False, 6, 18, 3),
+        (32, 5, 1, 16, True, None, None, None),
+        (32, 133, 1, 16, True, None, None, None),
+    ],
+)
+def test_fp8_decode_ignores_dirty_tail_beyond_sequence_length(
+    device: str,
+    page_size: int,
+    seq_len: int,
+    batch_size: int,
+    num_heads: int,
+    return_lse: bool,
+    expected_split: int | None,
+    expected_k_tiles: int | None,
+    expected_tail_tile: int | None,
+) -> None:
+    """Reused page bytes past seq_len must not contaminate decode output."""
+    import cutlass
+    from tokenspeed_mla.mla_decode import _get_split_kv_and_workspace_size
+    from tokenspeed_mla.mla_decode_fp8 import (
+        BlackwellMultiHeadLatentAttentionForwardFP8,
+    )
+    from tokenspeed_mla.mla_helpers import select_mla_decode_tilers
+    from tokenspeed_mla.utils import get_num_sm
+
+    if not current_platform().is_blackwell:
+        pytest.skip("tokenspeed_mla FP8 decode requires Blackwell")
+
+    query_len = 1
+    kv_lora_rank = 512
+    qk_rope_head_dim = 64
+    compute_capability = torch.cuda.get_device_capability()
+    mma_qk_tiler_mn, mma_pv_tiler_mn = select_mla_decode_tilers(
+        num_heads,
+        query_len,
+        is_fp8=True,
+        compute_capability=compute_capability,
+    )
+    qk_tile_size = mma_qk_tiler_mn[1]
+    if expected_split is not None:
+        if compute_capability != (10, 3):
+            pytest.skip(
+                "SM103 production split geometry is not portable to SM100; "
+                "the same H=12 case selects M64 there and is not verified here"
+            )
+        assert mma_qk_tiler_mn == (128, 128)
+        assert mma_pv_tiler_mn == (128, 256)
+
+        kernel = BlackwellMultiHeadLatentAttentionForwardFP8(
+            acc_dtype=cutlass.Float32,
+            lse_dtype=cutlass.Float32,
+            mma_qk_tiler_mn=mma_qk_tiler_mn,
+            mma_pv_tiler_mn=mma_pv_tiler_mn,
+            max_active_clusters=1,
+            page_size=page_size,
+            skip_correction_threshold=0.0,
+            is_persistent=False,
+            is_var_seq=True,
+            is_var_split_kv=False,
+            is_causal=True,
+            num_heads=num_heads,
+            seq_len_q=query_len,
+        )
+        assert kernel.cluster_shape_mnk == (2, 1, 1)
+        assert kernel.use_2cta_instrs
+
+        split_kv, _ = _get_split_kv_and_workspace_size(
+            batch_size,
+            query_len,
+            num_heads,
+            kv_lora_rank,
+            get_num_sm(device),
+            32768,
+            torch.float8_e4m3fn,
+            mma_qk_tiler_mn,
+        )
+        num_k_tiles = math.ceil(seq_len / qk_tile_size)
+        k_tiles_per_split = math.ceil(num_k_tiles / split_kv)
+        tail_tile_in_split = (num_k_tiles - 1) % k_tiles_per_split + 1
+        assert split_kv == expected_split
+        assert num_k_tiles == expected_k_tiles
+        assert k_tiles_per_split == expected_tail_tile
+        assert tail_tile_in_split == expected_tail_tile
+
+        # On SM100, H=12 and q_len=1 select the M64/1CTA family. This B300
+        # SM103 test intentionally does not claim runtime coverage for M64.
+
+    num_kernel_pages = math.ceil(seq_len / qk_tile_size) * qk_tile_size // page_size
+
+    torch.manual_seed(7)
+    query = torch.randn(
+        batch_size,
+        query_len,
+        num_heads,
+        kv_lora_rank + qk_rope_head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    ).to(torch.float8_e4m3fn)
+    clean_cache = torch.zeros(
+        num_kernel_pages + 1,
+        page_size,
+        kv_lora_rank + qk_rope_head_dim,
+        device=device,
+        dtype=torch.float8_e4m3fn,
+    )
+    clean_cache[1:].view(-1, kv_lora_rank + qk_rope_head_dim)[:seq_len] = torch.randn(
+        seq_len,
+        kv_lora_rank + qk_rope_head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    ).to(torch.float8_e4m3fn)
+    dirty_cache = clean_cache.clone()
+    dirty_cache[1:].view(torch.uint8).view(-1, kv_lora_rank + qk_rope_head_dim)[
+        seq_len:, :kv_lora_rank
+    ].fill_(0x7F)
+
+    block_tables = (
+        torch.arange(1, num_kernel_pages + 1, device=device, dtype=torch.int32)
+        .unsqueeze(0)
+        .expand(batch_size, -1)
+        .contiguous()
+    )
+    seq_lens = torch.full((batch_size,), seq_len, device=device, dtype=torch.int32)
+    workspace = torch.empty(64 * 1024 * 1024, device=device, dtype=torch.int8)
+    decode_kwargs = dict(
+        workspace_buffer=workspace,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        max_seq_len=32768,
+        softmax_scale=1.0 / math.sqrt(kv_lora_rank + qk_rope_head_dim),
+        return_lse=return_lse,
+    )
+
+    expected_result = kernel_mla.tokenspeed_mla_decode(
+        query, clean_cache, **decode_kwargs
+    )
+    if return_lse:
+        expected, expected_lse = expected_result
+    else:
+        expected = expected_result
+        expected_lse = None
+
+    valid_kv = (
+        clean_cache[1:].view(-1, kv_lora_rank + qk_rope_head_dim)[:seq_len].float()
+    )
+    reference_scores = (
+        torch.einsum("hd,kd->hk", query[0, 0].float(), valid_kv)
+        * decode_kwargs["softmax_scale"]
+    )
+    reference_probs = torch.softmax(reference_scores, dim=-1)
+    reference = torch.einsum("hk,kd->hd", reference_probs, valid_kv[:, :kv_lora_rank])
+    assert torch.isfinite(expected).all()
+    torch.testing.assert_close(expected[0, 0].float(), reference, atol=0.13, rtol=1e-5)
+    for _ in range(16):
+        actual_result = kernel_mla.tokenspeed_mla_decode(
+            query, dirty_cache, **decode_kwargs
+        )
+        if return_lse:
+            actual, actual_lse = actual_result
+        else:
+            actual = actual_result
+            actual_lse = None
+        torch.cuda.synchronize()
+
+        if return_lse:
+            assert torch.isfinite(actual_lse).all()
+            torch.testing.assert_close(actual_lse, expected_lse, atol=0, rtol=0)
+        assert torch.isfinite(actual).all()
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
 def test_scaled_independent_k_v(device: str) -> None:
     """k and v use different scales; output reflects each independently."""
     k_nope, k_pe, v = _make_kv_slice_inputs(device)

@@ -59,6 +59,17 @@ class MoECheckpointLoadError(RuntimeError):
     pass
 
 
+def _ep_partition(num_experts: int, ep_rank: int, ep_size: int) -> int:
+    if not (
+        num_experts > 0
+        and ep_size > 0
+        and num_experts % ep_size == 0
+        and 0 <= ep_rank < ep_size
+    ):
+        raise ValueError("experts must divide evenly across valid EP ranks")
+    return num_experts // ep_size
+
+
 def _build_default_expert_plan(
     schema: ExpertCheckpointSchema,
     *,
@@ -68,7 +79,7 @@ def _build_default_expert_plan(
 ) -> list[ExpertWeightPlanEntry]:
     # Expert ownership is assumed to be a contiguous per-rank range here.
     # EPLB-aware remapping would need a different planning step.
-    num_local_experts = num_experts // ep_size
+    num_local_experts = _ep_partition(num_experts, ep_rank, ep_size)
     start_expert = num_local_experts * ep_rank
     expert_plan: list[ExpertWeightPlanEntry] = []
     for local_expert_id in range(num_local_experts):
@@ -248,7 +259,7 @@ def _load_fused_expert_tensor(
 ) -> None:
     # Expert ownership is assumed to be a contiguous per-rank range here.
     # EPLB-aware remapping would need a different loading step.
-    num_local_experts = num_experts // ep_size
+    num_local_experts = _ep_partition(num_experts, ep_rank, ep_size)
     start_expert = num_local_experts * ep_rank
     end_expert = start_expert + num_local_experts
     weight_loader = param.weight_loader
