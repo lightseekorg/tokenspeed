@@ -433,6 +433,14 @@ def get_ready_port(ready: Dict[str, Any]) -> int | None:
     return parsed.port
 
 
+def configure_slurm_server_command(command: str, timeout: int) -> str:
+    """Keep the TokenSpeed engine deadline aligned with Slurm readiness."""
+    tokens = shlex.split(command)
+    if tokens[:2] != ["ts", "serve"] or "--engine-startup-timeout" in tokens:
+        return command
+    return f"{command} --engine-startup-timeout {timeout}"
+
+
 def kill_port_listeners(
     port: int,
     env: Dict[str, str],
@@ -1263,8 +1271,14 @@ def write_detailed_step_summary(result: Dict[str, Any]) -> None:
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if not summary_path:
         return
-    with open(summary_path, "a") as handle:
-        handle.write("\n".join(build_step_summary_lines(result)))
+    try:
+        with open(summary_path, "a") as handle:
+            handle.write("\n".join(build_step_summary_lines(result)))
+    except OSError as exc:
+        print(
+            f"warning: could not write GitHub step summary: {exc}",
+            file=sys.stderr,
+        )
 
 
 def write_result(path: str | None, payload: Dict[str, Any]) -> None:
@@ -1275,7 +1289,26 @@ def write_result(path: str | None, payload: Dict[str, Any]) -> None:
     result_path.write_text(json.dumps(payload, indent=2) + "\n")
 
 
-def poll_readiness(ready: Dict[str, Any], dry_run: bool) -> None:
+def server_exit_error(
+    process: subprocess.Popen[str], log_path: Path | None
+) -> str | None:
+    returncode = process.poll()
+    if returncode is None:
+        return None
+    detail = ""
+    if log_path is not None and log_path.exists():
+        lines = log_path.read_text(errors="replace").splitlines()
+        if lines:
+            detail = "\nLast server log lines:\n" + "\n".join(lines[-20:])
+    return f"server exited before readiness with exit code {returncode}{detail}"
+
+
+def poll_readiness(
+    ready: Dict[str, Any],
+    dry_run: bool,
+    process: subprocess.Popen[str] | None = None,
+    log_path: Path | None = None,
+) -> None:
     url = str(ready["url"])
     timeout_seconds = int(ready.get("timeout", 600))
     interval_seconds = int(ready.get("interval", 10))
@@ -1287,13 +1320,23 @@ def poll_readiness(ready: Dict[str, Any], dry_run: bool) -> None:
 
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
+        if process is not None:
+            error = server_exit_error(process, log_path)
+            if error is not None:
+                raise RuntimeError(error)
         try:
             with urlopen(url, timeout=5) as response:
                 if response.status == expected_status:
                     return
         except URLError:
             pass
-        time.sleep(interval_seconds)
+        sleep_deadline = min(deadline, time.time() + interval_seconds)
+        while time.time() < sleep_deadline:
+            if process is not None:
+                error = server_exit_error(process, log_path)
+                if error is not None:
+                    raise RuntimeError(error)
+            time.sleep(min(0.5, sleep_deadline - time.time()))
 
     raise RuntimeError(f"server readiness probe timed out: {url}")
 
@@ -1313,7 +1356,10 @@ def wrap_command_with_log(
     command: str, log_path: Path, *, login_shell: bool = True
 ) -> str:
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    wrapped = f"{{ {command}; }} 2>&1 | tee -a {shlex.quote(str(log_path))}"
+    wrapped = (
+        "set -o pipefail; "
+        f"{{ {command}; }} 2>&1 | tee -a {shlex.quote(str(log_path))}"
+    )
     flag = "-lc" if login_shell else "-c"
     return f"bash {flag} {shlex.quote(wrapped)}"
 
@@ -1498,8 +1544,12 @@ def execute_task(
             stages_run.append(stage_name)
             if stage_name == "server":
                 ready = dict(stage_payload["ready"])
+                server_command = stage_payload["command"]
                 if setup_mode == "slurm":
                     ready["timeout"] = max(int(ready.get("timeout", 600)), 7200)
+                    server_command = configure_slurm_server_command(
+                        server_command, int(ready["timeout"])
+                    )
                 if enable_perf_diagnostics:
                     run_perf_diagnostics(
                         "before server", runner_env, repo_root, dry_run
@@ -1515,7 +1565,7 @@ def execute_task(
                 if pgm is not None:
                     server_process = pgm.start(
                         wrap_command_with_log(
-                            stage_payload["command"],
+                            server_command,
                             server_log_path,
                             login_shell=False,
                         ),
@@ -1525,14 +1575,17 @@ def execute_task(
                     )
                 else:
                     server_process = start_server(
-                        wrap_command_with_log(
-                            stage_payload["command"], server_log_path
-                        ),
+                        wrap_command_with_log(server_command, server_log_path),
                         runner_env,
                         repo_root,
                         dry_run,
                     )
-                poll_readiness(ready, dry_run)
+                poll_readiness(
+                    ready,
+                    dry_run,
+                    process=server_process,
+                    log_path=server_log_path,
+                )
                 if enable_perf_diagnostics:
                     run_perf_diagnostics(
                         "after server ready", runner_env, repo_root, dry_run
@@ -1622,9 +1675,9 @@ def execute_task(
         result["perf_reference_check"] = perf_reference_check
     if eval_accept_rate is not None:
         result["eval_accept_rate"] = eval_accept_rate
+    write_result(result_json, result)
     if task.get("report", {}).get("github_step_summary"):
         write_detailed_step_summary(result)
-    write_result(result_json, result)
     if error is not None:
         if not error_reported:
             print(f"error: {error}", file=sys.stderr)

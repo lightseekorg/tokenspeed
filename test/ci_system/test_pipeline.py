@@ -1,4 +1,5 @@
 import re
+import subprocess
 import textwrap
 from pathlib import Path
 
@@ -10,6 +11,7 @@ from pipeline import (
     build_step_summary_lines,
     check_eval_score_threshold,
     check_perf_reference,
+    configure_slurm_server_command,
     ensure_ready_port_available,
     extract_evalscope_score,
     extract_perf_summary_rows,
@@ -23,11 +25,13 @@ from pipeline import (
     is_gb200_runner,
     is_nvidia_arm_runner,
     parse_args,
+    poll_readiness,
     resolve_score_threshold_for_runner,
     runner_matches_group,
     setup_runner,
     should_run_nvidia_gpu_cleanup,
     validate_task,
+    wrap_command_with_log,
 )
 
 
@@ -56,6 +60,37 @@ def test_stale_process_patterns_match_existing_targets():
         assert any(
             re.search(pat, cmdline) for pat in STALE_PROCESS_PATTERNS
         ), f"no STALE_PROCESS_PATTERNS entry matched cmdline: {cmdline!r}"
+
+
+def test_poll_readiness_fails_when_server_process_exits(monkeypatch, tmp_path):
+    class ServerProcess:
+        calls = 0
+
+        def poll(self):
+            self.calls += 1
+            return None if self.calls == 1 else 7
+
+    def unavailable(*_args, **_kwargs):
+        raise pipeline.URLError("not ready")
+
+    log = tmp_path / "server.log"
+    log.write_text("first line\nfatal startup error\n")
+    monkeypatch.setattr(pipeline, "urlopen", unavailable)
+
+    with pytest.raises(RuntimeError, match="exit code 7") as exc_info:
+        poll_readiness(
+            {"url": "http://127.0.0.1:8000/readiness", "interval": 10},
+            False,
+            process=ServerProcess(),
+            log_path=log,
+        )
+    assert "fatal startup error" in str(exc_info.value)
+
+
+def test_server_log_wrapper_preserves_server_exit_code(tmp_path):
+    command = wrap_command_with_log("exit 9", tmp_path / "server.log")
+    assert "set -o pipefail" in command
+    assert subprocess.run(command, shell=True).returncode == 9
 
 
 def test_amd_runner_prefixes_cover_legacy_and_arc_labels():
@@ -222,7 +257,10 @@ def test_slurm_execution_only_cleans_its_process_group(monkeypatch, tmp_path):
         "type": "ut",
         "runner": {"labels": ["gb200-1gpu"]},
         "ut": {"commands": ["run test"]},
+        "report": {"github_step_summary": True},
     }
+    result_json = tmp_path / "result.json"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(tmp_path / "missing" / "summary.md"))
 
     class FakeProcessGroupManager:
         terminated = False
@@ -252,12 +290,13 @@ def test_slurm_execution_only_cleans_its_process_group(monkeypatch, tmp_path):
         work_dir=str(tmp_path),
         dry_run=False,
         print_plan=False,
-        result_json=None,
+        result_json=str(result_json),
         setup_mode="slurm",
     )
 
     assert return_code == 0
     assert manager.terminated is True
+    assert result_json.exists()
 
 
 def test_runner_specific_env_uses_original_label_after_b200_override(monkeypatch):
@@ -457,6 +496,15 @@ def test_step_summary_includes_perf_reference_failures():
 def test_step_summary_omits_perf_reference_when_unconfigured():
     summary = "\n".join(build_step_summary_lines(_base_result()))
     assert "Perf reference" not in summary
+
+
+def test_step_summary_write_failure_is_non_fatal(monkeypatch, tmp_path, capsys):
+    missing = tmp_path / "missing" / "summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(missing))
+
+    pipeline.write_detailed_step_summary(_base_result())
+
+    assert "warning: could not write GitHub step summary" in capsys.readouterr().err
 
 
 def test_resolve_score_threshold_passes_through_scalar():
@@ -997,3 +1045,12 @@ def test_perf_reference_table_rendered_for_passing_check(capsys):
     assert "[perf-ref]   Conc" in out
     assert "[perf-ref]   ---" in out
     assert "%" in out
+
+
+def test_slurm_server_command_inherits_readiness_timeout():
+    assert configure_slurm_server_command("ts serve --model example", 7200) == (
+        "ts serve --model example --engine-startup-timeout 7200"
+    )
+    explicit = "ts serve --model example --engine-startup-timeout 300"
+    assert configure_slurm_server_command(explicit, 7200) == explicit
+    assert configure_slurm_server_command("python serve.py", 7200) == "python serve.py"

@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import html
 import json
 import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -23,7 +25,14 @@ from pipeline import build_matrix, normalize_task
 GPU_RE = re.compile(r"(?:^|-)([1-9]\d*)gpu(?:-|$)")
 TASK_TYPES = {"ut", "server_smoke", "eval", "perf"}
 DEFAULT_TASK_TYPES = {"eval", "perf"}
-PR_RE = re.compile(r"^(?:https://github\.com/[^/]+/[^/]+/pull/)?(\d+)(?:/)?$")
+PR_RE = re.compile(
+    r"^(?:https://github\.com/"
+    r"(?P<owner>[A-Za-z0-9._-]+)/(?P<repo>[A-Za-z0-9._-]+)/pull/)?"
+    r"(?P<number>\d+)/?$"
+)
+REPOSITORY_RE = re.compile(r"^(?P<owner>[A-Za-z0-9._-]+)/(?P<repo>[A-Za-z0-9._-]+)$")
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 
 
 @dataclass(frozen=True)
@@ -33,6 +42,13 @@ class Task:
     task_type: str
     runner: str
     gpus: int
+
+
+@dataclass(frozen=True)
+class Submission:
+    task: Task
+    job_id: str
+    log: Path
 
 
 def gpu_count(runner: str) -> int:
@@ -79,6 +95,13 @@ def select_tasks(args: argparse.Namespace, repo: Path) -> list[Task]:
     runners = args.runner or []
     task_types = set(args.task_types or DEFAULT_TASK_TYPES)
     patterns = args.match or []
+    excluded_patterns = getattr(args, "exclude_match", None) or []
+
+    def matches_filters(task: Task) -> bool:
+        return task_matches(repo, task, patterns) and (
+            not excluded_patterns or not task_matches(repo, task, excluded_patterns)
+        )
+
     if args.config:
         tasks = (
             [load_task(repo, args.config, runner) for runner in runners]
@@ -88,7 +111,7 @@ def select_tasks(args: argparse.Namespace, repo: Path) -> list[Task]:
         tasks = [
             task
             for task in tasks
-            if task.task_type in task_types and task_matches(repo, task, patterns)
+            if task.task_type in task_types and matches_filters(task)
         ]
         if not tasks:
             raise ValueError("the selected config does not match the task filters")
@@ -101,7 +124,7 @@ def select_tasks(args: argparse.Namespace, repo: Path) -> list[Task]:
         for item in matrix["include"]
         if item["type"] in task_types and item["runner"] in runners
     ]
-    tasks = [task for task in tasks if task_matches(repo, task, patterns)]
+    tasks = [task for task in tasks if matches_filters(task)]
     if not tasks:
         raise ValueError("no tasks match the requested runners and filters")
     return tasks
@@ -113,12 +136,39 @@ def parse_pr_number(value: str) -> int:
         raise ValueError(
             "--pr must be a pull request number or GitHub pull request URL"
         )
-    return int(match.group(1))
+    return int(match.group("number"))
+
+
+def source_pr_summary(value: str) -> str:
+    match = PR_RE.fullmatch(value)
+    if not match:
+        raise ValueError(
+            "--pr must be a pull request number or GitHub pull request URL"
+        )
+    number = int(match.group("number"))
+    owner = match.group("owner")
+    repo = match.group("repo")
+    if owner is None or repo is None:
+        repository_match = REPOSITORY_RE.fullmatch(
+            os.environ.get("GITHUB_REPOSITORY", "")
+        )
+        if repository_match:
+            owner = repository_match.group("owner")
+            repo = repository_match.group("repo")
+    if owner is not None and repo is not None:
+        url = f"https://github.com/{owner}/{repo}/pull/{number}"
+        return f"**Target PR:** [#{number}]({url})"
+    return f"**Target PR:** #{number}"
 
 
 @contextlib.contextmanager
 def pr_worktree(repo: Path, value: str):
     number = parse_pr_number(value)
+    if git(repo, "rev-parse", "--is-shallow-repository") == "true":
+        raise ValueError(
+            "cannot merge a pull request from a shallow checkout; "
+            "use actions/checkout with fetch-depth: 0 or unshallow the repository"
+        )
     temporary = Path(tempfile.mkdtemp(prefix=f"tokenspeed-pr-{number}-"))
     reference = f"refs/tokenspeed-slurm/pr-{number}-{os.getpid()}"
     try:
@@ -239,6 +289,8 @@ set -euo pipefail
 export RUNNER_NAME="slurm-${{SLURM_JOB_ID}}"
 export HF_HOME=/home/runner/.cache/huggingface
 export XDG_CACHE_HOME=/home/runner/.cache
+unset GITHUB_STEP_SUMMARY GITHUB_OUTPUT GITHUB_ENV GITHUB_PATH GITHUB_STATE \
+  GITHUB_EVENT_PATH
 
 scratch="${{SLURM_TMPDIR:-/tmp}}/tokenspeed-${{SLURM_JOB_ID}}"
 src="$scratch/src"
@@ -289,7 +341,7 @@ def submit(
     artifact_root: Path,
     args: argparse.Namespace,
     commit: str,
-) -> tuple[str, Path]:
+) -> Submission:
     stem = re.sub(r"[^A-Za-z0-9_.-]+", "-", task.name).strip("-")
     unique = f"{commit[:12]}-{time.time_ns()}"
     script_path = artifact_root / "scripts" / f"{stem}-{unique}.sbatch"
@@ -322,13 +374,13 @@ def submit(
     if args.render:
         print(f"$ {shlex.join(command)}")
         print(script, end="")
-        return "", log_pattern
+        return Submission(task, "", log_pattern)
     result = subprocess.run(command, check=True, capture_output=True, text=True)
     job_id = result.stdout.strip().split(";", 1)[0]
     log = Path(str(log_pattern).replace("%j", job_id))
     print(f"Submitted {job_id}: {task.config}")
     print(f"Log: {log}")
-    return job_id, log
+    return Submission(task, job_id, log)
 
 
 def follow(job_id: str, log: Path) -> None:
@@ -348,6 +400,204 @@ def follow(job_id: str, log: Path) -> None:
             tail.terminate()
 
 
+def slurm_states(job_ids: list[str]) -> dict[str, dict[str, str]]:
+    result = subprocess.run(
+        [
+            "sacct",
+            "-X",
+            "-n",
+            "-P",
+            "-j",
+            ",".join(job_ids),
+            "--format=JobIDRaw,State,Elapsed,ExitCode",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    states = {}
+    for line in result.stdout.splitlines():
+        fields = line.split("|")
+        if len(fields) >= 4 and fields[0] in job_ids:
+            states[fields[0]] = {
+                "state": fields[1].split("+", 1)[0],
+                "elapsed": fields[2],
+                "exit_code": fields[3],
+            }
+    return states
+
+
+def result_detail(path: Path) -> str:
+    if not path.exists():
+        return ""
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return "invalid result.json"
+    if data.get("eval_score_check"):
+        check = data["eval_score_check"]
+        return f"score={check['score']:g}, threshold={check['threshold']}"
+    if data.get("perf_reference_check"):
+        check = data["perf_reference_check"]
+        return f"perf={'pass' if check['passed'] else 'fail'}"
+    command_results = data.get("command_results", [])
+    for command_result in reversed(command_results):
+        if not isinstance(command_result, dict):
+            continue
+        score = command_result.get("evalscope_score")
+        if score is not None:
+            try:
+                return f"score={float(score):g}"
+            except (TypeError, ValueError):
+                continue
+    if command_results and command_results[-1].get("pytest_summary"):
+        return str(command_results[-1]["pytest_summary"])
+    return str(data.get("error", ""))
+
+
+def clean_report_text(value: object) -> str:
+    return CONTROL_RE.sub("", ANSI_ESCAPE_RE.sub("", str(value)))
+
+
+def table_cell(value: object, limit: int = 120) -> str:
+    text = clean_report_text(value)
+    line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    if len(line) > limit:
+        line = line[: limit - 3].rstrip() + "..."
+    return line.replace("\\", "\\\\").replace("|", "\\|")
+
+
+def detail_block(job_id: str, task_name: str, detail: str) -> list[str]:
+    text = clean_report_text(detail)
+    lines = text.splitlines()[:40]
+    body = "\n".join(lines)
+    truncated = len(text.splitlines()) > 40 or len(body) > 4000
+    if len(body) > 4000:
+        body = body[:4000].rstrip()
+    if truncated:
+        body += f"\n[truncated; see {job_id}.log in the artifact]"
+    longest_tilde_run = max((len(run) for run in re.findall(r"~+", body)), default=0)
+    fence = "~" * max(3, longest_tilde_run + 1)
+    title = html.escape(f"Job {job_id} — {task_name}")
+    return [
+        "<details>",
+        f"<summary>{title}</summary>",
+        "",
+        f"{fence}text",
+        body,
+        fence,
+        "</details>",
+        "",
+    ]
+
+
+def write_report(
+    submissions: list[Submission],
+    states: dict[str, dict[str, str]],
+    run_root: Path,
+    report_dir: Path,
+    source_pr: str | None = None,
+) -> None:
+    report_dir.mkdir(parents=True, exist_ok=True)
+    rows = []
+    summary = [
+        "## Slurm validation",
+        "",
+    ]
+    if source_pr:
+        summary.extend([source_pr_summary(source_pr), ""])
+    summary.extend(
+        [
+            "| Job | Type | Runner | Task | State | Elapsed | Result |",
+            "|---:|---|---|---|---|---:|---|",
+        ]
+    )
+    details = []
+    for submission in submissions:
+        state = states.get(
+            submission.job_id,
+            {"state": "UNKNOWN", "elapsed": "", "exit_code": ""},
+        )
+        result_path = run_root / submission.job_id / "result.json"
+        detail = result_detail(result_path)
+        row = {
+            "job_id": submission.job_id,
+            "task": submission.task.__dict__,
+            "log": str(submission.log),
+            "result": str(result_path),
+            **state,
+            "detail": detail,
+        }
+        rows.append(row)
+        display_state = {
+            "COMPLETED": "✅",
+            "FAILED": "❌",
+        }.get(state["state"], state["state"])
+        cells = [
+            submission.job_id,
+            submission.task.task_type,
+            submission.task.runner,
+            submission.task.name,
+            display_state,
+            state["elapsed"],
+            detail,
+        ]
+        summary.append("| " + " | ".join(table_cell(cell) for cell in cells) + " |")
+        if table_cell(detail) != detail:
+            details.extend(
+                detail_block(submission.job_id, submission.task.name, detail)
+            )
+        if submission.log.exists():
+            shutil.copy2(submission.log, report_dir / f"{submission.job_id}.log")
+        if result_path.exists():
+            shutil.copy2(result_path, report_dir / f"{submission.job_id}-result.json")
+    (report_dir / "manifest.json").write_text(json.dumps(rows, indent=2) + "\n")
+    if details:
+        summary.extend(["", "## Details", "", *details])
+    (report_dir / "summary.md").write_text("\n".join(summary) + "\n")
+
+
+def wait_all(
+    submissions: list[Submission],
+    run_root: Path,
+    report_dir: Path,
+    source_pr: str | None = None,
+) -> bool:
+    job_ids = [submission.job_id for submission in submissions]
+    previous_handlers = {}
+
+    def cancel_jobs(signum, _frame):
+        subprocess.run(["scancel", *job_ids], check=False)
+        raise SystemExit(128 + signum)
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        previous_handlers[signum] = signal.signal(signum, cancel_jobs)
+    try:
+        while True:
+            queued = subprocess.run(
+                ["squeue", "-h", "-j", ",".join(job_ids)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            if not queued.stdout.strip():
+                break
+            time.sleep(10)
+        states = {}
+        for _ in range(6):
+            states = slurm_states(job_ids)
+            if len(states) == len(job_ids):
+                break
+            time.sleep(2)
+        write_report(submissions, states, run_root, report_dir, source_pr)
+        return all(item.get("state") == "COMPLETED" for item in states.values()) and (
+            len(states) == len(job_ids)
+        )
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+
+
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group(required=True)
@@ -362,6 +612,11 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         action="append",
         help="Case-insensitive task/config/model substring; repeat for OR matching.",
     )
+    parser.add_argument(
+        "--exclude-match",
+        action="append",
+        help="Exclude a case-insensitive task/config/model substring; repeat for OR.",
+    )
     parser.add_argument("--pr", help="PR number or GitHub pull request URL to merge.")
     parser.add_argument("--list", action="store_true", help="List matching tasks only.")
     parser.add_argument(
@@ -375,6 +630,12 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--time", default="12:00:00")
     parser.add_argument("--nodelist")
     parser.add_argument("--follow", action="store_true")
+    parser.add_argument(
+        "--wait", action="store_true", help="Wait for every submitted job."
+    )
+    parser.add_argument(
+        "--report-dir", help="Write aggregate manifest, summary, logs, and results."
+    )
     parser.add_argument("--render", action="store_true")
     return parser.parse_args(argv)
 
@@ -416,10 +677,23 @@ def run(args: argparse.Namespace, repo: Path, artifact_root: Path, cache: Path) 
         )
         for task in tasks
     ]
+    if args.wait:
+        if args.render:
+            raise ValueError("--wait cannot be combined with --render")
+        report_dir = (
+            Path(args.report_dir).expanduser().resolve()
+            if args.report_dir
+            else artifact_root / "reports" / f"{commit[:12]}-{time.time_ns()}"
+        )
+        completed = wait_all(
+            submitted, artifact_root / "runs", report_dir, source_pr=args.pr
+        )
+        print(f"Report: {report_dir}")
+        return 0 if completed else 1
     if args.follow:
-        for job_id, log in submitted:
-            if job_id:
-                follow(job_id, log)
+        for submission in submitted:
+            if submission.job_id:
+                follow(submission.job_id, submission.log)
     return 0
 
 

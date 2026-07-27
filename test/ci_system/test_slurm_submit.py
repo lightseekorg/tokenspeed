@@ -5,12 +5,16 @@ from pathlib import Path
 
 import pytest
 from slurm_submit import (
+    Submission,
     Task,
     gpu_count,
     load_task,
     parse_pr_number,
+    pr_worktree,
     render_script,
+    result_detail,
     select_tasks,
+    write_report,
 )
 
 
@@ -111,6 +115,28 @@ def test_select_all_supports_multiple_runners_types_and_model_match(
     ]
 
 
+def test_select_all_supports_exclude_match(monkeypatch, tmp_path):
+    config = write_task(tmp_path, model="example/mmlu")
+    monkeypatch.setattr(
+        "slurm_submit.build_matrix",
+        lambda *_: {
+            "include": [
+                {"config": config, "type": "eval", "runner": "gb200-1gpu"},
+            ]
+        },
+    )
+    args = argparse.Namespace(
+        config=None,
+        runner=["gb200-1gpu"],
+        task_types=["eval"],
+        match=None,
+        exclude_match=["mmlu"],
+        trigger=None,
+    )
+    with pytest.raises(ValueError, match="no tasks match"):
+        select_tasks(args, tmp_path)
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
@@ -128,6 +154,28 @@ def test_parse_pr_number_rejects_other_urls():
         parse_pr_number("https://example.com/pull/795")
 
 
+def test_pr_worktree_rejects_shallow_checkout(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    subprocess.run(["git", "init", "-q", source], check=True)
+    subprocess.run(["git", "-C", source, "config", "user.name", "Test"], check=True)
+    subprocess.run(
+        ["git", "-C", source, "config", "user.email", "test@example.com"], check=True
+    )
+    (source / "README.md").write_text("test\n")
+    subprocess.run(["git", "-C", source, "add", "README.md"], check=True)
+    subprocess.run(["git", "-C", source, "commit", "-qm", "initial"], check=True)
+    shallow = tmp_path / "shallow"
+    subprocess.run(
+        ["git", "clone", "-q", "--depth=1", f"file://{source}", shallow],
+        check=True,
+    )
+
+    with pytest.raises(ValueError, match="fetch-depth: 0"):
+        with pr_worktree(shallow, "794"):
+            pass
+
+
 def test_render_script_contains_cluster_requirements():
     script = render_script(
         Task("test/ci/eval/example.yaml", "example", "eval", "gb200-1gpu", 1),
@@ -142,4 +190,49 @@ def test_render_script_contains_cluster_requirements():
     assert "libcudart.so.13" in script
     assert "/usr/bin/nvidia-smi" in script
     assert "/shared/cache:/home/runner/.cache" in script
+    unset = (
+        "unset GITHUB_STEP_SUMMARY GITHUB_OUTPUT GITHUB_ENV GITHUB_PATH "
+        "GITHUB_STATE   GITHUB_EVENT_PATH"
+    )
+    assert unset in script
+    assert script.index(unset) < script.index('srun "${srun_args[@]}"')
     subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+
+
+def test_result_detail_reports_eval_score(tmp_path):
+    result = tmp_path / "result.json"
+    result.write_text(
+        '{"eval_score_check": {"score": 0.95, "threshold": 0.9, "passed": true}}'
+    )
+    assert result_detail(result) == "score=0.95, threshold=0.9"
+
+
+def test_write_report_collects_logs_and_results(tmp_path):
+    log = tmp_path / "job.log"
+    log.write_text("task output\n")
+    run_root = tmp_path / "runs"
+    result = run_root / "123" / "result.json"
+    result.parent.mkdir(parents=True)
+    result.write_text('{"error": ""}')
+    task = Task("test/ci/eval/example.yaml", "example", "eval", "gb200-1gpu", 1)
+
+    report = tmp_path / "report"
+    write_report(
+        [Submission(task, "123", log)],
+        {
+            "123": {
+                "state": "COMPLETED",
+                "elapsed": "00:01:00",
+                "exit_code": "0:0",
+            }
+        },
+        run_root,
+        report,
+    )
+
+    assert (report / "123.log").read_text() == "task output\n"
+    assert (report / "123-result.json").exists()
+    assert (
+        "| 123 | eval | gb200-1gpu | example | ✅ |"
+        in (report / "summary.md").read_text()
+    )
